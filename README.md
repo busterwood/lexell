@@ -38,6 +38,9 @@ behind it, rebuilding itself in 0.66 s. It writes x86-64 ELF directly.
   time), JSON and a jq port, CommonMark, HTTP, TLS, tasks, and clients for
   SQLite, PostgreSQL, SQL Server and Oracle. A million database rows stream
   in 8 to 14 MB.
+- **Exact decimals, not floats.** `1.25m` is a 38-digit `Decimal` with a
+  display scale: the full precision of SQL Server's `decimal` and Oracle's
+  `NUMBER`, exact arithmetic, and no binary-float rounding.
 
 It targets Linux on x86-64. The numbers, method and caveats are in
 [PERFORMANCE.md](PERFORMANCE.md).
@@ -142,6 +145,11 @@ The programs are in [obx/cmd/](obx/cmd/README.md):
 each row into the program's own record. Memory stays flat: it is the same
 at 100,000 and at 1,000,000 rows. See
 [obx/design/db-streaming.md](obx/design/db-streaming.md).
+
+Decimals are exact end to end. The 38-digit `Decimal` matches the precision
+of SQL Server's `decimal`/`numeric` and Oracle's `NUMBER`; SQLite has no
+decimal type, so its client stores them as exact text and checks the declared
+precision and scale when binding.
 
 The Oracle client supports OUT binds, REF CURSORs and TLS.
 
