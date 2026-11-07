@@ -3,7 +3,50 @@
 Nine small programs, each building the same program with both backends,
 native and via C:
 
-    python3 obx/bench/bench.py [-n RUNS] [--only NAME ...] [--obo]
+    python3 obx/bench/bench.py [-n RUNS] [--only NAME ...] [--obo] [--perf]
+
+`--perf` adds instructions and cycles (`perf stat`, user mode) beside the
+wall times.
+
+## Like-for-like comparisons
+
+There are three different questions, and they must not be mixed:
+
+1. **Same obx source, native against the C backend.** The two builds are the
+   same algorithm, the same checks and the same runtime semantics; the
+   difference is the code generator (and the runtime implementation). This is
+   the number that decides whether the C backend can go. It is the
+   `native/C` column.
+2. **Same algorithm written in C, against native obx.** This is the
+   language/runtime comparison: allocation, strings, records, the ABI, the
+   checks the language requires. `obx/bench/c/NAME.c` holds these
+   references, built with `gcc -O2 -fno-optimize-sibling-calls`; the table's
+   `plain C` and `native/plain C` columns are this question.
+3. **Another implementation (Rust regex, Go regexp, GNU grep, jq, cmark,
+   OpenSSL).** These are usually a different algorithm. They answer "is our
+   algorithm competitive", not "is our compiler generating good code". The
+   regex and JSON benchmark scripts report them; keep them out of the
+   compiler's verdict.
+
+The hand-written C reference must execute the same work as the obx program.
+gcc -O2 will otherwise remove it: it constant-folds `fib(40)`, turns the sum
+in `loop` into a closed form, and vectorises `array`. The references say how
+they are held to the same work:
+
+- `fib.c`: `n` comes from the command line, the function is `noinline`, and
+  an empty asm keeps the two recursive calls from being turned into a loop
+  (`-fno-optimize-sibling-calls` as well).
+- `loop.c`: `n` comes from the command line and an empty asm keeps `s` in a
+  register across the iteration, so the loop cannot become a closed form or
+  a vector loop.
+- `alloc.c`: the allocations go through volatile function pointers, so
+  malloc/free cannot be folded away.
+- `array.c` is deliberately left as gcc compiles it: its 3x lead over native
+  is auto-vectorisation (fewer instructions, same work), which is a real
+  target, not an artifact.
+
+`maps` has no plain C reference yet: the obx map's index layout and keyed
+hash would have to be ported, not approximated.
 
 For each program it builds `NAME.obx` with `obx/compiler/out/obxc` (or
 `$OBXC`) twice, with `--native` and through C (`gcc -O2`). It checks that the

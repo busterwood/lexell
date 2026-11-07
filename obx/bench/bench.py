@@ -10,7 +10,12 @@ best wall time of N runs of each. A program with a hand-written C reference,
 obx/bench/c/NAME.c (no checks), also gets it built with gcc -O2 and timed, as
 the "plain C" column ("-" for the others).
 
-    python3 obx/bench/bench.py [-n RUNS] [--only NAME ...] [--obo]
+    python3 obx/bench/bench.py [-n RUNS] [--only NAME ...] [--obo] [--perf]
+
+The primary comparison is the same obx source built both ways (native and
+through C). The hand-written C references in c/ are a second, same-algorithm
+comparison; README.md says what each reference does to keep the work equal.
+--perf adds instructions and cycles (user mode) beside the wall times.
 """
 import argparse
 import os
@@ -52,6 +57,32 @@ def best(exe, name, n):
     return min(ts), out
 
 
+def perf_run(exe, name, n):
+    """Best wall time, and the least instructions/cycles (user mode), of n runs."""
+    ts, ins, cyc, outs = [], [], [], set()
+    for _ in range(n):
+        t0 = time.perf_counter()
+        p = subprocess.run(['perf', 'stat', '-x,', '-e', 'instructions:u,cycles:u', exe] + args_for(name),
+                           capture_output=True, text=True)
+        dt = time.perf_counter() - t0
+        if p.returncode != 0:
+            raise SystemExit(f"{exe} exited {p.returncode}: {p.stderr}")
+        outs.add(p.stdout.strip())
+        vals = {}
+        for line in p.stderr.splitlines():
+            f = line.split(',')
+            if len(f) > 2 and f[0].isdigit():
+                vals[f[2].split(':')[0]] = int(f[0])
+        if 'instructions' not in vals or 'cycles' not in vals:
+            raise SystemExit(f"perf did not report instructions/cycles for {exe}")
+        ts.append(dt)
+        ins.append(vals['instructions'])
+        cyc.append(vals['cycles'])
+    if len(outs) != 1:
+        raise SystemExit(f"{name}: runs print different output: {sorted(outs)}")
+    return min(ts), outs.pop(), min(ins), min(cyc)
+
+
 def build_obx(name, tmp, native=False):
     exe = os.path.join(tmp, name + ('_obxn' if native else '_obx'))
     subprocess.run([OBXC, os.path.join(HERE, name + '.obx'), '-o', exe] + (['--native'] if native else []),
@@ -64,7 +95,9 @@ def build_c(name, tmp):
     if not os.path.exists(src):
         return None
     exe = os.path.join(tmp, name + '_plainc')
-    subprocess.run(['gcc', '-O2', src, '-o', exe], check=True)
+    # No sibling-call optimisation: obx does not turn recursion into a loop,
+    # and fib's reference is about the call tree, not gcc removing it.
+    subprocess.run(['gcc', '-O2', '-fno-optimize-sibling-calls', src, '-o', exe], check=True)
     return exe
 
 
@@ -87,10 +120,21 @@ def main():
     ap.add_argument('-n', type=int, default=5, help='runs per program (best is reported)')
     ap.add_argument('--only', nargs='*')
     ap.add_argument('--obo', action='store_true', help='add the archived obo compiler as a column')
+    ap.add_argument('--perf', action='store_true',
+                    help='also report instructions and cycles (perf stat, user mode)')
     a = ap.parse_args()
     names = a.only or NAMES
     tmp = tempfile.mkdtemp(prefix='obxbench')
     rows = []
+
+    def timed(exe):
+        if exe is None:
+            return None, None, None, None
+        if a.perf:
+            return perf_run(exe, name, a.n)
+        t, out = best(exe, name, a.n)
+        return t, out, None, None
+
     for name in names:
         obx = build_obx(name, tmp)
         obxn = build_obx(name, tmp, native=True)
@@ -100,8 +144,8 @@ def main():
             code, out, err, _ = run(exe, name, {'OBX_CHECK': '1'})
             if code != 0:
                 raise SystemExit(f"{name}: {exe} with OBX_CHECK=1 exited {code}: {err}")
-        t_obx, out_obx = best(obx, name, a.n)
-        t_obxn, out_obxn = best(obxn, name, a.n)
+        t_obx, out_obx, i_obx, c_obx = timed(obx)
+        t_obxn, out_obxn, i_obxn, c_obxn = timed(obxn)
         if out_obxn != out_obx:
             raise SystemExit(f"{name}: outputs differ: C {out_obx!r}, native {out_obxn!r}")
         t_obo, out_obo = (None, None)
@@ -109,27 +153,41 @@ def main():
             t_obo, out_obo = best(obo, name, a.n)
         if obo and out_obo != out_obx:
             raise SystemExit(f"{name}: outputs differ: obx {out_obx!r}, obo {out_obo!r}")
-        t_plain = None
-        if plain:
-            t_plain, out_plain = best(plain, name, a.n)
-            if out_plain != out_obx:
-                raise SystemExit(f"{name}: outputs differ: obx {out_obx!r}, plain C {out_plain!r}")
-        rows.append((name, t_obo, t_obx, t_obxn, out_obx, t_plain))
-    if not a.obo:
-        print("| benchmark | via C | native | native/C | plain C | output |")
-        print("|---|---:|---:|---:|---:|---|")
-        for name, _, t_obx, t_obxn, out, t_plain in rows:
-            pc = fmt(t_plain) if t_plain is not None else "-"
-            print(f"| {name} | {fmt(t_obx)} | {fmt(t_obxn)} | {t_obxn / t_obx:.2f} | {pc} | {out} |")
+        t_plain, out_plain, i_plain, c_plain = timed(plain)
+        if plain and out_plain != out_obx:
+            raise SystemExit(f"{name}: outputs differ: obx {out_obx!r}, plain C {out_plain!r}")
+        rows.append(dict(name=name, obo=t_obo, c=t_obx, n=t_obxn, plain=t_plain, out=out_obx,
+                         ci=i_obx, ni=i_obxn, pi=i_plain, cc=c_obx, nc=c_obxn, pc=c_plain))
+    if a.obo:
+        if all(r['obo'] is None for r in rows):
+            print("note: the obo compiler did not build anything; obo columns skipped", file=sys.stderr)
+        print("| benchmark | obo | obx via C | obx native | C/obo | native/obo | output |")
+        print("|---|---:|---:|---:|---:|---:|---|")
+        for r in rows:
+            t_obo = r['obo']
+            cr = f"{r['c'] / t_obo:.2f}" if t_obo else "n/a"
+            nr = f"{r['n'] / t_obo:.2f}" if t_obo else "n/a"
+            print(f"| {r['name']} | {fmt(t_obo)} | {fmt(r['c'])} | {fmt(r['n'])} | {cr} | {nr} | {r['out']} |")
         return
-    if all(r[1] is None for r in rows):
-        print("note: the obo compiler did not build anything; obo columns skipped", file=sys.stderr)
-    print("| benchmark | obo | obx via C | obx native | C/obo | native/obo | output |")
+    print("| benchmark | via C | native | native/C | plain C | native/plain C | output |")
     print("|---|---:|---:|---:|---:|---:|---|")
-    for name, t_obo, t_obx, t_obxn, out, _ in rows:
-        r = f"{t_obx / t_obo:.2f}" if t_obo else "n/a"
-        rn = f"{t_obxn / t_obo:.2f}" if t_obo else "n/a"
-        print(f"| {name} | {fmt(t_obo)} | {fmt(t_obx)} | {fmt(t_obxn)} | {r} | {rn} | {out} |")
+    for r in rows:
+        pc = fmt(r['plain']) if r['plain'] is not None else "-"
+        npc = f"{r['n'] / r['plain']:.2f}" if r['plain'] else "-"
+        print(f"| {r['name']} | {fmt(r['c'])} | {fmt(r['n'])} | {r['n'] / r['c']:.2f} | "
+              f"{pc} | {npc} | {r['out']} |")
+    if a.perf:
+        print()
+        print("| benchmark | C Minstr | native Minstr | native/C | C Mcyc | native Mcyc | native/C | "
+              "plain Minstr | plain Mcyc | native/plain cyc |")
+        print("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+        for r in rows:
+            def m(x):
+                return f"{x / 1e6:.1f}" if x is not None else "-"
+            npc = f"{r['nc'] / r['pc']:.2f}" if r['pc'] else "-"
+            print(f"| {r['name']} | {m(r['ci'])} | {m(r['ni'])} | {r['ni'] / r['ci']:.2f} | "
+                  f"{m(r['cc'])} | {m(r['nc'])} | {r['nc'] / r['cc']:.2f} | "
+                  f"{m(r['pi'])} | {m(r['pc'])} | {npc} |")
 
 
 if __name__ == '__main__':
