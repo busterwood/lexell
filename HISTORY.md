@@ -2411,3 +2411,50 @@ The seed was refreshed with no compiler source change (`std.obx` line
 positions are embedded in the seed's `"std.obx:N"` strings). Gate quick
 passes; `diff.py` agrees on 11 operations over 200,000 inputs across four
 builds; `run_native.py --lib` and `--lib --opt` are 613 pass, 0 differ.
+
+### Report revision: PERFORMANCE.md as current state (2026-11-07)
+
+PERFORMANCE.md was revised to describe the current state only. Its
+before/after narrative moved here.
+
+**Application suite baseline.** Before the regex per-match work, the Markdown
+scan change and the Decimal changes, the Tier-1 row was regex 1.36 / json
+0.98 / jq 0.93 / cmark 1.14 / decimal 1.12 in wall time against C, with
+instructions 1.27 / 1.15 / 1.13 / 1.27 / 1.28. Regex, Decimal and cmark were
+the rows that moved. Decimal then won on time and cycles: the match-payload
+place (no copy of a payload that is only borrowed) and the targeted inlining
+of a call whose record argument is a place were worth 4.4% of its
+instructions and 9% of its cycles, and the 2026-11-07 operator fast paths
+took add from 29.6 to 13.3 ns and mul from 27.0 to 17.1 ns, to 0.92-0.93
+wall / 0.93 cycles.
+
+**Regex per-match.** The span path's change took the per-match overhead from
+341 to 46 to 16 instructions. Fusing the forward and backward passes into one
+call was measured and reverted: it helped native 1.7% but gcc inlined the
+fused function and took the C build 11%, widening the gap.
+
+**Decimal record ABI.** `decimal-abi` (design/decimal-perf-research.md
+section 9) made `mul128` return the low 64x64 product when both factors are
+below 2^64, and an ordered 128-bit compare against a constant, a register
+pair or memory compare the local where it is instead of copying it to
+`rax:rdx`. `record-abi` (design/record-abi.md) passed a value record that was
+copied into a temporary only to be the first argument of a call (a method
+receiver) as the place itself; a `match` binding that is only borrowed
+(`Ok(d)`, then `&d`) became the payload place too, not a 48-byte copy; a call
+whose record argument is a place was inlined up to 40 nodes where that
+removed the copy and its call; and a 128-bit member of a pointer local went
+straight to its register pair. At that point native `-O` against C was mul
+0.73 cycles (19 digits), div 0.92, add 0.93-0.97, quantize 0.96, rem 0.75,
+parse 1.28, format 1.16, cmp about 1.2, and the application row 0.97 wall /
+0.96 cycles, from 1.09 / 1.10 before. A throwaway by-reference oracle
+measured the rest of the ceiling at -9% Decimal cycles and nothing on cmark,
+json, jq or the compiler; it miscompiles the compiler, so the full
+by-reference ABI was not built.
+
+**Compiler host note.** During the 2026-11 compiler sweep the host was slow:
+the same gcc-built compiler took 536 ms at `5d340654`.
+
+**Frozen perfsuite inputs.** The inputs were frozen at `7d519d1` until
+6 November 2026, when number literals got their `f` and `m` suffixes and the
+old inputs stopped compiling; they moved to `af99f933`, the last revision
+before the native float registers.
