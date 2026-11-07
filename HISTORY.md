@@ -2494,3 +2494,35 @@ The README and `obx/bench/README.md` say the same: native is the build, the
 C backend is the bootstrap/portability/oracle path, and the three comparison
 questions (same source native vs C, the same algorithm in hand-written C,
 another implementation) stay separate.
+
+### Rust and compile-time reference (2026-11-07)
+
+The benchmark set now has an idiomatic Rust port of the nine programs that
+have a hand-written C reference (`obx/bench/rust/`, one dependency-free
+binary with a subcommand each; `maps` has none because obx's insertion-
+ordered, keyed-hash map has no direct Rust std equivalent). The build is
+fixed for a fair comparison: `opt-level = 3`, thin LTO, one codegen unit,
+`panic = "abort"`, `target-cpu=x86-64-v3`, `overflow-checks = true`, no
+unsafe, no external crates, bounds checks on, and `black_box`/argv where
+the C reference uses them. `bench.py` gained a Rust column and `--no-rust`.
+
+best of 11, one core (obx -O / Rust): fib 347/349 ms, loop 229/227,
+array 107/102, alloc 70/126, lists 31/40, strings 45/79 (Rc<str> 128),
+trees 20/25, tokens 12/12, sieve 148/247. Rust is at most 6% ahead on
+array and tokens; obx is ahead on alloc, lists, strings, trees and sieve;
+fib and loop are level. The first loop port took `n` from argv and
+black-boxed the accumulator, which also stopped LLVM proving the two
+overflow checks: 460 ms. It now keeps `loop.obx`'s constant bound, so LLVM
+proves them as obx `-O` does, and the row is 227 ms.
+
+`obx/bench/compile.py` adds compile time and size, best of 3, one core
+(obx / Rust / gcc): hello compile 12 ms / 162 ms / 86 ms; hello binary
+16 KB / 357 KB stripped / 16 KB; the nine benchmark programs 104 ms /
+2.95 s (cargo clean build) and 172 KB / 443 KB of binaries; the compiler
+self-build 656 ms and a 2.9 MB static binary. Rust includes std and the
+cargo build system; obx links its own runtime.
+
+PERFORMANCE.md now leads with the obx/Rust comparison and labels the
+implementation obx rather than native (native is ambiguous next to Rust).
+README's performance summary states the small-compiler, fast-compile and
+Rust-competitive results.

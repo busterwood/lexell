@@ -122,22 +122,30 @@ native-vs-C measurement is kept separately in
 [design/native-vs-c.md](obx/design/native-vs-c.md). They were measured on
 one 8-core test machine, so compare the columns, not the absolute numbers.
 
+obx is small and fast. The compiler is 39,436 lines and a 2.9 MB static
+binary, and builds itself in 0.66 s. A hello world compiles in 12 ms to a
+16 KB executable; Rust takes 162 ms and 357 KB (stripped), and gcc 86 ms.
+The nine benchmark programs compile in 104 ms with obx against 2.95 s for
+the Rust suite.
+
+- **Competitive with Rust:** on the nine microbenchmarks obx is level with
+  or ahead of idiomatic Rust on seven; Rust is at most 6% ahead on `array`
+  and `tokens`. Plain C is ahead only on `array` (3 times, AVX2
+  auto-vectorisation) and slightly on `tokens`; obx is ahead on allocation,
+  strings and trees. The table and the Rust ports are in
+  [PERFORMANCE.md](PERFORMANCE.md) and [obx/bench/rust/](obx/bench/rust/).
 - **Applications:** regex 44 ms, `json`/`jq` 0.4 to 0.5 s, Markdown 0.16 s,
   Decimal 2.2 s. The external references (Rust, Go, jq, cmark, .NET and
   Java) are in [PERFORMANCE.md](PERFORMANCE.md).
 - **Decimal:** 13.3 ns for a 19-digit add and 17.1 ns for a 6x6 multiply;
   1.2 times .NET on add and 1.5 on multiply.
-- **Microbenchmarks:** obx is level with Rust on fib, loop, tokens and
-  array and ahead on allocation, lists, strings and trees; gcc's
-  auto-vectorised array is 3 times obx. The table and the Rust ports are
-  in [PERFORMANCE.md](PERFORMANCE.md) and [obx/bench/rust/](obx/bench/rust/).
-- **Float math** in the native backend takes within about 15% of C's cycles per call.
+- **Float math** takes within about 15% of C's cycles per call.
 - **HTTP server:** one thread serves 65,600 requests a second to 100 clients.
   Go's `net/http` serves 44,500 on the same setup. With 8 worker processes
   the server reaches about 128,000.
 - **Database streaming:** 1,000,000 rows take 8 to 14 MB of memory when
   streamed. Buffering the same rows takes 109 to 365 MB.
-- **Small programs:** hello world is 16 KB natively, with no libc.
+- **Small programs:** hello world is 16 KB, static, with no libc.
 
 ## Where to read more
 

@@ -152,6 +152,28 @@ code-shape gaps.
   by under 1%, trees and sieve by 2–4%; maps moves as much between runs
   of one binary on a loaded machine, which is memory, not placement.
 
+## Compile time and size
+
+`python3 obx/bench/compile.py -n 3`, best of 3, one core. The builds are not
+identical: obx emits nine small executables, the Rust project emits one
+binary with nine subcommands, and cargo measures its own build system.
+
+| what | obx | Rust | C |
+|---|---:|---:|---:|
+| hello, compile | 12 ms | 162 ms | 86 ms |
+| hello, binary | 16 KB | 357 KB (stripped) | 16 KB |
+| nine benchmark programs, clean compile | 104 ms | 2.95 s | - |
+| nine benchmark programs, binaries | 172 KB | 443 KB | - |
+| compiler self-build (`--native`) | 656 ms | - | - |
+| compiler binary | 2.9 MB (static) | - | - |
+
+The compiler is 39,436 lines of obx (28,348 hand-written) and builds itself
+in 0.66 s; its binary is 2.9 MB and needs no libc. A hello world compiles in
+12 ms to 16 KB, against Rust's 162 ms and 357 KB (stripped) and gcc's 86 ms
+and 16 KB. The nine benchmark programs compile in 104 ms with obx; the Rust
+suite takes 2.95 s. Rust's figures include std and the cargo build system;
+obx links its own freestanding runtime.
+
 ## Regex
 
 `python3 obx/bench/regex/bench.py -n 7` ([obx/bench/regex/](obx/bench/regex/bench.py)),
@@ -994,6 +1016,7 @@ the comparison.
 ```sh
 obx/compiler/build.sh                                  # out/obxc from the seed
 python3 obx/bench/bench.py --opt --perf -n 11          # the microbenchmarks (hand-written C and obx -O)
+python3 obx/bench/compile.py -n 3                      # compile time and binary size
 python3 obx/bench/apps.py -n 5 --pin 2                 # the Tier-1 application suite
 python3 obx/bench/regex/bench.py -n 7                  # the regex table (Go, Rust and rg built by it)
 python3 obx/bench/json/bench.py --jq JQ                # the JSON library and jq large-input tables
