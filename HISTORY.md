@@ -1724,7 +1724,16 @@ numbering and rewrite (`optcost.py` -O/default +51.1% instructions against
 the +30% budget). The 613 `--opt --lib` native programs passed with the pass
 on. With M1's allocator model this closes M2/M3 as a route to redundancy
 elimination; the next speed is the tree-level work in
-`obx/design/codegen-audit.md` (bool/branch folding, addressing, frames).
+`obx/design/codegen-audit.md` (addressing, frames, the allocator).
+
+Boolean/branch folding (`bool-fold`, 2026-11-07) was built in `x64gen` (124
+lines: fuse a condition's defining statement into the `if`, and rewrite the
+checker's `bool b = A; if (b) … if (!b) …` shape into branches on `A`) and
+reverted. It removed the `setcc`/`movzx`/`test` chains, **-6.53% instructions
+on `tokens`** and -0.61% on the self-build, but only **-0.86% cycles** on
+`tokens` and about none on the self-build: the identifier kernel is bound by
+spilled string headers and the allocator, not issue slots, and the branch
+count does not change. It missed the 5%/3% cycle gate.
 
 `perf17` fails "Judging a pass": the run suite gains in cycles but on one
 program (fib), and the compile suite costs 1.05%. It is committed on its

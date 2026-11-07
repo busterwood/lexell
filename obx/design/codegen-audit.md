@@ -244,10 +244,14 @@ microbenchmarks.
 
 1. **Keep the `lea` selection** (done). 331M fib instructions and 1G loop
    instructions gone for 66 lines, fib 1.10 -> 0.99 of gcc.
-2. **Boolean/branch folding** (rank 2). The biggest remaining code-shape gap
-   on branch-heavy code, `tokens` first: ~40 extra instructions per
-   identifier byte. Judge it on `tokens` and the compiler self-build (the
-   same `&&`/`||` pattern is everywhere), not on the allocation benchmarks.
+2. **Boolean/branch folding** (rank 2) — **measured 2026-11-07 and reverted.**
+   The change (124 lines in `x64gen`: fuse `T t = E; if (cond(t))`, and rewrite
+   the checker's `bool b = A; if (b) … if (!b) …` shape to branch on `A`) did
+   remove the `setcc`/`movzx`/`test` chains: `tokens` −6.53% instructions and
+   −0.86% cycles; the self-build −0.61% instructions and −0.54% cycles. It did
+   not translate into time because the identifier kernel is bound by spilled
+   string headers and the allocator, not issue slots, and the branch count is
+   unchanged. Below the 5%/3% gate, so the patch was not kept.
 3. **Destination-directed arithmetic and addressing modes** (ranks 1 and 5):
    `*(p + i)` as an operand, so array's `mov rsi,rax` and maps' `imul`+`lea`
    go. 80-150 lines, safe on the same IR, measured by instruction counts.
