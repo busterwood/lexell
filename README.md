@@ -33,8 +33,8 @@ behind it, rebuilding itself in 0.66 s. It writes x86-64 ELF directly.
 
 - **The code is fast.** It is level with or ahead of idiomatic Rust on eight
   of nine microbenchmarks, and beats the same source built through obx's C
-  backend on nine of ten. Against hand-written C it is 2x on allocation,
-  1.7x on strings and 1.8x on the sieve.
+  backend on nine of ten. Against hand-written C it is 2x on allocation and
+  strings, 1.3x on trees, and ahead on lists and the sieve.
 - **Building is fast.** The nine benchmark programs compile in 104 ms
   against 2.95 s for the Rust suite. Rust's `rustc` plus its driver and LLVM
   is 316 MB; with the rest of the toolchain it is 1.3 GB.
@@ -52,25 +52,42 @@ It targets Linux on x86-64. The numbers, method and caveats are in
 ## A taste of obx
 
 ```
+type Point = value record { x: int; y: int }
+
+fn (p: &Point) norm2(): int { return p.x * p.x + p.y * p.y }
+fn ident[T](v: T): T { return v }
+fn firstPositive(xs: &[int]): Option[int] {
+    for x in xs { if x > 0 { return Some(x) } }
+    return None
+}
+
 fn main() {
+    let p = Point{x: 3, y: 4}
+    println(p.norm2())
+    println(ident("obx"))
+    match firstPositive(&[0, 7]) {
+        Some(n) { println(n) }
+        None { println("none") }
+    }
     let price = 19.99m
-    let total = price * 3.0m
-    println("total: " + total.toStr())
-    let rate = 0.5f
-    println("rate: " + rate.toStr())
+    println((price * 3.0m).toStr())
 }
 ```
 
-It prints `total: 59.970` and `rate: 0.5`.
+It prints `25`, `obx`, `7` and `59.970`. It shows a value record with a
+method, a generic function, a slice with `Option` and `match`, and an exact
+`Decimal`.
 
 ## Quick start
 
-Run these from the repository root. The first build uses the checked-in C
-seed.
+Run these from the repository root, with the program above saved as
+`prog.obx`. The first build uses the checked-in C seed and takes about 22 s
+because it runs gcc; later self-builds take 0.66 s.
 
 ```
 obx/compiler/build.sh                            # build the compiler from its seed
 obx/compiler/out/obxc prog.obx -o prog           # a native x86-64 program, no gcc
+./prog                                           # 25, obx, 7, 59.970
 obx/tools/gate.sh quick                          # run the test suites
 ```
 
@@ -91,7 +108,7 @@ Language and platform notes:
 - The owner frees a value. The compiler checks that borrows never outlive
   the value they lend.
 
-## What is in it
+## What's in the box
 
 ### The compiler
 
@@ -99,7 +116,7 @@ Language and platform notes:
   - **Native:** writes an ELF executable with no gcc. The program is static,
     or dynamically linked when it calls C libraries.
   - **C:** writes C and runs gcc.
-- The compiler is about 39,000 lines of obx. Under a third of that is
+- The compiler is 39,436 lines of obx. Under a third of that is
   generated runtime tables.
 - Its C is checked in as a seed. A first build needs only gcc.
 
@@ -157,6 +174,43 @@ precision and scale when binding.
 
 The Oracle client supports OUT binds, REF CURSORs and TLS.
 
+## Performance
+
+The short version: obx compiles like a script and runs like Rust. One 8-core
+test machine; full tables, method and caveats in
+[PERFORMANCE.md](PERFORMANCE.md).
+
+| | obx | Rust | C |
+|---|---:|---:|---:|
+| hello world, compile | 12 ms | 162 ms | 86 ms |
+| hello world, binary | 16 KB static | 357 KB | 16 KB |
+| nine programs, compile | 104 ms | 2.95 s | - |
+| self-build | 0.66 s | over 30 min* | - |
+| toolchain | 2.9 MB | 316 MB | system gcc |
+
+- **Code:** level with or ahead of idiomatic Rust on eight of nine
+  microbenchmarks. Against the same source built through obx's C backend,
+  `-O` wins nine of ten; against hand-written C, obx is 2x on allocation and
+  strings, 1.3x on trees, and ahead on lists and the sieve.
+- **Applications:** regex 44 ms, `json`/`jq` 0.4 to 0.5 s, Markdown 0.16 s,
+  Decimal 2.2 s. External references (Rust, Go, jq, cmark, .NET and Java)
+  are in [PERFORMANCE.md](PERFORMANCE.md).
+- **Decimal:** 13.3 ns for a 19-digit add and 17.1 ns for a 6x6 multiply;
+  1.2 times .NET on add and 1.5 on multiply.
+- **Float math** takes within about 15% of C's cycles per call.
+- **HTTP:** one thread serves 60,763 requests a second to 100 clients; Go's
+  `net/http` serves 44,500. With 8 worker processes the server reaches about
+  124,000.
+- **Streaming:** 1,000,000 rows take 8 to 14 MB of memory; buffering the same
+  rows takes 91 to 365 MB.
+
+\* Rust self-build: the
+[Rust compiler development guide](https://rustc-dev-guide.rust-lang.org/)'s
+estimate, not measured here; tests are separate. Rust's 316 MB is `rustc`,
+its driver and LLVM (560 MB installed, 1.3 GB with docs). The nine-program row
+builds nine obx executables against one Rust binary with nine subcommands, and
+cargo measures its own build system.
+
 ## Status and limitations
 
 obx is new: the project restarted on 2 November 2026. The language
@@ -176,57 +230,19 @@ the project. APIs may still change.
 - **Not 1.0.** There is no stable API or release process yet; the test
   suites and `gate.sh` are the contract.
 
-## Performance
-
-These figures come from [PERFORMANCE.md](PERFORMANCE.md); the internal
-native-vs-C measurement is kept separately in
-[design/native-vs-c.md](obx/design/native-vs-c.md). They were measured on
-one 8-core test machine, so compare the columns, not the absolute numbers.
-
-obx is small and fast. The compiler is 39,436 lines and a 2.9 MB static
-binary, and builds itself in 0.66 s. Rust's `rustc` plus its driver and
-LLVM is 316 MB (560 MB installed, 1.3 GB with docs), and a full rustc
-self-build is over 30 minutes on a moderately powerful laptop, according to
-the [Rust compiler development guide](https://rustc-dev-guide.rust-lang.org/);
-tests are separate. A hello world
-compiles in 12 ms to a 16 KB executable; Rust takes 162 ms and 357 KB
-(stripped), and gcc 86 ms. The nine benchmark programs compile in 104 ms
-with obx against 2.95 s for the Rust suite.
-
-- **Competitive with Rust:** on the nine microbenchmarks obx is level with
-  or ahead of idiomatic Rust on eight; Rust is clearly ahead only on
-  `tokens` (21%). Plain C is ahead on `array` (3.7 times, AVX2
-  auto-vectorisation), `tokens` (22%) and slightly `fib` (4%); obx is ahead
-  on allocation, strings, lists, trees and sieve. The table and the Rust
-  ports are in [PERFORMANCE.md](PERFORMANCE.md) and
-  [obx/bench/rust/](obx/bench/rust/).
-- **Applications:** regex 44 ms, `json`/`jq` 0.4 to 0.5 s, Markdown 0.16 s,
-  Decimal 2.2 s. The external references (Rust, Go, jq, cmark, .NET and
-  Java) are in [PERFORMANCE.md](PERFORMANCE.md).
-- **Decimal:** 13.3 ns for a 19-digit add and 17.1 ns for a 6x6 multiply;
-  1.2 times .NET on add and 1.5 on multiply.
-- **Float math** takes within about 15% of C's cycles per call.
-- **HTTP server:** one thread serves 60,763 requests a second to 100 clients.
-  Go's `net/http` serves 44,500 on the same setup. With 8 worker processes
-  the server reaches about 124,000.
-- **Database streaming:** 1,000,000 rows take 8 to 14 MB of memory when
-  streamed. Buffering the same rows takes 91 to 365 MB.
-- **Small programs:** hello world is 16 KB, static, with no libc.
-
 ## Where to read more
 
-| Document | What it covers |
+| Start here | What it covers |
 |---|---|
-| [obx/README.md](obx/README.md) | the language and the layout of the repository |
 | [obx/SPEC.md](obx/SPEC.md) | the language definition |
-| [obx/PLAN.md](obx/PLAN.md) | the stages, their gates and their state |
-| [PERFORMANCE.md](PERFORMANCE.md) | the measured numbers and how they were taken |
-| [design/native-vs-c.md](obx/design/native-vs-c.md) | native against the C backend, as an internal check |
-| [HISTORY.md](HISTORY.md) | how the project got here, with dated entries |
-| [obx/design/](obx/design/) | design notes for each stage and subsystem |
 | [obx/lib/README.md](obx/lib/README.md) | the library: every module |
 | [obx/cmd/README.md](obx/cmd/README.md) | the programs and their tests |
-| [obx/tests/README.md](obx/tests/README.md) | the test suites and the gate |
+| [PERFORMANCE.md](PERFORMANCE.md) | the measured numbers and how they were taken |
+| [design/native-vs-c.md](obx/design/native-vs-c.md) | native against the C backend |
+| [HISTORY.md](HISTORY.md) | how the project got here |
+
+The repository map, design notes, plans and test suites are in
+[obx/README.md](obx/README.md).
 
 ## Where it came from
 
