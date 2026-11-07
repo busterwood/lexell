@@ -267,10 +267,81 @@ microbenchmarks.
    header loads from `tokens`' identifier byte (-1.37% instructions, about
    -1.5% cycles) but displaced the append value, so the buffer pointer then
    reloaded once a byte. Preferring the invariants by 1.5-2x cost `maps` and
-   `regex`; the remaining load needs live-range splitting for the value that
-   borrows the register in one statement.
+   `regex`; the remaining load needed live-range splitting. **The splitter
+   was then built and measured (2026-11-07, `regalloc`, 65 lines in
+   `x64gen`), and it does not reach the gate; see the note after this list.**
+   The load a borrowed value saves is not an instruction: `&b->f_bytes` is a
+   `lea` when `b` is resident and a `mov` from its slot when it is spilled,
+   the same count, and every hot loop that would pay has six loop-carried
+   values for the five callee-saved registers.
 7. **Vectorisation last** (rank 8), or express it in the language; it is a
    3.4x win on one benchmark and a pass of its own.
+
+**Live-range splitting, measured and reverted (`regalloc`, 2026-11-07,
+from `db0f5971`).** A prototype in `x64gen` (about 65 lines) gave the hoisted
+`str` header pair full weight, made a branch or loop body a site of its own,
+and added `borrowReg`: a local that got no register borrows one from a local
+already given it. It finds the smallest site whose statement covers the
+borrower's whole range, stores each owner that meets it before the site and
+loads it after (uses inside read the owner's slot), and pays for that with
+the borrower's weight (`2 * site weight + the owner's use weights inside`).
+This is the "a short-lived value uses the register for one statement while
+the long-lived owner is saved around it" split, in the existing site
+machinery; no mid IR.
+
+Measured native `-O`, core 0, interleaved, best of five (`perf stat -x, -e
+instructions:u,cycles:u`):
+
+| program | base Minstr | split Minstr | d | base Mcyc | split Mcyc | d |
+|---|---:|---:|---:|---:|---:|---:|
+| fib | 3642.8 | 3642.8 | 0.00% | 1523.7 | 1523.8 | +0.00% |
+| loop | 7000.0 | 7000.0 | 0.00% | 1002.8 | 1003.3 | +0.05% |
+| array | 2413.0 | 2413.0 | 0.00% | 410.2 | 409.3 | -0.21% |
+| alloc | 1280.0 | 1280.0 | 0.00% | 281.3 | 281.2 | -0.05% |
+| lists | 453.3 | 453.3 | 0.00% | 132.2 | 131.8 | -0.34% |
+| strings | 931.3 | 931.3 | 0.00% | 192.7 | 192.5 | -0.11% |
+| trees | 254.1 | 254.1 | 0.00% | 70.1 | 69.3 | -1.12% |
+| tokens | 126.1 | 124.7 | **-1.08%** | 47.04 | 46.18 | **-1.82%** |
+| sieve | 1414.4 | 1414.4 | 0.00% | 536.6 | 532.1 | -0.84% |
+| maps | 2101.4 | 2105.6 | +0.20% | 684.5 | 684.1 | -0.07% |
+| regex (`\w+`) | 487.2 | 487.2 | 0.00% | 127.7 | 127.7 | +0.02% |
+| decimal add (M2:19) | 2112.5 | 2112.5 | 0.00% | 475.5 | 477.6 | +0.45% |
+| decimal mul (M3:19) | 2183.8 | 2183.8 | 0.00% | 493.0 | 494.8 | +0.37% |
+| grep (`-cE a.*z.*e`) | 13.26 | 13.16 | -0.74% | 4.30 | 4.24 | -1.43% |
+| self-build (`--emit-c`) | 3039.6 | 3039.6 | 0.00% | 1301.2 | 1311.8 | +0.82% |
+
+The gate (>=3% cycles on two of `tokens`, `array`, `maps`, `regex`,
+self-build, `decimal`, no program >1% worse on instructions) is missed:
+only `tokens` moves and by 1.82%. The identifier loop keeps both values the
+`loop-regs` experiment could not: `sd`/`sl` in `r14`/`r12` and the buffer
+pointer `b` in `r13` (borrowed from `c`, parked over the identifier branch at
+one store and one load per identifier token, not per byte). The measure is
+almost exactly the `loop-regs` result: four frame loads a byte become zero,
+but the saved access is not an instruction. `b`'s use is `&b->f_bytes`: a
+spilled `b` emits `mov -0x68(%rbp),%rax`, a resident `b` emits
+`lea 0x0(%r13),%rax`; both are one instruction. The prototype then pays two
+extra memory ops per identifier token to park `c`, so it is *worse* than the
+full-weight change alone (124.4M instructions) and still nowhere near 3%.
+`maps`' probe loop keeps `mov -0x40(%rbp),%edi` once per occupied probe and
+regex `Dfa_backward` keeps `cmp -0x68`, `mov -0x70`, `cmp -0x58` a byte:
+both have six loop-carried values for five callee-saved registers, every
+owner is used inside the loop, so parking one costs at least the one load
+the borrower saves. Those values are live across calls, so a caller-saved
+split saves and reloads around every call (two memory ops) for one load.
+
+The prototype also miscompiled 8 of the 613 `--lib` native tests (markdown
+smart quotes and the pgwire/postgres live programs), and the compiler built
+with it crashed compiling the compiler natively; the mechanism is not sound
+as written, and the cases were not reduced further once the numbers had
+missed. (The `-O`/default compile ratio was +16.1% instructions / +15.3%
+cycles, inside the 30% budget, but the default `--native` self-build crash
+makes that number moot.) What remains is not a cheaper cost model but
+per-range *liveness and location*: a value kept in a register only where it is live,
+with the split points chosen from def/use positions and control flow (and a
+load or store only at the boundary that needs one), plus a way to use a
+caller-saved register for the parts of a range not crossing a call. That is
+the 900-1,400-line allocator of rank 4, and two prototypes (M1 and this one)
+now say its return is below the cost.
 
 Checks (rank 7) stay shelved: the measured upper bound is 3.9% of
 instructions and no cycles.
