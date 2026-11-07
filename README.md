@@ -18,14 +18,14 @@ interfaces as generic constraints, growable arrays and slices, string
 slicing and views, closures and function values, `Option` and `Result` with
 `try`, `match` expressions, and destructors.
 
-Concurrency is cooperative tasks on one OS thread: stackful coroutines over
-an epoll loop, with handlers written in ordinary blocking style — no
-`async`/`await`, no function colouring. The language has no threads: nothing
-to lock, no data races, and no cross-core coordination to get wrong. More
-cores means shared-nothing worker processes, the nginx model: each worker
-keeps its own state, and the database is the only thing they share. One
-thread serves 60,763 HTTP requests a second; eight workers reach about
-124,000.
+**Concurrency without the concurrency bugs.** Handlers are plain blocking
+code — no `async`/`await`, no function colouring — running as many tasks on
+one OS thread over an epoll loop. If there are no threads, there is no
+threading bug to write: nothing to lock, no data races, nothing to coordinate
+between cores. More cores means shared-nothing worker processes, the nginx
+model: each worker owns its state, and the database is the only thing they
+share. One thread serves 60,763 HTTP requests a second; eight workers reach
+about 124,000.
 
 The compiler is 39,436 lines of obx, a 2.9 MB static binary with no LLVM
 behind it, rebuilding itself in 0.66 s. It writes x86-64 ELF directly.
