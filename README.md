@@ -4,10 +4,21 @@
 16 KB native binary in 12 ms, and produces code as fast as Rust — and often
 faster than C.**
 
-obx is a small systems language with Rust-style ownership, generics and no
-garbage collector. The compiler is the interesting part: 39,436 lines of obx,
-no LLVM, no optimiser framework, writing x86-64 ELF directly. It is one
-static binary, and it rebuilds itself from source in 0.66 s.
+obx is a small language in the Oberon line. It adds generics from the start
+and needs no garbage collector: each value has one owner, and borrows use
+group borrowing —
+[simpler memory management than Rust](https://verdagon.dev/blog/valen-group-borrowing),
+with no lifetime annotations. Strings are reference counted, and generic code
+is checked where it is written and compiled per instance.
+
+Concurrency is cooperative tasks on one OS thread: stackful coroutines over
+an epoll loop, with handlers written in ordinary blocking style — no
+`async`/`await`, no function colouring. More cores means shared-nothing
+worker processes, the nginx model. One thread serves 60,763 HTTP requests a
+second; eight workers reach about 124,000.
+
+The compiler is 39,436 lines of obx, a 2.9 MB static binary with no LLVM
+behind it, rebuilding itself in 0.66 s. It writes x86-64 ELF directly.
 
 - **The code is fast.** Level with or ahead of idiomatic Rust on eight of
   nine microbenchmarks; Rust is ahead only on `tokens` (21%). Against the
@@ -26,6 +37,20 @@ static binary, and it rebuilds itself from source in 0.66 s.
 It targets Linux on x86-64. The numbers, method and caveats are in
 [PERFORMANCE.md](PERFORMANCE.md).
 
+## A taste of obx
+
+```
+fn main() {
+    let price = 19.99m
+    let total = price * 3.0m
+    println("total: " + total.toStr())
+    let rate = 0.5f
+    println("rate: " + rate.toStr())
+}
+```
+
+It prints `total: 59.970` and `rate: 0.5`.
+
 ## Quick start
 
 Run these from the repository root. The first build uses the checked-in C
@@ -43,20 +68,6 @@ differential checks:
 ```
 obx/compiler/out/obxc prog.obx --c -o prog       # the same program through C
 ```
-
-A small program:
-
-```
-fn main() {
-    let price = 19.99m
-    let total = price * 3.0m
-    println("total: " + total.toStr())
-    let rate = 0.5f
-    println("rate: " + rate.toStr())
-}
-```
-
-It prints `total: 59.970` and `rate: 0.5`.
 
 Language and platform notes:
 
