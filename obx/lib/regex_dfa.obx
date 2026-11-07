@@ -182,9 +182,10 @@ pub type Dfa = record {
     cls: Classes
     longest: bool
     ninst: int
+    idxof: []int           // the start-state context index of each byte before/at the position
 }
 
-pub fn noDfa(): Dfa { return Dfa{ok: false, cls: emptyClasses(), longest: false, ninst: 0} }
+pub fn noDfa(): Dfa { return Dfa{ok: false, cls: emptyClasses(), longest: false, ninst: 0, idxof: []} }
 
 // The most instructions a program may have for a DFA.
 const MAX_DFA_INST = 20000
@@ -193,7 +194,16 @@ pub fn newDfa(p: &syn.Prog, longest: bool): Dfa {
     if len(p.inst) > MAX_DFA_INST { return noDfa() }
     let cls = buildClasses(p)
     if cls.n == 0 { return noDfa() }
-    return Dfa{ok: true, cls: cls, longest: longest, ninst: len(p.inst)}
+    // The start state's context left of a position depends on one byte: a
+    // newline before it, and whether that byte is a word byte (the same
+    // test syn.isWordChar makes; the class of an ASCII byte agrees).
+    var idxof = array(256, 0)
+    for b in 0..256 {
+        var idx = if b == 10 { 2 } else { 0 }
+        if syn.isWordChar(b) { idx = idx | 4 }
+        idxof[b] = idx
+    }
+    return Dfa{ok: true, cls: cls, longest: longest, ninst: len(p.inst), idxof: idxof}
 }
 
 // The number of rune classes (for tests).
@@ -653,34 +663,28 @@ fn (c: mut &Cache) next(d: &Dfa, p: &syn.Prog, s: int, k: int): int {
 
 // The start state for a search at pos (rev: a scan backward from pos):
 // its transition value, T_DEAD or T_FAILED.
-fn (c: mut &Cache) start(d: &Dfa, p: &syn.Prog, text: str, pos: int, anchored: bool, rev: bool): int {
-    var empty = 0
-    var lw = false
+fn (c: mut &Cache) start(d: &Dfa, p: &syn.Prog, text: &str, pos: int, anchored: bool, rev: bool): int {
+    var idx = 0
     if rev {
         if pos >= len(text) {
-            empty = syn.EMPTY_BEGIN_TEXT | syn.EMPTY_BEGIN_LINE
+            idx = 3
         } else {
-            let b = int(text[pos])
-            if b == 10 { empty = syn.EMPTY_BEGIN_LINE }
-            lw = syn.isWordChar(b)
+            idx = d.idxof[int(text[pos])]
         }
     } else {
         if pos == 0 {
-            empty = syn.EMPTY_BEGIN_TEXT | syn.EMPTY_BEGIN_LINE
+            idx = 3
         } else {
-            let b = int(text[pos - 1])
-            if b == 10 { empty = syn.EMPTY_BEGIN_LINE }
-            lw = syn.isWordChar(b)
+            idx = d.idxof[int(text[pos - 1])]
         }
     }
-    var idx = 0
-    if empty & syn.EMPTY_BEGIN_TEXT != 0 { idx = idx | 1 }
-    if empty & syn.EMPTY_BEGIN_LINE != 0 { idx = idx | 2 }
-    if lw { idx = idx | 4 }
     if !anchored { idx = idx | 8 }
     if c.starts[idx] >= 0 { return c.starts[idx] }
+    var empty = 0
+    if idx & 1 != 0 { empty = empty | syn.EMPTY_BEGIN_TEXT }
+    if idx & 2 != 0 { empty = empty | syn.EMPTY_BEGIN_LINE }
     var flag = empty << EMPTY_SHIFT
-    if lw { flag = flag | F_LASTWORD }
+    if idx & 4 != 0 { flag = flag | F_LASTWORD }
     if !anchored { flag = flag | F_U | F_START }
     c.qclear()
     c.add(p, p.start, empty)
@@ -700,9 +704,18 @@ fn (c: mut &Cache) start(d: &Dfa, p: &syn.Prog, text: str, pos: int, anchored: b
 // anchored: the match must start at pos. earliest: stop at the first match
 // end seen (only whether there is a match counts). The prefilter pf, if
 // any, skips text where no match starts.
-pub fn (d: &Dfa) forward(c: mut &Cache, p: &syn.Prog, text: str, pos: int, anchored: bool, earliest: bool, pf: &Prefilter): int {
-    let n = len(text)
-    var t = c.start(d, p, text, pos, anchored, false)
+pub fn (d: &Dfa) forward(c: mut &Cache, p: &syn.Prog, text: &str, pos: int, anchored: bool, earliest: bool, pf: &Prefilter): int {
+    // The start state for this context, from the cache when it is there
+    // (the call would rebuild the same index; this is the hot path).
+    var t = -1
+    if pos == 0 {
+        t = c.starts[if anchored { 11 } else { 3 }]
+    } else {
+        var idx = d.idxof[int(text[pos - 1])]
+        if !anchored { idx = idx | 8 }
+        t = c.starts[idx]
+    }
+    if t < 0 { t = c.start(d, p, text, pos, anchored, false) }
     if t == T_FAILED { return -2 }
     if t == T_DEAD { return -1 }
     var at = pos
@@ -720,6 +733,45 @@ pub fn (d: &Dfa) forward(c: mut &Cache, p: &syn.Prog, text: str, pos: int, ancho
     var s = t & T_MASK
     var last = -1
     let eot = d.cls.n
+    // at is a position (never negative); the clamp states it for the pass,
+    // which then proves the text[at] check of the ASCII loop.
+    if at < 0 { at = 0 }
+    // Right before the loop: the pass reuses a local length to prove the
+    // text[at] check cannot fail (a call in between would hide it).
+    let n = len(text)
+    // The ASCII bytes are the overwhelming majority, and a step of one lets
+    // the compiler prove the text[at] check (a variable rune width does
+    // not): run them here. Non-ASCII bytes, unknown transitions and the
+    // dead state continue in the general loop below.
+    if !usePf {
+        // Its own length local: the pass reuses it for the text[at] check
+        // (one declared outside the if is not in the loop's block).
+        let n2 = len(text)
+        while at < n2 {
+            let b = int(text[at])
+            if b >= 128 { break }
+            let t2 = c.trans[s + d.cls.ascii[b]]
+            if t2 < T_MATCH {
+                s = t2
+                at += 1
+                continue
+            }
+            if t2 < T_DEAD {
+                s = t2 & T_MASK
+                if t2 & T_MATCH != 0 {
+                    last = at
+                    if earliest { return at }
+                }
+                at += 1
+                continue
+            }
+            if t2 == T_DEAD {
+                c.reach = at + 1
+                return last
+            }
+            break
+        }
+    }
     while at < n {
         let b = int(text[at])
         var k = 0
@@ -737,6 +789,28 @@ pub fn (d: &Dfa) forward(c: mut &Cache, p: &syn.Prog, text: str, pos: int, ancho
             at += w
             continue
         }
+        // A match tag (with a start tag perhaps) is the common case inside a
+        // match: one compare below, not the two for the rare tags.
+        if t2 < T_DEAD {
+            s = t2 & T_MASK
+            if t2 & T_MATCH != 0 {
+                last = at
+                if earliest { return at }
+            }
+            at += w
+            if usePf && t2 & T_START != 0 {
+                let cand = c.prefilter(pf, text, at)
+                if cand < 0 { return last }
+                if cand > at {
+                    at = cand
+                    let t3 = c.start(d, p, text, at, false, false)
+                    if t3 == T_FAILED { return -2 }
+                    if t3 == T_DEAD { return last }
+                    s = t3 & T_MASK
+                }
+            }
+            continue
+        }
         if t2 == T_UNKNOWN {
             c.pos = at
             t2 = c.next(d, p, s, k)
@@ -752,7 +826,7 @@ pub fn (d: &Dfa) forward(c: mut &Cache, p: &syn.Prog, text: str, pos: int, ancho
             if earliest { return at }
         }
         at += w
-        if t2 & T_START != 0 && usePf {
+        if usePf && t2 & T_START != 0 {
             let cand = c.prefilter(pf, text, at)
             if cand < 0 { return last }
             if cand > at {
@@ -782,7 +856,7 @@ pub fn (d: &Dfa) forward(c: mut &Cache, p: &syn.Prog, text: str, pos: int, ancho
 // line is taken and the run starts again after it. Returns where the search
 // stopped (to, or the start of the line after the max-th), -2 if the cache
 // gave up (the lines in out so far are right).
-pub fn (d: &Dfa) forwardLines(c: mut &Cache, p: &syn.Prog, text: str, from: int, to: int, pf: &Prefilter, max: int, out: mut &[]int): int {
+pub fn (d: &Dfa) forwardLines(c: mut &Cache, p: &syn.Prog, text: &str, from: int, to: int, pf: &Prefilter, max: int, out: mut &[]int): int {
     var at = from
     var found = 0
     // The start state after a newline, kept until the cache is cleared.
@@ -888,13 +962,39 @@ pub fn (d: &Dfa) forwardLines(c: mut &Cache, p: &syn.Prog, text: str, from: int,
 // Searches backward from e, not before lo, for the start of the longest
 // match that ends at e, with the DFA of the reversed program (longest
 // kind): the start, -1 if there is none, -2 if the cache gave up.
-pub fn (d: &Dfa) backward(c: mut &Cache, p: &syn.Prog, text: str, lo: int, e: int): int {
-    var t = c.start(d, p, text, e, true, true)
+pub fn (d: &Dfa) backward(c: mut &Cache, p: &syn.Prog, text: &str, lo: int, e: int): int {
+    // The start state for this context, from the cache when it is there.
+    var t = -1
+    if e >= len(text) {
+        t = c.starts[3]
+    } else {
+        t = c.starts[d.idxof[int(text[e])]]
+    }
+    if t < 0 { t = c.start(d, p, text, e, true, true) }
     if t == T_FAILED { return -2 }
     if t == T_DEAD { return -1 }
     var s = t & T_MASK
     var at = e
     var last = -1
+    // The ASCII bytes in a step of one (see forward).
+    while at > lo {
+        let b = int(text[at - 1])
+        if b >= 128 { break }
+        let t2 = c.trans[s + d.cls.ascii[b]]
+        if t2 < T_MATCH {
+            s = t2
+            at -= 1
+            continue
+        }
+        if t2 < T_DEAD {
+            if t2 & T_MATCH != 0 { last = at }
+            s = t2 & T_MASK
+            at -= 1
+            continue
+        }
+        if t2 == T_DEAD { return last }
+        break
+    }
     while at > lo {
         let b = int(text[at - 1])
         var k = 0
@@ -909,6 +1009,13 @@ pub fn (d: &Dfa) backward(c: mut &Cache, p: &syn.Prog, text: str, lo: int, e: in
         var t2 = c.trans[s + k]
         if t2 < T_MATCH {
             s = t2
+            at -= w
+            continue
+        }
+        // A match tag is the common case: one compare below, not two.
+        if t2 < T_DEAD {
+            if t2 & T_MATCH != 0 { last = at }
+            s = t2 & T_MASK
             at -= w
             continue
         }
@@ -973,7 +1080,7 @@ pub fn noPrefilter(): Prefilter {
 }
 
 // The first candidate at or after from, or -1.
-pub fn (f: &Prefilter) find(text: str, from: int): int {
+pub fn (f: &Prefilter) find(text: &str, from: int): int {
     if f.kind == PF_STR { return strFind(text, from, f.lit) }
     if f.kind == PF_PAIR { return strFindPair(text, from, f.off1, f.set1, f.off2, f.set2) }
     if f.kind == PF_SET {
@@ -998,7 +1105,7 @@ pub fn linePrefilter(): Prefilter {
 
 // The prefilter's next candidate at or after at, remembered; switched off
 // (at is returned) once it skips too little to pay for itself.
-fn (c: mut &Cache) prefilter(f: &Prefilter, text: str, at: int): int {
+fn (c: mut &Cache) prefilter(f: &Prefilter, text: &str, at: int): int {
     if c.pfOff { return at }
     if c.pfFrom >= 0 && c.pfFrom <= at && (c.pfCand < 0 || at <= c.pfCand) { return c.pfCand }
     let cand = f.find(text, at)
