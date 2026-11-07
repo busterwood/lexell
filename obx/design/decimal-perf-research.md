@@ -420,3 +420,52 @@ Seen on the way, outside this work: main's switch to gcc -march=x86-64-v3 (64194
 build of Decimal code slower, with the same instructions: against faf112b, M2:6 1.36, M6:6 1.37,
 M4:0 1.13, M2:19 1.10 in cycles; M5:big and M9:40 1.49 (also 1.4 times the instructions, in
 libgcc's division). The native build did not move.
+
+## 9. The record copies and the remaining gap (2026-11-07, branch `decimal-abi`)
+
+Written after the `nativedec` merge (7474e63d), which brought native Decimal to 1.1 to 1.4 times
+C's cycles. The question was whether the 32-byte record passed by value is the rest of the gap.
+
+The copies were counted in the `-O` IR and the disassembly. An add call from `dbench` has four:
+`xs[i]` into the receiver temporary (the front end's `consume` copy), that temporary into the
+outgoing argument area, `ys[i]` into it, and the 40-byte `Result` from `addExact` into `errSum`.
+They are SysV by-value copies, and gcc removes most of them by inlining; the native inliner only
+takes scalar parameters and results, so it cannot remove them. A source-level `&Decimal` version
+cannot be used without changing the public API. The returned record itself is already forwarded:
+`makeDec` writes straight into the caller's hidden result pointer. Adding an IR pass that rewrites
+`T r = x; return r` to `return x` (to expose a call to `retInPlace`) produced byte-identical
+native code - x64gen's simplification pass already does it - so that pass was dropped. Passing
+internal records by reference would remove the copies but needs callee-side indirect parameter
+slots and a proof that the parameter is not written; it was not attempted. Remaining.
+
+Two changes were measured and kept:
+
+1. `mul128` returns early when `(a | b) >> 64` is 0 (both coefficients below 2^64): the low
+   64x64 product is the whole product and the three cross products are zero. `mulExact` and
+   `rem` use it. Best of 3, instructions, old/new: M3:6 0.808, M3:19 0.811, M9:1 0.862,
+   M9:10 0.754; M3:big (20-digit factors) 1.011 for the extra test. Cycles agree.
+2. The native backend compares a 128-bit value where it already is: against a constant, a
+   register pair or memory, without the two moves to rax:rdx (sbb writes its destination, so the
+   high word goes through r10). `digits`' compare tree is the main user. Instructions old/new:
+   M1:10/19/38 0.932/0.933/0.936, M10 0.940, M2:6/19 0.955/0.959, M3:6/19 0.977/0.978.
+   Quantize's 1% instruction gain is inside the run-to-run cycle noise of this machine and its
+   cycle ratio moved by 2 to 6% between runs and alignments; every other case agreed.
+   Reseeded; `-O` compile cost +15.8% instructions, +20.4% cycles (budget 30%).
+
+Rejected, measured: keeping a parameter in the registers it arrives in (rdi:rsi, with no
+prologue move, for a function with no calls - `digits` frees rbx and r12 and starts with its
+value in place) gave fewer instructions (M1:1 0.915, M2:6/19 0.965/0.965, M6:6 0.972,
+M10:0.951) but more cycles on the add and compare cases (M2:19 1.051, M10:same 1.016, again on
+9 runs), so it was dropped; the caller-saved registers seem to cost more in the hot callers
+than the two saved registers and moves they replace. The remainder in `quantize` as
+`a.coef - q * p` instead of a second `/`
+(the backend already turns a 128-bit division by a 64-bit divisor into one `div`, so the
+multiply and its test cost more: M6:6 1.05); forcing the strip loop's product to a widening
+multiply with `& M64` (the value may be above 2^64, and even below it the two `and`s cost more
+than the three extra imuls: M4:5 1.017); the same mask in `parse`'s coefficient update (wrong
+for 38 digits, and slower for 20: M7:20 1.007).
+
+What remains, in order of measured cost on `dbench -O`: the parse digit loop and `ParseAcc.take`
+(1.33 instructions against C), quantize's two divisions and `makeDec` (1.47), the compare path
+in `cmp`/`digits` (1.27), and the by-value record copies above (about four copies per add,
+roughly 5% of its instructions and more of its store-forwarding stalls).
