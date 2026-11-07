@@ -356,11 +356,18 @@ The library's own design and numbers are in
 
 | document | cmark | obx native | obx via C |
 |---|---:|---:|---:|
-| the spec, repeated to 10 MB | 0.18 | 0.21 | 0.18 |
-| the repo's Markdown files, repeated to 10 MB | 0.22 | 0.23 | 0.20 |
-| the spec's examples, repeated to 10 MB | 0.62 | 0.78 | 0.72 |
+| the spec, repeated to 10 MB | 0.18 | 0.17 | 0.16 |
+| the repo's Markdown files, repeated to 10 MB | 0.22 | 0.21 | 0.21 |
+| the spec's examples, repeated to 10 MB | 0.62 | 0.68 | 0.59 |
 
-The obx renderer takes 0.9 to 1.25 times cmark's time. cmark's pathological
+The obx columns are after the 2026-11-07 scan change (line endings and inline
+text runs found in runs, not byte by byte): on the spec the native build is
+1343.0M instructions / 487.3M cycles against the C build's 1055.7M / 459.4M,
+so native is 1.27 instructions and 1.06 cycles of its own C build, with the
+parse at 1.38 and the render at 1.06. The cmark column is the reference build
+from the earlier run.
+
+The obx renderer takes 0.9 to 1.1 times cmark's time. cmark's pathological
 inputs (nested emphasis, brackets and block quotes 30,000 to 100,000 deep, a
 million backticks, unclosed constructs) all finish in well under a second,
 within a small factor of cmark; the one quadratic case (a run of blank lines
@@ -513,17 +520,20 @@ the regex and Decimal changes (`OBX_HASH_SEED=42`, core 0, 51 s):
 
 | application | native | C | native/C (wall) | instructions native/C | cycles native/C |
 |---|---:|---:|---:|---:|---:|
-| regex (8 patterns, 3 MB) | 46 ms | 43 ms | 1.05 | 1.05 | 1.13 |
-| json (20 MB, parse/query/visit) | 514 ms | 526 ms | 0.98 | 1.14 | 0.97 |
-| jq (`-c .`, 20 MB) | 394 ms | 411 ms | 0.96 | 1.13 | 0.92 |
-| cmark (10 MB) | 170 ms | 163 ms | 1.04 | 1.27 | 1.09 |
-| decimal (all cases) | 2,891 ms | 2,646 ms | 1.09 | 1.23 | 1.10 |
+| regex (8 patterns, 3 MB) | 45 ms | 43 ms | 1.05 | 1.05 | 1.13 |
+| json (20 MB, parse/query/visit) | 516 ms | 507 ms | 1.02 | 1.14 | 1.02 |
+| jq (`-c .`, 20 MB) | 401 ms | 416 ms | 0.96 | 1.13 | 0.96 |
+| cmark (10 MB) | 168 ms | 161 ms | 1.04 | 1.27 | 1.07 |
+| decimal (all cases) | 2,935 ms | 2,688 ms | 1.09 | 1.23 | 1.09 |
 
-The first baseline, before the regex per-match work and the Decimal changes,
-was regex 1.36 / json 0.98 / jq 0.93 / cmark 1.14 / decimal 1.12 in wall time,
-with instructions 1.27 / 1.15 / 1.13 / 1.27 / 1.28 against C. Regex and
-Decimal are the two rows that have moved; JSON's instruction count is 1.14 of
-C's but its time is level, and cmark's remaining 1.27 is its parsing loop.
+The first baseline, before the regex per-match work, the Markdown scan change
+and the Decimal changes, was regex 1.36 / json 0.98 / jq 0.93 / cmark 1.14 /
+decimal 1.12 in wall time, with instructions 1.27 / 1.15 / 1.13 / 1.27 / 1.28
+against C. Regex and Decimal are the rows that moved; cmark's cycles went
+1.09 to 1.07 while its wall ratio stayed 1.04, because the library change
+speeds both builds. JSON's instruction count is 1.14 of C's but its time is
+level. Wall and cycle ratios move by several percent between runs; the
+instruction ratios are the stable ones.
 
 The benchmark harnesses set `OBX_HASH_SEED` (42 by default, `--hash-seed` or
 `--random-hash` to change it), so the map layout is identical across runs and
