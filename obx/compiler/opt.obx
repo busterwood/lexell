@@ -107,6 +107,7 @@ pub fn optimize(p: ir.Ir): ir.Ir {
     }
     o.dropDead()
     o.fwdReceivers()
+    o.fwdBorrows()
     return replace(mut &o.u, ir.newIr())
 }
 
@@ -217,6 +218,192 @@ fn (o: mut &Opt) fwdReceivers() {
         o.fwdStmtSafe(o.u.funcs[f].body, mut &uses)
         for l in touched { uses[l] = 0 }
     }
+}
+
+// ---------------------------------------------------------------- payload borrows
+//
+// A record local declared as a copy of a place and then used only as a call's address
+// (`T d = p.f; f(..., &d)`) stands for the place itself: the call reads the place instead of
+// a snapshot of it. This is the copy a match makes of the payload an arm binds by value
+// (`Ok(d) { return sumOf(acc, &d) }`).
+//
+// Sound when the place is pure, every statement between the declaration and the call is a
+// declaration with a pure initializer (so nothing writes the place between them), the local
+// is named nowhere else (so no later statement reads it), the call's other arguments are
+// pure, and the callee writes no memory and lets its pointer argument escape nowhere
+// (pureBody). Then the callee cannot tell the place from the copy, and nothing can change
+// the place before it reads it. As with receiver temporaries, a bounds check in the place
+// may run one statement later; a program that does not trap is unaffected.
+
+fn (o: mut &Opt) fwdBorrows() {
+    for f in 0..len(o.u.funcs) {
+        let b = o.u.funcs[f].body
+        if b >= 0 { o.borrowWalk(b, b) }
+    }
+}
+
+fn (o: mut &Opt) borrowWalk(s: int, body: int) {
+    if s < 0 { return }
+    let k = o.u.nk(s)
+    if k == ir.S_BLOCK {
+        let l = o.u.nodes[s].a
+        let n = o.u.items[l]
+        for j in 0..n {
+            let d = o.u.items[l + 1 + j]
+            if o.u.nk(d) == ir.S_DECL { o.borrowTry(d, l, j, n, body) }
+        }
+        for j in 0..o.u.items[l] { o.borrowWalk(o.u.items[l + 1 + j], body) }
+        return
+    }
+    if k == ir.S_IF {
+        o.borrowWalk(o.u.nodes[s].b, body)
+        o.borrowWalk(o.u.nodes[s].c, body)
+    } else if k == ir.S_WHILE || k == ir.S_SWITCH {
+        o.borrowWalk(o.u.nodes[s].b, body)
+    } else if k == ir.S_FOR {
+        o.borrowWalk(o.u.nodes[s].a, body)
+        o.borrowWalk(o.u.nodes[s].d, body)
+    }
+}
+
+// The call a statement's expression is (or assigns, declares or returns), or -1.
+fn (o: &Opt) stmtCall(s: int): int {
+    let k = o.u.nk(s)
+    if k == ir.S_EXPR {
+        let e = o.u.nodes[s].a
+        if o.u.nk(e) == ir.E_CALL { return e }
+        if o.u.nk(e) == ir.E_ASSIGN && o.u.nk(o.u.nodes[e].b) == ir.E_CALL { return o.u.nodes[e].b }
+    } else if k == ir.S_DECL {
+        if o.u.nodes[s].b >= 0 && o.u.nk(o.u.nodes[s].b) == ir.E_CALL { return o.u.nodes[s].b }
+    } else if k == ir.S_RETURN {
+        if o.u.nodes[s].a >= 0 && o.u.nk(o.u.nodes[s].a) == ir.E_CALL { return o.u.nodes[s].a }
+    }
+    return -1
+}
+
+// Finds the only use of local d in x as `&d` (into hit), or marks bad when d is named any
+// other way or more than once.
+fn (o: &Opt) scanBorrow(x: int, d: int, hit: mut &int, bad: mut &bool) {
+    if x < 0 || bad { return }
+    let k = o.u.nk(x)
+    if k == ir.E_LOCAL {
+        if o.u.nodes[x].a == d { bad = true }
+        return
+    }
+    if k == ir.E_ADDR {
+        let a = o.u.nodes[x].a
+        if o.u.nk(a) == ir.E_LOCAL && o.u.nodes[a].a == d {
+            if hit >= 0 { bad = true } else { hit = x }
+            return
+        }
+    }
+    let kc = ir.KIDS[k]
+    if kc == ir.K_NONE { return }
+    if kc != ir.K_BLOCK && kc != ir.K_CLIT && kc != ir.K_DECL { o.scanBorrow(o.u.nodes[x].a, d, hit, bad) }
+    if kc == ir.K_AB || kc == ir.K_ABC || kc == ir.K_FOR || kc == ir.K_DECL {
+        o.scanBorrow(o.u.nodes[x].b, d, hit, bad)
+    }
+    if kc == ir.K_ABC || kc == ir.K_FOR { o.scanBorrow(o.u.nodes[x].c, d, hit, bad) }
+    if kc == ir.K_FOR { o.scanBorrow(o.u.nodes[x].d, d, hit, bad) }
+    let l = if kc == ir.K_CALL || kc == ir.K_CLIT { o.u.nodes[x].b } else if kc == ir.K_BLOCK { o.u.nodes[x].a } else if kc == ir.K_DECL { o.u.nodes[x].c } else { -1 }
+    if l >= 0 { for j in 0..o.u.items[l] { o.scanBorrow(o.u.items[l + 1 + j], d, hit, bad) } }
+}
+
+// The runtime functions that read their arguments and write no memory (as cse's pureName).
+fn (o: &Opt) pureRt(name: str): bool {
+    if name == "rt_idx" || name == "rt_str_byte" || name == "rt_str_eq" || name == "rt_str_cmp" { return true }
+    if len(name) < 8 { return false }
+    if startsWith(name, "rt_cvs_") || startsWith(name, "rt_cvu_") { return true }
+    let o4 = name[3..7]
+    let o5 = name[3..8]
+    return o4 == "add_" || o4 == "sub_" || o4 == "mul_" || o4 == "div_" || o4 == "rem_" || o4 == "neg_" ||
+        o4 == "shl_" || o4 == "shr_" || o5 == "wadd_" || o5 == "wsub_" || o5 == "wmul_"
+}
+
+// Whether the body x writes no memory, calls only the runtime's reading functions, takes no
+// address that could escape (but a function's, a literal's or a global's), and names the
+// pointer parameter p only where it is read through (`*p`, a member of it). read: x is read
+// (the operand of a dereference or a member chain), so naming p there is the read itself.
+fn (o: &Opt) pureBody(x: int, p: int): bool { return o.pureAt(x, p, false) }
+
+fn (o: &Opt) pureAt(x: int, p: int, read: bool): bool {
+    if x < 0 { return true }
+    let k = o.u.nk(x)
+    let kc = ir.KIDS[k]
+    if kc < 0 { return false }
+    let a = o.u.nodes[x].a
+    if k == ir.E_LOCAL { return a != p || read }
+    if k == ir.E_ADDR || k == ir.E_DECAY {
+        let ak = o.u.nk(a)
+        return ak == ir.E_FUNC || ak == ir.E_STR || ak == ir.E_GLOBAL
+    }
+    if k == ir.E_ASSIGN || k == ir.E_POSTINC {
+        let r = o.root(a)
+        if r < 0 || r == p { return false }
+        return o.pureAt(a, p, false) && o.pureAt(o.u.nodes[x].b, p, false)
+    }
+    if k == ir.E_MEMBER || k == ir.E_DEREF { return o.pureAt(a, p, true) }
+    if k == ir.E_CALL {
+        let f = o.callee(x)
+        if f < 0 || o.u.funcs[f].body >= 0 || !o.pureRt(o.u.funcs[f].name) { return false }
+        let l = o.u.nodes[x].b
+        for j in 0..o.u.listLen(l) { if !o.pureAt(o.u.listAt(l, j), p, false) { return false } }
+        return true
+    }
+    let b = o.u.nodes[x].b
+    let c = o.u.nodes[x].c
+    if kc == ir.K_A { return o.pureAt(a, p, false) }
+    if kc == ir.K_AB { return o.pureAt(a, p, false) && o.pureAt(b, p, false) }
+    if kc == ir.K_BLOCK || kc == ir.K_CLIT {
+        let l = if kc == ir.K_BLOCK { a } else { b }
+        if l < 0 { return true }
+        for j in 0..o.u.listLen(l) { if !o.pureAt(o.u.listAt(l, j), p, false) { return false } }
+        return true
+    }
+    if kc == ir.K_ABC { return o.pureAt(a, p, false) && o.pureAt(b, p, false) && o.pureAt(c, p, false) }
+    if kc == ir.K_DECL {
+        if !o.pureAt(b, p, false) { return false }
+        if c >= 0 {
+            for j in 0..o.u.listLen(c) { if !o.pureAt(o.u.listAt(c, j), p, false) { return false } }
+        }
+        return true
+    }
+    if kc == ir.K_CALL { return false }
+    return o.pureAt(a, p, false) && o.pureAt(b, p, false) && o.pureAt(c, p, false) && o.pureAt(o.u.nodes[x].d, p, false)
+}
+
+// The declaration d (statement j of the list l, of n statements) as a payload borrow, when
+// it is one: the local stands for the place and the declaration goes.
+fn (o: mut &Opt) borrowTry(d: int, l: int, j: int, n: int, body: int) {
+    let t = o.u.nodes[d].a
+    let init = o.u.nodes[d].b
+    if init < 0 || o.u.nodes[d].c >= 0 { return }
+    let ty = o.u.locals[t].ty
+    if o.u.tk(ty) != ir.TY_STRUCT || o.u.structs[o.u.tys[ty].sid].isUnion { return }
+    if o.u.nodes[init].ty != ty || !o.lvalue(init) || !o.pureInit(init) { return }
+    if j + 1 >= n { return }
+    let c = o.stmtCall(o.u.items[l + 1 + j + 1])
+    if c < 0 { return }
+    var hit = -1
+    var bad = false
+    o.scanBorrow(body, t, mut &hit, mut &bad)
+    if bad || hit < 0 { return }
+    let args = o.u.nodes[c].b
+    var ai = -1
+    for i in 0..o.u.listLen(args) {
+        if o.u.listAt(args, i) == hit { ai = i }
+    }
+    if ai < 0 { return }
+    for i in 0..o.u.listLen(args) {
+        if i != ai && !o.pureInit(o.u.listAt(args, i)) { return }
+    }
+    let g = o.callee(c)
+    if g < 0 || o.u.funcs[g].body < 0 || ai >= len(o.u.funcs[g].params) { return }
+    let p = o.u.funcs[g].params[ai]
+    if o.u.nodes[hit].ty != o.u.locals[p].ty || !o.pureBody(o.u.funcs[g].body, p) { return }
+    o.u.nodes[hit].a = init
+    o.u.nodes[d].k = ir.S_EMPTY
+    o.u.nodes[d].b = -1
 }
 
 // ---------------------------------------------------------------- helpers
