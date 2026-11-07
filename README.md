@@ -10,10 +10,10 @@ borrowing —
 [simpler memory management than Rust](https://verdagon.dev/blog/valen-group-borrowing),
 with no lifetime annotations. There is no garbage collector. Strings are
 reference counted, and generic code is checked where it is written and
-compiled per instance. Programs are built from modules: one source file each,
-with explicit imports and `pub` visibility.
+compiled per instance.
 
-The rest is deliberately familiar: records with methods, structural
+The rest is deliberately familiar: modules (one source file each, with
+explicit imports and `pub` visibility), records with methods, structural
 interfaces as generic constraints, growable arrays and slices, string
 slicing and views, closures and function values, `Option` and `Result` with
 `try`, `match` expressions, and destructors.
