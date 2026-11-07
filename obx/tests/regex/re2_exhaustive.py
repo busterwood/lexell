@@ -53,7 +53,7 @@ def main():
         shutil.copy(RUNNER, tmp)
         open(os.path.join(tmp, 'main.obx'), 'w').write(MAIN)
         exe = os.path.join(tmp, 'main')
-        r = subprocess.run([a.compiler, os.path.join(tmp, 'main.obx'), '-o', exe] + (['--native'] if a.native else []),
+        r = subprocess.run([a.compiler, os.path.join(tmp, 'main.obx'), '-o', exe] + (['--native'] if a.native else ['--c']),
                            capture_output=True, text=True)
         if r.returncode != 0:
             sys.exit('building the runner failed:\n' + r.stdout + r.stderr)

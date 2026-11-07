@@ -35,7 +35,7 @@ FILTERS = [
 
 
 def build(src, out, native):
-    cmd = [OBXC, src, '-o', out] + (['--native'] if native else [])
+    cmd = [OBXC, src, '-o', out] + (['--native'] if native else ['--c'])
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
         sys.exit('building %s failed: %s' % (src, r.stderr[-800:]))

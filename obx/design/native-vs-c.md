@@ -46,26 +46,26 @@ are the stable figure.
 
 | benchmark | via C | native -O | -O/C | what it does |
 |---|---:|---:|---:|---|
-| fib | 349 ms | 346 ms | 0.99 | recursive calls |
-| loop | 286 ms | 228 ms | 0.80 | two overflow-checked operations per iteration |
-| array | 112 ms | 100 ms | 0.90 | checked indexing |
-| alloc | 132 ms | 66 ms | 0.50 | 20 million records allocated and freed |
-| lists | 40 ms | 33 ms | 0.82 | linked list build, sum, drop |
-| strings | 85 ms | 46 ms | 0.54 | concatenation and `toStr` |
-| trees | 27 ms | 21 ms | 0.78 | binary trees |
-| tokens | 22 ms | 13 ms | 0.61 | byte scanning and hashing |
-| sieve | 203 ms | 141 ms | 0.70 | the sieve of Eratosthenes to 10 million, ten rounds |
-| maps | 254 ms | 243 ms | 0.96 | `Map[str, int]` with short and long keys, `Map[int, int]` (keyed hashing) |
+| fib | 925 ms | 914 ms | 0.99 | recursive calls |
+| loop | 562 ms | 460 ms | 0.82 | two overflow-checked operations per iteration |
+| array | 432 ms | 361 ms | 0.84 | checked indexing |
+| alloc | 502 ms | 247 ms | 0.49 | 80 million records allocated and freed |
+| lists | 249 ms | 205 ms | 0.82 | linked list build, sum, drop |
+| strings | 421 ms | 227 ms | 0.54 | concatenation and `toStr` |
+| trees | 220 ms | 135 ms | 0.61 | binary trees |
+| tokens | 337 ms | 202 ms | 0.60 | byte scanning and hashing |
+| sieve | 507 ms | 337 ms | 0.66 | the sieve of Eratosthenes to 10 million, 30 rounds |
+| maps | 443 ms | 452 ms | 1.02 | `Map[str, int]` with short and long keys, `Map[int, int]` (keyed hashing) |
 
 The plain fast-compile path (`--native`, no `-O`) is slower where the loop
 passes matter: loop 446 ms, array 183 ms, sieve 187 ms; it is 0.50 on alloc
 and 0.54 on strings either way.
 
-Native `-O` over the C backend, cycles (best of 11):
+Native `-O` over the C backend, cycles (best of 5):
 
 | | fib | loop | array | alloc | lists | strings | trees | tokens | sieve | maps |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| `-O`/C | 1.00 | 0.80 | 0.88 | 0.50 | 0.79 | 0.53 | 0.74 | 0.60 | 0.70 | 0.97 |
+| `-O`/C | 1.00 | 0.80 | 0.89 | 0.50 | 0.77 | 0.53 | 0.75 | 0.60 | 0.69 | 1.06 |
 
 ## The optimization level
 
@@ -166,9 +166,6 @@ per byte.
 against 1,830M / 509M, 1.24 times the cycles, in the line-numbering and
 match walk rather than the DFA. The rest are at or within a few percent of
 C.
-
-A 1 GB run (21 cases, earlier sweep) is in PERFORMANCE.md with the GNU and
-ripgrep columns; native and C are within a few percent on every case.
 
 ### jq
 
@@ -414,8 +411,10 @@ latency chain.
 
 ## What it says
 
-- Native is at or ahead on all ten microbenchmarks in wall time (0.50 to
-  0.99 of C) and at or ahead on all ten in `-O` cycles (0.50 to 1.00).
+- Native is ahead on nine of the ten microbenchmarks in wall time (0.49 to
+  0.99 of C) and level on `fib`; `maps` is 1.02, a memory-bound row. In
+  `-O` cycles, nine of ten are at or ahead (0.50 to 1.00) and `maps` is
+  1.06.
 - It is at or ahead on four of the five application rows; regex is 1.10
   wall, and its instructions are level. The remaining regex gap is the byte
   loop, not the per-match work.

@@ -94,7 +94,7 @@ def main():
     try:
         pki(d)
         bins = {}
-        for name, extra in [('native', ['--native']), ('via C', [])]:
+        for name, extra in [('native', ['--native']), ('via C', ['--c'])]:
             b = os.path.join(d, 'tlsbench-' + name.replace(' ', ''))
             subprocess.run([OBXC, os.path.join(HERE, 'tlsbench.obx'), '-o', b] + extra, check=True)
             bins[name] = b

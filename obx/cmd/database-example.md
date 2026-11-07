@@ -17,7 +17,7 @@ queries) and the task runtime (`lib/task.obx`, `lib/net.obx`; see
 From `obx/`, with PostgreSQL listening on its local socket:
 
 ```sh
-compiler/out/obxc cmd/httpd.obx -o httpd          # add --native for the native backend
+compiler/out/obxc cmd/httpd.obx -o httpd          # native by default; add --c for the C backend
 ./httpd 127.0.0.1:8080 16                         # ADDR, then the pool size
 ```
 

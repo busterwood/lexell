@@ -13,7 +13,7 @@ static void *(*volatile alloc_fn)(size_t) = malloc;
 static void (*volatile free_fn)(void *) = free;
 
 int main(void) {
-    long long n = 20000000;
+    long long n = 80000000;
     long long total = 0;
     for (long long i = 0; i < n; i++) {
         Cell *c = alloc_fn(sizeof *c);

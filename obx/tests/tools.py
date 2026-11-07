@@ -2311,8 +2311,7 @@ class Harness:
         for t in TOOLS:
             exe = os.path.join(out, t)
             cmd = [OBXC, os.path.join(CMD, t + '.obx'), '-o', exe]
-            if not self.args.c:
-                cmd.insert(2, '--native')
+            cmd.insert(2, '--native' if not self.args.c else '--c')
             r = subprocess.run(cmd, capture_output=True, text=True, env=env)
             if r.returncode != 0:
                 raise SetupError('%s build failed: %s'

@@ -34,7 +34,7 @@ int main(void) {
         free(n);
     }
     long long total = 0;
-    for (long long round = 0; round < 200; round++) {
+    for (long long round = 0; round < 1000; round++) {
         char *words[5000];
         char *rs = intToStr(round);
         for (long long i = 0; i < 5000; i++) {

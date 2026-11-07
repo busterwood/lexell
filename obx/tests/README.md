@@ -1,7 +1,7 @@
 # obx conformance tests
 
 Black-box tests of the language in `../SPEC.md`. They only use the compiler
-driver, `obxc file.obx -o out`.
+driver, `obxc file.obx -o out` (native by default; `--c` builds through C).
 
     python3 obx/tests/run.py [--compiler PATH] [-j N] [--live] [filters...]
     python3 obx/tests/compiler/run_tests.py [--conformance] [filters...]

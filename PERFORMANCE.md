@@ -38,8 +38,8 @@ code here, and the experiments that did not pay — is in
 
 - AMD Ryzen 7 8745HS (8 cores, 16 threads; CPUs 2k and 2k+1 are the two
   hardware threads of core k, and all cores share one L3), WSL2, Linux 6.18,
-  gcc 13.3, glibc 2.39. Programs require an x86-64-v3 CPU (SPEC, exit code
-  16).
+  gcc 13.3, glibc 2.39. Programs require x86-64 with AVX2: Intel Haswell
+  (2013) or AMD Excavator (2015) and later, otherwise exit code 16.
 - Wall clock, best of N runs (11 for the benchmarks and the compiler, 9 for
   eza, 5 or 3 where a table says so), warm cache, output to `/dev/null` or a
   pipe. Cycle and instruction counts are `perf stat`, user mode, least of N,
@@ -59,21 +59,24 @@ code here, and the experiments that did not pay — is in
 ## Benchmarks
 
 `python3 obx/bench/bench.py --opt -n 11`
-([obx/bench/](obx/bench/README.md)); the instruction and cycle counts quoted
-below are from `--perf`, measuring the Rust binary the same way:
+([obx/bench/](obx/bench/README.md)), best of 11, one core:
 
 | benchmark | obx -O | plain C | Rust | obx/Rust | obx/plain C | what it does |
 |---|---:|---:|---:|---:|---:|---|
-| fib | 347 ms | 348 ms | 349 ms | 0.99 | 1.00 | recursive calls |
-| loop | 229 ms | 229 ms | 227 ms | 1.01 | 1.00 | two overflow-checked operations per iteration |
-| array | 107 ms | 35 ms | 102 ms | 1.05 | 3.01 | checked indexing |
-| alloc | 70 ms | 126 ms | 126 ms | 0.55 | 0.55 | 20 million records allocated and freed |
-| lists | 31 ms | 31 ms | 40 ms | 0.79 | 1.02 | linked list build, sum, drop |
-| strings | 45 ms | 91 ms | 79 ms | 0.57 | 0.49 | concatenation and `toStr` |
-| trees | 20 ms | 24 ms | 25 ms | 0.82 | 0.86 | binary trees |
-| tokens | 12 ms | 11 ms | 12 ms | 1.06 | 1.14 | byte scanning and hashing |
-| sieve | 148 ms | 158 ms | 247 ms | 0.60 | 0.94 | the sieve of Eratosthenes to 10 million, ten rounds |
-| maps | 238 ms | - | - | - | - | `Map[str, int]` with short and long keys, `Map[int, int]` (keyed hashing) |
+| fib | 914 ms | 878 ms | 884 ms | 1.03 | 1.04 | recursive calls |
+| loop | 460 ms | 461 ms | 457 ms | 1.01 | 1.00 | two overflow-checked operations per iteration |
+| array | 361 ms | 98 ms | 363 ms | 0.99 | 3.66 | checked indexing |
+| alloc | 247 ms | 485 ms | 487 ms | 0.51 | 0.51 | 80 million records allocated and freed |
+| lists | 205 ms | 217 ms | 270 ms | 0.76 | 0.94 | linked list build, sum, drop |
+| strings | 227 ms | 456 ms | 391 ms | 0.58 | 0.50 | concatenation and `toStr` |
+| trees | 135 ms | 180 ms | 173 ms | 0.78 | 0.75 | binary trees |
+| tokens | 202 ms | 166 ms | 167 ms | 1.21 | 1.22 | byte scanning and hashing |
+| sieve | 337 ms | 359 ms | 615 ms | 0.55 | 0.94 | the sieve of Eratosthenes to 10 million, 30 rounds |
+| maps | 452 ms | - | - | - | - | `Map[str, int]` with short and long keys, `Map[int, int]` (keyed hashing) |
+
+The ratios use the unrounded wall times (best of 11); the millisecond column
+is rounded, so two equal-looking values can differ by a few percent: a 1.06
+ratio, for instance, can come from two times that both round to 12 ms.
 
 The hand-written C references are in `obx/bench/c/` (nine programs; `maps`
 has none), built with `gcc -O2`. The Rust ports are in `obx/bench/rust/`, one
@@ -84,60 +87,50 @@ Rust std equivalent). Their build settings and anti-optimisation rules are in
 [obx/bench/README.md](obx/bench/README.md). The same-IR C build's column is in
 [design/native-vs-c.md](obx/design/native-vs-c.md).
 
-The plain fast-compile path (`--native`, no `-O`) is slower where the loop passes
-matter: loop 446 ms, array 183 ms, sieve 187 ms; it is 0.50 on alloc and 0.54
-on strings either way. `maps` moves with the hash seed;
+The plain fast-compile path (`--native`, no `-O`) is slower where the loop
+passes matter: loop 881 ms, array 740 ms, sieve 529 ms; it is level on alloc
+(248 vs 247) and strings (224 vs 227). `maps` moves with the hash seed;
 [design/codegen-audit.md](obx/design/codegen-audit.md) records the remaining
 code-shape gaps.
 
-- **Allocation and strings are cheap** (alloc, lists, strings, tokens,
-  trees). Small functions and glue are inlined before code generation; the
+- **Allocation and strings are cheap** (alloc, lists, strings, trees).
+  Small functions and glue are inlined before code generation; the
   freestanding runtime has a size-class allocator with no locks or libc
   bookkeeping and an 8-byte block header; the string and index checks are
   generated inline.
-- **Tight loops are obx's strength** (loop, array). The native backend
-  tests at the bottom of loops and aligns their bodies, reads array headers
-  once per loop, and drops the bounds and overflow checks that conditions,
+- **`loop` is level; `array` is the clear loss.** The native backend tests
+  at the bottom of loops and aligns their bodies, reads array headers once
+  per loop, and drops the bounds and overflow checks that conditions,
   passed checks and induction variables prove cannot fail
-  ([design/native.md](obx/design/native.md) sections 4 and 8). obx's checks
-  stay where they can fail, so array keeps one bounds check per element (its
-  bound is unrelated to the array's length).
-- **The sieve is at plain C's speed.** A hand-written C version with no
-  checks (`obx/bench/c/sieve.c`, `gcc -O2`, bench.py's "plain C" column)
-  took 158 ms in the same run. obx runs 1,414M instructions in 626M
-  cycles.
-- **fib** is calls and returns: obx runs 3,643M instructions in 1,524M
-  cycles. Rust is level on time (349 vs 347 ms) but runs 5,133M instructions:
-  its checked `n - 1` and `n - 2` add the overflow branches that the native
-  backend proves away.
-- **Rust is level on fib, loop, tokens and array.** fib, loop and tokens are
-  the same time as obx (349 vs 347 ms, 227 vs 229 ms, 12 vs 12 ms); Rust's
-  token scanner runs 104M instructions against obx's 126M. `array` is 102
-  ms against 107: both keep one bounds check per element. `loop` keeps
-  `loop.obx`'s constant bound, so LLVM proves both overflow checks away as
-  obx `-O` does; the C reference takes `n` from the command line and uses
-  an asm barrier only to stop gcc turning the iteration into a closed form.
-- **C's auto-vectorisation is the array gap; checks are the sieve gap.**
-  gcc turns `array`'s inner loop into AVX2 (35 ms, 3.0x obx) while Rust's
-  bounds checks keep it scalar (102 ms, level with obx's single check).
-  On `sieve`, Rust keeps a bounds check on every `prime[j]` and a checked
-  `j += i`: 247 ms, 2,106M instructions and 1,209M cycles, against obx's
-  148 ms and 1,414M/626M; C is 158 ms with no checks.
-- **Rust uses the system allocator.** `alloc` is 126 ms, the same as plain C
-  (126 ms) and 1.8x obx (70 ms): libc `malloc`/`free` against the
-  freestanding size-class allocator. `lists` is 40 vs 31 ms (Rust's
-  recursive `Drop` walks the 10,000-node list; C frees it iteratively) and
-  `trees` 25 vs 20 ms.
-- **Strings: `String` and `Rc<str>`.** obx is 45 ms and plain C 91 ms;
-  Rust `String` is 79 ms. The `Rc<str>` version (`dbench strings-rc`, the
-  closer analogue of obx's refcounted `str`) is 128 ms in an interleaved
-  best-of-15 run, 1.6x the `String` version: a safe concatenation builds a
-  `String` and then copies it into a fresh `Rc` allocation, two allocations
-  per `+`, whereas obx makes one refcounted block per `+` in its size-class
-  allocator.
-- **maps** runs 878M cycles and 2,102M instructions. `str`, `i128`, `u128`
-  and `Decimal` hash with SipHash-1-3 under a per-process key, and `Map`
-  mixes a per-process seed into its slots (lib/README.md, "Keyed hashing").
+  ([design/native.md](obx/design/native.md) sections 4 and 8). `loop` is 460
+  ms against plain C's 461. `array` is 361 against 98: gcc turns its inner
+  loop into AVX2, while obx keeps one bounds check per element (its bound is
+  unrelated to the array's length). Rust is level with obx there (363).
+- **The sieve is ahead of plain C** (337 vs 359 ms) and 1.8x ahead of Rust
+  (615). Rust keeps a bounds check on every `prime[j]` and a checked
+  `j += i`; C has no checks.
+- **fib is within 4%** (obx 914, Rust 884, C 878 ms): calls and returns.
+  Rust's checked `n - 1` and `n - 2` add branches; C has none.
+- **Rust is level on fib, loop and array; ahead on tokens.** Rust's token
+  scanner is 21% faster (167 vs 202 ms). obx is ahead on alloc (2x), strings
+  (1.7x), trees (1.3x), lists (1.3x) and sieve (1.8x).
+- **C's auto-vectorisation is the array gap.** gcc turns `array`'s inner
+  loop into AVX2 (98 ms, 3.66x obx); Rust's bounds checks keep it scalar
+  (363 ms, level with obx's 361). On `sieve`, C is 359 against obx's 337.
+- **Rust uses the system allocator.** `alloc` is 487 ms, the same as plain
+  C (485) and 2x obx (247): libc `malloc`/`free` against the freestanding
+  size-class allocator. `lists` is 270 vs 205 ms (Rust's recursive `Drop`
+  walks the 10,000-node list; C frees it iteratively) and `trees` 173 vs
+  135.
+- **Strings: `String` and `Rc<str>`.** obx is 227 ms and plain C 456; Rust
+  `String` is 391. The `Rc<str>` version (`dbench strings-rc`, the closer
+  analogue of obx's refcounted `str`) is slower still: a safe concatenation
+  builds a `String` and then copies it into a fresh `Rc` allocation, two
+  allocations per `+`, whereas obx makes one refcounted block per `+` in its
+  size-class allocator.
+- **maps** runs 452 ms. `str`, `i128`, `u128` and `Decimal` hash with
+  SipHash-1-3 under a per-process key, and `Map` mixes a per-process seed
+  into its slots (lib/README.md, "Keyed hashing").
   Map's index slots are `u32`: an entry number with the high bits of the
   mixed hash beside it, so a probe skips other keys' slots without loading
   their entries; a Map holds at most 2^31 entries. The probes wait on memory:
@@ -164,7 +157,7 @@ binary with nine subcommands, and cargo measures its own build system.
 | hello, binary | 16 KB | 357 KB (stripped) | 16 KB |
 | nine benchmark programs, clean compile | 104 ms | 2.95 s | - |
 | nine benchmark programs, binaries | 172 KB | 443 KB | - |
-| compiler self-build (`--native`) | 656 ms | ~45 min* | - |
+| compiler self-build (`--native`) | 656 ms | over 30 min* | - |
 | compiler, binary + libraries | 2.9 MB (static) | 316 MB | - |
 | compiler toolchain, bin + lib | 2.9 MB | 560 MB (1.3 GB installed) | - |
 
@@ -177,14 +170,17 @@ obx links its own freestanding runtime.
 
 Rust's compiler is `rustc` (636 KB) plus `librustc_driver` (138 MB) and
 `libLLVM` (178 MB): 316 MB, or 560 MB for the installed `bin` and `lib`
-(1.3 GB with the documentation and share files). Its full stage-2 self-build
-is commonly cited at around 45 minutes; that figure was not measured here,
-because it needs the rust-lang/rust source and bootstrap, and its tests are
-a separate `./x.py test` (so the 45 minutes does not include the test suite).
+(1.3 GB with the documentation and share files). The
+[Rust compiler development guide](https://rustc-dev-guide.rust-lang.org/)
+estimates over 30 minutes for a full self-build on a
+moderately powerful laptop; that figure was not measured here, because it
+needs the rust-lang/rust source and bootstrap, and its tests are a separate
+`./x.py test` (so the estimate does not include the test suite).
 
-\* Rust self-build: reported, not measured here. It is a different language
-and toolchain (LLVM, a full borrow checker and optimiser), so the ratio is a
-scale comparison, not a like-for-like build of the same work.
+\* Rust self-build: the guide's estimate, not measured here. It is a
+different language and toolchain (LLVM, a full borrow checker and optimiser),
+so the ratio is a scale comparison, not a like-for-like build of the same
+work.
 
 ## Regex
 
@@ -302,61 +298,6 @@ What makes it fast:
   each side.
 - **Output in pieces.** The prefix, the line and the newline go into a byte
   buffer; no string is built per line.
-
-### On 1 GB
-
-An earlier sweep (a 1 GB input and 21 cases); the 100 MB figures above scale
-linearly.
-
-The same generator run to 10^9 bytes (18.2 million lines), the cases above
-and more pattern shapes. Best of 3, output piped to `md5sum`, the file in the
-page cache, `LC_ALL=C`. ripgrep (14.1.1, one file; `-E` dropped, since rg's
-regexes are extended already) is for reference; it has no `-x` and its `-f`
-was not measured. On every case the obx build printed exactly what GNU
-grep printed, and so did ripgrep.
-
-| search | GNU | ripgrep | obx |
-|---|---:|---:|---:|
-| `needle5007` (a literal, one line) | 283 ms | 85 ms | 186 ms |
-| `-c zzz` (no match) | 353 ms | 76 ms | 183 ms |
-| `-c omega` | 873 ms | 390 ms | 614 ms |
-| `-v -c omega` | 994 ms | 581 ms | 741 ms |
-| `-c '[0-9]*7 alpha'` | 725 ms | 96 ms | 192 ms |
-| `-c -E '(alpha\|beta) gamma'` | 1,096 ms | 411 ms | 645 ms |
-| `-c -i NEEDLE` | 625 ms | 117 ms | 185 ms |
-| `-c -i 'OMEGA BETA'` | 714 ms | 455 ms | 227 ms |
-| `-c -w eta` | 2,081 ms | 1,689 ms | 1,901 ms |
-| `-c -v '^0'` (every line) | 571 ms | 644 ms | 457 ms |
-| `-c -E 'a.*z.*e'` | 2,112 ms | 1,702 ms | 1,055 ms |
-| `-c -E 'needle(1\|2)[0-9]{3}7'` | 572 ms | 78 ms | 193 ms |
-| `-c -E '^[0-9]+7[0-9]'` | 456 ms | 814 ms | 582 ms |
-| `-c -E '(alpha\|omega) .*(beta\|psi)$'` | 2,554 ms | 941 ms | 1,233 ms |
-| `-c -x '[0-9]* alpha beta gamma delta'` | 411 ms | — | 186 ms |
-| `-c -F -f` five fixed strings | 1,295 ms | — | 1,664 ms |
-| `-n omega` | 2,201 ms | 1,435 ms | 2,059 ms |
-| `omega` (prints 8.8 million lines) | 1,623 ms | 927 ms | 1,557 ms |
-| `-o 'needle[0-9]*'` | 605 ms | 103 ms | 196 ms |
-| `-o -w eta` | 3,845 ms | 2,946 ms | 3,412 ms |
-| `-n -w eta` | 3,885 ms | 3,269 ms | 3,327 ms |
-
-The times scale with the file: each is about ten times its 100 MB figure, so
-nothing in the obx port grows worse than linearly. The literal searches
-(`needle`, `zzz`, `-o 'needle'`) read the 1 GB at memory speed, so they move
-most with the machine's state, for every tool alike.
-
-**Against GNU grep:** obx is ahead on 19 of 21 cases, often by 2 to 4 times.
-
-**Still behind GNU:**
-- `-F -f` with several fixed strings, 1.25 to 1.3 times slower. Each string
-  becomes a branch of one regex, where GNU and ripgrep use a multi-string
-  search (Aho-Corasick, Teddy).
-- `^[0-9]+7[0-9]`, 1.2 to 1.3 times slower.
-
-**Against ripgrep:** ripgrep is faster wherever a literal or a rare required
-string can be found with SIMD (`needle`, `zzz`, `-x`, `-o`). obx is faster on
-case-insensitive patterns (`-i 'OMEGA BETA'`), on `a.*z.*e` and
-`^[0-9]+7[0-9]`, and when every line matches (`-v '^0'`). The two are close
-on `-w`.
 
 ## jq
 
@@ -1034,7 +975,7 @@ python3 obx/bench/regex/bench.py -n 7                  # the regex table (Go, Ru
 python3 obx/bench/json/bench.py --jq JQ                # the JSON library and jq large-input tables
 python3 obx/tests/markdown.py --perf --ref CMARK       # the Markdown table
 python3 obx/cmd/eza_gate.py -j 12                      # eza correctness on both builds
-obx/compiler/out/obxc obx/cmd/eza.obx --native -o eza
+obx/compiler/out/obxc obx/cmd/eza.obx -o eza
 obx/tools/native_selfbuild.sh                          # the obx-built compiler
 obx/compiler/out/obxc obx/bench/tasks.obx --native -o tasks && ./tasks
 obx/compiler/out/obxc obx/bench/math/calls.obx --native -o calls && ./calls exp

@@ -159,8 +159,8 @@ def main():
         print('magnitude, not the build systems byte for byte.')
         print('The Rust compiler is rustc plus librustc_driver and libLLVM; its self-build is')
         print('not measured here (it needs the rust-lang/rust source and bootstrap; tests are')
-        print('a separate ./x.py test). A full stage-2 build is commonly cited at around 45')
-        print('minutes.')
+        print('a separate ./x.py test). The Rust compiler development guide estimates over')
+        print('30 minutes for a full build on a moderately powerful laptop.')
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

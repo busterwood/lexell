@@ -77,6 +77,8 @@ def build(src, out, native):
         cmd.append('--native')
         if NATIVE_OPT:
             cmd.append('-O')
+    else:
+        cmd.append('--c')
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
         fail('building %s failed:\n%s' % (os.path.relpath(src, ROOT), (r.stdout + r.stderr)[-1500:]))

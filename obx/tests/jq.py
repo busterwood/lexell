@@ -1143,7 +1143,7 @@ def jqtest(path, ours, ref, jobs, verbose):
 
 
 def build(c_backend, out):
-    argv = [OBXC, os.path.join(OBX, 'cmd', 'jq.obx')] + ([] if c_backend else ['--native']) + ['-o', out]
+    argv = [OBXC, os.path.join(OBX, 'cmd', 'jq.obx')] + (['--c'] if c_backend else ['--native']) + ['-o', out]
     r = subprocess.run(argv, capture_output=True, text=True)
     if r.returncode != 0:
         sys.exit('build failed:\n' + r.stdout + r.stderr)

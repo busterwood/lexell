@@ -97,7 +97,7 @@ def main():
         open(hostile, 'w').write('a' * 100000)
         src = os.path.join(HERE, 'regex_bench.obx')
         drivers = []
-        for label, flags in (('obx native', ['--native']), ('obx via C', [])):
+        for label, flags in (('obx native', ['--native']), ('obx via C', ['--c'])):
             exe = os.path.join(tmp, 'obx_' + ('n' if flags else 'c'))
             subprocess.run([OBXC, src, '-o', exe] + flags, check=True)
             r = subprocess.run([exe, corpus, '1'], capture_output=True, text=True, env=dict(os.environ, OBX_CHECK='1'))

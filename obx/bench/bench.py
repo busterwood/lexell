@@ -118,7 +118,7 @@ def perf_run(exe, name, n):
 
 def build_obx(name, tmp, native=False, opt=False):
     exe = os.path.join(tmp, name + ('_obxn' if native else '_obx') + ('_O' if opt else ''))
-    flags = (['--native'] if native else []) + (['-O'] if opt else [])
+    flags = (['--native'] if native else ['--c']) + (['-O'] if opt else [])
     subprocess.run([OBXC, os.path.join(HERE, name + '.obx'), '-o', exe] + flags, check=True)
     return exe
 

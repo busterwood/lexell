@@ -465,7 +465,7 @@ def main(argv):
         open(src, 'w').write(OBX_SERVER)
         servers = []
         env = dict(os.environ, OBX_CHECK='1')
-        for name, extra in [('obx-c', []), ('obx-native', ['--native'])]:
+        for name, extra in [('obx-c', ['--c']), ('obx-native', ['--native'])]:
             exe = os.path.join(tmp, name)
             r = subprocess.run([args.compiler, src, '-o', exe] + extra, capture_output=True, text=True)
             if r.returncode:

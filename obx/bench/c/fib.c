@@ -3,7 +3,7 @@
    n comes from the command line so that gcc cannot constant-fold the call
    tree, and the empty asm keeps the two calls from being turned into a loop;
    the row is about calls, not about gcc removing them. The obx program
-   passes the same 40.
+   passes the same 42.
 
    Built by bench.py with gcc -O2 -fno-optimize-sibling-calls as the
    "plain C" column. */
@@ -19,7 +19,7 @@ __attribute__((noinline)) static long long fib(long long n) {
 }
 
 int main(int argc, char **argv) {
-    long long n = argc > 1 ? atoll(argv[1]) : 40;
+    long long n = argc > 1 ? atoll(argv[1]) : 42;
     printf("%lld\n", fib(n));
     return 0;
 }

@@ -124,7 +124,7 @@ def build(args, tmp):
     for name, src, native in [('httpd-native', 'httpd.obx', True), ('httpd-c', 'httpd.obx', False),
                               ('httpload', 'httpload.obx', True)]:
         out = os.path.join(tmp, name)
-        cmd = [obxc, os.path.join(HERE, src), '-o', out] + (['--native'] if native else [])
+        cmd = [obxc, os.path.join(HERE, src), '-o', out] + (['--native'] if native else ['--c'])
         r = subprocess.run(cmd, capture_output=True, text=True, env=env)
         if r.returncode != 0:
             sys.exit('build failed: %s\n%s%s' % (' '.join(cmd), r.stdout, r.stderr))

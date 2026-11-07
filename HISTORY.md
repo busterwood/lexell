@@ -2523,13 +2523,57 @@ self-build 656 ms and a 2.9 MB static binary. Rust includes std and the
 cargo build system; obx links its own runtime. Measured on this machine,
 Rust's compiler is `rustc` (636 KB) plus `librustc_driver` (138 MB) and
 `libLLVM` (178 MB): 316 MB, 560 MB for the installed `bin` and `lib` and
-1.3 GB for the full toolchain. A full rustc stage-2 self-build is commonly
-cited at around 45 minutes; it was not measured here (it needs the
-rust-lang/rust source and bootstrap, and its tests are a separate
-`./x.py test`). The comparison is one of scale, not of the same work: Rust
+1.3 GB for the full toolchain. The Rust compiler development guide estimates
+over 30 minutes for a full stage-2 build on a moderately powerful laptop; it
+was not measured here (it needs the rust-lang/rust source and bootstrap, and
+its tests are a separate `./x.py test`). The comparison is one of scale, not
+of the same work: Rust
 carries LLVM, a full borrow checker and a mature optimiser.
 
 PERFORMANCE.md now leads with the obx/Rust comparison and labels the
 implementation obx rather than native (native is ambiguous next to Rust).
 README's performance summary states the small-compiler, fast-compile and
 Rust-competitive results.
+
+### Native build is the default (2026-11-07)
+
+`obxc file.obx -o prog` now writes the native x86-64 ELF directly; it no
+longer needs gcc and no longer goes through C unless asked. `--c` selects the
+C backend (write C, run gcc); `--native` is still accepted and is the
+default, and `--emit-c`/`--emit-c-json` still print the C. `-O` applies to
+the native build.
+
+The seed was reseeded: the C of the new compiler is now `seed/obxc.c`, and a
+first build still needs only gcc. Every harness that wants the C side of a
+comparison now passes `--c` explicitly: run.py's C builds go through
+`--emit-c-json` as before, and the bench, tool, HTTP, TLS, JSON, Markdown,
+eza and generated-program drivers pass `--c` where they used to rely on the
+old default. The usage text, the compiler README, the command READMEs and
+the native-backend note say the new default.
+
+This follows the performance work: native is the build that wins on the
+application rows, and the C backend is the bootstrap, portability and
+differential oracle, not the default.
+
+### Benchmark workloads scaled (2026-11-07)
+
+The microbenchmarks were too short for whole-millisecond display: tokens
+was 12 ms and a 1 ms rounding step was 8%, so two equal-looking times could
+carry a visibly different ratio. The workloads are now 3.7x to 10x larger,
+identically in the obx program, the hand-written C reference and the Rust
+port: fib 40 -> 42, loop 1e9 -> 2e9, array 200 -> 800 rounds, alloc 20M ->
+80M, lists 300 -> 2000 rounds, strings 200 -> 1000, trees 40 -> 400,
+tokens 10 -> 200 rounds, sieve 10 -> 30 rounds, maps 200k -> 400k keys.
+
+At the new sizes (best of 11, one core, obx -O / Rust / plain C), the
+headline changes: obx is level with or ahead of Rust on eight of nine, and
+Rust is clearly ahead on tokens (202 / 167 / 166 ms, 21%). Plain C is ahead
+on array (3.7x, gcc AVX2), tokens (22%) and slightly fib (4%); obx is ahead
+on alloc (2x), strings (1.7x), trees (1.3x), lists (1.3x) and sieve (1.8x).
+The full table is in PERFORMANCE.md.
+
+The old numbers were not wrong, but startup and rounding were a larger
+share of the small rows than the code difference being measured. The
+`--perf` run at the new sizes gives the cycle ratios in
+design/native-vs-c.md: native is ahead on nine of ten against the C
+backend and `maps` is 1.06 (memory-bound); `fib` is level.

@@ -4,11 +4,12 @@ Stage 5 of [../PLAN.md](../PLAN.md): the self-hosted compiler writes x86-64
 Linux ELF executables itself. No assembler, linker or C compiler runs when a
 program is built natively:
 
-    obxc file.obx --native [-o out] [--run] [-- args]
+    obxc file.obx [-O] [-o out] [--run] [-- args]    # native, the default
+    obxc file.obx --c [-o out] [--run]               # the C backend
 
-Both backends start from one IR (`ir.obx`): the C backend prints it as C for
-gcc (`--emit-c`, the default build), the native backend compiles it to
-machine code.
+Both backends start from one IR (`ir.obx`): the native backend compiles it
+to machine code, the C backend prints it as C for gcc (`--c`, or `--emit-c`
+to print it).
 
 The goals for this backend — runtime performance against GCC/Clang, compile
 speed and implementation size — the survey of other small optimizing compilers

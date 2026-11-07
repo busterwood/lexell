@@ -219,7 +219,7 @@ def one(k, a, out):
     base = os.path.join(out, 'run', 'p%d' % k)
     with open(base + '.obx', 'w') as f:
         f.write(gen(rng, k))
-    c = subprocess.run([a.compiler, base + '.obx', '-o', base + '_c'], capture_output=True, text=True)
+    c = subprocess.run([a.compiler, base + '.obx', '--c', '-o', base + '_c'], capture_output=True, text=True)
     if c.returncode != 0:
         return ('fail', k, 'C build failed: ' + (c.stdout + c.stderr).strip()[:400])
     nb = subprocess.run([a.compiler, base + '.obx', '--native', '-o', base + '_n'], capture_output=True, text=True)

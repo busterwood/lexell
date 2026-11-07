@@ -72,7 +72,7 @@ def main():
         with open(src, 'w') as f:
             f.write(CHECK)
         exe = os.path.join(tmp, 'check')
-        cmd = [OBXC, src, '-o', exe] + ([] if a.c else ['--native'])
+        cmd = [OBXC, src, '-o', exe] + (['--c'] if a.c else ['--native'])
         r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode != 0:
             print('build failed:', r.stdout, r.stderr)

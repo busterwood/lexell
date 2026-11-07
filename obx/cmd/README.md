@@ -22,8 +22,8 @@ them is useful to another program yet; a split would only add imports and
 
 Build it from `obx/`:
 
-    compiler/out/obxc cmd/eza.obx --native -o eza    # native x86-64
-    compiler/out/obxc cmd/eza.obx -o eza             # through C
+    compiler/out/obxc cmd/eza.obx -o eza             # native x86-64 (default)
+    compiler/out/obxc cmd/eza.obx --c -o eza         # through C
 
 ### Tests
 
@@ -68,8 +68,8 @@ order) unchanged.
 
 Build from `obx/`:
 
-    compiler/out/obxc cmd/cat.obx --native -o cat    # native x86-64
-    compiler/out/obxc cmd/cat.obx -o cat             # through C
+    compiler/out/obxc cmd/cat.obx -o cat             # native x86-64 (default)
+    compiler/out/obxc cmd/cat.obx --c -o cat         # through C
 
 ### Tests
 
@@ -174,8 +174,8 @@ the real zoxide's database (`db.zo`, bincode version 3), so you can switch
 between the two at any time. Frecency scores, aging, the keyword rules, the
 `_ZO_*` variables, the messages and the exit codes are zoxide's.
 
-    compiler/out/obxc cmd/zoxide.obx --native -o zoxide
-    compiler/out/obxc cmd/zoxide.obx -o zoxide
+    compiler/out/obxc cmd/zoxide.obx -o zoxide       # native (default)
+    compiler/out/obxc cmd/zoxide.obx --c -o zoxide   # through C
 
 Supported:
 
@@ -249,8 +249,8 @@ It is split into five files:
 | `jq_lib.obx` | value operations, formats, dates, math, regexes and jq's JSON error messages |
 | `jq_builtins.obx` | jq's `builtin.jq`, with jq's MIT notice |
 
-    compiler/out/obxc cmd/jq.obx --native -o jq
-    compiler/out/obxc cmd/jq.obx -o jq
+    compiler/out/obxc cmd/jq.obx -o jq               # native (default)
+    compiler/out/obxc cmd/jq.obx --c -o jq           # through C
 
 ### Supported
 
@@ -402,8 +402,8 @@ With `--client` the tasks send through one `http.Client` per process
 `text()`: the HTTP client's gate. Reaching `dial` makes the native build
 dynamically linked (glibc's resolver).
 
-    compiler/out/obxc cmd/httpd.obx --native -o httpd && ./httpd 127.0.0.1:8080
-    compiler/out/obxc cmd/httpload.obx --native -o httpload && ./httpload 127.0.0.1:8080 10 5
+    compiler/out/obxc cmd/httpd.obx -o httpd && ./httpd 127.0.0.1:8080
+    compiler/out/obxc cmd/httpload.obx -o httpload && ./httpload 127.0.0.1:8080 10 5
     ./httpd 127.0.0.1:8080 4 8                    # 8 workers, a pool of 4 each
     ./httpload -p 8 127.0.0.1:8080 256 5 /db
 
@@ -454,7 +454,7 @@ The name is cmark's on purpose: the tests run it in place of cmark, and the
 library module (`markdown`) is what other renderers use. It reads the files
 (or standard input) as one document and writes HTML to standard output.
 
-    compiler/out/obxc cmd/cmark.obx --native -o cmark
+    compiler/out/obxc cmd/cmark.obx -o cmark
     cmark [--unsafe] [--smart] [--sourcepos] [--hardbreaks] [--nobreaks] [--validate-utf8] [file ...]
 
 `--unsafe` lets raw HTML and every URL through (cmark's default replaces raw

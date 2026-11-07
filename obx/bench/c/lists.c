@@ -1,6 +1,6 @@
 /* The linked-list benchmark of bench/lists.obx as plain C: build a list by
    pushing on the front, sum it by recursion, free it when the variable is
-   reassigned. Same 1,000-node list kept, 300 rounds of 10,000 nodes. */
+   reassigned. Same 1,000-node list kept, 2000 rounds of 10,000 nodes. */
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -34,7 +34,7 @@ int main(void) {
     Node *keep = NULL;
     for (long long i = 0; i < 1000; i++) keep = push(keep, i);
     long long total = 0;
-    for (long long round = 0; round < 300; round++) {
+    for (long long round = 0; round < 2000; round++) {
         Node *l = NULL;
         for (long long i = 0; i < 10000; i++) l = push(l, i);
         total += sum(l) % 7;

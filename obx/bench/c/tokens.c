@@ -99,7 +99,7 @@ int main(int argc, char **argv) {
     fclose(f);
 
     long long tokens = 0, unique = 0;
-    for (int round = 0; round < 10; round++) {
+    for (int round = 0; round < 200; round++) {
         Tokens toks = {0};
         scan(src, (size_t)n, &toks);
         Bucket table[1024] = {0};

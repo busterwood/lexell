@@ -3,7 +3,7 @@
 obx is a language for systems programs, the kind that run close to the
 machine. Each value has one owner. Other code can borrow a value (`&T`) for
 a while. There is no garbage collector, so the compiler decides when memory
-is freed. It also has generics.
+is freed. It also has generics. It targets Linux on x86-64.
 
 The compiler is written in obx and compiles itself. It builds programs
 straight to x86-64 executables. A C backend remains for the bootstrap seed,
@@ -19,7 +19,7 @@ seed.
 
 ```
 obx/compiler/build.sh                            # build the compiler from its seed
-obx/compiler/out/obxc prog.obx --native -o prog  # a native x86-64 program, no gcc
+obx/compiler/out/obxc prog.obx -o prog           # a native x86-64 program, no gcc
 obx/tools/gate.sh quick                          # run the test suites
 ```
 
@@ -27,7 +27,7 @@ The C backend is still available for the bootstrap, portability and
 differential checks:
 
 ```
-obx/compiler/out/obxc prog.obx -o prog           # the same program through C
+obx/compiler/out/obxc prog.obx --c -o prog       # the same program through C
 ```
 
 A small program:
@@ -48,9 +48,9 @@ Three things to know first:
 
 - A number with a fraction needs a suffix. `1.5m` is a Decimal and `1.5f` is a float.
   A bare `1.5` is a compile error.
-- Programs need an x86-64-v3 CPU, which means AVX2 and the instructions
-  around it. Intel Haswell (2013) and AMD Excavator (2015) or later have them.
-  On an older CPU a program stops with exit code 16.
+- Programs are Linux x86-64 executables. The CPU must support AVX2: Intel
+  Haswell (2013) or AMD Excavator (2015) and later. There is no Windows,
+  macOS or ARM support. On an older CPU a program stops with exit code 16.
 - The owner frees a value. The compiler checks that borrows never outlive
   the value they lend.
 
@@ -115,6 +115,25 @@ at 100,000 and at 1,000,000 rows. See
 
 The Oracle client supports OUT binds, REF CURSORs and TLS.
 
+## Status and limitations
+
+obx is new: the project restarted on 2 November 2026. The language
+specification is draft 1, there is no package manager or third-party
+ecosystem yet, and the compiler, library and programs in this repository are
+the project. APIs may still change.
+
+- **Linux x86-64 only.** The native backend writes a Linux ELF executable;
+  there is no Windows, macOS or ARM backend.
+- **AVX2 required.** Intel Haswell (2013) or AMD Excavator (2015) and later;
+  older CPUs stop with exit code 16.
+- **gcc for the first build.** The checked-in C seed needs gcc once. After
+  that `obxc` writes native executables directly and needs no C compiler.
+- **Some libraries use C.** TLS uses OpenSSL, SQLite uses libsqlite3, and
+  the ODBC SQL Server client links ODBC; the native runtime itself is
+  freestanding. Programs that use those libraries are dynamically linked.
+- **Not 1.0.** There is no stable API or release process yet; the test
+  suites and `gate.sh` are the contract.
+
 ## Performance
 
 These figures come from [PERFORMANCE.md](PERFORMANCE.md); the internal
@@ -125,17 +144,20 @@ one 8-core test machine, so compare the columns, not the absolute numbers.
 obx is small and fast. The compiler is 39,436 lines and a 2.9 MB static
 binary, and builds itself in 0.66 s. Rust's `rustc` plus its driver and
 LLVM is 316 MB (560 MB installed, 1.3 GB with docs), and a full rustc
-self-build is commonly around 45 minutes, tests separate. A hello world
+self-build is over 30 minutes on a moderately powerful laptop, according to
+the [Rust compiler development guide](https://rustc-dev-guide.rust-lang.org/);
+tests are separate. A hello world
 compiles in 12 ms to a 16 KB executable; Rust takes 162 ms and 357 KB
 (stripped), and gcc 86 ms. The nine benchmark programs compile in 104 ms
 with obx against 2.95 s for the Rust suite.
 
 - **Competitive with Rust:** on the nine microbenchmarks obx is level with
-  or ahead of idiomatic Rust on seven; Rust is at most 6% ahead on `array`
-  and `tokens`. Plain C is ahead only on `array` (3 times, AVX2
-  auto-vectorisation) and slightly on `tokens`; obx is ahead on allocation,
-  strings and trees. The table and the Rust ports are in
-  [PERFORMANCE.md](PERFORMANCE.md) and [obx/bench/rust/](obx/bench/rust/).
+  or ahead of idiomatic Rust on eight; Rust is clearly ahead only on
+  `tokens` (21%). Plain C is ahead on `array` (3.7 times, AVX2
+  auto-vectorisation), `tokens` (22%) and slightly `fib` (4%); obx is ahead
+  on allocation, strings, lists, trees and sieve. The table and the Rust
+  ports are in [PERFORMANCE.md](PERFORMANCE.md) and
+  [obx/bench/rust/](obx/bench/rust/).
 - **Applications:** regex 44 ms, `json`/`jq` 0.4 to 0.5 s, Markdown 0.16 s,
   Decimal 2.2 s. The external references (Rust, Go, jq, cmark, .NET and
   Java) are in [PERFORMANCE.md](PERFORMANCE.md).

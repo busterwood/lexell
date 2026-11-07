@@ -23,7 +23,7 @@ from run import tree  # noqa: E402
 
 def build(t, native, out):
     obxc, lib = t
-    cmd = [obxc, os.path.join(HERE, 'ddiff.obx'), '-o', out] + (['--native'] if native else [])
+    cmd = [obxc, os.path.join(HERE, 'ddiff.obx'), '-o', out] + (['--native'] if native else ['--c'])
     subprocess.run(cmd, check=True, env=dict(os.environ, OBX_LIB=lib))
     return out
 

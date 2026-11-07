@@ -32,7 +32,7 @@ fn bench_loop() {
     // loop.obx's constant bound, so LLVM can prove the two overflow checks
     // cannot fail, as obx's native `-O` does. The checks stay on in the build;
     // only the proof is shared.
-    let n: i64 = 1_000_000_000;
+    let n: i64 = 2_000_000_000;
     let mut s: i64 = 0;
     let mut i: i64 = 0;
     while i < n {
@@ -53,7 +53,7 @@ fn bench_array() {
         i += 1;
     }
     let mut total: i64 = 0;
-    for r in 0..200i64 {
+    for r in 0..800i64 {
         for i in 0..n as usize {
             a[i] = a[i] + r;
             total = total + a[i];
@@ -70,7 +70,7 @@ struct Cell {
 }
 
 fn bench_alloc() {
-    let n: i64 = 20_000_000;
+    let n: i64 = 80_000_000;
     let mut total: i64 = 0;
     let mut i: i64 = 0;
     while i < n {
@@ -109,7 +109,7 @@ fn bench_lists() {
         keep = push(keep, i);
     }
     let mut total: i64 = 0;
-    for _round in 0..300 {
+    for _round in 0..2000 {
         let mut l: Option<Box<Node>> = None;
         for i in 0..10000 {
             l = push(l, i);
@@ -143,7 +143,7 @@ fn bench_strings() {
         keep.push(concat("k", &i.to_string()));
     }
     let mut total: i64 = 0;
-    for round in 0..200 {
+    for round in 0..1000 {
         let mut words: Vec<String> = Vec::new();
         for i in 0..5000 {
             let w = concat("word", &i.to_string());
@@ -166,7 +166,7 @@ fn bench_strings_rc() {
         keep.push(concat_rc("k", &i.to_string()));
     }
     let mut total: i64 = 0;
-    for round in 0..200 {
+    for round in 0..1000 {
         let mut words: Vec<Rc<str>> = Vec::new();
         for i in 0..5000 {
             let w = concat_rc("word", &i.to_string());
@@ -215,7 +215,7 @@ fn check(t: &Tree) -> i64 {
 fn bench_trees() {
     let long = build(16);
     let mut total: i64 = 0;
-    for _ in 0..40 {
+    for _ in 0..400 {
         let t = build(14);
         total += check(&t);
     }
@@ -310,7 +310,7 @@ fn bench_tokens(path: &str) {
     });
     let mut tokens: i64 = 0;
     let mut unique: i64 = 0;
-    for _round in 0..10 {
+    for _round in 0..200 {
         let mut toks: Vec<Token> = Vec::new();
         scan(&src, &mut toks);
         let mut table: Vec<Vec<usize>> = vec![Vec::new(); 1024];
@@ -329,7 +329,7 @@ fn bench_tokens(path: &str) {
 fn bench_sieve() {
     let n: usize = 10_000_000;
     let mut count: i64 = 0;
-    for _round in 0..10 {
+    for _round in 0..30 {
         let mut prime: Vec<u8> = vec![1; n + 1];
         prime[0] = 0;
         prime[1] = 0;
@@ -365,7 +365,7 @@ fn main() {
     let rest: Vec<String> = args.collect();
     match bench.as_str() {
         "fib" => {
-            let n = rest.first().map(|s| s.parse().unwrap()).unwrap_or(40);
+            let n = rest.first().map(|s| s.parse().unwrap()).unwrap_or(42);
             println!("{}", fib(n));
         }
         "loop" => bench_loop(),

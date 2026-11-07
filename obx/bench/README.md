@@ -1,7 +1,7 @@
 # obx benchmarks
 
-Ten small programs, each building the same program with both backends,
-native and via C. Nine of them also have a hand-written Rust port:
+Ten small programs, each built with the default native backend and, with
+`--c`, through C. Nine of them also have a hand-written Rust port:
 
     python3 obx/bench/bench.py [-n RUNS] [--only NAME ...] [--obo] [--opt] [--perf]
                               [--no-rust]
@@ -94,7 +94,7 @@ insertion order, keyed hash and `u32` index slots have no direct Rust std
 equivalent, so a port would approximate rather than compare the same work.
 
 For each program it builds `NAME.obx` with `obx/compiler/out/obxc` (or
-`$OBXC`) twice, with `--native` and through C (`gcc -O2`). It checks that the
+`$OBXC`) twice, with the default native build and through C (`--c`, `gcc -O2`). It checks that the
 two print the same result and are leak free (`OBX_CHECK=1`), then reports the
 best wall time of N runs (default 5) with `OBX_CHECK` unset. A program with a
 hand-written C reference in `c/NAME.c` is also built with `gcc -O2` and timed,
@@ -130,8 +130,8 @@ The results, with eza and the compiler, are in
 
 `python3 obx/bench/apps.py [-n RUNS] [--only APP ...] [--json] [--json-out FILE]
 [--tsv FILE] [--pin CORE] [--no-perf] [--no-opt] [--json-mb MB] [--md-mb MB]`
-is the Tier-1 table for applications: each source is built natively (`--native
--O`) and through C, the two builds must print the same counts or checksums
+is the Tier-1 table for applications: each source is built with the native
+backend (`-O`) and through C (`--c`), the two builds must print the same counts or checksums
 (timings in their output are ignored), and both are timed with `perf stat -e
 instructions:u,cycles:u`, best of RUNS, pinned to one core (default 4). It
 reuses the existing harnesses rather than their input generation: `regex`

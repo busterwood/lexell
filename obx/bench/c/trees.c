@@ -1,5 +1,5 @@
 /* The binary-tree benchmark of bench/trees.obx as plain C: build a tree of
-   depth 16, then 40 trees of depth 14, walk each and free it. Same recursive
+   depth 16, then 400 trees of depth 14, walk each and free it. Same recursive
    build/check shape. */
 #include <stdio.h>
 #include <stdlib.h>
@@ -37,7 +37,7 @@ static void drop(Tree *t) {
 int main(void) {
     Tree *long_tree = build(16);
     long long total = 0;
-    for (long long i = 0; i < 40; i++) {
+    for (long long i = 0; i < 400; i++) {
         Tree *t = build(14);
         total += check(t);
         drop(t);

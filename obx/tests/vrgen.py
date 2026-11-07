@@ -159,7 +159,7 @@ def one(k, a, out):
     base = os.path.join(out, 'p%d' % k)
     with open(base + '.obx', 'w') as f:
         f.write(gen(rng, k % 2 == 1))
-    c = subprocess.run([a.compiler, base + '.obx', '-o', base + '_c'], capture_output=True, text=True)
+    c = subprocess.run([a.compiler, base + '.obx', '--c', '-o', base + '_c'], capture_output=True, text=True)
     if c.returncode != 0:
         os.remove(base + '.obx')
         return ('nocompile', k, (c.stdout + c.stderr).strip())

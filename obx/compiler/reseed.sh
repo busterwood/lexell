@@ -10,9 +10,9 @@ T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
 export OBX_LIB="$D/../lib"
 python3 "$D/gen_rt.py" >/dev/null
-"$D/out/obxc" "$D/main.obx" -o "$T/s2"
+"$D/out/obxc" "$D/main.obx" --c -o "$T/s2"
 "$T/s2" "$D/main.obx" --emit-c > "$T/c2.c"
-"$T/s2" "$D/main.obx" -o "$T/s3"
+"$T/s2" "$D/main.obx" --c -o "$T/s3"
 "$T/s3" "$D/main.obx" --emit-c > "$T/c3.c"
 cmp "$T/c2.c" "$T/c3.c" || { echo "reseed: no fixed point: stage 2 and stage 3 C differ" >&2; exit 1; }
 cp "$T/c2.c" "$D/seed/obxc.c"

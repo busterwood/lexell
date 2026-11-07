@@ -102,8 +102,7 @@ def load_examples(name):
 def build(c_backend, workdir):
     exe = os.path.join(workdir, 'cmark-c' if c_backend else 'cmark-n')
     cmd = [OBXC, os.path.join(OBX, 'cmd', 'cmark.obx'), '-o', exe]
-    if not c_backend:
-        cmd.insert(2, '--native')
+    cmd.insert(2, '--native' if not c_backend else '--c')
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
         print(r.stdout + r.stderr)

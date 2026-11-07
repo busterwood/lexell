@@ -1698,8 +1698,7 @@ class Harness:
         os.makedirs(out, exist_ok=True)
         self.exe = os.path.join(out, 'eza')
         cmd = [OBXC, OWN_SOURCE, '-o', self.exe]
-        if not self.args.c:
-            cmd.insert(2, '--native')
+        cmd.insert(2, '--native' if not self.args.c else '--c')
         r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode != 0:
             raise SetupError('eza build failed: %s' % (r.stdout + r.stderr).strip())

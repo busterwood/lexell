@@ -9,7 +9,7 @@
 int main(void) {
     long n = 10000000;
     long count = 0;
-    for (int round = 0; round < 10; round++) {
+    for (int round = 0; round < 30; round++) {
         bool* prime = malloc(n + 1);
         if (!prime) return 1;
         memset(prime, true, n + 1);

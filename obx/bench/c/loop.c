@@ -11,7 +11,7 @@
 #include <stdlib.h>
 
 int main(int argc, char **argv) {
-    long long n = argc > 1 ? atoll(argv[1]) : 1000000000LL;
+    long long n = argc > 1 ? atoll(argv[1]) : 2000000000LL;
     long long s = 0;
     for (long long i = 0; i < n; i++) {
         s = s + i * 2;

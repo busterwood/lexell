@@ -35,7 +35,7 @@ ORACLE_TARGET = '127.0.0.1:1521'
 def build(tmp):
     src = os.path.join(HERE, 'dbstream.obx')
     out = {}
-    for backend, extra in (('C', []), ('native', ['--native'])):
+    for backend, extra in (('C', ['--c']), ('native', ['--native'])):
         exe = os.path.join(tmp, 'dbstream_' + backend)
         subprocess.run([OBXC, src, '-o', exe] + extra, check=True)
         out[backend] = exe

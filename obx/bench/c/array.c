@@ -1,5 +1,5 @@
 /* The array benchmark of bench/array.obx as plain C: a growing array filled
-   with 0..n-1, then 200 rounds of a[i] = a[i] + r and total += a[i], with no
+   with 0..n-1, then 800 rounds of a[i] = a[i] + r and total += a[i], with no
    bounds checks. Same work, same loop order. */
 #include <stdio.h>
 #include <stdlib.h>
@@ -17,7 +17,7 @@ int main(void) {
         a[len++] = i;
     }
     long long total = 0;
-    for (long long r = 0; r < 200; r++) {
+    for (long long r = 0; r < 800; r++) {
         for (long long i = 0; i < n; i++) {
             a[i] = a[i] + r;
             total = total + a[i];
