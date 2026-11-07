@@ -159,11 +159,11 @@ def main():
     ap.add_argument('filters', nargs='*')
     a = ap.parse_args()
     all_tests = find_tests(True)
+    if a.filters:
+        all_tests = [t for t in all_tests
+                     if any(f in os.path.relpath(t[1], HERE) for f in a.filters)]
     tests = all_tests if a.live else [t for t in all_tests if not is_live(t[1])]
     live_skipped = len(all_tests) - len(tests)
-    if a.filters:
-        tests = [t for t in tests
-                 if any(f in os.path.relpath(t[1], HERE) for f in a.filters)]
     with ThreadPoolExecutor(max_workers=a.j) as ex:
         results = list(ex.map(lambda t: run_test(t[0], t[1], a.compiler), tests))
     failed = skipped = 0

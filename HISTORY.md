@@ -2369,6 +2369,16 @@ loaded from a parameter slot at entry and lives across calls; the failure is
 in the native register allocation or live-range handling for that shape, not
 in the pass's aliasing rule (conservative address-taking did not fix it).
 
+**Correction (2026-11-07).** The last two sentences were wrong: this was
+not a backend defect. The pass substituted `*p` on both sides of an
+assignment, and in `compileOnePass` the inlined `replace(op, o)` is a store
+through such a parameter. The store became a write to the pass's local copy,
+so the caller's `Regex.onepass` stayed empty and `doOnePass` indexed the empty
+program. With the store left in place, the pinned IR passes the native
+library tests and `doOnePass`' machine code is identical with and without the
+pinning. `obx/tests/run/ref_slot_replace.obx` records the shape. No x64gen
+change was needed.
+
 ### Decimal operator fast paths (2026-11-07)
 
 The matched comparison in `design/decimal-performance.md` showed the

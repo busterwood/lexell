@@ -181,11 +181,12 @@ natively against 1 in C). Two library changes are kept and take the row to
 582.7M/563.2M (1.03) instructions: the start-state cache is keyed by the byte
 (no `idxof` table load) and the general forward loop is out of the ASCII
 path. The remaining cycle gap did not move, so it is IPC, not instruction
-count: the one backend shape tried, reading a reference parameter's pointee
-into a local once at entry, miscompiles the one-pass matcher under `-O` and
-is reverted (HISTORY.md, "Regex per-match overhead"). Rank 3's shrink-wrapping
-and rank 4's allocator are still the levers, and rank 4 now has a concrete
-wrong-code case to start from.
+count: the one residency shape tried, reading a reference parameter's pointee
+into a local once at entry, was reverted because the pass (not the backend)
+rewrote a store through the parameter; a corrected pass passes the native
+library tests and leaves `doOnePass`' machine code unchanged (HISTORY.md,
+"Regex per-match overhead", correction). Rank 3's shrink-wrapping and rank
+4's allocator are still the levers.
 
 ## 5. Prototype: one `lea` for small constant arithmetic
 
