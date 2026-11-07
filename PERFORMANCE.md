@@ -417,6 +417,59 @@ the library (std's Map, say) shows in perfsuite only through the compiler,
 not in the frozen programs; measure such changes with bench.py and `perf
 stat` as well. The passes tried and shelved are in HISTORY.md.
 
+These rules are for the **default** path. `--native -O` is the optimising
+path: it may cost up to **30% more compile time** than the default
+(`python3 obx/tools/optcost.py --compiler <native-built obxc>`, instructions
+and cycles, best of N). Its target is the C backend's running time on the
+same source, not a smaller compile-suite figure.
+
+### The optimization level (`-O`)
+
+`--native` is the fast path. It runs `opt` (small-function inlining) and
+nothing else. `--native -O` adds `loops` (array headers and str headers out
+of loops, the bounds and overflow facts), perf17's range facts in loop-free
+functions, and `cse` (loads and checked element addresses reused along a
+straight run). The default grew faster to compile and the `-O` build carries
+the analysis; the generated code differs only between `-O` and the default.
+
+Compile cost of `-O` over the default (`optcost.py`, native-built compiler,
+best of 2, one core):
+
+| program | default Minstr | -O Minstr | -O/default | default Mcyc | -O Mcyc | -O/default |
+|---|---:|---:|---:|---:|---:|---:|
+| compiler | 4,611 | 5,764 | +25.0% | 2,584 | 3,275 | +26.7% |
+| eza | 486 | 569 | +17.1% | 281 | 293 | +4.2% |
+| grep | 1,176 | 1,395 | +18.6% | 559 | 664 | +18.7% |
+| zoxide | 478 | 544 | +13.7% | 234 | 284 | +21.1% |
+| jq | 1,991 | 2,385 | +19.7% | 1,012 | 1,345 | +32.9% |
+| cmark | 599 | 683 | +14.0% | 327 | 376 | +14.8% |
+| tokens | 82 | 88 | +7.4% | 38 | 38 | +0.8% |
+| maps | 96 | 106 | +11.4% | 43 | 47 | +11.0% |
+| **geomean** | | | **+15.8%** | | | **+15.8%** |
+
+The code `-O` makes is judged by `obx/bench/bench.py --opt` (the ten
+benchmarks, native `-O` against the C backend and against the hand-written C
+references) and by the regex, JSON/jq, Markdown and Decimal harnesses. First
+measurements of the pass ladder (best of 3, cycles, native `-O` over the C
+backend):
+
+| | fib | loop | array | alloc | lists | strings | trees | tokens | sieve | maps |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `-O`/C | 1.11 | 0.80 | 0.88 | 0.50 | 0.77 | 0.54 | 0.81 | 0.64 | 0.84 | 1.14 |
+
+and, from the application harnesses (ms, one run), regex `\w+` 63.0 native
+against 37.9 via C (1.66; the default was 66.5), Markdown 10 MB 0.251
+against 0.215 (1.17; the default 0.233), jq on a 20 MB file within a few
+percent of the C build, and Decimal still 1.1 to 1.37 times C (add 1.11,
+quantize 1.25, parse 1.37, format 1.14, cmp 1.30). The ladder pays on
+loops, allocation, strings, trees and Markdown; it barely moves the DFA,
+jq's calls and boxes, and Decimal's records. Those are the next pass's
+targets (the app gaps are in `obx/bench/README.md`'s three tiers).
+
+`-O` is part of the quick gate: `run_native.py --lib --opt` builds the 613
+programs with `-O` and requires the same output, exit code and stderr as the
+C build.
+
 ## Binary sizes
 
 | program | via C | native |

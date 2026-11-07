@@ -1,6 +1,6 @@
 // loops: loop optimizations in the IR, after opt and before the native backend (design/native.md,
-// sections 4 and 8, the sixth performance step). Per function with a loop (the others are left
-// alone: little to gain there, and the pass costs compile time):
+// sections 4 and 8, the sixth performance step). (A) and (C) are per function with a loop; (B) is
+// per function with a loop or a check it could remove (perf17):
 //
 // (A) Array headers out of loops. A loop that reads the data pointer or the length of an array
 //     or slice (`a.data`, `a.len`, `p->data`, `p->len`) whose root cannot change in the loop
@@ -175,6 +175,8 @@ type Loops = record {
     vstamp: int
     labelsOk: bool          // no case label but straight in its switch's block
     nLoad: int
+    nIf: int                // the ifs met by the last info walk
+    nChk: int               // the checks (rt_idx, checked + - *) met by the last info walk
 }
 
 // The program p with its loops optimized.
@@ -185,7 +187,7 @@ pub fn optimize(p: ir.Ir): ir.Ir {
         esc: [], asg: [], decls: [], cinit: [], cval: [], isParam: [], aliasOf: [], kmark: [], lenOf: [], rr: -1, places: [],
         klist: [], kmem: false, kstamp: 0, kbad: [], kvs: [], rmark: [], rstamp: 0, rall: false, facts: [], switches: [],
         nHoist: 0, nIdx: 0, nWrap: 0, nFwd: 0, rtw: [], atSet: newMap(), cont: newMap(), eAll: false, eK1: [], eTy: [],
-        eFn: false, sState: [], sAll: [], sK1: [], sTy: [], vmark: [], vstamp: 0, labelsOk: true, nLoad: 0}
+        eFn: false, sState: [], sAll: [], sK1: [], sTy: [], vmark: [], vstamp: 0, labelsOk: true, nLoad: 0, nChk: 0, nIf: 0}
     for j in 0..12 { append(mut &o.wfn, -1) }
     for f in 0..o.u.nRtFuncs {
         let name = o.u.funcs[f].name
@@ -273,7 +275,7 @@ fn (o: mut &Loops) see(l: int) {
 
 fn (o: mut &Loops) function(f: int) {
     let body = o.u.funcs[f].body
-    if !o.hasLoop(body) { return }
+    let loopy = o.hasLoop(body)
     let named = replace(mut &o.named, [])
     for l in named {
         o.seen[l] = false
@@ -291,7 +293,11 @@ fn (o: mut &Loops) function(f: int) {
         o.see(p)
         o.isParam[p] = true
     }
+    o.nChk = 0
+    o.nIf = 0
     o.go(body, W_INFO, 0)
+    // a function without a loop has the facts only (when it has a check and an if, the facts' source)
+    if !loopy && (o.nChk == 0 || o.nIf == 0) { return }
     // an alias that may be written, or whose value goes elsewhere than through reads or calls,
     // lets its local escape
     for j in 0..len(o.named) {
@@ -300,7 +306,7 @@ fn (o: mut &Loops) function(f: int) {
         if l >= 0 && (o.asg[q] > 0 || o.decls[q] != 1 || o.taken[q] || o.esc[q]) { o.esc[l] = true }
     }
     o.bases(f)
-    o.hoistIn(body)
+    if loopy { o.hoistIn(body) }
     if !o.labelsOk { return }
     // the lengths of the array locals whose address is never taken: only their assignments and
     // declarations change them
@@ -538,12 +544,15 @@ fn (o: mut &Loops) info(x: int, c: int): int {
         return 0
     }
     if k == ir.E_CALL {
+        let rc = o.rtcOf(x)
+        if rc == RC_IDX || rc >= RC_ADD { o.nChk += 1 }
         let ok = if o.safeCall(x) { 1 } else { 0 }
         o.go(a, W_INFO, 0)
         o.goList(o.u.nodes[x].b, W_INFO, ok)
         return 0
     }
     if k == ir.E_CAST { return o.go(a, W_INFO, c) }
+    if k == ir.S_IF { o.nIf += 1 }
     if k == ir.S_DECL {
         o.see(a)
         o.decls[a] += 1
@@ -910,7 +919,11 @@ fn (o: mut &Loops) strField(pl: int, off: int, ty: int, line: int): int {
 // never written, with nothing after the declaration changing pl's root: else -1.
 fn (o: mut &Loops) reuseLen(pl: int, out: &[]int): int {
     var j = len(out) - 1
-    while j >= 0 && j >= len(out) - 8 {
+    // Scan the whole block before the loop (not just the last eight statements):
+    // `let n = len(text)` often sits before several setup statements, and using
+    // it as the loop's length proofs is what removes text[at]'s check. The walk
+    // stops at a statement that may write the place, so the reuse is still sound.
+    while j >= 0 {
         let y = out[j]
         if o.u.nk(y) == ir.S_DECL {
             let l = o.u.nodes[y].a
@@ -1811,10 +1824,30 @@ fn (o: mut &Loops) define(l: int, v: int) {
                 o.add(Fact{k: F_LO, a: l, b: -1, c: 0, d: -1, v: 0})
                 o.add(Fact{k: F_HI, a: l, b: -1, c: 0, d: -1, v: kmax(ks)})
             }
+        } else if o.u.nk(v) == ir.E_BIN && o.u.nodes[v].v == ir.OP_AND {
+            o.defineBand(l, v, k)
         } else {
             o.defineArith(l, v, k)
         }
     }
+}
+
+// After `l = x & c` with c a non-negative constant: in two's complement the
+// result's set bits are a subset of c's, so it is in [0, c] whatever x is.
+// (The mask behind a state, a hash or a UTF-8 lead byte often has a range the
+// arithmetic facts alone cannot see.)
+fn (o: mut &Loops) defineBand(l: int, v: int, k: int) {
+    let a = o.u.nodes[v].a
+    let b = o.u.nodes[v].b
+    var c = -1
+    if o.u.nk(a) == ir.E_INT && o.u.nodes[a].v >= 0 {
+        c = o.u.nodes[a].v
+    } else if o.u.nk(b) == ir.E_INT && o.u.nodes[b].v >= 0 {
+        c = o.u.nodes[b].v
+    }
+    if c < 0 || c >= kmax(k) { return }
+    o.add(Fact{k: F_LO, a: l, b: -1, c: 0, d: -1, v: 0})
+    if c > kmin(k) { o.add(Fact{k: F_HI, a: l, b: -1, c: 0, d: -1, v: c}) }
 }
 
 // After `l = v` with v a checked or wrapping `+ - *` of l's kind k: l's range, and for `m + c`,

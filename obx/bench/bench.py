@@ -10,7 +10,7 @@ best wall time of N runs of each. A program with a hand-written C reference,
 obx/bench/c/NAME.c (no checks), also gets it built with gcc -O2 and timed, as
 the "plain C" column ("-" for the others).
 
-    python3 obx/bench/bench.py [-n RUNS] [--only NAME ...] [--obo] [--perf]
+    python3 obx/bench/bench.py [-n RUNS] [--only NAME ...] [--obo] [--opt] [--perf]
 
 The primary comparison is the same obx source built both ways (native and
 through C). The hand-written C references in c/ are a second, same-algorithm
@@ -83,10 +83,10 @@ def perf_run(exe, name, n):
     return min(ts), outs.pop(), min(ins), min(cyc)
 
 
-def build_obx(name, tmp, native=False):
-    exe = os.path.join(tmp, name + ('_obxn' if native else '_obx'))
-    subprocess.run([OBXC, os.path.join(HERE, name + '.obx'), '-o', exe] + (['--native'] if native else []),
-                   check=True)
+def build_obx(name, tmp, native=False, opt=False):
+    exe = os.path.join(tmp, name + ('_obxn' if native else '_obx') + ('_O' if opt else ''))
+    flags = (['--native'] if native else []) + (['-O'] if opt else [])
+    subprocess.run([OBXC, os.path.join(HERE, name + '.obx'), '-o', exe] + flags, check=True)
     return exe
 
 
@@ -120,6 +120,7 @@ def main():
     ap.add_argument('-n', type=int, default=5, help='runs per program (best is reported)')
     ap.add_argument('--only', nargs='*')
     ap.add_argument('--obo', action='store_true', help='add the archived obo compiler as a column')
+    ap.add_argument('--opt', action='store_true', help='also build native with -O and add its columns')
     ap.add_argument('--perf', action='store_true',
                     help='also report instructions and cycles (perf stat, user mode)')
     a = ap.parse_args()
@@ -138,9 +139,10 @@ def main():
     for name in names:
         obx = build_obx(name, tmp)
         obxn = build_obx(name, tmp, native=True)
+        obxo = build_obx(name, tmp, native=True, opt=True) if a.opt else None
         obo = build_obo(name, tmp) if a.obo else None
         plain = build_c(name, tmp)
-        for exe in (obx, obxn):
+        for exe in (obx, obxn) + ((obxo,) if obxo else ()):
             code, out, err, _ = run(exe, name, {'OBX_CHECK': '1'})
             if code != 0:
                 raise SystemExit(f"{name}: {exe} with OBX_CHECK=1 exited {code}: {err}")
@@ -148,6 +150,9 @@ def main():
         t_obxn, out_obxn, i_obxn, c_obxn = timed(obxn)
         if out_obxn != out_obx:
             raise SystemExit(f"{name}: outputs differ: C {out_obx!r}, native {out_obxn!r}")
+        t_obxo, out_obxo, i_obxo, c_obxo = timed(obxo)
+        if obxo is not None and out_obxo != out_obx:
+            raise SystemExit(f"{name}: outputs differ: C {out_obx!r}, native -O {out_obxo!r}")
         t_obo, out_obo = (None, None)
         if obo:
             t_obo, out_obo = best(obo, name, a.n)
@@ -156,8 +161,9 @@ def main():
         t_plain, out_plain, i_plain, c_plain = timed(plain)
         if plain and out_plain != out_obx:
             raise SystemExit(f"{name}: outputs differ: obx {out_obx!r}, plain C {out_plain!r}")
-        rows.append(dict(name=name, obo=t_obo, c=t_obx, n=t_obxn, plain=t_plain, out=out_obx,
-                         ci=i_obx, ni=i_obxn, pi=i_plain, cc=c_obx, nc=c_obxn, pc=c_plain))
+        rows.append(dict(name=name, obo=t_obo, c=t_obx, n=t_obxn, o=t_obxo, plain=t_plain, out=out_obx,
+                         ci=i_obx, ni=i_obxn, oi=i_obxo, pi=i_plain,
+                         cc=c_obx, nc=c_obxn, oc=c_obxo, pc=c_plain))
     if a.obo:
         if all(r['obo'] is None for r in rows):
             print("note: the obo compiler did not build anything; obo columns skipped", file=sys.stderr)
@@ -169,25 +175,43 @@ def main():
             nr = f"{r['n'] / t_obo:.2f}" if t_obo else "n/a"
             print(f"| {r['name']} | {fmt(t_obo)} | {fmt(r['c'])} | {fmt(r['n'])} | {cr} | {nr} | {r['out']} |")
         return
-    print("| benchmark | via C | native | native/C | plain C | native/plain C | output |")
-    print("|---|---:|---:|---:|---:|---:|---|")
-    for r in rows:
-        pc = fmt(r['plain']) if r['plain'] is not None else "-"
-        npc = f"{r['n'] / r['plain']:.2f}" if r['plain'] else "-"
-        print(f"| {r['name']} | {fmt(r['c'])} | {fmt(r['n'])} | {r['n'] / r['c']:.2f} | "
-              f"{pc} | {npc} | {r['out']} |")
+    if a.opt:
+        print("| benchmark | via C | native | native -O | -O/C | plain C | -O/plain C | output |")
+        print("|---|---:|---:|---:|---:|---:|---:|---|")
+        for r in rows:
+            pc = fmt(r['plain']) if r['plain'] is not None else "-"
+            opc = f"{r['o'] / r['plain']:.2f}" if r['plain'] else "-"
+            print(f"| {r['name']} | {fmt(r['c'])} | {fmt(r['n'])} | {fmt(r['o'])} | "
+                  f"{r['o'] / r['c']:.2f} | {pc} | {opc} | {r['out']} |")
+    else:
+        print("| benchmark | via C | native | native/C | plain C | native/plain C | output |")
+        print("|---|---:|---:|---:|---:|---:|---|")
+        for r in rows:
+            pc = fmt(r['plain']) if r['plain'] is not None else "-"
+            npc = f"{r['n'] / r['plain']:.2f}" if r['plain'] else "-"
+            print(f"| {r['name']} | {fmt(r['c'])} | {fmt(r['n'])} | {r['n'] / r['c']:.2f} | "
+                  f"{pc} | {npc} | {r['out']} |")
     if a.perf:
         print()
-        print("| benchmark | C Minstr | native Minstr | native/C | C Mcyc | native Mcyc | native/C | "
-              "plain Minstr | plain Mcyc | native/plain cyc |")
-        print("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
-        for r in rows:
-            def m(x):
-                return f"{x / 1e6:.1f}" if x is not None else "-"
-            npc = f"{r['nc'] / r['pc']:.2f}" if r['pc'] else "-"
-            print(f"| {r['name']} | {m(r['ci'])} | {m(r['ni'])} | {r['ni'] / r['ci']:.2f} | "
-                  f"{m(r['cc'])} | {m(r['nc'])} | {r['nc'] / r['cc']:.2f} | "
-                  f"{m(r['pi'])} | {m(r['pc'])} | {npc} |")
+        def m(x):
+            return f"{x / 1e6:.1f}" if x is not None else "-"
+        if a.opt:
+            print("| benchmark | C Mcyc | native Mcyc | -O Mcyc | -O/C | plain Mcyc | -O/plain | "
+                  "C Minstr | -O Minstr | -O/C |")
+            print("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+            for r in rows:
+                opc = f"{r['oc'] / r['pc']:.2f}" if r['pc'] else "-"
+                print(f"| {r['name']} | {m(r['cc'])} | {m(r['nc'])} | {m(r['oc'])} | {r['oc'] / r['cc']:.2f} | "
+                      f"{m(r['pc'])} | {opc} | {m(r['ci'])} | {m(r['oi'])} | {r['oi'] / r['ci']:.2f} |")
+        else:
+            print("| benchmark | C Minstr | native Minstr | native/C | C Mcyc | native Mcyc | native/C | "
+                  "plain Minstr | plain Mcyc | native/plain cyc |")
+            print("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+            for r in rows:
+                npc = f"{r['nc'] / r['pc']:.2f}" if r['pc'] else "-"
+                print(f"| {r['name']} | {m(r['ci'])} | {m(r['ni'])} | {r['ni'] / r['ci']:.2f} | "
+                      f"{m(r['cc'])} | {m(r['nc'])} | {r['nc'] / r['cc']:.2f} | "
+                      f"{m(r['pi'])} | {m(r['pc'])} | {npc} |")
 
 
 if __name__ == '__main__':

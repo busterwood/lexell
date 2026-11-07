@@ -3,10 +3,12 @@
 Nine small programs, each building the same program with both backends,
 native and via C:
 
-    python3 obx/bench/bench.py [-n RUNS] [--only NAME ...] [--obo] [--perf]
+    python3 obx/bench/bench.py [-n RUNS] [--only NAME ...] [--obo] [--opt] [--perf]
 
-`--perf` adds instructions and cycles (`perf stat`, user mode) beside the
-wall times.
+`--opt` adds a `native -O` build and its columns; `--perf` adds instructions
+and cycles (`perf stat`, user mode) beside the wall times. The compile cost
+of `-O` itself is `python3 obx/tools/optcost.py --compiler <native-built
+obxc>`.
 
 ## Like-for-like comparisons
 

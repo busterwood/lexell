@@ -33,6 +33,7 @@ REDTEAM = os.path.normpath(os.path.join(HERE, '..', 'redteam'))
 NATIVE = os.path.join(HERE, 'native')
 LIBDIRS = ['/usr/lib/x86_64-linux-gnu', '/lib/x86_64-linux-gnu', '/usr/lib64', '/usr/lib', '/usr/local/lib', '/lib']
 TIMEOUT = 10
+OPT = False          # build the native side with -O (the optimising path)
 os.environ.setdefault('OBX_LIB', os.path.normpath(os.path.join(HERE, '..', 'lib')))   # for compilers outside out/
 
 
@@ -118,7 +119,8 @@ def one(path, obxc):
                 return rel, 'skip', ''
             return rel, 'differ', 'C build failed: ' + (out + err)[:300]
         try:
-            r = subprocess.run([obxc, path, '--native', '-o', nexe], capture_output=True, text=True, timeout=60, cwd=tmp)
+            r = subprocess.run([obxc, path, '--native'] + (['-O'] if OPT else []) + ['-o', nexe],
+                               capture_output=True, text=True, timeout=60, cwd=tmp)
         except subprocess.TimeoutExpired:
             return rel, 'differ', 'native build timeout'
         if r.returncode != 0:
@@ -169,7 +171,7 @@ def runtime_parts(obxc):
             mp = os.path.join(t, 'p%d.map' % i)
             with open(p, 'w') as f:
                 f.write(src)
-            r = subprocess.run([obxc, p, '--native', '-o', exe], capture_output=True, text=True,
+            r = subprocess.run([obxc, p, '--native'] + (['-O'] if OPT else []) + ['-o', exe], capture_output=True, text=True,
                                env=dict(os.environ, OBX_NATIVE_MAP=mp))
             if r.returncode != 0:
                 bad.append('parts %d: the build failed: %s' % (i, r.stderr.strip()))
@@ -196,10 +198,13 @@ def main():
     ap.add_argument('--compiler', default=OBXC)
     ap.add_argument('--lib', action='store_true', help='also the library tests')
     ap.add_argument('--redteam', action='store_true', help='also the red-team programs')
+    ap.add_argument('--opt', action='store_true', help='build the native side with -O')
     ap.add_argument('-j', type=int, default=os.cpu_count() or 4)
     ap.add_argument('-v', action='store_true')
     ap.add_argument('filters', nargs='*')
     a = ap.parse_args()
+    global OPT
+    OPT = a.opt
     obxc = os.path.abspath(a.compiler)
     tests = find(a.lib, a.redteam)
     if a.filters:

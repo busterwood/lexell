@@ -22,6 +22,7 @@ steps=(
   "compiler tests|python3 obx/tests/compiler/run_tests.py"
   "lib|python3 obx/lib/run_tests.py -j 8"
   "native lib+run|python3 obx/tests/run_native.py --lib"
+  "native -O lib+run|python3 obx/tests/run_native.py --lib --opt"
   "native selfbuild|bash obx/tools/native_selfbuild.sh"
 )
 if [ "$tier" = full ]; then

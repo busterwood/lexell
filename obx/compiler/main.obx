@@ -2,7 +2,7 @@
 // program to C and builds it with gcc (or runs it, or prints the C).
 //
 //     obxc file.obx [-o out] [--run] [--emit-c] [-L libroot] [-- args...]
-//     obxc file.obx --native [-o out] [--run] [-- args...]   x86-64 ELF, no C compiler (design/native.md)
+//     obxc file.obx --native [-O] [-o out] [--run] [-- args...]   x86-64 ELF, no C compiler (design/native.md)
 //     obxc file.obx --emit-c-json          {"c": C text, "cmd": gcc command} for tools/cbuild.py
 //     obxc --emit-c file.obx file.obx...   the C of each program, in `== path` sections
 //     obxc --dump-ast file.obx...          the tree of each file (no imports)
@@ -32,11 +32,12 @@ import "strings"
 import "./x64gen"
 import "./opt"
 import "./loops"
+import "./cse"
 import "./elf"
 
 extern "c" fn mkdtemp(template: str): str
 
-const USAGE = "usage: obxc file.obx [-o out] [--run] [--emit-c] [--native] [-L libroot]\n"
+const USAGE = "usage: obxc file.obx [-o out] [--run] [--emit-c] [--native [-O]] [-L libroot]\n"
 
 fn usage(): never {
     writeFd(2, USAGE)
@@ -193,10 +194,10 @@ fn jsonStr(s: str): str {
     return b.toStr()
 }
 
-fn build(lib: str, roots: &[]str, src: str, out: str, isRun: bool, emitc: bool, json: bool, isNative: bool, rest: &[]str): int {
+fn build(lib: str, roots: &[]str, src: str, out: str, isRun: bool, emitc: bool, json: bool, isNative: bool, optim: bool, rest: &[]str): int {
     var libs: []str = []
     let p = compileIr(lib, roots, src, mut &libs)
-    if isNative { return buildNative(p, &libs, src, out, isRun, rest) }
+    if isNative { return buildNative(p, &libs, src, out, isRun, optim, rest) }
     let libm = cgen.needsLibm(&p)
     let csrc = cgen.print(p, rtText(&p))
     if emitc {
@@ -298,7 +299,7 @@ fn isElf(path: str): bool {
 }
 
 // The native backend: the executable written directly (no gcc; design/native.md).
-fn buildNative(p: ir.Ir, libs: &[]str, src: str, out: str, isRun: bool, rest: &[]str): int {
+fn buildNative(p: ir.Ir, libs: &[]str, src: str, out: str, isRun: bool, optim: bool, rest: &[]str): int {
     let names = x64gen.dynNames(&p)
     var dl: []elf.Lib = []
     if len(names) > 0 {
@@ -313,7 +314,11 @@ fn buildNative(p: ir.Ir, libs: &[]str, src: str, out: str, isRun: bool, rest: &[
         }
     }
     var symMap = ""
-    let q = loops.optimize(opt.optimize(p))
+    // The default is fast to compile: inlining (opt) and the loop optimisations
+    // (loops, the range facts) only run under -O. The native code they make is
+    // what -O is for; without -O the compiler is smaller and quicker.
+    let p0 = opt.optimize(p)
+    let q = if optim { cse.optimize(loops.optimize(p0)) } else { p0 }
     let irFile = os.envOr("OBX_NATIVE_IR", "")
     if irFile != "" {
         // the IR the native backend would compile, printed as C (for reading; nothing is built)
@@ -388,6 +393,7 @@ fn main() {
     var emitc = false
     var json = false
     var isNative = false
+    var optim = false
     var roots: []str = []
     var src = ""
     var rest: []str = []
@@ -410,6 +416,8 @@ fn main() {
             json = true
         } else if a == "--native" {
             isNative = true
+        } else if a == "-O" {
+            optim = true
         } else if a == "-L" {
             i += 1
             if i >= len(argv) { usage() }
@@ -424,5 +432,5 @@ fn main() {
         i += 1
     }
     if src == "" { usage() }
-    exit(build(libDir(argv[0]), &roots, src, out, isRun, emitc, json, isNative, &rest))
+    exit(build(libDir(argv[0]), &roots, src, out, isRun, emitc, json, isNative, optim, &rest))
 }
