@@ -5039,6 +5039,31 @@ fn (g: &Gen) isBoolVal(e: int): bool {
     return (n.k == ir.E_BIN && isCmp(n.v)) || n.k == ir.E_LNOT || n.k == ir.E_LAND || n.k == ir.E_LOR
 }
 
+// rax = r * k for the constants an lea expresses in one instruction (2, 3, 4, 5, 8, 9);
+// r * 1 is a move. False: k is none of them, nothing generated.
+fn (g: mut &Gen) leaMul(dst: int, r: int, k: int): bool {
+    if k == 1 {
+        g.a.movRR(8, dst, r)
+        return true
+    }
+    if k == 2 {
+        g.a.lea(dst, x64.memx(r, r, 1, 0))
+    } else if k == 3 {
+        g.a.lea(dst, x64.memx(r, r, 2, 0))
+    } else if k == 4 {
+        g.a.lea(dst, x64.memx(-1, r, 4, 0))
+    } else if k == 5 {
+        g.a.lea(dst, x64.memx(r, r, 4, 0))
+    } else if k == 8 {
+        g.a.lea(dst, x64.memx(-1, r, 8, 0))
+    } else if k == 9 {
+        g.a.lea(dst, x64.memx(r, r, 8, 0))
+    } else {
+        return false
+    }
+    return true
+}
+
 fn (g: mut &Gen) genBin(e: int) {
     let n = g.u.nodes[e]
     let op = n.v
@@ -5129,6 +5154,23 @@ fn (g: mut &Gen) genBin(e: int) {
         g.gen(g.u.nodes[n.a].a)
         g.a.shiftI(x64.ROL, 8, RAX, rk)
         return
+    }
+    // A 64-bit add, subtract or small multiply of a local in a register by a constant: one lea,
+    // where the two-operand form needs the local moved into rax first. `fib`'s arguments
+    // (`n - 1`, `n - 2`), `loop`'s `i * 2` and every `x + k` in an expression are this.
+    if g.size(c) == 8 && g.regOf(n.a) >= 0 && g.u.nk(n.b) == ir.E_INT {
+        let k = g.u.nodes[n.b].v
+        let la = g.regOf(n.a)
+        if (op == ir.OP_ADD || op == ir.OP_SUB) && x64.fits32(k) &&
+            (op == ir.OP_ADD || k != -2147483648) {
+            g.a.lea(RAX, x64.mem(la, if op == ir.OP_ADD { k } else { -k }))
+            g.norm(c)
+            return
+        }
+        if op == ir.OP_MUL && g.leaMul(RAX, la, k) {
+            g.norm(c)
+            return
+        }
     }
     let comm = op == ir.OP_ADD || op == ir.OP_AND || op == ir.OP_OR || op == ir.OP_XOR || op == ir.OP_MUL
     let src = if comm { g.pairSrcC(n.a, n.b) } else { g.pairSrc(n.a, n.b) }
@@ -6713,6 +6755,17 @@ fn (g: mut &Gen) arithInto(e: int, r: int, gen: bool): bool {
         b = x
     }
     if !gen { return true }
+    // the same one-lea form as genBin, for the destination the caller named
+    if w < 0 && sz == 8 && g.regOf(a) >= 0 && g.u.nk(b) == ir.E_INT {
+        let bv = g.u.nodes[b].v
+        let ra = g.regOf(a)
+        if ra != r && (op == ir.OP_ADD || op == ir.OP_SUB) && x64.fits32(bv) &&
+            (op == ir.OP_ADD || bv != -2147483648) {
+            g.a.lea(r, x64.mem(ra, if op == ir.OP_ADD { bv } else { -bv }))
+            g.normR(k, r)
+            return true
+        }
+    }
     g.genInto(a, r)
     let alu = if op == ir.OP_ADD { x64.ADD } else if op == ir.OP_SUB { x64.SUB } else if op == ir.OP_AND { x64.AND }
         else if op == ir.OP_OR { x64.OR } else { x64.XOR }
@@ -6750,14 +6803,23 @@ fn (g: mut &Gen) inlineRt(e: int, name: str): bool {
         let a = g.u.listAt(n.b, 0)
         let b = g.u.listAt(n.b, 1)
         if !ar.wrap && (nargs != 3 || !g.isWhere(g.u.listAt(n.b, 2))) { return false }
-        let src = if ar.op == ir.OP_SUB { g.pairSrc(a, b) } else { g.pairSrcC(a, b) }
         let k = ar.k
         let sz = if k == ir.TY_I64 || k == ir.TY_U64 { 8 } else { 4 }
+        // the local times the constant, straight from its register into rax
+        if ar.wrap && ar.op == ir.OP_MUL && g.u.nk(b) == ir.E_INT && g.regOf(a) >= 0 {
+            if g.leaMul(RAX, g.regOf(a), g.u.nodes[b].v) {
+                g.normR(k, RAX)
+                return true
+            }
+        }
+        let src = if ar.op == ir.OP_SUB { g.pairSrc(a, b) } else { g.pairSrcC(a, b) }
         if ar.op == ir.OP_MUL && k == ir.TY_U64 && !ar.wrap {
             g.srcRCX(src)
             g.a.unary(x64.MUL, 8, RCX)                  // rdx:rax; CF and OF when rdx != 0
         } else if ar.op == ir.OP_MUL {
-            g.imulSrc(if k == ir.TY_I32 || k == ir.TY_I64 { sz } else { 8 }, RAX, src)
+            if !(ar.wrap && src.imm && g.leaMul(RAX, RAX, src.v)) {
+                g.imulSrc(if k == ir.TY_I32 || k == ir.TY_I64 { sz } else { 8 }, RAX, src)
+            }
         } else {
             g.aluSrc(if ar.op == ir.OP_ADD { x64.ADD } else { x64.SUB }, sz, RAX, src)
         }
