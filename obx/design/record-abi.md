@@ -246,6 +246,43 @@ own outgoing area is the same `rsp` region while it runs.
 `Decimal` API to return `Result` everywhere is an API change, not a
 codegen one; not attempted.
 
+### 4.5 Kept: the match payload as a borrow, and the call that takes a place
+
+Two later passes (`decimal-match`, from the same seed) remove site 5 and the
+`errSum` call without a by-reference ABI:
+
+- **Payload borrows** (`opt.obx`, ~120 lines). A record local declared as a
+  copy of a place and used only as a call's address (`T d = p.f; f(..., &d)`)
+  stands for the place when nothing between the two statements writes it, the
+  call's other arguments are pure, and the callee writes no memory and lets
+  its pointer escape nowhere (a per-callee `pureBody` proof). This is exactly
+  the `Ok(d) { return sumOf(acc, &d) }` site 5: errSum's 48-byte copy and the
+  address of a local become the address of the payload inside the scrutinee.
+- **Inlining a call whose record argument is a place** (`opt.obx`, ~25
+  lines). A callee with a by-value struct parameter over 16 bytes passed a
+  place is inlined up to `INLINE_LIMIT + 15` nodes. `errSum` is 39 nodes and
+  its `Result` argument 64 bytes, so at 25 it stayed a call: the call and the
+  64-byte argument copy (site 4, which becomes a local copy) are what changes.
+  The global `INLINE_LIMIT = 40` experiment reached the same numbers but grew
+  the native compiler +12.6%; this rule grows it +0.9% and leaves the
+  `-O`/default ratio at +14.9%.
+
+Measured on the Decimal microbenchmarks (`--native -O`, 50 reps less the
+setup run, best of 5, instructions / cycles): add M2:19 −5.80% / −14.0%, mul
+M3:19 −5.60% / −16.9%, quantize M6:6 −6.21% / −32.7%, parse M7:20 −2.69% /
+−7.1%, and the 40-case suite −4.36% instructions (default reps, setup
+subtracted; the borrow alone is −1.0% on add/mul/quantize). The Decimal app row moves from
+1.21 instr / 1.06 cyc against C to 1.16 / 0.96; json, jq, regex and cmark
+instructions are unchanged or −0.15%. A 128-bit member of a pointer local now
+also goes straight to its argument registers (`x64gen`, 18 lines), which is
+−1.7% instructions on both cmp cases.
+
+A narrower threshold of "over 32 bytes" removes the extra compile work
+(compiling jq's default path +21.8% with the 16-byte rule) but loses M3:big
+(+15%) and M5 (+2–6%) because the `U256` helpers stop being inlined; it is
++0.4% over the 16-byte rule on the whole suite. A negative: the 16-byte rule's
+price is compile work on programs with many 32-byte records, not runtime.
+
 ## 5. Why the by-reference oracle is not an instruction win for add
 
 On the base (without the safe pass), `OBX_BYREF` removes sites 1–4 (40
