@@ -653,6 +653,15 @@ stat`, least of N). `diff.py` is the differential test that every change to
 Decimal must pass: 11 operations on 10^6 inputs each, old and new tree,
 native and C, identical text, errors and scales.
 
+A matched comparison with .NET's `System.Decimal` and Java's `BigDecimal` is
+in [design/decimal-performance.md](obx/design/decimal-performance.md):
+19-digit add, 6x6 multiply, 12/6 divide at scale 2, 20-digit parse,
+19-digit format and compare, plus 38-digit cases that .NET cannot represent.
+In short: .NET's 16-byte decimal is 2.2 to 2.5 times faster on add and
+multiply and 3 times faster on compare; obx is about twice as fast at parse
+and 1.6 times at format; Java is fast on small arithmetic but its parse is
+about twice obx's and its 38-digit format 3 times.
+
 Cycles per operation (the difference between 50 rounds and none over the
 4096 inputs, least of 5, pinned to one core; re-measured 2026-11-07 at
 `b6777cf4`):

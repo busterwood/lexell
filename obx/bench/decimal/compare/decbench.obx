@@ -1,0 +1,224 @@
+// Matched decimal benchmark: same inputs and operation counts as DecBench.cs
+// and DecBench.java. Prints "<case> <ns/op> <checksum>".
+//
+//     decbench
+//
+// 4096 inputs built from the same splitmix64 seed and the same construction
+// as the other two harnesses: 19-digit add, 6x6 mul, 12/6 div at scale 2,
+// 20-digit parse, 19-digit format and 19-digit compare; best of 7 runs each.
+
+import "time"
+
+const N: int = 4096
+const REPS: int = 4000
+
+var SEED: u64 = 0x2545f4914f6cdd1d
+
+fn next(): u64 {
+    SEED = SEED +% 0x9e3779b97f4a7c15
+    var z = SEED
+    z = (z ^ (z >> 30)) *% 0xbf58476d1ce4e5b9
+    z = (z ^ (z >> 27)) *% 0x94d049bb133111eb
+    return z ^ (z >> 31)
+}
+
+fn below(n: int): int { return int(next() % u64(n)) }
+
+fn p10(k: int): u128 {
+    var x: u128 = 1
+    for i in 0..k { x = x * 10 }
+    return x
+}
+
+fn coefNZ(d: int): u128 {
+    let lo = p10(d - 1)
+    let range = 9 * lo
+    var c = lo + u128(next()) % range
+    if c % 10 == 0 { c += 1 }
+    return c
+}
+
+fn dec(c: u128, scale: int, neg: bool): Decimal {
+    var u = i128(c)
+    if neg { u = -u }
+    return fromFraction(u, scale)
+}
+
+fn pad19(c: u128): str {
+    var s = u128ToStr(c)
+    while len(s) < 19 { s = "0" + s }
+    return s
+}
+
+fn resHash(d: Decimal): u64 {
+    var x = u64(d.coefficient() & 0xffffffffffffffff) ^ u64(d.scale())
+    if d.isNeg() { x = x ^ 1 }
+    return x
+}
+
+fn benchAdd(xs: &[]Decimal, ys: &[]Decimal, reps: int): u64 {
+    var a: u64 = 0
+    for r in 0..reps {
+        for i in 0..N { a = a +% resHash(xs[i].add(ys[i])) }
+    }
+    return a
+}
+
+fn benchMul(xs: &[]Decimal, ys: &[]Decimal, reps: int): u64 {
+    var a: u64 = 0
+    for r in 0..reps {
+        for i in 0..N { a = a +% resHash(xs[i].mul(ys[i])) }
+    }
+    return a
+}
+
+fn benchDiv(xs: &[]Decimal, ys: &[]Decimal, reps: int): u64 {
+    var a: u64 = 0
+    for r in 0..reps {
+        for i in 0..N {
+            match xs[i].div(ys[i], 2, Rounding.HALF_EVEN) {
+                Ok(d) { a = a +% resHash(d) }
+                Err(e) { a = a +% 3 }
+            }
+        }
+    }
+    return a
+}
+
+fn benchParse(xs: &[]str, reps: int): u64 {
+    var a: u64 = 0
+    for r in 0..reps {
+        for i in 0..N {
+            match Decimal.parse(xs[i]) {
+                Ok(d) { a = a +% resHash(d) }
+                Err(e) { a = a +% 5 }
+            }
+        }
+    }
+    return a
+}
+
+fn benchFormat(xs: &[]Decimal, reps: int): u64 {
+    var a: u64 = 0
+    for r in 0..reps {
+        for i in 0..N { a = a +% u64(len(xs[i].toStr())) }
+    }
+    return a
+}
+
+fn benchCmp(xs: &[]Decimal, ys: &[]Decimal, reps: int): u64 {
+    var a: u64 = 0
+    for r in 0..reps {
+        for i in 0..N { a = a +% u64(xs[i].cmp(&ys[i]) + 2) }
+    }
+    return a
+}
+
+fn report(name: str, best: int, acc: u64, reps: int) {
+    let ops = reps * N
+    let ns = float(best) / float(ops)
+    println(name + " " + ns.toStr() + " " + acc.toStr())
+}
+
+fn main() {
+    var xs19: []Decimal = []
+    var ys19: []Decimal = []
+    var xs6: []Decimal = []
+    var ys6: []Decimal = []
+    var xs12: []Decimal = []
+    var ys12: []Decimal = []
+    var fmts: []Decimal = []
+    var cmpA: []Decimal = []
+    var cmpB: []Decimal = []
+    var parseStrs: []str = []
+
+    for i in 0..N {
+        let cx = coefNZ(19)
+        let nx = below(4) == 0
+        append(mut &xs19, dec(cx, 2, nx))
+        let cy = coefNZ(19)
+        append(mut &ys19, dec(cy, 2, false))
+
+        let mx = coefNZ(6)
+        let nm = below(2) == 0
+        append(mut &xs6, dec(mx, 4, nm))
+        let my = coefNZ(6)
+        append(mut &ys6, dec(my, 3, false))
+
+        let dx = coefNZ(12)
+        let nd = below(2) == 0
+        append(mut &xs12, dec(dx, 2, nd))
+        let dy = coefNZ(6)
+        append(mut &ys12, dec(dy, 2, false))
+
+        let lead = 1 + below(9)
+        let digits = intToStr(lead) + pad19(coefNZ(19))
+        var t = strSlice(digits, 0, 16) + "." + strSlice(digits, 16, 20)
+        if below(3) == 0 { t = "-" + t }
+        append(mut &parseStrs, t)
+
+        let fc = coefNZ(19)
+        let fneg = below(3) == 0
+        append(mut &fmts, dec(fc, 2, fneg))
+
+        let ca = coefNZ(19)
+        append(mut &cmpA, dec(ca, 2, false))
+        let cb = coefNZ(19)
+        append(mut &cmpB, dec(cb, 2, false))
+    }
+
+    var best = -1
+    var acc: u64 = 0
+    for k in 0..7 {
+        let t0 = time.monotonicNs()
+        acc = benchAdd(&xs19, &ys19, REPS)
+        let dt = time.monotonicNs() - t0
+        if best < 0 || dt < best { best = dt }
+    }
+    report("add", best, acc, REPS)
+
+    best = -1
+    for k in 0..7 {
+        let t0 = time.monotonicNs()
+        acc = benchMul(&xs6, &ys6, REPS)
+        let dt = time.monotonicNs() - t0
+        if best < 0 || dt < best { best = dt }
+    }
+    report("mul", best, acc, REPS)
+
+    best = -1
+    for k in 0..7 {
+        let t0 = time.monotonicNs()
+        acc = benchDiv(&xs12, &ys12, REPS / 2)
+        let dt = time.monotonicNs() - t0
+        if best < 0 || dt < best { best = dt }
+    }
+    report("div", best, acc, REPS / 2)
+
+    best = -1
+    for k in 0..7 {
+        let t0 = time.monotonicNs()
+        acc = benchParse(&parseStrs, REPS)
+        let dt = time.monotonicNs() - t0
+        if best < 0 || dt < best { best = dt }
+    }
+    report("parse", best, acc, REPS)
+
+    best = -1
+    for k in 0..7 {
+        let t0 = time.monotonicNs()
+        acc = benchFormat(&fmts, REPS / 4)
+        let dt = time.monotonicNs() - t0
+        if best < 0 || dt < best { best = dt }
+    }
+    report("format", best, acc, REPS / 4)
+
+    best = -1
+    for k in 0..7 {
+        let t0 = time.monotonicNs()
+        acc = benchCmp(&cmpA, &cmpB, REPS * 2)
+        let dt = time.monotonicNs() - t0
+        if best < 0 || dt < best { best = dt }
+    }
+    report("cmp", best, acc, REPS * 2)
+}
