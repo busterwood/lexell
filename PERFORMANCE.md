@@ -19,8 +19,7 @@ This page is the current state: the measured tables and what they say about
 the code today, against external references and in absolute terms. The
 figures are from 7 November 2026, the application suite and Decimal tables
 at `fb50b4f1`, the rest at `b6777cf4`, and the benchmark table with the Rust
-column measured on the `bench-rust` branch; where a table comes from an
-earlier sweep it says so. Three references could not be re-run in this
+column at `180d8f5c`; where a table comes from an earlier sweep it says so. Three references could not be re-run in this
 environment: the jq 1.7.1 column, the cmark column of the Markdown table, and
 the Go and Node columns of the HTTP tables.
 
