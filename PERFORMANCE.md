@@ -127,18 +127,18 @@ figure.
 
 | pattern | matches | obx native | obx via C | Go | Rust | rg |
 |---|---:|---:|---:|---:|---:|---:|
-| `Sherlock Holmes` | 926 | 0.20 | 0.24 | 0.48 | 0.08 | 1.8 |
-| `Sherlock\|Holmes\|Watson\|Irene` | 7,350 | 0.84 | 0.70 | 138.19 | 0.42 | 3.0 |
-| `\w+` (all matches) | 669,532 | 35.80 | 22.91 | 153.95 | 17.10 | 41.5 |
-| `(?i)sherlock` | 4,280 | 0.76 | 0.64 | 72.69 | 0.46 | 3.5 |
-| `[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}` | 848 | 0.19 | 0.10 | 78.86 | 0.09 | 2.0 |
-| `(?m)^ERROR .*timeout$` | 197 | 0.34 | 0.41 | 32.09 | 0.59 | 2.5 |
-| `(?P<y>\d{4})-(?P<m>\d{2})-(?P<d>\d{2})` (captures) | 10,755 | 4.02 | 3.08 | 72.55 | 1.28 | 8.5 |
-| `(a*)*b` over 100,000 `a`s | 0 | 0.00 | 0.00 | 3.34 | 0.00 | 1.6 |
+| `Sherlock Holmes` | 926 | 0.20 | 0.25 | 0.46 | 0.08 | 1.8 |
+| `Sherlock\|Holmes\|Watson\|Irene` | 7,350 | 0.85 | 0.71 | 136.63 | 0.42 | 3.0 |
+| `\w+` (all matches) | 669,532 | 34.42 | 23.05 | 153.42 | 17.10 | 41.5 |
+| `(?i)sherlock` | 4,280 | 0.77 | 0.64 | 72.35 | 0.46 | 3.5 |
+| `[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}` | 848 | 0.19 | 0.11 | 79.63 | 0.09 | 2.0 |
+| `(?m)^ERROR .*timeout$` | 197 | 0.35 | 0.42 | 32.58 | 0.59 | 2.5 |
+| `(?P<y>\d{4})-(?P<m>\d{2})-(?P<d>\d{2})` (captures) | 10,755 | 4.18 | 3.14 | 73.99 | 1.28 | 8.5 |
+| `(a*)*b` over 100,000 `a`s | 0 | 0.00 | 0.00 | 3.39 | 0.00 | 1.6 |
 
-The table is the plain `--native` build. With `--native -O`, `\w+` is 31.47 ms
-against 23.02 via C (1.37 wall; 1.07 instructions and 1.14 cycles), the
-alternation 0.77/0.70, `(?i)` 0.70/0.64 and the captures 3.75/3.09.
+The table is the plain `--native` build. With `--native -O`, `\w+` is 29.83 ms
+against 22.98 via C (1.30 wall; 1.03 instructions and 1.11 cycles), the
+alternation 0.76/0.70, `(?i)` 0.70/0.64 and the captures 3.90/3.16.
 
 - **obx and Rust.** The engine has RE2's lazy DFA and Rust's literal
   searches (design/regex.md, "R2 as built"). Through C, obx takes 1.1 times
@@ -154,11 +154,15 @@ alternation 0.77/0.70, `(?i)` 0.70/0.64 and the captures 3.75/3.09.
   runs `forward` and `backward` in one loop, takes the DFA's text by borrow
   (no dup/drop per call), answers the start state from a 256-byte `idxof`
   table without entering `Cache.start`, and scans ASCII in a fast loop whose
-  constant step lets `loops.obx` prove the byte bounds check. That took the
-  per-match overhead from 341 to 46 instructions; what is left on `\w+`
-  (1.07 instructions, 1.14 cycles of the C build with `-O`) is the two call
-  prologues and the deliver callback per match, plus the backend's remaining
-  reloads of headers and stack temporaries.
+  constant step lets `loops.obx` prove the byte bounds check; `findAllIndexN`
+  has a span-specialized driver that appends `Span` directly instead of
+  calling a delivery callback with a two-slot `[]int`. That took the per-match
+  overhead from 341 to 46 to **16 instructions**; what is left on `\w+` (1.03
+  instructions, 1.11 cycles of the C build with `-O`) is mostly the backend's
+  own code shape around the two DFA calls, not library glue. Fusing the
+  forward and backward passes into one call was measured and reverted: it
+  helped native 1.7% but gcc inlined the fused function and took the C build
+  11%, widening the gap.
 - **`(a*)*b`** takes no time: the text has no `b`, and every match ends with
   one (the suffix check), so the search stops before any matcher runs. The
   DFA on such patterns is covered by the tests (`regex_linear`,
@@ -492,8 +496,8 @@ check elimination was measured first and is not it: deleting *every* inline
 check from the native backend buys 3.7% of `\w+`'s instructions and no cycles,
 because the gap is per-match work and instruction selection (HISTORY.md,
 "Tried and shelved"). After the later work those first figures are stale: with
-`-O`, regex `\w+` is 31.5 ms against 23.0 via C (1.37 wall, 1.07 instructions,
-1.14 cycles) and the Decimal aggregate is 1.10 cycles; the application suite
+`-O`, regex `\w+` is 29.8 ms against 23.0 via C (1.30 wall, 1.03 instructions,
+1.11 cycles) and the Decimal aggregate is 1.10 cycles; the application suite
 below is the current table.
 
 `-O` is part of the quick gate: `run_native.py --lib --opt` builds the 613
@@ -509,7 +513,7 @@ the regex and Decimal changes (`OBX_HASH_SEED=42`, core 0, 51 s):
 
 | application | native | C | native/C (wall) | instructions native/C | cycles native/C |
 |---|---:|---:|---:|---:|---:|
-| regex (8 patterns, 3 MB) | 48 ms | 43 ms | 1.11 | 1.09 | 1.16 |
+| regex (8 patterns, 3 MB) | 46 ms | 43 ms | 1.05 | 1.05 | 1.13 |
 | json (20 MB, parse/query/visit) | 514 ms | 526 ms | 0.98 | 1.14 | 0.97 |
 | jq (`-c .`, 20 MB) | 394 ms | 411 ms | 0.96 | 1.13 | 0.92 |
 | cmark (10 MB) | 170 ms | 163 ms | 1.04 | 1.27 | 1.09 |
