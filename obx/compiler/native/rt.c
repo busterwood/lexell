@@ -524,6 +524,22 @@ static void rt_vdso_init(char** envp) {
     rt_ts t;
     if (f && f(1, &t) == 0) rt_vdso_cg = f;
 }
+/* OBX_HASH_SEED=n: a fixed hash key instead of the per-process random one, for benchmark runs
+   that must hash identically over repeated runs and in both backends. Off by default: without
+   the variable, or with an empty or non-numeric value, the random key below is used. n is
+   decimal; the second word is n through the splitmix64 finalizer. */
+static int rt_hash_seed_env(unsigned char* k) {
+    const char* s = getenv("OBX_HASH_SEED");
+    if (!s || *s < '0' || *s > '9') return 0;
+    u64 w0 = 0, w1;
+    while (*s >= '0' && *s <= '9') { w0 = w0 * 10 + (u64)(*s - '0'); s++; }
+    w1 = w0 + 0x9e3779b97f4a7c15ULL;
+    w1 = (w1 ^ (w1 >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    w1 = (w1 ^ (w1 >> 27)) * 0x94d049bb133111ebULL;
+    w1 ^= w1 >> 31;
+    for (int j = 0; j < 8; j++) { k[j] = (unsigned char)(w0 >> (8 * j)); k[8 + j] = (unsigned char)(w1 >> (8 * j)); }
+    return 1;
+}
 /* lib std's hash key (std.obx, "keyed hashing"): the 16 random bytes the kernel gives every
    process (AT_RANDOM), which rt_init finds; std derives its key from them. Without AT_RANDOM
    (never on Linux since 2.6.29) the getrandom system call fills them. Word i, 0 or 1. */
@@ -532,8 +548,10 @@ u64 obxlib_hash_key(i64 i) {
     static unsigned char k[16];
     static bool got;
     if (!got) {
-        if (rt_at_random) for (int j = 0; j < 16; j++) k[j] = rt_at_random[j];
-        else SYS(S_GETRANDOM, k, 16, 0);
+        if (!rt_hash_seed_env(k)) {
+            if (rt_at_random) for (int j = 0; j < 16; j++) k[j] = rt_at_random[j];
+            else SYS(S_GETRANDOM, k, 16, 0);
+        }
         got = true;
     }
     u64 w = 0;

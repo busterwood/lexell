@@ -89,6 +89,9 @@ def find_jq(given):
 
 
 def main():
+    # Map hashes are keyed per process (jq and the JSON library's objects); a fixed seed makes
+    # the obx columns comparable run to run.
+    os.environ.setdefault('OBX_HASH_SEED', '42')
     ap = argparse.ArgumentParser()
     ap.add_argument('-n', '--runs', type=int, default=3)
     ap.add_argument('--mb', type=float, default=80)

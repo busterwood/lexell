@@ -81,6 +81,8 @@ def rg_time(path, pat, runs):
 
 
 def main():
+    # Map hashes are keyed per process; a fixed seed makes the obx columns comparable run to run.
+    os.environ.setdefault('OBX_HASH_SEED', '42')
     ap = argparse.ArgumentParser()
     ap.add_argument('-n', type=int, default=5, help='runs of each driver (default 5)')
     ap.add_argument('--reps', type=int, default=5, help='searches per pattern in a run (default 5)')

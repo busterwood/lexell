@@ -57,6 +57,13 @@ best wall time of N runs (default 5) with `OBX_CHECK` unset. A program with a
 hand-written C reference in `c/NAME.c` (no checks; so far `sieve`) is also
 built with `gcc -O2` and timed, as the "plain C" column.
 
+The runs set `OBX_HASH_SEED=42` (`--hash-seed N`, or `--random-hash` for the
+production default), so `maps` hashes the same way in both builds and in every
+run. The runtime reads that variable once, in `obxlib_hash_key`, and derives
+the same key for the two builds; without it, the key stays the per-process
+random one from `AT_RANDOM`. `Map` keeps insertion order, so the program's
+output does not depend on the seed.
+
 | program | what it does |
 |---|---|
 | `fib` | recursive calls |
@@ -72,6 +79,39 @@ built with `gcc -O2` and timed, as the "plain C" column.
 
 The results, with eza and the compiler, are in
 [PERFORMANCE.md](../../PERFORMANCE.md).
+
+## Application suite
+
+`python3 obx/bench/apps.py [-n RUNS] [--only APP ...] [--json] [--json-out FILE]
+[--tsv FILE] [--pin CORE] [--no-perf] [--no-opt] [--json-mb MB] [--md-mb MB]`
+is the Tier-1 table for applications: each source is built natively (`--native
+-O`) and through C, the two builds must print the same counts or checksums
+(timings in their output are ignored), and both are timed with `perf stat -e
+instructions:u,cycles:u`, best of RUNS, pinned to one core (default 4). It
+reuses the existing harnesses rather than their input generation: `regex`
+(`regex_bench.obx` and `gen_corpus.py`), `json` (`json_bench.obx` and
+`gen_data.py`, 20 MB by default), `jq` (`cmd/jq.obx`, `-c .` on that data,
+output SHA-256 compared), `cmark` (`cmd/cmark.obx` on the CommonMark spec
+repeated to 10 MB, the `tests/markdown.py --perf` input) and `decimal`
+(`dbench.obx`, every case, checksums compared; its row sums the cases). The
+table is also available as JSON (`--json`, `--json-out`) and TSV (`--tsv`) for
+regression tracking.
+
+One baseline, `-n 3`, core 4, hash seed 42, 59 s end to end:
+
+| application | native -O | C | native/C | native Minstr | C Minstr | instr native/C | native Mcyc | C Mcyc | cyc native/C |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| regex | 87 ms | 64 ms | 1.36 | 1215.9 | 961.1 | 1.27 | 319.9 | 217.0 | 1.47 |
+| json | 629 ms | 643 ms | 0.98 | 4418.6 | 3858.5 | 1.15 | 2183.8 | 2205.6 | 0.99 |
+| jq | 461 ms | 493 ms | 0.93 | 4288.6 | 3783.9 | 1.13 | 1620.3 | 1760.1 | 0.92 |
+| cmark | 214 ms | 187 ms | 1.14 | 1489.6 | 1169.4 | 1.27 | 645.7 | 559.2 | 1.15 |
+| decimal | 3158 ms | 2830 ms | 1.12 | 56393.8 | 44082.3 | 1.28 | 13287.9 | 11773.7 | 1.13 |
+
+`regex` still pays for the native backend's per-match work; `json` and `jq`
+are level on wall time, `cmark` within 1.14, all with more instructions
+natively (the C build's libc does more per call); `decimal` is about 1.1 times
+C. The suite also sets `OBX_HASH_SEED` (42 by default, `--random-hash` to opt
+out), so map-using programs hash identically in both builds.
 
 `regex/` is the regex library's benchmark (design/regex.md section 4):
 `python3 obx/bench/regex/bench.py` times eight patterns over a generated
