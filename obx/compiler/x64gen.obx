@@ -3487,6 +3487,19 @@ fn (g: &Gen) staticMem(e: int): x64.Mem {
 // Whether staticMem may name a value of type t through a register: a scalar of 8 bytes or less.
 fn (g: &Gen) viaRegOk(t: int): bool { return g.u.isScalar(t) && !g.isAggr(t) && !g.is128(t) }
 
+// The memory of a 128-bit value that is `*p` of a pointer local in a register, or a member of
+// that: [r + disp]; else base -9. staticMem's viaReg names scalars; this is the same place
+// read as two eightbytes (a call argument, which argDirect may leave to its register loads).
+fn (g: &Gen) viaReg128(x: int): x64.Mem {
+    let n = g.u.nodes[x]
+    if n.k == ir.E_DEREF && g.regOf(n.a) >= 0 { return x64.mem(g.regOf(n.a), 0) }
+    if n.k == ir.E_MEMBER {
+        let p = g.viaReg128(n.a)
+        if p.base != -9 { return at(p, n.v) }
+    }
+    return x64.mem(-9, 0)
+}
+
 // The memory of the aggregate x when it is `*p` of a pointer local in a register, or a member
 // of that: [r + disp]; else base -9.
 fn (g: &Gen) viaReg(x: int): x64.Mem {
@@ -6178,7 +6191,8 @@ fn (g: mut &Gen) genCall(e: int) {
                     g.a.movRR(8, INT_REGS[ni], g.preg[g.u.nodes[x].a])
                     g.a.movRR(8, INT_REGS[ni + 1], g.preg2[g.u.nodes[x].a])
                 } else {
-                    let m = g.staticMem(x)
+                    var m = g.staticMem(x)
+                    if m.base == -9 { m = g.viaReg128(x) }
                     g.a.load(8, INT_REGS[ni], m)
                     g.a.load(8, INT_REGS[ni + 1], at(m, 8))
                 }
@@ -6311,7 +6325,9 @@ fn (g: mut &Gen) dupArg(e: int, j: int): bool {
 // call with no other register used: a simple integer, or a double or aggregate in memory that
 // needs no code; a double in a register or a constant.
 fn (g: &Gen) argDirect(x: int, t: int): bool {
-    if g.is128(t) { return g.u.nodes[x].ty == t && (g.pairOf(x) >= 0 || g.staticMem(x).base != -9) }
+    if g.is128(t) {
+        return g.u.nodes[x].ty == t && (g.pairOf(x) >= 0 || g.staticMem(x).base != -9 || g.viaReg128(x).base != -9)
+    }
     if g.isF(t) && (g.fregOf(x) >= 0 || g.u.nk(x) == ir.E_FLT) { return true }
     if g.isAggr(t) || g.isF(t) { return g.staticMem(x).base != -9 }
     return g.simple(x)
