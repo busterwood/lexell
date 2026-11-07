@@ -1310,43 +1310,43 @@ favours either client.
 
 ### Re-measured 2026-11-07
 
-The two gates were run again at `1e601121` with the current native `postgres`
-client: three complete `--db 4,16` runs and three complete `--workers
-1,2,4,8 --db 4` runs. The one-minute load at the start of each was 1.17 to
-1.45 for the pool runs and 1.29 to 1.39 for the worker runs. Each cell is
-the best of the runs; most moved by 2% to 8% from run to run, with larger
-dips in a few rows when another agent's build overlapped a run. The libpq
-comparison and the 2026-11-06 kill-test counts above are kept as history.
+The two gates were run again at `b6777cf4` with the current native `postgres`
+client: two complete `--db 4,16` runs and two complete `--workers
+1,2,4,8 --db 4` runs. The one-minute load at the start of each was 1.92 and
+2.11 for the pool runs and 2.15 and 10.07 for the worker runs (the second
+overlapped the tail of another gate). Each cell is the best of the runs;
+most moved by 1% to 6% from run to run. The libpq comparison and the
+2026-11-06 kill-test counts above are kept as history.
 
 GET /db, 10,000 idle connections: requests/s, latency in us as p50/p99.
 
     server  pool  clients   req/s    p50/p99
-    native  4     1         2,628    357/651
-    native  4     10        20,699   469/775
-    native  4     100       19,614   5011/6232
-    c       4     1         2,510    377/704
-    c       4     10        21,424   454/714
-    c       4     100       18,935   5208/6310
-    native  16    1         2,466    382/761
-    native  16    10        19,561   499/803
-    native  16    100       19,888   4945/6531
-    c       16    1         2,539    370/734
-    c       16    10        19,813   491/818
-    c       16    100       20,296   4834/6678
+    native  4     1         2,594    368/665
+    native  4     10        20,818   469/739
+    native  4     100       20,016   4880/6370
+    c       4     1         2,620    367/634
+    c       4     10        21,310   457/710
+    c       4     100       20,448   4800/5890
+    native  16    1         2,633    362/693
+    native  16    10        20,310   483/746
+    native  16    100       21,217   4627/6142
+    c       16    1         2,656    354/700
+    c       16    10        20,080   484/799
+    c       16    100       21,785   4507/6022
 
 An idle connection cost 14.9 to 15.3 KB in every run, and `/shutdown` with
-the 10,000 idle connections open took 0.53 to 0.59 s, exit 0, every pool
+the 10,000 idle connections open took 0.54 to 0.58 s, exit 0, every pool
 connection idle.
 
 Workers, 256 connections: requests/s at 1, 2, 4 and 8 workers (pool 4 each).
 
-    GET /db   native   17,809  32,288  45,744  59,125
-              c        16,618  31,339  42,466  59,347
-    GET /     native   59,099  90,877 121,217 121,274
-              c        55,250  91,404 115,867 117,190
+    GET /db   native   19,275  31,919  47,674  60,852
+              c        18,921  32,495  48,070  62,347
+    GET /     native   56,215  95,292 122,990 124,333
+              c        60,894  98,047 124,723 125,134
 
-The kill test passed in all six runs: 64 to 80 requests lost, restart in 105
-to 111 ms, every worker drained with exit 0.
+The kill test passed in all four runs: 46, 48, 100 and 100 requests lost,
+restart in 105 to 108 ms, every worker drained with exit 0.
 
 ## 28. As built (P3b)
 
@@ -1427,20 +1427,20 @@ size at high latency is unchanged (note 8 of section 21).
 ### Re-measured 2026-11-07
 
 `run.py --latency 0,2.5 --latency-clients pg,pglibpq --small 0 --modes
-stream,buffered --runs 3` at `1e601121`, CPU 10, the load average 1.11 at
+stream,buffered --runs 3` at `b6777cf4`, CPU 10, the load average 3.37 at
 the start; a delay proxy in front of the TLS TCP port (the measured round
-trip through the proxy is 6.36 ms at 2.5 ms one way). Milliseconds for
+trip through the proxy is 6.1 to 6.2 ms at 2.5 ms one way). Milliseconds for
 1,000,000 rows, the least of 3 interleaved runs:
 
 | one way | client | streamed native | streamed C | buffered native | buffered C |
 |---:|---|---:|---:|---:|---:|
-| 0 ms | pg | 448 | 477 | 762 | 855 |
-| 0 ms | pglibpq | 647 | 707 | 788 | 846 |
-| 2.5 ms | pg | 480 | 522 | 787 | 935 |
-| 2.5 ms | pglibpq | 652 | 728 | 845 | 897 |
+| 0 ms | pg | 415 | 460 | 700 | 844 |
+| 0 ms | pglibpq | 598 | 692 | 793 | 811 |
+| 2.5 ms | pg | 458 | 482 | 739 | 912 |
+| 2.5 ms | pglibpq | 633 | 692 | 852 | 874 |
 
 The native stream is one Execute with no row limit (`roundTrips()` is 1),
-so the 2.5 ms delay adds only about 32 ms; the P3b run above, with 164
+so the 2.5 ms delay adds only about 40 ms; the P3b run above, with 164
 batches, added 45 ms. Native streamed is faster than libpq at both delays;
-the buffered queries are level. Peak RSS stayed at 12.3 MB for the native
-stream and 94.7 MB buffered; the checksums were equal in every row.
+the buffered queries are level. Peak RSS stayed at 12.3 to 12.4 MB for the
+native stream and 94.7 MB buffered; the checksums were equal in every row.
