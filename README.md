@@ -4,12 +4,13 @@
 16 KB native binary in 12 ms, and produces code as fast as Rust — and often
 faster than C.**
 
-obx is a small language in the Oberon line. It adds generics from the start
-and needs no garbage collector: each value has one owner, and borrows use
-group borrowing —
+obx is a small language in the Oberon line — the family Go also draws on. It
+looks a bit like Go, but has generics and uses single ownership with group
+borrowing —
 [simpler memory management than Rust](https://verdagon.dev/blog/valen-group-borrowing),
-with no lifetime annotations. Strings are reference counted, and generic code
-is checked where it is written and compiled per instance.
+with no lifetime annotations — instead of a garbage collector. Strings are
+reference counted, and generic code is checked where it is written and
+compiled per instance.
 
 Concurrency is cooperative tasks on one OS thread: stackful coroutines over
 an epoll loop, with handlers written in ordinary blocking style — no
@@ -20,12 +21,10 @@ second; eight workers reach about 124,000.
 The compiler is 39,436 lines of obx, a 2.9 MB static binary with no LLVM
 behind it, rebuilding itself in 0.66 s. It writes x86-64 ELF directly.
 
-- **The code is fast.** Level with or ahead of idiomatic Rust on eight of
-  nine microbenchmarks; Rust is ahead only on `tokens` (21%). Against the
-  same source built through obx's C backend, `-O` wins nine of ten. Against
-  hand-written C, obx is 2x on allocation, 1.7x on strings and 1.8x on the
-  sieve, and ahead on lists and trees. C wins only on `array` (3.7x, AVX2
-  auto-vectorisation), `tokens` (22%) and slightly `fib` (4%).
+- **The code is fast.** It is level with or ahead of idiomatic Rust on eight
+  of nine microbenchmarks, and beats the same source built through obx's C
+  backend on nine of ten. Against hand-written C it is 2x on allocation,
+  1.7x on strings and 1.8x on the sieve.
 - **Building is fast.** The nine benchmark programs compile in 104 ms
   against 2.95 s for the Rust suite. Rust's `rustc` plus its driver and LLVM
   is 316 MB; with the rest of the toolchain it is 1.3 GB.
