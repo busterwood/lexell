@@ -3,8 +3,8 @@
 Status: research note recorded 2026-11-07 (main at `9298038f`). This states the
 goals, the survey of other small compilers and the candidate optimizations for
 the native backend; it is a direction to test, not a decided pipeline. The
-measurements that decide each step belong in [../PERFORMANCE.md](../PERFORMANCE.md)
-and the pass-by-pass history in [../HISTORY.md](../HISTORY.md).
+measurements that decide each step belong in [../../PERFORMANCE.md](../../PERFORMANCE.md)
+and the pass-by-pass history in [../../HISTORY.md](../../HISTORY.md).
 
 ## Goals
 

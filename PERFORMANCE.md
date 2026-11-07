@@ -67,7 +67,7 @@ portable constants.
 The plain fast-compile path (`--native`, no `-O`) is slower where the loop passes
 matter: loop 446 ms, array 183 ms, sieve 187 ms; it is 0.50 on alloc and 0.54
 on strings either way. `maps` moves with the hash seed;
-[design/codegen-audit.md](design/codegen-audit.md) records the remaining
+[design/codegen-audit.md](obx/design/codegen-audit.md) records the remaining
 code-shape gaps.
 
 - **Native is ahead on allocation and strings** (alloc, lists, strings,
