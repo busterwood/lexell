@@ -153,7 +153,41 @@ checksum (equal across modes), buffer 1,024 rows, peak RSS of the process
 (VmHWM), least of 3 interleaved runs pinned to one CPU. The servers run on
 the same machine.
 
-(The PostgreSQL rows of the tables below were measured with the libpq client, before `postgres` moved to `pgwire`; the native client is measured in P3 of design/pgwire-stages.md.)
+(In the 2026-11-06 tables below, the PostgreSQL rows were measured with the libpq client, before `postgres` moved to `pgwire`; that run is kept as history.)
+
+### Re-measured 2026-11-07
+
+`python3 obx/bench/dbstream/run.py --cpu 10 --runs 5` at `1e601121`: all
+four clients in one run, 1,000,000 rows streamed and buffered and 100,000
+rows streamed, buffer 1,024, peak RSS, each figure the least of 5
+interleaved runs. The load average was 1.48 at the start. The checksums
+were equal for every client, backend and mode (5100839895 at 100,000 rows,
+505509398896 at 1,000,000). A second full run (load 1.06 at the start)
+moved every 1,000,000-row time by at most 6%.
+
+| client | backend | streamed 100,000 | streamed 1,000,000 | buffered 1,000,000 |
+|---|---|---:|---:|---:|
+| SQL Server | C | 115 ms, 11.5 MB | 485 ms, 11.5 MB | 1,248 ms, 364.8 MB |
+| SQL Server | native | 103 ms, 12.0 MB | 404 ms, 12.0 MB | 1,095 ms, 365.7 MB |
+| PostgreSQL | C | 51 ms, 8.2 MB | 458 ms, 8.2 MB | 908 ms, 88.7 MB |
+| PostgreSQL | native | 46 ms, 9.1 MB | 422 ms, 9.5 MB | 770 ms, 90.8 MB |
+| PostgreSQL (libpq) | C | 72 ms, 8.1 MB | 651 ms, 8.3 MB | 881 ms, 109.3 MB |
+| PostgreSQL (libpq) | native | 64 ms, 8.8 MB | 571 ms, 8.8 MB | 851 ms, 109.8 MB |
+| Oracle | C | 82 ms, 13.7 MB | 464 ms, 14.1 MB | 676 ms, 111.0 MB |
+| Oracle | native | 81 ms, 13.6 MB | 473 ms, 13.6 MB | 635 ms, 111.6 MB |
+
+- Peak RSS stays flat while streaming: 8.1 to 14.1 MB at both 100,000 and
+  1,000,000 rows (the program, its buffer and, for Oracle, a fetch of about
+  10,000 rows). Buffered grows with the result: 90.8 MB (PostgreSQL native,
+  its whole result), 109.3 to 109.8 MB (libpq's `PGresult`), 111.0 to
+  111.6 MB (Oracle, each value's bytes) and 364.8 to 365.7 MB (SQL Server,
+  a decoded cell per value).
+- Streaming is faster everywhere: 2.6x to 2.7x for SQL Server, 1.8x to
+  2.0x for PostgreSQL's native client, 1.35x to 1.5x for libpq and 1.3x to
+  1.5x for Oracle.
+- The checksums are equal in every row (rows, ids, name lengths, amounts).
+
+The tables after this one are the earlier 2026-11-06 run, kept as history.
 
 Measured 2026-11-06 13:53 on CPU 10 (11 idle), branch `streaming` at
 deb05bea. The load average was 4.1 at the start and 12.6 at the end (other
@@ -379,8 +413,8 @@ ahead, cost about 164 round trips. libpq's stream is not as slow there
 on the round trip at high latency. That is a design decision (open question
 8 in design/pgwire.md section 21), not built here. (Row limits went after
 this run: the PostgreSQL stream is now one Execute with no row limit,
-design/pgwire.md section 12; its 2.5 ms run is in section 28: native 431 ms,
-libpq 607 ms.)
+design/pgwire.md section 12; its 2.5 ms run is in section 28 (re-measured
+2026-11-07: native 480 ms, libpq 652 ms).)
 
 ## 8. API as built
 

@@ -13,11 +13,13 @@ Both are built from the same IR and must behave identically; the gate checks
 that on every test program. This page is the current report. Its figures
 were re-measured on 7 November 2026 at `5d340654`, after the `-O` ladder,
 the regex per-match work, the Markdown scan change, the Decimal `mul128` and
-in-place compare, and the method-receiver copy pass merged. The sections
-that could not be re-measured in this environment say so: the jq reference
-column (jq 1.7.1 is not installed), the cmark column of the Markdown table,
-the Go and Node columns of the HTTP tables, and the Postgres, Oracle and
-SQL Server tables (no database DSNs were configured).
+in-place compare, and the method-receiver copy pass merged; the database
+sections (`### With a Postgres pool`, `### With worker processes` and
+`## Database streaming`) were re-measured again on 7 November 2026 at
+`1e601121`, with the PostgreSQL, Oracle and SQL Server servers on this
+machine. The sections that could not be re-measured in this environment say
+so: the jq reference column (jq 1.7.1 is not installed), the cmark column of
+the Markdown table, and the Go and Node columns of the HTTP tables.
 
 How the numbers got here, the native backend's passes, the earlier figures and
 the obo record, is in [HISTORY.md](HISTORY.md), "The performance record".
@@ -815,9 +817,6 @@ it is not met (design/http-client.md, section 8).
 
 ### With a Postgres pool
 
-Not re-measured at `5d340654`: no database DSN was configured. The table is
-the earlier run.
-
 `python3 obx/cmd/http_gate.py --servers native,c --db 4,16`: the same server
 and load, each request `GET /db`, which takes a connection from a
 `postgres.Pool` of 4 or 16 connections, runs `SELECT $1::int8 + 1` with the
@@ -827,40 +826,35 @@ machine, over its Unix socket. The queries go through the native client
 the socket, and the server's one thread serves the 10,000 idle connections
 and the load meanwhile.
 
-Measured on 2026-11-06 (design/pgwire.md, section 27). Each figure is one
-5 s run. The libpq client
-(`postgres_libpq`) ran in the same gate, interleaved run by run (new, old,
-new, old, with the one-minute load checked before each run: 0.35 to 1.16):
+Measured on 2026-11-07 at `1e601121`, three complete gate runs (each cell:
+requests/s the best of the three, with the latency of that same run), the
+one-minute load 1.17 to 1.45 at the start of each. Each figure is one 5 s
+run; the three runs moved by 2% to 8% from run to run, except one run in
+which the native pool-4 server dipped to 1,738 requests/s at one client and
+14,280 at 10 (another agent's build started during it):
 
 | | native, pool 4 | via C, pool 4 | native, pool 16 | via C, pool 16 |
 |---|---:|---:|---:|---:|
-| 1 client: requests/s | 2,843 | 2,831 | 2,858 | 2,834 |
-| 10 clients: requests/s | 22,064 | 22,681 | 21,301 | 21,740 |
-| 100 clients: requests/s | 22,014 | 21,856 | 23,484 | 23,341 |
-| 1 client: latency p50 / p99 | 336 / 551 µs | 342 / 543 µs | 336 / 534 µs | 341 / 553 µs |
-| 10 clients: latency p50 / p99 | 444 / 645 µs | 432 / 627 µs | 463 / 660 µs | 453 / 645 µs |
-| 100 clients: latency p50 / p99 | 4.44 / 6.14 ms | 4.49 / 6.17 ms | 4.16 / 6.03 ms | 4.21 / 5.96 ms |
+| 1 client: requests/s | 2,628 | 2,510 | 2,466 | 2,539 |
+| 10 clients: requests/s | 20,699 | 21,424 | 19,561 | 19,813 |
+| 100 clients: requests/s | 19,614 | 18,935 | 19,888 | 20,296 |
+| 1 client: latency p50 / p99 | 357 / 651 µs | 377 / 704 µs | 382 / 761 µs | 370 / 734 µs |
+| 10 clients: latency p50 / p99 | 469 / 775 µs | 454 / 714 µs | 499 / 803 µs | 491 / 818 µs |
+| 100 clients: latency p50 / p99 | 5.01 / 6.23 ms | 5.21 / 6.31 ms | 4.95 / 6.53 ms | 4.83 / 6.68 ms |
 
-The same runs with the libpq client (`postgres_libpq`), requests/s:
-
-| | native, pool 4 | via C, pool 4 | native, pool 16 | via C, pool 16 |
-|---|---:|---:|---:|---:|
-| 1 client | 2,943 | 2,946 | 2,891 | 2,993 |
-| 10 clients | 21,881 | 22,054 | 19,789 | 20,247 |
-| 100 clients | 22,121 | 22,497 | 24,270 | 23,867 |
-
-Neither client is faster in these runs: the idle connections cost the same
-with both (about 15 KB each), and the requests/s differ by -5% to +8%, in
-both directions, which is the size of the noise in one 5 s run per figure.
+The libpq comparison of the 2026-11-06 run was not repeated. There the two
+clients were within -5% to +8% of each other in every row, in both
+directions, and the idle connections cost the same with both (about 15 KB
+each); that table is in design/pgwire.md, section 27.
 
 One client pays two round trips, the HTTP one and the server's to
 PostgreSQL (about 100 µs). From 10 clients on, the server's one thread is the
-limit: 1 / 22,000 requests/s is about 45 µs of it per request (the breakdown
+limit: 1 / 20,700 requests/s is about 48 µs of it per request (the breakdown
 was not measured for the native client). With 100 clients, most of them wait
-in the pool's queue (first come, first served), which is where the 4 ms comes
+in the pool's queue (first come, first served), which is where the 5 ms comes
 from. After the load, `/shutdown` with the 10,000 idle connections open took
-about 0.6 s, exit 0, no leak under `OBX_CHECK=1`, every pool connection idle
-and nobody waiting (measured before the native client, with the libpq one).
+0.53 to 0.59 s, exit 0, no leak under `OBX_CHECK=1`, every pool connection
+idle and nobody waiting. An idle connection cost 14.9 to 15.3 KB.
 
 The native client does not wait in a thread for a running query: the task
 parks on the socket, so a waiting query can be cancelled (a CancelRequest on
@@ -871,9 +865,6 @@ libpq's asynchronous API (`PQcancel`).
 
 ### With worker processes
 
-Not re-measured at `5d340654`: the `/db` rows need PostgreSQL and no DSN was
-configured. The table is the earlier run.
-
 `python3 obx/cmd/http_gate.py --workers 1,2,4,8 --db 4`: `httpd ADDR POOL
 WORKERS`, n worker processes under `task.workers` sharing one listener made
 before the fork, each with its own event loop and (for `/db`) its own pool of
@@ -883,46 +874,42 @@ connections spread over 8 load processes (`httpload -p 8`), 5 s per row,
 3, 5, 7 (1 to 4 workers each have a core of their own; 8 workers share four
 cores with SMT), the load on CPUs 8-15 (the other four cores); the gate
 stops if the two sets would share a core. PostgreSQL is not pinned.
-Measured on 2026-11-06 (design/pgwire.md, section 27), the native client
-and the libpq client (`postgres_libpq`) interleaved, new, old, new, old, with
-the load checked before each run. Requests/s, one 5 s run each:
+Measured on 2026-11-07 at `1e601121`, three complete gate runs with the
+native client (each cell: requests/s the best of the three), the one-minute
+load 1.29, 1.35 and 1.39 at the starts. Requests/s, one 5 s run each:
 
 | workers | native `/` | via C `/` | native `/db` | via C `/db` |
 |---:|---:|---:|---:|---:|
-| 1 | 65,480 | 63,045 | 20,896 | 20,357 |
-| 2 | 97,876 | 96,641 | 33,758 | 34,550 |
-| 4 | 126,285 | 127,058 | 49,259 | 48,614 |
-| 8 | 128,158 | 126,878 | 61,147 | 64,335 |
+| 1 | 59,099 | 55,250 | 17,809 | 16,618 |
+| 2 | 90,877 | 91,404 | 32,288 | 31,339 |
+| 4 | 121,217 | 115,867 | 45,744 | 42,466 |
+| 8 | 121,274 | 117,190 | 59,125 | 59,347 |
 
-The same runs with the libpq client:
+Most cells moved by 2% to 5% from run to run; a few moved by 10% to 25%
+when another agent's build started during the run (one 1-worker and one
+2-worker row), which is why the table is the best of three. The libpq
+comparison of the 2026-11-06 run was not repeated; those numbers are in
+design/pgwire.md, section 27.
 
-| workers | native `/` | via C `/` | native `/db` | via C `/db` |
-|---:|---:|---:|---:|---:|
-| 1 | 60,687 | 60,054 | 19,858 | 19,885 |
-| 2 | 98,535 | 96,948 | 33,307 | 33,011 |
-| 4 | 126,291 | 126,183 | 46,046 | 46,461 |
-| 8 | 125,308 | 124,895 | 59,957 | 62,480 |
-
-Section 27 gives no latency for the worker runs, so none is shown here.
-
-`/` scales 1.5 times at 2 workers and 1.9 to 2.0 at 4, then stops: the
-ceiling is the machine's, the loopback TCP of both sides and the WSL2
-virtual machine's cross-CPU wake-ups, not the workers. `/db` keeps scaling to
-8 workers (2.9 to 3.2 times): each request is mostly waiting for PostgreSQL,
-whose backends run on whatever CPUs are free, and 8 workers keep 32 queries
-in flight. A listener of its own in each worker (`httpd ... WORKERS
-reuseport`, `SO_REUSEPORT`) is the other mode; the shared listener is the
-default because connections waiting in a killed worker's own accept queue
-are reset with its socket.
+`/` scales 1.5 to 1.7 times at 2 workers and 2.0 to 2.1 at 4, then stops
+(2.05 to 2.12 at 8): the ceiling is the machine's, the loopback TCP of both
+sides and the WSL2 virtual machine's cross-CPU wake-ups, not the workers.
+`/db` keeps scaling to 8 workers (3.3 to 3.6 times): each request is mostly
+waiting for PostgreSQL, whose backends run on whatever CPUs are free, and 8
+workers keep 32 queries in flight. A listener of its own in each worker
+(`httpd ... WORKERS reuseport`, `SO_REUSEPORT`) is the other mode; the shared
+listener is the default because connections waiting in a killed worker's own
+accept queue are reset with its socket. Only the shared listener is
+re-measured here; the reuseport mode is unchanged.
 
 The kill test (4 workers, `/`, the load reconnecting after an error): a third
-of the way in, `SIGKILL` to one worker. It passed in all four runs of section
-27 (which client each run used is not stated there): 62, 64, 67 and 81
-requests were lost, the requests in flight on the killed worker's
-connections. The supervisor started the worker again after 105 to 107 ms
-(the 100 ms backoff; a crash after the worker is ready never counts toward
-giving up), it accepted from the same queue, and every worker drained at
-`/shutdown` with exit 0, the restart counted.
+of the way in, `SIGKILL` to one worker. It passed in all six runs (three
+worker runs, native and via C). The six runs lost 64, 64, 69, 80, 80 and 80
+requests, the ones in flight on the killed worker's connections. The
+supervisor started the worker again after 105 to 111 ms (the 100 ms backoff;
+a crash after the worker is ready never counts toward giving up), it
+accepted from the same queue, and every worker drained at `/shutdown` with
+exit 0, the restart counted.
 
 ## TLS
 
@@ -968,45 +955,45 @@ gate's "1,000 https requests over kept-alive connections"
 
 ## Database streaming
 
-Not re-measured at `5d340654`: no PostgreSQL, Oracle or SQL Server DSN was
-configured. The tables are the earlier run.
-
 `conn.stream(sql, args, bind, read)` in the SQL Server, PostgreSQL and
 Oracle clients decodes each row straight into the program's own record,
 a caller-owned buffer at a time, instead of holding the whole result in
 memory ([design/db-streaming.md](obx/design/db-streaming.md): the API,
 the column matching, each client's mechanism and early close). Measured
-by `python3 obx/bench/dbstream/run.py` on 6 November 2026 at main `3ba23237`:
-one run of all four clients, pinned to CPU 10, with the load average at 0.50
-at the start: 1,000,000 rows of (bigint, int, text, decimal(12,2)), every
+by `python3 obx/bench/dbstream/run.py` on 7 November 2026 at `1e601121`:
+one run of all four clients, pinned to CPU 10, with the one-minute load
+average 1.48 at the start: 1,000,000 rows of (bigint, int, text,
+decimal(12,2)), every
 value decoded into a record and folded into a checksum, which is equal in
 every row of the table; a buffer of 1,024 rows; peak RSS of the process;
-each figure the least of 5. The servers run on the same machine, unpinned;
-Oracle runs in a rootless podman container, whose networking adds about
-0.38 ms a round trip. `PostgreSQL` is the native client; `PostgreSQL
-(libpq)` is `postgres_libpq`, the old client, kept as the comparison.
+each figure the least of 5 interleaved runs (a second full run moved every
+1,000,000-row time by at most 6%). The servers run on the same machine,
+unpinned; Oracle runs in a rootless podman container,
+whose networking adds about 0.38 ms a round trip. `PostgreSQL` is the native
+client; `PostgreSQL (libpq)` is `postgres_libpq`, the old client, kept as
+the comparison.
 
 | client | backend | streamed | buffered | streamed, 100,000 rows |
 |---|---|---:|---:|---:|
-| SQL Server | via C | 454 ms, 11.5 MB | 1,139 ms, 365.0 MB | 104 ms, 11.5 MB |
-| SQL Server | native | 362 ms, 12.0 MB | 992 ms, 365.7 MB | 98 ms, 12.1 MB |
-| PostgreSQL | via C | 443 ms, 8.4 MB | 849 ms, 88.7 MB | 48 ms, 8.2 MB |
-| PostgreSQL | native | 384 ms, 9.5 MB | 720 ms, 90.9 MB | 41 ms, 9.0 MB |
-| PostgreSQL (libpq) | via C | 623 ms, 8.3 MB | 834 ms, 109.3 MB | 67 ms, 8.3 MB |
-| PostgreSQL (libpq) | native | 552 ms, 8.8 MB | 791 ms, 109.8 MB | 58 ms, 8.8 MB |
-| Oracle | via C | 434 ms, 14.1 MB | 633 ms, 111.0 MB | 75 ms, 13.7 MB |
-| Oracle | native | 444 ms, 13.6 MB | 569 ms, 111.6 MB | 75 ms, 13.6 MB |
+| SQL Server | via C | 485 ms, 11.5 MB | 1,248 ms, 364.8 MB | 115 ms, 11.5 MB |
+| SQL Server | native | 404 ms, 12.0 MB | 1,095 ms, 365.7 MB | 103 ms, 12.0 MB |
+| PostgreSQL | via C | 458 ms, 8.2 MB | 908 ms, 88.7 MB | 51 ms, 8.2 MB |
+| PostgreSQL | native | 422 ms, 9.5 MB | 770 ms, 90.8 MB | 46 ms, 9.1 MB |
+| PostgreSQL (libpq) | via C | 651 ms, 8.3 MB | 881 ms, 109.3 MB | 72 ms, 8.1 MB |
+| PostgreSQL (libpq) | native | 571 ms, 8.8 MB | 851 ms, 109.8 MB | 64 ms, 8.8 MB |
+| Oracle | via C | 464 ms, 14.1 MB | 676 ms, 111.0 MB | 82 ms, 13.7 MB |
+| Oracle | native | 473 ms, 13.6 MB | 635 ms, 111.6 MB | 81 ms, 13.6 MB |
 
 - **Memory is flat while streaming:** the same at 100,000 and 1,000,000
-  rows (8 to 14 MB: the program, its buffer and, for Oracle, a fetch of
+  rows (8.1 to 14.1 MB: the program, its buffer and, for Oracle, a fetch of
   about 10,000 rows). Buffered memory grows with the result: 91 MB for
-  PostgreSQL's native client (its whole result), 109 MB for PostgreSQL
-  through libpq (libpq's whole result), 111 MB for Oracle (each value's
-  bytes, decoded when read) and 365 MB for SQL Server (a decoded cell per
-  value).
-- **Streaming is never slower:** 2.5 to 2.7 times faster for SQL Server,
-  1.9 times for PostgreSQL's native client (1.3 to 1.4 through libpq) and
-  1.3 to 1.5 times for Oracle.
+  PostgreSQL's native client (its whole result), 109 to 110 MB for
+  PostgreSQL through libpq (libpq's whole result), 111 MB for Oracle (each
+  value's bytes, decoded when read) and 365 MB for SQL Server (a decoded
+  cell per value).
+- **Streaming is never slower:** 2.6 to 2.7 times faster for SQL Server,
+  1.8 to 2.0 times for PostgreSQL's native client (1.35 to 1.5 through
+  libpq) and 1.3 to 1.5 times for Oracle.
 - **How each client streams:** SQL Server decodes the reply a packet at a
   time. The native PostgreSQL client sends one Execute with no row limit and
   reads the rows off the socket as the buffer needs them, at most 256 KB a
@@ -1016,8 +1003,9 @@ Oracle runs in a rootless podman container, whose networking adds about
   about 256 KB a round trip (at the widest row for the first FETCH, then at
   the size the rows took: about 9,900 rows here) and sends the next FETCH
   before the program uses the last rows.
-- **Latency:** with a 2.5 ms one-way delay, native streams 1M rows in 431 ms
-  against libpq's 607 (design/pgwire.md, section 28).
+- **Latency:** with a 2.5 ms one-way delay (6.36 ms round trip through the
+  proxy), native streams 1M rows in 480 ms against libpq's 652; at 0 ms they
+  are 448 and 647 ms (design/pgwire.md, section 28).
 - **Client cost per row:** the cycles per row of the earlier run (native,
   streamed / buffered) were Oracle 1,169 / 1,010 and SQL Server 1,290 /
   2,515; they are not measured again in this run. The PostgreSQL figures
