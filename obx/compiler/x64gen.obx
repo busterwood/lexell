@@ -4402,6 +4402,52 @@ fn (g: mut &Gen) op128Into(o: Op128, lo: int, hi: int) {
     }
 }
 
+// lo:hi compared with the 128-bit operand o, word by word (CMP then SBB), keeping lo:hi: a
+// 128-bit local that is already in its two registers is compared where it is, without the copy
+// to rax:rdx. SBB writes its destination, so the high word's subtraction goes through r10.
+fn (g: mut &Gen) cmp128Reg(lo: int, hi: int, o: Op128) {
+    if o.k == 1 {
+        if x64.fits32(o.lo) {
+            g.a.aluI(x64.CMP, 8, lo, o.lo)
+        } else {
+            g.a.movRI(R10, o.lo)
+            g.a.alu(x64.CMP, 8, lo, R10)
+        }
+        g.a.movRR(8, R10, hi)
+        if x64.fits32(o.hi) {
+            g.a.aluI(x64.SBB, 8, R10, o.hi)
+        } else {
+            g.a.movRI(R11, o.hi)
+            g.a.alu(x64.SBB, 8, R10, R11)
+        }
+    } else if o.k == 2 {
+        g.a.alu(x64.CMP, 8, lo, o.lo)
+        g.a.movRR(8, R10, hi)
+        g.a.alu(x64.SBB, 8, R10, o.hi)
+    } else {
+        g.a.aluRM(x64.CMP, 8, lo, o.m)
+        g.a.movRR(8, R10, hi)
+        g.a.aluRM(x64.SBB, 8, R10, at(o.m, 8))
+    }
+}
+
+// [m] (two words) compared with the constant o, leaving the memory as it is.
+fn (g: mut &Gen) cmp128Mem(m: x64.Mem, o: Op128) {
+    if x64.fits32(o.lo) {
+        g.a.aluMI(x64.CMP, 8, m, o.lo)
+    } else {
+        g.a.movRI(R10, o.lo)
+        g.a.aluMR(x64.CMP, 8, m, R10)
+    }
+    g.a.load(8, R10, at(m, 8))
+    if x64.fits32(o.hi) {
+        g.a.aluI(x64.SBB, 8, R10, o.hi)
+    } else {
+        g.a.movRI(R11, o.hi)
+        g.a.alu(x64.SBB, 8, R10, R11)
+    }
+}
+
 fn (g: mut &Gen) alu128Op(op: int, o: Op128) {
     if op == ir.OP_ADD {
         g.alu128(x64.ADD, x64.ADC, o)
@@ -5695,13 +5741,22 @@ fn (g: mut &Gen) genCmp(e: int): int {
             }
         }
         if o.k > 0 && cop != ir.OP_GT && cop != ir.OP_LE {
-            g.gen(n.a)
             if cop == ir.OP_EQ || cop == ir.OP_NE {
+                g.gen(n.a)
                 g.alu128(x64.XOR, x64.XOR, o)
                 g.a.alu(x64.OR, 8, RAX, RDX)
                 return if cop == ir.OP_EQ { x64.CC_E } else { x64.CC_NE }
             }
-            g.alu128(x64.CMP, x64.SBB, o)
+            let pa = g.pairOf(n.a)
+            if pa >= 0 {
+                let l = g.u.nodes[n.a].a
+                g.cmp128Reg(g.preg[l], g.preg2[l], o)
+            } else if o.k == 1 && g.op128(n.a, n.b).k == 3 {
+                g.cmp128Mem(g.op128(n.a, n.b).m, o)
+            } else {
+                g.gen(n.a)
+                g.alu128(x64.CMP, x64.SBB, o)
+            }
             if sgn { return if cop == ir.OP_LT { x64.CC_L } else { x64.CC_GE } }
             return if cop == ir.OP_LT { x64.CC_B } else { x64.CC_AE }
         }
