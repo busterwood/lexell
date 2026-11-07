@@ -2368,3 +2368,46 @@ through C and without `-O` is right), so it is not kept. The pinned local is
 loaded from a parameter slot at entry and lives across calls; the failure is
 in the native register allocation or live-range handling for that shape, not
 in the pass's aliasing rule (conservative address-taking did not fix it).
+
+### Decimal operator fast paths (2026-11-07)
+
+The matched comparison in `design/decimal-performance.md` showed the
+arithmetic itself was not the problem: public `add` was 29.6 ns and 6x6
+`mul` 27.0 ns, while `addExact`/`mulExact` were 20.5/21.2 and the bare
+128-bit coefficient operation 1.25/1.36. The rest was normalisation and the
+`Result`/`orStop` layer. Three changes in `lib/std.obx`:
+
+- equal exponents (the common add) skip both `digits()` bound checks in
+  `addExact`, since a canonical coefficient already has at most 38 digits;
+- `makeDec` counts digits for the exponent check only when the exponent is
+  above `EXP_MAX` (after the `COEF_MAX` check the count is at most 38), and
+  runs the trailing-zero strip only when `coef % 10 == 0`;
+- `add`/`mul` return the `Decimal` directly on their hot path, using
+  `makeDecCore` and a `mut &int` error flag; `addExact`/`mulExact` keep
+  their `Result` body and `sub` is `a.add(b.neg())`.
+
+Public add fell from 29.6 to **13.3 ns** and multiply from 27.0 to
+**17.1**; the exact forms are 12.8 and 16.8 ns and the bare operation is
+unchanged at 1.2/1.3. div fell from 53.2 to 45.9 ns; parse, format and cmp
+are unchanged. dbench native instructions relative to the parent tree:
+`M2:6` 0.661, `M2:19` 0.663, `M3:6` 0.871, `M3:19` 0.874, `M5:s2` 0.935,
+`M6:6` 0.899, `M7:20` and `M8:c19` 1.000; native cycles `M2:6` 0.674,
+`M2:19` 0.684, `M3:6` 0.826, `M3:19` 0.856. The Tier-1 application row
+moved from 0.97 wall / 0.96 cycles to **0.92-0.93 wall / 0.93 cycles** of the
+C build, with
+40 checksums identical. In the matched table add is now 1.2 times .NET
+(was 2.5) and multiply 1.5 times (was 2.2); at 38 digits obx now beats Java
+on add (14.1 against 17.6 ns) and multiply (19.4 against 21.8) while
+staying 3.3 times faster at parse and format.
+
+Rejected: factoring the whole `addExact`/`mulExact` body into one
+Decimal-returning core shared with the operators. The native inliner does
+not inline a body that size, so the exact path paid a call and a
+Decimal-to-`Result` copy: addExact 13.5 -> 19.1 ns, mulExact 17.8 -> 28.0,
+dbench `M2:19` 1.223 and `M3:6` 1.148 instructions. Duplicating the body in
+the operator path, which is what landed, is cheaper than sharing it.
+
+The seed was refreshed with no compiler source change (`std.obx` line
+positions are embedded in the seed's `"std.obx:N"` strings). Gate quick
+passes; `diff.py` agrees on 11 operations over 200,000 inputs across four
+builds; `run_native.py --lib` and `--lib --opt` are 613 pass, 0 differ.

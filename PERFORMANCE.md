@@ -10,14 +10,16 @@ obx builds a program in two ways:
   -falign-loops=32`).
 
 Both are built from the same IR and must behave identically; the gate checks
-that on every test program. This page is the current report. Its figures
+that on every test program. This page is the current report. Most figures
 were re-measured on 7 November 2026 at `b6777cf4`, after the regex start-state
 cache change and the Decimal match-payload and record-argument inlining
 work, with the PostgreSQL, Oracle and SQL Server servers on this machine.
-The database sections were re-measured at the same commit. The sections that
-could not be re-measured in this environment say so: the jq reference column
-(jq 1.7.1 is not installed), the cmark column of the Markdown table, and the
-Go and Node columns of the HTTP tables.
+The database sections were re-measured at the same commit. The application
+suite and the Decimal tables were re-measured at `fb50b4f1`, after the
+Decimal operator fast paths; the sections that could not be re-measured in
+this environment say so: the jq reference column (jq 1.7.1 is not
+installed), the cmark column of the Markdown table, and the Go and Node
+columns of the HTTP tables.
 
 The host was shared and variable during this sweep: absolute times for
 I/O-bound and process-heavy tables (eza, grep, Markdown, HTTP, TLS) moved by
@@ -529,7 +531,7 @@ held for bool/branch folding (-6.53% instructions on `tokens`, -0.86% cycles)
 and for cheap allocator residency: the losses are memory, calls and copies,
 not instruction selection. Those experiments are in HISTORY.md, "Tried and
 shelved". The application rows below are the current targets: regex 1.03
-instructions / 1.14 cycles, cmark 1.27 / 1.07; Decimal is now 1.16 / 0.96 and
+instructions / 1.13 cycles, cmark 1.27 / 1.08; Decimal is now 1.18 / 0.93 and
 JSON and jq already win on time.
 
 `-O` is part of the quick gate: `run_native.py --lib --opt` builds the 613
@@ -541,15 +543,15 @@ C build.
 `python3 obx/bench/apps.py -n 5 --pin 2` is the Tier-1 table: the same source
 built with `--native -O` and through the C backend, identical output required,
 timed with `perf` on one core, best of N, as a table, JSON and TSV. Measured
-at `b6777cf4` (`OBX_HASH_SEED=42`, core 2, 72 s):
+at `fb50b4f1` (`OBX_HASH_SEED=42`, core 2, 60 s):
 
 | application | native | C | native/C (wall) | instructions native/C | cycles native/C |
 |---|---:|---:|---:|---:|---:|
-| regex (8 patterns, 3 MB) | 46 ms | 42 ms | 1.09 | 1.03 | 1.14 |
-| json (20 MB, parse/query/visit) | 507 ms | 519 ms | 0.98 | 1.14 | 0.98 |
-| jq (`-c .`, 20 MB) | 400 ms | 411 ms | 0.97 | 1.13 | 0.95 |
-| cmark (10 MB) | 165 ms | 163 ms | 1.01 | 1.27 | 1.07 |
-| decimal (all cases) | 2,595 ms | 2,689 ms | **0.97** | 1.16 | **0.96** |
+| regex (8 patterns, 3 MB) | 44 ms | 40 ms | 1.10 | 1.03 | 1.13 |
+| json (20 MB, parse/query/visit) | 481 ms | 488 ms | 0.99 | 1.14 | 0.99 |
+| jq (`-c .`, 20 MB) | 377 ms | 393 ms | 0.96 | 1.13 | 0.93 |
+| cmark (10 MB) | 159 ms | 159 ms | 1.00 | 1.27 | 1.08 |
+| decimal (all cases) | 2,211 ms | 2,393 ms | **0.92** | 1.18 | **0.93** |
 
 The first baseline, before the regex per-match work, the Markdown scan change
 and the Decimal changes, was regex 1.36 / json 0.98 / jq 0.93 / cmark 1.14 /
@@ -557,8 +559,10 @@ decimal 1.12 in wall time, with instructions 1.27 / 1.15 / 1.13 / 1.27 / 1.28
 against C. Regex, Decimal and cmark are the rows that moved. Decimal now wins
 on both time and cycles: the match-payload place (no copy of a payload that
 is only borrowed) and the targeted inlining of a call whose record argument is
-a place were worth 4.4% of its instructions and 9% of its cycles. Regex's
-instruction count is 1.03 and level on `\w+` alone; its 1.14 cycles are two
+a place were worth 4.4% of its instructions and 9% of its cycles; the
+operator fast paths then took `add` from 29.6 to 13.3 ns and `mul` from 27.0
+to 17.1 ns, moving the row to 0.92-0.93 wall / 0.93 cycles. Regex's
+instruction count is 1.03 and level on `\w+` alone; its 1.13 cycles are two
 taken branches per byte where gcc has one. cmark's wall is level but its
 instruction count stays 1.27 (its parse builds the node text literally where
 gcc's does less); the cycles follow. JSON's instruction count is 1.14 of C's
@@ -657,24 +661,24 @@ A matched comparison with .NET's `System.Decimal` and Java's `BigDecimal` is
 in [design/decimal-performance.md](obx/design/decimal-performance.md):
 19-digit add, 6x6 multiply, 12/6 divide at scale 2, 20-digit parse,
 19-digit format and compare, plus 38-digit cases that .NET cannot represent.
-In short: .NET's 16-byte decimal is 2.2 to 2.5 times faster on add and
-multiply and 3 times faster on compare; obx is about twice as fast at parse
-and 1.6 times at format; Java is fast on small arithmetic but its parse is
-about twice obx's and its 38-digit format 3 times.
+In short: after the operator fast paths .NET's 16-byte decimal is 1.2 times
+faster on add, 1.5 times on multiply and 3 times on compare; obx is about
+twice as fast at parse and 1.6 times at format; Java is fast on small
+arithmetic but its parse is about twice obx's and its 38-digit format 3
+times. At 38 digits obx is now ahead of Java on add and multiply too.
 
-Cycles per operation (the difference between 50 rounds and none over the
-4096 inputs, least of 5, pinned to one core; re-measured 2026-11-07 at
-`b6777cf4`):
+Cycles per operation (dbench under `perf stat`, least of 5, pinned to one
+core; re-measured 2026-11-07 at `fb50b4f1`):
 
 | operation | native | via C |
 |---|---:|---:|
-| add, 6 / 19 digits at 2 places (M2) | 98 / 97 | 104 / 100 |
-| mul, 6 / 19 digits (M3) | 98 / 98 | 132 / 135 |
-| div, 12 by 6 digits at scale 2 (M5:s2) | 242 | 262 |
-| quantize to 2 places from 6 digits (M6) | 88 | 92 |
-| parse, 20 digits (M7) | 230 | 180 |
-| format, 38 digits fixed (M8:f38) | 416 | 358 |
-| cmp, same leading digit position (M10:diff) | 55 | 42 |
+| add, 6 / 19 digits at 2 places (M2) | 66 / 66 | 73 / 73 |
+| mul, 6 / 19 digits (M3) | 80 / 83 | 130 / 131 |
+| div, 12 by 6 digits at scale 2 (M5:s2) | 237 | 257 |
+| quantize to 2 places from 6 digits (M6) | 73 | 76 |
+| parse, 20 digits (M7) | 247 | 180 |
+| format, 38 digits fixed (M8:f38) | 452 | 357 |
+| cmp, same leading digit position (M10:diff) | 50 | 39 |
 | `Decimal.fromUnits(u, 2)` and one add, a row of a 10M-row sum | 191 | 199 |
 
 The last row is the earlier run. The per-operation numbers are noisy at this
@@ -734,6 +738,26 @@ on cmark, json, jq or the compiler; it also miscompiles the compiler, so the
 full by-reference ABI is still not built. Parse, format and cmp remain the
 three losses; parse is now C's inlining depth (`digits` into `cmp`, `sumOf`
 into `errSum`), the Stage-B ceiling of design/record-abi.md.
+
+Three operator changes removed most of the remaining arithmetic overhead
+(`design/decimal-performance.md`, "Outcome"). `add`/`mul` now return the
+`Decimal` directly on their hot path, using `makeDecCore` and a `mut &int`
+error flag, with `addExact`/`mulExact` keeping their `Result` body; `sub` is
+`a.add(b.neg())`. Equal-exponent `add` skips both `digits()` bound checks,
+and `makeDec` counts digits for the exponent check only when the exponent is
+above `EXP_MAX` and runs the trailing-zero strip only when `coef % 10 == 0`.
+The matched comparison (`bench/decimal/compare`) moved add from 29.6 to
+**13.3 ns** and 6x6 multiply from 27.0 to **17.1 ns**; `addExact` is 12.8 and
+`mulExact` 16.8 ns, and the bare 128-bit operation is still 1.2/1.3 ns. div
+fell from 53.2 to 45.9 ns; parse, format and cmp are unchanged. Against the
+parent tree, dbench native instructions are `M2:6` 0.661, `M2:19` 0.663,
+`M3:6` 0.871, `M3:19` 0.874, `M5:s2` 0.935, `M6:6` 0.899, and `M7:20` /
+`M8:c19` 1.000; native cycles `M2:6` 0.674, `M2:19` 0.684, `M3:6` 0.826,
+`M3:19` 0.856. The application row is now **0.92-0.93 wall / 0.93 cycles**
+of the C build. What is left against .NET is the normalisation and the 32-byte copy
+(1.2 times on add, 1.5 on multiply); compare is 3 times, still in `digits`
+and its branches. Not normalising at all is the remaining representation
+change.
 
 The digit count is a compare tree, trailing zeros are stripped by exact
 division, long division is Knuth's algorithm D in base 2^64, text is written
