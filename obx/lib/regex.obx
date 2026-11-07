@@ -444,11 +444,11 @@ fn (re: &Regex) dfaExecute(x: mut &Exec, text: str, pos: int, ncap: int, out: mu
 // (the span is then not computed).
 fn (re: &Regex) dfaSearch(x: mut &Exec, text: str, pos: int, earliest: bool): Found {
     let anchored = re.cond & syn.EMPTY_BEGIN_TEXT != 0
-    let e = re.fdfa.forward(mut &x.fc, &re.prog, text, pos, anchored, earliest, &re.pf)
+    let e = re.fdfa.forward(mut &x.fc, &re.prog, &text, pos, anchored, earliest, &re.pf)
     if e == -2 { return Found{status: -1, start: 0, end: 0} }
     if e < 0 { return Found{status: 0, start: 0, end: 0} }
     if earliest || anchored { return Found{status: 1, start: pos, end: e} }
-    let s = re.rdfa.backward(mut &x.rc, &re.rprog, text, pos, e)
+    let s = re.rdfa.backward(mut &x.rc, &re.rprog, &text, pos, e)
     if s == -2 { return Found{status: -1, start: 0, end: 0} }
     if s < 0 { panic("regex: the reversed DFA found no start") }
     return Found{status: 1, start: s, end: e}
@@ -465,15 +465,15 @@ fn (re: &Regex) innerSearch(x: mut &Exec, text: str, pos: int, earliest: bool): 
     var reach = -1
     let none = lazy.noPrefilter()
     while true {
-        let h = re.ipf.find(text, from)
+        let h = re.ipf.find(&text, from)
         if h < 0 { return Found{status: 0, start: 0, end: 0} }
         from = h + 1
         if !lazy.hasByte(re.ipf.first, int(text[h])) { continue }
-        let s = re.idfa.backward(mut &x.ic, &re.iprog, text, pos, h)
+        let s = re.idfa.backward(mut &x.ic, &re.iprog, &text, pos, h)
         if s == -2 { return Found{status: -1, start: 0, end: 0} }
         if s < 0 { continue }
         if s < reach { return re.dfaSearch(x, text, pos, earliest) }
-        let e = re.fdfa.forward(mut &x.fc, &re.prog, text, s, true, earliest, &none)
+        let e = re.fdfa.forward(mut &x.fc, &re.prog, &text, s, true, earliest, &none)
         if e == -2 { return Found{status: -1, start: 0, end: 0} }
         if e >= 0 { return Found{status: 1, start: s, end: e} }
         reach = x.fc.reach
@@ -1703,7 +1703,7 @@ pub fn (re: &Regex) matchingLines(s: mut &Searcher, text: str, from: int, to: in
     if len(re.suffix) > 0 && !s.x.hasLiteral(text, from, re.suffix) { return to }
     re.setupCaches(mut &s.x)
     let n0 = len(out)
-    let r = re.fdfa.forwardLines(mut &s.x.fc, &re.prog, text, from, to, &re.pf, max, out)
+    let r = re.fdfa.forwardLines(mut &s.x.fc, &re.prog, &text, from, to, &re.pf, max, out)
     if r >= 0 { return r }
     // The DFA gave up: the other matchers go on after the lines found.
     s.x.dfaFailed = true
@@ -1790,14 +1790,90 @@ fn requiredLits(t: &syn.Tree, at: int, out: mut &[]str) {
 // for all), with ncap slots each: Go's allMatches. An empty match right
 // after the previous match is skipped.
 fn (re: &Regex) allMatches(text: str, n: int, ncap: int, deliver: &fn(&[]int)) {
-    let end = len(text)
     var x = newExec()
-    var a: []int = []
+    // The span of each match is all a DFA search needs to compute: run its
+    // two passes here, without the per-match call layers of execute,
+    // dfaExecute and dfaSearch (allMatches asks for many small matches).
+    if ncap == 2 && re.numSubexp == 0 && !re.hasOnePass && !re.literalOnly() && !re.inner && re.cond != -1 && len(text) >= re.minInputLen && re.useDfa(len(text)) {
+        re.allMatchesDfa(mut &x, text, n, deliver)
+        return
+    }
+    re.allMatchesSlow(mut &x, text, n, ncap, deliver, 0, 0, -1)
+}
+
+// allMatches for the DFA, spans only: the same loop, with forward and
+// backward run directly. A search the DFA gives up on hands the rest to
+// allMatchesSlow (Go's matchers, as execute does).
+fn (re: &Regex) allMatchesDfa(x: mut &Exec, text: str, n: int, deliver: &fn(&[]int)) {
+    let end = len(text)
+    var a: []int = [-1, -1]
     var pos = 0
     var i = 0
     var prevMatchEnd = -1
+    let anchored = re.cond & syn.EMPTY_BEGIN_TEXT != 0
+    let hasSuf = len(re.suffix) > 0
+    re.setupCaches(x)
+    // The parts both passes read never change here: take their addresses
+    // once, not at every match.
+    let fdfa = &re.fdfa
+    let rdfa = &re.rdfa
+    let fprog = &re.prog
+    let rprog = &re.rprog
+    let pf = &re.pf
+    let tp = &text
     while (n < 0 || i < n) && pos <= end {
-        if !re.execute(mut &x, text, pos, ncap, mut &a) { break }
+        if anchored && pos != 0 { break }
+        if hasSuf && !x.hasLiteral(text, pos, re.suffix) { break }
+        let e = fdfa.forward(mut &x.fc, fprog, tp, pos, anchored, false, pf)
+        if e == -2 {
+            x.dfaFailed = true
+            re.allMatchesSlow(x, text, n, 2, deliver, pos, i, prevMatchEnd)
+            return
+        }
+        if e < 0 { break }
+        var s = pos
+        if !anchored {
+            s = rdfa.backward(mut &x.rc, rprog, tp, pos, e)
+            if s == -2 {
+                x.dfaFailed = true
+                re.allMatchesSlow(x, text, n, 2, deliver, pos, i, prevMatchEnd)
+                return
+            }
+            if s < 0 { panic("regex: the reversed DFA found no start") }
+        }
+        a[0] = s
+        a[1] = e
+        var accept = true
+        if e == pos {
+            // An empty match: never right after the previous one.
+            if s == prevMatchEnd { accept = false }
+            if pos < end {
+                pos += syn.decodeRune(text, pos).w
+            } else {
+                pos = end + 1
+            }
+        } else {
+            pos = e
+        }
+        prevMatchEnd = e
+        if accept {
+            deliver(&a)
+            i += 1
+        }
+    }
+}
+
+// allMatches with execute: from pos after i matches, the last ending at
+// prevMatchEnd (the body execute is needed for: captures, Go's matchers,
+// and the rest after a DFA gives up).
+fn (re: &Regex) allMatchesSlow(x: mut &Exec, text: str, n: int, ncap: int, deliver: &fn(&[]int), pos0: int, i0: int, prev0: int) {
+    let end = len(text)
+    var a: []int = []
+    var pos = pos0
+    var i = i0
+    var prevMatchEnd = prev0
+    while (n < 0 || i < n) && pos <= end {
+        if !re.execute(x, text, pos, ncap, mut &a) { break }
         var accept = true
         if a[1] == pos {
             // An empty match: never right after the previous one.
