@@ -64,6 +64,13 @@ portable constants.
 | sieve | 187 ms | 133 ms | 0.71 | the sieve of Eratosthenes to 10 million, ten rounds |
 | maps | 183 ms | 185 ms | 1.01 | `Map[str, int]` with short and long keys, `Map[int, int]` (keyed hashing) |
 
+The table predates the constant-arithmetic `lea` selection (`257fdac7`), which
+changes only `fib` and `loop`'s code: measured after it, `fib` runs at 0.99 of
+the C build's cycles (0.34 s against 0.35 s, best of 5, core 6; 1.53G against
+1.54G cycles) and `loop`'s instructions are 12.5% fewer with cycles level.
+`maps` moves with the hash seed; [design/codegen-audit.md](design/codegen-audit.md)
+records the remaining code-shape gaps.
+
 - **Native is ahead on allocation and strings** (alloc, lists, strings,
   tokens, trees). Small functions and glue are inlined before code
   generation; the freestanding runtime has a size-class allocator with no
@@ -457,6 +464,14 @@ backend):
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | `-O`/C | 1.11 | 0.80 | 0.88 | 0.50 | 0.77 | 0.54 | 0.81 | 0.64 | 0.84 | 1.14 |
 
+After the constant-arithmetic `lea` selection (`257fdac7`) `fib` is 0.99 of
+the C build (1.53G against 1.54G cycles; its instructions -8.3%) and `loop`'s
+instructions are -12.5% with cycles level; the other benchmarks' instruction
+counts do not move. The remaining code-shape misses are measured and ranked
+in [design/codegen-audit.md](design/codegen-audit.md): materialised `bool`
+locals from `&&`/`||` first (`tokens`), then addressing modes, frames,
+strength reduction, the register allocator, and vectorisation last.
+
 and, from the application harnesses (ms, one run), regex `\w+` 63.0 native
 against 37.9 via C (1.66; the default was 66.5), Markdown 10 MB 0.251
 against 0.215 (1.17; the default 0.233), jq on a 20 MB file within a few
@@ -473,6 +488,27 @@ because the gap is per-match work and instruction selection (HISTORY.md,
 `-O` is part of the quick gate: `run_native.py --lib --opt` builds the 613
 programs with `-O` and requires the same output, exit code and stderr as the
 C build.
+
+### The application suite
+
+`python3 obx/bench/apps.py -n 3` is the Tier-1 table: the same source built
+with `--native -O` and through the C backend, identical output required, timed
+with `perf` on one core, best of N, as a table, JSON and TSV. First baseline
+(core 4, `OBX_HASH_SEED=42`, 59 s):
+
+| application | native | C | native/C (wall) | instructions native/C | cycles native/C |
+|---|---:|---:|---:|---:|---:|
+| regex (8 patterns, 3 MB) | 87 ms | 64 ms | 1.36 | 1.27 | 1.47 |
+| json (20 MB, parse/query/visit) | 629 ms | 643 ms | 0.98 | 1.15 | 0.99 |
+| jq (`-c .`, 20 MB) | 461 ms | 493 ms | 0.93 | 1.13 | 0.92 |
+| cmark (10 MB) | 214 ms | 187 ms | 1.14 | 1.27 | 1.15 |
+| decimal (all cases) | 3,158 ms | 2,830 ms | 1.12 | 1.28 | 1.13 |
+
+The benchmark harnesses set `OBX_HASH_SEED` (42 by default, `--hash-seed` or
+`--random-hash` to change it), so the map layout is identical across runs and
+in both backends; without it production keeps the per-process random key.
+The maps instruction count is now reproducible across runs and seeds; its
+cycles still move with the machine and the slot layout.
 
 ## Binary sizes
 
