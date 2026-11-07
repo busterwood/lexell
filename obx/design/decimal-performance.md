@@ -207,6 +207,64 @@ The small-value fast path (one 64-bit multiply instead of four) is *not*
 worth much: the bare multiply is 1.36 ns, so the four partial products are
 already cheap. The return/ABI and the normalisation are the levers.
 
+## Outcome (branch `decimal-fast`, 2026-11-07)
+
+Three changes landed in `lib/std.obx`; each was measured on its own on the
+comparison harness (`variants.obx`, best of 7, pinned to one core).
+
+| step | add public | add Exact | add raw | mul public | mul Exact | mul raw |
+|---|---:|---:|---:|---:|---:|---:|
+| main | 29.0 | 20.5 | 1.25 | 27.0 | 21.2 | 1.36 |
+| 1. equal exponents skip both `digits()` | 25.9 | 15.6 | 1.25 | 27.0 | 21.2 | 1.36 |
+| 2. `makeDec` range/strip fast paths | 19.7 | 13.9 | 1.25 | 26.0 | 18.5 | 1.37 |
+| 3. Result-free operator fast path | **14.0** | 13.5 | 1.26 | **17.3** | 17.8 | 1.37 |
+
+All numbers are ns/op. The matched `run.sh` at the end of the branch:
+add 14.2, mul 18.1, div 48.4, parse 52.7, format 56.4, cmp 8.9; the 37-digit
+add 15.0 and the 19x19-digit multiply 20.5. Against main, parse, format and
+cmp are unchanged (their instruction counts are identical); div and quantize
+improve because they share `makeDec`.
+
+- **Equal exponents.** A canonical coefficient always has at most 38 digits
+  (`makeDec` checks `COEF_MAX`, `parse` caps the significant digits, and every
+  other constructor goes through one of those), so when `a.exp == b.exp` both
+  `sa + digits(coef) <= 38` tests are redundant.
+- **makeDec.** After the `x > COEF_MAX` check, `digits(x) <= 38`, so
+  `e + digits(x) > EXP_MAX + 38` can only fail when `e > EXP_MAX`; the digit
+  count is now conditional on that. The trailing-zero strip runs only when
+  `x % 10 == 0`. Measured separately, the strip check saves about 3-5% of
+  instructions on random add/mul (`M2:19` 0.961, `M3:6` 0.968, `M4:0` 0.951)
+  and costs about 2-3% on sums deliberately full of trailing zeros (`M2:tz`
+  1.027, `M4:1` 1.032); the random case is the common one, so it stays.
+- **Result-free operators.** `add` returns the Decimal directly on the
+  equal-exponent path (using `makeDecCore`, which reports Inexact/Overflow
+  through a `mut &int`) and falls back to `addExact` otherwise; `mul` does the
+  same for its whole body; `sub` is `a.add(b.neg())`. `addExact`/`mulExact`
+  keep their Result-returning body.
+
+A literal application of the "core" refactoring (the whole `addExact`/
+`mulExact` body becoming a Decimal core called by both the operators and the
+Exact wrappers) was **rejected**: the native inliner does not inline a body
+that size, so the Exact path paid a call plus a Decimal-to-Result copy. On
+dbench native instructions that was `M2:19` 1.223 and `M3:6` 1.148, and the
+comparison harness showed addExact 13.5 -> 19.1 ns and mulExact 17.8 -> 28.0
+ns. Keeping the direct Result body and inlining only the operator fast path
+avoids it. A Decimal-returning core shared by both cannot be made to pay
+without either duplicating the Result body (what the operator path now does)
+or an inliner change.
+
+dbench, final instructions relative to main (native; identical on the C
+backend except where noted): `M2:6` 0.661, `M2:15` 0.645, `M2:19` 0.663,
+`M2:tz` 0.742, `M3:6` 0.871, `M3:19` 0.874, `M3:big` 0.997, `M4:0` 0.667,
+`M4:1` 0.709, `M4:5` 0.775, `M5:s2` 0.935, `M6:6` 0.899, `M7:20` 1.000,
+`M8:c19` 1.000, `M1:19` 0.999. The Tier-1 app suite keeps the Decimal row at
+0.93 of the C build (wall and cycles), with 40 checksums identical.
+
+The seed was refreshed (no compiler source changed): the seed embeds
+`std.obx` source positions, and these edits shift the lines that `sort`/`Map`
+are on, so `seed_check`'s stage-2 C differed from the seed only in the
+`"std.obx:N"` strings.
+
 ## Caveats
 
 - The semantics differ, and the table is not an equivalence claim: .NET is
