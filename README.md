@@ -8,7 +8,7 @@ obx is a small language in the Oberon line — the family Go also draws on. It
 looks a bit like Go, but has generics and uses single ownership with group
 borrowing —
 [simpler memory management than Rust](https://verdagon.dev/blog/valen-group-borrowing),
-with no lifetime annotations — instead of a garbage collector. Strings are
+with no lifetime annotations. There is no garbage collector. Strings are
 reference counted, and generic code is checked where it is written and
 compiled per instance.
 
