@@ -106,7 +106,174 @@ pub fn optimize(p: ir.Ir): ir.Ir {
         if o.u.funcs[f].body >= 0 { o.visit(f) }
     }
     o.dropDead()
+    o.fwdReceivers()
     return replace(mut &o.u, ir.newIr())
+}
+
+// ---------------------------------------------------------------- receiver temporaries
+//
+// A value record copied into a temporary only to be passed as the first argument of a call
+// (`T t = a[i]; f(t, ...)` -- the copy the front end makes of a method's receiver) is passed
+// as the place itself when nothing between the declaration and the call writes that place and
+// every argument after the first is pure. The call then copies the record once, into the
+// argument, instead of twice (a[i] to the temporary, the temporary to the argument).
+//
+// Sound: the copy f makes of argument 0 reads the place after the statements between (which
+// only declare new locals, so they cannot write it) and before the other arguments are
+// evaluated (which are pure, so they cannot write it either); no other use of the temporary
+// exists. A bounds check in the place may run a statement later than it did, so a program in
+// which two checks fail may report the other one; a program that does not trap is unaffected.
+
+fn (o: &Opt) receiverCall(s: int, t: int): int {
+    let k = o.u.nk(s)
+    var c = -1
+    if k == ir.S_DECL { c = o.u.nodes[s].b } else if k == ir.S_EXPR { c = o.u.nodes[s].a } else { return -1 }
+    if c < 0 || o.u.nk(c) != ir.E_CALL || o.callee(c) < 0 { return -1 }
+    let l = o.u.nodes[c].b
+    if o.u.listLen(l) == 0 { return -1 }
+    let a0 = o.u.listAt(l, 0)
+    if o.u.nk(a0) != ir.E_LOCAL || o.u.nodes[a0].a != t { return -1 }
+    for q in 1..o.u.listLen(l) {
+        if !o.pureInit(o.u.listAt(l, q)) { return -1 }
+    }
+    return c
+}
+
+fn (o: mut &Opt) fwdStmtSafe(s: int, uses: mut &[]int) {
+    if s < 0 { return }
+    if o.u.nk(s) != ir.S_BLOCK { return }
+    let l = o.u.nodes[s].a
+    for j in 0..o.u.items[l] {
+        let d = o.u.items[l + 1 + j]
+        if o.u.nk(d) != ir.S_DECL || o.u.nodes[d].b < 0 || o.u.nodes[d].c >= 0 { continue }
+        let t = o.u.nodes[d].a
+        if !o.u.isAggr(o.u.locals[t].ty) { continue }
+        let init = o.u.nodes[d].b
+        let ik = o.u.nk(init)
+        if ik != ir.E_MEMBER && ik != ir.E_DEREF { continue }
+        if o.u.nodes[init].ty != o.u.locals[t].ty || !o.pureInit(init) || uses[t] != 1 { continue }
+        var hit = -1
+        for q in j + 1..o.u.items[l] {
+            let nx = o.u.items[l + 1 + q]
+            if o.u.nk(nx) == ir.S_EMPTY { continue }
+            if o.u.nk(nx) == ir.S_DECL && o.u.nodes[nx].b >= 0 && o.u.nodes[nx].c < 0 &&
+                o.u.nk(o.u.nodes[nx].b) != ir.E_CALL && o.pureInit(o.u.nodes[nx].b) &&
+                !o.namesLocal(o.u.nodes[nx].b, t) {
+                continue
+            }
+            hit = o.receiverCall(nx, t)
+            break
+        }
+        if hit < 0 { continue }
+        o.u.items[o.u.nodes[hit].b + 1] = init
+        o.u.nodes[d].k = ir.S_EMPTY
+        o.u.nodes[d].b = -1
+        uses[t] = 0
+    }
+    for j in 0..o.u.items[l] {
+        let d = o.u.items[l + 1 + j]
+        let k = o.u.nk(d)
+        if k == ir.S_BLOCK { o.fwdStmtSafe(d, mut &uses) }
+        if k == ir.S_IF {
+            o.fwdStmtSafe(o.u.nodes[d].b, mut &uses)
+            o.fwdStmtSafe(o.u.nodes[d].c, mut &uses)
+        }
+        if k == ir.S_WHILE || k == ir.S_SWITCH { o.fwdStmtSafe(o.u.nodes[d].b, mut &uses) }
+        if k == ir.S_FOR { o.fwdStmtSafe(o.u.nodes[d].d, mut &uses) }
+    }
+}
+
+// Whether x names the local t.
+fn (o: &Opt) namesLocal(x: int, t: int): bool {
+    if x < 0 { return false }
+    let n = o.u.nodes[x]
+    if n.k == ir.E_LOCAL { return n.a == t }
+    let kc = ir.KIDS[n.k]
+    if kc == ir.K_NONE { return false }
+    if kc != ir.K_BLOCK && kc != ir.K_CLIT && kc != ir.K_DECL && o.namesLocal(n.a, t) { return true }
+    if (kc == ir.K_AB || kc == ir.K_ABC || kc == ir.K_FOR || kc == ir.K_DECL) && o.namesLocal(n.b, t) { return true }
+    if (kc == ir.K_ABC || kc == ir.K_FOR) && o.namesLocal(n.c, t) { return true }
+    if kc == ir.K_FOR && o.namesLocal(n.d, t) { return true }
+    if kc == ir.K_CALL {
+        let l = n.b
+        for j in 0..o.u.items[l] { if o.namesLocal(o.u.items[l + 1 + j], t) { return true } }
+    }
+    if kc == ir.K_CLIT {
+        let l = n.b
+        for j in 0..o.u.items[l] { if o.namesLocal(o.u.items[l + 1 + j], t) { return true } }
+    }
+    if kc == ir.K_DECL && n.c >= 0 {
+        for j in 0..o.u.items[n.c] { if o.namesLocal(o.u.items[n.c + 1 + j], t) { return true } }
+    }
+    return false
+}
+
+fn (o: mut &Opt) fwdReceivers() {
+    var uses: []int = array(len(o.u.locals), 0)
+    for f in 0..len(o.u.funcs) {
+        if o.u.funcs[f].body < 0 { continue }
+        var touched: []int = []
+        o.countAll(o.u.funcs[f].body, mut &uses, mut &touched)
+        o.fwdStmtSafe(o.u.funcs[f].body, mut &uses)
+        for l in touched { uses[l] = 0 }
+    }
+}
+
+// ---------------------------------------------------------------- helpers
+// Whether x has no effect: no assignment, and no call but the runtime checks generated in
+// place (rt_idx and the str readers).
+fn (o: &Opt) pureInit(x: int): bool {
+    if x < 0 { return true }
+    let k = o.u.nk(x)
+    if k == ir.E_ASSIGN || k == ir.E_POSTINC { return false }
+    if k == ir.E_CALL {
+        let c = o.u.nodes[x].a
+        if o.u.nk(c) != ir.E_DECAY || o.u.nk(o.u.nodes[c].a) != ir.E_FUNC {
+            return false
+        }
+        let nm = o.u.funcs[o.u.nodes[o.u.nodes[c].a].a].name
+        if nm != "rt_idx" && nm != "rt_sidx" && nm != "rt_str_byte" && nm != "rt_str_word" {
+            return false
+        }
+    }
+    let kc = ir.KIDS[k]
+    if kc == ir.K_NONE { return true }
+    if kc == ir.K_CLIT {
+        let l = o.u.nodes[x].b
+        for j in 0..o.u.items[l] { if !o.pureInit(o.u.items[l + 1 + j]) { return false } }
+        return true
+    }
+    if kc == ir.K_BLOCK || kc == ir.K_DECL { return false }
+    if !o.pureInit(o.u.nodes[x].a) { return false }
+    if kc == ir.K_AB || kc == ir.K_ABC || kc == ir.K_FOR { if !o.pureInit(o.u.nodes[x].b) { return false } }
+    if kc == ir.K_ABC || kc == ir.K_FOR { if !o.pureInit(o.u.nodes[x].c) { return false } }
+    if kc == ir.K_FOR { return o.pureInit(o.u.nodes[x].d) }
+    if kc == ir.K_CALL {
+        let l = o.u.nodes[x].b
+        for j in 0..o.u.items[l] { if !o.pureInit(o.u.items[l + 1 + j]) { return false } }
+    }
+    return true
+}
+
+// Adds to uses the times each local is named in x.
+fn (o: &Opt) countAll(x: int, uses: mut &[]int, touched: mut &[]int) {
+    if x < 0 { return }
+    let k = o.u.nk(x)
+    if k == ir.E_LOCAL {
+        let l = o.u.nodes[x].a
+        if uses[l] == 0 { append(touched, l) }
+        uses[l] += 1
+        return
+    }
+    let kc = ir.KIDS[k]
+    if kc == ir.K_NONE { return }
+    if kc != ir.K_BLOCK && kc != ir.K_CLIT && kc != ir.K_DECL { o.countAll(o.u.nodes[x].a, mut &uses, mut &touched) }
+    if kc == ir.K_AB || kc == ir.K_ABC || kc == ir.K_FOR || kc == ir.K_DECL { o.countAll(o.u.nodes[x].b, mut &uses, mut &touched) }
+    if kc == ir.K_ABC || kc == ir.K_FOR { o.countAll(o.u.nodes[x].c, mut &uses, mut &touched) }
+    if kc == ir.K_FOR { o.countAll(o.u.nodes[x].d, mut &uses, mut &touched) }
+    var l = -1
+    if kc == ir.K_CALL || kc == ir.K_CLIT { l = o.u.nodes[x].b } else if kc == ir.K_BLOCK { l = o.u.nodes[x].a } else if kc == ir.K_DECL { l = o.u.nodes[x].c }
+    if l >= 0 { for j in 0..o.u.items[l] { o.countAll(o.u.items[l + 1 + j], mut &uses, mut &touched) } }
 }
 
 // ---------------------------------------------------------------- nodes
