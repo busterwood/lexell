@@ -123,10 +123,12 @@ native-vs-C measurement is kept separately in
 one 8-core test machine, so compare the columns, not the absolute numbers.
 
 obx is small and fast. The compiler is 39,436 lines and a 2.9 MB static
-binary, and builds itself in 0.66 s. A hello world compiles in 12 ms to a
-16 KB executable; Rust takes 162 ms and 357 KB (stripped), and gcc 86 ms.
-The nine benchmark programs compile in 104 ms with obx against 2.95 s for
-the Rust suite.
+binary, and builds itself in 0.66 s. Rust's `rustc` plus its driver and
+LLVM is 316 MB (560 MB installed, 1.3 GB with docs), and a full rustc
+self-build is commonly around 45 minutes, tests separate. A hello world
+compiles in 12 ms to a 16 KB executable; Rust takes 162 ms and 357 KB
+(stripped), and gcc 86 ms. The nine benchmark programs compile in 104 ms
+with obx against 2.95 s for the Rust suite.
 
 - **Competitive with Rust:** on the nine microbenchmarks obx is level with
   or ahead of idiomatic Rust on seven; Rust is at most 6% ahead on `array`

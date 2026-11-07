@@ -2520,7 +2520,14 @@ proves them as obx `-O` does, and the row is 227 ms.
 16 KB / 357 KB stripped / 16 KB; the nine benchmark programs 104 ms /
 2.95 s (cargo clean build) and 172 KB / 443 KB of binaries; the compiler
 self-build 656 ms and a 2.9 MB static binary. Rust includes std and the
-cargo build system; obx links its own runtime.
+cargo build system; obx links its own runtime. Measured on this machine,
+Rust's compiler is `rustc` (636 KB) plus `librustc_driver` (138 MB) and
+`libLLVM` (178 MB): 316 MB, 560 MB for the installed `bin` and `lib` and
+1.3 GB for the full toolchain. A full rustc stage-2 self-build is commonly
+cited at around 45 minutes; it was not measured here (it needs the
+rust-lang/rust source and bootstrap, and its tests are a separate
+`./x.py test`). The comparison is one of scale, not of the same work: Rust
+carries LLVM, a full borrow checker and a mature optimiser.
 
 PERFORMANCE.md now leads with the obx/Rust comparison and labels the
 implementation obx rather than native (native is ambiguous next to Rust).

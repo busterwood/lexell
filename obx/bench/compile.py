@@ -16,6 +16,7 @@ The point is the order of magnitude, not a byte-for-byte build-system
 comparison.
 """
 import argparse
+import glob
 import os
 import shutil
 import subprocess
@@ -59,6 +60,27 @@ def fmt_s(t):
 
 def fmt_b(n):
     return f'{n / 1024:.0f} KB' if n < 1024 * 1024 else f'{n / 1048576:.1f} MB'
+
+
+def rust_compiler_sizes(rustc):
+    """(rustc + driver + LLVM, toolchain bin+lib), or (None, None) without a sysroot."""
+    try:
+        root = subprocess.check_output([rustc, '--print', 'sysroot'], text=True, stderr=subprocess.DEVNULL).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None, None
+
+    def total(paths):
+        return sum(os.path.getsize(p) for p in paths)
+
+    front = os.path.join(root, 'bin', 'rustc')
+    driver = glob.glob(os.path.join(root, 'lib', 'librustc_driver-*.so'))
+    llvm = glob.glob(os.path.join(root, 'lib', 'libLLVM*.so*'))
+    compiler = total([p for p in [front] + driver + llvm if os.path.exists(p)])
+    toolchain = 0
+    for sub in ('bin', 'lib'):
+        for dirpath, _, files in os.walk(os.path.join(root, sub)):
+            toolchain += total(os.path.join(dirpath, f) for f in files)
+    return compiler, toolchain
 
 
 def main():
@@ -124,11 +146,21 @@ def main():
         print(f'| nine benchmarks, binaries | {fmt_b(obx_total)} | '
               f'{fmt_b(size(rs_bin)) if t_rs_suite is not None else "-"} | - |')
         print(f'| compiler self-build | {fmt_s(t_self)} | - | - |')
-        print(f'| compiler binary | {fmt_b(size(self_exe))} | - | - |')
+        if rust:
+            rust_compiler, rust_toolchain = rust_compiler_sizes(rustc)
+            if rust_compiler:
+                print(f'| compiler, binary + libraries | {fmt_b(size(self_exe))} | '
+                      f'{fmt_b(rust_compiler)} | - |')
+                print(f'| compiler toolchain, bin + lib | {fmt_b(size(self_exe))} | '
+                      f'{fmt_b(rust_toolchain)} | - |')
         print()
         print('Note: obx emits nine executables; the Rust project emits one binary with nine')
         print('subcommands and cargo measures its own build system. Compare orders of')
         print('magnitude, not the build systems byte for byte.')
+        print('The Rust compiler is rustc plus librustc_driver and libLLVM; its self-build is')
+        print('not measured here (it needs the rust-lang/rust source and bootstrap; tests are')
+        print('a separate ./x.py test). A full stage-2 build is commonly cited at around 45')
+        print('minutes.')
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

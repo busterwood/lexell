@@ -164,8 +164,9 @@ binary with nine subcommands, and cargo measures its own build system.
 | hello, binary | 16 KB | 357 KB (stripped) | 16 KB |
 | nine benchmark programs, clean compile | 104 ms | 2.95 s | - |
 | nine benchmark programs, binaries | 172 KB | 443 KB | - |
-| compiler self-build (`--native`) | 656 ms | - | - |
-| compiler binary | 2.9 MB (static) | - | - |
+| compiler self-build (`--native`) | 656 ms | ~45 min* | - |
+| compiler, binary + libraries | 2.9 MB (static) | 316 MB | - |
+| compiler toolchain, bin + lib | 2.9 MB | 560 MB (1.3 GB installed) | - |
 
 The compiler is 39,436 lines of obx (28,348 hand-written) and builds itself
 in 0.66 s; its binary is 2.9 MB and needs no libc. A hello world compiles in
@@ -173,6 +174,17 @@ in 0.66 s; its binary is 2.9 MB and needs no libc. A hello world compiles in
 and 16 KB. The nine benchmark programs compile in 104 ms with obx; the Rust
 suite takes 2.95 s. Rust's figures include std and the cargo build system;
 obx links its own freestanding runtime.
+
+Rust's compiler is `rustc` (636 KB) plus `librustc_driver` (138 MB) and
+`libLLVM` (178 MB): 316 MB, or 560 MB for the installed `bin` and `lib`
+(1.3 GB with the documentation and share files). Its full stage-2 self-build
+is commonly cited at around 45 minutes; that figure was not measured here,
+because it needs the rust-lang/rust source and bootstrap, and its tests are
+a separate `./x.py test` (so the 45 minutes does not include the test suite).
+
+\* Rust self-build: reported, not measured here. It is a different language
+and toolchain (LLVM, a full borrow checker and optimiser), so the ratio is a
+scale comparison, not a like-for-like build of the same work.
 
 ## Regex
 
