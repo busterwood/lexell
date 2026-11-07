@@ -166,13 +166,26 @@ machine is noisy; where a fix was built, the measured number is used.
 | 7 | checks: bounds (array 1/iter), overflow (array 2/iter, loop 1/iter) | array 3 checks = 600M (25%); loop 1 = 1G (12.5% of its old 8) | measured: -3.9% instructions, no cycles (7fc83733) | do not repeat; only a pass that also changes code shape (vectorisation) should own them |
 | 8 | vectorisation, array only | 12 instructions per element against gcc's 2.5; hand C 707M/118.8M against native 2413M/430.6M | 3.4x instructions, 3.6x cycles on array; nothing else | auto-vectoriser 1,500-3,000 lines, or SIMD in the language (small-fast-compiler.md's recommendation); not a peephole |
 
-Regex, not modified and not measured here (the files belong to another
-change): `7fc83733` measured 1.16x the C build for one match and 1.63x for
+Regex: `7fc83733` measured 1.16x the C build for one match and 1.63x for
 669,532 matches, with a 22-instruction byte loop of which 4 to 6 are checks.
 The per-match cost is the same shape as rank 3 and 4 (prologue/epilogue per
 `forward`/`backward`, `Cache.start`, `str` dup/drop, span appends) rather
-than the checks themselves. Rank 3's shrink-wrapping and rank 4's allocator
-are the levers there too.
+than the checks themselves. Measured on `regex-permatch` (2026-11-07,
+`apps.py -n 7 --pin 2`, one search per pattern): the whole row is 603.8M
+native instructions against 574.2M through C (1.05) and 159.9M cycles
+against 141.8M (1.13); `\w+` alone is 461.1M/449.3M (1.026) and 125M/112M
+cycles. An empty `forward` call costs 174 native instructions against 61
+through C, and it runs twice per match; that is the rank-3/4 excess, not the
+byte loop (34.6 instructions a byte in both builds, 2 taken branches a byte
+natively against 1 in C). Two library changes are kept and take the row to
+582.7M/563.2M (1.03) instructions: the start-state cache is keyed by the byte
+(no `idxof` table load) and the general forward loop is out of the ASCII
+path. The remaining cycle gap did not move, so it is IPC, not instruction
+count: the one backend shape tried, reading a reference parameter's pointee
+into a local once at entry, miscompiles the one-pass matcher under `-O` and
+is reverted (HISTORY.md, "Regex per-match overhead"). Rank 3's shrink-wrapping
+and rank 4's allocator are still the levers, and rank 4 now has a concrete
+wrong-code case to start from.
 
 ## 5. Prototype: one `lea` for small constant arithmetic
 
