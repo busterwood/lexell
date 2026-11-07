@@ -127,30 +127,38 @@ figure.
 
 | pattern | matches | obx native | obx via C | Go | Rust | rg |
 |---|---:|---:|---:|---:|---:|---:|
-| `Sherlock Holmes` | 926 | 0.19 | 0.22 | 0.48 | 0.08 | 1.8 |
-| `Sherlock\|Holmes\|Watson\|Irene` | 7,350 | 1.13 | 0.85 | 133.12 | 0.42 | 3.0 |
-| `\w+` (all matches) | 669,532 | 60.65 | 36.11 | 140.25 | 17.10 | 41.5 |
-| `(?i)sherlock` | 4,280 | 0.94 | 0.73 | 69.09 | 0.46 | 3.5 |
-| `[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}` | 848 | 0.19 | 0.11 | 76.83 | 0.09 | 2.0 |
-| `(?m)^ERROR .*timeout$` | 197 | 0.32 | 0.40 | 30.76 | 0.59 | 2.5 |
-| `(?P<y>\d{4})-(?P<m>\d{2})-(?P<d>\d{2})` (captures) | 10,755 | 4.03 | 3.15 | 71.45 | 1.28 | 8.5 |
-| `(a*)*b` over 100,000 `a`s | 0 | 0.00 | 0.00 | 3.30 | 0.00 | 1.6 |
+| `Sherlock Holmes` | 926 | 0.20 | 0.24 | 0.48 | 0.08 | 1.8 |
+| `Sherlock\|Holmes\|Watson\|Irene` | 7,350 | 0.84 | 0.70 | 138.19 | 0.42 | 3.0 |
+| `\w+` (all matches) | 669,532 | 35.80 | 22.91 | 153.95 | 17.10 | 41.5 |
+| `(?i)sherlock` | 4,280 | 0.76 | 0.64 | 72.69 | 0.46 | 3.5 |
+| `[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}` | 848 | 0.19 | 0.10 | 78.86 | 0.09 | 2.0 |
+| `(?m)^ERROR .*timeout$` | 197 | 0.34 | 0.41 | 32.09 | 0.59 | 2.5 |
+| `(?P<y>\d{4})-(?P<m>\d{2})-(?P<d>\d{2})` (captures) | 10,755 | 4.02 | 3.08 | 72.55 | 1.28 | 8.5 |
+| `(a*)*b` over 100,000 `a`s | 0 | 0.00 | 0.00 | 3.34 | 0.00 | 1.6 |
+
+The table is the plain `--native` build. With `--native -O`, `\w+` is 31.47 ms
+against 23.02 via C (1.37 wall; 1.07 instructions and 1.14 cycles), the
+alternation 0.77/0.70, `(?i)` 0.70/0.64 and the captures 3.75/3.09.
 
 - **obx and Rust.** The engine has RE2's lazy DFA and Rust's literal
-  searches (design/regex.md, "R2 as built"). Through C, obx takes 1.2 times
-  Rust's time on the email pattern, 1.6 on `(?i)`, 2.0 on the alternation,
-  2.1 on `\w+`, 2.5 on the captures, 2.8 on the literal, and two thirds of
-  Rust's time on the `ERROR` lines (a prefilter on `ERROR ` and the suffix
-  check on `timeout`); natively 2.0 to 3.5 times Rust's time, and about half
-  on the `ERROR` lines.
+  searches (design/regex.md, "R2 as built"). Through C, obx takes 1.1 times
+  Rust's time on the email pattern, 1.4 on `(?i)`, 1.7 on the alternation,
+  1.3 on `\w+`, 2.4 on the captures, 2.5 on the literal, and a little over
+  half of Rust's time on the `ERROR` lines (a prefilter on `ERROR ` and the
+  suffix check on `timeout`); natively 1.7 to 3.1 times Rust's time, and a
+  little over half on the `ERROR` lines.
 - **Where the gap is.** The literal: Rust's memchr uses AVX2 (32 bytes a
   step), the runtime SSE2 (16). `\w+` and the captures are per-match costs
   (670,000 and 10,755 matches): each match is a forward and a reverse DFA
-  run plus, for captures, the backtracker on the span; Rust's inner loops are
-  tighter (unchecked indexing, a byte DFA with no rune decode). The native
-  build loses most on these DFA loops (1.7 times its C build on `\w+`): the
-  native backend's bounds and overflow checks in the inner loop, not the
-  library.
+  run plus, for captures, the backtracker on the span. The span path now
+  runs `forward` and `backward` in one loop, takes the DFA's text by borrow
+  (no dup/drop per call), answers the start state from a 256-byte `idxof`
+  table without entering `Cache.start`, and scans ASCII in a fast loop whose
+  constant step lets `loops.obx` prove the byte bounds check. That took the
+  per-match overhead from 341 to 46 instructions; what is left on `\w+`
+  (1.07 instructions, 1.14 cycles of the C build with `-O`) is the two call
+  prologues and the deliver callback per match, plus the backend's remaining
+  reloads of headers and stack temporaries.
 - **`(a*)*b`** takes no time: the text has no `b`, and every match ends with
   one (the suffix check), so the search stops before any matcher runs. The
   DFA on such patterns is covered by the tests (`regex_linear`,
@@ -483,7 +491,10 @@ targets (the app gaps are in `obx/bench/README.md`'s three tiers). Range and
 check elimination was measured first and is not it: deleting *every* inline
 check from the native backend buys 3.7% of `\w+`'s instructions and no cycles,
 because the gap is per-match work and instruction selection (HISTORY.md,
-"Tried and shelved").
+"Tried and shelved"). After the later work those first figures are stale: with
+`-O`, regex `\w+` is 31.5 ms against 23.0 via C (1.37 wall, 1.07 instructions,
+1.14 cycles) and the Decimal aggregate is 1.10 cycles; the application suite
+below is the current table.
 
 `-O` is part of the quick gate: `run_native.py --lib --opt` builds the 613
 programs with `-O` and requires the same output, exit code and stderr as the
@@ -493,16 +504,22 @@ C build.
 
 `python3 obx/bench/apps.py -n 3` is the Tier-1 table: the same source built
 with `--native -O` and through the C backend, identical output required, timed
-with `perf` on one core, best of N, as a table, JSON and TSV. First baseline
-(core 4, `OBX_HASH_SEED=42`, 59 s):
+with `perf` on one core, best of N, as a table, JSON and TSV. Measured after
+the regex and Decimal changes (`OBX_HASH_SEED=42`, core 0, 51 s):
 
 | application | native | C | native/C (wall) | instructions native/C | cycles native/C |
 |---|---:|---:|---:|---:|---:|
-| regex (8 patterns, 3 MB) | 87 ms | 64 ms | 1.36 | 1.27 | 1.47 |
-| json (20 MB, parse/query/visit) | 629 ms | 643 ms | 0.98 | 1.15 | 0.99 |
-| jq (`-c .`, 20 MB) | 461 ms | 493 ms | 0.93 | 1.13 | 0.92 |
-| cmark (10 MB) | 214 ms | 187 ms | 1.14 | 1.27 | 1.15 |
-| decimal (all cases) | 3,158 ms | 2,830 ms | 1.12 | 1.28 | 1.13 |
+| regex (8 patterns, 3 MB) | 48 ms | 43 ms | 1.11 | 1.09 | 1.16 |
+| json (20 MB, parse/query/visit) | 514 ms | 526 ms | 0.98 | 1.14 | 0.97 |
+| jq (`-c .`, 20 MB) | 394 ms | 411 ms | 0.96 | 1.13 | 0.92 |
+| cmark (10 MB) | 170 ms | 163 ms | 1.04 | 1.27 | 1.09 |
+| decimal (all cases) | 2,891 ms | 2,646 ms | 1.09 | 1.23 | 1.10 |
+
+The first baseline, before the regex per-match work and the Decimal changes,
+was regex 1.36 / json 0.98 / jq 0.93 / cmark 1.14 / decimal 1.12 in wall time,
+with instructions 1.27 / 1.15 / 1.13 / 1.27 / 1.28 against C. Regex and
+Decimal are the two rows that have moved; JSON's instruction count is 1.14 of
+C's but its time is level, and cmark's remaining 1.27 is its parsing loop.
 
 The benchmark harnesses set `OBX_HASH_SEED` (42 by default, `--hash-seed` or
 `--random-hash` to change it), so the map layout is identical across runs and
@@ -631,6 +648,19 @@ an allocation and a copy per call: half of its time is the runtime's, the
 same as C's), cmp (half of its branch misses are in `digits`' compare
 tree), and the records passed by value on the stack, which the ABI requires
 of both builds.
+
+Two more changes (`decimal-abi`, design/decimal-perf-research.md section 9):
+`mul128` returns the low 64×64 product when both factors are below 2^64,
+skipping three cross products, and an ordered 128-bit compare against a
+constant, a register pair or memory compares the local where it is instead
+of copying it to `rax:rdx`. Native `-O` against the C build now: mul 1.45
+instructions / 0.95 cycles (was 1.72 / 1.07), rem 1.32 / 0.74 (was 1.75
+cycles), cmp 1.29 / 1.44 instructions and cycles (was 1.35 / 1.44), add
+1.15 / 1.14, parse 1.33 / 1.38, quantize 1.49 / 1.29, format 1.00 / 1.13.
+The aggregate application row is 1.09 wall and 1.10 cycles. The measured
+cost left in add is the by-value record copies, about four per call and 5%
+of its instructions; removing them needs a by-reference ABI for internal
+record parameters, not a source change.
 
 The digit count is a compare tree, trailing zeros are stripped by exact
 division, long division is Knuth's algorithm D in base 2^64, text is written
