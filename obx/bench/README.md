@@ -11,6 +11,15 @@ and cycles (`perf stat`, user mode) beside the wall times. The compile cost
 of `-O` itself is `python3 obx/tools/optcost.py --compiler <native-built
 obxc>`.
 
+## Compile time and size
+
+`python3 obx/bench/compile.py -n 3` times a hello world, the nine benchmark
+programs and the compiler self-build, and reports the resulting binary
+sizes, against rustc and gcc. It is the source of PERFORMANCE.md's compile
+table. The builds are not identical: obx emits nine small executables, the
+Rust project one binary with nine subcommands, and cargo measures its own
+build system.
+
 ## Like-for-like comparisons
 
 There are three different questions, and they must not be mixed:

@@ -62,7 +62,7 @@ Three things to know first:
   - **Native:** writes an ELF executable with no gcc. The program is static,
     or dynamically linked when it calls C libraries.
   - **C:** writes C and runs gcc.
-- The compiler is about 38,000 lines of obx. Under a third of that is
+- The compiler is about 39,000 lines of obx. Under a third of that is
   generated runtime tables.
 - Its C is checked in as a seed. A first build needs only gcc.
 
