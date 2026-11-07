@@ -86,6 +86,12 @@ compares:
 - `cmd/jq.obx` (native and through C) with jq 1.7.1, running the same
   filters.
 
+`simd/` measures the size of the explicit-SIMD prize (design/simd.md):
+`python3 obx/bench/simd/run.py` builds scalar C, gcc auto-vectorised C and
+hand AVX2 versions of `array`, `loop`, `sieve`, `tokens`, `strings` and a
+float dot product, plus the exact instruction sequence the proposed vector
+extension would emit, pinned to one core.
+
 `--obo` adds a column for obx's predecessor, the archived obo 0.19
 (`archive/obo/obo`; build it with `make -C archive/obo`), running the same
 programs from `archive/obo/bench/*_obo.obx`. The programs came from obo's
