@@ -28,14 +28,15 @@ fn fib(n: i64) -> i64 {
 
 // ---------------------------------------------------------------- loop
 
-fn bench_loop(n: i64) {
+fn bench_loop() {
+    // loop.obx's constant bound, so LLVM can prove the two overflow checks
+    // cannot fail, as obx's native `-O` does. The checks stay on in the build;
+    // only the proof is shared.
+    let n: i64 = 1_000_000_000;
     let mut s: i64 = 0;
     let mut i: i64 = 0;
     while i < n {
-        // Two checked operations per iteration, exactly as in loop.obx.
         s = s + i * 2;
-        // Keep s live across the iteration: no closed form, no vector loop.
-        s = black_box(s);
         i = i + 1;
     }
     println!("{}", s);
@@ -367,13 +368,7 @@ fn main() {
             let n = rest.first().map(|s| s.parse().unwrap()).unwrap_or(40);
             println!("{}", fib(n));
         }
-        "loop" => {
-            let n = rest
-                .first()
-                .map(|s| s.parse().unwrap())
-                .unwrap_or(1_000_000_000);
-            bench_loop(n);
-        }
+        "loop" => bench_loop(),
         "array" => bench_array(),
         "alloc" => bench_alloc(),
         "lists" => bench_lists(),

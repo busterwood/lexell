@@ -71,6 +71,10 @@ to be equal. The build is deliberately fair and fixed in the project:
 - `std::hint::black_box` and the command-line sizes (where `c/NAME.c` has
   them) keep LLVM from constant-folding or closing the work up. `fib` is
   `#[inline(never)]` and both recursive calls stay.
+- `loop` keeps `loop.obx`'s constant bound, with no argv and no barrier, so
+  LLVM can prove the two overflow checks cannot fail as the native `-O` pass
+  does. The C reference's argv bound and asm barrier exist only to stop gcc
+  closing the form; the Rust port matches the obx source, not that harness.
 
 `strings` is measured with idiomatic `String` in the table; `dbench
 strings-rc` runs the same concatenations on `Rc<str>`, which matches obx's

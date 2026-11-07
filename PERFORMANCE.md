@@ -66,7 +66,7 @@ below are from `--perf`, measuring the Rust binary the same way:
 | benchmark | native -O | plain C | Rust | native/Rust | native/plain C | what it does |
 |---|---:|---:|---:|---:|---:|---|
 | fib | 347 ms | 348 ms | 349 ms | 0.99 | 1.00 | recursive calls |
-| loop | 229 ms | 230 ms | 460 ms | 0.50 | 0.99 | two overflow-checked operations per iteration |
+| loop | 229 ms | 229 ms | 227 ms | 1.01 | 1.00 | two overflow-checked operations per iteration |
 | array | 107 ms | 35 ms | 102 ms | 1.05 | 3.01 | checked indexing |
 | alloc | 70 ms | 126 ms | 126 ms | 0.55 | 0.55 | 20 million records allocated and freed |
 | lists | 31 ms | 31 ms | 40 ms | 0.79 | 1.02 | linked list build, sum, drop |
@@ -111,17 +111,13 @@ code-shape gaps.
   cycles. Rust is level on time (349 vs 347 ms) but runs 5,133M instructions:
   its checked `n - 1` and `n - 2` add the overflow branches that native's
   backend proves away.
-- **Rust is level on fib, tokens and array.** fib and tokens are the same
-  time as native (349 vs 347 ms, 12 vs 12 ms); Rust's token scanner runs
-  104M instructions against native's 126M. `array` is 102 ms against 107:
-  both keep one bounds check per element.
-- **Rust loses `loop` to checked arithmetic.** It runs 460 ms against 229
-  ms, 11,000M instructions and 2,026M cycles against native's 7,000M and
-  1,004M. `loop` takes `n` from the command line as the C reference does, so
-  LLVM cannot bound `i` and must keep both overflow checks; `loop.obx` has
-  the constant `n = 1000000000`, which native `-O` uses to prove them away.
-  This is the price of obx's checked operations when the source does not
-  give a provable bound.
+- **Rust is level on fib, loop, tokens and array.** fib, loop and tokens are
+  the same time as native (349 vs 347 ms, 227 vs 229 ms, 12 vs 12 ms); Rust's
+  token scanner runs 104M instructions against native's 126M. `array` is 102
+  ms against 107: both keep one bounds check per element. `loop` keeps
+  `loop.obx`'s constant bound, so LLVM proves both overflow checks away as
+  native `-O` does; the C reference takes `n` from the command line and uses
+  an asm barrier only to stop gcc turning the iteration into a closed form.
 - **C's auto-vectorisation is the array gap; checks are the sieve gap.**
   gcc turns `array`'s inner loop into AVX2 (35 ms, 3.0x native) while Rust's
   bounds checks keep it scalar (102 ms, level with native's single check).
