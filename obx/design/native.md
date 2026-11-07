@@ -10,6 +10,12 @@ Both backends start from one IR (`ir.obx`): the C backend prints it as C for
 gcc (`--emit-c`, the default build), the native backend compiles it to
 machine code.
 
+The goals for this backend — runtime performance against GCC/Clang, compile
+speed and implementation size — the survey of other small optimizing compilers
+(QBE, MIR, Cranelift, C1/C2, RyuJIT, Maglev) and the proposal to express SIMD
+in the language instead of building an automatic vectorizer are in
+[small-fast-compiler.md](small-fast-compiler.md).
+
 ## 1. Pipeline: from check's templates to the IR
 
     syntax -> sema -> check (templates, tmpl.obx) -> emit (instances, glue) -> lower -> IR
