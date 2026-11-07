@@ -261,7 +261,14 @@ microbenchmarks.
    (rank 3), measured on `fib` and the regex's per-match path.
 6. **Register allocator with splitting** (rank 4) only as a deliberate
    mid-IR project: 900-1,400 lines, 5-10% cycles, and it needs scalar
-   replacement to show the mid-ir.md ceiling.
+   replacement to show the mid-ir.md ceiling. The cheap part was measured
+   2026-11-07 and is not enough: giving the hoisted `str` header pair full
+   weight when a call forces it into the callee-saved pool removed all four
+   header loads from `tokens`' identifier byte (-1.37% instructions, about
+   -1.5% cycles) but displaced the append value, so the buffer pointer then
+   reloaded once a byte. Preferring the invariants by 1.5-2x cost `maps` and
+   `regex`; the remaining load needs live-range splitting for the value that
+   borrows the register in one statement.
 7. **Vectorisation last** (rank 8), or express it in the language; it is a
    3.4x win on one benchmark and a pass of its own.
 

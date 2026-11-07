@@ -1735,6 +1735,36 @@ on `tokens`** and -0.61% on the self-build, but only **-0.86% cycles** on
 spilled string headers and the allocator, not issue slots, and the branch
 count does not change. It missed the 5%/3% cycle gate.
 
+The allocator side of the same `tokens` miss (`loop-regs`, 2026-11-07) was
+built, measured and reverted. Eight lines in `allocRegs` gave the hoisted
+`str` data-pointer and length locals (`sl`, `sd`) their full weight and raw
+weight when a call in the loop forces them into the callee-saved pool; before,
+they were halved and could not open a callee-saved register. On the native
+`-O` build of `tokens` this removed all four header loads from the identifier
+byte (base `mov -0x50(%rbp)`, three times, and `cmp -0x48(%rbp)`, once) and
+took **126.5M to 124.7M instructions (-1.37%)**; cycles agreed in sign but
+only by about **1.5%** (best of fifteen, core 0: 48.0M to 47.3M; noisier
+windows said 2.4%). The pair displaced the short-lived append value (`ap1`)
+from `r15`, and the buffer pointer `b` then reloads once per byte, so the net
+was three loads a byte, not four, and only one benchmark moved.
+Every other program was instruction-identical or better: `grep` -0.72%,
+`array`, `maps`, `regex` and the ten microbenchmarks 0.00%, the `--native`
+self-build +0.00% and the `-O` build +0.02% instructions. It missed the
+3% cycle gate, so the code is not kept; both `--lib` and `--lib --opt`
+native suites passed (613/613) with the candidate.
+
+The greedy choice it exposed is correct, not a bug: `ap1` in its slot costs a
+store and a load per byte, while `b` in its slot costs one load per byte, so
+the allocator keeps `ap1` in `r15` and spills `b`. Trying to prefer the
+invariant (`b`, or every cross-call loop local) by 1.5x or 2x weight made
+`tokens` worse (-0.30% instructions) and cost `maps` +1.05% and `regex`
++1.7% to +4.9% instructions; keeping short-lived values out of callee-saved
+registers cost `fib` +9% instructions. Recovering the last load needs the
+thing this experiment avoided: live-range splitting (keep `b` in the register
+across the loop and save it around the one statement that borrows the
+register), i.e. the full allocator in rank 4, not a weight threshold.
+
+
 `perf17` fails "Judging a pass": the run suite gains in cycles but on one
 program (fib), and the compile suite costs 1.05%. It is committed on its
 branch with the tests (`lib/tests/run/range_facts_*`) that show the checks
