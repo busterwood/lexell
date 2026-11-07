@@ -2458,3 +2458,29 @@ the same gcc-built compiler took 536 ms at `5d340654`.
 6 November 2026, when number literals got their `f` and `m` suffixes and the
 old inputs stopped compiling; they moved to `af99f933`, the last revision
 before the native float registers.
+
+### The C backend leaves the performance report (2026-11-07)
+
+PERFORMANCE.md no longer carries the native-versus-C-backend figures. The
+C backend stays as a feature for three jobs: the bootstrap seed (the
+checked-in `seed/obxc.c` is its output), portability and sanitizers, and
+the differential oracle that has caught native code-generation bugs. It is
+not the external performance target, so its comparison moved to
+[design/native-vs-c.md](obx/design/native-vs-c.md).
+
+The design note keeps, in one place, the same-IR comparison for the ten
+microbenchmarks, the `-O` cycle ratios, the Tier-1 application suite, the
+compiler self-build, regex, eza, grep, jq, Markdown, Decimal, tasks, HTTP,
+TLS, database streaming, binary sizes and math. Reproduce it with the
+commands in that note.
+
+PERFORMANCE.md now leads with absolute native times and the external
+references: Rust, Go, ripgrep, jq, cmark, Python, .NET/Java, OpenSSL, Go's
+and Node's HTTP servers. The native/C columns were removed from its tables;
+the remaining C mentions are definitions, the hand-written C references in
+`obx/bench/c/`, and the differential gate.
+
+The README and `obx/bench/README.md` say the same: native is the build, the
+C backend is the bootstrap/portability/oracle path, and the three comparison
+questions (same source native vs C, the same algorithm in hand-written C,
+another implementation) stay separate.

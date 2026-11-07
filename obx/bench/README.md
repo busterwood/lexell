@@ -1,6 +1,6 @@
 # obx benchmarks
 
-Nine small programs, each building the same program with both backends,
+Ten small programs, each building the same program with both backends,
 native and via C:
 
     python3 obx/bench/bench.py [-n RUNS] [--only NAME ...] [--obo] [--opt] [--perf]
@@ -17,8 +17,9 @@ There are three different questions, and they must not be mixed:
 1. **Same obx source, native against the C backend.** The two builds are the
    same algorithm, the same checks and the same runtime semantics; the
    difference is the code generator (and the runtime implementation). This is
-   the number that decides whether the C backend can go. It is the
-   `native/C` column.
+   an internal regression check: the C backend stays for the bootstrap seed,
+   portability and differential testing. It is the `native/C` column, kept
+   in [design/native-vs-c.md](../design/native-vs-c.md).
 2. **Same algorithm written in C, against native obx.** This is the
    language/runtime comparison: allocation, strings, records, the ABI, the
    checks the language requires. `obx/bench/c/NAME.c` holds these

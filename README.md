@@ -6,20 +6,28 @@ a while. There is no garbage collector, so the compiler decides when memory
 is freed. It also has generics.
 
 The compiler is written in obx and compiles itself. It builds programs
-straight to x86-64 executables, or through C and gcc.
+straight to x86-64 executables. A C backend remains for the bootstrap seed,
+portability and differential testing.
 
 Most of the library is ordinary obx code, not compiler features.
 Decimal, money, `Option`, `Result` and the containers are all library code.
 
 ## Quick start
 
-Run these from the repository root. The first build needs only gcc.
+Run these from the repository root. The first build uses the checked-in C
+seed.
 
 ```
-obx/compiler/build.sh                            # build the compiler from its C seed
+obx/compiler/build.sh                            # build the compiler from its seed
 obx/compiler/out/obxc prog.obx --native -o prog  # a native x86-64 program, no gcc
-obx/compiler/out/obxc prog.obx -o prog           # the same program through C
 obx/tools/gate.sh quick                          # run the test suites
+```
+
+The C backend is still available for the bootstrap, portability and
+differential checks:
+
+```
+obx/compiler/out/obxc prog.obx -o prog           # the same program through C
 ```
 
 A small program:
@@ -109,13 +117,16 @@ The Oracle client supports OUT binds, REF CURSORs and TLS.
 
 ## Performance
 
-These figures come from [PERFORMANCE.md](PERFORMANCE.md). They were
-measured on one 8-core test machine, so compare the columns, not the
-absolute numbers.
+These figures come from [PERFORMANCE.md](PERFORMANCE.md); the internal
+native-vs-C measurement is kept separately in
+[design/native-vs-c.md](obx/design/native-vs-c.md). They were measured on
+one 8-core test machine, so compare the columns, not the absolute numbers.
 
-- **Native code** takes 0.5 to 1.1 times the time of the same program built
-  through C, on ten benchmarks.
-- **Native Decimal** takes about 1 to 1.4 times C's cycles. It was 2 to 2.5 times.
+- **Applications:** regex 44 ms, `json`/`jq` 0.4 to 0.5 s, Markdown 0.16 s,
+  Decimal 2.2 s. The external references (Rust, Go, jq, cmark, .NET and
+  Java) are in [PERFORMANCE.md](PERFORMANCE.md).
+- **Decimal:** 13.3 ns for a 19-digit add and 17.1 ns for a 6x6 multiply;
+  1.2 times .NET on add and 1.5 on multiply.
 - **Float math** in the native backend takes within about 15% of C's cycles per call.
 - **HTTP server:** one thread serves 65,600 requests a second to 100 clients.
   Go's `net/http` serves 44,500 on the same setup. With 8 worker processes
@@ -132,6 +143,7 @@ absolute numbers.
 | [obx/SPEC.md](obx/SPEC.md) | the language definition |
 | [obx/PLAN.md](obx/PLAN.md) | the stages, their gates and their state |
 | [PERFORMANCE.md](PERFORMANCE.md) | the measured numbers and how they were taken |
+| [design/native-vs-c.md](obx/design/native-vs-c.md) | native against the C backend, as an internal check |
 | [HISTORY.md](HISTORY.md) | how the project got here, with dated entries |
 | [obx/design/](obx/design/) | design notes for each stage and subsystem |
 | [obx/lib/README.md](obx/lib/README.md) | the library: every module |
