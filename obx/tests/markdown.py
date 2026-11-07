@@ -274,6 +274,9 @@ def perf(exes, ref, reps):
 
 
 def main():
+    # Markdown's link-reference table is a Map, whose hashes are keyed per process; a fixed
+    # seed keeps the benchmark (and the differential runs) reproducible.
+    os.environ.setdefault('OBX_HASH_SEED', '42')
     ap = argparse.ArgumentParser()
     ap.add_argument('--c', action='store_true', help='build through C instead of native')
     ap.add_argument('-j', type=int, default=8)

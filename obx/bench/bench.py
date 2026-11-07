@@ -11,11 +11,18 @@ obx/bench/c/NAME.c (no checks), also gets it built with gcc -O2 and timed, as
 the "plain C" column ("-" for the others).
 
     python3 obx/bench/bench.py [-n RUNS] [--only NAME ...] [--obo] [--opt] [--perf]
+                              [--hash-seed N | --random-hash]
 
 The primary comparison is the same obx source built both ways (native and
 through C). The hand-written C references in c/ are a second, same-algorithm
 comparison; README.md says what each reference does to keep the work equal.
 --perf adds instructions and cycles (user mode) beside the wall times.
+
+Every program runs with OBX_HASH_SEED=42 (--hash-seed changes it), so the
+random per-process hash key of std.Map does not move the maps timings between
+runs or between the two backends; --random-hash runs with the production
+default instead. The output is identical either way (Map keeps insertion
+order).
 """
 import argparse
 import os
@@ -31,17 +38,27 @@ OBO = os.path.join(ROOT, 'archive', 'obo')
 OBO_SRC = os.path.join(OBO, 'bench')
 NAMES = ['fib', 'loop', 'array', 'alloc', 'lists', 'strings', 'trees', 'tokens', 'sieve', 'maps']
 TOKENS_INPUT = os.path.join(ROOT, 'obx', 'compiler', 'sema.obx')   # any text file; same for both
+HASH_SEED = None     # set from the command line; see base_env
 
 
 def args_for(name):
     return [TOKENS_INPUT] if name == 'tokens' else []
 
 
-def run(exe, name, env_extra=None):
+def base_env(env_extra=None):
     env = dict(os.environ)
     env.pop('OBX_CHECK', None)
     env.pop('OBO_CHECK', None)
+    if HASH_SEED is None:
+        env.pop('OBX_HASH_SEED', None)
+    else:
+        env['OBX_HASH_SEED'] = HASH_SEED
     env.update(env_extra or {})
+    return env
+
+
+def run(exe, name, env_extra=None):
+    env = base_env(env_extra)
     t0 = time.perf_counter()
     p = subprocess.run([exe] + args_for(name), capture_output=True, text=True, env=env)
     return p.returncode, p.stdout.strip(), p.stderr.strip(), time.perf_counter() - t0
@@ -63,7 +80,7 @@ def perf_run(exe, name, n):
     for _ in range(n):
         t0 = time.perf_counter()
         p = subprocess.run(['perf', 'stat', '-x,', '-e', 'instructions:u,cycles:u', exe] + args_for(name),
-                           capture_output=True, text=True)
+                           capture_output=True, text=True, env=base_env())
         dt = time.perf_counter() - t0
         if p.returncode != 0:
             raise SystemExit(f"{exe} exited {p.returncode}: {p.stderr}")
@@ -123,7 +140,13 @@ def main():
     ap.add_argument('--opt', action='store_true', help='also build native with -O and add its columns')
     ap.add_argument('--perf', action='store_true',
                     help='also report instructions and cycles (perf stat, user mode)')
+    ap.add_argument('--hash-seed', type=int, default=42,
+                    help='OBX_HASH_SEED for the runs (default 42; makes maps reproducible)')
+    ap.add_argument('--random-hash', action='store_true',
+                    help='run with the production per-process random hash key')
     a = ap.parse_args()
+    global HASH_SEED
+    HASH_SEED = None if a.random_hash else str(a.hash_seed)
     names = a.only or NAMES
     tmp = tempfile.mkdtemp(prefix='obxbench')
     rows = []

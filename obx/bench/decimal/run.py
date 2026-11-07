@@ -50,6 +50,8 @@ def perf(exe, case):
 
 
 def main():
+    # Map hashes are keyed per process; a fixed seed keeps runs comparable.
+    os.environ.setdefault('OBX_HASH_SEED', '42')
     ap = argparse.ArgumentParser()
     ap.add_argument('--base', required=True)
     ap.add_argument('--new', default=OBX)

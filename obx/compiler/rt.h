@@ -883,6 +883,22 @@ void* obxlib_peek_ptr(const void* p, int64_t i) { return ((void* const*)p)[i]; }
 void obxlib_poke_ptr(void* p, int64_t i, void* q) { ((void**)p)[i] = q; }
 void obxlib_copy_in(void* dst, int64_t at, const void* src, int64_t n) { memcpy((char*)dst + at, src, (size_t)n); }
 void obxlib_copy_out(void* dst, const void* src, int64_t at, int64_t n) { memcpy(dst, (const char*)src + at, (size_t)n); }
+/* OBX_HASH_SEED=n: a fixed hash key instead of the per-process random one, for benchmark runs
+   that must hash identically over repeated runs and in both backends. Off by default: without
+   the variable, or with an empty or non-numeric value, the random key below is used. n is
+   decimal; the second word is n through the splitmix64 finalizer. */
+static int rt_hash_seed_env(unsigned char* k) {
+    const char* s = getenv("OBX_HASH_SEED");
+    if (!s || *s < '0' || *s > '9') return 0;
+    uint64_t w0 = 0, w1;
+    while (*s >= '0' && *s <= '9') { w0 = w0 * 10 + (uint64_t)(*s - '0'); s++; }
+    w1 = w0 + 0x9e3779b97f4a7c15ULL;
+    w1 = (w1 ^ (w1 >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    w1 = (w1 ^ (w1 >> 27)) * 0x94d049bb133111ebULL;
+    w1 ^= w1 >> 31;
+    for (int j = 0; j < 8; j++) { k[j] = (uint8_t)(w0 >> (8 * j)); k[8 + j] = (uint8_t)(w1 >> (8 * j)); }
+    return 1;
+}
 /* lib std's hash key (std.obx, "keyed hashing"): the 16 random bytes the kernel gives every
    process (AT_RANDOM, no system call); std derives its key from them. Without AT_RANDOM (never
    on Linux since 2.6.29) getrandom fills them. Word i, 0 or 1. */
@@ -890,9 +906,11 @@ uint64_t obxlib_hash_key(int64_t i) {
     static unsigned char k[16];
     static bool got;
     if (!got) {
-        const unsigned char* r = (const unsigned char*)getauxval(AT_RANDOM);
-        if (r) memcpy(k, r, 16);
-        else if (getrandom(k, 16, 0) != 16) {}
+        if (!rt_hash_seed_env(k)) {
+            const unsigned char* r = (const unsigned char*)getauxval(AT_RANDOM);
+            if (r) memcpy(k, r, 16);
+            else if (getrandom(k, 16, 0) != 16) {}
+        }
         got = true;
     }
     uint64_t w;
