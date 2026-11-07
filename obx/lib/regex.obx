@@ -1794,11 +1794,18 @@ fn (re: &Regex) allMatches(text: str, n: int, ncap: int, deliver: &fn(&[]int)) {
     // The span of each match is all a DFA search needs to compute: run its
     // two passes here, without the per-match call layers of execute,
     // dfaExecute and dfaSearch (allMatches asks for many small matches).
-    if ncap == 2 && re.numSubexp == 0 && !re.hasOnePass && !re.literalOnly() && !re.inner && re.cond != -1 && len(text) >= re.minInputLen && re.useDfa(len(text)) {
+    if ncap == 2 && re.spansByDfa(text) {
         re.allMatchesDfa(mut &x, text, n, deliver)
         return
     }
     re.allMatchesSlow(mut &x, text, n, ncap, deliver, 0, 0, -1)
+}
+
+// Whether allMatches' span-only loop can run: the DFA, no groups, and no
+// other search to plan (a literal, or the reverse-inner one).
+fn (re: &Regex) spansByDfa(text: str): bool {
+    return re.numSubexp == 0 && !re.hasOnePass && !re.literalOnly() && !re.inner && re.cond != -1 &&
+        len(text) >= re.minInputLen && re.useDfa(len(text))
 }
 
 // allMatches for the DFA, spans only: the same loop, with forward and
@@ -1863,6 +1870,93 @@ fn (re: &Regex) allMatchesDfa(x: mut &Exec, text: str, n: int, deliver: &fn(&[]i
     }
 }
 
+// allMatchesDfa appending the spans directly, for findAllIndexN: the
+// callback and its two-slot []int are gone (the span-only caller pays no
+// indirect call a match). A search the DFA gives up on hands the rest to
+// allMatchesSpansSlow (Go's matchers, as execute does).
+fn (re: &Regex) allMatchesDfaSpans(x: mut &Exec, text: str, n: int, out: mut &[]Span) {
+    let end = len(text)
+    var pos = 0
+    var i = 0
+    var prevMatchEnd = -1
+    let anchored = re.cond & syn.EMPTY_BEGIN_TEXT != 0
+    let hasSuf = len(re.suffix) > 0
+    re.setupCaches(x)
+    let fdfa = &re.fdfa
+    let rdfa = &re.rdfa
+    let fprog = &re.prog
+    let rprog = &re.rprog
+    let pf = &re.pf
+    let tp = &text
+    while (n < 0 || i < n) && pos <= end {
+        if anchored && pos != 0 { break }
+        if hasSuf && !x.hasLiteral(text, pos, re.suffix) { break }
+        let e = fdfa.forward(mut &x.fc, fprog, tp, pos, anchored, false, pf)
+        if e == -2 {
+            x.dfaFailed = true
+            re.allMatchesSpansSlow(x, text, n, out, pos, i, prevMatchEnd)
+            return
+        }
+        if e < 0 { break }
+        var s = pos
+        if !anchored {
+            s = rdfa.backward(mut &x.rc, rprog, tp, pos, e)
+            if s == -2 {
+                x.dfaFailed = true
+                re.allMatchesSpansSlow(x, text, n, out, pos, i, prevMatchEnd)
+                return
+            }
+            if s < 0 { panic("regex: the reversed DFA found no start") }
+        }
+        var accept = true
+        if e == pos {
+            // An empty match: never right after the previous one.
+            if s == prevMatchEnd { accept = false }
+            if pos < end {
+                pos += syn.decodeRune(text, pos).w
+            } else {
+                pos = end + 1
+            }
+        } else {
+            pos = e
+        }
+        prevMatchEnd = e
+        if accept {
+            append(out, Span{start: s, end: e})
+            i += 1
+        }
+    }
+}
+
+// allMatchesSlow appending spans directly (the rest after a DFA gives up).
+fn (re: &Regex) allMatchesSpansSlow(x: mut &Exec, text: str, n: int, out: mut &[]Span, pos0: int, i0: int, prev0: int) {
+    let end = len(text)
+    var a: []int = []
+    var pos = pos0
+    var i = i0
+    var prevMatchEnd = prev0
+    while (n < 0 || i < n) && pos <= end {
+        if !re.execute(x, text, pos, 2, mut &a) { break }
+        var accept = true
+        if a[1] == pos {
+            // An empty match: never right after the previous one.
+            if a[0] == prevMatchEnd { accept = false }
+            if pos < end {
+                pos += syn.decodeRune(text, pos).w
+            } else {
+                pos = end + 1
+            }
+        } else {
+            pos = a[1]
+        }
+        prevMatchEnd = a[1]
+        if accept {
+            append(out, Span{start: a[0], end: a[1]})
+            i += 1
+        }
+    }
+}
+
 // allMatches with execute: from pos after i matches, the last ending at
 // prevMatchEnd (the body execute is needed for: captures, Go's matchers,
 // and the rest after a DFA gives up).
@@ -1911,6 +2005,11 @@ pub fn (re: &Regex) findAllIndex(text: str): []Span { return re.findAllIndexN(te
 // The spans of at most n matches (n < 0: all).
 pub fn (re: &Regex) findAllIndexN(text: str, n: int): []Span {
     var out: []Span = []
+    if re.spansByDfa(text) {
+        var x = newExec()
+        re.allMatchesDfaSpans(mut &x, text, n, mut &out)
+        return out
+    }
     re.allMatches(text, n, 2, fn(a: &[]int) { append(mut &out, Span{start: a[0], end: a[1]}) })
     return out
 }
