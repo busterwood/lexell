@@ -2317,3 +2317,54 @@ Closing a stream early reads and discards the rest of its reply: a
 1,000,000-row stream closed after 10 rows takes about 200 ms. For 1,000,000
 rows, native against libpq: 386 ms against 598 ms at 0 ms one way, and 431 ms
 against 607 ms at 2.5 ms. See `obx/design/pgwire.md`, sections 12, 26 and 28.
+
+### Regex per-match overhead (2026-11-07)
+
+The regex application row (`python3 obx/bench/apps.py -n 7 --pin 2`, core 2,
+one search per pattern, ~604M native instructions) is dominated by `\w+` on
+the 3.2 MB corpus: 669,532 matches, and a forward and a backward DFA call for
+each. The start-state cache lookup in `forward`/`backward` ran on every one.
+It used `d.idxof[text[p]]` (a byte-to-context table load) and then
+`c.starts[idx]`; it is now keyed by the byte itself (`Cache.starts[1024]`,
+with a 16-entry `ctxs` fallback so a miss still builds one state per
+empty-width context rather than one per distinct byte). The general forward
+loop moved out of `forward` into `forwardGeneral`, called only when the ASCII
+fast loop leaves work, so a search that stays on ASCII does not pay its
+setup; `eot = d.cls.n` moved to its one use after the loops; and the
+`T_FAILED`/`T_DEAD` pair became one `t >= T_DEAD` branch. The now-unused
+`Dfa.idxof` table is gone.
+
+Measured against the same tree (`regex_bench.obx corpus 1 NAME`,
+`perf stat -e instructions:u`):
+
+| pattern | native before | native after | C before | C after | native/C |
+|---|---:|---:|---:|---:|---:|
+| `\w+` | 461.07M | 439.79M (-4.6%) | 449.34M | 438.54M (-2.4%) | 1.026 -> 1.003 |
+| `Sherlock\|Holmes\|Watson\|Irene` | 23.97M | 24.32M (+1.5%) | 21.31M | 21.30M | 1.125 -> 1.142 |
+| dates | 100.20M | 99.94M (-0.3%) | 86.27M | 86.10M | 1.162 -> 1.161 |
+| other five | -0.3% to +0.4% | | | | |
+
+The whole regex row: 603.8M -> 582.7M native instructions (-3.5%), 574.2M ->
+563.2M through C (-1.9%), the instruction ratio 1.05 -> 1.03. Cycles did not
+move beyond noise (native 159.9M/160.2M against C 141.8M/140.0M, ratio 1.13);
+the instructions removed were latency-hidden start-index work, and the
+remaining cycle gap is the backend's IPC on the byte loops. Wall was 1.07-1.08
+before and 1.09-1.11 after in the same noisy window, i.e. unchanged. The
+`alternation` regression is the new `forwardGeneral` call on the prefilter
+path (about 50 instructions a match); it is small and was not worth a second
+copy of the general loop.
+
+A compiler pass was built for the same problem and reverted: `pin.obx` read a
+reference parameter's pointee once at entry into a local (`q = *p`, for a
+parameter never assigned and whose address is not taken; 142 pin sites on the
+`\w+` driver). It cut the empty `forward` call from 157 to 145 native
+instructions and, on the full app suite (`-n 3`), instructions: `cmark`
+1343.0M -> 1277.5M (-4.9%), `json` 4417.2M -> 4373.6M (-1.0%), `jq`
+4288.9M -> 4263.6M (-0.6%), `decimal` unchanged, `regex` 603.8M -> 589.6M.
+But it miscompiles `regex_find.obx`, `regex_searcher.obx` and
+`regex_re2search/main.obx` under `--native -O` (`index out of range` in
+`doOnePass`, a wrong register/value in the one-pass matcher; the same IR
+through C and without `-O` is right), so it is not kept. The pinned local is
+loaded from a parameter slot at entry and lives across calls; the failure is
+in the native register allocation or live-range handling for that shape, not
+in the pass's aliasing rule (conservative address-taking did not fix it).
