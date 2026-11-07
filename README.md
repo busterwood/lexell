@@ -13,6 +13,11 @@ reference counted, and generic code is checked where it is written and
 compiled per instance. Programs are built from modules: one source file each,
 with explicit imports and `pub` visibility.
 
+The rest is deliberately familiar: records with methods, structural
+interfaces as generic constraints, generics, growable arrays and slices,
+string slicing and views, closures and function values, `Option` and `Result`
+with `try`, `match` expressions, and destructors.
+
 Concurrency is cooperative tasks on one OS thread: stackful coroutines over
 an epoll loop, with handlers written in ordinary blocking style — no
 `async`/`await`, no function colouring. More cores means shared-nothing
