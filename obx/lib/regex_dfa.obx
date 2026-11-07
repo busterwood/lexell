@@ -182,10 +182,9 @@ pub type Dfa = record {
     cls: Classes
     longest: bool
     ninst: int
-    idxof: []int           // the start-state context index of each byte before/at the position
 }
 
-pub fn noDfa(): Dfa { return Dfa{ok: false, cls: emptyClasses(), longest: false, ninst: 0, idxof: []} }
+pub fn noDfa(): Dfa { return Dfa{ok: false, cls: emptyClasses(), longest: false, ninst: 0} }
 
 // The most instructions a program may have for a DFA.
 const MAX_DFA_INST = 20000
@@ -194,16 +193,7 @@ pub fn newDfa(p: &syn.Prog, longest: bool): Dfa {
     if len(p.inst) > MAX_DFA_INST { return noDfa() }
     let cls = buildClasses(p)
     if cls.n == 0 { return noDfa() }
-    // The start state's context left of a position depends on one byte: a
-    // newline before it, and whether that byte is a word byte (the same
-    // test syn.isWordChar makes; the class of an ASCII byte agrees).
-    var idxof = array(256, 0)
-    for b in 0..256 {
-        var idx = if b == 10 { 2 } else { 0 }
-        if syn.isWordChar(b) { idx = idx | 4 }
-        idxof[b] = idx
-    }
-    return Dfa{ok: true, cls: cls, longest: longest, ninst: len(p.inst), idxof: idxof}
+    return Dfa{ok: true, cls: cls, longest: longest, ninst: len(p.inst)}
 }
 
 // The number of rune classes (for tests).
@@ -244,7 +234,8 @@ pub type Cache = record {
     trans: []int
     htab: []int
     hmask: int
-    starts: []int         // the start state per context, or -1
+    starts: []int         // the start state per byte context, or -1
+    ctxs: []int           // the same per empty-width context (a byte-key miss looks here)
     budget: int
     bail: bool
     paths: bool           // record the path entries (leftmost-first)
@@ -277,7 +268,7 @@ pub type Cache = record {
 
 pub fn newCache(): Cache {
     return Cache{stride: 0, sflag: [], slo: [], sn: [], shash: [], sinst: [], nstates: 0, trans: [], htab: [], hmask: 0,
-        starts: [], budget: 0, bail: true, paths: false, leaves: 0, clears: 0, resetAt: 0, pos: 0, reach: 0, vsparse: [], vdense: [], vn: 0, items: [],
+        starts: [], ctxs: [], budget: 0, bail: true, paths: false, leaves: 0, clears: 0, resetAt: 0, pos: 0, reach: 0, vsparse: [], vdense: [], vn: 0, items: [],
         ni: 0, lastMark: true, cur: [], stack: [], tmp: [], tn: 0, tflag: 0, save: [], pfFrom: -1, pfCand: -1, pfCalls: 0,
         pfSkip: 0, pfOff: false, markStart: true}
 }
@@ -300,7 +291,8 @@ pub fn (c: mut &Cache) setup(d: &Dfa, budget: int, bail: bool) {
     c.stack = array(n + 1, 0)
     c.htab = array(64, 0)
     c.hmask = 63
-    c.starts = array(16, -1)
+    c.starts = array(1024, -1)
+    c.ctxs = array(16, -1)
 }
 
 pub fn (c: &Cache) ready(): bool { return c.stride != 0 }
@@ -554,7 +546,8 @@ fn (c: mut &Cache) reset(): bool {
     c.nstates = 0
     c.htab = array(64, 0)
     c.hmask = 63
-    for k in 0..16 { c.starts[k] = -1 }
+    for k in 0..1024 { c.starts[k] = -1 }
+    for k in 0..16 { c.ctxs[k] = -1 }
     return true
 }
 
@@ -664,27 +657,43 @@ fn (c: mut &Cache) next(d: &Dfa, p: &syn.Prog, s: int, k: int): int {
 // The start state for a search at pos (rev: a scan backward from pos):
 // its transition value, T_DEAD or T_FAILED.
 fn (c: mut &Cache) start(d: &Dfa, p: &syn.Prog, text: &str, pos: int, anchored: bool, rev: bool): int {
-    var idx = 0
+    // The start-state cache key: the byte left of (or at, in a reverse scan) the
+    // position, 256 before the text, and 512 when anchored. Keying by the byte
+    // itself saves the old byte-to-context table load on the hot path; the flags
+    // are the same tests of the byte.
+    var b = 256
     if rev {
-        if pos >= len(text) {
-            idx = 3
-        } else {
-            idx = d.idxof[int(text[pos])]
-        }
+        if pos < len(text) { b = int(text[pos]) }
     } else {
-        if pos == 0 {
-            idx = 3
-        } else {
-            idx = d.idxof[int(text[pos - 1])]
-        }
+        if pos > 0 { b = int(text[pos - 1]) }
     }
-    if !anchored { idx = idx | 8 }
-    if c.starts[idx] >= 0 { return c.starts[idx] }
+    var key = b
+    if anchored { key = key | 512 }
+    if c.starts[key] >= 0 { return c.starts[key] }
+    // A byte key misses for every byte at the same empty-width context; keep the
+    // built state per context too, so a text with many distinct bytes does not
+    // build the same start state again for each (prefiltered searches do).
+    var ctx = 0
+    if b == 256 {
+        ctx = ctx | 3
+    } else {
+        if b == 10 { ctx = ctx | 2 }
+        if syn.isWordChar(b) { ctx = ctx | 4 }
+    }
+    if anchored { ctx = ctx | 8 }
+    if c.ctxs[ctx] >= 0 {
+        c.starts[key] = c.ctxs[ctx]
+        return c.ctxs[ctx]
+    }
     var empty = 0
-    if idx & 1 != 0 { empty = empty | syn.EMPTY_BEGIN_TEXT }
-    if idx & 2 != 0 { empty = empty | syn.EMPTY_BEGIN_LINE }
+    if b == 256 {
+        empty = empty | syn.EMPTY_BEGIN_TEXT
+        empty = empty | syn.EMPTY_BEGIN_LINE
+    } else if b == 10 {
+        empty = empty | syn.EMPTY_BEGIN_LINE
+    }
     var flag = empty << EMPTY_SHIFT
-    if idx & 4 != 0 { flag = flag | F_LASTWORD }
+    if b != 256 && syn.isWordChar(b) { flag = flag | F_LASTWORD }
     if !anchored { flag = flag | F_U | F_START }
     c.qclear()
     c.add(p, p.start, empty)
@@ -693,7 +702,8 @@ fn (c: mut &Cache) start(d: &Dfa, p: &syn.Prog, text: &str, pos: int, anchored: 
         if !c.reset() { return T_FAILED }
         t = c.intern(c.tflag, true, false)
     }
-    c.starts[idx] = t
+    c.starts[key] = t
+    c.ctxs[ctx] = t
     return t
 }
 
@@ -707,32 +717,32 @@ fn (c: mut &Cache) start(d: &Dfa, p: &syn.Prog, text: &str, pos: int, anchored: 
 pub fn (d: &Dfa) forward(c: mut &Cache, p: &syn.Prog, text: &str, pos: int, anchored: bool, earliest: bool, pf: &Prefilter): int {
     // The start state for this context, from the cache when it is there
     // (the call would rebuild the same index; this is the hot path).
-    var t = -1
-    if pos == 0 {
-        t = c.starts[if anchored { 11 } else { 3 }]
-    } else {
-        var idx = d.idxof[int(text[pos - 1])]
-        if !anchored { idx = idx | 8 }
-        t = c.starts[idx]
-    }
+    var key = 256
+    if pos != 0 { key = int(text[pos - 1]) }
+    if anchored { key = key | 512 }
+    var t = c.starts[key]
     if t < 0 { t = c.start(d, p, text, pos, anchored, false) }
-    if t == T_FAILED { return -2 }
-    if t == T_DEAD { return -1 }
+    if t >= T_DEAD {
+        if t == T_FAILED { return -2 }
+        return -1
+    }
     var at = pos
-    let usePf = pf.kind != PF_NONE && !anchored && !c.pfOff
-    if usePf && t & T_START != 0 {
-        let cand = c.prefilter(pf, text, at)
-        if cand < 0 { return -1 }
-        if cand > at {
-            at = cand
-            t = c.start(d, p, text, at, false, false)
-            if t == T_FAILED { return -2 }
-            if t == T_DEAD { return -1 }
+    if pf.kind != PF_NONE {
+        if !anchored && !c.pfOff {
+            if t & T_START != 0 {
+                let cand = c.prefilter(pf, text, at)
+                if cand < 0 { return -1 }
+                if cand > at {
+                    at = cand
+                    t = c.start(d, p, text, at, false, false)
+                    if t == T_FAILED { return -2 }
+                    if t == T_DEAD { return -1 }
+                }
+            }
         }
     }
     var s = t & T_MASK
     var last = -1
-    let eot = d.cls.n
     // at is a position (never negative); the clamp states it for the pass,
     // which then proves the text[at] check of the ASCII loop.
     if at < 0 { at = 0 }
@@ -743,7 +753,7 @@ pub fn (d: &Dfa) forward(c: mut &Cache, p: &syn.Prog, text: &str, pos: int, anch
     // the compiler prove the text[at] check (a variable rune width does
     // not): run them here. Non-ASCII bytes, unknown transitions and the
     // dead state continue in the general loop below.
-    if !usePf {
+    if pf.kind == PF_NONE || anchored || c.pfOff {
         // Its own length local: the pass reuses it for the text[at] check
         // (one declared outside the if is not in the loop's block).
         let n2 = len(text)
@@ -772,6 +782,38 @@ pub fn (d: &Dfa) forward(c: mut &Cache, p: &syn.Prog, text: &str, pos: int, anch
             break
         }
     }
+    if at < n {
+        let g = forwardGeneral(d, c, p, text, at, n, s, last, anchored, earliest, pf)
+        if g.st == -2 { return -2 }
+        if g.st == -1 { return g.last }
+        if g.st == 1 { return g.at }
+        s = g.s
+        last = g.last
+        at = g.at
+    }
+    c.reach = n
+    let eot = d.cls.n
+    var t2 = c.trans[s + eot]
+    if t2 == T_UNKNOWN {
+        c.pos = at
+        t2 = c.next(d, p, s, eot)
+        if t2 == T_FAILED { return -2 }
+    }
+    if t2 != T_DEAD && t2 & T_MATCH != 0 { last = n }
+    return last
+}
+
+
+// The general forward loop (non-ASCII bytes, unknown transitions, prefilters),
+// from at (at < n). Kept out of forward's common path so that a search that
+// stays on ASCII bytes does not pay its setup.
+type Gen = value record { st: int; last: int; s: int; at: int }
+
+fn forwardGeneral(d: &Dfa, c: mut &Cache, p: &syn.Prog, text: &str, at0: int, n: int, s0: int, last0: int, anchored: bool, earliest: bool, pf: &Prefilter): Gen {
+    var at = at0
+    var s = s0
+    var last = last0
+    let usePf = pf.kind != PF_NONE && !anchored && !c.pfOff
     while at < n {
         let b = int(text[at])
         var k = 0
@@ -795,17 +837,17 @@ pub fn (d: &Dfa) forward(c: mut &Cache, p: &syn.Prog, text: &str, pos: int, anch
             s = t2 & T_MASK
             if t2 & T_MATCH != 0 {
                 last = at
-                if earliest { return at }
+                if earliest { return Gen{st: 1, last: last, s: s, at: at} }
             }
             at += w
             if usePf && t2 & T_START != 0 {
                 let cand = c.prefilter(pf, text, at)
-                if cand < 0 { return last }
+                if cand < 0 { return Gen{st: -1, last: last, s: s, at: at} }
                 if cand > at {
                     at = cand
                     let t3 = c.start(d, p, text, at, false, false)
-                    if t3 == T_FAILED { return -2 }
-                    if t3 == T_DEAD { return last }
+                    if t3 == T_FAILED { return Gen{st: -2, last: last, s: s, at: at} }
+                    if t3 == T_DEAD { return Gen{st: -1, last: last, s: s, at: at} }
                     s = t3 & T_MASK
                 }
             }
@@ -814,39 +856,31 @@ pub fn (d: &Dfa) forward(c: mut &Cache, p: &syn.Prog, text: &str, pos: int, anch
         if t2 == T_UNKNOWN {
             c.pos = at
             t2 = c.next(d, p, s, k)
-            if t2 == T_FAILED { return -2 }
+            if t2 == T_FAILED { return Gen{st: -2, last: last, s: s, at: at} }
         }
         if t2 == T_DEAD {
             c.reach = at + w
-            return last
+            return Gen{st: -1, last: last, s: s, at: at}
         }
         s = t2 & T_MASK
         if t2 & T_MATCH != 0 {
             last = at
-            if earliest { return at }
+            if earliest { return Gen{st: 1, last: last, s: s, at: at} }
         }
         at += w
         if usePf && t2 & T_START != 0 {
             let cand = c.prefilter(pf, text, at)
-            if cand < 0 { return last }
+            if cand < 0 { return Gen{st: -1, last: last, s: s, at: at} }
             if cand > at {
                 at = cand
                 let t3 = c.start(d, p, text, at, false, false)
-                if t3 == T_FAILED { return -2 }
-                if t3 == T_DEAD { return last }
+                if t3 == T_FAILED { return Gen{st: -2, last: last, s: s, at: at} }
+                if t3 == T_DEAD { return Gen{st: -1, last: last, s: s, at: at} }
                 s = t3 & T_MASK
             }
         }
     }
-    c.reach = n
-    var t2 = c.trans[s + eot]
-    if t2 == T_UNKNOWN {
-        c.pos = at
-        t2 = c.next(d, p, s, eot)
-        if t2 == T_FAILED { return -2 }
-    }
-    if t2 != T_DEAD && t2 & T_MATCH != 0 { last = n }
-    return last
+    return Gen{st: 0, last: last, s: s, at: at}
 }
 
 // The lines of text[from..to] with a match, for a program no match of
@@ -964,15 +998,15 @@ pub fn (d: &Dfa) forwardLines(c: mut &Cache, p: &syn.Prog, text: &str, from: int
 // kind): the start, -1 if there is none, -2 if the cache gave up.
 pub fn (d: &Dfa) backward(c: mut &Cache, p: &syn.Prog, text: &str, lo: int, e: int): int {
     // The start state for this context, from the cache when it is there.
-    var t = -1
-    if e >= len(text) {
-        t = c.starts[3]
-    } else {
-        t = c.starts[d.idxof[int(text[e])]]
-    }
+    var key = 256
+    if e < len(text) { key = int(text[e]) }
+    key = key | 512
+    var t = c.starts[key]
     if t < 0 { t = c.start(d, p, text, e, true, true) }
-    if t == T_FAILED { return -2 }
-    if t == T_DEAD { return -1 }
+    if t >= T_DEAD {
+        if t == T_FAILED { return -2 }
+        return -1
+    }
     var s = t & T_MASK
     var at = e
     var last = -1
