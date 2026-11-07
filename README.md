@@ -127,9 +127,9 @@ one 8-core test machine, so compare the columns, not the absolute numbers.
   Java) are in [PERFORMANCE.md](PERFORMANCE.md).
 - **Decimal:** 13.3 ns for a 19-digit add and 17.1 ns for a 6x6 multiply;
   1.2 times .NET on add and 1.5 on multiply.
-- **Microbenchmarks:** native is level with Rust on fib, loop, tokens and
+- **Microbenchmarks:** obx is level with Rust on fib, loop, tokens and
   array and ahead on allocation, lists, strings and trees; gcc's
-  auto-vectorised array is 3 times native. The table and the Rust ports are
+  auto-vectorised array is 3 times obx. The table and the Rust ports are
   in [PERFORMANCE.md](PERFORMANCE.md) and [obx/bench/rust/](obx/bench/rust/).
 - **Float math** in the native backend takes within about 15% of C's cycles per call.
 - **HTTP server:** one thread serves 65,600 requests a second to 100 clients.

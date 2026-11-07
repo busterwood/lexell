@@ -10,7 +10,7 @@ obx builds a program in two ways:
   -falign-loops=32`).
 
 Both are built from the same IR and must behave identically; the gate checks
-that on every test program. Native is the program's build; the C backend is
+that on every test program. obx is the program's build; the C backend is
 kept for the bootstrap seed, portability and differential testing. Its
 performance comparison is not part of this report: it is in
 [design/native-vs-c.md](obx/design/native-vs-c.md).
@@ -62,7 +62,7 @@ code here, and the experiments that did not pay — is in
 ([obx/bench/](obx/bench/README.md)); the instruction and cycle counts quoted
 below are from `--perf`, measuring the Rust binary the same way:
 
-| benchmark | native -O | plain C | Rust | native/Rust | native/plain C | what it does |
+| benchmark | obx -O | plain C | Rust | obx/Rust | obx/plain C | what it does |
 |---|---:|---:|---:|---:|---:|---|
 | fib | 347 ms | 348 ms | 349 ms | 0.99 | 1.00 | recursive calls |
 | loop | 229 ms | 229 ms | 227 ms | 1.01 | 1.00 | two overflow-checked operations per iteration |
@@ -95,7 +95,7 @@ code-shape gaps.
   freestanding runtime has a size-class allocator with no locks or libc
   bookkeeping and an 8-byte block header; the string and index checks are
   generated inline.
-- **Tight loops are native's strength** (loop, array). The native backend
+- **Tight loops are obx's strength** (loop, array). The native backend
   tests at the bottom of loops and aligns their bodies, reads array headers
   once per loop, and drops the bounds and overflow checks that conditions,
   passed checks and induction variables prove cannot fail
@@ -104,31 +104,31 @@ code-shape gaps.
   bound is unrelated to the array's length).
 - **The sieve is at plain C's speed.** A hand-written C version with no
   checks (`obx/bench/c/sieve.c`, `gcc -O2`, bench.py's "plain C" column)
-  took 158 ms in the same run. Native obx runs 1,414M instructions in 626M
+  took 158 ms in the same run. obx runs 1,414M instructions in 626M
   cycles.
-- **fib** is calls and returns: native runs 3,643M instructions in 1,524M
+- **fib** is calls and returns: obx runs 3,643M instructions in 1,524M
   cycles. Rust is level on time (349 vs 347 ms) but runs 5,133M instructions:
-  its checked `n - 1` and `n - 2` add the overflow branches that native's
+  its checked `n - 1` and `n - 2` add the overflow branches that the native
   backend proves away.
 - **Rust is level on fib, loop, tokens and array.** fib, loop and tokens are
-  the same time as native (349 vs 347 ms, 227 vs 229 ms, 12 vs 12 ms); Rust's
-  token scanner runs 104M instructions against native's 126M. `array` is 102
+  the same time as obx (349 vs 347 ms, 227 vs 229 ms, 12 vs 12 ms); Rust's
+  token scanner runs 104M instructions against obx's 126M. `array` is 102
   ms against 107: both keep one bounds check per element. `loop` keeps
   `loop.obx`'s constant bound, so LLVM proves both overflow checks away as
-  native `-O` does; the C reference takes `n` from the command line and uses
+  obx `-O` does; the C reference takes `n` from the command line and uses
   an asm barrier only to stop gcc turning the iteration into a closed form.
 - **C's auto-vectorisation is the array gap; checks are the sieve gap.**
-  gcc turns `array`'s inner loop into AVX2 (35 ms, 3.0x native) while Rust's
-  bounds checks keep it scalar (102 ms, level with native's single check).
+  gcc turns `array`'s inner loop into AVX2 (35 ms, 3.0x obx) while Rust's
+  bounds checks keep it scalar (102 ms, level with obx's single check).
   On `sieve`, Rust keeps a bounds check on every `prime[j]` and a checked
-  `j += i`: 247 ms, 2,106M instructions and 1,209M cycles, against native's
+  `j += i`: 247 ms, 2,106M instructions and 1,209M cycles, against obx's
   148 ms and 1,414M/626M; C is 158 ms with no checks.
 - **Rust uses the system allocator.** `alloc` is 126 ms, the same as plain C
-  (126 ms) and 1.8x native (70 ms): libc `malloc`/`free` against the
+  (126 ms) and 1.8x obx (70 ms): libc `malloc`/`free` against the
   freestanding size-class allocator. `lists` is 40 vs 31 ms (Rust's
   recursive `Drop` walks the 10,000-node list; C frees it iteratively) and
   `trees` 25 vs 20 ms.
-- **Strings: `String` and `Rc<str>`.** Native is 45 ms and plain C 91 ms;
+- **Strings: `String` and `Rc<str>`.** obx is 45 ms and plain C 91 ms;
   Rust `String` is 79 ms. The `Rc<str>` version (`dbench strings-rc`, the
   closer analogue of obx's refcounted `str`) is 128 ms in an interleaved
   best-of-15 run, 1.6x the `String` version: a safe concatenation builds a
@@ -147,9 +147,9 @@ code-shape gaps.
   functions start at multiples of 64 and the native backend aligns loop
   heads; gcc gets `-falign-functions=64 -falign-loops=32`, in programs and in
   the native runtime. `python3 obx/tools/placement.py` builds a benchmark
-  eight times with its code shifted by 0, 8, ..., 56 bytes (native:
-  `OBX_PADB=n`) and reports the spread. Native fib, loop, array and alloc
-  move by under 1%, trees and sieve by 2–4%; maps moves as much between runs
+  eight times with its code shifted by 0, 8, ..., 56 bytes (obx:
+  `OBX_PADB=n`) and reports the spread. obx fib, loop, array and alloc move
+  by under 1%, trees and sieve by 2–4%; maps moves as much between runs
   of one binary on a loaded machine, which is memory, not placement.
 
 ## Regex
@@ -165,7 +165,7 @@ crate 1.12.3, and rg is ripgrep 14.1.1 counting matches as a whole process,
 start-up and file reading included: a reference point, not a like-for-like
 figure.
 
-| pattern | matches | obx native | Go | Rust | rg |
+| pattern | matches | obx | Go | Rust | rg |
 |---|---:|---:|---:|---:|---:|
 | `Sherlock Holmes` | 926 | 0.21 | 0.48 | 0.08 | 1.7 |
 | `Sherlock\|Holmes\|Watson\|Irene` | 7,350 | 0.88 | 139.90 | 0.44 | 2.6 |
@@ -225,7 +225,7 @@ view). `LC_ALL=C TZ=UTC`; the long listings use
 `--bytes --time-style=long-iso -n`, which that build required. Best of 9; both
 builds write byte-identical listings.
 
-| listing | output | native |
+| listing | output | obx |
 |---|---:|---:|
 | `-T /usr/share` (tree) | 2.1 MB | 119 ms |
 | `-T -l /usr/share` (long tree) | 3.7 MB | 234 ms |
@@ -242,7 +242,7 @@ generated text (1.8 million lines; the generator is in
 `LC_ALL=C` (under `C.UTF-8` GNU grep's `-w` takes 2.3 times as long; the obx
 port has no locale). Every output equals GNU grep's.
 
-| search | GNU | native |
+| search | GNU | obx |
 |---|---:|---:|
 | `needle5007` (a literal) | 27 ms | 17 ms |
 | `-c omega` | 89 ms | 64 ms |
@@ -278,10 +278,10 @@ The same generator run to 10^9 bytes (18.2 million lines), the cases above
 and more pattern shapes. Best of 3, output piped to `md5sum`, the file in the
 page cache, `LC_ALL=C`. ripgrep (14.1.1, one file; `-E` dropped, since rg's
 regexes are extended already) is for reference; it has no `-x` and its `-f`
-was not measured. On every case the native build printed exactly what GNU
+was not measured. On every case the obx build printed exactly what GNU
 grep printed, and so did ripgrep.
 
-| search | GNU | ripgrep | native |
+| search | GNU | ripgrep | obx |
 |---|---:|---:|---:|
 | `needle5007` (a literal, one line) | 283 ms | 85 ms | 186 ms |
 | `-c zzz` (no match) | 353 ms | 76 ms | 183 ms |
@@ -336,7 +336,7 @@ instruction counts are current.
 of 182,290 generated records. Best of 3; the output goes to a file, and the
 three outputs of each filter must be identical.
 
-| filter | jq 1.7.1 | native |
+| filter | jq 1.7.1 | obx |
 |---|---:|---:|
 | `.` | 2.50 s | 1.74 s |
 | `-c .` | 2.24 s | 1.62 s |
@@ -351,7 +351,7 @@ obx columns were measured at 80 MB with `--mb 80 -n 3`.
 The same script times the JSON library on the file (ms, best of 3), against
 Python's `json`:
 
-| step | obx native | Python |
+| step | obx | Python |
 |---|---:|---:|
 | parse | 771 | 846 |
 | compact output | 542 | 818 |
@@ -363,7 +363,7 @@ Python's `json`:
 best of 9); the outputs are identical. The table is from an earlier sweep
 (it needs the jq reference).
 
-| program | jq 1.7.1 | native |
+| program | jq 1.7.1 | obx |
 |---|---:|---:|
 | `1` (start-up) | 2 ms | 5 ms |
 | `reduce range(3000000) as $i (0; . + $i)` | 503 ms | 540 ms |
@@ -377,7 +377,7 @@ best of 9); the outputs are identical. The table is from an earlier sweep
 **Where the port wins.** Wherever JSON is parsed or written: jq builds a
 decNumber for every literal, and its writer goes through `jv_dump_term`; the
 JSON library keeps the literal's text and writes it back. Also on simple
-generators: `limit`, `range` and `map` are native in the port, and
+generators: `limit`, `range` and `map` are built into the port, and
 continuation calls cost less than jq's bytecode with its fork points.
 Compiled regexes are cached for the run.
 
@@ -405,7 +405,7 @@ host was too variable to re-baseline the pipe-bound times (the same binary
 moved by 1.7x between runs). The instruction and cycle ratios below are
 current.
 
-| document | cmark | obx native |
+| document | cmark | obx |
 |---|---:|---:|
 | the spec, repeated to 10 MB | 0.18 | 0.20 |
 | the repo's Markdown files, repeated to 10 MB | 0.22 | 0.25 |
@@ -428,10 +428,10 @@ parser keeps the tree in one array of 200-byte nodes: the 10 MB spec takes
 
 ## The compiler
 
-The obx compiler compiling itself (`obx/compiler/main.obx`), native build,
+The obx compiler compiling itself (`obx/compiler/main.obx`), obx build,
 best of 11:
 
-| | native build |
+| | obx build |
 |---|---:|
 | self-build to an executable (`--native`) | 733 ms |
 | self-build to C (`--emit-c`) | 457 ms |
@@ -440,7 +440,7 @@ best of 11:
 The compiler is 39,436 lines of obx (1.78 MB, 706 KB of it the generated
 runtime tables `rt.obx` and `rtx.obx`; 28,348 hand-written lines) and 5,634
 lines of C runtime (the C backend's `rt.h` and the native backend's
-freestanding `rt.c`). The native-built compiler runs 5,009M instructions in
+freestanding `rt.c`). The obx-built compiler runs 5,009M instructions in
 2,999M cycles on `--native`. Absolute times move with the host; the
 instruction counts are the stable comparison. The gcc-built comparison is in
 [design/native-vs-c.md](obx/design/native-vs-c.md).
@@ -518,7 +518,7 @@ best of 3, one core):
 | **geomean** | | | **+14.9%** | | | **+16.1%** |
 
 The code `-O` makes is judged by `obx/bench/bench.py --opt` (the ten
-benchmarks, native `-O` against the hand-written C references) and by the
+benchmarks, obx `-O` against the hand-written C references) and by the
 regex, JSON/jq, Markdown and Decimal harnesses. The ladder pays on loops,
 allocation, strings, trees, sieve and Markdown; it does not move the DFA's
 per-match work or jq's boxes. The `-O`/C cycle ratios are in
@@ -536,11 +536,11 @@ as the C build.
 ### The application suite
 
 `python3 obx/bench/apps.py -n 5 --pin 2` is the Tier-1 table: the same source
-built natively with `-O`, output checked, timed with `perf` on one core, best
+built with obx `-O`, output checked, timed with `perf` on one core, best
 of N, as a table, JSON and TSV. Measured at `fb50b4f1`
 (`OBX_HASH_SEED=42`, core 2, 60 s):
 
-| application | native wall | instructions | cycles |
+| application | obx wall | instructions | cycles |
 |---|---:|---:|---:|
 | regex (8 patterns, 3 MB) | 44 ms | 582.7M | 157.9M |
 | json (20 MB, parse/query/visit) | 481 ms | 4,410.7M | 1,734.9M |
@@ -562,7 +562,7 @@ move with the machine and the slot layout.
 
 ## Binary sizes
 
-| program | native |
+| program | obx |
 |---|---:|
 | empty program | 12,288 bytes (static) |
 | hello | 16,416 bytes (static) |
@@ -584,7 +584,7 @@ of a large program's size.
 A native executable carries its own runtime instead of linking libc. When a
 program calls C libraries (libssl, sqlite3), it is dynamically linked against
 them. A program that imports `postgres_libpq` is linked against libpq too; the
-native `postgres` client needs no libpq (it still uses libssl for TLS).
+obx `postgres` client needs no libpq (it still uses libssl for TLS).
 
 ## Math
 
@@ -603,7 +603,7 @@ doubles in `xmm8`-`xmm14` across the calls.
 both print the same checksum. Cycles per call in brackets (user cycles, least
 of 7, divided by 5M):
 
-| function | native |
+| function | obx |
 |---|---:|
 | exp | 12 (9.6) |
 | ln | 15 (12.9) |
@@ -612,7 +612,7 @@ of 7, divided by 5M):
 | atan | 19 (15.9) |
 | tan | 20 (16.9) |
 
-What is left on exp and sin is the call: the native loop calls the kernel,
+What is left on exp and sin is the call: the obx loop calls the kernel,
 and the kernel loads its polynomial constants on every call (49 operations
 an iteration). The loop is bound by dispatch, not by a latency chain
 (`perf`: 85% of the dispatch slots used, the rest mostly back-end stalls).
@@ -649,7 +649,7 @@ Java on add and multiply too.
 Cycles per operation (dbench under `perf stat`, least of 5, pinned to one
 core; measured 7 November 2026 at `fb50b4f1`):
 
-| operation | native |
+| operation | obx |
 |---|---:|
 | add, 6 / 19 digits at 2 places (M2) | 66 / 66 |
 | mul, 6 / 19 digits (M3) | 80 / 83 |
@@ -695,7 +695,7 @@ in 10^19 chunks two digits at a time, and parse reads eight digits at a time
 The cost of the concurrency primitives (`lib/task.obx`, `lib/net.obx`, SPEC
 16), from `obx/bench/tasks.obx`, ns per operation, best of 3 runs:
 
-| operation | native |
+| operation | obx |
 |---|---:|
 | task switch (`task.yield`) | 7.7 |
 | start a task (stack reused) | 21.3 |
@@ -738,13 +738,13 @@ per connection, with every limit and timeout of the design on, the hangup
 cancellation armed around each handler, the request parsed strictly and the
 reply built by the library. Measured by `python3 obx/cmd/http_gate.py
 --servers native,go,node`: the server on CPU 0, the load client
-`obx/cmd/httpload.obx` (native, one thread) on CPU 2, another core. 10,000
+`obx/cmd/httpload.obx` (obx, one thread) on CPU 2, another core. 10,000
 idle keep-alive connections are opened first and stay open during the load;
 each load client sends `GET /` and waits for the reply, 5 s per row. Go
 1.26's net/http (GOMAXPROCS=1) and Node 24's http serve the same reply, as
 references. This machine's numbers move by 5 to 10% from one run to the next.
 
-| | obx native | Go net/http | Node 24 |
+| | obx | Go net/http | Node 24 |
 |---|---:|---:|---:|
 | RSS per idle connection | 15.0 KB | 19.8 KB | 9.5 KB |
 | RSS with 10,000 idle connections | 150 MiB | 195 MiB | 139 MiB |
@@ -779,13 +779,13 @@ limit when it can and stops when it cannot.
 
 `httpload --client` sends the same load through one `http.Client`
 (`obx/lib/http.obx`: `get` and `text()` per request, `maxPerHost` equal to
-the connections), against the native server on CPU 0, the loader on CPU 2,
-5 s per row, the median of three alternating rounds (the native columns:
+the connections), against the obx server on CPU 0, the loader on CPU 2,
+5 s per row, the median of three alternating rounds (the obx columns:
 `http_gate.py --servers native --client --conns 1,100,1000`), beside
 httpload's own loop (a fixed request, only Content-Length parsed). No idle
 connections are held open here.
 
-| connections | raw, native | client, native |
+| connections | raw, obx | client, obx |
 |---:|---:|---:|
 | 1: requests/s | 4,360 | 4,030 |
 | 100: requests/s | 68,800 | 57,653 |
@@ -808,7 +808,7 @@ parity, so it is not met (design/http-client.md, section 8).
 and load, each request `GET /db`, which takes a connection from a
 `postgres.Pool` of 4 or 16 connections, runs `SELECT $1::int8 + 1` with the
 request's number, and returns the connection. PostgreSQL 16 on the same
-machine, over its Unix socket. The queries go through the native client
+machine, over its Unix socket. The queries go through the obx client
 (`postgres`, over `pgwire`, design/pgwire.md): each request's task parks on
 the socket, and the server's one thread serves the 10,000 idle connections
 and the load meanwhile.
@@ -818,7 +818,7 @@ latency of that same run), the one-minute load 1.92 and 2.11 at the start of
 each. Each figure is one 5 s
 run; the cells moved by 1% to 8% between runs:
 
-| | native, pool 4 | native, pool 16 |
+| | obx, pool 4 | obx, pool 16 |
 |---|---:|---:|
 | 1 client: requests/s | 2,594 | 2,633 |
 | 10 clients: requests/s | 20,818 | 20,310 |
@@ -834,13 +834,13 @@ the idle connections cost the same with both (about 15 KB each).
 One client pays two round trips, the HTTP one and the server's to
 PostgreSQL (about 100 µs). From 10 clients on, the server's one thread is the
 limit: 1 / 20,700 requests/s is about 48 µs of it per request (the breakdown
-was not measured for the native client). With 100 clients, most of them wait
+was not measured for the obx client). With 100 clients, most of them wait
 in the pool's queue (first come, first served), which is where the 5 ms comes
 from. After the load, `/shutdown` with the 10,000 idle connections open took
 0.53 to 0.59 s, exit 0, no leak under `OBX_CHECK=1`, every pool connection
 idle and nobody waiting. An idle connection cost 14.9 to 15.3 KB.
 
-The native client does not wait in a thread for a running query: the task
+The obx client does not wait in a thread for a running query: the task
 parks on the socket, so a waiting query can be cancelled (a CancelRequest on
 a second connection, design/pgwire.md section 13) when its task is, and its
 cost is the one thread's, the same budget the HTTP side uses; more cores come
@@ -858,18 +858,18 @@ connections spread over 8 load processes (`httpload -p 8`), 5 s per row,
 3, 5, 7 (1 to 4 workers each have a core of their own; 8 workers share four
 cores with SMT), the load on CPUs 8-15 (the other four cores); the gate
 stops if the two sets would share a core. PostgreSQL is not pinned.
-Two complete gate runs with the native client (each cell: requests/s the best
+Two complete gate runs with the obx client (each cell: requests/s the best
 of the two), the one-minute load 2.15 and 10.07 at the starts (the second run
 overlapped the tail of another gate). Requests/s, one 5 s run each:
 
-| workers | native `/` | native `/db` |
+| workers | obx `/` | obx `/db` |
 |---:|---:|---:|
 | 1 | 56,215 | 19,275 |
 | 2 | 95,292 | 31,919 |
 | 4 | 122,990 | 47,674 |
 | 8 | 124,333 | 60,852 |
 
-Most cells moved by 2% to 6% from run to run; the 1-worker native `/` row
+Most cells moved by 2% to 6% from run to run; the 1-worker obx `/` row
 moved by 13% (49,102 then 56,215), which is why the table is the best of
 two. The libpq comparison is in design/pgwire.md, section 27.
 
@@ -898,18 +898,18 @@ exit 0, the restart counted.
 `obx/lib/tls.obx` over OpenSSL 3.0.13 (design/tls.md), and https in the http
 client. Measured by `python3 obx/cmd/tls_bench.py`:
 
-- `obx/cmd/tlsbench.obx`, built natively, against OpenSSL's own clients and
+- `obx/cmd/tlsbench.obx`, built with obx, against OpenSSL's own clients and
   curl; the server on CPU 0 and the client on CPU 2;
 - a P-256 ECDSA certificate from a test CA, verified by every client; TLS
   1.3, TLS_AES_256_GCM_SHA384, X25519; each row the median of three runs.
 - **Handshakes:** full handshakes one after another (connect, handshake,
   close_notify, no resumption) against `openssl s_server -www`.
 - **Bulk:** one GET of 1 GiB from `tlsbench serve` (an https server written
-  with `tls`, native), its body streamed in 64 KiB reads.
+  with `tls`, obx), its body streamed in 64 KiB reads.
 - **Requests:** 20,000 small GETs over kept-alive connections to the same
   server (5,000 for curl, one URL list).
 
-| | obx native | OpenSSL / curl |
+| | obx | OpenSSL / curl |
 |---|---:|---:|
 | handshakes/s (s_server is the limit) | 752 | 560 (`openssl s_time -new`) |
 | client CPU per handshake | 527 µs | 595 µs (`s_time`) |
@@ -950,7 +950,7 @@ value decoded into a record and folded into a checksum, which is equal in
 every row of the table; a buffer of 1,024 rows; peak RSS of the process;
 each figure the least of 5 interleaved runs. The servers run on the same machine,
 unpinned; Oracle runs in a rootless podman container,
-whose networking adds about 0.38 ms a round trip. `PostgreSQL` is the native
+whose networking adds about 0.38 ms a round trip. `PostgreSQL` is the obx
 client; `PostgreSQL (libpq)` is `postgres_libpq`, the old client, kept as
 the comparison.
 
@@ -964,15 +964,15 @@ the comparison.
 - **Memory is flat while streaming:** the same at 100,000 and 1,000,000
   rows (8.2 to 14.0 MB: the program, its buffer and, for Oracle, a fetch of
   about 10,000 rows). Buffered memory grows with the result: 91 MB for
-  PostgreSQL's native client (its whole result), 109 to 110 MB for
+  PostgreSQL's obx client (its whole result), 109 to 110 MB for
   PostgreSQL through libpq (libpq's whole result), 111 MB for Oracle (each
   value's bytes, decoded when read) and 365 MB for SQL Server (a decoded
   cell per value).
 - **Streaming is never slower:** 2.6 to 2.7 times faster for SQL Server,
-  2.0 times for PostgreSQL's native client (1.6 for libpq) and 1.3 to 1.5
+  2.0 times for PostgreSQL's obx client (1.6 for libpq) and 1.3 to 1.5
   times for Oracle.
 - **How each client streams:** SQL Server decodes the reply a packet at a
-  time. The native PostgreSQL client sends one Execute with no row limit and
+  time. The obx PostgreSQL client sends one Execute with no row limit and
   reads the rows off the socket as the buffer needs them, at most 256 KB a
   batch (design/pgwire.md, section 12): the server sends the whole result,
   and TCP holds it back while the program reads slowly. The libpq client
@@ -981,9 +981,9 @@ the comparison.
   the size the rows took: about 9,900 rows here) and sends the next FETCH
   before the program uses the last rows.
 - **Latency:** with a 2.5 ms one-way delay (6.1 to 6.2 ms round trip through
-  the proxy), native streams 1M rows in 458 ms against libpq's 633; at 0 ms
+  the proxy), obx streams 1M rows in 458 ms against libpq's 633; at 0 ms
   they are 415 and 598 ms (design/pgwire.md, section 28).
-- **Client cost per row:** cycles per row (earlier sweep, native,
+- **Client cost per row:** cycles per row (earlier sweep, obx,
   streamed / buffered): Oracle 1,169 / 1,010 and SQL Server 1,290 / 2,515.
   Oracle's wall time is mostly the server's work and about 100 round trips. The breakdown (client
   CPU, server, network) and the slow-network runs are in
@@ -993,14 +993,14 @@ the comparison.
 
 ```sh
 obx/compiler/build.sh                                  # out/obxc from the seed
-python3 obx/bench/bench.py --opt --perf -n 11          # the microbenchmarks (C and native -O)
+python3 obx/bench/bench.py --opt --perf -n 11          # the microbenchmarks (hand-written C and obx -O)
 python3 obx/bench/apps.py -n 5 --pin 2                 # the Tier-1 application suite
 python3 obx/bench/regex/bench.py -n 7                  # the regex table (Go, Rust and rg built by it)
 python3 obx/bench/json/bench.py --jq JQ                # the JSON library and jq large-input tables
 python3 obx/tests/markdown.py --perf --ref CMARK       # the Markdown table
 python3 obx/cmd/eza_gate.py -j 12                      # eza correctness on both builds
 obx/compiler/out/obxc obx/cmd/eza.obx --native -o eza
-obx/tools/native_selfbuild.sh                          # the natively built compiler
+obx/tools/native_selfbuild.sh                          # the obx-built compiler
 obx/compiler/out/obxc obx/bench/tasks.obx --native -o tasks && ./tasks
 obx/compiler/out/obxc obx/bench/math/calls.obx --native -o calls && ./calls exp
 python3 obx/bench/decimal/run.py --base DIR            # Decimal, two trees compared
