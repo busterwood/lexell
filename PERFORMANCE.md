@@ -11,15 +11,19 @@ obx builds a program in two ways:
 
 Both are built from the same IR and must behave identically; the gate checks
 that on every test program. This page is the current report. Its figures
-were re-measured on 7 November 2026 at `5d340654`, after the `-O` ladder,
-the regex per-match work, the Markdown scan change, the Decimal `mul128` and
-in-place compare, and the method-receiver copy pass merged; the database
-sections (`### With a Postgres pool`, `### With worker processes` and
-`## Database streaming`) were re-measured again on 7 November 2026 at
-`1e601121`, with the PostgreSQL, Oracle and SQL Server servers on this
-machine. The sections that could not be re-measured in this environment say
-so: the jq reference column (jq 1.7.1 is not installed), the cmark column of
-the Markdown table, and the Go and Node columns of the HTTP tables.
+were re-measured on 7 November 2026 at `b6777cf4`, after the regex start-state
+cache change, the Decimal match-payload and record-argument inlining work,
+and the database re-measure at `1e601121` (the PostgreSQL, Oracle and SQL
+Server servers are on this machine). The sections that could not be
+re-measured in this environment say so: the jq reference column (jq 1.7.1 is
+not installed), the cmark column of the Markdown table, and the Go and Node
+columns of the HTTP tables.
+
+The host was shared and variable during this sweep: absolute times for
+I/O-bound and process-heavy tables (eza, grep, Markdown, HTTP, TLS) moved by
+up to 2x between runs. Those tables use the best observed run; every
+native/C ratio is from an interleaved same-run comparison and is stable to a
+few percent. The instruction columns are the most reproducible figure.
 
 How the numbers got here, the native backend's passes, the earlier figures and
 the obo record, is in [HISTORY.md](HISTORY.md), "The performance record".
@@ -55,16 +59,16 @@ portable constants.
 
 | benchmark | via C | native -O | -O/C | what it does |
 |---|---:|---:|---:|---|
-| fib | 343 ms | 342 ms | 1.00 | recursive calls |
-| loop | 283 ms | 225 ms | 0.79 | two overflow-checked operations per iteration |
-| array | 110 ms | 96 ms | 0.87 | checked indexing |
+| fib | 349 ms | 346 ms | 0.99 | recursive calls |
+| loop | 286 ms | 228 ms | 0.80 | two overflow-checked operations per iteration |
+| array | 112 ms | 100 ms | 0.90 | checked indexing |
 | alloc | 132 ms | 66 ms | 0.50 | 20 million records allocated and freed |
-| lists | 40 ms | 32 ms | 0.80 | linked list build, sum, drop |
-| strings | 85 ms | 45 ms | 0.54 | concatenation and `toStr` |
-| trees | 27 ms | 21 ms | 0.77 | binary trees |
-| tokens | 20 ms | 13 ms | 0.63 | byte scanning and hashing |
-| sieve | 181 ms | 122 ms | 0.67 | the sieve of Eratosthenes to 10 million, ten rounds |
-| maps | 190 ms | 192 ms | 1.01 | `Map[str, int]` with short and long keys, `Map[int, int]` (keyed hashing) |
+| lists | 40 ms | 33 ms | 0.82 | linked list build, sum, drop |
+| strings | 85 ms | 46 ms | 0.54 | concatenation and `toStr` |
+| trees | 27 ms | 21 ms | 0.78 | binary trees |
+| tokens | 22 ms | 13 ms | 0.61 | byte scanning and hashing |
+| sieve | 203 ms | 141 ms | 0.70 | the sieve of Eratosthenes to 10 million, ten rounds |
+| maps | 254 ms | 243 ms | 0.96 | `Map[str, int]` with short and long keys, `Map[int, int]` (keyed hashing) |
 
 The plain fast-compile path (`--native`, no `-O`) is slower where the loop passes
 matter: loop 446 ms, array 183 ms, sieve 187 ms; it is 0.50 on alloc and 0.54
@@ -87,13 +91,15 @@ code-shape gaps.
   unrelated to the array's length).
 - **The sieve is at plain C's speed.** A hand-written C version with no
   checks (`obx/bench/c/sieve.c`, `gcc -O2`, bench.py's "plain C" column)
-  took 135 ms in the same run (555M cycles). Native obx runs 1,414M
-  instructions in 523M cycles; through C obx keeps the overflow and bounds
+  took 150 ms in the same run (611M cycles). Native obx runs 1,414M
+  instructions in 586M cycles; through C obx keeps the overflow and bounds
   checks the native backend proves away.
 - **fib** is calls and returns, and now level: native runs 3,643M
-  instructions in 1,524M cycles; gcc's build runs 4,636M in 1,522M. The
+  instructions in 1,524M cycles; gcc's build runs 4,636M in 1,523M. The
   `lea` selection and the leaf path did it.
-- **maps** is level. `str`, `i128`, `u128` and `Decimal` hash with
+- **maps** is now a little ahead: 878M cycles against the C build's 902M,
+  2,102M instructions against 1,823M (the instruction lead is gcc's, the
+  cycle lead is native's). `str`, `i128`, `u128` and `Decimal` hash with
   SipHash-1-3 under a per-process key, and `Map` mixes a per-process seed
   into its slots (lib/README.md, "Keyed hashing"). Map's index slots are
   `u32`: an entry number with the high bits of the mixed hash beside it, so
@@ -129,18 +135,18 @@ figure.
 
 | pattern | matches | obx native | obx via C | Go | Rust | rg |
 |---|---:|---:|---:|---:|---:|---:|
-| `Sherlock Holmes` | 926 | 0.20 | 0.25 | 0.46 | 0.08 | 1.6 |
-| `Sherlock\|Holmes\|Watson\|Irene` | 7,350 | 0.85 | 0.71 | 137.04 | 0.44 | 2.7 |
-| `\w+` (all matches) | 669,532 | 33.88 | 22.92 | 156.40 | 17.60 | 42.4 |
-| `(?i)sherlock` | 4,280 | 0.77 | 0.65 | 72.81 | 0.47 | 3.2 |
-| `[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}` | 848 | 0.19 | 0.11 | 79.78 | 0.09 | 1.8 |
-| `(?m)^ERROR .*timeout$` | 197 | 0.35 | 0.41 | 32.66 | 0.61 | 1.9 |
-| `(?P<y>\d{4})-(?P<m>\d{2})-(?P<d>\d{2})` (captures) | 10,755 | 4.08 | 3.14 | 74.09 | 1.32 | 8.0 |
-| `(a*)*b` over 100,000 `a`s | 0 | 0.00 | 0.00 | 3.39 | 0.00 | 1.4 |
+| `Sherlock Holmes` | 926 | 0.21 | 0.25 | 0.48 | 0.08 | 1.7 |
+| `Sherlock\|Holmes\|Watson\|Irene` | 7,350 | 0.88 | 0.71 | 139.90 | 0.44 | 2.6 |
+| `\w+` (all matches) | 669,532 | 34.41 | 23.39 | 169.42 | 17.77 | 43.6 |
+| `(?i)sherlock` | 4,280 | 0.79 | 0.65 | 73.38 | 0.48 | 3.4 |
+| `[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}` | 848 | 0.19 | 0.12 | 80.62 | 0.09 | 1.9 |
+| `(?m)^ERROR .*timeout$` | 197 | 0.35 | 0.42 | 33.01 | 0.62 | 2.1 |
+| `(?P<y>\d{4})-(?P<m>\d{2})-(?P<d>\d{2})` (captures) | 10,755 | 4.11 | 3.18 | 74.97 | 1.33 | 8.3 |
+| `(a*)*b` over 100,000 `a`s | 0 | 0.00 | 0.00 | 3.42 | 0.00 | 1.4 |
 
-The table is the plain `--native` build. With `--native -O`, `\w+` is 29.83 ms
-against 22.98 via C (1.30 wall; 1.03 instructions and 1.11 cycles), the
-alternation 0.76/0.70, `(?i)` 0.70/0.64 and the captures 3.90/3.16.
+The table is the plain `--native` build. With `--native -O`, `\w+` is 30.9 ms
+against 23.6 via C (1.31 wall; instructions level at 1.00, cycles 1.13), the
+alternation 0.82/0.70, `(?i)` 0.74/0.66 and the captures 4.01/3.19.
 
 - **obx and Rust.** The engine has RE2's lazy DFA and Rust's literal
   searches (design/regex.md, "R2 as built"). Through C, obx takes 1.1 times
@@ -154,14 +160,16 @@ alternation 0.76/0.70, `(?i)` 0.70/0.64 and the captures 3.90/3.16.
   (670,000 and 10,755 matches): each match is a forward and a reverse DFA
   run plus, for captures, the backtracker on the span. The span path now
   runs `forward` and `backward` in one loop, takes the DFA's text by borrow
-  (no dup/drop per call), answers the start state from a 256-byte `idxof`
-  table without entering `Cache.start`, and scans ASCII in a fast loop whose
-  constant step lets `loops.obx` prove the byte bounds check; `findAllIndexN`
-  has a span-specialized driver that appends `Span` directly instead of
-  calling a delivery callback with a two-slot `[]int`. That took the per-match
-  overhead from 341 to 46 to **16 instructions**; what is left on `\w+` (1.03
-  instructions, 1.11 cycles of the C build with `-O`) is mostly the backend's
-  own code shape around the two DFA calls, not library glue. Fusing the
+  (no dup/drop per call), keys the start-state cache by the byte itself
+  (there is no byte-to-context table load on the hot path), and scans ASCII
+  in a fast loop whose constant step lets `loops.obx` prove the byte bounds
+  check; `findAllIndexN` has a span-specialized driver that appends `Span`
+  directly instead of calling a delivery callback with a two-slot `[]int`.
+  That took the per-match overhead from 341 to 46 to **16 instructions** and
+  the `-O` `\w+` instruction count is now **level** with the C build (1.00,
+  4,323M against 4,321M over ten searches). The remaining 1.13 cycle gap is
+  the byte loop itself: native takes two taken branches per byte where gcc
+  takes one, so the same instructions run about 13% slower. Fusing the
   forward and backward passes into one call was measured and reverted: it
   helped native 1.7% but gcc inlined the fused function and took the C build
   11%, widening the gap.
@@ -198,8 +206,9 @@ builds write byte-identical listings.
 | `-T -l /usr/share` (long tree) | 3.7 MB | 226 ms | 234 ms |
 | `-l /usr/lib/x86_64-linux-gnu` | 51 KB | 5 ms | 5 ms |
 
-The golden suite (`python3 obx/cmd/eza_gate.py -j 12`) passes on both
-builds.
+The native binary was rebuilt at `b6777cf4`; an interleaved old-vs-new run
+is 1.00 on the long tree, so these quiet-window times still apply. The golden
+suite (`python3 obx/cmd/eza_gate.py -j 12`) passes on both builds.
 
 ## grep
 
@@ -220,8 +229,12 @@ port has no locale). Every output equals GNU grep's.
 | `-n omega` | 237 ms | 211 ms | 173 ms |
 | `-o -w eta` | 400 ms | 323 ms | 284 ms |
 
+The native and C binaries were rebuilt at `b6777cf4`; an interleaved
+old-vs-new run is 0.98 to 1.00 on the long cases and the C binary is
+byte-identical, so the table's quiet-window times still apply.
+
 One case is clearly behind the C build: `-n omega` is 2,191M instructions /
-615M cycles natively against 1,830M / 510M, 1.21 times the cycles — the
+629M cycles natively against 1,830M / 509M, 1.24 times the cycles — the
 line-numbering and match walk, not the DFA. The rest are at or within a few
 percent of C, and ahead of GNU grep except `-c -v '^0'`.
 
@@ -239,7 +252,7 @@ What makes it fast:
 
 ### On 1 GB
 
-Not re-measured at `5d340654` (it needs a 1 GB input and 21 cases); the table
+Not re-measured at `b6777cf4` (it needs a 1 GB input and 21 cases); the table
 is the earlier run. The 100 MB figures above are current and scale linearly.
 
 The same generator run to 10^9 bytes (18.2 million lines), the cases above
@@ -296,7 +309,10 @@ on `-w`.
 
 [obx/cmd/jq.obx](obx/cmd/jq.obx), the jq 1.7.1 port, against jq 1.7.1 built
 from its release tarball (`./configure --with-oniguruma=builtin`, the default
-`-O2`). Wall times; figures vary by 5–10% between runs.
+`-O2`). Wall times; figures vary by 5–10% between runs. These are the earlier
+quiet-window figures: the C build is byte-identical at `b6777cf4` and the
+native instruction counts are unchanged, while the host was too variable to
+re-baseline the wall times.
 
 **Large input.** `python3 obx/bench/json/bench.py --jq JQ`, on an 80 MB file
 of 182,290 generated records. Best of 3; the output goes to a file, and the
@@ -326,7 +342,7 @@ Python's `json`:
 | visit | 200 | 99 | 50 |
 
 **Computation.** Programs with no input (`jq -n`), best of 5 (`group_by`
-best of 9); the outputs are identical. Not re-measured at `5d340654` (it
+best of 9); the outputs are identical. Not re-measured at `b6777cf4` (it
 needs the jq reference); the table is the earlier run.
 
 | program | jq 1.7.1 | native | via C |
@@ -366,7 +382,11 @@ The library's own design and numbers are in
 [obx/cmd/cmark.obx](obx/cmd/cmark.obx) (the `markdown` library) against cmark
 0.31.2 (`-O3` release build, cmake), rendering 10 MB documents with
 `--unsafe` to a pipe. Best of 3, seconds (`python3 obx/tests/markdown.py
---perf --ref CMARK`):
+--perf --ref CMARK`). The renderer's binary is byte-identical at `b6777cf4`
+for both backends, so these are the earlier quiet-window figures; the host
+was too variable to re-baseline the pipe-bound wall times (the same binary
+moved by 1.7x between runs). The instruction and cycle ratios below are
+still current.
 
 | document | cmark | obx native | obx via C |
 |---|---:|---:|---:|
@@ -397,20 +417,22 @@ best of 11, interleaved:
 
 | | gcc-built | native-built |
 |---|---:|---:|
-| self-build to an executable (`--native`) | 536 ms | 600 ms |
-| self-build to C (`--emit-c`) | 387 ms | 385 ms |
+| self-build to an executable (`--native`) | 671 ms | 733 ms |
+| self-build to C (`--emit-c`) | 476 ms | 457 ms |
 | full build through gcc (`build.sh`, from the seed) | 22 s, nearly all of it gcc | — |
-| compiler binary | 2,868,968 bytes (dynamic, glibc) | 3,039,745 bytes (static, no libc) |
+| compiler binary | 2,881,448 bytes (dynamic, glibc) | 3,068,417 bytes (static, no libc) |
 
-The compiler is 39,212 lines of obx (1.77 MB, 706 KB of it the generated
-runtime tables `rt.obx` and `rtx.obx`; 28,124 hand-written lines) and 5,634
+The compiler is 39,436 lines of obx (1.78 MB, 706 KB of it the generated
+runtime tables `rt.obx` and `rtx.obx`; 28,348 hand-written lines) and 5,634
 lines of C runtime (the C backend's `rt.h` and the native backend's
-freestanding `rt.c`). The gcc-built `--native` self-build runs 4,124M
-instructions in 2,073M cycles; the native-built one 4,717M (1.14 times) in
-2,137M (1.03 times).
+freestanding `rt.c`). The gcc-built `--native` self-build runs 4,342M
+instructions in 2,880M cycles; the native-built one 5,009M (1.15 times) in
+2,999M (1.04 times). The host was slow during this sweep (the same gcc-built
+compiler took 536 ms at `5d340654`); the upper rows' absolute times move with
+the host, the instruction counts are the stable comparison.
 
-- The native-built compiler is about 1.12 times slower than the gcc-built
-  one on `--native` and level on `--emit-c`. What is left is spread
+- The native-built compiler is about 1.09 times slower than the gcc-built
+  one on `--native` and slightly faster on `--emit-c`. What is left is spread
   thin: it is in the mix (more register-to-register moves, stores to the
   stack and compares than gcc's: spills, and loads and bounds checks repeated
   from one statement to the next), not in a few functions. A compiler is
@@ -479,15 +501,15 @@ best of 3, one core):
 
 | program | default Minstr | -O Minstr | -O/default | default Mcyc | -O Mcyc | -O/default |
 |---|---:|---:|---:|---:|---:|---:|
-| compiler | 4,716 | 5,883 | +24.7% | 2,196 | 2,784 | +26.8% |
-| eza | 491 | 574 | +17.0% | 214 | 245 | +14.4% |
-| grep | 1,203 | 1,428 | +18.7% | 526 | 602 | +14.4% |
-| zoxide | 483 | 549 | +13.6% | 211 | 230 | +9.1% |
-| jq | 2,025 | 2,421 | +19.5% | 915 | 1,116 | +21.9% |
-| cmark | 603 | 687 | +13.9% | 246 | 277 | +12.3% |
-| tokens | 82 | 88 | +7.3% | 34 | 36 | +6.2% |
-| maps | 96 | 107 | +11.3% | 39 | 43 | +10.7% |
-| **geomean** | | | **+15.6%** | | | **+14.3%** |
+| compiler | 5,009 | 6,181 | +23.4% | 2,852 | 3,708 | +30.0% |
+| eza | 513 | 596 | +16.3% | 302 | 358 | +18.4% |
+| grep | 1,225 | 1,449 | +18.3% | 635 | 791 | +24.6% |
+| zoxide | 499 | 564 | +13.1% | 259 | 330 | +27.5% |
+| jq | 2,595 | 3,031 | +16.8% | 1,313 | 1,521 | +15.9% |
+| cmark | 609 | 692 | +13.6% | 298 | 316 | +6.1% |
+| tokens | 82 | 88 | +7.4% | 37 | 39 | +4.7% |
+| maps | 96 | 107 | +11.3% | 43 | 45 | +5.3% |
+| **geomean** | | | **+14.9%** | | | **+16.1%** |
 
 The code `-O` makes is judged by `obx/bench/bench.py --opt` (the ten
 benchmarks, native `-O` against the C backend and against the hand-written C
@@ -496,19 +518,19 @@ references) and by the regex, JSON/jq, Markdown and Decimal harnesses. Native
 
 | | fib | loop | array | alloc | lists | strings | trees | tokens | sieve | maps |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| `-O`/C | 1.00 | 0.79 | 0.87 | 0.50 | 0.80 | 0.54 | 0.77 | 0.63 | 0.67 | 1.01 |
+| `-O`/C | 1.00 | 0.80 | 0.88 | 0.50 | 0.79 | 0.53 | 0.74 | 0.60 | 0.70 | 0.97 |
 
-The ladder pays on loops, allocation, strings, trees, sieve and Markdown;
-`fib` is level after the constant-arithmetic `lea` selection. It does not
-move the DFA's per-match work, jq's boxes, or Decimal's parse/quantize/cmp.
-Range and check elimination was measured first and is not the answer:
-deleting *every* inline check buys 3.7% of `\w+`'s instructions and no cycles.
-The same shape held for bool/branch folding (-6.53% instructions on `tokens`,
--0.86% cycles) and for cheap allocator residency: the losses are memory,
-calls and copies, not instruction selection. Those experiments are in
-HISTORY.md, "Tried and shelved". The application rows below are the current
-targets: regex 1.05 instructions / 1.12 cycles, Decimal 1.21 / 1.06, cmark
-1.27 / 1.05; JSON and jq already win on time.
+The ladder pays on loops, allocation, strings, trees, sieve and Markdown, and
+is now ahead on `maps` too; `fib` is level after the constant-arithmetic `lea`
+selection. It does not move the DFA's per-match work or jq's boxes. Range and
+check elimination was measured first and is not the answer: deleting *every*
+inline check buys 3.7% of `\w+`'s instructions and no cycles. The same shape
+held for bool/branch folding (-6.53% instructions on `tokens`, -0.86% cycles)
+and for cheap allocator residency: the losses are memory, calls and copies,
+not instruction selection. Those experiments are in HISTORY.md, "Tried and
+shelved". The application rows below are the current targets: regex 1.03
+instructions / 1.14 cycles, cmark 1.27 / 1.07; Decimal is now 1.16 / 0.96 and
+JSON and jq already win on time.
 
 `-O` is part of the quick gate: `run_native.py --lib --opt` builds the 613
 programs with `-O` and requires the same output, exit code and stderr as the
@@ -519,24 +541,29 @@ C build.
 `python3 obx/bench/apps.py -n 5 --pin 2` is the Tier-1 table: the same source
 built with `--native -O` and through the C backend, identical output required,
 timed with `perf` on one core, best of N, as a table, JSON and TSV. Measured
-at `5d340654` (`OBX_HASH_SEED=42`, core 2, 67 s):
+at `b6777cf4` (`OBX_HASH_SEED=42`, core 2, 72 s):
 
 | application | native | C | native/C (wall) | instructions native/C | cycles native/C |
 |---|---:|---:|---:|---:|---:|
-| regex (8 patterns, 3 MB) | 45 ms | 42 ms | 1.07 | 1.05 | 1.12 |
-| json (20 MB, parse/query/visit) | 515 ms | 519 ms | 0.99 | 1.14 | 1.01 |
-| jq (`-c .`, 20 MB) | 399 ms | 405 ms | 0.99 | 1.13 | 0.97 |
-| cmark (10 MB) | 165 ms | 165 ms | 1.00 | 1.27 | 1.05 |
-| decimal (all cases) | 2,823 ms | 2,673 ms | 1.06 | 1.21 | 1.06 |
+| regex (8 patterns, 3 MB) | 46 ms | 42 ms | 1.09 | 1.03 | 1.14 |
+| json (20 MB, parse/query/visit) | 507 ms | 519 ms | 0.98 | 1.14 | 0.98 |
+| jq (`-c .`, 20 MB) | 400 ms | 411 ms | 0.97 | 1.13 | 0.95 |
+| cmark (10 MB) | 165 ms | 163 ms | 1.01 | 1.27 | 1.07 |
+| decimal (all cases) | 2,595 ms | 2,689 ms | **0.97** | 1.16 | **0.96** |
 
 The first baseline, before the regex per-match work, the Markdown scan change
 and the Decimal changes, was regex 1.36 / json 0.98 / jq 0.93 / cmark 1.14 /
 decimal 1.12 in wall time, with instructions 1.27 / 1.15 / 1.13 / 1.27 / 1.28
-against C. Regex, Decimal and cmark are the rows that moved: cmark's wall
-ratio is 1.00 and cycles 1.05, but its library change speeds both builds, so
-its instruction ratio stays 1.27. JSON's instruction count is 1.14 of C's but
-its time is level, and jq wins on both. Wall and cycle ratios move by several
-percent between runs; the instruction ratios are the stable ones.
+against C. Regex, Decimal and cmark are the rows that moved. Decimal now wins
+on both time and cycles: the match-payload place (no copy of a payload that
+is only borrowed) and the targeted inlining of a call whose record argument is
+a place were worth 4.4% of its instructions and 9% of its cycles. Regex's
+instruction count is 1.03 and level on `\w+` alone; its 1.14 cycles are two
+taken branches per byte where gcc has one. cmark's wall is level but its
+instruction count stays 1.27 (its parse builds the node text literally where
+gcc's does less); the cycles follow. JSON's instruction count is 1.14 of C's
+but its time is level, and jq wins on both. Wall and cycle ratios still move
+by several percent between runs; the instruction ratios are the stable ones.
 
 The benchmark harnesses set `OBX_HASH_SEED` (42 by default, `--hash-seed` or
 `--random-hash` to change it), so the map layout is identical across runs and
@@ -553,7 +580,7 @@ cycles still move with the machine and the slot layout.
 | `import "regex"`, one call (`regex.quote`) | 63,544 bytes | 20,512 bytes |
 | eza | 284,320 bytes (dynamic, glibc) | 304,296 bytes (static) |
 | HTTP server (`cmd/httpd.obx`) | 638,320 bytes | 844,272 bytes (dynamic) |
-| compiler | 2,868,968 bytes (dynamic, glibc) | 3,039,745 bytes (static) |
+| compiler | 2,922,408 bytes (dynamic, glibc) | 3,068,417 bytes (static) |
 
 Every C build carries the start-up CPU check and the inline math primitives
 of `rt.h` (about 5 KB); a C build that calls a ported math function also
@@ -598,6 +625,9 @@ of 7, divided by 5M):
 | atan | 19 (16.5) | 19 (15.9) |
 | tan | 22 (18.6) | 20 (16.9) |
 
+The native binary is byte-identical at `b6777cf4` (only the runtime text
+changed since this run), so the table stands.
+
 What is left on exp and sin is the call. gcc inlines the kernel into the
 loop and keeps its polynomial constants in registers (exp: 36 operations an
 iteration); the native loop calls it, and the kernel loads its constants on
@@ -625,18 +655,21 @@ native and C, identical text, errors and scales.
 
 Cycles per operation (the difference between 50 rounds and none over the
 4096 inputs, least of 5, pinned to one core; re-measured 2026-11-07 at
-`5d340654`):
+`b6777cf4`):
 
 | operation | native | via C |
 |---|---:|---:|
-| add, 6 / 19 digits at 2 places (M2) | 111 / 110 | 104 / 96 |
-| mul, 6 / 19 digits (M3) | 118 / 114 | 131 / 133 |
-| div, 12 by 6 digits at scale 2 (M5:s2) | 271 | 264 |
-| quantize to 2 places from 6 digits (M6) | 121 | 92 |
-| parse, 20 digits (M7) | 249 | 177 |
-| format, 38 digits fixed (M8:f38) | 408 | 355 |
-| cmp, same leading digit position (M10:diff) | 49 | 42 |
+| add, 6 / 19 digits at 2 places (M2) | 98 / 97 | 104 / 100 |
+| mul, 6 / 19 digits (M3) | 98 / 98 | 132 / 135 |
+| div, 12 by 6 digits at scale 2 (M5:s2) | 242 | 262 |
+| quantize to 2 places from 6 digits (M6) | 88 | 92 |
+| parse, 20 digits (M7) | 230 | 180 |
+| format, 38 digits fixed (M8:f38) | 416 | 358 |
+| cmp, same leading digit position (M10:diff) | 55 | 42 |
 | `Decimal.fromUnits(u, 2)` and one add, a row of a 10M-row sum | 191 | 199 |
+
+The last row is the earlier run. The per-operation numbers are noisy at this
+size; the aggregate application row below is the reliable one.
 
 Before, native took 2 to 2.5 times C's cycles on the arithmetic (add 268,
 mul 317, div 622, quantize 249, cmp 86; the sum 483 to 500 a row). The causes, as
@@ -668,22 +701,30 @@ tree), and the remaining records passed by value on the stack, which the ABI
 requires of both builds (the receiver pass below removes one of those
 copies).
 
-Three more changes. `decimal-abi` (design/decimal-perf-research.md section
+Five more changes. `decimal-abi` (design/decimal-perf-research.md section
 9): `mul128` returns the low 64×64 product when both factors are below 2^64,
 and an ordered 128-bit compare against a constant, a register pair or memory
 compares the local where it is instead of copying it to `rax:rdx`. `record-abi`
 (design/record-abi.md): a value record copied into a temporary only to be the
-first argument of a call (a method receiver) is passed as the place itself.
-Native `-O` against the C build now: mul 0.90 instructions / **0.86 cycles**
-(19 digits), add 1.07 / 1.15, div 1.03, cmp 1.17, format 1.15, quantize 1.32,
-parse 1.41, rem 0.75. The aggregate application row is **1.06 wall / 1.06
-cycles**, from 1.09 / 1.10 before these changes.
+first argument of a call (a method receiver) is passed as the place itself,
+and a `match` binding that is only borrowed (`Ok(d)`, then `&d`) is the
+payload place too, not a 48-byte copy; a call whose record argument is a
+place is inlined up to 40 nodes where that removes the copy and its call, and
+a 128-bit member of a pointer local goes straight to its register pair.
+Native `-O` against the C build now: mul **0.73 cycles** (19 digits), div
+0.92, add 0.93–0.97, quantize 0.96, rem 0.75, parse 1.28, format 1.16, cmp
+about 1.2 (noisy at this size). The aggregate application row is **0.97 wall
+/ 0.96 cycles**, from 1.09 / 1.10 before this work: native is now faster
+than the C backend on Decimal.
 
-The receiver pass removes one of the two copies an `add` paid. The throwaway
-by-reference oracle measured the rest of the ceiling: **-9% Decimal cycles**
-and nothing on cmark, json, jq or the compiler; it also miscompiles the
-compiler, and the pass costs instructions inside `addExact`, so the ABI is
-not built. Parse, quantize and cmp remain the three losses.
+The payload place removes the copy an `errSum`/`sumOf` pair paid, and the
+targeted inlining removes the call; with the 128-bit member load, the three
+were worth 4.4% of the application's instructions and 9% of its cycles. The throwaway by-reference
+oracle measured the rest of the ceiling: **-9% Decimal cycles** and nothing
+on cmark, json, jq or the compiler; it also miscompiles the compiler, so the
+full by-reference ABI is still not built. Parse, format and cmp remain the
+three losses; parse is now C's inlining depth (`digits` into `cmp`, `sumOf`
+into `errSum`), the Stage-B ceiling of design/record-abi.md.
 
 The digit count is a compare tree, trailing zeros are stripped by exact
 division, long division is Knuth's algorithm D in base 2^64, text is written
@@ -720,7 +761,10 @@ The cost of the concurrency primitives (`lib/task.obx`, `lib/net.obx`, SPEC
 
 The `sleep` row is one run and noisy (the overshoot is divided among 10,000
 tasks). The unpinned helper-pool row was not re-measured; the earlier run was
-271–304 ns (C) and 433–451 ns (native).
+271–304 ns (C) and 433–451 ns (native). The native binary was rebuilt at
+`b6777cf4`; an interleaved old-vs-new run of the table is within 1–3% on every
+row (the earlier single-run outliers were scheduling noise), so the table
+stands.
 
 The task operations are far below a system call. The native runtime reads
 the clock through the vDSO, as libc does (design/native.md, section 2). The
@@ -758,14 +802,14 @@ references. This machine's numbers move by 5 to 10% from one run to the next.
 |---|---:|---:|---:|---:|
 | RSS per idle connection | 15.0 KB | 14.5 KB | 19.8 KB | 9.5 KB |
 | RSS with 10,000 idle connections | 150 MiB | 145 MiB | 195 MiB | 139 MiB |
-| 1 client: requests/s | 4,291 | 4,271 | 3,790 | 3,650 |
-| 10 clients: requests/s | 36,034 | 35,693 | 34,800 | 32,900 |
-| 100 clients: requests/s | 64,101 | 64,959 | 44,500 | 43,100 |
-| 1 client: latency p50 / p99 | 222 / 407 µs | 225 / 390 µs | 254 / 410 µs | 260 / 452 µs |
-| 10 clients: latency p50 / p99 | 271 / 409 µs | 273 / 414 µs | 268 / 503 µs | 289 / 524 µs |
-| 100 clients: latency p50 / p99 | 1.53 / 2.33 ms | 1.52 / 2.19 ms | 2.10 / 6.36 ms | 2.07 / 4.95 ms |
+| 1 client: requests/s | 4,185 | 4,151 | 3,790 | 3,650 |
+| 10 clients: requests/s | 35,839 | 35,723 | 34,800 | 32,900 |
+| 100 clients: requests/s | 60,763 | 62,168 | 44,500 | 43,100 |
+| 1 client: latency p50 / p99 | 230 / 403 µs | 228 / 511 µs | 254 / 410 µs | 260 / 452 µs |
+| 10 clients: latency p50 / p99 | 272 / 415 µs | 271 / 418 µs | 268 / 503 µs | 289 / 524 µs |
+| 100 clients: latency p50 / p99 | 1.63 / 2.40 ms | 1.58 / 2.42 ms | 2.10 / 6.36 ms | 2.07 / 4.95 ms |
 
-The obx columns were re-measured at `5d340654`; the Go and Node columns are
+The obx columns were re-measured at `b6777cf4`; the Go and Node columns are
 the earlier run (their toolchains were not re-run).
 
 What a request costs the server beyond reading and writing the socket: the
@@ -797,16 +841,16 @@ connections are held open here.
 
 | connections | raw, native | client, native | raw, via C | client, via C |
 |---:|---:|---:|---:|---:|
-| 1: requests/s | 4,360 | 4,020 | 4,440 | 3,988 |
-| 100: requests/s | 68,800 | 56,349 | 68,700 | 54,970 |
-| 1,000: requests/s | 57,200 | 44,940 | 54,000 | 51,073 |
-| 1: latency p50 / p99 | 219 / 380 µs | 237 / 483 µs | 214 / 383 µs | 237 / 582 µs |
-| 100: latency p50 / p99 | 1.43 / 2.59 ms | 1.76 / 2.55 ms | 1.41 / 2.53 ms | 1.78 / 2.69 ms |
-| 1,000: latency p50 / p99 | 16.4 / 21.6 ms | 21.4 / 27.8 ms | 17.5 / 25.0 ms | 18.4 / 26.7 ms |
+| 1: requests/s | 4,360 | 4,030 | 4,440 | 3,891 |
+| 100: requests/s | 68,800 | 57,653 | 68,700 | 55,259 |
+| 1,000: requests/s | 57,200 | 44,022 | 54,000 | 46,659 |
+| 1: latency p50 / p99 | 219 / 380 µs | 233 / 556 µs | 214 / 383 µs | 244 / 554 µs |
+| 100: latency p50 / p99 | 1.43 / 2.59 ms | 1.72 / 2.46 ms | 1.41 / 2.53 ms | 1.79 / 2.68 ms |
+| 1,000: latency p50 / p99 | 16.4 / 21.6 ms | 21.9 / 28.2 ms | 17.5 / 25.0 ms | 20.3 / 29.1 ms |
 
-The client columns were re-measured at `5d340654`; the raw columns are the
-earlier run. At 1,000 connections the native client now trails the C build
-(44,940 against 51,073), the one row where the C build leads.
+The client columns were re-measured at `b6777cf4`; the raw columns are the
+earlier run. At 1,000 connections the native client still trails the C build
+(44,022 against 46,659), the one row where the C build leads.
 
 The client does more work per request than the raw loop: it builds a full
 request, parses every reply header, works out the framing and goes through
@@ -929,12 +973,12 @@ client. Measured by `python3 obx/cmd/tls_bench.py`:
 
 | | obx native | obx via C | OpenSSL / curl |
 |---|---:|---:|---:|
-| handshakes/s (s_server is the limit) | 756 | 756 | 565 (`openssl s_time -new`) |
-| client CPU per handshake | 533 µs | 529 µs | 590 µs (`s_time`) |
-| GET 1 GiB: MB/s | 2,072 | 2,098 | 1,711 (curl) |
-| GET 1 GiB: client CPU | 0.40 s | 0.44 s | 0.44 s (curl) |
-| requests/s, 1 connection | 3,805 | 3,943 | 3,028 (curl) |
-| requests/s, 10 connections | 29,419 | 29,253 | |
+| handshakes/s (s_server is the limit) | 752 | 752 | 560 (`openssl s_time -new`) |
+| client CPU per handshake | 527 µs | 529 µs | 595 µs (`s_time`) |
+| GET 1 GiB: MB/s | 1,961 | 1,945 | 2,021 (curl) |
+| GET 1 GiB: client CPU | 0.47 s | 0.45 s | 0.44 s (curl) |
+| requests/s, 1 connection | 3,887 | 3,931 | 2,986 (curl) |
+| requests/s, 10 connections | 29,399 | 29,466 | |
 
 **Handshakes.** A handshake's client side costs what OpenSSL's own client
 costs. Most of the 0.5 ms is in OpenSSL 3.0: the per-connection `SSL` setup
