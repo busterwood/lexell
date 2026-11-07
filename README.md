@@ -22,10 +22,11 @@ slicing and views, closures and function values, `Option` and `Result` with
 code — no `async`/`await`, no function colouring — running as many tasks on
 one OS thread over an epoll loop. If there are no threads, there is no
 threading bug to write: nothing to lock, no data races, nothing to coordinate
-between cores. More cores means shared-nothing worker processes, the nginx
-model: each worker owns its state, and the database is the only thing they
-share. One thread serves 60,763 HTTP requests a second; eight workers reach
-about 124,000.
+between cores. Tasks return `Future[T]` values; a `Promise[T]` completes one
+by hand, and `Shared[T]` holds state that several tasks need. More cores
+means shared-nothing worker processes, the nginx model: each worker owns its
+state, and the database is the only thing they share. One thread serves
+60,763 HTTP requests a second; eight workers reach about 124,000.
 
 The compiler is 39,436 lines of obx, a 2.9 MB static binary with no LLVM
 behind it, rebuilding itself in 0.66 s. It writes x86-64 ELF directly.
