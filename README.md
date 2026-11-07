@@ -1,16 +1,30 @@
 # obx
 
-obx is a language for systems programs, the kind that run close to the
-machine. Each value has one owner. Other code can borrow a value (`&T`) for
-a while. There is no garbage collector, so the compiler decides when memory
-is freed. It also has generics. It targets Linux on x86-64.
+**A 2.9 MB compiler that builds itself in 0.66 s, turns a hello world into a
+16 KB native binary in 12 ms, and produces code as fast as Rust — and often
+faster than C.**
 
-The compiler is written in obx and compiles itself. It builds programs
-straight to x86-64 executables. A C backend remains for the bootstrap seed,
-portability and differential testing.
+obx is a small systems language with Rust-style ownership, generics and no
+garbage collector. The compiler is the interesting part: 39,436 lines of obx,
+no LLVM, no optimiser framework, writing x86-64 ELF directly. It is one
+static binary, and it rebuilds itself from source in 0.66 s.
 
-Most of the library is ordinary obx code, not compiler features.
-Decimal, money, `Option`, `Result` and the containers are all library code.
+- **The code is fast.** Level with or ahead of idiomatic Rust on eight of
+  nine microbenchmarks; Rust is ahead only on `tokens` (21%). Against the
+  same source built through obx's C backend, `-O` wins nine of ten. Against
+  hand-written C, obx is 2x on allocation, 1.7x on strings and 1.8x on the
+  sieve, and ahead on lists and trees. C wins only on `array` (3.7x, AVX2
+  auto-vectorisation), `tokens` (22%) and slightly `fib` (4%).
+- **Building is fast.** The nine benchmark programs compile in 104 ms
+  against 2.95 s for the Rust suite. Rust's `rustc` plus its driver and LLVM
+  is 316 MB; with the rest of the toolchain it is 1.3 GB.
+- **It is a real language with a real library.** Regex (RE2 syntax, linear
+  time), JSON and a jq port, CommonMark, HTTP, TLS, tasks, and clients for
+  SQLite, PostgreSQL, SQL Server and Oracle. A million database rows stream
+  in 8 to 14 MB.
+
+It targets Linux on x86-64. The numbers, method and caveats are in
+[PERFORMANCE.md](PERFORMANCE.md).
 
 ## Quick start
 
@@ -44,7 +58,7 @@ fn main() {
 
 It prints `total: 59.970` and `rate: 0.5`.
 
-Three things to know first:
+Language and platform notes:
 
 - A number with a fraction needs a suffix. `1.5m` is a Decimal and `1.5f` is a float.
   A bare `1.5` is a compile error.
@@ -164,11 +178,11 @@ with obx against 2.95 s for the Rust suite.
 - **Decimal:** 13.3 ns for a 19-digit add and 17.1 ns for a 6x6 multiply;
   1.2 times .NET on add and 1.5 on multiply.
 - **Float math** takes within about 15% of C's cycles per call.
-- **HTTP server:** one thread serves 65,600 requests a second to 100 clients.
+- **HTTP server:** one thread serves 60,763 requests a second to 100 clients.
   Go's `net/http` serves 44,500 on the same setup. With 8 worker processes
-  the server reaches about 128,000.
+  the server reaches about 124,000.
 - **Database streaming:** 1,000,000 rows take 8 to 14 MB of memory when
-  streamed. Buffering the same rows takes 109 to 365 MB.
+  streamed. Buffering the same rows takes 91 to 365 MB.
 - **Small programs:** hello world is 16 KB, static, with no libc.
 
 ## Where to read more
