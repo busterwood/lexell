@@ -1,0 +1,168 @@
+// Where obx's Decimal add/mul time goes: the public operator, addExact plus
+// match (no orStop), and the bare 128-bit coefficient operation.
+
+import "time"
+
+const N: int = 4096
+const REPS: int = 4000
+
+var SEED: u64 = 0x2545f4914f6cdd1d
+
+fn next(): u64 {
+    SEED = SEED +% 0x9e3779b97f4a7c15
+    var z = SEED
+    z = (z ^ (z >> 30)) *% 0xbf58476d1ce4e5b9
+    z = (z ^ (z >> 27)) *% 0x94d049bb133111eb
+    return z ^ (z >> 31)
+}
+
+fn below(n: int): int { return int(next() % u64(n)) }
+
+fn p10(k: int): u128 {
+    var x: u128 = 1
+    for i in 0..k { x = x * 10 }
+    return x
+}
+
+fn coefNZ(d: int): u128 {
+    let lo = p10(d - 1)
+    var c = lo + u128(next()) % (9 * lo)
+    if c % 10 == 0 { c += 1 }
+    return c
+}
+
+fn dec(c: u128, scale: int, neg: bool): Decimal {
+    var u = i128(c)
+    if neg { u = -u }
+    return fromFraction(u, scale)
+}
+
+fn resHash(d: Decimal): u64 {
+    var x = u64(d.coefficient() & 0xffffffffffffffff) ^ u64(d.scale())
+    if d.isNeg() { x = x ^ 1 }
+    return x
+}
+
+fn addPub(xs: &[]Decimal, ys: &[]Decimal, reps: int): u64 {
+    var a: u64 = 0
+    for r in 0..reps { for i in 0..N { a = a +% resHash(xs[i].add(ys[i])) } }
+    return a
+}
+
+fn addExactMatch(xs: &[]Decimal, ys: &[]Decimal, reps: int): u64 {
+    var a: u64 = 0
+    for r in 0..reps {
+        for i in 0..N {
+            match xs[i].addExact(ys[i]) {
+                Ok(d) { a = a +% resHash(d) }
+                Err(e) { a = a +% 3 }
+            }
+        }
+    }
+    return a
+}
+
+fn addRaw(xs: &[]Decimal, ys: &[]Decimal, reps: int): u64 {
+    var a: u64 = 0
+    for r in 0..reps {
+        for i in 0..N { a = a +% u64((xs[i].coefficient() + ys[i].coefficient()) & 0xffffffffffffffff) }
+    }
+    return a
+}
+
+fn mulPub(xs: &[]Decimal, ys: &[]Decimal, reps: int): u64 {
+    var a: u64 = 0
+    for r in 0..reps { for i in 0..N { a = a +% resHash(xs[i].mul(ys[i])) } }
+    return a
+}
+
+fn mulExactMatch(xs: &[]Decimal, ys: &[]Decimal, reps: int): u64 {
+    var a: u64 = 0
+    for r in 0..reps {
+        for i in 0..N {
+            match xs[i].mulExact(ys[i]) {
+                Ok(d) { a = a +% resHash(d) }
+                Err(e) { a = a +% 5 }
+            }
+        }
+    }
+    return a
+}
+
+fn mulRaw(xs: &[]Decimal, ys: &[]Decimal, reps: int): u64 {
+    var a: u64 = 0
+    for r in 0..reps {
+        for i in 0..N { a = a +% u64((xs[i].coefficient() * ys[i].coefficient()) & 0xffffffffffffffff) }
+    }
+    return a
+}
+
+fn report(name: str, best: int, reps: int) {
+    println(name + " " + (float(best) / float(reps * N)).toStr())
+}
+
+fn main() {
+    var xs: []Decimal = []
+    var ys: []Decimal = []
+    var ms: []Decimal = []
+    var ns: []Decimal = []
+    for i in 0..N {
+        let c = coefNZ(19)
+        let n = below(4) == 0
+        append(mut &xs, dec(c, 2, n))
+        let d = coefNZ(19)
+        append(mut &ys, dec(d, 2, false))
+        let m = coefNZ(6)
+        append(mut &ms, dec(m, 4, false))
+        let q = coefNZ(6)
+        append(mut &ns, dec(q, 3, false))
+    }
+    var best = -1
+    for k in 0..7 {
+        let t0 = time.monotonicNs()
+        addPub(&xs, &ys, REPS)
+        let dt = time.monotonicNs() - t0
+        if best < 0 || dt < best { best = dt }
+    }
+    report("add public", best, REPS)
+    best = -1
+    for k in 0..7 {
+        let t0 = time.monotonicNs()
+        addExactMatch(&xs, &ys, REPS)
+        let dt = time.monotonicNs() - t0
+        if best < 0 || dt < best { best = dt }
+    }
+    report("add addExact", best, REPS)
+    best = -1
+    for k in 0..7 {
+        let t0 = time.monotonicNs()
+        addRaw(&xs, &ys, REPS)
+        let dt = time.monotonicNs() - t0
+        if best < 0 || dt < best { best = dt }
+    }
+    report("add raw u128", best, REPS)
+    best = -1
+    for k in 0..7 {
+        let t0 = time.monotonicNs()
+        mulPub(&ms, &ns, REPS)
+        let dt = time.monotonicNs() - t0
+        if best < 0 || dt < best { best = dt }
+    }
+    report("mul public", best, REPS)
+    best = -1
+    for k in 0..7 {
+        let t0 = time.monotonicNs()
+        mulExactMatch(&ms, &ns, REPS)
+        let dt = time.monotonicNs() - t0
+        if best < 0 || dt < best { best = dt }
+    }
+    report("mul mulExact", best, REPS)
+    best = -1
+    for k in 0..7 {
+        let t0 = time.monotonicNs()
+        mulRaw(&ms, &ns, REPS)
+        let dt = time.monotonicNs() - t0
+        if best < 0 || dt < best { best = dt }
+    }
+    report("mul raw u128", best, REPS)
+}

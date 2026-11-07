@@ -108,6 +108,105 @@ table is obx against Java only. The 37-digit add keeps the sum inside obx's
   small-value shortcuts stop helping), while obx's parse and format are
   3.3 times faster. A 38-digit value is the case obx was built for.
 
+## Why .NET and Java win the arithmetic
+
+The answer is not that their arithmetic is better. In obx the 128-bit
+coefficient operation is almost free; nearly all of the time is the
+normalisation, the `Result` and the copies around it. The same 19-digit and
+6x6 inputs, measured three ways (ns per operation, same harness):
+
+| case | public operator | `...Exact` + `match` | bare 128-bit coefficient op |
+|---|---:|---:|---:|
+| add, 19 digits | 29.6 | 20.5 | **1.25** |
+| mul, 6x6 digits | 27.0 | 21.2 | **1.36** |
+
+The bare operation is the `u128` add (or the low half of a multiply) plus
+the loop and checksum: about 5 cycles. Everything else is:
+
+- `addExact`: two `digits()` calls for the 38-digit bound, the exponent
+  alignment, a `u256` add, and `makeDec` (trailing-zero strip, a third
+  `digits()` and the range checks);
+- `mulExact`: `mul128` (one 64x64 product when both factors fit, as
+  they do here), then `makeDec`;
+- the public `add`/`mul` operator: a `Result` return and an `orStop` match,
+  which copies the 32-byte `Decimal` out again (6 to 9 ns).
+
+.NET and Java avoid both layers, and each also specialises by size:
+
+**.NET `decimal`.** The value is a 96-bit integer in registers; `+` is a
+scale compare and a 96-bit add, with no allocation and no normalisation
+loop (trailing zeros stay in the scale). Multiply has three code paths:
+32x32 (one multiply), 96x32, and 96x96 (nine 32x32 partial products). On a
+separate threshold harness:
+
+| multiply digits | ns/op | path |
+|---:|---:|---|
+| 6 | 9.4 | 32x32, one multiply |
+| 9 | 9.4 | 32x32 |
+| 10 | 13.4 | leaves the 32-bit path |
+| 13 | 14.2 | 96x96 |
+
+Add is flat — about 9.7 ns at 9, 19 and 26 digits — because it is
+always the same 96-bit add.
+
+**Java `BigDecimal`.** Its `intCompact` keeps the unscaled value in a
+`long` when it fits, and add/multiply then use 64-bit arithmetic; only the
+result `BigDecimal` is allocated. When the value or result does not fit,
+it falls back to `BigInteger`. The threshold harness shows the jumps:
+
+| operation | digits | ns/op | path |
+|---|---:|---:|---|
+| mul | 6 | 7.8 | compact `long` |
+| mul | 9 | 8.0 | compact `long` |
+| mul | 10 | 21.8 | product overflows `long`, `BigInteger` |
+| mul | 19 | 16.5 | `BigInteger` |
+| mul | 38 | 21.3 | `BigInteger`, four limbs |
+| add | 9 | 7.7 | compact `long` |
+| add | 18 | 7.9 | compact `long` |
+| add | 19 | 14.9 | sums start to overflow `long` |
+| add | 26 | 18.8 | `BigInteger` |
+| add | 38 | 19.1 | `BigInteger` |
+
+The separate harness uses a different input scale and one operation per JVM
+run, so its absolute values are a little lower than the main table; the
+jumps are the point. This is exactly the size dependence you remembered:
+Java's cheap path is a single 64-bit operation, and it disappears at 10
+digits for a product and at 19 digits for a sum. The 19-digit compare in
+the main table sits right at that boundary, which is why Java's add there
+(16 ns) is between its 9-digit time (7.7) and its 38-digit time (19).
+
+**Beyond 28 digits.** .NET cannot represent the values, so it is obx
+against Java. obx's arithmetic is still only ~1.4 ns; its 26 to 31 ns is
+the same fixed normalisation and copy cost. Java has no normalisation and no
+`Result`, so its 4-limb `BigInteger` add (19 ns) and multiply (21 ns) beat
+it. obx's multiply barely moves from 6 to 38 digits (27 to 26 ns) because
+the width was never the cost; Java's multiply rises from 8 to 21 ns because
+its path changes. That is the clearest statement of the difference: obx is
+overhead-bound at every size, Java is arithmetic-bound only at large sizes.
+
+## What would close it
+
+1. **A `Result`-free internal path for the operators.** `add`/`mul` pay a
+   `Result` return and an `orStop` copy for errors that are nearly always
+   absent. An internal non-`Result` function used by the operator, or a
+   by-pointer return, recovers 6 to 9 ns of the 27 to 30.
+2. **One digit count instead of three.** `addExact` calls `digits()` on both
+   operands and again inside `makeDec`. A table indexed by the remaining
+   room (`10^38` thresholds), or a bit-length estimate, would replace each
+   binary-search chain with a load or a few instructions.
+3. **Skip the trailing-zero strip when `coef % 10 != 0`.** For random sums
+   and products the first test almost always fails; the current loop still
+   computes the multiply and compare once.
+4. **Do not normalise on every operation.** .NET keeps trailing zeros in the
+   scale and normalises only where it must. If obx kept them too (and
+   compared/formatted them correctly), `add` and `mul` would not need
+   `makeDec` at all. That is a representation change, not a peephole, but it
+   is the single largest difference from .NET.
+
+The small-value fast path (one 64-bit multiply instead of four) is *not*
+worth much: the bare multiply is 1.36 ns, so the four partial products are
+already cheap. The return/ABI and the normalisation are the levers.
+
 ## Caveats
 
 - The semantics differ, and the table is not an equivalence claim: .NET is
@@ -147,4 +246,10 @@ XDG_RUNTIME_DIR=/tmp/xdg DOTNET=$HOME/.dotnet/dotnet \
 
 The harnesses are `decbench.obx`, `decbench-big.obx`, `DecBench.cs`
 (+ `DecBench.csproj`) and `DecBench.java`/`DecBenchBig.java` in that
-directory.
+directory. The breakdown and threshold runs above are `diagnose.sh`
+(`variants.obx`, `Scale.cs`, `Scale.java`):
+
+```sh
+XDG_RUNTIME_DIR=/tmp/xdg DOTNET=$HOME/.dotnet/dotnet \
+  JAVAC=$HOME/jdk/*/bin/javac JAVA=$HOME/jdk/*/bin/java ./diagnose.sh
+```
