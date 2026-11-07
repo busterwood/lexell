@@ -3,7 +3,7 @@
 Black-box tests of the language in `../SPEC.md`. They only use the compiler
 driver, `obxc file.obx -o out`.
 
-    python3 obx/tests/run.py [--compiler PATH] [-j N] [filters...]
+    python3 obx/tests/run.py [--compiler PATH] [-j N] [--live] [filters...]
     python3 obx/tests/compiler/run_tests.py [--conformance] [filters...]
 
 A filter is a substring of the test path (`s10_`, `error/s06`, `trap`). The
@@ -15,8 +15,14 @@ else is executed directly).
 rather than the spec (`run/`, `error/`, and `unit/`, run tests built with
 `// cflags:` such as `-DRT_STR_MAX=64`). They were the reference compiler's own
 tests until ref was retired (2026-11-02, `../../archive/obx-ref/`), and use the
-same format; `--conformance` runs this suite as well. Compile timeout 20 s, run timeout 10 s. One line per
-failure, then `N passed, M failed`; exit status 1 on any failure.
+same format; `--conformance` runs this suite as well. Compile timeout 20 s,
+run timeout 10 s; a test may raise the run timeout with `// timeout: SECONDS`.
+One line per failure, then `N passed, M failed`; exit status 1 on any failure.
+
+Tests that need a database or another running service exit 77 when it is
+missing; their names carry `_live` for most of them. They are skipped by
+default so that the quick and full gates are hermetic and deterministic;
+`--live` runs them (they still exit 77, skipped, when the service is missing).
 
 ## Test tiers and the build cache
 
@@ -34,11 +40,14 @@ compile the current sources (stage 2), stage 2 compile them again (stage 3),
 and requires the C of stages 2 and 3 to equal the seed; so a compiler change
 needs `compiler/reseed.sh` before the gate passes.
 
+Live gate, when the database servers are up (`obx/tools/gate.sh live`): the
+`*_live*` library tests and the native backend on the same, with `--live`.
+
 Full gate, at the end of a fix round and before a merge (`obx/tools/gate.sh full`):
 the quick gate plus the red-team harnesses, rounds 1 to 5 (`obx/redteam/rt.py`,
 `round2/rt.py`, `round3/rt.py`, `round4/rt.py`, `round5/rt.py`) under ASan+UBSan, and the native
 backend on the red-team corpora and on 200 + 200 generated programs (`obx/tests/vrgen.py`,
-`obx/tests/loopgen.py`). The
+`obx/tests/loopgen.py`). The live tests are not part of it. The
 script prints a summary with the time of each
 step and the total, and exits 1 on any failure.
 

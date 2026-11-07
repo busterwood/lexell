@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Differential test of the native backend (design/native.md, section 7).
 
-usage: run_native.py [--compiler PATH] [--lib] [--redteam] [-j N] [-v] [filters...]
+usage: run_native.py [--compiler PATH] [--lib] [--redteam] [--live] [-j N] [-v] [filters...]
 
 For every run test and every test of tests/native (C libraries through dynamic linking; a
 test with `// needs: name` is skipped when lib<name>.so* is not installed), with --lib also
@@ -53,8 +53,8 @@ def redteam():
     return sorted(set(out))
 
 
-def find(lib, red):
-    tests = [p for k, p in runpy.find_tests() if k == 'run']
+def find(lib, red, live=False):
+    tests = [p for k, p in runpy.find_tests() if k == 'run' and (live or not runpy.is_live(p))]
     tests += [os.path.join(NATIVE, f) for f in sorted(os.listdir(NATIVE)) if f.endswith('.obx')]
     if red:
         tests += redteam()
@@ -62,20 +62,26 @@ def find(lib, red):
         for dirpath, dirnames, filenames in sorted(os.walk(LIB_TESTS)):
             dirnames.sort()
             if 'main.obx' in filenames:
-                tests.append(os.path.join(dirpath, 'main.obx'))
+                path = os.path.join(dirpath, 'main.obx')
+                if live or not runpy.is_live(path):
+                    tests.append(path)
                 dirnames[:] = []
                 continue
-            tests += [os.path.join(dirpath, f) for f in sorted(filenames) if f.endswith('.obx')]
+            for f in sorted(filenames):
+                path = os.path.join(dirpath, f)
+                if f.endswith('.obx') and (live or not runpy.is_live(path)):
+                    tests.append(path)
     return tests
 
 
-def execute(exe, stdin, check, cwd):
+def execute(exe, stdin, check, cwd, timeout=None):
     env = dict(os.environ)
     env.pop('OBX_CHECK', None)
     if check:
         env['OBX_CHECK'] = '1'
     try:
-        r = subprocess.run([exe], input=stdin.encode(), capture_output=True, timeout=TIMEOUT, env=env, cwd=cwd)
+        r = subprocess.run([exe], input=stdin.encode(), capture_output=True,
+                           timeout=timeout or TIMEOUT, env=env, cwd=cwd)
         return r.returncode, r.stdout, r.stderr
     except subprocess.TimeoutExpired:
         return 'timeout', b'', b''
@@ -129,8 +135,8 @@ def one(path, obxc):
                 return rel, 'unsupported', msg[msg.index('native: unsupported:') + 21:].splitlines()[0]
             return rel, 'differ', 'native build failed (%s): %s' % (r.returncode, msg[:400])
         for check in (False, True):
-            a = execute(cexe, stdin, check, tmp)
-            b = execute(nexe, stdin, check, tmp)
+            a = execute(cexe, stdin, check, tmp, d['timeout'])
+            b = execute(nexe, stdin, check, tmp, d['timeout'])
             if a == b and a[0] == runpy.SKIP_EXIT and d['exit'] != runpy.SKIP_EXIT:
                 return rel, 'skip', ''       # both runs found a live service missing
             if a != b and want(d, b) and not want(d, a):
@@ -199,6 +205,7 @@ def main():
     ap.add_argument('--lib', action='store_true', help='also the library tests')
     ap.add_argument('--redteam', action='store_true', help='also the red-team programs')
     ap.add_argument('--opt', action='store_true', help='build the native side with -O')
+    ap.add_argument('--live', action='store_true', help='also tests that need a live service')
     ap.add_argument('-j', type=int, default=os.cpu_count() or 4)
     ap.add_argument('-v', action='store_true')
     ap.add_argument('filters', nargs='*')
@@ -206,7 +213,7 @@ def main():
     global OPT
     OPT = a.opt
     obxc = os.path.abspath(a.compiler)
-    tests = find(a.lib, a.redteam)
+    tests = find(a.lib, a.redteam, a.live)
     if a.filters:
         tests = [t for t in tests if any(f in t for f in a.filters)]
     with ThreadPoolExecutor(max_workers=a.j) as ex:

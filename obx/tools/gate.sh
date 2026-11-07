@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# usage: obx/tools/gate.sh quick|full
+# usage: obx/tools/gate.sh quick|full|live
 # quick: the C seed's fixed point (it also builds compiler/out/obxc from the seed, the compiler
 #        every later step uses), the conformance suite, the compiler tests, the library tests,
 #        the native backend against the C backend (run + lib tests) and the native self-build.
@@ -10,21 +10,33 @@
 #        request parsing against Go's net/http and Node's llhttp on generated request streams
 #        (each oracle skipped when not installed), the regex tests under ASan+UBSan and the regex
 #        library against Go's regexp on random patterns (skipped without go).
+# live:  the library tests that need a database or another running service (the `*_live*`
+#        tests), and the native backend on the same. These are not part of quick or full so
+#        that those tiers stay hermetic and deterministic.
 # Builds are cached (tools/cbuild.py; OBX_NOCACHE=1 disables, OBX_CACHE sets the directory).
 set -u
 tier=${1:-}
-case "$tier" in quick|full) ;; *) echo "usage: $0 quick|full" >&2; exit 2;; esac
+case "$tier" in quick|full|live) ;; *) echo "usage: $0 quick|full|live" >&2; exit 2;; esac
 R=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$R"
-steps=(
-  "seed fixed point|python3 obx/tools/seed_check.py"
-  "conformance|python3 obx/tests/run.py"
-  "compiler tests|python3 obx/tests/compiler/run_tests.py"
-  "lib|python3 obx/lib/run_tests.py -j 8"
-  "native lib+run|python3 obx/tests/run_native.py --lib"
-  "native -O lib+run|python3 obx/tests/run_native.py --lib --opt"
-  "native selfbuild|bash obx/tools/native_selfbuild.sh"
-)
+if [ "$tier" = live ]; then
+  steps=(
+    "lib (live)|python3 obx/lib/run_tests.py --live -j 8"
+    "native lib+run (live)|python3 obx/tests/run_native.py --lib --live"
+    "redteam live|python3 obx/redteam/rt.py obx/lib/tests/run/pgwire_live.obx obx/lib/tests/run/pgwire_live_tls.obx obx/lib/tests/run/task_postgres_async.obx obx/lib/tests/run/task_postgres_pool.obx"
+    "redteam live tsan|OBX_SAN=thread python3 obx/redteam/rt.py obx/lib/tests/run/task_postgres_async.obx obx/lib/tests/run/task_postgres_pool.obx"
+  )
+else
+  steps=(
+    "seed fixed point|python3 obx/tools/seed_check.py"
+    "conformance|python3 obx/tests/run.py"
+    "compiler tests|python3 obx/tests/compiler/run_tests.py"
+    "lib|python3 obx/lib/run_tests.py -j 8"
+    "native lib+run|python3 obx/tests/run_native.py --lib"
+    "native -O lib+run|python3 obx/tests/run_native.py --lib --opt"
+    "native selfbuild|bash obx/tools/native_selfbuild.sh"
+  )
+fi
 if [ "$tier" = full ]; then
   steps+=(
     "redteam round 1|python3 obx/redteam/rt.py"
@@ -32,9 +44,9 @@ if [ "$tier" = full ]; then
     "redteam round 3|python3 obx/redteam/round3/rt.py"
     "redteam round 4|python3 obx/redteam/round4/rt.py"
     "redteam round 5|python3 obx/redteam/round5/rt.py"
-    "redteam tasks|python3 obx/redteam/rt.py obx/lib/tests/run/task_*.obx obx/lib/tests/run/net_*.obx obx/lib/tests/run/proc_*.obx obx/lib/tests/run/url_*.obx obx/lib/tests/run/http_*.obx obx/lib/tests/run/pgwire_*.obx"
+    "redteam tasks|python3 obx/redteam/rt.py $(ls obx/lib/tests/run/task_*.obx obx/lib/tests/run/net_*.obx obx/lib/tests/run/proc_*.obx obx/lib/tests/run/url_*.obx obx/lib/tests/run/http_*.obx obx/lib/tests/run/pgwire_*.obx | grep -v -e '_live' -e 'task_postgres_' | tr '\n' ' ')"
     "redteam regex|python3 obx/redteam/rt.py obx/lib/tests/run/regex_*.obx obx/lib/tests/run/regex_re2search/main.obx"
-    "redteam tsan|OBX_SAN=thread python3 obx/redteam/rt.py obx/lib/tests/run/task_blocking_*.obx obx/lib/tests/run/task_postgres_*.obx obx/lib/tests/run/net_*.obx"
+    "redteam tsan|OBX_SAN=thread python3 obx/redteam/rt.py obx/lib/tests/run/task_blocking_*.obx obx/lib/tests/run/net_*.obx"
     "native redteam|python3 obx/tests/run_native.py --lib --redteam"
     "native generated|python3 obx/tests/vrgen.py -n 200"
     "native loops gen|python3 obx/tests/loopgen.py -n 200"

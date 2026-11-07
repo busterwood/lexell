@@ -496,9 +496,9 @@ shelved". The application rows below carry their external references; the
 remaining gaps are regex's byte loop and cmark's parse instructions, and
 Decimal is 1.2 times .NET on add and 1.5 on multiply.
 
-`-O` is part of the quick gate: `run_native.py --lib --opt` builds the 613
-programs with `-O` and requires the same output, exit code and stderr as the
-C build.
+`-O` is part of the quick gate: `run_native.py --lib --opt` builds the
+library programs with `-O` and requires the same output, exit code and stderr
+as the C build.
 
 ### The application suite
 

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """obx conformance test runner. See README.md for the test file format.
 
-usage: run.py [--compiler PATH] [-v] [filters...]
+usage: run.py [--compiler PATH] [-v] [--live] [filters...]
 `// error: a|b` accepts either word; an empty `// error:` accepts any failure.
 A filter is a substring of the test's path relative to the tests directory.
+Tests with `_live` in the name need a service and are skipped unless --live.
 """
 import argparse, glob, os, re, subprocess, sys, tempfile
 from concurrent.futures import ThreadPoolExecutor
@@ -12,7 +13,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'
 import cbuild  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DIRECTIVE = re.compile(r'^\s*//\s*(expect|stderr|exit|stdin|error|line):(.*)$')
+DIRECTIVE = re.compile(r'^\s*//\s*(expect|stderr|exit|stdin|error|line|timeout):(.*)$')
 NEEDS = re.compile(r'^\s*//\s*needs:\s*(\S+)')
 LIBDIRS = ['/usr/lib/x86_64-linux-gnu', '/lib/x86_64-linux-gnu', '/usr/lib64', '/usr/lib', '/usr/local/lib', '/lib']
 SKIP_EXIT = 77     # a run test that exits 77 (and does not expect it) is skipped: a live service is missing
@@ -31,24 +32,41 @@ COMPILE_TIMEOUT = 20
 RUN_TIMEOUT = 10
 
 
-def find_tests():
+def is_live(path):
+    """A live test needs a database or another service that is not part of the build.
+
+    Those tests exit 77 when the service is missing; the name carries `_live`
+    for most of them, and the exit is the reliable marker for the rest."""
+    if '_live' in os.path.basename(path):
+        return True
+    try:
+        with open(path, encoding='utf-8', errors='replace') as f:
+            return 'exit(77)' in f.read()
+    except OSError:
+        return False
+
+
+def find_tests(live=False):
     tests = []
     for kind in ('run', 'error'):
         root = os.path.join(HERE, kind)
         for dirpath, dirnames, filenames in os.walk(root):
             dirnames.sort()
             if 'main.obx' in filenames:
-                tests.append((kind, os.path.join(dirpath, 'main.obx')))
+                path = os.path.join(dirpath, 'main.obx')
+                if live or not is_live(path):
+                    tests.append((kind, path))
                 dirnames[:] = []          # a directory with main.obx is one test
                 continue
             for f in sorted(filenames):
-                if f.endswith('.obx'):
-                    tests.append((kind, os.path.join(dirpath, f)))
+                path = os.path.join(dirpath, f)
+                if f.endswith('.obx') and (live or not is_live(path)):
+                    tests.append((kind, path))
     return tests
 
 
 def parse_directives(path):
-    d = {'expect': [], 'stderr': [], 'exit': 0, 'stdin': [], 'error': [], 'line': None}
+    d = {'expect': [], 'stderr': [], 'exit': 0, 'stdin': [], 'error': [], 'line': None, 'timeout': None}
     with open(path, encoding='utf-8', errors='replace') as f:
         for raw in f:
             m = DIRECTIVE.match(raw.rstrip('\n').rstrip('\r'))
@@ -69,6 +87,8 @@ def parse_directives(path):
                 d['error'].append(val.strip())
             elif key == 'line':
                 d['line'] = int(val.strip())
+            elif key == 'timeout':
+                d['timeout'] = float(val.strip())
     return d
 
 
@@ -113,7 +133,7 @@ def run_test(kind, path, compiler):
         stdin = ''.join(l + '\n' for l in d['stdin'])
         try:
             r = subprocess.run([out], input=stdin, capture_output=True, text=True,
-                               errors='replace', timeout=RUN_TIMEOUT, env=env, cwd=tmp)
+                               errors='replace', timeout=d['timeout'] or RUN_TIMEOUT, env=env, cwd=tmp)
         except subprocess.TimeoutExpired:
             return rel, 'run timeout'
         if r.returncode == SKIP_EXIT and d['exit'] != SKIP_EXIT:
@@ -135,9 +155,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--compiler', default=cbuild.OBXC)
     ap.add_argument('-j', type=int, default=os.cpu_count() or 4)
+    ap.add_argument('--live', action='store_true', help='also the tests that need a live service')
     ap.add_argument('filters', nargs='*')
     a = ap.parse_args()
-    tests = find_tests()
+    all_tests = find_tests(True)
+    tests = all_tests if a.live else [t for t in all_tests if not is_live(t[1])]
+    live_skipped = len(all_tests) - len(tests)
     if a.filters:
         tests = [t for t in tests
                  if any(f in os.path.relpath(t[1], HERE) for f in a.filters)]
@@ -150,8 +173,10 @@ def main():
         elif err:
             failed += 1
             print('FAIL %s: %s' % (rel, err))
-    print('%d passed, %d failed%s' % (len(results) - failed - skipped, failed,
-                                      ', %d skipped (a library or service missing)' % skipped if skipped else ''))
+    print('%d passed, %d failed%s%s' % (
+        len(results) - failed - skipped, failed,
+        ', %d skipped (a library or service missing)' % skipped if skipped else '',
+        ', %d live not run (use --live)' % live_skipped if live_skipped else ''))
     sys.exit(1 if failed else 0)
 
 
