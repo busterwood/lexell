@@ -10,7 +10,8 @@ borrowing —
 [simpler memory management than Rust](https://verdagon.dev/blog/valen-group-borrowing),
 with no lifetime annotations. There is no garbage collector. Strings are
 reference counted, and generic code is checked where it is written and
-compiled per instance.
+compiled per instance. Programs are built from modules: one source file each,
+with explicit imports and `pub` visibility.
 
 Concurrency is cooperative tasks on one OS thread: stackful coroutines over
 an epoll loop, with handlers written in ordinary blocking style — no
