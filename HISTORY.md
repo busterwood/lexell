@@ -1710,6 +1710,22 @@ mid-IR rank 1–2 (allocation and selection, design/mid-ir.md) and the regex
 API's per-match work (`forward`/`backward` arguments and prologues,
 `Cache.start`, dup/drop, span appends), not check elimination.
 
+The SSA/value-numbering oracle for the native `-O` path (`ssa-gvn`,
+2026-11-07) was built, measured and not merged. After `opt`, `loops` and `cse`
+the tree has 5,132 redundant computations on the self-build (851 pure
+expressions, 3,494 loads, 738 addresses, 49 calls), 39,206 weighted by
+10^depth: if every reuse saved one dynamic instruction that is under 0.001% of
+4.55G. Rewriting them cost **+1.95% instructions** and -0.51% cycles on the
+self-build; `array` cost **+58% instructions / +32% cycles** because its one
+reuse (a data-pointer cast) became a spilled frame local in the 200M-iteration
+loop; `grep` +2.67% and `tokens` +1.78% instructions; `lists` -1.99% was the
+only win. The construction alone cost +79% of the `-O` compile, +84.6% with
+numbering and rewrite (`optcost.py` -O/default +51.1% instructions against
+the +30% budget). The 613 `--opt --lib` native programs passed with the pass
+on. With M1's allocator model this closes M2/M3 as a route to redundancy
+elimination; the next speed is the tree-level work in
+`obx/design/codegen-audit.md` (bool/branch folding, addressing, frames).
+
 `perf17` fails "Judging a pass": the run suite gains in cycles but on one
 program (fib), and the compile suite costs 1.05%. It is committed on its
 branch with the tests (`lib/tests/run/range_facts_*`) that show the checks

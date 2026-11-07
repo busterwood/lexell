@@ -2,7 +2,12 @@
 
 Status: study, 2026-11-05; the open decisions at the end were the user's.
 M1 was built on branch `mid-ir-m1` and missed its gate: see "M1 as built"
-at the end of section 6.
+at the end of section 6. M2/M3 as a route to redundancy elimination were
+closed on 2026-11-07 by the SSA-on-the-tree oracle in
+[ssa-gvn.md](ssa-gvn.md): after `opt`, `loops` and `cse` the tree has 5,132
+redundant computations on the self-build (39,206 weighted by loop depth),
+under 0.001% of its dynamic instructions, and the rewrite cost 1.95% more
+instructions.
 
 The question: should obx put a MIR-like linear IR between the tree IR and
 `x64gen`? That means three-address instructions over virtual registers, in
@@ -36,8 +41,8 @@ Sources and measurements:
 | What does x64gen cost? | About 5.8K per instruction of the same granularity (1.28G of the 4.47G self-build). |
 | How much faster could obx's code get? | The native-built compiler runs at 0.81 of the gcc -O2 build's speed (cycles). On the benchmarks native already matches gcc. gcc's whole redundancy family (FRE, PRE, GCSE, DOM, DSE, LICM) is worth 5.3% of the compiler's cycles. |
 | What would a mid IR cost? | 6K to 8.5K lines of obx. 6K to 10K instructions per mid instruction for the full pipeline, against x64gen's 5.8K: 0% to +20% on the self-build. At MIR's constants, +60% to +105%. |
-| What pays first? | A register allocator with live-range splitting, then instruction selection, then GVN with obx's alias classes. |
-| Recommendation | Not as a default pass now. If the user wants the next ~10% of run speed from the native backend, build M1 (lowering, liveness and a static allocation model, no code) and decide at its gate. Otherwise keep x64gen. |
+| What pays first? | Instruction selection and frames on the tree ([codegen-audit.md](codegen-audit.md)); then a register allocator with live-range splitting if scalar replacement comes with it. GVN is not a reason: the tree oracle found under 0.001% ([ssa-gvn.md](ssa-gvn.md)). |
+| Recommendation | Not as a default pass now, and not for redundancy elimination (M2/M3 closed). If run speed from the native backend is still the goal, spend it on the tree first; an RA/mid-IR project needs M1's model as its gate. Otherwise keep x64gen. |
 
 ## 1. MIR's pipeline
 
