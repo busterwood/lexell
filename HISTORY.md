@@ -1689,6 +1689,27 @@ against what its code saves.
 | `perf15` (not built) | `str` locals and parameters as register pairs, the first item of the pass | not attempted: see design/native.md section 8 | | |
 | `perf21` (measured, not built) | constant folding after inlining: constant operands on both sides, `if`/`while`/`?:` on a constant condition, `switch` on a constant, a compare of a local with itself, construct-then-match on a local only ever assigned constants | not built: in the self-build's 406,000 IR nodes after inlining, 424 `E_BIN` have two constant operands (0.10%; 16 in loops), 407 conditions are constant (0.10%; 69 in loops), 338 casts of constants (x64gen takes them as immediates), 108 checked `rt_add/sub/mul/div` calls on constants, 5 self-compares, and 3 tests of a local that is only assigned constants; following single-assignment constant locals adds just 38 conditions. The perfsuite programs have 0 to 156 each (grep 156 of 81,743 nodes, sort 129 of 18,572 but 91 are its own constants) | | below 0.3% of static code at best, under 0.1% dynamic |
 
+The range/check pass for the native `-O` path (`range-check-pass`, 2026-11-07)
+was measured and not built. The upper bound was taken first: a throwaway
+`x64gen` with **every** inline check deleted (the `rt_idx`/`rt_sidx` trap
+branches, the `jo` of checked add/sub/mul, `inlineCv`'s range checks,
+`inlineDiv`'s trap branches) — strictly stronger than any sound pass. On regex
+`\w+` that is -3.7% instructions and +0.2% cycles (5,243M to 5,047M
+instructions, 1,334M to 1,337M cycles against the C build's 4,100M and 886M);
+alternation -2.8% instructions, -1.7% cycles; nocase -2.9% and +1.1%; dates
+-4.2% and +6.9%. Decimal over 41 cases: -2.3% instructions, +0.03% cycles.
+The compile suite: -3.9% instructions, +1.4% cycles. Instructions move, cycles
+do not, and the regex cost is per match: a 3.2 MB corpus with one match is
+1.16x the C build, the same corpus with 669,532 matches is 1.63x, and the
+byte loop is only 22 instructions of which 4 to 6 are checks. The checks that
+remain are also mostly not provable intraprocedurally: `at >= 0` needs a
+parameter precondition, `b`'s `[0,255]` is lost at the checked u8 conversion,
+`ascii.len >= 128` and `trans`'s layout are constructor invariants of another
+function's record, and `w == 1` is lost at an `if` join. The levers are
+mid-IR rank 1–2 (allocation and selection, design/mid-ir.md) and the regex
+API's per-match work (`forward`/`backward` arguments and prologues,
+`Cache.start`, dup/drop, span appends), not check elimination.
+
 `perf17` fails "Judging a pass": the run suite gains in cycles but on one
 program (fib), and the compile suite costs 1.05%. It is committed on its
 branch with the tests (`lib/tests/run/range_facts_*`) that show the checks

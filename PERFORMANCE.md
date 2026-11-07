@@ -464,7 +464,11 @@ percent of the C build, and Decimal still 1.1 to 1.37 times C (add 1.11,
 quantize 1.25, parse 1.37, format 1.14, cmp 1.30). The ladder pays on
 loops, allocation, strings, trees and Markdown; it barely moves the DFA,
 jq's calls and boxes, and Decimal's records. Those are the next pass's
-targets (the app gaps are in `obx/bench/README.md`'s three tiers).
+targets (the app gaps are in `obx/bench/README.md`'s three tiers). Range and
+check elimination was measured first and is not it: deleting *every* inline
+check from the native backend buys 3.7% of `\w+`'s instructions and no cycles,
+because the gap is per-match work and instruction selection (HISTORY.md,
+"Tried and shelved").
 
 `-O` is part of the quick gate: `run_native.py --lib --opt` builds the 613
 programs with `-O` and requires the same output, exit code and stderr as the
