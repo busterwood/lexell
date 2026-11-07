@@ -1,9 +1,10 @@
 # obx benchmarks
 
 Ten small programs, each building the same program with both backends,
-native and via C:
+native and via C. Nine of them also have a hand-written Rust port:
 
     python3 obx/bench/bench.py [-n RUNS] [--only NAME ...] [--obo] [--opt] [--perf]
+                              [--no-rust]
 
 `--opt` adds a `native -O` build and its columns; `--perf` adds instructions
 and cycles (`perf stat`, user mode) beside the wall times. The compile cost
@@ -25,7 +26,14 @@ There are three different questions, and they must not be mixed:
    checks the language requires. `obx/bench/c/NAME.c` holds these
    references, built with `gcc -O2 -fno-optimize-sibling-calls`; the table's
    `plain C` and `native/plain C` columns are this question.
-3. **Another implementation (Rust regex, Go regexp, GNU grep, jq, cmark,
+3. **The same algorithm written in Rust, against native obx.** This is a
+   second language/runtime comparison, and the closest external one because
+   obx's ownership model is close to Rust's. `obx/bench/rust/` holds the
+   ports, built once with `cargo build --release`; the table's `Rust` and
+   `native/Rust` columns are this question. It is not a compiler-backend
+   comparison: the Rust code is an independent, idiomatic implementation of
+   each program, not the same IR lowered by another backend.
+4. **Another implementation (Rust regex, Go regexp, GNU grep, jq, cmark,
    OpenSSL).** These are usually a different algorithm. They answer "is our
    algorithm competitive", not "is our compiler generating good code". The
    regex and JSON benchmark scripts report them; keep them out of the
@@ -48,15 +56,39 @@ they are held to the same work:
   is auto-vectorisation (fewer instructions, same work), which is a real
   target, not an artifact.
 
-`maps` has no plain C reference yet: the obx map's index layout and keyed
-hash would have to be ported, not approximated.
+The Rust ports in `rust/` are one dependency-free Cargo project (`dbench`,
+one subcommand per benchmark, plus `strings-rc`). They do the same work and
+print the same checksum as the obx programs; `bench.py` requires the outputs
+to be equal. The build is deliberately fair and fixed in the project:
+
+- `opt-level = 3`, `lto = "thin"`, `codegen-units = 1`, `panic = "abort"`.
+- `-C target-cpu=x86-64-v3`, the ISA the native backend requires.
+- `overflow-checks = true`: obx's `+`, `-` and `*` are checked, and `loop`
+  measures two checked operations per iteration, so the Rust build must keep
+  them too.
+- no `unsafe`, no `get_unchecked`, no external crates, no threads or
+  `std::arch` intrinsics; the bounds checks stay on.
+- `std::hint::black_box` and the command-line sizes (where `c/NAME.c` has
+  them) keep LLVM from constant-folding or closing the work up. `fib` is
+  `#[inline(never)]` and both recursive calls stay.
+
+`strings` is measured with idiomatic `String` in the table; `dbench
+strings-rc` runs the same concatenations on `Rc<str>`, which matches obx's
+refcounted `str`, and that number is reported beside the table.
+
+`maps` has no plain C reference yet, and no Rust one: the obx map's
+insertion order, keyed hash and `u32` index slots have no direct Rust std
+equivalent, so a port would approximate rather than compare the same work.
 
 For each program it builds `NAME.obx` with `obx/compiler/out/obxc` (or
 `$OBXC`) twice, with `--native` and through C (`gcc -O2`). It checks that the
 two print the same result and are leak free (`OBX_CHECK=1`), then reports the
 best wall time of N runs (default 5) with `OBX_CHECK` unset. A program with a
-hand-written C reference in `c/NAME.c` (no checks; so far `sieve`) is also
-built with `gcc -O2` and timed, as the "plain C" column.
+hand-written C reference in `c/NAME.c` is also built with `gcc -O2` and timed,
+as the "plain C" column. The Rust binary is built once (offline) and every
+port must print the obx checksum; `maps` shows `-` because it has no port.
+When cargo is not installed (or `--no-rust` is given) the note is printed and
+the Rust column is `-`.
 
 The runs set `OBX_HASH_SEED=42` (`--hash-seed N`, or `--random-hash` for the
 production default), so `maps` hashes the same way in both builds and in every

@@ -8,15 +8,19 @@ obo compiler (archive/obo/obo, if it runs). It checks that the outputs are
 equal and that both obx programs are leak free (OBX_CHECK=1), then prints the
 best wall time of N runs of each. A program with a hand-written C reference,
 obx/bench/c/NAME.c (no checks), also gets it built with gcc -O2 and timed, as
-the "plain C" column ("-" for the others).
+the "plain C" column ("-" for the others). The Rust ports in rust/ are built
+once with `cargo build --release` and timed as the "Rust" column ("-" for
+`maps`, which has no reference, and when cargo is missing or --no-rust is
+given). Their output must equal the obx output.
 
     python3 obx/bench/bench.py [-n RUNS] [--only NAME ...] [--obo] [--opt] [--perf]
-                              [--hash-seed N | --random-hash]
+                              [--no-rust] [--hash-seed N | --random-hash]
 
 The primary comparison is the same obx source built both ways (native and
-through C). The hand-written C references in c/ are a second, same-algorithm
-comparison; README.md says what each reference does to keep the work equal.
---perf adds instructions and cycles (user mode) beside the wall times.
+through C). The hand-written C and Rust references in c/ and rust/ are a
+second, same-algorithm comparison; README.md says what each reference does to
+keep the work equal. --perf adds instructions and cycles (user mode) beside
+the wall times.
 
 Every program runs with OBX_HASH_SEED=42 (--hash-seed changes it), so the
 random per-process hash key of std.Map does not move the maps timings between
@@ -26,6 +30,7 @@ order).
 """
 import argparse
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -38,11 +43,21 @@ OBO = os.path.join(ROOT, 'archive', 'obo')
 OBO_SRC = os.path.join(OBO, 'bench')
 NAMES = ['fib', 'loop', 'array', 'alloc', 'lists', 'strings', 'trees', 'tokens', 'sieve', 'maps']
 TOKENS_INPUT = os.path.join(ROOT, 'obx', 'compiler', 'sema.obx')   # any text file; same for both
+RUST_DIR = os.path.join(HERE, 'rust')
+# maps has no Rust reference: obx's Map is insertion-ordered and keyed-hashed,
+# with u32 index slots; there is no direct std equivalent.
+RUST_NAMES = {'fib', 'loop', 'array', 'alloc', 'lists', 'strings', 'trees', 'tokens', 'sieve'}
 HASH_SEED = None     # set from the command line; see base_env
+RUST_EXE = None      # the one dbench binary, once built
 
 
 def args_for(name):
     return [TOKENS_INPUT] if name == 'tokens' else []
+
+
+def cmd_for(exe, name):
+    """The Rust binary takes the benchmark name as its first argument."""
+    return [exe, name] if RUST_EXE is not None and exe == RUST_EXE else [exe]
 
 
 def base_env(env_extra=None):
@@ -60,7 +75,7 @@ def base_env(env_extra=None):
 def run(exe, name, env_extra=None):
     env = base_env(env_extra)
     t0 = time.perf_counter()
-    p = subprocess.run([exe] + args_for(name), capture_output=True, text=True, env=env)
+    p = subprocess.run(cmd_for(exe, name) + args_for(name), capture_output=True, text=True, env=env)
     return p.returncode, p.stdout.strip(), p.stderr.strip(), time.perf_counter() - t0
 
 
@@ -79,7 +94,8 @@ def perf_run(exe, name, n):
     ts, ins, cyc, outs = [], [], [], set()
     for _ in range(n):
         t0 = time.perf_counter()
-        p = subprocess.run(['perf', 'stat', '-x,', '-e', 'instructions:u,cycles:u', exe] + args_for(name),
+        p = subprocess.run(['perf', 'stat', '-x,', '-e', 'instructions:u,cycles:u']
+                           + cmd_for(exe, name) + args_for(name),
                            capture_output=True, text=True, env=base_env())
         dt = time.perf_counter() - t0
         if p.returncode != 0:
@@ -118,6 +134,17 @@ def build_c(name, tmp):
     return exe
 
 
+def build_rust():
+    """Build the Rust reference once; None when cargo is unavailable."""
+    if not shutil.which('cargo'):
+        return None
+    r = subprocess.run(['cargo', 'build', '--release', '--offline', '--quiet'], cwd=RUST_DIR)
+    if r.returncode != 0:
+        print('note: the Rust reference did not build; Rust column skipped', file=sys.stderr)
+        return None
+    return os.path.join(RUST_DIR, 'target', 'release', 'dbench')
+
+
 def build_obo(name, tmp):
     exe = os.path.join(tmp, name + '_obo')
     compiler = os.path.join(OBO, 'obo')
@@ -140,16 +167,21 @@ def main():
     ap.add_argument('--opt', action='store_true', help='also build native with -O and add its columns')
     ap.add_argument('--perf', action='store_true',
                     help='also report instructions and cycles (perf stat, user mode)')
+    ap.add_argument('--no-rust', action='store_true', help='skip the Rust reference column')
     ap.add_argument('--hash-seed', type=int, default=42,
                     help='OBX_HASH_SEED for the runs (default 42; makes maps reproducible)')
     ap.add_argument('--random-hash', action='store_true',
                     help='run with the production per-process random hash key')
     a = ap.parse_args()
-    global HASH_SEED
+    global HASH_SEED, RUST_EXE
     HASH_SEED = None if a.random_hash else str(a.hash_seed)
     names = a.only or NAMES
     tmp = tempfile.mkdtemp(prefix='obxbench')
     rows = []
+    if not a.no_rust and not a.obo:
+        RUST_EXE = build_rust()
+        if RUST_EXE is None and shutil.which('cargo') is None:
+            print('note: cargo not found; Rust column skipped', file=sys.stderr)
 
     def timed(exe):
         if exe is None:
@@ -165,6 +197,7 @@ def main():
         obxo = build_obx(name, tmp, native=True, opt=True) if a.opt else None
         obo = build_obo(name, tmp) if a.obo else None
         plain = build_c(name, tmp)
+        rust = RUST_EXE if name in RUST_NAMES else None
         for exe in (obx, obxn) + ((obxo,) if obxo else ()):
             code, out, err, _ = run(exe, name, {'OBX_CHECK': '1'})
             if code != 0:
@@ -184,9 +217,13 @@ def main():
         t_plain, out_plain, i_plain, c_plain = timed(plain)
         if plain and out_plain != out_obx:
             raise SystemExit(f"{name}: outputs differ: obx {out_obx!r}, plain C {out_plain!r}")
-        rows.append(dict(name=name, obo=t_obo, c=t_obx, n=t_obxn, o=t_obxo, plain=t_plain, out=out_obx,
-                         ci=i_obx, ni=i_obxn, oi=i_obxo, pi=i_plain,
-                         cc=c_obx, nc=c_obxn, oc=c_obxo, pc=c_plain))
+        t_rust, out_rust, i_rust, c_rust = timed(rust)
+        if rust and out_rust != out_obx:
+            raise SystemExit(f"{name}: outputs differ: obx {out_obx!r}, Rust {out_rust!r}")
+        rows.append(dict(name=name, obo=t_obo, c=t_obx, n=t_obxn, o=t_obxo, plain=t_plain, rust=t_rust,
+                         out=out_obx,
+                         ci=i_obx, ni=i_obxn, oi=i_obxo, pi=i_plain, ri=i_rust,
+                         cc=c_obx, nc=c_obxn, oc=c_obxo, pc=c_plain, rc=c_rust))
     if a.obo:
         if all(r['obo'] is None for r in rows):
             print("note: the obo compiler did not build anything; obo columns skipped", file=sys.stderr)
@@ -199,21 +236,25 @@ def main():
             print(f"| {r['name']} | {fmt(t_obo)} | {fmt(r['c'])} | {fmt(r['n'])} | {cr} | {nr} | {r['out']} |")
         return
     if a.opt:
-        print("| benchmark | via C | native | native -O | -O/C | plain C | -O/plain C | output |")
-        print("|---|---:|---:|---:|---:|---:|---:|---|")
+        print("| benchmark | via C | native | native -O | -O/C | plain C | -O/plain C | Rust | -O/Rust | output |")
+        print("|---|---:|---:|---:|---:|---:|---:|---:|---:|---|")
         for r in rows:
             pc = fmt(r['plain']) if r['plain'] is not None else "-"
             opc = f"{r['o'] / r['plain']:.2f}" if r['plain'] else "-"
+            rs = fmt(r['rust']) if r['rust'] is not None else "-"
+            ors = f"{r['o'] / r['rust']:.2f}" if r['rust'] else "-"
             print(f"| {r['name']} | {fmt(r['c'])} | {fmt(r['n'])} | {fmt(r['o'])} | "
-                  f"{r['o'] / r['c']:.2f} | {pc} | {opc} | {r['out']} |")
+                  f"{r['o'] / r['c']:.2f} | {pc} | {opc} | {rs} | {ors} | {r['out']} |")
     else:
-        print("| benchmark | via C | native | native/C | plain C | native/plain C | output |")
-        print("|---|---:|---:|---:|---:|---:|---|")
+        print("| benchmark | via C | native | native/C | plain C | native/plain C | Rust | native/Rust | output |")
+        print("|---|---:|---:|---:|---:|---:|---:|---:|---|")
         for r in rows:
             pc = fmt(r['plain']) if r['plain'] is not None else "-"
             npc = f"{r['n'] / r['plain']:.2f}" if r['plain'] else "-"
+            rs = fmt(r['rust']) if r['rust'] is not None else "-"
+            nrs = f"{r['n'] / r['rust']:.2f}" if r['rust'] else "-"
             print(f"| {r['name']} | {fmt(r['c'])} | {fmt(r['n'])} | {r['n'] / r['c']:.2f} | "
-                  f"{pc} | {npc} | {r['out']} |")
+                  f"{pc} | {npc} | {rs} | {nrs} | {r['out']} |")
     if a.perf:
         print()
         def m(x):

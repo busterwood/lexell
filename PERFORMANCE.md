@@ -18,10 +18,11 @@ performance comparison is not part of this report: it is in
 This page is the current state: the measured tables and what they say about
 the code today, against external references and in absolute terms. The
 figures are from 7 November 2026, the application suite and Decimal tables
-at `fb50b4f1` and the rest at `b6777cf4`; where a table comes from an earlier
-sweep it says so. Three references could not be re-run in this environment:
-the jq 1.7.1 column, the cmark column of the Markdown table, and the Go and
-Node columns of the HTTP tables.
+at `fb50b4f1`, the rest at `b6777cf4`, and the benchmark table with the Rust
+column measured on the `bench-rust` branch; where a table comes from an
+earlier sweep it says so. Three references could not be re-run in this
+environment: the jq 1.7.1 column, the cmark column of the Markdown table, and
+the Go and Node columns of the HTTP tables.
 
 The host is shared and variable: absolute times for I/O-bound and
 process-heavy tables (eza, grep, Markdown, HTTP, TLS) move by up to 2x
@@ -58,24 +59,30 @@ code here, and the experiments that did not pay — is in
 
 ## Benchmarks
 
-`python3 obx/bench/bench.py --opt --perf -n 11`
-([obx/bench/](obx/bench/README.md)):
+`python3 obx/bench/bench.py --opt -n 11`
+([obx/bench/](obx/bench/README.md)); the instruction and cycle counts quoted
+below are from `--perf`, measuring the Rust binary the same way:
 
-| benchmark | native -O | what it does |
-|---|---:|---|
-| fib | 346 ms | recursive calls |
-| loop | 228 ms | two overflow-checked operations per iteration |
-| array | 100 ms | checked indexing |
-| alloc | 66 ms | 20 million records allocated and freed |
-| lists | 33 ms | linked list build, sum, drop |
-| strings | 46 ms | concatenation and `toStr` |
-| trees | 21 ms | binary trees |
-| tokens | 13 ms | byte scanning and hashing |
-| sieve | 141 ms | the sieve of Eratosthenes to 10 million, ten rounds |
-| maps | 243 ms | `Map[str, int]` with short and long keys, `Map[int, int]` (keyed hashing) |
+| benchmark | native -O | plain C | Rust | native/Rust | native/plain C | what it does |
+|---|---:|---:|---:|---:|---:|---|
+| fib | 347 ms | 348 ms | 349 ms | 0.99 | 1.00 | recursive calls |
+| loop | 229 ms | 230 ms | 460 ms | 0.50 | 0.99 | two overflow-checked operations per iteration |
+| array | 107 ms | 35 ms | 102 ms | 1.05 | 3.01 | checked indexing |
+| alloc | 70 ms | 126 ms | 126 ms | 0.55 | 0.55 | 20 million records allocated and freed |
+| lists | 31 ms | 31 ms | 40 ms | 0.79 | 1.02 | linked list build, sum, drop |
+| strings | 45 ms | 91 ms | 79 ms | 0.57 | 0.49 | concatenation and `toStr` |
+| trees | 20 ms | 24 ms | 25 ms | 0.82 | 0.86 | binary trees |
+| tokens | 12 ms | 11 ms | 12 ms | 1.06 | 1.14 | byte scanning and hashing |
+| sieve | 148 ms | 158 ms | 247 ms | 0.60 | 0.94 | the sieve of Eratosthenes to 10 million, ten rounds |
+| maps | 238 ms | - | - | - | - | `Map[str, int]` with short and long keys, `Map[int, int]` (keyed hashing) |
 
 The hand-written C references are in `obx/bench/c/` (nine programs; `maps`
-has none), built with `gcc -O2`. The same-IR C build's column is in
+has none), built with `gcc -O2`. The Rust ports are in `obx/bench/rust/`, one
+dependency-free Cargo project built once with `cargo build --release
+--offline`; `maps` has no Rust reference either (obx's map is
+insertion-ordered and keyed-hashed, with `u32` index slots, and has no direct
+Rust std equivalent). Their build settings and anti-optimisation rules are in
+[obx/bench/README.md](obx/bench/README.md). The same-IR C build's column is in
 [design/native-vs-c.md](obx/design/native-vs-c.md).
 
 The plain fast-compile path (`--native`, no `-O`) is slower where the loop passes
@@ -98,10 +105,41 @@ code-shape gaps.
   bound is unrelated to the array's length).
 - **The sieve is at plain C's speed.** A hand-written C version with no
   checks (`obx/bench/c/sieve.c`, `gcc -O2`, bench.py's "plain C" column)
-  took 150 ms in the same run (611M cycles). Native obx runs 1,414M
-  instructions in 586M cycles.
-- **fib** is calls and returns: native runs 3,643M instructions in 1,524M
+  took 158 ms in the same run. Native obx runs 1,414M instructions in 626M
   cycles.
+- **fib** is calls and returns: native runs 3,643M instructions in 1,524M
+  cycles. Rust is level on time (349 vs 347 ms) but runs 5,133M instructions:
+  its checked `n - 1` and `n - 2` add the overflow branches that native's
+  backend proves away.
+- **Rust is level on fib, tokens and array.** fib and tokens are the same
+  time as native (349 vs 347 ms, 12 vs 12 ms); Rust's token scanner runs
+  104M instructions against native's 126M. `array` is 102 ms against 107:
+  both keep one bounds check per element.
+- **Rust loses `loop` to checked arithmetic.** It runs 460 ms against 229
+  ms, 11,000M instructions and 2,026M cycles against native's 7,000M and
+  1,004M. `loop` takes `n` from the command line as the C reference does, so
+  LLVM cannot bound `i` and must keep both overflow checks; `loop.obx` has
+  the constant `n = 1000000000`, which native `-O` uses to prove them away.
+  This is the price of obx's checked operations when the source does not
+  give a provable bound.
+- **C's auto-vectorisation is the array gap; checks are the sieve gap.**
+  gcc turns `array`'s inner loop into AVX2 (35 ms, 3.0x native) while Rust's
+  bounds checks keep it scalar (102 ms, level with native's single check).
+  On `sieve`, Rust keeps a bounds check on every `prime[j]` and a checked
+  `j += i`: 247 ms, 2,106M instructions and 1,209M cycles, against native's
+  148 ms and 1,414M/626M; C is 158 ms with no checks.
+- **Rust uses the system allocator.** `alloc` is 126 ms, the same as plain C
+  (126 ms) and 1.8x native (70 ms): libc `malloc`/`free` against the
+  freestanding size-class allocator. `lists` is 40 vs 31 ms (Rust's
+  recursive `Drop` walks the 10,000-node list; C frees it iteratively) and
+  `trees` 25 vs 20 ms.
+- **Strings: `String` and `Rc<str>`.** Native is 45 ms and plain C 91 ms;
+  Rust `String` is 79 ms. The `Rc<str>` version (`dbench strings-rc`, the
+  closer analogue of obx's refcounted `str`) is 128 ms in an interleaved
+  best-of-15 run, 1.6x the `String` version: a safe concatenation builds a
+  `String` and then copies it into a fresh `Rc` allocation, two allocations
+  per `+`, whereas obx makes one refcounted block per `+` in its size-class
+  allocator.
 - **maps** runs 878M cycles and 2,102M instructions. `str`, `i128`, `u128`
   and `Decimal` hash with SipHash-1-3 under a per-process key, and `Map`
   mixes a per-process seed into its slots (lib/README.md, "Keyed hashing").
