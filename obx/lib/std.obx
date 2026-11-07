@@ -975,6 +975,42 @@ fn makeDec(neg: bool, c: U256, exp: int, dscale: int): Result[Decimal, DecError]
     return Ok(Decimal{coef: x, exp: e, dscale: dscale, neg: neg})
 }
 
+// makeDec's body for the operator hot paths: the Decimal directly, with the
+// rare error in err (0 = none). Kept separate from makeDec because the native
+// inliner cannot inline either body, and a Result-returning wrapper around
+// this one adds a copy to addExact/mulExact.
+fn makeDecCore(neg: bool, c: U256, exp: int, dscale: int, err: mut &int): Decimal {
+    if isZeroU(c) { return zeroDec(dscale) }
+    var v = c
+    var e = exp
+    while v.hi != 0 {
+        let d = divSmall(v, 10)
+        if d.r != 0 { err = 3; return zeroDec(dscale) }
+        v = d.q
+        e += 1
+    }
+    var x = v.lo
+    if x % 10 == 0 {
+        while true {   // strip trailing zeros (x != 0), see INV5
+            let q = (x >> 1) *% INV5
+            if (q | (x << 127)) > DIV5_MAX { break }
+            x = q
+            e += 1
+        }
+    }
+    if x > COEF_MAX { err = 3; return zeroDec(dscale) }
+    // digits(x) <= 38 here, so the upper bound only needs the count when the
+    // exponent itself is already above EXP_MAX; otherwise no digits() call.
+    if e < EXP_MIN || e > EXP_MAX && e + digits(x) > EXP_MAX + 38 { err = 1; return zeroDec(dscale) }
+    return Decimal{coef: x, exp: e, dscale: dscale, neg: neg}
+}
+
+// makeDecCore only raises Inexact (3) and Overflow (1).
+fn decErrOf(code: int): DecError {
+    if code == 1 { return DecError.Overflow }
+    return DecError.Inexact
+}
+
 // The number of decimal digits of x (0 for 0): a binary search over the
 // powers of ten (one- to four-digit values first), written out as compares
 // with constants, so no table load and no loop. It is on every path: makeDec,
@@ -1096,9 +1132,45 @@ pub fn (a: Decimal) abs(): Decimal {
     return Decimal{coef: a.coef, exp: a.exp, dscale: a.dscale, neg: false}
 }
 
-pub fn (a: Decimal) add(b: Decimal): Decimal { return orStop(a.addExact(b)) }
-pub fn (a: Decimal) sub(b: Decimal): Decimal { return orStop(a.addExact(b.neg())) }
-pub fn (a: Decimal) mul(b: Decimal): Decimal { return orStop(a.mulExact(b)) }
+pub fn (a: Decimal) add(b: Decimal): Decimal {
+    // Equal exponents are the common add, and a canonical coefficient has at
+    // most 38 digits, so both fit and u128 holds the sum: return the Decimal
+    // directly instead of building a Result and copying it out. Anything else
+    // falls back to the exact operator.
+    let ds = max(a.dscale, b.dscale)
+    if a.coef == 0 { return Decimal{coef: b.coef, exp: b.exp, dscale: ds, neg: b.neg} }
+    if b.coef == 0 { return Decimal{coef: a.coef, exp: a.exp, dscale: ds, neg: a.neg} }
+    if a.exp == b.exp {
+        var err = 0
+        var d = zeroDec(ds)
+        if a.neg == b.neg {
+            d = makeDecCore(a.neg, u256(a.coef + b.coef), a.exp, ds, mut &err)
+        } else if a.coef == b.coef {
+            return zeroDec(ds)
+        } else if a.coef > b.coef {
+            d = makeDecCore(a.neg, u256(a.coef - b.coef), a.exp, ds, mut &err)
+        } else {
+            d = makeDecCore(b.neg, u256(b.coef - a.coef), a.exp, ds, mut &err)
+        }
+        if err != 0 { decStop(decErrOf(err)) }
+        return d
+    }
+    return orStop(a.addExact(b))
+}
+pub fn (a: Decimal) sub(b: Decimal): Decimal { return a.add(b.neg()) }
+pub fn (a: Decimal) mul(b: Decimal): Decimal {
+    // mulExact's body, returning the Decimal directly (see add).
+    var r = zeroDec(0)
+    if a.coef != 0 && b.coef != 0 {
+        var err = 0
+        r = makeDecCore(a.neg != b.neg, mul128(a.coef, b.coef), a.exp + b.exp, 0, mut &err)
+        if err != 0 { decStop(decErrOf(err)) }
+    }
+    var intd = 0
+    if r.coef != 0 { intd = max(0, digits(r.coef) + r.exp) }
+    r.dscale = min(min(a.dscale + b.dscale, DSCALE_MAX), max(0, 38 - intd))
+    return r
+}
 
 // Exact sum, DecError.Inexact if it needs more than 38 digits, DecError.Overflow if the
 // exponent is out of range. Display scale: the larger of the two.
