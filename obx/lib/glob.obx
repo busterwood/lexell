@@ -1,0 +1,238 @@
+// glob: zoxide's path glob syntax, as Rust's `glob` crate compiles it
+// (`Pattern::new`), with the path-aware matching zoxide's `_ZO_EXCLUDE_DIRS`
+// needs.
+//
+//     let p = try glob.compile("cache/**/tmp?.log")
+//     p.matches("cache/a/b/tmpx.log")        // true
+//     p.matches("cache/a/tmp1.log")          // true
+//
+// Syntax, case-sensitive, over Unicode code points:
+// - `?` matches one character except `/`;
+// - `*` matches zero or more characters except `/`;
+// - `**` as a whole path component matches zero or more components, `/`
+//   included; it is an error anywhere else (a**b, **a, ***);
+// - `[abc]`, `[a-z]`, `[!abc]` and `[^abc]` match one character except `/`;
+//   a range is inclusive and ordered by code point; an unclosed set is an
+//   error;
+// - `\` escapes the next character (`\*`, `\?`, `\[`, `\\`); a final `\` is
+//   a literal backslash. This is an extension: the Rust glob crate has no
+//   escape character and treats `\` literally;
+// - an empty pattern matches only the empty string.
+//
+// A path that is not valid UTF-8 is decoded as `strings.decodeAt` does: each
+// invalid part is one U+FFFD, so `?` matches one such part. Matching keeps two
+// rows of a dynamic-programming table, one per path code point; it does not
+// backtrack exponentially.
+//
+// zoxide compiles `_ZO_EXCLUDE_DIRS` entries with `glob::Pattern::new` and
+// matches with `Pattern::matches_path`, whose default options let `*`, `?`
+// and a set match `/`. This module implements the design's path-aware rule
+// instead: only `**` crosses a separator. `[^abc]` is accepted as a synonym
+// for `[!abc]`; Rust's glob crate treats `^` as a set member.
+
+import "strings"
+
+// Why a pattern did not compile: the message and the code-point position.
+pub type Error = value record {
+    pub msg: str
+    pub pos: int
+}
+
+// "Pattern syntax error near position 3: invalid range pattern" (Rust's
+// PatternError Display).
+pub fn (e: Error) toStr(): str {
+    return "Pattern syntax error near position " + intToStr(e.pos) + ": " + e.msg
+}
+
+pub fn (e: Error) eq(other: &Error): bool { return e.msg == other.msg && e.pos == other.pos }
+
+// The error messages of the Rust glob crate (lib.rs).
+const ERR_WILDCARDS = "wildcards are either regular `*` or recursive `**`"
+const ERR_RECURSIVE = "recursive wildcards must form a single path component"
+const ERR_RANGE = "invalid range pattern"
+
+// Token kinds. A literal token holds ch; a set token holds pairs lo, hi.
+const K_LIT = 0
+const K_ANY = 1        // ?
+const K_STAR = 2       // *
+const K_REC = 3        // **
+const K_SET = 4        // [...]
+const K_NOT_SET = 5    // [!...] or [^...]
+
+const SEP = 47          // '/'
+const BANG = 33         // '!'
+const CARET = 94        // '^'
+const DASH = 45         // '-'
+const OPEN = 91         // '['
+const CLOSE = 93        // ']'
+const STAR = 42         // '*'
+const QUESTION = 63     // '?'
+const BACKSLASH = 92    // '\'
+
+type Tok = value record {
+    kind: int
+    ch: int
+    set: []int
+}
+
+// A compiled pattern. Construct it with compile; it is immutable.
+pub type Pattern = record {
+    toks: []Tok
+}
+
+// The characters of a set as inclusive [lo, hi] pairs, greedily: "a-c-e" is
+// a-c then '-' then 'e' (Rust's parse_char_specifiers).
+fn parseSet(cs: &[int]): []int {
+    var set: []int = []
+    var i = 0
+    while i < len(cs) {
+        if i + 3 <= len(cs) && cs[i + 1] == DASH {
+            append(mut &set, cs[i])
+            append(mut &set, cs[i + 2])
+            i += 3
+        } else {
+            append(mut &set, cs[i])
+            append(mut &set, cs[i])
+            i += 1
+        }
+    }
+    return set
+}
+
+// Compiles a pattern. The position in an Error is a code-point index, as in
+// Rust's PatternError.
+pub fn compile(pattern: str): Result[Pattern, Error] {
+    let chars = strings.runes(pattern)
+    var toks: []Tok = []
+    var i = 0
+    while i < len(chars) {
+        let c = chars[i]
+        if c == QUESTION {
+            append(mut &toks, Tok{kind: K_ANY, ch: 0, set: []})
+            i += 1
+        } else if c == STAR {
+            let old = i
+            while i < len(chars) && chars[i] == STAR { i += 1 }
+            let count = i - old
+            if count > 2 {
+                return Err(Error{pos: old + 2, msg: ERR_WILDCARDS})
+            } else if count == 2 {
+                if i == 2 || chars[i - count - 1] == SEP {
+                    if i < len(chars) && chars[i] == SEP {
+                        i += 1
+                    } else if i != len(chars) {
+                        return Err(Error{pos: i, msg: ERR_RECURSIVE})
+                    }
+                } else {
+                    return Err(Error{pos: old - 1, msg: ERR_RECURSIVE})
+                }
+                let n = len(toks)
+                if !(n > 1 && toks[n - 1].kind == K_REC) {
+                    append(mut &toks, Tok{kind: K_REC, ch: 0, set: []})
+                }
+            } else {
+                append(mut &toks, Tok{kind: K_STAR, ch: 0, set: []})
+            }
+        } else if c == OPEN {
+            var done = false
+            let neg = i + 1 < len(chars) && (chars[i + 1] == BANG || chars[i + 1] == CARET)
+            if neg {
+                if i + 4 <= len(chars) {
+                    var j = i + 3
+                    while j < len(chars) && chars[j] != CLOSE { j += 1 }
+                    if j < len(chars) {
+                        append(mut &toks, Tok{kind: K_NOT_SET, ch: 0, set: parseSet(&chars[i + 2..j])})
+                        i = j + 1
+                        done = true
+                    }
+                }
+            } else if i + 3 <= len(chars) {
+                var j = i + 2
+                while j < len(chars) && chars[j] != CLOSE { j += 1 }
+                if j < len(chars) {
+                    append(mut &toks, Tok{kind: K_SET, ch: 0, set: parseSet(&chars[i + 1..j])})
+                    i = j + 1
+                    done = true
+                }
+            }
+            if !done { return Err(Error{pos: i, msg: ERR_RANGE}) }
+        } else if c == BACKSLASH && i + 1 < len(chars) {
+            // An escaped character is literal, including '*', '?' and '['.
+            append(mut &toks, Tok{kind: K_LIT, ch: chars[i + 1], set: []})
+            i += 2
+        } else {
+            append(mut &toks, Tok{kind: K_LIT, ch: c, set: []})
+            i += 1
+        }
+    }
+    return Ok(Pattern{toks: toks})
+}
+
+// Whether a code point is in the [lo, hi] pairs of set.
+fn inSet(set: &[]int, c: int): bool {
+    var i = 0
+    while i < len(set) {
+        if c >= set[i] && c <= set[i + 1] { return true }
+        i += 2
+    }
+    return false
+}
+
+// Whether one non-star token accepts code point c. A separator matches only
+// a literal '/', never '?', a set, or a negated set (zoxide's path-aware
+// rule).
+fn oneMatches(tok: &Tok, c: int): bool {
+    if tok.kind == K_LIT { return tok.ch == c }
+    if c == SEP { return false }
+    if tok.kind == K_ANY { return true }
+    if tok.kind == K_SET { return inSet(&tok.set, c) }
+    return !inSet(&tok.set, c)
+}
+
+// The dynamic-programming matcher: dp[t][s] says tokens[t..] matches
+// text[s..]. The two rows are computed right to left, so `*` and `**` are
+// O(1) per position instead of a recursive walk.
+fn matchToks(toks: &[]Tok, text: &[]int): bool {
+    let n = len(text)
+    var cur: []bool = []
+    var next: []bool = []
+    for i in 0..n + 1 {
+        append(mut &cur, false)
+        append(mut &next, false)
+    }
+    next[n] = true
+    var t = len(toks)
+    while t > 0 {
+        t -= 1
+        let tok = &toks[t]
+        let star = tok.kind == K_STAR || tok.kind == K_REC
+        cur[n] = if star { next[n] } else { false }
+        var s = n
+        while s > 0 {
+            s -= 1
+            if star {
+                var v = next[s]
+                if !v && (tok.kind == K_REC || text[s] != SEP) { v = cur[s + 1] }
+                cur[s] = v
+            } else {
+                cur[s] = oneMatches(tok, text[s]) && next[s + 1]
+            }
+        }
+        for k in 0..n + 1 { next[k] = cur[k] }
+    }
+    return next[0]
+}
+
+// Whether path matches the compiled pattern.
+pub fn (p: &Pattern) matches(path: str): bool {
+    return matchToks(&p.toks, &strings.runes(path))
+}
+
+// compile then matches, with the compile error passed through. The language
+// reserves `match`, so this convenience function is matchPath.
+pub fn matchPath(pattern: str, path: str): Result[bool, Error] {
+    match compile(pattern) {
+        Ok(p) { return Ok(p.matches(path)) }
+        Err(e) { return Err(e) }
+    }
+}
