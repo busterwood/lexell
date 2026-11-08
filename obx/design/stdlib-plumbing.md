@@ -54,7 +54,8 @@ no `~`, no glob, no shell.
 - `lastComponent(p: str): str`
 - `parentOf(p: str): str`
 - `join(a: str, b: str): str`
-- `extension(p: str): str`
+- `ext(p: str): str` - the extension without its dot, as Rust
+  `Path::extension`; `fs.extension` keeps its dot and keeps its name.
 
 The component semantics are Rust's `Path::components`, as obo verified
 against rustc 1.87. `realpath`, `clean` and `abs` are **not** here:
