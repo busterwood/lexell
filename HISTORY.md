@@ -2577,3 +2577,34 @@ share of the small rows than the code difference being measured. The
 `--perf` run at the new sizes gives the cycle ratios in
 design/native-vs-c.md: native is ahead on nine of ten against the C
 backend and `maps` is 1.06 (memory-bound); `fib` is level.
+
+### Standard-library plumbing (2026-11-08)
+
+The example programs in `obx/cmd` had grown their own copies of the small
+Unix/CLI layer that obo kept in `lib/`: option parsing, number padding,
+lexical paths, eza's name order and quoting, errno/debug formatting, chunked
+input, temp/atomic files, user lookup, civil date formatting, Unicode
+classification, endian codecs and base64. Those helpers are library code
+again, ported from `archive/obo/lib` and the newer tools and checked against
+the obo vectors and the differential suites:
+
+- `fmt` (digits/padding/permission string), `paths` (Rust lexical
+  components; `ext` omits the dot), `cli` (the eza/obo option grammar with a
+  structured Error), `unicode` (Unicode 15 classification and simple
+  lowercasing), `errors` (debugPath/osError), `binary` (endian and IEEE bit
+  patterns), `glob` (zoxide's Rust syntax, DP matcher), `base64` (strict and
+  jq-lenient decoders).
+- `io` gained `ChunkReader`/`createExclusive`/`copy`/`count`/`readAll`;
+  `fs` gained `walk`/`createTemp`/`writeAtomic`/`realpath`; `os` gained
+  `environ`/ids/the user database/`tempDir`; `strings` gained
+  natcmp/quoteName/parentPrefix/utf8Error; `time` gained Tm, strftime,
+  strptime and httpDate; `math` gained exact float bit patterns.
+- The compiler imports `os`, `fs`, `io` and `strings`, so the library changes
+  changed its generated C: `compiler/seed/obxc.c` was reseeded and the quick
+  gate passes the fixed point again. `fs.Stat` deliberately gained no
+  atime/ctime fields (changing the record would force another reseed; no
+  caller needs them yet).
+
+The two DB ledger examples needed no changes. The command-line examples were
+then migrated module by module, with each tool's existing golden or
+differential suite as the acceptance test.
