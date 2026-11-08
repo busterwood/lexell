@@ -615,15 +615,9 @@ pub fn lossy(s: str): str {
 // skipped at the top of the outer loop, ASCII digit runs compare naturally and
 // everything else compares by code point (folded for compare_ignore_case).
 // The decoder is decodeAt, so invalid bytes compare as the U+FFFD that eza's
-// lossy decode would produce; a string with any byte >= 0x80 takes the code
-// point loop, while pure ASCII keeps the byte loop (its order is identical).
-
-fn hasHigh(s: str): bool {
-    for i in 0..len(s) {
-        if int(strByte(s, i)) >= 0x80 { return true }
-    }
-    return false
-}
+// lossy decode would produce. One code-point loop handles both forms: an ASCII
+// byte steps without decoding, so there is no separate scan of the whole
+// string before the comparison.
 
 fn isDigitCp(cp: int): bool { return cp >= int('0') && cp <= int('9') }
 
@@ -681,10 +675,16 @@ fn lowerCp(cp: int): int {
 // omits VT and FF, and this comparator must keep the crate's set).
 fn isNatSpace(c: byte): bool { return c == ' ' || (c >= '\t' && c <= '\r') }
 
-// The ASCII byte form of natcmpCore (design Appendix A): fold selects ASCII
-// A..Z folding; digits are unaffected. Whitespace is skipped only at the top
-// of the outer loop, never inside a digit run.
-fn natcmpCore(a: str, b: str, fold: bool): int {
+// The ASCII byte form of the comparison (design Appendix A): fold selects
+// ASCII A..Z folding; digits are unaffected. Whitespace is skipped only at the
+// top of the outer loop, never inside a digit run.
+//
+// The first byte >= 0x80 hands the whole comparison to natcmpUtf8, so a pure
+// ASCII name pays no pre-scan (eza compares names in every sort and tree
+// walk). The hand-off is complete rather than resumable, which keeps the two
+// forms' state machines independent; only a name with non-ASCII bytes pays to
+// restart.
+fn natcmpAscii(a: str, b: str, fold: bool): int {
     var i = 0
     var j = 0
     while true {
@@ -733,6 +733,7 @@ fn natcmpCore(a: str, b: str, fold: bool): int {
         } else {
             var ca = strByte(a, i)
             var cb = strByte(b, j)
+            if ca >= 0x80 || cb >= 0x80 { return natcmpUtf8(a, b, fold) }
             if fold {
                 if ca >= 'A' && ca <= 'Z' { ca = byte(ca + 32) }
                 if cb >= 'A' && cb <= 'Z' { cb = byte(cb + 32) }
@@ -745,15 +746,18 @@ fn natcmpCore(a: str, b: str, fold: bool): int {
     }
 }
 
-// A decoded code point with rune -1 at the end of s.
+// A decoded code point with rune -1 at the end of s. An ASCII byte is the
+// common case in names, so it becomes a one-field step with no UTF-8 decode.
 fn peekDecoded(s: str, i: int): Decoded {
     if i >= len(s) { return Decoded{rune: -1, size: 0, ok: true} }
+    let c = strByte(s, i)
+    if c < 0x80 { return Decoded{rune: int(c), size: 1, ok: true} }
     return decodeAt(s, i)
 }
 
-// natord::compare_iter over decoded code points (fold selects lowerCp). It
-// follows natcmpCore; pa/pb are the current decoded steps, so advancing is an
-// index move plus decodeAt.
+// natord::compare_iter over decoded code points (fold selects lowerCp).
+// pa/pb are the current decoded steps, so advancing is an index move plus a
+// peek (one byte read for ASCII, decodeAt otherwise).
 fn natcmpUtf8(a: str, b: str, fold: bool): int {
     var i = 0
     var j = 0
@@ -826,13 +830,11 @@ fn natcmpUtf8(a: str, b: str, fold: bool): int {
 // eza's name order: natord::compare (case-sensitive) and
 // natord::compare_ignore_case (simple Unicode lowercase). -1, 0 or 1.
 pub fn natcmp(a: str, b: str): int {
-    if !hasHigh(a) && !hasHigh(b) { return natcmpCore(a, b, false) }
-    return natcmpUtf8(a, b, false)
+    return natcmpAscii(a, b, false)
 }
 
 pub fn natcmpFold(a: str, b: str): int {
-    if !hasHigh(a) && !hasHigh(b) { return natcmpCore(a, b, true) }
-    return natcmpUtf8(a, b, true)
+    return natcmpAscii(a, b, true)
 }
 
 // The names used by the stdlib contract for the same eza order.
