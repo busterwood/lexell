@@ -913,7 +913,7 @@ type Eza = record {
     zone: tz.Zone  // dates are shown in this zone ($TZ, else /etc/localtime)
     year: int      // the current year in that zone: dates in it show no year
     me: int        // the real uid: its user name is bold yellow
-    users: []os.User
+    users: []PwEntry
 }
 
 // Writes text in style s, as part of the current run. With colour on, the
@@ -1117,8 +1117,74 @@ fn fixed1(v: float): str {
     return (q / 10).toStr() + "." + (q % 10).toStr()
 }
 
-// The user database comes from os.users(); the first entry with an id is the
-// name eza shows, exactly as the /etc/passwd scan did.
+// The user database: /etc/passwd read directly. The libc getpw* calls in
+// os.users()/os.uid() would make this native binary dynamically linked, which
+// adds about 0.3 ms of loader work to every short listing; eza's own
+// /etc/passwd scan keeps it static.
+type PwEntry = value record {
+    uid: int
+    name: str
+}
+
+fn passwdEntries(): []PwEntry {
+    var out: []PwEntry = []
+    match io.read("/etc/passwd") {
+        Ok(text) {
+            for line in strings.lines(&text) {
+                match strings.cut(line, ":") {
+                    Some(a) {
+                        match strings.cut(a.after, ":") {
+                            Some(b) {
+                                match strings.cut(b.after, ":") {
+                                    Some(c) {
+                                        match strings.parseInt(c.before.toStr()) {
+                                            Ok(id) { append(mut &out, PwEntry{uid: id, name: a.before.toStr()}) }
+                                            Err(_) {}
+                                        }
+                                    }
+                                    None {}
+                                }
+                            }
+                            None {}
+                        }
+                    }
+                    None {}
+                }
+            }
+        }
+        Err(_) {}
+    }
+    return out
+}
+
+// The real uid of this process, from /proc/self/status (0 when unknown).
+fn currentUid(): int {
+    match io.read("/proc/self/status") {
+        Ok(text) {
+            for line in strings.lines(&text) {
+                match strings.cut(line, ":") {
+                    Some(c) {
+                        if c.before == "Uid" {
+                            var it = strings.fieldsIter(c.after)
+                            match it.next() {
+                                Some(f) {
+                                    match strings.parseInt(f.toStr()) {
+                                        Ok(v) { return v }
+                                        Err(_) {}
+                                    }
+                                }
+                                None {}
+                            }
+                        }
+                    }
+                    None {}
+                }
+            }
+        }
+        Err(_) {}
+    }
+    return 0
+}
 
 fn uid(e: &Entry): int { return match e.st { Some(s) { s.uid } None { 0 } } }
 
@@ -1567,8 +1633,8 @@ fn run(): Result[Unit, Fail] {
     let zone = tz.local()
     var z = Eza{o: o, pal: if o.colour { palette() } else { Palette{styles: [], patterns: [], types: false,
         exts: newMap(), names: newMap()} }, w: io.stdout(), open: false, prev: PLAIN,
-        zone: zone, year: zone.localTime(time.unixSeconds()).date.year, me: os.uid(),
-        users: if o.long && !o.numeric && !o.noUser { os.users() } else { [] }}
+        zone: zone, year: zone.localTime(time.unixSeconds()).date.year, me: currentUid(),
+        users: if o.long && !o.numeric && !o.noUser { passwdEntries() } else { [] }}
     let toDir = st.isDir() || (st.isLink() && match fs.stat(operand) { Ok(t) { t.isDir() } Err(_) { false } })
     if o.tree {
         z.tree(operand, st)
