@@ -111,9 +111,12 @@ Priority is what the examples actually call:
 `regex_unicode.inClass`/`simpleFold` and `markdown_unicode.SPACE`/`PUNCT`/
 `FOLD_*` already carry the data. Importing both large modules is a binary
 size risk; prefer the smaller dependency or one shared generated module if
-the integration review agrees. `strings.toLower` delegates to `unicode`.
-`strings.naturalCompare` may keep eza's documented partial folding if that
-is what the eza goldens pin; the difference must be explicit.
+the integration review agrees. `strings.toLower` stays ASCII: no example needs full Unicode lowercasing,
+and importing `unicode` into `strings` would pull the fold tables (about
+135 KB) into every program that only lowercases an extension. Callers that
+need full lowercasing use `unicode.lower` directly. `strings.naturalCompare`
+may keep eza's documented partial folding if that is what the eza goldens
+pin; the difference must be explicit.
 
 ### strings
 
