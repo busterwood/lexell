@@ -1,0 +1,260 @@
+// uuid: RFC 9562 universally unique identifiers.
+//
+// A Uuid is 128 bits in two ints: hi holds the first 8 bytes and lo the last
+// 8, each big-endian. It is a value record (a copy type), so it can be a Map
+// key, a sort value, or compared with eq/cmp/hash. nil is all zeroes and max
+// all ones.
+//
+// parse accepts the canonical 36-character hyphenated form and the bare
+// 32-hex-digit form, upper or lower case; toStr always writes the lowercase
+// canonical form. fromBytes/bytes convert to and from exactly 16 bytes.
+//
+// v4, v5 and v7 get their randomness and SHA-1 from the crypto module, which
+// calls OpenSSL, so a program that uses them links libcrypto (like jq and the
+// other users of crypto). parse, toStr, bytes, version, variant, eq, cmp and
+// hash are plain code and need no C library.
+//
+// Variant (RFC 9562 section 4.1, from the top bits of byte 8):
+//   0xxx -> 0, NCS backwards compatibility
+//   10xx -> 2, RFC 4122/9562 (the variant v4, v5 and v7 use)
+//   110x -> 6, Microsoft
+//   111x -> 7, reserved for future definition
+// version() is the high nibble of byte 6 (0..15).
+//
+// v7 layout (RFC 9562 section 5.7), 48-bit big-endian Unix milliseconds in
+// bytes 0..5, then:
+//   bits 48..51  version 7
+//   bits 52..63  rand_a (12 bits)
+//   bits 64..65  variant 10
+//   bits 66..127 rand_b (62 bits)
+// v7At(ms, tail) takes tail[0..2] as rand_a (tail[0]'s high nibble is unused)
+// and tail[2..10] as rand_b (tail[2]'s top two bits are unused), so a fixed
+// 10-byte tail gives a deterministic UUID for tests.
+
+import "crypto"
+import "time"
+
+// A 128-bit UUID: hi is bytes 0..7 big-endian, lo is bytes 8..15 big-endian.
+pub type Uuid = value record { pub hi: int; pub lo: int }
+
+// Why parse, fromBytes or v7At failed.
+pub type Error = value record { pub msg: str }
+
+pub fn (e: Error) toStr(): str { return "uuid: " + e.msg }
+
+pub fn (e: Error) eq(other: &Error): bool { return e.msg == other.msg }
+
+// The all-zero UUID.
+pub fn nil(): Uuid { return Uuid{hi: 0, lo: 0} }
+
+// The all-ones UUID.
+pub fn max(): Uuid { return Uuid{hi: -1, lo: -1} }
+
+pub fn isNil(u: &Uuid): bool { return u.hi == 0 && u.lo == 0 }
+
+// The unsigned 64 bits of an int (int's signed compare is not what UUID's
+// 128-bit big-endian order needs).
+fn bitsOf(a: int): u64 {
+    if a < 0 { return u64(a & 9223372036854775807) | u64(1) << 63 }
+    return u64(a)
+}
+
+// The int with the 64-bit pattern x (u64 to int is a lossy conversion when
+// the top bit is set, so build the negative two's-complement value directly).
+fn intOfBits(x: u64): int {
+    if x <= 9223372036854775807 { return int(x) }
+    return -1 - int(18446744073709551615 - x)
+}
+
+fn nibble(c: byte): int {
+    if c >= '0' && c <= '9' { return int(c - '0') }
+    if c >= 'a' && c <= 'f' { return int(c - 'a') + 10 }
+    if c >= 'A' && c <= 'F' { return int(c - 'A') + 10 }
+    return -1
+}
+
+// Parses the canonical 36-character form or the bare 32-hex-digit form,
+// either case. The error's message says whether the length is wrong, names
+// the first misplaced hyphen, or names the first byte that is not hex.
+pub fn parse(s: str): Result[Uuid, Error] {
+    let n = len(s)
+    if n != 36 && n != 32 {
+        return Err(Error{msg: "length " + intToStr(n) + ": want 36 or 32"})
+    }
+    var j = 0
+    var hi: u64 = 0
+    var lo: u64 = 0
+    var i = 0
+    while j < n {
+        if n == 36 && (j == 8 || j == 13 || j == 18 || j == 23) {
+            if strByte(s, j) != '-' {
+                return Err(Error{msg: "hyphen expected at byte " + intToStr(j)})
+            }
+            j += 1
+            continue
+        }
+        let a = nibble(strByte(s, j))
+        if a < 0 { return Err(Error{msg: "non-hex at byte " + intToStr(j)}) }
+        let b = nibble(strByte(s, j + 1))
+        if b < 0 { return Err(Error{msg: "non-hex at byte " + intToStr(j + 1)}) }
+        let v = u64(a * 16 + b)
+        if i < 8 { hi = hi << 8 | v } else { lo = lo << 8 | v }
+        i += 1
+        j += 2
+    }
+    return Ok(Uuid{hi: intOfBits(hi), lo: intOfBits(lo)})
+}
+
+// The lowercase canonical 36-character form.
+pub fn (u: &Uuid) toStr(): str {
+    let digits = "0123456789abcdef"
+    var b = newStrBuf()
+    let bs = u.bytes()
+    for i in 0..16 {
+        if i == 4 || i == 6 || i == 8 || i == 10 { b.addByte('-') }
+        b.addByte(strByte(digits, int(bs[i] >> 4)))
+        b.addByte(strByte(digits, int(bs[i] & 15)))
+    }
+    return b.toStr()
+}
+
+// The 16 bytes of u, big-endian, in a new array.
+pub fn (u: &Uuid) bytes(): []byte {
+    var out: []byte = []
+    let hi = bitsOf(u.hi)
+    let lo = bitsOf(u.lo)
+    for k in 0..8 { append(mut &out, byte((hi >> (56 - 8 * k)) & 255)) }
+    for k in 0..8 { append(mut &out, byte((lo >> (56 - 8 * k)) & 255)) }
+    return out
+}
+
+fn uuidOf(b: &[byte]): Uuid {
+    var hi: u64 = 0
+    var lo: u64 = 0
+    for k in 0..8 { hi = hi << 8 | u64(int(b[k])) }
+    for k in 8..16 { lo = lo << 8 | u64(int(b[k])) }
+    return Uuid{hi: intOfBits(hi), lo: intOfBits(lo)}
+}
+
+// The UUID with the 16 bytes of b, big-endian.
+pub fn fromBytes(b: &[byte]): Result[Uuid, Error] {
+    if len(b) != 16 {
+        return Err(Error{msg: "length " + intToStr(len(b)) + ": want 16 bytes"})
+    }
+    return Ok(uuidOf(b))
+}
+
+// The version: the high nibble of byte 6, 0..15.
+pub fn (u: &Uuid) version(): int { return int((bitsOf(u.hi) >> 12) & 15) }
+
+// The variant by the top bits of byte 8; see the module comment for the
+// mapping (0 NCS, 2 RFC, 6 Microsoft, 7 future).
+pub fn (u: &Uuid) variant(): int {
+    let b = int((bitsOf(u.lo) >> 56) & 255)
+    if b & 0x80 == 0 { return 0 }
+    if b & 0xc0 == 0x80 { return 2 }
+    if b & 0xe0 == 0xc0 { return 6 }
+    return 7
+}
+
+// A copy of the 16 bytes with version ver and the RFC variant.
+fn marked(b: &[byte], ver: int): Uuid {
+    var x: []byte = array(16, byte(0))
+    for i in 0..16 { x[i] = b[i] }
+    x[6] = byte((int(x[6]) & 0x0f) | ver << 4)
+    x[8] = byte((int(x[8]) & 0x3f) | 0x80)
+    return uuidOf(&x)
+}
+
+// A random (version 4) UUID from OpenSSL.
+pub fn v4(): Result[Uuid, crypto.Error] {
+    match crypto.randomBytes(16) {
+        Ok(s) {
+            let b = strToBytes(s)
+            return Ok(marked(&b, 4))
+        }
+        Err(e) { return Err(e) }
+    }
+}
+
+// The version 4 UUID with the version and variant bits set in a copy of b.
+pub fn v4From(b: &[byte]): Result[Uuid, Error] {
+    if len(b) != 16 {
+        return Err(Error{msg: "length " + intToStr(len(b)) + ": want 16 bytes"})
+    }
+    return Ok(marked(b, 4))
+}
+
+fn v7Of(ms: int, tail: &[byte]): Uuid {
+    var x: []byte = array(16, byte(0))
+    for k in 0..6 { x[k] = byte((ms >> (40 - 8 * k)) & 0xff) }
+    x[6] = byte(0x70 | (int(tail[0]) & 0x0f))
+    x[7] = tail[1]
+    x[8] = byte(0x80 | (int(tail[2]) & 0x3f))
+    for k in 3..10 { x[k + 6] = tail[k] }
+    return uuidOf(&x)
+}
+
+const MAX_MS = 281474976710655   // 2^48 - 1
+
+// A version 7 UUID at the current time from 10 OpenSSL random bytes.
+// A clock outside v7's 48-bit millisecond range (before 1970 or after the
+// year 10889) stops the program: there is no Error type here to report it.
+pub fn v7(): Result[Uuid, crypto.Error] {
+    let ms = time.unixMillis()
+    if ms < 0 || ms > MAX_MS { panic("uuid: clock outside v7's 48-bit range") }
+    match crypto.randomBytes(10) {
+        Ok(s) {
+            let tail = strToBytes(s)
+            return Ok(v7Of(ms, &tail))
+        }
+        Err(e) { return Err(e) }
+    }
+}
+
+// The version 7 UUID at Unix milliseconds ms from the 10 bytes of tail
+// (tail[0..2] rand_a, tail[2..10] rand_b; see the module comment).
+pub fn v7At(ms: int, tail: &[byte]): Result[Uuid, Error] {
+    if ms < 0 || ms > MAX_MS {
+        return Err(Error{msg: "timestamp " + intToStr(ms) + " outside 48 bits"})
+    }
+    if len(tail) != 10 {
+        return Err(Error{msg: "length " + intToStr(len(tail)) + ": want 10 bytes"})
+    }
+    return Ok(v7Of(ms, tail))
+}
+
+// The version 5 (SHA-1 name-based) UUID of name in namespace, as in RFC 9562
+// section 5.5: the first 16 bytes of SHA-1(namespace bytes || name bytes),
+// with version 5 and the RFC variant.
+pub fn v5(namespace: &Uuid, name: str): Result[Uuid, crypto.Error] {
+    let ns = namespace.bytes()
+    let data = strFromBytes(&ns) + name
+    match crypto.sha1(data) {
+        Ok(d) {
+            let h = strToBytes(d)
+            return Ok(marked(&h, 5))
+        }
+        Err(e) { return Err(e) }
+    }
+}
+
+pub fn (u: &Uuid) eq(other: &Uuid): bool { return u.hi == other.hi && u.lo == other.lo }
+
+// Unsigned 128-bit order: hi first, then lo, each compared as a u64.
+pub fn (u: &Uuid) cmp(other: &Uuid): int {
+    let a = bitsOf(u.hi)
+    let b = bitsOf(other.hi)
+    if a < b { return -1 }
+    if a > b { return 1 }
+    let c = bitsOf(u.lo)
+    let d = bitsOf(other.lo)
+    if c < d { return -1 }
+    if c > d { return 1 }
+    return 0
+}
+
+// Combines both halves; equal UUIDs hash equally.
+pub fn (u: &Uuid) hash(): u64 {
+    return u.hi.hash() +% (u.lo.hash() *% 0x9e3779b97f4a7c15)
+}
