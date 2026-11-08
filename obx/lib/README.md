@@ -38,6 +38,7 @@ for leaks.
 | `binary.obx` | 286 | endian reads/writes over bytes, str, and StrBuf |
 | `glob.obx` | 238 | zoxide's Rust-glob syntax with a DP matcher |
 | `base64.obx` | 107 | standard base64, strict and jq-lenient decoders |
+| `uuid.obx` | 260 | RFC 9562 UUIDs: parse/format, v4/v5/v7, bytes, version/variant |
 | `tz.obx` | 421 | time zones from TZif files (version 2+, 64-bit transitions) and their POSIX footer rules, as glibc applies them: utc, local (TZ or /etc/localtime), fromSpec, load, at, localTime; tested against zoneinfo by `tests/gen_tz.py` |
 | `sqldialect.obx` | 260 | Value, DbError and its codes, SQL fragments with placeholders per dialect, exact decimal text and (p, s) checks |
 | `ffi.obx` | 129 | C memory for modules that call C: owned `Mem` (alloc, cstr, copyBytes), unchecked peek/poke/bytes |
@@ -147,10 +148,13 @@ for leaks.
 - **Map[K: Eq + Hash, V]**: insertion-ordered entries plus an open-addressing
   index. `newMap`, `size`, `has(&k)`, `get(&k): Option[V]` and `getOr(&k, d)`
   (V: copy), `at(k): &V`, `atMut(k): mut &V`, `atOrPut(k, d): mut &V`,
-  `put(k, v)`, `remove(&k): Option[V]`, `clear`, `keyAt(i)`, `valAt(i)`,
+  `put(k, v)`, `remove(&k): Option[V]`, `removeStable(&k): Option[V]`,
+  `clear`, `keyAt(i)`, `valAt(i)`,
   `valAtMut(i)` for walking, `each(fn(k, v) {...})` and `eachMut(fn(k, v)
   {...})` (v is `mut &V`) in insertion order, `keys()`/`values()` (copy
-  types). `remove` moves the last entry into the hole. Slots come from
+  types). `remove` is O(1) and moves the last entry into the hole, so it
+  changes the iteration order; `removeStable` shifts the tail down and keeps
+  it, at O(size). Slots come from
   `(hash ^ seed) * GOLDEN` (the seed per process, above); the index is an
   array of u32 slots, each an entry number with some bits of that mixed hash
   beside it, so a probe passes other keys' slots without loading them. A Map
@@ -230,7 +234,8 @@ insertion point), `lowerBound`, `upperBound`, `find`, `findBy`, `contains`,
 `removeAt(xs, i): T`, `swapRemove`, `retain(xs, pred)`, `dedup`,
 `copyRange(xs, a, b)`, `copyOf`, `extend`, `filter`, `mapTo`.
 **Set[T: Eq + Hash]** (a Map to Unit): `newSet`, `setOf(&xs)`, `size`,
-`isEmpty`, `has`, `add(x): bool`, `remove(&x): bool`, `clear`, `at(i)`,
+`isEmpty`, `has`, `add(x): bool`, `remove(&x): bool` (O(1), order changes),
+`removeStable(&x): bool` (O(size), order kept), `clear`, `at(i)`,
 `each(f)`, `filter(pred): Set[T]`, `items()`, `sorted()`, `union`,
 `intersect`, `minus`, `isSubset`, `eq`.
 **UniqueList[T: Eq + Hash]** is a list of unique elements in insertion order, a port of
@@ -317,6 +322,18 @@ backtracking), and a pattern of plain literals compiles to a direct string
 compare. grep keeps its byte-wise GNU matcher.
 
 ### base64
+### uuid
+
+RFC 9562 identifiers as a two-int value record (`hi`, `lo`), so a Uuid is a
+copy type: a Map key, a sort value, and compared with `eq`/`cmp`/`hash`.
+`parse` accepts the canonical 36-character form or bare 32 hex digits, either
+case; `toStr` writes lowercase canonical. `fromBytes`/`bytes` convert exactly
+16 bytes. `nil`, `max`, `isNil`, `version` and `variant` (0 NCS, 2 RFC,
+6 Microsoft, 7 future) are plain code. `v4` (random), `v5` (SHA-1 name-based)
+and `v7` (48-bit Unix milliseconds + random, RFC 9562 layout) use `crypto`,
+so a program that generates them links libcrypto; `v4From`/`v7At` take fixed
+bytes for tests.
+
 
 `encode(s)` (standard alphabet, padded), `decodeStrict(s): Option[str]` (the
 crypto/pgwire rules: whole groups of four, padding required) and
