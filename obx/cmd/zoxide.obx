@@ -31,13 +31,13 @@
 //   * `query -i` collects every candidate before it starts fzf (zoxide streams
 //     them). fzf is run with zoxide's options; it is not needed otherwise.
 //   * clap's suggestions ("a similar argument exists") are not made.
-//   * A home directory comes from $HOME only (not the password file).
 
 import "io"
 import "fs"
 import "os"
 import "time"
 import "math"
+import "binary"
 import "strings"
 import "proc"
 import "collections"
@@ -502,69 +502,6 @@ fn parseU64(s: str): Result[int, str] {
     return Ok(v)
 }
 
-// x * 2^e, exact when the result is a float (each step is a power of two).
-fn pow2(x: float, e: int): float {
-    var f = x
-    var k = e
-    while k > 0 {
-        let s = if k > 60 { 60 } else { k }
-        f = f * float(1 << s)
-        k -= s
-    }
-    while k < 0 {
-        let s = if k < -60 { 60 } else { -k }
-        f = f / float(1 << s)
-        k += s
-    }
-    return f
-}
-
-// The float with IEEE 754 bits b.
-fn floatOfBits(b: int): float {
-    let e = (b >> 52) & 0x7ff
-    let m = b & 0xfffffffffffff
-    var f: float = 0.0f
-    if e == 0x7ff {
-        f = if m == 0 { math.inf() } else { math.nan() }
-    } else {
-        f = pow2(float(if e == 0 { m } else { m | (1 << 52) }), (if e == 0 { 1 } else { e }) - 1075)
-    }
-    if f != f { return math.nan().copySign(if b < 0 { -1.0f } else { 1.0f }) }
-    return if b < 0 { -f } else { f }
-}
-
-// The IEEE 754 bits of x.
-fn bitsOfFloat(x: float): int {
-    if x != x {
-        return 0x7ff8000000000000 | (if negNaN(x) { 1 << 63 } else { 0 })
-    }
-    var sign = 0
-    if x < 0.0f || (x == 0.0f && 1.0f / x < 0.0f) { sign = 1 << 63 }
-    var a = if x < 0.0f { -x } else { x }
-    if a == 0.0f { return sign }
-    if a == math.inf() { return sign | 0x7ff0000000000000 }
-    var e = 0
-    while a >= 9007199254740992.0f {
-        a = a / 2.0f
-        e += 1
-    }
-    while a < 4503599627370496.0f && e > -1074 {
-        a = a * 2.0f
-        e -= 1
-    }
-    var m = int(a)
-    let biased = e + 1075
-    if m < (1 << 52) || biased <= 0 {
-        // subnormal: m * 2^e with e = -1074
-        while e < -1074 {
-            m = m >> 1
-            e += 1
-        }
-        return sign | m
-    }
-    return sign | (biased << 52) | (m & 0xfffffffffffff)
-}
-
 // The score as zoxide prints it: clamped to 0..9999, one decimal, width 6.
 // Rust rounds the exact value half to even; so does this.
 fn scoreText(x: float): str {
@@ -599,28 +536,6 @@ fn fixed1(x: float): str {
 
 // ---------------------------------------------------------------- UTF-8
 
-// Rust's message for a string that is not UTF-8, or "" when it is.
-fn utf8Error(s: str): str {
-    var i = 0
-    while i < len(s) {
-        if s[i] < 0x80 {
-            i += 1
-            continue
-        }
-        let d = strings.decodeAt(s, i)
-        if d.ok {
-            i += d.size
-            continue
-        }
-        let c = int(s[i])
-        if c < 0xc2 || c > 0xf4 || i + d.size < len(s) {
-            return "invalid utf-8 sequence of " + intToStr(d.size) + " bytes from index " + intToStr(i)
-        }
-        return "incomplete utf-8 byte sequence from index " + intToStr(i)
-    }
-    return ""
-}
-
 // ASCII lower case (zoxide lowercases all of Unicode).
 fn lower(s: str): str {
     return strings.toLower(s)
@@ -648,54 +563,6 @@ fn resolvePath(path: str): str {
         }
     }
     return "/" + strings.join(&stack, "/")
-}
-
-// realpath: Ok(path), or the errno.
-fn realpath(path: str): Result[str, int] {
-    var stack: []str = []
-    var todo: []str = []
-    if len(path) == 0 || path[0] != '/' {
-        for c in splitComps(os.cwd()) { append(mut &todo, c) }
-    }
-    for c in strings.split(&path, "/") { append(mut &todo, c) }
-    // process todo from the front
-    var pos = 0
-    var links = 0
-    while pos < len(todo) {
-        let c = todo[pos]
-        pos += 1
-        if c == "" || c == "." { continue }
-        if c == ".." {
-            if len(stack) > 0 { pop(mut &stack) }
-            continue
-        }
-        let cand = "/" + strings.join(&stack, "/") + (if len(stack) > 0 { "/" } else { "" }) + c
-        match fs.lstat(cand) {
-            Err(e) { return Err(e.errno) }
-            Ok(st) {
-                if st.isLink() {
-                    links += 1
-                    if links > 40 { return Err(40) }
-                    match fs.readlink(cand) {
-                        Err(e) { return Err(e.errno) }
-                        Ok(target) {
-                            var rest: []str = []
-                            for k in pos..len(todo) { append(mut &rest, todo[k]) }
-                            var nt: []str = []
-                            if len(target) > 0 && target[0] == '/' { stack = [] }
-                            for t in strings.split(&target, "/") { append(mut &nt, t) }
-                            for r in rest { append(mut &nt, r) }
-                            todo = nt
-                            pos = 0
-                        }
-                    }
-                } else {
-                    append(mut &stack, c)
-                }
-            }
-        }
-    }
-    return Ok("/" + strings.join(&stack, "/"))
 }
 
 // Path::starts_with: whole components.
@@ -865,32 +732,12 @@ fn homeDir(): Option[str] {
         }
         None {}
     }
-    return passwdHome()
-}
-
-// The home directory of the user in /etc/passwd (getpwuid_r's answer).
-fn passwdHome(): Option[str] {
-    var uid = ""
-    match io.read("/proc/self/status") {
-        Ok(t) {
-            for line in strings.lines(&t) {
-                if startsWith(line, "Uid:") {
-                    let f = strings.fields(&line)
-                    if len(f) > 1 { uid = f[1] }
-                }
-            }
+    // The real user's passwd entry (what zoxide's home_dir fallback reads).
+    match os.userById(os.uid()) {
+        Some(u) {
+            if u.home != "" { return Some(u.home) }
         }
-        Err(_) {}
-    }
-    if uid == "" { return None }
-    match io.read("/etc/passwd") {
-        Ok(t) {
-            for line in strings.lines(&t) {
-                let f = strings.split(&line, ":")
-                if len(f) >= 6 && f[2] == uid && f[5] != "" { return Some(f[5]) }
-            }
-        }
-        Err(_) {}
+        None {}
     }
     return None
 }
@@ -993,16 +840,10 @@ fn (d: &Dir) score(now: int): float {
     return d.rank * 0.25f
 }
 
-fn le(s: str, at: int, n: int): int {
-    var v = 0
-    for k in 0..n { v = v | (int(s[at + k]) << (8 * k)) }
-    return v
-}
-
 fn dbOpen(): Db {
     let dir = dataDir()
     var file = dir + "/db.zo"
-    match realpath(file) {
+    match fs.realpath(file) {
         Ok(p) { file = p }
         Err(_) {}
     }
@@ -1027,7 +868,7 @@ fn badDb(cause: str): never {
 
 fn decode(file: str, s: str): Db {
     if len(s) < 4 { die1("could not deserialize database: corrupted data") }
-    let version = le(s, 0, 4)
+    let version = binary.readU32LEStr(&s, 0)
     if version != DB_VERSION {
         die1("unsupported version (got " + intToStr(version) + ", supports " + intToStr(DB_VERSION) + ")")
     }
@@ -1038,7 +879,7 @@ fn decode(file: str, s: str): Db {
     // the count
     if budget < 8 { badDb(limit) }
     if pos + 8 > len(s) { badDb(eof) }
-    let count = le(s, pos, 8)
+    let count = binary.readI64LEStr(&s, pos)
     pos += 8
     budget -= 8
     var dirs: []Dir = []
@@ -1046,7 +887,7 @@ fn decode(file: str, s: str): Db {
     while n < count || count < 0 {
         if budget < 8 { badDb(limit) }
         if pos + 8 > len(s) { badDb(eof) }
-        let plen = le(s, pos, 8)
+        let plen = binary.readI64LEStr(&s, pos)
         pos += 8
         budget -= 8
         if plen < 0 || plen > len(s) - pos { badDb("io error: ") }
@@ -1054,12 +895,14 @@ fn decode(file: str, s: str): Db {
         let path = s[pos..pos + plen]
         pos += plen
         budget -= plen
-        let bad = utf8Error(path)
-        if bad != "" { badDb("string is not valid utf8: " + bad) }
+        match strings.utf8Error(path) {
+            Some(bad) { badDb("string is not valid utf8: " + bad) }
+            None {}
+        }
         if budget < 16 { badDb(limit) }
         if pos + 16 > len(s) { badDb(eof) }
-        let rank = floatOfBits(le(s, pos, 8))
-        let last = le(s, pos + 8, 8)
+        let rank = math.fromBits(binary.readI64LEStr(&s, pos))
+        let last = binary.readI64LEStr(&s, pos + 8)
         pos += 16
         budget -= 16
         append(mut &dirs, Dir{path: path, rank: rank, last: last})
@@ -1067,10 +910,6 @@ fn decode(file: str, s: str): Db {
     }
     if pos != len(s) { badDb("Slice had bytes remaining after deserialization") }
     return Db{file: file, dirs: dirs, dirty: false}
-}
-
-fn putLe(b: mut &StrBuf, v: int, n: int) {
-    for k in 0..n { b.addByte(byte((v >> (8 * k)) & 0xff)) }
 }
 
 fn tmpName(): str {
@@ -1087,13 +926,13 @@ fn tmpName(): str {
 fn (db: mut &Db) save() {
     if !db.dirty { return }
     var b = newStrBuf()
-    putLe(mut &b, DB_VERSION, 4)
-    putLe(mut &b, len(db.dirs), 8)
+    binary.addU32LE(mut &b, DB_VERSION)
+    binary.addU64LE(mut &b, len(db.dirs))
     for d in db.dirs {
-        putLe(mut &b, len(d.path), 8)
+        binary.addU64LE(mut &b, len(d.path))
         b.add(d.path)
-        putLe(mut &b, bitsOfFloat(d.rank), 8)
-        putLe(mut &b, d.last, 8)
+        binary.addU64LE(mut &b, math.bitsOf(d.rank))
+        binary.addU64LE(mut &b, d.last)
     }
     let tmp = fs.dirName(db.file) + "/" + tmpName()
     match io.write(tmp, b.toStr()) {
@@ -1170,14 +1009,9 @@ fn (db: mut &Db) age(maxAge: float) {
     }
 }
 
-fn negNaN(x: float): bool {
-    let one: float = 1.0f
-    return one.copySign(x) < 0.0f
-}
-
 // f64::total_cmp's key.
 fn totalKey(x: float): int {
-    let i = bitsOfFloat(x)
+    let i = math.bitsOf(x)
     if i < 0 { return i ^ 0x7fffffffffffffff }
     return i
 }
@@ -1323,15 +1157,14 @@ fn cmdAdd(a: &Args) {
     for arg in a.pos {
         var path = ""
         if resolveSymlinksOn() {
-            match realpath(arg) {
+            match fs.realpath(arg) {
                 Ok(p) { path = p }
-                Err(en) { dieIo("could not resolve path: " + arg, en) }
+                Err(e) { dieIo("could not resolve path: " + arg, e.errno) }
             }
         } else {
             path = resolvePath(arg)
         }
-        let bad = utf8Error(path)
-        if bad != "" { die1("invalid unicode in path: " + path) }
+        if strings.utf8Error(path).isSome() { die1("invalid unicode in path: " + path) }
         if strings.indexOfByte(path, '\n', 0) >= 0 || strings.indexOfByte(path, '\r', 0) >= 0 { continue }
         var skip = false
         for g in excl {
@@ -1506,7 +1339,7 @@ fn cmdImport(a: &Args) {
         Ok(s) { buffer = s }
         Err(e) { dieIo("could not open database for importing: " + path, e.errno) }
     }
-    if utf8Error(buffer) != "" {
+    if strings.utf8Error(buffer).isSome() {
         die(["could not open database for importing: " + path, "stream did not contain valid UTF-8"])
     }
     var db = dbOpen()
