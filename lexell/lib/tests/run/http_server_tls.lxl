@@ -1,0 +1,113 @@
+// httpserver: HTTPS (design/http-server.md S2): serveTls accepts a TLS
+// connection and serves HTTP/1.1 over it, with keep-alive and a body both
+// ways. The certificates are made at test time (skipped without the openssl
+// command).
+// needs: ssl
+// expect: GET: 200 hello
+// expect: keep-alive: 3 requests
+// expect: POST: POST /echo 5 hello
+// expect: h2 only: refused
+// expect: stop: bye
+// expect: stopped: accepted 2, requests 5, open 0, rejected 0, timeouts 0, gone 0, errors 0
+import "task"
+import "net"
+import "strings"
+import "http"
+import "tls"
+import "httpserver"
+import "../support/tlstest" as tt
+
+type App = value record { name: str }
+
+fn hello(app: &App, rq: mut &httpserver.Request, w: mut &httpserver.Response): Result[Unit, httpserver.Error] {
+    return w.text("hello\n")
+}
+
+fn echo(app: &App, rq: mut &httpserver.Request, w: mut &httpserver.Response): Result[Unit, httpserver.Error] {
+    let body = try rq.text(1000)
+    return w.text(rq.method + " " + rq.path + " " + intToStr(len(body)) + " " + body + "\n")
+}
+
+fn stop(app: &App, rq: mut &httpserver.Request, w: mut &httpserver.Response): Result[Unit, httpserver.Error] {
+    rq.stopServer()
+    w.header("Connection", "close")
+    return w.text("bye\n")
+}
+
+fn routes(): httpserver.Router[App] {
+    var r = httpserver.router[App]()
+    r.handle("GET /hello", hello)
+    r.handle("GET /stop", stop)
+    r.handle("POST /echo", echo)
+    return r
+}
+
+type Job = record {
+    ln: net.Listener
+    ctx: tls.Context
+    app: App
+    r: httpserver.Router[App]
+    cfg: httpserver.Config
+}
+
+fn serveJob(j: Job): str {
+    let Job{ln: ln, ctx: ctx, app: app, r: r, cfg: cfg} = move(j)
+    match httpserver.serveTls(ln, ctx, app, r, cfg) {
+        Ok(s) { return s.toStr() }
+        Err(e) { return "error: " + e.toStr() }
+    }
+}
+
+fn portOf(addr: str): str {
+    return strings.cut(&addr, ":").unwrap().after
+}
+
+fn main() {
+    tt.pki()
+    let out = task.scoped(fn(s: mut &task.Scope): str {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let port = portOf(ln.localAddr())
+        var cfg = httpserver.defaults()
+        cfg.signals = false
+        cfg.logFd = -1
+        let job = Job{ln: ln, ctx: tt.serverContext("srv"), app: App{name: "app"}, r: routes(), cfg: cfg}
+        let srv = s.start(serveJob, job)
+        var o = http.defaults()
+        var to = tt.clientOptions()
+        to.alpn = "http/1.1"
+        o.tls = to
+        let c = http.newClient(o)
+        let base = "https://localhost:" + port
+        match c.get(base + "/hello") {
+            Ok(r) { println("GET: " + intToStr(r.status) + " " + strings.trimRight(r.text().unwrap())) }
+            Err(e) { println("GET: " + e.toStr()) }
+        }
+        var ok = 0
+        for i in 0..2 {
+            match c.get(base + "/hello") {
+                Ok(_) { ok += 1 }
+                Err(_) {}
+            }
+        }
+        println("keep-alive: " + intToStr(ok + 1) + " requests")
+        match c.post(base + "/echo", "text/plain", "hello") {
+            Ok(r) { println("POST: " + strings.trimRight(r.text().unwrap())) }
+            Err(e) { println("POST: " + e.toStr()) }
+        }
+        var o2 = http.defaults()
+        var to2 = tt.clientOptions()
+        to2.alpn = "h2"
+        o2.tls = to2
+        let c2 = http.newClient(o2)
+        match c2.get(base + "/hello") {
+            Ok(_) { println("h2 only: connected") }
+            Err(_) { println("h2 only: refused") }
+        }
+        match c.get(base + "/stop") {
+            Ok(r) { println("stop: " + strings.trimRight(r.text().unwrap())) }
+            Err(e) { println("stop: " + e.toStr()) }
+        }
+        return srv.wait().unwrap()
+    })
+    println("stopped: " + out)
+}

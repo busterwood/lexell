@@ -1,6 +1,6 @@
 # An HTTP server library for Lexell
 
-Status: design agreed 2026-11-03 (section 8 records the decisions); S1 starts after the client's H1 merges. Nothing here is built yet. It builds on
+Status: design agreed 2026-11-03 (section 8 records the decisions); S1 is built (section 9), and S2's TLS core and parts of S4 (forms, multipart, SSE) are built (section 9.5). It builds on
 stage C1 and C2 of [concurrency.md](concurrency.md) (tasks, `net`,
 `blocking` externs, `task.workers`) and on [http-client.md](http-client.md)
 (phase H1: the shared request-head parser in `lib/http.lxl`; phase H2: TLS
@@ -1173,9 +1173,41 @@ The gates at the end of S1, all passing:
 
 ### 9.4 Left for S2 to S4
 
-- S2: TLS and ALPN.
+- S2: SNI certificate selection, session tickets made before a fork, a
+  handshake cap, HSTS, and the TLS rows of section 3.6 beyond the defaults.
 - S3: HTTP/2.
 - S4, the extras of section 7, plus what S1 left out (section 9.1):
-  `maxBlocking`, `publicOrigin`, `w.hint`, cookies, `traceparent`, the
-  JSON log, SSE keep-alive comments, `basicLimits` and `cors`, per-IP
-  limits across workers, the `unwrap` lint.
+  `maxBlocking`, `publicOrigin`, `w.hint`, a `Cookie` type, `traceparent`,
+  the JSON log, `basicLimits` and `cors`, per-IP limits across workers,
+  static files, compression, WebSockets, the `unwrap` lint.
+
+### 9.5 S2 TLS and the first S4 extras, as built
+
+`httpserver.lxl` gained `serveTls(ln, ctx, app, r, cfg)`: a `tls.Context`
+made by `tls.server(options)` with a certificate and key; the handshake
+parks on the connection's task, bounded by `headerTimeoutMs`, and a failure
+closes without an HTTP reply.
+Because one SSL object serves both directions, the request and response
+sides share it through a small box: each call takes it, parks, and gives it
+back. HTTP/1.1 is sequential, so this is enough; a second task that reaches
+the same side while it is taken gets an error. `tls.lxl` gained the server
+ALPN callback: it selects `http/1.1` when the client offers it and aborts a
+client that offers only `h2` (`no_application_protocol`). `net` gained
+`Conn.writeStalled`, `Conn.cancelOnHangup`, `Conn.fd` and `ReadHalf.fd`.
+
+S4 so far:
+
+- **Forms and multipart** (`rq.form(limit)`): urlencoded fields, or
+  multipart fields and files, with `filename*` (RFC 5987 UTF-8), the
+  parameter and part limits (`maxParams`, `maxParts`, `maxPartHeaders`,
+  `maxPartHeadBytes`), strict part headers through `http.parseFields`, and
+  415 for another media type. The body is held in memory.
+- **SSE**: `w.eventWith(id, name, data)`, `w.retry(ms)`, `w.comment(text)`
+  and `w.keepAlive()`; `lib/sse.lxl`'s `Feed` is a broadcast hub with one
+  slot for an event published before a waiter arrives, and `wait(ms)` tells
+  a keep-alive timeout (`Ok(None)`) from cancellation or an enclosing
+  deadline (`Err`).
+
+Tests: `http_server_forms.lxl`, `http_server_sse.lxl`, and
+`http_server_tls.lxl` (TLS 1.2/1.3 through the test PKI, keep-alive, a
+body both ways, ALPN `http/1.1`, and an `h2`-only client refused).

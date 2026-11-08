@@ -1,0 +1,105 @@
+// httpserver: server-sent events (design/http-server.md 2.8 and S4):
+// startEvents, eventWith's id, retry, comment and keep-alive, the sse.Feed
+// hub, and an event id with a line break refused.
+// expect: events: 200 closed
+// expect:   200 [: welcome\n\nid: 7\nevent: tick\ndata: one\n\nretry: 2500\n\n:\n\ndata: two\ndata: lines\n\n] text/event-stream no-store
+// expect: hub: 200 closed
+// expect:   200 [id: 9\nevent: hub\ndata: from task\n\n] text/event-stream no-store
+// expect: timeout: 200 closed
+// expect:   200 [:\n\n] text/event-stream no-store
+// expect: bad id: 500 closed
+// expect:   500 [500 Internal Server Error\n] text/plain; charset=utf-8 no-store
+// expect: stop: 200 closed
+// expect:   200 [bye\n] text/plain; charset=utf-8
+// expect: stopped: accepted 5, requests 5, open 0, rejected 0, timeouts 0, gone 0, errors 1
+import "task"
+import "net"
+import "strings"
+import "sse"
+import "httpserver" as http
+import "../support/srvtest" as t
+import "../support/srvrun" as sr
+
+type App = value record { feed: sse.Feed }
+
+fn events(app: &App, rq: mut &http.Request, w: mut &http.Response): Result[Unit, http.Error] {
+    try w.startEvents()
+    try w.comment("welcome")
+    try w.eventWith("7", "tick", "one")
+    try w.retry(2500)
+    try w.keepAlive()
+    return w.event("", "two\nlines")
+}
+
+fn hub(app: &App, rq: mut &http.Request, w: mut &http.Response): Result[Unit, http.Error] {
+    try w.startEvents()
+    app.feed.publish(sse.Event{id: "9", name: "hub", data: "from task"})
+    match app.feed.wait(100, here()) {
+        Ok(v) {
+            match v {
+                Some(ev) { return w.eventWith(ev.id, ev.name, ev.data) }
+                None { return w.keepAlive() }
+            }
+        }
+        Err(_) { return Ok(Unit{}) }
+    }
+}
+
+fn timeout(app: &App, rq: mut &http.Request, w: mut &http.Response): Result[Unit, http.Error] {
+    try w.startEvents()
+    match app.feed.wait(10, here()) {
+        Ok(v) {
+            match v {
+                Some(ev) { return w.eventWith(ev.id, ev.name, ev.data) }
+                None { return w.keepAlive() }
+            }
+        }
+        Err(_) { return Ok(Unit{}) }
+    }
+}
+
+fn bad(app: &App, rq: mut &http.Request, w: mut &http.Response): Result[Unit, http.Error] {
+    return w.eventWith("a\nb", "x", "y")
+}
+
+fn routes(): http.Router[App] {
+    var r = http.router[App]()
+    r.handle("GET /events", events)
+    r.handle("GET /hub", hub)
+    r.handle("GET /timeout", timeout)
+    r.handle("GET /bad", bad)
+    r.handle("POST /stop", sr.stop[App])
+    return r
+}
+
+fn esc(s: str): str {
+    return strings.replaceAll(strings.replaceAll(s, "\r", "\\r"), "\n", "\\n")
+}
+
+fn show(name: str, g: &t.Got) {
+    println(name + ": " + t.codes(g))
+    for r in t.replies(g) {
+        var line = "  " + intToStr(r.code) + " [" + esc(r.body) + "] " + t.header(&r, "content-type")
+        let cc = t.header(&r, "cache-control")
+        if len(cc) > 0 { line = line + " " + cc }
+        println(line)
+    }
+}
+
+fn get(path: str): str { return "GET " + path + " HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n" }
+
+fn main() {
+    let feed = sse.newFeed()
+    let out = task.scoped(fn(s: mut &task.Scope): str {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let a = ln.localAddr()
+        let srv = s.start(sr.serveJob[App], sr.Job[App]{ln: ln, app: App{feed: feed}, r: routes(), cfg: sr.config()})
+        show("events", &t.talk(a, get("/events"), 3000))
+        show("hub", &t.talk(a, get("/hub"), 3000))
+        show("timeout", &t.talk(a, get("/timeout"), 3000))
+        show("bad id", &t.talk(a, get("/bad"), 3000))
+        show("stop", &t.talk(a, "POST /stop HTTP/1.1\r\nHost: test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", 3000))
+        return srv.wait().unwrap()
+    })
+    println("stopped: " + out)
+}

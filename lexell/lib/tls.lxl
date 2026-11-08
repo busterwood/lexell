@@ -66,6 +66,7 @@ extern "ssl" fn SSL_CTX_use_certificate_chain_file(c: ptr, f: str): i32
 extern "ssl" fn SSL_CTX_use_PrivateKey_file(c: ptr, f: str, kind: i32): i32
 extern "ssl" fn SSL_CTX_check_private_key(c: ptr): i32
 extern "ssl" fn SSL_CTX_set_alpn_protos(c: ptr, p: &[]byte, n: u32): i32
+extern "ssl" fn SSL_CTX_set_alpn_select_cb(c: ptr, cb: extern fn(ptr, ptr, ptr, ptr, u32, ptr): i32, arg: ptr)
 extern "ssl" fn SSL_new(c: ptr): ptr
 extern "ssl" fn SSL_free(s: ptr)
 extern "ssl" fn SSL_set_bio(s: ptr, r: ptr, w: ptr)
@@ -151,6 +152,10 @@ const EAGAIN = 11
 pub const WANT_INPUT = -1
 
 var OPEN: int = 0
+
+// The one protocol a server selects in ALPN until HTTP/2 (S3) exists. It is
+// a global so the C callback can point OpenSSL at it.
+var ALPN_HTTP11: once Option[ffi.Mem]
 
 // The number of Context and Engine values (a Conn holds one Engine) not
 // yet dropped.
@@ -331,6 +336,36 @@ fn normalPins(s: str): Result[str, str] {
     return Ok(out)
 }
 
+// OpenSSL's ALPN select callback for a server: "http/1.1" when the client
+// offers it, otherwise SSL_TLSEXT_ERR_ALERT_FATAL (2). The protocol bytes
+// live in ALPN_HTTP11 for as long as the process.
+fn alpnSelect(ssl: ptr, out: ptr, outlen: ptr, inp: ptr, inlen: u32, arg: ptr): i32 {
+    let wire = strToBytes("http/1.1")
+    var i = 0
+    while i < int(inlen) {
+        let n = int(ffi.peek(inp, i))
+        if i + 1 + n > int(inlen) { return 2 }
+        if n == len(wire) {
+            var same = true
+            for j in 0..n {
+                if ffi.peek(inp, i + 1 + j) != wire[j] { same = false; break }
+            }
+            if same {
+                match ALPN_HTTP11.get() {
+                    Some(m) {
+                        ffi.pokePtr(out, 0, m.ptr())
+                        ffi.poke(outlen, 0, byte(len(wire)))
+                        return 0
+                    }
+                    None { return 2 }
+                }
+            }
+        }
+        i += 1 + n
+    }
+    return 2
+}
+
 // ALPN's wire form: each protocol after its length byte.
 fn alpnWire(s: str): Result[[]byte, str] {
     var b: []byte = []
@@ -428,6 +463,10 @@ fn newContext(o: &Options, server: bool): Result[Context, Error] {
         if SSL_CTX_set_alpn_protos(h, &wire, u32(len(wire))) != 0 {    // 0 is success here
             return Err(queueFail(Kind.Config, "cannot set the ALPN protocols", ""))
         }
+    }
+    if server {
+        if !ALPN_HTTP11.isSet() { ALPN_HTTP11.set(Some(ffi.copyBytes("http/1.1"))) }
+        SSL_CTX_set_alpn_select_cb(h, alpnSelect, nullPtr())
     }
     ERR_clear_error()
     return Ok(c)
@@ -852,10 +891,21 @@ fn leftMs(dl: int): int {
 
 // Sends the engine's output, parking while the socket's buffer is full.
 fn (c: mut &Conn) flush(w: Where, dl: int): Result[Unit, Error] {
+    return c.flushStall(w, dl, 0)
+}
+
+// flush, with a no-progress limit of stallMs for each socket write (0: none).
+fn (c: mut &Conn) flushStall(w: Where, dl: int, stallMs: int): Result[Unit, Error] {
     while true {
         let n = c.e.output(mut &c.buf)
         if n == 0 { return Ok(Unit{}) }
-        let sent = if dl < 0 { c.sock.write(&c.buf[0..n], w) } else { c.sock.writeFor(&c.buf[0..n], leftMs(dl), w) }
+        let sent = if stallMs > 0 {
+            c.sock.writeStalled(&c.buf[0..n], stallMs, w)
+        } else if dl < 0 {
+            c.sock.write(&c.buf[0..n], w)
+        } else {
+            c.sock.writeFor(&c.buf[0..n], leftMs(dl), w)
+        }
         match sent {
             Ok(_) {}
             Err(x) { return Err(ioFail(x, c.e.host)) }
@@ -989,6 +1039,28 @@ pub fn (c: mut &Conn) writeStr(s: str, w: Where): Result[Unit, Error] {
     let b = strToBytes(s)
     return c.write(&b, w)
 }
+
+// write, failing with ETIMEDOUT when the peer takes none of the plaintext
+// for stallMs milliseconds in a row (0: no limit); there is no limit on the
+// whole write.
+pub fn (c: mut &Conn) writeStalled(data: &[byte], stallMs: int, w: Where): Result[Unit, Error] {
+    if c.e.state == ST_HANDSHAKE { try c.handshakeD(w, -1) }
+    var off = 0
+    while off < len(data) {
+        let n = min(len(data) - off, CHUNK)
+        try c.e.write(data[off..off + n])
+        off += n
+        try c.flushStall(w, -1, stallMs)
+    }
+    return Ok(Unit{})
+}
+
+// The socket's descriptor, for a transport that also watches for a hangup.
+pub fn (c: &Conn) fd(): int { return c.sock.fd() }
+
+// Arms net's hangup cancellation on the underlying socket, for a transport
+// that has split the TLS connection.
+pub fn (c: &Conn) cancelOnHangup(halfClose: bool): net.HangupGuard { return c.sock.cancelOnHangup(halfClose) }
 
 // Sends close_notify (parking until it is written); reading still works,
 // until the peer's close_notify reads as 0.

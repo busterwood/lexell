@@ -576,6 +576,41 @@ pub fn (c: &Conn) writeFor(data: &[byte], ms: int, w: Where): Result[Unit, io.Io
     return Ok(Unit{})
 }
 
+// write, failing with ETIMEDOUT when the peer takes none of the data for
+// stallMs milliseconds in a row (0: no limit). There is no limit on the
+// whole write.
+pub fn (c: &Conn) writeStalled(data: &[byte], stallMs: int, w: Where): Result[Unit, io.IoError] {
+    let k = rtCheck(w.cstr())
+    if k != 0 { return Err(stopped(k, "write", c.addr)) }
+    var off = 0
+    while off < len(data) {
+        let n = rtWrite(c.fd, data[off..], len(data) - off)
+        if n >= 0 {
+            off += n
+        } else if n == -EAGAIN {
+            var r = 0
+            if stallMs > 0 {
+                let old = rtWithin(stallMs)
+                r = rtWait(c.fd, 1, w.cstr())
+                rtRestore(old)
+            } else {
+                r = rtWait(c.fd, 1, w.cstr())
+            }
+            if r != 0 { return Err(stopped(r, "write", c.addr)) }
+        } else if n != -EINTR {
+            return Err(io.ioError(-n, "write", c.addr))
+        }
+    }
+    return Ok(Unit{})
+}
+
+// The descriptor, for a transport that wraps this connection (tls) and must
+// watch the same socket.
+pub fn (c: &Conn) fd(): int { return c.fd }
+
+// cancelOnHangup for the whole connection, before it is split.
+pub fn (c: &Conn) cancelOnHangup(halfClose: bool): HangupGuard { return hangup(c.fd, halfClose) }
+
 // SO_KEEPALIVE on or off; with on, the idle time before the first probe, the
 // interval between probes (seconds) and the number of lost probes before the
 // connection is dropped, each only when above 0 (else the system's). For a
@@ -917,6 +952,9 @@ pub fn (h: &ReadHalf) readNow(buf: mut &[byte]): Result[int, io.IoError] {
 // The peer's address ("" once it is gone).
 pub fn (h: &ReadHalf) peerAddr(): str { return sockText(h.fd, 1) }
 
+// The descriptor, for a transport that watches the same socket for a hangup.
+pub fn (h: &ReadHalf) fd(): int { return h.fd }
+
 // The peer's address as accept saw it (no system call).
 pub fn (h: &ReadHalf) remote(): str { return h.addr }
 
@@ -933,10 +971,14 @@ pub fn (h: &ReadHalf) localAddr(): str { return sockText(h.fd, 0) }
 // read: data that arrives stays for the reader. A server arms it while a
 // handler runs, so that the handler's next call that can park returns
 // Cancelled when the client has gone.
+pub fn hangup(fd: int, halfClose: bool): HangupGuard {
+    let seen = rtHangup(fd, 4)
+    let r = rtHangup(fd, if halfClose && (seen & 1) == 0 { 3 } else { 2 })
+    return HangupGuard{fd: fd}
+}
+
 pub fn (h: &ReadHalf) cancelOnHangup(halfClose: bool): HangupGuard {
-    let seen = rtHangup(h.fd, 4)
-    let r = rtHangup(h.fd, if halfClose && (seen & 1) == 0 { 3 } else { 2 })
-    return HangupGuard{fd: h.fd}
+    return hangup(h.fd, halfClose)
 }
 
 // Writes data from the reading side: a protocol's short interim reply

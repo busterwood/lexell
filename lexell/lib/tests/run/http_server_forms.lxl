@@ -1,0 +1,122 @@
+// httpserver: application/x-www-form-urlencoded and multipart/form-data
+// parsing (design/http-server.md 3.7 and S4): fields, repeated names,
+// files, filename*, the parameter and part limits, a body of another type,
+// and a malformed multipart body.
+// expect: urlencoded: 200 closed
+// expect:   200 [values 4 a=[one] b=[x y!] a=[two] c=[é] files 0\n] text/plain; charset=utf-8
+// expect: too many fields: 400 closed
+// expect:   400 [400 Bad Request\n] text/plain; charset=utf-8
+// expect: multipart: 200 closed
+// expect:   200 [values 2 a=[one] b=[two] files 1 up=café.txt:13:file contents\n] text/plain; charset=utf-8
+// expect: multipart file: 200 closed
+// expect:   200 [up café.txt file contents\n] text/plain; charset=utf-8
+// expect: filename*: 200 closed
+// expect:   200 [up café.txt star\n] text/plain; charset=utf-8
+// expect: too many parts: 413 closed
+// expect:   413 [413 Content Too Large\n] text/plain; charset=utf-8
+// expect: wrong type: 415 closed
+// expect:   415 [415 Unsupported Media Type\n] text/plain; charset=utf-8
+// expect: no boundary: 400 closed
+// expect:   400 [400 Bad Request\n] text/plain; charset=utf-8
+// expect: unterminated: 400 closed
+// expect:   400 [400 Bad Request\n] text/plain; charset=utf-8
+// expect: small limit: 413 closed
+// expect:   413 [413 Content Too Large\n] text/plain; charset=utf-8
+// expect: stop: 200 closed
+// expect:   200 [bye\n] text/plain; charset=utf-8
+// expect: stopped: accepted 11, requests 11, open 0, rejected 0, timeouts 0, gone 0, errors 0
+import "task"
+import "net"
+import "strings"
+import "httpserver" as http
+import "../support/srvtest" as t
+import "../support/srvrun" as sr
+
+type App = value record { name: str }
+
+fn formRoute(app: &App, rq: mut &http.Request, w: mut &http.Response): Result[Unit, http.Error] {
+    let f = try rq.form(100000)
+    var b = newStrBuf()
+    b.add("values " + f.size().toStr())
+    for i in 0..f.size() {
+        let p = f.at(i)
+        b.add(" " + p.name + "=[" + p.value + "]")
+    }
+    b.add(" files " + f.fileCount().toStr())
+    for i in 0..f.fileCount() {
+        let fl = f.fileAt(i)
+        b.add(" " + fl.field + "=" + fl.filename + ":" + intToStr(len(fl.data)) + ":" + strFromBytes(&fl.data))
+    }
+    return w.text(b.toStr() + "\n")
+}
+
+fn fileRoute(app: &App, rq: mut &http.Request, w: mut &http.Response): Result[Unit, http.Error] {
+    let f = try rq.form(100000)
+    match f.file("up") {
+        Some(fl) { return w.text("up " + fl.filename + " " + strFromBytes(&fl.data) + "\n") }
+        None { return w.text("no file\n") }
+    }
+}
+
+fn smallRoute(app: &App, rq: mut &http.Request, w: mut &http.Response): Result[Unit, http.Error] {
+    let f = try rq.form(10)
+    return w.text("values " + f.size().toStr() + "\n")
+}
+
+fn routes(): http.Router[App] {
+    var r = http.router[App]()
+    r.handle("POST /form", formRoute)
+    r.handle("POST /file", fileRoute)
+    r.handle("POST /small", smallRoute)
+    r.handle("POST /stop", sr.stop[App])
+    return r
+}
+
+fn esc(s: str): str {
+    return strings.replaceAll(strings.replaceAll(strings.replaceAll(s, "\r", "\\r"), "\n", "\\n"), "\x00", "\\0")
+}
+
+fn show(name: str, g: &t.Got) {
+    println(name + ": " + t.codes(g))
+    for r in t.replies(g) {
+        println("  " + intToStr(r.code) + " [" + esc(r.body) + "] " + t.header(&r, "content-type"))
+    }
+}
+
+fn post(path: str, ct: str, body: str): str {
+    return "POST " + path + " HTTP/1.1\r\nHost: test\r\nContent-Type: " + ct + "\r\nContent-Length: " +
+        intToStr(len(body)) + "\r\nConnection: close\r\n\r\n" + body
+}
+
+fn main() {
+    let out = task.scoped(fn(s: mut &task.Scope): str {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let a = ln.localAddr()
+        var cfg = sr.config()
+        cfg.maxParams = 4
+        cfg.maxParts = 3
+        let srv = s.start(sr.serveJob[App], sr.Job[App]{ln: ln, app: App{name: "app"}, r: routes(), cfg: cfg})
+        show("urlencoded", &t.talk(a, post("/form", "application/x-www-form-urlencoded", "a=one&b=x+y%21&a=two&c=%C3%A9"), 3000))
+        show("too many fields", &t.talk(a, post("/form", "application/x-www-form-urlencoded", "a=1&b=2&c=3&d=4&e=5"), 3000))
+        let mp = "--XyZ\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\none\r\n" +
+            "--XyZ\r\nContent-Disposition: form-data; name=\"b\"\r\n\r\ntwo\r\n" +
+            "--XyZ\r\nContent-Disposition: form-data; name=\"up\"; filename=\"caf\xC3\xA9.txt\"\r\n" +
+            "Content-Type: text/plain\r\n\r\nfile contents\r\n--XyZ--\r\n"
+        show("multipart", &t.talk(a, post("/form", "multipart/form-data; boundary=XyZ", mp), 3000))
+        show("multipart file", &t.talk(a, post("/file", "multipart/form-data; boundary=XyZ", mp), 3000))
+        let mpstar = "--XyZ\r\nContent-Disposition: form-data; name=\"up\"; filename*=UTF-8''caf%C3%A9.txt\r\n\r\nstar\r\n--XyZ--\r\n"
+        show("filename*", &t.talk(a, post("/file", "multipart/form-data; boundary=XyZ", mpstar), 3000))
+        let tooMany = "--XyZ\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\n1\r\n" +
+            "--XyZ\r\nContent-Disposition: form-data; name=\"b\"\r\n\r\n2\r\n" +
+            "--XyZ\r\nContent-Disposition: form-data; name=\"c\"\r\n\r\n3\r\n" +
+            "--XyZ\r\nContent-Disposition: form-data; name=\"d\"\r\n\r\n4\r\n--XyZ--\r\n"
+        show("too many parts", &t.talk(a, post("/form", "multipart/form-data; boundary=XyZ", tooMany), 3000))
+        show("wrong type", &t.talk(a, post("/form", "text/plain", "hello"), 3000))
+        show("no boundary", &t.talk(a, post("/form", "multipart/form-data", mp), 3000))
+        show("unterminated", &t.talk(a, post("/form", "multipart/form-data; boundary=XyZ", "--XyZ\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\none"), 3000))
+        show("small limit", &t.talk(a, post("/small", "application/x-www-form-urlencoded", "a=123456789012345"), 3000))
+        show("stop", &t.talk(a, post("/stop", "application/x-www-form-urlencoded", ""), 3000))
+        return srv.wait().unwrap()
+    })
+    println("stopped: " + out)
+}

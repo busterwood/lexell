@@ -1,0 +1,118 @@
+// sse: a broadcast hub for server-sent events. A Feed is shared by the
+// handlers that stream events and the tasks that publish them; each wait
+// gets the next event, or Ok(None) after its timeout so the handler can
+// write a keep-alive comment.
+//
+//     var feed = sse.newFeed()
+//     r.handle("GET /events", events)
+//
+//     fn events(app: &App, rq: mut &http.Request, w: mut &http.Response): Result[Unit, http.Error] {
+//         try w.startEvents()
+//         while true {
+//             match app.feed.wait(15000, here()) {
+//                 Ok(v) {
+//                     match v {
+//                         Some(ev) { try w.eventWith(ev.id, ev.name, ev.data) }
+//                         None { try w.keepAlive() }
+//                     }
+//                 }
+//                 Err(_) { return Ok(Unit{}) }
+//             }
+//         }
+//     }
+//
+// The hub is per process: a worker's Feed is its own, so a publisher must
+// be in the same worker (or the events must come through a database, a
+// socket, or another shared source). With no waiter, one published event is
+// kept for the next wait.
+import "task"
+import "time"
+
+// One server-sent event: an id, a name and data.
+pub type Event = value record {
+    pub id: str
+    pub name: str
+    pub data: str
+}
+
+type Waiter = record {
+    id: int
+    p: task.Promise[Event]
+}
+
+type State = record {
+    waiters: []Waiter
+    nextId: int
+    last: Option[Event]   // one slot for an event published before a waiter arrived
+}
+
+// A counted handle to one hub: copying it reaches the same waiters.
+pub type Feed = value record { sh: task.Shared[State] }
+
+pub fn newFeed(): Feed {
+    return Feed{sh: task.shared(State{waiters: [], nextId: 0, last: None})}
+}
+
+// Gives ev to every task waiting at this moment. With none waiting, ev is
+// kept in one slot, so the next wait returns it at once.
+pub fn (f: &Feed) publish(ev: Event) {
+    var ws: []Waiter = []
+    f.sh.with(fn(s: mut &State) {
+        if len(s.waiters) > 0 {
+            ws = replace(mut &s.waiters, [])
+            s.last = None
+        } else {
+            s.last = Some(ev)
+        }
+    })
+    while len(ws) > 0 {
+        let Waiter{id: _, p: pr} = pop(mut &ws)
+        var p = pr
+        p.complete(ev)
+    }
+}
+
+// Waits for the next event for at most ms milliseconds. Ok(None) means the
+// time passed; Err is the task being cancelled or an enclosing deadline.
+pub fn (f: &Feed) wait(ms: int, at: Where): Result[Option[Event], task.Cancelled] {
+    var fut: Option[task.Future[Event]] = None
+    var ready: Option[Event] = None
+    var id = 0
+    f.sh.with(fn(s: mut &State) {
+        ready = replace(mut &s.last, None)
+        if ready.isNone() {
+            s.nextId += 1
+            id = s.nextId
+            let task.Handoff{promise: pr, future: fv} = task.promise[Event]()
+            append(mut &s.waiters, Waiter{id: id, p: pr})
+            fut = Some(fv)
+        }
+    })
+    match replace(mut &ready, None) {
+        Some(ev) { return Ok(Some(ev)) }
+        None {}
+    }
+    let fv = match replace(mut &fut, None) {
+        Some(x) { x }
+        None { return Ok(None) }
+    }
+    let began = time.monotonicNs()
+    match fv.waitFor(ms, at) {
+        Ok(ev) { return Ok(Some(ev)) }
+        Err(c) {
+            // It timed out or was cancelled. If it is still queued, leave;
+            // if publish took it, the event was dropped with the future.
+            f.sh.with(fn(s: mut &State) {
+                for i in 0..len(s.waiters) {
+                    if s.waiters[i].id == id {
+                        for j in i..len(s.waiters) - 1 { swap(mut &s.waiters, j, j + 1) }
+                        let gone = pop(mut &s.waiters)
+                        break
+                    }
+                }
+            })
+            if c.toStr() == "timeout" && (time.monotonicNs() - began) / 1000000 >= ms { return Ok(None) }
+            return Err(c)
+        }
+    }
+}

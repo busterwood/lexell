@@ -37,6 +37,8 @@ import "task"
 import "io"
 import "time"
 import "strings"
+import "url"
+import "tls"
 
 extern "c" fn rtWithin(ms: int): int as "lxllib_task_within"
 extern "c" fn rtRestore(old: int) as "lxllib_task_restore"
@@ -103,12 +105,6 @@ pub fn check[T, E: Show](r: Result[T, E], status: int): Result[T, Error] {
     }
 }
 
-// The Error of a failed socket call.
-fn ioErr(e: &io.IoError, what: str): Error {
-    if e.isTimeout() { return errOf(503, ErrorKind.Timeout, what + ": " + e.toStr()) }
-    return errOf(499, ErrorKind.Gone, what + ": " + e.toStr())
-}
-
 // ---------------------------------------------------------------- configuration
 
 // Every limit and timeout (design/http-server.md section 3.4). defaults()
@@ -131,7 +127,10 @@ pub type Config = record {
     pub maxTargetBytes: int      // the request target: 414
     pub maxBody: int             // a route's request body unless RouteOpts says: 413
     pub maxDrain: int            // an unread body up to this is read and dropped to keep the connection
-    pub maxParams: int           // query parameters: 400
+    pub maxParams: int           // query and form parameters: 400
+    pub maxParts: int            // multipart parts: 413
+    pub maxPartHeaders: int      // one part's header lines: 413
+    pub maxPartHeadBytes: int    // one part's headers: 413
     pub maxTrailerBytes: int     // a chunked body's trailers
     pub maxTrailers: int
     pub memBudget: int           // buffered bytes in this worker; past it new requests get 503
@@ -153,7 +152,8 @@ pub fn defaults(): Config {
         bodyGraceMs: 10000, bodyMinRate: 1024, writeStallMs: 30000, deadlineMs: 30000, drainMs: 30000,
         maxConns: 10000, maxConnsPerIp: 0, maxRequestsPerConn: 1000,
         maxHeadBytes: 16384, maxHeaders: 100, maxLineBytes: 8192, maxTargetBytes: 8192,
-        maxBody: 1048576, maxDrain: 262144, maxParams: 1000, maxTrailerBytes: 8192, maxTrailers: 32,
+        maxBody: 1048576, maxDrain: 262144, maxParams: 1000, maxParts: 1000, maxPartHeaders: 64,
+        maxPartHeadBytes: 16384, maxTrailerBytes: 8192, maxTrailers: 32,
         memBudget: 536870912, fdMargin: 64, acceptBatch: 16,
         deferAccept: true, cancelOnHalfClose: true, signals: true,
         hosts: [], redirectHosts: [], trustedProxies: [], logFd: 1}
@@ -186,6 +186,9 @@ type Limits = value record {
     maxBody: int
     maxDrain: int
     maxParams: int
+    maxParts: int
+    maxPartHeaders: int
+    maxPartHeadBytes: int
     maxTrailerBytes: int
     maxTrailers: int
     cancelOnHalfClose: bool
@@ -196,7 +199,8 @@ fn limitsOf(c: &Config): Limits {
         bodyMinRate: c.bodyMinRate, writeStallMs: c.writeStallMs, deadlineMs: c.deadlineMs,
         maxRequestsPerConn: c.maxRequestsPerConn, maxHeadBytes: c.maxHeadBytes, maxHeaders: c.maxHeaders,
         maxLineBytes: c.maxLineBytes, maxTargetBytes: c.maxTargetBytes, maxBody: c.maxBody, maxDrain: c.maxDrain,
-        maxParams: c.maxParams, maxTrailerBytes: c.maxTrailerBytes, maxTrailers: c.maxTrailers,
+        maxParams: c.maxParams, maxParts: c.maxParts, maxPartHeaders: c.maxPartHeaders,
+        maxPartHeadBytes: c.maxPartHeadBytes, maxTrailerBytes: c.maxTrailerBytes, maxTrailers: c.maxTrailers,
         cancelOnHalfClose: c.cancelOnHalfClose}
 }
 
@@ -716,6 +720,217 @@ const C_CRLF = 2       // the CRLF after a chunk's data
 const C_DONE = 3
 
 // A request, as its handler sees it.
+// ---------------------------------------------------------------- transport
+//
+// A request owns the reading side and a response the writing side. For a
+// plain socket those are net's halves. For TLS, one SSL object is both, so
+// the two sides share it through a box: each call takes it, parks if it
+// has to, and gives it back. One connection's task uses it sequentially;
+// a second task that reaches the same side while it is taken gets an error
+// (the HTTP/1.1 server never does).
+
+type ConnError = value record {
+    timeout: bool
+    cancelled: bool
+    msg: str
+}
+
+fn (e: ConnError) toStr(): str { return e.msg }
+fn (e: ConnError) isTimeout(): bool { return e.timeout }
+fn (e: ConnError) isCancelled(): bool { return e.cancelled }
+
+fn ioConn(e: &io.IoError): ConnError {
+    return ConnError{timeout: e.isTimeout(), cancelled: e.isCancelled(), msg: e.toStr()}
+}
+
+fn tlsConn(e: &tls.Error): ConnError {
+    return ConnError{timeout: e.isTimeout(), cancelled: e.isCancelled(), msg: e.toStr()}
+}
+
+fn connErr(e: &ConnError, what: str): Error {
+    if e.timeout { return errOf(503, ErrorKind.Timeout, what + ": " + e.msg) }
+    return errOf(499, ErrorKind.Gone, what + ": " + e.msg)
+}
+
+type TlsBox = record {
+    c: Option[tls.Conn]
+    busy: bool
+}
+
+type ReadConn = record {
+    plain: Option[net.ReadHalf]
+    box: Option[task.Shared[TlsBox]]
+    fd: int
+    addr: str
+}
+
+type WriteConn = record {
+    plain: Option[net.WriteHalf]
+    box: Option[task.Shared[TlsBox]]
+    addr: str
+}
+
+type Locked = record {
+    box: task.Shared[TlsBox]
+    c: Option[tls.Conn]
+}
+
+fn takeTls(b: &task.Shared[TlsBox], at: Where): Result[Locked, ConnError] {
+    var got: Option[tls.Conn] = None
+    b.with(fn(x: mut &TlsBox) {
+        if !x.busy && x.c.isSome() {
+            x.busy = true
+            got = replace(mut &x.c, None)
+        }
+    })
+    match replace(mut &got, None) {
+        Some(c) { return Ok(Locked{box: b, c: Some(c)}) }
+        None { return Err(ConnError{timeout: false, cancelled: false, msg: "the TLS connection is in use by another task"}) }
+    }
+}
+
+fn (l: mut &Locked) release() {
+    var c = replace(mut &l.c, None)
+    let b = l.box
+    b.with(fn(x: mut &TlsBox) {
+        x.c = replace(mut &c, None)
+        x.busy = false
+    })
+}
+
+fn (l: mut &Locked) drop() { l.release() }
+
+fn (l: mut &Locked) read(buf: mut &[byte], at: Where): Result[int, ConnError] {
+    match replace(mut &l.c, None) {
+        Some(taken) {
+            var c = taken
+            let r = c.read(buf, at)
+            l.c = Some(c)
+            return match r {
+                Ok(n) { Ok(n) }
+                Err(e) { Err(tlsConn(&e)) }
+            }
+        }
+        None { return Err(ConnError{timeout: false, cancelled: false, msg: "the TLS connection is not held"}) }
+    }
+}
+
+fn (l: mut &Locked) writeStalled(data: &[byte], ms: int, at: Where): Result[Unit, ConnError] {
+    match replace(mut &l.c, None) {
+        Some(taken) {
+            var c = taken
+            let r = c.writeStalled(data, ms, at)
+            l.c = Some(c)
+            return match r {
+                Ok(_) { Ok(Unit{}) }
+                Err(e) { Err(tlsConn(&e)) }
+            }
+        }
+        None { return Err(ConnError{timeout: false, cancelled: false, msg: "the TLS connection is not held"}) }
+    }
+}
+
+fn (l: mut &Locked) shutdown(at: Where): Result[Unit, ConnError] {
+    match replace(mut &l.c, None) {
+        Some(taken) {
+            var c = taken
+            let r = c.shutdown(at)
+            l.c = Some(c)
+            return match r {
+                Ok(_) { Ok(Unit{}) }
+                Err(e) { Err(tlsConn(&e)) }
+            }
+        }
+        None { return Err(ConnError{timeout: false, cancelled: false, msg: "the TLS connection is not held"}) }
+    }
+}
+
+fn (c: &ReadConn) read(buf: mut &[byte], at: Where): Result[int, ConnError] {
+    match &c.plain {
+        Some(h) {
+            return match h.read(buf, at) {
+                Ok(n) { Ok(n) }
+                Err(e) { Err(ioConn(&e)) }
+            }
+        }
+        None {}
+    }
+    match &c.box {
+        Some(b) {
+            var l = try takeTls(&b, at)
+            return l.read(buf, at)
+        }
+        None {}
+    }
+    return Err(ConnError{timeout: false, cancelled: false, msg: "a connection with no reading side"})
+}
+
+fn (c: &ReadConn) writeInterim(data: &[byte], at: Where): Result[Unit, ConnError] {
+    match &c.plain {
+        Some(h) {
+            return match h.writeInterim(data, at) {
+                Ok(_) { Ok(Unit{}) }
+                Err(e) { Err(ioConn(&e)) }
+            }
+        }
+        None {}
+    }
+    match &c.box {
+        Some(b) {
+            var l = try takeTls(&b, at)
+            return l.writeStalled(data, 0, at)
+        }
+        None {}
+    }
+    return Err(ConnError{timeout: false, cancelled: false, msg: "a connection with no reading side"})
+}
+
+fn (c: &ReadConn) cancelOnHangup(halfClose: bool): net.HangupGuard {
+    return net.hangup(c.fd, halfClose)
+}
+
+fn (c: &ReadConn) remote(): str { return c.addr }
+
+fn (c: &WriteConn) writeStalled(data: &[byte], stallMs: int, at: Where): Result[Unit, ConnError] {
+    match &c.plain {
+        Some(h) {
+            return match h.writeStalled(data, stallMs, at) {
+                Ok(_) { Ok(Unit{}) }
+                Err(e) { Err(ioConn(&e)) }
+            }
+        }
+        None {}
+    }
+    match &c.box {
+        Some(b) {
+            var l = try takeTls(&b, at)
+            return l.writeStalled(data, stallMs, at)
+        }
+        None {}
+    }
+    return Err(ConnError{timeout: false, cancelled: false, msg: "a connection with no writing side"})
+}
+
+fn (c: &WriteConn) closeWrite(at: Where): Result[Unit, ConnError] {
+    match &c.plain {
+        Some(h) {
+            return match h.closeWrite() {
+                Ok(_) { Ok(Unit{}) }
+                Err(e) { Err(ioConn(&e)) }
+            }
+        }
+        None {}
+    }
+    match &c.box {
+        Some(b) {
+            var l = try takeTls(&b, at)
+            return l.shutdown(at)
+        }
+        None {}
+    }
+    return Err(ConnError{timeout: false, cancelled: false, msg: "a connection with no writing side"})
+}
+
 pub type Request = record {
     pub method: str        // as sent, a token
     pub path: str          // decoded once (section 3.2); rawTarget() gives it as sent
@@ -735,7 +950,7 @@ pub type Request = record {
     notes: []http.Header
     trailers: http.Headers
     allow: str
-    conn: net.ReadHalf
+    conn: ReadConn
     buf: []byte
     r: int                 // unread bytes: buf[r..n]
     n: int
@@ -907,7 +1122,7 @@ pub fn (rq: mut &Request) read(buf: mut &[byte], at: Where): Result[int, Error] 
                 Ok(_) {}
                 Err(e) {
                     rq.broken = true
-                    return Err(ioErr(&e, "100 Continue"))
+                    return Err(connErr(&e, "100 Continue"))
                 }
             }
         }
@@ -992,6 +1207,280 @@ pub fn (rq: mut &Request) text(limit: int, at: Where): Result[str, Error] {
     return Ok(s)
 }
 
+// ---------------------------------------------------------------- forms
+
+// A file part of a multipart/form-data body. `field` is its form field's
+// name (the Content-Disposition "name"), `filename` the name the client
+// sent, headers the part's own header lines, and data its bytes. The
+// filename is untrusted: never use it as a path without checking it.
+pub type File = record {
+    pub field: str
+    pub filename: str
+    pub headers: http.Headers
+    pub data: []byte
+}
+
+// A parsed form body: the pairs of an application/x-www-form-urlencoded
+// body, or the fields and files of a multipart/form-data body. Repeated
+// names keep their order.
+pub type Form = record {
+    pairs: url.Query
+    files: []File
+}
+
+// The first value of name, if the form has one.
+pub fn (f: &Form) get(name: str): Option[str] { return f.pairs.get(name) }
+
+// Every value of name, in order.
+pub fn (f: &Form) values(name: str): []str { return f.pairs.all(name) }
+
+pub fn (f: &Form) size(): int { return f.pairs.size() }
+
+pub fn (f: &Form) at(i: int): url.Param { return f.pairs.at(i) }
+
+pub fn (f: &Form) fileCount(): int { return len(f.files) }
+
+pub fn (f: &Form) fileAt(i: int): &File { return &f.files[i] }
+
+// The first file whose field is name.
+pub fn (f: &Form) file(name: str): Option[&File] {
+    for i in 0..len(f.files) {
+        if f.files[i].field == name { return Some(&f.files[i]) }
+    }
+    return None
+}
+
+// Reads and parses a form body. The media type decides the parser:
+// application/x-www-form-urlencoded, or multipart/form-data (whose fields
+// must be UTF-8; a part with a filename is a File and may hold any bytes).
+// The body is bounded by `limit` and the route's maxBody; the parameter
+// and part counts by Config.maxParams and Config.maxParts. A body of
+// another type is 415. The body is parsed into memory, so a file part is
+// held whole: raise RouteOpts.maxBody only for a body that fits.
+pub fn (rq: mut &Request) form(limit: int, at: Where): Result[Form, Error] {
+    let ct = rq.headers.get("Content-Type").unwrapOr("")
+    let mt = mediaType(ct)
+    if mt == "application/x-www-form-urlencoded" {
+        let body = try rq.text(limit, at)
+        let q = match url.parseQuery(body) {
+            Ok(q) { q }
+            Err(_) { return Err(error(400, "a form body that is not valid percent-encoded UTF-8")) }
+        }
+        if q.size() > rq.lim.maxParams { return Err(error(400, "more than " + intToStr(rq.lim.maxParams) + " form parameters")) }
+        return Ok(Form{pairs: q, files: []})
+    }
+    if mt == "multipart/form-data" {
+        let boundary = try boundaryOf(ct)
+        let body = try rq.bytes(limit, at)
+        return parseMultipart(&body, boundary, rq.lim)
+    }
+    return Err(errOf(415, ErrorKind.Client, "a form body of media type \"" + mt + "\""))
+}
+
+// The media type of a Content-Type (or Content-Disposition) value: the
+// part before the first ';', trimmed and lower-cased.
+fn mediaType(s: str): str {
+    let semi = strings.indexOf(s, ";", 0)
+    let head = if semi < 0 { s } else { s[..semi] }
+    return strings.toLowerAscii(strings.trim(head))
+}
+
+// A header value's parameters (after its leading token), with quoted
+// strings unescaped. The leading token itself is not returned.
+type HeaderParams = record {
+    base: str
+    params: []url.Param
+}
+
+// Parses `token; name=value; name="a; b"` (Content-Type and
+// Content-Disposition). An unterminated quote, a parameter without a
+// value, or a control character is an error.
+fn headerParams(s: str): Result[HeaderParams, str] {
+    var i = 0
+    while i < len(s) && s[i] != ';' { i += 1 }
+    let base = strings.toLowerAscii(strings.trim(s[..i]))
+    var ps: []url.Param = []
+    while i < len(s) {
+        i += 1
+        while i < len(s) && (s[i] == ' ' || s[i] == '\t') { i += 1 }
+        let start = i
+        while i < len(s) && s[i] != '=' && s[i] != ';' { i += 1 }
+        let name = strings.toLowerAscii(strings.trim(s[start..i]))
+        var value = ""
+        if i < len(s) && s[i] == '=' {
+            i += 1
+            while i < len(s) && (s[i] == ' ' || s[i] == '\t') { i += 1 }
+            if i < len(s) && s[i] == '"' {
+                i += 1
+                var b = newStrBuf()
+                var quoted = false
+                while i < len(s) {
+                    let c = s[i]
+                    if c == '"' { quoted = true; i += 1; break }
+                    if c == '\\' && i + 1 < len(s) {
+                        i += 1
+                        b.addByte(s[i])
+                    } else {
+                        if (c < byte(0x20) && c != '\t') || c == byte(0x7f) { return Err("a control character in a parameter") }
+                        b.addByte(c)
+                    }
+                    i += 1
+                }
+                if !quoted { return Err("an unterminated quoted parameter") }
+                value = b.toStr()
+            } else {
+                let vs = i
+                while i < len(s) && s[i] != ';' { i += 1 }
+                value = strings.trim(s[vs..i])
+            }
+        } else if len(name) > 0 {
+            return Err("a parameter without a value")
+        }
+        if len(name) > 0 { append(mut &ps, url.Param{name: name, value: value}) }
+        while i < len(s) && s[i] != ';' { i += 1 }
+    }
+    return Ok(HeaderParams{base: base, params: ps})
+}
+
+fn paramOf(h: &HeaderParams, name: str): Option[str] {
+    for p in h.params {
+        if p.name == name { return Some(p.value) }
+    }
+    return None
+}
+
+// The boundary of a multipart Content-Type, checked against RFC 2046's
+// bcharsnospace (1 to 70 characters).
+fn boundaryOf(ct: str): Result[str, Error] {
+    let h = match headerParams(ct) {
+        Ok(h) { h }
+        Err(m) { return Err(error(400, "a malformed Content-Type: " + m)) }
+    }
+    let b = match paramOf(&h, "boundary") {
+        Some(b) { b }
+        None { return Err(error(400, "a multipart body without a boundary")) }
+    }
+    if len(b) == 0 || len(b) > 70 { return Err(error(400, "a multipart boundary of " + intToStr(len(b)) + " characters")) }
+    for i in 0..len(b) {
+        let c = b[i]
+        if !(strings.isAlnum(c) || c == '\'' || c == '(' || c == ')' || c == '+' || c == '_' || c == ',' || c == '-' ||
+             c == '.' || c == '/' || c == ':' || c == '=' || c == '?') {
+            return Err(error(400, "a multipart boundary with an invalid character"))
+        }
+    }
+    return Ok(b)
+}
+
+// Finds needle in hay from `from`; -1 when it is not there.
+fn indexBytes(hay: &[byte], needle: &[byte], from: int): int {
+    if len(needle) == 0 { return from }
+    var i = from
+    while i + len(needle) <= len(hay) {
+        var j = 0
+        while j < len(needle) && hay[i + j] == needle[j] { j += 1 }
+        if j == len(needle) { return i }
+        i += 1
+    }
+    return -1
+}
+
+fn copyBytes(b: &[byte]): []byte {
+    var out: []byte = array(len(b), byte(0))
+    for i in 0..len(b) { out[i] = b[i] }
+    return out
+}
+
+// RFC 5987's filename*=UTF-8''...: the charset must be UTF-8 and the
+// percent-decoded value valid UTF-8.
+fn extendedName(v: str): Result[str, str] {
+    let sep = strings.indexOf(v, "''", 0)
+    if sep < 0 { return Err("a filename* without ''") }
+    let charset = strings.toLowerAscii(v[..sep])
+    if charset != "utf-8" { return Err("a filename* in a charset other than UTF-8") }
+    let raw = match url.decode(v[sep + 2..]) {
+        Ok(s) { s }
+        Err(_) { return Err("a filename* that is not valid percent-encoded UTF-8") }
+    }
+    if !strings.isValidUtf8(raw) { return Err("a filename* that is not UTF-8") }
+    return Ok(raw)
+}
+
+// Parses a multipart/form-data body. A preamble before the first boundary
+// and an epilogue after the last are ignored, as RFC 2046 allows.
+fn parseMultipart(body: &[byte], boundary: str, lim: Limits): Result[Form, Error] {
+    let delim = strToBytes("--" + boundary)
+    let inner = strToBytes("\r\n--" + boundary)
+    let blank = strToBytes("\r\n\r\n")
+    var at = indexBytes(body, &delim, 0)
+    if at < 0 { return Err(error(400, "a multipart body without its boundary")) }
+    at += len(delim)
+    var pairs = url.newQuery()
+    var files: []File = []
+    var parts = 0
+    while true {
+        // after a delimiter: "--" ends the body, else optional spaces and CRLF
+        if at + 1 < len(body) && body[at] == '-' && body[at + 1] == '-' {
+            return Ok(Form{pairs: pairs, files: files})
+        }
+        while at < len(body) && (body[at] == ' ' || body[at] == '\t') { at += 1 }
+        if at + 1 >= len(body) || body[at] != '\r' || body[at + 1] != '\n' {
+            return Err(error(400, "a multipart boundary not followed by CRLF"))
+        }
+        at += 2
+        parts += 1
+        if parts > lim.maxParts { return Err(errOf(413, ErrorKind.Limit, "more than " + intToStr(lim.maxParts) + " multipart parts")) }
+        let he = indexBytes(body, &blank, at)
+        if he < 0 { return Err(error(400, "a multipart part without the end of its headers")) }
+        if he - at > lim.maxPartHeadBytes {
+            return Err(errOf(413, ErrorKind.Limit, "a multipart part with headers over " + intToStr(lim.maxPartHeadBytes) + " bytes"))
+        }
+        var hs = http.newHeaders()
+        match http.parseFields(strFromBytes(&body[at..he]), 0, mut &hs, lim.maxPartHeaders) {
+            Ok(_) {}
+            Err(m) { return Err(error(400, "a multipart part's headers: " + m)) }
+        }
+        at = he + 4
+        let de = indexBytes(body, &inner, at)
+        if de < 0 { return Err(error(400, "a multipart part without its closing boundary")) }
+        let data = body[at..de]
+        at = de + len(inner)
+        let cd = hs.get("Content-Disposition").unwrapOr("")
+        let hp = match headerParams(cd) {
+            Ok(h) { h }
+            Err(m) { return Err(error(400, "a part's Content-Disposition: " + m)) }
+        }
+        if hp.base != "form-data" { return Err(error(400, "a part that is not form-data")) }
+        let name = match paramOf(&hp, "name") {
+            Some(n) { n }
+            None { return Err(error(400, "a multipart part without a name")) }
+        }
+        var filename = paramOf(&hp, "filename")
+        match paramOf(&hp, "filename*") {
+            Some(v) {
+                filename = Some(match extendedName(v) {
+                    Ok(n) { n }
+                    Err(m) { return Err(error(400, "a part's filename*: " + m)) }
+                })
+            }
+            None {}
+        }
+        match filename {
+            Some(fname) {
+                append(mut &files, File{field: name, filename: fname, headers: hs, data: copyBytes(data)})
+            }
+            None {
+                let s = strFromBytes(data)
+                if !strings.isValidUtf8(s) { return Err(error(400, "a multipart field that is not UTF-8")) }
+                pairs.add(name, s)
+                if pairs.size() > lim.maxParams {
+                    return Err(error(400, "more than " + intToStr(lim.maxParams) + " form parameters"))
+                }
+            }
+        }
+    }
+    return Err(error(400, "a multipart body without its closing boundary"))
+}
+
 // An error that loses the body's framing: the connection closes after it.
 fn (rq: mut &Request) badBody(status: int, msg: str): Error {
     rq.broken = true
@@ -1046,7 +1535,7 @@ fn (rq: mut &Request) fill(at: Where): Result[Unit, Error] {
             if e.isTimeout() && rq.bodyDeadline >= 0 && nowMs() >= rq.bodyDeadline - 1 {
                 return Err(errOf(408, ErrorKind.Timeout, "the body came too slowly"))
             }
-            return Err(ioErr(&e, "reading the body"))
+            return Err(connErr(&e, "reading the body"))
         }
     }
 }
@@ -1586,7 +2075,7 @@ const M_EMPTY = 4      // no body (HEAD, 204, 304)
 // buffered; a response finished by the server whose head was not yet
 // written gets a Content-Length, others are chunked.
 pub type Response = record {
-    conn: net.WriteHalf
+    conn: WriteConn
     code: int              // 0: not set (200)
     final: int             // the status the head was written with
     headers: http.Headers
@@ -1832,8 +2321,22 @@ pub fn (w: mut &Response) startEvents(at: Where): Result[Unit, Error] {
 
 // Writes one event (its name, then data's lines) and flushes it.
 pub fn (w: mut &Response) event(name: str, data: str, at: Where): Result[Unit, Error] {
+    return w.eventWith("", name, data, at)
+}
+
+// Writes one event with an id, a name and data, and flushes it. An id may
+// not contain CR, LF or NUL; a name may not contain CR or LF.
+pub fn (w: mut &Response) eventWith(id: str, name: str, data: str, at: Where): Result[Unit, Error] {
     if strings.indexOf(name, "\n", 0) >= 0 || strings.indexOf(name, "\r", 0) >= 0 { return Err(error(500, "an event name with a line break")) }
+    if strings.indexOf(id, "\n", 0) >= 0 || strings.indexOf(id, "\r", 0) >= 0 || strings.indexOf(id, "\x00", 0) >= 0 {
+        return Err(error(500, "an event id with a line break or NUL"))
+    }
     var b = newStrBuf()
+    if len(id) > 0 {
+        b.add("id: ")
+        b.add(id)
+        b.add("\n")
+    }
     if len(name) > 0 {
         b.add("event: ")
         b.add(name)
@@ -1852,6 +2355,47 @@ pub fn (w: mut &Response) event(name: str, data: str, at: Where): Result[Unit, E
     b.add("\n")
     try w.writeStr(b.toStr(), at)
     return w.flush(at)
+}
+
+// Writes an SSE retry field (the client's reconnect delay in ms) and
+// flushes it.
+pub fn (w: mut &Response) retry(ms: int, at: Where): Result[Unit, Error] {
+    if ms < 0 { return Err(error(500, "a negative SSE retry")) }
+    var b = newStrBuf()
+    b.add("retry: ")
+    b.addInt(ms)
+    b.add("\n\n")
+    try w.writeStr(b.toStr(), at)
+    return w.flush(at)
+}
+
+// Writes an SSE comment (": text") and flushes it; with empty text it is
+// the bare ":\n\n" keep-alive. A comment is one line per line of text, so
+// text may contain CR, LF or CRLF.
+pub fn (w: mut &Response) comment(text: str, at: Where): Result[Unit, Error] {
+    var b = newStrBuf()
+    var i = 0
+    while true {
+        b.add(":")
+        if i < len(text) {
+            b.add(" ")
+            var j = i
+            while j < len(text) && text[j] != '\n' && text[j] != '\r' { j += 1 }
+            b.add(text[i..j])
+            if j < len(text) && text[j] == '\r' && j + 1 < len(text) && text[j + 1] == '\n' { j += 1 }
+            i = j + 1
+        }
+        b.add("\n")
+        if i >= len(text) { break }
+    }
+    b.add("\n")
+    try w.writeStr(b.toStr(), at)
+    return w.flush(at)
+}
+
+// The bare SSE keep-alive comment.
+pub fn (w: mut &Response) keepAlive(at: Where): Result[Unit, Error] {
+    return w.comment("", at)
 }
 
 // Sends what is buffered now: the head, if it is not out yet (chunked,
@@ -2014,7 +2558,7 @@ fn (w: mut &Response) send(at: Where): Result[Unit, Error] {
         Ok(_) { return Ok(Unit{}) }
         Err(e) {
             w.failed = true
-            return Err(ioErr(&e, "writing the response"))
+            return Err(connErr(&e, "writing the response"))
         }
     }
 }
@@ -2158,6 +2702,7 @@ type AcceptCfg = value record {
 
 type ConnJob[A] = record {
     conn: net.Conn
+    tlsCtx: Option[tls.Context]
     app: A
     site: task.Frozen[Router[A]]
     st: task.Shared[State]
@@ -2182,6 +2727,16 @@ fn configErr(msg: str): Error { return errOf(0, ErrorKind.Config, msg) }
 // hard limit allows) or vm.max_map_count is too low for cfg.maxConns. In a
 // worker (task.workers), it marks the worker ready once it accepts.
 pub fn serve[A: copy](ln: net.Listener, app: A, r: Router[A], cfg: Config, at: Where): Result[Stats, Error] {
+    return serveWith(ln, app, r, cfg, None, at)
+}
+
+// Serves HTTPS on ln with the TLS context ctx (tls.server(options) with a
+// certificate and key), one HTTP/1.1 connection per accepted socket.
+pub fn serveTls[A: copy](ln: net.Listener, ctx: tls.Context, app: A, r: Router[A], cfg: Config, at: Where): Result[Stats, Error] {
+    return serveWith(ln, app, r, cfg, Some(ctx), at)
+}
+
+fn serveWith[A: copy](ln: net.Listener, app: A, r: Router[A], cfg: Config, tctx: Option[tls.Context], at: Where): Result[Stats, Error] {
     var site = r
     let errs = prepare(mut &site)
     if len(errs) > 0 { return Err(configErr(strings.join(&errs, "; "))) }
@@ -2222,7 +2777,7 @@ pub fn serve[A: copy](ln: net.Listener, app: A, r: Router[A], cfg: Config, at: W
     let ready = task.workerReady()
     var lst: Option[net.Listener] = Some(ln)
     task.scope(fn(s: mut &task.Scope) {
-        acceptLoop(s, mut &lst, mut &spare, app, sh, st, lim, ac, at)
+        acceptLoop(s, mut &lst, mut &spare, app, sh, st, lim, ac, &tctx, at)
     })
     flushLog(st)
     var out = noStats()
@@ -2251,7 +2806,8 @@ fn watchStop(st: task.Shared[State]): int {
 // the ended ones, closes idle ones under pressure, writes the access log,
 // and looks for a stop.
 fn acceptLoop[A: copy](s: mut &task.Scope, lst: mut &Option[net.Listener], spare: mut &Option[net.Spare], app: A,
-                       sh: task.Frozen[Router[A]], st: task.Shared[State], lim: Limits, ac: AcceptCfg, at: Where) {
+                       sh: task.Frozen[Router[A]], st: task.Shared[State], lim: Limits, ac: AcceptCfg,
+                       tctx: &Option[tls.Context], at: Where) {
     var futs: []Option[task.Future[int]] = []
     var free: []int = []
     var sig: Option[task.Future[int]] = None
@@ -2372,7 +2928,11 @@ fn acceptLoop[A: copy](s: mut &task.Scope, lst: mut &Option[net.Listener], spare
                     while len(x.slots) <= slot { append(mut &x.slots, Slot{state: SLOT_FREE, since: 0}) }
                     x.slots[slot] = Slot{state: SLOT_BUSY, since: now}
                 })
-                let f = s.start(connTask[A], ConnJob[A]{conn: c, app: app, site: sh, st: st, slot: slot, lim: lim})
+                let jt = match tctx {
+                    Some(ctx) { Some(ctx.share()) }
+                    None { None }
+                }
+                let f = s.start(connTask[A], ConnJob[A]{conn: c, tlsCtx: jt, app: app, site: sh, st: st, slot: slot, lim: lim})
                 futs[slot] = Some(f)
                 live += 1
                 batch += 1
@@ -2409,10 +2969,64 @@ fn flushLog(st: task.Shared[State]) {
 
 // ---------------------------------------------------------------- a connection
 
+type Sides = record {
+    read: ReadConn
+    write: WriteConn
+    peer: str
+}
+
+fn startSides(c: net.Conn, tctx: Option[tls.Context], hsMs: int, at: Where): Result[Sides, ConnError] {
+    match move(tctx) {
+        Some(ctx) {
+            var timed = false
+            var old = -1
+            if hsMs > 0 {
+                old = rtWithin(hsMs)
+                timed = true
+            }
+            let hr = ctx.accept(c, at)
+            if timed { rtRestore(old) }
+            match move(hr) {
+                Ok(tc) {
+                    let peer = tc.peerAddr()
+                    let fd = tc.fd()
+                    let box = task.shared(TlsBox{c: Some(tc), busy: false})
+                    return Ok(Sides{
+                        read: ReadConn{plain: None, box: Some(box), fd: fd, addr: peer},
+                        write: WriteConn{plain: None, box: Some(box), addr: peer},
+                        peer: peer})
+                }
+                Err(e) { return Err(tlsConn(&e)) }
+            }
+        }
+        None {
+            let net.Halves{read: rh, write: wh} = c.split()
+            let peer = rh.remote()
+            let fd = rh.fd()
+            return Ok(Sides{
+                read: ReadConn{plain: Some(rh), box: None, fd: fd, addr: peer},
+                write: WriteConn{plain: Some(wh), box: None, addr: peer},
+                peer: peer})
+        }
+    }
+}
+
 fn connTask[A: copy](j: ConnJob[A]): int {
-    let ConnJob{conn: c, app: app, site: site, st: st, slot: slot, lim: lim} = move(j)
-    let net.Halves{read: rh, write: wh} = c.split()
-    let peer = rh.remote()
+    let ConnJob{conn: c, tlsCtx: tctx, app: app, site: site, st: st, slot: slot, lim: lim} = move(j)
+    let sr = startSides(c, tctx, lim.headerTimeoutMs)
+    if sr.isErr() {
+        // The handshake (or the split) failed: the socket is closed and the
+        // connection is gone without an HTTP reply.
+        st.with(fn(x: mut &State) {
+            x.open -= 1
+            x.mem -= BUF + OUT
+            x.slots[slot].state = SLOT_DONE
+            append(mut &x.done, slot)
+        })
+        return 0
+    }
+    let sides = sr.unwrap()
+    let Sides{read: rh, write: wh, peer: peer} = move(sides)
     var trusted = false
     var refuse = false
     var counted = false
@@ -2470,8 +3084,8 @@ fn connTask[A: copy](j: ConnJob[A]): int {
 // still sends, for up to LINGER_MS and LINGER_BYTES, so that the client's
 // unread bytes (the rest of a refused request) do not turn the close into a
 // reset that destroys the reply before the client has read it.
-fn linger(rq: mut &Request, w: &Response) {
-    let r = w.conn.closeWrite()
+fn linger(rq: mut &Request, w: &Response, at: Where) {
+    let r = w.conn.closeWrite(at)
     let old = rtWithin(LINGER_MS)
     var total = 0
     while total < LINGER_BYTES {
