@@ -1,19 +1,19 @@
-# obx performance
+# Lexell performance
 
-obx builds a program in two ways:
+Lexell builds a program in two ways:
 
-- **native**: `obxc --native`, the compiler's own x86-64 backend. It writes an
+- **native**: `lxlc --native`, the compiler's own x86-64 backend. It writes an
   ELF executable directly, with no gcc and, unless the program calls C
   libraries, no libc.
-- **via C**: `obxc`, which writes C and runs gcc (`-O2 -march=x86-64-v3
+- **via C**: `lxlc`, which writes C and runs gcc (`-O2 -march=x86-64-v3
   -mmove-max=128 -mstore-max=128 -ffp-contract=off -falign-functions=64
   -falign-loops=32`).
 
 Both are built from the same IR and must behave identically; the gate checks
-that on every test program. obx is the program's build; the C backend is
+that on every test program. Lexell is the program's build; the C backend is
 kept for the bootstrap seed, portability and differential testing. Its
 performance comparison is not part of this report: it is in
-[design/native-vs-c.md](obx/design/native-vs-c.md).
+[design/native-vs-c.md](lexell/design/native-vs-c.md).
 
 This page is the current state: the measured tables and what they say about
 the code today, against external references and in absolute terms. The
@@ -54,15 +54,15 @@ code here, and the experiments that did not pay — is in
   consecutive days. Compare columns within this page, not with the figures
   in HISTORY.md.
 - Every row checks its outputs first: both builds print the same result and
-  are leak free under `OBX_CHECK=1`, and the tools' outputs equal the
+  are leak free under `LXL_CHECK=1`, and the tools' outputs equal the
   reference tool's.
 
 ## Benchmarks
 
-`python3 obx/bench/bench.py --opt -n 11`
-([obx/bench/](obx/bench/README.md)), best of 11, one core:
+`python3 lexell/bench/bench.py --opt -n 11`
+([lexell/bench/](lexell/bench/README.md)), best of 11, one core:
 
-| benchmark | obx -O | plain C | Rust | obx/Rust | obx/plain C | what it does |
+| benchmark | Lexell -O | plain C | Rust | lexell/Rust | lexell/plain C | what it does |
 |---|---:|---:|---:|---:|---:|---|
 | fib | 888 ms | 886 ms | 891 ms | 1.00 | 1.00 | recursive calls |
 | loop | 443 ms | 447 ms | 440 ms | 1.01 | 0.99 | two overflow-checked operations per iteration |
@@ -79,19 +79,19 @@ The ratios use the unrounded wall times (best of 11); the millisecond column
 is rounded, so two equal-looking values can differ by a few percent: a 1.06
 ratio, for instance, can come from two times that both round to 12 ms.
 
-The hand-written C references are in `obx/bench/c/` (nine programs; `maps`
-has none), built with `gcc -O2`. The Rust ports are in `obx/bench/rust/`, one
+The hand-written C references are in `lexell/bench/c/` (nine programs; `maps`
+has none), built with `gcc -O2`. The Rust ports are in `lexell/bench/rust/`, one
 dependency-free Cargo project built once with `cargo build --release
---offline`; `maps` has no Rust reference either (obx's map is
+--offline`; `maps` has no Rust reference either (Lexell's map is
 insertion-ordered and keyed-hashed, with `u32` index slots, and has no direct
 Rust std equivalent). Their build settings and anti-optimisation rules are in
-[obx/bench/README.md](obx/bench/README.md). The same-IR C build's column is in
-[design/native-vs-c.md](obx/design/native-vs-c.md).
+[lexell/bench/README.md](lexell/bench/README.md). The same-IR C build's column is in
+[design/native-vs-c.md](lexell/design/native-vs-c.md).
 
 The plain fast-compile path (`--native`, no `-O`) is slower where the loop
 passes matter: loop 890 ms, array 710 ms, sieve 562 ms; it is level on alloc
 (251 vs 250) and strings (219 vs 218). `maps` moves with the hash seed;
-[design/codegen-audit.md](obx/design/codegen-audit.md) records the remaining
+[design/codegen-audit.md](lexell/design/codegen-audit.md) records the remaining
 code-shape gaps.
 
 - **Allocation and strings are cheap** (alloc, lists, strings, trees).
@@ -103,31 +103,31 @@ code-shape gaps.
   at the bottom of loops and aligns their bodies, reads array headers once
   per loop, and drops the bounds and overflow checks that conditions,
   passed checks and induction variables prove cannot fail
-  ([design/native.md](obx/design/native.md) sections 4 and 8). `loop` is 460
+  ([design/native.md](lexell/design/native.md) sections 4 and 8). `loop` is 460
   ms against plain C's 461. `array` is 361 against 98: gcc turns its inner
-  loop into AVX2, while obx keeps one bounds check per element (its bound is
-  unrelated to the array's length). Rust is level with obx there (363).
+  loop into AVX2, while Lexell keeps one bounds check per element (its bound is
+  unrelated to the array's length). Rust is level with Lexell there (363).
 - **The sieve is ahead of plain C** (337 vs 359 ms) and 1.8x ahead of Rust
   (615). Rust keeps a bounds check on every `prime[j]` and a checked
   `j += i`; C has no checks.
-- **fib is within 4%** (obx 914, Rust 884, C 878 ms): calls and returns.
+- **fib is within 4%** (Lexell 914, Rust 884, C 878 ms): calls and returns.
   Rust's checked `n - 1` and `n - 2` add branches; C has none.
 - **Rust is level on fib, loop and array; ahead on tokens.** Rust's token
-  scanner is 21% faster (167 vs 202 ms). obx is ahead on alloc (2x), strings
+  scanner is 21% faster (167 vs 202 ms). Lexell is ahead on alloc (2x), strings
   (1.7x), trees (1.3x), lists (1.3x) and sieve (1.8x).
 - **C's auto-vectorisation is the array gap.** gcc turns `array`'s inner
-  loop into AVX2 (98 ms, 3.66x obx); Rust's bounds checks keep it scalar
-  (363 ms, level with obx's 361). On `sieve`, C is 359 against obx's 337.
+  loop into AVX2 (98 ms, 3.66x Lexell); Rust's bounds checks keep it scalar
+  (363 ms, level with Lexell's 361). On `sieve`, C is 359 against Lexell's 337.
 - **Rust uses the system allocator.** `alloc` is 487 ms, the same as plain
-  C (485) and 2x obx (247): libc `malloc`/`free` against the freestanding
+  C (485) and 2x Lexell (247): libc `malloc`/`free` against the freestanding
   size-class allocator. `lists` is 270 vs 205 ms (Rust's recursive `Drop`
   walks the 10,000-node list; C frees it iteratively) and `trees` 173 vs
   135.
-- **Strings: `String` and `Rc<str>`.** obx is 227 ms and plain C 456; Rust
+- **Strings: `String` and `Rc<str>`.** Lexell is 227 ms and plain C 456; Rust
   `String` is 391. The `Rc<str>` version (`dbench strings-rc`, the closer
-  analogue of obx's refcounted `str`) is slower still: a safe concatenation
+  analogue of Lexell's refcounted `str`) is slower still: a safe concatenation
   builds a `String` and then copies it into a fresh `Rc` allocation, two
-  allocations per `+`, whereas obx makes one refcounted block per `+` in its
+  allocations per `+`, whereas Lexell makes one refcounted block per `+` in its
   size-class allocator.
 - **maps** runs 568 ms (4,277M instructions, 1.6% more than the 4,212M
   before the Map hasher field; the wall time moves with the machine state).
@@ -142,9 +142,9 @@ code-shape gaps.
   depending on where they fall relative to 32- and 64-byte boundaries. Native
   functions start at multiples of 64 and the native backend aligns loop
   heads; gcc gets `-falign-functions=64 -falign-loops=32`, in programs and in
-  the native runtime. `python3 obx/tools/placement.py` builds a benchmark
-  eight times with its code shifted by 0, 8, ..., 56 bytes (obx:
-  `OBX_PADB=n`) and reports the spread. obx fib, loop, array and alloc move
+  the native runtime. `python3 lexell/tools/placement.py` builds a benchmark
+  eight times with its code shifted by 0, 8, ..., 56 bytes (Lexell:
+  `LXL_PADB=n`) and reports the spread. Lexell fib, loop, array and alloc move
   by under 1%, trees and sieve by 2–4%; maps moves as much between runs
   of one binary on a loaded machine, which is memory, not placement.
 
@@ -193,11 +193,11 @@ input, never for keys chosen by a network peer.
 
 ## Compile time and size
 
-`python3 obx/bench/compile.py -n 3`, best of 3, one core. The builds are not
-identical: obx emits nine small executables, the Rust project emits one
+`python3 lexell/bench/compile.py -n 3`, best of 3, one core. The builds are not
+identical: Lexell emits nine small executables, the Rust project emits one
 binary with nine subcommands, and cargo measures its own build system.
 
-| what | obx | Rust | C |
+| what | Lexell | Rust | C |
 |---|---:|---:|---:|
 | hello, compile | 12.7 ms | 154.1 ms | 61.0 ms |
 | hello, binary | 16 KB | 357 KB (stripped) | 16 KB |
@@ -207,12 +207,12 @@ binary with nine subcommands, and cargo measures its own build system.
 | compiler, binary + libraries | 2.9 MB (static) | 316.0 MB | - |
 | compiler toolchain, bin + lib | 2.9 MB | 559.9 MB (1.3 GB installed) | - |
 
-The compiler is 39,436 lines of obx (28,348 hand-written) and builds itself
+The compiler is 39,436 lines of Lexell (28,348 hand-written) and builds itself
 in 0.65 s; its binary is 2.9 MB and needs no libc. A hello world compiles in
 13 ms to 16 KB, against Rust's 154 ms and 357 KB (stripped) and gcc's 61 ms
-and 16 KB. The nine benchmark programs compile in 124 ms with obx; the Rust
+and 16 KB. The nine benchmark programs compile in 124 ms with Lexell; the Rust
 suite takes 2.23 s. Rust's figures include std and the cargo build system;
-obx links its own freestanding runtime.
+Lexell links its own freestanding runtime.
 
 Rust's compiler is `rustc` (636 KB) plus `librustc_driver` (138 MB) and
 `libLLVM` (178 MB): 316 MB, or 560 MB for the installed `bin` and `lib`
@@ -230,8 +230,8 @@ work.
 
 ## Regex
 
-`python3 obx/bench/regex/bench.py -n 7` ([obx/bench/regex/](obx/bench/regex/bench.py)),
-the benchmark set of [design/regex.md](obx/design/regex.md) section 4. The
+`python3 lexell/bench/regex/bench.py -n 7` ([lexell/bench/regex/](lexell/bench/regex/bench.py)),
+the benchmark set of [design/regex.md](lexell/design/regex.md) section 4. The
 corpus is 3.2 MB written by `gen_corpus.py` from a fixed seed (prose with the
 names the patterns look for, a log, C-like source; ASCII). Each driver times
 its own searches after reading the file: the best of 5 searches, best of 7
@@ -241,7 +241,7 @@ crate 1.12.3, and rg is ripgrep 14.1.1 counting matches as a whole process,
 start-up and file reading included: a reference point, not a like-for-like
 figure.
 
-| pattern | matches | obx | Go | Rust | rg |
+| pattern | matches | Lexell | Go | Rust | rg |
 |---|---:|---:|---:|---:|---:|
 | `Sherlock Holmes` | 926 | 0.21 | 0.48 | 0.08 | 1.7 |
 | `Sherlock\|Holmes\|Watson\|Irene` | 7,350 | 0.88 | 139.90 | 0.44 | 2.6 |
@@ -255,10 +255,10 @@ figure.
 The table is the plain `--native` build. With `--native -O`, `\w+` is
 30.9 ms, the alternation 0.82, `(?i)` 0.74 and the captures 4.01. The
 same-IR C build's column and the per-match instruction ratios are in
-[design/native-vs-c.md](obx/design/native-vs-c.md).
+[design/native-vs-c.md](lexell/design/native-vs-c.md).
 
-- **obx and Rust.** The engine has RE2's lazy DFA and Rust's literal
-  searches (design/regex.md, "R2 as built"). Obx takes 1.7 to 3.1 times
+- **Lexell and Rust.** The engine has RE2's lazy DFA and Rust's literal
+  searches (design/regex.md, "R2 as built"). Lexell takes 1.7 to 3.1 times
   Rust's time on the matching patterns and a little over half on the
   `ERROR` lines (a prefilter on `ERROR ` and the suffix check on `timeout`).
 - **Where the gap is.** The literal: Rust's memchr uses AVX2 (32 bytes a
@@ -268,7 +268,7 @@ same-IR C build's column and the per-match instruction ratios are in
   `forward` and `backward` in one loop, takes the DFA's text by borrow
   (no dup/drop per call), keys the start-state cache by the byte itself
   (there is no byte-to-context table load on the hot path), and scans ASCII
-  in a fast loop whose constant step lets `loops.obx` prove the byte bounds
+  in a fast loop whose constant step lets `loops.lxl` prove the byte bounds
   check; `findAllIndexN` has a span-specialized driver that appends `Span`
   directly instead of calling a delivery callback with a two-slot `[]int`.
   Per-match overhead is **16 instructions**, and the `-O` `\w+` instruction
@@ -279,7 +279,7 @@ same-IR C build's column and the per-match instruction ratios are in
   one (the suffix check), so the search stops before any matcher runs. The
   DFA on such patterns is covered by the tests (`regex_linear`,
   `regex_dfa`), not by this row.
-- **obx and Go.** obx is 2 to 700 times faster than Go's `regexp`, which has
+- **Lexell and Go.** Lexell is 2 to 700 times faster than Go's `regexp`, which has
   no DFA.
 - **Go's matchers** (the Pike VM, the backtracker and one-pass), which the
   engine uses for short texts (under 128 bytes), for one-pass patterns, and
@@ -295,13 +295,13 @@ same-IR C build's column and the per-match instruction ratios are in
 
 ## eza
 
-[obx/cmd/eza.obx](obx/cmd/eza.obx), a 1,677-line implementation of the
+[lexell/cmd/eza.lxl](lexell/cmd/eza.lxl), a 1,677-line implementation of the
 common subset of eza 0.23.3 at `38e114e` (1,857 lines, with the full long
 view). `LC_ALL=C TZ=UTC`; the long listings use
 `--bytes --time-style=long-iso -n`, which that build required. Best of 9; both
 builds write byte-identical listings.
 
-| listing | output | obx |
+| listing | output | Lexell |
 |---|---:|---:|
 | `-T /usr/share` (tree) | 2.1 MB | 130 ms |
 | `-T -l /usr/share` (long tree) | 3.8 MB | 262 ms |
@@ -311,17 +311,17 @@ These are the 8 November sweep; the host was about 10% slower than the
 previous one. The tree walk is 517M instructions, slightly below the
 previous commit (the library migration removed per-entry path and name-order
 allocations), so the wall difference is the host, not the code. The golden
-suite (`python3 obx/cmd/eza_gate.py -j 12`) passes on both builds.
+suite (`python3 lexell/cmd/eza_gate.py -j 12`) passes on both builds.
 
 ## grep
 
-[obx/cmd/grep.obx](obx/cmd/grep.obx) against GNU grep 3.11 on 100 MB of
+[lexell/cmd/grep.lxl](lexell/cmd/grep.lxl) against GNU grep 3.11 on 100 MB of
 generated text (1.8 million lines; the generator is in
-[obx/cmd/README.md](obx/cmd/README.md)). Best of 5, output to a pipe,
-`LC_ALL=C` (under `C.UTF-8` GNU grep's `-w` takes 2.3 times as long; the obx
+[lexell/cmd/README.md](lexell/cmd/README.md)). Best of 5, output to a pipe,
+`LC_ALL=C` (under `C.UTF-8` GNU grep's `-w` takes 2.3 times as long; the Lexell
 port has no locale). Every output equals GNU grep's.
 
-| search | GNU | obx |
+| search | GNU | Lexell |
 |---|---:|---:|
 | `needle5007` (a literal) | 27 ms | 17 ms |
 | `-c omega` | 89 ms | 64 ms |
@@ -353,17 +353,17 @@ What makes it fast:
 
 ## jq
 
-[obx/cmd/jq.obx](obx/cmd/jq.obx), the jq 1.7.1 port, against jq 1.7.1 built
+[lexell/cmd/jq.lxl](lexell/cmd/jq.lxl), the jq 1.7.1 port, against jq 1.7.1 built
 from its release tarball (`./configure --with-oniguruma=builtin`, the default
 `-O2`). Wall times; figures vary by 5–10% between runs. The wall times are
 from an earlier quiet window (the host was too variable to re-baseline); the
 instruction counts are current.
 
-**Large input.** `python3 obx/bench/json/bench.py --jq JQ`, on an 80 MB file
+**Large input.** `python3 lexell/bench/json/bench.py --jq JQ`, on an 80 MB file
 of 182,290 generated records. Best of 3; the output goes to a file, and the
 three outputs of each filter must be identical.
 
-| filter | jq 1.7.1 | obx |
+| filter | jq 1.7.1 | Lexell |
 |---|---:|---:|
 | `.` | 2.50 s | 1.74 s |
 | `-c .` | 2.24 s | 1.62 s |
@@ -373,7 +373,7 @@ three outputs of each filter must be identical.
 | `group_by(.address.city) \| map({city: .[0].address.city, n: length})` | 2.15 s | 1.95 s |
 
 The jq 1.7.1 column is from an earlier sweep (jq is not installed here); the
-obx columns were measured at 80 MB with `--mb 80 -n 3`. The application
+Lexell columns were measured at 80 MB with `--mb 80 -n 3`. The application
 suite at `93b295c5` measures `-c .` on 20 MB at 4,282.1M instructions, the
 same figure as the table's 4,282.3M; the large-input wall times remain from
 the earlier quiet window.
@@ -381,7 +381,7 @@ the earlier quiet window.
 The same script times the JSON library on the file (ms, best of 3), against
 Python's `json`:
 
-| step | obx | Python |
+| step | Lexell | Python |
 |---|---:|---:|
 | parse | 771 | 846 |
 | compact output | 542 | 818 |
@@ -393,7 +393,7 @@ Python's `json`:
 best of 9); the outputs are identical. The table is from an earlier sweep
 (it needs the jq reference).
 
-| program | jq 1.7.1 | obx |
+| program | jq 1.7.1 | Lexell |
 |---|---:|---:|
 | `1` (start-up) | 2 ms | 5 ms |
 | `reduce range(3000000) as $i (0; . + $i)` | 503 ms | 540 ms |
@@ -423,33 +423,33 @@ Compiled regexes are cached for the run.
   are faster to walk than the library's counted boxes.
 
 The library's own design and numbers are in
-[obx/design/json.md](obx/design/json.md), section 9.
+[lexell/design/json.md](lexell/design/json.md), section 9.
 
 ## Markdown
 
-[obx/cmd/cmark.obx](obx/cmd/cmark.obx) (the `markdown` library) against cmark
+[lexell/cmd/cmark.lxl](lexell/cmd/cmark.lxl) (the `markdown` library) against cmark
 0.31.2 (`-O3` release build, cmake), rendering 10 MB documents with
-`--unsafe` to a pipe. Best of 3, seconds (`python3 obx/tests/markdown.py
+`--unsafe` to a pipe. Best of 3, seconds (`python3 lexell/tests/markdown.py
 --perf --ref CMARK`). The wall times are from an earlier quiet window: the
 host was too variable to re-baseline the pipe-bound times (the same binary
 moved by 1.7x between runs). The instruction and cycle ratios below are
 current.
 
-| document | cmark | obx |
+| document | cmark | Lexell |
 |---|---:|---:|
 | the spec, repeated to 10 MB | 0.18 | 0.20 |
 | the repo's Markdown files, repeated to 10 MB | 0.22 | 0.25 |
 | the spec's examples, repeated to 10 MB | 0.62 | 0.72 |
 
-The obx columns are the plain `--native` build, with line endings and inline
+The Lexell columns are the plain `--native` build, with line endings and inline
 text runs found in runs rather than byte by byte.
 With `-O` the spec is 0.169 s: 1343.0M instructions / 487.3M cycles. The
 application suite at `93b295c5` measures its 10 MB document at 1,337.9M
 instructions, within 0.4% of the previous sweep. The
 cmark column is from an earlier sweep; the same-IR C ratios are in
-[design/native-vs-c.md](obx/design/native-vs-c.md).
+[design/native-vs-c.md](lexell/design/native-vs-c.md).
 
-The obx renderer takes 1.1 to 1.2 times cmark's time in the plain build and
+The Lexell renderer takes 1.1 to 1.2 times cmark's time in the plain build and
 0.94 to 1.10 with `-O`. cmark's pathological
 inputs (nested emphasis, brackets and block quotes 30,000 to 100,000 deep, a
 million backticks, unclosed constructs) all finish in well under a second,
@@ -460,19 +460,19 @@ parser keeps the tree in one array of 200-byte nodes: the 10 MB spec takes
 
 ## The compiler
 
-The obx compiler compiling itself (`obx/compiler/main.obx`), obx build,
+The Lexell compiler compiling itself (`lexell/compiler/main.lxl`), Lexell build,
 best of 11:
 
-| | obx build |
+| | Lexell build |
 |---|---:|
 | self-build to an executable (`--native`) | 704 ms |
 | self-build to C (`--emit-c`) | 475 ms |
-| compiler binary | 3,068,457 bytes (static, no libc) |
+| compiler binary | 3,068,569 bytes (static, no libc) |
 
-The compiler is 39,436 lines of obx (1.78 MB, 706 KB of it the generated
-runtime tables `rt.obx` and `rtx.obx`; 28,348 hand-written lines) and 5,634
+The compiler is 39,436 lines of Lexell (1.78 MB, 706 KB of it the generated
+runtime tables `rt.lxl` and `rtx.lxl`; 28,348 hand-written lines) and 5,634
 lines of C runtime (the C backend's `rt.h` and the native backend's
-freestanding `rt.c`). The obx-built compiler runs 4,981M instructions on
+freestanding `rt.c`). The Lexell-built compiler runs 4,981M instructions on
 `--native`; the commit before the compiler's Fx string hash ran 5,080M
 (−1.9%). Cycles move with the host. Absolute times move with the host; the
 instruction counts are the stable comparison. The compiler's string-keyed
@@ -482,7 +482,7 @@ default hash, which is one multiply. The `perfsuite.py main
 compiler-fast-hash` comparison gives a compile suite of −2.21% instructions
 and −3.37% cycles (geometric mean) with the run suite at 0.00%, and the
 generated output is byte-identical. The gcc-built comparison is in
-[design/native-vs-c.md](obx/design/native-vs-c.md).
+[design/native-vs-c.md](lexell/design/native-vs-c.md).
 
 - What is left is spread thin: it is in the mix (register-to-register moves,
   stores to the stack and compares: spills, and loads and bounds checks
@@ -493,11 +493,11 @@ generated output is byte-identical. The gcc-built comparison is in
 
 ### Judging a change
 
-A backend pass is judged by `obx/tools/perfsuite.py`, not by the self-build
+A backend pass is judged by `lexell/tools/perfsuite.py`, not by the self-build
 alone: each pass adds to the compiler's own sources, and the compiler is one
 program.
 
-    python3 obx/tools/perfsuite.py main BRANCH     # or two compiler paths
+    python3 lexell/tools/perfsuite.py main BRANCH     # or two compiler paths
 
 It builds both revisions' native compilers from their seeds, then measures
 them on inputs frozen at one revision (`af99f933`; they move only on purpose,
@@ -529,7 +529,7 @@ stat` as well. The passes tried and shelved are in HISTORY.md.
 
 These rules are for the **default** path. `--native -O` is the optimising
 path: it may cost up to **30% more compile time** than the default
-(`python3 obx/tools/optcost.py --compiler <native-built obxc>`, instructions
+(`python3 lexell/tools/optcost.py --compiler <native-built lxlc>`, instructions
 and cycles, best of N). Its target is a compiled program's running time, not
 a smaller compile-suite figure.
 
@@ -556,12 +556,12 @@ best of 3, one core):
 | maps | 96 | 107 | +11.3% | 43 | 45 | +5.3% |
 | **geomean** | | | **+14.9%** | | | **+16.1%** |
 
-The code `-O` makes is judged by `obx/bench/bench.py --opt` (the ten
-benchmarks, obx `-O` against the hand-written C references) and by the
+The code `-O` makes is judged by `lexell/bench/bench.py --opt` (the ten
+benchmarks, Lexell `-O` against the hand-written C references) and by the
 regex, JSON/jq, Markdown and Decimal harnesses. The ladder pays on loops,
 allocation, strings, trees, sieve and Markdown; it does not move the DFA's
 per-match work or jq's boxes. The `-O`/C cycle ratios are in
-[design/native-vs-c.md](obx/design/native-vs-c.md). Check elimination and branch folding were
+[design/native-vs-c.md](lexell/design/native-vs-c.md). Check elimination and branch folding were
 measured and rejected: the losses are memory, calls and copies, not
 instruction selection. Those experiments are in HISTORY.md, "Tried and
 shelved". The application rows below carry their external references; the
@@ -574,14 +574,14 @@ as the C build.
 
 ### The application suite
 
-`python3 obx/bench/apps.py -n 5 --pin 2` is the Tier-1 table: the same source
-built with obx `-O`, output checked, timed with `perf` on one core, best
+`python3 lexell/bench/apps.py -n 5 --pin 2` is the Tier-1 table: the same source
+built with Lexell `-O`, output checked, timed with `perf` on one core, best
 of N, as a table, JSON and TSV. Measured at `93b295c5` (8 November;
-`OBX_HASH_SEED=42`, core 2, 60 s). The host was busy: wall times are 1.2 to
+`LXL_HASH_SEED=42`, core 2, 60 s). The host was busy: wall times are 1.2 to
 1.5 times the previous sweep, while every instruction count is within 0.4%
 of it:
 
-| application | obx wall | instructions | cycles |
+| application | Lexell wall | instructions | cycles |
 |---|---:|---:|---:|
 | regex (8 patterns, 3 MB) | 47 ms | 582.7M | 159.9M |
 | json (20 MB, parse/query/visit) | 619 ms | 4,410.7M | 2,202.2M |
@@ -592,10 +592,10 @@ of it:
 The external references for each application are in its own section: Rust,
 Go and ripgrep for regex; jq for the jq port; cmark for Markdown; .NET and
 Java for Decimal. The same-IR C comparison is in
-[design/native-vs-c.md](obx/design/native-vs-c.md). Wall times move by
+[design/native-vs-c.md](lexell/design/native-vs-c.md). Wall times move by
 several percent between runs; instructions are the stable figure.
 
-The benchmark harnesses set `OBX_HASH_SEED` (42 by default, `--hash-seed` or
+The benchmark harnesses set `LXL_HASH_SEED` (42 by default, `--hash-seed` or
 `--random-hash` to change it), so the map layout is identical across runs and
 in both backends; without it production keeps the per-process random key.
 The maps instruction count is reproducible across runs and seeds; its cycles
@@ -603,21 +603,21 @@ move with the machine and the slot layout.
 
 ## Binary sizes
 
-| program | obx |
+| program | Lexell |
 |---|---:|
 | empty program | 12,288 bytes (static) |
 | hello | 16,416 bytes (static) |
 | `import "regex"`, one call (`regex.quote`) | 20,512 bytes (static) |
 | eza | 353,328 bytes (static) |
-| HTTP server (`cmd/httpd.obx`) | 848,440 bytes (dynamic) |
-| compiler | 3,068,457 bytes (static) |
+| HTTP server (`cmd/httpd.lxl`) | 848,440 bytes (dynamic) |
+| compiler | 3,068,569 bytes (static) |
 
 The native backend generates only the functions and globals reachable from
 `main` (design/native.md section 5, "Reachability"), as gcc drops a C
 program's unused static functions: an imported module costs only what the
 program uses of it. The runtime is linked
 the same way, by sections, as `ld --gc-sections` would: every function and
-datum of rt.c is a section of its own in `rtx.obx`, and the link keeps those
+datum of rt.c is a section of its own in `rtx.lxl`, and the link keeps those
 reachable from the runtime functions the program calls. Native functions
 start at multiples of 64 bytes (code placement, above), which costs about 1%
 of a large program's size.
@@ -625,12 +625,12 @@ of a large program's size.
 A native executable carries its own runtime instead of linking libc. When a
 program calls C libraries (libssl, sqlite3), it is dynamically linked against
 them. A program that imports `postgres_libpq` is linked against libpq too; the
-obx `postgres` client needs no libpq (it still uses libssl for TLS).
+Lexell `postgres` client needs no libpq (it still uses libssl for TLS).
 
 ## Math
 
 The float math functions are the runtime's own (musl 1.2.5, one C text for
-both backends, `obx/compiler/obxmath.inc`), not libm's. sqrt, floor, ceil,
+both backends, `lexell/compiler/lxlmath.inc`), not libm's. sqrt, floor, ceil,
 trunc, round, rint, fabs, copysign and fma are single instructions (sqrtsd,
 roundsd, masks, vfmadd213sd). The polynomials of exp, exp2, log, log2, pow,
 sin and cos use explicit fma; everything else is compiled with
@@ -640,11 +640,11 @@ with `-ffixed-xmm8` to `-ffixed-xmm15`), so that a native program keeps its
 doubles in `xmm8`-`xmm14` across the calls.
 
 5M calls of one function in a loop, the argument varying
-(`obx/bench/math/calls.obx`), ms, best of 7, pinned, both builds interleaved;
+(`lexell/bench/math/calls.lxl`), ms, best of 7, pinned, both builds interleaved;
 both print the same checksum. Cycles per call in brackets (user cycles, least
 of 7, divided by 5M):
 
-| function | obx |
+| function | Lexell |
 |---|---:|
 | exp | 12 (9.6) |
 | ln | 15 (12.9) |
@@ -653,7 +653,7 @@ of 7, divided by 5M):
 | atan | 19 (15.9) |
 | tan | 20 (16.9) |
 
-What is left on exp and sin is the call: the obx loop calls the kernel,
+What is left on exp and sin is the call: the Lexell loop calls the kernel,
 and the kernel loads its polynomial constants on every call (49 operations
 an iteration). The loop is bound by dispatch, not by a latency chain
 (`perf`: 85% of the dispatch slots used, the rest mostly back-end stalls).
@@ -670,27 +670,27 @@ get more of the speed that contraction would give.
 
 ## Decimal
 
-`obx/bench/decimal`: micro-benchmarks of the Decimal operations
-(`dbench.obx`, M0 to M10 on 4096 fixed-seed inputs each) and `run.py`, which
+`lexell/bench/decimal`: micro-benchmarks of the Decimal operations
+(`dbench.lxl`, M0 to M10 on 4096 fixed-seed inputs each) and `run.py`, which
 builds them with two trees and compares user cycles and instructions (`perf
 stat`, least of N). `diff.py` is the differential test that every change to
 Decimal must pass: 11 operations on 10^6 inputs each, old and new tree,
 native and C, identical text, errors and scales.
 
 A matched comparison with .NET's `System.Decimal` and Java's `BigDecimal` is
-in [design/decimal-performance.md](obx/design/decimal-performance.md):
+in [design/decimal-performance.md](lexell/design/decimal-performance.md):
 19-digit add, 6x6 multiply, 12/6 divide at scale 2, 20-digit parse,
 19-digit format and compare, plus 38-digit cases that .NET cannot represent.
 In short: .NET's 16-byte decimal is 1.2 times faster on add, 1.5 times on
-multiply and 3 times on compare; obx is about twice as fast at parse and 1.6
+multiply and 3 times on compare; Lexell is about twice as fast at parse and 1.6
 times at format; Java is fast on small arithmetic but its parse is about
-twice obx's and its 38-digit format 3 times. At 38 digits obx is ahead of
+twice Lexell's and its 38-digit format 3 times. At 38 digits Lexell is ahead of
 Java on add and multiply too.
 
 Cycles per operation (dbench under `perf stat`, least of 5, pinned to one
 core; measured 7 November 2026 at `fb50b4f1`):
 
-| operation | obx |
+| operation | Lexell |
 |---|---:|
 | add, 6 / 19 digits at 2 places (M2) | 66 / 66 |
 | mul, 6 / 19 digits (M3) | 80 / 83 |
@@ -703,7 +703,7 @@ core; measured 7 November 2026 at `fb50b4f1`):
 
 The last row is from an earlier sweep. The per-operation numbers are noisy
 at this size; the aggregate application row below is the reliable one. The
-same-IR C comparison is in [design/native-vs-c.md](obx/design/native-vs-c.md).
+same-IR C comparison is in [design/native-vs-c.md](lexell/design/native-vs-c.md).
 
 The expensive operations are parse, format and cmp. Parse carries the digit
 loop's checks and its 128-bit accumulation through a pointer; format is
@@ -733,10 +733,10 @@ in 10^19 chunks two digits at a time, and parse reads eight digits at a time
 
 ## Tasks
 
-The cost of the concurrency primitives (`lib/task.obx`, `lib/net.obx`, SPEC
-16), from `obx/bench/tasks.obx`, ns per operation, best of 3 runs:
+The cost of the concurrency primitives (`lib/task.lxl`, `lib/net.lxl`, SPEC
+16), from `lexell/bench/tasks.lxl`, ns per operation, best of 3 runs:
 
-| operation | obx |
+| operation | Lexell |
 |---|---:|
 | task switch (`task.yield`) | 7.7 |
 | start a task (stack reused) | 21.3 |
@@ -773,19 +773,19 @@ disk does not notice.
 
 ## HTTP server
 
-`obx/cmd/httpd.obx` on the server library `obx/lib/httpserver.obx`
+`lexell/cmd/httpd.lxl` on the server library `lexell/lib/httpserver.lxl`
 (design/http-server.md): a keep-alive HTTP/1.1 server on one thread, one task
 per connection, with every limit and timeout of the design on, the hangup
 cancellation armed around each handler, the request parsed strictly and the
-reply built by the library. Measured by `python3 obx/cmd/http_gate.py
+reply built by the library. Measured by `python3 lexell/cmd/http_gate.py
 --servers native,go,node`: the server on CPU 0, the load client
-`obx/cmd/httpload.obx` (obx, one thread) on CPU 2, another core. 10,000
+`lexell/cmd/httpload.lxl` (Lexell, one thread) on CPU 2, another core. 10,000
 idle keep-alive connections are opened first and stay open during the load;
 each load client sends `GET /` and waits for the reply, 5 s per row. Go
 1.26's net/http (GOMAXPROCS=1) and Node 24's http serve the same reply, as
 references. This machine's numbers move by 5 to 10% from one run to the next.
 
-| | obx | Go net/http | Node 24 |
+| | Lexell | Go net/http | Node 24 |
 |---|---:|---:|---:|
 | RSS per idle connection | 15.0 KB | 19.8 KB | 9.5 KB |
 | RSS with 10,000 idle connections | 150 MiB | 195 MiB | 139 MiB |
@@ -809,7 +809,7 @@ came with the request, which must not cancel it), the `Date` and
 An idle connection's resident cost is two pages of its task's stack (8 KiB;
 the stack is 256 KiB of address space), a 4 KiB read buffer, a 512-byte
 output buffer, and the request and response records with their header lists,
-kept for reuse. Under the gate's `OBX_CHECK=1`, `GET /shutdown` with the
+kept for reuse. Under the gate's `LXL_CHECK=1`, `GET /shutdown` with the
 10,000 connections open drains them all and ends the program in 0.5 to 0.6 s,
 exit 0, no leak. One client is bound by this machine's loopback round trip;
 with 100 clients the single-threaded load client may be the limit as much as
@@ -819,14 +819,14 @@ limit when it can and stops when it cannot.
 ### The HTTP client
 
 `httpload --client` sends the same load through one `http.Client`
-(`obx/lib/http.obx`: `get` and `text()` per request, `maxPerHost` equal to
-the connections), against the obx server on CPU 0, the loader on CPU 2,
-5 s per row, the median of three alternating rounds (the obx columns:
+(`lexell/lib/http.lxl`: `get` and `text()` per request, `maxPerHost` equal to
+the connections), against the Lexell server on CPU 0, the loader on CPU 2,
+5 s per row, the median of three alternating rounds (the Lexell columns:
 `http_gate.py --servers native --client --conns 1,100,1000`), beside
 httpload's own loop (a fixed request, only Content-Length parsed). No idle
 connections are held open here.
 
-| connections | raw, obx | client, obx |
+| connections | raw, Lexell | client, Lexell |
 |---:|---:|---:|
 | 1: requests/s | 4,360 | 4,030 |
 | 100: requests/s | 68,800 | 57,653 |
@@ -845,11 +845,11 @@ parity, so it is not met (design/http-client.md, section 8).
 
 ### With a Postgres pool
 
-`python3 obx/cmd/http_gate.py --servers native --db 4,16`: the same server
+`python3 lexell/cmd/http_gate.py --servers native --db 4,16`: the same server
 and load, each request `GET /db`, which takes a connection from a
 `postgres.Pool` of 4 or 16 connections, runs `SELECT $1::int8 + 1` with the
 request's number, and returns the connection. PostgreSQL 16 on the same
-machine, over its Unix socket. The queries go through the obx client
+machine, over its Unix socket. The queries go through the Lexell client
 (`postgres`, over `pgwire`, design/pgwire.md): each request's task parks on
 the socket, and the server's one thread serves the 10,000 idle connections
 and the load meanwhile.
@@ -859,7 +859,7 @@ latency of that same run), the one-minute load 1.92 and 2.11 at the start of
 each. Each figure is one 5 s
 run; the cells moved by 1% to 8% between runs:
 
-| | obx, pool 4 | obx, pool 16 |
+| | Lexell, pool 4 | Lexell, pool 16 |
 |---|---:|---:|
 | 1 client: requests/s | 2,594 | 2,633 |
 | 10 clients: requests/s | 20,818 | 20,310 |
@@ -875,13 +875,13 @@ the idle connections cost the same with both (about 15 KB each).
 One client pays two round trips, the HTTP one and the server's to
 PostgreSQL (about 100 µs). From 10 clients on, the server's one thread is the
 limit: 1 / 20,700 requests/s is about 48 µs of it per request (the breakdown
-was not measured for the obx client). With 100 clients, most of them wait
+was not measured for the Lexell client). With 100 clients, most of them wait
 in the pool's queue (first come, first served), which is where the 5 ms comes
 from. After the load, `/shutdown` with the 10,000 idle connections open took
-0.53 to 0.59 s, exit 0, no leak under `OBX_CHECK=1`, every pool connection
+0.53 to 0.59 s, exit 0, no leak under `LXL_CHECK=1`, every pool connection
 idle and nobody waiting. An idle connection cost 14.9 to 15.3 KB.
 
-The obx client does not wait in a thread for a running query: the task
+The Lexell client does not wait in a thread for a running query: the task
 parks on the socket, so a waiting query can be cancelled (a CancelRequest on
 a second connection, design/pgwire.md section 13) when its task is, and its
 cost is the one thread's, the same budget the HTTP side uses; more cores come
@@ -890,27 +890,27 @@ libpq's asynchronous API (`PQcancel`).
 
 ### With worker processes
 
-`python3 obx/cmd/http_gate.py --workers 1,2,4,8 --db 4`: `httpd ADDR POOL
+`python3 lexell/cmd/http_gate.py --workers 1,2,4,8 --db 4`: `httpd ADDR POOL
 WORKERS`, n worker processes under `task.workers` sharing one listener made
 before the fork, each with its own event loop and (for `/db`) its own pool of
 4 PostgreSQL connections. No idle connections; 256 keep-alive load
 connections spread over 8 load processes (`httpload -p 8`), 5 s per row,
-`OBX_CHECK=1`. Pinning: the n workers on the first n of CPUs 0, 2, 4, 6, 1,
+`LXL_CHECK=1`. Pinning: the n workers on the first n of CPUs 0, 2, 4, 6, 1,
 3, 5, 7 (1 to 4 workers each have a core of their own; 8 workers share four
 cores with SMT), the load on CPUs 8-15 (the other four cores); the gate
 stops if the two sets would share a core. PostgreSQL is not pinned.
-Two complete gate runs with the obx client (each cell: requests/s the best
+Two complete gate runs with the Lexell client (each cell: requests/s the best
 of the two), the one-minute load 2.15 and 10.07 at the starts (the second run
 overlapped the tail of another gate). Requests/s, one 5 s run each:
 
-| workers | obx `/` | obx `/db` |
+| workers | Lexell `/` | Lexell `/db` |
 |---:|---:|---:|
 | 1 | 56,215 | 19,275 |
 | 2 | 95,292 | 31,919 |
 | 4 | 122,990 | 47,674 |
 | 8 | 124,333 | 60,852 |
 
-Most cells moved by 2% to 6% from run to run; the 1-worker obx `/` row
+Most cells moved by 2% to 6% from run to run; the 1-worker Lexell `/` row
 moved by 13% (49,102 then 56,215), which is why the table is the best of
 two. The libpq comparison is in design/pgwire.md, section 27.
 
@@ -936,21 +936,21 @@ exit 0, the restart counted.
 
 ## TLS
 
-`obx/lib/tls.obx` over OpenSSL 3.0.13 (design/tls.md), and https in the http
-client. Measured by `python3 obx/cmd/tls_bench.py`:
+`lexell/lib/tls.lxl` over OpenSSL 3.0.13 (design/tls.md), and https in the http
+client. Measured by `python3 lexell/cmd/tls_bench.py`:
 
-- `obx/cmd/tlsbench.obx`, built with obx, against OpenSSL's own clients and
+- `lexell/cmd/tlsbench.lxl`, built with Lexell, against OpenSSL's own clients and
   curl; the server on CPU 0 and the client on CPU 2;
 - a P-256 ECDSA certificate from a test CA, verified by every client; TLS
   1.3, TLS_AES_256_GCM_SHA384, X25519; each row the median of three runs.
 - **Handshakes:** full handshakes one after another (connect, handshake,
   close_notify, no resumption) against `openssl s_server -www`.
 - **Bulk:** one GET of 1 GiB from `tlsbench serve` (an https server written
-  with `tls`, obx), its body streamed in 64 KiB reads.
+  with `tls`, Lexell), its body streamed in 64 KiB reads.
 - **Requests:** 20,000 small GETs over kept-alive connections to the same
   server (5,000 for curl, one URL list).
 
-| | obx | OpenSSL / curl |
+| | Lexell | OpenSSL / curl |
 |---|---:|---:|
 | handshakes/s (s_server is the limit) | 752 | 560 (`openssl s_time -new`) |
 | client CPU per handshake | 527 µs | 595 µs (`s_time`) |
@@ -973,17 +973,17 @@ between runs on this machine.
 by 15 to 25% from run to run. For scale, plain http to `httpd` reaches about
 4,300 per second on one connection (above). These runs are also the H2
 gate's "1,000 https requests over kept-alive connections"
-(design/http-client.md), under no `OBX_CHECK`; the tests run under
-`OBX_CHECK=1` with no leak.
+(design/http-client.md), under no `LXL_CHECK`; the tests run under
+`LXL_CHECK=1` with no leak.
 
 ## Database streaming
 
 `conn.stream(sql, args, bind, read)` in the SQL Server, PostgreSQL and
 Oracle clients decodes each row straight into the program's own record,
 a caller-owned buffer at a time, instead of holding the whole result in
-memory ([design/db-streaming.md](obx/design/db-streaming.md): the API,
+memory ([design/db-streaming.md](lexell/design/db-streaming.md): the API,
 the column matching, each client's mechanism and early close). Measured
-by `python3 obx/bench/dbstream/run.py`: one run of all four clients, pinned
+by `python3 lexell/bench/dbstream/run.py`: one run of all four clients, pinned
 to CPU 10, with the one-minute load
 average 0.84 at the start: 1,000,000 rows of (bigint, int, text,
 decimal(12,2)), every
@@ -991,7 +991,7 @@ value decoded into a record and folded into a checksum, which is equal in
 every row of the table; a buffer of 1,024 rows; peak RSS of the process;
 each figure the least of 5 interleaved runs. The servers run on the same machine,
 unpinned; Oracle runs in a rootless podman container,
-whose networking adds about 0.38 ms a round trip. `PostgreSQL` is the obx
+whose networking adds about 0.38 ms a round trip. `PostgreSQL` is the Lexell
 client; `PostgreSQL (libpq)` is `postgres_libpq`, the old client, kept as
 the comparison.
 
@@ -1005,15 +1005,15 @@ the comparison.
 - **Memory is flat while streaming:** the same at 100,000 and 1,000,000
   rows (8.2 to 14.0 MB: the program, its buffer and, for Oracle, a fetch of
   about 10,000 rows). Buffered memory grows with the result: 91 MB for
-  PostgreSQL's obx client (its whole result), 109 to 110 MB for
+  PostgreSQL's Lexell client (its whole result), 109 to 110 MB for
   PostgreSQL through libpq (libpq's whole result), 111 MB for Oracle (each
   value's bytes, decoded when read) and 365 MB for SQL Server (a decoded
   cell per value).
 - **Streaming is never slower:** 2.6 to 2.7 times faster for SQL Server,
-  2.0 times for PostgreSQL's obx client (1.6 for libpq) and 1.3 to 1.5
+  2.0 times for PostgreSQL's Lexell client (1.6 for libpq) and 1.3 to 1.5
   times for Oracle.
 - **How each client streams:** SQL Server decodes the reply a packet at a
-  time. The obx PostgreSQL client sends one Execute with no row limit and
+  time. The Lexell PostgreSQL client sends one Execute with no row limit and
   reads the rows off the socket as the buffer needs them, at most 256 KB a
   batch (design/pgwire.md, section 12): the server sends the whole result,
   and TCP holds it back while the program reads slowly. The libpq client
@@ -1022,9 +1022,9 @@ the comparison.
   the size the rows took: about 9,900 rows here) and sends the next FETCH
   before the program uses the last rows.
 - **Latency:** with a 2.5 ms one-way delay (6.1 to 6.2 ms round trip through
-  the proxy), obx streams 1M rows in 458 ms against libpq's 633; at 0 ms
+  the proxy), Lexell streams 1M rows in 458 ms against libpq's 633; at 0 ms
   they are 415 and 598 ms (design/pgwire.md, section 28).
-- **Client cost per row:** cycles per row (earlier sweep, obx,
+- **Client cost per row:** cycles per row (earlier sweep, Lexell,
   streamed / buffered): Oracle 1,169 / 1,010 and SQL Server 1,290 / 2,515.
   Oracle's wall time is mostly the server's work and about 100 round trips. The breakdown (client
   CPU, server, network) and the slow-network runs are in
@@ -1033,26 +1033,26 @@ the comparison.
 ## Reproducing
 
 ```sh
-obx/compiler/build.sh                                  # out/obxc from the seed
-python3 obx/bench/bench.py --opt --perf -n 11          # the microbenchmarks (hand-written C and obx -O)
-python3 obx/bench/compile.py -n 3                      # compile time and binary size
-python3 obx/bench/apps.py -n 5 --pin 2                 # the Tier-1 application suite
-python3 obx/bench/regex/bench.py -n 7                  # the regex table (Go, Rust and rg built by it)
-python3 obx/bench/json/bench.py --jq JQ                # the JSON library and jq large-input tables
-python3 obx/tests/markdown.py --perf --ref CMARK       # the Markdown table
-python3 obx/cmd/eza_gate.py -j 12                      # eza correctness on both builds
-obx/compiler/out/obxc obx/cmd/eza.obx -o eza
-obx/tools/native_selfbuild.sh                          # the obx-built compiler
-obx/compiler/out/obxc obx/bench/tasks.obx --native -o tasks && ./tasks
-obx/compiler/out/obxc obx/bench/math/calls.obx --native -o calls && ./calls exp
-python3 obx/bench/decimal/run.py --base DIR            # Decimal, two trees compared
-python3 obx/tools/placement.py                         # code placement spreads
-python3 obx/cmd/http_gate.py                           # the server table (about 2 minutes)
-python3 obx/cmd/http_gate.py --servers native --client --conns 1,100,1000   # the client table
-python3 obx/cmd/http_gate.py --servers native --db 4,16   # with Postgres ($OBX_PG_DSN)
-python3 obx/cmd/http_gate.py --workers 1,2,4,8 --db 4  # worker processes (about 3 minutes)
-python3 obx/tests/httpsrvgen.py -n 100000              # the server's parsing against Go and llhttp
-python3 obx/cmd/tls_bench.py                           # TLS handshakes, bulk and https requests (about 2 minutes)
-python3 obx/bench/dbstream/run.py                      # database streaming against buffered (the servers' DSNs; a quiet machine)
-python3 obx/bench/dbstream/run.py --latency 0,0.12,1.75  # Oracle over ~1 ms and ~5 ms round trips (delayproxy.py)
+lexell/compiler/build.sh                                  # out/lxlc from the seed
+python3 lexell/bench/bench.py --opt --perf -n 11          # the microbenchmarks (hand-written C and Lexell -O)
+python3 lexell/bench/compile.py -n 3                      # compile time and binary size
+python3 lexell/bench/apps.py -n 5 --pin 2                 # the Tier-1 application suite
+python3 lexell/bench/regex/bench.py -n 7                  # the regex table (Go, Rust and rg built by it)
+python3 lexell/bench/json/bench.py --jq JQ                # the JSON library and jq large-input tables
+python3 lexell/tests/markdown.py --perf --ref CMARK       # the Markdown table
+python3 lexell/cmd/eza_gate.py -j 12                      # eza correctness on both builds
+lexell/compiler/out/lxlc lexell/cmd/eza.lxl -o eza
+lexell/tools/native_selfbuild.sh                          # the Lexell-built compiler
+lexell/compiler/out/lxlc lexell/bench/tasks.lxl --native -o tasks && ./tasks
+lexell/compiler/out/lxlc lexell/bench/math/calls.lxl --native -o calls && ./calls exp
+python3 lexell/bench/decimal/run.py --base DIR            # Decimal, two trees compared
+python3 lexell/tools/placement.py                         # code placement spreads
+python3 lexell/cmd/http_gate.py                           # the server table (about 2 minutes)
+python3 lexell/cmd/http_gate.py --servers native --client --conns 1,100,1000   # the client table
+python3 lexell/cmd/http_gate.py --servers native --db 4,16   # with Postgres ($LXL_PG_DSN)
+python3 lexell/cmd/http_gate.py --workers 1,2,4,8 --db 4  # worker processes (about 3 minutes)
+python3 lexell/tests/httpsrvgen.py -n 100000              # the server's parsing against Go and llhttp
+python3 lexell/cmd/tls_bench.py                           # TLS handshakes, bulk and https requests (about 2 minutes)
+python3 lexell/bench/dbstream/run.py                      # database streaming against buffered (the servers' DSNs; a quiet machine)
+python3 lexell/bench/dbstream/run.py --latency 0,0.12,1.75  # Oracle over ~1 ms and ~5 ms round trips (delayproxy.py)
 ```

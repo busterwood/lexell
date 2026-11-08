@@ -2,8 +2,8 @@
 
 This page records where the project came from: mainline **obx** (the original
 garbage-collected dialect), the **obo** ownership fork and its per-stage release
-records, and the **new obx**: obo's ownership model with generics, in
-[obx/](obx/README.md), whose first stages are the last chapter. Start with
+records, and the **new obx**, now **Lexell**: obo's ownership model with generics, in
+[lexell/](lexell/README.md), whose first stages are the last chapter. Start with
 [README.md](README.md).
 
 obo grew out of mainline obx, the original garbage-collected Oberon-derived
@@ -19,6 +19,12 @@ and obo in [archive/obo/](archive/obo/README.md) (its language reference
 [FORK.md](archive/obo/FORK.md) and [design notes](archive/obo/design/README.md)).
 Paths below are as they were when written: mainline obx's `obx/...` is now
 `archive/obx/...`, and `obo/...` is `archive/obo/...`.
+
+> **Renamed to Lexell (2026-11-08).** The project, language and compiler are now
+> Lexell and `lxlc`; source files end in `.lxl`, and the current tree is `lexell/`.
+> Entries written before the rename keep the names and paths they used (`obx`,
+> `obxc`, `obx/...`), and the archived predecessors remain `archive/obx/` and
+> `archive/obo/`.
 
 ## OBX: mainline obx (the original dialect)
 

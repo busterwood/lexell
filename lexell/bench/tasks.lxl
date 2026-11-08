@@ -1,0 +1,253 @@
+// The costs of lib/task (design/concurrency.md, section 7): ns per operation.
+// Not part of bench.py (obo has no tasks): run it with both backends,
+//     lexell/compiler/out/lxlc lexell/bench/tasks.lxl -o t && ./t
+//     lexell/compiler/out/lxlc --native lexell/bench/tasks.lxl -o tn && ./tn
+// and take the best of a few runs. Each figure is the time of a loop divided
+// by its count; the loops' own overhead is included (a few ns).
+import "task"
+import "time"
+import "net"
+
+extern "c" fn absB(x: i32): i32 as "abs" blocking
+
+const N = 1000000
+const BATCH = 50
+
+fn spin(n: int): int {
+    for i in 0..n { task.yield().unwrap() }
+    return n
+}
+
+fn nop(n: int): int { return n }
+
+fn report(name: str, ns: int, n: int) {
+    let tenths = ns * 10 / n
+    let sign = if tenths < 0 { "-" } else { "" }
+    let t = if tenths < 0 { -tenths } else { tenths }
+    println(name + ": " + sign + intToStr(t / 10) + "." + intToStr(t % 10) + " ns")
+}
+
+// a task switch: two tasks yield to each other
+fn switches() {
+    let t0 = time.monotonicNs()
+    task.scope(fn(s: mut &task.Scope) {
+        let a = s.start(spin, N)
+        let b = s.start(spin, N)
+        let r = a.wait().unwrap() + b.wait().unwrap()
+    })
+    report("task switch (yield)", time.monotonicNs() - t0, 2 * N)
+}
+
+// start with a stack from the free list: batches of starts, run between them
+fn starts() {
+    var ns = 0
+    task.scope(fn(s: mut &task.Scope) {
+        for k in 0..N / BATCH {
+            var fs: []task.Future[int] = []
+            let t0 = time.monotonicNs()
+            for i in 0..BATCH { append(mut &fs, s.start(nop, i)) }
+            ns += time.monotonicNs() - t0
+            let r = task.all(fs).unwrap()
+        }
+    })
+    report("start (reused stack)", ns, N)
+}
+
+// start then wait: the wait parks, the task runs and ends, the waiter resumes
+fn startWait() {
+    let t0 = time.monotonicNs()
+    task.scope(fn(s: mut &task.Scope) {
+        for i in 0..N {
+            let f = s.start(nop, i)
+            let r = f.wait().unwrap()
+        }
+    })
+    report("start + wait that parks (round trip)", time.monotonicNs() - t0, N)
+}
+
+// a wait that does not park (the task has finished)
+fn readyWait() {
+    var ns = 0
+    task.scope(fn(s: mut &task.Scope) {
+        for k in 0..N / BATCH {
+            var fs: []task.Future[int] = []
+            for i in 0..BATCH { append(mut &fs, s.start(nop, i)) }
+            task.yield().unwrap()
+            let t0 = time.monotonicNs()
+            while len(fs) > 0 {
+                let f = pop(mut &fs)
+                let r = f.wait().unwrap()
+            }
+            ns += time.monotonicNs() - t0
+        }
+    })
+    report("wait, finished task", ns, N)
+}
+
+fn completes() {
+    var ns = 0
+    for k in 0..N / BATCH {
+        var ps: []task.Promise[int] = []
+        var fs: []task.Future[int] = []
+        for i in 0..BATCH {
+            let task.Handoff{promise: p, future: f} = task.promise[int]()
+            append(mut &ps, p)
+            append(mut &fs, f)
+        }
+        let t0 = time.monotonicNs()
+        var i = 0
+        while len(ps) > 0 {
+            let p = pop(mut &ps)
+            p.complete(i)
+            i += 1
+        }
+        ns += time.monotonicNs() - t0
+        let r = task.all(fs).unwrap()
+    }
+    report("promise complete", ns, N)
+}
+
+fn withs() {
+    let sh = task.shared(0)
+    let t0 = time.monotonicNs()
+    for i in 0..N { sh.with(fn(x: mut &int) { x += 1 }) }
+    let dt = time.monotonicNs() - t0
+    sh.with(fn(x: mut &int) { assert(x == N) })
+    report("Shared.with", dt, N)
+}
+
+// a wait that parks with a timer: start + wait as above, inside within (the
+// timer is set when the waiter parks and removed when the task wakes it)
+fn timedWait() {
+    let t0 = time.monotonicNs()
+    task.scope(fn(s: mut &task.Scope) {
+        let k = task.within(1000000, fn(): int {
+            for i in 0..N {
+                let f = s.start(nop, i)
+                let r = f.wait().unwrap()
+            }
+            return 0
+        })
+    })
+    report("start + wait that parks, with a deadline (timer set, removed)", time.monotonicNs() - t0, N)
+}
+
+fn nap(ms: int): int {
+    task.sleep(ms).unwrap()
+    return ms
+}
+
+fn nudge(ms: int): int {
+    task.yield().unwrap()
+    return ms
+}
+
+const SLEEPERS = 10000
+const ROUNDS = 20
+
+// one batch of SLEEPERS tasks running f, waited for; its time in ns
+fn batch(f: fn(int): int, ms: int): int {
+    let t0 = time.monotonicNs()
+    task.scope(fn(s: mut &task.Scope) {
+        var fs: []task.Future[int] = []
+        for i in 0..SLEEPERS { append(mut &fs, s.start(f, ms)) }
+        let r = task.all(fs).unwrap()
+    })
+    return time.monotonicNs() - t0
+}
+
+// timers that fire: batches of tasks that each sleep 1 ms, against batches of
+// tasks that yield once (the same starts, stacks and switches); the
+// difference beyond the 1 ms, per task, is the timer's cost (set, heap,
+// expiry, wake)
+fn timers() {
+    var ns = 0
+    for k in 0..ROUNDS { ns += batch(nap, 1) - 1000000 - batch(nudge, 1) }
+    report("sleep(1) that fires, beyond a yield (10,000 tasks at once)", ns, SLEEPERS * ROUNDS)
+}
+
+const PINGS = 10000
+
+fn ponger(c: net.Conn): int {
+    var buf = array(1, byte(0))
+    for i in 0..PINGS {
+        c.read(mut &buf).unwrap()
+        c.write(&buf).unwrap()
+    }
+    return 0
+}
+
+// epoll park and wake: two tasks bounce one byte over a TCP connection; each
+// read finds nothing, parks, and is woken through epoll_wait. Mostly the
+// kernel's loopback: compare a C or Python ping-pong on the same machine.
+fn pingPong() {
+    var t0 = 0
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let c = net.connect(ln.localAddr()).unwrap()
+        c.setNoDelay(true).unwrap()
+        let peer = ln.accept().unwrap()
+        peer.setNoDelay(true).unwrap()
+        var buf = array(1, byte(0))
+        t0 = time.monotonicNs()
+        let p = s.start(ponger, peer)
+        for i in 0..PINGS {
+            c.write(&buf).unwrap()
+            c.read(mut &buf).unwrap()
+        }
+        let r = p.wait().unwrap()
+    })
+    report("socket round trip (1 byte each way, both sides park in read)", time.monotonicNs() - t0, PINGS)
+}
+
+// a read that finds data at once (no park): the system call and the wrapper
+fn readyReads() {
+    let ln = net.listen("127.0.0.1:0").unwrap()
+    let c = net.connect(ln.localAddr()).unwrap()
+    let peer = ln.accept().unwrap()
+    let data = array(PINGS, byte(1))
+    peer.write(&data).unwrap()
+    task.sleep(10).unwrap()
+    var buf = array(1, byte(0))
+    let t0 = time.monotonicNs()
+    for i in 0..PINGS { c.read(mut &buf).unwrap() }
+    report("socket read, data waiting (no park)", time.monotonicNs() - t0, PINGS)
+}
+
+const CALLS = 200000
+
+// a blocking extern (SPEC 12) on a C function that does nothing: alone it runs
+// inline; with another task waiting (a sleep) it goes through the helper pool
+// and back (a task parks, a helper runs it, the event loop wakes the task)
+// sleeps until cancelled (its future is dropped)
+fn rest(ms: int): int {
+    let r = task.sleep(ms)
+    return ms
+}
+
+fn blockingCalls() {
+    var t0 = time.monotonicNs()
+    var k = 0
+    for i in 0..CALLS { k += int(absB(i32(i & 1023))) }
+    report("blocking call run inline (nothing else to run)", time.monotonicNs() - t0, CALLS)
+    task.scope(fn(s: mut &task.Scope) {
+        let f = s.start(rest, 1000000)
+        t0 = time.monotonicNs()
+        for i in 0..CALLS { k += int(absB(i32(i & 1023))) }
+        report("blocking call through the helper pool (another task sleeps)", time.monotonicNs() - t0, CALLS)
+    })
+}
+
+fn main() {
+    blockingCalls()
+    switches()
+    starts()
+    startWait()
+    readyWait()
+    completes()
+    withs()
+    timedWait()
+    timers()
+    pingPong()
+    readyReads()
+}

@@ -1,0 +1,387 @@
+// tds's encoders and decoders on byte strings, without a server: packet
+// framing, PRELOGIN both ways, the LOGIN7 layout (MS-TDS 2.2.6.4) and the
+// password scramble, SQLBatch's ALL_HEADERS, UTF-16 both ways, collations
+// and their code pages, a token stream with every core token and type, and
+// T2's: exact and civil types, RETURNVALUE, RPC parameters and requests,
+// transaction manager requests, floats to bits and uniqueidentifiers.
+// needs: ssl
+// expect: packets: 01 00 00 0d 00 00 01 00 61 62 63 64 65 | 01 01 00 0a 00 00 02 00 66 67
+// expect: empty: 0e 01 00 08 00 00 01 00
+// expect: header: type 4 status 1 length 4096 spid 55 id 1 | short: error 1022: tds: a packet length of 7
+// expect: prelogin: 00 00 1a 00 06 01 00 20 00 01 02 00 21 00 01 03 00 22 00 04 04 00 26 00 01 ff 00 01 00 00 00 00 01 00 00 00 00 00 00
+// expect: answer: version 17.0.5035.0 encryption 1 instance 0 mars 0
+// expect: bad prelogin: error 1022: tds: PRELOGIN: the option table has no terminator | error 1022: tds: PRELOGIN: option 1 is out of bounds | error 1022: tds: PRELOGIN: no ENCRYPTION option | error 1022: tds: PRELOGIN: a truncated option
+// expect: scramble a: b3 a5 | secret: 92 a5 f3 a5 93 a5 82 a5 f3 a5 e2 a5
+// expect: login7: length 172 version 04 00 00 74 packet 4096 flags e0 03 00 18 lcid 1033
+// expect: login7 fields: host 94/4 user 102/2 password 106/6 app 118/3 server 124/9 ext 142/4 lib 146/7 lang 160/0 db 160/3 sspi 166 attach 166 change 166
+// expect: login7 text: host=box1 user=sa app=lxl server=127.0.0.1 lib=lxl tds db=app password-scrambled=true
+// expect: login7 feature ext at 166: 0a 00 00 00 00 ff
+// expect: login7 too long: error 1000: the user name is longer than 128 characters | bad utf-8: error 1000: the password: invalid UTF-8 at byte 1
+// expect: batch: 16 00 00 00 12 00 00 00 02 00 01 02 03 04 05 06 07 08 01 00 00 00 53 00 45 00 4c 00 45 00 43 00 54 00 20 00 31 00
+// expect: utf16: 63 00 e9 00 3d d8 00 de | back: café😀 | odd: UTF-16 text has an odd number of bytes | lone: invalid UTF-16: lone surrogate at unit 1
+// expect: collations: 1252 1252 65001 utf8=true 1251 932 950 437 850 0
+// expect: describe: code page 1252 (LCID 0x0409, sort order 52)
+// expect: columns: id bigint, name nvarchar, note varchar, old varchar, f float, r real, b bit, t tinyint, s smallint, big nvarchar size -1, bin varbinary, d date
+// expect: rows 3 count 3
+// expect: row 0: Int(-5) Text(café) Text(naïve) Text(café) Float(2.5) Float(0.10000000149011612) Int(1) Int(255) Int(-2) Text(long😀text) Bytes(0001ff) Date(0540-09-13)
+// expect: row 1: Null Null Null Null Null Null Null Null Null Null Null Null
+// expect: row 2: Int(9223372036854775807) Text() Text(x) Null Float(-0) Null Int(0) Int(0) Int(-32768) Text() Bytes() Null
+// expect: messages: errors [Msg 208, Level 16, State 1, Line 3: Invalid object name 'nope'.] infos [Msg 5701, Level 10, State 2, Line 1: Changed database context to 'master'.]
+// expect: envs: 1 master<-tempdb 4 8192<-4096 7 5 bytes 8 8 bytes
+// expect: loginack: iface 1 tds 74000004 Microsoft SQL Server 17.0.5035 | features 0a:01 | return status -6 | affected 7
+// expect: dones: fd/11/3 ff/10/7 fd/0/0
+// expect: t2 columns: dec decimal, num numeric, m money, sm smallmoney, mf money, d date, t7 time, t0 time, dt2 datetime2, dto datetimeoffset, dt datetime, sdt smalldatetime, dtf datetime, g uniqueidentifier, x xml, v sql_variant
+// expect: t2 row 0: Dec(-123456789.0123456789) Dec(123.45) Dec(12.3400) Dec(-1.5000) Dec(-922337203685477.5808) Date(2026-11-05) Time(13:45:07.1234567) Time(23:59:59) DateTime(2026-11-05T13:45:07.123) Offset(2026-11-05T13:45:07.1234567+01:30) DateTime(2026-11-05T13:45:07.003) DateTime(2026-11-05T13:45:00) DateTime(1753-01-01T00:00:00) Guid(6F9619FF-8B86-D011-B42D-00C04FC964FF) Text(<a>é</a>) Failed(type sql_variant is not supported yet)
+// expect: t2 text 0: -123456789.0123456789 | 123.45 | 12.3400 | -1.5000 | -922337203685477.5808 | 2026-11-05 | 13:45:07.1234567 | 23:59:59 | 2026-11-05 13:45:07.123 | 2026-11-05 13:45:07.1234567 +01:30 | 2026-11-05 13:45:07.003 | 2026-11-05 13:45:00 | 1753-01-01 00:00:00.000 | 6F9619FF-8B86-D011-B42D-00C04FC964FF | <a>é</a> | Failed(type sql_variant is not supported yet)
+// expect: t2 row 1: Null Null Null Null Dec(0.5000) Null Null Null Null Null Null Null DateTime(1900-01-01T00:00:00) Null Null Null
+// expect: t2 text 1: Null | Null | Null | Null | 0.5000 | Null | Null | Null | Null | Null | Null | Null | 1900-01-01 00:00:00.000 | Null | Null | Null
+// expect: t2 row 2: Dec(-9999999999999999999999999999.9999999999) Dec(0.00) Dec(922337203685477.5807) Dec(-214748.3648) Dec(0.0000) Date(0001-01-01) Time(23:59:59.9999999) Time(00:00:00) DateTime(9999-12-31T23:59:59.999) Offset(0001-01-01T00:00:00-14:00) DateTime(9999-12-31T23:59:59.997) DateTime(2079-06-06T23:59:00) DateTime(9999-12-31T00:00:00) Guid(00000000-0000-0000-0000-000000000000) Text() Null
+// expect: t2 text 2: -9999999999999999999999999999.9999999999 | 0.00 | 922337203685477.5807 | -214748.3648 | 0.0000 | 0001-01-01 | 23:59:59.9999999 | 00:00:00 | 9999-12-31 23:59:59.999 | 0001-01-01 00:00:00.0000000 -14:00 | 9999-12-31 23:59:59.997 | 2079-06-06 23:59:00 | 9999-12-31 00:00:00.000 | 00000000-0000-0000-0000-000000000000 |  | Null
+// expect: t2 returnvalues: 1 @o status 1 bigint Int(42); 2 @s status 1 nvarchar Text(x21) | statuses 1 | counts ff:3/0
+// expect: bad values: Failed(a decimal of more than 38 digits); Failed(a time of day past midnight); Failed(a date out of range); Failed(a datetime out of range); Failed(a smalldatetime of 1440 minutes); Failed(an offset of 1440 minutes); Failed(a datetime2(7) of 7 bytes); Failed(a money value of 5 bytes)
+// expect: collation bytes: 09 04 10 00 34 | back code page 1252 (LCID 0x0409, sort order 52)
+// expect: int: bigint: 26 08 | 08 fe ff ff ff ff ff ff ff
+// expect: bit: bit: 68 01 | 01 01
+// expect: float: float: 6d 08 | 08 9a 99 99 99 99 99 b9 3f | nan: error 1004: SQL Server float has no NaN or Infinity | subnormal: error 1000: SQL Server float has no subnormal numbers: -5e-324 | smallest normal true
+// expect: text: nvarchar(4000): e7 40 1f 09 04 10 00 34 | 02 00 e9 00
+// expect: text 4001: nvarchar(max) e7 ff ff 09 04 10 00 34 | 42 1f 00 00 00 00 00 00 42 1f 00 00 ... 00 00 00 00 (8018 bytes)
+// expect: text 4000: nvarchar(4000) | bad: error 1000: text value: invalid UTF-8 at byte 1
+// expect: bytes: varbinary(8000): a5 40 1f | 02 00 00 ff | 8001: varbinary(max) | empty: varbinary(8000): a5 40 1f | 00 00
+// expect: decimal: decimal(4,2): 6a 11 04 02 | 05 01 e2 04 00 00
+// expect: decimal small: decimal(3,3): 6a 11 03 03 | 05 00 01 00 00 00
+// expect: decimal zero: decimal(2,2): 6a 11 02 02 | 05 01 00 00 00 00 | 1e3: decimal(4,0)
+// expect: decimal 38: decimal(38,10): 6a 11 26 0a | 11 00 ff ff ff ff 3f 22 8a 09 7a c4 86 5a a8 4c 3b 4b
+// expect: decimal 39 digits: error 1011: 100000000000000000000000000000000000000 does not fit SQL Server's decimal(38) | 1e-39: error 1013: decimal needs more than 38 fraction digits
+// expect: null int: int: 26 04 | 00
+// expect: null BIGINT: BIGINT: 26 08 | 00
+// expect: null varbinary(max): varbinary(max): a5 ff ff | ff ff ff ff ff ff ff ff
+// expect: null nvarchar(10): nvarchar(10): e7 14 00 09 04 10 00 34 | ff ff
+// expect: null decimal(10, 2): decimal(10, 2): 6a 11 0a 02 | 00
+// expect: null datetime2(3): datetime2(3): 2a 03 | 00
+// expect: null time: time: 29 07 | 00
+// expect: null xml: xml: f1 00 | ff ff ff ff ff ff ff ff
+// expect: null char(5): char(5): af 05 00 09 04 10 00 34 | ff ff
+// expect: null uniqueidentifier: uniqueidentifier: 24 10 | 00
+// expect: not types: error 1000: a type that parameters cannot have yet: geography | error 1000: a type that parameters cannot have yet: varchar(9000) | error 1000: a type that parameters cannot have yet: nvarchar(4001) | error 1000: a type that parameters cannot have yet: decimal(39) | error 1000: a type that parameters cannot have yet: decimal(5,6) | error 1000: a type that parameters cannot have yet: time(8) | error 1000: a type that parameters cannot have yet: char(max) | error 1000: a type name without its ')': int( | error 1000: a type that parameters cannot have yet: datetime2(x)
+// expect: rpc: 16 00 00 00 12 00 00 00 02 00 01 02 03 04 05 06 07 08 01 00 00 00 ff ff 0a 00 00 00
+// expect: rpc stmt: 00 00 e7 40 1f 09 04 10 00 34 14 00 SELECT @p1
+// expect: rpc params: 00 00 e7 40 1f 09 04 10 00 34 42 00 @p1 bigint, @o nvarchar(5) OUTPUT
+// expect: rpc p1, o: 03 40 00 70 00 31 00 00 26 08 08 07 00 00 00 00 00 00 00 02 40 00 6f 00 01 e7 0a 00 09 04 10 00 34 ff ff
+// expect: rpc unnamed: error 1000: a parameter's name must be @ and 1 to 127 letters, digits or _ @ # $
+// expect: tm begin: 16 00 00 00 12 00 00 00 02 00 00 00 00 00 00 00 00 00 01 00 00 00 05 00 00 00 | commit: 07 00 00 00 | rollback: 08 00 00 00
+// expect: float bits: 0000000000000000 8000000000000000 3ff0000000000000 c004000000000000 3fb999999999999a 7fefffffffffffff 0010000000000000 0000000000000001 8000000000000bdc 419d6f3454800000
+// expect: guid: 6F9619FF-8B86-D011-B42D-00C04FC964FF | back ff 19 96 6f 86 8b 11 d0 b4 2d 00 c0 4f c9 64 ff | bad true true
+
+import "tds"
+import "strings"
+import "sqldialect"
+import "math"
+import "../support/tdstest" as tt
+
+fn hex(b: &[byte]): str {
+    var out = newStrBuf()
+    for i in 0..len(b) {
+        if i > 0 { out.add(" ") }
+        out.add(strings.padLeft(strings.hex(int(b[i])), 2, '0'))
+    }
+    return out.toStr()
+}
+
+fn hexs(s: str): str { return hex(&strToBytes(s)) }
+
+fn le16(b: &[byte], at: int): int { return int(b[at]) | (int(b[at + 1]) << 8) }
+
+fn le32(b: &[byte], at: int): int { return le16(b, at) | (le16(b, at + 2) << 16) }
+
+// The text of a LOGIN7 field whose offset and length are at b[at..].
+fn field(b: &[byte], at: int): str {
+    let off = le16(b, at)
+    return tds.fromUtf16(strFromBytes(&b[off..off + 2 * le16(b, at + 2)])).unwrap()
+}
+
+fn errText[T](r: Result[T, tds.Error]): str {
+    match r {
+        Ok(_) { return "ok" }
+        Err(e) { return e.toStr() }
+    }
+}
+
+fn cellText(c: &tds.Cell): str {
+    match c {
+        tds.Cell.Null { return "Null" }
+        tds.Cell.Int(n) { return "Int(" + n.toStr() + ")" }
+        tds.Cell.Float(f) { return "Float(" + f.toStr() + ")" }
+        tds.Cell.Text(t) { return "Text(" + t + ")" }
+        tds.Cell.Bytes(b) { return "Bytes(" + strings.replaceAll(hexs(b), " ", "") + ")" }
+        tds.Cell.Failed(m) { return "Failed(" + m + ")" }
+        tds.Cell.Dec(d) { return "Dec(" + d.toStr() + ")" }
+        tds.Cell.Date(d) { return "Date(" + d.toStr() + ")" }
+        tds.Cell.Time(t) { return "Time(" + t.toStr() + ")" }
+        tds.Cell.DateTime(l) { return "DateTime(" + l.toStr() + ")" }
+        tds.Cell.Offset(o) { return "Offset(" + o.toStr() + ")" }
+        tds.Cell.Guid(g) { return "Guid(" + g + ")" }
+    }
+}
+
+// A cell's text as SQL Server writes it, or its Cell form.
+fn asText(col: &tds.Column, c: &tds.Cell): str {
+    match tds.cellText(col, c) {
+        Some(t) { return t }
+        None { return cellText(c) }
+    }
+}
+
+fn paramHex(p: &tds.Param): str { return p.declared + ": " + hexs(p.typeInfo) + " | " + hexs(p.data) }
+
+fn messages(ms: &[]tds.Message): str {
+    var parts: []str = []
+    for m in ms { append(mut &parts, m.toStr()) }
+    return "[" + strings.join(&parts, "; ") + "]"
+}
+
+fn main() {
+    // ---- packets
+    let p = tds.packets(1, "abcdefg", 13)
+    println("packets: " + hex(&p[0..13]) + " | " + hex(&p[13..len(p)]))
+    println("empty: " + hex(&tds.packets(14, "", 4096)))
+    let h = tds.parseHeader(&strToBytes("\x04\x01\x10\x00\x00\x37\x01\x00")).unwrap()
+    println("header: type " + h.ptype.toStr() + " status " + h.status.toStr() + " length " + h.length.toStr() + " spid " +
+            h.spid.toStr() + " id " + h.id.toStr() + " | short: " + errText(tds.parseHeader(&strToBytes("\x04\x01\x00\x07\x00\x00\x01\x00"))))
+
+    // ---- PRELOGIN
+    println("prelogin: " + hexs(tds.preloginRequest(tds.ENCRYPT_ON)))
+    var ans = tt.bytesOf()
+    for x in [0, 0, 21, 0, 6, 1, 0, 27, 0, 1, 2, 0, 28, 0, 1, 4, 0, 29, 0, 1, 0xff] { ans.u8(x) }
+    for x in [17, 0, 0x13, 0xab, 0, 0, 1, 0, 0] { ans.u8(x) }
+    let pre = tds.parsePrelogin(ans.str()).unwrap()
+    println("answer: version " + pre.version + " encryption " + pre.encryption.toStr() + " instance " + pre.instance.toStr() +
+            " mars " + pre.mars.toStr())
+    println("bad prelogin: " + errText(tds.parsePrelogin("\x02\x00\x05\x00\x00")) + " | " +
+            errText(tds.parsePrelogin("\x01\x00\x10\x00\x01\xff")) + " | " +
+            errText(tds.parsePrelogin("\x02\x00\x06\x00\x00\xff")) + " | " + errText(tds.parsePrelogin("\x00\x00")))
+
+    // ---- LOGIN7
+    println("scramble a: " + hex(&tds.scramble(&tds.toUtf16("a").unwrap())) + " | secret: " +
+            hex(&tds.scramble(&tds.toUtf16("secret").unwrap())))
+    let l = tds.Login{hostName: "box1", userName: "sa", password: "secret", appName: "lxl", serverName: "127.0.0.1",
+                      library: "lxl tds", language: "", database: "app", packetSize: 4096, clientPid: 0, utf8: true}
+    let lb = strToBytes(tds.login7(&l).unwrap())
+    println("login7: length " + le32(&lb, 0).toStr() + " version " + hex(&lb[4..8]) + " packet " + le32(&lb, 8).toStr() +
+            " flags " + hex(&lb[24..28]) + " lcid " + le32(&lb, 32).toStr())
+    var f = newStrBuf()
+    let names = ["host", "user", "password", "app", "server", "ext", "lib", "lang", "db"]
+    for i in 0..9 {
+        if i > 0 { f.add(" ") }
+        f.add(names[i] + " " + le16(&lb, 36 + 4 * i).toStr() + "/" + le16(&lb, 38 + 4 * i).toStr())
+    }
+    println("login7 fields: " + f.toStr() + " sspi " + le16(&lb, 78).toStr() + " attach " + le16(&lb, 82).toStr() +
+            " change " + le16(&lb, 86).toStr())
+    let ls = strFromBytes(&lb)
+    let pwAt = le16(&lb, 44)
+    let pw = ls[pwAt..pwAt + 2 * le16(&lb, 46)]
+    println("login7 text: host=" + field(&lb, 36) + " user=" + field(&lb, 40) + " app=" + field(&lb, 48) + " server=" +
+            field(&lb, 52) + " lib=" + field(&lb, 60) + " db=" + field(&lb, 68) + " password-scrambled=" +
+            (pw == strFromBytes(&tds.scramble(&tds.toUtf16("secret").unwrap()))).toStr())
+    let extAt = le32(&lb, le16(&lb, 56))
+    println("login7 feature ext at " + extAt.toStr() + ": " + hex(&lb[extAt..len(lb)]))
+    var long = l
+    long.userName = strings.padLeft("", 129, 'u')
+    var badPw = l
+    badPw.password = "a\xff"
+    println("login7 too long: " + errText(tds.login7(&long)) + " | bad utf-8: " + errText(tds.login7(&badPw)))
+
+    // ---- SQLBatch
+    println("batch: " + hexs(tds.sqlBatch("SELECT 1", "\x01\x02\x03\x04\x05\x06\x07\x08").unwrap()))
+
+    // ---- UTF-16
+    let u = tds.toUtf16("cé😀").unwrap()
+    let us = strFromBytes(&u)
+    println("utf16: " + hex(&u) + " | back: " + tds.fromUtf16("c\x00a\x00f\x00\xe9\x00" + us[4..]).unwrap() + " | odd: " +
+            tds.fromUtf16("a\x00b").unwrapErr() + " | lone: " + tds.fromUtf16("a\x00\x3d\xd8b\x00").unwrapErr())
+
+    // ---- collations
+    let cs = [tds.Collation{lcid: 0x0409, flags: 1, version: 0, sortId: 52},
+              tds.Collation{lcid: 0x0407, flags: 1, version: 2, sortId: 0},
+              tds.Collation{lcid: 0x0409, flags: 0x41, version: 2, sortId: 0},
+              tds.Collation{lcid: 0x0419, flags: 1, version: 0, sortId: 0},
+              tds.Collation{lcid: 0x0411, flags: 1, version: 0, sortId: 0},
+              tds.Collation{lcid: 0x0404, flags: 1, version: 0, sortId: 0},
+              tds.Collation{lcid: 0x0409, flags: 1, version: 0, sortId: 32},
+              tds.Collation{lcid: 0x0409, flags: 1, version: 0, sortId: 42},
+              tds.Collation{lcid: 0x0476, flags: 1, version: 0, sortId: 0}]
+    var cp = newStrBuf()
+    for i in 0..len(cs) {
+        if i > 0 { cp.add(" ") }
+        cp.add(cs[i].codePage().toStr())
+        if i == 2 { cp.add(" utf8=" + cs[i].utf8().toStr()) }
+    }
+    println("collations: " + cp.toStr())
+    let parsed = tds.parseCollation("\x09\x04\x10\x00\x34").unwrap()
+    println("describe: " + parsed.describe())
+
+    // ---- a reply
+    let r = tds.decode(tt.stream(), 1000).unwrap()
+    let rs = &r.results[0]
+    var cn: []str = []
+    for c in rs.columns {
+        var t = c.name + " " + c.typeName()
+        if c.size < 0 { t = t + " size -1" }
+        append(mut &cn, t)
+    }
+    println("columns: " + strings.join(&cn, ", "))
+    println("rows " + len(rs.rows).toStr() + " count " + rs.count.toStr())
+    for i in 0..len(rs.rows) {
+        var cells: []str = []
+        for c in rs.rows[i] { append(mut &cells, cellText(&c)) }
+        println("row " + i.toStr() + ": " + strings.join(&cells, " "))
+    }
+    println("messages: errors " + messages(&r.errors) + " infos " + messages(&r.infos))
+    var ev: []str = []
+    for e in r.envs {
+        if e.kind == 1 || e.kind == 4 {
+            append(mut &ev, e.kind.toStr() + " " + e.newValue + "<-" + e.oldValue)
+        } else {
+            append(mut &ev, e.kind.toStr() + " " + len(e.newValue).toStr() + " bytes")
+        }
+    }
+    println("envs: " + strings.join(&ev, " "))
+    let ack = r.loginAck.unwrap()
+    var feats: []str = []
+    for x in r.features { append(mut &feats, strings.padLeft(strings.hex(x.id), 2, '0') + ":" + strings.replaceAll(hexs(x.data), " ", "")) }
+    println("loginack: iface " + ack.iface.toStr() + " tds " + strings.hex(ack.tdsVersion) + " " + ack.progName + " " +
+            ack.version + " | features " + strings.join(&feats, ",") + " | return status " + r.returnStatus.unwrap().toStr() +
+            " | affected " + r.affected.toStr())
+    var ds: []str = []
+    for d in r.dones { append(mut &ds, strings.hex(d.token) + "/" + strings.hex(d.status) + "/" + d.count.toStr()) }
+    println("dones: " + strings.join(&ds, " "))
+
+    // ---- T2's types, RETURNVALUE, an RPC's reply
+    let r2 = tds.decode(tt.stream2(), 1000).unwrap()
+    let s2 = &r2.results[0]
+    var cn2: []str = []
+    for c in s2.columns { append(mut &cn2, c.name + " " + c.typeName()) }
+    println("t2 columns: " + strings.join(&cn2, ", "))
+    for i in 0..len(s2.rows) {
+        var cells: []str = []
+        var texts: []str = []
+        for k in 0..len(s2.columns) {
+            append(mut &cells, cellText(&s2.rows[i][k]))
+            append(mut &texts, asText(&s2.columns[k], &s2.rows[i][k]))
+        }
+        println("t2 row " + i.toStr() + ": " + strings.join(&cells, " "))
+        println("t2 text " + i.toStr() + ": " + strings.join(&texts, " | "))
+    }
+    var rv: []str = []
+    for v in r2.returnValues {
+        append(mut &rv, v.ordinal.toStr() + " " + v.name + " status " + v.status.toStr() + " " + v.column.typeName() + " " +
+               cellText(&v.value))
+    }
+    var cs2: []str = []
+    for x in r2.counts { append(mut &cs2, strings.hex(x.token) + ":" + x.rows.toStr() + "/" + x.resultSet.toStr()) }
+    println("t2 returnvalues: " + strings.join(&rv, "; ") + " | statuses " + len(r2.statuses).toStr() + " | counts " +
+            strings.join(&cs2, " "))
+
+    // values whose framing is right but whose content is not
+    var bad = tt.bytesOf()
+    bad.u8(tds.TK_COLMETADATA)
+    bad.u16(8)
+    for c in [tds.T_DECIMALN, tds.T_TIMEN, tds.T_DATEN, tds.T_DATETIMN, tds.T_DATETIMN, tds.T_DATETIMEOFFSETN, tds.T_DATETIME2N, tds.T_MONEYN] {
+        bad.col("c", c)
+        if c == tds.T_DECIMALN {
+            for x in [17, 38, 0] { bad.u8(x) }
+        } else if c == tds.T_TIMEN || c == tds.T_DATETIMEOFFSETN || c == tds.T_DATETIME2N {
+            bad.u8(7)
+        } else if c == tds.T_DATETIMN || c == tds.T_MONEYN {
+            bad.u8(8)
+        }
+        bad.name("c")
+    }
+    bad.u8(tds.TK_ROW)
+    bad.u8(17)
+    bad.u8(1)
+    for i in 0..16 { bad.u8(0xff) }                       // 2^128 - 1
+    bad.u8(5)
+    bad.le(864000000000, 5)                               // 24:00:00
+    bad.u8(3)
+    bad.le(3652059, 3)                                    // 10000-01-01
+    bad.u8(8)
+    bad.u32(0)
+    bad.u32(25920000)                                     // a day of ticks
+    bad.u8(4)
+    bad.u16(0)
+    bad.u16(1440)                                         // smalldatetime at 24:00 (in a datetime column of 4 bytes)
+    bad.u8(10)
+    bad.le(0, 5)
+    bad.le(0, 3)
+    bad.le(1440, 2)                                       // an offset of 24 hours
+    bad.u8(7)
+    bad.le(0, 7)                                          // datetime2(7) is 8 bytes
+    bad.u8(5)
+    bad.raw("\x01\x02\x03\x04\x05")                       // money is 4 or 8 bytes
+    bad.done(tds.TK_DONE, 0, 0, 0)
+    let rb = tds.decode(bad.str(), 100).unwrap()
+    var fails: []str = []
+    for c in rb.results[0].rows[0] { append(mut &fails, cellText(&c)) }
+    println("bad values: " + strings.join(&fails, "; "))
+
+    // ---- parameters
+    let coll = tds.Collation{lcid: 0x0409, flags: 1, version: 0, sortId: 52}
+    println("collation bytes: " + hexs(tds.collationBytes(&coll)) + " | back " + tds.parseCollation(tds.collationBytes(&coll)).unwrap().describe())
+    println("int: " + paramHex(&tds.intParam(-2)))
+    println("bit: " + paramHex(&tds.bitParam(true)))
+    println("float: " + paramHex(&tds.floatParam(0.1f).unwrap()) + " | nan: " + errText(tds.floatParam(math.nan())) + " | subnormal: " + errText(tds.floatParam(-4.9e-324f)) + " | smallest normal " + tds.floatParam(2.2250738585072014e-308f).isOk().toStr())
+    println("text: " + paramHex(&tds.textParam("é", &coll).unwrap()))
+    let longText = tds.textParam(strings.padLeft("", 4001, 'x'), &coll).unwrap()
+    println("text 4001: " + longText.declared + " " + hexs(longText.typeInfo) + " | " + hexs(longText.data[0..12]) + " ... " +
+            hexs(longText.data[len(longText.data) - 4..]) + " (" + len(longText.data).toStr() + " bytes)")
+    println("text 4000: " + tds.textParam(strings.padLeft("", 4000, 'x'), &coll).unwrap().declared + " | bad: " +
+            errText(tds.textParam("a\xff", &coll)))
+    println("bytes: " + paramHex(&tds.bytesParam("\x00\xff")) + " | 8001: " + tds.bytesParam(strings.padLeft("", 8001, 'x')).declared +
+            " | empty: " + paramHex(&tds.bytesParam("")))
+    println("decimal: " + paramHex(&tds.decimalParam(12.50m).unwrap()))
+    println("decimal small: " + paramHex(&tds.decimalParam(-0.001m).unwrap()))
+    println("decimal zero: " + paramHex(&tds.decimalParam(0.00m).unwrap()) + " | 1e3: " + tds.decimalParam(1.5e3m).unwrap().declared)
+    let d38 = sqldialect.parseDecimal("-9999999999999999999999999999.9999999999").unwrap()
+    println("decimal 38: " + paramHex(&tds.decimalParam(d38).unwrap()))
+    println("decimal 39 digits: " + errText(tds.decimalParam(sqldialect.parseDecimal("1e38").unwrap())) + " | 1e-39: " +
+            errText(tds.decimalParam(sqldialect.parseDecimal("1e-39").unwrap())))
+    for t in ["int", "BIGINT", "varbinary(max)", "nvarchar(10)", "decimal(10, 2)", "datetime2(3)", "time", "xml", "char(5)", "uniqueidentifier"] {
+        println("null " + t + ": " + paramHex(&tds.nullParam(t, &coll).unwrap()))
+    }
+    var nots: []str = []
+    for t in ["geography", "varchar(9000)", "nvarchar(4001)", "decimal(39)", "decimal(5,6)", "time(8)", "char(max)", "int(", "datetime2(x)"] {
+        append(mut &nots, errText(tds.typeInfoOf(t, &coll)))
+    }
+    println("not types: " + strings.join(&nots, " | "))
+
+    // ---- RPC and transactions
+    var p1 = tds.intParam(7)
+    p1.name = "@p1"
+    var o1 = tds.nullParam("nvarchar(5)", &coll).unwrap()
+    o1.name = "@o"
+    o1.output = true
+    let rpc = tds.executeSql("SELECT @p1", &[p1, o1], "\x01\x02\x03\x04\x05\x06\x07\x08", &coll).unwrap()
+    println("rpc: " + hexs(rpc[0..28]))
+    // @stmt: name (none), status, TYPE_INFO (8 bytes), length, text
+    println("rpc stmt: " + hexs(rpc[28..40]) + " " + tds.fromUtf16(rpc[40..60]).unwrap())
+    let dlen = int(rpc[70]) | (int(rpc[71]) << 8)
+    println("rpc params: " + hexs(rpc[60..72]) + " " + tds.fromUtf16(rpc[72..72 + dlen]).unwrap())
+    println("rpc p1, o: " + hexs(rpc[72 + dlen..]))
+    var unnamed = tds.intParam(1)
+    println("rpc unnamed: " + errText(tds.executeSql("SELECT 1", &[unnamed], tds.noTransaction(), &coll)))
+    println("tm begin: " + hexs(tds.tmRequest(tds.TM_BEGIN_XACT, tds.noTransaction())) + " | commit: " +
+            hexs(tds.tmRequest(tds.TM_COMMIT_XACT, "\x01\x02\x03\x04\x05\x06\x07\x08")[22..]) + " | rollback: " +
+            hexs(tds.tmRequest(tds.TM_ROLLBACK_XACT, tds.noTransaction())[22..]))
+
+    // ---- floats to bits, uniqueidentifiers
+    var fb: []str = []
+    let fs: []float = [0.0f, -0.0f, 1.0f, -2.5f, 0.1f, 1.7976931348623157e308f, 2.2250738585072014e-308f, 4.9e-324f, -1.5e-320f, 123456789.125f]
+    for x in fs {
+        let b = tds.bitsOfFloat(x)
+        append(mut &fb, strings.padLeft(strings.hex((b >> 32) & 0xffffffff), 8, '0') + strings.padLeft(strings.hex(b & 0xffffffff), 8, '0') + (if tds.floatOfBits(b).toStr() == x.toStr() { "" } else { " differs" }))
+    }
+    println("float bits: " + strings.join(&fb, " "))
+    println("guid: " + tds.guidText("\xff\x19\x96\x6f\x86\x8b\x11\xd0\xb4\x2d\x00\xc0\x4f\xc9\x64\xff") + " | back " +
+            hexs(tds.guidBytes("{6f9619ff-8b86-d011-b42d-00c04fc964ff}").unwrap()) + " | bad " +
+            tds.guidBytes("6f9619ff-8b86-d011-b42d-00c04fc964fg").isNone().toStr() + " " + tds.guidBytes("6f9619ff").isNone().toStr())
+}

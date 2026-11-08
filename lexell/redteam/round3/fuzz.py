@@ -1,0 +1,66 @@
+#!/usr/bin/env python3
+"""Mutation fuzzer: mutate test programs token-wise and report compiler crashes
+(`lxlc --emit-c` under LXL_CHECK=1: any result but exit 0, or exit 1 with one `file:line: message`,
+is a crash or a leak; no C build unless FZGCC=1). usage: fuzz.py N seed
+The compiler is $LXLC, else compiler/out/lxlc (until ref was retired this caught ref's Python
+tracebacks in-process; compiler/fuzz.py is the general mutant fuzzer)."""
+import os, sys, random, re, glob, subprocess
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(HERE, '..', '..', 'tools'))
+import cbuild
+MESSAGE = re.compile(r'^[^\n]+:\d+: [^\n]+\n?$')
+srcs = sorted(glob.glob(os.path.join(HERE, 'cases', '*.lxl')))
+TOK = re.compile(r'\s+|//[^\n]*|"(?:\\.|[^"\\])*"|\w+|..?')
+EXTRA = ['&', 'mut &', 'move(', ')', '[', ']', '{', '}', 'try ', '-', '0', '..', '.', ',', ';', '\n', 'T', 'int',
+         'str', '[]', 'fn ', 'return', 'break', 'None', 'Some(', 'x', 'self', '_', 'match ', 'value ', '<<', '%', '[..]', '[0..1]', '[1..]', '[..0]', '&[int]', 'mut &[int]', 'xs', 's', '""', '"a\\0b"',
+         'fn(', 'fn() ', 'fn(x) ', '&fn()', '&fn(int): int', 'never', 'once ', '.get()', '.set(', '.isSet()',
+         '1.5e3m', '2e-7f', 'let P{', 'var ', 'B.', 'Option.', 'Shape.', ': never', 'f()', 'exit(1)', 'panic("x")',
+         'while true ', 'as "abs"', 'n', 'b', 'r', 'reset(s)', 'call(fn() { xs = [] })']
+def mutate(s, r):
+    toks = [t for t in TOK.findall(s)]
+    for _ in range(r.randint(1, 3)):
+        i = r.randrange(len(toks))
+        op = r.random()
+        if op < 0.3: del toks[i]
+        elif op < 0.6: toks.insert(i, r.choice(EXTRA))
+        elif op < 0.8: toks[i] = r.choice(toks)
+        else:
+            j = r.randrange(len(toks)); toks[i], toks[j] = toks[j], toks[i]
+    return ''.join(toks)
+GCC = os.environ.get('FZGCC') == '1'
+def main():
+    n, seed = int(sys.argv[1]), int(sys.argv[2])
+    r = random.Random(seed)
+    seen = {}
+    path = os.path.join(HERE, 'build', f'fz{seed}.lxl')
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    for k in range(n):
+        src = open(r.choice(srcs)).read()
+        m = mutate(src, r)
+        open(path, 'w').write(m)
+        c = subprocess.run(cbuild.lxlc_argv() + [path, '--emit-c'], capture_output=True, text=True,
+                           errors='replace', env=dict(os.environ, LXL_CHECK='1'))
+        if c.returncode == 1 and MESSAGE.match(c.stderr):
+            continue
+        if c.returncode != 0 or c.stderr:
+            last = (c.stderr.strip().splitlines() or [''])[-1]
+            key = ('EXIT', c.returncode, re.sub(r'[^a-z ]', '', last)[:40])
+            if key not in seen:
+                seen[key] = m
+                out = os.path.join(HERE, 'build', f'crash_{c.returncode}_{len(seen)}_{seed}.lxl')
+                open(out, 'w').write(m)
+                print(key, last[:100], '->', out, flush=True)
+            continue
+        csrc = c.stdout
+        if GCC:
+            cf = path[:-4] + '.c'; open(cf, 'w').write(csrc)
+            g = subprocess.run(['gcc', '-fsyntax-only', '-w', '-std=gnu11', cf], capture_output=True, text=True)
+            if g.returncode:
+                line = next((l for l in g.stderr.splitlines() if 'error' in l), '')
+                key = ('CC', re.sub(r'[^a-z ]', '', line.split('error:')[-1])[:40])
+                if key not in seen:
+                    seen[key] = m
+                    out = os.path.join(HERE, 'build', f'ccfail_{len(seen)}_{seed}.lxl'); open(out, 'w').write(m)
+                    print(key, line[:150], '->', out, flush=True)
+    print('done', len(seen))
+main()
