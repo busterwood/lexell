@@ -1870,10 +1870,9 @@ fn siftDown[T: Ord](xs: mut &[T], start: int, end: int) {
 // A hash map that keeps its entries in insertion order in three parallel
 // arrays (keys, values, hashes) and finds them through an open-addressing
 // index (linear probing, at most half full). keyAt(i)/valAt(i) for i in
-// 0..size() walk the entries in insertion order. put appends; remove keeps
-// that order by shifting the tail down (O(size)); swapRemove is the O(1)
-// variant, and it is the only operation that changes the order (the last
-// entry moves into the hole).
+// 0..size() walk the entries in insertion order. put appends; remove moves
+// the last entry into the hole, so it changes that order (O(1)); removeStable
+// shifts the tail down and keeps it (O(size)).
 //
 // A slot of the index is a u32: 0 when empty, else the entry number plus one
 // in its low b bits (len(index) = 2^b, and there are at most 2^(b-1) + 1
@@ -2030,35 +2029,10 @@ pub fn (m: mut &Map[K, V]) put(k: K, v: V) {
     if 2 * len(m.keys) > len(m.index) { m.grow() }
 }
 
-// Removes k and returns its value, if it was there. The remaining entries keep
-// their insertion order: the tail shifts down, so this costs O(size); use
-// swapRemove when the order does not matter.
-pub fn (m: mut &Map[K, V]) remove(k: &K): Option[V] {
-    let p = m.find(k, k.hash())
-    if p.entry < 0 { return None }
-    m.unlink(p.slot)
-    let last = len(m.keys) - 1
-    var i = p.entry
-    while i < last {
-        swap(mut &m.keys, i, i + 1)
-        swap(mut &m.vals, i, i + 1)
-        swap(mut &m.hashes, i, i + 1)
-        i += 1
-    }
-    pop(mut &m.keys)
-    pop(mut &m.hashes)
-    let v = pop(mut &m.vals)
-    // Removing the last entry shifts nothing, so no slot changed its entry
-    // number; only a middle removal needs the index rebuilt.
-    if p.entry != last { m.reindex() }
-    return Some(v)
-}
-
 // Removes k and returns its value, if it was there, in O(1): the last entry
-// moves into the hole, so the insertion order of the rest changes. This is
-// the old remove; it is the right choice when the map is used as a set and
-// the order is not observed.
-pub fn (m: mut &Map[K, V]) swapRemove(k: &K): Option[V] {
+// moves into the hole, so the insertion order of the remaining entries
+// changes. removeStable keeps that order at O(size).
+pub fn (m: mut &Map[K, V]) remove(k: &K): Option[V] {
     let p = m.find(k, k.hash())
     if p.entry < 0 { return None }
     m.unlink(p.slot)
@@ -2074,6 +2048,45 @@ pub fn (m: mut &Map[K, V]) swapRemove(k: &K): Option[V] {
     pop(mut &m.keys)
     pop(mut &m.hashes)
     return Some(pop(mut &m.vals))
+}
+
+// Removes k and returns its value, if it was there, keeping the insertion
+// order of the remaining entries: the tail shifts down, so this costs
+// O(size). It is meant for small maps or rare removals; remove is O(1).
+pub fn (m: mut &Map[K, V]) removeStable(k: &K): Option[V] {
+    let p = m.find(k, k.hash())
+    if p.entry < 0 { return None }
+    m.unlink(p.slot)
+    let last = len(m.keys) - 1
+    var i = p.entry
+    while i < last {
+        swap(mut &m.keys, i, i + 1)
+        swap(mut &m.vals, i, i + 1)
+        swap(mut &m.hashes, i, i + 1)
+        i += 1
+    }
+    pop(mut &m.keys)
+    pop(mut &m.hashes)
+    let v = pop(mut &m.vals)
+    // Removing the last entry shifts nothing, so no slot changed its entry
+    // number; a middle removal decrements the numbers of the entries that
+    // shifted. That is one pass over the index with no rehash.
+    if p.entry != last { m.shiftEntries(p.entry) }
+    return Some(v)
+}
+
+// Entry e was removed and the tail shifted down by one: every index slot that
+// named an entry after e now names one less. The tags stay; only the low
+// entry+1 field changes. O(len(index)), no hashing.
+fn (m: mut &Map[K, V]) shiftEntries(e: int) {
+    let low = u32(len(m.index) - 1)
+    let cut = u32(e + 1)
+    for i in 0..len(m.index) {
+        let s = m.index[i]
+        if s == 0 { continue }
+        let num = s & low
+        if num > cut { m.index[i] = (s & ~low) | (num - 1) }
+    }
 }
 
 pub fn (m: mut &Map[K, V]) clear() {
