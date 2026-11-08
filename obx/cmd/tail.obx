@@ -60,29 +60,6 @@ type ReadStats = record {
     failed: bool           // a read error ended the scan
 }
 
-// An io.Reader read in chunks.
-type Reader = record {
-    src: io.Reader
-    buf: []byte
-    n: int
-}
-
-fn newReader(src: io.Reader): Reader {
-    return Reader{src: src, buf: array(CHUNK, 0), n: 0}
-}
-
-// Reads the next chunk: its length, 0 at the end of the input, or minus the
-// errno.
-fn (r: mut &Reader) fill(): int {
-    match r.src.read(mut &r.buf) {
-        Ok(k) {
-            r.n = k
-            return k
-        }
-        Err(e) { return -e.errno }
-    }
-}
-
 // What stat says about a path (following links).
 type PathStat = value record {
     mode: int
@@ -107,7 +84,7 @@ type Follow = record {
     path: str
     label: str
     opid: int              // operand position, distinct even for repeated paths
-    r: Reader
+    r: io.ChunkReader
     isStdin: bool
     dev: int
     ino: int
@@ -159,7 +136,7 @@ fn addLine(q: mut &LineQueue, line: []byte) {
 // Reads a stream to EOF, keeping only the last cap lines. Each newline ends a
 // line (the newline is part of the line); a final partial line is a line too,
 // and an empty stream has no lines. 0, or the errno of a failed read.
-fn collectLines(r: mut &Reader, cap: int, q: mut &LineQueue, stats: mut &ReadStats): int {
+fn collectLines(r: mut &io.ChunkReader, cap: int, q: mut &LineQueue, stats: mut &ReadStats): int {
     var cur: []byte = []
     while true {
         let n = r.fill()
@@ -179,7 +156,7 @@ fn collectLines(r: mut &Reader, cap: int, q: mut &LineQueue, stats: mut &ReadSta
 
 // Reads a stream to EOF, keeping only the last cap bytes. 0, or the errno of a
 // failed read.
-fn collectBytes(r: mut &Reader, cap: int, ring: mut &ByteRing, stats: mut &ReadStats): int {
+fn collectBytes(r: mut &io.ChunkReader, cap: int, ring: mut &ByteRing, stats: mut &ReadStats): int {
     while true {
         let n = r.fill()
         if n < 0 { return -n }
@@ -217,7 +194,7 @@ fn isRegular(path: str): bool {
 // The collectors read from the offset to the end, so data appended meanwhile
 // is still taken, and line mode needs no change: what follows the offset is
 // at most count lines.
-fn seekTail(r: mut &Reader, lineMode: bool, count: int): int {
+fn seekTail(r: mut &io.ChunkReader, lineMode: bool, count: int): int {
     let start = match r.src.seek(0, io.Whence.Current) { Ok(k) { k } Err(_) { -1 } }
     if start < 0 { return -1 }
     let size = match r.src.seek(0, io.Whence.End) { Ok(k) { k } Err(_) { -1 } }
@@ -240,7 +217,7 @@ fn seekTail(r: mut &Reader, lineMode: bool, count: int): int {
 }
 
 // Seeks r to at: at, or -1 when the seek fails.
-fn backTo(r: mut &Reader, at: int): int {
+fn backTo(r: mut &io.ChunkReader, at: int): int {
     match r.src.seek(at, io.Whence.Start) {
         Ok(_) { return at }
         Err(_) { return -1 }
@@ -250,7 +227,7 @@ fn backTo(r: mut &Reader, at: int): int {
 // Where the last count lines of bytes start..size begin, read backwards a chunk
 // at a time; -1 if a read fails or comes up short (the file shrank). A newline
 // as the last byte ends the last line and is not counted.
-fn lineStart(r: mut &Reader, start: int, size: int, count: int): int {
+fn lineStart(r: mut &io.ChunkReader, start: int, size: int, count: int): int {
     var pos = size
     var seen = 0
     while pos > start {
@@ -322,7 +299,7 @@ fn writeHeader(w: mut &io.Writer, label: str, st: mut &State): bool {
 // later operands' diagnostics. A read error is printed and sets failed; byte
 // mode stops before later operands (GNU 9.4 does this, while line mode
 // continues).
-fn processReader(r: mut &Reader, regular: bool, label: str, outId: int, o: &Opts, multi: bool,
+fn processReader(r: mut &io.ChunkReader, regular: bool, label: str, outId: int, o: &Opts, multi: bool,
                  stats: mut &ReadStats, w: mut &io.Writer, st: mut &State): bool {
     if multi && !st.writeFailed {
         if writeHeader(w, label, st) { st.lastOut = outId }
@@ -383,14 +360,14 @@ fn tailOperand(path: str, o: &Opts, multi: bool, outId: int, w: mut &io.Writer,
     st.operandOk = false
     var stats = ReadStats{bytes: 0, failed: false}
     if path == "-" {
-        var r = newReader(io.stdin())
+        var r = io.newChunkReader(io.stdin())
         let cont = processReader(mut &r, isRegular("-"), "standard input", outId, o, multi, mut &stats, w, st)
         if cont && !stats.failed { st.operandOk = true }
         return cont
     }
     match io.open(path) {
         Ok(src) {
-            var r = newReader(src)
+            var r = io.newChunkReader(src)
             let cont = processReader(mut &r, isRegular(path), path, outId, o, multi, mut &stats, w, st)
             if cont && !stats.failed { st.operandOk = true }
             return cont
@@ -485,7 +462,7 @@ fn startFollow(path: str, o: &Opts, multi: bool, outId: int, followers: mut &[]F
         }
     }
     var stats = ReadStats{bytes: 0, failed: false}
-    var r = newReader(src)
+    var r = io.newChunkReader(src)
     let cont = processReader(mut &r, isRegular(path), label, outId, o, multi, mut &stats, w, st)
     if !cont || st.writeFailed { return !st.writeFailed }
     if stats.failed {

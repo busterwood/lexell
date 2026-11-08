@@ -1,0 +1,337 @@
+// cli_parse: every successful spelling from obo design 5.6 over an
+// eza-like flag set: long required/optional/none, short clusters, attached and
+// split values, optional defaults, consume-vs-operand, interspersed operands,
+// "--", a lone "-", the empty operand, repeats and the from index. Opt.short
+// is the matched flag's canonical short form (0 when it has none), including
+// for a long spelling; Opt.value carries the effective value (the default for
+// a bare optional with a non-empty default), and hasValue is true exactly when
+// the value is effective.
+// expect: cli parse ok
+import "cli"
+
+// ---------------------------------------------------------------- checks
+
+fn fail(what: str) {
+    println("FAIL " + what)
+    exit(1)
+}
+
+fn checkInt(label: str, got: int, want: int) {
+    if got != want { fail(label + ": got " + got.toStr() + " want " + want.toStr()) }
+}
+
+fn checkByte(label: str, got: byte, want: byte) {
+    if got != want { fail(label + ": got " + got.toStr() + " want " + want.toStr()) }
+}
+
+fn checkStr(label: str, got: str, want: str) {
+    if got != want { fail(label + ": got [" + got + "] want [" + want + "]") }
+}
+
+fn checkBool(label: str, got: bool, want: bool) {
+    if got != want { fail(label + ": got " + got.toStr() + " want " + want.toStr()) }
+}
+
+fn checkStrs(label: str, got: &[]str, want: &[]str) {
+    checkInt(label + " count", len(got), len(want))
+    for i in 0..len(want) { checkStr(label + " [" + i.toStr() + "]", got[i], want[i]) }
+}
+
+// ---------------------------------------------------------------- the spec table
+
+fn specs(): []cli.Spec {
+    var out: []cli.Spec = []
+    append(mut &out, cli.Spec{short: 'a', long: "all", arity: cli.Arity.Flag,
+        consume: [], accept: [], choices: [], default: ""})
+    append(mut &out, cli.Spec{short: 'A', long: "almost-all", arity: cli.Arity.Flag,
+        consume: [], accept: [], choices: [], default: ""})
+    append(mut &out, cli.Spec{short: 's', long: "sort", arity: cli.Arity.Value,
+        consume: [],
+        accept: ["name", "Name", "size", "extension", "Extension", "modified",
+                 "changed", "accessed", "created", "inode", "type", "none"],
+        choices: ["name", "Name", "size", "extension", "Extension", "modified",
+                  "changed", "accessed", "created", "inode", "type", "none"],
+        default: ""})
+    append(mut &out, cli.Spec{short: 'F', long: "classify", arity: cli.Arity.Optional,
+        consume: ["always", "auto", "never"],
+        accept: ["always", "automatic", "auto", "never"],
+        choices: [], default: "auto"})
+    append(mut &out, cli.Spec{short: 0, long: "color", arity: cli.Arity.Optional,
+        consume: ["always", "auto", "never"],
+        accept: ["always", "automatic", "auto", "never"],
+        choices: [], default: "auto"})
+    append(mut &out, cli.Spec{short: 0, long: "icons", arity: cli.Arity.Optional,
+        consume: ["always", "auto", "never"],
+        accept: ["automatic", "auto", "never"],
+        choices: [], default: "auto"})
+    append(mut &out, cli.Spec{short: 'I', long: "ignore-glob", arity: cli.Arity.Value,
+        consume: [], accept: [], choices: [], default: ""})
+    append(mut &out, cli.Spec{short: 'l', long: "long", arity: cli.Arity.Flag,
+        consume: [], accept: [], choices: [], default: ""})
+    append(mut &out, cli.Spec{short: 'o', long: "output", arity: cli.Arity.Value,
+        consume: [], accept: [], choices: [], default: ""})
+    append(mut &out, cli.Spec{short: 0, long: "level", arity: cli.Arity.Optional,
+        consume: [], accept: [], choices: [], default: ""})
+    append(mut &out, cli.Spec{short: 0, long: "time-style", arity: cli.Arity.Value,
+        consume: [], accept: ["default", "long-iso"],
+        choices: ["default", "long-iso"], default: ""})
+    append(mut &out, cli.Spec{short: 0, long: "extra", arity: cli.Arity.Optional,
+        consume: ["ok"], accept: ["ok"], choices: [], default: "oops"})
+    return out
+}
+
+// ---------------------------------------------------------------- result helpers
+
+fn parsed(label: str, r: Result[cli.Command, cli.Error]): cli.Command {
+    match move(r) {
+        Ok(p) { return p }
+        Err(e) { fail(label + ": " + e.toStr()) }
+    }
+    return cli.Command{opts: [], operands: []}
+}
+
+fn counts(label: str, p: &cli.Command, nopts: int, nops: int) {
+    checkInt(label + " opts", len(p.opts), nopts)
+    checkInt(label + " operands", len(p.operands), nops)
+}
+
+fn optAt(label: str, p: &cli.Command, i: int, short: byte, long: str,
+         value: str, has: bool) {
+    checkByte(label + " short", p.opts[i].short, short)
+    checkStr(label + " long", p.opts[i].long, long)
+    checkStr(label + " value", p.opts[i].value, value)
+    checkBool(label + " hasValue", p.opts[i].hasValue, has)
+}
+
+fn oneOpt(label: str, p: &cli.Command, short: byte, long: str,
+          value: str, has: bool) {
+    counts(label, p, 1, 0)
+    optAt(label, p, 0, short, long, value, has)
+}
+
+fn operandsEq(label: str, p: &cli.Command, want: &[]str) {
+    checkStrs(label + " operand list", &p.operands, want)
+}
+
+// one option spelling with no operands
+fn one(label: str, av: &[str], sp: &[cli.Spec], short: byte, long: str,
+       value: str, has: bool) {
+    oneOpt(label, &parsed(label, cli.parse(av, 0, sp)), short, long, value, has)
+}
+
+// one option spelling followed by one operand
+fn oneOperand(label: str, av: &[str], sp: &[cli.Spec], short: byte, long: str,
+              value: str, has: bool, operand: str) {
+    let p = parsed(label, cli.parse(av, 0, sp))
+    counts(label, &p, 1, 1)
+    optAt(label, &p, 0, short, long, value, has)
+    operandsEq(label, &p, &[operand])
+}
+
+fn main() {
+    let sp = specs()
+    checkInt("spec count", len(sp), 12)
+
+    // no tokens
+    let p0 = parsed("empty", cli.parse(&[], 0, &sp))
+    counts("empty", &p0, 0, 0)
+
+    // long and short Flag spellings carry the canonical short form
+    one("all short", &["-a"], &sp, 'a', "all", "", false)
+    one("all long", &["--all"], &sp, 'a', "all", "", false)
+    one("long long", &["--long"], &sp, 'l', "long", "", false)
+    one("long short", &["-l"], &sp, 'l', "long", "", false)
+
+    // required long: =value, separate value, attached short, =value short,
+    // separate short value
+    one("sort eq", &["--sort=name"], &sp, 's', "sort", "name", true)
+    one("sort next", &["--sort", "name"], &sp, 's', "sort", "name", true)
+    one("sort attached", &["-sname"], &sp, 's', "sort", "name", true)
+    one("sort short eq", &["-s=name"], &sp, 's', "sort", "name", true)
+    one("sort short next", &["-s", "name"], &sp, 's', "sort", "name", true)
+    one("sort Extension", &["--sort=Extension"], &sp, 's', "sort", "Extension", true)
+
+    // required with an empty accept list takes any value, including "="
+    one("ignore eq", &["-I=foo"], &sp, 'I', "ignore-glob", "foo", true)
+    one("ignore bare eq", &["-I="], &sp, 'I', "ignore-glob", "=", true)
+    one("ignore long", &["--ignore-glob=*.txt"], &sp, 'I', "ignore-glob", "*.txt", true)
+    one("ignore dashdash value", &["--ignore-glob", "--"], &sp, 'I',
+        "ignore-glob", "--", true)
+
+    // optional: bare uses the default, split takes the value, a consumed next
+    // token is a value, an unconsumed next token stays an operand
+    one("classify bare", &["-F"], &sp, 'F', "classify", "auto", true)
+    one("classify long", &["--classify"], &sp, 'F', "classify", "auto", true)
+    one("classify eq", &["-F=always"], &sp, 'F', "classify", "always", true)
+    one("classify eq automatic", &["-F=automatic"], &sp, 'F', "classify",
+        "automatic", true)
+    one("classify attached", &["-Falways"], &sp, 'F', "classify", "always", true)
+    one("classify next", &["-F", "always"], &sp, 'F', "classify", "always", true)
+    oneOperand("classify operand", &["-F", "automatic"], &sp, 'F', "classify",
+               "auto", true, "automatic")
+    one("classify automatic", &["--classify=automatic"], &sp, 'F', "classify",
+        "automatic", true)
+    oneOperand("classify long operand", &["--classify", "automatic"], &sp, 'F',
+               "classify", "auto", true, "automatic")
+    // consume contains always/auto/never (not automatic): a separate token in
+    // consume is taken as the value; an attached rest is taken when in consume
+    one("classify auto next", &["-F", "auto"], &sp, 'F', "classify", "auto", true)
+    one("classify never next", &["-F", "never"], &sp, 'F', "classify", "never", true)
+    one("classify never eq", &["-F=never"], &sp, 'F', "classify", "never", true)
+    one("classify auto eq", &["-F=auto"], &sp, 'F', "classify", "auto", true)
+    one("classify auto attached", &["-Fauto"], &sp, 'F', "classify", "auto", true)
+    one("classify long auto", &["--classify", "auto"], &sp, 'F', "classify",
+        "auto", true)
+    one("classify long never", &["--classify", "never"], &sp, 'F', "classify",
+        "never", true)
+    one("classify long eq always", &["--classify=always"], &sp, 'F', "classify",
+        "always", true)
+    one("classify long next always", &["--classify", "always"], &sp, 'F',
+        "classify", "always", true)
+
+    // long-only optional flags report short 0
+    one("color bare", &["--color"], &sp, byte(0), "color", "auto", true)
+    one("color eq", &["--color=always"], &sp, byte(0), "color", "always", true)
+    one("icons bare", &["--icons"], &sp, byte(0), "icons", "auto", true)
+    oneOperand("icons operand", &["--icons", "automatic"], &sp, byte(0), "icons",
+               "auto", true, "automatic")
+    one("color auto", &["--color=auto"], &sp, byte(0), "color", "auto", true)
+    one("color automatic", &["--color=automatic"], &sp, byte(0), "color",
+        "automatic", true)
+    one("color never", &["--color=never"], &sp, byte(0), "color", "never", true)
+    one("color never next", &["--color", "never"], &sp, byte(0), "color", "never", true)
+    oneOperand("color automatic operand", &["--color", "automatic"], &sp, byte(0),
+               "color", "auto", true, "automatic")
+    one("icons auto", &["--icons=auto"], &sp, byte(0), "icons", "auto", true)
+    one("icons automatic eq", &["--icons=automatic"], &sp, byte(0), "icons",
+        "automatic", true)
+    one("icons never", &["--icons=never"], &sp, byte(0), "icons", "never", true)
+    one("icons never next", &["--icons", "never"], &sp, byte(0), "icons", "never", true)
+
+    // optional with an empty default: value is empty and hasValue is false
+    one("level bare", &["--level"], &sp, byte(0), "level", "", false)
+    one("level eq", &["--level=3"], &sp, byte(0), "level", "3", true)
+    oneOperand("level next", &["--level", "3"], &sp, byte(0), "level", "", false, "3")
+
+    // a required flag with both spellings (synthetic --output entry; eza's
+    // -o is --octal-permissions and it has no --output)
+    one("output", &["--output", "x"], &sp, 'o', "output", "x", true)
+    one("output short", &["-o", "x"], &sp, 'o', "output", "x", true)
+
+    // short clusters
+    let p32 = parsed("cluster al", cli.parse(&["-al"], 0, &sp))
+    counts("cluster al", &p32, 2, 0)
+    optAt("cluster al", &p32, 0, 'a', "all", "", false)
+    optAt("cluster al", &p32, 1, 'l', "long", "", false)
+    let p33 = parsed("cluster la", cli.parse(&["-la"], 0, &sp))
+    counts("cluster la", &p33, 2, 0)
+    optAt("cluster la", &p33, 0, 'l', "long", "", false)
+    optAt("cluster la", &p33, 1, 'a', "all", "", false)
+    let p34 = parsed("cluster lF", cli.parse(&["-lF"], 0, &sp))
+    counts("cluster lF", &p34, 2, 0)
+    optAt("cluster lF", &p34, 0, 'l', "long", "", false)
+    optAt("cluster lF", &p34, 1, 'F', "classify", "auto", true)
+    let p35 = parsed("cluster lFalways", cli.parse(&["-lFalways"], 0, &sp))
+    counts("cluster lFalways", &p35, 2, 0)
+    optAt("cluster lFalways", &p35, 0, 'l', "long", "", false)
+    optAt("cluster lFalways", &p35, 1, 'F', "classify", "always", true)
+    let p36 = parsed("cluster lF eq", cli.parse(&["-lF=always"], 0, &sp))
+    counts("cluster lF eq", &p36, 2, 0)
+    optAt("cluster lF eq", &p36, 0, 'l', "long", "", false)
+    optAt("cluster lF eq", &p36, 1, 'F', "classify", "always", true)
+    // an earlier prefix flag never takes the split value: Flag records no
+    // value and Optional records its default, then the walk reaches the last
+    // prefix flag, which takes the value
+    let p36a = parsed("cluster ls eq", cli.parse(&["-ls=name"], 0, &sp))
+    counts("cluster ls eq", &p36a, 2, 0)
+    optAt("cluster ls eq", &p36a, 0, 'l', "long", "", false)
+    optAt("cluster ls eq", &p36a, 1, 's', "sort", "name", true)
+    let p36b = parsed("cluster Fs eq", cli.parse(&["-Fs=name"], 0, &sp))
+    counts("cluster Fs eq", &p36b, 2, 0)
+    optAt("cluster Fs eq", &p36b, 0, 'F', "classify", "auto", true)
+    optAt("cluster Fs eq", &p36b, 1, 's', "sort", "name", true)
+    let p36c = parsed("cluster FF eq", cli.parse(&["-FF=always"], 0, &sp))
+    counts("cluster FF eq", &p36c, 2, 0)
+    optAt("cluster FF eq", &p36c, 0, 'F', "classify", "auto", true)
+    optAt("cluster FF eq", &p36c, 1, 'F', "classify", "always", true)
+    let p37 = parsed("cluster aa", cli.parse(&["-aa"], 0, &sp))
+    counts("cluster aa", &p37, 2, 0)
+    optAt("cluster aa", &p37, 0, 'a', "all", "", false)
+    optAt("cluster aa", &p37, 1, 'a', "all", "", false)
+    let p38 = parsed("cluster Aaa", cli.parse(&["-Aaa"], 0, &sp))
+    counts("cluster Aaa", &p38, 3, 0)
+    optAt("cluster Aaa", &p38, 0, 'A', "almost-all", "", false)
+    optAt("cluster Aaa", &p38, 1, 'a', "all", "", false)
+    optAt("cluster Aaa", &p38, 2, 'a', "all", "", false)
+
+    // "--" stops option parsing; a second "--" and "-a" become operands
+    let p39 = parsed("terminator", cli.parse(&["--"], 0, &sp))
+    counts("terminator", &p39, 0, 0)
+    let p40 = parsed("terminator operands", cli.parse(&["--", "-a", "--"], 0, &sp))
+    counts("terminator operands", &p40, 0, 2)
+    operandsEq("terminator operands", &p40, &["-a", "--"])
+    let p41 = parsed("terminator mixed", cli.parse(&["d", "--", "-l", "e"], 0, &sp))
+    counts("terminator mixed", &p41, 0, 3)
+    operandsEq("terminator mixed", &p41, &["d", "-l", "e"])
+
+    // a lone "-" and "" are operands
+    let p42 = parsed("lone dash", cli.parse(&["-"], 0, &sp))
+    counts("lone dash", &p42, 0, 1)
+    operandsEq("lone dash", &p42, &["-"])
+    let p43 = parsed("empty token", cli.parse(&[""], 0, &sp))
+    counts("empty token", &p43, 0, 1)
+    operandsEq("empty token", &p43, &[""])
+    let p44 = parsed("operand", cli.parse(&["d"], 0, &sp))
+    counts("operand", &p44, 0, 1)
+    operandsEq("operand", &p44, &["d"])
+
+    // options are interspersed with operands in either order
+    let p45 = parsed("operand then option", cli.parse(&["d", "-a"], 0, &sp))
+    counts("operand then option", &p45, 1, 1)
+    optAt("operand then option", &p45, 0, 'a', "all", "", false)
+    operandsEq("operand then option", &p45, &["d"])
+    let p46 = parsed("option then operand", cli.parse(&["-a", "d"], 0, &sp))
+    counts("option then operand", &p46, 1, 1)
+    optAt("option then operand", &p46, 0, 'a', "all", "", false)
+    operandsEq("option then operand", &p46, &["d"])
+    let p47 = parsed("interspersed", cli.parse(&["d", "--sort=name", "e"], 0, &sp))
+    counts("interspersed", &p47, 1, 2)
+    optAt("interspersed", &p47, 0, 's', "sort", "name", true)
+    operandsEq("interspersed", &p47, &["d", "e"])
+    let p48 = parsed("both sides", cli.parse(&["-a", "d", "-l"], 0, &sp))
+    counts("both sides", &p48, 2, 1)
+    optAt("both sides", &p48, 0, 'a', "all", "", false)
+    optAt("both sides", &p48, 1, 'l', "long", "", false)
+    operandsEq("both sides", &p48, &["d"])
+
+    // repeats append one option per occurrence, in order
+    let p49 = parsed("repeat short", cli.parse(&["-a", "-a"], 0, &sp))
+    counts("repeat short", &p49, 2, 0)
+    optAt("repeat short", &p49, 0, 'a', "all", "", false)
+    optAt("repeat short", &p49, 1, 'a', "all", "", false)
+    let p50 = parsed("repeat sort", cli.parse(&["--sort=name", "--sort=size"], 0, &sp))
+    counts("repeat sort", &p50, 2, 0)
+    optAt("repeat sort", &p50, 0, 's', "sort", "name", true)
+    optAt("repeat sort", &p50, 1, 's', "sort", "size", true)
+    let p51 = parsed("repeat mixed spelling", cli.parse(&["-a", "--all"], 0, &sp))
+    counts("repeat mixed spelling", &p51, 2, 0)
+    optAt("repeat mixed spelling", &p51, 0, 'a', "all", "", false)
+    optAt("repeat mixed spelling", &p51, 1, 'a', "all", "", false)
+
+    // from: 0 <= from <= len; from=len is no tokens; from=1 skips argv[0]
+    let av52: []str = ["prog", "-a", "d"]
+    let p52 = parsed("from 0", cli.parse(&av52, 0, &sp))
+    counts("from 0", &p52, 1, 2)
+    operandsEq("from 0", &p52, &["prog", "d"])
+    let p53 = parsed("from 1", cli.parse(&av52, 1, &sp))
+    counts("from 1", &p53, 1, 1)
+    optAt("from 1", &p53, 0, 'a', "all", "", false)
+    operandsEq("from 1", &p53, &["d"])
+    let p54 = parsed("from 2", cli.parse(&av52, 2, &sp))
+    counts("from 2", &p54, 0, 1)
+    operandsEq("from 2", &p54, &["d"])
+    let p55 = parsed("from len", cli.parse(&av52, 3, &sp))
+    counts("from len", &p55, 0, 0)
+
+    println("cli parse ok")
+}

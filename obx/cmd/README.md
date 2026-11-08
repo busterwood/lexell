@@ -13,12 +13,25 @@ dates in the zone of `TZ` (else the system's) with the current-year rule,
 view with a header), and eza's default colours. `--time-style=iso` and the other styles are rejected. The measured
 rules are in [../tests/eza/E3-PROBES.md](../tests/eza/E3-PROBES.md).
 
-It is one file. The parts (argument parsing, deduction, entries and sorting,
-colour, the three views) share two types, `Opts` and `Entry`, and nothing in
-them is useful to another program yet; a split would only add imports and
-`pub`. What is general went to the library instead (`fs.readlink`,
-`fs.Kind`, `io.isTerminal`, `io.terminalWidth`, `strings.displayWidth`,
-`strings.lossy`, the stdout write errors; see [../lib/README.md](../lib/README.md)).
+It is one file. The parts (deduction, entries and sorting, colour, the three
+views) share two types, `Opts` and `Entry`, and nothing in them is useful to
+another program yet; a split would only add imports and `pub`. What is
+general went to the library instead: `cli.parse` for the option grammar,
+`paths.lastComponent`/`parentOf`, `fmt.modeString`,
+`strings.natcmp`/`natcmpFold`, `errors.osError`/`debugPath`,
+`os.users`/`uid`, plus the earlier `fs.readlink`, `fs.Kind`,
+`io.isTerminal`, `io.terminalWidth`, `strings.displayWidth`, `strings.lossy`
+and the stdout write errors (see [../lib/README.md](../lib/README.md)).
+
+The CLI move has a size cost: `cli` is compiled in whole once `parse` is
+referenced, so the native binary grew from 304,296 to 353,328 bytes (+16.1%;
+about 41 KB of that is `cli`, the rest the other module moves and keeping the
+binary static). Runtime is unchanged: instruction counts over `-l /usr/bin`
+and `-T /usr/share` are equal to or below the old binary (the tree walk is
+about 8% fewer instructions), because the option parser runs once and the
+name order and path helpers no longer allocate per entry. Like `zoxide`, eza
+reads `/etc/passwd` and the uid directly rather than through the getpw* calls
+in `os`: those would make the native binary dynamically linked.
 
 Build it from `obx/`:
 
@@ -56,8 +69,9 @@ with its output, error messages and exit codes. The header comment of each
 file lists the options, the edge cases and what is rejected (`cat -nbsET`,
 `wc -lwc`, `sort -nru`, `head -n/-c`, `tail -n/-c/-f` and `--lines`/`--bytes`;
 every other option, long ones included, is an error as in obo). Each is one
-file. Input goes through `io.Reader` in 64 KiB chunks (a small `Reader`
-wrapper in each file keeps the chunk and the unused part of it), file
+file. Input goes through `io.ChunkReader` in 64 KiB chunks (the reader keeps
+the chunk and the unused part of it; `sort` keeps its growing-buffer reader
+and `grep` its 128 KiB carry reader), file
 metadata through `fs.stat` (`tail -f` tells a file by `dev` and `ino`); no
 tool declares an `extern`, and the native builds are static with no libc.
 `tail` reads a regular file (also as standard input) backwards from its end,
@@ -95,13 +109,14 @@ runtime report on the large-input cases (four for the coreutils, four for `grep`
 |---|---:|---:|
 | `cat` | 45,904 | 73,840 |
 | `wc` | 50,016 | 78,096 |
-| `sort` | 115,624 | 111,632 |
+| `sort` | 115,656 | 111,632 |
 | `head` | 50,304 | 74,488 |
-| `tail` | 71,016 | 92,768 |
-| `grep` | 544,672 | 476,488 |
-| `zoxide` | 589,536 | 352,496 |
-| `jq` | 1,114,456 (libc, libm) | 875,280 |
-| `cmark` | 329,928 | 445,072 |
+| `tail` | 71,056 | 92,768 |
+| `grep` | 544,728 | 476,488 |
+| `zoxide` | 335,096 | 296,448 |
+| `eza` | 353,328 | 305,488 |
+| `jq` | 1,163,592 (libc, libm) | 875,280 |
+| `cmark` | 338,176 | 445,072 |
 
 (obo's static binaries were 90 to 119 KB. `grep` is large because it carries
 the regex library. `jq` carries the regex and JSON libraries and jq's
@@ -233,7 +248,7 @@ set, so scores come from databases written with fixed ages.
 Install the reference into a scratch directory, not `~/.cargo/bin`:
 `CARGO_INSTALL_ROOT=/tmp/zoxide-ref cargo install zoxide --locked --version
 0.9.9` (0.10 needs a newer rustc). Our binary runs with `OBX_CHECK=1`.
-Sizes in bytes: `zoxide` is 589,536 native (static) and 352,496 through C.
+Sizes in bytes: `zoxide` is 335,096 native (static) and 296,448 through C.
 
 ## jq
 

@@ -1,10 +1,20 @@
 // strings: searching, splitting, joining, replacing, trimming, case,
-// integer parsing and formatting, padding, and UTF-8.
+// integer parsing and formatting, padding, UTF-8, eza's natural name order
+// and its QuoteSpaces escaping.
 //
 // str is a byte string. Indexes and lengths are in bytes; the rune functions
-// decode UTF-8. Case functions change ASCII letters only. std already has
-// indexOf, startsWith, endsWith, contains, split (at a byte), trim, repeat,
-// isSpace, isDigit and StrBuf.
+// decode UTF-8. Case functions change ASCII letters only: toLower does not
+// import unicode, because the Unicode tables cost about 135 KB in every
+// program that lowercases a byte and no example needs more than ASCII (eza's
+// extension sort is ASCII, zoxide documents ASCII-only lower, jq has
+// ascii_downcase and markdown has its own fold data). Callers that need full
+// Unicode use unicode.lower. std already has indexOf, startsWith, endsWith,
+// contains, split (at a byte), trim, repeat, isSpace, isDigit and StrBuf.
+//
+// natcmp/natcmpFold reproduce natord-plus-plus 2.0.0, the crate behind eza's
+// name order. They decode UTF-8 like the crate's char iterator and keep its
+// documented partial lowercase table (lowerCp); see the comment there for the
+// exact divergence from Rust's to_lowercase.
 
 // ------------------------------------------------------------ searching
 
@@ -236,6 +246,92 @@ fn lowerByte(c: byte): byte {
 
 pub fn isLetter(c: byte): bool { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') }
 pub fn isAlnum(c: byte): bool { return isLetter(c) || isDigit(c) }
+
+// C-locale isprint: 0x20..0x7E (printable ASCII, not DEL or a control byte).
+pub fn isPrint(c: byte): bool { return c >= ' ' && c <= '~' }
+
+// The blanks sort -n skips: space and tab only.
+pub fn isBlank(c: byte): bool { return c == ' ' || c == '\t' }
+
+// GNU wc's C-locale word byte: printable and not space (0x21..0x7E).
+pub fn isWordByte(c: byte): bool { return isPrint(c) && c != ' ' }
+
+// ------------------------------------------------------- eza name escaping
+//
+// eza's QuoteSpaces escaping (src/output/escape.rs). The rule:
+//   1. needs = the name contains ' ' or '\'';
+//   2. when quoteSpaces && needs, wrap in '"' if the name contains '\'',
+//      otherwise in '\'';
+//   3. \t, \n and \r become \\t, \\n, \\r; every other byte < 0x20 or 0x7f
+//      becomes \u{h} with lowercase hex and no leading zeros; every other byte
+//      is copied unchanged (including \\, ", ' and bytes >= 0x80);
+//   4. quotes wrap the escaped bytes and embedded quotes are not escaped.
+// With quoteSpaces=false no quote characters are added but controls are still
+// escaped. The function is byte-wise and does not validate UTF-8.
+
+// One lowercase hex digit, 0..15.
+fn hexDigit(v: int): byte {
+    if v < 10 { return byte(int('0') + v) }
+    return byte(int('a') + (v - 10))
+}
+
+// Append the lowercase hex form of a byte with no leading zero: 0 -> "0",
+// 0x1b -> "1b", 0x7f -> "7f" (the \u{...} payload of quoteName).
+fn appendHexByte(b: mut &StrBuf, v: byte) {
+    let hi = int(v) / 16
+    let lo = int(v) % 16
+    if hi > 0 { b.addByte(hexDigit(hi)) }
+    b.addByte(hexDigit(lo))
+}
+
+pub fn quoteName(name: str, quoteSpaces: bool): str {
+    var needs = false
+    var hasSingle = false
+    for i in 0..len(name) {
+        let b = strByte(name, i)
+        if b == ' ' || b == '\'' { needs = true }
+        if b == '\'' { hasSingle = true }
+    }
+    var quote = false
+    var q: byte = '\''
+    if quoteSpaces && needs {
+        quote = true
+        if hasSingle { q = '"' }
+    }
+    var b = newStrBuf()
+    if quote { b.addByte(q) }
+    for i in 0..len(name) {
+        let c = strByte(name, i)
+        if c == '\t' {
+            b.add("\\t")
+        } else if c == '\n' {
+            b.add("\\n")
+        } else if c == '\r' {
+            b.add("\\r")
+        } else if c < ' ' || c == 127 {
+            b.add("\\u{")
+            appendHexByte(mut &b, c)
+            b.addByte('}')
+        } else {
+            b.addByte(c)
+        }
+    }
+    if quote { b.addByte(q) }
+    return b.toStr()
+}
+
+// The shared parent prefix of an input operand or symlink target: escape the
+// whole parent once with the outer style, then:
+//   "" for an empty parent; "/" for parent "/" (the escaped root already ends
+//   in a separator, so none is added); otherwise the escaped parent plus "/".
+// It does not append a name. "/tmp" gives "/tmp/", "x y/sub" gives
+// "'x y/sub'/"; the caller appends the escaped name.
+pub fn parentPrefix(parent: str, quoteSpaces: bool): str {
+    if len(parent) == 0 { return "" }
+    let escaped = quoteName(parent, quoteSpaces)
+    if parent == "/" { return escaped }
+    return escaped + "/"
+}
 
 // ------------------------------------------------------------ integers
 
@@ -471,6 +567,34 @@ pub fn isValidUtf8(s: str): bool {
     return true
 }
 
+// Rust's message for the first invalid sequence in s, or None when s is
+// valid UTF-8. The wording is std::str::Utf8Error's Display ("invalid utf-8
+// sequence of N bytes from index I" / "incomplete utf-8 byte sequence from
+// index I") with the byte index of the first bad sequence, as zoxide reports
+// it. The N is the maximal invalid subpart decodeAt consumes: a cut-short
+// sequence at the end of s is "incomplete", anything followed by more bytes is
+// an "invalid ... sequence".
+pub fn utf8Error(s: str): Option[str] {
+    var i = 0
+    while i < len(s) {
+        if strByte(s, i) < 0x80 {
+            i += 1
+            continue
+        }
+        let d = decodeAt(s, i)
+        if d.ok {
+            i += d.size
+            continue
+        }
+        let c = int(strByte(s, i))
+        if c < 0xC2 || c > 0xF4 || i + d.size < len(s) {
+            return Some("invalid utf-8 sequence of " + intToStr(d.size) + " bytes from index " + intToStr(i))
+        }
+        return Some("incomplete utf-8 byte sequence from index " + intToStr(i))
+    }
+    return None
+}
+
 // s with each invalid part (decodeAt) replaced by U+FFFD; s itself when it
 // is valid UTF-8.
 pub fn lossy(s: str): str {
@@ -484,6 +608,239 @@ pub fn lossy(s: str): str {
     }
     return b.toStr()
 }
+
+// ------------------------------------------------------- the eza name order
+//
+// natord-plus-plus 2.0.0 compares a sequence of chars: Unicode whitespace is
+// skipped at the top of the outer loop, ASCII digit runs compare naturally and
+// everything else compares by code point (folded for compare_ignore_case).
+// The decoder is decodeAt, so invalid bytes compare as the U+FFFD that eza's
+// lossy decode would produce. One code-point loop handles both forms: an ASCII
+// byte steps without decoding, so there is no separate scan of the whole
+// string before the comparison.
+
+fn isDigitCp(cp: int): bool { return cp >= int('0') && cp <= int('9') }
+
+fn signCp(a: int, b: int): int {
+    if a < b { return -1 }
+    if a > b { return 1 }
+    return 0
+}
+
+// Rust char::is_whitespace (the White_Space property): the exact set the
+// reference's natord compares skip. ASCII space and 0x09..0x0D are included.
+fn isUnicodeSpace(cp: int): bool {
+    if cp == 0x20 { return true }
+    if cp >= 0x09 && cp <= 0x0D { return true }
+    if cp == 0x85 || cp == 0xA0 || cp == 0x1680 { return true }
+    if cp >= 0x2000 && cp <= 0x200A { return true }
+    if cp == 0x2028 || cp == 0x2029 || cp == 0x202F { return true }
+    if cp == 0x205F || cp == 0x3000 { return true }
+    return false
+}
+
+// Simple single-code-point Unicode lowercase for the common blocks: ASCII,
+// Latin-1 Supplement, Latin Extended-A, the basic Greek and Cyrillic blocks and
+// fullwidth A-Z. Rust's char::to_lowercase() is full Unicode lowercase; it can
+// expand one character into several (U+0130 is "i" plus a combining dot) and it
+// covers every script. Outside these blocks 1,234 scalar values (542 ranges)
+// still compare by their original code point, the documented divergence;
+// U+0130 is the only multi-character expansion and is deliberately left
+// unfolded. This is eza fidelity, not a substitute for unicode.lower.
+fn lowerCp(cp: int): int {
+    if cp >= int('A') && cp <= int('Z') { return cp + 32 }
+    if cp >= 0xC0 && cp <= 0xD6 { return cp + 32 }
+    if cp >= 0xD8 && cp <= 0xDE { return cp + 32 }
+    if cp >= 0x100 && cp <= 0x137 && cp != 0x130 && cp % 2 == 0 {
+        return cp + 1
+    }
+    if cp >= 0x139 && cp <= 0x148 && cp % 2 == 1 { return cp + 1 }
+    if cp >= 0x14A && cp <= 0x177 && cp % 2 == 0 { return cp + 1 }
+    if cp == 0x178 { return 0xFF }
+    if cp >= 0x179 && cp <= 0x17E && cp % 2 == 1 { return cp + 1 }
+    if cp == 0x386 { return 0x3AC }
+    if cp >= 0x388 && cp <= 0x38A { return cp + 37 }
+    if cp == 0x38C { return 0x3CC }
+    if cp >= 0x38E && cp <= 0x38F { return cp + 63 }
+    if cp >= 0x391 && cp <= 0x3A1 { return cp + 32 }
+    if cp >= 0x3A3 && cp <= 0x3AB { return cp + 32 }
+    if cp == 0x3CF { return 0x3D7 }
+    if cp >= 0x400 && cp <= 0x40F { return cp + 80 }
+    if cp >= 0x410 && cp <= 0x42F { return cp + 32 }
+    if cp >= 0xFF21 && cp <= 0xFF3A { return cp + 32 }
+    return cp
+}
+
+// C-locale whitespace as natord skips it: space and 0x09..0x0D (std.isSpace
+// omits VT and FF, and this comparator must keep the crate's set).
+fn isNatSpace(c: byte): bool { return c == ' ' || (c >= '\t' && c <= '\r') }
+
+// The ASCII byte form of the comparison (design Appendix A): fold selects
+// ASCII A..Z folding; digits are unaffected. Whitespace is skipped only at the
+// top of the outer loop, never inside a digit run.
+//
+// The first byte >= 0x80 hands the whole comparison to natcmpUtf8, so a pure
+// ASCII name pays no pre-scan (eza compares names in every sort and tree
+// walk). The hand-off is complete rather than resumable, which keeps the two
+// forms' state machines independent; only a name with non-ASCII bytes pays to
+// restart.
+fn natcmpAscii(a: str, b: str, fold: bool): int {
+    var i = 0
+    var j = 0
+    while true {
+        while i < len(a) && isNatSpace(strByte(a, i)) { i += 1 }
+        while j < len(b) && isNatSpace(strByte(b, j)) { j += 1 }
+        if i == len(a) && j == len(b) { return 0 }
+        if i == len(a) { return -1 }
+        if j == len(b) { return 1 }
+        let da = isDigit(strByte(a, i))
+        let db = isDigit(strByte(b, j))
+        if da && db {
+            if strByte(a, i) == '0' || strByte(b, j) == '0' {
+                // left-aligned matching: 015 < 12
+                if strByte(a, i) != strByte(b, j) {
+                    if strByte(a, i) < strByte(b, j) { return -1 }
+                    return 1
+                }
+                i += 1
+                j += 1
+                while i < len(a) && j < len(b) && isDigit(strByte(a, i)) && isDigit(strByte(b, j)) {
+                    if strByte(a, i) != strByte(b, j) {
+                        if strByte(a, i) < strByte(b, j) { return -1 }
+                        return 1
+                    }
+                    i += 1
+                    j += 1
+                }
+                if i < len(a) && isDigit(strByte(a, i)) { return 1 }
+                if j < len(b) && isDigit(strByte(b, j)) { return -1 }
+                // both runs ended: continue the outer loop
+            } else {
+                // right-aligned matching: 15 < 123
+                var last = 0
+                while i < len(a) && j < len(b) && isDigit(strByte(a, i)) && isDigit(strByte(b, j)) {
+                    if last == 0 && strByte(a, i) != strByte(b, j) {
+                        if strByte(a, i) < strByte(b, j) { last = -1 } else { last = 1 }
+                    }
+                    i += 1
+                    j += 1
+                }
+                if i < len(a) && isDigit(strByte(a, i)) { return 1 }
+                if j < len(b) && isDigit(strByte(b, j)) { return -1 }
+                if last != 0 { return last }
+                // both runs ended equal: continue
+            }
+        } else {
+            var ca = strByte(a, i)
+            var cb = strByte(b, j)
+            if ca >= 0x80 || cb >= 0x80 { return natcmpUtf8(a, b, fold) }
+            if fold {
+                if ca >= 'A' && ca <= 'Z' { ca = byte(ca + 32) }
+                if cb >= 'A' && cb <= 'Z' { cb = byte(cb + 32) }
+            }
+            if ca < cb { return -1 }
+            if ca > cb { return 1 }
+            i += 1
+            j += 1
+        }
+    }
+}
+
+// A decoded code point with rune -1 at the end of s. An ASCII byte is the
+// common case in names, so it becomes a one-field step with no UTF-8 decode.
+fn peekDecoded(s: str, i: int): Decoded {
+    if i >= len(s) { return Decoded{rune: -1, size: 0, ok: true} }
+    let c = strByte(s, i)
+    if c < 0x80 { return Decoded{rune: int(c), size: 1, ok: true} }
+    return decodeAt(s, i)
+}
+
+// natord::compare_iter over decoded code points (fold selects lowerCp).
+// pa/pb are the current decoded steps, so advancing is an index move plus a
+// peek (one byte read for ASCII, decodeAt otherwise).
+fn natcmpUtf8(a: str, b: str, fold: bool): int {
+    var i = 0
+    var j = 0
+    var pa = peekDecoded(a, 0)
+    var pb = peekDecoded(b, 0)
+    while true {
+        while pa.rune >= 0 && isUnicodeSpace(pa.rune) {
+            i += pa.size
+            pa = peekDecoded(a, i)
+        }
+        while pb.rune >= 0 && isUnicodeSpace(pb.rune) {
+            j += pb.size
+            pb = peekDecoded(b, j)
+        }
+        if pa.rune < 0 && pb.rune < 0 { return 0 }
+        if pa.rune < 0 { return -1 }
+        if pb.rune < 0 { return 1 }
+        if isDigitCp(pa.rune) && isDigitCp(pb.rune) {
+            if pa.rune == int('0') || pb.rune == int('0') {
+                // left-aligned matching: 015 < 12
+                if pa.rune != pb.rune { return signCp(pa.rune, pb.rune) }
+                i += pa.size
+                j += pb.size
+                pa = peekDecoded(a, i)
+                pb = peekDecoded(b, j)
+                while pa.rune >= 0 && pb.rune >= 0 && isDigitCp(pa.rune) &&
+                        isDigitCp(pb.rune) {
+                    if pa.rune != pb.rune { return signCp(pa.rune, pb.rune) }
+                    i += pa.size
+                    j += pb.size
+                    pa = peekDecoded(a, i)
+                    pb = peekDecoded(b, j)
+                }
+                if pa.rune >= 0 && isDigitCp(pa.rune) { return 1 }
+                if pb.rune >= 0 && isDigitCp(pb.rune) { return -1 }
+                // both runs ended: continue the outer loop
+            } else {
+                // right-aligned matching: 15 < 123
+                var last = 0
+                while pa.rune >= 0 && pb.rune >= 0 && isDigitCp(pa.rune) &&
+                        isDigitCp(pb.rune) {
+                    if last == 0 && pa.rune != pb.rune { last = signCp(pa.rune, pb.rune) }
+                    i += pa.size
+                    j += pb.size
+                    pa = peekDecoded(a, i)
+                    pb = peekDecoded(b, j)
+                }
+                if pa.rune >= 0 && isDigitCp(pa.rune) { return 1 }
+                if pb.rune >= 0 && isDigitCp(pb.rune) { return -1 }
+                if last != 0 { return last }
+                // both runs ended equal: continue
+            }
+        } else {
+            var x = pa.rune
+            var y = pb.rune
+            if fold {
+                x = lowerCp(x)
+                y = lowerCp(y)
+            }
+            if x < y { return -1 }
+            if x > y { return 1 }
+            i += pa.size
+            j += pb.size
+            pa = peekDecoded(a, i)
+            pb = peekDecoded(b, j)
+        }
+    }
+}
+
+// eza's name order: natord::compare (case-sensitive) and
+// natord::compare_ignore_case (simple Unicode lowercase). -1, 0 or 1.
+pub fn natcmp(a: str, b: str): int {
+    return natcmpAscii(a, b, false)
+}
+
+pub fn natcmpFold(a: str, b: str): int {
+    return natcmpAscii(a, b, true)
+}
+
+// The names used by the stdlib contract for the same eza order.
+pub fn naturalCompare(a: str, b: str): int { return natcmp(a, b) }
+
+pub fn naturalCompareFold(a: str, b: str): int { return natcmpFold(a, b) }
 
 // Appends the UTF-8 encoding of r to b (U+FFFD for an invalid code point).
 pub fn addRune(b: mut &StrBuf, r: int) {

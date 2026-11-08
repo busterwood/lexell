@@ -2577,3 +2577,73 @@ share of the small rows than the code difference being measured. The
 `--perf` run at the new sizes gives the cycle ratios in
 design/native-vs-c.md: native is ahead on nine of ten against the C
 backend and `maps` is 1.06 (memory-bound); `fib` is level.
+
+### Standard-library plumbing (2026-11-08)
+
+The example programs in `obx/cmd` had grown their own copies of the small
+Unix/CLI layer that obo kept in `lib/`: option parsing, number padding,
+lexical paths, eza's name order and quoting, errno/debug formatting, chunked
+input, temp/atomic files, user lookup, civil date formatting, Unicode
+classification, endian codecs and base64. Those helpers are library code
+again, ported from `archive/obo/lib` and the newer tools and checked against
+the obo vectors and the differential suites:
+
+- `fmt` (digits/padding/permission string), `paths` (Rust lexical
+  components; `ext` omits the dot), `cli` (the eza/obo option grammar with a
+  structured Error), `unicode` (Unicode 15 classification and simple
+  lowercasing), `errors` (debugPath/osError), `binary` (endian and IEEE bit
+  patterns), `glob` (zoxide's Rust syntax, DP matcher), `base64` (strict and
+  jq-lenient decoders).
+- `io` gained `ChunkReader`/`createExclusive`/`copy`/`count`/`readAll`;
+  `fs` gained `walk`/`createTemp`/`writeAtomic`/`realpath`; `os` gained
+  `environ`/ids/the user database/`tempDir`; `strings` gained
+  natcmp/quoteName/parentPrefix/utf8Error; `time` gained Tm, strftime,
+  strptime and httpDate; `math` gained exact float bit patterns.
+- The compiler imports `os`, `fs`, `io` and `strings`, so the library changes
+  changed its generated C: `compiler/seed/obxc.c` was reseeded and the quick
+  gate passes the fixed point again. `fs.Stat` deliberately gained no
+  atime/ctime fields (changing the record would force another reseed; no
+  caller needs them yet).
+
+The two DB ledger examples needed no changes. The command-line examples were
+then migrated module by module, with each tool's existing golden or
+differential suite as the acceptance test: the coreutils and grep pass 869
+differential cases plus the eight memory cases; zoxide passes its 362-case
+baseline differential; jq passes 869 baseline cases (its native binary is
+8 KB larger because @uri pulls in `url`); cmark keeps its local getopt
+because cmark's early `--help`/`--version` precedence is not the library
+grammar; the HTTP gate passes on both backends with 1,000 idle connections.
+
+### The library migration performance check (2026-11-08)
+
+Instruction counts (`perf stat -e instructions:u`, same compiler, before
+against after) separate code changes from machine noise. The coreutils,
+grep, jq and cmark are byte-identical in executed instructions; their wall
+clock differences are noise. Two real regressions were found and fixed:
+
+- `zoxide query -l` over a 1,500-entry database first went from 11.6M to
+  31.9M instructions (~5.0 to 6.4 ms). The exclusion glob decoded every path
+  and ran a DP table even for the default pattern, which is a single escaped
+  literal. `glob.compile` now marks all-literal patterns and matches them
+  with a string compare: 8.6M instructions, and `query -l` fell to about
+  4.3 ms (the old binary is 4.3 ms); a keyword query is also faster.
+- `eza -l /usr/bin` and `eza -T /usr/share` first grew by 6% and 12% of
+  instructions. Three causes were removed: `paths.lastComponent`/`parentOf`
+  built a component array per call (now a backwards scan that allocates
+  nothing), `strings.natcmp` pre-scanned both names for non-ASCII bytes and
+  used a record-based code-point loop even for ASCII (now one byte loop with
+  a hand-off to the code-point loop at the first high byte), and the
+  `os.userById`/`os.users` getpw* calls made the native binaries dynamically
+  linked. On the final binaries eza's tree walk is about 8% fewer
+  instructions than before and the long listing is level; zoxide is static
+  again and faster.
+- Both hot tools read `/proc/self/status` and `/etc/passwd` directly, as
+  they did before the port. The `os` user functions remain the NSS-aware
+  versions for programs that already link libc; the cost is documented in
+  `lib/README.md`.
+
+Final native sizes: zoxide 335,096 bytes (330,976 before, +1.2%); eza
+353,328 (304,296 before, +16.1%, of which about 41 KB is the whole `cli`
+module and the rest is the other moves plus static linking). The `cli`
+grammar is compiled in whole once `parse` is referenced; the parser itself
+runs once per process, so the size cost has no runtime counterpart.

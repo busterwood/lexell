@@ -1,0 +1,138 @@
+// paths: lexical path primitives over byte strings.
+//
+//     import "paths"
+//
+// Everything here is lexical: no filesystem, no ~, no glob, no shell, no
+// symlink resolution. '/' is the only separator. The contract for
+// lastComponent/parentOf is Rust Path::components (verified against rustc
+// 1.87 for the design table and the edge spellings below), not shell dirname/
+// basename. base/dir/stem/clean were removed from the obo v2 API and are
+// deliberately absent; clean/abs/realpath belong elsewhere (design/stdlib-
+// plumbing.md).
+//
+// The primitives split a path into components while remembering each
+// component's byte span in the original string. A parent is then a prefix of
+// the original bytes: it keeps the spelling before the last component
+// ("//a/b" -> "//a", "/./a/b" -> "/./a", "a/..//b" -> "a/..") but drops a
+// trailing "." component and trailing separators ("a/./b" -> "a",
+// "a/b/" -> "a"), exactly as Path::parent does. A lone root comes out as "/".
+
+// A component's half-open byte span [start, end) in its path.
+type PathPart = value record {
+    start: int
+    end: int
+}
+
+// true when p is non-empty and starts with '/'
+pub fn isAbsolute(p: str): bool {
+    return len(p) > 0 && strByte(p, 0) == '/'
+}
+
+// true when p is non-empty and ends with '/'
+pub fn hasTrailingSlash(p: str): bool {
+    return len(p) > 0 && strByte(p, len(p) - 1) == '/'
+}
+
+// exactly "." or ".."
+pub fn isDotName(p: str): bool {
+    if len(p) == 1 { return strByte(p, 0) == '.' }
+    if len(p) == 2 { return strByte(p, 0) == '.' && strByte(p, 1) == '.' }
+    return false
+}
+
+// The span of the last component Rust Path::components sees, or start -1 when
+// there is none. Separators are runs of '/'; a "." component is dropped unless
+// it is the leading component of a relative path (Rust keeps that one as a
+// CurDir component: "./a" has CurDir, a). ".." is an ordinary component. The
+// absolute root is not a component; isAbsolute(p) records its presence. The
+// scan runs backwards and allocates nothing, which matters because eza calls
+// this once per displayed entry.
+fn lastSpan(p: str): PathPart {
+    let n = len(p)
+    let absolute = n > 0 && strByte(p, 0) == '/'
+    var e = n
+    while e > 0 && strByte(p, e - 1) == '/' { e -= 1 }
+    while e > 0 {
+        var s = e
+        while s > 0 && strByte(p, s - 1) != '/' { s -= 1 }
+        let dot = e - s == 1 && strByte(p, s) == '.'
+        if !dot || (s == 0 && !absolute) { return PathPart{start: s, end: e} }
+        e = s
+        while e > 0 && strByte(p, e - 1) == '/' { e -= 1 }
+    }
+    return PathPart{start: -1, end: -1}
+}
+
+// Last component: "b" for "a/b/", "a" for "a/./", "." for "." and "", "/" for
+// "/" (and for any run of separators). The empty path is "." by contract.
+pub fn lastComponent(p: str): str {
+    if len(p) == 0 { return "." }
+    let span = lastSpan(p)
+    if span.start < 0 {
+        if isAbsolute(p) { return "/" }
+        return "."
+    }
+    return strSlice(p, span.start, span.end)
+}
+
+// The parent as a prefix of the original spelling, or "" when the path has no
+// parent ("", "/", ".", "..", "a", "a/"). "/a" -> "/", "./a" -> ".",
+// "a/b" -> "a", "//a" -> "/" (a lone root normalizes to "/"), "/a/b" -> "/a",
+// "a/./b" -> "a", "/./a/b" -> "/./a".
+pub fn parentOf(p: str): str {
+    let n = len(p)
+    let span = lastSpan(p)
+    if span.start < 0 { return "" }
+    let absolute = strByte(p, 0) == '/'
+    var e = span.start
+    while e > 0 && strByte(p, e - 1) == '/' { e -= 1 }
+    while e > 0 {
+        var s = e
+        while s > 0 && strByte(p, s - 1) != '/' { s -= 1 }
+        let dot = e - s == 1 && strByte(p, s) == '.'
+        if !dot || (s == 0 && !absolute) { return strSlice(p, 0, e) }
+        e = s
+        while e > 0 && strByte(p, e - 1) == '/' { e -= 1 }
+    }
+    if absolute { return "/" }
+    return ""
+}
+
+// The Rust Path::join shape: an absolute b replaces a; a joins b with one
+// separator, adding it when a does not end in '/'; an empty b appends the
+// separator (keep an existing one). No cleaning: join("a", "../b") is
+// "a/../b".
+pub fn join(a: str, b: str): str {
+    if isAbsolute(b) { return b }
+    if len(a) == 0 { return b }
+    if len(b) == 0 {
+        if hasTrailingSlash(a) { return a }
+        return a + "/"
+    }
+    if hasTrailingSlash(a) { return a + b }
+    return a + "/" + b
+}
+
+// The extension of the last component, as Rust Path::extension sees it: bytes
+// after the last '.' when the component is not exactly "." or ".." and the dot
+// is not the component's first byte. ".bashrc" -> "", "a.tar.gz" -> "gz",
+// "a." -> "", "a..b" -> "b", ".." -> "", "" -> "". The dot is not part of the
+// result (unlike fs.extension, which keeps it, so the two functions have
+// different names on purpose). This is not eza's --sort=extension notion; that
+// belongs to the eza layer. Components are what Rust extension uses, so a
+// trailing "." component is skipped like any other ".": "a.b/." has
+// extension "b" (verified with rustc 1.87), and a path ending in "/." does not
+// report an extension.
+pub fn ext(p: str): str {
+    let last = lastSpan(p)
+    if last.start < 0 { return "" }
+    let size = last.end - last.start
+    if size == 1 && strByte(p, last.start) == '.' { return "" }
+    if size == 2 && strByte(p, last.start) == '.' && strByte(p, last.start + 1) == '.' { return "" }
+    var dot = -1
+    for i in last.start..last.end {
+        if strByte(p, i) == '.' { dot = i }
+    }
+    if dot < 0 || dot == last.start { return "" }
+    return strSlice(p, dot + 1, last.end)
+}

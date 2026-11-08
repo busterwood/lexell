@@ -4,6 +4,8 @@
 // strings; join and baseName/dirName handle "/" separators only.
 
 import "io"
+import "os"
+import "time"
 
 extern "c" fn opendir(path: str): ptr
 extern "c" fn readdir(d: ptr): ptr
@@ -145,6 +147,70 @@ pub fn listNames(path: str): Result[[]str, io.IoError] {
 // DT_* is S_IFMT >> 12; DT_UNKNOWN (0) is Other.
 fn kindOfDirent(t: int): Kind { return kindOfMode(t << 12) }
 
+// Visits root and everything below it, depth first, in the order list gives
+// (sort a level yourself if you need a stable order). visit is called for
+// root itself first, with baseName(root) as its name, and then for every
+// entry below it; returning false for a directory stops the walk below that
+// directory and is ignored for every other kind.
+//
+// With followLinks false a symbolic link is reported as Kind.Link and is not
+// entered. With followLinks true it is stat'ed and a link to a directory is
+// entered as a directory. Directories are remembered by dev and ino, so a
+// link back to a directory already walked is visited but not entered again
+// (a cycle is a skip, never a loop). The first list or stat error stops the
+// walk and is returned.
+pub fn walk(root: str, followLinks: bool, visit: &fn(str, Entry): bool): Result[Unit, io.IoError] {
+    let st = if followLinks { try stat(root) } else { try lstat(root) }
+    if !visit(root, Entry{name: baseName(root), kind: st.kind()}) { return Ok(Unit{}) }
+    if !st.isDir() { return Ok(Unit{}) }
+    var seen = newMap[str, bool]()
+    seen.put(dirKey(&st), true)
+    return walkDir(root, followLinks, visit, mut &seen)
+}
+
+fn walkDir(dir: str, followLinks: bool, visit: &fn(str, Entry): bool,
+    seen: mut &Map[str, bool]): Result[Unit, io.IoError] {
+    let es = try list(dir)
+    for e in es {
+        let path = join(dir, e.name)
+        if e.kind == Kind.Link {
+            if !followLinks {
+                visit(path, Entry{name: e.name, kind: Kind.Link})
+                continue
+            }
+            let st = try stat(path)
+            let k = st.kind()
+            if k == Kind.Dir {
+                if visit(path, Entry{name: e.name, kind: k}) {
+                    let key = dirKey(&st)
+                    if !seen.has(&key) {
+                        seen.put(key, true)
+                        try walkDir(path, followLinks, visit, seen)
+                    }
+                }
+            } else {
+                visit(path, Entry{name: e.name, kind: k})
+            }
+            continue
+        }
+        if e.kind == Kind.Dir {
+            let st = try lstat(path)
+            if visit(path, Entry{name: e.name, kind: Kind.Dir}) {
+                let key = dirKey(&st)
+                if !seen.has(&key) {
+                    seen.put(key, true)
+                    try walkDir(path, followLinks, visit, seen)
+                }
+            }
+            continue
+        }
+        visit(path, Entry{name: e.name, kind: e.kind})
+    }
+    return Ok(Unit{})
+}
+
+fn dirKey(s: &Stat): str { return s.dev.toStr() + ":" + s.ino.toStr() }
+
 // Creates the directory path (mode 0777 less umask).
 pub fn mkdir(path: str): Result[Unit, io.IoError] {
     if cMkdir(path, u32(0x1FF)) != 0 { return Err(io.ioError(errno(), "mkdir", path)) }
@@ -196,6 +262,77 @@ pub fn rename(from: str, to: str): Result[Unit, io.IoError] {
     return Ok(Unit{})
 }
 
+// A new file in dir, open for writing, with mode 0600. The name starts with
+// prefix (or "tmp" when prefix is empty) and carries the pid, a monotonic
+// clock reading and a retry counter, so calls in one directory do not collide;
+// EEXIST on a taken name is retried. If the mode cannot be set the new file is
+// closed and removed and its error returned.
+pub fn createTemp(dir: str, prefix: str): Result[io.Writer, io.IoError] {
+    var attempt = 0
+    while attempt < 100 {
+        let path = join(dir, tempName(prefix, attempt))
+        match createTempFile(path) {
+            Ok(w) { return Ok(w) }
+            Err(e) { if e.errno != 17 { return Err(e) } }
+        }
+        attempt += 1
+    }
+    return Err(io.ioError(17, "createTemp", dir))
+}
+
+fn createTempFile(path: str): Result[io.Writer, io.IoError] {
+    var w = try io.createExclusive(path)
+    match chmod(path, 0x180) {
+        Ok(_) { return Ok(w) }
+        Err(e) {
+            w.close()
+            remove(path)
+            return Err(e)
+        }
+    }
+}
+
+fn tempName(prefix: str, attempt: int): str {
+    let p = if len(prefix) > 0 { prefix } else { "tmp" }
+    return p + "-" + os.pid().toStr() + "-" + time.monotonicNs().toStr() + "-" + attempt.toStr()
+}
+
+// Replaces the file at path with data through a temporary file in the same
+// directory, so a reader sees either the old bytes or the new ones. The
+// temporary is removed when writing, closing or renaming fails.
+pub fn writeAtomic(path: str, data: str): Result[Unit, io.IoError] {
+    let dir = dirName(path)
+    let d = if len(dir) == 0 { "." } else { dir }
+    let prefix = "." + baseName(path) + ".tmp"
+    var attempt = 0
+    while attempt < 100 {
+        let tmp = join(d, tempName(prefix, attempt))
+        match createTempFile(tmp) {
+            Ok(w0) {
+                var w = w0
+                w.write(data)
+                match w.close() {
+                    Ok(_) {}
+                    Err(e) {
+                        remove(tmp)
+                        return Err(e)
+                    }
+                }
+                match rename(tmp, path) {
+                    Ok(_) { return Ok(Unit{}) }
+                    Err(e) {
+                        remove(tmp)
+                        return Err(e)
+                    }
+                }
+            }
+            Err(e) { if e.errno != 17 { return Err(e) } }
+        }
+        attempt += 1
+    }
+    return Err(io.ioError(17, "writeAtomic", path))
+}
+
 // The target of the symbolic link path, as stored in the link.
 pub fn readlink(path: str): Result[str, io.IoError] {
     let n = cReadlink(path)
@@ -213,6 +350,84 @@ pub fn symlink(target: str, path: str): Result[Unit, io.IoError] {
 pub fn chmod(path: str, perm: int): Result[Unit, io.IoError] {
     if cChmod(path, u32(perm)) != 0 { return Err(io.ioError(errno(), "chmod", path)) }
     return Ok(Unit{})
+}
+
+// The absolute path of path with every symbolic link resolved and no "." or
+// ".." components; a relative path starts at os.cwd() (and so does an empty
+// path). More than 40 links is ELOOP (40), and a missing component returns
+// its errno. Trailing slashes are dropped, and a component that is not a
+// directory is not rejected before a later ".." (the same lexical behaviour
+// as zoxide's realpath).
+pub fn realpath(path: str): Result[str, io.IoError] {
+    var stack: []str = []
+    var todo: []str = []
+    if len(path) == 0 || strByte(path, 0) != '/' {
+        for c in splitComps(os.cwd()) { append(mut &todo, c) }
+    }
+    for c in splitOnSlash(path) { append(mut &todo, c) }
+    var pos = 0
+    var links = 0
+    while pos < len(todo) {
+        let c = todo[pos]
+        pos += 1
+        if len(c) == 0 || (len(c) == 1 && strByte(c, 0) == '.') { continue }
+        if len(c) == 2 && strByte(c, 0) == '.' && strByte(c, 1) == '.' {
+            if len(stack) > 0 { pop(mut &stack) }
+            continue
+        }
+        let cand = "/" + joinComps(&stack) + (if len(stack) > 0 { "/" } else { "" }) + c
+        match lstat(cand) {
+            Err(e) { return Err(e) }
+            Ok(st) {
+                if st.isLink() {
+                    links += 1
+                    if links > 40 { return Err(io.ioError(40, "realpath", path)) }
+                    let target = try readlink(cand)
+                    if len(target) > 0 && strByte(target, 0) == '/' { stack = [] }
+                    var next: []str = []
+                    for t in splitOnSlash(target) { append(mut &next, t) }
+                    for k in pos..len(todo) { append(mut &next, todo[k]) }
+                    todo = next
+                    pos = 0
+                } else {
+                    append(mut &stack, c)
+                }
+            }
+        }
+    }
+    return Ok("/" + joinComps(&stack))
+}
+
+// path split at every "/", including the empty ends.
+fn splitOnSlash(path: str): []str {
+    var out: []str = []
+    var start = 0
+    for i in 0..len(path) {
+        if strByte(path, i) == '/' {
+            append(mut &out, strSlice(path, start, i))
+            start = i + 1
+        }
+    }
+    append(mut &out, strSlice(path, start, len(path)))
+    return out
+}
+
+// The components of path: no empty ones and no ".".
+fn splitComps(path: str): []str {
+    var out: []str = []
+    for c in splitOnSlash(path) {
+        if len(c) > 0 && !(len(c) == 1 && strByte(c, 0) == '.') { append(mut &out, c) }
+    }
+    return out
+}
+
+fn joinComps(parts: &[str]): str {
+    var s = ""
+    for i in 0..len(parts) {
+        if i > 0 { s += "/" }
+        s += parts[i]
+    }
+    return s
 }
 
 // ------------------------------------------------------------------ paths

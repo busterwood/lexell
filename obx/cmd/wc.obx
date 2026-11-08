@@ -33,8 +33,7 @@
 // failure exit so the counts and the error both appear.
 
 import "io"
-
-const CHUNK = 65536
+import "fmt"
 
 type Counts = record {
     lines: int
@@ -54,29 +53,6 @@ type Opts = record {
     lines: bool
     words: bool
     bytes: bool
-}
-
-// An io.Reader read in chunks.
-type Reader = record {
-    src: io.Reader
-    buf: []byte
-    n: int
-}
-
-fn newReader(src: io.Reader): Reader {
-    return Reader{src: src, buf: array(CHUNK, 0), n: 0}
-}
-
-// Reads the next chunk: its length, 0 at the end of the input, or minus the
-// errno.
-fn (r: mut &Reader) fill(): int {
-    match r.src.read(mut &r.buf) {
-        Ok(k) {
-            r.n = k
-            return k
-        }
-        Err(e) { return -e.errno }
-    }
 }
 
 // Newline-only scan, used when lines are requested and words are not; the
@@ -181,7 +157,7 @@ fn scanWordsLines(c: mut &Counts, data: &[]byte, n: int) {
 
 // Counts one descriptor to its end: 0, or minus the errno of a failed read
 // (the counts so far stay in c).
-fn countReader(r: mut &Reader, c: mut &Counts, o: &Opts): int {
+fn countReader(r: mut &io.ChunkReader, c: mut &Counts, o: &Opts): int {
     while true {
         let n = r.fill()
         if n < 0 { return n }
@@ -204,7 +180,7 @@ fn newCounts(): Counts { return Counts{lines: 0, words: 0, bytes: 0, inWord: 0} 
 fn wcOperand(path: str, label: str, o: &Opts, stats: mut &[]WcStat): bool {
     var c = newCounts()
     if path == "-" {
-        var r = newReader(io.stdin())
+        var r = io.newChunkReader(io.stdin())
         let e = countReader(mut &r, mut &c, o)
         if e < 0 { eprintln("wc: -: " + io.errorText(-e)) }
         append(mut &stats, WcStat{label: label, counts: c, unknown: true, isStdin: true})
@@ -222,7 +198,7 @@ fn wcOperand(path: str, label: str, o: &Opts, stats: mut &[]WcStat): bool {
 // Counts an opened file operand and appends its stat; false when it failed.
 fn wcFile(src: io.Reader, path: str, o: &Opts, stats: mut &[]WcStat): bool {
     var c = newCounts()
-    var r = newReader(src)
+    var r = io.newChunkReader(src)
     let e = countReader(mut &r, mut &c, o)
     if e < 0 {
         eprintln("wc: " + path + ": " + io.errorText(-e))
@@ -241,42 +217,22 @@ fn columnCount(o: &Opts): int {
     return n
 }
 
-fn digits(n: int): int {
-    var d = 1
-    var t = n
-    while t >= 10 {
-        t = t / 10
-        d += 1
-    }
-    return d
-}
-
-fn putPadded(w: mut &io.Writer, n: int, width: int) {
-    let s = n.toStr()
-    var pad = width - len(s)
-    while pad > 0 {
-        w.writeByte(' ')
-        pad -= 1
-    }
-    w.write(s)
-}
-
 // One output line: the selected counts in l/w/c order, right-aligned to width,
 // single spaces between fields (no leading separator), then the label if any.
 fn emitStat(w: mut &io.Writer, s: &WcStat, o: &Opts, width: int) {
     var first = true
     if o.lines {
-        putPadded(w, s.counts.lines, width)
+        fmt.writePadded(w, s.counts.lines, width)
         first = false
     }
     if o.words {
         if !first { w.write(" ") }
-        putPadded(w, s.counts.words, width)
+        fmt.writePadded(w, s.counts.words, width)
         first = false
     }
     if o.bytes {
         if !first { w.write(" ") }
-        putPadded(w, s.counts.bytes, width)
+        fmt.writePadded(w, s.counts.bytes, width)
         first = false
     }
     if len(s.label) > 0 {
@@ -345,7 +301,7 @@ fn main() {
             if !s.isStdin { sizeSum += s.counts.bytes }
             if s.unknown { anyUnknown = true }
         }
-        width = digits(sizeSum)
+        width = fmt.digits(sizeSum)
         if anyUnknown && width < 7 { width = 7 }
     }
 

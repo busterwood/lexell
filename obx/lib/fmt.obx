@@ -1,0 +1,115 @@
+// fmt: number and mode formatting shared by the command-line tools and eza.
+//
+// The functions here take non-negative ints, which is what the tools count
+// and format: digits and appendPadded pad a decimal number, writePadded does
+// the same through an io.Writer, and modeString gives eza's 10-character
+// permission string. strings.padLeft remains the string primitive; this
+// module is the number and writer layer.
+//
+// A Writer buffers and reports the first write error at flush or close, so
+// writePadded has no Result of its own: it feeds bytes to the Writer and the
+// caller checks flush() as it would after any other write.
+
+import "io"
+
+// Decimal digit count of a non-negative int; digits(0) is 1.
+pub fn digits(n: int): int {
+    var d = 1
+    var v = n
+    while v >= 10 {
+        v = v / 10
+        d += 1
+    }
+    return d
+}
+
+// Append n right-aligned in width (width 0 or less means no padding) to a
+// byte buffer. The digits come from a power-of-ten loop, so no temporary
+// string is allocated.
+pub fn appendPadded(buf: mut &[]byte, n: int, width: int) {
+    let d = digits(n)
+    var pad = width - d
+    while pad > 0 {
+        append(buf, ' ')
+        pad -= 1
+    }
+    var p = 1
+    for i in 1..d { p *= 10 }
+    var v = n
+    for i in 0..d {
+        let digit = v / p
+        append(buf, byte(48 + digit))
+        v = v - digit * p
+        if p > 1 { p = p / 10 }
+    }
+}
+
+// Write n right-aligned in width (width 0 or less means no padding) through a
+// Writer. The digit loop mirrors appendPadded instead of building a byte
+// array, so a call allocates nothing beyond what the Writer's buffer needs.
+pub fn writePadded(w: mut &io.Writer, n: int, width: int) {
+    let d = digits(n)
+    var pad = width - d
+    while pad > 0 {
+        w.writeByte(' ')
+        pad -= 1
+    }
+    var p = 1
+    for i in 1..d { p *= 10 }
+    var v = n
+    for i in 0..d {
+        let digit = v / p
+        w.writeByte(byte(48 + digit))
+        v = v - digit * p
+        if p > 1 { p = p / 10 }
+    }
+}
+
+// bit set in mode -> ch, else '-'
+fn permChar(mode: int, bit: int, ch: byte): byte {
+    if mode & bit != 0 { return ch }
+    return '-'
+}
+
+// eza's 10-character permission string from a stat mode (type bits included).
+// Type: S_IFMT 0o170000; regular 0o100000 '.', directory 0o040000 'd',
+// symlink 0o120000 'l', FIFO 0o010000 '|', socket 0o140000 's', block
+// 0o060000 'b', char 0o020000 'c', anything else '?'. Permissions are the low
+// 12 bits; setuid/setgid/sticky replace the owner/group/other execute
+// character with 's'/'S' and 't'/'T'. There is no trailing '@': the tools do
+// not query xattrs.
+pub fn modeString(mode: int): str {
+    var out: []byte = []
+    let kind = mode & 0x0F000
+    var typeChar = '?'
+    if kind == 0x01000 { typeChar = '|' }
+    if kind == 0x02000 { typeChar = 'c' }
+    if kind == 0x04000 { typeChar = 'd' }
+    if kind == 0x06000 { typeChar = 'b' }
+    if kind == 0x08000 { typeChar = '.' }
+    if kind == 0x0A000 { typeChar = 'l' }
+    if kind == 0x0C000 { typeChar = 's' }
+    append(mut &out, typeChar)
+    append(mut &out, permChar(mode, 0x100, 'r'))
+    append(mut &out, permChar(mode, 0x080, 'w'))
+    if mode & 0x800 != 0 {
+        if mode & 0x040 != 0 { append(mut &out, 's') } else { append(mut &out, 'S') }
+    } else {
+        append(mut &out, permChar(mode, 0x040, 'x'))
+    }
+    append(mut &out, permChar(mode, 0x020, 'r'))
+    append(mut &out, permChar(mode, 0x010, 'w'))
+    if mode & 0x400 != 0 {
+        if mode & 0x008 != 0 { append(mut &out, 's') } else { append(mut &out, 'S') }
+    } else {
+        append(mut &out, permChar(mode, 0x008, 'x'))
+    }
+    append(mut &out, permChar(mode, 0x004, 'r'))
+    append(mut &out, permChar(mode, 0x002, 'w'))
+    if mode & 0x200 != 0 {
+        if mode & 0x001 != 0 { append(mut &out, 't') } else { append(mut &out, 'T') }
+    } else {
+        append(mut &out, permChar(mode, 0x001, 'x'))
+    }
+    return strFromBytes(&out)
+}
