@@ -1,7 +1,7 @@
 # obx
 
-**A 2.9 MB compiler that builds itself in 0.66 s, turns a hello world into a
-16 KB native binary in 12 ms, and produces code as fast as Rust — and often
+**A 2.9 MB compiler that builds itself in 0.65 s, turns a hello world into a
+16 KB native binary in 13 ms, and produces code as fast as Rust — and often
 faster than C.**
 
 obx is a small language in the Oberon line — the family Go also draws on. It
@@ -29,14 +29,14 @@ state, and the database is the only thing they share. One thread serves
 60,763 HTTP requests a second; eight workers reach about 124,000.
 
 The compiler is 39,436 lines of obx, a 2.9 MB static binary with no LLVM
-behind it, rebuilding itself in 0.66 s. It writes x86-64 ELF directly.
+behind it, rebuilding itself in 0.65 s. It writes x86-64 ELF directly.
 
 - **The code is fast.** It is level with or ahead of idiomatic Rust on eight
   of nine microbenchmarks, and beats the same source built through obx's C
   backend on nine of ten. Against hand-written C it is 2x on allocation and
   strings, 1.3x on trees, and ahead on lists and the sieve.
-- **Building is fast.** The nine benchmark programs compile in 104 ms
-  against 2.95 s for the Rust suite. Rust's `rustc` plus its driver and LLVM
+- **Building is fast.** The nine benchmark programs compile in 124 ms
+  against 2.23 s for the Rust suite. Rust's `rustc` plus its driver and LLVM
   is 316 MB; with the rest of the toolchain it is 1.3 GB.
 - **It is a real language with a real library.** Regex (RE2 syntax, linear
   time), JSON and a jq port, CommonMark, HTTP, TLS, tasks, and clients for
@@ -82,7 +82,7 @@ method, a generic function, a slice with `Option` and `match`, and an exact
 
 Run these from the repository root, with the program above saved as
 `prog.obx`. The first build uses the checked-in C seed and takes about 22 s
-because it runs gcc; later self-builds take 0.66 s.
+because it runs gcc; later self-builds take 0.65 s.
 
 ```
 obx/compiler/build.sh                            # build the compiler from its seed
@@ -182,10 +182,10 @@ test machine; full tables, method and caveats in
 
 | | obx | Rust | C |
 |---|---:|---:|---:|
-| hello world, compile | 12 ms | 162 ms | 86 ms |
+| hello world, compile | 13 ms | 154 ms | 61 ms |
 | hello world, binary | 16 KB static | 357 KB | 16 KB |
-| nine programs, compile | 104 ms | 2.95 s | - |
-| self-build | 0.66 s | over 30 min* | - |
+| nine programs, compile | 124 ms | 2.23 s | - |
+| self-build | 0.65 s | over 30 min* | - |
 | toolchain | 2.9 MB | 316 MB | system gcc |
 
 - **Code:** level with or ahead of idiomatic Rust on eight of nine

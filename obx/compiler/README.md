@@ -185,8 +185,8 @@ blocks and each task's park location, for the exit 13 and 14 messages.
   compiler change; the gate fails while the seed is stale. A language change
   the compiler's own source uses takes two rounds: implement it and reseed,
   then use it.
-- Speed: the compiler itself to C (`--emit-c`) in 0.19 s, to a complete
-  native executable in 0.23 s, both with the gcc-built out/obxc (2026-11-03).
+- Speed: the compiler itself to C (`--emit-c`) in 0.48 s, to a complete
+  native executable in 0.70 s, both with the gcc-built out/obxc (2026-11-08).
   A C build is then mostly gcc (9 s for the compiler).
 - By default `obxc` writes an x86-64 ELF without gcc (design/native.md);
   `--c` selects the C backend. The native output is static, or dynamically linked when the program calls C
