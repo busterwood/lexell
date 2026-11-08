@@ -97,8 +97,11 @@ Grammar requirements, from obo's design 5.6:
 
 ### unicode
 
-New module. Reuse the generated data in `regex_unicode.lxl` and
-`markdown_unicode.lxl`; do not add a third table.
+New module. The final layout is `unicode_data.lxl` (categories, simple case
+mapping, White_Space), `unicode_width.lxl` (terminal width) and
+`markdown_unicode.lxl` (Markdown-specific punctuation, space and full case
+folding); regex keeps its own
+`regex_unicode.lxl` for scripts and aliases.
 
 Priority is what the examples actually call:
 - `lower(r: int): int` / `fold(r: int): int` for simple case folding.
@@ -109,13 +112,11 @@ Priority is what the examples actually call:
   `strings.toUpper` use is ASCII; do not build a full uppercase table
   without a caller.
 
-`regex_unicode.inClass`/`simpleFold` and `markdown_unicode.SPACE`/`PUNCT`/
-`FOLD_*` already carry the data. Importing both large modules is a binary
-size risk; prefer the smaller dependency or one shared generated module if
-the integration review agrees. `strings.toLower` stays ASCII: no example needs full Unicode lowercasing,
-and importing `unicode` into `strings` would pull the fold tables (about
-135 KB) into every program that only lowercases an extension. Callers that
-need full lowercasing use `unicode.lower` directly. `strings.naturalCompare`
+`unicode_data.inClass`/`simpleFold` carry classification; `markdown_unicode`
+carries Markdown's P+S/space tables and the full fold for link labels. `strings` case mapping stays ASCII and
+is named `toUpperAscii`/`toLowerAscii`/`equalFoldAscii`, so importing `strings`
+never pulls the Unicode tables. Callers that need Unicode use
+`unicode.upper`/`lower`/`fold` directly. `strings.naturalCompare`
 may keep eza's documented partial folding if that is what the eza goldens
 pin; the difference must be explicit.
 

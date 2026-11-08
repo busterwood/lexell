@@ -1,0 +1,207 @@
+// hash: SipHash-1-3 and the per-process hash key of std's Map and Decimal.
+//
+// The key comes from AT_RANDOM, as std's comment explains (lexell/lib/README.md,
+// "Keyed hashing"). sipHash13 is also the test vectors' way in.
+
+// ---- keyed hashing
+//
+// A Map keyed by input (query parameters, header names, JSON object keys,
+// ids) must not let the sender choose keys that collide: n colliding keys
+// cost n^2 probes (hash flooding: Klink and Waelde, 28C3 2011). So every
+// hash of variable-length or wider-than-64-bit data (str, i128, u128,
+// Decimal and money) is SipHash-1-3 (Aumasson and Bernstein 2012; Rust's
+// std uses the same) under a 128-bit key chosen at random for each process.
+// A seeded FNV or Murmur hash would not do: their collisions are found
+// without knowing the seed. The 64-bit integers keep their multiplicative
+// hash, a bijection (no two values share a hash); Map mixes the key into
+// the slot a hash goes to (Map.home), so their slots cannot be predicted
+// either. Map keeps insertion order, so the key changes no program's output.
+//
+// The key comes from the 16 random bytes the kernel puts in every process's
+// auxiliary vector (AT_RANDOM): no system call. glibc uses the same bytes
+// for its stack canary and pointer guard, so the key is derived from them
+// with SipHash, never the bytes themselves. Worker processes forked by
+// task.workers inherit their supervisor's key (as they inherit all its
+// memory); a program run again gets a new one.
+//
+// LXL_HASH_SEED=n is a benchmark hook, off by default: lxllib_hash_key
+// (rt.h, native/rt.c) then uses a fixed key derived from n instead of
+// AT_RANDOM, so repeated runs and the two backends hash identically. It is
+// not a substitute for the random key in production.
+
+extern "c" fn rtHashKey(i: int): u64 as "lxllib_hash_key"
+
+var sipKeyed: bool = false
+var sipK0: u64 = 0
+var sipK1: u64 = 0
+var mapSeed: u64 = 0     // what Map mixes into its slots
+
+// The state of one SipHash computation.
+type Sip = value record { v0: u64; v1: u64; v2: u64; v3: u64 }
+
+fn sipOf(k0: u64, k1: u64): Sip {
+    return Sip{v0: k0 ^ 0x736f6d6570736575, v1: k1 ^ 0x646f72616e646f6d,
+        v2: k0 ^ 0x6c7967656e657261, v3: k1 ^ 0x7465646279746573}
+}
+
+fn (s: mut &Sip) round() {
+    s.v0 = s.v0 +% s.v1
+    s.v1 = (s.v1 << 13 | s.v1 >> 51) ^ s.v0
+    s.v0 = s.v0 << 32 | s.v0 >> 32
+    s.v2 = s.v2 +% s.v3
+    s.v3 = (s.v3 << 16 | s.v3 >> 48) ^ s.v2
+    s.v0 = s.v0 +% s.v3
+    s.v3 = (s.v3 << 21 | s.v3 >> 43) ^ s.v0
+    s.v2 = s.v2 +% s.v1
+    s.v1 = (s.v1 << 17 | s.v1 >> 47) ^ s.v2
+    s.v2 = s.v2 << 32 | s.v2 >> 32
+}
+
+// One 8-byte block (c = 1 round).
+fn (s: mut &Sip) block(m: u64) {
+    s.v3 ^= m
+    s.round()
+    s.v0 ^= m
+}
+
+// The hash (d = 3 rounds), after the last block.
+fn (s: mut &Sip) finish(): u64 {
+    s.v2 ^= 0xff
+    s.round()
+    s.round()
+    s.round()
+    return s.v0 ^ s.v1 ^ s.v2 ^ s.v3
+}
+
+// SipHash-1-3 of the bytes of s under the key (k0, k1). The rounds are written out on locals
+// (not Sip's methods): the hottest code of every Map with str keys.
+fn sipKeyedStr(k0: u64, k1: u64, s: &str): u64 {
+    var v0 = k0 ^ 0x736f6d6570736575
+    var v1 = k1 ^ 0x646f72616e646f6d
+    var v2 = k0 ^ 0x6c7967656e657261
+    var v3 = k1 ^ 0x7465646279746573
+    let n = len(s)
+    let end = n - (n & 7)
+    var i = 0
+    while i < end {
+        // the 8-byte blocks, little-endian
+        let m = strWord(s, i)
+        v3 ^= m
+        v0 = v0 +% v1
+        v1 = (v1 << 13 | v1 >> 51) ^ v0
+        v0 = v0 << 32 | v0 >> 32
+        v2 = v2 +% v3
+        v3 = (v3 << 16 | v3 >> 48) ^ v2
+        v0 = v0 +% v3
+        v3 = (v3 << 21 | v3 >> 43) ^ v0
+        v2 = v2 +% v1
+        v1 = (v1 << 17 | v1 >> 47) ^ v2
+        v2 = v2 << 32 | v2 >> 32
+        v0 ^= m
+        i += 8
+    }
+    // the last block: the rest of the bytes, then the length in the top byte. A string of 8
+    // bytes or more has them at the top of its last 8 bytes.
+    var m: u64 = 0
+    if n & 7 != 0 {
+        if n >= 8 {
+            m = strWord(s, n - 8) >> (64 - 8 * (n & 7))
+        } else {
+            var j = n
+            while j > 0 {
+                j -= 1
+                m = m << 8 | u64(strByte(s, j))
+            }
+        }
+    }
+    m |= u64(n & 255) << 56
+    v3 ^= m
+    v0 = v0 +% v1
+    v1 = (v1 << 13 | v1 >> 51) ^ v0
+    v0 = v0 << 32 | v0 >> 32
+    v2 = v2 +% v3
+    v3 = (v3 << 16 | v3 >> 48) ^ v2
+    v0 = v0 +% v3
+    v3 = (v3 << 21 | v3 >> 43) ^ v0
+    v2 = v2 +% v1
+    v1 = (v1 << 17 | v1 >> 47) ^ v2
+    v2 = v2 << 32 | v2 >> 32
+    v0 ^= m
+    v2 ^= 0xff
+    v0 = v0 +% v1
+    v1 = (v1 << 13 | v1 >> 51) ^ v0
+    v0 = v0 << 32 | v0 >> 32
+    v2 = v2 +% v3
+    v3 = (v3 << 16 | v3 >> 48) ^ v2
+    v0 = v0 +% v3
+    v3 = (v3 << 21 | v3 >> 43) ^ v0
+    v2 = v2 +% v1
+    v1 = (v1 << 17 | v1 >> 47) ^ v2
+    v2 = v2 << 32 | v2 >> 32
+    v0 = v0 +% v1
+    v1 = (v1 << 13 | v1 >> 51) ^ v0
+    v0 = v0 << 32 | v0 >> 32
+    v2 = v2 +% v3
+    v3 = (v3 << 16 | v3 >> 48) ^ v2
+    v0 = v0 +% v3
+    v3 = (v3 << 21 | v3 >> 43) ^ v0
+    v2 = v2 +% v1
+    v1 = (v1 << 17 | v1 >> 47) ^ v2
+    v2 = v2 << 32 | v2 >> 32
+    v0 = v0 +% v1
+    v1 = (v1 << 13 | v1 >> 51) ^ v0
+    v0 = v0 << 32 | v0 >> 32
+    v2 = v2 +% v3
+    v3 = (v3 << 16 | v3 >> 48) ^ v2
+    v0 = v0 +% v3
+    v3 = (v3 << 21 | v3 >> 43) ^ v0
+    v2 = v2 +% v1
+    v1 = (v1 << 17 | v1 >> 47) ^ v2
+    v2 = v2 << 32 | v2 >> 32
+    return v0 ^ v1 ^ v2 ^ v3
+}
+
+fn sipKey() {
+    let r0 = rtHashKey(0)
+    let r1 = rtHashKey(1)
+    var a = sipOf(r0, r1)
+    a.block(0x6b2068736168786f)     // "oxhash k": three outputs of the raw key
+    sipK0 = a.finish()
+    var b = sipOf(r0, r1)
+    b.block(0x6b2068736168786f)
+    b.block(1)
+    sipK1 = b.finish()
+    var c = sipOf(r0, r1)
+    c.block(0x6b2068736168786f)
+    c.block(2)
+    mapSeed = c.finish()
+    sipKeyed = true
+}
+
+// SipHash-1-3 of s under the process's key.
+pub fn sipStr(s: &str): u64 {
+    if !sipKeyed { sipKey() }
+    return sipKeyedStr(sipK0, sipK1, s)
+}
+
+// SipHash-1-3 of three words (24 bytes) under the process's key.
+pub fn sipWords(x: u64, y: u64, z: u64): u64 {
+    if !sipKeyed { sipKey() }
+    var st = sipOf(sipK0, sipK1)
+    st.block(x)
+    st.block(y)
+    st.block(z)
+    st.block(u64(24) << 56)
+    return st.finish()
+}
+
+// The key Map mixes into its slots.
+pub fn hashSeed(): u64 {
+    if !sipKeyed { sipKey() }
+    return mapSeed
+}
+
+// SipHash-1-3 of the bytes of s under the key (k0, k1): the test vectors'
+// way in (std_hash.lxl); programs use s.hash().
+pub fn sipHash13(k0: u64, k1: u64, s: &str): u64 { return sipKeyedStr(k0, k1, s) }
+

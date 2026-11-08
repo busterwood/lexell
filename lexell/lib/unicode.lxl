@@ -1,17 +1,15 @@
-// unicode: Unicode 15.0.0 character classification and simple lowercasing.
+// unicode: Unicode 15.0.0 classification and simple case mapping.
 //
 //     unicode.isLetter(0x03B1)        // true (GREEK SMALL LETTER ALPHA)
 //     unicode.lower(0x0391)           // 0x03B1
+//     unicode.upper(0x03B1)           // 0x0391
 //     unicode.category(0x1F600)       // "So"
 //
-// The data is not duplicated here. General categories, scripts, and the
-// simple-fold orbits come from regex_unicode.lxl (Go's Unicode tables); the
-// full case-fold table comes from markdown_unicode.lxl (Python's
-// unicodedata, CaseFolding.txt statuses C and F). lower uses the full-fold
-// table when a code point folds to a single code point, and otherwise walks
-// regex_unicode's simple-fold orbit to the lowercase member, so "ß", "ẞ",
-// "Σ", "İ" and the Cherokee capitals all lowercase as Unicode 15.0.0's
-// UnicodeData simple lowercase mapping does.
+// The data is unicode_data.lxl (generated from Go's Unicode tables). This
+// module is classification and simple case mapping only: scripts and category
+// aliases are regex_unicode's, and the full multi-code-point case fold is
+// Markdown's own markdown_unicode table. A program that only classifies text
+// does not pay for either.
 //
 // The predicates match Go's unicode package where the name is the same:
 // isLetter is Lu|Ll|Lt|Lm|Lo, isDigit is Nd, isUpper is Lu, isLower is Ll
@@ -20,14 +18,12 @@
 // is P only: symbols (Sc, Sk, Sm, So, as in "$" or "©") are not punctuation,
 // which differs from CommonMark's wider "punctuation or symbol" set.
 
-import "regex_unicode" as uni
-import "markdown_unicode" as mu
+import "unicode_data" as ud
 
-// Indices into uni.CLASS_NAMES. The first 38 names are the general
-// categories in Unicode's order; the values are pinned here so the
-// predicates do not scan CLASS_NAMES on every call. Keep them in step with
-// uni.CLASS_NAMES if the generated table is ever regenerated with a
-// different layout (its own order is stable).
+// Indices into ud.CLASS_NAMES. The first 38 names are the general categories
+// in Unicode's order; the values are pinned here so the predicates do not scan
+// CLASS_NAMES on every call. Keep them in step with ud.CLASS_NAMES if the
+// generated table is ever regenerated with a different layout.
 const CAT_L  = 6
 const CAT_LL = 8
 const CAT_LT = 11
@@ -39,93 +35,50 @@ const CAT_ZL = 35
 const CAT_ZP = 36
 const CAT_ZS = 37
 
-// The specific general categories, as indices into uni.CLASS_NAMES, in
-// table order. The composites (C, L, LC, M, N, P, S, Z) are omitted: every
-// code point is in exactly one of these 30.
+// The specific general categories, as indices into ud.CLASS_NAMES, in table
+// order. The composites (C, L, LC, M, N, P, S, Z) are omitted: every code
+// point is in exactly one of these 30.
 const CATS: []int = [1, 2, 3, 4, 5, 8, 9, 10, 11, 12, 14, 15, 16, 18, 19, 20,
     22, 23, 24, 25, 26, 27, 28, 30, 31, 32, 33, 35, 36, 37]
 
 // The Unicode simple lowercase mapping of r: the lowercase form of a cased
-// letter, else r. This is UnicodeData.txt's simple lowercase mapping
-// (field 13), not full case folding: it never returns more than one code
-// point. In particular lower(0x00DF "ß") is 0x00DF, and lower(0x0130 "İ")
-// is 0x0069 "i" (its full lowercase is "i" plus U+0307, which cannot be
-// represented here); lower(0x03A3 "Σ") is 0x03C3 "σ", not final sigma.
-pub fn lower(r: int): int {
-    if r >= 0x41 && r <= 0x5A { return r + 32 }
-    if r < 0x80 { return r }
-    // A titlecase letter, a lowercase letter, or a mark is already at its
-    // lower form (marks fold, but do not lowercase: U+0345 stays U+0345).
-    if uni.inClass(CAT_LL, r) || uni.inClass(CAT_M, r) { return r }
-    // İ is the one code point whose full fold is multi-code-point but whose
-    // simple lowercase mapping is a single other code point.
-    if r == 0x130 { return 0x69 }
-    let f = foldOne(r)
-    if f >= 0 { return f }
-    // No single-code-point fold: a Cherokee capital, capital sharp s, a
-    // titlecase digraph, ... Find the lowercase member of its fold orbit.
-    if uni.inClass(CAT_LU, r) || uni.inClass(CAT_LT, r) {
-        var x = uni.simpleFold(r)
-        var n = 0
-        while x != r && n < 32 {
-            if uni.inClass(CAT_LL, x) { return x }
-            x = uni.simpleFold(x)
-            n += 1
-        }
-    }
-    return r
-}
+// letter, else r. This is UnicodeData.txt's simple lowercase mapping (field
+// 13), not full case folding: it never returns more than one code point.
+pub fn lower(r: int): int { return ud.lower(r) }
 
-// The one-code-point full fold of r, or -1 when r has no fold or folds to
-// several code points ("ß" -> "ss", "ﬁ" -> "fi").
-fn foldOne(r: int): int {
-    var lo = 0
-    var hi = len(mu.FOLD_FROM)
-    while lo < hi {
-        let m = (lo + hi) / 2
-        let k = mu.FOLD_FROM[m]
-        if k == r {
-            if mu.FOLD_START[m + 1] - mu.FOLD_START[m] == 1 {
-                return mu.FOLD_DATA[mu.FOLD_START[m]]
-            }
-            return -1
-        }
-        if k < r { lo = m + 1 } else { hi = m }
-    }
-    return -1
-}
+// The Unicode simple uppercase mapping of r (UnicodeData.txt field 12), or r.
+pub fn upper(r: int): int { return ud.upper(r) }
+
+// The next code point of r's simple case-folding orbit, as Go's
+// unicode.SimpleFold: A -> a -> A, K -> k -> K (Kelvin) -> K.
+pub fn fold(r: int): int { return ud.simpleFold(r) }
 
 // Whether r is a letter: any of Lu, Ll, Lt, Lm, Lo.
-pub fn isLetter(r: int): bool { return uni.inClass(CAT_L, r) }
+pub fn isLetter(r: int): bool { return ud.inClass(CAT_L, r) }
 
 // Whether r is a decimal digit: general category Nd only.
-pub fn isDigit(r: int): bool { return uni.inClass(CAT_ND, r) }
+pub fn isDigit(r: int): bool { return ud.inClass(CAT_ND, r) }
 
-// Whether r is Unicode white space: the ASCII controls TAB, LF, VT, FF and
-// CR, the ASCII space, U+0085 NEL, the Zs separators (U+00A0, U+1680,
-// U+2000..U+200A, U+202F, U+205F, U+3000), and Zl/Zp (U+2028, U+2029).
-pub fn isSpace(r: int): bool {
-    if r == 0x20 || (r >= 0x09 && r <= 0x0D) || r == 0x85 { return true }
-    return uni.inClass(CAT_ZS, r) || uni.inClass(CAT_ZL, r) || uni.inClass(CAT_ZP, r)
-}
+// Whether r has the Unicode White_Space property.
+pub fn isSpace(r: int): bool { return ud.isSpace(r) }
 
 // Whether r is an uppercase letter: general category Lu only. A titlecase
 // letter (Lt) is neither upper nor lower.
-pub fn isUpper(r: int): bool { return uni.inClass(CAT_LU, r) }
+pub fn isUpper(r: int): bool { return ud.inClass(CAT_LU, r) }
 
 // Whether r is a lowercase letter: general category Ll only.
-pub fn isLower(r: int): bool { return uni.inClass(CAT_LL, r) }
+pub fn isLower(r: int): bool { return ud.inClass(CAT_LL, r) }
 
 // Whether r is punctuation: general category P (Pc, Pd, Pe, Pf, Pi, Po,
 // Ps). Symbols and marks are not punctuation.
-pub fn isPunct(r: int): bool { return uni.inClass(CAT_P, r) }
+pub fn isPunct(r: int): bool { return ud.inClass(CAT_P, r) }
 
 // The general category of r as its short Unicode name ("Lu", "Ll", "Nd",
 // "Zs", "Po", "So", ...). Unassigned code points are "Cn"; the generated
 // tables cover every code point from U+0000 to U+10FFFF exactly once.
 pub fn category(r: int): str {
     for i in CATS {
-        if uni.inClass(i, r) { return uni.CLASS_NAMES[i] }
+        if ud.inClass(i, r) { return ud.CLASS_NAMES[i] }
     }
     return "Cn"
 }

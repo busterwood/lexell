@@ -137,7 +137,7 @@ into every module and its public names are unqualified.
 import "strings"
 import "./ast" as syntax
 
-pub fn shout(s: str): str { return strings.toUpper(s) }
+pub fn shout(s: str): str { return strings.toUpperAscii(s) }
 ```
 
 ```rust

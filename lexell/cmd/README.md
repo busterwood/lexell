@@ -20,7 +20,7 @@ general went to the library instead: `cli.parse` for the option grammar,
 `paths.lastComponent`/`parentOf`, `fmt.modeString`,
 `strings.natcmp`/`natcmpFold`, `errors.osError`/`debugPath`,
 `os.users`/`uid`, plus the earlier `fs.readlink`, `fs.Kind`,
-`io.isTerminal`, `io.terminalWidth`, `strings.displayWidth`, `strings.lossy`
+`io.isTerminal`, `io.terminalWidth`, `unicode_width.displayWidth`, `strings.lossy`
 and the stdout write errors (see [../lib/README.md](../lib/README.md)).
 
 The CLI move has a size cost: `cli` is compiled in whole once `parse` is
@@ -184,7 +184,8 @@ first match). One measured case is still behind GNU: `-c -E '^[0-9]+7[0-9]'`
 
 ## zoxide
 
-`zoxide.lxl` is a port of zoxide 0.9.9, the "smarter cd". It reads and writes
+`zoxide.lxl` is a port of zoxide 0.9.9, the "smarter cd". Its Rust-glob
+matcher is the local module `zoxide_glob.lxl` (not part of the library). It reads and writes
 the real zoxide's database (`db.zo`, bincode version 3), so you can switch
 between the two at any time. Frecency scores, aging, the keyword rules, the
 `_ZO_*` variables, the messages and the exit codes are zoxide's.

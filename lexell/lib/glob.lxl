@@ -1,40 +1,35 @@
-// glob: zoxide's path glob syntax, as Rust's `glob` crate compiles it
-// (`Pattern::new`).
+// glob: Unix-compatible path globbing.
 //
 //     let p = try glob.compile("cache/**/tmp?.log")
-//     p.matches("cache/a/b/tmpx.log")        // true
-//     p.matches("cache/a/tmp1.log")          // true
+//     p.matches("cache/a/b/tmpx.log")        // true with globstar: true
 //
-// Two match modes over the same compiled pattern and the same syntax:
+// The defaults are bash's: `*`, `?` and `[...]` do not cross `/`; `*` and
+// `?` do not match a leading `.`; `**` is just `*` unless `globstar` is set;
+// character classes are ASCII (the C locale). Escapes use `\`. Brace and
+// tilde expansion are shell features, not glob, and are not here.
 //
-// - `Pattern.matches` is path-aware: `*`, `?` and a set stop at `/`; only
-//   `**` crosses a component boundary. This is the design's rule.
-// - `Pattern.matchesRelaxed` is zoxide's actual `Pattern::matches_path` with
-//   its default options (`require_literal_separator = false`): `*`, `?` and
-//   a set may match `/` too, and `**` keeps its recursive meaning. Parsing
-//   and compile errors are identical in both modes.
+// Matching is over Unicode code points, as bash is in a UTF-8 locale: `?`
+// matches one code point, not one byte. An invalid UTF-8 part is one U+FFFD,
+// as strings.decodeAt decodes it.
 //
-// Syntax, case-sensitive, over Unicode code points:
-// - `?` matches one character;
-// - `*` matches zero or more characters;
-// - `**` as a whole path component matches zero or more components, `/`
-//   included; it is an error anywhere else (a**b, **a, ***);
-// - `[abc]`, `[a-z]`, `[!abc]` and `[^abc]` match one character; a range is
-//   inclusive and ordered by code point; an unclosed set is an error;
-// - `\` escapes the next character (`\*`, `\?`, `\[`, `\\`); a final `\` is
-//   a literal backslash. This is an extension: the Rust glob crate has no
-//   escape character and treats `\` literally;
-// - an empty pattern matches only the empty string.
-//
-// A path that is not valid UTF-8 is decoded as `strings.decodeAt` does: each
-// invalid part is one U+FFFD, so `?` matches one such part. Matching keeps two
-// rows of a dynamic-programming table, one per path code point; it does not
-// backtrack exponentially. A pattern whose tokens are all literals takes a
-// direct string compare instead (the common zoxide exclusion). `[^abc]` is
-// accepted as a synonym for `[!abc]`; Rust's glob crate treats `^` as a set
-// member.
+// `expand` walks a root and matches the paths relative to it; a pattern is
+// relative (an absolute pattern is accepted but cannot match a relative
+// walk). Paths are returned sorted.
 
 import "strings"
+import "fs"
+import "io"
+
+pub type Options = value record {
+    pub dot: bool        // wildcards match a leading . (bash's dotglob)
+    pub globstar: bool   // a whole ** component crosses directories
+    pub caseFold: bool   // ASCII case folding
+    pub classes: bool    // POSIX [[:alpha:]] and friends (ASCII)
+}
+
+pub fn defaults(): Options {
+    return Options{dot: false, globstar: false, caseFold: false, classes: true}
+}
 
 // Why a pattern did not compile: the message and the code-point position.
 pub type Error = value record {
@@ -42,223 +37,320 @@ pub type Error = value record {
     pub pos: int
 }
 
-// "Pattern syntax error near position 3: invalid range pattern" (Rust's
-// PatternError Display).
-pub fn (e: Error) toStr(): str {
-    return "Pattern syntax error near position " + intToStr(e.pos) + ": " + e.msg
+pub fn (e: &Error) toStr(): str { return "glob: " + e.msg + " at " + e.pos.toStr() }
+
+pub fn (a: &Error) eq(b: &Error): bool { return a.msg == b.msg && a.pos == b.pos }
+
+// An expand error: a bad pattern or a filesystem error.
+pub type ExpandError = value closed {
+    Pattern(Error)
+    Io(io.IoError)
 }
 
-pub fn (e: Error) eq(other: &Error): bool { return e.msg == other.msg && e.pos == other.pos }
+pub fn (e: &ExpandError) toStr(): str {
+    match e {
+        ExpandError.Pattern(p) { return p.toStr() }
+        ExpandError.Io(i) { return i.toStr() }
+    }
+}
 
-// The error messages of the Rust glob crate (lib.rs).
-const ERR_WILDCARDS = "wildcards are either regular `*` or recursive `**`"
-const ERR_RECURSIVE = "recursive wildcards must form a single path component"
-const ERR_RANGE = "invalid range pattern"
+pub fn (a: &ExpandError) eq(b: &ExpandError): bool {
+    match a {
+        ExpandError.Pattern(x) {
+            match b {
+                ExpandError.Pattern(y) { return x.eq(&y) }
+                else { return false }
+            }
+        }
+        ExpandError.Io(x) {
+            match b {
+                ExpandError.Io(y) { return x.eq(&y) }
+                else { return false }
+            }
+        }
+    }
+}
 
-// Token kinds. A literal token holds ch; a set token holds pairs lo, hi.
 const K_LIT = 0
-const K_ANY = 1        // ?
-const K_STAR = 2       // *
-const K_REC = 3        // **
-const K_SET = 4        // [...]
-const K_NOT_SET = 5    // [!...] or [^...]
+const K_ANY = 1
+const K_STAR = 2
+const K_SET = 3
+const K_NOTSET = 4
 
-const SEP = 47          // '/'
-const BANG = 33         // '!'
-const CARET = 94        // '^'
-const DASH = 45         // '-'
-const OPEN = 91         // '['
-const CLOSE = 93        // ']'
-const STAR = 42         // '*'
-const QUESTION = 63     // '?'
-const BACKSLASH = 92    // '\'
+const SLASH = 47
+const STAR = 42
+const QUESTION = 63
+const OPEN = 91
+const CLOSE = 93
+const BACKSLASH = 92
+const BANG = 33
+const CARET = 94
+const DASH = 45
+const COLON = 58
 
 type Tok = value record {
     kind: int
     ch: int
-    set: []int
+    set: []int   // inclusive [lo, hi] pairs
 }
 
-// A compiled pattern. Construct it with compile; it is immutable. When every
-// token is a literal (no wildcard or set), isLiteral is true, literal is the
-// exact text the pattern matches, and matching is a string compare.
-pub type Pattern = record {
+type Comp = value record {
     toks: []Tok
-    literal: str
-    isLiteral: bool
+    recursive: bool
 }
 
-// The characters of a set as inclusive [lo, hi] pairs, greedily: "a-c-e" is
-// a-c then '-' then 'e' (Rust's parse_char_specifiers).
-fn parseSet(cs: &[int]): []int {
+pub type Pattern = record {
+    comps: []Comp
+    opts: Options
+}
+
+type SetParse = value record {
+    set: []int
+    neg: bool
+    next: int
+}
+
+// ASCII case folding; the glob is locale-free.
+fn foldCp(c: int): int {
+    if c >= 65 && c <= 90 { return c + 32 }
+    return c
+}
+
+fn classRanges(name: str): Result[[]int, str] {
+    match name {
+        "alpha" { return Ok([65, 90, 97, 122]) }
+        "digit" { return Ok([48, 57]) }
+        "alnum" { return Ok([48, 57, 65, 90, 97, 122]) }
+        "upper" { return Ok([65, 90]) }
+        "lower" { return Ok([97, 122]) }
+        "space" { return Ok([9, 13, 32, 32]) }
+        "blank" { return Ok([9, 9, 32, 32]) }
+        "punct" { return Ok([33, 47, 58, 64, 91, 96, 123, 126]) }
+        "print" { return Ok([32, 126]) }
+        "graph" { return Ok([33, 126]) }
+        "cntrl" { return Ok([0, 31, 127, 127]) }
+        "xdigit" { return Ok([48, 57, 65, 70, 97, 102]) }
+        else { return Err("unknown character class " + name) }
+    }
+}
+
+fn parseSet(chars: &[int], start: int, opts: Options): Result[SetParse, Error] {
+    let n = len(chars)
+    var i = start + 1
+    var neg = false
+    if i < n && (chars[i] == BANG || chars[i] == CARET) {
+        neg = true
+        i += 1
+    }
     var set: []int = []
-    var i = 0
-    while i < len(cs) {
-        if i + 3 <= len(cs) && cs[i + 1] == DASH {
-            append(mut &set, cs[i])
-            append(mut &set, cs[i + 2])
-            i += 3
-        } else {
-            append(mut &set, cs[i])
-            append(mut &set, cs[i])
+    // A ] first in the set is a literal ].
+    if i < n && chars[i] == CLOSE {
+        append(mut &set, CLOSE)
+        append(mut &set, CLOSE)
+        i += 1
+    }
+    while true {
+        if i >= n { return Err(Error{msg: "unclosed set", pos: start}) }
+        if chars[i] == CLOSE {
+            i += 1
+            break
+        }
+        if opts.classes && chars[i] == OPEN && i + 1 < n && chars[i + 1] == COLON {
+            var j = i + 2
+            while j + 1 < n && !(chars[j] == COLON && chars[j + 1] == CLOSE) { j += 1 }
+            if j + 1 >= n { return Err(Error{msg: "unclosed character class", pos: i}) }
+            let name = strings.fromRunes(&chars[i + 2..j])
+            match classRanges(name) {
+                Ok(rs) {
+                    for k in 0..len(rs) { append(mut &set, rs[k]) }
+                }
+                Err(msg) { return Err(Error{msg: msg, pos: i}) }
+            }
+            i = j + 2
+            continue
+        }
+        var c = chars[i]
+        i += 1
+        if c == BACKSLASH && i < n {
+            c = chars[i]
             i += 1
         }
+        if i < n && chars[i] == DASH && i + 1 < n && chars[i + 1] != CLOSE {
+            i += 1
+            var d = chars[i]
+            i += 1
+            if d == BACKSLASH && i < n {
+                d = chars[i]
+                i += 1
+            }
+            append(mut &set, c)
+            append(mut &set, d)
+        } else {
+            append(mut &set, c)
+            append(mut &set, c)
+        }
     }
-    return set
+    return Ok(SetParse{set: set, neg: neg, next: i})
 }
 
-// Compiles a pattern. The position in an Error is a code-point index, as in
-// Rust's PatternError.
-pub fn compile(pattern: str): Result[Pattern, Error] {
+// Splits a path at '/' and drops a trailing empty component (a/ is a).
+fn splitPath(path: str): []str {
+    var out: []str = []
+    var start = 0
+    for i in 0..len(path) {
+        if strByte(path, i) == '/' {
+            append(mut &out, strSlice(path, start, i))
+            start = i + 1
+        }
+    }
+    append(mut &out, strSlice(path, start, len(path)))
+    if len(out) > 1 && len(out[len(out) - 1]) == 0 { pop(mut &out) }
+    return out
+}
+
+fn compOf(toks: []Tok, rec: bool): Comp {
+    return Comp{toks: toks, recursive: rec}
+}
+
+pub fn compileWith(pattern: str, opts: Options): Result[Pattern, Error] {
     let chars = strings.runes(pattern)
+    var comps: []Comp = []
     var toks: []Tok = []
+    var rec = false
     var i = 0
     while i < len(chars) {
         let c = chars[i]
-        if c == QUESTION {
-            append(mut &toks, Tok{kind: K_ANY, ch: 0, set: []})
+        if c == SLASH {
+            append(mut &comps, compOf(toks, rec))
+            toks = []
+            rec = false
             i += 1
-        } else if c == STAR {
-            let old = i
-            while i < len(chars) && chars[i] == STAR { i += 1 }
-            let count = i - old
-            if count > 2 {
-                return Err(Error{pos: old + 2, msg: ERR_WILDCARDS})
-            } else if count == 2 {
-                if i == 2 || chars[i - count - 1] == SEP {
-                    if i < len(chars) && chars[i] == SEP {
-                        i += 1
-                    } else if i != len(chars) {
-                        return Err(Error{pos: i, msg: ERR_RECURSIVE})
-                    }
-                } else {
-                    return Err(Error{pos: old - 1, msg: ERR_RECURSIVE})
-                }
-                let n = len(toks)
-                if !(n > 1 && toks[n - 1].kind == K_REC) {
-                    append(mut &toks, Tok{kind: K_REC, ch: 0, set: []})
-                }
+            continue
+        }
+        if c == STAR {
+            var j = i
+            while j < len(chars) && chars[j] == STAR { j += 1 }
+            let count = j - i
+            if opts.globstar && count >= 2 && len(toks) == 0 && (j == len(chars) || chars[j] == SLASH) {
+                rec = true
             } else {
                 append(mut &toks, Tok{kind: K_STAR, ch: 0, set: []})
             }
-        } else if c == OPEN {
-            var done = false
-            let neg = i + 1 < len(chars) && (chars[i + 1] == BANG || chars[i + 1] == CARET)
-            if neg {
-                if i + 4 <= len(chars) {
-                    var j = i + 3
-                    while j < len(chars) && chars[j] != CLOSE { j += 1 }
-                    if j < len(chars) {
-                        append(mut &toks, Tok{kind: K_NOT_SET, ch: 0, set: parseSet(&chars[i + 2..j])})
-                        i = j + 1
-                        done = true
-                    }
-                }
-            } else if i + 3 <= len(chars) {
-                var j = i + 2
-                while j < len(chars) && chars[j] != CLOSE { j += 1 }
-                if j < len(chars) {
-                    append(mut &toks, Tok{kind: K_SET, ch: 0, set: parseSet(&chars[i + 1..j])})
-                    i = j + 1
-                    done = true
-                }
-            }
-            if !done { return Err(Error{pos: i, msg: ERR_RANGE}) }
-        } else if c == BACKSLASH && i + 1 < len(chars) {
-            // An escaped character is literal, including '*', '?' and '['.
+            i = j
+            continue
+        }
+        if c == QUESTION {
+            append(mut &toks, Tok{kind: K_ANY, ch: 0, set: []})
+            i += 1
+            continue
+        }
+        if c == OPEN {
+            var sp = try parseSet(&chars, i, opts)
+            let set = replace(mut &sp.set, [])
+            append(mut &toks, Tok{kind: if sp.neg { K_NOTSET } else { K_SET }, ch: 0, set: set})
+            i = sp.next
+            continue
+        }
+        if c == BACKSLASH && i + 1 < len(chars) {
             append(mut &toks, Tok{kind: K_LIT, ch: chars[i + 1], set: []})
             i += 2
-        } else {
-            append(mut &toks, Tok{kind: K_LIT, ch: c, set: []})
-            i += 1
+            continue
         }
+        append(mut &toks, Tok{kind: K_LIT, ch: c, set: []})
+        i += 1
     }
-    var allLit = true
-    var lit: []int = []
-    for tok in toks {
-        // U+FFFD is the decoding of invalid UTF-8 and would compare by code
-        // point differently from its UTF-8 bytes; keep the DP matcher for it.
-        if tok.kind != K_LIT || tok.ch == strings.REPLACEMENT {
-            allLit = false
-            break
-        }
-        append(mut &lit, tok.ch)
+    append(mut &comps, compOf(toks, rec))
+    if len(comps) > 1 && len(comps[len(comps) - 1].toks) == 0 && !comps[len(comps) - 1].recursive {
+        pop(mut &comps)
     }
-    let literal = if allLit { strings.fromRunes(&lit) } else { "" }
-    return Ok(Pattern{toks: toks, literal: literal, isLiteral: allLit})
+    return Ok(Pattern{comps: comps, opts: opts})
 }
 
-// Whether a code point is in the [lo, hi] pairs of set.
-fn inSet(set: &[]int, c: int): bool {
-    var i = 0
-    while i < len(set) {
-        if c >= set[i] && c <= set[i + 1] { return true }
-        i += 2
+pub fn compile(pattern: str): Result[Pattern, Error] {
+    return compileWith(pattern, defaults())
+}
+
+fn hidden(pc: str, opts: Options): bool {
+    return len(pc) > 0 && strByte(pc, 0) == '.' && !opts.dot
+}
+
+fn inSet(set: &[int], cp: int, fold: bool): bool {
+    for i in 0..len(set) / 2 {
+        if cp >= set[2 * i] && cp <= set[2 * i + 1] { return true }
+    }
+    if fold {
+        let f = foldCp(cp)
+        if f != cp {
+            for i in 0..len(set) / 2 {
+                if f >= set[2 * i] && f <= set[2 * i + 1] { return true }
+            }
+        }
     }
     return false
 }
 
-// Whether one non-star token accepts code point c. In strict mode (relaxed
-// false) a separator matches only a literal '/', never '?', a set, or a
-// negated set. In relaxed mode all three may match '/', as zoxide's
-// `Pattern::matches_path` default does.
-fn oneMatches(tok: &Tok, c: int, relaxed: bool): bool {
-    if tok.kind == K_LIT { return tok.ch == c }
-    if !relaxed && c == SEP { return false }
-    if tok.kind == K_ANY { return true }
-    if tok.kind == K_SET { return inSet(&tok.set, c) }
-    return !inSet(&tok.set, c)
+fn oneMatch(t: &Tok, cp: int, opts: Options): bool {
+    match t.kind {
+        K_LIT { return if opts.caseFold { foldCp(t.ch) == foldCp(cp) } else { t.ch == cp } }
+        K_ANY { return true }
+        K_SET { return inSet(&t.set, cp, opts.caseFold) }
+        K_NOTSET { return !inSet(&t.set, cp, opts.caseFold) }
+        else { return false }
+    }
 }
 
-// The dynamic-programming matcher: dp[t][s] says tokens[t..] matches
-// text[s..]. The two rows are computed right to left, so `*` and `**` are
-// O(1) per position instead of a recursive walk. In relaxed mode a plain `*`
-// consumes a separator too; `**` consumes every code point in both modes.
-fn matchToks(toks: &[]Tok, text: &[]int, relaxed: bool): bool {
-    let n = len(text)
-    var cur: []bool = []
-    var next: []bool = []
-    for i in 0..n + 1 {
-        append(mut &cur, false)
-        append(mut &next, false)
-    }
-    next[n] = true
-    var t = len(toks)
-    while t > 0 {
-        t -= 1
-        let tok = &toks[t]
-        let star = tok.kind == K_STAR || tok.kind == K_REC
-        cur[n] = if star { next[n] } else { false }
-        var s = n
-        while s > 0 {
-            s -= 1
-            if star {
-                var v = next[s]
-                if !v && (relaxed || tok.kind == K_REC || text[s] != SEP) { v = cur[s + 1] }
-                cur[s] = v
-            } else {
-                cur[s] = oneMatches(tok, text[s], relaxed) && next[s + 1]
-            }
+fn matchToks(toks: &[Tok], cps: &[int], opts: Options): bool {
+    let n = len(cps)
+    var prev = array(n + 1, false)
+    prev[0] = true
+    for tok in toks {
+        var cur = array(n + 1, false)
+        if tok.kind == K_STAR {
+            cur[0] = prev[0]
+            for j in 1..n + 1 { cur[j] = prev[j] || cur[j - 1] }
+        } else {
+            for j in 1..n + 1 { cur[j] = prev[j - 1] && oneMatch(&tok, cps[j - 1], opts) }
         }
-        for k in 0..n + 1 { next[k] = cur[k] }
+        prev = cur
     }
-    return next[0]
+    return prev[n]
 }
 
-// Whether path matches the compiled pattern, path-aware: `*`, `?` and a set
-// do not cross `/`; only `**` does.
+fn compMatches(c: &Comp, pc: str, opts: Options): bool {
+    if hidden(pc, opts) {
+        if len(c.toks) == 0 || c.toks[0].kind != K_LIT || c.toks[0].ch != 46 { return false }
+    }
+    return matchToks(&c.toks, &strings.runes(pc), opts)
+}
+
+fn matchComps(p: &Pattern, pi: int, path: &[]str, si: int, memo: mut &[]int, width: int): bool {
+    let key = pi * width + si
+    if memo[key] >= 0 { return memo[key] == 1 }
+    var result = false
+    if pi == len(p.comps) {
+        result = si == len(path)
+    } else {
+        let c = &p.comps[pi]
+        if c.recursive {
+            if matchComps(p, pi + 1, path, si, memo, width) {
+                result = true
+            } else if si < len(path) && !hidden(path[si], p.opts) && matchComps(p, pi, path, si + 1, memo, width) {
+                result = true
+            }
+        } else if si < len(path) && compMatches(c, path[si], p.opts) {
+            result = matchComps(p, pi + 1, path, si + 1, memo, width)
+        }
+    }
+    memo[key] = if result { 1 } else { 0 }
+    return result
+}
+
+// Whether path matches the compiled pattern.
 pub fn (p: &Pattern) matches(path: str): bool {
-    if p.isLiteral { return path == p.literal }
-    return matchToks(&p.toks, &strings.runes(path), false)
-}
-
-// Whether path matches the compiled pattern as zoxide's
-// `glob::Pattern::matches_path` does with its default options: `*`, `?` and a
-// set may match `/` too. `**` is recursive in both modes. The pattern syntax
-// and compile errors are the same as for matches.
-pub fn (p: &Pattern) matchesRelaxed(path: str): bool {
-    if p.isLiteral { return path == p.literal }
-    return matchToks(&p.toks, &strings.runes(path), true)
+    let parts = splitPath(path)
+    let width = len(parts) + 1
+    var memo = array((len(p.comps) + 1) * width, -1)
+    return matchComps(p, 0, &parts, 0, mut &memo, width)
 }
 
 // compile then matches, with the compile error passed through. The language
@@ -268,4 +360,49 @@ pub fn matchPath(pattern: str, path: str): Result[bool, Error] {
         Ok(p) { return Ok(p.matches(path)) }
         Err(e) { return Err(e) }
     }
+}
+
+pub fn matchPathWith(pattern: str, path: str, opts: Options): Result[bool, Error] {
+    match compileWith(pattern, opts) {
+        Ok(p) { return Ok(p.matches(path)) }
+        Err(e) { return Err(e) }
+    }
+}
+
+// Escapes the characters that have a meaning in a pattern.
+pub fn escape(s: str): str {
+    var b = newStrBuf()
+    for i in 0..len(s) {
+        let c = s[i]
+        if c == STAR || c == QUESTION || c == OPEN || c == BACKSLASH { b.addByte(BACKSLASH) }
+        b.addByte(c)
+    }
+    return b.toStr()
+}
+
+// Expands pattern under root, returning sorted paths relative to root.
+// Symlinks are not followed. A pattern is relative to root.
+pub fn expand(root: str, pattern: str, opts: Options): Result[[]str, ExpandError] {
+    let pat = match compileWith(pattern, opts) {
+        Ok(p) { p }
+        Err(e) { return Err(ExpandError.Pattern(e)) }
+    }
+    let walkRoot = if len(root) == 0 { "." } else { root }
+    var prefix = root
+    if len(prefix) == 0 { prefix = "." }
+    if !strings.endsWith(prefix, "/") { prefix = prefix + "/" }
+    var out: []str = []
+    let r = fs.walk(walkRoot, false, fn(p, e) {
+        if p == walkRoot { return true }
+        if !strings.startsWith(p, prefix) { return true }
+        let rel = p[len(prefix)..]
+        if pat.matches(rel) { append(mut &out, rel) }
+        return true
+    })
+    match r {
+        Ok(_) {}
+        Err(e) { return Err(ExpandError.Io(e)) }
+    }
+    sort(mut &out)
+    return Ok(out)
 }
