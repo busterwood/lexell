@@ -127,3 +127,180 @@ pub fn near(a: float, b: float, tol: float): bool {
     if d <= tol { return true }
     return d <= tol * max(a.abs(), b.abs())
 }
+
+// ---------------------------------------------------------------- bit patterns
+
+// x * 2^e, exact when the result is a float (each step is a power of two).
+fn pow2(x: float, e: int): float {
+    var f = x
+    var k = e
+    while k > 0 {
+        let s = if k > 60 { 60 } else { k }
+        f = f * float(1 << s)
+        k -= s
+    }
+    while k < 0 {
+        let s = if k < -60 { 60 } else { -k }
+        f = f / float(1 << s)
+        k += s
+    }
+    return f
+}
+
+fn negNaN(x: float): bool {
+    let one: float = 1.0f
+    return one.copySign(x) < 0.0f
+}
+
+// The exact IEEE 754 double bit pattern of x, as a 64-bit signed int (the
+// sign bit is the int's high bit, so a negative number gives a negative int).
+// A NaN is the canonical quiet NaN 0x7ff8000000000000 with x's sign.
+pub fn bitsOf(x: float): int {
+    if x != x {
+        return 0x7ff8000000000000 | (if negNaN(x) { 1 << 63 } else { 0 })
+    }
+    var sign = 0
+    if x < 0.0f || (x == 0.0f && 1.0f / x < 0.0f) { sign = 1 << 63 }
+    var a = if x < 0.0f { -x } else { x }
+    if a == 0.0f { return sign }
+    if a == inf() { return sign | 0x7ff0000000000000 }
+    var e = 0
+    while a >= 9007199254740992.0f {
+        a = a / 2.0f
+        e += 1
+    }
+    while a < 4503599627370496.0f && e > -1074 {
+        a = a * 2.0f
+        e -= 1
+    }
+    var m = int(a)
+    let biased = e + 1075
+    if m < (1 << 52) || biased <= 0 {
+        // subnormal: m * 2^e with e = -1074
+        while e < -1074 {
+            m = m >> 1
+            e += 1
+        }
+        return sign | m
+    }
+    return sign | (biased << 52) | (m & 0xfffffffffffff)
+}
+
+// The float with IEEE 754 double bit pattern b; the inverse of bitsOf,
+// including -0, the infinities, NaN and subnormals.
+pub fn fromBits(b: int): float {
+    let e = (b >> 52) & 0x7ff
+    let m = b & 0xfffffffffffff
+    var f: float = 0.0f
+    if e == 0x7ff {
+        f = if m == 0 { inf() } else { nan() }
+    } else {
+        f = pow2(float(if e == 0 { m } else { m | (1 << 52) }), (if e == 0 { 1 } else { e }) - 1075)
+    }
+    if f != f {
+        let n = nan()
+        return n.copySign(if b < 0 { -1.0f } else { 1.0f })
+    }
+    return if b < 0 { -f } else { f }
+}
+
+// The exact IEEE 754 single bit pattern of x, as a signed 32-bit int, rounded
+// to nearest even as a float32 conversion is. A NaN is the canonical quiet
+// NaN 0x7fc00000 with x's sign. bitsOf32Int gives the same pattern as an int,
+// ready for appendU32LE/BE.
+pub fn bitsOf32(x: float): i32 {
+    let b64 = bitsOf(x)
+    let neg = b64 < 0
+    let e2 = (b64 >> 52) & 0x7ff
+    let frac = b64 & 0xfffffffffffff
+    if e2 == 0 && frac == 0 { return signed32(neg, 0) }
+    if e2 == 0x7ff {
+        if frac == 0 { return signed32(neg, 0x7f800000) }
+        return signed32(neg, 0x7fc00000)
+    }
+    var sig = frac
+    var p = 52
+    var exp = e2 - 1023
+    if e2 == 0 {
+        // a double subnormal: value = frac * 2^-1074, p its top set bit
+        var t = frac
+        var k = 0
+        while t > 1 {
+            t = t >> 1
+            k += 1
+        }
+        p = k
+        exp = k - 1074
+    } else {
+        sig = frac | (1 << 52)
+    }
+    if exp < -126 {
+        // float subnormal: value = sig * 2^(exp - p), and 2^-149 is the unit
+        let shift = p - exp - 149
+        var m = sig
+        if shift > 0 { m = roundShift(sig, shift) } else { m = sig << -shift }
+        if m >= (1 << 23) { m = 1 << 23 }
+        return signed32(neg, m)
+    }
+    var m = sig
+    if p > 23 {
+        m = roundShift(sig, p - 23)
+    } else if p < 23 {
+        m = sig << (23 - p)
+    }
+    if m >= (1 << 24) {
+        m = m >> 1
+        exp += 1
+    }
+    if exp > 127 { return signed32(neg, 0x7f800000) }
+    let field = ((exp + 127) << 23) | (m - (1 << 23))
+    return signed32(neg, field)
+}
+
+// The single bit pattern of x as an int (the sign-extended i32 from bitsOf32),
+// so appendU32LE/BE can write it directly.
+pub fn bitsOf32Int(x: float): int {
+    return int(bitsOf32(x))
+}
+
+// n >> shift, rounded to nearest with ties to even. n is below 2^63 here, so
+// a shift of 63 or more leaves only a fraction below half and gives 0.
+fn roundShift(n: int, shift: int): int {
+    if shift >= 63 { return 0 }
+    let q = n >> shift
+    let rem = n & ((1 << shift) - 1)
+    let half = 1 << (shift - 1)
+    if rem > half || (rem == half && (q & 1) == 1) { return q + 1 }
+    return q
+}
+
+fn signed32(neg: bool, field: int): i32 {
+    let sign: i32 = if neg { -2147483647 - 1 } else { 0 }
+    return sign | i32(field)
+}
+
+// The float with IEEE 754 single bit pattern b; the inverse of bitsOf32,
+// including -0, the infinities, NaN and subnormals.
+pub fn fromBits32(b: i32): float {
+    return fromBits32Int(int(b))
+}
+
+// The float with the low 32 bits of b as IEEE 754 single bits. b may be any
+// int, including the 0..0xffffffff of readU32LE or a signed readI32 pattern,
+// so a codec needs no trapping i32 conversion.
+pub fn fromBits32Int(b: int): float {
+    let v = b
+    let e = (v >> 23) & 0xff
+    let m = v & 0x7fffff
+    var f: float = 0.0f
+    if e == 0xff {
+        if m != 0 {
+            let n = nan()
+            return n.copySign(if v < 0 { -1.0f } else { 1.0f })
+        }
+        f = inf()
+    } else {
+        f = pow2(float(if e == 0 { m } else { m | (1 << 23) }), (if e == 0 { 1 } else { e }) - 150)
+    }
+    return if ((v >> 31) & 1) == 1 { -f } else { f }
+}
