@@ -176,9 +176,11 @@ Extend `lib/fs.obx`.
   the same directory, write, rename; remove the temp on failure.
 - `realpath(path: str): Result[str, io.IoError>` - symlink resolution with
   a loop limit (ELOOP = 40).
-- `Stat` gains `atime` and `ctime` (seconds; the runtime helper exposes
-  those two but not their nanoseconds). Keep the existing fields; add the
-  new ones at the end of the record.
+- `Stat` keeps its existing fields. `atime`/`ctime` are **not** added:
+  the compiler imports `fs`, so changing the record layout forces a seed
+  reseed, and eza does not implement `-u`/`-U`/`--changed` yet. The runtime
+  helper already exposes the two second fields if a caller appears later.
+  This is the review's "decide, do not promise both" outcome.
 
 ### os
 
