@@ -367,3 +367,542 @@ fn pad(n: int, width: int): str {
     while len(s) < width { s = "0" + s }
     return s
 }
+
+// ---- broken-down time, strftime and strptime --------------------------------
+//
+// Tm is C's struct tm: tm_year since 1900, tm_mon 0..11, tm_mday 1..31,
+// tm_hour 0..23, tm_min 0..59, tm_sec 0..59, tm_wday 0..6 (Sunday 0),
+// tm_yday 0-based. fsec is the second with its fraction (jq's array view);
+// for a whole second it equals sec. wday and yday are -1 until known.
+
+pub type Tm = value record {
+    pub year: int    // since 1900
+    pub mon: int     // 0..11
+    pub mday: int    // 1..31
+    pub hour: int
+    pub min: int
+    pub sec: int
+    pub wday: int    // 0..6, Sunday 0; -1 when unknown
+    pub yday: int    // 0-based; -1 when unknown
+    pub fsec: float  // sec plus the fraction of a second
+}
+
+// A parsed prefix: the Tm and the byte offset just past what fmt consumed.
+pub type Strptime = value record {
+    pub tm: Tm
+    pub rest: int
+}
+
+type IsoWeek = value record { year: int; week: int }
+
+type Scan = value record { value: int; end: int }
+
+const MONTH_NAMES: []str = ["January", "February", "March", "April", "May", "June", "July", "August",
+    "September", "October", "November", "December"]
+const DAY_NAMES: []str = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+const YEAR_DAYS: []int = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334]
+
+// The day of the year, 0-based.
+fn ydayOf(d: Date): int {
+    var y = YEAR_DAYS[d.month - 1] + d.day - 1
+    if d.month > 2 && isLeapYear(d.year) { y += 1 }
+    return y
+}
+
+// The Tm of a civil date-time (tm_year is year - 1900).
+pub fn tmOf(l: LocalDateTime): Tm {
+    return Tm{year: l.date.year - 1900, mon: l.date.month - 1, mday: l.date.day,
+              hour: l.time.hour(), min: l.time.minute(), sec: l.time.second(),
+              wday: weekday(l.date), yday: ydayOf(l.date),
+              fsec: float(l.time.second()) + float(l.time.nano()) / 1000000000.0f}
+}
+
+// The civil date-time of a Tm, if its fields name a real wall-clock time.
+// wday, yday and the whole part of fsec are derived data and may be anything;
+// sec 60 (a leap second) is rejected: these civil values have no leap seconds.
+pub fn localDateTimeOf(t: Tm): Result[LocalDateTime, str] {
+    let year = t.year + 1900
+    if t.mon < 0 || t.mon > 11 {
+        return Err("time.Tm: month " + intToStr(t.mon) + " is not in 0..11")
+    }
+    if t.mday < 1 || t.mday > daysInMonth(year, t.mon + 1) {
+        return Err("time.Tm: day " + intToStr(t.mday) + " is not in 1.." +
+            intToStr(daysInMonth(year, t.mon + 1)))
+    }
+    if t.hour < 0 || t.hour > 23 { return Err("time.Tm: hour " + intToStr(t.hour) + " is not in 0..23") }
+    if t.min < 0 || t.min > 59 { return Err("time.Tm: minute " + intToStr(t.min) + " is not in 0..59") }
+    if t.sec < 0 || t.sec > 59 { return Err("time.Tm: second " + intToStr(t.sec) + " is not in 0..59") }
+    var ns = 0
+    if t.fsec == t.fsec {   // not NaN
+        let frac = t.fsec - float(t.sec)
+        if frac > 0.0f && frac < 1.0f {
+            ns = int(frac * 1000000000.0f + 0.5f)
+            if ns > 999999999 { ns = 999999999 }
+        }
+    }
+    let d = Date{year: year, month: t.mon + 1, day: t.mday}
+    let tod = TimeOfDay{nanos: ((t.hour * 60 + t.min) * 60 + t.sec) * 1000000000 + ns}
+    return Ok(LocalDateTime{date: d, time: tod})
+}
+
+// The broken-down UTC time of a Unix second.
+pub fn gmtimeOf(secs: int): Tm {
+    let days = floorDiv(secs, 86400)
+    let rem = secs - days * 86400
+    let d = dateOfDays(days)
+    return Tm{year: d.year - 1900, mon: d.month - 1, mday: d.day, hour: rem / 3600, min: (rem / 60) % 60,
+              sec: rem % 60, wday: weekday(d), yday: ydayOf(d), fsec: float(rem % 60)}
+}
+
+// The Unix second of a broken-down UTC time (C's timegm). mon outside 0..11
+// carries into the year, and mday beyond the month carries into the next, as
+// the jq convention allows.
+pub fn timegm(t: &Tm): int {
+    var y = t.year + 1900
+    var m = t.mon
+    let carry = floorDiv(m, 12)
+    y += carry
+    m -= carry * 12
+    let days = daysOfDate(Date{year: y, month: m + 1, day: 1}) + t.mday - 1
+    return days * 86400 + t.hour * 3600 + t.min * 60 + t.sec
+}
+
+fn padFill(n: int, width: int, fill: byte): str {
+    var b = newStrBuf()
+    if n < 0 { b.addByte('-') }
+    let s = intToStr(if n < 0 { -n } else { n })
+    var k = len(s)
+    while k < width {
+        b.addByte(fill)
+        k += 1
+    }
+    b.add(s)
+    return b.toStr()
+}
+
+fn isoWeekOf(t: &Tm): IsoWeek {
+    let wd = if t.wday >= 0 && t.wday < 7 { t.wday } else { 0 }
+    let wdayMon = (wd + 6) % 7
+    var year = t.year + 1900
+    var week = (t.yday - wdayMon + 10) / 7
+    if week < 1 {
+        year -= 1
+        let prevDays = if isLeapYear(year) { 366 } else { 365 }
+        week = (t.yday + prevDays - wdayMon + 10) / 7
+    } else {
+        let days = if isLeapYear(year) { 366 } else { 365 }
+        if week == 53 && (t.yday - wdayMon + 3) >= days {
+            year += 1
+            week = 1
+        }
+    }
+    return IsoWeek{year: year, week: week}
+}
+
+// Formats a broken-down time. zone is what %Z prints; %z is always "+0000"
+// because a Tm carries no offset. Unknown conversions pass through as "%X",
+// as jq does.
+pub fn strftime(t: &Tm, fmt: str, zone: str): str {
+    let wd = if t.wday >= 0 && t.wday < 7 { t.wday } else { 0 }
+    let mo = if t.mon >= 0 && t.mon < 12 { t.mon } else { 0 }
+    var b = newStrBuf()
+    var i = 0
+    while i < len(fmt) {
+        let c = strByte(fmt, i)
+        if c != '%' || i + 1 >= len(fmt) {
+            b.addByte(c)
+            i += 1
+            continue
+        }
+        let f = strByte(fmt, i + 1)
+        i += 2
+        if f == 'Y' {
+            b.addInt(t.year + 1900)
+        } else if f == 'm' {
+            b.add(padFill(t.mon + 1, 2, '0'))
+        } else if f == 'd' {
+            b.add(padFill(t.mday, 2, '0'))
+        } else if f == 'e' {
+            b.add(padFill(t.mday, 2, ' '))
+        } else if f == 'H' {
+            b.add(padFill(t.hour, 2, '0'))
+        } else if f == 'k' {
+            b.add(padFill(t.hour, 2, ' '))
+        } else if f == 'I' {
+            b.add(padFill(if t.hour % 12 == 0 { 12 } else { t.hour % 12 }, 2, '0'))
+        } else if f == 'l' {
+            b.add(padFill(if t.hour % 12 == 0 { 12 } else { t.hour % 12 }, 2, ' '))
+        } else if f == 'M' {
+            b.add(padFill(t.min, 2, '0'))
+        } else if f == 'S' {
+            b.add(padFill(t.sec, 2, '0'))
+        } else if f == 'j' {
+            b.add(padFill(t.yday + 1, 3, '0'))
+        } else if f == 'a' {
+            b.add(strSlice(DAY_NAMES[wd], 0, 3))
+        } else if f == 'A' {
+            b.add(DAY_NAMES[wd])
+        } else if f == 'b' || f == 'h' {
+            b.add(strSlice(MONTH_NAMES[mo], 0, 3))
+        } else if f == 'B' {
+            b.add(MONTH_NAMES[mo])
+        } else if f == 'p' {
+            b.add(if t.hour < 12 { "AM" } else { "PM" })
+        } else if f == 'P' {
+            b.add(if t.hour < 12 { "am" } else { "pm" })
+        } else if f == 'Z' {
+            b.add(zone)
+        } else if f == 'z' {
+            b.add("+0000")
+        } else if f == 'u' {
+            b.addInt(if wd == 0 { 7 } else { wd })
+        } else if f == 'w' {
+            b.addInt(wd)
+        } else if f == 'y' {
+            b.add(padFill((t.year + 1900) % 100, 2, '0'))
+        } else if f == 'C' {
+            b.add(padFill((t.year + 1900) / 100, 2, '0'))
+        } else if f == 'D' {
+            b.add(strftime(t, "%m/%d/%y", zone))
+        } else if f == 'F' {
+            b.add(strftime(t, "%Y-%m-%d", zone))
+        } else if f == 'T' {
+            b.add(strftime(t, "%H:%M:%S", zone))
+        } else if f == 'R' {
+            b.add(strftime(t, "%H:%M", zone))
+        } else if f == 'r' {
+            b.add(strftime(t, "%I:%M:%S %p", zone))
+        } else if f == 'c' {
+            b.add(strftime(t, "%a %b %e %H:%M:%S %Y", zone))
+        } else if f == 'x' {
+            b.add(strftime(t, "%m/%d/%y", zone))
+        } else if f == 'X' {
+            b.add(strftime(t, "%H:%M:%S", zone))
+        } else if f == 's' {
+            b.addInt(timegm(t))
+        } else if f == 'n' {
+            b.addByte('\n')
+        } else if f == 't' {
+            b.addByte('\t')
+        } else if f == '%' {
+            b.addByte('%')
+        } else if f == 'U' {
+            b.add(padFill((t.yday + 7 - wd) / 7, 2, '0'))
+        } else if f == 'W' {
+            b.add(padFill((t.yday + 7 - (wd + 6) % 7) / 7, 2, '0'))
+        } else if f == 'V' {
+            b.add(padFill(isoWeekOf(t).week, 2, '0'))
+        } else if f == 'G' {
+            b.addInt(isoWeekOf(t).year)
+        } else if f == 'g' {
+            b.add(padFill(isoWeekOf(t).year % 100, 2, '0'))
+        } else {
+            b.addByte('%')
+            b.addByte(f)
+        }
+    }
+    return b.toStr()
+}
+
+// strftime for a civil date-time; the Tm form above is the primitive.
+pub fn strftimeLocal(l: LocalDateTime, fmt: str, zone: str): str {
+    let t = tmOf(l)
+    return strftime(&t, fmt, zone)
+}
+
+fn isSpaceByte(c: byte): bool { return c == ' ' || c == '\t' || c == '\n' }
+
+fn isAlphaByte(c: byte): bool { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') }
+
+fn lowerByte(c: byte): byte {
+    if c >= 'A' && c <= 'Z' { return c + 32 }
+    return c
+}
+
+fn equalFoldAt(s: str, i: int, word: str): bool {
+    if i + len(word) > len(s) { return false }
+    for k in 0..len(word) {
+        if lowerByte(strByte(s, i + k)) != lowerByte(strByte(word, k)) { return false }
+    }
+    return true
+}
+
+// 100 * index + bytes consumed, for a full month or day name or its first
+// three letters; -1 when neither matches. Case-insensitive.
+fn matchName(s: str, i: int, names: &[str]): int {
+    for k in 0..len(names) {
+        if equalFoldAt(s, i, names[k]) { return k * 100 + len(names[k]) }
+        if i + 3 <= len(s) {
+            let abbr = strSlice(names[k], 0, 3)
+            if equalFoldAt(s, i, abbr) { return k * 100 + 3 }
+        }
+    }
+    return -1
+}
+
+fn scanInt(s: str, from: int, maxDigits: int): Option[Scan] {
+    var j = from
+    var neg = false
+    if j < len(s) && (strByte(s, j) == '+' || strByte(s, j) == '-') {
+        neg = strByte(s, j) == '-'
+        j += 1
+    }
+    let start = j
+    var v = 0
+    while j < len(s) && j - start < maxDigits {
+        let c = strByte(s, j)
+        if c < '0' || c > '9' { break }
+        v = v * 10 + int(c - '0')
+        j += 1
+    }
+    if j == start { return None }
+    return Some(Scan{value: if neg { -v } else { v }, end: j})
+}
+
+// Expands the composite conversions so one linear parser handles them all.
+fn expandParseFormat(fmt: str): str {
+    var b = newStrBuf()
+    var i = 0
+    while i < len(fmt) {
+        let c = strByte(fmt, i)
+        if c != '%' || i + 1 >= len(fmt) {
+            b.addByte(c)
+            i += 1
+            continue
+        }
+        let f = strByte(fmt, i + 1)
+        i += 2
+        if f == 'D' || f == 'x' {
+            b.add("%m/%d/%y")
+        } else if f == 'F' {
+            b.add("%Y-%m-%d")
+        } else if f == 'T' || f == 'X' {
+            b.add("%H:%M:%S")
+        } else if f == 'R' {
+            b.add("%H:%M")
+        } else if f == 'r' {
+            b.add("%I:%M:%S %p")
+        } else if f == 'c' {
+            b.add("%a %b %e %H:%M:%S %Y")
+        } else {
+            b.addByte('%')
+            b.addByte(f)
+        }
+    }
+    return b.toStr()
+}
+
+fn mismatch(s: str, fmt: str): str {
+    return "date \"" + s + "\" does not match format \"" + fmt + "\""
+}
+
+// Parses a prefix of s, returning the Tm and the byte offset where the format
+// stopped. Each conversion checks its own range (a full date must name a real
+// day; %j, %u, %w and %z are bounded), but a partial Tm is allowed, so fields
+// the format did not set keep their zero/-1 defaults. Like glibc, a space in
+// fmt matches any run of spaces, tabs and newlines, and numeric conversions
+// skip leading spaces. %Z and %z are consumed and discarded: a Tm has no zone.
+//
+// Not supported, as in jq: %U, %W, %V, %G and %g produce an error; a library
+// caller that needs ISO-week parsing should convert through Date.
+pub fn strptimePrefix(s: str, fmt: str): Result[Strptime, str] {
+    let full = expandParseFormat(fmt)
+    var t = Tm{year: 0, mon: 0, mday: 0, hour: 0, min: 0, sec: 0, wday: -1, yday: -1, fsec: 0.0f}
+    var i = 0
+    var f = 0
+    var pm = -1
+    var haveYear = false
+    var epoch = false
+    var bad = false
+    while f < len(full) && !bad {
+        let c = strByte(full, f)
+        if c == ' ' {
+            while i < len(s) && isSpaceByte(strByte(s, i)) { i += 1 }
+            f += 1
+            continue
+        }
+        if c != '%' || f + 1 >= len(full) {
+            if i < len(s) && strByte(s, i) == c {
+                i += 1
+            } else {
+                bad = true
+            }
+            f += 1
+            continue
+        }
+        let d = strByte(full, f + 1)
+        f += 2
+        if d == 'Y' || d == 'y' || d == 'C' || d == 'm' || d == 'd' || d == 'e' || d == 'H' || d == 'k' ||
+                d == 'I' || d == 'l' || d == 'M' || d == 'S' || d == 'j' || d == 'u' || d == 'w' {
+            while i < len(s) && strByte(s, i) == ' ' { i += 1 }
+            let maxd = if d == 'Y' { 4 } else if d == 'j' { 3 } else { 2 }
+            match scanInt(s, i, maxd) {
+                Some(n) {
+                    i = n.end
+                    let v = n.value
+                    if d == 'Y' {
+                        t.year = v - 1900
+                        haveYear = true
+                    } else if d == 'y' {
+                        t.year = if v < 69 { v + 100 } else { v }
+                        haveYear = true
+                    } else if d == 'C' {
+                        t.year = v * 100 - 1900
+                        haveYear = true
+                    } else if d == 'm' {
+                        t.mon = v - 1
+                    } else if d == 'd' || d == 'e' {
+                        t.mday = v
+                    } else if d == 'H' || d == 'k' {
+                        t.hour = v
+                    } else if d == 'I' || d == 'l' {
+                        t.hour = v % 12
+                    } else if d == 'M' {
+                        t.min = v
+                    } else if d == 'S' {
+                        t.sec = v
+                    } else if d == 'j' {
+                        if v < 1 || v > 366 { bad = true } else { t.yday = v - 1 }
+                    } else if d == 'u' {
+                        if v < 1 || v > 7 { bad = true } else { t.wday = v % 7 }
+                    } else if d == 'w' {
+                        if v < 0 || v > 6 { bad = true } else { t.wday = v }
+                    }
+                }
+                None { bad = true }
+            }
+        } else if d == 's' {
+            while i < len(s) && strByte(s, i) == ' ' { i += 1 }
+            match scanInt(s, i, 20) {
+                Some(n) {
+                    i = n.end
+                    t = gmtimeOf(n.value)
+                    haveYear = true
+                    epoch = true
+                }
+                None { bad = true }
+            }
+        } else if d == 'a' || d == 'A' {
+            let m = matchName(s, i, &DAY_NAMES)
+            if m < 0 {
+                bad = true
+            } else {
+                t.wday = m / 100
+                i += m % 100
+            }
+        } else if d == 'b' || d == 'B' || d == 'h' {
+            let m = matchName(s, i, &MONTH_NAMES)
+            if m < 0 {
+                bad = true
+            } else {
+                t.mon = m / 100
+                i += m % 100
+            }
+        } else if d == 'p' || d == 'P' {
+            if equalFoldAt(s, i, "AM") {
+                pm = 0
+                i += 2
+            } else if equalFoldAt(s, i, "PM") {
+                pm = 1
+                i += 2
+            } else {
+                bad = true
+            }
+        } else if d == 'Z' {
+            while i < len(s) && isAlphaByte(strByte(s, i)) { i += 1 }
+        } else if d == 'z' {
+            if i < len(s) && (strByte(s, i) == 'Z' || strByte(s, i) == 'z') {
+                i += 1
+            } else if i < len(s) && (strByte(s, i) == '+' || strByte(s, i) == '-') {
+                i += 1
+                match scanInt(s, i, 2) {
+                    Some(h) {
+                        if h.value < 0 || h.value > 23 {
+                            bad = true
+                        } else {
+                            i = h.end
+                            var colon = false
+                            if i < len(s) && strByte(s, i) == ':' {
+                                colon = true
+                                i += 1
+                            }
+                            if i + 2 <= len(s) && digits(s, i, i + 2) >= 0 {
+                                let mm = digits(s, i, i + 2)
+                                if mm > 59 { bad = true } else { i += 2 }
+                            } else if colon {
+                                bad = true
+                            }
+                        }
+                    }
+                    None { bad = true }
+                }
+            } else {
+                bad = true
+            }
+        } else if d == 'n' || d == 't' {
+            while i < len(s) && isSpaceByte(strByte(s, i)) { i += 1 }
+        } else if d == '%' {
+            if i < len(s) && strByte(s, i) == '%' {
+                i += 1
+            } else {
+                bad = true
+            }
+        } else {
+            bad = true
+        }
+    }
+    if bad { return Err(mismatch(s, fmt)) }
+    if pm == 1 { t.hour += 12 }
+    if !epoch && t.mday >= 1 && t.mon >= 0 && t.mon <= 11 {
+        if haveYear {
+            let dd = Date{year: t.year + 1900, month: t.mon + 1, day: t.mday}
+            if !dd.valid() { return Err(mismatch(s, fmt)) }
+            t.wday = weekday(dd)
+            t.yday = ydayOf(dd)
+        }
+    }
+    t.fsec = float(t.sec)
+    return Ok(Strptime{tm: t, rest: i})
+}
+
+fn tmError(t: &Tm): Option[str] {
+    if t.mon < 0 || t.mon > 11 {
+        return Some("time.Tm: month " + intToStr(t.mon) + " is not in 0..11")
+    }
+    if t.mday < 0 || t.mday > 31 { return Some("time.Tm: day " + intToStr(t.mday) + " is not in 0..31") }
+    if t.hour < 0 || t.hour > 23 { return Some("time.Tm: hour " + intToStr(t.hour) + " is not in 0..23") }
+    if t.min < 0 || t.min > 59 { return Some("time.Tm: minute " + intToStr(t.min) + " is not in 0..59") }
+    if t.sec < 0 || t.sec > 59 { return Some("time.Tm: second " + intToStr(t.sec) + " is not in 0..59") }
+    if t.wday < -1 || t.wday > 6 { return Some("time.Tm: weekday " + intToStr(t.wday) + " is not in 0..6") }
+    if t.yday < -1 || t.yday > 366 { return Some("time.Tm: yday " + intToStr(t.yday) + " is not in 0..366") }
+    return None
+}
+
+// Parses all of s with fmt. Unlike strptimePrefix, trailing bytes are an
+// error (there is no implicit remainder). Use strptimePrefix for a prefix,
+// or strptimeLocal for a validated LocalDateTime.
+pub fn strptime(s: str, fmt: str): Result[Tm, str] {
+    let p = try strptimePrefix(s, fmt)
+    if p.rest != len(s) {
+        return Err("date \"" + s + "\" has trailing text after format \"" + fmt + "\"")
+    }
+    let e = tmError(&p.tm)
+    if e.isSome() { return Err(e.unwrap()) }
+    return Ok(p.tm)
+}
+
+// Parses all of s with fmt and returns a civil date-time.
+pub fn strptimeLocal(s: str, fmt: str): Result[LocalDateTime, str] {
+    let t = try strptime(s, fmt)
+    return localDateTimeOf(t)
+}
+
+// RFC 7231 IMF-fixdate in GMT: "Thu, 01 Jan 1970 00:00:00 GMT".
+pub fn httpDate(sec: int): str {
+    let t = gmtimeOf(sec)
+    let wd = if t.wday >= 0 && t.wday < 7 { t.wday } else { 0 }
+    let mo = if t.mon >= 0 && t.mon < 12 { t.mon } else { 0 }
+    return strSlice(DAY_NAMES[wd], 0, 3) + ", " + padFill(t.mday, 2, '0') + " " +
+        strSlice(MONTH_NAMES[mo], 0, 3) + " " + padFill(t.year + 1900, 4, '0') + " " +
+        padFill(t.hour, 2, '0') + ":" + padFill(t.min, 2, '0') + ":" + padFill(t.sec, 2, '0') + " GMT"
+}
