@@ -21,11 +21,11 @@ for leaks.
 
 | Module | Lines | Contents |
 |---|---:|---|
-| `std.obx` | 2,026 | Option, Result, Unit, Where; Eq/Ord/Hash/Show for the primitives (keyed hashing, SipHash-1-3); print/println/eprint/eprintln; min/max; float text and math methods; StrBuf and basic string helpers; Decimal; sort; Map |
+| `std.obx` | 2,257 | Option, Result, Unit, Where; Eq/Ord/Hash/Show for the primitives (keyed hashing, SipHash-1-3); print/println/eprint/eprintln; min/max; float text and math methods; StrBuf and basic string helpers; Decimal; sort; Map (default SipHash, opt-in Fx hasher) |
 | `money.obx` | 196 | Currency, USD/EUR/GBP/JPY/CHF, Money[C] |
 | `math.obx` | 306 | float constants, parse, fixed, toDecimal, near, IEEE bit patterns |
-| `collections.obx` | 669 | stable sorts, searching, rearranging, copying, Set, UniqueList, Heap |
-| `strings.obx` | 1,027 | search, split/join, replace, trim, case, int parse/format, padding, UTF-8, eza's natcmp/quoteName |
+| `collections.obx` | 675 | stable sorts, searching, rearranging, copying, Set, UniqueList, Heap |
+| `strings.obx` | 1,047 | SIMD-backed search (indexOf/indexOfAny/count), split/join, replace, trim, case, int parse/format, padding, UTF-8, eza's natcmp/quoteName |
 | `io.obx` | 454 | IoError, whole-file read/write/append, readLines, readStdin, streaming Reader, buffered Writer, ChunkReader/copy/count/readAll |
 | `fs.obx` | 485 | stat/lstat, list, mkdirAll, remove/removeAll, rename, symlink, chmod, paths, walk, realpath, temp/atomic write |
 | `os.obx` | 263 | arguments, environment, pid, working directory, quit, ids, user database, tempDir |
@@ -154,7 +154,11 @@ for leaks.
   {...})` (v is `mut &V`) in insertion order, `keys()`/`values()` (copy
   types). `remove` is O(1) and moves the last entry into the hole, so it
   changes the iteration order; `removeStable` shifts the tail down and keeps
-  it, at O(size). Slots come from
+  it, at O(size). `newMapWith[K, V](hashFn)` takes a supplied `fn(&K): u64`
+  instead of `K.hash()`; `fxHashStr` and `fxHashInt` are the rustc-hash Fx
+  scheme. They are fast but **not** collision-resistant: use them only for
+  trusted input, and keep the default `newMap` for network-controlled keys.
+  Slots come from
   `(hash ^ seed) * GOLDEN` (the seed per process, above); the index is an
   array of u32 slots, each an entry number with some bits of that mixed hash
   beside it, so a probe passes other keys' slots without loading them. A Map
@@ -343,7 +347,15 @@ and `crypto.unbase64` delegate.
 
 ### strings
 
-`lastIndexOf`, `indexOfByte`, `count`, `equalFold`, `split(&s, sep):
+Searching walks the runtime's SIMD builtins: `indexOf`/`trim`/`count`/`split`
+use `strFind` (memmem) and `strFindAny` (memchr2/3) for long haystacks, with
+a scalar path for short strings where a call does not pay. On a 50 MB file
+that is 27x to 32x fewer instructions for absent-byte and absent-substring
+scans, 9.5x for `count`, and 9.3x for a byte `split`. A negative `from`
+clamps to 0 (it used to trap).
+
+`lastIndexOf`, `lastIndexOfByte`, `indexOfByte`, `indexOfAny(s, byteSet, from)`,
+`count`, `equalFold`, `split(&s, sep):
 []&str`, `splitN(&s, sep, n)` (n < 0: all), `fields(&s): []&str`, `cut(&s,
 sep): Option[Cut]` (`before` and `after` are views), `owned(&pieces): []str`,
 `lines(&text)` and `fieldsIter(&text)`, `join(&parts, sep)` (parts:
