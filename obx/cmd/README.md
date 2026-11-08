@@ -13,12 +13,20 @@ dates in the zone of `TZ` (else the system's) with the current-year rule,
 view with a header), and eza's default colours. `--time-style=iso` and the other styles are rejected. The measured
 rules are in [../tests/eza/E3-PROBES.md](../tests/eza/E3-PROBES.md).
 
-It is one file. The parts (argument parsing, deduction, entries and sorting,
-colour, the three views) share two types, `Opts` and `Entry`, and nothing in
-them is useful to another program yet; a split would only add imports and
-`pub`. What is general went to the library instead (`fs.readlink`,
-`fs.Kind`, `io.isTerminal`, `io.terminalWidth`, `strings.displayWidth`,
-`strings.lossy`, the stdout write errors; see [../lib/README.md](../lib/README.md)).
+It is one file. The parts (deduction, entries and sorting, colour, the three
+views) share two types, `Opts` and `Entry`, and nothing in them is useful to
+another program yet; a split would only add imports and `pub`. What is
+general went to the library instead: `cli.parse` for the option grammar,
+`paths.lastComponent`/`parentOf`, `fmt.modeString`,
+`strings.natcmp`/`natcmpFold`, `errors.osError`/`debugPath`,
+`os.users`/`uid`, plus the earlier `fs.readlink`, `fs.Kind`,
+`io.isTerminal`, `io.terminalWidth`, `strings.displayWidth`, `strings.lossy`
+and the stdout write errors (see [../lib/README.md](../lib/README.md)).
+
+The CLI move has a size cost: `cli` is compiled in whole once `parse` is
+referenced, so the native binary grew from 304,296 to 349,536 bytes (+14.9%;
+about 41 KB of that is `cli`, the rest the other module moves). Runtime is
+unchanged within noise, and the option parser runs once per process.
 
 Build it from `obx/`:
 

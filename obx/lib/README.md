@@ -305,10 +305,14 @@ forms do the same for single precision.
 ### glob
 
 zoxide's Rust-glob syntax: `compile(pattern): Result[Pattern, Error]`,
-`Pattern.matches(path): bool`, `matchPath(pattern, path)`. `*` and `?` do not
-cross `/`, `**` as a whole component does, sets (`[abc]`, `[a-z]`, `[!abc]`,
-`[^abc]`) and `\` escapes; matching is by Unicode code point with a DP
-matcher (no recursive backtracking). grep keeps its byte-wise GNU matcher.
+`Pattern.matches(path): bool`, `Pattern.matchesRelaxed(path): bool` and
+`matchPath(pattern, path)`. `matches` is path-aware: `*` and `?` do not cross
+`/`, and only `**` as a whole component does. `matchesRelaxed` is zoxide's
+`Pattern::matches_path` default, where `*`, `?` and a set may cross `/`.
+Sets (`[abc]`, `[a-z]`, `[!abc]`, `[^abc]`) and `\` escapes work in both;
+matching is by Unicode code point with a DP matcher (no recursive
+backtracking), and a pattern of plain literals compiles to a direct string
+compare. grep keeps its byte-wise GNU matcher.
 
 ### base64
 
