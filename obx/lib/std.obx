@@ -1870,8 +1870,10 @@ fn siftDown[T: Ord](xs: mut &[T], start: int, end: int) {
 // A hash map that keeps its entries in insertion order in three parallel
 // arrays (keys, values, hashes) and finds them through an open-addressing
 // index (linear probing, at most half full). keyAt(i)/valAt(i) for i in
-// 0..size() walk the entries in insertion order; remove moves the last entry
-// into the hole, so it changes that order.
+// 0..size() walk the entries in insertion order. put appends; remove keeps
+// that order by shifting the tail down (O(size)); swapRemove is the O(1)
+// variant, and it is the only operation that changes the order (the last
+// entry moves into the hole).
 //
 // A slot of the index is a u32: 0 when empty, else the entry number plus one
 // in its low b bits (len(index) = 2^b, and there are at most 2^(b-1) + 1
@@ -2028,8 +2030,33 @@ pub fn (m: mut &Map[K, V]) put(k: K, v: V) {
     if 2 * len(m.keys) > len(m.index) { m.grow() }
 }
 
-// Removes k and returns its value, if it was there.
+// Removes k and returns its value, if it was there. The remaining entries keep
+// their insertion order: the tail shifts down, so this costs O(size); use
+// swapRemove when the order does not matter.
 pub fn (m: mut &Map[K, V]) remove(k: &K): Option[V] {
+    let p = m.find(k, k.hash())
+    if p.entry < 0 { return None }
+    m.unlink(p.slot)
+    let last = len(m.keys) - 1
+    var i = p.entry
+    while i < last {
+        swap(mut &m.keys, i, i + 1)
+        swap(mut &m.vals, i, i + 1)
+        swap(mut &m.hashes, i, i + 1)
+        i += 1
+    }
+    pop(mut &m.keys)
+    pop(mut &m.hashes)
+    let v = pop(mut &m.vals)
+    m.reindex()
+    return Some(v)
+}
+
+// Removes k and returns its value, if it was there, in O(1): the last entry
+// moves into the hole, so the insertion order of the rest changes. This is
+// the old remove; it is the right choice when the map is used as a set and
+// the order is not observed.
+pub fn (m: mut &Map[K, V]) swapRemove(k: &K): Option[V] {
     let p = m.find(k, k.hash())
     if p.entry < 0 { return None }
     m.unlink(p.slot)
@@ -2082,11 +2109,12 @@ fn (m: mut &Map[K, V]) unlink(s: int) {
     m.index[hole] = 0
 }
 
-fn (m: mut &Map[K, V]) grow() {
-    let n = len(m.index) * 2
-    if n > 4294967296 { panic("Map: more than 2^31 entries") }
+// Fills a zeroed index of the current length from the hash array; the index
+// length and shift must already be set. grow and the order-preserving remove
+// both use it.
+fn (m: mut &Map[K, V]) reindex() {
+    let n = len(m.index)
     replace(mut &m.index, array(n, u32(0)))
-    m.shift -= 1
     let mask = n - 1
     for e in 0..len(m.keys) {
         let x = m.mix(m.hashes[e])
@@ -2094,6 +2122,14 @@ fn (m: mut &Map[K, V]) grow() {
         while m.index[i] != 0 { i = (i + 1) & mask }
         m.index[i] = m.tagOf(x) | u32(e + 1)
     }
+}
+
+fn (m: mut &Map[K, V]) grow() {
+    let n = len(m.index) * 2
+    if n > 4294967296 { panic("Map: more than 2^31 entries") }
+    replace(mut &m.index, array(n, u32(0)))
+    m.shift -= 1
+    m.reindex()
 }
 
 // ---------------------------------------------------------------- call sites
