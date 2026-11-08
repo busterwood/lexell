@@ -473,9 +473,10 @@ The compiler is 39,436 lines of obx (1.78 MB, 706 KB of it the generated
 runtime tables `rt.obx` and `rtx.obx`; 28,348 hand-written lines) and 5,634
 lines of C runtime (the C backend's `rt.h` and the native backend's
 freestanding `rt.c`). The obx-built compiler runs 5,080M instructions on
-`--native` (5,009M before the Map hasher field and the string-search change,
-+1.4%); cycles move with the host. Absolute times move with the host; the
-instruction counts are the stable comparison. The gcc-built comparison is in
+`--native`; the previous commit ran 5,067M (+0.26% for the Map hasher field
+and the string-search change), and the 7 November figure was 5,009M. Cycles
+move with the host. Absolute times move with the host; the instruction counts
+are the stable comparison. The gcc-built comparison is in
 [design/native-vs-c.md](obx/design/native-vs-c.md).
 
 - What is left is spread thin: it is in the mix (register-to-register moves,
