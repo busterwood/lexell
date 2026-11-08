@@ -44,7 +44,7 @@ lexell/compiler/out/lxlc lexell/cmd/jq.lxl --native -o lexell-jq
 printf '%s\n' '{"order":{"total":24.49}}' | ./lexell-jq '.order.total'
 ```
 
-This also prints `24.49`. The repository includes [other command-line tools and an HTTP server](lexell/cmd/README.md).
+This also prints `24.49`. The repository includes [other command-line tools, a Redis CLI and an HTTP server](lexell/cmd/README.md).
 
 ## Why I built Lexell
 
@@ -64,7 +64,7 @@ The current Lexell grew out of an Oberon dialect and an ownership fork called `o
 | Ownership | Single ownership for owned values and checked borrows. Strings are reference counted. |
 | Compiler | A self-hosted compiler that writes x86-64 ELF directly. The C backend shares the same intermediate representation and is used for bootstrapping and differential testing. |
 | Standard library | Collections, text and file I/O, time zones, regex, JSON, CommonMark, HTTP, TLS, Redis and tasks. |
-| Databases | Clients for SQLite, PostgreSQL, SQL Server and Oracle. The native PostgreSQL, SQL Server and Oracle clients can decode rows into your own record types in bounded batches. |
+| Data stores | Clients for SQLite, PostgreSQL, SQL Server, Oracle and Redis. PostgreSQL, SQL Server and Oracle use their native wire protocols; Redis speaks RESP2 and RESP3. The SQL clients can decode rows into your own record types in bounded batches. |
 | Programs | A jq port, a CommonMark renderer, an HTTP/1.1 server and load client, a Redis client and `redis-cli`, and ports of everyday tools including `grep`, `eza` and `zoxide`. |
 
 See the [database streaming design](lexell/design/db-streaming.md) for an example of binding columns and reading rows into a caller-owned buffer.
@@ -83,7 +83,7 @@ See the [database streaming design](lexell/design/db-streaming.md) for an exampl
 
 ## Status and feedback
 
-The specification is a draft. Record the commit you build from if you want to reproduce an example later. The compiler finds the standard library in the source tree. Some library features use system libraries, including OpenSSL for TLS, libsqlite3 for SQLite and ODBC for the ODBC SQL Server client.
+The specification is a draft. Record the commit you build from if you want to reproduce an example later. The compiler finds the standard library in the source tree. Some library features use system libraries, including OpenSSL for TLS and libsqlite3 for SQLite.
 
 If you try Lexell, I’d like to know what you built and where you got stuck. For a bug, include the commit, your platform, a small reproducer and the output you expected. For a library or documentation gap, an example of what you were trying to do is a good place to start.
 
