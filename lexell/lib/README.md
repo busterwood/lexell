@@ -1272,7 +1272,11 @@ println((try c.hget("order:42", "amount")).unwrapOr("missing"))
   `hgetall` (RESP2's flat array and RESP3's map both become `PairStr`);
   lists `lpush`, `rpush`, `lpop`, `rpop`, `llen`, `lrange`; sets `sadd`,
   `srem`, `smembers`, `sismember`; `publish`, `subscribe`, `scan`,
-  `multi`/`exec`/`discard`. Anything else is `command`.
+  `multi`/`exec`/`discard`. Inside a MULTI, send the queued commands with
+  `command` (they reply `QUEUED`); the typed helpers expect the command's
+  final reply. `WATCH`/`UNWATCH` are generic and are not tracked by the pool,
+  so use a dedicated connection for an optimistic transaction. Anything else
+  is `command`.
 - **Pool** (`newPool(url, size)` / `newPoolWith(cfg, size)`): at most
   `size` connections, `acquire()` parks until one is free, a `Lease` gives
   it back when dropped (a connection in MULTI or broken is closed
