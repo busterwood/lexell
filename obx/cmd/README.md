@@ -112,11 +112,11 @@ runtime report on the large-input cases (four for the coreutils, four for `grep`
 | `sort` | 115,656 | 111,632 |
 | `head` | 50,304 | 74,488 |
 | `tail` | 71,056 | 92,768 |
-| `grep` | 544,728 | 476,488 |
-| `zoxide` | 335,096 | 296,448 |
-| `eza` | 353,328 | 305,488 |
+| `grep` | 548,824 | 489,720 |
+| `zoxide` | 335,096 | 296,384 |
+| `eza` | 353,328 | 305,536 |
 | `jq` | 1,163,592 (libc, libm) | 875,280 |
-| `cmark` | 338,176 | 445,072 |
+| `cmark` | 342,272 | 453,872 |
 
 (obo's static binaries were 90 to 119 KB. `grep` is large because it carries
 the regex library. `jq` carries the regex and JSON libraries and jq's
@@ -248,7 +248,7 @@ set, so scores come from databases written with fixed ages.
 Install the reference into a scratch directory, not `~/.cargo/bin`:
 `CARGO_INSTALL_ROOT=/tmp/zoxide-ref cargo install zoxide --locked --version
 0.9.9` (0.10 needs a newer rustc). Our binary runs with `OBX_CHECK=1`.
-Sizes in bytes: `zoxide` is 335,096 native (static) and 296,448 through C.
+Sizes in bytes: `zoxide` is 335,096 native (static) and 296,384 through C.
 
 ## jq
 

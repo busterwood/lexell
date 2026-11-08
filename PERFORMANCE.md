@@ -17,11 +17,12 @@ performance comparison is not part of this report: it is in
 
 This page is the current state: the measured tables and what they say about
 the code today, against external references and in absolute terms. The
-figures are from 7 November 2026, the application suite and Decimal tables
-at `fb50b4f1`, the rest at `b6777cf4`, and the benchmark table with the Rust
-column at `180d8f5c`; where a table comes from an earlier sweep it says so. Three references could not be re-run in this
-environment: the jq 1.7.1 column, the cmark column of the Markdown table, and
-the Go and Node columns of the HTTP tables.
+figures for the benchmark, compile-time, application-suite, compiler, eza
+and binary-size tables are from 8 November 2026 at `93b295c5`; the grep, jq
+large-input, Markdown, Decimal, HTTP, TLS and database tables are from
+earlier sweeps and say so. Three references could not be re-run in this environment: the jq
+1.7.1 column, the cmark column of the Markdown table, and the Go and Node
+columns of the HTTP tables.
 
 The host is shared and variable: absolute times for I/O-bound and
 process-heavy tables (eza, grep, Markdown, HTTP, TLS) move by up to 2x
@@ -63,16 +64,16 @@ code here, and the experiments that did not pay — is in
 
 | benchmark | obx -O | plain C | Rust | obx/Rust | obx/plain C | what it does |
 |---|---:|---:|---:|---:|---:|---|
-| fib | 914 ms | 878 ms | 884 ms | 1.03 | 1.04 | recursive calls |
-| loop | 460 ms | 461 ms | 457 ms | 1.01 | 1.00 | two overflow-checked operations per iteration |
-| array | 361 ms | 98 ms | 363 ms | 0.99 | 3.66 | checked indexing |
-| alloc | 247 ms | 485 ms | 487 ms | 0.51 | 0.51 | 80 million records allocated and freed |
-| lists | 205 ms | 217 ms | 270 ms | 0.76 | 0.94 | linked list build, sum, drop |
-| strings | 227 ms | 456 ms | 391 ms | 0.58 | 0.50 | concatenation and `toStr` |
-| trees | 135 ms | 180 ms | 173 ms | 0.78 | 0.75 | binary trees |
-| tokens | 202 ms | 166 ms | 167 ms | 1.21 | 1.22 | byte scanning and hashing |
-| sieve | 337 ms | 359 ms | 615 ms | 0.55 | 0.94 | the sieve of Eratosthenes to 10 million, 30 rounds |
-| maps | 452 ms | - | - | - | - | `Map[str, int]` with short and long keys, `Map[int, int]` (keyed hashing) |
+| fib | 888 ms | 886 ms | 891 ms | 1.00 | 1.00 | recursive calls |
+| loop | 443 ms | 447 ms | 440 ms | 1.01 | 0.99 | two overflow-checked operations per iteration |
+| array | 366 ms | 102 ms | 371 ms | 0.99 | 3.60 | checked indexing |
+| alloc | 250 ms | 487 ms | 486 ms | 0.51 | 0.51 | 80 million records allocated and freed |
+| lists | 195 ms | 201 ms | 263 ms | 0.74 | 0.97 | linked list build, sum, drop |
+| strings | 218 ms | 439 ms | 379 ms | 0.58 | 0.50 | concatenation and `toStr` |
+| trees | 139 ms | 185 ms | 176 ms | 0.79 | 0.75 | binary trees |
+| tokens | 207 ms | 169 ms | 170 ms | 1.22 | 1.23 | byte scanning and hashing |
+| sieve | 361 ms | 398 ms | 674 ms | 0.54 | 0.91 | the sieve of Eratosthenes to 10 million, 30 rounds |
+| maps | 568 ms | - | - | - | - | `Map[str, int]` with short and long keys, `Map[int, int]` (keyed hashing) |
 
 The ratios use the unrounded wall times (best of 11); the millisecond column
 is rounded, so two equal-looking values can differ by a few percent: a 1.06
@@ -88,8 +89,8 @@ Rust std equivalent). Their build settings and anti-optimisation rules are in
 [design/native-vs-c.md](obx/design/native-vs-c.md).
 
 The plain fast-compile path (`--native`, no `-O`) is slower where the loop
-passes matter: loop 881 ms, array 740 ms, sieve 529 ms; it is level on alloc
-(248 vs 247) and strings (224 vs 227). `maps` moves with the hash seed;
+passes matter: loop 890 ms, array 710 ms, sieve 562 ms; it is level on alloc
+(251 vs 250) and strings (219 vs 218). `maps` moves with the hash seed;
 [design/codegen-audit.md](obx/design/codegen-audit.md) records the remaining
 code-shape gaps.
 
@@ -128,7 +129,9 @@ code-shape gaps.
   builds a `String` and then copies it into a fresh `Rc` allocation, two
   allocations per `+`, whereas obx makes one refcounted block per `+` in its
   size-class allocator.
-- **maps** runs 452 ms. `str`, `i128`, `u128` and `Decimal` hash with
+- **maps** runs 568 ms (4,277M instructions, 1.6% more than the 4,212M
+  before the Map hasher field; the wall time moves with the machine state).
+  `str`, `i128`, `u128` and `Decimal` hash with
   SipHash-1-3 under a per-process key, and `Map` mixes a per-process seed
   into its slots (lib/README.md, "Keyed hashing").
   Map's index slots are `u32`: an entry number with the high bits of the
@@ -145,6 +148,49 @@ code-shape gaps.
   by under 1%, trees and sieve by 2–4%; maps moves as much between runs
   of one binary on a loaded machine, which is memory, not placement.
 
+### String search
+
+The runtime has SIMD byte and substring search (`strFindByte` over memchr,
+`strFindAny` over SSE2, `strFind` over memchr plus a two-byte prefilter), and
+the public string API now uses it. Before 8 November, `std.indexOf`,
+`strings.indexOfByte` and `strings.count` were scalar loops and
+`std.split(byte)` scanned every byte. On a 50 MB file, three passes
+(instructions; cycles in brackets):
+
+| operation | before | after |
+|---|---:|---:|
+| first absent byte | 1.66B (498M) | 61.3M (76M) |
+| first absent substring | 3.31B (636M) | 103.5M (88M) |
+| `count("omega")` | 3.90B (743M) | 410.5M (153M) |
+| `split('\n')` | 1.74B (523M) | 186.1M (133M) |
+
+The gain is 27x to 32x fewer instructions on the byte and substring scans,
+9.5x on `count` and 9.3x on `split`. On a 5-byte haystack the runtime call
+costs more than a scan, so the library keeps a scalar path: the byte search
+is still 11% cheaper, and the substring probe is 5% more instructions, mostly
+the new clamp of a negative `from` (it used to trap) plus the threshold.
+`strings.indexOfAny` exposes the memchr2/3 set search and
+`lastIndexOfByte` the reverse byte scan.
+
+### Map and hashing
+
+The default `Map` hasher is still `K.hash()` — SipHash-1-3 under the process
+key for `str` — and the map mixes its own per-process seed into the slots. A
+`Map` now also carries the hasher for the opt-in `newMapWith`; every hash site
+tests a predictable `fast` flag, so the default path pays a branch rather than
+an indirect call. 500k keys, put + get (instructions):
+
+| keys | before | default map | `newMapWith` |
+|---|---:|---:|---:|
+| `str` | 782.2M | 789.2M (+0.9%) | 626.9M with `fxHashStr` (-19.9%) |
+| `int` | 262.5M | 266.1M (+1.4%) | 277.5M with `fxHashInt` (+5.7%) |
+
+The Fx hasher (rustc-hash's rotate/xor/multiply) is ~20% cheaper for large
+trusted string-keyed tables. It is slower for `int` keys, where the default
+hash is already one multiply, and it is **not** collision-resistant: `newMap`
+stays the default, and the module says to use `newMapWith` only for trusted
+input, never for keys chosen by a network peer.
+
 ## Compile time and size
 
 `python3 obx/bench/compile.py -n 3`, best of 3, one core. The builds are not
@@ -153,19 +199,19 @@ binary with nine subcommands, and cargo measures its own build system.
 
 | what | obx | Rust | C |
 |---|---:|---:|---:|
-| hello, compile | 12 ms | 162 ms | 86 ms |
+| hello, compile | 13.9 ms | 152.2 ms | 64.2 ms |
 | hello, binary | 16 KB | 357 KB (stripped) | 16 KB |
-| nine benchmark programs, clean compile | 104 ms | 2.95 s | - |
+| nine benchmark programs, clean compile | 122.6 ms | 2.23 s | - |
 | nine benchmark programs, binaries | 172 KB | 443 KB | - |
-| compiler self-build (`--native`) | 656 ms | over 30 min* | - |
-| compiler, binary + libraries | 2.9 MB (static) | 316 MB | - |
-| compiler toolchain, bin + lib | 2.9 MB | 560 MB (1.3 GB installed) | - |
+| compiler self-build (`--native`) | 659 ms | over 30 min* | - |
+| compiler, binary + libraries | 2.9 MB (static) | 316.0 MB | - |
+| compiler toolchain, bin + lib | 2.9 MB | 559.9 MB (1.3 GB installed) | - |
 
 The compiler is 39,436 lines of obx (28,348 hand-written) and builds itself
 in 0.66 s; its binary is 2.9 MB and needs no libc. A hello world compiles in
-12 ms to 16 KB, against Rust's 162 ms and 357 KB (stripped) and gcc's 86 ms
-and 16 KB. The nine benchmark programs compile in 104 ms with obx; the Rust
-suite takes 2.95 s. Rust's figures include std and the cargo build system;
+14 ms to 16 KB, against Rust's 152 ms and 357 KB (stripped) and gcc's 64 ms
+and 16 KB. The nine benchmark programs compile in 123 ms with obx; the Rust
+suite takes 2.23 s. Rust's figures include std and the cargo build system;
 obx links its own freestanding runtime.
 
 Rust's compiler is `rustc` (636 KB) plus `librustc_driver` (138 MB) and
@@ -249,7 +295,7 @@ same-IR C build's column and the per-match instruction ratios are in
 
 ## eza
 
-[obx/cmd/eza.obx](obx/cmd/eza.obx), a 1,600-line implementation of the
+[obx/cmd/eza.obx](obx/cmd/eza.obx), a 1,677-line implementation of the
 common subset of eza 0.23.3 at `38e114e` (1,857 lines, with the full long
 view). `LC_ALL=C TZ=UTC`; the long listings use
 `--bytes --time-style=long-iso -n`, which that build required. Best of 9; both
@@ -257,12 +303,15 @@ builds write byte-identical listings.
 
 | listing | output | obx |
 |---|---:|---:|
-| `-T /usr/share` (tree) | 2.1 MB | 119 ms |
-| `-T -l /usr/share` (long tree) | 3.7 MB | 234 ms |
+| `-T /usr/share` (tree) | 2.1 MB | 130 ms |
+| `-T -l /usr/share` (long tree) | 3.8 MB | 262 ms |
 | `-l /usr/lib/x86_64-linux-gnu` | 51 KB | 5 ms |
 
-The golden suite (`python3 obx/cmd/eza_gate.py -j 12`) passes on both
-builds.
+These are the 8 November sweep; the host was about 10% slower than the
+previous one. The tree walk is 517M instructions, slightly below the
+previous commit (the library migration removed per-entry path and name-order
+allocations), so the wall difference is the host, not the code. The golden
+suite (`python3 obx/cmd/eza_gate.py -j 12`) passes on both builds.
 
 ## grep
 
@@ -285,7 +334,10 @@ port has no locale). Every output equals GNU grep's.
 
 `-n omega` is the slowest row (2,191M instructions / 629M cycles); the cost
 is the line-numbering and match walk, not the DFA. The rest are ahead of GNU
-grep except `-c -v '^0'`.
+grep except `-c -v '^0'`. A `93b295c5` re-run of `-c omega` gives the same
+1,084.4M instructions: grep's matcher already used the runtime search
+builtins, so the library string-search change does not touch this table. The
+wall times above are from the earlier quiet sweep.
 
 What makes it fast:
 
@@ -321,7 +373,10 @@ three outputs of each filter must be identical.
 | `group_by(.address.city) \| map({city: .[0].address.city, n: length})` | 2.15 s | 1.95 s |
 
 The jq 1.7.1 column is from an earlier sweep (jq is not installed here); the
-obx columns were measured at 80 MB with `--mb 80 -n 3`.
+obx columns were measured at 80 MB with `--mb 80 -n 3`. The application
+suite at `93b295c5` measures `-c .` on 20 MB at 4,282.1M instructions, the
+same figure as the table's 4,282.3M; the large-input wall times remain from
+the earlier quiet window.
 
 The same script times the JSON library on the file (ms, best of 3), against
 Python's `json`:
@@ -389,6 +444,8 @@ current.
 The obx columns are the plain `--native` build, with line endings and inline
 text runs found in runs rather than byte by byte.
 With `-O` the spec is 0.169 s: 1343.0M instructions / 487.3M cycles. The
+application suite at `93b295c5` measures its 10 MB document at 1,337.9M
+instructions, within 0.4% of the previous sweep. The
 cmark column is from an earlier sweep; the same-IR C ratios are in
 [design/native-vs-c.md](obx/design/native-vs-c.md).
 
@@ -408,15 +465,16 @@ best of 11:
 
 | | obx build |
 |---|---:|
-| self-build to an executable (`--native`) | 733 ms |
-| self-build to C (`--emit-c`) | 457 ms |
-| compiler binary | 3,068,417 bytes (static, no libc) |
+| self-build to an executable (`--native`) | 676 ms |
+| self-build to C (`--emit-c`) | 501 ms |
+| compiler binary | 3,068,457 bytes (static, no libc) |
 
 The compiler is 39,436 lines of obx (1.78 MB, 706 KB of it the generated
 runtime tables `rt.obx` and `rtx.obx`; 28,348 hand-written lines) and 5,634
 lines of C runtime (the C backend's `rt.h` and the native backend's
-freestanding `rt.c`). The obx-built compiler runs 5,009M instructions in
-2,999M cycles on `--native`. Absolute times move with the host; the
+freestanding `rt.c`). The obx-built compiler runs 5,080M instructions on
+`--native` (5,009M before the Map hasher field and the string-search change,
++1.4%); cycles move with the host. Absolute times move with the host; the
 instruction counts are the stable comparison. The gcc-built comparison is in
 [design/native-vs-c.md](obx/design/native-vs-c.md).
 
@@ -512,16 +570,18 @@ as the C build.
 
 `python3 obx/bench/apps.py -n 5 --pin 2` is the Tier-1 table: the same source
 built with obx `-O`, output checked, timed with `perf` on one core, best
-of N, as a table, JSON and TSV. Measured at `fb50b4f1`
-(`OBX_HASH_SEED=42`, core 2, 60 s):
+of N, as a table, JSON and TSV. Measured at `93b295c5` (8 November;
+`OBX_HASH_SEED=42`, core 2, 60 s). The host was busy: wall times are 1.2 to
+1.5 times the previous sweep, while every instruction count is within 0.4%
+of it:
 
 | application | obx wall | instructions | cycles |
 |---|---:|---:|---:|
-| regex (8 patterns, 3 MB) | 44 ms | 582.7M | 157.9M |
-| json (20 MB, parse/query/visit) | 481 ms | 4,410.7M | 1,734.9M |
-| jq (`-c .`, 20 MB) | 377 ms | 4,282.3M | 1,348.9M |
-| cmark (10 MB) | 159 ms | 1,343.0M | 489.2M |
-| decimal (all cases) | 2,211 ms | 45,076.7M | 9,672.8M |
+| regex (8 patterns, 3 MB) | 47 ms | 582.7M | 159.9M |
+| json (20 MB, parse/query/visit) | 619 ms | 4,410.7M | 2,202.2M |
+| jq (`-c .`, 20 MB) | 442 ms | 4,282.1M | 1,455.6M |
+| cmark (10 MB) | 198 ms | 1,337.9M | 581.8M |
+| decimal (all cases) | 2,378 ms | 45,076.7M | 9,747.8M |
 
 The external references for each application are in its own section: Rust,
 Go and ripgrep for regex; jq for the jq port; cmark for Markdown; .NET and
@@ -542,9 +602,9 @@ move with the machine and the slot layout.
 | empty program | 12,288 bytes (static) |
 | hello | 16,416 bytes (static) |
 | `import "regex"`, one call (`regex.quote`) | 20,512 bytes (static) |
-| eza | 304,296 bytes (static) |
-| HTTP server (`cmd/httpd.obx`) | 844,272 bytes (dynamic) |
-| compiler | 3,068,417 bytes (static) |
+| eza | 353,328 bytes (static) |
+| HTTP server (`cmd/httpd.obx`) | 848,440 bytes (dynamic) |
+| compiler | 3,068,457 bytes (static) |
 
 The native backend generates only the functions and globals reachable from
 `main` (design/native.md section 5, "Reachability"), as gcc drops a C
