@@ -11,6 +11,8 @@ import "json"
 import "regex"
 import "time"
 import "collections"
+import "base64"
+import "url"
 
 pub type J = json.Json
 
@@ -962,8 +964,6 @@ fn foundString(s: str): str {
 
 // ---------------------------------------------------------------- formats
 
-const B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-
 fn csvRow(j: &J, tsv: bool): Result[str, str] {
     var b = newStrBuf()
     var first = true
@@ -1005,10 +1005,6 @@ fn csvRow(j: &J, tsv: bool): Result[str, str] {
     return Ok(b.toStr())
 }
 
-fn unreserved(c: byte): bool {
-    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~'
-}
-
 fn shQuote(x: &J): Result[str, str] {
     match x {
         json.Json.Str(s) {
@@ -1030,64 +1026,16 @@ fn shQuote(x: &J): Result[str, str] {
     }
 }
 
-pub fn base64Encode(s: str): str {
-    var b = newStrBuf()
-    var i = 0
-    while i + 3 <= len(s) {
-        let n = (int(s[i]) << 16) | (int(s[i + 1]) << 8) | int(s[i + 2])
-        b.addByte(B64[(n >> 18) & 63])
-        b.addByte(B64[(n >> 12) & 63])
-        b.addByte(B64[(n >> 6) & 63])
-        b.addByte(B64[n & 63])
-        i += 3
-    }
-    let rest = len(s) - i
-    if rest == 1 {
-        let n = int(s[i]) << 16
-        b.addByte(B64[(n >> 18) & 63])
-        b.addByte(B64[(n >> 12) & 63])
-        b.add("==")
-    } else if rest == 2 {
-        let n = (int(s[i]) << 16) | (int(s[i + 1]) << 8)
-        b.addByte(B64[(n >> 18) & 63])
-        b.addByte(B64[(n >> 12) & 63])
-        b.addByte(B64[(n >> 6) & 63])
-        b.addByte('=')
-    }
-    return b.toStr()
-}
-
-fn b64val(c: byte): int {
-    if c >= 'A' && c <= 'Z' { return int(c - 'A') }
-    if c >= 'a' && c <= 'z' { return int(c - 'a') + 26 }
-    if c >= '0' && c <= '9' { return int(c - '0') + 52 }
-    if c == '+' { return 62 }
-    if c == '/' { return 63 }
-    return -1
-}
+pub fn base64Encode(s: str): str { return base64.encode(s) }
 
 // jq 1.7.1's @base64d: invalid characters are an error, '=' ends the data, a
-// single leftover character is "trailing base64 byte found".
+// single leftover character is "trailing base64 byte found". base64.decodeLenient
+// returns those message fragments; jq prefixes the value with its typeErr.
 pub fn base64Decode(j: &J, s: str): Result[str, str] {
-    var out: []byte = []
-    var acc = 0
-    var bits = 0
-    var n = 0
-    for i in 0..len(s) {
-        let c = s[i]
-        if c == '=' { break }
-        let v = b64val(c)
-        if v < 0 { return Err(typeErr(j, "is not valid base64 data")) }
-        acc = (acc << 6) | v
-        bits += 6
-        n += 1
-        if bits >= 8 {
-            bits -= 8
-            append(mut &out, byte((acc >> bits) & 0xFF))
-        }
+    match base64.decodeLenient(s) {
+        Ok(d) { return Ok(json.validUtf8(d)) }
+        Err(e) { return Err(typeErr(j, e)) }
     }
-    if n % 4 == 1 { return Err(typeErr(j, "trailing base64 byte found")) }
-    return Ok(json.validUtf8(strFromBytes(&out)))
 }
 
 // @name applied to a value.
@@ -1115,22 +1063,7 @@ pub fn format(name: str, x: &J): Result[J, str] {
         }
         return Ok(json.string(b.toStr()))
     }
-    if name == "uri" {
-        let s = tostring(x)
-        var b = newStrBuf()
-        let hex = "0123456789ABCDEF"
-        for i in 0..len(s) {
-            let c = s[i]
-            if unreserved(c) {
-                b.addByte(c)
-            } else {
-                b.addByte('%')
-                b.addByte(hex[int(c) >> 4])
-                b.addByte(hex[int(c) & 15])
-            }
-        }
-        return Ok(json.string(b.toStr()))
-    }
+    if name == "uri" { return Ok(json.string(url.encode(tostring(x)))) }
     if name == "csv" || name == "tsv" {
         if !x.isArray() {
             return Err(typeErr(x, if name == "csv" { "cannot be csv-formatted, only array" } else { "cannot be tsv-formatted, only array" }))
@@ -1308,45 +1241,12 @@ pub fn lgammaR(x: float): J {
 }
 
 // ---------------------------------------------------------------- dates
+//
+// jq's JSON-array view of time.Tm. The calendar engine, strftime and
+// strptimePrefix are time's; what stays here is jq's array conversion, the
+// sentinel values of its unset fields, and its error text.
 
-const MONTHS: []str = ["January", "February", "March", "April", "May", "June", "July", "August", "September",
-    "October", "November", "December"]
-const DAYS: []str = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
-const YDAYS: []int = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334]
-
-// A broken-down time, as C's struct tm.
-pub type Tm = value record {
-    pub year: int    // since 1900
-    pub mon: int
-    pub mday: int
-    pub hour: int
-    pub min: int
-    pub sec: int
-    pub wday: int
-    pub yday: int
-    pub fsec: float  // seconds with the fraction, for the array
-}
-
-fn floorDiv(a: int, b: int): int {
-    var q = a / b
-    if (a % b != 0) && ((a < 0) != (b < 0)) { q -= 1 }
-    return q
-}
-
-// gmtime of whole seconds.
-pub fn gmtimeOf(secs: int): Tm {
-    let days = floorDiv(secs, 86400)
-    let rem = secs - days * 86400
-    let d = time.dateOfDays(days)
-    var yday = YDAYS[d.month - 1] + d.day - 1
-    if d.month > 2 && time.isLeapYear(d.year) { yday += 1 }
-    var wday = (days + 4) % 7
-    if wday < 0 { wday += 7 }
-    return Tm{year: d.year - 1900, mon: d.month - 1, mday: d.day, hour: rem / 3600, min: (rem / 60) % 60,
-              sec: rem % 60, wday: wday, yday: yday, fsec: float(rem % 60)}
-}
-
-pub fn tmToJson(t: &Tm): J {
+pub fn tmToJson(t: &time.Tm): J {
     return json.arrayOf([int2j(t.year + 1900), int2j(t.mon), int2j(t.mday), int2j(t.hour), int2j(t.min),
                          num(t.fsec), int2j(t.wday), int2j(t.yday)])
 }
@@ -1356,7 +1256,7 @@ pub fn gmtime(x: &J): Result[J, str] {
     let f = numVal(x)
     if f != f || f > 1e17f || f < -1e17f { return Err("error converting number of seconds since epoch to datetime") }
     let secs = int(f.trunc())
-    var t = gmtimeOf(secs)
+    var t = time.gmtimeOf(secs)
     t.fsec = float(t.sec) + (f - f.floor())
     return Ok(tmToJson(&t))
 }
@@ -1368,7 +1268,7 @@ fn fieldInt(a: &J, i: int): Option[int] {
     return Some(clampInt(f))
 }
 
-pub fn jsonToTm(a: &J): Option[Tm] {
+pub fn jsonToTm(a: &J): Option[time.Tm] {
     var v: []int = []
     for i in 0..8 {
         match fieldInt(a, i) {
@@ -1377,379 +1277,102 @@ pub fn jsonToTm(a: &J): Option[Tm] {
         }
     }
     let s = numVal(&a.item(5))
-    return Some(Tm{year: v[0] - 1900, mon: v[1], mday: v[2], hour: v[3], min: v[4], sec: v[5], wday: v[6], yday: v[7], fsec: s})
-}
-
-// timegm.
-pub fn timegm(t: &Tm): int {
-    var y = t.year + 1900
-    var m = t.mon
-    y += floorDiv(m, 12)
-    m = m - floorDiv(m, 12) * 12
-    let days = time.daysOfDate(time.Date{year: y, month: m + 1, day: 1}) + t.mday - 1
-    return days * 86400 + t.hour * 3600 + t.min * 60 + t.sec
+    return Some(time.Tm{year: v[0] - 1900, mon: v[1], mday: v[2], hour: v[3], min: v[4], sec: v[5],
+                        wday: v[6], yday: v[7], fsec: s})
 }
 
 pub fn mktime(a: &J): Result[J, str] {
     if !a.isArray() { return Err("mktime requires array inputs") }
     if a.size() < 6 { return Err("mktime requires parsed datetime inputs") }
     match jsonToTm(a) {
-        Some(t) { return Ok(int2j(timegm(&t))) }
+        Some(t) { return Ok(int2j(time.timegm(&t))) }
         None { return Err("mktime requires parsed datetime inputs") }
     }
 }
 
-fn pad(n: int, width: int, fill: byte): str {
-    var s = intToStr(if n < 0 { -n } else { n })
-    var b = newStrBuf()
-    if n < 0 { b.addByte('-') }
-    var k = len(s)
-    while k < width {
-        b.addByte(fill)
-        k += 1
-    }
-    b.add(s)
-    return b.toStr()
+fn strptimeErr(s: str, fmt: str): str {
+    return "date \"" + s + "\" does not match format \"" + fmt + "\""
 }
 
-fn isoWeek(t: &Tm): Tm {
-    // the ISO 8601 week-based year in year, the week in mon
-    let wdayMon = (t.wday + 6) % 7
-    var year = t.year + 1900
-    var week = (t.yday - wdayMon + 10) / 7
-    if week < 1 {
-        year -= 1
-        let prevDays = if time.isLeapYear(year) { 366 } else { 365 }
-        week = (t.yday + prevDays - wdayMon + 10) / 7
-    } else {
-        let days = if time.isLeapYear(year) { 366 } else { 365 }
-        if week == 53 && (t.yday - wdayMon + 3) >= days {
-            year += 1
-            week = 1
-        }
-    }
-    return Tm{year: year, mon: week, mday: 0, hour: 0, min: 0, sec: 0, wday: 0, yday: 0, fsec: 0.0f}
+// The conversions jq's strptime knows; time.strptimePrefix knows more, and jq
+// rejects the rest.
+fn jqDirective(c: byte): bool {
+    return c == 'Y' || c == 'm' || c == 'd' || c == 'e' || c == 'H' || c == 'M' || c == 'S' ||
+        c == 'j' || c == 'y' || c == 'I' || c == 'C' || c == 'k' || c == 'l' || c == 's' ||
+        c == 'a' || c == 'A' || c == 'b' || c == 'B' || c == 'h' || c == 'p' || c == 'Z' ||
+        c == 'z' || c == 'T' || c == 'D' || c == 'F' || c == 'R' || c == '%' || c == 'n' ||
+        c == 't'
 }
 
-pub fn strftime(t: &Tm, fmt: str, zone: str): str {
-    var b = newStrBuf()
+fn jqFormatOk(fmt: str): bool {
     var i = 0
     while i < len(fmt) {
         let c = fmt[i]
-        if c != '%' || i + 1 >= len(fmt) {
-            b.addByte(c)
+        i += 1
+        if c == '%' && i < len(fmt) {
+            if !jqDirective(fmt[i]) { return false }
             i += 1
-            continue
-        }
-        let f = fmt[i + 1]
-        i += 2
-        let wd = if t.wday >= 0 && t.wday < 7 { t.wday } else { 0 }
-        let mo = if t.mon >= 0 && t.mon < 12 { t.mon } else { 0 }
-        if f == 'Y' {
-            b.addInt(t.year + 1900)
-        } else if f == 'm' {
-            b.add(pad(t.mon + 1, 2, '0'))
-        } else if f == 'd' {
-            b.add(pad(t.mday, 2, '0'))
-        } else if f == 'e' {
-            b.add(pad(t.mday, 2, ' '))
-        } else if f == 'H' {
-            b.add(pad(t.hour, 2, '0'))
-        } else if f == 'k' {
-            b.add(pad(t.hour, 2, ' '))
-        } else if f == 'I' {
-            b.add(pad(if t.hour % 12 == 0 { 12 } else { t.hour % 12 }, 2, '0'))
-        } else if f == 'l' {
-            b.add(pad(if t.hour % 12 == 0 { 12 } else { t.hour % 12 }, 2, ' '))
-        } else if f == 'M' {
-            b.add(pad(t.min, 2, '0'))
-        } else if f == 'S' {
-            b.add(pad(t.sec, 2, '0'))
-        } else if f == 'j' {
-            b.add(pad(t.yday + 1, 3, '0'))
-        } else if f == 'a' {
-            b.add(DAYS[wd][..3])
-        } else if f == 'A' {
-            b.add(DAYS[wd])
-        } else if f == 'b' || f == 'h' {
-            b.add(MONTHS[mo][..3])
-        } else if f == 'B' {
-            b.add(MONTHS[mo])
-        } else if f == 'p' {
-            b.add(if t.hour < 12 { "AM" } else { "PM" })
-        } else if f == 'P' {
-            b.add(if t.hour < 12 { "am" } else { "pm" })
-        } else if f == 'Z' {
-            b.add(zone)
-        } else if f == 'z' {
-            b.add("+0000")
-        } else if f == 'u' {
-            b.addInt(if wd == 0 { 7 } else { wd })
-        } else if f == 'w' {
-            b.addInt(wd)
-        } else if f == 'y' {
-            b.add(pad((t.year + 1900) % 100, 2, '0'))
-        } else if f == 'C' {
-            b.add(pad((t.year + 1900) / 100, 2, '0'))
-        } else if f == 'D' {
-            b.add(strftime(t, "%m/%d/%y", zone))
-        } else if f == 'F' {
-            b.add(strftime(t, "%Y-%m-%d", zone))
-        } else if f == 'T' {
-            b.add(strftime(t, "%H:%M:%S", zone))
-        } else if f == 'R' {
-            b.add(strftime(t, "%H:%M", zone))
-        } else if f == 'r' {
-            b.add(strftime(t, "%I:%M:%S %p", zone))
-        } else if f == 'c' {
-            b.add(strftime(t, "%a %b %e %H:%M:%S %Y", zone))
-        } else if f == 'x' {
-            b.add(strftime(t, "%m/%d/%y", zone))
-        } else if f == 'X' {
-            b.add(strftime(t, "%H:%M:%S", zone))
-        } else if f == 's' {
-            b.addInt(timegm(t))
-        } else if f == 'n' {
-            b.addByte('\n')
-        } else if f == 't' {
-            b.addByte('\t')
-        } else if f == '%' {
-            b.addByte('%')
-        } else if f == 'U' {
-            b.add(pad((t.yday + 7 - wd) / 7, 2, '0'))
-        } else if f == 'W' {
-            b.add(pad((t.yday + 7 - (wd + 6) % 7) / 7, 2, '0'))
-        } else if f == 'V' {
-            b.add(pad(isoWeek(t).mon, 2, '0'))
-        } else if f == 'G' {
-            b.addInt(isoWeek(t).year)
-        } else if f == 'g' {
-            b.add(pad(isoWeek(t).year % 100, 2, '0'))
-        } else {
-            b.addByte('%')
-            b.addByte(f)
         }
     }
-    return b.toStr()
+    return true
 }
 
-fn matchName(s: &str, i: int, names: &[str]): int {
-    for k in 0..len(names) {
-        let full = names[k]
-        let lf = asciiCase(full, false)
-        if i + len(full) <= len(s) && asciiCase(s[i..i + len(full)], false) == lf { return k * 100 + len(full) }
-        if i + 3 <= len(s) && asciiCase(s[i..i + 3], false) == lf[..3] { return k * 100 + 3 }
-    }
-    return -1
-}
-
-fn readNum(s: &str, i: int, maxDigits: int): Option[Span] {
-    // start = the value, end = the offset after it
-    var j = i
-    var neg = false
-    if j < len(s) && (s[j] == '+' || s[j] == '-') {
-        neg = s[j] == '-'
-        j += 1
-    }
-    let st = j
-    var v = 0
-    while j < len(s) && j - st < maxDigits && isDigit(s[j]) {
-        v = v * 10 + int(s[j] - '0')
-        j += 1
-    }
-    if j == st { return None }
-    return Some(Span{start: if neg { -v } else { v }, end: j})
-}
-
-fn setWday(t: mut &Tm) {
-    let century = (1900 + t.year) / 100
-    var year = (1900 + t.year) % 100
-    if t.mon < 2 { year -= 1 }
-    var mon = t.mon - 1
-    if mon < 1 { mon += 12 }
-    let fm = (2.6f * float(mon) - 0.2f).floor()
-    var wday = (t.mday + int(fm) + year + int((float(year) / 4.0f).floor()) + int((float(century) / 4.0f).floor()) - 2 * century) % 7
-    if wday < 0 { wday += 7 }
-    t.wday = wday
-}
-
-fn setYday(t: mut &Tm) {
-    var mon = t.mon
-    let year = 1900 + t.year
-    var leap = 0
-    if t.mon > 1 && time.isLeapYear(year) { leap = 1 }
-    if mon < 0 { mon = -mon }
-    if mon > 11 { mon = mon % 12 }
-    t.yday = YDAYS[mon] + leap + t.mday - 1
-}
-
-// strptime for the common conversions (glibc's set).
-pub fn strptime(s: str, fmt: str): Result[J, str] {
-    var t = Tm{year: 0, mon: 0, mday: 0, hour: 0, min: 0, sec: 0, wday: 8, yday: 367, fsec: 0.0f}
+// Whether fmt sets a date part that jq recomputes wday and yday from. %C and
+// %j do not; %D and %F expand to conversions that do.
+fn jqFormatHasDate(fmt: str): bool {
     var i = 0
-    var f = 0
-    var ok = true
-    var haveDate = false
-    var pm = -1
-    var epoch = false
-    while f < len(fmt) && ok {
-        let c = fmt[f]
-        if c == ' ' {
-            while i < len(s) && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n') { i += 1 }
-            f += 1
-            continue
-        }
-        if c != '%' || f + 1 >= len(fmt) {
-            if i < len(s) && s[i] == c {
-                i += 1
-            } else {
-                ok = false
-            }
-            f += 1
-            continue
-        }
-        let d = fmt[f + 1]
-        f += 2
-        if d == 'Y' || d == 'm' || d == 'd' || d == 'e' || d == 'H' || d == 'M' || d == 'S' || d == 'j' || d == 'y' || d == 'I' || d == 'C' || d == 'k' || d == 'l' {
-            while i < len(s) && s[i] == ' ' { i += 1 }
-            let w = if d == 'Y' { 4 } else if d == 'j' { 3 } else { 2 }
-            match readNum(&s, i, w) {
-                Some(n) {
-                    i = n.end
-                    let v = n.start
-                    if d == 'Y' {
-                        t.year = v - 1900
-                        haveDate = true
-                    } else if d == 'm' {
-                        t.mon = v - 1
-                        haveDate = true
-                    } else if d == 'd' || d == 'e' {
-                        t.mday = v
-                        haveDate = true
-                    } else if d == 'H' || d == 'k' {
-                        t.hour = v
-                    } else if d == 'I' || d == 'l' {
-                        t.hour = v % 12
-                    } else if d == 'M' {
-                        t.min = v
-                    } else if d == 'S' {
-                        t.sec = v
-                    } else if d == 'j' {
-                        t.yday = v - 1
-                    } else if d == 'y' {
-                        t.year = if v < 69 { v + 100 } else { v }
-                        haveDate = true
-                    } else if d == 'C' {
-                        t.year = v * 100 - 1900
-                    }
-                }
-                None { ok = false }
-            }
-        } else if d == 's' {
-            match readNum(&s, i, 20) {
-                Some(n) {
-                    i = n.end
-                    t = gmtimeOf(n.start)
-                    epoch = true
-                }
-                None { ok = false }
-            }
-        } else if d == 'a' || d == 'A' {
-            let m = matchName(&s, i, &DAYS)
-            if m < 0 {
-                ok = false
-            } else {
-                t.wday = m / 100
-                i += m % 100
-            }
-        } else if d == 'b' || d == 'B' || d == 'h' {
-            let m = matchName(&s, i, &MONTHS)
-            if m < 0 {
-                ok = false
-            } else {
-                t.mon = m / 100
-                i += m % 100
-                haveDate = true
-            }
-        } else if d == 'p' {
-            if i + 2 <= len(s) && asciiCase(s[i..i + 2], true) == "AM" {
-                pm = 0
-                i += 2
-            } else if i + 2 <= len(s) && asciiCase(s[i..i + 2], true) == "PM" {
-                pm = 1
-                i += 2
-            } else {
-                ok = false
-            }
-        } else if d == 'Z' {
-            while i < len(s) && (strings_isAlpha(s[i])) { i += 1 }
-        } else if d == 'z' {
-            if i < len(s) && (s[i] == 'Z' || s[i] == 'z') {
-                i += 1
-            } else if i < len(s) && (s[i] == '+' || s[i] == '-') {
-                i += 1
-                var k = 0
-                while i < len(s) && k < 4 && (isDigit(s[i]) || s[i] == ':') {
-                    if s[i] != ':' { k += 1 }
-                    i += 1
-                }
-            } else {
-                ok = false
-            }
-        } else if d == 'T' || d == 'D' || d == 'F' || d == 'R' {
-            let sub = if d == 'T' { "%H:%M:%S" } else if d == 'D' { "%m/%d/%y" } else if d == 'F' { "%Y-%m-%d" } else { "%H:%M" }
-            let rest = sub + fmt[f..]
-            let r = try strptimeRest(s, i, rest, t)
-            return Ok(r)
-        } else if d == '%' {
-            if i < len(s) && s[i] == '%' {
-                i += 1
-            } else {
-                ok = false
-            }
-        } else if d == 'n' || d == 't' {
-            while i < len(s) && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n') { i += 1 }
-        } else {
-            ok = false
+    while i < len(fmt) {
+        let c = fmt[i]
+        i += 1
+        if c != '%' || i >= len(fmt) { continue }
+        let d = fmt[i]
+        i += 1
+        if d == 'Y' || d == 'm' || d == 'd' || d == 'e' || d == 'y' || d == 'b' || d == 'B' ||
+                d == 'h' || d == 'D' || d == 'F' {
+            return true
         }
     }
-    if !ok || (i < len(s) && !(s[i] == ' ' || s[i] == '\t' || s[i] == '\n')) {
-        return Err("date \"" + s + "\" does not match format \"" + fmt + "\"")
-    }
-    if pm == 1 { t.hour += 12 }
-    if !epoch && haveDate {
-        // glibc computes the weekday and day of the year from a full date
-        if t.mday != 0 && t.mon >= 0 && t.mon <= 11 {
-            setWday(mut &t)
-            setYday(mut &t)
+    return false
+}
+
+fn jqFormatHasEpoch(fmt: str): bool {
+    var i = 0
+    while i < len(fmt) {
+        let c = fmt[i]
+        i += 1
+        if c == '%' && i < len(fmt) {
+            if fmt[i] == 's' { return true }
+            i += 1
         }
-    } else if !epoch {
-        if t.wday == 8 && t.mday != 0 && t.mon >= 0 && t.mon <= 11 { setWday(mut &t) }
-        if t.yday == 367 && t.mday != 0 && t.mon >= 0 && t.mon <= 11 { setYday(mut &t) }
     }
+    return false
+}
+
+// strptime for jq's conversions: time.strptimePrefix parses, then this adds
+// jq's JSON-array view plus the unconsumed suffix. As in jq, trailing text is
+// allowed only when it starts with a space, tab or newline (and is returned).
+pub fn strptime(s: str, fmt: str): Result[J, str] {
+    if !jqFormatOk(fmt) { return Err(strptimeErr(s, fmt)) }
+    let p = try time.strptimePrefix(s, fmt)
+    let rest = p.rest
+    if rest < len(s) && s[rest] != ' ' && s[rest] != '\t' && s[rest] != '\n' {
+        return Err(strptimeErr(s, fmt))
+    }
+    var t = p.tm
+    // glibc fills wday and yday from any date parts, even without a year (the
+    // year is then 1900); time.strptimePrefix does so only when it has one.
+    if !jqFormatHasEpoch(fmt) && jqFormatHasDate(fmt) && t.mday != 0 && t.mon >= 0 && t.mon <= 11 {
+        let d = time.Date{year: t.year + 1900, month: t.mon + 1, day: t.mday}
+        t.wday = time.weekday(d)
+        t.yday = time.daysOfDate(d) - time.daysOfDate(time.Date{year: t.year + 1900, month: 1, day: 1})
+    }
+    // jq's sentinels for fields the format did not set
+    if t.wday < 0 { t.wday = 8 }
+    if t.yday < 0 { t.yday = 367 }
     t.fsec = float(t.sec)
     var out = tmToJson(&t)
-    if i < len(s) { out.push(json.string(s[i..])) }
+    if rest < len(s) { out.push(json.string(s[rest..])) }
     return Ok(out)
-}
-
-fn strings_isAlpha(c: byte): bool { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') }
-
-// strptime continuing at s[i] with a format that starts with an expansion.
-fn strptimeRest(s: str, i: int, fmt: str, t: Tm): Result[J, str] {
-    // parse the remainder with the expanded format, then merge the fields
-    // already set (only the date or time parts the expansion sets change)
-    let full = try strptime(s[i..], fmt)
-    var r = jsonToTm(&full).unwrap()
-    if t.year != 0 && r.year == 0 { r.year = t.year }
-    if t.mon != 0 && r.mon == 0 { r.mon = t.mon }
-    if t.mday != 0 && r.mday == 0 { r.mday = t.mday }
-    if r.mday != 0 && r.mon >= 0 && r.mon <= 11 {
-        setWday(mut &r)
-        setYday(mut &r)
-    }
-    r.fsec = float(r.sec)
-    return Ok(tmToJson(&r))
 }
 
 // ---------------------------------------------------------------- regular expressions
