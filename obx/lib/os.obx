@@ -1,5 +1,5 @@
 // os: the program's arguments and environment, the process, the working
-// directory, and stopping.
+// directory, the user database, and stopping.
 
 import "ffi"
 
@@ -21,6 +21,86 @@ pub fn arguments(): []str {
     return out
 }
 
+// ---------------------------------------------------------------- environment
+
+// One entry of the process environment.
+pub type Env = value record {
+    pub name: str
+    pub value: str
+}
+
+// A change made through setEnv/unsetEnv. /proc/self/environ shows the
+// environment the program was started with, not the one a later setenv made
+// (a new variable lives in a malloc'd array the kernel does not expose), so
+// environ() replays these changes on top of it. The log is a global str: a
+// change is 'S' name NUL value NUL, or 'R' name NUL (NUL cannot appear in an
+// environment name or value).
+var ENV_LOG: str = ""
+
+fn logSet(name: str, value: str) { ENV_LOG = ENV_LOG + "S" + name + "\0" + value + "\0" }
+fn logUnset(name: str) { ENV_LOG = ENV_LOG + "R" + name + "\0" }
+
+// The whole process environment in process order. It reads /proc/self/environ
+// (Linux) and replays the setEnv/unsetEnv changes made since the process
+// started; entries without an '=' (and with an empty name) are skipped.
+pub fn environ(): []Env {
+    var out: []Env = []
+    var text = ""
+    if readFile("/proc/self/environ", mut &text) == 0 {
+        var start = 0
+        for i in 0..len(text) + 1 {
+            if i == len(text) || text[i] == 0 {
+                if i > start {
+                    let entry = text[start..i]
+                    let eq = strFindByte(entry, 0, '=')
+                    if eq > 0 { append(mut &out, Env{name: entry[..eq], value: entry[eq + 1..]}) }
+                }
+                start = i + 1
+            }
+        }
+    }
+    var i = 0
+    while i < len(ENV_LOG) {
+        let kind = ENV_LOG[i]
+        i += 1
+        var e = i
+        while e < len(ENV_LOG) && ENV_LOG[e] != 0 { e += 1 }
+        let name = ENV_LOG[i..e]
+        i = e + 1
+        if kind == 'R' {
+            removeEnvEntry(mut &out, name)
+        } else {
+            var v = i
+            while v < len(ENV_LOG) && ENV_LOG[v] != 0 { v += 1 }
+            setEnvEntry(mut &out, name, ENV_LOG[i..v])
+            i = v + 1
+        }
+    }
+    return out
+}
+
+// Replaces name in place, or appends it (as setenv does for a new name).
+fn setEnvEntry(out: mut &[]Env, name: str, value: str) {
+    for i in 0..len(out) {
+        if out[i].name == name {
+            out[i] = Env{name: name, value: value}
+            return
+        }
+    }
+    append(mut &out, Env{name: name, value: value})
+}
+
+// Removes name, shifting the rest down (as unsetenv does).
+fn removeEnvEntry(out: mut &[]Env, name: str) {
+    var at = -1
+    for i in 0..len(out) {
+        if out[i].name == name { at = i; break }
+    }
+    if at < 0 { return }
+    for j in at..len(out) - 1 { out[j] = out[j + 1] }
+    pop(mut &out)
+}
+
 // The environment variable name, if it is set.
 pub fn env(name: str): Option[str] {
     var v = ""
@@ -38,12 +118,25 @@ pub fn envOr(name: str, d: str): str {
 // Sets an environment variable; the errno on failure.
 pub fn setEnv(name: str, value: str): Result[Unit, int] {
     if setenv(name, value, 1) != 0 { return Err(errno()) }
+    logSet(name, value)
     return Ok(Unit{})
 }
 
 pub fn unsetEnv(name: str): Result[Unit, int] {
     if unsetenv(name) != 0 { return Err(errno()) }
+    logUnset(name)
     return Ok(Unit{})
+}
+
+// The temporary directory: $TMPDIR when it is an absolute path, else /tmp.
+pub fn tempDir(): str {
+    match env("TMPDIR") {
+        Some(t) {
+            if len(t) > 0 && t[0] == '/' { return t }
+        }
+        None {}
+    }
+    return "/tmp"
 }
 
 pub fn pid(): int { return int(getpid()) }
@@ -60,16 +153,92 @@ pub fn setCwd(path: str): Result[Unit, int] {
 // dropped (and OBX_CHECK does not look for leaks).
 pub fn quit(code: int): never { exit(code) }
 
-// ---- the user
+// ---------------------------------------------------------------- the user
 
+extern "c" fn getuid(): u32
+extern "c" fn getgid(): u32
 extern "c" fn geteuid(): u32
+extern "c" fn getegid(): u32
 extern "c" fn getpwuid(uid: u32): ptr
+extern "c" fn getpwnam(name: str): ptr
+extern "c" fn getpwent(): ptr
+extern "c" fn setpwent()
+extern "c" fn endpwent()
 extern "c" fn strlen(p: ptr): int
+
+// The real user id.
+pub fn uid(): int { return int(getuid()) }
+
+// The real group id.
+pub fn gid(): int { return int(getgid()) }
+
+// The effective user id (what access checks use).
+pub fn effectiveUid(): int { return int(geteuid()) }
+
+// The effective group id.
+pub fn effectiveGid(): int { return int(getegid()) }
+
+// One entry of the user database.
+pub type User = value record {
+    pub uid: int
+    pub gid: int
+    pub name: str
+    pub home: str
+    pub shell: str
+}
 
 // The C string at p, copied ("" for NULL).
 fn cText(p: ptr): str {
     if isNull(p) { return "" }
     return ffi.bytes(p, strlen(p))
+}
+
+// Element i of a C uint32_t array (uid and gid are unsigned), as an int.
+fn cU32(p: ptr, i: int): int {
+    let v = int(ffi.peekI32(p, i))
+    if v < 0 { return v + 4294967296 }
+    return v
+}
+
+// A user from a struct passwd at p (NULL: none). The C structure is x86-64
+// glibc's: pw_name at word 0, pw_uid/pw_gid as the two 32-bit halves of word
+// 2, pw_gecos at word 3, pw_dir at word 4 and pw_shell at word 5. Fields are
+// copied at once; the entry is libc's static buffer and the next getpw* call
+// overwrites it. Every pointer is NULL-checked, so no uninitialized memory is
+// read. getpw* are not thread-safe.
+fn userOf(p: ptr): Option[User] {
+    if isNull(p) { return None }
+    return Some(User{
+        uid: cU32(p, 4),
+        gid: cU32(p, 5),
+        name: cText(ffi.peekPtr(p, 0)),
+        home: cText(ffi.peekPtr(p, 4)),
+        shell: cText(ffi.peekPtr(p, 5))})
+}
+
+// The user with id (getpwuid), if the user database has one.
+pub fn userById(id: int): Option[User] {
+    if id < 0 || id > 4294967295 { return None }
+    return userOf(getpwuid(u32(id)))
+}
+
+// The user named name (getpwnam), if the user database has one.
+pub fn userByName(name: str): Option[User] { return userOf(getpwnam(name)) }
+
+// Every user (getpwent), in the database's order.
+pub fn users(): []User {
+    var out: []User = []
+    setpwent()
+    while true {
+        let pw = getpwent()
+        if isNull(pw) { break }
+        match userOf(pw) {
+            Some(u) { append(mut &out, u) }
+            None {}
+        }
+    }
+    endpwent()
+    return out
 }
 
 // A field of the passwd entry of the effective user: the C string in word i
