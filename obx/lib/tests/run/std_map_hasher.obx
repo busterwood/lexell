@@ -1,0 +1,148 @@
+// std: Map with the default (SipHash, K.hash()) hasher and with newMapWith's
+// Fx hasher. Both must keep the same entries, order and results; the Fx
+// hashers must agree on equal keys and scatter sequential int keys.
+// expect: same size: true
+// expect: same gets: true
+// expect: same order: true
+// expect: replacement: true
+// expect: removeStable: true
+// expect: remove: true
+// expect: atOrPut: true
+// expect: order: a|c|d a|c|d d|c d|c
+// expect: clear: true
+// expect: fx equal keys: true
+// expect: int keys: true
+const N = 5000
+const NI = 10000
+
+fn keys(n: int): []str {
+    var ks: []str = []
+    for i in 0..n { append(mut &ks, "key-" + i.toStr()) }
+    return ks
+}
+
+fn joined(xs: &[]str): str {
+    var s = ""
+    for x in xs {
+        if len(s) > 0 { s += "|" }
+        s += x
+    }
+    return s
+}
+
+fn sortedKeys(m: &Map[str, int]): []str {
+    var ks = m.keys()
+    sort(mut &ks)
+    return ks
+}
+
+// newMapWith's field is fn(&K): u64, so a by-value hasher needs this adapter.
+fn fxHashIntKey(k: &int): u64 { return fxHashInt(k) }
+
+fn sameGets(a: &Map[str, int], b: &Map[str, int], ks: &[]str): bool {
+    for i in 0..len(ks) {
+        if a.getOr(&ks[i], -1) != b.getOr(&ks[i], -1) { return false }
+        if a.has(&ks[i]) != b.has(&ks[i]) { return false }
+    }
+    return true
+}
+
+fn main() {
+    let ks = keys(N)
+    var d: Map[str, int] = newMap()
+    var f: Map[str, int] = newMapWith[str, int](fxHashStr)
+    for i in 0..N {
+        d.put(ks[i], i)
+        f.put(ks[i], i)
+    }
+    println("same size: " + (d.size() == f.size() && d.size() == N).toStr())
+    println("same gets: " + sameGets(&d, &f, &ks).toStr())
+    println("same order: " + (joined(&sortedKeys(&d)) == joined(&sortedKeys(&f))).toStr())
+
+    // replacement: the old value goes away in both maps
+    var ok = true
+    for i in 0..N {
+        if i % 7 == 0 {
+            d.put(ks[i], i * 2)
+            f.put(ks[i], i * 2)
+        }
+    }
+    for i in 0..N {
+        let want = if i % 7 == 0 { i * 2 } else { i }
+        if d.getOr(&ks[i], -1) != want || f.getOr(&ks[i], -1) != want { ok = false }
+    }
+    println("replacement: " + ok.toStr())
+
+    // removeStable keeps insertion order; remove moves the tail
+    for i in 0..N {
+        if i % 3 == 0 {
+            if d.removeStable(&ks[i]).isNone() || f.removeStable(&ks[i]).isNone() { ok = false }
+        }
+    }
+    println("removeStable: " + (ok && d.size() == f.size() && sameGets(&d, &f, &ks)
+        && joined(&sortedKeys(&d)) == joined(&sortedKeys(&f))).toStr())
+
+    ok = true
+    for i in 0..N {
+        if i % 3 == 1 {
+            if d.remove(&ks[i]).isNone() || f.remove(&ks[i]).isNone() { ok = false }
+        }
+    }
+    println("remove: " + (ok && d.size() == f.size() && sameGets(&d, &f, &ks)
+        && joined(&sortedKeys(&d)) == joined(&sortedKeys(&f))).toStr())
+
+    // atOrPut over words, from empty maps (so they grow again)
+    var dc: Map[str, int] = newMap()
+    var fc: Map[str, int] = newMapWith[str, int](fxHashStr)
+    let words = split("the cat sat on the mat the ox on the box", ' ')
+    for w in words {
+        let a = dc.atOrPut(w, 0)
+        a += 1
+        let b = fc.atOrPut(w, 0)
+        b += 1
+    }
+    var okA = (dc.size() == fc.size()
+        && joined(&sortedKeys(&dc)) == joined(&sortedKeys(&fc))
+        && sameGets(&dc, &fc, &dc.keys())
+        && dc.getOr(&"the", 0) == 4 && fc.getOr(&"the", 0) == 4)
+    println("atOrPut: " + okA.toStr())
+
+    // removeStable keeps the order; remove moves the last entry into the hole
+    var od: Map[str, int] = newMap()
+    var of: Map[str, int] = newMapWith[str, int](fxHashStr)
+    for k in ["a", "b", "c", "d"] {
+        od.put(k, 1)
+        of.put(k, 1)
+    }
+    od.removeStable(&"b")
+    of.removeStable(&"b")
+    var first = joined(&od.keys()) + " " + joined(&of.keys())
+    od.remove(&"a")
+    of.remove(&"a")
+    println("order: " + first + " " + joined(&od.keys()) + " " + joined(&of.keys()))
+
+    // clear resets both, then they still work
+    d.clear()
+    f.clear()
+    var okc = d.size() == 0 && f.size() == 0 && d.get(&ks[1]).isNone() && f.get(&ks[1]).isNone()
+    d.put("again", 1)
+    f.put("again", 1)
+    println("clear: " + (okc && d.getOr(&"again", 0) == 1 && f.getOr(&"again", 0) == 1).toStr())
+
+    // equal keys hash equally; different keys do not have to
+    let a = "abc" + "def"
+    let b = "abcdef"
+    let x = 100 + 23
+    let y = 123
+    println("fx equal keys: " + (fxHashStr(&a) == fxHashStr(&b)
+        && fxHashInt(x) == fxHashInt(y)).toStr())
+
+    // sequential int keys: a weak hash would cluster and probes would explode
+    var im: Map[int, int] = newMapWith[int, int](fxHashIntKey)
+    for i in 0..NI { im.put(i, i * 3) }
+    var oki = im.size() == NI
+    for i in 0..NI {
+        if im.getOr(&i, -1) != i * 3 { oki = false }
+    }
+    println("int keys: " + oki.toStr())
+}
