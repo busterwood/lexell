@@ -23,13 +23,21 @@ for leaks.
 |---|---:|---|
 | `std.obx` | 2,026 | Option, Result, Unit, Where; Eq/Ord/Hash/Show for the primitives (keyed hashing, SipHash-1-3); print/println/eprint/eprintln; min/max; float text and math methods; StrBuf and basic string helpers; Decimal; sort; Map |
 | `money.obx` | 196 | Currency, USD/EUR/GBP/JPY/CHF, Money[C] |
-| `math.obx` | 129 | float constants, parse, fixed, toDecimal, near |
+| `math.obx` | 306 | float constants, parse, fixed, toDecimal, near, IEEE bit patterns |
 | `collections.obx` | 669 | stable sorts, searching, rearranging, copying, Set, UniqueList, Heap |
-| `strings.obx` | 672 | search, split/join, replace, trim, case, int parse/format, padding, UTF-8 |
-| `io.obx` | 365 | IoError, whole-file read/write/append, readLines, readStdin, streaming Reader, buffered Writer |
-| `fs.obx` | 270 | stat/lstat, list, mkdirAll, remove/removeAll, rename, symlink, chmod, paths |
-| `os.obx` | 59 | arguments, environment, pid, working directory, quit |
-| `time.obx` | 369 | wall and monotonic clocks, sleep, UTC dates, ISO 8601 text |
+| `strings.obx` | 1,027 | search, split/join, replace, trim, case, int parse/format, padding, UTF-8, eza's natcmp/quoteName |
+| `io.obx` | 454 | IoError, whole-file read/write/append, readLines, readStdin, streaming Reader, buffered Writer, ChunkReader/copy/count/readAll |
+| `fs.obx` | 485 | stat/lstat, list, mkdirAll, remove/removeAll, rename, symlink, chmod, paths, walk, realpath, temp/atomic write |
+| `os.obx` | 263 | arguments, environment, pid, working directory, quit, ids, user database, tempDir |
+| `time.obx` | 908 | wall and monotonic clocks, sleep, UTC dates, ISO 8601, Tm/strftime/strptime, HTTP date |
+| `fmt.obx` | 115 | number padding and eza's permission string |
+| `paths.obx` | 135 | lexical Rust Path components: join, lastComponent, parentOf, ext |
+| `cli.obx` | 451 | the eza/obo option grammar: Spec, Command, parse, structured Error |
+| `unicode.obx` | 131 | Unicode 15 classification and simple lowercasing |
+| `errors.obx` | 73 | Rust-style debugPath and osError |
+| `binary.obx` | 286 | endian reads/writes over bytes, str, and StrBuf |
+| `glob.obx` | 238 | zoxide's Rust-glob syntax with a DP matcher |
+| `base64.obx` | 107 | standard base64, strict and jq-lenient decoders |
 | `tz.obx` | 421 | time zones from TZif files (version 2+, 64-bit transitions) and their POSIX footer rules, as glibc applies them: utc, local (TZ or /etc/localtime), fromSpec, load, at, localTime; tested against zoneinfo by `tests/gen_tz.py` |
 | `sqldialect.obx` | 260 | Value, DbError and its codes, SQL fragments with placeholders per dialect, exact decimal text and (p, s) checks |
 | `ffi.obx` | 129 | C memory for modules that call C: owned `Mem` (alloc, cstr, copyBytes), unchecked peek/poke/bytes |
@@ -238,6 +246,78 @@ Slots come from the hash mixed with a per-process seed, as Map's do.
 **Heap[T: Ord]** (min-heap): `newHeap`, `push`, `pop(): Option[T]`, `peek`,
 `size`, `isEmpty`.
 
+### fmt
+
+`digits(n)` (decimal width, `digits(0) == 1`), `appendPadded(mut buf, n,
+width)`, `writePadded(w, n, width)` (through an `io.Writer`, no `Result`: the
+Writer keeps the first write error for `flush`/`close`), and
+`modeString(mode)` (eza's ten-character permission form: type, rwx triples,
+`s/S` and `t/T`; no xattr `@`). `strings.padLeft` remains the string
+primitive.
+
+### paths
+
+Lexical path primitives over bytes, Rust `Path::components` semantics:
+`isAbsolute`, `hasTrailingSlash`, `isDotName`, `lastComponent`, `parentOf`,
+`join`, and `ext` (the extension without its dot, unlike `fs.extension`,
+which keeps the dot). No filesystem, `~`, glob, shell or symlink resolution:
+`fs.realpath` is the filesystem operation.
+
+### cli
+
+The eza/obo option grammar. `Spec {short, long, arity, consume, accept,
+choices, default}` (`Arity` = `Flag`, `Value`, `Optional`), `Command {opts,
+operands}`, `Opt {short, long, value, hasValue}`, and
+`parse(args, from, specs): Result[Command, Error]`. It handles `--`,
+`--name=value`, short clusters, attached values, optional defaults and the
+`consume`/`accept` sets; values are validated after the whole token walk.
+`Error` is structured (`ErrorKind`, token, option, short, value, choices);
+the module never prints or exits, so each caller keeps its exact messages and
+exit codes.
+
+### unicode
+
+Unicode 15.0.0 classification and simple lowercasing, reusing the generated
+tables in `regex_unicode`/`markdown_unicode`: `lower`, `isLetter`, `isDigit`,
+`isSpace`, `isUpper`, `isLower`, `isPunct`, `category`. `isSpace` is the
+Unicode `White_Space` property; `isPunct` is general category P (symbols are
+not punctuation). `strings.toLower` stays ASCII to keep the tables out of
+programs that only lowercase an extension; callers that need full Unicode use
+`unicode.lower`.
+
+### errors
+
+`debugPath(p)` (Rust `Path`/`OsStr` Debug quoting: quotes, `\" \' \\ \0 \t
+\r \n`, `\u{h}` for other controls and DEL, bytes >= 0x80 copied) and
+`osError(errno)` (`io.errorText(errno)` plus `" (os error N)"`). There is one
+errno table (`io.errorText`); `errors.text` is a thin alias.
+
+### binary and math bits
+
+`binary`: `readU16/32/64LE/BE`, signed `readI16/32/64LE/BE`, the `...Str`
+variants over `&str`, `appendU16/32/64LE/BE`, in-place `setU16/32LE/BE`, and
+`addU16/32/64LE/BE` into a `StrBuf`. Reads use the language's checked index
+and trap if `at` is out of range; callers validate wire lengths. `math.bitsOf`
+/`fromBits` give the exact IEEE 754 double bit pattern as a 64-bit signed int
+(the sign bit makes it negative); `bitsOf32`/`fromBits32` and their `Int`
+forms do the same for single precision.
+
+### glob
+
+zoxide's Rust-glob syntax: `compile(pattern): Result[Pattern, Error]`,
+`Pattern.matches(path): bool`, `matchPath(pattern, path)`. `*` and `?` do not
+cross `/`, `**` as a whole component does, sets (`[abc]`, `[a-z]`, `[!abc]`,
+`[^abc]`) and `\` escapes; matching is by Unicode code point with a DP
+matcher (no recursive backtracking). grep keeps its byte-wise GNU matcher.
+
+### base64
+
+`encode(s)` (standard alphabet, padded), `decodeStrict(s): Option[str]` (the
+crypto/pgwire rules: whole groups of four, padding required) and
+`decodeLenient(s): Result[str, str]` (jq's `@base64d`: `=` ends the data,
+unpadded input accepted, a single trailing byte is an error). `crypto.base64`
+and `crypto.unbase64` delegate.
+
 ### strings
 
 `lastIndexOf`, `indexOfByte`, `count`, `equalFold`, `split(&s, sep):
@@ -256,6 +336,14 @@ its maximal subpart, as Rust's `from_utf8_lossy`), `runes`, `runeCount`,
 &buf, r)`, `fromRune`, `fromRunes`, `displayWidth(s)` and `runeWidth(r)`
 (terminal columns per unicode-width 0.1.14: wide East Asian and emoji 2,
 combining marks, format and control characters 0).
+eza's name order is here too: `natcmp`/`natcmpFold` (natord-plus-plus
+2.0.0: whitespace skipped, digit runs compared naturally, the documented
+partial Unicode lowercase table for the fold) and their aliases
+`naturalCompare`/`naturalCompareFold`. `quoteName(name, quoteSpaces)` and
+`parentPrefix(parent, quoteSpaces)` are eza's QuoteSpaces escaping;
+`isPrint`, `isBlank`, `isWordByte` are the byte predicates; `utf8Error(s):
+Option[str]` gives Rust's first-invalid-UTF-8 message and index (valid data is
+`None`).
 Splitting gives views (design/borrow-types.md): the pieces are `&str` views
 of the text, not copies and not counted, and the text is frozen while they
 live (SPEC 10, until their last use); a piece converts to `str` where one is
@@ -287,6 +375,11 @@ as `splitLines`), `seek(offset, whence: Whence): Result[int, IoError]` (`Whence`
 `Start Current End`; the new offset; `ESPIPE` for a pipe), `close(): Result`; the end is not sticky (a later read tries
 again: a growing file, a terminal), `EINTR` is retried, a file reader is
 closed when dropped. `isTerminal(fd)`, `terminalWidth(fd): Option[int]`.
+`createExclusive(path)` opens with `O_CREAT|O_EXCL`. `ChunkReader`
+(`newChunkReader`, `newChunkReaderSize(src, size)`) owns one buffer and
+exposes `fill(): int` plus `buf[0..n]`/`pos`; `copy(dst, src)`, `count(src)` and
+`readAll(src)` are the streaming helpers (one chunk-sized conversion per
+chunk).
 - **fs**: `stat`/`lstat(path): Result[Stat, IoError]` (`size mode mtime
   mtimeNs nlink uid gid ino dev blocks`, `kind() isDir() isFile() isLink()
   perm()`), `Kind` (`File Dir Link Fifo Socket CharDev BlockDev Other`,
@@ -294,8 +387,20 @@ closed when dropped. `isTerminal(fd)`, `terminalWidth(fd): Option[int]`.
   Result[[]Entry]` (`name`, `kind` from readdir, or lstat when readdir does
   not say), `listNames` (sorted), `mkdir`, `mkdirAll`, `remove`, `removeAll`
   (does not follow links), `rename`, `symlink`, `readlink`, `chmod`; paths: `join`, `baseName`, `dirName`, `extension`.
+  `walk(root, followLinks, visit)` visits the root then descendants, skips a
+  subtree when the callback returns false, tracks `dev:ino` to prevent symlink
+  cycles, and returns the first list/stat error. `createTemp(dir, prefix)`
+  returns an `io.Writer` with mode 0600; `writeAtomic(path, data)` writes a
+  temp in the same directory and renames it over `path`; `realpath(path)`
+  resolves links with the 40-link `ELOOP` limit. `Stat` keeps its existing
+  fields (no atime/ctime: the compiler imports `fs`, so changing the record
+  forces a seed reseed, and no caller needs them yet).
 - **os**: `argv()`, `arguments()`, `env(name): Option[str]`, `envOr`,
   `setEnv`, `unsetEnv`, `pid`, `cwd`, `setCwd`, `quit(code)`.
+  `environ(): []Env {name, value}` reads `/proc/self/environ` and replays
+  `setEnv`/`unsetEnv` changes; `uid`/`gid`/`effectiveUid`/`effectiveGid`;
+  `users()`, `userById`, `userByName` (`User {uid, gid, name, home, shell}`)
+  through getpw*; `tempDir()` ($TMPDIR when absolute, else /tmp).
 - **time**: `Time {sec, nsec}` (`now`, `fromNanos`, `cmp`, `eq`, `toStr`,
   `addMillis`, `millisUntil`), `unixSeconds`, `unixMillis`, `monotonicNs`,
   `sleepMs` (blocks the thread, every task with it: in tasks use
@@ -319,6 +424,13 @@ closed when dropped. `isTerminal(fd)`, `terminalWidth(fd): Option[int]`.
     `sameInstant`, `cmp` (by instant, then offset), `toStr`
     ("...+01:00"; 0 is "+00:00"), `parseOffsetDateTime` ("Z", "+HH:MM",
     "+HHMM" or "+HH").
+  - `Tm` is the C `struct tm` view (`year` since 1900, `mon` 0..11, `wday`,
+    `yday`, `fsec`): `gmtimeOf(sec)`, `timegm(t)`, `tmOf(local)`,
+    `localDateTimeOf(tm)`, `strftime(t, fmt, zoneName)`, `strftimeLocal`,
+    `strptimePrefix(s, fmt): Result[Strptime {tm, rest}]`, `strptime(s, fmt):
+    Result[Tm]`, `strptimeLocal(s, fmt): Result[LocalDateTime]`, and
+    `httpDate(sec)` (RFC 7231 IMF-fixdate, GMT). `zoneName` is the `%Z` label;
+    `%z` is `+0000`. Unknown format tokens pass through.
 
 ### ffi
 
@@ -1671,10 +1783,18 @@ them and a NUL-terminated temporary copy otherwise (freed after the call).
 - `fixed` and `toDecimal` work from the shortest decimal form of a float, not
   its exact binary value (deliberate, but unlike C's printf).
 - `fs.list` has no error for a failure in the middle of `readdir`; `Stat` has
-  no atime/ctime fields (the helper can read them); no `chown`, `utimes`,
-  `realpath`.
-- `time` is UTC only; time zones are in `tz`.
-- `strings` case mapping is ASCII only.
+  no atime/ctime fields (the helper can read them, but adding the fields
+  changes the compiler's seed); no `chown` or `utimes`.
+- `time` has civil formatting/parsing but no zone rules; time zones are in
+  `tz`. `%z` formatting is `+0000`; `strftime` takes a `%Z` label, not a zone.
+- `strings` case mapping is ASCII only; full simple lowercasing is
+  `unicode.lower` (opt-in, because it pulls the fold tables). `unicode` has no
+  full uppercase mapping.
+- `cli` is the eza/obo grammar, not GNU getopt: no unique long-prefix
+  matching, and the caller formats the messages.
+- `glob` is zoxide's Rust syntax; grep's GNU byte matcher stays in grep.
+- No general `html`/`csv`/`sh` module: jq and cmark keep their call-site
+  escaping, and `base64` is the only shared encoding module.
 - `regex`: no Unicode blocks, full case folding, `RegexSet` or
   byte-oriented matching (R3).
 - No `Deque`, no `BTreeMap`/ordered map; `Set` iterates in insertion order
