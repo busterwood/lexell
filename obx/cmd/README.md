@@ -56,8 +56,9 @@ with its output, error messages and exit codes. The header comment of each
 file lists the options, the edge cases and what is rejected (`cat -nbsET`,
 `wc -lwc`, `sort -nru`, `head -n/-c`, `tail -n/-c/-f` and `--lines`/`--bytes`;
 every other option, long ones included, is an error as in obo). Each is one
-file. Input goes through `io.Reader` in 64 KiB chunks (a small `Reader`
-wrapper in each file keeps the chunk and the unused part of it), file
+file. Input goes through `io.ChunkReader` in 64 KiB chunks (the reader keeps
+the chunk and the unused part of it; `sort` keeps its growing-buffer reader
+and `grep` its 128 KiB carry reader), file
 metadata through `fs.stat` (`tail -f` tells a file by `dev` and `ino`); no
 tool declares an `extern`, and the native builds are static with no libc.
 `tail` reads a regular file (also as standard input) backwards from its end,
