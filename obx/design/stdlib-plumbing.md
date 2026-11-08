@@ -99,15 +99,21 @@ Grammar requirements, from obo's design 5.6:
 New module. Reuse the generated data in `regex_unicode.obx` and
 `markdown_unicode.obx`; do not add a third table.
 
-- `lower(r: int): int`, `upper(r: int): int` (simple mappings; document
-  multi-character expansions if they are not handled)
-- `isLetter`, `isDigit`, `isSpace`, `isUpper`, `isLower`, `isPunct`
+Priority is what the examples actually call:
+- `lower(r: int): int` / `fold(r: int): int` for simple case folding.
+- `isLetter`, `isDigit`, `isSpace`, `isUpper`, `isLower`, `isPunct`.
 - `category(r: int): str` or a closed `Category` type if the caller needs
   more than the predicates.
+- `upper(r: int): int` only if a non-ASCII caller appears. eza's current
+  `strings.toUpper` use is ASCII; do not build a full uppercase table
+  without a caller.
 
-`strings.toLower`/`toUpper` delegate to `unicode`. `strings.naturalCompare`
-may keep eza's documented partial folding if that is what the eza goldens
-pin; the difference must be explicit.
+`regex_unicode.inClass`/`simpleFold` and `markdown_unicode.SPACE`/`PUNCT`/
+`FOLD_*` already carry the data. Importing both large modules is a binary
+size risk; prefer the smaller dependency or one shared generated module if
+the integration review agrees. `strings.toLower` delegates to `unicode`.
+`strings.naturalCompare` may keep eza's documented partial folding if that
+is what the eza goldens pin; the difference must be explicit.
 
 ### strings
 
@@ -172,10 +178,11 @@ Extend `lib/fs.obx`.
 
 Extend `lib/os.obx`.
 
-- `environ(): []Env` or `[]str` of `NAME=VALUE`, in process order.
-- `uid(): int`, `gid(): int` (real and effective if they differ; name the
-  fields so the caller chooses).
-- `User { uid, gid, name, home, shell }`
+- `Env { name: str; value: str }`; `environ(): []Env` in process order.
+- `uid(): int`, `gid(): int` for the real ids; `effectiveUid`,
+  `effectiveGid` if a caller needs them. Name the functions so the caller
+  chooses.
+- `User { uid: int; gid: int; name: str; home: str; shell: str }`
 - `userById(uid: int): Option[User]`, `userByName(name: str): Option[User]`,
   `users(): []User`
 - `tempDir(): str` - `$TMPDIR` when absolute, else `/tmp`.
