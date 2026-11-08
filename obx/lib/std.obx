@@ -719,15 +719,28 @@ pub fn (b: &StrBuf) toStr(): str { return strFromBytes(&b.bytes) }
 
 pub fn substr(s: str, from: int, to: int): str { return strSlice(s, from, to) }
 
-// The first index of sub in s at or after from, or -1.
+// The first index of sub in s at or after from, or -1. A negative from counts
+// as 0, an empty sub is found at from, and from past the end gives -1.
 pub fn indexOf(s: str, sub: str, from: int): int {
+    let start = if from < 0 { 0 } else { from }
     let n = len(sub)
     if n == 0 {
-        if from <= len(s) { return from }
+        if start <= len(s) { return start }
         return -1
     }
+    // Leave very short haystacks entirely to the scalar loop: the runtime call
+    // costs more than the scan there. For longer ones the crossover grows with
+    // the needle, because the runtime picks two needle bytes and reaches its
+    // 16-byte loop only once a whole window fits; a one-byte needle is the
+    // exception (its byte search always wins). Tuned on this tree.
+    if len(s) >= 16 {
+        if n == 1 { return strFind(s, start, sub) }
+        let rem = len(s) - start
+        let shortAt = if n <= 4 { 8 } else if n <= 7 { 2 * n + 4 } else { 3 * n + 6 }
+        if rem >= shortAt { return strFind(s, start, sub) }
+    }
     let first = strByte(sub, 0)
-    var i = from
+    var i = start
     while i + n <= len(s) {
         if strByte(s, i) == first && matchAt(s, i, sub) { return i }
         i += 1
@@ -757,11 +770,11 @@ pub fn contains(s: str, sub: str): bool { return indexOf(s, sub, 0) >= 0 }
 pub fn split(s: str, sep: byte): []str {
     var out: []str = []
     var start = 0
-    for i in 0..len(s) {
-        if strByte(s, i) == sep {
-            append(mut &out, strSlice(s, start, i))
-            start = i + 1
-        }
+    var i = strFindByte(s, start, sep)
+    while i >= 0 {
+        append(mut &out, strSlice(s, start, i))
+        start = i + 1
+        i = strFindByte(s, start, sep)
     }
     append(mut &out, strSlice(s, start, len(s)))
     return out
@@ -1867,11 +1880,73 @@ fn siftDown[T: Ord](xs: mut &[T], start: int, end: int) {
 
 // ---------------------------------------------------------------- Map
 //
+// A map's hasher is a function value in the map itself. newMap uses
+// defaultHash, which calls K.hash() (SipHash-1-3 for str: HashDoS-resistant).
+// newMapWith takes another hasher, such as fxHashStr or fxHashInt below.
+//
+// The Fx hasher (rustc-hash): rotate left 5, xor a word, multiply by the Fx
+// constant. It is fast and NOT cryptographically secure. Use it only for
+// trusted input (compiler tooling, internal tables): a Map built with it has
+// no protection against hash flooding, because an attacker can choose keys
+// that collide in the hash itself.
+//
+// fxHashStr hashes 8 bytes at a time (little-endian), then the 4-, 2- and
+// 1-byte tail. fxHashInt mixes the 64-bit value the same way.
+const FX_K: u64 = 0x517cc1b727220a95
+
+fn fxMix(h: u64, word: u64): u64 { return (h << 5 | h >> 59) ^ word }
+
+fn fxStep(h: u64, word: u64): u64 { return fxMix(h, word) *% FX_K }
+
+pub fn fxHashStr(s: &str): u64 {
+    var h: u64 = 0
+    let n = len(s)
+    let end = n - (n & 7)
+    var i = 0
+    while i < end {
+        h = fxStep(h, strWord(s, i))
+        i += 8
+    }
+    if end == n { return h }
+    // The tail bytes, in little-endian order in t's low bits.
+    var t: u64 = 0
+    if n >= 8 {
+        t = strWord(s, n - 8) >> (64 - 8 * (n & 7))
+    } else {
+        var j = 0
+        while j < n {
+            t |= u64(strByte(s, j)) << (8 * j)
+            j += 1
+        }
+    }
+    var rem = n & 7
+    if rem >= 4 {
+        h = fxStep(h, t & 0xffffffff)
+        t = t >> 32
+        rem -= 4
+    }
+    if rem >= 2 {
+        h = fxStep(h, t & 0xffff)
+        t = t >> 16
+        rem -= 2
+    }
+    if rem >= 1 { h = fxStep(h, t & 0xff) }
+    return h
+}
+
+pub fn fxHashInt(x: int): u64 { return fxStep(0, u64(x)) }
+
+// The default hasher: the key type's Hash implementation, so str keys are
+// SipHash-1-3 under the process's random key.
+fn defaultHash[K: Hash](k: &K): u64 { return k.hash() }
+
+//
 // A hash map that keeps its entries in insertion order in three parallel
 // arrays (keys, values, hashes) and finds them through an open-addressing
 // index (linear probing, at most half full). keyAt(i)/valAt(i) for i in
-// 0..size() walk the entries in insertion order; remove moves the last entry
-// into the hole, so it changes that order.
+// 0..size() walk the entries in insertion order. put appends; remove is the
+// O(1) swap-remove (the last entry moves into the hole, so the order changes);
+// removeStable shifts the tail down (O(size)) and keeps the order.
 //
 // A slot of the index is a u32: 0 when empty, else the entry number plus one
 // in its low b bits (len(index) = 2^b, and there are at most 2^(b-1) + 1
@@ -1887,13 +1962,27 @@ pub type Map[K: Eq + Hash, V] = record {
     index: []u32   // 0 or a tag and an entry number + 1; the length is a power of two, at most 2^32
     shift: int     // 64 - log2(len(index))
     seed: u64      // the process's hashSeed(): where a hash's slots are is not predictable
+    fast: bool     // true when hashFn is a supplied hasher, not the default K.hash()
+    hashFn: fn(&K): u64  // the hasher: consulted when fast; newMapWith supplies it
 }
 
 type Probe = value record { slot: int; entry: int }
 
 pub fn newMap[K: Eq + Hash, V](): Map[K, V] {
-    return Map{keys: [], vals: [], hashes: [], index: array(8, u32(0)), shift: 61, seed: hashSeed()}
+    return Map{keys: [], vals: [], hashes: [], index: array(8, u32(0)), shift: 61, seed: hashSeed(),
+        fast: false, hashFn: defaultHash[K]}
 }
+
+// A Map that hashes keys with hashFn instead of K.hash(). Use it for trusted
+// input only: fxHashStr and fxHashInt are fast but not collision resistant.
+pub fn newMapWith[K: Eq + Hash, V](hashFn: fn(&K): u64): Map[K, V] {
+    return Map{keys: [], vals: [], hashes: [], index: array(8, u32(0)), shift: 61, seed: hashSeed(),
+        fast: true, hashFn: hashFn}
+}
+
+// The hash of a key at a call site: the supplied hasher, or K.hash() on the
+// default path (direct, so a default Map pays one predictable branch). Written
+// out at each site: a helper function would add a call around every hash.
 
 // The mixed hash: (h ^ seed) * GOLDEN (Fibonacci hashing). Its top bits are the first slot.
 // With the seed, keys whose hashes are known (the integers') still land in unknown slots.
@@ -1925,30 +2014,37 @@ fn (m: &Map[K, V]) find(k: &K, h: u64): Probe {
 
 pub fn (m: &Map[K, V]) size(): int { return len(m.keys) }
 
-pub fn (m: &Map[K, V]) has(k: &K): bool { return m.find(k, k.hash()).entry >= 0 }
+pub fn (m: &Map[K, V]) has(k: &K): bool {
+    let h = if m.fast { m.hashFn(k) } else { k.hash() }
+    return m.find(k, h).entry >= 0
+}
 
 pub fn (m: &Map[K, V: copy]) get(k: &K): Option[V] {
-    let p = m.find(k, k.hash())
+    let h = if m.fast { m.hashFn(k) } else { k.hash() }
+    let p = m.find(k, h)
     if p.entry < 0 { return None }
     return Some(m.vals[p.entry])
 }
 
 pub fn (m: &Map[K, V: copy]) getOr(k: &K, d: V): V {
-    let p = m.find(k, k.hash())
+    let h = if m.fast { m.hashFn(k) } else { k.hash() }
+    let p = m.find(k, h)
     if p.entry < 0 { return d }
     return m.vals[p.entry]
 }
 
 // The value stored under k, borrowed from the map; stops the program if absent.
 pub fn (m: &Map[K, V]) at(k: K): &V {
-    let p = m.find(&k, k.hash())
+    let h = if m.fast { m.hashFn(&k) } else { k.hash() }
+    let p = m.find(&k, h)
     if p.entry < 0 { panic("Map.at: no such key") }
     return &m.vals[p.entry]
 }
 
 // The value stored under k, mutably borrowed; stops the program if absent.
 pub fn (m: mut &Map[K, V]) atMut(k: K): mut &V {
-    let p = m.find(&k, k.hash())
+    let h = if m.fast { m.hashFn(&k) } else { k.hash() }
+    let p = m.find(&k, h)
     if p.entry < 0 { panic("Map.atMut: no such key") }
     return mut &m.vals[p.entry]
 }
@@ -1956,10 +2052,14 @@ pub fn (m: mut &Map[K, V]) atMut(k: K): mut &V {
 // The value under k, mutably borrowed, after storing d there if k was
 // absent: `let n = counts.atOrPut(word, 0); n += 1`.
 pub fn (m: mut &Map[K, V]) atOrPut(k: K, d: V): mut &V {
-    let h = k.hash()
+    let h = if m.fast { m.hashFn(&k) } else { k.hash() }
     let p = m.find(&k, h)
     if p.entry >= 0 { return mut &m.vals[p.entry] }
-    m.put(k, d)
+    m.index[p.slot] = m.tagOf(m.mix(h)) | u32(len(m.keys) + 1)
+    append(mut &m.keys, k)
+    append(mut &m.vals, d)
+    append(mut &m.hashes, h)
+    if 2 * len(m.keys) > len(m.index) { m.grow() }
     return mut &m.vals[len(m.vals) - 1]
 }
 
@@ -2015,7 +2115,7 @@ pub fn (m: &Map[K, V: copy]) values(): []V {
 
 // Stores v under k, replacing (and dropping) an older value.
 pub fn (m: mut &Map[K, V]) put(k: K, v: V) {
-    let h = k.hash()
+    let h = if m.fast { m.hashFn(&k) } else { k.hash() }
     let p = m.find(&k, h)
     if p.entry >= 0 {
         replace(mut &m.vals[p.entry], v)
@@ -2028,9 +2128,12 @@ pub fn (m: mut &Map[K, V]) put(k: K, v: V) {
     if 2 * len(m.keys) > len(m.index) { m.grow() }
 }
 
-// Removes k and returns its value, if it was there.
+// Removes k and returns its value, if it was there, in O(1): the last entry
+// moves into the hole, so the insertion order of the remaining entries
+// changes. removeStable keeps that order at O(size).
 pub fn (m: mut &Map[K, V]) remove(k: &K): Option[V] {
-    let p = m.find(k, k.hash())
+    let h = if m.fast { m.hashFn(k) } else { k.hash() }
+    let p = m.find(k, h)
     if p.entry < 0 { return None }
     m.unlink(p.slot)
     let last = len(m.keys) - 1
@@ -2045,6 +2148,46 @@ pub fn (m: mut &Map[K, V]) remove(k: &K): Option[V] {
     pop(mut &m.keys)
     pop(mut &m.hashes)
     return Some(pop(mut &m.vals))
+}
+
+// Removes k and returns its value, if it was there. The remaining entries keep
+// their insertion order: the tail shifts down, so this costs O(size); use
+// remove when the order does not matter.
+pub fn (m: mut &Map[K, V]) removeStable(k: &K): Option[V] {
+    let h = if m.fast { m.hashFn(k) } else { k.hash() }
+    let p = m.find(k, h)
+    if p.entry < 0 { return None }
+    m.unlink(p.slot)
+    let last = len(m.keys) - 1
+    var i = p.entry
+    while i < last {
+        swap(mut &m.keys, i, i + 1)
+        swap(mut &m.vals, i, i + 1)
+        swap(mut &m.hashes, i, i + 1)
+        i += 1
+    }
+    pop(mut &m.keys)
+    pop(mut &m.hashes)
+    let v = pop(mut &m.vals)
+    // Removing the last entry shifts nothing, so no slot changed its entry
+    // number; a middle removal decrements the numbers of the entries that
+    // shifted. That is one pass over the index with no rehash.
+    if p.entry != last { m.shiftEntries(p.entry) }
+    return Some(v)
+}
+
+// Entry e was removed and the tail shifted down by one: every index slot that
+// named an entry after e now names one less. The tags stay; only the low
+// entry+1 field changes. O(len(index)), no hashing.
+fn (m: mut &Map[K, V]) shiftEntries(e: int) {
+    let low = u32(len(m.index) - 1)
+    let cut = u32(e + 1)
+    for i in 0..len(m.index) {
+        let s = m.index[i]
+        if s == 0 { continue }
+        let num = s & low
+        if num > cut { m.index[i] = (s & ~low) | (num - 1) }
+    }
 }
 
 pub fn (m: mut &Map[K, V]) clear() {

@@ -2647,3 +2647,42 @@ Final native sizes: zoxide 335,096 bytes (330,976 before, +1.2%); eza
 module and the rest is the other moves plus static linking). The `cli`
 grammar is compiled in whole once `parse` is referenced; the parser itself
 runs once per process, so the size cost has no runtime counterpart.
+
+### String search, UUIDs and the Map hasher (2026-11-08)
+
+The runtime has carried SIMD byte and substring search since the regex work
+(`strFindByte` over memchr, `strFindAny` over SSE2, `strFind` over memchr plus
+a two-byte prefilter), but the public API did not use it. `std.indexOf`,
+`std.split(byte)`, `strings.indexOfByte` and `strings.count` now delegate to
+the builtins, with a scalar path for short haystacks where a call costs more
+than a scan; `strings.indexOfAny` exposes the memchr2/3 primitive and
+`lastIndexOfByte` the reverse byte scan. On a 50 MB file (3 passes,
+instructions): an absent byte 1.66B -> 61M, an absent substring 3.31B -> 103M,
+`count("omega")` 3.90B -> 411M, a newline split 1.74B -> 186M. A negative
+`from` now clamps to 0 instead of trapping.
+
+`uuid` is RFC 9562: a two-int value record, parse (canonical and bare hex),
+lowercase canonical formatting, bytes, nil/max, version/variant, and v4, v5
+(SHA-1) and v7 (48-bit Unix milliseconds) generation. Generation uses
+`crypto` and therefore links libcrypto; parsing and formatting do not.
+`v4From`/`v7At` take fixed bytes so the layout is tested deterministically,
+and the RFC DNS v5 vector is pinned.
+
+The hash-table review found one real API bug: `Map` promised insertion-order
+iteration, but `remove` was a swap-remove (the last entry moved into the hole).
+`remove` stays O(1) and is now documented as changing the order; a new
+`removeStable` shifts the tail down and keeps it (O(size)), and `Set` has the
+same pair. Making `remove` itself order-preserving was measured first and
+rejected: removing 10,000 entries one at a time went from 9.6M to 22.0B
+instructions (5 ms to 1.3 s).
+
+`Map` also gained an opt-in hasher: `newMapWith(hashFn)` takes a `fn(&K): u64`,
+and `fxHashStr`/`fxHashInt` implement rustc-hash's Fx scheme. Over 500k string
+keys (put+get), the default map costs 0.9% more instructions than before (the
+predictable `fast` branch and the function field), while the Fx map is 20%
+cheaper; for `int` keys the default is already a single multiply, so the Fx
+map is slower. The default stays SipHash-1-3, because an Fx map is not
+protected against hash flooding; the module documents that it is for trusted
+input only. `compiler/seed/obxc.c` was reseeded for the Map layout and the
+library line shifts; the quick and full gates, the 292 library tests, and the
+coreutils/grep, zoxide, jq, eza, markdown and HTTP suites all pass.

@@ -1,0 +1,231 @@
+// std/strings: the SIMD-backed search builtins behind the public API, checked
+// against scalar reference implementations. A negative from counts as 0.
+// expect: ref indexOf 0/1530
+// expect: ref indexOfByte 0/630
+// expect: ref count 0/144
+// expect: ref indexOfAny 0/360
+// expect: ref split 0/27
+// expect: clamp -1 1 0 2 -1
+// expect: empty 0 2 3 0 -1
+// expect: short 13 13 33 -1
+// expect: repeat 2 1 2
+// expect: any 2 1 1 -1 -1
+// expect: last -1 0 3 2 -1 3
+// expect: split [a|b||c] [] [|] [a|] [|a]
+import "strings"
+
+fn refIndexOf(s: str, sub: str, from: int): int {
+    let start = if from < 0 { 0 } else { from }
+    let n = len(sub)
+    if n == 0 {
+        if start <= len(s) { return start }
+        return -1
+    }
+    var i = start
+    while i + n <= len(s) {
+        var ok = true
+        for j in 0..n {
+            if strByte(s, i + j) != strByte(sub, j) {
+                ok = false
+                break
+            }
+        }
+        if ok { return i }
+        i += 1
+    }
+    return -1
+}
+
+fn refIndexOfByte(s: str, c: byte, from: int): int {
+    let start = if from < 0 { 0 } else { from }
+    for i in start..len(s) {
+        if strByte(s, i) == c { return i }
+    }
+    return -1
+}
+
+fn refIndexOfAny(s: str, set: str, from: int): int {
+    let start = if from < 0 { 0 } else { from }
+    for i in start..len(s) {
+        for j in 0..len(set) {
+            if strByte(s, i) == strByte(set, j) { return i }
+        }
+    }
+    return -1
+}
+
+fn refCount(s: str, sub: str): int {
+    var n = 0
+    var from = 0
+    while from <= len(s) {
+        let i = refIndexOf(s, sub, from)
+        if i < 0 { break }
+        n += 1
+        from = i + len(sub)
+    }
+    return n
+}
+
+fn refLastIndexOfByte(s: str, c: byte): int {
+    var i = len(s) - 1
+    while i >= 0 {
+        if strByte(s, i) == c { return i }
+        i -= 1
+    }
+    return -1
+}
+
+fn refSplit(s: str, sep: byte): []str {
+    var out: []str = []
+    var start = 0
+    for i in 0..len(s) {
+        if strByte(s, i) == sep {
+            append(mut &out, strSlice(s, start, i))
+            start = i + 1
+        }
+    }
+    append(mut &out, strSlice(s, start, len(s)))
+    return out
+}
+
+fn show(xs: &[]str, sep: str): str { return "[" + strings.join(xs, sep) + "]" }
+
+fn main() {
+    // A 40-byte haystack sits just above the scalar/SIMD threshold.
+    let h40 = "0123456789abcdefghij0123456789abcdefghij"
+    let hay = [
+        "", "a", "abc", "abcabc", "aaaa", "x\nz", "\x80\x81\x82",
+        "the quick brown fox jumps over the lazy dog", h40,
+    ]
+    let needles = [
+        "", "a", "b", "ab", "abc", "bc", "abcabc", "z", "x", "\n",
+        "\x80", "\x81\x82", "nope", "quick", "dog", "lazy",
+        "0123456789abcdefghij0123456789abcdefghijx",
+    ]
+
+    // indexOf: every haystack/needle/from combination against the reference.
+    var iBad = 0
+    var iAll = 0
+    for h in hay {
+        let froms = [-3, -1, 0, 1, 2, 3, len(h) / 2, len(h) - 1, len(h), len(h) + 1]
+        for sub in needles {
+            for f in froms {
+                let got = indexOf(h, sub, f)
+                let want = refIndexOf(h, sub, f)
+                iAll += 1
+                if got != want { iBad += 1 }
+            }
+        }
+    }
+    println("ref indexOf " + iBad.toStr() + "/" + iAll.toStr())
+
+    // indexOfByte, including high bytes and NUL.
+    let bytes = ['a', 'b', '\n', byte(0), byte(0x80), byte(0x81), 'z']
+    var bBad = 0
+    var bAll = 0
+    for h in hay {
+        let froms = [-3, -1, 0, 1, 2, 3, len(h) / 2, len(h) - 1, len(h), len(h) + 1]
+        for c in bytes {
+            for f in froms {
+                let got = strings.indexOfByte(h, c, f)
+                let want = refIndexOfByte(h, c, f)
+                bAll += 1
+                if got != want { bBad += 1 }
+            }
+        }
+    }
+    println("ref indexOfByte " + bBad.toStr() + "/" + bAll.toStr())
+
+    // count: non-overlapping, compared with the scalar reference.
+    var cBad = 0
+    var cAll = 0
+    for h in hay {
+        for sub in needles {
+            if len(sub) > 0 {
+                let got = strings.count(h, sub)
+                let want = refCount(h, sub)
+                cAll += 1
+                if got != want { cBad += 1 }
+            }
+        }
+    }
+    println("ref count " + cBad.toStr() + "/" + cAll.toStr())
+
+    // indexOfAny: 1, 2, 4 bytes (SIMD lanes) and 16 bytes (table path).
+    let sets = ["q", "q\n", "q\n\x80z", "\xf0\xf1\xf2\xf3\xf4\xf5\xf6\xf7\xf8\xf9\xfa\xfb\xfc\xfd\xfe\xff"]
+    var aBad = 0
+    var aAll = 0
+    for h in hay {
+        let froms = [-3, -1, 0, 1, 2, 3, len(h) / 2, len(h) - 1, len(h), len(h) + 1]
+        for set in sets {
+            for f in froms {
+                let got = strings.indexOfAny(h, set, f)
+                let want = refIndexOfAny(h, set, f)
+                aAll += 1
+                if got != want { aBad += 1 }
+            }
+        }
+    }
+    println("ref indexOfAny " + aBad.toStr() + "/" + aAll.toStr())
+
+    // split at a byte against the scalar reference.
+    let seps = [byte(44), byte(10), byte(0x80)]
+    var sBad = 0
+    var sAll = 0
+    for h in hay {
+        for sep in seps {
+            let got = split(h, sep)
+            let want = refSplit(h, sep)
+            sAll += 1
+            if len(got) != len(want) {
+                sBad += 1
+            } else {
+                var same = true
+                for k in 0..len(got) {
+                    if got[k] != want[k] { same = false }
+                }
+                if !same { sBad += 1 }
+            }
+        }
+    }
+    println("ref split " + sBad.toStr() + "/" + sAll.toStr())
+
+    // Pinned behavior: a negative from counts as 0; an empty needle is found
+    // at (clamped) from; from past the end gives -1.
+    println("clamp " + indexOf("abc", "z", -7).toStr() + " " +
+        indexOf("abcabc", "bc", -5).toStr() + " " +
+        strings.indexOfByte("abc", 'a', -2).toStr() + " " +
+        strings.indexOfAny("abc", "c", -2).toStr() + " " +
+        strings.indexOfByte("abc", 'a', 9).toStr())
+    println("empty " + indexOf("abc", "", 0).toStr() + " " + indexOf("abc", "", 2).toStr() + " " +
+        indexOf("abc", "", 3).toStr() + " " + indexOf("abc", "", -2).toStr() + " " +
+        indexOf("abc", "", 4).toStr())
+
+    // The 40-byte haystack takes the SIMD path for these from values.
+    println("short " + indexOf(h40, "def", 0).toStr() + " " + indexOf(h40, "def", 13).toStr() + " " +
+        indexOf(h40, "def", 14).toStr() + " " + indexOf(h40, "def", len(h40)).toStr())
+
+    // Repeated bytes: indexOf finds the first, count counts non-overlapping.
+    println("repeat " + strings.count("aaaa", "aa").toStr() + " " + strings.count("aaa", "aa").toStr() +
+        " " + strings.count("aaaaa", "aa").toStr())
+
+    // indexOfAny: 1, 2, 4 and many bytes; empty set -> -1.
+    println("any " + strings.indexOfAny("abc", "c", 0).toStr() + " " +
+        strings.indexOfAny("abc", "cb", 0).toStr() + " " +
+        strings.indexOfAny("abc", "xbyc", 0).toStr() + " " +
+        strings.indexOfAny("\x80\x81\x82", "\xf0\xf1\xf2\xf3\xf4", 0).toStr() + " " +
+        strings.indexOfAny("abc", "", 0).toStr())
+
+    // lastIndexOfByte: absent, at 0, in the middle, at the end.
+    println("last " + strings.lastIndexOfByte("abc", 'z').toStr() + " " +
+        strings.lastIndexOfByte("abc", 'a').toStr() + " " +
+        strings.lastIndexOfByte("abca", 'a').toStr() + " " +
+        strings.lastIndexOfByte("abc", 'c').toStr() + " " +
+        strings.lastIndexOfByte("", 'a').toStr() + " " +
+        strings.lastIndexOfByte("x\nz\n", '\n').toStr())
+
+    // split keeps trailing and empty pieces.
+    println("split " + show(&split("a,b,,c", ','), "|") + " " + show(&split("", ','), "|") + " " +
+        show(&split(",", ','), "|") + " " + show(&split("a,", ','), "|") + " " +
+        show(&split(",a", ','), "|"))
+}

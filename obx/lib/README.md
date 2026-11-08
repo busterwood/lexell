@@ -21,11 +21,11 @@ for leaks.
 
 | Module | Lines | Contents |
 |---|---:|---|
-| `std.obx` | 2,026 | Option, Result, Unit, Where; Eq/Ord/Hash/Show for the primitives (keyed hashing, SipHash-1-3); print/println/eprint/eprintln; min/max; float text and math methods; StrBuf and basic string helpers; Decimal; sort; Map |
+| `std.obx` | 2,257 | Option, Result, Unit, Where; Eq/Ord/Hash/Show for the primitives (keyed hashing, SipHash-1-3); print/println/eprint/eprintln; min/max; float text and math methods; StrBuf and basic string helpers; Decimal; sort; Map (default SipHash, opt-in Fx hasher) |
 | `money.obx` | 196 | Currency, USD/EUR/GBP/JPY/CHF, Money[C] |
 | `math.obx` | 306 | float constants, parse, fixed, toDecimal, near, IEEE bit patterns |
-| `collections.obx` | 669 | stable sorts, searching, rearranging, copying, Set, UniqueList, Heap |
-| `strings.obx` | 1,027 | search, split/join, replace, trim, case, int parse/format, padding, UTF-8, eza's natcmp/quoteName |
+| `collections.obx` | 675 | stable sorts, searching, rearranging, copying, Set, UniqueList, Heap |
+| `strings.obx` | 1,047 | SIMD-backed search (indexOf/indexOfAny/count), split/join, replace, trim, case, int parse/format, padding, UTF-8, eza's natcmp/quoteName |
 | `io.obx` | 454 | IoError, whole-file read/write/append, readLines, readStdin, streaming Reader, buffered Writer, ChunkReader/copy/count/readAll |
 | `fs.obx` | 485 | stat/lstat, list, mkdirAll, remove/removeAll, rename, symlink, chmod, paths, walk, realpath, temp/atomic write |
 | `os.obx` | 263 | arguments, environment, pid, working directory, quit, ids, user database, tempDir |
@@ -38,6 +38,7 @@ for leaks.
 | `binary.obx` | 286 | endian reads/writes over bytes, str, and StrBuf |
 | `glob.obx` | 238 | zoxide's Rust-glob syntax with a DP matcher |
 | `base64.obx` | 107 | standard base64, strict and jq-lenient decoders |
+| `uuid.obx` | 260 | RFC 9562 UUIDs: parse/format, v4/v5/v7, bytes, version/variant |
 | `tz.obx` | 421 | time zones from TZif files (version 2+, 64-bit transitions) and their POSIX footer rules, as glibc applies them: utc, local (TZ or /etc/localtime), fromSpec, load, at, localTime; tested against zoneinfo by `tests/gen_tz.py` |
 | `sqldialect.obx` | 260 | Value, DbError and its codes, SQL fragments with placeholders per dialect, exact decimal text and (p, s) checks |
 | `ffi.obx` | 129 | C memory for modules that call C: owned `Mem` (alloc, cstr, copyBytes), unchecked peek/poke/bytes |
@@ -147,10 +148,17 @@ for leaks.
 - **Map[K: Eq + Hash, V]**: insertion-ordered entries plus an open-addressing
   index. `newMap`, `size`, `has(&k)`, `get(&k): Option[V]` and `getOr(&k, d)`
   (V: copy), `at(k): &V`, `atMut(k): mut &V`, `atOrPut(k, d): mut &V`,
-  `put(k, v)`, `remove(&k): Option[V]`, `clear`, `keyAt(i)`, `valAt(i)`,
+  `put(k, v)`, `remove(&k): Option[V]`, `removeStable(&k): Option[V]`,
+  `clear`, `keyAt(i)`, `valAt(i)`,
   `valAtMut(i)` for walking, `each(fn(k, v) {...})` and `eachMut(fn(k, v)
   {...})` (v is `mut &V`) in insertion order, `keys()`/`values()` (copy
-  types). `remove` moves the last entry into the hole. Slots come from
+  types). `remove` is O(1) and moves the last entry into the hole, so it
+  changes the iteration order; `removeStable` shifts the tail down and keeps
+  it, at O(size). `newMapWith[K, V](hashFn)` takes a supplied `fn(&K): u64`
+  instead of `K.hash()`; `fxHashStr` and `fxHashInt` are the rustc-hash Fx
+  scheme. They are fast but **not** collision-resistant: use them only for
+  trusted input, and keep the default `newMap` for network-controlled keys.
+  Slots come from
   `(hash ^ seed) * GOLDEN` (the seed per process, above); the index is an
   array of u32 slots, each an entry number with some bits of that mixed hash
   beside it, so a probe passes other keys' slots without loading them. A Map
@@ -230,7 +238,8 @@ insertion point), `lowerBound`, `upperBound`, `find`, `findBy`, `contains`,
 `removeAt(xs, i): T`, `swapRemove`, `retain(xs, pred)`, `dedup`,
 `copyRange(xs, a, b)`, `copyOf`, `extend`, `filter`, `mapTo`.
 **Set[T: Eq + Hash]** (a Map to Unit): `newSet`, `setOf(&xs)`, `size`,
-`isEmpty`, `has`, `add(x): bool`, `remove(&x): bool`, `clear`, `at(i)`,
+`isEmpty`, `has`, `add(x): bool`, `remove(&x): bool` (O(1), order changes),
+`removeStable(&x): bool` (O(size), order kept), `clear`, `at(i)`,
 `each(f)`, `filter(pred): Set[T]`, `items()`, `sorted()`, `union`,
 `intersect`, `minus`, `isSubset`, `eq`.
 **UniqueList[T: Eq + Hash]** is a list of unique elements in insertion order, a port of
@@ -317,6 +326,18 @@ backtracking), and a pattern of plain literals compiles to a direct string
 compare. grep keeps its byte-wise GNU matcher.
 
 ### base64
+### uuid
+
+RFC 9562 identifiers as a two-int value record (`hi`, `lo`), so a Uuid is a
+copy type: a Map key, a sort value, and compared with `eq`/`cmp`/`hash`.
+`parse` accepts the canonical 36-character form or bare 32 hex digits, either
+case; `toStr` writes lowercase canonical. `fromBytes`/`bytes` convert exactly
+16 bytes. `nil`, `max`, `isNil`, `version` and `variant` (0 NCS, 2 RFC,
+6 Microsoft, 7 future) are plain code. `v4` (random), `v5` (SHA-1 name-based)
+and `v7` (48-bit Unix milliseconds + random, RFC 9562 layout) use `crypto`,
+so a program that generates them links libcrypto; `v4From`/`v7At` take fixed
+bytes for tests.
+
 
 `encode(s)` (standard alphabet, padded), `decodeStrict(s): Option[str]` (the
 crypto/pgwire rules: whole groups of four, padding required) and
@@ -326,7 +347,15 @@ and `crypto.unbase64` delegate.
 
 ### strings
 
-`lastIndexOf`, `indexOfByte`, `count`, `equalFold`, `split(&s, sep):
+Searching walks the runtime's SIMD builtins: `indexOf`/`trim`/`count`/`split`
+use `strFind` (memmem) and `strFindAny` (memchr2/3) for long haystacks, with
+a scalar path for short strings where a call does not pay. On a 50 MB file
+that is 27x to 32x fewer instructions for absent-byte and absent-substring
+scans, 9.5x for `count`, and 9.3x for a byte `split`. A negative `from`
+clamps to 0 (it used to trap).
+
+`lastIndexOf`, `lastIndexOfByte`, `indexOfByte`, `indexOfAny(s, byteSet, from)`,
+`count`, `equalFold`, `split(&s, sep):
 []&str`, `splitN(&s, sep, n)` (n < 0: all), `fields(&s): []&str`, `cut(&s,
 sep): Option[Cut]` (`before` and `after` are views), `owned(&pieces): []str`,
 `lines(&text)` and `fieldsIter(&text)`, `join(&parts, sep)` (parts:
