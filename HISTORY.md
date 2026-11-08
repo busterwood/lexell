@@ -2686,3 +2686,17 @@ protected against hash flooding; the module documents that it is for trusted
 input only. `compiler/seed/obxc.c` was reseeded for the Map layout and the
 library line shifts; the quick and full gates, the 292 library tests, and the
 coreutils/grep, zoxide, jq, eza, markdown and HTTP suites all pass.
+
+### The compiler's internal tables use FxHash (2026-11-08)
+
+The compiler's string-keyed maps (module/type/symbol tables, the lowering
+scopes, emit's instance and string tables, and x64gen's runtime/import/stub
+tables) now use `newMapWith(fxHashStr)`; int-keyed maps keep the default hash,
+which is one multiply and faster than Fx for ints. The generated output is
+byte-identical (checked on a jq ELF, cmark's C and the compiler's own C).
+`perfsuite.py main compiler-fast-hash` gives a compile suite of -2.21%
+instructions and -3.37% cycles (geometric mean) with the run suite at 0.00%;
+compiling jq is -1.45%, the compiler's self-build -2.0%. Fx is not collision
+resistant; source text is not treated as a security boundary, and the tradeoff
+is documented at the top of compiler/main.obx. The compiler seed was reseeded
+for the source change.

@@ -17,10 +17,10 @@ performance comparison is not part of this report: it is in
 
 This page is the current state: the measured tables and what they say about
 the code today, against external references and in absolute terms. The
-figures for the benchmark, compile-time, application-suite, compiler, eza
-and binary-size tables are from 8 November 2026 at `93b295c5`; the grep, jq
-large-input, Markdown, Decimal, HTTP, TLS and database tables are from
-earlier sweeps and say so. Three references could not be re-run in this environment: the jq
+figures for the benchmark, application-suite, eza and binary-size tables are
+from 8 November 2026 at `93b295c5`; the compile-time and compiler tables are
+from the Fx-hash compiler at `5bfa9856`; the grep, jq large-input, Markdown,
+Decimal, HTTP, TLS and database tables are from earlier sweeps and say so. Three references could not be re-run in this environment: the jq
 1.7.1 column, the cmark column of the Markdown table, and the Go and Node
 columns of the HTTP tables.
 
@@ -199,18 +199,18 @@ binary with nine subcommands, and cargo measures its own build system.
 
 | what | obx | Rust | C |
 |---|---:|---:|---:|
-| hello, compile | 13.9 ms | 152.2 ms | 64.2 ms |
+| hello, compile | 12.7 ms | 154.1 ms | 61.0 ms |
 | hello, binary | 16 KB | 357 KB (stripped) | 16 KB |
-| nine benchmark programs, clean compile | 122.6 ms | 2.23 s | - |
+| nine benchmark programs, clean compile | 124.1 ms | 2.23 s | - |
 | nine benchmark programs, binaries | 172 KB | 443 KB | - |
-| compiler self-build (`--native`) | 659 ms | over 30 min* | - |
+| compiler self-build (`--native`) | 651 ms | over 30 min* | - |
 | compiler, binary + libraries | 2.9 MB (static) | 316.0 MB | - |
 | compiler toolchain, bin + lib | 2.9 MB | 559.9 MB (1.3 GB installed) | - |
 
 The compiler is 39,436 lines of obx (28,348 hand-written) and builds itself
-in 0.66 s; its binary is 2.9 MB and needs no libc. A hello world compiles in
-14 ms to 16 KB, against Rust's 152 ms and 357 KB (stripped) and gcc's 64 ms
-and 16 KB. The nine benchmark programs compile in 123 ms with obx; the Rust
+in 0.65 s; its binary is 2.9 MB and needs no libc. A hello world compiles in
+13 ms to 16 KB, against Rust's 154 ms and 357 KB (stripped) and gcc's 61 ms
+and 16 KB. The nine benchmark programs compile in 124 ms with obx; the Rust
 suite takes 2.23 s. Rust's figures include std and the cargo build system;
 obx links its own freestanding runtime.
 
@@ -465,18 +465,23 @@ best of 11:
 
 | | obx build |
 |---|---:|
-| self-build to an executable (`--native`) | 676 ms |
-| self-build to C (`--emit-c`) | 501 ms |
+| self-build to an executable (`--native`) | 704 ms |
+| self-build to C (`--emit-c`) | 475 ms |
 | compiler binary | 3,068,457 bytes (static, no libc) |
 
 The compiler is 39,436 lines of obx (1.78 MB, 706 KB of it the generated
 runtime tables `rt.obx` and `rtx.obx`; 28,348 hand-written lines) and 5,634
 lines of C runtime (the C backend's `rt.h` and the native backend's
-freestanding `rt.c`). The obx-built compiler runs 5,080M instructions on
-`--native`; the previous commit ran 5,067M (+0.26% for the Map hasher field
-and the string-search change), and the 7 November figure was 5,009M. Cycles
-move with the host. Absolute times move with the host; the instruction counts
-are the stable comparison. The gcc-built comparison is in
+freestanding `rt.c`). The obx-built compiler runs 4,981M instructions on
+`--native`; the commit before the compiler's Fx string hash ran 5,080M
+(−1.9%). Cycles move with the host. Absolute times move with the host; the
+instruction counts are the stable comparison. The compiler's string-keyed
+internal tables (`modIndex`, `tindex`, the lowering scopes and the emit and
+x64gen symbol tables) use `newMapWith(fxHashStr)`; int-keyed tables keep the
+default hash, which is one multiply. The `perfsuite.py main
+compiler-fast-hash` comparison gives a compile suite of −2.21% instructions
+and −3.37% cycles (geometric mean) with the run suite at 0.00%, and the
+generated output is byte-identical. The gcc-built comparison is in
 [design/native-vs-c.md](obx/design/native-vs-c.md).
 
 - What is left is spread thin: it is in the mix (register-to-register moves,
