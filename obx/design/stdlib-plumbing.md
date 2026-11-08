@@ -66,13 +66,21 @@ a later lexical addition. `fs.join` may delegate to `paths.join`.
 Port the grammar of `archive/obo/lib/cli.obx` (411 lines), not its eza
 message text.
 
-- `Spec { short: byte; long: str; arity: Arity }`
+- `Spec { short: byte; long: str; arity: Arity; consume: []str; accept: []str; choices: []str; default: str }`.
+  `short` is 0 for no short form. `consume` lists the next-token values an
+  `Optional` may consume; `accept` is the allowed value set (empty = any);
+  `choices` is help/error text only; `default` is the value of a bare
+  `Optional`.
 - `Arity` = `Flag`, `Value`, `Optional` (closed variant or equivalent).
 - `Command { opts: []Opt; operands: []str }`
-- `Opt { long: str; value: str }`
+- `Opt { short: byte; long: str; value: str; hasValue: bool }`. `value` is
+  the effective value; `hasValue` is true when a value is effective
+  (including a non-empty default).
 - `parse(args: &[str], from: int, specs: &[Spec]): Result[Command, Error]`
-- `Error` carries structured fields (kind, token, option, value); it never
-  prints. A caller formats the message and chooses the exit code.
+- `Error` carries structured fields (kind, token, option, value) and a
+  generic `code` if useful; it never prints. A caller formats the message
+  and chooses the exit code. Value validation runs after the whole token
+  walk, as eza does: a later syntax error wins over an earlier bad value.
 
 Grammar requirements, from obo's design 5.6:
 
@@ -140,8 +148,9 @@ reference, but the obx buffer model stays.
 - `count(src: mut &Reader): Result[int, IoError]`
 - `readAll(src: mut &Reader): Result[str, IoError]`
 
-No per-chunk allocation in the common path. Five programs must be able to
-drop their private `Reader` wrappers without a performance regression.
+Avoid per-byte allocation. One chunk-sized `strFromBytes` conversion per
+chunk is acceptable; the goal is that five programs can drop their private
+`Reader` wrappers without a performance regression.
 
 ### fs
 
