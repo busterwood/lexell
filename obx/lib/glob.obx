@@ -29,8 +29,10 @@
 // A path that is not valid UTF-8 is decoded as `strings.decodeAt` does: each
 // invalid part is one U+FFFD, so `?` matches one such part. Matching keeps two
 // rows of a dynamic-programming table, one per path code point; it does not
-// backtrack exponentially. `[^abc]` is accepted as a synonym for `[!abc]`;
-// Rust's glob crate treats `^` as a set member.
+// backtrack exponentially. A pattern whose tokens are all literals takes a
+// direct string compare instead (the common zoxide exclusion). `[^abc]` is
+// accepted as a synonym for `[!abc]`; Rust's glob crate treats `^` as a set
+// member.
 
 import "strings"
 
@@ -77,9 +79,13 @@ type Tok = value record {
     set: []int
 }
 
-// A compiled pattern. Construct it with compile; it is immutable.
+// A compiled pattern. Construct it with compile; it is immutable. When every
+// token is a literal (no wildcard or set), isLiteral is true, literal is the
+// exact text the pattern matches, and matching is a string compare.
 pub type Pattern = record {
     toks: []Tok
+    literal: str
+    isLiteral: bool
 }
 
 // The characters of a set as inclusive [lo, hi] pairs, greedily: "a-c-e" is
@@ -167,7 +173,19 @@ pub fn compile(pattern: str): Result[Pattern, Error] {
             i += 1
         }
     }
-    return Ok(Pattern{toks: toks})
+    var allLit = true
+    var lit: []int = []
+    for tok in toks {
+        // U+FFFD is the decoding of invalid UTF-8 and would compare by code
+        // point differently from its UTF-8 bytes; keep the DP matcher for it.
+        if tok.kind != K_LIT || tok.ch == strings.REPLACEMENT {
+            allLit = false
+            break
+        }
+        append(mut &lit, tok.ch)
+    }
+    let literal = if allLit { strings.fromRunes(&lit) } else { "" }
+    return Ok(Pattern{toks: toks, literal: literal, isLiteral: allLit})
 }
 
 // Whether a code point is in the [lo, hi] pairs of set.
@@ -230,6 +248,7 @@ fn matchToks(toks: &[]Tok, text: &[]int, relaxed: bool): bool {
 // Whether path matches the compiled pattern, path-aware: `*`, `?` and a set
 // do not cross `/`; only `**` does.
 pub fn (p: &Pattern) matches(path: str): bool {
+    if p.isLiteral { return path == p.literal }
     return matchToks(&p.toks, &strings.runes(path), false)
 }
 
@@ -238,6 +257,7 @@ pub fn (p: &Pattern) matches(path: str): bool {
 // set may match `/` too. `**` is recursive in both modes. The pattern syntax
 // and compile errors are the same as for matches.
 pub fn (p: &Pattern) matchesRelaxed(path: str): bool {
+    if p.isLiteral { return path == p.literal }
     return matchToks(&p.toks, &strings.runes(path), true)
 }
 
