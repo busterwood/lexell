@@ -34,6 +34,7 @@
 
 import "io"
 import "fs"
+import "glob"
 import "os"
 import "time"
 import "math"
@@ -581,146 +582,15 @@ fn startsWithPath(path: str, base: str): bool {
 
 // ---------------------------------------------------------------- globs
 
-// A glob::Pattern: Char (kind 0), `?` (1), `*` (2), `**` (3), [..] (4) and
-// [!..] (5); a set is pairs lo, hi in set.
-type Tok = record {
-    kind: int
-    ch: int
-    set: []int
-}
-
-type Glob = record {
-    toks: []Tok
-}
-
-type GlobError = value record {
-    pos: int
-    msg: str
-}
-
-fn isSep(c: int): bool { return c == 47 }
-
-fn parseSet(cs: &[int]): []int {
-    var set: []int = []
-    var i = 0
-    while i < len(cs) {
-        if i + 3 <= len(cs) && cs[i + 1] == 45 {
-            append(mut &set, cs[i])
-            append(mut &set, cs[i + 2])
-            i += 3
-        } else {
-            append(mut &set, cs[i])
-            append(mut &set, cs[i])
-            i += 1
-        }
+// Pattern::escape for the home-directory default: backslash-escape the
+// metacharacters so the home path matches literally.
+fn globEscape(s: str): str {
+    var b = newStrBuf()
+    for r in strings.runes(s) {
+        if r == 42 || r == 63 || r == 91 || r == 92 { b.addByte(92) }
+        strings.addRune(mut &b, r)
     }
-    return set
-}
-
-fn globNew(pattern: str): Result[Glob, GlobError] {
-    let chars = strings.runes(pattern)
-    var toks: []Tok = []
-    var i = 0
-    while i < len(chars) {
-        let c = chars[i]
-        if c == 63 {
-            append(mut &toks, Tok{kind: 1, ch: 0, set: []})
-            i += 1
-        } else if c == 42 {
-            let old = i
-            while i < len(chars) && chars[i] == 42 { i += 1 }
-            let count = i - old
-            if count > 2 {
-                return Err(GlobError{pos: old + 2, msg: "wildcards are either regular `*` or recursive `**`"})
-            } else if count == 2 {
-                let recMsg = "recursive wildcards must form a single path component"
-                if i == 2 || isSep(chars[i - count - 1]) {
-                    if i < len(chars) && isSep(chars[i]) {
-                        i += 1
-                    } else if i != len(chars) {
-                        return Err(GlobError{pos: i, msg: recMsg})
-                    }
-                } else {
-                    return Err(GlobError{pos: old - 1, msg: recMsg})
-                }
-                let n = len(toks)
-                if !(n > 1 && toks[n - 1].kind == 3) {
-                    append(mut &toks, Tok{kind: 3, ch: 0, set: []})
-                }
-            } else {
-                append(mut &toks, Tok{kind: 2, ch: 0, set: []})
-            }
-        } else if c == 91 {
-            var done = false
-            if i + 4 <= len(chars) && chars[i + 1] == 33 {
-                var j = i + 3
-                while j < len(chars) && chars[j] != 93 { j += 1 }
-                if j < len(chars) {
-                    append(mut &toks, Tok{kind: 5, ch: 0, set: parseSet(&chars[i + 2..j])})
-                    i = j + 1
-                    done = true
-                }
-            } else if i + 3 <= len(chars) && chars[i + 1] != 33 {
-                var j = i + 2
-                while j < len(chars) && chars[j] != 93 { j += 1 }
-                if j < len(chars) {
-                    append(mut &toks, Tok{kind: 4, ch: 0, set: parseSet(&chars[i + 1..j])})
-                    i = j + 1
-                    done = true
-                }
-            }
-            if !done { return Err(GlobError{pos: i, msg: "invalid range pattern"}) }
-        } else {
-            append(mut &toks, Tok{kind: 0, ch: c, set: []})
-            i += 1
-        }
-    }
-    return Ok(Glob{toks: toks})
-}
-
-fn inSet(set: &[int], c: int): bool {
-    var i = 0
-    while i < len(set) {
-        if c >= set[i] && c <= set[i + 1] { return true }
-        i += 2
-    }
-    return false
-}
-
-fn globFrom(toks: &[Tok], ti: int, text: &[int], si: int): bool {
-    var t = ti
-    var s = si
-    while t < len(toks) {
-        let tok = &toks[t]
-        if tok.kind == 2 || tok.kind == 3 {
-            if globFrom(toks, t + 1, text, s) { return true }
-            var k = s
-            while k < len(text) {
-                let c = text[k]
-                k += 1
-                if tok.kind == 3 && !isSep(c) { continue }
-                if globFrom(toks, t + 1, text, k) { return true }
-            }
-            return tok.kind == 3 && globFrom(toks, t + 1, text, len(text))
-        }
-        if s >= len(text) { return false }
-        let c = text[s]
-        var ok = false
-        match tok.kind {
-            0 { ok = tok.ch == c }
-            1 { ok = true }
-            4 { ok = inSet(&tok.set, c) }
-            else { ok = !inSet(&tok.set, c) }
-        }
-        if !ok { return false }
-        s += 1
-        t += 1
-    }
-    return s == len(text)
-}
-
-fn globMatches(g: &Glob, path: str): bool {
-    return globFrom(&g.toks, 0, &strings.runes(path), 0)
+    return b.toStr()
 }
 
 // ---------------------------------------------------------------- config
@@ -776,17 +646,14 @@ fn resolveSymlinksOn(): bool {
 }
 
 // The patterns of _ZO_EXCLUDE_DIRS; by default the home directory itself.
-fn excludeDirs(): []Glob {
-    var out: []Glob = []
+fn excludeDirs(): []glob.Pattern {
+    var out: []glob.Pattern = []
     match os.env("_ZO_EXCLUDE_DIRS") {
         Some(v) {
             for p in strings.split(&v, ":") {
-                match globNew(p) {
+                match glob.compile(p) {
                     Ok(g) { append(mut &out, g) }
-                    Err(e) {
-                        die(["invalid glob in _ZO_EXCLUDE_DIRS: " + p,
-                             "Pattern syntax error near position " + intToStr(e.pos) + ": " + e.msg])
-                    }
+                    Err(e) { die(["invalid glob in _ZO_EXCLUDE_DIRS: " + p, e.toStr()]) }
                 }
             }
         }
@@ -794,9 +661,10 @@ fn excludeDirs(): []Glob {
             match homeDir() {
                 Some(h) {
                     // Pattern::escape(home): matches the home directory only
-                    var toks: []Tok = []
-                    for r in strings.runes(h) { append(mut &toks, Tok{kind: 0, ch: r, set: []}) }
-                    append(mut &out, Glob{toks: toks})
+                    match glob.compile(globEscape(h)) {
+                        Ok(g) { append(mut &out, g) }
+                        Err(_) {}
+                    }
                 }
                 None {}
             }
@@ -1059,7 +927,7 @@ type Stream = record {
     idx: int
     now: int
     keywords: []str
-    exclude: []Glob
+    exclude: []glob.Pattern
     exists: bool
     resolve: bool
     ttl: int
@@ -1108,7 +976,7 @@ fn (st: mut &Stream) next(db: mut &Db): Option[Dir] {
         }
         var excluded = false
         for g in st.exclude {
-            if globMatches(&g, dir.path) { excluded = true }
+            if g.matchesRelaxed(dir.path) { excluded = true }
         }
         if excluded {
             db.swapRemove(idx)
@@ -1168,7 +1036,7 @@ fn cmdAdd(a: &Args) {
         if strings.indexOfByte(path, '\n', 0) >= 0 || strings.indexOfByte(path, '\r', 0) >= 0 { continue }
         var skip = false
         for g in excl {
-            if globMatches(&g, path) { skip = true }
+            if g.matchesRelaxed(path) { skip = true }
         }
         if skip { continue }
         if !fs.isDir(path) { die1("not a directory: " + path) }
