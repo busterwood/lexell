@@ -1117,7 +1117,7 @@ No measurements were taken in P1.
 ## 25. As built (P2)
 
 Branch `pgwire-p2`. `lexell/lib/postgres.lxl` is rewritten over `pgwire.Session`
-(664 lines); the libpq client is `lexell/lib/postgres_libpq.lxl` (`git mv`, only
+(664 lines); the libpq client is `lexell/lib/tests/support/postgres_libpq.lxl` (`git mv`, only
 its header comment changed). No compiler, runtime or `pgwire` change. 6.1's
 table is corrected: a URI query parameter without `=` is `missing key/value
 separator "=" in URI query parameter: "x"` (as P1 built it).

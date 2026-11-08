@@ -6,7 +6,7 @@ user's; T1 took D1 and D3 provisionally.
 
 ## 1. Why
 
-`lib/mssql.lxl` reaches SQL Server through ODBC: unixODBC, Microsoft's
+`lib/tests/support/mssql.lxl` reaches SQL Server through ODBC: unixODBC, Microsoft's
 ODBC Driver 18 and a dynamic link. Every call that can wait is a `blocking`
 extern, which runs on the helper pool of C threads (design/concurrency.md,
 C1c) while the task parks.

@@ -70,7 +70,7 @@ other number comes from the source cited next to it.
 | `blocking` externs on a helper pool (4 threads by default) | C1c, SPEC 12 |
 | worker processes: `task.workers(n, f: &fn(int), w)`, `workersWith(n, WorkerPolicy, f, w)`, `stopWorkers()`, `watchSignals`/`waitSignal`/`terminated`, a supervisor with restarts and drain, a shared listener (`EPOLLEXCLUSIVE`) or `net.listenReusePort` | C2, merged 2026-11-03 |
 | Postgres: async libpq, `Pool`/`Lease`, `PQcancel` on cancellation or deadline | `lib/postgres.lxl` |
-| SQLite and SQL Server: `blocking` externs, not cancellable while a call runs | `lib/sqlite.lxl`, `lib/mssql.lxl` |
+| SQLite and SQL Server: `blocking` externs, not cancellable while a call runs | `lib/sqlite.lxl`, `lib/tests/support/mssql.lxl` |
 | `cmd/httpd.lxl`: the gate server (about 380 lines) | minimal: no timeouts, no limits other than a 4 KiB head, a lenient parser (below) |
 | `lib/http.lxl` and `lib/url.lxl`: the client, with `Headers`, `parseFields`, `parseRequest`, `contentLength` shared with servers | in progress (H1, branch `h1`) |
 | TLS (OpenSSL 3.0.13 through externs) | in progress (H2 of the client plan) |

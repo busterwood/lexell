@@ -458,7 +458,7 @@ already private to their module, so the wrapper module makes the choice. A
 an `extern fn` accepts any Lexell function of the matching type, and a callback
 would run Lexell code on the helper thread.
 
-lib/mssql.lxl (SQL Server through ODBC) has no non-blocking API to park on,
+lib/tests/support/mssql.lxl (SQL Server through ODBC) has no non-blocking API to park on,
 so its long calls are the third kind: SQLDriverConnectW, SQLExecDirectW,
 SQLExecute, SQLFetch, SQLGetData, SQLMoreResults and SQLDescribeParam are
 marked `blocking`. Each has a single call site, outside any `Shared.with`,
