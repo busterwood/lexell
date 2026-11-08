@@ -166,13 +166,15 @@ Extend `lib/fs.obx`.
   or a small `WalkOptions` record if the callback needs skip-dir and
   on-error. No symlink loops; a cycle is an error or a skip, documented.
 - `createTemp(dir: str, prefix: str): Result[io.Writer, io.IoError]` -
-  `O_EXCL`, mode 0600, random suffix.
+  `O_EXCL`, 0600 (the runtime opens 0666 & umask, so chmod after open),
+  random suffix.
 - `writeAtomic(path: str, data: str): Result[Unit, io.IoError]` - temp in
   the same directory, write, rename; remove the temp on failure.
 - `realpath(path: str): Result[str, io.IoError>` - symlink resolution with
   a loop limit (ELOOP = 40).
-- `Stat` gains `atime`, `atimeNs`, `ctime`, `ctimeNs` (the runtime helper
-  already has them); keep the existing fields and ABI.
+- `Stat` gains `atime` and `ctime` (seconds; the runtime helper exposes
+  those two but not their nanoseconds). Keep the existing fields; add the
+  new ones at the end of the record.
 
 ### os
 
