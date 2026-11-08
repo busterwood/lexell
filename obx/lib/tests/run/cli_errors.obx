@@ -1,0 +1,271 @@
+// cli_errors: every error spelling from obo design 5.6, adapted to the
+// structured cli.Error (kind, token, option, short, value, choices): bad values
+// for required (with choices) and optional (no choices) flags, forbidden values
+// on Flag specs, unknown long names (whole token vs the name before '='),
+// unknown short bytes, the missing-value forms, the default value validated for
+// an optional flag, split short clusters whose earlier prefix flag is
+// value-taking (only the last prefix flag takes the '=value' remainder), the
+// deferred accept check (a later syntax error wins over an earlier bad value),
+// and the from bounds. parse() returns the error; it never prints or exits.
+//
+// Unlike obo, this test asserts the Error fields, not eza's exact message text.
+// ErrorKind.UnexpectedArgument is the optional flag's attached-rest error
+// (-Ffoo); ErrorKind.UnexpectedValue is a Flag given a split value (--all=x).
+// expect: cli errors ok
+import "cli"
+
+// ---------------------------------------------------------------- checks
+
+fn fail(what: str) {
+    println("FAIL " + what)
+    exit(1)
+}
+
+fn checkInt(label: str, got: int, want: int) {
+    if got != want { fail(label + ": got " + got.toStr() + " want " + want.toStr()) }
+}
+
+fn checkByte(label: str, got: byte, want: byte) {
+    if got != want { fail(label + ": got " + got.toStr() + " want " + want.toStr()) }
+}
+
+fn checkStr(label: str, got: str, want: str) {
+    if got != want { fail(label + ": got [" + got + "] want [" + want + "]") }
+}
+
+fn sameKind(a: cli.ErrorKind, b: cli.ErrorKind): bool { return a == b }
+
+// ---------------------------------------------------------------- the spec table
+
+fn specs(): []cli.Spec {
+    var out: []cli.Spec = []
+    append(mut &out, cli.Spec{short: 'a', long: "all", arity: cli.Arity.Flag,
+        consume: [], accept: [], choices: [], default: ""})
+    append(mut &out, cli.Spec{short: 'A', long: "almost-all", arity: cli.Arity.Flag,
+        consume: [], accept: [], choices: [], default: ""})
+    append(mut &out, cli.Spec{short: 's', long: "sort", arity: cli.Arity.Value,
+        consume: [],
+        accept: ["name", "Name", "size", "extension", "Extension", "modified",
+                 "changed", "accessed", "created", "inode", "type", "none"],
+        choices: ["name", "Name", "size", "extension", "Extension", "modified",
+                  "changed", "accessed", "created", "inode", "type", "none"],
+        default: ""})
+    append(mut &out, cli.Spec{short: 'F', long: "classify", arity: cli.Arity.Optional,
+        consume: ["always", "auto", "never"],
+        accept: ["always", "automatic", "auto", "never"],
+        choices: [], default: "auto"})
+    append(mut &out, cli.Spec{short: 0, long: "color", arity: cli.Arity.Optional,
+        consume: ["always", "auto", "never"],
+        accept: ["always", "automatic", "auto", "never"],
+        choices: [], default: "auto"})
+    append(mut &out, cli.Spec{short: 0, long: "icons", arity: cli.Arity.Optional,
+        consume: ["always", "auto", "never"],
+        accept: ["automatic", "auto", "never"],
+        choices: [], default: "auto"})
+    append(mut &out, cli.Spec{short: 'I', long: "ignore-glob", arity: cli.Arity.Value,
+        consume: [], accept: [], choices: [], default: ""})
+    append(mut &out, cli.Spec{short: 'l', long: "long", arity: cli.Arity.Flag,
+        consume: [], accept: [], choices: [], default: ""})
+    append(mut &out, cli.Spec{short: 'o', long: "output", arity: cli.Arity.Value,
+        consume: [], accept: [], choices: [], default: ""})
+    append(mut &out, cli.Spec{short: 0, long: "level", arity: cli.Arity.Optional,
+        consume: [], accept: [], choices: [], default: ""})
+    append(mut &out, cli.Spec{short: 0, long: "time-style", arity: cli.Arity.Value,
+        consume: [], accept: ["default", "long-iso"],
+        choices: ["default", "long-iso"], default: ""})
+    append(mut &out, cli.Spec{short: 0, long: "extra", arity: cli.Arity.Optional,
+        consume: ["ok"], accept: ["ok"], choices: [], default: "oops"})
+    return out
+}
+
+fn expectErr(label: str, r: Result[cli.Command, cli.Error], want: cli.ErrorKind,
+             token: str, option: str, short: byte, value: str, nchoices: int) {
+    match move(r) {
+        Ok(p) {
+            fail(label + ": expected an error, got " + len(p.opts).toStr() +
+                 " opts, " + len(p.operands).toStr() + " operands")
+        }
+        Err(e) {
+            if !sameKind(e.kind, want) {
+                fail(label + " kind: got " + e.kind.toStr() + " want " + want.toStr())
+            }
+            checkStr(label + " token", e.token, token)
+            checkStr(label + " option", e.option, option)
+            checkByte(label + " short", e.short, short)
+            checkStr(label + " value", e.value, value)
+            checkInt(label + " choices", len(e.choices), nchoices)
+        }
+    }
+}
+
+fn main() {
+    let sp = specs()
+    let bad = cli.ErrorKind.BadValue
+    let missing = cli.ErrorKind.MissingValue
+    let unknown = cli.ErrorKind.UnknownOption
+    let noValue = cli.ErrorKind.UnexpectedValue
+    let arg = cli.ErrorKind.UnexpectedArgument
+    let start = cli.ErrorKind.InvalidStart
+
+    // --sort: bad values carry the 12-item choices list
+    expectErr("sort bad split", cli.parse(&["--sort=foo"], 0, &sp),
+        bad, "--sort=foo", "sort", 's', "foo", 12)
+    expectErr("sort default", cli.parse(&["--sort=default"], 0, &sp),
+        bad, "--sort=default", "sort", 's', "default", 12)
+    expectErr("sort bad attached", cli.parse(&["-sfoo"], 0, &sp),
+        bad, "-sfoo", "sort", 's', "foo", 12)
+    expectErr("sort bad next", cli.parse(&["-s", "foo"], 0, &sp),
+        bad, "-s", "sort", 's', "foo", 12)
+    expectErr("sort short bare equals", cli.parse(&["-s="], 0, &sp),
+        bad, "-s=", "sort", 's', "=", 12)
+    expectErr("sort double equals", cli.parse(&["--sort=="], 0, &sp),
+        bad, "--sort==", "sort", 's', "=", 12)
+    expectErr("sort missing long", cli.parse(&["--sort"], 0, &sp),
+        missing, "--sort", "sort", 's', "", 12)
+    expectErr("sort missing short", cli.parse(&["-s"], 0, &sp),
+        missing, "-s", "sort", 's', "", 12)
+
+    // --classify: optional bad values have no choices; a trailing '=' does not
+    // split; an attached rest not in consume is an unexpected argument; the
+    // split '=' form bypasses consume and is validated against accept
+    expectErr("classify bad value", cli.parse(&["--classify=foo"], 0, &sp),
+        bad, "--classify=foo", "classify", 'F', "foo", 0)
+    expectErr("classify double equals", cli.parse(&["--classify=="], 0, &sp),
+        bad, "--classify==", "classify", 'F', "=", 0)
+    expectErr("classify trailing equals", cli.parse(&["--classify="], 0, &sp),
+        unknown, "--classify=", "classify=", byte(0), "", 0)
+    expectErr("classify attached foo", cli.parse(&["-Ffoo"], 0, &sp),
+        arg, "-Ffoo", "classify", 'F', "foo", 0)
+    expectErr("classify attached l", cli.parse(&["-Fl"], 0, &sp),
+        arg, "-Fl", "classify", 'F', "l", 0)
+    expectErr("classify bare equals", cli.parse(&["-F="], 0, &sp),
+        arg, "-F=", "classify", 'F', "=", 0)
+    expectErr("classify attached automatic", cli.parse(&["-Fautomatic"], 0, &sp),
+        arg, "-Fautomatic", "classify", 'F', "automatic", 0)
+    expectErr("classify split bad value", cli.parse(&["-F=foo"], 0, &sp),
+        bad, "-F=foo", "classify", 'F', "foo", 0)
+
+    // --color and --icons: optional, long only; --icons rejects always
+    expectErr("color bad value", cli.parse(&["--color=foo"], 0, &sp),
+        bad, "--color=foo", "color", byte(0), "foo", 0)
+    expectErr("color double equals", cli.parse(&["--color=="], 0, &sp),
+        bad, "--color==", "color", byte(0), "=", 0)
+    expectErr("color trailing equals", cli.parse(&["--color="], 0, &sp),
+        unknown, "--color=", "color=", byte(0), "", 0)
+    expectErr("icons bad value", cli.parse(&["--icons=foo"], 0, &sp),
+        bad, "--icons=foo", "icons", byte(0), "foo", 0)
+    expectErr("icons always", cli.parse(&["--icons=always"], 0, &sp),
+        bad, "--icons=always", "icons", byte(0), "always", 0)
+    expectErr("icons trailing equals", cli.parse(&["--icons="], 0, &sp),
+        unknown, "--icons=", "icons=", byte(0), "", 0)
+
+    // Flag with a value: long split, and the last short in a cluster
+    expectErr("all value", cli.parse(&["--all=x"], 0, &sp),
+        noValue, "--all=x", "all", 'a', "x", 0)
+    expectErr("cluster all value", cli.parse(&["-la=value"], 0, &sp),
+        noValue, "-la=value", "all", 'a', "value", 0)
+    expectErr("all short bare equals", cli.parse(&["-a="], 0, &sp),
+        unknown, "-a=", "=", '=', "", 0)
+    expectErr("long short equals", cli.parse(&["-l=1"], 0, &sp),
+        noValue, "-l=1", "long", 'l', "1", 0)
+
+    // split short cluster: only the LAST prefix flag takes the value. An
+    // earlier Value prefix flag is a missing-value error; an earlier Optional
+    // flag records its default and the walk continues; an earlier Flag records
+    // no value and the walk continues
+    expectErr("split cluster early required", cli.parse(&["-sF=always"], 0, &sp),
+        missing, "-sF=always", "sort", 's', "", 12)
+    expectErr("split cluster early required no choices", cli.parse(&["-Is=4"], 0, &sp),
+        missing, "-Is=4", "ignore-glob", 'I', "", 0)
+    expectErr("split cluster early required output", cli.parse(&["-ol=9"], 0, &sp),
+        missing, "-ol=9", "output", 'o', "", 0)
+    expectErr("split cluster last forbidden", cli.parse(&["-Fl=always"], 0, &sp),
+        noValue, "-Fl=always", "long", 'l', "always", 0)
+    expectErr("split cluster unknown last", cli.parse(&["-FQ=foo"], 0, &sp),
+        unknown, "-FQ=foo", "Q", 'Q', "", 0)
+    expectErr("split cluster bad last value", cli.parse(&["-Fs=foo"], 0, &sp),
+        bad, "-Fs=foo", "sort", 's', "foo", 12)
+
+    // a bad value is reported only after the whole token walk: a syntax error
+    // later in argv wins
+    expectErr("bad sort then unknown", cli.parse(&["--sort=foo", "-Q"], 0, &sp),
+        unknown, "-Q", "Q", 'Q', "", 0)
+    expectErr("sort equals then unknown", cli.parse(&["--sort==", "-Q"], 0, &sp),
+        unknown, "-Q", "Q", 'Q', "", 0)
+    expectErr("bad default then unknown", cli.parse(&["--extra", "-Q"], 0, &sp),
+        unknown, "-Q", "Q", 'Q', "", 0)
+    expectErr("bad sort then valid", cli.parse(&["--sort=foo", "-l"], 0, &sp),
+        bad, "--sort=foo", "sort", 's', "foo", 12)
+
+    // unknown long names: a split long reports only the name before '=',
+    // a non-split token reports the whole name (including a trailing '=')
+    expectErr("unknown split", cli.parse(&["--foo=bar"], 0, &sp),
+        unknown, "--foo=bar", "foo", byte(0), "", 0)
+    expectErr("unknown split equals", cli.parse(&["--foo=="], 0, &sp),
+        unknown, "--foo==", "foo", byte(0), "", 0)
+    expectErr("unknown trailing equals", cli.parse(&["--foo="], 0, &sp),
+        unknown, "--foo=", "foo=", byte(0), "", 0)
+    expectErr("unknown empty name", cli.parse(&["--=x"], 0, &sp),
+        unknown, "--=x", "=x", byte(0), "", 0)
+    expectErr("help", cli.parse(&["--help"], 0, &sp),
+        unknown, "--help", "help", byte(0), "", 0)
+    expectErr("version", cli.parse(&["--version"], 0, &sp),
+        unknown, "--version", "version", byte(0), "", 0)
+    expectErr("help value", cli.parse(&["--help=x"], 0, &sp),
+        unknown, "--help=x", "help", byte(0), "", 0)
+    expectErr("version value", cli.parse(&["--version=x"], 0, &sp),
+        unknown, "--version=x", "version", byte(0), "", 0)
+    expectErr("sort trailing equals", cli.parse(&["--sort="], 0, &sp),
+        unknown, "--sort=", "sort=", byte(0), "", 0)
+    expectErr("all trailing equals", cli.parse(&["--all="], 0, &sp),
+        unknown, "--all=", "all=", byte(0), "", 0)
+
+    // unknown short bytes: the first unknown byte of the cluster
+    expectErr("unknown short attached", cli.parse(&["-Qfoo"], 0, &sp),
+        unknown, "-Qfoo", "Q", 'Q', "", 0)
+    expectErr("unknown short split", cli.parse(&["-Q=foo"], 0, &sp),
+        unknown, "-Q=foo", "Q", 'Q', "", 0)
+    expectErr("unknown short", cli.parse(&["-Q"], 0, &sp),
+        unknown, "-Q", "Q", 'Q', "", 0)
+    expectErr("unknown short after known", cli.parse(&["-aQ"], 0, &sp),
+        unknown, "-aQ", "Q", 'Q', "", 0)
+
+    // required flags with no choices text
+    expectErr("ignore missing long", cli.parse(&["--ignore-glob"], 0, &sp),
+        missing, "--ignore-glob", "ignore-glob", 'I', "", 0)
+    expectErr("ignore missing short", cli.parse(&["-I"], 0, &sp),
+        missing, "-I", "ignore-glob", 'I', "", 0)
+    expectErr("output missing long", cli.parse(&["--output"], 0, &sp),
+        missing, "--output", "output", 'o', "", 0)
+    expectErr("output missing short", cli.parse(&["-o"], 0, &sp),
+        missing, "-o", "output", 'o', "", 0)
+
+    // a long-only required flag with choices
+    expectErr("time-style bad value", cli.parse(&["--time-style=foo"], 0, &sp),
+        bad, "--time-style=foo", "time-style", byte(0), "foo", 2)
+    expectErr("time-style bad next", cli.parse(&["--time-style", "foo"], 0, &sp),
+        bad, "--time-style", "time-style", byte(0), "foo", 2)
+    expectErr("time-style missing", cli.parse(&["--time-style"], 0, &sp),
+        missing, "--time-style", "time-style", byte(0), "", 2)
+
+    // an optional flag's default is validated like an explicit value
+    expectErr("extra default bad", cli.parse(&["--extra"], 0, &sp),
+        bad, "--extra", "extra", byte(0), "oops", 0)
+    expectErr("extra bad value", cli.parse(&["--extra=nope"], 0, &sp),
+        bad, "--extra=nope", "extra", byte(0), "nope", 0)
+
+    // from bounds: 0 <= from <= len(args), else InvalidStart
+    let av50: []str = ["prog", "-a", "d"]
+    expectErr("from negative", cli.parse(&av50, -1, &sp),
+        start, "", "", byte(0), "", 0)
+    expectErr("from past end", cli.parse(&av50, 4, &sp),
+        start, "", "", byte(0), "", 0)
+    expectErr("from very negative", cli.parse(&av50, -1000, &sp),
+        start, "", "", byte(0), "", 0)
+    expectErr("from large", cli.parse(&av50, 1000000, &sp),
+        start, "", "", byte(0), "", 0)
+    expectErr("empty from one", cli.parse(&[], 1, &sp),
+        start, "", "", byte(0), "", 0)
+
+    println("cli errors ok")
+}

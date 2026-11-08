@@ -1,0 +1,451 @@
+// cli: the eza/obo command-line grammar over an argv array.
+//
+//     import "cli"
+//     let cmd = try cli.parse(args, 1, &specs)
+//
+// parse() walks args[from..] and returns a Command. Every stored long name,
+// value and operand is an owned string: the result does not retain references
+// into argv or the spec table. parse() never prints and never exits; on a
+// grammar error it returns an Error whose fields describe what happened, and
+// the caller formats the message and chooses the exit code.
+//
+// Grammar (obo design 5.6, pinned from eza 0.23.3):
+//   * Options and free operands are interspersed; "-" alone and "" are
+//     operands. A "--" token ends option parsing and the remaining tokens are
+//     operands (a second "--" after it is an operand too).
+//   * Equals splitting applies to long and short tokens: split at the FIRST
+//     '=' only when the name before it is non-empty and at least one byte
+//     follows. Otherwise the token is not split and a trailing '=' is an
+//     ordinary byte. A split long token reports only the name before '=';
+//     a non-split token is reported whole.
+//   * Long: --name / --name=value. With no split, Value consumes the next
+//     token as its value, Optional consumes it only when it is in consume,
+//     and otherwise the flag uses its default. A Flag given a split value is
+//     an error.
+//   * Short clusters: every byte after '-' is a flag. Without a split, Flag
+//     continues the cluster, Value takes the rest of the cluster (including a
+//     leading '=') or the next token, and Optional takes a non-empty rest only
+//     when it is in consume (else an error) or the next token only when it is
+//     in consume. With a split, the bytes before '=' are the cluster and only
+//     the LAST prefix flag takes the split value, validated against accept.
+//     An earlier prefix Flag records no value and the walk continues, an
+//     earlier Optional records the spec's default and the walk continues, and
+//     an earlier Value is a missing-value error.
+//   * Values are validated against accept when accept is non-empty, after the
+//     whole token walk: a later syntax error wins over an earlier bad value
+//     (`--sort=foo -Q` is an unknown-option error for -Q). Every occurrence is
+//     then validated in occurrence order.
+//
+// Opt.value carries the EFFECTIVE value: an explicit value is copied in; when
+// a bare Optional uses a non-empty default, value is that default. hasValue is
+// true when a value is effective this way and false for a Flag and for an
+// Optional with an empty default.
+
+// How many bytes an option takes.
+pub type Arity = value closed { Flag; Value; Optional }
+
+pub fn (a: Arity) takesValue(): bool { return a != Arity.Flag }
+
+// One option in the caller's table. short is 0 for no short form. consume lists
+// the next-token values an Optional may consume; accept is the allowed value
+// set (empty = any); choices is help text only; default is the value of a bare
+// Optional.
+pub type Spec = value record {
+    pub short: byte
+    pub long: str
+    pub arity: Arity
+    pub consume: []str
+    pub accept: []str
+    pub choices: []str
+    pub default: str
+}
+
+// One option occurrence. value is the effective value; hasValue is true when a
+// value is effective (including a non-empty default). short is the canonical
+// short form of the matched spec, or 0 when it has none.
+pub type Opt = value record {
+    pub short: byte
+    pub long: str
+    pub value: str
+    pub hasValue: bool
+}
+
+pub type Command = value record {
+    pub opts: []Opt
+    pub operands: []str
+}
+
+// What parse() rejected. The fields let a caller distinguish the cases and
+// write its own wording:
+//
+//   UnknownOption      token held an option name in option (the looked-up long
+//                      name, or a one-byte short string) that is not in specs
+//   MissingValue       an option with arity Value had no value; option is the
+//                      canonical long name, short its canonical short form
+//   BadValue           value is not in accept; option/value name the failure
+//   UnexpectedValue    a Flag was given a value (from a split), in value
+//   UnexpectedArgument an Optional was given an attached argument that is not
+//                      in consume (e.g. -Ffoo), in value
+//   InvalidStart       from was outside 0..len(args)
+//
+// token is the argv token that caused the error ("" for InvalidStart).
+// choices is a copy of the spec's choices, for a caller that formats help/error
+// text. The module never prints and never exits.
+pub type ErrorKind = value closed {
+    UnknownOption
+    MissingValue
+    BadValue
+    UnexpectedValue
+    UnexpectedArgument
+    InvalidStart
+}
+
+pub type Error = value record {
+    pub kind: ErrorKind
+    pub token: str
+    pub option: str
+    pub short: byte
+    pub value: str
+    pub choices: []str
+}
+
+pub fn (k: ErrorKind) toStr(): str {
+    match k {
+        ErrorKind.UnknownOption { return "unknown option" }
+        ErrorKind.MissingValue { return "missing value" }
+        ErrorKind.BadValue { return "value not accepted" }
+        ErrorKind.UnexpectedValue { return "unexpected value" }
+        ErrorKind.UnexpectedArgument { return "unexpected argument" }
+        ErrorKind.InvalidStart { return "invalid start" }
+    }
+}
+
+// One option label: "--long (-s)" when the spec has a short form.
+fn optionLabel(option: str, short: byte): str {
+    if len(option) == 0 { return "" }
+    if short == 0 { return "--" + option }
+    return "--" + option + " (-" + oneChar(short) + ")"
+}
+
+// Generic wording. The caller is expected to format its own message; this is a
+// usable fallback for logs and tests.
+pub fn (e: Error) toStr(): str {
+    match e.kind {
+        ErrorKind.InvalidStart { return "invalid start index" }
+        ErrorKind.UnknownOption { return "unknown option " + e.token }
+        ErrorKind.MissingValue {
+            return "option " + optionLabel(e.option, e.short) + " needs a value"
+        }
+        ErrorKind.BadValue {
+            return "option " + optionLabel(e.option, e.short) +
+                " does not accept value \"" + e.value + "\""
+        }
+        ErrorKind.UnexpectedValue {
+            return "option " + optionLabel(e.option, e.short) + " cannot take a value"
+        }
+        ErrorKind.UnexpectedArgument {
+            return "unexpected argument \"" + e.value + "\" for option " +
+                optionLabel(e.option, e.short)
+        }
+    }
+}
+
+// An independent one-byte string (for labels).
+fn oneChar(c: byte): str {
+    let b: []byte = [c]
+    return strFromBytes(&b)
+}
+
+// true when xs contains s (xs may be empty: an empty list lists nothing).
+fn inList(xs: &[]str, s: str): bool {
+    for i in 0..len(xs) {
+        if xs[i] == s { return true }
+    }
+    return false
+}
+
+// The first index of '=' at or after from, or -1.
+fn firstEquals(a: str, from: int): int {
+    for i in from..len(a) {
+        if a[i] == '=' { return i }
+    }
+    return -1
+}
+
+fn specByShort(specs: &[Spec], c: byte): int {
+    if c == 0 { return -1 }
+    for i in 0..len(specs) {
+        if specs[i].short == c { return i }
+    }
+    return -1
+}
+
+fn specByLong(specs: &[Spec], name: str): int {
+    for i in 0..len(specs) {
+        if specs[i].long == name { return i }
+    }
+    return -1
+}
+
+// accept is a whitelist when non-empty.
+fn accepts(spec: &Spec, value: str): bool {
+    if len(spec.accept) == 0 { return true }
+    return inList(&spec.accept, value)
+}
+
+fn copyChoices(xs: &[]str): []str {
+    var out: []str = []
+    for i in 0..len(xs) { append(mut &out, xs[i]) }
+    return out
+}
+
+fn makeError(kind: ErrorKind, token: str, option: str, short: byte, value: str,
+              choices: &[]str): Error {
+    return Error{kind: kind, token: token, option: option, short: short,
+                 value: value, choices: copyChoices(choices)}
+}
+
+fn invalidStart(): Error {
+    return makeError(ErrorKind.InvalidStart, "", "", 0, "", &[])
+}
+
+fn unknownLong(token: str, name: str): Error {
+    return makeError(ErrorKind.UnknownOption, token, name, 0, "", &[])
+}
+
+fn unknownShort(token: str, c: byte): Error {
+    return makeError(ErrorKind.UnknownOption, token, oneChar(c), c, "", &[])
+}
+
+fn missingValue(token: str, spec: &Spec): Error {
+    return makeError(ErrorKind.MissingValue, token, spec.long, spec.short, "",
+                     &spec.choices)
+}
+
+fn unexpectedValue(token: str, spec: &Spec, value: str): Error {
+    return makeError(ErrorKind.UnexpectedValue, token, spec.long, spec.short, value,
+                     &spec.choices)
+}
+
+fn unexpectedArgument(token: str, spec: &Spec, value: str): Error {
+    return makeError(ErrorKind.UnexpectedArgument, token, spec.long, spec.short,
+                     value, &spec.choices)
+}
+
+fn badValue(token: str, spec: &Spec, value: str): Error {
+    return makeError(ErrorKind.BadValue, token, spec.long, spec.short, value,
+                     &spec.choices)
+}
+
+// Append one occurrence; toks keeps the argv token for a deferred value error.
+fn pushOpt(opts: mut &[]Opt, toks: mut &[]str, token: str, spec: &Spec,
+           short: byte, value: str, hasValue: bool) {
+    append(opts, Opt{short: short, long: spec.long, value: value,
+                     hasValue: hasValue})
+    append(toks, token)
+}
+
+// argv() including argv[0]; callers normally pass from = 1.
+pub fn argv(): []str { return args() }
+
+// --------------- token predicates (exported: they pin the split rule)
+
+// a[i], or the byte 0 when i is out of range (0 is the "no short form" byte).
+pub fn shortName(a: str, i: int): byte {
+    if i < 0 || i >= len(a) { return byte(0) }
+    return a[i]
+}
+
+// A long option token: at least "--x" ("--" is the terminator, not long).
+pub fn isLong(a: str): bool {
+    return len(a) > 2 && a[0] == '-' && a[1] == '-'
+}
+
+// True when the long token splits into a name and a value: the first '=' has a
+// non-empty name before it and at least one byte after it.
+pub fn hasLongValue(a: str): bool {
+    if !isLong(a) { return false }
+    let e = firstEquals(a, 2)
+    return e > 2 && e + 1 < len(a)
+}
+
+// The long option's name; the whole rest when the token does not split.
+pub fn longName(a: str): str {
+    if !isLong(a) { return "" }
+    let e = firstEquals(a, 2)
+    if e > 2 && e + 1 < len(a) { return a[2..e] }
+    return a[2..len(a)]
+}
+
+// The value after the first '=' when the token splits, else "".
+pub fn longValue(a: str): str {
+    if !hasLongValue(a) { return "" }
+    let e = firstEquals(a, 2)
+    return a[e + 1..len(a)]
+}
+
+// Parse args[from..]; from must satisfy 0 <= from <= len(args).
+pub fn parse(args: &[str], from: int, specs: &[Spec]): Result[Command, Error] {
+    if from < 0 || from > len(args) { return Err(invalidStart()) }
+    var opts: []Opt = []
+    var tokens: []str = []
+    var operands: []str = []
+    var i = from
+    var stop = false
+    while i < len(args) && !stop {
+        let a = args[i]
+        if a == "--" {
+            // Everything after -- is an operand, including a second --.
+            i += 1
+            while i < len(args) {
+                append(mut &operands, args[i])
+                i += 1
+            }
+            stop = true
+        } else if isLong(a) {
+            let e = firstEquals(a, 2)
+            if e > 2 && e + 1 < len(a) {
+                // Split long: the name before '=', the value after it.
+                let name = a[2..e]
+                let value = a[e + 1..len(a)]
+                let si = specByLong(specs, name)
+                if si < 0 { return Err(unknownLong(a, name)) }
+                let spec = &specs[si]
+                if spec.arity == Arity.Flag {
+                    return Err(unexpectedValue(a, spec, value))
+                }
+                pushOpt(mut &opts, mut &tokens, a, spec, spec.short, value, true)
+            } else {
+                let name = a[2..len(a)]
+                let si = specByLong(specs, name)
+                if si < 0 { return Err(unknownLong(a, name)) }
+                let spec = &specs[si]
+                match spec.arity {
+                    Arity.Flag {
+                        pushOpt(mut &opts, mut &tokens, a, spec, spec.short, "", false)
+                    }
+                    Arity.Value {
+                        if i + 1 >= len(args) {
+                            return Err(missingValue(a, spec))
+                        }
+                        i += 1
+                        pushOpt(mut &opts, mut &tokens, a, spec, spec.short, args[i], true)
+                    }
+                    Arity.Optional {
+                        if i + 1 < len(args) && inList(&spec.consume, args[i + 1]) {
+                            i += 1
+                            pushOpt(mut &opts, mut &tokens, a, spec, spec.short,
+                                    args[i], true)
+                        } else {
+                            let value = spec.default
+                            pushOpt(mut &opts, mut &tokens, a, spec, spec.short,
+                                    value, len(value) > 0)
+                        }
+                    }
+                }
+            }
+        } else if len(a) > 1 && a[0] == '-' {
+            // A short token ("-" alone was an operand above).
+            let e = firstEquals(a, 1)
+            if e > 1 && e + 1 < len(a) {
+                // Split: the bytes 1..e-1 are the cluster; the last takes value.
+                var j = 1
+                var done = false
+                while j < e && !done {
+                    let c = a[j]
+                    let si = specByShort(specs, c)
+                    if si < 0 { return Err(unknownShort(a, c)) }
+                    let spec = &specs[si]
+                    if j == e - 1 {
+                        let value = a[e + 1..len(a)]
+                        if spec.arity == Arity.Flag {
+                            return Err(unexpectedValue(a, spec, value))
+                        }
+                        pushOpt(mut &opts, mut &tokens, a, spec, c, value, true)
+                        done = true
+                    } else {
+                        match spec.arity {
+                            Arity.Flag {
+                                pushOpt(mut &opts, mut &tokens, a, spec, c, "", false)
+                                j += 1
+                            }
+                            Arity.Optional {
+                                // An earlier optional prefix flag records its
+                                // default and the walk continues.
+                                let value = spec.default
+                                pushOpt(mut &opts, mut &tokens, a, spec, c, value,
+                                        len(value) > 0)
+                                j += 1
+                            }
+                            Arity.Value {
+                                // An earlier required prefix flag has no value.
+                                return Err(missingValue(a, spec))
+                            }
+                        }
+                    }
+                }
+            } else {
+                var j = 1
+                var done = false
+                while j < len(a) && !done {
+                    let c = a[j]
+                    let si = specByShort(specs, c)
+                    if si < 0 { return Err(unknownShort(a, c)) }
+                    let spec = &specs[si]
+                    match spec.arity {
+                        Arity.Flag {
+                            pushOpt(mut &opts, mut &tokens, a, spec, c, "", false)
+                            j += 1
+                        }
+                        Arity.Value {
+                            if j + 1 < len(a) {
+                                let value = a[j + 1..len(a)]
+                                pushOpt(mut &opts, mut &tokens, a, spec, c, value, true)
+                            } else if i + 1 < len(args) {
+                                i += 1
+                                pushOpt(mut &opts, mut &tokens, a, spec, c, args[i], true)
+                            } else {
+                                return Err(missingValue(a, spec))
+                            }
+                            done = true
+                        }
+                        Arity.Optional {
+                            if j + 1 < len(a) {
+                                let value = a[j + 1..len(a)]
+                                if !inList(&spec.consume, value) {
+                                    return Err(unexpectedArgument(a, spec, value))
+                                }
+                                pushOpt(mut &opts, mut &tokens, a, spec, c, value, true)
+                            } else if i + 1 < len(args) &&
+                                      inList(&spec.consume, args[i + 1]) {
+                                i += 1
+                                pushOpt(mut &opts, mut &tokens, a, spec, c, args[i], true)
+                            } else {
+                                let value = spec.default
+                                pushOpt(mut &opts, mut &tokens, a, spec, c, value,
+                                        len(value) > 0)
+                            }
+                            done = true
+                        }
+                    }
+                }
+            }
+        } else {
+            append(mut &operands, a)
+        }
+        i += 1
+    }
+    // Value validation runs after the whole token walk: a later syntax error
+    // wins over an earlier bad value. Occurrences are checked in order.
+    var k = 0
+    while k < len(opts) {
+        let si = specByLong(specs, opts[k].long)
+        if si >= 0 && specs[si].arity != Arity.Flag {
+            if !accepts(&specs[si], opts[k].value) {
+                return Err(badValue(tokens[k], &specs[si], opts[k].value))
+            }
+        }
+        k += 1
+    }
+    return Ok(Command{opts: opts, operands: operands})
+}
