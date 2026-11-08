@@ -197,6 +197,15 @@ Extend `lib/os.obx`.
 - `dataDir(app: str)`, `configDir(app: str)`, `cacheDir(app: str)` only if
   a caller needs them; zoxide is the likely first.
 
+The user functions use getpw* (and uid uses getuid), which resolves NSS
+users but makes a native binary dynamically linked: about 0.3 ms of loader
+work per process, which is visible on zoxide's per-cd `query` and on eza's
+short listings. The first implementation ignored that and both tools
+regressed. The resolution: the library keeps the NSS-aware functions for
+programs that already link libc (the DB tools), and the two hot CLIs read
+`/proc/self/status` and `/etc/passwd` directly, which is what they did
+before the migration and keeps them static.
+
 ### time
 
 Extend `lib/time.obx`. The engine already exists in `cmd/jq_lib.obx`

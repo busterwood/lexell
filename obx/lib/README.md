@@ -261,7 +261,9 @@ Lexical path primitives over bytes, Rust `Path::components` semantics:
 `isAbsolute`, `hasTrailingSlash`, `isDotName`, `lastComponent`, `parentOf`,
 `join`, and `ext` (the extension without its dot, unlike `fs.extension`,
 which keeps the dot). No filesystem, `~`, glob, shell or symlink resolution:
-`fs.realpath` is the filesystem operation.
+`fs.realpath` is the filesystem operation. `lastComponent`, `parentOf` and
+`ext` scan backwards and allocate nothing, which matters for a caller that
+formats a name per entry (eza).
 
 ### cli
 
@@ -343,7 +345,10 @@ combining marks, format and control characters 0).
 eza's name order is here too: `natcmp`/`natcmpFold` (natord-plus-plus
 2.0.0: whitespace skipped, digit runs compared naturally, the documented
 partial Unicode lowercase table for the fold) and their aliases
-`naturalCompare`/`naturalCompareFold`. `quoteName(name, quoteSpaces)` and
+`naturalCompare`/`naturalCompareFold`. The comparison runs in one pass: an
+ASCII byte is compared directly, and the first byte >= 0x80 hands the whole
+comparison to the code-point loop, so a pure ASCII name is never scanned
+twice. `quoteName(name, quoteSpaces)` and
 `parentPrefix(parent, quoteSpaces)` are eza's QuoteSpaces escaping;
 `isPrint`, `isBlank`, `isWordByte` are the byte predicates; `utf8Error(s):
 Option[str]` gives Rust's first-invalid-UTF-8 message and index (valid data is
@@ -404,7 +409,11 @@ chunk).
   `environ(): []Env {name, value}` reads `/proc/self/environ` and replays
   `setEnv`/`unsetEnv` changes; `uid`/`gid`/`effectiveUid`/`effectiveGid`;
   `users()`, `userById`, `userByName` (`User {uid, gid, name, home, shell}`)
-  through getpw*; `tempDir()` ($TMPDIR when absolute, else /tmp).
+  through getpw*; `tempDir()` ($TMPDIR when absolute, else /tmp). The getpw*
+  and getuid calls (including `userName`/`homeDir`) are libc symbols: calling
+  them makes a native binary dynamically linked and adds loader work at
+  startup. A program that must stay static reads `/proc/self/status` and
+  `/etc/passwd` itself, as `zoxide` and `eza` do.
 - **time**: `Time {sec, nsec}` (`now`, `fromNanos`, `cmp`, `eq`, `toStr`,
   `addMillis`, `millisUntil`), `unixSeconds`, `unixMillis`, `monotonicNs`,
   `sleepMs` (blocks the thread, every task with it: in tasks use

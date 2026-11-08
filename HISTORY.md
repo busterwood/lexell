@@ -2609,8 +2609,41 @@ The two DB ledger examples needed no changes. The command-line examples were
 then migrated module by module, with each tool's existing golden or
 differential suite as the acceptance test: the coreutils and grep pass 869
 differential cases plus the eight memory cases; zoxide passes its 362-case
-baseline differential and fell from 326,880 to 323,192 bytes native; jq
-passes 869 baseline cases (its native binary is 8 KB larger because @uri
-pulls in `url`); cmark keeps its local getopt because cmark's early
-`--help`/`--version` precedence is not the library grammar; the HTTP gate
-passes on both backends with 1,000 idle connections.
+baseline differential; jq passes 869 baseline cases (its native binary is
+8 KB larger because @uri pulls in `url`); cmark keeps its local getopt
+because cmark's early `--help`/`--version` precedence is not the library
+grammar; the HTTP gate passes on both backends with 1,000 idle connections.
+
+### The library migration performance check (2026-11-08)
+
+Instruction counts (`perf stat -e instructions:u`, same compiler, before
+against after) separate code changes from machine noise. The coreutils,
+grep, jq and cmark are byte-identical in executed instructions; their wall
+clock differences are noise. Two real regressions were found and fixed:
+
+- `zoxide query -l` over a 1,500-entry database first went from 11.6M to
+  31.9M instructions (~5.0 to 6.4 ms). The exclusion glob decoded every path
+  and ran a DP table even for the default pattern, which is a single escaped
+  literal. `glob.compile` now marks all-literal patterns and matches them
+  with a string compare: 8.6M instructions, and `query -l` fell to about
+  4.3 ms (the old binary is 4.3 ms); a keyword query is also faster.
+- `eza -l /usr/bin` and `eza -T /usr/share` first grew by 6% and 12% of
+  instructions. Three causes were removed: `paths.lastComponent`/`parentOf`
+  built a component array per call (now a backwards scan that allocates
+  nothing), `strings.natcmp` pre-scanned both names for non-ASCII bytes and
+  used a record-based code-point loop even for ASCII (now one byte loop with
+  a hand-off to the code-point loop at the first high byte), and the
+  `os.userById`/`os.users` getpw* calls made the native binaries dynamically
+  linked. On the final binaries eza's tree walk is about 8% fewer
+  instructions than before and the long listing is level; zoxide is static
+  again and faster.
+- Both hot tools read `/proc/self/status` and `/etc/passwd` directly, as
+  they did before the port. The `os` user functions remain the NSS-aware
+  versions for programs that already link libc; the cost is documented in
+  `lib/README.md`.
+
+Final native sizes: zoxide 335,096 bytes (330,976 before, +1.2%); eza
+353,328 (304,296 before, +16.1%, of which about 41 KB is the whole `cli`
+module and the rest is the other moves plus static linking). The `cli`
+grammar is compiled in whole once `parse` is referenced; the parser itself
+runs once per process, so the size cost has no runtime counterpart.
