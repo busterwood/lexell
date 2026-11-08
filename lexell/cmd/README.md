@@ -400,9 +400,17 @@ and formatted cases against an in-process RESP2 server:
     python3 cmd/redis_gate.py
     python3 cmd/redis_gate.py --c
 
-`lib/tests/run/redis_live.lxl` is the live check (set `LXL_REDIS_LIVE=1`;
-`LXL_REDIS` is the URL, default `redis://127.0.0.1:6379/15`); without a
-server it exits 77 and the library runner skips it.
+`lib/tests/run/redis_live.lxl` and `redis_live_extra.lxl` are the live
+checks (set `LXL_REDIS_LIVE=1`; `LXL_REDIS` is the URL, default
+`redis://127.0.0.1:6379/15`); without a server they exit 77 and the library
+runner skips them.
+
+Checked on 2026-11-08: `redis_gate.py` passes both backends and is a CI
+step; the CLI was also run against a live Redis 7.0.15 over TCP and TLS,
+with password and ACL-user AUTH. Not automated: the interactive prompt
+(a terminal/pty) and the full option matrix. The limits listed for the
+library apply to the CLI too: no cluster redirection, streamed RESP3
+replies, or pipe/scan/eval modes.
 
 ## httpd and httpload
 

@@ -1295,12 +1295,56 @@ println((try c.hget("order:42", "amount")).unwrapOr("missing"))
   dynamically linked to OpenSSL for TLS (and to libc for name lookup), as
   `http` is.
 
-Tests: `tests/run/redis_basic.lxl` against the in-process
-`tests/support/redistest.lxl` (RESP2 and RESP3, all four data types,
-pipelining, server errors, AUTH, pool tasks, URL parsing), and
-`tests/run/redis_live.lxl` and `tests/run/redis_live_extra.lxl` against a
-live server with `LXL_REDIS_LIVE=1` (default
-`redis://127.0.0.1:6379/15`; otherwise exit 77).
+#### Verification
+
+`tests/run/redis_basic.lxl` runs against the in-process
+`tests/support/redistest.lxl` (RESP2 and RESP3, strings, hashes, lists,
+sets, pipelining, server errors, AUTH, pool tasks, URL parsing and the
+reply-type corpus), and is part of the quick and full gates. In the full
+gate it also runs under ASan and TSan, and through the native/C differential
+runner. `tests/run/redis_live.lxl` and `tests/run/redis_live_extra.lxl` run
+against a live server with `LXL_REDIS_LIVE=1` (default
+`redis://127.0.0.1:6379/15`; otherwise exit 77). The extra test covers
+`setEx`, `setNx`, `expire`/`ttl`, the hash, list and set tails, `SCAN`,
+`MULTI`/`EXEC`, `WATCH`, binary values, pub/sub and a read timeout.
+
+Checked on 2026-11-08:
+
+- quick and full gates pass; the full gate includes `redis_basic` under
+  ASan and TSan and in the native red-team run.
+- `redis_basic` and `redis_gate.py` pass on the native and C backends.
+- a live Redis 7.0.15 passed `redis_live` and `redis_live_extra` over TCP;
+  a separate connection with a test CA passed over TLS, and the client was
+  checked with password and ACL-user AUTH, `--insecure`, a task pool,
+  pub/sub, transactions, `WATCH`, expiry, binary values and a `BLPOP` read
+  timeout.
+- `cmd/redis_gate.py` covers the CLI's one-shot, pipe, `-x`, `-r`,
+  raw/formatted, error and exit-code paths on both backends; it is a CI
+  step.
+
+    python3 lexell/lib/run_tests.py redis          # the hermetic tests
+    python3 lexell/cmd/redis_gate.py              # CLI, native
+    python3 lexell/cmd/redis_gate.py --c          # CLI, through C
+    LXL_REDIS_LIVE=1 LXL_REDIS=redis://127.0.0.1:6379/15 \
+        python3 lexell/lib/run_tests.py --live redis
+
+`--live redis` runs both live tests.
+
+#### Not covered
+
+- Live testing used Redis 7.0.15 only; older and newer servers, Cluster,
+  Sentinel and managed Redis variants are untested. There is no cluster
+  redirection or slot routing.
+- Streamed RESP3 replies (`$?`, `*?`) are rejected as protocol errors.
+- Unix sockets and IPv6 are implemented and parsed, but the live test uses
+  TCP and IPv4. TLS client certificates, pins and `tlsName` are implemented
+  but not exercised live.
+- The interactive CLI prompt is not automated; one-shot and pipe modes are.
+- Typed helpers inside `MULTI` see `QUEUED`; use `command` for queued
+  commands. `WATCH` is not tracked by the pool; use a dedicated connection.
+- A pool does not proactively health-check an idle connection: one closed
+  by the server fails once, is discarded, and its place is reused.
+- No performance benchmark is recorded for Redis.
 
 ### regex
 
