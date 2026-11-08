@@ -151,6 +151,10 @@ pub fn stderr(): Writer { return Writer{fd: 2, path: "<stderr>", buf: newStrBuf(
 // A writer to a new or emptied file.
 pub fn create(path: str): Result[Writer, IoError] { return openWriter(path, 1) }
 
+// A writer to a file that must not exist yet (O_CREAT|O_EXCL, mode 0666 less
+// the umask): EEXIST when the name is taken.
+pub fn createExclusive(path: str): Result[Writer, IoError] { return openWriter(path, 3) }
+
 // A writer that adds to the end of a file (creating it).
 pub fn openAppend(path: str): Result[Writer, IoError] { return openWriter(path, 2) }
 
@@ -362,4 +366,89 @@ pub fn (r: mut &Reader) close(): Result[Unit, IoError] {
 
 fn (r: mut &Reader) drop() {
     if r.ownsFd && r.fd >= 0 { close(i32(r.fd)) }
+}
+
+// ------------------------------------------------------ ChunkReader, copy
+
+// A Reader read a chunk at a time with the buffer exposed: fill reads the next
+// chunk into buf[0..n], and pos is the caller's position within that chunk.
+// The buffer is allocated once at construction. A chunk shorter than buf is
+// data, not the end: only a fill returning 0 is the end, and the Reader does
+// not remember it, so later fills try again (a growing file or a terminal can
+// give more bytes).
+pub type ChunkReader = record {
+    pub src: Reader
+    pub buf: []byte
+    pub n: int
+    pub pos: int
+}
+
+// A chunk reader whose buffer is size bytes (CHUNK when size is not positive).
+pub fn newChunkReaderSize(src: Reader, size: int): ChunkReader {
+    let width = if size <= 0 { CHUNK } else { size }
+    return ChunkReader{src: src, buf: array(width, 0), n: 0, pos: 0}
+}
+
+// A chunk reader with the standard CHUNK-byte buffer.
+pub fn newChunkReader(src: Reader): ChunkReader {
+    return newChunkReaderSize(src, CHUNK)
+}
+
+// Reads the next chunk into buf (discarding bytes before pos left unconsumed):
+// its length, 0 at the end of the input, or minus the errno. No allocation per
+// chunk.
+pub fn (r: mut &ChunkReader) fill(): int {
+    r.pos = 0
+    match r.src.read(mut &r.buf) {
+        Ok(k) {
+            r.n = k
+            return k
+        }
+        Err(e) {
+            r.n = 0
+            return -e.errno
+        }
+    }
+}
+
+// Copies src to dst until the end of the input, flushing dst after each chunk
+// so a pipe makes progress promptly: the number of bytes copied. A read or
+// write error stops at once; the bytes before it are not reported. The chunk's
+// string is the only allocation per chunk.
+pub fn copy(dst: mut &Writer, src: mut &Reader): Result[int, IoError] {
+    var buf: []byte = array(CHUNK, 0)
+    var total = 0
+    while true {
+        let k = try src.read(mut &buf)
+        if k == 0 { return Ok(total) }
+        dst.write(strFromBytes(&buf[0..k]))
+        try dst.flush()
+        total += k
+    }
+    return Ok(total)
+}
+
+// The number of bytes src has left, reading and discarding them. A read error
+// stops at once.
+pub fn count(src: mut &Reader): Result[int, IoError] {
+    var buf: []byte = array(CHUNK, 0)
+    var total = 0
+    while true {
+        let k = try src.read(mut &buf)
+        if k == 0 { return Ok(total) }
+        total += k
+    }
+    return Ok(total)
+}
+
+// Everything src has left as one string. A read error stops at once.
+pub fn readAll(src: mut &Reader): Result[str, IoError] {
+    var out = newStrBuf()
+    var buf: []byte = array(CHUNK, 0)
+    while true {
+        let k = try src.read(mut &buf)
+        if k == 0 { return Ok(out.toStr()) }
+        out.add(strFromBytes(&buf[0..k]))
+    }
+    return Ok("")
 }
