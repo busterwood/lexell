@@ -1,19 +1,26 @@
 // glob: zoxide's path glob syntax, as Rust's `glob` crate compiles it
-// (`Pattern::new`), with the path-aware matching zoxide's `_ZO_EXCLUDE_DIRS`
-// needs.
+// (`Pattern::new`).
 //
 //     let p = try glob.compile("cache/**/tmp?.log")
 //     p.matches("cache/a/b/tmpx.log")        // true
 //     p.matches("cache/a/tmp1.log")          // true
 //
+// Two match modes over the same compiled pattern and the same syntax:
+//
+// - `Pattern.matches` is path-aware: `*`, `?` and a set stop at `/`; only
+//   `**` crosses a component boundary. This is the design's rule.
+// - `Pattern.matchesRelaxed` is zoxide's actual `Pattern::matches_path` with
+//   its default options (`require_literal_separator = false`): `*`, `?` and
+//   a set may match `/` too, and `**` keeps its recursive meaning. Parsing
+//   and compile errors are identical in both modes.
+//
 // Syntax, case-sensitive, over Unicode code points:
-// - `?` matches one character except `/`;
-// - `*` matches zero or more characters except `/`;
+// - `?` matches one character;
+// - `*` matches zero or more characters;
 // - `**` as a whole path component matches zero or more components, `/`
 //   included; it is an error anywhere else (a**b, **a, ***);
-// - `[abc]`, `[a-z]`, `[!abc]` and `[^abc]` match one character except `/`;
-//   a range is inclusive and ordered by code point; an unclosed set is an
-//   error;
+// - `[abc]`, `[a-z]`, `[!abc]` and `[^abc]` match one character; a range is
+//   inclusive and ordered by code point; an unclosed set is an error;
 // - `\` escapes the next character (`\*`, `\?`, `\[`, `\\`); a final `\` is
 //   a literal backslash. This is an extension: the Rust glob crate has no
 //   escape character and treats `\` literally;
@@ -22,13 +29,8 @@
 // A path that is not valid UTF-8 is decoded as `strings.decodeAt` does: each
 // invalid part is one U+FFFD, so `?` matches one such part. Matching keeps two
 // rows of a dynamic-programming table, one per path code point; it does not
-// backtrack exponentially.
-//
-// zoxide compiles `_ZO_EXCLUDE_DIRS` entries with `glob::Pattern::new` and
-// matches with `Pattern::matches_path`, whose default options let `*`, `?`
-// and a set match `/`. This module implements the design's path-aware rule
-// instead: only `**` crosses a separator. `[^abc]` is accepted as a synonym
-// for `[!abc]`; Rust's glob crate treats `^` as a set member.
+// backtrack exponentially. `[^abc]` is accepted as a synonym for `[!abc]`;
+// Rust's glob crate treats `^` as a set member.
 
 import "strings"
 
@@ -178,12 +180,13 @@ fn inSet(set: &[]int, c: int): bool {
     return false
 }
 
-// Whether one non-star token accepts code point c. A separator matches only
-// a literal '/', never '?', a set, or a negated set (zoxide's path-aware
-// rule).
-fn oneMatches(tok: &Tok, c: int): bool {
+// Whether one non-star token accepts code point c. In strict mode (relaxed
+// false) a separator matches only a literal '/', never '?', a set, or a
+// negated set. In relaxed mode all three may match '/', as zoxide's
+// `Pattern::matches_path` default does.
+fn oneMatches(tok: &Tok, c: int, relaxed: bool): bool {
     if tok.kind == K_LIT { return tok.ch == c }
-    if c == SEP { return false }
+    if !relaxed && c == SEP { return false }
     if tok.kind == K_ANY { return true }
     if tok.kind == K_SET { return inSet(&tok.set, c) }
     return !inSet(&tok.set, c)
@@ -191,8 +194,9 @@ fn oneMatches(tok: &Tok, c: int): bool {
 
 // The dynamic-programming matcher: dp[t][s] says tokens[t..] matches
 // text[s..]. The two rows are computed right to left, so `*` and `**` are
-// O(1) per position instead of a recursive walk.
-fn matchToks(toks: &[]Tok, text: &[]int): bool {
+// O(1) per position instead of a recursive walk. In relaxed mode a plain `*`
+// consumes a separator too; `**` consumes every code point in both modes.
+fn matchToks(toks: &[]Tok, text: &[]int, relaxed: bool): bool {
     let n = len(text)
     var cur: []bool = []
     var next: []bool = []
@@ -212,10 +216,10 @@ fn matchToks(toks: &[]Tok, text: &[]int): bool {
             s -= 1
             if star {
                 var v = next[s]
-                if !v && (tok.kind == K_REC || text[s] != SEP) { v = cur[s + 1] }
+                if !v && (relaxed || tok.kind == K_REC || text[s] != SEP) { v = cur[s + 1] }
                 cur[s] = v
             } else {
-                cur[s] = oneMatches(tok, text[s]) && next[s + 1]
+                cur[s] = oneMatches(tok, text[s], relaxed) && next[s + 1]
             }
         }
         for k in 0..n + 1 { next[k] = cur[k] }
@@ -223,9 +227,18 @@ fn matchToks(toks: &[]Tok, text: &[]int): bool {
     return next[0]
 }
 
-// Whether path matches the compiled pattern.
+// Whether path matches the compiled pattern, path-aware: `*`, `?` and a set
+// do not cross `/`; only `**` does.
 pub fn (p: &Pattern) matches(path: str): bool {
-    return matchToks(&p.toks, &strings.runes(path))
+    return matchToks(&p.toks, &strings.runes(path), false)
+}
+
+// Whether path matches the compiled pattern as zoxide's
+// `glob::Pattern::matches_path` does with its default options: `*`, `?` and a
+// set may match `/` too. `**` is recursive in both modes. The pattern syntax
+// and compile errors are the same as for matches.
+pub fn (p: &Pattern) matchesRelaxed(path: str): bool {
+    return matchToks(&p.toks, &strings.runes(path), true)
 }
 
 // compile then matches, with the compile error passed through. The language
