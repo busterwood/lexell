@@ -2607,4 +2607,10 @@ the obo vectors and the differential suites:
 
 The two DB ledger examples needed no changes. The command-line examples were
 then migrated module by module, with each tool's existing golden or
-differential suite as the acceptance test.
+differential suite as the acceptance test: the coreutils and grep pass 869
+differential cases plus the eight memory cases; zoxide passes its 362-case
+baseline differential and fell from 326,880 to 323,192 bytes native; jq
+passes 869 baseline cases (its native binary is 8 KB larger because @uri
+pulls in `url`); cmark keeps its local getopt because cmark's early
+`--help`/`--version` precedence is not the library grammar; the HTTP gate
+passes on both backends with 1,000 idle connections.
