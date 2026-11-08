@@ -1,0 +1,104 @@
+// redis: a live Redis 6 or later, for the commands the client wraps. Skipped
+// (exit 77) unless LXL_REDIS_LIVE=1 and a server answers; LXL_REDIS sets the
+// URL (default redis://127.0.0.1:6379/15). It uses its own keys and removes
+// them.
+// expect: live ping PONG
+// expect: live string 24.49 none
+// expect: live counter 1 2
+// expect: live hash a=1 b=2
+// expect: live list b a c
+// expect: live set a b
+// expect: live pipeline OK 7
+// expect: live resp3 true
+// expect: live pool open 2 idle 2 waiting 0
+import "os"
+import "collections"
+import "task"
+import "redis"
+
+fn showOpt(o: Option[str]): str {
+    match o {
+        Some(s) { return s }
+        None { return "none" }
+    }
+}
+
+fn showPairs(var ps: []redis.PairStr): str {
+    collections.sortBy(mut &ps, fn(a: &redis.PairStr, b: &redis.PairStr): int { return a.key.cmp(&b.key) })
+    var b = newStrBuf()
+    for i in 0..len(ps) {
+        if i > 0 { b.add(" ") }
+        b.add(ps[i].key)
+        b.add("=")
+        b.add(ps[i].value)
+    }
+    return b.toStr()
+}
+
+fn showList(xs: []str): str {
+    var b = newStrBuf()
+    for i in 0..len(xs) {
+        if i > 0 { b.add(" ") }
+        b.add(xs[i])
+    }
+    return b.toStr()
+}
+
+fn main() {
+    if os.envOr("LXL_REDIS_LIVE", "") != "1" { exit(77) }
+    let url = os.envOr("LXL_REDIS", "redis://127.0.0.1:6379/15")
+    var maybe: Option[redis.Conn] = None
+    match redis.connect(url) {
+        Ok(x) { maybe = Some(x) }
+        Err(e) {
+            eprintln(e.toStr())
+            exit(77)
+        }
+    }
+    var c = maybe.unwrap()
+    let base = "lxl:live:" + os.pid().toStr()
+    let k = base + ":k"
+    let h = base + ":h"
+    let l = base + ":l"
+    let s = base + ":s"
+    c.del(&[k, h, l, s]).unwrap()
+    println("live ping " + c.ping().unwrap())
+    c.set(k, "24.49").unwrap()
+    println("live string " + showOpt(c.get(k).unwrap()) + " " + showOpt(c.get(base + ":missing").unwrap()))
+    println("live counter " + c.incr(base + ":n").unwrap().toStr() + " " + c.incr(base + ":n").unwrap().toStr())
+    c.hset(h, "a", "1").unwrap()
+    c.hset(h, "b", "2").unwrap()
+    println("live hash " + showPairs(c.hgetall(h).unwrap()))
+    c.rpush(l, &["a", "c"]).unwrap()
+    c.lpush(l, &["b"]).unwrap()
+    println("live list " + showList(c.lrange(l, 0, -1).unwrap()))
+    c.sadd(s, &["a", "b"]).unwrap()
+    var members = c.smembers(s).unwrap()
+    collections.sortStable(mut &members)
+    println("live set " + showList(members))
+    c.send(&["SET", base + ":p", "7"]).unwrap()
+    c.send(&["GET", base + ":p"]).unwrap()
+    let p1 = c.receive().unwrap()
+    let p2 = c.receive().unwrap()
+    println("live pipeline " + p1.toStr() + " " + p2.toStr())
+    println("live resp3 " + c.isResp3().toStr())
+    c.del(&[k, h, l, s, base + ":n", base + ":p"]).unwrap()
+    c.close()
+
+    let pool = redis.newPool(url, 2).unwrap()
+    task.scope(fn(sc: mut &task.Scope) {
+        var fs: []task.Future[int] = []
+        for i in 0..6 { append(mut &fs, sc.start(livePing, pool)) }
+        task.all(fs).unwrap()
+    })
+    let st = pool.stats()
+    println("live pool open " + st.open.toStr() + " idle " + st.idle.toStr() + " waiting " + st.waiting.toStr())
+}
+
+fn livePing(p: redis.Pool): int {
+    var l = p.acquire().unwrap()
+    l.set("lxl:live:pool", "v").unwrap()
+    let got = l.get("lxl:live:pool").unwrap()
+    if got.isNone() { return 1 }
+    return 0
+}

@@ -1,0 +1,180 @@
+// redis: the RESP client against an in-process server (tests/support/redistest).
+// It covers RESP3 and RESP2, strings, hashes, lists and sets, pipelining,
+// server errors, AUTH/SELECT, a pool shared by tasks, and URL parsing.
+// expect: url host=127.0.0.1 port=6380 user=u pass=p db=2 timeout=5000
+// expect: url unix=/tmp/redis.sock db=1
+// expect: bad config config
+// expect: ping PONG echo hi
+// expect: set/get 24.49 none
+// expect: getdel 24.49 then none
+// expect: incr 1 2 5
+// expect: mset/mget 1 2 none
+// expect: hash a=1 b=2
+// expect: hgetall a=1 b=2
+// expect: list b a c
+// expect: lpop b
+// expect: set members a b
+// expect: sismember true false
+// expect: del 2 exists 0 type set
+// expect: error ERR unknown command 'NOPE'
+// expect: raw [ok, 42, true, 1.5, 12345678901234567890, hello, [a, b], {k: v}]
+// expect: attr after
+// expect: push [message, hi]
+// expect: nil (nil)
+// expect: empty []
+// expect: nested [[a, b], [c]]
+// expect: big 100000
+// expect: pipeline OK 7
+// expect: auth ok
+// expect: wrong-password auth
+// expect: resp2 false
+// expect: pool open 2 idle 2 waiting 0
+import "task"
+import "net"
+import "strings"
+import "redis"
+import "../support/redistest" as rt
+
+fn addrPort(a: str): str { return strings.cut(&a, ":").unwrap().after }
+
+fn cfgFor(addr: str, password: str, hello3: bool): redis.Config {
+    var cfg = redis.defaults()
+    cfg.host = "127.0.0.1"
+    cfg.port = match strings.parseInt(addrPort(addr)) { Ok(n) { n } Err(_) { 0 } }
+    cfg.password = password
+    cfg.db = 2
+    return cfg
+}
+
+fn showOpt(o: Option[str]): str {
+    match o {
+        Some(s) { return s }
+        None { return "none" }
+    }
+}
+
+fn showPairs(ps: []redis.PairStr): str {
+    var b = newStrBuf()
+    for i in 0..len(ps) {
+        if i > 0 { b.add(" ") }
+        b.add(ps[i].key)
+        b.add("=")
+        b.add(ps[i].value)
+    }
+    return b.toStr()
+}
+
+fn showList(xs: []str): str {
+    var b = newStrBuf()
+    for i in 0..len(xs) {
+        if i > 0 { b.add(" ") }
+        b.add(xs[i])
+    }
+    return b.toStr()
+}
+
+fn main() {
+    let u = redis.parseUrl("redis://u:p@127.0.0.1:6380/2?timeout=5000").unwrap()
+    println("url host=" + u.host + " port=" + u.port.toStr() + " user=" + u.username + " pass=" + u.password + " db=" +
+            u.db.toStr() + " timeout=" + u.timeoutMs.toStr())
+    let x = redis.parseUrl("unix:///tmp/redis.sock?db=1").unwrap()
+    println("url unix=" + x.unixPath + " db=" + x.db.toStr())
+    let badUrl = redis.parseUrl("http://h").unwrapErr()
+    let badPort = redis.parseUrl("redis://h:70000").unwrapErr()
+    println("bad " + badUrl.kind.toStr() + " " + badPort.kind.toStr())
+
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        let srv = s.start(rt.serve, rt.Server{ln: ln, sh: rt.newStore(), password: "", hello3: true})
+        let cfg = cfgFor(addr, "", true)
+        var c = redis.connectWith(&cfg).unwrap()
+        println("ping " + c.ping().unwrap() + " echo " + c.echo("hi").unwrap())
+
+        c.set("order:42", "24.49").unwrap()
+        println("set/get " + showOpt(c.get("order:42").unwrap()) + " " + showOpt(c.get("missing").unwrap()))
+        println("getdel " + showOpt(c.getDel("order:42").unwrap()) + " then " + showOpt(c.get("order:42").unwrap()))
+
+        println("incr " + c.incr("counter").unwrap().toStr() + " " + c.incr("counter").unwrap().toStr() + " " +
+                c.incrBy("counter", 3).unwrap().toStr())
+        c.mset(&[redis.PairStr{key: "a", value: "1"}, redis.PairStr{key: "b", value: "2"}]).unwrap()
+        let mg = c.mget(&["a", "b", "c"]).unwrap()
+        println("mset/mget " + showOpt(mg[0]) + " " + showOpt(mg[1]) + " " + showOpt(mg[2]))
+
+        c.hset("h", "a", "1").unwrap()
+        c.hset("h", "b", "2").unwrap()
+        println("hash a=" + showOpt(c.hget("h", "a").unwrap()) + " b=" + showOpt(c.hget("h", "b").unwrap()))
+        println("hgetall " + showPairs(c.hgetall("h").unwrap()))
+
+        c.rpush("l", &["a", "c"]).unwrap()
+        c.lpush("l", &["b"]).unwrap()
+        println("list " + showList(c.lrange("l", 0, -1).unwrap()))
+        println("lpop " + showOpt(c.lpop("l").unwrap()))
+
+        c.sadd("s", &["a", "b"]).unwrap()
+        println("set members " + showList(c.smembers("s").unwrap()))
+        println("sismember " + c.sismember("s", "a").unwrap().toStr() + " " +
+                c.sismember("s", "z").unwrap().toStr())
+
+        println("del " + c.del(&["h", "l"]).unwrap().toStr() + " exists " + c.exists(&["h"]).unwrap().toStr() +
+                " type " + c.command(&["TYPE", "s"]).unwrap().toStr())
+
+        let bad = c.command(&["NOPE"]).unwrap()
+        match bad {
+            redis.Value.Error(e) { println("error " + e) }
+            else { println("error none") }
+        }
+
+        println("raw " + c.command(&["RAW"]).unwrap().toStr())
+        println("attr " + c.command(&["ATTR"]).unwrap().toStr())
+        println("push " + c.command(&["PUSH"]).unwrap().toStr())
+        println("nil " + c.command(&["NILARR"]).unwrap().toStr())
+        println("empty [" + c.command(&["EMPTY"]).unwrap().toStr() + "]")
+        println("nested " + c.command(&["NEST"]).unwrap().toStr())
+        let big = c.command(&["BIG", "100000"]).unwrap()
+        println("big " + len(big.toStr()).toStr())
+
+        c.send(&["SET", "p", "7"]).unwrap()
+        c.send(&["GET", "p"]).unwrap()
+        let p1 = c.receive().unwrap()
+        let p2 = c.receive().unwrap()
+        println("pipeline " + p1.toStr() + " " + p2.toStr())
+        c.close()
+    })
+
+    // AUTH, RESP2 fallback and a pool over the same fake server.
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        let sh = rt.newStore()
+        let srv = s.start(rt.serve, rt.Server{ln: ln, sh: sh, password: "secret", hello3: false})
+        var good = cfgFor(addr, "secret", false)
+        good.username = "u"
+        var c = redis.connectWith(&good).unwrap()
+        println("auth ok")
+        c.close()
+        var bad = cfgFor(addr, "wrong", false)
+        match redis.connectWith(&bad) {
+            Ok(_) { println("wrong-password none") }
+            Err(e) { println("wrong-password " + e.kind.toStr()) }
+        }
+        var c2 = redis.connectWith(&good).unwrap()
+        println("resp2 " + c2.isResp3().toStr())
+        c2.close()
+
+        let pool = redis.newPoolWith(good, 2)
+        var fs: []task.Future[int] = []
+        for i in 0..6 { append(mut &fs, s.start(pinger, pool)) }
+        task.all(fs).unwrap()
+        let st = pool.stats()
+        println("pool open " + st.open.toStr() + " idle " + st.idle.toStr() + " waiting " + st.waiting.toStr())
+    })
+}
+
+fn pinger(p: redis.Pool): int {
+    var l = p.acquire().unwrap()
+    l.set("pool:key", "v").unwrap()
+    let got = l.get("pool:key").unwrap()
+    if got.isNone() { return 1 }
+    return 0
+}

@@ -1,0 +1,562 @@
+// A small in-process Redis server for the redis tests. It speaks resp2 and
+// resp3 and keeps the common string, hash, list and set commands in one
+// shared store, so a pool's connections see the same data. It is not a Redis
+// implementation: it is only what the tests need, and every other command
+// answers with an error.
+//
+//     task.scope(fn(s: mut &task.Scope) {
+//         let ln = net.listen("127.0.0.1:0").unwrap()
+//         let srv = s.start(serve, Server{ln: ln, sh: newStore(), password: ""})
+//         let c = try redis.connect("redis://" + ln.localAddr())
+//         ...
+//     })
+import "task"
+import "net"
+import "strings"
+
+pub type Store = record {
+    kv: Map[str, str]
+    lists: Map[str, []str]
+    sets: Map[str, []str]
+    hashes: Map[str, Map[str, str]]
+}
+
+pub fn newStore(): task.Shared[Store] {
+    return task.shared(Store{kv: newMap(), lists: newMap(), sets: newMap(), hashes: newMap()})
+}
+
+pub type Server = record {
+    pub ln: net.Listener
+    pub sh: task.Shared[Store]
+    pub password: str
+    pub hello3: bool          // false: answer HELLO with an error, for the RESP2 path
+}
+
+type ConnArgs = record {
+    c: net.Conn
+    sh: task.Shared[Store]
+    password: str
+    hello3: bool
+}
+
+pub fn serve(sv: Server): int {
+    task.scope(fn(s: mut &task.Scope) {
+        while true {
+            match sv.ln.accept() {
+                Ok(c) { s.spawn(serveOne, ConnArgs{c: c, sh: sv.sh, password: sv.password, hello3: sv.hello3}) }
+                Err(_) { break }
+            }
+        }
+    })
+    return 0
+}
+
+fn serveOne(a: ConnArgs): int {
+    let ConnArgs{c: c, sh: sh, password: password, hello3: hello3} = move(a)
+    var rd = newReader(c)
+    var resp3 = false
+    while true {
+        let cmd = match rd.command() {
+            Some(x) { x }
+            None { return 0 }
+        }
+        if len(cmd) == 0 { continue }
+        let name = strings.toUpper(cmd[0])
+        if name == "QUIT" {
+            rd.c.writeStr("+OK\r\n").unwrap()
+            return 0
+        }
+        if name == "HELLO" {
+            if hello3 && len(cmd) > 1 && cmd[1] == "3" {
+                resp3 = true
+                rd.c.writeStr("%1\r\n$5\r\nproto\r\n:3\r\n").unwrap()
+            } else {
+                rd.c.writeStr("-ERR unknown command 'HELLO'\r\n").unwrap()
+            }
+            continue
+        }
+        if name == "AUTH" {
+            if len(password) == 0 || cmd[len(cmd) - 1] == password {
+                rd.c.writeStr("+OK\r\n").unwrap()
+            } else {
+                rd.c.writeStr("-WRONGPASS invalid username-password pair\r\n").unwrap()
+            }
+            continue
+        }
+        var out = ""
+        sh.with(fn(st: mut &Store) { out = dispatch(st, &cmd, resp3) })
+        rd.c.writeStr(out).unwrap()
+    }
+    return 0
+}
+
+// ---------------------------------------------------------------- the store
+
+fn simple(s: str): str { return "+" + s + "\r\n" }
+
+fn err(s: str): str { return "-" + s + "\r\n" }
+
+fn integer(n: int): str { return ":" + n.toStr() + "\r\n" }
+
+fn bulk(s: str): str { return "$" + len(s).toStr() + "\r\n" + s + "\r\n" }
+
+fn nilBulk(): str { return "$-1\r\n" }
+
+fn bulkArray(xs: &[str]): str {
+    var b = newStrBuf()
+    b.add("*")
+    b.addInt(len(xs))
+    b.add("\r\n")
+    for x in xs { b.add(bulk(x)) }
+    return b.toStr()
+}
+
+fn nilArray(): str { return "*-1\r\n" }
+
+fn pairsMap(ps: &[str]): str {
+    var b = newStrBuf()
+    b.add("%")
+    b.addInt(len(ps) / 2)
+    b.add("\r\n")
+    for x in ps { b.add(bulk(x)) }
+    return b.toStr()
+}
+
+fn parseIntArg(s: str): Option[int] {
+    match strings.parseInt(s) {
+        Ok(n) { return Some(n) }
+        Err(_) { return None }
+    }
+}
+
+fn listAt(st: &Store, key: str): []str {
+    var out: []str = []
+    if st.lists.has(&key) {
+        for x in st.lists.at(key) { append(mut &out, x) }
+    }
+    return out
+}
+
+fn setAt(st: &Store, key: str): []str {
+    var out: []str = []
+    if st.sets.has(&key) {
+        for x in st.sets.at(key) { append(mut &out, x) }
+    }
+    return out
+}
+
+fn hashKeys(st: &Store, key: str): []str {
+    var out: []str = []
+    if st.hashes.has(&key) {
+        let h = st.hashes.at(key)
+        for i in 0..h.size() { append(mut &out, h.keyAt(i)) }
+    }
+    return out
+}
+
+fn hashVals(st: &Store, key: str): []str {
+    var out: []str = []
+    if st.hashes.has(&key) {
+        let h = st.hashes.at(key)
+        for i in 0..h.size() { append(mut &out, h.valAt(i)) }
+    }
+    return out
+}
+
+fn delKey(st: mut &Store, key: str) {
+    let a = st.kv.remove(&key)
+    let b = st.lists.remove(&key)
+    let c = st.sets.remove(&key)
+    let d = st.hashes.remove(&key)
+}
+
+fn typeOf(st: &Store, key: str): str {
+    if st.kv.has(&key) { return "string" }
+    if st.lists.has(&key) { return "list" }
+    if st.sets.has(&key) { return "set" }
+    if st.hashes.has(&key) { return "hash" }
+    return "none"
+}
+
+fn dispatch(st: mut &Store, args: &[]str, resp3: bool): str {
+    let name = strings.toUpper(args[0])
+    if name == "PING" { return simple("PONG") }
+    if name == "ECHO" {
+        if len(args) < 2 { return err("ERR wrong number of arguments for 'echo'") }
+        return bulk(args[1])
+    }
+    if name == "SELECT" || name == "CLIENT" { return simple("OK") }
+    if name == "TYPE" {
+        if len(args) < 2 { return err("ERR wrong number of arguments for 'type'") }
+        return simple(typeOf(st, args[1]))
+    }
+    if name == "DBSIZE" { return integer(st.kv.size() + st.lists.size() + st.sets.size() + st.hashes.size()) }
+    if name == "FLUSHDB" {
+        st.kv.clear()
+        st.lists.clear()
+        st.sets.clear()
+        st.hashes.clear()
+        return simple("OK")
+    }
+    if name == "GET" {
+        if len(args) < 2 { return err("ERR wrong number of arguments for 'get'") }
+        let got = st.kv.get(&args[1])
+        return match got { Some(x) { bulk(x) } None { nilBulk() } }
+    }
+    if name == "SET" {
+        if len(args) < 3 { return err("ERR wrong number of arguments for 'set'") }
+        let key = args[1]
+        var nx = false
+        var xx = false
+        for i in 2..len(args) {
+            let o = strings.toUpper(args[i])
+            if o == "NX" { nx = true }
+            if o == "XX" { xx = true }
+        }
+        if nx && st.kv.has(&key) { return nilBulk() }
+        if xx && !st.kv.has(&key) { return nilBulk() }
+        st.kv.put(key, args[2])
+        return simple("OK")
+    }
+    if name == "GETDEL" {
+        if len(args) < 2 { return err("ERR wrong number of arguments for 'getdel'") }
+        let got = st.kv.get(&args[1])
+        delKey(st, args[1])
+        return match got { Some(x) { bulk(x) } None { nilBulk() } }
+    }
+    if name == "DEL" {
+        var n = 0
+        for i in 1..len(args) {
+            if typeOf(st, args[i]) != "none" {
+                delKey(st, args[i])
+                n += 1
+            }
+        }
+        return integer(n)
+    }
+    if name == "EXISTS" {
+        var n = 0
+        for i in 1..len(args) { if typeOf(st, args[i]) != "none" { n += 1 } }
+        return integer(n)
+    }
+    if name == "INCR" || name == "INCRBY" || name == "DECR" || name == "DECRBY" {
+        if len(args) < 2 { return err("ERR wrong number of arguments") }
+        let key = args[1]
+        var delta = 1
+        if name == "INCRBY" || name == "DECRBY" {
+            if len(args) < 3 { return err("ERR wrong number of arguments") }
+            match parseIntArg(args[2]) {
+                Some(n) { delta = n }
+                None { return err("ERR value is not an integer or out of range") }
+            }
+        }
+        if name == "DECR" || name == "DECRBY" { delta = -delta }
+        var old = 0
+        if st.kv.has(&key) {
+            match parseIntArg(st.kv.getOr(&key, "0")) {
+                Some(n) { old = n }
+                None { return err("ERR value is not an integer or out of range") }
+            }
+        }
+        let n = old + delta
+        st.kv.put(key, n.toStr())
+        return integer(n)
+    }
+    if name == "MSET" {
+        if len(args) < 3 || len(args) % 2 == 0 { return err("ERR wrong number of arguments for 'mset'") }
+        var i = 1
+        while i + 1 < len(args) {
+            st.kv.put(args[i], args[i + 1])
+            i += 2
+        }
+        return simple("OK")
+    }
+    if name == "MGET" {
+        var b = newStrBuf()
+        b.add("*")
+        b.addInt(len(args) - 1)
+        b.add("\r\n")
+        for i in 1..len(args) {
+            match st.kv.get(&args[i]) {
+                Some(x) { b.add(bulk(x)) }
+                None { b.add(nilBulk()) }
+            }
+        }
+        return b.toStr()
+    }
+    if name == "HGET" {
+        if len(args) < 3 { return err("ERR wrong number of arguments for 'hget'") }
+        if st.hashes.has(&args[1]) {
+            let h = st.hashes.at(args[1])
+            if h.has(&args[2]) { return bulk(h.getOr(&args[2], "")) }
+        }
+        return nilBulk()
+    }
+    if name == "HSET" {
+        if len(args) < 4 || len(args) % 2 != 0 { return err("ERR wrong number of arguments for 'hset'") }
+        let key = args[1]
+        let h = st.hashes.atOrPut(key, newMap())
+        var n = 0
+        var i = 2
+        while i + 1 < len(args) {
+            if !h.has(&args[i]) { n += 1 }
+            h.put(args[i], args[i + 1])
+            i += 2
+        }
+        return integer(n)
+    }
+    if name == "HDEL" {
+        if len(args) < 3 { return err("ERR wrong number of arguments for 'hdel'") }
+        var n = 0
+        if st.hashes.has(&args[1]) {
+            let h = st.hashes.atOrPut(args[1], newMap())
+            for i in 2..len(args) {
+                let old = h.remove(&args[i])
+                if old.isSome() { n += 1 }
+            }
+        }
+        return integer(n)
+    }
+    if name == "HLEN" {
+        if len(args) < 2 { return err("ERR wrong number of arguments for 'hlen'") }
+        if st.hashes.has(&args[1]) { return integer(st.hashes.at(args[1]).size()) }
+        return integer(0)
+    }
+    if name == "HEXISTS" {
+        if len(args) < 3 { return err("ERR wrong number of arguments for 'hexists'") }
+        if st.hashes.has(&args[1]) && st.hashes.at(args[1]).has(&args[2]) { return integer(1) }
+        return integer(0)
+    }
+    if name == "HGETALL" {
+        if len(args) < 2 { return err("ERR wrong number of arguments for 'hgetall'") }
+        let ks = hashKeys(st, args[1])
+        let vs = hashVals(st, args[1])
+        var flat: []str = []
+        for i in 0..len(ks) {
+            append(mut &flat, ks[i])
+            append(mut &flat, vs[i])
+        }
+        if resp3 { return pairsMap(&flat) }
+        return bulkArray(&flat)
+    }
+    if name == "LPUSH" || name == "RPUSH" {
+        if len(args) < 3 { return err("ERR wrong number of arguments") }
+        let key = args[1]
+        let l = st.lists.atOrPut(key, [])
+        for i in 2..len(args) {
+            if name == "LPUSH" { insert(l, 0, args[i]) } else { append(l, args[i]) }
+        }
+        return integer(len(l))
+    }
+    if name == "LPOP" || name == "RPOP" {
+        if len(args) < 2 { return err("ERR wrong number of arguments") }
+        let key = args[1]
+        if !st.lists.has(&key) { return nilBulk() }
+        let l = st.lists.atOrPut(key, [])
+        if len(l) == 0 { return nilBulk() }
+        let x = if name == "LPOP" { popFront(l) } else { pop(l) }
+        return bulk(x)
+    }
+    if name == "LLEN" {
+        if len(args) < 2 { return err("ERR wrong number of arguments for 'llen'") }
+        return integer(len(listAt(st, args[1])))
+    }
+    if name == "LRANGE" {
+        if len(args) < 4 { return err("ERR wrong number of arguments for 'lrange'") }
+        let ls = listAt(st, args[1])
+        let start0 = match parseIntArg(args[2]) { Some(n) { n } None { return err("ERR value is not an integer") } }
+        let stop0 = match parseIntArg(args[3]) { Some(n) { n } None { return err("ERR value is not an integer") } }
+        var start = if start0 < 0 { len(ls) + start0 } else { start0 }
+        var stop = if stop0 < 0 { len(ls) + stop0 } else { stop0 }
+        if start < 0 { start = 0 }
+        if stop >= len(ls) { stop = len(ls) - 1 }
+        if start > stop || start >= len(ls) { return bulkArray(&[]) }
+        return bulkArray(ls[start..stop + 1])
+    }
+    if name == "SADD" || name == "SREM" {
+        if len(args) < 3 { return err("ERR wrong number of arguments") }
+        let key = args[1]
+        let s = st.sets.atOrPut(key, [])
+        var n = 0
+        for i in 2..len(args) {
+            var at = -1
+            for j in 0..len(s) { if s[j] == args[i] { at = j } }
+            if name == "SADD" {
+                if at < 0 {
+                    append(s, args[i])
+                    n += 1
+                }
+            } else if at >= 0 {
+                let gone = removeAt(s, at)
+                n += 1
+            }
+        }
+        return integer(n)
+    }
+    if name == "SMEMBERS" {
+        if len(args) < 2 { return err("ERR wrong number of arguments for 'smembers'") }
+        let ss = setAt(st, args[1])
+        return bulkArray(&ss)
+    }
+    if name == "SISMEMBER" {
+        if len(args) < 3 { return err("ERR wrong number of arguments for 'sismember'") }
+        let ss = setAt(st, args[1])
+        for x in ss { if x == args[2] { return integer(1) } }
+        return integer(0)
+    }
+    if name == "SCAN" {
+        let ks = st.kv.keys()
+        var all: []str = ["0"]
+        for k in ks { append(mut &all, k) }
+        return bulkArray(&all)
+    }
+    if name == "RAW" {
+        return "*8\r\n+ok\r\n:42\r\n#t\r\n,1.5\r\n(12345678901234567890\r\n=9\r\ntxt:hello\r\n~2\r\n+a\r\n+b\r\n%1\r\n+k\r\n+v\r\n"
+    }
+    if name == "ATTR" {
+        return "|1\r\n+k\r\n+v\r\n+after\r\n"
+    }
+    if name == "PUSH" {
+        return ">2\r\n+message\r\n+hi\r\n"
+    }
+    if name == "NILARR" { return "*-1\r\n" }
+    if name == "EMPTY" { return "$0\r\n\r\n" }
+    if name == "NEST" { return "*2\r\n*2\r\n+a\r\n+b\r\n*1\r\n+c\r\n" }
+    if name == "BIG" {
+        let n = if len(args) > 1 { match parseIntArg(args[1]) { Some(x) { x } None { 0 } } } else { 0 }
+        var b = newStrBuf()
+        b.add("$")
+        b.addInt(n)
+        b.add("\r\n")
+        for i in 0..n { b.addByte('x') }
+        b.add("\r\n")
+        return b.toStr()
+    }
+    if name == "PUBLISH" { return integer(0) }
+    return err("ERR unknown command '" + args[0] + "'")
+}
+
+fn insert(xs: mut &[]str, at: int, v: str) {
+    append(xs, v)
+    var i = len(xs) - 1
+    while i > at {
+        swap(xs, i, i - 1)
+        i -= 1
+    }
+}
+
+fn removeAt(xs: mut &[]str, at: int): str {
+    let v = xs[at]
+    var i = at
+    while i + 1 < len(xs) {
+        xs[i] = xs[i + 1]
+        i += 1
+    }
+    let gone = pop(xs)
+    return v
+}
+
+fn popFront(xs: mut &[]str): str {
+    return removeAt(xs, 0)
+}
+
+// ---------------------------------------------------------------- the reader
+
+type Reader = record {
+    c: net.Conn
+    buf: []byte
+    r: int
+    w: int
+}
+
+fn newReader(c: net.Conn): Reader { return Reader{c: c, buf: array(4096, byte(0)), r: 0, w: 0} }
+
+fn (rd: mut &Reader) room() {
+    if rd.w < len(rd.buf) { return }
+    if rd.r > 0 {
+        let n = rd.w - rd.r
+        for i in 0..n { rd.buf[i] = rd.buf[rd.r + i] }
+        rd.r = 0
+        rd.w = n
+        return
+    }
+    var b = array(len(rd.buf) * 2, byte(0))
+    for i in 0..rd.w { b[i] = rd.buf[i] }
+    rd.buf = b
+}
+
+fn (rd: mut &Reader) fill(): bool {
+    rd.room()
+    if rd.w == len(rd.buf) { return false }
+    match rd.c.read(mut &rd.buf[rd.w..len(rd.buf)]) {
+        Ok(n) {
+            if n == 0 { return false }
+            rd.w += n
+            return true
+        }
+        Err(_) { return false }
+    }
+}
+
+fn (rd: mut &Reader) line(): Option[str] {
+    var from = rd.r
+    while true {
+        var i = from
+        while i + 1 < rd.w {
+            if rd.buf[i] == '\r' && rd.buf[i + 1] == '\n' {
+                let s = strFromBytes(&rd.buf[rd.r..i])
+                rd.r = i + 2
+                return Some(s)
+            }
+            i += 1
+        }
+        if !rd.fill() { return None }
+        from = rd.r
+    }
+    return None
+}
+
+fn (rd: mut &Reader) take(n: int): Option[str] {
+    while rd.w - rd.r < n {
+        let before = rd.w - rd.r
+        if !rd.fill() { return None }
+        if rd.w - rd.r == before { return None }
+    }
+    let s = strFromBytes(&rd.buf[rd.r..rd.r + n])
+    rd.r += n
+    return Some(s)
+}
+
+fn (rd: mut &Reader) command(): Option[[]str] {
+    let head = match rd.line() {
+        Some(s) { s }
+        None { return None }
+    }
+    if len(head) < 2 || head[0] != '*' { return None }
+    let n = match strings.parseInt(head[1..len(head)]) {
+        Ok(x) { x }
+        Err(_) { return None }
+    }
+    var out: []str = []
+    for i in 0..n {
+        let h = match rd.line() {
+            Some(s) { s }
+            None { return None }
+        }
+        if len(h) < 2 || h[0] != '$' { return None }
+        let lenArg = match strings.parseInt(h[1..len(h)]) {
+            Ok(x) { x }
+            Err(_) { return None }
+        }
+        let body = match rd.take(lenArg) {
+            Some(s) { s }
+            None { return None }
+        }
+        let tail = match rd.take(2) {
+            Some(s) { s }
+            None { return None }
+        }
+        append(mut &out, body)
+    }
+    return Some(out)
+}

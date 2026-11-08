@@ -40,8 +40,8 @@ compile the current sources (stage 2), stage 2 compile them again (stage 3),
 and requires the C of stages 2 and 3 to equal the seed; so a compiler change
 needs `compiler/reseed.sh` before the gate passes.
 
-Live gate, when the database servers are up (`lexell/tools/gate.sh live`): the
-`*_live*` library tests and the native backend on the same, with `--live`.
+Live gate, when the database servers and Redis are up (`lexell/tools/gate.sh live`):
+the `*_live*` library tests and the native backend on the same, with `--live`.
 
 Full gate, at the end of a fix round and before a merge (`lexell/tools/gate.sh full`):
 the quick gate plus the red-team harnesses, rounds 1 to 5 (`lexell/redteam/rt.py`,
@@ -117,7 +117,7 @@ lines anywhere in the file:
 | `// needs: name` | run | the test is skipped when no `lib<name>.so*` is installed (a C library its externs link) |
 
 A run test that exits with code 77 (and does not expect it) is reported as skipped:
-the library tests that need a live database server exit 77 when there is none.
+the library tests that need a live database or Redis server exit 77 when there is none.
 
 `run/` tests are run with `LXL_CHECK=1`, so a leaked object makes the exit
 code 5 and fails the test. Stdout is compared exactly. Stderr is checked only

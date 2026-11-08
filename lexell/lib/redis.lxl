@@ -1,0 +1,1530 @@
+// redis: a Redis client over RESP (Redis serialization protocol), native:
+// the client is Lexell all the way down to the socket.
+//
+//     var c = try redis.connect("redis://127.0.0.1:6379/0")
+//     try c.set("order:42", "24.49")
+//     println((try c.get("order:42")).unwrapOr("missing"))
+//     try c.hset("order:42", "amount", "24.49")
+//     println((try c.hget("order:42", "amount")).unwrapOr("missing"))
+//
+//     var cfg = redis.defaults()
+//     cfg.host = "cache.internal"
+//     cfg.port = 6380
+//     cfg.password = "secret"
+//     cfg.db = 2
+//     var c = try redis.connectWith(&cfg)
+//
+// RESP2 is the baseline; a connection asks for RESP3 with HELLO 3 and falls
+// back to RESP2 when the server does not know the command (Redis before 6).
+// The parser accepts every ordinary reply type of both versions: simple
+// strings, errors, integers, bulk and verbatim strings, arrays, maps, sets,
+// booleans, doubles, big numbers, push messages and attributes. Streamed
+// strings and aggregates (`$?`, `*?`) are rejected as protocol errors; Redis
+// does not send them for the commands here. A server error is a
+// Value.Error, not a transport error; a lost connection, a malformed reply
+// and a refused configuration are Error values.
+//
+// Commands are sent as arrays of bulk strings, never interpolated into a
+// command line. The convenience methods (get, set, hget, lpush, ...) are
+// thin wrappers over command; a command that is not covered can be sent with
+// `command(&["DO", "SOMETHING"], where)`. A connection is used by one task at
+// a time (the calls take `mut &Conn`); use one connection per task, or a
+// pool in the program, as with postgres.
+//
+// TLS is available with rediss:// and Config.tls; verification is on by
+// default and follows tls.Options (caFile, pins, client certificates). A
+// connection over a Unix socket uses unix:///path or Config.unixPath.
+//
+// Limits protect against a hostile or broken server: a protocol line of 64
+// KiB, a bulk value of Config.maxBulk (64 MiB by default), 1,000,000
+// elements or pairs in one aggregate, and 32 levels of nesting. A reply past
+// one of them is a Protocol error and the connection is unusable.
+//
+// Calls park their task (net, task) and every call that can park takes the
+// caller's location as a last std.Where, which a call leaves out (SPEC 15).
+// Config.timeoutMs bounds each socket wait (0: the task's own deadline only).
+
+import "io"
+import "net"
+import "strings"
+import "tls"
+import "task"
+
+pub const DEFAULT_HOST = "127.0.0.1"
+pub const DEFAULT_PORT = 6379
+pub const DEFAULT_TIMEOUT_MS = 30000
+pub const DEFAULT_MAX_BULK = 67108864
+
+const MAX_LINE = 65536
+const MAX_ELEMENTS = 1000000
+const MAX_DEPTH = 32
+const BUF = 4096
+
+// ---------------------------------------------------------------- errors
+
+// What went wrong. Server is a reply beginning with '-', turned into an
+// Error by a convenience method; command returns it as Value.Error instead.
+pub type Kind = value closed {
+    Config; Connect; Dns; Tls; Timeout; Cancelled; Io; Protocol; Auth; Server
+}
+
+pub fn (k: Kind) toStr(): str {
+    match k {
+        Kind.Config { return "config" }
+        Kind.Connect { return "connect" }
+        Kind.Dns { return "name lookup" }
+        Kind.Tls { return "tls" }
+        Kind.Timeout { return "timeout" }
+        Kind.Cancelled { return "cancelled" }
+        Kind.Io { return "i/o" }
+        Kind.Protocol { return "protocol" }
+        Kind.Auth { return "auth" }
+        Kind.Server { return "server" }
+    }
+}
+
+pub type Error = value record {
+    pub kind: Kind
+    pub msg: str
+}
+
+// "redis: protocol: expected CRLF after a bulk string"
+pub fn (e: Error) toStr(): str { return "redis: " + e.kind.toStr() + ": " + e.msg }
+
+fn fail(k: Kind, msg: str): Error { return Error{kind: k, msg: msg} }
+
+fn serverFail(msg: str): Error { return fail(Kind.Server, msg) }
+
+// ---------------------------------------------------------------- values
+
+// One field of a map reply.
+pub type Pair = value record {
+    pub key: Value
+    pub value: Value
+}
+
+// A reply. A RESP2 array that is logically a map (HGETALL, CONFIG GET) stays
+// an Array; a RESP3 map is a Map. Push is a pub/sub or client-tracking
+// message. Verbatim is the text after the three-byte format and ':'.
+pub type Value = value closed {
+    Nil
+    Status(str)       // a simple string reply, '+'
+    Str(str)          // a bulk string reply, '$'
+    Int(int)
+    Double(float)
+    Bool(bool)
+    BigNumber(str)
+    Verbatim(str)
+    Array([]Value)
+    Map([]Pair)
+    Set([]Value)
+    Push([]Value)
+    Error(str)
+}
+
+pub fn (v: &Value) isNil(): bool {
+    match v {
+        Value.Nil { return true }
+        else { return false }
+    }
+}
+
+pub fn (v: &Value) isError(): bool {
+    match v {
+        Value.Error(_) { return true }
+        else { return false }
+    }
+}
+
+// The text of a string-like reply (Str, Verbatim or BigNumber).
+pub fn (v: &Value) text(): Option[str] {
+    match v {
+        Value.Status(s) { return Some(s) }
+        Value.Str(s) { return Some(s) }
+        Value.Verbatim(s) { return Some(s) }
+        Value.BigNumber(s) { return Some(s) }
+        else { return None }
+    }
+}
+
+// The server's error text, for Value.Error.
+pub fn (v: &Value) errorText(): Option[str] {
+    match v {
+        Value.Error(s) { return Some(s) }
+        else { return None }
+    }
+}
+
+// The number of elements of an array, map, set or push message.
+pub fn (v: &Value) count(): int {
+    match v {
+        Value.Array(xs) { return len(xs) }
+        Value.Set(xs) { return len(xs) }
+        Value.Push(xs) { return len(xs) }
+        Value.Map(ps) { return len(ps) }
+        else { return 0 }
+    }
+}
+
+// A short debug form: strings raw, arrays in brackets, maps as key: value.
+pub fn (v: &Value) toStr(): str {
+    match v {
+        Value.Nil { return "(nil)" }
+        Value.Status(s) { return s }
+        Value.Str(s) { return s }
+        Value.Int(n) { return n.toStr() }
+        Value.Double(f) { return f.toStr() }
+        Value.Bool(b) { return b.toStr() }
+        Value.BigNumber(s) { return s }
+        Value.Verbatim(s) { return s }
+        Value.Error(s) { return "(error) " + s }
+        Value.Array(xs) { return showItems(&xs) }
+        Value.Set(xs) { return showItems(&xs) }
+        Value.Push(xs) { return showItems(&xs) }
+        Value.Map(ps) { return showPairs(&ps) }
+    }
+}
+
+fn showItems(xs: &[Value]): str {
+    var b = newStrBuf()
+    b.add("[")
+    for i in 0..len(xs) {
+        if i > 0 { b.add(", ") }
+        b.add(xs[i].toStr())
+    }
+    b.add("]")
+    return b.toStr()
+}
+
+fn showPairs(ps: &[Pair]): str {
+    var b = newStrBuf()
+    b.add("{")
+    for i in 0..len(ps) {
+        if i > 0 { b.add(", ") }
+        b.add(ps[i].key.toStr())
+        b.add(": ")
+        b.add(ps[i].value.toStr())
+    }
+    b.add("}")
+    return b.toStr()
+}
+
+// ---------------------------------------------------------------- configuration
+
+pub type Config = value record {
+    pub host: str
+    pub port: int
+    pub unixPath: str          // when set, connect to this Unix socket instead
+    pub username: str          // ACL user; "" means the default user
+    pub password: str          // "" means no AUTH
+    pub db: int                // SELECT db, 0 when not needed
+    pub tls: bool              // rediss://, or set by hand
+    pub tlsOptions: tls.Options
+    pub tlsName: str           // the name checked and sent as SNI; "" uses host
+    pub timeoutMs: int         // each socket wait; 0: none
+    pub maxBulk: int           // the largest bulk value accepted
+    pub clientName: str        // CLIENT SETNAME; "" for none
+    pub resp3: bool            // ask with HELLO 3, falling back to RESP2
+}
+
+pub fn defaults(): Config {
+    return Config{host: DEFAULT_HOST, port: DEFAULT_PORT, unixPath: "", username: "", password: "", db: 0,
+                  tls: false, tlsOptions: tls.defaults(), tlsName: "", timeoutMs: DEFAULT_TIMEOUT_MS,
+                  maxBulk: DEFAULT_MAX_BULK, clientName: "", resp3: true}
+}
+
+fn hexVal(c: byte): int {
+    if c >= '0' && c <= '9' { return int(c - '0') }
+    if c >= 'a' && c <= 'f' { return int(c - 'a') + 10 }
+    if c >= 'A' && c <= 'F' { return int(c - 'A') + 10 }
+    return -1
+}
+
+// Percent-decodes a URI component; '+' is literal (Redis URIs use %20).
+fn pct(s: str): Result[str, Error] {
+    var b = newStrBuf()
+    var i = 0
+    while i < len(s) {
+        let c = s[i]
+        if c == '%' {
+            if i + 2 >= len(s) { return Err(fail(Kind.Config, "a truncated % escape in " + s)) }
+            let hi = hexVal(s[i + 1])
+            let lo = hexVal(s[i + 2])
+            if hi < 0 || lo < 0 { return Err(fail(Kind.Config, "a bad % escape in " + s)) }
+            b.addByte(byte(hi * 16 + lo))
+            i += 3
+        } else {
+            b.addByte(c)
+            i += 1
+        }
+    }
+    return Ok(b.toStr())
+}
+
+fn queryValue(q: str, name: str): Option[str] {
+    for part in split(q, '&') {
+        let eq = indexOf(part, "=", 0)
+        if eq >= 0 {
+            let key = part[0..eq]
+            if key == name { return Some(part[eq + 1..len(part)]) }
+        }
+    }
+    return None
+}
+
+fn parseDb(s: str): Result[int, Error] {
+    match strings.parseInt(s) {
+        Ok(n) {
+            if n < 0 { return Err(fail(Kind.Config, "a negative database number: " + s)) }
+            return Ok(n)
+        }
+        Err(_) { return Err(fail(Kind.Config, "a database number that is not an integer: " + s)) }
+    }
+}
+
+fn parseTimeout(s: str): Result[int, Error] {
+    match strings.parseInt(s) {
+        Ok(n) {
+            if n < 0 { return Err(fail(Kind.Config, "a negative timeout: " + s)) }
+            return Ok(n)
+        }
+        Err(_) { return Err(fail(Kind.Config, "a timeout that is not an integer: " + s)) }
+    }
+}
+
+fn parseBool(s: str): Result[bool, Error] {
+    if s == "1" || s == "true" { return Ok(true) }
+    if s == "0" || s == "false" { return Ok(false) }
+    return Err(fail(Kind.Config, "a boolean that is not true or false: " + s))
+}
+
+// redis://[[user]:password@]host[:port][/db][?db=N&timeout=MS]
+// rediss:// is the same with TLS. unix:///path[?db=N] is a Unix socket.
+// A string with no "://" is host[:port].
+pub fn parseUrl(text: str): Result[Config, Error] {
+    var cfg = defaults()
+    let s = trim(text)
+    if len(s) == 0 { return Err(fail(Kind.Config, "empty connection string")) }
+    var rest = s
+    var scheme = ""
+    let at = indexOf(s, "://", 0)
+    if at >= 0 {
+        scheme = s[0..at]
+        rest = s[at + 3..len(s)]
+    }
+    if scheme == "unix" {
+        var path = rest
+        if len(path) > 1 && path[0] == '/' && path[1] == '/' { path = path[1..len(path)] }
+        var q = ""
+        let qm = indexOf(path, "?", 0)
+        if qm >= 0 {
+            q = path[qm + 1..len(path)]
+            path = path[0..qm]
+        }
+        try urlQuery(mut &cfg, q)
+        cfg.unixPath = path
+        cfg.host = ""
+        cfg.port = 0
+        return Ok(cfg)
+    }
+    if scheme == "rediss" {
+        cfg.tls = true
+    } else if scheme != "redis" && len(scheme) > 0 {
+        return Err(fail(Kind.Config, "unknown scheme '" + scheme + "'"))
+    }
+    var authority = rest
+    var path = ""
+    var q = ""
+    let slash = indexOf(authority, "/", 0)
+    if slash >= 0 {
+        path = authority[slash + 1..len(authority)]
+        authority = authority[0..slash]
+    }
+    let qm = indexOf(path, "?", 0)
+    if qm >= 0 {
+        q = path[qm + 1..len(path)]
+        path = path[0..qm]
+    }
+    var userinfo = ""
+    let atSign = strings.lastIndexOf(authority, "@")
+    if atSign >= 0 {
+        userinfo = authority[0..atSign]
+        authority = authority[atSign + 1..len(authority)]
+    }
+    if len(userinfo) > 0 {
+        let colon = indexOf(userinfo, ":", 0)
+        if colon >= 0 {
+            cfg.username = try pct(userinfo[0..colon])
+            cfg.password = try pct(userinfo[colon + 1..len(userinfo)])
+        } else {
+            cfg.username = try pct(userinfo)
+        }
+    }
+    if len(authority) > 0 { try parseAuthority(mut &cfg, authority) }
+    if len(path) > 0 { cfg.db = try parseDb(path) }
+    try urlQuery(mut &cfg, q)
+    return Ok(cfg)
+}
+
+fn urlQuery(cfg: mut &Config, q: str): Result[Unit, Error] {
+    if len(q) == 0 { return Ok(Unit{}) }
+    match queryValue(q, "db") {
+        Some(v) { cfg.db = try parseDb(v) }
+        None {}
+    }
+    match queryValue(q, "timeout") {
+        Some(v) { cfg.timeoutMs = try parseTimeout(v) }
+        None {}
+    }
+    match queryValue(q, "username") {
+        Some(v) { cfg.username = v }
+        None {}
+    }
+    match queryValue(q, "password") {
+        Some(v) { cfg.password = v }
+        None {}
+    }
+    match queryValue(q, "resp3") {
+        Some(v) { cfg.resp3 = try parseBool(v) }
+        None {}
+    }
+    return Ok(Unit{})
+}
+
+fn parseAuthority(cfg: mut &Config, a: str): Result[Unit, Error] {
+    if len(a) == 0 { return Err(fail(Kind.Config, "the host is empty")) }
+    if a[0] == '[' {
+        let close = indexOf(a, "]", 0)
+        if close < 0 { return Err(fail(Kind.Config, "an unclosed IPv6 address: " + a)) }
+        cfg.host = a[1..close]
+        if close + 1 < len(a) {
+            if a[close + 1] != ':' { return Err(fail(Kind.Config, "unexpected text after an IPv6 address: " + a)) }
+            cfg.port = try parsePort(a[close + 2..len(a)])
+        }
+        return Ok(Unit{})
+    }
+    let colon = strings.lastIndexOf(a, ":")
+    if colon >= 0 {
+        cfg.host = a[0..colon]
+        cfg.port = try parsePort(a[colon + 1..len(a)])
+    } else {
+        cfg.host = a
+    }
+    if len(cfg.host) == 0 { return Err(fail(Kind.Config, "the host is empty")) }
+    return Ok(Unit{})
+}
+
+fn parsePort(s: str): Result[int, Error] {
+    match strings.parseInt(s) {
+        Ok(n) {
+            if n < 1 || n > 65535 { return Err(fail(Kind.Config, "a port outside 1..65535: " + s)) }
+            return Ok(n)
+        }
+        Err(_) { return Err(fail(Kind.Config, "a port that is not an integer: " + s)) }
+    }
+}
+
+fn hostPort(cfg: &Config): str {
+    if len(cfg.host) == 0 { return "127.0.0.1:" + cfg.port.toStr() }
+    if contains(cfg.host, ":") && !startsWith(cfg.host, "[") {
+        return "[" + cfg.host + "]:" + cfg.port.toStr()
+    }
+    return cfg.host + ":" + cfg.port.toStr()
+}
+
+// ---------------------------------------------------------------- the stream
+
+// What a connection reads and writes through: plain TCP, TLS over TCP, or a
+// Unix socket (which is a net.Conn too).
+type Stream = value closed {
+    Tcp(net.Conn)
+    Tls(tls.Conn)
+    Gone
+}
+
+type SErr = value record {
+    errno: int
+    io: io.IoError
+    tls: str
+}
+
+fn sockErr(e: io.IoError): SErr { return SErr{errno: e.errno, io: e, tls: ""} }
+
+fn tlsErr(e: tls.Error): SErr {
+    if e.kind == tls.Kind.Io || e.kind == tls.Kind.Timeout || e.kind == tls.Kind.Cancelled { return sockErr(e.cause) }
+    return SErr{errno: 0, io: io.ioError(0, "", ""), tls: e.kind.toStr() + ": " + e.msg}
+}
+
+fn (s: &Stream) isTls(): bool {
+    match s {
+        Stream.Tls(_) { return true }
+        else { return false }
+    }
+}
+
+fn (s: mut &Stream) takeTls(): tls.Conn {
+    match replace(s, Stream.Gone) {
+        Stream.Tls(t) { return t }
+        else { panic("redis: not a TLS stream") }
+    }
+}
+
+fn (s: mut &Stream) putTls(t: tls.Conn) { let old = replace(s, Stream.Tls(t)) }
+
+fn (s: mut &Stream) read(b: mut &[byte], ms: int, w: Where): Result[int, SErr] {
+    if s.isTls() {
+        var t = s.takeTls()
+        let r = if ms > 0 { t.readFor(b, ms, w) } else { t.read(b, w) }
+        s.putTls(t)
+        return match r {
+            Ok(n) { Ok(n) }
+            Err(e) { Err(tlsErr(e)) }
+        }
+    }
+    match s {
+        Stream.Tcp(c) {
+            let r = if ms > 0 { c.readFor(b, ms, w) } else { c.read(b, w) }
+            return match r {
+                Ok(n) { Ok(n) }
+                Err(e) { Err(sockErr(e)) }
+            }
+        }
+        else { return Err(sockErr(io.ioError(9, "read", ""))) }
+    }
+}
+
+fn (s: mut &Stream) write(data: &[byte], ms: int, w: Where): Result[Unit, SErr] {
+    if s.isTls() {
+        var t = s.takeTls()
+        let r = if ms > 0 { t.writeFor(data, ms, w) } else { t.write(data, w) }
+        s.putTls(t)
+        return match r {
+            Ok(_) { Ok(Unit{}) }
+            Err(e) { Err(tlsErr(e)) }
+        }
+    }
+    match s {
+        Stream.Tcp(c) {
+            let r = if ms > 0 { c.writeFor(data, ms, w) } else { c.write(data, w) }
+            return match r {
+                Ok(_) { Ok(Unit{}) }
+                Err(e) { Err(sockErr(e)) }
+            }
+        }
+        else { return Err(sockErr(io.ioError(9, "write", ""))) }
+    }
+}
+
+fn (s: mut &Stream) writeStr(data: str, ms: int, w: Where): Result[Unit, SErr] {
+    let b = strToBytes(data)
+    return s.write(&b, ms, w)
+}
+
+// ---------------------------------------------------------------- connection
+
+pub type Conn = record {
+    s: Stream
+    buf: []byte
+    r: int
+    w: int
+    timeoutMs: int
+    maxBulk: int
+    resp3: bool
+    db: int
+    addr: str
+    tx: bool          // inside MULTI (a lease with this set is not reusable)
+    broken: bool      // a transport or protocol error: the connection is unusable
+}
+
+fn streamError(e: SErr, op: str): Error {
+    if len(e.tls) > 0 { return fail(Kind.Tls, e.tls) }
+    let x = e.io
+    if x.isTimeout() { return fail(Kind.Timeout, x.toStr()) }
+    if x.isCancelled() { return fail(Kind.Cancelled, x.toStr()) }
+    if x.isLookup() { return fail(Kind.Dns, x.toStr()) }
+    return fail(Kind.Io, x.toStr())
+}
+
+fn connectError(e: io.IoError): Error {
+    if e.isTimeout() { return fail(Kind.Timeout, e.toStr()) }
+    if e.isCancelled() { return fail(Kind.Cancelled, e.toStr()) }
+    if e.isLookup() { return fail(Kind.Dns, e.toStr()) }
+    return fail(Kind.Connect, e.toStr())
+}
+
+// Connects with a redis://, rediss:// or unix:// URL (parseUrl).
+pub fn connect(text: str, w: Where): Result[Conn, Error] {
+    let cfg = try parseUrl(text)
+    return connectWith(&cfg, w)
+}
+
+// Connects with a configuration. TLS options are checked before the socket
+// is opened, so a bad CA file fails without a connection.
+pub fn connectWith(cfg: &Config, w: Where): Result[Conn, Error] {
+    if cfg.tls && len(cfg.unixPath) > 0 {
+        return Err(fail(Kind.Config, "TLS over a Unix socket is not supported"))
+    }
+    var ctx: Option[tls.Context] = None
+    if cfg.tls {
+        let c = match tls.client(cfg.tlsOptions) {
+            Ok(x) { x }
+            Err(e) { return Err(fail(Kind.Tls, e.kind.toStr() + ": " + e.msg)) }
+        }
+        ctx = Some(c)
+    }
+    var sock: Option[net.Conn] = None
+    if len(cfg.unixPath) > 0 {
+        sock = Some(match net.connectUnix(cfg.unixPath, w) {
+            Ok(c) { c }
+            Err(e) { return Err(connectError(e)) }
+        })
+    } else {
+        let nc = match net.dial(hostPort(cfg), w) {
+            Ok(c) { c }
+            Err(e) { return Err(connectError(e)) }
+        }
+        match nc.setNoDelay(true) {
+            Ok(_) {}
+            Err(e) { return Err(connectError(e)) }
+        }
+        sock = Some(nc)
+    }
+    let nc = match move(sock) {
+        Some(c) { c }
+        None { return Err(fail(Kind.Connect, "no socket")) }
+    }
+    var stream = Stream.Gone
+    let serverName = if len(cfg.tlsName) > 0 { cfg.tlsName } else { cfg.host }
+    match move(ctx) {
+        Some(c) {
+            let t = match c.connect(nc, serverName, w) {
+                Ok(x) { x }
+                Err(e) { return Err(fail(Kind.Tls, e.kind.toStr() + ": " + e.msg)) }
+            }
+            stream = Stream.Tls(t)
+        }
+        None { stream = Stream.Tcp(nc) }
+    }
+    let addr = if len(cfg.unixPath) > 0 { "unix:" + cfg.unixPath } else { hostPort(cfg) }
+    var conn = Conn{s: stream, buf: array(BUF, byte(0)), r: 0, w: 0, timeoutMs: cfg.timeoutMs,
+                    maxBulk: cfg.maxBulk, resp3: cfg.resp3, db: cfg.db, addr: addr, tx: false, broken: false}
+    try login(mut &conn, cfg, w)
+    return Ok(conn)
+}
+
+// Closes the connection; dropping it does the same.
+pub fn (c: Conn) close() {}
+
+fn login(c: mut &Conn, cfg: &Config, w: Where): Result[Unit, Error] {
+    if len(cfg.password) > 0 {
+        var args: []str = ["AUTH"]
+        if len(cfg.username) > 0 { append(mut &args, cfg.username) }
+        append(mut &args, cfg.password)
+        let r = try c.command(&args, w)
+        match r {
+            Value.Status(s) {
+                if s != "OK" { return Err(fail(Kind.Auth, "AUTH: " + s)) }
+            }
+            Value.Str(s) {
+                if s != "OK" { return Err(fail(Kind.Auth, "AUTH: " + s)) }
+            }
+            Value.Error(s) { return Err(fail(Kind.Auth, s)) }
+            else { return Err(fail(Kind.Protocol, "AUTH: unexpected reply " + r.toStr())) }
+        }
+    }
+    if cfg.resp3 {
+        let r = try c.command(&["HELLO", "3"], w)
+        match r {
+            Value.Map(_) {}
+            else { c.resp3 = false }
+        }
+    }
+    if cfg.db != 0 {
+        let r = try c.command(&["SELECT", cfg.db.toStr()], w)
+        match r {
+            Value.Status(s) {
+                if s != "OK" { return Err(serverFail("SELECT: " + s)) }
+            }
+            Value.Str(s) {
+                if s != "OK" { return Err(serverFail("SELECT: " + s)) }
+            }
+            Value.Error(s) { return Err(serverFail(s)) }
+            else { return Err(fail(Kind.Protocol, "SELECT: unexpected reply " + r.toStr())) }
+        }
+        c.db = cfg.db
+    }
+    if len(cfg.clientName) > 0 {
+        let r = try c.command(&["CLIENT", "SETNAME", cfg.clientName], w)
+        match r {
+            Value.Status(s) {
+                if s != "OK" { return Err(serverFail("CLIENT SETNAME: " + s)) }
+            }
+            Value.Str(s) {
+                if s != "OK" { return Err(serverFail("CLIENT SETNAME: " + s)) }
+            }
+            Value.Error(s) { return Err(serverFail(s)) }
+            else { return Err(fail(Kind.Protocol, "CLIENT SETNAME: unexpected reply " + r.toStr())) }
+        }
+    }
+    return Ok(Unit{})
+}
+
+// ---------------------------------------------------------------- commands
+
+// Sends one command and reads its reply.
+pub fn command(c: mut &Conn, args: &[str], w: Where): Result[Value, Error] {
+    try send(c, args, w)
+    let r = try receive(c, w)
+    updateTx(c, args, &r)
+    return Ok(r)
+}
+
+fn updateTx(c: mut &Conn, args: &[str], r: &Value) {
+    if len(args) == 0 { return }
+    let name = strings.toUpper(args[0])
+    if name == "MULTI" {
+        match r {
+            Value.Status(s) { if s == "OK" { c.tx = true } }
+            Value.Str(s) { if s == "OK" { c.tx = true } }
+            else {}
+        }
+    } else if name == "EXEC" || name == "DISCARD" || name == "RESET" {
+        c.tx = false
+        if name == "RESET" { c.db = 0 }
+    } else if name == "SELECT" && len(args) > 1 {
+        match strings.parseInt(args[1]) {
+            Ok(n) { if n >= 0 { c.db = n } }
+            Err(_) {}
+        }
+    }
+}
+
+// Whether the connection can go back to a pool: no transaction open, no
+// error since the last command.
+pub fn (c: &Conn) idle(): bool { return !c.tx && !c.broken }
+
+// Whether a MULTI has not yet been followed by EXEC or DISCARD.
+pub fn (c: &Conn) inTransaction(): bool { return c.tx }
+
+// The method form of command.
+pub fn (c: mut &Conn) command(args: &[str], w: Where): Result[Value, Error] {
+    return command(c, args, w)
+}
+
+pub fn (c: mut &Conn) send(args: &[str], w: Where): Result[Unit, Error] {
+    return send(c, args, w)
+}
+
+pub fn (c: mut &Conn) receive(w: Where): Result[Value, Error] {
+    return receive(c, w)
+}
+
+pub fn (c: mut &Conn) next(w: Where): Result[Value, Error] {
+    return next(c, w)
+}
+
+// Sends a command without reading its reply (pipelining). Follow it with
+// receive, once per command.
+pub fn send(c: mut &Conn, args: &[str], w: Where): Result[Unit, Error] {
+    if len(args) == 0 { return Err(fail(Kind.Config, "an empty command")) }
+    var b = newStrBuf()
+    b.add("*")
+    b.addInt(len(args))
+    b.add("\r\n")
+    for a in args {
+        b.add("$")
+        b.addInt(len(a))
+        b.add("\r\n")
+        b.add(a)
+        b.add("\r\n")
+    }
+    match c.s.writeStr(b.toStr(), c.timeoutMs, w) {
+        Ok(_) { return Ok(Unit{}) }
+        Err(e) {
+            c.broken = true
+            return Err(streamError(e, "write"))
+        }
+    }
+}
+
+// Reads one reply.
+pub fn receive(c: mut &Conn, w: Where): Result[Value, Error] {
+    match readValue(c, 0, w) {
+        Ok(v) { return Ok(v) }
+        Err(e) {
+            c.broken = true
+            return Err(e)
+        }
+    }
+}
+
+// Reads one reply without a preceding command (a pub/sub message, or a
+// client-tracking push).
+pub fn next(c: mut &Conn, w: Where): Result[Value, Error] { return readValue(c, 0, w) }
+
+fn readValue(c: mut &Conn, depth: int, w: Where): Result[Value, Error] {
+    if depth > MAX_DEPTH { return Err(fail(Kind.Protocol, "a reply nested more than 32 levels")) }
+    let line = try readLine(c, w)
+    if len(line) == 0 { return Err(fail(Kind.Protocol, "an empty reply line")) }
+    let kind = line[0]
+    let rest = line[1..len(line)]
+    match kind {
+        '+' { return Ok(Value.Status(rest)) }
+        '-' { return Ok(Value.Error(rest)) }
+        ':' { return Ok(Value.Int(try lineInt(rest, "integer"))) }
+        '_' { return Ok(Value.Nil) }
+        '#' {
+            if rest == "t" { return Ok(Value.Bool(true)) }
+            if rest == "f" { return Ok(Value.Bool(false)) }
+            return Err(fail(Kind.Protocol, "a boolean that is not #t or #f: " + rest))
+        }
+        ',' {
+            var f = 0.0f
+            if !parseFloat(rest, mut &f) { return Err(fail(Kind.Protocol, "a double that is not a number: " + rest)) }
+            return Ok(Value.Double(f))
+        }
+        '(' { return Ok(Value.BigNumber(rest)) }
+        '$' { return readBulk(c, rest, false, w) }
+        '!' { return readBulk(c, rest, true, w) }
+        '=' { return readVerbatim(c, rest, w) }
+        '*' { return readArray(c, rest, depth, w) }
+        '~' { return readSet(c, rest, depth, w) }
+        '>' { return readPush(c, rest, depth, w) }
+        '%' { return readMap(c, rest, depth, w) }
+        '|' {
+            let n = try lineInt(rest, "attribute count")
+            if n < 0 || n > MAX_ELEMENTS { return Err(fail(Kind.Protocol, "an attribute count out of range: " + rest)) }
+            for i in 0..n {
+                let k = try readValue(c, depth + 1, w)
+                let v = try readValue(c, depth + 1, w)
+            }
+            return readValue(c, depth, w)
+        }
+        else { return Err(fail(Kind.Protocol, "an unknown reply type '" + strFromBytes(&[kind]) + "'")) }
+    }
+}
+
+fn lineInt(s: str, what: str): Result[int, Error] {
+    match strings.parseInt(s) {
+        Ok(n) { return Ok(n) }
+        Err(_) { return Err(fail(Kind.Protocol, "a " + what + " that is not an integer: " + s)) }
+    }
+}
+
+fn readBulk(c: mut &Conn, rest: str, isError: bool, w: Where): Result[Value, Error] {
+    let n = try lineInt(rest, "bulk length")
+    if n == -1 { return Ok(Value.Nil) }
+    if n < 0 { return Err(fail(Kind.Protocol, "a negative bulk length: " + rest)) }
+    if n > c.maxBulk {
+        return Err(fail(Kind.Protocol, "a bulk value of " + n.toStr() + " bytes (over maxBulk)"))
+    }
+    let text = try readN(c, n, w)
+    try expectCrlf(c, w)
+    if isError { return Ok(Value.Error(text)) }
+    return Ok(Value.Str(text))
+}
+
+fn readVerbatim(c: mut &Conn, rest: str, w: Where): Result[Value, Error] {
+    let n = try lineInt(rest, "verbatim length")
+    if n < 0 { return Err(fail(Kind.Protocol, "a negative verbatim length: " + rest)) }
+    if n > c.maxBulk {
+        return Err(fail(Kind.Protocol, "a verbatim value of " + n.toStr() + " bytes (over maxBulk)"))
+    }
+    let text = try readN(c, n, w)
+    try expectCrlf(c, w)
+    if len(text) >= 4 && text[3] == ':' { return Ok(Value.Verbatim(text[4..len(text)])) }
+    return Ok(Value.Verbatim(text))
+}
+
+fn readArray(c: mut &Conn, rest: str, depth: int, w: Where): Result[Value, Error] {
+    let n = try lineInt(rest, "array length")
+    if n == -1 { return Ok(Value.Nil) }
+    if n < 0 || n > MAX_ELEMENTS { return Err(fail(Kind.Protocol, "an array length out of range: " + rest)) }
+    var xs: []Value = []
+    for i in 0..n { append(mut &xs, try readValue(c, depth + 1, w)) }
+    return Ok(Value.Array(xs))
+}
+
+fn readSet(c: mut &Conn, rest: str, depth: int, w: Where): Result[Value, Error] {
+    let n = try lineInt(rest, "set length")
+    if n < 0 || n > MAX_ELEMENTS { return Err(fail(Kind.Protocol, "a set length out of range: " + rest)) }
+    var xs: []Value = []
+    for i in 0..n { append(mut &xs, try readValue(c, depth + 1, w)) }
+    return Ok(Value.Set(xs))
+}
+
+fn readPush(c: mut &Conn, rest: str, depth: int, w: Where): Result[Value, Error] {
+    let n = try lineInt(rest, "push length")
+    if n < 0 || n > MAX_ELEMENTS { return Err(fail(Kind.Protocol, "a push length out of range: " + rest)) }
+    var xs: []Value = []
+    for i in 0..n { append(mut &xs, try readValue(c, depth + 1, w)) }
+    return Ok(Value.Push(xs))
+}
+
+fn readMap(c: mut &Conn, rest: str, depth: int, w: Where): Result[Value, Error] {
+    let n = try lineInt(rest, "map length")
+    if n < 0 || n > MAX_ELEMENTS { return Err(fail(Kind.Protocol, "a map length out of range: " + rest)) }
+    var ps: []Pair = []
+    for i in 0..n {
+        let k = try readValue(c, depth + 1, w)
+        let v = try readValue(c, depth + 1, w)
+        append(mut &ps, Pair{key: k, value: v})
+    }
+    return Ok(Value.Map(ps))
+}
+
+// Makes room after buf[w]: moves unread bytes to the front, or grows the
+// buffer up to MAX_LINE + BUF when it is full of them.
+fn room(c: mut &Conn) {
+    if c.w < len(c.buf) { return }
+    if c.r > 0 {
+        let n = c.w - c.r
+        for i in 0..n { c.buf[i] = c.buf[c.r + i] }
+        c.r = 0
+        c.w = n
+        return
+    }
+    if len(c.buf) < MAX_LINE + BUF {
+        var bigger = array(len(c.buf) * 2, byte(0))
+        for i in 0..c.w { bigger[i] = c.buf[i] }
+        c.buf = bigger
+    }
+}
+
+fn fill(c: mut &Conn, w: Where): Result[int, Error] {
+    room(c)
+    if c.w == len(c.buf) { return Ok(-1) }
+    match c.s.read(mut &c.buf[c.w..len(c.buf)], c.timeoutMs, w) {
+        Ok(n) {
+            c.w += n
+            return Ok(n)
+        }
+        Err(e) { return Err(streamError(e, "read")) }
+    }
+}
+
+fn readLine(c: mut &Conn, w: Where): Result[str, Error] {
+    var from = c.r
+    while true {
+        var i = from
+        while i + 1 < c.w {
+            if c.buf[i] == '\r' && c.buf[i + 1] == '\n' {
+                let line = strFromBytes(&c.buf[c.r..i])
+                c.r = i + 2
+                return Ok(line)
+            }
+            i += 1
+        }
+        if c.w - c.r > MAX_LINE { return Err(fail(Kind.Protocol, "a line over 64 KiB")) }
+        let n = try fill(c, w)
+        if n == 0 { return Err(fail(Kind.Io, "the connection closed inside a reply")) }
+        if n < 0 { return Err(fail(Kind.Protocol, "a line over 64 KiB")) }
+        from = if c.w > n + 1 { c.w - n - 1 } else { c.r }
+    }
+}
+
+fn readN(c: mut &Conn, n: int, w: Where): Result[str, Error] {
+    if n == 0 { return Ok("") }
+    let have = c.w - c.r
+    if have >= n {
+        let s = strFromBytes(&c.buf[c.r..c.r + n])
+        c.r += n
+        return Ok(s)
+    }
+    var out = array(n, byte(0))
+    var got = 0
+    if have > 0 {
+        for i in 0..have { out[i] = c.buf[c.r + i] }
+        got = have
+        c.r = c.w
+    }
+    while got < n {
+        let k = match c.s.read(mut &out[got..n], c.timeoutMs, w) {
+            Ok(x) { x }
+            Err(e) { return Err(streamError(e, "read")) }
+        }
+        if k == 0 { return Err(fail(Kind.Io, "the connection closed inside a bulk value")) }
+        got += k
+    }
+    return Ok(strFromBytes(&out))
+}
+
+fn expectCrlf(c: mut &Conn, w: Where): Result[Unit, Error] {
+    let b = try readN(c, 2, w)
+    if b != "\r\n" { return Err(fail(Kind.Protocol, "a bulk value not followed by CRLF")) }
+    return Ok(Unit{})
+}
+
+// ---------------------------------------------------------------- convenience commands
+
+fn replyStr(v: &Value): Result[str, Error] {
+    match v {
+        Value.Status(s) { return Ok(s) }
+        Value.Str(s) { return Ok(s) }
+        Value.Error(s) { return Err(serverFail(s)) }
+        else { return Err(fail(Kind.Protocol, "expected a string, got " + v.toStr())) }
+    }
+}
+
+fn replyInt(v: &Value): Result[int, Error] {
+    match v {
+        Value.Int(n) { return Ok(n) }
+        Value.Error(s) { return Err(serverFail(s)) }
+        else { return Err(fail(Kind.Protocol, "expected an integer, got " + v.toStr())) }
+    }
+}
+
+fn replyOptStr(v: &Value): Result[Option[str], Error] {
+    match v {
+        Value.Status(s) { return Ok(Some(s)) }
+        Value.Str(s) { return Ok(Some(s)) }
+        Value.Nil { return Ok(None) }
+        Value.Error(s) { return Err(serverFail(s)) }
+        else { return Err(fail(Kind.Protocol, "expected a string or nil, got " + v.toStr())) }
+    }
+}
+
+fn replyOk(v: &Value): Result[Unit, Error] {
+    match v {
+        Value.Status(s) {
+            if s == "OK" { return Ok(Unit{}) }
+            return Err(serverFail(s))
+        }
+        Value.Str(s) {
+            if s == "OK" { return Ok(Unit{}) }
+            return Err(serverFail(s))
+        }
+        Value.Error(s) { return Err(serverFail(s)) }
+        else { return Err(fail(Kind.Protocol, "expected OK, got " + v.toStr())) }
+    }
+}
+
+fn strList(v: &Value): Result[[]str, Error] {
+    match v {
+        Value.Array(xs) {
+            var out: []str = []
+            for x in xs {
+                match x {
+                    Value.Status(s) { append(mut &out, s) }
+                    Value.Str(s) { append(mut &out, s) }
+                    Value.Nil { append(mut &out, "") }
+                    Value.Error(s) { return Err(serverFail(s)) }
+                    else { return Err(fail(Kind.Protocol, "a non-string in an array: " + x.toStr())) }
+                }
+            }
+            return Ok(out)
+        }
+        Value.Set(xs) {
+            var out: []str = []
+            for x in xs {
+                match x {
+                    Value.Status(s) { append(mut &out, s) }
+                    Value.Str(s) { append(mut &out, s) }
+                    Value.Error(s) { return Err(serverFail(s)) }
+                    else { return Err(fail(Kind.Protocol, "a non-string in a set: " + x.toStr())) }
+                }
+            }
+            return Ok(out)
+        }
+        Value.Error(s) { return Err(serverFail(s)) }
+        else { return Err(fail(Kind.Protocol, "expected an array, got " + v.toStr())) }
+    }
+}
+
+pub fn ping(c: mut &Conn, w: Where): Result[str, Error] {
+    return replyStr(&try c.command(&["PING"], w))
+}
+
+pub fn (c: mut &Conn) ping(w: Where): Result[str, Error] { return ping(c, w) }
+
+pub fn echo(c: mut &Conn, text: str, w: Where): Result[str, Error] {
+    return replyStr(&try c.command(&["ECHO", text], w))
+}
+
+pub fn (c: mut &Conn) echo(text: str, w: Where): Result[str, Error] { return echo(c, text, w) }
+
+// GET; None for a missing key.
+pub fn (c: mut &Conn) get(key: str, w: Where): Result[Option[str], Error] {
+    return replyOptStr(&try c.command(&["GET", key], w))
+}
+
+pub fn (c: mut &Conn) set(key: str, value: str, w: Where): Result[Unit, Error] {
+    return replyOk(&try c.command(&["SET", key, value], w))
+}
+
+// SET key value EX seconds.
+pub fn (c: mut &Conn) setEx(key: str, value: str, seconds: int, w: Where): Result[Unit, Error] {
+    return replyOk(&try c.command(&["SET", key, value, "EX", seconds.toStr()], w))
+}
+
+// SET key value NX: true when the key was set.
+pub fn (c: mut &Conn) setNx(key: str, value: str, w: Where): Result[bool, Error] {
+    let r = try c.command(&["SET", key, value, "NX"], w)
+    match r {
+        Value.Status(s) {
+            if s == "OK" { return Ok(true) }
+            return Err(serverFail(s))
+        }
+        Value.Str(s) {
+            if s == "OK" { return Ok(true) }
+            return Err(serverFail(s))
+        }
+        Value.Nil { return Ok(false) }
+        Value.Error(s) { return Err(serverFail(s)) }
+        else { return Err(fail(Kind.Protocol, "SET NX: unexpected reply " + r.toStr())) }
+    }
+}
+
+// GETDEL.
+pub fn (c: mut &Conn) getDel(key: str, w: Where): Result[Option[str], Error] {
+    return replyOptStr(&try c.command(&["GETDEL", key], w))
+}
+
+// DEL: the number of keys removed.
+pub fn (c: mut &Conn) del(keys: &[str], w: Where): Result[int, Error] {
+    if len(keys) == 0 { return Ok(0) }
+    var args: []str = ["DEL"]
+    for k in keys { append(mut &args, k) }
+    return replyInt(&try c.command(&args, w))
+}
+
+pub fn (c: mut &Conn) exists(keys: &[str], w: Where): Result[int, Error] {
+    if len(keys) == 0 { return Ok(0) }
+    var args: []str = ["EXISTS"]
+    for k in keys { append(mut &args, k) }
+    return replyInt(&try c.command(&args, w))
+}
+
+pub fn (c: mut &Conn) expire(key: str, seconds: int, w: Where): Result[bool, Error] {
+    let r = try c.command(&["EXPIRE", key, seconds.toStr()], w)
+    let n = try replyInt(&r)
+    return Ok(n == 1)
+}
+
+// TTL in seconds: -2 when the key is missing, -1 when it has no expiry.
+pub fn (c: mut &Conn) ttl(key: str, w: Where): Result[int, Error] {
+    return replyInt(&try c.command(&["TTL", key], w))
+}
+
+pub fn (c: mut &Conn) incrBy(key: str, delta: int, w: Where): Result[int, Error] {
+    return replyInt(&try c.command(&["INCRBY", key, delta.toStr()], w))
+}
+
+pub fn (c: mut &Conn) incr(key: str, w: Where): Result[int, Error] { return c.incrBy(key, 1, w) }
+
+pub fn (c: mut &Conn) decrBy(key: str, delta: int, w: Where): Result[int, Error] {
+    return replyInt(&try c.command(&["DECRBY", key, delta.toStr()], w))
+}
+
+pub fn (c: mut &Conn) decr(key: str, w: Where): Result[int, Error] { return c.decrBy(key, 1, w) }
+
+pub fn (c: mut &Conn) mset(pairs: &[PairStr], w: Where): Result[Unit, Error] {
+    var args: []str = ["MSET"]
+    for p in pairs {
+        append(mut &args, p.key)
+        append(mut &args, p.value)
+    }
+    return replyOk(&try c.command(&args, w))
+}
+
+pub fn (c: mut &Conn) mget(keys: &[str], w: Where): Result[[]Option[str], Error] {
+    var args: []str = ["MGET"]
+    for k in keys { append(mut &args, k) }
+    let v = try c.command(&args, w)
+    match v {
+        Value.Array(xs) {
+            var out: []Option[str] = []
+            for x in xs {
+                match x {
+                    Value.Status(s) { append(mut &out, Some(s)) }
+                    Value.Str(s) { append(mut &out, Some(s)) }
+                    Value.Nil { append(mut &out, None) }
+                    Value.Error(s) { return Err(serverFail(s)) }
+                    else { return Err(fail(Kind.Protocol, "a non-string in MGET: " + x.toStr())) }
+                }
+            }
+            return Ok(out)
+        }
+        Value.Error(s) { return Err(serverFail(s)) }
+        else { return Err(fail(Kind.Protocol, "MGET: unexpected reply " + v.toStr())) }
+    }
+}
+
+// ---------------------------------------------------------------- hashes
+
+pub type PairStr = value record {
+    pub key: str
+    pub value: str
+}
+
+pub fn (c: mut &Conn) hget(key: str, field: str, w: Where): Result[Option[str], Error] {
+    return replyOptStr(&try c.command(&["HGET", key, field], w))
+}
+
+pub fn (c: mut &Conn) hset(key: str, field: str, value: str, w: Where): Result[int, Error] {
+    return replyInt(&try c.command(&["HSET", key, field, value], w))
+}
+
+pub fn (c: mut &Conn) hdel(key: str, fields: &[str], w: Where): Result[int, Error] {
+    var args: []str = ["HDEL", key]
+    for f in fields { append(mut &args, f) }
+    return replyInt(&try c.command(&args, w))
+}
+
+pub fn (c: mut &Conn) hlen(key: str, w: Where): Result[int, Error] {
+    return replyInt(&try c.command(&["HLEN", key], w))
+}
+
+pub fn (c: mut &Conn) hexists(key: str, field: str, w: Where): Result[bool, Error] {
+    let n = try replyInt(&try c.command(&["HEXISTS", key, field], w))
+    return Ok(n == 1)
+}
+
+// HGETALL as field/value pairs, in server order. RESP2's flat array and
+// RESP3's map both become PairStr values.
+pub fn (c: mut &Conn) hgetall(key: str, w: Where): Result[[]PairStr, Error] {
+    let v = try c.command(&["HGETALL", key], w)
+    match v {
+        Value.Array(xs) {
+            if len(xs) % 2 != 0 { return Err(fail(Kind.Protocol, "HGETALL: an odd number of fields")) }
+            var out: []PairStr = []
+            var i = 0
+            while i < len(xs) {
+                let k = try replyStr(&xs[i])
+                let x = try replyStr(&xs[i + 1])
+                append(mut &out, PairStr{key: k, value: x})
+                i += 2
+            }
+            return Ok(out)
+        }
+        Value.Map(ps) {
+            var out: []PairStr = []
+            for p in ps {
+                let k = try replyStr(&p.key)
+                let x = try replyStr(&p.value)
+                append(mut &out, PairStr{key: k, value: x})
+            }
+            return Ok(out)
+        }
+        Value.Error(s) { return Err(serverFail(s)) }
+        else { return Err(fail(Kind.Protocol, "HGETALL: unexpected reply " + v.toStr())) }
+    }
+}
+
+// ---------------------------------------------------------------- lists
+
+pub fn (c: mut &Conn) lpush(key: str, values: &[str], w: Where): Result[int, Error] {
+    var args: []str = ["LPUSH", key]
+    for x in values { append(mut &args, x) }
+    return replyInt(&try c.command(&args, w))
+}
+
+pub fn (c: mut &Conn) rpush(key: str, values: &[str], w: Where): Result[int, Error] {
+    var args: []str = ["RPUSH", key]
+    for x in values { append(mut &args, x) }
+    return replyInt(&try c.command(&args, w))
+}
+
+pub fn (c: mut &Conn) lpop(key: str, w: Where): Result[Option[str], Error] {
+    return replyOptStr(&try c.command(&["LPOP", key], w))
+}
+
+pub fn (c: mut &Conn) rpop(key: str, w: Where): Result[Option[str], Error] {
+    return replyOptStr(&try c.command(&["RPOP", key], w))
+}
+
+pub fn (c: mut &Conn) llen(key: str, w: Where): Result[int, Error] {
+    return replyInt(&try c.command(&["LLEN", key], w))
+}
+
+// LRANGE with Redis's inclusive stop; -1 is the last element.
+pub fn (c: mut &Conn) lrange(key: str, start: int, stop: int, w: Where): Result[[]str, Error] {
+    return strList(&try c.command(&["LRANGE", key, start.toStr(), stop.toStr()], w))
+}
+
+// ---------------------------------------------------------------- sets
+
+pub fn (c: mut &Conn) sadd(key: str, members: &[str], w: Where): Result[int, Error] {
+    var args: []str = ["SADD", key]
+    for x in members { append(mut &args, x) }
+    return replyInt(&try c.command(&args, w))
+}
+
+pub fn (c: mut &Conn) srem(key: str, members: &[str], w: Where): Result[int, Error] {
+    var args: []str = ["SREM", key]
+    for x in members { append(mut &args, x) }
+    return replyInt(&try c.command(&args, w))
+}
+
+pub fn (c: mut &Conn) smembers(key: str, w: Where): Result[[]str, Error] {
+    return strList(&try c.command(&["SMEMBERS", key], w))
+}
+
+pub fn (c: mut &Conn) sismember(key: str, member: str, w: Where): Result[bool, Error] {
+    let n = try replyInt(&try c.command(&["SISMEMBER", key, member], w))
+    return Ok(n == 1)
+}
+
+// ---------------------------------------------------------------- other commands
+
+pub fn (c: mut &Conn) publish(channel: str, message: str, w: Where): Result[int, Error] {
+    return replyInt(&try c.command(&["PUBLISH", channel, message], w))
+}
+
+// Subscribes to channels. The reply is the subscription confirmation; read
+// messages with next, or use a loop that matches Value.Push (RESP3) and
+// Value.Array (RESP2).
+pub fn (c: mut &Conn) subscribe(channels: &[str], w: Where): Result[Value, Error] {
+    var args: []str = ["SUBSCRIBE"]
+    for x in channels { append(mut &args, x) }
+    return c.command(&args, w)
+}
+
+// SCAN. cursor is the previous reply's cursor, "0" to start.
+pub type Scan = value record {
+    pub cursor: str
+    pub keys: []str
+}
+
+pub fn (c: mut &Conn) scan(cursor: str, pattern: str, count: int, w: Where): Result[Scan, Error] {
+    var args: []str = ["SCAN", cursor]
+    if len(pattern) > 0 {
+        append(mut &args, "MATCH")
+        append(mut &args, pattern)
+    }
+    if count > 0 {
+        append(mut &args, "COUNT")
+        append(mut &args, count.toStr())
+    }
+    let v = try c.command(&args, w)
+    match v {
+        Value.Array(xs) {
+            if len(xs) != 2 { return Err(fail(Kind.Protocol, "SCAN: expected two elements")) }
+            let cur = try replyStr(&xs[0])
+            let keys = try strList(&xs[1])
+            return Ok(Scan{cursor: cur, keys: keys})
+        }
+        Value.Error(s) { return Err(serverFail(s)) }
+        else { return Err(fail(Kind.Protocol, "SCAN: unexpected reply " + v.toStr())) }
+    }
+}
+
+// MULTI/EXEC/DISCARD are plain commands; these wrappers make the common
+// case readable.
+pub fn (c: mut &Conn) multi(w: Where): Result[Unit, Error] {
+    return replyOk(&try c.command(&["MULTI"], w))
+}
+
+pub fn (c: mut &Conn) exec(w: Where): Result[Value, Error] {
+    return c.command(&["EXEC"], w)
+}
+
+pub fn (c: mut &Conn) discard(w: Where): Result[Unit, Error] {
+    return replyOk(&try c.command(&["DISCARD"], w))
+}
+
+// The connection's current database, as SELECT left it.
+pub fn (c: &Conn) database(): int { return c.db }
+
+// Whether HELLO 3 was accepted.
+pub fn (c: &Conn) isResp3(): bool { return c.resp3 }
+
+// The server address, for messages.
+pub fn (c: &Conn) address(): str { return c.addr }
+
+// ---------------------------------------------------------------- pools
+
+// A pool of at most `size` connections to one server, for the tasks of a
+// program: acquire takes an idle connection, opens a new one while fewer
+// than size are open, or else parks until another task gives one back, first
+// come first served. A Lease gives its connection back when it is dropped,
+// unless a MULTI is open or the connection broke; that one is closed and its
+// place goes to the next waiter, which opens a new connection. A Pool is a
+// counted handle (task.Shared): copies reach the same pool, and the
+// connections close when the last copy and the last lease are gone.
+//
+//     let pool = try redis.newPool("redis://127.0.0.1:6379/0", 16)
+//     // in any task:
+//     let lease = try pool.acquire()
+//     try lease.set("order:42", "24.49")
+//
+// A connection in subscribe mode is not reusable by the pool; subscribe on a
+// connection of your own, not on a lease.
+pub type Pool = value record { sh: task.Shared[PoolState] }
+
+type PoolState = record {
+    cfg: Config
+    size: int
+    open: int                 // connections open or being opened, leased or idle
+    idle: []Conn
+    waiters: []Waiter         // first come first served
+    nextId: int
+}
+
+type Waiter = record { id: int; p: task.Promise[Option[Conn]] }
+
+// A connection taken from a pool, given back when it is dropped.
+pub type Lease = record {
+    cs: []Conn                // the leased connection: one element, none once given back
+    pool: task.Shared[PoolState]
+}
+
+// What a pool holds: connections open (leased, idle or being opened), idle,
+// and tasks waiting for one.
+pub type PoolStats = value record { pub open: int; pub idle: int; pub waiting: int }
+
+// A pool over a redis://, rediss:// or unix:// URL; an invalid URL is Err.
+pub fn newPool(text: str, size: int): Result[Pool, Error] {
+    let cfg = try parseUrl(text)
+    return Ok(newPoolWith(cfg, size))
+}
+
+pub fn newPoolWith(cfg: Config, size: int): Pool {
+    let n = if size < 1 { 1 } else { size }
+    return Pool{sh: task.shared(PoolState{cfg: cfg, size: n, open: 0, idle: [], waiters: [], nextId: 0})}
+}
+
+pub fn (p: &Pool) stats(): PoolStats {
+    var r = PoolStats{open: 0, idle: 0, waiting: 0}
+    p.sh.with(fn(st: mut &PoolState) { r = PoolStats{open: st.open, idle: len(st.idle), waiting: len(st.waiters)} })
+    return r
+}
+
+// A connection of the pool; parks while all size are leased. Err when a new
+// connection fails (connect's errors), or when the task is cancelled or its
+// deadline passes while it waits.
+pub fn (p: &Pool) acquire(w: Where): Result[Lease, Error] {
+    var got: Option[Conn] = None
+    var place = false
+    var wait: Option[task.Future[Option[Conn]]] = None
+    var id = 0
+    var cfg = defaults()
+    p.sh.with(fn(st: mut &PoolState) {
+        cfg = st.cfg
+        if len(st.idle) > 0 {
+            got = Some(pop(mut &st.idle))
+        } else if st.open < st.size {
+            st.open += 1
+            place = true
+        } else {
+            id = st.nextId
+            st.nextId += 1
+            let task.Handoff{promise: pr, future: f} = task.promise[Option[Conn]]()
+            append(mut &st.waiters, Waiter{id: id, p: pr})
+            wait = Some(f)
+        }
+    })
+    match replace(mut &wait, None) {
+        Some(f) {
+            match f.wait(w) {
+                Ok(v) {
+                    got = v
+                    place = got.isNone()
+                }
+                Err(e) {
+                    var served = true
+                    p.sh.with(fn(st: mut &PoolState) {
+                        for i in 0..len(st.waiters) {
+                            if st.waiters[i].id == id {
+                                for j in i..len(st.waiters) - 1 { swap(mut &st.waiters, j, j + 1) }
+                                let dropped = pop(mut &st.waiters)
+                                served = false
+                                break
+                            }
+                        }
+                    })
+                    if served { handOn(&p.sh, None) }
+                    let k = if e == task.Cancelled.Timeout { Kind.Timeout } else { Kind.Cancelled }
+                    return Err(fail(k, "pool: " + e.toStr() + " while waiting for a connection"))
+                }
+            }
+        }
+        None {}
+    }
+    match replace(mut &got, None) {
+        Some(c) {
+            if c.idle() { return Ok(Lease{cs: [c], pool: p.sh}) }
+            place = true                  // went bad while idle: closed here, its place reused
+        }
+        None {}
+    }
+    match connectWith(&cfg, w) {
+        Ok(c) { return Ok(Lease{cs: [c], pool: p.sh}) }
+        Err(e) {
+            handOn(&p.sh, None)
+            return Err(e)
+        }
+    }
+}
+
+// Gives a connection (or, for None, a place to open one) to the first waiter;
+// with none, keeps the connection idle (or frees the place). The promise is
+// completed outside with: if its future is gone, what it carries is dropped
+// there, and that may come back here.
+fn handOn(sh: &task.Shared[PoolState], var c: Option[Conn]) {
+    var p: Option[task.Promise[Option[Conn]]] = None
+    sh.with(fn(st: mut &PoolState) {
+        if len(st.waiters) > 0 {
+            for j in 0..len(st.waiters) - 1 { swap(mut &st.waiters, j, j + 1) }
+            let Waiter{id: _, p: pr} = pop(mut &st.waiters)
+            p = Some(pr)
+        } else {
+            match replace(mut &c, None) {
+                Some(conn) { append(mut &st.idle, conn) }
+                None { st.open -= 1 }
+            }
+        }
+    })
+    match replace(mut &p, None) {
+        Some(pr) { pr.complete(replace(mut &c, None)) }
+        None {}
+    }
+}
+
+fn (l: mut &Lease) drop() {
+    if len(l.cs) == 0 { return }
+    let c = pop(mut &l.cs)
+    if c.idle() {
+        handOn(&l.pool, Some(c))
+    } else {
+        c.close()
+        handOn(&l.pool, None)
+    }
+}
+
+// The leased connection, for a command this module does not wrap. The lease
+// must stay in scope while the borrow is used.
+pub fn (l: mut &Lease) conn(): mut &Conn {
+    if len(l.cs) == 0 { panic("redis: the lease is gone") }
+    return mut &l.cs[0]
+}
+
+pub fn (l: mut &Lease) command(args: &[str], w: Where): Result[Value, Error] {
+    if len(l.cs) == 0 { return Err(fail(Kind.Config, "the lease is gone")) }
+    return l.cs[0].command(args, w)
+}
+
+pub fn (l: mut &Lease) get(key: str, w: Where): Result[Option[str], Error] {
+    if len(l.cs) == 0 { return Err(fail(Kind.Config, "the lease is gone")) }
+    return l.cs[0].get(key, w)
+}
+
+pub fn (l: mut &Lease) set(key: str, value: str, w: Where): Result[Unit, Error] {
+    if len(l.cs) == 0 { return Err(fail(Kind.Config, "the lease is gone")) }
+    return l.cs[0].set(key, value, w)
+}
+
+pub fn (l: mut &Lease) del(keys: &[str], w: Where): Result[int, Error] {
+    if len(l.cs) == 0 { return Err(fail(Kind.Config, "the lease is gone")) }
+    return l.cs[0].del(keys, w)
+}
+
+pub fn (l: mut &Lease) hget(key: str, field: str, w: Where): Result[Option[str], Error] {
+    if len(l.cs) == 0 { return Err(fail(Kind.Config, "the lease is gone")) }
+    return l.cs[0].hget(key, field, w)
+}
+
+pub fn (l: mut &Lease) hset(key: str, field: str, value: str, w: Where): Result[int, Error] {
+    if len(l.cs) == 0 { return Err(fail(Kind.Config, "the lease is gone")) }
+    return l.cs[0].hset(key, field, value, w)
+}

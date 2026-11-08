@@ -1,0 +1,514 @@
+// redis-cli: a small Redis command-line client on lib/redis.
+//
+//     redis-cli [OPTIONS] [COMMAND [ARG ...]]
+//
+// With a command it sends it and prints the reply; with none it reads
+// commands from standard input, one per line, and prints each reply. A
+// terminal gets the interactive prompt; a pipe gets raw output by default
+// (like redis-cli when standard output is not a terminal).
+//
+// Options:
+//   -h HOST            server host (default 127.0.0.1)
+//   -p PORT            server port (default 6379)
+//   -s PATH            Unix socket
+//   -u URL             redis://, rediss:// or unix:// URL
+//   -a PASSWORD        password (AUTH)
+//   --user USER        ACL user for AUTH
+//   -n DB              database (SELECT)
+//   --tls              use TLS
+//   --cacert FILE      trust only this CA file
+//   --cacertdir DIR    trust only this CA directory
+//   --insecure         do not verify the server certificate
+//   --sni NAME         TLS server name (SNI and verification)
+//   --cert FILE        client certificate
+//   --key FILE         client private key
+//   -r COUNT           repeat the command COUNT times
+//   -i SECONDS         wait between repeats
+//   -x                 read the last argument from standard input
+//   -3, --resp3        use RESP3 (the default is RESP2, like redis-cli)
+//   --raw              raw output
+//   --no-raw           formatted output
+//   --version          print the version
+//   --help, -?         this text
+//
+// Not supported: cluster redirection (-c), --pipe, --scan, --eval, the
+// subscription REPL, and the full option set of redis-cli. A command that
+// is not wrapped by lib/redis is still available through the generic path.
+
+import "io"
+import "os"
+import "strings"
+import "redis"
+import "task"
+
+const VERSION = "0.1.0"
+
+type Opts = record {
+    cfg: redis.Config
+    repeat: int
+    intervalMs: int
+    raw: bool
+    rawSet: bool
+    readLast: bool
+    cmd: []str
+    help: bool
+    version: bool
+}
+
+fn usage(): str {
+    return "Usage: redis-cli [OPTIONS] [command [arg ...]]\n" +
+           "  -h HOST  -p PORT  -s PATH  -u URL  -a PASSWORD  --user USER  -n DB\n" +
+           "  --tls  --cacert FILE  --cacertdir DIR  --insecure  --sni NAME\n" +
+           "  --cert FILE  --key FILE  -3  -r COUNT  -i SECONDS  -x  --raw  --no-raw\n" +
+           "  --version  --help\n"
+}
+
+fn bad(msg: str): never {
+    eprintln("redis-cli: " + msg)
+    eprintln(usage())
+    exit(1)
+}
+
+fn need(args: &[]str, i: int, what: str): str {
+    if i + 1 >= len(args) { bad("option " + what + " needs a value") }
+    return args[i + 1]
+}
+
+fn parseCount(s: str, what: str): int {
+    match strings.parseInt(s) {
+        Ok(n) {
+            if n < 0 { bad(what + " must not be negative") }
+            return n
+        }
+        Err(_) { bad(what + " must be an integer") }
+    }
+    return 0
+}
+
+fn parseArgs(args: []str): Opts {
+    var o = Opts{cfg: redis.defaults(), repeat: 1, intervalMs: 0, raw: false, rawSet: false,
+                 readLast: false, cmd: [], help: false, version: false}
+    o.cfg.resp3 = false
+    var i = 0
+    while i < len(args) {
+        let a = args[i]
+        if a == "--" {
+            i += 1
+            while i < len(args) {
+                append(mut &o.cmd, args[i])
+                i += 1
+            }
+            break
+        }
+        if len(a) == 0 || a[0] != '-' || a == "-" {
+            append(mut &o.cmd, a)
+            i += 1
+            while i < len(args) {
+                append(mut &o.cmd, args[i])
+                i += 1
+            }
+            break
+        }
+        if a == "--help" || a == "-?" {
+            o.help = true
+            i += 1
+        } else if a == "--version" {
+            o.version = true
+            i += 1
+        } else if a == "-h" || a == "--host" {
+            o.cfg.host = need(&args, i, a)
+            i += 2
+        } else if a == "-p" || a == "--port" {
+            o.cfg.port = parseCount(need(&args, i, a), a)
+            i += 2
+        } else if a == "-s" || a == "--socket" {
+            o.cfg.unixPath = need(&args, i, a)
+            o.cfg.host = ""
+            o.cfg.port = 0
+            i += 2
+        } else if a == "-u" || a == "--uri" {
+            let cfg = match redis.parseUrl(need(&args, i, a)) {
+                Ok(x) { x }
+                Err(e) { bad(e.toStr()) }
+            }
+            o.cfg = cfg
+            o.cfg.resp3 = false
+            i += 2
+        } else if a == "-a" || a == "--pass" {
+            o.cfg.password = need(&args, i, a)
+            i += 2
+        } else if a == "--user" {
+            o.cfg.username = need(&args, i, a)
+            i += 2
+        } else if a == "-n" || a == "--db" {
+            o.cfg.db = parseCount(need(&args, i, a), a)
+            i += 2
+        } else if a == "--tls" {
+            o.cfg.tls = true
+            i += 1
+        } else if a == "--cacert" {
+            o.cfg.tlsOptions.caFile = need(&args, i, a)
+            o.cfg.tls = true
+            i += 2
+        } else if a == "--cacertdir" {
+            o.cfg.tlsOptions.caDir = need(&args, i, a)
+            o.cfg.tls = true
+            i += 2
+        } else if a == "--insecure" {
+            o.cfg.tlsOptions.insecureSkipVerify = true
+            o.cfg.tls = true
+            i += 1
+        } else if a == "--sni" {
+            o.cfg.tlsName = need(&args, i, a)
+            o.cfg.tls = true
+            i += 2
+        } else if a == "--cert" {
+            o.cfg.tlsOptions.certFile = need(&args, i, a)
+            o.cfg.tls = true
+            i += 2
+        } else if a == "--key" {
+            o.cfg.tlsOptions.keyFile = need(&args, i, a)
+            o.cfg.tls = true
+            i += 2
+        } else if a == "-r" {
+            o.repeat = parseCount(need(&args, i, a), a)
+            i += 2
+        } else if a == "-i" {
+            let s = need(&args, i, a)
+            let ms = parseCount(s, a)
+            o.intervalMs = ms * 1000
+            i += 2
+        } else if a == "-3" || a == "--resp3" {
+            o.cfg.resp3 = true
+            i += 1
+        } else if a == "-x" {
+            o.readLast = true
+            i += 1
+        } else if a == "--raw" {
+            o.raw = true
+            o.rawSet = true
+            i += 1
+        } else if a == "--no-raw" {
+            o.raw = false
+            o.rawSet = true
+            i += 1
+        } else if a == "-c" {
+            eprintln("redis-cli: cluster redirection is not supported")
+            exit(1)
+        } else if a == "--pipe" || a == "--scan" || a == "--eval" {
+            eprintln("redis-cli: " + a + " is not supported")
+            exit(1)
+        } else {
+            bad("unknown option " + a)
+        }
+    }
+    if !o.rawSet { o.raw = !io.isTerminal(1) }
+    return o
+}
+
+// ---------------------------------------------------------------- output
+
+fn quote(s: str): str {
+    var b = newStrBuf()
+    b.add("\"")
+    for i in 0..len(s) {
+        let c = s[i]
+        if c == '"' { b.add("\\\"") }
+        else if c == '\\' { b.add("\\\\") }
+        else if c == '\n' { b.add("\\n") }
+        else if c == '\r' { b.add("\\r") }
+        else if c == '\t' { b.add("\\t") }
+        else if c < 32 || c == 127 {
+            let hex = "0123456789abcdef"
+            b.add("\\x")
+            b.addByte(hex[int(c / 16)])
+            b.addByte(hex[int(c % 16)])
+        } else {
+            b.addByte(c)
+        }
+    }
+    b.add("\"")
+    return b.toStr()
+}
+
+fn formatted(v: &redis.Value, indent: str): str {
+    match v {
+        redis.Value.Nil { return indent + "(nil)" }
+        redis.Value.Status(s) { return indent + s }
+        redis.Value.Str(s) { return indent + quote(s) }
+        redis.Value.Int(n) { return indent + "(integer) " + n.toStr() }
+        redis.Value.Double(f) { return indent + "(double) " + f.toStr() }
+        redis.Value.Bool(x) { return indent + "(" + x.toStr() + ")" }
+        redis.Value.BigNumber(s) { return indent + "(big number) " + s }
+        redis.Value.Verbatim(s) { return indent + s }
+        redis.Value.Error(s) { return indent + "(error) " + s }
+        redis.Value.Array(xs) { return formattedList(&xs, indent, ")") }
+        redis.Value.Set(xs) { return formattedList(&xs, indent, "~") }
+        redis.Value.Push(xs) { return formattedList(&xs, indent, ">") }
+        redis.Value.Map(ps) {
+            if len(ps) == 0 { return indent + "(empty map)" }
+            var b = newStrBuf()
+            for i in 0..len(ps) {
+                if i > 0 { b.add("\n") }
+                b.add(indent)
+                b.addInt(i + 1)
+                b.add("# ")
+                b.add(quote(ps[i].key.toStr()))
+                b.add(" => ")
+                b.add(formatted(&ps[i].value, ""))
+            }
+            return b.toStr()
+        }
+    }
+}
+
+fn formattedList(xs: &[redis.Value], indent: str, mark: str): str {
+    if len(xs) == 0 { return indent + "(empty array)" }
+    var b = newStrBuf()
+    for i in 0..len(xs) {
+        if i > 0 { b.add("\n") }
+        b.add(indent)
+        b.addInt(i + 1)
+        b.add(mark)
+        b.add(" ")
+        b.add(formatted(&xs[i], ""))
+    }
+    return b.toStr()
+}
+
+fn raw(v: &redis.Value): str {
+    match v {
+        redis.Value.Nil { return "" }
+        redis.Value.Status(s) { return s }
+        redis.Value.Str(s) { return s }
+        redis.Value.Int(n) { return n.toStr() }
+        redis.Value.Double(f) { return f.toStr() }
+        redis.Value.Bool(x) { return x.toStr() }
+        redis.Value.BigNumber(s) { return s }
+        redis.Value.Verbatim(s) { return s }
+        redis.Value.Error(s) { return "(error) " + s }
+        redis.Value.Array(xs) { return rawList(&xs) }
+        redis.Value.Set(xs) { return rawList(&xs) }
+        redis.Value.Push(xs) { return rawList(&xs) }
+        redis.Value.Map(ps) {
+            var b = newStrBuf()
+            for i in 0..len(ps) {
+                if i > 0 { b.add("\n") }
+                b.add(raw(&ps[i].key))
+                b.add("\n")
+                b.add(raw(&ps[i].value))
+            }
+            return b.toStr()
+        }
+    }
+}
+
+fn rawList(xs: &[redis.Value]): str {
+    var b = newStrBuf()
+    for i in 0..len(xs) {
+        if i > 0 { b.add("\n") }
+        b.add(raw(&xs[i]))
+    }
+    return b.toStr()
+}
+
+fn printReply(v: &redis.Value, useRaw: bool): bool {
+    match v {
+        redis.Value.Error(s) {
+            if useRaw { eprintln("(error) " + s) } else { println("(error) " + s) }
+            return true
+        }
+        else {
+            if useRaw { println(raw(v)) } else { println(formatted(v, "")) }
+            return false
+        }
+    }
+}
+
+// ---------------------------------------------------------------- command lines
+
+// A shell-like split: spaces separate; "..." and '...' group; a backslash
+// escapes the next byte outside quotes, and inside double quotes it also
+// gives \n, \r and \t. An unclosed quote is an error.
+fn splitArgs(line: str): Result[[]str, str] {
+    var out: []str = []
+    var b = newStrBuf()
+    var have = false
+    var quoteChar = byte(0)
+    var i = 0
+    while i < len(line) {
+        let c = line[i]
+        if quoteChar != 0 {
+            if c == quoteChar {
+                quoteChar = 0
+                i += 1
+            } else if c == '\\' && quoteChar == '"' {
+                if i + 1 >= len(line) { return Err("a trailing backslash") }
+                let n = line[i + 1]
+                if n == 'n' { b.addByte('\n') }
+                else if n == 'r' { b.addByte('\r') }
+                else if n == 't' { b.addByte('\t') }
+                else { b.addByte(n) }
+                i += 2
+            } else {
+                b.addByte(c)
+                i += 1
+            }
+        } else {
+            if c == ' ' || c == '\t' || c == '\r' || c == '\n' {
+                if have {
+                    append(mut &out, b.toStr())
+                    b.clear()
+                    have = false
+                }
+                i += 1
+            } else if c == '"' || c == '\'' {
+                quoteChar = c
+                have = true
+                i += 1
+            } else if c == '\\' {
+                if i + 1 >= len(line) { return Err("a trailing backslash") }
+                b.addByte(line[i + 1])
+                have = true
+                i += 2
+            } else {
+                b.addByte(c)
+                have = true
+                i += 1
+            }
+        }
+    }
+    if quoteChar != 0 { return Err("an unclosed quote") }
+    if have { append(mut &out, b.toStr()) }
+    return Ok(out)
+}
+
+fn prompt(cfg: &redis.Config): str {
+    if len(cfg.unixPath) > 0 { return "unix:" + cfg.unixPath + "> " }
+    return cfg.host + ":" + cfg.port.toStr() + "> "
+}
+
+fn runOne(c: mut &redis.Conn, cmd: &[str], useRaw: bool): bool {
+    match c.command(cmd) {
+        Ok(v) { return printReply(&v, useRaw) }
+        Err(e) {
+            eprintln(e.toStr())
+            return true
+        }
+    }
+}
+
+fn main() {
+    var o = parseArgs(os.arguments())
+    if o.help {
+        print(usage())
+        return
+    }
+    if o.version {
+        println("redis-cli " + VERSION + " (Lexell)")
+        return
+    }
+    if o.readLast {
+        if len(o.cmd) == 0 { bad("-x needs a command") }
+        let text = match io.readStdin() {
+            Ok(s) { s }
+            Err(e) { bad("cannot read standard input: " + e.toStr()) }
+        }
+        var last = text
+        if len(last) > 0 && last[len(last) - 1] == '\n' { last = last[0..len(last) - 1] }
+        if len(last) > 0 && last[len(last) - 1] == '\r' { last = last[0..len(last) - 1] }
+        append(mut &o.cmd, last)
+    }
+    var c = match redis.connectWith(&o.cfg) {
+        Ok(x) { x }
+        Err(e) { bad("Could not connect to Redis: " + e.toStr()) }
+    }
+    var failed = false
+    if len(o.cmd) > 0 {
+        var n = 0
+        while n < o.repeat {
+            if n > 0 && o.intervalMs > 0 { task.sleep(o.intervalMs).unwrap() }
+            if runOne(mut &c, &o.cmd, o.raw) { failed = true }
+            n += 1
+        }
+    } else if io.isTerminal(0) && io.isTerminal(1) {
+        var stdin = io.stdin()
+        var p = prompt(&o.cfg)
+        while true {
+            print(p)
+            match io.flushStdout() {
+                Ok(_) {}
+                Err(_) { break }
+            }
+            var line: Option[str] = None
+            match stdin.readLine() {
+                Ok(x) { line = x }
+                Err(e) {
+                    eprintln("redis-cli: " + e.toStr())
+                    break
+                }
+            }
+            match line {
+                Some(text) {
+                    let t = trim(text)
+                    if len(t) == 0 { continue }
+                    if t == "quit" || t == "exit" { break }
+                    if t == "clear" {
+                        print("\x1b[2J\x1b[H")
+                        continue
+                    }
+                    if t == "help" {
+                        print(usage())
+                        continue
+                    }
+                    var cmd: []str = []
+                    match splitArgs(t) {
+                        Ok(x) { cmd = x }
+                        Err(m) {
+                            eprintln("redis-cli: " + m)
+                            continue
+                        }
+                    }
+                    if len(cmd) > 0 {
+                        if runOne(mut &c, &cmd, o.raw) { failed = true }
+                    }
+                }
+                None { break }
+            }
+        }
+    } else {
+        var stdin = io.stdin()
+        while true {
+            var line: Option[str] = None
+            match stdin.readLine() {
+                Ok(x) { line = x }
+                Err(e) {
+                    eprintln("redis-cli: " + e.toStr())
+                    failed = true
+                    break
+                }
+            }
+            match line {
+                Some(text) {
+                    let t = trim(text)
+                    if len(t) == 0 { continue }
+                    var cmd: []str = []
+                    match splitArgs(t) {
+                        Ok(x) { cmd = x }
+                        Err(m) {
+                            eprintln("redis-cli: " + m)
+                            failed = true
+                            continue
+                        }
+                    }
+                    if len(cmd) > 0 {
+                        if runOne(mut &c, &cmd, o.raw) { failed = true }
+                    }
+                }
+                None { break }
+            }
+        }
+    }
+    c.close()
+    if failed { exit(1) }
+}

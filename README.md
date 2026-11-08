@@ -63,9 +63,9 @@ The current Lexell grew out of an Oberon dialect and an ownership fork called `o
 | Language | Modules with explicit imports, records with methods, generics, structural interfaces, slices, closures, `Option`, `Result`, `try`, `match` and destructors. |
 | Ownership | Single ownership for owned values and checked borrows. Strings are reference counted. |
 | Compiler | A self-hosted compiler that writes x86-64 ELF directly. The C backend shares the same intermediate representation and is used for bootstrapping and differential testing. |
-| Standard library | Collections, text and file I/O, time zones, regex, JSON, CommonMark, HTTP, TLS and tasks. |
+| Standard library | Collections, text and file I/O, time zones, regex, JSON, CommonMark, HTTP, TLS, Redis and tasks. |
 | Databases | Clients for SQLite, PostgreSQL, SQL Server and Oracle. The native PostgreSQL, SQL Server and Oracle clients can decode rows into your own record types in bounded batches. |
-| Programs | A jq port, a CommonMark renderer, an HTTP/1.1 server and load client, and ports of everyday tools including `grep`, `eza` and `zoxide`. |
+| Programs | A jq port, a CommonMark renderer, an HTTP/1.1 server and load client, a Redis client and `redis-cli`, and ports of everyday tools including `grep`, `eza` and `zoxide`. |
 
 See the [database streaming design](lexell/design/db-streaming.md) for an example of binding columns and reading rows into a caller-owned buffer.
 

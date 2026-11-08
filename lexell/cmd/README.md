@@ -117,6 +117,7 @@ runtime report on the large-input cases (four for the coreutils, four for `grep`
 | `eza` | 353,328 | 305,536 |
 | `jq` | 1,163,592 (libc, libm) | 875,280 |
 | `cmark` | 342,272 | 453,872 |
+| `redis-cli` | 335,776 (libssl, libc) | 292,768 |
 
 (obo's static binaries were 90 to 119 KB. `grep` is large because it carries
 the regex library. `jq` carries the regex and JSON libraries and jq's
@@ -361,6 +362,47 @@ Results on both builds:
 | `manonig.test` | 17 of 17 | |
 | `optional.test` | 3 of 3 | |
 | `base64.test` | 7 of 7 | |
+
+## redis-cli
+
+`redis-cli.lxl` is a small Redis command-line client on
+[../lib/redis.lxl](../lib/redis.lxl). It sends one command when one is
+given, reads commands from standard input when it is a pipe, and shows the
+prompt on a terminal:
+
+    compiler/out/lxlc cmd/redis-cli.lxl -o redis-cli          # native (default)
+    compiler/out/lxlc cmd/redis-cli.lxl --c -o redis-cli      # through C
+
+    ./redis-cli -p 6379 ping
+    ./redis-cli -p 6379 set order:42 24.49
+    ./redis-cli -p 6379 --no-raw lrange queue 0 -1
+    printf 'ping\nget order:42\n' | ./redis-cli -p 6379
+
+Options: `-h HOST -p PORT -s PATH -u URL -a PASSWORD --user USER -n DB`,
+`--tls --cacert FILE --cacertdir DIR --insecure --sni NAME --cert FILE
+--key FILE`, `-3 --resp3`, `-r COUNT -i SECONDS -x --raw --no-raw --version --help`.
+The default is RESP2, as redis-cli's; `-3` asks for RESP3.
+`-x` reads the last argument from standard input; `-r` repeats a command
+and `-i` waits between repeats. A command line is split like a shell
+(`"..."`, `'...'`, backslash escapes). Output is raw when standard output
+is not a terminal, and formatted (`1) "a"`, `(integer) 1`, `1# "f" =>
+"v"`) otherwise; `--raw` and `--no-raw` force either. A server error prints
+`(error) ...`, and a one-shot command exits 1 for it.
+
+Not supported: cluster redirection (`-c`), `--pipe`, `--scan`, `--eval`,
+the subscription REPL, and the rest of redis-cli's options. Every other
+Redis command is still sent through the generic `command` path; the
+library wraps the common ones.
+
+`cmd/redis_gate.py` builds both backends and runs one-shot, pipe, `-x`, `-r`
+and formatted cases against an in-process RESP2 server:
+
+    python3 cmd/redis_gate.py
+    python3 cmd/redis_gate.py --c
+
+`lib/tests/run/redis_live.lxl` is the live check (set `LXL_REDIS_LIVE=1`;
+`LXL_REDIS` is the URL, default `redis://127.0.0.1:6379/15`); without a
+server it exits 77 and the library runner skips it.
 
 ## httpd and httpload
 

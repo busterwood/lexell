@@ -31,7 +31,7 @@ It is retired in [../archive/obx-ref/](../archive/obx-ref/README.md).
 | [PLAN.md](PLAN.md) | the stages, their gates and state |
 | [compiler/](compiler/README.md) | the compiler, and its C seed |
 | [lib/](lib/README.md) | the library, one module per file |
-| [cmd/](cmd/README.md) | programs: eza, the coreutils subset, grep, zoxide, jq, cmark, an HTTP server and its load client, tlsbench |
+| [cmd/](cmd/README.md) | programs: eza, the coreutils subset, grep, zoxide, jq, redis-cli, cmark, an HTTP server and its load client, tlsbench |
 | [tests/](tests/README.md) | the test suites and their runners |
 | [bench/](bench/README.md) | benchmarks, native against C |
 | [design/](design/) | design notes, one per stage or subsystem |
