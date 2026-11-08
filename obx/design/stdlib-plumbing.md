@@ -199,53 +199,89 @@ Extend `lib/os.obx`.
 Extend `lib/time.obx`. The engine already exists in `cmd/jq_lib.obx`
 (gmtime, timegm, strftime, strptime, ISO week); move the generic part.
 
-- `strftime(t: LocalDateTime, fmt: str, zone: str): str`
-- `strptime(s: str, fmt: str): Result[LocalDateTime, str]`
-- `httpDate(sec: int): str` - RFC 7231 IMF-fixdate, GMT.
-- A `Tm` view is allowed if jq needs the C `struct tm` fields; keep it in
-  `time`, not in `jq_lib`.
+The design review is right that the engine is `Tm`-shaped, not
+`LocalDateTime`-shaped: jq needs 0-based `mon`, `wday`, `yday`, `fsec`,
+sentinel values for unset fields, and an unconsumed suffix from `strptime`.
+So the library interface is:
 
-The token set must cover what jq, eza and the access log use: `%Y %m %d %e
-%H %k %I %l %M %S %j %a %A %b %B %p %P %Z %z %u %w %y %C %D %F %T %R %r %c
-%x %X %s %n %t %G %g %V %U %W %%`. Unknown tokens pass through as `%X`, as
-jq does, unless we choose to reject them.
+- `Tm { year (since 1900), mon (0..11), mday, hour, min, sec, wday, yday,
+  fsec }`
+- `gmtimeOf(sec: int): Tm`, `timegm(t: &Tm): int`, `isoWeek(t: &Tm): ...`
+- `strftime(t: &Tm, fmt: str, zoneName: str): str`
+- `strptime(s: str, fmt: str): Result[Strptime, str>` with
+  `Strptime { tm: Tm; rest: int }` (or a documented equivalent)
+- `tmOf(l: LocalDateTime): Tm`, `localDateTimeOf(t: &Tm):
+  Result[LocalDateTime, str]` as adapters
+- `httpDate(sec: int): str` - RFC 7231 IMF-fixdate, GMT
+- `strftimeOffset(t: OffsetDateTime, fmt: str, zoneName: str): str` only
+  if a caller needs a real `%z`; `tz.Zone` cannot be imported by `time`
+  (tz imports time).
+
+Keep jq's JSON-array conversion and jq's exact error text in `jq_lib`.
+The token set must cover what jq, eza and the access log use. Unknown
+tokens pass through as `%X`, as jq does, unless we choose to reject them.
+`zoneName` is a `%Z` label; `%z` must be documented as `+0000` unless an
+offset-taking variant is used.
 
 ### binary and math bits
 
 New `binary` module; extend `math`.
 
-- `readU16LE/BE`, `readU32LE/BE`, `readU64LE/BE` (index into `&[byte]`,
-  bounds-checked or documented).
-- `appendU16LE/BE`, `appendU32LE/BE`, `appendU64LE/BE` (into `[]byte` or
-  `StrBuf`).
-- `math.bitsOf(x: float): u64`, `math.fromBits(b: u64): float`; 32-bit
-  variants if the DB codecs need them.
+The design review found the unsigned-only contract too narrow. The codecs
+need signed reads, `&str` sources, in-place setters, and `StrBuf` writers.
 
-The existing `mssql`, `pgwire`, `tds`, `tns` and `tz` helpers migrate to
-these; do not keep two endian implementations.
+- Reads: `readU16/32/64LE/BE` and signed `readI16/32/64LE/BE`; signed
+  values are sign-extended, `readI64` may return the raw int bit pattern.
+  Bounds are documented (callers validate wire lengths; an out-of-range
+  index traps).
+- `&str` variants for the hot wire paths (`readU32BEStr`, `readU16LEStr`,
+  `readU64LEStr`, ...).
+- Append: `appendU16/32/64LE/BE(mut b: &[]byte, v: int)`.
+- In-place: `setU16/32LE/BE(mut b: &[]byte, at: int, v: int)`.
+- StrBuf: `addU16/32/64LE/BE(mut b: &StrBuf, v: int)` using `addByte`.
+- `math.bitsOf(x: float): int` and `math.fromBits(b: int): float` - the
+  exact double bit pattern as a 64-bit signed int; `u64` is not usable
+  because `u64(-1)` traps and the DB codecs already carry signed bits.
+  32-bit `bitsOf32`/`fromBits32` for the `real`/`float` codecs.
+
+The existing `mssql`, `pgwire`, `tds`, `tns` and `tz` helpers migrate one
+codec at a time under their differential wire tests; do not keep two endian
+implementations after the migration.
 
 ### glob
 
-New module. `grep`'s GNU matcher and `zoxide`'s Rust glob are the sources.
+New module for zoxide's Rust-glob syntax. The design review is right that
+grep's GNU matcher is a different language: byte-wise, C-locale, `* ? [] \`,
+and matching a suffix after `/`. Keep grep's 60-line matcher in grep unless
+a second GNU-style caller appears.
 
 - `compile(pattern: str): Result[Pattern, Error]`
 - `Pattern.matches(name: &str): bool`
-- Options for pathname separators and `**`; default to the caller's syntax.
-
-No exponential backtracking: an iterative/DP matcher or a compiled token
-list. `grep` needs `* ? [] \`; `zoxide` needs `**` and path components.
-One module, two modes, one test corpus.
+- Rust-glob rules: `*` does not cross `/`, `**` as a whole component does,
+  `?`, `[abc]`, `[!abc]`, escapes; decode to code points.
+- No exponential backtracking: an iterative/DP matcher or a compiled token
+  list. `zoxide`'s `_ZO_EXCLUDE_DIRS` and the `glob` test corpus are the
+  oracle.
 
 ### html and base64
 
-New small modules.
+New small modules. The design review narrowed these to the real callers.
 
-- `html.escapeText(s: str): str`, `html.escapeAttr(s: str): str`,
-  `html.validateUrl(s: str): Result[str, str]` (http/https only, no
-  `javascript:`/`data:`).
-- `base64.encode(s: str): str`, `base64.decode(s: str): Option[str]` or
-  `Result`. Move the pure functions out of `crypto`; update `pgwire` and
-  keep `crypto.base64` as a thin wrapper for compatibility if needed.
+- `html.escapeText(s: str): str` - `& < > \" '` and ASCII controls, as
+  obo/jq do.
+- `html.escapeAttr(s: str): str` - the same plus tab/LF/CR as numeric
+  references, both quote characters escaped.
+- Do **not** add `html.validateUrl` as a general HTML primitive: jq does
+  not use it, and cmark's `safeHref` allows relative/mailto/ftp and image
+  data URLs, which is a markdown policy, not an HTML one. If a scheme
+  check is needed, put it in `markdown` or use `url.parse` plus a caller
+  policy.
+- `base64.encode(s: str): str` shared.
+- Two decoders, because the callers differ: `base64.decodeStrict` (padded,
+  whole groups of four, as `crypto.unbase64`/pgwire) and
+  `base64.decodeLenient` (jq's `@base64d`: stops at `=`, accepts unpadded,
+  rejects a single trailing byte). Keep `crypto.base64` as the strict
+  codec or delegate to `base64`.
 
 `csv` and `sh` quoting stay in `jq_lib` until a second caller appears.
 
