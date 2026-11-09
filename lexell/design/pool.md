@@ -192,9 +192,10 @@ Two things are new:
   `hget`, `hset`) are gone (D1): `l.conn().set(...)`. `conn()` was already
   there. `redis_basic` and `redis_live` are moved.
 - Tests: `redis_basic` (a scripted server, a pool shared by six tasks) and
-  `pool_fake` pass on both backends under LXL_CHECK=1. No Redis server runs
-  on this machine, so `redis_live` and `redis_live_extra` were skipped
-  (exit 77); they need a run with `LXL_REDIS_LIVE=1` before a merge.
+  `pool_fake` pass on both backends under LXL_CHECK=1, and so do
+  `redis_live` and `redis_live_extra` against a live Redis 7
+  (`redis:7-alpine` in podman, `LXL_REDIS_LIVE=1`; run 2026-11-09 after
+  stage 4).
 - Still as before: a subscribed connection is not detected. `Conn` does
   not track subscribe mode, so a lease dropped while subscribed goes back
   to the pool. Tracking it would let `release` refuse it; a follow-up.
