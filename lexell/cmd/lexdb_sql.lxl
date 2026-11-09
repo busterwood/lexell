@@ -121,12 +121,14 @@ pub type Stmt = record {
     pub index: str              // CREATE INDEX / DROP INDEX: the index's name
     pub unique: bool
     pub inner: []Stmt           // EXPLAIN: the statement explained
+    pub distinct: bool          // SELECT DISTINCT
+    pub having: Option[Expr]
 }
 
 fn newStmt(kind: int): Stmt {
     return Stmt{kind: kind, table: "", ifFlag: false, cols: [], pk: [], names: [], rows: [], items: [], where: None,
                 group: [], order: [], limit: None, offset: None, sets: [], params: 0, from: [], index: "",
-                unique: false, inner: []}
+                unique: false, inner: [], distinct: false, having: None}
 }
 
 // ---- the lexer
@@ -291,7 +293,7 @@ fn (p: mut &P) expectKw(w: str): Result[Unit, lexdb_base.DbErr] {
 const RESERVED: []str = ["select", "from", "where", "group", "order", "by", "limit", "offset", "and", "or", "not", "is",
                   "null", "as", "values", "set", "into", "insert", "update", "delete", "create", "table",
                   "primary", "key", "asc", "desc", "true", "false", "cast", "on", "join", "inner", "left",
-                  "right", "full", "outer", "cross", "using", "natural"]
+                  "right", "full", "outer", "cross", "using", "natural", "having", "distinct"]
 
 fn isReserved(w: &str): bool {
     for r in RESERVED { if r == w { return true } }
@@ -505,16 +507,25 @@ fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
             p.pos += 1
             var args: []Expr = []
             var star = false
+            var fname = t.text
             if p.acceptKw("*") {
                 star = true
             } else if !p.isKw(")") {
-                let d = p.acceptKw("distinct")
-                if d { return Err(lexdb_base.err("0A000", "DISTINCT in aggregates is not supported")) }
+                // agg(DISTINCT x): the name carries it, "count distinct"
+                if p.acceptKw("distinct") { fname = fname + " distinct" } else { let al = p.acceptKw("all") }
                 append(mut &args, try p.expr())
                 while p.acceptKw(",") { append(mut &args, try p.expr()) }
             }
             try p.expectKw(")")
-            return Ok(Expr.Call(t.text, args, star))
+            if p.acceptKw("filter") {
+                // agg(...) FILTER (WHERE cond): the condition is the last argument
+                try p.expectKw("(")
+                try p.expectKw("where")
+                append(mut &args, try p.expr())
+                try p.expectKw(")")
+                fname = fname + " filter"
+            }
+            return Ok(Expr.Call(fname, args, star))
         }
         var name = t.text
         if p.acceptKw(".") {
@@ -593,8 +604,12 @@ fn (p: mut &P) insert(): Result[Stmt, lexdb_base.DbErr] {
 
 fn (p: mut &P) select(): Result[Stmt, lexdb_base.DbErr] {
     var s = newStmt(S_SELECT)
-    if p.acceptKw("distinct") { return Err(lexdb_base.err("0A000", "SELECT DISTINCT is not supported")) }
-    let all = p.acceptKw("all")
+    if p.acceptKw("distinct") {
+        if p.isKw("on") { return Err(lexdb_base.err("0A000", "SELECT DISTINCT ON is not supported")) }
+        s.distinct = true
+    } else {
+        let all = p.acceptKw("all")
+    }
     while true {
         let q = p.peek()
         if p.acceptKw("*") {
@@ -660,6 +675,7 @@ fn (p: mut &P) select(): Result[Stmt, lexdb_base.DbErr] {
         append(mut &s.group, try p.expr())
         while p.acceptKw(",") { append(mut &s.group, try p.expr()) }
     }
+    if p.acceptKw("having") { s.having = Some(try p.expr()) }
     if p.acceptKw("order") {
         try p.expectKw("by")
         while true {
@@ -901,10 +917,17 @@ pub fn exprText(x: &Expr): str {
         Expr.IsNull(a, neg) { return "(" + exprText(&a) + (if neg { " is not null)" } else { " is null)" }) }
         Expr.Cast(a, t) { return "cast(" + exprText(&a) + " as " + typeText(&t) + ")" }
         Expr.Call(n, args, star) {
-            if star { return n + "(*)" }
+            // modifiers in the name: "count distinct filter"
+            let words = strings.split(&n, " ")
+            let base = words[0].toStr()
+            let distinct = strings.contains(n, " distinct")
+            let filtered = strings.contains(n, " filter")
             var parts: []str = []
-            for a in args { append(mut &parts, exprText(&a)) }
-            return n + "(" + strings.join(&parts, ", ") + ")"
+            let last = if filtered { len(args) - 1 } else { len(args) }
+            for i in 0..last { append(mut &parts, exprText(&args[i])) }
+            var out = if star { base + "(*)" } else { base + "(" + (if distinct { "distinct " } else { "" }) + strings.join(&parts, ", ") + ")" }
+            if filtered { out = out + " filter (where " + exprText(&args[len(args) - 1]) + ")" }
+            return out
         }
     }
 }

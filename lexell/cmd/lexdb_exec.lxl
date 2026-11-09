@@ -380,7 +380,20 @@ fn truth(v: &Val): Option[bool] {
     }
 }
 
-fn isAgg(name: &str): bool { return name == "count" || name == "sum" || name == "min" || name == "max" || name == "avg" }
+// An aggregate's name without its modifiers ("count distinct filter").
+fn aggBase(name: &str): str {
+    let i = strings.indexOf(name, " ", 0)
+    return if i < 0 { name } else { name[0..i] }
+}
+
+const AGGS: []str = ["count", "sum", "avg", "min", "max", "string_agg", "bool_and", "bool_or", "every", "stddev",
+                     "stddev_samp", "stddev_pop", "variance", "var_samp", "var_pop"]
+
+fn isAgg(name: &str): bool {
+    let b = aggBase(name)
+    for a in AGGS { if a == b { return true } }
+    return false
+}
 
 pub fn hasAgg(x: &Expr): bool {
     match x {
@@ -397,14 +410,14 @@ pub fn hasAgg(x: &Expr): bool {
     }
 }
 
-// What an expression is evaluated against: the table's columns, a row, the
-// rows of its group (for aggregates; agg false outside them) and the
+// What an expression is evaluated against: the columns, a row, the values
+// of the query's aggregates for the row's group (an aggregate call is
+// rewritten to its slot, "#agg"; none outside a grouped query) and the
 // statement's parameters.
 pub type Env = value record {
     cols: &[]lexdb_sql.ColDef
     row: &[]Val
-    group: &[][]Val
-    agg: bool
+    aggs: &[]Val
     params: &[]Val
 }
 
@@ -492,47 +505,23 @@ pub fn eval(x: &Expr, env: &Env): Result[Val, DbErr] {
             return coerce(v, &t)
         }
         Expr.Call(name, args, star) {
-            if isAgg(&name) {
-                if !env.agg { return Err(e("42803", "aggregate functions are not allowed here")) }
-                return aggregate(&name, &args, star, env)
+            if name == "#agg" {
+                match args[0] {
+                    Expr.Lit(v) {
+                        match v {
+                            Val.Int(i) { return Ok(env.aggs[i]) }
+                            else {}
+                        }
+                    }
+                    else {}
+                }
             }
+            if isAgg(&name) { return Err(e("42803", "aggregate functions are not allowed here")) }
             var vs: []Val = []
             for a in args { append(mut &vs, try eval(&a, env)) }
             return call(&name, &vs)
         }
     }
-}
-
-fn aggregate(name: &str, args: &[]Expr, star: bool, env: &Env): Result[Val, DbErr] {
-    if name == "count" && star { return Ok(Val.Int(len(env.group))) }
-    if len(args) != 1 { return Err(e("42883", "function " + name + " takes one argument")) }
-    var count = 0
-    var acc = Val.Null
-    let none: [][]Val = []
-    for r in env.group {
-        let sub = Env{cols: env.cols, row: r, group: &none, agg: false, params: env.params}
-        let v = try eval(&args[0], &sub)
-        if isNull(&v) { continue }
-        count += 1
-        if isNull(&acc) {
-            acc = v
-            continue
-        }
-        if name == "sum" || name == "avg" {
-            acc = try arith(&"+", &acc, &v)
-        } else if name == "min" {
-            if (try compare(&v, &acc)) < 0 { acc = v }
-        } else if name == "max" {
-            if (try compare(&v, &acc)) > 0 { acc = v }
-        }
-    }
-    if name == "count" { return Ok(Val.Int(count)) }
-    if name == "avg" {
-        if count == 0 { return Ok(Val.Null) }
-        let q = try arith(&"/", &Val.Num(asNum(&acc).unwrap()), &Val.Num(Decimal.fromInt(count)))
-        return Ok(q)
-    }
-    return Ok(acc)
 }
 
 fn call(name: &str, vs: &[]Val): Result[Val, DbErr] {
@@ -1106,8 +1095,8 @@ fn constVal(x: &Expr, params: &[]Val): Option[Val] {
     if len(ns) > 0 || hasAgg(x) { return None }
     let noCols: []lexdb_sql.ColDef = []
     let noRow: []Val = []
-    let noGroup: [][]Val = []
-    let env = Env{cols: &noCols, row: &noRow, group: &noGroup, agg: false, params: params}
+    let noAggs: []Val = []
+    let env = Env{cols: &noCols, row: &noRow, aggs: &noAggs, params: params}
     match eval(x, &env) {
         Ok(v) {
             if isNull(&v) { return None }
@@ -1425,8 +1414,8 @@ fn fetch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, p: &Path,
 
 fn allTrue(cs: &[]Expr, cols: &[]lexdb_sql.ColDef, row: &[]Val, params: &[]Val): Result[bool, DbErr] {
     if len(cs) == 0 { return Ok(true) }
-    let noGroup: [][]Val = []
-    let env = Env{cols: cols, row: row, group: &noGroup, agg: false, params: params}
+    let noAggs: []Val = []
+    let env = Env{cols: cols, row: row, aggs: &noAggs, params: params}
     for c in cs { if truth(&(try eval(&c, &env))) != Some(true) { return Ok(false) } }
     return Ok(true)
 }
@@ -1565,8 +1554,8 @@ fn materialize(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query,
             let lv = &q.levels[k]
             var full: []Val = array(len(q.cols), Val.Null)
             {
-                let noGroup: [][]Val = []
-                let env = Env{cols: &q.cols, row: &full, group: &noGroup, agg: false, params: params}
+                let noAggs: []Val = []
+                let env = Env{cols: &q.cols, row: &full, aggs: &noAggs, params: params}
                 let sc = try pathScan(&lv.t, &lv.path, &env)
                 var cur = newCursor()
                 while !cur.done { try fetch(st, txn, &lv.t, &lv.path, &sc, mut &cur, mut &rows) }
@@ -1641,8 +1630,8 @@ fn runLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, k: int
         var kb = newStrBuf()
         var nul = false
         {
-            let noGroup: [][]Val = []
-            let env = Env{cols: &q.cols, row: row, group: &noGroup, agg: false, params: params}
+            let noAggs: []Val = []
+            let env = Env{cols: &q.cols, row: row, aggs: &noAggs, params: params}
             for i in 0..len(lv.hashCols) {
                 let v = try coerce(try eval(&lv.hashVals[i], &env), &lv.t.cols[lv.hashCols[i]].typ)
                 if isNull(&v) { nul = true }
@@ -1664,8 +1653,8 @@ fn runLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, k: int
     } else {
         var sc = Scan{empty: true, point: false, lo: "", hi: ""}
         {
-            let noGroup: [][]Val = []
-            let env = Env{cols: &q.cols, row: row, group: &noGroup, agg: false, params: params}
+            let noAggs: []Val = []
+            let env = Env{cols: &q.cols, row: row, aggs: &noAggs, params: params}
             sc = try pathScan(&lv.t, &lv.path, &env)
         }
         var cur = newCursor()
@@ -1841,9 +1830,9 @@ fn checkUnique(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, ix:
 fn inIndex(t: &Table, ix: &Index, row: &[]Val): Result[bool, DbErr] {
     match ix.pred {
         Some(x) {
-            let noGroup: [][]Val = []
+            let noAggs: []Val = []
             let noParams: []Val = []
-            let env = Env{cols: &t.cols, row: row, group: &noGroup, agg: false, params: &noParams}
+            let env = Env{cols: &t.cols, row: row, aggs: &noAggs, params: &noParams}
             return Ok(truth(&(try eval(&x, &env))) == Some(true))
         }
         None { return Ok(true) }
@@ -2042,8 +2031,8 @@ fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     }
     let noCols: []lexdb_sql.ColDef = []
     let noRow: []Val = []
-    let noGroup: [][]Val = []
-    let env = Env{cols: &noCols, row: &noRow, group: &noGroup, agg: false, params: params}
+    let noAggs: []Val = []
+    let env = Env{cols: &noCols, row: &noRow, aggs: &noAggs, params: params}
     var count = 0
     for r in s.rows {
         if len(r) > len(targets) { return Err(e("42601", "INSERT has more expressions than target columns")) }
@@ -2079,9 +2068,9 @@ fn update(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
         append(mut &found, copyRow(r))
         return Ok(true)
     }, mut &rs)
-    let noGroup: [][]Val = []
+    let noAggs: []Val = []
     for old in found {
-        let env = Env{cols: &q.cols, row: &old, group: &noGroup, agg: false, params: params}
+        let env = Env{cols: &q.cols, row: &old, aggs: &noAggs, params: params}
         var row = copyRow(&old)
         for k in 0..len(sets) {
             row[targets[k]] = try coerce(try eval(&sets[k], &env), &t.cols[targets[k]].typ)
@@ -2145,7 +2134,7 @@ fn explain(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, x: &lexdb_sql.Stmt
 fn exprName(x: &Expr): str {
     match x {
         Expr.Col(n) { return colPart(&n) }
-        Expr.Call(n, _, _) { return n }
+        Expr.Call(n, _, _) { return aggBase(&n) }
         Expr.Cast(a, t) {
             let inner = exprName(&a)
             return if inner == "?column?" { kindName(&t) } else { inner }
@@ -2188,8 +2177,11 @@ pub fn exprOid(x: &Expr, cols: &[]lexdb_sql.ColDef, ptypes: &[]int): int {
         Expr.IsNull(_, _) { return lexdb_sql.OID_BOOL }
         Expr.Cast(_, t) { return t.oid }
         Expr.Call(n, args, _) {
-            match n {
+            match aggBase(&n) {
                 "count" { return lexdb_sql.OID_INT8 }
+                "bool_and", "bool_or", "every" { return lexdb_sql.OID_BOOL }
+                "string_agg" { return lexdb_sql.OID_TEXT }
+                "stddev", "stddev_samp", "stddev_pop", "variance", "var_samp", "var_pop" { return lexdb_sql.OID_NUMERIC }
                 "avg" { return lexdb_sql.OID_NUMERIC }
                 "sum" {
                     let a = if len(args) > 0 { exprOid(&args[0], cols, ptypes) } else { lexdb_sql.OID_INT8 }
@@ -2273,8 +2265,8 @@ fn evalInt(x: &Option[Expr], params: &[]Val, what: str): Result[int, DbErr] {
         Some(v) {
             let noCols: []lexdb_sql.ColDef = []
             let noRow: []Val = []
-            let noGroup: [][]Val = []
-            let env = Env{cols: &noCols, row: &noRow, group: &noGroup, agg: false, params: params}
+            let noAggs: []Val = []
+            let env = Env{cols: &noCols, row: &noRow, aggs: &noAggs, params: params}
             match try coerce(try eval(&v, &env), &lexdb_sql.TypeName{kind: lexdb_sql.K_INT, oid: lexdb_sql.OID_INT8, prec: 0, scale: 0, len: 0}) {
                 Val.Int(n) {
                     if n < 0 { return Err(e("2201W", what + " must not be negative")) }
@@ -2314,6 +2306,235 @@ fn select(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     return selectWith(st, txn, s, params, ptypes, false, mut &none)
 }
 
+// ---- aggregates: one accumulator per call and group, so a grouped
+// query holds its groups, not its rows
+
+// An aggregate call of the query: its function, arguments, modifiers.
+type AggSpec = record {
+    fname: str
+    args: []Expr
+    star: bool
+    distinct: bool
+    filter: Option[Expr]
+    text: str               // to share one accumulator between equal calls
+}
+
+type Acc = record {
+    n: int
+    val: Val                // min, max, bool_and, bool_or
+    sum: Val                // sum, avg; the variances: the sum ...
+    sumsq: Val              // ... and the sum of squares
+    parts: []str            // string_agg
+    seen: Map[str, int]     // DISTINCT
+}
+
+fn newAccs(n: int): []Acc {
+    var out: []Acc = []
+    for i in 0..n { append(mut &out, Acc{n: 0, val: Val.Null, sum: Val.Null, sumsq: Val.Null, parts: [], seen: newMap()}) }
+    return out
+}
+
+fn slotRef(i: int): Expr { return Expr.Call("#agg", [Expr.Lit(Val.Int(i))], false) }
+
+// x with each aggregate call replaced by its slot, the calls added to specs.
+fn collectAggs(x: &Expr, specs: mut &[]AggSpec): Result[Expr, DbErr] {
+    match x {
+        Expr.Call(name, args, star) {
+            if !isAgg(&name) {
+                var out: []Expr = []
+                for a in args { append(mut &out, try collectAggs(&a, specs)) }
+                return Ok(Expr.Call(name, out, star))
+            }
+            let base = aggBase(&name)
+            var aargs = cloneAll(&args)
+            var filter: Option[Expr] = None
+            if strings.contains(name, " filter") { filter = Some(pop(mut &aargs)) }
+            for a in aargs { if hasAgg(&a) { return Err(e("42803", "aggregate function calls cannot be nested")) } }
+            match filter {
+                Some(f) { if hasAgg(&f) { return Err(e("42803", "aggregate functions are not allowed in FILTER")) } }
+                None {}
+            }
+            let want = if base == "string_agg" { 2 } else { 1 }
+            if star && base != "count" { return Err(e("42809", base + "(*) is not an aggregate that takes *")) }
+            if !star && len(aargs) != want {
+                return Err(e("42883", "function " + base + " takes " + want.toStr() + " argument" + (if want > 1 { "s" } else { "" })))
+            }
+            let text = lexdb_sql.exprText(x)
+            for i in 0..len(specs) { if specs[i].text == text { return Ok(slotRef(i)) } }
+            append(specs, AggSpec{fname: base, args: aargs, star: star, distinct: strings.contains(name, " distinct"),
+                                  filter: filter, text: text})
+            return Ok(slotRef(len(specs) - 1))
+        }
+        Expr.Unary(op, a) { return Ok(Expr.Unary(op, try collectAggs(&a, specs))) }
+        Expr.Bin(op, a, b) {
+            let l = try collectAggs(&a, specs)
+            let r = try collectAggs(&b, specs)
+            return Ok(Expr.Bin(op, l, r))
+        }
+        Expr.IsNull(a, neg) { return Ok(Expr.IsNull(try collectAggs(&a, specs), neg)) }
+        Expr.Cast(a, t) { return Ok(Expr.Cast(try collectAggs(&a, specs), t)) }
+        else { return Ok(clone(x)) }
+    }
+}
+
+fn numOf(v: &Val, fname: &str): Result[Val, DbErr] {
+    match asNum(v) {
+        Some(d) { return Ok(Val.Num(d)) }
+        None { return Err(e("42883", "function " + fname + " needs a number")) }
+    }
+}
+
+// Adds one row (env) to an accumulator.
+fn accumulate(sp: &AggSpec, acc: mut &Acc, env: &Env): Result[Unit, DbErr] {
+    match sp.filter {
+        Some(f) { if truth(&(try eval(&f, env))) != Some(true) { return Ok(Unit{}) } }
+        None {}
+    }
+    if sp.star {
+        acc.n += 1
+        return Ok(Unit{})
+    }
+    let v = try eval(&sp.args[0], env)
+    if isNull(&v) { return Ok(Unit{}) }
+    if sp.distinct {
+        var kb = newStrBuf()
+        encIdxPart(mut &kb, &v)
+        let k = kb.toStr()
+        if acc.seen.get(&k).isSome() { return Ok(Unit{}) }
+        acc.seen.put(k, 1)
+    }
+    let f = sp.fname
+    if f == "sum" || f == "avg" {
+        acc.sum = if isNull(&acc.sum) { v } else { try arith(&"+", &acc.sum, &v) }
+    } else if f == "min" {
+        if isNull(&acc.val) || (try compare(&v, &acc.val)) < 0 { acc.val = v }
+    } else if f == "max" {
+        if isNull(&acc.val) || (try compare(&v, &acc.val)) > 0 { acc.val = v }
+    } else if f == "bool_and" || f == "every" || f == "bool_or" {
+        let b = match truth(&v) {
+            Some(x) { x }
+            None { return Err(e("42883", "function " + f + " needs a boolean")) }
+        }
+        let prev = match acc.val { Val.Bool(x) { x } else { f != "bool_or" } }
+        acc.val = Val.Bool(if f == "bool_or" { prev || b } else { prev && b })
+    } else if f == "string_agg" {
+        let sep = try eval(&sp.args[1], env)
+        if acc.n > 0 && !isNull(&sep) { append(mut &acc.parts, text(&sep)) }
+        append(mut &acc.parts, text(&v))
+    } else if f != "count" {
+        // the variances and standard deviations
+        let x = try numOf(&v, &f)
+        let sq = try arith(&"*", &x, &x)
+        acc.sum = if isNull(&acc.sum) { x } else { try arith(&"+", &acc.sum, &x) }
+        acc.sumsq = if isNull(&acc.sumsq) { sq } else { try arith(&"+", &acc.sumsq, &sq) }
+    }
+    acc.n += 1
+    return Ok(Unit{})
+}
+
+// The square root at 16 places (Newton's method at 20).
+fn sqrtNum(v: &Val): Result[Val, DbErr] {
+    let a = asNum(v).unwrap()
+    if a.isNeg() { return Err(e("2201F", "cannot take square root of a negative number")) }
+    if a.isZero() { return Ok(Val.Num(a)) }
+    var x = if (try compare(v, &Val.Int(1))) > 0 { a } else { Decimal.fromInt(1) }
+    let two = Decimal.fromInt(2)
+    for i in 0..200 {
+        let q = match a.div(x, 20, Rounding.HALF_EVEN) { Ok(d) { d } Err(_) { return Err(decErr()) } }
+        let next = match q.addExact(x) { Ok(d) { d } Err(_) { return Err(decErr()) } }
+        let half = match next.div(two, 20, Rounding.HALF_EVEN) { Ok(d) { d } Err(_) { return Err(decErr()) } }
+        if half.canonical() == x.canonical() { break }
+        x = half
+    }
+    match x.quantize(16, Rounding.HALF_EVEN) {
+        Ok(d) { return Ok(Val.Num(d)) }
+        Err(_) { return Err(decErr()) }
+    }
+}
+
+// An accumulator's result.
+fn finish(sp: &AggSpec, acc: &Acc): Result[Val, DbErr] {
+    let f = sp.fname
+    if f == "count" { return Ok(Val.Int(acc.n)) }
+    if acc.n == 0 { return Ok(Val.Null) }
+    if f == "sum" { return Ok(acc.sum) }
+    if f == "avg" { return arith(&"/", &(try numOf(&acc.sum, &f)), &Val.Num(Decimal.fromInt(acc.n))) }
+    if f == "string_agg" { return Ok(Val.Text(strings.join(&acc.parts, ""))) }
+    if f == "min" || f == "max" || f == "bool_and" || f == "bool_or" || f == "every" { return Ok(acc.val) }
+    // variance: (n * sum of squares - sum * sum) / (n * (n - 1)), or n * n for the population's
+    let pop = f == "var_pop" || f == "stddev_pop"
+    if !pop && acc.n < 2 { return Ok(Val.Null) }
+    let n = Val.Int(acc.n)
+    let num = try arith(&"-", &(try arith(&"*", &n, &acc.sumsq)), &(try arith(&"*", &acc.sum, &acc.sum)))
+    let den = Val.Int(if pop { acc.n * acc.n } else { acc.n * (acc.n - 1) })
+    let vr = try arith(&"/", &(try numOf(&num, &f)), &(try numOf(&den, &f)))
+    if f == "variance" || f == "var_samp" || f == "var_pop" { return Ok(vr) }
+    return sqrtNum(&vr)
+}
+
+// A grouped query's output may use a column only inside an aggregate, as
+// part of a GROUP BY expression, or from a table whose whole primary key
+// is grouped (its other columns follow from it).
+fn checkGrouped(x: &Expr, gtexts: &[]str, okLevels: &[]bool, q: &Query): Result[Unit, DbErr] {
+    let t = lexdb_sql.exprText(x)
+    for g in gtexts { if g == t { return Ok(Unit{}) } }
+    match x {
+        Expr.Col(n) {
+            let i = colIndex(&q.cols, &n)
+            if i < 0 { return Ok(Unit{}) }      // an output column's alias (ORDER BY)
+            let l = q.levelOf(&n)
+            if l >= 0 && okLevels[l] { return Ok(Unit{}) }
+            return Err(e("42803", "column \"" + n + "\" must appear in the GROUP BY clause or be used in an aggregate function"))
+        }
+        Expr.Call(name, args, _) {
+            if name == "#agg" { return Ok(Unit{}) }
+            for a in args { try checkGrouped(&a, gtexts, okLevels, q) }
+        }
+        Expr.Unary(_, a) { try checkGrouped(&a, gtexts, okLevels, q) }
+        Expr.Bin(_, a, b) {
+            try checkGrouped(&a, gtexts, okLevels, q)
+            try checkGrouped(&b, gtexts, okLevels, q)
+        }
+        Expr.IsNull(a, _) { try checkGrouped(&a, gtexts, okLevels, q) }
+        Expr.Cast(a, _) { try checkGrouped(&a, gtexts, okLevels, q) }
+        else {}
+    }
+    return Ok(Unit{})
+}
+
+// GROUP BY: an input column or expression; else an output column's
+// position or name, meaning its expression.
+fn resolveGroup(g: &Expr, cols: &[]lexdb_sql.ColDef, outs: &[]OutCol, exprs: &[]Expr): Result[Expr, DbErr] {
+    match g {
+        Expr.Lit(v) {
+            match v {
+                Val.Int(n) {
+                    if n < 1 || n > len(exprs) { return Err(e("42P10", "GROUP BY position " + n.toStr() + " is not in select list")) }
+                    return Ok(clone(&exprs[n - 1]))
+                }
+                else {}
+            }
+        }
+        Expr.Col(n) {
+            match resolveName(cols, len(cols), &n) {
+                Ok(r) { return Ok(Expr.Col(r)) }
+                Err(x) {
+                    for i in 0..len(outs) { if outs[i].name == n { return Ok(clone(&exprs[i])) } }
+                    return Err(x)
+                }
+            }
+        }
+        else {}
+    }
+    return resolve(g, cols, len(cols))
+}
+
+fn valsKey(vs: &[]Val): str {
+    var kb = newStrBuf()
+    for v in vs { encIdxPart(mut &kb, &v) }
+    return kb.toStr()
+}
+
 // A SELECT, planned: its query, its output, and how its order is had.
 type Sel = record {
     q: Query
@@ -2326,6 +2547,9 @@ type Sel = record {
     first: int              // MIN or MAX served by the scan's order: stop at the first non-NULL value of this column
     limit: int
     offset: int
+    having: Option[Expr]
+    specs: []AggSpec        // the aggregate calls; exprs, having and order use their slots
+    distinct: bool
 }
 
 // The column of level 0 an expression is, else -1.
@@ -2424,11 +2648,35 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
     var exprs: []Expr = []
     let outs = try selectCols(s, &q.cols, ptypes, mut &exprs)
     var groupBy: []Expr = []
-    for g in s.group { append(mut &groupBy, try resolve(&g, &q.cols, len(q.cols))) }
+    for g in s.group {
+        let r = try resolveGroup(&g, &q.cols, &outs, &exprs)
+        if hasAgg(&r) { return Err(e("42803", "aggregate functions are not allowed in GROUP BY")) }
+        append(mut &groupBy, r)
+    }
     var order: []Expr = []
     for o in s.order { append(mut &order, try resolveOrder(&o.expr, &q.cols, &outs)) }
-    var aggQ = len(groupBy) > 0
+    var having: Option[Expr] = None
+    match s.having {
+        Some(h) { having = Some(try resolve(&h, &q.cols, len(q.cols))) }
+        None {}
+    }
+    var aggQ = len(groupBy) > 0 || having.isSome()
     for x in exprs { if hasAgg(&x) { aggQ = true } }
+    for x in order { if hasAgg(&x) { aggQ = true } }
+    if s.distinct {
+        // SELECT DISTINCT: ORDER BY may use only what it outputs
+        for o in order {
+            var ok = false
+            match o {
+                Expr.Lit(v) { match v { Val.Int(_) { ok = true } else {} } }
+                Expr.Col(n) { if colIndex(&q.cols, &n) < 0 { ok = true } }
+                else {}
+            }
+            let t = lexdb_sql.exprText(&o)
+            for x in exprs { if lexdb_sql.exprText(&x) == t { ok = true } }
+            if !ok { return Err(e("42P10", "for SELECT DISTINCT, ORDER BY expressions must appear in select list")) }
+        }
+    }
     let limit = try evalInt(&s.limit, params, "LIMIT")
     let offset = try evalInt(&s.offset, params, "OFFSET")
     var sort = len(order) > 0
@@ -2491,8 +2739,49 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         q.levels[0].path.desc = setDesc
         q.levels[0].path.noNulls = setNoNulls
     }
+    // A grouped query: its aggregate calls become accumulators, and its
+    // columns must be grouped.
+    var specs: []AggSpec = []
+    if aggQ {
+        var rx: []Expr = []
+        for x in exprs { append(mut &rx, try collectAggs(&x, mut &specs)) }
+        exprs = rx
+        var ro: []Expr = []
+        for x in order { append(mut &ro, try collectAggs(&x, mut &specs)) }
+        order = ro
+        var rh: Option[Expr] = None
+        match having {
+            Some(h) { rh = Some(try collectAggs(&h, mut &specs)) }
+            None {}
+        }
+        having = rh
+        var gtexts: []str = []
+        for g in groupBy { append(mut &gtexts, lexdb_sql.exprText(&g)) }
+        var okLevels: []bool = []
+        for lv in q.levels {
+            var all = true
+            for c in lv.t.pk {
+                let name = lv.alias + "." + lv.t.cols[c].name
+                var found = false
+                for g in groupBy {
+                    match g {
+                        Expr.Col(n) { if n == name { found = true } }
+                        else {}
+                    }
+                }
+                if !found { all = false }
+            }
+            append(mut &okLevels, all && len(groupBy) > 0)
+        }
+        for x in exprs { try checkGrouped(&x, &gtexts, &okLevels, &q) }
+        for x in order { try checkGrouped(&x, &gtexts, &okLevels, &q) }
+        match having {
+            Some(h) { try checkGrouped(&h, &gtexts, &okLevels, &q) }
+            None {}
+        }
+    }
     return Ok(Sel{q: q, exprs: exprs, outs: outs, groupBy: groupBy, order: order, aggQ: aggQ, sort: sort,
-                  first: first, limit: limit, offset: offset})
+                  first: first, limit: limit, offset: offset, having: having, specs: specs, distinct: s.distinct})
 }
 
 // EXPLAIN's lines for a planned SELECT.
@@ -2501,6 +2790,8 @@ fn selLines(sel: &Sel, cnt: &[]Counts): []str {
     if len(sel.q.levels) == 0 { append(mut &lines, "result") }
     if sel.first >= 0 { append(mut &lines, "min/max: the first value in the scan's order") }
     if len(sel.groupBy) > 0 || (sel.aggQ && sel.first < 0) { append(mut &lines, "aggregate") }
+    if sel.having.isSome() { append(mut &lines, "having") }
+    if sel.distinct { append(mut &lines, "distinct") }
     if len(sel.order) > 0 { append(mut &lines, if sel.sort { "order: sort" } else { "order: the scan's" }) }
     if sel.limit >= 0 && !sel.aggQ && !sel.sort { append(mut &lines, "limit: stops the scan") }
     return lines
@@ -2519,48 +2810,70 @@ fn selectWith(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
     var outRows: []OutRow = []
     let early = !sel.aggQ && !sel.sort && limit >= 0
     let stopAt = if offset > 0 { limit + offset } else { limit }
-    let noGroup: [][]Val = []
+    let noAggs: []Val = []
+    var seen: Map[str, int] = newMap()      // SELECT DISTINCT
     if sel.aggQ {
-        var groups: [][][]Val = []
+        // per group: its first row (for grouped columns) and its accumulators
         var index: Map[str, int] = newMap()
+        var firsts: [][]Val = []
+        var accs: [][]Acc = []
         try runQuery(st, txn, q, params, fn(r: &[]Val): Result[bool, DbErr] {
             if sel.first >= 0 && isNull(&r[sel.first]) { return Ok(true) }
-            let row = copyRow(r)
+            let env = Env{cols: &q.cols, row: r, aggs: &noAggs, params: params}
+            var g = 0
             if len(sel.groupBy) > 0 {
                 var kb = newStrBuf()
-                {
-                    let env = Env{cols: &q.cols, row: &row, group: &noGroup, agg: false, params: params}
-                    for g in sel.groupBy { encIdxPart(mut &kb, &(try eval(&g, &env))) }
-                }
+                for x in sel.groupBy { encIdxPart(mut &kb, &(try eval(&x, &env))) }
                 let k = kb.toStr()
                 match index.get(&k) {
-                    Some(i) { append(mut &groups[i], row) }
+                    Some(i) { g = i }
                     None {
-                        index.put(k, len(groups))
-                        append(mut &groups, [row])
+                        g = len(firsts)
+                        index.put(k, g)
+                        append(mut &firsts, copyRow(r))
+                        append(mut &accs, newAccs(len(sel.specs)))
                     }
                 }
-            } else {
-                if len(groups) == 0 { append(mut &groups, []) }
-                append(mut &groups[0], row)
+            } else if len(firsts) == 0 {
+                append(mut &firsts, copyRow(r))
+                append(mut &accs, newAccs(len(sel.specs)))
             }
+            for i in 0..len(sel.specs) { try accumulate(&sel.specs[i], mut &accs[g][i], &env) }
             return Ok(sel.first < 0)        // MIN/MAX in order: its first value is the answer
         }, mut &rs)
-        if len(groups) == 0 && len(sel.groupBy) == 0 { append(mut &groups, []) }
-        let noRow: []Val = []
-        for g in groups {
-            let env = Env{cols: &q.cols, row: if len(g) > 0 { &g[0] } else { &noRow }, group: g, agg: true, params: params}
+        if len(firsts) == 0 && len(sel.groupBy) == 0 {
+            append(mut &firsts, [])         // no rows, no GROUP BY: one group, empty
+            append(mut &accs, newAccs(len(sel.specs)))
+        }
+        for gi in 0..len(firsts) {
             var vals: []Val = []
-            for x in sel.exprs { append(mut &vals, try eval(&x, &env)) }
+            for i in 0..len(sel.specs) { append(mut &vals, try finish(&sel.specs[i], &accs[gi][i])) }
+            let env = Env{cols: &q.cols, row: &firsts[gi], aggs: &vals, params: params}
+            match sel.having {
+                Some(h) { if truth(&(try eval(&h, &env))) != Some(true) { continue } }
+                None {}
+            }
+            var out: []Val = []
+            for x in sel.exprs { append(mut &out, try eval(&x, &env)) }
+            if sel.distinct {
+                let k = valsKey(&out)
+                if seen.get(&k).isSome() { continue }
+                seen.put(k, 1)
+            }
             var ord: []Val = []
-            for o in sel.order { append(mut &ord, try orderValue(&o, &sel.outs, &vals, &env)) }
-            append(mut &outRows, OutRow{vals: vals, ord: ord})
+            for o in sel.order { append(mut &ord, try orderValue(&o, &sel.outs, &out, &env)) }
+            append(mut &outRows, OutRow{vals: out, ord: ord})
         }
     } else {
         try runQuery(st, txn, q, params, fn(r: &[]Val): Result[bool, DbErr] {
-            let env = Env{cols: &q.cols, row: r, group: &noGroup, agg: false, params: params}
+            let env = Env{cols: &q.cols, row: r, aggs: &noAggs, params: params}
             var vals: []Val = []
             for x in sel.exprs { append(mut &vals, try eval(&x, &env)) }
+            if sel.distinct {
+                let k = valsKey(&vals)
+                if seen.get(&k).isSome() { return Ok(true) }
+                seen.put(k, 1)
+            }
             var ord: []Val = []
             if sel.sort { for o in sel.order { append(mut &ord, try orderValue(&o, &sel.outs, &vals, &env)) } }
             append(mut &outRows, OutRow{vals: vals, ord: ord})

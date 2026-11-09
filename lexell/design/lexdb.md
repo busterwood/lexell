@@ -392,7 +392,7 @@ Built on 2026-11-09 on branch `lexdb`, about 6,300 lines in
 (cache, trees, transactions, log, checkpoints, recovery, snapshots),
 `lexdb_sql` (lexer, parser), `lexdb_exec` (catalog, rows, keys, planner,
 statements, sessions), `lexdb_wire` (protocol 3.0) and `lexdb` (the
-server). Tests: `python3 lexell/tests/lexdb.py` (16 programs in
+server). Tests: `python3 lexell/tests/lexdb.py` (17 programs in
 `tests/lexdb/run`, under `LXL_CHECK=1`).
 
     lexell/compiler/out/lxlc lexell/cmd/lexdb.lxl -o lexdb
@@ -426,7 +426,8 @@ server). Tests: `python3 lexell/tests/lexdb.py` (16 programs in
   statement waits, after it runs, until what it read is durable, since its
   result goes out before COMMIT (4.4).
 - **Interpreted, not bytecode.** The executor walks the statement's tree.
-- **No subqueries, DISTINCT, HAVING, schemas, bytea, dates or times yet.**
+- **No subqueries, schemas, LIKE, IN lists, BETWEEN, CASE, bytea, dates or
+  times yet.**
 - **Trust login**: no password, no TLS. The server listens on loopback by
   default.
 - **A simple query with several statements** runs each in its own
@@ -499,14 +500,15 @@ is the comparison to make.
 2. Plans kept per prepared statement: since D4 every execution resolves
    names and chooses paths, and point selects fell from 26,700 to 23,800
    tps (one run each).
-3. Schemas (the user uses them extensively): `schema.table` names, the
+3. LIKE, IN lists, BETWEEN and CASE (common, and missing).
+4. Schemas (the user uses them extensively): `schema.table` names, the
    catalog keyed by schema, `CREATE SCHEMA`/`DROP SCHEMA`, `search_path`,
    and three-part column names (`s.t.c`) in the resolver.
-4. COPY; then the cost questions (section 0), with EXPLAIN ANALYZE's
+5. COPY; then the cost questions (section 0), with EXPLAIN ANALYZE's
    counts as the evidence.
-5. Overflow pages for large rows; reclaiming a dropped table's pages.
-6. Authentication (SCRAM) and TLS, so the server can leave loopback.
-7. The checkpoint pause and the memory of decoded nodes, measured under a
+6. Overflow pages for large rows; reclaiming a dropped table's pages.
+7. Authentication (SCRAM) and TLS, so the server can leave loopback.
+8. The checkpoint pause and the memory of decoded nodes, measured under a
    large write load; io_uring if the helper pool is the limit (D5).
 
 ### 9.5 Indexes and joins (D4)
@@ -578,4 +580,32 @@ is the comparison to make.
   large table buffers every entry in its transaction; no expression
   indexes; mixed ASC/DESC orders and MIN with MAX in one query are sorted
   or aggregated the plain way.
+
+### 9.6 Grouping and aggregates
+
+- **Running totals.** Each aggregate call of a query (shared when two are
+  the same text) is an accumulator per group, and the expressions use its
+  slot (`#agg`). A grouped query holds, per group, its first row and its
+  accumulators, not its rows.
+- **Functions:** count, sum, avg, min, max, string_agg, bool_and, bool_or,
+  every, variance, var_samp, var_pop, stddev, stddev_samp, stddev_pop;
+  `agg(DISTINCT x)` and `agg(...) FILTER (WHERE ...)` on any of them (kept
+  in the call's name, "count distinct filter", the filter as the last
+  argument). avg and the variances divide at 16 places as PostgreSQL does
+  for integers; for numeric columns PostgreSQL keeps more places in the
+  variances. stddev is a square root by Newton's method.
+- **GROUP BY** takes expressions, output positions and output names (an
+  input column first), and **HAVING**. A grouped query may use a column only
+  inside an aggregate, inside a GROUP BY expression, or from a table whose
+  whole primary key is grouped (42803 otherwise, as in PostgreSQL); nested
+  aggregates and aggregates in WHERE or GROUP BY are 42803 too.
+- **SELECT DISTINCT** drops repeated output rows as they come, so a LIMIT
+  still stops the scan; its ORDER BY may use only its outputs (42P10).
+- **Not yet:** ORDER BY inside an aggregate (string_agg's order is the
+  scan's), GROUPING SETS and ROLLUP, DISTINCT ON, grouping in an index's
+  order without a hash table.
+- **Tests:** `exec_agg`, checked by hand. `exec_index_diff` compares grouped
+  aggregates on the indexed and plain tables, DISTINCT with GROUP BY,
+  FILTER with WHERE, and HAVING with the groups filtered in the test;
+  ignoring DISTINCT (36 differ), FILTER (64) or HAVING (29) fails it.
 
