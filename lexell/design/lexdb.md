@@ -393,7 +393,7 @@ Built on 2026-11-09 on branch `lexdb`, about 6,300 lines in
 (cache, trees, transactions, log, checkpoints, recovery, snapshots),
 `lexdb_sql` (lexer, parser), `lexdb_exec` (catalog, rows, keys, planner,
 statements, sessions), `lexdb_wire` (protocol 3.0) and `lexdb` (the
-server). Tests: `python3 lexell/tests/lexdb.py` (35 programs in
+server). Tests: `python3 lexell/tests/lexdb.py` (36 programs in
 `tests/lexdb/run`, under `LXL_CHECK=1`).
 
     lexell/compiler/out/lxlc lexell/cmd/lexdb.lxl -o lexdb
@@ -525,8 +525,11 @@ is the comparison to make.
    - built: ORDER BY inside an aggregate (`string_agg(x, ',' ORDER BY
      x)`, 9.25); not done: `array_agg` and `json_agg`, whose results
      depend on it too;
-   - hashing a correlated scalar subquery with an aggregate (a count per
-     customer) as a grouped run.
+   - built: hashing a correlated scalar subquery with an aggregate (a
+     count per customer) as a grouped run (9.26); not done: the same
+     with GROUP BY, HAVING or DISTINCT in the subquery, and choosing
+     between the hash and per-row lookups by row counts (now: lookups
+     whenever an index path uses the reference).
 
    Waiting for row counts (costs, which the user has left for now: section
    0): choosing hash or index per row (9.9), and when an IN subquery's
@@ -1652,4 +1655,50 @@ Caught, each put back:
 - ties unstable;
 - accumulators shared across directions, and `exprText` without them;
 - the second key ignored.
+
+### 9.26 A correlated scalar aggregate as one grouped run
+
+`SELECT c.id, (SELECT count(*) FROM o WHERE o.cust = c.id) FROM c` ran the
+subquery once per distinct `c.id` (memoized). Without an index on
+`o.cust`, each run read all of o.
+
+- **When.** `hashSub` now also takes a scalar subquery that:
+  - is one aggregate row (no GROUP BY, HAVING, DISTINCT, LIMIT or
+    OFFSET, and no subquery in its output);
+  - refers to its outer row only in equality keys;
+  - has no path that already uses those references.
+
+  That last rule is the one EXISTS and IN follow (9.10): with an index on
+  the key, a lookup per row reads only the rows it needs.
+- **How.** The key's inner sides become the subquery's GROUP BY, and it
+  outputs the key, then the aggregate. `runHashed` keeps a value per key.
+  For a key with no rows, or a NULL outer key, the value is the aggregate
+  over no rows: count 0, sum NULL, `coalesce(sum(x), 0)` 0,
+  `count(*) + 1` 1. It is computed once, from fresh accumulators.
+- **Measured.** For 50 customers over 9,990 orders, o is read once
+  (9,990 rows) instead of 50 times (499,500).
+
+`exec_hashagg` compares each result with the same subquery written with
+`LIMIT 1`, which is not hashed and returns the same single row:
+
+- counts, and a key with no rows;
+- sum, coalesce and count + 1 over no rows;
+- max;
+- an extra filter;
+- two keys;
+- a NULL outer key;
+- in WHERE;
+- a non-equality reference (not hashed);
+- a key with an index (not hashed);
+- EXPLAIN and the rows read.
+
+Caught, each put back:
+
+- the no-rows value left NULL;
+- never hashed;
+- LIMIT allowed (wrong answers: the limit applies to the grouped run);
+- not grouped by the key.
+
+Not caught, as expected: dropping the NULL-key check, since NULL keys are
+never stored and the lookup misses anyway.
 

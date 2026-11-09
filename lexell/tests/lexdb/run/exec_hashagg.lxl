@@ -1,0 +1,127 @@
+// lexdb_exec: a correlated scalar subquery with an aggregate, its outer
+// references only equality keys, run once grouped by its key and hashed
+// (design/lexdb.md 9.26), instead of once per outer row. Each result is
+// compared with the same subquery written so it is not hashed (LIMIT 1:
+// the same single row), over customers 0..49 (o.cust has no index):
+// - count, and a key with no rows (count 0);
+// - sum with no rows (NULL), coalesce(sum, 0), count(*) + 1;
+// - max; a filter besides the key; two keys; a NULL outer key;
+// - in WHERE;
+// - not hashed: a non-equality reference, and a key with an index (a
+//   lookup per row is cheaper there);
+// - EXPLAIN shows the hash; EXPLAIN ANALYZE reads o once.
+// expect: count: 0|10 1|10 2|10 49|10, total 500 same
+// expect: no rows: 0 same
+// expect: sum, coalesce, +1: 999|t|0|1 same
+// expect: max: 9049 same
+// expect: filter: 250 same
+// expect: two keys: 250 same
+// expect: null key: 0 same
+// expect: in where: 25 same
+// expect: not hashed, non-equality: 490 same
+// expect: explain: subquery 1 (scalar): hashed on o.cust = c.id
+// expect: indexed: subquery 1 (scalar): per row, on c.id
+// expect: rows of o read: 9990 hashed, 499500 per row
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            var out: []str = []
+            for r in rs {
+                for row in r.rows {
+                    var vs: []str = []
+                    for v in row { append(mut &vs, lexdb_exec.text(&v)) }
+                    append(mut &out, strings.join(&vs, "|"))
+                }
+            }
+            return strings.join(&out, " ")
+        }
+        Err(e) { return e.state }
+    }
+}
+
+fn one(s: mut &lexdb_exec.Session, sql: &str) {
+    match s.exec(sql) {
+        Ok(_) {}
+        Err(e) { println(sql + ": " + e.state + " " + e.msg) }
+    }
+}
+
+// the result, and whether the not-hashed form agrees: each subquery's end,
+// written @), gets LIMIT 1 there
+fn cmp(s: mut &lexdb_exec.Session, label: &str, sql: &str) {
+    let a = q(s, &strings.replaceAll(sql, "@)", ")"))
+    let b = q(s, &strings.replaceAll(sql, "@)", " limit 1)"))
+    println(label + ": " + a + (if a == b { " same" } else { " DIFFERENT: " + b }))
+}
+
+fn line(s: mut &lexdb_exec.Session, sql: &str, prefix: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            for row in rs[0].rows {
+                let l = strings.trim(lexdb_exec.text(&row[0]))
+                if strings.startsWith(l, prefix) { return l }
+            }
+            return "none"
+        }
+        Err(e) { return e.state }
+    }
+}
+
+fn rowsRead(l: &str): str {
+    let i = strings.indexOf(l, "rows read ", 0)
+    if i < 0 { return l }
+    let rest = l[i + 10..len(l)]
+    return strings.split(&rest, ",")[0]
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(47), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 1024 * 1024, ckptBytes: 1024 * 1024, snapNodes: 100000}, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        one(mut &s, &"create table c (id int primary key, kind int, ref int)")
+        one(mut &s, &"create table o (id int primary key, cust int, kind int, amount int)")
+        one(mut &s, &"create table oi (id int primary key, cust int)")
+        one(mut &s, &"create index oi_cust on oi (cust)")
+        var vals: []str = []
+        for i in 0..1000 {
+            let r = if i % 7 == 0 { "null" } else { i.toStr() }
+            append(mut &vals, "(" + i.toStr() + ", " + (i % 2).toStr() + ", " + r + ")")
+        }
+        one(mut &s, &("insert into c values " + strings.join(&vals, ", ")))
+        for b in 0..10 {
+            var ov: []str = []
+            for j in 0..1000 {
+                let i = b * 1000 + j
+                append(mut &ov, "(" + i.toStr() + ", " + (i % 1000).toStr() + ", " + (b % 2).toStr() + ", " + i.toStr() + ")")
+            }
+            one(mut &s, &("insert into o values " + strings.join(&ov, ", ")))
+            one(mut &s, &("insert into oi select id, cust from o where id >= " + (b * 1000).toStr()))
+        }
+        one(mut &s, &"delete from o where cust = 999")
+
+        let counts = q(mut &s, &"select c.id, (select count(*) from o where o.cust = c.id) from c where c.id in (0, 1, 2, 49) order by c.id")
+        let total = "select sum((select count(*) from o where o.cust = c.id)) from c where c.id < 50"
+        let ta = q(mut &s, &total)
+        let tb = q(mut &s, &strings.replaceAll(&total, "c.id)", "c.id limit 1)"))
+        println("count: " + counts + ", total " + ta + (if ta == tb { " same" } else { " DIFFERENT: " + tb }))
+        cmp(mut &s, &"no rows", &"select (select count(*) from o where o.cust = c.id@) from c where c.id = 999")
+        cmp(mut &s, &"sum, coalesce, +1", &"select c.id, (select sum(amount) from o where o.cust = c.id@) is null, (select coalesce(sum(amount), 0) from o where o.cust = c.id@), (select count(*) + 1 from o where o.cust = c.id@) from c where c.id = 999")
+        cmp(mut &s, &"max", &"select max((select max(amount) from o where o.cust = c.id@)) from c where c.id < 50")
+        cmp(mut &s, &"filter", &"select sum((select count(*) from o where o.cust = c.id and o.amount >= 5000@)) from c where c.id < 50")
+        cmp(mut &s, &"two keys", &"select sum((select count(*) from o where o.cust = c.id and o.kind = c.kind@)) from c where c.id < 50")
+        cmp(mut &s, &"null key", &"select sum((select count(*) from o where o.cust = c.ref@)) from c where c.id = 7")
+        cmp(mut &s, &"in where", &"select count(*) from c where c.id < 50 and (select count(*) from o where o.cust = c.id and o.amount < 5000@) = 5 and c.kind = 1")
+        cmp(mut &s, &"not hashed, non-equality", &"select sum((select count(*) from o where o.cust < c.id@)) from c where c.id < 50 and c.id >= 49")
+        let hq = "explain analyze select sum((select count(*) from o where o.cust = c.id)) from c where c.id < 50"
+        println("explain: " + line(mut &s, &"explain select (select count(*) from o where o.cust = c.id) from c", &"subquery 1"))
+        println("indexed: " + line(mut &s, &"explain select (select count(*) from oi where oi.cust = c.id) from c", &"subquery 1"))
+        println("rows of o read: " + rowsRead(&line(mut &s, &hq, &"scan o")) + " hashed, " +
+                rowsRead(&line(mut &s, &strings.replaceAll(&hq, "c.id)", "c.id limit 1)"), &"scan o")) + " per row")
+        return 0
+    }).unwrap()
+}

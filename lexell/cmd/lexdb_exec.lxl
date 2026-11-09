@@ -2461,7 +2461,7 @@ type SubPlan = record {
     sel: Sel
     oid: int                    // its column's type
     name: str                   // its column's name, as an output column
-    hashed: bool                // correlated, run once into a hash: sel outputs the key (then IN's value)
+    hashed: bool                // correlated, run once into a hash: sel outputs the key (then IN's value, a scalar's aggregate)
     keyOuter: []Expr            // per key column: what it equals, of outer values only (refs as parameters)
     keyText: []str              // EXPLAIN: "inner = outer"
     cte: int                    // a CTE's use: the CTE's number (its rows shared); -1
@@ -2573,7 +2573,7 @@ fn planSub(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
     let name = if s.use == lexdb_sql.SUB_EXISTS { "exists" } else if s.use == lexdb_sql.SUB_SCALAR { sel.outs[0].name } else { "?column?" }
     // (in FROM: its columns are its outs)
     var sp = SubPlan{use: s.use, sel: sel, oid: oid, name: name, hashed: false, keyOuter: [], keyText: [], cte: s.cte}
-    if (s.use == lexdb_sql.SUB_EXISTS || s.use == lexdb_sql.SUB_IN) && len(sp.sel.q.refs) > 0 { hashSub(mut &sp, sc.base) }
+    if len(sp.sel.q.refs) > 0 && s.use != lexdb_sql.SUB_FROM { hashSub(mut &sp, sc.base) }
     return Ok(sp)
 }
 
@@ -2689,9 +2689,15 @@ fn dropTexts(cs: []Expr, texts: &[]str): []Expr {
 
 fn hashSub(sp: mut &SubPlan, base: int) {
     var hk = HashKeys{inner: [], outer: [], texts: []}
+    // a scalar subquery: one aggregate row, no GROUP BY, its key's groups
+    // then its value per group (9.26)
+    let scalar = sp.use == lexdb_sql.SUB_SCALAR
     {
         let sel = &sp.sel
-        if sel.aggQ || sel.limit >= 0 || sel.offset > 0 || len(sel.groupBy) > 0 { return }
+        if sel.setop != 0 || sel.limit >= 0 || sel.offset > 0 || len(sel.groupBy) > 0 { return }
+        if scalar {
+            if !sel.aggQ || sel.having.isSome() || sel.distinct || len(sel.exprs) != 1 || hasSubCall(&sel.exprs[0]) { return }
+        } else if sel.aggQ { return }
         if !noRefs(&sel.exprs, base) || !noRefs(&sel.order, base) { return }
         let q = &sel.q
         for lv in q.levels {
@@ -2711,10 +2717,17 @@ fn hashSub(sp: mut &SubPlan, base: int) {
         sp.sel.q.levels[k].local = dropTexts(replace(mut &sp.sel.q.levels[k].local, []), &hk.texts)
     }
     sp.sel.q.top = dropTexts(replace(mut &sp.sel.q.top, []), &hk.texts)
-    // it outputs the key, then IN's value
+    // it outputs the key, then IN's value or the scalar's aggregate (grouped
+    // by the key)
     var outs: []Expr = []
     for x in hk.inner { append(mut &outs, clone(&x)) }
-    if sp.use == lexdb_sql.SUB_IN { append(mut &outs, clone(&sp.sel.exprs[0])) }
+    if sp.use == lexdb_sql.SUB_IN || scalar { append(mut &outs, clone(&sp.sel.exprs[0])) }
+    if scalar {
+        var gb: []Expr = []
+        for x in hk.inner { append(mut &gb, clone(&x)) }
+        sp.sel.groupBy = gb
+        sp.sel.first = -1               // per group now: no stopping at the first row
+    }
     var texts: []str = []
     for i in 0..len(hk.inner) {
         let r = refOf(&hk.outer[i], base)
@@ -2768,6 +2781,30 @@ fn runHashed(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sp: &SubPlan, pa
     var out = emptyRes()
     out.rows = len(res.rows)
     let nk = len(sp.keyOuter)
+    if sp.use == lexdb_sql.SUB_SCALAR {
+        for r in res.rows {
+            var gk = newStrBuf()
+            var nul = false
+            for j in 0..nk {
+                if isNull(&r[j]) { nul = true }
+                keyPart(mut &gk, &r[j])
+            }
+            if nul { continue }
+            out.groups.put(gk.toStr(), len(out.data))
+            append(mut &out.data, [r[nk]])
+        }
+        // a key with no rows: the aggregate over none (count 0, sum NULL)
+        var vals: []Val = []
+        for spec in sp.sel.specs {
+            let a = newAccs(1)
+            append(mut &vals, try finish(&spec, &a[0]))
+        }
+        let noRow: []Val = array(len(sp.sel.q.cols), Val.Null)
+        let noSubs: []SubRes = []
+        let env = Env{cols: &sp.sel.q.cols, row: &noRow, aggs: &vals, params: params, subs: &noSubs, cur: &noRow}
+        out.val = try eval(&sp.sel.exprs[nk], &env)
+        return Ok(out)
+    }
     for r in res.rows {
         var gk = newStrBuf()
         var nul = false
@@ -2803,6 +2840,14 @@ fn hashValue(n: &str, r: &SubRes, keyVals: &[]Val, x: &Val): Val {
     for v in keyVals {
         if isNull(&v) { miss = true }               // inner = NULL: no row
         keyPart(mut &gk, &v)
+    }
+    if n == "#sub" {
+        // a scalar: its group's value, or the aggregate over no rows
+        if miss { return r.val }
+        match r.groups.get(&gk.toStr()) {
+            Some(i) { return r.data[i][0] }
+            None { return r.val }
+        }
     }
     var f = 0
     if !miss {
