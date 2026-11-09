@@ -1101,7 +1101,22 @@ fn succ(s: &str): str {
     return strFromBytes(&bs)
 }
 
+// A row's stored form: per column a tag (0 NULL, 1 int, 2 bool, 3 numeric,
+// 4 text) and its value. A row with a text of LONG bytes or more begins with
+// tag 6 and its column count, and each such text is tag 5 and its length
+// in place, its bytes after the last column (9.31): the columns before
+// them stay at the row's start, which a large row keeps in its leaf.
+const LONG = 256
+
 fn encRow(row: &[]Val): str {
+    var long = false
+    for v in row {
+        match v {
+            Val.Text(s) { if len(s) >= LONG { long = true } }
+            else {}
+        }
+    }
+    if long { return encLong(row) }
     var b = newStrBuf()
     for v in row {
         match v {
@@ -1130,6 +1145,48 @@ fn encRow(row: &[]Val): str {
     return b.toStr()
 }
 
+fn encLong(row: &[]Val): str {
+    var b = newStrBuf()
+    b.addByte(6)
+    binary.addU32LE(mut &b, len(row))
+    for v in row {
+        match v {
+            Val.Null { b.addByte(0) }
+            Val.Int(n) {
+                b.addByte(1)
+                binary.addU64LE(mut &b, n)
+            }
+            Val.Bool(x) {
+                b.addByte(2)
+                b.addByte(if x { 1 } else { 0 })
+            }
+            Val.Num(d) {
+                b.addByte(3)
+                let s = d.toStr()
+                binary.addU32LE(mut &b, len(s))
+                b.add(s)
+            }
+            Val.Text(s) {
+                if len(s) >= LONG {
+                    b.addByte(5)
+                    binary.addU32LE(mut &b, len(s))
+                } else {
+                    b.addByte(4)
+                    binary.addU32LE(mut &b, len(s))
+                    b.add(s)
+                }
+            }
+        }
+    }
+    for v in row {
+        match v {
+            Val.Text(s) { if len(s) >= LONG { b.add(s) } }
+            else {}
+        }
+    }
+    return b.toStr()
+}
+
 fn decRow(s: &str, n: int): Result[[]Val, DbErr] {
     let all: []bool = []
     return decRowNeed(s, n, &all)
@@ -1141,13 +1198,29 @@ fn decRowNeed(s: &str, n: int, need: &[]bool): Result[[]Val, DbErr] {
     var out: []Val = []
     var at = 0
     let some = len(need) > 0
+    // a row with long texts: its column count, and where each long text is
+    var cols = n
+    let long = len(s) > 0 && s[0] == 6
+    if long {
+        cols = binary.readU32LEStr(s, 1)
+        at = 5
+    }
+    var longAt: []int = []               // the long texts' columns, in order
+    var longLen: []int = []
     for i in 0..n {
-        if at >= len(s) {
+        if i >= cols || (!long && at >= len(s)) {
             append(mut &out, Val.Null)       // a column added after the row was written
             continue
         }
         let tag = s[at]
         at += 1
+        if tag == 5 {
+            append(mut &longAt, i)
+            append(mut &longLen, binary.readU32LEStr(s, at))
+            at += 4
+            append(mut &out, Val.Null)
+            continue
+        }
         if some && !need[i] {
             if tag == 1 { at += 8 } else if tag == 2 { at += 1 } else if tag == 3 || tag == 4 { at += 4 + binary.readU32LEStr(s, at) }
             else if tag != 0 { return Err(lexdb_base.corrupt("a row's value tag")) }
@@ -1176,6 +1249,25 @@ fn decRowNeed(s: &str, n: int, need: &[]bool): Result[[]Val, DbErr] {
             }
         } else {
             return Err(lexdb_base.corrupt("a row's value tag"))
+        }
+    }
+    if long {
+        // the columns not read when the row has more than the table (none yet)
+        for i in n..cols {
+            let tag = s[at]
+            at += 1
+            if tag == 5 {
+                append(mut &longAt, i)
+                append(mut &longLen, binary.readU32LEStr(s, at))
+                at += 4
+            } else if tag == 1 { at += 8 } else if tag == 2 { at += 1 } else if tag == 3 || tag == 4 { at += 4 + binary.readU32LEStr(s, at) }
+        }
+        for k in 0..len(longAt) {
+            let l = longLen[k]
+            if at + l > len(s) { return Err(lexdb_base.corrupt("a row's long text")) }
+            let i = longAt[k]
+            if i < n && (!some || need[i]) { out[i] = Val.Text(s[at..at + l]) }
+            at += l
         }
     }
     return Ok(out)

@@ -1982,7 +1982,16 @@ This is done in three steps; the first is built:
    - names in subqueries not collected;
    - names in join conditions not collected;
    - names in ORDER BY not collected.
-2. Long texts stored after a row's other columns: to come.
+2. **Long texts are stored after a row's other columns.** A row with a
+   text of `LONG` (256) bytes or more begins with tag 6 and its column
+   count; each such text is tag 5 and its length in its place, its bytes
+   after the last column, in column order. The other columns stay at the
+   row's start. The count keeps a column added later reading as NULL
+   rather than as the long texts' bytes. Rows with no long text are
+   written as before. `exec_big` reads such rows column by column and
+   whole, and checks each long text's first and last bytes. Planted:
+   the long texts' offsets not advancing, caught by those bytes (lengths
+   alone did not catch it).
 3. A large row's start kept in its stub, so a scan whose columns are all
    there reads no chunks: to come.
 
