@@ -393,7 +393,7 @@ Built on 2026-11-09 on branch `lexdb`, about 6,300 lines in
 (cache, trees, transactions, log, checkpoints, recovery, snapshots),
 `lexdb_sql` (lexer, parser), `lexdb_exec` (catalog, rows, keys, planner,
 statements, sessions), `lexdb_wire` (protocol 3.0) and `lexdb` (the
-server). Tests: `python3 lexell/tests/lexdb.py` (40 programs in
+server). Tests: `python3 lexell/tests/lexdb.py` (41 programs in
 `tests/lexdb/run`, under `LXL_CHECK=1`).
 
     lexell/compiler/out/lxlc lexell/cmd/lexdb.lxl -o lexdb
@@ -419,8 +419,9 @@ server). Tests: `python3 lexell/tests/lexdb.py` (40 programs in
   from the checkpoint's log position could re-apply an older batch over a
   newer, unlogged one and leave a transaction half applied.
 - **Deleting does not merge nodes**: an empty node leaves its parent, an
-  underfull one stays. **A dropped table's pages are not reclaimed** unless
-  its nodes are in memory (the free list never sees the others).
+  underfull one stays. A dropped table's pages are freed by the
+  checkpoints after the drop, a few hundred internal pages read by each
+  (9.32).
 - **Statements outside a block are retried** up to 10 times on 40001 (the
   client has seen nothing of the failed try). In a read-write block each
   statement waits, after it runs, until what it read is durable, since its
@@ -560,7 +561,6 @@ is the comparison to make.
 7. COPY; then the cost questions (section 0), with EXPLAIN ANALYZE's
    counts as the evidence.
 8. Large rows (built: 9.29). Not done:
-   - reclaiming a dropped table's pages (its companion tree's too);
    - a large row whose columns before its long texts are more than its
      leaf holds (about 1.3 KB less the key) is read whole by any query; so
      is one whose large part is not a text (many medium texts, a large
@@ -1967,7 +1967,7 @@ table `d (id, title, body)`, beside a table `e (id, title)` without bodies:
 ### 9.31 Reading only the columns used
 
 A large row was read whole however little of it a query used (9.30).
-This is done in three steps; the first is built:
+This was done in three steps, all built:
 
 1. **A SELECT decodes only the columns it names** (`narrow`, after
    `buildQuery` in `planSelect`). For each table it reads, the columns
@@ -2038,3 +2038,82 @@ This is done in three steps; the first is built:
      until the frame was placed on a page boundary: frames are padded to
      pages, so 4 bytes matter only there.
 
+### 9.32 Freeing a dropped table's pages
+
+A drop freed only the nodes in memory. A node not in memory has no slots
+for its children, so the pages under it were never freed: dropping a
+table that was mostly on disk leaked nearly all of it.
+
+**The dropped subtrees.** When a slot not in memory is released, its page
+and the height of the subtree under it go on `Db.dropped`, instead of the
+page alone going to the free list. Its subtree is on disk as it was
+written: a node is evicted only clean, and only after its children.
+
+**The walk.** Each checkpoint, before it writes, takes the list and reads
+up to `DROP_READS` (256) of its pages (`walkDropped`). An internal page's
+children go on the list one level lower; a page of height 0 is a leaf and
+is freed without being read. Every page reached is freed as the
+checkpoint's other pages are: free once the checkpoint is durable. What
+is left of the list is written with the checkpoint, a list like the free
+list (`Meta.dropped`, `(page, height + 1)` pairs), and an open reads it
+back. A crash at any point leaves each page in one of: a tree, the dropped
+list, the free list.
+
+**Heights.** The walk first read every subtree whose height it did not
+know, leaves included. A drop's nodes in memory are mostly internal ones
+whose children are not loaded, so this read about as many leaves as the
+cache's internal nodes have children. Now a drop loads the first leaf of
+the tree and of its companion (`writeNeeds`: a few pages), the depth of
+that leaf gives the tree's height, and each node released gets its height
+from its depth. Heights also go through the slots kept for snapshots
+(`Deferred.height`). A height not known (-1) is learned by reading down
+the first children (`heightAt`).
+
+**Checked** by `store_drop`, with `audit`. Audit reads a closed data file's
+last checkpoint and counts each page's uses. Every page must be in exactly
+one of: a tree, a dropped subtree, the free list, a list page.
+- A table of 3,000 rows, three levels deep, with a companion tree: 775
+  pages. One checkpoint at two reads leaves 671 pages to free. A reopened
+  store goes on from there, and the 15 internal pages left take 8
+  checkpoints, so the leaves are not read (41 before the heights).
+- Afterwards every page but tree a's is free. Writing the rows again does
+  not grow the file.
+- 12 crashes at random points of a drop and its walk, with commits to
+  another tree going on. Some come with the walk partway done in the
+  durable checkpoint. Each recovers with nothing lost or freed twice and
+  every committed row there.
+
+Planted, each caught: an internal page's children not walked; leaves of
+known height read; the list not read at open; the rest of the list not
+kept; unloaded subtrees leaked (as before); children one level too low;
+the height stored off by one; the depth off by one at the drop; the drop
+loading nothing; the deferred release losing the height; freed pages not
+given back; freed pages listed again (a page twice).
+
+**Measured** on real files, a table of 400,000 rows of 250 bytes (26,800
+pages, 105 MB):
+
+| | the drop's commit | checkpoints walking | the next checkpoint |
+|---|---:|---:|---:|
+| reopened, nothing in memory | 1.5 ms | one, 26 ms (117 reads) | 7 ms |
+| everything in memory | 13 ms | none | 21 ms |
+
+Times vary between runs: another run of the second row gave 8.7 ms and
+8 ms.
+
+The walk's time is its reads: 117 took 27 ms, 0.7 ms of it decoding. The
+data file is opened with O_DIRECT, and each read waits for the device
+(here WSL2's virtual disk). The reads park the checkpoint's task on the
+helper pool: commits and queries go on, and only the checkpoint's end is
+later.
+
+Not done:
+- **The free list is written whole by every checkpoint.** After this drop
+  it is 26,800 pages, 53 list pages. A 10 GB table would add 2.5 million,
+  20 MB a checkpoint until they are used again. Extents, a bitmap, or
+  cutting the file's free tail would fix this; measure first.
+- **A large drop is freed over many checkpoints.** A 10 GB table has
+  about 10,000 internal pages: about 40 checkpoints, and checkpoints come
+  with the log's growth (`ckptBytes`). With few writes after the drop,
+  the space comes back slowly. The reads are one at a time; several at
+  once would shorten each checkpoint's share.

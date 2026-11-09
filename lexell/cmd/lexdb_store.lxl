@@ -72,7 +72,7 @@ type Hist = record { since: int; until: int; node: lexdb_page.Node }
 // A live snapshot: it sees the store as it was after commit seq.
 type Snap = value record { id: int; seq: int; cancelled: bool }
 
-type Deferred = value record { slot: int; seq: int }
+type Deferred = value record { slot: int; seq: int; height: int }
 
 // A tree's root changed by commit seq (prev: the root before, -1 none): a
 // snapshot at an earlier commit starts from prev.
@@ -106,6 +106,8 @@ pub type Db = record {
     free: []int                 // pages free now
     freeAfterNext: []int        // pages the next checkpoint frees
     pendingFree: []int          // pages the checkpoint in flight frees when durable
+    dropped: []int              // subtrees no tree reaches, their pages to free: (page, height or -1) pairs (9.32)
+    dropReads: int              // the most of their pages a checkpoint reads (DROP_READS; tests set fewer)
     listPages: []int            // the list pages of the last durable checkpoint
     ckpt: int
     durableCkpt: int
@@ -333,17 +335,30 @@ fn (db: &Db) maxSnap(): int {
 
 // Frees a slot the tree no longer reaches; while a snapshot may still reach
 // it (it sees a version the slot holds), the slot is kept until then.
-fn (db: mut &Db) freeSlot(s: int) {
+fn (db: mut &Db) freeSlot(s: int) { db.freeSubtree(s, -1) }
+
+// freeSlot for a slot whose subtree is h high (-1: not known), which
+// matters when it is not in memory (releaseSlot).
+fn (db: mut &Db) freeSubtree(s: int, h: int) {
     if (db.seq > db.durableSeq || db.maxSnap() >= 0) && !db.meta[s].pinned {
         db.meta[s].pinned = true
-        append(mut &db.deferred, Deferred{slot: s, seq: db.seq})
+        append(mut &db.deferred, Deferred{slot: s, seq: db.seq, height: h})
         return
     }
-    db.releaseSlot(s)
+    db.releaseSlot(s, h)
 }
 
-fn (db: mut &Db) releaseSlot(s: int) {
-    if db.meta[s].disk >= 0 { db.freePage(db.meta[s].disk) }
+fn (db: mut &Db) releaseSlot(s: int, h: int) {
+    if db.meta[s].disk >= 0 {
+        // A node not in memory: its page's subtree is on disk as it was
+        // written, and a checkpoint reads it to free its pages (9.32); its
+        // height says which of them are leaves, freed unread.
+        if db.meta[s].loaded { db.freePage(db.meta[s].disk) }
+        else {
+            append(mut &db.dropped, db.meta[s].disk)
+            append(mut &db.dropped, h)
+        }
+    }
     db.dropSlot(s)
 }
 
@@ -443,7 +458,7 @@ fn (db: mut &Db) prune() {
     for d in replace(mut &db.deferred, []) {
         var need = d.seq > db.durableSeq
         for q in live { if q < d.seq { need = true } }
-        if need { append(mut &still, d) } else { db.releaseSlot(d.slot) }
+        if need { append(mut &still, d) } else { db.releaseSlot(d.slot, d.height) }
     }
     db.deferred = still
 }
@@ -841,19 +856,32 @@ fn (db: mut &Db) applyCreate(tree: int) {
     if !isOvf(tree) && tree >= db.nextTree { db.nextTree = tree + 1 }
 }
 
-// Drops a tree. Its nodes in memory are freed; the pages of nodes that are
-// not are not reclaimed yet (design/lexdb.md, as built).
+// Drops a tree. Its nodes in memory are freed; those that are not go to the
+// dropped subtrees, which checkpoints free (9.32).
 fn (db: mut &Db) applyDrop(tree: int) {
     let r = match db.trees.get(&tree) { Some(x) { x } None { -1 } }
     if r < 0 { return }
     db.setRoot(tree, -1)
-    var stack = [r]
+    // Its height: writeNeeds loaded its first leaf's path (not known only
+    // where nothing loaded it).
+    var height = 0
+    var x = r
+    while db.meta[x].loaded && !db.pool[db.meta[x].frame].leaf {
+        x = db.pool[db.meta[x].frame].kids[0]
+        height += 1
+    }
+    if !db.meta[x].loaded { height = -1 }
+    var stack = [r, 0]
     while len(stack) > 0 {
+        let depth = pop(mut &stack)
         let s = pop(mut &stack)
         if db.meta[s].loaded && !db.pool[db.meta[s].frame].leaf {
-            for k in db.pool[db.meta[s].frame].kids { append(mut &stack, k) }
+            for k in db.pool[db.meta[s].frame].kids {
+                append(mut &stack, k)
+                append(mut &stack, depth + 1)
+            }
         }
-        db.freeSlot(s)
+        db.freeSubtree(s, if height >= 0 { height - depth } else { -1 })
     }
 }
 
@@ -873,8 +901,17 @@ fn (db: mut &Db) applyWrite(w: &TxWrite) {
 
 // The slot a write needs loaded before it can be applied, or -1: the leaf
 // of its key, and when it writes or removes a large value, the companion
-// tree's leaves its chunks are in or go to.
+// tree's leaves its chunks are in or go to; for a drop, a slot on the
+// way to the first leaf of the tree or its companion.
 fn (db: mut &Db) writeNeeds(w: &TxWrite): int {
+    // A drop: the paths give the trees' heights (applyDrop).
+    if w.op == OP_DROP {
+        for t in [w.tree, w.tree + OVF] {
+            let d = db.descend(t, &"")
+            if d.need >= 0 { return d.need }
+        }
+        return -1
+    }
     if w.op == OP_PUT || w.op == OP_DEL {
         let d = db.descend(w.tree, &w.key)
         if d.need >= 0 { return d.need }
@@ -1950,6 +1987,60 @@ fn (db: mut &Db) allocPage(): int {
     return p
 }
 
+// The most pages of dropped subtrees one checkpoint reads (9.32).
+const DROP_READS = 256
+
+// The height of the subtree on page p (0: a leaf), read down its first
+// children.
+fn heightAt(f: &lexdb_disk.File, p: int, b: mut &[]byte, reads: mut &int): Result[int, lexdb_base.DbErr] {
+    var h = 0
+    var at = p
+    while true {
+        try f.read(at * PAGE, mut &b[0..PAGE], PAGE)
+        try lexdb_page.check(b, at, lexdb_page.T_LEAF)
+        reads += 1
+        if int(b[12]) == lexdb_page.T_LEAF { return Ok(h) }
+        if h > 64 { return Err(lexdb_base.corrupt("page " + p.toStr() + ": its subtree is over 64 deep")) }
+        at = lexdb_page.decodeNode(b).kids[0]
+        h += 1
+    }
+    return Ok(h)
+}
+
+// Frees pages of the dropped subtrees in todo ((page, height) pairs, -1 a
+// height not known), reading up to most of them: a leaf of known
+// height is freed unread, an internal page read for its children. The
+// pages freed are added to gone; todo keeps what is left.
+fn walkDropped(f: &lexdb_disk.File, todo: mut &[]int, gone: mut &[]int, most: int): Result[Unit, lexdb_base.DbErr] {
+    var b = array(PAGE, byte(0))
+    var reads = 0
+    while len(todo) >= 2 && reads < most {
+        let h = pop(mut &todo)
+        let p = pop(mut &todo)
+        if h == 0 {
+            append(mut &gone, p)
+            continue
+        }
+        try f.read(p * PAGE, mut &b[0..PAGE], PAGE)
+        try lexdb_page.check(&b, p, lexdb_page.T_LEAF)
+        reads += 1
+        if int(b[12]) == lexdb_page.T_INTERNAL {
+            let node = lexdb_page.decodeNode(&b)
+            let kids = &node.kids
+            var kh = h - 1
+            if h < 0 { kh = try heightAt(f, kids[0], mut &b, mut &reads) }
+            for k in kids {
+                append(mut &todo, k)
+                append(mut &todo, kh)
+            }
+        } else if h > 0 {
+            return Err(lexdb_base.corrupt("page " + p.toStr() + ": a leaf where a dropped subtree has height " + h.toStr()))
+        }
+        append(mut &gone, p)
+    }
+    return Ok(Unit{})
+}
+
 // Writes out the dirty nodes under s (children first): s's page.
 fn (db: mut &Db) encodeSlot(s: int, n: int, out: mut &[]PageOut): int {
     if !db.meta[s].dirty { return db.meta[s].disk }
@@ -2000,6 +2091,8 @@ pub fn (st: &Store) checkpoint(): Result[Unit, lexdb_base.DbErr] {
     var newLists: []int = []
     var oldSegs: []int = []
     var fs = lexdb_disk.Fs.Real("")
+    var todo: []int = []
+    var most = 0
     st.sh.with(fn(db: mut &Db) {
         if len(db.failed) > 0 {
             append(mut &bad, db.failed[0])
@@ -2010,6 +2103,30 @@ pub fn (st: &Store) checkpoint(): Result[Unit, lexdb_base.DbErr] {
             return
         }
         db.ckptRunning = true
+        todo = replace(mut &db.dropped, [])
+        most = db.dropReads
+        f = db.data
+    })
+    if len(bad) > 0 { return Err(bad[0]) }
+    if busy { return Ok(Unit{}) }
+    // Some of the dropped subtrees' pages: freed by this checkpoint, which
+    // names the rest.
+    var gone: []int = []
+    match walkDropped(&f, mut &todo, mut &gone, most) {
+        Ok(_) {}
+        Err(e) {
+            st.fail(e)
+            return Err(e)
+        }
+    }
+    st.sh.with(fn(db: mut &Db) {
+        if len(db.failed) > 0 {
+            append(mut &bad, db.failed[0])
+            return
+        }
+        for x in db.dropped { append(mut &todo, x) }
+        db.dropped = replace(mut &todo, [])
+        for p in gone { db.freePage(p) }
         db.ckpt += 1
         n = db.ckpt
         f = db.data
@@ -2033,13 +2150,28 @@ pub fn (st: &Store) checkpoint(): Result[Unit, lexdb_base.DbErr] {
         // what is left, and what this checkpoint frees.
         var rootPages: []int = []
         for i in 0..lexdb_page.listPages(len(roots)) { append(mut &rootPages, db.allocPage()) }
+        var dropVals: []int = []
+        var i = 0
+        while i + 1 < len(db.dropped) {
+            append(mut &dropVals, db.dropped[i])
+            append(mut &dropVals, db.dropped[i + 1] + 1)
+            i += 2
+        }
+        var dropPages: []int = []
+        for j in 0..lexdb_page.listPages(len(dropVals)) { append(mut &dropPages, db.allocPage()) }
         var freePages: []int = []
-        for i in 0..lexdb_page.listPages(len(db.free) + len(freed)) { append(mut &freePages, db.allocPage()) }
+        for j in 0..lexdb_page.listPages(len(db.free) + len(freed)) { append(mut &freePages, db.allocPage()) }
         var freeVals: []int = []
         for p in db.free { append(mut &freeVals, p) }
         for p in freed { append(mut &freeVals, p) }
+        var dl = lexdb_page.encodeList(&dropVals, &dropPages)
+        i = len(dl) - 1
+        while i >= 0 {
+            append(mut &out, PageOut{no: dropPages[i], leaf: false, n: 0, body: "", raw: pop(mut &dl)})
+            i -= 1
+        }
         var rl = lexdb_page.encodeList(&roots, &rootPages)
-        var i = len(rl) - 1
+        i = len(rl) - 1
         while i >= 0 {
             append(mut &out, PageOut{no: rootPages[i], leaf: false, n: 0, body: "", raw: pop(mut &rl)})
             i -= 1
@@ -2051,6 +2183,7 @@ pub fn (st: &Store) checkpoint(): Result[Unit, lexdb_base.DbErr] {
             i -= 1
         }
         for p in rootPages { append(mut &newLists, p) }
+        for p in dropPages { append(mut &newLists, p) }
         for p in freePages { append(mut &newLists, p) }
         db.pendingFree = freed
         target = db.appliedBatch
@@ -2058,7 +2191,7 @@ pub fn (st: &Store) checkpoint(): Result[Unit, lexdb_base.DbErr] {
                                 roots: if len(rootPages) > 0 { rootPages[0] } else { 0 },
                                 free: if len(freePages) > 0 { freePages[0] } else { 0 },
                                 replaySeg: db.seg, replayOff: db.segOff, replayBatch: db.durableBatch + 1,
-                                nextTree: db.nextTree}
+                                nextTree: db.nextTree, dropped: if len(dropPages) > 0 { dropPages[0] } else { 0 }}
         metaPage = lexdb_page.encodeMeta(&m, n % 2)
         for s in 1..db.seg { append(mut &oldSegs, s) }
     })
@@ -2159,7 +2292,7 @@ pub fn checkpointer(st: Store): int {
 fn newDb(fs: lexdb_disk.Fs, data: lexdb_disk.File, opts: Options, m: &lexdb_page.Meta): Db {
     return Db{opts: opts, fs: fs, data: data, watched: -1, watchedWrites: 0, pool: [], owner: [], meta: [], freeSlots: [], loadedCount: 0, cacheUsed: 0, wlog: [], wlogFloor: 0, hand: 0,
               trees: newMap(), nextTree: m.nextTree, npages: m.npages, free: [], freeAfterNext: [],
-              pendingFree: [], listPages: [], ckpt: m.ckpt, durableCkpt: m.ckpt, ckptRunning: false,
+              pendingFree: [], dropped: [], dropReads: DROP_READS, listPages: [], ckpt: m.ckpt, durableCkpt: m.ckpt, ckptRunning: false,
               batch: [], batchCount: 0, batchNo: m.replayBatch, appliedBatch: m.replayBatch - 1,
               durableBatch: m.replayBatch - 1, waiters: [], writerWake: [], ckptWake: [], ckptDone: [], seg: m.replaySeg,
               segOff: m.replayOff, logSinceCkpt: 0, failed: [], closing: false, seq: 0, snaps: [], nextSnap: 0,
@@ -2190,12 +2323,19 @@ pub fn open(fs: lexdb_disk.Fs, opts: Options): Result[Store, lexdb_base.DbErr] {
         return Err(lexdb_base.corrupt("no valid meta page, and the log does not start at its beginning"))
     }
     let m = best.unwrapOr(lexdb_page.Meta{ckpt: 0, npages: 2, roots: 0, free: 0, replaySeg: 1, replayOff: 0,
-                                          replayBatch: 1, nextTree: 1})
+                                          replayBatch: 1, nextTree: 1, dropped: 0})
     var lists: []int = []
     let roots = try lexdb_page.readList(&data, m.roots, mut &lists)
     let free = try lexdb_page.readList(&data, m.free, mut &lists)
+    let dropped = try lexdb_page.readList(&data, m.dropped, mut &lists)
     var db = newDb(fs, data, opts, &m)
     db.free = free
+    var d = 0
+    while d + 1 < len(dropped) {
+        append(mut &db.dropped, dropped[d])
+        append(mut &db.dropped, dropped[d + 1] - 1)
+        d += 2
+    }
     db.listPages = lists
     var i = 0
     while i + 1 < len(roots) {
@@ -2209,6 +2349,70 @@ pub fn open(fs: lexdb_disk.Fs, opts: Options): Result[Store, lexdb_base.DbErr] {
     let st = Store{sh: task.shared(db)}
     try st.replay(&m)
     return Ok(st)
+}
+
+// Checks the data file's last checkpoint (a test's check, with the store
+// closed): every page below its high-water mark is in one tree, one dropped
+// subtree, the free list or a list page, and in no more than one of them.
+pub fn audit(fs: lexdb_disk.Fs): Result[str, lexdb_base.DbErr] {
+    let data = try fs.open(DATA, false)
+    var best: Option[lexdb_page.Meta] = None
+    var b = array(PAGE, byte(0))
+    for i in 0..2 {
+        try data.read(i * PAGE, mut &b[0..PAGE], PAGE)
+        match lexdb_page.decodeMeta(&b, i) {
+            Some(m) {
+                let better = match best { Some(o) { m.ckpt > o.ckpt } None { true } }
+                if better { best = Some(m) }
+            }
+            None {}
+        }
+    }
+    let m = match best {
+        Some(x) { x }
+        None { return Err(lexdb_base.corrupt("no valid meta page")) }
+    }
+    var lists: []int = []
+    let roots = try lexdb_page.readList(&data, m.roots, mut &lists)
+    let free = try lexdb_page.readList(&data, m.free, mut &lists)
+    let dropped = try lexdb_page.readList(&data, m.dropped, mut &lists)
+    var uses = array(m.npages, 0)
+    for p in lists { uses[p] += 1 }
+    for p in free { uses[p] += 1 }
+    var inTrees = 0
+    var inDropped = 0
+    var internal = 0
+    var stack: []int = []
+    for pass in 0..2 {
+        var i = 0
+        let tops = if pass == 0 { &roots } else { &dropped }
+        while i + 1 < len(tops) {
+            append(mut &stack, if pass == 0 { tops[i + 1] } else { tops[i] })
+            i += 2
+        }
+        while len(stack) > 0 {
+            let p = pop(mut &stack)
+            if p < 2 || p >= m.npages { return Err(lexdb_base.corrupt("page " + p.toStr() + " is past the file's pages")) }
+            uses[p] += 1
+            if pass == 0 { inTrees += 1 } else { inDropped += 1 }
+            try data.read(p * PAGE, mut &b[0..PAGE], PAGE)
+            try lexdb_page.check(&b, p, lexdb_page.T_LEAF)
+            if int(b[12]) == lexdb_page.T_INTERNAL {
+                internal += 1
+                for k in lexdb_page.decodeNode(&b).kids { append(mut &stack, k) }
+            }
+        }
+    }
+    var lost = 0
+    var twice = 0
+    for p in 2..m.npages {
+        if uses[p] == 0 { lost += 1 }
+        if uses[p] > 1 { twice += 1 }
+    }
+    data.close()
+    return Ok("pages " + (m.npages - 2).toStr() + ": trees " + (len(roots) / 2).toStr() + " " + inTrees.toStr() +
+              ", dropped " + inDropped.toStr() + ", free " + len(free).toStr() + ", lists " + len(lists).toStr() +
+              ", lost " + lost.toStr() + ", twice " + twice.toStr() + "; internal " + internal.toStr())
 }
 
 fn (st: &Store) applyRecovered(w: &TxWrite): Result[Unit, lexdb_base.DbErr] {
@@ -2329,17 +2533,21 @@ pub type Stats = value record {
     pub held: int
     pub pages: int
     pub free: int
+    pub dropped: int            // dropped subtrees whose pages are still to free
     pub wholes: int
 }
 
+// The most pages of dropped subtrees one checkpoint reads (tests).
+pub fn (st: &Store) setDropReads(n: int) { st.sh.with(fn(db: mut &Db) { db.dropReads = n }) }
+
 pub fn (st: &Store) stats(): Stats {
     var s = Stats{commits: 0, conflicts: 0, loads: 0, evictions: 0, flushes: 0, checkpoints: 0, loaded: 0,
-                  cacheUsed: 0, held: 0, pages: 0, free: 0, wholes: 0}
+                  cacheUsed: 0, held: 0, pages: 0, free: 0, dropped: 0, wholes: 0}
     st.sh.with(fn(db: mut &Db) {
         s = Stats{commits: db.commits, conflicts: db.conflicts, loads: db.loads, evictions: db.evictions,
                   flushes: db.flushes, checkpoints: db.checkpoints, loaded: db.loadedCount,
                   cacheUsed: db.cacheUsed, held: db.held, pages: db.npages,
-                  free: len(db.free), wholes: db.wholes}
+                  free: len(db.free), dropped: len(db.dropped) / 2, wholes: db.wholes}
     })
     return s
 }

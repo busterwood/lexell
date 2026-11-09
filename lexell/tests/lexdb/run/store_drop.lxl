@@ -1,0 +1,173 @@
+// lexdb_store: a dropped tree's pages are freed (design/lexdb.md 9.32).
+// Tree b holds 3,000 rows (100-byte keys, so its internal pages have few
+// children and it is three levels deep; every 40th value 20 KB, in the
+// companion tree). It is dropped with nearly all of it on disk; checkpoints
+// read its internal pages a few at a time, freeing them and the leaves
+// under them unread. After each step lexdb_store.audit checks the data
+// file's last checkpoint: every page in one tree, one dropped subtree, the
+// free list or a list page, and in no more than one.
+// - Built: nothing lost.
+// - Dropped, two pages read a checkpoint: what is still to free is in the
+//   checkpoint, and a reopened store goes on from it.
+// - Then none left: every page of b free. At two reads a checkpoint, the
+//   15 internal pages left take 8: the leaves (about 650) are not read.
+//   (Before the drop loaded the trees' first leaves, so that the nodes in
+//   memory had their heights, it read the leaves under them: 41.)
+// - b's rows written again: the file does not grow.
+// - Crashes at random points of a drop and its walk, with commits to tree
+//   a going on: each recovers with nothing lost or freed twice, and a's rows
+//   all there (some crashes come with the walk partway done).
+// expect: built: pages 785: trees 3 775, dropped 0, free 8, lists 2, lost 0, twice 0; internal 24
+// expect: one checkpoint: pages 785: trees 1 1, dropped 671, free 110, lists 3, lost 0, twice 0; internal 15
+// expect: reopened: still to free yes, checkpoints to free it 8
+// expect: walked: pages 785: trees 1 1, dropped 0, free 781, lists 3, lost 0, twice 0; internal 0
+// expect: refilled: file grew no
+// expect: crashes 12: ok 12, with the walk partway done some
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_base"
+import "strings"
+
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: 3 * 2048, segBytes: 16 * 4096, ckptBytes: 1024 * 1024, snapNodes: 1000}
+}
+
+fn key(i: int): str { return "k" + strings.padLeft(i.toStr(), 5, '0') + strings.repeat("x", 94) }
+
+fn value(i: int): str {
+    let tag = "v" + i.toStr() + ":"
+    if i % 40 == 0 { return tag + strings.repeat("abcdefghij", 2000) }
+    return tag + strings.repeat("r", 300)
+}
+
+fn fill(st: &lexdb_store.Store, tree: int) {
+    var i = 0
+    while i < 3000 {
+        var t = lexdb_store.begin()
+        for j in i..i + 100 { t.put(tree, key(j), value(j)).unwrap() }
+        st.commit(t).unwrap()
+        i += 100
+    }
+}
+
+fn count(st: &lexdb_store.Store, tree: int): int {
+    var t = lexdb_store.begin()
+    var n = 0
+    st.scan(mut &t, tree, "", "", fn(e: &lexdb_store.Entry): bool {
+        n += 1
+        return true
+    }).unwrap()
+    return n
+}
+
+// Ends a's rows past 3000 by n more.
+fn grow(st: &lexdb_store.Store, a: int, from: int, n: int) {
+    var t = lexdb_store.begin()
+    for j in from..from + n { t.put(a, "a" + strings.padLeft(j.toStr(), 6, '0'), "small") }
+    st.commit(t).unwrap()
+}
+
+fn audit(fs: lexdb_disk.Fs): str {
+    return match lexdb_store.audit(fs) { Ok(s) { s } Err(e) { "audit: " + e.toStr() } }
+}
+
+fn main() {
+    let fs = lexdb_disk.sim(7)
+    var b = -1
+    var a = -1
+    lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int {
+        var t = lexdb_store.begin()
+        a = st.createTree(mut &t)
+        b = st.createTree(mut &t)
+        st.commit(t).unwrap()
+        grow(&st, a, 0, 20)
+        fill(&st, b)
+        return 0
+    }).unwrap()
+    println("built: " + audit(fs))
+    let base = fs.crash(0)     // a copy: everything is flushed
+
+    // b dropped; one checkpoint reads two of its pages
+    lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int {
+        st.setDropReads(2)
+        var t = lexdb_store.begin()
+        t.dropTree(b)
+        st.commit(t).unwrap()
+        return 0
+    }).unwrap()
+    println("one checkpoint: " + audit(fs))
+    var npages = 0
+    lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int {
+        st.setDropReads(2)
+        let left = st.stats().dropped
+        let c0 = st.stats().checkpoints
+        var rounds = 0
+        while st.stats().dropped > 0 && rounds < 1000 {
+            st.checkpoint().unwrap()
+            rounds += 1
+        }
+        npages = st.stats().pages
+        println("reopened: still to free " + (if left > 0 { "yes" } else { "no" }) + ", checkpoints to free it " + (st.stats().checkpoints - c0).toStr())
+        return 0
+    }).unwrap()
+    println("walked: " + audit(fs))
+    lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int {
+        var t = lexdb_store.begin()
+        let c = st.createTree(mut &t)
+        st.commit(t).unwrap()
+        fill(&st, c)
+        return 0
+    }).unwrap()
+    var after = 0
+    lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int {
+        after = st.stats().pages
+        return 0
+    }).unwrap()
+    println("refilled: file grew " + (if after > npages { "yes, " + npages.toStr() + " to " + after.toStr() } else { "no" }))
+
+    // crashes during a drop and its walk
+    var ok = 0
+    var partway = 0
+    let runs = 12
+    for seed in 1..runs + 1 {
+        let c = base.crash(seed)
+        var rng = lexdb_base.rng(seed)
+        let at = rng.below(12)
+        var crashed = c
+        var added = 0
+        lexdb_store.run(c, opts(), fn(st: lexdb_store.Store): int {
+            st.setDropReads(1 + rng.below(4))
+            var t = lexdb_store.begin()
+            t.dropTree(b)
+            st.commit(t).unwrap()
+            for k in 0..12 {
+                if k == at {
+                    crashed = c.crash(seed)
+                    return 0
+                }
+                grow(&st, a, 20 + added, 5)
+                added += 5
+                if rng.below(2) == 0 { st.checkpoint().unwrap() }
+            }
+            crashed = c.crash(seed)
+            return 0
+        }).unwrap()
+        if !strings.contains(&audit(crashed), &"dropped 0,") { partway += 1 }
+        var rows = 0
+        var gone = false
+        lexdb_store.run(crashed, opts(), fn(st: lexdb_store.Store): int {
+            rows = count(&st, a)
+            var rounds = 0
+            while st.stats().dropped > 0 && rounds < 1000 {
+                st.checkpoint().unwrap()
+                rounds += 1
+            }
+            gone = st.stats().dropped == 0
+            return 0
+        }).unwrap()
+        let au = audit(crashed)
+        if rows == 20 + added && gone && strings.contains(&au, &"trees 1 ") && strings.contains(&au, &"lost 0, twice 0") { ok += 1 }
+        else { println("seed " + seed.toStr() + ": rows " + rows.toStr() + " of up to " + (20 + added).toStr() + ", " + au) }
+    }
+    println("crashes " + runs.toStr() + ": ok " + ok.toStr() + ", with the walk partway done " + (if partway > 0 { "some" } else { "none" }))
+}
