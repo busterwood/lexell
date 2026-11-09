@@ -817,6 +817,8 @@ pub fn eval(x: &Expr, env: &Env): Result[Val, DbErr] {
                 }
             }
             if isAgg(&name) { return Err(e("42803", "aggregate functions are not allowed here")) }
+            if name == "#win" || name == "#wmark" { return Err(e("42P20", "window functions are not allowed here")) }
+            if isWinFn(&name) { return Err(e("42809", "window function " + name + " requires an OVER clause")) }
             if name == "case" || name == "case else" {
                 // only the branch taken is evaluated
                 let pairs = if name == "case else" { (len(args) - 1) / 2 } else { len(args) / 2 }
@@ -3507,6 +3509,7 @@ fn hashSub(sp: mut &SubPlan, base: int) {
     sp.sel.sort = false
     sp.sel.distinct = false
     sp.sel.desc = []
+    sp.sel.nullsFirst = []
     sp.hashed = true
     sp.keyOuter = replace(mut &hk.outer, [])
     sp.keyText = texts
@@ -5441,6 +5444,7 @@ fn exprName(x: &Expr): str {
             if isSubCall(&n) && len(args) >= 3 {
                 match args[2] { Expr.Lit(v) { return text(&v) } else {} }
             }
+            if n == "#win" && len(args) == 2 { return exprName(&args[1]) }
             return aggBase(&n)
         }
         Expr.Cast(a, t) {
@@ -5485,6 +5489,21 @@ pub fn exprOid(x: &Expr, cols: &[]lexdb_sql.ColDef, ptypes: &[]int): int {
         Expr.IsNull(_, _) { return lexdb_sql.OID_BOOL }
         Expr.Cast(_, t) { return t.oid }
         Expr.Call(n, args, _) {
+            if n == "#win" && len(args) == 2 {
+                // a window call: its function's type (9.46)
+                match args[1] {
+                    Expr.Call(f, fa, _) {
+                        let b = aggBase(&f)
+                        if b == "row_number" || b == "rank" || b == "dense_rank" || b == "ntile" { return lexdb_sql.OID_INT8 }
+                        if b == "percent_rank" || b == "cume_dist" { return lexdb_sql.OID_NUMERIC }
+                        if b == "lag" || b == "lead" || b == "first_value" || b == "last_value" || b == "nth_value" {
+                            return if len(fa) > 0 { exprOid(&fa[0], cols, ptypes) } else { lexdb_sql.OID_TEXT }
+                        }
+                    }
+                    else {}
+                }
+                return exprOid(&args[1], cols, ptypes)
+            }
             if isSubCall(&n) {
                 if n != "#sub" { return lexdb_sql.OID_BOOL }
                 let oid = if len(args) >= 2 { litInt(&args[1]) } else { -1 }
@@ -5733,6 +5752,7 @@ fn collectAggs(x: &Expr, specs: mut &[]AggSpec): Result[Expr, DbErr] {
                 for o in order { if hasAgg(&o) { return Err(e("42803", "aggregate function calls cannot be nested")) } }
             }
             for a in aargs { if hasAgg(&a) { return Err(e("42803", "aggregate function calls cannot be nested")) } }
+            for a in aargs { if hasWin(&a) { return Err(e("42803", "aggregate function calls cannot contain window function calls")) } }
             match filter {
                 Some(f) { if hasAgg(&f) { return Err(e("42803", "aggregate functions are not allowed in FILTER")) } }
                 None {}
@@ -6029,6 +6049,7 @@ type Sel = record {
     specs: []AggSpec        // the aggregate calls; exprs, having and order use their slots
     distinct: bool
     desc: []bool            // per ORDER BY item
+    nullsFirst: []bool      // ... NULLs first
     parts: []Sel            // UNION, INTERSECT, EXCEPT: its two queries (q has no tables, refs theirs)
     setop: int
     setAll: bool
@@ -6036,6 +6057,8 @@ type Sel = record {
     rec: int                // a recursive CTE: its number; -1
     srf: str                // a function in FROM: its name; exprs are its arguments, outs its columns (9.27)
     ordin: bool             // ... WITH ORDINALITY
+    wins: []WinPlan         // its window calls (9.46): exprs and order read their values from slots nAggs + i
+    nAggs: int
 }
 
 // The column of level 0 an expression is, else -1.
@@ -6056,6 +6079,7 @@ fn orderCols(q: &Query, order: &[]Expr, items: &[]lexdb_sql.OrderItem, exprs: &[
     if len(order) == 0 || len(q.levels) == 0 { return -1 }
     for i in 0..len(order) {
         if items[i].desc != items[0].desc { return -1 }
+        if items[i].nullsFirst != items[i].desc { return -1 }    // NULLs where an index does not keep them
         var c = q.firstCol(&order[i])
         match order[i] {
             Expr.Lit(v) {
@@ -6146,6 +6170,8 @@ fn stmtNames(s: &lexdb_sql.Stmt, names: mut &Map[str, int], star: mut &bool) {
     for f in s.from { match f.on { Some(x) { colNames(&x, mut &xs) } None {} } }
     for r in s.rows { for x in r { colNames(&x, mut &xs) } }
     for si in s.sets { colNames(&si.expr, mut &xs) }
+    for w in s.wins { winNames(&w, mut &xs) }
+    for nw in s.windows { winNames(&nw.def, mut &xs) }
     for x in xs { names.put(colPart(&x), 1) }
     for b in s.subs { stmtNames(&b, names, star) }
     for b in s.inner { stmtNames(&b, names, star) }
@@ -6190,10 +6216,41 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         Some(h) { having = Some(try resolve(&h, &q.cols, len(q.cols), sc)) }
         None {}
     }
+    // window calls (9.46): not where rows are chosen or grouped; their
+    // definitions merged with the named windows and resolved
+    var wdefs: []lexdb_sql.WinDef = []
+    if len(s.wins) > 0 {
+        if hasWinOpt(&s.where) { return Err(e("42P20", "window functions are not allowed in WHERE")) }
+        if hasWinOpt(&s.having) { return Err(e("42P20", "window functions are not allowed in HAVING")) }
+        for g in groupBy { if hasWin(&g) { return Err(e("42P20", "window functions are not allowed in GROUP BY")) } }
+        for f in s.from { if hasWinOpt(&f.on) { return Err(e("42P20", "window functions are not allowed in JOIN conditions")) } }
+        for w in s.wins {
+            let d = try mergeWin(&w, &s.windows, 0)
+            var r = lexdb_sql.WinDef{call: try resolve(&d.call, &q.cols, len(q.cols), sc), ref: "", bare: false, part: [], order: [],
+                                     frame: cloneFrame(&d.frame)}
+            for x in d.part { append(mut &r.part, try resolve(&x, &q.cols, len(q.cols), sc)) }
+            for o in d.order {
+                append(mut &r.order, lexdb_sql.WinOrder{expr: try resolve(&o.expr, &q.cols, len(q.cols), sc), desc: o.desc, nullsFirst: o.nullsFirst})
+            }
+            var inDef = false
+            for x in r.part { if hasWin(&x) { inDef = true } }
+            for o in r.order { if hasWin(&o.expr) { inDef = true } }
+            if inDef { return Err(e("42P20", "window functions are not allowed in window definitions")) }
+            if hasWin(&r.call) { return Err(e("42P20", "window function calls cannot be nested")) }
+            append(mut &wdefs, r)
+        }
+        var mx: []Expr = []
+        for x in exprs { append(mut &mx, winMarks(&x)) }
+        exprs = mx
+        var mo: []Expr = []
+        for x in order { append(mut &mo, winMarks(&x)) }
+        order = mo
+    }
     endScope(sc, mut &q)
     var aggQ = len(groupBy) > 0 || having.isSome()
     for x in exprs { if hasAgg(&x) { aggQ = true } }
     for x in order { if hasAgg(&x) { aggQ = true } }
+    for d in wdefs { if winHasAgg(&d) { aggQ = true } }
     if s.distinct {
         // SELECT DISTINCT: ORDER BY may use only what it outputs
         for o in order {
@@ -6286,6 +6343,23 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             None {}
         }
         having = rh
+        // a window's arguments, partitions and order: over the groups, their aggregates in slots
+        for k in 0..len(wdefs) {
+            var call = clone(&wdefs[k].call)
+            match wdefs[k].call {
+                Expr.Call(f, args, star) {
+                    var ca: []Expr = []
+                    for a in args { append(mut &ca, try collectAggs(&a, mut &specs)) }
+                    call = Expr.Call(f, ca, star)
+                }
+                else {}
+            }
+            wdefs[k].call = call
+            var wp: []Expr = []
+            for x in wdefs[k].part { append(mut &wp, try collectAggs(&x, mut &specs)) }
+            wdefs[k].part = wp
+            for j in 0..len(wdefs[k].order) { wdefs[k].order[j].expr = try collectAggs(&wdefs[k].order[j].expr, mut &specs) }
+        }
         var gtexts: []str = []
         for g in groupBy { append(mut &gtexts, lexdb_sql.exprText(&g)) }
         var okLevels: []bool = []
@@ -6310,12 +6384,36 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             Some(h) { try checkGrouped(&h, &gtexts, &okLevels, &q) }
             None {}
         }
+        for d in wdefs {
+            match d.call {
+                Expr.Call(_, args, _) { for a in args { try checkGrouped(&a, &gtexts, &okLevels, &q) } }
+                else {}
+            }
+            for x in d.part { try checkGrouped(&x, &gtexts, &okLevels, &q) }
+            for o in d.order { try checkGrouped(&o.expr, &gtexts, &okLevels, &q) }
+        }
+    }
+    // the window values' slots follow the aggregates'
+    let nAggs = len(specs)
+    var wins: []WinPlan = []
+    if len(wdefs) > 0 {
+        var wx: []Expr = []
+        for x in exprs { append(mut &wx, winSlots(&x, nAggs)) }
+        exprs = wx
+        var wo: []Expr = []
+        for x in order { append(mut &wo, winSlots(&x, nAggs)) }
+        order = wo
+        for d in wdefs { append(mut &wins, try winPlan(&d)) }
     }
     var desc: []bool = []
-    for o in s.order { append(mut &desc, o.desc) }
+    var nullsFirst: []bool = []
+    for o in s.order {
+        append(mut &desc, o.desc)
+        append(mut &nullsFirst, o.nullsFirst)
+    }
     return Ok(Sel{q: q, exprs: exprs, outs: outs, groupBy: groupBy, order: order, aggQ: aggQ, sort: sort,
-                  first: first, limit: limit, offset: offset, having: having, specs: specs, distinct: s.distinct, desc: desc,
-                  parts: [], setop: 0, setAll: false, split: 0, rec: -1, srf: s.srf, ordin: s.ordin})
+                  first: first, limit: limit, offset: offset, having: having, specs: specs, distinct: s.distinct, desc: desc, nullsFirst: nullsFirst,
+                  parts: [], setop: 0, setAll: false, split: 0, rec: -1, srf: s.srf, ordin: s.ordin, wins: wins, nAggs: nAggs})
 }
 
 // UNION, INTERSECT, EXCEPT: its two queries, planned on their own; the
@@ -6324,6 +6422,7 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
 // with the first's columns.
 fn planSet(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val,
            sc: mut &Scope): Result[Sel, DbErr] {
+    if len(s.wins) > 0 { return Err(e("0A000", "lexdb: window functions in the ORDER BY of a UNION, INTERSECT or EXCEPT are not supported")) }
     let l = try planSelect(st, txn, &s.inner[0], params, sc)
     if s.rec {
         var cols: []lexdb_sql.ColDef = []
@@ -6349,7 +6448,11 @@ fn planSet(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
         append(mut &order, clone(&o.expr))
     }
     var desc: []bool = []
-    for o in s.order { append(mut &desc, o.desc) }
+    var nullsFirst: []bool = []
+    for o in s.order {
+        append(mut &desc, o.desc)
+        append(mut &nullsFirst, o.nullsFirst)
+    }
     var refs = cloneAll(&l.q.refs)
     for x in r.q.refs { append(mut &refs, clone(&x)) }
     let split = len(l.q.refs)
@@ -6357,8 +6460,9 @@ fn planSet(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
     let offset = try evalInt(&s.offset, params, "OFFSET")
     let q = Query{levels: [], cols: [], top: [], subs: [], base: sc.base, corr: false, refs: refs}
     return Ok(Sel{q: q, exprs: [], outs: outs, groupBy: [], order: order, aggQ: false, sort: len(order) > 0, first: -1,
-                  limit: limit, offset: offset, having: None, specs: [], distinct: false, desc: desc, parts: [l, r],
-                  setop: s.setop, setAll: s.setAll, split: split, rec: if s.rec { s.cte } else { -1 }, srf: "", ordin: false})
+                  limit: limit, offset: offset, having: None, specs: [], distinct: false, desc: desc, nullsFirst: nullsFirst, parts: [l, r],
+                  setop: s.setop, setAll: s.setAll, split: split, rec: if s.rec { s.cte } else { -1 }, srf: "", ordin: false,
+                  wins: [], nAggs: 0})
 }
 
 // A row's key for UNION and the like (NULLs alike; 2 = 2.0).
@@ -6550,6 +6654,10 @@ fn execSel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
         for x in sel.exprs { if hasCorr(&x) { late = true } }
         if sorting { for x in sel.order { if hasCorr(&x) { late = true } } }
     }
+    // with window calls the rows are kept first, then their values made (9.46)
+    let windowed = len(sel.wins) > 0
+    if windowed && !sel.aggQ { late = true }
+    var bases: []WinRow = []
     var outRows: []OutRow = []
     // the rows kept here, counted in the row callbacks (they cannot reach rs)
     let room = rs.room()
@@ -6570,7 +6678,7 @@ fn execSel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
         }
     }
     let rs0max = rs.maxHeld
-    let early = !sel.aggQ && !sorting && limit >= 0 && !(late && sel.distinct)
+    let early = !sel.aggQ && !sorting && limit >= 0 && !(late && sel.distinct) && !windowed
     let stopAt = if offset > 0 { limit + offset } else { limit }
     let noAggs: []Val = []
     var seen: Map[str, int] = newMap()      // SELECT DISTINCT
@@ -6625,6 +6733,10 @@ fn execSel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
                 Some(h) { if truth(&(try evalX(st, txn, q, &h, &env, rs))) != Some(true) { continue } }
                 None {}
             }
+            if windowed {
+                append(mut &bases, WinRow{row: copyRow(&firsts[gi]), aggs: copyRow(&vals)})
+                continue
+            }
             var out: []Val = []
             for x in sel.exprs { append(mut &out, try evalX(st, txn, q, &x, &env, rs)) }
             if sel.distinct {
@@ -6645,7 +6757,11 @@ fn execSel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
             append(mut &raws, copyRow(r))
             return Ok(!early || len(raws) < stopAt)
         }, rs)
+        if windowed {
+            for i in 0..len(raws) { append(mut &bases, WinRow{row: replace(mut &raws[i], []), aggs: []}) }
+        }
         for r in raws {
+            if windowed { break }
             let env = Env{cols: &q.cols, row: &r, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: sqe}
             var vals: []Val = []
             for x in sel.exprs { append(mut &vals, try evalX(st, txn, q, &x, &env, rs)) }
@@ -6677,10 +6793,35 @@ fn execSel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
             return Ok(!early || len(outRows) < stopAt)
         }, rs)
     }
+    if windowed {
+        var wv = try winValues(st, txn, sel, &bases, &m, params, rs)
+        for bi in 0..len(bases) {
+            // the slots: the row's aggregates, then its window values
+            var aggs = if len(bases[bi].aggs) == 0 { replace(mut &wv[bi], []) } else { copyRow(&bases[bi].aggs) }
+            if len(bases[bi].aggs) > 0 { for v in wv[bi] { append(mut &aggs, v) } }
+            let env = Env{cols: &q.cols, row: &bases[bi].row, aggs: &aggs, params: params, subs: &m.subs, cur: &noAggs, seq: sqe}
+            var vals: []Val = []
+            for x in sel.exprs { append(mut &vals, try evalX(st, txn, q, &x, &env, rs)) }
+            if sel.distinct {
+                let k = valsKey(&vals)
+                if seen.get(&k).isSome() { continue }
+                seen.put(k, 1)
+            }
+            var ord: []Val = []
+            if sorting { for o in sel.order { append(mut &ord, try orderX(st, txn, q, &o, &sel.outs, &vals, &env, rs)) } }
+            held += rowBytes(&vals) + rowBytes(&ord)
+            append(mut &outRows, OutRow{vals: vals, ord: ord})
+        }
+    }
     try rs.hold(held)
     if sorting {
         collections.sortBy(mut &outRows, fn(a: &OutRow, b: &OutRow): int {
             for i in 0..len(sel.desc) {
+                let na = isNull(&a.ord[i])
+                let nb = isNull(&b.ord[i])
+                if na && nb { continue }
+                if na { return if sel.nullsFirst[i] { -1 } else { 1 } }
+                if nb { return if sel.nullsFirst[i] { 1 } else { -1 } }
                 var c = sortCmp(&a.ord[i], &b.ord[i])
                 if sel.desc[i] { c = -c }
                 if c != 0 { return c }
@@ -7103,6 +7244,10 @@ fn hasSubs(s: &lexdb_sql.Stmt): bool {
 
 fn execStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int,
             lim: Limits, pc: mut &PlanCache, input: &CopyInput): Result[Res, DbErr] {
+    if len(s.wins) > 0 && s.kind != lexdb_sql.S_SELECT {
+        let what = if len(s.items) > 0 && s.kind != lexdb_sql.S_SELECT { "RETURNING" } else { stmtName(s.kind) }
+        return Err(e("42P20", "window functions are not allowed in " + what))
+    }
     match s.kind {
         lexdb_sql.S_CREATE { return createTable(st, txn, s) }
         lexdb_sql.S_DROP { return dropTable(st, txn, s) }
@@ -8995,4 +9140,623 @@ fn copyField(v: &Val, o: &lexdb_sql.CopyOpts, single: bool, force: bool, b: mut 
         b.addByte(c)
     }
     b.addByte(q)
+}
+
+// ---- window functions (9.46)
+//
+// f(args) OVER (PARTITION BY ... ORDER BY ... frame): after the rows are
+// found, grouped and HAVING has chosen, before DISTINCT, ORDER BY and
+// LIMIT. The rows (a grouped query's groups, with their aggregates) are
+// kept (WinRow); per window call, they are sorted by partition and order,
+// and each gets the call's value, which the select list and ORDER BY read
+// from a slot after the aggregates' (#agg nAggs + i).
+
+const WIN_FNS: []str = ["row_number", "rank", "dense_rank", "percent_rank", "cume_dist", "ntile", "lag", "lead",
+                        "first_value", "last_value", "nth_value"]
+
+fn isWinFn(name: &str): bool {
+    for w in WIN_FNS { if w == name { return true } }
+    return false
+}
+
+// A row a window call ranges over: the query's row (a group's first), and
+// its aggregates' values.
+type WinRow = record { row: []Val; aggs: []Val }
+
+type WinPlan = record {
+    fname: str              // row_number ... nth_value, or an aggregate's
+    agg: bool               // an aggregate over the frame, with spec
+    spec: AggSpec
+    args: []Expr            // a ranking or value function's arguments
+    part: []Expr
+    order: []Expr
+    desc: []bool
+    nullsFirst: []bool
+    mode: int               // FR_ROWS, FR_RANGE, FR_GROUPS
+    start: int              // B_*
+    startOff: Option[Expr]
+    end: int
+    endOff: Option[Expr]
+    exclude: int            // EX_*
+}
+
+fn hasWin(x: &Expr): bool {
+    match x {
+        Expr.Call(name, args, _) {
+            if name == "#win" || name == "#wmark" { return true }
+            for a in args { if hasWin(&a) { return true } }
+            return false
+        }
+        Expr.Unary(_, a) { return hasWin(&a) }
+        Expr.Bin(_, a, b) { return hasWin(&a) || hasWin(&b) }
+        Expr.IsNull(a, _) { return hasWin(&a) }
+        Expr.Cast(a, _) { return hasWin(&a) }
+        else { return false }
+    }
+}
+
+fn hasWinOpt(x: &Option[Expr]): bool {
+    match x {
+        Some(v) { return hasWin(&v) }
+        None { return false }
+    }
+}
+
+// Whether a window's arguments, partitions or order use aggregates (the
+// query is then grouped; a window aggregate itself does not make it so).
+fn winHasAgg(d: &lexdb_sql.WinDef): bool {
+    match d.call {
+        Expr.Call(_, args, _) { for a in args { if hasAgg(&a) { return true } } }
+        else {}
+    }
+    for x in d.part { if hasAgg(&x) { return true } }
+    for o in d.order { if hasAgg(&o.expr) { return true } }
+    return false
+}
+
+fn winNames(d: &lexdb_sql.WinDef, out: mut &[]str) {
+    colNames(&d.call, out)
+    for x in d.part { colNames(&x, out) }
+    for o in d.order { colNames(&o.expr, out) }
+}
+
+// x with its window calls (#win i, the call inside) marked (#wmark i), so
+// that a window aggregate is not taken for the query's.
+fn winMarks(x: &Expr): Expr {
+    match x {
+        Expr.Call(name, args, star) {
+            if name == "#win" { return Expr.Call("#wmark", [clone(&args[0])], false) }
+            var out: []Expr = []
+            for a in args { append(mut &out, winMarks(&a)) }
+            return Expr.Call(name, out, star)
+        }
+        Expr.Unary(op, a) { return Expr.Unary(op, winMarks(&a)) }
+        Expr.Bin(op, a, b) { return Expr.Bin(op, winMarks(&a), winMarks(&b)) }
+        Expr.IsNull(a, neg) { return Expr.IsNull(winMarks(&a), neg) }
+        Expr.Cast(a, t) { return Expr.Cast(winMarks(&a), t) }
+        else { return clone(x) }
+    }
+}
+
+// x with each mark read from its slot, after the aggregates' (base).
+fn winSlots(x: &Expr, base: int): Expr {
+    match x {
+        Expr.Call(name, args, star) {
+            if name == "#wmark" { return slotRef(base + litInt(&args[0])) }
+            var out: []Expr = []
+            for a in args { append(mut &out, winSlots(&a, base)) }
+            return Expr.Call(name, out, star)
+        }
+        Expr.Unary(op, a) { return Expr.Unary(op, winSlots(&a, base)) }
+        Expr.Bin(op, a, b) { return Expr.Bin(op, winSlots(&a, base), winSlots(&b, base)) }
+        Expr.IsNull(a, neg) { return Expr.IsNull(winSlots(&a, base), neg) }
+        Expr.Cast(a, t) { return Expr.Cast(winSlots(&a, base), t) }
+        else { return clone(x) }
+    }
+}
+
+fn optClone(x: &Option[Expr]): Option[Expr] {
+    match x {
+        Some(v) { return Some(clone(&v)) }
+        None { return None }
+    }
+}
+
+fn cloneFrame(f: &lexdb_sql.Frame): lexdb_sql.Frame {
+    return lexdb_sql.Frame{mode: f.mode, start: f.start, startOff: optClone(&f.startOff), end: f.end, endOff: optClone(&f.endOff),
+                           exclude: f.exclude}
+}
+
+fn cloneWin(d: &lexdb_sql.WinDef): lexdb_sql.WinDef {
+    var order: []lexdb_sql.WinOrder = []
+    for o in d.order { append(mut &order, lexdb_sql.WinOrder{expr: clone(&o.expr), desc: o.desc, nullsFirst: o.nullsFirst}) }
+    return lexdb_sql.WinDef{call: clone(&d.call), ref: d.ref, bare: d.bare, part: cloneAll(&d.part), order: order,
+                            frame: cloneFrame(&d.frame)}
+}
+
+// A window call's definition with the named window it names merged in,
+// by PostgreSQL's rules: OVER w is w as it is; OVER (w ...) takes w's
+// partitions and order, and may add an order (if w has none) and a frame
+// (w may not have one).
+fn mergeWin(d: &lexdb_sql.WinDef, named: &[]lexdb_sql.NamedWin, depth: int): Result[lexdb_sql.WinDef, DbErr] {
+    if d.ref == "" { return Ok(cloneWin(d)) }
+    var k = -1
+    for i in 0..len(named) { if named[i].name == d.ref { k = i } }
+    if k < 0 || depth > len(named) { return Err(e("42704", "window \"" + d.ref + "\" does not exist")) }
+    var b = try mergeWin(&named[k].def, named, depth + 1)
+    b.call = clone(&d.call)
+    b.ref = ""
+    b.bare = false
+    if d.bare { return Ok(b) }
+    if len(d.part) > 0 { return Err(e("42P20", "cannot override PARTITION BY clause of window \"" + d.ref + "\"")) }
+    if len(b.order) > 0 && len(d.order) > 0 { return Err(e("42P20", "cannot override ORDER BY clause of window \"" + d.ref + "\"")) }
+    if b.frame.mode != lexdb_sql.FR_NONE { return Err(e("42P20", "cannot copy window \"" + d.ref + "\" because it has a frame clause")) }
+    if len(d.order) > 0 {
+        var order: []lexdb_sql.WinOrder = []
+        for o in d.order { append(mut &order, lexdb_sql.WinOrder{expr: clone(&o.expr), desc: o.desc, nullsFirst: o.nullsFirst}) }
+        b.order = order
+    }
+    b.frame = cloneFrame(&d.frame)
+    return Ok(b)
+}
+
+fn noSpec(): AggSpec {
+    return AggSpec{fname: "", args: [], star: false, distinct: false, filter: None, order: [], dirs: "", text: ""}
+}
+
+fn modeName(m: int): str {
+    return if m == lexdb_sql.FR_ROWS { "ROWS" } else if m == lexdb_sql.FR_GROUPS { "GROUPS" } else { "RANGE" }
+}
+
+// A window call planned: its function checked, its frame made whole (the
+// default: RANGE UNBOUNDED PRECEDING to CURRENT ROW, which without ORDER BY
+// is the whole partition: every row a peer).
+fn winPlan(d: &lexdb_sql.WinDef): Result[WinPlan, DbErr] {
+    var name = ""
+    var args: []Expr = []
+    var star = false
+    match d.call {
+        Expr.Call(n, a, st) {
+            name = n
+            args = cloneAll(&a)
+            star = st
+        }
+        else {}
+    }
+    let base = aggBase(&name)
+    var w = WinPlan{fname: base, agg: false, spec: noSpec(), args: [], part: cloneAll(&d.part), order: [], desc: [], nullsFirst: [],
+                    mode: d.frame.mode, start: d.frame.start, startOff: optClone(&d.frame.startOff), end: d.frame.end,
+                    endOff: optClone(&d.frame.endOff), exclude: d.frame.exclude}
+    for o in d.order {
+        append(mut &w.order, clone(&o.expr))
+        append(mut &w.desc, o.desc)
+        append(mut &w.nullsFirst, o.nullsFirst)
+    }
+    if w.mode == lexdb_sql.FR_NONE {
+        w.mode = lexdb_sql.FR_RANGE
+        w.start = lexdb_sql.B_UNBOUNDED_PRECEDING
+        w.end = lexdb_sql.B_CURRENT
+    }
+    if strings.contains(name, " distinct") { return Err(e("0A000", "DISTINCT is not implemented for window functions")) }
+    if isAgg(&name) {
+        if strings.contains(name, " order:") { return Err(e("0A000", "aggregate ORDER BY is not implemented for window functions")) }
+        var specs: []AggSpec = []
+        let r = try collectAggs(&d.call, mut &specs)
+        w.agg = true
+        w.spec = pop(mut &specs)
+    } else if isWinFn(&base) {
+        if strings.contains(name, " filter") { return Err(e("0A000", "FILTER is not implemented for non-aggregate window functions")) }
+        let n = len(args)
+        let none = base == "row_number" || base == "rank" || base == "dense_rank" || base == "percent_rank" || base == "cume_dist"
+        let ok = (none && n == 0) || (base == "ntile" && n == 1) || ((base == "lag" || base == "lead") && n >= 1 && n <= 3) ||
+                 ((base == "first_value" || base == "last_value") && n == 1) || (base == "nth_value" && n == 2)
+        if !ok || star { return Err(e("42883", "function " + base + " with " + n.toStr() + " argument" + (if n == 1 { "" } else { "s" }) + " does not exist")) }
+        w.args = args
+    } else {
+        return Err(e("42809", "OVER specified, but " + base + " is not a window function nor an aggregate function"))
+    }
+    let offs = w.start == lexdb_sql.B_PRECEDING || w.start == lexdb_sql.B_FOLLOWING || w.end == lexdb_sql.B_PRECEDING ||
+               w.end == lexdb_sql.B_FOLLOWING
+    if w.mode == lexdb_sql.FR_RANGE && offs && len(w.order) != 1 {
+        return Err(e("42P20", "RANGE with offset PRECEDING/FOLLOWING requires exactly one ORDER BY column"))
+    }
+    if w.mode == lexdb_sql.FR_GROUPS && len(w.order) == 0 { return Err(e("42P20", "GROUPS mode requires an ORDER BY clause")) }
+    var ns: []str = []
+    match w.startOff { Some(x) { colNames(&x, mut &ns) } None {} }
+    match w.endOff { Some(x) { colNames(&x, mut &ns) } None {} }
+    if len(ns) > 0 { return Err(e("42P10", "argument of " + modeName(w.mode) + " must not contain variables")) }
+    return Ok(w)
+}
+
+// Two rows' ORDER BY values in a window's order (0: peers).
+fn winCmp(a: &[]Val, b: &[]Val, w: &WinPlan): int {
+    for k in 0..len(a) {
+        let na = isNull(&a[k])
+        let nb = isNull(&b[k])
+        if na && nb { continue }
+        if na { return if w.nullsFirst[k] { -1 } else { 1 } }
+        if nb { return if w.nullsFirst[k] { 1 } else { -1 } }
+        var c = sortCmp(&a[k], &b[k])
+        if w.desc[k] { c = -c }
+        if c != 0 { return c }
+    }
+    return 0
+}
+
+// A frame's offset: evaluated once, not NULL, not negative (ROWS and
+// GROUPS: a whole number).
+fn frameOff(x: &Option[Expr], w: &WinPlan, start: bool, params: &[]Val): Result[Val, DbErr] {
+    let which = if start { "starting" } else { "ending" }
+    match x {
+        Some(v) {
+            let noCols: []lexdb_sql.ColDef = []
+            let none: []Val = []
+            let noSubs: []SubRes = []
+            let env = Env{cols: &noCols, row: &none, aggs: &none, params: params, subs: &noSubs, cur: &none, seq: None}
+            let r = try eval(&v, &env)
+            if isNull(&r) { return Err(e("22004", "frame " + which + " offset must not be null")) }
+            if w.mode != lexdb_sql.FR_RANGE {
+                let t = lexdb_sql.TypeName{kind: lexdb_sql.K_INT, oid: lexdb_sql.OID_INT8, prec: 0, scale: 0, len: 0}
+                let n = try coerce(r, &t)
+                match n {
+                    Val.Int(i) { if i < 0 { return Err(e("22013", "frame " + which + " offset must not be negative")) } }
+                    else {}
+                }
+                return Ok(n)
+            }
+            if try compare(&r, &Val.Int(0)) < 0 { return Err(e("22013", "invalid preceding or following size in window function")) }
+            return Ok(r)
+        }
+        None { return Ok(Val.Int(0)) }
+    }
+}
+
+// A fraction without its trailing zeros (0.5, not 0.5000000000000000): as
+// PostgreSQL's float8 shows percent_rank and cume_dist.
+fn shortest(v: Val): Val {
+    match v {
+        Val.Num(d) {
+            match Decimal.parse(d.canonical()) {
+                Ok(x) { return Val.Num(x) }
+                Err(_) {}
+            }
+        }
+        else {}
+    }
+    return v
+}
+
+fn offInt(v: &Val): int {
+    match v {
+        Val.Int(i) { return i }
+        else { return 0 }
+    }
+}
+
+// The values of a query's window calls for each of its rows.
+fn winValues(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, rows: &[]WinRow, m: &Mats, params: &[]Val,
+             rs: mut &Run): Result[[][]Val, DbErr] {
+    let sqe = seqEnv(st, txn)
+    let q = &sel.q
+    let n = len(rows)
+    var out: [][]Val = []
+    for b in 0..n { append(mut &out, array(len(sel.wins), Val.Null)) }
+    let noAggs: []Val = []
+    // windows of one partitioning and order share their sort (as PostgreSQL's)
+    var specs: []str = []
+    for w in sel.wins { append(mut &specs, winSpecText(&w)) }
+    var done: []bool = array(len(sel.wins), false)
+    for wi in 0..len(sel.wins) {
+        if done[wi] { continue }
+        let w = &sel.wins[wi]
+        // each row's partition and order
+        var keys: []str = []
+        var ords: [][]Val = []
+        for b in 0..n {
+            let env = Env{cols: &q.cols, row: &rows[b].row, aggs: &rows[b].aggs, params: params, subs: &m.subs, cur: &noAggs, seq: sqe}
+            if len(w.part) == 0 {
+                append(mut &keys, "")
+            } else {
+                var kb = newStrBuf()
+                for x in w.part { encIdxPart(mut &kb, &(try evalX(st, txn, q, &x, &env, rs))) }
+                append(mut &keys, kb.toStr())
+            }
+            var ov: []Val = []
+            for x in w.order { append(mut &ov, try evalX(st, txn, q, &x, &env, rs)) }
+            append(mut &ords, ov)
+        }
+        var idx: []int = []
+        for b in 0..n { append(mut &idx, b) }
+        // rows often come in the window's order already (ORDER BY the key the scan follows)
+        var sorted = true
+        for b in 1..n {
+            if keys[b - 1] != keys[b] || winCmp(&ords[b - 1], &ords[b], w) > 0 {
+                sorted = false
+                break
+            }
+        }
+        if !sorted { collections.sortBy(mut &idx, fn(a: &int, b: &int): int {
+            if keys[a] != keys[b] { return if keys[a] < keys[b] { -1 } else { 1 } }
+            let c = winCmp(&ords[a], &ords[b], w)
+            if c != 0 { return c }
+            return a - b                        // peers keep the rows' order
+        }) }
+        for wj in wi..len(sel.wins) {
+            if done[wj] || specs[wj] != specs[wi] { continue }
+            done[wj] = true
+            let wv = &sel.wins[wj]
+            let so = try frameOff(&wv.startOff, wv, true, params)
+            let eo = try frameOff(&wv.endOff, wv, false, params)
+            var lo = 0
+            while lo < n {
+                var hi = lo + 1
+                while hi < n && keys[idx[hi]] == keys[idx[lo]] { hi += 1 }
+                try winPartition(st, txn, sel, wj, rows, &idx, lo, hi, &ords, &so, &eo, m, params, rs, mut &out)
+                lo = hi
+            }
+        }
+    }
+    return Ok(out)
+}
+
+// A window's partitioning and order as text: windows with the same share
+// a sort.
+fn winSpecText(w: &WinPlan): str {
+    var b = newStrBuf()
+    for x in w.part {
+        b.add(lexdb_sql.exprText(&x))
+        b.add(";")
+    }
+    b.add("|")
+    for k in 0..len(w.order) {
+        b.add(lexdb_sql.exprText(&w.order[k]))
+        b.add(if w.desc[k] { " d" } else { " a" })
+        b.add(if w.nullsFirst[k] { "f;" } else { "l;" })
+    }
+    return b.toStr()
+}
+
+// The frame's first and last positions in the partition (k the current
+// row's; may be empty: first > last).
+fn frameBounds(w: &WinPlan, k: int, n: int, grp: &[]int, gStart: &[]int, gEnd: &[]int, keyAt: &[]Val, so: &Val, eo: &Val,
+               first: mut &int, last: mut &int): Result[Unit, DbErr] {
+    let g = grp[k]
+    let ng = len(gStart)
+    var a = 0
+    var b = n - 1
+    if w.mode == lexdb_sql.FR_ROWS {
+        if w.start == lexdb_sql.B_PRECEDING { a = k - offInt(so) }
+        else if w.start == lexdb_sql.B_CURRENT { a = k }
+        else if w.start == lexdb_sql.B_FOLLOWING { a = k + offInt(so) }
+        if w.end == lexdb_sql.B_PRECEDING { b = k - offInt(eo) }
+        else if w.end == lexdb_sql.B_CURRENT { b = k }
+        else if w.end == lexdb_sql.B_FOLLOWING { b = k + offInt(eo) }
+    } else if w.mode == lexdb_sql.FR_GROUPS {
+        if w.start == lexdb_sql.B_PRECEDING { a = if g - offInt(so) < 0 { 0 } else { gStart[g - offInt(so)] } }
+        else if w.start == lexdb_sql.B_CURRENT { a = gStart[g] }
+        else if w.start == lexdb_sql.B_FOLLOWING { a = if g + offInt(so) >= ng { n } else { gStart[g + offInt(so)] } }
+        if w.end == lexdb_sql.B_PRECEDING { b = if g - offInt(eo) < 0 { -1 } else { gEnd[g - offInt(eo)] - 1 } }
+        else if w.end == lexdb_sql.B_CURRENT { b = gEnd[g] - 1 }
+        else if w.end == lexdb_sql.B_FOLLOWING { b = if g + offInt(eo) >= ng { n - 1 } else { gEnd[g + offInt(eo)] - 1 } }
+    } else {
+        // RANGE: by the one ORDER BY value; a NULL one's frame is its peers
+        if w.start == lexdb_sql.B_CURRENT { a = gStart[g] }
+        if w.end == lexdb_sql.B_CURRENT { b = gEnd[g] - 1 }
+        let sOff = w.start == lexdb_sql.B_PRECEDING || w.start == lexdb_sql.B_FOLLOWING
+        let eOff = w.end == lexdb_sql.B_PRECEDING || w.end == lexdb_sql.B_FOLLOWING
+        if sOff || eOff {
+            let v = &keyAt[k]
+            if isNull(v) {
+                if sOff { a = gStart[g] }
+                if eOff { b = gEnd[g] - 1 }
+            } else {
+                if sOff {
+                    let t = try rangeTarget(v, so, w.start == lexdb_sql.B_PRECEDING, w.desc[0])
+                    a = try firstNot(keyAt, &t, w, false)
+                }
+                if eOff {
+                    let t = try rangeTarget(v, eo, w.end == lexdb_sql.B_PRECEDING, w.desc[0])
+                    b = (try firstNot(keyAt, &t, w, true)) - 1
+                }
+            }
+        }
+    }
+    first = if a < 0 { 0 } else { a }
+    last = if b > n - 1 { n - 1 } else { b }
+    return Ok(Unit{})
+}
+
+// v - off or v + off: the value a RANGE bound stands at (preceding rows
+// have smaller values going up, larger going down).
+fn rangeTarget(v: &Val, off: &Val, preceding: bool, desc: bool): Result[Val, DbErr] {
+    return arith(&(if preceding != desc { "-" } else { "+" }), v, off)
+}
+
+// The first position whose value is not before t (after: not after t is
+// the test, so this is one past the last at or before it), in the
+// window's order: the values sorted, NULLs at one end.
+fn firstNot(keyAt: &[]Val, t: &Val, w: &WinPlan, after: bool): Result[int, DbErr] {
+    var lo = 0
+    var hi = len(keyAt)
+    while lo < hi {
+        let mid = (lo + hi) / 2
+        var c = 0
+        if isNull(&keyAt[mid]) { c = if w.nullsFirst[0] { -1 } else { 1 } } else {
+            c = try compare(&keyAt[mid], t)
+            if w.desc[0] { c = -c }
+        }
+        // before: c < 0; at or before: c <= 0
+        let moveOn = if after { c <= 0 } else { c < 0 }
+        if moveOn { lo = mid + 1 } else { hi = mid }
+    }
+    return Ok(lo)
+}
+
+// Whether frame position p is left out of row k's frame (EXCLUDE).
+fn excluded(w: &WinPlan, p: int, k: int, grp: &[]int): bool {
+    if w.exclude == lexdb_sql.EX_CURRENT { return p == k }
+    if w.exclude == lexdb_sql.EX_GROUP { return grp[p] == grp[k] }
+    if w.exclude == lexdb_sql.EX_TIES { return grp[p] == grp[k] && p != k }
+    return false
+}
+
+// One partition's values of window call wi: its rows rows[idx[lo..hi]],
+// in its order.
+fn winPartition(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, wi: int, rows: &[]WinRow, idx: &[]int, lo: int,
+                hi: int, ords: &[][]Val, so: &Val, eo: &Val, m: &Mats, params: &[]Val, rs: mut &Run,
+                out: mut &[][]Val): Result[Unit, DbErr] {
+    let sqe = seqEnv(st, txn)
+    let q = &sel.q
+    let w = &sel.wins[wi]
+    let n = hi - lo
+    let noAggs: []Val = []
+    // peer groups: rows equal in the window's ORDER BY
+    var grp: []int = []
+    var gStart: []int = []
+    var gEnd: []int = []
+    for k in 0..n {
+        if k == 0 || winCmp(&ords[idx[lo + k - 1]], &ords[idx[lo + k]], w) != 0 {
+            if k > 0 { append(mut &gEnd, k) }
+            append(mut &gStart, k)
+        }
+        append(mut &grp, len(gStart) - 1)
+    }
+    append(mut &gEnd, n)
+    var keyAt: []Val = []
+    if w.mode == lexdb_sql.FR_RANGE && len(w.order) == 1 { for k in 0..n { append(mut &keyAt, ords[idx[lo + k]][0]) } }
+    let f = w.fname
+    if f == "row_number" || f == "rank" || f == "dense_rank" || f == "percent_rank" || f == "cume_dist" {
+        for k in 0..n {
+            let g = grp[k]
+            var v = Val.Int(k + 1)
+            if f == "rank" { v = Val.Int(gStart[g] + 1) }
+            if f == "dense_rank" { v = Val.Int(g + 1) }
+            if f == "percent_rank" {
+                v = if n <= 1 { Val.Num(Decimal.fromInt(0)) } else {
+                    try arith(&"/", &Val.Num(Decimal.fromInt(gStart[g])), &Val.Num(Decimal.fromInt(n - 1)))
+                }
+            }
+            if f == "cume_dist" { v = try arith(&"/", &Val.Num(Decimal.fromInt(gEnd[g])), &Val.Num(Decimal.fromInt(n))) }
+            if f == "percent_rank" || f == "cume_dist" { v = shortest(v) }
+            out[idx[lo + k]][wi] = v
+        }
+        return Ok(Unit{})
+    }
+    if f == "ntile" || f == "lag" || f == "lead" {
+        for k in 0..n {
+            let r = idx[lo + k]
+            let env = Env{cols: &q.cols, row: &rows[r].row, aggs: &rows[r].aggs, params: params, subs: &m.subs, cur: &noAggs, seq: sqe}
+            if f == "ntile" {
+                let bv = try evalX(st, txn, q, &w.args[0], &env, rs)
+                if isNull(&bv) { continue }
+                let t = lexdb_sql.TypeName{kind: lexdb_sql.K_INT, oid: lexdb_sql.OID_INT8, prec: 0, scale: 0, len: 0}
+                let nb = offInt(&(try coerce(bv, &t)))
+                if nb <= 0 { return Err(e("22014", "argument of ntile must be greater than zero")) }
+                // n rows in nb buckets: the first n % nb one row bigger
+                let size = n / nb
+                let extra = n % nb
+                var bucket = k + 1
+                if size > 0 {
+                    bucket = if k < (size + 1) * extra { k / (size + 1) + 1 } else { extra + (k - (size + 1) * extra) / size + 1 }
+                }
+                out[r][wi] = Val.Int(bucket)
+                continue
+            }
+            var off = 1
+            if len(w.args) > 1 {
+                let ov = try evalX(st, txn, q, &w.args[1], &env, rs)
+                if isNull(&ov) { continue }
+                let t = lexdb_sql.TypeName{kind: lexdb_sql.K_INT, oid: lexdb_sql.OID_INT8, prec: 0, scale: 0, len: 0}
+                off = offInt(&(try coerce(ov, &t)))
+            }
+            let at = if f == "lag" { k - off } else { k + off }
+            if at >= 0 && at < n {
+                let tr = idx[lo + at]
+                let env2 = Env{cols: &q.cols, row: &rows[tr].row, aggs: &rows[tr].aggs, params: params, subs: &m.subs, cur: &noAggs, seq: sqe}
+                out[r][wi] = try evalX(st, txn, q, &w.args[0], &env2, rs)
+            } else if len(w.args) > 2 {
+                out[r][wi] = try evalX(st, txn, q, &w.args[2], &env, rs)
+            }
+        }
+        return Ok(Unit{})
+    }
+    // over the frame: an aggregate, first_value, last_value, nth_value
+    if w.agg && w.start == lexdb_sql.B_UNBOUNDED_PRECEDING && w.exclude == lexdb_sql.EX_NONE {
+        // the frame only grows: one accumulator, its value made again only when it does
+        var acc = newAccs(1)
+        var added = -1
+        var lastEnd = -2
+        var val = Val.Null
+        for k in 0..n {
+            var a = 0
+            var b = 0
+            try frameBounds(w, k, n, &grp, &gStart, &gEnd, &keyAt, so, eo, mut &a, mut &b)
+            while added < b {
+                added += 1
+                let tr = idx[lo + added]
+                let env = Env{cols: &q.cols, row: &rows[tr].row, aggs: &rows[tr].aggs, params: params, subs: &m.subs, cur: &noAggs, seq: sqe}
+                try accumulate(&w.spec, mut &acc[0], &env)
+            }
+            if b != lastEnd {
+                val = try finish(&w.spec, &acc[0])
+                lastEnd = b
+            }
+            out[idx[lo + k]][wi] = val
+        }
+        return Ok(Unit{})
+    }
+    for k in 0..n {
+        let r = idx[lo + k]
+        var a = 0
+        var b = 0
+        try frameBounds(w, k, n, &grp, &gStart, &gEnd, &keyAt, so, eo, mut &a, mut &b)
+        if w.agg {
+            var acc = newAccs(1)
+            for p in a..b + 1 {
+                if excluded(w, p, k, &grp) { continue }
+                let tr = idx[lo + p]
+                let env = Env{cols: &q.cols, row: &rows[tr].row, aggs: &rows[tr].aggs, params: params, subs: &m.subs, cur: &noAggs, seq: sqe}
+                try accumulate(&w.spec, mut &acc[0], &env)
+            }
+            out[r][wi] = try finish(&w.spec, &acc[0])
+            continue
+        }
+        var nth = 1
+        if f == "nth_value" {
+            let env = Env{cols: &q.cols, row: &rows[r].row, aggs: &rows[r].aggs, params: params, subs: &m.subs, cur: &noAggs, seq: sqe}
+            let nv = try evalX(st, txn, q, &w.args[1], &env, rs)
+            if isNull(&nv) { continue }
+            let t = lexdb_sql.TypeName{kind: lexdb_sql.K_INT, oid: lexdb_sql.OID_INT8, prec: 0, scale: 0, len: 0}
+            nth = offInt(&(try coerce(nv, &t)))
+            if nth <= 0 { return Err(e("22016", "argument of nth_value must be greater than zero")) }
+        }
+        // the frame's rows, those excluded left out
+        var at = -1
+        var seen = 0
+        if f == "last_value" {
+            var p = b
+            while p >= a {
+                if !excluded(w, p, k, &grp) {
+                    at = p
+                    break
+                }
+                p -= 1
+            }
+        } else {
+            for p in a..b + 1 {
+                if excluded(w, p, k, &grp) { continue }
+                seen += 1
+                if seen == nth {
+                    at = p
+                    break
+                }
+            }
+        }
+        if at >= 0 {
+            let tr = idx[lo + at]
+            let env = Env{cols: &q.cols, row: &rows[tr].row, aggs: &rows[tr].aggs, params: params, subs: &m.subs, cur: &noAggs, seq: sqe}
+            out[r][wi] = try evalX(st, txn, q, &w.args[0], &env, rs)
+        }
+    }
+    return Ok(Unit{})
 }

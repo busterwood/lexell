@@ -183,7 +183,9 @@ pub type FromItem = record {
     pub lateral: bool           // LATERAL: a subquery that sees the FROM items before it
 }
 
-pub type OrderItem = record { pub expr: Expr; pub desc: bool }
+// ORDER BY's item: NULLs first or last (by default last going up, first
+// going down, as PostgreSQL).
+pub type OrderItem = record { pub expr: Expr; pub desc: bool; pub nullsFirst: bool }
 
 pub type SetItem = record { pub col: str; pub expr: Expr }
 
@@ -334,6 +336,54 @@ pub type Stmt = record {
     pub idOpts: []IdOpts        // CREATE TABLE, ADD COLUMN: identity columns' sequence options
     pub overriding: int         // INSERT: OVR_*
     pub copy: CopyOpts          // COPY's
+    pub wins: []WinDef          // its window calls: an expression names one by number (#win, 9.46)
+    pub windows: []NamedWin     // WINDOW name AS (...), ...
+}
+
+// A window call: f(args) OVER (...). In its query's expressions it is
+// Call("#win", [Lit(i), the call]), i its number in Stmt.wins (the call
+// kept there for the column's name and type).
+pub type WinDef = record {
+    pub call: Expr              // Call(name, args, star), the name carrying " filter" and the like
+    pub ref: str                // OVER w, OVER (w ...): the named window it starts from; "" none
+    pub bare: bool              // OVER w (not in parentheses): the named window as it is, frame and all
+    pub part: []Expr            // PARTITION BY
+    pub order: []WinOrder       // ORDER BY
+    pub frame: Frame
+}
+
+pub type WinOrder = record { pub expr: Expr; pub desc: bool; pub nullsFirst: bool }
+
+pub type NamedWin = record { pub name: str; pub def: WinDef }
+
+// A window's frame: FR_NONE (the default), or ROWS, RANGE or GROUPS
+// BETWEEN start AND end (B_*), offsets for B_PRECEDING and B_FOLLOWING,
+// and EXCLUDE (EX_*).
+pub type Frame = record {
+    pub mode: int
+    pub start: int
+    pub startOff: Option[Expr]
+    pub end: int
+    pub endOff: Option[Expr]
+    pub exclude: int
+}
+
+pub const FR_NONE = 0
+pub const FR_ROWS = 1
+pub const FR_RANGE = 2
+pub const FR_GROUPS = 3
+pub const B_UNBOUNDED_PRECEDING = 1
+pub const B_PRECEDING = 2
+pub const B_CURRENT = 3
+pub const B_FOLLOWING = 4
+pub const B_UNBOUNDED_FOLLOWING = 5
+pub const EX_NONE = 0
+pub const EX_CURRENT = 1
+pub const EX_GROUP = 2
+pub const EX_TIES = 3
+
+pub fn noFrame(): Frame {
+    return Frame{mode: FR_NONE, start: B_UNBOUNDED_PRECEDING, startOff: None, end: B_CURRENT, endOff: None, exclude: EX_NONE}
 }
 
 pub const SET_UNION = 1
@@ -351,7 +401,7 @@ fn newStmt(kind: int): Stmt {
                 group: [], order: [], limit: None, offset: None, sets: [], params: 0, from: [], index: "",
                 unique: false, inner: [], distinct: false, having: None, subs: [], use: 0, setop: 0, setAll: false,
                 cte: -1, rec: false, cascade: false, src: "", srf: "", ordin: false, alters: [], cons: [], seqNames: [], seq: noSeqOpts(), idOpts: [], overriding: OVR_NONE,
-                copy: noCopyOpts()}
+                copy: noCopyOpts(), wins: [], windows: []}
 }
 
 // ---- the lexer
@@ -549,6 +599,7 @@ type P = record {
     inCte: []InCte      // the recursive CTEs whose bodies are being parsed
     depth: int          // subqueries deep
     seqs: []str         // the sequences named by nextval, currval and setval so far
+    wins: []WinDef      // the window calls of the query being parsed (9.46)
 }
 
 // A CTE: kept as its text (where its tokens start), parsed again as a
@@ -597,7 +648,7 @@ const RESERVED: []str = ["select", "from", "where", "group", "order", "by", "lim
                   "null", "as", "values", "set", "into", "insert", "update", "delete", "create", "table",
                   "primary", "key", "asc", "desc", "true", "false", "cast", "on", "join", "inner", "left",
                   "right", "full", "outer", "cross", "using", "natural", "having", "distinct", "in", "like", "ilike", "between",
-                  "case", "when", "then", "else", "end", "union", "intersect", "except", "with", "returning"]
+                  "case", "when", "then", "else", "end", "union", "intersect", "except", "with", "returning", "window"]
 
 fn isReserved(w: &str): bool {
     for r in RESERVED { if r == w { return true } }
@@ -884,12 +935,14 @@ fn (p: mut &P) subquery(use: int): Result[int, lexdb_base.DbErr] {
     p.depth += 1
     let start = p.pos
     let saved = replace(mut &p.subs, [])
+    let savedW = replace(mut &p.wins, [])
     var pushed = 0
     if p.acceptKw("with") { pushed = try p.withList() }
     try p.expectKw("select")
     var sq = try p.select()
     p.popCtes(pushed)
     sq.subs = replace(mut &p.subs, saved)
+    sq.wins = replace(mut &p.wins, savedW)
     sq.use = use
     p.depth -= 1
     // a scalar subquery written again in the same query is the same one:
@@ -1101,6 +1154,15 @@ fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
                     Some(n) { append(mut &p.seqs, n) }
                     None {}
                 }
+            }
+            if p.acceptKw("over") {
+                // a window call (9.46): kept in the query, named here by number
+                var d = try p.over()
+                var copied: []Expr = []
+                for a in args { append(mut &copied, cloneE(&a)) }
+                d.call = Expr.Call(fname, copied, star)
+                append(mut &p.wins, d)
+                return Ok(Expr.Call("#win", [Expr.Lit(Val.Int(len(p.wins) - 1)), Expr.Call(fname, args, star)], false))
             }
             return Ok(Expr.Call(fname, args, star))
         }
@@ -1640,6 +1702,7 @@ fn (p: mut &P) insert(): Result[Stmt, lexdb_base.DbErr] {
         var q = try p.select()
         if paren { try p.expectKw(")") }
         q.subs = replace(mut &p.subs, [])
+        q.wins = replace(mut &p.wins, [])
         q.params = p.params
         append(mut &s.inner, q)
         try p.returning(mut &s)
@@ -1676,6 +1739,7 @@ fn (p: mut &P) select(): Result[Stmt, lexdb_base.DbErr] {
         return Ok(first)
     }
     first.subs = replace(mut &p.subs, [])
+    first.wins = replace(mut &p.wins, [])
     var lhs = try p.intersects(first)
     while p.isKw("union") || p.isKw("except") {
         var op = SET_EXCEPT
@@ -1726,6 +1790,7 @@ fn (p: mut &P) setBranch(): Result[Stmt, lexdb_base.DbErr] {
         b = try p.selectCore()
     }
     b.subs = replace(mut &p.subs, [])
+    b.wins = replace(mut &p.wins, [])
     return Ok(b)
 }
 
@@ -1816,6 +1881,18 @@ fn (p: mut &P) selectCore(): Result[Stmt, lexdb_base.DbErr] {
         while p.acceptKw(",") { append(mut &s.group, try p.expr()) }
     }
     if p.acceptKw("having") { s.having = Some(try p.expr()) }
+    if p.acceptKw("window") {
+        // WINDOW name AS (spec), ...
+        while true {
+            let n = try p.name()
+            try p.expectKw("as")
+            try p.expectKw("(")
+            let d = try p.winSpec()
+            for w in s.windows { if w.name == n { return Err(lexdb_base.err("42P20", "window \"" + n + "\" is already defined")) } }
+            append(mut &s.windows, NamedWin{name: n, def: d})
+            if !p.acceptKw(",") { break }
+        }
+    }
     return Ok(s)
 }
 
@@ -1826,7 +1903,14 @@ fn (p: mut &P) orderLimit(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
             let e = try p.expr()
             var desc = false
             if p.acceptKw("desc") { desc = true } else { let a = p.acceptKw("asc") }
-            append(mut &s.order, OrderItem{expr: e, desc: desc})
+            var nf = desc
+            if p.acceptKw("nulls") {
+                if p.acceptKw("first") { nf = true } else {
+                    try p.expectKw("last")
+                    nf = false
+                }
+            }
+            append(mut &s.order, OrderItem{expr: e, desc: desc, nullsFirst: nf})
             if !p.acceptKw(",") { break }
         }
     }
@@ -1896,6 +1980,7 @@ fn (p: mut &P) fromFunction(join: int): Result[FromItem, lexdb_base.DbErr] {
     try p.expectKw("(")
     p.depth += 1
     let saved = replace(mut &p.subs, [])
+    let savedW = replace(mut &p.wins, [])
     var s = newStmt(S_SELECT)
     s.srf = name
     s.use = SUB_FROM
@@ -1907,6 +1992,7 @@ fn (p: mut &P) fromFunction(join: int): Result[FromItem, lexdb_base.DbErr] {
     }
     try p.expectKw(")")
     s.subs = replace(mut &p.subs, saved)
+    s.wins = replace(mut &p.wins, savedW)
     p.depth -= 1
     if p.acceptKw("with") {
         try p.expectKw("ordinality")
@@ -2016,6 +2102,7 @@ fn (p: mut &P) copyStmt(): Result[Stmt, lexdb_base.DbErr] {
         } else { return Err(lexdb_base.err("0A000", "lexdb: COPY's query must be a SELECT")) }
         try p.expectKw(")")
         q.subs = replace(mut &p.subs, [])
+        q.wins = replace(mut &p.wins, [])
         q.params = p.params
         append(mut &s.inner, q)
     } else {
@@ -2168,6 +2255,111 @@ fn (p: mut &P) bareNames(): Result[[]str, lexdb_base.DbErr] {
     return Ok(ns)
 }
 
+// ---- windows (9.46)
+
+// After OVER: a window's name, or (spec).
+fn (p: mut &P) over(): Result[WinDef, lexdb_base.DbErr] {
+    if p.acceptKw("(") { return p.winSpec() }
+    let n = try p.name()
+    return Ok(WinDef{call: Expr.Lit(Val.Null), ref: n, bare: true, part: [], order: [], frame: noFrame()})
+}
+
+// A window's spec, after its "(": [name] [PARTITION BY ...] [ORDER BY ...]
+// [frame], and its ")".
+fn (p: mut &P) winSpec(): Result[WinDef, lexdb_base.DbErr] {
+    var d = WinDef{call: Expr.Lit(Val.Null), ref: "", bare: false, part: [], order: [], frame: noFrame()}
+    let t = p.peek()
+    if (t.kind == T_IDENT || t.kind == T_QIDENT) && !(t.kind == T_IDENT &&
+        (t.text == "partition" || t.text == "order" || t.text == "rows" || t.text == "range" || t.text == "groups")) {
+        d.ref = try p.name()
+    }
+    if p.acceptKw("partition") {
+        try p.expectKw("by")
+        append(mut &d.part, try p.expr())
+        while p.acceptKw(",") { append(mut &d.part, try p.expr()) }
+    }
+    if p.acceptKw("order") {
+        try p.expectKw("by")
+        while true {
+            let x = try p.expr()
+            var desc = false
+            if p.acceptKw("desc") { desc = true } else { let a = p.acceptKw("asc") }
+            var nf = desc                   // NULLs come first going down, last going up
+            if p.acceptKw("nulls") {
+                if p.acceptKw("first") { nf = true } else {
+                    try p.expectKw("last")
+                    nf = false
+                }
+            }
+            append(mut &d.order, WinOrder{expr: x, desc: desc, nullsFirst: nf})
+            if !p.acceptKw(",") { break }
+        }
+    }
+    var mode = FR_NONE
+    if p.acceptKw("rows") { mode = FR_ROWS }
+    else if p.acceptKw("range") { mode = FR_RANGE }
+    else if p.acceptKw("groups") { mode = FR_GROUPS }
+    if mode != FR_NONE {
+        var f = noFrame()
+        f.mode = mode
+        if p.acceptKw("between") {
+            try p.bound(mut &f, true)
+            try p.expectKw("and")
+            try p.bound(mut &f, false)
+        } else {
+            try p.bound(mut &f, true)
+            f.end = B_CURRENT
+        }
+        if p.acceptKw("exclude") {
+            if p.acceptKw("current") { try p.expectKw("row"); f.exclude = EX_CURRENT }
+            else if p.acceptKw("group") { f.exclude = EX_GROUP }
+            else if p.acceptKw("ties") { f.exclude = EX_TIES }
+            else { try p.expectKw("no"); try p.expectKw("others") }
+        }
+        if f.start == B_UNBOUNDED_FOLLOWING { return Err(lexdb_base.err("42P20", "frame start cannot be UNBOUNDED FOLLOWING")) }
+        if f.end == B_UNBOUNDED_PRECEDING { return Err(lexdb_base.err("42P20", "frame end cannot be UNBOUNDED PRECEDING")) }
+        if f.start == B_CURRENT && f.end == B_PRECEDING {
+            return Err(lexdb_base.err("42P20", "frame starting from current row cannot have preceding rows"))
+        }
+        if f.start == B_FOLLOWING && (f.end == B_PRECEDING || f.end == B_CURRENT) {
+            return Err(lexdb_base.err("42P20", "frame starting from following row cannot have preceding rows"))
+        }
+        d.frame = f
+    }
+    try p.expectKw(")")
+    return Ok(d)
+}
+
+// A frame's bound: UNBOUNDED PRECEDING | n PRECEDING | CURRENT ROW |
+// n FOLLOWING | UNBOUNDED FOLLOWING.
+fn (p: mut &P) bound(f: mut &Frame, start: bool): Result[Unit, lexdb_base.DbErr] {
+    var kind = 0
+    var off: Option[Expr] = None
+    if p.acceptKw("unbounded") {
+        if p.acceptKw("preceding") { kind = B_UNBOUNDED_PRECEDING } else {
+            try p.expectKw("following")
+            kind = B_UNBOUNDED_FOLLOWING
+        }
+    } else if p.acceptKw("current") {
+        try p.expectKw("row")
+        kind = B_CURRENT
+    } else {
+        off = Some(try p.expr())
+        if p.acceptKw("preceding") { kind = B_PRECEDING } else {
+            try p.expectKw("following")
+            kind = B_FOLLOWING
+        }
+    }
+    if start {
+        f.start = kind
+        f.startOff = off
+    } else {
+        f.end = kind
+        f.endOff = off
+    }
+    return Ok(Unit{})
+}
+
 // A COPY option's value: a string.
 fn (p: mut &P) copyStr(): Result[str, lexdb_base.DbErr] {
     let t = p.peek()
@@ -2250,6 +2442,7 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
             s.ifFlag = p.acceptKw("analyze")        // EXPLAIN ANALYZE: run it and count
             var inner = try p.statement()
             inner.subs = replace(mut &p.subs, [])
+            inner.wins = replace(mut &p.wins, [])
             inner.params = p.params
             if s.ifFlag && inner.kind != S_SELECT {
                 return Err(lexdb_base.err("0A000", "EXPLAIN ANALYZE takes SELECT"))
@@ -2397,7 +2590,7 @@ fn (p: mut &P) skipToEnd() {
 // highest $n in each.
 pub fn parse(sql: &str): Result[[]Stmt, lexdb_base.DbErr] {
     let toks = try lex(sql)
-    var p = P{toks: toks, pos: 0, params: 0, subs: [], ctes: [], nextCte: 0, inCte: [], depth: 0, seqs: []}
+    var p = P{toks: toks, pos: 0, params: 0, subs: [], ctes: [], nextCte: 0, inCte: [], depth: 0, seqs: [], wins: []}
     var out: []Stmt = []
     while true {
         p.params = 0
@@ -2407,10 +2600,14 @@ pub fn parse(sql: &str): Result[[]Stmt, lexdb_base.DbErr] {
         p.inCte = []
         p.depth = 0
         p.seqs = []
+        p.wins = []
         var s = try p.statement()
         s.params = p.params
         s.seqNames = replace(mut &p.seqs, [])
-        if s.kind != S_EXPLAIN { s.subs = replace(mut &p.subs, []) }
+        if s.kind != S_EXPLAIN {
+            s.subs = replace(mut &p.subs, [])
+            s.wins = replace(mut &p.wins, [])
+        }
         let t = p.peek()
         if t.kind == T_EOF {
             if s.kind != S_EMPTY || len(out) == 0 { append(mut &out, s) }
@@ -2544,7 +2741,7 @@ pub fn exprText(x: &Expr): str {
 // One expression and nothing after it.
 pub fn parseExpr(sql: &str): Result[Expr, lexdb_base.DbErr] {
     let toks = try lex(sql)
-    var p = P{toks: toks, pos: 0, params: 0, subs: [], ctes: [], nextCte: 0, inCte: [], depth: 0, seqs: []}
+    var p = P{toks: toks, pos: 0, params: 0, subs: [], ctes: [], nextCte: 0, inCte: [], depth: 0, seqs: [], wins: []}
     let x = try p.expr()
     let t = p.peek()
     if t.kind != T_EOF { return Err(near(&t)) }

@@ -393,7 +393,7 @@ Built on 2026-11-09 on branch `lexdb`, about 6,300 lines in
 (cache, trees, transactions, log, checkpoints, recovery, snapshots),
 `lexdb_sql` (lexer, parser), `lexdb_exec` (catalog, rows, keys, planner,
 statements, sessions), `lexdb_wire` (protocol 3.0) and `lexdb` (the
-server). Tests: `python3 lexell/tests/lexdb.py` (56 programs in
+server). Tests: `python3 lexell/tests/lexdb.py` (57 programs in
 `tests/lexdb/run`, under `LXL_CHECK=1`).
 
     lexell/compiler/out/lxlc lexell/cmd/lexdb.lxl -o lexdb
@@ -599,6 +599,7 @@ is the comparison to make.
 15. SERIAL and COPY (the user's request, 2026-11-09), in steps: (1)
    sequences, SERIAL and identity columns (built: 9.43); (2) RETURNING, for
    clients to read the ids back (built: 9.44); (3) COPY (built: 9.45).
+16. Window functions (the user's request, 2026-11-09; built: 9.46).
 
 ### 9.5 Indexes and joins (D4)
 
@@ -3170,3 +3171,151 @@ Seven survived the first run. The tests then gained a quoted empty field,
 tag, the delimiter `||`, and CONTEXT at the wire. The one left, a quoted
 empty field read as NULL by its unquoted branch, is equivalent: an
 unquoted field's raw and decoded text are the same.
+
+### 9.46 Window functions
+
+**What is built.** `f(args) OVER (...)`, `OVER name`, and `WINDOW name AS
+(...)`.
+- **Specs:** `[name] [PARTITION BY ...] [ORDER BY ... [ASC | DESC] [NULLS
+  FIRST | LAST]] [frame]`.
+- **Frames:** `{ROWS | RANGE | GROUPS} [BETWEEN] bound [AND bound]
+  [EXCLUDE CURRENT ROW | GROUP | TIES | NO OTHERS]`, the bounds UNBOUNDED,
+  n PRECEDING, CURRENT ROW and n FOLLOWING. RANGE offsets are over a
+  number.
+- **Ranking functions:** row_number, rank, dense_rank, percent_rank,
+  cume_dist, ntile.
+- **Value functions:** lag and lead (an offset and a default),
+  first_value, last_value, nth_value.
+- **Aggregates:** every aggregate (count, sum, avg, min, max, string_agg,
+  bool_and, bool_or, the variances), FILTER included.
+- **Where they may be:** in the select list and ORDER BY, over a grouped
+  query's groups (`rank() OVER (ORDER BY sum(x))`, `sum(sum(x)) OVER ()`),
+  in subqueries and CTEs.
+- **ORDER BY ... NULLS FIRST / LAST**, which SELECT lacked: it is now in
+  ORDER BY too. An index serves an order only when its NULLs go where the
+  index keeps them.
+
+**Checked against PostgreSQL 16 itself.** Two psql scripts (about 70
+queries with the errors) ran on a scratch PostgreSQL and on lexdb, and
+the outputs were diffed. They agree but for:
+- the order of peers, which is unspecified;
+- percent_rank and cume_dist, float8 in PostgreSQL. lexdb has no float
+  type, so they are numeric, shown without trailing zeros (as float8 is
+  shown); 8/9 is 0.8888888888888889 where float8 gives ...888;
+- a duplicate key's DETAIL (as for INSERT, 9.45);
+- PostgreSQL's LINE and position lines in errors.
+
+`exec_window`'s expected lines for its queries are PostgreSQL's own
+output (psql -At).
+
+**How.**
+- **The parser.** A call followed by OVER becomes `Call("#win", [Lit(i),
+  the call])`, and its definition goes to `Stmt.wins[i]` (`WinDef`). The
+  call is kept inside the `#win` so that the column has its function's
+  name and type before planning (exprName, exprOid). Window calls are
+  scoped to their SELECT, as subqueries are: wherever the parser moves
+  `p.subs` it moves `p.wins`. WINDOW's definitions go to `Stmt.windows`.
+  `window` is now reserved.
+- **Planning (planSelect).**
+  - `mergeWin` applies a named window by PostgreSQL's rules: `OVER w` is
+    w as it is; `OVER (w ...)` takes its partitions and order, and may add
+    an order and a frame.
+  - Window calls are 42P20 in WHERE, GROUP BY, HAVING, JOIN conditions,
+    window definitions, other window calls, and INSERT, UPDATE, DELETE and
+    RETURNING; 42803 in aggregates.
+  - The select list's and ORDER BY's `#win` become marks, so that a
+    window's own aggregate is not taken for the query's. In a grouped
+    query, a window's arguments, partitions and order then go through
+    `collectAggs` (their aggregates become the query's) and
+    `checkGrouped`.
+  - At last the marks become slots after the aggregates: `#agg nAggs +
+    i`. The evaluator reads a window value as it reads an aggregate, and
+    `Env` is unchanged.
+  - `winPlan` checks the function and its arguments, and makes the frame
+    whole. The default is RANGE UNBOUNDED PRECEDING to CURRENT ROW, which
+    without ORDER BY is the whole partition (every row a peer). It also
+    refuses: DISTINCT and ORDER BY in a window aggregate (0A000, as
+    PostgreSQL); RANGE offsets without exactly one ORDER BY column;
+    GROUPS without ORDER BY; offsets with columns.
+- **Running (execSel).**
+  - The rows are kept first: a plain query takes the path that keeps its
+    rows (`late`, with no early stop at LIMIT); a grouped one keeps the
+    groups HAVING chose, with their aggregates (`WinRow`).
+  - `winValues` then gives each row each call's value.
+  - Then the select list, DISTINCT, ORDER BY and LIMIT run as before.
+- **Per window (winValues and winPartition).**
+  - Each row's partition key and ORDER BY values; the rows sorted by them,
+    peers keeping their order. The sort is skipped when the rows already
+    come in that order, and windows with the same partitioning and order
+    share it.
+  - Per partition: peer groups.
+  - Ranking functions from the positions and groups.
+  - lag and lead by position.
+  - Frames by position (ROWS), by peer group (GROUPS) or by value (RANGE:
+    a binary search for v - n and v + n, the direction and the NULLs'
+    end taken into account; a NULL row's offset frame is its peers).
+  - Aggregates through the query's own accumulators (`accumulate`,
+    `finish`). A frame starting UNBOUNDED PRECEDING with no EXCLUDE only
+    grows: one accumulator, its value made again only when its end moves.
+    Other frames are summed afresh per row.
+
+**Measured** on 1M rows (id, n = i % 97), through psql:
+
+| Query | PostgreSQL 16 | lexdb |
+|---|---|---|
+| `row_number()` and `sum(id)` over `(PARTITION BY n ORDER BY id)` | 0.58 s | 2.4-2.7 s |
+| `rank() OVER (ORDER BY n)` | 0.35 s | 1.82 s |
+| `sum(n) OVER (ORDER BY id ROWS 10 PRECEDING)` | 0.34 s | 1.70 s |
+| `lag(n) OVER (ORDER BY id)` | 0.30 s | 1.03 s |
+
+The first lexdb version took 4.06, 1.99, 2.20 and 1.49 s.
+
+In the executor with 300K rows, lag was 440 ms, against 176 ms for the
+same subquery without it. A profile (the C build) spread the cost thin:
+the sort's comparisons about 7%, the rest in allocation and copying.
+Three changes brought it to 280-300 ms:
+- skipping the sort when the rows are in order already;
+- moving the kept rows instead of copying them;
+- no partition key, and no slot copy, when there is none.
+
+Sharing one sort between windows of one partitioning and order took the
+first query from 3.77 s to about 2.5 s. What is left is the sort of 1M
+rows by a closure, and the scan (9.45: about 0.6 µs a row): item 11's
+work.
+
+**Not done:**
+- Inverse transitions: a sliding frame's aggregate is summed afresh per
+  row, O(rows x frame).
+- RANGE offsets over dates or intervals (lexdb has neither).
+- Window calls in the ORDER BY of a UNION (0A000).
+- Correlated subqueries in a window's arguments (an aggregate's
+  `accumulate` evaluates without them).
+- The window functions' float8 results (numeric here).
+
+**Checked** by `exec_window` (33 lines: 28 queries' results as
+PostgreSQL gives them, then errors and described types). Planted (39),
+each caught:
+- in ranking: rank as row_number; dense_rank as rank; cume_dist to the
+  group's start; ntile's buckets even;
+- in values: lag as lead; no default; last_value from the frame's start;
+- in sorting: partitions not split; the partition left out of the sort;
+  DESC ignored; NULLs' place ignored, in a window and in a SELECT's
+  ORDER BY, and the window's default (DESC: first); no peers; the sorted
+  check ignoring partitions; always taken as sorted; windows with other
+  specs, or only another direction, sharing a sort;
+- in frames: the default frame ROWS; a ROWS offset ignored; FOLLOWING one
+  short; GROUPS by rows; RANGE's direction; RANGE's end not inclusive;
+  EXCLUDE ignored; TIES excluding the row; the incremental value not made
+  again; the `ROWS n PRECEDING` shorthand ending elsewhere;
+- in planning: slots over the aggregates; a window's group aggregates not
+  collected; an early stop at LIMIT; DISTINCT before the windows; WHERE
+  allowed; bare `OVER w` refused; an ORDER BY override allowed; partition
+  columns not read (9.31's narrowing); FILTER lost; percent_rank's type;
+  window calls not scoped to their subquery.
+
+Five survived the first run; the test then gained:
+- a LIMIT with a whole-table window;
+- WHERE's own message (the evaluator's has the same state);
+- a bare `OVER w` with a frame;
+- a window's DESC with its default NULLs;
+- the `ROWS n PRECEDING` shorthand.
