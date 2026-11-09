@@ -1,0 +1,75 @@
+// lexdb: a small SQL server on disk behind the PostgreSQL wire protocol
+// (design/lexdb.md).
+//
+//     lexdb DATADIR [ADDR]
+//
+// DATADIR is made when it does not exist; ADDR defaults to 127.0.0.1:5433.
+// There is no authentication yet: keep it on loopback. SIGTERM or SIGINT
+// stops it: no new connections, the open ones are cut off, and the log is
+// flushed before it exits.
+import "task"
+import "net"
+import "io"
+import "os"
+import "fs"
+import "./lexdb_base"
+import "./lexdb_disk"
+import "./lexdb_store"
+import "./lexdb_exec"
+import "./lexdb_wire"
+
+fn main() {
+    let args = os.arguments()
+    if len(args) < 1 || len(args) > 2 {
+        eprintln("usage: lexdb DATADIR [ADDR]")
+        exit(2)
+    }
+    let dir = args[0]
+    let addr = if len(args) > 1 { args[1] } else { "127.0.0.1:5433" }
+    if os.env("LXL_HELPERS").isNone() { os.setEnv("LXL_HELPERS", "32") }   // reads in flight (section 3)
+    match fs.mkdirAll(dir) {
+        Ok(_) {}
+        Err(e) {
+            eprintln("lexdb: " + dir + ": " + e.toStr())
+            exit(1)
+        }
+    }
+    task.watchSignals(&[task.SIGTERM, task.SIGINT])
+    let opened = lexdb_store.open(lexdb_disk.real(dir), lexdb_store.defaults())
+    if opened.isErr() {
+        eprintln("lexdb: open " + dir + ": " + opened.unwrapErr().toStr())
+        exit(1)
+    }
+    let st = opened.unwrap()
+    var code = 0
+    task.scope(fn(s: mut &task.Scope) {
+        s.spawn(lexdb_store.writer, st)
+        s.spawn(lexdb_store.checkpointer, st)
+        match lexdb_exec.bootstrap(&st) {
+            Ok(_) {}
+            Err(e) {
+                eprintln("lexdb: " + e.toStr())
+                code = 1
+                st.close()
+                return
+            }
+        }
+        match net.listen(addr) {
+            Ok(ln) {
+                println("lexdb: listening on " + ln.localAddr() + ", data in " + dir)
+                let fl = io.flushStdout()
+                let f = s.start(lexdb_wire.acceptLoop, lexdb_wire.AcceptArg{ln: ln, st: st})
+                let sig = task.terminated()
+                { let stop = f }                       // cancels the accept loop and the connections
+                println("lexdb: stopping")
+            }
+            Err(e) {
+                eprintln("lexdb: listen " + addr + ": " + e.toStr())
+                code = 1
+            }
+        }
+        let ck = st.checkpoint()
+        st.close()
+    })
+    if code != 0 { exit(code) }
+}

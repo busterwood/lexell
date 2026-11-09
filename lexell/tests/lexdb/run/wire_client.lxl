@@ -1,0 +1,86 @@
+// lexdb_wire against Lexell's own PostgreSQL client (lib/postgres, the
+// extended protocol with typed parameters), server and client in one
+// process on the simulated disk.
+// expect: connected
+// expect: inserted 3
+// expect: 2 bob 20.50 true
+// expect: rows 2 cols id,name
+// expect: sum 61.50
+// expect: in transaction: 4
+// expect: after rollback: 3
+// expect: error 23505
+// expect: error 42P01
+// expect: still works: 3
+// expect: null name true
+import "task"
+import "net"
+import "postgres"
+import "sqldialect"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_wire"
+
+type V = sqldialect.Value
+
+fn client(addr: str): Result[Unit, postgres.Error] {
+    let at = addr
+    let port = at[10..len(at)]
+    var c = try postgres.connect("host=127.0.0.1 port=" + port + " user=test dbname=test sslmode=disable")
+    println("connected")
+    try c.exec("create table people (id bigint primary key, name text, score numeric(8,2), active boolean)")
+    var n = 0
+    for p in [1, 2, 3] {
+        let names = ["", "ann", "bob", "cy"]
+        let r = try c.query("insert into people values ($1, $2, $3, $4)",
+                            &[V.Int(p), V.Text(names[p]), V.Dec(decimalOf(p * 10).add(0.5m)), V.Bool(p != 1)])
+        n += r.affected()
+    }
+    println("inserted " + n.toStr())
+    let one = try c.query("select id, name, score, active from people where id = $1", &[V.Int(2)])
+    println((try one.int(0, 0)).toStr() + " " + (try one.text(0, 1)) + " " + (try one.text(0, 2)) + " " + (try one.bool(0, 3)).toStr())
+    let some = try c.query("select id, name from people where active = $1 order by id", &[V.Bool(true)])
+    println("rows " + some.rowCount().toStr() + " cols " + (try some.columnName(0)) + "," + (try some.columnName(1)))
+    let sum = try c.query("select sum(score) from people", &[])
+    println("sum " + (try sum.text(0, 0)))
+    try c.exec("begin")
+    try c.exec("insert into people values (4, 'dee', 1, true)")
+    let inside = try c.query("select count(*) from people", &[])
+    println("in transaction: " + (try inside.text(0, 0)))
+    try c.exec("rollback")
+    let after = try c.query("select count(*) from people", &[])
+    println("after rollback: " + (try after.text(0, 0)))
+    match c.query("insert into people values ($1, 'again', 0, false)", &[V.Int(1)]) {
+        Ok(_) { println("no error?") }
+        Err(e) { println("error " + e.state) }
+    }
+    match c.query("select * from missing", &[]) {
+        Ok(_) { println("no error?") }
+        Err(e) { println("error " + e.state) }
+    }
+    let still = try c.query("select count(*) from people", &[])
+    println("still works: " + (try still.text(0, 0)))
+    let nr = try c.query("insert into people (id) values ($1)", &[V.Int(9)])
+    let nl = try c.query("select name from people where id = $1", &[V.Int(9)])
+    println("null name " + (try nl.isNull(0, 0)).toStr())
+    return Ok(Unit{})
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        let f = s.start(lexdb_wire.acceptLoop, lexdb_wire.AcceptArg{ln: ln, st: st})
+        match client(addr) {
+            Ok(_) {}
+            Err(e) { println("client: " + e.toStr()) }
+        }
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(5), lexdb_store.defaults(), body).unwrap()
+}

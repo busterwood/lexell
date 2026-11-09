@@ -816,7 +816,20 @@ fn (st: &Store) openSeg(g: int, size: int): Result[lexdb_disk.File, lexdb_base.D
     if !fs.exists(name) && fs.exists(SPARE) { try fs.rename(SPARE, name) }
     let f = try fs.open(name, true)
     let have = try f.size()
-    if have < size { try f.grow(size) }
+    if have < size {
+        // Written with zeros once, not just allocated: a flush after a write
+        // into an allocated but unwritten extent costs about twice as much
+        // on ext4, which must journal the extent's change (design/lexdb.md 3).
+        try f.grow(size)
+        let chunk = array(1024 * 1024, byte(0))
+        var at = have / PAGE * PAGE
+        while at < size {
+            let n = if size - at < len(chunk) { size - at } else { len(chunk) }
+            try f.write(at, &chunk[0..n])
+            at += n
+        }
+        try f.flush()
+    }
     return Ok(f)
 }
 

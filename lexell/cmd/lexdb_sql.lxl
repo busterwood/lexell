@@ -1,0 +1,729 @@
+// lexdb: SQL text to statements (design/lexdb.md 4.8): a lexer and a
+// recursive-descent parser for the subset lexdb runs.
+//
+// Statements: CREATE TABLE (a primary key is required), DROP TABLE, INSERT
+// ... VALUES, SELECT (one table or none; WHERE, GROUP BY, ORDER BY, LIMIT,
+// OFFSET; aggregates), UPDATE, DELETE, BEGIN / START TRANSACTION, COMMIT /
+// END, ROLLBACK, and SET (accepted and ignored). Names are folded to lower
+// case unless quoted. Expressions: literals, $n parameters, columns
+// (table.column too), + - * / % ||, comparisons, AND OR NOT, IS [NOT] NULL,
+// casts (::type and CAST(x AS type)) and function calls.
+import "strings"
+import "./lexdb_base"
+
+// Column kinds.
+pub const K_INT = 1
+pub const K_BOOL = 2
+pub const K_NUM = 3
+pub const K_TEXT = 4
+
+// Postgres type OIDs.
+pub const OID_BOOL = 16
+pub const OID_INT8 = 20
+pub const OID_INT2 = 21
+pub const OID_INT4 = 23
+pub const OID_TEXT = 25
+pub const OID_VARCHAR = 1043
+pub const OID_NUMERIC = 1700
+pub const OID_UNKNOWN = 705
+
+pub type TypeName = value record {
+    pub kind: int
+    pub oid: int
+    pub prec: int       // numeric precision, 0 when not given
+    pub scale: int      // numeric scale
+    pub len: int        // varchar length, 0 when not given
+}
+
+pub type Val = value closed {
+    Null
+    Int(int)
+    Bool(bool)
+    Num(Decimal)
+    Text(str)
+}
+
+pub type Expr = closed {
+    Lit(Val)
+    Param(int)                  // $n, from 1
+    Col(str)
+    Unary(str, Expr)            // "-", "not"
+    Bin(str, Expr, Expr)        // + - * / % || = <> < <= > >= and or
+    IsNull(Expr, bool)          // IS NULL; true: IS NOT NULL
+    Call(str, []Expr, bool)     // name, arguments, count(*)
+    Cast(Expr, TypeName)
+}
+
+pub type ColDef = record {
+    pub name: str
+    pub typ: TypeName
+    pub notNull: bool
+}
+
+pub type SelItem = record {
+    pub star: bool
+    pub expr: Option[Expr]
+    pub alias: str
+}
+
+pub type OrderItem = record { pub expr: Expr; pub desc: bool }
+
+pub type SetItem = record { pub col: str; pub expr: Expr }
+
+pub const S_EMPTY = 0
+pub const S_CREATE = 1
+pub const S_DROP = 2
+pub const S_INSERT = 3
+pub const S_SELECT = 4
+pub const S_UPDATE = 5
+pub const S_DELETE = 6
+pub const S_BEGIN = 7
+pub const S_COMMIT = 8
+pub const S_ROLLBACK = 9
+pub const S_SET = 10
+
+pub type Stmt = record {
+    pub kind: int
+    pub table: str
+    pub ifFlag: bool            // IF NOT EXISTS / IF EXISTS
+    pub cols: []ColDef          // CREATE
+    pub pk: []str
+    pub names: []str            // INSERT's column list
+    pub rows: [][]Expr          // INSERT's VALUES
+    pub items: []SelItem        // SELECT
+    pub where: Option[Expr]
+    pub group: []Expr
+    pub order: []OrderItem
+    pub limit: Option[Expr]
+    pub offset: Option[Expr]
+    pub sets: []SetItem         // UPDATE
+    pub params: int             // the highest $n
+}
+
+fn newStmt(kind: int): Stmt {
+    return Stmt{kind: kind, table: "", ifFlag: false, cols: [], pk: [], names: [], rows: [], items: [], where: None,
+                group: [], order: [], limit: None, offset: None, sets: [], params: 0}
+}
+
+// ---- the lexer
+
+const T_EOF = 0
+const T_IDENT = 1        // folded to lower case
+const T_QIDENT = 2       // "quoted"
+const T_NUM = 3
+const T_STR = 4
+const T_PARAM = 5
+const T_OP = 6
+
+type Tok = value record { kind: int; text: str; at: int }
+
+fn syntax(msg: str): lexdb_base.DbErr { return lexdb_base.err("42601", msg) }
+
+fn isIdentStart(c: byte): bool { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || c >= 128 }
+fn isIdentChar(c: byte): bool { return isIdentStart(c) || (c >= '0' && c <= '9') || c == '$' }
+fn isDigit(c: byte): bool { return c >= '0' && c <= '9' }
+
+fn lex(s: &str): Result[[]Tok, lexdb_base.DbErr] {
+    var out: []Tok = []
+    var i = 0
+    let n = len(s)
+    while i < n {
+        let c = s[i]
+        if c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == 12 {
+            i += 1
+            continue
+        }
+        if c == '-' && i + 1 < n && s[i + 1] == '-' {
+            while i < n && s[i] != '\n' { i += 1 }
+            continue
+        }
+        if c == '/' && i + 1 < n && s[i + 1] == '*' {
+            i += 2
+            while i + 1 < n && !(s[i] == '*' && s[i + 1] == '/') { i += 1 }
+            i += 2
+            continue
+        }
+        let start = i
+        if isIdentStart(c) {
+            while i < n && isIdentChar(s[i]) { i += 1 }
+            append(mut &out, Tok{kind: T_IDENT, text: strings.toLowerAscii(s[start..i]), at: start})
+            continue
+        }
+        if c == '"' {
+            var b = newStrBuf()
+            i += 1
+            while true {
+                if i >= n { return Err(syntax("unterminated quoted identifier")) }
+                if s[i] == '"' {
+                    if i + 1 < n && s[i + 1] == '"' {
+                        b.addByte('"')
+                        i += 2
+                        continue
+                    }
+                    i += 1
+                    break
+                }
+                b.addByte(s[i])
+                i += 1
+            }
+            append(mut &out, Tok{kind: T_QIDENT, text: b.toStr(), at: start})
+            continue
+        }
+        if isDigit(c) || (c == '.' && i + 1 < n && isDigit(s[i + 1])) {
+            while i < n && (isDigit(s[i]) || s[i] == '.') { i += 1 }
+            if i < n && (s[i] == 'e' || s[i] == 'E') {
+                i += 1
+                if i < n && (s[i] == '+' || s[i] == '-') { i += 1 }
+                while i < n && isDigit(s[i]) { i += 1 }
+            }
+            append(mut &out, Tok{kind: T_NUM, text: s[start..i], at: start})
+            continue
+        }
+        if c == '\'' {
+            var b = newStrBuf()
+            i += 1
+            while true {
+                if i >= n { return Err(syntax("unterminated quoted string")) }
+                if s[i] == '\'' {
+                    if i + 1 < n && s[i + 1] == '\'' {
+                        b.addByte('\'')
+                        i += 2
+                        continue
+                    }
+                    i += 1
+                    break
+                }
+                b.addByte(s[i])
+                i += 1
+            }
+            append(mut &out, Tok{kind: T_STR, text: b.toStr(), at: start})
+            continue
+        }
+        if c == '$' && i + 1 < n && isDigit(s[i + 1]) {
+            i += 1
+            while i < n && isDigit(s[i]) { i += 1 }
+            append(mut &out, Tok{kind: T_PARAM, text: s[start + 1..i], at: start})
+            continue
+        }
+        // operators
+        var op = s[i..i + 1]
+        if i + 1 < n {
+            let two = s[i..i + 2]
+            if two == "<=" || two == ">=" || two == "<>" || two == "!=" || two == "||" || two == "::" { op = two }
+        }
+        if !strings.contains(&"(),;.*+-/%=<>|:![]", &op[0..1]) {
+            return Err(syntax("syntax error at or near \"" + op + "\""))
+        }
+        i += len(op)
+        append(mut &out, Tok{kind: T_OP, text: op, at: start})
+    }
+    append(mut &out, Tok{kind: T_EOF, text: "", at: n})
+    return Ok(out)
+}
+
+// ---- the parser
+
+type P = record {
+    toks: []Tok
+    pos: int
+    params: int
+}
+
+fn (p: &P) peek(): Tok { return p.toks[p.pos] }
+fn (p: &P) peekAt(k: int): Tok {
+    let i = if p.pos + k < len(p.toks) { p.pos + k } else { len(p.toks) - 1 }
+    return p.toks[i]
+}
+fn (p: mut &P) next(): Tok {
+    let t = p.toks[p.pos]
+    if t.kind != T_EOF { p.pos += 1 }
+    return t
+}
+
+fn near(t: &Tok): lexdb_base.DbErr {
+    if t.kind == T_EOF { return syntax("syntax error at end of input") }
+    return syntax("syntax error at or near \"" + t.text + "\"")
+}
+
+// Is the next token the keyword (or operator) w?
+fn (p: &P) isKw(w: str): bool {
+    let t = p.peek()
+    return (t.kind == T_IDENT || t.kind == T_OP) && t.text == w
+}
+
+fn (p: mut &P) acceptKw(w: str): bool {
+    if p.isKw(w) {
+        p.pos += 1
+        return true
+    }
+    return false
+}
+
+fn (p: mut &P) expectKw(w: str): Result[Unit, lexdb_base.DbErr] {
+    if p.acceptKw(w) { return Ok(Unit{}) }
+    return Err(near(&p.peek()))
+}
+
+const RESERVED: []str = ["select", "from", "where", "group", "order", "by", "limit", "offset", "and", "or", "not", "is",
+                  "null", "as", "values", "set", "into", "insert", "update", "delete", "create", "table",
+                  "primary", "key", "asc", "desc", "true", "false", "cast", "on", "join"]
+
+fn isReserved(w: &str): bool {
+    for r in RESERVED { if r == w { return true } }
+    return false
+}
+
+fn (p: mut &P) name(): Result[str, lexdb_base.DbErr] {
+    let t = p.peek()
+    if t.kind == T_QIDENT || (t.kind == T_IDENT && !isReserved(&t.text)) {
+        p.pos += 1
+        return Ok(t.text)
+    }
+    return Err(near(&t))
+}
+
+fn (p: mut &P) typeName(): Result[TypeName, lexdb_base.DbErr] {
+    let w = try p.name()
+    var t = TypeName{kind: 0, oid: 0, prec: 0, scale: 0, len: 0}
+    match w {
+        "int", "integer", "int4" { t = TypeName{kind: K_INT, oid: OID_INT4, prec: 0, scale: 0, len: 0} }
+        "bigint", "int8" { t = TypeName{kind: K_INT, oid: OID_INT8, prec: 0, scale: 0, len: 0} }
+        "smallint", "int2" { t = TypeName{kind: K_INT, oid: OID_INT2, prec: 0, scale: 0, len: 0} }
+        "boolean", "bool" { t = TypeName{kind: K_BOOL, oid: OID_BOOL, prec: 0, scale: 0, len: 0} }
+        "numeric", "decimal" { t = TypeName{kind: K_NUM, oid: OID_NUMERIC, prec: 0, scale: 0, len: 0} }
+        "text" { t = TypeName{kind: K_TEXT, oid: OID_TEXT, prec: 0, scale: 0, len: 0} }
+        "varchar" { t = TypeName{kind: K_TEXT, oid: OID_VARCHAR, prec: 0, scale: 0, len: 0} }
+        "character" {
+            if p.acceptKw("varying") {
+                t = TypeName{kind: K_TEXT, oid: OID_VARCHAR, prec: 0, scale: 0, len: 0}
+            } else {
+                return Err(lexdb_base.err("0A000", "type character is not supported (use varchar or text)"))
+            }
+        }
+        else { return Err(lexdb_base.err("42704", "type \"" + w + "\" does not exist")) }
+    }
+    if p.acceptKw("(") {
+        let a = try p.intLit()
+        if t.kind == K_NUM {
+            t.prec = a
+            if p.acceptKw(",") { t.scale = try p.intLit() }
+            if t.prec < 1 || t.prec > 38 {
+                return Err(lexdb_base.err("22023", "NUMERIC precision " + t.prec.toStr() + " must be between 1 and 38"))
+            }
+            if t.scale < 0 || t.scale > t.prec {
+                return Err(lexdb_base.err("22023", "NUMERIC scale " + t.scale.toStr() + " must be between 0 and precision " + t.prec.toStr()))
+            }
+        } else if t.kind == K_TEXT {
+            t.len = a
+        } else {
+            return Err(near(&p.toks[p.pos - 1]))
+        }
+        try p.expectKw(")")
+    }
+    return Ok(t)
+}
+
+fn (p: mut &P) intLit(): Result[int, lexdb_base.DbErr] {
+    let t = p.next()
+    if t.kind != T_NUM { return Err(near(&t)) }
+    match strings.parseIntOpt(t.text) {
+        Some(n) { return Ok(n) }
+        None { return Err(near(&t)) }
+    }
+}
+
+// ---- expressions, by precedence: OR, AND, NOT, comparison and IS, ||,
+// + -, * / %, unary -, ::.
+
+fn (p: mut &P) expr(): Result[Expr, lexdb_base.DbErr] { return p.orExpr() }
+
+fn (p: mut &P) orExpr(): Result[Expr, lexdb_base.DbErr] {
+    var e = try p.andExpr()
+    while p.acceptKw("or") {
+        let r = try p.andExpr()
+        e = Expr.Bin("or", e, r)
+    }
+    return Ok(e)
+}
+
+fn (p: mut &P) andExpr(): Result[Expr, lexdb_base.DbErr] {
+    var e = try p.notExpr()
+    while p.acceptKw("and") {
+        let r = try p.notExpr()
+        e = Expr.Bin("and", e, r)
+    }
+    return Ok(e)
+}
+
+fn (p: mut &P) notExpr(): Result[Expr, lexdb_base.DbErr] {
+    if p.acceptKw("not") {
+        let e = try p.notExpr()
+        return Ok(Expr.Unary("not", e))
+    }
+    return p.cmpExpr()
+}
+
+fn (p: mut &P) cmpExpr(): Result[Expr, lexdb_base.DbErr] {
+    var e = try p.catExpr()
+    let t = p.peek()
+    if t.kind == T_OP && (t.text == "=" || t.text == "<>" || t.text == "!=" || t.text == "<" || t.text == "<=" ||
+                          t.text == ">" || t.text == ">=") {
+        p.pos += 1
+        let r = try p.catExpr()
+        let op = if t.text == "!=" { "<>" } else { t.text }
+        return Ok(Expr.Bin(op, e, r))
+    }
+    if p.acceptKw("is") {
+        let neg = p.acceptKw("not")
+        if p.acceptKw("null") { return Ok(Expr.IsNull(e, neg)) }
+        if p.acceptKw("true") {
+            let x = Expr.Bin("=", e, Expr.Lit(Val.Bool(true)))
+            return Ok(if neg { Expr.Unary("not", x) } else { x })
+        }
+        if p.acceptKw("false") {
+            let x = Expr.Bin("=", e, Expr.Lit(Val.Bool(false)))
+            return Ok(if neg { Expr.Unary("not", x) } else { x })
+        }
+        return Err(near(&p.peek()))
+    }
+    return Ok(e)
+}
+
+fn (p: mut &P) catExpr(): Result[Expr, lexdb_base.DbErr] {
+    var e = try p.addExpr()
+    while p.acceptKw("||") {
+        let r = try p.addExpr()
+        e = Expr.Bin("||", e, r)
+    }
+    return Ok(e)
+}
+
+fn (p: mut &P) addExpr(): Result[Expr, lexdb_base.DbErr] {
+    var e = try p.mulExpr()
+    while p.isKw("+") || p.isKw("-") {
+        let op = p.next().text
+        let r = try p.mulExpr()
+        e = Expr.Bin(op, e, r)
+    }
+    return Ok(e)
+}
+
+fn (p: mut &P) mulExpr(): Result[Expr, lexdb_base.DbErr] {
+    var e = try p.unary()
+    while p.isKw("*") || p.isKw("/") || p.isKw("%") {
+        let op = p.next().text
+        let r = try p.unary()
+        e = Expr.Bin(op, e, r)
+    }
+    return Ok(e)
+}
+
+fn (p: mut &P) unary(): Result[Expr, lexdb_base.DbErr] {
+    if p.acceptKw("-") {
+        let e = try p.unary()
+        return Ok(Expr.Unary("-", e))
+    }
+    if p.acceptKw("+") { return p.unary() }
+    var e = try p.primary()
+    while p.acceptKw("::") {
+        let t = try p.typeName()
+        e = Expr.Cast(e, t)
+    }
+    return Ok(e)
+}
+
+fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
+    let t = p.next()
+    if t.kind == T_NUM {
+        if !strings.contains(&t.text, ".") && !strings.contains(&t.text, "e") && !strings.contains(&t.text, "E") {
+            match strings.parseIntOpt(t.text) {
+                Some(n) { return Ok(Expr.Lit(Val.Int(n))) }
+                None {}
+            }
+        }
+        match Decimal.parse(t.text) {
+            Ok(d) { return Ok(Expr.Lit(Val.Num(d))) }
+            Err(_) { return Err(lexdb_base.err("22003", "numeric literal out of range: " + t.text)) }
+        }
+    }
+    if t.kind == T_STR { return Ok(Expr.Lit(Val.Text(t.text))) }
+    if t.kind == T_PARAM {
+        let n = strings.parseIntOpt(t.text).unwrapOr(0)
+        if n < 1 || n > 65535 { return Err(near(&t)) }
+        if n > p.params { p.params = n }
+        return Ok(Expr.Param(n))
+    }
+    if t.kind == T_OP && t.text == "(" {
+        let e = try p.expr()
+        try p.expectKw(")")
+        return Ok(e)
+    }
+    if t.kind == T_IDENT {
+        match t.text {
+            "null" { return Ok(Expr.Lit(Val.Null)) }
+            "true" { return Ok(Expr.Lit(Val.Bool(true))) }
+            "false" { return Ok(Expr.Lit(Val.Bool(false))) }
+            "cast" {
+                try p.expectKw("(")
+                let e = try p.expr()
+                try p.expectKw("as")
+                let ty = try p.typeName()
+                try p.expectKw(")")
+                return Ok(Expr.Cast(e, ty))
+            }
+            else {}
+        }
+        if isReserved(&t.text) { return Err(near(&t)) }
+    }
+    if t.kind == T_IDENT || t.kind == T_QIDENT {
+        if p.isKw("(") && t.kind == T_IDENT {
+            p.pos += 1
+            var args: []Expr = []
+            var star = false
+            if p.acceptKw("*") {
+                star = true
+            } else if !p.isKw(")") {
+                let d = p.acceptKw("distinct")
+                if d { return Err(lexdb_base.err("0A000", "DISTINCT in aggregates is not supported")) }
+                append(mut &args, try p.expr())
+                while p.acceptKw(",") { append(mut &args, try p.expr()) }
+            }
+            try p.expectKw(")")
+            return Ok(Expr.Call(t.text, args, star))
+        }
+        var name = t.text
+        if p.acceptKw(".") {
+            name = try p.name()      // table.column: one table, so the column
+        }
+        return Ok(Expr.Col(name))
+    }
+    return Err(near(&t))
+}
+
+// ---- statements
+
+fn (p: mut &P) createTable(): Result[Stmt, lexdb_base.DbErr] {
+    var s = newStmt(S_CREATE)
+    if p.acceptKw("if") {
+        try p.expectKw("not")
+        try p.expectKw("exists")
+        s.ifFlag = true
+    }
+    s.table = try p.name()
+    try p.expectKw("(")
+    while true {
+        if p.acceptKw("primary") {
+            try p.expectKw("key")
+            try p.expectKw("(")
+            append(mut &s.pk, try p.name())
+            while p.acceptKw(",") { append(mut &s.pk, try p.name()) }
+            try p.expectKw(")")
+        } else {
+            let n = try p.name()
+            let ty = try p.typeName()
+            var c = ColDef{name: n, typ: ty, notNull: false}
+            while true {
+                if p.acceptKw("not") {
+                    try p.expectKw("null")
+                    c.notNull = true
+                } else if p.acceptKw("null") {
+                } else if p.acceptKw("primary") {
+                    try p.expectKw("key")
+                    append(mut &s.pk, n)
+                    c.notNull = true
+                } else {
+                    break
+                }
+            }
+            append(mut &s.cols, c)
+        }
+        if !p.acceptKw(",") { break }
+    }
+    try p.expectKw(")")
+    return Ok(s)
+}
+
+fn (p: mut &P) insert(): Result[Stmt, lexdb_base.DbErr] {
+    try p.expectKw("into")
+    var s = newStmt(S_INSERT)
+    s.table = try p.name()
+    if p.acceptKw("(") {
+        append(mut &s.names, try p.name())
+        while p.acceptKw(",") { append(mut &s.names, try p.name()) }
+        try p.expectKw(")")
+    }
+    try p.expectKw("values")
+    while true {
+        try p.expectKw("(")
+        var row: []Expr = []
+        append(mut &row, try p.expr())
+        while p.acceptKw(",") { append(mut &row, try p.expr()) }
+        try p.expectKw(")")
+        append(mut &s.rows, row)
+        if !p.acceptKw(",") { break }
+    }
+    return Ok(s)
+}
+
+fn (p: mut &P) select(): Result[Stmt, lexdb_base.DbErr] {
+    var s = newStmt(S_SELECT)
+    if p.acceptKw("distinct") { return Err(lexdb_base.err("0A000", "SELECT DISTINCT is not supported")) }
+    let all = p.acceptKw("all")
+    while true {
+        if p.acceptKw("*") {
+            append(mut &s.items, SelItem{star: true, expr: None, alias: ""})
+        } else {
+            let e = try p.expr()
+            var alias = ""
+            if p.acceptKw("as") {
+                alias = try p.name()
+            } else {
+                let t = p.peek()
+                if t.kind == T_QIDENT || (t.kind == T_IDENT && !isReserved(&t.text)) {
+                    alias = t.text
+                    p.pos += 1
+                }
+            }
+            append(mut &s.items, SelItem{star: false, expr: Some(e), alias: alias})
+        }
+        if !p.acceptKw(",") { break }
+    }
+    if p.acceptKw("from") {
+        s.table = try p.name()
+        if p.acceptKw("as") {
+            let a = try p.name()
+        } else if p.peek().kind == T_IDENT && !isReserved(&p.peek().text) {
+            p.pos += 1                      // an alias: one table, so it changes nothing
+        }
+        if p.isKw(",") || p.isKw("join") || p.isKw("inner") || p.isKw("left") || p.isKw("cross") {
+            return Err(lexdb_base.err("0A000", "joins are not supported yet"))
+        }
+    }
+    if p.acceptKw("where") { s.where = Some(try p.expr()) }
+    if p.acceptKw("group") {
+        try p.expectKw("by")
+        append(mut &s.group, try p.expr())
+        while p.acceptKw(",") { append(mut &s.group, try p.expr()) }
+    }
+    if p.acceptKw("order") {
+        try p.expectKw("by")
+        while true {
+            let e = try p.expr()
+            var desc = false
+            if p.acceptKw("desc") { desc = true } else { let a = p.acceptKw("asc") }
+            append(mut &s.order, OrderItem{expr: e, desc: desc})
+            if !p.acceptKw(",") { break }
+        }
+    }
+    while p.isKw("limit") || p.isKw("offset") {
+        if p.acceptKw("limit") {
+            if p.acceptKw("all") { s.limit = None } else { s.limit = Some(try p.expr()) }
+        } else {
+            let o = p.acceptKw("offset")
+            s.offset = Some(try p.expr())
+            let r = p.acceptKw("rows") || p.acceptKw("row")
+        }
+    }
+    return Ok(s)
+}
+
+fn (p: mut &P) update(): Result[Stmt, lexdb_base.DbErr] {
+    var s = newStmt(S_UPDATE)
+    s.table = try p.name()
+    try p.expectKw("set")
+    while true {
+        let c = try p.name()
+        try p.expectKw("=")
+        let e = try p.expr()
+        append(mut &s.sets, SetItem{col: c, expr: e})
+        if !p.acceptKw(",") { break }
+    }
+    if p.acceptKw("where") { s.where = Some(try p.expr()) }
+    return Ok(s)
+}
+
+fn (p: mut &P) delete(): Result[Stmt, lexdb_base.DbErr] {
+    try p.expectKw("from")
+    var s = newStmt(S_DELETE)
+    s.table = try p.name()
+    if p.acceptKw("where") { s.where = Some(try p.expr()) }
+    return Ok(s)
+}
+
+fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
+    let t = p.peek()
+    if t.kind == T_EOF || (t.kind == T_OP && t.text == ";") { return Ok(newStmt(S_EMPTY)) }
+    if t.kind != T_IDENT { return Err(near(&t)) }
+    p.pos += 1
+    match t.text {
+        "select" { return p.select() }
+        "insert" { return p.insert() }
+        "update" { return p.update() }
+        "delete" { return p.delete() }
+        "create" {
+            if p.acceptKw("table") { return p.createTable() }
+            return Err(lexdb_base.err("0A000", "only CREATE TABLE is supported"))
+        }
+        "drop" {
+            try p.expectKw("table")
+            var s = newStmt(S_DROP)
+            if p.acceptKw("if") {
+                try p.expectKw("exists")
+                s.ifFlag = true
+            }
+            s.table = try p.name()
+            return Ok(s)
+        }
+        "begin", "start" {
+            if t.text == "start" { try p.expectKw("transaction") } else {
+                let a = p.acceptKw("transaction") || p.acceptKw("work")
+            }
+            p.skipToEnd()
+            return Ok(newStmt(S_BEGIN))
+        }
+        "commit", "end" {
+            let a = p.acceptKw("transaction") || p.acceptKw("work")
+            return Ok(newStmt(S_COMMIT))
+        }
+        "rollback", "abort" {
+            let a = p.acceptKw("transaction") || p.acceptKw("work")
+            return Ok(newStmt(S_ROLLBACK))
+        }
+        "set", "reset", "discard", "deallocate" {
+            p.skipToEnd()
+            return Ok(newStmt(S_SET))
+        }
+        else {}
+    }
+    return Err(near(&t))
+}
+
+// Skips the rest of a statement (the options of BEGIN, a SET's value).
+fn (p: mut &P) skipToEnd() {
+    while p.peek().kind != T_EOF && !(p.peek().kind == T_OP && p.peek().text == ";") { p.pos += 1 }
+}
+
+// Parses SQL text into its statements (separated by ;). params is the
+// highest $n in each.
+pub fn parse(sql: &str): Result[[]Stmt, lexdb_base.DbErr] {
+    let toks = try lex(sql)
+    var p = P{toks: toks, pos: 0, params: 0}
+    var out: []Stmt = []
+    while true {
+        p.params = 0
+        var s = try p.statement()
+        s.params = p.params
+        let t = p.peek()
+        if t.kind == T_EOF {
+            if s.kind != S_EMPTY || len(out) == 0 { append(mut &out, s) }
+            break
+        }
+        if t.kind == T_OP && t.text == ";" {
+            p.pos += 1
+            if s.kind != S_EMPTY { append(mut &out, s) }
+            continue
+        }
+        return Err(near(&t))
+    }
+    return Ok(out)
+}

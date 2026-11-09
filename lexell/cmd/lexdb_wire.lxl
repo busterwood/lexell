@@ -1,0 +1,556 @@
+// lexdb: the PostgreSQL wire protocol, version 3.0, server side
+// (design/lexdb.md 4.7). One task per connection.
+//
+// Startup: an SSLRequest or GSSENCRequest is answered 'N' (no TLS yet), a
+// CancelRequest is ignored, and a StartupMessage is accepted without a
+// password (trust: listen on loopback until authentication is built). Then
+// the simple query protocol (several statements in one Query), and the
+// extended one: Parse, Bind, Describe, Execute, Close, Sync and Flush.
+// After an error in the extended protocol the messages up to Sync are
+// skipped, as PostgreSQL does. Results are text; parameters may be text or
+// binary integers, booleans and text.
+import "net"
+import "task"
+import "io"
+import "binary"
+import "strings"
+import "./lexdb_base"
+import "./lexdb_store"
+import "./lexdb_sql"
+import "./lexdb_exec"
+
+type Val = lexdb_sql.Val
+
+const SSL_REQUEST = 80877103
+const GSS_REQUEST = 80877104
+const CANCEL_REQUEST = 80877102
+const PROTOCOL_3 = 196608
+const MAX_MESSAGE = 64 * 1024 * 1024
+
+pub type ConnArg = record { pub conn: net.Conn; pub st: lexdb_store.Store; pub id: int }
+
+type Prepared = record {
+    stmts: []lexdb_sql.Stmt     // none (an empty query) or one
+    ptypes: []int
+}
+
+type Portal = record {
+    stmt: str
+    params: []Val
+}
+
+type Wire = record {
+    c: net.Conn
+    inBuf: []byte
+    inPos: int
+    out: StrBuf
+    sess: lexdb_exec.Session
+    st: lexdb_store.Store
+    skipping: bool
+}
+
+// The prepared statements and portals of a connection.
+type Ps = record {
+    stmts: Map[str, Prepared]
+    portals: Map[str, Portal]
+}
+
+// ---- reading
+
+fn (w: mut &Wire) fill(n: int): Result[bool, io.IoError] {
+    while len(w.inBuf) - w.inPos < n {
+        if w.inPos > 0 && w.inPos == len(w.inBuf) {
+            w.inBuf = []
+            w.inPos = 0
+        }
+        var chunk = array(65536, byte(0))
+        let got = try w.c.read(mut &chunk)
+        if got == 0 { return Ok(false) }
+        for i in 0..got { append(mut &w.inBuf, chunk[i]) }
+    }
+    return Ok(true)
+}
+
+fn (w: mut &Wire) take(n: int): str {
+    let s = strFromBytes(&w.inBuf[w.inPos..w.inPos + n])
+    w.inPos += n
+    if w.inPos == len(w.inBuf) {
+        w.inBuf = []
+        w.inPos = 0
+    }
+    return s
+}
+
+// A message: its type byte (0 for the startup packet, which has none) and
+// its body. None at the end of the stream.
+type Msg = value record { typ: byte; body: str }
+
+fn (w: mut &Wire) readMsg(startup: bool): Result[Option[Msg], io.IoError] {
+    var typ: byte = 0
+    if !startup {
+        if !(try w.fill(1)) { return Ok(None) }
+        typ = w.take(1)[0]
+    }
+    if !(try w.fill(4)) { return Ok(None) }
+    let n = binary.readI32BEStr(&w.take(4), 0)
+    if n < 4 || n > MAX_MESSAGE { return Ok(None) }
+    if !(try w.fill(n - 4)) { return Ok(None) }
+    return Ok(Some(Msg{typ: typ, body: w.take(n - 4)}))
+}
+
+// A cursor over a message body.
+type Rd = record { s: str; at: int; bad: bool }
+
+fn (r: mut &Rd) i16(): int {
+    if r.at + 2 > len(r.s) {
+        r.bad = true
+        return 0
+    }
+    let v = binary.readI16BEStr(&r.s, r.at)
+    r.at += 2
+    return v
+}
+
+fn (r: mut &Rd) i32(): int {
+    if r.at + 4 > len(r.s) {
+        r.bad = true
+        return 0
+    }
+    let v = binary.readI32BEStr(&r.s, r.at)
+    r.at += 4
+    return v
+}
+
+fn (r: mut &Rd) cstr(): str {
+    var i = r.at
+    while i < len(r.s) && r.s[i] != 0 { i += 1 }
+    if i >= len(r.s) {
+        r.bad = true
+        return ""
+    }
+    let v = r.s[r.at..i]
+    r.at = i + 1
+    return v
+}
+
+fn (r: mut &Rd) bytes(n: int): str {
+    if n < 0 || r.at + n > len(r.s) {
+        r.bad = true
+        return ""
+    }
+    let v = r.s[r.at..r.at + n]
+    r.at += n
+    return v
+}
+
+// ---- writing
+
+fn (w: mut &Wire) msg(typ: byte, body: &StrBuf) {
+    w.out.addByte(typ)
+    binary.addU32BE(mut &w.out, body.size() + 4)
+    w.out.add(body.toStr())
+}
+
+fn (w: mut &Wire) empty(typ: byte) {
+    w.out.addByte(typ)
+    binary.addU32BE(mut &w.out, 4)
+}
+
+fn (w: mut &Wire) flush(): Result[Unit, io.IoError] {
+    if w.out.size() == 0 { return Ok(Unit{}) }
+    let s = w.out.toStr()
+    w.out.clear()
+    return w.c.writeStr(s)
+}
+
+fn addC(b: mut &StrBuf, s: &str) {
+    b.add(s)
+    b.addByte(0)
+}
+
+fn (w: mut &Wire) paramStatus(name: str, value: str) {
+    var b = newStrBuf()
+    addC(mut &b, &name)
+    addC(mut &b, &value)
+    w.msg('S', &b)
+}
+
+fn (w: mut &Wire) error(e: &lexdb_base.DbErr) {
+    var b = newStrBuf()
+    let sev = if e.state == "57P01" { "FATAL" } else { "ERROR" }
+    b.addByte('S')
+    addC(mut &b, &sev)
+    b.addByte('V')
+    addC(mut &b, &sev)
+    b.addByte('C')
+    addC(mut &b, &e.state)
+    b.addByte('M')
+    addC(mut &b, &e.msg)
+    b.addByte(0)
+    w.msg('E', &b)
+}
+
+fn (w: mut &Wire) ready() {
+    var b = newStrBuf()
+    b.addByte(w.sess.status())
+    w.msg('Z', &b)
+}
+
+fn typLen(oid: int): int {
+    if oid == lexdb_sql.OID_INT8 { return 8 }
+    if oid == lexdb_sql.OID_INT4 { return 4 }
+    if oid == lexdb_sql.OID_INT2 { return 2 }
+    if oid == lexdb_sql.OID_BOOL { return 1 }
+    return -1
+}
+
+fn (w: mut &Wire) rowDesc(cols: &[]lexdb_exec.OutCol) {
+    var b = newStrBuf()
+    binary.addU16BE(mut &b, len(cols))
+    for c in cols {
+        addC(mut &b, &c.name)
+        binary.addU32BE(mut &b, 0)          // table OID
+        binary.addU16BE(mut &b, 0)          // column number
+        binary.addU32BE(mut &b, c.oid)
+        binary.addU16BE(mut &b, typLen(c.oid) & 0xFFFF)
+        binary.addU32BE(mut &b, 0xFFFFFFFF) // typmod -1
+        binary.addU16BE(mut &b, 0)          // text
+    }
+    w.msg('T', &b)
+}
+
+fn (w: mut &Wire) dataRows(rows: &[][]Val) {
+    for r in rows {
+        var b = newStrBuf()
+        binary.addU16BE(mut &b, len(r))
+        for v in r {
+            if lexdb_exec.isNull(&v) {
+                binary.addU32BE(mut &b, 0xFFFFFFFF)
+            } else {
+                let t = lexdb_exec.text(&v)
+                binary.addU32BE(mut &b, len(t))
+                b.add(t)
+            }
+        }
+        w.msg('D', &b)
+    }
+}
+
+fn (w: mut &Wire) complete(tag: &str) {
+    var b = newStrBuf()
+    addC(mut &b, tag)
+    w.msg('C', &b)
+}
+
+fn protoErr(msg: str): lexdb_base.DbErr { return lexdb_base.err("08P01", msg) }
+
+// ---- the simple query protocol
+
+fn (w: mut &Wire) query(sql: &str): Result[Unit, io.IoError] {
+    match lexdb_sql.parse(sql) {
+        Err(e) { w.error(&e) }
+        Ok(stmts) {
+            let none: []Val = []
+            let nt: []int = []
+            if len(stmts) == 1 && stmts[0].kind == lexdb_sql.S_EMPTY {
+                w.empty('I')
+            } else {
+                for s in stmts {
+                    match w.sess.run(&s, &none, &nt) {
+                        Ok(r) {
+                            if r.hasRows {
+                                w.rowDesc(&r.cols)
+                                w.dataRows(&r.rows)
+                            }
+                            w.complete(&r.tag)
+                        }
+                        Err(e) {
+                            w.error(&e)
+                            break
+                        }
+                    }
+                    if w.out.size() > 65536 { try w.flush() }
+                }
+            }
+        }
+    }
+    w.ready()
+    return w.flush()
+}
+
+// ---- the extended query protocol
+
+fn (w: mut &Wire) parseMsg(ps: mut &Ps, body: &str): Result[Unit, lexdb_base.DbErr] {
+    var r = Rd{s: body, at: 0, bad: false}
+    let name = r.cstr()
+    let sql = r.cstr()
+    let n = r.i16()
+    var given: []int = []
+    for i in 0..n { append(mut &given, r.i32()) }
+    if r.bad { return Err(protoErr("invalid Parse message")) }
+    var stmts = try lexdb_sql.parse(&sql)
+    if len(stmts) > 1 { return Err(lexdb_base.err("42601", "cannot insert multiple commands into a prepared statement")) }
+    if len(stmts) == 1 && stmts[0].kind == lexdb_sql.S_EMPTY { stmts = [] }
+    var ptypes: []int = []
+    if len(stmts) == 1 { ptypes = lexdb_exec.paramTypes(&w.st, &stmts[0], &given) }
+    if name != "" && ps.stmts.has(&name) {
+        return Err(lexdb_base.err("42P05", "prepared statement \"" + name + "\" already exists"))
+    }
+    ps.stmts.put(name, Prepared{stmts: stmts, ptypes: ptypes})
+    w.empty('1')
+    return Ok(Unit{})
+}
+
+fn binParam(data: &str, oid: int): Result[str, lexdb_base.DbErr] {
+    if oid == lexdb_sql.OID_INT8 && len(data) == 8 { return Ok(binary.readI64BEStr(data, 0).toStr()) }
+    if oid == lexdb_sql.OID_INT4 && len(data) == 4 { return Ok(binary.readI32BEStr(data, 0).toStr()) }
+    if oid == lexdb_sql.OID_INT2 && len(data) == 2 { return Ok(binary.readI16BEStr(data, 0).toStr()) }
+    if oid == lexdb_sql.OID_BOOL && len(data) == 1 { return Ok(if data[0] != 0 { "t" } else { "f" }) }
+    if oid == lexdb_sql.OID_TEXT || oid == lexdb_sql.OID_VARCHAR { return Ok(data) }
+    return Err(lexdb_base.err("0A000", "lexdb: a binary parameter of type " + oid.toStr() + " is not supported"))
+}
+
+fn (w: mut &Wire) bindMsg(ps: mut &Ps, body: &str): Result[Unit, lexdb_base.DbErr] {
+    var r = Rd{s: body, at: 0, bad: false}
+    let portal = r.cstr()
+    let name = r.cstr()
+    let nf = r.i16()
+    var fmts: []int = []
+    for i in 0..nf { append(mut &fmts, r.i16()) }
+    let np = r.i16()
+    var raw: []Option[str] = []
+    var isBin: []bool = []
+    for i in 0..np {
+        let n = r.i32()
+        if n < 0 {
+            append(mut &raw, None)
+        } else {
+            append(mut &raw, Some(r.bytes(n)))
+        }
+        let f = if nf == 1 { fmts[0] } else if i < nf { fmts[i] } else { 0 }
+        append(mut &isBin, f == 1)
+    }
+    let nr = r.i16()
+    for i in 0..nr {
+        if r.i16() != 0 { return Err(lexdb_base.err("0A000", "lexdb: results in binary are not supported")) }
+    }
+    if r.bad { return Err(protoErr("invalid Bind message")) }
+    if !ps.stmts.has(&name) {
+        return Err(lexdb_base.err("26000", "prepared statement \"" + name + "\" does not exist"))
+    }
+    var vals: []Val = []
+    {
+    let p = ps.stmts.at(name)
+    var texts: []Option[str] = []
+    for i in 0..np {
+        match raw[i] {
+            Some(d) {
+                if isBin[i] {
+                    let oid = if i < len(p.ptypes) { p.ptypes[i] } else { lexdb_sql.OID_TEXT }
+                    append(mut &texts, Some(try binParam(&d, oid)))
+                } else {
+                    append(mut &texts, Some(d))
+                }
+            }
+            None { append(mut &texts, None) }
+        }
+    }
+    let need = if len(p.stmts) == 1 { p.stmts[0].params } else { 0 }
+    if np != need {
+        return Err(protoErr("bind message supplies " + np.toStr() + " parameters, but prepared statement \"" + name +
+                            "\" requires " + need.toStr()))
+    }
+    vals = try lexdb_exec.paramVals(&texts, &p.ptypes)
+    }
+    ps.portals.put(portal, Portal{stmt: name, params: vals})
+    w.empty('2')
+    return Ok(Unit{})
+}
+
+fn (w: mut &Wire) describeMsg(ps: mut &Ps, body: &str): Result[Unit, lexdb_base.DbErr] {
+    var r = Rd{s: body, at: 0, bad: false}
+    let kind = r.bytes(1)
+    let name = r.cstr()
+    if r.bad { return Err(protoErr("invalid Describe message")) }
+    var stmtName = name
+    if kind == "P" {
+        if !ps.portals.has(&name) { return Err(lexdb_base.err("34000", "portal \"" + name + "\" does not exist")) }
+        stmtName = ps.portals.at(name).stmt
+    }
+    if !ps.stmts.has(&stmtName) {
+        return Err(lexdb_base.err("26000", "prepared statement \"" + stmtName + "\" does not exist"))
+    }
+    let p = ps.stmts.at(stmtName)
+    if kind == "S" {
+        var b = newStrBuf()
+        binary.addU16BE(mut &b, len(p.ptypes))
+        for t in p.ptypes { binary.addU32BE(mut &b, t) }
+        w.msg('t', &b)
+    }
+    if len(p.stmts) == 0 || p.stmts[0].kind != lexdb_sql.S_SELECT {
+        w.empty('n')
+        return Ok(Unit{})
+    }
+    let cols = try lexdb_exec.describe(&w.st, &p.stmts[0], &p.ptypes)
+    w.rowDesc(&cols)
+    return Ok(Unit{})
+}
+
+fn (w: mut &Wire) executeMsg(ps: mut &Ps, body: &str): Result[Unit, lexdb_base.DbErr] {
+    var r = Rd{s: body, at: 0, bad: false}
+    let portal = r.cstr()
+    let maxRows = r.i32()
+    if r.bad { return Err(protoErr("invalid Execute message")) }
+    if !ps.portals.has(&portal) { return Err(lexdb_base.err("34000", "portal \"" + portal + "\" does not exist")) }
+    let po = ps.portals.at(portal)
+    let p = ps.stmts.at(po.stmt)
+    if len(p.stmts) == 0 {
+        w.empty('I')
+        return Ok(Unit{})
+    }
+    let res = try w.sess.run(&p.stmts[0], &po.params, &p.ptypes)
+    if res.hasRows { w.dataRows(&res.rows) }
+    w.complete(&res.tag)
+    return Ok(Unit{})
+}
+
+fn (w: mut &Wire) closeMsg(ps: mut &Ps, body: &str): Result[Unit, lexdb_base.DbErr] {
+    var r = Rd{s: body, at: 0, bad: false}
+    let kind = r.bytes(1)
+    let name = r.cstr()
+    if kind == "S" {
+        let gone = ps.stmts.remove(&name)
+    } else {
+        let gone = ps.portals.remove(&name)
+    }
+    w.empty('3')
+    return Ok(Unit{})
+}
+
+// ---- a connection
+
+fn startup(w: mut &Wire): Result[bool, io.IoError] {
+    while true {
+        match try w.readMsg(true) {
+            None { return Ok(false) }
+            Some(m) {
+                let code = if len(m.body) >= 4 { binary.readI32BEStr(&m.body, 0) } else { 0 }
+                if code == SSL_REQUEST || code == GSS_REQUEST {
+                    try w.c.writeStr("N")
+                    continue
+                }
+                if code == CANCEL_REQUEST { return Ok(false) }
+                if code != PROTOCOL_3 {
+                    w.error(&lexdb_base.err("0A000", "unsupported frontend protocol " + (code >> 16).toStr() + "." + (code & 0xFFFF).toStr()))
+                    try w.flush()
+                    return Ok(false)
+                }
+                var b = newStrBuf()
+                binary.addU32BE(mut &b, 0)
+                w.msg('R', &b)                       // AuthenticationOk
+                w.paramStatus("server_version", "16.0")
+                w.paramStatus("server_encoding", "UTF8")
+                w.paramStatus("client_encoding", "UTF8")
+                w.paramStatus("DateStyle", "ISO, MDY")
+                w.paramStatus("integer_datetimes", "on")
+                w.paramStatus("standard_conforming_strings", "on")
+                w.paramStatus("TimeZone", "UTC")
+                w.paramStatus("application_name", "")
+                var k = newStrBuf()
+                binary.addU32BE(mut &k, 1)
+                binary.addU32BE(mut &k, 0)
+                w.msg('K', &k)
+                w.ready()
+                try w.flush()
+                return Ok(true)
+            }
+        }
+    }
+    return Ok(false)
+}
+
+fn (w: mut &Wire) step(ps: mut &Ps, m: &Msg): Result[bool, io.IoError] {
+    let t = m.typ
+    if t == 'X' { return Ok(false) }
+    if t == 'S' {
+        w.skipping = false
+        w.ready()
+        try w.flush()
+        return Ok(true)
+    }
+    if t == 'H' {
+        try w.flush()
+        return Ok(true)
+    }
+    if t == 'Q' {
+        w.skipping = false
+        var r = Rd{s: m.body, at: 0, bad: false}
+        let sql = r.cstr()
+        try w.query(&sql)
+        return Ok(true)
+    }
+    if w.skipping { return Ok(true) }
+    var res: Result[Unit, lexdb_base.DbErr] = Ok(Unit{})
+    if t == 'P' { res = w.parseMsg(ps, &m.body) }
+    else if t == 'B' { res = w.bindMsg(ps, &m.body) }
+    else if t == 'D' { res = w.describeMsg(ps, &m.body) }
+    else if t == 'E' { res = w.executeMsg(ps, &m.body) }
+    else if t == 'C' { res = w.closeMsg(ps, &m.body) }
+    else { res = Err(protoErr("invalid frontend message type " + int(t).toStr())) }
+    match res {
+        Ok(_) {}
+        Err(e) {
+            w.error(&e)
+            w.skipping = true
+        }
+    }
+    if w.out.size() > 65536 { try w.flush() }
+    return Ok(true)
+}
+
+// Serves one client until it says goodbye or goes away.
+pub fn serve(a: ConnArg): int {
+    let ConnArg{conn: c, st: st, id: _} = move(a)
+    let nd = c.setNoDelay(true)
+    var w = Wire{c: c, inBuf: [], inPos: 0, out: newStrBuf(), sess: lexdb_exec.newSession(st), st: st,
+                 skipping: false}
+    var ps = Ps{stmts: newMap(), portals: newMap()}
+    if !startup(mut &w).unwrapOr(false) { return 0 }
+    while true {
+        let got = w.readMsg(false)
+        if got.isErr() { return 0 }
+        match got.unwrap() {
+            Some(m) {
+                if !w.step(mut &ps, &m).unwrapOr(false) { return 0 }
+            }
+            None { return 0 }
+        }
+    }
+    return 0
+}
+
+pub type AcceptArg = record { pub ln: net.Listener; pub st: lexdb_store.Store }
+
+// Accepts connections and serves each in a task of its own, until the task
+// running it is cancelled (which cancels the connections' tasks too).
+pub fn acceptLoop(a: AcceptArg): int {
+    let AcceptArg{ln: ln, st: st} = move(a)
+    var id = 0
+    task.scope(fn(s: mut &task.Scope) {
+        while true {
+            match ln.accept() {
+                Ok(c) {
+                    id += 1
+                    s.spawn(serve, ConnArg{conn: c, st: st, id: id})
+                }
+                Err(e) {
+                    if e.isCancelled() || e.isTimeout() { return }
+                    eprintln("lexdb: accept: " + e.toStr())
+                    let r = task.sleep(100)
+                    if r.isErr() { return }
+                }
+            }
+        }
+    })
+    return 0
+}

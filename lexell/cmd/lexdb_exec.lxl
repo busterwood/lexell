@@ -1,0 +1,1553 @@
+// lexdb: running statements (design/lexdb.md 4.2, 4.8). Tables, rows and
+// keys on the store's trees; the planner's rules; a session's transaction.
+//
+// The catalog is tree 1: table name -> its definition (its tree, columns,
+// primary key), read and written in the statement's transaction like any
+// row, so DDL is transactional. A row is one entry of its table's tree: the
+// key is the primary key's columns, encoded so that byte order is SQL
+// order; the value is every column.
+//
+// Plans are rules, not costs: an equality on every primary-key column is a
+// point lookup; equalities on a prefix of it, or a range on its next
+// column, are a range scan; anything else is a full scan. The whole WHERE
+// is then applied to each row the scan gives.
+import "binary"
+import "strings"
+import "collections"
+import "./lexdb_base"
+import "./lexdb_store"
+import "./lexdb_sql"
+
+pub const CATALOG = 1
+
+type Val = lexdb_sql.Val
+type Expr = lexdb_sql.Expr
+type DbErr = lexdb_base.DbErr
+
+fn e(state: str, msg: str): DbErr { return lexdb_base.err(state, msg) }
+
+pub type Table = record {
+    pub name: str
+    pub tree: int
+    pub cols: []lexdb_sql.ColDef
+    pub pk: []int
+}
+
+// A result column: its name and type OID.
+pub type OutCol = value record { pub name: str; pub oid: int }
+
+pub type Res = record {
+    pub cols: []OutCol
+    pub rows: [][]Val
+    pub tag: str
+    pub hasRows: bool       // a statement that returns rows (SELECT), even none
+}
+
+fn tagOnly(tag: str): Res { return Res{cols: [], rows: [], tag: tag, hasRows: false} }
+
+// ---- values
+
+// The text a client sees for a value (NULL is told apart by the caller).
+pub fn text(v: &Val): str {
+    match v {
+        Val.Null { return "" }
+        Val.Int(n) { return n.toStr() }
+        Val.Bool(b) { return if b { "t" } else { "f" } }
+        Val.Num(d) { return d.toStr() }
+        Val.Text(s) { return s }
+    }
+}
+
+pub fn isNull(v: &Val): bool {
+    match v {
+        Val.Null { return true }
+        else { return false }
+    }
+}
+
+fn kindName(t: &lexdb_sql.TypeName): str {
+    if t.kind == lexdb_sql.K_INT {
+        return if t.oid == lexdb_sql.OID_INT8 { "bigint" } else if t.oid == lexdb_sql.OID_INT2 { "smallint" } else { "integer" }
+    }
+    if t.kind == lexdb_sql.K_BOOL { return "boolean" }
+    if t.kind == lexdb_sql.K_NUM { return "numeric" }
+    return if t.oid == lexdb_sql.OID_VARCHAR { "character varying" } else { "text" }
+}
+
+fn badInput(t: &lexdb_sql.TypeName, s: &str): DbErr {
+    return e("22P02", "invalid input syntax for type " + kindName(t) + ": \"" + s + "\"")
+}
+
+fn parseBool(s: &str): Option[bool] {
+    let l = strings.toLowerAscii(strings.trim(s))
+    if l == "t" || l == "true" || l == "yes" || l == "on" || l == "1" || l == "y" { return Some(true) }
+    if l == "f" || l == "false" || l == "no" || l == "off" || l == "0" || l == "n" { return Some(false) }
+    return None
+}
+
+fn intDigits(d: &Decimal): int {
+    let s = d.abs().toStr()
+    let dot = strings.indexOf(&s, ".", 0)
+    let ip = if dot < 0 { s } else { s[0..dot] }
+    if ip == "0" { return 0 }
+    return len(ip)
+}
+
+fn intRange(t: &lexdb_sql.TypeName, n: int): Result[int, DbErr] {
+    if t.oid == lexdb_sql.OID_INT4 && (n < -2147483648 || n > 2147483647) { return Err(e("22003", "integer out of range")) }
+    if t.oid == lexdb_sql.OID_INT2 && (n < -32768 || n > 32767) { return Err(e("22003", "smallint out of range")) }
+    return Ok(n)
+}
+
+// A value made fit for a column of type t (an assignment's conversion).
+pub fn coerce(v: Val, t: &lexdb_sql.TypeName): Result[Val, DbErr] {
+    match v {
+        Val.Null { return Ok(Val.Null) }
+        else {}
+    }
+    if t.kind == lexdb_sql.K_INT {
+        match v {
+            Val.Int(n) { return Ok(Val.Int(try intRange(t, n))) }
+            Val.Num(d) {
+                match d.toInt(Rounding.HALF_AWAY) {
+                    Ok(n) { return Ok(Val.Int(try intRange(t, n))) }
+                    Err(_) { return Err(e("22003", kindName(t) + " out of range")) }
+                }
+            }
+            Val.Text(s) {
+                match strings.parseIntOpt(strings.trim(s)) {
+                    Some(n) { return Ok(Val.Int(try intRange(t, n))) }
+                    None { return Err(badInput(t, &s)) }
+                }
+            }
+            else {}
+        }
+    } else if t.kind == lexdb_sql.K_BOOL {
+        match v {
+            Val.Bool(b) { return Ok(Val.Bool(b)) }
+            Val.Text(s) {
+                match parseBool(&s) {
+                    Some(b) { return Ok(Val.Bool(b)) }
+                    None { return Err(badInput(t, &s)) }
+                }
+            }
+            else {}
+        }
+    } else if t.kind == lexdb_sql.K_NUM {
+        var d = Decimal.zero()
+        match v {
+            Val.Int(n) { d = Decimal.fromInt(n) }
+            Val.Num(x) { d = x }
+            Val.Text(s) {
+                match Decimal.parse(strings.trim(s)) {
+                    Ok(x) { d = x }
+                    Err(_) { return Err(badInput(t, &s)) }
+                }
+            }
+            else { return Err(e("42804", "column is of type numeric but expression is of type boolean")) }
+        }
+        if t.prec > 0 {
+            match d.quantize(t.scale, Rounding.HALF_AWAY) {
+                Ok(q) { d = q }
+                Err(_) { return Err(e("22003", "numeric field overflow")) }
+            }
+            if intDigits(&d) > t.prec - t.scale {
+                return Err(e("22003", "numeric field overflow: a field with precision " + t.prec.toStr() + ", scale " +
+                             t.scale.toStr() + " must round to an absolute value less than 10^" + (t.prec - t.scale).toStr()))
+            }
+        }
+        return Ok(Val.Num(d))
+    } else {
+        var s = ""
+        match v {
+            Val.Text(x) { s = x }
+            Val.Int(n) { s = n.toStr() }
+            Val.Num(d) { s = d.toStr() }
+            Val.Bool(b) { s = if b { "true" } else { "false" } }
+            else {}
+        }
+        if t.len > 0 && strings.runeCount(&s) > t.len {
+            return Err(e("22001", "value too long for type character varying(" + t.len.toStr() + ")"))
+        }
+        return Ok(Val.Text(s))
+    }
+    return Err(e("42804", "column is of type " + kindName(t) + " but the expression is of another type"))
+}
+
+fn kindOf(v: &Val): int {
+    match v {
+        Val.Null { return 0 }
+        Val.Int(_) { return lexdb_sql.K_INT }
+        Val.Bool(_) { return lexdb_sql.K_BOOL }
+        Val.Num(_) { return lexdb_sql.K_NUM }
+        Val.Text(_) { return lexdb_sql.K_TEXT }
+    }
+}
+
+fn asNum(v: &Val): Option[Decimal] {
+    match v {
+        Val.Int(n) { return Some(Decimal.fromInt(n)) }
+        Val.Num(d) { return Some(d) }
+        Val.Text(s) {
+            match Decimal.parse(strings.trim(s)) {
+                Ok(d) { return Some(d) }
+                Err(_) { return None }
+            }
+        }
+        else { return None }
+    }
+}
+
+// Compares two values that are not NULL; a text compared with a number or a
+// boolean is read as one (a parameter sent as text).
+fn compare(a: &Val, b: &Val): Result[int, DbErr] {
+    let ka = kindOf(a)
+    let kb = kindOf(b)
+    match a {
+        Val.Int(x) {
+            match b {
+                Val.Int(y) { return Ok(x.cmp(&y)) }
+                Val.Text(s) {
+                    match strings.parseIntOpt(strings.trim(s)) {
+                        Some(y) { return Ok(x.cmp(&y)) }
+                        None {}
+                    }
+                }
+                else {}
+            }
+        }
+        Val.Text(x) {
+            match b {
+                Val.Text(y) { return Ok(x.cmp(&y)) }
+                Val.Int(_) {
+                    let r = try compare(b, a)
+                    return Ok(-r)
+                }
+                Val.Bool(_) {
+                    let r = try compare(b, a)
+                    return Ok(-r)
+                }
+                Val.Num(_) {
+                    let r = try compare(b, a)
+                    return Ok(-r)
+                }
+                else {}
+            }
+        }
+        Val.Bool(x) {
+            let y = match b {
+                Val.Bool(v) { Some(v) }
+                Val.Text(s) { parseBool(&s) }
+                else { None }
+            }
+            match y {
+                Some(v) { return Ok(if x == v { 0 } else if !x { -1 } else { 1 }) }
+                None {}
+            }
+        }
+        else {}
+    }
+    if ka == lexdb_sql.K_NUM || kb == lexdb_sql.K_NUM {
+        match asNum(a) {
+            Some(x) {
+                match asNum(b) {
+                    Some(y) { return Ok(x.cmp(&y)) }
+                    None {}
+                }
+            }
+            None {}
+        }
+    }
+    return Err(e("42883", "operator does not exist: " + text(a) + " compared with " + text(b)))
+}
+
+fn decErr(): DbErr { return e("22003", "numeric value out of range") }
+
+fn arith(op: &str, a: &Val, b: &Val): Result[Val, DbErr] {
+    if isNull(a) || isNull(b) { return Ok(Val.Null) }
+    var x = 0
+    var y = 0
+    var ints = false
+    match a {
+        Val.Int(n) {
+            match b {
+                Val.Int(m) {
+                    x = n
+                    y = m
+                    ints = true
+                }
+                Val.Text(s) {
+                    match strings.parseIntOpt(strings.trim(s)) {
+                        Some(m) {
+                            x = n
+                            y = m
+                            ints = true
+                        }
+                        None {}
+                    }
+                }
+                else {}
+            }
+        }
+        Val.Text(s) {
+            match b {
+                Val.Int(m) {
+                    match strings.parseIntOpt(strings.trim(s)) {
+                        Some(n) {
+                            x = n
+                            y = m
+                            ints = true
+                        }
+                        None {}
+                    }
+                }
+                else {}
+            }
+        }
+        else {}
+    }
+    if ints {
+        var r: Option[int] = None
+        match op {
+            "+" { r = x.checkedAdd(y) }
+            "-" { r = x.checkedSub(y) }
+            "*" { r = x.checkedMul(y) }
+            "/" {
+                if y == 0 { return Err(e("22012", "division by zero")) }
+                r = x.checkedDiv(y)
+            }
+            "%" {
+                if y == 0 { return Err(e("22012", "division by zero")) }
+                r = x.checkedRem(y)
+            }
+            else {}
+        }
+        match r {
+            Some(v) { return Ok(Val.Int(v)) }
+            None { return Err(e("22003", "bigint out of range")) }
+        }
+    }
+    let da = asNum(a)
+    let db = asNum(b)
+    if da.isNone() || db.isNone() {
+        return Err(e("42883", "operator does not exist: " + text(a) + " " + op + " " + text(b)))
+    }
+    let p = da.unwrap()
+    let q = db.unwrap()
+    var r: Result[Decimal, DecError] = Ok(Decimal.zero())
+    match op {
+        "+" { r = p.addExact(q) }
+        "-" { r = p.subExact(q) }
+        "*" { r = p.mulExact(q) }
+        "/" {
+            if q.isZero() { return Err(e("22012", "division by zero")) }
+            var sc = 16
+            if p.scale() > sc { sc = p.scale() }
+            if q.scale() > sc { sc = q.scale() }
+            r = p.div(q, sc, Rounding.HALF_EVEN)
+        }
+        "%" {
+            if q.isZero() { return Err(e("22012", "division by zero")) }
+            r = p.remExact(q)
+        }
+        else {}
+    }
+    match r {
+        Ok(v) { return Ok(Val.Num(v)) }
+        Err(_) { return Err(decErr()) }
+    }
+}
+
+fn truth(v: &Val): Option[bool] {
+    match v {
+        Val.Bool(b) { return Some(b) }
+        Val.Text(s) { return parseBool(&s) }
+        else { return None }
+    }
+}
+
+fn isAgg(name: &str): bool { return name == "count" || name == "sum" || name == "min" || name == "max" || name == "avg" }
+
+pub fn hasAgg(x: &Expr): bool {
+    match x {
+        Expr.Call(name, args, _) {
+            if isAgg(&name) { return true }
+            for a in args { if hasAgg(&a) { return true } }
+            return false
+        }
+        Expr.Unary(_, a) { return hasAgg(&a) }
+        Expr.Bin(_, a, b) { return hasAgg(&a) || hasAgg(&b) }
+        Expr.IsNull(a, _) { return hasAgg(&a) }
+        Expr.Cast(a, _) { return hasAgg(&a) }
+        else { return false }
+    }
+}
+
+// What an expression is evaluated against: the table's columns, a row, the
+// rows of its group (for aggregates; agg false outside them) and the
+// statement's parameters.
+pub type Env = value record {
+    cols: &[]lexdb_sql.ColDef
+    row: &[]Val
+    group: &[][]Val
+    agg: bool
+    params: &[]Val
+}
+
+fn colIndex(cols: &[]lexdb_sql.ColDef, name: &str): int {
+    for i in 0..len(cols) { if cols[i].name == name { return i } }
+    return -1
+}
+
+pub fn eval(x: &Expr, env: &Env): Result[Val, DbErr] {
+    match x {
+        Expr.Lit(v) { return Ok(v) }
+        Expr.Param(n) {
+            if n > len(env.params) { return Err(e("08P01", "there is no parameter $" + n.toStr())) }
+            return Ok(env.params[n - 1])
+        }
+        Expr.Col(name) {
+            let i = colIndex(&env.cols, &name)
+            if i < 0 { return Err(e("42703", "column \"" + name + "\" does not exist")) }
+            if len(env.row) == 0 { return Ok(Val.Null) }
+            return Ok(env.row[i])
+        }
+        Expr.Unary(op, a) {
+            let v = try eval(&a, env)
+            if op == "-" {
+                match v {
+                    Val.Null { return Ok(Val.Null) }
+                    Val.Int(n) {
+                        match (0).checkedSub(n) {
+                            Some(m) { return Ok(Val.Int(m)) }
+                            None { return Err(e("22003", "bigint out of range")) }
+                        }
+                    }
+                    Val.Num(d) { return Ok(Val.Num(d.neg())) }
+                    else { return arith(&"-", &Val.Int(0), &v) }
+                }
+            }
+            if isNull(&v) { return Ok(Val.Null) }
+            match truth(&v) {
+                Some(b) { return Ok(Val.Bool(!b)) }
+                None { return Err(e("42804", "argument of NOT must be type boolean")) }
+            }
+        }
+        Expr.Bin(op, a, b) {
+            if op == "and" || op == "or" {
+                let l = truth(&(try eval(&a, env)))
+                if op == "and" && l == Some(false) { return Ok(Val.Bool(false)) }
+                if op == "or" && l == Some(true) { return Ok(Val.Bool(true)) }
+                let r = truth(&(try eval(&b, env)))
+                if op == "and" {
+                    if r == Some(false) { return Ok(Val.Bool(false)) }
+                    if l.isNone() || r.isNone() { return Ok(Val.Null) }
+                    return Ok(Val.Bool(true))
+                }
+                if r == Some(true) { return Ok(Val.Bool(true)) }
+                if l.isNone() || r.isNone() { return Ok(Val.Null) }
+                return Ok(Val.Bool(false))
+            }
+            let l = try eval(&a, env)
+            let r = try eval(&b, env)
+            if op == "||" {
+                if isNull(&l) || isNull(&r) { return Ok(Val.Null) }
+                return Ok(Val.Text(text(&l) + text(&r)))
+            }
+            if op == "=" || op == "<>" || op == "<" || op == "<=" || op == ">" || op == ">=" {
+                if isNull(&l) || isNull(&r) { return Ok(Val.Null) }
+                let c = try compare(&l, &r)
+                let t = match op {
+                    "=" { c == 0 }
+                    "<>" { c != 0 }
+                    "<" { c < 0 }
+                    "<=" { c <= 0 }
+                    ">" { c > 0 }
+                    else { c >= 0 }
+                }
+                return Ok(Val.Bool(t))
+            }
+            return arith(&op, &l, &r)
+        }
+        Expr.IsNull(a, neg) {
+            let v = try eval(&a, env)
+            return Ok(Val.Bool(isNull(&v) != neg))
+        }
+        Expr.Cast(a, t) {
+            let v = try eval(&a, env)
+            return coerce(v, &t)
+        }
+        Expr.Call(name, args, star) {
+            if isAgg(&name) {
+                if !env.agg { return Err(e("42803", "aggregate functions are not allowed here")) }
+                return aggregate(&name, &args, star, env)
+            }
+            var vs: []Val = []
+            for a in args { append(mut &vs, try eval(&a, env)) }
+            return call(&name, &vs)
+        }
+    }
+}
+
+fn aggregate(name: &str, args: &[]Expr, star: bool, env: &Env): Result[Val, DbErr] {
+    if name == "count" && star { return Ok(Val.Int(len(env.group))) }
+    if len(args) != 1 { return Err(e("42883", "function " + name + " takes one argument")) }
+    var count = 0
+    var acc = Val.Null
+    let none: [][]Val = []
+    for r in env.group {
+        let sub = Env{cols: env.cols, row: r, group: &none, agg: false, params: env.params}
+        let v = try eval(&args[0], &sub)
+        if isNull(&v) { continue }
+        count += 1
+        if isNull(&acc) {
+            acc = v
+            continue
+        }
+        if name == "sum" || name == "avg" {
+            acc = try arith(&"+", &acc, &v)
+        } else if name == "min" {
+            if (try compare(&v, &acc)) < 0 { acc = v }
+        } else if name == "max" {
+            if (try compare(&v, &acc)) > 0 { acc = v }
+        }
+    }
+    if name == "count" { return Ok(Val.Int(count)) }
+    if name == "avg" {
+        if count == 0 { return Ok(Val.Null) }
+        let q = try arith(&"/", &Val.Num(asNum(&acc).unwrap()), &Val.Num(Decimal.fromInt(count)))
+        return Ok(q)
+    }
+    return Ok(acc)
+}
+
+fn call(name: &str, vs: &[]Val): Result[Val, DbErr] {
+    let n = len(vs)
+    if name == "coalesce" {
+        for v in vs { if !isNull(&v) { return Ok(v) } }
+        return Ok(Val.Null)
+    }
+    if name == "version" && n == 0 { return Ok(Val.Text("PostgreSQL 16.0 (lexdb 0.1)")) }
+    if name == "current_database" && n == 0 { return Ok(Val.Text("lexdb")) }
+    if n == 1 {
+        let v = vs[0]
+        if isNull(&v) { return Ok(Val.Null) }
+        match name {
+            "lower" { return Ok(Val.Text(strings.toLowerAscii(text(&v)))) }
+            "upper" { return Ok(Val.Text(strings.toUpperAscii(text(&v)))) }
+            "length", "char_length" { return Ok(Val.Int(strings.runeCount(&text(&v)))) }
+            "abs" {
+                match v {
+                    Val.Int(x) { return Ok(Val.Int(if x < 0 { try arithInt(0, x) } else { x })) }
+                    Val.Num(d) { return Ok(Val.Num(d.abs())) }
+                    else {}
+                }
+            }
+            "round" {
+                match asNum(&v) {
+                    Some(d) {
+                        match d.roundAway(0) {
+                            Ok(r) { return Ok(Val.Num(r)) }
+                            Err(_) { return Err(decErr()) }
+                        }
+                    }
+                    None {}
+                }
+            }
+            else {}
+        }
+    }
+    if n == 2 && name == "round" {
+        match asNum(&vs[0]) {
+            Some(d) {
+                match vs[1] {
+                    Val.Int(s) {
+                        match d.roundAway(s) {
+                            Ok(r) { return Ok(Val.Num(r)) }
+                            Err(_) { return Err(decErr()) }
+                        }
+                    }
+                    else {}
+                }
+            }
+            None {}
+        }
+    }
+    return Err(e("42883", "function " + name + " with " + n.toStr() + " arguments does not exist"))
+}
+
+fn arithInt(a: int, b: int): Result[int, DbErr] {
+    match a.checkedSub(b) {
+        Some(v) { return Ok(v) }
+        None { return Err(e("22003", "bigint out of range")) }
+    }
+}
+
+// ---- keys and rows
+
+fn encKeyPart(b: mut &StrBuf, v: &Val) {
+    match v {
+        Val.Int(n) { binary.addU64BE(b, n ^ (-9223372036854775807 - 1)) }
+        Val.Bool(x) { b.addByte(if x { 1 } else { 0 }) }
+        Val.Text(s) {
+            for i in 0..len(s) {
+                b.addByte(s[i])
+                if s[i] == 0 { b.addByte(0xFF) }
+            }
+            b.addByte(0)
+            b.addByte(0)
+        }
+        else {}
+    }
+}
+
+// The key of a row: its primary key's values, in byte order = SQL order.
+fn keyOf(t: &Table, row: &[]Val): str {
+    var b = newStrBuf()
+    for i in t.pk { encKeyPart(mut &b, &row[i]) }
+    return b.toStr()
+}
+
+// The smallest string after every string that starts with s ("" when there
+// is none: the end of the tree).
+fn succ(s: &str): str {
+    var bs = strToBytes(s)
+    while len(bs) > 0 && bs[len(bs) - 1] == 0xFF { let x = pop(mut &bs) }
+    if len(bs) == 0 { return "" }
+    bs[len(bs) - 1] = bs[len(bs) - 1] + 1
+    return strFromBytes(&bs)
+}
+
+fn encRow(row: &[]Val): str {
+    var b = newStrBuf()
+    for v in row {
+        match v {
+            Val.Null { b.addByte(0) }
+            Val.Int(n) {
+                b.addByte(1)
+                binary.addU64LE(mut &b, n)
+            }
+            Val.Bool(x) {
+                b.addByte(2)
+                b.addByte(if x { 1 } else { 0 })
+            }
+            Val.Num(d) {
+                b.addByte(3)
+                let s = d.toStr()
+                binary.addU32LE(mut &b, len(s))
+                b.add(s)
+            }
+            Val.Text(s) {
+                b.addByte(4)
+                binary.addU32LE(mut &b, len(s))
+                b.add(s)
+            }
+        }
+    }
+    return b.toStr()
+}
+
+fn decRow(s: &str, n: int): Result[[]Val, DbErr] {
+    var out: []Val = []
+    var at = 0
+    for i in 0..n {
+        if at >= len(s) {
+            append(mut &out, Val.Null)       // a column added after the row was written
+            continue
+        }
+        let tag = s[at]
+        at += 1
+        if tag == 0 {
+            append(mut &out, Val.Null)
+        } else if tag == 1 {
+            append(mut &out, Val.Int(binary.readI64LEStr(s, at)))
+            at += 8
+        } else if tag == 2 {
+            append(mut &out, Val.Bool(s[at] == 1))
+            at += 1
+        } else if tag == 3 || tag == 4 {
+            let l = binary.readU32LEStr(s, at)
+            let t = s[at + 4..at + 4 + l]
+            at += 4 + l
+            if tag == 4 {
+                append(mut &out, Val.Text(t))
+            } else {
+                match Decimal.parse(t) {
+                    Ok(d) { append(mut &out, Val.Num(d)) }
+                    Err(_) { return Err(lexdb_base.corrupt("a numeric value in a row")) }
+                }
+            }
+        } else {
+            return Err(lexdb_base.corrupt("a row's value tag"))
+        }
+    }
+    return Ok(out)
+}
+
+// ---- the catalog
+
+fn encTable(t: &Table): str {
+    var b = newStrBuf()
+    binary.addU32LE(mut &b, t.tree)
+    binary.addU32LE(mut &b, len(t.cols))
+    for c in t.cols {
+        binary.addU32LE(mut &b, len(c.name))
+        b.add(c.name)
+        binary.addU32LE(mut &b, c.typ.kind)
+        binary.addU32LE(mut &b, c.typ.oid)
+        binary.addU32LE(mut &b, c.typ.prec)
+        binary.addU32LE(mut &b, c.typ.scale)
+        binary.addU32LE(mut &b, c.typ.len)
+        b.addByte(if c.notNull { 1 } else { 0 })
+    }
+    binary.addU32LE(mut &b, len(t.pk))
+    for i in t.pk { binary.addU32LE(mut &b, i) }
+    return b.toStr()
+}
+
+fn decTable(name: str, s: &str): Table {
+    var t = Table{name: name, tree: binary.readU32LEStr(s, 0), cols: [], pk: []}
+    let n = binary.readU32LEStr(s, 4)
+    var at = 8
+    for i in 0..n {
+        let l = binary.readU32LEStr(s, at)
+        let cn = s[at + 4..at + 4 + l]
+        at += 4 + l
+        let ty = lexdb_sql.TypeName{kind: binary.readU32LEStr(s, at), oid: binary.readU32LEStr(s, at + 4),
+                                    prec: binary.readU32LEStr(s, at + 8), scale: binary.readU32LEStr(s, at + 12),
+                                    len: binary.readU32LEStr(s, at + 16)}
+        at += 20
+        append(mut &t.cols, lexdb_sql.ColDef{name: cn, typ: ty, notNull: s[at] == 1})
+        at += 1
+    }
+    let k = binary.readU32LEStr(s, at)
+    at += 4
+    for i in 0..k {
+        append(mut &t.pk, binary.readU32LEStr(s, at))
+        at += 4
+    }
+    return t
+}
+
+fn findTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, name: &str): Result[Option[Table], DbErr] {
+    match try st.get(txn, CATALOG, name) {
+        Some(s) { return Ok(Some(decTable(name, &s))) }
+        None { return Ok(None) }
+    }
+}
+
+fn needTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, name: &str): Result[Table, DbErr] {
+    match try findTable(st, txn, name) {
+        Some(t) { return Ok(t) }
+        None { return Err(e("42P01", "relation \"" + name + "\" does not exist")) }
+    }
+}
+
+// Makes the catalog when the store is new.
+pub fn bootstrap(st: &lexdb_store.Store): Result[Unit, DbErr] {
+    for id in st.trees() { if id == CATALOG { return Ok(Unit{}) } }
+    var t = lexdb_store.begin()
+    let id = st.createTree(mut &t)
+    if id != CATALOG { return Err(lexdb_base.corrupt("the store has trees but no catalog")) }
+    return st.commit(t)
+}
+
+// ---- planning a scan
+
+type Scan = record {
+    point: bool         // one key
+    lo: str             // the range [lo, hi); hi "" for the end
+    hi: str
+}
+
+fn conjuncts(x: &Expr, out: mut &[]Expr) {
+    match x {
+        Expr.Bin(op, a, b) {
+            if op == "and" {
+                conjuncts(&a, out)
+                conjuncts(&b, out)
+                return
+            }
+        }
+        else {}
+    }
+    append(out, clone(x))
+}
+
+fn cloneAll(xs: &[]Expr): []Expr {
+    var out: []Expr = []
+    for x in xs { append(mut &out, clone(&x)) }
+    return out
+}
+
+// A copy of an expression (Expr is boxed and owned).
+pub fn clone(x: &Expr): Expr {
+    match x {
+        Expr.Lit(v) { return Expr.Lit(v) }
+        Expr.Param(n) { return Expr.Param(n) }
+        Expr.Col(n) { return Expr.Col(n) }
+        Expr.Unary(op, a) { return Expr.Unary(op, clone(&a)) }
+        Expr.Bin(op, a, b) { return Expr.Bin(op, clone(&a), clone(&b)) }
+        Expr.IsNull(a, neg) { return Expr.IsNull(clone(&a), neg) }
+        Expr.Call(n, args, star) { return Expr.Call(n, cloneAll(&args), star) }
+        Expr.Cast(a, t) { return Expr.Cast(clone(&a), t) }
+    }
+}
+
+fn usesCols(x: &Expr): bool {
+    match x {
+        Expr.Col(_) { return true }
+        Expr.Unary(_, a) { return usesCols(&a) }
+        Expr.Bin(_, a, b) { return usesCols(&a) || usesCols(&b) }
+        Expr.IsNull(a, _) { return usesCols(&a) }
+        Expr.Cast(a, _) { return usesCols(&a) }
+        Expr.Call(_, args, _) {
+            for a in args { if usesCols(&a) { return true } }
+            return false
+        }
+        else { return false }
+    }
+}
+
+// A conjunct "col op constant" (or "constant op col", turned round): the
+// operator and the constant.
+type Bound = record { op: str; val: Expr }
+
+fn bounds(cs: &[]Expr, col: &str): []Bound {
+    var out: []Bound = []
+    for c in cs {
+        match c {
+            Expr.Bin(op, a, b) {
+                if op == "=" || op == "<" || op == "<=" || op == ">" || op == ">=" {
+                    match a {
+                        Expr.Col(n) {
+                            if n == col && !usesCols(&b) { append(mut &out, Bound{op: op, val: clone(&b)}) }
+                        }
+                        else {
+                            match b {
+                                Expr.Col(n) {
+                                    if n == col && !usesCols(&a) {
+                                        let flip = match op { "<" { ">" } "<=" { ">=" } ">" { "<" } ">=" { "<=" } else { "=" } }
+                                        append(mut &out, Bound{op: flip, val: clone(&a)})
+                                    }
+                                }
+                                else {}
+                            }
+                        }
+                    }
+                }
+            }
+            else {}
+        }
+    }
+    return out
+}
+
+fn planScan(t: &Table, where: &Option[Expr], env: &Env): Result[Scan, DbErr] {
+    var full = Scan{point: false, lo: "", hi: ""}
+    var cs: []Expr = []
+    match where {
+        Some(w) { conjuncts(&w, mut &cs) }
+        None { return Ok(full) }
+    }
+    var prefix = newStrBuf()
+    var eqs = 0
+    for k in 0..len(t.pk) {
+        let col = &t.cols[t.pk[k]]
+        let bs = bounds(&cs, &col.name)
+        var found = false
+        for b in bs {
+            if b.op == "=" {
+                let v = try coerce(try eval(&b.val, env), &col.typ)
+                if isNull(&v) { return Ok(full) }
+                encKeyPart(mut &prefix, &v)
+                found = true
+                break
+            }
+        }
+        if !found {
+            // a range on this column
+            var lo = prefix.toStr()
+            var hi = if eqs > 0 { succ(&prefix.toStr()) } else { "" }
+            var ranged = false
+            for b in bs {
+                let v = try coerce(try eval(&b.val, env), &col.typ)
+                if isNull(&v) { return Ok(full) }
+                var kb = newStrBuf()
+                kb.add(prefix.toStr())
+                encKeyPart(mut &kb, &v)
+                let kv = kb.toStr()
+                if (b.op == ">" || b.op == ">=") && kv > lo {
+                    lo = kv
+                    ranged = true
+                }
+                if b.op == "<" && (hi == "" || kv < hi) {
+                    hi = kv
+                    ranged = true
+                }
+                if b.op == "<=" {
+                    let s = succ(&kv)
+                    if hi == "" || (s != "" && s < hi) {
+                        hi = s
+                        ranged = true
+                    }
+                }
+            }
+            if eqs == 0 && !ranged { return Ok(full) }
+            return Ok(Scan{point: false, lo: lo, hi: hi})
+        }
+        eqs += 1
+    }
+    let key = prefix.toStr()
+    return Ok(Scan{point: true, lo: key, hi: succ(&key)})
+}
+
+// Calls f on each row of t that the WHERE keeps (with its key), in key
+// order, while f gives true.
+fn rows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, where: &Option[Expr], params: &[]Val,
+        f: &fn(&str, []Val): Result[bool, DbErr]): Result[Unit, DbErr] {
+    let noRow: []Val = []
+    let noGroup: [][]Val = []
+    let env0 = Env{cols: &t.cols, row: &noRow, group: &noGroup, agg: false, params: params}
+    let sc = try planScan(t, where, &env0)
+    var bad: []DbErr = []
+    let n = len(t.cols)
+    var res: Result[Unit, DbErr] = Ok(Unit{})
+    {
+        let visit = fn(key: &str, val: &str): bool {
+            match decRow(val, n) {
+                Ok(row) {
+                    match where {
+                        Some(w) {
+                            var keep = false
+                            {
+                                let env = Env{cols: &t.cols, row: &row, group: &noGroup, agg: false, params: params}
+                                match eval(&w, &env) {
+                                    Ok(v) { keep = truth(&v) == Some(true) }
+                                    Err(x) {
+                                        append(mut &bad, x)
+                                        return false
+                                    }
+                                }
+                            }
+                            if !keep { return true }
+                            match f(key, row) {
+                                Ok(more) { return more }
+                                Err(x) {
+                                    append(mut &bad, x)
+                                    return false
+                                }
+                            }
+                        }
+                        None {
+                            match f(key, row) {
+                                Ok(more) { return more }
+                                Err(x) {
+                                    append(mut &bad, x)
+                                    return false
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(x) {
+                    append(mut &bad, x)
+                    return false
+                }
+            }
+        }
+        if sc.point {
+            match try st.get(txn, t.tree, sc.lo) {
+                Some(v) { let more = visit(&sc.lo, &v) }
+                None {}
+            }
+        } else {
+            res = st.scan(txn, t.tree, sc.lo, sc.hi, fn(en: &lexdb_store.Entry): bool { return visit(&en.key, &en.val) })
+        }
+    }
+    try res
+    if len(bad) > 0 { return Err(bad[0]) }
+    return Ok(Unit{})
+}
+
+// ---- statements
+
+fn createTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
+    match try findTable(st, txn, &s.table) {
+        Some(_) {
+            if s.ifFlag { return Ok(tagOnly("CREATE TABLE")) }
+            return Err(e("42P07", "relation \"" + s.table + "\" already exists"))
+        }
+        None {}
+    }
+    if len(s.pk) == 0 {
+        return Err(e("42P16", "lexdb: table \"" + s.table + "\" needs a PRIMARY KEY"))
+    }
+    var t = Table{name: s.table, tree: 0, cols: [], pk: []}
+    for c in s.cols {
+        if colIndex(&t.cols, &c.name) >= 0 { return Err(e("42701", "column \"" + c.name + "\" specified more than once")) }
+        append(mut &t.cols, lexdb_sql.ColDef{name: c.name, typ: c.typ, notNull: c.notNull})
+    }
+    for p in s.pk {
+        let i = colIndex(&t.cols, &p)
+        if i < 0 { return Err(e("42703", "column \"" + p + "\" named in key does not exist")) }
+        if t.cols[i].typ.kind == lexdb_sql.K_NUM {
+            return Err(e("0A000", "lexdb: a numeric primary key column is not supported yet (\"" + p + "\")"))
+        }
+        t.cols[i].notNull = true
+        append(mut &t.pk, i)
+    }
+    if len(t.pk) > 1 {
+        for a in 0..len(t.pk) {
+            for b in a + 1..len(t.pk) {
+                if t.pk[a] == t.pk[b] { return Err(e("42701", "column appears twice in primary key")) }
+            }
+        }
+    }
+    t.tree = st.createTree(txn)
+    try txn.put(CATALOG, s.table, encTable(&t))
+    return Ok(tagOnly("CREATE TABLE"))
+}
+
+fn dropTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
+    match try findTable(st, txn, &s.table) {
+        Some(t) {
+            txn.dropTree(t.tree)
+            txn.del(CATALOG, s.table)
+            return Ok(tagOnly("DROP TABLE"))
+        }
+        None {
+            if s.ifFlag { return Ok(tagOnly("DROP TABLE")) }
+            return Err(e("42P01", "table \"" + s.table + "\" does not exist"))
+        }
+    }
+}
+
+fn checkRow(t: &Table, row: &[]Val): Result[Unit, DbErr] {
+    for i in 0..len(t.cols) {
+        if t.cols[i].notNull && isNull(&row[i]) {
+            return Err(e("23502", "null value in column \"" + t.cols[i].name + "\" of relation \"" + t.name +
+                         "\" violates not-null constraint"))
+        }
+    }
+    return Ok(Unit{})
+}
+
+fn dupKey(t: &Table, row: &[]Val): DbErr {
+    var names: []str = []
+    var vals: []str = []
+    for i in t.pk {
+        append(mut &names, t.cols[i].name)
+        append(mut &vals, text(&row[i]))
+    }
+    return e("23505", "duplicate key value violates unique constraint \"" + t.name + "_pkey\": Key (" +
+             strings.join(&names, ", ") + ")=(" + strings.join(&vals, ", ") + ") already exists.")
+}
+
+fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val): Result[Res, DbErr] {
+    let t = try needTable(st, txn, &s.table)
+    var targets: []int = []
+    if len(s.names) == 0 {
+        for i in 0..len(t.cols) { append(mut &targets, i) }
+    } else {
+        for n in s.names {
+            let i = colIndex(&t.cols, &n)
+            if i < 0 { return Err(e("42703", "column \"" + n + "\" of relation \"" + t.name + "\" does not exist")) }
+            append(mut &targets, i)
+        }
+    }
+    let noCols: []lexdb_sql.ColDef = []
+    let noRow: []Val = []
+    let noGroup: [][]Val = []
+    let env = Env{cols: &noCols, row: &noRow, group: &noGroup, agg: false, params: params}
+    var count = 0
+    for r in s.rows {
+        if len(r) > len(targets) { return Err(e("42601", "INSERT has more expressions than target columns")) }
+        var row: []Val = array(len(t.cols), Val.Null)
+        for k in 0..len(r) {
+            let ci = targets[k]
+            row[ci] = try coerce(try eval(&r[k], &env), &t.cols[ci].typ)
+        }
+        try checkRow(&t, &row)
+        let key = keyOf(&t, &row)
+        if (try st.get(txn, t.tree, key)).isSome() { return Err(dupKey(&t, &row)) }
+        try txn.put(t.tree, key, encRow(&row))
+        count += 1
+    }
+    return Ok(tagOnly("INSERT 0 " + count.toStr()))
+}
+
+type Found = record { key: str; row: []Val }
+
+fn update(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val): Result[Res, DbErr] {
+    let t = try needTable(st, txn, &s.table)
+    var targets: []int = []
+    for set in s.sets {
+        let i = colIndex(&t.cols, &set.col)
+        if i < 0 { return Err(e("42703", "column \"" + set.col + "\" of relation \"" + t.name + "\" does not exist")) }
+        append(mut &targets, i)
+    }
+    var found: []Found = []
+    try rows(st, txn, &t, &s.where, params, fn(k: &str, r: []Val): Result[bool, DbErr] {
+        append(mut &found, Found{key: k, row: r})
+        return Ok(true)
+    })
+    let noGroup: [][]Val = []
+    for f in found {
+        let env = Env{cols: &t.cols, row: &f.row, group: &noGroup, agg: false, params: params}
+        var row: []Val = []
+        for v in f.row { append(mut &row, v) }
+        for k in 0..len(s.sets) {
+            row[targets[k]] = try coerce(try eval(&s.sets[k].expr, &env), &t.cols[targets[k]].typ)
+        }
+        try checkRow(&t, &row)
+        let key = keyOf(&t, &row)
+        if key != f.key {
+            if (try st.get(txn, t.tree, key)).isSome() { return Err(dupKey(&t, &row)) }
+            txn.del(t.tree, f.key)
+        }
+        try txn.put(t.tree, key, encRow(&row))
+    }
+    return Ok(tagOnly("UPDATE " + len(found).toStr()))
+}
+
+fn delete(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val): Result[Res, DbErr] {
+    let t = try needTable(st, txn, &s.table)
+    var keys: []str = []
+    try rows(st, txn, &t, &s.where, params, fn(k: &str, r: []Val): Result[bool, DbErr] {
+        append(mut &keys, k)
+        return Ok(true)
+    })
+    for k in keys { txn.del(t.tree, k) }
+    return Ok(tagOnly("DELETE " + len(keys).toStr()))
+}
+
+// ---- SELECT
+
+fn exprName(x: &Expr): str {
+    match x {
+        Expr.Col(n) { return n }
+        Expr.Call(n, _, _) { return n }
+        Expr.Cast(a, t) {
+            let inner = exprName(&a)
+            return if inner == "?column?" { kindName(&t) } else { inner }
+        }
+        else { return "?column?" }
+    }
+}
+
+// The type OID of an expression, as far as it can be told before running.
+pub fn exprOid(x: &Expr, cols: &[]lexdb_sql.ColDef, ptypes: &[]int): int {
+    match x {
+        Expr.Lit(v) {
+            match v {
+                Val.Int(n) { return if n >= -2147483648 && n <= 2147483647 { lexdb_sql.OID_INT4 } else { lexdb_sql.OID_INT8 } }
+                Val.Bool(_) { return lexdb_sql.OID_BOOL }
+                Val.Num(_) { return lexdb_sql.OID_NUMERIC }
+                else { return lexdb_sql.OID_TEXT }
+            }
+        }
+        Expr.Param(n) {
+            if n <= len(ptypes) && ptypes[n - 1] != 0 { return ptypes[n - 1] }
+            return lexdb_sql.OID_TEXT
+        }
+        Expr.Col(n) {
+            let i = colIndex(cols, &n)
+            return if i >= 0 { cols[i].typ.oid } else { lexdb_sql.OID_TEXT }
+        }
+        Expr.Unary(op, a) { return if op == "not" { lexdb_sql.OID_BOOL } else { exprOid(&a, cols, ptypes) } }
+        Expr.Bin(op, a, b) {
+            if op == "||" { return lexdb_sql.OID_TEXT }
+            if op == "+" || op == "-" || op == "*" || op == "/" || op == "%" {
+                let l = exprOid(&a, cols, ptypes)
+                let r = exprOid(&b, cols, ptypes)
+                if l == lexdb_sql.OID_NUMERIC || r == lexdb_sql.OID_NUMERIC { return lexdb_sql.OID_NUMERIC }
+                if l == lexdb_sql.OID_INT8 || r == lexdb_sql.OID_INT8 { return lexdb_sql.OID_INT8 }
+                return lexdb_sql.OID_INT4
+            }
+            return lexdb_sql.OID_BOOL
+        }
+        Expr.IsNull(_, _) { return lexdb_sql.OID_BOOL }
+        Expr.Cast(_, t) { return t.oid }
+        Expr.Call(n, args, _) {
+            match n {
+                "count" { return lexdb_sql.OID_INT8 }
+                "avg" { return lexdb_sql.OID_NUMERIC }
+                "sum" {
+                    let a = if len(args) > 0 { exprOid(&args[0], cols, ptypes) } else { lexdb_sql.OID_INT8 }
+                    return if a == lexdb_sql.OID_NUMERIC { lexdb_sql.OID_NUMERIC } else { lexdb_sql.OID_INT8 }
+                }
+                "min", "max", "abs", "coalesce" {
+                    return if len(args) > 0 { exprOid(&args[0], cols, ptypes) } else { lexdb_sql.OID_TEXT }
+                }
+                "length", "char_length" { return lexdb_sql.OID_INT4 }
+                "round" { return lexdb_sql.OID_NUMERIC }
+                else { return lexdb_sql.OID_TEXT }
+            }
+        }
+    }
+}
+
+// The output columns of a SELECT: (name, OID), and the expressions behind
+// them (* expanded).
+fn selectCols(s: &lexdb_sql.Stmt, cols: &[]lexdb_sql.ColDef, ptypes: &[]int, exprs: mut &[]Expr): Result[[]OutCol, DbErr] {
+    var out: []OutCol = []
+    for it in s.items {
+        if it.star {
+            if len(cols) == 0 && s.table == "" { return Err(e("42601", "SELECT * with no tables specified is not valid")) }
+            for c in cols {
+                append(mut &out, OutCol{name: c.name, oid: c.typ.oid})
+                append(exprs, Expr.Col(c.name))
+            }
+            continue
+        }
+        match it.expr {
+            Some(x) {
+                let name = if it.alias != "" { it.alias } else { exprName(&x) }
+                append(mut &out, OutCol{name: name, oid: exprOid(&x, cols, ptypes)})
+                append(exprs, clone(&x))
+            }
+            None {}
+        }
+    }
+    return Ok(out)
+}
+
+type OutRow = record { vals: []Val; ord: []Val }
+
+fn sortCmp(a: &Val, b: &Val): int {
+    let na = isNull(a)
+    let nb = isNull(b)
+    if na && nb { return 0 }
+    if na { return 1 }          // NULLS LAST ascending
+    if nb { return -1 }
+    match compare(a, b) {
+        Ok(c) { return c }
+        Err(_) { return kindOf(a) - kindOf(b) }
+    }
+}
+
+fn evalInt(x: &Option[Expr], params: &[]Val, what: str): Result[int, DbErr] {
+    match x {
+        Some(v) {
+            let noCols: []lexdb_sql.ColDef = []
+            let noRow: []Val = []
+            let noGroup: [][]Val = []
+            let env = Env{cols: &noCols, row: &noRow, group: &noGroup, agg: false, params: params}
+            match try coerce(try eval(&v, &env), &lexdb_sql.TypeName{kind: lexdb_sql.K_INT, oid: lexdb_sql.OID_INT8, prec: 0, scale: 0, len: 0}) {
+                Val.Int(n) {
+                    if n < 0 { return Err(e("2201W", what + " must not be negative")) }
+                    return Ok(n)
+                }
+                else { return Ok(-1) }
+            }
+        }
+        None { return Ok(-1) }
+    }
+}
+
+// An ORDER BY item may name an output column by position or by its alias.
+fn orderValue(o: &Expr, outs: &[]OutCol, vals: &[]Val, env: &Env): Result[Val, DbErr] {
+    match o {
+        Expr.Lit(v) {
+            match v {
+                Val.Int(n) {
+                    if n < 1 || n > len(vals) { return Err(e("42P10", "ORDER BY position " + n.toStr() + " is not in select list")) }
+                    return Ok(vals[n - 1])
+                }
+                else {}
+            }
+        }
+        Expr.Col(n) {
+            if colIndex(&env.cols, &n) < 0 {
+                for i in 0..len(outs) { if outs[i].name == n { return Ok(vals[i]) } }
+            }
+        }
+        else {}
+    }
+    return eval(o, env)
+}
+
+fn select(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int): Result[Res, DbErr] {
+    var t = Table{name: "", tree: 0, cols: [], pk: []}
+    if s.table != "" { t = try needTable(st, txn, &s.table) }
+    var exprs: []Expr = []
+    let outs = try selectCols(s, &t.cols, ptypes, mut &exprs)
+    var aggQ = len(s.group) > 0
+    for x in exprs { if hasAgg(&x) { aggQ = true } }
+    let limit = try evalInt(&s.limit, params, "LIMIT")
+    let offset = try evalInt(&s.offset, params, "OFFSET")
+    var outRows: []OutRow = []
+    let early = !aggQ && len(s.order) == 0 && limit >= 0
+    let stopAt = if offset > 0 { limit + offset } else { limit }
+    if aggQ {
+        var groups: [][][]Val = []
+        var index: Map[str, int] = newMap()
+        {
+            let noGroup: [][]Val = []
+            let group = fn(row: []Val): Result[Unit, DbErr] {
+                var kvals: []Val = []
+                if len(s.group) > 0 {
+                    {
+                        let env = Env{cols: &t.cols, row: &row, group: &noGroup, agg: false, params: params}
+                        for g in s.group { append(mut &kvals, try eval(&g, &env)) }
+                    }
+                    let k = encRow(&kvals)
+                    match index.get(&k) {
+                        Some(i) { append(mut &groups[i], row) }
+                        None {
+                            index.put(k, len(groups))
+                            append(mut &groups, [row])
+                        }
+                    }
+                } else {
+                    if len(groups) == 0 { append(mut &groups, []) }
+                    append(mut &groups[0], row)
+                }
+                return Ok(Unit{})
+            }
+            if s.table != "" {
+                try rows(st, txn, &t, &s.where, params, fn(k: &str, r: []Val): Result[bool, DbErr] {
+                    try group(r)
+                    return Ok(true)
+                })
+            } else {
+                try group([])
+            }
+        }
+        if len(groups) == 0 && len(s.group) == 0 { append(mut &groups, []) }
+        let noRow: []Val = []
+        for g in groups {
+            let env = Env{cols: &t.cols, row: if len(g) > 0 { &g[0] } else { &noRow }, group: g, agg: true, params: params}
+            var vals: []Val = []
+            for x in exprs { append(mut &vals, try eval(&x, &env)) }
+            var ord: []Val = []
+            for o in s.order { append(mut &ord, try orderValue(&o.expr, &outs, &vals, &env)) }
+            append(mut &outRows, OutRow{vals: vals, ord: ord})
+        }
+    } else if s.table == "" {
+        let noCols: []lexdb_sql.ColDef = []
+        let noRow: []Val = []
+        let noGroup: [][]Val = []
+        let env = Env{cols: &noCols, row: &noRow, group: &noGroup, agg: false, params: params}
+        var keep = true
+        match s.where {
+            Some(w) { keep = truth(&(try eval(&w, &env))) == Some(true) }
+            None {}
+        }
+        if keep {
+            var vals: []Val = []
+            for x in exprs { append(mut &vals, try eval(&x, &env)) }
+            append(mut &outRows, OutRow{vals: vals, ord: []})
+        }
+    } else {
+        let noGroup: [][]Val = []
+        try rows(st, txn, &t, &s.where, params, fn(k: &str, r: []Val): Result[bool, DbErr] {
+            let env = Env{cols: &t.cols, row: &r, group: &noGroup, agg: false, params: params}
+            var vals: []Val = []
+            for x in exprs { append(mut &vals, try eval(&x, &env)) }
+            var ord: []Val = []
+            for o in s.order { append(mut &ord, try orderValue(&o.expr, &outs, &vals, &env)) }
+            append(mut &outRows, OutRow{vals: vals, ord: ord})
+            return Ok(!early || len(outRows) < stopAt)
+        })
+    }
+    if len(s.order) > 0 {
+        collections.sortBy(mut &outRows, fn(a: &OutRow, b: &OutRow): int {
+            for i in 0..len(s.order) {
+                var c = sortCmp(&a.ord[i], &b.ord[i])
+                if s.order[i].desc { c = -c }
+                if c != 0 { return c }
+            }
+            return 0
+        })
+    }
+    var res = Res{cols: outs, rows: [], tag: "", hasRows: true}
+    var i = 0
+    for r in outRows {
+        if i >= offset || offset < 0 {
+            if limit >= 0 && len(res.rows) >= limit { break }
+            var vs: []Val = []
+            for v in r.vals { append(mut &vs, v) }
+            append(mut &res.rows, vs)
+        }
+        i += 1
+    }
+    res.tag = "SELECT " + len(res.rows).toStr()
+    return Ok(res)
+}
+
+// ---- describing a statement before it runs (the extended protocol)
+
+// The parameter types of a statement: the client's, else what the
+// statement compares or assigns them to, else text.
+pub fn paramTypes(st: &lexdb_store.Store, s: &lexdb_sql.Stmt, given: &[]int): []int {
+    var out: []int = []
+    for i in 0..s.params { append(mut &out, if i < len(given) { given[i] } else { 0 }) }
+    var txn = lexdb_store.begin()
+    let t = match findTable(st, mut &txn, &s.table) { Ok(x) { x } Err(_) { None } }
+    match t {
+        Some(tb) {
+            let set = fn(x: &Expr, oid: int) {
+                match x {
+                    Expr.Param(n) { if n <= len(out) && out[n - 1] == 0 { out[n - 1] = oid } }
+                    else {}
+                }
+            }
+            if s.kind == lexdb_sql.S_INSERT {
+                for r in s.rows {
+                    for k in 0..len(r) {
+                        let ci = if len(s.names) == 0 { k } else { colIndex(&tb.cols, &s.names[k]) }
+                        if ci >= 0 && ci < len(tb.cols) { set(&r[k], tb.cols[ci].typ.oid) }
+                    }
+                }
+            }
+            for si in s.sets {
+                let ci = colIndex(&tb.cols, &si.col)
+                if ci >= 0 { set(&si.expr, tb.cols[ci].typ.oid) }
+            }
+            match s.where {
+                Some(w) {
+                    var cs: []Expr = []
+                    conjuncts(&w, mut &cs)
+                    for c in tb.cols {
+                        for b in bounds(&cs, &c.name) { set(&b.val, c.typ.oid) }
+                    }
+                }
+                None {}
+            }
+        }
+        None {}
+    }
+    for i in 0..len(out) { if out[i] == 0 { out[i] = lexdb_sql.OID_TEXT } }
+    return out
+}
+
+// The columns a statement returns (none unless it is a SELECT).
+pub fn describe(st: &lexdb_store.Store, s: &lexdb_sql.Stmt, ptypes: &[]int): Result[[]OutCol, DbErr] {
+    if s.kind != lexdb_sql.S_SELECT { return Ok([]) }
+    var txn = lexdb_store.begin()
+    var cols: []lexdb_sql.ColDef = []
+    if s.table != "" {
+        var t = try needTable(st, mut &txn, &s.table)
+        cols = replace(mut &t.cols, [])
+    }
+    var exprs: []Expr = []
+    return selectCols(s, &cols, ptypes, mut &exprs)
+}
+
+// ---- sessions
+
+pub type Session = record {
+    st: lexdb_store.Store
+    txn: []lexdb_store.Txn      // the open transaction block, if any
+    failed: bool                // an error in the block: only ROLLBACK (or COMMIT) now
+}
+
+pub fn newSession(st: lexdb_store.Store): Session { return Session{st: st, txn: [], failed: false} }
+
+// 'I' idle, 'T' in a transaction block, 'E' in a failed one.
+pub fn (s: &Session) status(): byte {
+    if len(s.txn) == 0 { return 'I' }
+    return if s.failed { 'E' } else { 'T' }
+}
+
+fn execIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int): Result[Res, DbErr] {
+    match s.kind {
+        lexdb_sql.S_CREATE { return createTable(st, txn, s) }
+        lexdb_sql.S_DROP { return dropTable(st, txn, s) }
+        lexdb_sql.S_INSERT { return insert(st, txn, s, params) }
+        lexdb_sql.S_SELECT { return select(st, txn, s, params, ptypes) }
+        lexdb_sql.S_UPDATE { return update(st, txn, s, params) }
+        lexdb_sql.S_DELETE { return delete(st, txn, s, params) }
+        else { return Err(e("XX000", "not a data statement")) }
+    }
+}
+
+// Converts the parameters a client sent as text to values of their types.
+pub fn paramVals(texts: &[]Option[str], ptypes: &[]int): Result[[]Val, DbErr] {
+    var out: []Val = []
+    for i in 0..len(texts) {
+        match texts[i] {
+            None { append(mut &out, Val.Null) }
+            Some(s) {
+                let oid = if i < len(ptypes) { ptypes[i] } else { lexdb_sql.OID_TEXT }
+                var ty = lexdb_sql.TypeName{kind: lexdb_sql.K_TEXT, oid: lexdb_sql.OID_TEXT, prec: 0, scale: 0, len: 0}
+                if oid == lexdb_sql.OID_INT8 || oid == lexdb_sql.OID_INT4 || oid == lexdb_sql.OID_INT2 {
+                    ty = lexdb_sql.TypeName{kind: lexdb_sql.K_INT, oid: lexdb_sql.OID_INT8, prec: 0, scale: 0, len: 0}
+                } else if oid == lexdb_sql.OID_BOOL {
+                    ty = lexdb_sql.TypeName{kind: lexdb_sql.K_BOOL, oid: oid, prec: 0, scale: 0, len: 0}
+                } else if oid == lexdb_sql.OID_NUMERIC {
+                    ty = lexdb_sql.TypeName{kind: lexdb_sql.K_NUM, oid: oid, prec: 0, scale: 0, len: 0}
+                }
+                append(mut &out, try coerce(Val.Text(s), &ty))
+            }
+        }
+    }
+    return Ok(out)
+}
+
+// Runs one statement: in the open transaction block, or in a transaction of
+// its own that is committed at once (retried a few times on a
+// serialization failure: nothing the client saw depends on the first try).
+pub fn (s: mut &Session) run(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int): Result[Res, DbErr] {
+    match stmt.kind {
+        lexdb_sql.S_EMPTY { return Ok(tagOnly("")) }
+        lexdb_sql.S_SET { return Ok(tagOnly("SET")) }
+        lexdb_sql.S_BEGIN {
+            if len(s.txn) == 0 {
+                append(mut &s.txn, lexdb_store.begin())
+                s.failed = false
+            }
+            return Ok(tagOnly("BEGIN"))
+        }
+        lexdb_sql.S_COMMIT {
+            if len(s.txn) == 0 { return Ok(tagOnly("COMMIT")) }
+            let t = pop(mut &s.txn)
+            if s.failed {
+                s.failed = false
+                return Ok(tagOnly("ROLLBACK"))
+            }
+            try s.st.commit(t)
+            return Ok(tagOnly("COMMIT"))
+        }
+        lexdb_sql.S_ROLLBACK {
+            if len(s.txn) > 0 { let t = pop(mut &s.txn) }
+            s.failed = false
+            return Ok(tagOnly("ROLLBACK"))
+        }
+        else {}
+    }
+    if len(s.txn) > 0 {
+        if s.failed {
+            return Err(e("25P02", "current transaction is aborted, commands ignored until end of transaction block"))
+        }
+        let st = s.st
+        let r = execIn(&st, mut &s.txn[0], stmt, params, ptypes)
+        if r.isErr() { s.failed = true }
+        return r
+    }
+    var tries = 0
+    while true {
+        var t = lexdb_store.begin()
+        let r = try execIn(&s.st, mut &t, stmt, params, ptypes)
+        match s.st.commit(t) {
+            Ok(_) { return Ok(r) }
+            Err(x) {
+                tries += 1
+                if x.state != lexdb_base.S_CONFLICT || tries >= 10 { return Err(x) }
+            }
+        }
+    }
+    return Err(e("XX000", "unreachable"))
+}
+
+// Parses and runs SQL text with no parameters (for the tests and tools).
+pub fn (s: mut &Session) exec(sql: &str): Result[[]Res, DbErr] {
+    let stmts = try lexdb_sql.parse(sql)
+    var out: []Res = []
+    let none: []Val = []
+    let nt: []int = []
+    for st in stmts { append(mut &out, try s.run(&st, &none, &nt)) }
+    return Ok(out)
+}

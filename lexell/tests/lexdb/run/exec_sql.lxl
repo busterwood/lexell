@@ -1,0 +1,88 @@
+// lexdb_exec: SQL statements against a store, through a session.
+// expect: CREATE TABLE
+// expect: INSERT 0 3
+// expect: 1|apple|1.50|t
+// expect: 2|banana|0.25|f
+// expect: 3|cherry|10.00|t
+// expect: SELECT 3
+// expect: 3|cherry
+// expect: 2|banana
+// expect: count=3 sum=11.75 min=0.25 max=10.00
+// expect: 23505: duplicate key value violates unique constraint "fruit_pkey": Key (id)=(2) already exists.
+// expect: UPDATE 2
+// expect: 1|apple|1.65
+// expect: 3|cherry|11.00
+// expect: DELETE 1
+// expect: INSERT 0 1
+// expect: t|2
+// expect: f|1
+// expect: 42P01: relation "nope" does not exist
+// expect: 22003: numeric field overflow: a field with precision 6, scale 2 must round to an absolute value less than 10^4
+// expect: 2
+// expect: BEGIN
+// expect: INSERT 0 1
+// expect: ROLLBACK
+// expect: in block: 4 then rollback: 3
+// expect: 25P02 then ROLLBACK
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_base"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_sql"
+import "strings"
+
+fn show(r: &lexdb_exec.Res) {
+    for row in r.rows {
+        var parts: []str = []
+        for v in row { append(mut &parts, if lexdb_exec.isNull(&v) { "NULL" } else { lexdb_exec.text(&v) }) }
+        println(strings.join(&parts, "|"))
+    }
+}
+
+fn run1(s: mut &lexdb_exec.Session, sql: str) {
+    match s.exec(&sql) {
+        Ok(rs) {
+            for r in rs {
+                if r.hasRows { show(&r) } else { println(r.tag) }
+            }
+        }
+        Err(e) { println(e.toStr()) }
+    }
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    var s = lexdb_exec.newSession(st)
+    run1(mut &s, "create table fruit (id int primary key, name text not null, price numeric(6,2), ripe boolean)")
+    run1(mut &s, "insert into fruit values (1, 'apple', 1.5, true), (2, 'banana', 0.25, false), (3, 'cherry', 10, 't')")
+    run1(mut &s, "select * from fruit")
+    match s.exec(&"select * from fruit") { Ok(rs) { println(rs[0].tag) } Err(e) { println(e.toStr()) } }
+    run1(mut &s, "select id, name from fruit where id >= 2 order by id desc")
+    run1(mut &s, "select 'count=' || count(*) || ' sum=' || sum(price) || ' min=' || min(price) || ' max=' || max(price) from fruit")
+    run1(mut &s, "insert into fruit values (2, 'again', 1, false)")
+    run1(mut &s, "update fruit set price = price * 1.1 where ripe")
+    run1(mut &s, "select id, name, price from fruit where ripe = true order by price")
+    run1(mut &s, "delete from fruit where name = 'banana'")
+    run1(mut &s, "insert into fruit (id, name, ripe) values (4, 'date', false)")
+    run1(mut &s, "select ripe, count(*) from fruit group by ripe order by ripe desc")
+    run1(mut &s, "select * from nope")
+    run1(mut &s, "insert into fruit values (5, 'big', 12345.678, true)")
+    run1(mut &s, "select 1 + 1")
+    run1(mut &s, "begin")
+    run1(mut &s, "insert into fruit values (6, 'fig', 2, true)")
+    var inBlock = 0
+    match s.exec(&"select count(*) from fruit") { Ok(rs) { inBlock = strings.parseIntOpt(lexdb_exec.text(&rs[0].rows[0][0])).unwrap() } Err(e) { println(e.toStr()) } }
+    run1(mut &s, "rollback")
+    var after = 0
+    match s.exec(&"select count(*) from fruit") { Ok(rs) { after = strings.parseIntOpt(lexdb_exec.text(&rs[0].rows[0][0])).unwrap() } Err(e) { println(e.toStr()) } }
+    println("in block: " + inBlock.toStr() + " then rollback: " + after.toStr())
+    let x = s.exec(&"begin; select * from nope")
+    var st2 = ""
+    match s.exec(&"select 1") { Ok(_) { st2 = "ok" } Err(e) { st2 = e.state } }
+    match s.exec(&"commit") { Ok(rs) { println(st2 + " then " + rs[0].tag) } Err(e) { println(e.toStr()) } }
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(3), lexdb_store.defaults(), body).unwrap()
+}
