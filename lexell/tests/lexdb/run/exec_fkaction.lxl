@@ -1,0 +1,131 @@
+// lexdb_exec: foreign keys' actions (design/lexdb.md 9.42): ON DELETE and
+// ON UPDATE CASCADE, SET NULL, SET DEFAULT, at the statement's end as
+// PostgreSQL's. Through several tables and a table referencing itself; the
+// rows written by an action checked as any (NOT NULL, CHECK, unique keys,
+// their own foreign keys, their indexes kept); an error undoing the whole
+// statement; mixed with NO ACTION; after a reopen.
+// expect: delete cascade: DELETE 1, children 3 4, grandchildren 31
+// expect: through an index: 3 4, none of 1
+// expect: set null: DELETE 1, 1| 2|2 3|; not null: 23502, all kept: 1 1
+// expect: set default: DELETE 1, 1|0 2|2; default not there: 23503 insert or update on table "sd2" violates foreign key constraint "sd2_pid_fkey": Key (pid)=(9) is not present in table "p0".
+// expect: update cascade: UPDATE 1, children 10|1 10|2 2|3, grandchildren 10|1, by the index 1 2
+// expect: update set null: UPDATE 1, 1| 2|2
+// expect: a check: 23514 new row for relation "cc" violates check constraint "cc_pid_check"
+// expect: a unique key: 23505
+// expect: itself: DELETE 1, left 5|; two of one branch: DELETE 2; renumbered: UPDATE 1, 7|60 60|
+// expect: with NO ACTION: 23503 "na_pid_fkey", all kept: 1 1 1
+// expect: rolled back: 2 rows
+// expect: reopened: DELETE 1, 0
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if !r.hasRows { return r.tag }
+            var out: []str = []
+            for row in r.rows {
+                var vs: []str = []
+                for v in row { append(mut &vs, lexdb_exec.text(&v)) }
+                append(mut &out, strings.join(&vs, "|"))
+            }
+            return strings.join(&out, " ")
+        }
+        Err(e) { return e.state + " " + e.msg }
+    }
+}
+
+fn state(s: mut &lexdb_exec.Session, sql: &str): str { return q(s, sql)[0..5] }
+
+fn which(s: mut &lexdb_exec.Session, sql: &str): str {
+    let r = q(s, sql)
+    if !strings.startsWith(r, "23503") { return r }
+    let i = strings.indexOf(&r, "constraint \"", 0)
+    let j = strings.indexOf(&r, "\"", i + 12)
+    return "23503 " + r[i + 11..j + 1]
+}
+
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: 256 * 1024, segBytes: 1024 * 1024, ckptBytes: 512 * 1024, snapNodes: 100000}
+}
+
+fn main() {
+    let fs = lexdb_disk.sim(42)
+    lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        // three tables deep
+        let a1 = q(mut &s, &"create table p (id int primary key); create table c (id int primary key, pid int references p on delete cascade)")
+        let a2 = q(mut &s, &"create table g (id int primary key, cid int references c on delete cascade); create index c_pid on c (pid)")
+        let a3 = q(mut &s, &"insert into p values (1), (2); insert into c values (1, 1), (2, 1), (3, 2), (4, 2)")
+        let a4 = q(mut &s, &"insert into g values (11, 1), (21, 2), (31, 3)")
+        println("delete cascade: " + q(mut &s, &"delete from p where id = 1") + ", children " + q(mut &s, &"select id from c order by id") +
+                ", grandchildren " + q(mut &s, &"select id from g order by id"))
+        println("through an index: " + q(mut &s, &"select id from c where pid = 2 order by id") + ", none of 1" + q(mut &s, &"select id from c where pid = 1"))
+
+        let b1 = q(mut &s, &"create table p0 (id int primary key); insert into p0 values (0), (1), (2)")
+        let b2 = q(mut &s, &"create table sn (id int primary key, pid int references p0 on delete set null); insert into sn values (1, 1), (2, 2), (3, null)")
+        let b3 = q(mut &s, &"delete from p0 where id = 1")
+        let b4 = q(mut &s, &"create table snn (id int primary key, pid int not null references p0 on delete set null); insert into snn values (1, 2)")
+        let b5 = state(mut &s, &"delete from p0 where id = 2")
+        println("set null: " + b3 + ", " + q(mut &s, &"select * from sn order by id") + "; not null: " + b5 + ", all kept: " +
+                q(mut &s, &"select count(*) from p0 where id = 2") + " " + q(mut &s, &"select count(*) from snn"))
+
+        let d1 = q(mut &s, &"insert into p0 values (1); create table sd (id int primary key, pid int default 0 references p0 on delete set default)")
+        let d2 = q(mut &s, &"insert into sd values (1, 1), (2, 2)")
+        let d3 = q(mut &s, &"delete from p0 where id = 1")
+        let d4 = q(mut &s, &"insert into p0 values (1); create table sd2 (id int primary key, pid int default 9 references p0 on delete set default); insert into sd2 values (1, 1)")
+        println("set default: " + d3 + ", " + q(mut &s, &"select * from sd order by id") + "; default not there: " + q(mut &s, &"delete from p0 where id = 1"))
+
+        // ON UPDATE CASCADE from a primary key and from a unique key
+        let u1 = q(mut &s, &"create table up (id int primary key); insert into up values (1), (2)")
+        let u2 = q(mut &s, &"create table uc (id int primary key, pid int references up on update cascade, k int unique); create index uc_pid on uc (pid)")
+        let u3 = q(mut &s, &"create table ug (id int primary key, ck int references uc (k) on update cascade)")
+        let u4 = q(mut &s, &"insert into uc values (1, 1, 1), (2, 1, 2), (3, 2, 3); insert into ug values (1, 1)")
+        let u5 = q(mut &s, &"update up set id = 10 where id = 1")
+        let u6 = q(mut &s, &"update uc set k = 10 where id = 1")
+        println("update cascade: " + u5 + ", children " + q(mut &s, &"select pid, id from uc order by id") + ", grandchildren " +
+                q(mut &s, &"select ck, id from ug") + ", by the index " + q(mut &s, &"select id from uc where pid = 10 order by id"))
+        let v1 = q(mut &s, &"create table vp (id int primary key); insert into vp values (1), (2)")
+        let v2 = q(mut &s, &"create table vc (id int primary key, pid int references vp on update set null); insert into vc values (1, 1), (2, 2)")
+        println("update set null: " + q(mut &s, &"update vp set id = 5 where id = 1") + ", " + q(mut &s, &"select * from vc order by id"))
+
+        // the rows an action writes are checked as any
+        let w1 = q(mut &s, &"create table cp (id int primary key); insert into cp values (1); create table cc (id int primary key, pid int references cp on update cascade check (pid < 5)); insert into cc values (1, 1)")
+        println("a check: " + q(mut &s, &"update cp set id = 7 where id = 1"))
+        let w2 = q(mut &s, &"create table kp (id int primary key); insert into kp values (1), (2); create table kc (id int primary key, pid int unique references kp on delete set default default 2); insert into kc values (1, 1), (2, 2)")
+        println("a unique key: " + state(mut &s, &"delete from kp where id = 1"))
+
+        // a table referencing itself
+        let t1 = q(mut &s, &"create table tree (id int primary key, parent int references tree on delete cascade on update cascade)")
+        let t2 = q(mut &s, &"insert into tree values (1, null), (2, 1), (3, 2), (4, 1), (5, null)")
+        let t3 = q(mut &s, &"delete from tree where id = 1")
+        let t4 = q(mut &s, &"insert into tree values (6, null), (7, 6), (8, 7)")
+        let t5 = q(mut &s, &"delete from tree where id in (7, 8)")
+        let t6 = q(mut &s, &"insert into tree values (7, 6); update tree set id = 60 where id = 6")
+        println("itself: " + t3 + ", left " + q(mut &s, &"select * from tree where id = 5") + "; two of one branch: " + t5 + "; renumbered: " + t6 + ", " +
+                q(mut &s, &"select * from tree where id <> 5 order by id"))
+
+        // a cascade and NO ACTION from one delete: all or nothing
+        let n1 = q(mut &s, &"create table np (id int primary key); insert into np values (1)")
+        let n2 = q(mut &s, &"create table nc (id int primary key, pid int references np on delete cascade); insert into nc values (1, 1)")
+        let n3 = q(mut &s, &"create table na (id int primary key, pid int references np); insert into na values (1, 1)")
+        println("with NO ACTION: " + which(mut &s, &"delete from np") + ", all kept: " + q(mut &s, &"select count(*) from np") + " " +
+                q(mut &s, &"select count(*) from nc") + " " + q(mut &s, &"select count(*) from na"))
+
+        let r1 = q(mut &s, &"begin")
+        let r2 = q(mut &s, &"delete from p")
+        let r3 = q(mut &s, &"rollback")
+        println("rolled back: " + q(mut &s, &"select count(*) from c") + " rows")
+        return 0
+    }).unwrap()
+
+    lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int {
+        var s = lexdb_exec.newSession(st)
+        println("reopened: " + q(mut &s, &"delete from p where id = 2") + ", " + q(mut &s, &"select count(*) from g"))
+        return 0
+    }).unwrap()
+}

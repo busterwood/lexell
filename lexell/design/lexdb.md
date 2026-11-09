@@ -393,7 +393,7 @@ Built on 2026-11-09 on branch `lexdb`, about 6,300 lines in
 (cache, trees, transactions, log, checkpoints, recovery, snapshots),
 `lexdb_sql` (lexer, parser), `lexdb_exec` (catalog, rows, keys, planner,
 statements, sessions), `lexdb_wire` (protocol 3.0) and `lexdb` (the
-server). Tests: `python3 lexell/tests/lexdb.py` (49 programs in
+server). Tests: `python3 lexell/tests/lexdb.py` (50 programs in
 `tests/lexdb/run`, under `LXL_CHECK=1`).
 
     lexell/compiler/out/lxlc lexell/cmd/lexdb.lxl -o lexdb
@@ -594,7 +594,8 @@ is the comparison to make.
    defaults, ADD COLUMN ... DEFAULT among them, are built (9.38).
 14. Constraints (the user's request, 2026-11-09), in steps: (1) UNIQUE
    (built: 9.39); (2) CHECK (built: 9.40); (3) FOREIGN KEY, with NO ACTION and RESTRICT
-   (built: 9.41); (4) the CASCADE, SET NULL and SET DEFAULT actions.
+   (built: 9.41); (4) the CASCADE, SET NULL and SET DEFAULT actions
+   (built: 9.42).
 
 ### 9.5 Indexes and joins (D4)
 
@@ -2655,10 +2656,12 @@ statement needs once. A table with neither does no foreign-key work.
 - *A referenced key deleted or changed:* the rows referencing it are
   looked for (`referenced`) through the referencing table's primary key or
   an index starting with the key's columns; failing both, the whole table
-  is read. With rows found, RESTRICT refuses at once. NO ACTION looks again
-  at the statement's end (23503 "... is still referenced from table ...").
-  By then the key may be back, or the rows referencing it gone: a table
-  referencing itself can be emptied with one DELETE.
+  is read. With rows found, both look again at the statement's end (23503
+  "... is still referenced from table ..."). By then the rows referencing
+  it may be gone: a table referencing itself can be emptied with one
+  DELETE. NO ACTION also lets the key be if it is back by then; RESTRICT
+  does not. (First built with RESTRICT refusing at once; PostgreSQL checks
+  both at the statement's end, so 9.42 made it so.)
 - *Two transactions racing* (a parent deleted while a child referencing it
   is inserted) are caught by serializable validation: the insert read the
   parent's row.
@@ -2724,3 +2727,79 @@ Planted, each caught:
 - a type change allowed;
 - a dropped column's own key kept, or a referenced column dropped;
 - names, types or the referenced key not compared.
+
+### 9.42 Foreign key actions
+
+`ON DELETE` and `ON UPDATE` take CASCADE, SET NULL and SET DEFAULT too.
+`SET NULL (cols)` and `SET DEFAULT (cols)` remain 0A000.
+
+**At the statement's end, in order, as PostgreSQL's triggers run.** A row
+deleted or changed in a referenced table queues what its key's going
+does, in the statement's queue (`FkLater`):
+- FK_DELETE: ON DELETE CASCADE;
+- FK_SET: SET NULL, SET DEFAULT, ON UPDATE CASCADE, with the new key;
+- FK_GONE: NO ACTION and RESTRICT, queued only when rows reference the key
+  now;
+- FK_MISSING, from 9.41: a key a row was written with that was not there.
+
+`fkFinish` runs the queue from its front. For DELETE and SET it reads the
+rows referencing the key *then* and deletes them (`delRow`) or sets the
+key's columns (`updRow`). Those writes queue their own work behind, so
+chains of tables and tables referencing themselves are followed to their
+end without recursion.
+
+Running last is what PostgreSQL does, and it decides what a statement
+sees of its own rows:
+- `DELETE FROM tree WHERE id IN (1, 2)` with 2 under 1 deletes both
+  (DELETE 2) before the cascade looks;
+- an UPDATE's rows are all written before a cascade sets the rows
+  referencing them.
+
+**A row an action writes is a row written.** The same code as UPDATE and
+DELETE writes it (`updRow` and `delRow`, now shared):
+- NOT NULL (SET NULL on a NOT NULL column: 23502);
+- CHECK constraints;
+- the primary key and unique indexes;
+- the table's indexes kept;
+- its own foreign keys: a SET DEFAULT whose default is not in the
+  referenced table is 23503;
+- the tables referencing it in turn.
+
+Any error undoes the whole statement, cascades included.
+
+**Tables loaded.** `fkTables` loads the tables a statement needs once:
+those referencing a table an action writes, and their referenced tables,
+followed until no new table is written.
+
+**Cost**, on a real file: deleting 100 parents, which cascades to 10K
+child rows through an index on the child's key column, took 57 ms. The
+same rows deleted by hand in one transaction, without the foreign key,
+took 51 ms.
+
+**Checked** by `exec_fkaction`:
+- ON DELETE CASCADE three tables deep, the child's index after;
+- SET NULL, and on a NOT NULL column (all undone);
+- SET DEFAULT, and a default not in the referenced table;
+- ON UPDATE CASCADE from a primary key and a unique key, with the index
+  read after;
+- ON UPDATE SET NULL;
+- a CHECK and a unique key violated by an action;
+- a table referencing itself: a subtree deleted, two rows of one branch,
+  a key renumbered;
+- a cascade with NO ACTION on the same key (all undone);
+- a rollback, and a reopen.
+
+`exec_fkey` now checks RESTRICT against NO ACTION where they differ: a key
+changed and back in one UPDATE.
+
+Planted, each caught:
+- the cascade not done, or not followed from the deleted rows;
+- the rows an action writes not checked, or their foreign keys not;
+- their indexes not kept;
+- SET NULL setting nothing;
+- ON UPDATE CASCADE keeping the old key;
+- ON UPDATE taking ON DELETE's action;
+- NO ACTION never letting a key back, RESTRICT letting it;
+- the queue not run to its end;
+- the tables actions write not followed;
+- RESTRICT refusing at once.

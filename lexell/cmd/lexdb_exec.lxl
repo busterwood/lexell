@@ -5095,7 +5095,7 @@ fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
             try insertOne(st, txn, &t, &targets, &r, &defs, &fw, mut &later)
             count += 1
         }
-        try fkFinish(st, txn, &fw, &later)
+        try fkFinish(st, txn, &fw, mut &later)
         return Ok(tagOnly("INSERT 0 " + count.toStr()))
     }
     // its subqueries are run first
@@ -5140,7 +5140,7 @@ fn insertRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, targ
         try insertOne(st, txn, t, targets, &vs, &defs, &fw, mut &later)
         count += 1
     }
-    try fkFinish(st, txn, &fw, &later)
+    try fkFinish(st, txn, &fw, mut &later)
     return Ok(tagOnly("INSERT 0 " + count.toStr()))
 }
 
@@ -5206,21 +5206,9 @@ fn update(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
             if lexdb_sql.isDefault(&sets[k]) { row[targets[k]] = defs[targets[k]] }
             else { row[targets[k]] = try coerce(try evalX(st, txn, &q, &sets[k], &env, mut &rs), &t.cols[targets[k]].typ) }
         }
-        try checkRow(t, &row)
-        try checkChecks(t, &row)
-        let oldKey = keyOf(t, &old)
-        let key = keyOf(t, &row)
-        if key != oldKey {
-            if (try st.get(txn, t.tree, key)).isSome() { return Err(dupKey(t, &row)) }
-            txn.del(t.tree, oldKey)
-        }
-        let enc = encRowOf(t, &row)
-        try txn.putRow(t.tree, key, enc, rowHead(&enc))
-        try changeIndexes(st, txn, t, &old, &oldKey, &row, &key)
-        if len(t.fks) > 0 { try childSide(st, txn, t, &fw, &row, &old, mut &later) }
-        if len(t.refBy) > 0 { try parentSide(st, txn, t, &fw, &old, &row, true, mut &later) }
+        try updRow(st, txn, t, &old, &row, &fw, mut &later)
     }
-    try fkFinish(st, txn, &fw, &later)
+    try fkFinish(st, txn, &fw, mut &later)
     return Ok(tagOnly("UPDATE " + len(found).toStr()))
 }
 
@@ -5244,14 +5232,8 @@ fn delete(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     }, mut &rs)
     let fw = try fkTables(st, txn, t, false, true)
     var later: []FkLater = []
-    let none: []Val = []
-    for row in found {
-        let key = keyOf(t, &row)
-        txn.del(t.tree, key)
-        for ix in t.indexes { if try inIndex(t, &ix, &row) { txn.del(ix.tree, idxEntry(&ix, &row, &key)) } }
-        if len(t.refBy) > 0 { try parentSide(st, txn, t, &fw, &row, &none, false, mut &later) }
-    }
-    try fkFinish(st, txn, &fw, &later)
+    for row in found { try delRow(st, txn, t, &row, &fw, mut &later) }
+    try fkFinish(st, txn, &fw, mut &later)
     return Ok(tagOnly("DELETE " + len(found).toStr()))
 }
 
@@ -7118,10 +7100,11 @@ pub fn (s: mut &Session) exec(sql: &str): Result[[]Res, DbErr] {
 // MATCH SIMPLE: a row with a NULL in the key's columns references nothing.
 // A row's key is looked up in the referenced table as it is written; one
 // not there (it may come later in the statement: a table referencing
-// itself) is looked up again at the statement's end. A referenced key
-// deleted or changed: RESTRICT refuses at once while a row references it;
-// NO ACTION looks again at the statement's end (the key may be back, or the
-// rows referencing it gone).
+// itself) is looked up again at the statement's end. What a referenced key
+// deleted or changed does waits for the statement's end too, as
+// PostgreSQL's triggers do: the rows referencing it deleted or set
+// (CASCADE, SET NULL, SET DEFAULT), or none may be left referencing it (NO
+// ACTION, unless the key is back by then; RESTRICT).
 
 // Table k from the catalog (k a catalog key, not a name to look up).
 fn byKeyOpt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, k: &str): Result[Option[Table], DbErr] {
@@ -7234,10 +7217,16 @@ fn parentHas(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, p: &Table, fc: &
     return Ok(found)
 }
 
-// Whether a row of table c has vals in its columns cols: through its
-// primary key or an index starting with them, else read whole (as
-// PostgreSQL, lexdb makes no index for a foreign key).
+// Whether a row of table c has vals in its columns cols.
 fn referenced(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, c: &Table, cols: &[]int, vals: &[]Val): Result[bool, DbErr] {
+    let rows = try refRows(st, txn, c, cols, vals, true)
+    return Ok(len(rows) > 0)
+}
+
+// The rows of table c with vals in its columns cols (the first only, with
+// one): through its primary key or an index starting with them, else read
+// whole (as PostgreSQL, lexdb makes no index for a foreign key).
+fn refRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, c: &Table, cols: &[]int, vals: &[]Val, one: bool): Result[[][]Val, DbErr] {
     let n = len(cols)
     var crow = nullRow(len(c.cols))
     for j in 0..n { crow[cols[j]] = vals[j] }
@@ -7263,13 +7252,19 @@ fn referenced(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, c: &Table, cols
     }
     let want = encVals(vals)
     let all: []bool = []
+    var out: [][]Val = []
     var cur = newCursor()
     while !cur.done {
         var batch: [][]Val = []
         try fetch(st, txn, c, &path, &sc, &all, mut &cur, mut &batch)
-        for r in batch { if encVals(&valsAt(&r, cols)) == want { return Ok(true) } }
+        for r in batch {
+            if encVals(&valsAt(&r, cols)) == want {
+                append(mut &out, copyRow(&r))
+                if one { return Ok(out) }
+            }
+        }
     }
-    return Ok(false)
+    return Ok(out)
 }
 
 fn keyText(names: &[]str, vals: &[]Val): str {
@@ -7289,28 +7284,100 @@ fn stillRef(p: &Table, c: &Table, f: &ForeignKey, vals: &[]Val): DbErr {
              lexdb_sql.baseName(&c.name) + "\".")
 }
 
-// What a statement looks at again at its end: a row's key not found in the
-// table it references (gone false), or a referenced key deleted or changed
-// while rows referenced it (gone true). child is the referencing table, fk
-// its foreign key's number, vals the key.
-type FkLater = record { gone: bool; child: str; fk: int; vals: []Val }
+// What a statement does at its end, in order (each may add more):
+const FK_MISSING = 0    // a row's key was not in the table it references: look again
+const FK_GONE = 1       // a referenced key gone (NO ACTION, RESTRICT): no row may still reference it
+const FK_DELETE = 2     // ON DELETE CASCADE: the rows referencing it deleted
+const FK_SET = 3        // ON ... SET NULL, SET DEFAULT, ON UPDATE CASCADE: their key's columns set
+
+// child is the referencing table, fk its foreign key's number, vals the key
+// (in the foreign key's column order); act the action (FK_GONE, FK_SET);
+// to the new key (ON UPDATE CASCADE).
+type FkLater = record { kind: int; child: str; fk: int; vals: []Val; act: int; to: []Val }
+
+fn fkLater(kind: int, child: &str, fk: int, vals: []Val, act: int, to: []Val): FkLater {
+    return FkLater{kind: kind, child: child, fk: fk, vals: vals, act: act, to: to}
+}
 
 // The tables a statement on t needs for its foreign keys, t itself among
-// them: those it references (parents), those referencing it (children).
+// them: those it references (parents); those referencing it (children),
+// and when an action writes their rows, the tables those need in turn.
 // None when t has no foreign key either way.
 fn fkTables(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, parents: bool, children: bool): Result[[]Table, DbErr] {
     var out: []Table = []
     if len(t.fks) == 0 && len(t.refBy) == 0 { return Ok(out) }
-    var keys = [t.name]
-    if parents { for f in t.fks { addKey(mut &keys, &f.ref) } }
-    if children { for k in t.refBy { addKey(mut &keys, &k) } }
-    for k in keys { append(mut &out, try byKey(st, txn, &k)) }
+    let ti = try loadTab(st, txn, mut &out, &t.name)
+    if parents { for f in t.fks { let pi = try loadTab(st, txn, mut &out, &f.ref) } }
+    if !children { return Ok(out) }
+    var written = [t.name]
+    var w = 0
+    while w < len(written) {
+        let wn = written[w]
+        w += 1
+        let wi = try loadTab(st, txn, mut &out, &wn)
+        var kids: []str = []
+        for k in out[wi].refBy { append(mut &kids, k) }
+        for ck in kids {
+            let ci = try loadTab(st, txn, mut &out, &ck)
+            var acts = false
+            var refs: []str = []
+            for f in out[ci].fks {
+                if f.ref == wn && (f.onDelete >= lexdb_sql.FK_CASCADE || f.onUpdate >= lexdb_sql.FK_CASCADE) { acts = true }
+                append(mut &refs, f.ref)
+            }
+            var seen = false
+            for x in written { if x == ck { seen = true } }
+            if acts && !seen {
+                append(mut &written, ck)
+                for r in refs { let ri = try loadTab(st, txn, mut &out, &r) }
+            }
+        }
+    }
     return Ok(out)
+}
+
+fn loadTab(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, out: mut &[]Table, k: &str): Result[int, DbErr] {
+    for i in 0..len(out) { if out[i].name == k { return Ok(i) } }
+    append(out, try byKey(st, txn, k))
+    return Ok(len(out) - 1)
 }
 
 fn findTab(fw: &[]Table, k: &str): int {
     for i in 0..len(fw) { if fw[i].name == k { return i } }
     return -1
+}
+
+// Row old of table t changed to row: checked, written, its indexes, and
+// its foreign keys either way.
+fn updRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, old: &[]Val, row: &[]Val, fw: &[]Table,
+          later: mut &[]FkLater): Result[Unit, DbErr] {
+    try checkRow(t, row)
+    try checkChecks(t, row)
+    let oldKey = keyOf(t, old)
+    let key = keyOf(t, row)
+    if key != oldKey {
+        if (try st.get(txn, t.tree, key)).isSome() { return Err(dupKey(t, row)) }
+        txn.del(t.tree, oldKey)
+    }
+    let enc = encRowOf(t, row)
+    try txn.putRow(t.tree, key, enc, rowHead(&enc))
+    try changeIndexes(st, txn, t, old, &oldKey, row, &key)
+    if len(t.fks) > 0 { try childSide(st, txn, t, fw, row, old, later) }
+    if len(t.refBy) > 0 { try parentSide(st, txn, t, fw, old, row, true, later) }
+    return Ok(Unit{})
+}
+
+// Row of table t deleted, its index entries, and what references it.
+fn delRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, row: &[]Val, fw: &[]Table,
+          later: mut &[]FkLater): Result[Unit, DbErr] {
+    let key = keyOf(t, row)
+    txn.del(t.tree, key)
+    for ix in t.indexes { if try inIndex(t, &ix, row) { txn.del(ix.tree, idxEntry(&ix, row, &key)) } }
+    if len(t.refBy) > 0 {
+        let none: []Val = []
+        try parentSide(st, txn, t, fw, row, &none, false, later)
+    }
+    return Ok(Unit{})
 }
 
 // Row of table t written (old the row it was, [] for an INSERT): its keys
@@ -7325,13 +7392,14 @@ fn childSide(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, fw: &
         let vals = valsAt(row, &fc.cols)
         if len(old) > 0 && encVals(&valsAt(old, &fc.cols)) == encVals(&vals) { continue }
         let has = try parentHas(st, txn, &fw[pi], &fc, &vals)
-        if !has { append(later, FkLater{gone: false, child: t.name, fk: k, vals: vals}) }
+        let none: []Val = []
+        if !has { append(later, fkLater(FK_MISSING, &t.name, k, vals, 0, none)) }
     }
     return Ok(Unit{})
 }
 
-// Row old of table t deleted, or changed to row (upd): the rows
-// referencing its keys.
+// Row old of table t deleted, or changed to row (upd): what its keys going
+// does to the rows referencing them, at the statement's end.
 fn parentSide(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, fw: &[]Table, old: &[]Val, row: &[]Val, upd: bool,
               later: mut &[]FkLater): Result[Unit, DbErr] {
     for ck in t.refBy {
@@ -7343,29 +7411,67 @@ fn parentSide(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, fw: 
             let vals = valsAt(old, &fc.refCols)
             if upd && encVals(&valsAt(row, &fc.refCols)) == encVals(&vals) { continue }
             let act = if upd { c.fks[k].onUpdate } else { c.fks[k].onDelete }
-            let refd = try referenced(st, txn, c, &fc.cols, &vals)
-            if refd {
-                if act == lexdb_sql.FK_RESTRICT { return Err(stillRef(t, c, &c.fks[k], &vals)) }
-                append(later, FkLater{gone: true, child: ck, fk: k, vals: vals})
+            let none: []Val = []
+            if act == lexdb_sql.FK_CASCADE && !upd {
+                append(later, fkLater(FK_DELETE, &ck, k, vals, act, none))
+            } else if act == lexdb_sql.FK_CASCADE {
+                append(later, fkLater(FK_SET, &ck, k, vals, act, valsAt(row, &fc.refCols)))
+            } else if act >= lexdb_sql.FK_SET_NULL {
+                append(later, fkLater(FK_SET, &ck, k, vals, act, none))
+            } else {
+                // NO ACTION, RESTRICT: nothing to do while no row references it
+                let refd = try referenced(st, txn, c, &fc.cols, &vals)
+                if refd { append(later, fkLater(FK_GONE, &ck, k, vals, act, none)) }
             }
         }
     }
     return Ok(Unit{})
 }
 
-// A statement's end: what it left to look at again.
-fn fkFinish(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, fw: &[]Table, later: &[]FkLater): Result[Unit, DbErr] {
-    for l in later {
-        let c = &fw[findTab(fw, &l.child)]
-        let f = &c.fks[l.fk]
+// A statement's end: what it left, in order; deleting and setting rows
+// may add more.
+fn fkFinish(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, fw: &[]Table, later: mut &[]FkLater): Result[Unit, DbErr] {
+    var i = 0
+    while i < len(later) {
+        let kind = later[i].kind
+        let child = later[i].child
+        let k = later[i].fk
+        let act = later[i].act
+        let vals = copyRow(&later[i].vals)
+        let to = copyRow(&later[i].to)
+        i += 1
+        let c = &fw[findTab(fw, &child)]
+        let f = &c.fks[k]
         let p = &fw[findTab(fw, &f.ref)]
         let fc = fkCols(c, f, p)
-        let has = try parentHas(st, txn, p, &fc, &l.vals)
-        if !l.gone {
-            if !has { return Err(notPresent(c, f, p, &l.vals)) }
-        } else if !has {
-            let refd = try referenced(st, txn, c, &fc.cols, &l.vals)
-            if refd { return Err(stillRef(p, c, f, &l.vals)) }
+        if kind == FK_MISSING {
+            let has = try parentHas(st, txn, p, &fc, &vals)
+            if !has { return Err(notPresent(c, f, p, &vals)) }
+        } else if kind == FK_GONE {
+            // NO ACTION lets a key back by now be
+            let back = act != lexdb_sql.FK_RESTRICT && try parentHas(st, txn, p, &fc, &vals)
+            if !back {
+                let refd = try referenced(st, txn, c, &fc.cols, &vals)
+                if refd { return Err(stillRef(p, c, f, &vals)) }
+            }
+        } else {
+            let rows = try refRows(st, txn, c, &fc.cols, &vals, false)
+            if kind == FK_DELETE {
+                for r in rows { try delRow(st, txn, c, &r, fw, later) }
+            } else {
+                var defs: []Val = []
+                if act == lexdb_sql.FK_SET_DEFAULT { defs = try defaultsOf(c) }
+                for r in rows {
+                    var nr = copyRow(&r)
+                    for j in 0..len(fc.cols) {
+                        let col = fc.cols[j]
+                        if act == lexdb_sql.FK_CASCADE { nr[col] = to[j] }
+                        else if act == lexdb_sql.FK_SET_NULL { nr[col] = Val.Null }
+                        else { nr[col] = defs[col] }
+                    }
+                    try updRow(st, txn, c, &r, &nr, fw, later)
+                }
+            }
         }
     }
     return Ok(Unit{})
@@ -7375,9 +7481,6 @@ fn fkFinish(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, fw: &[]Table, lat
 
 // Adds foreign key c to table t, the table it references naming t back.
 fn addForeign(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, c: &lexdb_sql.Constraint): Result[Unit, DbErr] {
-    if c.onDelete >= lexdb_sql.FK_CASCADE || c.onUpdate >= lexdb_sql.FK_CASCADE {
-        return Err(e("0A000", "lexdb: CASCADE, SET NULL and SET DEFAULT actions are not supported yet"))
-    }
     let refKey = try catKey(st, txn, &c.refTable, false)
     if refKey == t.name {
         let f = try makeFk(st, txn, t, t, c, &refKey)
