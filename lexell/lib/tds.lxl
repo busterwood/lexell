@@ -18,6 +18,8 @@
 //     intParam, floatParam, bitParam, textParam, bytesParam, decimalParam,
 //     nullParam and typeInfoOf from a SQL type name), OUTPUT ones too, and
 //     table-valued ones (tableParam).
+//   - bulk load: INSERT BULK, then the rows in a BULK_LOAD message
+//     (bulkColumnsQuery, bulkLoad, Session.bulkData).
 //   - Transaction Manager requests (tmRequest): begin, commit, rollback.
 //   - the reply's tokens (decode): COLMETADATA, ROW, NBCROW, DONE,
 //     DONEPROC, DONEINPROC (every row count kept), ERROR, INFO, LOGINACK,
@@ -647,6 +649,19 @@ pub fn floatParam(f: float): Result[Param, Error] {
 // PLP data: the total length, one chunk, the terminator.
 fn plp(d: mut &[]byte, s: str) {
     for k in 0..8 { put8(d, (len(s) >> (8 * k)) & 0xff) }
+    plpChunks(d, s)
+}
+
+// PLP data of unknown total length (PLP_UNKNOWN_LEN), one chunk, the
+// terminator: what a bulk load's rows need (with the length known, the
+// server misreads them: error 4804).
+fn plpUnknown(d: mut &[]byte, s: str) {
+    put8(d, 0xFE)
+    for k in 0..7 { put8(d, 0xFF) }
+    plpChunks(d, s)
+}
+
+fn plpChunks(d: mut &[]byte, s: str) {
     if len(s) > 0 {
         put32(d, len(s))
         appendStr(d, s)
@@ -654,9 +669,12 @@ fn plp(d: mut &[]byte, s: str) {
     put32(d, 0)
 }
 
-// UTF-16 text as an nvarchar value: its length then the text, or PLP for max.
-fn textData(d: mut &[]byte, u: &[]byte, max: bool) {
-    if max {
+// UTF-16 text as an nvarchar value: its length then the text, or PLP for
+// max (of unknown length when unknown).
+fn textData(d: mut &[]byte, u: &[]byte, max: bool, unknown: bool) {
+    if max && unknown {
+        plpUnknown(d, strFromBytes(u))
+    } else if max {
         plp(d, strFromBytes(u))
     } else {
         put16(d, len(u))
@@ -664,9 +682,12 @@ fn textData(d: mut &[]byte, u: &[]byte, max: bool) {
     }
 }
 
-// Bytes as a varbinary value: their length then the bytes, or PLP for max.
-fn bytesData(d: mut &[]byte, b: &str, max: bool) {
-    if max {
+// Bytes as a varbinary value: their length then the bytes, or PLP for max
+// (of unknown length when unknown).
+fn bytesData(d: mut &[]byte, b: &str, max: bool, unknown: bool) {
+    if max && unknown {
+        plpUnknown(d, b)
+    } else if max {
         plp(d, b)
     } else {
         put16(d, len(b))
@@ -687,7 +708,7 @@ pub fn textParam(s: str, coll: &Collation): Result[Param, Error] {
     let max = len(u) > 8000
     put16(mut &ti, if max { 0xFFFF } else { 8000 })
     appendStr(mut &ti, collationBytes(coll))
-    textData(mut &d, &u, max)
+    textData(mut &d, &u, max, false)
     return Ok(param(if max { "nvarchar(max)" } else { "nvarchar(4000)" }, &ti, &d))
 }
 
@@ -699,7 +720,7 @@ pub fn bytesParam(b: str): Param {
     var d: []byte = []
     let max = len(b) > 8000
     put16(mut &ti, if max { 0xFFFF } else { 8000 })
-    bytesData(mut &d, &b, max)
+    bytesData(mut &d, &b, max, false)
     return param(if max { "varbinary(max)" } else { "varbinary(8000)" }, &ti, &d)
 }
 
@@ -956,6 +977,7 @@ type ColKind = value closed {
 type TableCol = record {
     kind: ColKind
     long: bool
+    bulk: bool                          // in a bulk load's rows: PLP of unknown length
     intDigits: int
     scale: int
 }
@@ -996,9 +1018,10 @@ fn intDigits(n: int): int {
 
 fn intMagnitude(n: int): u128 { return if n < 0 { u128(-(n + 1)) + 1 } else { u128(n) } }
 
-// Takes value v (column i) into col's kind, or E_INPUT when the column
-// already holds values of another kind. An int goes into a decimal column.
-fn (col: mut &TableCol) take(v: &sqldialect.Value, i: int): Result[Unit, Error] {
+// Takes value v into col's kind, or E_INPUT when the column (named by
+// what: "column 1", "column [price]") already holds values of another
+// kind. An int goes into a decimal column.
+fn (col: mut &TableCol) take(v: &sqldialect.Value, what: &str): Result[Unit, Error] {
     var k = ColKind.Unknown
     match v {
         sqldialect.Value.Null { return Ok(Unit{}) }
@@ -1026,8 +1049,7 @@ fn (col: mut &TableCol) take(v: &sqldialect.Value, i: int): Result[Unit, Error] 
     if col.kind == ColKind.Unknown || col.kind == k { col.kind = k } else if col.kind == ColKind.Int && k == ColKind.Dec {
         col.kind = k
     } else if !(col.kind == ColKind.Dec && k == ColKind.Int) {
-        return Err(sqldialect.inputError("column " + (i + 1).toStr() + " has " + kindName(col.kind) + " and " +
-                                         kindName(k) + " values"))
+        return Err(sqldialect.inputError(what + " has " + kindName(col.kind) + " and " + kindName(k) + " values"))
     }
     return Ok(Unit{})
 }
@@ -1087,9 +1109,9 @@ fn (col: &TableCol) put(d: mut &[]byte, v: &sqldialect.Value, ti: &str): Result[
                 Ok(x) { x }
                 Err(e) { return Err(sqldialect.inputError("text value: " + e)) }
             }
-            textData(d, &u, col.long)
+            textData(d, &u, col.long, col.bulk)
         }
-        sqldialect.Value.Bytes(b) { bytesData(d, &b, col.long) }
+        sqldialect.Value.Bytes(b) { bytesData(d, &b, col.long, col.bulk) }
         sqldialect.Value.Dec(x) {
             let parts = try decimalParts(x)
             var m = parts.m
@@ -1173,7 +1195,7 @@ pub fn tableParam(typeName: str, rows: &[[]sqldialect.Value], nullTypes: &[str],
         byServer[k] = true
     }
     var cols: []TableCol = []
-    for i in 0..n { append(mut &cols, TableCol{kind: ColKind.Unknown, long: false, intDigits: 0, scale: 0}) }
+    for i in 0..n { append(mut &cols, TableCol{kind: ColKind.Unknown, long: false, bulk: false, intDigits: 0, scale: 0}) }
     for r in 0..len(rows) {
         if len(rows[r]) != n {
             return Err(sqldialect.inputError("row " + (r + 1).toStr() + " of a table parameter has " + len(rows[r]).toStr() +
@@ -1181,7 +1203,7 @@ pub fn tableParam(typeName: str, rows: &[[]sqldialect.Value], nullTypes: &[str],
         }
         for i in 0..n {
             if !byServer[i] {
-                try cols[i].take(&rows[r][i], i)
+                try cols[i].take(&rows[r][i], &("column " + (i + 1).toStr()))
             } else if !isNull(&rows[r][i]) {
                 return Err(sqldialect.inputError("row " + (r + 1).toStr() + " has a value for default column " + i.toStr() +
                                                  ": the server fills it, so it must be NULL"))
@@ -1209,6 +1231,157 @@ pub fn tableParam(typeName: str, rows: &[[]sqldialect.Value], nullTypes: &[str],
     put8(mut &d, TVP_END)
     return Ok(Param{name: "", output: false, byDefault: false, declared: typeName + " READONLY",
                     typeInfo: strFromBytes(&ti), data: strFromBytes(&d)})
+}
+
+// ---------------------------------------------------------------- bulk load
+
+pub const PT_BULK = 7
+
+// The SQL type the column's TYPE_INFO is, as INSERT BULK's column list
+// declares it: typeInfo's choice, by name.
+fn (col: &TableCol) sqlType(nullType: &str): str {
+    return match col.kind {
+        ColKind.Int { "bigint" }
+        ColKind.Float { "float" }
+        ColKind.Bool { "bit" }
+        ColKind.Bytes { if col.long { "varbinary(max)" } else { "varbinary(8000)" } }
+        ColKind.Dec { "decimal(" + max(col.intDigits + col.scale, 1).toStr() + "," + col.scale.toStr() + ")" }
+        ColKind.Text { if col.long { "nvarchar(max)" } else { "nvarchar(4000)" } }
+        ColKind.Unknown { if len(nullType) > 0 { strings.toLowerAscii(strings.trim(nullType)) } else { "nvarchar(4000)" } }
+    }
+}
+
+// A name in brackets, ] doubled: a delimited identifier.
+fn bracketed(n: &str): str {
+    var out = newStrBuf()
+    out.add("[")
+    for i in 0..len(n) {
+        let c = n[i..i + 1]
+        out.add(if c == "]" { "]]" } else { c })
+    }
+    out.add("]")
+    return out.toStr()
+}
+
+// What a bulk load sends: the INSERT BULK statement, then the BULK_LOAD
+// message (COLMETADATA, a ROW per row, DONE).
+pub type BulkLoad = value record {
+    pub statement: str
+    pub payload: str
+}
+
+// The INSERT BULK options, in WITH (...).
+pub type BulkOptions = value record {
+    pub tablock: bool               // TABLOCK: a table lock for the load
+    pub checkConstraints: bool      // CHECK_CONSTRAINTS: else CHECK and FOREIGN KEY constraints are not checked
+    pub fireTriggers: bool          // FIRE_TRIGGERS: else INSERT triggers do not run
+    pub keepNulls: bool             // KEEP_NULLS: else a NULL goes in as the column's DEFAULT, if it has one
+}
+
+// The checked name of a table: one to three regular identifiers (a
+// #temporary table's name too).
+pub fn validTableName(t: &str): bool {
+    let parts = strings.split(t, ".")
+    if len(parts) > 3 { return false }
+    for p in parts {
+        if !validIdentifier(&p) { return false }
+    }
+    return true
+}
+
+// The query whose COLMETADATA describes a bulk load's destination columns
+// (bulkLoad's dest): no rows. E_INPUT for a table name that is not
+// validTableName, no columns, more than MAX_TABLE_COLUMNS, or a column
+// name that is empty, longer than 128 characters or not UTF-8.
+pub fn bulkColumnsQuery(table: str, names: &[str]): Result[str, Error] {
+    if !validTableName(&table) {
+        return Err(sqldialect.inputError("a table's name must be one to three regular identifiers"))
+    }
+    if len(names) < 1 || len(names) > MAX_TABLE_COLUMNS {
+        return Err(sqldialect.inputError("a bulk load has 1 to " + MAX_TABLE_COLUMNS.toStr() + " columns, not " + len(names).toStr()))
+    }
+    var q = newStrBuf()
+    q.add("SELECT TOP 0 ")
+    for i in 0..len(names) {
+        if len(names[i]) < 1 || utf16Units(&names[i]) > 128 || toUtf16(names[i]).isErr() {
+            return Err(sqldialect.inputError("a column's name is 1 to 128 characters of UTF-8"))
+        }
+        if i > 0 { q.add(", ") }
+        q.add(bracketed(&names[i]))
+    }
+    q.add(" FROM " + table)
+    return Ok(q.toStr())
+}
+
+fn binaryType(t: int): bool { return t == T_BIGVARBIN || t == T_BIGBINARY || t == T_VARBINARY || t == T_BINARY || t == T_IMAGE }
+
+// The bulk load of rows into table, whose columns dest describes (the
+// COLMETADATA of bulkColumnsQuery's result), in the rows' order. Each
+// column goes as the type its values make it, as a table parameter's
+// (tableParam), and the server converts it to the table's as an INSERT
+// does; one of only NULLs goes as varbinary for a binary column, else
+// nvarchar. Text and bytes for a (max) or xml column go as (max): the
+// server takes no other type there (error 4816). A
+// column's nullability is dest's: the server refuses a load that differs
+// (error 4816). E_INPUT for rows of another length than dest and a column
+// with values of two kinds (but int and decimal).
+pub fn bulkLoad(table: str, dest: &[Column], rows: &[[]sqldialect.Value], opts: &BulkOptions,
+                coll: &Collation): Result[BulkLoad, Error] {
+    if !validTableName(&table) {
+        return Err(sqldialect.inputError("a table's name must be one to three regular identifiers"))
+    }
+    let n = len(dest)
+    if n < 1 || n > MAX_TABLE_COLUMNS {
+        return Err(sqldialect.inputError("a bulk load has 1 to " + MAX_TABLE_COLUMNS.toStr() + " columns, not " + n.toStr()))
+    }
+    var cols: []TableCol = []
+    for i in 0..n { append(mut &cols, TableCol{kind: ColKind.Unknown, long: false, bulk: false, intDigits: 0, scale: 0}) }
+    for r in 0..len(rows) {
+        if len(rows[r]) != n {
+            return Err(sqldialect.inputError("row " + (r + 1).toStr() + " has " + len(rows[r]).toStr() + " values for " +
+                                             n.toStr() + " columns"))
+        }
+        for i in 0..n { try cols[i].take(&rows[r][i], &("column " + bracketed(&dest[i].name))) }
+    }
+    var b: []byte = []
+    put8(mut &b, TK_COLMETADATA)
+    put16(mut &b, n)
+    var infos: []str = []
+    var decl = newStrBuf()
+    decl.add("INSERT BULK " + table + " (")
+    for i in 0..n {
+        // a (max) or xml column takes only (max) text and bytes (error 4816)
+        let plp = dest[i].size < 0 || dest[i].tdsType == T_XML
+        if plp { cols[i].long = true }
+        cols[i].bulk = true
+        let nt = if cols[i].kind != ColKind.Unknown { "" } else if binaryType(dest[i].tdsType) {
+            if plp { "varbinary(max)" } else { "varbinary(8000)" }
+        } else if plp { "nvarchar(max)" } else { "nvarchar(4000)" }
+        let info = try cols[i].typeInfo(&nt, coll)
+        put32(mut &b, 0)                               // UserType
+        put16(mut &b, (dest[i].flags & 1) | 8)          // Flags: dest's fNullable, usUpdateable read/write
+        appendStr(mut &b, info)
+        putBVarchar(mut &b, &dest[i].name)
+        append(mut &infos, info)
+        if i > 0 { decl.add(", ") }
+        decl.add(bracketed(&dest[i].name) + " " + cols[i].sqlType(&nt))
+    }
+    decl.add(")")
+    var with: []str = []
+    if opts.tablock { append(mut &with, "TABLOCK") }
+    if opts.checkConstraints { append(mut &with, "CHECK_CONSTRAINTS") }
+    if opts.fireTriggers { append(mut &with, "FIRE_TRIGGERS") }
+    if opts.keepNulls { append(mut &with, "KEEP_NULLS") }
+    if len(with) > 0 { decl.add(" WITH (" + strings.join(&with, ", ") + ")") }
+    for r in 0..len(rows) {
+        put8(mut &b, TK_ROW)
+        for i in 0..n { try cols[i].put(mut &b, &rows[r][i], &infos[i]) }
+    }
+    put8(mut &b, TK_DONE)
+    put16(mut &b, 0)                                   // Status
+    put16(mut &b, 0)                                   // CurCmd
+    for k in 0..8 { put8(mut &b, 0) }                  // DoneRowCount
+    return Ok(BulkLoad{statement: decl.toStr(), payload: strFromBytes(&b)})
 }
 
 // ---------------------------------------------------------------- transactions
@@ -2737,6 +2910,14 @@ pub fn (s: mut &Session) executeSql(sql: str, params: &[Param], w: Where): Resul
     if s.broken { return Err(ioErr("the connection is broken by an earlier error")) }
     let payload = try executeSql(sql, params, s.txn, &s.collation)
     return s.request(PT_RPC, payload, w)
+}
+
+// Sends the BULK_LOAD message of a bulk load whose INSERT BULK statement
+// the server has accepted (in a batch just before): the reply's DONE has
+// the rows loaded.
+pub fn (s: mut &Session) bulkData(payload: str, w: Where): Result[Reply, Error] {
+    if s.broken { return Err(ioErr("the connection is broken by an earlier error")) }
+    return s.request(PT_BULK, payload, w)
 }
 
 // Sends a Transaction Manager request: TM_BEGIN_XACT, TM_COMMIT_XACT or

@@ -230,7 +230,7 @@ Each stage is one branch, merged after the full gate.
 | T2 | every type of the table, collations 1252 and Latin-1, RPC `sp_executesql` with parameters, multiple results, ERROR/INFO with their state and severity, row counts, `transaction[T]`, ENVCHANGE | the full type matrix and the error cases match ODBC (built: section 9) |
 | T3 | streamed `Rows`, ATTENTION with deadlines and cancellation (section 2), `Pool`/`Lease`, the http_gate `--db` SQL Server load, PERFORMANCE.md | load numbers against ODBC; cancellation tests; no leak under LXL_CHECK=1 |
 | T4 | Sybase ASE over TDS 5.0 (`sybase` module) | the differential suite against ASE (needs a server) |
-| T5 | bulk copy (BULK LOAD, packet type 7) for fast inserts; NTLM; TDS 8.0 strict; Azure AD tokens; table-valued parameters (built: section 11) | each as needed |
+| T5 | bulk copy (BULK LOAD, packet type 7) for fast inserts (built: section 12); NTLM; TDS 8.0 strict; Azure AD tokens; table-valued parameters (built: section 11) | each as needed |
 
 T1 is about one agent's run, and T2 and T3 one each. T4 depends on having a
 server.
@@ -526,3 +526,75 @@ READONLY`.
   rolled back, a procedure's parameter, an identity column refused and then
   filled by the server, a computed column and a DEFAULT, the refusals for
   default columns). Both pass under the C and native backends.
+
+## 12. Bulk copy, as built (2026-11-09)
+
+Branch `bulk`. `Conn.bulkInsert(table, &columns, &rows, &opts): int` is
+the BULK_LOAD protocol (MS-TDS 2.2.6.1), what bcp and SqlBulkCopy send, in
+three round trips:
+
+1. `SELECT TOP 0 [c1], [c2], ... FROM table`: the destination's
+   COLMETADATA. The server checks the names (208, 207) before anything is
+   loaded.
+2. `INSERT BULK table ([c1] type, ...) [WITH (TABLOCK, CHECK_CONSTRAINTS,
+   FIRE_TRIGGERS, KEEP_NULLS)]` as a SQL batch: the server accepts it with a
+   DONE and then waits for the rows.
+3. A BULK_LOAD message (packet type 7, no ALL_HEADERS): COLMETADATA (the
+   columns' TYPE_INFO and names), a ROW token per row, a DONE. The reply's
+   DONE has the rows loaded.
+
+What the live server showed, case by case (`sqlserver_live_bulk_types`
+is the matrix):
+
+- **Types convert as an INSERT does.** The columns go as the types their
+  values make them (as a table parameter's: bigint, float, bit, nvarchar,
+  varbinary, decimal(p, s) wide enough), declared so in INSERT BULK and
+  COLMETADATA, and the server converts each to the table's column: bigint
+  into int, tinyint, money or bit, text into date, datetime2,
+  uniqueidentifier, xml or a code-page varchar. Where SQL Server has no
+  implicit conversion the error is the INSERT's: 206 (an Int into a date),
+  257 (Text into varbinary). So no client-side encoding per destination
+  type is needed, as it is in SqlBulkCopy and go-mssqldb, which declare the
+  destination's own types and convert to them.
+- **Nullability must match the destination's** in COLMETADATA's flags,
+  both ways (error 4816, "Invalid column type from bcp client"): that is
+  what the SELECT TOP 0 is for.
+- **A (max) or xml column takes only (max) types** (4816 for
+  nvarchar(4000) into nvarchar(max), although bigint goes in), so text and
+  bytes for such a column go as nvarchar(max) and varbinary(max).
+- **PLP values must have an unknown length** (PLP_UNKNOWN_LEN,
+  0xFFFFFFFFFFFFFFFE, then the chunks). With the total length given, as
+  RPC parameters have it, the server misreads the row (4804, premature end
+  of message, or 4895 in a later column). The bulk rows use the unknown
+  length; RPCs and table parameters keep the known one.
+- **A column of only NULLs** goes as varbinary for a binary column and as
+  nvarchar otherwise, (max) as the destination: the destination is known,
+  so there are no null types to give.
+- **Identity:** INSERT BULK has no KEEP_IDENTITY (error 102). An identity
+  column named in the columns takes the rows' values; one left out gets
+  the server's. SqlBulkCopy's KeepIdentity is that choice.
+- **Defaults:** without KEEP_NULLS a NULL takes the column's DEFAULT, as
+  bcp does; columns left out get theirs.
+
+Errors in the rows (8115, 515, 547 under CHECK_CONSTRAINTS, 245) are the
+server's, after which the connection is idle. A deadline or cancellation
+while the reply is awaited sends ATTENTION (the request path's abandon);
+one while the rows are being sent breaks the connection (part of the
+message may have gone), as for any request.
+
+- **Not done:** streaming rows into packets as they are produced (the
+  message is built whole, so a load's rows and their encoding are in
+  memory together: load in batches, a call each); ORDER and
+  ROWS_PER_BATCH / KILOBYTES_PER_BATCH hints; columns by default (every
+  column of the table without naming them); text, ntext and image
+  destinations take Text and Bytes but are not tested beyond the matrix.
+- **Tests:** `sqlserver_fake_bulk` (offline: the three messages, the BULK_LOAD
+  one decoded by the client's own token decoder, with the destination's
+  nullability and the unknown PLP length; a server error, no rows, a
+  deadline with ATTENTION, the server closing; it fails when the bulk rows
+  use known PLP lengths), `sqlserver_live_bulk` (twelve kinds of column,
+  each server error idle, identity given and left out, each option on and
+  off, 50,000 rows, a transaction rolled back, our refusals) and
+  `sqlserver_live_bulk_types` (the matrix). All pass under the C and native
+  backends.
+

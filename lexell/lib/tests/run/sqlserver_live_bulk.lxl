@@ -1,0 +1,161 @@
+// sqlserver.bulkInsert against a live SQL Server ($MSSQL_TEST_DSN or
+// ~/.obo-mssql-dsn; exits 77, skipped, without one; the string and the
+// server's connect messages are never printed): twelve columns of every
+// kind converted by the server (text to date, uniqueidentifier, datetime2,
+// xml and a code-page varchar; an Int into decimal and tinyint; a NULL
+// becoming a column's DEFAULT); the server's errors for an overflow, a
+// missing column and a missing table, each leaving the connection idle; an
+// identity column given and left out; KEEP_NULLS, CHECK_CONSTRAINTS,
+// FIRE_TRIGGERS and TABLOCK each on and off; 50,000 rows with (max) text
+// over many packets; a load in a transaction rolled back; no rows (the
+// names still checked); our refusals before anything is sent. The table it
+// creates is dropped.
+// expect: loaded 2
+// expect: row 1 'café' 12.50 '2026-11-09' true 'naïve' '6F9619FF-8B86-D011-B42D-00C04FC964FF' '2026-11-09 10:11:12.345' x'0102' 7 '<a>1</a>' 'dflt'
+// expect: row 2 NULL 3.00 NULL false NULL NULL NULL NULL NULL NULL 'given'
+// expect: overflow: error 8115 | idle true
+// expect: no column: error 207 | idle true
+// expect: no table: error 208 | idle true
+// expect: identity: 100a,101b
+// expect: keep nulls: off 'dflt' | on NULL
+// expect: check constraints: off loaded 1 | on error 547 | idle true
+// expect: fire triggers: off 1 | on 10
+// expect: tablock: loaded 1
+// expect: many: 50000 sum 1249975000 longest 5000
+// expect: rolled back: loaded 3, rows after 0, idle true
+// expect: no rows: 0 | bad column: error 207
+// expect: refused: error 1000: a table's name must be one to three regular identifiers
+// expect: refused: error 1000: row 1 has 1 values for 2 columns
+// expect: refused: error 1000: column [id] has int and text values
+// expect: refused: error 1000: a column's name is 1 to 128 characters of UTF-8
+// expect: open handles 0
+import "sqlserver"
+import "sqldialect"
+import "io"
+import "os"
+import "strings"
+
+type V = sqlserver.Value
+type Error = sqlserver.Error
+
+fn dsn(): Option[str] {
+    match os.env("MSSQL_TEST_DSN") {
+        Some(d) { if len(strings.trim(d)) > 0 { return Some(strings.trim(d)) } }
+        None {}
+    }
+    match io.read(os.envOr("HOME", "") + "/.obo-mssql-dsn") {
+        Ok(d) { if len(strings.trim(d)) > 0 { return Some(strings.trim(d)) } }
+        Err(_) {}
+    }
+    return None
+}
+
+// Server errors by number only (their text can name generated temp names); ours in full.
+fn err(e: &Error): str {
+    if e.code == sqldialect.E_INPUT { return "error " + e.code.toStr() + ": " + e.msg }
+    return "error " + e.code.toStr()
+}
+
+fn load(c: mut &sqlserver.Conn, table: str, cols: &[str], rows: &[[]V], o: &sqlserver.BulkOptions): str {
+    match c.bulkInsert(table, cols, rows, o) {
+        Ok(n) { return "loaded " + n.toStr() }
+        Err(e) { return err(&e) }
+    }
+}
+
+fn one(c: mut &sqlserver.Conn, sql: str): str { return c.query(sql, &[]).unwrap().value(0, 0).unwrap().toStr() }
+
+fn main() {
+    let d = match dsn() { Some(x) { x } None { exit(77) } }
+    var c = match sqlserver.connect(d) {
+        Ok(x) { x }
+        Err(_) { exit(77) }
+    }
+    run(mut &c)
+    c.exec("IF OBJECT_ID('dbo.LxlBulk') IS NOT NULL DROP TABLE dbo.LxlBulk").unwrap()
+    c.close()
+    println("open handles " + intToStr(sqlserver.openHandles()))
+}
+
+fn run(c: mut &sqlserver.Conn) {
+    let none = sqlserver.bulkOptions()
+    c.exec("CREATE TABLE #b(id int NOT NULL, name nvarchar(50), price decimal(10,2), born date, ok bit, " +
+           "v varchar(20) COLLATE Latin1_General_CI_AS, g uniqueidentifier, dt datetime2(3), bin varbinary(10), small tinyint, " +
+           "x xml, d2 nvarchar(10) DEFAULT N'dflt')").unwrap()
+    let cols = ["id", "name", "price", "born", "ok", "v", "g", "dt", "bin", "small", "x", "d2"]
+    let rows: [][]V = [
+        [V.Int(1), V.Text("café"), V.Dec(12.5m), V.Text("2026-11-09"), V.Bool(true), V.Text("naïve"),
+         V.Text("6F9619FF-8B86-D011-B42D-00C04FC964FF"), V.Text("2026-11-09 10:11:12.345"), V.Bytes("\x01\x02"), V.Int(7),
+         V.Text("<a>1</a>"), V.Null],
+        [V.Int(2), V.Null, V.Int(3), V.Null, V.Bool(false), V.Null, V.Null, V.Null, V.Null, V.Null, V.Null, V.Text("given")],
+    ]
+    println(load(c, "#b", &cols, &rows, &none))
+    let r = c.query("SELECT name, price, born, ok, v, g, dt, bin, small, x, d2 FROM #b ORDER BY id", &[]).unwrap()
+    for i in 0..r.rowCount() {
+        var cells: []str = []
+        for j in 0..r.columnCount() { append(mut &cells, r.value(i, j).unwrap().toStr()) }
+        println("row " + (i + 1).toStr() + " " + strings.join(&cells, " "))
+    }
+    println("overflow: " + load(c, "#b", &["id", "small"], &[[V.Int(3), V.Int(300)]], &none) + " | idle " + c.idle().toStr())
+    println("no column: " + load(c, "#b", &["id", "nope"], &[[V.Int(3), V.Null]], &none) + " | idle " + c.idle().toStr())
+    println("no table: " + load(c, "#nope", &["id"], &[[V.Int(3)]], &none) + " | idle " + c.idle().toStr())
+
+    c.exec("CREATE TABLE #i(id int IDENTITY(10,1), name nvarchar(10))").unwrap()
+    let given = load(c, "#i", &["id", "name"], &[[V.Int(100), V.Text("a")]], &none)
+    let omitted = load(c, "#i", &["name"], &[[V.Text("b")]], &none)
+    println("identity: " + c.query("SELECT STRING_AGG(CONCAT(id, name), ',') WITHIN GROUP (ORDER BY id) FROM #i", &[]).unwrap()
+                               .text(0, 0).unwrap())
+
+    // KEEP_NULLS: a NULL for a column with a DEFAULT
+    c.exec("CREATE TABLE #k(id int, d nvarchar(10) DEFAULT N'dflt')").unwrap()
+    var keep = sqlserver.bulkOptions()
+    keep.keepNulls = true
+    let k1 = load(c, "#k", &["id", "d"], &[[V.Int(1), V.Null]], &none)
+    let k2 = load(c, "#k", &["id", "d"], &[[V.Int(2), V.Null]], &keep)
+    println("keep nulls: off " + one(c, "SELECT d FROM #k WHERE id = 1") + " | on " + one(c, "SELECT d FROM #k WHERE id = 2"))
+
+    // CHECK_CONSTRAINTS and FIRE_TRIGGERS need a real table (a temporary one has no triggers)
+    c.exec("IF OBJECT_ID('dbo.LxlBulk') IS NOT NULL DROP TABLE dbo.LxlBulk").unwrap()
+    c.exec("CREATE TABLE dbo.LxlBulk(id int, n int CHECK (n > 0))").unwrap()
+    c.exec("CREATE TRIGGER dbo.LxlBulkTimesTen ON dbo.LxlBulk AFTER INSERT AS " +
+           "UPDATE dbo.LxlBulk SET n = n * 10 WHERE id IN (SELECT id FROM inserted)").unwrap()
+    var check = sqlserver.bulkOptions()
+    check.checkConstraints = true
+    let c1 = load(c, "dbo.LxlBulk", &["id", "n"], &[[V.Int(1), V.Int(-1)]], &none)
+    let c2 = load(c, "dbo.LxlBulk", &["id", "n"], &[[V.Int(2), V.Int(-1)]], &check)
+    println("check constraints: off " + c1 + " | on " + c2 + " | idle " + c.idle().toStr())
+    c.exec("DELETE FROM dbo.LxlBulk").unwrap()
+    var fire = sqlserver.bulkOptions()
+    fire.fireTriggers = true
+    let f1 = load(c, "dbo.LxlBulk", &["id", "n"], &[[V.Int(1), V.Int(1)]], &none)
+    let f2 = load(c, "dbo.LxlBulk", &["id", "n"], &[[V.Int(2), V.Int(1)]], &fire)
+    println("fire triggers: off " + one(c, "SELECT n FROM dbo.LxlBulk WHERE id = 1") + " | on " +
+            one(c, "SELECT n FROM dbo.LxlBulk WHERE id = 2"))
+    var lock = sqlserver.bulkOptions()
+    lock.tablock = true
+    println("tablock: " + load(c, "dbo.LxlBulk", &["id", "n"], &[[V.Int(3), V.Int(1)]], &lock))
+
+    c.exec("CREATE TABLE #m(id int, note nvarchar(max))").unwrap()
+    var many: [][]V = []
+    for i in 0..50000 {
+        append(mut &many, [V.Int(i), if i % 1000 == 0 { V.Text(strings.padLeft("", 5000, 'z')) } else { V.Text("row " + i.toStr()) }])
+    }
+    let m = c.bulkInsert("#m", &["id", "note"], &many, &none).unwrap()
+    println("many: " + m.toStr() + " sum " + one(c, "SELECT SUM(CAST(id AS bigint)) FROM #m") + " longest " +
+            one(c, "SELECT MAX(LEN(note)) FROM #m"))
+
+    c.exec("CREATE TABLE #t(id int)").unwrap()
+    var inside = ""
+    let tr = c.transaction(fn(t: mut &sqlserver.Conn): Result[Unit, Error] {
+        inside = load(t, "#t", &["id"], &[[V.Int(1)], [V.Int(2)], [V.Int(3)]], &sqlserver.bulkOptions())
+        return Err(sqldialect.inputError("roll back"))
+    })
+    println("rolled back: " + inside + ", rows after " + one(c, "SELECT COUNT(*) FROM #t") + ", idle " + c.idle().toStr())
+
+    println("no rows: " + c.bulkInsert("#t", &["id"], &[], &none).unwrap().toStr() + " | bad column: " +
+            load(c, "#t", &["nope"], &[], &none))
+    println("refused: " + load(c, "#t; DROP TABLE x", &["id"], &[[V.Int(1)]], &none))
+    println("refused: " + load(c, "#b", &["id", "name"], &[[V.Int(1)]], &none))
+    println("refused: " + load(c, "#b", &["id", "name"], &[[V.Int(1), V.Null], [V.Text("x"), V.Null]], &none))
+    println("refused: " + load(c, "#b", &["id", ""], &[[V.Int(1), V.Null]], &none))
+}

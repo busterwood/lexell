@@ -1,0 +1,321 @@
+// sqlserver.bulkInsert against a scripted fake server on 127.0.0.1 (a task
+// of this program), byte level: the SELECT TOP 0 that asks for the
+// destination's columns, the INSERT BULK statement (each column's type
+// from its values, a (max) column as (max), the options), and the BULK_LOAD
+// message (packet type 7), decoded by the client's own token decoder:
+// COLMETADATA with the destination's nullability and names, the rows, a
+// (max) value of unknown length, then DONE. Then a server error for the
+// rows (the connection idle), no rows (only the column query), a deadline
+// while the rows' reply is awaited (ATTENTION, the connection idle), and
+// the server closing during a load (the connection broken).
+// expect: loaded 2 | idle true
+// expect: refused: error 515: Cannot insert the value NULL into column 'id'. | idle true
+// expect: no rows: 0
+// expect: deadline: error 1021 | idle true | after: 9
+// expect: closed: error 1023 | idle false
+// expect: server: SELECT TOP 0 [id], [name], [note] FROM dbo.t | INSERT BULK dbo.t ([id] bigint, [name] nvarchar(4000), [note] nvarchar(max)) WITH (TABLOCK, KEEP_NULLS) | bulk type 7: columns id INTN not null, name NVARCHAR null, note NVARCHAR null | rows 1 'é' 'long' / 2 NULL NULL | unknown length true | done true | SELECT TOP 0 [id] FROM #t | INSERT BULK #t ([id] nvarchar(4000)) | bulk type 7 | SELECT TOP 0 [id] FROM #t | SELECT TOP 0 [id] FROM #t | INSERT BULK #t ([id] bigint) | bulk type 7 | attention while the rows' reply is awaited | UPDATE x | SELECT TOP 0 [id] FROM #t | INSERT BULK #t ([id] bigint) | closed
+// expect: open handles: 0
+import "sqlserver"
+import "tds"
+import "net"
+import "task"
+import "strings"
+import "../support/tdstest" as tt
+
+type V = sqlserver.Value
+type Error = sqlserver.Error
+
+var ADDR: str = ""
+
+type Wire = record { c: net.Conn; pending: str; rest: str }
+
+fn (x: mut &Wire) fill(n: int): bool {
+    var tmp = array(4096, byte(0))
+    while len(x.pending) < n {
+        match x.c.read(mut &tmp) {
+            Ok(k) {
+                if k == 0 { return false }
+                x.pending = x.pending + strFromBytes(&tmp[0..k])
+            }
+            Err(_) { return false }
+        }
+    }
+    return true
+}
+
+// A message, and the status of its first packet.
+type Msg = value record { ptype: int; status: int; data: str }
+
+fn (x: mut &Wire) message(): Option[Msg] {
+    var data = ""
+    var ptype = -1
+    var status = -1
+    while true {
+        if !x.fill(8) { return None }
+        let n = (int(x.pending[2]) << 8) | int(x.pending[3])
+        if n < 8 || !x.fill(n) { return None }
+        ptype = int(x.pending[0])
+        if status < 0 { status = int(x.pending[1]) }
+        let eom = (int(x.pending[1]) & 1) != 0
+        data = data + x.pending[8..n]
+        x.pending = x.pending[n..]
+        if eom { break }
+    }
+    return Some(Msg{ptype: ptype, status: status, data: data})
+}
+
+// The request's text (a batch: after ALL_HEADERS, UTF-16).
+fn sqlOf(m: &Msg): str {
+    if m.ptype != tds.PT_SQLBATCH || len(m.data) < 4 { return "type " + m.ptype.toStr() }
+    let skip = int(m.data[0]) | (int(m.data[1]) << 8) | (int(m.data[2]) << 16)
+    return tds.fromUtf16(m.data[skip..]).unwrap()
+}
+
+fn (x: &Wire) send(payload: str) { let r = x.c.write(&tds.packets(tds.PT_REPLY, payload, 512)) }
+
+// The first k packets of a reply (none with EOM); the rest is kept for
+// attention: a server stops between tokens, so it ends the message it is
+// sending before it acknowledges, as SQL Server does when the reply is
+// already on its way.
+fn (x: mut &Wire) sendPart(payload: str, k: int) {
+    let b = tds.packets(tds.PT_REPLY, payload, 512)
+    var end = 0
+    for i in 0..k { end += (int(b[end + 2]) << 8) | int(b[end + 3]) }
+    let r = x.c.write(&b[0..end])
+    x.rest = strFromBytes(&b[end..])
+}
+
+// The rest of an interrupted reply, then the acknowledgement in a message
+// of its own.
+fn (x: mut &Wire) acknowledge() {
+    if len(x.rest) > 0 {
+        let r = x.c.writeStr(x.rest)
+        x.rest = ""
+    }
+    x.send(acknowledged())
+}
+
+fn done(status: int, count: int): str {
+    var b = tt.bytesOf()
+    b.done(tds.TK_DONE, status, 0xC1, count)
+    return b.str()
+}
+
+fn acknowledged(): str { return done(0x20, 0) }
+
+// Accepts a connection and logs it in (packet size 512).
+fn session(ln: &net.Listener): Option[Wire] {
+    let a = ln.accept()
+    if a.isErr() { return None }
+    var w = Wire{c: a.unwrap(), pending: "", rest: ""}
+    if w.message().isNone() { return None }
+    var p = tt.bytesOf()
+    for v in [0, 0, 11, 0, 6, 1, 0, 17, 0, 1, 0xff] { p.u8(v) }
+    for v in [17, 0, 0x13, 0xab, 0, 0] { p.u8(v) }
+    p.u8(tds.ENCRYPT_NOT_SUP)
+    w.send(p.str())
+    if w.message().isNone() { return None }
+    var l = tt.bytesOf()
+    l.loginAck()
+    l.envText(1, "app", "master")
+    l.envText(4, "512", "4096")
+    l.raw(done(0, 0))
+    w.send(l.str())
+    return Some(w)
+}
+
+// The next message is an ATTENTION: acknowledged, and logged as what.
+fn attention(w: mut &Wire, log: mut &[]str, what: str) {
+    match w.message() {
+        Some(m) {
+            if m.ptype == tds.PT_ATTENTION {
+                append(log, "attention " + what)
+                w.acknowledge()
+            } else {
+                append(log, "no attention " + what + ": " + sqlOf(&m))
+            }
+        }
+        None { append(log, "closed instead of attention " + what) }
+    }
+}
+
+fn expect(w: mut &Wire, log: mut &[]str, sql: str): bool {
+    match w.message() {
+        Some(m) {
+            if sqlOf(&m) == sql { return true }
+            append(log, "unexpected " + sqlOf(&m))
+        }
+        None { append(log, "closed before " + sql) }
+    }
+    return false
+}
+
+fn connStr(): str { return "Server=tcp:" + strings.replaceAll(ADDR, ":", ",") + ";UID=u;PWD=p;Database=app;Encrypt=no" }
+
+fn code[T](r: &Result[T, Error]): str {
+    match r {
+        Ok(_) { return "ok" }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+// The destination's columns: id int NOT NULL, name nvarchar(50) NULL, note nvarchar(max) NULL.
+fn columnsReply(): str {
+    var b = tt.bytesOf()
+    b.u8(tds.TK_COLMETADATA)
+    b.u16(3)
+    b.u32(0)
+    b.u16(0)                  // flags: NOT NULL
+    b.u8(tds.T_INTN)
+    b.u8(4)
+    b.name("id")
+    b.col("name", tds.T_NVARCHAR)
+    b.u16(100)
+    b.collation(0x0409, 1, 52)
+    b.name("name")
+    b.col("note", tds.T_NVARCHAR)
+    b.u16(0xFFFF)
+    b.collation(0x0409, 1, 52)
+    b.name("note")
+    b.raw(done(0x10, 0))
+    return b.str()
+}
+
+// One column, id int NULL.
+fn oneColumn(): str {
+    var b = tt.bytesOf()
+    b.u8(tds.TK_COLMETADATA)
+    b.u16(1)
+    b.col("id", tds.T_INTN)
+    b.u8(4)
+    b.name("id")
+    b.raw(done(0x10, 0))
+    return b.str()
+}
+
+fn typeName(t: int): str {
+    if t == tds.T_INTN { return "INTN" }
+    if t == tds.T_NVARCHAR { return "NVARCHAR" }
+    return t.toStr()
+}
+
+// What the BULK_LOAD message holds, decoded as a token stream.
+fn bulkText(m: &Msg): str {
+    var out = "bulk type " + m.ptype.toStr()
+    let r = match tds.decode(m.data, 1000) {
+        Ok(x) { x }
+        Err(e) { return out + ": undecodable " + e.msg }
+    }
+    let rs = &r.results[0]
+    var cols: []str = []
+    for c in rs.columns {
+        append(mut &cols, c.name + " " + typeName(c.tdsType) + (if (c.flags & 1) != 0 { " null" } else { " not null" }))
+    }
+    var rows: []str = []
+    for row in rs.rows {
+        var cells: []str = []
+        for i in 0..len(row) {
+            match tds.cellText(&rs.columns[i], &row[i]) {
+                Some(t) { append(mut &cells, if rs.columns[i].tdsType == tds.T_INTN { t } else { "'" + t + "'" }) }
+                None { append(mut &cells, "NULL") }
+            }
+        }
+        append(mut &rows, strings.join(&cells, " "))
+    }
+    let unknown = strings.contains(&m.data, &"\xfe\xff\xff\xff\xff\xff\xff\xff")
+    let ends = len(m.data) >= 13 && int(m.data[len(m.data) - 13]) == tds.TK_DONE
+    return out + ": columns " + strings.join(&cols, ", ") + " | rows " + strings.join(&rows, " / ") + " | unknown length " +
+           unknown.toStr() + " | done " + ends.toStr()
+}
+
+fn next(w: mut &Wire, log: mut &[]str): Option[Msg] {
+    match w.message() {
+        Some(m) {
+            append(log, if m.ptype == tds.PT_SQLBATCH { sqlOf(&m) } else { "bulk type " + m.ptype.toStr() })
+            return Some(m)
+        }
+        None {
+            append(log, "closed")
+            return None
+        }
+    }
+}
+
+fn serve(ln: net.Listener): str {
+    var log: []str = []
+    var w = match session(&ln) {
+        Some(x) { x }
+        None { return "no session" }
+    }
+    // a load: the columns, INSERT BULK, the rows
+    if next(mut &w, mut &log).isNone() { return strings.join(&log, " | ") }
+    w.send(columnsReply())
+    if next(mut &w, mut &log).isNone() { return strings.join(&log, " | ") }
+    w.send(done(0, 0))
+    match w.message() {
+        Some(m) {
+            append(mut &log, bulkText(&m))
+            w.send(done(0x10, 2))
+        }
+        None { append(mut &log, "closed") }
+    }
+    // the server refuses the rows
+    if next(mut &w, mut &log).isNone() { return strings.join(&log, " | ") }
+    w.send(oneColumn())
+    if next(mut &w, mut &log).isNone() { return strings.join(&log, " | ") }
+    w.send(done(0, 0))
+    if next(mut &w, mut &log).isNone() { return strings.join(&log, " | ") }
+    var e = tt.bytesOf()
+    e.message(tds.TK_ERROR, 515, 2, 16, "Cannot insert the value NULL into column 'id'.", 1)
+    e.raw(done(0x02, 0))
+    w.send(e.str())
+    // no rows: the columns only
+    if next(mut &w, mut &log).isNone() { return strings.join(&log, " | ") }
+    w.send(oneColumn())
+    // a deadline while the rows' reply is awaited
+    if next(mut &w, mut &log).isNone() { return strings.join(&log, " | ") }
+    w.send(oneColumn())
+    if next(mut &w, mut &log).isNone() { return strings.join(&log, " | ") }
+    w.send(done(0, 0))
+    if next(mut &w, mut &log).isNone() { return strings.join(&log, " | ") }
+    attention(mut &w, mut &log, "while the rows' reply is awaited")
+    if next(mut &w, mut &log).isNone() { return strings.join(&log, " | ") }
+    w.send(done(0x10, 9))
+    // closes after INSERT BULK
+    if next(mut &w, mut &log).isNone() { return strings.join(&log, " | ") }
+    w.send(oneColumn())
+    if next(mut &w, mut &log).isNone() { return strings.join(&log, " | ") }
+    append(mut &log, "closed")
+    return strings.join(&log, " | ")                   // w is dropped: the connection closes
+}
+
+fn client() {
+    var c = sqlserver.connect(connStr()).unwrap()
+    var o = sqlserver.bulkOptions()
+    o.tablock = true
+    o.keepNulls = true
+    let rows: [][]V = [[V.Int(1), V.Text("é"), V.Text("long")], [V.Int(2), V.Null, V.Null]]
+    println("loaded " + c.bulkInsert("dbo.t", &["id", "name", "note"], &rows, &o).unwrap().toStr() + " | idle " + c.idle().toStr())
+    let none = sqlserver.bulkOptions()
+    match c.bulkInsert("#t", &["id"], &[[V.Null]], &none) {
+        Ok(_) { println("refused: loaded") }
+        Err(e) { println("refused: " + e.toStr() + " | idle " + c.idle().toStr()) }
+    }
+    println("no rows: " + c.bulkInsert("#t", &["id"], &[], &none).unwrap().toStr())
+    let d = task.within(100, fn(): Result[int, Error] { return c.bulkInsert("#t", &["id"], &[[V.Int(1)]], &sqlserver.bulkOptions()) })
+    println("deadline: " + code(&d) + " | idle " + c.idle().toStr() + " | after: " + c.run("UPDATE x", &[]).unwrap().toStr())
+    let k = c.bulkInsert("#t", &["id"], &[[V.Int(1)]], &none)
+    println("closed: " + code(&k) + " | idle " + c.idle().toStr())
+}
+
+fn main() {
+    let log = task.scoped(fn(sc: mut &task.Scope): str {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        ADDR = ln.localAddr()
+        let srv = sc.start(serve, ln)
+        client()
+        return srv.wait().unwrap()
+    })
+    println("server: " + log)
+    println("open handles: " + sqlserver.openHandles().toStr())
+}

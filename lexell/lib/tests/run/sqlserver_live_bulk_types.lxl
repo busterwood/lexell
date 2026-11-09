@@ -1,0 +1,95 @@
+// sqlserver.bulkInsert of one value of each kind (Int, Float, Bool, Text,
+// Bytes, Dec, and a column of only NULLs) into a column of each SQL Server
+// type, against a live server ($MSSQL_TEST_DSN or ~/.obo-mssql-dsn; exits
+// 77, skipped, without one; never printed): "ok", or the server's error
+// number. A bulk load converts as an INSERT does: 206 (operand type clash)
+// and 257 (implicit conversion not allowed) where SQL Server makes no
+// implicit conversion, 8114 and 9403 for a value that does not convert
+// (bytes as a decimal, as XML). (max) and xml columns load because text
+// and bytes for them go as (max) (else error 4816), and a column of NULLs
+// loads into every type (varbinary for binary ones).
+// expect: type Int Float Bool Text Bytes Dec NullOnly
+// expect: tinyint ok ok ok ok ok ok ok
+// expect: smallint ok ok ok ok ok ok ok
+// expect: int ok ok ok ok ok ok ok
+// expect: bigint ok ok ok ok ok ok ok
+// expect: bit ok ok ok ok ok ok ok
+// expect: decimal(10,2) ok ok ok ok 8114 ok ok
+// expect: money ok ok ok ok ok ok ok
+// expect: smallmoney ok ok ok ok ok ok ok
+// expect: float ok ok ok ok 206 ok ok
+// expect: real ok ok ok ok 206 ok ok
+// expect: date 206 206 206 ok 257 206 ok
+// expect: time 206 206 206 ok 257 206 ok
+// expect: datetime ok ok ok ok ok ok ok
+// expect: datetime2 206 206 206 ok 257 206 ok
+// expect: smalldatetime ok ok ok ok ok ok ok
+// expect: datetimeoffset 206 206 206 ok 257 206 ok
+// expect: char(10) ok ok ok ok ok ok ok
+// expect: varchar(10) ok ok ok ok ok ok ok
+// expect: varchar(max) ok ok ok ok ok ok ok
+// expect: nchar(10) ok ok ok ok ok ok ok
+// expect: nvarchar(10) ok ok ok ok ok ok ok
+// expect: nvarchar(max) ok ok ok ok ok ok ok
+// expect: binary(4) ok ok ok 257 ok ok ok
+// expect: varbinary(10) ok ok ok 257 ok ok ok
+// expect: varbinary(max) ok ok ok 257 ok ok ok
+// expect: uniqueidentifier 206 206 206 ok ok 206 ok
+// expect: xml 206 206 206 ok 9403 206 ok
+// expect: text 206 206 206 ok 206 206 ok
+// expect: ntext 206 206 206 ok 206 206 ok
+// expect: image 206 206 206 206 ok 206 ok
+// expect: sql_variant ok ok ok ok ok ok ok
+import "sqlserver"
+import "io"
+import "os"
+import "strings"
+
+type V = sqlserver.Value
+
+fn dsn(): Option[str] {
+    match os.env("MSSQL_TEST_DSN") {
+        Some(d) { if len(strings.trim(d)) > 0 { return Some(strings.trim(d)) } }
+        None {}
+    }
+    match io.read(os.envOr("HOME", "") + "/.obo-mssql-dsn") {
+        Ok(d) { if len(strings.trim(d)) > 0 { return Some(strings.trim(d)) } }
+        Err(_) {}
+    }
+    return None
+}
+
+fn main() {
+    let d = match dsn() { Some(x) { x } None { exit(77) } }
+    var c = match sqlserver.connect(d) {
+        Ok(x) { x }
+        Err(_) { exit(77) }
+    }
+    let types = ["tinyint", "smallint", "int", "bigint", "bit", "decimal(10,2)", "money", "smallmoney", "float", "real",
+                 "date", "time", "datetime", "datetime2", "smalldatetime", "datetimeoffset", "char(10)", "varchar(10)",
+                 "varchar(max)", "nchar(10)", "nvarchar(10)", "nvarchar(max)", "binary(4)", "varbinary(10)", "varbinary(max)",
+                 "uniqueidentifier", "xml", "text", "ntext", "image", "sql_variant"]
+    let kinds = ["Int", "Float", "Bool", "Text", "Bytes", "Dec", "NullOnly"]
+    println("type Int Float Bool Text Bytes Dec NullOnly")
+    for t in types {
+        var line = t
+        for k in kinds {
+            c.exec("IF OBJECT_ID('tempdb..#m') IS NOT NULL DROP TABLE #m").unwrap()
+            c.exec("CREATE TABLE #m(a " + t + ")").unwrap()
+            let v = match k {
+                "Int" { V.Int(1) }
+                "Float" { V.Float(1.0f) }
+                "Bool" { V.Bool(true) }
+                "Text" { if strings.contains(&t, "date") || t == "time" { V.Text("2026-11-09") } else if t == "uniqueidentifier" { V.Text("6F9619FF-8B86-D011-B42D-00C04FC964FF") } else if t == "xml" { V.Text("<a/>") } else { V.Text("1") } }
+                "Bytes" { V.Bytes("\x01") }
+                "Dec" { V.Dec(1.5m) }
+                else { V.Null }
+            }
+            match c.bulkInsert("#m", &["a"], &[[v]], &sqlserver.bulkOptions()) {
+                Ok(n) { line = line + " ok" }
+                Err(e) { line = line + " " + e.code.toStr() }
+            }
+        }
+        println(line)
+    }
+}

@@ -16,7 +16,8 @@
 // parameters); every result set and row count of a batch (queryAll); every
 // ERROR of a call (errors(), the first is the Err) and its INFOs
 // (diagnostics()); procedures' return status; table-valued parameters
-// (queryTables, Table); transaction[T] by Transaction Manager requests. Types: tinyint, smallint, int, bigint, bit, real,
+// (queryTables, Table); bulk copy (bulkInsert); transaction[T] by
+// Transaction Manager requests. Types: tinyint, smallint, int, bigint, bit, real,
 // float, decimal, numeric, money, smallmoney, nchar, nvarchar, char and
 // varchar (a UTF-8 collation, code page 1252 or ISO-8859-1; another code
 // page is an error naming it, when that cell is read), binary, varbinary,
@@ -656,6 +657,51 @@ pub fn (c: mut &Conn) callWith(sql: str, args: &[Value], tables: &[Table], outs:
     }
     let outputs = Rows{cols: ocols, rows: if len(ocols) > 0 { [orow] } else { [] }, affected: -1, sets: 0}
     return Ok(Results{sets: sets, counts: counts, returnStatus: r.returnStatus, outputs: outputs})
+}
+
+// ---------------------------------------------------------------- bulk copy
+
+// INSERT BULK's options (all off in bulkOptions()): tablock (TABLOCK, a
+// table lock for the load), checkConstraints (CHECK_CONSTRAINTS: without
+// it CHECK and FOREIGN KEY constraints are not checked, and the server
+// marks them not trusted), fireTriggers (FIRE_TRIGGERS: without it INSERT
+// triggers do not run), keepNulls (KEEP_NULLS: without it a NULL goes in
+// as the column's DEFAULT, when it has one).
+pub type BulkOptions = tds.BulkOptions
+
+pub fn bulkOptions(): BulkOptions { return BulkOptions{tablock: false, checkConstraints: false, fireTriggers: false, keepNulls: false} }
+
+// Loads rows into table by bulk copy (the BULK_LOAD protocol: what bcp and
+// SqlBulkCopy send), and returns the rows loaded. table is one to three
+// regular identifiers ("t", "dbo.t", "app.dbo.t", "#t"); columns names the
+// table's columns the rows give, in their order; a column left out gets
+// its DEFAULT, NULL or, for an identity column, the next identity value (an
+// identity column named in columns takes the rows' values). Three round
+// trips: the columns' metadata (SELECT TOP 0: a table or column that is not
+// there is the server's error 208 or 207), INSERT BULK, then the rows in one
+// message. Without rows only the first is made, and the result is 0.
+//
+// Values go as a table parameter's do (Table: each column as the type its
+// values make it, a decimal as wide as all of them), and the server
+// converts them to the column's type as an INSERT does (error 245, 8115,
+// 2628 for a value that does not fit; 206 and 257 for a conversion SQL
+// Server does not make, such as an Int into a date or Text into varbinary).
+// A column of only NULLs needs no type. E_INPUT for a bad table or column
+// name, rows of another length than columns, and a column with values of
+// two kinds (but Int and Dec). An error leaves the connection idle; one
+// while the rows are sent (the task cancelled or past its deadline) breaks
+// it. In a transaction, the load is part of it.
+//
+//     let n = try conn.bulkInsert("dbo.events", &["at", "kind", "payload"], &rows, &sqlserver.bulkOptions())
+pub fn (c: mut &Conn) bulkInsert(table: str, columns: &[str], rows: &[[]Value], opts: &BulkOptions,
+                                 w: Where): Result[int, Error] {
+    let q = try tds.bulkColumnsQuery(table, columns)
+    let meta = try c.query(q, &[], w)
+    if len(rows) == 0 { return Ok(0) }
+    let bl = try tds.bulkLoad(table, &meta.cols, rows, opts, &c.s.collation)
+    let accepted = try checked(try c.s.batch(bl.statement, w))
+    let r = try checked(try c.s.bulkData(bl.payload, w))
+    return Ok(r.affected)
 }
 
 // ---------------------------------------------------------------- transactions
