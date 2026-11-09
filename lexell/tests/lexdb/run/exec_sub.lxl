@@ -1,7 +1,8 @@
 // lexdb_exec: subqueries. Scalar, EXISTS and IN (SELECT ...), uncorrelated
 // (run once) and correlated (per row, cached by outer value), nested, in
 // WHERE, ON, the select list, ORDER BY, GROUP BY, HAVING, UPDATE,
-// DELETE and INSERT; NULL rules of IN and NOT IN; the errors. Expected
+// DELETE and INSERT; hashed (no index on the correlating column): EXISTS,
+// NOT EXISTS, IN and NOT IN with their NULLs; the errors. Expected
 // output checked by hand when written.
 // expect: create table c (id int primary key, name text, city text) -> CREATE TABLE
 // expect: create table o (id int primary key, cust int, amount numeric(8,2), status text) -> CREATE TABLE
@@ -49,6 +50,26 @@
 // expect: select (select id from o where o.cust = c.id order by amount desc limit 1) from c order by id -> 11; 12; 13; NULL; NULL
 // expect: select id from c where city = (select city from c where id = 1) or exists (select 1 from o where o.cust = c.id and o.status = 'open') order by id -> 1; 3
 // expect: select a.id, b.id from c a join c b on b.id = (select min(id) from c where id > a.id) order by a.id -> 1|2; 2|3; 3|4; 4|5
+// expect: create table h (id int primary key, g int, v int) -> CREATE TABLE
+// expect: insert into h values (1, 1, 10), (2, 1, null), (3, 2, 20), (4, 3, 30) -> INSERT 0 4
+// expect: create table k (id int primary key, g int, x int) -> CREATE TABLE
+// expect: insert into k values (1, 1, 10), (2, 1, 11), (3, 2, 20), (4, 2, null), (5, 4, 1), (6, null, 5) -> INSERT 0 6
+// expect: select k.id, k.x in (select v from h where h.g = k.g), k.x not in (select v from h where h.g = k.g) from k order by k.id -> 1|t|f; 2|NULL|NULL; 3|t|f; 4|NULL|NULL; 5|f|t; 6|f|t
+// expect: explain analyze select k.id from k where k.x not in (select v from h where h.g = k.g) -> scan k: full scan (rows read 6, kept 2); subquery 1 (in): hashed on h.g = k.g (runs 1, probes 6);   scan h: full scan (rows read 4, kept 4); result: 2 rows
+// expect: select k.id from k where exists (select 1 from h where h.g = k.g) order by 1 -> 1; 2; 3; 4
+// expect: select k.id from k where not exists (select 1 from h where k.g = h.g) order by 1 -> 5; 6
+// expect: select k.id from k where exists (select 1 from h where h.g = k.g and h.v = k.x) order by 1 -> 1; 3
+// expect: explain select k.id from k where exists (select 1 from h where h.g = k.g and h.v = k.x) -> scan k: full scan; subquery 1 (exists): hashed on h.g = k.g, h.v = k.x;   scan h: full scan
+// expect: select k.id from k where exists (select 1 from h where h.g = k.g and h.v > 15) order by 1 -> 3; 4
+// expect: select k.id from k where exists (select 1 from h where h.g + 0 = k.g + 0) order by 1 -> 1; 2; 3; 4
+// expect: explain select k.id from k where exists (select 1 from h where h.g + 0 = k.g + 0) -> scan k: full scan; subquery 1 (exists): hashed on ("h"."g" + 0) = an outer expression;   scan h: full scan
+// expect: select k.id from k where exists (select 1 from h join k k2 on k2.x = h.v where k2.g = k.g) order by 1 -> 1; 2; 3; 4
+// expect: explain select k.id from k where exists (select 1 from h join k k2 on k2.x = h.v where k2.g = k.g) -> scan k: full scan; subquery 1 (exists): hashed on k2.g = k.g;   scan h: full scan;   join k k2: hash on (x) over full scan
+// expect: select k.id from k where k.x + 10 in (select v from h where h.g = k.g + 1) order by 1 -> 1; 3
+// expect: select k.id from k where exists (select 1 from h where h.g = k.g and exists (select 1 from h h2 where h2.id = h.id + 1)) order by 1 -> 1; 2; 3; 4
+// expect: explain select k.id from k where exists (select 1 from h where h.g = k.g and h.v > k.x) -> scan k: full scan; subquery 1 (exists): per row, on k.g, k.x;   scan h: full scan
+// expect: explain select k.id from k where exists (select 1 from h where h.id = k.g) -> scan k: full scan; subquery 1 (exists): per row, on k.g;   scan h: primary key lookup
+// expect: explain select k.id from k where exists (select 1 from h left join c on c.id = h.v and c.id = k.x) -> scan k: full scan; subquery 1 (exists): per row, on k.x;   scan h: full scan;   left join c: primary key lookup per row
 // expect: explain select id from c where id in (select cust from o where status = 'open') -> scan c: full scan; subquery 1 (in): run once;   scan o: full scan
 // expect: select id from c where id in (select cust from o where status = $1) -> SELECT 0
 // expect: update c set city = (select status from o where o.cust = c.id order by id limit 1) where id < 3 -> UPDATE 2
@@ -136,6 +157,26 @@ fn main() {
         show(mut &s, "select (select id from o where o.cust = c.id order by amount desc limit 1) from c order by id")
         show(mut &s, "select id from c where city = (select city from c where id = 1) or exists (select 1 from o where o.cust = c.id and o.status = 'open') order by id")
         show(mut &s, "select a.id, b.id from c a join c b on b.id = (select min(id) from c where id > a.id) order by a.id")
+        show(mut &s, "create table h (id int primary key, g int, v int)")
+        show(mut &s, "insert into h values (1, 1, 10), (2, 1, null), (3, 2, 20), (4, 3, 30)")
+        show(mut &s, "create table k (id int primary key, g int, x int)")
+        show(mut &s, "insert into k values (1, 1, 10), (2, 1, 11), (3, 2, 20), (4, 2, null), (5, 4, 1), (6, null, 5)")
+        show(mut &s, "select k.id, k.x in (select v from h where h.g = k.g), k.x not in (select v from h where h.g = k.g) from k order by k.id")
+        show(mut &s, "explain analyze select k.id from k where k.x not in (select v from h where h.g = k.g)")
+        show(mut &s, "select k.id from k where exists (select 1 from h where h.g = k.g) order by 1")
+        show(mut &s, "select k.id from k where not exists (select 1 from h where k.g = h.g) order by 1")
+        show(mut &s, "select k.id from k where exists (select 1 from h where h.g = k.g and h.v = k.x) order by 1")
+        show(mut &s, "explain select k.id from k where exists (select 1 from h where h.g = k.g and h.v = k.x)")
+        show(mut &s, "select k.id from k where exists (select 1 from h where h.g = k.g and h.v > 15) order by 1")
+        show(mut &s, "select k.id from k where exists (select 1 from h where h.g + 0 = k.g + 0) order by 1")
+        show(mut &s, "explain select k.id from k where exists (select 1 from h where h.g + 0 = k.g + 0)")
+        show(mut &s, "select k.id from k where exists (select 1 from h join k k2 on k2.x = h.v where k2.g = k.g) order by 1")
+        show(mut &s, "explain select k.id from k where exists (select 1 from h join k k2 on k2.x = h.v where k2.g = k.g)")
+        show(mut &s, "select k.id from k where k.x + 10 in (select v from h where h.g = k.g + 1) order by 1")
+        show(mut &s, "select k.id from k where exists (select 1 from h where h.g = k.g and exists (select 1 from h h2 where h2.id = h.id + 1)) order by 1")
+        show(mut &s, "explain select k.id from k where exists (select 1 from h where h.g = k.g and h.v > k.x)")
+        show(mut &s, "explain select k.id from k where exists (select 1 from h where h.id = k.g)")
+        show(mut &s, "explain select k.id from k where exists (select 1 from h left join c on c.id = h.v and c.id = k.x)")
         show(mut &s, "explain select id from c where id in (select cust from o where status = 'open')")
         show(mut &s, "select id from c where id in (select cust from o where status = $1)")
         show(mut &s, "update c set city = (select status from o where o.cust = c.id order by id limit 1) where id < 3")

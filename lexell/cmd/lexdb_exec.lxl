@@ -2112,6 +2112,9 @@ type SubPlan = record {
     sel: Sel
     oid: int                    // its column's type
     name: str                   // its column's name, as an output column
+    hashed: bool                // correlated, run once into a hash: sel outputs the key (then IN's value)
+    keyOuter: []Expr            // per key column: what it equals, of outer values only (refs as parameters)
+    keyText: []str              // EXPLAIN: "inner = outer"
 }
 
 // A subquery's result: a scalar's value, how many rows, IN's values.
@@ -2121,9 +2124,12 @@ type SubRes = record {
     set: Map[str, int]
     numeric: bool               // the values are numbers: keyed as numbers
     hasNull: bool
+    groups: Map[str, int]       // hashed: key -> 1 rows, 3 rows and a NULL value (IN)
 }
 
-fn emptyRes(): SubRes { return SubRes{val: Val.Null, rows: 0, set: newMap(), numeric: false, hasNull: false} }
+fn emptyRes(): SubRes {
+    return SubRes{val: Val.Null, rows: 0, set: newMap(), numeric: false, hasNull: false, groups: newMap()}
+}
 
 // The queries being planned, outermost first.
 type Frame = record {
@@ -2200,12 +2206,262 @@ fn endScope(sc: mut &Scope, q: mut &Query) {
 
 fn planSub(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val,
            sc: mut &Scope): Result[SubPlan, DbErr] {
-    let sel = try planSelect(st, txn, s, params, sc)
+    var sel = try planSelect(st, txn, s, params, sc)
     if s.use == lexdb_sql.SUB_IN && len(sel.outs) != 1 { return Err(e("42601", "subquery has too many columns")) }
     if s.use == lexdb_sql.SUB_SCALAR && len(sel.outs) != 1 { return Err(e("42601", "subquery must return only one column")) }
     let oid = if s.use == lexdb_sql.SUB_EXISTS { lexdb_sql.OID_BOOL } else { sel.outs[0].oid }
     let name = if s.use == lexdb_sql.SUB_EXISTS { "exists" } else if s.use == lexdb_sql.SUB_SCALAR { sel.outs[0].name } else { "?column?" }
-    return Ok(SubPlan{use: s.use, sel: sel, oid: oid, name: name})
+    var sp = SubPlan{use: s.use, sel: sel, oid: oid, name: name, hashed: false, keyOuter: [], keyText: []}
+    if s.use != lexdb_sql.SUB_SCALAR && len(sp.sel.q.refs) > 0 { hashSub(mut &sp, sc.base) }
+    return Ok(sp)
+}
+
+// ---- hashed subqueries: a semi-join (EXISTS, IN) or anti-join (NOT ...)
+//
+// A correlated EXISTS or IN whose outer values are used only in WHERE
+// equalities "inner = outer" (outer: of outer values only), none of them a
+// lookup's key, is the same
+// subquery without them, keyed by their inner sides: it is run once into a
+// hash, and each outer row probes it. (With such a key, an index, it stays
+// per row: a lookup each.)
+
+fn refOf(x: &Expr, base: int): int {
+    match x {
+        Expr.Param(n) { if n > base { return n - base - 1 } }
+        else {}
+    }
+    return -1
+}
+
+fn usesRefs(x: &Expr, base: int): bool {
+    match x {
+        Expr.Param(n) { return n > base }
+        Expr.Unary(_, a) { return usesRefs(&a, base) }
+        Expr.Bin(_, a, b) { return usesRefs(&a, base) || usesRefs(&b, base) }
+        Expr.IsNull(a, _) { return usesRefs(&a, base) }
+        Expr.Cast(a, _) { return usesRefs(&a, base) }
+        Expr.Call(_, args, _) {
+            for a in args { if usesRefs(&a, base) { return true } }
+            return false
+        }
+        else { return false }
+    }
+}
+
+type HashKeys = record {
+    inner: []Expr
+    outer: []Expr
+    texts: []str                // the conjuncts taken out, by their text
+}
+
+// Of outer values only: no column of the subquery's, no subquery.
+fn outerOnly(x: &Expr, base: int): bool {
+    var ns: []str = []
+    colNames(x, mut &ns)
+    return len(ns) == 0 && usesRefs(x, base) && !hasAgg(x) && !hasSubCall(x)
+}
+
+fn hasSubCall(x: &Expr): bool {
+    match x {
+        Expr.Unary(_, a) { return hasSubCall(&a) }
+        Expr.Bin(_, a, b) { return hasSubCall(&a) || hasSubCall(&b) }
+        Expr.IsNull(a, _) { return hasSubCall(&a) }
+        Expr.Cast(a, _) { return hasSubCall(&a) }
+        Expr.Call(n, args, _) {
+            if isSubCall(&n) { return true }
+            for a in args { if hasSubCall(&a) { return true } }
+            return false
+        }
+        else { return false }
+    }
+}
+
+// A conjunct "inner = outer" (either way round), into hk; false: it uses an
+// outer value otherwise.
+fn keyConj(c: &Expr, base: int, hk: mut &HashKeys): bool {
+    let t = lexdb_sql.exprText(c)
+    for x in hk.texts { if x == t { return true } }
+    match c {
+        Expr.Bin(op, a, b) {
+            if op != "=" { return false }
+            var inner = clone(&a)
+            var outer = clone(&b)
+            if !outerOnly(&outer, base) {
+                inner = clone(&b)
+                outer = clone(&a)
+            }
+            if !outerOnly(&outer, base) || usesRefs(&inner, base) || hasCorr(&inner) { return false }
+            append(mut &hk.inner, inner)
+            append(mut &hk.outer, outer)
+            append(mut &hk.texts, t)
+            return true
+        }
+        else { return false }
+    }
+}
+
+fn keyConjs(cs: &[]Expr, base: int, hk: mut &HashKeys, movable: bool): bool {
+    for c in cs {
+        if !usesRefs(&c, base) { continue }
+        if !movable || !keyConj(&c, base, hk) { return false }
+    }
+    return true
+}
+
+fn noRefs(xs: &[]Expr, base: int): bool {
+    for x in xs { if usesRefs(&x, base) { return false } }
+    return true
+}
+
+fn dropTexts(cs: []Expr, texts: &[]str): []Expr {
+    var all = cs
+    var out: []Expr = []
+    for i in 0..len(all) {
+        let c = replace(mut &all[i], Expr.Lit(Val.Null))
+        let t = lexdb_sql.exprText(&c)
+        var drop = false
+        for x in texts { if x == t { drop = true } }
+        if !drop { append(mut &out, c) }
+    }
+    return out
+}
+
+fn hashSub(sp: mut &SubPlan, base: int) {
+    var hk = HashKeys{inner: [], outer: [], texts: []}
+    {
+        let sel = &sp.sel
+        if sel.aggQ || sel.limit >= 0 || sel.offset > 0 || len(sel.groupBy) > 0 { return }
+        if !noRefs(&sel.exprs, base) || !noRefs(&sel.order, base) { return }
+        let q = &sel.q
+        for lv in q.levels {
+            if !noRefs(&lv.path.eqs, base) || !noRefs(&lv.path.ins, base) || !noRefs(&lv.hashVals, base) { return }
+            for b in lv.path.rng { if usesRefs(&b.val, base) { return } }
+            // an outer join's ON conjuncts are not WHERE filters: they stay
+            if !keyConjs(&lv.cond, base, mut &hk, !isOuter(lv.join)) { return }
+            if !keyConjs(&lv.post, base, mut &hk, true) { return }
+            if !keyConjs(&lv.local, base, mut &hk, !isOuter(lv.join)) { return }
+        }
+        if !keyConjs(&q.top, base, mut &hk, true) { return }
+        if len(hk.inner) == 0 { return }
+    }
+    for k in 0..len(sp.sel.q.levels) {
+        sp.sel.q.levels[k].cond = dropTexts(replace(mut &sp.sel.q.levels[k].cond, []), &hk.texts)
+        sp.sel.q.levels[k].post = dropTexts(replace(mut &sp.sel.q.levels[k].post, []), &hk.texts)
+        sp.sel.q.levels[k].local = dropTexts(replace(mut &sp.sel.q.levels[k].local, []), &hk.texts)
+    }
+    sp.sel.q.top = dropTexts(replace(mut &sp.sel.q.top, []), &hk.texts)
+    // it outputs the key, then IN's value
+    var outs: []Expr = []
+    for x in hk.inner { append(mut &outs, clone(&x)) }
+    if sp.use == lexdb_sql.SUB_IN { append(mut &outs, clone(&sp.sel.exprs[0])) }
+    var texts: []str = []
+    for i in 0..len(hk.inner) {
+        let r = refOf(&hk.outer[i], base)
+        var outer = "an outer expression"
+        if r >= 0 {
+            outer = match sp.sel.q.refs[r] {
+                Expr.Col(n) { n }
+                else { "an outer value" }
+            }
+        }
+        let inner = match hk.inner[i] {
+            Expr.Col(n) { n }
+            else { lexdb_sql.exprText(&hk.inner[i]) }
+        }
+        append(mut &texts, inner + " = " + outer)
+    }
+    sp.sel.exprs = outs
+    sp.sel.order = []
+    sp.sel.sort = false
+    sp.sel.distinct = false
+    sp.sel.desc = []
+    sp.hashed = true
+    sp.keyOuter = replace(mut &hk.outer, [])
+    sp.keyText = texts
+}
+
+// A hash key's part: numbers by value (2 = 2.0), else as the value.
+fn keyPart(b: mut &StrBuf, v: &Val) {
+    match v {
+        Val.Int(_) {}
+        Val.Num(_) {}
+        else {
+            encIdxPart(b, v)
+            return
+        }
+    }
+    match asNum(v) {
+        Some(d) {
+            b.addByte(3)
+            encNum(b, &d)
+        }
+        None { encIdxPart(b, v) }
+    }
+}
+
+// Runs a hashed subquery once: its keys (a NULL key matches nothing), and
+// for IN its values per key.
+fn runHashed(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sp: &SubPlan, params: &[]Val,
+             stat: mut &SubStat): Result[SubRes, DbErr] {
+    var rs = newRun(&sp.sel.q)
+    let res = try execSel(st, txn, &sp.sel, params, -1, mut &rs)
+    stat.runs += 1
+    addCounts(mut &stat.cnt, &rs.cnt)
+    mergeStats(mut &stat.inner, &rs.stats)
+    var out = emptyRes()
+    out.rows = len(res.rows)
+    let nk = len(sp.keyOuter)
+    for r in res.rows {
+        var gk = newStrBuf()
+        var nul = false
+        for j in 0..nk {
+            if isNull(&r[j]) { nul = true }
+            keyPart(mut &gk, &r[j])
+        }
+        if nul { continue }
+        let g = gk.toStr()
+        var f = 1
+        if sp.use == lexdb_sql.SUB_IN {
+            if isNull(&r[nk]) {
+                f = 3
+            } else {
+                var mk = newStrBuf()
+                mk.add(g)
+                keyPart(mut &mk, &r[nk])
+                out.set.put(mk.toStr(), 1)
+            }
+        }
+        match out.groups.get(&g) {
+            Some(old) { if old < f { out.groups.put(g, f) } }
+            None { out.groups.put(g, f) }
+        }
+    }
+    return Ok(out)
+}
+
+// A hashed subquery's value for an outer row: its key's values, IN's x.
+fn hashValue(n: &str, r: &SubRes, keyVals: &[]Val, x: &Val): Val {
+    var gk = newStrBuf()
+    var miss = false
+    for v in keyVals {
+        if isNull(&v) { miss = true }               // inner = NULL: no row
+        keyPart(mut &gk, &v)
+    }
+    var f = 0
+    if !miss {
+        match r.groups.get(&gk.toStr()) {
+            Some(v) { f = v }
+            None {}
+        }
+    }
+    if f == 0 { return Val.Bool(false) }            // no rows for it
+    if n == "#exists" { return Val.Bool(true) }
+    if isNull(x) { return Val.Null }
+    var mk = newStrBuf()
+    mk.add(gk.toStr())
+    keyPart(mut &mk, x)
+    if r.set.get(&mk.toStr()).isSome() { return Val.Bool(true) }
+    return if f == 3 { Val.Null } else { Val.Bool(false) }
 }
 
 fn isSubCall(n: &str): bool { return n == "#sub" || n == "#exists" || n == "#in" }
@@ -2371,6 +2627,20 @@ fn fillCur(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, x: &Exp
             }
             var refVals: []Val = []
             for j in fixed..len(args) { append(mut &refVals, try eval(&args[j], env)) }
+            if q.subs[i].hashed {
+                // its key's outer sides, over the statement's parameters and its refs' values
+                var ps: []Val = []
+                for j in 0..q.base { append(mut &ps, env.params[j]) }
+                for v in refVals { append(mut &ps, v) }
+                let noCols: []lexdb_sql.ColDef = []
+                let noRow: []Val = []
+                let kenv = Env{cols: &noCols, row: &noRow, aggs: &noRow, params: &ps, subs: env.subs, cur: &noRow}
+                var kv: []Val = []
+                for ko in q.subs[i].keyOuter { append(mut &kv, try eval(&ko, &kenv)) }
+                rs.stats[i].hits += 1
+                cur[i] = hashValue(&n, &env.subs[i], &kv, &xv)
+                return Ok(Unit{})
+            }
             let key = valsKey(&refVals)
             var at = -1
             match rs.memo[i].get(&key) {
@@ -2435,13 +2705,18 @@ fn prepare(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, params:
         append(mut &m.buckets, [])
     }
     for i in 0..len(q.subs) {
-        if len(q.subs[i].sel.q.refs) > 0 {
+        let sp = &q.subs[i]
+        if len(sp.sel.q.refs) > 0 && !sp.hashed {
             append(mut &m.subs, emptyRes())
             continue
         }
         var ps: []Val = []
         for j in 0..q.base { append(mut &ps, params[j]) }
-        append(mut &m.subs, try runSub(st, txn, &q.subs[i], &ps, mut &rs.stats[i]))
+        if sp.hashed {
+            append(mut &m.subs, try runHashed(st, txn, sp, &ps, mut &rs.stats[i]))
+        } else {
+            append(mut &m.subs, try runSub(st, txn, sp, &ps, mut &rs.stats[i]))
+        }
     }
     try materialize(st, txn, q, mut &m, params, rs)
     return Ok(m)
@@ -2455,7 +2730,9 @@ fn subLines(q: &Query, stats: &[]SubStat, out: mut &[]str) {
         let sp = &q.subs[i]
         let what = if sp.use == lexdb_sql.SUB_EXISTS { "exists" } else if sp.use == lexdb_sql.SUB_IN { "in" } else { "scalar" }
         var head = "subquery " + (i + 1).toStr() + " (" + what + "): "
-        if len(sp.sel.q.refs) == 0 {
+        if sp.hashed {
+            head = head + "hashed on " + strings.join(&sp.keyText, ", ")
+        } else if len(sp.sel.q.refs) == 0 {
             head = head + "run once"
         } else {
             var rs: []str = []
@@ -2468,7 +2745,10 @@ fn subLines(q: &Query, stats: &[]SubStat, out: mut &[]str) {
             head = head + "per row, on " + strings.join(&rs, ", ")
         }
         var inner: []str = []
-        if i < len(stats) {
+        if i < len(stats) && sp.hashed {
+            head = head + " (runs " + stats[i].runs.toStr() + ", probes " + stats[i].hits.toStr() + ")"
+            inner = selLines(&sp.sel, &stats[i].cnt, &stats[i].inner)
+        } else if i < len(stats) {
             head = head + " (runs " + stats[i].runs.toStr() + ", from cache " + stats[i].hits.toStr() + ")"
             inner = selLines(&sp.sel, &stats[i].cnt, &stats[i].inner)
         } else {

@@ -505,14 +505,13 @@ is the comparison to make.
 
 ### 9.4 Next
 
-1. The rest of subqueries and CTEs (9.8 has the first part): a hashed
-   semi-join and anti-join for a correlated `EXISTS`, `NOT EXISTS` or
-   `IN` that has no index to look up (the subquery read once, keyed by its
-   correlating equalities, then probed per row); `WITH` as named
+1. The rest of subqueries and CTEs (9.8, 9.9): `WITH` as named
    subqueries, and subqueries in FROM; then `WITH RECURSIVE`. Smaller: a
    correlated subquery's value as a lookup's key (now it is only a filter),
    a small uncorrelated IN set as an IN-list lookup, and correlated
-   subqueries in GROUP BY and in aggregates' arguments.
+   subqueries in GROUP BY and in aggregates' arguments; hashing a
+   correlated scalar subquery with an aggregate (a count per customer) as
+   a grouped run; choosing hash or index per row by row counts (9.9).
 2. The cache budget in bytes, not nodes (measured in 9.3: decoded nodes
    take 1.8 to 3.3 times their page, so the default of 100,000 nodes could
    reach 0.7 to 1.5 GB), a smaller decoded node, and why a restarted server
@@ -680,9 +679,8 @@ is the comparison to make.
   columns, with its plan; EXPLAIN ANALYZE adds its runs, how many came
   from the cache, and its tables' counts summed over the runs.
 - Not yet: CTEs, subqueries in FROM, `ANY`/`ALL`, correlated subqueries
-  in GROUP BY or in an aggregate's arguments (0A000), the hashed
-  semi-join (9.4).
-- Tests: `exec_sub` (62 statements, checked by hand); `exec_index_diff`
+  in GROUP BY or in an aggregate's arguments (0A000).
+- Tests: `exec_sub` (62 statements then, checked by hand); `exec_index_diff`
   compares IN with a correlated EXISTS and with the list of its values,
   NOT EXISTS with a LEFT JOIN's unmatched rows, a correlated count with a
   grouped LEFT JOIN and a scalar with its value, and UPDATE uses
@@ -694,4 +692,40 @@ is the comparison to make.
 - pgbench point selects before and after, alternating, four runs each:
   24,681 and 24,016 tps on average, within the runs' spread (22,800 to
   26,500). The binary is 1.08 MB.
+
+### 9.9 Hashed subqueries (semi-joins and anti-joins)
+
+- A correlated `EXISTS` or `IN` (and `NOT EXISTS`, `NOT IN`) is hashed
+  when its outer values appear only in WHERE equalities `inner = outer`
+  (outer: an expression of outer values only, `k.g + 1` too) and none of
+  them is a lookup's key or a hash join's value: the equalities are taken
+  out, the subquery outputs their inner sides (then IN's value), runs once
+  per execution, and its rows go into a hash by key. Each outer row
+  probes it once, with the same answers as running it: EXISTS is whether
+  the key has rows; IN is true if the key has the value, NULL if x is
+  NULL or the key has a NULL value, else false; a NULL key has no rows.
+  It is a semi-join for EXISTS and IN, an anti-join for their NOTs, NULL-
+  aware for NOT IN, and works wherever the subquery is (WHERE, the select
+  list, ...).
+- It stays per row when an equality is the subquery's lookup key (an
+  index on the correlating column), when an outer value is used another
+  way (`h.v > k.x`), or when the equality is in an outer join's ON.
+- EXPLAIN: `subquery 1 (exists): hashed on o.cust = c.id`; ANALYZE adds
+  `(runs 1, probes N)`.
+- Measured (10,000 customers, 10,000 orders, NOT EXISTS on the customer,
+  no index): 10,953 ms per row, 12 ms hashed, with the same count. With an
+  index it stays per row, 21 to 23 ms; hashing would take 12 ms there,
+  but for a few outer rows the lookups win: that choice needs row counts.
+- Tests: `exec_sub` adds hashed EXISTS, NOT EXISTS, IN and NOT IN with
+  NULLs on both sides, two keys, an expression key, the key on a
+  hash-joined table, nesting, and the cases that stay per row (82
+  statements now); `exec_index_diff` compares b (per row through its index
+  on x) with b0 (hashed) for EXISTS, NOT EXISTS, IN, and IN and NOT IN as
+  values, keyed on `x` and on `x + 1`, with no differences over four
+  seeds. Mutations caught: NOT IN ignoring a NULL value (11 differ, 2
+  lines of `exec_sub`), IN's set without the key (23, 3), ON conjuncts
+  taken as keys (1 line), a key conjunct left in a hash join's filters
+  (1 line, after adding that case). Skipping NULL keys on the build side
+  and on the probe side are each enough alone: removing one changes
+  nothing.
 

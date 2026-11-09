@@ -11,8 +11,9 @@
 // rows. Subqueries are compared with what they equal: IN with a correlated
 // EXISTS and with the list of its values, NOT EXISTS with a LEFT JOIN's
 // unmatched rows, a correlated count with a grouped LEFT JOIN, a scalar with
-// its value; UPDATE uses them too.
-// expect: statements ok, queries 1204 differ 0, index paths used true, hash joins used true, index order used true, backward true, min/max true, filtered true, in-lists true, subqueries per row true and once true
+// its value; UPDATE uses them too. b has an index on x and b0 none, so a
+// subquery correlated on x is per row on one side and hashed on the other.
+// expect: statements ok, queries 1204 differ 0, index paths used true, hash joins used true, index order used true, backward true, min/max true, filtered true, in-lists true, subqueries per row true and once true, hashed true
 import "strings"
 import "collections"
 import "../../../cmd/lexdb_store"
@@ -134,6 +135,7 @@ fn body(st: lexdb_store.Store): int {
     var filtered = false
     var inLists = false
     var correlated = false
+    var hashedSub = false
     var runOnce = false
     for round in 0..40 {
         // changes, the same to both pairs
@@ -169,7 +171,7 @@ fn body(st: lexdb_store.Store): int {
             var sql = ""
             let c = cond(mut &r)
             let n = (r.below(9) + 1).toStr()
-            let j = r.below(24)
+            let j = r.below(26)
             var q1 = ""
             var q0 = ""
             var got1 = ""
@@ -236,6 +238,16 @@ fn body(st: lexdb_store.Store): int {
                 let lit = if v == "N" { "null" } else { v }
                 q1 = "select id, x from a where x <= (select max(x) from b where " + c + ") order by x desc, id limit " + n
                 q0 = "select id, x from a0 where x <= " + lit + " order by x desc, id limit " + n
+                got1 = rows(mut &s, &q1)
+                got0 = rows(mut &s, &q0)
+            } else if j == 24 || j == 25 {
+                // correlated IN and NOT IN as values (NULLs and all): per row
+                // through b's index against b0 hashed
+                let key = if j == 24 { "u.x = t.x" } else { "u.x = t.x + 1" }
+                let sub = "(select u.z from T u where " + key + " and (" + qual(&c, &"u") + "))"
+                let sql2 = "select t.id, t.z in " + sub + ", t.z not in " + sub + " from a t order by 1"
+                q1 = strings.replaceAll(sql2, "from T", "from b")
+                q0 = strings.replaceAll(sql2, "from T", "from b0")
                 got1 = rows(mut &s, &q1)
                 got0 = rows(mut &s, &q0)
             } else if j == 12 {
@@ -337,6 +349,7 @@ fn body(st: lexdb_store.Store): int {
             if strings.contains(ex, "(filtered)") { filtered = true }
             if strings.contains(ex, "for each of") { inLists = true }
             if strings.contains(ex, "per row, on") { correlated = true }
+            if strings.contains(rows(mut &s, &("explain " + q0)), "hashed on") { hashedSub = true }
             if strings.contains(ex, "run once") { runOnce = true }
         }
     }
@@ -365,7 +378,7 @@ fn body(st: lexdb_store.Store): int {
     if n == "0" { println("a is empty") }
     println("statements ok, queries " + queries.toStr() + " differ " + differ.toStr() + ", index paths used " +
             indexed.toStr() + ", hash joins used " + hashed.toStr() +
-            ", index order used " + ordered.toStr() + ", backward " + backward.toStr() + ", min/max " + firstValue.toStr() + ", filtered " + filtered.toStr() + ", in-lists " + inLists.toStr() + ", subqueries per row " + correlated.toStr() + " and once " + runOnce.toStr())
+            ", index order used " + ordered.toStr() + ", backward " + backward.toStr() + ", min/max " + firstValue.toStr() + ", filtered " + filtered.toStr() + ", in-lists " + inLists.toStr() + ", subqueries per row " + correlated.toStr() + " and once " + runOnce.toStr() + ", hashed " + hashedSub.toStr())
     return 0
 }
 
