@@ -60,6 +60,7 @@ type SlotMeta = value record {
     pinned: bool        // freed, but a snapshot may still reach it: kept until it ends
     cost: int           // loaded: what it counts against the cache (lexdb_page.nodeCost)
     listed: bool        // in Db.histSlots
+    frame: int          // loaded: its node, pool[frame]; -1 when not (a slot not in memory holds no node)
 }
 
 // An old version of a node, kept while a snapshot can see it: the commits
@@ -86,7 +87,8 @@ pub type Db = record {
     opts: Options
     fs: lexdb_disk.Fs
     data: lexdb_disk.File
-    nodes: []lexdb_page.Node
+    pool: []lexdb_page.Node     // the nodes in memory, one per loaded slot (SlotMeta.frame)
+    owner: []int                // the slot of each node in pool
     meta: []SlotMeta
     freeSlots: []int
     loadedCount: int
@@ -209,18 +211,45 @@ fn (db: mut &Db) allocSlot(): int {
         db.meta[s].cost = 0
         return s
     }
-    append(mut &db.nodes, lexdb_page.newLeaf())
     append(mut &db.meta, SlotMeta{used: true, gen: 0, loaded: false, dirty: false, root: false, disk: -1,
                                   ckpt: 0, version: 0, ref: false, since: 0, pinned: false, cost: 0,
-                                  listed: false})
+                                  listed: false, frame: -1})
     append(mut &db.hist, [])
     return len(db.meta) - 1
+}
+
+// Gives slot s node n, in a frame of the pool (its own, or a new one).
+fn (db: mut &Db) setNode(s: int, n: lexdb_page.Node) {
+    let f = db.meta[s].frame
+    if f >= 0 {
+        db.pool[f] = n
+        return
+    }
+    db.meta[s].frame = len(db.pool)
+    append(mut &db.pool, n)
+    append(mut &db.owner, s)
+}
+
+// Takes slot s's node out of memory: the pool's last node moves into its
+// frame, so the pool holds loaded nodes only.
+fn (db: mut &Db) freeNode(s: int) {
+    let f = db.meta[s].frame
+    if f < 0 { return }
+    db.meta[s].frame = -1
+    let last = len(db.pool) - 1
+    let n = pop(mut &db.pool)
+    let o = pop(mut &db.owner)
+    if f < last {
+        db.pool[f] = n
+        db.owner[f] = o
+        db.meta[o].frame = f
+    }
 }
 
 // A new node in memory, dirty.
 fn (db: mut &Db) newNode(n: lexdb_page.Node): int {
     let s = db.allocSlot()
-    db.nodes[s] = n
+    db.setNode(s, n)
     db.meta[s].loaded = true
     db.meta[s].dirty = true
     db.meta[s].since = db.seq
@@ -232,7 +261,7 @@ fn (db: mut &Db) newNode(n: lexdb_page.Node): int {
 // Counts node s's memory again after it changed (a loaded node).
 fn (db: mut &Db) recost(s: int) {
     if !db.meta[s].loaded { return }
-    let c = lexdb_page.nodeCost(&db.nodes[s])
+    let c = lexdb_page.nodeCost(&db.pool[db.meta[s].frame])
     db.cacheUsed += c - db.meta[s].cost
     db.meta[s].cost = c
 }
@@ -284,7 +313,7 @@ fn (db: mut &Db) dropSlot(s: int) {
     if db.meta[s].loaded {
         db.loadedCount -= 1
         db.uncost(s)
-        db.nodes[s] = lexdb_page.newLeaf()      // not loaded: empty already (an evicted node's children)
+        db.freeNode(s)
     }
     db.meta[s].used = false
     db.meta[s].gen += 1
@@ -323,7 +352,7 @@ fn (db: mut &Db) willChange(s: int) {
             append(mut &db.histSlots, s)
             db.meta[s].listed = true
         }
-        append(mut &db.hist[s], Hist{since: db.meta[s].since, until: db.seq, node: copyNode(&db.nodes[s])})
+        append(mut &db.hist[s], Hist{since: db.meta[s].since, until: db.seq, node: copyNode(&db.pool[db.meta[s].frame])})
         db.histCount += 1
     }
     db.meta[s].since = db.seq
@@ -377,8 +406,8 @@ fn (db: &Db) evictable(s: int): bool {
 
 // Whether none of an inner node's children is in memory (a leaf: true).
 fn (db: &Db) kidsOut(s: int): bool {
-    if !db.nodes[s].leaf {
-        for k in db.nodes[s].kids { if db.meta[k].loaded { return false } }
+    if !db.pool[db.meta[s].frame].leaf {
+        for k in db.pool[db.meta[s].frame].kids { if db.meta[k].loaded { return false } }
     }
     return true
 }
@@ -404,13 +433,13 @@ fn (db: mut &Db) maybeEvict() {
             continue
         }
         if !db.kidsOut(s) { continue }
-        if !db.nodes[s].leaf {
+        if !db.pool[db.meta[s].frame].leaf {
             var kids: []int = []
-            for k in db.nodes[s].kids { append(mut &kids, k) }
+            for k in db.pool[db.meta[s].frame].kids { append(mut &kids, k) }
             for k in kids { db.dropSlot(k) }
         }
         db.uncost(s)
-        db.nodes[s] = lexdb_page.newLeaf()
+        db.freeNode(s)
         db.meta[s].loaded = false
         db.loadedCount -= 1
         db.evictions += 1
@@ -440,7 +469,7 @@ fn (db: mut &Db) install(r: LoadReq, b: &[]byte): Result[Unit, lexdb_base.DbErr]
             n.kids[i] = k
         }
     }
-    db.nodes[s] = n
+    db.setNode(s, n)
     db.meta[s].loaded = true
     db.meta[s].ref = true
     db.loadedCount += 1
@@ -511,13 +540,13 @@ fn (db: mut &Db) descend(tree: int, k: &str): Descent {
         }
         db.meta[s].ref = true
         append(mut &d.path, s)
-        if db.nodes[s].leaf { return d }
-        let i = childIndex(&db.nodes[s].keys, k)
-        if i < len(db.nodes[s].keys) {
-            d.upper = db.nodes[s].keys[i]
+        if db.pool[db.meta[s].frame].leaf { return d }
+        let i = childIndex(&db.pool[db.meta[s].frame].keys, k)
+        if i < len(db.pool[db.meta[s].frame].keys) {
+            d.upper = db.pool[db.meta[s].frame].keys[i]
             d.hasUpper = true
         }
-        s = db.nodes[s].kids[i]
+        s = db.pool[db.meta[s].frame].kids[i]
     }
     return d
 }
@@ -538,53 +567,53 @@ fn nodeSize(n: &lexdb_page.Node): int {
 // Splits an oversized node; the new right node's slot and separator.
 fn (db: mut &Db) split(s: int, atEnd: bool): Descent {
     db.willChange(s)
-    let leaf = db.nodes[s].leaf
-    let total = db.nodes[s].size
-    let n = len(db.nodes[s].keys)
+    let leaf = db.pool[db.meta[s].frame].leaf
+    let total = db.pool[db.meta[s].frame].size
+    let n = len(db.pool[db.meta[s].frame].keys)
     var right = lexdb_page.Node{leaf: leaf, keys: [], vals: [], kids: [], size: 0, packed: false}
     var sep = ""
     if leaf {
         var acc = 0
         var m = 0
         while m < n - 1 {
-            let e = lexdb_page.leafEntry(&db.nodes[s].keys[m], &db.nodes[s].vals[m])
+            let e = lexdb_page.leafEntry(&db.pool[db.meta[s].frame].keys[m], &db.pool[db.meta[s].frame].vals[m])
             if m > 0 && acc + e > total / 2 { break }
             acc += e
             m += 1
         }
         if atEnd && n >= 2 { m = n - 1 }        // the left stays full: only the new entry goes right
         for i in m..n {
-            append(mut &right.keys, db.nodes[s].keys[i])
-            append(mut &right.vals, db.nodes[s].vals[i])
+            append(mut &right.keys, db.pool[db.meta[s].frame].keys[i])
+            append(mut &right.vals, db.pool[db.meta[s].frame].vals[i])
         }
         for i in m..n {
-            let k = pop(mut &db.nodes[s].keys)
-            let v = pop(mut &db.nodes[s].vals)
+            let k = pop(mut &db.pool[db.meta[s].frame].keys)
+            let v = pop(mut &db.pool[db.meta[s].frame].vals)
         }
         sep = lexdb_base.own(&right.keys[0])
     } else {
         var acc = 8
         var m = 1
         while m < n - 1 {
-            let e = lexdb_page.kidEntry(&db.nodes[s].keys[m - 1])
+            let e = lexdb_page.kidEntry(&db.pool[db.meta[s].frame].keys[m - 1])
             if acc + e > total / 2 { break }
             acc += e
             m += 1
         }
         if atEnd && n >= 3 { m = n - 2 }        // the left stays full: the last two children go right
         // keys[m] goes up; keys after it and kids after m go right
-        sep = lexdb_base.own(&db.nodes[s].keys[m])
-        for i in m + 1..n { append(mut &right.keys, db.nodes[s].keys[i]) }
-        for i in m + 1..n + 1 { append(mut &right.kids, db.nodes[s].kids[i]) }
+        sep = lexdb_base.own(&db.pool[db.meta[s].frame].keys[m])
+        for i in m + 1..n { append(mut &right.keys, db.pool[db.meta[s].frame].keys[i]) }
+        for i in m + 1..n + 1 { append(mut &right.kids, db.pool[db.meta[s].frame].kids[i]) }
         for i in m..n {
-            let k = pop(mut &db.nodes[s].keys)
-            let c = pop(mut &db.nodes[s].kids)
+            let k = pop(mut &db.pool[db.meta[s].frame].keys)
+            let c = pop(mut &db.pool[db.meta[s].frame].kids)
         }
     }
-    db.nodes[s].size = nodeSize(&db.nodes[s])
+    db.pool[db.meta[s].frame].size = nodeSize(&db.pool[db.meta[s].frame])
     right.size = nodeSize(&right)
     db.meta[s].version += 1
-    db.nodes[s].packed = false
+    db.pool[db.meta[s].frame].packed = false
     db.recost(s)
     let r = db.newNode(right)
     return Descent{path: [r], need: -1, upper: sep, hasUpper: true}
@@ -597,7 +626,7 @@ fn (db: mut &Db) fixOverflow(tree: int, path: &[]int, from: int, atEnd: bool) {
     var end = atEnd
     while j >= 0 {
         let s = path[j]
-        if db.nodes[s].size <= lexdb_page.NODE_ROOM { return }
+        if db.pool[db.meta[s].frame].size <= lexdb_page.NODE_ROOM { return }
         let sp = db.split(s, end)
         let r = sp.path[0]
         if j == 0 {
@@ -614,13 +643,13 @@ fn (db: mut &Db) fixOverflow(tree: int, path: &[]int, from: int, atEnd: bool) {
         let p = path[j - 1]
         db.willChange(p)
         var at = 0
-        while db.nodes[p].kids[at] != s { at += 1 }
-        collections.insert(mut &db.nodes[p].keys, at, sp.upper)
-        collections.insert(mut &db.nodes[p].kids, at + 1, r)
-        end = end && at + 2 == len(db.nodes[p].kids)     // the new child is the parent's last
-        db.nodes[p].size += lexdb_page.kidEntry(&sp.upper)
+        while db.pool[db.meta[p].frame].kids[at] != s { at += 1 }
+        collections.insert(mut &db.pool[db.meta[p].frame].keys, at, sp.upper)
+        collections.insert(mut &db.pool[db.meta[p].frame].kids, at + 1, r)
+        end = end && at + 2 == len(db.pool[db.meta[p].frame].kids)     // the new child is the parent's last
+        db.pool[db.meta[p].frame].size += lexdb_page.kidEntry(&sp.upper)
         db.meta[p].version += 1
-        db.nodes[p].packed = false
+        db.pool[db.meta[p].frame].packed = false
         db.recost(p)
         j -= 1
     }
@@ -632,22 +661,22 @@ fn (db: mut &Db) applyPut(tree: int, key: &str, val: &str) {
     for s in d.path { db.markDirty(s) }
     let leaf = d.path[len(d.path) - 1]
     db.willChange(leaf)
-    let i = lowerIndex(&db.nodes[leaf].keys, key)
+    let i = lowerIndex(&db.pool[db.meta[leaf].frame].keys, key)
     // A key past every key in the tree (the rightmost leaf, at its end): an
     // ascending load. Its splits leave the left node full, not half (as
     // PostgreSQL's rightmost split and SQLite's quick balance do): a table
     // loaded in key order then takes half the pages.
-    let atEnd = !d.hasUpper && i == len(db.nodes[leaf].keys)
-    if i < len(db.nodes[leaf].keys) && db.nodes[leaf].keys[i] == key {
-        db.nodes[leaf].size += len(val) - len(db.nodes[leaf].vals[i])
-        db.nodes[leaf].vals[i] = val
+    let atEnd = !d.hasUpper && i == len(db.pool[db.meta[leaf].frame].keys)
+    if i < len(db.pool[db.meta[leaf].frame].keys) && db.pool[db.meta[leaf].frame].keys[i] == key {
+        db.pool[db.meta[leaf].frame].size += len(val) - len(db.pool[db.meta[leaf].frame].vals[i])
+        db.pool[db.meta[leaf].frame].vals[i] = val
     } else {
-        collections.insert(mut &db.nodes[leaf].keys, i, key)
-        collections.insert(mut &db.nodes[leaf].vals, i, val)
-        db.nodes[leaf].size += lexdb_page.leafEntry(key, val)
+        collections.insert(mut &db.pool[db.meta[leaf].frame].keys, i, key)
+        collections.insert(mut &db.pool[db.meta[leaf].frame].vals, i, val)
+        db.pool[db.meta[leaf].frame].size += lexdb_page.leafEntry(key, val)
     }
     db.meta[leaf].version += 1
-    db.nodes[leaf].packed = false
+    db.pool[db.meta[leaf].frame].packed = false
     db.recost(leaf)
     db.fixOverflow(tree, &d.path, len(d.path) - 1, atEnd)
 }
@@ -656,34 +685,34 @@ fn (db: mut &Db) applyDel(tree: int, key: &str) {
     let d = db.descend(tree, key)
     if len(d.path) == 0 { return }
     let leaf = d.path[len(d.path) - 1]
-    let i = lowerIndex(&db.nodes[leaf].keys, key)
-    if i >= len(db.nodes[leaf].keys) || db.nodes[leaf].keys[i] != key { return }
+    let i = lowerIndex(&db.pool[db.meta[leaf].frame].keys, key)
+    if i >= len(db.pool[db.meta[leaf].frame].keys) || db.pool[db.meta[leaf].frame].keys[i] != key { return }
     for s in d.path { db.markDirty(s) }
     db.willChange(leaf)
-    db.nodes[leaf].size -= lexdb_page.leafEntry(&db.nodes[leaf].keys[i], &db.nodes[leaf].vals[i])
-    let k = collections.removeAt(mut &db.nodes[leaf].keys, i)
-    let v = collections.removeAt(mut &db.nodes[leaf].vals, i)
+    db.pool[db.meta[leaf].frame].size -= lexdb_page.leafEntry(&db.pool[db.meta[leaf].frame].keys[i], &db.pool[db.meta[leaf].frame].vals[i])
+    let k = collections.removeAt(mut &db.pool[db.meta[leaf].frame].keys, i)
+    let v = collections.removeAt(mut &db.pool[db.meta[leaf].frame].vals, i)
     db.meta[leaf].version += 1
-    db.nodes[leaf].packed = false
+    db.pool[db.meta[leaf].frame].packed = false
     db.recost(leaf)
     // An empty node leaves its parent (no merging: design/lexdb.md 4.2).
     var j = len(d.path) - 1
     while j > 0 {
         let c = d.path[j]
-        let empty = if db.nodes[c].leaf { len(db.nodes[c].keys) == 0 } else { len(db.nodes[c].kids) == 0 }
+        let empty = if db.pool[db.meta[c].frame].leaf { len(db.pool[db.meta[c].frame].keys) == 0 } else { len(db.pool[db.meta[c].frame].kids) == 0 }
         if !empty { break }
         let p = d.path[j - 1]
         db.willChange(p)
         var at = 0
-        while db.nodes[p].kids[at] != c { at += 1 }
-        let gone = collections.removeAt(mut &db.nodes[p].kids, at)
-        if len(db.nodes[p].keys) > 0 {
+        while db.pool[db.meta[p].frame].kids[at] != c { at += 1 }
+        let gone = collections.removeAt(mut &db.pool[db.meta[p].frame].kids, at)
+        if len(db.pool[db.meta[p].frame].keys) > 0 {
             let ki = if at == 0 { 0 } else { at - 1 }
-            let sk = collections.removeAt(mut &db.nodes[p].keys, ki)
+            let sk = collections.removeAt(mut &db.pool[db.meta[p].frame].keys, ki)
         }
-        db.nodes[p].size = nodeSize(&db.nodes[p])
+        db.pool[db.meta[p].frame].size = nodeSize(&db.pool[db.meta[p].frame])
         db.meta[p].version += 1
-        db.nodes[p].packed = false
+        db.pool[db.meta[p].frame].packed = false
         db.recost(p)
         db.freeSlot(c)
         j -= 1
@@ -691,14 +720,14 @@ fn (db: mut &Db) applyDel(tree: int, key: &str) {
     // The root: an internal root with no children becomes an empty leaf, and
     // one with a single child in memory gives way to it.
     var root = d.path[0]
-    if !db.nodes[root].leaf && len(db.nodes[root].kids) == 0 {
+    if !db.pool[db.meta[root].frame].leaf && len(db.pool[db.meta[root].frame].kids) == 0 {
         db.willChange(root)
-        db.nodes[root] = lexdb_page.newLeaf()
+        db.setNode(root, lexdb_page.newLeaf())
         db.meta[root].version += 1
         db.recost(root)
     }
-    while !db.nodes[root].leaf && len(db.nodes[root].kids) == 1 && db.meta[db.nodes[root].kids[0]].loaded {
-        let only = db.nodes[root].kids[0]
+    while !db.pool[db.meta[root].frame].leaf && len(db.pool[db.meta[root].frame].kids) == 1 && db.meta[db.pool[db.meta[root].frame].kids[0]].loaded {
+        let only = db.pool[db.meta[root].frame].kids[0]
         db.markDirty(only)
         db.meta[only].root = true
         db.setRoot(tree, only)
@@ -732,8 +761,8 @@ fn (db: mut &Db) applyDrop(tree: int) {
     var stack = [r]
     while len(stack) > 0 {
         let s = pop(mut &stack)
-        if db.meta[s].loaded && !db.nodes[s].leaf {
-            for k in db.nodes[s].kids { append(mut &stack, k) }
+        if db.meta[s].loaded && !db.pool[db.meta[s].frame].leaf {
+            for k in db.pool[db.meta[s].frame].kids { append(mut &stack, k) }
         }
         db.freeSlot(s)
     }
@@ -842,9 +871,9 @@ pub fn (st: &Store) get(t: mut &Txn, tree: int, key: str): Result[Option[str], l
             if len(d.path) == 0 { return }
             let leaf = d.path[len(d.path) - 1]
             append(mut &t.reads, db.mark(leaf))
-            let i = lowerIndex(&db.nodes[leaf].keys, &key)
-            if i < len(db.nodes[leaf].keys) && db.nodes[leaf].keys[i] == key {
-                out = Some(db.nodes[leaf].vals[i])
+            let i = lowerIndex(&db.pool[db.meta[leaf].frame].keys, &key)
+            if i < len(db.pool[db.meta[leaf].frame].keys) && db.pool[db.meta[leaf].frame].keys[i] == key {
+                out = Some(db.pool[db.meta[leaf].frame].vals[i])
             }
         })
         if len(bad) > 0 { return Err(bad[0]) }
@@ -935,11 +964,11 @@ pub fn (st: &Store) scan(t: mut &Txn, tree: int, from: str, to: str, f: &fn(&Ent
             if len(d.path) == 0 { return }
             let leaf = d.path[len(d.path) - 1]
             append(mut &t.reads, db.mark(leaf))
-            var i = lowerIndex(&db.nodes[leaf].keys, &cursor)
-            while i < len(db.nodes[leaf].keys) {
-                let k = db.nodes[leaf].keys[i]
+            var i = lowerIndex(&db.pool[db.meta[leaf].frame].keys, &cursor)
+            while i < len(db.pool[db.meta[leaf].frame].keys) {
+                let k = db.pool[db.meta[leaf].frame].keys[i]
                 if len(to) > 0 && k >= to { break }
-                append(mut &chunk, Entry{key: k, val: db.nodes[leaf].vals[i]})
+                append(mut &chunk, Entry{key: k, val: db.pool[db.meta[leaf].frame].vals[i]})
                 i += 1
             }
             upper = d.upper
@@ -989,13 +1018,13 @@ fn (db: mut &Db) descendBack(tree: int, k: &str): Descent {
         }
         db.meta[s].ref = true
         append(mut &d.path, s)
-        if db.nodes[s].leaf { return d }
-        let j = if len(k) == 0 { len(db.nodes[s].keys) } else { lowerIndex(&db.nodes[s].keys, k) }
+        if db.pool[db.meta[s].frame].leaf { return d }
+        let j = if len(k) == 0 { len(db.pool[db.meta[s].frame].keys) } else { lowerIndex(&db.pool[db.meta[s].frame].keys, k) }
         if j > 0 {
-            d.upper = db.nodes[s].keys[j - 1]       // here: the lower fence
+            d.upper = db.pool[db.meta[s].frame].keys[j - 1]       // here: the lower fence
             d.hasUpper = true
         }
-        s = db.nodes[s].kids[j]
+        s = db.pool[db.meta[s].frame].kids[j]
     }
     return d
 }
@@ -1055,12 +1084,12 @@ pub fn (st: &Store) scanBack(t: mut &Txn, tree: int, from: str, to: str, f: &fn(
             if len(d.path) == 0 { return }
             let leaf = d.path[len(d.path) - 1]
             append(mut &t.reads, db.mark(leaf))
-            var i = if len(cursor) == 0 { len(db.nodes[leaf].keys) } else { lowerIndex(&db.nodes[leaf].keys, &cursor) }
+            var i = if len(cursor) == 0 { len(db.pool[db.meta[leaf].frame].keys) } else { lowerIndex(&db.pool[db.meta[leaf].frame].keys, &cursor) }
             while i > 0 {
                 i -= 1
-                let k = db.nodes[leaf].keys[i]
+                let k = db.pool[db.meta[leaf].frame].keys[i]
                 if k < from { break }
-                append(mut &chunk, Entry{key: k, val: db.nodes[leaf].vals[i]})
+                append(mut &chunk, Entry{key: k, val: db.pool[db.meta[leaf].frame].vals[i]})
             }
             lower = d.upper
             hasLower = d.hasUpper
@@ -1322,7 +1351,7 @@ fn (db: &Db) verOf(s: int, q: int): int {
 
 fn (db: &Db) snapNode(s: int, v: int): &lexdb_page.Node {
     if v >= 0 { return &db.hist[s][v].node }
-    return &db.nodes[s]
+    return &db.pool[db.meta[s].frame]
 }
 
 fn snapCancelled(): lexdb_base.DbErr {
@@ -1561,19 +1590,19 @@ fn (db: mut &Db) allocPage(): int {
 fn (db: mut &Db) encodeSlot(s: int, n: int, out: mut &[]PageOut): int {
     if !db.meta[s].dirty { return db.meta[s].disk }
     var pages: []int = []
-    if !db.nodes[s].leaf {
+    if !db.pool[db.meta[s].frame].leaf {
         var kids: []int = []
-        for k in db.nodes[s].kids { append(mut &kids, k) }
+        for k in db.pool[db.meta[s].frame].kids { append(mut &kids, k) }
         for k in kids { append(mut &pages, db.encodeSlot(k, n, mut &out)) }
     }
     let p = db.allocPage()
-    let body = lexdb_page.nodeBody(&db.nodes[s], &pages)
-    lexdb_page.repack(mut &db.nodes[s], &body)
+    let body = lexdb_page.nodeBody(&db.pool[db.meta[s].frame], &pages)
+    lexdb_page.repack(mut &db.pool[db.meta[s].frame], &body)
     db.recost(s)
     db.meta[s].dirty = false
     db.meta[s].disk = p
     db.meta[s].ckpt = n
-    append(mut &out, PageOut{no: p, leaf: db.nodes[s].leaf, n: len(db.nodes[s].keys), body: body, raw: []})
+    append(mut &out, PageOut{no: p, leaf: db.pool[db.meta[s].frame].leaf, n: len(db.pool[db.meta[s].frame].keys), body: body, raw: []})
     return p
 }
 
@@ -1764,7 +1793,7 @@ pub fn checkpointer(st: Store): int {
 // ---- open, recovery, close
 
 fn newDb(fs: lexdb_disk.Fs, data: lexdb_disk.File, opts: Options, m: &lexdb_page.Meta): Db {
-    return Db{opts: opts, fs: fs, data: data, nodes: [], meta: [], freeSlots: [], loadedCount: 0, cacheUsed: 0, freedAt: [], hand: 0,
+    return Db{opts: opts, fs: fs, data: data, pool: [], owner: [], meta: [], freeSlots: [], loadedCount: 0, cacheUsed: 0, freedAt: [], hand: 0,
               trees: newMap(), nextTree: m.nextTree, npages: m.npages, free: [], freeAfterNext: [],
               pendingFree: [], listPages: [], ckpt: m.ckpt, durableCkpt: m.ckpt, ckptRunning: false,
               batch: [], batchCount: 0, batchNo: m.replayBatch, appliedBatch: m.replayBatch - 1,

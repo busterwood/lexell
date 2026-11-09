@@ -1173,8 +1173,20 @@ the rightmost, which changes nothing measurable (random 67%). Nor the
 inner-level rule, whose pages are 1% of the total; checked by hand
 instead: 961 pages in use against 964 without it.
 
-Next for the cache: the placeholders. An unloaded child keeps a slot of
+**A slot not in memory holds no node.** An unloaded child kept a slot of
 about 230 bytes (measured: an empty `Node` record 118, `SlotMeta` 85, the
-history list 24). With `Option[Node]` (`None` is a null pointer, 8 bytes)
-and the history kept only for slots that have some, it would be about 90.
+history list 24), and was charged 200, so the cache ran over its budget.
+Now the nodes in memory sit in a dense pool (`Db.pool`, `SlotMeta.frame`,
+`owner`): a node loaded takes a frame, and one evicted or freed gives it
+back, with the pool's last node moved into the hole. A slot not in memory
+costs about 117 bytes, charged 120. A stray read of one now stops with an
+index error, where it used to read an empty node.
 
+| 10 million rows in key order, random point selects | before | after |
+|---|---:|---:|
+| 64 MB cache | 15,200/s, 1.41 reads each, RSS 75 MB | 16,700/s, 1.19 reads each, RSS 66 MB |
+| 128 MB cache | 19,200/s, 1.00 reads each | 19,800/s, 0.96 reads each |
+
+Caught: `freeNode` not telling the moved node its new frame (5 programs).
+A further 40 bytes a slot could come from moving the history lists into a
+map (most slots have none) and narrowing `SlotMeta`'s fields.
