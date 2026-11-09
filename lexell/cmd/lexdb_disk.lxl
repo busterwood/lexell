@@ -1,0 +1,397 @@
+// lexdb: files, real and simulated (design/lexdb.md 4.1 and stage D0).
+//
+// A Fs is a directory of files. The real one opens files with O_DIRECT and
+// does its reads, writes and flushes as blocking C calls, which park the
+// task on the helper pool. Offsets and lengths are multiples of 4 KiB, and
+// the bytes go through a 4 KiB-aligned C buffer, as O_DIRECT requires.
+//
+// The simulated one keeps each file in memory twice: what reads see, and
+// what a crash would leave (the state at the last flush). Writes since the
+// last flush are kept in order; crash() makes a new Fs from the flushed
+// state with a random choice, per write, of dropping it, applying it, or
+// tearing it at 512-byte sectors. That is what a drive without power-loss
+// protection may do. Creating, renaming and removing files are durable at
+// once in the simulation (the real Fs calls syncDir after them). Every
+// simulated read, write and flush yields, so other tasks run in between, as
+// they would while a real call is parked.
+import "task"
+import "fs"
+import "./lexdb_base"
+
+pub const PAGE = 4096
+const SECTOR = 512
+
+extern "c" fn openFile(path: str, flags: i32, mode: u32): i32 as "open"
+extern "c" fn closeFd(fd: i32): i32 as "close"
+extern "c" fn posix_memalign(out: mut &ptr, align: int, size: int): i32
+extern "c" fn freeMem(p: ptr) as "free"
+extern "c" fn pread(fd: i32, buf: ptr, n: int, off: int): int blocking
+extern "c" fn pwrite(fd: i32, buf: ptr, n: int, off: int): int blocking
+extern "c" fn fdatasync(fd: i32): i32 blocking
+extern "c" fn fsyncFd(fd: i32): i32 as "fsync" blocking
+extern "c" fn posix_fallocate(fd: i32, off: int, n: int): i32 blocking
+extern "c" fn lseek(fd: i32, off: int, whence: i32): int
+extern "c" fn errno(): int as "lxl_errno"
+extern "c" fn copyIn(dst: ptr, at: int, src: &[byte], n: int) as "lxllib_copy_in"
+extern "c" fn copyOut(dst: mut &[byte], src: ptr, at: int, n: int) as "lxllib_copy_out"
+
+const O_RDONLY: i32 = 0
+const O_RDWR: i32 = 2
+const O_CREAT: i32 = 64
+const O_DIRECT: i32 = 16384
+const O_DIRECTORY: i32 = 65536
+const O_CLOEXEC: i32 = 524288
+
+pub type Fs = value closed {
+    Real(str)                       // the directory
+    Sim(task.Shared[SimFs])
+}
+
+pub type File = value closed {
+    Real(i32)                       // the descriptor
+    Sim(task.Shared[SimFs], int)    // the file's index in the SimFs
+}
+
+type Pending = value record { off: int; data: str }
+
+type SimFile = record {
+    name: str
+    live: bool
+    cur: []byte                     // what reads see
+    durable: []byte                 // what a crash keeps, before the pending writes
+    pending: []Pending              // writes since the last flush, in order
+}
+
+pub type SimFs = record {
+    files: []SimFile
+    rng: lexdb_base.Rng
+    pub writes: int                 // counters, for the tests
+    pub flushes: int
+    failAt: int                     // the I/O call that fails (EIO), or -1
+    ios: int
+}
+
+pub fn real(dir: str): Fs { return Fs.Real(dir) }
+
+pub fn sim(seed: int): Fs {
+    return Fs.Sim(task.shared(SimFs{files: [], rng: lexdb_base.rng(seed), writes: 0, flushes: 0,
+                                     failAt: -1, ios: 0}))
+}
+
+fn alignedCheck(off: int, n: int, op: str): Result[Unit, lexdb_base.DbErr] {
+    if off % PAGE != 0 || n % PAGE != 0 || n <= 0 {
+        return Err(lexdb_base.err(lexdb_base.S_INTERNAL, op + ": unaligned offset or length"))
+    }
+    return Ok(Unit{})
+}
+
+// ---- the file system
+
+fn simFind(st: &SimFs, name: &str): int {
+    for i in 0..len(st.files) {
+        if st.files[i].live && st.files[i].name == name { return i }
+    }
+    return -1
+}
+
+// Opens a file, creating it (empty) when create is true and it does not exist.
+pub fn (f: &Fs) open(name: str, create: bool): Result[File, lexdb_base.DbErr] {
+    match f {
+        Fs.Real(dir) {
+            let path = fs.join(dir, name)
+            var flags = O_RDWR | O_DIRECT | O_CLOEXEC
+            let isNew = create && !fs.exists(path)
+            if create { flags = flags | O_CREAT }
+            let fd = openFile(path, flags, 420)
+            if fd < 0 { return Err(lexdb_base.ioErr("open " + path, errno())) }
+            if isNew { try f.syncDir() }
+            return Ok(File.Real(fd))
+        }
+        Fs.Sim(sh) {
+            var idx = -1
+            sh.with(fn(st: mut &SimFs) {
+                idx = simFind(st, &name)
+                if idx < 0 && create {
+                    append(mut &st.files, SimFile{name: name, live: true, cur: [], durable: [], pending: []})
+                    idx = len(st.files) - 1
+                }
+            })
+            if idx < 0 { return Err(lexdb_base.ioErr("open " + name, 2)) }
+            return Ok(File.Sim(sh, idx))
+        }
+    }
+}
+
+pub fn (f: &Fs) exists(name: str): bool {
+    match f {
+        Fs.Real(dir) { return fs.exists(fs.join(dir, name)) }
+        Fs.Sim(sh) {
+            var found = false
+            sh.with(fn(st: mut &SimFs) { found = simFind(st, &name) >= 0 })
+            return found
+        }
+    }
+}
+
+pub fn (f: &Fs) remove(name: str): Result[Unit, lexdb_base.DbErr] {
+    match f {
+        Fs.Real(dir) {
+            match fs.remove(fs.join(dir, name)) {
+                Ok(_) {}
+                Err(e) { return Err(lexdb_base.ioErr("remove " + name, e.errno)) }
+            }
+            return f.syncDir()
+        }
+        Fs.Sim(sh) {
+            sh.with(fn(st: mut &SimFs) {
+                let i = simFind(st, &name)
+                if i >= 0 { st.files[i].live = false }
+            })
+            return Ok(Unit{})
+        }
+    }
+}
+
+// Renames from to to, replacing to.
+pub fn (f: &Fs) rename(from: str, to: str): Result[Unit, lexdb_base.DbErr] {
+    match f {
+        Fs.Real(dir) {
+            match fs.rename(fs.join(dir, from), fs.join(dir, to)) {
+                Ok(_) {}
+                Err(e) { return Err(lexdb_base.ioErr("rename " + from, e.errno)) }
+            }
+            return f.syncDir()
+        }
+        Fs.Sim(sh) {
+            var ok = false
+            sh.with(fn(st: mut &SimFs) {
+                let old = simFind(st, &to)
+                if old >= 0 { st.files[old].live = false }
+                let i = simFind(st, &from)
+                if i >= 0 {
+                    st.files[i].name = to
+                    ok = true
+                }
+            })
+            if !ok { return Err(lexdb_base.ioErr("rename " + from, 2)) }
+            return Ok(Unit{})
+        }
+    }
+}
+
+// Makes the directory's entries durable (after a create, rename or remove).
+pub fn (f: &Fs) syncDir(): Result[Unit, lexdb_base.DbErr] {
+    match f {
+        Fs.Real(dir) {
+            let fd = openFile(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0)
+            if fd < 0 { return Err(lexdb_base.ioErr("open " + dir, errno())) }
+            let r = fsyncFd(fd)
+            let e = errno()
+            closeFd(fd)
+            if r != 0 { return Err(lexdb_base.ioErr("fsync " + dir, e)) }
+            return Ok(Unit{})
+        }
+        Fs.Sim(_) { return Ok(Unit{}) }
+    }
+}
+
+// The simulation's file system after a crash: each file as flushed, with
+// some of the writes since its last flush dropped, applied or torn. The
+// new Fs has its own state; the old one is left as it was.
+pub fn (f: &Fs) crash(seed: int): Fs {
+    var files: []SimFile = []
+    match f {
+        Fs.Real(_) { panic("crash: only a simulated Fs can crash") }
+        Fs.Sim(sh) {
+            sh.with(fn(st: mut &SimFs) {
+                var r = lexdb_base.rng(seed)
+                for i in 0..len(st.files) {
+                    var d: []byte = []
+                    for b in st.files[i].durable { append(mut &d, b) }
+                    for p in st.files[i].pending {
+                        let how = r.below(3)
+                        if how == 0 { continue }
+                        while len(d) < p.off + len(p.data) { append(mut &d, byte(0)) }
+                        for s in 0..len(p.data) / SECTOR {
+                            if how == 1 || r.below(2) == 0 {
+                                for k in s * SECTOR..(s + 1) * SECTOR { d[p.off + k] = p.data[k] }
+                            }
+                        }
+                    }
+                    var c: []byte = []
+                    for b in d { append(mut &c, b) }
+                    append(mut &files, SimFile{name: st.files[i].name, live: st.files[i].live, cur: c, durable: d,
+                                              pending: []})
+                }
+            })
+        }
+    }
+    return Fs.Sim(task.shared(SimFs{files: files, rng: lexdb_base.rng(seed + 1), writes: 0, flushes: 0,
+                                     failAt: -1, ios: 0}))
+}
+
+// Makes the n-th I/O call from now (0: the next) fail with EIO, for the tests.
+pub fn (f: &Fs) failIn(n: int) {
+    match f {
+        Fs.Real(_) {}
+        Fs.Sim(sh) { sh.with(fn(st: mut &SimFs) { st.failAt = st.ios + n }) }
+    }
+}
+
+// The number of flushes of a simulated Fs, for the tests.
+pub fn (f: &Fs) flushes(): int {
+    var n = 0
+    match f {
+        Fs.Real(_) {}
+        Fs.Sim(sh) { sh.with(fn(st: mut &SimFs) { n = st.flushes }) }
+    }
+    return n
+}
+
+// ---- files
+
+fn simIo(st: mut &SimFs): bool {
+    let fail = st.failAt >= 0 && st.ios == st.failAt
+    st.ios += 1
+    return fail
+}
+
+pub fn (f: &File) size(): Result[int, lexdb_base.DbErr] {
+    match f {
+        File.Real(fd) {
+            let n = lseek(fd, 0, 2)
+            if n < 0 { return Err(lexdb_base.ioErr("lseek", errno())) }
+            return Ok(n)
+        }
+        File.Sim(sh, i) {
+            var n = 0
+            sh.with(fn(st: mut &SimFs) { n = len(st.files[i].cur) })
+            return Ok(n)
+        }
+    }
+}
+
+// Makes the file at least n bytes long (zeros), with the space allocated.
+pub fn (f: &File) grow(n: int): Result[Unit, lexdb_base.DbErr] {
+    match f {
+        File.Real(fd) {
+            let r = posix_fallocate(fd, 0, n)
+            if r != 0 { return Err(lexdb_base.ioErr("fallocate", int(r))) }
+            return Ok(Unit{})
+        }
+        File.Sim(sh, i) {
+            sh.with(fn(st: mut &SimFs) {
+                while len(st.files[i].cur) < n { append(mut &st.files[i].cur, byte(0)) }
+                while len(st.files[i].durable) < n { append(mut &st.files[i].durable, byte(0)) }
+            })
+            return Ok(Unit{})
+        }
+    }
+}
+
+// Reads n bytes at off into dst[0..n). Past the end of the file the bytes
+// are zeros.
+pub fn (f: &File) read(off: int, dst: mut &[byte], n: int): Result[Unit, lexdb_base.DbErr] {
+    try alignedCheck(off, n, "read")
+    match f {
+        File.Real(fd) {
+            var buf = nullPtr()
+            if posix_memalign(mut &buf, PAGE, n) != 0 { panic("lexdb: out of memory (an I/O buffer)") }
+            let got = pread(fd, buf, n, off)
+            let e = errno()
+            if got < 0 {
+                freeMem(buf)
+                return Err(lexdb_base.ioErr("pread", e))
+            }
+            copyOut(dst, buf, 0, got)
+            freeMem(buf)
+            for i in got..n { dst[i] = 0 }
+            return Ok(Unit{})
+        }
+        File.Sim(sh, idx) {
+            let yd = task.yield()
+            var fail = false
+            sh.with(fn(st: mut &SimFs) {
+                fail = simIo(st)
+                let have = len(st.files[idx].cur)
+                for i in 0..n {
+                    dst[i] = if off + i < have { st.files[idx].cur[off + i] } else { byte(0) }
+                }
+            })
+            if fail { return Err(lexdb_base.ioErr("pread", 5)) }
+            return Ok(Unit{})
+        }
+    }
+}
+
+// Writes src at off. Durable only after flush.
+pub fn (f: &File) write(off: int, src: &[byte]): Result[Unit, lexdb_base.DbErr] {
+    let n = len(src)
+    try alignedCheck(off, n, "write")
+    match f {
+        File.Real(fd) {
+            var buf = nullPtr()
+            if posix_memalign(mut &buf, PAGE, n) != 0 { panic("lexdb: out of memory (an I/O buffer)") }
+            copyIn(buf, 0, src, n)
+            let put = pwrite(fd, buf, n, off)
+            let e = errno()
+            freeMem(buf)
+            if put < 0 { return Err(lexdb_base.ioErr("pwrite", e)) }
+            if put != n { return Err(lexdb_base.ioErr("pwrite (short)", 5)) }
+            return Ok(Unit{})
+        }
+        File.Sim(sh, idx) {
+            let yd = task.yield()
+            var fail = false
+            sh.with(fn(st: mut &SimFs) {
+                fail = simIo(st)
+                if !fail {
+                    st.writes += 1
+                    while len(st.files[idx].cur) < off + n { append(mut &st.files[idx].cur, byte(0)) }
+                    var bs: []byte = []
+                    for i in 0..n {
+                        st.files[idx].cur[off + i] = src[i]
+                        append(mut &bs, src[i])
+                    }
+                    append(mut &st.files[idx].pending, Pending{off: off, data: strFromBytes(&bs)})
+                }
+            })
+            if fail { return Err(lexdb_base.ioErr("pwrite", 5)) }
+            return Ok(Unit{})
+        }
+    }
+}
+
+// Makes every write before it durable (fdatasync).
+pub fn (f: &File) flush(): Result[Unit, lexdb_base.DbErr] {
+    match f {
+        File.Real(fd) {
+            if fdatasync(fd) != 0 { return Err(lexdb_base.ioErr("fdatasync", errno())) }
+            return Ok(Unit{})
+        }
+        File.Sim(sh, idx) {
+            // A flush is the slow call (section 3): let more happen meanwhile.
+            for i in 0..4 { let yd = task.yield() }
+            var fail = false
+            sh.with(fn(st: mut &SimFs) {
+                fail = simIo(st)
+                if !fail {
+                    st.flushes += 1
+                    var d: []byte = []
+                    for b in st.files[idx].cur { append(mut &d, b) }
+                    st.files[idx].durable = d
+                    st.files[idx].pending = []
+                }
+            })
+            if fail { return Err(lexdb_base.ioErr("fdatasync", 5)) }
+            return Ok(Unit{})
+        }
+    }
+}
+
+pub fn (f: &File) close() {
+    match f {
+        File.Real(fd) { closeFd(fd) }
+        File.Sim(_, _) {}
+    }
+}

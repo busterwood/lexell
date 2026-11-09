@@ -1,0 +1,74 @@
+// lexdb_store: puts, gets, deletes and scans in one store, through commits,
+// with splits (many keys) and the transaction's own writes.
+// expect: get k0005 v5
+// expect: count 3000 first k0000 last k2999
+// expect: own: a 1, b 2, k0000 v0 ...
+// expect: after delete 2000
+// expect: range 10
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_base"
+import "strings"
+
+fn key(i: int): str { return "k" + strings.padLeft(i.toStr(), 4, '0') }
+
+fn body(st: lexdb_store.Store): Result[Unit, lexdb_base.DbErr] {
+    var t = lexdb_store.begin()
+    let tree = st.createTree(mut &t)
+    try st.commit(t)
+    var i = 0
+    while i < 3000 {
+        var w = lexdb_store.begin()
+        for j in i..i + 100 { try w.put(tree, key(j), "v" + j.toStr()) }
+        try st.commit(w)
+        i += 100
+    }
+    var r = lexdb_store.begin()
+    println("get k0005 " + (try st.get(mut &r, tree, "k0005")).unwrap())
+    var n = 0
+    var first = ""
+    var last = ""
+    try st.scan(mut &r, tree, "", "", fn(e: &lexdb_store.Entry): bool {
+        if n == 0 { first = e.key }
+        last = e.key
+        n += 1
+        return true
+    })
+    println("count " + n.toStr() + " first " + first + " last " + last)
+    try st.commit(r)
+    var o = lexdb_store.begin()
+    try o.put(tree, "a", "1")
+    try o.put(tree, "b", "2")
+    o.del(tree, "k0001")
+    var seen: []str = []
+    try st.scan(mut &o, tree, "", "k0002", fn(e: &lexdb_store.Entry): bool {
+        append(mut &seen, e.key + " " + e.val)
+        return true
+    })
+    println("own: " + strings.join(&seen, ", ") + " ...")
+    var d = lexdb_store.begin()
+    for j in 0..1000 { d.del(tree, key(j * 3)) }
+    try st.commit(d)
+    var c = lexdb_store.begin()
+    n = 0
+    try st.scan(mut &c, tree, "", "", fn(e: &lexdb_store.Entry): bool {
+        n += 1
+        return true
+    })
+    println("after delete " + n.toStr())
+    n = 0
+    try st.scan(mut &c, tree, "k0100", "k0115", fn(e: &lexdb_store.Entry): bool {
+        n += 1
+        return true
+    })
+    println("range " + n.toStr())
+    return Ok(Unit{})
+}
+
+fn main() {
+    let fs = lexdb_disk.sim(7)
+    match lexdb_store.run(fs, lexdb_store.defaults(), body) {
+        Ok(r) { r.unwrap() }
+        Err(e) { println(e.toStr()) }
+    }
+}

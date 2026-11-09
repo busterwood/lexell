@@ -1,0 +1,94 @@
+// lexdb: what every layer shares: the error type, CRC32C and a small
+// deterministic random generator for the simulated disk and the tests.
+// Design: design/lexdb.md.
+
+// An error, with the SQLSTATE a Postgres client sees (design/lexdb.md 4.4:
+// 40001 is a serialization failure the client retries).
+pub type DbErr = value record {
+    pub state: str
+    pub msg: str
+}
+
+pub fn err(state: str, msg: str): DbErr { return DbErr{state: state, msg: msg} }
+
+pub fn (e: &DbErr) toStr(): str { return e.state + ": " + e.msg }
+
+pub const S_IO = "58030"            // io_error
+pub const S_CORRUPT = "XX001"       // data_corrupted
+pub const S_INTERNAL = "XX000"      // internal_error
+pub const S_CONFLICT = "40001"      // serialization_failure
+pub const S_LIMIT = "54000"         // program_limit_exceeded
+
+pub fn ioErr(op: str, errno: int): DbErr {
+    return DbErr{state: S_IO, msg: op + ": errno " + errno.toStr()}
+}
+
+pub fn corrupt(msg: str): DbErr { return DbErr{state: S_CORRUPT, msg: msg} }
+
+pub fn conflict(): DbErr {
+    return DbErr{state: S_CONFLICT, msg: "could not serialize access due to concurrent update"}
+}
+
+// ---- CRC32C (Castagnoli), reflected, as iSCSI and ext4 use it.
+
+var CRC_TABLE: once []u32
+
+fn crcInit() {
+    if !CRC_TABLE.isSet() {
+        var t: []u32 = []
+        for i in 0..256 {
+            var c = u32(i)
+            for k in 0..8 {
+                if c & 1 == 1 { c = (c >> 1) ^ 0x82F63B78 } else { c = c >> 1 }
+            }
+            append(mut &t, c)
+        }
+        CRC_TABLE.set(t)
+    }
+}
+
+// CRC32C of b[from..to).
+pub fn crc32c(b: &[byte], from: int, to: int): u32 {
+    crcInit()
+    let t = CRC_TABLE.get()
+    var c: u32 = 0xFFFFFFFF
+    for i in from..to {
+        c = t[int((c ^ u32(b[i])) & 0xFF)] ^ (c >> 8)
+    }
+    return c ^ 0xFFFFFFFF
+}
+
+// CRC32C of a string's bytes.
+pub fn crc32cStr(s: &str): u32 {
+    crcInit()
+    let t = CRC_TABLE.get()
+    var c: u32 = 0xFFFFFFFF
+    for i in 0..len(s) {
+        c = t[int((c ^ u32(s[i])) & 0xFF)] ^ (c >> 8)
+    }
+    return c ^ 0xFFFFFFFF
+}
+
+// ---- xorshift64*: deterministic, for the simulated disk and the tests.
+
+pub type Rng = value record { s: u64 }
+
+pub fn rng(seed: int): Rng {
+    var s = u64(seed & 0x7FFFFFFFFFFFFFFF) *% 0x9E3779B97F4A7C15
+    if s == 0 { s = 0x2545F4914F6CDD1D }
+    return Rng{s: s}
+}
+
+pub fn (r: mut &Rng) next(): u64 {
+    var x = r.s
+    x = x ^ (x >> 12)
+    x = x ^ (x << 25)
+    x = x ^ (x >> 27)
+    r.s = x
+    return x *% 0x2545F4914F6CDD1D
+}
+
+// A number in 0..n-1 (n > 0).
+pub fn (r: mut &Rng) below(n: int): int {
+    return int((r.next() >> 1) % u64(n))
+}

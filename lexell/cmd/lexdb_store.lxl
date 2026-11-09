@@ -1,0 +1,1337 @@
+// lexdb: the store. Copy-on-write B+trees of byte keys and values, a node
+// cache, optimistic transactions checked by leaf versions, a log of
+// committed rows with group commit, checkpoints and recovery
+// (design/lexdb.md section 4, stages D1 and D2).
+//
+// All of the store's state is one Db in a task.Shared. Everything that
+// changes it runs inside `with`, which cannot park, so no other task can see
+// it half done; every read, write and flush of a file runs outside `with`.
+// A descent that meets a node not in memory leaves `with` with the slot it
+// needs, loads the page, installs it in another `with`, and starts again
+// from the root: what it saw before the park may have changed.
+//
+// Nodes live in a table of slots. A slot keeps its number while its node is
+// evicted and loaded again; a page number is where the node was last
+// written. A node that changes after a checkpoint wrote it is dirty, and the
+// next checkpoint writes it to a new page (copy on write): its old page is
+// freed once that checkpoint's meta page is durable.
+import "task"
+import "binary"
+import "collections"
+import "./lexdb_base"
+import "./lexdb_disk"
+import "./lexdb_page"
+
+pub const DATA = "data.lxdb"
+const SPARE = "log.spare"
+const PAGE = 4096
+const LOG_MAGIC = 0x4C474C58
+const FRAME_HDR = 32
+
+pub const OP_PUT = 1
+pub const OP_DEL = 2
+pub const OP_CREATE = 3
+pub const OP_DROP = 4
+
+fn segName(g: int): str { return "log." + g.toStr() }
+
+pub type Options = value record {
+    pub cacheNodes: int     // nodes kept in memory before clean ones are evicted
+    pub segBytes: int       // the size of a log segment
+    pub ckptBytes: int      // log bytes after which the checkpointer runs
+}
+
+pub fn defaults(): Options {
+    return Options{cacheNodes: 100000, segBytes: 64 * 1024 * 1024, ckptBytes: 32 * 1024 * 1024}
+}
+
+type SlotMeta = value record {
+    used: bool
+    gen: int            // changes when the slot is freed, so stale references are seen
+    loaded: bool
+    dirty: bool
+    root: bool
+    disk: int           // the page it was last written to, -1 when none
+    ckpt: int           // the checkpoint that wrote that page
+    version: int        // changes with every change to the node (leaf versions: 4.4)
+    ref: bool           // clock bit
+}
+
+type Waiter = record { batch: int; p: task.Promise[Result[Unit, lexdb_base.DbErr]] }
+
+type PageOut = record { no: int; bytes: []byte }
+
+pub type Db = record {
+    opts: Options
+    fs: lexdb_disk.Fs
+    data: lexdb_disk.File
+    nodes: []lexdb_page.Node
+    meta: []SlotMeta
+    freeSlots: []int
+    loadedCount: int
+    hand: int
+    trees: Map[int, int]        // tree id -> root slot
+    nextTree: int
+    npages: int
+    free: []int                 // pages free now
+    freeAfterNext: []int        // pages the next checkpoint frees
+    pendingFree: []int          // pages the checkpoint in flight frees when durable
+    listPages: []int            // the list pages of the last durable checkpoint
+    ckpt: int
+    durableCkpt: int
+    ckptRunning: bool
+    batch: []byte               // the records of the open batch
+    batchCount: int
+    batchNo: int                // the open batch's number
+    appliedBatch: int           // the highest batch with an applied commit
+    durableBatch: int
+    waiters: []Waiter
+    writerWake: []task.Promise[Unit]
+    ckptWake: []task.Promise[Unit]
+    seg: int                    // the end of the durable log
+    segOff: int
+    logSinceCkpt: int
+    failed: []lexdb_base.DbErr  // one element once a write or flush has failed
+    closing: bool
+    // counters
+    pub commits: int
+    pub conflicts: int
+    pub loads: int
+    pub evictions: int
+    pub flushes: int
+    pub checkpoints: int
+}
+
+// A handle to an open store; copies reach the same store.
+pub type Store = value record { sh: task.Shared[Db] }
+
+// A read mark: a leaf seen at a version (4.4).
+type Mark = value record { slot: int; gen: int; version: int }
+
+type TxWrite = value record { op: int; tree: int; key: str; val: str }
+
+pub type Txn = record {
+    reads: []Mark
+    writes: []TxWrite
+    index: Map[str, int]        // tree:key -> the last write of it
+    created: []int
+}
+
+pub fn begin(): Txn {
+    return Txn{reads: [], writes: [], index: newMap(), created: []}
+}
+
+fn wkey(tree: int, key: &str): str { return tree.toStr() + ":" + key }
+
+pub fn (t: mut &Txn) put(tree: int, key: str, val: str): Result[Unit, lexdb_base.DbErr] {
+    if len(key) > lexdb_page.MAX_KEY || lexdb_page.leafEntry(&key, &val) > lexdb_page.MAX_ENTRY {
+        return Err(lexdb_base.err(lexdb_base.S_LIMIT, "row too large: a key and value take at most " +
+                                  lexdb_page.MAX_ENTRY.toStr() + " bytes (key at most " + lexdb_page.MAX_KEY.toStr() + ")"))
+    }
+    t.index.put(wkey(tree, &key), len(t.writes))
+    append(mut &t.writes, TxWrite{op: OP_PUT, tree: tree, key: key, val: val})
+    return Ok(Unit{})
+}
+
+pub fn (t: mut &Txn) del(tree: int, key: str) {
+    t.index.put(wkey(tree, &key), len(t.writes))
+    append(mut &t.writes, TxWrite{op: OP_DEL, tree: tree, key: key, val: ""})
+}
+
+pub fn (t: mut &Txn) dropTree(tree: int) {
+    append(mut &t.writes, TxWrite{op: OP_DROP, tree: tree, key: "", val: ""})
+}
+
+pub fn (t: &Txn) hasWrites(): bool { return len(t.writes) > 0 }
+
+// ---- slots and the cache
+
+fn (db: mut &Db) allocSlot(): int {
+    if len(db.freeSlots) > 0 {
+        let s = pop(mut &db.freeSlots)
+        db.meta[s].used = true
+        db.meta[s].loaded = false
+        db.meta[s].dirty = false
+        db.meta[s].root = false
+        db.meta[s].disk = -1
+        db.meta[s].ckpt = 0
+        db.meta[s].version = 0
+        db.meta[s].ref = false
+        return s
+    }
+    append(mut &db.nodes, lexdb_page.newLeaf())
+    append(mut &db.meta, SlotMeta{used: true, gen: 0, loaded: false, dirty: false, root: false, disk: -1,
+                                  ckpt: 0, version: 0, ref: false})
+    return len(db.meta) - 1
+}
+
+// A new node in memory, dirty.
+fn (db: mut &Db) newNode(n: lexdb_page.Node): int {
+    let s = db.allocSlot()
+    db.nodes[s] = n
+    db.meta[s].loaded = true
+    db.meta[s].dirty = true
+    db.loadedCount += 1
+    return s
+}
+
+fn (db: mut &Db) freeSlot(s: int) {
+    if db.meta[s].loaded { db.loadedCount -= 1 }
+    if db.meta[s].disk >= 0 { append(mut &db.freeAfterNext, db.meta[s].disk) }
+    db.meta[s].used = false
+    db.meta[s].gen += 1
+    db.meta[s].loaded = false
+    db.meta[s].dirty = false
+    db.meta[s].disk = -1
+    db.nodes[s] = lexdb_page.newLeaf()
+    append(mut &db.freeSlots, s)
+}
+
+// Marks a node changed: its page belongs to the last checkpoint, and the
+// next one writes it elsewhere and frees that page.
+fn (db: mut &Db) markDirty(s: int) {
+    if !db.meta[s].dirty {
+        db.meta[s].dirty = true
+        if db.meta[s].disk >= 0 { append(mut &db.freeAfterNext, db.meta[s].disk) }
+        db.meta[s].disk = -1
+    }
+}
+
+fn (db: &Db) evictable(s: int): bool {
+    let m = db.meta[s]
+    if !m.used || !m.loaded || m.dirty || m.root || m.ckpt > db.durableCkpt || m.disk < 0 { return false }
+    if !db.nodes[s].leaf {
+        for k in db.nodes[s].kids { if db.meta[k].loaded { return false } }
+    }
+    return true
+}
+
+// Evicts clean nodes, clock order, while more than the cache's size are in
+// memory. A node is evicted only after its children (they hang from it).
+// One sweep at most: a node referenced since the last sweep survives this
+// one, so a commit that needs many paths in memory at once (every descent
+// marks its path) never loses them while it loads the rest; the cache
+// then holds more than its size for a while.
+fn (db: mut &Db) maybeEvict() {
+    var tries = 0
+    while db.loadedCount > db.opts.cacheNodes && tries < len(db.meta) {
+        tries += 1
+        db.hand += 1
+        if db.hand >= len(db.meta) { db.hand = 0 }
+        let s = db.hand
+        if !db.evictable(s) { continue }
+        if db.meta[s].ref {
+            db.meta[s].ref = false
+            continue
+        }
+        if !db.nodes[s].leaf {
+            var kids: []int = []
+            for k in db.nodes[s].kids { append(mut &kids, k) }
+            for k in kids { db.freeSlot(k) }
+        }
+        db.nodes[s] = lexdb_page.newLeaf()
+        db.meta[s].loaded = false
+        db.loadedCount -= 1
+        db.evictions += 1
+    }
+}
+
+// What a load needs, read inside with: the page and the slot's generation.
+type LoadReq = value record { slot: int; gen: int; page: int }
+
+fn (db: &Db) loadReq(s: int): LoadReq {
+    return LoadReq{slot: s, gen: db.meta[s].gen, page: db.meta[s].disk}
+}
+
+// Installs a page read for a slot, unless the slot changed meanwhile.
+fn (db: mut &Db) install(r: LoadReq, b: &[]byte): Result[Unit, lexdb_base.DbErr] {
+    let s = r.slot
+    if !db.meta[s].used || db.meta[s].gen != r.gen || db.meta[s].loaded || db.meta[s].disk != r.page {
+        return Ok(Unit{})
+    }
+    try lexdb_page.check(b, r.page, lexdb_page.T_LEAF)
+    var n = lexdb_page.decodeNode(b)
+    if !n.leaf {
+        for i in 0..len(n.kids) {
+            let k = db.allocSlot()
+            db.meta[k].disk = n.kids[i]
+            db.meta[k].ckpt = db.meta[s].ckpt
+            n.kids[i] = k
+        }
+    }
+    db.nodes[s] = n
+    db.meta[s].loaded = true
+    db.meta[s].ref = true
+    db.loadedCount += 1
+    db.loads += 1
+    db.maybeEvict()
+    return Ok(Unit{})
+}
+
+// Loads the page of a slot that is not in memory (parks).
+fn (st: &Store) load(slot: int): Result[Unit, lexdb_base.DbErr] {
+    var r = LoadReq{slot: 0, gen: 0, page: -1}
+    var f = lexdb_disk.File.Real(-1)
+    st.sh.with(fn(db: mut &Db) {
+        r = db.loadReq(slot)
+        f = db.data
+    })
+    if r.page < 0 { return Err(lexdb_base.err(lexdb_base.S_INTERNAL, "load: a slot without a page")) }
+    var b = array(PAGE, byte(0))
+    try f.read(r.page * PAGE, mut &b[0..PAGE], PAGE)
+    var res: Result[Unit, lexdb_base.DbErr] = Ok(Unit{})
+    st.sh.with(fn(db: mut &Db) { res = db.install(r, &b) })
+    return res
+}
+
+// ---- descending
+
+// The number of keys <= k: the child to follow.
+fn childIndex(keys: &[]str, k: &str): int {
+    var lo = 0
+    var hi = len(keys)
+    while lo < hi {
+        let mid = (lo + hi) / 2
+        if keys[mid] <= k { lo = mid + 1 } else { hi = mid }
+    }
+    return lo
+}
+
+// The first index whose key is >= k.
+fn lowerIndex(keys: &[]str, k: &str): int {
+    var lo = 0
+    var hi = len(keys)
+    while lo < hi {
+        let mid = (lo + hi) / 2
+        if keys[mid] < k { lo = mid + 1 } else { hi = mid }
+    }
+    return lo
+}
+
+// A descent: the path from the root to the leaf for a key, or the slot to
+// load first (need >= 0). upper is the smallest separator above the key on
+// the path: the leaf holds no key >= it.
+type Descent = record {
+    path: []int
+    need: int
+    upper: str
+    hasUpper: bool
+}
+
+fn (db: mut &Db) descend(tree: int, k: &str): Descent {
+    var d = Descent{path: [], need: -1, upper: "", hasUpper: false}
+    var s = match db.trees.get(&tree) { Some(r) { r } None { -1 } }
+    if s < 0 { return d }
+    while true {
+        if !db.meta[s].loaded {
+            d.need = s
+            return d
+        }
+        db.meta[s].ref = true
+        append(mut &d.path, s)
+        if db.nodes[s].leaf { return d }
+        let i = childIndex(&db.nodes[s].keys, k)
+        if i < len(db.nodes[s].keys) {
+            d.upper = db.nodes[s].keys[i]
+            d.hasUpper = true
+        }
+        s = db.nodes[s].kids[i]
+    }
+    return d
+}
+
+// ---- changing a tree (inside with; every node on the path is in memory)
+
+fn nodeSize(n: &lexdb_page.Node): int {
+    var size = 0
+    if n.leaf {
+        for i in 0..len(n.keys) { size += lexdb_page.leafEntry(&n.keys[i], &n.vals[i]) }
+    } else {
+        size = 8
+        for k in n.keys { size += lexdb_page.kidEntry(&k) }
+    }
+    return size
+}
+
+// Splits an oversized node; the new right node's slot and separator.
+fn (db: mut &Db) split(s: int): Descent {
+    let leaf = db.nodes[s].leaf
+    let total = db.nodes[s].size
+    let n = len(db.nodes[s].keys)
+    var right = lexdb_page.Node{leaf: leaf, keys: [], vals: [], kids: [], size: 0}
+    var sep = ""
+    if leaf {
+        var acc = 0
+        var m = 0
+        while m < n - 1 {
+            let e = lexdb_page.leafEntry(&db.nodes[s].keys[m], &db.nodes[s].vals[m])
+            if m > 0 && acc + e > total / 2 { break }
+            acc += e
+            m += 1
+        }
+        for i in m..n {
+            append(mut &right.keys, db.nodes[s].keys[i])
+            append(mut &right.vals, db.nodes[s].vals[i])
+        }
+        for i in m..n {
+            let k = pop(mut &db.nodes[s].keys)
+            let v = pop(mut &db.nodes[s].vals)
+        }
+        sep = right.keys[0]
+    } else {
+        var acc = 8
+        var m = 1
+        while m < n - 1 {
+            let e = lexdb_page.kidEntry(&db.nodes[s].keys[m - 1])
+            if acc + e > total / 2 { break }
+            acc += e
+            m += 1
+        }
+        // keys[m] goes up; keys after it and kids after m go right
+        sep = db.nodes[s].keys[m]
+        for i in m + 1..n { append(mut &right.keys, db.nodes[s].keys[i]) }
+        for i in m + 1..n + 1 { append(mut &right.kids, db.nodes[s].kids[i]) }
+        for i in m..n {
+            let k = pop(mut &db.nodes[s].keys)
+            let c = pop(mut &db.nodes[s].kids)
+        }
+    }
+    db.nodes[s].size = nodeSize(&db.nodes[s])
+    right.size = nodeSize(&right)
+    db.meta[s].version += 1
+    let r = db.newNode(right)
+    return Descent{path: [r], need: -1, upper: sep, hasUpper: true}
+}
+
+// After path[j] grew past a page, split it and the parents that overflow
+// in turn; a split root gets a new root above it.
+fn (db: mut &Db) fixOverflow(tree: int, path: &[]int, from: int) {
+    var j = from
+    while j >= 0 {
+        let s = path[j]
+        if db.nodes[s].size <= lexdb_page.NODE_ROOM { return }
+        let sp = db.split(s)
+        let r = sp.path[0]
+        if j == 0 {
+            let root = lexdb_page.Node{leaf: false, keys: [sp.upper], vals: [], kids: [s, r], size: 0}
+            var rn = root
+            rn.size = nodeSize(&rn)
+            let ns = db.newNode(rn)
+            db.meta[s].root = false
+            db.meta[ns].root = true
+            db.trees.put(tree, ns)
+            return
+        }
+        let p = path[j - 1]
+        var at = 0
+        while db.nodes[p].kids[at] != s { at += 1 }
+        collections.insert(mut &db.nodes[p].keys, at, sp.upper)
+        collections.insert(mut &db.nodes[p].kids, at + 1, r)
+        db.nodes[p].size += lexdb_page.kidEntry(&sp.upper)
+        db.meta[p].version += 1
+        j -= 1
+    }
+}
+
+fn (db: mut &Db) applyPut(tree: int, key: &str, val: &str) {
+    let d = db.descend(tree, key)
+    if len(d.path) == 0 { return }       // no such tree (recovery replays a dropped tree's rows)
+    for s in d.path { db.markDirty(s) }
+    let leaf = d.path[len(d.path) - 1]
+    let i = lowerIndex(&db.nodes[leaf].keys, key)
+    if i < len(db.nodes[leaf].keys) && db.nodes[leaf].keys[i] == key {
+        db.nodes[leaf].size += len(val) - len(db.nodes[leaf].vals[i])
+        db.nodes[leaf].vals[i] = val
+    } else {
+        collections.insert(mut &db.nodes[leaf].keys, i, key)
+        collections.insert(mut &db.nodes[leaf].vals, i, val)
+        db.nodes[leaf].size += lexdb_page.leafEntry(key, val)
+    }
+    db.meta[leaf].version += 1
+    db.fixOverflow(tree, &d.path, len(d.path) - 1)
+}
+
+fn (db: mut &Db) applyDel(tree: int, key: &str) {
+    let d = db.descend(tree, key)
+    if len(d.path) == 0 { return }
+    let leaf = d.path[len(d.path) - 1]
+    let i = lowerIndex(&db.nodes[leaf].keys, key)
+    if i >= len(db.nodes[leaf].keys) || db.nodes[leaf].keys[i] != key { return }
+    for s in d.path { db.markDirty(s) }
+    db.nodes[leaf].size -= lexdb_page.leafEntry(&db.nodes[leaf].keys[i], &db.nodes[leaf].vals[i])
+    let k = collections.removeAt(mut &db.nodes[leaf].keys, i)
+    let v = collections.removeAt(mut &db.nodes[leaf].vals, i)
+    db.meta[leaf].version += 1
+    // An empty node leaves its parent (no merging: design/lexdb.md 4.2).
+    var j = len(d.path) - 1
+    while j > 0 {
+        let c = d.path[j]
+        let empty = if db.nodes[c].leaf { len(db.nodes[c].keys) == 0 } else { len(db.nodes[c].kids) == 0 }
+        if !empty { break }
+        let p = d.path[j - 1]
+        var at = 0
+        while db.nodes[p].kids[at] != c { at += 1 }
+        let gone = collections.removeAt(mut &db.nodes[p].kids, at)
+        if len(db.nodes[p].keys) > 0 {
+            let ki = if at == 0 { 0 } else { at - 1 }
+            let sk = collections.removeAt(mut &db.nodes[p].keys, ki)
+        }
+        db.nodes[p].size = nodeSize(&db.nodes[p])
+        db.meta[p].version += 1
+        db.freeSlot(c)
+        j -= 1
+    }
+    // The root: an internal root with no children becomes an empty leaf, and
+    // one with a single child in memory gives way to it.
+    var root = d.path[0]
+    if !db.nodes[root].leaf && len(db.nodes[root].kids) == 0 {
+        db.nodes[root] = lexdb_page.newLeaf()
+        db.meta[root].version += 1
+    }
+    while !db.nodes[root].leaf && len(db.nodes[root].kids) == 1 && db.meta[db.nodes[root].kids[0]].loaded {
+        let only = db.nodes[root].kids[0]
+        db.markDirty(only)
+        db.meta[only].root = true
+        db.trees.put(tree, only)
+        db.meta[root].root = false
+        db.freeSlot(root)
+        root = only
+    }
+}
+
+fn (db: mut &Db) applyCreate(tree: int) {
+    if db.trees.has(&tree) { return }
+    let s = db.newNode(lexdb_page.newLeaf())
+    db.meta[s].root = true
+    db.trees.put(tree, s)
+    if tree >= db.nextTree { db.nextTree = tree + 1 }
+}
+
+// Drops a tree. Its nodes in memory are freed; the pages of nodes that are
+// not are not reclaimed yet (design/lexdb.md, as built).
+fn (db: mut &Db) applyDrop(tree: int) {
+    let r = match db.trees.get(&tree) { Some(x) { x } None { -1 } }
+    if r < 0 { return }
+    let gone = db.trees.remove(&tree)
+    var stack = [r]
+    while len(stack) > 0 {
+        let s = pop(mut &stack)
+        if db.meta[s].loaded && !db.nodes[s].leaf {
+            for k in db.nodes[s].kids { append(mut &stack, k) }
+        }
+        db.freeSlot(s)
+    }
+}
+
+fn (db: mut &Db) applyWrite(w: &TxWrite) {
+    if w.op == OP_PUT { db.applyPut(w.tree, &w.key, &w.val) }
+    else if w.op == OP_DEL { db.applyDel(w.tree, &w.key) }
+    else if w.op == OP_CREATE { db.applyCreate(w.tree) }
+    else if w.op == OP_DROP { db.applyDrop(w.tree) }
+}
+
+// The slot a write needs loaded before it can be applied, or -1.
+fn (db: mut &Db) writeNeeds(w: &TxWrite): int {
+    if w.op == OP_PUT || w.op == OP_DEL {
+        let d = db.descend(w.tree, &w.key)
+        if d.need >= 0 { return d.need }
+        if w.op == OP_DEL && len(d.path) > 0 {
+            // collapsing the root wants its only child in memory; it is not required
+        }
+    }
+    return -1
+}
+
+// ---- the log record format
+
+fn addRecord(b: mut &[]byte, w: &TxWrite) {
+    append(b, byte(w.op))
+    binary.appendU32LE(b, w.tree)
+    binary.appendU32LE(b, len(w.key))
+    appendStr(b, w.key)
+    binary.appendU32LE(b, len(w.val))
+    appendStr(b, w.val)
+}
+
+fn parseRecords(b: &[]byte, from: int, to: int): Result[[]TxWrite, lexdb_base.DbErr] {
+    var out: []TxWrite = []
+    var at = from
+    while at < to {
+        if at + 13 > to { return Err(lexdb_base.corrupt("log record cut short")) }
+        let op = int(b[at])
+        let tree = binary.readU32LE(b, at + 1)
+        let kl = binary.readU32LE(b, at + 5)
+        if at + 9 + kl + 4 > to { return Err(lexdb_base.corrupt("log record cut short")) }
+        let key = strFromBytes(&b[at + 9..at + 9 + kl])
+        let vl = binary.readU32LE(b, at + 9 + kl)
+        let vs = at + 13 + kl
+        if vs + vl > to { return Err(lexdb_base.corrupt("log record cut short")) }
+        let val = strFromBytes(&b[vs..vs + vl])
+        append(mut &out, TxWrite{op: op, tree: tree, key: key, val: val})
+        at = vs + vl
+    }
+    return Ok(out)
+}
+
+// A frame: the header, the records, padded to whole pages so that a block
+// once flushed is never written again (4.6).
+fn frame(records: &[]byte, count: int, batchNo: int, seg: int): []byte {
+    var n = FRAME_HDR + len(records)
+    n = (n + PAGE - 1) / PAGE * PAGE
+    var b = array(n, byte(0))
+    binary.setU32LE(mut &b, 0, LOG_MAGIC)
+    binary.setU64LE(mut &b, 8, batchNo)
+    binary.setU32LE(mut &b, 16, seg)
+    binary.setU32LE(mut &b, 20, len(records))
+    binary.setU32LE(mut &b, 24, count)
+    for i in 0..len(records) { b[FRAME_HDR + i] = records[i] }
+    let c = lexdb_base.crc32c(&b, 8, FRAME_HDR + len(records))
+    binary.setU32LE(mut &b, 4, int(c))
+    return b
+}
+
+// ---- transactions
+
+// Reads key in tree: the transaction's own write of it, else the store's.
+pub fn (st: &Store) get(t: mut &Txn, tree: int, key: str): Result[Option[str], lexdb_base.DbErr] {
+    match t.index.get(&wkey(tree, &key)) {
+        Some(i) {
+            if t.writes[i].op == OP_DEL { return Ok(None) }
+            return Ok(Some(t.writes[i].val))
+        }
+        None {}
+    }
+    while true {
+        var need = -1
+        var out: Option[str] = None
+        var bad: []lexdb_base.DbErr = []
+        st.sh.with(fn(db: mut &Db) {
+            if len(db.failed) > 0 {
+                append(mut &bad, db.failed[0])
+                return
+            }
+            let d = db.descend(tree, &key)
+            if d.need >= 0 {
+                need = d.need
+                return
+            }
+            if len(d.path) == 0 { return }
+            let leaf = d.path[len(d.path) - 1]
+            append(mut &t.reads, Mark{slot: leaf, gen: db.meta[leaf].gen, version: db.meta[leaf].version})
+            let i = lowerIndex(&db.nodes[leaf].keys, &key)
+            if i < len(db.nodes[leaf].keys) && db.nodes[leaf].keys[i] == key {
+                out = Some(db.nodes[leaf].vals[i])
+            }
+        })
+        if len(bad) > 0 { return Err(bad[0]) }
+        if need < 0 { return Ok(out) }
+        try st.load(need)
+    }
+    return Ok(None)
+}
+
+// An entry a scan gives.
+pub type Entry = value record { pub key: str; pub val: str }
+
+// The transaction's own writes to tree with keys in [from, to) (to "" for no
+// end), sorted, the last write of each key.
+fn (t: &Txn) ownRange(tree: int, from: &str, to: &str): []TxWrite {
+    var out: []TxWrite = []
+    for i in 0..len(t.writes) {
+        let w = t.writes[i]
+        if w.tree != tree || (w.op != OP_PUT && w.op != OP_DEL) { continue }
+        if w.key < from || (len(to) > 0 && w.key >= to) { continue }
+        match t.index.get(&wkey(tree, &w.key)) {
+            Some(last) { if last != i { continue } }
+            None {}
+        }
+        append(mut &out, w)
+    }
+    collections.sortBy(mut &out, fn(a: &TxWrite, b: &TxWrite): int { return a.key.cmp(&b.key) })
+    return out
+}
+
+// Calls f on the entries of tree with keys in [from, to) (to "": to the
+// end) in key order, the transaction's own writes included, while f gives
+// true.
+pub fn (st: &Store) scan(t: mut &Txn, tree: int, from: str, to: str, f: &fn(&Entry): bool): Result[Unit, lexdb_base.DbErr] {
+    let own = t.ownRange(tree, &from, &to)
+    var oi = 0
+    var cursor = from
+    var more = true
+    while more {
+        var need = -1
+        var chunk: []Entry = []
+        var bad: []lexdb_base.DbErr = []
+        var upper = ""
+        var hasUpper = false
+        st.sh.with(fn(db: mut &Db) {
+            if len(db.failed) > 0 {
+                append(mut &bad, db.failed[0])
+                return
+            }
+            let d = db.descend(tree, &cursor)
+            if d.need >= 0 {
+                need = d.need
+                return
+            }
+            if len(d.path) == 0 { return }
+            let leaf = d.path[len(d.path) - 1]
+            append(mut &t.reads, Mark{slot: leaf, gen: db.meta[leaf].gen, version: db.meta[leaf].version})
+            var i = lowerIndex(&db.nodes[leaf].keys, &cursor)
+            while i < len(db.nodes[leaf].keys) {
+                let k = db.nodes[leaf].keys[i]
+                if len(to) > 0 && k >= to { break }
+                append(mut &chunk, Entry{key: k, val: db.nodes[leaf].vals[i]})
+                i += 1
+            }
+            upper = d.upper
+            hasUpper = d.hasUpper
+        })
+        if len(bad) > 0 { return Err(bad[0]) }
+        if need >= 0 {
+            try st.load(need)
+            continue
+        }
+        let last = !hasUpper || (len(to) > 0 && upper >= to)
+        // Merge with the transaction's own writes below the chunk's end.
+        var ci = 0
+        while ci < len(chunk) || (oi < len(own) && (last || own[oi].key < upper)) {
+            var takeOwn = false
+            if oi < len(own) && (last || own[oi].key < upper) {
+                takeOwn = ci >= len(chunk) || own[oi].key <= chunk[ci].key
+            }
+            if takeOwn {
+                let w = own[oi]
+                oi += 1
+                if ci < len(chunk) && chunk[ci].key == w.key { ci += 1 }
+                if w.op == OP_PUT {
+                    if !f(&Entry{key: w.key, val: w.val}) { return Ok(Unit{}) }
+                }
+            } else {
+                if !f(&chunk[ci]) { return Ok(Unit{}) }
+                ci += 1
+            }
+        }
+        if last { more = false } else { cursor = upper }
+    }
+    return Ok(Unit{})
+}
+
+// A new tree, created when the transaction commits.
+pub fn (st: &Store) createTree(t: mut &Txn): int {
+    var id = 0
+    st.sh.with(fn(db: mut &Db) {
+        id = db.nextTree
+        db.nextTree += 1
+    })
+    append(mut &t.writes, TxWrite{op: OP_CREATE, tree: id, key: "", val: ""})
+    append(mut &t.created, id)
+    return id
+}
+
+fn (db: &Db) validate(t: &Txn): bool {
+    for m in t.reads {
+        if db.meta[m.slot].gen != m.gen || db.meta[m.slot].version != m.version { return false }
+    }
+    for w in t.writes {
+        if w.op == OP_CREATE { continue }
+        if !db.trees.has(&w.tree) {
+            var mine = false
+            for c in t.created { if c == w.tree { mine = true } }
+            if !mine { return false }
+        }
+    }
+    return true
+}
+
+// Commits: checks that nothing the transaction read has changed, applies its
+// writes and waits until the log holds them. A transaction that only read
+// is checked too, and waits until what it saw is durable (4.4).
+pub fn (st: &Store) commit(t: Txn): Result[Unit, lexdb_base.DbErr] {
+    var wait: []task.Future[Result[Unit, lexdb_base.DbErr]] = []
+    var wake: []task.Promise[Unit] = []
+    while true {
+        var need = -1
+        var bad: []lexdb_base.DbErr = []
+        st.sh.with(fn(db: mut &Db) {
+            if len(db.failed) > 0 {
+                append(mut &bad, db.failed[0])
+                return
+            }
+            for w in t.writes {
+                let n = db.writeNeeds(&w)
+                if n >= 0 {
+                    need = n
+                    return
+                }
+            }
+            if !db.validate(&t) {
+                db.conflicts += 1
+                append(mut &bad, lexdb_base.conflict())
+                return
+            }
+            var b = db.appliedBatch
+            if len(t.writes) > 0 {
+                for w in t.writes {
+                    db.applyWrite(&w)
+                    addRecord(mut &db.batch, &w)
+                    db.batchCount += 1
+                }
+                b = db.batchNo
+                db.appliedBatch = b
+                db.commits += 1
+                while len(db.writerWake) > 0 { append(mut &wake, pop(mut &db.writerWake)) }
+            }
+            if b > db.durableBatch {
+                let task.Handoff{promise: p, future: f} = task.promise[Result[Unit, lexdb_base.DbErr]]()
+                append(mut &db.waiters, Waiter{batch: b, p: p})
+                append(mut &wait, f)
+            }
+        })
+        if len(bad) > 0 { return Err(bad[0]) }
+        if need >= 0 {
+            try st.load(need)
+            continue
+        }
+        break
+    }
+    while len(wake) > 0 { pop(mut &wake).complete(Unit{}) }
+    if len(wait) > 0 {
+        match pop(mut &wait).wait() {
+            Ok(r) { return r }
+            Err(_) { return Err(lexdb_base.err(lexdb_base.S_INTERNAL, "commit: the log writer has gone")) }
+        }
+    }
+    return Ok(Unit{})
+}
+
+// ---- the log writer: one task, one flush at a time; commits made while a
+// flush runs go in the next batch (group commit, 4.6).
+
+fn (st: &Store) openSeg(g: int, size: int): Result[lexdb_disk.File, lexdb_base.DbErr] {
+    var fs = lexdb_disk.Fs.Real("")
+    st.sh.with(fn(db: mut &Db) { fs = db.fs })
+    let name = segName(g)
+    if !fs.exists(name) && fs.exists(SPARE) { try fs.rename(SPARE, name) }
+    let f = try fs.open(name, true)
+    let have = try f.size()
+    if have < size { try f.grow(size) }
+    return Ok(f)
+}
+
+fn (st: &Store) fail(e: lexdb_base.DbErr) {
+    var ws: []Waiter = []
+    st.sh.with(fn(db: mut &Db) {
+        if len(db.failed) == 0 { append(mut &db.failed, e) }
+        while len(db.waiters) > 0 { append(mut &ws, pop(mut &db.waiters)) }
+    })
+    while len(ws) > 0 {
+        let Waiter{batch: _, p: p} = pop(mut &ws)
+        p.complete(Err(e))
+    }
+}
+
+// The writer's loop; runs until the store closes or fails.
+pub fn writer(st: Store): int {
+    var segNo = 0
+    var segOff = 0
+    var segBytes = 0
+    st.sh.with(fn(db: mut &Db) {
+        segNo = db.seg
+        segOff = db.segOff
+        segBytes = db.opts.segBytes
+    })
+    var segF = lexdb_disk.File.Real(-1)
+    match st.openSeg(segNo, segBytes) {
+        Ok(f) { segF = f }
+        Err(e) {
+            st.fail(e)
+            return 1
+        }
+    }
+    while true {
+        var job: []byte = []
+        var count = 0
+        var no = 0
+        var stop = false
+        var idle: []task.Future[Unit] = []
+        st.sh.with(fn(db: mut &Db) {
+            if len(db.failed) > 0 || (db.closing && db.batchCount == 0) {
+                stop = true
+                return
+            }
+            if db.batchCount > 0 {
+                job = replace(mut &db.batch, [])
+                count = db.batchCount
+                no = db.batchNo
+                db.batchNo += 1
+                db.batchCount = 0
+            } else {
+                let task.Handoff{promise: p, future: f} = task.promise[Unit]()
+                append(mut &db.writerWake, p)
+                append(mut &idle, f)
+            }
+        })
+        if stop { break }
+        if len(idle) > 0 {
+            match pop(mut &idle).wait() {
+                Ok(_) {}
+                Err(_) { break }
+            }
+            continue
+        }
+        var fr = frame(&job, count, no, segNo)
+        if segOff > 0 && segOff + len(fr) > segBytes {
+            segF.close()
+            segNo += 1
+            segOff = 0
+            binary.setU32LE(mut &fr, 16, segNo)
+            let c = lexdb_base.crc32c(&fr, 8, FRAME_HDR + len(job))
+            binary.setU32LE(mut &fr, 4, int(c))
+            match st.openSeg(segNo, if len(fr) > segBytes { len(fr) } else { segBytes }) {
+                Ok(f) { segF = f }
+                Err(e) {
+                    st.fail(e)
+                    return 1
+                }
+            }
+        }
+        match segF.write(segOff, &fr) {
+            Ok(_) {}
+            Err(e) {
+                st.fail(e)
+                return 1
+            }
+        }
+        match segF.flush() {
+            Ok(_) {}
+            Err(e) {
+                st.fail(e)        // never retried: the store stops (fsyncgate, 4.1)
+                return 1
+            }
+        }
+        segOff += len(fr)
+        var done: []Waiter = []
+        var ck: []task.Promise[Unit] = []
+        st.sh.with(fn(db: mut &Db) {
+            db.durableBatch = no
+            db.seg = segNo
+            db.segOff = segOff
+            db.flushes += 1
+            db.logSinceCkpt += len(fr)
+            var keep: []Waiter = []
+            while len(db.waiters) > 0 {
+                let w = pop(mut &db.waiters)
+                if w.batch <= no { append(mut &done, w) } else { append(mut &keep, w) }
+            }
+            db.waiters = keep
+            if db.logSinceCkpt >= db.opts.ckptBytes && !db.ckptRunning {
+                while len(db.ckptWake) > 0 { append(mut &ck, pop(mut &db.ckptWake)) }
+            }
+        })
+        while len(done) > 0 {
+            let Waiter{batch: _, p: p} = pop(mut &done)
+            p.complete(Ok(Unit{}))
+        }
+        while len(ck) > 0 { pop(mut &ck).complete(Unit{}) }
+    }
+    segF.close()
+    return 0
+}
+
+// ---- checkpoints (4.5)
+
+fn (db: mut &Db) allocPage(): int {
+    if len(db.free) > 0 { return pop(mut &db.free) }
+    let p = db.npages
+    db.npages += 1
+    return p
+}
+
+// Writes out the dirty nodes under s (children first): s's page.
+fn (db: mut &Db) encodeSlot(s: int, n: int, out: mut &[]PageOut): int {
+    if !db.meta[s].dirty { return db.meta[s].disk }
+    var pages: []int = []
+    if !db.nodes[s].leaf {
+        var kids: []int = []
+        for k in db.nodes[s].kids { append(mut &kids, k) }
+        for k in kids { append(mut &pages, db.encodeSlot(k, n, mut &out)) }
+    }
+    let p = db.allocPage()
+    let bytes = lexdb_page.encodeNode(&db.nodes[s], &pages, p)
+    db.meta[s].dirty = false
+    db.meta[s].disk = p
+    db.meta[s].ckpt = n
+    append(mut &out, PageOut{no: p, bytes: bytes})
+    return p
+}
+
+// Takes a checkpoint: writes the changed nodes to new pages, then a meta
+// page that names them, once the log holds every commit they include.
+// Commits go on meanwhile. Does nothing while another checkpoint runs.
+pub fn (st: &Store) checkpoint(): Result[Unit, lexdb_base.DbErr] {
+    var out: []PageOut = []
+    var metaPage: []byte = []
+    var f = lexdb_disk.File.Real(-1)
+    var busy = false
+    var bad: []lexdb_base.DbErr = []
+    var target = 0
+    var n = 0
+    var newLists: []int = []
+    var oldSegs: []int = []
+    var fs = lexdb_disk.Fs.Real("")
+    st.sh.with(fn(db: mut &Db) {
+        if len(db.failed) > 0 {
+            append(mut &bad, db.failed[0])
+            return
+        }
+        if db.ckptRunning {
+            busy = true
+            return
+        }
+        db.ckptRunning = true
+        db.ckpt += 1
+        n = db.ckpt
+        f = db.data
+        fs = db.fs
+        var roots: []int = []
+        var ids: []int = []
+        var rs: []int = []
+        for i in 0..db.trees.size() {
+            let id: int = db.trees.keyAt(i)
+            let r: int = db.trees.valAt(i)
+            append(mut &ids, id)
+            append(mut &rs, r)
+        }
+        for i in 0..len(ids) {
+            append(mut &roots, ids[i])
+            append(mut &roots, db.encodeSlot(rs[i], n, mut &out))
+        }
+        var freed = replace(mut &db.freeAfterNext, [])
+        for p in db.listPages { append(mut &freed, p) }
+        // The list pages come from the free pages; the free list then holds
+        // what is left, and what this checkpoint frees.
+        var rootPages: []int = []
+        for i in 0..lexdb_page.listPages(len(roots)) { append(mut &rootPages, db.allocPage()) }
+        var freePages: []int = []
+        for i in 0..lexdb_page.listPages(len(db.free) + len(freed)) { append(mut &freePages, db.allocPage()) }
+        var freeVals: []int = []
+        for p in db.free { append(mut &freeVals, p) }
+        for p in freed { append(mut &freeVals, p) }
+        var rl = lexdb_page.encodeList(&roots, &rootPages)
+        var i = len(rl) - 1
+        while i >= 0 {
+            append(mut &out, PageOut{no: rootPages[i], bytes: pop(mut &rl)})
+            i -= 1
+        }
+        var fl = lexdb_page.encodeList(&freeVals, &freePages)
+        i = len(fl) - 1
+        while i >= 0 {
+            append(mut &out, PageOut{no: freePages[i], bytes: pop(mut &fl)})
+            i -= 1
+        }
+        for p in rootPages { append(mut &newLists, p) }
+        for p in freePages { append(mut &newLists, p) }
+        db.pendingFree = freed
+        target = db.appliedBatch
+        let m = lexdb_page.Meta{ckpt: n, npages: db.npages,
+                                roots: if len(rootPages) > 0 { rootPages[0] } else { 0 },
+                                free: if len(freePages) > 0 { freePages[0] } else { 0 },
+                                replaySeg: db.seg, replayOff: db.segOff, replayBatch: db.durableBatch + 1,
+                                nextTree: db.nextTree}
+        metaPage = lexdb_page.encodeMeta(&m, n % 2)
+        for s in 1..db.seg { append(mut &oldSegs, s) }
+    })
+    if len(bad) > 0 { return Err(bad[0]) }
+    if busy { return Ok(Unit{}) }
+    let r = st.finishCheckpoint(&f, &out, &metaPage, n, target)
+    match r {
+        Ok(_) {}
+        Err(e) {
+            st.fail(e)
+            return Err(e)
+        }
+    }
+    st.sh.with(fn(db: mut &Db) {
+        db.durableCkpt = n
+        let pf = replace(mut &db.pendingFree, [])
+        for p in pf { append(mut &db.free, p) }
+        db.listPages = replace(mut &newLists, [])
+        db.ckptRunning = false
+        db.logSinceCkpt = 0
+        db.checkpoints += 1
+        db.maybeEvict()
+    })
+    // Segments before the one recovery now starts from are not needed.
+    for s in oldSegs {
+        let name = segName(s)
+        if fs.exists(name) {
+            if !fs.exists(SPARE) { try fs.rename(name, SPARE) } else { try fs.remove(name) }
+        }
+    }
+    return Ok(Unit{})
+}
+
+fn (st: &Store) finishCheckpoint(f: &lexdb_disk.File, out: &[]PageOut, metaPage: &[]byte, n: int, target: int): Result[Unit, lexdb_base.DbErr] {
+    for p in out { try f.write(p.no * PAGE, &p.bytes) }
+    // The log must hold every commit this checkpoint includes before its
+    // meta page may name it (otherwise recovery could mix a commit's rows).
+    var wait: []task.Future[Result[Unit, lexdb_base.DbErr]] = []
+    var wake: []task.Promise[Unit] = []
+    st.sh.with(fn(db: mut &Db) {
+        if target > db.durableBatch {
+            let task.Handoff{promise: p, future: fu} = task.promise[Result[Unit, lexdb_base.DbErr]]()
+            append(mut &db.waiters, Waiter{batch: target, p: p})
+            append(mut &wait, fu)
+            while len(db.writerWake) > 0 { append(mut &wake, pop(mut &db.writerWake)) }
+        }
+    })
+    while len(wake) > 0 { pop(mut &wake).complete(Unit{}) }
+    if len(wait) > 0 {
+        match pop(mut &wait).wait() {
+            Ok(r) { try r }
+            Err(_) { return Err(lexdb_base.err(lexdb_base.S_INTERNAL, "checkpoint: the log writer has gone")) }
+        }
+    }
+    try f.flush()
+    try f.write((n % 2) * PAGE, metaPage)
+    try f.flush()
+    return Ok(Unit{})
+}
+
+// The checkpointer's loop: a checkpoint whenever the writer says the log
+// has grown by ckptBytes.
+pub fn checkpointer(st: Store): int {
+    while true {
+        var stop = false
+        var idle: []task.Future[Unit] = []
+        st.sh.with(fn(db: mut &Db) {
+            if db.closing || len(db.failed) > 0 {
+                stop = true
+                return
+            }
+            let task.Handoff{promise: p, future: f} = task.promise[Unit]()
+            append(mut &db.ckptWake, p)
+            append(mut &idle, f)
+        })
+        if stop { break }
+        match pop(mut &idle).wait() {
+            Ok(_) {}
+            Err(_) { break }
+        }
+        match st.checkpoint() {
+            Ok(_) {}
+            Err(_) { break }
+        }
+    }
+    return 0
+}
+
+// ---- open, recovery, close
+
+fn newDb(fs: lexdb_disk.Fs, data: lexdb_disk.File, opts: Options, m: &lexdb_page.Meta): Db {
+    return Db{opts: opts, fs: fs, data: data, nodes: [], meta: [], freeSlots: [], loadedCount: 0, hand: 0,
+              trees: newMap(), nextTree: m.nextTree, npages: m.npages, free: [], freeAfterNext: [],
+              pendingFree: [], listPages: [], ckpt: m.ckpt, durableCkpt: m.ckpt, ckptRunning: false,
+              batch: [], batchCount: 0, batchNo: m.replayBatch, appliedBatch: m.replayBatch - 1,
+              durableBatch: m.replayBatch - 1, waiters: [], writerWake: [], ckptWake: [], seg: m.replaySeg,
+              segOff: m.replayOff, logSinceCkpt: 0, failed: [], closing: false, commits: 0, conflicts: 0,
+              loads: 0, evictions: 0, flushes: 0, checkpoints: 0}
+}
+
+// Opens the store in fs (creating it when it is new) and recovers: the last
+// checkpoint, then the log after it.
+pub fn open(fs: lexdb_disk.Fs, opts: Options): Result[Store, lexdb_base.DbErr] {
+    let data = try fs.open(DATA, true)
+    let size = try data.size()
+    var best: Option[lexdb_page.Meta] = None
+    if size >= 2 * PAGE {
+        var b = array(PAGE, byte(0))
+        for i in 0..2 {
+            try data.read(i * PAGE, mut &b[0..PAGE], PAGE)
+            match lexdb_page.decodeMeta(&b, i) {
+                Some(m) {
+                    let better = match best { Some(o) { m.ckpt > o.ckpt } None { true } }
+                    if better { best = Some(m) }
+                }
+                None {}
+            }
+        }
+    }
+    if best.isNone() && fs.exists(segName(2)) && !fs.exists(segName(1)) {
+        return Err(lexdb_base.corrupt("no valid meta page, and the log does not start at its beginning"))
+    }
+    let m = best.unwrapOr(lexdb_page.Meta{ckpt: 0, npages: 2, roots: 0, free: 0, replaySeg: 1, replayOff: 0,
+                                          replayBatch: 1, nextTree: 1})
+    var lists: []int = []
+    let roots = try lexdb_page.readList(&data, m.roots, mut &lists)
+    let free = try lexdb_page.readList(&data, m.free, mut &lists)
+    var db = newDb(fs, data, opts, &m)
+    db.free = free
+    db.listPages = lists
+    var i = 0
+    while i + 1 < len(roots) {
+        let s = db.allocSlot()
+        db.meta[s].disk = roots[i + 1]
+        db.meta[s].ckpt = m.ckpt
+        db.meta[s].root = true
+        db.trees.put(roots[i], s)
+        i += 2
+    }
+    let st = Store{sh: task.shared(db)}
+    try st.replay(&m)
+    return Ok(st)
+}
+
+fn (st: &Store) applyRecovered(w: &TxWrite): Result[Unit, lexdb_base.DbErr] {
+    while true {
+        var need = -1
+        st.sh.with(fn(db: mut &Db) {
+            need = db.writeNeeds(w)
+            if need < 0 { db.applyWrite(w) }
+        })
+        if need < 0 { return Ok(Unit{}) }
+        try st.load(need)
+    }
+    return Ok(Unit{})
+}
+
+// Reads one frame at off: its records and length, or None when there is no
+// valid frame with that batch number there.
+fn readFrame(f: &lexdb_disk.File, off: int, size: int, seg: int, batch: int): Result[Option[[]TxWrite], lexdb_base.DbErr] {
+    if off + PAGE > size { return Ok(None) }
+    var h = array(PAGE, byte(0))
+    try f.read(off, mut &h[0..PAGE], PAGE)
+    if binary.readU32LE(&h, 0) != LOG_MAGIC || int(binary.readU64LE(&h, 8)) != batch || binary.readU32LE(&h, 16) != seg {
+        return Ok(None)
+    }
+    let plen = binary.readU32LE(&h, 20)
+    var n = (FRAME_HDR + plen + PAGE - 1) / PAGE * PAGE
+    if off + n > size { return Ok(None) }
+    var b = array(n, byte(0))
+    try f.read(off, mut &b[0..n], n)
+    let c = lexdb_base.crc32c(&b, 8, FRAME_HDR + plen)
+    if int(c) != binary.readU32LE(&b, 4) { return Ok(None) }
+    let recs = try parseRecords(&b, FRAME_HDR, FRAME_HDR + plen)
+    return Ok(Some(recs))
+}
+
+fn frameLen(recs: &[]TxWrite): int {
+    var n = FRAME_HDR
+    for w in recs { n += 13 + len(w.key) + len(w.val) }
+    return (n + PAGE - 1) / PAGE * PAGE
+}
+
+// Replays the log from the meta page's position; afterwards the writer
+// goes on where the last valid frame ended.
+fn (st: &Store) replay(m: &lexdb_page.Meta): Result[Unit, lexdb_base.DbErr] {
+    var fs = lexdb_disk.Fs.Real("")
+    st.sh.with(fn(db: mut &Db) { fs = db.fs })
+    var seg = m.replaySeg
+    var off = m.replayOff
+    var batch = m.replayBatch
+    while fs.exists(segName(seg)) {
+        let f = try fs.open(segName(seg), false)
+        let size = try f.size()
+        var got = try readFrame(&f, off, size, seg, batch)
+        var at = off
+        var sg = seg
+        match got {
+            Some(_) {}
+            None {
+                // The writer may have moved on to the next segment.
+                f.close()
+                if !fs.exists(segName(seg + 1)) { break }
+                let g = try fs.open(segName(seg + 1), false)
+                let gs = try g.size()
+                got = try readFrame(&g, 0, gs, seg + 1, batch)
+                g.close()
+                match got {
+                    Some(_) {
+                        sg = seg + 1
+                        at = 0
+                    }
+                    None { break }
+                }
+            }
+        }
+        match got {
+            Some(recs) {
+                for w in recs { try st.applyRecovered(&w) }
+                seg = sg
+                off = at + frameLen(&recs)
+                batch += 1
+            }
+            None { break }
+        }
+        f.close()
+    }
+    st.sh.with(fn(db: mut &Db) {
+        db.seg = seg
+        db.segOff = off
+        db.batchNo = batch
+        db.appliedBatch = batch - 1
+        db.durableBatch = batch - 1
+    })
+    return Ok(Unit{})
+}
+
+// Asks the writer and the checkpointer to stop once the log holds every
+// commit.
+pub fn (st: &Store) close() {
+    var wake: []task.Promise[Unit] = []
+    st.sh.with(fn(db: mut &Db) {
+        db.closing = true
+        while len(db.writerWake) > 0 { append(mut &wake, pop(mut &db.writerWake)) }
+        while len(db.ckptWake) > 0 { append(mut &wake, pop(mut &db.ckptWake)) }
+    })
+    while len(wake) > 0 { pop(mut &wake).complete(Unit{}) }
+}
+
+// Counters, for the tests and the server's log.
+pub type Stats = value record {
+    pub commits: int
+    pub conflicts: int
+    pub loads: int
+    pub evictions: int
+    pub flushes: int
+    pub checkpoints: int
+    pub loaded: int
+    pub pages: int
+    pub free: int
+}
+
+pub fn (st: &Store) stats(): Stats {
+    var s = Stats{commits: 0, conflicts: 0, loads: 0, evictions: 0, flushes: 0, checkpoints: 0, loaded: 0,
+                  pages: 0, free: 0}
+    st.sh.with(fn(db: mut &Db) {
+        s = Stats{commits: db.commits, conflicts: db.conflicts, loads: db.loads, evictions: db.evictions,
+                  flushes: db.flushes, checkpoints: db.checkpoints, loaded: db.loadedCount, pages: db.npages,
+                  free: len(db.free)}
+    })
+    return s
+}
+
+// The ids of the trees, in no order.
+pub fn (st: &Store) trees(): []int {
+    var out: []int = []
+    st.sh.with(fn(db: mut &Db) {
+        for i in 0..db.trees.size() { append(mut &out, db.trees.keyAt(i)) }
+    })
+    return out
+}
+
+// Opens the store, runs the writer and the checkpointer as tasks, calls f,
+// then closes the store and waits for them.
+pub fn run[R](fs: lexdb_disk.Fs, opts: Options, f: &fn(Store): R): Result[R, lexdb_base.DbErr] {
+    let st = try open(fs, opts)
+    var out: []R = []
+    task.scope(fn(s: mut &task.Scope) {
+        s.spawn(writer, st)
+        s.spawn(checkpointer, st)
+        append(mut &out, f(st))
+        st.close()
+    })
+    return Ok(pop(mut &out))
+}

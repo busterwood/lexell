@@ -1,0 +1,126 @@
+// lexdb_store: crash recovery against a model. Random transactions of puts
+// and deletes, with a small cache (evictions), small log segments (segment
+// switches) and frequent checkpoints; a simulated crash after a random
+// acknowledged commit; the store recovered from what the crash left must
+// hold exactly the acknowledged state. Then more work on the recovered store,
+// and another crash, three times per seed.
+// expect: seeds 40 crashes 120 ok 120
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_base"
+import "strings"
+
+type Ctx = record {
+    model: Map[str, str]
+    rng: lexdb_base.Rng
+    tree: int
+    commits: int
+    crashAt: int
+    snap: []lexdb_disk.Fs
+    ok: bool
+    msg: str
+}
+
+fn key(i: int): str { return "key" + strings.padLeft(i.toStr(), 5, '0') }
+
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheNodes: 3, segBytes: 16 * 4096, ckptBytes: 6 * 4096}
+}
+
+// Compares the store's tree with the model.
+fn check(st: &lexdb_store.Store, tree: int, model: &Map[str, str]): str {
+    var t = lexdb_store.begin()
+    var n = 0
+    var bad = ""
+    let r = st.scan(mut &t, tree, "", "", fn(e: &lexdb_store.Entry): bool {
+        n += 1
+        match model.get(&e.key) {
+            Some(v) { if v != e.val && bad == "" { bad = "value of " + e.key } }
+            None { if bad == "" { bad = "extra key " + e.key } }
+        }
+        return true
+    })
+    if r.isErr() { return "scan: " + r.unwrapErr().toStr() }
+    if bad != "" { return bad }
+    if n != model.size() { return "count " + n.toStr() + " want " + model.size().toStr() }
+    return ""
+}
+
+fn work(st: lexdb_store.Store, c: mut &Ctx): Result[Unit, lexdb_base.DbErr] {
+    if c.tree < 0 {
+        var t = lexdb_store.begin()
+        c.tree = st.createTree(mut &t)
+        try st.commit(t)
+    } else {
+        let m = check(&st, c.tree, &c.model)
+        if m != "" {
+            c.ok = false
+            c.msg = "after recovery: " + m
+            return Ok(Unit{})
+        }
+    }
+    var i = 0
+    while i < 60 {
+        var t = lexdb_store.begin()
+        var changes: []lexdb_store.Entry = []
+        let n = 1 + c.rng.below(12)
+        for j in 0..n {
+            let k = key(c.rng.below(1500))
+            if c.rng.below(4) == 0 {
+                t.del(c.tree, k)
+                append(mut &changes, lexdb_store.Entry{key: k, val: ""})
+            } else {
+                let v = "v" + c.rng.below(1000000).toStr() + strings.repeat("x", c.rng.below(200))
+                try t.put(c.tree, k, v)
+                append(mut &changes, lexdb_store.Entry{key: k, val: v})
+            }
+        }
+        try st.commit(t)
+        for e in changes {
+            if e.val == "" { let gone = c.model.remove(&e.key) } else { c.model.put(e.key, e.val) }
+        }
+        c.commits += 1
+        if c.commits == c.crashAt { return Ok(Unit{}) }
+        i += 1
+    }
+    return Ok(Unit{})
+}
+
+fn round(c: mut &Ctx, fs: lexdb_disk.Fs, seed: int): lexdb_disk.Fs {
+    var crashed = fs
+    let r = lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): Result[Unit, lexdb_base.DbErr] {
+        let w = work(st, c)
+        crashed = fs.crash(seed)
+        return w
+    })
+    match r {
+        Ok(w) { if w.isErr() { c.ok = false; c.msg = w.unwrapErr().toStr() } }
+        Err(e) { c.ok = false; c.msg = "open: " + e.toStr() }
+    }
+    return crashed
+}
+
+fn main() {
+    var crashes = 0
+    var good = 0
+    for seed in 0..40 {
+        var c = Ctx{model: newMap(), rng: lexdb_base.rng(seed), tree: -1, commits: 0, crashAt: 0, snap: [], ok: true, msg: ""}
+        var fs = lexdb_disk.sim(seed)
+        for k in 0..3 {
+            c.crashAt = c.commits + 1 + c.rng.below(59)
+            fs = round(mut &c, fs, seed * 10 + k)
+            crashes += 1
+            // verify what the crash left
+            var v = Ctx{model: newMap(), rng: lexdb_base.rng(0), tree: c.tree, commits: 0, crashAt: 0, snap: [], ok: true, msg: ""}
+            let r = lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): str { return check(&st, c.tree, &c.model) })
+            match r {
+                Ok(m) {
+                    if m == "" { good += 1 } else { println("seed " + seed.toStr() + " crash " + k.toStr() + ": " + m) }
+                }
+                Err(e) { println("seed " + seed.toStr() + " crash " + k.toStr() + ": open " + e.toStr()) }
+            }
+            if !c.ok { println("seed " + seed.toStr() + ": " + c.msg) }
+        }
+    }
+    println("seeds 40 crashes " + crashes.toStr() + " ok " + good.toStr())
+}

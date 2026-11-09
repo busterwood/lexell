@@ -1,0 +1,227 @@
+// lexdb: the 4 KiB page formats (design/lexdb.md 4.1, 4.2).
+//
+// Every page: [0..4) CRC32C of [4..4096), [4..12) its own page number,
+// [12] its type, [13..16) zero. A page read from the wrong place, or torn,
+// fails the check.
+//
+// Leaf (type 2): [16..18) n; then n entries: u16 key length, u16 value
+// length, key, value.
+// Internal (type 3): [16..18) n keys; [18..26) child 0; then n entries: u16
+// key length, key, u64 child. Child i+1 holds the keys >= key i.
+// Meta (type 1, pages 0 and 1): see Meta.
+// List (type 5): [16..24) next list page (0: none), [24..28) count, then
+// u64 values. The tree roots and the free pages are lists.
+import "binary"
+import "./lexdb_base"
+import "./lexdb_disk"
+
+pub const PAGE = 4096
+pub const T_META = 1
+pub const T_LEAF = 2
+pub const T_INTERNAL = 3
+pub const T_LIST = 5
+
+const HDR = 16
+// The bytes a node's entries may use: the page less the header and count
+// (leaf), and for an internal node also its first child.
+pub const NODE_ROOM = PAGE - HDR - 2
+// The largest leaf entry: a node over NODE_ROOM always splits into two that
+// fit when no entry is over a third of it.
+pub const MAX_ENTRY = 1350
+pub const MAX_KEY = 512
+const LIST_ROOM = (PAGE - 28) / 8
+
+// A B+tree node as the store holds it in memory. kids are slot numbers of
+// the store's node table (page numbers between decode and install).
+pub type Node = record {
+    pub leaf: bool
+    pub keys: []str
+    pub vals: []str
+    pub kids: []int
+    pub size: int        // the bytes its entries take on a page
+}
+
+pub fn newLeaf(): Node { return Node{leaf: true, keys: [], vals: [], kids: [], size: 0} }
+
+pub fn leafEntry(k: &str, v: &str): int { return 4 + len(k) + len(v) }
+pub fn kidEntry(k: &str): int { return 2 + len(k) + 8 }
+
+// ---- header and check
+
+fn seal(b: mut &[]byte, pageNo: int, typ: int) {
+    binary.setU64LE(b, 4, pageNo)
+    b[12] = byte(typ)
+    let c = lexdb_base.crc32c(b, 4, PAGE)
+    binary.setU32LE(b, 0, int(c))
+}
+
+// Checks a page read from disk: its CRC, number and type.
+pub fn check(b: &[]byte, pageNo: int, typ: int): Result[Unit, lexdb_base.DbErr] {
+    let c = lexdb_base.crc32c(b, 4, PAGE)
+    if int(c) != binary.readU32LE(b, 0) {
+        return Err(lexdb_base.corrupt("page " + pageNo.toStr() + ": checksum mismatch"))
+    }
+    if int(binary.readU64LE(b, 4)) != pageNo {
+        return Err(lexdb_base.corrupt("page " + pageNo.toStr() + ": holds page " + int(binary.readU64LE(b, 4)).toStr()))
+    }
+    if int(b[12]) != typ && !(typ == T_LEAF && int(b[12]) == T_INTERNAL) {
+        return Err(lexdb_base.corrupt("page " + pageNo.toStr() + ": type " + int(b[12]).toStr()))
+    }
+    return Ok(Unit{})
+}
+
+fn putStr(b: mut &[]byte, at: int, s: &str) {
+    for i in 0..len(s) { b[at + i] = s[i] }
+}
+
+fn getStr(b: &[]byte, at: int, n: int): str {
+    return strFromBytes(&b[at..at + n])
+}
+
+// ---- nodes
+
+// The page of a node whose kids have been given page numbers (pages[i] for
+// kid i).
+pub fn encodeNode(n: &Node, pages: &[]int, pageNo: int): []byte {
+    var b = array(PAGE, byte(0))
+    binary.setU16LE(mut &b, 16, len(n.keys))
+    if n.leaf {
+        var at = 18
+        for i in 0..len(n.keys) {
+            binary.setU16LE(mut &b, at, len(n.keys[i]))
+            binary.setU16LE(mut &b, at + 2, len(n.vals[i]))
+            putStr(mut &b, at + 4, &n.keys[i])
+            putStr(mut &b, at + 4 + len(n.keys[i]), &n.vals[i])
+            at += leafEntry(&n.keys[i], &n.vals[i])
+        }
+        seal(mut &b, pageNo, T_LEAF)
+    } else {
+        binary.setU64LE(mut &b, 18, pages[0])
+        var at = 26
+        for i in 0..len(n.keys) {
+            binary.setU16LE(mut &b, at, len(n.keys[i]))
+            putStr(mut &b, at + 2, &n.keys[i])
+            binary.setU64LE(mut &b, at + 2 + len(n.keys[i]), pages[i + 1])
+            at += kidEntry(&n.keys[i])
+        }
+        seal(mut &b, pageNo, T_INTERNAL)
+    }
+    return b
+}
+
+// The node on a checked page; an internal node's kids are page numbers.
+pub fn decodeNode(b: &[]byte): Node {
+    let n = binary.readU16LE(b, 16)
+    if int(b[12]) == T_LEAF {
+        var node = newLeaf()
+        var at = 18
+        for i in 0..n {
+            let kl = binary.readU16LE(b, at)
+            let vl = binary.readU16LE(b, at + 2)
+            append(mut &node.keys, getStr(b, at + 4, kl))
+            append(mut &node.vals, getStr(b, at + 4 + kl, vl))
+            at += 4 + kl + vl
+        }
+        node.size = at - 18
+        return node
+    }
+    var node = Node{leaf: false, keys: [], vals: [], kids: [int(binary.readU64LE(b, 18))], size: 8}
+    var at = 26
+    for i in 0..n {
+        let kl = binary.readU16LE(b, at)
+        append(mut &node.keys, getStr(b, at + 2, kl))
+        append(mut &node.kids, int(binary.readU64LE(b, at + 2 + kl)))
+        at += 2 + kl + 8
+    }
+    node.size = at - 18
+    return node
+}
+
+// ---- meta pages
+
+pub const MAGIC = 0x313030424458454C    // "LEXDB001", little-endian
+
+pub type Meta = value record {
+    pub ckpt: int          // checkpoint number; the higher valid meta page wins
+    pub npages: int        // pages in use or free below this; the file's high-water mark
+    pub roots: int         // first list page of (tree, root page) pairs, 0 when none
+    pub free: int          // first list page of free pages, 0 when none
+    pub replaySeg: int     // where recovery starts replaying the log
+    pub replayOff: int
+    pub replayBatch: int   // the batch number expected there
+    pub nextTree: int      // the next tree id to give out
+}
+
+pub fn encodeMeta(m: &Meta, pageNo: int): []byte {
+    var b = array(PAGE, byte(0))
+    binary.setU64LE(mut &b, 16, MAGIC)
+    binary.setU64LE(mut &b, 24, m.ckpt)
+    binary.setU64LE(mut &b, 32, m.npages)
+    binary.setU64LE(mut &b, 40, m.roots)
+    binary.setU64LE(mut &b, 48, m.free)
+    binary.setU64LE(mut &b, 56, m.replaySeg)
+    binary.setU64LE(mut &b, 64, m.replayOff)
+    binary.setU64LE(mut &b, 72, m.replayBatch)
+    binary.setU64LE(mut &b, 80, m.nextTree)
+    seal(mut &b, pageNo, T_META)
+    return b
+}
+
+// The meta page in b, or None when it is not a valid one (never written, or
+// torn).
+pub fn decodeMeta(b: &[]byte, pageNo: int): Option[Meta] {
+    match check(b, pageNo, T_META) {
+        Ok(_) {}
+        Err(_) { return None }
+    }
+    if int(b[12]) != T_META || binary.readU64LE(b, 16) != u64(MAGIC) { return None }
+    return Some(Meta{ckpt: int(binary.readU64LE(b, 24)), npages: int(binary.readU64LE(b, 32)),
+                     roots: int(binary.readU64LE(b, 40)), free: int(binary.readU64LE(b, 48)),
+                     replaySeg: int(binary.readU64LE(b, 56)), replayOff: int(binary.readU64LE(b, 64)),
+                     replayBatch: int(binary.readU64LE(b, 72)), nextTree: int(binary.readU64LE(b, 80))})
+}
+
+// ---- list pages
+
+// How many list pages n values take.
+pub fn listPages(n: int): int { return (n + LIST_ROOM - 1) / LIST_ROOM }
+
+// The pages of a list of values, on the given page numbers (listPages(len)
+// of them), each pointing to the next.
+pub fn encodeList(vals: &[]int, pages: &[]int): [][]byte {
+    var out: [][]byte = []
+    for p in 0..len(pages) {
+        var b = array(PAGE, byte(0))
+        var from = p * LIST_ROOM
+        if from > len(vals) { from = len(vals) }
+        var to = from + LIST_ROOM
+        if to > len(vals) { to = len(vals) }
+        binary.setU64LE(mut &b, 16, if p + 1 < len(pages) { pages[p + 1] } else { 0 })
+        binary.setU32LE(mut &b, 24, to - from)
+        for i in from..to { binary.setU64LE(mut &b, 28 + (i - from) * 8, vals[i]) }
+        seal(mut &b, pages[p], T_LIST)
+        append(mut &out, b)
+    }
+    return out
+}
+
+// Reads a list whose first page is head (0: an empty list). The pages it
+// took are added to pages.
+pub fn readList(f: &lexdb_disk.File, head: int, pages: mut &[]int): Result[[]int, lexdb_base.DbErr] {
+    var vals: []int = []
+    var p = head
+    var b = array(PAGE, byte(0))
+    var seen = 0
+    while p != 0 {
+        seen += 1
+        if seen > 1000000 { return Err(lexdb_base.corrupt("list pages form a loop")) }
+        try f.read(p * PAGE, mut &b[0..PAGE], PAGE)
+        try check(&b, p, T_LIST)
+        if int(b[12]) != T_LIST { return Err(lexdb_base.corrupt("page " + p.toStr() + " is not a list page")) }
+        append(mut &pages, p)
+        let n = binary.readU32LE(&b, 24)
+        for i in 0..n { append(mut &vals, int(binary.readU64LE(&b, 28 + i * 8))) }
+        p = int(binary.readU64LE(&b, 16))
+    }
+    return Ok(vals)
+}

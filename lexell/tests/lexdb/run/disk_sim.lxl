@@ -1,0 +1,44 @@
+// lexdb_disk: the simulated disk keeps what was flushed through any crash,
+// and a write after the last flush is dropped, kept or torn at sectors.
+// expect: flushed kept 200
+// expect: saw dropped true kept true torn true
+// expect: fail EIO true
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_base"
+
+fn page(v: int): []byte { return array(lexdb_disk.PAGE, byte(v)) }
+
+fn main() {
+    var kept = 0
+    var dropped = false
+    var full = false
+    var torn = false
+    for seed in 0..200 {
+        let fs = lexdb_disk.sim(seed)
+        let f = fs.open("a", true).unwrap()
+        f.write(0, &page(1)).unwrap()
+        f.flush().unwrap()
+        f.write(0, &page(2)).unwrap()
+        let after = fs.crash(seed * 7 + 3)
+        let g = after.open("a", false).unwrap()
+        var b = array(lexdb_disk.PAGE, byte(9))
+        g.read(0, mut &b, lexdb_disk.PAGE).unwrap()
+        var ones = 0
+        var twos = 0
+        for x in b {
+            if x == 1 { ones += 1 } else if x == 2 { twos += 1 }
+        }
+        if ones + twos == lexdb_disk.PAGE { kept += 1 }
+        if twos == 0 { dropped = true } else if ones == 0 { full = true } else { torn = true }
+    }
+    println("flushed kept " + kept.toStr())
+    println("saw dropped " + dropped.toStr() + " kept " + full.toStr() + " torn " + torn.toStr())
+    let fs = lexdb_disk.sim(1)
+    let f = fs.open("b", true).unwrap()
+    fs.failIn(1)
+    f.write(0, &page(1)).unwrap()
+    match f.flush() {
+        Ok(_) { println("fail EIO false") }
+        Err(e) { println("fail EIO " + (e.state == lexdb_base.S_IO).toStr()) }
+    }
+}

@@ -1,0 +1,63 @@
+// lexdb_store on a real directory (O_DIRECT, fdatasync, the helper pool):
+// write, close, open again and read back; a checkpoint in between.
+// expect: first 500 commits
+// expect: reopened 500 sum 124750
+// expect: reopened again 500
+import "os"
+import "fs"
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_base"
+
+fn key(i: int): str { return "k" + strings.padLeft(i.toStr(), 4, '0') }
+
+fn count(st: &lexdb_store.Store, tree: int): int {
+    var t = lexdb_store.begin()
+    var n = 0
+    st.scan(mut &t, tree, "", "", fn(e: &lexdb_store.Entry): bool {
+        n += 1
+        return true
+    }).unwrap()
+    return n
+}
+
+fn main() {
+    let dir = fs.join(os.tempDir(), "lexdb_test_" + os.pid().toStr())
+    let made = fs.mkdirAll(dir)
+    let d = lexdb_disk.real(dir)
+    var tree = 0
+    let r1 = lexdb_store.run(d, lexdb_store.defaults(), fn(st: lexdb_store.Store): int {
+        var t = lexdb_store.begin()
+        tree = st.createTree(mut &t)
+        st.commit(t).unwrap()
+        for i in 0..500 {
+            var w = lexdb_store.begin()
+            w.put(tree, key(i), i.toStr()).unwrap()
+            st.commit(w).unwrap()
+            if i == 250 { st.checkpoint().unwrap() }
+        }
+        println("first " + count(&st, tree).toStr() + " commits")
+        return 0
+    })
+    r1.unwrap()
+    let tr = tree
+    let r2 = lexdb_store.run(d, lexdb_store.defaults(), fn(st: lexdb_store.Store): int {
+        var t = lexdb_store.begin()
+        var sum = 0
+        st.scan(mut &t, tr, "", "", fn(e: &lexdb_store.Entry): bool {
+            sum += strings.parseIntOpt(e.val).unwrapOr(0)
+            return true
+        }).unwrap()
+        println("reopened " + count(&st, tr).toStr() + " sum " + sum.toStr())
+        st.checkpoint().unwrap()
+        return 0
+    })
+    r2.unwrap()
+    let r3 = lexdb_store.run(d, lexdb_store.defaults(), fn(st: lexdb_store.Store): int {
+        println("reopened again " + count(&st, tr).toStr())
+        return 0
+    })
+    r3.unwrap()
+    let gone = fs.removeAll(dir)
+}

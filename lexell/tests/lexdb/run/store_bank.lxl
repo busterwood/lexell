@@ -1,0 +1,145 @@
+// lexdb_store: concurrent transfers between accounts, each a transaction
+// that reads two balances and writes both, retried on 40001. A crash is
+// taken at a random moment while the tasks run. Whatever the crash leaves,
+// the money adds up (no transfer half applied) and every transfer that was
+// acknowledged before the crash is there. Without a crash the money adds
+// up too and every transfer happened once.
+// expect: runs 30 total ok 30 acked ok 30 final ok 30
+// expect: conflicts seen true
+import "task"
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_base"
+
+const ACCOUNTS = 12
+const TASKS = 6
+const EACH = 25
+
+type Acks = record { n: []int; atCrash: []int; crashed: []lexdb_disk.Fs }
+
+type Arg = record { st: lexdb_store.Store; tree: int; id: int; seed: int; acks: task.Shared[Acks] }
+
+type CrashArg = record { fs: lexdb_disk.Fs; seed: int; acks: task.Shared[Acks] }
+
+fn acct(i: int): str { return "acct" + strings.padLeft(i.toStr(), 3, '0') }
+fn ctr(i: int): str { return "n" + i.toStr() }
+
+fn num(o: Option[str]): int {
+    match o {
+        Some(s) { return strings.parseIntOpt(s).unwrapOr(0) }
+        None { return 0 }
+    }
+}
+
+fn transfer(a: Arg): int {
+    var r = lexdb_base.rng(a.seed)
+    var done = 0
+    while done < EACH {
+        var t = lexdb_store.begin()
+        let x = r.below(ACCOUNTS)
+        var y = r.below(ACCOUNTS - 1)
+        if y >= x { y += 1 }
+        let amt = r.below(10)
+        let vx = num(a.st.get(mut &t, a.tree, acct(x)).unwrap())
+        let vy = num(a.st.get(mut &t, a.tree, acct(y)).unwrap())
+        let n = num(a.st.get(mut &t, a.tree, ctr(a.id)).unwrap())
+        // a client's round trip between its reads and its writes
+        for k in 0..r.below(3) { let yd = task.yield() }
+        t.put(a.tree, acct(x), (vx - amt).toStr()).unwrap()
+        t.put(a.tree, acct(y), (vy + amt).toStr()).unwrap()
+        t.put(a.tree, ctr(a.id), (n + 1).toStr()).unwrap()
+        match a.st.commit(t) {
+            Ok(_) {
+                done += 1
+                let id = a.id
+                a.acks.with(fn(k: mut &Acks) { k.n[id] += 1 })
+            }
+            Err(e) {
+                if e.state != lexdb_base.S_CONFLICT { panic("transfer: " + e.toStr()) }
+            }
+        }
+    }
+    return 0
+}
+
+fn crasher(c: CrashArg): int {
+    var r = lexdb_base.rng(c.seed)
+    let k = r.below(400)
+    for i in 0..k { let y = task.yield() }
+    let fs = c.fs
+    let seed = c.seed
+    c.acks.with(fn(a: mut &Acks) {
+        append(mut &a.crashed, fs.crash(seed))
+        for i in 0..TASKS { a.atCrash[i] = a.n[i] }
+    })
+    return 0
+}
+
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheNodes: 4, segBytes: 8 * 4096, ckptBytes: 3 * 4096}
+}
+
+// The total of the accounts and the counters, as a store holds them.
+fn audit(st: &lexdb_store.Store, tree: int, counts: mut &[]int): int {
+    var t = lexdb_store.begin()
+    var total = 0
+    for i in 0..ACCOUNTS { total += num(st.get(mut &t, tree, acct(i)).unwrap()) }
+    for i in 0..TASKS { counts[i] = num(st.get(mut &t, tree, ctr(i)).unwrap()) }
+    return total
+}
+
+fn main() {
+    var totalOk = 0
+    var ackedOk = 0
+    var finalOk = 0
+    var conflicts = 0
+    for run in 0..30 {
+        let fs = lexdb_disk.sim(run)
+        let acks = task.shared(Acks{n: array(TASKS, 0), atCrash: array(TASKS, 0), crashed: []})
+        var tree = 0
+        let res = lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int {
+            var t = lexdb_store.begin()
+            tree = st.createTree(mut &t)
+            for i in 0..ACCOUNTS { t.put(tree, acct(i), "100").unwrap() }
+            st.commit(t).unwrap()
+            let tr = tree
+            task.scope(fn(s: mut &task.Scope) {
+                s.spawn(crasher, CrashArg{fs: fs, seed: run * 31 + 7, acks: acks})
+                for i in 0..TASKS {
+                    s.spawn(transfer, Arg{st: st, tree: tr, id: i, seed: run * 100 + i, acks: acks})
+                }
+            })
+            var counts = array(TASKS, 0)
+            let total = audit(&st, tr, mut &counts)
+            var all = total == ACCOUNTS * 100
+            for c in counts { if c != EACH { all = false } }
+            if all { finalOk += 1 }
+            conflicts += st.stats().conflicts
+            return 0
+        })
+        res.unwrap()
+        var crashed = lexdb_disk.sim(0)
+        var at = array(TASKS, 0)
+        acks.with(fn(a: mut &Acks) {
+            crashed = a.crashed[0]
+            for i in 0..TASKS { at[i] = a.atCrash[i] }
+        })
+        let tr = tree
+        let after = lexdb_store.run(crashed, opts(), fn(st: lexdb_store.Store): int {
+            var counts = array(TASKS, 0)
+            let total = audit(&st, tr, mut &counts)
+            if total == ACCOUNTS * 100 { totalOk += 1 } else { println("run " + run.toStr() + ": total " + total.toStr()) }
+            var ok = true
+            for i in 0..TASKS { if counts[i] < at[i] { ok = false } }
+            if ok { ackedOk += 1 } else { println("run " + run.toStr() + ": an acknowledged transfer is missing") }
+            return 0
+        })
+        match after {
+            Ok(_) {}
+            Err(e) { println("run " + run.toStr() + ": open after crash: " + e.toStr()) }
+        }
+    }
+    println("runs 30 total ok " + totalOk.toStr() + " acked ok " + ackedOk.toStr() + " final ok " + finalOk.toStr())
+    println("conflicts seen " + (conflicts > 0).toStr())
+}
