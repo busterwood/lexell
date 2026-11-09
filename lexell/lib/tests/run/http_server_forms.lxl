@@ -12,6 +12,10 @@
 // expect:   200 [up café.txt file contents\n] text/plain; charset=utf-8
 // expect: filename*: 200 closed
 // expect:   200 [up café.txt star\n] text/plain; charset=utf-8
+// expect: binary file: 200 closed
+// expect:   200 [up 6 00 ff 0d 0a 2d 41\n] text/plain; charset=utf-8
+// expect: field not UTF-8: 400 closed
+// expect:   400 [400 Bad Request\n] text/plain; charset=utf-8
 // expect: too many parts: 413 closed
 // expect:   413 [413 Content Too Large\n] text/plain; charset=utf-8
 // expect: wrong type: 415 closed
@@ -24,7 +28,7 @@
 // expect:   413 [413 Content Too Large\n] text/plain; charset=utf-8
 // expect: stop: 200 closed
 // expect:   200 [bye\n] text/plain; charset=utf-8
-// expect: stopped: accepted 11, requests 11, open 0, rejected 0, timeouts 0, gone 0, errors 0
+// expect: stopped: accepted 13, requests 13, open 0, rejected 0, timeouts 0, gone 0, errors 0
 import "task"
 import "net"
 import "strings"
@@ -58,6 +62,21 @@ fn fileRoute(app: &App, rq: mut &http.Request, w: mut &http.Response): Result[Un
     }
 }
 
+// The file's bytes in hex.
+fn bytesRoute(app: &App, rq: mut &http.Request, w: mut &http.Response): Result[Unit, http.Error] {
+    let f = try rq.form(100000)
+    let fl = f.file("up").unwrap()
+    var b = newStrBuf()
+    b.add("up " + intToStr(len(fl.data)))
+    let hex = "0123456789abcdef"
+    for x in fl.data {
+        b.add(" ")
+        b.addByte(hex[int(x) / 16])
+        b.addByte(hex[int(x) % 16])
+    }
+    return w.text(b.toStr() + "\n")
+}
+
 fn smallRoute(app: &App, rq: mut &http.Request, w: mut &http.Response): Result[Unit, http.Error] {
     let f = try rq.form(10)
     return w.text("values " + f.size().toStr() + "\n")
@@ -68,6 +87,7 @@ fn routes(): http.Router[App] {
     r.handle("POST /form", formRoute)
     r.handle("POST /file", fileRoute)
     r.handle("POST /small", smallRoute)
+    r.handle("POST /bytes", bytesRoute)
     r.handle("POST /stop", sr.stop[App])
     return r
 }
@@ -106,6 +126,11 @@ fn main() {
         show("multipart file", &t.talk(a, post("/file", "multipart/form-data; boundary=XyZ", mp), 3000))
         let mpstar = "--XyZ\r\nContent-Disposition: form-data; name=\"up\"; filename*=UTF-8''caf%C3%A9.txt\r\n\r\nstar\r\n--XyZ--\r\n"
         show("filename*", &t.talk(a, post("/file", "multipart/form-data; boundary=XyZ", mpstar), 3000))
+        // a file part holds any bytes, even CRLF and "-" short of the delimiter
+        let bin = "--XyZ\r\nContent-Disposition: form-data; name=\"up\"; filename=\"b.bin\"\r\n\r\n\x00\xff\r\n-A\r\n--XyZ--\r\n"
+        show("binary file", &t.talk(a, post("/bytes", "multipart/form-data; boundary=XyZ", bin), 3000))
+        let badField = "--XyZ\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\n\xff\xfe\r\n--XyZ--\r\n"
+        show("field not UTF-8", &t.talk(a, post("/form", "multipart/form-data; boundary=XyZ", badField), 3000))
         let tooMany = "--XyZ\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\n1\r\n" +
             "--XyZ\r\nContent-Disposition: form-data; name=\"b\"\r\n\r\n2\r\n" +
             "--XyZ\r\nContent-Disposition: form-data; name=\"c\"\r\n\r\n3\r\n" +

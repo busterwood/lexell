@@ -719,218 +719,109 @@ const C_DATA = 1       // inside a chunk's data
 const C_CRLF = 2       // the CRLF after a chunk's data
 const C_DONE = 3
 
-// A request, as its handler sees it.
 // ---------------------------------------------------------------- transport
 //
 // A request owns the reading side and a response the writing side. For a
 // plain socket those are net's halves. For TLS, one SSL object is both, so
-// the two sides share it through a box: each call takes it, parks if it
-// has to, and gives it back. One connection's task uses it sequentially;
-// a second task that reaches the same side while it is taken gets an error
-// (the HTTP/1.1 server never does).
+// the two sides share it through a box: each call takes it out, parks if it
+// has to, and puts it back. One connection's task uses it sequentially; a
+// second task that reaches the box while it is empty gets an error (the
+// HTTP/1.1 server never does).
 
 type ConnError = value record {
     timeout: bool
-    cancelled: bool
     msg: str
 }
 
 fn (e: ConnError) toStr(): str { return e.msg }
 fn (e: ConnError) isTimeout(): bool { return e.timeout }
-fn (e: ConnError) isCancelled(): bool { return e.cancelled }
 
-fn ioConn(e: &io.IoError): ConnError {
-    return ConnError{timeout: e.isTimeout(), cancelled: e.isCancelled(), msg: e.toStr()}
-}
+fn ioConn(e: &io.IoError): ConnError { return ConnError{timeout: e.isTimeout(), msg: e.toStr()} }
 
-fn tlsConn(e: &tls.Error): ConnError {
-    return ConnError{timeout: e.isTimeout(), cancelled: e.isCancelled(), msg: e.toStr()}
-}
+fn tlsConn(e: &tls.Error): ConnError { return ConnError{timeout: e.isTimeout(), msg: e.toStr()} }
 
 fn connErr(e: &ConnError, what: str): Error {
     if e.timeout { return errOf(503, ErrorKind.Timeout, what + ": " + e.msg) }
     return errOf(499, ErrorKind.Gone, what + ": " + e.msg)
 }
 
-type TlsBox = record {
-    c: Option[tls.Conn]
-    busy: bool
-}
+// None while a call has the connection out.
+type TlsBox = record { c: Option[tls.Conn] }
 
-type ReadConn = record {
-    plain: Option[net.ReadHalf]
-    box: Option[task.Shared[TlsBox]]
-    fd: int
-    addr: str
-}
+// The reading side; a TLS one keeps the socket's descriptor for the hangup
+// watch.
+type ReadConn = value closed { Plain(net.ReadHalf); Tls(task.Shared[TlsBox], int) }
 
-type WriteConn = record {
-    plain: Option[net.WriteHalf]
-    box: Option[task.Shared[TlsBox]]
-    addr: str
-}
+type WriteConn = value closed { Plain(net.WriteHalf); Tls(task.Shared[TlsBox]) }
 
-type Locked = record {
-    box: task.Shared[TlsBox]
-    c: Option[tls.Conn]
-}
-
-fn takeTls(b: &task.Shared[TlsBox], at: Where): Result[Locked, ConnError] {
-    var got: Option[tls.Conn] = None
-    b.with(fn(x: mut &TlsBox) {
-        if !x.busy && x.c.isSome() {
-            x.busy = true
-            got = replace(mut &x.c, None)
-        }
-    })
-    match replace(mut &got, None) {
-        Some(c) { return Ok(Locked{box: b, c: Some(c)}) }
-        None { return Err(ConnError{timeout: false, cancelled: false, msg: "the TLS connection is in use by another task"}) }
-    }
-}
-
-fn (l: mut &Locked) release() {
-    var c = replace(mut &l.c, None)
-    let b = l.box
-    b.with(fn(x: mut &TlsBox) {
-        x.c = replace(mut &c, None)
-        x.busy = false
-    })
-}
-
-fn (l: mut &Locked) drop() { l.release() }
-
-fn (l: mut &Locked) read(buf: mut &[byte], at: Where): Result[int, ConnError] {
-    match replace(mut &l.c, None) {
+// Runs f on the boxed TLS connection, taking it out for the call (f may
+// park) and putting it back after.
+fn withTls[T](b: &task.Shared[TlsBox], f: &fn(mut &tls.Conn): Result[T, tls.Error]): Result[T, ConnError] {
+    var held: Option[tls.Conn] = None
+    b.with(fn(x: mut &TlsBox) { held = replace(mut &x.c, None) })
+    match move(held) {
         Some(taken) {
             var c = taken
-            let r = c.read(buf, at)
-            l.c = Some(c)
-            return match r {
-                Ok(n) { Ok(n) }
+            let r = f(mut &c)
+            var back: Option[tls.Conn] = Some(c)
+            b.with(fn(x: mut &TlsBox) { x.c = replace(mut &back, None) })
+            return match move(r) {
+                Ok(v) { Ok(v) }
                 Err(e) { Err(tlsConn(&e)) }
             }
         }
-        None { return Err(ConnError{timeout: false, cancelled: false, msg: "the TLS connection is not held"}) }
+        None { return Err(ConnError{timeout: false, msg: "the TLS connection is in use by another task"}) }
     }
 }
 
-fn (l: mut &Locked) writeStalled(data: &[byte], ms: int, at: Where): Result[Unit, ConnError] {
-    match replace(mut &l.c, None) {
-        Some(taken) {
-            var c = taken
-            let r = c.writeStalled(data, ms, at)
-            l.c = Some(c)
-            return match r {
-                Ok(_) { Ok(Unit{}) }
-                Err(e) { Err(tlsConn(&e)) }
-            }
-        }
-        None { return Err(ConnError{timeout: false, cancelled: false, msg: "the TLS connection is not held"}) }
-    }
-}
-
-fn (l: mut &Locked) shutdown(at: Where): Result[Unit, ConnError] {
-    match replace(mut &l.c, None) {
-        Some(taken) {
-            var c = taken
-            let r = c.shutdown(at)
-            l.c = Some(c)
-            return match r {
-                Ok(_) { Ok(Unit{}) }
-                Err(e) { Err(tlsConn(&e)) }
-            }
-        }
-        None { return Err(ConnError{timeout: false, cancelled: false, msg: "the TLS connection is not held"}) }
+fn ioUnit(r: Result[Unit, io.IoError]): Result[Unit, ConnError] {
+    return match r {
+        Ok(_) { Ok(Unit{}) }
+        Err(e) { Err(ioConn(&e)) }
     }
 }
 
 fn (c: &ReadConn) read(buf: mut &[byte], at: Where): Result[int, ConnError] {
-    match &c.plain {
-        Some(h) {
+    match c {
+        ReadConn.Plain(h) {
             return match h.read(buf, at) {
                 Ok(n) { Ok(n) }
                 Err(e) { Err(ioConn(&e)) }
             }
         }
-        None {}
+        ReadConn.Tls(b, _) { return withTls(&b, fn(t: mut &tls.Conn): Result[int, tls.Error] { return t.read(buf, at) }) }
     }
-    match &c.box {
-        Some(b) {
-            var l = try takeTls(&b, at)
-            return l.read(buf, at)
-        }
-        None {}
-    }
-    return Err(ConnError{timeout: false, cancelled: false, msg: "a connection with no reading side"})
 }
 
 fn (c: &ReadConn) writeInterim(data: &[byte], at: Where): Result[Unit, ConnError] {
-    match &c.plain {
-        Some(h) {
-            return match h.writeInterim(data, at) {
-                Ok(_) { Ok(Unit{}) }
-                Err(e) { Err(ioConn(&e)) }
-            }
-        }
-        None {}
+    match c {
+        ReadConn.Plain(h) { return ioUnit(h.writeInterim(data, at)) }
+        ReadConn.Tls(b, _) { return withTls(&b, fn(t: mut &tls.Conn): Result[Unit, tls.Error] { return t.writeStalled(data, 0, at) }) }
     }
-    match &c.box {
-        Some(b) {
-            var l = try takeTls(&b, at)
-            return l.writeStalled(data, 0, at)
-        }
-        None {}
-    }
-    return Err(ConnError{timeout: false, cancelled: false, msg: "a connection with no reading side"})
 }
 
 fn (c: &ReadConn) cancelOnHangup(halfClose: bool): net.HangupGuard {
-    return net.hangup(c.fd, halfClose)
+    match c {
+        ReadConn.Plain(h) { return h.cancelOnHangup(halfClose) }
+        ReadConn.Tls(_, fd) { return net.hangup(fd, halfClose) }
+    }
 }
 
-fn (c: &ReadConn) remote(): str { return c.addr }
-
 fn (c: &WriteConn) writeStalled(data: &[byte], stallMs: int, at: Where): Result[Unit, ConnError] {
-    match &c.plain {
-        Some(h) {
-            return match h.writeStalled(data, stallMs, at) {
-                Ok(_) { Ok(Unit{}) }
-                Err(e) { Err(ioConn(&e)) }
-            }
-        }
-        None {}
+    match c {
+        WriteConn.Plain(h) { return ioUnit(h.writeStalled(data, stallMs, at)) }
+        WriteConn.Tls(b) { return withTls(&b, fn(t: mut &tls.Conn): Result[Unit, tls.Error] { return t.writeStalled(data, stallMs, at) }) }
     }
-    match &c.box {
-        Some(b) {
-            var l = try takeTls(&b, at)
-            return l.writeStalled(data, stallMs, at)
-        }
-        None {}
-    }
-    return Err(ConnError{timeout: false, cancelled: false, msg: "a connection with no writing side"})
 }
 
 fn (c: &WriteConn) closeWrite(at: Where): Result[Unit, ConnError] {
-    match &c.plain {
-        Some(h) {
-            return match h.closeWrite() {
-                Ok(_) { Ok(Unit{}) }
-                Err(e) { Err(ioConn(&e)) }
-            }
-        }
-        None {}
+    match c {
+        WriteConn.Plain(h) { return ioUnit(h.closeWrite()) }
+        WriteConn.Tls(b) { return withTls(&b, fn(t: mut &tls.Conn): Result[Unit, tls.Error] { return t.shutdown(at) }) }
     }
-    match &c.box {
-        Some(b) {
-            var l = try takeTls(&b, at)
-            return l.shutdown(at)
-        }
-        None {}
-    }
-    return Err(ConnError{timeout: false, cancelled: false, msg: "a connection with no writing side"})
 }
 
+// A request, as its handler sees it.
 pub type Request = record {
     pub method: str        // as sent, a token
     pub path: str          // decoded once (section 3.2); rawTarget() gives it as sent
@@ -1272,7 +1163,7 @@ pub fn (rq: mut &Request) form(limit: int, at: Where): Result[Form, Error] {
     if mt == "multipart/form-data" {
         let boundary = try boundaryOf(ct)
         let body = try rq.bytes(limit, at)
-        return parseMultipart(&body, boundary, rq.lim)
+        return parseMultipart(strFromBytes(&body), boundary, rq.lim)
     }
     return Err(errOf(415, ErrorKind.Client, "a form body of media type \"" + mt + "\""))
 }
@@ -1285,8 +1176,8 @@ fn mediaType(s: str): str {
     return strings.toLowerAscii(strings.trim(head))
 }
 
-// A header value's parameters (after its leading token), with quoted
-// strings unescaped. The leading token itself is not returned.
+// A header value's leading token (mediaType) and its parameters, with
+// quoted strings unescaped.
 type HeaderParams = record {
     base: str
     params: []url.Param
@@ -1296,9 +1187,9 @@ type HeaderParams = record {
 // Content-Disposition). An unterminated quote, a parameter without a
 // value, or a control character is an error.
 fn headerParams(s: str): Result[HeaderParams, str] {
-    var i = 0
-    while i < len(s) && s[i] != ';' { i += 1 }
-    let base = strings.toLowerAscii(strings.trim(s[..i]))
+    let base = mediaType(s)
+    var i = strings.indexOf(s, ";", 0)
+    if i < 0 { i = len(s) }
     var ps: []url.Param = []
     while i < len(s) {
         i += 1
@@ -1371,25 +1262,6 @@ fn boundaryOf(ct: str): Result[str, Error] {
     return Ok(b)
 }
 
-// Finds needle in hay from `from`; -1 when it is not there.
-fn indexBytes(hay: &[byte], needle: &[byte], from: int): int {
-    if len(needle) == 0 { return from }
-    var i = from
-    while i + len(needle) <= len(hay) {
-        var j = 0
-        while j < len(needle) && hay[i + j] == needle[j] { j += 1 }
-        if j == len(needle) { return i }
-        i += 1
-    }
-    return -1
-}
-
-fn copyBytes(b: &[byte]): []byte {
-    var out: []byte = array(len(b), byte(0))
-    for i in 0..len(b) { out[i] = b[i] }
-    return out
-}
-
 // RFC 5987's filename*=UTF-8''...: the charset must be UTF-8 and the
 // percent-decoded value valid UTF-8.
 fn extendedName(v: str): Result[str, str] {
@@ -1407,11 +1279,12 @@ fn extendedName(v: str): Result[str, str] {
 
 // Parses a multipart/form-data body. A preamble before the first boundary
 // and an epilogue after the last are ignored, as RFC 2046 allows.
-fn parseMultipart(body: &[byte], boundary: str, lim: Limits): Result[Form, Error] {
-    let delim = strToBytes("--" + boundary)
-    let inner = strToBytes("\r\n--" + boundary)
-    let blank = strToBytes("\r\n\r\n")
-    var at = indexBytes(body, &delim, 0)
+// The body is a str only for its byte search: a file part may hold any
+// bytes, and only a field is checked for UTF-8.
+fn parseMultipart(body: str, boundary: str, lim: Limits): Result[Form, Error] {
+    let delim = "--" + boundary
+    let inner = "\r\n--" + boundary
+    var at = strings.indexOf(body, delim, 0)
     if at < 0 { return Err(error(400, "a multipart body without its boundary")) }
     at += len(delim)
     var pairs = url.newQuery()
@@ -1429,18 +1302,18 @@ fn parseMultipart(body: &[byte], boundary: str, lim: Limits): Result[Form, Error
         at += 2
         parts += 1
         if parts > lim.maxParts { return Err(errOf(413, ErrorKind.Limit, "more than " + intToStr(lim.maxParts) + " multipart parts")) }
-        let he = indexBytes(body, &blank, at)
+        let he = strings.indexOf(body, "\r\n\r\n", at)
         if he < 0 { return Err(error(400, "a multipart part without the end of its headers")) }
         if he - at > lim.maxPartHeadBytes {
             return Err(errOf(413, ErrorKind.Limit, "a multipart part with headers over " + intToStr(lim.maxPartHeadBytes) + " bytes"))
         }
         var hs = http.newHeaders()
-        match http.parseFields(strFromBytes(&body[at..he]), 0, mut &hs, lim.maxPartHeaders) {
+        match http.parseFields(body[at..he], 0, mut &hs, lim.maxPartHeaders) {
             Ok(_) {}
             Err(m) { return Err(error(400, "a multipart part's headers: " + m)) }
         }
         at = he + 4
-        let de = indexBytes(body, &inner, at)
+        let de = strings.indexOf(body, inner, at)
         if de < 0 { return Err(error(400, "a multipart part without its closing boundary")) }
         let data = body[at..de]
         at = de + len(inner)
@@ -1466,12 +1339,11 @@ fn parseMultipart(body: &[byte], boundary: str, lim: Limits): Result[Form, Error
         }
         match filename {
             Some(fname) {
-                append(mut &files, File{field: name, filename: fname, headers: hs, data: copyBytes(data)})
+                append(mut &files, File{field: name, filename: fname, headers: hs, data: strToBytes(data)})
             }
             None {
-                let s = strFromBytes(data)
-                if !strings.isValidUtf8(s) { return Err(error(400, "a multipart field that is not UTF-8")) }
-                pairs.add(name, s)
+                if !strings.isValidUtf8(data) { return Err(error(400, "a multipart field that is not UTF-8")) }
+                pairs.add(name, data)
                 if pairs.size() > lim.maxParams {
                     return Err(error(400, "more than " + intToStr(lim.maxParams) + " form parameters"))
                 }
@@ -2342,19 +2214,26 @@ pub fn (w: mut &Response) eventWith(id: str, name: str, data: str, at: Where): R
         b.add(name)
         b.add("\n")
     }
-    var i = 0
-    while i <= len(data) {
-        var j = i
-        while j < len(data) && data[j] != '\n' && data[j] != '\r' { j += 1 }
-        b.add("data: ")
-        b.add(data[i..j])
-        b.add("\n")
-        if j < len(data) && data[j] == '\r' && j + 1 < len(data) && data[j + 1] == '\n' { j += 1 }
-        i = j + 1
-    }
+    sseLines(mut &b, "data", data)
     b.add("\n")
     try w.writeStr(b.toStr(), at)
     return w.flush(at)
+}
+
+// Adds `field: line` for each line of text, split at CR, LF or CRLF as SSE
+// splits ("" is one empty line). A comment's field is "".
+fn sseLines(b: mut &StrBuf, field: str, text: str) {
+    var i = 0
+    while i <= len(text) {
+        var j = i
+        while j < len(text) && text[j] != '\n' && text[j] != '\r' { j += 1 }
+        b.add(field)
+        b.add(": ")
+        b.add(text[i..j])
+        b.add("\n")
+        if j < len(text) && text[j] == '\r' && j + 1 < len(text) && text[j + 1] == '\n' { j += 1 }
+        i = j + 1
+    }
 }
 
 // Writes an SSE retry field (the client's reconnect delay in ms) and
@@ -2373,21 +2252,12 @@ pub fn (w: mut &Response) retry(ms: int, at: Where): Result[Unit, Error] {
 // the bare ":\n\n" keep-alive. A comment is one line per line of text, so
 // text may contain CR, LF or CRLF.
 pub fn (w: mut &Response) comment(text: str, at: Where): Result[Unit, Error] {
-    var b = newStrBuf()
-    var i = 0
-    while true {
-        b.add(":")
-        if i < len(text) {
-            b.add(" ")
-            var j = i
-            while j < len(text) && text[j] != '\n' && text[j] != '\r' { j += 1 }
-            b.add(text[i..j])
-            if j < len(text) && text[j] == '\r' && j + 1 < len(text) && text[j + 1] == '\n' { j += 1 }
-            i = j + 1
-        }
-        b.add("\n")
-        if i >= len(text) { break }
+    if len(text) == 0 {
+        try w.writeStr(":\n\n", at)
+        return w.flush(at)
     }
+    var b = newStrBuf()
+    sseLines(mut &b, "", text)
     b.add("\n")
     try w.writeStr(b.toStr(), at)
     return w.flush(at)
@@ -2978,23 +2848,17 @@ type Sides = record {
 fn startSides(c: net.Conn, tctx: Option[tls.Context], hsMs: int, at: Where): Result[Sides, ConnError] {
     match move(tctx) {
         Some(ctx) {
-            var timed = false
-            var old = -1
-            if hsMs > 0 {
-                old = rtWithin(hsMs)
-                timed = true
-            }
+            // within cannot hold the handshake: accept takes c
+            let timed = hsMs > 0
+            let old = if timed { rtWithin(hsMs) } else { 0 }
             let hr = ctx.accept(c, at)
             if timed { rtRestore(old) }
             match move(hr) {
                 Ok(tc) {
                     let peer = tc.peerAddr()
                     let fd = tc.fd()
-                    let box = task.shared(TlsBox{c: Some(tc), busy: false})
-                    return Ok(Sides{
-                        read: ReadConn{plain: None, box: Some(box), fd: fd, addr: peer},
-                        write: WriteConn{plain: None, box: Some(box), addr: peer},
-                        peer: peer})
+                    let box = task.shared(TlsBox{c: Some(tc)})
+                    return Ok(Sides{read: ReadConn.Tls(box, fd), write: WriteConn.Tls(box), peer: peer})
                 }
                 Err(e) { return Err(tlsConn(&e)) }
             }
@@ -3002,11 +2866,7 @@ fn startSides(c: net.Conn, tctx: Option[tls.Context], hsMs: int, at: Where): Res
         None {
             let net.Halves{read: rh, write: wh} = c.split()
             let peer = rh.remote()
-            let fd = rh.fd()
-            return Ok(Sides{
-                read: ReadConn{plain: Some(rh), box: None, fd: fd, addr: peer},
-                write: WriteConn{plain: Some(wh), box: None, addr: peer},
-                peer: peer})
+            return Ok(Sides{read: ReadConn.Plain(rh), write: WriteConn.Plain(wh), peer: peer})
         }
     }
 }

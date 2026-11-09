@@ -420,21 +420,7 @@ pub fn (c: &Conn) read(buf: mut &[byte], w: Where): Result[int, io.IoError] {
 // Writes all of data, parking while the socket's buffer is full. On an
 // error part of data may have been sent.
 pub fn (c: &Conn) write(data: &[byte], w: Where): Result[Unit, io.IoError] {
-    let k = rtCheck(w.cstr())
-    if k != 0 { return Err(stopped(k, "write", c.addr)) }
-    var off = 0
-    while off < len(data) {
-        let n = rtWrite(c.fd, data[off..], len(data) - off)
-        if n >= 0 {
-            off += n
-        } else if n == -EAGAIN {
-            let r = rtWait(c.fd, 1, w.cstr())
-            if r != 0 { return Err(stopped(r, "write", c.addr)) }
-        } else if n != -EINTR {
-            return Err(io.ioError(-n, "write", c.addr))
-        }
-    }
-    return Ok(Unit{})
+    return writeAll(c.fd, c.addr, data, 0, w)
 }
 
 // write for the bytes of s.
@@ -580,36 +566,12 @@ pub fn (c: &Conn) writeFor(data: &[byte], ms: int, w: Where): Result[Unit, io.Io
 // stallMs milliseconds in a row (0: no limit). There is no limit on the
 // whole write.
 pub fn (c: &Conn) writeStalled(data: &[byte], stallMs: int, w: Where): Result[Unit, io.IoError] {
-    let k = rtCheck(w.cstr())
-    if k != 0 { return Err(stopped(k, "write", c.addr)) }
-    var off = 0
-    while off < len(data) {
-        let n = rtWrite(c.fd, data[off..], len(data) - off)
-        if n >= 0 {
-            off += n
-        } else if n == -EAGAIN {
-            var r = 0
-            if stallMs > 0 {
-                let old = rtWithin(stallMs)
-                r = rtWait(c.fd, 1, w.cstr())
-                rtRestore(old)
-            } else {
-                r = rtWait(c.fd, 1, w.cstr())
-            }
-            if r != 0 { return Err(stopped(r, "write", c.addr)) }
-        } else if n != -EINTR {
-            return Err(io.ioError(-n, "write", c.addr))
-        }
-    }
-    return Ok(Unit{})
+    return writeAll(c.fd, c.addr, data, stallMs, w)
 }
 
 // The descriptor, for a transport that wraps this connection (tls) and must
 // watch the same socket.
 pub fn (c: &Conn) fd(): int { return c.fd }
-
-// cancelOnHangup for the whole connection, before it is split.
-pub fn (c: &Conn) cancelOnHangup(halfClose: bool): HangupGuard { return hangup(c.fd, halfClose) }
 
 // SO_KEEPALIVE on or off; with on, the idle time before the first probe, the
 // interval between probes (seconds) and the number of lost probes before the
@@ -952,9 +914,6 @@ pub fn (h: &ReadHalf) readNow(buf: mut &[byte]): Result[int, io.IoError] {
 // The peer's address ("" once it is gone).
 pub fn (h: &ReadHalf) peerAddr(): str { return sockText(h.fd, 1) }
 
-// The descriptor, for a transport that watches the same socket for a hangup.
-pub fn (h: &ReadHalf) fd(): int { return h.fd }
-
 // The peer's address as accept saw it (no system call).
 pub fn (h: &ReadHalf) remote(): str { return h.addr }
 
@@ -1017,25 +976,31 @@ pub fn (h: &WriteHalf) write(data: &[byte], w: Where): Result[Unit, io.IoError] 
 // the data for stallMs milliseconds in a row (0: no limit). There is no
 // limit on the whole write: a slow reader that keeps reading is served.
 pub fn (h: &WriteHalf) writeStalled(data: &[byte], stallMs: int, w: Where): Result[Unit, io.IoError] {
+    return writeAll(h.fd, h.addr, data, stallMs, w)
+}
+
+// The write loop of Conn and WriteHalf: all of data, parking while the
+// socket's buffer is full, with an optional no-progress limit of stallMs.
+fn writeAll(fd: int, addr: str, data: &[byte], stallMs: int, w: Where): Result[Unit, io.IoError] {
     let k = rtCheck(w.cstr())
-    if k != 0 { return Err(stopped(k, "write", h.addr)) }
+    if k != 0 { return Err(stopped(k, "write", addr)) }
     var off = 0
     while off < len(data) {
-        let n = rtWrite(h.fd, data[off..], len(data) - off)
+        let n = rtWrite(fd, data[off..], len(data) - off)
         if n >= 0 {
             off += n
         } else if n == -EAGAIN {
             var r = 0
             if stallMs > 0 {
                 let old = rtWithin(stallMs)
-                r = rtWait(h.fd, 1, w.cstr())
+                r = rtWait(fd, 1, w.cstr())
                 rtRestore(old)
             } else {
-                r = rtWait(h.fd, 1, w.cstr())
+                r = rtWait(fd, 1, w.cstr())
             }
-            if r != 0 { return Err(stopped(r, "write", h.addr)) }
+            if r != 0 { return Err(stopped(r, "write", addr)) }
         } else if n != -EINTR {
-            return Err(io.ioError(-n, "write", h.addr))
+            return Err(io.ioError(-n, "write", addr))
         }
     }
     return Ok(Unit{})
