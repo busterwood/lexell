@@ -2080,9 +2080,12 @@ void* lxllib_task_take(void* p) {
     rt_release(t);
     return r;
 }
+/* An explicit yield looks at the timers and sockets every time (without waiting), not every
+   64 switches: it asks for the others to run, and a task that is woken by a socket is one of
+   them (a long computation yielding now and then lets a waiting client in at once). */
 int64_t lxllib_task_yield(const char* w) {
     rt_nopark(w);
-    if ((rt_nio | rt_nheap | rt_njobs) && (++rt_ticks & 63) == 0) rt_poll(false, w);
+    if (rt_nio | rt_nheap | rt_njobs) rt_poll(false, w);
     if (rt_rq_head) {
         rt_enqueue(rt_cur);
         rt_switch(rt_dequeue());
