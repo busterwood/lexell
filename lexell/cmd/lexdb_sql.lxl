@@ -136,13 +136,14 @@ pub const A_RENAME_COL = 2      // RENAME COLUMN name TO to
 pub const A_RENAME = 3          // RENAME TO name
 pub const A_SET_NOT_NULL = 4    // ALTER COLUMN name SET NOT NULL
 pub const A_DROP_NOT_NULL = 5   // ALTER COLUMN name DROP NOT NULL
+pub const A_DROP_COL = 6        // DROP COLUMN name
 
 pub type Alter = record {
     pub kind: int
     pub col: ColDef             // A_ADD: the column
     pub name: str               // the column changed; A_RENAME: the table's new name
     pub to: str                 // A_RENAME_COL: the column's new name
-    pub ifFlag: bool            // ADD COLUMN IF NOT EXISTS
+    pub ifFlag: bool            // ADD COLUMN IF NOT EXISTS, DROP COLUMN IF EXISTS
 }
 
 // A qualified name, schema.name, as the parser gives it: the two joined by
@@ -964,8 +965,9 @@ fn noCol(): ColDef { return ColDef{name: "", typ: TypeName{kind: 0, oid: 0, prec
 
 // ALTER TABLE [IF EXISTS] [ONLY] name, then RENAME [COLUMN] a TO b, or
 // RENAME TO name (each alone), or actions separated by commas: ADD
-// [COLUMN] [IF NOT EXISTS] name type [NOT NULL | NULL], ALTER [COLUMN]
-// name SET NOT NULL or DROP NOT NULL.
+// [COLUMN] [IF NOT EXISTS] name type [NOT NULL | NULL], DROP [COLUMN] [IF
+// EXISTS] name [RESTRICT | CASCADE], ALTER [COLUMN] name SET NOT NULL or
+// DROP NOT NULL.
 fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
     var s = newStmt(S_ALTER)
     if p.acceptKw("if") {
@@ -1015,6 +1017,19 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
                 }
             }
             append(mut &s.alters, a)
+        } else if p.acceptKw("drop") {
+            if p.isKw("constraint") {
+                return Err(lexdb_base.err("0A000", "lexdb: ALTER TABLE cannot drop a constraint (a unique index can be dropped)"))
+            }
+            let c = p.acceptKw("column")
+            var a = Alter{kind: A_DROP_COL, col: noCol(), name: "", to: "", ifFlag: false}
+            if p.acceptKw("if") {
+                try p.expectKw("exists")
+                a.ifFlag = true
+            }
+            a.name = try p.name()
+            if !p.acceptKw("cascade") { let r = p.acceptKw("restrict") }
+            append(mut &s.alters, a)
         } else if p.acceptKw("alter") {
             let c = p.acceptKw("column")
             let n = try p.name()
@@ -1032,7 +1047,7 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
                 return Err(lexdb_base.err("0A000", "lexdb: ALTER COLUMN takes SET NOT NULL or DROP NOT NULL"))
             }
         } else {
-            return Err(lexdb_base.err("0A000", "lexdb: ALTER TABLE takes ADD COLUMN, RENAME, and ALTER COLUMN ... SET or DROP NOT NULL"))
+            return Err(lexdb_base.err("0A000", "lexdb: ALTER TABLE takes ADD COLUMN, DROP COLUMN, RENAME, and ALTER COLUMN ... SET or DROP NOT NULL"))
         }
         if !p.acceptKw(",") { break }
     }

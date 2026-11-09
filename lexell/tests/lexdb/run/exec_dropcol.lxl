@@ -1,0 +1,134 @@
+// lexdb_exec: ALTER TABLE ... DROP COLUMN (design/lexdb.md 9.35). A
+// dropped column keeps its place in the stored rows, skipped (Table.slots);
+// no row is rewritten. Table d has rows with long texts (stored after the
+// other columns) and short ones, and indexes on the columns before and
+// after the one dropped.
+// - What reads give after the drop: SELECT *, each column alone (reads
+//   narrowed to them, large rows read in part), through an index on a
+//   column after the dropped one (its column number moved), backwards.
+// - The indexes on the column, and a filtered one whose predicate names
+//   it, are dropped with it; the others keep working, a unique one too.
+// - A column added again under the dropped one's name is NULL in the old
+//   rows, not their old values.
+// - Rows inserted and updated after the drop; DROP in a block rolled back;
+//   two drops in one statement; the key's column (refused), one that does
+//   not exist, IF EXISTS; after a reopen.
+// expect: dropped: ALTER TABLE, columns id|a|c|n, trees dropped 3
+// expect: rows: 1|300|x1|1.5 2|10|x2|2.5 3|300|300|
+// expect: one at a time: 300 10 300, x1 x2 300, 1.5 2.5 , 3 2 1
+// expect: by the index on c: 2, Index Scan using d_c on d
+// expect: dropped with it: 42704 42704 42704; kept: DROP INDEX
+// expect: unique still: 23505
+// expect: added again as b: id|a|c|n|b, 1| 2| 3| 4|9
+// expect: updated: 2|10|y2|2.5|5, by the index on c: 2
+// expect: rolled back: id|a|c|n|b, 3|300|300|
+// expect: two at once: ALTER TABLE, columns id|c|b, 1|x1| 2|y2|5 3|300| 4|x4|9
+// expect: key after the drop: 1|10 2|21 3|30, by key 30, again 23505
+// expect: the key: 0A000; missing: 42703 column "zz" of relation "d" does not exist; if exists: ALTER TABLE
+// expect: reopened: id|c|b, 1|x1| 2|y2|5 3|300| 4|x4|9, by the index on c: 3
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if !r.hasRows { return r.tag }
+            var out: []str = []
+            for row in r.rows {
+                var vs: []str = []
+                for v in row { append(mut &vs, lexdb_exec.text(&v)) }
+                append(mut &out, strings.join(&vs, "|"))
+            }
+            return strings.join(&out, " ")
+        }
+        Err(e) { return e.state + " " + e.msg }
+    }
+}
+
+fn state(s: mut &lexdb_exec.Session, sql: &str): str { return q(s, sql)[0..5] }
+
+fn cols(s: mut &lexdb_exec.Session, t: &str): str {
+    match s.exec(&("select * from " + t + " limit 0")) {
+        Ok(rs) {
+            var ns: []str = []
+            for c in rs[len(rs) - 1].cols { append(mut &ns, c.name) }
+            return strings.join(&ns, "|")
+        }
+        Err(e) { return e.state }
+    }
+}
+
+fn plan(s: mut &lexdb_exec.Session, sql: &str, want: &str): str {
+    let p = q(s, &("explain " + sql))
+    return if strings.contains(&p, want) { "Index Scan using " + want + " on d" } else { p }
+}
+
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: 256 * 1024, segBytes: 1024 * 1024, ckptBytes: 512 * 1024, snapNodes: 100000}
+}
+
+fn main() {
+    let fs = lexdb_disk.sim(35)
+    let longA = strings.repeat("a", 300)
+    let longC = strings.repeat("c", 300)
+    lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        let c1 = q(mut &s, &"create table d (id int primary key, a text, b int, c text, n numeric)")
+        let i1 = q(mut &s, &("insert into d values (1, '" + longA + "', 10, 'x1', 1.5), (2, 'aaaaaaaaaa', 20, 'x2', 2.5), (3, '" + longA + "', 30, '" + longC + "', null)"))
+        let x1 = q(mut &s, &"create index d_b on d (b)")
+        let x2 = q(mut &s, &"create index d_c on d (c)")
+        let x3 = q(mut &s, &"create index d_id on d (id) where b > 15")
+        let x4 = q(mut &s, &"create unique index d_cu on d (c, n)")
+        let x5 = q(mut &s, &"create index d_bn on d (n, b)")
+        let x6 = q(mut &s, &"create index d_id2 on d (id) where id > 1")
+        let before = len(st.trees())
+        let dr = q(mut &s, &"alter table d drop column b")
+        println("dropped: " + dr + ", columns " + cols(mut &s, &"d") + ", trees dropped " + (before - len(st.trees())).toStr())
+        println("rows: " + q(mut &s, &"select id, length(a), case when length(c) > 10 then length(c)::text else c end, n from d order by id"))
+        println("one at a time: " + q(mut &s, &"select length(a) from d order by id") + ", " +
+                q(mut &s, &"select case when length(c) > 10 then length(c)::text else c end from d order by id") + ", " +
+                q(mut &s, &"select n from d order by id") + ", " + q(mut &s, &"select id from d order by id desc"))
+        println("by the index on c: " + q(mut &s, &"select id from d where c = 'x2'") + ", " + plan(mut &s, &"select id from d where c = 'x2'", &"d_c"))
+        println("dropped with it: " + state(mut &s, &"drop index d_b") + " " + state(mut &s, &"drop index d_bn") + " " + state(mut &s, &"drop index d_id") +
+                "; kept: " + q(mut &s, &"drop index d_id2"))
+        println("unique still: " + state(mut &s, &"insert into d values (9, 'q', 'x1', 1.5)"))
+
+        let ab = q(mut &s, &"alter table d add b int")
+        let i2 = q(mut &s, &"insert into d values (4, 'a4', 'x4', null, 9)")
+        println("added again as b: " + cols(mut &s, &"d") + ", " + q(mut &s, &"select id, b from d order by id"))
+        let u1 = q(mut &s, &"update d set c = 'y2', b = 5 where id = 2")
+        println("updated: " + q(mut &s, &"select id, length(a), c, n, b from d where id = 2") + ", by the index on c: " + q(mut &s, &"select id from d where c = 'y2'"))
+
+        let bg = q(mut &s, &"begin")
+        let da = q(mut &s, &"alter table d drop a")
+        let rb = q(mut &s, &"rollback")
+        println("rolled back: " + cols(mut &s, &"d") + ", " + q(mut &s, &"select id, length(a), length(c), n from d where id = 3"))
+
+        let two = q(mut &s, &"alter table d drop column a, drop column n")
+        println("two at once: " + two + ", columns " + cols(mut &s, &"d") + ", " +
+                q(mut &s, &"select id, case when length(c) > 10 then length(c)::text else c end, b from d order by id"))
+        // a key after the column dropped: its column number moves
+        let k1 = q(mut &s, &"create table k2 (x text, id int, y int, primary key (id))")
+        let k2 = q(mut &s, &"insert into k2 values ('p', 1, 10), ('q', 2, 20)")
+        let k3 = q(mut &s, &"alter table k2 drop x")
+        let k4 = q(mut &s, &"insert into k2 values (3, 30)")
+        let k5 = q(mut &s, &"update k2 set y = 21 where id = 2")
+        println("key after the drop: " + q(mut &s, &"select * from k2 order by id") + ", by key " + q(mut &s, &"select y from k2 where id = 3") +
+                ", again " + state(mut &s, &"insert into k2 values (1, 0)"))
+        println("the key: " + state(mut &s, &"alter table d drop id") + "; missing: " + q(mut &s, &"alter table d drop zz") +
+                "; if exists: " + q(mut &s, &"alter table d drop column if exists zz"))
+        return 0
+    }).unwrap()
+
+    lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int {
+        var s = lexdb_exec.newSession(st)
+        println("reopened: " + cols(mut &s, &"d") + ", " +
+                q(mut &s, &"select id, case when length(c) > 10 then length(c)::text else c end, b from d order by id") +
+                ", by the index on c: " + q(mut &s, &("select id from d where c = '" + longC + "'")))
+        return 0
+    }).unwrap()
+}

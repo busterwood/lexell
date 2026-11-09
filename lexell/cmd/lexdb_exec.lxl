@@ -46,6 +46,11 @@ pub type Table = record {
     pub cols: []lexdb_sql.ColDef
     pub pk: []int
     pub indexes: []Index
+    // Where each column is in a stored row, once a column has been dropped
+    // (9.35): a column keeps its place, and a dropped one's is skipped.
+    // [] when none has been: column i is at i.
+    pub slots: []int
+    pub width: int              // the places a row has (with slots)
 }
 
 // A result column: its name and type OID.
@@ -1189,8 +1194,43 @@ fn encLong(row: &[]Val): str {
 
 // A row from a stored value as a Part read gives it: a large row from its
 // first bytes when the columns used are all there, else read whole (9.31).
-fn rowOf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, tree: int, key: &str, v: &str, n: int,
+// n and need are of the row's places (rowWidth, placesNeeded); the values
+// are the table's columns'.
+fn rowOf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, key: &str, v: &str, n: int,
          need: &[]bool): Result[[]Val, DbErr] {
+    let places = try placesOf(st, txn, t.tree, key, v, n, need)
+    if len(t.slots) == 0 { return Ok(places) }
+    var out: []Val = []
+    for k in t.slots { append(mut &out, places[k]) }
+    return Ok(out)
+}
+
+// The places a stored row has: its table's columns, and dropped ones.
+fn rowWidth(t: &Table): int { return if len(t.slots) == 0 { len(t.cols) } else { t.width } }
+
+// need ([] all) of the table's columns as of the row's places.
+fn placesNeeded(t: &Table, need: &[]bool): []bool {
+    var out: []bool = []
+    if len(t.slots) == 0 || len(need) == 0 {
+        for x in need { append(mut &out, x) }
+        return out
+    }
+    out = array(t.width, false)
+    for i in 0..len(t.slots) { out[t.slots[i]] = need[i] }
+    return out
+}
+
+// A table's row as stored: its values at their places, NULL at a dropped
+// column's.
+fn encRowOf(t: &Table, row: &[]Val): str {
+    if len(t.slots) == 0 { return encRow(row) }
+    var places: []Val = array(t.width, Val.Null)
+    for i in 0..len(t.slots) { places[t.slots[i]] = row[i] }
+    return encRow(&places)
+}
+
+fn placesOf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, tree: int, key: &str, v: &str, n: int,
+            need: &[]bool): Result[[]Val, DbErr] {
     match lexdb_store.partOf(v) {
         Some(p) {
             if fitsIn(&p, n, need) { return decRowNeed(&p, n, need) }
@@ -1361,11 +1401,16 @@ fn encTable(t: &Table): str {
             None {}
         }
     }
+    if len(t.slots) > 0 {
+        binary.addU32LE(mut &b, t.width)
+        binary.addU32LE(mut &b, len(t.slots))
+        for k in t.slots { binary.addU32LE(mut &b, k) }
+    }
     return b.toStr()
 }
 
 fn decTable(name: str, s: &str): Result[Table, DbErr] {
-    var t = Table{name: name, tree: binary.readU32LEStr(s, 0), cols: [], pk: [], indexes: []}
+    var t = Table{name: name, tree: binary.readU32LEStr(s, 0), cols: [], pk: [], indexes: [], slots: [], width: 0}
     let n = binary.readU32LEStr(s, 4)
     var at = 8
     for i in 0..n {
@@ -1410,6 +1455,15 @@ fn decTable(name: str, s: &str): Result[Table, DbErr] {
             at += 4 + pl
         }
         append(mut &t.indexes, ix)
+    }
+    if at + 8 <= len(s) {
+        t.width = binary.readU32LEStr(s, at)
+        let ns = binary.readU32LEStr(s, at + 4)
+        at += 8
+        for i in 0..ns {
+            append(mut &t.slots, binary.readU32LEStr(s, at))
+            at += 4
+        }
     }
     return Ok(t)
 }
@@ -2428,7 +2482,8 @@ fn after(k: &str): str {
 // index's entries) can use the transaction between.
 fn fetch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, p: &Path, sc: &Scan, need: &[]bool, cur: mut &Cursor,
          out: mut &[][]Val): Result[Unit, DbErr] {
-    let n = len(t.cols)
+    let n = rowWidth(t)
+    let places = placesNeeded(t, need)
     // only some columns used: large rows are read in part (rowOf)
     let part = len(need) > 0
     if sc.empty {
@@ -2439,7 +2494,7 @@ fn fetch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, p: &Path,
         cur.done = true
         let got = if part { try st.getPart(txn, t.tree, sc.lo) } else { try st.get(txn, t.tree, sc.lo) }
         match got {
-            Some(v) { append(out, try rowOf(st, txn, t.tree, &sc.lo, &v, n, need)) }
+            Some(v) { append(out, try rowOf(st, txn, t, &sc.lo, &v, n, &places)) }
             None {}
         }
         return Ok(Unit{})
@@ -2492,11 +2547,11 @@ fn fetch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, p: &Path,
     }
     for k in 0..len(vals) {
         if !byIndex {
-            append(out, try rowOf(st, txn, t.tree, &keys[k], &vals[k], n, need))
+            append(out, try rowOf(st, txn, t, &keys[k], &vals[k], n, &places))
         } else {
             let got = if part { try st.getPart(txn, t.tree, vals[k]) } else { try st.get(txn, t.tree, vals[k]) }
             match got {
-                Some(rv) { append(out, try rowOf(st, txn, t.tree, &vals[k], &rv, n, need)) }
+                Some(rv) { append(out, try rowOf(st, txn, t, &vals[k], &rv, n, &places)) }
                 None { return Err(lexdb_base.corrupt("an index entry of \"" + t.name + "\" without its row")) }
             }
         }
@@ -2536,7 +2591,7 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
         for lv in q.levels {
             if lv.alias == f.alias { return Err(e("42712", "table name \"" + f.alias + "\" specified more than once")) }
         }
-        var t = Table{name: f.alias, tree: -1, cols: [], pk: [], indexes: []}
+        var t = Table{name: f.alias, tree: -1, cols: [], pk: [], indexes: [], slots: [], width: 0}
         var lateral = false
         if f.sub >= 0 {
             sc.frames[me].hidden = !f.lateral
@@ -3957,7 +4012,7 @@ fn createTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
     if len(s.pk) == 0 {
         return Err(e("42P16", "lexdb: table \"" + base + "\" needs a PRIMARY KEY"))
     }
-    var t = Table{name: key, tree: 0, cols: [], pk: [], indexes: []}
+    var t = Table{name: key, tree: 0, cols: [], pk: [], indexes: [], slots: [], width: 0}
     for c in s.cols {
         if colIndex(&t.cols, &c.name) >= 0 { return Err(e("42701", "column \"" + c.name + "\" specified more than once")) }
         append(mut &t.cols, lexdb_sql.ColDef{name: c.name, typ: c.typ, notNull: c.notNull})
@@ -4047,9 +4102,51 @@ fn anyRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, col: int
     return Ok(false)
 }
 
+// Drops column i: its place in the rows is kept and skipped, and its
+// values go as rows are written again. The indexes on it, or whose
+// predicate names it, are dropped (as PostgreSQL's are).
+fn dropColumn(txn: mut &lexdb_store.Txn, t: mut &Table, i: int): Result[Unit, DbErr] {
+    let name = t.cols[i].name
+    for k in t.pk {
+        if k == i { return Err(e("0A000", "lexdb: column \"" + name + "\" is in the primary key, which cannot be changed")) }
+    }
+    if len(t.slots) == 0 {
+        for k in 0..len(t.cols) { append(mut &t.slots, k) }
+        t.width = len(t.cols)
+    }
+    let gone = collections.removeAt(mut &t.cols, i)
+    let place = collections.removeAt(mut &t.slots, i)
+    for k in 0..len(t.pk) { if t.pk[k] > i { t.pk[k] -= 1 } }
+    var old = replace(mut &t.indexes, [])
+    var rev: []Index = []
+    while len(old) > 0 {
+        var ix = pop(mut &old)
+        var uses = false
+        for c in ix.cols { if c == i { uses = true } }
+        match ix.pred {
+            Some(x) {
+                var ns: []str = []
+                colNames(&x, mut &ns)
+                for n in ns { if n == name { uses = true } }
+            }
+            None {}
+        }
+        if uses {
+            txn.dropTree(ix.tree)
+            txn.del(CATALOG, idxName(&ix.name))
+        } else {
+            for k in 0..len(ix.cols) { if ix.cols[k] > i { ix.cols[k] -= 1 } }
+            append(mut &rev, ix)
+        }
+    }
+    while len(rev) > 0 { append(mut &t.indexes, pop(mut &rev)) }
+    return Ok(Unit{})
+}
+
 // ALTER TABLE: its actions in order, on the table's catalog row. None
 // rewrites a row: a row written before a column was added has fewer
-// values, read as NULL (decRowNeed).
+// values, read as NULL (decRowNeed); a dropped column's place is skipped
+// (Table.slots).
 fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
     let found = try findTable(st, txn, &s.table)
     if found.isNone() {
@@ -4069,6 +4166,17 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
                 return Err(e("23502", "column \"" + a.col.name + "\" of relation \"" + rel + "\" contains null values"))
             }
             append(mut &t.cols, lexdb_sql.ColDef{name: a.col.name, typ: a.col.typ, notNull: a.col.notNull})
+            if len(t.slots) > 0 {
+                append(mut &t.slots, t.width)
+                t.width += 1
+            }
+        } else if a.kind == lexdb_sql.A_DROP_COL {
+            let i = colIndex(&t.cols, &a.name)
+            if i < 0 {
+                if a.ifFlag { continue }
+                return Err(e("42703", "column \"" + a.name + "\" of relation \"" + rel + "\" does not exist"))
+            }
+            try dropColumn(txn, mut &t, i)
         } else if a.kind == lexdb_sql.A_RENAME {
             let key = lexdb_sql.qual(&lexdb_sql.schemaOf(&t.name), &a.name)
             if key == t.name { continue }
@@ -4331,7 +4439,7 @@ fn insertOne(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, targe
     try checkRow(t, &row)
     let key = keyOf(t, &row)
     if (try st.get(txn, t.tree, key)).isSome() { return Err(dupKey(t, &row)) }
-    let enc = encRow(&row)
+    let enc = encRowOf(t, &row)
     try txn.putRow(t.tree, key, enc, rowHead(&enc))
     try addIndexes(st, txn, t, &row, &key)
     return Ok(Unit{})
@@ -4379,7 +4487,7 @@ fn update(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
             if (try st.get(txn, t.tree, key)).isSome() { return Err(dupKey(t, &row)) }
             txn.del(t.tree, oldKey)
         }
-        let enc = encRow(&row)
+        let enc = encRowOf(t, &row)
         try txn.putRow(t.tree, key, enc, rowHead(&enc))
         try changeIndexes(st, txn, t, &old, &oldKey, &row, &key)
     }

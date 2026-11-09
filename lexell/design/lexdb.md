@@ -393,7 +393,7 @@ Built on 2026-11-09 on branch `lexdb`, about 6,300 lines in
 (cache, trees, transactions, log, checkpoints, recovery, snapshots),
 `lexdb_sql` (lexer, parser), `lexdb_exec` (catalog, rows, keys, planner,
 statements, sessions), `lexdb_wire` (protocol 3.0) and `lexdb` (the
-server). Tests: `python3 lexell/tests/lexdb.py` (42 programs in
+server). Tests: `python3 lexell/tests/lexdb.py` (43 programs in
 `tests/lexdb/run`, under `LXL_CHECK=1`).
 
     lexell/compiler/out/lxlc lexell/cmd/lexdb.lxl -o lexdb
@@ -589,7 +589,8 @@ is the comparison to make.
    (tight loops over arrays); measure that before deciding.
 13. ALTER (the user's request, 2026-11-09), in steps: (1) the actions that
    rewrite no row: ADD COLUMN, RENAME COLUMN, RENAME TO, SET and DROP NOT
-   NULL (built: 9.34); (2) DROP COLUMN; (3) ALTER COLUMN TYPE; (4) SET
+   NULL (built: 9.34); (2) DROP COLUMN (built: 9.35); (3) ALTER COLUMN
+   TYPE; (4) SET
    SCHEMA, ALTER INDEX ... RENAME, ALTER SCHEMA ... RENAME. Column
    defaults (and so ADD COLUMN ... DEFAULT) are a feature of their own.
 
@@ -2211,8 +2212,8 @@ columns too, which went unchecked.
 
 **Not supported yet**, each 0A000: constraints (ADD PRIMARY KEY, UNIQUE,
 CHECK, FOREIGN KEY: a unique index can be created), DEFAULT (no column
-defaults yet), ALTER INDEX. DROP COLUMN, ALTER COLUMN TYPE and SET SCHEMA
-are the next steps (9.4, item 13).
+defaults yet), ALTER INDEX. DROP COLUMN (built: 9.35), ALTER COLUMN TYPE
+and SET SCHEMA are the next steps (9.4, item 13).
 
 **Checked** by `exec_alter` and `wire_describe`. Planted, each caught:
 - a column added twice;
@@ -2230,3 +2231,58 @@ are the next steps (9.4, item 13).
 
 The renames to a taken name were not caught at first; the test now tries
 both.
+
+### 9.35 DROP COLUMN
+
+`DROP [COLUMN] [IF EXISTS] name [RESTRICT | CASCADE]`, one of ALTER
+TABLE's actions (with the others, separated by commas).
+
+**No row is rewritten.** As in PostgreSQL, a dropped column keeps its
+place in the stored rows. A table that has dropped a column has
+`Table.slots`, each column's place in a row, and `Table.width`, the
+places a row has; both are in its catalog row, after its indexes (a
+catalog row without them: column i at place i). Reads decode the places
+and give the columns (`rowOf`). The columns a query uses are mapped to
+places first (`placesNeeded`), so narrowed reads and large rows read in
+part work as before. Writes put each column at its place and NULL at a
+dropped one's (`encRowOf`), so a dropped value's space comes back as rows
+are written again. A column added after a drop takes a new place: a
+column added again under the dropped one's name is NULL in the old rows,
+not their old values. A table that never dropped a column has no slots
+and pays nothing.
+
+**What goes with it.** Indexes on the column, and filtered ones whose
+predicate names it, are dropped with it, as PostgreSQL's are; the others'
+column numbers, and the key's, move down. The key's own columns cannot be
+dropped (0A000): lexdb's tables need their key.
+
+**Cost**, on real files, 200,000 rows of five columns, one dropped: a
+scan's `sum` 53 to 57 ms, a filtered count 60 to 65 ms, a filter with
+no rows 67 to 69 ms. That is the mapping, an array a row.
+
+**Checked** by `exec_dropcol`: rows with long texts and short ones; each
+column read alone; reads through an index on a column after the dropped
+one, and backwards; the indexes dropped with it (their trees too) and
+those kept, a unique one still enforced; a column added again under the
+name; updates and inserts after the drop; a drop rolled back; two drops
+in one statement; a key after the dropped column; the key's column, a
+column that does not exist, IF EXISTS; after a reopen.
+
+Planted, each caught:
+- places not mapped to columns;
+- rows written by column, not place;
+- needed columns not mapped to places;
+- a column added after a drop at the dropped place;
+- the key's column not moved;
+- indexes' columns not moved;
+- an index on the column kept;
+- a predicate naming it kept;
+- places not saved;
+- the width not read back;
+- the key column dropped;
+- a dropped index's tree kept.
+
+The last was caught only after the test counted the store's trees.
+
+Not done: the places are never compacted (a table that drops and adds
+many columns keeps a NULL a place in each row written).
