@@ -1012,7 +1012,11 @@ fn (p: mut &P) createTable(): Result[Stmt, lexdb_base.DbErr] {
                     var u = newConstraint(C_UNIQUE, cn)
                     append(mut &u.cols, n)
                     append(mut &s.cons, u)
-                } else if p.isKw("check") || p.isKw("references") {
+                } else if p.acceptKw("check") {
+                    var ck = try p.checkTail(cn)
+                    append(mut &ck.cols, n)         // a column's: named for it
+                    append(mut &s.cons, ck)
+                } else if p.isKw("references") {
                     return Err(p.notYet())
                 } else if len(cn) > 0 {
                     return Err(near(&p.peek()))
@@ -1028,9 +1032,10 @@ fn (p: mut &P) createTable(): Result[Stmt, lexdb_base.DbErr] {
     return Ok(s)
 }
 
-// A table constraint, after [CONSTRAINT name]: UNIQUE (cols). (CHECK and
-// FOREIGN KEY come with 9.40 and 9.41.)
+// A table constraint, after [CONSTRAINT name]: UNIQUE (cols) or CHECK
+// (expr). (FOREIGN KEY comes with 9.41.)
 fn (p: mut &P) tableConstraint(name: str): Result[Constraint, lexdb_base.DbErr] {
+    if p.acceptKw("check") { return p.checkTail(name) }
     if p.acceptKw("unique") {
         var c = newConstraint(C_UNIQUE, name)
         try p.uniqueTail()
@@ -1052,9 +1057,27 @@ fn (p: mut &P) uniqueTail(): Result[Unit, lexdb_base.DbErr] {
     return Ok(Unit{})
 }
 
+// After CHECK: (expr) [NO INHERIT]. No subquery or parameter; NOT VALID is
+// not lexdb's (rows there are always checked).
+fn (p: mut &P) checkTail(name: str): Result[Constraint, lexdb_base.DbErr] {
+    var c = newConstraint(C_CHECK, name)
+    try p.expectKw("(")
+    let subs = len(p.subs)
+    let params = p.params
+    c.expr = Some(try p.expr())
+    if len(p.subs) > subs { return Err(lexdb_base.err("0A000", "cannot use subquery in check constraint")) }
+    if p.params > params { return Err(lexdb_base.err("42P02", "there is no parameter $" + p.params.toStr())) }
+    try p.expectKw(")")
+    if p.acceptKw("no") { try p.expectKw("inherit") }
+    if p.isKw("not") && p.pos + 1 < len(p.toks) && p.toks[p.pos + 1].kind == T_IDENT && p.toks[p.pos + 1].text == "valid" {
+        return Err(lexdb_base.err("0A000", "lexdb: NOT VALID is not supported (the rows there are checked)"))
+    }
+    return Ok(c)
+}
+
 fn (p: &P) notYet(): lexdb_base.DbErr {
-    if p.isKw("check") || p.isKw("foreign") || p.isKw("references") || p.isKw("exclude") {
-        return lexdb_base.err("0A000", "lexdb: CHECK constraints and foreign keys are not supported yet")
+    if p.isKw("foreign") || p.isKw("references") || p.isKw("exclude") {
+        return lexdb_base.err("0A000", "lexdb: foreign keys and EXCLUDE constraints are not supported yet")
     }
     return near(&p.peek())
 }

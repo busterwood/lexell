@@ -52,7 +52,11 @@ pub type Table = record {
     // [] when none has been: column i is at i.
     pub slots: []int
     pub width: int              // the places a row has (with slots)
+    pub checks: []Check         // CHECK constraints (9.40)
 }
+
+// A CHECK constraint: a row may not make expr false (column names bare).
+pub type Check = record { pub name: str; pub expr: Expr }
 
 // A result column: its name and type OID.
 pub type OutCol = value record { pub name: str; pub oid: int }
@@ -1420,12 +1424,13 @@ fn encTable(t: &Table): str {
     // defaults)
     var defs = false
     for c in t.cols { if c.def.isSome() || !isNull(&c.missing) { defs = true } }
-    if len(t.slots) > 0 || defs {
+    let checks = len(t.checks) > 0
+    if len(t.slots) > 0 || defs || checks {
         binary.addU32LE(mut &b, t.width)
         binary.addU32LE(mut &b, len(t.slots))
         for k in t.slots { binary.addU32LE(mut &b, k) }
     }
-    if defs {
+    if defs || checks {
         for c in t.cols {
             let missing = !isNull(&c.missing)
             b.addByte((if c.def.isSome() { 1 } else { 0 }) + (if missing { 2 } else { 0 }))
@@ -1444,11 +1449,22 @@ fn encTable(t: &Table): str {
             }
         }
     }
+    // then the checks
+    if checks {
+        binary.addU32LE(mut &b, len(t.checks))
+        for c in t.checks {
+            binary.addU32LE(mut &b, len(c.name))
+            b.add(c.name)
+            let text = lexdb_sql.exprText(&c.expr)
+            binary.addU32LE(mut &b, len(text))
+            b.add(text)
+        }
+    }
     return b.toStr()
 }
 
 fn decTable(name: str, s: &str): Result[Table, DbErr] {
-    var t = Table{name: name, tree: binary.readU32LEStr(s, 0), cols: [], pk: [], indexes: [], slots: [], width: 0}
+    var t = Table{name: name, tree: binary.readU32LEStr(s, 0), cols: [], pk: [], indexes: [], slots: [], width: 0, checks: []}
     let n = binary.readU32LEStr(s, 4)
     var at = 8
     for i in 0..n {
@@ -1522,6 +1538,21 @@ fn decTable(name: str, s: &str): Result[Table, DbErr] {
                 t.cols[i].missing = vs[0]
                 at += 4 + l
             }
+        }
+    }
+    if at + 4 <= len(s) {
+        let nc = binary.readU32LEStr(s, at)
+        at += 4
+        for i in 0..nc {
+            let l = binary.readU32LEStr(s, at)
+            let cn = s[at + 4..at + 4 + l]
+            at += 4 + l
+            let xl = binary.readU32LEStr(s, at)
+            match lexdb_sql.parseExpr(&s[at + 4..at + 4 + xl]) {
+                Ok(x) { append(mut &t.checks, Check{name: cn, expr: x}) }
+                Err(_) { return Err(lexdb_base.corrupt("check constraint \"" + cn + "\"")) }
+            }
+            at += 4 + xl
         }
     }
     return Ok(t)
@@ -2651,7 +2682,7 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
         for lv in q.levels {
             if lv.alias == f.alias { return Err(e("42712", "table name \"" + f.alias + "\" specified more than once")) }
         }
-        var t = Table{name: f.alias, tree: -1, cols: [], pk: [], indexes: [], slots: [], width: 0}
+        var t = Table{name: f.alias, tree: -1, cols: [], pk: [], indexes: [], slots: [], width: 0, checks: []}
         var lateral = false
         if f.sub >= 0 {
             sc.frames[me].hidden = !f.lateral
@@ -4072,7 +4103,7 @@ fn createTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
     if len(s.pk) == 0 {
         return Err(e("42P16", "lexdb: table \"" + base + "\" needs a PRIMARY KEY"))
     }
-    var t = Table{name: key, tree: 0, cols: [], pk: [], indexes: [], slots: [], width: 0}
+    var t = Table{name: key, tree: 0, cols: [], pk: [], indexes: [], slots: [], width: 0, checks: []}
     for c in s.cols {
         if colIndex(&t.cols, &c.name) >= 0 { return Err(e("42701", "column \"" + c.name + "\" specified more than once")) }
         var col = lexdb_sql.colDef(c.name, c.typ, c.notNull)
@@ -4238,6 +4269,15 @@ fn dropColumn(txn: mut &lexdb_store.Txn, t: mut &Table, i: int): Result[Unit, Db
         }
     }
     while len(rev) > 0 { append(mut &t.indexes, pop(mut &rev)) }
+    // the checks naming it go too (as PostgreSQL's do)
+    var k = 0
+    while k < len(t.checks) {
+        var ns: []str = []
+        colNames(&t.checks[k].expr, mut &ns)
+        var uses = false
+        for n in ns { if n == name { uses = true } }
+        if uses { let dropped = collections.removeAt(mut &t.checks, k) } else { k += 1 }
+    }
     return Ok(Unit{})
 }
 
@@ -4415,6 +4455,7 @@ fn retype(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, chan
             row[changes[k].col] = try coerce(try evalX(st, txn, &q, &xs[k], &env, mut &rs), &changes[k].typ)
         }
         try checkRow(t, &row)
+        try checkChecks(t, &row)
         let key = keyOf(t, &row)
         if (try st.get(txn, t.tree, key)).isSome() { return Err(dupKey(t, &row)) }
         let enc = encRowOf(t, &row)
@@ -4548,6 +4589,7 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
                     }
                     if renamed.isSome() { t.indexes[k].pred = renamed }
                 }
+                for k in 0..len(t.checks) { t.checks[k].expr = renameCol(&t.checks[k].expr, &a.name, &a.to) }
             } else if a.kind == lexdb_sql.A_SET_NOT_NULL {
                 let nulls = !t.cols[i].notNull && try anyRow(st, txn, &t, i)
                 if nulls {
@@ -4716,7 +4758,9 @@ fn addIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, ix
 
 // A name PostgreSQL's way: table, columns and a suffix joined by "_", cut
 // to 63 bytes, a number added while the name is taken in the schema.
-fn makeName(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, cols: &[]str, suffix: &str): Result[str, DbErr] {
+// A CHECK's name need only be free among the table's constraints (rel
+// false): it is not a relation.
+fn makeName(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, cols: &[]str, suffix: &str, rel: bool): Result[str, DbErr] {
     var parts = [lexdb_sql.baseName(&t.name)]
     for c in cols { append(mut &parts, c) }
     var base = strings.join(&parts, "_")
@@ -4725,7 +4769,8 @@ fn makeName(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, cols: 
     var n = 0
     while true {
         let name = base + "_" + suffix + (if n == 0 { "" } else { n.toStr() })
-        if !(try relExists(st, txn, &lexdb_sql.qual(&sc, &name))) && !hasConName(t, &name) { return Ok(name) }
+        let taken = rel && try relExists(st, txn, &lexdb_sql.qual(&sc, &name))
+        if !taken && !hasConName(t, &name) { return Ok(name) }
         n += 1
     }
     return Ok("")
@@ -4733,12 +4778,14 @@ fn makeName(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, cols: 
 
 fn hasConName(t: &Table, name: &str): bool {
     for ix in t.indexes { if ix.con && lexdb_sql.baseName(&ix.name) == name { return true } }
+    for c in t.checks { if c.name == name { return true } }
     return false
 }
 
 // Adds constraint c to table t (its rows checked against it).
 fn addConstraint(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, c: &lexdb_sql.Constraint): Result[Unit, DbErr] {
-    if c.kind != lexdb_sql.C_UNIQUE { return Err(e("0A000", "lexdb: CHECK constraints and foreign keys are not supported yet")) }
+    if c.kind == lexdb_sql.C_CHECK { return addCheck(st, txn, t, c) }
+    if c.kind != lexdb_sql.C_UNIQUE { return Err(e("0A000", "lexdb: foreign keys are not supported yet")) }
     var cols: []int = []
     for n in c.cols {
         let i = colIndex(&t.cols, &n)
@@ -4747,7 +4794,7 @@ fn addConstraint(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Tabl
         append(mut &cols, i)
     }
     var name = c.name
-    if len(name) == 0 { name = try makeName(st, txn, t, &c.cols, &"key") }
+    if len(name) == 0 { name = try makeName(st, txn, t, &c.cols, &"key", true) }
     let key = lexdb_sql.qual(&lexdb_sql.schemaOf(&t.name), &name)
     if hasConName(t, &name) { return Err(e("42710", "constraint \"" + name + "\" for relation \"" + lexdb_sql.baseName(&t.name) + "\" already exists")) }
     if try relExists(st, txn, &key) { return Err(e("42P07", "relation \"" + name + "\" already exists")) }
@@ -4755,8 +4802,97 @@ fn addConstraint(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Tabl
     return addIndex(st, txn, t, ix)
 }
 
+// ---- CHECK constraints (9.40)
+
+// Adds a CHECK to table t, the rows there checked. Its columns must be
+// t's; no aggregate (a subquery or parameter the parser refused).
+fn addCheck(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, c: &lexdb_sql.Constraint): Result[Unit, DbErr] {
+    let x = match c.expr {
+        Some(v) { clone(&v) }
+        None { Expr.Lit(Val.Bool(true)) }
+    }
+    var ns: []str = []
+    colNames(&x, mut &ns)
+    var refs: []str = []
+    for n in ns {
+        if colIndex(&t.cols, &n) < 0 { return Err(e("42703", "column \"" + n + "\" does not exist")) }
+        var seen = false
+        for r in refs { if r == n { seen = true } }
+        if !seen { append(mut &refs, n) }
+    }
+    if hasAgg(&x) { return Err(e("42803", "aggregate functions are not allowed in check constraints")) }
+    var name = c.name
+    if len(name) == 0 {
+        // a column's is named for it, a table's for its one column, or none
+        let none: []str = []
+        let named = if len(c.cols) > 0 { &c.cols } else if len(refs) == 1 { &refs } else { &none }
+        name = try makeName(st, txn, t, named, &"check", false)
+    }
+    if hasConName(t, &name) { return Err(e("42710", "constraint \"" + name + "\" for relation \"" + lexdb_sql.baseName(&t.name) + "\" already exists")) }
+    let ck = Check{name: name, expr: x}
+    // Not a boolean: tried on a row of zeros ('' and false), as there is
+    // no type of an expression without a row (an error then is let be:
+    // a division by the zero).
+    var zeros: []Val = []
+    for col in t.cols {
+        let k = col.typ.kind
+        append(mut &zeros, if k == lexdb_sql.K_INT { Val.Int(0) } else if k == lexdb_sql.K_BOOL { Val.Bool(false) }
+                           else if k == lexdb_sql.K_NUM { Val.Num(Decimal.zero()) } else if k == lexdb_sql.K_ARRAY { Val.Text("{}") } else { Val.Text("") })
+    }
+    match passes(t, &ck, &zeros) {
+        Ok(_) {}
+        Err(bad) { if bad.state == "42804" { return Err(bad) } }
+    }
+    // the rows there
+    let path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: []}
+    let sc = Scan{empty: false, point: false, lo: "", hi: "", whole: false}
+    var cur = newCursor()
+    while !cur.done {
+        var batch: [][]Val = []
+        let all: []bool = []
+        try fetch(st, txn, t, &path, &sc, &all, mut &cur, mut &batch)
+        for r in batch {
+            if !(try passes(t, &ck, &r)) {
+                return Err(e("23514", "check constraint \"" + name + "\" of relation \"" + lexdb_sql.baseName(&t.name) + "\" is violated by some row"))
+            }
+        }
+    }
+    append(mut &t.checks, ck)
+    return Ok(Unit{})
+}
+
+// Whether row passes check c: true or NULL (as SQL's CHECK has it).
+fn passes(t: &Table, c: &Check, row: &[]Val): Result[bool, DbErr] {
+    let noAggs: []Val = []
+    let noParams: []Val = []
+    let noSubs: []SubRes = []
+    let env = Env{cols: &t.cols, row: row, aggs: &noAggs, params: &noParams, subs: &noSubs, cur: &noAggs}
+    let v = try eval(&c.expr, &env)
+    match v {
+        Val.Null { return Ok(true) }
+        Val.Bool(b) { return Ok(b) }
+        else { return Err(e("42804", "argument of CHECK must be type boolean")) }
+    }
+}
+
+// A row to be written, against table t's checks.
+fn checkChecks(t: &Table, row: &[]Val): Result[Unit, DbErr] {
+    for c in t.checks {
+        if !(try passes(t, &c, row)) {
+            return Err(e("23514", "new row for relation \"" + lexdb_sql.baseName(&t.name) + "\" violates check constraint \"" + c.name + "\""))
+        }
+    }
+    return Ok(Unit{})
+}
+
 // Drops table t's constraint named name: false when it has none.
 fn dropConstraint(txn: mut &lexdb_store.Txn, t: mut &Table, name: &str): bool {
+    for k in 0..len(t.checks) {
+        if t.checks[k].name == name {
+            let gone = collections.removeAt(mut &t.checks, k)
+            return true
+        }
+    }
     for k in 0..len(t.indexes) {
         if t.indexes[k].con && lexdb_sql.baseName(&t.indexes[k].name) == name {
             let ix = collections.removeAt(mut &t.indexes, k)
@@ -4899,6 +5035,7 @@ fn insertOne(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, targe
         row[ci] = try coerce(vs[k], &t.cols[ci].typ)
     }
     try checkRow(t, &row)
+    try checkChecks(t, &row)
     let key = keyOf(t, &row)
     if (try st.get(txn, t.tree, key)).isSome() { return Err(dupKey(t, &row)) }
     let enc = encRowOf(t, &row)
@@ -4945,6 +5082,7 @@ fn update(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
             else { row[targets[k]] = try coerce(try evalX(st, txn, &q, &sets[k], &env, mut &rs), &t.cols[targets[k]].typ) }
         }
         try checkRow(t, &row)
+        try checkChecks(t, &row)
         let oldKey = keyOf(t, &old)
         let key = keyOf(t, &row)
         if key != oldKey {

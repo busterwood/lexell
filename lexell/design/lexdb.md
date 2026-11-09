@@ -393,7 +393,7 @@ Built on 2026-11-09 on branch `lexdb`, about 6,300 lines in
 (cache, trees, transactions, log, checkpoints, recovery, snapshots),
 `lexdb_sql` (lexer, parser), `lexdb_exec` (catalog, rows, keys, planner,
 statements, sessions), `lexdb_wire` (protocol 3.0) and `lexdb` (the
-server). Tests: `python3 lexell/tests/lexdb.py` (47 programs in
+server). Tests: `python3 lexell/tests/lexdb.py` (48 programs in
 `tests/lexdb/run`, under `LXL_CHECK=1`).
 
     lexell/compiler/out/lxlc lexell/cmd/lexdb.lxl -o lexdb
@@ -593,7 +593,7 @@ is the comparison to make.
    SCHEMA, ALTER INDEX ... RENAME, ALTER SCHEMA ... RENAME. Column
    defaults, ADD COLUMN ... DEFAULT among them, are built (9.38).
 14. Constraints (the user's request, 2026-11-09), in steps: (1) UNIQUE
-   (built: 9.39); (2) CHECK; (3) FOREIGN KEY, with its ON DELETE and ON
+   (built: 9.39); (2) CHECK (built: 9.40); (3) FOREIGN KEY, with its ON DELETE and ON
    UPDATE actions.
 
 ### 9.5 Indexes and joins (D4)
@@ -2541,3 +2541,72 @@ Planted, each caught:
 - CREATE's constraints dropped;
 - rows not checked when added;
 - a constraint name given twice.
+
+### 9.40 CHECK constraints
+
+**Where.**
+- In CREATE TABLE: `CHECK (expr)` on a column or among the columns, either
+  after `CONSTRAINT name`.
+- `ALTER TABLE ADD [CONSTRAINT name] CHECK (expr)`; DROP CONSTRAINT (9.39).
+
+`NO INHERIT` is accepted (there is no inheritance). `NOT VALID` is 0A000:
+the rows there are always checked.
+
+**The rule is SQL's: a row passes unless the expression is false.** NULL
+passes. Every row written is checked (`checkChecks`): INSERT (VALUES,
+SELECT, DEFAULT VALUES), UPDATE, and a type change's rewrite. A violation
+is 23514 "new row for relation ... violates check constraint ...".
+ADD CHECK reads the rows there first (23514 "... is violated by some
+row").
+
+**When made**, refused:
+- a column not the table's (42703);
+- a subquery (0A000) or a parameter (42P02), by the parser;
+- an aggregate (42803);
+- an expression not boolean (42804). There is no type of an expression
+  without a row, so it is evaluated on a row of zeros ('' for text,
+  false, 0); errors other than 42804 there are let be.
+
+**Names** are made as PostgreSQL makes them (`makeName`): a column's check
+is `t_col_check`; a table's is named for its column when it names one, and
+is `t_check` otherwise. A number is added while the name is another
+constraint's of the table. A check is not a relation, so relations' names
+do not count.
+
+**Kept** in the table's catalog row, after the defaults section: a count,
+then each check's name and expression text (`exprText`, parsed again on
+reading). RENAME COLUMN renames in it. DROP COLUMN drops the checks naming
+the column, as PostgreSQL does.
+
+**Cost.** Each check is evaluated by walking its expression for each row.
+100K rows in 1000-row INSERTs into a real file: 439 ms without checks,
+550 ms with three (about 0.4 µs per check per row; parsing the VALUES is
+the larger cost). One-row statements: 3%, the commit's fdatasync being
+most of it.
+
+Measuring this first ran on the simulated disk, which took 45 ms per
+commit whatever the rows. Its flush copies the whole file, one byte at a
+time, to model what a crash keeps. Benchmarks must use a real file.
+
+**Checked** by `exec_check`:
+- each kind of check violated (a column's, a named one, a table's, a
+  function, IN, OR);
+- NULL passing;
+- names made and their numbers;
+- INSERT ... SELECT, DEFAULT VALUES, UPDATE (the row unchanged);
+- ADD over violating rows and then without;
+- DROP CONSTRAINT;
+- errors when made;
+- RENAME COLUMN, DROP COLUMN, a type change;
+- a rollback, and a reopen.
+
+Planted, each caught:
+- INSERT, UPDATE or the rewrite not checked;
+- NULL failing;
+- the rows there not checked;
+- checks not saved;
+- RENAME COLUMN or DROP COLUMN leaving checks;
+- check names not compared;
+- a table's one-column check named `t_check`;
+- an unknown column, an aggregate or a non-boolean allowed;
+- DROP CONSTRAINT doing nothing.

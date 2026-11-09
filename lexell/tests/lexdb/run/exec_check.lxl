@@ -1,0 +1,109 @@
+// lexdb_exec: CHECK constraints (design/lexdb.md 9.40). On a column and on
+// the table, named or not; INSERT (VALUES, SELECT, DEFAULT VALUES) and
+// UPDATE checked, NULL passing; ALTER TABLE ADD CHECK over the rows there;
+// DROP CONSTRAINT; what DROP COLUMN, RENAME COLUMN and a type change do;
+// errors when made; rolled back; after a reopen.
+// expect: created: CREATE TABLE
+// expect: violations: 23514 new row for relation "p" violates check constraint "p_price_check"; "qty_pos" "p_check" "p_code_check" "p_status_check" "p_either_check"
+// expect: NULL passes: INSERT 0 1
+// expect: names: ALTER TABLE 42704, the column's kept: "p_lo_check"
+// expect: by SELECT: "p_price_check"; by DEFAULT VALUES: "d_x_check"
+// expect: update: "qty_pos", the row as it was: 1|5
+// expect: added over rows: 23514 check constraint "q_v_check" of relation "q" is violated by some row; fixed: ALTER TABLE, then "q_v_check"
+// expect: dropped: ALTER TABLE, then INSERT 0 1
+// expect: made: 42703 0A000 42803 0A000 42804 42710
+// expect: rename column: ALTER TABLE, "r_a_check"; drop column: ALTER TABLE, its check 42704, INSERT 0 1
+// expect: type change: 23514, still 9.996
+// expect: rolled back: INSERT 0 1
+// expect: reopened: "p_price_check" "p_check", 42704
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if !r.hasRows { return r.tag }
+            var out: []str = []
+            for row in r.rows {
+                var vs: []str = []
+                for v in row { append(mut &vs, lexdb_exec.text(&v)) }
+                append(mut &out, strings.join(&vs, "|"))
+            }
+            return strings.join(&out, " ")
+        }
+        Err(e) { return e.state + " " + e.msg }
+    }
+}
+
+fn state(s: mut &lexdb_exec.Session, sql: &str): str { return q(s, sql)[0..5] }
+
+// A check violation's constraint, in quotes (anything else as it is).
+fn which(s: mut &lexdb_exec.Session, sql: &str): str {
+    let r = q(s, sql)
+    if !strings.startsWith(r, "23514") { return r }
+    let i = strings.indexOf(&r, "constraint \"", 0)
+    let j = strings.indexOf(&r, "\"", i + 12)
+    return r[i + 11..j + 1]
+}
+
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: 256 * 1024, segBytes: 1024 * 1024, ckptBytes: 512 * 1024, snapNodes: 100000}
+}
+
+fn main() {
+    let fs = lexdb_disk.sim(40)
+    lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        println("created: " + q(mut &s, &"create table p (id int primary key, price numeric check (price > 0), qty int constraint qty_pos check (qty >= 0), lo int check (lo > -100), hi int, code text check (length(code) = 3), status text check (status in ('a', 'b')), x int, y int, check (lo <= hi), check (lo > -100), constraint p_either_check check (x is not null or y is not null))"))
+        let ok = q(mut &s, &"insert into p values (1, 1.5, 5, 1, 2, 'abc', 'a', 1, null)")
+        println("violations: " + q(mut &s, &"insert into p values (2, 0, 5, 1, 2, 'abc', 'a', 1, null)") + "; " +
+                which(mut &s, &"insert into p values (2, 1, -1, 1, 2, 'abc', 'a', 1, null)") + " " + which(mut &s, &"insert into p values (2, 1, 1, 3, 2, 'abc', 'a', 1, null)") + " " +
+                which(mut &s, &"insert into p values (2, 1, 1, 1, 2, 'ab', 'a', 1, null)") + " " + which(mut &s, &"insert into p values (2, 1, 1, 1, 2, 'abc', 'c', 1, null)") + " " +
+                which(mut &s, &"insert into p values (2, 1, 1, 1, 2, 'abc', 'a', null, null)"))
+        println("NULL passes: " + q(mut &s, &"insert into p values (3, null, null, null, null, null, null, 1, null)"))
+        // the column's and the table's one-column check on lo: the second is lo_check1
+        let n1 = q(mut &s, &"alter table p drop constraint p_lo_check1")
+        let n2 = state(mut &s, &"alter table p drop constraint p_lo_check2")
+        println("names: " + n1 + " " + n2 + ", the column's kept: " + which(mut &s, &"insert into p values (2, 1, 1, -200, 2, 'abc', 'a', 1, null)"))
+        println("by SELECT: " + which(mut &s, &"insert into p (id, price, x) select id + 10, price - 2, 1 from p where id = 1") + "; by DEFAULT VALUES: " +
+                which(mut &s, &"create table d (id int primary key default 1, x int default 0 check (x > 0)); insert into d default values"))
+        println("update: " + which(mut &s, &"update p set qty = qty - 10 where id = 1") + ", the row as it was: " + q(mut &s, &"select id, qty from p where id = 1"))
+
+        let c2 = q(mut &s, &"create table q (id int primary key, v int)")
+        let i2 = q(mut &s, &"insert into q values (1, 5), (2, -5)")
+        let a1 = q(mut &s, &"alter table q add check (v > 0)")
+        let u1 = q(mut &s, &"update q set v = 5 where id = 2")
+        let a2 = q(mut &s, &"alter table q add check (v > 0)")
+        println("added over rows: " + a1 + "; fixed: " + a2 + ", then " + which(mut &s, &"insert into q values (3, -1)"))
+        println("dropped: " + q(mut &s, &"alter table q drop constraint q_v_check") + ", then " + q(mut &s, &"insert into q values (3, -1)"))
+        println("made: " + state(mut &s, &"create table e1 (id int primary key, check (zz > 0))") + " " + state(mut &s, &"create table e2 (id int primary key, check (id > (select 1)))") + " " +
+                state(mut &s, &"create table e3 (id int primary key, check (count(*) > 0))") + " " + state(mut &s, &"alter table q add check (v > 0) not valid") + " " +
+                state(mut &s, &"create table e5 (id int primary key, check (id + 1))") + " " + state(mut &s, &"alter table q add constraint q_pkey2 check (v > -10), add constraint q_pkey2 check (v > -20)"))
+
+        let c3 = q(mut &s, &"create table r (id int primary key, a int check (a > 0), b int check (b > 0))")
+        let rn = q(mut &s, &"alter table r rename column a to aa")
+        println("rename column: " + rn + ", " + which(mut &s, &"insert into r values (1, 0, 1)") + "; drop column: " + q(mut &s, &"alter table r drop column b") +
+                ", its check " + state(mut &s, &"alter table r drop constraint r_b_check") + ", " + q(mut &s, &"insert into r values (2, 1)"))
+
+        let c4 = q(mut &s, &"create table m (id int primary key, m numeric(6,3) check (m < 10))")
+        let i4 = q(mut &s, &"insert into m values (1, 9.996)")
+        println("type change: " + state(mut &s, &"alter table m alter m type numeric(5,2)") + ", still " + q(mut &s, &"select m from m"))
+
+        let bg = q(mut &s, &"begin")
+        let ab = q(mut &s, &"alter table q add constraint q_big check (v > 100)")
+        let rb = q(mut &s, &"rollback")
+        println("rolled back: " + q(mut &s, &"insert into q values (4, 1)"))
+        return 0
+    }).unwrap()
+
+    lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int {
+        var s = lexdb_exec.newSession(st)
+        println("reopened: " + which(mut &s, &"insert into p values (9, -1, 1, 1, 2, 'abc', 'a', 1, null)") + " " +
+                which(mut &s, &"insert into p values (9, 1, 1, 3, 2, 'abc', 'a', 1, null)") + ", " + state(mut &s, &"alter table p drop constraint p_lo_check1"))
+        return 0
+    }).unwrap()
+}
