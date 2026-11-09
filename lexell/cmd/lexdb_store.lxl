@@ -536,7 +536,7 @@ fn nodeSize(n: &lexdb_page.Node): int {
 }
 
 // Splits an oversized node; the new right node's slot and separator.
-fn (db: mut &Db) split(s: int): Descent {
+fn (db: mut &Db) split(s: int, atEnd: bool): Descent {
     db.willChange(s)
     let leaf = db.nodes[s].leaf
     let total = db.nodes[s].size
@@ -552,6 +552,7 @@ fn (db: mut &Db) split(s: int): Descent {
             acc += e
             m += 1
         }
+        if atEnd && n >= 2 { m = n - 1 }        // the left stays full: only the new entry goes right
         for i in m..n {
             append(mut &right.keys, db.nodes[s].keys[i])
             append(mut &right.vals, db.nodes[s].vals[i])
@@ -570,6 +571,7 @@ fn (db: mut &Db) split(s: int): Descent {
             acc += e
             m += 1
         }
+        if atEnd && n >= 3 { m = n - 2 }        // the left stays full: the last two children go right
         // keys[m] goes up; keys after it and kids after m go right
         sep = lexdb_base.own(&db.nodes[s].keys[m])
         for i in m + 1..n { append(mut &right.keys, db.nodes[s].keys[i]) }
@@ -590,12 +592,13 @@ fn (db: mut &Db) split(s: int): Descent {
 
 // After path[j] grew past a page, split it and the parents that overflow
 // in turn; a split root gets a new root above it.
-fn (db: mut &Db) fixOverflow(tree: int, path: &[]int, from: int) {
+fn (db: mut &Db) fixOverflow(tree: int, path: &[]int, from: int, atEnd: bool) {
     var j = from
+    var end = atEnd
     while j >= 0 {
         let s = path[j]
         if db.nodes[s].size <= lexdb_page.NODE_ROOM { return }
-        let sp = db.split(s)
+        let sp = db.split(s, end)
         let r = sp.path[0]
         if j == 0 {
             let root = lexdb_page.Node{leaf: false, keys: [sp.upper], vals: [], kids: [s, r], size: 0, packed: false}
@@ -614,6 +617,7 @@ fn (db: mut &Db) fixOverflow(tree: int, path: &[]int, from: int) {
         while db.nodes[p].kids[at] != s { at += 1 }
         collections.insert(mut &db.nodes[p].keys, at, sp.upper)
         collections.insert(mut &db.nodes[p].kids, at + 1, r)
+        end = end && at + 2 == len(db.nodes[p].kids)     // the new child is the parent's last
         db.nodes[p].size += lexdb_page.kidEntry(&sp.upper)
         db.meta[p].version += 1
         db.nodes[p].packed = false
@@ -629,6 +633,11 @@ fn (db: mut &Db) applyPut(tree: int, key: &str, val: &str) {
     let leaf = d.path[len(d.path) - 1]
     db.willChange(leaf)
     let i = lowerIndex(&db.nodes[leaf].keys, key)
+    // A key past every key in the tree (the rightmost leaf, at its end): an
+    // ascending load. Its splits leave the left node full, not half (as
+    // PostgreSQL's rightmost split and SQLite's quick balance do): a table
+    // loaded in key order then takes half the pages.
+    let atEnd = !d.hasUpper && i == len(db.nodes[leaf].keys)
     if i < len(db.nodes[leaf].keys) && db.nodes[leaf].keys[i] == key {
         db.nodes[leaf].size += len(val) - len(db.nodes[leaf].vals[i])
         db.nodes[leaf].vals[i] = val
@@ -640,7 +649,7 @@ fn (db: mut &Db) applyPut(tree: int, key: &str, val: &str) {
     db.meta[leaf].version += 1
     db.nodes[leaf].packed = false
     db.recost(leaf)
-    db.fixOverflow(tree, &d.path, len(d.path) - 1)
+    db.fixOverflow(tree, &d.path, len(d.path) - 1, atEnd)
 }
 
 fn (db: mut &Db) applyDel(tree: int, key: &str) {

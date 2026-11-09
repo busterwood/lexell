@@ -393,7 +393,7 @@ Built on 2026-11-09 on branch `lexdb`, about 6,300 lines in
 (cache, trees, transactions, log, checkpoints, recovery, snapshots),
 `lexdb_sql` (lexer, parser), `lexdb_exec` (catalog, rows, keys, planner,
 statements, sessions), `lexdb_wire` (protocol 3.0) and `lexdb` (the
-server). Tests: `python3 lexell/tests/lexdb.py` (24 programs in
+server). Tests: `python3 lexell/tests/lexdb.py` (25 programs in
 `tests/lexdb/run`, under `LXL_CHECK=1`).
 
     lexell/compiler/out/lxlc lexell/cmd/lexdb.lxl -o lexdb
@@ -1140,4 +1140,41 @@ spinning on other cores. Even all in cache, the sockets cost 10 us of
 system calls per select, a third of it. An event loop built on io_uring
 for sockets too could batch those across sessions. Either is a runtime
 change, so it is the user's decision.
+
+**Ascending loads fill their pages.** After those fixes, at 128 MB (the
+default cache) a select still read 1.4 pages: the inner nodes did not fit.
+Counted: 3,900 of them held 121 of the 128 MB (32.5 KB each, about two
+thirds of it the 200 bytes kept per child: 9.4), and still 28% of loads
+were inner nodes. And the 10 million rows (1.35 GB of entries) took a
+2.9 GB file: every split cut a node in half, so a load in key order left
+every page half full for good. A clock count for inner nodes (as
+PostgreSQL's usage count) was tried first and changed nothing: the inner
+nodes did not fit at all.
+
+Now an insert past every key in the tree (the rightmost leaf, at its end)
+splits leaving the left node full: one entry goes right. Up the tree the
+same holds while the new child is its parent's last, where the last two
+children go right. These are PostgreSQL's rightmost split and SQLite's
+quick balance. Other inserts split in half as before.
+
+| 10 million rows loaded in key order | before | after |
+|---|---:|---:|
+| data file | 2,815 MB | 1,401 MB |
+| load (psql, 2,000-row INSERTs) | 135 s | 94 s |
+| random point selects, 64 MB cache | 14,000/s, 1.72 reads each | 15,200/s, 1.41 reads each |
+| the same, 128 MB cache | 14,600/s, 1.40 reads each | 19,200/s, 1.00 reads each |
+
+`store_fill` loads 40,000 entries of about 100 bytes in three orders and
+checks that each reads back whole, forward, backward and by key. Fill:
+ascending 98%, descending 51%, random 68% (the textbook 69% for random
+inserts). Caught: no end detection, and a leaf split that ignores it
+(both 49%). Not caught: the rule applied at the end of any leaf, not only
+the rightmost, which changes nothing measurable (random 67%). Nor the
+inner-level rule, whose pages are 1% of the total; checked by hand
+instead: 961 pages in use against 964 without it.
+
+Next for the cache: the placeholders. An unloaded child keeps a slot of
+about 230 bytes (measured: an empty `Node` record 118, `SlotMeta` 85, the
+history list 24). With `Option[Node]` (`None` is a null pointer, 8 bytes)
+and the history kept only for slots that have some, it would be about 90.
 

@@ -1,0 +1,96 @@
+// lexdb_store: how full a load leaves the pages. 40,000 entries of about
+// 100 bytes (about 1,000 leaves under two levels of inner nodes), loaded in
+// ascending, descending and random order into a fresh store each, then a
+// checkpoint: fill is the entries' bytes over the pages in use. An
+// ascending load (every key past the tree's last) splits leaving the left
+// node full, leaves and inner nodes alike, so it fills its pages; the other
+// orders split in half. Each tree reads back whole, forward, backward and
+// by key.
+// expect: ascending: fill over 90% true, contents ok true
+// expect: descending: fill over 45% true, contents ok true
+// expect: random: fill over 60% true, under 90% true, contents ok true
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_page"
+import "../../../cmd/lexdb_base"
+
+const N: int = 40000
+
+fn key(i: int): str { return "k" + strings.padLeft(i.toStr(), 6, '0') }
+fn val(i: int): str { return "v" + i.toStr() + strings.repeat("x", 80) }
+
+// order 0 ascending, 1 descending, 2 random: (fill in percent, contents ok)
+fn load(order: int): str {
+    var ids: []int = []
+    for i in 0..N { append(mut &ids, if order == 1 { N - 1 - i } else { i }) }
+    if order == 2 {
+        var r = lexdb_base.rng(7)
+        var i = N - 1
+        while i > 0 {
+            let j = int(r.next() % u64(i + 1))
+            let t = ids[i]
+            ids[i] = ids[j]
+            ids[j] = t
+            i -= 1
+        }
+    }
+    var out = ""
+    lexdb_store.run(lexdb_disk.sim(11 + order), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 4 * 1024 * 1024, ckptBytes: 64 * 1024 * 1024, snapNodes: 100000}, fn(st: lexdb_store.Store): int {
+        var t0 = lexdb_store.begin()
+        let tree = st.createTree(mut &t0)
+        st.commit(t0).unwrap()
+        var bytes = 0
+        var b = 0
+        while b < N {
+            var t = lexdb_store.begin()
+            for k in b..b + 1000 {
+                t.put(tree, key(ids[k]), val(ids[k])).unwrap()
+                bytes += lexdb_page.leafEntry(&key(ids[k]), &val(ids[k]))
+            }
+            st.commit(t).unwrap()
+            b += 1000
+        }
+        st.checkpointAll().unwrap()
+        let s = st.stats()
+        let fill = bytes * 100 / ((s.pages - s.free) * lexdb_page.NODE_ROOM)
+        var ok = true
+        var n = 0
+        var t = lexdb_store.begin()
+        st.scan(mut &t, tree, "", "", fn(e: &lexdb_store.Entry): bool {
+            if e.key != key(n) || e.val != val(n) { ok = false }
+            n += 1
+            return true
+        }).unwrap()
+        var m = N
+        st.scanBack(mut &t, tree, "", "", fn(e: &lexdb_store.Entry): bool {
+            m -= 1
+            if e.key != key(m) { ok = false }
+            return true
+        }).unwrap()
+        for i in 0..200 {
+            let k = (i * 197) % N
+            if st.get(mut &t, tree, key(k)).unwrap() != Some(val(k)) { ok = false }
+        }
+        ok = ok && n == N && m == 0
+        out = fill.toStr() + " " + ok.toStr()
+        return 0
+    }).unwrap()
+    return out
+}
+
+fn main() {
+    let la = load(0)
+    let ld = load(1)
+    let lr = load(2)
+    let a = strings.split(&la, " ")
+    let d = strings.split(&ld, " ")
+    let r = strings.split(&lr, " ")
+    let fa = strings.parseIntOpt(a[0]).unwrapOr(0)
+    let fd = strings.parseIntOpt(d[0]).unwrapOr(0)
+    let fr = strings.parseIntOpt(r[0]).unwrapOr(0)
+    eprintln("fill: ascending " + fa.toStr() + "%, descending " + fd.toStr() + "%, random " + fr.toStr() + "%")
+    println("ascending: fill over 90% " + (fa > 90).toStr() + ", contents ok " + a[1])
+    println("descending: fill over 45% " + (fd > 45).toStr() + ", contents ok " + d[1])
+    println("random: fill over 60% " + (fr > 60).toStr() + ", under 90% " + (fr < 90).toStr() + ", contents ok " + r[1])
+}
