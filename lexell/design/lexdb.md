@@ -392,7 +392,7 @@ Built on 2026-11-09 on branch `lexdb`, about 6,300 lines in
 (cache, trees, transactions, log, checkpoints, recovery, snapshots),
 `lexdb_sql` (lexer, parser), `lexdb_exec` (catalog, rows, keys, planner,
 statements, sessions), `lexdb_wire` (protocol 3.0) and `lexdb` (the
-server). Tests: `python3 lexell/tests/lexdb.py` (17 programs in
+server). Tests: `python3 lexell/tests/lexdb.py` (18 programs in
 `tests/lexdb/run`, under `LXL_CHECK=1`).
 
     lexell/compiler/out/lxlc lexell/cmd/lexdb.lxl -o lexdb
@@ -426,8 +426,7 @@ server). Tests: `python3 lexell/tests/lexdb.py` (17 programs in
   statement waits, after it runs, until what it read is durable, since its
   result goes out before COMMIT (4.4).
 - **Interpreted, not bytecode.** The executor walks the statement's tree.
-- **No subqueries, schemas, LIKE, IN lists, BETWEEN, CASE, bytea, dates or
-  times yet.**
+- **No subqueries, CTEs, schemas, bytea, dates or times yet.**
 - **Trust login**: no password, no TLS. The server listens on loopback by
   default.
 - **A simple query with several statements** runs each in its own
@@ -489,6 +488,16 @@ defaults (`LXL_HELPERS=32`), 5 s runs, one run each:
 | BEGIN READ ONLY, two 100-row aggregates, COMMIT, beside 16 writers | 8 | 2,266 | 3.5 ms |
 | (the 16 writers meanwhile) | 16 | 3,481 | 4.6 ms |
 
+Size and memory (2026-11-09, the native backend): the binary is 993 KB
+(773 KB through C), linking only libc. Resident memory: 4.0 MB at a fresh
+start (33 threads: the main one and 32 I/O helpers); 6 MB with the
+10,000-row table; 8.7 MB under 32 writing and 8 reading clients; 111 MB
+after inserting 300,000 rows of about 80 bytes (a 34 MB data file), 112 MB
+after a full scan and a 1,000-group GROUP BY over them. Restarted on that
+database: 26 MB idle, 63 MB after a full scan. Memory is the cache, which
+grows as pages are read and is not given back; a query's own memory is
+small (rows stream in batches; groups keep running totals).
+
 One client is close to the drive's flush (about 1 ms, section 3); more
 clients share flushes (group commit). No run had a failed transaction.
 These are first numbers, not a comparison: PostgreSQL on the same machine
@@ -496,20 +505,27 @@ is the comparison to make.
 
 ### 9.4 Next
 
-1. Whole-server crash tests through the wire protocol.
-2. Plans kept per prepared statement: since D4 every execution resolves
-   names and chooses paths, and point selects fell from 26,700 to 23,800
-   tps (one run each).
-3. LIKE, IN lists, BETWEEN and CASE (common, and missing).
-4. Schemas (the user uses them extensively): `schema.table` names, the
+1. Subqueries and CTEs (the user needs them soon): uncorrelated
+   `IN (SELECT ...)` and scalar subqueries; correlated `EXISTS` and
+   `NOT EXISTS` as semi-joins and anti-joins in the join levels; `WITH`
+   as named subqueries, then `WITH RECURSIVE`.
+2. The cache budget in bytes, not nodes (measured in 9.3: decoded nodes
+   take 1.8 to 3.3 times their page, so the default of 100,000 nodes could
+   reach 0.7 to 1.5 GB), a smaller decoded node, and why a restarted server
+   idles at 26 MB.
+3. Schemas (the user uses them extensively): `schema.table` names, the
    catalog keyed by schema, `CREATE SCHEMA`/`DROP SCHEMA`, `search_path`,
    and three-part column names (`s.t.c`) in the resolver.
-5. COPY; then the cost questions (section 0), with EXPLAIN ANALYZE's
+4. Plans kept per prepared statement: since D4 every execution resolves
+   names and chooses paths, and point selects fell from 26,700 to about
+   24,000 tps.
+5. Whole-server crash tests through the wire protocol.
+6. COPY; then the cost questions (section 0), with EXPLAIN ANALYZE's
    counts as the evidence.
-6. Overflow pages for large rows; reclaiming a dropped table's pages.
-7. Authentication (SCRAM) and TLS, so the server can leave loopback.
-8. The checkpoint pause and the memory of decoded nodes, measured under a
-   large write load; io_uring if the helper pool is the limit (D5).
+7. Overflow pages for large rows; reclaiming a dropped table's pages.
+8. Authentication (SCRAM) and TLS, so the server can leave loopback.
+9. The checkpoint pause under a large write load; io_uring if the helper
+   pool is the limit (D5).
 
 ### 9.5 Indexes and joins (D4)
 
@@ -608,4 +624,23 @@ is the comparison to make.
   aggregates on the indexed and plain tables, DISTINCT with GROUP BY,
   FILTER with WHERE, and HAVING with the groups filtered in the test;
   ignoring DISTINCT (36 differ), FILTER (64) or HAVING (29) fails it.
+
+### 9.7 Operators and functions
+
+- `[NOT] LIKE` and `ILIKE` (ASCII case folding) with `ESCAPE`, matching by
+  character; `[NOT] IN (list)` with SQL's NULLs (no match and a NULL in
+  the list is NULL); `[NOT] BETWEEN`, parsed as two comparisons;
+  `IS [NOT] DISTINCT FROM`; `CASE`, both forms, evaluating only the branch
+  taken; nullif, greatest, least, concat, substr/substring, strpos, trim,
+  ltrim, rtrim, replace, left, right.
+- The planner reads an IN list on a key column as a lookup (or range) per
+  value, in key order, so ORDER BY and MIN/MAX still come from the scan;
+  `LIKE 'abc%'` on a text column as the range from 'abc' to 'abd'. A
+  bound too long for a varchar column matches nothing rather than failing.
+- `IN (SELECT ...)` says it is not supported yet (0A000).
+- Tests: `exec_ops`, checked by hand; `exec_index_diff` uses the new
+  operators in its random conditions and compares IN with a chain of ORs,
+  NOT IN with NOT of it, LIKE with substr and CASE buckets with FILTER
+  counts. Unsorted IN keys (6 differ), a LIKE bound past its prefix (5) and
+  an IN path taken for a full scan (11, a bug the test found) fail it.
 

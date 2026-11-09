@@ -293,7 +293,8 @@ fn (p: mut &P) expectKw(w: str): Result[Unit, lexdb_base.DbErr] {
 const RESERVED: []str = ["select", "from", "where", "group", "order", "by", "limit", "offset", "and", "or", "not", "is",
                   "null", "as", "values", "set", "into", "insert", "update", "delete", "create", "table",
                   "primary", "key", "asc", "desc", "true", "false", "cast", "on", "join", "inner", "left",
-                  "right", "full", "outer", "cross", "using", "natural", "having", "distinct"]
+                  "right", "full", "outer", "cross", "using", "natural", "having", "distinct", "in", "like", "ilike", "between",
+                  "case", "when", "then", "else", "end"]
 
 fn isReserved(w: &str): bool {
     for r in RESERVED { if r == w { return true } }
@@ -400,16 +401,56 @@ fn (p: mut &P) cmpExpr(): Result[Expr, lexdb_base.DbErr] {
         let op = if t.text == "!=" { "<>" } else { t.text }
         return Ok(Expr.Bin(op, e, r))
     }
+    // [NOT] LIKE, ILIKE, IN, BETWEEN
+    var neg = false
+    let nt = p.peekAt(1)
+    if p.isKw("not") && nt.kind == T_IDENT && (nt.text == "like" || nt.text == "ilike" || nt.text == "in" || nt.text == "between") {
+        p.pos += 1
+        neg = true
+    }
+    if p.isKw("like") || p.isKw("ilike") {
+        let kw = p.next().text
+        var args: []Expr = [e]
+        append(mut &args, try p.catExpr())
+        if p.acceptKw("escape") { append(mut &args, try p.catExpr()) }
+        return Ok(negate(neg, Expr.Call(kw, args, false)))
+    }
+    if p.acceptKw("in") {
+        try p.expectKw("(")
+        if p.isKw("select") || p.isKw("with") {
+            return Err(lexdb_base.err("0A000", "IN (SELECT ...) subqueries are not supported yet"))
+        }
+        var args: []Expr = [e]
+        append(mut &args, try p.expr())
+        while p.acceptKw(",") { append(mut &args, try p.expr()) }
+        try p.expectKw(")")
+        return Ok(negate(neg, Expr.Call("in", args, false)))
+    }
+    if p.acceptKw("between") {
+        // a BETWEEN b AND c is a >= b AND a <= c: the planner knows those
+        let lo = try p.catExpr()
+        try p.expectKw("and")
+        let hi = try p.catExpr()
+        let again = cloneE(&e)
+        return Ok(negate(neg, Expr.Bin("and", Expr.Bin(">=", e, lo), Expr.Bin("<=", again, hi))))
+    }
+    if neg { return Err(near(&p.peek())) }
     if p.acceptKw("is") {
-        let neg = p.acceptKw("not")
-        if p.acceptKw("null") { return Ok(Expr.IsNull(e, neg)) }
+        let isNot = p.acceptKw("not")
+        if p.acceptKw("distinct") {
+            try p.expectKw("from")
+            let r = try p.catExpr()
+            let d = Expr.Call("distinct from", [e, r], false)
+            return Ok(if isNot { Expr.Unary("not", d) } else { d })
+        }
+        if p.acceptKw("null") { return Ok(Expr.IsNull(e, isNot)) }
         if p.acceptKw("true") {
             let x = Expr.Bin("=", e, Expr.Lit(Val.Bool(true)))
-            return Ok(if neg { Expr.Unary("not", x) } else { x })
+            return Ok(if isNot { Expr.Unary("not", x) } else { x })
         }
         if p.acceptKw("false") {
             let x = Expr.Bin("=", e, Expr.Lit(Val.Bool(false)))
-            return Ok(if neg { Expr.Unary("not", x) } else { x })
+            return Ok(if isNot { Expr.Unary("not", x) } else { x })
         }
         return Err(near(&p.peek()))
     }
@@ -459,8 +500,51 @@ fn (p: mut &P) unary(): Result[Expr, lexdb_base.DbErr] {
     return Ok(e)
 }
 
+fn negate(neg: bool, x: Expr): Expr { return if neg { Expr.Unary("not", x) } else { x } }
+
+fn cloneE(x: &Expr): Expr {
+    match x {
+        Expr.Lit(v) { return Expr.Lit(v) }
+        Expr.Param(n) { return Expr.Param(n) }
+        Expr.Col(n) { return Expr.Col(n) }
+        Expr.Unary(op, a) { return Expr.Unary(op, cloneE(&a)) }
+        Expr.Bin(op, a, b) { return Expr.Bin(op, cloneE(&a), cloneE(&b)) }
+        Expr.IsNull(a, neg) { return Expr.IsNull(cloneE(&a), neg) }
+        Expr.Cast(a, t) { return Expr.Cast(cloneE(&a), t) }
+        Expr.Call(n, args, star) {
+            var out: []Expr = []
+            for a in args { append(mut &out, cloneE(&a)) }
+            return Expr.Call(n, out, star)
+        }
+    }
+}
+
+// CASE [x] WHEN a THEN b ... [ELSE c] END: a call "case" (or "case else")
+// of the WHEN and THEN pairs, then the ELSE; CASE x WHEN a is WHEN x = a.
+fn (p: mut &P) caseExpr(): Result[Expr, lexdb_base.DbErr] {
+    var operand: []Expr = []
+    if !p.isKw("when") { append(mut &operand, try p.expr()) }
+    var args: []Expr = []
+    while p.acceptKw("when") {
+        var w = try p.expr()
+        if len(operand) > 0 { w = Expr.Bin("=", cloneE(&operand[0]), w) }
+        try p.expectKw("then")
+        append(mut &args, w)
+        append(mut &args, try p.expr())
+    }
+    if len(args) == 0 { return Err(near(&p.peek())) }
+    var name = "case"
+    if p.acceptKw("else") {
+        append(mut &args, try p.expr())
+        name = "case else"
+    }
+    try p.expectKw("end")
+    return Ok(Expr.Call(name, args, false))
+}
+
 fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
     let t = p.next()
+    if t.kind == T_IDENT && t.text == "case" { return p.caseExpr() }
     if t.kind == T_NUM {
         if !strings.contains(&t.text, ".") && !strings.contains(&t.text, "e") && !strings.contains(&t.text, "E") {
             match strings.parseIntOpt(t.text) {
@@ -500,7 +584,9 @@ fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
             }
             else {}
         }
-        if isReserved(&t.text) { return Err(near(&t)) }
+        // left( and right( are functions, as in PostgreSQL
+        let fn2 = (t.text == "left" || t.text == "right") && p.isKw("(")
+        if isReserved(&t.text) && !fn2 { return Err(near(&t)) }
     }
     if t.kind == T_IDENT || t.kind == T_QIDENT {
         if p.isKw("(") && t.kind == T_IDENT {
@@ -917,6 +1003,27 @@ pub fn exprText(x: &Expr): str {
         Expr.IsNull(a, neg) { return "(" + exprText(&a) + (if neg { " is not null)" } else { " is null)" }) }
         Expr.Cast(a, t) { return "cast(" + exprText(&a) + " as " + typeText(&t) + ")" }
         Expr.Call(n, args, star) {
+            if n == "like" || n == "ilike" {
+                var out = "(" + exprText(&args[0]) + " " + n + " " + exprText(&args[1])
+                if len(args) > 2 { out = out + " escape " + exprText(&args[2]) }
+                return out + ")"
+            }
+            if n == "in" {
+                var parts: []str = []
+                for i in 1..len(args) { append(mut &parts, exprText(&args[i])) }
+                return "(" + exprText(&args[0]) + " in (" + strings.join(&parts, ", ") + "))"
+            }
+            if n == "distinct from" { return "(" + exprText(&args[0]) + " is distinct from " + exprText(&args[1]) + ")" }
+            if n == "case" || n == "case else" {
+                var out = "(case"
+                var i = 0
+                while i + 1 < len(args) {
+                    out = out + " when " + exprText(&args[i]) + " then " + exprText(&args[i + 1])
+                    i += 2
+                }
+                if n == "case else" { out = out + " else " + exprText(&args[len(args) - 1]) }
+                return out + " end)"
+            }
             // modifiers in the name: "count distinct filter"
             let words = strings.split(&n, " ")
             let base = words[0].toStr()

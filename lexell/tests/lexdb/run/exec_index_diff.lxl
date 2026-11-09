@@ -9,7 +9,7 @@
 // aggregated on the other; a RIGHT JOIN must equal the LEFT JOIN the other
 // way round, and a FULL JOIN the LEFT JOIN plus the other side's unmatched
 // rows.
-// expect: statements ok, queries 1204 differ 0, index paths used true, hash joins used true, index order used true, backward true, min/max true, filtered true
+// expect: statements ok, queries 1204 differ 0, index paths used true, hash joins used true, index order used true, backward true, min/max true, filtered true, in-lists true
 import "strings"
 import "collections"
 import "../../../cmd/lexdb_store"
@@ -64,7 +64,11 @@ fn zval(r: mut &lexdb_base.Rng): str {
 }
 
 fn cond(r: mut &lexdb_base.Rng): str {
-    return match r.below(14) {
+    return match r.below(18) {
+        14 { "x in (" + xval(r) + ", " + xval(r) + ", " + xval(r) + ")" }
+        15 { "x between " + xval(r) + " and " + xval(r) }
+        16 { "y like '" + ["a", "b", "c", "ce", "e", "f", "fi", "x", ""][r.below(9)] + "%'" }
+        17 { "x not in (" + xval(r) + ", " + xval(r) + ") and y like '%r%'" }
         11 { "x >= " + xval(r) + " and z < " + zval(r) }
         12 { "y = " + yval(r) + " and x = " + xval(r) + " and z > " + zval(r) }
         13 { "y > 'b' and x >= " + xval(r) }
@@ -104,6 +108,7 @@ fn body(st: lexdb_store.Store): int {
     var backward = false
     var firstValue = false
     var filtered = false
+    var inLists = false
     for round in 0..40 {
         // changes, the same to both pairs
         for k in 0..25 {
@@ -134,7 +139,7 @@ fn body(st: lexdb_store.Store): int {
             var sql = ""
             let c = cond(mut &r)
             let n = (r.below(9) + 1).toStr()
-            let j = r.below(16)
+            let j = r.below(19)
             var q1 = ""
             var q0 = ""
             var got1 = ""
@@ -193,6 +198,40 @@ fn body(st: lexdb_store.Store): int {
                     if len(parts) == 2 && strings.parseIntOpt(parts[1].toStr()).unwrapOr(0) > lim { append(mut &kept, line.toStr()) }
                 }
                 got0 = strings.join(&kept, ";")
+            } else if j == 16 {
+                // IN = a chain of ORs; NOT IN = NOT of it (NULLs alike)
+                let v1 = xval(mut &r)
+                let v2 = xval(mut &r)
+                let v3 = xval(mut &r)
+                let neg = if r.below(2) == 0 { "" } else { "not " }
+                q1 = "select id from a where " + neg + "x in (" + v1 + ", " + v2 + ", " + v3 + ") order by id"
+                q0 = "select id from a0 where " + neg + "(x = " + v1 + " or x = " + v2 + " or x = " + v3 + ") order by id"
+                got1 = rows(mut &s, &q1)
+                got0 = rows(mut &s, &q0)
+            } else if j == 17 {
+                // LIKE 'p%' = substr(y, 1, len) = 'p'
+                let pf = ["a", "b", "c", "ce", "e", "f", "fi", "x", "ash"][r.below(9)]
+                q1 = "select id from a where y like '" + pf + "%' order by id"
+                q0 = "select id from a0 where substr(y, 1, " + len(pf).toStr() + ") = '" + pf + "' order by id"
+                got1 = rows(mut &s, &q1)
+                got0 = rows(mut &s, &q0)
+            } else if j == 18 {
+                // BETWEEN = two comparisons; CASE buckets = FILTER counts
+                let lo = xval(mut &r)
+                let hi = xval(mut &r)
+                q1 = "select case when x between " + lo + " and " + hi + " then 'in' when x is null then 'none' else 'out' end, count(*) from a group by 1 order by 1"
+                // "out" is the rest: a NULL bound makes the condition NULL, and CASE falls through
+                let c1 = rows(mut &s, &("select count(*) filter (where x >= " + lo + " and x <= " + hi + "), count(*) filter (where x is null), count(*) from a0"))
+                got1 = rows(mut &s, &q1)
+                let parts = strings.split(&c1, "|")
+                let nIn = strings.parseIntOpt(parts[0].toStr()).unwrapOr(0)
+                let nNone = strings.parseIntOpt(parts[1].toStr()).unwrapOr(0)
+                let nOut = strings.parseIntOpt(parts[2].toStr()).unwrapOr(0) - nIn - nNone
+                var want: []str = []
+                if nIn > 0 { append(mut &want, "in|" + nIn.toStr()) }
+                if nNone > 0 { append(mut &want, "none|" + nNone.toStr()) }
+                if nOut > 0 { append(mut &want, "out|" + nOut.toStr()) }
+                got0 = strings.join(&want, ";")
             } else if j == 9 {
                 // RIGHT JOIN = the LEFT JOIN the other way round
                 let side = if r.below(2) == 0 { "u." } else { "t." }
@@ -225,6 +264,7 @@ fn body(st: lexdb_store.Store): int {
             if strings.contains(ex, "backward") { backward = true }
             if strings.contains(ex, "min/max:") { firstValue = true }
             if strings.contains(ex, "(filtered)") { filtered = true }
+            if strings.contains(ex, "for each of") { inLists = true }
         }
     }
     // Scans longer than a batch (256 rows), in order both ways, against sorts
@@ -252,7 +292,7 @@ fn body(st: lexdb_store.Store): int {
     if n == "0" { println("a is empty") }
     println("statements ok, queries " + queries.toStr() + " differ " + differ.toStr() + ", index paths used " +
             indexed.toStr() + ", hash joins used " + hashed.toStr() +
-            ", index order used " + ordered.toStr() + ", backward " + backward.toStr() + ", min/max " + firstValue.toStr() + ", filtered " + filtered.toStr())
+            ", index order used " + ordered.toStr() + ", backward " + backward.toStr() + ", min/max " + firstValue.toStr() + ", filtered " + filtered.toStr() + ", in-lists " + inLists.toStr())
     return 0
 }
 

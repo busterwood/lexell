@@ -517,6 +517,13 @@ pub fn eval(x: &Expr, env: &Env): Result[Val, DbErr] {
                 }
             }
             if isAgg(&name) { return Err(e("42803", "aggregate functions are not allowed here")) }
+            if name == "case" || name == "case else" {
+                // only the branch taken is evaluated
+                let pairs = if name == "case else" { (len(args) - 1) / 2 } else { len(args) / 2 }
+                for k in 0..pairs { if truth(&(try eval(&args[2 * k], env))) == Some(true) { return eval(&args[2 * k + 1], env) } }
+                if name == "case else" { return eval(&args[len(args) - 1], env) }
+                return Ok(Val.Null)
+            }
             var vs: []Val = []
             for a in args { append(mut &vs, try eval(&a, env)) }
             return call(&name, &vs)
@@ -524,8 +531,166 @@ pub fn eval(x: &Expr, env: &Env): Result[Val, DbErr] {
     }
 }
 
+fn intArg(v: Val, fname: &str): Result[int, DbErr] {
+    match v {
+        Val.Int(n) { return Ok(n) }
+        else {
+            match try coerce(v, &lexdb_sql.TypeName{kind: lexdb_sql.K_INT, oid: lexdb_sql.OID_INT8, prec: 0, scale: 0, len: 0}) {
+                Val.Int(n) { return Ok(n) }
+                else { return Err(e("42883", "function " + fname + " needs an integer")) }
+            }
+        }
+    }
+}
+
+// LIKE: % any run of characters, _ one character, the escape character
+// (backslash unless given; '' for none) before either for itself.
+fn likeMatch(s: str, pat: str, esc: str, fold: bool): Result[bool, DbErr] {
+    let sr = strings.runes(if fold { strings.toLowerAscii(s) } else { s })
+    let pr = strings.runes(if fold { strings.toLowerAscii(pat) } else { pat })
+    let er = strings.runes(esc)
+    if len(er) > 1 { return Err(e("22019", "invalid escape string")) }
+    let ec = if len(er) == 1 { er[0] } else { -1 }
+    var kind: []int = []            // 0 a character, 1 _, 2 %
+    var lit: []int = []
+    var i = 0
+    while i < len(pr) {
+        let c = pr[i]
+        if c == ec {
+            if i + 1 >= len(pr) { return Err(e("22025", "LIKE pattern must not end with escape character")) }
+            append(mut &kind, 0)
+            append(mut &lit, pr[i + 1])
+            i += 2
+            continue
+        }
+        if c == 37 {
+            if len(kind) == 0 || kind[len(kind) - 1] != 2 {
+                append(mut &kind, 2)
+                append(mut &lit, 0)
+            }
+        } else if c == 95 {
+            append(mut &kind, 1)
+            append(mut &lit, 0)
+        } else {
+            append(mut &kind, 0)
+            append(mut &lit, c)
+        }
+        i += 1
+    }
+    var si = 0
+    var pi = 0
+    var star = -1
+    var mark = 0
+    while si < len(sr) {
+        if pi < len(kind) && (kind[pi] == 1 || (kind[pi] == 0 && lit[pi] == sr[si])) {
+            si += 1
+            pi += 1
+        } else if pi < len(kind) && kind[pi] == 2 {
+            star = pi
+            mark = si
+            pi += 1
+        } else if star >= 0 {
+            pi = star + 1
+            mark += 1
+            si = mark
+        } else {
+            return Ok(false)
+        }
+    }
+    while pi < len(kind) && kind[pi] == 2 { pi += 1 }
+    return Ok(pi == len(kind))
+}
+
+// substr(s, from [, count]), by characters, from 1, as PostgreSQL clips it.
+fn substr(s: str, from: int, count: int, hasCount: bool): Result[str, DbErr] {
+    let rs = strings.runes(s)
+    if hasCount && count < 0 { return Err(e("22011", "negative substring length not allowed")) }
+    var lo = from
+    var hi = if hasCount { from + count } else { len(rs) + 1 }
+    if lo < 1 { lo = 1 }
+    if hi > len(rs) + 1 { hi = len(rs) + 1 }
+    if hi <= lo { return Ok("") }
+    var out: []int = []
+    for i in lo - 1..hi - 1 { append(mut &out, rs[i]) }
+    return Ok(strings.fromRunes(&out))
+}
+
 fn call(name: &str, vs: &[]Val): Result[Val, DbErr] {
     let n = len(vs)
+    if name == "in" {
+        // x IN (a, b): true if one equals x; else NULL if x or one of them is NULL
+        if isNull(&vs[0]) { return Ok(Val.Null) }
+        var sawNull = false
+        for i in 1..n {
+            if isNull(&vs[i]) {
+                sawNull = true
+                continue
+            }
+            if (try compare(&vs[0], &vs[i])) == 0 { return Ok(Val.Bool(true)) }
+        }
+        return Ok(if sawNull { Val.Null } else { Val.Bool(false) })
+    }
+    if name == "distinct from" {
+        let na = isNull(&vs[0])
+        let nb = isNull(&vs[1])
+        if na || nb { return Ok(Val.Bool(na != nb)) }
+        return Ok(Val.Bool((try compare(&vs[0], &vs[1])) != 0))
+    }
+    if name == "like" || name == "ilike" {
+        for v in vs { if isNull(&v) { return Ok(Val.Null) } }
+        let esc = if n > 2 { text(&vs[2]) } else { "\\" }
+        return Ok(Val.Bool(try likeMatch(text(&vs[0]), text(&vs[1]), esc, name == "ilike")))
+    }
+    if name == "nullif" && n == 2 {
+        if isNull(&vs[0]) || isNull(&vs[1]) { return Ok(vs[0]) }
+        if (try compare(&vs[0], &vs[1])) == 0 { return Ok(Val.Null) }
+        return Ok(vs[0])
+    }
+    if (name == "greatest" || name == "least") && n >= 1 {
+        var best = Val.Null
+        for v in vs {
+            if isNull(&v) { continue }
+            if isNull(&best) { best = v } else {
+                let c = try compare(&v, &best)
+                if (name == "greatest" && c > 0) || (name == "least" && c < 0) { best = v }
+            }
+        }
+        return Ok(best)
+    }
+    if name == "concat" {
+        var out = ""
+        for v in vs { if !isNull(&v) { out = out + text(&v) } }
+        return Ok(Val.Text(out))
+    }
+    let strFn = name == "substr" || name == "substring" || name == "strpos" || name == "replace" || name == "left" ||
+                name == "right"
+    if n >= 2 && strFn {
+        for v in vs { if isNull(&v) { return Ok(Val.Null) } }
+        let a = text(&vs[0])
+        if (name == "substr" || name == "substring") && n <= 3 {
+            let from = try intArg(vs[1], name)
+            let count = if n == 3 { try intArg(vs[2], name) } else { 0 }
+            return Ok(Val.Text(try substr(a, from, count, n == 3)))
+        }
+        if name == "strpos" && n == 2 {
+            let i = strings.indexOf(a, text(&vs[1]), 0)
+            return Ok(Val.Int(if i < 0 { 0 } else { strings.runeCount(&a[0..i]) + 1 }))
+        }
+        if name == "replace" && n == 3 {
+            let from = text(&vs[1])
+            if len(from) == 0 { return Ok(Val.Text(a)) }
+            return Ok(Val.Text(strings.replaceAll(a, from, text(&vs[2]))))
+        }
+        if (name == "left" || name == "right") && n == 2 {
+            let k = try intArg(vs[1], name)
+            let total = strings.runeCount(&a)
+            var take = if k >= 0 { k } else { total + k }
+            if take < 0 { take = 0 }
+            if take > total { take = total }
+            if name == "left" { return Ok(Val.Text(try substr(a, 1, take, true))) }
+            return Ok(Val.Text(try substr(a, total - take + 1, take, true)))
+        }
+    }
     if name == "coalesce" {
         for v in vs { if !isNull(&v) { return Ok(v) } }
         return Ok(Val.Null)
@@ -537,6 +702,9 @@ fn call(name: &str, vs: &[]Val): Result[Val, DbErr] {
         if isNull(&v) { return Ok(Val.Null) }
         match name {
             "lower" { return Ok(Val.Text(strings.toLowerAscii(text(&v)))) }
+            "trim", "btrim" { return Ok(Val.Text(strings.trim(text(&v)))) }
+            "ltrim" { return Ok(Val.Text(strings.trimLeft(text(&v)))) }
+            "rtrim" { return Ok(Val.Text(strings.trimRight(text(&v)))) }
             "upper" { return Ok(Val.Text(strings.toUpperAscii(text(&v)))) }
             "length", "char_length" { return Ok(Val.Int(strings.runeCount(&text(&v)))) }
             "abs" {
@@ -882,6 +1050,7 @@ type Path = record {
     rng: []Bound
     desc: bool          // read backward (ORDER BY ... DESC, MAX)
     noNulls: bool       // an index path: leave out its next column's NULLs (MIN, MAX)
+    ins: []Expr         // x IN (...) on the column after the equalities: a lookup per value
 }
 
 type Scan = record {
@@ -1053,6 +1222,7 @@ fn (q: &Query) minLevel(x: &Expr): int {
 // The conjuncts "col op value" whose value uses only tables before level k.
 fn bounds(cs: &[]Expr, col: &str, k: int, q: &Query): []Bound {
     var out: []Bound = []
+    for c in cs { likeBounds(&c, col, q, mut &out) }
     for c in cs {
         match c {
             Expr.Bin(op, a, b) {
@@ -1240,6 +1410,73 @@ fn (q: &Query) usable(k: int, c: int, cs: &[]Expr, params: &[]Val): bool {
     }
 }
 
+// The values of a conjunct "col IN (...)" whose values use only tables
+// before level k (none: no such conjunct).
+fn inList(cs: &[]Expr, col: &str, k: int, q: &Query): []Expr {
+    for c in cs {
+        match c {
+            Expr.Call(n, args, _) {
+                if n == "in" && len(args) > 1 {
+                    var ok = false
+                    match args[0] { Expr.Col(x) { ok = x == col } else {} }
+                    for i in 1..len(args) { if q.maxLevel(&args[i]) >= k { ok = false } }
+                    if ok {
+                        var out: []Expr = []
+                        for i in 1..len(args) { append(mut &out, clone(&args[i])) }
+                        return out
+                    }
+                }
+            }
+            else {}
+        }
+    }
+    return []
+}
+
+// LIKE 'abc%' on a text column: the strings from 'abc' to 'abd'.
+fn likeBounds(c: &Expr, col: &str, q: &Query, out: mut &[]Bound) {
+    match c {
+        Expr.Call(n, args, _) {
+            if n != "like" || len(args) != 2 { return }
+            match args[0] {
+                Expr.Col(x) { if x != col { return } }
+                else { return }
+            }
+            let ci = colIndex(&q.cols, col)
+            if ci < 0 || q.cols[ci].typ.kind != lexdb_sql.K_TEXT { return }
+            match args[1] {
+                Expr.Lit(v) {
+                    match v {
+                        Val.Text(pat) {
+                            // the characters before the first wildcard; \ escapes
+                            var pre = newStrBuf()
+                            var i = 0
+                            while i < len(pat) {
+                                let b = pat[i]
+                                if b == '%' || b == '_' { break }
+                                if b == '\\' {
+                                    if i + 1 >= len(pat) { return }
+                                    i += 1
+                                }
+                                pre.addByte(pat[i])
+                                i += 1
+                            }
+                            let p = pre.toStr()
+                            if len(p) == 0 { return }
+                            append(out, Bound{op: ">=", val: Expr.Lit(Val.Text(p))})
+                            let next = succ(&p)
+                            if next != "" { append(out, Bound{op: "<", val: Expr.Lit(Val.Text(next))}) }
+                        }
+                        else {}
+                    }
+                }
+                else {}
+            }
+        }
+        else {}
+    }
+}
+
 fn keyCols(t: &Table, index: int): []int {
     var out: []int = []
     if index < 0 {
@@ -1255,7 +1492,7 @@ fn keyCols(t: &Table, index: int): []int {
 // the next column; the primary key wins a tie. Nothing: a full scan.
 fn choosePath(q: &Query, k: int, cs: &[]Expr, params: &[]Val): Path {
     let lv = &q.levels[k]
-    var best = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false}
+    var best = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: []}
     var bestScore = 0
     for c0 in 0..len(lv.t.indexes) + 1 {
         let c = c0 - 1
@@ -1263,25 +1500,30 @@ fn choosePath(q: &Query, k: int, cs: &[]Expr, params: &[]Val): Path {
         let cols = keyCols(&lv.t, c)
         var eqs: []Expr = []
         var rng: []Bound = []
+        var ins: []Expr = []
         for ci in cols {
             let name = lv.alias + "." + lv.t.cols[ci].name
             var bs = bounds(cs, &name, k, q)
             var eqAt = -1
             for i in 0..len(bs) { if bs[i].op == "=" && eqAt < 0 { eqAt = i } }
             if eqAt < 0 {
-                rng = bs
+                ins = inList(cs, &name, k, q)
+                if len(ins) == 0 { rng = bs }
                 break
             }
             append(mut &eqs, replace(mut &bs[eqAt].val, Expr.Lit(Val.Null)))
         }
-        var score = 2 * len(eqs) + (if len(rng) > 0 { 1 } else { 0 })
+        // an IN list counts as an equality; the full key by one is a lookup per value
+        var score = 2 * (len(eqs) + (if len(ins) > 0 { 1 } else { 0 })) + (if len(rng) > 0 { 1 } else { 0 })
         if c >= 0 && lv.t.indexes[c].pred.isSome() { score += 1 }      // filtered: fewer rows
         if len(eqs) == len(cols) {
             if c < 0 { score = 1000 } else if lv.t.indexes[c].unique { score = 999 }
+        } else if len(ins) > 0 && len(eqs) + 1 == len(cols) {
+            if c < 0 { score = 500 } else if lv.t.indexes[c].unique { score = 499 }
         }
         if score > bestScore {
             bestScore = score
-            best = Path{index: c, eqs: eqs, rng: rng, desc: false, noNulls: false}
+            best = Path{index: c, eqs: eqs, rng: rng, desc: false, noNulls: false, ins: ins}
         }
     }
     return best
@@ -1289,6 +1531,7 @@ fn choosePath(q: &Query, k: int, cs: &[]Expr, params: &[]Val): Path {
 
 fn (q: &Query) pathOuter(p: &Path): bool {
     for x in p.eqs { if q.maxLevel(&x) >= 0 { return true } }
+    for x in p.ins { if q.maxLevel(&x) >= 0 { return true } }
     for b in p.rng { if q.maxLevel(&b.val) >= 0 { return true } }
     return false
 }
@@ -1298,13 +1541,59 @@ fn encPart(b: mut &StrBuf, v: &Val, index: bool) {
 }
 
 // The keys a path covers, its values evaluated now.
+// A column's type for its bounds: a value too long for varchar(n) is not
+// an error there, it only matches nothing.
+fn boundType(t: &lexdb_sql.TypeName): lexdb_sql.TypeName {
+    return lexdb_sql.TypeName{kind: t.kind, oid: t.oid, prec: t.prec, scale: t.scale, len: 0}
+}
+
+// The keys a path covers: with an IN list, a lookup (or range) per value,
+// in key order (backward for a backward path).
+fn pathScans(t: &Table, p: &Path, env: &Env): Result[[]Scan, DbErr] {
+    if len(p.ins) == 0 { return Ok([try pathScan(t, p, env)]) }
+    let ix = p.index >= 0
+    let cols = keyCols(t, p.index)
+    var prefix = newStrBuf()
+    for k in 0..len(p.eqs) {
+        let v = try coerce(try eval(&p.eqs[k], env), &boundType(&t.cols[cols[k]].typ))
+        if isNull(&v) { return Ok([]) }
+        encPart(mut &prefix, &v, ix)
+    }
+    let pre = prefix.toStr()
+    let typ = boundType(&t.cols[cols[len(p.eqs)]].typ)
+    var keys: []str = []
+    for x in p.ins {
+        let v = try coerce(try eval(&x, env), &typ)
+        if isNull(&v) { continue }
+        var kb = newStrBuf()
+        kb.add(pre)
+        encPart(mut &kb, &v, ix)
+        append(mut &keys, kb.toStr())
+    }
+    collections.sortBy(mut &keys, fn(a: &str, b: &str): int { return a.cmp(b) })
+    let point = !ix && len(p.eqs) + 1 == len(cols)
+    var out: []Scan = []
+    for i in 0..len(keys) {
+        if i > 0 && keys[i] == keys[i - 1] { continue }
+        if point { append(mut &out, Scan{empty: false, point: true, lo: keys[i], hi: ""}) } else {
+            append(mut &out, Scan{empty: false, point: false, lo: keys[i], hi: succ(&keys[i])})
+        }
+    }
+    if p.desc {
+        var rev: []Scan = []
+        while len(out) > 0 { append(mut &rev, pop(mut &out)) }
+        return Ok(rev)
+    }
+    return Ok(out)
+}
+
 fn pathScan(t: &Table, p: &Path, env: &Env): Result[Scan, DbErr] {
     let none = Scan{empty: true, point: false, lo: "", hi: ""}
     let ix = p.index >= 0
     let cols = keyCols(t, p.index)
     var prefix = newStrBuf()
     for k in 0..len(p.eqs) {
-        let v = try coerce(try eval(&p.eqs[k], env), &t.cols[cols[k]].typ)
+        let v = try coerce(try eval(&p.eqs[k], env), &boundType(&t.cols[cols[k]].typ))
         if isNull(&v) { return Ok(none) }
         encPart(mut &prefix, &v, ix)
     }
@@ -1313,9 +1602,9 @@ fn pathScan(t: &Table, p: &Path, env: &Env): Result[Scan, DbErr] {
     var lo = pre
     var hi = if len(pre) > 0 { succ(&pre) } else { "" }
     if len(p.rng) > 0 {
-        let typ = &t.cols[cols[len(p.eqs)]].typ
+        let typ = boundType(&t.cols[cols[len(p.eqs)]].typ)
         for b in p.rng {
-            let v = try coerce(try eval(&b.val, env), typ)
+            let v = try coerce(try eval(&b.val, env), &typ)
             if isNull(&v) { return Ok(none) }
             var kb = newStrBuf()
             kb.add(pre)
@@ -1421,7 +1710,7 @@ fn allTrue(cs: &[]Expr, cols: &[]lexdb_sql.ColDef, row: &[]Val, params: &[]Val):
 }
 
 fn newLevel(t: Table, alias: str, join: int, first: int): Level {
-    return Level{t: t, alias: alias, join: join, first: first, path: Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false}, cond: [],
+    return Level{t: t, alias: alias, join: join, first: first, path: Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: []}, cond: [],
                  post: [], local: [], perRow: true, hashCols: [], hashVals: [], mat: [], keys: newMap(), buckets: []}
 }
 
@@ -1487,7 +1776,7 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
         let right = keepsRight(q.levels[k].join)
         if right {
             // Every row of it is kept: read it all once, and remember which joined.
-            path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false}
+            path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: []}
             perRow = false
         }
         var local: []Expr = []
@@ -1556,9 +1845,11 @@ fn materialize(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query,
             {
                 let noAggs: []Val = []
                 let env = Env{cols: &q.cols, row: &full, aggs: &noAggs, params: params}
-                let sc = try pathScan(&lv.t, &lv.path, &env)
-                var cur = newCursor()
-                while !cur.done { try fetch(st, txn, &lv.t, &lv.path, &sc, mut &cur, mut &rows) }
+                let scans = try pathScans(&lv.t, &lv.path, &env)
+                for sc in scans {
+                    var cur = newCursor()
+                    while !cur.done { try fetch(st, txn, &lv.t, &lv.path, &sc, mut &cur, mut &rows) }
+                }
             }
             rs.cnt[k].built += len(rows)
             let keepAll = keepsRight(lv.join)
@@ -1651,20 +1942,22 @@ fn runLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, k: int
             }
         }
     } else {
-        var sc = Scan{empty: true, point: false, lo: "", hi: ""}
+        var scans: []Scan = []
         {
             let noAggs: []Val = []
             let env = Env{cols: &q.cols, row: row, aggs: &noAggs, params: params}
-            sc = try pathScan(&lv.t, &lv.path, &env)
+            scans = try pathScans(&lv.t, &lv.path, &env)
         }
-        var cur = newCursor()
-        while !cur.done {
-            var batch: [][]Val = []
-            try fetch(st, txn, &lv.t, &lv.path, &sc, mut &cur, mut &batch)
-            for r in batch {
-                let got = try tryRow(st, txn, q, k, &r, -1, row, params, emit, rs)
-                if got < 0 { return Ok(false) }
-                if got > 0 { matched = true }
+        for sc in scans {
+            var cur = newCursor()
+            while !cur.done {
+                var batch: [][]Val = []
+                try fetch(st, txn, &lv.t, &lv.path, &sc, mut &cur, mut &batch)
+                for r in batch {
+                    let got = try tryRow(st, txn, q, k, &r, -1, row, params, emit, rs)
+                    if got < 0 { return Ok(false) }
+                    if got > 0 { matched = true }
+                }
             }
         }
     }
@@ -1709,6 +2002,12 @@ fn runQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, params
 fn pathText(lv: &Level): str {
     let p = &lv.path
     let cols = keyCols(&lv.t, p.index)
+    if len(p.ins) > 0 {
+        let each = " for each of " + len(p.ins).toStr() + " values" + (if p.desc { " backward" } else { "" })
+        if p.index < 0 { return "primary key " + (if len(p.eqs) + 1 == len(cols) { "lookup" } else { "range" }) + each }
+        return "index " + lv.t.indexes[p.index].name + (if lv.t.indexes[p.index].pred.isSome() { " (filtered)" } else { "" }) +
+               " lookup" + each
+    }
     if p.index < 0 {
         if len(p.eqs) == len(cols) { return "primary key lookup" }
         if len(p.eqs) > 0 || len(p.rng) > 0 { return "primary key range" }
@@ -1949,7 +2248,7 @@ fn createIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
         None {}
     }
     let ix = Index{name: s.index, tree: st.createTree(txn), cols: cols, unique: s.unique, pred: pred}
-    let path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false}
+    let path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: []}
     let sc = Scan{empty: false, point: false, lo: "", hi: ""}
     var cur = newCursor()
     while !cur.done {
@@ -2181,6 +2480,10 @@ pub fn exprOid(x: &Expr, cols: &[]lexdb_sql.ColDef, ptypes: &[]int): int {
                 "count" { return lexdb_sql.OID_INT8 }
                 "bool_and", "bool_or", "every" { return lexdb_sql.OID_BOOL }
                 "string_agg" { return lexdb_sql.OID_TEXT }
+                "like", "ilike", "in", "distinct" { return lexdb_sql.OID_BOOL }
+                "case" { return if len(args) > 1 { exprOid(&args[1], cols, ptypes) } else { lexdb_sql.OID_TEXT } }
+                "nullif", "greatest", "least" { return if len(args) > 0 { exprOid(&args[0], cols, ptypes) } else { lexdb_sql.OID_TEXT } }
+                "strpos" { return lexdb_sql.OID_INT4 }
                 "stddev", "stddev_samp", "stddev_pop", "variance", "var_samp", "var_pop" { return lexdb_sql.OID_NUMERIC }
                 "avg" { return lexdb_sql.OID_NUMERIC }
                 "sum" {
@@ -2616,7 +2919,7 @@ fn orderedScan(q: &Query, cols: &[]int, params: &[]Val): Option[int] {
     let t = &q.levels[0].t
     for c0 in 0..len(t.indexes) + 1 {
         if !q.usable(0, c0 - 1, &q.levels[0].cond, params) { continue }
-        let p = Path{index: c0 - 1, eqs: [], rng: [], desc: false, noNulls: false}
+        let p = Path{index: c0 - 1, eqs: [], rng: [], desc: false, noNulls: false, ins: []}
         if servesOrder(t, &p, cols) { return Some(c0 - 1) }
     }
     return None
@@ -2707,7 +3010,7 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         if dir >= 0 {
             var ix = path.index
             var use = servesOrder(t, path, &cols)
-            let full = len(path.eqs) == 0 && len(path.rng) == 0
+            let full = len(path.eqs) == 0 && len(path.rng) == 0 && len(path.ins) == 0
             // A full scan changes to an index for its order only when that
             // saves reading everything: a LIMIT, or MIN/MAX. Else a sort is
             // cheaper than a lookup per row.
