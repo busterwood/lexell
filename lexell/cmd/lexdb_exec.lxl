@@ -4018,6 +4018,8 @@ type AggSpec = record {
     star: bool
     distinct: bool
     filter: Option[Expr]
+    order: []Expr           // ORDER BY in the call (string_agg's result depends on it; the others' not)
+    dirs: str               // per key: a, A (NULLs first), d, D (NULLs last), as the parser gives them
     text: str               // to share one accumulator between equal calls
 }
 
@@ -4027,12 +4029,14 @@ type Acc = record {
     sum: Val                // sum, avg; the variances: the sum ...
     sumsq: Val              // ... and the sum of squares
     parts: []str            // string_agg
+    seps: []Val             // ... with ORDER BY: each value's separator
+    ords: [][]Val           // ... and its keys (sorted when it finishes)
     seen: Map[str, int]     // DISTINCT
 }
 
 fn newAccs(n: int): []Acc {
     var out: []Acc = []
-    for i in 0..n { append(mut &out, Acc{n: 0, val: Val.Null, sum: Val.Null, sumsq: Val.Null, parts: [], seen: newMap()}) }
+    for i in 0..n { append(mut &out, Acc{n: 0, val: Val.Null, sum: Val.Null, sumsq: Val.Null, parts: [], seps: [], ords: [], seen: newMap()}) }
     return out
 }
 
@@ -4051,6 +4055,18 @@ fn collectAggs(x: &Expr, specs: mut &[]AggSpec): Result[Expr, DbErr] {
             var aargs = cloneAll(&args)
             var filter: Option[Expr] = None
             if strings.contains(name, " filter") { filter = Some(pop(mut &aargs)) }
+            var order: []Expr = []
+            var dirs = ""
+            let oi = strings.indexOf(name, " order:", 0)
+            if oi >= 0 {
+                let rest = name[oi + 7..len(name)]
+                let sp = strings.indexOf(rest, " ", 0)
+                dirs = if sp < 0 { rest } else { rest[0..sp] }
+                var rev: []Expr = []
+                for k in 0..len(dirs) { append(mut &rev, pop(mut &aargs)) }
+                while len(rev) > 0 { append(mut &order, pop(mut &rev)) }
+                for o in order { if hasAgg(&o) { return Err(e("42803", "aggregate function calls cannot be nested")) } }
+            }
             for a in aargs { if hasAgg(&a) { return Err(e("42803", "aggregate function calls cannot be nested")) } }
             match filter {
                 Some(f) { if hasAgg(&f) { return Err(e("42803", "aggregate functions are not allowed in FILTER")) } }
@@ -4061,10 +4077,10 @@ fn collectAggs(x: &Expr, specs: mut &[]AggSpec): Result[Expr, DbErr] {
             if !star && len(aargs) != want {
                 return Err(e("42883", "function " + base + " takes " + want.toStr() + " argument" + (if want > 1 { "s" } else { "" })))
             }
-            let text = lexdb_sql.exprText(x)
+            let text = lexdb_sql.exprText(x) + " " + name         // the name: DISTINCT, ORDER BY's directions
             for i in 0..len(specs) { if specs[i].text == text { return Ok(slotRef(i)) } }
             append(specs, AggSpec{fname: base, args: aargs, star: star, distinct: strings.contains(name, " distinct"),
-                                  filter: filter, text: text})
+                                  filter: filter, order: order, dirs: dirs, text: text})
             return Ok(slotRef(len(specs) - 1))
         }
         Expr.Unary(op, a) { return Ok(Expr.Unary(op, try collectAggs(&a, specs))) }
@@ -4127,6 +4143,7 @@ fn groupCorr(sel: &Sel): bool {
     for g in sel.groupBy { if hasCorr(&g) { return true } }
     for sp in sel.specs {
         for a in sp.args { if hasCorr(&a) { return true } }
+        for o in sp.order { if hasCorr(&o) { return true } }
         match sp.filter {
             Some(f) { if hasCorr(&f) { return true } }
             None {}
@@ -4170,8 +4187,16 @@ fn accumulate(sp: &AggSpec, acc: mut &Acc, env: &Env): Result[Unit, DbErr] {
         acc.val = Val.Bool(if f == "bool_or" { prev || b } else { prev && b })
     } else if f == "string_agg" {
         let sep = try eval(&sp.args[1], env)
-        if acc.n > 0 && !isNull(&sep) { append(mut &acc.parts, text(&sep)) }
-        append(mut &acc.parts, text(&v))
+        if len(sp.order) > 0 {
+            var ks: []Val = []
+            for o in sp.order { append(mut &ks, try eval(&o, env)) }
+            append(mut &acc.parts, text(&v))
+            append(mut &acc.seps, sep)
+            append(mut &acc.ords, ks)
+        } else {
+            if acc.n > 0 && !isNull(&sep) { append(mut &acc.parts, text(&sep)) }
+            append(mut &acc.parts, text(&v))
+        }
     } else if f != "count" {
         // the variances and standard deviations
         let x = try numOf(&v, &f)
@@ -4203,6 +4228,42 @@ fn sqrtNum(v: &Val): Result[Val, DbErr] {
     }
 }
 
+// string_agg with ORDER BY: its values sorted by their keys (stable: equal
+// keys keep their order), each after its own separator but the first.
+fn orderedParts(sp: &AggSpec, acc: &Acc): Result[str, DbErr] {
+    var idx: []int = []
+    for i in 0..len(acc.parts) { append(mut &idx, i) }
+    var bad = false
+    collections.sortBy(mut &idx, fn(a: &int, b: &int): int {
+        for k in 0..len(sp.dirs) {
+            let d = sp.dirs[k]
+            let desc = d == 'd' || d == 'D'
+            let nullsFirst = d == 'A' || d == 'd'
+            let x = &acc.ords[a][k]
+            let y = &acc.ords[b][k]
+            let xn = isNull(x)
+            let yn = isNull(y)
+            if xn || yn {
+                if xn && yn { continue }
+                return if xn == nullsFirst { -1 } else { 1 }
+            }
+            let r = compare(x, y)
+            if r.isErr() { bad = true }
+            let c = r.unwrapOr(0)
+            if c != 0 { return if desc { -c } else { c } }
+        }
+        return a - b
+    })
+    if bad { return Err(e("42804", "string_agg: its ORDER BY keys cannot be compared")) }
+    var b = newStrBuf()
+    for j in 0..len(idx) {
+        let i = idx[j]
+        if j > 0 && !isNull(&acc.seps[i]) { b.add(text(&acc.seps[i])) }
+        b.add(acc.parts[i])
+    }
+    return Ok(b.toStr())
+}
+
 // An accumulator's result.
 fn finish(sp: &AggSpec, acc: &Acc): Result[Val, DbErr] {
     let f = sp.fname
@@ -4210,6 +4271,7 @@ fn finish(sp: &AggSpec, acc: &Acc): Result[Val, DbErr] {
     if acc.n == 0 { return Ok(Val.Null) }
     if f == "sum" { return Ok(acc.sum) }
     if f == "avg" { return arith(&"/", &(try numOf(&acc.sum, &f)), &Val.Num(Decimal.fromInt(acc.n))) }
+    if f == "string_agg" && len(sp.order) > 0 { return Ok(Val.Text(try orderedParts(sp, acc))) }
     if f == "string_agg" { return Ok(Val.Text(strings.join(&acc.parts, ""))) }
     if f == "min" || f == "max" || f == "bool_and" || f == "bool_or" || f == "every" { return Ok(acc.val) }
     // variance: (n * sum of squares - sum * sum) / (n * (n - 1)), or n * n for the population's
@@ -4831,6 +4893,7 @@ fn execSel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
             for x in sel.groupBy { try fillCur(st, txn, q, &x, &env, rs, mut &cur) }
             for sp in sel.specs {
                 for a in sp.args { try fillCur(st, txn, q, &a, &env, rs, mut &cur) }
+                for o in sp.order { try fillCur(st, txn, q, &o, &env, rs, mut &cur) }
                 match sp.filter {
                     Some(f) { try fillCur(st, txn, q, &f, &env, rs, mut &cur) }
                     None {}

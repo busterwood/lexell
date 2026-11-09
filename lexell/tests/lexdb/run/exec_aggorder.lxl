@@ -1,0 +1,64 @@
+// lexdb_exec: ORDER BY inside an aggregate call (design/lexdb.md 9.25).
+// string_agg's result follows it; the other aggregates accept it (their
+// results do not depend on order). The table (id, g, name, k):
+// (1,1,b,2) (2,1,a,3) (3,1,c,1) (4,2,x,NULL) (5,2,y,5) (6,2,NULL,4).
+// expect: by name: a,b,c,x,y
+// expect: by name desc: y,x,c,b,a
+// expect: per group by k: 1|c-b-a 2|y-x
+// expect: nulls first: 2|x-y
+// expect: desc, its NULLs first: 2|x-y
+// expect: desc nulls last: 2|y-x
+// expect: two keys: x,y,a,b,c
+// expect: each row's separator: b+a,c,x,y and y,x,c+a,b
+// expect: sum with order: 15
+// expect: distinct: a,b,c,x,y
+// expect: two orders, two results: a,b,c,x,y|y,x,c,b,a
+// expect: a correlated key: c,x,b,a,y
+// expect: no rows: t
+// expect: not an aggregate: 42883
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            var out: []str = []
+            for r in rs {
+                for row in r.rows {
+                    var vs: []str = []
+                    for v in row { append(mut &vs, lexdb_exec.text(&v)) }
+                    append(mut &out, strings.join(&vs, "|"))
+                }
+            }
+            return strings.join(&out, " ")
+        }
+        Err(e) { return e.state }
+    }
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(43), lexdb_store.Options{cacheBytes: 16 * 1024 * 1024, segBytes: 1024 * 1024, ckptBytes: 1024 * 1024, snapNodes: 100000}, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        let a = q(mut &s, &"create table t (id int primary key, g int, name text, k int)")
+        let b = q(mut &s, &"insert into t values (1, 1, 'b', 2), (2, 1, 'a', 3), (3, 1, 'c', 1), (4, 2, 'x', null), (5, 2, 'y', 5), (6, 2, null, 4)")
+        println("by name: " + q(mut &s, &"select string_agg(name, ',' order by name) from t"))
+        println("by name desc: " + q(mut &s, &"select string_agg(name, ',' order by name desc) from t"))
+        println("per group by k: " + q(mut &s, &"select g, string_agg(name, '-' order by k) from t group by g order by g"))
+        println("nulls first: " + q(mut &s, &"select g, string_agg(name, '-' order by k nulls first) from t where g = 2 group by g"))
+        println("desc, its NULLs first: " + q(mut &s, &"select g, string_agg(name, '-' order by k desc) from t where g = 2 group by g"))
+        println("desc nulls last: " + q(mut &s, &"select g, string_agg(name, '-' order by k desc nulls last) from t where g = 2 group by g"))
+        println("two keys: " + q(mut &s, &"select string_agg(name, ',' order by g desc, name) from t"))
+        println("each row's separator: " + q(mut &s, &"select string_agg(name, case when id = 2 then '+' else ',' end order by id) from t") +
+                " and " + q(mut &s, &"select string_agg(name, case when id = 2 then '+' else ',' end order by id desc) from t"))
+        println("sum with order: " + q(mut &s, &"select sum(k order by id desc) from t"))
+        println("distinct: " + q(mut &s, &"select string_agg(distinct name, ',' order by name) from t"))
+        println("two orders, two results: " + q(mut &s, &"select string_agg(name, ',' order by name), string_agg(name, ',' order by name desc) from t"))
+        println("a correlated key: " + q(mut &s, &"select string_agg(name, ',' order by (select count(*) from t t2 where t2.k < t.k)) from t"))
+        println("no rows: " + q(mut &s, &"select string_agg(name, ',' order by name) is null from t where id < 0"))
+        println("not an aggregate: " + q(mut &s, &"select upper(name order by id) from t"))
+        return 0
+    }).unwrap()
+}

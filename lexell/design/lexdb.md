@@ -393,7 +393,7 @@ Built on 2026-11-09 on branch `lexdb`, about 6,300 lines in
 (cache, trees, transactions, log, checkpoints, recovery, snapshots),
 `lexdb_sql` (lexer, parser), `lexdb_exec` (catalog, rows, keys, planner,
 statements, sessions), `lexdb_wire` (protocol 3.0) and `lexdb` (the
-server). Tests: `python3 lexell/tests/lexdb.py` (34 programs in
+server). Tests: `python3 lexell/tests/lexdb.py` (35 programs in
 `tests/lexdb/run`, under `LXL_CHECK=1`).
 
     lexell/compiler/out/lxlc lexell/cmd/lexdb.lxl -o lexdb
@@ -522,7 +522,9 @@ is the comparison to make.
      arguments (9.24); not done: an aggregate inside a correlated
      subquery's reference to its parent (`HAVING (SELECT ... WHERE c.id =
      min(o.cust))`), which PostgreSQL evaluates in the parent;
-   - ORDER BY inside an aggregate (`string_agg(x, ',' ORDER BY x)`);
+   - built: ORDER BY inside an aggregate (`string_agg(x, ',' ORDER BY
+     x)`, 9.25); not done: `array_agg` and `json_agg`, whose results
+     depend on it too;
    - hashing a correlated scalar subquery with an aggregate (a count per
      customer) as a grouped run.
 
@@ -1607,4 +1609,47 @@ Caught, each put back:
 - FILTER's values not computed;
 - no merging;
 - merging regardless of the text.
+
+### 9.25 ORDER BY inside an aggregate
+
+`string_agg(name, ',' ORDER BY k DESC NULLS LAST, name)`.
+
+- **Parsing.** The keys follow the call's arguments. The call's name
+  carries their directions (`string_agg order:Da`: `a` ascending, NULLs
+  last; `A` ascending, NULLs first; `d` descending, NULLs first; `D`
+  descending, NULLs last), as it already carries DISTINCT and FILTER.
+  `collectAggs` takes them off into `AggSpec.order` and `dirs`.
+- **string_agg** keeps each value with its own separator and its keys,
+  and sorts when it finishes (stable: ties keep the order the rows came
+  in). Each value but the first is preceded by its own row's separator,
+  as in PostgreSQL. The other aggregates accept ORDER BY and ignore it:
+  their results do not depend on order.
+- **Correlated keys** group later, as correlated arguments do (9.24).
+- **Fixed on the way:** two calls differing only in their directions (or
+  DISTINCT) shared one accumulator, since `exprText` leaves the name's
+  marks out. The spec's key now includes the full name.
+
+`exec_aggorder` covers:
+
+- ascending and descending;
+- per group;
+- NULLs' default places and NULLS FIRST/LAST;
+- two keys;
+- each row's separator, forward and backward;
+- sum with ORDER BY;
+- DISTINCT;
+- two orders in one query;
+- a correlated key;
+- no rows;
+- ORDER BY in a function that is not an aggregate (42883).
+
+Caught, each put back:
+
+- DESC ignored;
+- NULLs always last;
+- NULLS FIRST not parsed;
+- separators by arrival;
+- ties unstable;
+- accumulators shared across directions;
+- the second key ignored.
 
