@@ -18,6 +18,7 @@
 import "binary"
 import "strings"
 import "collections"
+import "time"
 import "./lexdb_base"
 import "./lexdb_store"
 import "./lexdb_sql"
@@ -902,6 +903,20 @@ pub type Level = record {
     buckets: [][]int        // rows of mat
 }
 
+// What one table of a query did (EXPLAIN ANALYZE).
+type Counts = value record {
+    starts: int         // scans or lookups begun (per row: one per row of the tables before); hash: probes
+    read: int           // candidate rows tried
+    joined: int         // rows that met the join's conditions
+    nulls: int          // LEFT JOIN rows made with NULLs
+    built: int          // hash: rows read to build it, and kept
+    kept: int
+}
+
+fn newCounts(q: &Query): []Counts {
+    return array(len(q.levels), Counts{starts: 0, read: 0, joined: 0, nulls: 0, built: 0, kept: 0})
+}
+
 pub type Query = record {
     levels: []Level
     cols: []lexdb_sql.ColDef    // the joined row's columns, named alias.column
@@ -1322,7 +1337,8 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
 }
 
 // Reads the tables that are joined by hash, once.
-fn materialize(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query, params: &[]Val): Result[Unit, DbErr] {
+fn materialize(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query, params: &[]Val,
+               cnt: mut &[]Counts): Result[Unit, DbErr] {
     for k in 1..len(q.levels) {
         if q.levels[k].perRow { continue }
         var rows: [][]Val = []
@@ -1339,6 +1355,7 @@ fn materialize(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query,
                 var cur = newCursor()
                 while !cur.done { try fetch(st, txn, &lv.t, &lv.path, &sc, mut &cur, mut &rows) }
             }
+            cnt[k].built += len(rows)
             for i in 0..len(rows) {
                 let r = replace(mut &rows[i], [])
                 for j in 0..len(r) { full[lv.first + j] = r[j] }
@@ -1362,6 +1379,7 @@ fn materialize(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query,
                 }
                 append(mut &buckets[b], len(mat))
                 append(mut &mat, r)
+                cnt[k].kept += 1
             }
         }
         q.levels[k].mat = mat
@@ -1374,22 +1392,25 @@ fn materialize(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query,
 // Places a candidate row of level k in the joined row and goes on to the
 // next level if it joins: -1 stop, 0 it does not join, 1 it joined.
 fn tryRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, k: int, r: &[]Val, row: mut &[]Val,
-          params: &[]Val, emit: &fn(&[]Val): Result[bool, DbErr]): Result[int, DbErr] {
+          params: &[]Val, emit: &fn(&[]Val): Result[bool, DbErr], cnt: mut &[]Counts): Result[int, DbErr] {
     let lv = &q.levels[k]
     for i in 0..len(r) { row[lv.first + i] = r[i] }
+    cnt[k].read += 1
     if !(try allTrue(&lv.cond, &q.cols, row, params)) { return Ok(0) }
+    cnt[k].joined += 1
     if !(try allTrue(&lv.post, &q.cols, row, params)) { return Ok(1) }
-    if !(try runLevel(st, txn, q, k + 1, row, params, emit)) { return Ok(-1) }
+    if !(try runLevel(st, txn, q, k + 1, row, params, emit, cnt)) { return Ok(-1) }
     return Ok(1)
 }
 
 // Joins the rows of level k on to the joined row (levels before k filled),
 // calling emit for each complete row; false: emit asked to stop.
 fn runLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, k: int, row: mut &[]Val, params: &[]Val,
-            emit: &fn(&[]Val): Result[bool, DbErr]): Result[bool, DbErr] {
+            emit: &fn(&[]Val): Result[bool, DbErr], cnt: mut &[]Counts): Result[bool, DbErr] {
     if k == len(q.levels) { return emit(row) }
     let lv = &q.levels[k]
     var matched = false
+    cnt[k].starts += 1
     if !lv.perRow {
         var kb = newStrBuf()
         var nul = false
@@ -1406,7 +1427,7 @@ fn runLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, k: int
             match lv.keys.get(&kb.toStr()) {
                 Some(b) {
                     for ri in lv.buckets[b] {
-                        let got = try tryRow(st, txn, q, k, &lv.mat[ri], row, params, emit)
+                        let got = try tryRow(st, txn, q, k, &lv.mat[ri], row, params, emit, cnt)
                         if got < 0 { return Ok(false) }
                         if got > 0 { matched = true }
                     }
@@ -1426,7 +1447,7 @@ fn runLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, k: int
             var batch: [][]Val = []
             try fetch(st, txn, &lv.t, &lv.path, &sc, mut &cur, mut &batch)
             for r in batch {
-                let got = try tryRow(st, txn, q, k, &r, row, params, emit)
+                let got = try tryRow(st, txn, q, k, &r, row, params, emit, cnt)
                 if got < 0 { return Ok(false) }
                 if got > 0 { matched = true }
             }
@@ -1434,8 +1455,9 @@ fn runLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, k: int
     }
     if lv.join == lexdb_sql.J_LEFT && !matched {
         for i in 0..len(lv.t.cols) { row[lv.first + i] = Val.Null }
+        cnt[k].nulls += 1
         if try allTrue(&lv.post, &q.cols, row, params) {
-            if !(try runLevel(st, txn, q, k + 1, row, params, emit)) { return Ok(false) }
+            if !(try runLevel(st, txn, q, k + 1, row, params, emit, cnt)) { return Ok(false) }
         }
     }
     return Ok(true)
@@ -1443,14 +1465,14 @@ fn runLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, k: int
 
 // Calls emit on each row of the query (materialize first).
 fn runQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, params: &[]Val,
-            emit: &fn(&[]Val): Result[bool, DbErr]): Result[Unit, DbErr] {
+            emit: &fn(&[]Val): Result[bool, DbErr], cnt: mut &[]Counts): Result[Unit, DbErr] {
     if len(q.levels) == 0 {
         let none: []Val = []
         if try allTrue(&q.top, &q.cols, &none, params) { let more = try emit(&none) }
         return Ok(Unit{})
     }
     var row: []Val = array(len(q.cols), Val.Null)
-    let done = try runLevel(st, txn, q, 0, mut &row, params, emit)
+    let done = try runLevel(st, txn, q, 0, mut &row, params, emit, cnt)
     return Ok(Unit{})
 }
 
@@ -1465,14 +1487,29 @@ fn pathText(lv: &Level): str {
     return "index " + lv.t.indexes[p.index].name + (if len(p.eqs) == len(cols) { " lookup" } else { " range" })
 }
 
-// EXPLAIN: a line per table.
-fn explainLines(q: &Query): []str {
+// EXPLAIN: a line per table; with counts (EXPLAIN ANALYZE), what each did.
+fn explainLines(q: &Query, cnt: &[]Counts): []str {
     var out: []str = []
     for k in 0..len(q.levels) {
+        var tail = ""
+        if len(cnt) > 0 {
+            let c = cnt[k]
+            var parts: []str = []
+            if k > 0 && !q.levels[k].perRow {
+                append(mut &parts, "table rows " + c.kept.toStr() + " of " + c.built.toStr() + " read")
+                append(mut &parts, "probes " + c.starts.toStr())
+            } else if k > 0 {
+                append(mut &parts, "lookups " + c.starts.toStr())
+            }
+            append(mut &parts, "rows read " + c.read.toStr())
+            append(mut &parts, (if k == 0 { "kept " } else { "joined " }) + c.joined.toStr())
+            if q.levels[k].join == lexdb_sql.J_LEFT { append(mut &parts, "null rows " + c.nulls.toStr()) }
+            tail = " (" + strings.join(&parts, ", ") + ")"
+        }
         let lv = &q.levels[k]
         let name = if lv.alias == lv.t.name { lv.t.name } else { lv.t.name + " " + lv.alias }
         if k == 0 {
-            append(mut &out, "scan " + name + ": " + pathText(lv))
+            append(mut &out, "scan " + name + ": " + pathText(lv) + tail)
             continue
         }
         let kind = match lv.join { lexdb_sql.J_LEFT { "left join " } lexdb_sql.J_CROSS { "cross join " } else { "join " } }
@@ -1486,7 +1523,7 @@ fn explainLines(q: &Query): []str {
         } else {
             how = "loop over " + pathText(lv)
         }
-        append(mut &out, kind + name + ": " + how)
+        append(mut &out, kind + name + ": " + how + tail)
     }
     return out
 }
@@ -1752,10 +1789,11 @@ fn update(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
         append(mut &sets, try resolve(&set.expr, &q.cols, len(q.cols)))
     }
     var found: [][]Val = []
+    var cnt = newCounts(&q)
     try runQuery(st, txn, &q, params, fn(r: &[]Val): Result[bool, DbErr] {
         append(mut &found, copyRow(r))
         return Ok(true)
-    })
+    }, mut &cnt)
     let noGroup: [][]Val = []
     for old in found {
         let env = Env{cols: &q.cols, row: &old, group: &noGroup, agg: false, params: params}
@@ -1780,10 +1818,11 @@ fn delete(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     let q = try buildQuery(st, txn, &oneTable(&s.table), &s.where)
     let t = &q.levels[0].t
     var found: [][]Val = []
+    var cnt = newCounts(&q)
     try runQuery(st, txn, &q, params, fn(r: &[]Val): Result[bool, DbErr] {
         append(mut &found, copyRow(r))
         return Ok(true)
-    })
+    }, mut &cnt)
     for row in found {
         let key = keyOf(t, &row)
         txn.del(t.tree, key)
@@ -1792,13 +1831,27 @@ fn delete(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     return Ok(tagOnly("DELETE " + len(found).toStr()))
 }
 
-fn explain(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
-    let q = if s.kind == lexdb_sql.S_SELECT { try buildQuery(st, txn, &s.from, &s.where) } else {
-        try buildQuery(st, txn, &oneTable(&s.table), &s.where)
-    }
+fn explain(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, x: &lexdb_sql.Stmt, params: &[]Val,
+           ptypes: &[]int): Result[Res, DbErr] {
+    let s = &x.inner[0]
     var res = Res{cols: [OutCol{name: "QUERY PLAN", oid: lexdb_sql.OID_TEXT}], rows: [], tag: "EXPLAIN", hasRows: true}
-    if len(q.levels) == 0 { append(mut &res.rows, [Val.Text("result")]) }
-    for l in explainLines(&q) { append(mut &res.rows, [Val.Text(l)]) }
+    var lines: []str = []
+    if x.ifFlag {
+        // ANALYZE: run it, counting what each table does
+        let t0 = time.monotonicNs()
+        let r = try selectWith(st, txn, s, params, ptypes, true, mut &lines)
+        let us = (time.monotonicNs() - t0) / 1000
+        append(mut &lines, "result: " + len(r.rows).toStr() + " rows in " + (us / 1000).toStr() + "." +
+               strings.padLeft((us % 1000).toStr(), 3, '0') + " ms")
+    } else {
+        let q = if s.kind == lexdb_sql.S_SELECT { try buildQuery(st, txn, &s.from, &s.where) } else {
+            try buildQuery(st, txn, &oneTable(&s.table), &s.where)
+        }
+        let none: []Counts = []
+        lines = explainLines(&q, &none)
+        if len(q.levels) == 0 { append(mut &lines, "result") }
+    }
+    for l in lines { append(mut &res.rows, [Val.Text(l)]) }
     return Ok(res)
 }
 
@@ -1972,7 +2025,16 @@ fn orderValue(o: &Expr, outs: &[]OutCol, vals: &[]Val, env: &Env): Result[Val, D
 }
 
 fn select(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int): Result[Res, DbErr] {
+    var none: []str = []
+    return selectWith(st, txn, s, params, ptypes, false, mut &none)
+}
+
+// A SELECT; with analyze, plan gets EXPLAIN ANALYZE's lines (a line per
+// table, with what it did). The counts are kept for every query: an add each.
+fn selectWith(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int,
+              analyze: bool, plan: mut &[]str): Result[Res, DbErr] {
     var q = try buildQuery(st, txn, &s.from, &s.where)
+    var cnt = newCounts(&q)
     var exprs: []Expr = []
     let outs = try selectCols(s, &q.cols, ptypes, mut &exprs)
     var groupBy: []Expr = []
@@ -1983,7 +2045,7 @@ fn select(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     for x in exprs { if hasAgg(&x) { aggQ = true } }
     let limit = try evalInt(&s.limit, params, "LIMIT")
     let offset = try evalInt(&s.offset, params, "OFFSET")
-    try materialize(st, txn, mut &q, params)
+    try materialize(st, txn, mut &q, params, mut &cnt)
     var outRows: []OutRow = []
     let early = !aggQ && len(order) == 0 && limit >= 0
     let stopAt = if offset > 0 { limit + offset } else { limit }
@@ -2012,7 +2074,7 @@ fn select(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
                 append(mut &groups[0], row)
             }
             return Ok(true)
-        })
+        }, mut &cnt)
         if len(groups) == 0 && len(groupBy) == 0 { append(mut &groups, []) }
         let noRow: []Val = []
         for g in groups {
@@ -2032,7 +2094,7 @@ fn select(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
             for o in order { append(mut &ord, try orderValue(&o, &outs, &vals, &env)) }
             append(mut &outRows, OutRow{vals: vals, ord: ord})
             return Ok(!early || len(outRows) < stopAt)
-        })
+        }, mut &cnt)
     }
     if len(order) > 0 {
         collections.sortBy(mut &outRows, fn(a: &OutRow, b: &OutRow): int {
@@ -2056,6 +2118,10 @@ fn select(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
         i += 1
     }
     res.tag = "SELECT " + len(res.rows).toStr()
+    if analyze {
+        let lines = explainLines(&q, &cnt)
+        for l in lines { append(plan, l) }
+    }
     return Ok(res)
 }
 
@@ -2207,7 +2273,7 @@ fn execIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
         lexdb_sql.S_DELETE { return delete(st, txn, s, params) }
         lexdb_sql.S_CREATE_INDEX { return createIndex(st, txn, s) }
         lexdb_sql.S_DROP_INDEX { return dropIndex(st, txn, s) }
-        lexdb_sql.S_EXPLAIN { return explain(st, txn, &s.inner[0]) }
+        lexdb_sql.S_EXPLAIN { return explain(st, txn, s, params, ptypes) }
         else { return Err(e("XX000", "not a data statement")) }
     }
 }

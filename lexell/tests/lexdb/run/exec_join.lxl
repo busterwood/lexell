@@ -77,6 +77,13 @@
 // expect: select c.name, o.total, p.name from cust c join orders o on o.cust = c.id join people p on p.id = c.id order by o.id -> [name,total,name]
 // expect: select c.name from cust c join orders o on o.cust = c.id limit 1 -> [name] ann
 // expect: select * from cust c right join orders o on true -> 0A000 RIGHT, FULL and NATURAL joins are not supported
+// expect: -- explain analyze
+// expect: explain analyze select c.name, o.total from cust c join orders o on o.cust = c.id -> scan cust c: full scan (rows read 3, kept 3); join orders o: index orders_cust lookup per row (lookups 3, rows read 3, joined 3); result: 3 rows
+// expect: drop index orders_cust -> DROP INDEX
+// expect: explain analyze select c.name, o.total from cust c left join orders o on o.cust = c.id -> scan cust c: full scan (rows read 3, kept 3); left join orders o: hash on (cust) over full scan (table rows 4 of 4 read, probes 3, rows read 3, joined 3, null rows 1); result: 4 rows
+// expect: explain analyze select c.name, o.total from orders o join cust c on c.id = o.cust where o.total > 6 -> scan orders o: full scan (rows read 4, kept 2); join cust c: primary key lookup per row (lookups 2, rows read 2, joined 2); result: 2 rows
+// expect: explain analyze select count(*) from cust a, cust b -> scan cust a: full scan (rows read 3, kept 3); cross join cust b: loop over full scan (table rows 3 of 3 read, probes 3, rows read 9, joined 9); result: 1 rows
+// expect: explain analyze delete from cust -> 0A000 EXPLAIN ANALYZE takes SELECT
 // expect: drop table orders -> DROP TABLE
 // expect: create index orders_cust on cust (name) -> CREATE INDEX
 // expect: explain update people set age = 1 where name = 'cy' -> [QUERY PLAN] scan people: index people_name lookup
@@ -102,6 +109,20 @@ fn show(s: mut &lexdb_exec.Session, sql: str) {
             var names: []str = []
             for c in r.cols { append(mut &names, c.name) }
             println(sql + " -> [" + strings.join(&names, ",") + "]" + (if len(lines) > 0 { " " } else { "" }) + strings.join(&lines, "; "))
+        }
+        Err(e) { println(sql + " -> " + e.state + " " + e.msg) }
+    }
+}
+
+// EXPLAIN ANALYZE without its last line (the time).
+fn analyze(s: mut &lexdb_exec.Session, sql: str) {
+    match s.exec(&sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            var lines: []str = []
+            for i in 0..len(r.rows) - 1 { append(mut &lines, lexdb_exec.text(&r.rows[i][0])) }
+            let last = lexdb_exec.text(&r.rows[len(r.rows) - 1][0])
+            println(sql + " -> " + strings.join(&lines, "; ") + "; " + last[0..strings.indexOf(last, " in ", 0)])
         }
         Err(e) { println(sql + " -> " + e.state + " " + e.msg) }
     }
@@ -187,6 +208,13 @@ fn body(st: lexdb_store.Store): int {
     show(mut &s, "select c.name, o.total, p.name from cust c join orders o on o.cust = c.id join people p on p.id = c.id order by o.id")
     show(mut &s, "select c.name from cust c join orders o on o.cust = c.id limit 1")
     show(mut &s, "select * from cust c right join orders o on true")
+    println("-- explain analyze")
+    analyze(mut &s, "explain analyze select c.name, o.total from cust c join orders o on o.cust = c.id")
+    show(mut &s, "drop index orders_cust")
+    analyze(mut &s, "explain analyze select c.name, o.total from cust c left join orders o on o.cust = c.id")
+    analyze(mut &s, "explain analyze select c.name, o.total from orders o join cust c on c.id = o.cust where o.total > 6")
+    analyze(mut &s, "explain analyze select count(*) from cust a, cust b")
+    show(mut &s, "explain analyze delete from cust")
     show(mut &s, "drop table orders")
     show(mut &s, "create index orders_cust on cust (name)")
     show(mut &s, "explain update people set age = 1 where name = 'cy'")
