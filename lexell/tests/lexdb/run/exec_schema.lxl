@@ -1,0 +1,130 @@
+// lexdb_exec: schemas (design/lexdb.md 9.20). schema.table names, CREATE
+// and DROP SCHEMA, the search path, three-part column names:
+// - a table t in public and one in schema s: t and s.t are each its own;
+//   s.t.v names a column of s.t;
+// - SET search_path to s, public: t is s's; a table only in public is still
+//   found; a new unqualified table goes in s; SHOW search_path;
+// - an index lives in its table's schema: the same name in two schemas,
+//   EXPLAIN names it, DROP INDEX finds it by the path or qualified;
+// - UPDATE and DELETE of s.t;
+// - in a block: the path from before BEGIN, and one SET in it; a ROLLBACK
+//   restores the path SET in its block;
+// - a prepared SELECT plans again when the path changes;
+// - DROP SCHEMA refused while it holds tables, CASCADE drops them;
+// - the errors: a schema that does not exist, made twice, a path naming
+//   no schema that exists.
+// expect: public t: p1, s.t: s1, s.t.v: s1, joined: p1 s1
+// expect: path s, public: t is s1, only-public: o1, show: s, public
+// expect: new table on the path: in s 1, in public 42P01
+// expect: same index name in two schemas: ok ok, twice in s: 42P07
+// expect: explain: scan t: index vi lookup
+// expect: drop index by path: public 42704, qualified ok
+// expect: update and delete in s: s2, then 0 rows
+// expect: block: s1, p1 then s1, rollback: public
+// expect: prepared: p1, after set: s1, plans 2
+// expect: drop schema: 2BP01, cascade ok, then s.t 42P01
+// expect: errors: create in missing schema 3F000, schema twice 42P06, drop missing 3F000, if exists ok
+// expect: path to no schema: create 3F000, select 42P01
+// expect: reset: public p1
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_sql"
+
+type Val = lexdb_sql.Val
+
+// every value of every row, space-separated, or the error's state
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            var out: []str = []
+            for r in rs {
+                for row in r.rows { for v in row { append(mut &out, lexdb_exec.text(&v)) } }
+            }
+            if len(out) == 0 { return "ok" }
+            return strings.join(&out, " ")
+        }
+        Err(e) { return e.state }
+    }
+}
+
+fn one(s: mut &lexdb_exec.Session, sql: &str) {
+    let r = q(s, sql)
+    if r != "ok" { println(sql + ": " + r) }
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(23), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 1024 * 1024, ckptBytes: 1024 * 1024, snapNodes: 100000}, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        one(mut &s, &"create schema s")
+        one(mut &s, &"create table s.t (id int primary key, v text)")
+        one(mut &s, &"insert into s.t values (1, 's1')")
+        one(mut &s, &"create table t (id int primary key, v text)")
+        one(mut &s, &"insert into public.t values (1, 'p1')")
+        one(mut &s, &"create table o (id int primary key, v text)")
+        one(mut &s, &"insert into o values (1, 'o1')")
+        println("public t: " + q(mut &s, &"select v from t") + ", s.t: " + q(mut &s, &"select v from s.t") +
+                ", s.t.v: " + q(mut &s, &"select s.t.v from s.t") +
+                ", joined: " + q(mut &s, &"select t.v, x.v from t join s.t x on x.id = t.id"))
+
+        one(mut &s, &"set search_path to s, public")
+        println("path s, public: t is " + q(mut &s, &"select v from t") + ", only-public: " + q(mut &s, &"select v from o") +
+                ", show: " + q(mut &s, &"show search_path"))
+        one(mut &s, &"create table u (id int primary key)")
+        one(mut &s, &"insert into u values (1)")
+        one(mut &s, &"set search_path = public")
+        println("new table on the path: in s " + q(mut &s, &"select count(*) from s.u") + ", in public " + q(mut &s, &"select count(*) from u"))
+
+        let i1 = q(mut &s, &"create index vi on t (v)")
+        let i2 = q(mut &s, &"create index vi on s.t (v)")
+        let i3 = q(mut &s, &"create index vi on s.u (id)")
+        println("same index name in two schemas: " + i1 + " " + i2 + ", twice in s: " + i3)
+        println("explain: " + q(mut &s, &"explain select id from s.t where v = 's1'"))
+        one(mut &s, &"create index wi on s.t (id, v)")
+        println("drop index by path: public " + q(mut &s, &"drop index wi") + ", qualified " + q(mut &s, &"drop index s.wi"))
+
+        one(mut &s, &"insert into s.t values (2, 's2')")
+        one(mut &s, &"update s.t set v = 'z' where id = 1")
+        let after = q(mut &s, &"select v from s.t where v <> 'z'")
+        one(mut &s, &"delete from s.t where id = 2")
+        one(mut &s, &"delete from s.t where id = 1")
+        println("update and delete in s: " + after + ", then " + q(mut &s, &"select count(*) from s.t") + " rows")
+        one(mut &s, &"insert into s.t values (1, 's1')")
+
+        one(mut &s, &"set search_path to s")
+        one(mut &s, &"begin")
+        let inBlock = q(mut &s, &"select v from t")
+        one(mut &s, &"commit")
+        one(mut &s, &"reset search_path")
+        one(mut &s, &"begin")
+        let pubBlock = q(mut &s, &"select v from t")
+        one(mut &s, &"set search_path to s")
+        let setBlock = q(mut &s, &"select v from t")
+        one(mut &s, &"rollback")
+        println("block: " + inBlock + ", " + pubBlock + " then " + setBlock + ", rollback: " + q(mut &s, &"show search_path"))
+
+        let ps = lexdb_sql.parse(&"select v from t where id = $1").unwrap()
+        var pc = lexdb_exec.newPlanCache()
+        let pt: []int = [lexdb_sql.OID_INT8]
+        let a = lexdb_exec.text(&s.runCached(&ps[0], &[Val.Int(1)], &pt, mut &pc).unwrap().rows[0][0])
+        let a2 = s.runCached(&ps[0], &[Val.Int(1)], &pt, mut &pc).unwrap()
+        one(mut &s, &"set search_path to s, public")
+        let b = lexdb_exec.text(&s.runCached(&ps[0], &[Val.Int(1)], &pt, mut &pc).unwrap().rows[0][0])
+        println("prepared: " + a + ", after set: " + b + ", plans " + pc.plans.toStr())
+        one(mut &s, &"reset search_path")
+
+        let d1 = q(mut &s, &"drop schema s")
+        let d2 = q(mut &s, &"drop schema s cascade")
+        println("drop schema: " + d1 + ", cascade " + d2 + ", then s.t " + q(mut &s, &"select * from s.t"))
+        println("errors: create in missing schema " + q(mut &s, &"create table s.x (id int primary key)") +
+                ", schema twice " + q(mut &s, &"create schema public") +
+                ", drop missing " + q(mut &s, &"drop schema s") + ", if exists " + q(mut &s, &"drop schema if exists s"))
+        one(mut &s, &"set search_path to nope")
+        println("path to no schema: create " + q(mut &s, &"create table y (id int primary key)") + ", select " + q(mut &s, &"select * from t"))
+        one(mut &s, &"reset all")
+        println("reset: " + q(mut &s, &"show search_path") + " " + q(mut &s, &"select v from t"))
+        return 0
+    }).unwrap()
+}

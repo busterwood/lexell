@@ -34,6 +34,7 @@ type Prepared = record {
     ptypes: []int
     cols: []lexdb_exec.OutCol   // its result's columns, as Describe found them
     colsAt: int                 // the catalog's changes then (Store.changes), -1 not yet
+    pathAt: int                 // the session's search path then (Session.pathVersion)
     plan: lexdb_exec.PlanCache  // its SELECT's plan, kept between executions
 }
 
@@ -304,11 +305,11 @@ fn (w: mut &Wire) parseMsg(ps: mut &Ps, body: &str): Result[Unit, lexdb_base.DbE
     if len(stmts) > 1 { return Err(lexdb_base.err("42601", "cannot insert multiple commands into a prepared statement")) }
     if len(stmts) == 1 && stmts[0].kind == lexdb_sql.S_EMPTY { stmts = [] }
     var ptypes: []int = []
-    if len(stmts) == 1 { ptypes = lexdb_exec.paramTypes(&w.st, &stmts[0], &given) }
+    if len(stmts) == 1 { ptypes = w.sess.paramTypes(&stmts[0], &given) }
     if name != "" && ps.stmts.has(&name) {
         return Err(lexdb_base.err("42P05", "prepared statement \"" + name + "\" already exists"))
     }
-    ps.stmts.put(name, Prepared{stmts: stmts, ptypes: ptypes, cols: [], colsAt: -1, plan: lexdb_exec.newPlanCache()})
+    ps.stmts.put(name, Prepared{stmts: stmts, ptypes: ptypes, cols: [], colsAt: -1, pathAt: 0, plan: lexdb_exec.newPlanCache()})
     w.empty('1')
     return Ok(Unit{})
 }
@@ -399,22 +400,23 @@ fn (w: mut &Wire) describeMsg(ps: mut &Ps, body: &str): Result[Unit, lexdb_base.
         for t in p.ptypes { binary.addU32BE(mut &b, t) }
         w.msg('t', &b)
     }
-    if len(p.stmts) == 0 || p.stmts[0].kind != lexdb_sql.S_SELECT {
+    if len(p.stmts) == 0 || (p.stmts[0].kind != lexdb_sql.S_SELECT && p.stmts[0].kind != lexdb_sql.S_SHOW) {
         w.empty('n')
         return Ok(Unit{})
     }
     // Describing plans the query: libpq describes the portal before every
     // execution, so the columns are kept while the catalog is unchanged.
     let now = w.st.changes()
-    if p.colsAt == now {
+    if p.colsAt == now && p.pathAt == w.sess.pathVersion() {
         w.rowDesc(&p.cols)
         return Ok(Unit{})
     }
-    let cols = try lexdb_exec.describe(&w.st, &p.stmts[0], &p.ptypes)
+    let cols = try w.sess.describe(&p.stmts[0], &p.ptypes)
     w.rowDesc(&cols)
     let m = ps.stmts.atMut(stmtName)
     m.cols = cols
     m.colsAt = now
+    m.pathAt = w.sess.pathVersion()
     return Ok(Unit{})
 }
 

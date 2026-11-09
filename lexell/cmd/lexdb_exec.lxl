@@ -1016,9 +1016,49 @@ fn bumpCatalog(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[Unit, 
     return Ok(Unit{})
 }
 
+// ---- schemas (9.20): a table's catalog key is its name qualified by its
+// schema (lexdb_sql.qual: schema QSEP name), public's unqualified. A schema
+// is a catalog row of its own (schemaKey). An unqualified name is looked up
+// along the transaction's search path (Txn.path, [] for public alone).
+
+fn schemaKey(n: &str): str { return "\x03" + n }
+
+fn schemaExists(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, n: &str): Result[bool, DbErr] {
+    if n == "public" { return Ok(true) }
+    return Ok((try st.get(txn, CATALOG, schemaKey(n))).isSome())
+}
+
+// The schema new unqualified names go in: the first on the path that
+// exists ("" none).
+fn createSchema(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[str, DbErr] {
+    if len(txn.path) == 0 { return Ok("public") }
+    for i in 0..len(txn.path) {
+        let sc = txn.path[i]
+        if try schemaExists(st, txn, &sc) { return Ok(sc) }
+    }
+    return Ok("")
+}
+
+// The catalog key of a table (idx false) or an index named n: n if it is
+// qualified or the path is public's; else the first schema on the path
+// holding it, or none: the schema new names would go in (it is not there).
+fn catKey(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, n: &str, idx: bool): Result[str, DbErr] {
+    if len(txn.path) == 0 || lexdb_sql.isQual(n) { return Ok(n) }
+    for i in 0..len(txn.path) {
+        let sc = txn.path[i]
+        let k = lexdb_sql.qual(&sc, n)
+        let found = try st.get(txn, CATALOG, if idx { idxName(&k) } else { k })
+        if found.isSome() { return Ok(k) }
+    }
+    let sc = try createSchema(st, txn)
+    let first = txn.path[0]
+    return Ok(lexdb_sql.qual(if len(sc) > 0 { &sc } else { &first }, n))
+}
+
 fn findTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, name: &str): Result[Option[Table], DbErr] {
-    match try st.get(txn, CATALOG, name) {
-        Some(s) { return Ok(Some(try decTable(name, &s))) }
+    let k = try catKey(st, txn, name, false)
+    match try st.get(txn, CATALOG, k) {
+        Some(s) { return Ok(Some(try decTable(&k, &s))) }
         None { return Ok(None) }
     }
 }
@@ -1026,7 +1066,7 @@ fn findTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, name: &str): Res
 fn needTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, name: &str): Result[Table, DbErr] {
     match try findTable(st, txn, name) {
         Some(t) { return Ok(t) }
-        None { return Err(e("42P01", "relation \"" + name + "\" does not exist")) }
+        None { return Err(e("42P01", "relation \"" + lexdb_sql.shown(name) + "\" does not exist")) }
     }
 }
 
@@ -3113,7 +3153,7 @@ fn pathText(lv: &Level): str {
     if len(p.ins) > 0 {
         let each = " for each of " + len(p.ins).toStr() + " values" + (if p.desc { " backward" } else { "" })
         if p.index < 0 { return "primary key " + (if len(p.eqs) + 1 == len(cols) { "lookup" } else { "range" }) + each }
-        return "index " + lv.t.indexes[p.index].name + (if lv.t.indexes[p.index].pred.isSome() { " (filtered)" } else { "" }) +
+        return "index " + lexdb_sql.baseName(&lv.t.indexes[p.index].name) + (if lv.t.indexes[p.index].pred.isSome() { " (filtered)" } else { "" }) +
                " lookup" + each
     }
     if p.index < 0 {
@@ -3123,7 +3163,7 @@ fn pathText(lv: &Level): str {
     }
     let what = if len(p.eqs) == len(cols) { " lookup" } else if len(p.eqs) > 0 || len(p.rng) > 0 { " range" } else { " scan" }
     let filtered = if lv.t.indexes[p.index].pred.isSome() { " (filtered)" } else { "" }
-    return "index " + lv.t.indexes[p.index].name + filtered + what + (if p.desc { " backward" } else { "" })
+    return "index " + lexdb_sql.baseName(&lv.t.indexes[p.index].name) + filtered + what + (if p.desc { " backward" } else { "" })
 }
 
 // EXPLAIN: a line per table; with counts (EXPLAIN ANALYZE), what each did.
@@ -3147,7 +3187,8 @@ fn explainLines(q: &Query, cnt: &[]Counts): []str {
             tail = " (" + strings.join(&parts, ", ") + ")"
         }
         let lv = &q.levels[k]
-        let name = if lv.alias == lv.t.name { lv.t.name } else { lv.t.name + " " + lv.alias }
+        let tn = lexdb_sql.baseName(&lv.t.name)
+        let name = if lv.alias == tn { tn } else { tn + " " + lv.alias }
         if k == 0 {
             append(mut &out, "scan " + name + ": " + pathText(lv) + tail)
             continue
@@ -3181,7 +3222,7 @@ fn copyRow(r: &[]Val): []Val {
 }
 
 fn oneTable(name: &str): []lexdb_sql.FromItem {
-    return [lexdb_sql.FromItem{table: name, alias: name, join: lexdb_sql.J_FIRST, on: None, sub: -1, cols: [], work: -1, lateral: false}]
+    return [lexdb_sql.FromItem{table: name, alias: lexdb_sql.baseName(name), join: lexdb_sql.J_FIRST, on: None, sub: -1, cols: [], work: -1, lateral: false}]
 }
 
 // ---- indexes: an entry per row, its key the indexed columns then the
@@ -3229,7 +3270,7 @@ fn checkUnique(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, ix:
         append(mut &names, t.cols[c].name)
         append(mut &vals, text(&row[c]))
     }
-    return Err(e("23505", "duplicate key value violates unique constraint \"" + ix.name + "\": Key (" +
+    return Err(e("23505", "duplicate key value violates unique constraint \"" + lexdb_sql.baseName(&ix.name) + "\": Key (" +
                  strings.join(&names, ", ") + ")=(" + strings.join(&vals, ", ") + ") already exists."))
 }
 
@@ -3276,15 +3317,25 @@ fn changeIndexes(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, o
 // ---- statements
 
 fn createTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
-    let exists = (try findTable(st, txn, &s.table)).isSome() || (try st.get(txn, CATALOG, idxName(&s.table))).isSome()
+    var key = s.table
+    if lexdb_sql.isQual(&s.table) {
+        let sn = lexdb_sql.schemaOf(&s.table)
+        if !(try schemaExists(st, txn, &sn)) { return Err(e("3F000", "schema \"" + sn + "\" does not exist")) }
+    } else {
+        let sn = try createSchema(st, txn)
+        if len(sn) == 0 { return Err(e("3F000", "no schema has been selected to create in")) }
+        key = lexdb_sql.qual(&sn, &s.table)
+    }
+    let base = lexdb_sql.baseName(&key)
+    let exists = (try st.get(txn, CATALOG, key)).isSome() || (try st.get(txn, CATALOG, idxName(&key))).isSome()
     if exists {
         if s.ifFlag { return Ok(tagOnly("CREATE TABLE")) }
-        return Err(e("42P07", "relation \"" + s.table + "\" already exists"))
+        return Err(e("42P07", "relation \"" + base + "\" already exists"))
     }
     if len(s.pk) == 0 {
-        return Err(e("42P16", "lexdb: table \"" + s.table + "\" needs a PRIMARY KEY"))
+        return Err(e("42P16", "lexdb: table \"" + base + "\" needs a PRIMARY KEY"))
     }
-    var t = Table{name: s.table, tree: 0, cols: [], pk: [], indexes: []}
+    var t = Table{name: key, tree: 0, cols: [], pk: [], indexes: []}
     for c in s.cols {
         if colIndex(&t.cols, &c.name) >= 0 { return Err(e("42701", "column \"" + c.name + "\" specified more than once")) }
         append(mut &t.cols, lexdb_sql.ColDef{name: c.name, typ: c.typ, notNull: c.notNull})
@@ -3303,7 +3354,7 @@ fn createTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
         }
     }
     t.tree = st.createTree(txn)
-    try txn.put(CATALOG, s.table, encTable(&t))
+    try txn.put(CATALOG, key, encTable(&t))
     try bumpCatalog(st, txn)
     return Ok(tagOnly("CREATE TABLE"))
 }
@@ -3311,31 +3362,76 @@ fn createTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
 fn dropTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
     match try findTable(st, txn, &s.table) {
         Some(t) {
-            for ix in t.indexes {
-                txn.dropTree(ix.tree)
-                txn.del(CATALOG, idxName(&ix.name))
-            }
-            txn.dropTree(t.tree)
-            txn.del(CATALOG, s.table)
+            dropOne(txn, &t)
             try bumpCatalog(st, txn)
             return Ok(tagOnly("DROP TABLE"))
         }
         None {
             if s.ifFlag { return Ok(tagOnly("DROP TABLE")) }
-            return Err(e("42P01", "table \"" + s.table + "\" does not exist"))
+            return Err(e("42P01", "table \"" + lexdb_sql.shown(&s.table) + "\" does not exist"))
         }
     }
+}
+
+// A table's trees and catalog rows, its indexes' too.
+fn dropOne(txn: mut &lexdb_store.Txn, t: &Table) {
+    for ix in t.indexes {
+        txn.dropTree(ix.tree)
+        txn.del(CATALOG, idxName(&ix.name))
+    }
+    txn.dropTree(t.tree)
+    txn.del(CATALOG, t.name)
+}
+
+fn createSchemaStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
+    if try schemaExists(st, txn, &s.table) {
+        if s.ifFlag { return Ok(tagOnly("CREATE SCHEMA")) }
+        return Err(e("42P06", "schema \"" + s.table + "\" already exists"))
+    }
+    if strings.startsWith(s.table, "pg_") { return Err(e("42939", "unacceptable schema name \"" + s.table + "\"")) }
+    try txn.put(CATALOG, schemaKey(&s.table), "")
+    try bumpCatalog(st, txn)
+    return Ok(tagOnly("CREATE SCHEMA"))
+}
+
+// DROP SCHEMA: refused while it holds a table, unless CASCADE, which drops
+// them.
+fn dropSchema(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
+    if s.table == "public" { return Err(e("0A000", "lexdb: schema public cannot be dropped")) }
+    if !(try schemaExists(st, txn, &s.table)) {
+        if s.ifFlag { return Ok(tagOnly("DROP SCHEMA")) }
+        return Err(e("3F000", "schema \"" + s.table + "\" does not exist"))
+    }
+    let from = lexdb_sql.qual(&s.table, &"")
+    var keys: []str = []
+    try st.scan(txn, CATALOG, from, from + "\xff", fn(en: &lexdb_store.Entry): bool {
+        append(mut &keys, en.key)
+        return true
+    })
+    if len(keys) > 0 && !s.cascade {
+        return Err(e("2BP01", "cannot drop schema " + s.table + " because other objects depend on it"))
+    }
+    for k in keys {
+        match try findTable(st, txn, &k) {
+            Some(t) { dropOne(txn, &t) }
+            None {}
+        }
+    }
+    txn.del(CATALOG, schemaKey(&s.table))
+    try bumpCatalog(st, txn)
+    return Ok(tagOnly("DROP SCHEMA"))
 }
 
 // CREATE [UNIQUE] INDEX: a tree of its own, filled from the table's rows in
 // the same transaction.
 fn createIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
-    let exists = (try findTable(st, txn, &s.index)).isSome() || (try st.get(txn, CATALOG, idxName(&s.index))).isSome()
+    var t = try needTable(st, txn, &s.table)
+    let ixKey = lexdb_sql.qual(&lexdb_sql.schemaOf(&t.name), &s.index)     // in its table's schema
+    let exists = (try st.get(txn, CATALOG, ixKey)).isSome() || (try st.get(txn, CATALOG, idxName(&ixKey))).isSome()
     if exists {
         if s.ifFlag { return Ok(tagOnly("CREATE INDEX")) }
         return Err(e("42P07", "relation \"" + s.index + "\" already exists"))
     }
-    var t = try needTable(st, txn, &s.table)
     var cols: []int = []
     for n in s.names {
         let i = colIndex(&t.cols, &n)
@@ -3359,7 +3455,7 @@ fn createIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
         }
         None {}
     }
-    let ix = Index{name: s.index, tree: st.createTree(txn), cols: cols, unique: s.unique, pred: pred}
+    let ix = Index{name: ixKey, tree: st.createTree(txn), cols: cols, unique: s.unique, pred: pred}
     let path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: []}
     let sc = Scan{empty: false, point: false, lo: "", hi: ""}
     var cur = newCursor()
@@ -3381,30 +3477,31 @@ fn createIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
     }
     append(mut &t.indexes, ix)
     try txn.put(CATALOG, t.name, encTable(&t))
-    try txn.put(CATALOG, idxName(&s.index), t.name)
+    try txn.put(CATALOG, idxName(&ixKey), t.name)
     try bumpCatalog(st, txn)
     return Ok(tagOnly("CREATE INDEX"))
 }
 
 fn dropIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
-    match try st.get(txn, CATALOG, idxName(&s.index)) {
+    let ixKey = try catKey(st, txn, &s.index, true)
+    match try st.get(txn, CATALOG, idxName(&ixKey)) {
         Some(tn) {
             var t = try needTable(st, txn, &tn)
             var old = replace(mut &t.indexes, [])
             var rev: []Index = []
             while len(old) > 0 {
                 let ix = pop(mut &old)
-                if ix.name == s.index { txn.dropTree(ix.tree) } else { append(mut &rev, ix) }
+                if ix.name == ixKey { txn.dropTree(ix.tree) } else { append(mut &rev, ix) }
             }
             while len(rev) > 0 { append(mut &t.indexes, pop(mut &rev)) }
-            txn.del(CATALOG, idxName(&s.index))
+            txn.del(CATALOG, idxName(&ixKey))
             try txn.put(CATALOG, t.name, encTable(&t))
             try bumpCatalog(st, txn)
             return Ok(tagOnly("DROP INDEX"))
         }
         None {
             if s.ifFlag { return Ok(tagOnly("DROP INDEX")) }
-            return Err(e("42704", "index \"" + s.index + "\" does not exist"))
+            return Err(e("42704", "index \"" + lexdb_sql.shown(&s.index) + "\" does not exist"))
         }
     }
 }
@@ -3412,7 +3509,7 @@ fn dropIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.St
 fn checkRow(t: &Table, row: &[]Val): Result[Unit, DbErr] {
     for i in 0..len(t.cols) {
         if t.cols[i].notNull && isNull(&row[i]) {
-            return Err(e("23502", "null value in column \"" + t.cols[i].name + "\" of relation \"" + t.name +
+            return Err(e("23502", "null value in column \"" + t.cols[i].name + "\" of relation \"" + lexdb_sql.baseName(&t.name) +
                          "\" violates not-null constraint"))
         }
     }
@@ -3426,7 +3523,7 @@ fn dupKey(t: &Table, row: &[]Val): DbErr {
         append(mut &names, t.cols[i].name)
         append(mut &vals, text(&row[i]))
     }
-    return e("23505", "duplicate key value violates unique constraint \"" + t.name + "_pkey\": Key (" +
+    return e("23505", "duplicate key value violates unique constraint \"" + lexdb_sql.baseName(&t.name) + "_pkey\": Key (" +
              strings.join(&names, ", ") + ")=(" + strings.join(&vals, ", ") + ") already exists.")
 }
 
@@ -3438,7 +3535,7 @@ fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     } else {
         for n in s.names {
             let i = colIndex(&t.cols, &n)
-            if i < 0 { return Err(e("42703", "column \"" + n + "\" of relation \"" + t.name + "\" does not exist")) }
+            if i < 0 { return Err(e("42703", "column \"" + n + "\" of relation \"" + lexdb_sql.baseName(&t.name) + "\" does not exist")) }
             append(mut &targets, i)
         }
     }
@@ -3493,7 +3590,7 @@ fn update(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     for set in s.sets {
         let i = colIndex(&q.levels[0].t.cols, &set.col)
         if i < 0 {
-            return Err(e("42703", "column \"" + set.col + "\" of relation \"" + q.levels[0].t.name + "\" does not exist"))
+            return Err(e("42703", "column \"" + set.col + "\" of relation \"" + lexdb_sql.baseName(&q.levels[0].t.name) + "\" does not exist"))
         }
         append(mut &targets, i)
         append(mut &sets, try resolve(&set.expr, &q.cols, len(q.cols), mut &sc))
@@ -3785,7 +3882,8 @@ fn select(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
           lim: Limits, pc: mut &PlanCache): Result[Res, DbErr] {
     // A prepared statement's plan, kept while the schema the transaction
     // sees is the same and the plan looked at no parameter's value.
-    let ver = try catVersion(st, txn)
+    var ver = try catVersion(st, txn)
+    if len(txn.path) > 0 { ver = ver + "|" + strings.join(&txn.path, ",") }      // its names resolved by the path
     if len(pc.sels) == 0 || pc.ver != ver {
         pc.sels = []
         var sc = newScope(params, ptypes)
@@ -4700,13 +4798,13 @@ fn execSel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
 
 // The parameter types of a statement: the client's, else what the
 // statement compares or assigns them to, else text.
-pub fn paramTypes(st: &lexdb_store.Store, s: &lexdb_sql.Stmt, given: &[]int): []int {
+fn paramTypes(st: &lexdb_store.Store, s: &lexdb_sql.Stmt, given: &[]int, path: &[]str): []int {
     var out: []int = []
     for i in 0..s.params { append(mut &out, if i < len(given) { given[i] } else { 0 }) }
     if s.kind == lexdb_sql.S_EXPLAIN && len(s.inner) > 0 {
-        guessParams(st, &s.inner[0], mut &out)
+        guessParams(st, &s.inner[0], mut &out, path)
     } else {
-        guessParams(st, s, mut &out)
+        guessParams(st, s, mut &out, path)
     }
     for i in 0..len(out) { if out[i] == 0 { out[i] = lexdb_sql.OID_TEXT } }
     return out
@@ -4719,12 +4817,13 @@ fn setParam(x: &Expr, oid: int, out: mut &[]int) {
     }
 }
 
-fn guessParams(st: &lexdb_store.Store, s: &lexdb_sql.Stmt, out: mut &[]int) {
+fn guessParams(st: &lexdb_store.Store, s: &lexdb_sql.Stmt, out: mut &[]int, path: &[]str) {
     if s.setop != 0 {
-        for b in s.inner { guessParams(st, &b, out) }
+        for b in s.inner { guessParams(st, &b, out, path) }
         return
     }
     var txn = lexdb_store.begin()
+    for x in path { append(mut &txn.path, x) }
     match findTable(st, mut &txn, &s.table) {
         Ok(found) {
             match found {
@@ -4794,10 +4893,12 @@ fn compared(c: &Expr, q: &Query, out: mut &[]int) {
 }
 
 // The columns a statement returns (none unless it is a SELECT or EXPLAIN).
-pub fn describe(st: &lexdb_store.Store, s: &lexdb_sql.Stmt, ptypes: &[]int): Result[[]OutCol, DbErr] {
+fn describe(st: &lexdb_store.Store, s: &lexdb_sql.Stmt, ptypes: &[]int, path: &[]str): Result[[]OutCol, DbErr] {
     if s.kind == lexdb_sql.S_EXPLAIN { return Ok([OutCol{name: "QUERY PLAN", oid: lexdb_sql.OID_TEXT}]) }
+    if s.kind == lexdb_sql.S_SHOW { return Ok(showCols(&s.table)) }
     if s.kind != lexdb_sql.S_SELECT { return Ok([]) }
     var txn = lexdb_store.begin()
+    for x in path { append(mut &txn.path, x) }
     if s.setop != 0 {
         let np: []Val = array(if s.params > len(ptypes) { s.params } else { len(ptypes) }, Val.Null)
         var sc = newScope(&np, ptypes)
@@ -4825,11 +4926,72 @@ pub type Session = record {
     maxMem: int                 // SET max_statement_mem: the bytes of rows a statement holds at most; 0 no limit
     saved: []Limits             // in a transaction block: the settings at its BEGIN (a ROLLBACK restores them)
     readOnly: bool              // the block is BEGIN READ ONLY
+    path: []str                 // SET search_path: its schemas; [] public alone (the default)
+    pathAt: int                 // bumped when the path changes (the wire's kept descriptions)
+    savedPath: [][]str          // in a transaction block: the path at its BEGIN
+}
+
+// The columns a statement returns, its names looked up along the session's
+// search path.
+pub fn (s: &Session) describe(stmt: &lexdb_sql.Stmt, ptypes: &[]int): Result[[]OutCol, DbErr] {
+    return describe(&s.st, stmt, ptypes, &s.path)
+}
+
+// A statement's parameter types (paramTypes), along the session's path.
+pub fn (s: &Session) paramTypes(stmt: &lexdb_sql.Stmt, given: &[]int): []int {
+    return paramTypes(&s.st, stmt, given, &s.path)
+}
+
+// Changes when the search path does: a statement's description kept from
+// before may name other tables.
+pub fn (s: &Session) pathVersion(): int { return s.pathAt }
+
+fn (s: mut &Session) setPath(names: &[]str) {
+    var p: []str = []
+    for n in names { append(mut &p, n) }
+    if len(p) == 1 && p[0] == "public" { p = [] }
+    s.path = p
+    s.pathAt += 1
+    if len(s.txn) > 0 {
+        var q: []str = []
+        for n in s.path { append(mut &q, n) }
+        s.txn[0].path = q
+    }
+}
+
+// SHOW's columns: the setting's name, or SHOW ALL's name and setting.
+fn showCols(name: &str): []OutCol {
+    if name == "all" { return [OutCol{name: "name", oid: lexdb_sql.OID_TEXT}, OutCol{name: "setting", oid: lexdb_sql.OID_TEXT}] }
+    return [OutCol{name: name, oid: lexdb_sql.OID_TEXT}]
+}
+
+fn (s: &Session) setting(name: &str): Option[str] {
+    match name {
+        "search_path" { return Some(if len(s.path) == 0 { "public" } else { strings.join(&s.path, ", ") }) }
+        "max_recursion" { return Some(s.maxRecursion.toStr()) }
+        "statement_timeout" { return Some(if s.timeoutMs == 0 { "0" } else { s.timeoutMs.toStr() + "ms" }) }
+        "max_statement_mem" { return Some(if s.maxMem == 0 { "0" } else { (s.maxMem / 1024).toStr() + "kB" }) }
+        "transaction_isolation" { return Some("serializable") }
+        else { return None }
+    }
+}
+
+fn (s: &Session) show(name: &str): Result[Res, DbErr] {
+    var res = Res{cols: showCols(name), rows: [], tag: "SHOW", hasRows: true}
+    if name == "all" {
+        for n in lexdb_sql.SETTINGS { append(mut &res.rows, [Val.Text(n), Val.Text(s.setting(&n).unwrap())]) }
+        return Ok(res)
+    }
+    match s.setting(name) {
+        Some(v) { append(mut &res.rows, [Val.Text(v)]) }
+        None { return Err(e("42704", "unrecognized configuration parameter \"" + name + "\"")) }
+    }
+    return Ok(res)
 }
 
 pub fn newSession(st: lexdb_store.Store): Session {
     return Session{st: st, txn: [], failed: false, maxRecursion: MAX_RECURSION, timeoutMs: 0, maxMem: MAX_STATEMENT_MEM,
-                   saved: [], readOnly: false}
+                   saved: [], readOnly: false, path: [], pathAt: 0, savedPath: []}
 }
 
 // max_statement_mem's default.
@@ -4839,6 +5001,12 @@ pub const MAX_STATEMENT_MEM = 256 * 1024 * 1024
 fn (s: mut &Session) restore() {
     if len(s.saved) == 0 { return }
     let l = pop(mut &s.saved)
+    if len(s.savedPath) > 0 {
+        let p = pop(mut &s.savedPath)
+        if strings.join(&p, ",") != strings.join(&s.path, ",") {
+            if len(p) == 0 { s.setPath(&["public"]) } else { s.setPath(&p) }
+        }
+    }
     s.maxRecursion = l.rounds
     s.maxMem = l.mem
     s.timeoutMs = l.deadline                // saved there: the timeout in ms
@@ -4894,7 +5062,7 @@ pub fn (s: mut &Session) close() {
 fn isWrite(kind: int): bool {
     return kind == lexdb_sql.S_CREATE || kind == lexdb_sql.S_DROP || kind == lexdb_sql.S_INSERT ||
            kind == lexdb_sql.S_UPDATE || kind == lexdb_sql.S_DELETE || kind == lexdb_sql.S_CREATE_INDEX ||
-           kind == lexdb_sql.S_DROP_INDEX
+           kind == lexdb_sql.S_DROP_INDEX || kind == lexdb_sql.S_CREATE_SCHEMA || kind == lexdb_sql.S_DROP_SCHEMA
 }
 
 fn stmtName(kind: int): str {
@@ -4905,6 +5073,8 @@ fn stmtName(kind: int): str {
         lexdb_sql.S_UPDATE { "UPDATE" }
         lexdb_sql.S_CREATE_INDEX { "CREATE INDEX" }
         lexdb_sql.S_DROP_INDEX { "DROP INDEX" }
+        lexdb_sql.S_CREATE_SCHEMA { "CREATE SCHEMA" }
+        lexdb_sql.S_DROP_SCHEMA { "DROP SCHEMA" }
         else { "DELETE" }
     }
 }
@@ -4947,6 +5117,8 @@ fn execStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
         lexdb_sql.S_DELETE { return delete(st, txn, s, params, lim) }
         lexdb_sql.S_CREATE_INDEX { return createIndex(st, txn, s) }
         lexdb_sql.S_DROP_INDEX { return dropIndex(st, txn, s) }
+        lexdb_sql.S_CREATE_SCHEMA { return createSchemaStmt(st, txn, s) }
+        lexdb_sql.S_DROP_SCHEMA { return dropSchema(st, txn, s) }
         lexdb_sql.S_EXPLAIN { return explain(st, txn, s, params, lim, ptypes) }
         else { return Err(e("XX000", "not a data statement")) }
     }
@@ -4987,8 +5159,14 @@ pub fn (s: mut &Session) run(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
 pub fn (s: mut &Session) runCached(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int, pc: mut &PlanCache): Result[Res, DbErr] {
     match stmt.kind {
         lexdb_sql.S_EMPTY { return Ok(tagOnly("")) }
+        lexdb_sql.S_SHOW { return s.show(&stmt.table) }
         lexdb_sql.S_SET {
+            if stmt.table == "search_path" {
+                if stmt.ifFlag || len(stmt.names) == 0 { s.setPath(&["public"]) } else { s.setPath(&stmt.names) }
+                return Ok(tagOnly(if stmt.ifFlag { "RESET" } else { "SET" }))
+            }
             if stmt.table == "all" {
+                if len(s.path) > 0 { s.setPath(&["public"]) }
                 s.maxRecursion = MAX_RECURSION
                 s.timeoutMs = 0
                 s.maxMem = MAX_STATEMENT_MEM
@@ -5020,6 +5198,12 @@ pub fn (s: mut &Session) runCached(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes
                 s.readOnly = stmt.ifFlag
                 s.failed = false
                 s.saved = [Limits{rounds: s.maxRecursion, mem: s.maxMem, deadline: s.timeoutMs}]
+                var p: []str = []
+                for n in s.path { append(mut &p, n) }
+                s.savedPath = [p]
+                var q: []str = []
+                for n in s.path { append(mut &q, n) }
+                s.txn[0].path = q
             }
             return Ok(tagOnly("BEGIN"))
         }
@@ -5033,6 +5217,7 @@ pub fn (s: mut &Session) runCached(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes
                 return Ok(tagOnly("ROLLBACK"))
             }
             s.saved = []
+            s.savedPath = []
             try s.st.commit(t)
             return Ok(tagOnly("COMMIT"))
         }
@@ -5074,6 +5259,7 @@ pub fn (s: mut &Session) runCached(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes
         // went over their budget (72000) is tried again on a new one.
         let snap = stmt.kind == lexdb_sql.S_SELECT
         var t = if snap { try s.st.beginSnapshot() } else { lexdb_store.begin() }
+        for n in s.path { append(mut &t.path, n) }
         match execIn(&s.st, mut &t, stmt, params, ptypes, lim, pc) {
             Ok(r) {
                 match s.st.commit(t) {

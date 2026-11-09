@@ -393,7 +393,7 @@ Built on 2026-11-09 on branch `lexdb`, about 6,300 lines in
 (cache, trees, transactions, log, checkpoints, recovery, snapshots),
 `lexdb_sql` (lexer, parser), `lexdb_exec` (catalog, rows, keys, planner,
 statements, sessions), `lexdb_wire` (protocol 3.0) and `lexdb` (the
-server). Tests: `python3 lexell/tests/lexdb.py` (29 programs in
+server). Tests: `python3 lexell/tests/lexdb.py` (30 programs in
 `tests/lexdb/run`, under `LXL_CHECK=1`).
 
     lexell/compiler/out/lxlc lexell/cmd/lexdb.lxl -o lexdb
@@ -427,7 +427,7 @@ server). Tests: `python3 lexell/tests/lexdb.py` (29 programs in
   statement waits, after it runs, until what it read is durable, since its
   result goes out before COMMIT (4.4).
 - **Interpreted, not bytecode.** The executor walks the statement's tree.
-- **No schemas, bytea, dates or times yet.**
+- **No bytea, dates or times yet.** Schemas are built (9.20).
 - **Trust login**: no password, no TLS. The server listens on loopback by
   default.
 - **A simple query with several statements** runs each in its own
@@ -517,9 +517,7 @@ is the comparison to make.
    customer) as a grouped run, `WITH` before INSERT, UPDATE and DELETE.
    Choosing hash or index per row by row counts (9.9) waits for costs,
    which the user has left for now (section 0).
-4. Schemas (the user uses them extensively): `schema.table` names, the
-   catalog keyed by schema, `CREATE SCHEMA`/`DROP SCHEMA`, `search_path`,
-   and three-part column names (`s.t.c`) in the resolver.
+4. Schemas (built: 9.20).
 5. Plans kept per prepared statement: since D4 every execution resolves
    names and chooses paths, and point selects fell from 26,700 to about
    24,000 tps.
@@ -1363,4 +1361,62 @@ Caught, each put back:
 - blocks' reads not noted;
 - a scan's stop ignored;
 - a missing key not noted.
+
+### 9.20 Schemas
+
+- **Names.** `schema.table` anywhere a table is named; `s.t.c` as a
+  column (the schema is not checked: the column is `t.c`). The parser
+  joins a qualified name with `QSEP` (`\x1f`, which no identifier holds);
+  `public.t` is `t`.
+- **The catalog.** A table's key is its qualified name, so public's tables
+  keep the keys they had and old databases need no change. A schema is a
+  row of its own (`\x03name`). An index lives in its table's schema: the
+  same index name may be used in two schemas.
+- **The search path.** `SET search_path TO a, b` (also `= 'a, b'`, `SET
+  SCHEMA 'a'`, `RESET`). It is the session's, and its open transaction
+  carries a copy (`Txn.path`). `findTable` looks an unqualified name up
+  along it: the first schema holding it. A new unqualified table or index
+  goes in the first schema on the path that exists. With none:
+  3F000, as in PostgreSQL.
+  - A ROLLBACK restores the path from before its block, as it does the
+    other settings.
+  - The default path is `[]` (public alone), so a statement pays nothing
+    for it: point selects in cache ran at 46,500 to 48,500/s before and
+    after, user time 9.0 to 9.3 us each.
+- **Kept plans and descriptions** depend on the path: a prepared SELECT's
+  plan is keyed by the catalog version and the path, and the wire's kept
+  description (9.17) by the catalog's changes and `Session.pathVersion`.
+- **`CREATE SCHEMA [IF NOT EXISTS]`**, **`DROP SCHEMA [IF EXISTS] ...
+  [CASCADE | RESTRICT]`**. DROP refuses (2BP01) while the schema holds a
+  table; CASCADE drops them and their indexes. public cannot be dropped.
+- **`SHOW name`**, **`SHOW ALL`**: lexdb's settings, and
+  `transaction_isolation` (serializable).
+
+Not done: `ALTER ... SET SCHEMA`, privileges, `$user` in the path (a
+schema named `$user` is looked for and usually not there, which is what
+PostgreSQL does for a user without one), `current_schema()`, and the
+`pg_catalog` and `information_schema` views.
+
+`exec_schema` covers:
+
+- public's t and s's t side by side, and a join of the two;
+- the path finding s's t first and a table only in public;
+- an unqualified CREATE going in s;
+- the same index name in two schemas, EXPLAIN naming it, DROP INDEX found
+  by the path or qualified;
+- UPDATE and DELETE of s.t;
+- a block using the path from before BEGIN and one SET in it, and the
+  ROLLBACK restoring it;
+- a prepared SELECT planning again when the path changes;
+- DROP SCHEMA refused, then CASCADE;
+- the errors.
+
+`wire_prepared` adds a prepared `SELECT *` described again when only the
+path changed.
+
+Planted and caught, each put back: public not normalised, the path
+ignored, the plan's key without the path, an index outside its table's
+schema, DROP SCHEMA ignoring its tables, ROLLBACK keeping the path, a
+block not given the path at BEGIN or at a SET in it, the wire's
+description kept across a path change, CREATE ignoring the path.
 

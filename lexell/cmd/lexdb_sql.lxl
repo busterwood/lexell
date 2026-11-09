@@ -104,10 +104,42 @@ pub const S_SET = 10
 
 // The settings lexdb keeps per session (lexdb_exec.Session); SET of any
 // other is accepted and ignored.
-pub const SETTINGS: []str = ["max_recursion", "statement_timeout", "max_statement_mem"]
+pub const SETTINGS: []str = ["max_recursion", "statement_timeout", "max_statement_mem", "search_path"]
 pub const S_CREATE_INDEX = 11
 pub const S_DROP_INDEX = 12
 pub const S_EXPLAIN = 13
+pub const S_CREATE_SCHEMA = 14
+pub const S_DROP_SCHEMA = 15
+pub const S_SHOW = 16
+
+// A qualified name, schema.name, as the parser gives it: the two joined by
+// QSEP (an identifier never holds it, so "a.b" quoted stays one name).
+pub const QSEP: str = "\x1f"
+
+// public's names are kept unqualified: public.t is t.
+pub fn qual(schema: &str, name: &str): str {
+    if schema == "public" { return name }
+    return schema + QSEP + name
+}
+
+// The schema part of a name (public: unqualified).
+pub fn schemaOf(n: &str): str {
+    let i = strings.indexOf(n, QSEP, 0)
+    if i < 0 { return "public" }
+    return n[0..i]
+}
+
+pub fn isQual(n: &str): bool { return strings.indexOf(n, QSEP, 0) >= 0 }
+
+// The name part of a possibly qualified name.
+pub fn baseName(n: &str): str {
+    let i = strings.indexOf(n, QSEP, 0)
+    if i < 0 { return n }
+    return n[i + len(QSEP)..len(n)]
+}
+
+// A possibly qualified name as SQL shows it: schema.name.
+pub fn shown(n: &str): str { return strings.replaceAll(n, QSEP, ".") }
 
 pub type Stmt = record {
     pub kind: int
@@ -137,6 +169,7 @@ pub type Stmt = record {
     pub setAll: bool            // ... ALL
     pub cte: int                // a CTE where it is used: its number in the statement; -1 none
     pub rec: bool               // a recursive CTE: inner[1] reads its working table
+    pub cascade: bool           // DROP SCHEMA ... CASCADE
 }
 
 pub const SET_UNION = 1
@@ -153,7 +186,7 @@ fn newStmt(kind: int): Stmt {
     return Stmt{kind: kind, table: "", ifFlag: false, cols: [], pk: [], names: [], rows: [], items: [], where: None,
                 group: [], order: [], limit: None, offset: None, sets: [], params: 0, from: [], index: "",
                 unique: false, inner: [], distinct: false, having: None, subs: [], use: 0, setop: 0, setAll: false,
-                cte: -1, rec: false}
+                cte: -1, rec: false, cascade: false}
 }
 
 // ---- the lexer
@@ -345,6 +378,13 @@ fn (p: mut &P) name(): Result[str, lexdb_base.DbErr] {
         return Ok(t.text)
     }
     return Err(near(&t))
+}
+
+// A table's (or an index's) name: name or schema.name (qual).
+fn (p: mut &P) qname(): Result[str, lexdb_base.DbErr] {
+    let first = try p.name()
+    if p.acceptKw(".") { return Ok(qual(&first, &(try p.name()))) }
+    return Ok(first)
 }
 
 fn (p: mut &P) typeName(): Result[TypeName, lexdb_base.DbErr] {
@@ -750,6 +790,12 @@ fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
         if p.acceptKw(".") {
             let col = try p.name()
             name = t.text + "." + col     // qualified: table (or alias) dot column
+            if p.acceptKw(".") {
+                // schema.table.column: the table's columns are qualified by
+                // its name in FROM (lenient: the schema is not checked)
+                let c3 = try p.name()
+                name = col + "." + c3
+            }
         }
         return Ok(Expr.Col(name))
     }
@@ -765,7 +811,7 @@ fn (p: mut &P) createTable(): Result[Stmt, lexdb_base.DbErr] {
         try p.expectKw("exists")
         s.ifFlag = true
     }
-    s.table = try p.name()
+    s.table = try p.qname()
     try p.expectKw("(")
     while true {
         if p.acceptKw("primary") {
@@ -802,7 +848,7 @@ fn (p: mut &P) createTable(): Result[Stmt, lexdb_base.DbErr] {
 fn (p: mut &P) insert(): Result[Stmt, lexdb_base.DbErr] {
     try p.expectKw("into")
     var s = newStmt(S_INSERT)
-    s.table = try p.name()
+    s.table = try p.qname()
     if p.acceptKw("(") {
         append(mut &s.names, try p.name())
         while p.acceptKw(",") { append(mut &s.names, try p.name()) }
@@ -997,11 +1043,12 @@ fn (p: mut &P) fromItem(join: int): Result[FromItem, lexdb_base.DbErr] {
         try p.aliasOf(mut &alias, mut &cols)
         return Ok(FromItem{table: "", alias: alias, join: join, on: None, sub: i, cols: cols, work: -1, lateral: lateral})
     }
-    let table = try p.name()
-    var alias = table
+    let table = try p.qname()
+    var alias = baseName(&table)
     var cols: []str = []
     try p.aliasOf(mut &alias, mut &cols)
-    // a CTE in scope (the innermost of the name) before a table
+    // a CTE in scope (the innermost of the name) before a table; a
+    // qualified name is always a table
     var ci = -1
     for i in 0..len(p.ctes) { if p.ctes[i].name == table { ci = i } }
     if ci >= 0 {
@@ -1053,9 +1100,9 @@ fn (p: mut &P) createIndex(unique: bool): Result[Stmt, lexdb_base.DbErr] {
         try p.expectKw("exists")
         s.ifFlag = true
     }
-    s.index = try p.name()
+    s.index = try p.name()                  // in its table's schema
     try p.expectKw("on")
-    s.table = try p.name()
+    s.table = try p.qname()
     if p.acceptKw("using") {
         let m = try p.name()
         if m != "btree" { return Err(lexdb_base.err("0A000", "index method \"" + m + "\" is not supported")) }
@@ -1070,7 +1117,7 @@ fn (p: mut &P) createIndex(unique: bool): Result[Stmt, lexdb_base.DbErr] {
 
 fn (p: mut &P) update(): Result[Stmt, lexdb_base.DbErr] {
     var s = newStmt(S_UPDATE)
-    s.table = try p.name()
+    s.table = try p.qname()
     try p.expectKw("set")
     while true {
         let c = try p.name()
@@ -1086,7 +1133,7 @@ fn (p: mut &P) update(): Result[Stmt, lexdb_base.DbErr] {
 fn (p: mut &P) delete(): Result[Stmt, lexdb_base.DbErr] {
     try p.expectKw("from")
     var s = newStmt(S_DELETE)
-    s.table = try p.name()
+    s.table = try p.qname()
     if p.acceptKw("where") { s.where = Some(try p.expr()) }
     return Ok(s)
 }
@@ -1111,12 +1158,22 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
         "delete" { return p.delete() }
         "create" {
             if p.acceptKw("table") { return p.createTable() }
+            if p.acceptKw("schema") {
+                var s = newStmt(S_CREATE_SCHEMA)
+                if p.acceptKw("if") {
+                    try p.expectKw("not")
+                    try p.expectKw("exists")
+                    s.ifFlag = true
+                }
+                s.table = try p.name()
+                return Ok(s)
+            }
             if p.acceptKw("index") { return p.createIndex(false) }
             if p.acceptKw("unique") {
                 try p.expectKw("index")
                 return p.createIndex(true)
             }
-            return Err(lexdb_base.err("0A000", "only CREATE TABLE and CREATE INDEX are supported"))
+            return Err(lexdb_base.err("0A000", "only CREATE TABLE, CREATE INDEX and CREATE SCHEMA are supported"))
         }
         "explain" {
             var s = newStmt(S_EXPLAIN)
@@ -1140,7 +1197,17 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
                     try p.expectKw("exists")
                     s.ifFlag = true
                 }
-                s.index = try p.name()
+                s.index = try p.qname()
+                return Ok(s)
+            }
+            if p.acceptKw("schema") {
+                var s = newStmt(S_DROP_SCHEMA)
+                if p.acceptKw("if") {
+                    try p.expectKw("exists")
+                    s.ifFlag = true
+                }
+                s.table = try p.name()
+                if p.acceptKw("cascade") { s.cascade = true } else { let r = p.acceptKw("restrict") }
                 return Ok(s)
             }
             try p.expectKw("table")
@@ -1149,7 +1216,7 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
                 try p.expectKw("exists")
                 s.ifFlag = true
             }
-            s.table = try p.name()
+            s.table = try p.qname()
             return Ok(s)
         }
         "begin", "start" {
@@ -1176,6 +1243,13 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
             let a = p.acceptKw("transaction") || p.acceptKw("work")
             return Ok(newStmt(S_ROLLBACK))
         }
+        "show" {
+            var st = newStmt(S_SHOW)
+            if p.acceptKw("all") { st.table = "all" } else { st.table = try p.name() }
+            if st.table == "transaction" { st.table = "transaction_isolation" }   // SHOW TRANSACTION ISOLATION LEVEL
+            p.skipToEnd()
+            return Ok(st)
+        }
         "set", "reset", "discard", "deallocate" {
             // lexdb's own settings (SETTINGS): SET name = value | TO value |
             // = DEFAULT, RESET name, RESET ALL; the rest are accepted and ignored
@@ -1186,11 +1260,39 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
                 st.table = "all"
                 return Ok(st)
             }
+            if t.text == "set" && p.acceptKw("schema") {
+                // SET SCHEMA 'x': the search path x
+                st.table = "search_path"
+                let v = p.peek()
+                if v.kind == T_STR { p.pos += 1; append(mut &st.names, v.text) } else { append(mut &st.names, try p.name()) }
+                return Ok(st)
+            }
             var known = false
             for name in SETTINGS { if p.isKw(name) { known = true } }
             if known && (t.text == "set" || t.text == "reset") {
                 st.table = p.toks[p.pos].text
                 p.pos += 1
+                if t.text == "set" && st.table == "search_path" {
+                    // a list of schemas, names or strings ('a, b' splits too); DEFAULT
+                    if !p.acceptKw("to") { try p.expectKw("=") }
+                    if p.acceptKw("default") { return Ok(st) }
+                    while true {
+                        let v = p.peek()
+                        if v.kind == T_STR {
+                            p.pos += 1
+                            for part in strings.split(&v.text, ",") {
+                                var x = strings.trim(part)
+                                if len(x) >= 2 && x[0] == '"' && x[len(x) - 1] == '"' { x = x[1..len(x) - 1] }
+                                if len(x) > 0 { append(mut &st.names, x) }
+                            }
+                        } else {
+                            append(mut &st.names, try p.name())
+                        }
+                        if !p.acceptKw(",") { break }
+                    }
+                    if len(st.names) == 0 { return Err(lexdb_base.err("22023", "search_path names no schema")) }
+                    return Ok(st)
+                }
                 if t.text == "set" {
                     if !p.acceptKw("to") { try p.expectKw("=") }
                     if p.acceptKw("default") { st.limit = None } else { st.limit = Some(try p.expr()) }
