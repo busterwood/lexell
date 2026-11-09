@@ -1190,9 +1190,11 @@ closes without an HTTP reply.
 Because one SSL object serves both directions, the request and response
 sides share it through a small box: each call takes it, parks, and gives it
 back. HTTP/1.1 is sequential, so this is enough; a second task that reaches
-the same box while it is out gets an error. `tls.lxl` gained the server
-ALPN callback: it selects `http/1.1` when the client offers it and aborts a
-client that offers only `h2` (`no_application_protocol`). `net` gained
+the same box while it is out gets an error. `tls.lxl` gained server ALPN:
+a server context's `Options.alpn` lists the protocols it accepts (each
+engine holds the list for the select callback), a client that offers ALPN
+but none of them is aborted (`no_application_protocol`), and `""` answers
+without ALPN. `serveTls` accepts `""` or `"http/1.1"`. `net` gained
 `Conn.writeStalled` and `Conn.fd`, and `hangup(fd, halfClose)` for a
 transport (TLS) that watches the socket under its own object.
 
@@ -1210,5 +1212,7 @@ S4 so far:
   deadline (`Err`).
 
 Tests: `http_server_forms.lxl` (binary file parts too), `http_server_sse.lxl`,
-and `http_server_tls.lxl` (TLS 1.2/1.3 through the test PKI, keep-alive, a
-body both ways, ALPN `http/1.1`, and an `h2`-only client refused).
+`tls_alpn.lxl`, and `http_server_tls.lxl` (TLS 1.2/1.3
+through the test PKI, keep-alive, a body both ways, ALPN `http/1.1` with an
+`h2`-only client refused, no ALPN, and an `h2` context refused by
+`serveTls`).

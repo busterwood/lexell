@@ -59,11 +59,11 @@ for leaks.
 | `oracle.lxl` | 1,653 | Oracle Database natively over `tns`, for tasks: connection strings, Conn, Value and typed Param binds, buffered Rows, Stream, errors with ORA- codes, transaction[T], call with OUT binds and REF CURSORs (stages O1 to O3, O5) |
 | `task.lxl` | 702 | concurrent tasks on one thread: Scope, Future, Promise, Shared, Frozen, all/any, yield, cancellation, sleep, deadlines; signals; worker processes |
 | `net.lxl` | 1,077 | TCP over IPv4 and IPv6 for tasks: listen (also with SO_REUSEPORT), accept, connect, read, write; name lookup and dial |
-| `tls.lxl` | 1,107 | TLS 1.2 and 1.3 through OpenSSL 3: an engine over memory buffers, and connections over net sockets for tasks; client and server contexts, verification, pins, client certificates, ALPN (a server selects http/1.1) |
+| `tls.lxl` | 1,113 | TLS 1.2 and 1.3 through OpenSSL 3: an engine over memory buffers, and connections over net sockets for tasks; client and server contexts, verification, pins, client certificates, ALPN (a client offers, a server selects) |
 | `proc.lxl` | 614 | other programs: start with pipes, a Command's environment, directory and streams; wait on a pidfd as a task; output, communicate, run; cancellation sends SIGTERM then SIGKILL; PATH lookup in the child's environment; optional process group |
 | `url.lxl` | 552 | URLs for http and https (RFC 3986): parse, resolve, percent-encoding, queries |
 | `http.lxl` | 1,687 | an HTTP/1.1 client for http and https (pool, strict framing, redirects, retries, deadlines) and the head parsing the server shares |
-| `httpserver.lxl` | 3,409 | an HTTPS and HTTP/1.1 server: TLS (S2), Go 1.22 routing, middleware, streaming bodies, forms and multipart, server-sent events, strict parsing, every limit and timeout, cancellation on hangup, request ids, access log, graceful drain |
+| `httpserver.lxl` | 3,417 | an HTTPS and HTTP/1.1 server: TLS (S2), Go 1.22 routing, middleware, streaming bodies, forms and multipart, server-sent events, strict parsing, every limit and timeout, cancellation on hangup, request ids, access log, graceful drain |
 | `sse.lxl` | 118 | a broadcast hub for server-sent events: Feed, Event, publish, wait with a keep-alive timeout |
 | `redis.lxl` | 1,530 | Redis over RESP2 and RESP3 for tasks: Config and redis:// URLs, Conn, Value/Pair, Pool/Lease; strings, hashes, lists, sets, pub/sub, SCAN and transactions; TLS and Unix sockets |
 | `markdown.lxl` | 2,626 | CommonMark 0.31.2: parse to a tree (arena of nodes, walker) and render HTML as cmark does; with `markdown_entities.lxl` (HTML5 entities) and `markdown_unicode.lxl` (punctuation, space, full case folding) |
@@ -871,7 +871,10 @@ try c.close()                                       // close_notify
   `certFile`, `keyFile` (a server's certificate, or a client's),
   `clientCaFile` (a server asks for and verifies client certificates),
   `minVersion` `Version.Tls12`, `maxVersion` `Version.Tls13`, `alpn`
-  ("h2,http/1.1"; a client's offer).
+  ("h2,http/1.1"): a client offers these; a server selects the first of
+  its own that the client offers, refuses a client that offers ALPN but
+  none of them (`no_application_protocol`), and with `""` answers without
+  ALPN. `ctx.alpn()` gives the list, trimmed.
 - `Context` (`client(o)`, `server(o)`): an SSL_CTX, owned, freed by its
   drop; `share()` gives another handle on it (to move into a task or a
   pool). `engine(serverName)`, `connect(sock, serverName)`,
@@ -1150,8 +1153,10 @@ let st = try http.serve(net.listen(":8080").expect("listen"), app, r, http.defau
 `clientCaFile`). The handshake runs on the connection's task and parks on
 the socket, bounded by `headerTimeoutMs`; a failed or late handshake closes
 the connection without an HTTP reply.
-A server offers ALPN `http/1.1` to a client that sends ALPN; a client that
-offers only `h2` is refused with `no_application_protocol`. The request and
+The context's `alpn` is `""` (ALPN not answered: any client gets HTTP/1.1)
+or `"http/1.1"` (a client that offers ALPN without it, such as an `h2`-only
+one, is refused with `no_application_protocol`); any other list is a
+Config error, as the server speaks only HTTP/1.1. The request and
 response sides share the one SSL object (takes, parks, gives back), so
 HTTP/1.1's sequential reads and writes stay correct. Not yet: SNI
 certificate selection, session tickets made before a worker fork, a

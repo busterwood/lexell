@@ -67,6 +67,9 @@ extern "ssl" fn SSL_CTX_use_PrivateKey_file(c: ptr, f: str, kind: i32): i32
 extern "ssl" fn SSL_CTX_check_private_key(c: ptr): i32
 extern "ssl" fn SSL_CTX_set_alpn_protos(c: ptr, p: &[]byte, n: u32): i32
 extern "ssl" fn SSL_CTX_set_alpn_select_cb(c: ptr, cb: extern fn(ptr, ptr, ptr, ptr, u32, ptr): i32, arg: ptr)
+extern "ssl" fn SSL_select_next_proto(out: ptr, outlen: ptr, srv: ptr, srvlen: u32, cli: ptr, clilen: u32): i32
+extern "ssl" fn SSL_set_ex_data(s: ptr, idx: i32, p: ptr): i32
+extern "ssl" fn SSL_get_ex_data(s: ptr, idx: i32): ptr
 extern "ssl" fn SSL_new(c: ptr): ptr
 extern "ssl" fn SSL_free(s: ptr)
 extern "ssl" fn SSL_set_bio(s: ptr, r: ptr, w: ptr)
@@ -152,10 +155,6 @@ const EAGAIN = 11
 pub const WANT_INPUT = -1
 
 var OPEN: int = 0
-
-// The one protocol a server selects in ALPN until HTTP/2 (S3) exists. It is
-// a global so the C callback can point OpenSSL at it.
-var ALPN_HTTP11: once Option[ffi.Mem]
 
 // The number of Context and Engine values (a Conn holds one Engine) not
 // yet dropped.
@@ -299,7 +298,9 @@ pub type Options = value record {
     pub clientCaFile: str          // server: ask clients for a certificate and verify it against these CAs
     pub minVersion: Version
     pub maxVersion: Version
-    pub alpn: str                  // client: protocols offered (ALPN), separated by commas: "h2,http/1.1"
+    pub alpn: str                  // ALPN protocols, separated by commas: "h2,http/1.1". A client offers
+                                   // them; a server selects the first of them the client offers, and
+                                   // refuses a client that offers ALPN but none of them ("": no ALPN)
     pub verifyName: bool           // client: check the name (SSL_set1_host); false: the chain only (verify-ca),
                                    // SNI is still sent for a name, and engine("") is allowed with verification on
     pub sni: bool                  // client: send SNI for a name; false: never
@@ -336,33 +337,16 @@ fn normalPins(s: str): Result[str, str] {
     return Ok(out)
 }
 
-// OpenSSL's ALPN select callback for a server: "http/1.1" when the client
-// offers it, otherwise SSL_TLSEXT_ERR_ALERT_FATAL (2). The protocol bytes
-// live in ALPN_HTTP11 for as long as the process.
+// OpenSSL's ALPN select callback for a server. The server's protocols are
+// the engine's wire list (SSL ex_data 0), ended by a 0 byte; OpenSSL copies
+// the selection before the list can go.
 fn alpnSelect(ssl: ptr, out: ptr, outlen: ptr, inp: ptr, inlen: u32, arg: ptr): i32 {
-    let wire = strToBytes("http/1.1")
-    var i = 0
-    while i < int(inlen) {
-        let n = int(ffi.peek(inp, i))
-        if i + 1 + n > int(inlen) { return 2 }
-        if n == len(wire) {
-            var same = true
-            for j in 0..n {
-                if ffi.peek(inp, i + 1 + j) != wire[j] { same = false; break }
-            }
-            if same {
-                match ALPN_HTTP11.get() {
-                    Some(m) {
-                        ffi.pokePtr(out, 0, m.ptr())
-                        ffi.poke(outlen, 0, byte(len(wire)))
-                        return 0
-                    }
-                    None { return 2 }
-                }
-            }
-        }
-        i += 1 + n
-    }
+    let mine = SSL_get_ex_data(ssl, i32(0))
+    if isNull(mine) { return 3 }        // SSL_TLSEXT_ERR_NOACK: answer without ALPN
+    var n = 0
+    while ffi.peek(mine, n) != byte(0) { n += 1 + int(ffi.peek(mine, n)) }
+    // OPENSSL_NPN_NEGOTIATED (1): SSL_TLSEXT_ERR_OK; else ALERT_FATAL, no_application_protocol
+    if SSL_select_next_proto(out, outlen, mine, u32(n), inp, inlen) == 1 { return 0 }
     return 2
 }
 
@@ -379,6 +363,16 @@ fn alpnWire(s: str): Result[[]byte, str] {
     return Ok(b)
 }
 
+// The protocols of an alpn option, trimmed, without empty ones, joined by ",".
+fn alpnNormal(s: str): str {
+    var ps: []str = []
+    for part in strings.splitByte(s, ',') {
+        let p = strings.trim(part)
+        if len(p) > 0 { append(mut &ps, p) }
+    }
+    return strings.join(&ps, ",")
+}
+
 // ---------------------------------------------------------------- contexts
 
 // The settings and trust store that connections share (an SSL_CTX).
@@ -391,6 +385,7 @@ pub type Context = record {
     pins: str          // normalized
     names: bool        // client: the name is checked (Options.verifyName)
     sni: bool          // client: SNI is sent for a name
+    alpn: str          // the ALPN protocols, normalized ("": none)
 }
 
 fn (c: mut &Context) drop() {
@@ -418,7 +413,8 @@ fn newContext(o: &Options, server: bool): Result[Context, Error] {
     let h = SSL_CTX_new(if server { TLS_server_method() } else { TLS_client_method() })
     if isNull(h) { return Err(queueFail(Kind.Config, "SSL_CTX_new failed", "")) }
     OPEN += 1
-    var c = Context{ctx: h, server: server, verify: false, pins: pins, names: o.verifyName, sni: o.sni}   // freed by its drop on an error below
+    var c = Context{ctx: h, server: server, verify: false, pins: pins, names: o.verifyName, sni: o.sni,
+                    alpn: alpnNormal(o.alpn)}   // freed by its drop on an error below
     if SSL_CTX_ctrl(h, i32(SSL_CTRL_SET_MIN_PROTO_VERSION), versionCode(o.minVersion), nullPtr()) != 1 ||
        SSL_CTX_ctrl(h, i32(SSL_CTRL_SET_MAX_PROTO_VERSION), versionCode(o.maxVersion), nullPtr()) != 1 {
         return Err(queueFail(Kind.Config, "cannot set the protocol versions", ""))
@@ -455,18 +451,16 @@ fn newContext(o: &Options, server: bool): Result[Context, Error] {
     } else if server {
         return Err(fail(Kind.Config, "a server needs a certificate (certFile)", 0, ""))
     }
-    if len(o.alpn) > 0 && !server {
-        let wire = match alpnWire(o.alpn) {
+    if len(c.alpn) > 0 {
+        let wire = match alpnWire(c.alpn) {
             Ok(b) { b }
             Err(m) { return Err(fail(Kind.Config, m, 0, "")) }
         }
-        if SSL_CTX_set_alpn_protos(h, &wire, u32(len(wire))) != 0 {    // 0 is success here
+        if server {
+            SSL_CTX_set_alpn_select_cb(h, alpnSelect, nullPtr())    // each engine holds the list
+        } else if SSL_CTX_set_alpn_protos(h, &wire, u32(len(wire))) != 0 {    // 0 is success here
             return Err(queueFail(Kind.Config, "cannot set the ALPN protocols", ""))
         }
-    }
-    if server {
-        if !ALPN_HTTP11.isSet() { ALPN_HTTP11.set(Some(ffi.copyBytes("http/1.1"))) }
-        SSL_CTX_set_alpn_select_cb(h, alpnSelect, nullPtr())
     }
     ERR_clear_error()
     return Ok(c)
@@ -487,10 +481,14 @@ fn loadCas(h: ptr, file: str, dir: str): Result[Unit, Error] {
 pub fn (c: &Context) share(): Context {
     let r = SSL_CTX_up_ref(c.ctx)
     OPEN += 1
-    return Context{ctx: c.ctx, server: c.server, verify: c.verify, pins: c.pins, names: c.names, sni: c.sni}
+    return Context{ctx: c.ctx, server: c.server, verify: c.verify, pins: c.pins, names: c.names, sni: c.sni,
+                   alpn: c.alpn}
 }
 
 pub fn (c: &Context) isServer(): bool { return c.server }
+
+// The ALPN protocols from Options.alpn, trimmed and joined by "," ("": none).
+pub fn (c: &Context) alpn(): str { return c.alpn }
 
 // Whether h is an IPv4 or IPv6 address literal (no SNI is sent for one).
 fn isIpLiteral(h: str): bool {
@@ -521,10 +519,17 @@ pub fn (c: &Context) engine(serverName: str): Result[Engine, Error] {
     if isNull(rb) || isNull(wb) { panic("tls: out of memory (BIO_new)") }
     SSL_set_bio(ssl, rb, wb)        // the SSL owns them now
     OPEN += 1
-    let e = Engine{ssl: ssl, rbio: rb, wbio: wb, host: host, pins: c.pins, state: ST_HANDSHAKE, server: c.server,
-                   verify: c.verify}
+    var e = Engine{ssl: ssl, rbio: rb, wbio: wb, host: host, pins: c.pins, state: ST_HANDSHAKE, server: c.server,
+                   verify: c.verify, alpn: None}
     if c.server {
         SSL_set_accept_state(ssl)
+        if len(c.alpn) > 0 {
+            // alpnSelect's list: the wire form and a 0 byte, as long as the SSL
+            let wire = alpnWire(c.alpn).unwrap()    // checked by newContext
+            let m = ffi.copyBytes(strFromBytes(&wire) + "\x00")
+            let r = SSL_set_ex_data(ssl, i32(0), m.ptr())
+            e.alpn = Some(m)
+        }
     } else {
         SSL_set_connect_state(ssl)
         if len(host) > 0 {
@@ -573,6 +578,7 @@ pub type Engine = record {
     state: int
     server: bool
     verify: bool
+    alpn: Option[ffi.Mem]    // a server's ALPN list, for alpnSelect
 }
 
 fn (e: mut &Engine) drop() {

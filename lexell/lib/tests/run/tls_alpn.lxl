@@ -1,0 +1,73 @@
+// tls: server ALPN in memory mode. A server selects the first of its own
+// protocols that the client offers, refuses a client that offers ALPN but
+// none of them, and answers without ALPN when it has none (any client
+// connects, whatever it offers).
+// needs: ssl
+// expect: server imap,smtp / client smtp,imap: imap imap
+// expect: server imap,smtp / client imap: imap imap
+// expect: server imap,smtp / client none: connected, no ALPN
+// expect: server imap,smtp / client pop3: refused
+// expect: server none / client h2: connected, no ALPN
+// expect: context alpn: [imap,smtp] []
+// expect: handles 0
+import "tls"
+import "../support/tlstest" as tt
+
+fn pump(from: mut &tls.Engine, to: mut &tls.Engine): int {
+    let b = from.takeOutput()
+    to.feed(&b)
+    return len(b)
+}
+
+fn handshake(c: mut &tls.Engine, s: mut &tls.Engine): Result[Unit, tls.Error] {
+    for i in 0..10 {
+        let cd = try c.handshake()
+        let a = pump(c, s)
+        let sd = try s.handshake()
+        let b = pump(s, c)
+        if cd && sd { return Ok(Unit{}) }
+    }
+    panic("the handshake made no progress")
+}
+
+fn serverCtx(alpn: str): tls.Context {
+    var o = tls.defaults()
+    o.certFile = tt.path("srv.pem")
+    o.keyFile = tt.path("srv.key")
+    o.alpn = alpn
+    return tls.server(o).unwrap()
+}
+
+fn try1(sctx: &tls.Context, srvName: str, offer: str) {
+    var co = tt.clientOptions()
+    co.alpn = offer
+    let cctx = tls.client(co).unwrap()
+    var c = cctx.engine("localhost").unwrap()
+    var s = sctx.engine("").unwrap()
+    let label = "server " + srvName + " / client " + (if len(offer) == 0 { "none" } else { offer }) + ": "
+    match handshake(mut &c, mut &s) {
+        Ok(_) {
+            if len(c.alpn()) == 0 && len(s.alpn()) == 0 {
+                println(label + "connected, no ALPN")
+            } else {
+                println(label + c.alpn() + " " + s.alpn())
+            }
+        }
+        Err(_) { println(label + "refused") }
+    }
+}
+
+fn main() {
+    tt.pki()
+    {
+        let mail = serverCtx(" imap, ,smtp ")
+        try1(&mail, "imap,smtp", "smtp,imap")
+        try1(&mail, "imap,smtp", "imap")
+        try1(&mail, "imap,smtp", "")
+        try1(&mail, "imap,smtp", "pop3")
+        let plain = serverCtx("")
+        try1(&plain, "none", "h2")
+        println("context alpn: [" + mail.alpn() + "] [" + plain.alpn() + "]")
+    }
+    println("handles " + intToStr(tls.openHandles()))
+}

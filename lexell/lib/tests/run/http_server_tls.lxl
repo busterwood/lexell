@@ -1,7 +1,8 @@
 // httpserver: HTTPS (design/http-server.md S2): serveTls accepts a TLS
 // connection and serves HTTP/1.1 over it, with keep-alive and a body both
-// ways. The certificates are made at test time (skipped without the openssl
-// command).
+// ways; ALPN: a context with "http/1.1" refuses an h2-only client, one
+// without ALPN serves it HTTP/1.1, and one with h2 is a Config error. The
+// certificates are made at test time (skipped without the openssl command).
 // needs: ssl
 // expect: GET: 200 hello
 // expect: keep-alive: 3 requests
@@ -9,6 +10,10 @@
 // expect: h2 only: refused
 // expect: stop: bye
 // expect: stopped: accepted 2, requests 5, open 0, rejected 0, timeouts 0, gone 0, errors 0
+// expect: no ALPN, h2 only: 200 hello
+// expect: no ALPN stopped: accepted 2, requests 2, open 0, rejected 0, timeouts 0, gone 0, errors 0
+// expect: alpn h2: error: 0 config: serveTls speaks only HTTP/1.1, not the context's ALPN "h2,http/1.1"
+// expect: client context: error: 0 config: serveTls needs a server context (tls.server)
 import "task"
 import "net"
 import "strings"
@@ -62,21 +67,43 @@ fn portOf(addr: str): str {
     return strings.cut(&addr, ":").unwrap().after
 }
 
+fn serverCtx(alpn: str): tls.Context {
+    var o = tls.defaults()
+    o.certFile = tt.path("srv.pem")
+    o.keyFile = tt.path("srv.key")
+    o.alpn = alpn
+    return tls.server(o).unwrap()
+}
+
+fn clientFor(alpn: str): http.Client {
+    var o = http.defaults()
+    var to = tt.clientOptions()
+    to.alpn = alpn
+    o.tls = to
+    return http.newClient(o)
+}
+
+fn config(): httpserver.Config {
+    var cfg = httpserver.defaults()
+    cfg.signals = false
+    cfg.logFd = -1
+    return cfg
+}
+
+// Serves with ctx; the result of serveTls, which must fail before it serves.
+fn refused(ctx: tls.Context): str {
+    let ln = net.listen("127.0.0.1:0").unwrap()
+    return serveJob(Job{ln: ln, ctx: ctx, app: App{name: "app"}, r: routes(), cfg: config()})
+}
+
 fn main() {
     tt.pki()
     let out = task.scoped(fn(s: mut &task.Scope): str {
         let ln = net.listen("127.0.0.1:0").unwrap()
         let port = portOf(ln.localAddr())
-        var cfg = httpserver.defaults()
-        cfg.signals = false
-        cfg.logFd = -1
-        let job = Job{ln: ln, ctx: tt.serverContext("srv"), app: App{name: "app"}, r: routes(), cfg: cfg}
+        let job = Job{ln: ln, ctx: serverCtx("http/1.1"), app: App{name: "app"}, r: routes(), cfg: config()}
         let srv = s.start(serveJob, job)
-        var o = http.defaults()
-        var to = tt.clientOptions()
-        to.alpn = "http/1.1"
-        o.tls = to
-        let c = http.newClient(o)
+        let c = clientFor("http/1.1")
         let base = "https://localhost:" + port
         match c.get(base + "/hello") {
             Ok(r) { println("GET: " + intToStr(r.status) + " " + strings.trimRight(r.text().unwrap())) }
@@ -94,11 +121,7 @@ fn main() {
             Ok(r) { println("POST: " + strings.trimRight(r.text().unwrap())) }
             Err(e) { println("POST: " + e.toStr()) }
         }
-        var o2 = http.defaults()
-        var to2 = tt.clientOptions()
-        to2.alpn = "h2"
-        o2.tls = to2
-        let c2 = http.newClient(o2)
+        let c2 = clientFor("h2")
         match c2.get(base + "/hello") {
             Ok(_) { println("h2 only: connected") }
             Err(_) { println("h2 only: refused") }
@@ -110,4 +133,21 @@ fn main() {
         return srv.wait().unwrap()
     })
     println("stopped: " + out)
+    let out2 = task.scoped(fn(s: mut &task.Scope): str {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let base = "https://localhost:" + portOf(ln.localAddr())
+        let srv = s.start(serveJob, Job{ln: ln, ctx: serverCtx(""), app: App{name: "app"}, r: routes(), cfg: config()})
+        match clientFor("h2").get(base + "/hello") {
+            Ok(r) { println("no ALPN, h2 only: " + intToStr(r.status) + " " + strings.trimRight(r.text().unwrap())) }
+            Err(e) { println("no ALPN, h2 only: " + e.toStr()) }
+        }
+        match clientFor("").get(base + "/stop") {
+            Ok(_) {}
+            Err(e) { println("stop: " + e.toStr()) }
+        }
+        return srv.wait().unwrap()
+    })
+    println("no ALPN stopped: " + out2)
+    println("alpn h2: " + refused(serverCtx("h2,http/1.1")))
+    println("client context: " + refused(tls.client(tt.clientOptions()).unwrap()))
 }
