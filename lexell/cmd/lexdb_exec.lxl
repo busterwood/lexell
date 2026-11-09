@@ -997,6 +997,25 @@ fn decTable(name: str, s: &str): Result[Table, DbErr] {
     return Ok(t)
 }
 
+// The catalog's version: a row every DDL statement bumps, read through the
+// transaction, so it names the schema the transaction sees (a snapshot may
+// predate the latest DDL). Its key sorts before every name (index names
+// start with 1, table names with a letter).
+const CAT_VERSION: str = "\x02version"
+
+fn catVersion(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[str, DbErr] {
+    match try st.get(txn, CATALOG, CAT_VERSION) {
+        Some(v) { return Ok(v) }
+        None { return Ok("0") }
+    }
+}
+
+fn bumpCatalog(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[Unit, DbErr] {
+    let v = strings.parseIntOpt(try catVersion(st, txn)).unwrapOr(0)
+    try txn.put(CATALOG, CAT_VERSION, (v + 1).toStr())
+    return Ok(Unit{})
+}
+
 fn findTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, name: &str): Result[Option[Table], DbErr] {
     match try st.get(txn, CATALOG, name) {
         Some(s) { return Ok(Some(try decTable(name, &s))) }
@@ -1510,7 +1529,14 @@ fn mentions(x: &Expr, col: &str): bool {
 // Whether a query's conjunct c implies a predicate's conjunct p: the same
 // text; a comparison of a column for "column IS NOT NULL"; or comparisons
 // of a column with constants (x >= 3 implies x > 0).
+// Planning that looks at a parameter's value counts here (a partial index's
+// predicate implied, a LIMIT or OFFSET): a plan made with any look is not
+// kept for the next execution (PlanCache). The SQL thread is one, so a
+// module counter will do.
+var PARAM_LOOKS: int = 0
+
 fn impliesOne(c: &Expr, p: &Expr, params: &[]Val): bool {
+    if len(params) > 0 { PARAM_LOOKS += 1 }
     if lexdb_sql.exprText(c) == lexdb_sql.exprText(p) { return true }
     match p {
         Expr.IsNull(a, neg) {
@@ -3278,6 +3304,7 @@ fn createTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
     }
     t.tree = st.createTree(txn)
     try txn.put(CATALOG, s.table, encTable(&t))
+    try bumpCatalog(st, txn)
     return Ok(tagOnly("CREATE TABLE"))
 }
 
@@ -3290,6 +3317,7 @@ fn dropTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.St
             }
             txn.dropTree(t.tree)
             txn.del(CATALOG, s.table)
+            try bumpCatalog(st, txn)
             return Ok(tagOnly("DROP TABLE"))
         }
         None {
@@ -3354,6 +3382,7 @@ fn createIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
     append(mut &t.indexes, ix)
     try txn.put(CATALOG, t.name, encTable(&t))
     try txn.put(CATALOG, idxName(&s.index), t.name)
+    try bumpCatalog(st, txn)
     return Ok(tagOnly("CREATE INDEX"))
 }
 
@@ -3370,6 +3399,7 @@ fn dropIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.St
             while len(rev) > 0 { append(mut &t.indexes, pop(mut &rev)) }
             txn.del(CATALOG, idxName(&s.index))
             try txn.put(CATALOG, t.name, encTable(&t))
+            try bumpCatalog(st, txn)
             return Ok(tagOnly("DROP INDEX"))
         }
         None {
@@ -3708,6 +3738,10 @@ fn sortCmp(a: &Val, b: &Val): int {
 fn evalInt(x: &Option[Expr], params: &[]Val, what: str): Result[int, DbErr] {
     match x {
         Some(v) {
+            match v {
+                Expr.Lit(_) {}
+                else { PARAM_LOOKS += 1 }
+            }
             let noCols: []lexdb_sql.ColDef = []
             let noRow: []Val = []
             let noAggs: []Val = []
@@ -3748,10 +3782,36 @@ fn orderValue(o: &Expr, outs: &[]OutCol, vals: &[]Val, env: &Env): Result[Val, D
 }
 
 fn select(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int,
-          lim: Limits): Result[Res, DbErr] {
-    var none: []str = []
-    return selectWith(st, txn, s, params, ptypes, lim, false, mut &none)
+          lim: Limits, pc: mut &PlanCache): Result[Res, DbErr] {
+    // A prepared statement's plan, kept while the schema the transaction
+    // sees is the same and the plan looked at no parameter's value.
+    let ver = try catVersion(st, txn)
+    if len(pc.sels) == 0 || pc.ver != ver {
+        pc.sels = []
+        var sc = newScope(params, ptypes)
+        let looks = PARAM_LOOKS
+        let sel = try planSelect(st, txn, s, params, mut &sc)
+        if PARAM_LOOKS != looks || !pc.keep { return runSel(st, txn, &sel, params, lim) }
+        append(mut &pc.sels, sel)
+        pc.ver = ver
+        pc.plans += 1
+    }
+    return runSel(st, txn, &pc.sels[0], params, lim)
 }
+
+fn runSel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params: &[]Val, lim: Limits): Result[Res, DbErr] {
+    var rs = newRun(&sel.q)
+    rs.limit(&lim)
+    return execSel(st, txn, sel, params, -1, mut &rs)
+}
+
+// A prepared statement's plan (select), with the catalog version it was
+// made for. keep false: never kept (a statement run once).
+pub type PlanCache = record { sels: []Sel; ver: str; keep: bool; pub plans: int }
+
+pub fn newPlanCache(): PlanCache { return PlanCache{sels: [], ver: "", keep: true, plans: 0} }
+
+pub fn oneShot(): PlanCache { return PlanCache{sels: [], ver: "", keep: false, plans: 0} }
 
 // ---- aggregates: one accumulator per call and group, so a grouped
 // query holds its groups, not its rows
@@ -4856,7 +4916,7 @@ pub fn (s: &Session) status(): byte {
 }
 
 fn execIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int,
-          lim: Limits): Result[Res, DbErr] {
+          lim: Limits, pc: mut &PlanCache): Result[Res, DbErr] {
     // with subqueries, the outer values they use are numbered after all the
     // statement's parameters: those not sent are NULL
     let subs = hasSubs(s)
@@ -4865,9 +4925,9 @@ fn execIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
         var ps: []Val = []
         for v in params { append(mut &ps, v) }
         while len(ps) < want { append(mut &ps, Val.Null) }
-        return execStmt(st, txn, s, &ps, ptypes, lim)
+        return execStmt(st, txn, s, &ps, ptypes, lim, pc)
     }
-    return execStmt(st, txn, s, params, ptypes, lim)
+    return execStmt(st, txn, s, params, ptypes, lim, pc)
 }
 
 fn hasSubs(s: &lexdb_sql.Stmt): bool {
@@ -4877,12 +4937,12 @@ fn hasSubs(s: &lexdb_sql.Stmt): bool {
 }
 
 fn execStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int,
-            lim: Limits): Result[Res, DbErr] {
+            lim: Limits, pc: mut &PlanCache): Result[Res, DbErr] {
     match s.kind {
         lexdb_sql.S_CREATE { return createTable(st, txn, s) }
         lexdb_sql.S_DROP { return dropTable(st, txn, s) }
         lexdb_sql.S_INSERT { return insert(st, txn, s, params, lim) }
-        lexdb_sql.S_SELECT { return select(st, txn, s, params, ptypes, lim) }
+        lexdb_sql.S_SELECT { return select(st, txn, s, params, ptypes, lim, pc) }
         lexdb_sql.S_UPDATE { return update(st, txn, s, params, lim) }
         lexdb_sql.S_DELETE { return delete(st, txn, s, params, lim) }
         lexdb_sql.S_CREATE_INDEX { return createIndex(st, txn, s) }
@@ -4919,6 +4979,12 @@ pub fn paramVals(texts: &[]Option[str], ptypes: &[]int): Result[[]Val, DbErr] {
 // its own that is committed at once (retried a few times on a
 // serialization failure: nothing the client saw depends on the first try).
 pub fn (s: mut &Session) run(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int): Result[Res, DbErr] {
+    var pc = oneShot()
+    return s.runCached(stmt, params, ptypes, mut &pc)
+}
+
+// run, keeping a SELECT's plan in pc for the next run of the same statement.
+pub fn (s: mut &Session) runCached(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int, pc: mut &PlanCache): Result[Res, DbErr] {
     match stmt.kind {
         lexdb_sql.S_EMPTY { return Ok(tagOnly("")) }
         lexdb_sql.S_SET {
@@ -4990,7 +5056,7 @@ pub fn (s: mut &Session) run(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
         // UPDATE and DELETE read the live tree: the rows they change are
         // checked at COMMIT either way, and the latest is less often stale
         s.txn[0].live = stmt.kind == lexdb_sql.S_UPDATE || stmt.kind == lexdb_sql.S_DELETE || stmt.kind == lexdb_sql.S_INSERT
-        let r = execIn(&st, mut &s.txn[0], stmt, params, ptypes, s.limits())
+        let r = execIn(&st, mut &s.txn[0], stmt, params, ptypes, s.limits(), pc)
         s.txn[0].live = false
         if r.isErr() {
             s.failed = true
@@ -5008,7 +5074,7 @@ pub fn (s: mut &Session) run(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
         // went over their budget (72000) is tried again on a new one.
         let snap = stmt.kind == lexdb_sql.S_SELECT
         var t = if snap { try s.st.beginSnapshot() } else { lexdb_store.begin() }
-        match execIn(&s.st, mut &t, stmt, params, ptypes, lim) {
+        match execIn(&s.st, mut &t, stmt, params, ptypes, lim, pc) {
             Ok(r) {
                 match s.st.commit(t) {
                     Ok(_) { return Ok(r) }

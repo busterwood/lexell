@@ -393,7 +393,7 @@ Built on 2026-11-09 on branch `lexdb`, about 6,300 lines in
 (cache, trees, transactions, log, checkpoints, recovery, snapshots),
 `lexdb_sql` (lexer, parser), `lexdb_exec` (catalog, rows, keys, planner,
 statements, sessions), `lexdb_wire` (protocol 3.0) and `lexdb` (the
-server). Tests: `python3 lexell/tests/lexdb.py` (26 programs in
+server). Tests: `python3 lexell/tests/lexdb.py` (27 programs in
 `tests/lexdb/run`, under `LXL_CHECK=1`).
 
     lexell/compiler/out/lxlc lexell/cmd/lexdb.lxl -o lexdb
@@ -1205,4 +1205,46 @@ three times while another connection inserts a row (same columns), then
 drops and recreates the table with others (new columns, matching rows).
 Caught: a cache never invalidated, and a catalog never watched. Next:
 planning at Execute, 17% (9.4).
+
+**A prepared statement keeps its plan.** Execute planned the SELECT every
+time: 17% of the SQL thread, catalog lookup included. A prepared
+statement now keeps its plan (`PlanCache` in the wire layer's
+`Prepared`, passed down through `runCached`, `execIn` and `execStmt`).
+
+- **Keyed by the schema the transaction sees.** A snapshot may predate
+  the latest DDL, and a plan made from a newer catalog could name an
+  index or a table's tree the snapshot cannot see. So the key is a
+  version row in the catalog (`\x02version`), which every DDL statement
+  bumps and which is read through the transaction. Concurrent DDL
+  statements conflict on it, which serializes them.
+- **Never kept when planning looked at a parameter's value:** a LIMIT or
+  OFFSET that is not a literal, and the question whether `x > $1`
+  implies a partial index's predicate. Both count in `PARAM_LOOKS`.
+- **A statement run once** (simple query protocol, `Session.run`) keeps
+  nothing.
+
+| 10 million rows, random point selects | before | after |
+|---|---:|---:|
+| 128 MB cache | 21,000/s, user 25.2 us a select | 22,500/s, user 21.3 us |
+| all in cache (ids 0 to 99,999) | 43,400/s, user 11.4 us | 47,200/s, user 9.1 us |
+
+All in cache, system calls (11.3 us a select) now cost more than the
+user code: the socket side of the io_uring question.
+
+`exec_plancache` uses two sessions. Covered: one plan for three runs; a
+new plan after CREATE INDEX, and after a table is dropped and remade
+with other columns; LIMIT $1 and a partial index (5 and 12 rows) never
+kept; a block begun before a drop and remake keeps the plan its snapshot
+matches and sees the old rows, then plans again after COMMIT; `run`
+keeps nothing. Caught:
+
+- DDL not bumping the version (a wrong, empty result);
+- the version read outside the transaction;
+- LIMIT looks not counted (1 row where 3 were asked);
+- partial-index looks not counted (7 rows where 12 were right);
+- a one-shot run keeping its plan.
+
+Lexell's PostgreSQL client parses every query as the unnamed statement,
+so a Lexell program never reuses a plan. Prepared statements in
+`lib/postgres` come next (the user's request).
 

@@ -1,0 +1,117 @@
+// lexdb_exec: a prepared statement keeps its SELECT's plan (PlanCache)
+// while the schema the transaction sees is the same, and the plan looked at
+// no parameter's value. Two sessions, A runs prepared statements, B changes
+// the schema:
+// - a point select run three times plans once;
+// - B's CREATE INDEX: A's next run plans again;
+// - B drops the table and makes it again with other columns: A plans
+//   again and reads the new table;
+// - LIMIT $1 is never kept (each run plans), and gives the right rows;
+// - nor a plan that asked whether x > $1 implies a partial index's
+//   predicate (x > 50): true for 60, false for 10;
+// - A in a block begun before B drops and remakes a table keeps the plan
+//   its snapshot's schema matches and sees the old rows; after COMMIT it
+//   plans again and sees the new table;
+// - Session.run (a statement run once) keeps nothing.
+// expect: point: b5 b6 b7, plans 1
+// expect: after create index: b8, plans 2
+// expect: after drop and create: five, plans 3
+// expect: limit: 1 row, 3 rows, plans 0
+// expect: partial index: 5 12, plans 0
+// expect: block before the drop: 3 3, plans 1
+// expect: after commit: 0, plans 2
+// expect: run once: plans 0
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_sql"
+
+type Val = lexdb_sql.Val
+
+fn stmt(sql: &str): lexdb_sql.Stmt {
+    var ss = lexdb_sql.parse(sql).unwrap()
+    return pop(mut &ss)
+}
+
+// the first column of every row, space-separated (or the error's state)
+fn run(s: mut &lexdb_exec.Session, st: &lexdb_sql.Stmt, params: &[]Val, pc: mut &lexdb_exec.PlanCache): str {
+    let pt: []int = [lexdb_sql.OID_INT8]
+    match s.runCached(st, params, &pt, pc) {
+        Ok(r) {
+            var out: []str = []
+            for row in r.rows { append(mut &out, lexdb_exec.text(&row[0])) }
+            return strings.join(&out, " ")
+        }
+        Err(e) { return e.state }
+    }
+}
+
+fn one(s: mut &lexdb_exec.Session, sql: &str) {
+    match s.exec(sql) {
+        Ok(_) {}
+        Err(e) { println(sql + ": " + e.state) }
+    }
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(21), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 1024 * 1024, ckptBytes: 1024 * 1024, snapNodes: 100000}, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var a = lexdb_exec.newSession(st)
+        var b = lexdb_exec.newSession(st)
+        one(mut &b, &"create table t (id int primary key, b text)")
+        var vals: []str = []
+        for i in 0..100 { append(mut &vals, "(" + i.toStr() + ", 'b" + i.toStr() + "')") }
+        one(mut &b, &("insert into t values " + strings.join(&vals, ", ")))
+
+        let q1 = stmt(&"select b from t where id = $1")
+        var pc1 = lexdb_exec.newPlanCache()
+        var got: []str = []
+        for i in 5..8 { append(mut &got, run(mut &a, &q1, &[Val.Int(i)], mut &pc1)) }
+        println("point: " + strings.join(&got, " ") + ", plans " + pc1.plans.toStr())
+        one(mut &b, &"create index tb on t (b)")
+        println("after create index: " + run(mut &a, &q1, &[Val.Int(8)], mut &pc1) + ", plans " + pc1.plans.toStr())
+        one(mut &b, &"drop table t")
+        one(mut &b, &"create table t (id int primary key, c int, b text)")
+        one(mut &b, &"insert into t values (5, 1, 'five')")
+        println("after drop and create: " + run(mut &a, &q1, &[Val.Int(5)], mut &pc1) + ", plans " + pc1.plans.toStr())
+
+        one(mut &b, &"insert into t values (6, 2, 'six'), (7, 3, 'seven')")
+        let q2 = stmt(&"select id from t order by id limit $1")
+        var pc2 = lexdb_exec.newPlanCache()
+        let l1 = run(mut &a, &q2, &[Val.Int(1)], mut &pc2)
+        let l3 = run(mut &a, &q2, &[Val.Int(3)], mut &pc2)
+        println("limit: " + len(strings.split(&l1, " ")).toStr() + " row, " + len(strings.split(&l3, " ")).toStr() +
+                " rows, plans " + pc2.plans.toStr())
+
+        // a partial index usable for one value of $1 and not another
+        one(mut &b, &"create table p (id int primary key, x int, z int)")
+        var pv: []str = []
+        for i in 0..100 { append(mut &pv, "(" + i.toStr() + ", " + i.toStr() + ", " + (i % 7).toStr() + ")") }
+        one(mut &b, &("insert into p values " + strings.join(&pv, ", ")))
+        one(mut &b, &"create index p_big on p (z) where x > 50")
+        let qp = stmt(&"select count(*) from p where x > $1 and z = 3")
+        var pcp = lexdb_exec.newPlanCache()
+        let p60 = run(mut &a, &qp, &[Val.Int(60)], mut &pcp)
+        let p10 = run(mut &a, &qp, &[Val.Int(10)], mut &pcp)
+        println("partial index: " + p60 + " " + p10 + ", plans " + pcp.plans.toStr())
+
+        one(mut &b, &"create table u (x int primary key)")
+        one(mut &b, &"insert into u values (1), (2), (3)")
+        let q3 = stmt(&"select count(*) from u where x > $1")
+        var pc3 = lexdb_exec.newPlanCache()
+        one(mut &a, &"begin")
+        let before = run(mut &a, &q3, &[Val.Int(0)], mut &pc3)
+        one(mut &b, &"drop table u")
+        one(mut &b, &"create table u (x int primary key, y int)")
+        let during = run(mut &a, &q3, &[Val.Int(0)], mut &pc3)
+        println("block before the drop: " + before + " " + during + ", plans " + pc3.plans.toStr())
+        one(mut &a, &"commit")
+        println("after commit: " + run(mut &a, &q3, &[Val.Int(0)], mut &pc3) + ", plans " + pc3.plans.toStr())
+
+        var pc4 = lexdb_exec.oneShot()
+        let r4 = run(mut &a, &q1, &[Val.Int(5)], mut &pc4)
+        println("run once: plans " + pc4.plans.toStr())
+        return 0
+    }).unwrap()
+}
