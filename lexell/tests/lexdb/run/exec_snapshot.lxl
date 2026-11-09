@@ -1,0 +1,61 @@
+// lexdb_exec: BEGIN READ ONLY is a snapshot. Another session's commits are
+// not seen until it ends, it never aborts, and it cannot write; read-write
+// blocks stay serializable (40001 on a conflict).
+// expect: reader sees 3
+// expect: writer commits: INSERT 0 1 / UPDATE 1
+// expect: reader still sees 3 sum 60
+// expect: write in snapshot: 25006
+// expect: reader commits: COMMIT then sees 4 sum 90
+// expect: serializable: COMMIT then 40001
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_base"
+import "strings"
+
+fn one(s: mut &lexdb_exec.Session, sql: str): str {
+    match s.exec(&sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if r.hasRows && len(r.rows) > 0 {
+                var out = ""
+                for v in r.rows[0] { out = out + (if out == "" { "" } else { " " }) + lexdb_exec.text(&v) }
+                return out
+            }
+            return r.tag
+        }
+        Err(e) { return e.state }
+    }
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    var a = lexdb_exec.newSession(st)
+    var b = lexdb_exec.newSession(st)
+    let x = one(mut &b, "create table t (id int primary key, v int)")
+    let y = one(mut &b, "insert into t values (1, 10), (2, 20), (3, 30)")
+    let z = one(mut &a, "begin read only")
+    println("reader sees " + one(mut &a, "select count(*) from t"))
+    println("writer commits: " + one(mut &b, "insert into t values (4, 40)") + " / " + one(mut &b, "update t set v = v * 0 + 0 where id = 1"))
+    println("reader still sees " + strings.replaceAll(one(mut &a, "select count(*), sum(v) from t"), " ", " sum "))
+    println("write in snapshot: " + one(mut &a, "insert into t values (9, 9)"))
+    let r = one(mut &a, "rollback")
+    let q = one(mut &a, "start transaction read only")
+    let c = one(mut &a, "commit")
+    println("reader commits: " + c + " then sees " + strings.replaceAll(one(mut &a, "select count(*), sum(v) from t"), " ", " sum "))
+    // two read-write blocks that read and write the same row: the second to commit fails
+    let b1 = one(mut &a, "begin")
+    let b2 = one(mut &b, "begin")
+    let r1 = one(mut &a, "select v from t where id = 2")
+    let r2 = one(mut &b, "select v from t where id = 2")
+    let w1 = one(mut &a, "update t set v = 21 where id = 2")
+    let w2 = one(mut &b, "update t set v = 22 where id = 2")
+    println("serializable: " + one(mut &a, "commit") + " then " + one(mut &b, "commit"))
+    a.close()
+    b.close()
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(9), lexdb_store.defaults(), body).unwrap()
+}

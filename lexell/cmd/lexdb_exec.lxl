@@ -1446,6 +1446,27 @@ pub type Session = record {
 
 pub fn newSession(st: lexdb_store.Store): Session { return Session{st: st, txn: [], failed: false} }
 
+// Ends the session: an open block is rolled back (a snapshot released).
+pub fn (s: mut &Session) close() {
+    if len(s.txn) > 0 { s.st.abort(pop(mut &s.txn)) }
+    s.failed = false
+}
+
+fn isWrite(kind: int): bool {
+    return kind == lexdb_sql.S_CREATE || kind == lexdb_sql.S_DROP || kind == lexdb_sql.S_INSERT ||
+           kind == lexdb_sql.S_UPDATE || kind == lexdb_sql.S_DELETE
+}
+
+fn stmtName(kind: int): str {
+    return match kind {
+        lexdb_sql.S_CREATE { "CREATE TABLE" }
+        lexdb_sql.S_DROP { "DROP TABLE" }
+        lexdb_sql.S_INSERT { "INSERT" }
+        lexdb_sql.S_UPDATE { "UPDATE" }
+        else { "DELETE" }
+    }
+}
+
 // 'I' idle, 'T' in a transaction block, 'E' in a failed one.
 pub fn (s: &Session) status(): byte {
     if len(s.txn) == 0 { return 'I' }
@@ -1496,7 +1517,11 @@ pub fn (s: mut &Session) run(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
         lexdb_sql.S_SET { return Ok(tagOnly("SET")) }
         lexdb_sql.S_BEGIN {
             if len(s.txn) == 0 {
-                append(mut &s.txn, lexdb_store.begin())
+                if stmt.ifFlag {
+                    append(mut &s.txn, try s.st.beginSnapshot())     // READ ONLY: a snapshot (4.5)
+                } else {
+                    append(mut &s.txn, lexdb_store.begin())
+                }
                 s.failed = false
             }
             return Ok(tagOnly("BEGIN"))
@@ -1506,13 +1531,14 @@ pub fn (s: mut &Session) run(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
             let t = pop(mut &s.txn)
             if s.failed {
                 s.failed = false
+                s.st.abort(t)
                 return Ok(tagOnly("ROLLBACK"))
             }
             try s.st.commit(t)
             return Ok(tagOnly("COMMIT"))
         }
         lexdb_sql.S_ROLLBACK {
-            if len(s.txn) > 0 { let t = pop(mut &s.txn) }
+            if len(s.txn) > 0 { s.st.abort(pop(mut &s.txn)) }
             s.failed = false
             return Ok(tagOnly("ROLLBACK"))
         }
@@ -1522,9 +1548,19 @@ pub fn (s: mut &Session) run(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
         if s.failed {
             return Err(e("25P02", "current transaction is aborted, commands ignored until end of transaction block"))
         }
+        if s.txn[0].isSnapshot() && isWrite(stmt.kind) {
+            s.failed = true
+            return Err(e("25006", "cannot execute " + stmtName(stmt.kind) + " in a read-only transaction"))
+        }
         let st = s.st
         let r = execIn(&st, mut &s.txn[0], stmt, params, ptypes)
-        if r.isErr() { s.failed = true }
+        if r.isErr() {
+            s.failed = true
+            return r
+        }
+        // The client sees this statement's result before the block commits:
+        // what it read must be durable first (a snapshot waited when it began).
+        if !s.txn[0].isSnapshot() { try s.st.syncReads() }
         return r
     }
     var tries = 0
