@@ -11,7 +11,7 @@ reviewed merge by the lead before the next starts.
 | P1 | `pgwire`: connection strings, env, `.pgpass`; transport; startup, TLS, authentication; simple and extended queries; raw rows; errors; portals; cancel; codecs; offline and fake-server tests | large: about 3,500 |
 | P2 | `postgres` rewritten on `pgwire`, old one renamed `postgres_libpq`; the existing tests pass natively; the differential test | medium to large: about 2,000 |
 | P3 | streaming speed: batches sized by bytes, fetch-ahead, in-place scanning, the numeric fast path, the bench | medium: about 700 |
-| P4 | the pool's alive check, `httpd`/`http_gate --db` measured, the `batch` (pipeline) API | small to medium: about 600 |
+| P4 | the pool's alive check (built 2026-11-09 for every client as `quiet()`, design/pool.md section 12), `httpd`/`http_gate --db` measured, the `batch` (pipeline) API | small to medium: about 600 |
 | P5 | later items, each its own small brief when picked: COPY, LISTEN/NOTIFY, notices, the service file, TLS cancel requests, CRLs, `target_session_attrs`, `load_balance_hosts`, `requirepeer`, direct TLS, NFKC SASLprep, statement cache study | small each |
 
 ## Rules every stage carries

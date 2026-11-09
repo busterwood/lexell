@@ -2,7 +2,9 @@
 // it cannot connect): eight tasks share a pool of two connections, never
 // more than two open, the others parked in acquire until a lease is
 // dropped; a waiter whose deadline passes leaves the queue; a lease left in
-// a transaction is closed and its place reopened; a pool that cannot connect
+// a transaction is closed and its place reopened; an idle connection whose
+// backend is terminated is replaced when it is acquired, with no error; a
+// pool that cannot connect
 // reports it and keeps no place. No handle stays open.
 // expect: results 0 1 2 3 4 5 6 7
 // expect: most open at once: 2
@@ -11,6 +13,7 @@
 // expect: after timeout: open 1, idle 1, waiting 0
 // expect: same connection again: true
 // expect: in a transaction: closed, a new one: true
+// expect: terminated while idle: query ok true, a new backend true
 // expect: bad pool: code 1, open 0
 // expect: open handles 0
 import "postgres"
@@ -90,9 +93,23 @@ fn run() {
         println("same connection again: " + (pid(mut &c) == first).toStr())
         c.conn().exec("BEGIN").unwrap()
     }
+    var victim = 0
     {
         var c = one.acquire().unwrap()
-        println("in a transaction: closed, a new one: " + (pid(mut &c) != first).toStr())
+        victim = pid(mut &c)
+        println("in a transaction: closed, a new one: " + (victim != first).toStr())
+    }
+    {
+        var k = postgres.connect(dsn()).unwrap()
+        k.query("SELECT pg_terminate_backend($1::int4)", &[V.Int(victim)]).unwrap()
+    }
+    task.sleep(100).unwrap()                       // the backend's end reaches the idle socket
+    {
+        var c = one.acquire().unwrap()
+        let r = c.conn().query("SELECT pg_backend_pid()", &[])
+        let ok = r.isOk()
+        let now = if ok { r.unwrap().int(0, 0).unwrap() } else { victim }
+        println("terminated while idle: query ok " + ok.toStr() + ", a new backend " + (now != victim).toStr())
     }
 
     let bad = postgres.newPool("host=/nonexistent/lxl dbname=x", 3).unwrap()

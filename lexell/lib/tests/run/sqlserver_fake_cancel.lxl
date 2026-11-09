@@ -5,16 +5,17 @@
 // connection is used again), none has come, a stream past its deadline, a
 // server that never acknowledges (broken after tds.ABORT_MS); and through a
 // pool: a lease that leaves a stream open (ended with ATTENTION when the
-// connection is acquired again) and RESETCONNECTION on every request after
-// a lease went back.
+// connection is acquired again), RESETCONNECTION on every request after
+// a lease went back, and an idle connection the server closes (replaced by
+// a new login when it is acquired, with no error).
 // needs: ssl
 // timeout: 30
 // expect: deadline mid-reply: error 1021 | idle true | after: 3
 // expect: deadline before any reply: error 1021 | idle true | after: 4
 // expect: stream past its deadline: rows true, then error 1021 | idle true | after: 5
 // expect: no acknowledgement: error 1021 | idle false | after: error 1023
-// expect: pool: first 1 | stream 5 rows, left open | then 2 | open 1, idle 1
-// expect: server: attention after part of a reply | attention before any reply | attention in a stream | attention unanswered, the client closed | pool: UPDATE a reset false | SELECT rows reset true | attention | UPDATE c reset true
+// expect: pool: first 1 | stream 5 rows, left open | then 2 | after the server closed it: 9 | open 1, idle 1
+// expect: server: attention after part of a reply | attention before any reply | attention in a stream | attention unanswered, the client closed | pool: UPDATE a reset false | SELECT rows reset true | attention | UPDATE c reset true | closed by the server | a new login: UPDATE d reset false
 // expect: open handles: 0
 
 import "sqlserver"
@@ -221,12 +222,27 @@ fn serve(ln: net.Listener): str {
                         p.sendPart(rowsReply(2000), 4)
                     } else {
                         p.send(done(0x10, if sql == "UPDATE a" { 1 } else { 2 }))
+                        if sql == "UPDATE c" { break }      // then the server closes the idle connection
                     }
                 }
             }
             None { break }
         }
     }
+    { let closing = p.c.take() }                            // the socket closes with closing
+    append(mut &steps, "closed by the server")
+    var q = match session(&ln) {
+        Some(x) { x }
+        None { return "no new login" }
+    }
+    match q.message() {
+        Some(m) {
+            append(mut &steps, "a new login: " + sqlOf(&m) + " reset " + ((m.status & tds.STATUS_RESET) != 0).toStr())
+            q.send(done(0x10, 9))
+        }
+        None { append(mut &steps, "the new login closed") }
+    }
+    let rest = q.message()                                  // until the client closes
     append(mut &log, "pool: " + strings.join(&steps, " | "))
     return strings.join(&log, " | ")
 }
@@ -302,9 +318,18 @@ fn viaPool() {
         var l = pool.acquire().unwrap()
         then = l.conn().run("UPDATE c", &[]).unwrap()
     }
+    task.sleep(50).unwrap()                                 // the server closes the idle connection meanwhile
+    var later = ""
+    {
+        var l = pool.acquire().unwrap()
+        later = match l.conn().run("UPDATE d", &[]) {
+            Ok(n) { n.toStr() }
+            Err(e) { "error " + e.code.toStr() }
+        }
+    }
     let st = pool.stats()
     println("pool: first " + first.toStr() + " | stream " + got.toStr() + " rows, left open | then " + then.toStr() +
-            " | open " + st.open.toStr() + ", idle " + st.idle.toStr())
+            " | after the server closed it: " + later + " | open " + st.open.toStr() + ", idle " + st.idle.toStr())
 }
 
 fn main() {

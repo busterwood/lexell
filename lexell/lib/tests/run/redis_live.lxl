@@ -11,6 +11,7 @@
 // expect: live pipeline OK 7
 // expect: live resp3 true
 // expect: live pool open 2 idle 2 waiting 0
+// expect: live killed while idle: command ok true, a new client true
 import "os"
 import "collections"
 import "task"
@@ -93,6 +94,26 @@ fn main() {
     })
     let st = pool.stats()
     println("live pool open " + st.open.toStr() + " idle " + st.idle.toStr() + " waiting " + st.waiting.toStr())
+
+    // An idle pooled connection the server ends (CLIENT KILL from another
+    // connection) is replaced when it is acquired: no error reaches the caller.
+    let one = redis.newPool(url, 1).unwrap()
+    var id = ""
+    {
+        var lease = one.acquire().unwrap()
+        id = lease.conn().command(&["CLIENT", "ID"]).unwrap().toStr()
+    }
+    var killer = redis.connect(url).unwrap()
+    killer.command(&["CLIENT", "KILL", "ID", id]).unwrap()
+    killer.close()
+    task.sleep(100).unwrap()
+    {
+        var lease = one.acquire().unwrap()
+        let r = lease.conn().command(&["CLIENT", "ID"])
+        let ok = r.isOk()
+        let now = if ok { r.unwrap().toStr() } else { id }
+        println("live killed while idle: command ok " + ok.toStr() + ", a new client " + (now != id).toStr())
+    }
 }
 
 fn livePing(p: redis.Pool): int {

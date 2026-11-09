@@ -1,10 +1,11 @@
 # One connection pool for every client
 
-Status: agreed with the user (2026-11-09). Stages 1 to 5 are built on
+Status: agreed with the user (2026-11-09). Stages 1 to 6 are built on
 branch `pool`: `lib/pool.lxl` with its test `pool_fake`, then postgres,
 redis, sqlserver and oracle on it, then sqlserver's cleanup after a
-cancelled request and RESETCONNECTION (sections 7 to 11). Section 11
-records where stage 5 departs from section 2.
+cancelled request and RESETCONNECTION, then an idle check in every client's
+`reuse` (sections 7 to 12). Section 11 records where stage 5 departs from
+section 2.
 
 ## 1. Why
 
@@ -138,6 +139,7 @@ Two things are new:
 | 2 (built) | postgres on `pool`: `Conn.open` from a `pgwire.Config`, `waitFailed` with the errors of today (`E_TIMEOUT`, `E_CANCELLED`, "pool: timeout while waiting for a connection"), `release` = `idle()`, `reuse` = `Ok`; its pool code removed; callers on `l.conn()` and `newPool`'s Result: `cmd/httpd.lxl`, the doc comment in `lib/httpserver.lxl`, `task_postgres_pool`, `postgres_live_stream` | the live postgres tests and `http_gate --db` unchanged |
 | 3 (built) | redis on `pool`, its copy removed; `redis_basic`, `redis_live` on `l.conn()` | the redis tests pass |
 | 4 (built) | sqlserver and oracle: the four members, the aliases, `newPool`; `sqlserver_live_pool`, `oracle_live_pool` (the shape of `task_postgres_pool`) | the live tests pass on both backends |
+| 6 (built) | every client's `reuse`: an idle connection the server has closed is replaced, not handed out (section 12) | a pooled connection killed while idle gives no error to the next lease, live where the server allows the kill |
 | 5 (built) | sqlserver T3: a cancelled request leaves the connection unsettled, not broken; `release` keeps it, `reuse` settles it with ATTENTION; RESETCONNECTION (section 5) | a cancelled query's connection is reused, not reopened, in a live test |
 
 ## 7. Stage 1, as built (2026-11-09)
@@ -279,3 +281,43 @@ and a temporary table, `SET LANGUAGE Deutsch` and `USE tempdb` gone for the
 next lease, with `database()` right again. Both pass on the C backend under
 LXL_CHECK=1 (four runs) and on the native backend; so does every live
 database test (40) and the library suites (301 C, 627 native).
+
+## 12. Stage 6, as built: the idle check (2026-11-09)
+
+Before, `reuse` asked only `idle()`, which knows the client's own state: a
+connection the server had closed while it sat in the pool (a restart, an
+idle timeout, a killed session, failover) was handed out, and the next
+lease's first call failed with `E_IO`.
+
+- `net.Conn.quiet()` and `tls.Conn.quiet()`: one read that never parks
+  (`readNow`). True only when nothing has arrived and the peer has not
+  closed; the end of the stream, a failed read, or bytes nobody asked for
+  are false (a server that ends a session usually says why first, as
+  PostgreSQL's "terminating connection" ErrorResponse does; the connection
+  is closed after, so those bytes are not needed). Under TLS a record with
+  no application data, such as a TLS 1.3 session ticket, changes nothing.
+  `readNow` makes none of the checks of a call that can park, so a
+  cancelled acquiring task gets a true answer, not a false one.
+- Each client's session has `quiet()` too: nothing read ahead in its own
+  buffer, and its stream quiet (`pgwire`, `tds`, `tns`; redis checks its
+  buffer and stream in `Conn`). Every client's `reuse` is now `idle() &&
+  quiet()` (sqlserver after its `settle`); a false closes the connection
+  and the pool opens a new one in the same acquire.
+- The cost is one `read` system call per acquire of an idle connection:
+  the postgres gate (`--db 16`, 2 s) gave 2,671 / 20,156 / 21,709
+  requests/s at 1 / 10 / 100 clients, within the recorded run's spread.
+- Not covered: a connection the server closes while it is leased fails as
+  before; the pool cannot retry a call for the caller.
+
+Tests: `tls_tasks` (quiet on an idle TLS and plain connection, before and
+after the server closes it; at 50 ms TLS 1.3's tickets have arrived);
+`sqlserver_fake_cancel` (the scripted server closes an idle pooled
+connection: the next lease runs on a new login, no reset bit, no error;
+without the check the test fails); live `task_postgres_pool`
+(`pg_terminate_backend` of the idle connection's backend from another
+connection) and `redis_live` (`CLIENT KILL ID`): the next lease's call
+succeeds on a new backend or client. The SQL Server and Oracle test logins
+may not kill sessions (no ALTER ANY CONNECTION, no ALTER SYSTEM), so their
+live tests do not cover it; oracle's check is the same code as the others'.
+All pass on both backends under LXL_CHECK=1, with the library suites (301
+C, 627 native) and every live database test (41).

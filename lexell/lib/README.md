@@ -724,7 +724,9 @@ meanwhile, and a plain program (its main task) uses the same calls.
   (libc's resolver needs nsswitch); programs that do not stay static.
 - `Conn.readNow(buf)`: one read that never parks (`EAGAIN` when nothing is
   there); the http pool uses it to see whether an idle connection was
-  closed. `Conn.writeNow(data)`: one write that never parks (the count
+  closed. `Conn.quiet()`: that check for any pool (true when nothing has
+  arrived and the peer has not closed); the database pools call it before
+  they hand an idle connection out. `Conn.writeNow(data)`: one write that never parks (the count
   written, 0 when the socket's buffer is full), usable in a `drop` or
   inside `with` (`tls` sends close_notify with it). `Conn.take()` moves the
   socket out of a `Conn` (left closed), for a wrapper that gives its socket
@@ -898,6 +900,8 @@ try c.close()                                       // close_notify
 - `Conn` (a socket): `read(buf)` (0 at close_notify, or the socket's end
   at a record boundary; the end inside a record is `Protocol`),
   `readNow(buf)` (never parks: `WANT_INPUT` when nothing is there),
+  `quiet()` (net's, for TLS: a record without application data, such as a
+  TLS 1.3 session ticket, does not count),
   `write(data)`, `writeStr(s)`, `handshake()`, `shutdown()` (close_notify,
   reading goes on), `close()`, `detach(): Detached {sock, rest}` (TLS ends
   without close_notify; the socket and what arrived after the last
@@ -1429,8 +1433,9 @@ Checked on 2026-11-08:
 - The interactive CLI prompt is not automated; one-shot and pipe modes are.
 - Typed helpers inside `MULTI` see `QUEUED`; use `command` for queued
   commands. `WATCH` is not tracked by the pool; use a dedicated connection.
-- A pool does not proactively health-check an idle connection: one closed
-  by the server fails once, is discarded, and its place is reused.
+- A pool checks an idle connection before it hands it out (`quiet()`, no
+  round trip): one the server has closed is replaced by a new one without
+  an error. One that the server closes while it is leased fails as before.
 - No performance benchmark is recorded for Redis.
 
 ### regex
@@ -1642,8 +1647,10 @@ that need one are skipped when it is not installed). Examples:
   connection, a `mut &Conn` (`try l.conn().query(...)`); the Lease gives it
   back when dropped, or closes it when it is not `idle()` (in a
   transaction, broken, a query abandoned): its place goes to the next
-  waiter, which opens a new one. An idle connection that went bad is
-  closed at the next acquire and a new one opened. `stats(): PoolStats
+  waiter, which opens a new one. An idle connection that went bad, or that
+  the server has closed (`net`'s and `tls`'s `quiet()`, a read that never
+  parks), is closed at the next acquire and a new one opened, with no
+  error for the caller (the same in sqlserver, oracle and redis). `stats(): PoolStats
   {open, idle, waiting}`. These are the shared `pool` module's
   (`pool.Pool[Conn, pgwire.Config, Error]`, design/pool.md): `Conn` is
   `pool.Pooled` (`open`, `waitFailed`, `release`, `reuse`).

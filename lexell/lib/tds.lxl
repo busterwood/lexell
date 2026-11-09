@@ -1941,6 +1941,21 @@ fn (s: mut &Stream) takeTls(): tls.Conn {
 
 fn (s: mut &Stream) put(t: tls.Conn) { let old = replace(s, Stream.Tls(t)) }
 
+// Whether the idle connection can be used again, without parking (net's and
+// tls's quiet: the server has not closed it and has sent nothing unasked).
+fn (s: mut &Stream) quiet(): bool {
+    if s.isTls() {
+        var t = s.takeTls()
+        let q = t.quiet()
+        s.put(t)
+        return q
+    }
+    match s {
+        Stream.Plain(c) { return c.quiet() }
+        else { return false }
+    }
+}
+
 // The milliseconds left before the deadline dl (monotonic ns), at least 1;
 // E_TIMEOUT once it has passed.
 fn msLeft(dl: int): Result[int, Error] {
@@ -2414,6 +2429,14 @@ pub fn (s: mut &Session) executeSql(sql: str, params: &[Param], w: Where): Resul
 pub fn (s: mut &Session) transact(kind: int, w: Where): Result[Reply, Error] {
     if s.broken { return Err(ioErr("the connection is broken by an earlier error")) }
     return s.request(PT_TRANSACTION, tmRequest(kind, s.txn), w)
+}
+
+// Whether an idle session's connection is still there: nothing read ahead
+// and the stream quiet (a pool's check before it hands the connection out
+// again; no I/O that parks).
+pub fn (s: mut &Session) quiet(): bool {
+    if s.broken || s.rr.active || s.t.inbox.pos < s.t.inbox.end { return false }
+    return s.t.s.quiet()
 }
 
 // Asks for RESETCONNECTION on the next request (a pool gives the session
