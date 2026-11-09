@@ -10,8 +10,11 @@
 // rows of different lengths, a bad type or parameter name and a column of
 // two kinds, each leaving the connection idle; 20,000 rows (many packets);
 // two tables in one call; INSERT ... SELECT from one, inside a transaction
-// rolled back; a procedure's table parameter; an identity column is not
-// supported yet. The types and procedure it creates are dropped.
+// rolled back; a procedure's table parameter; an identity column refused
+// with a value and without its column, then filled by the server as a
+// default column, as are a computed column and a DEFAULT (and refusals for
+// a default column given a value or out of range). The types and the
+// procedure it creates are dropped.
 // expect: select: 1 'café' 12.50 '2026-11-09' x'00ff' true 0.5 1 | 2 NULL 3.00 NULL NULL false NULL NULL | 3 '' -0.01 '2000-01-01' x'' NULL -2 5000 [counts 3] idle true
 // expect: empty: 0 [counts 1] idle true
 // expect: no schema: 2 [counts 1] idle true
@@ -35,6 +38,11 @@
 // expect: procedure: 103 [counts 1] idle true
 // expect: identity: error 500 | idle true
 // expect: identity both: error 1077 | idle true
+// expect: identity by server: 1 'a' | 2 'b' | 3 NULL [counts 3] idle true
+// expect: identity given: error 1000: table parameter @t: row 1 has a value for default column 0: the server fills it, so it must be NULL | idle true
+// expect: default out of range: error 1000: table parameter @t: default column 2 out of range (2 columns) | idle true
+// expect: computed and default: 1 2 'dflt' 7 | 2 4 'dflt' NULL [counts 2] idle true
+// expect: default given NULL: NULL [counts 1] idle true
 // expect: after: 1 [counts 1] idle true
 // expect: open handles 0
 import "sqlserver"
@@ -71,7 +79,11 @@ fn show(r: &sqlserver.Rows): str {
 }
 
 fn tvp(name: str, typeName: str, rows: [][]V): sqlserver.Table {
-    return sqlserver.Table{name: name, typeName: typeName, rows: rows, nullTypes: ["", "", "", "", "varbinary(20)"]}
+    return sqlserver.Table{name: name, typeName: typeName, rows: rows, nullTypes: ["", "", "", "", "varbinary(20)"], defaults: []}
+}
+
+fn byServer(name: str, typeName: str, rows: [][]V, defaults: []int): sqlserver.Table {
+    return sqlserver.Table{name: name, typeName: typeName, rows: rows, nullTypes: [], defaults: defaults}
 }
 
 fn probe(c: mut &sqlserver.Conn, what: str, sql: str, args: &[V], tables: &[sqlserver.Table]) {
@@ -115,7 +127,7 @@ fn main() {
     probe(mut &c, "null types", "SELECT COUNT(*), COUNT(data) FROM @items", &[],
           &[tvp("@items", "dbo.LxlTvpItems", [[V.Int(1), V.Null, V.Null, V.Null, V.Null, V.Null, V.Null, V.Null]])])
     probe(mut &c, "bad null type", "SELECT COUNT(*) FROM @items", &[],
-          &[sqlserver.Table{name: "@items", typeName: "dbo.LxlTvpItems", rows: [[V.Int(1), V.Null]], nullTypes: ["", "int; --"]}])
+          &[sqlserver.Table{name: "@items", typeName: "dbo.LxlTvpItems", rows: [[V.Int(1), V.Null]], nullTypes: ["", "int; --"], defaults: []}])
     probe(mut &c, "short row", "SELECT COUNT(*) FROM @items", &[], &[tvp("@items", "dbo.LxlTvpItems", [[V.Int(1), V.Null]])])
     probe(mut &c, "ragged", "SELECT COUNT(*) FROM @items", &[], &[tvp("@items", "dbo.LxlTvpItems", [[V.Int(1)], [V.Int(1), V.Null]])])
     probe(mut &c, "no type", "SELECT COUNT(*) FROM @items", &[], &[tvp("@items", "dbo.Nope", [[V.Int(1)]])])
@@ -152,6 +164,17 @@ fn main() {
     c.exec("CREATE TYPE dbo.LxlTvpIdent AS TABLE (id int IDENTITY, name nvarchar(10))").unwrap()
     probe(mut &c, "identity", "SELECT COUNT(*) FROM @t", &[], &[tvp("@t", "dbo.LxlTvpIdent", [[V.Text("a")]])])
     probe(mut &c, "identity both", "SELECT COUNT(*) FROM @t", &[], &[tvp("@t", "dbo.LxlTvpIdent", [[V.Int(5), V.Text("a")]])])
+    probe(mut &c, "identity by server", "SELECT id, name FROM @t ORDER BY id", &[],
+          &[byServer("@t", "dbo.LxlTvpIdent", [[V.Null, V.Text("a")], [V.Null, V.Text("b")], [V.Null, V.Null]], [0])])
+    probe(mut &c, "identity given", "SELECT 1", &[], &[byServer("@t", "dbo.LxlTvpIdent", [[V.Int(5), V.Text("a")]], [0])])
+    probe(mut &c, "default out of range", "SELECT 1", &[], &[byServer("@t", "dbo.LxlTvpIdent", [[V.Null, V.Text("a")]], [2])])
+    c.exec("IF TYPE_ID('dbo.LxlTvpComputed') IS NOT NULL DROP TYPE dbo.LxlTvpComputed").unwrap()
+    c.exec("CREATE TYPE dbo.LxlTvpComputed AS TABLE (a int, twice AS a * 2, tag nvarchar(10) DEFAULT N'dflt', n int)").unwrap()
+    probe(mut &c, "computed and default", "SELECT a, twice, tag, n FROM @t ORDER BY a", &[],
+          &[byServer("@t", "dbo.LxlTvpComputed", [[V.Int(1), V.Null, V.Null, V.Int(7)], [V.Int(2), V.Null, V.Null, V.Null]], [1, 2])])
+    probe(mut &c, "default given NULL", "SELECT tag FROM @t", &[],
+          &[byServer("@t", "dbo.LxlTvpComputed", [[V.Int(1), V.Null, V.Null, V.Null]], [1])])
+    c.exec("DROP TYPE dbo.LxlTvpComputed").unwrap()
     probe(mut &c, "after", "SELECT 1", &[], &[])
     c.exec("DROP TYPE dbo.LxlTvpIdent").unwrap()
     c.exec("IF TYPE_ID('dbo.LxlTvpItems') IS NOT NULL DROP TYPE dbo.LxlTvpItems").unwrap()

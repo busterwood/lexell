@@ -471,7 +471,8 @@ TVP_END_TOKEN; the value is TVP_ROW_TOKEN and a TYPE_VARBYTE per column,
 per row, then TVP_END_TOKEN. sp_executesql declares it `@name type
 READONLY`.
 
-- **API:** `sqlserver.Table{name, typeName, rows: [][]Value, nullTypes}`
+- **API:** `sqlserver.Table{name, typeName, rows: [][]Value, nullTypes,
+  defaults}`
   (`table(name, typeName, rows)`), bound by `queryTables(sql, &args,
   &tables): Results` and `callWith(sql, &args, &tables, &outs)`; `query`,
   `run`, `queryAll` and `call` are unchanged. Value is shared by every
@@ -502,10 +503,17 @@ READONLY`.
   identifiers (it goes into sp_executesql's declaration); a parameter name
   as validParamName; rows of one length, 1 to 1,024 columns; one kind per
   column (Int and Dec mix); null types `typeInfoOf` knows.
-- **Not done:** identity and computed columns (the server refuses a value
-  for them, error 1077, and their omission, error 500; they need the
-  column flag fDefault and rows without those values); a table in
-  `stream`; TVP_ORDER_UNIQUE and TVP_COLUMN_ORDERING; sending the rows as
+- **Columns the server fills:** an identity or computed column refuses a
+  value (error 1077) and cannot be left out (error 500: the column count
+  is the type's). `defaults` lists such columns (0-based, as Rows'): their
+  metadata has fDefault (0x200), and their values are not sent in the
+  rows. The server gives identity values, computes computed columns, and
+  uses a column's DEFAULT; a DEFAULT column not listed gets the NULL sent,
+  as in an INSERT. Rows keep a value for every column, NULL for these
+  (anything else is E_INPUT), so a row lines up with the type's columns.
+  Their TYPE_INFO is the null type's (nvarchar(4000) by default): the
+  server checks no conversion for a column it fills. Added the same day.
+- **Not done:** a table in `stream`; TVP_ORDER_UNIQUE and TVP_COLUMN_ORDERING; sending the rows as
   they are produced rather than built whole in memory.
 - **Tests:** `tds_table_param` (bytes: the TYPE_INFO and rows of a small
   table, decimal widening, the (max) switch at 4,000 units counting
@@ -515,5 +523,6 @@ READONLY`.
   @p1, a column of NULLs with and without its null type, the server's
   errors and ours with the connection idle after each, 20,000 rows over
   many packets, two tables in one call, INSERT ... SELECT in a transaction
-  rolled back, a procedure's parameter, an identity column refused). Both
-  pass under the C and native backends.
+  rolled back, a procedure's parameter, an identity column refused and then
+  filled by the server, a computed column and a DEFAULT, the refusals for
+  default columns). Both pass under the C and native backends.

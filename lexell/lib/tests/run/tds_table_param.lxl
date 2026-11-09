@@ -2,7 +2,8 @@
 // column's metadata each) and its rows, byte for byte; each column's type
 // from its values (a decimal widened over its rows, an int in a decimal
 // column, nvarchar(max) past 4,000 UTF-16 units, an emoji counting two);
-// a null type for a column of NULLs; no rows as the type's default; the
+// a null type for a column of NULLs; a default column (fDefault, its
+// values not sent) and its refusals; no rows as the type's default; the
 // declaration sp_executesql gets and the default flag; and every refusal.
 // expect: ti: f3 00 03 640062006f00 01 5400 0200 00000000 0100 2608 00 00000000 0100 e7401f0000000000 00 00
 // expect: rows: 01 080100000000000000 02006100 01 00 ffff 00
@@ -12,6 +13,10 @@
 // expect: units: 4000 nvarchar(4000) | 4001 nvarchar(max) | 2000 emoji 4000 | 2001 emoji max
 // expect: max rows: 01 0100000000000000 01000000 61 00000000 | 01 ffffffffffffffff | 01 411f000000000000 411f0000
 // expect: null type: a5 1400 | ffff00 | none: e7 401f
+// expect: default column: flags 0102 0100 | rows 01 0101 01 00 00
+// expect: default refusals:
+// expect:   1000 row 1 has a value for default column 0: the server fills it, so it must be NULL
+// expect:   1000 default column -1 out of range (2 columns)
 // expect: empty: f3 00 00 01 5400 ffff 00 | 00 | default true
 // expect: rpc: declares true, status 02
 // expect: errors:
@@ -47,11 +52,11 @@ fn hexs(s: &str): str {
 }
 
 fn param(t: str, rows: [][]V, nulls: []str): tds.Param {
-    return tds.tableParam(t, &rows, &nulls, &tds.noCollation()).unwrap()
+    return tds.tableParam(t, &rows, &nulls, &[], &tds.noCollation()).unwrap()
 }
 
 fn errOf(t: str, rows: [][]V, nulls: []str): str {
-    match tds.tableParam(t, &rows, &nulls, &tds.noCollation()) {
+    match tds.tableParam(t, &rows, &nulls, &[], &tds.noCollation()) {
         Ok(_) { return "  ok" }
         Err(e) { return "  " + e.code.toStr() + " " + e.msg }
     }
@@ -102,6 +107,21 @@ fn main() {
     let none = hexs(&param("T", [[V.Int(1), V.Null]], []).typeInfo)
     println("null type: " + nt[46..48] + " " + nt[48..52] + " | " + hexs(&np.data)[20..] + " | none: " + none[46..48] + " " + none[48..52])
 
+    // column 0 is the server's: fDefault in its flags, no value in the rows
+    let dfp = tds.tableParam("T", &[[V.Null, V.Bool(true)], [V.Null, V.Null]], &[], &[0], &tds.noCollation()).unwrap()
+    let dft = hexs(&dfp.typeInfo)
+    // f3 00 00 01 5400 | 0200 | 00000000 <flags> e7401f0000000000 00 | 00000000 <flags> 6801 00 | 00
+    println("default column: flags " + dft[24..28] + " " + dft[54..58] + " | rows " + hexs(&dfp.data)[0..2] + " " +
+            hexs(&dfp.data)[2..6] + " " + hexs(&dfp.data)[6..8] + " " + hexs(&dfp.data)[8..10] + " " + hexs(&dfp.data)[10..])
+    println("default refusals:")
+    for k in [0, -1] {
+        let rows: [][]V = if k == 0 { [[V.Int(1), V.Null]] } else { [[V.Null, V.Null]] }
+        match tds.tableParam("T", &rows, &[], &[k], &tds.noCollation()) {
+            Ok(_) { println("  ok") }
+            Err(e) { println("  " + e.code.toStr() + " " + e.msg) }
+        }
+    }
+
     let ep = param("T", [], [])
     let et = hexs(&ep.typeInfo)
     println("empty: " + et[0..2] + " " + et[2..4] + " " + et[4..6] + " " + et[6..8] + " " + et[8..12] + " " + et[12..16] + " " +
@@ -132,5 +152,5 @@ fn main() {
     println(errOf("T", [[V.Null]], ["blob"]))
     var full: []V = []
     for i in 0..1024 { append(mut &full, V.Int(i)) }
-    println("1024 columns: " + (if tds.tableParam("T", &[full], &[], &tds.noCollation()).isOk() { "ok" } else { "refused" }))
+    println("1024 columns: " + (if tds.tableParam("T", &[full], &[], &[], &tds.noCollation()).isOk() { "ok" } else { "refused" }))
 }
