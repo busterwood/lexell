@@ -1131,8 +1131,16 @@ fn encRow(row: &[]Val): str {
 }
 
 fn decRow(s: &str, n: int): Result[[]Val, DbErr] {
+    let all: []bool = []
+    return decRowNeed(s, n, &all)
+}
+
+// A row's values; need: the columns used ([] all), the others NULL and not
+// decoded (9.31).
+fn decRowNeed(s: &str, n: int, need: &[]bool): Result[[]Val, DbErr] {
     var out: []Val = []
     var at = 0
+    let some = len(need) > 0
     for i in 0..n {
         if at >= len(s) {
             append(mut &out, Val.Null)       // a column added after the row was written
@@ -1140,6 +1148,12 @@ fn decRow(s: &str, n: int): Result[[]Val, DbErr] {
         }
         let tag = s[at]
         at += 1
+        if some && !need[i] {
+            if tag == 1 { at += 8 } else if tag == 2 { at += 1 } else if tag == 3 || tag == 4 { at += 4 + binary.readU32LEStr(s, at) }
+            else if tag != 0 { return Err(lexdb_base.corrupt("a row's value tag")) }
+            append(mut &out, Val.Null)
+            continue
+        }
         if tag == 0 {
             append(mut &out, Val.Null)
         } else if tag == 1 {
@@ -1423,6 +1437,7 @@ pub type Level = record {
     src: int                // a subquery in FROM (or a CTE): its number, its rows read from the run; -1 a table
     work: int               // a recursive CTE's working table: the CTE's number; -1
     lateral: bool           // a subquery in FROM using outer values (LATERAL): run per row
+    need: []bool            // a table's columns the statement uses (the others are read as NULL); [] all (9.31)
 }
 
 // A level of rows held by the run (a subquery's, a working table), not a table's.
@@ -2267,7 +2282,7 @@ fn after(k: &str): str {
 // Appends up to BATCH rows of a scan to out, from the cursor on. Rows are
 // read in batches so that what is done with them (a join's lookups, an
 // index's entries) can use the transaction between.
-fn fetch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, p: &Path, sc: &Scan, cur: mut &Cursor,
+fn fetch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, p: &Path, sc: &Scan, need: &[]bool, cur: mut &Cursor,
          out: mut &[][]Val): Result[Unit, DbErr] {
     let n = len(t.cols)
     if sc.empty {
@@ -2277,7 +2292,7 @@ fn fetch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, p: &Path,
     if sc.point {
         cur.done = true
         match try st.get(txn, t.tree, sc.lo) {
-            Some(v) { append(out, try decRow(&v, n)) }
+            Some(v) { append(out, try decRowNeed(&v, n, need)) }
             None {}
         }
         return Ok(Unit{})
@@ -2308,10 +2323,10 @@ fn fetch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, p: &Path,
     }
     for v in vals {
         if !byIndex {
-            append(out, try decRow(&v, n))
+            append(out, try decRowNeed(&v, n, need))
         } else {
             match try st.get(txn, t.tree, v) {
-                Some(rv) { append(out, try decRow(&rv, n)) }
+                Some(rv) { append(out, try decRowNeed(&rv, n, need)) }
                 None { return Err(lexdb_base.corrupt("an index entry of \"" + t.name + "\" without its row")) }
             }
         }
@@ -2330,7 +2345,7 @@ fn allTrue(cs: &[]Expr, cols: &[]lexdb_sql.ColDef, row: &[]Val, params: &[]Val):
 
 fn newLevel(t: Table, alias: str, join: int, first: int): Level {
     return Level{t: t, alias: alias, join: join, first: first, path: Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: []}, cond: [],
-                 post: [], local: [], perRow: true, hashCols: [], hashVals: [], src: -1, work: -1, lateral: false}
+                 post: [], local: [], perRow: true, hashCols: [], hashVals: [], src: -1, work: -1, lateral: false, need: []}
 }
 
 // Plans a query over the tables of FROM (4.8): the tables are joined in the
@@ -2549,7 +2564,7 @@ fn materialize(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: 
                 let scans = try pathScans(&lv.t, &lv.path, &env)
                 for sc in scans {
                     var cur = newCursor()
-                    while !cur.done { try fetch(st, txn, &lv.t, &lv.path, &sc, mut &cur, mut &rows) }
+                    while !cur.done { try fetch(st, txn, &lv.t, &lv.path, &sc, &lv.need, mut &cur, mut &rows) }
                 }
             }
             rs.cnt[k].built += len(rows)
@@ -2711,7 +2726,7 @@ fn runLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Ma
             var cur = newCursor()
             while !cur.done {
                 var batch: [][]Val = []
-                try fetch(st, txn, &lv.t, &lv.path, &sc, mut &cur, mut &batch)
+                try fetch(st, txn, &lv.t, &lv.path, &sc, &lv.need, mut &cur, mut &batch)
                 for r in batch {
                     let got = try tryRow(st, txn, q, m, k, &r, -1, row, params, emit, rs)
                     if got < 0 { return Ok(false) }
@@ -3898,7 +3913,8 @@ fn createIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
     var cur = newCursor()
     while !cur.done {
         var batch: [][]Val = []
-        try fetch(st, txn, &t, &path, &sc, mut &cur, mut &batch)
+        let all: []bool = []
+        try fetch(st, txn, &t, &path, &sc, &all, mut &cur, mut &batch)
         for r in batch {
             if !(try inIndex(&t, &ix, &r)) { continue }
             let pk = keyOf(&t, &r)
@@ -4834,6 +4850,44 @@ fn minMax(q: &Query, exprs: &[]Expr, dir: mut &int): int {
     return col
 }
 
+// The columns a statement names, without their tables, in any of its
+// parts and subqueries; star: a * anywhere in it.
+fn stmtNames(s: &lexdb_sql.Stmt, names: mut &Map[str, int], star: mut &bool) {
+    var xs: []str = []
+    for it in s.items {
+        if it.star { star = true }
+        match it.expr { Some(x) { colNames(&x, mut &xs) } None {} }
+    }
+    match s.where { Some(x) { colNames(&x, mut &xs) } None {} }
+    match s.having { Some(x) { colNames(&x, mut &xs) } None {} }
+    match s.limit { Some(x) { colNames(&x, mut &xs) } None {} }
+    match s.offset { Some(x) { colNames(&x, mut &xs) } None {} }
+    for g in s.group { colNames(&g, mut &xs) }
+    for o in s.order { colNames(&o.expr, mut &xs) }
+    for f in s.from { match f.on { Some(x) { colNames(&x, mut &xs) } None {} } }
+    for r in s.rows { for x in r { colNames(&x, mut &xs) } }
+    for si in s.sets { colNames(&si.expr, mut &xs) }
+    for x in xs { names.put(colPart(&x), 1) }
+    for b in s.subs { stmtNames(&b, names, star) }
+    for b in s.inner { stmtNames(&b, names, star) }
+}
+
+// A SELECT reads of its tables only the columns it names (9.31): its
+// results depend on nothing else. (UPDATE and DELETE write rows back
+// whole; they are not planned here.)
+fn narrow(q: mut &Query, s: &lexdb_sql.Stmt) {
+    var names: Map[str, int] = newMap()
+    var star = false
+    stmtNames(s, mut &names, mut &star)
+    if star { return }
+    for k in 0..len(q.levels) {
+        if q.levels[k].virt() { continue }
+        var need: []bool = []
+        for c in q.levels[k].t.cols { append(mut &need, names.has(&c.name)) }
+        q.levels[k].need = need
+    }
+}
+
 fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val,
               sc: mut &Scope): Result[Sel, DbErr] {
     if s.rec && s.setop != lexdb_sql.SET_UNION {
@@ -4841,6 +4895,7 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
     }
     if s.setop != 0 { return planSet(st, txn, s, params, sc) }
     var q = try buildQuery(st, txn, &s.from, &s.where, params, &s.subs, sc)
+    if s.kind == lexdb_sql.S_SELECT { narrow(mut &q, s) }
     var exprs: []Expr = []
     let outs = try selectCols(s, &q.cols, sc, mut &exprs)
     var groupBy: []Expr = []

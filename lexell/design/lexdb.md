@@ -1962,3 +1962,27 @@ table `d (id, title, body)`, beside a table `e (id, title)` without bodies:
   whole log segment to model a crash. With 64 MB segments that is 64 MB
   per commit. The tests use 1 MB segments. Measure on real files.
 
+### 9.31 Reading only the columns used
+
+A large row was read whole however little of it a query used (9.30).
+This is done in three steps; the first is built:
+
+1. **A SELECT decodes only the columns it names** (`narrow`, after
+   `buildQuery` in `planSelect`). For each table it reads, the columns
+   named anywhere in the statement (its parts and its subqueries, which is
+   where correlated references are) are decoded. The others are skipped in
+   the row and read as NULL (`decRowNeed`). A `*` anywhere in the statement
+   means all. A SELECT's results depend on nothing else. UPDATE and DELETE,
+   which write rows back whole, are not planned there, and `narrow`
+   checks the statement is a SELECT.
+
+   This applies to every row, not only large ones. The 40 test programs
+   are its check: a column missed would read as NULL. Planted bugs, each
+   caught by `exec_sub`:
+   - names in subqueries not collected;
+   - names in join conditions not collected;
+   - names in ORDER BY not collected.
+2. Long texts stored after a row's other columns: to come.
+3. A large row's start kept in its stub, so a scan whose columns are all
+   there reads no chunks: to come.
+
