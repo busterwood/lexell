@@ -62,8 +62,22 @@ pub type ColDef = record {
 
 pub type SelItem = record {
     pub star: bool
+    pub qual: str               // t.* : the table (or alias); "" for *
     pub expr: Option[Expr]
     pub alias: str
+}
+
+// A table in FROM: how it joins the ones before it.
+pub const J_FIRST = 0
+pub const J_INNER = 1
+pub const J_LEFT = 2
+pub const J_CROSS = 3
+
+pub type FromItem = record {
+    pub table: str
+    pub alias: str              // the name its columns are qualified by
+    pub join: int
+    pub on: Option[Expr]
 }
 
 pub type OrderItem = record { pub expr: Expr; pub desc: bool }
@@ -81,6 +95,9 @@ pub const S_BEGIN = 7
 pub const S_COMMIT = 8
 pub const S_ROLLBACK = 9
 pub const S_SET = 10
+pub const S_CREATE_INDEX = 11
+pub const S_DROP_INDEX = 12
+pub const S_EXPLAIN = 13
 
 pub type Stmt = record {
     pub kind: int
@@ -98,11 +115,16 @@ pub type Stmt = record {
     pub offset: Option[Expr]
     pub sets: []SetItem         // UPDATE
     pub params: int             // the highest $n
+    pub from: []FromItem        // SELECT
+    pub index: str              // CREATE INDEX / DROP INDEX: the index's name
+    pub unique: bool
+    pub inner: []Stmt           // EXPLAIN: the statement explained
 }
 
 fn newStmt(kind: int): Stmt {
     return Stmt{kind: kind, table: "", ifFlag: false, cols: [], pk: [], names: [], rows: [], items: [], where: None,
-                group: [], order: [], limit: None, offset: None, sets: [], params: 0}
+                group: [], order: [], limit: None, offset: None, sets: [], params: 0, from: [], index: "",
+                unique: false, inner: []}
 }
 
 // ---- the lexer
@@ -266,7 +288,8 @@ fn (p: mut &P) expectKw(w: str): Result[Unit, lexdb_base.DbErr] {
 
 const RESERVED: []str = ["select", "from", "where", "group", "order", "by", "limit", "offset", "and", "or", "not", "is",
                   "null", "as", "values", "set", "into", "insert", "update", "delete", "create", "table",
-                  "primary", "key", "asc", "desc", "true", "false", "cast", "on", "join"]
+                  "primary", "key", "asc", "desc", "true", "false", "cast", "on", "join", "inner", "left",
+                  "right", "full", "outer", "cross", "using", "natural"]
 
 fn isReserved(w: &str): bool {
     for r in RESERVED { if r == w { return true } }
@@ -493,7 +516,8 @@ fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
         }
         var name = t.text
         if p.acceptKw(".") {
-            name = try p.name()      // table.column: one table, so the column
+            let col = try p.name()
+            name = t.text + "." + col     // qualified: table (or alias) dot column
         }
         return Ok(Expr.Col(name))
     }
@@ -570,8 +594,13 @@ fn (p: mut &P) select(): Result[Stmt, lexdb_base.DbErr] {
     if p.acceptKw("distinct") { return Err(lexdb_base.err("0A000", "SELECT DISTINCT is not supported")) }
     let all = p.acceptKw("all")
     while true {
+        let q = p.peek()
         if p.acceptKw("*") {
-            append(mut &s.items, SelItem{star: true, expr: None, alias: ""})
+            append(mut &s.items, SelItem{star: true, qual: "", expr: None, alias: ""})
+        } else if (q.kind == T_IDENT || q.kind == T_QIDENT) && p.peekAt(1).kind == T_OP && p.peekAt(1).text == "." &&
+                  p.peekAt(2).kind == T_OP && p.peekAt(2).text == "*" {
+            p.pos += 3
+            append(mut &s.items, SelItem{star: true, qual: q.text, expr: None, alias: ""})
         } else {
             let e = try p.expr()
             var alias = ""
@@ -584,20 +613,38 @@ fn (p: mut &P) select(): Result[Stmt, lexdb_base.DbErr] {
                     p.pos += 1
                 }
             }
-            append(mut &s.items, SelItem{star: false, expr: Some(e), alias: alias})
+            append(mut &s.items, SelItem{star: false, qual: "", expr: Some(e), alias: alias})
         }
         if !p.acceptKw(",") { break }
     }
     if p.acceptKw("from") {
-        s.table = try p.name()
-        if p.acceptKw("as") {
-            let a = try p.name()
-        } else if p.peek().kind == T_IDENT && !isReserved(&p.peek().text) {
-            p.pos += 1                      // an alias: one table, so it changes nothing
+        append(mut &s.from, try p.fromItem(J_FIRST))
+        while true {
+            if p.acceptKw(",") {
+                append(mut &s.from, try p.fromItem(J_CROSS))
+            } else if p.acceptKw("cross") {
+                try p.expectKw("join")
+                append(mut &s.from, try p.fromItem(J_CROSS))
+            } else if p.isKw("join") || p.isKw("inner") || p.isKw("left") {
+                var kind = J_INNER
+                if p.acceptKw("left") {
+                    let o = p.acceptKw("outer")
+                    kind = J_LEFT
+                } else {
+                    let i = p.acceptKw("inner")
+                }
+                try p.expectKw("join")
+                var f = try p.fromItem(kind)
+                try p.expectKw("on")
+                f.on = Some(try p.expr())
+                append(mut &s.from, f)
+            } else if p.isKw("right") || p.isKw("full") || p.isKw("natural") {
+                return Err(lexdb_base.err("0A000", "RIGHT, FULL and NATURAL joins are not supported"))
+            } else {
+                break
+            }
         }
-        if p.isKw(",") || p.isKw("join") || p.isKw("inner") || p.isKw("left") || p.isKw("cross") {
-            return Err(lexdb_base.err("0A000", "joins are not supported yet"))
-        }
+        s.table = s.from[0].table
     }
     if p.acceptKw("where") { s.where = Some(try p.expr()) }
     if p.acceptKw("group") {
@@ -624,6 +671,43 @@ fn (p: mut &P) select(): Result[Stmt, lexdb_base.DbErr] {
             let r = p.acceptKw("rows") || p.acceptKw("row")
         }
     }
+    return Ok(s)
+}
+
+fn (p: mut &P) fromItem(join: int): Result[FromItem, lexdb_base.DbErr] {
+    let table = try p.name()
+    var alias = table
+    if p.acceptKw("as") {
+        alias = try p.name()
+    } else {
+        let t = p.peek()
+        if t.kind == T_QIDENT || (t.kind == T_IDENT && !isReserved(&t.text)) {
+            alias = t.text
+            p.pos += 1
+        }
+    }
+    return Ok(FromItem{table: table, alias: alias, join: join, on: None})
+}
+
+fn (p: mut &P) createIndex(unique: bool): Result[Stmt, lexdb_base.DbErr] {
+    var s = newStmt(S_CREATE_INDEX)
+    s.unique = unique
+    if p.acceptKw("if") {
+        try p.expectKw("not")
+        try p.expectKw("exists")
+        s.ifFlag = true
+    }
+    s.index = try p.name()
+    try p.expectKw("on")
+    s.table = try p.name()
+    if p.acceptKw("using") {
+        let m = try p.name()
+        if m != "btree" { return Err(lexdb_base.err("0A000", "index method \"" + m + "\" is not supported")) }
+    }
+    try p.expectKw("(")
+    append(mut &s.names, try p.name())
+    while p.acceptKw(",") { append(mut &s.names, try p.name()) }
+    try p.expectKw(")")
     return Ok(s)
 }
 
@@ -662,9 +746,32 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
         "delete" { return p.delete() }
         "create" {
             if p.acceptKw("table") { return p.createTable() }
-            return Err(lexdb_base.err("0A000", "only CREATE TABLE is supported"))
+            if p.acceptKw("index") { return p.createIndex(false) }
+            if p.acceptKw("unique") {
+                try p.expectKw("index")
+                return p.createIndex(true)
+            }
+            return Err(lexdb_base.err("0A000", "only CREATE TABLE and CREATE INDEX are supported"))
+        }
+        "explain" {
+            var s = newStmt(S_EXPLAIN)
+            let inner = try p.statement()
+            if inner.kind != S_SELECT && inner.kind != S_UPDATE && inner.kind != S_DELETE {
+                return Err(lexdb_base.err("0A000", "EXPLAIN takes SELECT, UPDATE or DELETE"))
+            }
+            append(mut &s.inner, inner)
+            return Ok(s)
         }
         "drop" {
+            if p.acceptKw("index") {
+                var s = newStmt(S_DROP_INDEX)
+                if p.acceptKw("if") {
+                    try p.expectKw("exists")
+                    s.ifFlag = true
+                }
+                s.index = try p.name()
+                return Ok(s)
+            }
             try p.expectKw("table")
             var s = newStmt(S_DROP)
             if p.acceptKw("if") {

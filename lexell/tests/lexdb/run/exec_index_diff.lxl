@@ -1,0 +1,143 @@
+// lexdb_exec: indexes and joins against plain scans. Tables a and b have
+// secondary indexes; a0 and b0 hold the same rows and have none. The same
+// random inserts, updates and deletes go to both; random queries must give
+// the same rows from each (index lookups and ranges against full scans),
+// and the same joins (per-row index lookups against hash joins). The cache
+// is small, so nodes are evicted and loaded meanwhile.
+// expect: statements ok, queries 1200 differ 0, index paths used true, hash joins used true
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_base"
+
+fn rows(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if !r.hasRows { return r.tag }
+            var lines: []str = []
+            for row in r.rows {
+                var cells: []str = []
+                for v in row { append(mut &cells, if lexdb_exec.isNull(&v) { "N" } else { lexdb_exec.text(&v) }) }
+                append(mut &lines, strings.join(&cells, "|"))
+            }
+            return strings.join(&lines, ";")
+        }
+        Err(e) { return "error " + e.state }      // the message names the table
+    }
+}
+
+fn must(s: mut &lexdb_exec.Session, sql: str) {
+    match s.exec(&sql) {
+        Ok(_) {}
+        Err(e) { panic(sql + ": " + e.state + " " + e.msg) }
+    }
+}
+
+fn xval(r: mut &lexdb_base.Rng): str {
+    if r.below(8) == 0 { return "null" }
+    return (r.below(40) - 10).toStr()
+}
+
+fn yval(r: mut &lexdb_base.Rng): str {
+    let ys = ["'ash'", "'birch'", "'cedar'", "'elm'", "'fir'", "''", "null"]
+    return ys[r.below(len(ys))]
+}
+
+fn zval(r: mut &lexdb_base.Rng): str {
+    if r.below(9) == 0 { return "null" }
+    return (r.below(2000) - 1000).toStr() + "." + r.below(100).toStr()
+}
+
+fn cond(r: mut &lexdb_base.Rng): str {
+    return match r.below(11) {
+        10 { "id >= " + r.below(3000).toStr() + " and id <= " + r.below(3000).toStr() }
+        0 { "x = " + xval(r) }
+        1 { "x > " + xval(r) + " and x <= " + xval(r) }
+        2 { "y = " + yval(r) + " and x < " + xval(r) }
+        3 { "y = " + yval(r) }
+        4 { "z >= " + zval(r) }
+        5 { "x is null" }
+        6 { "y > " + yval(r) }
+        7 { "z = " + zval(r) + " or x = 3" }
+        8 { "y = " + yval(r) + " and x = " + xval(r) }
+        else { "x >= " + xval(r) + " and x < " + xval(r) }
+    }
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    var s = lexdb_exec.newSession(st)
+    for t in ["a", "a0", "b", "b0"] {
+        must(mut &s, "create table " + t + " (id int primary key, x int, y text, z numeric(8,2))")
+    }
+    must(mut &s, "create index a_x on a (x)")
+    must(mut &s, "create index a_yx on a (y, x)")
+    must(mut &s, "create index a_z on a (z)")
+    must(mut &s, "create index b_x on b (x)")
+    var r = lexdb_base.rng(42)
+    var queries = 0
+    var differ = 0
+    var indexed = false
+    var hashed = false
+    for round in 0..40 {
+        // changes, the same to both pairs
+        for k in 0..25 {
+            let op = r.below(10)
+            var sql = ""
+            if op < 6 {
+                var vs: []str = []
+                for v in 0..5 {
+                    append(mut &vs, "(" + r.below(3000).toStr() + ", " + xval(mut &r) + ", " + yval(mut &r) + ", " +
+                           zval(mut &r) + ")")
+                }
+                sql = "insert into T values " + strings.join(&vs, ", ")
+            } else if op < 9 {
+                sql = "update T set x = " + xval(mut &r) + ", y = " + yval(mut &r) + " where " + cond(mut &r)
+            } else {
+                sql = "delete from T where " + cond(mut &r)
+            }
+            let p = if r.below(2) == 0 { ["a", "a0"] } else { ["b", "b0"] }
+            let got1 = rows(mut &s, &strings.replaceAll(sql, " T ", " " + p[0] + " "))
+            let got0 = rows(mut &s, &strings.replaceAll(sql, " T ", " " + p[1] + " "))
+            if got1 != got0 {
+                differ += 1
+                println("differ: " + sql + ": " + got1 + " / " + got0)
+            }
+        }
+        // queries
+        for k in 0..30 {
+            var sql = ""
+            let c = cond(mut &r)
+            let j = r.below(4)
+            if j < 2 {
+                sql = "select id, x, y, z from T where " + c + " order by id"
+            } else if j == 2 {
+                sql = "select t.id, u.id from T t join U u on u.x = t.x where t." + c + " order by 1, 2"
+            } else {
+                sql = "select t.id, u.id, u.y from T t left join U u on u.x = t.x and u.y = t.y order by 1, 2"
+            }
+            let q1 = strings.replaceAll(strings.replaceAll(sql, "from T", "from a"), "join U", "join b")
+            let q0 = strings.replaceAll(strings.replaceAll(sql, "from T", "from a0"), "join U", "join b0")
+            let got1 = rows(mut &s, &q1)
+            let got0 = rows(mut &s, &q0)
+            queries += 1
+            if got1 != got0 {
+                differ += 1
+                println("differ: " + q1 + "\n  " + got1 + "\n  " + got0)
+            }
+            if strings.contains(rows(mut &s, &("explain " + q1)), "index ") { indexed = true }
+            if strings.contains(rows(mut &s, &("explain " + q0)), "hash on") { hashed = true }
+        }
+    }
+    let n = rows(mut &s, &"select count(*) from a")
+    if n == "0" { println("a is empty") }
+    println("statements ok, queries " + queries.toStr() + " differ " + differ.toStr() + ", index paths used " +
+            indexed.toStr() + ", hash joins used " + hashed.toStr())
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(3), lexdb_store.Options{cacheNodes: 12, segBytes: 256 * 1024, ckptBytes: 64 * 1024, snapNodes: 50000}, body).unwrap()
+}

@@ -1,0 +1,198 @@
+// lexdb_exec: secondary indexes, joins and EXPLAIN (D4). Expected output
+// checked by hand when written.
+// expect: -- numeric keys
+// expect: create table prices (p numeric(10,2) primary key, label text) -> CREATE TABLE
+// expect: insert into prices values (-12.5, 'a'), (-2, 'b'), (0, 'c'), (0.05, 'd'), (1.5, 'e'), (10, 'f'), (100.25, 'g') -> INSERT 0 7
+// expect: select label from prices -> [label] a; b; c; d; e; f; g
+// expect: select label from prices where p = 1.50 -> [label] e
+// expect: select label from prices where p >= -2 and p < 10 -> [label] b; c; d; e
+// expect: insert into prices values (1.5, 'dup') -> 23505 duplicate key value violates unique constraint "prices_pkey": Key (p)=(1.50) already exists.
+// expect: create table n (id int primary key, v int) -> CREATE TABLE
+// expect: insert into n values (1, 1), (2, 2), (3, 3) -> INSERT 0 3
+// expect: select id from n where id < 2.3 -> [id] 1; 2
+// expect: select id from n where id > 1.5 and id <= 2.5 -> [id] 2
+// expect: -- indexes
+// expect: create table people (id int primary key, name text, city text, age int) -> CREATE TABLE
+// expect: insert into people values (1, 'ann', 'oslo', 30), (2, 'bob', 'rome', 25), (3, 'cy', 'oslo', 41), (4, 'di', null, 30), (5, 'ed', 'rome', 30) -> INSERT 0 5
+// expect: create index people_city on people (city) -> CREATE INDEX
+// expect: create unique index people_name on people (name) -> CREATE INDEX
+// expect: create index people_city_age on people (city, age) -> CREATE INDEX
+// expect: explain select * from people where city = 'oslo' -> [QUERY PLAN] scan people: index people_city lookup
+// expect: select id, name from people where city = 'oslo' -> [id,name] 1|ann; 3|cy
+// expect: explain select * from people where city = 'oslo' and age > 35 -> [QUERY PLAN] scan people: index people_city_age range
+// expect: select name from people where city = 'oslo' and age > 35 -> [name] cy
+// expect: explain select * from people where name = 'bob' -> [QUERY PLAN] scan people: index people_name lookup
+// expect: explain select * from people where id = 3 and name = 'cy' -> [QUERY PLAN] scan people: primary key lookup
+// expect: explain select * from people where age = 30 -> [QUERY PLAN] scan people: full scan
+// expect: select name from people where city is null -> [name] di
+// expect: select name from people where city > 'p' -> [name] bob; ed
+// expect: insert into people values (6, 'bob', 'oslo', 1) -> 23505 duplicate key value violates unique constraint "people_name": Key (name)=(bob) already exists.
+// expect: insert into people values (6, null, 'oslo', 1), (7, null, 'oslo', 2) -> INSERT 0 2
+// expect: update people set city = 'rome' where name = 'ann' -> UPDATE 1
+// expect: select name from people where city = 'oslo' -> [name] cy; NULL; NULL
+// expect: select name from people where city = 'rome' -> [name] ann; bob; ed
+// expect: update people set name = 'cy' where id = 2 -> 23505 duplicate key value violates unique constraint "people_name": Key (name)=(cy) already exists.
+// expect: update people set id = 20 where id = 2 -> UPDATE 1
+// expect: select id, name from people where name = 'bob' -> [id,name] 20|bob
+// expect: delete from people where city = 'rome' and age = 30 -> DELETE 2
+// expect: select id from people where city = 'rome' -> [id] 20
+// expect: select count(*) from people -> [count] 5
+// expect: create unique index people_city_u on people (city) -> 23505 could not create unique index "people_city_u": a value is duplicated
+// expect: create index people_city on people (age) -> 42P07 relation "people_city" already exists
+// expect: create table people_city (x int primary key) -> 42P07 relation "people_city" already exists
+// expect: begin -> BEGIN
+// expect: create index people_age on people (age) -> CREATE INDEX
+// expect: explain select * from people where age = 1 -> [QUERY PLAN] scan people: index people_age lookup
+// expect: rollback -> ROLLBACK
+// expect: explain select * from people where age = 1 -> [QUERY PLAN] scan people: full scan
+// expect: drop index people_city_age -> DROP INDEX
+// expect: drop index people_city_age -> 42704 index "people_city_age" does not exist
+// expect: drop index if exists people_city_age -> DROP INDEX
+// expect: explain select * from people where city = 'oslo' and age > 35 -> [QUERY PLAN] scan people: index people_city lookup
+// expect: -- joins
+// expect: create table cust (id int primary key, name text) -> CREATE TABLE
+// expect: create table orders (id int primary key, cust int, total int) -> CREATE TABLE
+// expect: insert into cust values (1, 'ann'), (2, 'bob'), (3, 'cy') -> INSERT 0 3
+// expect: insert into orders values (10, 1, 5), (11, 1, 7), (12, 2, 9), (13, 9, 1) -> INSERT 0 4
+// expect: select c.name, o.total from cust c join orders o on o.cust = c.id order by o.id -> [name,total] ann|5; ann|7; bob|9
+// expect: explain select c.name, o.total from cust c join orders o on o.cust = c.id -> [QUERY PLAN] scan cust c: full scan; join orders o: hash on (cust) over full scan
+// expect: select c.name, o.total from orders o join cust c on c.id = o.cust order by o.id -> [name,total] ann|5; ann|7; bob|9
+// expect: explain select c.name, o.total from orders o join cust c on c.id = o.cust -> [QUERY PLAN] scan orders o: full scan; join cust c: primary key lookup per row
+// expect: create index orders_cust on orders (cust) -> CREATE INDEX
+// expect: explain select c.name, o.total from cust c join orders o on o.cust = c.id -> [QUERY PLAN] scan cust c: full scan; join orders o: index orders_cust lookup per row
+// expect: select c.name, o.total from cust c join orders o on o.cust = c.id where c.name <> 'bob' order by 2 -> [name,total] ann|5; ann|7
+// expect: select c.name, o.id from cust c left join orders o on o.cust = c.id order by c.id, o.id -> [name,id] ann|10; ann|11; bob|12; cy|NULL
+// expect: select c.name from cust c left join orders o on o.cust = c.id where o.id is null -> [name] cy
+// expect: select c.name, count(o.id), sum(o.total) from cust c left join orders o on o.cust = c.id group by c.name order by c.name -> [name,count,sum] ann|2|12; bob|1|9; cy|0|NULL
+// expect: select count(*) from cust, orders -> [count] 12
+// expect: explain select * from cust, orders -> [QUERY PLAN] scan cust: full scan; cross join orders: loop over full scan
+// expect: select cust.name, orders.total from cust, orders where orders.cust = cust.id and orders.total > 6 order by total -> [name,total] ann|7; bob|9
+// expect: select c.*, o.id from cust c cross join orders o where o.id = 13 -> [id,name,id] 1|ann|13; 2|bob|13; 3|cy|13
+// expect: select name, total from cust join orders on cust = cust.id where cust.id = 1 -> [name,total] ann|5; ann|7
+// expect: select id from cust join orders on cust = cust.id -> 42702 column reference "id" is ambiguous
+// expect: select x.id from cust c -> 42P01 missing FROM-clause entry for table "x"
+// expect: select * from cust c join cust c on true -> 42712 table name "c" specified more than once
+// expect: select a.name, b.name from cust a join cust b on b.id = a.id + 1 order by a.id -> [name,name] ann|bob; bob|cy
+// expect: explain select a.name, b.name from cust a join cust b on b.id = a.id + 1 -> [QUERY PLAN] scan cust a: full scan; join cust b: primary key lookup per row
+// expect: select c.name, o.total, p.name from cust c join orders o on o.cust = c.id join people p on p.id = c.id order by o.id -> [name,total,name]
+// expect: select c.name from cust c join orders o on o.cust = c.id limit 1 -> [name] ann
+// expect: select * from cust c right join orders o on true -> 0A000 RIGHT, FULL and NATURAL joins are not supported
+// expect: drop table orders -> DROP TABLE
+// expect: create index orders_cust on cust (name) -> CREATE INDEX
+// expect: explain update people set age = 1 where name = 'cy' -> [QUERY PLAN] scan people: index people_name lookup
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "strings"
+
+fn show(s: mut &lexdb_exec.Session, sql: str) {
+    match s.exec(&sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if !r.hasRows {
+                println(sql + " -> " + r.tag)
+                return
+            }
+            var lines: []str = []
+            for row in r.rows {
+                var cells: []str = []
+                for v in row { append(mut &cells, if lexdb_exec.isNull(&v) { "NULL" } else { lexdb_exec.text(&v) }) }
+                append(mut &lines, strings.join(&cells, "|"))
+            }
+            var names: []str = []
+            for c in r.cols { append(mut &names, c.name) }
+            println(sql + " -> [" + strings.join(&names, ",") + "]" + (if len(lines) > 0 { " " } else { "" }) + strings.join(&lines, "; "))
+        }
+        Err(e) { println(sql + " -> " + e.state + " " + e.msg) }
+    }
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    var s = lexdb_exec.newSession(st)
+    println("-- numeric keys")
+    show(mut &s, "create table prices (p numeric(10,2) primary key, label text)")
+    show(mut &s, "insert into prices values (-12.5, 'a'), (-2, 'b'), (0, 'c'), (0.05, 'd'), (1.5, 'e'), (10, 'f'), (100.25, 'g')")
+    show(mut &s, "select label from prices")
+    show(mut &s, "select label from prices where p = 1.50")
+    show(mut &s, "select label from prices where p >= -2 and p < 10")
+    show(mut &s, "insert into prices values (1.5, 'dup')")
+    show(mut &s, "create table n (id int primary key, v int)")
+    show(mut &s, "insert into n values (1, 1), (2, 2), (3, 3)")
+    show(mut &s, "select id from n where id < 2.3")
+    show(mut &s, "select id from n where id > 1.5 and id <= 2.5")
+    println("-- indexes")
+    show(mut &s, "create table people (id int primary key, name text, city text, age int)")
+    show(mut &s, "insert into people values (1, 'ann', 'oslo', 30), (2, 'bob', 'rome', 25), (3, 'cy', 'oslo', 41), (4, 'di', null, 30), (5, 'ed', 'rome', 30)")
+    show(mut &s, "create index people_city on people (city)")
+    show(mut &s, "create unique index people_name on people (name)")
+    show(mut &s, "create index people_city_age on people (city, age)")
+    show(mut &s, "explain select * from people where city = 'oslo'")
+    show(mut &s, "select id, name from people where city = 'oslo'")
+    show(mut &s, "explain select * from people where city = 'oslo' and age > 35")
+    show(mut &s, "select name from people where city = 'oslo' and age > 35")
+    show(mut &s, "explain select * from people where name = 'bob'")
+    show(mut &s, "explain select * from people where id = 3 and name = 'cy'")
+    show(mut &s, "explain select * from people where age = 30")
+    show(mut &s, "select name from people where city is null")
+    show(mut &s, "select name from people where city > 'p'")
+    show(mut &s, "insert into people values (6, 'bob', 'oslo', 1)")
+    show(mut &s, "insert into people values (6, null, 'oslo', 1), (7, null, 'oslo', 2)")
+    show(mut &s, "update people set city = 'rome' where name = 'ann'")
+    show(mut &s, "select name from people where city = 'oslo'")
+    show(mut &s, "select name from people where city = 'rome'")
+    show(mut &s, "update people set name = 'cy' where id = 2")
+    show(mut &s, "update people set id = 20 where id = 2")
+    show(mut &s, "select id, name from people where name = 'bob'")
+    show(mut &s, "delete from people where city = 'rome' and age = 30")
+    show(mut &s, "select id from people where city = 'rome'")
+    show(mut &s, "select count(*) from people")
+    show(mut &s, "create unique index people_city_u on people (city)")
+    show(mut &s, "create index people_city on people (age)")
+    show(mut &s, "create table people_city (x int primary key)")
+    show(mut &s, "begin")
+    show(mut &s, "create index people_age on people (age)")
+    show(mut &s, "explain select * from people where age = 1")
+    show(mut &s, "rollback")
+    show(mut &s, "explain select * from people where age = 1")
+    show(mut &s, "drop index people_city_age")
+    show(mut &s, "drop index people_city_age")
+    show(mut &s, "drop index if exists people_city_age")
+    show(mut &s, "explain select * from people where city = 'oslo' and age > 35")
+    println("-- joins")
+    show(mut &s, "create table cust (id int primary key, name text)")
+    show(mut &s, "create table orders (id int primary key, cust int, total int)")
+    show(mut &s, "insert into cust values (1, 'ann'), (2, 'bob'), (3, 'cy')")
+    show(mut &s, "insert into orders values (10, 1, 5), (11, 1, 7), (12, 2, 9), (13, 9, 1)")
+    show(mut &s, "select c.name, o.total from cust c join orders o on o.cust = c.id order by o.id")
+    show(mut &s, "explain select c.name, o.total from cust c join orders o on o.cust = c.id")
+    show(mut &s, "select c.name, o.total from orders o join cust c on c.id = o.cust order by o.id")
+    show(mut &s, "explain select c.name, o.total from orders o join cust c on c.id = o.cust")
+    show(mut &s, "create index orders_cust on orders (cust)")
+    show(mut &s, "explain select c.name, o.total from cust c join orders o on o.cust = c.id")
+    show(mut &s, "select c.name, o.total from cust c join orders o on o.cust = c.id where c.name <> 'bob' order by 2")
+    show(mut &s, "select c.name, o.id from cust c left join orders o on o.cust = c.id order by c.id, o.id")
+    show(mut &s, "select c.name from cust c left join orders o on o.cust = c.id where o.id is null")
+    show(mut &s, "select c.name, count(o.id), sum(o.total) from cust c left join orders o on o.cust = c.id group by c.name order by c.name")
+    show(mut &s, "select count(*) from cust, orders")
+    show(mut &s, "explain select * from cust, orders")
+    show(mut &s, "select cust.name, orders.total from cust, orders where orders.cust = cust.id and orders.total > 6 order by total")
+    show(mut &s, "select c.*, o.id from cust c cross join orders o where o.id = 13")
+    show(mut &s, "select name, total from cust join orders on cust = cust.id where cust.id = 1")
+    show(mut &s, "select id from cust join orders on cust = cust.id")
+    show(mut &s, "select x.id from cust c")
+    show(mut &s, "select * from cust c join cust c on true")
+    show(mut &s, "select a.name, b.name from cust a join cust b on b.id = a.id + 1 order by a.id")
+    show(mut &s, "explain select a.name, b.name from cust a join cust b on b.id = a.id + 1")
+    show(mut &s, "select c.name, o.total, p.name from cust c join orders o on o.cust = c.id join people p on p.id = c.id order by o.id")
+    show(mut &s, "select c.name from cust c join orders o on o.cust = c.id limit 1")
+    show(mut &s, "select * from cust c right join orders o on true")
+    show(mut &s, "drop table orders")
+    show(mut &s, "create index orders_cust on cust (name)")
+    show(mut &s, "explain update people set age = 1 where name = 'cy'")
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(5), lexdb_store.Options{cacheNodes: 100000, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, body).unwrap()
+}
