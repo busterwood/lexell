@@ -393,7 +393,7 @@ Built on 2026-11-09 on branch `lexdb`, about 6,300 lines in
 (cache, trees, transactions, log, checkpoints, recovery, snapshots),
 `lexdb_sql` (lexer, parser), `lexdb_exec` (catalog, rows, keys, planner,
 statements, sessions), `lexdb_wire` (protocol 3.0) and `lexdb` (the
-server). Tests: `python3 lexell/tests/lexdb.py` (46 programs in
+server). Tests: `python3 lexell/tests/lexdb.py` (47 programs in
 `tests/lexdb/run`, under `LXL_CHECK=1`).
 
     lexell/compiler/out/lxlc lexell/cmd/lexdb.lxl -o lexdb
@@ -592,6 +592,9 @@ is the comparison to make.
    TYPE (built: 9.36); (4) (built: 9.37) SET
    SCHEMA, ALTER INDEX ... RENAME, ALTER SCHEMA ... RENAME. Column
    defaults, ADD COLUMN ... DEFAULT among them, are built (9.38).
+14. Constraints (the user's request, 2026-11-09), in steps: (1) UNIQUE
+   (built: 9.39); (2) CHECK; (3) FOREIGN KEY, with its ON DELETE and ON
+   UPDATE actions.
 
 ### 9.5 Indexes and joins (D4)
 
@@ -2480,3 +2483,61 @@ Planted, each caught:
 Not done: volatile defaults (`now()`, `nextval()`, `gen_random_uuid()`)
 wait for those functions. When they come, ADD COLUMN with one must
 rewrite the rows, and the default must be made per row.
+
+### 9.39 UNIQUE constraints
+
+**Where.**
+- In CREATE TABLE: `UNIQUE` on a column, `UNIQUE (a, b)` among the
+  columns, either after `CONSTRAINT name`.
+- `ALTER TABLE ADD [CONSTRAINT name] UNIQUE (cols)`.
+- `ALTER TABLE DROP CONSTRAINT [IF EXISTS] name`.
+
+`NULLS DISTINCT` (the default) is accepted, `NULLS NOT DISTINCT` is 0A000.
+`CONSTRAINT name` before NOT NULL, DEFAULT or PRIMARY KEY is accepted, and
+the name is not kept.
+
+**As in PostgreSQL, a unique constraint is a unique index the constraint
+owns**, of the same name, in the table's schema. `Index.con` marks it,
+saved as bit 4 of the index's flags byte; the flags are now read as bits.
+The index enforces it and the planner uses it, as any unique index. NULLs
+are not equal, and the violation message names the constraint (23505).
+DROP CONSTRAINT drops the index. DROP INDEX of it is 2BP01 ("constraint
+... requires it"). What happens to indexes happens to it: DROP COLUMN of
+one of its columns drops it, a type change rebuilds it, and renames and
+SET SCHEMA move it.
+
+**Names** are made as PostgreSQL makes them: the table, the columns and
+`key`, joined by `_` and cut to 63 bytes, with 1, 2, ... added while the
+name is taken by a relation in the schema or a constraint of the table
+(`makeName`). A name given and taken is 42P07 (a relation's) or 42710
+(the table's constraint's).
+
+**ADD UNIQUE checks the rows there** as CREATE UNIQUE INDEX does (23505,
+"could not create unique index"), through the same code (`addIndex`, now
+shared).
+
+**Checked** by `exec_unique`:
+- violations naming each kind of constraint;
+- several NULLs;
+- updates;
+- names made around a taken one, and a name given twice;
+- ADD over duplicated rows and then without;
+- the planner using it;
+- DROP INDEX refused, DROP CONSTRAINT (its tree dropped);
+- a constraint missing, IF EXISTS, the key's name (0A000);
+- DROP COLUMN, a rename, SET SCHEMA;
+- a rollback;
+- bad columns, and a reopen.
+
+Planted, each caught:
+- the flag not saved, or not read;
+- the index not unique;
+- names made without a number;
+- a taken name not skipped;
+- DROP INDEX allowed;
+- DROP CONSTRAINT leaving the index's tree (caught once the test counted
+  the store's trees);
+- columns twice;
+- CREATE's constraints dropped;
+- rows not checked when added;
+- a constraint name given twice.

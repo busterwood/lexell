@@ -94,6 +94,26 @@ pub fn isDefault(x: &Expr): bool {
     }
 }
 
+// A table constraint other than its key and NOT NULL (9.39).
+pub const C_UNIQUE = 1
+pub const C_CHECK = 2
+pub const C_FOREIGN = 3
+
+pub type Constraint = record {
+    pub kind: int
+    pub name: str               // "" when not given: one is made
+    pub cols: []str             // UNIQUE's, a foreign key's
+    pub expr: Option[Expr]      // CHECK's
+    pub refTable: str           // a foreign key's table and columns
+    pub refCols: []str
+    pub onDelete: int
+    pub onUpdate: int
+}
+
+pub fn newConstraint(kind: int, name: str): Constraint {
+    return Constraint{kind: kind, name: name, cols: [], expr: None, refTable: "", refCols: [], onDelete: 0, onUpdate: 0}
+}
+
 pub type SelItem = record {
     pub star: bool
     pub qual: str               // t.* : the table (or alias); "" for *
@@ -160,6 +180,8 @@ pub const A_TYPE = 7            // ALTER COLUMN name TYPE col.typ [USING using]
 pub const A_SET_SCHEMA = 8      // SET SCHEMA name
 pub const A_SET_DEFAULT = 9     // ALTER COLUMN name SET DEFAULT col.def
 pub const A_DROP_DEFAULT = 10   // ALTER COLUMN name DROP DEFAULT
+pub const A_ADD_CON = 11        // ADD [CONSTRAINT name] UNIQUE (...) ...
+pub const A_DROP_CON = 12       // DROP CONSTRAINT [IF EXISTS] name
 
 pub type Alter = record {
     pub kind: int
@@ -168,6 +190,7 @@ pub type Alter = record {
     pub to: str                 // A_RENAME_COL: the column's new name
     pub ifFlag: bool            // ADD COLUMN IF NOT EXISTS, DROP COLUMN IF EXISTS
     pub using: Option[Expr]     // A_TYPE: the new value, of the row as it was
+    pub cons: []Constraint      // A_ADD_CON: the constraint
 }
 
 // A qualified name, schema.name, as the parser gives it: the two joined by
@@ -232,6 +255,7 @@ pub type Stmt = record {
     pub srf: str                // in FROM, a function: generate_series or unnest; its arguments are items
     pub ordin: bool             // ... WITH ORDINALITY
     pub alters: []Alter         // ALTER TABLE: its actions, in order
+    pub cons: []Constraint      // CREATE TABLE's constraints (UNIQUE, CHECK, FOREIGN KEY)
 }
 
 pub const SET_UNION = 1
@@ -248,7 +272,7 @@ fn newStmt(kind: int): Stmt {
     return Stmt{kind: kind, table: "", ifFlag: false, cols: [], pk: [], names: [], rows: [], items: [], where: None,
                 group: [], order: [], limit: None, offset: None, sets: [], params: 0, from: [], index: "",
                 unique: false, inner: [], distinct: false, having: None, subs: [], use: 0, setop: 0, setAll: false,
-                cte: -1, rec: false, cascade: false, src: "", srf: "", ordin: false, alters: []}
+                cte: -1, rec: false, cascade: false, src: "", srf: "", ordin: false, alters: [], cons: []}
 }
 
 // ---- the lexer
@@ -954,17 +978,25 @@ fn (p: mut &P) createTable(): Result[Stmt, lexdb_base.DbErr] {
     s.table = try p.qname()
     try p.expectKw("(")
     while true {
+        var cname = ""
+        if p.acceptKw("constraint") { cname = try p.name() }
         if p.acceptKw("primary") {
             try p.expectKw("key")
             try p.expectKw("(")
             append(mut &s.pk, try p.name())
             while p.acceptKw(",") { append(mut &s.pk, try p.name()) }
             try p.expectKw(")")
+        } else if len(cname) > 0 || p.isKw("unique") || p.isKw("check") || p.isKw("foreign") || p.isKw("exclude") {
+            append(mut &s.cons, try p.tableConstraint(cname))
         } else {
             let n = try p.name()
             let ty = try p.typeName()
             var c = colDef(n, ty, false)
             while true {
+                // CONSTRAINT name names the one after it (a UNIQUE's; the
+                // others' names are not kept)
+                var cn = ""
+                if p.acceptKw("constraint") { cn = try p.name() }
                 if p.acceptKw("not") {
                     try p.expectKw("null")
                     c.notNull = true
@@ -975,6 +1007,15 @@ fn (p: mut &P) createTable(): Result[Stmt, lexdb_base.DbErr] {
                     c.notNull = true
                 } else if p.acceptKw("default") {
                     c.def = Some(try p.defaultExpr())
+                } else if p.acceptKw("unique") {
+                    try p.uniqueTail()
+                    var u = newConstraint(C_UNIQUE, cn)
+                    append(mut &u.cols, n)
+                    append(mut &s.cons, u)
+                } else if p.isKw("check") || p.isKw("references") {
+                    return Err(p.notYet())
+                } else if len(cn) > 0 {
+                    return Err(near(&p.peek()))
                 } else {
                     break
                 }
@@ -985,6 +1026,37 @@ fn (p: mut &P) createTable(): Result[Stmt, lexdb_base.DbErr] {
     }
     try p.expectKw(")")
     return Ok(s)
+}
+
+// A table constraint, after [CONSTRAINT name]: UNIQUE (cols). (CHECK and
+// FOREIGN KEY come with 9.40 and 9.41.)
+fn (p: mut &P) tableConstraint(name: str): Result[Constraint, lexdb_base.DbErr] {
+    if p.acceptKw("unique") {
+        var c = newConstraint(C_UNIQUE, name)
+        try p.uniqueTail()
+        try p.expectKw("(")
+        append(mut &c.cols, try p.name())
+        while p.acceptKw(",") { append(mut &c.cols, try p.name()) }
+        try p.expectKw(")")
+        return Ok(c)
+    }
+    return Err(p.notYet())
+}
+
+// After UNIQUE: NULLS [NOT] DISTINCT (only the default, DISTINCT, is lexdb's).
+fn (p: mut &P) uniqueTail(): Result[Unit, lexdb_base.DbErr] {
+    if p.acceptKw("nulls") {
+        if p.acceptKw("not") { return Err(lexdb_base.err("0A000", "lexdb: UNIQUE NULLS NOT DISTINCT is not supported")) }
+        try p.expectKw("distinct")
+    }
+    return Ok(Unit{})
+}
+
+fn (p: &P) notYet(): lexdb_base.DbErr {
+    if p.isKw("check") || p.isKw("foreign") || p.isKw("references") || p.isKw("exclude") {
+        return lexdb_base.err("0A000", "lexdb: CHECK constraints and foreign keys are not supported yet")
+    }
+    return near(&p.peek())
 }
 
 fn noCol(): ColDef { return colDef("", TypeName{kind: 0, oid: 0, prec: 0, scale: 0, len: 0}, false) }
@@ -1021,27 +1093,37 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
     s.table = try p.qname()
     if p.isKw("set") && p.pos + 1 < len(p.toks) && p.toks[p.pos + 1].kind == T_IDENT && p.toks[p.pos + 1].text == "schema" {
         p.pos += 2
-        append(mut &s.alters, Alter{kind: A_SET_SCHEMA, col: noCol(), name: try p.name(), to: "", ifFlag: false, using: None})
+        append(mut &s.alters, Alter{kind: A_SET_SCHEMA, col: noCol(), name: try p.name(), to: "", ifFlag: false, using: None, cons: []})
         return Ok(s)
     }
     if p.acceptKw("rename") {
         if p.acceptKw("to") {
-            append(mut &s.alters, Alter{kind: A_RENAME, col: noCol(), name: try p.name(), to: "", ifFlag: false, using: None})
+            append(mut &s.alters, Alter{kind: A_RENAME, col: noCol(), name: try p.name(), to: "", ifFlag: false, using: None, cons: []})
             return Ok(s)
         }
         let c = p.acceptKw("column")
         let from = try p.name()
         try p.expectKw("to")
-        append(mut &s.alters, Alter{kind: A_RENAME_COL, col: noCol(), name: from, to: try p.name(), ifFlag: false, using: None})
+        append(mut &s.alters, Alter{kind: A_RENAME_COL, col: noCol(), name: from, to: try p.name(), ifFlag: false, using: None, cons: []})
         return Ok(s)
     }
     while true {
         if p.acceptKw("add") {
-            if p.isKw("constraint") || p.isKw("primary") || p.isKw("unique") || p.isKw("check") || p.isKw("foreign") {
-                return Err(lexdb_base.err("0A000", "lexdb: ALTER TABLE cannot add a constraint (a unique index can be created)"))
+            if p.isKw("primary") {
+                return Err(lexdb_base.err("0A000", "lexdb: a table's primary key cannot be changed"))
+            }
+            if p.isKw("constraint") || p.isKw("unique") || p.isKw("check") || p.isKw("foreign") || p.isKw("exclude") {
+                var cname = ""
+                if p.acceptKw("constraint") { cname = try p.name() }
+                if p.isKw("primary") { return Err(lexdb_base.err("0A000", "lexdb: a table's primary key cannot be changed")) }
+                var a = Alter{kind: A_ADD_CON, col: noCol(), name: "", to: "", ifFlag: false, using: None, cons: []}
+                append(mut &a.cons, try p.tableConstraint(cname))
+                append(mut &s.alters, a)
+                if !p.acceptKw(",") { break }
+                continue
             }
             let c = p.acceptKw("column")
-            var a = Alter{kind: A_ADD, col: noCol(), name: "", to: "", ifFlag: false, using: None}
+            var a = Alter{kind: A_ADD, col: noCol(), name: "", to: "", ifFlag: false, using: None, cons: []}
             if p.acceptKw("if") {
                 try p.expectKw("not")
                 try p.expectKw("exists")
@@ -1059,18 +1141,27 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
                 } else if p.acceptKw("default") {
                     a.col.def = Some(try p.defaultExpr())
                 } else if p.isKw("unique") || p.isKw("check") || p.isKw("references") || p.isKw("constraint") {
-                    return Err(lexdb_base.err("0A000", "lexdb: ALTER TABLE cannot add a constraint (a unique index can be created)"))
+                    return Err(lexdb_base.err("0A000", "lexdb: ADD COLUMN takes no constraint but NOT NULL and DEFAULT (ADD UNIQUE (...) after it)"))
                 } else {
                     break
                 }
             }
             append(mut &s.alters, a)
         } else if p.acceptKw("drop") {
-            if p.isKw("constraint") {
-                return Err(lexdb_base.err("0A000", "lexdb: ALTER TABLE cannot drop a constraint (a unique index can be dropped)"))
+            if p.acceptKw("constraint") {
+                var a = Alter{kind: A_DROP_CON, col: noCol(), name: "", to: "", ifFlag: false, using: None, cons: []}
+                if p.acceptKw("if") {
+                    try p.expectKw("exists")
+                    a.ifFlag = true
+                }
+                a.name = try p.name()
+                if !p.acceptKw("cascade") { let r = p.acceptKw("restrict") }
+                append(mut &s.alters, a)
+                if !p.acceptKw(",") { break }
+                continue
             }
             let c = p.acceptKw("column")
-            var a = Alter{kind: A_DROP_COL, col: noCol(), name: "", to: "", ifFlag: false, using: None}
+            var a = Alter{kind: A_DROP_COL, col: noCol(), name: "", to: "", ifFlag: false, using: None, cons: []}
             if p.acceptKw("if") {
                 try p.expectKw("exists")
                 a.ifFlag = true
@@ -1087,7 +1178,7 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
                 try p.expectKw("type")
             }
             if data || p.acceptKw("type") {
-                var a = Alter{kind: A_TYPE, col: noCol(), name: n, to: "", ifFlag: false, using: None}
+                var a = Alter{kind: A_TYPE, col: noCol(), name: n, to: "", ifFlag: false, using: None, cons: []}
                 a.col.typ = try p.typeName()
                 if p.acceptKw("using") {
                     let subs = len(p.subs)
@@ -1099,7 +1190,7 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
                 append(mut &s.alters, a)
             } else if p.acceptKw("set") {
                 if p.acceptKw("default") {
-                    var a = Alter{kind: A_SET_DEFAULT, col: noCol(), name: n, to: "", ifFlag: false, using: None}
+                    var a = Alter{kind: A_SET_DEFAULT, col: noCol(), name: n, to: "", ifFlag: false, using: None, cons: []}
                     a.col.def = Some(try p.defaultExpr())
                     append(mut &s.alters, a)
                     if !p.acceptKw(",") { break }
@@ -1107,16 +1198,16 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
                 }
                 try p.expectKw("not")
                 try p.expectKw("null")
-                append(mut &s.alters, Alter{kind: A_SET_NOT_NULL, col: noCol(), name: n, to: "", ifFlag: false, using: None})
+                append(mut &s.alters, Alter{kind: A_SET_NOT_NULL, col: noCol(), name: n, to: "", ifFlag: false, using: None, cons: []})
             } else if p.acceptKw("drop") {
                 if p.acceptKw("default") {
-                    append(mut &s.alters, Alter{kind: A_DROP_DEFAULT, col: noCol(), name: n, to: "", ifFlag: false, using: None})
+                    append(mut &s.alters, Alter{kind: A_DROP_DEFAULT, col: noCol(), name: n, to: "", ifFlag: false, using: None, cons: []})
                     if !p.acceptKw(",") { break }
                     continue
                 }
                 try p.expectKw("not")
                 try p.expectKw("null")
-                append(mut &s.alters, Alter{kind: A_DROP_NOT_NULL, col: noCol(), name: n, to: "", ifFlag: false, using: None})
+                append(mut &s.alters, Alter{kind: A_DROP_NOT_NULL, col: noCol(), name: n, to: "", ifFlag: false, using: None, cons: []})
             } else {
                 return Err(lexdb_base.err("0A000", "lexdb: ALTER COLUMN takes TYPE, SET or DROP NOT NULL, SET or DROP DEFAULT"))
             }
@@ -1526,7 +1617,7 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
                     return Err(lexdb_base.err("0A000", "lexdb: ALTER " + (if idx { "INDEX" } else { "SCHEMA" }) + " takes RENAME TO only"))
                 }
                 try p.expectKw("to")
-                append(mut &s.alters, Alter{kind: A_RENAME, col: noCol(), name: try p.name(), to: "", ifFlag: false, using: None})
+                append(mut &s.alters, Alter{kind: A_RENAME, col: noCol(), name: try p.name(), to: "", ifFlag: false, using: None, cons: []})
                 return Ok(s)
             }
             return Err(lexdb_base.err("0A000", "only ALTER TABLE, ALTER INDEX and ALTER SCHEMA are supported"))

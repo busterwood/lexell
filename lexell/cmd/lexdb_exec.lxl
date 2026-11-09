@@ -38,6 +38,7 @@ pub type Index = record {
     pub cols: []int
     pub unique: bool
     pub pred: Option[Expr]      // a filtered index: the rows it holds (column names bare)
+    pub con: bool               // a UNIQUE constraint's (9.39): dropped with the constraint, not by DROP INDEX
 }
 
 pub type Table = record {
@@ -1403,7 +1404,7 @@ fn encTable(t: &Table): str {
         b.add(ix.name)
         binary.addU32LE(mut &b, ix.tree)
         let filtered = ix.pred.isSome()
-        b.addByte((if ix.unique { 1 } else { 0 }) + (if filtered { 2 } else { 0 }))
+        b.addByte((if ix.unique { 1 } else { 0 }) + (if filtered { 2 } else { 0 }) + (if ix.con { 4 } else { 0 }))
         binary.addU32LE(mut &b, len(ix.cols))
         for c in ix.cols { binary.addU32LE(mut &b, c) }
         match ix.pred {
@@ -1472,18 +1473,19 @@ fn decTable(name: str, s: &str): Result[Table, DbErr] {
     at += 4
     for i in 0..ni {
         let l = binary.readU32LEStr(s, at)
-        var ix = Index{name: s[at + 4..at + 4 + l], tree: 0, cols: [], unique: false, pred: None}
+        var ix = Index{name: s[at + 4..at + 4 + l], tree: 0, cols: [], unique: false, pred: None, con: false}
         at += 4 + l
         ix.tree = binary.readU32LEStr(s, at)
         let flags = s[at + 4]
-        ix.unique = flags == 1 || flags == 3
+        ix.unique = flags & 1 != 0
+        ix.con = flags & 4 != 0
         let nc = binary.readU32LEStr(s, at + 5)
         at += 9
         for j in 0..nc {
             append(mut &ix.cols, binary.readU32LEStr(s, at))
             at += 4
         }
-        if flags >= 2 {
+        if flags & 2 != 0 {
             let pl = binary.readU32LEStr(s, at)
             match lexdb_sql.parseExpr(&s[at + 4..at + 4 + pl]) {
                 Ok(x) { ix.pred = Some(x) }
@@ -4097,6 +4099,7 @@ fn createTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
         }
     }
     t.tree = st.createTree(txn)
+    for c in s.cons { try addConstraint(st, txn, mut &t, &c) }
     try txn.put(CATALOG, key, encTable(&t))
     try bumpCatalog(st, txn)
     return Ok(tagOnly("CREATE TABLE"))
@@ -4477,6 +4480,15 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         let rel = lexdb_sql.baseName(&t.name)
         if a.kind == lexdb_sql.A_TYPE {
             append(mut &types, j)
+        } else if a.kind == lexdb_sql.A_ADD_CON {
+            try addConstraint(st, txn, mut &t, &a.cons[0])
+        } else if a.kind == lexdb_sql.A_DROP_CON {
+            if !dropConstraint(txn, mut &t, &a.name) {
+                if a.name == rel + "_pkey" { return Err(e("0A000", "lexdb: a table's primary key cannot be changed")) }
+                if !a.ifFlag {
+                    return Err(e("42704", "constraint \"" + a.name + "\" of relation \"" + rel + "\" does not exist"))
+                }
+            }
         } else if a.kind == lexdb_sql.A_SET_SCHEMA {
             try setSchema(st, txn, mut &t, &a.name)
         } else if a.kind == lexdb_sql.A_ADD {
@@ -4664,32 +4676,96 @@ fn createIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
         }
         None {}
     }
-    let ix = Index{name: ixKey, tree: st.createTree(txn), cols: cols, unique: s.unique, pred: pred}
+    let ix = Index{name: ixKey, tree: st.createTree(txn), cols: cols, unique: s.unique, pred: pred, con: false}
+    try addIndex(st, txn, mut &t, ix)
+    try txn.put(CATALOG, t.name, encTable(&t))
+    try bumpCatalog(st, txn)
+    return Ok(tagOnly("CREATE INDEX"))
+}
+
+// Fills index ix from table t's rows (a unique one checked) and adds it to
+// t, its catalog row naming t (t's own row is the caller's to write).
+fn addIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, ix: Index): Result[Unit, DbErr] {
     let path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: []}
     let sc = Scan{empty: false, point: false, lo: "", hi: "", whole: false}
     var cur = newCursor()
     while !cur.done {
         var batch: [][]Val = []
         let all: []bool = []
-        try fetch(st, txn, &t, &path, &sc, &all, mut &cur, mut &batch)
+        try fetch(st, txn, t, &path, &sc, &all, mut &cur, mut &batch)
         for r in batch {
-            if !(try inIndex(&t, &ix, &r)) { continue }
-            let pk = keyOf(&t, &r)
-            match checkUnique(st, txn, &t, &ix, &r, &pk) {
+            if !(try inIndex(t, &ix, &r)) { continue }
+            let pk = keyOf(t, &r)
+            match checkUnique(st, txn, t, &ix, &r, &pk) {
                 Ok(_) {}
                 Err(x) {
                     if x.state != "23505" { return Err(x) }
-                    return Err(e("23505", "could not create unique index \"" + s.index + "\": a value is duplicated"))
+                    return Err(e("23505", "could not create unique index \"" + lexdb_sql.baseName(&ix.name) + "\": a value is duplicated"))
                 }
             }
             try txn.put(ix.tree, idxEntry(&ix, &r, &pk), pk)
         }
     }
+    try txn.put(CATALOG, idxName(&ix.name), t.name)
     append(mut &t.indexes, ix)
-    try txn.put(CATALOG, t.name, encTable(&t))
-    try txn.put(CATALOG, idxName(&ixKey), t.name)
-    try bumpCatalog(st, txn)
-    return Ok(tagOnly("CREATE INDEX"))
+    return Ok(Unit{})
+}
+
+// ---- UNIQUE constraints (9.39): a unique index the constraint owns, of
+// the same name.
+
+// A name PostgreSQL's way: table, columns and a suffix joined by "_", cut
+// to 63 bytes, a number added while the name is taken in the schema.
+fn makeName(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, cols: &[]str, suffix: &str): Result[str, DbErr] {
+    var parts = [lexdb_sql.baseName(&t.name)]
+    for c in cols { append(mut &parts, c) }
+    var base = strings.join(&parts, "_")
+    if len(base) + 1 + len(suffix) > 63 { base = base[0..63 - 1 - len(suffix)] }
+    let sc = lexdb_sql.schemaOf(&t.name)
+    var n = 0
+    while true {
+        let name = base + "_" + suffix + (if n == 0 { "" } else { n.toStr() })
+        if !(try relExists(st, txn, &lexdb_sql.qual(&sc, &name))) && !hasConName(t, &name) { return Ok(name) }
+        n += 1
+    }
+    return Ok("")
+}
+
+fn hasConName(t: &Table, name: &str): bool {
+    for ix in t.indexes { if ix.con && lexdb_sql.baseName(&ix.name) == name { return true } }
+    return false
+}
+
+// Adds constraint c to table t (its rows checked against it).
+fn addConstraint(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, c: &lexdb_sql.Constraint): Result[Unit, DbErr] {
+    if c.kind != lexdb_sql.C_UNIQUE { return Err(e("0A000", "lexdb: CHECK constraints and foreign keys are not supported yet")) }
+    var cols: []int = []
+    for n in c.cols {
+        let i = colIndex(&t.cols, &n)
+        if i < 0 { return Err(e("42703", "column \"" + n + "\" named in key does not exist")) }
+        for k in cols { if k == i { return Err(e("42701", "column \"" + n + "\" appears twice in unique constraint")) } }
+        append(mut &cols, i)
+    }
+    var name = c.name
+    if len(name) == 0 { name = try makeName(st, txn, t, &c.cols, &"key") }
+    let key = lexdb_sql.qual(&lexdb_sql.schemaOf(&t.name), &name)
+    if hasConName(t, &name) { return Err(e("42710", "constraint \"" + name + "\" for relation \"" + lexdb_sql.baseName(&t.name) + "\" already exists")) }
+    if try relExists(st, txn, &key) { return Err(e("42P07", "relation \"" + name + "\" already exists")) }
+    let ix = Index{name: key, tree: st.createTree(txn), cols: cols, unique: true, pred: None, con: true}
+    return addIndex(st, txn, t, ix)
+}
+
+// Drops table t's constraint named name: false when it has none.
+fn dropConstraint(txn: mut &lexdb_store.Txn, t: mut &Table, name: &str): bool {
+    for k in 0..len(t.indexes) {
+        if t.indexes[k].con && lexdb_sql.baseName(&t.indexes[k].name) == name {
+            let ix = collections.removeAt(mut &t.indexes, k)
+            txn.dropTree(ix.tree)
+            txn.del(CATALOG, idxName(&ix.name))
+            return true
+        }
+    }
+    return false
 }
 
 fn dropIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
@@ -4697,6 +4773,13 @@ fn dropIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.St
     match try st.get(txn, CATALOG, idxName(&ixKey)) {
         Some(tn) {
             var t = try needTable(st, txn, &tn)
+            for ix in t.indexes {
+                if ix.name == ixKey && ix.con {
+                    let n = lexdb_sql.baseName(&ixKey)
+                    return Err(e("2BP01", "cannot drop index " + n + " because constraint " + n + " on table " + lexdb_sql.baseName(&t.name) +
+                                 " requires it (drop the constraint instead)"))
+                }
+            }
             var old = replace(mut &t.indexes, [])
             var rev: []Index = []
             while len(old) > 0 {

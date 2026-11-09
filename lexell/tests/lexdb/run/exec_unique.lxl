@@ -1,0 +1,117 @@
+// lexdb_exec: UNIQUE constraints (design/lexdb.md 9.39): a unique index
+// the constraint owns, of its name. In CREATE TABLE (on a column, on
+// columns, named or not) and ALTER TABLE ADD [CONSTRAINT name] UNIQUE;
+// DROP CONSTRAINT; names made as PostgreSQL makes them; NULLs not equal;
+// what DROP INDEX, DROP COLUMN, renames, rollback and a reopen do.
+// expect: created: CREATE TABLE
+// expect: violations: 23505 duplicate key value violates unique constraint "u_email_key": Key (email)=(a@x) already exists.; 23505 "u_a_b_key"; 23505 "by_name"; 23505 "col_named"
+// expect: NULLs: INSERT 0 1 INSERT 0 1
+// expect: updates: 23505, the same value: UPDATE 1
+// expect: names: ALTER TABLE ALTER TABLE 42704, given twice: 42710
+// expect: added over rows: 23505 could not create unique index "s_k_key": a value is duplicated; without: ALTER TABLE, then 23505 "s_k_key"
+// expect: used: Index Scan using u_email_key
+// expect: drop index: 2BP01; drop constraint: ALTER TABLE, then INSERT 0 1; missing 42704, if exists ALTER TABLE, the key 0A000
+// expect: drop column: ALTER TABLE, its constraint 42704
+// expect: renamed table: 23505 "u_a_b_key"; moved: 23505 "u_a_b_key"
+// expect: rolled back: 42704 42704, the name free: CREATE INDEX
+// expect: bad: 42703 42701 0A000 0A000
+// expect: reopened: 23505 "u_a_b_key", 2BP01
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if !r.hasRows { return r.tag }
+            var out: []str = []
+            for row in r.rows {
+                var vs: []str = []
+                for v in row { append(mut &vs, lexdb_exec.text(&v)) }
+                append(mut &out, strings.join(&vs, "|"))
+            }
+            return strings.join(&out, " ")
+        }
+        Err(e) { return e.state + " " + e.msg }
+    }
+}
+
+fn state(s: mut &lexdb_exec.Session, sql: &str): str { return q(s, sql)[0..5] }
+
+// A unique violation's state and constraint.
+fn which(s: mut &lexdb_exec.Session, sql: &str): str {
+    let r = q(s, sql)
+    let i = strings.indexOf(&r, "\"", 0)
+    if !strings.startsWith(r, "23505") || i < 0 { return r }
+    let j = strings.indexOf(&r, "\"", i + 1)
+    return "23505 " + r[i..j + 1]
+}
+
+fn plan(s: mut &lexdb_exec.Session, sql: &str, want: &str): str {
+    let p = q(s, &("explain " + sql))
+    return if strings.contains(&p, want) { "Index Scan using " + want } else { p }
+}
+
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: 256 * 1024, segBytes: 1024 * 1024, ckptBytes: 512 * 1024, snapNodes: 100000}
+}
+
+fn main() {
+    let fs = lexdb_disk.sim(39)
+    lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        println("created: " + q(mut &s, &"create table u (id int primary key, email text unique, a int, b int, c int, d int constraint col_named unique, unique (a, b), constraint by_name unique (c))"))
+        let i1 = q(mut &s, &"insert into u values (1, 'a@x', 1, 1, 1, 1)")
+        println("violations: " + q(mut &s, &"insert into u values (2, 'a@x', 2, 2, 2, 2)") + "; " + which(mut &s, &"insert into u values (2, 'b@x', 1, 1, 2, 2)") + "; " +
+                which(mut &s, &"insert into u values (2, 'b@x', 1, 2, 1, 2)") + "; " + which(mut &s, &"insert into u values (2, 'b@x', 1, 2, 2, 1)"))
+        println("NULLs: " + q(mut &s, &"insert into u values (3, null, 1, null, null, null)") + " " + q(mut &s, &"insert into u values (4, null, 1, null, null, null)"))
+        let i2 = q(mut &s, &"insert into u values (5, 'e@x', 5, 5, 5, 5)")
+        println("updates: " + state(mut &s, &"update u set email = 'a@x' where id = 5") + ", the same value: " + q(mut &s, &"update u set email = 'e@x' where id = 5"))
+
+        let w0 = q(mut &s, &"create table w_v_key (id int primary key)")
+        let w1 = q(mut &s, &"create table w (id int primary key, v int unique, unique (v))")
+        // the names made: w_v_key is a table's, so the two are w_v_key1 and w_v_key2
+        println("names: " + q(mut &s, &"alter table w drop constraint w_v_key1") + " " + q(mut &s, &"alter table w drop constraint w_v_key2") + " " +
+                state(mut &s, &"alter table w drop constraint w_v_key") + ", given twice: " +
+                state(mut &s, &"create table w2 (id int primary key, x int constraint c unique, y int constraint c unique)"))
+
+        let s1 = q(mut &s, &"create table s (id int primary key, k int)")
+        let s2 = q(mut &s, &"insert into s values (1, 1), (2, 1)")
+        let s3 = q(mut &s, &"alter table s add unique (k)")
+        let s4 = q(mut &s, &"update s set k = 2 where id = 2")
+        let s5 = q(mut &s, &"alter table s add unique (k)")
+        println("added over rows: " + s3 + "; without: " + s5 + ", then " + which(mut &s, &"insert into s values (3, 2)"))
+        println("used: " + plan(mut &s, &"select id from u where email = 'e@x'", &"u_email_key"))
+
+        let di = state(mut &s, &"drop index u_email_key")
+        let trees = len(st.trees())
+        let dc = q(mut &s, &"alter table u drop constraint u_email_key") + (if len(st.trees()) == trees - 1 { "" } else { " (its index's tree kept)" })
+        println("drop index: " + di + "; drop constraint: " + dc + ", then " + q(mut &s, &"insert into u values (6, 'a@x', 6, 6, 6, 6)") +
+                "; missing " + state(mut &s, &"alter table u drop constraint nope") + ", if exists " + q(mut &s, &"alter table u drop constraint if exists nope") +
+                ", the key " + state(mut &s, &"alter table u drop constraint u_pkey"))
+        let dd = q(mut &s, &"alter table u drop column d")
+        println("drop column: " + dd + ", its constraint " + state(mut &s, &"alter table u drop constraint col_named"))
+        let rn = q(mut &s, &"alter table u rename to u2")
+        let rn1 = which(mut &s, &"insert into u2 values (7, 'q', 1, 1, 7)")
+        let sc = q(mut &s, &"create schema o; alter table u2 set schema o")
+        println("renamed table: " + rn1 + "; moved: " + which(mut &s, &"insert into o.u2 values (7, 'q', 1, 1, 7)"))
+        let bg = q(mut &s, &"begin")
+        let ab = q(mut &s, &"alter table s add constraint s_id_u unique (id, k)")
+        let ac = q(mut &s, &"alter table s add constraint s_one unique (id)")
+        let rb = q(mut &s, &"rollback")
+        println("rolled back: " + state(mut &s, &"alter table s drop constraint s_one") + " " + state(mut &s, &"alter table s drop constraint s_id_u") +
+                ", the name free: " + q(mut &s, &"create index s_one on s (k)"))
+        println("bad: " + state(mut &s, &"create table b1 (id int primary key, unique (zz))") + " " + state(mut &s, &"create table b2 (id int primary key, x int, unique (x, x))") + " " +
+                state(mut &s, &"create table b3 (id int primary key, x int unique nulls not distinct)") + " " + state(mut &s, &"create table b4 (id int primary key, x int check (x > 0))"))
+        return 0
+    }).unwrap()
+
+    lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int {
+        var s = lexdb_exec.newSession(st)
+        println("reopened: " + which(mut &s, &"insert into o.u2 values (8, 'r', 1, 1, 8)") + ", " + state(mut &s, &"drop index o.u_a_b_key"))
+        return 0
+    }).unwrap()
+}
