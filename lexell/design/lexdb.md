@@ -564,8 +564,8 @@ is the comparison to make.
    - reading a large row's columns only when used (TOAST fetches a
      column when it is used; lexdb reads the whole row as it scans);
    - compression;
-   - a chunk takes at most one leaf entry (about 1.3 KB), so a page holds
-     three: about 5% of the space is lost to entry and page headers.
+   - space: a page holds three chunks; values loaded in random order fill
+     84% of the pages with data, in key order 90% (9.30).
 9. Authentication (SCRAM) and TLS, so the server can leave loopback.
 10. The checkpoint pause under a large write load; io_uring if the helper
    pool is the limit (D5).
@@ -1873,8 +1873,9 @@ stored with one more 0xFF before it, so a stub is never mistaken for a value.
   so they need no conflict marks of their own.
 - **Before a commit applies**, `writeNeeds` also loads the companion's
   leaves for the key's chunks when the write makes or removes a large value.
-  An overwrite or delete removes the old chunks; dropping the table drops
-  the companion tree.
+  An overwrite or delete removes the old chunks, the ones found under the
+  key, not as many as the stub's length says, so a damaged stub cannot make
+  a commit run on (9.30). Dropping the table drops the companion tree.
 - **Reading back** (`unstore`): the chunks are read and checked against the
   stub's length and CRC. A live read that finds them changed since it read
   the stub (a commit between, while it loaded a page) fails with 40001, as
@@ -1929,4 +1930,35 @@ the last one):
   - no escape: reported not caught, probably because the diff held raw
     bytes and the script's grep treated it as binary;
   - the last chunk cut short: not run.
+
+### 9.30 Large rows: measured, and full pages in random order
+
+Measured on real files (`fdatasync` per commit), 1,000 rows of 20 KB in a
+table `d (id, title, body)`, beside a table `e (id, title)` without bodies:
+
+| | key order | random order |
+|---|---:|---:|
+| insert, a row of each table (two commits) | 2.2 ms | 2.2 ms |
+| pages that are data, before | 90% | 57% |
+| pages that are data, after | 90% | 84% |
+| scan of d for its titles | 9.1 ms | 11.4 ms |
+| scan of e for its titles | 0.2 ms | 0.2 ms |
+
+- **Space.** Chunks put into the middle of the companion tree split
+  leaves in half, so values loaded in random order left them half full.
+  Now a companion leaf splits just after the new entry, or else just before
+  it, when both halves fit. A run of chunks then fills its leaves, as a
+  load in key order does. Tables' splits are unchanged. In `store_big`,
+  300 values of 8 KB in random order: 96% data, 61% without the change.
+- **Chunks are removed by walking their range** in the companion, not by
+  the count the stub's length gives. A stub that claimed 8×10^18 bytes (a
+  planted bug made one) kept the commit removing chunks indefinitely.
+- **Reading.** A scan that needs only `title` costs 45 to 55 times as
+  much with the bodies: every row's chunks are read and put together.
+  This is the next step (9.4, item 8).
+- **Measuring with the simulated disk misleads.** The first run took
+  147 ms a row. A profile (`perf`, with the `LXL_NATIVE_MAP` symbol map)
+  put 93% of the time in the simulated disk's flush, which copies the
+  whole log segment to model a crash. With 64 MB segments that is 64 MB
+  per commit. The tests use 1 MB segments. Measure on real files.
 

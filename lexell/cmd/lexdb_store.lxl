@@ -608,7 +608,12 @@ fn nodeSize(n: &lexdb_page.Node): int {
 }
 
 // Splits an oversized node; the new right node's slot and separator.
-fn (db: mut &Db) split(s: int, atEnd: bool): Descent {
+// at >= 0: a leaf of a companion tree, the new entry's index. A large
+// value's chunks come in key order, so the leaf is split just after the new
+// entry, or else just before it, when both halves fit: the leaves a run of
+// chunks fills stay full, where halving would leave them half full wherever
+// in the tree the run goes (9.30).
+fn (db: mut &Db) split(s: int, atEnd: bool, at: int): Descent {
     db.willChange(s)
     let leaf = db.pool[db.meta[s].frame].leaf
     let total = db.pool[db.meta[s].frame].size
@@ -625,6 +630,18 @@ fn (db: mut &Db) split(s: int, atEnd: bool): Descent {
             m += 1
         }
         if atEnd && n >= 2 { m = n - 1 }        // the left stays full: only the new entry goes right
+        if at >= 0 {
+            var sizes: []int = []
+            for i in 0..n { append(mut &sizes, lexdb_page.leafEntry(&db.pool[db.meta[s].frame].keys[i], &db.pool[db.meta[s].frame].vals[i])) }
+            var left = 0
+            for i in 0..at + 1 { left += sizes[i] }
+            if at + 1 < n && left <= lexdb_page.NODE_ROOM && total - left <= lexdb_page.NODE_ROOM {
+                m = at + 1
+            } else {
+                left -= sizes[at]
+                if at > 0 && left <= lexdb_page.NODE_ROOM && total - left <= lexdb_page.NODE_ROOM { m = at }
+            }
+        }
         for i in m..n {
             append(mut &right.keys, db.pool[db.meta[s].frame].keys[i])
             append(mut &right.vals, db.pool[db.meta[s].frame].vals[i])
@@ -664,13 +681,13 @@ fn (db: mut &Db) split(s: int, atEnd: bool): Descent {
 
 // After path[j] grew past a page, split it and the parents that overflow
 // in turn; a split root gets a new root above it.
-fn (db: mut &Db) fixOverflow(tree: int, path: &[]int, from: int, atEnd: bool) {
+fn (db: mut &Db) fixOverflow(tree: int, path: &[]int, from: int, atEnd: bool, ins: int) {
     var j = from
     var end = atEnd
     while j >= 0 {
         let s = path[j]
         if db.pool[db.meta[s].frame].size <= lexdb_page.NODE_ROOM { return }
-        let sp = db.split(s, end)
+        let sp = db.split(s, end, if j == len(path) - 1 { ins } else { -1 })
         let r = sp.path[0]
         if j == 0 {
             let root = lexdb_page.Node{leaf: false, keys: [sp.upper], vals: [], kids: [s, r], size: 0, packed: false}
@@ -721,7 +738,7 @@ fn (db: mut &Db) applyPut(tree: int, key: &str, val: &str) {
     db.meta[leaf].version += 1
     db.pool[db.meta[leaf].frame].packed = false
     db.recost(leaf)
-    db.fixOverflow(tree, &d.path, len(d.path) - 1, atEnd)
+    db.fixOverflow(tree, &d.path, len(d.path) - 1, atEnd, if isOvf(tree) { i } else { -1 })
 }
 
 fn (db: mut &Db) applyDel(tree: int, key: &str) {
@@ -926,18 +943,32 @@ fn (db: mut &Db) rangeNeeds(tree: int, lo: &str, hi: &str): int {
     return -1
 }
 
-// Removes the chunks of the value at key, if it is a large one.
+// Removes the chunks of the value at key, if it is a large one: the ones
+// there (writeNeeds loaded their leaves), not as many as the stub's length
+// says, so a damaged stub cannot make a commit run on.
 fn (db: mut &Db) dropChunks(tree: int, key: &str) {
-    match db.leafVal(tree, key) {
-        Some(v) {
-            if isStub(&v) {
-                let total = int(binary.readU64LEStr(&v, 2))
-                let room = chunkRoom(key)
-                for i in 0..(total + room - 1) / room { db.applyDel(tree + OVF, &chunkKey(key, i)) }
-            }
-        }
-        None {}
+    let big = match db.leafVal(tree, key) {
+        Some(v) { isStub(&v) }
+        None { false }
     }
+    if !big { return }
+    let ovf = tree + OVF
+    let hi = chunkKey(key, LAST_CHUNK)
+    var gone: []str = []
+    var cursor = chunkKey(key, 0)
+    while true {
+        let d = db.descend(ovf, &cursor)
+        if len(d.path) == 0 || d.need >= 0 { break }
+        let leaf = d.path[len(d.path) - 1]
+        var i = lowerIndex(&db.pool[db.meta[leaf].frame].keys, &cursor)
+        while i < len(db.pool[db.meta[leaf].frame].keys) && db.pool[db.meta[leaf].frame].keys[i] < hi {
+            append(mut &gone, lexdb_base.own(&db.pool[db.meta[leaf].frame].keys[i]))
+            i += 1
+        }
+        if !d.hasUpper || d.upper >= hi { break }
+        cursor = d.upper
+    }
+    for k in gone { db.applyDel(ovf, &k) }
 }
 
 // Writes a value in its stored form: itself, escaped, or chunks and a stub.

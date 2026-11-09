@@ -11,6 +11,9 @@
 // - Limits: the key, the value; a megabyte; the largest key with a large
 //   value (the smallest chunks).
 // - A dropped tree's chunks go with it.
+// - Space: 300 values of 8,000 bytes in random key order; the share of the
+//   pages written that is data (halving the companion's leaves gave about
+//   57%: 9.30).
 // - Not large values, found with them: a commit that empties a leaf and
 //   then writes into its range (rows deleted and put back), with the
 //   leaf's neighbour not in memory, panicked: the range went to the
@@ -22,6 +25,7 @@
 // expect: limits: 54000 54000, 1048576 same, 512-byte key 9000 same
 // expect: dropped: chunks 0
 // expect: refilled in one commit: rounds 300 rows 3000
+// expect: random order: 96% of the pages data
 import "../../../cmd/lexdb_store"
 import "../../../cmd/lexdb_disk"
 import "../../../cmd/lexdb_base"
@@ -222,6 +226,35 @@ fn refill(): str {
     return r.unwrap()
 }
 
+fn space(): str {
+    let r = lexdb_store.run(lexdb_disk.sim(4), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 1024 * 1024, ckptBytes: 1024 * 1024, snapNodes: 1000}, fn(st: lexdb_store.Store): str {
+        var t = lexdb_store.begin()
+        let tree = st.createTree(mut &t)
+        st.commit(t).unwrap()
+        st.checkpointAll().unwrap()
+        let p0 = st.stats().pages - st.stats().free
+        var rng = lexdb_base.rng(11)
+        var ids: []int = []
+        for i in 0..300 { append(mut &ids, i) }
+        for i in 0..300 {
+            let j = i + rng.below(300 - i)
+            let x = ids[i]
+            ids[i] = ids[j]
+            ids[j] = x
+        }
+        for i in ids {
+            var w = lexdb_store.begin()
+            w.put(tree, key(i), strings.repeat("d", 8000)).unwrap()
+            st.commit(w).unwrap()
+        }
+        st.checkpointAll().unwrap()
+        st.checkpointAll().unwrap()
+        let pages = st.stats().pages - st.stats().free - p0
+        return "random order: " + (300 * 8000 * 100 / (pages * 4096)).toStr() + "% of the pages data"
+    })
+    return r.unwrap()
+}
+
 fn main() {
     println(crashes())
     let r = lexdb_store.run(lexdb_disk.sim(7), lexdb_store.Options{cacheBytes: 4 * 2048, segBytes: 1024 * 1024, ckptBytes: 64 * 1024, snapNodes: 100000}, fn(st: lexdb_store.Store): int {
@@ -285,4 +318,5 @@ fn main() {
     })
     r.unwrap()
     println("refilled in one commit: " + refill())
+    println(space())
 }
