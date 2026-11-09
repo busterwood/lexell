@@ -129,6 +129,8 @@ pub const S_CREATE_SCHEMA = 14
 pub const S_DROP_SCHEMA = 15
 pub const S_SHOW = 16
 pub const S_ALTER = 17
+pub const S_ALTER_INDEX = 18    // ALTER INDEX index RENAME TO alters[0].name
+pub const S_ALTER_SCHEMA = 19   // ALTER SCHEMA table RENAME TO alters[0].name
 
 // ALTER TABLE's actions (Alter.kind).
 pub const A_ADD = 1             // ADD COLUMN
@@ -138,6 +140,7 @@ pub const A_SET_NOT_NULL = 4    // ALTER COLUMN name SET NOT NULL
 pub const A_DROP_NOT_NULL = 5   // ALTER COLUMN name DROP NOT NULL
 pub const A_DROP_COL = 6        // DROP COLUMN name
 pub const A_TYPE = 7            // ALTER COLUMN name TYPE col.typ [USING using]
+pub const A_SET_SCHEMA = 8      // SET SCHEMA name
 
 pub type Alter = record {
     pub kind: int
@@ -965,8 +968,8 @@ fn (p: mut &P) createTable(): Result[Stmt, lexdb_base.DbErr] {
 
 fn noCol(): ColDef { return ColDef{name: "", typ: TypeName{kind: 0, oid: 0, prec: 0, scale: 0, len: 0}, notNull: false} }
 
-// ALTER TABLE [IF EXISTS] [ONLY] name, then RENAME [COLUMN] a TO b, or
-// RENAME TO name (each alone), or actions separated by commas: ADD
+// ALTER TABLE [IF EXISTS] [ONLY] name, then RENAME [COLUMN] a TO b,
+// RENAME TO name or SET SCHEMA name (each alone), or actions separated by commas: ADD
 // [COLUMN] [IF NOT EXISTS] name type [NOT NULL | NULL], DROP [COLUMN] [IF
 // EXISTS] name [RESTRICT | CASCADE], ALTER [COLUMN] name [SET DATA] TYPE
 // type [USING expr], ALTER [COLUMN] name SET NOT NULL or DROP NOT NULL.
@@ -978,6 +981,11 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
     }
     let only = p.acceptKw("only")
     s.table = try p.qname()
+    if p.isKw("set") && p.pos + 1 < len(p.toks) && p.toks[p.pos + 1].kind == T_IDENT && p.toks[p.pos + 1].text == "schema" {
+        p.pos += 2
+        append(mut &s.alters, Alter{kind: A_SET_SCHEMA, col: noCol(), name: try p.name(), to: "", ifFlag: false, using: None})
+        return Ok(s)
+    }
     if p.acceptKw("rename") {
         if p.acceptKw("to") {
             append(mut &s.alters, Alter{kind: A_RENAME, col: noCol(), name: try p.name(), to: "", ifFlag: false, using: None})
@@ -1446,7 +1454,28 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
         "insert" { return p.insert() }
         "alter" {
             if p.acceptKw("table") { return p.alterTable() }
-            return Err(lexdb_base.err("0A000", "only ALTER TABLE is supported"))
+            // ALTER INDEX [IF EXISTS] name RENAME TO new, ALTER SCHEMA name
+            // RENAME TO new
+            let idx = p.acceptKw("index")
+            if idx || p.acceptKw("schema") {
+                var s = newStmt(if idx { S_ALTER_INDEX } else { S_ALTER_SCHEMA })
+                if idx {
+                    if p.acceptKw("if") {
+                        try p.expectKw("exists")
+                        s.ifFlag = true
+                    }
+                    s.index = try p.qname()
+                } else {
+                    s.table = try p.name()
+                }
+                if !p.acceptKw("rename") {
+                    return Err(lexdb_base.err("0A000", "lexdb: ALTER " + (if idx { "INDEX" } else { "SCHEMA" }) + " takes RENAME TO only"))
+                }
+                try p.expectKw("to")
+                append(mut &s.alters, Alter{kind: A_RENAME, col: noCol(), name: try p.name(), to: "", ifFlag: false, using: None})
+                return Ok(s)
+            }
+            return Err(lexdb_base.err("0A000", "only ALTER TABLE, ALTER INDEX and ALTER SCHEMA are supported"))
         }
         "update" { return p.update() }
         "delete" { return p.delete() }

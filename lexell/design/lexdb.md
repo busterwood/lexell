@@ -393,7 +393,7 @@ Built on 2026-11-09 on branch `lexdb`, about 6,300 lines in
 (cache, trees, transactions, log, checkpoints, recovery, snapshots),
 `lexdb_sql` (lexer, parser), `lexdb_exec` (catalog, rows, keys, planner,
 statements, sessions), `lexdb_wire` (protocol 3.0) and `lexdb` (the
-server). Tests: `python3 lexell/tests/lexdb.py` (44 programs in
+server). Tests: `python3 lexell/tests/lexdb.py` (45 programs in
 `tests/lexdb/run`, under `LXL_CHECK=1`).
 
     lexell/compiler/out/lxlc lexell/cmd/lexdb.lxl -o lexdb
@@ -548,7 +548,6 @@ is the comparison to make.
    - other set-returning functions (`regexp_split_to_table`, the JSON
      ones), and generate_series over dates (no date types yet).
 4. Schemas (built: 9.20). Not done:
-   - `ALTER TABLE ... SET SCHEMA` and `ALTER SCHEMA ... RENAME`;
    - privileges (`GRANT`, `AUTHORIZATION`), which wait for logins (item 9);
    - `$user` in the search path as the login's name (now it is a schema
      name looked for like any other);
@@ -590,7 +589,7 @@ is the comparison to make.
 13. ALTER (the user's request, 2026-11-09), in steps: (1) the actions that
    rewrite no row: ADD COLUMN, RENAME COLUMN, RENAME TO, SET and DROP NOT
    NULL (built: 9.34); (2) DROP COLUMN (built: 9.35); (3) ALTER COLUMN
-   TYPE (built: 9.36); (4) SET
+   TYPE (built: 9.36); (4) (built: 9.37) SET
    SCHEMA, ALTER INDEX ... RENAME, ALTER SCHEMA ... RENAME. Column
    defaults (and so ADD COLUMN ... DEFAULT) are a feature of their own.
 
@@ -2364,3 +2363,47 @@ Three were not caught at first. The test read the other index only after
 the key was changed back, which made its stale entries right again. It
 never used a filtered index whose rows change. And the unique-check
 mutant did not compile.
+
+### 9.37 SET SCHEMA, ALTER INDEX and ALTER SCHEMA
+
+- `ALTER TABLE [IF EXISTS] name SET SCHEMA s`: the table moves with its
+  indexes, their names kept. A table or index of any of those names
+  already in `s` is 42P07 ("relation ... already exists in schema ..."),
+  and a missing `s` is 3F000.
+- `ALTER INDEX [IF EXISTS] name RENAME TO new`: in its schema; a name
+  taken by a table or an index is 42P07.
+- `ALTER SCHEMA name RENAME TO new`: its tables and indexes go with it.
+  `public` cannot be renamed, since its names are kept unqualified (0A000);
+  a name taken is 42P06, `pg_` names 42939.
+
+Each moves catalog rows only (`moveTable`): the table's under its new key,
+each index's, and the index rows' pointer to the table. No data moves; a
+table's trees are named by number. All in the transaction, and the
+catalog's version is bumped, as for other DDL.
+
+**Checked** by `exec_rename`:
+- a table moved, its index used under the new schema;
+- names taken, by a table and by an index;
+- a schema missing; a move to `public`;
+- an index renamed, then renamed again through the search path;
+- a schema renamed, its index used, and an insert;
+- `public`, a taken name, a missing schema, a `pg_` name;
+- a rollback, and a reopen.
+
+After the moves, the old names can be made again: no catalog row is left
+under them. Planted, each caught:
+- the old table row kept;
+- the old index rows kept;
+- index rows naming the old table;
+- indexes left in the old schema;
+- a name taken not seen;
+- no such schema not seen;
+- an index renamed in its table's row only;
+- an index's old row kept;
+- an index renamed onto a taken name;
+- a schema's tables not moved;
+- the old schema row kept;
+- a schema renamed onto one that exists.
+
+The old index rows were not caught at first. The old index name being
+free again is now checked.

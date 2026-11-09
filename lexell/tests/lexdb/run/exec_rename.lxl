@@ -1,0 +1,101 @@
+// lexdb_exec: ALTER TABLE ... SET SCHEMA, ALTER INDEX ... RENAME TO,
+// ALTER SCHEMA ... RENAME TO (design/lexdb.md 9.37): catalog rows moved,
+// no row of data. A table moves with its indexes; a schema renamed takes
+// its tables and indexes. Names taken, schemas missing, public, through
+// the search path, rolled back, after a reopen. Leftovers: after the
+// renames the old names can be made again.
+// expect: set schema: ALTER TABLE, b.t 1|x 2|y, a.t 42P01, Index Scan using t_v
+// expect: the index's name free in a: CREATE INDEX
+// expect: no such schema: 3F000; taken: 42P07 relation "t2" already exists in schema "b"; an index's name taken: 42P07 relation "ix" already exists in schema "b"
+// expect: to public: ALTER TABLE, 7
+// expect: index renamed: ALTER INDEX, Index Scan using t_v2, old name 42P01, taken 42P07 relation "t" already exists, if exists ALTER INDEX
+// expect: through the path: ALTER INDEX, Index Scan using t_v3
+// expect: schema renamed: ALTER SCHEMA, c.t 1|x 2|y, b.t 42P01, Index Scan using t_v3, insert INSERT 0 1
+// expect: schema errors: public 0A000, taken 42P06, missing 3F000, pg_ 42939
+// expect: old names made again: CREATE SCHEMA CREATE TABLE CREATE INDEX
+// expect: rolled back: c.t 3, d.t 42P01
+// expect: reopened: c.t 3, Index Scan using t_v3, b.t 0
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if !r.hasRows { return r.tag }
+            var out: []str = []
+            for row in r.rows {
+                var vs: []str = []
+                for v in row { append(mut &vs, lexdb_exec.text(&v)) }
+                append(mut &out, strings.join(&vs, "|"))
+            }
+            return strings.join(&out, " ")
+        }
+        Err(e) { return e.state + " " + e.msg }
+    }
+}
+
+fn state(s: mut &lexdb_exec.Session, sql: &str): str { return q(s, sql)[0..5] }
+
+fn plan(s: mut &lexdb_exec.Session, sql: &str, want: &str): str {
+    let p = q(s, &("explain " + sql))
+    return if strings.contains(&p, want) { "Index Scan using " + want } else { p }
+}
+
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: 256 * 1024, segBytes: 1024 * 1024, ckptBytes: 512 * 1024, snapNodes: 100000}
+}
+
+fn main() {
+    let fs = lexdb_disk.sim(37)
+    lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        let c1 = q(mut &s, &"create schema a; create schema b")
+        let c2 = q(mut &s, &"create table a.t (id int primary key, v text)")
+        let c3 = q(mut &s, &"insert into a.t values (1, 'x'), (2, 'y')")
+        let c4 = q(mut &s, &"create index t_v on a.t (v)")
+        let ss = q(mut &s, &"alter table a.t set schema b")
+        println("set schema: " + ss + ", b.t " + q(mut &s, &"select * from b.t order by id") + ", a.t " + state(mut &s, &"select * from a.t") + ", " +
+                plan(mut &s, &"select id from b.t where v = 'y'", &"t_v"))
+
+        let c5 = q(mut &s, &"create table a.t2 (id int primary key); create table b.t2 (id int primary key)")
+        let c6 = q(mut &s, &"create table a.x (id int primary key); create index ix on a.x (id); create table b.ix (id int primary key)")
+        println("the index's name free in a: " + q(mut &s, &"create index t_v on a.t2 (id)"))
+        println("no such schema: " + state(mut &s, &"alter table a.t2 set schema nope") + "; taken: " + q(mut &s, &"alter table a.t2 set schema b") +
+                "; an index's name taken: " + q(mut &s, &"alter table a.x set schema b"))
+        let c7 = q(mut &s, &"create table a.t3 (id int primary key); insert into a.t3 values (7)")
+        println("to public: " + q(mut &s, &"alter table a.t3 set schema public") + ", " + q(mut &s, &"select id from t3"))
+
+        let ri = q(mut &s, &"alter index b.t_v rename to t_v2")
+        println("index renamed: " + ri + ", " + plan(mut &s, &"select id from b.t where v = 'y'", &"t_v2") + ", old name " + state(mut &s, &"alter index b.t_v rename to z") +
+                ", taken " + q(mut &s, &"alter index b.t_v2 rename to t") + ", if exists " + q(mut &s, &"alter index if exists b.nope rename to z"))
+        let sp = q(mut &s, &"set search_path to b")
+        let rp = q(mut &s, &"alter index t_v2 rename to t_v3")
+        let sp2 = q(mut &s, &"set search_path to default")
+        println("through the path: " + rp + ", " + plan(mut &s, &"select id from b.t where v = 'y'", &"t_v3"))
+
+        let rs = q(mut &s, &"alter schema b rename to c")
+        println("schema renamed: " + rs + ", c.t " + q(mut &s, &"select * from c.t order by id") + ", b.t " + state(mut &s, &"select * from b.t") + ", " +
+                plan(mut &s, &"select id from c.t where v = 'y'", &"t_v3") + ", insert " + q(mut &s, &"insert into c.t values (3, 'z')"))
+        println("schema errors: public " + state(mut &s, &"alter schema public rename to p") + ", taken " + state(mut &s, &"alter schema c rename to a") +
+                ", missing " + state(mut &s, &"alter schema b rename to e") + ", pg_ " + state(mut &s, &"alter schema c rename to pg_x"))
+        println("old names made again: " + q(mut &s, &"create schema b") + " " + q(mut &s, &"create table b.t (id int primary key, v text)") + " " +
+                q(mut &s, &"create index t_v3 on b.t (v)"))
+
+        let bg = q(mut &s, &"begin")
+        let d1 = q(mut &s, &"alter schema c rename to d")
+        let rb = q(mut &s, &"rollback")
+        println("rolled back: c.t " + q(mut &s, &"select count(*) from c.t") + ", d.t " + state(mut &s, &"select * from d.t"))
+        return 0
+    }).unwrap()
+
+    lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int {
+        var s = lexdb_exec.newSession(st)
+        println("reopened: c.t " + q(mut &s, &"select count(*) from c.t") + ", " + plan(mut &s, &"select id from c.t where v = 'y'", &"t_v3") +
+                ", b.t " + q(mut &s, &"select count(*) from b.t"))
+        return 0
+    }).unwrap()
+}

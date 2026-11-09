@@ -4143,6 +4143,90 @@ fn dropColumn(txn: mut &lexdb_store.Txn, t: mut &Table, i: int): Result[Unit, Db
     return Ok(Unit{})
 }
 
+// ---- moving between schemas, renaming indexes and schemas (9.37)
+
+// Moves table t and its indexes to schema sc, their names kept: their
+// catalog rows under the new keys, the index rows naming the table's.
+fn moveTable(txn: mut &lexdb_store.Txn, t: mut &Table, sc: &str): Result[Unit, DbErr] {
+    txn.del(CATALOG, t.name)
+    t.name = lexdb_sql.qual(sc, &lexdb_sql.baseName(&t.name))
+    for k in 0..len(t.indexes) {
+        txn.del(CATALOG, idxName(&t.indexes[k].name))
+        t.indexes[k].name = lexdb_sql.qual(sc, &lexdb_sql.baseName(&t.indexes[k].name))
+    }
+    for ix in t.indexes { try txn.put(CATALOG, idxName(&ix.name), t.name) }
+    try txn.put(CATALOG, t.name, encTable(t))
+    return Ok(Unit{})
+}
+
+// Whether a table or an index has catalog key k.
+fn relExists(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, k: &str): Result[bool, DbErr] {
+    return Ok((try st.get(txn, CATALOG, k)).isSome() || (try st.get(txn, CATALOG, idxName(k))).isSome())
+}
+
+// ALTER TABLE ... SET SCHEMA: the table and its indexes, unless a name is
+// taken there.
+fn setSchema(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, sc: &str): Result[Unit, DbErr] {
+    if !(try schemaExists(st, txn, sc)) { return Err(e("3F000", "schema \"" + sc + "\" does not exist")) }
+    if lexdb_sql.schemaOf(&t.name) == sc { return Ok(Unit{}) }
+    var names = [lexdb_sql.baseName(&t.name)]
+    for ix in t.indexes { append(mut &names, lexdb_sql.baseName(&ix.name)) }
+    for n in names {
+        if try relExists(st, txn, &lexdb_sql.qual(sc, &n)) {
+            return Err(e("42P07", "relation \"" + n + "\" already exists in schema \"" + sc + "\""))
+        }
+    }
+    return moveTable(txn, t, sc)
+}
+
+fn alterIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
+    let ixKey = try catKey(st, txn, &s.index, true)
+    let owner = try st.get(txn, CATALOG, idxName(&ixKey))
+    if owner.isNone() {
+        if s.ifFlag { return Ok(tagOnly("ALTER INDEX")) }
+        return Err(e("42P01", "relation \"" + lexdb_sql.shown(&s.index) + "\" does not exist"))
+    }
+    var t = try needTable(st, txn, &owner.unwrap())
+    let to = s.alters[0].name
+    let key = lexdb_sql.qual(&lexdb_sql.schemaOf(&ixKey), &to)
+    if key == ixKey { return Ok(tagOnly("ALTER INDEX")) }
+    if try relExists(st, txn, &key) { return Err(e("42P07", "relation \"" + to + "\" already exists")) }
+    for k in 0..len(t.indexes) { if t.indexes[k].name == ixKey { t.indexes[k].name = key } }
+    txn.del(CATALOG, idxName(&ixKey))
+    try txn.put(CATALOG, idxName(&key), t.name)
+    try txn.put(CATALOG, t.name, encTable(&t))
+    try bumpCatalog(st, txn)
+    return Ok(tagOnly("ALTER INDEX"))
+}
+
+// ALTER SCHEMA ... RENAME TO: its tables and indexes move to the new name.
+fn alterSchema(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
+    let to = s.alters[0].name
+    if s.table == "public" { return Err(e("0A000", "lexdb: schema public cannot be renamed")) }
+    if !(try schemaExists(st, txn, &s.table)) { return Err(e("3F000", "schema \"" + s.table + "\" does not exist")) }
+    if try schemaExists(st, txn, &to) { return Err(e("42P06", "schema \"" + to + "\" already exists")) }
+    if strings.startsWith(to, "pg_") { return Err(e("42939", "unacceptable schema name \"" + to + "\"")) }
+    let from = lexdb_sql.qual(&s.table, &"")
+    var keys: []str = []
+    try st.scan(txn, CATALOG, from, from + "\xff", fn(en: &lexdb_store.Entry): bool {
+        append(mut &keys, en.key)
+        return true
+    })
+    for k in keys {
+        match try findTable(st, txn, &k) {
+            Some(t) {
+                var m = t
+                try moveTable(txn, mut &m, &to)
+            }
+            None {}
+        }
+    }
+    txn.del(CATALOG, schemaKey(&s.table))
+    try txn.put(CATALOG, schemaKey(&to), "")
+    try bumpCatalog(st, txn)
+    return Ok(tagOnly("ALTER SCHEMA"))
+}
+
 // ---- ALTER COLUMN TYPE (9.36)
 
 // A column's new type: col its number, using its new value (None: the
@@ -4296,6 +4380,8 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         let rel = lexdb_sql.baseName(&t.name)
         if a.kind == lexdb_sql.A_TYPE {
             append(mut &types, j)
+        } else if a.kind == lexdb_sql.A_SET_SCHEMA {
+            try setSchema(st, txn, mut &t, &a.name)
         } else if a.kind == lexdb_sql.A_ADD {
             if colIndex(&t.cols, &a.col.name) >= 0 {
                 if a.ifFlag { continue }
@@ -6297,7 +6383,7 @@ fn isWrite(kind: int): bool {
     return kind == lexdb_sql.S_CREATE || kind == lexdb_sql.S_DROP || kind == lexdb_sql.S_INSERT ||
            kind == lexdb_sql.S_UPDATE || kind == lexdb_sql.S_DELETE || kind == lexdb_sql.S_CREATE_INDEX ||
            kind == lexdb_sql.S_DROP_INDEX || kind == lexdb_sql.S_CREATE_SCHEMA || kind == lexdb_sql.S_DROP_SCHEMA ||
-           kind == lexdb_sql.S_ALTER
+           kind == lexdb_sql.S_ALTER || kind == lexdb_sql.S_ALTER_INDEX || kind == lexdb_sql.S_ALTER_SCHEMA
 }
 
 fn stmtName(kind: int): str {
@@ -6311,6 +6397,8 @@ fn stmtName(kind: int): str {
         lexdb_sql.S_CREATE_SCHEMA { "CREATE SCHEMA" }
         lexdb_sql.S_DROP_SCHEMA { "DROP SCHEMA" }
         lexdb_sql.S_ALTER { "ALTER TABLE" }
+        lexdb_sql.S_ALTER_INDEX { "ALTER INDEX" }
+        lexdb_sql.S_ALTER_SCHEMA { "ALTER SCHEMA" }
         else { "DELETE" }
     }
 }
@@ -6356,6 +6444,8 @@ fn execStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
         lexdb_sql.S_CREATE_SCHEMA { return createSchemaStmt(st, txn, s) }
         lexdb_sql.S_DROP_SCHEMA { return dropSchema(st, txn, s) }
         lexdb_sql.S_ALTER { return alterTable(st, txn, s, lim) }
+        lexdb_sql.S_ALTER_INDEX { return alterIndex(st, txn, s) }
+        lexdb_sql.S_ALTER_SCHEMA { return alterSchema(st, txn, s) }
         lexdb_sql.S_EXPLAIN { return explain(st, txn, s, params, lim, ptypes) }
         else { return Err(e("XX000", "not a data statement")) }
     }
