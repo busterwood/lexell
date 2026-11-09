@@ -1095,6 +1095,7 @@ pub type Level = record {
     hashVals: []Expr        // ... equal to these values from earlier tables
     src: int                // a subquery in FROM (or a CTE): its number, its rows read from the run; -1 a table
     work: int               // a recursive CTE's working table: the CTE's number; -1
+    lateral: bool           // a subquery in FROM using outer values (LATERAL): run per row
 }
 
 // A level of rows held by the run (a subquery's, a working table), not a table's.
@@ -1793,7 +1794,7 @@ fn allTrue(cs: &[]Expr, cols: &[]lexdb_sql.ColDef, row: &[]Val, params: &[]Val):
 
 fn newLevel(t: Table, alias: str, join: int, first: int): Level {
     return Level{t: t, alias: alias, join: join, first: first, path: Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: []}, cond: [],
-                 post: [], local: [], perRow: true, hashCols: [], hashVals: [], src: -1, work: -1}
+                 post: [], local: [], perRow: true, hashCols: [], hashVals: [], src: -1, work: -1, lateral: false}
 }
 
 // Plans a query over the tables of FROM (4.8): the tables are joined in the
@@ -1806,14 +1807,26 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
     // one, not this one's tables
     var planned: [][]SubPlan = []
     for i in 0..len(subs) { append(mut &planned, []) }
+    // its scope comes first, its columns added as its tables are read: a
+    // LATERAL subquery sees the tables before it, another none of them
+    append(mut &sc.frames, Frame{cols: [], refs: [], refOids: [], subRefs: [], subOids: [], subNames: [], hidden: false})
+    let me = len(sc.frames) - 1
     for f in from {
         for lv in q.levels {
             if lv.alias == f.alias { return Err(e("42712", "table name \"" + f.alias + "\" specified more than once")) }
         }
         var t = Table{name: f.alias, tree: -1, cols: [], pk: [], indexes: []}
+        var lateral = false
         if f.sub >= 0 {
-            let sp = try planSub(st, txn, &subs[f.sub], params, sc)
-            if len(sp.sel.q.refs) > 0 { return Err(e("0A000", "a subquery in FROM cannot use an outer query's columns yet")) }
+            sc.frames[me].hidden = !f.lateral
+            let planning = planSub(st, txn, &subs[f.sub], params, sc)
+            sc.frames[me].hidden = false
+            let sp = try planning
+            // outer values: run per row of the tables before it (and cached by them)
+            lateral = len(sp.sel.q.refs) > 0
+            if lateral && keepsRight(f.join) {
+                return Err(e("42P10", "a LATERAL subquery cannot be the right side of a RIGHT or FULL JOIN"))
+            }
             if len(f.cols) > len(sp.sel.outs) {
                 return Err(e("42P10", "table \"" + f.alias + "\" has " + len(sp.sel.outs).toStr() + " columns available but " +
                              len(f.cols).toStr() + " columns specified"))
@@ -1847,15 +1860,15 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
         var lv = newLevel(t, f.alias, f.join, first)
         lv.src = f.sub
         lv.work = f.work
+        lv.lateral = lateral
         append(mut &q.levels, lv)
+        if len(subs) > 0 {
+            // only its subqueries look here
+            for i in first..len(q.cols) {
+                append(mut &sc.frames[me].cols, lexdb_sql.ColDef{name: q.cols[i].name, typ: q.cols[i].typ, notNull: q.cols[i].notNull})
+            }
+        }
     }
-    // its scope: its columns, for its own expressions and its subqueries' (planned first)
-    var fcols: []lexdb_sql.ColDef = []
-    if len(subs) > 0 {
-        // only its subqueries look here
-        for c in q.cols { append(mut &fcols, lexdb_sql.ColDef{name: c.name, typ: c.typ, notNull: c.notNull}) }
-    }
-    append(mut &sc.frames, Frame{cols: fcols, refs: [], refOids: [], subRefs: [], subOids: [], subNames: []})
     for i in 0..len(subs) {
         if len(planned[i]) == 0 { append(mut &planned[i], try planSub(st, txn, &subs[i], params, sc)) }
         let sp = pop(mut &planned[i])
@@ -1918,7 +1931,7 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
         var path = if q.levels[k].virt() { Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: []} } else {
             choosePath(&q, k, &m, params)
         }
-        var perRow = k == 0 || q.pathOuter(&path)
+        var perRow = k == 0 || q.pathOuter(&path) || q.levels[k].lateral
         let right = keepsRight(q.levels[k].join)
         if right {
             // Every row of it is kept: read it all once, and remember which joined.
@@ -2095,6 +2108,43 @@ fn runLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Ma
                 None {}
             }
         }
+    } else if lv.lateral {
+        // its subquery with this row's values, its rows kept per values
+        let i = lv.src
+        var refVals: []Val = []
+        {
+            let noAggs: []Val = []
+            let env = Env{cols: &q.cols, row: row, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs}
+            for x in q.subs[i].sel.q.refs { append(mut &refVals, try eval(&x, &env)) }
+        }
+        let key = valsKey(&refVals)
+        var at = -1
+        match rs.memo[i].get(&key) {
+            Some(n) { at = n }
+            None {}
+        }
+        var rows: [][]Val = []
+        if at >= 0 {
+            rs.stats[i].hits += 1
+            rows = replace(mut &rs.memoRes[i][at].data, [])
+        } else {
+            var ps: []Val = []
+            for j in 0..q.base { append(mut &ps, params[j]) }
+            for v in refVals { append(mut &ps, v) }
+            var res = try runChild(st, txn, &q.subs[i].sel, &ps, -1, rs, i)
+            rows = replace(mut &res.rows, [])
+            if len(rs.memoRes[i]) < MEMO_MAX {
+                at = len(rs.memoRes[i])
+                rs.memo[i].put(key, at)
+                append(mut &rs.memoRes[i], emptyRes())
+            }
+        }
+        for r in rows {
+            let got = try tryRow(st, txn, q, m, k, &r, -1, row, params, emit, rs)
+            if got < 0 { return Ok(false) }
+            if got > 0 { matched = true }
+        }
+        if at >= 0 { rs.memoRes[i][at].data = rows }
     } else if lv.virt() {
         for r in m.vrows[k] {
             let got = try tryRow(st, txn, q, m, k, &r, -1, row, params, emit, rs)
@@ -2205,6 +2255,7 @@ type Frame = record {
     subRefs: [][]Expr           // per subquery of it: the subquery's refs, in its terms
     subOids: []int
     subNames: []str
+    hidden: bool                // its columns are not in scope (a FROM subquery that is not LATERAL)
 }
 
 pub type Scope = record {
@@ -2238,6 +2289,10 @@ fn outerRef(sc: mut &Scope, name: &str): Result[Option[Expr], DbErr] {
     var found = ""
     var oid = 0
     while f >= 0 && found == "" {
+        if sc.frames[f].hidden {
+            f -= 1
+            continue
+        }
         match resolveName(&sc.frames[f].cols, len(sc.frames[f].cols), name) {
             Ok(n) {
                 oid = sc.frames[f].cols[colIndex(&sc.frames[f].cols, &n)].typ.oid
@@ -2914,6 +2969,7 @@ fn subLines(q: &Query, stats: &[]SubStat, out: mut &[]str) {
 }
 
 fn pathText(lv: &Level): str {
+    if lv.lateral { return "rows of subquery " + (lv.src + 1).toStr() + ", run" }
     if lv.src >= 0 { return "rows of subquery " + (lv.src + 1).toStr() }
     if lv.work >= 0 { return "rows of the working table" }
     let p = &lv.path
@@ -2989,7 +3045,7 @@ fn copyRow(r: &[]Val): []Val {
 }
 
 fn oneTable(name: &str): []lexdb_sql.FromItem {
-    return [lexdb_sql.FromItem{table: name, alias: name, join: lexdb_sql.J_FIRST, on: None, sub: -1, cols: [], work: -1}]
+    return [lexdb_sql.FromItem{table: name, alias: name, join: lexdb_sql.J_FIRST, on: None, sub: -1, cols: [], work: -1, lateral: false}]
 }
 
 // ---- indexes: an entry per row, its key the indexed columns then the

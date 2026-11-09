@@ -427,7 +427,7 @@ server). Tests: `python3 lexell/tests/lexdb.py` (20 programs in
   statement waits, after it runs, until what it read is durable, since its
   result goes out before COMMIT (4.4).
 - **Interpreted, not bytecode.** The executor walks the statement's tree.
-- **No LATERAL, schemas, bytea, dates or times yet.**
+- **No schemas, bytea, dates or times yet.**
 - **Trust login**: no password, no TLS. The server listens on loopback by
   default.
 - **A simple query with several statements** runs each in its own
@@ -506,8 +506,7 @@ is the comparison to make.
 
 ### 9.4 Next
 
-1. The rest of subqueries (9.8 to 9.11): `LATERAL` (a subquery in FROM
-   using the tables before it). A statement's memory and time: a limit on
+1. A statement's memory and time: a limit on
    the rows a statement holds and a statement timeout (a recursive CTE
    within max_recursion can still grow without bound, 9.11). Smaller: a correlated subquery's value as a lookup's key
    (now it is only a filter), a small uncorrelated IN set as an IN-list
@@ -746,8 +745,7 @@ is the comparison to make.
   CTE used twice is planned and run twice: the same rows, more work
   (running it once is in 9.4).
 - A subquery in FROM is planned before the query's tables, seeing the
-  queries around the query but not its tables (no `LATERAL`); using an
-  outer query's columns is 0A000 for now. It runs once per execution,
+  queries around the query but not its tables (`LATERAL`: 9.12). It runs once per execution,
   before the query, into rows held by the run; its level reads them, with
   no key: at the first level a scan of them, after it a hash join on its
   equalities (or a loop). Its hash keys are by value (`2 = 2.0`), as its
@@ -815,4 +813,29 @@ is the comparison to make.
   `exec_with` run without end (rows multiply), so it fails by time.
 - pgbench point selects, the last commit and this one: 25,523 / 25,516
   and 23,467 / 26,871 tps. The binary is 1.19 MB.
+
+### 9.12 LATERAL
+
+- `FROM t, LATERAL (SELECT ... t.x ...) l`, `JOIN LATERAL (...) l ON ...`,
+  `LEFT JOIN LATERAL (...) l ON true`: the subquery sees the FROM items
+  before it. A query's scope is made before its FROM items and gets each
+  table's columns as it is read; a subquery in FROM that is not LATERAL
+  plans with them hidden, so it sees the queries around (its use of them
+  now works) but not its neighbours (42P01 for those, as in PostgreSQL).
+- A subquery in FROM with outer values is a level run per row: its
+  values from the row, the subquery run with them (cached per values, as
+  correlated subqueries are), its rows joined. On the right of a RIGHT or
+  FULL JOIN it is 42P10.
+- EXPLAIN: `cross join t: rows of subquery 1, run per row`, then
+  `subquery 1 (from): per row, on c.id` with runs and cache hits.
+- Tests: `exec_with` (102 statements): top-N per row, LEFT JOIN LATERAL ON
+  true, aggregates, UNION inside, nested subqueries, outer columns in a
+  FROM subquery of a correlated subquery, the errors. `exec_index_diff`
+  compares a LATERAL count with a scalar count and LEFT JOIN LATERAL's
+  first row with min(): no differences over four seeds. Mutations caught:
+  its cache ignoring the values (31 differ), cached rows not put back
+  (38), neighbours visible without LATERAL (2 lines), the level hashed
+  instead of per row (41).
+- pgbench point selects over six pairs, last commit and this one: 24,339
+  and 23,980 tps on average, each pair varying by up to 3,000: noise.
 
