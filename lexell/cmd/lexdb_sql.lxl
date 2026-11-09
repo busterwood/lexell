@@ -716,6 +716,7 @@ fn (p: mut &P) createIndex(unique: bool): Result[Stmt, lexdb_base.DbErr] {
     append(mut &s.names, try p.name())
     while p.acceptKw(",") { append(mut &s.names, try p.name()) }
     try p.expectKw(")")
+    if p.acceptKw("where") { s.where = Some(try p.expr()) }      // a filtered index
     return Ok(s)
 }
 
@@ -855,3 +856,66 @@ pub fn parse(sql: &str): Result[[]Stmt, lexdb_base.DbErr] {
     }
     return Ok(out)
 }
+
+// ---- expressions as text: a filtered index's predicate is kept in the
+// catalog so, and parsed again when the table is read.
+
+fn typeText(t: &TypeName): str {
+    if t.oid == OID_INT2 { return "smallint" }
+    if t.oid == OID_INT4 { return "integer" }
+    if t.oid == OID_INT8 { return "bigint" }
+    if t.oid == OID_BOOL { return "boolean" }
+    if t.kind == K_NUM {
+        if t.prec > 0 { return "numeric(" + t.prec.toStr() + ", " + t.scale.toStr() + ")" }
+        return "numeric"
+    }
+    if t.oid == OID_VARCHAR {
+        if t.len > 0 { return "varchar(" + t.len.toStr() + ")" }
+        return "varchar"
+    }
+    return "text"
+}
+
+fn quoteIdent(n: &str): str { return "\"" + strings.replaceAll(n, "\"", "\"\"") + "\"" }
+
+// SQL text that parses back to x.
+pub fn exprText(x: &Expr): str {
+    match x {
+        Expr.Lit(v) {
+            match v {
+                Val.Null { return "null" }
+                Val.Int(n) { return n.toStr() }
+                Val.Bool(b) { return if b { "true" } else { "false" } }
+                Val.Num(d) { return d.canonical() }
+                Val.Text(t) { return "'" + strings.replaceAll(t, "'", "''") + "'" }
+            }
+        }
+        Expr.Param(n) { return "$" + n.toStr() }
+        Expr.Col(n) {
+            let d = strings.indexOf(n, ".", 0)
+            if d < 0 { return quoteIdent(&n) }
+            return quoteIdent(&n[0..d]) + "." + quoteIdent(&n[d + 1..len(n)])
+        }
+        Expr.Unary(op, a) { return "(" + op + " " + exprText(&a) + ")" }
+        Expr.Bin(op, a, b) { return "(" + exprText(&a) + " " + op + " " + exprText(&b) + ")" }
+        Expr.IsNull(a, neg) { return "(" + exprText(&a) + (if neg { " is not null)" } else { " is null)" }) }
+        Expr.Cast(a, t) { return "cast(" + exprText(&a) + " as " + typeText(&t) + ")" }
+        Expr.Call(n, args, star) {
+            if star { return n + "(*)" }
+            var parts: []str = []
+            for a in args { append(mut &parts, exprText(&a)) }
+            return n + "(" + strings.join(&parts, ", ") + ")"
+        }
+    }
+}
+
+// One expression and nothing after it.
+pub fn parseExpr(sql: &str): Result[Expr, lexdb_base.DbErr] {
+    let toks = try lex(sql)
+    var p = P{toks: toks, pos: 0, params: 0}
+    let x = try p.expr()
+    let t = p.peek()
+    if t.kind != T_EOF { return Err(near(&t)) }
+    return Ok(x)
+}
+

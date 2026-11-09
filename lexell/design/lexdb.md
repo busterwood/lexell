@@ -392,7 +392,7 @@ Built on 2026-11-09 on branch `lexdb`, about 6,300 lines in
 (cache, trees, transactions, log, checkpoints, recovery, snapshots),
 `lexdb_sql` (lexer, parser), `lexdb_exec` (catalog, rows, keys, planner,
 statements, sessions), `lexdb_wire` (protocol 3.0) and `lexdb` (the
-server). Tests: `python3 lexell/tests/lexdb.py` (15 programs in
+server). Tests: `python3 lexell/tests/lexdb.py` (16 programs in
 `tests/lexdb/run`, under `LXL_CHECK=1`).
 
     lexell/compiler/out/lxlc lexell/cmd/lexdb.lxl -o lexdb
@@ -426,8 +426,7 @@ server). Tests: `python3 lexell/tests/lexdb.py` (15 programs in
   statement waits, after it runs, until what it read is durable, since its
   result goes out before COMMIT (4.4).
 - **Interpreted, not bytecode.** The executor walks the statement's tree.
-- **No subqueries, DISTINCT, HAVING, RIGHT or FULL joins, bytea, dates or
-  times yet.**
+- **No subqueries, DISTINCT, HAVING, schemas, bytea, dates or times yet.**
 - **Trust login**: no password, no TLS. The server listens on loopback by
   default.
 - **A simple query with several statements** runs each in its own
@@ -461,6 +460,15 @@ server). Tests: `python3 lexell/tests/lexdb.py` (15 programs in
   index entry behind on UPDATE (974 differ) or DELETE (1,021), or making a
   range's lower bound exclusive (109), fails it.
 - `exec_join`: each index, join and EXPLAIN feature once, checked by hand.
+- `exec_index_diff` also compares ORDER BY/LIMIT and MIN/MAX through
+  indexes with sorts, RIGHT JOIN with the LEFT JOIN the other way, FULL
+  JOIN with the LEFT JOIN plus the unmatched rows, scans longer than a
+  batch, and filtered indexes with plain scans. Caught: a backward cursor
+  repeating a row, WHERE below a RIGHT JOIN, ON filtering the kept table,
+  rows not added to a filtered index, a stale entry, `x >= 0` taken to
+  imply `x > 0`, an implication across columns.
+- `store_back`: backward scans equal forward scans reversed, with the
+  transaction's own writes and in snapshots.
 - `wire_client`: `lib/postgres` against the server in the same process.
 - `store_real`: the real file system: write, reopen, read.
 
@@ -491,11 +499,14 @@ is the comparison to make.
 2. Plans kept per prepared statement: since D4 every execution resolves
    names and chooses paths, and point selects fell from 26,700 to 23,800
    tps (one run each).
-3. COPY; then the cost questions (section 0), with EXPLAIN ANALYZE's
+3. Schemas (the user uses them extensively): `schema.table` names, the
+   catalog keyed by schema, `CREATE SCHEMA`/`DROP SCHEMA`, `search_path`,
+   and three-part column names (`s.t.c`) in the resolver.
+4. COPY; then the cost questions (section 0), with EXPLAIN ANALYZE's
    counts as the evidence.
-4. Overflow pages for large rows; reclaiming a dropped table's pages.
-5. Authentication (SCRAM) and TLS, so the server can leave loopback.
-6. The checkpoint pause and the memory of decoded nodes, measured under a
+5. Overflow pages for large rows; reclaiming a dropped table's pages.
+6. Authentication (SCRAM) and TLS, so the server can leave loopback.
+7. The checkpoint pause and the memory of decoded nodes, measured under a
    large write load; io_uring if the helper pool is the limit (D5).
 
 ### 9.5 Indexes and joins (D4)
@@ -536,7 +547,35 @@ is the comparison to make.
   (3.4 ms); with an index on `orders(cust)`, 1 lookup and 4 rows (0.04 ms).
   Writing the FROM list in a good order is the user's job until costs come
   (section 0).
-- **Not yet:** an index cannot serve ORDER BY or MIN/MAX, a hash join's table
-  must fit in memory, CREATE INDEX on a large table buffers every entry in
-  its transaction, and there are no expression or partial indexes.
+- **Composite indexes** are used by their leading equalities and a range on
+  the next column, and for ORDER BY and MIN/MAX on the columns after the
+  equalities.
+- **Filtered indexes** (`CREATE [UNIQUE] INDEX ... WHERE predicate`) hold
+  only the rows whose predicate is true; a filtered unique index makes its
+  columns unique among those rows ("one open task per owner"). The
+  predicate is kept in the catalog as SQL text (`lexdb_sql.exprText`, parsed
+  again when the table is read). The planner uses one only when the
+  query's conditions on that table imply the predicate: the same
+  conjunct, a comparison of a column for its `IS NOT NULL`, or comparisons
+  with constants or parameters (`x >= 3` implies `x > 0`; plans are made
+  per execution, so a parameter's value counts). A usable filtered index
+  scores one more than an unfiltered one, so `WHERE status = 'open'` alone
+  scans just the open rows. EXPLAIN marks it `(filtered)`.
+- **RIGHT and FULL joins.** The kept table is read once and its rows marked
+  as they join; after the scan its unmatched rows go on, with NULLs for the
+  tables before it, through the tables after it. No WHERE conjunct is
+  checked below the last RIGHT or FULL JOIN, and the table's own ON
+  conditions decide matches without filtering it.
+- **Indexes give order.** The store scans backward too. When the first
+  table's path yields the ORDER BY order (its key after its equalities,
+  an index's key ending with the primary key), in one direction, there is
+  no sort and a LIMIT stops the scan; DESC reads backward, NULLs first as in
+  PostgreSQL. A full scan switches to an index for its order only with a
+  LIMIT or for MIN/MAX (else a sort costs less than a lookup per row).
+  MIN or MAX of one column is the first non-NULL value in that order.
+  EXPLAIN says `order: sort` or `order: the scan's`.
+- **Not yet:** a hash join's table must fit in memory; CREATE INDEX on a
+  large table buffers every entry in its transaction; no expression
+  indexes; mixed ASC/DESC orders and MIN with MAX in one query are sorted
+  or aggregated the plain way.
 

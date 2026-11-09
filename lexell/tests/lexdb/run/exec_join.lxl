@@ -119,6 +119,46 @@
 // expect: explain analyze select name from people order by city desc limit 1 -> scan people: index people_city scan backward (rows read 1, kept 1); order: the scan's; limit: stops the scan; result: 1 rows
 // expect: select c.name, o.id from cust c join orders o on o.cust = c.id order by c.id desc limit 2 -> [name,id] bob|12; ann|10
 // expect: explain select c.name, o.id from cust c join orders o on o.cust = c.id order by c.id desc limit 2 -> [QUERY PLAN] scan cust c: full scan backward; join orders o: hash on (cust) over full scan; order: the scan's; limit: stops the scan
+// expect: -- filtered indexes
+// expect: create table tasks (id int primary key, owner int, status text, due int) -> CREATE TABLE
+// expect: insert into tasks values (1, 1, 'open', 3), (2, 2, 'open', 8), (3, 1, 'done', 1), (4, 3, 'done', 2), (5, 3, 'open', null), (6, 4, null, 4), (7, 2, 'done', 9) -> INSERT 0 7
+// expect: create index tasks_open_due on tasks (due) where status = 'open' -> CREATE INDEX
+// expect: create unique index tasks_one_open on tasks (owner) where status = 'open' -> CREATE INDEX
+// expect: explain select id from tasks where status = 'open' and due < 5 -> [QUERY PLAN] scan tasks: index tasks_open_due (filtered) range
+// expect: select id from tasks where status = 'open' and due < 5 -> [id] 1
+// expect: explain select id from tasks where due < 5 -> [QUERY PLAN] scan tasks: full scan
+// expect: explain select id from tasks where status = 'open' -> [QUERY PLAN] scan tasks: index tasks_open_due (filtered) scan
+// expect: select id from tasks where status = 'open' -> [id] 1; 2; 5
+// expect: explain select id from tasks where status = 'open' and owner = 3 -> [QUERY PLAN] scan tasks: index tasks_one_open (filtered) lookup
+// expect: select id from tasks where status = 'open' and owner = 3 -> [id] 5
+// expect: select id, due from tasks where status = 'open' order by due desc limit 2 -> [id,due] 5|NULL; 2|8
+// expect: explain select id, due from tasks where status = 'open' order by due desc limit 2 -> [QUERY PLAN] scan tasks: index tasks_open_due (filtered) scan backward; order: the scan's; limit: stops the scan
+// expect: select max(due) from tasks where status = 'open' -> [max] 8
+// expect: insert into tasks values (20, 1, 'open', 3) -> 23505 duplicate key value violates unique constraint "tasks_one_open": Key (owner)=(1) already exists.
+// expect: insert into tasks values (21, 1, 'done', 3) -> INSERT 0 1
+// expect: update tasks set status = 'open' where id = 21 -> 23505 duplicate key value violates unique constraint "tasks_one_open": Key (owner)=(1) already exists.
+// expect: update tasks set status = 'done' where id = 1 -> UPDATE 1
+// expect: update tasks set status = 'open', due = 0 where id = 21 -> UPDATE 1
+// expect: select id from tasks where status = 'open' and due < 5 -> [id] 21
+// expect: update tasks set due = 7 where status = 'open' and due = 0 -> UPDATE 1
+// expect: select id, due from tasks where status = 'open' and due > 5 -> [id,due] 21|7; 2|8
+// expect: delete from tasks where id = 2 -> DELETE 1
+// expect: select id from tasks where status = 'open' and due > 5 -> [id] 21
+// expect: create index tasks_later on tasks (id) where due > 3 -> CREATE INDEX
+// expect: explain select id from tasks where due >= 7 -> [QUERY PLAN] scan tasks: index tasks_later (filtered) scan
+// expect: explain select id from tasks where due = 4 -> [QUERY PLAN] scan tasks: index tasks_later (filtered) scan
+// expect: explain select id from tasks where due > 2 -> [QUERY PLAN] scan tasks: full scan
+// expect: select id from tasks where due = 4 -> [id] 6
+// expect: create index tasks_dated on tasks (owner) where due is not null -> CREATE INDEX
+// expect: explain select * from tasks where due < 9 and owner = 2 -> [QUERY PLAN] scan tasks: index tasks_dated (filtered) lookup
+// expect: select id from tasks where due < 9 and owner = 2 -> [id]
+// expect: explain select * from tasks where owner = 2 -> [QUERY PLAN] scan tasks: full scan
+// expect: create unique index tasks_bad on tasks (owner) where status = 'done' -> 23505 could not create unique index "tasks_bad": a value is duplicated
+// expect: create index tasks_bad on tasks (due) where nope > 1 -> 42703 column "nope" does not exist
+// expect: create index tasks_bad on tasks (due) where count(*) > 1 -> 42803 aggregate functions are not allowed in index predicates
+// expect: create index tasks_odd on tasks (due) where status = 'it''s' or owner * 2 > 6 -> CREATE INDEX
+// expect: explain select id from tasks where status = 'it''s' or owner * 2 > 6 -> [QUERY PLAN] scan tasks: index tasks_odd (filtered) scan
+// expect: select id from tasks where status = 'it''s' or owner * 2 > 6 -> [id] 6
 // expect: drop table orders -> DROP TABLE
 // expect: create index orders_cust on cust (name) -> CREATE INDEX
 // expect: explain update people set age = 1 where name = 'cy' -> [QUERY PLAN] scan people: index people_name lookup
@@ -285,6 +325,46 @@ fn body(st: lexdb_store.Store): int {
     analyze(mut &s, "explain analyze select name from people order by city desc limit 1")
     show(mut &s, "select c.name, o.id from cust c join orders o on o.cust = c.id order by c.id desc limit 2")
     show(mut &s, "explain select c.name, o.id from cust c join orders o on o.cust = c.id order by c.id desc limit 2")
+    println("-- filtered indexes")
+    show(mut &s, "create table tasks (id int primary key, owner int, status text, due int)")
+    show(mut &s, "insert into tasks values (1, 1, 'open', 3), (2, 2, 'open', 8), (3, 1, 'done', 1), (4, 3, 'done', 2), (5, 3, 'open', null), (6, 4, null, 4), (7, 2, 'done', 9)")
+    show(mut &s, "create index tasks_open_due on tasks (due) where status = 'open'")
+    show(mut &s, "create unique index tasks_one_open on tasks (owner) where status = 'open'")
+    show(mut &s, "explain select id from tasks where status = 'open' and due < 5")
+    show(mut &s, "select id from tasks where status = 'open' and due < 5")
+    show(mut &s, "explain select id from tasks where due < 5")
+    show(mut &s, "explain select id from tasks where status = 'open'")
+    show(mut &s, "select id from tasks where status = 'open'")
+    show(mut &s, "explain select id from tasks where status = 'open' and owner = 3")
+    show(mut &s, "select id from tasks where status = 'open' and owner = 3")
+    show(mut &s, "select id, due from tasks where status = 'open' order by due desc limit 2")
+    show(mut &s, "explain select id, due from tasks where status = 'open' order by due desc limit 2")
+    show(mut &s, "select max(due) from tasks where status = 'open'")
+    show(mut &s, "insert into tasks values (20, 1, 'open', 3)")
+    show(mut &s, "insert into tasks values (21, 1, 'done', 3)")
+    show(mut &s, "update tasks set status = 'open' where id = 21")
+    show(mut &s, "update tasks set status = 'done' where id = 1")
+    show(mut &s, "update tasks set status = 'open', due = 0 where id = 21")
+    show(mut &s, "select id from tasks where status = 'open' and due < 5")
+    show(mut &s, "update tasks set due = 7 where status = 'open' and due = 0")
+    show(mut &s, "select id, due from tasks where status = 'open' and due > 5")
+    show(mut &s, "delete from tasks where id = 2")
+    show(mut &s, "select id from tasks where status = 'open' and due > 5")
+    show(mut &s, "create index tasks_later on tasks (id) where due > 3")
+    show(mut &s, "explain select id from tasks where due >= 7")
+    show(mut &s, "explain select id from tasks where due = 4")
+    show(mut &s, "explain select id from tasks where due > 2")
+    show(mut &s, "select id from tasks where due = 4")
+    show(mut &s, "create index tasks_dated on tasks (owner) where due is not null")
+    show(mut &s, "explain select * from tasks where due < 9 and owner = 2")
+    show(mut &s, "select id from tasks where due < 9 and owner = 2")
+    show(mut &s, "explain select * from tasks where owner = 2")
+    show(mut &s, "create unique index tasks_bad on tasks (owner) where status = 'done'")
+    show(mut &s, "create index tasks_bad on tasks (due) where nope > 1")
+    show(mut &s, "create index tasks_bad on tasks (due) where count(*) > 1")
+    show(mut &s, "create index tasks_odd on tasks (due) where status = 'it''s' or owner * 2 > 6")
+    show(mut &s, "explain select id from tasks where status = 'it''s' or owner * 2 > 6")
+    show(mut &s, "select id from tasks where status = 'it''s' or owner * 2 > 6")
     show(mut &s, "drop table orders")
     show(mut &s, "create index orders_cust on cust (name)")
     show(mut &s, "explain update people set age = 1 where name = 'cy'")
