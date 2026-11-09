@@ -393,7 +393,7 @@ Built on 2026-11-09 on branch `lexdb`, about 6,300 lines in
 (cache, trees, transactions, log, checkpoints, recovery, snapshots),
 `lexdb_sql` (lexer, parser), `lexdb_exec` (catalog, rows, keys, planner,
 statements, sessions), `lexdb_wire` (protocol 3.0) and `lexdb` (the
-server). Tests: `python3 lexell/tests/lexdb.py` (45 programs in
+server). Tests: `python3 lexell/tests/lexdb.py` (46 programs in
 `tests/lexdb/run`, under `LXL_CHECK=1`).
 
     lexell/compiler/out/lxlc lexell/cmd/lexdb.lxl -o lexdb
@@ -591,7 +591,7 @@ is the comparison to make.
    NULL (built: 9.34); (2) DROP COLUMN (built: 9.35); (3) ALTER COLUMN
    TYPE (built: 9.36); (4) (built: 9.37) SET
    SCHEMA, ALTER INDEX ... RENAME, ALTER SCHEMA ... RENAME. Column
-   defaults (and so ADD COLUMN ... DEFAULT) are a feature of their own.
+   defaults, ADD COLUMN ... DEFAULT among them, are built (9.38).
 
 ### 9.5 Indexes and joins (D4)
 
@@ -2407,3 +2407,76 @@ under them. Planted, each caught:
 
 The old index rows were not caught at first. The old index name being
 free again is now checked.
+
+### 9.38 Column defaults
+
+**Where.**
+- `DEFAULT expr` in CREATE TABLE and in ALTER TABLE ADD COLUMN;
+- `ALTER [COLUMN] c SET DEFAULT expr` and `DROP DEFAULT`;
+- `DEFAULT` as a value in INSERT's VALUES and in UPDATE's SET;
+- `INSERT ... DEFAULT VALUES`.
+
+A column an INSERT leaves out, or one written DEFAULT, takes its default;
+with none, NULL. A NULL written stays NULL. INSERT ... SELECT fills the
+columns it leaves out the same way.
+
+**The expression** is parsed as PostgreSQL's `b_expr` is, so that
+`DEFAULT 1 NOT NULL` parses: arithmetic, `||`, casts, calls, and
+anything in parentheses (`catExpr`). It may not use a column (0A000), a
+subquery (0A000), an aggregate (42803) or a parameter (42P02). It is
+kept as its text in the table's catalog row, with the column.
+
+**Checked when made.** lexdb has no volatile function (no `random()` or
+`now()` yet), so a default's value is the same whenever it is made. Its
+value is made, of the column's type, when the default is set. A bad one
+(`'abc'` for an int, an overflow) fails then, not at each INSERT. A
+statement makes each default once, for all its rows (`defaultsOf`).
+
+**ADD COLUMN ... DEFAULT rewrites no row**, as in PostgreSQL 11 and later.
+The value is kept with the column as its *missing value*: what rows
+written before the column was added read for it. The row decoder gives
+it for a place a row does not have (`placesMissing`, by place, so after
+a DROP COLUMN too), and so do narrowed reads. An index made later gets
+it, and so does a row updated (written whole). SET DEFAULT and DROP
+DEFAULT change new rows only: the rows there keep the value they had. A
+NOT NULL column may be added over rows when its default is not NULL.
+
+**Type changes.** A default must be of the column's new type, or the
+ALTER fails. A rewrite writes every row whole, the missing values with
+them, and then no column has one.
+
+**In the catalog row**, after the places (9.35), which are written, empty,
+when there are defaults: a byte per column (1: a default, 2: a missing
+value), the default's text, the missing value encoded as a row of one.
+
+**Checked** by `exec_default`:
+- each kind of type, with expressions;
+- columns left out, DEFAULT in VALUES, DEFAULT VALUES, INSERT ... SELECT;
+- SET c = DEFAULT, with and without a default;
+- the six errors at CREATE;
+- parsing next to NOT NULL, NULL and PRIMARY KEY;
+- ADD COLUMN ... DEFAULT over short rows and a row with a long text, read
+  whole, alone, in a WHERE, and by an index made after;
+- NOT NULL with a default;
+- SET and DROP DEFAULT (the old rows unchanged);
+- after a dropped column;
+- a type change refused by the default, and one that rewrites;
+- a rollback, and a reopen.
+
+Planted, each caught:
+- old rows reading NULL;
+- ADD's default not kept as the missing value;
+- SET DEFAULT changing the rows there;
+- columns left out NULL;
+- DEFAULT in VALUES taken as NULL;
+- SET c = DEFAULT ignored;
+- defaults not saved;
+- a column referenced in a default;
+- missing values by column, not by place;
+- NOT NULL refused over rows despite a default;
+- a default not checked for a new type;
+- a default not converted to the column's type.
+
+Not done: volatile defaults (`now()`, `nextval()`, `gen_random_uuid()`)
+wait for those functions. When they come, ADD COLUMN with one must
+rewrite the rows, and the default must be made per row.

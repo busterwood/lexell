@@ -1197,8 +1197,8 @@ fn encLong(row: &[]Val): str {
 // n and need are of the row's places (rowWidth, placesNeeded); the values
 // are the table's columns'.
 fn rowOf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, key: &str, v: &str, n: int,
-         need: &[]bool): Result[[]Val, DbErr] {
-    let places = try placesOf(st, txn, t.tree, key, v, n, need)
+         need: &[]bool, missing: &[]Val): Result[[]Val, DbErr] {
+    let places = try placesOf(st, txn, t.tree, key, v, n, need, missing)
     if len(t.slots) == 0 { return Ok(places) }
     var out: []Val = []
     for k in t.slots { append(mut &out, places[k]) }
@@ -1207,6 +1207,18 @@ fn rowOf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, key: &str
 
 // The places a stored row has: its table's columns, and dropped ones.
 fn rowWidth(t: &Table): int { return if len(t.slots) == 0 { len(t.cols) } else { t.width } }
+
+// The values rows written before a column was added have for it, by
+// place ([] when all are NULL).
+fn placesMissing(t: &Table): []Val {
+    var any = false
+    for c in t.cols { if !isNull(&c.missing) { any = true } }
+    var out: []Val = []
+    if !any { return out }
+    out = array(rowWidth(t), Val.Null)
+    for i in 0..len(t.cols) { out[if len(t.slots) == 0 { i } else { t.slots[i] }] = t.cols[i].missing }
+    return out
+}
 
 // need ([] all) of the table's columns as of the row's places.
 fn placesNeeded(t: &Table, need: &[]bool): []bool {
@@ -1230,14 +1242,14 @@ fn encRowOf(t: &Table, row: &[]Val): str {
 }
 
 fn placesOf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, tree: int, key: &str, v: &str, n: int,
-            need: &[]bool): Result[[]Val, DbErr] {
+            need: &[]bool, missing: &[]Val): Result[[]Val, DbErr] {
     match lexdb_store.partOf(v) {
         Some(p) {
-            if fitsIn(&p, n, need) { return decRowNeed(&p, n, need) }
+            if fitsIn(&p, n, need) { return decRowNeed(&p, n, need, missing) }
             let w = try st.whole(txn, tree, key, v)
-            return decRowNeed(&w, n, need)
+            return decRowNeed(&w, n, need, missing)
         }
-        None { return decRowNeed(v, n, need) }
+        None { return decRowNeed(v, n, need, missing) }
     }
 }
 
@@ -1279,12 +1291,13 @@ fn rowHead(s: &str): int {
 
 fn decRow(s: &str, n: int): Result[[]Val, DbErr] {
     let all: []bool = []
-    return decRowNeed(s, n, &all)
+    let none: []Val = []
+    return decRowNeed(s, n, &all, &none)
 }
 
 // A row's values; need: the columns used ([] all), the others NULL and not
 // decoded (9.31).
-fn decRowNeed(s: &str, n: int, need: &[]bool): Result[[]Val, DbErr] {
+fn decRowNeed(s: &str, n: int, need: &[]bool, missing: &[]Val): Result[[]Val, DbErr] {
     var out: []Val = []
     var at = 0
     let some = len(need) > 0
@@ -1299,7 +1312,8 @@ fn decRowNeed(s: &str, n: int, need: &[]bool): Result[[]Val, DbErr] {
     var longLen: []int = []
     for i in 0..n {
         if i >= cols || (!long && at >= len(s)) {
-            append(mut &out, Val.Null)       // a column added after the row was written
+            // a column added after the row was written: its default then
+            append(mut &out, if i < len(missing) { missing[i] } else { Val.Null })
             continue
         }
         let tag = s[at]
@@ -1401,10 +1415,33 @@ fn encTable(t: &Table): str {
             None {}
         }
     }
-    if len(t.slots) > 0 {
+    // then defaults, after the places (written, with none, when there are
+    // defaults)
+    var defs = false
+    for c in t.cols { if c.def.isSome() || !isNull(&c.missing) { defs = true } }
+    if len(t.slots) > 0 || defs {
         binary.addU32LE(mut &b, t.width)
         binary.addU32LE(mut &b, len(t.slots))
         for k in t.slots { binary.addU32LE(mut &b, k) }
+    }
+    if defs {
+        for c in t.cols {
+            let missing = !isNull(&c.missing)
+            b.addByte((if c.def.isSome() { 1 } else { 0 }) + (if missing { 2 } else { 0 }))
+            match c.def {
+                Some(x) {
+                    let text = lexdb_sql.exprText(&x)
+                    binary.addU32LE(mut &b, len(text))
+                    b.add(text)
+                }
+                None {}
+            }
+            if missing {
+                let v = encRow(&[c.missing])
+                binary.addU32LE(mut &b, len(v))
+                b.add(v)
+            }
+        }
     }
     return b.toStr()
 }
@@ -1421,7 +1458,7 @@ fn decTable(name: str, s: &str): Result[Table, DbErr] {
                                     prec: binary.readU32LEStr(s, at + 8), scale: binary.readU32LEStr(s, at + 12),
                                     len: binary.readU32LEStr(s, at + 16)}
         at += 20
-        append(mut &t.cols, lexdb_sql.ColDef{name: cn, typ: ty, notNull: s[at] == 1})
+        append(mut &t.cols, lexdb_sql.colDef(cn, ty, s[at] == 1))
         at += 1
     }
     let k = binary.readU32LEStr(s, at)
@@ -1463,6 +1500,26 @@ fn decTable(name: str, s: &str): Result[Table, DbErr] {
         for i in 0..ns {
             append(mut &t.slots, binary.readU32LEStr(s, at))
             at += 4
+        }
+    }
+    if at < len(s) {
+        for i in 0..len(t.cols) {
+            let flags = s[at]
+            at += 1
+            if flags & 1 != 0 {
+                let l = binary.readU32LEStr(s, at)
+                match lexdb_sql.parseExpr(&s[at + 4..at + 4 + l]) {
+                    Ok(x) { t.cols[i].def = Some(x) }
+                    Err(_) { return Err(lexdb_base.corrupt("the default of column \"" + t.cols[i].name + "\"")) }
+                }
+                at += 4 + l
+            }
+            if flags & 2 != 0 {
+                let l = binary.readU32LEStr(s, at)
+                let vs = try decRow(&s[at + 4..at + 4 + l], 1)
+                t.cols[i].missing = vs[0]
+                at += 4 + l
+            }
         }
     }
     return Ok(t)
@@ -2484,6 +2541,7 @@ fn fetch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, p: &Path,
          out: mut &[][]Val): Result[Unit, DbErr] {
     let n = rowWidth(t)
     let places = placesNeeded(t, need)
+    let missing = placesMissing(t)
     // only some columns used: large rows are read in part (rowOf)
     let part = len(need) > 0
     if sc.empty {
@@ -2494,7 +2552,7 @@ fn fetch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, p: &Path,
         cur.done = true
         let got = if part { try st.getPart(txn, t.tree, sc.lo) } else { try st.get(txn, t.tree, sc.lo) }
         match got {
-            Some(v) { append(out, try rowOf(st, txn, t, &sc.lo, &v, n, &places)) }
+            Some(v) { append(out, try rowOf(st, txn, t, &sc.lo, &v, n, &places, &missing)) }
             None {}
         }
         return Ok(Unit{})
@@ -2547,11 +2605,11 @@ fn fetch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, p: &Path,
     }
     for k in 0..len(vals) {
         if !byIndex {
-            append(out, try rowOf(st, txn, t, &keys[k], &vals[k], n, &places))
+            append(out, try rowOf(st, txn, t, &keys[k], &vals[k], n, &places, &missing))
         } else {
             let got = if part { try st.getPart(txn, t.tree, vals[k]) } else { try st.get(txn, t.tree, vals[k]) }
             match got {
-                Some(rv) { append(out, try rowOf(st, txn, t, &vals[k], &rv, n, &places)) }
+                Some(rv) { append(out, try rowOf(st, txn, t, &vals[k], &rv, n, &places, &missing)) }
                 None { return Err(lexdb_base.corrupt("an index entry of \"" + t.name + "\" without its row")) }
             }
         }
@@ -2609,7 +2667,7 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
             }
             for i in 0..len(sp.sel.outs) {
                 let name = if i < len(f.cols) { f.cols[i] } else { sp.sel.outs[i].name }
-                append(mut &t.cols, lexdb_sql.ColDef{name: name, typ: oidType(sp.sel.outs[i].oid), notNull: false})
+                append(mut &t.cols, lexdb_sql.colDef(name, oidType(sp.sel.outs[i].oid), false))
             }
             append(mut &planned[f.sub], sp)
         } else if f.work >= 0 {
@@ -2624,7 +2682,7 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
             }
             for i in 0..len(sc.works[w].cols) {
                 let name = if i < len(f.cols) { f.cols[i] } else { sc.works[w].cols[i].name }
-                append(mut &t.cols, lexdb_sql.ColDef{name: name, typ: sc.works[w].cols[i].typ, notNull: false})
+                append(mut &t.cols, lexdb_sql.colDef(name, sc.works[w].cols[i].typ, false))
             }
         } else {
             t = try needTable(st, txn, &f.table)
@@ -2635,7 +2693,7 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
             // unnest(a, b)): each its own column, the name ambiguous
             var name = t.cols[k].name
             for j in 0..k { if t.cols[j].name == name { name = name + DUPSEP + k.toStr() } }
-            append(mut &q.cols, lexdb_sql.ColDef{name: f.alias + "." + name, typ: t.cols[k].typ, notNull: t.cols[k].notNull})
+            append(mut &q.cols, lexdb_sql.colDef(f.alias + "." + name, t.cols[k].typ, t.cols[k].notNull))
         }
         var lv = newLevel(t, f.alias, f.join, first)
         lv.src = f.sub
@@ -2645,7 +2703,7 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
         if len(subs) > 0 {
             // only its subqueries look here
             for i in first..len(q.cols) {
-                append(mut &sc.frames[me].cols, lexdb_sql.ColDef{name: q.cols[i].name, typ: q.cols[i].typ, notNull: q.cols[i].notNull})
+                append(mut &sc.frames[me].cols, lexdb_sql.colDef(q.cols[i].name, q.cols[i].typ, q.cols[i].notNull))
             }
         }
     }
@@ -4015,7 +4073,15 @@ fn createTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
     var t = Table{name: key, tree: 0, cols: [], pk: [], indexes: [], slots: [], width: 0}
     for c in s.cols {
         if colIndex(&t.cols, &c.name) >= 0 { return Err(e("42701", "column \"" + c.name + "\" specified more than once")) }
-        append(mut &t.cols, lexdb_sql.ColDef{name: c.name, typ: c.typ, notNull: c.notNull})
+        var col = lexdb_sql.colDef(c.name, c.typ, c.notNull)
+        match c.def {
+            Some(x) {
+                let v = try defaultValue(&x, &col)
+                col.def = Some(clone(&x))
+            }
+            None {}
+        }
+        append(mut &t.cols, col)
     }
     for p in s.pk {
         let i = colIndex(&t.cols, &p)
@@ -4058,6 +4124,35 @@ fn dropOne(txn: mut &lexdb_store.Txn, t: &Table) {
     }
     txn.dropTree(t.tree)
     txn.del(CATALOG, t.name)
+}
+
+// ---- column defaults (9.38)
+
+// A DEFAULT checked for column c: no column and no aggregate in it; its
+// value, of c's type. lexdb has no volatile function, so the value is the
+// same whenever it is made: a bad default fails here, not at each INSERT.
+fn defaultValue(x: &Expr, c: &lexdb_sql.ColDef): Result[Val, DbErr] {
+    var ns: []str = []
+    colNames(x, mut &ns)
+    if len(ns) > 0 { return Err(e("0A000", "cannot use column reference in DEFAULT expression")) }
+    if hasAgg(x) { return Err(e("42803", "aggregate functions are not allowed in DEFAULT expressions")) }
+    let none: []Val = []
+    let noCols: []lexdb_sql.ColDef = []
+    let noSubs: []SubRes = []
+    let env = Env{cols: &noCols, row: &none, aggs: &none, params: &none, subs: &noSubs, cur: &none}
+    return coerce(try eval(x, &env), &c.typ)
+}
+
+// Each column's default value (NULL with none), for a statement's rows.
+fn defaultsOf(t: &Table): Result[[]Val, DbErr] {
+    var out: []Val = []
+    for c in t.cols {
+        match c.def {
+            Some(x) { append(mut &out, try defaultValue(&x, &c)) }
+            None { append(mut &out, Val.Null) }
+        }
+    }
+    return Ok(out)
 }
 
 // ---- ALTER TABLE (9.34)
@@ -4297,6 +4392,8 @@ fn retype(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, chan
 
     var changed: []bool = array(len(t.cols), false)
     var keyChanged = false
+    // every row written below has every place
+    for k in 0..len(t.cols) { t.cols[k].missing = Val.Null }
     for ch in changes {
         t.cols[ch.col].typ = ch.typ
         changed[ch.col] = true
@@ -4387,11 +4484,20 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
                 if a.ifFlag { continue }
                 return Err(e("42701", "column \"" + a.col.name + "\" of relation \"" + rel + "\" already exists"))
             }
-            let full = a.col.notNull && try anyRow(st, txn, &t, -1)
+            // the rows there read the default as it is now (no row is written)
+            var col = lexdb_sql.colDef(a.col.name, a.col.typ, a.col.notNull)
+            match a.col.def {
+                Some(x) {
+                    col.missing = try defaultValue(&x, &col)
+                    col.def = Some(clone(&x))
+                }
+                None {}
+            }
+            let full = a.col.notNull && isNull(&col.missing) && try anyRow(st, txn, &t, -1)
             if full {
                 return Err(e("23502", "column \"" + a.col.name + "\" of relation \"" + rel + "\" contains null values"))
             }
-            append(mut &t.cols, lexdb_sql.ColDef{name: a.col.name, typ: a.col.typ, notNull: a.col.notNull})
+            append(mut &t.cols, col)
             if len(t.slots) > 0 {
                 append(mut &t.slots, t.width)
                 t.width += 1
@@ -4436,6 +4542,17 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
                     return Err(e("23502", "column \"" + a.name + "\" of relation \"" + rel + "\" contains null values"))
                 }
                 t.cols[i].notNull = true
+            } else if a.kind == lexdb_sql.A_SET_DEFAULT {
+                // for rows inserted from now on; those there keep their values
+                match a.col.def {
+                    Some(x) {
+                        let v = try defaultValue(&x, &t.cols[i])
+                        t.cols[i].def = Some(clone(&x))
+                    }
+                    None {}
+                }
+            } else if a.kind == lexdb_sql.A_DROP_DEFAULT {
+                t.cols[i].def = None
             } else if a.kind == lexdb_sql.A_DROP_NOT_NULL {
                 for k in t.pk {
                     if k == i { return Err(e("42P16", "column \"" + a.name + "\" is in a primary key")) }
@@ -4463,6 +4580,13 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
     }
     if rewrite { try retype(st, txn, mut &t, &changes, lim) }
     else { for ch in changes { t.cols[ch.col].typ = ch.typ } }
+    // a default must be one of the new type
+    for ch in changes {
+        match t.cols[ch.col].def {
+            Some(x) { let v = try defaultValue(&x, &t.cols[ch.col]) }
+            None {}
+        }
+    }
     try txn.put(CATALOG, t.name, encTable(&t))
     try bumpCatalog(st, txn)
     return Ok(tagOnly("ALTER TABLE"))
@@ -4631,9 +4755,10 @@ fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
         let noTypes: []int = []
         var pc = oneShot()
         let res = try select(st, txn, &s.inner[0], params, &noTypes, lim, mut &pc)
+        let defs = try defaultsOf(&t)
         var count = 0
         for r in res.rows {
-            try insertOne(st, txn, &t, &targets, &r)
+            try insertOne(st, txn, &t, &targets, &r, &defs)
             count += 1
         }
         return Ok(tagOnly("INSERT 0 " + count.toStr()))
@@ -4663,20 +4788,29 @@ fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
 
 fn insertRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, targets: &[]int, rows: &[][]Expr,
               env: &Env): Result[Res, DbErr] {
+    let defs = try defaultsOf(t)
     var count = 0
     for r in rows {
         var vs: []Val = []
-        for x in r { append(mut &vs, try eval(&x, env)) }
-        try insertOne(st, txn, t, targets, &vs)
+        for k in 0..len(r) {
+            if lexdb_sql.isDefault(&r[k]) {
+                if k >= len(targets) { return Err(e("42601", "INSERT has more expressions than target columns")) }
+                append(mut &vs, defs[targets[k]])
+            } else {
+                append(mut &vs, try eval(&r[k], env))
+            }
+        }
+        try insertOne(st, txn, t, targets, &vs, &defs)
         count += 1
     }
     return Ok(tagOnly("INSERT 0 " + count.toStr()))
 }
 
 // A row of values for the target columns (the rest NULL).
-fn insertOne(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, targets: &[]int, vs: &[]Val): Result[Unit, DbErr] {
+fn insertOne(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, targets: &[]int, vs: &[]Val,
+             defs: &[]Val): Result[Unit, DbErr] {
     if len(vs) > len(targets) { return Err(e("42601", "INSERT has more expressions than target columns")) }
-    var row: []Val = array(len(t.cols), Val.Null)
+    var row: []Val = copyRow(defs)
     for k in 0..len(vs) {
         let ci = targets[k]
         row[ci] = try coerce(vs[k], &t.cols[ci].typ)
@@ -4719,11 +4853,13 @@ fn update(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
         return Ok(true)
     }, mut &rs)
     let noAggs: []Val = []
+    let defs = try defaultsOf(t)
     for old in found {
         let env = Env{cols: &q.cols, row: &old, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs}
         var row = copyRow(&old)
         for k in 0..len(sets) {
-            row[targets[k]] = try coerce(try evalX(st, txn, &q, &sets[k], &env, mut &rs), &t.cols[targets[k]].typ)
+            if lexdb_sql.isDefault(&sets[k]) { row[targets[k]] = defs[targets[k]] }
+            else { row[targets[k]] = try coerce(try evalX(st, txn, &q, &sets[k], &env, mut &rs), &t.cols[targets[k]].typ) }
         }
         try checkRow(t, &row)
         let oldKey = keyOf(t, &old)
@@ -5683,7 +5819,7 @@ fn planSet(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
     let l = try planSelect(st, txn, &s.inner[0], params, sc)
     if s.rec {
         var cols: []lexdb_sql.ColDef = []
-        for o in l.outs { append(mut &cols, lexdb_sql.ColDef{name: o.name, typ: oidType(o.oid), notNull: false}) }
+        for o in l.outs { append(mut &cols, lexdb_sql.colDef(o.name, oidType(o.oid), false)) }
         append(mut &sc.works, Work{id: s.cte, cols: cols})
     }
     let rr = planSelect(st, txn, &s.inner[1], params, sc)

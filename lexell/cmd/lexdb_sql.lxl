@@ -75,6 +75,23 @@ pub type ColDef = record {
     pub name: str
     pub typ: TypeName
     pub notNull: bool
+    pub def: Option[Expr]       // a table's column: its DEFAULT (9.38)
+    pub missing: Val            // a table's column: its value in rows written before it was added
+}
+
+// A column with no default.
+pub fn colDef(name: str, typ: TypeName, notNull: bool): ColDef {
+    return ColDef{name: name, typ: typ, notNull: notNull, def: None, missing: Val.Null}
+}
+
+// The DEFAULT keyword where a value goes (INSERT's VALUES, UPDATE's SET).
+pub const DEFAULT_MARK: str = "#default"
+
+pub fn isDefault(x: &Expr): bool {
+    match x {
+        Expr.Call(n, a, s) { return n == DEFAULT_MARK }
+        else { return false }
+    }
 }
 
 pub type SelItem = record {
@@ -141,6 +158,8 @@ pub const A_DROP_NOT_NULL = 5   // ALTER COLUMN name DROP NOT NULL
 pub const A_DROP_COL = 6        // DROP COLUMN name
 pub const A_TYPE = 7            // ALTER COLUMN name TYPE col.typ [USING using]
 pub const A_SET_SCHEMA = 8      // SET SCHEMA name
+pub const A_SET_DEFAULT = 9     // ALTER COLUMN name SET DEFAULT col.def
+pub const A_DROP_DEFAULT = 10   // ALTER COLUMN name DROP DEFAULT
 
 pub type Alter = record {
     pub kind: int
@@ -944,7 +963,7 @@ fn (p: mut &P) createTable(): Result[Stmt, lexdb_base.DbErr] {
         } else {
             let n = try p.name()
             let ty = try p.typeName()
-            var c = ColDef{name: n, typ: ty, notNull: false}
+            var c = colDef(n, ty, false)
             while true {
                 if p.acceptKw("not") {
                     try p.expectKw("null")
@@ -954,6 +973,8 @@ fn (p: mut &P) createTable(): Result[Stmt, lexdb_base.DbErr] {
                     try p.expectKw("key")
                     append(mut &s.pk, n)
                     c.notNull = true
+                } else if p.acceptKw("default") {
+                    c.def = Some(try p.defaultExpr())
                 } else {
                     break
                 }
@@ -966,7 +987,24 @@ fn (p: mut &P) createTable(): Result[Stmt, lexdb_base.DbErr] {
     return Ok(s)
 }
 
-fn noCol(): ColDef { return ColDef{name: "", typ: TypeName{kind: 0, oid: 0, prec: 0, scale: 0, len: 0}, notNull: false} }
+fn noCol(): ColDef { return colDef("", TypeName{kind: 0, oid: 0, prec: 0, scale: 0, len: 0}, false) }
+
+// A DEFAULT's expression: no subquery, no parameter (column references and
+// aggregates are refused where the table is known).
+fn (p: mut &P) defaultExpr(): Result[Expr, lexdb_base.DbErr] {
+    let subs = len(p.subs)
+    let params = p.params
+    let x = try p.catExpr()      // no NOT, AND or IS at the top: "DEFAULT 1 NOT NULL" 
+    if len(p.subs) > subs { return Err(lexdb_base.err("0A000", "cannot use subquery in DEFAULT expression")) }
+    if p.params > params { return Err(lexdb_base.err("42P02", "there is no parameter $" + p.params.toStr())) }
+    return Ok(x)
+}
+
+// A value, or DEFAULT (INSERT's VALUES, UPDATE's SET).
+fn (p: mut &P) valueOrDefault(): Result[Expr, lexdb_base.DbErr] {
+    if p.acceptKw("default") { return Ok(Expr.Call(DEFAULT_MARK, [], false)) }
+    return p.expr()
+}
 
 // ALTER TABLE [IF EXISTS] [ONLY] name, then RENAME [COLUMN] a TO b,
 // RENAME TO name or SET SCHEMA name (each alone), or actions separated by commas: ADD
@@ -1018,8 +1056,8 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
                 } else if p.acceptKw("null") {
                 } else if p.isKw("primary") {
                     return Err(lexdb_base.err("0A000", "lexdb: a table's primary key cannot be changed"))
-                } else if p.isKw("default") {
-                    return Err(lexdb_base.err("0A000", "lexdb: column defaults are not supported"))
+                } else if p.acceptKw("default") {
+                    a.col.def = Some(try p.defaultExpr())
                 } else if p.isKw("unique") || p.isKw("check") || p.isKw("references") || p.isKw("constraint") {
                     return Err(lexdb_base.err("0A000", "lexdb: ALTER TABLE cannot add a constraint (a unique index can be created)"))
                 } else {
@@ -1060,17 +1098,27 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
                 }
                 append(mut &s.alters, a)
             } else if p.acceptKw("set") {
-                if p.isKw("default") { return Err(lexdb_base.err("0A000", "lexdb: column defaults are not supported")) }
+                if p.acceptKw("default") {
+                    var a = Alter{kind: A_SET_DEFAULT, col: noCol(), name: n, to: "", ifFlag: false, using: None}
+                    a.col.def = Some(try p.defaultExpr())
+                    append(mut &s.alters, a)
+                    if !p.acceptKw(",") { break }
+                    continue
+                }
                 try p.expectKw("not")
                 try p.expectKw("null")
                 append(mut &s.alters, Alter{kind: A_SET_NOT_NULL, col: noCol(), name: n, to: "", ifFlag: false, using: None})
             } else if p.acceptKw("drop") {
-                if p.isKw("default") { return Err(lexdb_base.err("0A000", "lexdb: column defaults are not supported")) }
+                if p.acceptKw("default") {
+                    append(mut &s.alters, Alter{kind: A_DROP_DEFAULT, col: noCol(), name: n, to: "", ifFlag: false, using: None})
+                    if !p.acceptKw(",") { break }
+                    continue
+                }
                 try p.expectKw("not")
                 try p.expectKw("null")
                 append(mut &s.alters, Alter{kind: A_DROP_NOT_NULL, col: noCol(), name: n, to: "", ifFlag: false, using: None})
             } else {
-                return Err(lexdb_base.err("0A000", "lexdb: ALTER COLUMN takes TYPE, SET NOT NULL or DROP NOT NULL"))
+                return Err(lexdb_base.err("0A000", "lexdb: ALTER COLUMN takes TYPE, SET or DROP NOT NULL, SET or DROP DEFAULT"))
             }
         } else {
             return Err(lexdb_base.err("0A000", "lexdb: ALTER TABLE takes ADD COLUMN, DROP COLUMN, RENAME, and ALTER COLUMN ... SET or DROP NOT NULL"))
@@ -1107,12 +1155,18 @@ fn (p: mut &P) insert(): Result[Stmt, lexdb_base.DbErr] {
         append(mut &s.inner, q)
         return Ok(s)
     }
+    if p.acceptKw("default") {
+        // DEFAULT VALUES: one row, every column its default
+        try p.expectKw("values")
+        append(mut &s.rows, [])
+        return Ok(s)
+    }
     try p.expectKw("values")
     while true {
         try p.expectKw("(")
         var row: []Expr = []
-        append(mut &row, try p.expr())
-        while p.acceptKw(",") { append(mut &row, try p.expr()) }
+        append(mut &row, try p.valueOrDefault())
+        while p.acceptKw(",") { append(mut &row, try p.valueOrDefault()) }
         try p.expectKw(")")
         append(mut &s.rows, row)
         if !p.acceptKw(",") { break }
@@ -1416,7 +1470,7 @@ fn (p: mut &P) update(): Result[Stmt, lexdb_base.DbErr] {
     while true {
         let c = try p.name()
         try p.expectKw("=")
-        let e = try p.expr()
+        let e = try p.valueOrDefault()
         append(mut &s.sets, SetItem{col: c, expr: e})
         if !p.acceptKw(",") { break }
     }
