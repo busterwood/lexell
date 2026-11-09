@@ -17,7 +17,8 @@
 // ERROR of a call (errors(), the first is the Err) and its INFOs
 // (diagnostics()); procedures' return status; procedures called by name
 // (callProc: Arg, arg, outArg, inOutArg, defaultArg); table-valued parameters
-// (queryTables, Table); bulk copy (bulkInsert); transaction[T] by
+// (queryTables, Table); bulk copy (bulkInsert, and bulkStream a batch at a
+// time); transaction[T] by
 // Transaction Manager requests. Types: tinyint, smallint, int, bigint, bit, real,
 // float, decimal, numeric, money, smallmoney, nchar, nvarchar, char and
 // varchar (a UTF-8 collation, code page 1252 or ISO-8859-1; another code
@@ -775,29 +776,87 @@ pub fn bulkOptions(): BulkOptions { return BulkOptions{tablock: false, checkCons
 // identity column named in columns takes the rows' values). Three round
 // trips: the columns' metadata (SELECT TOP 0: a table or column that is not
 // there is the server's error 208 or 207), INSERT BULK, then the rows in one
-// message. Without rows only the first is made, and the result is 0.
+// message, sent a packet at a time as they are encoded. Without rows only
+// the first is made, and the result is 0.
 //
 // Values go as a table parameter's do (Table: each column as the type its
-// values make it, a decimal as wide as all of them), and the server
-// converts them to the column's type as an INSERT does (error 245, 8115,
-// 2628 for a value that does not fit; 206 and 257 for a conversion SQL
-// Server does not make, such as an Int into a date or Text into varbinary).
-// A column of only NULLs needs no type. E_INPUT for a bad table or column
-// name, rows of another length than columns, and a column with values of
-// two kinds (but Int and Dec). An error leaves the connection idle; one
-// while the rows are sent (the task cancelled or past its deadline) breaks
-// it. In a transaction, the load is part of it.
+// values make it), and the server converts them to the column's type as an
+// INSERT does (error 245, 8115, 2628 for a value that does not fit; 206 and
+// 257 for a conversion SQL Server does not make, such as an Int into a date
+// or Text into varbinary). Text and bytes go as (max) only for a (max) or
+// xml column, a decimal as decimal(38, s) (s at least the column's scale),
+// and a column of only NULLs as the column's own kind (tds.bulkWriter).
+// E_INPUT for a bad table or column name, rows of another length than
+// columns, a column with values of two kinds (but Int and Dec), and text
+// of more than 4,000 UTF-16 units (bytes of more than 8,000) for a column
+// that is not (max). An error leaves the connection idle; one while the
+// rows are sent (the task cancelled or past its deadline) breaks it. In a
+// transaction, the load is part of it.
 //
 //     let n = try conn.bulkInsert("dbo.events", &["at", "kind", "payload"], &rows, &sqlserver.bulkOptions())
 pub fn (c: mut &Conn) bulkInsert(table: str, columns: &[str], rows: &[[]Value], opts: &BulkOptions,
                                  w: Where): Result[int, Error] {
+    return c.bulkLoad(table, columns, opts, rows, fn(): Result[[][]Value, Error] { return Ok([]) }, w)
+}
+
+// bulkInsert with the rows a batch at a time from next, sent as they come,
+// so a load of any size needs memory for one batch: next gives the next
+// rows, any number, and no rows when there are no more. It is called first
+// for the first batch, whose values fix each column's type (bulkInsert's;
+// a decimal column goes with the most decimal places of the first batch,
+// or the column's scale when that is more), then again after each batch
+// has been encoded and its whole packets sent. One message, so one load:
+// a later value its column's type cannot carry (E_INPUT naming the row,
+// counted over the load, and the column: another kind, a decimal with more
+// decimal places, text too long for a column that is not (max)) or an
+// error from next ends the message with IGNORE, the server loads none of
+// it, and that error is the result, the connection idle.
+//
+//     var day = 0
+//     let n = try conn.bulkStream("dbo.events", &["at", "kind"], &sqlserver.bulkOptions(), fn(): Result[[][]Value, Error] {
+//         day += 1
+//         if day > 365 { return Ok([]) }
+//         return eventsOf(day)                // [][]Value for one day
+//     })
+pub fn (c: mut &Conn) bulkStream(table: str, columns: &[str], opts: &BulkOptions, next: &fn(): Result[[][]Value, Error],
+                                 w: Where): Result[int, Error] {
+    let first = try next()
+    return c.bulkLoad(table, columns, opts, &first, next, w)
+}
+
+fn (c: mut &Conn) bulkLoad(table: str, columns: &[str], opts: &BulkOptions, first: &[[]Value],
+                           next: &fn(): Result[[][]Value, Error], w: Where): Result[int, Error] {
     let q = try tds.bulkColumnsQuery(table, columns)
     let meta = try c.query(q, &[], w)
-    if len(rows) == 0 { return Ok(0) }
-    let bl = try tds.bulkLoad(table, &meta.cols, rows, opts, &c.s.collation)
-    let accepted = try checked(try c.s.batch(bl.statement, w))
-    let r = try checked(try c.s.bulkData(bl.payload, w))
+    if len(first) == 0 { return Ok(0) }
+    var bw = try tds.bulkWriter(table, &meta.cols, first, opts, &c.s.collation)
+    let accepted = try checked(try c.s.batch(bw.statement, w))
+    while true {
+        try c.s.bulkSend(mut &bw, false, w)
+        let more = match next() {
+            Ok(x) { x }
+            Err(e) { return Err(c.cancelBulk(e, w)) }
+        }
+        if len(more) == 0 { break }
+        match bw.add(&more) {
+            Ok(_) {}
+            Err(e) { return Err(c.cancelBulk(e, w)) }
+        }
+    }
+    bw.end()
+    try c.s.bulkSend(mut &bw, true, w)
+    let r = try checked(try c.s.partReply(w))
     return Ok(r.affected)
+}
+
+// Ends a bulk load's message unloaded (IGNORE) and reads the server's
+// reply; e stays the error.
+fn (c: mut &Conn) cancelBulk(e: Error, w: Where): Error {
+    match c.s.cancelPart(tds.PT_BULK, w) {
+        Ok(_) {}
+        Err(_) {}                         // the session is broken: the next call says so
+    }
+    return e
 }
 
 // ---------------------------------------------------------------- transactions

@@ -582,9 +582,8 @@ while the reply is awaited sends ATTENTION (the request path's abandon);
 one while the rows are being sent breaks the connection (part of the
 message may have gone), as for any request.
 
-- **Not done:** streaming rows into packets as they are produced (the
-  message is built whole, so a load's rows and their encoding are in
-  memory together: load in batches, a call each); ORDER and
+- **Not done:** streaming rows into packets as they are produced (built
+  the same day: section 14); ORDER and
   ROWS_PER_BATCH / KILOBYTES_PER_BATCH hints; columns by default (every
   column of the table without naming them); text, ntext and image
   destinations take Text and Bytes but are not tested beyond the matrix.
@@ -646,3 +645,59 @@ without NUL.
   types, several result sets, a table parameter, bracketed, temporary and
   system procedures, each server error idle, a rolled-back transaction,
   the refusals). Both pass under the C and native backends.
+
+## 14. Streamed bulk copy, as built (2026-11-09)
+
+Branch `sqlproc`, after section 13. `Conn.bulkStream(table, &columns,
+&opts, next): int` loads rows that `next` gives a batch at a time (no rows
+ends the load) in one BULK_LOAD message whose packets go as the rows are
+encoded: after each batch the whole packets are sent and the rest (less
+than one packet) kept; DONE goes after the last batch, with EOM. Memory
+is one batch and one packet, whatever the load's size. `bulkInsert` is the
+same path with one batch; its bytes no longer sit whole in memory either.
+
+- **Types before the rows.** COLMETADATA goes first, so each column's type
+  is fixed by the first batch and the destination, and every later value
+  is checked against it (`tds.bulkWriter`, `BulkWriter.add`, `fits`):
+  - text and bytes go as (max) exactly when the column is (max) or xml,
+    and as nvarchar(4000) and varbinary(8000) otherwise (bulkInsert sent
+    nvarchar(max) for a long value, which the server refused with 4816
+    for a column that is not (max); now it is E_INPUT before anything is
+    sent);
+  - a decimal goes as decimal(38, s), s the first batch's most decimal
+    places and at least a decimal or numeric column's scale (4 for money),
+    so later values fit unless they have more places (E_INPUT) or more
+    integer digits than 38 - s (E_DEC_RANGE); an Int column bound for an
+    exact column goes as decimal too;
+  - a column all NULL in the first batch goes as the destination's own
+    kind: bigint, bit, float, decimal(38, s), varbinary, else nvarchar
+    (it was nvarchar or varbinary only).
+  The conversion matrix (`sqlserver_live_bulk_types`) is unchanged.
+- **Cancelling.** A later value that does not fit, or an error from
+  `next`, ends the message with an empty packet whose status is EOM |
+  IGNORE (0x03; MS-TDS 2.2.3.1.2): the server drops the whole message,
+  loads none of the rows already sent and answers with INFO 3621 ("The
+  statement has been terminated") and a DONE; the connection is idle and
+  a transaction it is in goes on (found live). The IGNORE packet is sent
+  even when no packet of the rows has gone: the server is waiting for the
+  message after INSERT BULK, and a request of another type then is its
+  error 4022 ("Bulk load data was expected but not sent"), found live.
+- **Errors in the rows** that only the server finds (8115 in a later
+  batch) fail the whole load, as before; the connection is idle.
+- **Session API:** `sendPart(ptype, &data, last)` (whole packets, ids
+  continuing from the message's first, RESETCONNECTION on its first when
+  asked; a write failure breaks the session), `cancelPart(ptype)`,
+  `partReply`, and `bulkSend(&writer, last)` over them.
+- **Not done:** TVPs streamed the same way (an RPC parameter's rows); a
+  deadline while `next` runs is the program's (the server waits).
+- **Tests:** `sqlserver_fake_bulk_stream` (packet size 512: a three-batch
+  load's ids, sizes and EOM, its tokens decoded; IGNORE as the last
+  packet after a bad value, after an error from `next`, and as the only
+  packet; the first batch refused or failing before anything is sent; it
+  fails with IGNORE off, with packet ids from 0, and with the cancel
+  skipped when nothing was sent) and `sqlserver_live_bulk_stream` (200,000
+  rows in 200 batches with 50,000-character values; each cancel loading
+  nothing with the connection idle; a decimal's scale from the column; a
+  first batch of NULLs; the server's 8115 in a later batch; a cancelled
+  and a good load in one committed transaction; no rows; a missing
+  column). Both pass under the C and native backends.

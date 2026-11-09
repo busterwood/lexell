@@ -1,0 +1,164 @@
+// sqlserver.bulkStream against a live SQL Server ($MSSQL_TEST_DSN or
+// ~/.obo-mssql-dsn; exits 77, skipped, without one; the string and the
+// server's connect messages are never printed): 200 batches of 1,000 rows
+// in one load, with 50,000-character (max) values among them; a value in a
+// later batch that its column cannot carry (another kind, more decimal
+// places, text too long for a column that is not (max)) and an error from
+// the batch function, each loading none of the rows already sent (IGNORE:
+// the server's 3621) with the connection idle; a decimal column's scale
+// from the destination; a first batch of NULLs and later values of the
+// destination's kind; the server's error in a later batch; a cancelled load
+// and a good one in a transaction, which commits the good one; no rows;
+// a missing column. The tables are temporary.
+// expect: many: loaded 200000 sum 20000100000 longest 50000 price 4905000.0000
+// expect: wrong kind: error 1000: row 14001, column [id]: a text value: the column goes as bigint, from its first rows | rows 0 | idle true | 3621
+// expect: next failed: error 1000: the source broke | rows 0 | idle true
+// expect: scale from the column: loaded 2 | more places: error 1000: row 2, column [d]: 1.23456 has 5 decimal places: the column goes as decimal(38,4), from its first rows
+// expect: float column: error 1000: row 2, column [f]: 1.25 has 2 decimal places: the column goes as decimal(38,1), from its first rows
+// expect: too long: error 1000: row 2, column [n]: text of 4001 UTF-16 units goes as nvarchar(4000): the column is not (max) | rows 0
+// expect: nulls first: loaded 4 | 3 true x'0a0b' 2.50 | idle true
+// expect: server error: error 8115 | rows 0 | idle true
+// expect: in a transaction: cancelled error 1000 | good loaded 3 | committed rows 3 | idle true
+// expect: no rows: loaded 0 | bad column: error 207
+// expect: open handles 0
+import "sqlserver"
+import "sqldialect"
+import "io"
+import "os"
+import "strings"
+
+type V = sqlserver.Value
+type Error = sqlserver.Error
+
+fn dsn(): Option[str] {
+    match os.env("MSSQL_TEST_DSN") {
+        Some(d) { if len(strings.trim(d)) > 0 { return Some(strings.trim(d)) } }
+        None {}
+    }
+    match io.read(os.envOr("HOME", "") + "/.obo-mssql-dsn") {
+        Ok(d) { if len(strings.trim(d)) > 0 { return Some(strings.trim(d)) } }
+        Err(_) {}
+    }
+    return None
+}
+
+// Server errors by number only (their text can name generated temp names); ours in full.
+fn err(e: &Error): str {
+    if e.code == sqldialect.E_INPUT || e.code == sqldialect.E_DEC_RANGE { return "error " + e.code.toStr() + ": " + e.msg }
+    return "error " + e.code.toStr()
+}
+
+fn one(c: mut &sqlserver.Conn, sql: str): str { return c.query(sql, &[]).unwrap().value(0, 0).unwrap().toStr() }
+
+fn batches(c: mut &sqlserver.Conn, table: str, cols: &[str], n: int, bad: int, f: &fn(int, int): []V): str {
+    var k = 0
+    let r = c.bulkStream(table, cols, &sqlserver.bulkOptions(), fn(): Result[[][]V, Error] {
+        k += 1
+        if k > n { return Ok([]) }
+        if k == bad { return Err(sqldialect.inputError("the source broke")) }
+        var rows: [][]V = []
+        for i in 0..1000 { append(mut &rows, f(k, i)) }
+        return Ok(rows)
+    })
+    match r {
+        Ok(x) { return "loaded " + x.toStr() }
+        Err(e) { return err(&e) }
+    }
+}
+
+fn rows(c: mut &sqlserver.Conn, t: str): str { return one(c, "SELECT COUNT(*) FROM " + t) }
+
+fn infos(c: &sqlserver.Conn): str {
+    var out: []str = []
+    for m in c.diagnostics() { append(mut &out, m.number.toStr()) }
+    return strings.join(&out, ",")
+}
+
+fn main() {
+    let d = match dsn() { Some(x) { x } None { exit(77) } }
+    var c = match sqlserver.connect(d) {
+        Ok(x) { x }
+        Err(_) { exit(77) }
+    }
+    run(mut &c)
+    c.close()
+    println("open handles " + intToStr(sqlserver.openHandles()))
+}
+
+// A load of n batches, batch k from f(k).
+fn load(c: mut &sqlserver.Conn, table: str, cols: &[str], n: int, f: &fn(int): [][]V): str {
+    var k = 0
+    let r = c.bulkStream(table, cols, &sqlserver.bulkOptions(), fn(): Result[[][]V, Error] {
+        k += 1
+        if k > n { return Ok([]) }
+        return Ok(f(k))
+    })
+    match r {
+        Ok(x) { return "loaded " + x.toStr() }
+        Err(e) { return err(&e) }
+    }
+}
+
+fn run(c: mut &sqlserver.Conn) {
+    c.exec("CREATE TABLE #m(id int, note nvarchar(max), price decimal(12,4))").unwrap()
+    let many = batches(c, "#m", &["id", "note", "price"], 200, 0, fn(k: int, i: int): []V {
+        let id = (k - 1) * 1000 + i + 1
+        return [V.Int(id), if i == 999 { V.Text(strings.padLeft("", 50000, 'z')) } else { V.Text("row " + id.toStr()) },
+                if i % 2 == 0 { V.Dec(0.05m) } else { V.Int(id % 100) }]
+    })
+    println("many: " + many + " sum " + one(c, "SELECT SUM(CAST(id AS bigint)) FROM #m") + " longest " +
+            one(c, "SELECT MAX(LEN(note)) FROM #m") + " price " + one(c, "SELECT SUM(price) FROM #m"))
+
+    c.exec("CREATE TABLE #s(id int, note nvarchar(100))").unwrap()
+    let wrong = batches(c, "#s", &["id", "note"], 20, 0, fn(k: int, i: int): []V {
+        return [if k == 15 && i == 0 { V.Text("bad") } else { V.Int(k * 1000 + i) }, V.Text("row " + i.toStr())]
+    })
+    let terminated = infos(&c)
+    println("wrong kind: " + wrong + " | rows " + rows(c, "#s") + " | idle " + c.idle().toStr() + " | " + terminated)
+    let broke = batches(c, "#s", &["id", "note"], 20, 5, fn(k: int, i: int): []V { return [V.Int(i), V.Null] })
+    println("next failed: " + broke + " | rows " + rows(c, "#s") + " | idle " + c.idle().toStr())
+
+    c.exec("CREATE TABLE #d(d decimal(10,4), f float, n nvarchar(4000))").unwrap()
+    let scaled = load(c, "#d", &["d"], 2, fn(k: int): [][]V { return if k == 1 { [[V.Dec(1.5m)]] } else { [[V.Dec(1.2345m)]] } })
+    let places = load(c, "#d", &["d"], 2, fn(k: int): [][]V { return if k == 1 { [[V.Dec(1.5m)]] } else { [[V.Dec(1.23456m)]] } })
+    println("scale from the column: " + scaled + " | more places: " + places)
+    println("float column: " + load(c, "#d", &["f"], 2, fn(k: int): [][]V {
+        return if k == 1 { [[V.Dec(1.5m)]] } else { [[V.Dec(1.25m)]] }
+    }))
+    let long = load(c, "#d", &["n"], 2, fn(k: int): [][]V {
+        return if k == 1 { [[V.Text("short")]] } else { [[V.Text(strings.padLeft("", 4001, 'y'))]] }
+    })
+    c.exec("DELETE FROM #d").unwrap()
+    println("too long: " + long + " | rows " + rows(c, "#d"))
+
+    c.exec("CREATE TABLE #n(id int, ok bit, b varbinary(10), p money)").unwrap()
+    let nulls = load(c, "#n", &["id", "ok", "b", "p"], 2, fn(k: int): [][]V {
+        return if k == 1 { [[V.Null, V.Null, V.Null, V.Null], [V.Null, V.Null, V.Null, V.Null]] } else {
+            [[V.Int(3), V.Bool(true), V.Bytes("\x0a\x0b"), V.Dec(2.5m)], [V.Int(4), V.Null, V.Null, V.Int(7)]]
+        }
+    })
+    let got = c.query("SELECT id, ok, b, CAST(p AS decimal(10,2)) FROM #n WHERE id = 3", &[]).unwrap()
+    println("nulls first: " + nulls + " | " + got.value(0, 0).unwrap().toStr() + " " + got.value(0, 1).unwrap().toStr() + " " +
+            got.value(0, 2).unwrap().toStr() + " " + got.value(0, 3).unwrap().toStr() + " | idle " + c.idle().toStr())
+
+    c.exec("CREATE TABLE #o(id int, small tinyint)").unwrap()
+    let over = batches(c, "#o", &["id", "small"], 5, 0, fn(k: int, i: int): []V { return [V.Int(i), V.Int(if k == 3 && i == 7 { 300 } else { 1 })] })
+    println("server error: " + over + " | rows " + rows(c, "#o") + " | idle " + c.idle().toStr())
+
+    c.exec("CREATE TABLE #x(id int)").unwrap()
+    var cancelled = ""
+    var good = ""
+    let tr = c.transaction(fn(t: mut &sqlserver.Conn): Result[Unit, Error] {
+        cancelled = load(t, "#x", &["id"], 3, fn(k: int): [][]V {
+            var b: [][]V = []
+            for i in 0..1000 { append(mut &b, [if k == 3 { V.Text("x") } else { V.Int(i) }]) }
+            return b
+        })
+        good = load(t, "#x", &["id"], 3, fn(k: int): [][]V { return [[V.Int(k)]] })
+        return Ok(Unit{})
+    })
+    println("in a transaction: cancelled " + cancelled[..10] + " | good " + good + " | committed rows " + rows(c, "#x") +
+            " | idle " + c.idle().toStr())
+    println("no rows: " + load(c, "#x", &["id"], 0, fn(k: int): [][]V { return [] }) + " | bad column: " +
+            load(c, "#x", &["nope"], 0, fn(k: int): [][]V { return [] }))
+}

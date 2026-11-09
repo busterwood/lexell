@@ -20,7 +20,9 @@
 //     table-valued ones (tableParam); RPC to a procedure by its name
 //     (procCall).
 //   - bulk load: INSERT BULK, then the rows in a BULK_LOAD message
-//     (bulkColumnsQuery, bulkLoad, Session.bulkData).
+//     (bulkColumnsQuery, bulkWriter, bulkLoad, Session.bulkData), or sent
+//     a packet at a time as they are encoded (Session.bulkSend, sendPart),
+//     and ended unloaded by IGNORE (cancelPart).
 //   - Transaction Manager requests (tmRequest): begin, commit, rollback.
 //   - the reply's tokens (decode): COLMETADATA, ROW, NBCROW, DONE,
 //     DONEPROC, DONEINPROC (every row count kept), ERROR, INFO, LOGINACK,
@@ -78,6 +80,7 @@ pub const PT_LOGIN7 = 16
 pub const PT_PRELOGIN = 18
 
 pub const STATUS_EOM = 1
+pub const STATUS_IGNORE = 2       // with EOM: the server drops the message (MS-TDS 2.2.3.1.2)
 pub const STATUS_RESET = 8        // RESETCONNECTION, on a request's first packet (MS-TDS 2.2.3.1.2)
 pub const HEADER = 8
 pub const MIN_PACKET = 512
@@ -343,6 +346,17 @@ pub fn packetsWith(ptype: int, payload: str, packetSize: int, first: int): []byt
         if last { break }
     }
     return out
+}
+
+// One packet onto out: its type, status, id (modulo 256) and payload.
+fn packetInto(out: mut &[]byte, ptype: int, status: int, id: int, payload: &[byte]) {
+    put8(out, ptype)
+    put8(out, status)
+    put16be(out, len(payload) + HEADER)
+    put16be(out, 0)
+    put8(out, id % 256)
+    put8(out, 0)
+    for x in payload { append(out, x) }
 }
 
 // A packet header.
@@ -1376,18 +1390,47 @@ pub fn bulkColumnsQuery(table: str, names: &[str]): Result[str, Error] {
 
 fn binaryType(t: int): bool { return t == T_BIGVARBIN || t == T_BIGBINARY || t == T_VARBINARY || t == T_BINARY || t == T_IMAGE }
 
+fn intType(t: int): bool { return t == T_INTN || t == T_INT1 || t == T_INT2 || t == T_INT4 || t == T_INT8 }
+fn exactType(t: int): bool { return t == T_DECIMALN || t == T_NUMERICN || t == T_DECIMAL || t == T_NUMERIC }
+fn moneyType(t: int): bool { return t == T_MONEYN || t == T_MONEY || t == T_MONEY4 }
+
+// A bulk load under way: its INSERT BULK statement, each column's type (as
+// it goes in COLMETADATA, fixed before the first row is sent), and the
+// encoded bytes not yet sent (buf: COLMETADATA, then a ROW per row, then
+// DONE).
+pub type BulkWriter = record {
+    pub statement: str
+    cols: []TableCol
+    infos: []str
+    names: []str
+    pub rows: int                   // the rows added so far
+    pub buf: []byte
+}
+
 // The bulk load of rows into table, whose columns dest describes (the
-// COLMETADATA of bulkColumnsQuery's result), in the rows' order. Each
-// column goes as the type its values make it, as a table parameter's
+// COLMETADATA of bulkColumnsQuery's result), in the rows' order, with
+// first the first rows to go (the writer has them added). Each column
+// goes as the type its first rows make it, as a table parameter's
 // (tableParam), and the server converts it to the table's as an INSERT
-// does; one of only NULLs goes as varbinary for a binary column, else
-// nvarchar. Text and bytes for a (max) or xml column go as (max): the
-// server takes no other type there (error 4816). A
-// column's nullability is dest's: the server refuses a load that differs
-// (error 4816). E_INPUT for rows of another length than dest and a column
-// with values of two kinds (but int and decimal).
-pub fn bulkLoad(table: str, dest: &[Column], rows: &[[]sqldialect.Value], opts: &BulkOptions,
-                coll: &Collation): Result[BulkLoad, Error] {
+// does, with these differences so that later rows fit:
+//
+//   - text and bytes go as (max) for a (max) or xml column (the server
+//     takes no other type there, error 4816) and as nvarchar(4000) and
+//     varbinary(8000) otherwise, whatever the values;
+//   - a decimal goes as decimal(38, s), s the most decimal places of the
+//     first rows' values and at least a decimal or numeric column's scale
+//     (4 for money): an Int in such a column goes as a decimal too;
+//   - a column whose first rows are all NULL goes as the column's own
+//     kind: bigint for an integer column, bit, float, decimal(38, s) for
+//     decimal, numeric and money, varbinary for a binary one, else
+//     nvarchar.
+//
+// A column's nullability is dest's: the server refuses a load that differs
+// (error 4816). E_INPUT for rows of another length than dest, a column with
+// values of two kinds (but int and decimal), and a value its column's type
+// cannot carry (BulkWriter.add).
+pub fn bulkWriter(table: str, dest: &[Column], first: &[[]sqldialect.Value], opts: &BulkOptions,
+                  coll: &Collation): Result[BulkWriter, Error] {
     if !validTableName(&table) {
         return Err(sqldialect.inputError("a table's name must be one to three regular identifiers"))
     }
@@ -1396,13 +1439,14 @@ pub fn bulkLoad(table: str, dest: &[Column], rows: &[[]sqldialect.Value], opts: 
         return Err(sqldialect.inputError("a bulk load has 1 to " + MAX_TABLE_COLUMNS.toStr() + " columns, not " + n.toStr()))
     }
     var cols: []TableCol = []
-    for i in 0..n { append(mut &cols, TableCol{kind: ColKind.Unknown, long: false, bulk: false, intDigits: 0, scale: 0}) }
-    for r in 0..len(rows) {
-        if len(rows[r]) != n {
-            return Err(sqldialect.inputError("row " + (r + 1).toStr() + " has " + len(rows[r]).toStr() + " values for " +
-                                             n.toStr() + " columns"))
-        }
-        for i in 0..n { try cols[i].take(&rows[r][i], &("column " + bracketed(&dest[i].name))) }
+    var names: []str = []
+    for i in 0..n {
+        append(mut &cols, TableCol{kind: ColKind.Unknown, long: false, bulk: true, intDigits: 0, scale: 0})
+        append(mut &names, "column " + bracketed(&dest[i].name))
+    }
+    for r in 0..len(first) {
+        try rowLength(&first[r], r, n)
+        for i in 0..n { try cols[i].take(&first[r][i], &names[i]) }
     }
     var b: []byte = []
     put8(mut &b, TK_COLMETADATA)
@@ -1411,21 +1455,32 @@ pub fn bulkLoad(table: str, dest: &[Column], rows: &[[]sqldialect.Value], opts: 
     var decl = newStrBuf()
     decl.add("INSERT BULK " + table + " (")
     for i in 0..n {
-        // a (max) or xml column takes only (max) text and bytes (error 4816)
-        let plp = dest[i].size < 0 || dest[i].tdsType == T_XML
-        if plp { cols[i].long = true }
-        cols[i].bulk = true
-        let nt = if cols[i].kind != ColKind.Unknown { "" } else if binaryType(dest[i].tdsType) {
-            if plp { "varbinary(max)" } else { "varbinary(8000)" }
-        } else if plp { "nvarchar(max)" } else { "nvarchar(4000)" }
-        let info = try cols[i].typeInfo(&nt, coll)
+        let t = dest[i].tdsType
+        cols[i].long = dest[i].size < 0 || t == T_XML
+        if cols[i].kind == ColKind.Unknown {
+            cols[i].kind = if intType(t) { ColKind.Int } else if t == T_BITN || t == T_BIT { ColKind.Bool }
+                else if t == T_FLTN || t == T_FLT4 || t == T_FLT8 { ColKind.Float }
+                else if exactType(t) || moneyType(t) { ColKind.Dec }
+                else if binaryType(t) { ColKind.Bytes } else { ColKind.Text }
+        }
+        if cols[i].kind == ColKind.Int && (exactType(t) || moneyType(t)) { cols[i].kind = ColKind.Dec }
+        if cols[i].kind == ColKind.Dec {
+            let s = max(cols[i].scale, if exactType(t) { dest[i].scale } else if moneyType(t) { 4 } else { 0 })
+            if cols[i].intDigits + s > 38 {
+                return Err(sqldialect.dbError(sqldialect.E_DEC_RANGE, names[i] + " needs " + (cols[i].intDigits + s).toStr() +
+                                              " digits: SQL Server's decimal has 38"))
+            }
+            cols[i].scale = s
+            cols[i].intDigits = 38 - s
+        }
+        let info = try cols[i].typeInfo(&"", coll)
         put32(mut &b, 0)                               // UserType
         put16(mut &b, (dest[i].flags & 1) | 8)          // Flags: dest's fNullable, usUpdateable read/write
         appendStr(mut &b, info)
         putBVarchar(mut &b, &dest[i].name)
         append(mut &infos, info)
         if i > 0 { decl.add(", ") }
-        decl.add(bracketed(&dest[i].name) + " " + cols[i].sqlType(&nt))
+        decl.add(bracketed(&dest[i].name) + " " + cols[i].sqlType(&""))
     }
     decl.add(")")
     var with: []str = []
@@ -1434,15 +1489,109 @@ pub fn bulkLoad(table: str, dest: &[Column], rows: &[[]sqldialect.Value], opts: 
     if opts.fireTriggers { append(mut &with, "FIRE_TRIGGERS") }
     if opts.keepNulls { append(mut &with, "KEEP_NULLS") }
     if len(with) > 0 { decl.add(" WITH (" + strings.join(&with, ", ") + ")") }
-    for r in 0..len(rows) {
-        put8(mut &b, TK_ROW)
-        for i in 0..n { try cols[i].put(mut &b, &rows[r][i], &infos[i]) }
+    var bw = BulkWriter{statement: decl.toStr(), cols: cols, infos: infos, names: names, rows: 0, buf: b}
+    try bw.add(first)
+    return Ok(bw)
+}
+
+fn rowLength(row: &[]sqldialect.Value, r: int, n: int): Result[Unit, Error] {
+    if len(row) != n {
+        return Err(sqldialect.inputError("row " + (r + 1).toStr() + " has " + len(row).toStr() + " values for " +
+                                         n.toStr() + " columns"))
     }
-    put8(mut &b, TK_DONE)
-    put16(mut &b, 0)                                   // Status
-    put16(mut &b, 0)                                   // CurCmd
-    for k in 0..8 { put8(mut &b, 0) }                  // DoneRowCount
-    return Ok(BulkLoad{statement: decl.toStr(), payload: strFromBytes(&b)})
+    return Ok(Unit{})
+}
+
+// Adds rows to the load, encoded onto buf. All or none: E_INPUT (buf as it
+// was) for a row of another length, or a value its column's type cannot
+// carry: another kind of value (an Int fits a decimal column), text of
+// more than 4,000 UTF-16 units or bytes of more than 8,000 for a column
+// that is not (max), a decimal with more decimal places than its column
+// has (E_DEC_RANGE: more integer digits than it has room for). Rows count
+// from 1 over the whole load.
+pub fn (bw: mut &BulkWriter) add(rows: &[[]sqldialect.Value]): Result[Unit, Error] {
+    let n = len(bw.cols)
+    var b: []byte = []
+    for r in 0..len(rows) {
+        try rowLength(&rows[r], bw.rows + r, n)
+        put8(mut &b, TK_ROW)
+        for i in 0..n {
+            match bw.cols[i].fits(&rows[r][i]) {
+                Some(e) { return Err(sqldialect.dbError(e.code, "row " + (bw.rows + r + 1).toStr() + ", " + bw.names[i] + ": " + e.msg)) }
+                None {}
+            }
+            try bw.cols[i].put(mut &b, &rows[r][i], &bw.infos[i])
+        }
+    }
+    for x in b { append(mut &bw.buf, x) }
+    bw.rows += len(rows)
+    return Ok(Unit{})
+}
+
+fn decRange(d: str, scale: int): Option[Error] {
+    return Some(sqldialect.dbError(sqldialect.E_DEC_RANGE, d + " has more integer digits than decimal(38," + scale.toStr() + ") has room for"))
+}
+
+fn misfit(why: str): Option[Error] { return Some(sqldialect.inputError(why)) }
+
+// Why v does not fit the column's type, or None.
+fn (col: &TableCol) fits(v: &sqldialect.Value): Option[Error] {
+    var k = ColKind.Unknown
+    match v {
+        sqldialect.Value.Null { return None }
+        sqldialect.Value.Int(x) {
+            if col.kind == ColKind.Dec && intDigits(x) > col.intDigits { return decRange(x.toStr(), col.scale) }
+            k = ColKind.Int
+        }
+        sqldialect.Value.Float(_) { k = ColKind.Float }
+        sqldialect.Value.Bool(_) { k = ColKind.Bool }
+        sqldialect.Value.Text(t) {
+            let u = utf16Units(&t)
+            if col.kind == ColKind.Text && !col.long && u > 4000 {
+                return misfit("text of " + u.toStr() + " UTF-16 units goes as nvarchar(4000): the column is not (max)")
+            }
+            k = ColKind.Text
+        }
+        sqldialect.Value.Bytes(x) {
+            if col.kind == ColKind.Bytes && !col.long && len(x) > 8000 {
+                return misfit(len(x).toStr() + " bytes go as varbinary(8000): the column is not (max)")
+            }
+            k = ColKind.Bytes
+        }
+        sqldialect.Value.Dec(d) {
+            k = ColKind.Dec
+            if col.kind == ColKind.Dec {
+                let x = match decimalParts(d) {
+                    Ok(p) { p }
+                    Err(e) { return Some(e) }
+                }
+                if x.s > col.scale {
+                    return misfit(d.toStr() + " has " + x.s.toStr() + " decimal places: the column goes as decimal(38," +
+                                col.scale.toStr() + "), from its first rows")
+                }
+                if x.p - x.s > col.intDigits { return decRange(d.toStr(), col.scale) }
+            }
+        }
+    }
+    if k == col.kind || (k == ColKind.Int && col.kind == ColKind.Dec) { return None }
+    return misfit("a " + kindName(k) + " value: the column goes as " + col.sqlType(&"") + ", from its first rows")
+}
+
+// Ends the load's rows: DONE onto buf.
+pub fn (bw: mut &BulkWriter) end() {
+    put8(mut &bw.buf, TK_DONE)
+    put16(mut &bw.buf, 0)                               // Status
+    put16(mut &bw.buf, 0)                               // CurCmd
+    for k in 0..8 { put8(mut &bw.buf, 0) }              // DoneRowCount
+}
+
+// The whole bulk load of rows (bulkWriter with every row, ended): the
+// statement and the BULK_LOAD message.
+pub fn bulkLoad(table: str, dest: &[Column], rows: &[[]sqldialect.Value], opts: &BulkOptions,
+                coll: &Collation): Result[BulkLoad, Error] {
+    var bw = try bulkWriter(table, dest, rows, opts, coll)
+    bw.end()
+    return Ok(BulkLoad{statement: bw.statement, payload: strFromBytes(&bw.buf)})
 }
 
 // ---------------------------------------------------------------- transactions
@@ -2614,7 +2763,12 @@ pub fn (t: mut &Transport) send(ptype: int, payload: str, w: Where): Result[Unit
 // the connection cannot be used after it.
 fn (t: mut &Transport) sendWith(ptype: int, payload: str, first: int, dl: int, w: Where): Result[Unit, Error] {
     let b = packetsWith(ptype, payload, t.packetSize, first)
-    if !t.s.isTls() { return t.s.write(&b, dl, w) }
+    return t.writePackets(&b, dl, w)
+}
+
+// Writes whole packets: under TLS each by itself.
+fn (t: mut &Transport) writePackets(b: &[]byte, dl: int, w: Where): Result[Unit, Error] {
+    if !t.s.isTls() { return t.s.write(b, dl, w) }
     var off = 0
     while off < len(b) {
         let n = (int(b[off + 2]) << 8) | int(b[off + 3])
@@ -2778,6 +2932,7 @@ pub type Session = record {
     pub userInstance: str        // ENVCHANGE 19
     pub resets: int              // ENVCHANGE 18: RESETCONNECTION acknowledged, so many times
     rr: RowReader                // a reply read a row at a time (stream)
+    part: int                    // the packets sent of a message sent in parts (sendPart), 0 when none is
     resetNext: bool              // the next request asks for RESETCONNECTION
     login: Restored              // the login's database, language and collation: a reset returns to them
 }
@@ -2851,7 +3006,7 @@ pub fn open(cfg: &Config, w: Where): Result[Session, Error] {
                     serverVersion: ack.version, preloginVersion: pre.version, database: "", collation: noCollation(),
                     utf8: false, maxReply: MAX_REPLY, broken: false, resetNext: false, txn: noTransaction(), infos: replace(mut &r.infos, []),
                     errors: [], language: "", charset: "", sortLocale: "", sortFlags: "", mirrorPartner: "",
-                    userInstance: "", resets: 0, rr: noReader(),
+                    userInstance: "", resets: 0, rr: noReader(), part: 0,
                     login: Restored{database: "", language: "", collation: noCollation()}}
     for f in r.features {
         if f.id == FEATURE_UTF8 && len(f.data) >= 1 && f.data[0] != 0 { s.utf8 = true }
@@ -2989,6 +3144,19 @@ pub fn (s: mut &Session) bulkData(payload: str, w: Where): Result[Reply, Error] 
     return s.request(PT_BULK, payload, w)
 }
 
+// Sends what the bulk load has encoded and not sent (sendPart): its whole
+// packets, or with last (after end) all of it. The bulk load's INSERT BULK
+// must have been accepted just before.
+pub fn (s: mut &Session) bulkSend(bw: mut &BulkWriter, last: bool, w: Where): Result[Unit, Error] {
+    let n = try s.sendPart(PT_BULK, &bw.buf, last, w)
+    if n > 0 {
+        var rest: []byte = []
+        for i in n..len(bw.buf) { append(mut &rest, bw.buf[i]) }
+        bw.buf = rest
+    }
+    return Ok(Unit{})
+}
+
 // Sends a Transaction Manager request: TM_BEGIN_XACT, TM_COMMIT_XACT or
 // TM_ROLLBACK_XACT, for the current transaction.
 pub fn (s: mut &Session) transact(kind: int, w: Where): Result[Reply, Error] {
@@ -3028,6 +3196,70 @@ fn (s: mut &Session) sendRequest(ptype: int, payload: str, w: Where): Result[Uni
 fn (s: mut &Session) request(ptype: int, payload: str, w: Where): Result[Reply, Error] {
     try s.settle(w)
     try s.sendRequest(ptype, payload, w)
+    return s.reply(w)
+}
+
+// Sends part of a message of type ptype (a bulk load's rows as they are
+// encoded): the whole packets in data now, keeping at least one byte back,
+// or with last all of it, the final packet with EOM. The first packet of a
+// message asks for RESETCONNECTION when it was asked for. Returns how many
+// bytes of data went (data[..n]); read the reply with partReply. A failure
+// breaks the session: part of a packet may have gone.
+pub fn (s: mut &Session) sendPart(ptype: int, data: &[]byte, last: bool, w: Where): Result[int, Error] {
+    if s.broken { return Err(ioErr("the connection is broken by an earlier error")) }
+    if s.part == 0 { try s.settle(w) }
+    let room = s.t.packetSize - HEADER
+    var out: []byte = []
+    var off = 0
+    while len(data) - off > room || (last && (off < len(data) || (off == 0 && s.part == 0))) {
+        let n = min(len(data) - off, room)
+        let eom = last && off + n == len(data)
+        s.part += 1
+        let status = (if eom { STATUS_EOM } else { 0 }) | (if s.part == 1 && s.resetNext { STATUS_RESET } else { 0 })
+        packetInto(mut &out, ptype, status, s.part, &data[off..off + n])
+        off += n
+        if eom { break }
+    }
+    if len(out) > 0 {
+        match s.t.writePackets(&out, -1, w) {
+            Ok(_) {}
+            Err(e) {
+                s.broken = true
+                s.part = 0
+                return Err(e)
+            }
+        }
+        s.resetNext = false
+    }
+    if last { s.part = 0 }
+    return Ok(off)
+}
+
+// Ends a message of type ptype that sendPart has begun, or that the server
+// awaits (a bulk load's rows after INSERT BULK) with none of it sent yet,
+// without the server acting on it: an empty last packet with IGNORE, then
+// the server's reply read (SQL Server's: INFO 3621, "The statement has
+// been terminated").
+pub fn (s: mut &Session) cancelPart(ptype: int, w: Where): Result[Reply, Error] {
+    if s.broken { return Err(ioErr("the connection is broken by an earlier error")) }
+    var out: []byte = []
+    packetInto(mut &out, ptype, STATUS_EOM | STATUS_IGNORE, s.part + 1, &[])
+    s.part = 0
+    match s.t.writePackets(&out, -1, w) {
+        Ok(_) {}
+        Err(e) {
+            s.broken = true
+            return Err(e)
+        }
+    }
+    return s.reply(w)
+}
+
+// The reply to a message sent in parts.
+pub fn (s: mut &Session) partReply(w: Where): Result[Reply, Error] { return s.reply(w) }
+
+// Reads and decodes the reply to the request just sent.
+fn (s: mut &Session) reply(w: Where): Result[Reply, Error] {
     let got = match s.t.receive(s.maxReply, w) {
         Ok(x) { x }
         Err(e) { return Err(s.abandon(e, w)) }

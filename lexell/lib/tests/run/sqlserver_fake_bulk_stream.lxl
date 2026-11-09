@@ -1,0 +1,427 @@
+// sqlserver.bulkStream against a scripted fake server on 127.0.0.1 (a task
+// of this program), packet by packet (packet size 512): a load of three
+// batches is one BULK_LOAD message of many packets, ids 1, 2, 3, ... (modulo
+// 256), every one full but the last, only the last with EOM, its tokens
+// (COLMETADATA, every row of every batch, DONE) decoded by the client's own
+// decoder; the column types fixed by the first batch (an all-NULL column
+// as its destination's kind); a value in a later batch that its column
+// cannot carry, and an error from the batch function, each ending the
+// message with an empty packet of status EOM | IGNORE after the packets
+// already sent (or as its only packet, when none has gone), the server's 3621 INFO then the connection idle; an error
+// in the first batch, before anything is sent.
+// expect: loaded 2500 | idle true
+// expect: wrong kind: error 1000: row 2001, column [id]: a text value: the column goes as bigint, from its first rows | idle true
+// expect: next failed: error 1000: no more data | idle true | diagnostics 3621
+// expect: before a packet: error 1000: row 2, column [id]: a text value: the column goes as bigint, from its first rows | idle true
+// expect: first batch: error 1000: row 2 has 2 values for 1 columns | idle true
+// expect: first batch fails: error 1000: no data | idle true
+// expect: after: 9
+// expect: server: SELECT TOP 0 [id], [note] FROM #s | INSERT BULK #s ([id] bigint, [note] nvarchar(4000)) | bulk: PACKETS ids in order true, full but the last true, EOM only on the last true, IGNORE false | columns id INTN null, note NVARCHAR null | rows 2500, first 0 'n0', last 2499 NULL | done true | SELECT TOP 0 [id] FROM #t | INSERT BULK #t ([id] bigint) | ignored: PACKETS, the last empty with EOM and IGNORE: true | SELECT TOP 0 [id] FROM #t | INSERT BULK #t ([id] bigint) | ignored: PACKETS, the last empty with EOM and IGNORE: true | SELECT TOP 0 [id] FROM #t | INSERT BULK #t ([id] bigint) | ignored: 1 packets, the last empty with EOM and IGNORE: true | SELECT TOP 0 [id] FROM #t | UPDATE x
+// expect: open handles: 0
+import "sqlserver"
+import "tds"
+import "net"
+import "task"
+import "strings"
+import "sqldialect"
+import "../support/tdstest" as tt
+
+type V = sqlserver.Value
+type Error = sqlserver.Error
+
+var ADDR: str = ""
+
+type Wire = record { c: net.Conn; pending: str; rest: str }
+
+fn (x: mut &Wire) fill(n: int): bool {
+    var tmp = array(4096, byte(0))
+    while len(x.pending) < n {
+        match x.c.read(mut &tmp) {
+            Ok(k) {
+                if k == 0 { return false }
+                x.pending = x.pending + strFromBytes(&tmp[0..k])
+            }
+            Err(_) { return false }
+        }
+    }
+    return true
+}
+
+// A message, and the status of its first packet.
+type Msg = value record { ptype: int; status: int; data: str; statuses: []int; ids: []int; lens: []int }
+
+fn (x: mut &Wire) message(): Option[Msg] {
+    var data = ""
+    var ptype = -1
+    var status = -1
+    var statuses: []int = []
+    var ids: []int = []
+    var lens: []int = []
+    while true {
+        if !x.fill(8) { return None }
+        let n = (int(x.pending[2]) << 8) | int(x.pending[3])
+        if n < 8 || !x.fill(n) { return None }
+        ptype = int(x.pending[0])
+        if status < 0 { status = int(x.pending[1]) }
+        append(mut &statuses, int(x.pending[1]))
+        append(mut &ids, int(x.pending[6]))
+        append(mut &lens, n)
+        let eom = (int(x.pending[1]) & 1) != 0
+        data = data + x.pending[8..n]
+        x.pending = x.pending[n..]
+        if eom { break }
+    }
+    return Some(Msg{ptype: ptype, status: status, data: data, statuses: statuses, ids: ids, lens: lens})
+}
+
+// The request's text (a batch: after ALL_HEADERS, UTF-16).
+fn sqlOf(m: &Msg): str {
+    if m.ptype != tds.PT_SQLBATCH || len(m.data) < 4 { return "type " + m.ptype.toStr() }
+    let skip = int(m.data[0]) | (int(m.data[1]) << 8) | (int(m.data[2]) << 16)
+    return tds.fromUtf16(m.data[skip..]).unwrap()
+}
+
+fn (x: &Wire) send(payload: str) { let r = x.c.write(&tds.packets(tds.PT_REPLY, payload, 512)) }
+
+// The first k packets of a reply (none with EOM); the rest is kept for
+// attention: a server stops between tokens, so it ends the message it is
+// sending before it acknowledges, as SQL Server does when the reply is
+// already on its way.
+fn (x: mut &Wire) sendPart(payload: str, k: int) {
+    let b = tds.packets(tds.PT_REPLY, payload, 512)
+    var end = 0
+    for i in 0..k { end += (int(b[end + 2]) << 8) | int(b[end + 3]) }
+    let r = x.c.write(&b[0..end])
+    x.rest = strFromBytes(&b[end..])
+}
+
+// The rest of an interrupted reply, then the acknowledgement in a message
+// of its own.
+fn (x: mut &Wire) acknowledge() {
+    if len(x.rest) > 0 {
+        let r = x.c.writeStr(x.rest)
+        x.rest = ""
+    }
+    x.send(acknowledged())
+}
+
+fn done(status: int, count: int): str {
+    var b = tt.bytesOf()
+    b.done(tds.TK_DONE, status, 0xC1, count)
+    return b.str()
+}
+
+fn acknowledged(): str { return done(0x20, 0) }
+
+// Accepts a connection and logs it in (packet size 512).
+fn session(ln: &net.Listener): Option[Wire] {
+    let a = ln.accept()
+    if a.isErr() { return None }
+    var w = Wire{c: a.unwrap(), pending: "", rest: ""}
+    if w.message().isNone() { return None }
+    var p = tt.bytesOf()
+    for v in [0, 0, 11, 0, 6, 1, 0, 17, 0, 1, 0xff] { p.u8(v) }
+    for v in [17, 0, 0x13, 0xab, 0, 0] { p.u8(v) }
+    p.u8(tds.ENCRYPT_NOT_SUP)
+    w.send(p.str())
+    if w.message().isNone() { return None }
+    var l = tt.bytesOf()
+    l.loginAck()
+    l.envText(1, "app", "master")
+    l.envText(4, "512", "4096")
+    l.raw(done(0, 0))
+    w.send(l.str())
+    return Some(w)
+}
+
+// The next message is an ATTENTION: acknowledged, and logged as what.
+fn attention(w: mut &Wire, log: mut &[]str, what: str) {
+    match w.message() {
+        Some(m) {
+            if m.ptype == tds.PT_ATTENTION {
+                append(log, "attention " + what)
+                w.acknowledge()
+            } else {
+                append(log, "no attention " + what + ": " + sqlOf(&m))
+            }
+        }
+        None { append(log, "closed instead of attention " + what) }
+    }
+}
+
+fn expect(w: mut &Wire, log: mut &[]str, sql: str): bool {
+    match w.message() {
+        Some(m) {
+            if sqlOf(&m) == sql { return true }
+            append(log, "unexpected " + sqlOf(&m))
+        }
+        None { append(log, "closed before " + sql) }
+    }
+    return false
+}
+
+fn connStr(): str { return "Server=tcp:" + strings.replaceAll(ADDR, ":", ",") + ";UID=u;PWD=p;Database=app;Encrypt=no" }
+
+fn code[T](r: &Result[T, Error]): str {
+    match r {
+        Ok(_) { return "ok" }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+// The destination's columns: id int NOT NULL, name nvarchar(50) NULL, note nvarchar(max) NULL.
+fn columnsReply(): str {
+    var b = tt.bytesOf()
+    b.u8(tds.TK_COLMETADATA)
+    b.u16(3)
+    b.u32(0)
+    b.u16(0)                  // flags: NOT NULL
+    b.u8(tds.T_INTN)
+    b.u8(4)
+    b.name("id")
+    b.col("name", tds.T_NVARCHAR)
+    b.u16(100)
+    b.collation(0x0409, 1, 52)
+    b.name("name")
+    b.col("note", tds.T_NVARCHAR)
+    b.u16(0xFFFF)
+    b.collation(0x0409, 1, 52)
+    b.name("note")
+    b.raw(done(0x10, 0))
+    return b.str()
+}
+
+// One column, id int NULL.
+fn oneColumn(): str {
+    var b = tt.bytesOf()
+    b.u8(tds.TK_COLMETADATA)
+    b.u16(1)
+    b.col("id", tds.T_INTN)
+    b.u8(4)
+    b.name("id")
+    b.raw(done(0x10, 0))
+    return b.str()
+}
+
+fn typeName(t: int): str {
+    if t == tds.T_INTN { return "INTN" }
+    if t == tds.T_NVARCHAR { return "NVARCHAR" }
+    return t.toStr()
+}
+
+// What the BULK_LOAD message holds, decoded as a token stream.
+fn bulkText(m: &Msg): str {
+    var out = "bulk type " + m.ptype.toStr()
+    let r = match tds.decode(m.data, 1000) {
+        Ok(x) { x }
+        Err(e) { return out + ": undecodable " + e.msg }
+    }
+    let rs = &r.results[0]
+    var cols: []str = []
+    for c in rs.columns {
+        append(mut &cols, c.name + " " + typeName(c.tdsType) + (if (c.flags & 1) != 0 { " null" } else { " not null" }))
+    }
+    var rows: []str = []
+    for row in rs.rows {
+        var cells: []str = []
+        for i in 0..len(row) {
+            match tds.cellText(&rs.columns[i], &row[i]) {
+                Some(t) { append(mut &cells, if rs.columns[i].tdsType == tds.T_INTN { t } else { "'" + t + "'" }) }
+                None { append(mut &cells, "NULL") }
+            }
+        }
+        append(mut &rows, strings.join(&cells, " "))
+    }
+    let unknown = strings.contains(&m.data, &"\xfe\xff\xff\xff\xff\xff\xff\xff")
+    let ends = len(m.data) >= 13 && int(m.data[len(m.data) - 13]) == tds.TK_DONE
+    return out + ": columns " + strings.join(&cols, ", ") + " | rows " + strings.join(&rows, " / ") + " | unknown length " +
+           unknown.toStr() + " | done " + ends.toStr()
+}
+
+fn next(w: mut &Wire, log: mut &[]str): Option[Msg] {
+    match w.message() {
+        Some(m) {
+            append(log, if m.ptype == tds.PT_SQLBATCH { sqlOf(&m) } else { "bulk type " + m.ptype.toStr() })
+            return Some(m)
+        }
+        None {
+            append(log, "closed")
+            return None
+        }
+    }
+}
+
+
+// The BULK_LOAD message's packets: ids from 1 in order (modulo 256), all
+// full (512) but the last, EOM only on the last, and none with IGNORE.
+fn framing(m: &Msg): str {
+    var inOrder = true
+    var full = true
+    var eom = true
+    var ignore = false
+    let n = len(m.ids)
+    for i in 0..n {
+        if m.ids[i] != (i + 1) % 256 { inOrder = false }
+        if i < n - 1 && m.lens[i] != 512 { full = false }
+        if ((m.statuses[i] & 1) != 0) != (i == n - 1) { eom = false }
+        if (m.statuses[i] & 2) != 0 { ignore = true }
+    }
+    return (if n > 10 { "PACKETS" } else { n.toStr() + " packets" }) + " ids in order " + inOrder.toStr() + ", full but the last " +
+           full.toStr() + ", EOM only on the last " + eom.toStr() + ", IGNORE " + ignore.toStr()
+}
+
+fn streamed(m: &Msg): str {
+    let r = match tds.decode(m.data, 100000) {
+        Ok(x) { x }
+        Err(e) { return "undecodable " + e.msg }
+    }
+    let rs = &r.results[0]
+    var cols: []str = []
+    for c in rs.columns {
+        append(mut &cols, c.name + " " + typeName(c.tdsType) + (if (c.flags & 1) != 0 { " null" } else { " not null" }))
+    }
+    let k = len(rs.rows) - 1
+    let cell = fn(row: int, i: int): str {
+        match tds.cellText(&rs.columns[i], &rs.rows[row][i]) {
+            Some(t) { return if i == 0 { t } else { "'" + t + "'" } }
+            None { return "NULL" }
+        }
+    }
+    let ends = len(m.data) >= 13 && int(m.data[len(m.data) - 13]) == tds.TK_DONE
+    return "columns " + strings.join(&cols, ", ") + " | rows " + len(rs.rows).toStr() + ", first " + cell(0, 0) + " " + cell(0, 1) +
+           ", last " + cell(k, 0) + " " + cell(k, 1) + " | done " + ends.toStr()
+}
+
+// A message cancelled by IGNORE: some packets, then an empty one with EOM and IGNORE.
+fn ignored(m: &Msg): str {
+    let n = len(m.ids)
+    let last = n >= 1 && m.lens[n - 1] == 8 && m.statuses[n - 1] == 3 && m.ids[n - 1] == n % 256
+    return "ignored: " + (if n > 10 { "PACKETS" } else { n.toStr() + " packets" }) + ", the last empty with EOM and IGNORE: " + last.toStr()
+}
+
+fn terminated(): str {
+    var b = tt.bytesOf()
+    b.message(tds.TK_INFO, 3621, 0, 0, "The statement has been terminated.", 1)
+    b.raw(done(0x20, 0))
+    return b.str()
+}
+
+// The destination's columns: id int NULL, note nvarchar(50) NULL.
+fn twoColumns(): str {
+    var b = tt.bytesOf()
+    b.u8(tds.TK_COLMETADATA)
+    b.u16(2)
+    b.col("id", tds.T_INTN)
+    b.u8(4)
+    b.name("id")
+    b.col("note", tds.T_NVARCHAR)
+    b.u16(100)
+    b.collation(0x0409, 1, 52)
+    b.name("note")
+    b.raw(done(0x10, 0))
+    return b.str()
+}
+
+fn serve(ln: net.Listener): str {
+    var log: []str = []
+    var w = match session(&ln) {
+        Some(x) { x }
+        None { return "no session" }
+    }
+    // three batches, one message
+    if next(mut &w, mut &log).isNone() { return strings.join(&log, " | ") }
+    w.send(twoColumns())
+    if next(mut &w, mut &log).isNone() { return strings.join(&log, " | ") }
+    w.send(done(0, 0))
+    match w.message() {
+        Some(m) {
+            append(mut &log, "bulk: " + framing(&m) + " | " + streamed(&m))
+            w.send(done(0x10, 2500))
+        }
+        None { append(mut &log, "closed") }
+    }
+    // a later batch's value does not fit; then the batch function fails; then
+    // a value does not fit before a packet has gone
+    for k in 0..3 {
+        if next(mut &w, mut &log).isNone() { return strings.join(&log, " | ") }
+        w.send(oneColumn())
+        if next(mut &w, mut &log).isNone() { return strings.join(&log, " | ") }
+        w.send(done(0, 0))
+        match w.message() {
+            Some(m) {
+                append(mut &log, ignored(&m))
+                w.send(terminated())
+            }
+            None { append(mut &log, "closed") }
+        }
+    }
+    // the first batch is refused after the columns are known
+    if next(mut &w, mut &log).isNone() { return strings.join(&log, " | ") }
+    w.send(oneColumn())
+    // the first batch fails: nothing is sent
+    if next(mut &w, mut &log).isNone() { return strings.join(&log, " | ") }
+    w.send(done(0x10, 9))
+    return strings.join(&log, " | ")
+}
+
+fn client() {
+    var c = sqlserver.connect(connStr()).unwrap()
+    let none = sqlserver.bulkOptions()
+    var k = 0
+    let n = c.bulkStream("#s", &["id", "note"], &none, fn(): Result[[][]V, Error] {
+        k += 1
+        if k > 3 { return Ok([]) }
+        var rows: [][]V = []
+        let size = if k == 2 { 1500 } else { 500 }
+        let base = if k == 1 { 0 } else if k == 2 { 500 } else { 2000 }
+        for i in 0..size {
+            // the first batch has no notes after its first row: the column goes as the destination's nvarchar
+            append(mut &rows, [V.Int(base + i), if k == 1 && i > 0 { V.Null } else if k == 3 && i == size - 1 { V.Null } else { V.Text("n" + (base + i).toStr()) }])
+        }
+        return Ok(rows)
+    })
+    println("loaded " + n.unwrap().toStr() + " | idle " + c.idle().toStr())
+    k = 0
+    let bad = c.bulkStream("#t", &["id"], &none, fn(): Result[[][]V, Error] {
+        k += 1
+        var rows: [][]V = []
+        for i in 0..1000 { append(mut &rows, [V.Int(i)]) }
+        if k == 3 { rows[0] = [V.Text("x")] }
+        return Ok(rows)
+    })
+    println("wrong kind: " + bad.unwrapErr().toStr() + " | idle " + c.idle().toStr())
+    k = 0
+    let failed = c.bulkStream("#t", &["id"], &none, fn(): Result[[][]V, Error] {
+        k += 1
+        if k == 4 { return Err(sqldialect.inputError("no more data")) }
+        var rows: [][]V = []
+        for i in 0..1000 { append(mut &rows, [V.Int(i)]) }
+        return Ok(rows)
+    })
+    var diag: []str = []
+    for m in c.diagnostics() { append(mut &diag, m.number.toStr()) }
+    println("next failed: " + failed.unwrapErr().toStr() + " | idle " + c.idle().toStr() + " | diagnostics " + strings.join(&diag, ","))
+    k = 0
+    let early = c.bulkStream("#t", &["id"], &none, fn(): Result[[][]V, Error] {
+        k += 1
+        return Ok([[if k == 1 { V.Int(1) } else { V.Text("x") }]])
+    })
+    println("before a packet: " + early.unwrapErr().toStr() + " | idle " + c.idle().toStr())
+    let first = c.bulkStream("#t", &["id"], &none, fn(): Result[[][]V, Error] { return Ok([[V.Int(1)], [V.Int(2), V.Int(3)]]) })
+    println("first batch: " + first.unwrapErr().toStr() + " | idle " + c.idle().toStr())
+    let fails = c.bulkStream("#t", &["id"], &none, fn(): Result[[][]V, Error] { return Err(sqldialect.inputError("no data")) })
+    println("first batch fails: " + fails.unwrapErr().toStr() + " | idle " + c.idle().toStr())
+    println("after: " + c.run("UPDATE x", &[]).unwrap().toStr())
+}
+
+fn main() {
+    let log = task.scoped(fn(sc: mut &task.Scope): str {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        ADDR = ln.localAddr()
+        let srv = sc.start(serve, ln)
+        client()
+        return srv.wait().unwrap()
+    })
+    println("server: " + log)
+    println("open handles: " + sqlserver.openHandles().toStr())
+}
