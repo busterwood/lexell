@@ -392,7 +392,7 @@ Built on 2026-11-09 on branch `lexdb`, about 6,300 lines in
 (cache, trees, transactions, log, checkpoints, recovery, snapshots),
 `lexdb_sql` (lexer, parser), `lexdb_exec` (catalog, rows, keys, planner,
 statements, sessions), `lexdb_wire` (protocol 3.0) and `lexdb` (the
-server). Tests: `python3 lexell/tests/lexdb.py` (18 programs in
+server). Tests: `python3 lexell/tests/lexdb.py` (19 programs in
 `tests/lexdb/run`, under `LXL_CHECK=1`).
 
     lexell/compiler/out/lxlc lexell/cmd/lexdb.lxl -o lexdb
@@ -426,7 +426,7 @@ server). Tests: `python3 lexell/tests/lexdb.py` (18 programs in
   statement waits, after it runs, until what it read is durable, since its
   result goes out before COMMIT (4.4).
 - **Interpreted, not bytecode.** The executor walks the statement's tree.
-- **No subqueries, CTEs, schemas, bytea, dates or times yet.**
+- **No CTEs, subqueries in FROM, schemas, bytea, dates or times yet.**
 - **Trust login**: no password, no TLS. The server listens on loopback by
   default.
 - **A simple query with several statements** runs each in its own
@@ -505,10 +505,14 @@ is the comparison to make.
 
 ### 9.4 Next
 
-1. Subqueries and CTEs (the user needs them soon): uncorrelated
-   `IN (SELECT ...)` and scalar subqueries; correlated `EXISTS` and
-   `NOT EXISTS` as semi-joins and anti-joins in the join levels; `WITH`
-   as named subqueries, then `WITH RECURSIVE`.
+1. The rest of subqueries and CTEs (9.8 has the first part): a hashed
+   semi-join and anti-join for a correlated `EXISTS`, `NOT EXISTS` or
+   `IN` that has no index to look up (the subquery read once, keyed by its
+   correlating equalities, then probed per row); `WITH` as named
+   subqueries, and subqueries in FROM; then `WITH RECURSIVE`. Smaller: a
+   correlated subquery's value as a lookup's key (now it is only a filter),
+   a small uncorrelated IN set as an IN-list lookup, and correlated
+   subqueries in GROUP BY and in aggregates' arguments.
 2. The cache budget in bytes, not nodes (measured in 9.3: decoded nodes
    take 1.8 to 3.3 times their page, so the default of 100,000 nodes could
    reach 0.7 to 1.5 GB), a smaller decoded node, and why a restarted server
@@ -643,4 +647,51 @@ is the comparison to make.
   NOT IN with NOT of it, LIKE with substr and CASE buckets with FILTER
   counts. Unsorted IN keys (6 differ), a LIKE bound past its prefix (5) and
   an IN path taken for a full scan (11, a bug the test found) fail it.
+
+### 9.8 Subqueries
+
+- Scalar `(SELECT ...)`, `EXISTS (SELECT ...)` and `x IN (SELECT ...)`,
+  with `NOT`, anywhere an expression goes: WHERE, ON, the select list,
+  ORDER BY, HAVING, UPDATE's SET and WHERE, DELETE's WHERE, INSERT's
+  VALUES. A scalar subquery with more than one row is error 21000; one
+  with no rows is NULL. IN follows SQL's NULLs: no match and a NULL in the
+  subquery's values is NULL, so `NOT IN` over a NULL keeps no row.
+- The parser gives a statement its subqueries, numbered; an expression
+  names one (`#sub`, `#exists`, `#in`). Each is planned inside the query
+  it is in. A name not among a query's own tables is looked up in the
+  queries around it, nearest first, and becomes a parameter numbered after
+  the statement's own; the query it is in supplies its value, and a query
+  in between passes it down (correlation two levels out works).
+- A subquery with no outer names runs once per execution, before the
+  query: its value is then a constant to the planner, so
+  `id = (SELECT max(id) ...)` is a primary key lookup. IN's values become
+  a hash set, probed per row. A correlated subquery runs for each row that
+  needs it, with the outer values as parameters, so an index on its
+  correlating column is used; its results are kept per outer value (up to
+  10,000), and EXISTS stops at its first row. Its conjuncts are checked
+  after the others; in the select list or ORDER BY it is evaluated after
+  the scan, from the rows kept.
+- Hash tables and subquery results moved from the plan to the run, so a
+  plan does not change while it runs and a subquery's plan can run inside
+  its parent's.
+- Numeric keys drop trailing zeros, so a whole number has one key whether
+  it came as an integer or a numeric (the IN set needs it).
+- EXPLAIN shows each subquery, run once or per row and on which outer
+  columns, with its plan; EXPLAIN ANALYZE adds its runs, how many came
+  from the cache, and its tables' counts summed over the runs.
+- Not yet: CTEs, subqueries in FROM, `ANY`/`ALL`, correlated subqueries
+  in GROUP BY or in an aggregate's arguments (0A000), the hashed
+  semi-join (9.4).
+- Tests: `exec_sub` (62 statements, checked by hand); `exec_index_diff`
+  compares IN with a correlated EXISTS and with the list of its values,
+  NOT EXISTS with a LEFT JOIN's unmatched rows, a correlated count with a
+  grouped LEFT JOIN and a scalar with its value, and UPDATE uses
+  subqueries, with no differences over four seeds. Mutations: a cache
+  that ignores the outer values (63 differ, 20 lines of `exec_sub`),
+  NOT IN ignoring a NULL (5, 2), no trailing-zero rule (2 lines), a
+  correlated subquery taken as a lookup's key (2 lines), an ambiguous name
+  in a subquery taken from outside (2 lines, after adding that case).
+- pgbench point selects before and after, alternating, four runs each:
+  24,681 and 24,016 tps on average, within the runs' spread (22,800 to
+  26,500). The binary is 1.08 MB.
 

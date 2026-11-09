@@ -123,12 +123,19 @@ pub type Stmt = record {
     pub inner: []Stmt           // EXPLAIN: the statement explained
     pub distinct: bool          // SELECT DISTINCT
     pub having: Option[Expr]
+    pub subs: []Stmt            // its subqueries: an expression names one by number (#sub, #exists, #in)
+    pub use: int                // a subquery: what it is used as (SUB_SCALAR, SUB_EXISTS, SUB_IN)
 }
+
+// What a subquery is used as.
+pub const SUB_SCALAR = 1
+pub const SUB_EXISTS = 2
+pub const SUB_IN = 3
 
 fn newStmt(kind: int): Stmt {
     return Stmt{kind: kind, table: "", ifFlag: false, cols: [], pk: [], names: [], rows: [], items: [], where: None,
                 group: [], order: [], limit: None, offset: None, sets: [], params: 0, from: [], index: "",
-                unique: false, inner: [], distinct: false, having: None}
+                unique: false, inner: [], distinct: false, having: None, subs: [], use: 0}
 }
 
 // ---- the lexer
@@ -253,6 +260,7 @@ type P = record {
     toks: []Tok
     pos: int
     params: int
+    subs: []Stmt        // the subqueries of the statement being parsed
 }
 
 fn (p: &P) peek(): Tok { return p.toks[p.pos] }
@@ -418,7 +426,8 @@ fn (p: mut &P) cmpExpr(): Result[Expr, lexdb_base.DbErr] {
     if p.acceptKw("in") {
         try p.expectKw("(")
         if p.isKw("select") || p.isKw("with") {
-            return Err(lexdb_base.err("0A000", "IN (SELECT ...) subqueries are not supported yet"))
+            let i = try p.subquery(SUB_IN)
+            return Ok(negate(neg, Expr.Call("#in", [Expr.Lit(Val.Int(i)), e], false)))
         }
         var args: []Expr = [e]
         append(mut &args, try p.expr())
@@ -542,9 +551,29 @@ fn (p: mut &P) caseExpr(): Result[Expr, lexdb_base.DbErr] {
     return Ok(Expr.Call(name, args, false))
 }
 
+// A subquery, after its "(": its own subqueries go with it, and the
+// statement it is in gets it, numbered.
+fn (p: mut &P) subquery(use: int): Result[int, lexdb_base.DbErr] {
+    if p.isKw("with") { return Err(lexdb_base.err("0A000", "WITH is not supported yet")) }
+    try p.expectKw("select")
+    let saved = replace(mut &p.subs, [])
+    var sq = try p.select()
+    sq.subs = replace(mut &p.subs, saved)
+    sq.use = use
+    try p.expectKw(")")
+    append(mut &p.subs, sq)
+    return Ok(len(p.subs) - 1)
+}
+
+fn subRef(name: str, i: int): Expr { return Expr.Call(name, [Expr.Lit(Val.Int(i))], false) }
+
 fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
     let t = p.next()
     if t.kind == T_IDENT && t.text == "case" { return p.caseExpr() }
+    if t.kind == T_IDENT && t.text == "exists" && p.isKw("(") {
+        p.pos += 1
+        return Ok(subRef("#exists", try p.subquery(SUB_EXISTS)))
+    }
     if t.kind == T_NUM {
         if !strings.contains(&t.text, ".") && !strings.contains(&t.text, "e") && !strings.contains(&t.text, "E") {
             match strings.parseIntOpt(t.text) {
@@ -565,6 +594,7 @@ fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
         return Ok(Expr.Param(n))
     }
     if t.kind == T_OP && t.text == "(" {
+        if p.isKw("select") || p.isKw("with") { return Ok(subRef("#sub", try p.subquery(SUB_SCALAR))) }
         let e = try p.expr()
         try p.expectKw(")")
         return Ok(e)
@@ -867,7 +897,9 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
         "explain" {
             var s = newStmt(S_EXPLAIN)
             s.ifFlag = p.acceptKw("analyze")        // EXPLAIN ANALYZE: run it and count
-            let inner = try p.statement()
+            var inner = try p.statement()
+            inner.subs = replace(mut &p.subs, [])
+            inner.params = p.params
             if s.ifFlag && inner.kind != S_SELECT {
                 return Err(lexdb_base.err("0A000", "EXPLAIN ANALYZE takes SELECT"))
             }
@@ -938,12 +970,14 @@ fn (p: mut &P) skipToEnd() {
 // highest $n in each.
 pub fn parse(sql: &str): Result[[]Stmt, lexdb_base.DbErr] {
     let toks = try lex(sql)
-    var p = P{toks: toks, pos: 0, params: 0}
+    var p = P{toks: toks, pos: 0, params: 0, subs: []}
     var out: []Stmt = []
     while true {
         p.params = 0
+        p.subs = []
         var s = try p.statement()
         s.params = p.params
+        if s.kind != S_EXPLAIN { s.subs = replace(mut &p.subs, []) }
         let t = p.peek()
         if t.kind == T_EOF {
             if s.kind != S_EMPTY || len(out) == 0 { append(mut &out, s) }
@@ -1003,6 +1037,16 @@ pub fn exprText(x: &Expr): str {
         Expr.IsNull(a, neg) { return "(" + exprText(&a) + (if neg { " is not null)" } else { " is null)" }) }
         Expr.Cast(a, t) { return "cast(" + exprText(&a) + " as " + typeText(&t) + ")" }
         Expr.Call(n, args, star) {
+            if n == "#sub" || n == "#exists" || n == "#in" {
+                // a subquery: by its number, from 1
+                var i = 0
+                match args[0] { Expr.Lit(v) { match v { Val.Int(k) { i = k } else {} } } else {} }
+                let sq = "(subquery " + (i + 1).toStr() + ")"
+                if n == "#sub" { return sq }
+                if n == "#exists" { return "(exists " + sq + ")" }
+                let at = if len(args) > 3 { 3 } else { 1 }
+                return "(" + exprText(&args[at]) + " in " + sq + ")"
+            }
             if n == "like" || n == "ilike" {
                 var out = "(" + exprText(&args[0]) + " " + n + " " + exprText(&args[1])
                 if len(args) > 2 { out = out + " escape " + exprText(&args[2]) }
@@ -1042,7 +1086,7 @@ pub fn exprText(x: &Expr): str {
 // One expression and nothing after it.
 pub fn parseExpr(sql: &str): Result[Expr, lexdb_base.DbErr] {
     let toks = try lex(sql)
-    var p = P{toks: toks, pos: 0, params: 0}
+    var p = P{toks: toks, pos: 0, params: 0, subs: []}
     let x = try p.expr()
     let t = p.peek()
     if t.kind != T_EOF { return Err(near(&t)) }

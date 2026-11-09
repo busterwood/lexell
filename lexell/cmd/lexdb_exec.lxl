@@ -419,6 +419,8 @@ pub type Env = value record {
     row: &[]Val
     aggs: &[]Val
     params: &[]Val
+    subs: &[]SubRes     // the results of the subqueries run once
+    cur: &[]Val         // the correlated subqueries' values for this row
 }
 
 fn colIndex(cols: &[]lexdb_sql.ColDef, name: &str): int {
@@ -505,6 +507,16 @@ pub fn eval(x: &Expr, env: &Env): Result[Val, DbErr] {
             return coerce(v, &t)
         }
         Expr.Call(name, args, star) {
+            if isSubCall(&name) {
+                let i = litInt(&args[0])
+                if len(args) > subFixed(&name) {
+                    if i < len(env.cur) { return Ok(env.cur[i]) }
+                    return Err(e("0A000", "a correlated subquery is not supported here"))
+                }
+                if len(args) < subFixed(&name) || i >= len(env.subs) { return Err(e("0A000", "a subquery is not supported here")) }
+                let xv = if name == "#in" { try eval(&args[3], env) } else { Val.Null }
+                return Ok(subValue(&name, &env.subs[i], &xv))
+            }
             if name == "#agg" {
                 match args[0] {
                     Expr.Lit(v) {
@@ -782,8 +794,12 @@ fn encNum(b: mut &StrBuf, d: &Decimal) {
         b.addByte(0x80)
         return
     }
-    let digs = d.coefficient().toStr()
+    // trailing zeros dropped: equal values (1.5, 1.50) have one key
+    var digs = d.coefficient().toStr()
+    var nd = len(digs)
+    while nd > 1 && digs[nd - 1] == '0' { nd -= 1 }
     let ex = len(digs) + d.exponent() + 0x40000000
+    digs = digs[0..nd]
     if d.isNeg() {
         b.addByte(0x7F)
         binary.addU32BE(b, 0x7FFFFFFF - ex)
@@ -1077,9 +1093,6 @@ pub type Level = record {
     perRow: bool
     hashCols: []int         // hash: its columns ...
     hashVals: []Expr        // ... equal to these values from earlier tables
-    mat: [][]Val            // hash: its rows
-    keys: Map[str, int]     // hash key -> bucket
-    buckets: [][]int        // rows of mat
 }
 
 // What one table of a query did (EXPLAIN ANALYZE).
@@ -1095,13 +1108,31 @@ type Counts = value record {
 
 // A query's run: the counts, and per RIGHT or FULL JOIN table which of its
 // rows have joined.
-type Run = record { cnt: []Counts; seen: [][]bool }
+type Run = record {
+    cnt: []Counts
+    seen: [][]bool
+    memo: []Map[str, int]       // per subquery (correlated): its outer values -> its result in memoRes
+    memoRes: [][]SubRes
+    stats: []SubStat            // per subquery: its runs (EXPLAIN ANALYZE)
+}
+
+// What a subquery did: runs, results taken from the cache, and its own
+// counts and subqueries' over all its runs.
+type SubStat = record { runs: int; hits: int; cnt: []Counts; inner: []SubStat }
 
 fn newRun(q: &Query): Run {
     var seen: [][]bool = []
     for k in 0..len(q.levels) { append(mut &seen, []) }
+    var memo: []Map[str, int] = []
+    var memoRes: [][]SubRes = []
+    var stats: []SubStat = []
+    for i in 0..len(q.subs) {
+        append(mut &memo, newMap())
+        append(mut &memoRes, [])
+        append(mut &stats, SubStat{runs: 0, hits: 0, cnt: [], inner: []})
+    }
     return Run{cnt: array(len(q.levels), Counts{starts: 0, read: 0, joined: 0, nulls: 0, built: 0, kept: 0, unmatched: 0}),
-               seen: seen}
+               seen: seen, memo: memo, memoRes: memoRes, stats: stats}
 }
 
 fn keepsRight(join: int): bool { return join == lexdb_sql.J_RIGHT || join == lexdb_sql.J_FULL }
@@ -1114,6 +1145,10 @@ pub type Query = record {
     levels: []Level
     cols: []lexdb_sql.ColDef    // the joined row's columns, named alias.column
     top: []Expr                 // no FROM: the WHERE
+    subs: []SubPlan             // its subqueries, by number
+    base: int                   // the statement's parameters; then refs' values
+    corr: bool                  // a subquery of it is correlated
+    refs: []Expr                // a subquery: the outer values it uses (in the outer query's terms)
 }
 
 fn dotAt(s: &str): int {
@@ -1154,20 +1189,53 @@ fn resolveName(cols: &[]lexdb_sql.ColDef, n: int, name: &str): Result[str, DbErr
 }
 
 // An expression with its column names made alias.column.
-fn resolve(x: &Expr, cols: &[]lexdb_sql.ColDef, n: int): Result[Expr, DbErr] {
+// A name not among a query's columns may be one of a query around it
+// (a correlated subquery): then it is a parameter.
+fn resolve(x: &Expr, cols: &[]lexdb_sql.ColDef, n: int, sc: mut &Scope): Result[Expr, DbErr] {
     match x {
-        Expr.Col(name) { return Ok(Expr.Col(try resolveName(cols, n, &name))) }
-        Expr.Unary(op, a) { return Ok(Expr.Unary(op, try resolve(&a, cols, n))) }
+        Expr.Col(name) {
+            match resolveName(cols, n, &name) {
+                Ok(r) { return Ok(Expr.Col(r)) }
+                Err(err) {
+                    var mine = false
+                    match resolveName(cols, len(cols), &name) {
+                        Ok(_) { mine = true }
+                        Err(x2) { mine = x2.state == "42702" }
+                    }
+                    if !mine && len(sc.frames) > 1 {
+                        match try outerRef(sc, &name) {
+                            Some(r) { return Ok(r) }
+                            None {}
+                        }
+                    }
+                    return Err(err)
+                }
+            }
+        }
+        Expr.Unary(op, a) { return Ok(Expr.Unary(op, try resolve(&a, cols, n, sc))) }
         Expr.Bin(op, a, b) {
-            let l = try resolve(&a, cols, n)
-            let r = try resolve(&b, cols, n)
+            let l = try resolve(&a, cols, n, sc)
+            let r = try resolve(&b, cols, n, sc)
             return Ok(Expr.Bin(op, l, r))
         }
-        Expr.IsNull(a, neg) { return Ok(Expr.IsNull(try resolve(&a, cols, n), neg)) }
-        Expr.Cast(a, t) { return Ok(Expr.Cast(try resolve(&a, cols, n), t)) }
+        Expr.IsNull(a, neg) { return Ok(Expr.IsNull(try resolve(&a, cols, n, sc), neg)) }
+        Expr.Cast(a, t) { return Ok(Expr.Cast(try resolve(&a, cols, n, sc), t)) }
         Expr.Call(nm, args, star) {
             var out: []Expr = []
-            for a in args { append(mut &out, try resolve(&a, cols, n)) }
+            if isSubCall(&nm) && len(args) < subFixed(&nm) {
+                // a subquery: its number, type and name, (IN: the value), then the outer values it needs
+                let i = litInt(&args[0])
+                var xs: []Expr = []
+                if nm == "#in" { append(mut &xs, try resolve(&args[1], cols, n, sc)) }
+                let f = &sc.frames[len(sc.frames) - 1]
+                append(mut &out, Expr.Lit(Val.Int(i)))
+                append(mut &out, Expr.Lit(Val.Int(f.subOids[i])))
+                append(mut &out, Expr.Lit(Val.Text(f.subNames[i])))
+                if len(xs) > 0 { append(mut &out, pop(mut &xs)) }
+                for r in f.subRefs[i] { append(mut &out, clone(&r)) }
+                return Ok(Expr.Call(nm, out, star))
+            }
+            for a in args { append(mut &out, try resolve(&a, cols, n, sc)) }
             return Ok(Expr.Call(nm, out, star))
         }
         else { return Ok(clone(x)) }
@@ -1188,6 +1256,8 @@ fn colNames(x: &Expr, out: mut &[]str) {
         else {}
     }
 }
+
+fn (q: &Query) valBefore(x: &Expr, k: int): bool { return q.maxLevel(x) < k && !(q.corr && hasCorr(x)) }
 
 fn (q: &Query) levelOf(name: &str): int {
     let i = colIndex(&q.cols, name)
@@ -1230,7 +1300,7 @@ fn bounds(cs: &[]Expr, col: &str, k: int, q: &Query): []Bound {
                     var done = false
                     match a {
                         Expr.Col(n) {
-                            if n == col && q.maxLevel(&b) < k {
+                            if n == col && q.valBefore(&b, k) {
                                 append(mut &out, Bound{op: op, val: clone(&b)})
                                 done = true
                             }
@@ -1240,7 +1310,7 @@ fn bounds(cs: &[]Expr, col: &str, k: int, q: &Query): []Bound {
                     if !done {
                         match b {
                             Expr.Col(n) {
-                                if n == col && q.maxLevel(&a) < k {
+                                if n == col && q.valBefore(&a, k) {
                                     let flip = match op { "<" { ">" } "<=" { ">=" } ">" { "<" } ">=" { "<=" } else { "=" } }
                                     append(mut &out, Bound{op: flip, val: clone(&a)})
                                 }
@@ -1266,7 +1336,8 @@ fn constVal(x: &Expr, params: &[]Val): Option[Val] {
     let noCols: []lexdb_sql.ColDef = []
     let noRow: []Val = []
     let noAggs: []Val = []
-    let env = Env{cols: &noCols, row: &noRow, aggs: &noAggs, params: params}
+    let noSubs: []SubRes = []
+    let env = Env{cols: &noCols, row: &noRow, aggs: &noAggs, params: params, subs: &noSubs, cur: &noAggs}
     match eval(x, &env) {
         Ok(v) {
             if isNull(&v) { return None }
@@ -1419,7 +1490,7 @@ fn inList(cs: &[]Expr, col: &str, k: int, q: &Query): []Expr {
                 if n == "in" && len(args) > 1 {
                     var ok = false
                     match args[0] { Expr.Col(x) { ok = x == col } else {} }
-                    for i in 1..len(args) { if q.maxLevel(&args[i]) >= k { ok = false } }
+                    for i in 1..len(args) { if !q.valBefore(&args[i], k) { ok = false } }
                     if ok {
                         var out: []Expr = []
                         for i in 1..len(args) { append(mut &out, clone(&args[i])) }
@@ -1704,22 +1775,23 @@ fn fetch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, p: &Path,
 fn allTrue(cs: &[]Expr, cols: &[]lexdb_sql.ColDef, row: &[]Val, params: &[]Val): Result[bool, DbErr] {
     if len(cs) == 0 { return Ok(true) }
     let noAggs: []Val = []
-    let env = Env{cols: cols, row: row, aggs: &noAggs, params: params}
+    let noSubs: []SubRes = []
+    let env = Env{cols: cols, row: row, aggs: &noAggs, params: params, subs: &noSubs, cur: &noAggs}
     for c in cs { if truth(&(try eval(&c, &env))) != Some(true) { return Ok(false) } }
     return Ok(true)
 }
 
 fn newLevel(t: Table, alias: str, join: int, first: int): Level {
     return Level{t: t, alias: alias, join: join, first: first, path: Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: []}, cond: [],
-                 post: [], local: [], perRow: true, hashCols: [], hashVals: [], mat: [], keys: newMap(), buckets: []}
+                 post: [], local: [], perRow: true, hashCols: [], hashVals: []}
 }
 
 // Plans a query over the tables of FROM (4.8): the tables are joined in the
 // order written, and each WHERE conjunct is checked at the first table
 // where all its columns are known.
 fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_sql.FromItem,
-              where: &Option[Expr], params: &[]Val): Result[Query, DbErr] {
-    var q = Query{levels: [], cols: [], top: []}
+              where: &Option[Expr], params: &[]Val, subs: &[]lexdb_sql.Stmt, sc: mut &Scope): Result[Query, DbErr] {
+    var q = Query{levels: [], cols: [], top: [], subs: [], base: sc.base, corr: false, refs: []}
     for f in from {
         for lv in q.levels {
             if lv.alias == f.alias { return Err(e("42712", "table name \"" + f.alias + "\" specified more than once")) }
@@ -1730,6 +1802,22 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
             append(mut &q.cols, lexdb_sql.ColDef{name: f.alias + "." + c.name, typ: c.typ, notNull: c.notNull})
         }
         append(mut &q.levels, newLevel(t, f.alias, f.join, first))
+    }
+    // its scope: its columns, for its own expressions and its subqueries' (planned first)
+    var fcols: []lexdb_sql.ColDef = []
+    if len(subs) > 0 {
+        // only its subqueries look here
+        for c in q.cols { append(mut &fcols, lexdb_sql.ColDef{name: c.name, typ: c.typ, notNull: c.notNull}) }
+    }
+    append(mut &sc.frames, Frame{cols: fcols, refs: [], refOids: [], subRefs: [], subOids: [], subNames: []})
+    for i in 0..len(subs) {
+        let sp = try planSub(st, txn, &subs[i], params, sc)
+        let top = len(sc.frames) - 1
+        append(mut &sc.frames[top].subRefs, cloneAll(&sp.sel.q.refs))
+        append(mut &sc.frames[top].subOids, sp.oid)
+        append(mut &sc.frames[top].subNames, sp.name)
+        if len(sp.sel.q.refs) > 0 { q.corr = true }
+        append(mut &q.subs, sp)
     }
     let nl = len(q.levels)
     // A RIGHT or FULL JOIN can make the columns before it NULL: no WHERE
@@ -1744,7 +1832,7 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
         match from[k].on {
             Some(on) {
                 // ON sees this table and those before it
-                let r = try resolve(&on, &q.cols, q.levels[k].first + len(q.levels[k].t.cols))
+                let r = try resolve(&on, &q.cols, q.levels[k].first + len(q.levels[k].t.cols), sc)
                 conjuncts(&r, mut &ms[k])
             }
             None {}
@@ -1752,7 +1840,7 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
     }
     match where {
         Some(w) {
-            let r = try resolve(&w, &q.cols, len(q.cols))
+            let r = try resolve(&w, &q.cols, len(q.cols), sc)
             var cs: []Expr = []
             conjuncts(&r, mut &cs)
             for i in 0..len(cs) {
@@ -1768,6 +1856,14 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
             }
         }
         None {}
+    }
+    if q.corr {
+        // a correlated subquery runs per row: its conjuncts go last
+        for k in 0..nl {
+            ms[k] = subsLast(replace(mut &ms[k], []))
+            ps[k] = subsLast(replace(mut &ps[k], []))
+        }
+        q.top = subsLast(replace(mut &q.top, []))
     }
     for k in 0..nl {
         let m = replace(mut &ms[k], [])
@@ -1794,7 +1890,7 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
                             var got = false
                             match a {
                                 Expr.Col(n) {
-                                    if q.levelOf(&n) == k && q.maxLevel(&b) < k {
+                                    if q.levelOf(&n) == k && q.valBefore(&b, k) {
                                         append(mut &hcols, colIndex(&q.cols, &n) - q.levels[k].first)
                                         append(mut &hvals, clone(&b))
                                         got = true
@@ -1805,7 +1901,7 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
                             if !got {
                                 match b {
                                     Expr.Col(n) {
-                                        if q.levelOf(&n) == k && q.maxLevel(&a) < k {
+                                        if q.levelOf(&n) == k && q.valBefore(&a, k) {
                                             append(mut &hcols, colIndex(&q.cols, &n) - q.levels[k].first)
                                             append(mut &hvals, clone(&a))
                                         }
@@ -1831,7 +1927,7 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
 }
 
 // Reads the tables that are joined by hash, once.
-fn materialize(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query, params: &[]Val,
+fn materialize(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: mut &Mats, params: &[]Val,
                rs: mut &Run): Result[Unit, DbErr] {
     for k in 1..len(q.levels) {
         if q.levels[k].perRow { continue }
@@ -1844,7 +1940,7 @@ fn materialize(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query,
             var full: []Val = array(len(q.cols), Val.Null)
             {
                 let noAggs: []Val = []
-                let env = Env{cols: &q.cols, row: &full, aggs: &noAggs, params: params}
+                let env = Env{cols: &q.cols, row: &full, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs}
                 let scans = try pathScans(&lv.t, &lv.path, &env)
                 for sc in scans {
                     var cur = newCursor()
@@ -1856,7 +1952,7 @@ fn materialize(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query,
             for i in 0..len(rows) {
                 let r = replace(mut &rows[i], [])
                 for j in 0..len(r) { full[lv.first + j] = r[j] }
-                if !(try allTrue(&lv.local, &q.cols, &full, params)) { continue }
+                if !(try allTrueX(st, txn, q, m, &lv.local, &full, params, rs)) { continue }
                 var kb = newStrBuf()
                 var nul = false
                 for c in lv.hashCols {
@@ -1887,32 +1983,32 @@ fn materialize(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query,
             }
         }
         if keepsRight(q.levels[k].join) { rs.seen[k] = array(len(mat), false) }
-        q.levels[k].mat = mat
-        q.levels[k].keys = keys
-        q.levels[k].buckets = buckets
+        m.mat[k] = mat
+        m.keys[k] = keys
+        m.buckets[k] = buckets
     }
     return Ok(Unit{})
 }
 
 // Places a candidate row of level k in the joined row and goes on to the
 // next level if it joins: -1 stop, 0 it does not join, 1 it joined.
-fn tryRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, k: int, r: &[]Val, ri: int, row: mut &[]Val,
-          params: &[]Val, emit: &fn(&[]Val): Result[bool, DbErr], rs: mut &Run): Result[int, DbErr] {
+fn tryRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Mats, k: int, r: &[]Val, ri: int,
+          row: mut &[]Val, params: &[]Val, emit: &fn(&[]Val): Result[bool, DbErr], rs: mut &Run): Result[int, DbErr] {
     let lv = &q.levels[k]
     for i in 0..len(r) { row[lv.first + i] = r[i] }
     rs.cnt[k].read += 1
-    if !(try allTrue(&lv.cond, &q.cols, row, params)) { return Ok(0) }
+    if !(try allTrueX(st, txn, q, m, &lv.cond, row, params, rs)) { return Ok(0) }
     rs.cnt[k].joined += 1
     if ri >= 0 && len(rs.seen[k]) > 0 { rs.seen[k][ri] = true }
-    if !(try allTrue(&lv.post, &q.cols, row, params)) { return Ok(1) }
-    if !(try runLevel(st, txn, q, k + 1, row, params, emit, rs)) { return Ok(-1) }
+    if !(try allTrueX(st, txn, q, m, &lv.post, row, params, rs)) { return Ok(1) }
+    if !(try runLevel(st, txn, q, m, k + 1, row, params, emit, rs)) { return Ok(-1) }
     return Ok(1)
 }
 
 // Joins the rows of level k on to the joined row (levels before k filled),
 // calling emit for each complete row; false: emit asked to stop.
-fn runLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, k: int, row: mut &[]Val, params: &[]Val,
-            emit: &fn(&[]Val): Result[bool, DbErr], rs: mut &Run): Result[bool, DbErr] {
+fn runLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Mats, k: int, row: mut &[]Val,
+            params: &[]Val, emit: &fn(&[]Val): Result[bool, DbErr], rs: mut &Run): Result[bool, DbErr] {
     if k == len(q.levels) { return emit(row) }
     let lv = &q.levels[k]
     var matched = false
@@ -1922,7 +2018,7 @@ fn runLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, k: int
         var nul = false
         {
             let noAggs: []Val = []
-            let env = Env{cols: &q.cols, row: row, aggs: &noAggs, params: params}
+            let env = Env{cols: &q.cols, row: row, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs}
             for i in 0..len(lv.hashCols) {
                 let v = try coerce(try eval(&lv.hashVals[i], &env), &lv.t.cols[lv.hashCols[i]].typ)
                 if isNull(&v) { nul = true }
@@ -1930,10 +2026,10 @@ fn runLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, k: int
             }
         }
         if !nul {
-            match lv.keys.get(&kb.toStr()) {
+            match m.keys[k].get(&kb.toStr()) {
                 Some(b) {
-                    for ri in lv.buckets[b] {
-                        let got = try tryRow(st, txn, q, k, &lv.mat[ri], ri, row, params, emit, rs)
+                    for ri in m.buckets[k][b] {
+                        let got = try tryRow(st, txn, q, m, k, &m.mat[k][ri], ri, row, params, emit, rs)
                         if got < 0 { return Ok(false) }
                         if got > 0 { matched = true }
                     }
@@ -1945,7 +2041,7 @@ fn runLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, k: int
         var scans: []Scan = []
         {
             let noAggs: []Val = []
-            let env = Env{cols: &q.cols, row: row, aggs: &noAggs, params: params}
+            let env = Env{cols: &q.cols, row: row, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs}
             scans = try pathScans(&lv.t, &lv.path, &env)
         }
         for sc in scans {
@@ -1954,7 +2050,7 @@ fn runLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, k: int
                 var batch: [][]Val = []
                 try fetch(st, txn, &lv.t, &lv.path, &sc, mut &cur, mut &batch)
                 for r in batch {
-                    let got = try tryRow(st, txn, q, k, &r, -1, row, params, emit, rs)
+                    let got = try tryRow(st, txn, q, m, k, &r, -1, row, params, emit, rs)
                     if got < 0 { return Ok(false) }
                     if got > 0 { matched = true }
                 }
@@ -1964,39 +2060,423 @@ fn runLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, k: int
     if keepsLeft(lv.join) && !matched {
         for i in 0..len(lv.t.cols) { row[lv.first + i] = Val.Null }
         rs.cnt[k].nulls += 1
-        if try allTrue(&lv.post, &q.cols, row, params) {
-            if !(try runLevel(st, txn, q, k + 1, row, params, emit, rs)) { return Ok(false) }
+        if try allTrueX(st, txn, q, m, &lv.post, row, params, rs) {
+            if !(try runLevel(st, txn, q, m, k + 1, row, params, emit, rs)) { return Ok(false) }
         }
     }
     return Ok(true)
 }
 
 // Calls emit on each row of the query (materialize first).
-fn runQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, params: &[]Val,
+fn runQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Mats, params: &[]Val,
             emit: &fn(&[]Val): Result[bool, DbErr], rs: mut &Run): Result[Unit, DbErr] {
     if len(q.levels) == 0 {
         let none: []Val = []
-        if try allTrue(&q.top, &q.cols, &none, params) { let more = try emit(&none) }
+        if try allTrueX(st, txn, q, m, &q.top, &none, params, rs) { let more = try emit(&none) }
         return Ok(Unit{})
     }
     var row: []Val = array(len(q.cols), Val.Null)
-    if !(try runLevel(st, txn, q, 0, mut &row, params, emit, rs)) { return Ok(Unit{}) }
+    if !(try runLevel(st, txn, q, m, 0, mut &row, params, emit, rs)) { return Ok(Unit{}) }
     // A RIGHT or FULL JOIN's rows that joined nothing, with NULLs for the
     // tables before it, go on through the tables after it.
     for k in 1..len(q.levels) {
         let lv = &q.levels[k]
         if !keepsRight(lv.join) { continue }
-        for ri in 0..len(lv.mat) {
+        for ri in 0..len(m.mat[k]) {
             if rs.seen[k][ri] { continue }
             for i in 0..len(row) { row[i] = Val.Null }
-            for i in 0..len(lv.mat[ri]) { row[lv.first + i] = lv.mat[ri][i] }
+            for i in 0..len(m.mat[k][ri]) { row[lv.first + i] = m.mat[k][ri][i] }
             rs.cnt[k].unmatched += 1
-            if try allTrue(&lv.post, &q.cols, &row, params) {
-                if !(try runLevel(st, txn, q, k + 1, mut &row, params, emit, rs)) { return Ok(Unit{}) }
+            if try allTrueX(st, txn, q, m, &lv.post, &row, params, rs) {
+                if !(try runLevel(st, txn, q, m, k + 1, mut &row, params, emit, rs)) { return Ok(Unit{}) }
             }
         }
     }
     return Ok(Unit{})
+}
+
+// ---- subqueries (design 9.8)
+//
+// A statement's subqueries are planned with it, each inside the query it is
+// in. A name not among a query's own columns is looked for in the queries
+// around it, nearest first, and becomes a parameter after the statement's
+// own: the query it is in supplies its value (its "refs"), and a query in
+// between passes it down. A subquery with no refs is run once per
+// execution, before the query; one with refs is run for each row that needs
+// it, its result kept per value of its refs.
+
+const MEMO_MAX = 10000          // results kept per correlated subquery
+
+type SubPlan = record {
+    use: int                    // lexdb_sql.SUB_SCALAR, SUB_EXISTS, SUB_IN
+    sel: Sel
+    oid: int                    // its column's type
+    name: str                   // its column's name, as an output column
+}
+
+// A subquery's result: a scalar's value, how many rows, IN's values.
+type SubRes = record {
+    val: Val
+    rows: int
+    set: Map[str, int]
+    numeric: bool               // the values are numbers: keyed as numbers
+    hasNull: bool
+}
+
+fn emptyRes(): SubRes { return SubRes{val: Val.Null, rows: 0, set: newMap(), numeric: false, hasNull: false} }
+
+// The queries being planned, outermost first.
+type Frame = record {
+    cols: []lexdb_sql.ColDef
+    refs: []Expr                // the outer values it uses, in the terms of the query around it
+    refOids: []int
+    subRefs: [][]Expr           // per subquery of it: the subquery's refs, in its terms
+    subOids: []int
+    subNames: []str
+}
+
+pub type Scope = record {
+    frames: []Frame
+    base: int                   // the statement's parameters
+    ptypes: []int
+}
+
+fn newScope(params: &[]Val, ptypes: &[]int): Scope {
+    var pt: []int = []
+    for i in 0..len(params) { append(mut &pt, if i < len(ptypes) { ptypes[i] } else { 0 }) }
+    return Scope{frames: [], base: len(params), ptypes: pt}
+}
+
+// The parameter types of the query being planned: the statement's, then
+// its refs'.
+fn ptypesOf(sc: &Scope): []int {
+    var out: []int = []
+    for t in sc.ptypes { append(mut &out, t) }
+    if len(sc.frames) > 0 { for t in sc.frames[len(sc.frames) - 1].refOids { append(mut &out, t) } }
+    return out
+}
+
+// A name of a query around the one being planned, as a parameter of it.
+fn outerRef(sc: mut &Scope, name: &str): Result[Option[Expr], DbErr] {
+    let top = len(sc.frames) - 1
+    var f = top - 1
+    var found = ""
+    var oid = 0
+    while f >= 0 && found == "" {
+        match resolveName(&sc.frames[f].cols, len(sc.frames[f].cols), name) {
+            Ok(n) {
+                oid = sc.frames[f].cols[colIndex(&sc.frames[f].cols, &n)].typ.oid
+                found = n
+            }
+            Err(x) {
+                // ambiguous there, or its table is there and the column is not
+                if x.state == "42702" || (x.state == "42703" && dotAt(name) >= 0) { return Err(x) }
+            }
+        }
+        if found == "" { f -= 1 }
+    }
+    if found == "" { return Ok(None) }
+    var x = Expr.Col(found)
+    for g in f + 1..top + 1 {
+        let t = lexdb_sql.exprText(&x)
+        var at = -1
+        for i in 0..len(sc.frames[g].refs) { if lexdb_sql.exprText(&sc.frames[g].refs[i]) == t { at = i } }
+        if at < 0 {
+            at = len(sc.frames[g].refs)
+            append(mut &sc.frames[g].refs, clone(&x))
+            append(mut &sc.frames[g].refOids, oid)
+        }
+        x = Expr.Param(sc.base + at + 1)
+    }
+    return Ok(Some(x))
+}
+
+// The query being planned is done: its refs are what the query around it
+// must supply.
+fn endScope(sc: mut &Scope, q: mut &Query) {
+    var f = pop(mut &sc.frames)
+    q.refs = replace(mut &f.refs, [])
+}
+
+fn planSub(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val,
+           sc: mut &Scope): Result[SubPlan, DbErr] {
+    let sel = try planSelect(st, txn, s, params, sc)
+    if s.use == lexdb_sql.SUB_IN && len(sel.outs) != 1 { return Err(e("42601", "subquery has too many columns")) }
+    if s.use == lexdb_sql.SUB_SCALAR && len(sel.outs) != 1 { return Err(e("42601", "subquery must return only one column")) }
+    let oid = if s.use == lexdb_sql.SUB_EXISTS { lexdb_sql.OID_BOOL } else { sel.outs[0].oid }
+    let name = if s.use == lexdb_sql.SUB_EXISTS { "exists" } else if s.use == lexdb_sql.SUB_SCALAR { sel.outs[0].name } else { "?column?" }
+    return Ok(SubPlan{use: s.use, sel: sel, oid: oid, name: name})
+}
+
+fn isSubCall(n: &str): bool { return n == "#sub" || n == "#exists" || n == "#in" }
+
+// A resolved subquery call's arguments before its refs: number, type, name
+// (and IN's value).
+fn subFixed(n: &str): int { return if n == "#in" { 4 } else { 3 } }
+
+fn litInt(x: &Expr): int {
+    match x {
+        Expr.Lit(v) { match v { Val.Int(n) { return n } else {} } }
+        else {}
+    }
+    return -1
+}
+
+// Has a correlated subquery: one run per row.
+fn hasCorr(x: &Expr): bool {
+    match x {
+        Expr.Unary(_, a) { return hasCorr(&a) }
+        Expr.Bin(_, a, b) { return hasCorr(&a) || hasCorr(&b) }
+        Expr.IsNull(a, _) { return hasCorr(&a) }
+        Expr.Cast(a, _) { return hasCorr(&a) }
+        Expr.Call(n, args, _) {
+            if isSubCall(&n) && len(args) > subFixed(&n) { return true }
+            for a in args { if hasCorr(&a) { return true } }
+            return false
+        }
+        else { return false }
+    }
+}
+
+fn subsLast(cs: []Expr): []Expr {
+    var all = cs
+    var first: []Expr = []
+    var last: []Expr = []
+    for i in 0..len(all) {
+        let c = replace(mut &all[i], Expr.Lit(Val.Null))
+        if hasCorr(&c) { append(mut &last, c) } else { append(mut &first, c) }
+    }
+    for i in 0..len(last) { append(mut &first, replace(mut &last[i], Expr.Lit(Val.Null))) }
+    return first
+}
+
+// An IN set's key: numbers by value (1 = 1.0), else as the value.
+fn setKey(v: &Val, numeric: bool): Option[str] {
+    var kb = newStrBuf()
+    if numeric {
+        match asNum(v) {
+            Some(d) {
+                encNum(mut &kb, &d)
+                return Some(kb.toStr())
+            }
+            None { return None }
+        }
+    }
+    encIdxPart(mut &kb, v)
+    return Some(kb.toStr())
+}
+
+// x IN (subquery): true if one equals x; else NULL if x or one is NULL.
+fn inProbe(r: &SubRes, x: &Val): Val {
+    if r.rows == 0 { return Val.Bool(false) }
+    if isNull(x) { return Val.Null }
+    match setKey(x, r.numeric) {
+        Some(k) { if r.set.get(&k).isSome() { return Val.Bool(true) } }
+        None {}
+    }
+    return if r.hasNull { Val.Null } else { Val.Bool(false) }
+}
+
+fn subValue(n: &str, r: &SubRes, x: &Val): Val {
+    if n == "#exists" { return Val.Bool(r.rows > 0) }
+    if n == "#in" { return inProbe(r, x) }
+    return r.val
+}
+
+fn addCounts(a: mut &[]Counts, b: &[]Counts) {
+    if len(a) == 0 {
+        for c in b { append(a, c) }
+        return
+    }
+    for i in 0..len(b) {
+        a[i].starts += b[i].starts
+        a[i].read += b[i].read
+        a[i].joined += b[i].joined
+        a[i].nulls += b[i].nulls
+        a[i].built += b[i].built
+        a[i].kept += b[i].kept
+        a[i].unmatched += b[i].unmatched
+    }
+}
+
+fn mergeStats(a: mut &[]SubStat, b: &[]SubStat) {
+    for i in 0..len(b) {
+        if i >= len(a) { append(a, SubStat{runs: 0, hits: 0, cnt: [], inner: []}) }
+        a[i].runs += b[i].runs
+        a[i].hits += b[i].hits
+        addCounts(mut &a[i].cnt, &b[i].cnt)
+        mergeStats(mut &a[i].inner, &b[i].inner)
+    }
+}
+
+// Runs a subquery: EXISTS stops at its first row, a scalar at its second.
+fn runSub(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sp: &SubPlan, params: &[]Val,
+          stat: mut &SubStat): Result[SubRes, DbErr] {
+    let cap = if sp.use == lexdb_sql.SUB_EXISTS { 1 } else if sp.use == lexdb_sql.SUB_SCALAR { 2 } else { -1 }
+    var rs = newRun(&sp.sel.q)
+    let res = try execSel(st, txn, &sp.sel, params, cap, mut &rs)
+    stat.runs += 1
+    addCounts(mut &stat.cnt, &rs.cnt)
+    mergeStats(mut &stat.inner, &rs.stats)
+    var out = emptyRes()
+    out.rows = len(res.rows)
+    if sp.use == lexdb_sql.SUB_SCALAR {
+        if len(res.rows) > 1 { return Err(e("21000", "more than one row returned by a subquery used as an expression")) }
+        if len(res.rows) == 1 { out.val = res.rows[0][0] }
+    } else if sp.use == lexdb_sql.SUB_IN {
+        for r in res.rows {
+            match r[0] {
+                Val.Int(_) { out.numeric = true }
+                Val.Num(_) { out.numeric = true }
+                else {}
+            }
+        }
+        for r in res.rows {
+            if isNull(&r[0]) {
+                out.hasNull = true
+                continue
+            }
+            match setKey(&r[0], out.numeric) {
+                Some(k) { out.set.put(k, 1) }
+                None {}
+            }
+        }
+    }
+    return Ok(out)
+}
+
+// The values of the correlated subqueries in x for env's row, into cur.
+fn fillCur(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, x: &Expr, env: &Env, rs: mut &Run,
+           cur: mut &[]Val): Result[Unit, DbErr] {
+    match x {
+        Expr.Unary(_, a) { return fillCur(st, txn, q, &a, env, rs, cur) }
+        Expr.Bin(_, a, b) {
+            try fillCur(st, txn, q, &a, env, rs, cur)
+            return fillCur(st, txn, q, &b, env, rs, cur)
+        }
+        Expr.IsNull(a, _) { return fillCur(st, txn, q, &a, env, rs, cur) }
+        Expr.Cast(a, _) { return fillCur(st, txn, q, &a, env, rs, cur) }
+        Expr.Call(n, args, _) {
+            let fixed = subFixed(&n)
+            if !(isSubCall(&n) && len(args) > fixed) {
+                for a in args { try fillCur(st, txn, q, &a, env, rs, cur) }
+                return Ok(Unit{})
+            }
+            let i = litInt(&args[0])
+            var xv = Val.Null
+            if n == "#in" {
+                try fillCur(st, txn, q, &args[3], env, rs, cur)
+                let env2 = Env{cols: env.cols, row: env.row, aggs: env.aggs, params: env.params, subs: env.subs, cur: cur}
+                xv = try eval(&args[3], &env2)
+            }
+            var refVals: []Val = []
+            for j in fixed..len(args) { append(mut &refVals, try eval(&args[j], env)) }
+            let key = valsKey(&refVals)
+            var at = -1
+            match rs.memo[i].get(&key) {
+                Some(k) { at = k }
+                None {}
+            }
+            if at >= 0 {
+                rs.stats[i].hits += 1
+                cur[i] = subValue(&n, &rs.memoRes[i][at], &xv)
+                return Ok(Unit{})
+            }
+            var ps: []Val = []
+            for j in 0..q.base { append(mut &ps, env.params[j]) }
+            for v in refVals { append(mut &ps, v) }
+            let r = try runSub(st, txn, &q.subs[i], &ps, mut &rs.stats[i])
+            cur[i] = subValue(&n, &r, &xv)
+            if len(rs.memoRes[i]) < MEMO_MAX {
+                rs.memo[i].put(key, len(rs.memoRes[i]))
+                append(mut &rs.memoRes[i], r)
+            }
+            return Ok(Unit{})
+        }
+        else { return Ok(Unit{}) }
+    }
+}
+
+// eval, running x's correlated subqueries for env's row first.
+fn evalX(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, x: &Expr, env: &Env,
+         rs: mut &Run): Result[Val, DbErr] {
+    if !q.corr || !hasCorr(x) { return eval(x, env) }
+    var cur: []Val = array(len(q.subs), Val.Null)
+    try fillCur(st, txn, q, x, env, rs, mut &cur)
+    let env2 = Env{cols: env.cols, row: env.row, aggs: env.aggs, params: env.params, subs: env.subs, cur: &cur}
+    return eval(x, &env2)
+}
+
+fn allTrueX(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Mats, cs: &[]Expr, row: &[]Val,
+            params: &[]Val, rs: mut &Run): Result[bool, DbErr] {
+    if len(cs) == 0 { return Ok(true) }
+    let noAggs: []Val = []
+    let env = Env{cols: &q.cols, row: row, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs}
+    for c in cs { if truth(&(try evalX(st, txn, q, &c, &env, rs))) != Some(true) { return Ok(false) } }
+    return Ok(true)
+}
+
+// What a query's run reads besides its tables: per hash-joined level its
+// rows, and the results of the subqueries run once.
+type Mats = record {
+    mat: [][][]Val
+    keys: []Map[str, int]       // hash key -> bucket
+    buckets: [][][]int          // rows of mat
+    subs: []SubRes
+}
+
+// Before a query runs: its subqueries without refs, then its hash tables.
+fn prepare(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, params: &[]Val,
+           rs: mut &Run): Result[Mats, DbErr] {
+    var m = Mats{mat: [], keys: [], buckets: [], subs: []}
+    for k in 0..len(q.levels) {
+        append(mut &m.mat, [])
+        append(mut &m.keys, newMap())
+        append(mut &m.buckets, [])
+    }
+    for i in 0..len(q.subs) {
+        if len(q.subs[i].sel.q.refs) > 0 {
+            append(mut &m.subs, emptyRes())
+            continue
+        }
+        var ps: []Val = []
+        for j in 0..q.base { append(mut &ps, params[j]) }
+        append(mut &m.subs, try runSub(st, txn, &q.subs[i], &ps, mut &rs.stats[i]))
+    }
+    try materialize(st, txn, q, mut &m, params, rs)
+    return Ok(m)
+}
+
+// EXPLAIN's lines for a query's subqueries (with their runs, ANALYZE).
+fn subLines(q: &Query, stats: &[]SubStat, out: mut &[]str) {
+    let none: []Counts = []
+    let noStats: []SubStat = []
+    for i in 0..len(q.subs) {
+        let sp = &q.subs[i]
+        let what = if sp.use == lexdb_sql.SUB_EXISTS { "exists" } else if sp.use == lexdb_sql.SUB_IN { "in" } else { "scalar" }
+        var head = "subquery " + (i + 1).toStr() + " (" + what + "): "
+        if len(sp.sel.q.refs) == 0 {
+            head = head + "run once"
+        } else {
+            var rs: []str = []
+            for r in sp.sel.q.refs {
+                match r {
+                    Expr.Col(n) { append(mut &rs, n) }
+                    else { append(mut &rs, "an outer value") }
+                }
+            }
+            head = head + "per row, on " + strings.join(&rs, ", ")
+        }
+        var inner: []str = []
+        if i < len(stats) {
+            head = head + " (runs " + stats[i].runs.toStr() + ", from cache " + stats[i].hits.toStr() + ")"
+            inner = selLines(&sp.sel, &stats[i].cnt, &stats[i].inner)
+        } else {
+            inner = selLines(&sp.sel, &none, &noStats)
+        }
+        append(out, head)
+        for l in inner { append(out, "  " + l) }
+    }
 }
 
 fn pathText(lv: &Level): str {
@@ -2131,7 +2611,8 @@ fn inIndex(t: &Table, ix: &Index, row: &[]Val): Result[bool, DbErr] {
         Some(x) {
             let noAggs: []Val = []
             let noParams: []Val = []
-            let env = Env{cols: &t.cols, row: row, aggs: &noAggs, params: &noParams}
+            let noSubs: []SubRes = []
+            let env = Env{cols: &t.cols, row: row, aggs: &noAggs, params: &noParams, subs: &noSubs, cur: &noAggs}
             return Ok(truth(&(try eval(&x, &env))) == Some(true))
         }
         None { return Ok(true) }
@@ -2242,6 +2723,7 @@ fn createIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
                 if colIndex(&t.cols, &n) < 0 { return Err(e("42703", "column \"" + n + "\" does not exist")) }
             }
             if hasAgg(&w) { return Err(e("42803", "aggregate functions are not allowed in index predicates")) }
+            if len(s.subs) > 0 { return Err(e("0A000", "cannot use subquery in index predicate")) }
             if s.params > 0 { return Err(e("42P02", "there is no parameter $1")) }
             pred = Some(clone(&w))
         }
@@ -2328,51 +2810,76 @@ fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
             append(mut &targets, i)
         }
     }
-    let noCols: []lexdb_sql.ColDef = []
-    let noRow: []Val = []
+    // its subqueries are run first
+    var sc = newScope(params, &[])
+    let noFrom: []lexdb_sql.FromItem = []
+    let noWhere: Option[Expr] = None
+    var q = try buildQuery(st, txn, &noFrom, &noWhere, params, &s.subs, mut &sc)
+    var rows: [][]Expr = []
+    if len(s.subs) > 0 {
+        for r in s.rows {
+            var rr: []Expr = []
+            for x in r { append(mut &rr, try resolve(&x, &q.cols, 0, mut &sc)) }
+            append(mut &rows, rr)
+        }
+    }
+    endScope(mut &sc, mut &q)
+    var rs = newRun(&q)
+    let m = try prepare(st, txn, &q, params, mut &rs)
     let noAggs: []Val = []
-    let env = Env{cols: &noCols, row: &noRow, aggs: &noAggs, params: params}
+    let env = Env{cols: &q.cols, row: &noAggs, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs}
+    if len(s.subs) > 0 { return insertRows(st, txn, &t, &targets, &rows, &env) }
+    return insertRows(st, txn, &t, &targets, &s.rows, &env)
+}
+
+fn insertRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, targets: &[]int, rows: &[][]Expr,
+              env: &Env): Result[Res, DbErr] {
     var count = 0
-    for r in s.rows {
+    for r in rows {
         if len(r) > len(targets) { return Err(e("42601", "INSERT has more expressions than target columns")) }
         var row: []Val = array(len(t.cols), Val.Null)
         for k in 0..len(r) {
             let ci = targets[k]
-            row[ci] = try coerce(try eval(&r[k], &env), &t.cols[ci].typ)
+            row[ci] = try coerce(try eval(&r[k], env), &t.cols[ci].typ)
         }
-        try checkRow(&t, &row)
-        let key = keyOf(&t, &row)
-        if (try st.get(txn, t.tree, key)).isSome() { return Err(dupKey(&t, &row)) }
+        try checkRow(t, &row)
+        let key = keyOf(t, &row)
+        if (try st.get(txn, t.tree, key)).isSome() { return Err(dupKey(t, &row)) }
         try txn.put(t.tree, key, encRow(&row))
-        try addIndexes(st, txn, &t, &row, &key)
+        try addIndexes(st, txn, t, &row, &key)
         count += 1
     }
     return Ok(tagOnly("INSERT 0 " + count.toStr()))
 }
 
 fn update(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val): Result[Res, DbErr] {
-    let q = try buildQuery(st, txn, &oneTable(&s.table), &s.where, params)
-    let t = &q.levels[0].t
+    var sc = newScope(params, &[])
+    var q = try buildQuery(st, txn, &oneTable(&s.table), &s.where, params, &s.subs, mut &sc)
     var targets: []int = []
     var sets: []Expr = []
     for set in s.sets {
-        let i = colIndex(&t.cols, &set.col)
-        if i < 0 { return Err(e("42703", "column \"" + set.col + "\" of relation \"" + t.name + "\" does not exist")) }
+        let i = colIndex(&q.levels[0].t.cols, &set.col)
+        if i < 0 {
+            return Err(e("42703", "column \"" + set.col + "\" of relation \"" + q.levels[0].t.name + "\" does not exist"))
+        }
         append(mut &targets, i)
-        append(mut &sets, try resolve(&set.expr, &q.cols, len(q.cols)))
+        append(mut &sets, try resolve(&set.expr, &q.cols, len(q.cols), mut &sc))
     }
+    endScope(mut &sc, mut &q)
+    let t = &q.levels[0].t
     var found: [][]Val = []
     var rs = newRun(&q)
-    try runQuery(st, txn, &q, params, fn(r: &[]Val): Result[bool, DbErr] {
+    let m = try prepare(st, txn, &q, params, mut &rs)
+    try runQuery(st, txn, &q, &m, params, fn(r: &[]Val): Result[bool, DbErr] {
         append(mut &found, copyRow(r))
         return Ok(true)
     }, mut &rs)
     let noAggs: []Val = []
     for old in found {
-        let env = Env{cols: &q.cols, row: &old, aggs: &noAggs, params: params}
+        let env = Env{cols: &q.cols, row: &old, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs}
         var row = copyRow(&old)
         for k in 0..len(sets) {
-            row[targets[k]] = try coerce(try eval(&sets[k], &env), &t.cols[targets[k]].typ)
+            row[targets[k]] = try coerce(try evalX(st, txn, &q, &sets[k], &env, mut &rs), &t.cols[targets[k]].typ)
         }
         try checkRow(t, &row)
         let oldKey = keyOf(t, &old)
@@ -2388,11 +2895,14 @@ fn update(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
 }
 
 fn delete(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val): Result[Res, DbErr] {
-    let q = try buildQuery(st, txn, &oneTable(&s.table), &s.where, params)
+    var sc = newScope(params, &[])
+    var q = try buildQuery(st, txn, &oneTable(&s.table), &s.where, params, &s.subs, mut &sc)
+    endScope(mut &sc, mut &q)
     let t = &q.levels[0].t
     var found: [][]Val = []
     var rs = newRun(&q)
-    try runQuery(st, txn, &q, params, fn(r: &[]Val): Result[bool, DbErr] {
+    let m = try prepare(st, txn, &q, params, mut &rs)
+    try runQuery(st, txn, &q, &m, params, fn(r: &[]Val): Result[bool, DbErr] {
         append(mut &found, copyRow(r))
         return Ok(true)
     }, mut &rs)
@@ -2418,11 +2928,17 @@ fn explain(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, x: &lexdb_sql.Stmt
         append(mut &lines, "result: " + len(r.rows).toStr() + " rows in " + (us / 1000).toStr() + "." +
                strings.padLeft((us % 1000).toStr(), 3, '0') + " ms")
     } else if s.kind == lexdb_sql.S_SELECT {
-        let sel = try planSelect(st, txn, s, params, ptypes)
-        lines = selLines(&sel, &none)
+        var sc = newScope(params, ptypes)
+        let sel = try planSelect(st, txn, s, params, mut &sc)
+        let noStats: []SubStat = []
+        lines = selLines(&sel, &none, &noStats)
     } else {
-        let q = try buildQuery(st, txn, &oneTable(&s.table), &s.where, params)
+        var sc = newScope(params, ptypes)
+        var q = try buildQuery(st, txn, &oneTable(&s.table), &s.where, params, &s.subs, mut &sc)
+        endScope(mut &sc, mut &q)
         lines = explainLines(&q, &none)
+        let noStats: []SubStat = []
+        subLines(&q, &noStats, mut &lines)
     }
     for l in lines { append(mut &res.rows, [Val.Text(l)]) }
     return Ok(res)
@@ -2433,7 +2949,12 @@ fn explain(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, x: &lexdb_sql.Stmt
 fn exprName(x: &Expr): str {
     match x {
         Expr.Col(n) { return colPart(&n) }
-        Expr.Call(n, _, _) { return aggBase(&n) }
+        Expr.Call(n, args, _) {
+            if isSubCall(&n) && len(args) >= 3 {
+                match args[2] { Expr.Lit(v) { return text(&v) } else {} }
+            }
+            return aggBase(&n)
+        }
         Expr.Cast(a, t) {
             let inner = exprName(&a)
             return if inner == "?column?" { kindName(&t) } else { inner }
@@ -2476,6 +2997,11 @@ pub fn exprOid(x: &Expr, cols: &[]lexdb_sql.ColDef, ptypes: &[]int): int {
         Expr.IsNull(_, _) { return lexdb_sql.OID_BOOL }
         Expr.Cast(_, t) { return t.oid }
         Expr.Call(n, args, _) {
+            if isSubCall(&n) {
+                if n != "#sub" { return lexdb_sql.OID_BOOL }
+                let oid = if len(args) >= 2 { litInt(&args[1]) } else { -1 }
+                return if oid > 0 { oid } else { lexdb_sql.OID_TEXT }
+            }
             match aggBase(&n) {
                 "count" { return lexdb_sql.OID_INT8 }
                 "bool_and", "bool_or", "every" { return lexdb_sql.OID_BOOL }
@@ -2503,7 +3029,7 @@ pub fn exprOid(x: &Expr, cols: &[]lexdb_sql.ColDef, ptypes: &[]int): int {
 
 // The output columns of a SELECT: (name, OID), and the expressions behind
 // them (* expanded).
-fn selectCols(s: &lexdb_sql.Stmt, cols: &[]lexdb_sql.ColDef, ptypes: &[]int, exprs: mut &[]Expr): Result[[]OutCol, DbErr] {
+fn selectCols(s: &lexdb_sql.Stmt, cols: &[]lexdb_sql.ColDef, sc: mut &Scope, exprs: mut &[]Expr): Result[[]OutCol, DbErr] {
     var out: []OutCol = []
     for it in s.items {
         if it.star {
@@ -2520,9 +3046,10 @@ fn selectCols(s: &lexdb_sql.Stmt, cols: &[]lexdb_sql.ColDef, ptypes: &[]int, exp
         }
         match it.expr {
             Some(x) {
-                let name = if it.alias != "" { it.alias } else { exprName(&x) }
-                let r = try resolve(&x, cols, len(cols))
-                append(mut &out, OutCol{name: name, oid: exprOid(&r, cols, ptypes)})
+                let r = try resolve(&x, cols, len(cols), sc)
+                let name = if it.alias != "" { it.alias } else { exprName(&r) }
+                let pt = ptypesOf(sc)
+                append(mut &out, OutCol{name: name, oid: exprOid(&r, cols, &pt)})
                 append(exprs, r)
             }
             None {}
@@ -2533,7 +3060,7 @@ fn selectCols(s: &lexdb_sql.Stmt, cols: &[]lexdb_sql.ColDef, ptypes: &[]int, exp
 
 // ORDER BY: an output column's name, if no input column has it, else an
 // expression over the input.
-fn resolveOrder(o: &Expr, cols: &[]lexdb_sql.ColDef, outs: &[]OutCol): Result[Expr, DbErr] {
+fn resolveOrder(o: &Expr, cols: &[]lexdb_sql.ColDef, outs: &[]OutCol, sc: mut &Scope): Result[Expr, DbErr] {
     match o {
         Expr.Col(n) {
             match resolveName(cols, len(cols), &n) {
@@ -2546,7 +3073,7 @@ fn resolveOrder(o: &Expr, cols: &[]lexdb_sql.ColDef, outs: &[]OutCol): Result[Ex
         }
         else {}
     }
-    return resolve(o, cols, len(cols))
+    return resolve(o, cols, len(cols), sc)
 }
 
 type OutRow = record { vals: []Val; ord: []Val }
@@ -2569,7 +3096,8 @@ fn evalInt(x: &Option[Expr], params: &[]Val, what: str): Result[int, DbErr] {
             let noCols: []lexdb_sql.ColDef = []
             let noRow: []Val = []
             let noAggs: []Val = []
-            let env = Env{cols: &noCols, row: &noRow, aggs: &noAggs, params: params}
+            let noSubs: []SubRes = []
+            let env = Env{cols: &noCols, row: &noRow, aggs: &noAggs, params: params, subs: &noSubs, cur: &noAggs}
             match try coerce(try eval(&v, &env), &lexdb_sql.TypeName{kind: lexdb_sql.K_INT, oid: lexdb_sql.OID_INT8, prec: 0, scale: 0, len: 0}) {
                 Val.Int(n) {
                     if n < 0 { return Err(e("2201W", what + " must not be negative")) }
@@ -2807,7 +3335,7 @@ fn checkGrouped(x: &Expr, gtexts: &[]str, okLevels: &[]bool, q: &Query): Result[
 
 // GROUP BY: an input column or expression; else an output column's
 // position or name, meaning its expression.
-fn resolveGroup(g: &Expr, cols: &[]lexdb_sql.ColDef, outs: &[]OutCol, exprs: &[]Expr): Result[Expr, DbErr] {
+fn resolveGroup(g: &Expr, cols: &[]lexdb_sql.ColDef, outs: &[]OutCol, exprs: &[]Expr, sc: mut &Scope): Result[Expr, DbErr] {
     match g {
         Expr.Lit(v) {
             match v {
@@ -2829,7 +3357,7 @@ fn resolveGroup(g: &Expr, cols: &[]lexdb_sql.ColDef, outs: &[]OutCol, exprs: &[]
         }
         else {}
     }
-    return resolve(g, cols, len(cols))
+    return resolve(g, cols, len(cols), sc)
 }
 
 fn valsKey(vs: &[]Val): str {
@@ -2853,6 +3381,7 @@ type Sel = record {
     having: Option[Expr]
     specs: []AggSpec        // the aggregate calls; exprs, having and order use their slots
     distinct: bool
+    desc: []bool            // per ORDER BY item
 }
 
 // The column of level 0 an expression is, else -1.
@@ -2946,23 +3475,24 @@ fn minMax(q: &Query, exprs: &[]Expr, dir: mut &int): int {
 }
 
 fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val,
-              ptypes: &[]int): Result[Sel, DbErr] {
-    var q = try buildQuery(st, txn, &s.from, &s.where, params)
+              sc: mut &Scope): Result[Sel, DbErr] {
+    var q = try buildQuery(st, txn, &s.from, &s.where, params, &s.subs, sc)
     var exprs: []Expr = []
-    let outs = try selectCols(s, &q.cols, ptypes, mut &exprs)
+    let outs = try selectCols(s, &q.cols, sc, mut &exprs)
     var groupBy: []Expr = []
     for g in s.group {
-        let r = try resolveGroup(&g, &q.cols, &outs, &exprs)
+        let r = try resolveGroup(&g, &q.cols, &outs, &exprs, sc)
         if hasAgg(&r) { return Err(e("42803", "aggregate functions are not allowed in GROUP BY")) }
         append(mut &groupBy, r)
     }
     var order: []Expr = []
-    for o in s.order { append(mut &order, try resolveOrder(&o.expr, &q.cols, &outs)) }
+    for o in s.order { append(mut &order, try resolveOrder(&o.expr, &q.cols, &outs, sc)) }
     var having: Option[Expr] = None
     match s.having {
-        Some(h) { having = Some(try resolve(&h, &q.cols, len(q.cols))) }
+        Some(h) { having = Some(try resolve(&h, &q.cols, len(q.cols), sc)) }
         None {}
     }
+    endScope(sc, mut &q)
     var aggQ = len(groupBy) > 0 || having.isSome()
     for x in exprs { if hasAgg(&x) { aggQ = true } }
     for x in order { if hasAgg(&x) { aggQ = true } }
@@ -3076,6 +3606,19 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             }
             append(mut &okLevels, all && len(groupBy) > 0)
         }
+        if q.corr {
+            // these are evaluated while the rows are read: no subquery run per row there
+            for g in groupBy { if hasCorr(&g) { return Err(e("0A000", "correlated subqueries in GROUP BY are not supported yet")) } }
+            for sp in specs {
+                var bad = false
+                for a in sp.args { if hasCorr(&a) { bad = true } }
+                match sp.filter {
+                    Some(f) { if hasCorr(&f) { bad = true } }
+                    None {}
+                }
+                if bad { return Err(e("0A000", "correlated subqueries in aggregate arguments are not supported yet")) }
+            }
+        }
         for x in exprs { try checkGrouped(&x, &gtexts, &okLevels, &q) }
         for x in order { try checkGrouped(&x, &gtexts, &okLevels, &q) }
         match having {
@@ -3083,12 +3626,14 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             None {}
         }
     }
+    var desc: []bool = []
+    for o in s.order { append(mut &desc, o.desc) }
     return Ok(Sel{q: q, exprs: exprs, outs: outs, groupBy: groupBy, order: order, aggQ: aggQ, sort: sort,
-                  first: first, limit: limit, offset: offset, having: having, specs: specs, distinct: s.distinct})
+                  first: first, limit: limit, offset: offset, having: having, specs: specs, distinct: s.distinct, desc: desc})
 }
 
 // EXPLAIN's lines for a planned SELECT.
-fn selLines(sel: &Sel, cnt: &[]Counts): []str {
+fn selLines(sel: &Sel, cnt: &[]Counts, stats: &[]SubStat): []str {
     var lines = explainLines(&sel.q, cnt)
     if len(sel.q.levels) == 0 { append(mut &lines, "result") }
     if sel.first >= 0 { append(mut &lines, "min/max: the first value in the scan's order") }
@@ -3097,6 +3642,7 @@ fn selLines(sel: &Sel, cnt: &[]Counts): []str {
     if sel.distinct { append(mut &lines, "distinct") }
     if len(sel.order) > 0 { append(mut &lines, if sel.sort { "order: sort" } else { "order: the scan's" }) }
     if sel.limit >= 0 && !sel.aggQ && !sel.sort { append(mut &lines, "limit: stops the scan") }
+    subLines(&sel.q, stats, mut &lines)
     return lines
 }
 
@@ -3104,14 +3650,41 @@ fn selLines(sel: &Sel, cnt: &[]Counts): []str {
 // table, with what it did). The counts are kept for every query: an add each.
 fn selectWith(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int,
               analyze: bool, plan: mut &[]str): Result[Res, DbErr] {
-    var sel = try planSelect(st, txn, s, params, ptypes)
+    var sc = newScope(params, ptypes)
+    let sel = try planSelect(st, txn, s, params, mut &sc)
     var rs = newRun(&sel.q)
-    try materialize(st, txn, mut &sel.q, params, mut &rs)
+    let res = try execSel(st, txn, &sel, params, -1, mut &rs)
+    if analyze {
+        let lines = selLines(&sel, &rs.cnt, &rs.stats)
+        for l in lines { append(plan, l) }
+    }
+    return Ok(res)
+}
+
+// An ORDER BY value, running its correlated subqueries.
+fn orderX(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, o: &Expr, outs: &[]OutCol, vals: &[]Val,
+          env: &Env, rs: mut &Run): Result[Val, DbErr] {
+    if q.corr && hasCorr(o) { return evalX(st, txn, q, o, env, rs) }
+    return orderValue(o, outs, vals, env)
+}
+
+// Runs a planned SELECT. cap >= 0: at most that many rows are wanted (a
+// subquery: EXISTS 1, in any order; a scalar 2).
+fn execSel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params: &[]Val, cap: int,
+           rs: mut &Run): Result[Res, DbErr] {
+    let m = try prepare(st, txn, &sel.q, params, rs)
     let q = &sel.q
-    let limit = sel.limit
+    let limit = if cap >= 0 && (sel.limit < 0 || cap < sel.limit) { cap } else { sel.limit }
     let offset = sel.offset
+    let sorting = sel.sort && cap != 1
+    // correlated subqueries in the output run after the scan, from its rows kept
+    var late = false
+    if q.corr && !sel.aggQ {
+        for x in sel.exprs { if hasCorr(&x) { late = true } }
+        if sorting { for x in sel.order { if hasCorr(&x) { late = true } } }
+    }
     var outRows: []OutRow = []
-    let early = !sel.aggQ && !sel.sort && limit >= 0
+    let early = !sel.aggQ && !sorting && limit >= 0 && !(late && sel.distinct)
     let stopAt = if offset > 0 { limit + offset } else { limit }
     let noAggs: []Val = []
     var seen: Map[str, int] = newMap()      // SELECT DISTINCT
@@ -3120,9 +3693,9 @@ fn selectWith(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         var index: Map[str, int] = newMap()
         var firsts: [][]Val = []
         var accs: [][]Acc = []
-        try runQuery(st, txn, q, params, fn(r: &[]Val): Result[bool, DbErr] {
+        try runQuery(st, txn, q, &m, params, fn(r: &[]Val): Result[bool, DbErr] {
             if sel.first >= 0 && isNull(&r[sel.first]) { return Ok(true) }
-            let env = Env{cols: &q.cols, row: r, aggs: &noAggs, params: params}
+            let env = Env{cols: &q.cols, row: r, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs}
             var g = 0
             if len(sel.groupBy) > 0 {
                 var kb = newStrBuf()
@@ -3143,7 +3716,7 @@ fn selectWith(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             }
             for i in 0..len(sel.specs) { try accumulate(&sel.specs[i], mut &accs[g][i], &env) }
             return Ok(sel.first < 0)        // MIN/MAX in order: its first value is the answer
-        }, mut &rs)
+        }, rs)
         if len(firsts) == 0 && len(sel.groupBy) == 0 {
             append(mut &firsts, [])         // no rows, no GROUP BY: one group, empty
             append(mut &accs, newAccs(len(sel.specs)))
@@ -3151,25 +3724,44 @@ fn selectWith(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         for gi in 0..len(firsts) {
             var vals: []Val = []
             for i in 0..len(sel.specs) { append(mut &vals, try finish(&sel.specs[i], &accs[gi][i])) }
-            let env = Env{cols: &q.cols, row: &firsts[gi], aggs: &vals, params: params}
+            let env = Env{cols: &q.cols, row: &firsts[gi], aggs: &vals, params: params, subs: &m.subs, cur: &noAggs}
             match sel.having {
-                Some(h) { if truth(&(try eval(&h, &env))) != Some(true) { continue } }
+                Some(h) { if truth(&(try evalX(st, txn, q, &h, &env, rs))) != Some(true) { continue } }
                 None {}
             }
             var out: []Val = []
-            for x in sel.exprs { append(mut &out, try eval(&x, &env)) }
+            for x in sel.exprs { append(mut &out, try evalX(st, txn, q, &x, &env, rs)) }
             if sel.distinct {
                 let k = valsKey(&out)
                 if seen.get(&k).isSome() { continue }
                 seen.put(k, 1)
             }
             var ord: []Val = []
-            for o in sel.order { append(mut &ord, try orderValue(&o, &sel.outs, &out, &env)) }
+            if sorting { for o in sel.order { append(mut &ord, try orderX(st, txn, q, &o, &sel.outs, &out, &env, rs)) } }
             append(mut &outRows, OutRow{vals: out, ord: ord})
         }
+    } else if late {
+        var raws: [][]Val = []
+        try runQuery(st, txn, q, &m, params, fn(r: &[]Val): Result[bool, DbErr] {
+            append(mut &raws, copyRow(r))
+            return Ok(!early || len(raws) < stopAt)
+        }, rs)
+        for r in raws {
+            let env = Env{cols: &q.cols, row: &r, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs}
+            var vals: []Val = []
+            for x in sel.exprs { append(mut &vals, try evalX(st, txn, q, &x, &env, rs)) }
+            if sel.distinct {
+                let k = valsKey(&vals)
+                if seen.get(&k).isSome() { continue }
+                seen.put(k, 1)
+            }
+            var ord: []Val = []
+            if sorting { for o in sel.order { append(mut &ord, try orderX(st, txn, q, &o, &sel.outs, &vals, &env, rs)) } }
+            append(mut &outRows, OutRow{vals: vals, ord: ord})
+        }
     } else {
-        try runQuery(st, txn, q, params, fn(r: &[]Val): Result[bool, DbErr] {
-            let env = Env{cols: &q.cols, row: r, aggs: &noAggs, params: params}
+        try runQuery(st, txn, q, &m, params, fn(r: &[]Val): Result[bool, DbErr] {
+            let env = Env{cols: &q.cols, row: r, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs}
             var vals: []Val = []
             for x in sel.exprs { append(mut &vals, try eval(&x, &env)) }
             if sel.distinct {
@@ -3178,16 +3770,16 @@ fn selectWith(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
                 seen.put(k, 1)
             }
             var ord: []Val = []
-            if sel.sort { for o in sel.order { append(mut &ord, try orderValue(&o, &sel.outs, &vals, &env)) } }
+            if sorting { for o in sel.order { append(mut &ord, try orderValue(&o, &sel.outs, &vals, &env)) } }
             append(mut &outRows, OutRow{vals: vals, ord: ord})
             return Ok(!early || len(outRows) < stopAt)
-        }, mut &rs)
+        }, rs)
     }
-    if sel.sort {
+    if sorting {
         collections.sortBy(mut &outRows, fn(a: &OutRow, b: &OutRow): int {
-            for i in 0..len(s.order) {
+            for i in 0..len(sel.desc) {
                 var c = sortCmp(&a.ord[i], &b.ord[i])
-                if s.order[i].desc { c = -c }
+                if sel.desc[i] { c = -c }
                 if c != 0 { return c }
             }
             return 0
@@ -3207,10 +3799,6 @@ fn selectWith(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         i += 1
     }
     res.tag = "SELECT " + len(res.rows).toStr()
-    if analyze {
-        let lines = selLines(&sel, &rs.cnt)
-        for l in lines { append(plan, l) }
-    }
     return Ok(res)
 }
 
@@ -3262,19 +3850,24 @@ fn guessParams(st: &lexdb_store.Store, s: &lexdb_sql.Stmt, out: mut &[]int) {
         Err(_) {}
     }
     if s.kind != lexdb_sql.S_SELECT && s.kind != lexdb_sql.S_UPDATE && s.kind != lexdb_sql.S_DELETE { return }
-    let np: []Val = []
-    let built = if s.kind == lexdb_sql.S_SELECT { buildQuery(st, mut &txn, &s.from, &s.where, &np) } else {
-        buildQuery(st, mut &txn, &oneTable(&s.table), &s.where, &np)
+    let np: []Val = array(len(out), Val.Null)
+    let noTypes: []int = []
+    var sc = newScope(&np, &noTypes)
+    let built = if s.kind == lexdb_sql.S_SELECT { buildQuery(st, mut &txn, &s.from, &s.where, &np, &s.subs, mut &sc) } else {
+        buildQuery(st, mut &txn, &oneTable(&s.table), &s.where, &np, &s.subs, mut &sc)
     }
     match built {
-        Ok(q) {
-            for lv in q.levels {
-                for c in lv.cond { compared(&c, &q, out) }
-                for c in lv.post { compared(&c, &q, out) }
-            }
-        }
+        Ok(q) { comparedIn(&q, out) }
         Err(_) {}
     }
+}
+
+fn comparedIn(q: &Query, out: mut &[]int) {
+    for lv in q.levels {
+        for c in lv.cond { compared(&c, q, out) }
+        for c in lv.post { compared(&c, q, out) }
+    }
+    for sp in q.subs { comparedIn(&sp.sel.q, out) }
 }
 
 // A parameter compared with a column takes the column's type.
@@ -3308,10 +3901,11 @@ pub fn describe(st: &lexdb_store.Store, s: &lexdb_sql.Stmt, ptypes: &[]int): Res
     if s.kind != lexdb_sql.S_SELECT { return Ok([]) }
     var txn = lexdb_store.begin()
     let none: Option[Expr] = None
-    let np: []Val = []
-    let q = try buildQuery(st, mut &txn, &s.from, &none, &np)
+    let np: []Val = array(if s.params > len(ptypes) { s.params } else { len(ptypes) }, Val.Null)
+    var sc = newScope(&np, ptypes)
+    let q = try buildQuery(st, mut &txn, &s.from, &none, &np, &s.subs, mut &sc)
     var exprs: []Expr = []
-    return selectCols(s, &q.cols, ptypes, mut &exprs)
+    return selectCols(s, &q.cols, mut &sc, mut &exprs)
 }
 
 // ---- sessions
@@ -3355,6 +3949,20 @@ pub fn (s: &Session) status(): byte {
 }
 
 fn execIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int): Result[Res, DbErr] {
+    // with subqueries, the outer values they use are numbered after all the
+    // statement's parameters: those not sent are NULL
+    let subs = len(s.subs) > 0 || (len(s.inner) > 0 && len(s.inner[0].subs) > 0)
+    let want = if s.params > len(ptypes) { s.params } else { len(ptypes) }
+    if subs && len(params) < want {
+        var ps: []Val = []
+        for v in params { append(mut &ps, v) }
+        while len(ps) < want { append(mut &ps, Val.Null) }
+        return execStmt(st, txn, s, &ps, ptypes)
+    }
+    return execStmt(st, txn, s, params, ptypes)
+}
+
+fn execStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int): Result[Res, DbErr] {
     match s.kind {
         lexdb_sql.S_CREATE { return createTable(st, txn, s) }
         lexdb_sql.S_DROP { return dropTable(st, txn, s) }

@@ -8,8 +8,11 @@
 // and MIN/MAX are read in an index's order on one side and sorted or
 // aggregated on the other; a RIGHT JOIN must equal the LEFT JOIN the other
 // way round, and a FULL JOIN the LEFT JOIN plus the other side's unmatched
-// rows.
-// expect: statements ok, queries 1204 differ 0, index paths used true, hash joins used true, index order used true, backward true, min/max true, filtered true, in-lists true
+// rows. Subqueries are compared with what they equal: IN with a correlated
+// EXISTS and with the list of its values, NOT EXISTS with a LEFT JOIN's
+// unmatched rows, a correlated count with a grouped LEFT JOIN, a scalar with
+// its value; UPDATE uses them too.
+// expect: statements ok, queries 1204 differ 0, index paths used true, hash joins used true, index order used true, backward true, min/max true, filtered true, in-lists true, subqueries per row true and once true
 import "strings"
 import "collections"
 import "../../../cmd/lexdb_store"
@@ -86,6 +89,27 @@ fn cond(r: mut &lexdb_base.Rng): str {
     }
 }
 
+// A condition's columns qualified by a table's alias.
+fn qual(c: &str, alias: &str): str {
+    var out: []str = []
+    for w in strings.split(c, " ") {
+        let t = w.toStr()
+        append(mut &out, if t == "x" || t == "y" || t == "z" || t == "id" { alias + "." + t } else { t })
+    }
+    return strings.join(&out, " ")
+}
+
+// A query's single column as a list of literals.
+fn literals(x: &str): []str {
+    var out: []str = []
+    if x == "" { return out }
+    for v in strings.split(x, ";") {
+        let t = v.toStr()
+        append(mut &out, if t == "N" { "null" } else { t })
+    }
+    return out
+}
+
 fn body(st: lexdb_store.Store): int {
     lexdb_exec.bootstrap(&st).unwrap()
     var s = lexdb_exec.newSession(st)
@@ -109,6 +133,8 @@ fn body(st: lexdb_store.Store): int {
     var firstValue = false
     var filtered = false
     var inLists = false
+    var correlated = false
+    var runOnce = false
     for round in 0..40 {
         // changes, the same to both pairs
         for k in 0..25 {
@@ -121,14 +147,18 @@ fn body(st: lexdb_store.Store): int {
                            zval(mut &r) + ")")
                 }
                 sql = "insert into T values " + strings.join(&vs, ", ")
-            } else if op < 9 {
+            } else if op < 8 {
                 sql = "update T set x = " + xval(mut &r) + ", y = " + yval(mut &r) + " where " + cond(mut &r)
+            } else if op < 9 {
+                // subqueries in DML: a value and a condition from b0, the same for both of a pair
+                sql = "update T set z = (select max(v.z) from b0 v where v.x = T.x) where x " + (if r.below(2) == 0 { "" } else { "not " }) +
+                      "in (select x from b0 where " + cond(mut &r) + ")"
             } else {
                 sql = "delete from T where " + cond(mut &r)
             }
             let p = if r.below(2) == 0 { ["a", "a0"] } else { ["b", "b0"] }
-            let got1 = rows(mut &s, &strings.replaceAll(sql, " T ", " " + p[0] + " "))
-            let got0 = rows(mut &s, &strings.replaceAll(sql, " T ", " " + p[1] + " "))
+            let got1 = rows(mut &s, &strings.replaceAll(strings.replaceAll(sql, " T ", " " + p[0] + " "), " T.", " " + p[0] + "."))
+            let got0 = rows(mut &s, &strings.replaceAll(strings.replaceAll(sql, " T ", " " + p[1] + " "), " T.", " " + p[1] + "."))
             if got1 != got0 {
                 differ += 1
                 println("differ: " + sql + ": " + got1 + " / " + got0)
@@ -139,7 +169,7 @@ fn body(st: lexdb_store.Store): int {
             var sql = ""
             let c = cond(mut &r)
             let n = (r.below(9) + 1).toStr()
-            let j = r.below(19)
+            let j = r.below(24)
             var q1 = ""
             var q0 = ""
             var got1 = ""
@@ -165,6 +195,47 @@ fn body(st: lexdb_store.Store): int {
                 }
                 q1 = strings.replaceAll(strings.replaceAll(sql, "from T", "from a"), "join U", "join b")
                 q0 = strings.replaceAll(strings.replaceAll(sql, "from T", "from a0"), "join U", "join b0")
+                got1 = rows(mut &s, &q1)
+                got0 = rows(mut &s, &q0)
+            } else if j == 19 {
+                // IN (subquery) = a correlated EXISTS
+                q1 = "select id from a where x in (select x from b where " + c + ") order by id"
+                q0 = "select t.id from a0 t where exists (select 1 from b0 u where u.x = t.x and (" + qual(&c, &"u") + ")) order by 1"
+                got1 = rows(mut &s, &q1)
+                got0 = rows(mut &s, &q0)
+            } else if j == 20 {
+                // NOT EXISTS = a LEFT JOIN's rows that joined nothing
+                q1 = "select t.id from a t where not exists (select 1 from b u where u.x = t.x and (" + qual(&c, &"u") + ")) order by 1"
+                q0 = "select t.id from a0 t left join b0 u on u.x = t.x and (" + qual(&c, &"u") + ") where u.id is null order by 1"
+                got1 = rows(mut &s, &q1)
+                got0 = rows(mut &s, &q0)
+            } else if j == 21 {
+                // a correlated count = a LEFT JOIN grouped
+                let c2 = cond(mut &r)
+                q1 = "select t.id, (select count(*) from b u where u.x = t.x and (" + qual(&c, &"u") + ")), (select max(u.z) from b u where u.x = t.x) from a t where " +
+                     qual(&c2, &"t") + " order by 1"
+                q0 = "select t.id, count(u.id), (select max(z) from b0 where b0.x = t.x) from a0 t left join b0 u on u.x = t.x and (" + qual(&c, &"u") + ") where " +
+                     qual(&c2, &"t") + " group by t.id order by 1"
+                got1 = rows(mut &s, &q1)
+                got0 = rows(mut &s, &q0)
+            } else if j == 22 {
+                // IN and NOT IN (subquery) = the list of its values
+                let neg = if r.below(2) == 0 { "" } else { "not " }
+                let vals = literals(&rows(mut &s, &("select x from b0 where " + c)))
+                q1 = "select id from a where x " + neg + "in (select x from b where " + c + ") order by id"
+                if len(vals) == 0 {
+                    q0 = "select id from a0 where " + (if neg == "" { "false" } else { "true" }) + " order by id"
+                } else {
+                    q0 = "select id from a0 where x " + neg + "in (" + strings.join(&vals, ", ") + ") order by id"
+                }
+                got1 = rows(mut &s, &q1)
+                got0 = rows(mut &s, &q0)
+            } else if j == 23 {
+                // a scalar subquery = its value; in ORDER BY with LIMIT too
+                let v = rows(mut &s, &("select max(x) from b0 where " + c))
+                let lit = if v == "N" { "null" } else { v }
+                q1 = "select id, x from a where x <= (select max(x) from b where " + c + ") order by x desc, id limit " + n
+                q0 = "select id, x from a0 where x <= " + lit + " order by x desc, id limit " + n
                 got1 = rows(mut &s, &q1)
                 got0 = rows(mut &s, &q0)
             } else if j == 12 {
@@ -265,6 +336,8 @@ fn body(st: lexdb_store.Store): int {
             if strings.contains(ex, "min/max:") { firstValue = true }
             if strings.contains(ex, "(filtered)") { filtered = true }
             if strings.contains(ex, "for each of") { inLists = true }
+            if strings.contains(ex, "per row, on") { correlated = true }
+            if strings.contains(ex, "run once") { runOnce = true }
         }
     }
     // Scans longer than a batch (256 rows), in order both ways, against sorts
@@ -292,7 +365,7 @@ fn body(st: lexdb_store.Store): int {
     if n == "0" { println("a is empty") }
     println("statements ok, queries " + queries.toStr() + " differ " + differ.toStr() + ", index paths used " +
             indexed.toStr() + ", hash joins used " + hashed.toStr() +
-            ", index order used " + ordered.toStr() + ", backward " + backward.toStr() + ", min/max " + firstValue.toStr() + ", filtered " + filtered.toStr() + ", in-lists " + inLists.toStr())
+            ", index order used " + ordered.toStr() + ", backward " + backward.toStr() + ", min/max " + firstValue.toStr() + ", filtered " + filtered.toStr() + ", in-lists " + inLists.toStr() + ", subqueries per row " + correlated.toStr() + " and once " + runOnce.toStr())
     return 0
 }
 
