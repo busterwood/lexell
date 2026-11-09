@@ -1,0 +1,273 @@
+// The whole-server crash test's client (tests/lexdb/crash.py runs it). A
+// real lexdb process is killed (SIGKILL) while this loads it; what the
+// server acknowledged must survive the restart, and nothing else may
+// appear.
+//
+//     client setup DSN DIR             the tables
+//     client load DSN DIR ROUND        workers until the server dies
+//     client check DSN DIR             the database against every round's records
+//
+// The tables: acct (1,000 accounts of 1,000: their sum is 1,000,000 after
+// any number of transfers) and log (id, worker, note), with an index on
+// worker. Each load worker has its own connection and mixes:
+// - a transfer in a block: two balance updates and a log row, then COMMIT;
+// - an insert of a log row with a note of about 180 bytes (the tree splits);
+// - a delete of one of its own acknowledged rows.
+// A worker writes what happened to DIR/ROUND.WORKER: "I id" an insert
+// acknowledged (a transfer's log row too), "D id" a delete acknowledged,
+// "? id" in flight when the connection died (either outcome is allowed),
+// "C" a conflict (40001: not applied). Ids are unique over all rounds:
+// round * 10^7 + worker * 10^5 + n.
+//
+// check: sum(bal) is 1,000,000 and there are 1,000 accounts; every
+// acknowledged insert not acknowledged deleted is there, every acknowledged
+// delete is not; no row is there that was never attempted; every row's
+// worker and note are what its id says; for each worker, the index
+// (worker = $1) and the scan count the same rows. It prints "ok ROWS" or
+// the problems, and exits 1 on any.
+import "os"
+import "fs"
+import "io"
+import "task"
+import "strings"
+import "postgres"
+import "sqldialect"
+
+type V = sqldialect.Value
+
+const WORKERS: int = 12
+const ACCTS: int = 1000
+
+fn note(id: int): str {
+    return "row " + id.toStr() + " " + strings.repeat(strings.padLeft((id % 97).toStr(), 2, '0'), 85)
+}
+
+fn rnd(s: mut &int): int {
+    s = (s * 1103515245 + 12345) % 2147483648
+    return s
+}
+
+type Arg = record { dsn: str; dir: str; round: int; worker: int }
+
+// What a statement's error means: "C" a conflict, "?" the connection is
+// gone (the outcome unknown), else the error itself (a test failure).
+fn kind(e: &postgres.Error): str {
+    if e.state == "40001" { return "C" }
+    if len(e.state) == 0 { return "?" }
+    return "ERR " + e.toStr()
+}
+
+fn worker(a: Arg): int {
+    var out: []str = []
+    var seed = a.round * 7919 + a.worker * 104729 + 1
+    var mine: []int = []
+    let base = a.round * 10000000 + a.worker * 100000
+    var n = 0
+    let cr = postgres.connect(a.dsn)
+    if cr.isErr() {
+        append(mut &out, "# connect: " + cr.unwrapErr().toStr())
+        save(&a, &out)
+        return 0
+    }
+    var c = cr.unwrap()
+    let pr = c.prepare("insert into log values ($1, $2, $3)")
+    if pr.isErr() {
+        let e = pr.unwrapErr()
+        // the server already gone: nothing was attempted
+        if len(e.state) > 0 { append(mut &out, "# prepare: " + e.toStr()) }
+        save(&a, &out)
+        return 0
+    }
+    let ins = pr.unwrap()
+    var going = true
+    while going && n < 99000 {
+        n += 1
+        let id = base + n
+        let op = rnd(mut &seed) % 10
+        if op < 4 {
+            // a transfer in a block
+            let x = rnd(mut &seed) % ACCTS
+            var y = rnd(mut &seed) % ACCTS
+            if y == x { y = (x + 1) % ACCTS }
+            let d = rnd(mut &seed) % 50 + 1
+            var failed = ""
+            for sql in ["begin",
+                        "update acct set bal = bal - " + d.toStr() + " where id = " + x.toStr(),
+                        "update acct set bal = bal + " + d.toStr() + " where id = " + y.toStr(),
+                        "insert into log values (" + id.toStr() + ", " + a.worker.toStr() + ", '" + note(id) + "')"] {
+                if len(failed) == 0 {
+                    match c.exec(sql) {
+                        Ok(_) {}
+                        Err(e) { failed = kind(&e) }
+                    }
+                }
+            }
+            if len(failed) == 0 {
+                match c.exec("commit") {
+                    Ok(_) {
+                        append(mut &out, "I " + id.toStr())
+                        append(mut &mine, id)
+                    }
+                    Err(e) { failed = kind(&e) }
+                }
+                if failed == "?" { append(mut &out, "? " + id.toStr()) }
+            }
+            if failed == "C" {
+                append(mut &out, "C")
+                match c.exec("rollback") { Ok(_) {} Err(e) { failed = kind(&e) } }
+            }
+            if failed == "?" { going = false }
+            else if strings.startsWith(failed, "ERR") {
+                append(mut &out, "# transfer " + id.toStr() + ": " + failed)
+                match c.exec("rollback") { Ok(_) {} Err(_) {} }
+            }
+        } else if op < 9 || len(mine) == 0 {
+            // an insert, prepared
+            match c.queryPrepared(&ins, &[V.Int(id), V.Int(a.worker), V.Text(note(id))]) {
+                Ok(_) {
+                    append(mut &out, "I " + id.toStr())
+                    append(mut &mine, id)
+                }
+                Err(e) {
+                    let k = kind(&e)
+                    if k == "?" {
+                        append(mut &out, "? " + id.toStr())
+                        going = false
+                    } else if k == "C" { append(mut &out, "C") }
+                    else { append(mut &out, "# insert " + id.toStr() + ": " + k) }
+                }
+            }
+        } else {
+            // a delete of one of its own acknowledged rows
+            let at = rnd(mut &seed) % len(mine)
+            let gone = mine[at]
+            mine[at] = mine[len(mine) - 1]
+            let last = pop(mut &mine)
+            match c.exec("delete from log where id = " + gone.toStr()) {
+                Ok(_) { append(mut &out, "D " + gone.toStr()) }
+                Err(e) {
+                    let k = kind(&e)
+                    if k == "?" {
+                        append(mut &out, "?D " + gone.toStr())
+                        going = false
+                    } else if k == "C" { append(mut &out, "C") }
+                    else { append(mut &out, "# delete " + gone.toStr() + ": " + k) }
+                }
+            }
+        }
+    }
+    save(&a, &out)
+    return 0
+}
+
+fn save(a: &Arg, out: &[]str) {
+    let path = a.dir + "/" + a.round.toStr() + "." + a.worker.toStr()
+    fs.writeAtomic(path, strings.join(out, "\n") + "\n").unwrap()
+}
+
+fn setup(dsn: str): int {
+    var c = postgres.connect(dsn).unwrap()
+    c.exec("create table acct (id int primary key, bal int)").unwrap()
+    c.exec("create table log (id bigint primary key, worker int, note text)").unwrap()
+    c.exec("create index log_worker on log (worker)").unwrap()
+    var vals: []str = []
+    for i in 0..ACCTS { append(mut &vals, "(" + i.toStr() + ", 1000)") }
+    c.exec("insert into acct values " + strings.join(&vals, ", ")).unwrap()
+    println("setup ok")
+    return 0
+}
+
+fn load(dsn: str, dir: str, round: int): int {
+    task.scope(fn(sc: mut &task.Scope) {
+        for w in 0..WORKERS { sc.spawn(worker, Arg{dsn: dsn, dir: dir, round: round, worker: w}) }
+    })
+    return 0
+}
+
+fn readFile(path: str): str {
+    var r = io.open(path).unwrap()
+    return io.readAll(mut &r).unwrap()
+}
+
+fn check(dsn: str, dir: str): int {
+    // what the records say: per id, its last acknowledged state
+    var acked: Map[int, bool] = newMap()        // true: inserted, false: deleted
+    var maybe: Map[int, bool] = newMap()        // in flight
+    var problems: []str = []
+    var conflicts = 0
+    for name in fs.listNames(dir).unwrap() {
+        if !strings.contains(name, ".") { continue }
+        let text = readFile(dir + "/" + name)
+        for line in strings.split(&text, "\n") {
+            if len(line) == 0 { continue }
+            if line == "C" { conflicts += 1; continue }
+            if strings.startsWith(line, "#") { append(mut &problems, name + ": " + line); continue }
+            let parts = strings.split(&line, " ")
+            let id = strings.parseIntOpt(parts[1]).unwrap()
+            if parts[0] == "I" { acked.put(id, true) }
+            else if parts[0] == "D" { acked.put(id, false) }
+            else { maybe.put(id, true) }
+        }
+    }
+    let cr = postgres.connect(dsn)
+    if cr.isErr() {
+        println("connect: " + cr.unwrapErr().toStr())
+        return 1
+    }
+    var c = cr.unwrap()
+    let sum = c.query("select sum(bal), count(*) from acct", &[]).unwrap()
+    if sum.text(0, 0).unwrap() != "1000000" || sum.text(0, 1).unwrap() != "1000" {
+        append(mut &problems, "acct: sum " + sum.text(0, 0).unwrap() + " count " + sum.text(0, 1).unwrap())
+    }
+    let rows = c.query("select id, worker, note from log", &[]).unwrap()
+    var present: Map[int, bool] = newMap()
+    var perWorker = array(WORKERS, 0)
+    for i in 0..rows.rowCount() {
+        let id = rows.int(i, 0).unwrap()
+        present.put(id, true)
+        let w = rows.int(i, 1).unwrap()
+        if w != (id % 10000000) / 100000 || rows.text(i, 2).unwrap() != note(id) {
+            append(mut &problems, "row " + id.toStr() + ": worker " + w.toStr() + " or its note is not what was written")
+        }
+        if w >= 0 && w < WORKERS { perWorker[w] += 1 }
+        let known = match acked.get(&id) { Some(_) { true } None { maybe.has(&id) } }
+        if !known { append(mut &problems, "row " + id.toStr() + " was never acknowledged nor in flight") }
+    }
+    for id in acked.keys() {
+        let want = acked.at(id)
+        let has = present.has(&id)
+        if want && !has && !maybe.has(&id) { append(mut &problems, "acknowledged insert " + id.toStr() + " is missing") }
+        if !want && has && !maybe.has(&id) { append(mut &problems, "acknowledged delete " + id.toStr() + " is still there") }
+    }
+    for w in 0..WORKERS {
+        let r = c.query("select count(*) from log where worker = $1", &[V.Int(w)]).unwrap()
+        let n = r.int(0, 0).unwrap()
+        if n != perWorker[w] { append(mut &problems, "worker " + w.toStr() + ": the index counts " + n.toStr() + ", the scan " + perWorker[w].toStr()) }
+    }
+    if len(problems) > 0 {
+        var shown = 0
+        for p in problems {
+            if shown < 20 { println(p) }
+            shown += 1
+        }
+        println(len(problems).toStr() + " problems")
+        return 1
+    }
+    println("ok " + rows.rowCount().toStr() + " rows, " + len(acked.keys()).toStr() + " acknowledged, " + len(maybe.keys()).toStr() +
+            " in flight, " + conflicts.toStr() + " conflicts")
+    return 0
+}
+
+fn main() {
+    let args = os.arguments()
+    if len(args) < 3 {
+        eprintln("usage: client setup|load|check DSN DIR [ROUND]")
+        exit(2)
+    }
+    let mode = args[0]
+    var code = 0
+    if mode == "setup" { code = setup(args[1]) }
+    else if mode == "load" { code = load(args[1], args[2], strings.parseIntOpt(args[3]).unwrap()) }
+    else { code = check(args[1], args[2]) }
+    exit(code)
+}

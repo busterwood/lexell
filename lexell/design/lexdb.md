@@ -525,7 +525,7 @@ is the comparison to make.
 5. Plans kept per prepared statement: since D4 every execution resolves
    names and chooses paths, and point selects fell from 26,700 to about
    24,000 tps.
-6. Whole-server crash tests through the wire protocol.
+6. Whole-server crash tests through the wire protocol (built: 9.18).
 7. COPY; then the cost questions (section 0), with EXPLAIN ANALYZE's
    counts as the evidence.
 8. Overflow pages for large rows; reclaiming a dropped table's pages.
@@ -1257,4 +1257,51 @@ process:
 - LIMIT $1;
 - a statement that does not parse;
 - a statement used on another connection.
+
+### 9.18 The whole-server crash test
+
+`tests/lexdb/crash.py` runs a real lexdb process on the real disk.
+`crash/client.lxl`, on `lib/postgres`, loads it from 12 connections:
+
+- transfers in blocks: two balance updates and a log row;
+- prepared inserts of about 180 bytes, which split the tree;
+- deletes of each worker's own acknowledged rows.
+
+After 0.3 to 3 s the server is killed with SIGKILL, or every fifth round
+stopped with SIGTERM, when it must exit 0. Every fourth round the
+restarted server is killed again during recovery. The server runs with a
+4 MB cache, 1 MB log segments and a checkpoint every 512 KB of log
+(`LEXDB_CACHE_MB`, `LEXDB_SEG_KB`, `LEXDB_CKPT_KB`), so kills land in
+evictions, segment switches and checkpoints.
+
+After each round, a check on the restarted server, against every round's
+records:
+
+- the 1,000 accounts still sum to 1,000,000;
+- every acknowledged insert is there and every acknowledged delete gone
+  (an operation in flight at the kill may go either way);
+- no row is there that was never attempted;
+- every row's worker and note are what its id says;
+- per worker, the index and the scan count the same rows.
+
+A kill leaves the kernel's page cache, so this tests the server's own
+path: sockets, group commit, checkpoints, recovery. A power cut is the
+simulated disk's (`store_crash`).
+
+40 rounds (seed 2) passed: 240,451 acknowledged writes and 387 in flight
+over 32 kills, 10 of them in recovery, and 8 clean stops. Recovery took
+0.02 to 0.1 s. Two planted bugs were caught in the first round, and put
+back:
+
+- a commit acknowledged before its flush: 9 acknowledged inserts missing;
+- replay stopping at the end of a log segment: acknowledged deletes back
+  and inserts missing.
+
+The test is not in the quick suite (`tests/lexdb.py`): 40 rounds take
+about three minutes.
+
+It also shows the cost of page-level conflicts. About 15% of all
+operations failed with 40001 (43,339 of about 284,000): transfers among
+1,000 accounts in a few leaves collide even when they touch different
+accounts. That is the baseline for per-row conflicts (9.4), next.
 
