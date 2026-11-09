@@ -510,17 +510,29 @@ is the comparison to make.
    change). For file reads only it saves at most 17 us of system calls per
    cache miss on the SQL thread; for the whole event loop, sockets too.
 2. Conflicts per row, not per leaf (built: 9.19).
-3. Smaller items: a correlated subquery's value as a lookup's key (now it
-   is only a filter), correlated subqueries in GROUP BY and in aggregates' arguments,
-   ORDER BY inside an aggregate (`string_agg(x, ',' ORDER BY x)`),
-   hashing a correlated scalar subquery with an aggregate (a count per
-   customer) as a grouped run, `WITH` before INSERT, UPDATE and DELETE.
-   Choosing hash or index per row by row counts (9.9) waits for costs,
-   which the user has left for now (section 0).
-4. Schemas (built: 9.20).
-5. Plans kept per prepared statement: since D4 every execution resolves
-   names and chooses paths, and point selects fell from 26,700 to about
-   24,000 tps.
+3. Smaller items, in the order the user set (after schemas):
+   - built: an uncorrelated `IN (subquery)` as lookups (9.21);
+   - `WITH` before INSERT, UPDATE and DELETE;
+   - a correlated subquery's value as a lookup's key (now it is only a
+     filter);
+   - correlated subqueries in GROUP BY and in aggregates' arguments;
+   - ORDER BY inside an aggregate (`string_agg(x, ',' ORDER BY x)`);
+   - hashing a correlated scalar subquery with an aggregate (a count per
+     customer) as a grouped run.
+
+   Waiting for row counts (costs, which the user has left for now: section
+   0): choosing hash or index per row (9.9), and when an IN subquery's
+   values are too many for lookups (now a fixed 1,000: 9.21).
+4. Schemas (built: 9.20). Not done:
+   - `ALTER TABLE ... SET SCHEMA` and `ALTER SCHEMA ... RENAME`;
+   - privileges (`GRANT`, `AUTHORIZATION`), which wait for logins (item 9);
+   - `$user` in the search path as the login's name (now it is a schema
+     name looked for like any other);
+   - `current_schema()` and `current_schemas()`;
+   - the `pg_catalog` and `information_schema` views, which clients and
+     tools use to list schemas and tables (decided later: section 0);
+   - `SHOW` of PostgreSQL's own settings (`server_version` and the rest).
+5. Plans kept per prepared statement (built: 9.17).
 6. Whole-server crash tests through the wire protocol (built: 9.18).
 7. COPY; then the cost questions (section 0), with EXPLAIN ANALYZE's
    counts as the evidence.
