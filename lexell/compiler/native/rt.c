@@ -558,6 +558,21 @@ u64 lxllib_hash_key(i64 i) {
     for (int j = 7; j >= 0; j--) w = w << 8 | k[(i & 1) * 8 + j];
     return w;
 }
+/* lib hash's crc32c (hash.lxl): the CRC32C (Castagnoli) of n bytes at p, continuing crc (0 to
+   start). SSE4.2's crc32 instruction, which computes exactly this CRC, 8 bytes a step; x86-64-v3,
+   which programs require, includes SSE4.2. */
+uint32_t lxllib_hash_crc32c(const void* p, i64 n, uint32_t crc) {
+    const unsigned char* b = (const unsigned char*)p;
+    u64 c = (uint32_t)~crc;
+    for (; n >= 8; b += 8, n -= 8) {
+        u64 w;
+        __builtin_memcpy(&w, b, 8);
+        c = __builtin_ia32_crc32di(c, w);
+    }
+    uint32_t c32 = (uint32_t)c;
+    for (; n > 0; b++, n--) c32 = __builtin_ia32_crc32qi(c32, *b);
+    return ~c32;
+}
 
 /* clock_gettime(which): through the vDSO when rt_init found it, else the system call */
 static void rt_clock(int which, rt_ts* t) {

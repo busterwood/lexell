@@ -22,7 +22,7 @@ for leaks.
 | Module | Lines | Contents |
 |---|---:|---|
 | `std.lxl` | 537 | the prelude facade: Option, Result, Unit, Where; Eq/Ord/Hash/Show for the primitives; checked arithmetic and float methods; print/println/eprint/eprintln; min/max; prelude aliases/wrappers for Decimal, Map, StrBuf and sort |
-| `hash.lxl` | 207 | SipHash-1-3 and the per-process hash key (AT_RANDOM); `sipHash13`, `sipStr`, `sipWords`, `hashSeed` |
+| `hash.lxl` | 224 | SipHash-1-3 and the per-process hash key (AT_RANDOM); `sipHash13`, `sipStr`, `sipWords`, `hashSeed`; CRC32C with the CPU's crc32 instruction, `crc32c`, `crc32cMore` |
 | `decimal.lxl` | 1,041 | Decimal, Rounding, DecError, exact arithmetic, parse/format, POW10, sumDecimals (the `m` literal's implementation) |
 | `money.lxl` | 196 | Currency, USD/EUR/GBP/JPY/CHF, Money[C] |
 | `math.lxl` | 306 | float constants, parse, fixed, toDecimal, near, IEEE bit patterns |
