@@ -1625,9 +1625,9 @@ Caught, each put back:
   as in PostgreSQL. The other aggregates accept ORDER BY and ignore it:
   their results do not depend on order.
 - **Correlated keys** group later, as correlated arguments do (9.24).
-- **Fixed on the way:** two calls differing only in their directions (or
-  DISTINCT) shared one accumulator, since `exprText` leaves the name's
-  marks out. The spec's key now includes the full name.
+- **`exprText` shows the ORDER BY** (`string_agg(name, ',' order by k
+  desc)`). It is the key equal calls share an accumulator by: without the
+  directions, two calls differing only in them shared one.
 
 `exec_aggorder` covers:
 
@@ -1650,6 +1650,6 @@ Caught, each put back:
 - NULLS FIRST not parsed;
 - separators by arrival;
 - ties unstable;
-- accumulators shared across directions;
+- accumulators shared across directions, and `exprText` without them;
 - the second key ignored.
 
