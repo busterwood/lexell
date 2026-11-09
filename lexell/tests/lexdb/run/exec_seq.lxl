@@ -1,0 +1,201 @@
+// lexdb_exec: sequences, SERIAL and identity columns (design/lexdb.md
+// 9.43). CREATE, ALTER and DROP SEQUENCE with their options; nextval,
+// currval, setval, lastval; values outside transactions (a rollback keeps
+// them taken, two sessions never conflict over them); serial, bigserial,
+// smallserial; GENERATED ALWAYS and BY DEFAULT AS IDENTITY with OVERRIDING;
+// DEFAULT nextval(...); a sequence made in the open transaction; what DROP
+// TABLE, DROP COLUMN, renames and moves do to a column's sequence; after a
+// reopen (the values go on after the last block written).
+// expect: nextval: 1 2 3, currval 3, lastval 3; another session: 55000 55000
+// expect: options: 10 15, down -1 -2, bounded 1 2 3 then 2200H nextval: reached maximum value of sequence "b" (3), cycling 2 3 1
+// expect: setval: 100 then 101; not called: 50 then 50; bounds 22003 setval: value 0 is out of bounds for sequence "s" (1..9223372036854775807)
+// expect: alter: restart 1, with 7, increment 10: 17
+// expect: many: 1 100 100 5050
+// expect: rolled back: 2 then 3
+// expect: two sessions: 1 2, both commit COMMIT COMMIT
+// expect: serial: 1|a 2|b 10|c 3|d, currval 3; smallserial bounds 22003; bigserial 1
+// expect: always: 1, given 428C9, overriding 5, default 2, update 428C9, to default 3
+// expect: by default: 100 110 5 120
+// expect: default nextval: 1000|a 1001|b, missing 42P01
+// expect: in the transaction: 1, w 1, after commit 2
+// expect: rolled back sequence: 1
+// expect: names: x_a_seq1 1, a table on it 42P07
+// expect: drop: 2BP01, cascade DROP SEQUENCE, then 23502; table dropped, its sequence 42P01; column dropped 42P01
+// expect: renamed: 4, dropped with it 42P01; column renamed then dropped 42P01
+// expect: moved: 2, schema renamed 3 4
+// expect: add column: ALTER TABLE 1, with rows 0A000
+// expect: errors: 22023 22023 22023 0A000 42P01 42601 22023; a name not bound by its statement 0A000
+// expect: reopened: 33, d 1032, currval of one not used yet 55000
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if !r.hasRows { return r.tag }
+            var out: []str = []
+            for row in r.rows {
+                var vs: []str = []
+                for v in row { append(mut &vs, lexdb_exec.text(&v)) }
+                append(mut &out, strings.join(&vs, "|"))
+            }
+            return strings.join(&out, " ")
+        }
+        Err(e) { return e.state + " " + e.msg }
+    }
+}
+
+fn state(s: mut &lexdb_exec.Session, sql: &str): str { return q(s, sql)[0..5] }
+
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: 256 * 1024, segBytes: 1024 * 1024, ckptBytes: 512 * 1024, snapNodes: 100000}
+}
+
+fn main() {
+    let fs = lexdb_disk.sim(43)
+    lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        var s2 = lexdb_exec.newSession(st)
+        let c1 = q(mut &s, &"create sequence s")
+        let n1 = q(mut &s, &"select nextval('s')")
+        let n2 = q(mut &s, &"select nextval('s')")
+        println("nextval: " + n1 + " " + n2 + " " + q(mut &s, &"select nextval('S')") + ", currval " + q(mut &s, &"select currval('s')") +
+                ", lastval " + q(mut &s, &"select lastval()") + "; another session: " + state(mut &s2, &"select currval('s')") + " " +
+                state(mut &s2, &"select lastval()"))
+
+        let o1 = q(mut &s, &"create sequence i increment by 5 start with 10; create sequence dn increment -1")
+        let o2 = q(mut &s, &"create sequence b maxvalue 3; create sequence cy minvalue 1 maxvalue 3 start 2 cycle")
+        let o3 = q(mut &s, &"select nextval('i')")
+        let o4 = q(mut &s, &"select nextval('dn')")
+        let o5 = q(mut &s, &"select nextval('b')")
+        let o6 = q(mut &s, &"select nextval('b')")
+        let o7 = q(mut &s, &"select nextval('cy')")
+        let o8 = q(mut &s, &"select nextval('cy')")
+        println("options: " + o3 + " " + q(mut &s, &"select nextval('i')") + ", down " + o4 + " " + q(mut &s, &"select nextval('dn')") +
+                ", bounded " + o5 + " " + o6 + " " + q(mut &s, &"select nextval('b')") + " then " + q(mut &s, &"select nextval('b')") +
+                ", cycling " + o7 + " " + o8 + " " + q(mut &s, &"select nextval('cy')"))
+
+        let v1 = q(mut &s, &"select setval('s', 100)")
+        let v2 = q(mut &s, &"select nextval('s')")
+        let v3 = q(mut &s, &"select setval('s', 50, false)")
+        println("setval: " + v1 + " then " + v2 + "; not called: " + v3 + " then " + q(mut &s, &"select nextval('s')") + "; bounds " +
+                q(mut &s, &"select setval('s', 0)"))
+        let a1 = q(mut &s, &"alter sequence s restart")
+        let a2 = q(mut &s, &"select nextval('s')")
+        let a3 = q(mut &s, &"alter sequence s restart with 7")
+        let a4 = q(mut &s, &"select nextval('s')")
+        let a5 = q(mut &s, &"alter sequence s increment by 10")
+        println("alter: restart " + a2 + ", with " + a4 + ", increment 10: " + q(mut &s, &"select nextval('s')"))
+
+        // across many blocks
+        let m1 = q(mut &s, &"create sequence many; create table mt (id int primary key)")
+        let m2 = q(mut &s, &"insert into mt select nextval('many') from generate_series(1, 100)")
+        println("many: " + q(mut &s, &"select min(id) || ' ' || max(id) || ' ' || count(*) || ' ' || sum(id) from mt"))
+
+        // outside transactions
+        let r1 = q(mut &s, &"create sequence rb; begin")
+        let r2 = q(mut &s, &"select nextval('rb')")
+        let r3 = q(mut &s, &"select nextval('rb')")
+        let r4 = q(mut &s, &"rollback")
+        println("rolled back: " + r3 + " then " + q(mut &s, &"select nextval('rb')"))
+        let p1 = q(mut &s, &"create sequence two; create table tw (id int primary key, who text)")
+        let p2 = q(mut &s, &"begin")
+        let p3 = q(mut &s2, &"begin")
+        let p4 = q(mut &s, &"insert into tw values (nextval('two'), 'a')")
+        let p5 = q(mut &s2, &"insert into tw values (nextval('two'), 'b')")
+        let p6 = q(mut &s, &"commit")
+        let p7 = q(mut &s2, &"commit")
+        println("two sessions: " + q(mut &s, &"select id from tw order by who") + ", both commit " + p6 + " " + p7)
+
+        // serial
+        let e1 = q(mut &s, &"create table t (id serial primary key, v text)")
+        let e2 = q(mut &s, &"insert into t (v) values ('a'), ('b'); insert into t values (10, 'c'); insert into t (v) values ('d')")
+        let e3 = q(mut &s, &"create table ts (id smallserial primary key); create table tb (id bigserial primary key)")
+        let e4 = q(mut &s, &"insert into tb default values")
+        println("serial: " + q(mut &s, &"select id, v from t order by v") + ", currval " + q(mut &s, &"select currval('t_id_seq')") +
+                "; smallserial bounds " + state(mut &s, &"select setval('ts_id_seq', 40000)") + "; bigserial " + q(mut &s, &"select id from tb"))
+
+        // identity
+        let g1 = q(mut &s, &"create table g (id int generated always as identity primary key, v text)")
+        let g2 = q(mut &s, &"insert into g (v) values ('a')")
+        let g3 = state(mut &s, &"insert into g (id, v) values (5, 'x')")
+        let g4 = q(mut &s, &"insert into g (id, v) overriding system value values (5, 'x')")
+        let g5 = q(mut &s, &"insert into g values (default, 'y')")
+        let g5v = q(mut &s, &"select id from g where v = 'y'")
+        let g6 = state(mut &s, &"update g set id = 9 where v = 'y'")
+        let g7 = q(mut &s, &"update g set id = default where v = 'y'")
+        println("always: " + q(mut &s, &"select id from g where v = 'a'") + ", given " + g3 + ", overriding " + q(mut &s, &"select id from g where v = 'x'") +
+                ", default " + g5v + ", update " + g6 + ", to default " + q(mut &s, &"select id from g where v = 'y'"))
+        let h1 = q(mut &s, &"create table h (id bigint generated by default as identity (start with 100 increment by 10) primary key, v text)")
+        let h2 = q(mut &s, &"insert into h (v) values ('a'), ('b'); insert into h values (5, 'c')")
+        let h3 = q(mut &s, &"insert into h (id, v) overriding user value values (999, 'd')")
+        println("by default: " + q(mut &s, &"select id from h order by v"))
+
+        let d1 = q(mut &s, &"create sequence s2 start 1000; create table d (id int primary key default nextval('s2'), v text)")
+        let d2 = q(mut &s, &"insert into d (v) values ('a'), ('b')")
+        println("default nextval: " + q(mut &s, &"select * from d order by id") + ", missing " +
+                state(mut &s, &"create table d2 (id int primary key default nextval('nope'))"))
+
+        // a sequence made in the open transaction
+        let x1 = q(mut &s, &"begin; create sequence s3")
+        let x2 = q(mut &s, &"select nextval('s3')")
+        let x3 = q(mut &s, &"create table w (id serial primary key); insert into w default values")
+        let x4 = q(mut &s, &"select id from w")
+        let x5 = q(mut &s, &"commit")
+        println("in the transaction: " + x2 + ", w " + x4 + ", after commit " + q(mut &s, &"select nextval('s3')"))
+        let y1 = q(mut &s, &"begin; create sequence s4")
+        let y2 = q(mut &s, &"select nextval('s4')")
+        let y3 = q(mut &s, &"rollback; create sequence s4")
+        println("rolled back sequence: " + q(mut &s, &"select nextval('s4')"))
+
+        let n3 = q(mut &s, &"create sequence x_a_seq; create table x (id int primary key, a serial)")
+        println("names: x_a_seq1 " + q(mut &s, &"select nextval('x_a_seq1')") + ", a table on it " +
+                state(mut &s, &"create table x_a_seq1 (id int primary key)"))
+
+        // what a column's sequence goes with
+        let k1 = state(mut &s, &"drop sequence t_id_seq")
+        let k2 = q(mut &s, &"create table k (id serial primary key, v text); drop sequence k_id_seq cascade")
+        let k3 = state(mut &s, &"insert into k (v) values ('a')")
+        let k4 = q(mut &s, &"drop table t")
+        let k5 = state(mut &s, &"select nextval('t_id_seq')")
+        let k6 = q(mut &s, &"create table dc (id int primary key, n serial); alter table dc drop column n")
+        println("drop: " + k1 + ", cascade " + k2 + ", then " + k3 + "; table dropped, its sequence " + k5 + "; column dropped " +
+                state(mut &s, &"select nextval('dc_n_seq')"))
+        let w1 = q(mut &s, &"create table rn (id serial primary key, v int); insert into rn (v) values (1), (2), (3); alter table rn rename to rn2")
+        let w2 = q(mut &s, &"insert into rn2 (v) values (4); select max(id) from rn2")
+        let w3 = q(mut &s, &"drop table rn2")
+        let w4 = state(mut &s, &"select nextval('rn_id_seq')")
+        let w5 = q(mut &s, &"create table rc (id int primary key, n serial); alter table rc rename n to m; alter table rc drop column m")
+        println("renamed: " + w2 + ", dropped with it " + w4 + "; column renamed then dropped " + state(mut &s, &"select nextval('rc_n_seq')"))
+        let z1 = q(mut &s, &"create schema sa; create table mv (id serial primary key, v int); insert into mv (v) values (1); alter table mv set schema sa")
+        let z2 = q(mut &s, &"insert into sa.mv (v) values (2); select max(id) from sa.mv")
+        let z3 = q(mut &s, &"alter schema sa rename to sb")
+        let z4 = q(mut &s, &"insert into sb.mv (v) values (3); select max(id) from sb.mv")
+        println("moved: " + z2 + ", schema renamed " + z4 + " " + q(mut &s, &"select nextval('sb.mv_id_seq')"))
+
+        let ad1 = q(mut &s, &"create table ac (v int primary key); alter table ac add column id serial")
+        let ad2 = q(mut &s, &"insert into ac (v) values (1); select id from ac")
+        let ad3 = q(mut &s, &"create table ar (v int primary key); insert into ar values (1)")
+        println("add column: " + ad1 + " " + ad2 + ", with rows " + state(mut &s, &"alter table ar add column id serial"))
+
+        println("errors: " + state(mut &s, &"create sequence e1 increment 0") + " " + state(mut &s, &"create sequence e2 minvalue 5 maxvalue 5") + " " +
+                state(mut &s, &"create sequence e3 start 0") + " " + state(mut &s, &"select nextval(v::text) from ar") + " " +
+                state(mut &s, &"select nextval('ar')") + " " + state(mut &s, &"create table e4 (id serial default 1 primary key)") + " " +
+                state(mut &s, &"create table e5 (id text generated always as identity primary key)") + "; a name not bound by its statement " +
+                state(mut &s, &"select nextval(x) from (select 'rb' as x) q"))
+        let last = q(mut &s, &"select nextval('rb')")
+        return 0
+    }).unwrap()
+
+    lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int {
+        var s = lexdb_exec.newSession(st)
+        let t1 = q(mut &s, &"insert into d (v) values ('c')")
+        println("reopened: " + q(mut &s, &"select nextval('rb')") + ", d " + q(mut &s, &"select id from d where v = 'c'") + ", currval of one not used yet " +
+                state(mut &s, &"select currval('s')"))
+        return 0
+    }).unwrap()
+}

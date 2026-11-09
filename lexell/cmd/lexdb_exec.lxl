@@ -396,9 +396,10 @@ fn srfCols(name: &str, ordin: bool, args: &[]OutCol): Result[[]OutCol, DbErr] {
 // A function in FROM, run: its arguments, then its rows.
 fn execSrf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params: &[]Val, cap: int,
            rs: mut &Run): Result[Res, DbErr] {
+    let sqe = seqEnv(st, txn)
     let m = try prepare(st, txn, &sel.q, params, rs)
     let noRow: []Val = []
-    let env = Env{cols: &sel.q.cols, row: &noRow, aggs: &noRow, params: params, subs: &m.subs, cur: &noRow}
+    let env = Env{cols: &sel.q.cols, row: &noRow, aggs: &noRow, params: params, subs: &m.subs, cur: &noRow, seq: sqe}
     var args: []Val = []
     for x in sel.exprs { append(mut &args, try evalX(st, txn, &sel.q, &x, &env, rs)) }
     var rows: [][]Val = []
@@ -706,6 +707,7 @@ pub type Env = value record {
     params: &[]Val
     subs: &[]SubRes     // the results of the subqueries run once
     cur: &[]Val         // the correlated subqueries' values for this row
+    seq: Option[SeqEnv] // nextval and its kind: the store and session (none: not allowed here)
 }
 
 fn colIndex(cols: &[]lexdb_sql.ColDef, name: &str): int {
@@ -823,6 +825,7 @@ pub fn eval(x: &Expr, env: &Env): Result[Val, DbErr] {
             }
             var vs: []Val = []
             for a in args { append(mut &vs, try eval(&a, env)) }
+            if isSeqFn(&name) { return seqCall(&name, &vs, env) }
             return call(&name, &vs)
         }
     }
@@ -1440,7 +1443,7 @@ fn encTable(t: &Table): str {
     // then defaults, after the places (written, with none, when there are
     // defaults)
     var defs = false
-    for c in t.cols { if c.def.isSome() || !isNull(&c.missing) { defs = true } }
+    for c in t.cols { if c.def.isSome() || !isNull(&c.missing) || len(c.seq) > 0 { defs = true } }
     let fkx = len(t.fks) > 0 || len(t.refBy) > 0
     let checks = len(t.checks) > 0 || fkx
     if len(t.slots) > 0 || defs || checks {
@@ -1451,7 +1454,7 @@ fn encTable(t: &Table): str {
     if defs || checks {
         for c in t.cols {
             let missing = !isNull(&c.missing)
-            b.addByte((if c.def.isSome() { 1 } else { 0 }) + (if missing { 2 } else { 0 }))
+            b.addByte((if c.def.isSome() { 1 } else { 0 }) + (if missing { 2 } else { 0 }) + (if len(c.seq) > 0 { 4 } else { 0 }))
             match c.def {
                 Some(x) {
                     let text = lexdb_sql.exprText(&x)
@@ -1464,6 +1467,10 @@ fn encTable(t: &Table): str {
                 let v = encRow(&[c.missing])
                 binary.addU32LE(mut &b, len(v))
                 b.add(v)
+            }
+            if len(c.seq) > 0 {
+                b.addByte(byte(c.identity))
+                addStr(mut &b, &c.seq)
             }
         }
     }
@@ -1605,6 +1612,11 @@ fn decTable(name: str, s: &str): Result[Table, DbErr] {
                 t.cols[i].missing = vs[0]
                 at += 4 + l
             }
+            if flags & 4 != 0 {
+                t.cols[i].identity = int(s[at])
+                t.cols[i].seq = strAt(s, at + 1)
+                at += 5 + len(t.cols[i].seq)
+            }
         }
     }
     if at + 4 <= len(s) {
@@ -1718,11 +1730,24 @@ fn needTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, name: &str): Res
 // Makes the catalog when the store is new.
 pub fn bootstrap(st: &lexdb_store.Store): Result[Unit, DbErr] {
     st.watch(CATALOG)
-    for id in st.trees() { if id == CATALOG { return Ok(Unit{}) } }
-    var t = lexdb_store.begin()
-    let id = st.createTree(mut &t)
-    if id != CATALOG { return Err(lexdb_base.corrupt("the store has trees but no catalog")) }
-    return st.commit(t)
+    var have = false
+    for id in st.trees() { if id == CATALOG { have = true } }
+    if !have {
+        var t = lexdb_store.begin()
+        let id = st.createTree(mut &t)
+        if id != CATALOG { return Err(lexdb_base.corrupt("the store has trees but no catalog")) }
+        try st.commit(t)
+    }
+    // the sequences' values (9.43): a tree of their own, made once
+    var r = lexdb_store.begin()
+    let seqs = try st.get(mut &r, CATALOG, SEQ_TREE)
+    if seqs.isSome() {
+        st.abort(r)
+        return Ok(Unit{})
+    }
+    let tree = st.createTree(mut &r)
+    try r.put(CATALOG, SEQ_TREE, tree.toStr())
+    return st.commit(r)
 }
 
 // ---- planning: access paths and joins
@@ -2171,7 +2196,7 @@ fn constVal(x: &Expr, params: &[]Val): Option[Val] {
     let noRow: []Val = []
     let noAggs: []Val = []
     let noSubs: []SubRes = []
-    let env = Env{cols: &noCols, row: &noRow, aggs: &noAggs, params: params, subs: &noSubs, cur: &noAggs}
+    let env = Env{cols: &noCols, row: &noRow, aggs: &noAggs, params: params, subs: &noSubs, cur: &noAggs, seq: None}
     match eval(x, &env) {
         Ok(v) {
             if isNull(&v) { return None }
@@ -2738,7 +2763,7 @@ fn allTrue(cs: &[]Expr, cols: &[]lexdb_sql.ColDef, row: &[]Val, params: &[]Val):
     if len(cs) == 0 { return Ok(true) }
     let noAggs: []Val = []
     let noSubs: []SubRes = []
-    let env = Env{cols: cols, row: row, aggs: &noAggs, params: params, subs: &noSubs, cur: &noAggs}
+    let env = Env{cols: cols, row: row, aggs: &noAggs, params: params, subs: &noSubs, cur: &noAggs, seq: None}
     for c in cs { if truth(&(try eval(&c, &env))) != Some(true) { return Ok(false) } }
     return Ok(true)
 }
@@ -2947,6 +2972,7 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
 // Reads the tables that are joined by hash, once.
 fn materialize(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: mut &Mats, params: &[]Val,
                rs: mut &Run): Result[Unit, DbErr] {
+    let sqe = seqEnv(st, txn)
     for k in 1..len(q.levels) {
         if q.levels[k].perRow { continue }
         var rows: [][]Val = []
@@ -2960,7 +2986,7 @@ fn materialize(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: 
                 for r in m.vrows[k] { append(mut &rows, copyRow(&r)) }
             } else {
                 let noAggs: []Val = []
-                let env = Env{cols: &q.cols, row: &full, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs}
+                let env = Env{cols: &q.cols, row: &full, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: sqe}
                 let scans = try pathScans(&lv.t, &lv.path, &env)
                 for sc in scans {
                     var cur = newCursor()
@@ -3031,6 +3057,7 @@ fn tryRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Mats
 // calling emit for each complete row; false: emit asked to stop.
 fn runLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Mats, k: int, row: mut &[]Val,
             params: &[]Val, emit: &fn(&[]Val): Result[bool, DbErr], rs: mut &Run): Result[bool, DbErr] {
+    let sqe = seqEnv(st, txn)
     if k == len(q.levels) { return emit(row) }
     let lv = &q.levels[k]
     var matched = false
@@ -3040,7 +3067,7 @@ fn runLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Ma
         var nul = false
         {
             let noAggs: []Val = []
-            let env = Env{cols: &q.cols, row: row, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs}
+            let env = Env{cols: &q.cols, row: row, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: sqe}
             for i in 0..len(lv.hashCols) {
                 if lv.virt() {
                     let v = try eval(&lv.hashVals[i], &env)
@@ -3071,7 +3098,7 @@ fn runLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Ma
         var refVals: []Val = []
         {
             let noAggs: []Val = []
-            let env = Env{cols: &q.cols, row: row, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs}
+            let env = Env{cols: &q.cols, row: row, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: sqe}
             for x in q.subs[i].sel.q.refs { append(mut &refVals, try eval(&x, &env)) }
         }
         let key = valsKey(&refVals)
@@ -3113,10 +3140,10 @@ fn runLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Ma
         var scans: []Scan = []
         {
             let noAggs: []Val = []
-            let env = Env{cols: &q.cols, row: row, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs}
+            let env = Env{cols: &q.cols, row: row, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: sqe}
             if q.corr && pathCorr(&lv.path) {
                 let cur = try pathCur(st, txn, q, &lv.path, &env, rs)
-                let env2 = Env{cols: &q.cols, row: row, aggs: &noAggs, params: params, subs: &m.subs, cur: &cur}
+                let env2 = Env{cols: &q.cols, row: row, aggs: &noAggs, params: params, subs: &m.subs, cur: &cur, seq: sqe}
                 scans = try pathScans(&lv.t, &lv.path, &env2)
             } else {
                 scans = try pathScans(&lv.t, &lv.path, &env)
@@ -3507,6 +3534,7 @@ fn keyPart(b: mut &StrBuf, v: &Val) {
 // for IN its values per key.
 fn runHashed(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sp: &SubPlan, params: &[]Val, parent: mut &Run,
              i: int): Result[SubRes, DbErr] {
+    let sqe = seqEnv(st, txn)
     let res = try runChild(st, txn, &sp.sel, params, -1, parent, i)
     var out = emptyRes()
     out.rows = len(res.rows)
@@ -3531,7 +3559,7 @@ fn runHashed(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sp: &SubPlan, pa
         }
         let noRow: []Val = array(len(sp.sel.q.cols), Val.Null)
         let noSubs: []SubRes = []
-        let env = Env{cols: &sp.sel.q.cols, row: &noRow, aggs: &vals, params: params, subs: &noSubs, cur: &noRow}
+        let env = Env{cols: &sp.sel.q.cols, row: &noRow, aggs: &vals, params: params, subs: &noSubs, cur: &noRow, seq: sqe}
         out.val = try eval(&sp.sel.exprs[nk], &env)
         return Ok(out)
     }
@@ -3825,6 +3853,7 @@ fn runSub(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sp: &SubPlan, param
 // The values of the correlated subqueries in x for env's row, into cur.
 fn fillCur(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, x: &Expr, env: &Env, rs: mut &Run,
            cur: mut &[]Val): Result[Unit, DbErr] {
+    let sqe = seqEnv(st, txn)
     match x {
         Expr.Unary(_, a) { return fillCur(st, txn, q, &a, env, rs, cur) }
         Expr.Bin(_, a, b) {
@@ -3843,7 +3872,7 @@ fn fillCur(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, x: &Exp
             var xv = Val.Null
             if n == "#in" {
                 try fillCur(st, txn, q, &args[3], env, rs, cur)
-                let env2 = Env{cols: env.cols, row: env.row, aggs: env.aggs, params: env.params, subs: env.subs, cur: cur}
+                let env2 = Env{cols: env.cols, row: env.row, aggs: env.aggs, params: env.params, subs: env.subs, cur: cur, seq: sqe}
                 xv = try eval(&args[3], &env2)
             }
             var refVals: []Val = []
@@ -3855,7 +3884,7 @@ fn fillCur(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, x: &Exp
                 for v in refVals { append(mut &ps, v) }
                 let noCols: []lexdb_sql.ColDef = []
                 let noRow: []Val = []
-                let kenv = Env{cols: &noCols, row: &noRow, aggs: &noRow, params: &ps, subs: env.subs, cur: &noRow}
+                let kenv = Env{cols: &noCols, row: &noRow, aggs: &noRow, params: &ps, subs: env.subs, cur: &noRow, seq: sqe}
                 var kv: []Val = []
                 for ko in q.subs[i].keyOuter { append(mut &kv, try eval(&ko, &kenv)) }
                 rs.stats[i].hits += 1
@@ -3892,18 +3921,20 @@ fn fillCur(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, x: &Exp
 // eval, running x's correlated subqueries for env's row first.
 fn evalX(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, x: &Expr, env: &Env,
          rs: mut &Run): Result[Val, DbErr] {
+    let sqe = seqEnv(st, txn)
     if !q.corr || !hasCorr(x) { return eval(x, env) }
     var cur: []Val = array(len(q.subs), Val.Null)
     try fillCur(st, txn, q, x, env, rs, mut &cur)
-    let env2 = Env{cols: env.cols, row: env.row, aggs: env.aggs, params: env.params, subs: env.subs, cur: &cur}
+    let env2 = Env{cols: env.cols, row: env.row, aggs: env.aggs, params: env.params, subs: env.subs, cur: &cur, seq: sqe}
     return eval(x, &env2)
 }
 
 fn allTrueX(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Mats, cs: &[]Expr, row: &[]Val,
             params: &[]Val, rs: mut &Run): Result[bool, DbErr] {
+    let sqe = seqEnv(st, txn)
     if len(cs) == 0 { return Ok(true) }
     let noAggs: []Val = []
-    let env = Env{cols: &q.cols, row: row, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs}
+    let env = Env{cols: &q.cols, row: row, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: sqe}
     for c in cs { if truth(&(try evalX(st, txn, q, &c, &env, rs))) != Some(true) { return Ok(false) } }
     return Ok(true)
 }
@@ -4133,7 +4164,7 @@ fn inIndex(t: &Table, ix: &Index, row: &[]Val): Result[bool, DbErr] {
             let noAggs: []Val = []
             let noParams: []Val = []
             let noSubs: []SubRes = []
-            let env = Env{cols: &t.cols, row: row, aggs: &noAggs, params: &noParams, subs: &noSubs, cur: &noAggs}
+            let env = Env{cols: &t.cols, row: row, aggs: &noAggs, params: &noParams, subs: &noSubs, cur: &noAggs, seq: None}
             return Ok(truth(&(try eval(&x, &env))) == Some(true))
         }
         None { return Ok(true) }
@@ -4179,7 +4210,7 @@ fn createTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
         key = lexdb_sql.qual(&sn, &s.table)
     }
     let base = lexdb_sql.baseName(&key)
-    let exists = (try st.get(txn, CATALOG, key)).isSome() || (try st.get(txn, CATALOG, idxName(&key))).isSome()
+    let exists = try relExists(st, txn, &key)
     if exists {
         if s.ifFlag { return Ok(tagOnly("CREATE TABLE")) }
         return Err(e("42P07", "relation \"" + base + "\" already exists"))
@@ -4191,6 +4222,7 @@ fn createTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
     for c in s.cols {
         if colIndex(&t.cols, &c.name) >= 0 { return Err(e("42701", "column \"" + c.name + "\" specified more than once")) }
         var col = lexdb_sql.colDef(c.name, c.typ, c.notNull)
+        col.identity = c.identity
         match c.def {
             Some(x) {
                 let v = try defaultValue(&x, &col)
@@ -4214,6 +4246,8 @@ fn createTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
         }
     }
     t.tree = st.createTree(txn)
+    try makeColSeqs(st, txn, mut &t, -1, &s.idOpts)
+    for c in t.cols { try defaultSeqs(st, txn, &c) }
     for c in s.cons { if c.kind != lexdb_sql.C_FOREIGN { try addConstraint(st, txn, mut &t, &c) } }
     for c in s.cons { if c.kind == lexdb_sql.C_FOREIGN { try addConstraint(st, txn, mut &t, &c) } }
     try txn.put(CATALOG, key, encTable(&t))
@@ -4226,6 +4260,7 @@ fn dropTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.St
         Some(t) {
             var d = t
             try unlinkTable(st, txn, mut &d, s.cascade)
+            try dropOwnedSeqs(st, txn, &d, &"")
             dropOne(txn, &d)
             try bumpCatalog(st, txn)
             return Ok(tagOnly("DROP TABLE"))
@@ -4249,6 +4284,19 @@ fn dropOne(txn: mut &lexdb_store.Txn, t: &Table) {
 
 // ---- column defaults (9.38)
 
+// A default calling sequence functions: the sequences it names must be.
+fn defaultSeqs(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, c: &lexdb_sql.ColDef): Result[Unit, DbErr] {
+    match c.def {
+        Some(x) {
+            var ns: []str = []
+            seqNamesOf(&x, mut &ns)
+            for n in ns { let d = try needSeq(st, txn, &nameOfText(&n)) }
+        }
+        None {}
+    }
+    return Ok(Unit{})
+}
+
 // A DEFAULT checked for column c: no column and no aggregate in it; its
 // value, of c's type. lexdb has no volatile function, so the value is the
 // same whenever it is made: a bad default fails here, not at each INSERT.
@@ -4257,24 +4305,14 @@ fn defaultValue(x: &Expr, c: &lexdb_sql.ColDef): Result[Val, DbErr] {
     colNames(x, mut &ns)
     if len(ns) > 0 { return Err(e("0A000", "cannot use column reference in DEFAULT expression")) }
     if hasAgg(x) { return Err(e("42803", "aggregate functions are not allowed in DEFAULT expressions")) }
+    if isVolatile(x) { return Ok(Val.Null) }        // nextval's: per row (defaultsOf)
     let none: []Val = []
     let noCols: []lexdb_sql.ColDef = []
     let noSubs: []SubRes = []
-    let env = Env{cols: &noCols, row: &none, aggs: &none, params: &none, subs: &noSubs, cur: &none}
+    let env = Env{cols: &noCols, row: &none, aggs: &none, params: &none, subs: &noSubs, cur: &none, seq: None}
     return coerce(try eval(x, &env), &c.typ)
 }
 
-// Each column's default value (NULL with none), for a statement's rows.
-fn defaultsOf(t: &Table): Result[[]Val, DbErr] {
-    var out: []Val = []
-    for c in t.cols {
-        match c.def {
-            Some(x) { append(mut &out, try defaultValue(&x, &c)) }
-            None { append(mut &out, Val.Null) }
-        }
-    }
-    return Ok(out)
-}
 
 // ---- ALTER TABLE (9.34)
 
@@ -4377,6 +4415,7 @@ fn moveTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, s
     let old = t.name
     t.name = lexdb_sql.qual(sc, &lexdb_sql.baseName(&t.name))
     try relink(st, txn, t, &old)
+    try ownerMoved(st, txn, t, &old, &"", &"", sc)
     for k in 0..len(t.indexes) {
         txn.del(CATALOG, idxName(&t.indexes[k].name))
         t.indexes[k].name = lexdb_sql.qual(sc, &lexdb_sql.baseName(&t.indexes[k].name))
@@ -4388,7 +4427,8 @@ fn moveTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, s
 
 // Whether a table or an index has catalog key k.
 fn relExists(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, k: &str): Result[bool, DbErr] {
-    return Ok((try st.get(txn, CATALOG, k)).isSome() || (try st.get(txn, CATALOG, idxName(k))).isSome())
+    return Ok((try st.get(txn, CATALOG, k)).isSome() || (try st.get(txn, CATALOG, idxName(k))).isSome() ||
+              (try st.get(txn, CATALOG, seqRow(k))).isSome())
 }
 
 // ALTER TABLE ... SET SCHEMA: the table and its indexes, unless a name is
@@ -4448,6 +4488,12 @@ fn alterSchema(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
             None {}
         }
     }
+    for d in try allSeqs(st, txn, &s.table) {
+        var m = seqCopy(&d)
+        txn.del(CATALOG, seqRow(&m.key))
+        m.key = lexdb_sql.qual(&to, &lexdb_sql.baseName(&m.key))
+        try txn.put(CATALOG, seqRow(&m.key), encSeq(&m))
+    }
     txn.del(CATALOG, schemaKey(&s.table))
     try txn.put(CATALOG, schemaKey(&to), "")
     try bumpCatalog(st, txn)
@@ -4491,6 +4537,7 @@ fn widens(a: &lexdb_sql.TypeName, b: &lexdb_sql.TypeName): bool {
 // made again; the old trees are dropped. All in the transaction, the rows
 // held in memory as an UPDATE's are (max_statement_mem).
 fn retype(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, changes: &[]Retype, lim: Limits): Result[Unit, DbErr] {
+    let sqe = seqEnv(st, txn)
     // the rows, read as the table stands (the statement's other actions done)
     try txn.put(CATALOG, t.name, encTable(t))
     var sc = newScope(&[], &[])
@@ -4538,7 +4585,7 @@ fn retype(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, chan
     var keys: []str = []
     let noAggs: []Val = []
     for f in found {
-        let env = Env{cols: &q.cols, row: &f, aggs: &noAggs, params: &noParams, subs: &m.subs, cur: &noAggs}
+        let env = Env{cols: &q.cols, row: &f, aggs: &noAggs, params: &noParams, subs: &m.subs, cur: &noAggs, seq: sqe}
         var row = copyRow(&f)
         for k in 0..len(changes) {
             row[changes[k].col] = try coerce(try evalX(st, txn, &q, &xs[k], &env, mut &rs), &changes[k].typ)
@@ -4628,12 +4675,19 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             }
             // the rows there read the default as it is now (no row is written)
             var col = lexdb_sql.colDef(a.col.name, a.col.typ, a.col.notNull)
+            col.identity = a.col.identity
+            var perRow = a.col.identity != lexdb_sql.ID_NONE
             match a.col.def {
                 Some(x) {
                     col.missing = try defaultValue(&x, &col)
                     col.def = Some(clone(&x))
+                    if isVolatile(&x) { perRow = true }
                 }
                 None {}
+            }
+            try defaultSeqs(st, txn, &col)
+            if perRow && try anyRow(st, txn, &t, -1) {
+                return Err(e("0A000", "lexdb: a column whose default is a sequence's cannot be added to a table with rows"))
             }
             let full = a.col.notNull && isNull(&col.missing) && try anyRow(st, txn, &t, -1)
             if full {
@@ -4644,6 +4698,7 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
                 append(mut &t.slots, t.width)
                 t.width += 1
             }
+            try makeColSeqs(st, txn, mut &t, len(t.cols) - 1, &s.idOpts)
         } else if a.kind == lexdb_sql.A_DROP_COL {
             let i = colIndex(&t.cols, &a.name)
             if i < 0 {
@@ -4651,17 +4706,19 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
                 return Err(e("42703", "column \"" + a.name + "\" of relation \"" + rel + "\" does not exist"))
             }
             try fkDropColumn(st, txn, mut &t, &a.name, a.cascade)
+            try dropOwnedSeqs(st, txn, &t, &a.name)
             try dropColumn(txn, mut &t, i)
         } else if a.kind == lexdb_sql.A_RENAME {
             let key = lexdb_sql.qual(&lexdb_sql.schemaOf(&t.name), &a.name)
             if key == t.name { continue }
-            if (try st.get(txn, CATALOG, key)).isSome() || (try st.get(txn, CATALOG, idxName(&key))).isSome() {
+            if try relExists(st, txn, &key) {
                 return Err(e("42P07", "relation \"" + a.name + "\" already exists"))
             }
             txn.del(CATALOG, t.name)
             let old = t.name
             t.name = key
             try relink(st, txn, mut &t, &old)
+            try ownerMoved(st, txn, mut &t, &old, &"", &"", &"")
             for ix in t.indexes { try txn.put(CATALOG, idxName(&ix.name), key) }
         } else {
             let i = colIndex(&t.cols, &a.name)
@@ -4683,6 +4740,8 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
                 }
                 for k in 0..len(t.checks) { t.checks[k].expr = renameCol(&t.checks[k].expr, &a.name, &a.to) }
                 try renameFkCol(st, txn, mut &t, &a.name, &a.to)
+                let tn = t.name
+                try ownerMoved(st, txn, mut &t, &tn, &a.name, &a.to, &"")
             } else if a.kind == lexdb_sql.A_SET_NOT_NULL {
                 let nulls = !t.cols[i].notNull && try anyRow(st, txn, &t, i)
                 if nulls {
@@ -4691,15 +4750,27 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
                 t.cols[i].notNull = true
             } else if a.kind == lexdb_sql.A_SET_DEFAULT {
                 // for rows inserted from now on; those there keep their values
+                if t.cols[i].identity == lexdb_sql.ID_ALWAYS || t.cols[i].identity == lexdb_sql.ID_BY_DEFAULT {
+                    return Err(e("42601", "column \"" + a.name + "\" of relation \"" + rel + "\" is an identity column"))
+                }
                 match a.col.def {
                     Some(x) {
                         let v = try defaultValue(&x, &t.cols[i])
                         t.cols[i].def = Some(clone(&x))
+                        try defaultSeqs(st, txn, &t.cols[i])
                     }
                     None {}
                 }
+                // a serial column's default is replaced (its sequence stays, owned by it)
+                t.cols[i].seq = ""
+                t.cols[i].identity = lexdb_sql.ID_NONE
             } else if a.kind == lexdb_sql.A_DROP_DEFAULT {
+                if t.cols[i].identity == lexdb_sql.ID_ALWAYS || t.cols[i].identity == lexdb_sql.ID_BY_DEFAULT {
+                    return Err(e("42601", "column \"" + a.name + "\" of relation \"" + rel + "\" is an identity column"))
+                }
                 t.cols[i].def = None
+                t.cols[i].seq = ""
+                t.cols[i].identity = lexdb_sql.ID_NONE
             } else if a.kind == lexdb_sql.A_DROP_NOT_NULL {
                 for k in t.pk {
                     if k == i { return Err(e("42P16", "column \"" + a.name + "\" is in a primary key")) }
@@ -4716,6 +4787,9 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         if i < 0 { return Err(e("42703", "column \"" + a.name + "\" of relation \"" + lexdb_sql.baseName(&t.name) + "\" does not exist")) }
         for ch in changes {
             if ch.col == i { return Err(e("42601", "multiple changes of the type of column \"" + a.name + "\"")) }
+        }
+        if len(t.cols[i].seq) > 0 && a.col.typ.kind != lexdb_sql.K_INT {
+            return Err(e("0A000", "lexdb: column \"" + a.name + "\" takes its default from a sequence, so its type stays an integer"))
         }
         if try fkUses(st, txn, &t, &a.name) {
             return Err(e("0A000", "lexdb: column \"" + a.name + "\" is in a foreign key, so its type cannot be changed (drop the constraint first)"))
@@ -4767,7 +4841,8 @@ fn dropSchema(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         append(mut &keys, en.key)
         return true
     })
-    if len(keys) > 0 && !s.cascade {
+    let seqs = try allSeqs(st, txn, &s.table)
+    if (len(keys) > 0 || len(seqs) > 0) && !s.cascade {
         return Err(e("2BP01", "cannot drop schema " + s.table + " because other objects depend on it"))
     }
     for k in keys {
@@ -4780,6 +4855,7 @@ fn dropSchema(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             None {}
         }
     }
+    for d in try allSeqs(st, txn, &s.table) { try dropSeqRows(st, txn, &d) }
     txn.del(CATALOG, schemaKey(&s.table))
     try bumpCatalog(st, txn)
     return Ok(tagOnly("DROP SCHEMA"))
@@ -4790,7 +4866,7 @@ fn dropSchema(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
 fn createIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
     var t = try needTable(st, txn, &s.table)
     let ixKey = lexdb_sql.qual(&lexdb_sql.schemaOf(&t.name), &s.index)     // in its table's schema
-    let exists = (try st.get(txn, CATALOG, ixKey)).isSome() || (try st.get(txn, CATALOG, idxName(&ixKey))).isSome()
+    let exists = try relExists(st, txn, &ixKey)
     if exists {
         if s.ifFlag { return Ok(tagOnly("CREATE INDEX")) }
         return Err(e("42P07", "relation \"" + s.index + "\" already exists"))
@@ -4967,7 +5043,7 @@ fn passes(t: &Table, c: &Check, row: &[]Val): Result[bool, DbErr] {
     let noAggs: []Val = []
     let noParams: []Val = []
     let noSubs: []SubRes = []
-    let env = Env{cols: &t.cols, row: row, aggs: &noAggs, params: &noParams, subs: &noSubs, cur: &noAggs}
+    let env = Env{cols: &t.cols, row: row, aggs: &noAggs, params: &noParams, subs: &noSubs, cur: &noAggs, seq: None}
     let v = try eval(&c.expr, &env)
     match v {
         Val.Null { return Ok(true) }
@@ -5070,6 +5146,7 @@ fn dupKey(t: &Table, row: &[]Val): DbErr {
 }
 
 fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, lim: Limits): Result[Res, DbErr] {
+    let sqe = seqEnv(st, txn)
     let t = try needTable(st, txn, &s.table)
     var targets: []int = []
     if len(s.names) == 0 {
@@ -5087,12 +5164,20 @@ fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
         let noTypes: []int = []
         var pc = oneShot()
         let res = try select(st, txn, &s.inner[0], params, &noTypes, lim, mut &pc)
-        let defs = try defaultsOf(&t)
+        let defs = try defaultsOf(st, txn, &t)
         let fw = try fkTables(st, txn, &t, true, false)
         var later: []FkLater = []
         var count = 0
         for r in res.rows {
-            try insertOne(st, txn, &t, &targets, &r, &defs, &fw, mut &later)
+            var vs: []Val = []
+            for k in 0..len(r) {
+                if k < len(targets) && try idDefault(&t, targets[k], false, s.overriding) {
+                    append(mut &vs, try defAt(st, txn, &defs, &t, targets[k]))
+                } else {
+                    append(mut &vs, r[k])
+                }
+            }
+            try insertOne(st, txn, &t, &targets, &vs, &defs, &fw, mut &later)
             count += 1
         }
         try fkFinish(st, txn, &fw, mut &later)
@@ -5116,23 +5201,37 @@ fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     rs.limit(&lim)
     let m = try prepare(st, txn, &q, params, mut &rs)
     let noAggs: []Val = []
-    let env = Env{cols: &q.cols, row: &noAggs, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs}
-    if len(s.subs) > 0 { return insertRows(st, txn, &t, &targets, &rows, &env) }
-    return insertRows(st, txn, &t, &targets, &s.rows, &env)
+    let env = Env{cols: &q.cols, row: &noAggs, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: sqe}
+    if len(s.subs) > 0 { return insertRows(st, txn, &t, &targets, &rows, &env, s.overriding) }
+    return insertRows(st, txn, &t, &targets, &s.rows, &env, s.overriding)
+}
+
+// Whether column i of t takes its default though a value was given (an
+// identity column under OVERRIDING USER VALUE); an error if it may not
+// take one (GENERATED ALWAYS, with no OVERRIDING SYSTEM VALUE).
+fn idDefault(t: &Table, i: int, isDef: bool, ovr: int): Result[bool, DbErr] {
+    let id = t.cols[i].identity
+    if isDef || (id != lexdb_sql.ID_ALWAYS && id != lexdb_sql.ID_BY_DEFAULT) { return Ok(false) }
+    if ovr == lexdb_sql.OVR_USER { return Ok(true) }
+    if id == lexdb_sql.ID_ALWAYS && ovr != lexdb_sql.OVR_SYSTEM {
+        return Err(e("428C9", "cannot insert a non-DEFAULT value into column \"" + t.cols[i].name + "\": it is GENERATED ALWAYS AS IDENTITY (OVERRIDING SYSTEM VALUE inserts it)"))
+    }
+    return Ok(false)
 }
 
 fn insertRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, targets: &[]int, rows: &[][]Expr,
-              env: &Env): Result[Res, DbErr] {
-    let defs = try defaultsOf(t)
+              env: &Env, ovr: int): Result[Res, DbErr] {
+    let defs = try defaultsOf(st, txn, t)
     let fw = try fkTables(st, txn, t, true, false)
     var later: []FkLater = []
     var count = 0
     for r in rows {
         var vs: []Val = []
         for k in 0..len(r) {
-            if lexdb_sql.isDefault(&r[k]) {
-                if k >= len(targets) { return Err(e("42601", "INSERT has more expressions than target columns")) }
-                append(mut &vs, defs[targets[k]])
+            if k >= len(targets) { return Err(e("42601", "INSERT has more expressions than target columns")) }
+            let isDef = lexdb_sql.isDefault(&r[k])
+            if isDef || try idDefault(t, targets[k], false, ovr) {
+                append(mut &vs, try defAt(st, txn, &defs, t, targets[k]))
             } else {
                 append(mut &vs, try eval(&r[k], env))
             }
@@ -5146,13 +5245,18 @@ fn insertRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, targ
 
 // A row of values for the target columns (the rest NULL).
 fn insertOne(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, targets: &[]int, vs: &[]Val,
-             defs: &[]Val, fw: &[]Table, later: mut &[]FkLater): Result[Unit, DbErr] {
+             defs: &Defs, fw: &[]Table, later: mut &[]FkLater): Result[Unit, DbErr] {
     if len(vs) > len(targets) { return Err(e("42601", "INSERT has more expressions than target columns")) }
-    var row: []Val = copyRow(defs)
+    var row = nullRow(len(t.cols))
+    var given: []bool = []
+    for i in 0..len(t.cols) { append(mut &given, false) }
     for k in 0..len(vs) {
         let ci = targets[k]
         row[ci] = try coerce(vs[k], &t.cols[ci].typ)
+        given[ci] = true
     }
+    // the others their defaults (a sequence's taken only for these)
+    for i in 0..len(t.cols) { if !given[i] { row[i] = try defAt(st, txn, defs, t, i) } }
     try checkRow(t, &row)
     try checkChecks(t, &row)
     let key = keyOf(t, &row)
@@ -5168,6 +5272,7 @@ fn insertOne(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, targe
 }
 
 fn update(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, lim: Limits): Result[Res, DbErr] {
+    let sqe = seqEnv(st, txn)
     var sc = newScope(params, &[])
     var q = try buildQuery(st, txn, &oneTable(&s.table), &s.where, params, &s.subs, mut &sc)
     var targets: []int = []
@@ -5196,14 +5301,19 @@ fn update(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
         return Ok(true)
     }, mut &rs)
     let noAggs: []Val = []
-    let defs = try defaultsOf(t)
+    let defs = try defaultsOf(st, txn, t)
+    for k in 0..len(sets) {
+        if t.cols[targets[k]].identity == lexdb_sql.ID_ALWAYS && !lexdb_sql.isDefault(&sets[k]) {
+            return Err(e("428C9", "column \"" + t.cols[targets[k]].name + "\" can only be updated to DEFAULT"))
+        }
+    }
     let fw = try fkTables(st, txn, t, true, true)
     var later: []FkLater = []
     for old in found {
-        let env = Env{cols: &q.cols, row: &old, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs}
+        let env = Env{cols: &q.cols, row: &old, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: sqe}
         var row = copyRow(&old)
         for k in 0..len(sets) {
-            if lexdb_sql.isDefault(&sets[k]) { row[targets[k]] = defs[targets[k]] }
+            if lexdb_sql.isDefault(&sets[k]) { row[targets[k]] = try defAt(st, txn, &defs, t, targets[k]) }
             else { row[targets[k]] = try coerce(try evalX(st, txn, &q, &sets[k], &env, mut &rs), &t.cols[targets[k]].typ) }
         }
         try updRow(st, txn, t, &old, &row, &fw, mut &later)
@@ -5352,6 +5462,7 @@ pub fn exprOid(x: &Expr, cols: &[]lexdb_sql.ColDef, ptypes: &[]int): int {
                     return if len(args) > 0 { exprOid(&args[0], cols, ptypes) } else { lexdb_sql.OID_TEXT }
                 }
                 "length", "char_length" { return lexdb_sql.OID_INT4 }
+                "nextval", "currval", "setval", "lastval" { return lexdb_sql.OID_INT8 }
                 "round" { return lexdb_sql.OID_NUMERIC }
                 else { return lexdb_sql.OID_TEXT }
             }
@@ -5433,7 +5544,7 @@ fn evalInt(x: &Option[Expr], params: &[]Val, what: str): Result[int, DbErr] {
             let noRow: []Val = []
             let noAggs: []Val = []
             let noSubs: []SubRes = []
-            let env = Env{cols: &noCols, row: &noRow, aggs: &noAggs, params: params, subs: &noSubs, cur: &noAggs}
+            let env = Env{cols: &noCols, row: &noRow, aggs: &noAggs, params: params, subs: &noSubs, cur: &noAggs, seq: None}
             match try coerce(try eval(&v, &env), &lexdb_sql.TypeName{kind: lexdb_sql.K_INT, oid: lexdb_sql.OID_INT8, prec: 0, scale: 0, len: 0}) {
                 Val.Int(n) {
                     if n < 0 { return Err(e("2201W", what + " must not be negative")) }
@@ -6365,6 +6476,7 @@ fn orderX(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, o: &Expr
 // subquery: EXISTS 1, in any order; a scalar 2).
 fn execSel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params: &[]Val, cap: int,
            rs: mut &Run): Result[Res, DbErr] {
+    let sqe = seqEnv(st, txn)
     if len(sel.srf) > 0 { return execSrf(st, txn, sel, params, cap, rs) }
     let m = try prepare(st, txn, &sel.q, params, rs)
     let q = &sel.q
@@ -6389,7 +6501,7 @@ fn execSel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
             var ord: []Val = []
             if sorting {
                 let none: []Val = []
-                let env = Env{cols: &noCols, row: &vals, aggs: &none, params: params, subs: &m.subs, cur: &none}
+                let env = Env{cols: &noCols, row: &vals, aggs: &none, params: params, subs: &m.subs, cur: &none, seq: sqe}
                 for o in sel.order { append(mut &ord, try orderValue(&o, &sel.outs, &vals, &env)) }
             }
             held += rowBytes(&ord)
@@ -6419,12 +6531,12 @@ fn execSel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
                 append(mut &kept, copyRow(r))
                 return Ok(sel.first < 0)
             }
-            let env = Env{cols: &q.cols, row: r, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs}
+            let env = Env{cols: &q.cols, row: r, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: sqe}
             try addToGroup(sel, mut &gs, r, &env, mut &held, room, rs0max)
             return Ok(sel.first < 0)        // MIN/MAX in order: its first value is the answer
         }, rs)
         for r in kept {
-            let env = Env{cols: &q.cols, row: &r, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs}
+            let env = Env{cols: &q.cols, row: &r, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: sqe}
             var cur: []Val = array(len(q.subs), Val.Null)
             for x in sel.groupBy { try fillCur(st, txn, q, &x, &env, rs, mut &cur) }
             for sp in sel.specs {
@@ -6435,7 +6547,7 @@ fn execSel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
                     None {}
                 }
             }
-            let env2 = Env{cols: &q.cols, row: &r, aggs: &noAggs, params: params, subs: &m.subs, cur: &cur}
+            let env2 = Env{cols: &q.cols, row: &r, aggs: &noAggs, params: params, subs: &m.subs, cur: &cur, seq: sqe}
             try addToGroup(sel, mut &gs, &r, &env2, mut &held, room, rs0max)
         }
         var firsts = replace(mut &gs.firsts, [])
@@ -6447,7 +6559,7 @@ fn execSel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
         for gi in 0..len(firsts) {
             var vals: []Val = []
             for i in 0..len(sel.specs) { append(mut &vals, try finish(&sel.specs[i], &accs[gi][i])) }
-            let env = Env{cols: &q.cols, row: &firsts[gi], aggs: &vals, params: params, subs: &m.subs, cur: &noAggs}
+            let env = Env{cols: &q.cols, row: &firsts[gi], aggs: &vals, params: params, subs: &m.subs, cur: &noAggs, seq: sqe}
             match sel.having {
                 Some(h) { if truth(&(try evalX(st, txn, q, &h, &env, rs))) != Some(true) { continue } }
                 None {}
@@ -6473,7 +6585,7 @@ fn execSel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
             return Ok(!early || len(raws) < stopAt)
         }, rs)
         for r in raws {
-            let env = Env{cols: &q.cols, row: &r, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs}
+            let env = Env{cols: &q.cols, row: &r, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: sqe}
             var vals: []Val = []
             for x in sel.exprs { append(mut &vals, try evalX(st, txn, q, &x, &env, rs)) }
             if sel.distinct {
@@ -6488,7 +6600,7 @@ fn execSel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
         }
     } else {
         try runQuery(st, txn, q, &m, params, fn(r: &[]Val): Result[bool, DbErr] {
-            let env = Env{cols: &q.cols, row: r, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs}
+            let env = Env{cols: &q.cols, row: r, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: sqe}
             var vals: []Val = []
             for x in sel.exprs { append(mut &vals, try eval(&x, &env)) }
             if sel.distinct {
@@ -6721,6 +6833,7 @@ pub type Session = record {
     path: []str                 // SET search_path: its schemas; [] public alone (the default)
     pathAt: int                 // bumped when the path changes (the wire's kept descriptions)
     savedPath: [][]str          // in a transaction block: the path at its BEGIN
+    id: int                     // its number while the store is open (its sequences' currval: 9.43)
 }
 
 // The columns a statement returns, its names looked up along the session's
@@ -6782,8 +6895,10 @@ fn (s: &Session) show(name: &str): Result[Res, DbErr] {
 }
 
 pub fn newSession(st: lexdb_store.Store): Session {
+    let id = num(&st.memoGet(&"sessions").unwrapOr("0")) + 1
+    st.memoPut(&"sessions", &id.toStr())
     return Session{st: st, txn: [], failed: false, maxRecursion: MAX_RECURSION, timeoutMs: 0, maxMem: MAX_STATEMENT_MEM,
-                   saved: [], readOnly: false, path: [], pathAt: 0, savedPath: []}
+                   saved: [], readOnly: false, path: [], pathAt: 0, savedPath: [], id: id}
 }
 
 // max_statement_mem's default.
@@ -6855,7 +6970,8 @@ fn isWrite(kind: int): bool {
     return kind == lexdb_sql.S_CREATE || kind == lexdb_sql.S_DROP || kind == lexdb_sql.S_INSERT ||
            kind == lexdb_sql.S_UPDATE || kind == lexdb_sql.S_DELETE || kind == lexdb_sql.S_CREATE_INDEX ||
            kind == lexdb_sql.S_DROP_INDEX || kind == lexdb_sql.S_CREATE_SCHEMA || kind == lexdb_sql.S_DROP_SCHEMA ||
-           kind == lexdb_sql.S_ALTER || kind == lexdb_sql.S_ALTER_INDEX || kind == lexdb_sql.S_ALTER_SCHEMA
+           kind == lexdb_sql.S_ALTER || kind == lexdb_sql.S_ALTER_INDEX || kind == lexdb_sql.S_ALTER_SCHEMA ||
+           kind == lexdb_sql.S_CREATE_SEQ || kind == lexdb_sql.S_ALTER_SEQ || kind == lexdb_sql.S_DROP_SEQ
 }
 
 fn stmtName(kind: int): str {
@@ -6871,6 +6987,9 @@ fn stmtName(kind: int): str {
         lexdb_sql.S_ALTER { "ALTER TABLE" }
         lexdb_sql.S_ALTER_INDEX { "ALTER INDEX" }
         lexdb_sql.S_ALTER_SCHEMA { "ALTER SCHEMA" }
+        lexdb_sql.S_CREATE_SEQ { "CREATE SEQUENCE" }
+        lexdb_sql.S_ALTER_SEQ { "ALTER SEQUENCE" }
+        lexdb_sql.S_DROP_SEQ { "DROP SEQUENCE" }
         else { "DELETE" }
     }
 }
@@ -6883,6 +7002,7 @@ pub fn (s: &Session) status(): byte {
 
 fn execIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int,
           lim: Limits, pc: mut &PlanCache): Result[Res, DbErr] {
+    try bindSeqs(st, txn, &s.seqNames)
     // with subqueries, the outer values they use are numbered after all the
     // statement's parameters: those not sent are NULL
     let subs = hasSubs(s)
@@ -6918,6 +7038,9 @@ fn execStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
         lexdb_sql.S_ALTER { return alterTable(st, txn, s, lim) }
         lexdb_sql.S_ALTER_INDEX { return alterIndex(st, txn, s) }
         lexdb_sql.S_ALTER_SCHEMA { return alterSchema(st, txn, s) }
+        lexdb_sql.S_CREATE_SEQ { return createSeq(st, txn, s) }
+        lexdb_sql.S_ALTER_SEQ { return alterSeq(st, txn, s) }
+        lexdb_sql.S_DROP_SEQ { return dropSeq(st, txn, s) }
         lexdb_sql.S_EXPLAIN { return explain(st, txn, s, params, lim, ptypes) }
         else { return Err(e("XX000", "not a data statement")) }
     }
@@ -6978,7 +7101,7 @@ pub fn (s: mut &Session) runCached(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes
                         let noCols: []lexdb_sql.ColDef = []
                         let none: []Val = []
                         let noSubs: []SubRes = []
-                        let env = Env{cols: &noCols, row: &none, aggs: &none, params: params, subs: &noSubs, cur: &none}
+                        let env = Env{cols: &noCols, row: &none, aggs: &none, params: params, subs: &noSubs, cur: &none, seq: None}
                         v = try settingValue(&stmt.table, &(try eval(&x, &env)))
                     }
                     None {}
@@ -7005,6 +7128,7 @@ pub fn (s: mut &Session) runCached(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes
                 var q: []str = []
                 for n in s.path { append(mut &q, n) }
                 s.txn[0].path = q
+                s.txn[0].sess = s.id
             }
             return Ok(tagOnly("BEGIN"))
         }
@@ -7061,6 +7185,7 @@ pub fn (s: mut &Session) runCached(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes
         let snap = stmt.kind == lexdb_sql.S_SELECT
         var t = if snap { try s.st.beginSnapshot() } else { lexdb_store.begin() }
         for n in s.path { append(mut &t.path, n) }
+        t.sess = s.id
         match execIn(&s.st, mut &t, stmt, params, ptypes, lim, pc) {
             Ok(r) {
                 match s.st.commit(t) {
@@ -7459,15 +7584,14 @@ fn fkFinish(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, fw: &[]Table, lat
             if kind == FK_DELETE {
                 for r in rows { try delRow(st, txn, c, &r, fw, later) }
             } else {
-                var defs: []Val = []
-                if act == lexdb_sql.FK_SET_DEFAULT { defs = try defaultsOf(c) }
+                let defs = try defaultsOf(st, txn, c)
                 for r in rows {
                     var nr = copyRow(&r)
                     for j in 0..len(fc.cols) {
                         let col = fc.cols[j]
                         if act == lexdb_sql.FK_CASCADE { nr[col] = to[j] }
                         else if act == lexdb_sql.FK_SET_NULL { nr[col] = Val.Null }
-                        else { nr[col] = defs[col] }
+                        else { nr[col] = try defAt(st, txn, &defs, c, col) }
                     }
                     try updRow(st, txn, c, &r, &nr, fw, later)
                 }
@@ -7727,6 +7851,725 @@ fn relink(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, old:
         var c = try byKey(st, txn, &ck)
         for k in 0..len(c.fks) { if c.fks[k].ref == old { c.fks[k].ref = now } }
         try putTable(txn, &c)
+    }
+    return Ok(Unit{})
+}
+
+// ---- sequences (9.43)
+//
+// A sequence is a catalog row of its own, seqRow(key), in the relations'
+// namespace (a table, an index or a sequence may not share a name): its
+// definition (Seq), changed only by DDL, in the DDL's transaction.
+//
+// Its values are outside any transaction, as PostgreSQL's: nextval in a
+// transaction rolled back is not given again, and two transactions taking
+// values never conflict. They are handed out from the store's memo
+// (Store.memoGet), a block at a time: before a block's first value is given,
+// its last is written, in a transaction of its own, to the sequences' tree
+// (SEQ_TREE, not the catalog, whose writes make the wire describe
+// statements again). After a crash the sequence goes on after the last
+// block written, skipping what was left of it (as PostgreSQL skips what it
+// logged ahead).
+
+pub type Seq = record {
+    key: str            // its catalog key
+    id: str             // made when it was: its values' memo and durable row
+    typ: int            // OID_INT2, OID_INT4, OID_INT8
+    inc: int
+    min: int
+    max: int
+    start: int
+    cache: int
+    cycle: bool
+    ownerT: str         // OWNED BY: a table's catalog key and column; "" none
+    ownerC: str
+}
+
+fn seqCopy(d: &Seq): Seq {
+    return Seq{key: d.key, id: d.id, typ: d.typ, inc: d.inc, min: d.min, max: d.max, start: d.start, cache: d.cache,
+               cycle: d.cycle, ownerT: d.ownerT, ownerC: d.ownerC}
+}
+
+fn noSeq(): Seq {
+    return Seq{key: "", id: "", typ: 0, inc: 1, min: 1, max: 1, start: 1, cache: 1, cycle: false, ownerT: "", ownerC: ""}
+}
+
+// The catalog key holding the id of the sequences' tree.
+const SEQ_TREE: str = "\x02seqs"
+
+fn seqRow(k: &str): str { return "\x04" + k }
+
+// What a session's evaluation needs for nextval and its kind (Env.seq).
+pub type SeqEnv = value record { st: lexdb_store.Store; sess: int }
+
+fn seqEnv(st: &lexdb_store.Store, txn: &lexdb_store.Txn): Option[SeqEnv] {
+    return Some(SeqEnv{st: st.handle(), sess: txn.sess})
+}
+
+fn encSeq(d: &Seq): str {
+    var b = newStrBuf()
+    addStrs(mut &b, &[d.key, d.id, d.typ.toStr(), d.inc.toStr(), d.min.toStr(), d.max.toStr(), d.start.toStr(), d.cache.toStr(),
+                     if d.cycle { "1" } else { "0" }, d.ownerT, d.ownerC])
+    return b.toStr()
+}
+
+fn num(s: &str): int { return strings.parseIntOpt(s).unwrapOr(0) }
+
+fn decSeq(s: &str): Seq {
+    let f = strsAt(s, 0)
+    return Seq{key: f[0], id: f[1], typ: num(&f[2]), inc: num(&f[3]), min: num(&f[4]), max: num(&f[5]), start: num(&f[6]),
+               cache: num(&f[7]), cycle: f[8] == "1", ownerT: f[9], ownerC: f[10]}
+}
+
+fn typMax(oid: int): int {
+    if oid == lexdb_sql.OID_INT2 { return 32767 }
+    if oid == lexdb_sql.OID_INT4 { return 2147483647 }
+    return 9223372036854775807
+}
+
+fn typMin(oid: int): int {
+    if oid == lexdb_sql.OID_INT2 { return -32768 }
+    if oid == lexdb_sql.OID_INT4 { return -2147483648 }
+    return -9223372036854775807 - 1
+}
+
+// A sequence's name in a string, as nextval('...') takes it: unquoted
+// parts lower-cased, "quoted" ones kept, schema.name qualified.
+fn nameOfText(t: &str): str {
+    var parts: []str = []
+    var cur = newStrBuf()
+    var quoted = false
+    var i = 0
+    while i < len(t) {
+        let c = t[i]
+        if quoted {
+            if c == '"' {
+                if i + 1 < len(t) && t[i + 1] == '"' {
+                    cur.addByte('"')
+                    i += 1
+                } else {
+                    quoted = false
+                }
+            } else {
+                cur.addByte(c)
+            }
+        } else if c == '"' {
+            quoted = true
+        } else if c == '.' {
+            append(mut &parts, cur.toStr())
+            cur = newStrBuf()
+        } else if c >= 'A' && c <= 'Z' {
+            cur.addByte(byte(c + 32))
+        } else {
+            cur.addByte(c)
+        }
+        i += 1
+    }
+    append(mut &parts, cur.toStr())
+    let n = len(parts)
+    if n >= 2 { return lexdb_sql.qual(&parts[n - 2], &parts[n - 1]) }
+    return parts[0]
+}
+
+// The sequence named n (a name as written: along the search path), or none.
+fn findSeq(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, n: &str): Result[Option[Seq], DbErr] {
+    var keys: []str = []
+    if len(txn.path) == 0 || lexdb_sql.isQual(n) {
+        append(mut &keys, n)
+    } else {
+        for sc in txn.path { append(mut &keys, lexdb_sql.qual(&sc, n)) }
+    }
+    for k in keys {
+        match try st.get(txn, CATALOG, seqRow(&k)) {
+            Some(v) { return Ok(Some(decSeq(&v))) }
+            None {}
+        }
+    }
+    return Ok(None)
+}
+
+fn needSeq(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, n: &str): Result[Seq, DbErr] {
+    match try findSeq(st, txn, n) {
+        Some(d) { return Ok(d) }
+        None { return Err(e("42P01", "relation \"" + lexdb_sql.shown(n) + "\" does not exist")) }
+    }
+}
+
+// The id of the sequences' tree (made by bootstrap).
+fn seqTree(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[int, DbErr] {
+    match try st.get(txn, CATALOG, SEQ_TREE) {
+        Some(v) { return Ok(num(&v)) }
+        None { return Err(lexdb_base.corrupt("the sequences' tree")) }
+    }
+}
+
+// A sequence's definition from its options: those not given as d has them
+// (CREATE: d the defaults for its type).
+fn seqFrom(o: &lexdb_sql.SeqOpts, d: &Seq, creating: bool): Result[Seq, DbErr] {
+    var r = seqCopy(d)
+    if o.typ != 0 { r.typ = o.typ }
+    if o.hasInc { r.inc = o.inc }
+    if r.inc == 0 { return Err(e("22023", "INCREMENT must not be zero")) }
+    let tn = lexdb_sql.typeText(&lexdb_sql.TypeName{kind: lexdb_sql.K_INT, oid: r.typ, prec: 0, scale: 0, len: 0})
+    if o.hasMax == 1 { r.max = o.max } else if o.hasMax == 2 || creating || o.typ != 0 { r.max = if r.inc > 0 { typMax(r.typ) } else { -1 } }
+    if o.hasMin == 1 { r.min = o.min } else if o.hasMin == 2 || creating || o.typ != 0 { r.min = if r.inc > 0 { 1 } else { typMin(r.typ) } }
+    if r.max > typMax(r.typ) || r.max < typMin(r.typ) {
+        return Err(e("22023", "MAXVALUE (" + r.max.toStr() + ") is out of range for sequence data type " + tn))
+    }
+    if r.min > typMax(r.typ) || r.min < typMin(r.typ) {
+        return Err(e("22023", "MINVALUE (" + r.min.toStr() + ") is out of range for sequence data type " + tn))
+    }
+    if r.min >= r.max { return Err(e("22023", "MINVALUE (" + r.min.toStr() + ") must be less than MAXVALUE (" + r.max.toStr() + ")")) }
+    if o.hasStart { r.start = o.start } else if creating { r.start = if r.inc > 0 { r.min } else { r.max } }
+    if r.start < r.min { return Err(e("22023", "START value (" + r.start.toStr() + ") cannot be less than MINVALUE (" + r.min.toStr() + ")")) }
+    if r.start > r.max { return Err(e("22023", "START value (" + r.start.toStr() + ") cannot be greater than MAXVALUE (" + r.max.toStr() + ")")) }
+    if o.cache > 0 { r.cache = o.cache }
+    if o.cycle != 0 { r.cycle = o.cycle == 1 }
+    return Ok(r)
+}
+
+// A new sequence key, its definition from o (typ its type unless o says).
+fn newSeq(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, key: &str, typ: int, o: &lexdb_sql.SeqOpts): Result[Seq, DbErr] {
+    var d = noSeq()
+    d.key = key
+    d.typ = typ
+    // unique: the catalog's version (one per DDL statement) and the time
+    d.id = (try catVersion(st, txn)) + "." + time.unixMillis().toStr() + "." + time.monotonicNs().toStr()
+    let r = try seqFrom(o, &d, true)
+    try txn.put(CATALOG, seqRow(key), encSeq(&r))
+    return Ok(r)
+}
+
+// ---- a sequence's values (nextval, setval)
+
+// Its memo: "sn:" the next value to give ("e" none left), "sl:" the last
+// value of the block written ("" none), "sb:" a block being written, "sg:"
+// the last value given.
+fn memoGiven(d: &Seq): str { return "sg:" + d.id }
+fn memoNext(d: &Seq): str { return "sn:" + d.id }
+fn memoLast(d: &Seq): str { return "sl:" + d.id }
+fn memoBusy(d: &Seq): str { return "sb:" + d.id }
+
+// What follows n ("e" past its bounds).
+fn seqAfter(d: &Seq, n: int): str {
+    if d.inc > 0 && n > d.max - d.inc { return "e" }
+    if d.inc < 0 && n < d.min - d.inc { return "e" }
+    return (n + d.inc).toStr()
+}
+
+// Waits while a block of sequence d is being written, then marks one.
+fn seqLock(st: &lexdb_store.Store, d: &Seq) {
+    while st.memoGet(&memoBusy(d)).isSome() { let y = task.yield() }
+    st.memoPut(&memoBusy(d), &"1")
+}
+
+// Writes v as sequence d's last durable value, in a transaction of its own,
+// not waiting for the disk: a commit using its values waits for it too.
+fn seqWrite(st: &lexdb_store.Store, d: &Seq, v: int): Result[Unit, DbErr] {
+    var t = lexdb_store.begin()
+    let tree = try seqTree(st, mut &t)
+    try t.put(tree, d.id, v.toStr())
+    // durable before any transaction using the block's values is
+    return st.commitAhead(t)
+}
+
+// The sequence's next value.
+fn nextVal(st: &lexdb_store.Store, d: &Seq): Result[int, DbErr] {
+    let kn = memoNext(d)
+    let kl = memoLast(d)
+    while true {
+        if st.memoGet(&kn).isNone() {
+            // first used since the store opened: after its last value written
+            seqLock(st, d)
+            if st.memoGet(&kn).isNone() {
+                var t = lexdb_store.begin()
+                let tree = seqTree(st, mut &t)
+                match tree {
+                    Ok(tr) {
+                        match st.get(mut &t, tr, d.id) {
+                            Ok(got) {
+                                match got {
+                                    Some(v) {
+                                        st.memoPut(&kn, &seqAfter(d, num(&v)))
+                                        st.memoPut(&kl, &v)
+                                    }
+                                    None {
+                                        st.memoPut(&kn, &d.start.toStr())
+                                        st.memoPut(&kl, &"")
+                                    }
+                                }
+                            }
+                            Err(x) {
+                                st.abort(t)
+                                st.memoDel(&memoBusy(d))
+                                return Err(x)
+                            }
+                        }
+                    }
+                    Err(x) {
+                        st.abort(t)
+                        st.memoDel(&memoBusy(d))
+                        return Err(x)
+                    }
+                }
+                st.abort(t)
+            }
+            st.memoDel(&memoBusy(d))
+            continue
+        }
+        let nv = st.memoGet(&kn).unwrap()
+        if nv == "e" {
+            if !d.cycle {
+                let edge = if d.inc > 0 { "maximum value of sequence \"" + lexdb_sql.baseName(&d.key) + "\" (" + d.max.toStr() + ")" }
+                           else { "minimum value of sequence \"" + lexdb_sql.baseName(&d.key) + "\" (" + d.min.toStr() + ")" }
+                return Err(e("2200H", "nextval: reached " + edge))
+            }
+            st.memoPut(&kn, &(if d.inc > 0 { d.min } else { d.max }).toStr())
+            st.memoPut(&kl, &"")
+            continue
+        }
+        let n = num(&nv)
+        let lv = st.memoGet(&kl).unwrapOr("")
+        let held = len(lv) > 0 && (if d.inc > 0 { n <= num(&lv) } else { n >= num(&lv) })
+        if held {
+            st.memoPut(&kn, &seqAfter(d, n))
+            st.memoPut(&memoGiven(d), &n.toStr())
+            return Ok(n)
+        }
+        // the next block: its last value written before its first is given
+        if st.memoGet(&memoBusy(d)).isSome() {
+            let y = task.yield()
+            continue
+        }
+        st.memoPut(&memoBusy(d), &"1")
+        let steps = (if d.cache > 32 { d.cache } else { 32 }) - 1
+        var room = steps
+        if d.inc > 0 {
+            if !(n < 0 && d.max - 9223372036854775807 > n) { room = (d.max - n) / d.inc }
+        } else {
+            if !(n > 0 && d.min + 9223372036854775807 < n) { room = (n - d.min) / (0 - d.inc) }
+        }
+        let hi = n + d.inc * (if room < steps { room } else { steps })
+        let w = seqWrite(st, d, hi)
+        st.memoDel(&memoBusy(d))
+        match w {
+            Ok(_) { st.memoPut(&kl, &hi.toStr()) }
+            Err(x) { return Err(x) }
+        }
+    }
+    return Ok(0)
+}
+
+// setval(d, v, called): the next value v + inc (called) or v; written at
+// once.
+fn setVal(st: &lexdb_store.Store, d: &Seq, v: int, called: bool): Result[Unit, DbErr] {
+    if v < d.min || v > d.max {
+        return Err(e("22003", "setval: value " + v.toStr() + " is out of bounds for sequence \"" + lexdb_sql.baseName(&d.key) +
+                     "\" (" + d.min.toStr() + ".." + d.max.toStr() + ")"))
+    }
+    seqLock(st, d)
+    // the last value given: v, or (not called) the one before it
+    var last = v
+    var next = seqAfter(d, v)
+    if !called {
+        next = v.toStr()
+        last = v - d.inc
+        if (d.inc > 0 && v == typMin(d.typ)) || (d.inc < 0 && v == typMax(d.typ)) { last = v }
+    }
+    let w = seqWrite(st, d, last)
+    match w {
+        Ok(_) {
+            st.memoPut(&memoNext(d), &next)
+            st.memoPut(&memoLast(d), &(if called { last.toStr() } else { "" }))
+            if called { st.memoPut(&memoGiven(d), &v.toStr()) } else { st.memoDel(&memoGiven(d)) }
+        }
+        Err(_) {}
+    }
+    st.memoDel(&memoBusy(d))
+    return w
+}
+
+// Sequence d's definition changed: its next value follows the last given,
+// by its new increment, in a block written anew (or, none given since the
+// store opened, the last written).
+fn seqForget(st: &lexdb_store.Store, d: &Seq) {
+    match st.memoGet(&memoGiven(d)) {
+        Some(g) {
+            let gv = num(&g)
+            var nx = seqAfter(d, gv)
+            if nx != "e" && (num(&nx) < d.min || num(&nx) > d.max) { nx = "e" }
+            st.memoPut(&memoNext(d), &nx)
+        }
+        None { st.memoDel(&memoNext(d)) }
+    }
+    st.memoPut(&memoLast(d), &"")
+}
+
+// ---- the session's side: currval, lastval, and the names its statement binds
+
+fn curKey(sess: int, d: &Seq): str { return "cv:" + sess.toStr() + ":" + d.id }
+fn lastKey(sess: int): str { return "lv:" + sess.toStr() }
+fn bindKey(sess: int, name: &str): str { return "bd:" + sess.toStr() + ":" + name }
+fn stmtKey(sess: int): str { return "bs:" + sess.toStr() }
+
+// nextval for session sess: its currval and lastval too.
+fn nextFor(st: &lexdb_store.Store, sess: int, d: &Seq): Result[int, DbErr] {
+    let v = try nextVal(st, d)
+    st.memoPut(&curKey(sess, d), &v.toStr())
+    st.memoPut(&lastKey(sess), &v.toStr())
+    return Ok(v)
+}
+
+// A statement's start: the sequences its calls name, looked up in its
+// transaction (a sequence made earlier in it is seen) and kept for its
+// evaluation, under a number of this statement's.
+fn bindSeqs(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, names: &[]str): Result[Unit, DbErr] {
+    if len(names) == 0 { return Ok(Unit{}) }
+    let no = num(&st.memoGet(&stmtKey(txn.sess)).unwrapOr("0")) + 1
+    st.memoPut(&stmtKey(txn.sess), &no.toStr())
+    for n in names {
+        let d = try needSeq(st, txn, &nameOfText(&n))
+        st.memoPut(&bindKey(txn.sess, &n), &(no.toStr() + "\n" + encSeq(&d)))
+    }
+    return Ok(Unit{})
+}
+
+// The sequence a call names, as its statement bound it.
+fn boundSeq(q: &SeqEnv, name: &str, f: &str): Result[Seq, DbErr] {
+    let no = q.st.memoGet(&stmtKey(q.sess)).unwrapOr("")
+    match q.st.memoGet(&bindKey(q.sess, name)) {
+        Some(v) {
+            let i = strings.indexOf(&v, "\n", 0)
+            if i > 0 && v[0..i] == no { return Ok(decSeq(&v[i + 1..len(v)])) }
+        }
+        None {}
+    }
+    return Err(e("0A000", "lexdb: " + f + " takes its sequence's name as a literal ('name')"))
+}
+
+fn isSeqFn(name: &str): bool { return name == "nextval" || name == "currval" || name == "setval" || name == "lastval" }
+
+// nextval, currval, setval, lastval.
+fn seqCall(name: &str, vs: &[]Val, env: &Env): Result[Val, DbErr] {
+    match env.seq {
+        None { return Err(e("0A000", "lexdb: " + name + " is not allowed here")) }
+        Some(q) {
+            if name == "lastval" {
+                if len(vs) != 0 { return Err(e("42883", "function lastval takes no arguments")) }
+                match q.st.memoGet(&lastKey(q.sess)) {
+                    Some(v) { return Ok(Val.Int(num(&v))) }
+                    None { return Err(e("55000", "lastval is not yet defined in this session")) }
+                }
+            }
+            if len(vs) == 0 || isNull(&vs[0]) { return Ok(Val.Null) }
+            let d = try boundSeq(&q, &text(&vs[0]), name)
+            if name == "nextval" {
+                if len(vs) != 1 { return Err(e("42883", "function nextval takes one argument")) }
+                return Ok(Val.Int(try nextFor(&q.st, q.sess, &d)))
+            }
+            if name == "currval" {
+                if len(vs) != 1 { return Err(e("42883", "function currval takes one argument")) }
+                match q.st.memoGet(&curKey(q.sess, &d)) {
+                    Some(v) { return Ok(Val.Int(num(&v))) }
+                    None { return Err(e("55000", "currval of sequence \"" + lexdb_sql.baseName(&d.key) + "\" is not yet defined in this session")) }
+                }
+            }
+            // setval(name, v [, called])
+            if len(vs) < 2 || len(vs) > 3 { return Err(e("42883", "function setval takes two or three arguments")) }
+            if isNull(&vs[1]) { return Ok(Val.Null) }
+            let v = match vs[1] { Val.Int(n) { n } else { 0 } }
+            match vs[1] {
+                Val.Int(_) {}
+                else { return Err(e("42804", "setval takes a bigint")) }
+            }
+            var called = true
+            if len(vs) == 3 {
+                match vs[2] {
+                    Val.Bool(b) { called = b }
+                    else { return Err(e("42804", "setval's third argument is a boolean")) }
+                }
+            }
+            try setVal(&q.st, &d, v, called)
+            return Ok(Val.Int(v))
+        }
+    }
+}
+
+// Whether x calls a sequence function (evaluated per row, never once).
+fn isVolatile(x: &Expr): bool {
+    match x {
+        Expr.Call(n, args, _) {
+            if isSeqFn(&n) { return true }
+            for a in args { if isVolatile(&a) { return true } }
+            return false
+        }
+        Expr.Unary(_, a) { return isVolatile(&a) }
+        Expr.Bin(_, a, b) { return isVolatile(&a) || isVolatile(&b) }
+        Expr.IsNull(a, _) { return isVolatile(&a) }
+        Expr.Cast(a, _) { return isVolatile(&a) }
+        else { return false }
+    }
+}
+
+// The sequence names x's calls give as literals.
+fn seqNamesOf(x: &Expr, out: mut &[]str) {
+    match x {
+        Expr.Call(n, args, _) {
+            if (n == "nextval" || n == "currval" || n == "setval") && len(args) > 0 {
+                match lexdb_sql.litText(&args[0]) {
+                    Some(t) { append(out, t) }
+                    None {}
+                }
+            }
+            for a in args { seqNamesOf(&a, out) }
+        }
+        Expr.Unary(_, a) { seqNamesOf(&a, out) }
+        Expr.Bin(_, a, b) {
+            seqNamesOf(&a, out)
+            seqNamesOf(&b, out)
+        }
+        Expr.IsNull(a, _) { seqNamesOf(&a, out) }
+        Expr.Cast(a, _) { seqNamesOf(&a, out) }
+        else {}
+    }
+}
+
+// ---- defaults with sequences: a statement's (9.38's defaultsOf, per row
+// where a column's default is its sequence's nextval or calls one)
+
+type Defs = record {
+    vals: []Val             // the defaults that are values
+    seqs: []Seq             // a column's own sequence (key "" none)
+    exprs: []Option[Expr]   // a default calling a sequence function: evaluated per row
+}
+
+fn defaultsOf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table): Result[Defs, DbErr] {
+    var d = Defs{vals: [], seqs: [], exprs: []}
+    var names: []str = []
+    for c in t.cols {
+        var v = Val.Null
+        var sq = noSeq()
+        var x: Option[Expr] = None
+        if len(c.seq) > 0 {
+            match try st.get(txn, CATALOG, seqRow(&c.seq)) {
+                Some(r) { sq = decSeq(&r) }
+                None { return Err(lexdb_base.corrupt("the sequence of column \"" + c.name + "\"")) }
+            }
+        } else {
+            match c.def {
+                Some(dx) {
+                    if isVolatile(&dx) {
+                        seqNamesOf(&dx, mut &names)
+                        x = Some(clone(&dx))
+                    } else {
+                        v = try defaultValue(&dx, &c)
+                    }
+                }
+                None {}
+            }
+        }
+        append(mut &d.vals, v)
+        append(mut &d.seqs, sq)
+        append(mut &d.exprs, x)
+    }
+    if len(names) > 0 { try bindSeqs(st, txn, &names) }
+    return Ok(d)
+}
+
+// Column i's default for a row.
+fn defAt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, d: &Defs, t: &Table, i: int): Result[Val, DbErr] {
+    let sqe = seqEnv(st, txn)
+    if len(d.seqs[i].key) > 0 { return Ok(Val.Int(try nextFor(st, txn.sess, &d.seqs[i]))) }
+    match d.exprs[i] {
+        Some(x) {
+            let none: []Val = []
+            let noCols: []lexdb_sql.ColDef = []
+            let noSubs: []SubRes = []
+            let env = Env{cols: &noCols, row: &none, aggs: &none, params: &none, subs: &noSubs, cur: &none, seq: sqe}
+            return coerce(try eval(&x, &env), &t.cols[i].typ)
+        }
+        None { return Ok(d.vals[i]) }
+    }
+}
+
+// ---- sequences made, changed, dropped
+
+// CREATE SEQUENCE.
+fn createSeq(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
+    var key = s.table
+    if lexdb_sql.isQual(&s.table) {
+        let sn = lexdb_sql.schemaOf(&s.table)
+        if !(try schemaExists(st, txn, &sn)) { return Err(e("3F000", "schema \"" + sn + "\" does not exist")) }
+    } else {
+        let sn = try createSchema(st, txn)
+        if len(sn) == 0 { return Err(e("3F000", "no schema has been selected to create in")) }
+        key = lexdb_sql.qual(&sn, &s.table)
+    }
+    if try relExists(st, txn, &key) {
+        if s.ifFlag { return Ok(tagOnly("CREATE SEQUENCE")) }
+        return Err(e("42P07", "relation \"" + lexdb_sql.baseName(&key) + "\" already exists"))
+    }
+    var d = try newSeq(st, txn, &key, lexdb_sql.OID_INT8, &s.seq)
+    if len(s.seq.owned) == 2 && len(s.seq.owned[0]) > 0 {
+        try ownSeq(st, txn, mut &d, &s.seq.owned)
+        try txn.put(CATALOG, seqRow(&key), encSeq(&d))
+    }
+    try bumpCatalog(st, txn)
+    return Ok(tagOnly("CREATE SEQUENCE"))
+}
+
+// OWNED BY table.column: in the sequence's schema, as PostgreSQL has it.
+fn ownSeq(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, d: mut &Seq, owned: &[]str): Result[Unit, DbErr] {
+    if len(owned[0]) == 0 {
+        d.ownerT = ""
+        d.ownerC = ""
+        return Ok(Unit{})
+    }
+    let t = try needTable(st, txn, &owned[0])
+    if colIndex(&t.cols, &owned[1]) < 0 {
+        return Err(e("42703", "column \"" + owned[1] + "\" of relation \"" + lexdb_sql.baseName(&t.name) + "\" does not exist"))
+    }
+    if lexdb_sql.schemaOf(&t.name) != lexdb_sql.schemaOf(&d.key) {
+        return Err(e("55000", "sequence must be in same schema as table it is linked to"))
+    }
+    d.ownerT = t.name
+    d.ownerC = owned[1]
+    return Ok(Unit{})
+}
+
+// ALTER SEQUENCE: its options; RESTART at once (as setval).
+fn alterSeq(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
+    let found = try findSeq(st, txn, &s.table)
+    if found.isNone() {
+        if s.ifFlag { return Ok(tagOnly("ALTER SEQUENCE")) }
+        return Err(e("42P01", "relation \"" + lexdb_sql.shown(&s.table) + "\" does not exist"))
+    }
+    let old = found.unwrap()
+    var d = try seqFrom(&s.seq, &old, false)
+    if len(s.seq.owned) == 2 { try ownSeq(st, txn, mut &d, &s.seq.owned) }
+    try txn.put(CATALOG, seqRow(&d.key), encSeq(&d))
+    seqForget(st, &d)
+    if s.seq.restart > 0 {
+        try setVal(st, &d, if s.seq.restart == 2 { s.seq.restartWith } else { d.start }, false)
+    }
+    try bumpCatalog(st, txn)
+    return Ok(tagOnly("ALTER SEQUENCE"))
+}
+
+// Sequence d's rows deleted (its definition and last value).
+fn dropSeqRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, d: &Seq): Result[Unit, DbErr] {
+    txn.del(CATALOG, seqRow(&d.key))
+    txn.del(try seqTree(st, txn), d.id)
+    return Ok(Unit{})
+}
+
+// DROP SEQUENCE: refused while it is a column's (its default), unless
+// CASCADE, which takes the column's default away.
+fn dropSeq(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
+    let found = try findSeq(st, txn, &s.table)
+    if found.isNone() {
+        if s.ifFlag { return Ok(tagOnly("DROP SEQUENCE")) }
+        return Err(e("42P01", "sequence \"" + lexdb_sql.shown(&s.table) + "\" does not exist"))
+    }
+    let d = found.unwrap()
+    if len(d.ownerT) > 0 {
+        match try byKeyOpt(st, txn, &d.ownerT) {
+            Some(t) {
+                var u = t
+                var used = false
+                for i in 0..len(u.cols) {
+                    if u.cols[i].seq == d.key {
+                        used = true
+                        if !s.cascade {
+                            return Err(e("2BP01", "cannot drop sequence " + lexdb_sql.baseName(&d.key) + " because column " + u.cols[i].name +
+                                         " of table " + lexdb_sql.baseName(&u.name) + " requires it (with CASCADE its default is dropped)"))
+                        }
+                        u.cols[i].seq = ""
+                        u.cols[i].identity = lexdb_sql.ID_NONE
+                    }
+                }
+                if used { try putTable(txn, &u) }
+            }
+            None {}
+        }
+    }
+    try dropSeqRows(st, txn, &d)
+    try bumpCatalog(st, txn)
+    return Ok(tagOnly("DROP SEQUENCE"))
+}
+
+// The sequences in the catalog: in schema sc ("" all).
+fn allSeqs(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &str): Result[[]Seq, DbErr] {
+    let from = if len(sc) > 0 { seqRow(&lexdb_sql.qual(sc, &"")) } else { "\x04" }
+    let to = if len(sc) > 0 { from + "\xff" } else { "\x05" }
+    var out: []Seq = []
+    try st.scan(txn, CATALOG, from, to, fn(en: &lexdb_store.Entry): bool {
+        append(mut &out, decSeq(&en.val))
+        return true
+    })
+    return Ok(out)
+}
+
+// Table t's columns' sequences (SERIAL, identity) made: named table_column_seq
+// as PostgreSQL names them, owned by their columns. Its own options from
+// ids (an identity column's).
+fn makeColSeqs(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, only: int, ids: &[]lexdb_sql.IdOpts): Result[Unit, DbErr] {
+    for i in 0..len(t.cols) {
+        if (only >= 0 && i != only) || t.cols[i].identity == lexdb_sql.ID_NONE || len(t.cols[i].seq) > 0 { continue }
+        let cname = t.cols[i].name
+        let ctyp = t.cols[i].typ
+        let cid = t.cols[i].identity
+        let cdef = t.cols[i].def.isSome()
+        if ctyp.kind != lexdb_sql.K_INT { return Err(e("22023", "identity column type must be smallint, integer, or bigint")) }
+        if cdef {
+            if cid == lexdb_sql.ID_SERIAL {
+                return Err(e("42601", "multiple default values specified for column \"" + cname + "\" of table \"" + lexdb_sql.baseName(&t.name) + "\""))
+            }
+            return Err(e("42601", "both default and identity specified for column \"" + cname + "\" of table \"" + lexdb_sql.baseName(&t.name) + "\""))
+        }
+        var oi = -1
+        for k in 0..len(ids) { if ids[k].col == cname { oi = k } }
+        let none = lexdb_sql.noSeqOpts()
+        let o = if oi >= 0 { &ids[oi].opts } else { &none }
+        if len(o.owned) > 0 { return Err(e("42601", "lexdb: an identity column's sequence is owned by it (no OWNED BY)")) }
+        let name = try makeName(st, txn, t, &[cname], &"seq", true)
+        let key = lexdb_sql.qual(&lexdb_sql.schemaOf(&t.name), &name)
+        var d = try newSeq(st, txn, &key, ctyp.oid, o)
+        d.ownerT = t.name
+        d.ownerC = cname
+        try txn.put(CATALOG, seqRow(&key), encSeq(&d))
+        t.cols[i].seq = key
+    }
+    return Ok(Unit{})
+}
+
+// The sequences owned by table t (its column col; "" any) dropped.
+fn dropOwnedSeqs(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, col: &str): Result[Unit, DbErr] {
+    for d in try allSeqs(st, txn, &"") {
+        if d.ownerT == t.name && (len(col) == 0 || d.ownerC == col) { try dropSeqRows(st, txn, &d) }
+    }
+    return Ok(Unit{})
+}
+
+// Table t renamed from old (a key), or its column from renamed to: its
+// sequences' owner. Moved to schema sc ("" not moved): its sequences with it,
+// unless a name is taken there.
+fn ownerMoved(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, old: &str, from: &str, to: &str, sc: &str): Result[Unit, DbErr] {
+    for d in try allSeqs(st, txn, &"") {
+        if d.ownerT != old { continue }
+        var m = seqCopy(&d)
+        m.ownerT = t.name
+        if len(from) > 0 && m.ownerC == from { m.ownerC = to }
+        if len(sc) > 0 && lexdb_sql.schemaOf(&m.key) != sc {
+            let nk = lexdb_sql.qual(sc, &lexdb_sql.baseName(&m.key))
+            if try relExists(st, txn, &nk) {
+                return Err(e("42P07", "relation \"" + lexdb_sql.baseName(&m.key) + "\" already exists in schema \"" + sc + "\""))
+            }
+            txn.del(CATALOG, seqRow(&m.key))
+            for i in 0..len(t.cols) { if t.cols[i].seq == m.key { t.cols[i].seq = nk } }
+            m.key = nk
+        }
+        try txn.put(CATALOG, seqRow(&m.key), encSeq(&m))
     }
     return Ok(Unit{})
 }

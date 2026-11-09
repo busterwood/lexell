@@ -393,7 +393,7 @@ Built on 2026-11-09 on branch `lexdb`, about 6,300 lines in
 (cache, trees, transactions, log, checkpoints, recovery, snapshots),
 `lexdb_sql` (lexer, parser), `lexdb_exec` (catalog, rows, keys, planner,
 statements, sessions), `lexdb_wire` (protocol 3.0) and `lexdb` (the
-server). Tests: `python3 lexell/tests/lexdb.py` (50 programs in
+server). Tests: `python3 lexell/tests/lexdb.py` (53 programs in
 `tests/lexdb/run`, under `LXL_CHECK=1`).
 
     lexell/compiler/out/lxlc lexell/cmd/lexdb.lxl -o lexdb
@@ -596,6 +596,9 @@ is the comparison to make.
    (built: 9.39); (2) CHECK (built: 9.40); (3) FOREIGN KEY, with NO ACTION and RESTRICT
    (built: 9.41); (4) the CASCADE, SET NULL and SET DEFAULT actions
    (built: 9.42).
+15. SERIAL and COPY (the user's request, 2026-11-09), in steps: (1)
+   sequences, SERIAL and identity columns (built: 9.43); (2) RETURNING, for
+   clients to read the ids back; (3) COPY.
 
 ### 9.5 Indexes and joins (D4)
 
@@ -2803,3 +2806,151 @@ Planted, each caught:
 - the queue not run to its end;
 - the tables actions write not followed;
 - RESTRICT refusing at once.
+
+### 9.43 Sequences, SERIAL and identity columns
+
+**What is built.**
+- `CREATE SEQUENCE [IF NOT EXISTS] name` with AS, INCREMENT [BY],
+  MINVALUE / NO MINVALUE, MAXVALUE / NO MAXVALUE, START [WITH], CACHE,
+  [NO] CYCLE and OWNED BY table.column / NONE. PostgreSQL's defaults and
+  checks apply (22023).
+- `ALTER SEQUENCE` with the same options and RESTART [[WITH] n].
+  RENAME, SET SCHEMA and OWNER are 0A000.
+- `DROP SEQUENCE [IF EXISTS] ... [CASCADE]`.
+- `nextval`, `currval`, `setval(name, v [, is_called])` and `lastval`, with
+  PostgreSQL's errors: 55000 for a value not yet defined in the session,
+  2200H for a sequence at its end, 22003 for setval out of bounds. A name
+  is written as PostgreSQL takes it: 'name', 'Schema.name', '"Quoted"', or
+  'name'::regclass (regclass is text here).
+- `serial`, `bigserial` and `smallserial` (and serial2/4/8).
+- `GENERATED ALWAYS | BY DEFAULT AS IDENTITY [(options)]`, in CREATE TABLE
+  and ADD COLUMN.
+- INSERT's `OVERRIDING SYSTEM VALUE` and `OVERRIDING USER VALUE`.
+- `DEFAULT nextval('s')` and other defaults calling sequence functions,
+  evaluated for each row.
+
+**A sequence** is a catalog row of its own, `"\x04" + key`, in the
+relations' namespace: a table, an index or a sequence may not share a name
+(42P07; `relExists` checks all three). The row holds its definition
+(`Seq`), changed only by DDL in the DDL's transaction, and an id made when
+it is created (the catalog version and the time). The id names its values,
+so a sequence dropped and made again starts afresh.
+
+**Its values are outside transactions, as PostgreSQL's.** A value taken in
+a transaction that rolls back is not given again, and two sessions taking
+values never conflict. Kept as an ordinary row, every two concurrent
+inserts would conflict under serializable validation.
+
+They are handed out from the store's memo (`Store.memoGet` and
+`memoPut`: a map kept while the store is open, outside any transaction) a
+block at a time. Before a block's first value is given, its last is
+written (`seqWrite`) to the sequences' tree, in a transaction of its own.
+The tree is made by `bootstrap`, its id under the catalog key "\x02seqs".
+It is not the catalog, whose writes make the wire describe statements
+again.
+
+A block is max(CACHE, 32) values. Opened again, or after a crash, a
+sequence goes on after the last block written, skipping what was left of
+it, as PostgreSQL skips the values it logged ahead.
+
+**The block's write does not wait for the disk** (`Store.commitAhead`,
+new). It is applied and in the log ahead of every commit after it, and the
+log is made durable in order. So no transaction using its values can be
+durable before it is.
+
+Measured: with a separate durable commit per block, inserting 100K serial
+rows took 3.4 s against 0.31 s with ids given, one fdatasync per 32
+values. Without waiting it takes 0.35 s, and 100K nextval calls take
+159 ms (1.6 µs each).
+
+A crash may let a value seen by a transaction that never committed be
+given again. That is PostgreSQL's behaviour too: nothing durable used it.
+`exec_seqcrash` crashes the simulated disk 120 times at random commits and
+checks that every committed row is there and that no id is given again.
+
+**Evaluation.** An expression is evaluated without the store, and a
+sequence made earlier in the open transaction is seen only through that
+transaction. So:
+- the parser notes the names nextval, currval and setval calls give as
+  literals (`Stmt.seqNames`);
+- the statement's start (`execIn`, `bindSeqs`) looks them up in its
+  transaction and keeps them in the memo under the session and a
+  statement number;
+- evaluation (`seqCall`) finds them there through `Env.seq`: the store's
+  handle and the session's id. Transactions carry the id (`Txn.sess`, as
+  they carry the search path).
+
+A name not bound by its statement (a non-literal argument) is 0A000.
+Where `Env.seq` is none (CHECK, index predicates, constant folding), the
+functions are 0A000, so a call is never folded into a constant. currval
+and lastval are per session, in the memo.
+
+**Defaults.** `defaultsOf` now returns, per column:
+- a value;
+- its own sequence (`ColDef.seq`, the sequence's key: serial and identity
+  columns);
+- or a default calling sequence functions, evaluated per row (its names
+  bound like a statement's).
+
+`defAt` gives a row's default. A sequence's value is taken only for the
+columns a row leaves out, as in PostgreSQL. INSERT's VALUES with DEFAULT,
+UPDATE SET c = DEFAULT and the SET DEFAULT action go through it.
+`ColDef.identity` and `ColDef.seq` are kept in the catalog's defaults
+section (flag 4).
+
+**Identity:**
+- GENERATED ALWAYS refuses a value given (428C9) unless OVERRIDING SYSTEM
+  VALUE;
+- UPDATE may set it only to DEFAULT (428C9);
+- OVERRIDING USER VALUE gives identity columns their defaults;
+- SET DEFAULT and DROP DEFAULT of an identity column are 42601.
+
+For a serial column they replace the sequence's default; the sequence
+stays, owned by the column.
+
+**A column's sequence** is made named `table_column_seq` (a number added
+while the name is taken), in the table's schema, of the column's type,
+owned by the column. It goes with its column:
+- DROP TABLE and DROP COLUMN drop it (any sequence OWNED BY them);
+- DROP SEQUENCE of it is 2BP01 unless CASCADE, which drops the column's
+  default;
+- renames of the table or the column change its owner;
+- SET SCHEMA moves it with the table;
+- ALTER SCHEMA RENAME moves every sequence in the schema;
+- a type change of the column to a non-integer is 0A000.
+
+**Not done:**
+- ADD COLUMN with a sequence's default on a table with rows is 0A000
+  (PostgreSQL rewrites the table).
+- A non-owned sequence renamed or moved breaks the defaults naming it as
+  text (PostgreSQL binds them by OID).
+- RESTART takes effect at once, even if its transaction rolls back.
+- nextval runs in READ ONLY transactions (PostgreSQL refuses).
+- After ALTER SEQUENCE, the next value follows the last given in this
+  store's life, else the last block written.
+
+**Checked** by `exec_seq` (20 lines) and `exec_seqcrash`. Planted, each
+caught:
+- the block not written first, values not reloaded after it, blocks of
+  one, a block written short (by the crash test);
+- bounds not checked;
+- cycling to the start, not the minimum (caught once the test's sequence
+  started above its minimum);
+- setval's is_called ignored;
+- currval not kept, or kept per store not per session;
+- a name's binding used by a later statement (caught once the test used a
+  non-literal name);
+- explicit values taking a sequence's value too;
+- ALWAYS not enforced on INSERT or UPDATE;
+- OVERRIDING USER VALUE ignored;
+- column sequences not saved;
+- owned sequences not dropped, their owner not renamed, not moved;
+- DROP SEQUENCE of a column's allowed;
+- sequences' names free for tables;
+- ALTER INCREMENT going on from the block's end;
+- ADD COLUMN serial on rows.
+
+**Tests now run natively.** The test runner built every program through
+gcc (its cached C build), which took several minutes for the suite and
+timed out under load. With `LXL_NOCACHE=1` it calls `lxlc src -o out`,
+the native backend: 10 s for the suite. The C build is for profiling only.

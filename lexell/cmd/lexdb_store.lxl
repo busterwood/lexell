@@ -108,6 +108,7 @@ pub type Db = record {
     pendingFree: []int          // runs the checkpoint in flight frees when durable
     dropped: []int              // subtrees no tree reaches, their pages to free: (page, height or -1) pairs (9.32)
     dropReads: int              // the most of their pages a checkpoint reads (DROP_READS; tests set fewer)
+    memo: Map[str, str]         // what the SQL layer keeps while the store is open, outside transactions (its sequences' blocks: 9.43)
     listPages: []int            // the list pages of the last durable checkpoint
     ckpt: int
     durableCkpt: int
@@ -188,10 +189,11 @@ pub type Txn = record {
     track: bool                 // a snapshot's reads are noted (Mark) for its writes' commit: a transaction block
     pub live: bool              // a block's reads go to the live tree for now (its UPDATE and DELETE: 9.16)
     pub path: []str             // the SQL layer's search path for its names (lexdb_exec); [] the default
+    pub sess: int               // the SQL layer's session running it (its sequences' values, 9.43)
 }
 
 pub fn begin(): Txn {
-    return Txn{reads: [], writes: [], index: newMap(), created: [], snap: -1, snapSeq: 0, snapTrees: newMap(), track: false, live: false, path: []}
+    return Txn{reads: [], writes: [], index: newMap(), created: [], snap: -1, snapSeq: 0, snapTrees: newMap(), track: false, live: false, path: [], sess: 0}
 }
 
 pub fn (t: &Txn) isSnapshot(): bool { return t.snap >= 0 }
@@ -1578,12 +1580,23 @@ pub fn (st: &Store) commit(t: Txn): Result[Unit, lexdb_base.DbErr] {
         st.endSnap(id)
         return Ok(Unit{})
     }
-    let r = st.commitLive(t)
+    let r = st.commitLive(t, true)
     st.endSnap(id)
     return r
 }
 
-fn (st: &Store) commitLive(t: Txn): Result[Unit, lexdb_base.DbErr] {
+// A commit that does not wait for the log to reach the disk: applied, and in
+// the log ahead of every commit after it, so durable once any later commit
+// is (a sequence's block, 9.43: no transaction using its values can be
+// durable before it). A crash before then loses it.
+pub fn (st: &Store) commitAhead(t: Txn): Result[Unit, lexdb_base.DbErr] {
+    let id = t.snap
+    let r = st.commitLive(t, false)
+    st.endSnap(id)
+    return r
+}
+
+fn (st: &Store) commitLive(t: Txn, durable: bool): Result[Unit, lexdb_base.DbErr] {
     var wait: []task.Future[Result[Unit, lexdb_base.DbErr]] = []
     var wake: []task.Promise[Unit] = []
     while true {
@@ -1639,7 +1652,7 @@ fn (st: &Store) commitLive(t: Txn): Result[Unit, lexdb_base.DbErr] {
                 while len(db.writerWake) > 0 { append(mut &wake, pop(mut &db.writerWake)) }
                 db.overBudget()
             }
-            if b > db.durableBatch {
+            if durable && b > db.durableBatch {
                 let task.Handoff{promise: p, future: f} = task.promise[Result[Unit, lexdb_base.DbErr]]()
                 append(mut &db.waiters, Waiter{batch: b, p: p})
                 append(mut &wait, f)
@@ -2376,7 +2389,7 @@ pub fn checkpointer(st: Store): int {
 fn newDb(fs: lexdb_disk.Fs, data: lexdb_disk.File, opts: Options, m: &lexdb_page.Meta): Db {
     return Db{opts: opts, fs: fs, data: data, watched: -1, watchedWrites: 0, pool: [], owner: [], meta: [], freeSlots: [], loadedCount: 0, cacheUsed: 0, wlog: [], wlogFloor: 0, hand: 0,
               trees: newMap(), nextTree: m.nextTree, npages: m.npages, free: [], freeAfterNext: [],
-              pendingFree: [], dropped: [], dropReads: DROP_READS, listPages: [], ckpt: m.ckpt, durableCkpt: m.ckpt, ckptRunning: false,
+              pendingFree: [], dropped: [], dropReads: DROP_READS, memo: newMap(), listPages: [], ckpt: m.ckpt, durableCkpt: m.ckpt, ckptRunning: false,
               batch: [], batchCount: 0, batchNo: m.replayBatch, appliedBatch: m.replayBatch - 1,
               durableBatch: m.replayBatch - 1, waiters: [], writerWake: [], ckptWake: [], ckptDone: [], seg: m.replaySeg,
               segOff: m.replayOff, logSinceCkpt: 0, failed: [], closing: false, seq: 0, snaps: [], nextSnap: 0,
@@ -2636,6 +2649,21 @@ pub type Stats = value record {
 
 // The most pages of dropped subtrees one checkpoint reads (tests).
 pub fn (st: &Store) setDropReads(n: int) { st.sh.with(fn(db: mut &Db) { db.dropReads = n }) }
+
+// The memo: values the SQL layer keeps while the store is open, outside any
+// transaction (lost when it closes).
+// A copy of the store's handle (it is a reference to the one store).
+pub fn (st: &Store) handle(): Store { return Store{sh: st.sh} }
+
+pub fn (st: &Store) memoGet(k: &str): Option[str] {
+    var out: Option[str] = None
+    st.sh.with(fn(db: mut &Db) { out = db.memo.get(k) })
+    return out
+}
+
+pub fn (st: &Store) memoPut(k: &str, v: &str) { st.sh.with(fn(db: mut &Db) { db.memo.put(k, v) }) }
+
+pub fn (st: &Store) memoDel(k: &str) { st.sh.with(fn(db: mut &Db) { let gone = db.memo.remove(k) }) }
 
 pub fn (st: &Store) stats(): Stats {
     var s = Stats{commits: 0, conflicts: 0, loads: 0, evictions: 0, flushes: 0, checkpoints: 0, loaded: 0,
