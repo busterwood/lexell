@@ -1430,6 +1430,11 @@ fn colNames(x: &Expr, out: mut &[]str) {
 
 fn (q: &Query) valBefore(x: &Expr, k: int): bool { return q.maxLevel(x) < k && !(q.corr && hasCorr(x)) }
 
+// A path's key value for level k: it uses only the tables before k. A
+// correlated subquery in it is run per row of them before k is read
+// (runLevel: pathCur), so it may be one too (9.23).
+fn (q: &Query) keyBefore(x: &Expr, k: int): bool { return q.maxLevel(x) < k }
+
 fn (q: &Query) levelOf(name: &str): int {
     let i = colIndex(&q.cols, name)
     var k = -1
@@ -1471,7 +1476,7 @@ fn bounds(cs: &[]Expr, col: &str, k: int, q: &Query): []Bound {
                     var done = false
                     match a {
                         Expr.Col(n) {
-                            if n == col && q.valBefore(&b, k) {
+                            if n == col && q.keyBefore(&b, k) {
                                 append(mut &out, Bound{op: op, val: clone(&b)})
                                 done = true
                             }
@@ -1481,7 +1486,7 @@ fn bounds(cs: &[]Expr, col: &str, k: int, q: &Query): []Bound {
                     if !done {
                         match b {
                             Expr.Col(n) {
-                                if n == col && q.valBefore(&a, k) {
+                                if n == col && q.keyBefore(&a, k) {
                                     let flip = match op { "<" { ">" } "<=" { ">=" } ">" { "<" } ">=" { "<=" } else { "=" } }
                                     append(mut &out, Bound{op: flip, val: clone(&a)})
                                 }
@@ -1668,7 +1673,7 @@ fn inList(cs: &[]Expr, col: &str, k: int, q: &Query): []Expr {
                 if n == "in" && len(args) > 1 {
                     var ok = false
                     match args[0] { Expr.Col(x) { ok = x == col } else {} }
-                    for i in 1..len(args) { if !q.valBefore(&args[i], k) { ok = false } }
+                    for i in 1..len(args) { if !q.keyBefore(&args[i], k) { ok = false } }
                     if ok {
                         var out: []Expr = []
                         for i in 1..len(args) { append(mut &out, clone(&args[i])) }
@@ -1797,11 +1802,30 @@ fn choosePath(q: &Query, k: int, cs: &[]Expr, params: &[]Val): Path {
     return best
 }
 
+// Whether the path's values change from row to row of the tables before
+// it: they use those tables, or a correlated subquery (run per row).
 fn (q: &Query) pathOuter(p: &Path): bool {
     for x in p.eqs { if q.maxLevel(&x) >= 0 { return true } }
     for x in p.ins { if q.maxLevel(&x) >= 0 { return true } }
     for b in p.rng { if q.maxLevel(&b.val) >= 0 { return true } }
+    return q.corr && pathCorr(p)
+}
+
+fn pathCorr(p: &Path): bool {
+    for x in p.eqs { if hasCorr(&x) { return true } }
+    for x in p.ins { if hasCorr(&x) { return true } }
+    for b in p.rng { if hasCorr(&b.val) { return true } }
     return false
+}
+
+// The values of the correlated subqueries in a path's key values, for
+// env's row (fillCur; memoized as the filter's are).
+fn pathCur(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, p: &Path, env: &Env, rs: mut &Run): Result[[]Val, DbErr] {
+    var cur: []Val = array(len(q.subs), Val.Null)
+    for x in p.eqs { try fillCur(st, txn, q, &x, env, rs, mut &cur) }
+    for x in p.ins { try fillCur(st, txn, q, &x, env, rs, mut &cur) }
+    for b in p.rng { try fillCur(st, txn, q, &b.val, env, rs, mut &cur) }
+    return Ok(cur)
 }
 
 fn encPart(b: mut &StrBuf, v: &Val, index: bool) {
@@ -2361,7 +2385,13 @@ fn runLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Ma
         {
             let noAggs: []Val = []
             let env = Env{cols: &q.cols, row: row, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs}
-            scans = try pathScans(&lv.t, &lv.path, &env)
+            if q.corr && pathCorr(&lv.path) {
+                let cur = try pathCur(st, txn, q, &lv.path, &env, rs)
+                let env2 = Env{cols: &q.cols, row: row, aggs: &noAggs, params: params, subs: &m.subs, cur: &cur}
+                scans = try pathScans(&lv.t, &lv.path, &env2)
+            } else {
+                scans = try pathScans(&lv.t, &lv.path, &env)
+            }
         }
         for sc in scans {
             var cur = newCursor()

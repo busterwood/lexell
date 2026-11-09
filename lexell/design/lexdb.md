@@ -393,7 +393,7 @@ Built on 2026-11-09 on branch `lexdb`, about 6,300 lines in
 (cache, trees, transactions, log, checkpoints, recovery, snapshots),
 `lexdb_sql` (lexer, parser), `lexdb_exec` (catalog, rows, keys, planner,
 statements, sessions), `lexdb_wire` (protocol 3.0) and `lexdb` (the
-server). Tests: `python3 lexell/tests/lexdb.py` (32 programs in
+server). Tests: `python3 lexell/tests/lexdb.py` (33 programs in
 `tests/lexdb/run`, under `LXL_CHECK=1`).
 
     lexell/compiler/out/lxlc lexell/cmd/lexdb.lxl -o lexdb
@@ -517,8 +517,7 @@ is the comparison to make.
      ... RETURNING ...)`), which wait for `RETURNING`, and `UPDATE ...
      FROM`, the way to join a CTE into an UPDATE (now only through
      subqueries);
-   - a correlated subquery's value as a lookup's key (now it is only a
-     filter);
+   - built: a correlated subquery's value as a lookup's key (9.23);
    - correlated subqueries in GROUP BY and in aggregates' arguments;
    - ORDER BY inside an aggregate (`string_agg(x, ',' ORDER BY x)`);
    - hashing a correlated scalar subquery with an aggregate (a count per
@@ -1520,4 +1519,45 @@ Caught, each put back:
 - the query's subqueries not its own;
 - no parameter type from the query;
 - the column count unchecked.
+
+### 9.23 A correlated subquery's value as a lookup's key
+
+`b.id = (SELECT min(id) FROM c x WHERE x.grp = a.grp AND x.id > a.id)`
+was a filter over every row of b, for every row of a: path values had to
+be free of correlated subqueries (`valBefore`), since those run per row
+(`fillCur`) and a path's values were evaluated without them.
+
+- **Choosing.** A path's key value (`keyBefore`) needs only to use the
+  tables before its level; a correlated subquery whose references are
+  among them, or the parent query's, qualifies. Equalities, ranges and IN
+  lists all take such values. A value using the level's own columns stays
+  a filter.
+- **Running.** Before the level is read for a row of the tables before it,
+  `pathCur` runs the path's correlated subqueries (memoized by their
+  references' values, as a filter's are) and the scans are built with
+  their values. The condition stays as a filter, so a subquery giving no
+  row (NULL: no key) or two rows (an error) means what it meant.
+- **Per row.** A level whose path holds such a value is read per row
+  (`pathOuter`), never hashed once: in a subquery, a value using only the
+  parent query's columns still changes from one run to the next.
+- **Measured.** "Each row's next row in its group" over 1,000 rows reads
+  990 rows of b instead of 1,000,000.
+
+`exec_corrkey` compares each result with the same query written so no
+path can use it (`col + 0`):
+
+- the primary key and an index;
+- a range;
+- an IN list;
+- NULL and two-row subqueries;
+- a subquery keyed by its parent's correlated subquery, and a join's
+  second table inside a subquery keyed so;
+- a value using the table's own columns.
+
+Caught, each put back:
+
+- never a key;
+- such a level hashed once;
+- the values not computed before the scan;
+- the level's own columns allowed in the key.
 

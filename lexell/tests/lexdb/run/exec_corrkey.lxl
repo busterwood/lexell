@@ -1,0 +1,121 @@
+// lexdb_exec: a correlated subquery's value as a lookup's key (design/
+// lexdb.md 9.23). For each row of the tables before it, the subquery runs
+// (memoized as a filter's is) and its value is the key of the next table's
+// lookup or range, instead of a filter over all its rows. Each result is
+// compared with the same query written so no path can use it (col + 0):
+// - a join on the primary key = (subquery), and on an index;
+// - a range: > (subquery);
+// - in an IN list with another value;
+// - the subquery giving NULL (no row), and giving two rows (an error);
+// - a subquery's own table keyed by its parent's correlated subquery, and
+//   its join's second table so (read per row, not hashed once);
+// - a value using the table's own columns stays a filter;
+// - EXPLAIN shows a lookup per row; EXPLAIN ANALYZE the rows read.
+// expect: explain: join c b: primary key lookup per row
+// expect: pk: 990 same
+// expect: index: 9900 same
+// expect: range: 21 same
+// expect: in list: 1990 same
+// expect: null key: 0 same
+// expect: two rows: 21000 same
+// expect: nested: 99 same
+// expect: parent's value in a join: 49 same
+// expect: own columns: 10 same
+// expect: read: 990 of 1000000
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            var out: []str = []
+            for r in rs {
+                for row in r.rows { for v in row { append(mut &out, lexdb_exec.text(&v)) } }
+            }
+            return strings.join(&out, " ")
+        }
+        Err(e) { return e.state }
+    }
+}
+
+fn one(s: mut &lexdb_exec.Session, sql: &str) {
+    match s.exec(sql) {
+        Ok(_) {}
+        Err(e) { println(sql + ": " + e.state + " " + e.msg) }
+    }
+}
+
+// the result with the key, and whether the keyless form (from, to) agrees
+fn cmp(s: mut &lexdb_exec.Session, label: &str, sql: &str, from: &str, to: &str) {
+    let a = q(s, sql)
+    let b = q(s, &strings.replaceAll(sql, from, to))
+    println(label + ": " + a + (if a == b { " same" } else { " DIFFERENT: " + b }))
+}
+
+// EXPLAIN's line for a table (the line starting with prefix)
+fn line(s: mut &lexdb_exec.Session, sql: &str, prefix: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            for row in rs[0].rows {
+                let l = strings.trim(lexdb_exec.text(&row[0]))
+                if strings.startsWith(l, prefix) { return l }
+            }
+            return "none"
+        }
+        Err(e) { return e.state }
+    }
+}
+
+fn readOf(s: mut &lexdb_exec.Session, sql: &str): str {
+    let l = line(s, &("explain analyze " + sql), &"join c b")
+    let i = strings.indexOf(l, "rows read ", 0)
+    if i < 0 { return l }
+    let rest = l[i + 10..len(l)]
+    return strings.split(&rest, ",")[0]
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(37), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 1024 * 1024, ckptBytes: 1024 * 1024, snapNodes: 100000}, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        one(mut &s, &"create table c (id int primary key, grp int)")
+        one(mut &s, &"create table o (id int primary key, cust int)")
+        one(mut &s, &"create index o_cust on o (cust)")
+        var vals: []str = []
+        for i in 0..1000 { append(mut &vals, "(" + i.toStr() + ", " + (i % 10).toStr() + ")") }
+        one(mut &s, &("insert into c values " + strings.join(&vals, ", ")))
+        for b in 0..10 {
+            var ov: []str = []
+            for j in 0..1000 {
+                let i = b * 1000 + j
+                append(mut &ov, "(" + i.toStr() + ", " + (i % 1000).toStr() + ")")
+            }
+            one(mut &s, &("insert into o values " + strings.join(&ov, ", ")))
+        }
+
+        // b is the next row of a's group after a
+        let next = "select count(*) from c a join c b on b.id = (select min(id) from c x where x.grp = a.grp and x.id > a.id)"
+        println("explain: " + line(mut &s, &("explain " + next), &"join c b"))
+        cmp(mut &s, &"pk", &next, &"b.id =", &"b.id + 0 =")
+        cmp(mut &s, &"index", &"select count(*) from c a join o b on b.cust = (select min(id) from c x where x.grp = a.grp and x.id > a.id)",
+            &"b.cust =", &"b.cust + 0 =")
+        cmp(mut &s, &"range", &"select count(*) from c a join c b on b.id > (select max(id) from c x where x.grp = a.grp and x.id < 1000) - 2 where a.id < 2",
+            &"b.id >", &"b.id + 0 >")
+        cmp(mut &s, &"in list", &"select count(*) from c a join c b on b.id in (a.id, (select min(id) from c x where x.grp = a.grp and x.id > a.id))",
+            &"b.id in", &"b.id + 0 in")
+        cmp(mut &s, &"null key", &"select count(*) from c a join c b on b.id = (select min(id) from c x where x.id > a.id + 5000)",
+            &"b.id =", &"b.id + 0 =")
+        cmp(mut &s, &"two rows", &"select count(*) from c a join c b on b.id = (select id from c x where x.grp = a.grp and x.id > a.id and x.id < 990)",
+            &"b.id =", &"b.id + 0 =")
+        cmp(mut &s, &"nested", &"select count(*) from c where c.id < 100 and (select count(*) from o where o.cust = (select max(id) from c c3 where c3.id < c.id)) = 10",
+            &"o.cust =", &"o.cust + 0 =")
+        cmp(mut &s, &"parent's value in a join", &"select count(*) from c where c.id < 50 and (select count(*) from c z join o on o.cust = (select max(id) from c c3 where c3.id < c.id) where z.id = 1) = 10",
+            &"o.cust =", &"o.cust + 0 =")
+        cmp(mut &s, &"own columns", &"select count(*) from c a join c b on b.id = (select min(id) from c x where x.grp = b.grp) where a.id = 1",
+            &"b.id =", &"b.id + 0 =")
+        println("read: " + readOf(mut &s, &next) + " of " + readOf(mut &s, &strings.replaceAll(&next, "b.id =", "b.id + 0 =")))
+        return 0
+    }).unwrap()
+}
