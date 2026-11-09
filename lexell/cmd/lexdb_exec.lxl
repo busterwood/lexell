@@ -19,6 +19,7 @@ import "binary"
 import "strings"
 import "collections"
 import "time"
+import "task"
 import "./lexdb_base"
 import "./lexdb_store"
 import "./lexdb_sql"
@@ -1126,7 +1127,13 @@ type Run = record {
     maxHeld: int                // max_statement_mem; 0 no limit
     deadline: int               // statement_timeout: the monotonic clock's ns to stop at; 0 none
     ticks: int
+    turnEnd: int                // the monotonic clock's ns after which the statement lets other sessions run
 }
+
+// A statement that does not wait (its pages in the cache) lets the other
+// sessions run after this much time: lexdb runs SQL on one thread
+// (design/lexdb.md 9.15).
+pub const TURN_NS = 100000
 
 // A session's limits on one statement (SET max_recursion,
 // max_statement_mem, statement_timeout).
@@ -1161,11 +1168,23 @@ fn memErr(max: int): DbErr {
              " kB) of rows; SET max_statement_mem to allow more, 0 for no limit")
 }
 
-// Per row looked at: every 256th, the clock against statement_timeout.
+// Per row looked at: every 256th, the clock. Past statement_timeout: an
+// error. After a turn of TURN_NS: the other sessions run, then this again.
 fn (rs: mut &Run) tick(): Result[Unit, DbErr] {
     rs.ticks += 1
-    if rs.deadline == 0 || rs.ticks % 256 != 0 { return Ok(Unit{}) }
-    if time.monotonicNs() > rs.deadline { return Err(e("57014", "canceling statement due to statement timeout")) }
+    if rs.ticks % 256 != 0 { return Ok(Unit{}) }
+    let now = time.monotonicNs()
+    if rs.deadline != 0 && now > rs.deadline { return Err(e("57014", "canceling statement due to statement timeout")) }
+    if rs.turnEnd == 0 {
+        rs.turnEnd = now + TURN_NS
+    } else if now > rs.turnEnd {
+        // a yield looks at the sockets: a session whose query has arrived runs
+        match task.yield() {
+            Ok(_) {}
+            Err(_) { return Err(e("57014", "canceling statement: its session has ended")) }
+        }
+        rs.turnEnd = time.monotonicNs() + TURN_NS
+    }
     return Ok(Unit{})
 }
 
@@ -1218,7 +1237,7 @@ fn newRun(q: &Query): Run {
     }
     return Run{cnt: array(len(q.levels), Counts{starts: 0, read: 0, joined: 0, nulls: 0, built: 0, kept: 0, unmatched: 0}),
                seen: seen, memo: memo, memoRes: memoRes, stats: stats, cache: newCache(), maxRounds: MAX_RECURSION,
-               held: 0, maxHeld: 0, deadline: 0, ticks: 0}
+               held: 0, maxHeld: 0, deadline: 0, ticks: 0, turnEnd: 0}
 }
 
 fn keepsRight(join: int): bool { return join == lexdb_sql.J_RIGHT || join == lexdb_sql.J_FULL }
@@ -2829,10 +2848,12 @@ fn runChild(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params
     rs.deadline = parent.deadline
     rs.held = parent.held
     rs.ticks = parent.ticks
+    rs.turnEnd = parent.turnEnd
     rs.cache = replace(mut &parent.cache, newCache())
     let r = execSel(st, txn, sel, params, cap, mut &rs)
     parent.cache = replace(mut &rs.cache, newCache())
     parent.ticks = rs.ticks
+    parent.turnEnd = rs.turnEnd
     while len(parent.stats) <= i { append(mut &parent.stats, SubStat{runs: 0, hits: 0, cnt: [], inner: []}) }
     parent.stats[i].runs += 1
     addCounts(mut &parent.stats[i].cnt, &rs.cnt)
@@ -4976,13 +4997,27 @@ pub fn (s: mut &Session) run(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
     var tries = 0
     let lim = s.limits()                    // retries share the statement's time
     while true {
-        var t = lexdb_store.begin()
-        let r = try execIn(&s.st, mut &t, stmt, params, ptypes, lim)
-        match s.st.commit(t) {
-            Ok(_) { return Ok(r) }
+        // A SELECT runs on a snapshot: it sees one state and never conflicts.
+        // It may be long, letting other sessions run (Run.tick) and commit
+        // meanwhile; run optimistically, it would conflict with them and
+        // run again (design/lexdb.md 9.15). A snapshot whose old versions
+        // went over their budget (72000) is tried again on a new one.
+        let snap = stmt.kind == lexdb_sql.S_SELECT
+        var t = if snap { try s.st.beginSnapshot() } else { lexdb_store.begin() }
+        match execIn(&s.st, mut &t, stmt, params, ptypes, lim) {
+            Ok(r) {
+                match s.st.commit(t) {
+                    Ok(_) { return Ok(r) }
+                    Err(x) {
+                        tries += 1
+                        if x.state != lexdb_base.S_CONFLICT || tries >= 10 { return Err(x) }
+                    }
+                }
+            }
             Err(x) {
+                s.st.abort(t)
                 tries += 1
-                if x.state != lexdb_base.S_CONFLICT || tries >= 10 { return Err(x) }
+                if !(snap && x.state == "72000") || tries >= 10 { return Err(x) }
             }
         }
     }

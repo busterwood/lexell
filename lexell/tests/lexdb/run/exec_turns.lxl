@@ -1,0 +1,110 @@
+// lexdb_exec: sessions taking turns. A long query (its pages all in the
+// cache, so it never waits for the disk) lets other sessions run: a short
+// session started after it ends first. A long SELECT outside a transaction
+// block reads one snapshot: while another session commits transfers that
+// keep the sum of a column, the long query's sum is the sum, and it never
+// conflicts; inside a block, the same query fails at COMMIT (40001), as
+// serializable PostgreSQL would.
+// expect: order: short, long
+// expect: transfers all committed: true
+// expect: snapshot sum ok: true
+// expect: in a block: 40001
+import "strings"
+import "task"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+
+type Arg = record { st: lexdb_store.Store; which: int }
+
+fn one(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if len(r.rows) == 0 { return r.tag }
+            var cells: []str = []
+            for v in r.rows[0] { append(mut &cells, lexdb_exec.text(&v)) }
+            return strings.join(&cells, "|")
+        }
+        Err(e) { return e.state }
+    }
+}
+
+// which 0: the long query, then its mark; 1: short queries, then its mark
+fn order(a: Arg): int {
+    var s = lexdb_exec.newSession(a.st)
+    if a.which == 0 {
+        let n = one(mut &s, &"select count(*) from big x, small y, small z")
+        let m = one(mut &s, &"insert into log values ((select count(*) from log), 'long')")
+    } else {
+        for i in 0..20 { let r = one(mut &s, &("select b from big where id = " + (i * 7).toStr())) }
+        let m = one(mut &s, &"insert into log values ((select count(*) from log), 'short')")
+    }
+    return 0
+}
+
+// which 0: the long sum (outside a block, then in one); 1: transfers
+fn sums(a: Arg): int {
+    var s = lexdb_exec.newSession(a.st)
+    if a.which == 0 {
+        let got = one(mut &s, &"select sum(a) from big x, small y, small z")
+        let r = one(mut &s, &("insert into log values (100, '" + got + "')"))
+        let b = one(mut &s, &"begin")
+        let inBlock = one(mut &s, &"select sum(a) from big x, small y, small z")
+        let c = one(mut &s, &"commit")
+        let r2 = one(mut &s, &("insert into log values (101, '" + c + "')"))
+    } else {
+        // transfers until the long session has run its block
+        var ok = 0
+        var n = 0
+        var i = 0
+        while one(mut &s, &"select count(*) from log where id = 101") == "0" {
+            let k = (i * 131) % 20000
+            let b = one(mut &s, &"begin")
+            let u1 = one(mut &s, &("update big set a = a + 5 where id = " + k.toStr()))
+            let u2 = one(mut &s, &("update big set a = a - 5 where id = " + ((k + 1) % 20000).toStr()))
+            if one(mut &s, &"commit") == "COMMIT" { ok += 1 }
+            n += 1
+            i += 1
+        }
+        let all = ok == n && n > 10
+        let r = one(mut &s, &("insert into log values (102, '" + all.toStr() + "')"))
+    }
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(3), lexdb_store.Options{cacheBytes: 128 * 1024 * 1024, segBytes: 4 * 1024 * 1024, ckptBytes: 2 * 1024 * 1024, snapNodes: 50000}, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        let c1 = one(mut &s, &"create table big (id int primary key, a int, b text)")
+        let c2 = one(mut &s, &"create table small (id int primary key)")
+        let c3 = one(mut &s, &"create table log (id int primary key, who text)")
+        var i = 0
+        while i < 20000 {
+            var vals: []str = []
+            for j in i..i + 1000 { append(mut &vals, "(" + j.toStr() + ", " + (j % 100).toStr() + ", 'row " + j.toStr() + "')") }
+            let r = one(mut &s, &("insert into big values " + strings.join(&vals, ", ")))
+            i += 1000
+        }
+        let c4 = one(mut &s, &"insert into small values (1), (2), (3), (4), (5), (6)")
+        let warm = one(mut &s, &"select count(*) from big")
+        let total = one(mut &s, &"select sum(a) from big")
+        task.scope(fn(sc: mut &task.Scope) {
+            sc.spawn(order, Arg{st: st, which: 0})
+            sc.spawn(order, Arg{st: st, which: 1})
+        })
+        let first = one(mut &s, &"select who from log where id = 0")
+        let second = one(mut &s, &"select who from log where id = 1")
+        println("order: " + first + ", " + second)
+        task.scope(fn(sc: mut &task.Scope) {
+            sc.spawn(sums, Arg{st: st, which: 0})
+            sc.spawn(sums, Arg{st: st, which: 1})
+        })
+        println("transfers all committed: " + one(mut &s, &"select who from log where id = 102"))
+        let want = (strings.parseIntOpt(total).unwrapOr(0) * 36).toStr()
+        println("snapshot sum ok: " + (one(mut &s, &"select who from log where id = 100") == want).toStr())
+        println("in a block: " + one(mut &s, &"select who from log where id = 101"))
+        return 0
+    }).unwrap()
+}

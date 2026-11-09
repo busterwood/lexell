@@ -393,7 +393,7 @@ Built on 2026-11-09 on branch `lexdb`, about 6,300 lines in
 (cache, trees, transactions, log, checkpoints, recovery, snapshots),
 `lexdb_sql` (lexer, parser), `lexdb_exec` (catalog, rows, keys, planner,
 statements, sessions), `lexdb_wire` (protocol 3.0) and `lexdb` (the
-server). Tests: `python3 lexell/tests/lexdb.py` (22 programs in
+server). Tests: `python3 lexell/tests/lexdb.py` (23 programs in
 `tests/lexdb/run`, under `LXL_CHECK=1`).
 
     lexell/compiler/out/lxlc lexell/cmd/lexdb.lxl -o lexdb
@@ -506,29 +506,25 @@ is the comparison to make.
 
 ### 9.4 Next
 
-1. A long statement letting other sessions run: today a statement that
-   does not wait on I/O holds the one thread until it ends (statement_timeout
-   bounds it, 9.14); its per-row clock check could yield every few ms.
-   Measure the point-select latency beside a long query first.
-2. Smaller items: a correlated subquery's value as a lookup's key (now it
+1. Smaller items: a correlated subquery's value as a lookup's key (now it
    is only a filter), a small uncorrelated IN set as an IN-list
    lookup, correlated subqueries in GROUP BY and in aggregates' arguments,
    hashing a correlated scalar subquery with an aggregate (a count per
    customer) as a grouped run, `WITH` before INSERT, UPDATE and DELETE.
    Choosing hash or index per row by row counts (9.9) waits for costs,
    which the user has left for now (section 0).
-3. Schemas (the user uses them extensively): `schema.table` names, the
+2. Schemas (the user uses them extensively): `schema.table` names, the
    catalog keyed by schema, `CREATE SCHEMA`/`DROP SCHEMA`, `search_path`,
    and three-part column names (`s.t.c`) in the resolver.
-4. Plans kept per prepared statement: since D4 every execution resolves
+3. Plans kept per prepared statement: since D4 every execution resolves
    names and chooses paths, and point selects fell from 26,700 to about
    24,000 tps.
-5. Whole-server crash tests through the wire protocol.
-6. COPY; then the cost questions (section 0), with EXPLAIN ANALYZE's
+4. Whole-server crash tests through the wire protocol.
+5. COPY; then the cost questions (section 0), with EXPLAIN ANALYZE's
    counts as the evidence.
-7. Overflow pages for large rows; reclaiming a dropped table's pages.
-8. Authentication (SCRAM) and TLS, so the server can leave loopback.
-9. The checkpoint pause under a large write load; io_uring if the helper
+6. Overflow pages for large rows; reclaiming a dropped table's pages.
+7. Authentication (SCRAM) and TLS, so the server can leave loopback.
+8. The checkpoint pause under a large write load; io_uring if the helper
    pool is the limit (D5).
 
 ### 9.5 Indexes and joins (D4)
@@ -960,4 +956,51 @@ Per session, as PostgreSQL's SET, kept until changed:
   23,826 and 23,501 tps (noise). Three scans and a join of 300,000 rows,
   warm: 0.56 s, the same as before 9.13. 9.13 had made it 0.64 s by
   copying what scans hand out, and this change stops copying it.
+
+### 9.15 Taking turns, and SELECT on a snapshot
+
+- **Turns.** lexdb runs SQL on one thread; sessions interleave when one
+  waits (sockets through epoll, the disk through the helper pool). A
+  statement whose pages are all in the cache never waits, so it used to
+  run to its end while every other session waited. Now the per-row clock
+  check (9.14) yields after 0.1 ms of a statement (`TURN_NS`).
+- **The runtime.** `task.yield` looked at sockets only every 64th switch,
+  so a lone long query let a waiting client in only every 64 turns. It now
+  looks every time (commit 608223a8, the user's decision: both runtimes,
+  regenerated, reseeded; run.py, run_native.py and httpsrvgen.py pass).
+- **SELECT outside a block runs on a snapshot.** A query that yields lets
+  other sessions commit meanwhile. Run optimistically, a long scan beside
+  writers to its table conflicted on every retry and failed. On a
+  snapshot it sees one state and never conflicts. It is serializable:
+  read-write transactions are validated in commit order, and a snapshot
+  sees a prefix of that order. A snapshot whose old versions passed their
+  budget (72000) is retried on a new one. Inside a transaction block
+  nothing changed: reads are validated at COMMIT, and a long read there
+  can fail with 40001, as in serializable PostgreSQL (`BEGIN READ ONLY`
+  for long reads).
+- **Measured** (point selects, 4 clients, a 300,000-row cached aggregate
+  running all the time on another connection):
+
+| | point-select p50 | p99 | max | point tps | aggregates in 6 s |
+|---|---|---|---|---|---|
+| before | 109 ms | 122 ms | 224 ms | 44 | 54 |
+| turns of 1 ms | 1.34 ms | 3.5 ms | 6.8 ms | 2,668 | 49 |
+| turns of 0.25 ms | 0.72 ms | 2.9 ms | 4.3 ms | 4,300 | 47 |
+| turns of 0.1 ms | 0.54 ms | 2.7 ms | 4.1 ms | 5,234 | 46 |
+
+  Alone, the aggregate takes 98 ms with turns (no cost seen). Beside 4
+  writers updating random rows of its table, it failed every time before
+  the snapshot change. After it, it takes 151 ms, while the writers do
+  1,572 tps (316 before, held off by the scan). Retrying on a snapshot
+  only after a conflict took 299 ms. 16 writers and 8 point readers
+  together are the same either way (readers 3,460 tps, writers 3,390).
+  Further tuning was stopped at the user's request.
+- **Tests.** `exec_turns` runs sessions as tasks on one store:
+  - a short session started after a long query ends first;
+  - a long sum outside a block, while another session commits transfers
+    that keep the sum, gives the sum; every transfer commits;
+  - the same query inside a block fails at COMMIT with 40001.
+
+  Never yielding, no turn started, and optimistic SELECTs each change the
+  output.
 
