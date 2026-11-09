@@ -41,8 +41,9 @@ type Portal = record {
 
 type Wire = record {
     c: net.Conn
-    inBuf: []byte
+    inBuf: []byte               // read into directly; [inPos, inEnd) not yet taken
     inPos: int
+    inEnd: int
     out: StrBuf
     sess: lexdb_exec.Session
     st: lexdb_store.Store
@@ -58,15 +59,23 @@ type Ps = record {
 // ---- reading
 
 fn (w: mut &Wire) fill(n: int): Result[bool, io.IoError] {
-    while len(w.inBuf) - w.inPos < n {
-        if w.inPos > 0 && w.inPos == len(w.inBuf) {
-            w.inBuf = []
+    while w.inEnd - w.inPos < n {
+        // room for n from inPos: move what is left to the front, or grow
+        if w.inPos + n > len(w.inBuf) {
+            let have = w.inEnd - w.inPos
+            if n > len(w.inBuf) {
+                var nb = array(if n > 2 * len(w.inBuf) { n } else { 2 * len(w.inBuf) }, byte(0))
+                for i in 0..have { nb[i] = w.inBuf[w.inPos + i] }
+                w.inBuf = nb
+            } else {
+                for i in 0..have { w.inBuf[i] = w.inBuf[w.inPos + i] }
+            }
             w.inPos = 0
+            w.inEnd = have
         }
-        var chunk = array(65536, byte(0))
-        let got = try w.c.read(mut &chunk)
+        let got = try w.c.read(mut &w.inBuf[w.inEnd..len(w.inBuf)])
         if got == 0 { return Ok(false) }
-        for i in 0..got { append(mut &w.inBuf, chunk[i]) }
+        w.inEnd += got
     }
     return Ok(true)
 }
@@ -74,9 +83,9 @@ fn (w: mut &Wire) fill(n: int): Result[bool, io.IoError] {
 fn (w: mut &Wire) take(n: int): str {
     let s = strFromBytes(&w.inBuf[w.inPos..w.inPos + n])
     w.inPos += n
-    if w.inPos == len(w.inBuf) {
-        w.inBuf = []
+    if w.inPos == w.inEnd {
         w.inPos = 0
+        w.inEnd = 0
     }
     return s
 }
@@ -512,7 +521,7 @@ fn (w: mut &Wire) step(ps: mut &Ps, m: &Msg): Result[bool, io.IoError] {
 pub fn serve(a: ConnArg): int {
     let ConnArg{conn: c, st: st, id: _} = move(a)
     let nd = c.setNoDelay(true)
-    var w = Wire{c: c, inBuf: [], inPos: 0, out: newStrBuf(), sess: lexdb_exec.newSession(st), st: st,
+    var w = Wire{c: c, inBuf: array(65536, byte(0)), inPos: 0, inEnd: 0, out: newStrBuf(), sess: lexdb_exec.newSession(st), st: st,
                  skipping: false}
     var ps = Ps{stmts: newMap(), portals: newMap()}
     if startup(mut &w).unwrapOr(false) {

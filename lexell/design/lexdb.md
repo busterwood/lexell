@@ -506,8 +506,9 @@ is the comparison to make.
 
 ### 9.4 Next
 
-1. io_uring for the page file's and the log's reads and writes, in place of
-   the helper pool (the user's request: consider it; 9.17).
+1. io_uring: measured (9.17), the decision is the user's (a runtime
+   change). For file reads only it saves at most 17 us of system calls per
+   cache miss on the SQL thread; for the whole event loop, sockets too.
 2. Conflicts per row, not per leaf: a commit fails when a leaf it read
    changed, even for another row in it. Transfers in blocks over 10,000
    rows by 16 writers fail 1.6% of the time, most of it this.
@@ -1084,4 +1085,59 @@ Beside 16 writers, point selects took 2.2 ms instead of 0.27 ms, and
 
   Checking own writes before the snapshot in `get` turned out to be only
   a shortcut: the scan merges them anyway.
+
+### 9.17 The read path beyond the cache, and io_uring
+
+The user asked to consider io_uring for reads and writes. It was measured
+first against the helper pool, then in lexdb itself. Then they asked
+whether uncached plans were the cost.
+
+**The drive, with and without io_uring** (`uring_probe.c`, no liburing;
+4 KiB `O_DIRECT` random reads of a 4 GiB file; two runs agreed; the first
+run, while the host still wrote the file back, was 2 to 5 times slower and
+is left out):
+
+| | IOPS | p50 | p99 | CPU per read |
+|---|---:|---:|---:|---:|
+| threads, 1 / 8 / 32 | 6,000 / 40,000 / 88,000 | 140 / 173 / 310 us | 330 / 450 / 1,050 us | 16 / 18 / 24 us |
+| io_uring, one thread, depth 1 / 8 / 32 / 64 | 5,400 / 40,000 / 85,000 / 98,000 | 160 / 179 / 330 / 554 us | 333 / 472 / 1,060 / 2,040 us | 17 / 9 / 6 / 6 us |
+| 4 KiB write + `fdatasync`: pwrite / io_uring linked | 1,080 / 980 a second | 880 / 955 us | 1,450 / 1,700 us | 33 / 78 us |
+
+The drive gives the same reads in flight either way. io_uring costs a
+quarter of the CPU per read, and a flush the same time (the device sets
+it). The kernel allows io_uring (`io_uring_disabled` 0).
+
+**lexdb, random point selects on 10 million rows (2.9 GB) with a 64 MB
+cache**, so nearly every select reads its leaf (pgbench, prepared, 32
+clients; CPU per select from `/proc`):
+
+| | selects/s | SQL thread per select | user | system | helpers |
+|---|---:|---:|---:|---:|---:|
+| before | 8,900 | 110 us | 78 us | 32 us | 87 us |
+| after (below) | 14,000 | 68 us | 41 us | 27 us | 80 us |
+| the same, all in cache (ids 0 to 99,999) | 41,000 | 23 us | 14 us | 10 us | none |
+
+The SQL thread was saturated, and 98% of its sampled time was user code
+(perf, with the symbol map that `LXL_NATIVE_MAP` writes). Planning and
+parsing were 1.5%: a prepared point select plans in a few microseconds.
+What it was:
+
+- `Wire.fill`, 23%: a new 64 KiB array, zeroed, for every socket read,
+  copied byte by byte. Now one buffer per connection, read into directly.
+- CRC32C, 17%: a byte at a time. Now `hash.crc32c` in the standard
+  library, with the CPU's crc32 instruction (the user's choice), 2%.
+- Eviction: the clock scanned every child of each inner node it passed,
+  though an inner node on a path in use is nearly always referenced. The
+  reference bit is now checked first. Freeing an evicted inner node's
+  child slots made and dropped an empty node for each, though they were
+  empty already.
+
+**What io_uring would give.** Per cache miss, the SQL thread spends 28 us
+of user time and 17 us of system time (the pool: a futex wake, the
+eventfd, more turns of the epoll loop). io_uring for file reads would
+save at most those 17 us, about a quarter of a miss, and the helpers'
+spinning on other cores. Even all in cache, the sockets cost 10 us of
+system calls per select, a third of it. An event loop built on io_uring
+for sockets too could batch those across sessions. Either is a runtime
+change, so it is the user's decision.
 

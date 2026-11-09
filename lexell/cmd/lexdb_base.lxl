@@ -1,6 +1,7 @@
 // lexdb: what every layer shares: the error type, CRC32C and a small
 // deterministic random generator for the simulated disk and the tests.
 // Design: design/lexdb.md.
+import "hash"
 
 // An error, with the SQLSTATE a Postgres client sees (design/lexdb.md 4.4:
 // 40001 is a serialization failure the client retries).
@@ -29,45 +30,13 @@ pub fn conflict(): DbErr {
     return DbErr{state: S_CONFLICT, msg: "could not serialize access due to concurrent update"}
 }
 
-// ---- CRC32C (Castagnoli), reflected, as iSCSI and ext4 use it.
-
-var CRC_TABLE: once []u32
-
-fn crcInit() {
-    if !CRC_TABLE.isSet() {
-        var t: []u32 = []
-        for i in 0..256 {
-            var c = u32(i)
-            for k in 0..8 {
-                if c & 1 == 1 { c = (c >> 1) ^ 0x82F63B78 } else { c = c >> 1 }
-            }
-            append(mut &t, c)
-        }
-        CRC_TABLE.set(t)
-    }
-}
+// ---- CRC32C (Castagnoli), as iSCSI and ext4 use it: lib hash's, with the
+// CPU's crc32 instruction. Every page read is checked, so this is on the
+// read path (a byte-at-a-time table took 17% of the SQL thread in random
+// reads beyond the cache).
 
 // CRC32C of b[from..to).
-pub fn crc32c(b: &[byte], from: int, to: int): u32 {
-    crcInit()
-    let t = CRC_TABLE.get()
-    var c: u32 = 0xFFFFFFFF
-    for i in from..to {
-        c = t[int((c ^ u32(b[i])) & 0xFF)] ^ (c >> 8)
-    }
-    return c ^ 0xFFFFFFFF
-}
-
-// CRC32C of a string's bytes.
-pub fn crc32cStr(s: &str): u32 {
-    crcInit()
-    let t = CRC_TABLE.get()
-    var c: u32 = 0xFFFFFFFF
-    for i in 0..len(s) {
-        c = t[int((c ^ u32(s[i])) & 0xFF)] ^ (c >> 8)
-    }
-    return c ^ 0xFFFFFFFF
-}
+pub fn crc32c(b: &[byte], from: int, to: int): u32 { return hash.crc32c(&b[from..to]) }
 
 // ---- xorshift64*: deterministic, for the simulated disk and the tests.
 

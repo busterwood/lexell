@@ -284,13 +284,13 @@ fn (db: mut &Db) dropSlot(s: int) {
     if db.meta[s].loaded {
         db.loadedCount -= 1
         db.uncost(s)
+        db.nodes[s] = lexdb_page.newLeaf()      // not loaded: empty already (an evicted node's children)
     }
     db.meta[s].used = false
     db.meta[s].gen += 1
     db.meta[s].loaded = false
     db.meta[s].dirty = false
     db.meta[s].disk = -1
-    db.nodes[s] = lexdb_page.newLeaf()
     append(mut &db.freeSlots, s)
 }
 
@@ -368,10 +368,15 @@ fn (db: mut &Db) prune() {
     db.deferred = still
 }
 
+// Whether slot s could be evicted, but for its children (kidsOut).
 fn (db: &Db) evictable(s: int): bool {
-    let m = db.meta[s]
+    let m = &db.meta[s]
     if !m.used || !m.loaded || m.dirty || m.root || m.ckpt > db.durableCkpt || m.disk < 0 { return false }
-    if m.pinned || len(db.hist[s]) > 0 { return false }
+    return !m.pinned && len(db.hist[s]) == 0
+}
+
+// Whether none of an inner node's children is in memory (a leaf: true).
+fn (db: &Db) kidsOut(s: int): bool {
     if !db.nodes[s].leaf {
         for k in db.nodes[s].kids { if db.meta[k].loaded { return false } }
     }
@@ -392,10 +397,13 @@ fn (db: mut &Db) maybeEvict() {
         if db.hand >= len(db.meta) { db.hand = 0 }
         let s = db.hand
         if !db.evictable(s) { continue }
+        // the reference bit first: an inner node on a path in use is almost
+        // always referenced, and its children's scan was 8% of a read
         if db.meta[s].ref {
             db.meta[s].ref = false
             continue
         }
+        if !db.kidsOut(s) { continue }
         if !db.nodes[s].leaf {
             var kids: []int = []
             for k in db.nodes[s].kids { append(mut &kids, k) }
