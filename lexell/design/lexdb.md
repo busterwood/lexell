@@ -393,7 +393,7 @@ Built on 2026-11-09 on branch `lexdb`, about 6,300 lines in
 (cache, trees, transactions, log, checkpoints, recovery, snapshots),
 `lexdb_sql` (lexer, parser), `lexdb_exec` (catalog, rows, keys, planner,
 statements, sessions), `lexdb_wire` (protocol 3.0) and `lexdb` (the
-server). Tests: `python3 lexell/tests/lexdb.py` (27 programs in
+server). Tests: `python3 lexell/tests/lexdb.py` (28 programs in
 `tests/lexdb/run`, under `LXL_CHECK=1`).
 
     lexell/compiler/out/lxlc lexell/cmd/lexdb.lxl -o lexdb
@@ -1244,7 +1244,17 @@ keeps nothing. Caught:
 - partial-index looks not counted (7 rows where 12 were right);
 - a one-shot run keeping its plan.
 
-Lexell's PostgreSQL client parses every query as the unnamed statement,
-so a Lexell program never reuses a plan. Prepared statements in
-`lib/postgres` come next (the user's request).
+Lexell's PostgreSQL client parsed every query as the unnamed statement,
+so a Lexell program never reused a plan. It now has prepared statements
+the program asks for (`prepare`, `queryPrepared`, `closePrepared`;
+design/pgwire.md 7.2). `wire_prepared` runs them against lexdb in one
+process:
+
+- a select run for three ids takes one round trip each;
+- a prepared insert;
+- the select after another connection remakes the table with other
+  columns: lexdb plans it again, where PostgreSQL refuses with 0A000;
+- LIMIT $1;
+- a statement that does not parse;
+- a statement used on another connection.
 

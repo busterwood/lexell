@@ -2574,6 +2574,60 @@ pub fn (s: mut &Session) query(sql: str, params: &[]Param, w: Where): Result[Rep
     return s.collect(w)
 }
 
+// --------------------------------------------------------- named statements
+//
+// A statement parsed once under a name, then run many times without Parse:
+// the server skips parsing it again, and lexdb and PostgreSQL may keep its
+// plan. Its parameters' types are the server's inference (Parse sends none,
+// as PQprepare with no types does): the arguments go as text, so a binary
+// argument (bytes) fits only a bytea parameter. It lasts until closed or the
+// connection ends; DDL on what it reads may make the server refuse it
+// (PostgreSQL: 0A000, "cached plan must not change result type").
+
+// Parse sql as the statement name, and Sync: one round trip.
+pub fn (s: mut &Session) prepare(name: str, sql: str, w: Where): Result[Unit, Error] {
+    let none: []Param = []
+    try checkRequest(sql, &none)
+    try sqldialect.noNul(name, "statement name")
+    if len(name) == 0 { return Err(input("a prepared statement needs a name (the unnamed one is query's)")) }
+    try s.begin(w)
+    putParse(mut &s.out, name, sql, &none)
+    putSync(mut &s.out)
+    s.state = S_BUSY
+    try s.flush(-1, w)
+    s.trips += 1
+    let r = try s.collect(w)
+    return Ok(Unit{})
+}
+
+// Runs the statement prepared as name with params ($1, $2, ... in order):
+// Bind, Describe portal, Execute (all rows), Sync in one write, as query
+// but without Parse.
+pub fn (s: mut &Session) queryPrepared(name: str, params: &[]Param, w: Where): Result[Reply, Error] {
+    if len(params) > 65535 { return Err(input("more than 65535 parameters")) }
+    try s.begin(w)
+    putBind(mut &s.out, "", name, params)
+    putDescribe(mut &s.out, 80, "")
+    putExecute(mut &s.out, "", 0)
+    putSync(mut &s.out)
+    s.state = S_BUSY
+    try s.flush(-1, w)
+    s.trips += 1
+    return s.collect(w)
+}
+
+// Closes the statement prepared as name (Close, Sync): the server frees it.
+pub fn (s: mut &Session) closePrepared(name: str, w: Where): Result[Unit, Error] {
+    try s.begin(w)
+    putClose(mut &s.out, 83, name)
+    putSync(mut &s.out)
+    s.state = S_BUSY
+    try s.flush(-1, w)
+    s.trips += 1
+    let r = try s.collect(w)
+    return Ok(Unit{})
+}
+
 // --------------------------------------------------------------- cancellation
 
 // Asks the server to cancel what the session is running: a CancelRequest on a

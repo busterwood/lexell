@@ -88,7 +88,9 @@ pub fn openHandles(): int { return OPEN }
 
 // -------------------------------------------------------------- connections
 
-pub type Conn = record { s: pgwire.Session }
+pub type Conn = record { s: pgwire.Session; id: int }    // id: this process's number for it (prepared statements)
+
+var CONNS: int = 0
 
 fn (c: mut &Conn) drop() {
     c.s.close()
@@ -144,6 +146,42 @@ pub fn (c: mut &Conn) query(sql: str, args: &[Value], w: Where): Result[Rows, Er
     let pgwire.Reply{columns: cols, rows: raw, tag: tag, empty: empty} = try c.s.query(sql, &ps, w)
     OPEN += 1
     return Ok(Rows{cols: cols, raw: raw, tag: tag, empty: empty})
+}
+
+// A statement prepared on a connection (prepare): parsed once, run many
+// times with queryPrepared, closed with closePrepared (or when the
+// connection ends). It belongs to the connection that prepared it.
+pub type Prepared = record { name: str; conn: int }
+
+var PREPARED: int = 0
+
+// Parses sql once on this connection, as a named statement: queryPrepared
+// then runs it without parsing it again (the server may keep its plan too).
+// The parameters' types are the server's inference from the statement.
+pub fn (c: mut &Conn) prepare(sql: str, w: Where): Result[Prepared, Error] {
+    try c.s.settle(w)
+    PREPARED += 1
+    let name = "lxl_" + PREPARED.toStr()
+    try c.s.prepare(name, sql, w)
+    return Ok(Prepared{name: name, conn: c.id})
+}
+
+// Runs a prepared statement with $1, $2, ... bound to args, in order.
+pub fn (c: mut &Conn) queryPrepared(p: &Prepared, args: &[Value], w: Where): Result[Rows, Error] {
+    if p.conn != c.id { return Err(sqldialect.inputError("prepared statement " + p.name + " belongs to another connection")) }
+    try c.s.settle(w)
+    var ps: []pgwire.Param = []
+    for v in args { append(mut &ps, try pgwire.param(&v)) }
+    let pgwire.Reply{columns: cols, rows: raw, tag: tag, empty: empty} = try c.s.queryPrepared(p.name, &ps, w)
+    OPEN += 1
+    return Ok(Rows{cols: cols, raw: raw, tag: tag, empty: empty})
+}
+
+// Closes a prepared statement: the server frees it.
+pub fn (c: mut &Conn) closePrepared(p: Prepared, w: Where): Result[Unit, Error] {
+    if p.conn != c.id { return Err(sqldialect.inputError("prepared statement " + p.name + " belongs to another connection")) }
+    try c.s.settle(w)
+    return c.s.closePrepared(p.name, w)
 }
 
 // Runs a fragment with $1, $2, ... placeholders and its arguments.
@@ -345,7 +383,8 @@ pub fn newPool(conninfo: str, size: int): Result[Pool, Error] {
 pub fn (Conn) open(cfg: &pgwire.Config, w: Where): Result[Conn, Error] {
     let s = try pgwire.connect(cfg, w)
     OPEN += 1
-    return Ok(Conn{s: s})
+    CONNS += 1
+    return Ok(Conn{s: s, id: CONNS})
 }
 
 pub fn (Conn) waitFailed(why: task.Cancelled): Error {

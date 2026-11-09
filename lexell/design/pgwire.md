@@ -412,6 +412,9 @@ keys apply where the string gives none, before the environment.
 |---|---|---|---|
 | `exec(script)` | simple Query | `Q` | `PQsendQuery` |
 | `query(sql, args)`, `querySql` | extended, unnamed statement and portal | Parse, Bind, Describe portal, Execute 0, Sync | `PQsendQueryParams` (the same messages) |
+| `prepare(sql)` | extended, a named statement | Parse (name, no parameter types), Sync | `PQprepare` with no types |
+| `queryPrepared(p, args)` | extended, the named statement, unnamed portal | Bind, Describe portal, Execute 0, Sync | `PQsendQueryPrepared` (the same messages) |
+| `closePrepared(p)` | | Close statement, Sync | `PQclosePrepared` |
 | `stream` | extended, unnamed, row limit | Parse, Bind, Describe portal, Execute n, Flush (no Sync, section 12) | single-row mode |
 | `transaction` | `exec("BEGIN")`, the body, `exec("COMMIT")` or `exec("ROLLBACK")` | | the same |
 
@@ -429,6 +432,25 @@ per-column binary results, at the cost of server memory per connection,
 `cached plan must not change result type` (0A000) after DDL, and
 `DISCARD ALL` interplay with poolers. Not now; P5 measures it on
 `http_gate --db` (the case it would help) before anyone builds it.
+
+Named statements the program asks for (2026-11-09, the user's choice
+over an automatic cache): `prepare` parses a statement once under a name
+(`lxl_N`), `queryPrepared` runs it with Bind, Describe, Execute and Sync,
+one round trip with no Parse, and `closePrepared` frees it. lexdb keeps a
+prepared statement's plan, so a repeated query skips parsing and planning
+there. Their costs are the program's to see, not hidden:
+
+- the server keeps each statement until it is closed or the connection
+  ends;
+- `Prepared` records its connection, and using it on another fails in the
+  client, not with the server's 26000;
+- `closePrepared` takes the `Prepared`, so running one after closing it
+  does not compile;
+- after DDL on what it reads, PostgreSQL may refuse it with 0A000
+  ("cached plan must not change result type"), and the program prepares
+  it again (checked against PostgreSQL 16).
+
+The parameters' types are the server's inference: Parse sends none.
 
 ### 7.3 Parameters
 

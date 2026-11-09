@@ -5,6 +5,7 @@
 // SSLRequest answered N and E and S followed by a stray byte,
 // NegotiateProtocolVersion, 4 and 32 byte cancel keys, ParameterStatus and
 // notices mid-session, scripts with two results and an error, extended queries,
+// named statements (Parse once, Bind-Describe-Execute twice, Close),
 // a portal of 300 rows in batches of 7, replies split at every byte, closePortal,
 // a cancelled wait (the CancelRequest the server sees), a FATAL, and 300 mutated
 // replies that each end in Ok or Err.
@@ -42,6 +43,7 @@
 // expect: negotiate minor 0: ok || startup user=u,database=d,client_encoding=UTF8
 // expect: negotiate with an option: error 1: connection to server at "127.0.0.1", port PORT failed: the server does not support the protocol options requested || startup user=u,database=d,client_encoding=UTF8
 // expect: queries: tz Asia/Tokyo | notices 1 | two results: 2 rows tag SELECT 2 1,x;2,NULL; | script error: error 7: division by zero tx 73 ready true state 22012 | extended: 2 rows 1,x;2,NULL; cols a/25 | nodata: 3 cols 0 | empty: true | portal 43 batches 300 rows | rows ok true | ready true | cols 1 | close: more true open true closed ready true idle true then ok | settle: ok ready true | fatal: error 7: terminating connection due to administrator command broken true next error 1023: pgwire: the connection is broken: FATAL: terminating connection due to administrator command || Q:tz Q:two Q:fail ext:PBDES ext:PBDES Q:empty ext:PBDES portal:rows 300 ext:PBDES p5:rows 300 ext:PBDES ext:PBDES p5:rows 300 ext:PBDES Q:fatal
+// expect: prepared: error 1000: a prepared statement needs a name (the unnamed one is query's) | s1:7; | s1:8; | trips 2 | closed ready true || PS:s1=select $1 BDES:s1(7) BDES:s1(8) CS:Ss1
 // expect: split: split replies: 117 positions: 117 ok || served 117
 // expect: cancel 4: error 1021: query: deadline passed | ready true | after: ok || cancel pid=4242 key=KEYK
 // expect: cancel 32: error 1021: query: deadline passed | ready true | after: ok || cancel pid=77 keylen=32
@@ -888,8 +890,69 @@ fn cliMutated(): str {
     return "mutated: " + MUTATIONS.toStr() + " replies, " + (if ended == MUTATIONS { "each ended" } else { (MUTATIONS - ended).toStr() + " failed to connect" })
 }
 
+// Named statements: Parse "s1" and Sync; then Bind, Describe, Execute and
+// Sync with no Parse, twice (the server echoes the statement and the
+// argument); Close "s1" and Sync. An empty name is refused before anything
+// is sent.
+fn servePrepared(ln: net.Listener): str {
+    var x = match pt.accept(&ln) { Some(w) { w } None { return "no connection" } }
+    pt.trust(mut &x, 4242, "KEYK")
+    var log: []str = []
+    while true {
+        let m = match x.message() { Some(m) { m } None { break } }
+        if m.t == 88 { break }
+        var letters = letter(m.t)
+        var first = m.body
+        while m.t != 83 {
+            let n = match x.message() { Some(n) { n } None { return strings.join(&log, " ") + " eof" } }
+            letters = letters + letter(n.t)
+            if n.t == 83 { break }
+        }
+        if m.t == 80 {
+            let name = cstrAt(first, 0)
+            append(mut &log, letters + ":" + name + "=" + cstrAt(first, len(name) + 1))
+            x.send(pt.parseOk() + pt.ready("I"))
+        } else if m.t == 66 {
+            let portal = cstrAt(first, 0)
+            let stmt = cstrAt(first, len(portal) + 1)
+            // after the names: 2 bytes of format count, its codes, 2 bytes of
+            // parameter count, then a 4-byte length and the value
+            var at = len(portal) + len(stmt) + 2
+            let nf = int(first[at]) * 256 + int(first[at + 1])
+            at += 2 + 2 * nf + 2
+            let vlen = int(first[at + 3])
+            let arg = first[at + 4..at + 4 + vlen]
+            append(mut &log, letters + ":" + stmt + "(" + arg + ")")
+            x.send(pt.bindOk() + pt.rowDesc(&["v"], &[25]) + pt.dataRow(&[stmt + ":" + arg]) + pt.cmd("SELECT 1") + pt.ready("I"))
+        } else if m.t == 67 {
+            append(mut &log, letters + ":" + first[0..1] + cstrAt(first, 1))
+            x.send(pt.closeOk() + pt.ready("I"))
+        } else {
+            append(mut &log, "type" + m.t.toStr())
+        }
+    }
+    return strings.join(&log, " ")
+}
+
+fn cliPrepared(): str {
+    var s = connectWith("").unwrap()
+    var out = show(&s.prepare("", "select $1"), "ok")
+    s.prepare("s1", "select $1").unwrap()
+    let trips = s.roundTrips()
+    for v in [7, 8] {
+        let p = pgwire.param(&sqldialect.Value.Int(v)).unwrap()
+        let r = s.queryPrepared("s1", &[p]).unwrap()
+        out = out + " | " + describeRows(&r)
+    }
+    out = out + " | trips " + (s.roundTrips() - trips).toStr()
+    s.closePrepared("s1").unwrap()
+    out = out + " | closed ready " + s.ready().toStr()
+    return out
+}
+
 fn queryTests() {
     run("queries", serveQueries, cliQueries)
+    run("prepared", servePrepared, cliPrepared)
     run("split", serveSplit, cliSplit)
     MODE = 0
     run("cancel 4", serveCancel, cliCancel)

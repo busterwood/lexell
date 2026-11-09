@@ -1,0 +1,108 @@
+// lexdb_wire against lib/postgres's prepared statements (prepare,
+// queryPrepared, closePrepared), server and client in one process on the
+// simulated disk: a select prepared once and run for several ids, a
+// prepared insert, the same statement after another connection remakes the
+// table with other columns, LIMIT $1, a statement that does not parse, and
+// a statement used on another connection. (closePrepared takes the
+// Prepared: running one after closing it does not compile.) Each run is
+// one round trip.
+// expect: names: ann bob cy
+// expect: inserted 1, then dee
+// expect: after the table is remade: x9
+// expect: limit: 1 2
+// expect: bad sql: 42601
+// expect: other connection: belongs to another connection
+// expect: round trips for 3 runs: 3
+import "task"
+import "net"
+import "postgres"
+import "sqldialect"
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_wire"
+
+type V = sqldialect.Value
+
+fn firsts(r: &postgres.Rows): str {
+    var out: []str = []
+    for i in 0..r.rowCount() { append(mut &out, r.text(i, 0).unwrapOr("?")) }
+    return strings.join(&out, " ")
+}
+
+fn state(e: &postgres.Error): str {
+    let t = e.toStr()
+    for code in ["42601", "26000", "42P01"] { if strings.contains(t, code) { return code } }
+    if strings.contains(t, "belongs to another connection") { return "belongs to another connection" }
+    return t
+}
+
+fn client(addr: str): Result[Unit, postgres.Error] {
+    let port = addr[10..len(addr)]
+    let dsn = "host=127.0.0.1 port=" + port + " user=test dbname=test sslmode=disable"
+    var c = try postgres.connect(dsn)
+    var other = try postgres.connect(dsn)
+    try c.exec("create table people (id bigint primary key, name text)")
+    try c.exec("insert into people values (1, 'ann'), (2, 'bob'), (3, 'cy')")
+
+    let get = try c.prepare("select name from people where id = $1")
+    var names: []str = []
+    let before = c.roundTrips()
+    for id in [1, 2, 3] {
+        let r = try c.queryPrepared(&get, &[V.Int(id)])
+        append(mut &names, firsts(&r))
+    }
+    let trips = c.roundTrips() - before
+    println("names: " + strings.join(&names, " "))
+
+    let ins = try c.prepare("insert into people values ($1, $2)")
+    let r1 = try c.queryPrepared(&ins, &[V.Int(4), V.Text("dee")])
+    let r2 = try c.queryPrepared(&get, &[V.Int(4)])
+    println("inserted " + r1.affected().toStr() + ", then " + firsts(&r2))
+    try c.closePrepared(ins)
+
+    try other.exec("drop table people")
+    try other.exec("create table people (id bigint primary key, age int, name text)")
+    try other.exec("insert into people values (9, 40, 'x9')")
+    let r3 = try c.queryPrepared(&get, &[V.Int(9)])
+    println("after the table is remade: " + firsts(&r3))
+
+    try other.exec("insert into people values (10, 41, 'x10'), (11, 42, 'x11')")
+    let lim = try c.prepare("select id from people order by id limit $1")
+    let l1 = try c.queryPrepared(&lim, &[V.Int(1)])
+    let l2 = try c.queryPrepared(&lim, &[V.Int(2)])
+    println("limit: " + l1.rowCount().toStr() + " " + l2.rowCount().toStr())
+
+    match c.prepare("select from where") {
+        Ok(_) { println("bad sql: prepared") }
+        Err(e) { println("bad sql: " + state(&e)) }
+    }
+    match other.queryPrepared(&get, &[V.Int(1)]) {
+        Ok(_) { println("other connection: ran") }
+        Err(e) { println("other connection: " + state(&e)) }
+    }
+    try c.closePrepared(get)
+    try c.closePrepared(lim)
+    println("round trips for 3 runs: " + trips.toStr())
+    return Ok(Unit{})
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        let f = s.start(lexdb_wire.acceptLoop, lexdb_wire.AcceptArg{ln: ln, st: st})
+        match client(addr) {
+            Ok(_) {}
+            Err(e) { println("client: " + e.toStr()) }
+        }
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(13), lexdb_store.Options{cacheBytes: 128 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, body).unwrap()
+}
