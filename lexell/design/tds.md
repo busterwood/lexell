@@ -421,7 +421,7 @@ Branch `tds-t2`. No change to the compiler, time.lxl, decimal or sqldialect;
   deadlines and cancellation, `Pool`/`Lease`, the load test. Later: sql_variant, table
   parameters, UDTs, routing, ALTMETADATA/ALTROW (COMPUTE), DATACLASSIFICATION,
   an RPC to a procedure by name (its RETURNSTATUS and outputs without
-  sp_executesql), Encrypt=strict.
+  sp_executesql; built, section 13), Encrypt=strict.
 
 ## 10. Stage T3, as built: streams (2026-11-06)
 
@@ -598,3 +598,51 @@ message may have gone), as for any request.
   `sqlserver_live_bulk_types` (the matrix). All pass under the C and native
   backends.
 
+## 13. Procedures by name, as built (2026-11-09)
+
+Branch `sqlproc`. `Conn.callProc(proc, &args, &tables): Results` sends an
+RPC whose ProcNameLength and ProcName (UTF-16) name the procedure, in place
+of sp_executesql's ProcID 10 and SQL text (`tds.procCall`,
+`Session.callProc`). The server takes the name as an object name: brackets
+and one to four parts work, `#p` reaches a temporary procedure, and
+`dbo.p; SELECT 1` is a procedure that does not exist (2812), never SQL.
+The client checks only that the name is 1 to 1,000 UTF-16 units of UTF-8
+without NUL.
+
+- **Parameters** are `Arg{name, value, output, byDefault, sqlType}`:
+  `arg(name, v)`, `outArg(name, sqlType)` (OUTPUT, NULL of that type),
+  `inOutArg(name, v)` (OUTPUT with a value), `defaultArg(name)`
+  (fDefaultValue: the procedure's default, for a positional parameter
+  before others). A name of `""` is positional; positional ones come
+  before every named one (E_INPUT otherwise, as in EXEC). Named ones go in
+  any order and the procedure's parameters not given take their defaults
+  (201 for one without). Tables go after args, by name, as for
+  queryTables.
+- **The return status** is the procedure's RETURNSTATUS (0 without a
+  RETURN): what sp_executesql hides. Result sets and row counts are what
+  `EXEC p` in a batch gives, the RPC's own DONEPROC left out.
+- **An output comes back in the type sent, not the procedure's**
+  (RETURNVALUE's TYPE_INFO is the parameter's as the client declared it;
+  found live): an Int in-out returns as bigint, and an `outArg("@t",
+  "nvarchar(5)")` for an nvarchar(20) parameter returns its first five
+  characters, as SqlClient's Size does. So `inOutArg` sends text and bytes
+  as nvarchar(max) and varbinary(max) (`tds.longTextParam`,
+  `longBytesParam`), a decimal as decimal(38, s) at the value's scale
+  (`wideDecimalParam`: 1.5 comes back as 5.0 where 1.5000 gives 5.0000),
+  and NULL as nvarchar(max); `outArg`'s type should be the procedure's. A
+  positional output comes back with no name.
+- **Errors** are the server's (8114 and 257 converting a parameter, 201,
+  8145 for an unknown name, 2812, the procedure's own THROW after a result
+  set), after which the connection is idle; the request path is
+  sp_executesql's, so deadlines, cancellation, transactions and
+  RESETCONNECTION are as for every RPC.
+- **Not done:** callProc in `stream`; asking the server for the
+  parameters' types (SqlClient's DeriveParameters, a round trip to
+  sys.parameters) so outputs need no type.
+- **Tests:** `tds_proc_call` (bytes: the name, a positional, an OUTPUT and
+  a DEFAULT parameter, a name past the BMP, the (max) and decimal(38)
+  parameters, every refusal) and `sqlserver_live_proc` (positional, named,
+  DEFAULT, OUTPUT and in-out parameters against a batch EXEC, the output
+  types, several result sets, a table parameter, bracketed, temporary and
+  system procedures, each server error idle, a rolled-back transaction,
+  the refusals). Both pass under the C and native backends.

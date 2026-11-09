@@ -1,0 +1,82 @@
+// tds.procCall: the RPC payload that runs a procedure by its name (its
+// length and UTF-16 name in place of a ProcID), byte for byte, with a
+// positional parameter, an OUTPUT one and a DEFAULT one; the parameters an
+// input-output value goes as (longTextParam, longBytesParam,
+// wideDecimalParam); and every refusal.
+// expect: headers: 16000000 | name: 0500 640062006f002e007000 | options: 0000
+// expect: positional: 00 00 2608 080700000000000000
+// expect: output: 02 40006f00 01 2604 00
+// expect: default: 02 40006400 02 e7401f0000000000ffff
+// expect: unicode name: 02007000ac200000
+// expect: long text: nvarchar(max) e7ffff | 0400000000000000040000006100620000000000
+// expect: long bytes: varbinary(max) a5ffff | 0100000000000000010000000100000000
+// expect: wide decimal: decimal(38,2) 6a112602 | 110196000000000000000000000000000000
+// expect: refused: 1000 a procedure's name is 1 to 1000 characters, without NUL
+// expect: refused: 1000 a procedure's name is 1 to 1000 characters, without NUL
+// expect: 1000 units: true | 1000 a procedure's name is 1 to 1000 characters, without NUL
+// expect: refused: 1000 a procedure's name must be UTF-8
+// expect: refused: 1000 a positional parameter after a named one
+// expect: refused: 1000 a parameter's name must be @ and 1 to 127 letters, digits or _ @ # $
+// expect: 2100: true | 1000 more than 2100 parameters
+// expect: refused: 1000 a transaction descriptor is 8 bytes
+import "tds"
+import "sqldialect"
+
+fn hexs(s: &str): str {
+    let digits = "0123456789abcdef"
+    var out = newStrBuf()
+    for i in 0..len(s) {
+        let c = int(strByte(s, i))
+        out.add(digits[c >> 4..(c >> 4) + 1] + digits[(c & 15)..(c & 15) + 1])
+    }
+    return out.toStr()
+}
+
+fn named(p: tds.Param, name: str, output: bool, byDefault: bool): tds.Param {
+    var q = p
+    q.name = name
+    q.output = output
+    q.byDefault = byDefault
+    return q
+}
+
+fn refused(proc: str, ps: &[tds.Param], txn: str): str {
+    match tds.procCall(proc, ps, txn) {
+        Ok(_) { return "accepted" }
+        Err(e) { return e.code.toStr() + " " + e.msg }
+    }
+}
+
+fn main() {
+    let coll = tds.noCollation()
+    let ps = [named(tds.intParam(7), "", false, false), named(tds.nullParam("int", &coll).unwrap(), "@o", true, false),
+              named(tds.nullParam("nvarchar(4000)", &coll).unwrap(), "@d", false, true)]
+    let b = tds.procCall("dbo.p", &ps, tds.noTransaction()).unwrap()
+    let h = hexs(&b)
+    println("headers: " + h[0..8] + " | name: " + h[44..48] + " " + h[48..68] + " | options: " + h[68..72])
+    println("positional: " + h[72..74] + " " + h[74..76] + " " + h[76..80] + " " + h[80..98])
+    println("output: " + h[98..100] + " " + h[100..108] + " " + h[108..110] + " " + h[110..114] + " " + h[114..116])
+    println("default: " + h[116..118] + " " + h[118..126] + " " + h[126..128] + " " + h[128..])
+    println("unicode name: " + hexs(&tds.procCall("p€", &[], tds.noTransaction()).unwrap())[44..])
+    let lt = tds.longTextParam("ab", &coll).unwrap()
+    println("long text: " + lt.declared + " " + hexs(&lt.typeInfo)[0..6] + " | " + hexs(&lt.data))
+    let lb = tds.longBytesParam("\x01")
+    println("long bytes: " + lb.declared + " " + hexs(&lb.typeInfo) + " | " + hexs(&lb.data))
+    let wd = tds.wideDecimalParam(1.50m).unwrap()
+    println("wide decimal: " + wd.declared + " " + hexs(&wd.typeInfo) + " | " + hexs(&wd.data))
+    println("refused: " + refused("", &[], tds.noTransaction()))
+    println("refused: " + refused("p\x00q", &[], tds.noTransaction()))
+    var long = ""
+    for i in 0..1001 { long = long + "a" }
+    println("1000 units: " + (refused(long[..1000], &[], tds.noTransaction()) == "accepted").toStr() + " | " +
+            refused(long, &[], tds.noTransaction()))
+    println("refused: " + refused("p\xff", &[], tds.noTransaction()))
+    println("refused: " + refused("p", &[named(tds.intParam(1), "@a", false, false), named(tds.intParam(2), "", false, false)],
+                                  tds.noTransaction()))
+    println("refused: " + refused("p", &[named(tds.intParam(1), "a", false, false)], tds.noTransaction()))
+    var many: []tds.Param = []
+    for i in 0..2101 { append(mut &many, tds.intParam(i)) }
+    println("2100: " + (refused("p", &many[..2100], tds.noTransaction()) == "accepted").toStr() + " | " +
+            refused("p", &many, tds.noTransaction()))
+    println("refused: " + refused("p", &[], "short"))
+}

@@ -1,0 +1,173 @@
+// sqlserver.callProc against a live SQL Server ($MSSQL_TEST_DSN or
+// ~/.obo-mssql-dsn; exits 77, skipped, without one; the string and the
+// server's connect messages are never printed): a procedure called by its
+// name with positional parameters, DEFAULT, OUTPUT and input-output ones;
+// named ones in any order with the rest left to their defaults; its return
+// status, result sets and row counts as an EXEC in a batch gives them; an
+// output's value in the type sent (text and bytes in-out as (max), so a
+// longer value comes back whole; a decimal at its value's scale; a short
+// output type truncates); no RETURN; several result sets; a table
+// parameter; a bracketed name, a temporary procedure and a system one; a
+// name with SQL in it is only a name; the server's errors (conversion, a
+// missing or unknown parameter, a missing procedure, the procedure's own
+// THROW after a result set), each leaving the connection idle; a call in a
+// transaction rolled back; our refusals. What it creates is dropped.
+// expect: positional: status 5 sets 1 [1 'dflt'] counts 1,1,1,1,2,1 outs :varbinary=x'0102' :bigint=42 :nvarchar='café au lait'
+// expect: named: status 5 sets 1 [2 'given'] counts 1,1,1,1,2,1 outs @t:nvarchar='café au lait' @n:bigint=8
+// expect: batch exec: status 5 sets 1 [1 'dflt'] counts 1,1,1,1,2,1 outs
+// expect: in-out: status 5 sets 1 [3 'dflt'] counts 1,1,1,1,2,1 outs @t:nvarchar='café au lait' @b:varbinary=x'0102' @n:nvarchar=NULL
+// expect: decimal: 5.0 | 5.0000
+// expect: short output type: 'café '
+// expect: no return: status 0 sets 2 [1] [2] [3] counts 1,2 outs
+// expect: table: status 0 sets 1 [3 60] counts 1,1 outs @n:int=3
+// expect: bracketed: status 5 sets 1 [4 'dflt'] counts 1,1,1,1,2,1 outs
+// expect: temporary: status 7 sets 0 counts 1 outs
+// expect: system: status 0 sets 1 [42] counts 1 outs
+// expect: sql in the name: error 2812 | idle true
+// expect: text into int: error 8114 | idle true
+// expect: nvarchar into varbinary: error 257 | idle true
+// expect: missing parameter: error 201 | idle true
+// expect: unknown parameter: error 8145 | idle true
+// expect: missing procedure: error 2812 | idle true
+// expect: throw: error 50001 | idle true
+// expect: rolled back: status 0 sets 0 counts 1 outs, rows after 0, idle true
+// expect: refused: error 1000: a procedure's name is 1 to 1000 characters, without NUL
+// expect: refused: error 1000: a positional parameter after a named one
+// expect: refused: error 1000: a parameter's name must be @ and 1 to 127 letters, digits or _ @ # $
+// expect: refused: error 1000: SQL Server float has no subnormal numbers: 5e-324
+// expect: open handles 0
+import "sqlserver"
+import "sqldialect"
+import "io"
+import "os"
+import "strings"
+
+type V = sqlserver.Value
+type Error = sqlserver.Error
+
+fn dsn(): Option[str] {
+    match os.env("MSSQL_TEST_DSN") {
+        Some(d) { if len(strings.trim(d)) > 0 { return Some(strings.trim(d)) } }
+        None {}
+    }
+    match io.read(os.envOr("HOME", "") + "/.obo-mssql-dsn") {
+        Ok(d) { if len(strings.trim(d)) > 0 { return Some(strings.trim(d)) } }
+        Err(_) {}
+    }
+    return None
+}
+
+fn err(e: &Error): str {
+    if e.code == sqldialect.E_INPUT { return "error " + e.code.toStr() + ": " + e.msg }
+    return "error " + e.code.toStr()
+}
+
+// Rows counts only: the tokens differ by nothing a caller sees.
+fn show(r: &sqlserver.Results): str {
+    var s = "status " + match r.returnStatus { Some(n) { n.toStr() } None { "none" } } + " sets " + len(r.sets).toStr()
+    for x in r.sets {
+        for i in 0..x.rowCount() {
+            var cells: []str = []
+            for j in 0..x.columnCount() { append(mut &cells, x.value(i, j).unwrap().toStr()) }
+            s = s + " [" + strings.join(&cells, " ") + "]"
+        }
+    }
+    var cs: []str = []
+    for k in r.counts { append(mut &cs, k.rows.toStr()) }
+    s = s + " counts " + strings.join(&cs, ",")
+    var outs: []str = []
+    for j in 0..r.outputs.columnCount() {
+        append(mut &outs, r.outputs.columnName(j).unwrap() + ":" + r.outputs.columnTypeName(j).unwrap() + "=" +
+               r.outputs.value(0, j).unwrap().toStr())
+    }
+    return s + " outs" + if len(outs) > 0 { " " + strings.join(&outs, " ") } else { "" }
+}
+
+fn call(c: mut &sqlserver.Conn, p: str, args: &[sqlserver.Arg]): str {
+    match c.callProc(p, args, &[]) {
+        Ok(r) { return show(&r) }
+        Err(e) { return err(&e) }
+    }
+}
+
+fn idle(c: mut &sqlserver.Conn, p: str, args: &[sqlserver.Arg]): str { return call(c, p, args) + " | idle " + c.idle().toStr() }
+
+fn main() {
+    let d = match dsn() { Some(x) { x } None { exit(77) } }
+    var c = match sqlserver.connect(d) {
+        Ok(x) { x }
+        Err(_) { exit(77) }
+    }
+    drop(mut &c)
+    run(mut &c)
+    drop(mut &c)
+    c.close()
+    println("open handles " + intToStr(sqlserver.openHandles()))
+}
+
+fn drop(c: mut &sqlserver.Conn) {
+    c.exec("IF OBJECT_ID('dbo.LxlProc') IS NOT NULL DROP PROCEDURE dbo.LxlProc; " +
+           "IF OBJECT_ID('dbo.LxlProcSets') IS NOT NULL DROP PROCEDURE dbo.LxlProcSets; " +
+           "IF OBJECT_ID('dbo.LxlProcItems') IS NOT NULL DROP PROCEDURE dbo.LxlProcItems; " +
+           "IF TYPE_ID('dbo.LxlProcItem') IS NOT NULL DROP TYPE dbo.LxlProcItem").unwrap()
+}
+
+fn run(c: mut &sqlserver.Conn) {
+    c.exec("CREATE PROCEDURE dbo.LxlProc @a int, @s nvarchar(10) = N'dflt', @b varbinary(4) = NULL OUTPUT, " +
+           "@n int = 0 OUTPUT, @t nvarchar(20) = NULL OUTPUT AS BEGIN " +
+           "SELECT @a AS a, @s AS s; SET @b = 0x0102; SET @n = @n * 2; SET @t = N'café au lait'; " +
+           "DECLARE @x TABLE(i int); INSERT INTO @x VALUES (1), (2); RETURN 5 END").unwrap()
+    println("positional: " + call(c, "dbo.LxlProc", &[sqlserver.arg("", V.Int(1)), sqlserver.defaultArg(""),
+                                  sqlserver.outArg("", "varbinary(4)"), sqlserver.inOutArg("", V.Int(21)),
+                                  sqlserver.outArg("", "nvarchar(20)")]))
+    println("named: " + call(c, "dbo.LxlProc", &[sqlserver.outArg("@t", "nvarchar(20)"), sqlserver.inOutArg("@n", V.Int(4)),
+                             sqlserver.arg("@s", V.Text("given")), sqlserver.arg("@a", V.Int(2))]))
+    println("batch exec: " + show(&c.queryAll("EXEC dbo.LxlProc 1", &[]).unwrap()))
+    println("in-out: " + call(c, "dbo.LxlProc", &[sqlserver.arg("@a", V.Int(3)), sqlserver.inOutArg("@t", V.Text("x")),
+                              sqlserver.inOutArg("@b", V.Bytes("\x09")), sqlserver.inOutArg("@n", V.Null)]))
+    c.exec("CREATE PROCEDURE #dec @d decimal(10,4) OUTPUT AS SET @d = @d * 3.3333").unwrap()
+    let d1 = c.callProc("#dec", &[sqlserver.inOutArg("@d", V.Dec(1.5m))], &[]).unwrap()
+    let d4 = c.callProc("#dec", &[sqlserver.inOutArg("@d", V.Dec(1.5000m))], &[]).unwrap()
+    println("decimal: " + d1.outputs.value(0, 0).unwrap().toStr() + " | " + d4.outputs.value(0, 0).unwrap().toStr())
+    let short = c.callProc("dbo.LxlProc", &[sqlserver.arg("@a", V.Int(1)), sqlserver.outArg("@t", "nvarchar(5)")], &[]).unwrap()
+    println("short output type: " + short.outputs.value(0, 0).unwrap().toStr())
+
+    c.exec("CREATE PROCEDURE dbo.LxlProcSets AS BEGIN SELECT 1; SELECT 2 UNION ALL SELECT 3 END").unwrap()
+    println("no return: " + call(c, "dbo.LxlProcSets", &[]))
+    c.exec("CREATE TYPE dbo.LxlProcItem AS TABLE (id int, price int)").unwrap()
+    c.exec("CREATE PROCEDURE dbo.LxlProcItems @items dbo.LxlProcItem READONLY, @n int OUTPUT AS BEGIN " +
+           "SELECT COUNT(*), SUM(price) FROM @items; SELECT @n = COUNT(*) FROM @items END").unwrap()
+    let items = sqlserver.table("@items", "dbo.LxlProcItem", [[V.Int(1), V.Int(10)], [V.Int(2), V.Int(20)], [V.Int(3), V.Int(30)]])
+    match c.callProc("dbo.LxlProcItems", &[sqlserver.outArg("@n", "int")], &[items]) {
+        Ok(r) { println("table: " + show(&r)) }
+        Err(e) { println("table: " + err(&e)) }
+    }
+    println("bracketed: " + call(c, "[dbo].[LxlProc]", &[sqlserver.arg("@a", V.Int(4))]))
+    c.exec("CREATE PROCEDURE #seven AS RETURN 7").unwrap()
+    println("temporary: " + call(c, "#seven", &[]))
+    println("system: " + call(c, "sys.sp_executesql", &[sqlserver.arg("@stmt", V.Text("SELECT 42"))]))
+
+    println("sql in the name: " + idle(c, "dbo.LxlProc; SELECT 1", &[sqlserver.arg("@a", V.Int(3))]))
+    println("text into int: " + idle(c, "dbo.LxlProc", &[sqlserver.arg("@a", V.Text("x"))]))
+    println("nvarchar into varbinary: " + idle(c, "dbo.LxlProc", &[sqlserver.arg("@a", V.Int(1)), sqlserver.outArg("@b", "nvarchar(4)")]))
+    println("missing parameter: " + idle(c, "dbo.LxlProc", &[sqlserver.arg("@s", V.Text("x"))]))
+    println("unknown parameter: " + idle(c, "dbo.LxlProc", &[sqlserver.arg("@a", V.Int(1)), sqlserver.arg("@zz", V.Int(1))]))
+    println("missing procedure: " + idle(c, "dbo.Nope", &[]))
+    c.exec("CREATE PROCEDURE #throw AS BEGIN SELECT 1; THROW 50001, 'no', 1 END").unwrap()
+    println("throw: " + idle(c, "#throw", &[]))
+
+    c.exec("CREATE TABLE #t(id int)").unwrap()
+    c.exec("CREATE PROCEDURE #ins @id int AS INSERT INTO #t VALUES (@id)").unwrap()
+    var inside = ""
+    let tr = c.transaction(fn(t: mut &sqlserver.Conn): Result[Unit, Error] {
+        inside = call(t, "#ins", &[sqlserver.arg("@id", V.Int(1))])
+        return Err(sqldialect.inputError("roll back"))
+    })
+    println("rolled back: " + inside + ", rows after " + c.query("SELECT COUNT(*) FROM #t", &[]).unwrap().value(0, 0).unwrap().toStr() +
+            ", idle " + c.idle().toStr())
+
+    println("refused: " + call(c, "", &[]))
+    println("refused: " + call(c, "dbo.LxlProc", &[sqlserver.arg("@a", V.Int(1)), sqlserver.arg("", V.Int(2))]))
+    println("refused: " + call(c, "dbo.LxlProc", &[sqlserver.arg("a", V.Int(1))]))
+    println("refused: " + call(c, "dbo.LxlProc", &[sqlserver.arg("@a", V.Float(5e-324f))]))
+}

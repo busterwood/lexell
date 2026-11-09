@@ -17,7 +17,8 @@
 //   - RPC to sp_executesql (executeSql) with typed parameters (Param:
 //     intParam, floatParam, bitParam, textParam, bytesParam, decimalParam,
 //     nullParam and typeInfoOf from a SQL type name), OUTPUT ones too, and
-//     table-valued ones (tableParam).
+//     table-valued ones (tableParam); RPC to a procedure by its name
+//     (procCall).
 //   - bulk load: INSERT BULK, then the rows in a BULK_LOAD message
 //     (bulkColumnsQuery, bulkLoad, Session.bulkData).
 //   - Transaction Manager requests (tmRequest): begin, commit, rollback.
@@ -697,7 +698,13 @@ fn bytesData(d: mut &[]byte, b: &str, max: bool, unknown: bool) {
 
 // An nvarchar parameter: nvarchar(4000) up to 4,000 UTF-16 units, else
 // nvarchar(max) (PLP). E_INPUT for text that is not UTF-8.
-pub fn textParam(s: str, coll: &Collation): Result[Param, Error] {
+pub fn textParam(s: str, coll: &Collation): Result[Param, Error] { return textParamOf(s, coll, false) }
+
+// An nvarchar(max) parameter, however short (an input-output one: the
+// value that comes back has the type that went in).
+pub fn longTextParam(s: str, coll: &Collation): Result[Param, Error] { return textParamOf(s, coll, true) }
+
+fn textParamOf(s: str, coll: &Collation, long: bool): Result[Param, Error] {
     let u = match toUtf16(s) {
         Ok(x) { x }
         Err(e) { return Err(sqldialect.inputError("text value: " + e)) }
@@ -705,7 +712,7 @@ pub fn textParam(s: str, coll: &Collation): Result[Param, Error] {
     var ti: []byte = []
     put8(mut &ti, T_NVARCHAR)
     var d: []byte = []
-    let max = len(u) > 8000
+    let max = long || len(u) > 8000
     put16(mut &ti, if max { 0xFFFF } else { 8000 })
     appendStr(mut &ti, collationBytes(coll))
     textData(mut &d, &u, max, false)
@@ -714,11 +721,16 @@ pub fn textParam(s: str, coll: &Collation): Result[Param, Error] {
 
 // A varbinary parameter: varbinary(8000) up to 8,000 bytes, else
 // varbinary(max) (PLP).
-pub fn bytesParam(b: str): Param {
+pub fn bytesParam(b: str): Param { return bytesParamOf(b, false) }
+
+// A varbinary(max) parameter, however short (as longTextParam).
+pub fn longBytesParam(b: str): Param { return bytesParamOf(b, true) }
+
+fn bytesParamOf(b: str, long: bool): Param {
     var ti: []byte = []
     put8(mut &ti, T_BIGVARBIN)
     var d: []byte = []
-    let max = len(b) > 8000
+    let max = long || len(b) > 8000
     put16(mut &ti, if max { 0xFFFF } else { 8000 })
     bytesData(mut &d, &b, max, false)
     return param(if max { "varbinary(max)" } else { "varbinary(8000)" }, &ti, &d)
@@ -739,6 +751,13 @@ fn decimalBytes(p: int): int {
 pub fn decimalParam(d: Decimal): Result[Param, Error] {
     let x = try decimalParts(d)
     return Ok(decimalParamOf(x.neg, x.m, x.p, x.s))
+}
+
+// A decimal(38, s) parameter, s the value's scale as decimalParam's (an
+// input-output one: the value that comes back is a decimal(38, s)).
+pub fn wideDecimalParam(d: Decimal): Result[Param, Error] {
+    let x = try decimalParts(d)
+    return Ok(decimalParamOf(x.neg, x.m, 38, x.s))
 }
 
 // A decimal as SQL Server stores it: sign, magnitude, precision and scale.
@@ -921,6 +940,48 @@ pub fn executeSql(sql: str, params: &[Param], txn: str, coll: &Collation): Resul
     for p in params {
         if !validParamName(&p.name) {
             return Err(sqldialect.inputError("a parameter's name must be @ and 1 to 127 letters, digits or _ @ # $"))
+        }
+        rpcParam(mut &b, &p)
+    }
+    return Ok(strFromBytes(&b))
+}
+
+pub const MAX_PROC_PARAMS = 2100
+pub const MAX_PROC_NAME = 1000          // UTF-16 units: four parts of 128 characters, quoted, fit
+
+// The RPC payload that runs the procedure proc by its name (ProcNameLength
+// and ProcName, not a ProcID): "dbo.Orders_Add", "[my proc]", "#p",
+// "db.dbo.p". The server takes the name as an object name, never as SQL
+// text. Parameters with no name are positional and come first; the rest
+// are named, in any order, and a procedure's parameter not given takes its
+// default. E_INPUT for a name that is empty, not UTF-8, longer than
+// MAX_PROC_NAME units or holds a NUL; for a positional parameter after a
+// named one, a name that is not one, and more than MAX_PROC_PARAMS
+// parameters.
+pub fn procCall(proc: str, params: &[Param], txn: str): Result[str, Error] {
+    if len(txn) != 8 { return Err(sqldialect.inputError("a transaction descriptor is 8 bytes")) }
+    if len(params) > MAX_PROC_PARAMS { return Err(sqldialect.inputError("more than " + MAX_PROC_PARAMS.toStr() + " parameters")) }
+    let u = match toUtf16(proc) {
+        Ok(x) { x }
+        Err(_) { return Err(sqldialect.inputError("a procedure's name must be UTF-8")) }
+    }
+    if len(u) == 0 || len(u) / 2 > MAX_PROC_NAME || strings.contains(&proc, "\x00") {
+        return Err(sqldialect.inputError("a procedure's name is 1 to " + MAX_PROC_NAME.toStr() + " characters, without NUL"))
+    }
+    var b: []byte = []
+    allHeaders(mut &b, txn)
+    put16(mut &b, len(u) / 2)
+    for x in u { append(mut &b, x) }
+    put16(mut &b, 0)                                   // OptionFlags
+    var named = false
+    for p in params {
+        if len(p.name) == 0 {
+            if named { return Err(sqldialect.inputError("a positional parameter after a named one")) }
+        } else {
+            if !validParamName(&p.name) {
+                return Err(sqldialect.inputError("a parameter's name must be @ and 1 to 127 letters, digits or _ @ # $"))
+            }
+            named = true
         }
         rpcParam(mut &b, &p)
     }
@@ -2909,6 +2970,14 @@ pub fn (s: mut &Session) batch(sql: str, w: Where): Result[Reply, Error] {
 pub fn (s: mut &Session) executeSql(sql: str, params: &[Param], w: Where): Result[Reply, Error] {
     if s.broken { return Err(ioErr("the connection is broken by an earlier error")) }
     let payload = try executeSql(sql, params, s.txn, &s.collation)
+    return s.request(PT_RPC, payload, w)
+}
+
+// Runs the procedure proc by its name with the parameters (procCall), as
+// batch does otherwise.
+pub fn (s: mut &Session) callProc(proc: str, params: &[Param], w: Where): Result[Reply, Error] {
+    if s.broken { return Err(ioErr("the connection is broken by an earlier error")) }
+    let payload = try procCall(proc, params, s.txn)
     return s.request(PT_RPC, payload, w)
 }
 
