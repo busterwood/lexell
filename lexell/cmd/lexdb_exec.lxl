@@ -1093,6 +1093,7 @@ pub type Level = record {
     perRow: bool
     hashCols: []int         // hash: its columns ...
     hashVals: []Expr        // ... equal to these values from earlier tables
+    src: int                // a subquery in FROM (or a CTE): its number, its rows read from the run; -1 a table
 }
 
 // What one table of a query did (EXPLAIN ANALYZE).
@@ -1783,7 +1784,7 @@ fn allTrue(cs: &[]Expr, cols: &[]lexdb_sql.ColDef, row: &[]Val, params: &[]Val):
 
 fn newLevel(t: Table, alias: str, join: int, first: int): Level {
     return Level{t: t, alias: alias, join: join, first: first, path: Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: []}, cond: [],
-                 post: [], local: [], perRow: true, hashCols: [], hashVals: []}
+                 post: [], local: [], perRow: true, hashCols: [], hashVals: [], src: -1}
 }
 
 // Plans a query over the tables of FROM (4.8): the tables are joined in the
@@ -1792,16 +1793,37 @@ fn newLevel(t: Table, alias: str, join: int, first: int): Level {
 fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_sql.FromItem,
               where: &Option[Expr], params: &[]Val, subs: &[]lexdb_sql.Stmt, sc: mut &Scope): Result[Query, DbErr] {
     var q = Query{levels: [], cols: [], top: [], subs: [], base: sc.base, corr: false, refs: []}
+    // a subquery in FROM is planned first: it sees the queries around this
+    // one, not this one's tables
+    var planned: [][]SubPlan = []
+    for i in 0..len(subs) { append(mut &planned, []) }
     for f in from {
         for lv in q.levels {
             if lv.alias == f.alias { return Err(e("42712", "table name \"" + f.alias + "\" specified more than once")) }
         }
-        let t = try needTable(st, txn, &f.table)
+        var t = Table{name: f.alias, tree: -1, cols: [], pk: [], indexes: []}
+        if f.sub >= 0 {
+            let sp = try planSub(st, txn, &subs[f.sub], params, sc)
+            if len(sp.sel.q.refs) > 0 { return Err(e("0A000", "a subquery in FROM cannot use an outer query's columns yet")) }
+            if len(f.cols) > len(sp.sel.outs) {
+                return Err(e("42P10", "table \"" + f.alias + "\" has " + len(sp.sel.outs).toStr() + " columns available but " +
+                             len(f.cols).toStr() + " columns specified"))
+            }
+            for i in 0..len(sp.sel.outs) {
+                let name = if i < len(f.cols) { f.cols[i] } else { sp.sel.outs[i].name }
+                append(mut &t.cols, lexdb_sql.ColDef{name: name, typ: oidType(sp.sel.outs[i].oid), notNull: false})
+            }
+            append(mut &planned[f.sub], sp)
+        } else {
+            t = try needTable(st, txn, &f.table)
+        }
         let first = len(q.cols)
         for c in t.cols {
             append(mut &q.cols, lexdb_sql.ColDef{name: f.alias + "." + c.name, typ: c.typ, notNull: c.notNull})
         }
-        append(mut &q.levels, newLevel(t, f.alias, f.join, first))
+        var lv = newLevel(t, f.alias, f.join, first)
+        lv.src = f.sub
+        append(mut &q.levels, lv)
     }
     // its scope: its columns, for its own expressions and its subqueries' (planned first)
     var fcols: []lexdb_sql.ColDef = []
@@ -1811,7 +1833,8 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
     }
     append(mut &sc.frames, Frame{cols: fcols, refs: [], refOids: [], subRefs: [], subOids: [], subNames: []})
     for i in 0..len(subs) {
-        let sp = try planSub(st, txn, &subs[i], params, sc)
+        if len(planned[i]) == 0 { append(mut &planned[i], try planSub(st, txn, &subs[i], params, sc)) }
+        let sp = pop(mut &planned[i])
         let top = len(sc.frames) - 1
         append(mut &sc.frames[top].subRefs, cloneAll(&sp.sel.q.refs))
         append(mut &sc.frames[top].subOids, sp.oid)
@@ -1867,7 +1890,10 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
     }
     for k in 0..nl {
         let m = replace(mut &ms[k], [])
-        var path = choosePath(&q, k, &m, params)
+        // a subquery's rows have no key: read them all
+        var path = if q.levels[k].src >= 0 { Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: []} } else {
+            choosePath(&q, k, &m, params)
+        }
         var perRow = k == 0 || q.pathOuter(&path)
         let right = keepsRight(q.levels[k].join)
         if right {
@@ -1938,7 +1964,9 @@ fn materialize(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: 
         {
             let lv = &q.levels[k]
             var full: []Val = array(len(q.cols), Val.Null)
-            {
+            if lv.src >= 0 {
+                for r in m.subs[lv.src].data { append(mut &rows, copyRow(&r)) }
+            } else {
                 let noAggs: []Val = []
                 let env = Env{cols: &q.cols, row: &full, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs}
                 let scans = try pathScans(&lv.t, &lv.path, &env)
@@ -1957,7 +1985,7 @@ fn materialize(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: 
                 var nul = false
                 for c in lv.hashCols {
                     if isNull(&r[c]) { nul = true }
-                    encIdxPart(mut &kb, &r[c])
+                    if lv.src >= 0 { keyPart(mut &kb, &r[c]) } else { encIdxPart(mut &kb, &r[c]) }
                 }
                 if nul {
                     // NULL equals nothing; a RIGHT or FULL JOIN still keeps the row
@@ -2020,9 +2048,15 @@ fn runLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Ma
             let noAggs: []Val = []
             let env = Env{cols: &q.cols, row: row, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs}
             for i in 0..len(lv.hashCols) {
-                let v = try coerce(try eval(&lv.hashVals[i], &env), &lv.t.cols[lv.hashCols[i]].typ)
-                if isNull(&v) { nul = true }
-                encIdxPart(mut &kb, &v)
+                if lv.src >= 0 {
+                    let v = try eval(&lv.hashVals[i], &env)
+                    if isNull(&v) { nul = true }
+                    keyPart(mut &kb, &v)
+                } else {
+                    let v = try coerce(try eval(&lv.hashVals[i], &env), &lv.t.cols[lv.hashCols[i]].typ)
+                    if isNull(&v) { nul = true }
+                    encIdxPart(mut &kb, &v)
+                }
             }
         }
         if !nul {
@@ -2036,6 +2070,12 @@ fn runLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Ma
                 }
                 None {}
             }
+        }
+    } else if lv.src >= 0 {
+        for r in m.subs[lv.src].data {
+            let got = try tryRow(st, txn, q, m, k, &r, -1, row, params, emit, rs)
+            if got < 0 { return Ok(false) }
+            if got > 0 { matched = true }
         }
     } else {
         var scans: []Scan = []
@@ -2125,10 +2165,11 @@ type SubRes = record {
     numeric: bool               // the values are numbers: keyed as numbers
     hasNull: bool
     groups: Map[str, int]       // hashed: key -> 1 rows, 3 rows and a NULL value (IN)
+    data: [][]Val               // in FROM: its rows
 }
 
 fn emptyRes(): SubRes {
-    return SubRes{val: Val.Null, rows: 0, set: newMap(), numeric: false, hasNull: false, groups: newMap()}
+    return SubRes{val: Val.Null, rows: 0, set: newMap(), numeric: false, hasNull: false, groups: newMap(), data: []}
 }
 
 // The queries being planned, outermost first.
@@ -2209,10 +2250,11 @@ fn planSub(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
     var sel = try planSelect(st, txn, s, params, sc)
     if s.use == lexdb_sql.SUB_IN && len(sel.outs) != 1 { return Err(e("42601", "subquery has too many columns")) }
     if s.use == lexdb_sql.SUB_SCALAR && len(sel.outs) != 1 { return Err(e("42601", "subquery must return only one column")) }
-    let oid = if s.use == lexdb_sql.SUB_EXISTS { lexdb_sql.OID_BOOL } else { sel.outs[0].oid }
+    let oid = if s.use == lexdb_sql.SUB_EXISTS || len(sel.outs) == 0 { lexdb_sql.OID_BOOL } else { sel.outs[0].oid }
     let name = if s.use == lexdb_sql.SUB_EXISTS { "exists" } else if s.use == lexdb_sql.SUB_SCALAR { sel.outs[0].name } else { "?column?" }
+    // (in FROM: its columns are its outs)
     var sp = SubPlan{use: s.use, sel: sel, oid: oid, name: name, hashed: false, keyOuter: [], keyText: []}
-    if s.use != lexdb_sql.SUB_SCALAR && len(sp.sel.q.refs) > 0 { hashSub(mut &sp, sc.base) }
+    if (s.use == lexdb_sql.SUB_EXISTS || s.use == lexdb_sql.SUB_IN) && len(sp.sel.q.refs) > 0 { hashSub(mut &sp, sc.base) }
     return Ok(sp)
 }
 
@@ -2565,6 +2607,31 @@ fn mergeStats(a: mut &[]SubStat, b: &[]SubStat) {
     }
 }
 
+// A subquery in FROM: its rows.
+fn runFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sp: &SubPlan, params: &[]Val,
+           stat: mut &SubStat): Result[SubRes, DbErr] {
+    var rs = newRun(&sp.sel.q)
+    var res = try execSel(st, txn, &sp.sel, params, -1, mut &rs)
+    stat.runs += 1
+    addCounts(mut &stat.cnt, &rs.cnt)
+    mergeStats(mut &stat.inner, &rs.stats)
+    var out = emptyRes()
+    out.rows = len(res.rows)
+    out.data = replace(mut &res.rows, [])
+    return Ok(out)
+}
+
+// A column type for a result's OID.
+fn oidType(oid: int): lexdb_sql.TypeName {
+    var kind = lexdb_sql.K_TEXT
+    var o = oid
+    if oid == lexdb_sql.OID_BOOL { kind = lexdb_sql.K_BOOL }
+    if oid == lexdb_sql.OID_INT2 || oid == lexdb_sql.OID_INT4 || oid == lexdb_sql.OID_INT8 { kind = lexdb_sql.K_INT }
+    if oid == lexdb_sql.OID_NUMERIC { kind = lexdb_sql.K_NUM }
+    if kind == lexdb_sql.K_TEXT && oid != lexdb_sql.OID_VARCHAR { o = lexdb_sql.OID_TEXT }
+    return lexdb_sql.TypeName{kind: kind, oid: o, prec: 0, scale: 0, len: 0}
+}
+
 // Runs a subquery: EXISTS stops at its first row, a scalar at its second.
 fn runSub(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sp: &SubPlan, params: &[]Val,
           stat: mut &SubStat): Result[SubRes, DbErr] {
@@ -2712,7 +2779,9 @@ fn prepare(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, params:
         }
         var ps: []Val = []
         for j in 0..q.base { append(mut &ps, params[j]) }
-        if sp.hashed {
+        if sp.use == lexdb_sql.SUB_FROM {
+            append(mut &m.subs, try runFrom(st, txn, sp, &ps, mut &rs.stats[i]))
+        } else if sp.hashed {
             append(mut &m.subs, try runHashed(st, txn, sp, &ps, mut &rs.stats[i]))
         } else {
             append(mut &m.subs, try runSub(st, txn, sp, &ps, mut &rs.stats[i]))
@@ -2728,7 +2797,7 @@ fn subLines(q: &Query, stats: &[]SubStat, out: mut &[]str) {
     let noStats: []SubStat = []
     for i in 0..len(q.subs) {
         let sp = &q.subs[i]
-        let what = if sp.use == lexdb_sql.SUB_EXISTS { "exists" } else if sp.use == lexdb_sql.SUB_IN { "in" } else { "scalar" }
+        let what = if sp.use == lexdb_sql.SUB_EXISTS { "exists" } else if sp.use == lexdb_sql.SUB_IN { "in" } else if sp.use == lexdb_sql.SUB_FROM { "from" } else { "scalar" }
         var head = "subquery " + (i + 1).toStr() + " (" + what + "): "
         if sp.hashed {
             head = head + "hashed on " + strings.join(&sp.keyText, ", ")
@@ -2760,6 +2829,7 @@ fn subLines(q: &Query, stats: &[]SubStat, out: mut &[]str) {
 }
 
 fn pathText(lv: &Level): str {
+    if lv.src >= 0 { return "rows of subquery " + (lv.src + 1).toStr() }
     let p = &lv.path
     let cols = keyCols(&lv.t, p.index)
     if len(p.ins) > 0 {
@@ -2833,7 +2903,7 @@ fn copyRow(r: &[]Val): []Val {
 }
 
 fn oneTable(name: &str): []lexdb_sql.FromItem {
-    return [lexdb_sql.FromItem{table: name, alias: name, join: lexdb_sql.J_FIRST, on: None}]
+    return [lexdb_sql.FromItem{table: name, alias: name, join: lexdb_sql.J_FIRST, on: None, sub: -1, cols: []}]
 }
 
 // ---- indexes: an entry per row, its key the indexed columns then the
@@ -3796,7 +3866,7 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
     var first = -1
     // The first table's order holds through the joins, unless a RIGHT or
     // FULL JOIN adds its unmatched rows at the end.
-    var keeps = len(q.levels) > 0
+    var keeps = len(q.levels) > 0 && q.levels[0].src < 0
     for lv in q.levels { if keepsRight(lv.join) { keeps = false } }
     var setIndex = -2               // the first table's path, changed: its index, its direction
     var setDesc = false
@@ -3884,7 +3954,7 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
                 }
                 if !found { all = false }
             }
-            append(mut &okLevels, all && len(groupBy) > 0)
+            append(mut &okLevels, all && len(groupBy) > 0 && len(lv.t.pk) > 0)
         }
         if q.corr {
             // these are evaluated while the rows are read: no subquery run per row there

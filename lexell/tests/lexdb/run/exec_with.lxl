@@ -1,0 +1,123 @@
+// lexdb_exec: subqueries in FROM and CTEs (WITH): as tables, joined (hash,
+// both sides), grouped, nested, in subqueries; scope and shadowing; the
+// errors. Expected output checked by hand when written.
+// expect: create table c (id int primary key, name text, city text) -> CREATE TABLE
+// expect: create table o (id int primary key, cust int, amount numeric(8,2), status text) -> CREATE TABLE
+// expect: insert into c values (1,'ann','paris'),(2,'bob','rome'),(3,'cy','paris'),(4,'dee',null),(5,'eve','oslo') -> INSERT 0 5
+// expect: insert into o values (10,1,5.00,'paid'),(11,1,7.50,'open'),(12,2,3.00,'paid'),(13,3,9.99,'open'),(14,null,1.00,'paid'),(15,9,2.00,'paid') -> INSERT 0 6
+// expect: select * from (select id, name from c where city = 'paris') p order by id -> 1|ann; 3|cy
+// expect: select x.n, x.total from (select cust as n, sum(amount) as total from o group by cust) x where x.total > 3 order by x.n -> 1|12.50; 3|9.99
+// expect: select t.a, t.b from (select id, name from c) as t(a, b) where t.a < 3 order by 1 -> 1|ann; 2|bob
+// expect: select c.name, s.total from c join (select cust, sum(amount) total from o group by cust) s on s.cust = c.id order by c.name -> ann|12.50; bob|3.00; cy|9.99
+// expect: explain select c.name, s.total from c join (select cust, sum(amount) total from o group by cust) s on s.cust = c.id -> scan c: full scan; join s: hash on (cust) over rows of subquery 1; subquery 1 (from): run once;   scan o: full scan;   aggregate
+// expect: select c.name, s.n from c left join (select cust, count(*) n from o where status = 'paid' group by cust) s on s.cust = c.id order by c.id -> ann|1; bob|1; cy|NULL; dee|NULL; eve|NULL
+// expect: select count(*) from (select distinct city from c) d -> 4
+// expect: select max(n) from (select count(*) n from o group by status) g -> 4
+// expect: select * from (select 1 as one, 'x' as two) z -> 1|x
+// expect: select * from (select id from c order by id desc limit 2) t order by id -> 4; 5
+// expect: select s.cust from (select cust from o) s right join c on c.id = s.cust where c.id > 3 order by c.id -> NULL; NULL
+// expect: select q.id from (select id from c) q where q.id in (select cust from o) order by 1 -> 1; 2; 3
+// expect: select (select count(*) from (select id from o where amount > 4) big) -> 3
+// expect: select id from c where exists (select 1 from (select cust from o) s where s.cust = c.id) order by 1 -> 1; 2; 3
+// expect: select * from (select id from c) t, (select id from o where id < 12) u order by 1, 2 -> 1|10; 1|11; 2|10; 2|11; 3|10; 3|11; 4|10; 4|11; 5|10; 5|11
+// expect: with p as (select id, name from c where city = 'paris') select name from p order by name -> ann; cy
+// expect: with p as (select id from c where city = 'paris'), q as (select cust from o where cust in (select id from p)) select count(*) from q -> 3
+// expect: with t(a, b) as (select id, name from c) select b from t where a = 2 -> bob
+// expect: with totals as (select cust, sum(amount) as total from o group by cust) select c.name, t.total from c join totals t on t.cust = c.id where t.total = (select max(total) from totals) -> ann|12.50
+// expect: explain with totals as (select cust, sum(amount) as total from o group by cust) select c.name, t.total from c join totals t on t.cust = c.id where t.total = (select max(total) from totals) -> scan c: full scan; join t: hash on (cust) over rows of subquery 1; subquery 1 (from): run once;   scan o: full scan;   aggregate; subquery 2 (scalar): run once;   scan totals: rows of subquery 1;   aggregate;   subquery 1 (from): run once;     scan o: full scan;     aggregate
+// expect: with c as (select 42 as id) select id from c -> 42
+// expect: with x as (select 1 as v) select * from (with x as (select 2 as v) select v from x) inner_q, x -> 2|1
+// expect: with a as (select 1 as v), b as (select v + 1 as v from a) select v from b -> 2
+// expect: with b as (select v from a), a as (select 1 as v) select * from b -> 42P01 relation "a" does not exist
+// expect: with recursive r as (select 1) select * from r -> 0A000 WITH RECURSIVE is not supported yet
+// expect: with x as (select 1 as v), x as (select 2 as v) select * from x -> 42712 WITH query name "x" specified more than once
+// expect: with x as (select 1 as v) insert into c values (9, 'z', 'z') -> 0A000 WITH is supported before SELECT only
+// expect: select id from c where id in (with w as (select cust from o where status = 'open') select cust from w) order by 1 -> 1; 3
+// expect: with w as (select cust from o where status = 'open') select id from c where exists (select 1 from w where w.cust = c.id) order by 1 -> 1; 3
+// expect: with w as (select id, city from c) select city, count(*) from w group by city order by city -> oslo|1; paris|2; rome|1; NULL|1
+// expect: with w as (select id, city from c) select city, max(id) from w group by city having count(*) > 1 -> paris|3
+// expect: explain analyze select c.name, s.total from c join (select cust, sum(amount) total from o group by cust) s on s.cust = c.id -> scan c: full scan (rows read 5, kept 5); join s: hash on (cust) over rows of subquery 1 (table rows 4 of 5 read, probes 5, rows read 3, joined 3); subquery 1 (from): run once (runs 1, from cache 0);   scan o: full scan (rows read 6, kept 6);   aggregate; result: 3 rows
+// expect: update c set city = 'lyon' where id in (select cust from (select cust from o where status = 'open') t) -> UPDATE 2
+// expect: delete from o where exists (select 1 from (select id from c where city = 'lyon') l where l.id = o.cust) -> DELETE 3
+// expect: select id, city from c order by id -> 1|lyon; 2|rome; 3|lyon; 4|NULL; 5|oslo
+// expect: select id from o order by id -> 12; 14; 15
+// expect: select * from (select id from c) -> 1; 2; 3; 4; 5
+// expect: select * from (select id from c) t(a, b) -> 42P10 table "t" has 1 columns available but 2 columns specified
+// expect: select * from (select x from c) t -> 42703 column "x" does not exist
+// expect: select id from c where exists (select 1 from (select cust from o where o.cust = c.id) s) -> 0A000 a subquery in FROM cannot use an outer query's columns yet
+// expect: select * from (c join o on o.cust = c.id) -> 0A000 parenthesized joins are not supported
+// expect: select * from c x(a) -> 0A000 column aliases for a table are not supported
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "strings"
+fn show(s: mut &lexdb_exec.Session, sql: str) {
+    match s.exec(&sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            var lines: []str = []
+            for row in r.rows {
+                var cells: []str = []
+                for v in row { append(mut &cells, if lexdb_exec.isNull(&v) { "NULL" } else { lexdb_exec.text(&v) }) }
+                append(mut &lines, strings.join(&cells, "|"))
+            }
+            let out = sql + " -> " + (if len(lines) == 0 { r.tag } else { strings.join(&lines, "; ") })
+            let k = strings.indexOf(out, " rows in ", 0)      // EXPLAIN ANALYZE's time varies
+            println(if k >= 0 { out[0..k] + " rows" } else { out })
+        }
+        Err(e) { println(sql + " -> " + e.state + " " + e.msg) }
+    }
+}
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(1), lexdb_store.Options{cacheNodes: 100000, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        show(mut &s, "create table c (id int primary key, name text, city text)")
+        show(mut &s, "create table o (id int primary key, cust int, amount numeric(8,2), status text)")
+        show(mut &s, "insert into c values (1,'ann','paris'),(2,'bob','rome'),(3,'cy','paris'),(4,'dee',null),(5,'eve','oslo')")
+        show(mut &s, "insert into o values (10,1,5.00,'paid'),(11,1,7.50,'open'),(12,2,3.00,'paid'),(13,3,9.99,'open'),(14,null,1.00,'paid'),(15,9,2.00,'paid')")
+        show(mut &s, "select * from (select id, name from c where city = 'paris') p order by id")
+        show(mut &s, "select x.n, x.total from (select cust as n, sum(amount) as total from o group by cust) x where x.total > 3 order by x.n")
+        show(mut &s, "select t.a, t.b from (select id, name from c) as t(a, b) where t.a < 3 order by 1")
+        show(mut &s, "select c.name, s.total from c join (select cust, sum(amount) total from o group by cust) s on s.cust = c.id order by c.name")
+        show(mut &s, "explain select c.name, s.total from c join (select cust, sum(amount) total from o group by cust) s on s.cust = c.id")
+        show(mut &s, "select c.name, s.n from c left join (select cust, count(*) n from o where status = 'paid' group by cust) s on s.cust = c.id order by c.id")
+        show(mut &s, "select count(*) from (select distinct city from c) d")
+        show(mut &s, "select max(n) from (select count(*) n from o group by status) g")
+        show(mut &s, "select * from (select 1 as one, 'x' as two) z")
+        show(mut &s, "select * from (select id from c order by id desc limit 2) t order by id")
+        show(mut &s, "select s.cust from (select cust from o) s right join c on c.id = s.cust where c.id > 3 order by c.id")
+        show(mut &s, "select q.id from (select id from c) q where q.id in (select cust from o) order by 1")
+        show(mut &s, "select (select count(*) from (select id from o where amount > 4) big)")
+        show(mut &s, "select id from c where exists (select 1 from (select cust from o) s where s.cust = c.id) order by 1")
+        show(mut &s, "select * from (select id from c) t, (select id from o where id < 12) u order by 1, 2")
+        show(mut &s, "with p as (select id, name from c where city = 'paris') select name from p order by name")
+        show(mut &s, "with p as (select id from c where city = 'paris'), q as (select cust from o where cust in (select id from p)) select count(*) from q")
+        show(mut &s, "with t(a, b) as (select id, name from c) select b from t where a = 2")
+        show(mut &s, "with totals as (select cust, sum(amount) as total from o group by cust) select c.name, t.total from c join totals t on t.cust = c.id where t.total = (select max(total) from totals)")
+        show(mut &s, "explain with totals as (select cust, sum(amount) as total from o group by cust) select c.name, t.total from c join totals t on t.cust = c.id where t.total = (select max(total) from totals)")
+        show(mut &s, "with c as (select 42 as id) select id from c")
+        show(mut &s, "with x as (select 1 as v) select * from (with x as (select 2 as v) select v from x) inner_q, x")
+        show(mut &s, "with a as (select 1 as v), b as (select v + 1 as v from a) select v from b")
+        show(mut &s, "with b as (select v from a), a as (select 1 as v) select * from b")
+        show(mut &s, "with recursive r as (select 1) select * from r")
+        show(mut &s, "with x as (select 1 as v), x as (select 2 as v) select * from x")
+        show(mut &s, "with x as (select 1 as v) insert into c values (9, 'z', 'z')")
+        show(mut &s, "select id from c where id in (with w as (select cust from o where status = 'open') select cust from w) order by 1")
+        show(mut &s, "with w as (select cust from o where status = 'open') select id from c where exists (select 1 from w where w.cust = c.id) order by 1")
+        show(mut &s, "with w as (select id, city from c) select city, count(*) from w group by city order by city")
+        show(mut &s, "with w as (select id, city from c) select city, max(id) from w group by city having count(*) > 1")
+        show(mut &s, "explain analyze select c.name, s.total from c join (select cust, sum(amount) total from o group by cust) s on s.cust = c.id")
+        show(mut &s, "update c set city = 'lyon' where id in (select cust from (select cust from o where status = 'open') t)")
+        show(mut &s, "delete from o where exists (select 1 from (select id from c where city = 'lyon') l where l.id = o.cust)")
+        show(mut &s, "select id, city from c order by id")
+        show(mut &s, "select id from o order by id")
+        show(mut &s, "select * from (select id from c)")
+        show(mut &s, "select * from (select id from c) t(a, b)")
+        show(mut &s, "select * from (select x from c) t")
+        show(mut &s, "select id from c where exists (select 1 from (select cust from o where o.cust = c.id) s)")
+        show(mut &s, "select * from (c join o on o.cust = c.id)")
+        show(mut &s, "select * from c x(a)")
+        return 0
+    }).unwrap()
+}

@@ -80,6 +80,8 @@ pub type FromItem = record {
     pub alias: str              // the name its columns are qualified by
     pub join: int
     pub on: Option[Expr]
+    pub sub: int                // a subquery (in FROM, or a CTE's): its number; -1: a table
+    pub cols: []str             // names for its columns (AS x(a, b)); the rest keep theirs
 }
 
 pub type OrderItem = record { pub expr: Expr; pub desc: bool }
@@ -131,6 +133,7 @@ pub type Stmt = record {
 pub const SUB_SCALAR = 1
 pub const SUB_EXISTS = 2
 pub const SUB_IN = 3
+pub const SUB_FROM = 4          // in FROM: a subquery, or a CTE where it is used
 
 fn newStmt(kind: int): Stmt {
     return Stmt{kind: kind, table: "", ifFlag: false, cols: [], pk: [], names: [], rows: [], items: [], where: None,
@@ -261,7 +264,12 @@ type P = record {
     pos: int
     params: int
     subs: []Stmt        // the subqueries of the statement being parsed
+    ctes: []Cte         // the CTEs in scope, innermost last
 }
+
+// A CTE: kept as its text (where its tokens start), parsed again as a
+// subquery in FROM wherever it is used, seeing the CTEs before it.
+type Cte = record { name: str; cols: []str; start: int }
 
 fn (p: &P) peek(): Tok { return p.toks[p.pos] }
 fn (p: &P) peekAt(k: int): Tok {
@@ -554,15 +562,68 @@ fn (p: mut &P) caseExpr(): Result[Expr, lexdb_base.DbErr] {
 // A subquery, after its "(": its own subqueries go with it, and the
 // statement it is in gets it, numbered.
 fn (p: mut &P) subquery(use: int): Result[int, lexdb_base.DbErr] {
-    if p.isKw("with") { return Err(lexdb_base.err("0A000", "WITH is not supported yet")) }
-    try p.expectKw("select")
     let saved = replace(mut &p.subs, [])
+    var pushed = 0
+    if p.acceptKw("with") { pushed = try p.withList() }
+    try p.expectKw("select")
     var sq = try p.select()
+    p.popCtes(pushed)
     sq.subs = replace(mut &p.subs, saved)
     sq.use = use
     try p.expectKw(")")
     append(mut &p.subs, sq)
     return Ok(len(p.subs) - 1)
+}
+
+// WITH's list, after "with": the CTEs go in scope (how many: the result).
+// Each is parsed now to check it, and again where it is used.
+fn (p: mut &P) withList(): Result[int, lexdb_base.DbErr] {
+    if p.isKw("recursive") { return Err(lexdb_base.err("0A000", "WITH RECURSIVE is not supported yet")) }
+    var n = 0
+    while true {
+        let name = try p.name()
+        var cols: []str = []
+        if p.acceptKw("(") {
+            append(mut &cols, try p.name())
+            while p.acceptKw(",") { append(mut &cols, try p.name()) }
+            try p.expectKw(")")
+        }
+        try p.expectKw("as")
+        if p.acceptKw("not") { try p.expectKw("materialized") } else { let m = p.acceptKw("materialized") }
+        try p.expectKw("(")
+        let start = p.pos
+        let keep = len(p.subs)
+        let i = try p.subquery(SUB_FROM)
+        while len(p.subs) > keep { let x = pop(mut &p.subs) }
+        for k in len(p.ctes) - n..len(p.ctes) {
+            if p.ctes[k].name == name {
+                return Err(lexdb_base.err("42712", "WITH query name \"" + name + "\" specified more than once"))
+            }
+        }
+        append(mut &p.ctes, Cte{name: name, cols: cols, start: start})
+        n += 1
+        if !p.acceptKw(",") { break }
+    }
+    return Ok(n)
+}
+
+fn (p: mut &P) popCtes(n: int) { for i in 0..n { let c = pop(mut &p.ctes) } }
+
+// A use of CTE ci: its text parsed again, here, with the CTEs before it in
+// scope.
+fn (p: mut &P) cteRef(ci: int): Result[int, lexdb_base.DbErr] {
+    let saved = replace(mut &p.ctes, [])
+    for i in 0..ci {
+        var cols: []str = []
+        for c in saved[i].cols { append(mut &cols, c) }
+        append(mut &p.ctes, Cte{name: saved[i].name, cols: cols, start: saved[i].start})
+    }
+    let pos = p.pos
+    p.pos = saved[ci].start
+    let r = p.subquery(SUB_FROM)
+    p.pos = pos
+    p.ctes = saved
+    return r
 }
 
 fn subRef(name: str, i: int): Expr { return Expr.Call(name, [Expr.Lit(Val.Int(i))], false) }
@@ -815,18 +876,51 @@ fn (p: mut &P) select(): Result[Stmt, lexdb_base.DbErr] {
 }
 
 fn (p: mut &P) fromItem(join: int): Result[FromItem, lexdb_base.DbErr] {
+    if p.acceptKw("(") {
+        // a subquery in FROM
+        if !p.isKw("select") && !p.isKw("with") { return Err(lexdb_base.err("0A000", "parenthesized joins are not supported")) }
+        let i = try p.subquery(SUB_FROM)
+        var alias = "unnamed_subquery"
+        var cols: []str = []
+        try p.aliasOf(mut &alias, mut &cols)
+        return Ok(FromItem{table: "", alias: alias, join: join, on: None, sub: i, cols: cols})
+    }
     let table = try p.name()
     var alias = table
+    var cols: []str = []
+    try p.aliasOf(mut &alias, mut &cols)
+    // a CTE in scope (the innermost of the name) before a table
+    var ci = -1
+    for i in 0..len(p.ctes) { if p.ctes[i].name == table { ci = i } }
+    if ci >= 0 {
+        if len(cols) == 0 { for c in p.ctes[ci].cols { append(mut &cols, c) } }
+        let i = try p.cteRef(ci)
+        return Ok(FromItem{table: table, alias: alias, join: join, on: None, sub: i, cols: cols})
+    }
+    if len(cols) > 0 { return Err(lexdb_base.err("0A000", "column aliases for a table are not supported")) }
+    return Ok(FromItem{table: table, alias: alias, join: join, on: None, sub: -1, cols: cols})
+}
+
+// [AS] alias [(column, ...)]
+fn (p: mut &P) aliasOf(alias: mut &str, cols: mut &[]str): Result[Unit, lexdb_base.DbErr] {
+    var got = false
     if p.acceptKw("as") {
-        alias = try p.name()
+        let old = replace(alias, try p.name())
+        got = true
     } else {
         let t = p.peek()
         if t.kind == T_QIDENT || (t.kind == T_IDENT && !isReserved(&t.text)) {
-            alias = t.text
+            let old = replace(alias, t.text)
             p.pos += 1
+            got = true
         }
     }
-    return Ok(FromItem{table: table, alias: alias, join: join, on: None})
+    if got && p.acceptKw("(") {
+        append(cols, try p.name())
+        while p.acceptKw(",") { append(cols, try p.name()) }
+        try p.expectKw(")")
+    }
+    return Ok(Unit{})
 }
 
 fn (p: mut &P) createIndex(unique: bool): Result[Stmt, lexdb_base.DbErr] {
@@ -882,6 +976,14 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
     p.pos += 1
     match t.text {
         "select" { return p.select() }
+        "with" {
+            let n = try p.withList()
+            if !p.isKw("select") { return Err(lexdb_base.err("0A000", "WITH is supported before SELECT only")) }
+            p.pos += 1
+            let r = p.select()
+            p.popCtes(n)
+            return r
+        }
         "insert" { return p.insert() }
         "update" { return p.update() }
         "delete" { return p.delete() }
@@ -970,11 +1072,12 @@ fn (p: mut &P) skipToEnd() {
 // highest $n in each.
 pub fn parse(sql: &str): Result[[]Stmt, lexdb_base.DbErr] {
     let toks = try lex(sql)
-    var p = P{toks: toks, pos: 0, params: 0, subs: []}
+    var p = P{toks: toks, pos: 0, params: 0, subs: [], ctes: []}
     var out: []Stmt = []
     while true {
         p.params = 0
         p.subs = []
+        p.ctes = []
         var s = try p.statement()
         s.params = p.params
         if s.kind != S_EXPLAIN { s.subs = replace(mut &p.subs, []) }
@@ -1086,7 +1189,7 @@ pub fn exprText(x: &Expr): str {
 // One expression and nothing after it.
 pub fn parseExpr(sql: &str): Result[Expr, lexdb_base.DbErr] {
     let toks = try lex(sql)
-    var p = P{toks: toks, pos: 0, params: 0, subs: []}
+    var p = P{toks: toks, pos: 0, params: 0, subs: [], ctes: []}
     let x = try p.expr()
     let t = p.peek()
     if t.kind != T_EOF { return Err(near(&t)) }

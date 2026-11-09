@@ -39,7 +39,8 @@ machine, through WSL2's virtual disk.
   predictable plans. Costs are reconsidered with joins and secondary indexes
   (D4), and then only a small model: a row count per table, distinct-value
   estimates per index, join order over a few tables, plans fixed per
-  prepared statement and shown by `EXPLAIN`.
+  prepared statement and shown by `EXPLAIN`. With joins, indexes and
+  subqueries built, the user decided (2026-11-09): leave costs for now.
 
 ## 1. Recommendation
 
@@ -392,7 +393,7 @@ Built on 2026-11-09 on branch `lexdb`, about 6,300 lines in
 (cache, trees, transactions, log, checkpoints, recovery, snapshots),
 `lexdb_sql` (lexer, parser), `lexdb_exec` (catalog, rows, keys, planner,
 statements, sessions), `lexdb_wire` (protocol 3.0) and `lexdb` (the
-server). Tests: `python3 lexell/tests/lexdb.py` (19 programs in
+server). Tests: `python3 lexell/tests/lexdb.py` (20 programs in
 `tests/lexdb/run`, under `LXL_CHECK=1`).
 
     lexell/compiler/out/lxlc lexell/cmd/lexdb.lxl -o lexdb
@@ -426,7 +427,7 @@ server). Tests: `python3 lexell/tests/lexdb.py` (19 programs in
   statement waits, after it runs, until what it read is durable, since its
   result goes out before COMMIT (4.4).
 - **Interpreted, not bytecode.** The executor walks the statement's tree.
-- **No CTEs, subqueries in FROM, schemas, bytea, dates or times yet.**
+- **No WITH RECURSIVE, LATERAL, schemas, bytea, dates or times yet.**
 - **Trust login**: no password, no TLS. The server listens on loopback by
   default.
 - **A simple query with several statements** runs each in its own
@@ -505,13 +506,15 @@ is the comparison to make.
 
 ### 9.4 Next
 
-1. The rest of subqueries and CTEs (9.8, 9.9): `WITH` as named
-   subqueries, and subqueries in FROM; then `WITH RECURSIVE`. Smaller: a
-   correlated subquery's value as a lookup's key (now it is only a filter),
-   a small uncorrelated IN set as an IN-list lookup, and correlated
-   subqueries in GROUP BY and in aggregates' arguments; hashing a
-   correlated scalar subquery with an aggregate (a count per customer) as
-   a grouped run; choosing hash or index per row by row counts (9.9).
+1. The rest of subqueries and CTEs (9.8 to 9.10): `WITH RECURSIVE`; a CTE
+   used twice run once; `LATERAL` (a subquery in FROM using the tables
+   before it). Smaller: a correlated subquery's value as a lookup's key
+   (now it is only a filter), a small uncorrelated IN set as an IN-list
+   lookup, correlated subqueries in GROUP BY and in aggregates' arguments,
+   hashing a correlated scalar subquery with an aggregate (a count per
+   customer) as a grouped run, `WITH` before INSERT, UPDATE and DELETE.
+   Choosing hash or index per row by row counts (9.9) waits for costs,
+   which the user has left for now (section 0).
 2. The cache budget in bytes, not nodes (measured in 9.3: decoded nodes
    take 1.8 to 3.3 times their page, so the default of 100,000 nodes could
    reach 0.7 to 1.5 GB), a smaller decoded node, and why a restarted server
@@ -678,8 +681,8 @@ is the comparison to make.
 - EXPLAIN shows each subquery, run once or per row and on which outer
   columns, with its plan; EXPLAIN ANALYZE adds its runs, how many came
   from the cache, and its tables' counts summed over the runs.
-- Not yet: CTEs, subqueries in FROM, `ANY`/`ALL`, correlated subqueries
-  in GROUP BY or in an aggregate's arguments (0A000).
+- Not yet: `ANY`/`ALL`, correlated subqueries in GROUP BY or in an
+  aggregate's arguments (0A000).
 - Tests: `exec_sub` (62 statements then, checked by hand); `exec_index_diff`
   compares IN with a correlated EXISTS and with the list of its values,
   NOT EXISTS with a LEFT JOIN's unmatched rows, a correlated count with a
@@ -728,4 +731,40 @@ is the comparison to make.
   (1 line, after adding that case). Skipping NULL keys on the build side
   and on the probe side are each enough alone: removing one changes
   nothing.
+
+### 9.10 Subqueries in FROM and CTEs
+
+- `FROM (SELECT ...) [AS] t [(a, b)]` (the alias may be left out, as in
+  PostgreSQL 16: `unnamed_subquery`), and `WITH x [(a, b)] AS (SELECT ...),
+  ... SELECT ...`, at the top or in any subquery, `[NOT] MATERIALIZED`
+  accepted. A CTE sees the ones before it in its WITH and those around it;
+  an inner one, or one of a name, hides the outer one or a table of that
+  name.
+- The parser keeps a CTE as its tokens and parses them again, as a
+  subquery in FROM, wherever the CTE is used; scope comes from that. So a
+  CTE used twice is planned and run twice: the same rows, more work
+  (running it once is in 9.4).
+- A subquery in FROM is planned before the query's tables, seeing the
+  queries around the query but not its tables (no `LATERAL`); using an
+  outer query's columns is 0A000 for now. It runs once per execution,
+  before the query, into rows held by the run; its level reads them, with
+  no key: at the first level a scan of them, after it a hash join on its
+  equalities (or a loop). Its hash keys are by value (`2 = 2.0`), as its
+  values keep their own types. ORDER BY and MIN/MAX are not taken from its
+  order, and grouping by its columns implies nothing of the others.
+- EXPLAIN: `join s: hash on (cust) over rows of subquery 1`, then
+  `subquery 1 (from): run once` and its plan.
+- Not yet: `WITH RECURSIVE`, `LATERAL`, WITH before INSERT, UPDATE or
+  DELETE (0A000; their subqueries may use subqueries in FROM and WITH),
+  column aliases for a table (`FROM t x(a)`).
+- Tests: `exec_with` (46 statements, checked by hand); `exec_index_diff`
+  compares a subquery in FROM with its query, a grouped CTE joined with a
+  correlated count, and subqueries in FROM on both sides of a LEFT JOIN
+  with the tables themselves: no differences over four seeds. Mutations:
+  its hash keys coerced like a table's (23 differ, 4 lines of
+  `exec_with`), ORDER BY taken from its scan (21, 2), a CTE seeing itself
+  and later ones (1 line), the outermost CTE of a name winning (1 line),
+  column aliases ignored (2 lines).
+- pgbench point selects, the last commit and this one, two rounds each:
+  26,666 / 26,173 and 23,823 / 24,054 tps. The binary is 1.13 MB.
 

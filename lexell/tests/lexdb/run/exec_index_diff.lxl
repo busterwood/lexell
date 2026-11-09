@@ -13,6 +13,7 @@
 // unmatched rows, a correlated count with a grouped LEFT JOIN, a scalar with
 // its value; UPDATE uses them too. b has an index on x and b0 none, so a
 // subquery correlated on x is per row on one side and hashed on the other.
+// A subquery in FROM and a CTE are compared with the tables they read.
 // expect: statements ok, queries 1204 differ 0, index paths used true, hash joins used true, index order used true, backward true, min/max true, filtered true, in-lists true, subqueries per row true and once true, hashed true
 import "strings"
 import "collections"
@@ -171,7 +172,7 @@ fn body(st: lexdb_store.Store): int {
             var sql = ""
             let c = cond(mut &r)
             let n = (r.below(9) + 1).toStr()
-            let j = r.below(26)
+            let j = r.below(29)
             var q1 = ""
             var q0 = ""
             var got1 = ""
@@ -238,6 +239,31 @@ fn body(st: lexdb_store.Store): int {
                 let lit = if v == "N" { "null" } else { v }
                 q1 = "select id, x from a where x <= (select max(x) from b where " + c + ") order by x desc, id limit " + n
                 q0 = "select id, x from a0 where x <= " + lit + " order by x desc, id limit " + n
+                got1 = rows(mut &s, &q1)
+                got0 = rows(mut &s, &q0)
+            } else if j == 26 {
+                // a subquery in FROM = its query
+                q1 = "select t.id, t.y from (select id, y from a where " + c + ") t order by t.id"
+                q0 = "select id, y from a0 where " + c + " order by id"
+                got1 = rows(mut &s, &q1)
+                got0 = rows(mut &s, &q0)
+            } else if j == 27 {
+                // a CTE grouped and joined = a correlated count where there is one
+                let c2 = cond(mut &r)
+                q1 = "with u as (select x, count(*) as n from b where " + c + " group by x) select t.id, u.n from a t join u on u.x = t.x where " +
+                     qual(&c2, &"t") + " order by 1"
+                q0 = "select t.id, (select count(*) from b0 u where u.x = t.x and (" + qual(&c, &"u") + ")) from a0 t where (" + qual(&c2, &"t") +
+                     ") and exists (select 1 from b0 u where u.x = t.x and (" + qual(&c, &"u") + ")) order by 1"
+                got1 = rows(mut &s, &q1)
+                got0 = rows(mut &s, &q0)
+            } else if j == 28 {
+                // a subquery in FROM on either side of a LEFT JOIN = the tables themselves
+                if r.below(2) == 0 {
+                    q1 = "select t.id, u.id from a t left join (select id, x from b where " + c + ") u on u.x = t.x order by 1, 2"
+                } else {
+                    q1 = "select t.id, u.id from (select id, x from a) t left join (select id, x from b where " + c + ") u on u.x = t.x order by 1, 2"
+                }
+                q0 = "select t.id, u.id from a0 t left join b0 u on u.x = t.x and (" + qual(&c, &"u") + ") order by 1, 2"
                 got1 = rows(mut &s, &q1)
                 got0 = rows(mut &s, &q0)
             } else if j == 24 || j == 25 {
