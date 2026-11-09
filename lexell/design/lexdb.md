@@ -1,8 +1,10 @@
 # lexdb: a small SQL database server
 
-Status: research note, 2026-11-09. The decisions in section 0 are the user's,
-from the same day. Nothing is built yet. Section 3's measurements were taken
-on the development machine, through WSL2's virtual disk.
+Status: the decisions in section 0 are the user's (2026-11-09). Stages D0 to
+D3 and the read-only snapshots of 4.5 are built (2026-11-09, branch
+`lexdb`); section 9 records how, with what differs from this design and
+the measurements. Section 3's measurements were taken on the development
+machine, through WSL2's virtual disk.
 
 ## 0. Decisions
 
@@ -27,6 +29,17 @@ on the development machine, through WSL2's virtual disk.
   the same park/wake interface when a measurement shows the pool is the
   limit. The concurrency note already says io_uring comes "later if file
   I/O needs it", and a database is that case.
+- **Two isolation levels, both in the plan.** Read-write transactions are
+  serializable (4.4), the default and the only level for writes; there is no
+  read-write snapshot isolation, which allows write skew. Read-only
+  transactions are snapshots (4.5): every statement sees the database as of
+  the start, for a page built from several queries on one connection. Both
+  are built (section 9).
+- **No cost-based optimizer for now.** The planner's rules (4.8) give
+  predictable plans. Costs are reconsidered with joins and secondary indexes
+  (D4), and then only a small model: a row count per table, distinct-value
+  estimates per index, join order over a few tables, plans fixed per
+  prepared statement and shown by `EXPLAIN`.
 
 ## 1. Recommendation
 
@@ -323,8 +336,8 @@ written into this note.
   statements, and a pgbench-like load is measured.
 
 **D4: the rest of version 1's SQL.**
-- Secondary indexes, read-only snapshots, joins, `ORDER BY`/`LIMIT`,
-  aggregates, `COPY`.
+- Secondary indexes, joins, `COPY`. (Read-only snapshots, `ORDER BY`,
+  `LIMIT` and aggregates came earlier: section 9.)
 
 **D5: io_uring**, behind park/wake, when D2 to D4's numbers show the
 helper pool is the limit.
@@ -369,3 +382,106 @@ helper pool is the limit.
   `wsl --mount --bare`? WSL2 is fine for development and for crash
   correctness.
 - **`pg_catalog`** (section 0).
+
+## 9. As built (D0 to D3, and snapshots)
+
+Built on 2026-11-09 on branch `lexdb`, about 5,300 lines in
+`cmd/lexdb*.lxl`: `lexdb_base` (errors, CRC32C, a generator), `lexdb_disk`
+(real and simulated files), `lexdb_page` (page formats), `lexdb_store`
+(cache, trees, transactions, log, checkpoints, recovery, snapshots),
+`lexdb_sql` (lexer, parser), `lexdb_exec` (catalog, rows, keys, planner,
+statements, sessions), `lexdb_wire` (protocol 3.0) and `lexdb` (the
+server). Tests: `python3 lexell/tests/lexdb.py` (12 programs in
+`tests/lexdb/run`, under `LXL_CHECK=1`).
+
+    lexell/compiler/out/lxlc lexell/cmd/lexdb.lxl -o lexdb
+    ./lexdb /path/to/data 127.0.0.1:5433
+    psql "host=127.0.0.1 port=5433 user=me dbname=lexdb"
+
+### 9.1 What differs from the design
+
+- **Nodes are decoded into records** (`lexdb_page.Node`: arrays of keys,
+  values and children) rather than worked on as slotted pages. Simpler;
+  the cost is a decode per load and an encode per checkpoint. Measure before
+  changing it.
+- **No overflow pages yet**: a key is at most 512 bytes and a key and its row
+  at most 1,350 (an entry over a third of a page cannot always split), so a
+  row is limited to about 1.3 KB. Error 54000.
+- **Old versions are kept per node, not per page**, as copies made when a
+  commit changes a node a snapshot can see (4.5). Slots a snapshot may
+  still reach are kept until it ends, and not evicted. A checkpoint is not
+  a snapshot as 4.5 suggests: it encodes every dirty node inside one `with`
+  (no park), then writes the pages outside it. That pause grows with the
+  dirty set; it is the first thing to measure under a large write load.
+- **The checkpoint waits for the log.** The meta page is written only after
+  the log holds every commit the checkpoint includes. Without that, replay
+  from the checkpoint's log position could re-apply an older batch over a
+  newer, unlogged one and leave a transaction half applied.
+- **Deleting does not merge nodes**: an empty node leaves its parent, an
+  underfull one stays. **A dropped table's pages are not reclaimed** unless
+  its nodes are in memory (the free list never sees the others).
+- **Statements outside a block are retried** up to 10 times on 40001 (the
+  client has seen nothing of the failed try). In a read-write block each
+  statement waits, after it runs, until what it read is durable, since its
+  result goes out before COMMIT (4.4).
+- **Interpreted, not bytecode.** The executor walks the statement's tree.
+- **One table per SELECT**; no joins, subqueries, DISTINCT, secondary
+  indexes, bytea, dates or times yet. A numeric primary key is not
+  supported yet (keys need an order-preserving decimal encoding).
+- **Trust login**: no password, no TLS. The server listens on loopback by
+  default.
+- **A simple query with several statements** runs each in its own
+  transaction, not one implicit transaction as PostgreSQL does.
+- **Log segments are zero-filled** when made, not only allocated: a flush
+  after writing into an allocated, unwritten extent cost twice as much
+  (1.6 ms against 2.9 ms per pgbench transaction with one client).
+
+### 9.2 Tests and what they catch
+
+- `store_crash`: 40 seeds, three crashes each, at a random acknowledged
+  commit, with a 3-node cache (evictions), 64 KiB log segments and a
+  checkpoint every 24 KiB of log; the recovered tree must equal a model.
+  Removing the flush before the meta page fails it (3 of 120).
+- `store_bank`: 30 runs of 6 tasks making transfers with think time
+  (conflicts and retries), a crash at a random moment: the money adds up
+  and every acknowledged transfer survives. Skipping validation fails it
+  at once. **Not caught yet:** removing the checkpoint's wait for the log
+  (above): the window is narrow and a random crash rarely lands in it. A
+  targeted test is owed.
+- `store_snapshot`: 60 snapshots totalling 1,200 accounts while 300
+  transfers commit, with a 20-node cache; keeping no old versions fails it.
+  A snapshot over the budget gets 72000.
+- `wire_client`: `lib/postgres` against the server in the same process.
+- `store_real`: the real file system: write, reopen, read.
+
+### 9.3 Measurements
+
+pgbench 16.15 on the development machine (section 3: WSL2, consumer NVMe),
+2026-11-09, `-M prepared`, a table of 10,000 rows, the server with its
+defaults (`LXL_HELPERS=32`), 5 s runs, one run each:
+
+| workload | clients | tps | latency |
+|---|---:|---:|---:|
+| UPDATE by key, then SELECT it (autocommit) | 1 | 611 | 1.6 ms |
+| same | 8 | 1,146 | 7.0 ms |
+| same | 32 | 3,376 | 9.5 ms |
+| same | 64 | 5,376 | 11.9 ms |
+| SELECT by key | 8 | 26,668 | 0.30 ms |
+| BEGIN READ ONLY, two 100-row aggregates, COMMIT, beside 16 writers | 8 | 2,266 | 3.5 ms |
+| (the 16 writers meanwhile) | 16 | 3,481 | 4.6 ms |
+
+One client is close to the drive's flush (about 1 ms, section 3); more
+clients share flushes (group commit). No run had a failed transaction.
+These are first numbers, not a comparison: PostgreSQL on the same machine
+is the comparison to make.
+
+### 9.4 Next
+
+1. A targeted test for the checkpoint's wait for the log; whole-server
+   crash tests through the wire protocol.
+2. D4: secondary indexes, joins, COPY; then the cost questions (section 0).
+3. Overflow pages for large rows; reclaiming a dropped table's pages.
+4. Authentication (SCRAM) and TLS, so the server can leave loopback.
+5. The checkpoint pause and the memory of decoded nodes, measured under a
+   large write load; io_uring if the helper pool is the limit (D5).
+

@@ -545,3 +545,29 @@ again in safe mode, with smart punctuation, `--sourcepos`, `--hardbreaks` and
 every `*.md` file of the repository against cmark with three option sets, and
 cmark's pathological inputs (plus a few more) with a time limit against cmark.
 Our tool runs with `LXL_CHECK=1`, so a leak fails a case.
+
+## lexdb
+
+`lexdb.lxl` is a small SQL database server on disk that speaks the
+PostgreSQL wire protocol, so `psql`, `pgbench` and `lib/postgres` connect to
+it. The design and its state are in
+[../design/lexdb.md](../design/lexdb.md).
+
+| File | Contents |
+|---|---|
+| `lexdb.lxl` | the server: `lexdb DATADIR [ADDR]` (ADDR defaults to 127.0.0.1:5433) |
+| `lexdb_wire.lxl` | protocol 3.0: startup, simple and extended queries |
+| `lexdb_sql.lxl` | the SQL lexer and parser |
+| `lexdb_exec.lxl` | the catalog, rows, keys, the planner's rules, statements, sessions |
+| `lexdb_store.lxl` | copy-on-write B+trees, the cache, transactions, the log, checkpoints, recovery, snapshots |
+| `lexdb_page.lxl` | the page formats |
+| `lexdb_disk.lxl` | files with O_DIRECT, and a simulated disk that crashes |
+| `lexdb_base.lxl` | errors, CRC32C, a deterministic generator |
+
+    compiler/out/lxlc cmd/lexdb.lxl -o lexdb
+    ./lexdb /tmp/lexdb-data &
+    psql "host=127.0.0.1 port=5433 user=me dbname=lexdb"
+
+There is no authentication yet: keep it on loopback. SIGTERM or SIGINT stops
+it after a checkpoint. `python3 lexell/tests/lexdb.py` runs its tests.
+
