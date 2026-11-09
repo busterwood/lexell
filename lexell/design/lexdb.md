@@ -1,8 +1,8 @@
 # lexdb: a small SQL database server
 
 Status: the decisions in section 0 are the user's (2026-11-09). Stages D0 to
-D3 and the read-only snapshots of 4.5 are built (2026-11-09, branch
-`lexdb`); section 9 records how, with what differs from this design and
+D3, the read-only snapshots of 4.5, and D4's secondary indexes and joins
+are built (2026-11-09, branch `lexdb`); section 9 records how, with what differs from this design and
 the measurements. Section 3's measurements were taken on the development
 machine, through WSL2's virtual disk.
 
@@ -337,7 +337,8 @@ written into this note.
 
 **D4: the rest of version 1's SQL.**
 - Secondary indexes, joins, `COPY`. (Read-only snapshots, `ORDER BY`,
-  `LIMIT` and aggregates came earlier: section 9.)
+  `LIMIT` and aggregates came earlier. Indexes, joins and `EXPLAIN` are
+  built: 9.5. `COPY` is not yet.)
 
 **D5: io_uring**, behind park/wake, when D2 to D4's numbers show the
 helper pool is the limit.
@@ -383,15 +384,15 @@ helper pool is the limit.
   correctness.
 - **`pg_catalog`** (section 0).
 
-## 9. As built (D0 to D3, and snapshots)
+## 9. As built (D0 to D3, snapshots, D4's indexes and joins)
 
-Built on 2026-11-09 on branch `lexdb`, about 5,300 lines in
+Built on 2026-11-09 on branch `lexdb`, about 6,300 lines in
 `cmd/lexdb*.lxl`: `lexdb_base` (errors, CRC32C, a generator), `lexdb_disk`
 (real and simulated files), `lexdb_page` (page formats), `lexdb_store`
 (cache, trees, transactions, log, checkpoints, recovery, snapshots),
 `lexdb_sql` (lexer, parser), `lexdb_exec` (catalog, rows, keys, planner,
 statements, sessions), `lexdb_wire` (protocol 3.0) and `lexdb` (the
-server). Tests: `python3 lexell/tests/lexdb.py` (13 programs in
+server). Tests: `python3 lexell/tests/lexdb.py` (15 programs in
 `tests/lexdb/run`, under `LXL_CHECK=1`).
 
     lexell/compiler/out/lxlc lexell/cmd/lexdb.lxl -o lexdb
@@ -425,9 +426,8 @@ server). Tests: `python3 lexell/tests/lexdb.py` (13 programs in
   statement waits, after it runs, until what it read is durable, since its
   result goes out before COMMIT (4.4).
 - **Interpreted, not bytecode.** The executor walks the statement's tree.
-- **One table per SELECT**; no joins, subqueries, DISTINCT, secondary
-  indexes, bytea, dates or times yet. A numeric primary key is not
-  supported yet (keys need an order-preserving decimal encoding).
+- **No subqueries, DISTINCT, HAVING, RIGHT or FULL joins, bytea, dates or
+  times yet.**
 - **Trust login**: no password, no TLS. The server listens on loopback by
   default.
 - **A simple query with several statements** runs each in its own
@@ -454,6 +454,13 @@ server). Tests: `python3 lexell/tests/lexdb.py` (13 programs in
 - `store_snapshot`: 60 snapshots totalling 1,200 accounts while 300
   transfers commit, with a 20-node cache; keeping no old versions fails it.
   A snapshot over the budget gets 72000.
+- `exec_index_diff`: two tables with indexes and copies of them without,
+  under the same random inserts, updates and deletes; 1,200 random queries
+  and joins (index lookups and ranges against full scans, per-row lookups
+  against hash joins) must agree, with a 12-node cache. Leaving the old
+  index entry behind on UPDATE (974 differ) or DELETE (1,021), or making a
+  range's lower bound exclusive (109), fails it.
+- `exec_join`: each index, join and EXPLAIN feature once, checked by hand.
 - `wire_client`: `lib/postgres` against the server in the same process.
 - `store_real`: the real file system: write, reopen, read.
 
@@ -481,9 +488,55 @@ is the comparison to make.
 ### 9.4 Next
 
 1. Whole-server crash tests through the wire protocol.
-2. D4: secondary indexes, joins, COPY; then the cost questions (section 0).
-3. Overflow pages for large rows; reclaiming a dropped table's pages.
-4. Authentication (SCRAM) and TLS, so the server can leave loopback.
-5. The checkpoint pause and the memory of decoded nodes, measured under a
+2. Plans kept per prepared statement: since D4 every execution resolves
+   names and chooses paths, and point selects fell from 26,700 to 23,800
+   tps (one run each).
+3. COPY; then the cost questions (section 0), with EXPLAIN ANALYZE's
+   counts as the evidence.
+4. Overflow pages for large rows; reclaiming a dropped table's pages.
+5. Authentication (SCRAM) and TLS, so the server can leave loopback.
+6. The checkpoint pause and the memory of decoded nodes, measured under a
    large write load; io_uring if the helper pool is the limit (D5).
+
+### 9.5 Indexes and joins (D4)
+
+- **An index is a tree of its own.** Per row, its key is the indexed
+  columns then the primary key, and its value is the primary key. Each
+  column is a marker (1 a value, 2 NULL, so NULLs sort last as in
+  PostgreSQL) and then the column in key order. The index's definition is
+  part of its table's catalog entry, and the catalog maps its name (prefixed
+  by byte 1) to the table, so CREATE INDEX and DROP INDEX are transactional.
+  INSERT, UPDATE and DELETE keep every index in step in the same
+  transaction. A unique index is checked by scanning its value's prefix:
+  the scan reads the leaf, so two transactions adding the same value fail
+  one with 40001. NULLs never clash.
+- **Numeric keys** encode the canonical decimal: 0x80 for zero; 0x81, the
+  exponent of the leading digit and the digits for a positive value; 0x7F
+  and all of that complemented for a negative one. 1.5 and 1.50 give the
+  same key, so numeric primary keys and GROUP BY on numerics work.
+- **The rules choose a path per table**: the primary key or an index, by
+  the whole primary key equal, then a unique index fully equal, then the
+  most leading equalities and a range on the next column; the primary key
+  wins a tie. Range ends are inclusive, because a bound coerced to the
+  column's type may be rounded. Every row is checked against the
+  conditions.
+- **Joins run in the order written.** A table whose path takes its values
+  from the tables before it is looked up per row (a nested loop through a
+  key or an index). Otherwise it is read once into memory and matched by a
+  hash of the equalities that link it (none: a cross product). Each WHERE
+  conjunct is checked at the first table where its columns are known. For
+  a LEFT JOIN, the WHERE conjunct is checked after the NULL row is made, and
+  only ON decides the match. Rows are read in batches of 256, because a
+  scan holds the transaction and the lookups need it in between.
+- **EXPLAIN** prints a line per table: its path and how it joins. **EXPLAIN
+  ANALYZE** runs a SELECT and adds, per table, the lookups or probes made,
+  the rows tried and joined, a hash table's rows and LEFT JOIN null rows,
+  then the result's rows and time. On 1,000 customers and 10,000 orders,
+  one customer's orders: the hash join reads all 10,000 orders to find 4
+  (3.4 ms); with an index on `orders(cust)`, 1 lookup and 4 rows (0.04 ms).
+  Writing the FROM list in a good order is the user's job until costs come
+  (section 0).
+- **Not yet:** an index cannot serve ORDER BY or MIN/MAX, a hash join's table
+  must fit in memory, CREATE INDEX on a large table buffers every entry in
+  its transaction, and there are no expression or partial indexes.
 

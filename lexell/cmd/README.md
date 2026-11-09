@@ -558,7 +558,7 @@ it. The design and its state are in
 | `lexdb.lxl` | the server: `lexdb DATADIR [ADDR]` (ADDR defaults to 127.0.0.1:5433) |
 | `lexdb_wire.lxl` | protocol 3.0: startup, simple and extended queries |
 | `lexdb_sql.lxl` | the SQL lexer and parser |
-| `lexdb_exec.lxl` | the catalog, rows, keys, the planner's rules, statements, sessions |
+| `lexdb_exec.lxl` | the catalog, rows, keys, indexes, the planner's rules, joins, EXPLAIN, statements, sessions |
 | `lexdb_store.lxl` | copy-on-write B+trees, the cache, transactions, the log, checkpoints, recovery, snapshots |
 | `lexdb_page.lxl` | the page formats |
 | `lexdb_disk.lxl` | files with O_DIRECT, and a simulated disk that crashes |
