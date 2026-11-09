@@ -32,6 +32,8 @@ pub type ConnArg = record { pub conn: net.Conn; pub st: lexdb_store.Store; pub i
 type Prepared = record {
     stmts: []lexdb_sql.Stmt     // none (an empty query) or one
     ptypes: []int
+    cols: []lexdb_exec.OutCol   // its result's columns, as Describe found them
+    colsAt: int                 // the catalog's changes then (Store.changes), -1 not yet
 }
 
 type Portal = record {
@@ -305,7 +307,7 @@ fn (w: mut &Wire) parseMsg(ps: mut &Ps, body: &str): Result[Unit, lexdb_base.DbE
     if name != "" && ps.stmts.has(&name) {
         return Err(lexdb_base.err("42P05", "prepared statement \"" + name + "\" already exists"))
     }
-    ps.stmts.put(name, Prepared{stmts: stmts, ptypes: ptypes})
+    ps.stmts.put(name, Prepared{stmts: stmts, ptypes: ptypes, cols: [], colsAt: -1})
     w.empty('1')
     return Ok(Unit{})
 }
@@ -400,8 +402,18 @@ fn (w: mut &Wire) describeMsg(ps: mut &Ps, body: &str): Result[Unit, lexdb_base.
         w.empty('n')
         return Ok(Unit{})
     }
+    // Describing plans the query: libpq describes the portal before every
+    // execution, so the columns are kept while the catalog is unchanged.
+    let now = w.st.changes()
+    if p.colsAt == now {
+        w.rowDesc(&p.cols)
+        return Ok(Unit{})
+    }
     let cols = try lexdb_exec.describe(&w.st, &p.stmts[0], &p.ptypes)
     w.rowDesc(&cols)
+    let m = ps.stmts.atMut(stmtName)
+    m.cols = cols
+    m.colsAt = now
     return Ok(Unit{})
 }
 

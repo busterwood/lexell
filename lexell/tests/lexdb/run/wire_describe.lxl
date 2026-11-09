@@ -1,0 +1,136 @@
+// lexdb_wire: a prepared statement's Describe. libpq describes the portal
+// before every execution, so the server keeps the columns it found while
+// the catalog is unchanged. A raw client prepares "select * from t" once,
+// then runs Bind, Describe portal, Execute, Sync three times; between runs
+// a second connection inserts a row (the catalog unchanged: the same
+// columns), then drops t and makes it again with other columns: the next
+// Describe has the new ones, and the rows match them. Describe statement
+// too.
+// expect: run 1: cols a,b rows 1 width 2
+// expect: run 2: cols a,b rows 2 width 2
+// expect: run 3: cols a,c,d rows 1 width 3
+// expect: statement: cols a,c,d
+import "task"
+import "net"
+import "postgres"
+import "pgwire"
+import "binary"
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_wire"
+
+// Reads messages until ReadyForQuery: the columns of the last
+// RowDescription, the DataRows and the values in the last one.
+type Seen = record { cols: []str; rows: int; width: int; err: str }
+
+type Rx = record { buf: []byte }
+
+fn readUntilReady(c: &net.Conn, rx: mut &Rx): Seen {
+    var seen = Seen{cols: [], rows: 0, width: 0, err: ""}
+    var chunk = array(65536, byte(0))
+    while true {
+        while len(rx.buf) < 5 || len(rx.buf) < 1 + binary.readI32BE(&rx.buf, 1) {
+            let n = c.read(mut &chunk).unwrap()
+            if n == 0 { return seen }
+            for i in 0..n { append(mut &rx.buf, chunk[i]) }
+        }
+        let typ = rx.buf[0]
+        let size = binary.readI32BE(&rx.buf, 1)
+        var body: []byte = []
+        for i in 5..1 + size { append(mut &body, rx.buf[i]) }
+        var rest: []byte = []
+        for i in 1 + size..len(rx.buf) { append(mut &rest, rx.buf[i]) }
+        rx.buf = rest
+        if typ == 'T' {
+            seen.cols = []
+            let n = binary.readU16BE(&body, 0)
+            var at = 2
+            for k in 0..n {
+                var name = ""
+                while body[at] != 0 {
+                    name = name + strFromBytes(&body[at..at + 1])
+                    at += 1
+                }
+                at += 1 + 18
+                append(mut &seen.cols, name)
+            }
+        } else if typ == 'D' {
+            seen.rows += 1
+            seen.width = binary.readU16BE(&body, 0)
+        } else if typ == 'E' {
+            seen.err = "error"
+        } else if typ == 'Z' {
+            return seen
+        }
+    }
+    return seen
+}
+
+fn send(c: &net.Conn, o: &pgwire.Out) { c.write(o.bytes()).unwrap() }
+
+fn run(c: &net.Conn, buf: mut &Rx, label: str) {
+    var o = pgwire.newOut()
+    let none: []pgwire.Param = []
+    pgwire.putBind(mut &o, "", "s", &none)
+    pgwire.putDescribe(mut &o, 80, "")
+    pgwire.putExecute(mut &o, "", 0)
+    pgwire.putSync(mut &o)
+    send(c, &o)
+    let s = readUntilReady(c, buf)
+    println(label + ": cols " + strings.join(&s.cols, ",") + " rows " + s.rows.toStr() + " width " + s.width.toStr() + s.err)
+}
+
+fn client(addr: str): Result[Unit, postgres.Error] {
+    let port = addr[10..len(addr)]
+    var other = try postgres.connect("host=127.0.0.1 port=" + port + " user=test dbname=test sslmode=disable")
+    try other.exec("create table t (a int primary key, b text)")
+    try other.exec("insert into t values (1, 'one')")
+    let c = net.connect(addr).unwrap()
+    var buf = Rx{buf: []}
+    var o = pgwire.newOut()
+    let settings: []pgwire.Setting = []
+    pgwire.putStartup(mut &o, "test", "test", &settings)
+    send(&c, &o)
+    let hello = readUntilReady(&c, mut &buf)
+    var p = pgwire.newOut()
+    let none: []pgwire.Param = []
+    pgwire.putParse(mut &p, "s", "select * from t", &none)
+    pgwire.putSync(mut &p)
+    send(&c, &p)
+    let parsed = readUntilReady(&c, mut &buf)
+    run(&c, mut &buf, "run 1")
+    try other.exec("insert into t values (2, 'two')")
+    run(&c, mut &buf, "run 2")
+    try other.exec("drop table t")
+    try other.exec("create table t (a int primary key, c text, d int)")
+    try other.exec("insert into t values (1, 'x', 3)")
+    run(&c, mut &buf, "run 3")
+    var d = pgwire.newOut()
+    pgwire.putDescribe(mut &d, 83, "s")
+    pgwire.putSync(mut &d)
+    send(&c, &d)
+    let st = readUntilReady(&c, mut &buf)
+    println("statement: cols " + strings.join(&st.cols, ","))
+    return Ok(Unit{})
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        let f = s.start(lexdb_wire.acceptLoop, lexdb_wire.AcceptArg{ln: ln, st: st})
+        match client(addr) {
+            Ok(_) {}
+            Err(e) { println("client: " + e.toStr()) }
+        }
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(9), lexdb_store.Options{cacheBytes: 128 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, body).unwrap()
+}

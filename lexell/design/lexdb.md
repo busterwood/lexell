@@ -393,7 +393,7 @@ Built on 2026-11-09 on branch `lexdb`, about 6,300 lines in
 (cache, trees, transactions, log, checkpoints, recovery, snapshots),
 `lexdb_sql` (lexer, parser), `lexdb_exec` (catalog, rows, keys, planner,
 statements, sessions), `lexdb_wire` (protocol 3.0) and `lexdb` (the
-server). Tests: `python3 lexell/tests/lexdb.py` (25 programs in
+server). Tests: `python3 lexell/tests/lexdb.py` (26 programs in
 `tests/lexdb/run`, under `LXL_CHECK=1`).
 
     lexell/compiler/out/lxlc lexell/cmd/lexdb.lxl -o lexdb
@@ -1190,3 +1190,19 @@ index error, where it used to read an empty node.
 Caught: `freeNode` not telling the moved node its new frame (5 programs).
 A further 40 bytes a slot could come from moving the history lists into a
 map (most slots have none) and narrowing `SlotMeta`'s fields.
+
+**Describe once per schema.** libpq, and so pgbench's prepared mode,
+sends Bind, Describe portal, Execute, Sync for every execution, and
+Describe planned the whole query (catalog lookup included) to report its
+columns: 15% of the SQL thread, then Execute planned it again. A prepared
+statement now keeps the columns Describe found, with the catalog's write
+count then. The store counts the writes to one watched tree
+(`Store.watch`, `changes`), which the executor sets to its catalog at
+bootstrap; any DDL by any session changes the count. Describe fell to
+2.7%; 10 million rows at 128 MB: 19,800 to 21,000 selects/s.
+`wire_describe` drives the protocol by hand: one prepared statement run
+three times while another connection inserts a row (same columns), then
+drops and recreates the table with others (new columns, matching rows).
+Caught: a cache never invalidated, and a catalog never watched. Next:
+planning at Execute, 17% (9.4).
+

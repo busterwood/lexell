@@ -87,6 +87,8 @@ pub type Db = record {
     opts: Options
     fs: lexdb_disk.Fs
     data: lexdb_disk.File
+    watched: int                // a tree whose writes are counted (watch), -1 none
+    watchedWrites: int
     pool: []lexdb_page.Node     // the nodes in memory, one per loaded slot (SlotMeta.frame)
     owner: []int                // the slot of each node in pool
     meta: []SlotMeta
@@ -769,6 +771,7 @@ fn (db: mut &Db) applyDrop(tree: int) {
 }
 
 fn (db: mut &Db) applyWrite(w: &TxWrite) {
+    if w.tree == db.watched { db.watchedWrites += 1 }
     if w.op == OP_PUT { db.applyPut(w.tree, &w.key, &w.val) }
     else if w.op == OP_DEL { db.applyDel(w.tree, &w.key) }
     else if w.op == OP_CREATE { db.applyCreate(w.tree) }
@@ -1793,7 +1796,7 @@ pub fn checkpointer(st: Store): int {
 // ---- open, recovery, close
 
 fn newDb(fs: lexdb_disk.Fs, data: lexdb_disk.File, opts: Options, m: &lexdb_page.Meta): Db {
-    return Db{opts: opts, fs: fs, data: data, pool: [], owner: [], meta: [], freeSlots: [], loadedCount: 0, cacheUsed: 0, freedAt: [], hand: 0,
+    return Db{opts: opts, fs: fs, data: data, watched: -1, watchedWrites: 0, pool: [], owner: [], meta: [], freeSlots: [], loadedCount: 0, cacheUsed: 0, freedAt: [], hand: 0,
               trees: newMap(), nextTree: m.nextTree, npages: m.npages, free: [], freeAfterNext: [],
               pendingFree: [], listPages: [], ckpt: m.ckpt, durableCkpt: m.ckpt, ckptRunning: false,
               batch: [], batchCount: 0, batchNo: m.replayBatch, appliedBatch: m.replayBatch - 1,
@@ -1977,6 +1980,23 @@ pub fn (st: &Store) stats(): Stats {
                   free: len(db.free)}
     })
     return s
+}
+
+// Counts the writes to tree from now on (changes): the executor watches
+// its catalog, so what it derived from the schema (a prepared statement's
+// columns) is known to be current while the count is the same.
+pub fn (st: &Store) watch(tree: int) {
+    st.sh.with(fn(db: mut &Db) {
+        db.watched = tree
+        db.watchedWrites = 0
+    })
+}
+
+// The writes to the watched tree applied so far.
+pub fn (st: &Store) changes(): int {
+    var n = 0
+    st.sh.with(fn(db: mut &Db) { n = db.watchedWrites })
+    return n
 }
 
 // The ids of the trees, in no order.
