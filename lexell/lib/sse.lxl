@@ -1,15 +1,19 @@
-// sse: a broadcast hub for server-sent events. A Feed is shared by the
-// handlers that stream events and the tasks that publish them; each wait
-// gets the next event, or Ok(None) after its timeout so the handler can
-// write a keep-alive comment.
+// sse: a broadcast hub for server-sent events. Publishers add events to a
+// Feed; each streaming handler subscribes and reads them in order through
+// its own Cursor, so a handler that is busy writing when an event comes
+// still gets it on its next wait. A Feed keeps the last KEEP events; a
+// cursor that falls further behind skips to the oldest kept one and counts
+// the rest in missed(). A reconnecting client sends the id of the last
+// event it got (Last-Event-ID); subscribeAfter resumes after it.
 //
 //     var feed = sse.newFeed()
 //     r.handle("GET /events", events)
 //
 //     fn events(app: &App, rq: mut &http.Request, w: mut &http.Response): Result[Unit, http.Error] {
+//         var sub = app.feed.subscribeAfter(rq.headers.get("Last-Event-ID").unwrapOr(""))
 //         try w.startEvents()
 //         while true {
-//             match app.feed.wait(15000, here()) {
+//             match sub.wait(15000, here()) {
 //                 Ok(v) {
 //                     match v {
 //                         Some(ev) { try w.eventWith(ev.id, ev.name, ev.data) }
@@ -23,10 +27,13 @@
 //
 // The hub is per process: a worker's Feed is its own, so a publisher must
 // be in the same worker (or the events must come through a database, a
-// socket, or another shared source). With no waiter, one published event is
-// kept for the next wait.
+// socket, or another shared source).
 import "task"
 import "time"
+import "collections"
+
+// The events a Feed keeps for cursors that are behind.
+pub const KEEP = 64
 
 // One server-sent event: an id, a name and data.
 pub type Event = value record {
@@ -35,84 +42,147 @@ pub type Event = value record {
     pub data: str
 }
 
+// A parked wait; publish completes it to wake the waiter.
 type Waiter = record {
     id: int
-    p: task.Promise[Event]
+    p: task.Promise[int]
 }
 
 type State = record {
+    events: []Event    // the last KEEP published, oldest first
+    next: int          // the number of the next event; events[i] is next - len(events) + i
     waiters: []Waiter
     nextId: int
-    last: Option[Event]   // one slot for an event published before a waiter arrived
 }
 
-// A counted handle to one hub: copying it reaches the same waiters.
+// A counted handle to one hub: copying it reaches the same events.
 pub type Feed = value record { sh: task.Shared[State] }
 
 pub fn newFeed(): Feed {
-    return Feed{sh: task.shared(State{waiters: [], nextId: 0, last: None})}
+    return Feed{sh: task.shared(State{events: [], next: 0, waiters: [], nextId: 0})}
 }
 
-// Gives ev to every task waiting at this moment. With none waiting, ev is
-// kept in one slot, so the next wait returns it at once.
+// Adds ev to the feed and wakes every waiting cursor.
 pub fn (f: &Feed) publish(ev: Event) {
     var ws: []Waiter = []
     f.sh.with(fn(s: mut &State) {
-        if len(s.waiters) > 0 {
-            ws = replace(mut &s.waiters, [])
-            s.last = None
-        } else {
-            s.last = Some(ev)
-        }
+        append(mut &s.events, ev)
+        if len(s.events) > KEEP { let old = collections.removeAt(mut &s.events, 0) }
+        s.next += 1
+        ws = replace(mut &s.waiters, [])
     })
     while len(ws) > 0 {
         let Waiter{id: _, p: pr} = pop(mut &ws)
-        var p = pr
-        p.complete(ev)
+        pr.complete(0)
     }
 }
 
-// Waits for the next event for at most ms milliseconds. Ok(None) means the
-// time passed; Err is the task being cancelled or an enclosing deadline.
-pub fn (f: &Feed) wait(ms: int, at: Where): Result[Option[Event], task.Cancelled] {
-    var fut: Option[task.Future[Event]] = None
-    var ready: Option[Event] = None
-    var id = 0
+// A subscriber's place in a feed: it reads the events published after
+// subscribe, in order.
+pub type Cursor = value record {
+    sh: task.Shared[State]
+    next: int          // the number of the next event to read
+    missed: int
+}
+
+pub fn (f: &Feed) subscribe(): Cursor {
+    var next = 0
+    f.sh.with(fn(s: mut &State) { next = s.next })
+    return Cursor{sh: f.sh, next: next, missed: 0}
+}
+
+// A cursor for a reconnecting client: the events after the newest kept one
+// whose id is lastId (the request's Last-Event-ID). When the feed no longer
+// keeps that event (it is too old, or the id is from before a restart), the
+// cursor starts at the oldest kept event, so the client may see some again
+// but misses none the feed still has. "" is subscribe(). Resuming needs ids
+// that are unique among the feed's events.
+pub fn (f: &Feed) subscribeAfter(lastId: str): Cursor {
+    if len(lastId) == 0 { return f.subscribe() }
+    var next = 0
     f.sh.with(fn(s: mut &State) {
-        ready = replace(mut &s.last, None)
-        if ready.isNone() {
-            s.nextId += 1
-            id = s.nextId
-            let task.Handoff{promise: pr, future: fv} = task.promise[Event]()
-            append(mut &s.waiters, Waiter{id: id, p: pr})
-            fut = Some(fv)
+        let first = s.next - len(s.events)
+        next = first
+        var i = len(s.events) - 1
+        while i >= 0 {
+            if s.events[i].id == lastId {
+                next = first + i + 1
+                break
+            }
+            i -= 1
         }
     })
-    match replace(mut &ready, None) {
-        Some(ev) { return Ok(Some(ev)) }
+    return Cursor{sh: f.sh, next: next, missed: 0}
+}
+
+// The events this cursor skipped because the feed no longer kept them.
+pub fn (c: &Cursor) missed(): int { return c.missed }
+
+type Poll = record {
+    ev: Option[Event]
+    fut: Option[task.Future[int]]   // with park: woken by the next publish
+    id: int
+}
+
+// The cursor's next event if the feed has it; else, with park, a waiter
+// queued in the same step, so no publish falls between the two.
+fn (c: mut &Cursor) poll(park: bool): Poll {
+    var out = Poll{ev: None, fut: None, id: 0}
+    var next = c.next
+    var missed = 0
+    c.sh.with(fn(s: mut &State) {
+        let first = s.next - len(s.events)
+        if next < first {
+            missed = first - next
+            next = first
+        }
+        if next < s.next {
+            out.ev = Some(s.events[next - first])
+            next += 1
+        } else if park {
+            s.nextId += 1
+            let task.Handoff{promise: pr, future: fv} = task.promise[int]()
+            append(mut &s.waiters, Waiter{id: s.nextId, p: pr})
+            out.fut = Some(fv)
+            out.id = s.nextId
+        }
+    })
+    c.next = next
+    c.missed += missed
+    return out
+}
+
+// The next event, waiting for at most ms milliseconds. Ok(None) means the
+// time passed; Err is the task being cancelled or an enclosing deadline.
+pub fn (c: mut &Cursor) wait(ms: int, at: Where): Result[Option[Event], task.Cancelled] {
+    let Poll{ev: ev, fut: fut, id: id} = c.poll(true)
+    match ev {
+        Some(e) { return Ok(Some(e)) }
         None {}
     }
-    let fv = match replace(mut &fut, None) {
+    let fv = match move(fut) {
         Some(x) { x }
         None { return Ok(None) }
     }
     let began = time.monotonicNs()
     match fv.waitFor(ms, at) {
-        Ok(ev) { return Ok(Some(ev)) }
-        Err(c) {
-            // It timed out or was cancelled. If it is still queued, leave;
-            // if publish took it, the event was dropped with the future.
-            f.sh.with(fn(s: mut &State) {
+        Ok(_) { return Ok(c.poll(false).ev) }
+        Err(k) {
+            // Still queued unless a publish took it: leave the queue.
+            c.sh.with(fn(s: mut &State) {
                 for i in 0..len(s.waiters) {
                     if s.waiters[i].id == id {
-                        for j in i..len(s.waiters) - 1 { swap(mut &s.waiters, j, j + 1) }
-                        let gone = pop(mut &s.waiters)
+                        let gone = collections.removeAt(mut &s.waiters, i)
                         break
                     }
                 }
             })
-            if c.toStr() == "timeout" && (time.monotonicNs() - began) / 1000000 >= ms { return Ok(None) }
-            return Err(c)
+            // Our own timeout (not an enclosing deadline): an event that
+            // came at that moment is still the cursor's.
+            if k == task.Cancelled.Timeout && (time.monotonicNs() - began) / 1000000 >= ms {
+                return Ok(c.poll(false).ev)
+            }
+            return Err(k)
         }
     }
 }

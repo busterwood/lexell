@@ -1,17 +1,20 @@
 // httpserver: server-sent events (design/http-server.md 2.8 and S4):
 // startEvents, eventWith's id, retry, comment and keep-alive, the sse.Feed
-// hub, and an event id with a line break refused.
+// hub, a reconnect resumed from Last-Event-ID, and an event id with a line
+// break refused.
 // expect: events: 200 closed
 // expect:   200 [: welcome\n\nid: 7\nevent: tick\ndata: one\n\nretry: 2500\n\n:\n\ndata: two\ndata: lines\n\n] text/event-stream no-store
 // expect: hub: 200 closed
 // expect:   200 [id: 9\nevent: hub\ndata: from task\n\n] text/event-stream no-store
 // expect: timeout: 200 closed
 // expect:   200 [:\n\n] text/event-stream no-store
+// expect: resume: 200 closed
+// expect:   200 [id: r2\ndata: two\n\nid: r3\ndata: three\n\n] text/event-stream no-store
 // expect: bad id: 500 closed
 // expect:   500 [500 Internal Server Error\n] text/plain; charset=utf-8 no-store
 // expect: stop: 200 closed
 // expect:   200 [bye\n] text/plain; charset=utf-8
-// expect: stopped: accepted 5, requests 5, open 0, rejected 0, timeouts 0, gone 0, errors 1
+// expect: stopped: accepted 6, requests 6, open 0, rejected 0, timeouts 0, gone 0, errors 1
 import "task"
 import "net"
 import "strings"
@@ -32,9 +35,10 @@ fn events(app: &App, rq: mut &http.Request, w: mut &http.Response): Result[Unit,
 }
 
 fn hub(app: &App, rq: mut &http.Request, w: mut &http.Response): Result[Unit, http.Error] {
+    var sub = app.feed.subscribe()
     try w.startEvents()
     app.feed.publish(sse.Event{id: "9", name: "hub", data: "from task"})
-    match app.feed.wait(100, here()) {
+    match sub.wait(100, here()) {
         Ok(v) {
             match v {
                 Some(ev) { return w.eventWith(ev.id, ev.name, ev.data) }
@@ -46,8 +50,9 @@ fn hub(app: &App, rq: mut &http.Request, w: mut &http.Response): Result[Unit, ht
 }
 
 fn timeout(app: &App, rq: mut &http.Request, w: mut &http.Response): Result[Unit, http.Error] {
+    var sub = app.feed.subscribe()
     try w.startEvents()
-    match app.feed.wait(10, here()) {
+    match sub.wait(10, here()) {
         Ok(v) {
             match v {
                 Some(ev) { return w.eventWith(ev.id, ev.name, ev.data) }
@@ -56,6 +61,24 @@ fn timeout(app: &App, rq: mut &http.Request, w: mut &http.Response): Result[Unit
         }
         Err(_) { return Ok(Unit{}) }
     }
+}
+
+// Sends what the feed has after the client's Last-Event-ID, then ends.
+fn resume(app: &App, rq: mut &http.Request, w: mut &http.Response): Result[Unit, http.Error] {
+    var sub = app.feed.subscribeAfter(rq.headers.get("Last-Event-ID").unwrapOr(""))
+    try w.startEvents()
+    while true {
+        match sub.wait(0, here()) {
+            Ok(v) {
+                match v {
+                    Some(ev) { try w.eventWith(ev.id, ev.name, ev.data) }
+                    None { return Ok(Unit{}) }
+                }
+            }
+            Err(_) { return Ok(Unit{}) }
+        }
+    }
+    return Ok(Unit{})
 }
 
 fn bad(app: &App, rq: mut &http.Request, w: mut &http.Response): Result[Unit, http.Error] {
@@ -67,6 +90,7 @@ fn routes(): http.Router[App] {
     r.handle("GET /events", events)
     r.handle("GET /hub", hub)
     r.handle("GET /timeout", timeout)
+    r.handle("GET /resume", resume)
     r.handle("GET /bad", bad)
     r.handle("POST /stop", sr.stop[App])
     return r
@@ -97,6 +121,10 @@ fn main() {
         show("events", &t.talk(a, get("/events"), 3000))
         show("hub", &t.talk(a, get("/hub"), 3000))
         show("timeout", &t.talk(a, get("/timeout"), 3000))
+        feed.publish(sse.Event{id: "r1", name: "", data: "one"})
+        feed.publish(sse.Event{id: "r2", name: "", data: "two"})
+        feed.publish(sse.Event{id: "r3", name: "", data: "three"})
+        show("resume", &t.talk(a, "GET /resume HTTP/1.1\r\nHost: test\r\nLast-Event-ID: r1\r\nConnection: close\r\n\r\n", 3000))
         show("bad id", &t.talk(a, get("/bad"), 3000))
         show("stop", &t.talk(a, "POST /stop HTTP/1.1\r\nHost: test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", 3000))
         return srv.wait().unwrap()

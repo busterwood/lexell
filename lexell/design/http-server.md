@@ -1206,13 +1206,15 @@ S4 so far:
   `maxPartHeadBytes`), strict part headers through `http.parseFields`, and
   415 for another media type. The body is held in memory.
 - **SSE**: `w.eventWith(id, name, data)`, `w.retry(ms)`, `w.comment(text)`
-  and `w.keepAlive()`; `lib/sse.lxl`'s `Feed` is a broadcast hub with one
-  slot for an event published before a waiter arrives, and `wait(ms)` tells
-  a keep-alive timeout (`Ok(None)`) from cancellation or an enclosing
+  and `w.keepAlive()`; `lib/sse.lxl`'s `Feed` is a broadcast hub that keeps
+  the last 64 events, read in order through a `Cursor` per subscriber (so
+  an event published while a handler writes is not lost);
+  `subscribeAfter(lastEventId)` resumes a reconnect, and `cursor.wait(ms)`
+  tells a keep-alive timeout (`Ok(None)`) from cancellation or an enclosing
   deadline (`Err`).
 
 Tests: `http_server_forms.lxl` (binary file parts too), `http_server_sse.lxl`,
-`tls_alpn.lxl`, and `http_server_tls.lxl` (TLS 1.2/1.3
+`sse_feed.lxl`, `tls_alpn.lxl`, and `http_server_tls.lxl` (TLS 1.2/1.3
 through the test PKI, keep-alive, a body both ways, ALPN `http/1.1` with an
 `h2`-only client refused, no ALPN, and an `h2` context refused by
 `serveTls`).

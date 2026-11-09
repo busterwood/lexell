@@ -1,0 +1,113 @@
+// sse.Feed: every subscriber gets every event published after it
+// subscribed, in order, including those published while it was not
+// waiting; a cursor more than KEEP behind skips ahead and counts the rest
+// as missed; a wait times out with Ok(None), and a later wait is still woken.
+// subscribeAfter resumes after a Last-Event-ID, from the oldest kept event
+// when the id is not kept, and like subscribe for "".
+// expect: a: one two / b: one two
+// expect: busy: e1 e2 e3
+// expect: late subscriber: three
+// expect: behind: first 10 missed 10 then 11
+// expect: timeout: none
+// expect: woken: wake
+// expect: resume after r1: r2 r3 none
+// expect: resume after r3: none
+// expect: resume after unknown: r1 r2 r3 none
+// expect: resume after "": none
+import "task"
+import "sse"
+
+fn ev(s: str): sse.Event { return sse.Event{id: "", name: "", data: s} }
+
+// The data of every event the cursor has now, then "none".
+fn drain(c: mut &sse.Cursor): str {
+    var out = ""
+    while true {
+        let x = next(c, 0)
+        out = if len(out) > 0 { out + " " + x } else { x }
+        if x == "none" { return out }
+    }
+    return out
+}
+
+fn next(c: mut &sse.Cursor, ms: int): str {
+    match c.wait(ms, here()) {
+        Ok(v) {
+            match v {
+                Some(e) { return e.data }
+                None { return "none" }
+            }
+        }
+        Err(k) { return "err " + k.toStr() }
+    }
+}
+
+type Job = record { c: sse.Cursor }
+
+// Waits for two events on its own cursor.
+fn reader(j: Job): str {
+    var c = j.c
+    let x = next(mut &c, 2000)
+    let y = next(mut &c, 2000)
+    return x + " " + y
+}
+
+fn publishLater(f: sse.Feed): int {
+    let r = task.sleep(20)
+    f.publish(ev("wake"))
+    return 0
+}
+
+fn main() {
+    let feed = sse.newFeed()
+    // two subscribers waiting at once both get both events
+    let both = task.scoped(fn(s: mut &task.Scope): str {
+        let a = s.start(reader, Job{c: feed.subscribe()})
+        let b = s.start(reader, Job{c: feed.subscribe()})
+        let r = task.sleep(20)
+        feed.publish(ev("one"))
+        feed.publish(ev("two"))
+        return "a: " + a.wait().unwrap() + " / b: " + b.wait().unwrap()
+    })
+    println(both)
+
+    // events published while the subscriber is not waiting are kept for it
+    var busy = feed.subscribe()
+    feed.publish(ev("e1"))
+    feed.publish(ev("e2"))
+    feed.publish(ev("e3"))
+    println("busy: " + next(mut &busy, 0) + " " + next(mut &busy, 0) + " " + next(mut &busy, 0))
+
+    // a subscriber sees only what comes after subscribe
+    feed.publish(ev("old"))
+    var late = feed.subscribe()
+    feed.publish(ev("three"))
+    println("late subscriber: " + next(mut &late, 0))
+
+    // more than KEEP behind: skip to the oldest kept
+    var behind = feed.subscribe()
+    for i in 0..sse.KEEP + 10 { feed.publish(ev(intToStr(i))) }
+    let first = next(mut &behind, 0)
+    println("behind: first " + first + " missed " + intToStr(behind.missed()) + " then " + next(mut &behind, 0))
+
+    var quiet = feed.subscribe()
+    println("timeout: " + next(mut &quiet, 10))
+    let woke = task.scoped(fn(s: mut &task.Scope): str {
+        let p = s.start(publishLater, feed)
+        let got = next(mut &quiet, 2000)
+        let z = p.wait().unwrap()
+        return got
+    })
+    println("woken: " + woke)
+
+    let fresh = sse.newFeed()
+    for id in ["r1", "r2", "r3"] { fresh.publish(sse.Event{id: id, name: "", data: id}) }
+    var r1 = fresh.subscribeAfter("r1")
+    println("resume after r1: " + drain(mut &r1))
+    var r3 = fresh.subscribeAfter("r3")
+    println("resume after r3: " + drain(mut &r3))
+    var unknown = fresh.subscribeAfter("gone")
+    println("resume after unknown: " + drain(mut &unknown))
+    var none = fresh.subscribeAfter("")
+    println("resume after \"\": " + drain(mut &none))
+}
