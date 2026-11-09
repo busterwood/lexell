@@ -888,6 +888,59 @@ cost is the one thread's, the same budget the HTTP side uses; more cores come
 from processes (below). The libpq client had the same budget through
 libpq's asynchronous API (`PQcancel`).
 
+### With a SQL Server pool
+
+`python3 lexell/cmd/http_gate.py --servers native --db 4,16 --db-server
+sqlserver`: the same server and load, but `GET /db` takes a connection from
+a `sqlserver.Pool` (the shared pool of design/pool.md) and runs `SELECT
+CAST(@p1 AS bigint) + 1` with the request's number through sp_executesql.
+SQL Server 2025 (17.0.5035) on the same machine, over TCP on loopback with
+TLS for everything (`Encrypt=yes`), packets of 4,096 bytes; the client is
+`sqlserver` over `tds`, written in Lexell (design/tds.md). Measured
+2026-11-09.
+
+Two complete gate runs (each cell: requests/s the best of the two, with the
+latency of that same run), the one-minute load 0.35 and 3.38 at their
+starts. Each figure is one 5 s run; the pool-of-4 cells moved by up to 48%
+between the two runs, the pool-of-16 ones by up to 19%:
+
+| | Lexell, pool 4 | Lexell, pool 16 |
+|---|---:|---:|
+| 1 client: requests/s | 1,432 | 1,426 |
+| 10 clients: requests/s | 8,302 | 11,664 |
+| 100 clients: requests/s | 8,281 | 15,086 |
+| 1 client: latency p50 / p99 | 665 / 1,228 µs | 670 / 1,167 µs |
+| 10 clients: latency p50 / p99 | 1.15 / 2.15 ms | 808 / 1,356 µs |
+| 100 clients: latency p50 / p99 | 11.9 / 14.0 ms | 6.46 / 8.95 ms |
+
+Both runs passed the gate: the 10,000 idle connections still answered,
+exit 0, no leak under `LXL_CHECK=1`, every pool connection idle and nobody
+waiting. In the first run (the second's other lines were not kept)
+`/shutdown` took 0.53 to 0.54 s and an idle connection cost 15.3 KB.
+The 200 ms maxima at 10 and 100 clients are the requests that waited for a
+pool connection's login (TLS and LOGIN7), as the pool opens them when the
+load arrives.
+
+**Where the time goes.** The query, not the client. One connection running
+the same statement sequentially, 4,000 times after 200 to warm up (each
+variant in a process of its own, its CPU time from `getrusage`; two runs):
+
+| client | per query | client CPU per query |
+|---|---:|---:|
+| `sqlserver` (TDS), sp_executesql with `@p1` | 350 to 396 µs | 35 µs |
+| `sqlserver` (TDS), the same as a plain batch | 458 to 466 µs | 33 µs |
+| the ODBC client (`lib/tests/support/mssql.lxl`, ODBC Driver 18.7), `?` parameter | 736 to 788 µs | 87 to 88 µs |
+
+So about 90% of a TDS round trip is the server's (and TLS on both ends);
+the Lexell client is about twice as fast as ODBC per query and uses 2.5
+times less CPU. Against PostgreSQL's table above, one client gets about
+half the requests per second (1,430 against 2,600), which is that round
+trip: about 0.35 ms on top of the HTTP one's. With the pool of 4, four
+queries in flight at about 0.5 ms each bound it near 8,000 requests/s; with
+16, it reaches 15,000. An ODBC-backed httpd was not run: the ODBC client
+blocks a thread per call and is a test oracle, not a library module, so the
+comparison is the sequential one above.
+
 ### With worker processes
 
 `python3 lexell/cmd/http_gate.py --workers 1,2,4,8 --db 4`: `httpd ADDR POOL

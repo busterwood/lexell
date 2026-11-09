@@ -5,7 +5,7 @@ gracefully with no leaks (LXL_CHECK=1).
 
     python3 cmd/http_gate.py [--idle N] [--conns 1,10,100] [--seconds S]
                              [--servers native,c,go,node] [--compiler PATH] [--no-pin]
-                             [--db 4,16] [--client]
+                             [--db 4,16] [--db-server postgres|sqlserver] [--client]
     python3 cmd/http_gate.py --workers 1,2,4,8 [--servers native,c] [--db 4]
                              [--listen shared|reuseport|both] [--conns 256]
                              [--seconds S] [--no-kill] [--no-pin]
@@ -14,7 +14,11 @@ With --db (stage C1c), each lxl server runs once per pool size with a
 Postgres pool of that many connections ($LXL_PG_DSN, default the local
 socket), and the load is GET /db: one query through the pool per request.
 After the shutdown the server must report its pool with nothing waiting.
-The go and node references need a Postgres driver (lib/pq or pgx in the Go
+With --db-server sqlserver the pool is SQL Server's instead (lib/sqlserver,
+TDS over TLS), at $MSSQL_TEST_DSN or ~/.obo-mssql-dsn as for the live tests
+(never printed), and /db runs SELECT CAST(@p1 AS bigint) + 1 through
+sp_executesql; go and node are skipped there. The go and node references
+need a Postgres driver (lib/pq or pgx in the Go
 module cache, the pg module for node); without one they are skipped.
 
 For each server: start it on 0.0.0.0 port 0 (so that the idle connections can
@@ -251,8 +255,33 @@ def load_cpu():
     sys.exit('no CPU on a core apart from CPU %d\'s; use --no-pin' % SERVER_CPU)
 
 
+def mssql_dsn():
+    """The SQL Server connection string of the live tests: never printed."""
+    d = os.environ.get('MSSQL_TEST_DSN', '').strip()
+    if not d:
+        try:
+            with open(os.path.expanduser('~/.obo-mssql-dsn')) as f:
+                d = f.read().strip()
+        except OSError:
+            d = ''
+    if not d:
+        sys.exit('--db-server sqlserver: no $MSSQL_TEST_DSN or ~/.obo-mssql-dsn')
+    return d
+
+
+def db_env(env):
+    """httpd's database: LXL_DB, and the SQL Server DSN when it is that."""
+    env['LXL_DB'] = DB_SERVER
+    if DB_SERVER == 'sqlserver':
+        env['LXL_MSSQL_DSN'] = mssql_dsn()
+    return env
+
+
+DB_SERVER = 'postgres'
+
+
 def run_server(name, exe, args, loader, pin, pool=0):
-    env = dict(os.environ, LXL_CHECK='1', GOMAXPROCS='1')
+    env = db_env(dict(os.environ, LXL_CHECK='1', GOMAXPROCS='1'))
     cmd = list(exe) if isinstance(exe, tuple) else [exe]
     cmd += ['0.0.0.0:0'] + ([str(pool)] if pool else [])
     if pin:
@@ -386,7 +415,7 @@ def start_workers(exe, n, pool, mode, pin):
     cmd = [exe, '0.0.0.0:0', str(pool), str(n), mode]
     if pin:
         cmd = ['taskset', '-c', ','.join(str(c) for c in sorted(SERVER_CPUS[:n]))] + cmd
-    env = dict(os.environ, LXL_CHECK='1')
+    env = db_env(dict(os.environ, LXL_CHECK='1'))
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
     line = p.stdout.readline().strip()
     m = re.search(r'listening on (\S+):(\d+)$', line)
@@ -567,11 +596,15 @@ def main(argv):
     ap.add_argument('--compiler', default=os.environ.get('LXLC', DEFAULT_LXLC))
     ap.add_argument('--no-pin', action='store_true')
     ap.add_argument('--client', action='store_true', help='the load through lib/http (httpload --client)')
-    ap.add_argument('--db', default='', help='pool sizes: serve GET /db through a Postgres pool')
+    ap.add_argument('--db', default='', help='pool sizes: serve GET /db through a database pool')
+    ap.add_argument('--db-server', default='postgres', choices=['postgres', 'sqlserver'],
+                    help='the database of --db: postgres ($LXL_PG_DSN) or sqlserver ($MSSQL_TEST_DSN or ~/.obo-mssql-dsn)')
     ap.add_argument('--workers', default='', help='worker counts: the stage C2 gate (see above)')
     ap.add_argument('--listen', default='shared', help='with --workers: shared, reuseport or both')
     ap.add_argument('--no-kill', action='store_true', help='with --workers: no kill test')
     args = ap.parse_args(argv)
+    global DB_SERVER
+    DB_SERVER = args.db_server
     if args.workers:
         return main_workers(args, ap)
     args.conns = [int(c) for c in (args.conns or '1,10,100').split(',')]
@@ -596,12 +629,12 @@ def main(argv):
                 log('%s: not available, skipped' % name)
                 continue
             if pool and name not in ('native', 'c'):
-                log('%s: no Postgres driver installed, skipped' % name)
+                log('%s: no %s driver installed, skipped' % (name, 'SQL Server' if DB_SERVER == 'sqlserver' else 'Postgres'))
                 continue
             label = 'lxl ' + name if name in ('native', 'c') else name
             log('== %s: %d idle connections, load%s %s%s for %d s each%s' %
                 (label, args.idle, ' through http.Client' if args.client else '', args.conns,
-                 ' on /db, pool %d' % pool if pool else '', args.seconds,
+                 ' on /db, %s pool %d' % (DB_SERVER, pool) if pool else '', args.seconds,
                  ' (server on CPU %d, load on CPU %d)' % (SERVER_CPU, load_cpu()) if pin else ''))
             r = run_server(label, exes[key], args, exes['httpload'], pin, pool)
             results.append(r)

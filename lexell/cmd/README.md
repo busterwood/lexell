@@ -418,11 +418,11 @@ replies, or pipe/scan/eval modes.
 concurrency stages C1b, C1c and C2 (design/concurrency.md) and since stage
 S1 the example program of the server library, `lib/httpserver.lxl`
 (design/http-server.md; [../lib/README.md](../lib/README.md)). It is about
-210 lines: four handlers, a router and a call to `http.serve`. `GET /`
+250 lines: four handlers, a router and a call to `http.serve`. `GET /`
 says hello, `GET /stats` gives its counters, `GET /db` (when started with
 a pool size, `httpd ADDR POOL`: stage C1c) runs one query through a
 `postgres.Pool` of that many connections (`$LXL_PG_DSN`, default the local
-socket), and `GET /shutdown` stops it gracefully: the library's drain
+socket), or with `LXL_DB=sqlserver` through a `sqlserver.Pool` (`$LXL_MSSQL_DSN`), and `GET /shutdown` stops it gracefully: the library's drain
 closes the listener and the idle connections, lets the requests in flight
 finish (with `Connection: close`), and `serve` returns its counters, which
 the program prints. `SIGTERM` and `SIGINT` do the same.
@@ -494,6 +494,7 @@ are in [../../PERFORMANCE.md](../../PERFORMANCE.md).
     python3 cmd/http_gate.py                     # about 2 minutes
     python3 cmd/http_gate.py --idle 1000 --servers native,c --seconds 2
     python3 cmd/http_gate.py --servers native,c --db 4,16   # with Postgres
+    python3 cmd/http_gate.py --servers native --db 4,16 --db-server sqlserver   # with SQL Server
     python3 cmd/http_gate.py --workers 1,2,4,8 --db 4 --listen both   # worker processes
 
 ## tlsbench

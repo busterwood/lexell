@@ -428,7 +428,11 @@ Branch `streaming`; the shared design is design/db-streaming.md. This is
 the streaming part of T3 only. `Pool`/`Lease` came after, on the shared
 pool (design/pool.md, stage 4, 2026-11-09), and ATTENTION on a task's
 deadline or cancellation with RESETCONNECTION (design/pool.md, stage 5 and
-section 11, which settles D2); the load test is still to do.
+section 11, which settles D2), then the load test (2026-11-09):
+`http_gate.py --db 4,16 --db-server sqlserver` passes, with up to 15,086
+requests/s through a pool of 16; one connection's round trip is 350 to 396
+µs against ODBC's 736 to 788, with 35 µs of client CPU against 87
+(PERFORMANCE.md, "With a SQL Server pool"). T3 is done.
 
 - **Shape (D3):** `Conn.stream(sql, args, bind, read)` gives a `Stream[B,
   T]` holding `mut &Conn`, the borrow-class design of section 3, not the

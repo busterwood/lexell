@@ -4,7 +4,7 @@
 //
 //     httpd [ADDR [POOL [WORKERS [MODE]]]]
 //         ADDR     host:port, default 127.0.0.1:8080 (port 0: any)
-//         POOL     connections of the Postgres pool, default 0: no /db
+//         POOL     connections of the database pool, default 0: no /db
 //         WORKERS  worker processes (task.workers), default 0: serve in this
 //                  process
 //         MODE     with WORKERS: "shared" (default), one listener made before
@@ -13,16 +13,18 @@
 //                  same port (SO_REUSEPORT: the kernel spreads connections)
 //
 // The pool connects to $LXL_PG_DSN (default the local socket,
-// host=/var/run/postgresql dbname=postgres), at most POOL connections, opened
-// as requests need them. With WORKERS each worker has its own pool: up to
+// host=/var/run/postgresql dbname=postgres), or with LXL_DB=sqlserver to SQL
+// Server at $LXL_MSSQL_DSN (an ADO.NET or ODBC connection string; never
+// printed), at most POOL connections, opened as requests need them. With WORKERS each worker has its own pool: up to
 // WORKERS x POOL connections to the database in all. It prints
 // "listening on HOST:PORT" once it listens (with WORKERS, then a line saying
 // how many and how they listen).
 // Routes (GET also answers HEAD):
 //     GET /             "hello, world\n"
 //     GET /db           one query through the pool (SELECT $1::int8 + 1, $1 the
-//                       worker's request count): "db N\n"; 503 without a pool
-//                       or when the query fails
+//                       worker's request count; on SQL Server SELECT
+//                       CAST(@p1 AS bigint) + 1 through sp_executesql):
+//                       "db N\n"; 503 without a pool or when the query fails
 //     GET /stats        counters: open connections, accepted, requests; with
 //                       WORKERS those of the worker that answers ("worker I"
 //                       first): the workers share no memory
@@ -47,12 +49,15 @@ import "io"
 import "os"
 import "strings"
 import "postgres"
+import "sqlserver"
 import "httpserver" as http
+import "pool"
 
 // What every handler gets: handles only, so a copy type; each connection's
 // task has its own copy.
 type App = value record {
     db: Option[postgres.Pool]
+    ms: Option[sqlserver.Pool]        // with LXL_DB=sqlserver instead of db
     worker: int                       // the worker's index, or -1 without workers
 }
 
@@ -63,19 +68,20 @@ fn hello(app: &App, rq: mut &http.Request, w: mut &http.Response): Result[Unit, 
 }
 
 fn db(app: &App, rq: mut &http.Request, w: mut &http.Response): Result[Unit, http.Error] {
-    match app.db {
-        Some(pool) {
-            match query(&pool, rq.serverStats().requests) {
-                Ok(v) { return w.text("db " + intToStr(v) + "\n") }
-                Err(e) {
-                    w.status(503)
-                    return w.text(e.toStr() + "\n")
-                }
-            }
-        }
-        None {
+    let n = rq.serverStats().requests
+    if app.db.isNone() && app.ms.isNone() {
+        w.status(503)
+        return w.text("no database\n")
+    }
+    let r = match app.db {
+        Some(pool) { query(&pool, n) }
+        None { queryMs(&app.ms.unwrap(), n) }
+    }
+    match r {
+        Ok(v) { return w.text("db " + intToStr(v) + "\n") }
+        Err(e) {
             w.status(503)
-            return w.text("no database\n")
+            return w.text(e.toStr() + "\n")
         }
     }
 }
@@ -103,6 +109,13 @@ fn query(pool: &postgres.Pool, n: int): Result[int, postgres.Error] {
     return rows.int(0, 0)
 }
 
+// The same on SQL Server.
+fn queryMs(pool: &sqlserver.Pool, n: int): Result[int, sqlserver.Error] {
+    var c = try pool.acquire()
+    let rows = try c.conn().query("SELECT CAST(@p1 AS bigint) + 1", &[sqlserver.Value.Int(n)])
+    return rows.int(0, 0)
+}
+
 fn routes(): http.Router[App] {
     var r = http.router[App]()
     r.handle("GET /{$}", hello)
@@ -117,7 +130,18 @@ fn routes(): http.Router[App] {
 // Serves on ln until /shutdown, SIGTERM or SIGINT; then prints its counters.
 fn run(ln: net.Listener, size: int, worker: int) {
     var pool: Option[postgres.Pool] = None
-    if size > 0 {
+    var ms: Option[sqlserver.Pool] = None
+    let which = os.envOr("LXL_DB", "postgres")
+    if size > 0 && which == "sqlserver" {
+        // the error names an entry of the string by position, never its text
+        match sqlserver.newPool(os.envOr("LXL_MSSQL_DSN", ""), size) {
+            Ok(p) { ms = Some(p) }
+            Err(e) {
+                eprintln("httpd: LXL_MSSQL_DSN: " + e.toStr())
+                os.quit(1)
+            }
+        }
+    } else if size > 0 && which == "postgres" {
         match postgres.newPool(os.envOr("LXL_PG_DSN", "host=/var/run/postgresql dbname=postgres"), size) {
             Ok(p) { pool = Some(p) }
             Err(e) {
@@ -125,18 +149,22 @@ fn run(ln: net.Listener, size: int, worker: int) {
                 os.quit(1)
             }
         }
+    } else if size > 0 {
+        eprintln("httpd: LXL_DB is postgres or sqlserver")
+        os.quit(1)
     }
     var cfg = http.defaults()
     cfg.maxConns = 30000                  // the gates hold 10,000 idle connections and more
     let who = if worker >= 0 { "worker " + intToStr(worker) + ": " } else { "" }
-    match http.serve(ln, App{db: pool, worker: worker}, routes(), cfg) {
+    match http.serve(ln, App{db: pool, ms: ms, worker: worker}, routes(), cfg) {
         Ok(s) {
             var pg = ""
             match &pool {
-                Some(p) {
-                    let ps = p.stats()
-                    pg = ", pool open " + intToStr(ps.open) + " idle " + intToStr(ps.idle) + " waiting " + intToStr(ps.waiting)
-                }
+                Some(p) { pg = poolLine(p.stats()) }
+                None {}
+            }
+            match &ms {
+                Some(p) { pg = poolLine(p.stats()) }
                 None {}
             }
             println("stopped: " + who + "accepted " + intToStr(s.accepted) + ", requests " + intToStr(s.requests) +
@@ -147,6 +175,10 @@ fn run(ln: net.Listener, size: int, worker: int) {
             os.quit(1)
         }
     }
+}
+
+fn poolLine(ps: pool.PoolStats): str {
+    return ", pool open " + intToStr(ps.open) + " idle " + intToStr(ps.idle) + " waiting " + intToStr(ps.waiting)
 }
 
 fn listenOr(addr: str, reuseport: bool): net.Listener {
