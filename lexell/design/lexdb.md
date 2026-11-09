@@ -393,7 +393,7 @@ Built on 2026-11-09 on branch `lexdb`, about 6,300 lines in
 (cache, trees, transactions, log, checkpoints, recovery, snapshots),
 `lexdb_sql` (lexer, parser), `lexdb_exec` (catalog, rows, keys, planner,
 statements, sessions), `lexdb_wire` (protocol 3.0) and `lexdb` (the
-server). Tests: `python3 lexell/tests/lexdb.py` (20 programs in
+server). Tests: `python3 lexell/tests/lexdb.py` (21 programs in
 `tests/lexdb/run`, under `LXL_CHECK=1`).
 
     lexell/compiler/out/lxlc lexell/cmd/lexdb.lxl -o lexdb
@@ -495,7 +495,7 @@ start (33 threads: the main one and 32 I/O helpers); 6 MB with the
 10,000-row table; 8.7 MB under 32 writing and 8 reading clients; 111 MB
 after inserting 300,000 rows of about 80 bytes (a 34 MB data file), 112 MB
 after a full scan and a 1,000-group GROUP BY over them. Restarted on that
-database: 26 MB idle, 63 MB after a full scan. Memory is the cache, which
+database: 26 MB idle, 63 MB after a full scan (now 2.7 MB and 45 MB: 9.13). Memory is the cache, which
 grows as pages are read and is not given back; a query's own memory is
 small (rows stream in batches; groups keep running totals).
 
@@ -515,10 +515,6 @@ is the comparison to make.
    customer) as a grouped run, `WITH` before INSERT, UPDATE and DELETE.
    Choosing hash or index per row by row counts (9.9) waits for costs,
    which the user has left for now (section 0).
-2. The cache budget in bytes, not nodes (measured in 9.3: decoded nodes
-   take 1.8 to 3.3 times their page, so the default of 100,000 nodes could
-   reach 0.7 to 1.5 GB), a smaller decoded node, and why a restarted server
-   idles at 26 MB.
 3. Schemas (the user uses them extensively): `schema.table` names, the
    catalog keyed by schema, `CREATE SCHEMA`/`DROP SCHEMA`, `search_path`,
    and three-part column names (`s.t.c`) in the resolver.
@@ -838,4 +834,70 @@ is the comparison to make.
   instead of per row (41).
 - pgbench point selects over six pairs, last commit and this one: 24,339
   and 23,980 tps on average, each pair varying by up to 3,000: noise.
+
+### 9.13 The cache in bytes
+
+- **The budget.** `Options.cacheBytes` (128 MB by default; the server takes
+  `LEXDB_CACHE_MB`) replaces a count of nodes. Each loaded node counts an
+  estimate of its memory, `lexdb_page.nodeCost`, kept per slot and summed;
+  clean nodes are evicted while the sum is over the budget. The estimate
+  was fitted to measurements: a node read from disk, its entries' bytes and
+  64 bytes a key; a node changed since, its entries' bytes and 144 bytes a
+  key; 200 bytes for each child's slot. A test checked the running sum
+  against a full recount at every eviction pass over the whole suite.
+- **A smaller node.** A node read from disk keeps its keys and values as
+  slices of one string, the page's entries, not two allocations an entry.
+  A checkpoint does the same for each node it writes (repack), and its
+  write list holds those same strings, making each 4 KiB page only as it is
+  written. Since a slice keeps its whole string alive, everything the store
+  hands out (get, scans) is a copy, and so is a key that moves up into a
+  parent on a split.
+- **Writes.** A changed node leaves memory only once a checkpoint has
+  written it. When the cache is over budget, the writer starts a checkpoint
+  after an eighth of `ckptBytes` of log, not all of it. While a checkpoint
+  runs and the cache is over twice its budget, a commit that writes waits
+  for it to end (the stop line counts these: "commits held").
+- **Shutdown** waits for a running checkpoint and then takes its own. It
+  used to return at once when the checkpointer was busy, so the next start
+  replayed up to `ckptBytes` of log: that was the 26 MB idle after restart.
+- **Two bugs found on the way, both older than this change.**
+  - Evicting an internal node freed its children's pages, though the
+    parent's page still named them. A later checkpoint reused them:
+    "page 2398: type 5" after a bulk load with a small cache. The tests
+    missed it because their trees had two levels, whose root is never
+    evicted.
+  - Evicting a parent drops its children's slots, and a transaction's reads
+    were validated by slot generation. So a scan bigger than the cache always
+    conflicted. A read of a clean leaf now also notes its page and the
+    commit it saw. If the slot is gone, the read still holds unless the page
+    has been freed since (`freedAt`, 8 bytes per page). Pages are written
+    once and never in place.
+- **Measured** (300,000 rows of about 80 bytes, 34 MB of pages):
+
+| budget | bulk load, peak RSS | full scan after restart, peak RSS |
+|---|---|---|
+| before (100,000 nodes) | 112 MB | 63 MB (26 MB idle) |
+| 16 MB | 49 MB (3 commits held) | 19 MB |
+| 64 MB | 105 MB | 45 MB (all of it cached) |
+| 128 MB | 111 MB | 45 MB |
+
+  A restart idles at 2.7 MB. Reads stay within a few MB of the budget.
+  Writes reach about three times it at 16 MB: the counted cache goes up to
+  twice the budget before commits wait, and the allocator keeps freed
+  memory. With a large budget the peak is a bulk load's changed nodes and
+  their repacking at the shutdown checkpoint. pgbench point selects, HEAD
+  and this over four pairs: 23,866 and 23,318 tps on average, each pair
+  varying by over 2,000 tps: noise.
+- **Tests.** `store_evict` is new. It uses a tree of three levels (100-byte
+  keys) and a 64 KB cache. Over 30 rounds of changes and checkpoints, the
+  tree must equal a model, and again after a reopen. Whole scans commit,
+  20 of 20. A read whose leaf's slot was dropped conflicts when another
+  commit changed that leaf (20 of 20) and commits when it changed another
+  (20 of 20). Bugs put back to check the test catches them:
+  - children's pages freed on eviction: the test hangs, as the tree breaks;
+  - dropped slots always conflicting: a scan's commit fails;
+  - the page not checked: conflicted 0;
+  - freeing on change not recorded: conflicted 0.
+
+  The store tests that sized their caches in nodes use 2 KB a node now.
 

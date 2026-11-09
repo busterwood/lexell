@@ -1,0 +1,150 @@
+// lexdb_store: eviction in a tree of three levels (100-byte keys, so an
+// internal node holds few), with a cache of a few nodes: internal nodes
+// are evicted too, and with them the slots of their children.
+// - Their children's pages stay the tree's: after many commits and
+//   checkpoints (pages freed and reused) and a reopen, the tree is the model.
+// - A scan of the whole tree in a transaction commits (its leaves' slots
+//   were dropped, their pages unchanged), many times over.
+// - A read of a leaf whose slot was then dropped still conflicts when
+//   another commit changed that leaf, and does not when it changed another.
+// expect: rounds 30 ok 30, reopened ok, scans 20 committed 20, stale 20 conflicted 20, others 20 committed 20, evictions true
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_base"
+
+const N = 3000
+
+fn key(i: int): str { return strings.padLeft(i.toStr(), 100, '0') }
+
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: 64 * 1024, segBytes: 256 * 1024, ckptBytes: 32 * 1024, snapNodes: 1000}
+}
+
+fn check(st: &lexdb_store.Store, tree: int, model: &Map[str, str]): str {
+    var t = lexdb_store.begin()
+    var n = 0
+    var bad = ""
+    let r = st.scan(mut &t, tree, "", "", fn(e: &lexdb_store.Entry): bool {
+        n += 1
+        match model.get(&e.key) {
+            Some(v) { if v != e.val && bad == "" { bad = "value of " + e.key } }
+            None { if bad == "" { bad = "extra key " + e.key } }
+        }
+        return true
+    })
+    if r.isErr() { return "scan: " + r.unwrapErr().toStr() }
+    if bad != "" { return bad }
+    if n != model.size() { return "count " + n.toStr() + " want " + model.size().toStr() }
+    return ""
+}
+
+// Reads every leaf of the tree (evicting most of what the cache held).
+fn readAll(st: &lexdb_store.Store, t: mut &lexdb_store.Txn, tree: int): int {
+    var n = 0
+    st.scan(t, tree, "", "", fn(e: &lexdb_store.Entry): bool {
+        n += 1
+        return true
+    }).unwrap()
+    return n
+}
+
+fn main() {
+    let fs = lexdb_disk.sim(21)
+    var model: Map[str, str] = newMap()
+    var tree = -1
+    var rounds = 0
+    var ok = 0
+    var scans = 0
+    var committed = 0
+    var stale = 0
+    var conflicted = 0
+    var others = 0
+    var othersOk = 0
+    var evictions = 0
+    lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int {
+        var r = lexdb_base.rng(5)
+        var t0 = lexdb_store.begin()
+        tree = st.createTree(mut &t0)
+        st.commit(t0).unwrap()
+        // the tree, in commits of 300 keys, then rounds of changes
+        var i = 0
+        while i < N {
+            var t = lexdb_store.begin()
+            for j in i..i + 300 {
+                let v = "v" + j.toStr()
+                t.put(tree, key(j), v).unwrap()
+                model.put(key(j), v)
+            }
+            st.commit(t).unwrap()
+            i += 300
+        }
+        for round in 0..30 {
+            var t = lexdb_store.begin()
+            for k in 0..40 {
+                let j = r.below(N)
+                if r.below(4) == 0 {
+                    t.del(tree, key(j))
+                    model.remove(&key(j))
+                } else {
+                    let v = "r" + round.toStr() + "." + k.toStr()
+                    t.put(tree, key(j), v).unwrap()
+                    model.put(key(j), v)
+                }
+            }
+            st.commit(t).unwrap()
+            if round % 3 == 0 { st.checkpoint().unwrap() }
+            rounds += 1
+            let m = check(&st, tree, &model)
+            if m == "" { ok += 1 } else { println("round " + round.toStr() + ": " + m) }
+        }
+        // whole scans commit
+        for s in 0..20 {
+            var t = lexdb_store.begin()
+            let n = readAll(&st, mut &t, tree)
+            scans += 1
+            let c = st.commit(t)
+            if n == model.size() && c.isOk() { committed += 1 }
+        }
+        // a read, its leaf's slot dropped (a whole scan), then a change to
+        // that key or to another far from it, then the reader's commit
+        for s in 0..40 {
+            let j = r.below(N)
+            let same = s % 2 == 0
+            var t1 = lexdb_store.begin()
+            let got = st.get(mut &t1, tree, key(j)).unwrap()
+            t1.put(tree, key(N + 1), "w").unwrap()
+            var t3 = lexdb_store.begin()
+            let n = readAll(&st, mut &t3, tree)
+            st.commit(t3).unwrap()
+            var t2 = lexdb_store.begin()
+            let other = (j + N / 2) % N
+            let changed = if same { j } else { other }
+            let v = "c" + s.toStr()
+            t2.put(tree, key(changed), v).unwrap()
+            st.commit(t2).unwrap()
+            model.put(key(changed), v)
+            let res = st.commit(t1)
+            if res.isOk() { model.put(key(N + 1), "w") }
+            if same {
+                stale += 1
+                if res.isErr() { conflicted += 1 }
+            } else {
+                others += 1
+                if res.isOk() { othersOk += 1 }
+            }
+        }
+        evictions = st.stats().evictions
+        return 0
+    }).unwrap()
+    // reopened from what it wrote (the shutdown leaves the log to replay)
+    var reopened = ""
+    lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int {
+        reopened = check(&st, tree, &model)
+        return 0
+    }).unwrap()
+    println("rounds " + rounds.toStr() + " ok " + ok.toStr() + ", reopened " + (if reopened == "" { "ok" } else { reopened }) +
+            ", scans " + scans.toStr() + " committed " + committed.toStr() + ", stale " + stale.toStr() + " conflicted " +
+            conflicted.toStr() + ", others " + others.toStr() + " committed " + othersOk.toStr() + ", evictions " +
+            (evictions > 1000).toStr())
+}

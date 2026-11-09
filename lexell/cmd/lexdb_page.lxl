@@ -39,9 +39,10 @@ pub type Node = record {
     pub vals: []str
     pub kids: []int
     pub size: int        // the bytes its entries take on a page
+    pub packed: bool     // its keys and values are slices of one string (read or written as a page since it changed)
 }
 
-pub fn newLeaf(): Node { return Node{leaf: true, keys: [], vals: [], kids: [], size: 0} }
+pub fn newLeaf(): Node { return Node{leaf: true, keys: [], vals: [], kids: [], size: 0, packed: false} }
 
 pub fn leafEntry(k: &str, v: &str): int { return 4 + len(k) + len(v) }
 pub fn kidEntry(k: &str): int { return 2 + len(k) + 8 }
@@ -110,31 +111,92 @@ pub fn encodeNode(n: &Node, pages: &[]int, pageNo: int): []byte {
 }
 
 // The node on a checked page; an internal node's kids are page numbers.
+// Its keys and values are slices of one string, the page's entries (one
+// allocation, not one per key and per value: design/lexdb.md 9.13).
 pub fn decodeNode(b: &[]byte): Node {
     let n = binary.readU16LE(b, 16)
-    if int(b[12]) == T_LEAF {
-        var node = newLeaf()
-        var at = 18
-        for i in 0..n {
-            let kl = binary.readU16LE(b, at)
-            let vl = binary.readU16LE(b, at + 2)
-            append(mut &node.keys, getStr(b, at + 4, kl))
-            append(mut &node.vals, getStr(b, at + 4 + kl, vl))
+    let leaf = int(b[12]) == T_LEAF
+    var end = if leaf { 18 } else { 26 }
+    for i in 0..n {
+        end += if leaf { 4 + binary.readU16LE(b, end) + binary.readU16LE(b, end + 2) } else { 2 + binary.readU16LE(b, end) + 8 }
+    }
+    var node = Node{leaf: leaf, keys: array(n, ""), vals: [], kids: [], size: end - 18, packed: true}
+    if leaf { node.vals = array(n, "") } else { node.kids = array(n + 1, 0) }
+    unpack(mut &node, &getStr(b, 18, end - 18), true)
+    return node
+}
+
+// The bytes of n's page after its header and count: its entries (with an
+// internal node's kids' pages, pages[i] for kid i).
+pub fn nodeBody(n: &Node, pages: &[]int): str {
+    let b = encodeNode(n, pages, 0)
+    return getStr(&b, 18, n.size)
+}
+
+// Page pageNo holding a node's body (nodeBody) and count.
+pub fn bodyPage(leaf: bool, n: int, body: &str, pageNo: int): []byte {
+    var b = array(PAGE, byte(0))
+    binary.setU16LE(mut &b, 16, n)
+    putStr(mut &b, 18, body)
+    seal(mut &b, pageNo, if leaf { T_LEAF } else { T_INTERNAL })
+    return b
+}
+
+// Node n, its keys and values made slices of body, its page's body
+// (nodeBody; its kids kept): a node changed by commits, each key and value
+// its own allocation in arrays with room to spare, takes less memory
+// after this.
+pub fn repack(n: mut &Node, body: &str) {
+    var keys: []str = array(len(n.keys), "")
+    n.keys = keys
+    if n.leaf {
+        var vals: []str = array(len(n.keys), "")
+        n.vals = vals
+    } else {
+        var kids: []int = array(len(n.kids), 0)
+        for i in 0..len(n.kids) { kids[i] = n.kids[i] }
+        n.kids = kids
+    }
+    unpack(n, body, false)
+}
+
+// Fills n's keys and values (arrays of the right length) with slices of
+// body (a page from byte 18), and with kids its kids' page numbers.
+fn unpack(n: mut &Node, body: &str, kids: bool) {
+    let cnt = len(n.keys)
+    if n.leaf {
+        var at = 0
+        for i in 0..cnt {
+            let kl = binary.readU16LEStr(body, at)
+            let vl = binary.readU16LEStr(body, at + 2)
+            n.keys[i] = body[at + 4..at + 4 + kl]
+            n.vals[i] = body[at + 4 + kl..at + 4 + kl + vl]
             at += 4 + kl + vl
         }
-        node.size = at - 18
-        return node
+        n.size = at
+    } else {
+        if kids { n.kids[0] = int(binary.readU64LEStr(body, 0)) }
+        var at = 8
+        for i in 0..cnt {
+            let kl = binary.readU16LEStr(body, at)
+            n.keys[i] = body[at + 2..at + 2 + kl]
+            if kids { n.kids[i + 1] = int(binary.readU64LEStr(body, at + 2 + kl)) }
+            at += 2 + kl + 8
+        }
+        n.size = at
     }
-    var node = Node{leaf: false, keys: [], vals: [], kids: [int(binary.readU64LE(b, 18))], size: 8}
-    var at = 26
-    for i in 0..n {
-        let kl = binary.readU16LE(b, at)
-        append(mut &node.keys, getStr(b, at + 2, kl))
-        append(mut &node.kids, int(binary.readU64LE(b, at + 2 + kl)))
-        at += 2 + kl + 8
-    }
-    node.size = at - 18
-    return node
+    n.packed = true
+}
+
+// About the memory a node in the cache takes (measured, design/lexdb.md
+// 9.13): its record, and per key its strs (16 bytes each) with the
+// arrays; packed, its entries' bytes and 64 bytes a key; changed since, its
+// entries' bytes and 144 bytes a key (each key and value its own
+// allocation, arrays with spare room); per child, the slot the store
+// keeps for it (about 200 bytes, loaded or not).
+pub fn nodeCost(n: &Node): int {
+    let keys = n.size + (if n.packed { 64 } else { 144 }) * len(n.keys)
+    return 160 + keys + 200 * len(n.kids)
 }
 
 // ---- meta pages
