@@ -1,0 +1,128 @@
+// lexdb_exec: col IN (subquery), the subquery uncorrelated, as a lookup per
+// value it gives (Path.inSub) on an index or the primary key whose next
+// column is col. Each result is compared with the same query written so
+// no path can use it (region + 0 IN ...: a filter over every row):
+// - on an index, on the primary key, in a join's second table;
+// - the subquery giving nothing, 3 values 10,000 times (still lookups),
+//   NULLs, the same value twice, text and
+//   numeric values for an int column;
+// - more than IN_LOOKUP_MAX values: the whole table, in key order, and
+//   ORDER BY on the column still sorted;
+// - DELETE ... WHERE id IN (subquery);
+// - EXPLAIN shows the path, EXPLAIN ANALYZE the rows read.
+// expect: explain: scan c: index c_region lookup for each value of subquery 1
+// expect: explain pk: scan c: primary key lookup for each value of subquery 1
+// expect: index: 300 same
+// expect: pk: 3 same
+// expect: join: 300 same
+// expect: empty: 0 same
+// expect: repeated: 300 same
+// expect: repeated: 300 read
+// expect: nulls and twice: 300 same
+// expect: text values: 0 same
+// expect: numeric values: 200 same
+// expect: many values on the key: 10000 same
+// expect: many values on the index: 10000,0,99, ordered true
+// expect: read: 300 of 10000
+// expect: delete: 0, left 9997
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            var out: []str = []
+            for r in rs {
+                for row in r.rows { for v in row { append(mut &out, lexdb_exec.text(&v)) } }
+            }
+            return strings.join(&out, " ")
+        }
+        Err(e) { return e.state + " " + e.msg }
+    }
+}
+
+// the first line of a result (EXPLAIN's first table)
+fn first(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) { return lexdb_exec.text(&rs[0].rows[0][0]) }
+        Err(e) { return e.state }
+    }
+}
+
+// EXPLAIN ANALYZE's rows read of the first table
+fn readOf(s: mut &lexdb_exec.Session, sql: &str): str {
+    let l = first(s, &("explain analyze " + sql))
+    let i = strings.indexOf(l, "rows read ", 0)
+    if i < 0 { return l }
+    let rest = l[i + 10..len(l)]
+    return strings.split(&rest, ",")[0]
+}
+
+fn one(s: mut &lexdb_exec.Session, sql: &str) {
+    match s.exec(sql) {
+        Ok(_) {}
+        Err(e) { println(sql + ": " + e.state + " " + e.msg) }
+    }
+}
+
+// the count by the lookup path, and whether the filter-only query agrees
+fn cmp(s: mut &lexdb_exec.Session, label: &str, sql: &str) {
+    let a = q(s, sql)
+    let b = q(s, &strings.replaceAll(sql, "region in", "region + 0 in"))
+    let c = q(s, &strings.replaceAll(&strings.replaceAll(sql, "c.id in", "c.id + 0 in"), "where id in", "where id + 0 in"))
+    let other = if strings.contains(sql, "region in") { b } else { c }
+    println(label + ": " + a + (if a == other { " same" } else { " DIFFERENT: " + other }))
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(29), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 1024 * 1024, ckptBytes: 1024 * 1024, snapNodes: 100000}, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        one(mut &s, &"create table c (id int primary key, region int, name text)")
+        one(mut &s, &"create index c_region on c (region)")
+        one(mut &s, &"create table r (id int primary key, hot boolean, t text, n numeric)")
+        var vals: []str = []
+        for i in 0..10000 {
+            append(mut &vals, "(" + i.toStr() + ", " + (i % 100).toStr() + ", 'c" + i.toStr() + "')")
+            if len(vals) == 1000 {
+                one(mut &s, &("insert into c values " + strings.join(&vals, ", ")))
+                vals = []
+            }
+        }
+        var rv: []str = []
+        for i in 0..100 {
+            let hot = if i == 7 || i == 42 || i == 99 { "true" } else { "false" }
+            let n = if i < 2 { (i + 1).toStr() + ".0" } else { "null" }
+            append(mut &rv, "(" + i.toStr() + ", " + hot + ", '" + i.toStr() + "', " + n + ")")
+        }
+        one(mut &s, &("insert into r values " + strings.join(&rv, ", ")))
+        one(mut &s, &"create table one (id int primary key)")
+        one(mut &s, &"insert into one values (1)")
+
+        println("explain: " + first(mut &s, &"explain select name from c where region in (select id from r where hot)"))
+        println("explain pk: " + first(mut &s, &"explain select name from c where id in (select id from r where hot)"))
+        cmp(mut &s, &"index", &"select count(*) from c where region in (select id from r where hot)")
+        cmp(mut &s, &"pk", &"select count(*) from c where id in (select id from r where hot)")
+        cmp(mut &s, &"join", &"select count(*) from one, c where c.region in (select id from r where hot) and one.id = 1")
+        cmp(mut &s, &"empty", &"select count(*) from c where region in (select id from r where id < 0)")
+        cmp(mut &s, &"repeated", &"select count(*) from c where region in (select id % 3 from c)")
+        println("repeated: " + readOf(mut &s, &"select name from c where region in (select id % 3 from c)") + " read")
+        cmp(mut &s, &"nulls and twice", &"select count(*) from c where region in (select case when id < 50 then null else 42 end from r union all select 7 from one union all select 99 from one)")
+        cmp(mut &s, &"text values", &"select count(*) from c where region in (select t from r where hot union all select 'x' from one)")
+        cmp(mut &s, &"numeric values", &"select count(*) from c where region in (select n from r)")
+        cmp(mut &s, &"many values on the key", &"select count(*) from c where id in (select id * 7 % 10000 from c)")
+        let ordered = q(mut &s, &"select region from c where region in (select id from c) order by region")
+        let parts = strings.split(&ordered, " ")
+        var sorted = len(parts) == 10000
+        for i in 1..len(parts) { if strings.parseIntOpt(parts[i]).unwrapOr(-1) < strings.parseIntOpt(parts[i - 1]).unwrapOr(-1) { sorted = false } }
+        println("many values on the index: " + strings.replaceAll(q(mut &s, &"select count(*), min(region), max(region) from c where region in (select id from c)"), " ", ",") +
+                ", ordered " + sorted.toStr())
+        println("read: " + readOf(mut &s, &"select name from c where region in (select id from r where hot)") + " of " +
+                readOf(mut &s, &"select name from c where region + 0 in (select id from r where hot)"))
+        one(mut &s, &"delete from c where id in (select id from r where hot)")
+        println("delete: " + q(mut &s, &"select count(*) from c where id in (7, 42, 99)") + ", left " + q(mut &s, &"select count(*) from c"))
+        return 0
+    }).unwrap()
+}

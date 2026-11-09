@@ -393,7 +393,7 @@ Built on 2026-11-09 on branch `lexdb`, about 6,300 lines in
 (cache, trees, transactions, log, checkpoints, recovery, snapshots),
 `lexdb_sql` (lexer, parser), `lexdb_exec` (catalog, rows, keys, planner,
 statements, sessions), `lexdb_wire` (protocol 3.0) and `lexdb` (the
-server). Tests: `python3 lexell/tests/lexdb.py` (30 programs in
+server). Tests: `python3 lexell/tests/lexdb.py` (31 programs in
 `tests/lexdb/run`, under `LXL_CHECK=1`).
 
     lexell/compiler/out/lxlc lexell/cmd/lexdb.lxl -o lexdb
@@ -511,8 +511,8 @@ is the comparison to make.
    cache miss on the SQL thread; for the whole event loop, sockets too.
 2. Conflicts per row, not per leaf (built: 9.19).
 3. Smaller items: a correlated subquery's value as a lookup's key (now it
-   is only a filter), a small uncorrelated IN set as an IN-list
-   lookup, correlated subqueries in GROUP BY and in aggregates' arguments,
+   is only a filter), correlated subqueries in GROUP BY and in aggregates' arguments,
+   ORDER BY inside an aggregate (`string_agg(x, ',' ORDER BY x)`),
    hashing a correlated scalar subquery with an aggregate (a count per
    customer) as a grouped run, `WITH` before INSERT, UPDATE and DELETE.
    Choosing hash or index per row by row counts (9.9) waits for costs,
@@ -1419,4 +1419,47 @@ ignored, the plan's key without the path, an index outside its table's
 schema, DROP SCHEMA ignoring its tables, ROLLBACK keeping the path, a
 block not given the path at BEGIN or at a SET in it, the wire's
 description kept across a path change, CREATE ignoring the path.
+
+### 9.21 IN (subquery) as lookups
+
+`col IN (SELECT ...)`, the subquery uncorrelated, was a filter over a full
+scan even with an index on col. Such a subquery already runs once before
+the tables are read, so its values are known when each level builds its
+scans.
+
+- **The path.** `choosePath` takes it as it takes an IN list: as the
+  column after the equalities, on the primary key or an index
+  (`Path.inSub`). `pathScans` makes a lookup per distinct value, in key
+  order. The condition stays a filter, so what IN means (NULLs, numbers
+  against text) is decided as before. A value not of the column's type is
+  left out of the lookups rather than being an error.
+- **Too many values.** There are no row counts yet to choose by. Past
+  `IN_LOOKUP_MAX` (1,000) distinct values the level reads the whole table
+  instead (`Scan.whole`), not the whole index. Such a path never serves an
+  ORDER BY, since that read is in primary key order.
+- **Measured.** In 10,000 rows, `region IN (3 values)` reads 300 rows
+  instead of 10,000.
+
+`exec_insub` compares each result with the same query written so no path
+can use it (`region + 0 IN ...`):
+
+- on an index, on the primary key, in a join's second table;
+- the subquery giving nothing, 3 values 10,000 times (still lookups),
+  NULLs, a value twice, text, numeric and unconvertible values for an
+  int column;
+- more than 1,000 values on the key and on the index, with ORDER BY still
+  sorted;
+- DELETE with it, and EXPLAIN.
+
+Caught, each put back:
+
+- no fallback;
+- the path serving ORDER BY;
+- an unconvertible value as an error;
+- values kept with duplicates;
+- the path never chosen.
+
+Not caught, as expected: the fallback reading the whole index (the same
+rows, only slower), and NULLs looked up (the subquery's values never hold
+them).
 

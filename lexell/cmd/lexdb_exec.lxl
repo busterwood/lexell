@@ -1128,13 +1128,19 @@ type Path = record {
     desc: bool          // read backward (ORDER BY ... DESC, MAX)
     noNulls: bool       // an index path: leave out its next column's NULLs (MIN, MAX)
     ins: []Expr         // x IN (...) on the column after the equalities: a lookup per value
+    inSub: int          // or x IN (subquery), uncorrelated: a lookup per value it gives; -1 none
 }
+
+// An IN subquery's values looked up one by one at most; past this many its
+// path reads the whole table instead (no row counts to choose by yet).
+const IN_LOOKUP_MAX: int = 1000
 
 type Scan = record {
     empty: bool         // a bound is NULL: no row can match
     point: bool         // one primary key (lo)
     lo: str             // the keys [lo, hi) of the primary key or the index; hi "" for the end
     hi: str
+    whole: bool         // the whole table, in primary key order, whatever the path's index
 }
 
 // One table of a query, in FROM order. Its rows join the rows of the tables
@@ -1676,6 +1682,22 @@ fn inList(cs: &[]Expr, col: &str, k: int, q: &Query): []Expr {
     return []
 }
 
+// col IN (subquery), the subquery uncorrelated (run once, before the
+// tables are read): its number, else -1.
+fn inSubOf(cs: &[]Expr, col: &str): int {
+    for c in cs {
+        match c {
+            Expr.Call(n, args, _) {
+                if n == "#in" && len(args) == subFixed(&n) {
+                    match args[3] { Expr.Col(x) { if x == col { return litInt(&args[0]) } } else {} }
+                }
+            }
+            else {}
+        }
+    }
+    return -1
+}
+
 // LIKE 'abc%' on a text column: the strings from 'abc' to 'abd'.
 fn likeBounds(c: &Expr, col: &str, q: &Query, out: mut &[]Bound) {
     match c {
@@ -1735,7 +1757,7 @@ fn keyCols(t: &Table, index: int): []int {
 // the next column; the primary key wins a tie. Nothing: a full scan.
 fn choosePath(q: &Query, k: int, cs: &[]Expr, params: &[]Val): Path {
     let lv = &q.levels[k]
-    var best = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: []}
+    var best = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1}
     var bestScore = 0
     for c0 in 0..len(lv.t.indexes) + 1 {
         let c = c0 - 1
@@ -1744,6 +1766,7 @@ fn choosePath(q: &Query, k: int, cs: &[]Expr, params: &[]Val): Path {
         var eqs: []Expr = []
         var rng: []Bound = []
         var ins: []Expr = []
+        var inSub = -1
         for ci in cols {
             let name = lv.alias + "." + lv.t.cols[ci].name
             var bs = bounds(cs, &name, k, q)
@@ -1751,22 +1774,24 @@ fn choosePath(q: &Query, k: int, cs: &[]Expr, params: &[]Val): Path {
             for i in 0..len(bs) { if bs[i].op == "=" && eqAt < 0 { eqAt = i } }
             if eqAt < 0 {
                 ins = inList(cs, &name, k, q)
-                if len(ins) == 0 { rng = bs }
+                if len(ins) == 0 { inSub = inSubOf(cs, &name) }
+                if len(ins) == 0 && inSub < 0 { rng = bs }
                 break
             }
             append(mut &eqs, replace(mut &bs[eqAt].val, Expr.Lit(Val.Null)))
         }
         // an IN list counts as an equality; the full key by one is a lookup per value
-        var score = 2 * (len(eqs) + (if len(ins) > 0 { 1 } else { 0 })) + (if len(rng) > 0 { 1 } else { 0 })
+        let hasIn = len(ins) > 0 || inSub >= 0
+        var score = 2 * (len(eqs) + (if hasIn { 1 } else { 0 })) + (if len(rng) > 0 { 1 } else { 0 })
         if c >= 0 && lv.t.indexes[c].pred.isSome() { score += 1 }      // filtered: fewer rows
         if len(eqs) == len(cols) {
             if c < 0 { score = 1000 } else if lv.t.indexes[c].unique { score = 999 }
-        } else if len(ins) > 0 && len(eqs) + 1 == len(cols) {
+        } else if hasIn && len(eqs) + 1 == len(cols) {
             if c < 0 { score = 500 } else if lv.t.indexes[c].unique { score = 499 }
         }
         if score > bestScore {
             bestScore = score
-            best = Path{index: c, eqs: eqs, rng: rng, desc: false, noNulls: false, ins: ins}
+            best = Path{index: c, eqs: eqs, rng: rng, desc: false, noNulls: false, ins: ins, inSub: inSub}
         }
     }
     return best
@@ -1793,7 +1818,10 @@ fn boundType(t: &lexdb_sql.TypeName): lexdb_sql.TypeName {
 // The keys a path covers: with an IN list, a lookup (or range) per value,
 // in key order (backward for a backward path).
 fn pathScans(t: &Table, p: &Path, env: &Env): Result[[]Scan, DbErr] {
-    if len(p.ins) == 0 { return Ok([try pathScan(t, p, env)]) }
+    if len(p.ins) == 0 && p.inSub < 0 { return Ok([try pathScan(t, p, env)]) }
+    if p.inSub >= 0 && len(env.subs[p.inSub].vals) > IN_LOOKUP_MAX {
+        return Ok([Scan{empty: false, point: false, lo: "", hi: "", whole: true}])
+    }
     let ix = p.index >= 0
     let cols = keyCols(t, p.index)
     var prefix = newStrBuf()
@@ -1804,9 +1832,21 @@ fn pathScans(t: &Table, p: &Path, env: &Env): Result[[]Scan, DbErr] {
     }
     let pre = prefix.toStr()
     let typ = boundType(&t.cols[cols[len(p.eqs)]].typ)
+    var vs: []Val = []
+    if p.inSub >= 0 {
+        // the subquery's values; one not of the column's type is left to
+        // the condition, which stays (it decides what IN means)
+        for x in env.subs[p.inSub].vals {
+            match coerce(x, &typ) {
+                Ok(v) { append(mut &vs, v) }
+                Err(_) {}
+            }
+        }
+    } else {
+        for x in p.ins { append(mut &vs, try coerce(try eval(&x, env), &typ)) }
+    }
     var keys: []str = []
-    for x in p.ins {
-        let v = try coerce(try eval(&x, env), &typ)
+    for v in vs {
         if isNull(&v) { continue }
         var kb = newStrBuf()
         kb.add(pre)
@@ -1818,8 +1858,8 @@ fn pathScans(t: &Table, p: &Path, env: &Env): Result[[]Scan, DbErr] {
     var out: []Scan = []
     for i in 0..len(keys) {
         if i > 0 && keys[i] == keys[i - 1] { continue }
-        if point { append(mut &out, Scan{empty: false, point: true, lo: keys[i], hi: ""}) } else {
-            append(mut &out, Scan{empty: false, point: false, lo: keys[i], hi: succ(&keys[i])})
+        if point { append(mut &out, Scan{empty: false, point: true, lo: keys[i], hi: "", whole: false}) } else {
+            append(mut &out, Scan{empty: false, point: false, lo: keys[i], hi: succ(&keys[i]), whole: false})
         }
     }
     if p.desc {
@@ -1831,7 +1871,7 @@ fn pathScans(t: &Table, p: &Path, env: &Env): Result[[]Scan, DbErr] {
 }
 
 fn pathScan(t: &Table, p: &Path, env: &Env): Result[Scan, DbErr] {
-    let none = Scan{empty: true, point: false, lo: "", hi: ""}
+    let none = Scan{empty: true, point: false, lo: "", hi: "", whole: false}
     let ix = p.index >= 0
     let cols = keyCols(t, p.index)
     var prefix = newStrBuf()
@@ -1841,7 +1881,7 @@ fn pathScan(t: &Table, p: &Path, env: &Env): Result[Scan, DbErr] {
         encPart(mut &prefix, &v, ix)
     }
     let pre = prefix.toStr()
-    if !ix && len(p.eqs) == len(cols) { return Ok(Scan{empty: false, point: true, lo: pre, hi: ""}) }
+    if !ix && len(p.eqs) == len(cols) { return Ok(Scan{empty: false, point: true, lo: pre, hi: "", whole: false}) }
     var lo = pre
     var hi = if len(pre) > 0 { succ(&pre) } else { "" }
     if len(p.rng) > 0 {
@@ -1873,7 +1913,7 @@ fn pathScan(t: &Table, p: &Path, env: &Env): Result[Scan, DbErr] {
             if hi == "" || nk < hi { hi = nk }
         }
     }
-    return Ok(Scan{empty: false, point: false, lo: lo, hi: hi})
+    return Ok(Scan{empty: false, point: false, lo: lo, hi: hi, whole: false})
 }
 
 const BATCH = 256
@@ -1908,7 +1948,8 @@ fn fetch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, p: &Path,
         }
         return Ok(Unit{})
     }
-    let tree = if p.index >= 0 { t.indexes[p.index].tree } else { t.tree }
+    let byIndex = p.index >= 0 && !sc.whole
+    let tree = if byIndex { t.indexes[p.index].tree } else { t.tree }
     var vals: []str = []
     var last = ""
     if p.desc {
@@ -1932,7 +1973,7 @@ fn fetch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, p: &Path,
         if len(vals) < BATCH { cur.done = true } else { cur.at = after(&last) }
     }
     for v in vals {
-        if p.index < 0 {
+        if !byIndex {
             append(out, try decRow(&v, n))
         } else {
             match try st.get(txn, t.tree, v) {
@@ -1954,7 +1995,7 @@ fn allTrue(cs: &[]Expr, cols: &[]lexdb_sql.ColDef, row: &[]Val, params: &[]Val):
 }
 
 fn newLevel(t: Table, alias: str, join: int, first: int): Level {
-    return Level{t: t, alias: alias, join: join, first: first, path: Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: []}, cond: [],
+    return Level{t: t, alias: alias, join: join, first: first, path: Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1}, cond: [],
                  post: [], local: [], perRow: true, hashCols: [], hashVals: [], src: -1, work: -1, lateral: false}
 }
 
@@ -2089,14 +2130,14 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
     for k in 0..nl {
         let m = replace(mut &ms[k], [])
         // a subquery's rows have no key: read them all
-        var path = if q.levels[k].virt() { Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: []} } else {
+        var path = if q.levels[k].virt() { Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1} } else {
             choosePath(&q, k, &m, params)
         }
         var perRow = k == 0 || q.pathOuter(&path) || q.levels[k].lateral
         let right = keepsRight(q.levels[k].join)
         if right {
             // Every row of it is kept: read it all once, and remember which joined.
-            path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: []}
+            path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1}
             perRow = false
         }
         var local: []Expr = []
@@ -2405,10 +2446,11 @@ type SubRes = record {
     hasNull: bool
     groups: Map[str, int]       // hashed: key -> 1 rows, 3 rows and a NULL value (IN)
     data: [][]Val               // in FROM: its rows
+    vals: []Val                 // IN: its distinct values not NULL, IN_LOOKUP_MAX + 1 at most (Path.inSub)
 }
 
 fn emptyRes(): SubRes {
-    return SubRes{val: Val.Null, rows: 0, set: newMap(), numeric: false, hasNull: false, groups: newMap(), data: []}
+    return SubRes{val: Val.Null, rows: 0, set: newMap(), numeric: false, hasNull: false, groups: newMap(), data: [], vals: []}
 }
 
 // The queries being planned, outermost first.
@@ -2963,7 +3005,10 @@ fn runSub(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sp: &SubPlan, param
                 continue
             }
             match setKey(&r[0], out.numeric) {
-                Some(k) { out.set.put(k, 1) }
+                Some(k) {
+                    if out.set.get(&k).isNone() && len(out.vals) <= IN_LOOKUP_MAX { append(mut &out.vals, r[0]) }
+                    out.set.put(k, 1)
+                }
                 None {}
             }
         }
@@ -3150,8 +3195,9 @@ fn pathText(lv: &Level): str {
     if lv.work >= 0 { return "rows of the working table" }
     let p = &lv.path
     let cols = keyCols(&lv.t, p.index)
-    if len(p.ins) > 0 {
-        let each = " for each of " + len(p.ins).toStr() + " values" + (if p.desc { " backward" } else { "" })
+    if len(p.ins) > 0 || p.inSub >= 0 {
+        let many = if p.inSub >= 0 { " value of subquery " + (p.inSub + 1).toStr() } else { " of " + len(p.ins).toStr() + " values" }
+        let each = " for each" + many + (if p.desc { " backward" } else { "" })
         if p.index < 0 { return "primary key " + (if len(p.eqs) + 1 == len(cols) { "lookup" } else { "range" }) + each }
         return "index " + lexdb_sql.baseName(&lv.t.indexes[p.index].name) + (if lv.t.indexes[p.index].pred.isSome() { " (filtered)" } else { "" }) +
                " lookup" + each
@@ -3456,8 +3502,8 @@ fn createIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
         None {}
     }
     let ix = Index{name: ixKey, tree: st.createTree(txn), cols: cols, unique: s.unique, pred: pred}
-    let path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: []}
-    let sc = Scan{empty: false, point: false, lo: "", hi: ""}
+    let path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1}
+    let sc = Scan{empty: false, point: false, lo: "", hi: "", whole: false}
     var cur = newCursor()
     while !cur.done {
         var batch: [][]Val = []
@@ -4206,6 +4252,7 @@ fn orderCols(q: &Query, order: &[]Expr, items: &[]lexdb_sql.OrderItem, exprs: &[
 // they follow its key (an index's key ends with the primary key) after its
 // equalities, skipping columns held equal.
 fn servesOrder(t: &Table, p: &Path, cols: &[]int): bool {
+    if p.inSub >= 0 { return false }        // past IN_LOOKUP_MAX it reads in primary key order
     var key = keyCols(t, p.index)
     if p.index >= 0 { for c in t.pk { append(mut &key, c) } }
     if p.index < 0 && len(p.eqs) == len(t.pk) { return true }     // one row
@@ -4227,7 +4274,7 @@ fn orderedScan(q: &Query, cols: &[]int, params: &[]Val): Option[int] {
     let t = &q.levels[0].t
     for c0 in 0..len(t.indexes) + 1 {
         if !q.usable(0, c0 - 1, &q.levels[0].cond, params) { continue }
-        let p = Path{index: c0 - 1, eqs: [], rng: [], desc: false, noNulls: false, ins: []}
+        let p = Path{index: c0 - 1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1}
         if servesOrder(t, &p, cols) { return Some(c0 - 1) }
     }
     return None
@@ -4323,7 +4370,7 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         if dir >= 0 {
             var ix = path.index
             var use = servesOrder(t, path, &cols)
-            let full = len(path.eqs) == 0 && len(path.rng) == 0 && len(path.ins) == 0
+            let full = len(path.eqs) == 0 && len(path.rng) == 0 && len(path.ins) == 0 && path.inSub < 0
             // A full scan changes to an index for its order only when that
             // saves reading everything: a LIMIT, or MIN/MAX. Else a sort is
             // cheaper than a lookup per row.
