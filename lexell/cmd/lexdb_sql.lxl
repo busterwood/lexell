@@ -501,8 +501,25 @@ fn (p: mut &P) cmpExpr(): Result[Expr, lexdb_base.DbErr] {
     if t.kind == T_OP && (t.text == "=" || t.text == "<>" || t.text == "!=" || t.text == "<" || t.text == "<=" ||
                           t.text == ">" || t.text == ">=") {
         p.pos += 1
-        let r = try p.catExpr()
         let op = if t.text == "!=" { "<>" } else { t.text }
+        let q = p.peek()
+        if q.kind == T_IDENT && (q.text == "any" || q.text == "some" || q.text == "all") && p.peekAt(1).kind == T_OP && p.peekAt(1).text == "(" {
+            // x op ANY (array), x op ALL (array): the call "any op" or "all op"
+            // (9.28); with a subquery, = ANY is IN and <> ALL is NOT IN
+            let all = q.text == "all"
+            p.pos += 2
+            if p.isKw("select") || p.isKw("with") {
+                if (op == "=" && !all) || (op == "<>" && all) {
+                    let i = try p.subquery(SUB_IN)
+                    return Ok(negate(all, Expr.Call("#in", [Expr.Lit(Val.Int(i)), e], false)))
+                }
+                return Err(lexdb_base.err("0A000", "lexdb: a subquery after ANY or ALL is supported with = ANY and <> ALL only"))
+            }
+            let arr = try p.expr()
+            try p.expectKw(")")
+            return Ok(Expr.Call((if all { "all " } else { "any " }) + op, [e, arr], false))
+        }
+        let r = try p.catExpr()
         return Ok(Expr.Bin(op, e, r))
     }
     // [NOT] LIKE, ILIKE, IN, BETWEEN
@@ -1514,6 +1531,9 @@ pub fn typeText(t: &TypeName): str {
 fn quoteIdent(n: &str): str { return "\"" + strings.replaceAll(n, "\"", "\"\"") + "\"" }
 
 // SQL text that parses back to x.
+// x op ANY (array), x op ALL (array): the call's name, "any =", "all <>".
+pub fn isQuant(n: &str): bool { return strings.startsWith(n, "any ") || strings.startsWith(n, "all ") }
+
 pub fn exprText(x: &Expr): str {
     match x {
         Expr.Lit(v) {
@@ -1557,6 +1577,10 @@ pub fn exprText(x: &Expr): str {
                 return "(" + exprText(&args[0]) + " in (" + strings.join(&parts, ", ") + "))"
             }
             if n == "distinct from" { return "(" + exprText(&args[0]) + " is distinct from " + exprText(&args[1]) + ")" }
+            if isQuant(&n) {
+                let sp = strings.indexOf(n, " ", 0)
+                return "(" + exprText(&args[0]) + " " + n[sp + 1..len(n)] + " " + n[0..sp] + " (" + exprText(&args[1]) + "))"
+            }
             if n == "case" || n == "case else" {
                 var out = "(case"
                 var i = 0

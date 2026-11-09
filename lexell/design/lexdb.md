@@ -393,7 +393,7 @@ Built on 2026-11-09 on branch `lexdb`, about 6,300 lines in
 (cache, trees, transactions, log, checkpoints, recovery, snapshots),
 `lexdb_sql` (lexer, parser), `lexdb_exec` (catalog, rows, keys, planner,
 statements, sessions), `lexdb_wire` (protocol 3.0) and `lexdb` (the
-server). Tests: `python3 lexell/tests/lexdb.py` (37 programs in
+server). Tests: `python3 lexell/tests/lexdb.py` (38 programs in
 `tests/lexdb/run`, under `LXL_CHECK=1`).
 
     lexell/compiler/out/lxlc lexell/cmd/lexdb.lxl -o lexdb
@@ -534,9 +534,11 @@ is the comparison to make.
    Waiting for row counts (costs, which the user has left for now: section
    0): choosing hash or index per row (9.9), and when an IN subquery's
    values are too many for lookups (now a fixed 1,000: 9.21).
-   Functions in FROM and arrays (built: 9.27). Not done:
-   - `= ANY(array)` and `<> ALL(array)`, the usual way to pass a list of
-     keys as one parameter (`WHERE id = ANY($1)`);
+   Functions in FROM and arrays (built: 9.27), `op ANY/ALL (array)`
+   (built: 9.28). Not done:
+   - `ANY`/`ALL` with a subquery other than `= ANY` and `<> ALL` (`x < ANY
+     (SELECT ...)`: 0A000);
+   - an index range from `col < ANY(array)` (only `= ANY` is a lookup);
    - subscripts (`a[1]`), `array_length`, `cardinality`, `array_agg`,
      `@>`, and array comparisons other than equality (now: by text);
    - functions in the select list (`SELECT generate_series(1, 3)`);
@@ -1780,4 +1782,53 @@ Caught, each put back:
 - functions not LATERAL;
 - the alias not the column;
 - elements unchecked.
+
+### 9.28 op ANY (array) and op ALL (array)
+
+`WHERE id = ANY($1)` passes a list of keys as one parameter, one plan for
+any number of them (an IN list's plan is per length).
+
+- **Parsing.** After a comparison operator, `ANY`, `SOME` or `ALL` and a
+  parenthesis: with an array, the call `"any op"` or `"all op"` (x,
+  array); `exprText` writes it back, so filtered-index predicates and
+  aggregate keys keep it. With a subquery, `= ANY` is `IN` and `<> ALL`
+  is `NOT IN`; other operators with a subquery are refused (0A000).
+- **Values**, as PostgreSQL: ANY is true if one comparison is, else NULL
+  if an element or x is NULL, else false; an empty array gives false
+  (ALL: true) whatever x is. Elements are read as x's type.
+- **Lookups.** `col = ANY(array)`, the array from constants, parameters
+  or earlier tables, is a lookup per element on the column's key or
+  index (`Path.inArr`, beside the IN list and the IN subquery), shown
+  as "lookup for each element of the array". Elements not of the
+  column's type are skipped there and the condition, which stays,
+  decides. From an earlier table (`JOIN t ON t.id = ANY(p.ids)`) it is
+  recomputed per row.
+- **Parameters.** `col op ANY($1)` describes `$1` as the array of the
+  column's type, so drivers send an array (binary, as pgx does, or text).
+
+`exec_any` covers:
+
+- ANY, SOME and ALL with each kind of answer, NULLs and empty arrays;
+- text elements, quoting and case;
+- lookups by key and by index (2 rows read of 10,000), with a repeated
+  and a missing key;
+- a parameter: its type, and one plan kept;
+- `<> ALL`; `= ANY` and `<> ALL` with subqueries, and the refusal;
+- an array column joined per row;
+- a filtered index whose predicate uses ANY, and a row inserted later;
+- errors.
+
+`WHERE id = ANY($1)` through the server with a binary int4 array from a
+raw-protocol client: `$1` described as int4[], and the rows found.
+
+Caught, each put back:
+
+- NULL elements ignored;
+- an empty array NULL;
+- ALL as ANY;
+- never a lookup;
+- no array parameter type;
+- the array not recomputed per row;
+- `<> ALL (subquery)` as IN;
+- exprText losing the operator.
 

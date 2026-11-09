@@ -290,6 +290,39 @@ pub fn arrayText(vals: &[]Val): str {
     return b.toStr()
 }
 
+// x op ANY (array), x op ALL (array), as PostgreSQL: ANY is true if one
+// comparison is, else NULL if one is NULL, else false (an empty array:
+// false); ALL is false if one is false, else NULL if one is NULL, else true.
+// The elements are read as x's type.
+fn quantified(name: &str, x: &Val, arr: &Val): Result[Val, DbErr] {
+    let all = strings.startsWith(name, "all ")
+    let op = name[4..len(name)]
+    let a = match arr {
+        Val.Text(t) { t }
+        Val.Null { return Ok(Val.Null) }
+        else { return Err(e("42809", "op ANY/ALL (array) requires an array on the right")) }
+    }
+    let parts = try arrayParts(&a)
+    if len(parts) == 0 { return Ok(Val.Bool(all)) }
+    if isNull(x) { return Ok(Val.Null) }
+    let ty = oidType(if kindOf(x) == lexdb_sql.K_INT { lexdb_sql.OID_INT8 } else { kindOid(x) })
+    var sawNull = false
+    for part in parts {
+        match part {
+            None { sawNull = true }
+            Some(p) {
+                let v = try coerce(Val.Text(p), &ty)
+                let c = try compare(x, &v)
+                let ok = if op == "=" { c == 0 } else if op == "<>" { c != 0 } else if op == "<" { c < 0 } else if op == "<=" { c <= 0 } else if op == ">" { c > 0 } else { c >= 0 }
+                if ok && !all { return Ok(Val.Bool(true)) }
+                if !ok && all { return Ok(Val.Bool(false)) }
+            }
+        }
+    }
+    if sawNull { return Ok(Val.Null) }
+    return Ok(Val.Bool(all))
+}
+
 // A value's type OID by its kind (for messages).
 fn kindOid(v: &Val): int {
     match v {
@@ -854,6 +887,7 @@ fn substr(s: str, from: int, count: int, hasCount: bool): Result[str, DbErr] {
 
 fn call(name: &str, vs: &[]Val): Result[Val, DbErr] {
     if name == "array" { return Ok(Val.Text(arrayText(vs))) }
+    if lexdb_sql.isQuant(name) { return quantified(name, &vs[0], &vs[1]) }
     let n = len(vs)
     if name == "in" {
         // x IN (a, b): true if one equals x; else NULL if x or one of them is NULL
@@ -1354,6 +1388,7 @@ type Path = record {
     noNulls: bool       // an index path: leave out its next column's NULLs (MIN, MAX)
     ins: []Expr         // x IN (...) on the column after the equalities: a lookup per value
     inSub: int          // or x IN (subquery), uncorrelated: a lookup per value it gives; -1 none
+    inArr: []Expr       // or x = ANY (array): its one expression, a lookup per element (9.28); [] none
 }
 
 // An IN subquery's values looked up one by one at most; past this many its
@@ -1923,6 +1958,21 @@ fn inList(cs: &[]Expr, col: &str, k: int, q: &Query): []Expr {
     return []
 }
 
+// col = ANY (array), the array from the tables before level k: [it], else [].
+fn anyOf(cs: &[]Expr, col: &str, k: int, q: &Query): []Expr {
+    for c in cs {
+        match c {
+            Expr.Call(n, args, _) {
+                if n == "any =" && len(args) == 2 && q.keyBefore(&args[1], k) {
+                    match args[0] { Expr.Col(x) { if x == col { return [clone(&args[1])] } } else {} }
+                }
+            }
+            else {}
+        }
+    }
+    return []
+}
+
 // col IN (subquery), the subquery uncorrelated (run once, before the
 // tables are read): its number, else -1.
 fn inSubOf(cs: &[]Expr, col: &str): int {
@@ -1998,7 +2048,7 @@ fn keyCols(t: &Table, index: int): []int {
 // the next column; the primary key wins a tie. Nothing: a full scan.
 fn choosePath(q: &Query, k: int, cs: &[]Expr, params: &[]Val): Path {
     let lv = &q.levels[k]
-    var best = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1}
+    var best = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: []}
     var bestScore = 0
     for c0 in 0..len(lv.t.indexes) + 1 {
         let c = c0 - 1
@@ -2008,6 +2058,7 @@ fn choosePath(q: &Query, k: int, cs: &[]Expr, params: &[]Val): Path {
         var rng: []Bound = []
         var ins: []Expr = []
         var inSub = -1
+        var inArr: []Expr = []
         for ci in cols {
             let name = lv.alias + "." + lv.t.cols[ci].name
             var bs = bounds(cs, &name, k, q)
@@ -2016,13 +2067,14 @@ fn choosePath(q: &Query, k: int, cs: &[]Expr, params: &[]Val): Path {
             if eqAt < 0 {
                 ins = inList(cs, &name, k, q)
                 if len(ins) == 0 { inSub = inSubOf(cs, &name) }
-                if len(ins) == 0 && inSub < 0 { rng = bs }
+                if len(ins) == 0 && inSub < 0 { inArr = anyOf(cs, &name, k, q) }
+                if len(ins) == 0 && inSub < 0 && len(inArr) == 0 { rng = bs }
                 break
             }
             append(mut &eqs, replace(mut &bs[eqAt].val, Expr.Lit(Val.Null)))
         }
         // an IN list counts as an equality; the full key by one is a lookup per value
-        let hasIn = len(ins) > 0 || inSub >= 0
+        let hasIn = len(ins) > 0 || inSub >= 0 || len(inArr) > 0
         var score = 2 * (len(eqs) + (if hasIn { 1 } else { 0 })) + (if len(rng) > 0 { 1 } else { 0 })
         if c >= 0 && lv.t.indexes[c].pred.isSome() { score += 1 }      // filtered: fewer rows
         if len(eqs) == len(cols) {
@@ -2032,7 +2084,7 @@ fn choosePath(q: &Query, k: int, cs: &[]Expr, params: &[]Val): Path {
         }
         if score > bestScore {
             bestScore = score
-            best = Path{index: c, eqs: eqs, rng: rng, desc: false, noNulls: false, ins: ins, inSub: inSub}
+            best = Path{index: c, eqs: eqs, rng: rng, desc: false, noNulls: false, ins: ins, inSub: inSub, inArr: inArr}
         }
     }
     return best
@@ -2044,6 +2096,7 @@ fn (q: &Query) pathOuter(p: &Path): bool {
     for x in p.eqs { if q.maxLevel(&x) >= 0 { return true } }
     for x in p.ins { if q.maxLevel(&x) >= 0 { return true } }
     for b in p.rng { if q.maxLevel(&b.val) >= 0 { return true } }
+    for x in p.inArr { if q.maxLevel(&x) >= 0 { return true } }
     return q.corr && pathCorr(p)
 }
 
@@ -2051,6 +2104,7 @@ fn pathCorr(p: &Path): bool {
     for x in p.eqs { if hasCorr(&x) { return true } }
     for x in p.ins { if hasCorr(&x) { return true } }
     for b in p.rng { if hasCorr(&b.val) { return true } }
+    for x in p.inArr { if hasCorr(&x) { return true } }
     return false
 }
 
@@ -2061,6 +2115,7 @@ fn pathCur(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, p: &Pat
     for x in p.eqs { try fillCur(st, txn, q, &x, env, rs, mut &cur) }
     for x in p.ins { try fillCur(st, txn, q, &x, env, rs, mut &cur) }
     for b in p.rng { try fillCur(st, txn, q, &b.val, env, rs, mut &cur) }
+    for x in p.inArr { try fillCur(st, txn, q, &x, env, rs, mut &cur) }
     return Ok(cur)
 }
 
@@ -2078,7 +2133,7 @@ fn boundType(t: &lexdb_sql.TypeName): lexdb_sql.TypeName {
 // The keys a path covers: with an IN list, a lookup (or range) per value,
 // in key order (backward for a backward path).
 fn pathScans(t: &Table, p: &Path, env: &Env): Result[[]Scan, DbErr] {
-    if len(p.ins) == 0 && p.inSub < 0 { return Ok([try pathScan(t, p, env)]) }
+    if len(p.ins) == 0 && p.inSub < 0 && len(p.inArr) == 0 { return Ok([try pathScan(t, p, env)]) }
     if p.inSub >= 0 && len(env.subs[p.inSub].vals) > IN_LOOKUP_MAX {
         return Ok([Scan{empty: false, point: false, lo: "", hi: "", whole: true}])
     }
@@ -2101,6 +2156,25 @@ fn pathScans(t: &Table, p: &Path, env: &Env): Result[[]Scan, DbErr] {
                 Ok(v) { append(mut &vs, v) }
                 Err(_) {}
             }
+        }
+    } else if len(p.inArr) > 0 {
+        // the array's elements; one not of the column's type is left to
+        // the condition (it stays), as an IN subquery's are
+        match try eval(&p.inArr[0], env) {
+            Val.Text(a) {
+                for part in try arrayParts(&a) {
+                    match part {
+                        Some(x) {
+                            match coerce(Val.Text(x), &typ) {
+                                Ok(v) { append(mut &vs, v) }
+                                Err(_) {}
+                            }
+                        }
+                        None {}
+                    }
+                }
+            }
+            else {}
         }
     } else {
         for x in p.ins { append(mut &vs, try coerce(try eval(&x, env), &typ)) }
@@ -2255,7 +2329,7 @@ fn allTrue(cs: &[]Expr, cols: &[]lexdb_sql.ColDef, row: &[]Val, params: &[]Val):
 }
 
 fn newLevel(t: Table, alias: str, join: int, first: int): Level {
-    return Level{t: t, alias: alias, join: join, first: first, path: Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1}, cond: [],
+    return Level{t: t, alias: alias, join: join, first: first, path: Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: []}, cond: [],
                  post: [], local: [], perRow: true, hashCols: [], hashVals: [], src: -1, work: -1, lateral: false}
 }
 
@@ -2394,14 +2468,14 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
     for k in 0..nl {
         let m = replace(mut &ms[k], [])
         // a subquery's rows have no key: read them all
-        var path = if q.levels[k].virt() { Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1} } else {
+        var path = if q.levels[k].virt() { Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: []} } else {
             choosePath(&q, k, &m, params)
         }
         var perRow = k == 0 || q.pathOuter(&path) || q.levels[k].lateral
         let right = keepsRight(q.levels[k].join)
         if right {
             // Every row of it is kept: read it all once, and remember which joined.
-            path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1}
+            path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: []}
             perRow = false
         }
         var local: []Expr = []
@@ -3512,8 +3586,8 @@ fn pathText(lv: &Level): str {
     if lv.work >= 0 { return "rows of the working table" }
     let p = &lv.path
     let cols = keyCols(&lv.t, p.index)
-    if len(p.ins) > 0 || p.inSub >= 0 {
-        let many = if p.inSub >= 0 { " value of subquery " + (p.inSub + 1).toStr() } else { " of " + len(p.ins).toStr() + " values" }
+    if len(p.ins) > 0 || p.inSub >= 0 || len(p.inArr) > 0 {
+        let many = if p.inSub >= 0 { " value of subquery " + (p.inSub + 1).toStr() } else if len(p.inArr) > 0 { " element of the array" } else { " of " + len(p.ins).toStr() + " values" }
         let each = " for each" + many + (if p.desc { " backward" } else { "" })
         if p.index < 0 { return "primary key " + (if len(p.eqs) + 1 == len(cols) { "lookup" } else { "range" }) + each }
         return "index " + lexdb_sql.baseName(&lv.t.indexes[p.index].name) + (if lv.t.indexes[p.index].pred.isSome() { " (filtered)" } else { "" }) +
@@ -3819,7 +3893,7 @@ fn createIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
         None {}
     }
     let ix = Index{name: ixKey, tree: st.createTree(txn), cols: cols, unique: s.unique, pred: pred}
-    let path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1}
+    let path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: []}
     let sc = Scan{empty: false, point: false, lo: "", hi: "", whole: false}
     var cur = newCursor()
     while !cur.done {
@@ -4132,7 +4206,7 @@ pub fn exprOid(x: &Expr, cols: &[]lexdb_sql.ColDef, ptypes: &[]int): int {
                 "count" { return lexdb_sql.OID_INT8 }
                 "bool_and", "bool_or", "every" { return lexdb_sql.OID_BOOL }
                 "string_agg" { return lexdb_sql.OID_TEXT }
-                "like", "ilike", "in", "distinct" { return lexdb_sql.OID_BOOL }
+                "like", "ilike", "in", "distinct", "any", "all" { return lexdb_sql.OID_BOOL }
                 "case" { return if len(args) > 1 { exprOid(&args[1], cols, ptypes) } else { lexdb_sql.OID_TEXT } }
                 "nullif", "greatest", "least" { return if len(args) > 0 { exprOid(&args[0], cols, ptypes) } else { lexdb_sql.OID_TEXT } }
                 "strpos" { return lexdb_sql.OID_INT4 }
@@ -4734,7 +4808,7 @@ fn orderedScan(q: &Query, cols: &[]int, params: &[]Val): Option[int] {
     let t = &q.levels[0].t
     for c0 in 0..len(t.indexes) + 1 {
         if !q.usable(0, c0 - 1, &q.levels[0].cond, params) { continue }
-        let p = Path{index: c0 - 1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1}
+        let p = Path{index: c0 - 1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: []}
         if servesOrder(t, &p, cols) { return Some(c0 - 1) }
     }
     return None
@@ -4830,7 +4904,7 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         if dir >= 0 {
             var ix = path.index
             var use = servesOrder(t, path, &cols)
-            let full = len(path.eqs) == 0 && len(path.rng) == 0 && len(path.ins) == 0 && path.inSub < 0
+            let full = len(path.eqs) == 0 && len(path.rng) == 0 && len(path.ins) == 0 && path.inSub < 0 && len(path.inArr) == 0
             // A full scan changes to an index for its order only when that
             // saves reading everything: a LIMIT, or MIN/MAX. Else a sort is
             // cheaper than a lookup per row.
@@ -5411,9 +5485,21 @@ fn comparedIn(q: &Query, out: mut &[]int) {
     for sp in q.subs { comparedIn(&sp.sel.q, out) }
 }
 
-// A parameter compared with a column takes the column's type.
+// A parameter compared with a column takes the column's type; in col op
+// ANY ($1), an array of it.
 fn compared(c: &Expr, q: &Query, out: mut &[]int) {
     match c {
+        Expr.Call(n, args, _) {
+            if lexdb_sql.isQuant(&n) && len(args) == 2 {
+                match args[0] {
+                    Expr.Col(x) {
+                        let i = colIndex(&q.cols, &x)
+                        if i >= 0 && lexdb_sql.arrayOid(q.cols[i].typ.oid) > 0 { setParam(&args[1], lexdb_sql.arrayOid(q.cols[i].typ.oid), out) }
+                    }
+                    else {}
+                }
+            }
+        }
         Expr.Bin(op, a, b) {
             if op == "=" || op == "<>" || op == "<" || op == "<=" || op == ">" || op == ">=" {
                 match a {

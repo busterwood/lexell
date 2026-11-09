@@ -1,0 +1,122 @@
+// lexdb_exec: x op ANY (array), x op ALL (array), and = ANY / <> ALL
+// (subquery) (design/lexdb.md 9.28). t: ids 0..9999, v 'v' || id.
+// expect: any: t|f|t|t|f
+// expect: nulls: t|t|t|t|f
+// expect: all: t|t|f|t
+// expect: text: t|t|f
+// expect: lookups: 2, primary key lookup for each element of the array, read 2 of 10000
+// expect: index: 2, index t_v lookup for each element of the array
+// expect: parameter: 1007, 3 rows, plans 1
+// expect: not: 9998
+// expect: subqueries: 5 9995 0A000
+// expect: array column: {3,4} | 1|3 1|4 2|5 | join t: primary key lookup for each element of the array per row
+// expect: filtered index: CREATE INDEX, 1, index t_p, a later row: 1
+// expect: errors: 22P02 42809
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_sql"
+
+type Val = lexdb_sql.Val
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if !r.hasRows { return r.tag }
+            var out: []str = []
+            for row in r.rows {
+                var vs: []str = []
+                for v in row { append(mut &vs, lexdb_exec.text(&v)) }
+                append(mut &out, strings.join(&vs, "|"))
+            }
+            return strings.join(&out, " ")
+        }
+        Err(e) { return e.state }
+    }
+}
+
+fn line(s: mut &lexdb_exec.Session, sql: &str, prefix: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            for row in rs[0].rows {
+                let l = strings.trim(lexdb_exec.text(&row[0]))
+                if strings.startsWith(l, prefix) { return l }
+            }
+            return "none"
+        }
+        Err(e) { return e.state }
+    }
+}
+
+// what a table's line says it does, without the table: "scan t: <this>"
+fn how(l: &str): str {
+    let i = strings.indexOf(l, ": ", 0)
+    let rest = if i < 0 { l } else { l[i + 2..len(l)] }
+    let j = strings.indexOf(rest, " (", 0)
+    return if j < 0 { rest } else { rest[0..j] }
+}
+
+fn rowsRead(l: &str): str {
+    let i = strings.indexOf(l, "rows read ", 0)
+    if i < 0 { return l }
+    return strings.split(&l[i + 10..len(l)], ",")[0]
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(59), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 1024 * 1024, ckptBytes: 1024 * 1024, snapNodes: 100000}, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        println("any: " + q(mut &s, &"select 2 = any('{1,2,3}'::int[]), 5 = any(array[1, 2]), 1 = any(array[1, null]), 3 > some(array[5, 2]), 1 = any('{}'::int[])"))
+        println("nulls: " + q(mut &s, &"select (5 = any(array[1, null])) is null, (null::int = any(array[1])) is null, (1 <> all(array[2, null])) is null, (null::int = any(null::int[])) is null, null::int = any('{}'::int[])"))
+        println("all: " + q(mut &s, &"select 1 = all('{}'::int[]), 1 < all(array[2, 3]), 3 < all(array[2, 3]), 2.5 > all(array[1, 2])"))
+        println("text: " + q(mut &s, &"select 'b' = any('{a,b}'::text[]), 'a b' = any('{\"a b\",c}'::text[]), 'a' = any(array['A'])"))
+
+        let a = q(mut &s, &"create table t (id int primary key, v text)")
+        let b = q(mut &s, &"create index t_v on t (v)")
+        for k in 0..10 {
+            var vals: []str = []
+            for j in 0..1000 {
+                let i = k * 1000 + j
+                append(mut &vals, "(" + i.toStr() + ", 'v" + i.toStr() + "')")
+            }
+            let r = q(mut &s, &("insert into t values " + strings.join(&vals, ", ")))
+        }
+        let look = "select count(*) from t where id = any('{5,7,7,99999}'::int[])"
+        println("lookups: " + q(mut &s, &look) + ", " + how(&line(mut &s, &("explain " + look), &"scan t")) + ", read " +
+                rowsRead(&line(mut &s, &("explain analyze " + look), &"scan t")) + " of " +
+                rowsRead(&line(mut &s, &("explain analyze " + strings.replaceAll(&look, "id =", "id + 0 =")), &"scan t")))
+        let iq = "select count(*) from t where v = any(array['v5', 'v6', 'nope'])"
+        println("index: " + q(mut &s, &iq) + ", " + how(&line(mut &s, &("explain " + iq), &"scan t")))
+
+        // a parameter: an array of the column's type, its plan kept
+        let ps = lexdb_sql.parse(&"select count(*) from t where id = any($1)").unwrap()
+        let pt = s.paramTypes(&ps[0], &[])
+        var pc = lexdb_exec.newPlanCache()
+        let pv = lexdb_exec.paramVals(&[Some("{1,2,3}")], &pt).unwrap()
+        let r1 = lexdb_exec.text(&s.runCached(&ps[0], &pv, &pt, mut &pc).unwrap().rows[0][0])
+        let r2 = s.runCached(&ps[0], &pv, &pt, mut &pc).unwrap()
+        println("parameter: " + pt[0].toStr() + ", " + r1 + " rows, plans " + pc.plans.toStr())
+
+        println("not: " + q(mut &s, &"select count(*) from t where id <> all('{1,2}'::int[])"))
+        println("subqueries: " + q(mut &s, &"select count(*) from t where id = any(select id from t where id < 5)") + " " +
+                q(mut &s, &"select count(*) from t where id <> all(select id from t where id < 5)") + " " +
+                q(mut &s, &"select count(*) from t where id < any(select id from t where id < 5)"))
+
+        let c = q(mut &s, &"create table p (id int primary key, ids int[])")
+        let d = q(mut &s, &"insert into p values (1, '{3,4}'), (2, '{5}')")
+        let jq = "select p.id, t.id from p join t on t.id = any(p.ids) order by 1, 2"
+        println("array column: " + q(mut &s, &"select ids from p where id = 1") + " | " + q(mut &s, &jq) + " | " + line(mut &s, &("explain " + jq), &"join t"))
+
+        // its predicate is kept as text and parsed again when t is read
+        let f = q(mut &s, &"create index t_p on t (v) where id < any('{3}'::int[])")
+        let fq = "select count(*) from t where v = 'v2' and id < any('{3}'::int[])"
+        // a row inserted later goes in by the predicate's text, parsed again
+        let g = q(mut &s, &"insert into t values (-1, 'vneg')")
+        println("filtered index: " + f + ", " + q(mut &s, &fq) + ", " + how(&line(mut &s, &("explain " + fq), &"scan t")) +
+                ", a later row: " + q(mut &s, &"select count(*) from t where v = 'vneg' and id < any('{3}'::int[])"))
+        println("errors: " + q(mut &s, &"select 1 = any('{x}'::text[]::text::int[])") + " " + q(mut &s, &"select 1 = any(5)"))
+        return 0
+    }).unwrap()
+}
