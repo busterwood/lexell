@@ -1,0 +1,106 @@
+// lexdb_exec: rows larger than a leaf takes, through SQL (design/lexdb.md
+// 9.29). d: id 1..40, body id * 3,000 bytes, tag 't' || id % 4 (indexed).
+// expect: rows 40, bytes 2460000, tail 38997 tail
+// expect: by index: 4|12000 8|24000 12|36000
+// expect: longest: 40|120000 39|117000
+// expect: backward: 40|120000|tail 39|117000|tail
+// expect: updated: 21003, 5, 150000
+// expect: deleted: 20 1347003
+// expect: reopened: 20 1347003, d 150000 same
+// expect: parameter: INSERT 0 1, 1048576 same
+// expect: key too large: 54000
+// expect: over 50000 bytes: 13
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_sql"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if !r.hasRows { return r.tag }
+            var out: []str = []
+            for row in r.rows {
+                var vs: []str = []
+                for v in row { append(mut &vs, lexdb_exec.text(&v)) }
+                append(mut &out, strings.join(&vs, "|"))
+            }
+            return strings.join(&out, " ")
+        }
+        Err(e) { return e.state + " " + e.msg }
+    }
+}
+
+// n bytes: a counter's digits, so a chunk out of place shows
+fn body(n: int, tag: &str): str {
+    var b = newStrBuf()
+    var i = 0
+    while i * 8 < n - len(tag) {
+        b.add(strings.padLeft(i.toStr(), 8, '0'))
+        i += 1
+    }
+    let s = b.toStr()
+    return s[0..n - len(tag)] + tag
+}
+
+fn sp(s: &str): str { return strings.replaceAll(s, "|", " ") }
+
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: 256 * 1024, segBytes: 1024 * 1024, ckptBytes: 512 * 1024, snapNodes: 100000}
+}
+
+fn main() {
+    let fs = lexdb_disk.sim(61)
+    var big = ""
+    lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        let a = q(mut &s, &"create table d (id int primary key, body text, tag text)")
+        let b = q(mut &s, &"create index d_tag on d (tag)")
+        for i in 1..41 {
+            let r = q(mut &s, &("insert into d values (" + i.toStr() + ", '" + body(i * 3000, &"tail") + "', 't" + (i % 4).toStr() + "')"))
+            if r != "INSERT 0 1" { println(r) }
+        }
+        let full = body(40000, &"tail")
+        println("rows " + q(mut &s, &"select count(*) from d") + ", bytes " + q(mut &s, &"select sum(length(body)) from d") + ", tail " +
+                sp(&q(mut &s, &"select strpos(body, 'tail'), right(body, 4) from d where id = 13 and left(body, 16) = '0000000000000001'")))
+        println("by index: " + q(mut &s, &"select id, length(body) from d where tag = 't0' and id <= 12 order by id"))
+        println("longest: " + q(mut &s, &"select id, length(body) from d order by length(body) desc limit 2"))
+        println("backward: " + q(mut &s, &"select id, length(body), right(body, 4) from d order by id desc limit 2"))
+        let u1 = q(mut &s, &"update d set body = body || 'xyz' where id = 7")
+        let u2 = q(mut &s, &"update d set body = 'small' where id = 8")
+        let u3 = q(mut &s, &("update d set body = '" + body(150000, &"dddd") + "' where id = 1"))
+        println("updated: " + q(mut &s, &"select length(body) from d where id = 7") + ", " + q(mut &s, &"select length(body) from d where id = 8") +
+                ", " + q(mut &s, &"select length(body) from d where id = 1"))
+        let dl = q(mut &s, &"delete from d where id % 2 = 0")
+        println("deleted: " + sp(&q(mut &s, &"select count(*), sum(length(body)) from d")))
+        big = body(1048576, &"zzzz")
+        return 0
+    }).unwrap()
+
+    // reopened: from the checkpoint and the log
+    lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int {
+        var s = lexdb_exec.newSession(st)
+        let want = body(150000, &"dddd")
+        let got = q(mut &s, &"select body from d where id = 1")
+        println("reopened: " + sp(&q(mut &s, &"select count(*), sum(length(body)) from d")) + ", d " + len(got).toStr() +
+                (if got == want { " same" } else { " DIFFERENT" }))
+
+        // a megabyte as a parameter
+        let ins = lexdb_sql.parse(&"insert into d values ($1, $2, 'p')").unwrap()
+        let pt = s.paramTypes(&ins[0], &[])
+        let vals = lexdb_exec.paramVals(&[Some("1000"), Some(big)], &pt).unwrap()
+        var pc = lexdb_exec.oneShot()
+        let r = s.runCached(&ins[0], &vals, &pt, mut &pc)
+        let tag = match r { Ok(x) { x.tag } Err(x) { x.state } }
+        let back = q(mut &s, &"select body from d where id = 1000")
+        println("parameter: " + tag + ", " + len(back).toStr() + (if back == big { " same" } else { " DIFFERENT" }))
+        let k = q(mut &s, &"create table kt (k text primary key)")
+        println("key too large: " + q(mut &s, &("insert into kt values ('" + strings.repeat("k", 600) + "')"))[0..5])
+        let del = q(mut &s, &"delete from d where id = 1000")
+        println("over 50000 bytes: " + q(mut &s, &"select count(*) from d where length(body) > 50000"))
+        return 0
+    }).unwrap()
+}

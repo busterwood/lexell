@@ -393,7 +393,7 @@ Built on 2026-11-09 on branch `lexdb`, about 6,300 lines in
 (cache, trees, transactions, log, checkpoints, recovery, snapshots),
 `lexdb_sql` (lexer, parser), `lexdb_exec` (catalog, rows, keys, planner,
 statements, sessions), `lexdb_wire` (protocol 3.0) and `lexdb` (the
-server). Tests: `python3 lexell/tests/lexdb.py` (38 programs in
+server). Tests: `python3 lexell/tests/lexdb.py` (40 programs in
 `tests/lexdb/run`, under `LXL_CHECK=1`).
 
     lexell/compiler/out/lxlc lexell/cmd/lexdb.lxl -o lexdb
@@ -406,9 +406,8 @@ server). Tests: `python3 lexell/tests/lexdb.py` (38 programs in
   values and children) rather than worked on as slotted pages. Simpler;
   the cost is a decode per load and an encode per checkpoint. Measure before
   changing it.
-- **No overflow pages yet**: a key is at most 512 bytes and a key and its row
-  at most 1,350 (an entry over a third of a page cannot always split), so a
-  row is limited to about 1.3 KB. Error 54000.
+- **Large rows go to a companion tree, not to overflow pages** (9.29): a
+  key is at most 512 bytes, a row at most 64 MiB (error 54000).
 - **Old versions are kept per node, not per page**, as copies made when a
   commit changes a node a snapshot can see (4.5). Slots a snapshot may
   still reach are kept until it ends, and not evicted. A checkpoint is not
@@ -560,10 +559,32 @@ is the comparison to make.
 6. Whole-server crash tests through the wire protocol (built: 9.18).
 7. COPY; then the cost questions (section 0), with EXPLAIN ANALYZE's
    counts as the evidence.
-8. Overflow pages for large rows; reclaiming a dropped table's pages.
+8. Large rows (built: 9.29). Not done:
+   - reclaiming a dropped table's pages (its companion tree's too);
+   - reading a large row's columns only when used (TOAST fetches a
+     column when it is used; lexdb reads the whole row as it scans);
+   - compression;
+   - a chunk takes at most one leaf entry (about 1.3 KB), so a page holds
+     three: about 5% of the space is lost to entry and page headers.
 9. Authentication (SCRAM) and TLS, so the server can leave loopback.
 10. The checkpoint pause under a large write load; io_uring if the helper
    pool is the limit (D5).
+11. Batches, not rows (the user's backlog, 2026-11-09). The executor works
+   a row at a time: a scan's callback gets one entry, `decRow` turns it
+   into a `[]Val` (a tagged value per column), and each expression,
+   condition and aggregate (`accumulate`) is evaluated for that row. The
+   per-row cost is the dispatch and the tagged values, not the arithmetic.
+   The question: process a leaf's rows as a batch, with each needed column
+   decoded into a plain array (ints as `[]int`, a NULL bitmap), and run
+   conditions and aggregates over the arrays. Measure first: the share of a
+   scan's time now in decoding, dispatch and the B+tree walk.
+12. Fast aggregation with SIMD (the user's backlog, 2026-11-09), on top of
+   item 11: `sum`, `count`, `min`, `max` and filters over a column array
+   with AVX2 (Lexell already requires x86-64-v3). Lexell has no vector
+   types or intrinsics; SIMD is reached only through C runtime functions
+   (as `hash.crc32c` is). Either needs a language or runtime change: the
+   user's decision. Without SIMD, batches alone may give most of the gain
+   (tight loops over arrays); measure that before deciding.
 
 ### 9.5 Indexes and joins (D4)
 
@@ -1831,4 +1852,81 @@ Caught, each put back:
 - the array not recomputed per row;
 - `<> ALL (subquery)` as IN;
 - exprText losing the operator.
+
+### 9.29 Large rows
+
+A row whose leaf entry would be over `MAX_ENTRY` (1,350 bytes) used to be
+refused (54000). Now it is cut into chunks, kept in a **companion tree** of
+its table (id `tree + OVF`, 2^40), as PostgreSQL's TOAST keeps them in a
+table of their own. The leaf keeps a 14-byte stub: a mark (0xFF), 1, the
+value's length and its CRC32C. A value that itself begins with 0xFF is
+stored with one more 0xFF before it, so a stub is never mistaken for a value.
+
+- **Only where commits apply.** The log, a transaction's writes, conflict
+  checks and what `get` and scans return all carry the value as written.
+  `putValue` cuts it when the commit applies (and so again when recovery
+  replays the log). Snapshots, checkpoints, eviction and recovery needed no
+  change: the companion is an ordinary tree.
+- **Chunks** are keyed by the row key's length, the key and the chunk's
+  number (the length keeps one key's chunks from mixing with a longer
+  key's). A chunk fills one leaf entry. They change only with their row,
+  so they need no conflict marks of their own.
+- **Before a commit applies**, `writeNeeds` also loads the companion's
+  leaves for the key's chunks when the write makes or removes a large value.
+  An overwrite or delete removes the old chunks; dropping the table drops
+  the companion tree.
+- **Reading back** (`unstore`): the chunks are read and checked against the
+  stub's length and CRC. A live read that finds them changed since it read
+  the stub (a commit between, while it loaded a page) fails with 40001, as
+  its commit would have. A snapshot reads them as of its snapshot.
+- **Limit:** 64 MiB a row, the wire's largest message.
+- **Fixed on the way (not only large values):** a commit that emptied a
+  leaf unlinked it, and its keys' range went to a neighbour. A later write
+  of the same commit into that range, with the neighbour not in memory,
+  panicked the server, because a commit cannot load a page. This happens
+  when rows are deleted and put back in one transaction. Checked against
+  the old store: 300 such commits with a small cache panicked within the
+  run. Now an empty node is unlinked only when the nodes that take its
+  range are in memory; otherwise it stays, empty.
+
+`store_big` covers:
+
+- 60 crashes against a model, with values of every size (either side of a
+  leaf's largest, values beginning with 0xFF or shaped like a stub, up to
+  40 KB) over a cache of a few nodes; then every row deleted and no chunk
+  left;
+- a snapshot reading an overwritten large value;
+- a live scan finding a row's chunks replaced by a value of the same length
+  (40001: the CRC tells);
+- the next table's id (a companion's must not raise it);
+- limits: a 513-byte key, a value over 64 MiB, a megabyte, a 512-byte key
+  with a large value;
+- a dropped table's chunks;
+- the delete-and-refill commits above.
+
+`exec_big` does the same through SQL:
+
+- 40 rows to 120 KB; reads through an index, ORDER BY and backwards;
+- updates to larger, to small and to large; deletes;
+- reopening from the checkpoint and the log;
+- a megabyte parameter;
+- a primary key too large.
+
+Planted bugs, each put back (the run was stopped for low memory before
+the last one):
+
+- caught:
+  - chunks kept on delete;
+  - chunks kept on overwrite;
+  - the companion not loaded;
+  - empty leaves always unlinked;
+  - the CRC unchecked;
+  - the companion not dropped;
+  - a companion's id raising the next table's;
+  - `get` giving the stub;
+  - a backward scan giving the stub;
+- not confirmed:
+  - no escape: reported not caught, probably because the diff held raw
+    bytes and the script's grep treated it as binary;
+  - the last chunk cut short: not run.
 

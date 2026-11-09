@@ -16,6 +16,7 @@
 // next checkpoint writes it to a new page (copy on write): its old page is
 // freed once that checkpoint's meta page is durable.
 import "task"
+import "hash"
 import "binary"
 import "collections"
 import "./lexdb_base"
@@ -215,9 +216,11 @@ fn (t: &Txn) noting(): bool { return t.snap < 0 || t.live || t.track }
 fn wkey(tree: int, key: &str): str { return tree.toStr() + ":" + key }
 
 pub fn (t: mut &Txn) put(tree: int, key: str, val: str): Result[Unit, lexdb_base.DbErr] {
-    if len(key) > lexdb_page.MAX_KEY || lexdb_page.leafEntry(&key, &val) > lexdb_page.MAX_ENTRY {
-        return Err(lexdb_base.err(lexdb_base.S_LIMIT, "row too large: a key and value take at most " +
-                                  lexdb_page.MAX_ENTRY.toStr() + " bytes (key at most " + lexdb_page.MAX_KEY.toStr() + ")"))
+    if len(key) > lexdb_page.MAX_KEY {
+        return Err(lexdb_base.err(lexdb_base.S_LIMIT, "key too large: " + len(key).toStr() + " bytes, at most " + lexdb_page.MAX_KEY.toStr()))
+    }
+    if len(val) > MAX_VALUE {
+        return Err(lexdb_base.err(lexdb_base.S_LIMIT, "row too large: " + len(val).toStr() + " bytes, at most " + MAX_VALUE.toStr()))
     }
     t.index.put(wkey(tree, &key), len(t.writes))
     append(mut &t.writes, TxWrite{op: OP_PUT, tree: tree, key: key, val: val})
@@ -735,16 +738,23 @@ fn (db: mut &Db) applyDel(tree: int, key: &str) {
     db.meta[leaf].version += 1
     db.pool[db.meta[leaf].frame].packed = false
     db.recost(leaf)
-    // An empty node leaves its parent (no merging: design/lexdb.md 4.2).
+    // An empty node leaves its parent (no merging: design/lexdb.md 4.2),
+    // its keys' range going to a neighbour: only when the neighbour's nodes
+    // that take that range are in memory. A later write of the same commit
+    // may go there, and a commit cannot load (writeNeeds loaded the nodes
+    // as they were). Otherwise the empty node stays.
     var j = len(d.path) - 1
     while j > 0 {
         let c = d.path[j]
         let empty = if db.pool[db.meta[c].frame].leaf { len(db.pool[db.meta[c].frame].keys) == 0 } else { len(db.pool[db.meta[c].frame].kids) == 0 }
         if !empty { break }
         let p = d.path[j - 1]
-        db.willChange(p)
         var at = 0
         while db.pool[db.meta[p].frame].kids[at] != c { at += 1 }
+        let nk = len(db.pool[db.meta[p].frame].kids)
+        if at > 0 && !db.edgeLoaded(db.pool[db.meta[p].frame].kids[at - 1], true) { break }
+        if at == 0 && nk > 1 && !db.edgeLoaded(db.pool[db.meta[p].frame].kids[1], false) { break }
+        db.willChange(p)
         let gone = collections.removeAt(mut &db.pool[db.meta[p].frame].kids, at)
         if len(db.pool[db.meta[p].frame].keys) > 0 {
             let ki = if at == 0 { 0 } else { at - 1 }
@@ -777,6 +787,20 @@ fn (db: mut &Db) applyDel(tree: int, key: &str) {
     }
 }
 
+// Whether a node and its last (right) or first children down to a leaf
+// are in memory: the nodes that take an emptied neighbour's range.
+fn (db: &Db) edgeLoaded(s: int, right: bool): bool {
+    var x = s
+    while true {
+        if !db.meta[x].loaded { return false }
+        if db.pool[db.meta[x].frame].leaf { return true }
+        let n = len(db.pool[db.meta[x].frame].kids)
+        if n == 0 { return true }
+        x = db.pool[db.meta[x].frame].kids[if right { n - 1 } else { 0 }]
+    }
+    return true
+}
+
 // Sets (slot >= 0) or removes a tree's root, noting the change for snapshots.
 fn (db: mut &Db) setRoot(tree: int, slot: int) {
     let prev = match db.trees.get(&tree) { Some(x) { x } None { -1 } }
@@ -789,7 +813,7 @@ fn (db: mut &Db) applyCreate(tree: int) {
     let s = db.newNode(lexdb_page.newLeaf())
     db.meta[s].root = true
     db.setRoot(tree, s)
-    if tree >= db.nextTree { db.nextTree = tree + 1 }
+    if !isOvf(tree) && tree >= db.nextTree { db.nextTree = tree + 1 }
 }
 
 // Drops a tree. Its nodes in memory are freed; the pages of nodes that are
@@ -810,22 +834,171 @@ fn (db: mut &Db) applyDrop(tree: int) {
 
 fn (db: mut &Db) applyWrite(w: &TxWrite) {
     if w.tree == db.watched { db.watchedWrites += 1 }
-    if w.op == OP_PUT { db.applyPut(w.tree, &w.key, &w.val) }
-    else if w.op == OP_DEL { db.applyDel(w.tree, &w.key) }
+    if w.op == OP_PUT { db.putValue(w.tree, &w.key, &w.val) }
+    else if w.op == OP_DEL {
+        db.dropChunks(w.tree, &w.key)
+        db.applyDel(w.tree, &w.key)
+    }
     else if w.op == OP_CREATE { db.applyCreate(w.tree) }
-    else if w.op == OP_DROP { db.applyDrop(w.tree) }
+    else if w.op == OP_DROP {
+        db.applyDrop(w.tree)
+        db.applyDrop(w.tree + OVF)
+    }
 }
 
-// The slot a write needs loaded before it can be applied, or -1.
+// The slot a write needs loaded before it can be applied, or -1: the leaf
+// of its key, and when it writes or removes a large value, the companion
+// tree's leaves its chunks are in or go to.
 fn (db: mut &Db) writeNeeds(w: &TxWrite): int {
     if w.op == OP_PUT || w.op == OP_DEL {
         let d = db.descend(w.tree, &w.key)
         if d.need >= 0 { return d.need }
-        if w.op == OP_DEL && len(d.path) > 0 {
-            // collapsing the root wants its only child in memory; it is not required
+        let ovf = w.tree + OVF
+        if db.trees.has(&ovf) {
+            var touch = w.op == OP_PUT && lexdb_page.leafEntry(&w.key, &w.val) + 1 > lexdb_page.MAX_ENTRY
+            if !touch {
+                match db.leafVal(w.tree, &w.key) {
+                    Some(v) { touch = isStub(&v) }
+                    None {}
+                }
+            }
+            if touch { return db.rangeNeeds(ovf, &chunkKey(&w.key, 0), &chunkKey(&w.key, LAST_CHUNK)) }
         }
     }
     return -1
+}
+
+// ---- large values (design/lexdb.md 9.29)
+//
+// A value whose leaf entry would be over MAX_ENTRY is cut into chunks kept
+// in its tree's companion tree (id tree + OVF), under the key's length,
+// the key and the chunk's number; the leaf holds a stub: BIG, 1, the
+// value's length (u64), its CRC32C (u32). A value that itself begins with
+// BIG is stored with one more BIG before it. Only the store sees these
+// forms: the log, a transaction's writes and what get and scans give are
+// the values written. The chunks change only with their row, in the same
+// apply, so they need no conflict marks of their own.
+
+pub const MAX_VALUE = 64 * 1024 * 1024       // the wire's largest message (lexdb_wire.MAX_MESSAGE)
+pub const OVF = 1 << 40                       // (public for the tests: a scan of tree + OVF gives its chunks)
+const BIG: byte = 0xFF
+const STUB_LEN = 14
+const LAST_CHUNK = 0xFFFFFFFF                 // past every chunk's number: a key range's end
+
+fn isOvf(tree: int): bool { return tree >= OVF }
+fn marked(v: &str): bool { return len(v) > 0 && v[0] == BIG }
+fn isStub(v: &str): bool { return len(v) == STUB_LEN && v[0] == BIG && v[1] == 1 }
+
+fn chunkKey(key: &str, i: int): str {
+    var b = newStrBuf()
+    binary.addU16BE(mut &b, len(key))
+    b.add(key)
+    binary.addU32BE(mut &b, i)
+    return b.toStr()
+}
+
+// The bytes of a value each chunk of key holds.
+fn chunkRoom(key: &str): int { return lexdb_page.MAX_ENTRY - lexdb_page.leafEntry(&chunkKey(key, 0), &"") }
+
+fn crcOf(crc: u32, s: &str): u32 { return hash.crc32cMore(crc, &strToBytes(s)) }
+
+// The value at key in a tree whose leaf for it is in memory.
+fn (db: mut &Db) leafVal(tree: int, key: &str): Option[str] {
+    let d = db.descend(tree, key)
+    if len(d.path) == 0 || d.need >= 0 { return None }
+    let leaf = d.path[len(d.path) - 1]
+    let i = lowerIndex(&db.pool[db.meta[leaf].frame].keys, key)
+    if i < len(db.pool[db.meta[leaf].frame].keys) && db.pool[db.meta[leaf].frame].keys[i] == key {
+        return Some(db.pool[db.meta[leaf].frame].vals[i])
+    }
+    return None
+}
+
+// The first leaf of [lo, hi) of tree not in memory, or -1.
+fn (db: mut &Db) rangeNeeds(tree: int, lo: &str, hi: &str): int {
+    var cursor = lexdb_base.own(lo)
+    while true {
+        let d = db.descend(tree, &cursor)
+        if d.need >= 0 { return d.need }
+        if !d.hasUpper || d.upper >= hi { return -1 }
+        cursor = d.upper
+    }
+    return -1
+}
+
+// Removes the chunks of the value at key, if it is a large one.
+fn (db: mut &Db) dropChunks(tree: int, key: &str) {
+    match db.leafVal(tree, key) {
+        Some(v) {
+            if isStub(&v) {
+                let total = int(binary.readU64LEStr(&v, 2))
+                let room = chunkRoom(key)
+                for i in 0..(total + room - 1) / room { db.applyDel(tree + OVF, &chunkKey(key, i)) }
+            }
+        }
+        None {}
+    }
+}
+
+// Writes a value in its stored form: itself, escaped, or chunks and a stub.
+fn (db: mut &Db) putValue(tree: int, key: &str, val: &str) {
+    db.dropChunks(tree, key)
+    let esc = marked(val)
+    if lexdb_page.leafEntry(key, val) + (if esc { 1 } else { 0 }) <= lexdb_page.MAX_ENTRY {
+        if !esc {
+            db.applyPut(tree, key, val)
+            return
+        }
+        var b = newStrBuf()
+        b.addByte(BIG)
+        b.add(val)
+        db.applyPut(tree, key, &b.toStr())
+        return
+    }
+    let ovf = tree + OVF
+    if !db.trees.has(&ovf) { db.applyCreate(ovf) }
+    let room = chunkRoom(key)
+    var crc: u32 = 0
+    var i = 0
+    var at = 0
+    while at < len(val) {
+        let end = if at + room < len(val) { at + room } else { len(val) }
+        let part = lexdb_base.own(&val[at..end])
+        crc = crcOf(crc, &part)
+        db.applyPut(ovf, &chunkKey(key, i), &part)
+        i += 1
+        at = end
+    }
+    var b = newStrBuf()
+    b.addByte(BIG)
+    b.addByte(1)
+    binary.addU64LE(mut &b, len(val))
+    binary.addU32LE(mut &b, int(crc))
+    db.applyPut(tree, key, &b.toStr())
+}
+
+// The value written, from its stored form (marked): an escaped value without
+// its mark, or a stub's chunks read back and checked. A live read that finds
+// them changed since it read the stub (a commit between) fails as a conflict,
+// as its commit would.
+fn (st: &Store) unstore(t: mut &Txn, tree: int, key: &str, v: &str): Result[str, lexdb_base.DbErr] {
+    if !isStub(v) { return Ok(v[1..len(v)]) }
+    let total = int(binary.readU64LEStr(v, 2))
+    let want = binary.readU32LEStr(v, 10)
+    var b = newStrBuf()
+    var got = 0
+    var crc: u32 = 0
+    try st.scanIn(t, tree + OVF, chunkKey(key, 0), chunkKey(key, LAST_CHUNK), fn(e: &Entry): bool {
+        b.add(e.val)
+        got += len(e.val)
+        crc = crcOf(crc, &e.val)
+        return got <= total
+    }, true)
+    if got != total || int(crc) != want {
+        if t.snap < 0 || t.live { return Err(lexdb_base.conflict()) }
+        return Err(lexdb_base.err(lexdb_base.S_INTERNAL, "a large value's chunks do not match it"))
+    }
+    return Ok(b.toStr())
 }
 
 // ---- the log record format
@@ -918,7 +1091,13 @@ pub fn (st: &Store) get(t: mut &Txn, tree: int, key: str): Result[Option[str], l
             }
         })
         if len(bad) > 0 { return Err(bad[0]) }
-        if need < 0 { return Ok(out) }
+        if need < 0 {
+            match out {
+                Some(v) { if marked(&v) && !isOvf(tree) { return Ok(Some(try st.unstore(t, tree, &key, &v))) } }
+                None {}
+            }
+            return Ok(out)
+        }
         try st.load(need)
     }
     return Ok(None)
@@ -954,12 +1133,17 @@ fn (t: &Txn) ownRange(tree: int, from: &str, to: &str): []TxWrite {
 // end) in key order, the transaction's own writes included, while f gives
 // true.
 pub fn (st: &Store) scan(t: mut &Txn, tree: int, from: str, to: str, f: &fn(&Entry): bool): Result[Unit, lexdb_base.DbErr] {
-    let own = t.ownRange(tree, &from, &to)
+    return st.scanIn(t, tree, from, to, f, false)
+}
+
+// scan; raw: the stored forms, no reads noted (a companion tree's chunks).
+fn (st: &Store) scanIn(t: mut &Txn, tree: int, from: str, to: str, f: &fn(&Entry): bool, raw: bool): Result[Unit, lexdb_base.DbErr] {
+    let own: []TxWrite = if raw { [] } else { t.ownRange(tree, &from, &to) }
     let root = if t.snap >= 0 && !t.live { match t.snapTrees.get(&tree) { Some(r) { r } None { -1 } } } else { -1 }
     var oi = 0
     var cursor = from
     var more = true
-    let noting = t.noting()
+    let noting = !raw && t.noting()
     while more {
         var rseq = 0
         var need = -1
@@ -1040,6 +1224,10 @@ pub fn (st: &Store) scan(t: mut &Txn, tree: int, from: str, to: str, f: &fn(&Ent
                     }
                 }
             } else {
+                if !raw && marked(&chunk[ci].val) && !isOvf(tree) {
+                    let v = try st.unstore(t, tree, &chunk[ci].key, &chunk[ci].val)
+                    chunk[ci].val = v
+                }
                 if !f(&chunk[ci]) {
                     if noting { t.noteRead(tree, cursor, chunk[ci].key + "\x00", rseq) }
                     return Ok(Unit{})
@@ -1169,6 +1357,10 @@ pub fn (st: &Store) scanBack(t: mut &Txn, tree: int, from: str, to: str, f: &fn(
                     }
                 }
             } else {
+                if marked(&chunk[ci].val) && !isOvf(tree) {
+                    let v = try st.unstore(t, tree, &chunk[ci].key, &chunk[ci].val)
+                    chunk[ci].val = v
+                }
                 if !f(&chunk[ci]) {
                     if noting { t.noteRead(tree, chunk[ci].key, cursor, rseq) }
                     return Ok(Unit{})
@@ -2073,7 +2265,10 @@ pub fn (st: &Store) changes(): int {
 pub fn (st: &Store) trees(): []int {
     var out: []int = []
     st.sh.with(fn(db: mut &Db) {
-        for i in 0..db.trees.size() { append(mut &out, db.trees.keyAt(i)) }
+        for i in 0..db.trees.size() {
+            let id: int = db.trees.keyAt(i)
+            if !isOvf(id) { append(mut &out, id) }
+        }
     })
     return out
 }

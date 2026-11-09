@@ -1,0 +1,288 @@
+// lexdb_store: large values, cut into chunks in a companion tree
+// (design/lexdb.md 9.29).
+// - Crash recovery against a model, as store_crash, with values of every
+//   size: small, either side of the largest a leaf takes, ones beginning
+//   with the stub's mark (0xFF), and large ones (to 40 KB), over a cache of
+//   a few nodes (chunks evicted and loaded again). At the end every row is
+//   deleted, and the companion tree must be empty.
+// - A snapshot still sees a large value overwritten after it began.
+// - A live scan that finds a row's chunks changed since it read the row's
+//   stub fails as a conflict.
+// - Limits: the key, the value; a megabyte; the largest key with a large
+//   value (the smallest chunks).
+// - A dropped tree's chunks go with it.
+// - Not large values, found with them: a commit that empties a leaf and
+//   then writes into its range (rows deleted and put back), with the
+//   leaf's neighbour not in memory, panicked: the range went to the
+//   neighbour, which the commit could not load.
+// expect: seeds 20 crashes 60 ok 60, chunks left 0
+// expect: snapshot: old 30000 old, live new 50000 new
+// expect: changed under a scan: 40001
+// expect: the next table's id: small
+// expect: limits: 54000 54000, 1048576 same, 512-byte key 9000 same
+// expect: dropped: chunks 0
+// expect: refilled in one commit: rounds 300 rows 3000
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_base"
+import "strings"
+
+type Ctx = record {
+    model: Map[str, str]
+    rng: lexdb_base.Rng
+    tree: int
+    commits: int
+    crashAt: int
+    ok: bool
+    msg: str
+}
+
+fn key(i: int): str { return "key" + strings.padLeft(i.toStr(), 4, '0') }
+
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: 3 * 2048, segBytes: 16 * 4096, ckptBytes: 6 * 4096, snapNodes: 1000}
+}
+
+// A value of a random size: the edges of a leaf's room, the mark, large.
+fn value(r: mut &lexdb_base.Rng): str {
+    let tag = "v" + r.below(1000000).toStr()
+    let k = r.below(6)
+    if k == 0 { return tag }
+    if k == 1 { return tag + strings.repeat("e", 1320 + r.below(40) - len(tag)) }     // a leaf's largest, either side
+    if k == 2 { return "\xff" + tag + strings.repeat("m", r.below(1400)) }
+    if k == 3 { return "\xff\x01" + strings.repeat("s", 12) }                          // a stub's shape, not a stub
+    let pat = "abcdefghij"
+    let from = r.below(10)
+    return tag + strings.repeat(&pat[from..10], 2000 + r.below(4000))
+}
+
+fn check(st: &lexdb_store.Store, tree: int, model: &Map[str, str]): str {
+    var t = lexdb_store.begin()
+    var n = 0
+    var bad = ""
+    let r = st.scan(mut &t, tree, "", "", fn(e: &lexdb_store.Entry): bool {
+        n += 1
+        match model.get(&e.key) {
+            Some(v) { if v != e.val && bad == "" { bad = "value of " + e.key + " (" + len(e.val).toStr() + " bytes, want " + len(v).toStr() + ")" } }
+            None { if bad == "" { bad = "extra key " + e.key } }
+        }
+        return true
+    })
+    if r.isErr() { return "scan: " + r.unwrapErr().toStr() }
+    if bad != "" { return bad }
+    if n != model.size() { return "count " + n.toStr() + " want " + model.size().toStr() }
+    // get agrees
+    for i in 0..model.size() {
+        let k: str = model.keyAt(i)
+        let want: str = model.valAt(i)
+        var g = lexdb_store.begin()
+        match st.get(mut &g, tree, k) {
+            Ok(v) { if v.unwrapOr("") != want { return "get " + k } }
+            Err(e) { return "get " + k + ": " + e.toStr() }
+        }
+    }
+    return ""
+}
+
+fn chunks(st: &lexdb_store.Store, tree: int): int {
+    var t = lexdb_store.begin()
+    var n = 0
+    let r = st.scan(mut &t, tree + lexdb_store.OVF, "", "", fn(e: &lexdb_store.Entry): bool {
+        n += 1
+        return true
+    })
+    return n
+}
+
+fn work(st: lexdb_store.Store, c: mut &Ctx): Result[Unit, lexdb_base.DbErr] {
+    if c.tree < 0 {
+        var t = lexdb_store.begin()
+        c.tree = st.createTree(mut &t)
+        try st.commit(t)
+    } else {
+        let m = check(&st, c.tree, &c.model)
+        if m != "" {
+            c.ok = false
+            c.msg = "after recovery: " + m
+            return Ok(Unit{})
+        }
+    }
+    var i = 0
+    while i < 40 {
+        var t = lexdb_store.begin()
+        var changes: []lexdb_store.Entry = []
+        let n = 1 + c.rng.below(6)
+        for j in 0..n {
+            let k = key(c.rng.below(60))
+            if c.rng.below(4) == 0 {
+                t.del(c.tree, k)
+                append(mut &changes, lexdb_store.Entry{key: k, val: ""})
+            } else {
+                let v = value(mut &c.rng)
+                try t.put(c.tree, k, v)
+                append(mut &changes, lexdb_store.Entry{key: k, val: v})
+            }
+        }
+        try st.commit(t)
+        for e in changes {
+            if e.val == "" { let gone = c.model.remove(&e.key) } else { c.model.put(e.key, e.val) }
+        }
+        c.commits += 1
+        if c.commits == c.crashAt { return Ok(Unit{}) }
+        i += 1
+    }
+    return Ok(Unit{})
+}
+
+fn round(c: mut &Ctx, fs: lexdb_disk.Fs, seed: int): lexdb_disk.Fs {
+    var crashed = fs
+    let r = lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): Result[Unit, lexdb_base.DbErr] {
+        let w = work(st, c)
+        crashed = fs.crash(seed)
+        return w
+    })
+    match r {
+        Ok(w) { if w.isErr() { c.ok = false; c.msg = w.unwrapErr().toStr() } }
+        Err(e) { c.ok = false; c.msg = "open: " + e.toStr() }
+    }
+    return crashed
+}
+
+fn crashes(): str {
+    var crashes = 0
+    var good = 0
+    var left = 0
+    for seed in 0..20 {
+        var c = Ctx{model: newMap(), rng: lexdb_base.rng(seed), tree: -1, commits: 0, crashAt: 0, ok: true, msg: ""}
+        var fs = lexdb_disk.sim(seed)
+        for k in 0..3 {
+            c.crashAt = c.commits + 1 + c.rng.below(39)
+            fs = round(mut &c, fs, seed * 10 + k)
+            crashes += 1
+            let r = lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): str { return check(&st, c.tree, &c.model) })
+            match r {
+                Ok(m) {
+                    if m == "" { good += 1 } else { println("seed " + seed.toStr() + " crash " + k.toStr() + ": " + m) }
+                }
+                Err(e) { println("seed " + seed.toStr() + " crash " + k.toStr() + ": open " + e.toStr()) }
+            }
+            if !c.ok { println("seed " + seed.toStr() + ": " + c.msg) }
+        }
+        // every row deleted: no chunk stays
+        let r = lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int {
+            var t = lexdb_store.begin()
+            for i in 0..c.model.size() { t.del(c.tree, c.model.keyAt(i)) }
+            st.commit(t).unwrap()
+            return chunks(&st, c.tree)
+        })
+        left += r.unwrap()
+    }
+    return "seeds 20 crashes " + crashes.toStr() + " ok " + good.toStr() + ", chunks left " + left.toStr()
+}
+
+fn val(st: &lexdb_store.Store, t: mut &lexdb_store.Txn, tree: int, k: &str): str {
+    match st.get(t, tree, k) {
+        Ok(v) { return v.unwrapOr("none") }
+        Err(e) { return e.state }
+    }
+}
+
+fn brief(v: &str): str { return v[0..3] + " " + len(v).toStr() + " " + v[len(v) - 3..len(v)] }
+
+fn refill(): str {
+    let r = lexdb_store.run(lexdb_disk.sim(3), lexdb_store.Options{cacheBytes: 3 * 2048, segBytes: 1024 * 1024, ckptBytes: 1024 * 1024, snapNodes: 1000}, fn(st: lexdb_store.Store): str {
+        var t = lexdb_store.begin()
+        let tree = st.createTree(mut &t)
+        st.commit(t).unwrap()
+        for b in 0..30 {
+            var w = lexdb_store.begin()
+            for i in 0..100 { w.put(tree, "k" + strings.padLeft((b * 100 + i).toStr(), 5, '0'), strings.repeat("v", 100)).unwrap() }
+            st.commit(w).unwrap()
+        }
+        var rng = lexdb_base.rng(5)
+        var ok = 0
+        for round in 0..300 {
+            st.checkpointAll().unwrap()         // clean: evicted as others load
+            let a = rng.below(2900)
+            let n = 1 + rng.below(80)
+            var w = lexdb_store.begin()
+            for i in a..a + n { w.del(tree, "k" + strings.padLeft(i.toStr(), 5, '0')) }
+            for i in a..a + n { w.put(tree, "k" + strings.padLeft(i.toStr(), 5, '0'), strings.repeat("w", 100)).unwrap() }
+            st.commit(w).unwrap()
+            ok += 1
+        }
+        var c = lexdb_store.begin()
+        var n = 0
+        st.scan(mut &c, tree, "", "", fn(e: &lexdb_store.Entry): bool {
+            n += 1
+            return true
+        }).unwrap()
+        return "rounds " + ok.toStr() + " rows " + n.toStr()
+    })
+    return r.unwrap()
+}
+
+fn main() {
+    println(crashes())
+    let r = lexdb_store.run(lexdb_disk.sim(7), lexdb_store.Options{cacheBytes: 4 * 2048, segBytes: 1024 * 1024, ckptBytes: 64 * 1024, snapNodes: 100000}, fn(st: lexdb_store.Store): int {
+        var t = lexdb_store.begin()
+        let tree = st.createTree(mut &t)
+        t.put(tree, "a", "old" + strings.repeat("o", 29994) + "old").unwrap()
+        t.put(tree, "b", "bbb" + strings.repeat("b", 29994) + "bbb").unwrap()
+        st.commit(t).unwrap()
+
+        // a snapshot, then the value overwritten
+        var snap = st.beginSnapshot().unwrap()
+        var w = lexdb_store.begin()
+        w.put(tree, "a", "new" + strings.repeat("n", 49994) + "new").unwrap()
+        st.commit(w).unwrap()
+        var live = lexdb_store.begin()
+        println("snapshot: " + brief(&val(&st, mut &snap, tree, &"a")) + ", live " + brief(&val(&st, mut &live, tree, &"a")))
+        st.endSnapshot(&snap)
+
+        // a live scan: while it is at "a", another transaction replaces
+        // "b", whose stub the scan has already read (the same leaf)
+        var s = lexdb_store.begin()
+        var first = true
+        let sr = st.scan(mut &s, tree, "", "", fn(e: &lexdb_store.Entry): bool {
+            if first {
+                first = false
+                var x = lexdb_store.begin()
+                x.put(tree, "b", "B" + strings.repeat("x", 29999)).unwrap()     // the same length: the CRC tells
+                st.commit(x).unwrap()
+            }
+            return true
+        })
+        println("changed under a scan: " + (if sr.isErr() { sr.unwrapErr().state } else { "no error" }))
+        var nt = lexdb_store.begin()
+        let next = st.createTree(mut &nt)
+        st.commit(nt).unwrap()
+        println("the next table's id: " + (if next < 100 { "small" } else { next.toStr() }))
+
+        // limits
+        var l = lexdb_store.begin()
+        let k1 = l.put(tree, strings.repeat("k", 513), "v")
+        let k2 = l.put(tree, "big", strings.repeat("z", lexdb_store.MAX_VALUE + 1))
+        let mb = strings.repeat("0123456789abcdef", 65536)
+        let longKey = strings.repeat("K", 512)
+        let lk = strings.repeat("q", 9000)
+        l.put(tree, "mb", mb).unwrap()
+        l.put(tree, longKey, lk).unwrap()
+        st.commit(l).unwrap()
+        var g = lexdb_store.begin()
+        let gm = val(&st, mut &g, tree, &"mb")
+        let gk = val(&st, mut &g, tree, &longKey)
+        println("limits: " + (if k1.isErr() { k1.unwrapErr().state } else { "ok" }) + " " + (if k2.isErr() { k2.unwrapErr().state } else { "ok" }) +
+                ", " + len(gm).toStr() + (if gm == mb { " same" } else { " DIFFERENT" }) + ", 512-byte key " + len(gk).toStr() + (if gk == lk { " same" } else { " DIFFERENT" }))
+
+        // drop
+        let before = chunks(&st, tree)
+        var d = lexdb_store.begin()
+        d.dropTree(tree)
+        st.commit(d).unwrap()
+        println("dropped: chunks " + chunks(&st, tree).toStr() + (if before > 0 { "" } else { " (none before)" }))
+        return 0
+    })
+    r.unwrap()
+    println("refilled in one commit: " + refill())
+}
