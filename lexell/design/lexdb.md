@@ -393,7 +393,7 @@ Built on 2026-11-09 on branch `lexdb`, about 6,300 lines in
 (cache, trees, transactions, log, checkpoints, recovery, snapshots),
 `lexdb_sql` (lexer, parser), `lexdb_exec` (catalog, rows, keys, planner,
 statements, sessions), `lexdb_wire` (protocol 3.0) and `lexdb` (the
-server). Tests: `python3 lexell/tests/lexdb.py` (21 programs in
+server). Tests: `python3 lexell/tests/lexdb.py` (22 programs in
 `tests/lexdb/run`, under `LXL_CHECK=1`).
 
     lexell/compiler/out/lxlc lexell/cmd/lexdb.lxl -o lexdb
@@ -506,10 +506,12 @@ is the comparison to make.
 
 ### 9.4 Next
 
-1. A statement's memory and time: a limit on
-   the rows a statement holds and a statement timeout (a recursive CTE
-   within max_recursion can still grow without bound, 9.11). Smaller: a correlated subquery's value as a lookup's key
-   (now it is only a filter), a small uncorrelated IN set as an IN-list
+1. A long statement letting other sessions run: today a statement that
+   does not wait on I/O holds the one thread until it ends (statement_timeout
+   bounds it, 9.14); its per-row clock check could yield every few ms.
+   Measure the point-select latency beside a long query first.
+2. Smaller items: a correlated subquery's value as a lookup's key (now it
+   is only a filter), a small uncorrelated IN set as an IN-list
    lookup, correlated subqueries in GROUP BY and in aggregates' arguments,
    hashing a correlated scalar subquery with an aggregate (a count per
    customer) as a grouped run, `WITH` before INSERT, UPDATE and DELETE.
@@ -849,9 +851,11 @@ is the comparison to make.
   slices of one string, the page's entries, not two allocations an entry.
   A checkpoint does the same for each node it writes (repack), and its
   write list holds those same strings, making each 4 KiB page only as it is
-  written. Since a slice keeps its whole string alive, everything the store
-  hands out (get, scans) is a copy, and so is a key that moves up into a
-  parent on a split.
+  written. A slice keeps its whole string alive, so a key that moves up
+  into a parent on a split is copied. What get and scans hand out is not
+  copied (9.14 measured the copies at 14% of a scan). The executor keeps
+  nothing beyond a statement, so a page stays alive at most until the
+  statement that read it ends.
 - **Writes.** A changed node leaves memory only once a checkpoint has
   written it. When the cache is over budget, the writer starts a checkpoint
   after an eighth of `ckptBytes` of log, not all of it. While a checkpoint
@@ -900,4 +904,60 @@ is the comparison to make.
   - freeing on change not recorded: conflicted 0.
 
   The store tests that sized their caches in nodes use 2 KB a node now.
+
+### 9.14 A statement's limits
+
+Per session, as PostgreSQL's SET, kept until changed:
+
+- `statement_timeout`: in ms, or with a unit (`'5s'`, `'2 min'`); 0, the
+  default, for none. Error 57014 when exceeded. It counts from the
+  statement's start, across its retries after a conflict. Every 256th
+  row a query looks at (any level of a join, in any query inside it)
+  checks the clock, and so does every round of a recursive CTE. lexdb is
+  one thread, so a long statement holds up every other session; this
+  bounds how long.
+- `max_statement_mem`: in kB, or with a unit (`'64MB'`); 0 for none, 256 MB
+  by default. Error 53200 when exceeded. It counts an estimate of the rows
+  a statement keeps until it ends:
+  - its result and sort;
+  - its groups;
+  - a hash join's built side;
+  - subqueries' results and their per-row cache;
+  - a CTE's shared rows;
+  - a set operation's sides;
+  - a recursion's rows;
+  - the rows an UPDATE or DELETE changes.
+
+  A query inside another checks against its parent's count plus its own,
+  and the parent counts only what it keeps. So a subquery run per row does
+  not add up, while one kept does. Rows that stream (a count, a filter, a
+  few groups) count nothing.
+- `max_recursion` (9.11) is the third. `RESET name`, `RESET ALL` and
+  `SET name = DEFAULT` restore the defaults. A SET in a transaction block
+  that rolls back is undone, as in PostgreSQL. Bad values are 22023. Other
+  SETs are accepted and ignored.
+- **Not counted:** a transaction's writes across statements (an explicit
+  block of many INSERTs), and the pages kept alive by rows that slice them
+  (9.13). The latter is about 1.3 times the count for whole rows; it can
+  be more for a small piece of each of many rows, until the statement
+  ends. A sort cannot be interrupted by the clock: a statement over its
+  time ends after its sort.
+- **Tests.** `exec_limits` (78 statements) covers:
+  - timeouts of a cross join, an endless recursion, a per-row UPDATE, and
+    one in a transaction block (which then fails, 25P02);
+  - each kind of row the memory limit counts, with cases sized so the part
+    alone fits and what is kept from it does not;
+  - streaming queries and per-row subqueries not stopped;
+  - SET forms, units, bad values, RESET, RESET ALL, rollback and commit
+    of SETs.
+
+  Each count removed, the clock check removed, the limits not handed to
+  inner queries, inner queries' temporary rows added to the parent, or
+  rollback keeping SETs: each changes the output. One mutant changes no
+  output: the check inside the row callbacks removed. The count after the
+  scan still stops the statement, only after the rows are gathered.
+- **Measured:** pgbench point selects, HEAD and this over four pairs:
+  23,826 and 23,501 tps (noise). Three scans and a join of 300,000 rows,
+  warm: 0.56 s, the same as before 9.13. 9.13 had made it 0.64 s by
+  copying what scans hand out, and this change stops copying it.
 

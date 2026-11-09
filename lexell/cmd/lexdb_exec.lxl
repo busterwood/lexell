@@ -1122,6 +1122,80 @@ type Run = record {
     stats: []SubStat            // per subquery (or part of a UNION): its runs (EXPLAIN ANALYZE)
     cache: CteCache
     maxRounds: int              // a recursive CTE's rounds at most (the session's max_recursion); 0 no limit
+    held: int                   // about the bytes of rows the statement holds (its runs inside: their own and this)
+    maxHeld: int                // max_statement_mem; 0 no limit
+    deadline: int               // statement_timeout: the monotonic clock's ns to stop at; 0 none
+    ticks: int
+}
+
+// A session's limits on one statement (SET max_recursion,
+// max_statement_mem, statement_timeout).
+pub type Limits = value record {
+    pub rounds: int             // a recursive CTE's rounds; 0 no limit
+    pub mem: int                // bytes of rows held; 0 no limit
+    pub deadline: int           // time.monotonicNs() to stop at; 0 none
+}
+
+pub fn noLimits(): Limits { return Limits{rounds: 0, mem: 0, deadline: 0} }
+
+fn (rs: mut &Run) limit(l: &Limits) {
+    rs.maxRounds = l.rounds
+    rs.maxHeld = l.mem
+    rs.deadline = l.deadline
+}
+
+// Rows of about n bytes now held until the statement ends (or its run
+// inside another does).
+fn (rs: mut &Run) hold(n: int): Result[Unit, DbErr] {
+    rs.held += n
+    if rs.maxHeld > 0 && rs.held > rs.maxHeld { return Err(memErr(rs.maxHeld)) }
+    return Ok(Unit{})
+}
+
+// The bytes a run may still hold (-1: no limit), for code that cannot reach
+// the run (a row callback): it counts and checks itself, then holds.
+fn (rs: &Run) room(): int { return if rs.maxHeld > 0 { rs.maxHeld - rs.held } else { -1 } }
+
+fn memErr(max: int): DbErr {
+    return e("53200", "statement holds more than max_statement_mem (" + (max / 1024).toStr() +
+             " kB) of rows; SET max_statement_mem to allow more, 0 for no limit")
+}
+
+// Per row looked at: every 256th, the clock against statement_timeout.
+fn (rs: mut &Run) tick(): Result[Unit, DbErr] {
+    rs.ticks += 1
+    if rs.deadline == 0 || rs.ticks % 256 != 0 { return Ok(Unit{}) }
+    if time.monotonicNs() > rs.deadline { return Err(e("57014", "canceling statement due to statement timeout")) }
+    return Ok(Unit{})
+}
+
+// About the memory a row takes: its array, and per value its tag and
+// payload (text and numbers their bytes).
+fn rowBytes(r: &[]Val): int {
+    var n = 32
+    for v in r {
+        n += 24
+        match v {
+            Val.Text(t) { n += len(t) }
+            Val.Num(_) { n += 32 }
+            else {}
+        }
+    }
+    return n
+}
+
+fn rowsBytes(rows: &[][]Val): int {
+    var n = 24
+    for r in rows { n += rowBytes(&r) }
+    return n
+}
+
+// A subquery's kept result: its rows, its set's and groups' keys.
+fn resBytes(r: &SubRes): int {
+    var n = 96 + rowsBytes(&r.data)
+    for i in 0..r.set.size() { n += 48 + len(r.set.keyAt(i)) }
+    for i in 0..r.groups.size() { n += 48 + len(r.groups.keyAt(i)) }
+    return n
 }
 
 // max_recursion's default: rounds of a recursive CTE.
@@ -1143,7 +1217,8 @@ fn newRun(q: &Query): Run {
         append(mut &stats, SubStat{runs: 0, hits: 0, cnt: [], inner: []})
     }
     return Run{cnt: array(len(q.levels), Counts{starts: 0, read: 0, joined: 0, nulls: 0, built: 0, kept: 0, unmatched: 0}),
-               seen: seen, memo: memo, memoRes: memoRes, stats: stats, cache: newCache(), maxRounds: MAX_RECURSION}
+               seen: seen, memo: memo, memoRes: memoRes, stats: stats, cache: newCache(), maxRounds: MAX_RECURSION,
+               held: 0, maxHeld: 0, deadline: 0, ticks: 0}
 }
 
 fn keepsRight(join: int): bool { return join == lexdb_sql.J_RIGHT || join == lexdb_sql.J_FULL }
@@ -2013,6 +2088,7 @@ fn materialize(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: 
                 }
             }
             rs.cnt[k].built += len(rows)
+            try rs.hold(rowsBytes(&rows))
             let keepAll = keepsRight(lv.join)
             for i in 0..len(rows) {
                 let r = replace(mut &rows[i], [])
@@ -2059,6 +2135,7 @@ fn materialize(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: 
 // next level if it joins: -1 stop, 0 it does not join, 1 it joined.
 fn tryRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Mats, k: int, r: &[]Val, ri: int,
           row: mut &[]Val, params: &[]Val, emit: &fn(&[]Val): Result[bool, DbErr], rs: mut &Run): Result[int, DbErr] {
+    try rs.tick()
     let lv = &q.levels[k]
     for i in 0..len(r) { row[lv.first + i] = r[i] }
     rs.cnt[k].read += 1
@@ -2134,6 +2211,7 @@ fn runLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Ma
             var res = try runChild(st, txn, &q.subs[i].sel, &ps, -1, rs, i)
             rows = replace(mut &res.rows, [])
             if len(rs.memoRes[i]) < MEMO_MAX {
+                try rs.hold(rowsBytes(&rows) + len(key) + 48)
                 at = len(rs.memoRes[i])
                 rs.memo[i].put(key, at)
                 append(mut &rs.memoRes[i], emptyRes())
@@ -2704,7 +2782,10 @@ fn runFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sp: &SubPlan, para
     var res = try runChild(st, txn, &sp.sel, params, -1, parent, i)
     out.rows = len(res.rows)
     out.data = replace(mut &res.rows, [])
-    if sp.cte >= 0 { cachePut(mut &parent.cache, key, copyRows(&out.data)) }
+    if sp.cte >= 0 {
+        try parent.hold(rowsBytes(&out.data))
+        cachePut(mut &parent.cache, key, copyRows(&out.data))
+    }
     return Ok(out)
 }
 
@@ -2744,9 +2825,14 @@ fn runChild(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params
             i: int): Result[Res, DbErr] {
     var rs = newRun(&sel.q)
     rs.maxRounds = parent.maxRounds
+    rs.maxHeld = parent.maxHeld
+    rs.deadline = parent.deadline
+    rs.held = parent.held
+    rs.ticks = parent.ticks
     rs.cache = replace(mut &parent.cache, newCache())
     let r = execSel(st, txn, sel, params, cap, mut &rs)
     parent.cache = replace(mut &rs.cache, newCache())
+    parent.ticks = rs.ticks
     while len(parent.stats) <= i { append(mut &parent.stats, SubStat{runs: 0, hits: 0, cnt: [], inner: []}) }
     parent.stats[i].runs += 1
     addCounts(mut &parent.stats[i].cnt, &rs.cnt)
@@ -2854,6 +2940,7 @@ fn fillCur(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, x: &Exp
             let r = try runSub(st, txn, &q.subs[i], &ps, rs, i)
             cur[i] = subValue(&n, &r, &xv)
             if len(rs.memoRes[i]) < MEMO_MAX {
+                try rs.hold(resBytes(&r) + len(key) + 48)
                 rs.memo[i].put(key, len(rs.memoRes[i]))
                 append(mut &rs.memoRes[i], r)
             }
@@ -2917,6 +3004,7 @@ fn prepare(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, params:
         } else {
             append(mut &m.subs, try runSub(st, txn, sp, &ps, rs, i))
         }
+        try rs.hold(resBytes(&m.subs[len(m.subs) - 1]))
     }
     // the levels' rows: a subquery's (each is read by one level), a working table's
     for k in 0..len(q.levels) {
@@ -3290,7 +3378,7 @@ fn dupKey(t: &Table, row: &[]Val): DbErr {
              strings.join(&names, ", ") + ")=(" + strings.join(&vals, ", ") + ") already exists.")
 }
 
-fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, lim: int): Result[Res, DbErr] {
+fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, lim: Limits): Result[Res, DbErr] {
     let t = try needTable(st, txn, &s.table)
     var targets: []int = []
     if len(s.names) == 0 {
@@ -3317,7 +3405,7 @@ fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     }
     endScope(mut &sc, mut &q)
     var rs = newRun(&q)
-    rs.maxRounds = lim
+    rs.limit(&lim)
     let m = try prepare(st, txn, &q, params, mut &rs)
     let noAggs: []Val = []
     let env = Env{cols: &q.cols, row: &noAggs, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs}
@@ -3345,7 +3433,7 @@ fn insertRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, targ
     return Ok(tagOnly("INSERT 0 " + count.toStr()))
 }
 
-fn update(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, lim: int): Result[Res, DbErr] {
+fn update(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, lim: Limits): Result[Res, DbErr] {
     var sc = newScope(params, &[])
     var q = try buildQuery(st, txn, &oneTable(&s.table), &s.where, params, &s.subs, mut &sc)
     var targets: []int = []
@@ -3362,9 +3450,14 @@ fn update(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     let t = &q.levels[0].t
     var found: [][]Val = []
     var rs = newRun(&q)
-    rs.maxRounds = lim
+    rs.limit(&lim)
     let m = try prepare(st, txn, &q, params, mut &rs)
+    let room = rs.room()
+    let max = rs.maxHeld
+    var held = 0
     try runQuery(st, txn, &q, &m, params, fn(r: &[]Val): Result[bool, DbErr] {
+        held += 2 * rowBytes(r)             // the row found, and its write
+        if room >= 0 && held > room { return Err(memErr(max)) }
         append(mut &found, copyRow(r))
         return Ok(true)
     }, mut &rs)
@@ -3388,16 +3481,21 @@ fn update(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     return Ok(tagOnly("UPDATE " + len(found).toStr()))
 }
 
-fn delete(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, lim: int): Result[Res, DbErr] {
+fn delete(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, lim: Limits): Result[Res, DbErr] {
     var sc = newScope(params, &[])
     var q = try buildQuery(st, txn, &oneTable(&s.table), &s.where, params, &s.subs, mut &sc)
     endScope(mut &sc, mut &q)
     let t = &q.levels[0].t
     var found: [][]Val = []
     var rs = newRun(&q)
-    rs.maxRounds = lim
+    rs.limit(&lim)
     let m = try prepare(st, txn, &q, params, mut &rs)
+    let room = rs.room()
+    let max = rs.maxHeld
+    var held = 0
     try runQuery(st, txn, &q, &m, params, fn(r: &[]Val): Result[bool, DbErr] {
+        held += 2 * rowBytes(r)             // the row found, and its write
+        if room >= 0 && held > room { return Err(memErr(max)) }
         append(mut &found, copyRow(r))
         return Ok(true)
     }, mut &rs)
@@ -3409,7 +3507,7 @@ fn delete(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     return Ok(tagOnly("DELETE " + len(found).toStr()))
 }
 
-fn explain(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, x: &lexdb_sql.Stmt, params: &[]Val, lim: int,
+fn explain(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, x: &lexdb_sql.Stmt, params: &[]Val, lim: Limits,
            ptypes: &[]int): Result[Res, DbErr] {
     let s = &x.inner[0]
     var res = Res{cols: [OutCol{name: "QUERY PLAN", oid: lexdb_sql.OID_TEXT}], rows: [], tag: "EXPLAIN", hasRows: true}
@@ -3628,7 +3726,7 @@ fn orderValue(o: &Expr, outs: &[]OutCol, vals: &[]Val, env: &Env): Result[Val, D
 }
 
 fn select(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int,
-          lim: int): Result[Res, DbErr] {
+          lim: Limits): Result[Res, DbErr] {
     var none: []str = []
     return selectWith(st, txn, s, params, ptypes, lim, false, mut &none)
 }
@@ -4256,7 +4354,9 @@ fn runSet(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params: 
     for j in base + sel.split..len(params) { append(mut &rp, params[j]) }
     if sel.rec >= 0 { return runRecursive(st, txn, sel, &lp, &rp, rs) }
     var lres = try runChild(st, txn, &sel.parts[0], &lp, -1, rs, 0)
+    try rs.hold(rowsBytes(&lres.rows))
     var rres = try runChild(st, txn, &sel.parts[1], &rp, -1, rs, 1)
+    try rs.hold(rowsBytes(&rres.rows))
     return Ok(combine(sel.setop, sel.setAll, replace(mut &lres.rows, []), replace(mut &rres.rows, [])))
 }
 
@@ -4274,6 +4374,8 @@ fn runRecursive(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, lp
     // max_recursion: rounds that add rows (the last round, adding none, is free)
     var rounds = 0
     while len(work) > 0 {
+        try rs.tick()
+        try rs.hold(rowsBytes(&work) * 2)       // kept in the result and as the working table
         for r in work { append(mut &out, copyRow(&r)) }
         cachePut(mut &rs.cache, key, work)
         var rres = try runChild(st, txn, &sel.parts[1], rp, -1, rs, 1)
@@ -4328,11 +4430,11 @@ fn setLines(sel: &Sel, stats: &[]SubStat): []str {
 // A SELECT; with analyze, plan gets EXPLAIN ANALYZE's lines (a line per
 // table, with what it did). The counts are kept for every query: an add each.
 fn selectWith(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int,
-              lim: int, analyze: bool, plan: mut &[]str): Result[Res, DbErr] {
+              lim: Limits, analyze: bool, plan: mut &[]str): Result[Res, DbErr] {
     var sc = newScope(params, ptypes)
     let sel = try planSelect(st, txn, s, params, mut &sc)
     var rs = newRun(&sel.q)
-    rs.maxRounds = lim
+    rs.limit(&lim)
     let res = try execSel(st, txn, &sel, params, -1, mut &rs)
     if analyze {
         let lines = selLines(&sel, &rs.cnt, &rs.stats)
@@ -4364,6 +4466,9 @@ fn execSel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
         if sorting { for x in sel.order { if hasCorr(&x) { late = true } } }
     }
     var outRows: []OutRow = []
+    // the rows kept here, counted in the row callbacks (they cannot reach rs)
+    let room = rs.room()
+    var held = 0
     if sel.setop != 0 {
         var rows = try runSet(st, txn, sel, params, rs)
         let noCols: []lexdb_sql.ColDef = []
@@ -4375,9 +4480,11 @@ fn execSel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
                 let env = Env{cols: &noCols, row: &vals, aggs: &none, params: params, subs: &m.subs, cur: &none}
                 for o in sel.order { append(mut &ord, try orderValue(&o, &sel.outs, &vals, &env)) }
             }
+            held += rowBytes(&ord)
             append(mut &outRows, OutRow{vals: vals, ord: ord})
         }
     }
+    let rs0max = rs.maxHeld
     let early = !sel.aggQ && !sorting && limit >= 0 && !(late && sel.distinct)
     let stopAt = if offset > 0 { limit + offset } else { limit }
     let noAggs: []Val = []
@@ -4401,6 +4508,8 @@ fn execSel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
                     Some(i) { g = i }
                     None {
                         g = len(firsts)
+                        held += rowBytes(r) + 64 * (len(sel.specs) + 1) + len(k)
+                        if room >= 0 && held > room { return Err(memErr(rs0max)) }
                         index.put(k, g)
                         append(mut &firsts, copyRow(r))
                         append(mut &accs, newAccs(len(sel.specs)))
@@ -4434,11 +4543,14 @@ fn execSel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
             }
             var ord: []Val = []
             if sorting { for o in sel.order { append(mut &ord, try orderX(st, txn, q, &o, &sel.outs, &out, &env, rs)) } }
+            held += rowBytes(&out) + rowBytes(&ord)
             append(mut &outRows, OutRow{vals: out, ord: ord})
         }
     } else if late {
         var raws: [][]Val = []
         try runQuery(st, txn, q, &m, params, fn(r: &[]Val): Result[bool, DbErr] {
+            held += rowBytes(r)
+            if room >= 0 && held > room { return Err(memErr(rs0max)) }
             append(mut &raws, copyRow(r))
             return Ok(!early || len(raws) < stopAt)
         }, rs)
@@ -4453,6 +4565,7 @@ fn execSel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
             }
             var ord: []Val = []
             if sorting { for o in sel.order { append(mut &ord, try orderX(st, txn, q, &o, &sel.outs, &vals, &env, rs)) } }
+            held += rowBytes(&vals) + rowBytes(&ord)
             append(mut &outRows, OutRow{vals: vals, ord: ord})
         }
     } else {
@@ -4467,10 +4580,13 @@ fn execSel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
             }
             var ord: []Val = []
             if sorting { for o in sel.order { append(mut &ord, try orderValue(&o, &sel.outs, &vals, &env)) } }
+            held += rowBytes(&vals) + rowBytes(&ord)
+            if room >= 0 && held > room { return Err(memErr(rs0max)) }
             append(mut &outRows, OutRow{vals: vals, ord: ord})
             return Ok(!early || len(outRows) < stopAt)
         }, rs)
     }
+    try rs.hold(held)
     if sorting {
         collections.sortBy(mut &outRows, fn(a: &OutRow, b: &OutRow): int {
             for i in 0..len(sel.desc) {
@@ -4623,10 +4739,67 @@ pub type Session = record {
     txn: []lexdb_store.Txn      // the open transaction block, if any
     failed: bool                // an error in the block: only ROLLBACK (or COMMIT) now
     maxRecursion: int           // SET max_recursion: a recursive CTE's rounds at most; 0 no limit
+    timeoutMs: int              // SET statement_timeout: a statement's time at most; 0 no limit
+    maxMem: int                 // SET max_statement_mem: the bytes of rows a statement holds at most; 0 no limit
+    saved: []Limits             // in a transaction block: the settings at its BEGIN (a ROLLBACK restores them)
 }
 
 pub fn newSession(st: lexdb_store.Store): Session {
-    return Session{st: st, txn: [], failed: false, maxRecursion: MAX_RECURSION}
+    return Session{st: st, txn: [], failed: false, maxRecursion: MAX_RECURSION, timeoutMs: 0, maxMem: MAX_STATEMENT_MEM,
+                   saved: []}
+}
+
+// max_statement_mem's default.
+pub const MAX_STATEMENT_MEM = 256 * 1024 * 1024
+
+// A transaction block rolled back: its SETs with it (as PostgreSQL's).
+fn (s: mut &Session) restore() {
+    if len(s.saved) == 0 { return }
+    let l = pop(mut &s.saved)
+    s.maxRecursion = l.rounds
+    s.maxMem = l.mem
+    s.timeoutMs = l.deadline                // saved there: the timeout in ms
+}
+
+// The limits for a statement starting now.
+fn (s: &Session) limits(): Limits {
+    let dl = if s.timeoutMs > 0 { time.monotonicNs() + s.timeoutMs * 1000000 } else { 0 }
+    return Limits{rounds: s.maxRecursion, mem: s.maxMem, deadline: dl}
+}
+
+// A setting's value: a number (statement_timeout in ms, max_statement_mem
+// in kB, as PostgreSQL's), or a string with a unit ('5s', '64MB').
+fn settingValue(name: &str, v: &Val): Result[int, DbErr] {
+    let bad = e("22023", "invalid value for parameter \"" + name + "\"")
+    var n = 0
+    var unit = ""
+    match v {
+        Val.Int(i) { n = i }
+        Val.Text(t) {
+            var i = 0
+            while i < len(t) && t[i] >= '0' && t[i] <= '9' { i += 1 }
+            if i == 0 { return Err(bad) }
+            n = strings.parseIntOpt(t[0..i]).unwrapOr(-1)
+            unit = strings.toLowerAscii(strings.trim(t[i..len(t)]))
+        }
+        else { return Err(bad) }
+    }
+    if n < 0 { return Err(bad) }
+    if name == "statement_timeout" {
+        if unit == "" || unit == "ms" { return Ok(n) }
+        if unit == "s" { return Ok(n * 1000) }
+        if unit == "min" { return Ok(n * 60000) }
+        if unit == "h" { return Ok(n * 3600000) }
+        return Err(bad)
+    }
+    if name == "max_statement_mem" {
+        if unit == "" || unit == "kb" { return Ok(n * 1024) }
+        if unit == "mb" { return Ok(n * 1024 * 1024) }
+        if unit == "gb" { return Ok(n * 1024 * 1024 * 1024) }
+        return Err(bad)
+    }
+    if unit != "" { return Err(bad) }
+    return Ok(n)
 }
 
 // Ends the session: an open block is rolled back (a snapshot released).
@@ -4660,7 +4833,7 @@ pub fn (s: &Session) status(): byte {
 }
 
 fn execIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int,
-          lim: int): Result[Res, DbErr] {
+          lim: Limits): Result[Res, DbErr] {
     // with subqueries, the outer values they use are numbered after all the
     // statement's parameters: those not sent are NULL
     let subs = hasSubs(s)
@@ -4681,7 +4854,7 @@ fn hasSubs(s: &lexdb_sql.Stmt): bool {
 }
 
 fn execStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int,
-            lim: int): Result[Res, DbErr] {
+            lim: Limits): Result[Res, DbErr] {
     match s.kind {
         lexdb_sql.S_CREATE { return createTable(st, txn, s) }
         lexdb_sql.S_DROP { return dropTable(st, txn, s) }
@@ -4726,14 +4899,25 @@ pub fn (s: mut &Session) run(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
     match stmt.kind {
         lexdb_sql.S_EMPTY { return Ok(tagOnly("")) }
         lexdb_sql.S_SET {
-            if stmt.table == "max_recursion" {
+            if stmt.table == "all" {
+                s.maxRecursion = MAX_RECURSION
+                s.timeoutMs = 0
+                s.maxMem = MAX_STATEMENT_MEM
+            } else if stmt.table != "" {
+                var v = -1                          // DEFAULT, RESET
                 match stmt.limit {
                     Some(x) {
-                        let v = try evalInt(&Some(clone(&x)), params, "max_recursion")
-                        s.maxRecursion = if v < 0 { MAX_RECURSION } else { v }
+                        let noCols: []lexdb_sql.ColDef = []
+                        let none: []Val = []
+                        let noSubs: []SubRes = []
+                        let env = Env{cols: &noCols, row: &none, aggs: &none, params: params, subs: &noSubs, cur: &none}
+                        v = try settingValue(&stmt.table, &(try eval(&x, &env)))
                     }
-                    None { s.maxRecursion = MAX_RECURSION }     // RESET
+                    None {}
                 }
+                if stmt.table == "max_recursion" { s.maxRecursion = if v < 0 { MAX_RECURSION } else { v } }
+                if stmt.table == "statement_timeout" { s.timeoutMs = if v < 0 { 0 } else { v } }
+                if stmt.table == "max_statement_mem" { s.maxMem = if v < 0 { MAX_STATEMENT_MEM } else { v } }
             }
             return Ok(tagOnly(if stmt.ifFlag { "RESET" } else { "SET" }))
         }
@@ -4745,6 +4929,7 @@ pub fn (s: mut &Session) run(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
                     append(mut &s.txn, lexdb_store.begin())
                 }
                 s.failed = false
+                s.saved = [Limits{rounds: s.maxRecursion, mem: s.maxMem, deadline: s.timeoutMs}]
             }
             return Ok(tagOnly("BEGIN"))
         }
@@ -4754,14 +4939,17 @@ pub fn (s: mut &Session) run(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
             if s.failed {
                 s.failed = false
                 s.st.abort(t)
+                s.restore()
                 return Ok(tagOnly("ROLLBACK"))
             }
+            s.saved = []
             try s.st.commit(t)
             return Ok(tagOnly("COMMIT"))
         }
         lexdb_sql.S_ROLLBACK {
             if len(s.txn) > 0 { s.st.abort(pop(mut &s.txn)) }
             s.failed = false
+            s.restore()
             return Ok(tagOnly("ROLLBACK"))
         }
         else {}
@@ -4775,7 +4963,7 @@ pub fn (s: mut &Session) run(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
             return Err(e("25006", "cannot execute " + stmtName(stmt.kind) + " in a read-only transaction"))
         }
         let st = s.st
-        let r = execIn(&st, mut &s.txn[0], stmt, params, ptypes, s.maxRecursion)
+        let r = execIn(&st, mut &s.txn[0], stmt, params, ptypes, s.limits())
         if r.isErr() {
             s.failed = true
             return r
@@ -4786,9 +4974,10 @@ pub fn (s: mut &Session) run(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
         return r
     }
     var tries = 0
+    let lim = s.limits()                    // retries share the statement's time
     while true {
         var t = lexdb_store.begin()
-        let r = try execIn(&s.st, mut &t, stmt, params, ptypes, s.maxRecursion)
+        let r = try execIn(&s.st, mut &t, stmt, params, ptypes, lim)
         match s.st.commit(t) {
             Ok(_) { return Ok(r) }
             Err(x) {

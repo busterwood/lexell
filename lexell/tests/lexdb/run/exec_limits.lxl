@@ -1,0 +1,206 @@
+// lexdb_exec: a session's limits on a statement. statement_timeout (ms,
+// or with a unit) stops a long query, a recursive CTE and a long DML with
+// 57014; max_statement_mem (kB, or with a unit) stops a statement holding
+// too many rows (a result, a sort, groups, a hash join's side, a CTE's
+// rows, recursion, the rows an UPDATE changes) with 53200, while one that
+// streams its rows (a count, a few groups) or runs a subquery per row
+// (not adding up) is not stopped; SET forms, RESET, RESET ALL, bad values.
+// expect: create table big (id int primary key, a int, b text) -> CREATE TABLE
+// expect: create table small (id int primary key, name text) -> CREATE TABLE
+// expect: insert into small values (1, 'one'), (2, 'two'), (3, 'three') -> INSERT 0 3
+// expect: select count(*) from big -> 20000
+// expect: set statement_timeout = 200 -> SET
+// expect: set max_recursion = 0 -> SET
+// expect: select count(*) from big x, big y -> 57014 canceling statement due to statement timeout
+// expect: with recursive t(n) as (select 1 union all select n + 1 from t) select count(*) from t -> 57014 canceling statement due to statement timeout
+// expect: select count(*) from big -> 20000
+// expect: set statement_timeout to '1s' -> SET
+// expect: select count(*) from big x, small y -> 60000
+// expect: set statement_timeout = '50ms' -> SET
+// expect: update big set a = a + 1 where (select count(*) from big z where z.a < big.id) > 0 -> 57014 canceling statement due to statement timeout
+// expect: select count(*) from big where a = 1 -> 200
+// expect: set statement_timeout = default -> SET
+// expect: select count(*) from small x, small y, small z -> 27
+// expect: set max_statement_mem = '1MB' -> SET
+// expect: set max_recursion = 0 -> SET
+// expect: select * from big -> 53200 statement holds more than max_statement_mem (1024 kB) of rows; SET max_statement_mem to allow more, 0 for no limit
+// expect: select * from big where id < 100 -> 100 rows
+// expect: select id from big order by b desc limit 5 -> 53200 statement holds more than max_statement_mem (1024 kB) of rows; SET max_statement_mem to allow more, 0 for no limit
+// expect: select count(*), sum(a) from big -> 20000|990000
+// expect: select a, count(*) from big group by a order by a limit 2 -> 0|200; 1|200
+// expect: select b, count(*) from big group by b -> 53200 statement holds more than max_statement_mem (1024 kB) of rows; SET max_statement_mem to allow more, 0 for no limit
+// expect: select count(*) from big x join big y on y.b = x.b -> 53200 statement holds more than max_statement_mem (1024 kB) of rows; SET max_statement_mem to allow more, 0 for no limit
+// expect: select count(*) from small x join big y on y.id = x.id -> 3
+// expect: select count(*) from big where a in (select a from big) -> 53200 statement holds more than max_statement_mem (1024 kB) of rows; SET max_statement_mem to allow more, 0 for no limit
+// expect: select count(*) from big x where (select count(*) from small s where s.id = x.a) > 0 -> 600
+// expect: select count(*) from big x where exists (select 1 from big y where y.id = x.id + 1) -> 53200 statement holds more than max_statement_mem (1024 kB) of rows; SET max_statement_mem to allow more, 0 for no limit
+// expect: with w as (select * from big) select count(*) from w -> 53200 statement holds more than max_statement_mem (1024 kB) of rows; SET max_statement_mem to allow more, 0 for no limit
+// expect: with recursive t(n) as (select 1 union all select n + 1 from t where n < 50000) select count(*) from t -> 53200 statement holds more than max_statement_mem (1024 kB) of rows; SET max_statement_mem to allow more, 0 for no limit
+// expect: select count(*) from (select id from big union select id from big) u -> 53200 statement holds more than max_statement_mem (1024 kB) of rows; SET max_statement_mem to allow more, 0 for no limit
+// expect: update big set a = a where id >= 0 -> 53200 statement holds more than max_statement_mem (1024 kB) of rows; SET max_statement_mem to allow more, 0 for no limit
+// expect: update big set a = a where id < 10 -> UPDATE 10
+// expect: delete from big where id < 0 -> DELETE 0
+// expect: select count(*) from big where id in (select id from big where id < 9500) and id + 1 in (select id + 1 from big where id < 9500) -> 53200 statement holds more than max_statement_mem (1024 kB) of rows; SET max_statement_mem to allow more, 0 for no limit
+// expect: select count(*) from big where id in (select id from big where id < 9500) -> 9500
+// expect: with w as (select id from big where id < 5500) select count(*) from w a join w b on b.id = a.id -> 53200 statement holds more than max_statement_mem (1024 kB) of rows; SET max_statement_mem to allow more, 0 for no limit
+// expect: with w as (select id from big where id < 3000) select count(*) from w a join w b on b.id = a.id -> 3000
+// expect: select id from big where id < 8000 union all select id from big where id < 8000 -> 53200 statement holds more than max_statement_mem (1024 kB) of rows; SET max_statement_mem to allow more, 0 for no limit
+// expect: select id from big where id < 4000 union all select id from big where id < 4000 -> 8000 rows
+// expect: select count(*) from (select id from big where id < 5500 union all select id from big where id < 5500) u -> 11000
+// expect: select count(*) from (select id from big where id < 3000 union all select id from big where id < 3000) u -> 6000
+// expect: with recursive t(n) as (select 1 union all select n + 1 from t where n < 8000) select count(*) from t -> 53200 statement holds more than max_statement_mem (1024 kB) of rows; SET max_statement_mem to allow more, 0 for no limit
+// expect: with recursive t(n) as (select 1 union all select n + 1 from t where n < 3000) select count(*) from t -> 3000
+// expect: select b, count(*) from big group by b having count(*) > 1 -> 53200 statement holds more than max_statement_mem (1024 kB) of rows; SET max_statement_mem to allow more, 0 for no limit
+// expect: select a, count(*) from big group by a having count(*) > 1000 -> SELECT 0
+// expect: set max_statement_mem = 4096 -> SET
+// expect: select count(*) from big x where (select count(*) from (select s.id from small s, small t where s.id <> x.id) q) > 0 -> 20000
+// expect: select * from big where id < 10000 -> 10000 rows
+// expect: set max_statement_mem = 0 -> SET
+// expect: select * from big -> 20000 rows
+// expect: reset max_statement_mem -> RESET
+// expect: select * from big -> 20000 rows
+// expect: set statement_timeout = '2 min' -> SET
+// expect: set statement_timeout = 'soon' -> 22023 invalid value for parameter "statement_timeout"
+// expect: set statement_timeout = -5 -> 22023 invalid value for parameter "statement_timeout"
+// expect: set max_statement_mem = '1 PB' -> 22023 invalid value for parameter "max_statement_mem"
+// expect: set max_recursion = '1s' -> 22023 invalid value for parameter "max_recursion"
+// expect: set session max_statement_mem = '1kB' -> SET
+// expect: select count(*) from small x, small y -> 9
+// expect: select * from small x, small y -> 53200 statement holds more than max_statement_mem (1 kB) of rows; SET max_statement_mem to allow more, 0 for no limit
+// expect: reset all -> RESET
+// expect: select * from small x, small y -> 9 rows
+// expect: set work_mem = '64MB' -> SET
+// expect: begin -> BEGIN
+// expect: set statement_timeout = 100 -> SET
+// expect: select count(*) from big x, big y -> 57014 canceling statement due to statement timeout
+// expect: select 1 -> 25P02 current transaction is aborted, commands ignored until end of transaction block
+// expect: rollback -> ROLLBACK
+// expect: begin -> BEGIN
+// expect: set max_statement_mem = '1kB' -> SET
+// expect: rollback -> ROLLBACK
+// expect: select * from small x, small y -> 9 rows
+// expect: begin -> BEGIN
+// expect: set max_statement_mem = '1kB' -> SET
+// expect: commit -> COMMIT
+// expect: select * from small x, small y -> 53200 statement holds more than max_statement_mem (1 kB) of rows; SET max_statement_mem to allow more, 0 for no limit
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "strings"
+
+fn show(s: mut &lexdb_exec.Session, sql: str) {
+    match s.exec(&sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            var lines: []str = []
+            for row in r.rows {
+                var cells: []str = []
+                for v in row { append(mut &cells, if lexdb_exec.isNull(&v) { "NULL" } else { lexdb_exec.text(&v) }) }
+                append(mut &lines, strings.join(&cells, "|"))
+            }
+            println(sql + " -> " + (if len(lines) == 0 { r.tag } else if len(lines) > 3 { len(lines).toStr() + " rows" } else { strings.join(&lines, "; ") }))
+        }
+        Err(e) { println(sql + " -> " + e.state + " " + e.msg) }
+    }
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(1), lexdb_store.Options{cacheBytes: 128 * 1024 * 1024, segBytes: 4 * 1024 * 1024, ckptBytes: 2 * 1024 * 1024, snapNodes: 50000}, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        show(mut &s, "create table big (id int primary key, a int, b text)")
+        show(mut &s, "create table small (id int primary key, name text)")
+        var i = 0
+        while i < 20000 {
+            var vals: []str = []
+            for j in i..i + 1000 { append(mut &vals, "(" + j.toStr() + ", " + (j % 100).toStr() + ", 'row " + j.toStr() + " some padding text')") }
+            match s.exec(&("insert into big values " + strings.join(&vals, ", "))) {
+                Ok(_) {}
+                Err(x) { println("insert: " + x.msg) }
+            }
+            i += 1000
+        }
+        show(mut &s, "insert into small values (1, 'one'), (2, 'two'), (3, 'three')")
+        show(mut &s, "select count(*) from big")
+        // time
+        show(mut &s, "set statement_timeout = 200")
+        show(mut &s, "set max_recursion = 0")
+        show(mut &s, "select count(*) from big x, big y")
+        show(mut &s, "with recursive t(n) as (select 1 union all select n + 1 from t) select count(*) from t")
+        show(mut &s, "select count(*) from big")
+        show(mut &s, "set statement_timeout to '1s'")
+        show(mut &s, "select count(*) from big x, small y")
+        show(mut &s, "set statement_timeout = '50ms'")
+        show(mut &s, "update big set a = a + 1 where (select count(*) from big z where z.a < big.id) > 0")
+        show(mut &s, "select count(*) from big where a = 1")
+        show(mut &s, "set statement_timeout = default")
+        show(mut &s, "select count(*) from small x, small y, small z")
+        // memory
+        show(mut &s, "set max_statement_mem = '1MB'")
+        show(mut &s, "set max_recursion = 0")
+        show(mut &s, "select * from big")
+        show(mut &s, "select * from big where id < 100")
+        show(mut &s, "select id from big order by b desc limit 5")
+        show(mut &s, "select count(*), sum(a) from big")
+        show(mut &s, "select a, count(*) from big group by a order by a limit 2")
+        show(mut &s, "select b, count(*) from big group by b")
+        show(mut &s, "select count(*) from big x join big y on y.b = x.b")
+        show(mut &s, "select count(*) from small x join big y on y.id = x.id")
+        show(mut &s, "select count(*) from big where a in (select a from big)")
+        show(mut &s, "select count(*) from big x where (select count(*) from small s where s.id = x.a) > 0")
+        show(mut &s, "select count(*) from big x where exists (select 1 from big y where y.id = x.id + 1)")
+        show(mut &s, "with w as (select * from big) select count(*) from w")
+        show(mut &s, "with recursive t(n) as (select 1 union all select n + 1 from t where n < 50000) select count(*) from t")
+        show(mut &s, "select count(*) from (select id from big union select id from big) u")
+        show(mut &s, "update big set a = a where id >= 0")
+        show(mut &s, "update big set a = a where id < 10")
+        show(mut &s, "delete from big where id < 0")
+        // each part within the limit, what is kept from them not
+        show(mut &s, "select count(*) from big where id in (select id from big where id < 9500) and id + 1 in (select id + 1 from big where id < 9500)")
+        show(mut &s, "select count(*) from big where id in (select id from big where id < 9500)")
+        show(mut &s, "with w as (select id from big where id < 5500) select count(*) from w a join w b on b.id = a.id")
+        show(mut &s, "with w as (select id from big where id < 3000) select count(*) from w a join w b on b.id = a.id")
+        show(mut &s, "select id from big where id < 8000 union all select id from big where id < 8000")
+        show(mut &s, "select id from big where id < 4000 union all select id from big where id < 4000")
+        show(mut &s, "select count(*) from (select id from big where id < 5500 union all select id from big where id < 5500) u")
+        show(mut &s, "select count(*) from (select id from big where id < 3000 union all select id from big where id < 3000) u")
+        show(mut &s, "with recursive t(n) as (select 1 union all select n + 1 from t where n < 8000) select count(*) from t")
+        show(mut &s, "with recursive t(n) as (select 1 union all select n + 1 from t where n < 3000) select count(*) from t")
+        show(mut &s, "select b, count(*) from big group by b having count(*) > 1")
+        show(mut &s, "select a, count(*) from big group by a having count(*) > 1000")
+        show(mut &s, "set max_statement_mem = 4096")
+        show(mut &s, "select count(*) from big x where (select count(*) from (select s.id from small s, small t where s.id <> x.id) q) > 0")
+        show(mut &s, "select * from big where id < 10000")
+        show(mut &s, "set max_statement_mem = 0")
+        show(mut &s, "select * from big")
+        show(mut &s, "reset max_statement_mem")
+        show(mut &s, "select * from big")
+        // forms and values
+        show(mut &s, "set statement_timeout = '2 min'")
+        show(mut &s, "set statement_timeout = 'soon'")
+        show(mut &s, "set statement_timeout = -5")
+        show(mut &s, "set max_statement_mem = '1 PB'")
+        show(mut &s, "set max_recursion = '1s'")
+        show(mut &s, "set session max_statement_mem = '1kB'")
+        show(mut &s, "select count(*) from small x, small y")
+        show(mut &s, "select * from small x, small y")
+        show(mut &s, "reset all")
+        show(mut &s, "select * from small x, small y")
+        show(mut &s, "set work_mem = '64MB'")
+        // in a transaction: a timeout ends it; SETs rolled back with it, kept by COMMIT
+        show(mut &s, "begin")
+        show(mut &s, "set statement_timeout = 100")
+        show(mut &s, "select count(*) from big x, big y")
+        show(mut &s, "select 1")
+        show(mut &s, "rollback")
+        show(mut &s, "begin")
+        show(mut &s, "set max_statement_mem = '1kB'")
+        show(mut &s, "rollback")
+        show(mut &s, "select * from small x, small y")
+        show(mut &s, "begin")
+        show(mut &s, "set max_statement_mem = '1kB'")
+        show(mut &s, "commit")
+        show(mut &s, "select * from small x, small y")
+        return 0
+    }).unwrap()
+}
