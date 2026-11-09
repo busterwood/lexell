@@ -24,8 +24,9 @@
 // uniqueidentifier, xml, and their (max) forms. sql_variant, UDTs and table
 // types are an E_TYPE error naming the type for their cells. query reads
 // rows whole; stream (T3, design/db-streaming.md) reads them a buffer at a
-// time into the program's records, and ends early with ATTENTION. Pools and
-// ATTENTION on a task's deadline come later in T3.
+// time into the program's records, and ends early with ATTENTION. Pool and
+// Lease are the shared pool's (design/pool.md); ATTENTION on a task's
+// deadline comes later in T3.
 //
 // Connection strings (design/tds.md, section 4) take the ADO.NET keywords
 // and the ODBC ones that mssql is given, so one string serves both modules:
@@ -63,6 +64,7 @@ import "sqldialect"
 import "sqlrows"
 import "strings"
 import "task"
+import "pool"
 import "time"
 
 pub type Value = sqldialect.Value
@@ -329,6 +331,48 @@ pub fn connectWith(st: &Settings, w: Where): Result[Conn, Error] {
 
 // Closes the connection (dropping it does the same).
 pub fn (c: Conn) close() {}
+
+// -------------------------------------------------------------------- pools
+
+// A pool of at most `size` connections to one server, for the tasks of a
+// program: the shared pool of lib/pool.lxl (design/pool.md) over Conn.
+// acquire takes an idle connection, opens a new one while fewer than size
+// are open, or else parks until another task gives one back, first come
+// first served. A Lease gives the connection back when it is dropped, unless
+// it is no longer idle (broken, in a transaction, a stream left unfinished): that one is
+// closed, and its place goes to the next waiter, which opens a new
+// connection. A Pool is a counted handle: copies reach the same pool, and the
+// connections close when the last copy and the last lease are gone.
+//
+//     let pool = try sqlserver.newPool(connStr, 16)
+//     // in any task:
+//     var l = try pool.acquire()
+//     let rows = try l.conn().query("SELECT name FROM users WHERE id = @p1", &[Value.Int(id)])
+pub type Pool = pool.Pool[Conn, Settings, Error]
+pub type Lease = pool.Lease[Conn, Settings, Error]
+pub type PoolStats = pool.PoolStats
+
+// A pool over a connection string, parsed now: one that cannot be parsed is
+// E_INPUT here, not at the first acquire.
+pub fn newPool(connStr: str, size: int): Result[Pool, Error] {
+    let st = try parseConnString(connStr)
+    return Ok(pool.newPool[Conn, Settings, Error](st, size))
+}
+
+// pool.Pooled: how the pool opens, judges and reuses a connection.
+pub fn (Conn) open(st: &Settings, w: Where): Result[Conn, Error] { return connectWith(st, w) }
+
+pub fn (Conn) waitFailed(why: task.Cancelled): Error {
+    return sqldialect.dbError(if why == task.Cancelled.Timeout { sqldialect.E_TIMEOUT } else { sqldialect.E_CANCELLED },
+        "pool: " + why.toStr() + " while waiting for a connection")
+}
+
+pub fn (c: mut &Conn) release(): bool { return c.idle() }
+
+pub fn (c: mut &Conn) reuse(w: Where): Result[Unit, Error] {
+    if c.idle() { return Ok(Unit{}) }
+    return Err(sqldialect.dbError(sqldialect.E_IO, "pool: the idle connection went bad"))
+}
 
 // "16.0.4135" (LOGINACK's version).
 pub fn (c: &Conn) serverVersion(): str { return c.s.serverVersion }

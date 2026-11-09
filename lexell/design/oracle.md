@@ -188,7 +188,7 @@ round trips sized by bytes"). `masked()` hides the password.
 - **O4** LOBs: CLOB/NCLOB/BLOB through LONG defines, then LOB locators and
   streaming reads and writes.
 - **later** REF CURSORs and implicit results, PL/SQL OUT binds, intervals,
-  JSON and VECTOR, array DML, statement cache, DRCP and pooling, Advanced
+  JSON and VECTOR, array DML, statement cache, DRCP, Advanced
   Queuing, NNE, Kerberos/RADIUS/token auth, out-of-band breaks (cancel of a
   running statement), the 23ai "fast auth" and pipelining.
 
@@ -501,4 +501,5 @@ Next stages: O4 LOBs (LONG defines, then locators; LOB OUT binds),
 PL/SQL collections and records as binds, array DML (executemany), REF
 CURSOR IN binds, nested cursors (CURSOR(...) columns), intervals, JSON and
 VECTOR, REDIRECT packets (RAC and shared servers), out-of-band breaks,
-statement cache, pooling and DRCP, Advanced Queuing, NNE.
+statement cache, DRCP, Advanced Queuing, NNE. (A client-side pool is
+built: the shared pool of design/pool.md, stage 4.)

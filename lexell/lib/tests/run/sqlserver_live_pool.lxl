@@ -1,0 +1,134 @@
+// sqlserver.Pool against a live SQL Server ($MSSQL_TEST_DSN or ~/.obo-mssql-dsn; exits 77,
+// skipped, without one; the string and the server's connect messages are
+// never printed): eight tasks share a pool of two connections, never more
+// than two open, the others parked in acquire until a lease is dropped; a
+// waiter whose deadline passes leaves the queue; an idle connection is
+// handed out again; a lease left in a transaction is closed and its place
+// reopened; a string that does not parse fails newPool; a pool that cannot
+// connect reports it and keeps no place. No handle stays open.
+// expect: results 0 1 2 3 4 5 6 7
+// expect: most open at once: 2
+// expect: after: open 2, idle 2, waiting 0
+// expect: waiter timeout: error 1021: pool: timeout while waiting for a connection
+// expect: after timeout: open 1, idle 1, waiting 0
+// expect: same connection again: true
+// expect: not idle: true, closed, a new one: true
+// expect: bad string: error 1000
+// expect: bad server: failed true, open 0
+// expect: open handles 0
+import "sqlserver"
+import "task"
+import "io"
+import "os"
+import "strings"
+
+type V = sqlserver.Value
+type Error = sqlserver.Error
+
+fn dsn(): Option[str] {
+    match os.env("MSSQL_TEST_DSN") {
+        Some(d) { if len(strings.trim(d)) > 0 { return Some(strings.trim(d)) } }
+        None {}
+    }
+    match io.read(os.envOr("HOME", "") + "/.obo-mssql-dsn") {
+        Ok(d) { if len(strings.trim(d)) > 0 { return Some(strings.trim(d)) } }
+        Err(_) {}
+    }
+    return None
+}
+
+type Work = value record { pool: sqlserver.Pool; k: int; peak: task.Shared[int] }
+
+fn work(w: Work): int {
+    var l = w.pool.acquire().unwrap()
+    let st = w.pool.stats()
+    w.peak.with(fn(p: mut &int) { if st.open > p { p = st.open } })
+    let r = l.conn().query("SELECT CAST(@p1 AS bigint)", &[V.Int(w.k)]).unwrap().int(0, 0).unwrap()
+    task.sleep(20).unwrap()
+    return r
+}
+
+// Which session this is: the server may give a closed session's id to the
+// next one, so its login time too.
+fn session(l: mut &sqlserver.Lease): str {
+    let rows = l.conn().query("SELECT CAST(@@SPID AS nvarchar(10)) + N' ' + CONVERT(nvarchar(30), login_time, 126) FROM sys.dm_exec_sessions WHERE session_id = @@SPID", &[]).unwrap()
+    return rows.text(0, 0).unwrap()
+}
+
+fn stats(p: &sqlserver.Pool): str {
+    let s = p.stats()
+    return "open " + s.open.toStr() + ", idle " + s.idle.toStr() + ", waiting " + s.waiting.toStr()
+}
+
+type Hold = value record { pool: sqlserver.Pool; ms: int }
+
+fn hold(h: Hold): int {
+    var l = h.pool.acquire().unwrap()
+    task.sleep(h.ms).unwrap()
+    return 0
+}
+
+fn main() {
+    let d = match dsn() { Some(x) { x } None { exit(77) } }
+    match sqlserver.connect(d) {
+        Ok(c) {
+            var c2 = c
+            c2.close()
+        }
+        Err(_) { exit(77) }
+    }
+    run(d)
+
+    println("open handles " + intToStr(sqlserver.openHandles()))
+}
+
+fn run(d: str) {
+    let pool = sqlserver.newPool(d, 2).unwrap()
+    let peak = task.shared(0)
+    task.scope(fn(s: mut &task.Scope) {
+        var fs: []task.Future[int] = []
+        for k in 0..8 { append(mut &fs, s.start(work, Work{pool: pool, k: k, peak: peak})) }
+        var line = "results"
+        for r in task.all(fs).unwrap() { line = line + " " + r.toStr() }
+        println(line)
+    })
+    peak.with(fn(p: mut &int) { println("most open at once: " + p.toStr()) })
+    println("after: " + stats(&pool))
+
+    let one = sqlserver.newPool(d, 1).unwrap()
+    task.scope(fn(s: mut &task.Scope) {
+        let h = s.start(hold, Hold{pool: one, ms: 300})
+        task.sleep(20).unwrap()
+        match task.within(50, fn(): Result[sqlserver.Lease, Error] { return one.acquire() }) {
+            Ok(_) { println("waiter timeout: got one?") }
+            Err(e) { println("waiter timeout: " + e.toStr()) }
+        }
+        h.wait().unwrap()
+    })
+    println("after timeout: " + stats(&one))
+    var first = ""
+    {
+        var l = one.acquire().unwrap()
+        first = session(mut &l)
+    }
+    {
+        var l = one.acquire().unwrap()
+        println("same connection again: " + (session(mut &l) == first).toStr())
+        l.conn().exec("BEGIN TRANSACTION").unwrap()
+        print("not idle: " + (!l.conn().idle()).toStr())
+    }
+    {
+        var l = one.acquire().unwrap()
+        println(", closed, a new one: " + (session(mut &l) != first).toStr())
+    }
+
+    match sqlserver.newPool("nonsense", 2) {
+        Ok(_) { println("bad string: parsed?") }
+        Err(e) { println("bad string: error " + e.code.toStr()) }
+    }
+    let bad = sqlserver.newPool("Server=tcp:127.0.0.1,1;UID=x;PWD=y;Encrypt=no;Connect Timeout=3", 3).unwrap()
+    match bad.acquire() {
+        Ok(_) { println("bad server: connected?") }
+        Err(e) { println("bad server: failed " + (e.code != 0).toStr() + ", open " + bad.stats().open.toStr()) }
+    }
+}
