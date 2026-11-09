@@ -76,14 +76,49 @@
 // expect: explain select a.name, b.name from cust a join cust b on b.id = a.id + 1 -> [QUERY PLAN] scan cust a: full scan; join cust b: primary key lookup per row
 // expect: select c.name, o.total, p.name from cust c join orders o on o.cust = c.id join people p on p.id = c.id order by o.id -> [name,total,name]
 // expect: select c.name from cust c join orders o on o.cust = c.id limit 1 -> [name] ann
-// expect: select * from cust c right join orders o on true -> 0A000 RIGHT, FULL and NATURAL joins are not supported
+// expect: select * from cust c right join orders o on true -> [id,name,id,cust,total] 1|ann|10|1|5; 1|ann|11|1|7; 1|ann|12|2|9; 1|ann|13|9|1; 2|bob|10|1|5; 2|bob|11|1|7; 2|bob|12|2|9; 2|bob|13|9|1; 3|cy|10|1|5; 3|cy|11|1|7; 3|cy|12|2|9; 3|cy|13|9|1
 // expect: -- explain analyze
 // expect: explain analyze select c.name, o.total from cust c join orders o on o.cust = c.id -> scan cust c: full scan (rows read 3, kept 3); join orders o: index orders_cust lookup per row (lookups 3, rows read 3, joined 3); result: 3 rows
 // expect: drop index orders_cust -> DROP INDEX
 // expect: explain analyze select c.name, o.total from cust c left join orders o on o.cust = c.id -> scan cust c: full scan (rows read 3, kept 3); left join orders o: hash on (cust) over full scan (table rows 4 of 4 read, probes 3, rows read 3, joined 3, null rows 1); result: 4 rows
 // expect: explain analyze select c.name, o.total from orders o join cust c on c.id = o.cust where o.total > 6 -> scan orders o: full scan (rows read 4, kept 2); join cust c: primary key lookup per row (lookups 2, rows read 2, joined 2); result: 2 rows
-// expect: explain analyze select count(*) from cust a, cust b -> scan cust a: full scan (rows read 3, kept 3); cross join cust b: loop over full scan (table rows 3 of 3 read, probes 3, rows read 9, joined 9); result: 1 rows
+// expect: explain analyze select count(*) from cust a, cust b -> scan cust a: full scan (rows read 3, kept 3); cross join cust b: loop over full scan (table rows 3 of 3 read, probes 3, rows read 9, joined 9); aggregate; result: 1 rows
 // expect: explain analyze delete from cust -> 0A000 EXPLAIN ANALYZE takes SELECT
+// expect: -- right and full joins
+// expect: select c.name, o.id from orders o right join cust c on o.cust = c.id order by c.id, o.id -> [name,id] ann|10; ann|11; bob|12; cy|NULL
+// expect: select c.name, o.id from cust c right join orders o on o.cust = c.id order by o.id -> [name,id] ann|10; ann|11; bob|12; NULL|13
+// expect: select c.name, o.id from cust c full join orders o on o.cust = c.id order by o.id, c.id -> [name,id] ann|10; ann|11; bob|12; NULL|13; cy|NULL
+// expect: select c.name, o.id from cust c full outer join orders o on o.cust = c.id and o.total > 6 order by o.id, c.id -> [name,id] NULL|10; ann|11; bob|12; NULL|13; cy|NULL
+// expect: select c.name, o.id from cust c right join orders o on o.cust = c.id where c.name is null -> [name,id] NULL|13
+// expect: select o.id from cust c right join orders o on o.cust = c.id where c.id > 1 -> [id] 12
+// expect: select c.name, o.id, p.name from cust c join people p on p.id = c.id + 2 right join orders o on o.cust = c.id order by o.id -> [name,id,name] ann|10|cy; ann|11|cy; bob|12|di; NULL|13|NULL
+// expect: explain select * from cust c full join orders o on o.cust = c.id -> [QUERY PLAN] scan cust c: full scan; full join orders o: hash on (cust) over full scan
+// expect: explain analyze select * from cust c full join orders o on o.cust = c.id -> scan cust c: full scan (rows read 3, kept 3); full join orders o: hash on (cust) over full scan (table rows 4 of 4 read, probes 3, rows read 3, joined 3, null rows 1, unmatched rows 1); result: 5 rows
+// expect: -- order by and min/max through indexes
+// expect: explain select name from people order by city limit 2 -> [QUERY PLAN] scan people: index people_city scan; order: the scan's; limit: stops the scan
+// expect: select name, city from people order by city limit 3 -> [name,city] cy|oslo; NULL|oslo; NULL|oslo
+// expect: explain select name from people order by city desc limit 2 -> [QUERY PLAN] scan people: index people_city scan backward; order: the scan's; limit: stops the scan
+// expect: select name, city from people order by city desc limit 3 -> [name,city] di|NULL; bob|rome; NULL|oslo
+// expect: explain select name from people order by city -> [QUERY PLAN] scan people: full scan; order: sort
+// expect: explain select id from people where city = 'oslo' order by id desc -> [QUERY PLAN] scan people: index people_city lookup backward; order: the scan's
+// expect: select id from people where city = 'oslo' order by id desc -> [id] 7; 6; 3
+// expect: explain select id from people order by id desc limit 2 -> [QUERY PLAN] scan people: full scan backward; order: the scan's; limit: stops the scan
+// expect: select id from people order by id desc limit 2 offset 1 -> [id] 7; 6
+// expect: select id, name from people order by 2 limit 2 -> [id,name] 20|bob; 3|cy
+// expect: explain select id, name as n from people order by n limit 2 -> [QUERY PLAN] scan people: index people_name scan; order: the scan's; limit: stops the scan
+// expect: explain select min(city) from people -> [QUERY PLAN] scan people: index people_city scan; min/max: the first value in the scan's order
+// expect: select min(city), max(city) from people -> [min,max] oslo|rome
+// expect: select max(city) from people -> [max] rome
+// expect: explain select max(city) from people -> [QUERY PLAN] scan people: index people_city scan backward; min/max: the first value in the scan's order
+// expect: select min(name) from people where city = 'oslo' -> [min] cy
+// expect: select max(id) from people where id < 7 -> [max] 6
+// expect: explain select max(id) from people where id < 7 -> [QUERY PLAN] scan people: primary key range; min/max: the first value in the scan's order
+// expect: select min(age) from people -> [min] 1
+// expect: select max(city) from people where city > 'z' -> [max] NULL
+// expect: explain analyze select max(city) from people -> scan people: index people_city scan backward (rows read 1, kept 1); min/max: the first value in the scan's order; result: 1 rows
+// expect: explain analyze select name from people order by city desc limit 1 -> scan people: index people_city scan backward (rows read 1, kept 1); order: the scan's; limit: stops the scan; result: 1 rows
+// expect: select c.name, o.id from cust c join orders o on o.cust = c.id order by c.id desc limit 2 -> [name,id] bob|12; ann|10
+// expect: explain select c.name, o.id from cust c join orders o on o.cust = c.id order by c.id desc limit 2 -> [QUERY PLAN] scan cust c: full scan backward; join orders o: hash on (cust) over full scan; order: the scan's; limit: stops the scan
 // expect: drop table orders -> DROP TABLE
 // expect: create index orders_cust on cust (name) -> CREATE INDEX
 // expect: explain update people set age = 1 where name = 'cy' -> [QUERY PLAN] scan people: index people_name lookup
@@ -215,6 +250,41 @@ fn body(st: lexdb_store.Store): int {
     analyze(mut &s, "explain analyze select c.name, o.total from orders o join cust c on c.id = o.cust where o.total > 6")
     analyze(mut &s, "explain analyze select count(*) from cust a, cust b")
     show(mut &s, "explain analyze delete from cust")
+    println("-- right and full joins")
+    show(mut &s, "select c.name, o.id from orders o right join cust c on o.cust = c.id order by c.id, o.id")
+    show(mut &s, "select c.name, o.id from cust c right join orders o on o.cust = c.id order by o.id")
+    show(mut &s, "select c.name, o.id from cust c full join orders o on o.cust = c.id order by o.id, c.id")
+    show(mut &s, "select c.name, o.id from cust c full outer join orders o on o.cust = c.id and o.total > 6 order by o.id, c.id")
+    show(mut &s, "select c.name, o.id from cust c right join orders o on o.cust = c.id where c.name is null")
+    show(mut &s, "select o.id from cust c right join orders o on o.cust = c.id where c.id > 1")
+    show(mut &s, "select c.name, o.id, p.name from cust c join people p on p.id = c.id + 2 right join orders o on o.cust = c.id order by o.id")
+    show(mut &s, "explain select * from cust c full join orders o on o.cust = c.id")
+    analyze(mut &s, "explain analyze select * from cust c full join orders o on o.cust = c.id")
+    println("-- order by and min/max through indexes")
+    show(mut &s, "explain select name from people order by city limit 2")
+    show(mut &s, "select name, city from people order by city limit 3")
+    show(mut &s, "explain select name from people order by city desc limit 2")
+    show(mut &s, "select name, city from people order by city desc limit 3")
+    show(mut &s, "explain select name from people order by city")
+    show(mut &s, "explain select id from people where city = 'oslo' order by id desc")
+    show(mut &s, "select id from people where city = 'oslo' order by id desc")
+    show(mut &s, "explain select id from people order by id desc limit 2")
+    show(mut &s, "select id from people order by id desc limit 2 offset 1")
+    show(mut &s, "select id, name from people order by 2 limit 2")
+    show(mut &s, "explain select id, name as n from people order by n limit 2")
+    show(mut &s, "explain select min(city) from people")
+    show(mut &s, "select min(city), max(city) from people")
+    show(mut &s, "select max(city) from people")
+    show(mut &s, "explain select max(city) from people")
+    show(mut &s, "select min(name) from people where city = 'oslo'")
+    show(mut &s, "select max(id) from people where id < 7")
+    show(mut &s, "explain select max(id) from people where id < 7")
+    show(mut &s, "select min(age) from people")
+    show(mut &s, "select max(city) from people where city > 'z'")
+    analyze(mut &s, "explain analyze select max(city) from people")
+    analyze(mut &s, "explain analyze select name from people order by city desc limit 1")
+    show(mut &s, "select c.name, o.id from cust c join orders o on o.cust = c.id order by c.id desc limit 2")
+    show(mut &s, "explain select c.name, o.id from cust c join orders o on o.cust = c.id order by c.id desc limit 2")
     show(mut &s, "drop table orders")
     show(mut &s, "create index orders_cust on cust (name)")
     show(mut &s, "explain update people set age = 1 where name = 'cy'")

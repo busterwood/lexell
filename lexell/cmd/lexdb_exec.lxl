@@ -872,6 +872,8 @@ type Path = record {
     index: int
     eqs: []Expr
     rng: []Bound
+    desc: bool          // read backward (ORDER BY ... DESC, MAX)
+    noNulls: bool       // an index path: leave out its next column's NULLs (MIN, MAX)
 }
 
 type Scan = record {
@@ -911,11 +913,25 @@ type Counts = value record {
     nulls: int          // LEFT JOIN rows made with NULLs
     built: int          // hash: rows read to build it, and kept
     kept: int
+    unmatched: int      // RIGHT and FULL JOIN: its rows that joined nothing
 }
 
-fn newCounts(q: &Query): []Counts {
-    return array(len(q.levels), Counts{starts: 0, read: 0, joined: 0, nulls: 0, built: 0, kept: 0})
+// A query's run: the counts, and per RIGHT or FULL JOIN table which of its
+// rows have joined.
+type Run = record { cnt: []Counts; seen: [][]bool }
+
+fn newRun(q: &Query): Run {
+    var seen: [][]bool = []
+    for k in 0..len(q.levels) { append(mut &seen, []) }
+    return Run{cnt: array(len(q.levels), Counts{starts: 0, read: 0, joined: 0, nulls: 0, built: 0, kept: 0, unmatched: 0}),
+               seen: seen}
 }
+
+fn keepsRight(join: int): bool { return join == lexdb_sql.J_RIGHT || join == lexdb_sql.J_FULL }
+
+fn keepsLeft(join: int): bool { return join == lexdb_sql.J_LEFT || join == lexdb_sql.J_FULL }
+
+fn isOuter(join: int): bool { return keepsLeft(join) || keepsRight(join) }
 
 pub type Query = record {
     levels: []Level
@@ -1077,7 +1093,7 @@ fn keyCols(t: &Table, index: int): []int {
 // the next column; the primary key wins a tie. Nothing: a full scan.
 fn choosePath(q: &Query, k: int, cs: &[]Expr): Path {
     let lv = &q.levels[k]
-    var best = Path{index: -1, eqs: [], rng: []}
+    var best = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false}
     var bestScore = 0
     for c0 in 0..len(lv.t.indexes) + 1 {
         let c = c0 - 1
@@ -1101,7 +1117,7 @@ fn choosePath(q: &Query, k: int, cs: &[]Expr): Path {
         }
         if score > bestScore {
             bestScore = score
-            best = Path{index: c, eqs: eqs, rng: rng}
+            best = Path{index: c, eqs: eqs, rng: rng, desc: false, noNulls: false}
         }
     }
     return best
@@ -1150,7 +1166,9 @@ fn pathScan(t: &Table, p: &Path, env: &Env): Result[Scan, DbErr] {
                 if s != "" && (hi == "" || s < hi) { hi = s }
             }
         }
-        if ix {
+    }
+    if ix && (len(p.rng) > 0 || p.noNulls) {
+        {
             // An index's NULLs sort last (marker 2): no range includes them.
             var nb = newStrBuf()
             nb.add(pre)
@@ -1194,17 +1212,29 @@ fn fetch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, p: &Path,
         }
         return Ok(Unit{})
     }
-    let from = if cur.started { cur.at } else { sc.lo }
-    cur.started = true
     let tree = if p.index >= 0 { t.indexes[p.index].tree } else { t.tree }
     var vals: []str = []
     var last = ""
-    try st.scan(txn, tree, from, sc.hi, fn(en: &lexdb_store.Entry): bool {
-        append(mut &vals, en.val)
-        last = en.key
-        return len(vals) < BATCH
-    })
-    if len(vals) < BATCH { cur.done = true } else { cur.at = after(&last) }
+    if p.desc {
+        // backward: the cursor is the exclusive end
+        let to = if cur.started { cur.at } else { sc.hi }
+        cur.started = true
+        try st.scanBack(txn, tree, sc.lo, to, fn(en: &lexdb_store.Entry): bool {
+            append(mut &vals, en.val)
+            last = en.key
+            return len(vals) < BATCH
+        })
+        if len(vals) < BATCH { cur.done = true } else { cur.at = last }
+    } else {
+        let from = if cur.started { cur.at } else { sc.lo }
+        cur.started = true
+        try st.scan(txn, tree, from, sc.hi, fn(en: &lexdb_store.Entry): bool {
+            append(mut &vals, en.val)
+            last = en.key
+            return len(vals) < BATCH
+        })
+        if len(vals) < BATCH { cur.done = true } else { cur.at = after(&last) }
+    }
     for v in vals {
         if p.index < 0 {
             append(out, try decRow(&v, n))
@@ -1227,7 +1257,7 @@ fn allTrue(cs: &[]Expr, cols: &[]lexdb_sql.ColDef, row: &[]Val, params: &[]Val):
 }
 
 fn newLevel(t: Table, alias: str, join: int, first: int): Level {
-    return Level{t: t, alias: alias, join: join, first: first, path: Path{index: -1, eqs: [], rng: []}, cond: [],
+    return Level{t: t, alias: alias, join: join, first: first, path: Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false}, cond: [],
                  post: [], local: [], perRow: true, hashCols: [], hashVals: [], mat: [], keys: newMap(), buckets: []}
 }
 
@@ -1249,6 +1279,10 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
         append(mut &q.levels, newLevel(t, f.alias, f.join, first))
     }
     let nl = len(q.levels)
+    // A RIGHT or FULL JOIN can make the columns before it NULL: no WHERE
+    // conjunct goes below the last one.
+    var lastRight = -1
+    for k in 0..nl { if keepsRight(q.levels[k].join) { lastRight = k } }
     var ms: [][]Expr = []
     var ps: [][]Expr = []
     for k in 0..nl {
@@ -1275,7 +1309,8 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
                 } else {
                     var k = q.maxLevel(&c)
                     if k < 0 { k = 0 }
-                    if q.levels[k].join == lexdb_sql.J_LEFT { append(mut &ps[k], c) } else { append(mut &ms[k], c) }
+                    if lastRight > k { k = lastRight }
+                    if isOuter(q.levels[k].join) { append(mut &ps[k], c) } else { append(mut &ms[k], c) }
                 }
             }
         }
@@ -1283,15 +1318,21 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
     }
     for k in 0..nl {
         let m = replace(mut &ms[k], [])
-        let path = choosePath(&q, k, &m)
-        let perRow = k == 0 || q.pathOuter(&path)
+        var path = choosePath(&q, k, &m)
+        var perRow = k == 0 || q.pathOuter(&path)
+        let right = keepsRight(q.levels[k].join)
+        if right {
+            // Every row of it is kept: read it all once, and remember which joined.
+            path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false}
+            perRow = false
+        }
         var local: []Expr = []
         var hcols: []int = []
         var hvals: []Expr = []
         if !perRow {
             for c in m {
                 if q.minLevel(&c) >= k {
-                    append(mut &local, clone(&c))
+                    if !right { append(mut &local, clone(&c)) }
                     continue
                 }
                 match c {
@@ -1338,7 +1379,7 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
 
 // Reads the tables that are joined by hash, once.
 fn materialize(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query, params: &[]Val,
-               cnt: mut &[]Counts): Result[Unit, DbErr] {
+               rs: mut &Run): Result[Unit, DbErr] {
     for k in 1..len(q.levels) {
         if q.levels[k].perRow { continue }
         var rows: [][]Val = []
@@ -1355,7 +1396,8 @@ fn materialize(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query,
                 var cur = newCursor()
                 while !cur.done { try fetch(st, txn, &lv.t, &lv.path, &sc, mut &cur, mut &rows) }
             }
-            cnt[k].built += len(rows)
+            rs.cnt[k].built += len(rows)
+            let keepAll = keepsRight(lv.join)
             for i in 0..len(rows) {
                 let r = replace(mut &rows[i], [])
                 for j in 0..len(r) { full[lv.first + j] = r[j] }
@@ -1366,7 +1408,14 @@ fn materialize(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query,
                     if isNull(&r[c]) { nul = true }
                     encIdxPart(mut &kb, &r[c])
                 }
-                if nul { continue }           // NULL equals nothing
+                if nul {
+                    // NULL equals nothing; a RIGHT or FULL JOIN still keeps the row
+                    if keepAll {
+                        append(mut &mat, r)
+                        rs.cnt[k].kept += 1
+                    }
+                    continue
+                }
                 let key = kb.toStr()
                 var b = -1
                 match keys.get(&key) {
@@ -1379,9 +1428,10 @@ fn materialize(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query,
                 }
                 append(mut &buckets[b], len(mat))
                 append(mut &mat, r)
-                cnt[k].kept += 1
+                rs.cnt[k].kept += 1
             }
         }
+        if keepsRight(q.levels[k].join) { rs.seen[k] = array(len(mat), false) }
         q.levels[k].mat = mat
         q.levels[k].keys = keys
         q.levels[k].buckets = buckets
@@ -1391,26 +1441,27 @@ fn materialize(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query,
 
 // Places a candidate row of level k in the joined row and goes on to the
 // next level if it joins: -1 stop, 0 it does not join, 1 it joined.
-fn tryRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, k: int, r: &[]Val, row: mut &[]Val,
-          params: &[]Val, emit: &fn(&[]Val): Result[bool, DbErr], cnt: mut &[]Counts): Result[int, DbErr] {
+fn tryRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, k: int, r: &[]Val, ri: int, row: mut &[]Val,
+          params: &[]Val, emit: &fn(&[]Val): Result[bool, DbErr], rs: mut &Run): Result[int, DbErr] {
     let lv = &q.levels[k]
     for i in 0..len(r) { row[lv.first + i] = r[i] }
-    cnt[k].read += 1
+    rs.cnt[k].read += 1
     if !(try allTrue(&lv.cond, &q.cols, row, params)) { return Ok(0) }
-    cnt[k].joined += 1
+    rs.cnt[k].joined += 1
+    if ri >= 0 && len(rs.seen[k]) > 0 { rs.seen[k][ri] = true }
     if !(try allTrue(&lv.post, &q.cols, row, params)) { return Ok(1) }
-    if !(try runLevel(st, txn, q, k + 1, row, params, emit, cnt)) { return Ok(-1) }
+    if !(try runLevel(st, txn, q, k + 1, row, params, emit, rs)) { return Ok(-1) }
     return Ok(1)
 }
 
 // Joins the rows of level k on to the joined row (levels before k filled),
 // calling emit for each complete row; false: emit asked to stop.
 fn runLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, k: int, row: mut &[]Val, params: &[]Val,
-            emit: &fn(&[]Val): Result[bool, DbErr], cnt: mut &[]Counts): Result[bool, DbErr] {
+            emit: &fn(&[]Val): Result[bool, DbErr], rs: mut &Run): Result[bool, DbErr] {
     if k == len(q.levels) { return emit(row) }
     let lv = &q.levels[k]
     var matched = false
-    cnt[k].starts += 1
+    rs.cnt[k].starts += 1
     if !lv.perRow {
         var kb = newStrBuf()
         var nul = false
@@ -1427,7 +1478,7 @@ fn runLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, k: int
             match lv.keys.get(&kb.toStr()) {
                 Some(b) {
                     for ri in lv.buckets[b] {
-                        let got = try tryRow(st, txn, q, k, &lv.mat[ri], row, params, emit, cnt)
+                        let got = try tryRow(st, txn, q, k, &lv.mat[ri], ri, row, params, emit, rs)
                         if got < 0 { return Ok(false) }
                         if got > 0 { matched = true }
                     }
@@ -1447,17 +1498,17 @@ fn runLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, k: int
             var batch: [][]Val = []
             try fetch(st, txn, &lv.t, &lv.path, &sc, mut &cur, mut &batch)
             for r in batch {
-                let got = try tryRow(st, txn, q, k, &r, row, params, emit, cnt)
+                let got = try tryRow(st, txn, q, k, &r, -1, row, params, emit, rs)
                 if got < 0 { return Ok(false) }
                 if got > 0 { matched = true }
             }
         }
     }
-    if lv.join == lexdb_sql.J_LEFT && !matched {
+    if keepsLeft(lv.join) && !matched {
         for i in 0..len(lv.t.cols) { row[lv.first + i] = Val.Null }
-        cnt[k].nulls += 1
+        rs.cnt[k].nulls += 1
         if try allTrue(&lv.post, &q.cols, row, params) {
-            if !(try runLevel(st, txn, q, k + 1, row, params, emit, cnt)) { return Ok(false) }
+            if !(try runLevel(st, txn, q, k + 1, row, params, emit, rs)) { return Ok(false) }
         }
     }
     return Ok(true)
@@ -1465,14 +1516,29 @@ fn runLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, k: int
 
 // Calls emit on each row of the query (materialize first).
 fn runQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, params: &[]Val,
-            emit: &fn(&[]Val): Result[bool, DbErr], cnt: mut &[]Counts): Result[Unit, DbErr] {
+            emit: &fn(&[]Val): Result[bool, DbErr], rs: mut &Run): Result[Unit, DbErr] {
     if len(q.levels) == 0 {
         let none: []Val = []
         if try allTrue(&q.top, &q.cols, &none, params) { let more = try emit(&none) }
         return Ok(Unit{})
     }
     var row: []Val = array(len(q.cols), Val.Null)
-    let done = try runLevel(st, txn, q, 0, mut &row, params, emit, cnt)
+    if !(try runLevel(st, txn, q, 0, mut &row, params, emit, rs)) { return Ok(Unit{}) }
+    // A RIGHT or FULL JOIN's rows that joined nothing, with NULLs for the
+    // tables before it, go on through the tables after it.
+    for k in 1..len(q.levels) {
+        let lv = &q.levels[k]
+        if !keepsRight(lv.join) { continue }
+        for ri in 0..len(lv.mat) {
+            if rs.seen[k][ri] { continue }
+            for i in 0..len(row) { row[i] = Val.Null }
+            for i in 0..len(lv.mat[ri]) { row[lv.first + i] = lv.mat[ri][i] }
+            rs.cnt[k].unmatched += 1
+            if try allTrue(&lv.post, &q.cols, &row, params) {
+                if !(try runLevel(st, txn, q, k + 1, mut &row, params, emit, rs)) { return Ok(Unit{}) }
+            }
+        }
+    }
     return Ok(Unit{})
 }
 
@@ -1482,9 +1548,10 @@ fn pathText(lv: &Level): str {
     if p.index < 0 {
         if len(p.eqs) == len(cols) { return "primary key lookup" }
         if len(p.eqs) > 0 || len(p.rng) > 0 { return "primary key range" }
-        return "full scan"
+        return "full scan" + (if p.desc { " backward" } else { "" })
     }
-    return "index " + lv.t.indexes[p.index].name + (if len(p.eqs) == len(cols) { " lookup" } else { " range" })
+    let what = if len(p.eqs) == len(cols) { " lookup" } else if len(p.eqs) > 0 || len(p.rng) > 0 { " range" } else { " scan" }
+    return "index " + lv.t.indexes[p.index].name + what + (if p.desc { " backward" } else { "" })
 }
 
 // EXPLAIN: a line per table; with counts (EXPLAIN ANALYZE), what each did.
@@ -1503,7 +1570,8 @@ fn explainLines(q: &Query, cnt: &[]Counts): []str {
             }
             append(mut &parts, "rows read " + c.read.toStr())
             append(mut &parts, (if k == 0 { "kept " } else { "joined " }) + c.joined.toStr())
-            if q.levels[k].join == lexdb_sql.J_LEFT { append(mut &parts, "null rows " + c.nulls.toStr()) }
+            if keepsLeft(q.levels[k].join) { append(mut &parts, "null rows " + c.nulls.toStr()) }
+            if keepsRight(q.levels[k].join) { append(mut &parts, "unmatched rows " + c.unmatched.toStr()) }
             tail = " (" + strings.join(&parts, ", ") + ")"
         }
         let lv = &q.levels[k]
@@ -1512,7 +1580,13 @@ fn explainLines(q: &Query, cnt: &[]Counts): []str {
             append(mut &out, "scan " + name + ": " + pathText(lv) + tail)
             continue
         }
-        let kind = match lv.join { lexdb_sql.J_LEFT { "left join " } lexdb_sql.J_CROSS { "cross join " } else { "join " } }
+        let kind = match lv.join {
+            lexdb_sql.J_LEFT { "left join " }
+            lexdb_sql.J_RIGHT { "right join " }
+            lexdb_sql.J_FULL { "full join " }
+            lexdb_sql.J_CROSS { "cross join " }
+            else { "join " }
+        }
         var how = ""
         if lv.perRow {
             how = pathText(lv) + " per row"
@@ -1676,7 +1750,7 @@ fn createIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
         append(mut &cols, i)
     }
     let ix = Index{name: s.index, tree: st.createTree(txn), cols: cols, unique: s.unique}
-    let path = Path{index: -1, eqs: [], rng: []}
+    let path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false}
     let sc = Scan{empty: false, point: false, lo: "", hi: ""}
     var cur = newCursor()
     while !cur.done {
@@ -1789,11 +1863,11 @@ fn update(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
         append(mut &sets, try resolve(&set.expr, &q.cols, len(q.cols)))
     }
     var found: [][]Val = []
-    var cnt = newCounts(&q)
+    var rs = newRun(&q)
     try runQuery(st, txn, &q, params, fn(r: &[]Val): Result[bool, DbErr] {
         append(mut &found, copyRow(r))
         return Ok(true)
-    }, mut &cnt)
+    }, mut &rs)
     let noGroup: [][]Val = []
     for old in found {
         let env = Env{cols: &q.cols, row: &old, group: &noGroup, agg: false, params: params}
@@ -1818,11 +1892,11 @@ fn delete(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     let q = try buildQuery(st, txn, &oneTable(&s.table), &s.where)
     let t = &q.levels[0].t
     var found: [][]Val = []
-    var cnt = newCounts(&q)
+    var rs = newRun(&q)
     try runQuery(st, txn, &q, params, fn(r: &[]Val): Result[bool, DbErr] {
         append(mut &found, copyRow(r))
         return Ok(true)
-    }, mut &cnt)
+    }, mut &rs)
     for row in found {
         let key = keyOf(t, &row)
         txn.del(t.tree, key)
@@ -1836,6 +1910,7 @@ fn explain(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, x: &lexdb_sql.Stmt
     let s = &x.inner[0]
     var res = Res{cols: [OutCol{name: "QUERY PLAN", oid: lexdb_sql.OID_TEXT}], rows: [], tag: "EXPLAIN", hasRows: true}
     var lines: []str = []
+    let none: []Counts = []
     if x.ifFlag {
         // ANALYZE: run it, counting what each table does
         let t0 = time.monotonicNs()
@@ -1843,13 +1918,12 @@ fn explain(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, x: &lexdb_sql.Stmt
         let us = (time.monotonicNs() - t0) / 1000
         append(mut &lines, "result: " + len(r.rows).toStr() + " rows in " + (us / 1000).toStr() + "." +
                strings.padLeft((us % 1000).toStr(), 3, '0') + " ms")
+    } else if s.kind == lexdb_sql.S_SELECT {
+        let sel = try planSelect(st, txn, s, params, ptypes)
+        lines = selLines(&sel, &none)
     } else {
-        let q = if s.kind == lexdb_sql.S_SELECT { try buildQuery(st, txn, &s.from, &s.where) } else {
-            try buildQuery(st, txn, &oneTable(&s.table), &s.where)
-        }
-        let none: []Counts = []
+        let q = try buildQuery(st, txn, &oneTable(&s.table), &s.where)
         lines = explainLines(&q, &none)
-        if len(q.levels) == 0 { append(mut &lines, "result") }
     }
     for l in lines { append(mut &res.rows, [Val.Text(l)]) }
     return Ok(res)
@@ -2029,12 +2103,111 @@ fn select(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     return selectWith(st, txn, s, params, ptypes, false, mut &none)
 }
 
-// A SELECT; with analyze, plan gets EXPLAIN ANALYZE's lines (a line per
-// table, with what it did). The counts are kept for every query: an add each.
-fn selectWith(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int,
-              analyze: bool, plan: mut &[]str): Result[Res, DbErr] {
+// A SELECT, planned: its query, its output, and how its order is had.
+type Sel = record {
+    q: Query
+    exprs: []Expr
+    outs: []OutCol
+    groupBy: []Expr
+    order: []Expr
+    aggQ: bool
+    sort: bool              // ORDER BY sorts; false: the scan gives the order
+    first: int              // MIN or MAX served by the scan's order: stop at the first non-NULL value of this column
+    limit: int
+    offset: int
+}
+
+// The column of level 0 an expression is, else -1.
+fn (q: &Query) firstCol(x: &Expr): int {
+    match x {
+        Expr.Col(n) {
+            if q.levelOf(&n) == 0 { return colIndex(&q.cols, &n) }
+        }
+        else {}
+    }
+    return -1
+}
+
+// The columns of the first table an ORDER BY sorts by, all one way: the
+// direction (0 up, 1 down), or -1 when it sorts by anything else.
+fn orderCols(q: &Query, order: &[]Expr, items: &[]lexdb_sql.OrderItem, exprs: &[]Expr, outs: &[]OutCol,
+             cols: mut &[]int): int {
+    if len(order) == 0 || len(q.levels) == 0 { return -1 }
+    for i in 0..len(order) {
+        if items[i].desc != items[0].desc { return -1 }
+        var c = q.firstCol(&order[i])
+        match order[i] {
+            Expr.Lit(v) {
+                match v {
+                    Val.Int(n) { if n >= 1 && n <= len(exprs) { c = q.firstCol(&exprs[n - 1]) } }
+                    else {}
+                }
+            }
+            Expr.Col(n) {
+                if c < 0 {
+                    for j in 0..len(outs) { if outs[j].name == n { c = q.firstCol(&exprs[j]) } }
+                }
+            }
+            else {}
+        }
+        if c < 0 { return -1 }
+        append(cols, c)
+    }
+    return if items[0].desc { 1 } else { 0 }
+}
+
+// Whether a path of the first table gives its rows in the order of cols:
+// they follow its key (an index's key ends with the primary key) after its
+// equalities, skipping columns held equal.
+fn servesOrder(t: &Table, p: &Path, cols: &[]int): bool {
+    var key = keyCols(t, p.index)
+    if p.index >= 0 { for c in t.pk { append(mut &key, c) } }
+    if p.index < 0 && len(p.eqs) == len(t.pk) { return true }     // one row
+    var j = len(p.eqs)
+    for c in cols {
+        if j < len(key) && key[j] == c {
+            j += 1
+            continue
+        }
+        var held = false
+        for x in 0..len(p.eqs) { if key[x] == c { held = true } }
+        if !held { return false }
+    }
+    return true
+}
+
+// A full scan of the primary key or an index that gives the order, if one does.
+fn orderedScan(t: &Table, cols: &[]int): Option[int] {
+    for c0 in 0..len(t.indexes) + 1 {
+        let p = Path{index: c0 - 1, eqs: [], rng: [], desc: false, noNulls: false}
+        if servesOrder(t, &p, cols) { return Some(c0 - 1) }
+    }
+    return None
+}
+
+// The column of the first table every output is MIN (0) or MAX (1) of, else -1.
+fn minMax(q: &Query, exprs: &[]Expr, dir: mut &int): int {
+    var col = -1
+    var fname = ""
+    for x in exprs {
+        match x {
+            Expr.Call(n, args, star) {
+                if (n != "min" && n != "max") || star || len(args) != 1 { return -1 }
+                let c = q.firstCol(&args[0])
+                if c < 0 || (col >= 0 && (c != col || n != fname)) { return -1 }
+                col = c
+                fname = n
+            }
+            else { return -1 }
+        }
+    }
+    dir = if fname == "max" { 1 } else { 0 }
+    return col
+}
+
+fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val,
+              ptypes: &[]int): Result[Sel, DbErr] {
     var q = try buildQuery(st, txn, &s.from, &s.where)
-    var cnt = newCounts(&q)
     var exprs: []Expr = []
     let outs = try selectCols(s, &q.cols, ptypes, mut &exprs)
     var groupBy: []Expr = []
@@ -2045,21 +2218,106 @@ fn selectWith(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
     for x in exprs { if hasAgg(&x) { aggQ = true } }
     let limit = try evalInt(&s.limit, params, "LIMIT")
     let offset = try evalInt(&s.offset, params, "OFFSET")
-    try materialize(st, txn, mut &q, params, mut &cnt)
+    var sort = len(order) > 0
+    var first = -1
+    // The first table's order holds through the joins, unless a RIGHT or
+    // FULL JOIN adds its unmatched rows at the end.
+    var keeps = len(q.levels) > 0
+    for lv in q.levels { if keepsRight(lv.join) { keeps = false } }
+    var setIndex = -2               // the first table's path, changed: its index, its direction
+    var setDesc = false
+    var setNoNulls = false
+    if keeps {
+        let t = &q.levels[0].t
+        let path = &q.levels[0].path
+        var cols: []int = []
+        var dir = -1
+        var mm = -1
+        if !aggQ {
+            dir = orderCols(&q, &order, &s.order, &exprs, &outs, mut &cols)
+        } else if len(groupBy) == 0 {
+            var d = 0
+            mm = minMax(&q, &exprs, mut &d)
+            if mm >= 0 {
+                append(mut &cols, mm)
+                dir = d
+            }
+        }
+        if dir >= 0 {
+            var ix = path.index
+            var use = servesOrder(t, path, &cols)
+            let full = len(path.eqs) == 0 && len(path.rng) == 0
+            // A full scan changes to an index for its order only when that
+            // saves reading everything: a LIMIT, or MIN/MAX. Else a sort is
+            // cheaper than a lookup per row.
+            if !use && full && (limit >= 0 || mm >= 0) {
+                match orderedScan(t, &cols) {
+                    Some(x) {
+                        ix = x
+                        use = true
+                    }
+                    None {}
+                }
+            }
+            if use {
+                setIndex = ix
+                setDesc = dir == 1
+                if mm >= 0 {
+                    first = mm
+                    // MIN and MAX skip NULLs: an index whose next column it is need not read them
+                    let key = keyCols(t, ix)
+                    setNoNulls = ix >= 0 && len(path.eqs) < len(key) && key[len(path.eqs)] == mm
+                } else {
+                    sort = false
+                }
+            }
+        }
+    }
+    if setIndex > -2 {
+        q.levels[0].path.index = setIndex
+        q.levels[0].path.desc = setDesc
+        q.levels[0].path.noNulls = setNoNulls
+    }
+    return Ok(Sel{q: q, exprs: exprs, outs: outs, groupBy: groupBy, order: order, aggQ: aggQ, sort: sort,
+                  first: first, limit: limit, offset: offset})
+}
+
+// EXPLAIN's lines for a planned SELECT.
+fn selLines(sel: &Sel, cnt: &[]Counts): []str {
+    var lines = explainLines(&sel.q, cnt)
+    if len(sel.q.levels) == 0 { append(mut &lines, "result") }
+    if sel.first >= 0 { append(mut &lines, "min/max: the first value in the scan's order") }
+    if len(sel.groupBy) > 0 || (sel.aggQ && sel.first < 0) { append(mut &lines, "aggregate") }
+    if len(sel.order) > 0 { append(mut &lines, if sel.sort { "order: sort" } else { "order: the scan's" }) }
+    if sel.limit >= 0 && !sel.aggQ && !sel.sort { append(mut &lines, "limit: stops the scan") }
+    return lines
+}
+
+// A SELECT; with analyze, plan gets EXPLAIN ANALYZE's lines (a line per
+// table, with what it did). The counts are kept for every query: an add each.
+fn selectWith(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int,
+              analyze: bool, plan: mut &[]str): Result[Res, DbErr] {
+    var sel = try planSelect(st, txn, s, params, ptypes)
+    var rs = newRun(&sel.q)
+    try materialize(st, txn, mut &sel.q, params, mut &rs)
+    let q = &sel.q
+    let limit = sel.limit
+    let offset = sel.offset
     var outRows: []OutRow = []
-    let early = !aggQ && len(order) == 0 && limit >= 0
+    let early = !sel.aggQ && !sel.sort && limit >= 0
     let stopAt = if offset > 0 { limit + offset } else { limit }
     let noGroup: [][]Val = []
-    if aggQ {
+    if sel.aggQ {
         var groups: [][][]Val = []
         var index: Map[str, int] = newMap()
-        try runQuery(st, txn, &q, params, fn(r: &[]Val): Result[bool, DbErr] {
+        try runQuery(st, txn, q, params, fn(r: &[]Val): Result[bool, DbErr] {
+            if sel.first >= 0 && isNull(&r[sel.first]) { return Ok(true) }
             let row = copyRow(r)
-            if len(groupBy) > 0 {
+            if len(sel.groupBy) > 0 {
                 var kb = newStrBuf()
                 {
                     let env = Env{cols: &q.cols, row: &row, group: &noGroup, agg: false, params: params}
-                    for g in groupBy { encIdxPart(mut &kb, &(try eval(&g, &env))) }
+                    for g in sel.groupBy { encIdxPart(mut &kb, &(try eval(&g, &env))) }
                 }
                 let k = kb.toStr()
                 match index.get(&k) {
@@ -2073,30 +2331,30 @@ fn selectWith(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
                 if len(groups) == 0 { append(mut &groups, []) }
                 append(mut &groups[0], row)
             }
-            return Ok(true)
-        }, mut &cnt)
-        if len(groups) == 0 && len(groupBy) == 0 { append(mut &groups, []) }
+            return Ok(sel.first < 0)        // MIN/MAX in order: its first value is the answer
+        }, mut &rs)
+        if len(groups) == 0 && len(sel.groupBy) == 0 { append(mut &groups, []) }
         let noRow: []Val = []
         for g in groups {
             let env = Env{cols: &q.cols, row: if len(g) > 0 { &g[0] } else { &noRow }, group: g, agg: true, params: params}
             var vals: []Val = []
-            for x in exprs { append(mut &vals, try eval(&x, &env)) }
+            for x in sel.exprs { append(mut &vals, try eval(&x, &env)) }
             var ord: []Val = []
-            for o in order { append(mut &ord, try orderValue(&o, &outs, &vals, &env)) }
+            for o in sel.order { append(mut &ord, try orderValue(&o, &sel.outs, &vals, &env)) }
             append(mut &outRows, OutRow{vals: vals, ord: ord})
         }
     } else {
-        try runQuery(st, txn, &q, params, fn(r: &[]Val): Result[bool, DbErr] {
+        try runQuery(st, txn, q, params, fn(r: &[]Val): Result[bool, DbErr] {
             let env = Env{cols: &q.cols, row: r, group: &noGroup, agg: false, params: params}
             var vals: []Val = []
-            for x in exprs { append(mut &vals, try eval(&x, &env)) }
+            for x in sel.exprs { append(mut &vals, try eval(&x, &env)) }
             var ord: []Val = []
-            for o in order { append(mut &ord, try orderValue(&o, &outs, &vals, &env)) }
+            if sel.sort { for o in sel.order { append(mut &ord, try orderValue(&o, &sel.outs, &vals, &env)) } }
             append(mut &outRows, OutRow{vals: vals, ord: ord})
             return Ok(!early || len(outRows) < stopAt)
-        }, mut &cnt)
+        }, mut &rs)
     }
-    if len(order) > 0 {
+    if sel.sort {
         collections.sortBy(mut &outRows, fn(a: &OutRow, b: &OutRow): int {
             for i in 0..len(s.order) {
                 var c = sortCmp(&a.ord[i], &b.ord[i])
@@ -2106,6 +2364,8 @@ fn selectWith(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             return 0
         })
     }
+    var outs: []OutCol = []
+    for oc in sel.outs { append(mut &outs, oc) }
     var res = Res{cols: outs, rows: [], tag: "", hasRows: true}
     var i = 0
     for r in outRows {
@@ -2119,7 +2379,7 @@ fn selectWith(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
     }
     res.tag = "SELECT " + len(res.rows).toStr()
     if analyze {
-        let lines = explainLines(&q, &cnt)
+        let lines = selLines(&sel, &rs.cnt)
         for l in lines { append(plan, l) }
     }
     return Ok(res)

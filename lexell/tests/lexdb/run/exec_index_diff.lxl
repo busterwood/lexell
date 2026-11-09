@@ -3,9 +3,14 @@
 // random inserts, updates and deletes go to both; random queries must give
 // the same rows from each (index lookups and ranges against full scans),
 // and the same joins (per-row index lookups against hash joins). The cache
-// is small, so nodes are evicted and loaded meanwhile.
-// expect: statements ok, queries 1200 differ 0, index paths used true, hash joins used true
+// is small, so nodes are evicted and loaded meanwhile. ORDER BY with LIMIT
+// and MIN/MAX are read in an index's order on one side and sorted or
+// aggregated on the other; a RIGHT JOIN must equal the LEFT JOIN the other
+// way round, and a FULL JOIN the LEFT JOIN plus the other side's unmatched
+// rows.
+// expect: statements ok, queries 1204 differ 0, index paths used true, hash joins used true, index order used true, backward true, min/max true
 import "strings"
+import "collections"
 import "../../../cmd/lexdb_store"
 import "../../../cmd/lexdb_disk"
 import "../../../cmd/lexdb_exec"
@@ -26,6 +31,13 @@ fn rows(s: mut &lexdb_exec.Session, sql: &str): str {
         }
         Err(e) { return "error " + e.state }      // the message names the table
     }
+}
+
+fn sorted(x: &str): str {
+    var parts: []str = []
+    for part in strings.split(x, ";") { append(mut &parts, part.toStr()) }
+    collections.sortBy(mut &parts, fn(a: &str, b: &str): int { return a.cmp(b) })
+    return strings.join(&parts, ";")
 }
 
 fn must(s: mut &lexdb_exec.Session, sql: str) {
@@ -81,6 +93,9 @@ fn body(st: lexdb_store.Store): int {
     var differ = 0
     var indexed = false
     var hashed = false
+    var ordered = false
+    var backward = false
+    var firstValue = false
     for round in 0..40 {
         // changes, the same to both pairs
         for k in 0..25 {
@@ -110,18 +125,55 @@ fn body(st: lexdb_store.Store): int {
         for k in 0..30 {
             var sql = ""
             let c = cond(mut &r)
-            let j = r.below(4)
-            if j < 2 {
-                sql = "select id, x, y, z from T where " + c + " order by id"
-            } else if j == 2 {
-                sql = "select t.id, u.id from T t join U u on u.x = t.x where t." + c + " order by 1, 2"
+            let n = (r.below(9) + 1).toStr()
+            let j = r.below(12)
+            var q1 = ""
+            var q0 = ""
+            var got1 = ""
+            var got0 = ""
+            if j < 9 {
+                if j < 2 {
+                    sql = "select id, x, y, z from T where " + c + " order by id"
+                } else if j == 2 {
+                    sql = "select t.id, u.id from T t join U u on u.x = t.x where t." + c + " order by 1, 2"
+                } else if j == 3 {
+                    sql = "select t.id, u.id, u.y from T t left join U u on u.x = t.x and u.y = t.y order by 1, 2"
+                } else if j == 4 {
+                    sql = "select id, x from T where " + c + " order by x, id limit " + n
+                } else if j == 5 {
+                    sql = "select id, x from T where " + c + " order by x desc, id desc limit " + n
+                } else if j == 6 {
+                    sql = "select y, x, id from T where " + c + " order by y desc, x desc, id desc limit " + n
+                } else if j == 7 {
+                    sql = "select id from T where " + c + " order by id desc limit " + n + " offset 2"
+                } else {
+                    let f = ["min(x)", "max(x)", "min(z)", "max(z)", "max(y)", "min(y)", "max(id)"][r.below(7)]
+                    sql = "select " + f + " from T where " + c
+                }
+                q1 = strings.replaceAll(strings.replaceAll(sql, "from T", "from a"), "join U", "join b")
+                q0 = strings.replaceAll(strings.replaceAll(sql, "from T", "from a0"), "join U", "join b0")
+                got1 = rows(mut &s, &q1)
+                got0 = rows(mut &s, &q0)
+            } else if j == 9 {
+                // RIGHT JOIN = the LEFT JOIN the other way round
+                let side = if r.below(2) == 0 { "u." } else { "t." }
+                q1 = "select t.id, u.id from a t right join b u on u.x = t.x where " + side + c + " order by 1, 2"
+                q0 = "select t.id, u.id from b u left join a t on u.x = t.x where " + side + c + " order by 1, 2"
+                got1 = rows(mut &s, &q1)
+                got0 = rows(mut &s, &q0)
             } else {
-                sql = "select t.id, u.id, u.y from T t left join U u on u.x = t.x and u.y = t.y order by 1, 2"
+                // FULL JOIN = the LEFT JOIN, and the other side's rows that joined nothing
+                let on = if j == 10 { "u.x = t.x" } else { "u.x = t.x and u.y = t.y and u.id > 1000" }
+                q1 = "select t.id, u.id from a0 t full join b0 u on " + on
+                q0 = "select t.id, u.id from a0 t left join b0 u on " + on
+                got1 = sorted(&rows(mut &s, &q1))
+                let l = rows(mut &s, &q0)
+                let rest = rows(mut &s, &("select t.id, u.id from b0 u left join a0 t on " + on + " where t.id is null"))
+                var all: []str = []
+                if l != "" { append(mut &all, l) }
+                if rest != "" { append(mut &all, rest) }
+                got0 = sorted(&strings.join(&all, ";"))
             }
-            let q1 = strings.replaceAll(strings.replaceAll(sql, "from T", "from a"), "join U", "join b")
-            let q0 = strings.replaceAll(strings.replaceAll(sql, "from T", "from a0"), "join U", "join b0")
-            let got1 = rows(mut &s, &q1)
-            let got0 = rows(mut &s, &q0)
             queries += 1
             if got1 != got0 {
                 differ += 1
@@ -129,12 +181,38 @@ fn body(st: lexdb_store.Store): int {
             }
             if strings.contains(rows(mut &s, &("explain " + q1)), "index ") { indexed = true }
             if strings.contains(rows(mut &s, &("explain " + q0)), "hash on") { hashed = true }
+            let ex = rows(mut &s, &("explain " + q1))
+            if strings.contains(ex, "order: the scan's") && strings.contains(ex, "index ") { ordered = true }
+            if strings.contains(ex, "backward") { backward = true }
+            if strings.contains(ex, "min/max:") { firstValue = true }
+        }
+    }
+    // Scans longer than a batch (256 rows), in order both ways, against sorts
+    // (an expression in ORDER BY is always sorted).
+    must(mut &s, "create table big (id int primary key, x int)")
+    must(mut &s, "create index big_x on big (x)")
+    for k in 0..14 {
+        var vs: []str = []
+        for i in 0..50 { append(mut &vs, "(" + (k * 50 + i).toStr() + ", " + xval(mut &r) + ")") }
+        must(mut &s, "insert into big values " + strings.join(&vs, ", "))
+    }
+    for pair in [["order by id desc limit 700", "order by id + 0 desc limit 700"],
+                 ["order by x desc, id desc limit 700", "order by x + 0 desc, id desc limit 700"],
+                 ["order by x, id limit 690", "order by x + 0, id limit 690"],
+                 ["where id > 20 order by id desc limit 600", "where id > 20 order by id + 0 desc limit 600"]] {
+        let g1 = rows(mut &s, &("select id, x from big " + pair[0]))
+        let g0 = rows(mut &s, &("select id, x from big " + pair[1]))
+        queries += 1
+        if g1 != g0 {
+            differ += 1
+            println("differ: " + pair[0])
         }
     }
     let n = rows(mut &s, &"select count(*) from a")
     if n == "0" { println("a is empty") }
     println("statements ok, queries " + queries.toStr() + " differ " + differ.toStr() + ", index paths used " +
-            indexed.toStr() + ", hash joins used " + hashed.toStr())
+            indexed.toStr() + ", hash joins used " + hashed.toStr() +
+            ", index order used " + ordered.toStr() + ", backward " + backward.toStr() + ", min/max " + firstValue.toStr())
     return 0
 }
 

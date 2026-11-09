@@ -839,6 +839,99 @@ pub fn (st: &Store) scan(t: mut &Txn, tree: int, from: str, to: str, f: &fn(&Ent
     return Ok(Unit{})
 }
 
+// A descent for a backward scan: the leaf with the largest keys below k (k
+// "": the last leaf). lower is the largest separator above it on the path:
+// the leaf holds no key below it, so the next leaf back is the one below it.
+fn (db: mut &Db) descendBack(tree: int, k: &str): Descent {
+    var d = Descent{path: [], need: -1, upper: "", hasUpper: false}
+    var s = match db.trees.get(&tree) { Some(r) { r } None { -1 } }
+    if s < 0 { return d }
+    while true {
+        if !db.meta[s].loaded {
+            d.need = s
+            return d
+        }
+        db.meta[s].ref = true
+        append(mut &d.path, s)
+        if db.nodes[s].leaf { return d }
+        let j = if len(k) == 0 { len(db.nodes[s].keys) } else { lowerIndex(&db.nodes[s].keys, k) }
+        if j > 0 {
+            d.upper = db.nodes[s].keys[j - 1]       // here: the lower fence
+            d.hasUpper = true
+        }
+        s = db.nodes[s].kids[j]
+    }
+    return d
+}
+
+// scan, backward: the entries with keys in [from, to) (to "": to the end)
+// from the last down, the transaction's own writes included, while f gives
+// true. Each leaf read is marked as scan marks it.
+pub fn (st: &Store) scanBack(t: mut &Txn, tree: int, from: str, to: str, f: &fn(&Entry): bool): Result[Unit, lexdb_base.DbErr] {
+    if t.snap >= 0 { return st.snapScanBack(t, tree, from, to, f) }
+    let own = t.ownRange(tree, &from, &to)
+    var oi = len(own) - 1
+    var cursor = to
+    var more = true
+    while more {
+        var need = -1
+        var chunk: []Entry = []                 // descending
+        var bad: []lexdb_base.DbErr = []
+        var lower = ""
+        var hasLower = false
+        st.sh.with(fn(db: mut &Db) {
+            if len(db.failed) > 0 {
+                append(mut &bad, db.failed[0])
+                return
+            }
+            let d = db.descendBack(tree, &cursor)
+            if d.need >= 0 {
+                need = d.need
+                return
+            }
+            if len(d.path) == 0 { return }
+            let leaf = d.path[len(d.path) - 1]
+            append(mut &t.reads, Mark{slot: leaf, gen: db.meta[leaf].gen, version: db.meta[leaf].version})
+            var i = if len(cursor) == 0 { len(db.nodes[leaf].keys) } else { lowerIndex(&db.nodes[leaf].keys, &cursor) }
+            while i > 0 {
+                i -= 1
+                let k = db.nodes[leaf].keys[i]
+                if k < from { break }
+                append(mut &chunk, Entry{key: k, val: db.nodes[leaf].vals[i]})
+            }
+            lower = d.upper
+            hasLower = d.hasUpper
+        })
+        if len(bad) > 0 { return Err(bad[0]) }
+        if need >= 0 {
+            try st.load(need)
+            continue
+        }
+        let last = !hasLower || lower <= from
+        // Merge with the transaction's own writes at or above the leaf's fence.
+        var ci = 0
+        while ci < len(chunk) || (oi >= 0 && (last || own[oi].key >= lower)) {
+            var takeOwn = false
+            if oi >= 0 && (last || own[oi].key >= lower) {
+                takeOwn = ci >= len(chunk) || own[oi].key >= chunk[ci].key
+            }
+            if takeOwn {
+                let w = own[oi]
+                oi -= 1
+                if ci < len(chunk) && chunk[ci].key == w.key { ci += 1 }
+                if w.op == OP_PUT {
+                    if !f(&Entry{key: w.key, val: w.val}) { return Ok(Unit{}) }
+                }
+            } else {
+                if !f(&chunk[ci]) { return Ok(Unit{}) }
+                ci += 1
+            }
+        }
+        if last { more = false } else { cursor = lower }
+    }
+    return Ok(Unit{})
+}
+
 // A new tree, created when the transaction commits.
 pub fn (st: &Store) createTree(t: mut &Txn): int {
     var id = 0
@@ -1112,6 +1205,68 @@ fn (st: &Store) snapScan(t: mut &Txn, tree: int, from: str, to: str, one: bool, 
         for e in chunk { if !f(&e) { return Ok(Unit{}) } }
         if one || !hasUpper || (len(to) > 0 && upper >= to) { break }
         cursor = upper
+    }
+    return Ok(Unit{})
+}
+
+// A snapshot's backward scan of [from, to) (to "": to the end).
+fn (st: &Store) snapScanBack(t: mut &Txn, tree: int, from: str, to: str, f: &fn(&Entry): bool): Result[Unit, lexdb_base.DbErr] {
+    let root = match t.snapTrees.get(&tree) { Some(r) { r } None { -1 } }
+    if root < 0 { return Ok(Unit{}) }
+    let q = t.snapSeq
+    let id = t.snap
+    var cursor = to
+    while true {
+        var need = -1
+        var chunk: []Entry = []
+        var bad: []lexdb_base.DbErr = []
+        var lower = ""
+        var hasLower = false
+        st.sh.with(fn(db: mut &Db) {
+            for sn in db.snaps {
+                if sn.id == id && sn.cancelled {
+                    append(mut &bad, snapCancelled())
+                    return
+                }
+            }
+            var s = root
+            while true {
+                let v = db.verOf(s, q)
+                if v == -2 {
+                    need = s
+                    return
+                }
+                if v == -3 {
+                    append(mut &bad, lexdb_base.err(lexdb_base.S_INTERNAL, "snapshot: a node version is missing"))
+                    return
+                }
+                db.meta[s].ref = true
+                let n = db.snapNode(s, v)
+                if n.leaf {
+                    var i = if len(cursor) == 0 { len(n.keys) } else { lowerIndex(&n.keys, &cursor) }
+                    while i > 0 {
+                        i -= 1
+                        if n.keys[i] < from { break }
+                        append(mut &chunk, Entry{key: n.keys[i], val: n.vals[i]})
+                    }
+                    return
+                }
+                let j = if len(cursor) == 0 { len(n.keys) } else { lowerIndex(&n.keys, &cursor) }
+                if j > 0 {
+                    lower = n.keys[j - 1]
+                    hasLower = true
+                }
+                s = n.kids[j]
+            }
+        })
+        if len(bad) > 0 { return Err(bad[0]) }
+        if need >= 0 {
+            try st.load(need)
+            continue
+        }
+        for e in chunk { if !f(&e) { return Ok(Unit{}) } }
+        if !hasLower || lower <= from { break }
+        cursor = lower
     }
     return Ok(Unit{})
 }

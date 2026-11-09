@@ -1,0 +1,98 @@
+// lexdb_store: backward scans. Over a tree of many leaves (a 6-node
+// cache, so they are evicted and loaded), with the transaction's own puts
+// and deletes not yet committed, every backward scan of a random range
+// gives the forward scan's entries reversed; in a snapshot too, while
+// commits change the tree. Stopping early gives a prefix of it.
+// expect: ranges 600 equal 600, early 600 equal 600, snapshot 300 equal 300
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_base"
+
+fn key(i: int): str { return "k" + strings.padLeft(i.toStr(), 5, '0') }
+
+fn fwd(st: &lexdb_store.Store, t: mut &lexdb_store.Txn, tree: int, from: &str, to: &str): []str {
+    var out: []str = []
+    st.scan(t, tree, from, to, fn(e: &lexdb_store.Entry): bool {
+        append(mut &out, e.key + "=" + e.val)
+        return true
+    }).unwrap()
+    return out
+}
+
+fn back(st: &lexdb_store.Store, t: mut &lexdb_store.Txn, tree: int, from: &str, to: &str, n: int): []str {
+    var out: []str = []
+    st.scanBack(t, tree, from, to, fn(e: &lexdb_store.Entry): bool {
+        append(mut &out, e.key + "=" + e.val)
+        return n < 0 || len(out) < n
+    }).unwrap()
+    return out
+}
+
+fn reversed(xs: &[]str, n: int): str {
+    var out: []str = []
+    var i = len(xs) - 1
+    while i >= 0 && (n < 0 || len(out) < n) {
+        append(mut &out, xs[i])
+        i -= 1
+    }
+    return strings.join(&out, ",")
+}
+
+fn bound(r: mut &lexdb_base.Rng): str { return if r.below(6) == 0 { "" } else { key(r.below(3000)) } }
+
+fn main() {
+    var ok = 0
+    var early = 0
+    var snapOk = 0
+    lexdb_store.run(lexdb_disk.sim(8), lexdb_store.Options{cacheNodes: 6, segBytes: 256 * 1024, ckptBytes: 64 * 1024, snapNodes: 100000}, fn(st: lexdb_store.Store): int {
+        var r = lexdb_base.rng(77)
+        var t0 = lexdb_store.begin()
+        let tree = st.createTree(mut &t0)
+        for i in 0..3000 { if r.below(3) > 0 { t0.put(tree, key(i), "v" + i.toStr() + strings.repeat("x", 40)).unwrap() } }
+        st.commit(t0).unwrap()
+        for round in 0..20 {
+            var t = lexdb_store.begin()
+            for k in 0..40 {
+                let i = r.below(3000)
+                if r.below(2) == 0 { t.put(tree, key(i), "own" + i.toStr()).unwrap() } else { t.del(tree, key(i)) }
+            }
+            for k in 0..30 {
+                var from = bound(mut &r)
+                let to = bound(mut &r)
+                if r.below(4) == 0 { from = "" }
+                let f = fwd(&st, mut &t, tree, &from, &to)
+                if strings.join(&back(&st, mut &t, tree, &from, &to, -1), ",") == reversed(&f, -1) { ok += 1 } else {
+                    println("differ [" + from + ", " + to + ")")
+                }
+                let n = r.below(5) + 1
+                if strings.join(&back(&st, mut &t, tree, &from, &to, n), ",") == reversed(&f, n) { early += 1 }
+            }
+            if round % 2 == 0 { st.commit(t).unwrap() }
+            // a snapshot, then commits, then its scans
+            var sn = st.beginSnapshot().unwrap()
+            var before: [][]str = []
+            var ranges: []str = []
+            for k in 0..15 {
+                let from = bound(mut &r)
+                let to = bound(mut &r)
+                append(mut &ranges, from)
+                append(mut &ranges, to)
+                append(mut &before, fwd(&st, mut &sn, tree, &from, &to))
+            }
+            for k in 0..30 {
+                var w = lexdb_store.begin()
+                let i = r.below(3000)
+                if r.below(2) == 0 { w.put(tree, key(i), "later" + strings.repeat("y", 60)).unwrap() } else { w.del(tree, key(i)) }
+                st.commit(w).unwrap()
+            }
+            for k in 0..15 {
+                let got = strings.join(&back(&st, mut &sn, tree, &ranges[2 * k], &ranges[2 * k + 1], -1), ",")
+                if got == reversed(&before[k], -1) { snapOk += 1 }
+            }
+            st.commit(sn).unwrap()
+        }
+        return 0
+    }).unwrap()
+    println("ranges 600 equal " + ok.toStr() + ", early 600 equal " + early.toStr() + ", snapshot 300 equal " + snapOk.toStr())
+}
