@@ -1,0 +1,69 @@
+// lexdb_store: a checkpoint's meta page waits until the log holds every
+// commit it includes. T2 (k=2) is in a batch whose flush is held; T3 (k=3,
+// x=3) commits after it, in the next batch; a checkpoint runs; the store
+// crashes. What recovery gives must be a prefix of T1, T2, T3: k=1 x=1, k=2
+// x=1 or k=3 x=3, never T3 half applied (k=2 x=3). A meta page written
+// before the log held T2 and T3 would replay T2's row over the
+// checkpoint's T3.
+// expect: crashes 30 consistent 30
+import "task"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_base"
+
+type Arg = record { st: lexdb_store.Store; tree: int; k: str; x: str }
+
+fn commitTask(a: Arg): int {
+    var t = lexdb_store.begin()
+    t.put(a.tree, "k", a.k).unwrap()
+    if a.x != "" { t.put(a.tree, "x", a.x).unwrap() }
+    let r = a.st.commit(t)
+    return 0
+}
+
+fn ckptTask(st: lexdb_store.Store): int {
+    let r = st.checkpoint()
+    return 0
+}
+
+fn spin(n: int) { for i in 0..n { let y = task.yield() } }
+
+fn main() {
+    var good = 0
+    for seed in 0..30 {
+        let fs = lexdb_disk.sim(seed)
+        var crashed = fs
+        var tree = 0
+        lexdb_store.run(fs, lexdb_store.defaults(), fn(st: lexdb_store.Store): int {
+            var t = lexdb_store.begin()
+            tree = st.createTree(mut &t)
+            t.put(tree, "k", "1").unwrap()
+            t.put(tree, "x", "1").unwrap()
+            st.commit(t).unwrap()
+            st.checkpoint().unwrap()
+            fs.holdFlushes("log.")
+            let tr = tree
+            task.scope(fn(s: mut &task.Scope) {
+                s.spawn(commitTask, Arg{st: st, tree: tr, k: "2", x: ""})
+                spin(20)                    // the writer has taken T2's batch; its flush waits
+                s.spawn(commitTask, Arg{st: st, tree: tr, k: "3", x: "3"})
+                spin(20)
+                s.spawn(ckptTask, st)
+                spin(200)
+                crashed = fs.crash(seed * 7 + 1)
+                fs.holdFlushes("")
+            })
+            return 0
+        }).unwrap()
+        let tr = tree
+        lexdb_store.run(crashed, lexdb_store.defaults(), fn(st: lexdb_store.Store): int {
+            var t = lexdb_store.begin()
+            let k = st.get(mut &t, tr, "k").unwrap().unwrapOr("-")
+            let x = st.get(mut &t, tr, "x").unwrap().unwrapOr("-")
+            let state = k + x
+            if state == "11" || state == "21" || state == "33" { good += 1 } else { println("seed " + seed.toStr() + ": k=" + k + " x=" + x) }
+            return 0
+        }).unwrap()
+    }
+    println("crashes 30 consistent " + good.toStr())
+}

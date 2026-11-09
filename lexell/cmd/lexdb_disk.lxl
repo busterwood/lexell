@@ -16,6 +16,7 @@
 // they would while a real call is parked.
 import "task"
 import "fs"
+import "strings"
 import "./lexdb_base"
 
 pub const PAGE = 4096
@@ -69,13 +70,14 @@ pub type SimFs = record {
     pub flushes: int
     failAt: int                     // the I/O call that fails (EIO), or -1
     ios: int
+    hold: str                       // flushes of files whose names start with it wait ("" none)
 }
 
 pub fn real(dir: str): Fs { return Fs.Real(dir) }
 
 pub fn sim(seed: int): Fs {
     return Fs.Sim(task.shared(SimFs{files: [], rng: lexdb_base.rng(seed), writes: 0, flushes: 0,
-                                     failAt: -1, ios: 0}))
+                                     failAt: -1, ios: 0, hold: ""}))
 }
 
 fn alignedCheck(off: int, n: int, op: str): Result[Unit, lexdb_base.DbErr] {
@@ -227,7 +229,7 @@ pub fn (f: &Fs) crash(seed: int): Fs {
         }
     }
     return Fs.Sim(task.shared(SimFs{files: files, rng: lexdb_base.rng(seed + 1), writes: 0, flushes: 0,
-                                     failAt: -1, ios: 0}))
+                                     failAt: -1, ios: 0, hold: ""}))
 }
 
 // Makes the n-th I/O call from now (0: the next) fail with EIO, for the tests.
@@ -235,6 +237,15 @@ pub fn (f: &Fs) failIn(n: int) {
     match f {
         Fs.Real(_) {}
         Fs.Sim(sh) { sh.with(fn(st: mut &SimFs) { st.failAt = st.ios + n }) }
+    }
+}
+
+// Makes the flushes of files whose names start with prefix wait until it is
+// called again with "" (for the tests: a slow flush, held open).
+pub fn (f: &Fs) holdFlushes(prefix: str) {
+    match f {
+        Fs.Real(_) {}
+        Fs.Sim(sh) { sh.with(fn(st: mut &SimFs) { st.hold = prefix }) }
     }
 }
 
@@ -372,6 +383,14 @@ pub fn (f: &File) flush(): Result[Unit, lexdb_base.DbErr] {
         File.Sim(sh, idx) {
             // A flush is the slow call (section 3): let more happen meanwhile.
             for i in 0..4 { let yd = task.yield() }
+            while true {
+                var held = false
+                sh.with(fn(st: mut &SimFs) {
+                    held = len(st.hold) > 0 && strings.startsWith(st.files[idx].name, st.hold)
+                })
+                if !held { break }
+                if task.yield().isErr() { break }
+            }
             var fail = false
             sh.with(fn(st: mut &SimFs) {
                 fail = simIo(st)

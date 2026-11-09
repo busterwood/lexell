@@ -391,7 +391,7 @@ Built on 2026-11-09 on branch `lexdb`, about 5,300 lines in
 (cache, trees, transactions, log, checkpoints, recovery, snapshots),
 `lexdb_sql` (lexer, parser), `lexdb_exec` (catalog, rows, keys, planner,
 statements, sessions), `lexdb_wire` (protocol 3.0) and `lexdb` (the
-server). Tests: `python3 lexell/tests/lexdb.py` (12 programs in
+server). Tests: `python3 lexell/tests/lexdb.py` (13 programs in
 `tests/lexdb/run`, under `LXL_CHECK=1`).
 
     lexell/compiler/out/lxlc lexell/cmd/lexdb.lxl -o lexdb
@@ -445,9 +445,12 @@ server). Tests: `python3 lexell/tests/lexdb.py` (12 programs in
 - `store_bank`: 30 runs of 6 tasks making transfers with think time
   (conflicts and retries), a crash at a random moment: the money adds up
   and every acknowledged transfer survives. Skipping validation fails it
-  at once. **Not caught yet:** removing the checkpoint's wait for the log
-  (above): the window is narrow and a random crash rarely lands in it. A
-  targeted test is owed.
+  at once. It does not catch removing the checkpoint's wait for the log
+  (above): the window is narrow and a random crash rarely lands in it.
+- `store_ckptwait` builds that window: a log flush held open (the simulated
+  disk's `holdFlushes`), a later commit, a checkpoint, a crash. Recovery
+  must give a prefix of the commits; without the wait 17 of 30 crashes leave
+  a transaction half applied.
 - `store_snapshot`: 60 snapshots totalling 1,200 accounts while 300
   transfers commit, with a 20-node cache; keeping no old versions fails it.
   A snapshot over the budget gets 72000.
@@ -477,8 +480,7 @@ is the comparison to make.
 
 ### 9.4 Next
 
-1. A targeted test for the checkpoint's wait for the log; whole-server
-   crash tests through the wire protocol.
+1. Whole-server crash tests through the wire protocol.
 2. D4: secondary indexes, joins, COPY; then the cost questions (section 0).
 3. Overflow pages for large rows; reclaiming a dropped table's pages.
 4. Authentication (SCRAM) and TLS, so the server can leave loopback.
