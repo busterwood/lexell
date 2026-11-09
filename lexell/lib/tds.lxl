@@ -16,7 +16,8 @@
 //     the text in UTF-16LE).
 //   - RPC to sp_executesql (executeSql) with typed parameters (Param:
 //     intParam, floatParam, bitParam, textParam, bytesParam, decimalParam,
-//     nullParam and typeInfoOf from a SQL type name), OUTPUT ones too.
+//     nullParam and typeInfoOf from a SQL type name), OUTPUT ones too, and
+//     table-valued ones (tableParam).
 //   - Transaction Manager requests (tmRequest): begin, commit, rollback.
 //   - the reply's tokens (decode): COLMETADATA, ROW, NBCROW, DONE,
 //     DONEPROC, DONEINPROC (every row count kept), ERROR, INFO, LOGINACK,
@@ -561,12 +562,15 @@ pub const PROC_EXECUTESQL = 10
 pub const MAX_PARAMS = 2098            // SQL Server's 2100, less sp_executesql's @stmt and @params
 
 // A parameter of an RPC as it is sent: its name ("" for a positional one),
-// whether it is an OUTPUT parameter, the type sp_executesql's @params
-// declares for it ("bigint", "nvarchar(4000)", "decimal(12,2)"), its TYPE_INFO
-// and its value (TYPE_VARBYTE), both as bytes.
+// whether it is an OUTPUT parameter, whether it is the parameter's default
+// (fDefaultValue: only an empty table parameter is sent so), the type
+// sp_executesql's @params declares for it ("bigint", "nvarchar(4000)",
+// "decimal(12,2)", "dbo.Items READONLY"), its TYPE_INFO and its value
+// (TYPE_VARBYTE; a table parameter's rows), both as bytes.
 pub type Param = value record {
     pub name: str
     pub output: bool
+    pub byDefault: bool
     pub declared: str
     pub typeInfo: str
     pub data: str
@@ -581,7 +585,7 @@ pub fn collationBytes(c: &Collation): str {
 }
 
 fn param(declared: str, ti: &[]byte, data: &[]byte): Param {
-    return Param{name: "", output: false, declared: declared, typeInfo: strFromBytes(ti), data: strFromBytes(data)}
+    return Param{name: "", output: false, byDefault: false, declared: declared, typeInfo: strFromBytes(ti), data: strFromBytes(data)}
 }
 
 // A bigint parameter (INTN of 8 bytes).
@@ -650,6 +654,26 @@ fn plp(d: mut &[]byte, s: str) {
     put32(d, 0)
 }
 
+// UTF-16 text as an nvarchar value: its length then the text, or PLP for max.
+fn textData(d: mut &[]byte, u: &[]byte, max: bool) {
+    if max {
+        plp(d, strFromBytes(u))
+    } else {
+        put16(d, len(u))
+        for x in u { append(d, x) }
+    }
+}
+
+// Bytes as a varbinary value: their length then the bytes, or PLP for max.
+fn bytesData(d: mut &[]byte, b: &str, max: bool) {
+    if max {
+        plp(d, b)
+    } else {
+        put16(d, len(b))
+        appendStr(d, b)
+    }
+}
+
 // An nvarchar parameter: nvarchar(4000) up to 4,000 UTF-16 units, else
 // nvarchar(max) (PLP). E_INPUT for text that is not UTF-8.
 pub fn textParam(s: str, coll: &Collation): Result[Param, Error] {
@@ -663,12 +687,7 @@ pub fn textParam(s: str, coll: &Collation): Result[Param, Error] {
     let max = len(u) > 8000
     put16(mut &ti, if max { 0xFFFF } else { 8000 })
     appendStr(mut &ti, collationBytes(coll))
-    if max {
-        plp(mut &d, strFromBytes(&u))
-    } else {
-        put16(mut &d, len(u))
-        for x in u { append(mut &d, x) }
-    }
+    textData(mut &d, &u, max)
     return Ok(param(if max { "nvarchar(max)" } else { "nvarchar(4000)" }, &ti, &d))
 }
 
@@ -680,12 +699,7 @@ pub fn bytesParam(b: str): Param {
     var d: []byte = []
     let max = len(b) > 8000
     put16(mut &ti, if max { 0xFFFF } else { 8000 })
-    if max {
-        plp(mut &d, b)
-    } else {
-        put16(mut &d, len(b))
-        appendStr(mut &d, b)
-    }
+    bytesData(mut &d, &b, max)
     return param(if max { "varbinary(max)" } else { "varbinary(8000)" }, &ti, &d)
 }
 
@@ -702,6 +716,15 @@ fn decimalBytes(p: int): int {
 // first nonzero integer digit to the last fraction digit, at least s and at
 // least 1. E_DEC_RANGE when that is more than 38 digits.
 pub fn decimalParam(d: Decimal): Result[Param, Error] {
+    let x = try decimalParts(d)
+    return Ok(decimalParamOf(x.neg, x.m, x.p, x.s))
+}
+
+// A decimal as SQL Server stores it: sign, magnitude, precision and scale.
+type DecParts = value record { neg: bool; m: u128; p: int; s: int }
+
+// decimalParam's precision and scale for d, and its magnitude at that scale.
+fn decimalParts(d: Decimal): Result[DecParts, Error] {
     let t = try sqldialect.decimalText(d, 38)
     let body = if len(t) > 0 && t[0] == '-' { t[1..] } else { t }
     let dot = strings.indexOfByte(body, '.', 0)
@@ -719,15 +742,20 @@ pub fn decimalParam(d: Decimal): Result[Param, Error] {
         if c < '0' || c > '9' { return Err(sqldialect.dbError(sqldialect.E_DEC_RANGE, d.toStr() + " does not fit SQL Server's decimal(38)")) }
         m = m * 10 + u128(c - '0')
     }
-    return Ok(decimalParamOf(d.isNeg(), m, p, s))
+    return Ok(DecParts{neg: d.isNeg(), m: m, p: p, s: s})
+}
+
+// A decimal value of precision p: its length, sign and magnitude.
+fn decimalData(d: mut &[]byte, neg: bool, m: u128, p: int) {
+    let n = decimalBytes(p)
+    put8(d, n + 1)
+    put8(d, if neg { 0 } else { 1 })
+    for k in 0..n { append(d, byte(int((m >> (8 * k)) & 0xff))) }
 }
 
 fn decimalParamOf(neg: bool, m: u128, p: int, s: int): Param {
-    let n = decimalBytes(p)
     var d: []byte = []
-    put8(mut &d, n + 1)
-    put8(mut &d, if neg { 0 } else { 1 })
-    for k in 0..n { append(mut &d, byte(int((m >> (8 * k)) & 0xff))) }
+    decimalData(mut &d, neg, m, p)
     return param("decimal(" + p.toStr() + "," + s.toStr() + ")", &[byte(T_DECIMALN), byte(17), byte(p), byte(s)], &d)
 }
 
@@ -737,16 +765,21 @@ fn decimalParamOf(neg: bool, m: u128, p: int, s: int): Param {
 pub fn nullParam(declared: str, coll: &Collation): Result[Param, Error] {
     let ti = try typeInfoOf(declared, coll)
     var d: []byte = []
-    let t = int(ti[0])
-    let isMax = len(ti) >= 3 && ti[1] == 0xFF && ti[2] == 0xFF
+    nullData(mut &d, &ti)
+    return Ok(Param{name: "", output: false, byDefault: false, declared: declared, typeInfo: ti, data: strFromBytes(&d)})
+}
+
+// NULL as a value of the type whose TYPE_INFO is ti.
+fn nullData(d: mut &[]byte, ti: &str) {
+    let t = int(strByte(ti, 0))
+    let isMax = len(ti) >= 3 && strByte(ti, 1) == 0xFF && strByte(ti, 2) == 0xFF
     if isMax || t == T_XML {
-        for k in 0..8 { put8(mut &d, 0xFF) }        // PLP NULL
+        for k in 0..8 { put8(d, 0xFF) }             // PLP NULL
     } else if t == T_BIGVARCHR || t == T_BIGCHAR || t == T_NVARCHAR || t == T_NCHAR || t == T_BIGVARBIN || t == T_BIGBINARY {
-        put16(mut &d, 0xFFFF)
+        put16(d, 0xFFFF)
     } else {
-        put8(mut &d, 0)
+        put8(d, 0)
     }
-    return Ok(Param{name: "", output: false, declared: declared, typeInfo: ti, data: strFromBytes(&d)})
 }
 
 // The TYPE_INFO for a parameter of the SQL type named t (lower or upper
@@ -891,9 +924,262 @@ fn rpcParam(b: mut &[]byte, p: &Param) {
     let u = toUtf16(p.name).unwrapOr([])
     put8(b, len(u) / 2)
     for x in u { append(b, x) }
-    put8(b, if p.output { 1 } else { 0 })            // fByRefValue
+    put8(b, (if p.output { 1 } else { 0 }) | (if p.byDefault { PARAM_DEFAULT } else { 0 }))   // fByRefValue, fDefaultValue
     appendStr(b, p.typeInfo)
     appendStr(b, p.data)
+}
+
+// ---------------------------------------------------------------- table-valued parameters
+
+pub const T_TABLE = 0xF3                // TVPTYPE
+pub const PARAM_DEFAULT = 2             // an RPC parameter's StatusFlags: fDefaultValue
+pub const MAX_TABLE_COLUMNS = 1024
+const TVP_NULL = 0xFFFF                 // no column metadata: the type's default, an empty table
+const TVP_END = 0
+const TVP_ROW = 1
+
+// What a column of a table parameter holds, from its values.
+type ColKind = value closed {
+    Unknown                             // only NULLs so far
+    Int
+    Float
+    Bool
+    Text
+    Bytes
+    Dec
+}
+
+// A column of a table parameter as its values make it: its kind, whether
+// it needs (max), and for decimals the most digits before and after the
+// point.
+type TableCol = record {
+    kind: ColKind
+    long: bool
+    intDigits: int
+    scale: int
+}
+
+fn kindName(k: ColKind): str {
+    return match k {
+        ColKind.Unknown { "NULL" }
+        ColKind.Int { "int" }
+        ColKind.Float { "float" }
+        ColKind.Bool { "bool" }
+        ColKind.Text { "text" }
+        ColKind.Bytes { "bytes" }
+        ColKind.Dec { "decimal" }
+    }
+}
+
+// The UTF-16 units of UTF-8 text: one per character, two above U+FFFF.
+fn utf16Units(s: &str): int {
+    var n = 0
+    for i in 0..len(s) {
+        let c = strByte(s, i)
+        if c < 0x80 || c >= 0xC0 { n += 1 }
+        if c >= 0xF0 { n += 1 }
+    }
+    return n
+}
+
+// The decimal digits of n's magnitude (0 has none: decimal(1,0) holds it).
+fn intDigits(n: int): int {
+    var m = intMagnitude(n)
+    var k = 0
+    while m > 0 {
+        m = m / 10
+        k += 1
+    }
+    return k
+}
+
+fn intMagnitude(n: int): u128 { return if n < 0 { u128(-(n + 1)) + 1 } else { u128(n) } }
+
+// Takes value v (column i) into col's kind, or E_INPUT when the column
+// already holds values of another kind. An int goes into a decimal column.
+fn (col: mut &TableCol) take(v: &sqldialect.Value, i: int): Result[Unit, Error] {
+    var k = ColKind.Unknown
+    match v {
+        sqldialect.Value.Null { return Ok(Unit{}) }
+        sqldialect.Value.Int(n) {
+            col.intDigits = max(col.intDigits, intDigits(n))
+            k = ColKind.Int
+        }
+        sqldialect.Value.Float(_) { k = ColKind.Float }
+        sqldialect.Value.Bool(_) { k = ColKind.Bool }
+        sqldialect.Value.Text(t) {
+            if utf16Units(&t) > 4000 { col.long = true }
+            k = ColKind.Text
+        }
+        sqldialect.Value.Bytes(b) {
+            if len(b) > 8000 { col.long = true }
+            k = ColKind.Bytes
+        }
+        sqldialect.Value.Dec(d) {
+            let x = try decimalParts(d)
+            col.intDigits = max(col.intDigits, x.p - x.s)
+            col.scale = max(col.scale, x.s)
+            k = ColKind.Dec
+        }
+    }
+    if col.kind == ColKind.Unknown || col.kind == k { col.kind = k } else if col.kind == ColKind.Int && k == ColKind.Dec {
+        col.kind = k
+    } else if !(col.kind == ColKind.Dec && k == ColKind.Int) {
+        return Err(sqldialect.inputError("column " + (i + 1).toStr() + " has " + kindName(col.kind) + " and " +
+                                         kindName(k) + " values"))
+    }
+    return Ok(Unit{})
+}
+
+// The column's TYPE_INFO: bigint, float, bit, nvarchar(4000|max),
+// varbinary(8000|max), decimal(p,s) wide enough for every value, and for a
+// column of NULLs nullType ("" for nvarchar(4000)).
+fn (col: &TableCol) typeInfo(nullType: &str, coll: &Collation): Result[str, Error] {
+    if col.kind == ColKind.Unknown && len(nullType) > 0 { return typeInfoOf(nullType, coll) }
+    var b: []byte = []
+    match col.kind {
+        ColKind.Int { for x in [T_INTN, 8] { put8(mut &b, x) } }
+        ColKind.Float { for x in [T_FLTN, 8] { put8(mut &b, x) } }
+        ColKind.Bool { for x in [T_BITN, 1] { put8(mut &b, x) } }
+        ColKind.Bytes {
+            put8(mut &b, T_BIGVARBIN)
+            put16(mut &b, if col.long { 0xFFFF } else { 8000 })
+        }
+        ColKind.Dec {
+            let p = max(col.intDigits + col.scale, 1)
+            if p > 38 {
+                return Err(sqldialect.dbError(sqldialect.E_DEC_RANGE, "a decimal column needs " + p.toStr() +
+                                              " digits: SQL Server's decimal has 38"))
+            }
+            for x in [T_DECIMALN, 17, p, col.scale] { put8(mut &b, x) }
+        }
+        else {
+            put8(mut &b, T_NVARCHAR)
+            put16(mut &b, if col.long { 0xFFFF } else { 8000 })
+            appendStr(mut &b, collationBytes(coll))
+        }
+    }
+    return Ok(strFromBytes(&b))
+}
+
+// v as a value of the column whose TYPE_INFO is ti.
+fn (col: &TableCol) put(d: mut &[]byte, v: &sqldialect.Value, ti: &str): Result[Unit, Error] {
+    match v {
+        sqldialect.Value.Null { nullData(d, ti) }
+        sqldialect.Value.Int(n) {
+            if col.kind == ColKind.Dec {
+                var m = intMagnitude(n)
+                for k in 0..col.scale { m = m * 10 }
+                decimalData(d, n < 0, m, max(col.intDigits + col.scale, 1))
+            } else {
+                put8(d, 8)
+                for k in 0..8 { put8(d, (n >> (8 * k)) & 0xff) }
+            }
+        }
+        sqldialect.Value.Float(f) { appendStr(d, (try floatParam(f)).data) }
+        sqldialect.Value.Bool(x) {
+            put8(d, 1)
+            put8(d, if x { 1 } else { 0 })
+        }
+        sqldialect.Value.Text(t) {
+            let u = match toUtf16(t) {
+                Ok(x) { x }
+                Err(e) { return Err(sqldialect.inputError("text value: " + e)) }
+            }
+            textData(d, &u, col.long)
+        }
+        sqldialect.Value.Bytes(b) { bytesData(d, &b, col.long) }
+        sqldialect.Value.Dec(x) {
+            let parts = try decimalParts(x)
+            var m = parts.m
+            for k in parts.s..col.scale { m = m * 10 }
+            decimalData(d, parts.neg, m, max(col.intDigits + col.scale, 1))
+        }
+    }
+    return Ok(Unit{})
+}
+
+// A regular identifier of at most 128 characters: a letter, _, @ or #,
+// then letters, digits and _ @ # $ (ASCII).
+fn validIdentifier(n: &str): bool {
+    if len(n) < 1 || len(n) > 128 { return false }
+    for i in 0..len(n) {
+        let c = strByte(n, i)
+        let letter = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || c == '@' || c == '#'
+        if !(letter || (i > 0 && ((c >= '0' && c <= '9') || c == '$'))) { return false }
+    }
+    return true
+}
+
+// B_VARCHAR: a length in UTF-16 units (one byte), then the text.
+fn putBVarchar(b: mut &[]byte, s: &str) {
+    let u = toUtf16(s).unwrapOr([])
+    put8(b, len(u) / 2)
+    for x in u { append(b, x) }
+}
+
+// A table-valued parameter of the table type typeName ("Items" or
+// "dbo.Items": a user-defined table type of the current database), its rows
+// as rows. Every row has a value for every column of the type, in the
+// type's order; each column's type comes from its values (as a parameter's:
+// bigint, float, bit, nvarchar, varbinary, decimal(p,s) wide enough for all
+// of them, ints too), and the server converts it to the column's. A column
+// whose values are all NULL goes as nullTypes[i] (a name typeInfoOf knows),
+// or nvarchar(4000) when that is "" or missing. No rows sends the type's
+// default, an empty table. E_INPUT for a type name that is not one or two
+// regular identifiers, rows of different lengths, more than
+// MAX_TABLE_COLUMNS columns, a column with values of two kinds (other than
+// int and decimal), and a null type typeInfoOf does not know.
+pub fn tableParam(typeName: str, rows: &[[]sqldialect.Value], nullTypes: &[str], coll: &Collation): Result[Param, Error] {
+    let parts = strings.split(&typeName, ".")
+    if len(parts) > 2 || !validIdentifier(&parts[len(parts) - 1]) || (len(parts) == 2 && !validIdentifier(&parts[0])) {
+        return Err(sqldialect.inputError("a table type's name must be type or schema.type, regular identifiers"))
+    }
+    var ti: []byte = []
+    put8(mut &ti, T_TABLE)
+    put8(mut &ti, 0)                                   // DbName: the current database's
+    putBVarchar(mut &ti, if len(parts) == 2 { parts[0] } else { "" })
+    putBVarchar(mut &ti, parts[len(parts) - 1])
+    var d: []byte = []
+    if len(rows) == 0 {
+        put16(mut &ti, TVP_NULL)
+        put8(mut &ti, TVP_END)
+        put8(mut &d, TVP_END)
+        return Ok(Param{name: "", output: false, byDefault: true, declared: typeName + " READONLY",
+                        typeInfo: strFromBytes(&ti), data: strFromBytes(&d)})
+    }
+    let n = len(rows[0])
+    if n < 1 || n > MAX_TABLE_COLUMNS {
+        return Err(sqldialect.inputError("a table parameter has 1 to " + MAX_TABLE_COLUMNS.toStr() + " columns, not " + n.toStr()))
+    }
+    var cols: []TableCol = []
+    for i in 0..n { append(mut &cols, TableCol{kind: ColKind.Unknown, long: false, intDigits: 0, scale: 0}) }
+    for r in 0..len(rows) {
+        if len(rows[r]) != n {
+            return Err(sqldialect.inputError("row " + (r + 1).toStr() + " of a table parameter has " + len(rows[r]).toStr() +
+                                             " values, row 1 has " + n.toStr()))
+        }
+        for i in 0..n { try cols[i].take(&rows[r][i], i) }
+    }
+    put16(mut &ti, n)
+    var infos: []str = []
+    for i in 0..n {
+        let nt = if i < len(nullTypes) { nullTypes[i] } else { "" }
+        let info = try cols[i].typeInfo(&nt, coll)
+        put32(mut &ti, 0)                              // UserType
+        put16(mut &ti, 1)                              // Flags: fNullable
+        appendStr(mut &ti, info)
+        put8(mut &ti, 0)                               // ColName: none
+        append(mut &infos, info)
+    }
+    put8(mut &ti, TVP_END)                             // no ordering metadata
+    for r in 0..len(rows) {
+        put8(mut &d, TVP_ROW)
+        for i in 0..n { try cols[i].put(mut &d, &rows[r][i], &infos[i]) }
+    }
+    put8(mut &d, TVP_END)
+    return Ok(Param{name: "", output: false, byDefault: false, declared: typeName + " READONLY",
+                    typeInfo: strFromBytes(&ti), data: strFromBytes(&d)})
 }
 
 // ---------------------------------------------------------------- transactions

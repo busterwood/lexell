@@ -15,8 +15,8 @@
 // through sp_executesql (query, run, queryAll, call with OUTPUT
 // parameters); every result set and row count of a batch (queryAll); every
 // ERROR of a call (errors(), the first is the Err) and its INFOs
-// (diagnostics()); procedures' return status; transaction[T] by Transaction
-// Manager requests. Types: tinyint, smallint, int, bigint, bit, real,
+// (diagnostics()); procedures' return status; table-valued parameters
+// (queryTables, Table); transaction[T] by Transaction Manager requests. Types: tinyint, smallint, int, bigint, bit, real,
 // float, decimal, numeric, money, smallmoney, nchar, nvarchar, char and
 // varchar (a UTF-8 collation, code page 1252 or ISO-8859-1; another code
 // page is an error naming it, when that cell is read), binary, varbinary,
@@ -479,13 +479,53 @@ fn paramOf(v: &Value, name: str, coll: &tds.Collation): Result[tds.Param, Error]
     return Ok(p)
 }
 
-// The RPC parameters: args as @p1, @p2, ..., then the outputs.
-fn (c: &Conn) params(args: &[Value], outs: &[Out]): Result[[]tds.Param, Error] {
-    if len(args) + len(outs) > tds.MAX_PARAMS {
+// A table-valued parameter: its name ("@items"), its table type ("Items"
+// or "dbo.Items", created with CREATE TYPE ... AS TABLE in the connection's
+// database) and its rows, each with a value for every column of the type in
+// the type's order. The SQL reads it as a table (SELECT ... FROM @items,
+// INSERT INTO t SELECT * FROM @items, EXEC p @items); it is READONLY.
+//
+// The values of a column must be of one kind, and NULLs: each column goes
+// as the type a parameter of that kind goes as (Int as bigint, Text as
+// nvarchar, Dec as a decimal(p, s) wide enough for every value, Ints in it
+// too), and the server converts it to the column's type as it converts a
+// parameter (dates as text, for example). NULL carries no type: a column
+// whose values are all NULL goes as its entry in nullTypes (a type name, as
+// Out.sqlType), or as nvarchar(4000) when that is "" or there is none.
+// nvarchar converts to every column type but binary and varbinary (error
+// 257), so a binary column needs one: nullTypes: ["", "varbinary(max)"].
+// No rows is an empty table. A table type with an identity or a computed
+// column cannot be sent yet.
+pub type Table = record {
+    pub name: str
+    pub typeName: str
+    pub rows: [][]Value
+    pub nullTypes: []str
+}
+
+// A Table without null types.
+pub fn table(name: str, typeName: str, rows: [][]Value): Table {
+    return Table{name: name, typeName: typeName, rows: rows, nullTypes: []}
+}
+
+// The RPC parameters: args as @p1, @p2, ..., then the tables, then the outputs.
+fn (c: &Conn) params(args: &[Value], tables: &[Table], outs: &[Out]): Result[[]tds.Param, Error] {
+    if len(args) + len(tables) + len(outs) > tds.MAX_PARAMS {
         return Err(sqldialect.inputError("more than " + tds.MAX_PARAMS.toStr() + " parameters"))
     }
     var ps: []tds.Param = []
     for i in 0..len(args) { append(mut &ps, try paramOf(&args[i], "@p" + (i + 1).toStr(), &c.s.collation)) }
+    for t in tables {
+        if !tds.validParamName(&t.name) {
+            return Err(sqldialect.inputError("a table parameter's name must be @ and 1 to 127 letters, digits or _ @ # $"))
+        }
+        var p = match tds.tableParam(t.typeName, &t.rows, &t.nullTypes, &c.s.collation) {
+            Ok(x) { x }
+            Err(e) { return Err(sqldialect.dbError(e.code, "table parameter " + t.name + ": " + e.msg)) }
+        }
+        p.name = t.name
+        append(mut &ps, p)
+    }
     for o in outs {
         if !tds.validParamName(&o.name) {
             return Err(sqldialect.inputError("an output parameter's name must be @ and 1 to 127 letters, digits or _ @ # $"))
@@ -498,11 +538,11 @@ fn (c: &Conn) params(args: &[Value], outs: &[Out]): Result[[]tds.Param, Error] {
     return Ok(ps)
 }
 
-// Sends sql: as a SQL batch without parameters or outputs, else through
-// sp_executesql with args as @p1, @p2, ... and the outputs after them.
-fn (c: mut &Conn) send(sql: str, args: &[Value], outs: &[Out], w: Where): Result[tds.Reply, Error] {
-    if len(args) == 0 && len(outs) == 0 { return checked(try c.s.batch(sql, w)) }
-    let ps = try c.params(args, outs)
+// Sends sql: as a SQL batch without parameters, else through sp_executesql
+// with args as @p1, @p2, ..., then the tables and the outputs.
+fn (c: mut &Conn) send(sql: str, args: &[Value], tables: &[Table], outs: &[Out], w: Where): Result[tds.Reply, Error] {
+    if len(args) == 0 && len(tables) == 0 && len(outs) == 0 { return checked(try c.s.batch(sql, w)) }
+    let ps = try c.params(args, tables, outs)
     var r = try c.s.executeSql(sql, &ps, w)
     // sp_executesql's own RETURNSTATUS (0) comes last: it is not the SQL's
     if len(r.statuses) > 0 {
@@ -520,7 +560,7 @@ fn (c: mut &Conn) send(sql: str, args: &[Value], outs: &[Out], w: Where): Result
 // error is the result; every error is in errors() (the statements after an
 // error may have run: SQL Server goes on after most errors in a batch).
 pub fn (c: mut &Conn) exec(sql: str, w: Where): Result[Unit, Error] {
-    let r = try c.send(sql, &[], &[], w)
+    let r = try c.send(sql, &[], &[], &[], w)
     return Ok(Unit{})
 }
 
@@ -533,7 +573,7 @@ pub fn (c: mut &Conn) exec(sql: str, w: Where): Result[Unit, Error] {
 // as varbinary(8000) (varbinary(max) beyond), Dec as decimal(p, s) from the
 // value, NULL as NULL_TYPE. Dates go in as text, which the server converts.
 pub fn (c: mut &Conn) query(sql: str, args: &[Value], w: Where): Result[Rows, Error] {
-    var r = try c.send(sql, args, &[], w)
+    var r = try c.send(sql, args, &[], &[], w)
     let sets = len(r.results)
     if sets == 0 { return Ok(Rows{cols: [], rows: [], affected: r.affected, sets: 0}) }
     let first = replace(mut &r.results[0], tds.ResultSet{columns: [], rows: [], count: -1})
@@ -548,7 +588,7 @@ pub fn (c: mut &Conn) querySql(q: &Sql, w: Where): Result[Rows, Error] {
 // Runs sql (with parameters as query): the rows changed by its last
 // statement that has no result set, -1 when none says.
 pub fn (c: mut &Conn) run(sql: str, args: &[Value], w: Where): Result[int, Error] {
-    let r = try c.send(sql, args, &[], w)
+    let r = try c.send(sql, args, &[], &[], w)
     return Ok(r.affected)
 }
 
@@ -575,7 +615,23 @@ pub fn (c: mut &Conn) queryAll(sql: str, args: &[Value], w: Where): Result[Resul
 // SQL sets them (SET @total = ..., EXEC p @x OUTPUT), and they come back in
 // Results.outputs, in the order the server sends them.
 pub fn (c: mut &Conn) call(sql: str, args: &[Value], outs: &[Out], w: Where): Result[Results, Error] {
-    var r = try c.send(sql, args, outs, w)
+    return c.callWith(sql, args, &[], outs, w)
+}
+
+// queryAll with table-valued parameters: args are @p1, @p2, ..., and each
+// table is bound under its own name (Table).
+//
+//     try conn.exec("CREATE TYPE dbo.Items AS TABLE (id int, name nvarchar(50))")
+//     let items = sqlserver.table("@items", "dbo.Items", [[Value.Int(1), Value.Text("a")], [Value.Int(2), Value.Null]])
+//     let r = try conn.queryTables("INSERT INTO t SELECT id, name FROM @items WHERE id > @p1", &[Value.Int(0)], &[items])
+//     // r.counts[0].rows == 2
+pub fn (c: mut &Conn) queryTables(sql: str, args: &[Value], tables: &[Table], w: Where): Result[Results, Error] {
+    return c.callWith(sql, args, tables, &[], w)
+}
+
+// call with table-valued parameters, as queryTables.
+pub fn (c: mut &Conn) callWith(sql: str, args: &[Value], tables: &[Table], outs: &[Out], w: Where): Result[Results, Error] {
+    var r = try c.send(sql, args, tables, outs, w)
     var sets: []Rows = []
     for k in 0..len(r.results) {
         let rs = replace(mut &r.results[k], tds.ResultSet{columns: [], rows: [], count: -1})
@@ -583,7 +639,7 @@ pub fn (c: mut &Conn) call(sql: str, args: &[Value], outs: &[Out], w: Where): Re
         append(mut &sets, Rows{cols: cols, rows: rows, affected: n, sets: 1})
     }
     var counts: []StatementCount = []
-    let rpc = len(args) > 0 || len(outs) > 0
+    let rpc = len(args) > 0 || len(tables) > 0 || len(outs) > 0
     for x in r.counts {
         if !(rpc && x.token == tds.TK_DONEPROC) { append(mut &counts, x) }
     }
@@ -897,7 +953,7 @@ pub fn (c: mut &Conn) stream[B, T](sql: str, args: []Value, bind: fn(&Columns): 
     if len(args) == 0 {
         has = try c.s.streamBatch(sql, w)
     } else {
-        let ps = try c.params(&args, &[])
+        let ps = try c.params(&args, &[], &[])
         has = try c.s.streamExecuteSql(sql, &ps, w)
     }
     let cols = sqlrows.columns(if has { tds.describe(c.s.streamColumns()) } else { [] })

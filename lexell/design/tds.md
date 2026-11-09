@@ -139,7 +139,8 @@ allocation. The token decoder is fuzzed (section 5).
 | binary, varbinary, image | bytes (`str`) | |
 | (max) types, xml | `str` / bytes | PLP: partially length-prefixed chunks, decoded as they arrive; a size limit as in mssql.lxl's `setMaxValue` |
 | uniqueidentifier | `str` | the canonical text (mixed-endian layout) |
-| sql_variant, table-valued parameters, UDTs | later | |
+| sql_variant, UDTs | later | |
+| table-valued parameters | `sqlserver.Table` (in) | section 11 |
 
 Parameters go out typed. `Value.Dec` is sent as decimal(p, s) from the
 value. Text is sent as nvarchar, with max beyond 4,000 characters. NULL
@@ -229,7 +230,7 @@ Each stage is one branch, merged after the full gate.
 | T2 | every type of the table, collations 1252 and Latin-1, RPC `sp_executesql` with parameters, multiple results, ERROR/INFO with their state and severity, row counts, `transaction[T]`, ENVCHANGE | the full type matrix and the error cases match ODBC (built: section 9) |
 | T3 | streamed `Rows`, ATTENTION with deadlines and cancellation (section 2), `Pool`/`Lease`, the http_gate `--db` SQL Server load, PERFORMANCE.md | load numbers against ODBC; cancellation tests; no leak under LXL_CHECK=1 |
 | T4 | Sybase ASE over TDS 5.0 (`sybase` module) | the differential suite against ASE (needs a server) |
-| T5 | bulk copy (BULK LOAD, packet type 7) for fast inserts; NTLM; TDS 8.0 strict; Azure AD tokens; table-valued parameters | each as needed |
+| T5 | bulk copy (BULK LOAD, packet type 7) for fast inserts; NTLM; TDS 8.0 strict; Azure AD tokens; table-valued parameters (built: section 11) | each as needed |
 
 T1 is about one agent's run, and T2 and T3 one each. T4 depends on having a
 server.
@@ -458,3 +459,61 @@ requests/s through a pool of 16; one connection's round trip is 350 to 396
 - **Not done:** a PLP value longer than a packet is rescanned from the
   start of its row for every packet that brings more of it (quadratic in
   the value's packets; fine for values of a few packets).
+
+## 11. Table-valued parameters, as built (2026-11-09)
+
+Branch `tvp`, from `pool`. A table-valued parameter (MS-TDS 2.2.5.5.5,
+TVP_TYPE_INFO) is one more RPC parameter, so it rides on `Param` and
+`executeSql` unchanged: the TYPE_INFO is TVPTYPE (0xF3), the type's name
+(DbName empty: the current database; the schema; the name), the column
+metadata (UserType 0, fNullable, a TYPE_INFO each, no name) and
+TVP_END_TOKEN; the value is TVP_ROW_TOKEN and a TYPE_VARBYTE per column,
+per row, then TVP_END_TOKEN. sp_executesql declares it `@name type
+READONLY`.
+
+- **API:** `sqlserver.Table{name, typeName, rows: [][]Value, nullTypes}`
+  (`table(name, typeName, rows)`), bound by `queryTables(sql, &args,
+  &tables): Results` and `callWith(sql, &args, &tables, &outs)`; `query`,
+  `run`, `queryAll` and `call` are unchanged. Value is shared by every
+  dialect (sqldialect), so a table is not a Value; it is a parameter of its
+  own, by name, as an Out is.
+- **Column types from values, not declared:** a column goes as the type its
+  values go as as parameters (bigint, float, bit, nvarchar, varbinary,
+  decimal(p, s)), and the server converts it to the table type's column as
+  it converts a parameter: bigint to int, text to date, a decimal rounded
+  to the column's scale; its conversion errors (245, 2628) are the
+  server's. A decimal column is as wide as all its values need (the most
+  integer digits plus the most fraction digits, 38 at most, else
+  E_DEC_RANGE), and an Int in it is scaled in. Text past 4,000 UTF-16
+  units, or bytes past 8,000, makes the column (max), every value PLP.
+  Declaring the types (as ADO.NET's SqlMetaData and JDBC's column
+  metadata do) would mean encoding every Value as every SQL type, client
+  side; the server's conversions already do that.
+- **NULL has no type:** a column of only NULLs is nvarchar(4000), which
+  converts to everything but binary and varbinary (error 257), so a
+  `Table` has `nullTypes`: per column, the type its NULLs go as when no
+  value says (`typeInfoOf`'s names). Learning the types from the server
+  (sys.table_types) was the alternative: a round trip, or a cache that a
+  DROP and CREATE TYPE makes wrong.
+- **No rows:** sent as the type's default (StatusFlags fDefaultValue,
+  TVP_NULL_TOKEN for the metadata), as SqlClient does: the column count is
+  not needed.
+- **Checked before sending (E_INPUT):** a type name of one or two regular
+  identifiers (it goes into sp_executesql's declaration); a parameter name
+  as validParamName; rows of one length, 1 to 1,024 columns; one kind per
+  column (Int and Dec mix); null types `typeInfoOf` knows.
+- **Not done:** identity and computed columns (the server refuses a value
+  for them, error 1077, and their omission, error 500; they need the
+  column flag fDefault and rows without those values); a table in
+  `stream`; TVP_ORDER_UNIQUE and TVP_COLUMN_ORDERING; sending the rows as
+  they are produced rather than built whole in memory.
+- **Tests:** `tds_table_param` (bytes: the TYPE_INFO and rows of a small
+  table, decimal widening, the (max) switch at 4,000 units counting
+  surrogate pairs, null types, the empty table and its status flag, every
+  refusal) and live `sqlserver_live_tvp` (every kind of column and the
+  server's conversions, an empty table, a type without its schema beside
+  @p1, a column of NULLs with and without its null type, the server's
+  errors and ours with the connection idle after each, 20,000 rows over
+  many packets, two tables in one call, INSERT ... SELECT in a transaction
+  rolled back, a procedure's parameter, an identity column refused). Both
+  pass under the C and native backends.

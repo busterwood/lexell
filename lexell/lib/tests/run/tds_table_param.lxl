@@ -1,0 +1,136 @@
+// tds.tableParam: a table-valued parameter's TYPE_INFO (the type name, a
+// column's metadata each) and its rows, byte for byte; each column's type
+// from its values (a decimal widened over its rows, an int in a decimal
+// column, nvarchar(max) past 4,000 UTF-16 units, an emoji counting two);
+// a null type for a column of NULLs; no rows as the type's default; the
+// declaration sp_executesql gets and the default flag; and every refusal.
+// expect: ti: f3 00 03 640062006f00 01 5400 0200 00000000 0100 2608 00 00000000 0100 e7401f0000000000 00 00
+// expect: rows: 01 080100000000000000 02006100 01 00 ffff 00
+// expect: declared: dbo.T READONLY | default false
+// expect: decimal: 6a110402 | 0501e2040000 05012c010000 050001000000
+// expect: min int in decimal: 6a111401 | 0d000000000000000000050000
+// expect: units: 4000 nvarchar(4000) | 4001 nvarchar(max) | 2000 emoji 4000 | 2001 emoji max
+// expect: max rows: 01 0100000000000000 01000000 61 00000000 | 01 ffffffffffffffff | 01 411f000000000000 411f0000
+// expect: null type: a5 1400 | ffff00 | none: e7 401f
+// expect: empty: f3 00 00 01 5400 ffff 00 | 00 | default true
+// expect: rpc: declares true, status 02
+// expect: errors:
+// expect:   1000 a table type's name must be type or schema.type, regular identifiers
+// expect:   1000 a table type's name must be type or schema.type, regular identifiers
+// expect:   1000 a table type's name must be type or schema.type, regular identifiers
+// expect:   1000 a table parameter has 1 to 1024 columns, not 0
+// expect:   1000 a table parameter has 1 to 1024 columns, not 1025
+// expect:   1000 row 2 of a table parameter has 1 values, row 1 has 2
+// expect:   1000 column 1 has int and float values
+// expect:   1000 column 2 has text and bytes values
+// expect:   1011 a decimal column needs 41 digits: SQL Server's decimal has 38
+// expect:   1004 SQL Server float has no NaN or Infinity
+// expect:   1000 text value: invalid UTF-8 at byte 1
+// expect:   1000 a type that parameters cannot have yet: blob
+// expect: 1024 columns: ok
+
+import "tds"
+import "sqldialect"
+import "strings"
+import "math"
+
+type V = sqldialect.Value
+
+fn hexs(s: &str): str {
+    let digits = "0123456789abcdef"
+    var out = newStrBuf()
+    for i in 0..len(s) {
+        let c = int(strByte(s, i))
+        out.add(digits[c >> 4..(c >> 4) + 1] + digits[(c & 15)..(c & 15) + 1])
+    }
+    return out.toStr()
+}
+
+fn param(t: str, rows: [][]V, nulls: []str): tds.Param {
+    return tds.tableParam(t, &rows, &nulls, &tds.noCollation()).unwrap()
+}
+
+fn errOf(t: str, rows: [][]V, nulls: []str): str {
+    match tds.tableParam(t, &rows, &nulls, &tds.noCollation()) {
+        Ok(_) { return "  ok" }
+        Err(e) { return "  " + e.code.toStr() + " " + e.msg }
+    }
+}
+
+// The declared type of a one-column table of one text value.
+fn textType(s: str): str {
+    let p = param("T", [[V.Text(s)]], [])
+    // F3, DbName, schema, name "T", count, UserType, Flags, then TYPE_INFO: E7 and its size at 15
+    return if strByte(&p.typeInfo, 15) == 0xFF { "max" } else { "4000" }
+}
+
+fn main() {
+    let p = param("dbo.T", [[V.Int(1), V.Text("a")], [V.Null, V.Null]], [])
+    let ti = hexs(&p.typeInfo)
+    // split as: TVPTYPE, DbName, schema, name, count, column 1, column 2, end
+    println("ti: " + ti[0..2] + " " + ti[2..4] + " " + ti[4..6] + " " + ti[6..18] + " " + ti[18..20] + " " + ti[20..24] + " " +
+            ti[24..28] + " " + ti[28..36] + " " + ti[36..40] + " " + ti[40..44] + " " + ti[44..46] + " " + ti[46..54] + " " +
+            ti[54..58] + " " + ti[58..74] + " " + ti[74..76] + " " + ti[76..])
+    let d = hexs(&p.data)
+    println("rows: " + d[0..2] + " " + d[2..20] + " " + d[20..28] + " " + d[28..30] + " " + d[30..32] + " " + d[32..36] + " " + d[36..])
+    println("declared: " + p.declared + " | default " + p.byDefault.toStr())
+
+    let dp = param("T", [[V.Dec(12.5m)], [V.Int(3)], [V.Dec(-0.01m)]], [])
+    let dt = hexs(&dp.typeInfo)
+    let dd = hexs(&dp.data)
+    // ti: f3 00 00 01 5400 0100 | 00000000 0100 | 6a110402 | 00 00; rows: 01 <value> each, then 00
+    println("decimal: " + dt[28..36] + " | " + dd[2..14] + " " + dd[16..28] + " " + dd[30..42])
+    let mp = param("T", [[V.Int(-9223372036854775807 - 1)], [V.Dec(1.0m)]], [])
+    println("min int in decimal: " + hexs(&mp.typeInfo)[28..36] + " | " + hexs(&mp.data)[2..28])
+
+    var e1 = ""
+    for i in 0..2000 { e1 = e1 + "😀" }
+    let e2 = e1 + "😀"
+    println("units: 4000 nvarchar(" + textType(strings.padLeft("", 4000, 'x')) + ") | 4001 nvarchar(" +
+            textType(strings.padLeft("", 4001, 'x')) + ") | 2000 emoji " + textType(e1) +
+            " | 2001 emoji " + textType(e2))
+
+    // a (max) column: every value PLP, the short one too, and NULL as PLP NULL
+    let xp = param("T", [[V.Bytes("a")], [V.Null], [V.Bytes(strings.padLeft("", 8001, 'b'))]], [])
+    let xd = hexs(&xp.data)
+    // row: 01, PLP total length, chunk length, chunk, terminator; NULL as PLP NULL
+    println("max rows: " + xd[0..2] + " " + xd[2..18] + " " + xd[18..26] + " " + xd[26..28] + " " + xd[28..36] + " | " +
+            xd[36..38] + " " + xd[38..54] + " | " + xd[54..56] + " " + xd[56..72] + " " + xd[72..80])
+
+    let np = param("T", [[V.Int(1), V.Null]], ["", "varbinary(20)"])
+    let nt = hexs(&np.typeInfo)
+    let none = hexs(&param("T", [[V.Int(1), V.Null]], []).typeInfo)
+    println("null type: " + nt[46..48] + " " + nt[48..52] + " | " + hexs(&np.data)[20..] + " | none: " + none[46..48] + " " + none[48..52])
+
+    let ep = param("T", [], [])
+    let et = hexs(&ep.typeInfo)
+    println("empty: " + et[0..2] + " " + et[2..4] + " " + et[4..6] + " " + et[6..8] + " " + et[8..12] + " " + et[12..16] + " " +
+            et[16..] + " | " + hexs(&ep.data) + " | default " + ep.byDefault.toStr())
+
+    var rp = ep
+    rp.name = "@t"
+    let rpc = tds.executeSql("SELECT 1", &[rp], tds.noTransaction(), &tds.noCollation()).unwrap()
+    let decl = strFromBytes(&tds.toUtf16("@t T READONLY").unwrap())
+    let name = strFromBytes(&tds.toUtf16("@t").unwrap())
+    let at = strings.lastIndexOf(&rpc, &name)
+    println("rpc: declares " + strings.contains(&rpc, &decl).toStr() + ", status " + hexs(&rpc[at + len(name)..at + len(name) + 1]))
+
+    println("errors:")
+    println(errOf("a.b.c", [[V.Int(1)]], []))
+    println(errOf("dbo.T; DROP TABLE x", [[V.Int(1)]], []))
+    println(errOf("1T", [[V.Int(1)]], []))
+    println(errOf("T", [[]], []))
+    var wide: []V = []
+    for i in 0..1025 { append(mut &wide, V.Null) }
+    println(errOf("T", [wide], []))
+    println(errOf("T", [[V.Int(1), V.Int(2)], [V.Int(3)]], []))
+    println(errOf("T", [[V.Int(1)], [V.Null], [V.Float(1.5f)]], []))
+    println(errOf("T", [[V.Null, V.Text("a")], [V.Null, V.Bytes("b")]], []))
+    println(errOf("T", [[V.Dec(sqldialect.parseDecimal("1e30").unwrap())], [V.Dec(sqldialect.parseDecimal("1e-10").unwrap())]], []))
+    println(errOf("T", [[V.Float(math.nan())]], []))
+    println(errOf("T", [[V.Text("a\xff")]], []))
+    println(errOf("T", [[V.Null]], ["blob"]))
+    var full: []V = []
+    for i in 0..1024 { append(mut &full, V.Int(i)) }
+    println("1024 columns: " + (if tds.tableParam("T", &[full], &[], &tds.noCollation()).isOk() { "ok" } else { "refused" }))
+}

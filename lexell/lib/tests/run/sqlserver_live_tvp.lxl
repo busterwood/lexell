@@ -1,0 +1,168 @@
+// sqlserver's table-valued parameters (queryTables) against a live SQL
+// Server ($MSSQL_TEST_DSN or ~/.obo-mssql-dsn; exits 77, skipped, without
+// one; the string and the server's connect messages are never printed):
+// rows of every kind of value, converted by the server to the table type's
+// columns (bigint to int, text to date, a decimal widened over its rows, an
+// int in a decimal column, nvarchar(max) text); an empty table; a type
+// without its schema, beside @p1; a column of NULLs as nvarchar (error 257
+// for varbinary) and as its null type; the server's errors for a short row,
+// a missing type, text that is not an int and text too long, and ours for
+// rows of different lengths, a bad type or parameter name and a column of
+// two kinds, each leaving the connection idle; 20,000 rows (many packets);
+// two tables in one call; INSERT ... SELECT from one, inside a transaction
+// rolled back; a procedure's table parameter; an identity column is not
+// supported yet. The types and procedure it creates are dropped.
+// expect: select: 1 'café' 12.50 '2026-11-09' x'00ff' true 0.5 1 | 2 NULL 3.00 NULL NULL false NULL NULL | 3 '' -0.01 '2000-01-01' x'' NULL -2 5000 [counts 3] idle true
+// expect: empty: 0 [counts 1] idle true
+// expect: no schema: 2 [counts 1] idle true
+// expect: null varbinary: error 257 | idle true
+// expect: null types: 1 0 [counts 1] idle true
+// expect: bad null type: error 1000: table parameter @items: a type that parameters cannot have yet: int; -- | idle true
+// expect: short row: error 500 | idle true
+// expect: ragged: error 1000: table parameter @items: row 2 of a table parameter has 2 values, row 1 has 1 | idle true
+// expect: no type: error 351 | idle true
+// expect: bad name: error 1000: table parameter @items: a table type's name must be type or schema.type, regular identifiers | idle true
+// expect: three parts: error 1000: table parameter @items: a table type's name must be type or schema.type, regular identifiers | idle true
+// expect: mixed: error 1000: table parameter @items: column 1 has int and text values | idle true
+// expect: bad param name: error 1000: a table parameter's name must be @ and 1 to 127 letters, digits or _ @ # $ | idle true
+// expect: text into int: error 245 | idle true
+// expect: rounded: 1.01 [counts 1] idle true
+// expect: too long: error 2628 | idle true
+// expect: many: 20000 199990000 25000.00 'row 9999' [counts 1] idle true
+// expect: two: 30 [counts 1] idle true
+// expect: insert: 3 [counts 3 1] idle false
+// expect: rolled back: rows 0, idle true
+// expect: procedure: 103 [counts 1] idle true
+// expect: identity: error 500 | idle true
+// expect: identity both: error 1077 | idle true
+// expect: after: 1 [counts 1] idle true
+// expect: open handles 0
+import "sqlserver"
+import "io"
+import "os"
+import "strings"
+import "sqldialect"
+
+type V = sqlserver.Value
+type Error = sqlserver.Error
+
+fn dsn(): Option[str] {
+    match os.env("MSSQL_TEST_DSN") {
+        Some(d) { if len(strings.trim(d)) > 0 { return Some(strings.trim(d)) } }
+        None {}
+    }
+    match io.read(os.envOr("HOME", "") + "/.obo-mssql-dsn") {
+        Ok(d) { if len(strings.trim(d)) > 0 { return Some(strings.trim(d)) } }
+        Err(_) {}
+    }
+    return None
+}
+
+fn err(e: &Error): str { return "error " + e.code.toStr() + ": " + e.msg }
+
+fn show(r: &sqlserver.Rows): str {
+    var out: []str = []
+    for i in 0..r.rowCount() {
+        var cells: []str = []
+        for j in 0..r.columnCount() { append(mut &cells, r.value(i, j).unwrap().toStr()) }
+        append(mut &out, strings.join(&cells, " "))
+    }
+    return strings.join(&out, " | ")
+}
+
+fn tvp(name: str, typeName: str, rows: [][]V): sqlserver.Table {
+    return sqlserver.Table{name: name, typeName: typeName, rows: rows, nullTypes: ["", "", "", "", "varbinary(20)"]}
+}
+
+fn probe(c: mut &sqlserver.Conn, what: str, sql: str, args: &[V], tables: &[sqlserver.Table]) {
+    match c.queryTables(sql, args, tables) {
+        Ok(r) {
+            var sets: []str = []
+            for s in r.sets { append(mut &sets, show(&s)) }
+            var counts: []str = []
+            for x in r.counts { append(mut &counts, x.rows.toStr()) }
+            println(what + ": " + strings.join(&sets, " || ") + " [counts " + strings.join(&counts, " ") + "] idle " +
+                    c.idle().toStr())
+        }
+        Err(e) {
+            let text = if e.code == sqldialect.E_INPUT { err(&e) } else { "error " + e.code.toStr() }
+            println(what + ": " + text + " | idle " + c.idle().toStr())
+        }
+    }
+}
+
+fn main() {
+    let d = match dsn() { Some(x) { x } None { exit(77) } }
+    var c = match sqlserver.connect(d) {
+        Ok(x) { x }
+        Err(_) { exit(77) }
+    }
+    c.exec("IF TYPE_ID('dbo.LxlTvpItems') IS NOT NULL DROP TYPE dbo.LxlTvpItems").unwrap()
+    match c.exec("CREATE TYPE dbo.LxlTvpItems AS TABLE (id int NOT NULL, name nvarchar(50) NULL, price decimal(10,2) NULL, " +
+                 "born date NULL, data varbinary(20) NULL, ok bit NULL, f float NULL, note nvarchar(max) NULL)") {
+        Ok(_) {}
+        Err(e) {
+            println("create type: " + err(&e))
+            exit(77)
+        }
+    }
+    probe(mut &c, "select", "SELECT id, name, price, born, data, ok, f, LEN(note) FROM @items ORDER BY id", &[],
+          &[tvp("@items", "dbo.LxlTvpItems", items())])
+    probe(mut &c, "empty", "SELECT COUNT(*) FROM @items", &[], &[tvp("@items", "dbo.LxlTvpItems", [])])
+    probe(mut &c, "no schema", "SELECT COUNT(*) FROM @items WHERE id > @p1", &[V.Int(1)], &[tvp("@items", "LxlTvpItems", items())])
+    probe(mut &c, "null varbinary", "SELECT COUNT(*) FROM @items", &[],
+          &[sqlserver.table("@items", "dbo.LxlTvpItems", [[V.Int(1), V.Null, V.Null, V.Null, V.Null, V.Null, V.Null, V.Null]])])
+    probe(mut &c, "null types", "SELECT COUNT(*), COUNT(data) FROM @items", &[],
+          &[tvp("@items", "dbo.LxlTvpItems", [[V.Int(1), V.Null, V.Null, V.Null, V.Null, V.Null, V.Null, V.Null]])])
+    probe(mut &c, "bad null type", "SELECT COUNT(*) FROM @items", &[],
+          &[sqlserver.Table{name: "@items", typeName: "dbo.LxlTvpItems", rows: [[V.Int(1), V.Null]], nullTypes: ["", "int; --"]}])
+    probe(mut &c, "short row", "SELECT COUNT(*) FROM @items", &[], &[tvp("@items", "dbo.LxlTvpItems", [[V.Int(1), V.Null]])])
+    probe(mut &c, "ragged", "SELECT COUNT(*) FROM @items", &[], &[tvp("@items", "dbo.LxlTvpItems", [[V.Int(1)], [V.Int(1), V.Null]])])
+    probe(mut &c, "no type", "SELECT COUNT(*) FROM @items", &[], &[tvp("@items", "dbo.Nope", [[V.Int(1)]])])
+    probe(mut &c, "bad name", "SELECT COUNT(*) FROM @items", &[], &[tvp("@items", "dbo.x; DROP", [[V.Int(1)]])])
+    probe(mut &c, "three parts", "SELECT COUNT(*) FROM @items", &[], &[tvp("@items", "db.dbo.x", [[V.Int(1)]])])
+    probe(mut &c, "mixed", "SELECT COUNT(*) FROM @items", &[], &[tvp("@items", "dbo.LxlTvpItems", [[V.Int(1)], [V.Text("a")]])])
+    probe(mut &c, "bad param name", "SELECT 1", &[], &[tvp("items", "dbo.LxlTvpItems", [[V.Int(1)]])])
+    probe(mut &c, "text into int", "SELECT COUNT(*) FROM @items", &[],
+          &[tvp("@items", "dbo.LxlTvpItems", [[V.Text("x"), V.Null, V.Null, V.Null, V.Null, V.Null, V.Null, V.Null]])])
+    probe(mut &c, "rounded", "SELECT price FROM @items", &[],
+          &[tvp("@items", "dbo.LxlTvpItems", [[V.Int(1), V.Null, V.Dec(1.005m), V.Null, V.Null, V.Null, V.Null, V.Null]])])
+    probe(mut &c, "too long", "SELECT name FROM @items", &[],
+          &[tvp("@items", "dbo.LxlTvpItems", [[V.Int(1), V.Text(strings.padLeft("", 51, 'y')), V.Null, V.Null, V.Null, V.Null, V.Null, V.Null]])])
+    var many: [][]V = []
+    for i in 0..20000 { append(mut &many, [V.Int(i), V.Text("row " + i.toStr()), V.Dec(1.25m), V.Null, V.Null, V.Null, V.Null, V.Null]) }
+    probe(mut &c, "many", "SELECT COUNT(*), SUM(CAST(id AS bigint)), SUM(price), MAX(name) FROM @items", &[], &[tvp("@items", "dbo.LxlTvpItems", many)])
+    probe(mut &c, "two", "SELECT (SELECT COUNT(*) FROM @a) * 10 + (SELECT COUNT(*) FROM @b)", &[],
+          &[tvp("@a", "dbo.LxlTvpItems", items()), tvp("@b", "dbo.LxlTvpItems", [])])
+    c.exec("CREATE TABLE #t(id int, name nvarchar(50))").unwrap()
+    let r = c.transaction(fn(t: mut &sqlserver.Conn): Result[Unit, Error] {
+        probe(t, "insert", "INSERT INTO #t SELECT id, name FROM @items; SELECT COUNT(*) FROM #t", &[],
+              &[tvp("@items", "dbo.LxlTvpItems", items())])
+        return Err(sqldialect.inputError("roll back"))
+    })
+    println("rolled back: rows " + c.query("SELECT COUNT(*) FROM #t", &[]).unwrap().int(0, 0).unwrap().toStr() + ", idle " +
+            c.idle().toStr())
+    c.exec("IF OBJECT_ID('dbo.LxlTvpCount') IS NOT NULL DROP PROCEDURE dbo.LxlTvpCount").unwrap()
+    match c.exec("CREATE PROCEDURE dbo.LxlTvpCount @t dbo.LxlTvpItems READONLY, @k int AS SELECT COUNT(*) + @k FROM @t") {
+        Ok(_) { probe(mut &c, "procedure", "EXEC dbo.LxlTvpCount @items, @p1", &[V.Int(100)], &[tvp("@items", "dbo.LxlTvpItems", items())]) }
+        Err(e) { println("create procedure: " + err(&e)) }
+    }
+    c.exec("DROP PROCEDURE dbo.LxlTvpCount").unwrap()
+    c.exec("IF TYPE_ID('dbo.LxlTvpIdent') IS NOT NULL DROP TYPE dbo.LxlTvpIdent").unwrap()
+    c.exec("CREATE TYPE dbo.LxlTvpIdent AS TABLE (id int IDENTITY, name nvarchar(10))").unwrap()
+    probe(mut &c, "identity", "SELECT COUNT(*) FROM @t", &[], &[tvp("@t", "dbo.LxlTvpIdent", [[V.Text("a")]])])
+    probe(mut &c, "identity both", "SELECT COUNT(*) FROM @t", &[], &[tvp("@t", "dbo.LxlTvpIdent", [[V.Int(5), V.Text("a")]])])
+    probe(mut &c, "after", "SELECT 1", &[], &[])
+    c.exec("DROP TYPE dbo.LxlTvpIdent").unwrap()
+    c.exec("IF TYPE_ID('dbo.LxlTvpItems') IS NOT NULL DROP TYPE dbo.LxlTvpItems").unwrap()
+    c.close()
+    println("open handles " + intToStr(sqlserver.openHandles()))
+}
+
+fn items(): [][]V {
+    return [
+        [V.Int(1), V.Text("café"), V.Dec(12.5m), V.Text("2026-11-09"), V.Bytes("\x00\xff"), V.Bool(true), V.Float(0.5f), V.Text("n")],
+        [V.Int(2), V.Null, V.Int(3), V.Null, V.Null, V.Bool(false), V.Null, V.Null],
+        [V.Int(3), V.Text(""), V.Dec(-0.01m), V.Text("2000-01-01"), V.Bytes(""), V.Null, V.Float(-2.0f), V.Text(strings.padLeft("", 5000, 'x'))],
+    ]
+}
