@@ -1,0 +1,157 @@
+// lexdb_exec: ALTER TABLE, the actions that change no row (design/lexdb.md
+// 9.34): ADD COLUMN, RENAME COLUMN, RENAME TO, ALTER COLUMN SET and DROP
+// NOT NULL; several in one statement, all or none; in a block, rolled
+// back; a NULL committed by another session while SET NOT NULL is open (the
+// ALTER fails); after a reopen. Rows written before a column was added read it as
+// NULL, short rows and rows with long texts alike.
+// expect: added: ALTER TABLE | 1|a|| 2|b|| 3|c|x|7
+// expect: star: id|name|note|n
+// expect: long rows: 300||tail, 300|5|tail after an update
+// expect: added again: 42701 column "note" of relation "t" already exists; if not exists: ALTER TABLE
+// expect: not null on rows: 23502 column "z" of relation "t" contains null values; on none: ALTER TABLE, then 23502
+// expect: renamed column: 1|a 2|b 3|c; old name: 42703; to a name taken: 42701 column "n" of relation "t" already exists
+// expect: filtered index: 3, Index Scan using t_x on t (filtered)
+// expect: renamed table: 3, old: 42P01, taken: 42P07 relation "e" already exists, by an index: 42P07 relation "t_x" already exists
+// expect: index dropped through the new name: DROP INDEX
+// expect: in a schema: s.v2 3
+// expect: set not null: 23502 column "note" of relation "u" contains null values, 23502, ALTER TABLE
+// expect: drop not null: 42P16 column "id" is in a primary key; ALTER TABLE, insert INSERT 0 1
+// expect: all or none: 42701, columns id|label|note|n|k
+// expect: rolled back: id|label|note|n|k
+// expect: if exists: ALTER TABLE; missing: 42P01 relation "nope" does not exist
+// expect: not supported: 0A000 0A000 0A000 0A000 0A000
+// expect: racing a NULL: ALTER TABLE, other session INSERT 0 1, commit 40001 could not serialize access due to concurrent update, 1
+// expect: reopened: id|label|note|n|k|w, 4|d||||, 2 by the index
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if !r.hasRows { return r.tag }
+            var out: []str = []
+            for row in r.rows {
+                var vs: []str = []
+                for v in row { append(mut &vs, lexdb_exec.text(&v)) }
+                append(mut &out, strings.join(&vs, "|"))
+            }
+            return strings.join(&out, " ")
+        }
+        Err(e) { return e.state + " " + e.msg }
+    }
+}
+
+fn state(s: mut &lexdb_exec.Session, sql: &str): str { return q(s, sql)[0..5] }
+
+// The columns a SELECT * gives.
+fn cols(s: mut &lexdb_exec.Session, t: &str): str {
+    match s.exec(&("select * from " + t + " limit 0")) {
+        Ok(rs) {
+            var ns: []str = []
+            for c in rs[len(rs) - 1].cols { append(mut &ns, c.name) }
+            return strings.join(&ns, "|")
+        }
+        Err(e) { return e.state }
+    }
+}
+
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: 256 * 1024, segBytes: 1024 * 1024, ckptBytes: 512 * 1024, snapNodes: 100000}
+}
+
+fn main() {
+    let fs = lexdb_disk.sim(34)
+    lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        let c1 = q(mut &s, &"create table t (id int primary key, name text)")
+        let i1 = q(mut &s, &"insert into t values (1, 'a'), (2, 'b')")
+        let a1 = q(mut &s, &"alter table t add column note text, add n int")
+        let i2 = q(mut &s, &"insert into t values (3, 'c', 'x', 7)")
+        println("added: " + a1 + " | " + q(mut &s, &"select * from t order by id"))
+        println("star: " + cols(mut &s, &"t"))
+
+        // a row with a long text, written before a column is added
+        let c2 = q(mut &s, &"create table lt (id int primary key, body text)")
+        let i3 = q(mut &s, &("insert into lt values (1, '" + strings.repeat("b", 296) + "tail')"))
+        let a2 = q(mut &s, &"alter table lt add extra int")
+        let before = q(mut &s, &"select length(body), extra, right(body, 4) from lt")
+        let u3 = q(mut &s, &"update lt set extra = 5")
+        println("long rows: " + before + ", " + q(mut &s, &"select length(body), extra, right(body, 4) from lt") + " after an update")
+
+        println("added again: " + q(mut &s, &"alter table t add note int") + "; if not exists: " + q(mut &s, &"alter table t add column if not exists note int"))
+        let c3 = q(mut &s, &"create table em (id int primary key)")
+        let a3 = q(mut &s, &"alter table em add z int not null")
+        println("not null on rows: " + q(mut &s, &"alter table t add z int not null") + "; on none: " + a3 + ", then " + state(mut &s, &"insert into em values (1)"))
+
+        let r1 = q(mut &s, &"alter table t rename column name to label")
+        println("renamed column: " + q(mut &s, &"select id, label from t order by id") + "; old name: " + state(mut &s, &"select name from t") +
+                "; to a name taken: " + q(mut &s, &"alter table t rename label to n"))
+
+        // a filtered index naming a renamed column
+        let ix = q(mut &s, &"create index t_x on t (id) where note is not null")
+        let r2 = q(mut &s, &"alter table t rename note to remark")
+        let plan = q(mut &s, &"explain select id from t where remark is not null and id > 0")
+        println("filtered index: " + q(mut &s, &"select id from t where remark is not null and id > 0") + ", " +
+                (if strings.contains(&plan, &"t_x") { "Index Scan using t_x on t (filtered)" } else { plan }))
+        let r3 = q(mut &s, &"alter table t rename remark to note")
+
+        let c4 = q(mut &s, &"create table e (id int primary key)")
+        let r4 = q(mut &s, &"alter table t rename to u")
+        println("renamed table: " + q(mut &s, &"select count(*) from u") + ", old: " + state(mut &s, &"select * from t") +
+                ", taken: " + q(mut &s, &"alter table u rename to e") + ", by an index: " + q(mut &s, &"alter table u rename to t_x"))
+        let ix2 = q(mut &s, &"create index u_label on u (label)")
+        let r5 = q(mut &s, &"alter table u rename to u2")
+        println("index dropped through the new name: " + q(mut &s, &"drop index u_label"))
+        let r6 = q(mut &s, &"alter table u2 rename to u")
+
+        let sc = q(mut &s, &"create schema s")
+        let c5 = q(mut &s, &"create table s.v (id int primary key)")
+        let i4 = q(mut &s, &"insert into s.v values (1), (2), (3)")
+        let r7 = q(mut &s, &"alter table s.v rename to v2")
+        println("in a schema: s.v2 " + q(mut &s, &"select count(*) from s.v2"))
+
+        let sn1 = q(mut &s, &"alter table u alter column note set not null")
+        let fix = q(mut &s, &"update u set note = 'y' where note is null")
+        let sn2 = q(mut &s, &"alter table u alter note set not null")
+        println("set not null: " + sn1 + ", " + state(mut &s, &"insert into u (id, label) values (9, 'q')") + ", " + sn2)
+        let dn = q(mut &s, &"alter table u alter column note drop not null")
+        println("drop not null: " + q(mut &s, &"alter table u alter id drop not null") + "; " + dn + ", insert " + q(mut &s, &"insert into u (id, label) values (9, 'q')"))
+        let d9 = q(mut &s, &"delete from u where id = 9")
+
+        let ak = q(mut &s, &"alter table u add k int")
+        println("all or none: " + state(mut &s, &"alter table u add w int, add k int") + ", columns " + cols(mut &s, &"u"))
+        let b = q(mut &s, &"begin")
+        let aw = q(mut &s, &"alter table u add w int")
+        let rb = q(mut &s, &"rollback")
+        println("rolled back: " + cols(mut &s, &"u"))
+
+        println("if exists: " + q(mut &s, &"alter table if exists nope add x int") + "; missing: " + q(mut &s, &"alter table nope add x int"))
+        println("not supported: " + state(mut &s, &"alter table u add primary key (id)") + " " + state(mut &s, &"alter table u add x int default 1") + " " +
+                state(mut &s, &"alter table u alter note set default 'a'") + " " + state(mut &s, &"alter table u add constraint c unique (k)") + " " +
+                state(mut &s, &"alter index u_label rename to x"))
+        // a NULL committed while SET NOT NULL is open: the ALTER fails
+        var s2 = lexdb_exec.newSession(st)
+        let cc = q(mut &s, &"create table cc (id int primary key, v int)")
+        let cc1 = q(mut &s, &"insert into cc values (1, 1)")
+        let b2 = q(mut &s, &"begin")
+        let sn = q(mut &s, &"alter table cc alter v set not null")
+        let other = q(mut &s2, &"insert into cc values (2, null)")
+        println("racing a NULL: " + sn + ", other session " + other + ", commit " + q(mut &s, &"commit") + ", " + q(mut &s, &"select count(*) from cc where v is null"))
+        let aw2 = q(mut &s, &"alter table u add w int")
+        let i5 = q(mut &s, &"insert into u (id, label) values (4, 'd')")
+        let i6 = q(mut &s, &"update u set k = 7 where id = 2")
+        let ix3 = q(mut &s, &"create index u_k on u (k)")
+        return 0
+    }).unwrap()
+
+    lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int {
+        var s = lexdb_exec.newSession(st)
+        println("reopened: " + cols(mut &s, &"u") + ", " + q(mut &s, &"select * from u where id = 4") + ", " +
+                q(mut &s, &"select id from u where k = 7") + (if strings.contains(&q(mut &s, &"explain select id from u where k = 7"), &"u_k") { " by the index" } else { " not by the index" }))
+        return 0
+    }).unwrap()
+}

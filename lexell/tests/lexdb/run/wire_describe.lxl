@@ -5,11 +5,15 @@
 // a second connection inserts a row (the catalog unchanged: the same
 // columns), then drops t and makes it again with other columns: the next
 // Describe has the new ones, and the rows match them. Describe statement
-// too.
+// too. Then ALTER TABLE adds a column: run without Describe, the rows would
+// not match the columns described, and the server refuses (0A000, as
+// PostgreSQL); described again, they do.
 // expect: run 1: cols a,b rows 1 width 2
 // expect: run 2: cols a,b rows 2 width 2
 // expect: run 3: cols a,c,d rows 1 width 3
 // expect: statement: cols a,c,d
+// expect: altered, not described: rows 0 width 0 error 0A000
+// expect: altered, described: cols a,c,d,e rows 1 width 4
 import "task"
 import "net"
 import "postgres"
@@ -60,7 +64,13 @@ fn readUntilReady(c: &net.Conn, rx: mut &Rx): Seen {
             seen.rows += 1
             seen.width = binary.readU16BE(&body, 0)
         } else if typ == 'E' {
-            seen.err = "error"
+            seen.err = " error"
+            var at = 0
+            while at < len(body) && body[at] != 0 {
+                if body[at] == 'C' { seen.err = " error " + strFromBytes(&body[at + 1..at + 6]) }
+                while body[at] != 0 { at += 1 }
+                at += 1
+            }
         } else if typ == 'Z' {
             return seen
         }
@@ -80,6 +90,17 @@ fn run(c: &net.Conn, buf: mut &Rx, label: str) {
     send(c, &o)
     let s = readUntilReady(c, buf)
     println(label + ": cols " + strings.join(&s.cols, ",") + " rows " + s.rows.toStr() + " width " + s.width.toStr() + s.err)
+}
+
+fn runBare(c: &net.Conn, buf: mut &Rx, label: str) {
+    var o = pgwire.newOut()
+    let none: []pgwire.Param = []
+    pgwire.putBind(mut &o, "", "s", &none)
+    pgwire.putExecute(mut &o, "", 0)
+    pgwire.putSync(mut &o)
+    send(c, &o)
+    let s = readUntilReady(c, buf)
+    println(label + ": rows " + s.rows.toStr() + " width " + s.width.toStr() + s.err)
 }
 
 fn client(addr: str): Result[Unit, postgres.Error] {
@@ -113,6 +134,9 @@ fn client(addr: str): Result[Unit, postgres.Error] {
     send(&c, &d)
     let st = readUntilReady(&c, mut &buf)
     println("statement: cols " + strings.join(&st.cols, ","))
+    try other.exec("alter table t add e int")
+    runBare(&c, mut &buf, "altered, not described")
+    run(&c, mut &buf, "altered, described")
     return Ok(Unit{})
 }
 

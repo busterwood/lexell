@@ -393,7 +393,7 @@ Built on 2026-11-09 on branch `lexdb`, about 6,300 lines in
 (cache, trees, transactions, log, checkpoints, recovery, snapshots),
 `lexdb_sql` (lexer, parser), `lexdb_exec` (catalog, rows, keys, planner,
 statements, sessions), `lexdb_wire` (protocol 3.0) and `lexdb` (the
-server). Tests: `python3 lexell/tests/lexdb.py` (41 programs in
+server). Tests: `python3 lexell/tests/lexdb.py` (42 programs in
 `tests/lexdb/run`, under `LXL_CHECK=1`).
 
     lexell/compiler/out/lxlc lexell/cmd/lexdb.lxl -o lexdb
@@ -587,6 +587,11 @@ is the comparison to make.
    (as `hash.crc32c` is). Either needs a language or runtime change: the
    user's decision. Without SIMD, batches alone may give most of the gain
    (tight loops over arrays); measure that before deciding.
+13. ALTER (the user's request, 2026-11-09), in steps: (1) the actions that
+   rewrite no row: ADD COLUMN, RENAME COLUMN, RENAME TO, SET and DROP NOT
+   NULL (built: 9.34); (2) DROP COLUMN; (3) ALTER COLUMN TYPE; (4) SET
+   SCHEMA, ALTER INDEX ... RENAME, ALTER SCHEMA ... RENAME. Column
+   defaults (and so ADD COLUMN ... DEFAULT) are a feature of their own.
 
 ### 9.5 Indexes and joins (D4)
 
@@ -2167,3 +2172,61 @@ Planted, each caught:
 - the highest page given out.
 
 Not done: cutting the file's free tail; a file does not shrink.
+
+### 9.34 ALTER TABLE, without rewriting rows
+
+`ALTER TABLE [IF EXISTS] [ONLY] name` and then:
+- `ADD [COLUMN] [IF NOT EXISTS] name type [NOT NULL | NULL]`;
+- `RENAME [COLUMN] a TO b`;
+- `RENAME TO name`;
+- `ALTER [COLUMN] name SET NOT NULL` or `DROP NOT NULL`.
+
+The RENAME forms stand alone; the others can be several, separated by
+commas. They are applied in order to the table's catalog row
+(`alterTable`), and the statement does all or none, as any statement in its
+transaction. DDL was already transactional, so an ALTER in a block rolls
+back with it, and the catalog's version tells cached plans.
+
+**No row is rewritten.** Rows are positional, and a row written before a
+column was added has fewer values: the decoder reads the missing ones as
+NULL (`decRowNeed` already did, rows with long texts included). So ADD
+COLUMN costs one catalog write whatever the table's size. A column added
+NOT NULL needs an empty table (23502 otherwise, as PostgreSQL without a
+default), and SET NOT NULL scans for a NULL (23502). Both scans are reads
+of the transaction: a NULL committed meanwhile by another session makes
+the ALTER fail at commit (40001), as the test shows.
+
+**Names.** A table renamed stays in its schema; its indexes' catalog rows,
+which name their table, are rewritten. A renamed column is renamed in its
+table's filtered indexes' predicates, which name columns. Index columns
+are positions and need nothing. DROP NOT NULL on a key column is 42P16.
+
+**Prepared statements.** A statement's result columns are described once,
+and libpq describes again before each run, so the client sees new
+columns. A client that runs it without describing would read rows by the
+old description. Execute now refuses rows whose columns differ from those
+last described, with PostgreSQL's 0A000 "cached plan must not change
+result type". This covers a table dropped and made again with other
+columns too, which went unchecked.
+
+**Not supported yet**, each 0A000: constraints (ADD PRIMARY KEY, UNIQUE,
+CHECK, FOREIGN KEY: a unique index can be created), DEFAULT (no column
+defaults yet), ALTER INDEX. DROP COLUMN, ALTER COLUMN TYPE and SET SCHEMA
+are the next steps (9.4, item 13).
+
+**Checked** by `exec_alter` and `wire_describe`. Planted, each caught:
+- a column added twice;
+- NOT NULL added over rows;
+- index rows keeping the old table name;
+- the old name kept;
+- a table renamed to an index's name;
+- a table renamed out of its schema;
+- predicates keeping the old column name;
+- SET NOT NULL over NULLs;
+- any row taken as a NULL;
+- DROP NOT NULL on the key;
+- a column renamed to a name the table has;
+- rows unlike the description sent.
+
+The renames to a taken name were not caught at first; the test now tries
+both.

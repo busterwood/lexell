@@ -4005,6 +4005,116 @@ fn dropOne(txn: mut &lexdb_store.Txn, t: &Table) {
     txn.del(CATALOG, t.name)
 }
 
+// ---- ALTER TABLE (9.34)
+
+// x with column from named to.
+fn renameCol(x: &Expr, from: &str, to: &str): Expr {
+    match x {
+        Expr.Col(n) { return Expr.Col(if n == from { to } else { n }) }
+        Expr.Unary(op, a) { return Expr.Unary(op, renameCol(&a, from, to)) }
+        Expr.Bin(op, a, b) { return Expr.Bin(op, renameCol(&a, from, to), renameCol(&b, from, to)) }
+        Expr.IsNull(a, neg) { return Expr.IsNull(renameCol(&a, from, to), neg) }
+        Expr.Call(f, args, star) {
+            var xs: []Expr = []
+            for a in args { append(mut &xs, renameCol(&a, from, to)) }
+            return Expr.Call(f, xs, star)
+        }
+        Expr.Cast(a, ty) { return Expr.Cast(renameCol(&a, from, to), ty) }
+        else { return clone(x) }
+    }
+}
+
+// Whether the table has a row (col < 0), or a row whose column col is NULL.
+fn anyRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, col: int): Result[bool, DbErr] {
+    let path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: []}
+    let sc = Scan{empty: false, point: false, lo: "", hi: "", whole: false}
+    var need: []bool = []
+    if col >= 0 {
+        for i in 0..len(t.cols) { append(mut &need, i == col) }
+    }
+    var cur = newCursor()
+    while !cur.done {
+        var batch: [][]Val = []
+        try fetch(st, txn, t, &path, &sc, &need, mut &cur, mut &batch)
+        for r in batch {
+            if col < 0 { return Ok(true) }
+            match r[col] {
+                Val.Null { return Ok(true) }
+                else {}
+            }
+        }
+    }
+    return Ok(false)
+}
+
+// ALTER TABLE: its actions in order, on the table's catalog row. None
+// rewrites a row: a row written before a column was added has fewer
+// values, read as NULL (decRowNeed).
+fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
+    let found = try findTable(st, txn, &s.table)
+    if found.isNone() {
+        if s.ifFlag { return Ok(tagOnly("ALTER TABLE")) }
+        return Err(e("42P01", "relation \"" + lexdb_sql.shown(&s.table) + "\" does not exist"))
+    }
+    var t = found.unwrap()
+    for a in s.alters {
+        let rel = lexdb_sql.baseName(&t.name)
+        if a.kind == lexdb_sql.A_ADD {
+            if colIndex(&t.cols, &a.col.name) >= 0 {
+                if a.ifFlag { continue }
+                return Err(e("42701", "column \"" + a.col.name + "\" of relation \"" + rel + "\" already exists"))
+            }
+            let full = a.col.notNull && try anyRow(st, txn, &t, -1)
+            if full {
+                return Err(e("23502", "column \"" + a.col.name + "\" of relation \"" + rel + "\" contains null values"))
+            }
+            append(mut &t.cols, lexdb_sql.ColDef{name: a.col.name, typ: a.col.typ, notNull: a.col.notNull})
+        } else if a.kind == lexdb_sql.A_RENAME {
+            let key = lexdb_sql.qual(&lexdb_sql.schemaOf(&t.name), &a.name)
+            if key == t.name { continue }
+            if (try st.get(txn, CATALOG, key)).isSome() || (try st.get(txn, CATALOG, idxName(&key))).isSome() {
+                return Err(e("42P07", "relation \"" + a.name + "\" already exists"))
+            }
+            txn.del(CATALOG, t.name)
+            t.name = key
+            for ix in t.indexes { try txn.put(CATALOG, idxName(&ix.name), key) }
+        } else {
+            let i = colIndex(&t.cols, &a.name)
+            if i < 0 { return Err(e("42703", "column \"" + a.name + "\" does not exist")) }
+            if a.kind == lexdb_sql.A_RENAME_COL {
+                if a.to == a.name { continue }
+                if colIndex(&t.cols, &a.to) >= 0 {
+                    return Err(e("42701", "column \"" + a.to + "\" of relation \"" + rel + "\" already exists"))
+                }
+                t.cols[i].name = a.to
+                // a filtered index's predicate names its columns
+                for k in 0..len(t.indexes) {
+                    var renamed: Option[Expr] = None
+                    match t.indexes[k].pred {
+                        Some(x) { renamed = Some(renameCol(&x, &a.name, &a.to)) }
+                        None {}
+                    }
+                    if renamed.isSome() { t.indexes[k].pred = renamed }
+                }
+            } else if a.kind == lexdb_sql.A_SET_NOT_NULL {
+                let nulls = !t.cols[i].notNull && try anyRow(st, txn, &t, i)
+                if nulls {
+                    return Err(e("23502", "column \"" + a.name + "\" of relation \"" + rel + "\" contains null values"))
+                }
+                t.cols[i].notNull = true
+            } else if a.kind == lexdb_sql.A_DROP_NOT_NULL {
+                for k in t.pk {
+                    if k == i { return Err(e("42P16", "column \"" + a.name + "\" is in a primary key")) }
+                }
+                t.cols[i].notNull = false
+            }
+        }
+    }
+    try txn.put(CATALOG, t.name, encTable(&t))
+    try bumpCatalog(st, txn)
+    return Ok(tagOnly("ALTER TABLE"))
+}
+
 fn createSchemaStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
     if try schemaExists(st, txn, &s.table) {
         if s.ifFlag { return Ok(tagOnly("CREATE SCHEMA")) }
@@ -5919,7 +6029,8 @@ pub fn (s: mut &Session) close() {
 fn isWrite(kind: int): bool {
     return kind == lexdb_sql.S_CREATE || kind == lexdb_sql.S_DROP || kind == lexdb_sql.S_INSERT ||
            kind == lexdb_sql.S_UPDATE || kind == lexdb_sql.S_DELETE || kind == lexdb_sql.S_CREATE_INDEX ||
-           kind == lexdb_sql.S_DROP_INDEX || kind == lexdb_sql.S_CREATE_SCHEMA || kind == lexdb_sql.S_DROP_SCHEMA
+           kind == lexdb_sql.S_DROP_INDEX || kind == lexdb_sql.S_CREATE_SCHEMA || kind == lexdb_sql.S_DROP_SCHEMA ||
+           kind == lexdb_sql.S_ALTER
 }
 
 fn stmtName(kind: int): str {
@@ -5932,6 +6043,7 @@ fn stmtName(kind: int): str {
         lexdb_sql.S_DROP_INDEX { "DROP INDEX" }
         lexdb_sql.S_CREATE_SCHEMA { "CREATE SCHEMA" }
         lexdb_sql.S_DROP_SCHEMA { "DROP SCHEMA" }
+        lexdb_sql.S_ALTER { "ALTER TABLE" }
         else { "DELETE" }
     }
 }
@@ -5976,6 +6088,7 @@ fn execStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
         lexdb_sql.S_DROP_INDEX { return dropIndex(st, txn, s) }
         lexdb_sql.S_CREATE_SCHEMA { return createSchemaStmt(st, txn, s) }
         lexdb_sql.S_DROP_SCHEMA { return dropSchema(st, txn, s) }
+        lexdb_sql.S_ALTER { return alterTable(st, txn, s) }
         lexdb_sql.S_EXPLAIN { return explain(st, txn, s, params, lim, ptypes) }
         else { return Err(e("XX000", "not a data statement")) }
     }
