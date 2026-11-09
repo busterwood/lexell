@@ -314,12 +314,47 @@ fn (w: mut &Wire) parseMsg(ps: mut &Ps, body: &str): Result[Unit, lexdb_base.DbE
     return Ok(Unit{})
 }
 
+// A binary array parameter (one dimension, of the types binParam takes) as
+// its text form, as the executor holds arrays (9.27).
+fn binArray(data: &str, elem: int): Result[str, lexdb_base.DbErr] {
+    let bad = lexdb_base.err("22P03", "invalid binary array parameter")
+    if len(data) < 12 { return Err(bad) }
+    let ndim = binary.readI32BEStr(data, 0)
+    if ndim == 0 { return Ok("{}") }
+    if ndim != 1 { return Err(lexdb_base.err("0A000", "lexdb: arrays of more than one dimension are not supported")) }
+    if len(data) < 20 { return Err(bad) }
+    let n = binary.readI32BEStr(data, 12)
+    var at = 20
+    var vals: []lexdb_sql.Val = []
+    for i in 0..n {
+        if at + 4 > len(data) { return Err(bad) }
+        let l = binary.readI32BEStr(data, at)
+        at += 4
+        if l < 0 {
+            append(mut &vals, lexdb_sql.Val.Null)
+            continue
+        }
+        if at + l > len(data) { return Err(bad) }
+        let t = try binParam(&data[at..at + l], elem)
+        at += l
+        if elem == lexdb_sql.OID_TEXT || elem == lexdb_sql.OID_VARCHAR {
+            append(mut &vals, lexdb_sql.Val.Text(t))
+        } else if elem == lexdb_sql.OID_BOOL {
+            append(mut &vals, lexdb_sql.Val.Bool(t == "t"))
+        } else {
+            append(mut &vals, lexdb_sql.Val.Int(strings.parseIntOpt(t).unwrapOr(0)))
+        }
+    }
+    return Ok(lexdb_exec.arrayText(&vals))
+}
+
 fn binParam(data: &str, oid: int): Result[str, lexdb_base.DbErr] {
     if oid == lexdb_sql.OID_INT8 && len(data) == 8 { return Ok(binary.readI64BEStr(data, 0).toStr()) }
     if oid == lexdb_sql.OID_INT4 && len(data) == 4 { return Ok(binary.readI32BEStr(data, 0).toStr()) }
     if oid == lexdb_sql.OID_INT2 && len(data) == 2 { return Ok(binary.readI16BEStr(data, 0).toStr()) }
     if oid == lexdb_sql.OID_BOOL && len(data) == 1 { return Ok(if data[0] != 0 { "t" } else { "f" }) }
     if oid == lexdb_sql.OID_TEXT || oid == lexdb_sql.OID_VARCHAR { return Ok(data) }
+    if lexdb_sql.elemOid(oid) > 0 { return binArray(data, lexdb_sql.elemOid(oid)) }
     return Err(lexdb_base.err("0A000", "lexdb: a binary parameter of type " + oid.toStr() + " is not supported"))
 }
 

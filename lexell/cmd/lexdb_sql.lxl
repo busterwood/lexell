@@ -16,6 +16,7 @@ pub const K_INT = 1
 pub const K_BOOL = 2
 pub const K_NUM = 3
 pub const K_TEXT = 4
+pub const K_ARRAY = 5       // one dimension; its value is PostgreSQL's text form, {1,2,NULL} (9.27)
 
 // Postgres type OIDs.
 pub const OID_BOOL = 16
@@ -26,6 +27,22 @@ pub const OID_TEXT = 25
 pub const OID_VARCHAR = 1043
 pub const OID_NUMERIC = 1700
 pub const OID_UNKNOWN = 705
+
+// The array types: element OIDs and, at the same places, their arrays'.
+const ELEM_OIDS: []int = [16, 21, 23, 25, 1043, 20, 1700]
+const ARRAY_OIDS: []int = [1000, 1005, 1007, 1009, 1015, 1016, 1231]
+
+// The array type of an element type (0: none).
+pub fn arrayOid(elem: int): int {
+    for i in 0..len(ELEM_OIDS) { if ELEM_OIDS[i] == elem { return ARRAY_OIDS[i] } }
+    return 0
+}
+
+// The element type of an array type (0: not an array).
+pub fn elemOid(arr: int): int {
+    for i in 0..len(ARRAY_OIDS) { if ARRAY_OIDS[i] == arr { return ELEM_OIDS[i] } }
+    return 0
+}
 
 pub type TypeName = value record {
     pub kind: int
@@ -171,6 +188,8 @@ pub type Stmt = record {
     pub rec: bool               // a recursive CTE: inner[1] reads its working table
     pub cascade: bool           // DROP SCHEMA ... CASCADE
     src: str                    // a scalar subquery: its tokens (one written twice is one subquery)
+    pub srf: str                // in FROM, a function: generate_series or unnest; its arguments are items
+    pub ordin: bool             // ... WITH ORDINALITY
 }
 
 pub const SET_UNION = 1
@@ -187,7 +206,7 @@ fn newStmt(kind: int): Stmt {
     return Stmt{kind: kind, table: "", ifFlag: false, cols: [], pk: [], names: [], rows: [], items: [], where: None,
                 group: [], order: [], limit: None, offset: None, sets: [], params: 0, from: [], index: "",
                 unique: false, inner: [], distinct: false, having: None, subs: [], use: 0, setop: 0, setAll: false,
-                cte: -1, rec: false, cascade: false, src: ""}
+                cte: -1, rec: false, cascade: false, src: "", srf: "", ordin: false}
 }
 
 // ---- the lexer
@@ -425,6 +444,13 @@ fn (p: mut &P) typeName(): Result[TypeName, lexdb_base.DbErr] {
             return Err(near(&p.toks[p.pos - 1]))
         }
         try p.expectKw(")")
+    }
+    if p.acceptKw("[") {
+        // T[]: an array of T (its length, if given, is not kept: PostgreSQL
+        // does not check it either)
+        if p.peek().kind == T_NUM { let n = try p.intLit() }
+        try p.expectKw("]")
+        return Ok(TypeName{kind: K_ARRAY, oid: arrayOid(t.oid), prec: 0, scale: 0, len: 0})
     }
     return Ok(t)
 }
@@ -734,6 +760,17 @@ fn subRef(name: str, i: int): Expr { return Expr.Call(name, [Expr.Lit(Val.Int(i)
 fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
     let t = p.next()
     if t.kind == T_IDENT && t.text == "case" { return p.caseExpr() }
+    if t.kind == T_IDENT && t.text == "array" && p.isKw("[") {
+        // ARRAY[a, b, ...]: an array of the values
+        p.pos += 1
+        var xs: []Expr = []
+        if !p.isKw("]") {
+            append(mut &xs, try p.expr())
+            while p.acceptKw(",") { append(mut &xs, try p.expr()) }
+        }
+        try p.expectKw("]")
+        return Ok(Expr.Call("array", xs, false))
+    }
     if t.kind == T_IDENT && t.text == "exists" && p.isKw("(") {
         p.pos += 1
         return Ok(subRef("#exists", try p.subquery(SUB_EXISTS)))
@@ -1095,7 +1132,11 @@ fn (p: mut &P) orderLimit(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
 
 fn (p: mut &P) fromItem(join: int): Result[FromItem, lexdb_base.DbErr] {
     let lateral = p.acceptKw("lateral")
-    if lateral && !p.isKw("(") { return Err(lexdb_base.err("0A000", "LATERAL is supported before a subquery only")) }
+    if p.peek().kind == T_IDENT && (p.peek().text == "generate_series" || p.peek().text == "unnest") &&
+       p.pos + 1 < len(p.toks) && p.toks[p.pos + 1].kind == T_OP && p.toks[p.pos + 1].text == "(" {
+        return p.fromFunction(join)
+    }
+    if lateral && !p.isKw("(") { return Err(lexdb_base.err("0A000", "LATERAL is supported before a subquery or a function only")) }
     if p.acceptKw("(") {
         // a subquery in FROM
         if !p.isKw("select") && !p.isKw("with") { return Err(lexdb_base.err("0A000", "parenthesized joins are not supported")) }
@@ -1133,6 +1174,43 @@ fn (p: mut &P) fromItem(join: int): Result[FromItem, lexdb_base.DbErr] {
 }
 
 // [AS] alias [(column, ...)]
+// A function in FROM (9.27): generate_series(start, stop [, step]) or
+// unnest(array, ...), [WITH ORDINALITY], [AS alias [(columns)]]. It is a
+// subquery (SUB_FROM) whose items are the arguments and whose srf names the
+// function; it may use the FROM items before it (LATERAL, as in
+// PostgreSQL).
+fn (p: mut &P) fromFunction(join: int): Result[FromItem, lexdb_base.DbErr] {
+    let name = p.next().text
+    try p.expectKw("(")
+    p.depth += 1
+    let saved = replace(mut &p.subs, [])
+    var s = newStmt(S_SELECT)
+    s.srf = name
+    s.use = SUB_FROM
+    if !p.isKw(")") {
+        while true {
+            append(mut &s.items, SelItem{star: false, qual: "", expr: Some(try p.expr()), alias: ""})
+            if !p.acceptKw(",") { break }
+        }
+    }
+    try p.expectKw(")")
+    s.subs = replace(mut &p.subs, saved)
+    p.depth -= 1
+    if p.acceptKw("with") {
+        try p.expectKw("ordinality")
+        s.ordin = true
+    }
+    append(mut &p.subs, s)
+    let i = len(p.subs) - 1
+    var alias = name
+    var cols: []str = []
+    try p.aliasOf(mut &alias, mut &cols)
+    // one column, an alias and no column names: the column is the alias
+    let single = name == "generate_series" || len(p.subs[i].items) == 1
+    if single && alias != name && len(cols) == 0 { append(mut &cols, alias) }
+    return Ok(FromItem{table: name, alias: alias, join: join, on: None, sub: i, cols: cols, work: -1, lateral: true})
+}
+
 fn (p: mut &P) aliasOf(alias: mut &str, cols: mut &[]str): Result[Unit, lexdb_base.DbErr] {
     var got = false
     if p.acceptKw("as") {
@@ -1412,7 +1490,12 @@ pub fn parse(sql: &str): Result[[]Stmt, lexdb_base.DbErr] {
 // ---- expressions as text: a filtered index's predicate is kept in the
 // catalog so, and parsed again when the table is read.
 
-fn typeText(t: &TypeName): str {
+pub fn typeText(t: &TypeName): str {
+    if t.kind == K_ARRAY {
+        let e = elemOid(t.oid)
+        let k = if e == OID_BOOL { K_BOOL } else if e == OID_NUMERIC { K_NUM } else if e == OID_INT2 || e == OID_INT4 || e == OID_INT8 { K_INT } else { K_TEXT }
+        return typeText(&TypeName{kind: k, oid: e, prec: 0, scale: 0, len: 0}) + "[]"
+    }
     if t.oid == OID_INT2 { return "smallint" }
     if t.oid == OID_INT4 { return "integer" }
     if t.oid == OID_INT8 { return "bigint" }

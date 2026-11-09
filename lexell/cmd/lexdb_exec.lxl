@@ -172,6 +172,21 @@ pub fn coerce(v: Val, t: &lexdb_sql.TypeName): Result[Val, DbErr] {
             }
         }
         return Ok(Val.Num(d))
+    } else if t.kind == lexdb_sql.K_ARRAY {
+        match v {
+            Val.Text(x) {
+                let et = oidType(lexdb_sql.elemOid(t.oid))
+                var vals: []Val = []
+                for part in try arrayParts(&x) {
+                    match part {
+                        Some(p) { append(mut &vals, try coerce(Val.Text(p), &et)) }
+                        None { append(mut &vals, Val.Null) }
+                    }
+                }
+                return Ok(Val.Text(arrayText(&vals)))
+            }
+            else { return Err(e("42804", "cannot cast a " + kindName(&oidType(kindOid(&v))) + " to " + lexdb_sql.typeText(t))) }
+        }
     } else {
         var s = ""
         match v {
@@ -187,6 +202,215 @@ pub fn coerce(v: Val, t: &lexdb_sql.TypeName): Result[Val, DbErr] {
         return Ok(Val.Text(s))
     }
     return Err(e("42804", "column is of type " + kindName(t) + " but the expression is of another type"))
+}
+
+// ---- arrays (9.27): one dimension, held as PostgreSQL's text form
+
+// The elements of an array's text form, {a,"b c",NULL}: None for NULL.
+fn arrayParts(s: &str): Result[[]Option[str], DbErr] {
+    let bad = e("22P02", "malformed array literal: \"" + s + "\"")
+    var out: []Option[str] = []
+    var i = 0
+    let n = len(s)
+    while i < n && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n') { i += 1 }
+    if i >= n || s[i] != '{' { return Err(bad) }
+    i += 1
+    while i < n && s[i] == ' ' { i += 1 }
+    if i < n && s[i] == '}' { return Ok(out) }
+    while true {
+        while i < n && s[i] == ' ' { i += 1 }
+        if i >= n { return Err(bad) }
+        if s[i] == '{' { return Err(e("0A000", "lexdb: arrays of more than one dimension are not supported")) }
+        if s[i] == '"' {
+            var b = newStrBuf()
+            i += 1
+            while i < n && s[i] != '"' {
+                if s[i] == '\\' { i += 1 }
+                if i >= n { return Err(bad) }
+                b.addByte(s[i])
+                i += 1
+            }
+            if i >= n { return Err(bad) }
+            i += 1
+            append(mut &out, Some(b.toStr()))
+        } else {
+            var b = newStrBuf()
+            while i < n && s[i] != ',' && s[i] != '}' {
+                if s[i] == '\\' { i += 1 }
+                if i >= n { return Err(bad) }
+                b.addByte(s[i])
+                i += 1
+            }
+            let w = strings.trim(b.toStr())
+            if len(w) == 0 { return Err(bad) }
+            if strings.toLowerAscii(w) == "null" { append(mut &out, None) } else { append(mut &out, Some(w)) }
+        }
+        while i < n && s[i] == ' ' { i += 1 }
+        if i >= n { return Err(bad) }
+        if s[i] == '}' {
+            i += 1
+            break
+        }
+        if s[i] != ',' { return Err(bad) }
+        i += 1
+    }
+    while i < n && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n') { i += 1 }
+    if i != n { return Err(bad) }
+    return Ok(out)
+}
+
+// An array's text form: elements quoted when they must be.
+pub fn arrayText(vals: &[]Val): str {
+    var b = newStrBuf()
+    b.addByte('{')
+    for i in 0..len(vals) {
+        if i > 0 { b.addByte(',') }
+        match vals[i] {
+            Val.Null { b.add("NULL") }
+            Val.Bool(x) { b.add(if x { "t" } else { "f" }) }
+            Val.Text(x) {
+                var plain = len(x) > 0 && strings.toLowerAscii(x) != "null"
+                for k in 0..len(x) {
+                    let c = x[k]
+                    if c == ',' || c == '{' || c == '}' || c == '"' || c == '\\' || c == ' ' || c == '\t' || c == '\n' { plain = false }
+                }
+                if plain { b.add(x) } else {
+                    b.addByte('"')
+                    for k in 0..len(x) {
+                        if x[k] == '"' || x[k] == '\\' { b.addByte('\\') }
+                        b.addByte(x[k])
+                    }
+                    b.addByte('"')
+                }
+            }
+            else { b.add(text(&vals[i])) }
+        }
+    }
+    b.addByte('}')
+    return b.toStr()
+}
+
+// A value's type OID by its kind (for messages).
+fn kindOid(v: &Val): int {
+    match v {
+        Val.Int(_) { return lexdb_sql.OID_INT8 }
+        Val.Bool(_) { return lexdb_sql.OID_BOOL }
+        Val.Num(_) { return lexdb_sql.OID_NUMERIC }
+        else { return lexdb_sql.OID_TEXT }
+    }
+}
+
+// A function in FROM: its columns, from its arguments' types.
+fn srfCols(name: &str, ordin: bool, args: &[]OutCol): Result[[]OutCol, DbErr] {
+    var out: []OutCol = []
+    if name == "generate_series" {
+        if len(args) < 2 || len(args) > 3 {
+            return Err(e("42883", "function generate_series with " + len(args).toStr() + " arguments does not exist"))
+        }
+        var oid = lexdb_sql.OID_INT4
+        for a in args {
+            if a.oid == lexdb_sql.OID_NUMERIC { oid = lexdb_sql.OID_NUMERIC }
+            else if oid != lexdb_sql.OID_NUMERIC && a.oid != lexdb_sql.OID_INT4 && a.oid != lexdb_sql.OID_INT2 { oid = lexdb_sql.OID_INT8 }
+        }
+        for a in args {
+            let k = oidType(a.oid).kind
+            if k != lexdb_sql.K_INT && k != lexdb_sql.K_NUM && a.oid != lexdb_sql.OID_TEXT {
+                return Err(e("42883", "function generate_series needs numbers"))
+            }
+        }
+        append(mut &out, OutCol{name: "generate_series", oid: oid})
+    } else {
+        if len(args) == 0 { return Err(e("42883", "function unnest() does not exist")) }
+        for k in 0..len(args) {
+            let el = lexdb_sql.elemOid(args[k].oid)
+            if el == 0 {
+                return Err(e("42804", "function unnest: argument " + (k + 1).toStr() + " is not an array (cast it: $1::int[], '{1,2}'::text[])"))
+            }
+            append(mut &out, OutCol{name: "unnest", oid: el})
+        }
+    }
+    if ordin { append(mut &out, OutCol{name: "ordinality", oid: lexdb_sql.OID_INT8}) }
+    return Ok(out)
+}
+
+// A function in FROM, run: its arguments, then its rows.
+fn execSrf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params: &[]Val, cap: int,
+           rs: mut &Run): Result[Res, DbErr] {
+    let m = try prepare(st, txn, &sel.q, params, rs)
+    let noRow: []Val = []
+    let env = Env{cols: &sel.q.cols, row: &noRow, aggs: &noRow, params: params, subs: &m.subs, cur: &noRow}
+    var args: []Val = []
+    for x in sel.exprs { append(mut &args, try evalX(st, txn, &sel.q, &x, &env, rs)) }
+    var rows: [][]Val = []
+    let room = rs.room()
+    var bytes = 0
+    if sel.srf == "generate_series" {
+        for a in args { if isNull(&a) { return Ok(Res{cols: [], rows: [], tag: "", hasRows: true}) } }
+        let ty = oidType(sel.outs[0].oid)
+        let start = try coerce(args[0], &ty)
+        let stop = try coerce(args[1], &ty)
+        let step = if len(args) > 2 { try coerce(args[2], &ty) } else { try coerce(Val.Int(1), &ty) }
+        let zero = try coerce(Val.Int(0), &ty)
+        let dir = try compare(&step, &zero)
+        if dir == 0 { return Err(e("22023", "step size cannot equal zero")) }
+        var v = start
+        var n = 0
+        while true {
+            let c = try compare(&v, &stop)
+            if (dir > 0 && c > 0) || (dir < 0 && c < 0) { break }
+            if cap >= 0 && len(rows) >= cap { break }
+            n += 1
+            var row: []Val = [v]
+            if sel.ordin { append(mut &row, Val.Int(n)) }
+            bytes += rowBytes(&row)
+            if room >= 0 && bytes > room { return Err(memErr(rs.maxHeld)) }
+            append(mut &rows, row)
+            try rs.tick()
+            // the next value; past the type's range: the end
+            match arith(&"+", &v, &step) {
+                Ok(x) { v = x }
+                Err(_) { break }
+            }
+            if ty.kind == lexdb_sql.K_INT {
+                match coerce(v, &ty) {
+                    Ok(x) { v = x }
+                    Err(_) { break }
+                }
+            }
+        }
+    } else {
+        // unnest: the arrays side by side, the shorter padded with NULLs
+        var cols: [][]Val = []
+        var most = 0
+        for k in 0..len(args) {
+            var vals: []Val = []
+            match args[k] {
+                Val.Text(x) {
+                    let et = oidType(sel.outs[k].oid)
+                    for part in try arrayParts(&x) {
+                        match part {
+                            Some(p) { append(mut &vals, try coerce(Val.Text(p), &et)) }
+                            None { append(mut &vals, Val.Null) }
+                        }
+                    }
+                }
+                else {}
+            }
+            if len(vals) > most { most = len(vals) }
+            append(mut &cols, vals)
+        }
+        for i in 0..most {
+            if cap >= 0 && len(rows) >= cap { break }
+            var row: []Val = []
+            for k in 0..len(cols) { append(mut &row, if i < len(cols[k]) { cols[k][i] } else { Val.Null }) }
+            if sel.ordin { append(mut &row, Val.Int(i + 1)) }
+            bytes += rowBytes(&row)
+            if room >= 0 && bytes > room { return Err(memErr(rs.maxHeld)) }
+            append(mut &rows, row)
+            try rs.tick()
+        }
+    }
+    return Ok(Res{cols: [], rows: rows, tag: "", hasRows: true})
 }
 
 fn kindOf(v: &Val): int {
@@ -629,6 +853,7 @@ fn substr(s: str, from: int, count: int, hasCount: bool): Result[str, DbErr] {
 }
 
 fn call(name: &str, vs: &[]Val): Result[Val, DbErr] {
+    if name == "array" { return Ok(Val.Text(arrayText(vs))) }
     let n = len(vs)
     if name == "in" {
         // x IN (a, b): true if one equals x; else NULL if x or one of them is NULL
@@ -1327,18 +1552,29 @@ fn dotAt(s: &str): int {
     return -1
 }
 
-// The column part of alias.column.
+// The column part of alias.column (a repeated name's mark taken off).
 fn colPart(q: &str): str {
     let i = dotAt(q)
-    return if i < 0 { q } else { q[i + 1..len(q)] }
+    let c = if i < 0 { q } else { q[i + 1..len(q)] }
+    let d = strings.indexOf(c, DUPSEP, 0)
+    return if d < 0 { c } else { c[0..d] }
 }
+
+// Marks a column name repeated in one FROM item: name DUPSEP position.
+const DUPSEP: str = "\x1e"
 
 // The column a name refers to among the first n columns: alias.column, or a
 // column name only one table has.
 fn resolveName(cols: &[]lexdb_sql.ColDef, n: int, name: &str): Result[str, DbErr] {
     let d = dotAt(name)
     if d >= 0 {
-        for i in 0..n { if cols[i].name == name { return Ok(name) } }
+        for i in 0..n {
+            if cols[i].name == name {
+                let again = name + DUPSEP
+                for j in 0..n { if strings.startsWith(cols[j].name, again) { return Err(e("42702", "column reference \"" + name + "\" is ambiguous")) } }
+                return Ok(name)
+            }
+        }
         let alias = name[0..d]
         var known = false
         for i in 0..n {
@@ -2080,8 +2316,12 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
             t = try needTable(st, txn, &f.table)
         }
         let first = len(q.cols)
-        for c in t.cols {
-            append(mut &q.cols, lexdb_sql.ColDef{name: f.alias + "." + c.name, typ: c.typ, notNull: c.notNull})
+        for k in 0..len(t.cols) {
+            // a name repeated in one FROM item ((SELECT 1 AS a, 2 AS a) x,
+            // unnest(a, b)): each its own column, the name ambiguous
+            var name = t.cols[k].name
+            for j in 0..k { if t.cols[j].name == name { name = name + DUPSEP + k.toStr() } }
+            append(mut &q.cols, lexdb_sql.ColDef{name: f.alias + "." + name, typ: t.cols[k].typ, notNull: t.cols[k].notNull})
         }
         var lv = newLevel(t, f.alias, f.join, first)
         lv.src = f.sub
@@ -2567,6 +2807,7 @@ fn endScope(sc: mut &Scope, q: mut &Query) {
 fn planSub(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val,
            sc: mut &Scope): Result[SubPlan, DbErr] {
     var sel = try planSelect(st, txn, s, params, sc)
+    if len(s.srf) > 0 { sel.outs = try srfCols(&s.srf, s.ordin, &sel.outs) }
     if s.use == lexdb_sql.SUB_IN && len(sel.outs) != 1 { return Err(e("42601", "subquery has too many columns")) }
     if s.use == lexdb_sql.SUB_SCALAR && len(sel.outs) != 1 { return Err(e("42601", "subquery must return only one column")) }
     let oid = if s.use == lexdb_sql.SUB_EXISTS || len(sel.outs) == 0 { lexdb_sql.OID_BOOL } else { sel.outs[0].oid }
@@ -3047,6 +3288,7 @@ fn runChild(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params
 
 // A column type for a result's OID.
 fn oidType(oid: int): lexdb_sql.TypeName {
+    if lexdb_sql.elemOid(oid) > 0 { return lexdb_sql.TypeName{kind: lexdb_sql.K_ARRAY, oid: oid, prec: 0, scale: 0, len: 0} }
     var kind = lexdb_sql.K_TEXT
     var o = oid
     if oid == lexdb_sql.OID_BOOL { kind = lexdb_sql.K_BOOL }
@@ -3894,6 +4136,15 @@ pub fn exprOid(x: &Expr, cols: &[]lexdb_sql.ColDef, ptypes: &[]int): int {
                 "case" { return if len(args) > 1 { exprOid(&args[1], cols, ptypes) } else { lexdb_sql.OID_TEXT } }
                 "nullif", "greatest", "least" { return if len(args) > 0 { exprOid(&args[0], cols, ptypes) } else { lexdb_sql.OID_TEXT } }
                 "strpos" { return lexdb_sql.OID_INT4 }
+                "array" {
+                    var el = lexdb_sql.OID_TEXT
+                    for a in args {
+                        let o = exprOid(&a, cols, ptypes)
+                        if o != lexdb_sql.OID_TEXT { el = o }
+                    }
+                    let ao = lexdb_sql.arrayOid(el)
+                    return if ao > 0 { ao } else { lexdb_sql.arrayOid(lexdb_sql.OID_TEXT) }
+                }
                 "stddev", "stddev_samp", "stddev_pop", "variance", "var_samp", "var_pop" { return lexdb_sql.OID_NUMERIC }
                 "avg" { return lexdb_sql.OID_NUMERIC }
                 "sum" {
@@ -4414,6 +4665,8 @@ type Sel = record {
     setAll: bool
     split: int              // refs: the first query's, then the second's
     rec: int                // a recursive CTE: its number; -1
+    srf: str                // a function in FROM: its name; exprs are its arguments, outs its columns (9.27)
+    ordin: bool             // ... WITH ORDINALITY
 }
 
 // The column of level 0 an expression is, else -1.
@@ -4654,7 +4907,7 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
     for o in s.order { append(mut &desc, o.desc) }
     return Ok(Sel{q: q, exprs: exprs, outs: outs, groupBy: groupBy, order: order, aggQ: aggQ, sort: sort,
                   first: first, limit: limit, offset: offset, having: having, specs: specs, distinct: s.distinct, desc: desc,
-                  parts: [], setop: 0, setAll: false, split: 0, rec: -1})
+                  parts: [], setop: 0, setAll: false, split: 0, rec: -1, srf: s.srf, ordin: s.ordin})
 }
 
 // UNION, INTERSECT, EXCEPT: its two queries, planned on their own; the
@@ -4697,7 +4950,7 @@ fn planSet(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
     let q = Query{levels: [], cols: [], top: [], subs: [], base: sc.base, corr: false, refs: refs}
     return Ok(Sel{q: q, exprs: [], outs: outs, groupBy: [], order: order, aggQ: false, sort: len(order) > 0, first: -1,
                   limit: limit, offset: offset, having: None, specs: [], distinct: false, desc: desc, parts: [l, r],
-                  setop: s.setop, setAll: s.setAll, split: split, rec: if s.rec { s.cte } else { -1 }})
+                  setop: s.setop, setAll: s.setAll, split: split, rec: if s.rec { s.cte } else { -1 }, srf: "", ordin: false})
 }
 
 // A row's key for UNION and the like (NULLs alike; 2 = 2.0).
@@ -4815,7 +5068,8 @@ fn runRecursive(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, lp
 fn selLines(sel: &Sel, cnt: &[]Counts, stats: &[]SubStat): []str {
     if sel.setop != 0 { return setLines(sel, stats) }
     var lines = explainLines(&sel.q, cnt)
-    if len(sel.q.levels) == 0 { append(mut &lines, "result") }
+    if len(sel.srf) > 0 { append(mut &lines, "function " + sel.srf + (if sel.ordin { " with ordinality" } else { "" })) }
+    else if len(sel.q.levels) == 0 { append(mut &lines, "result") }
     if sel.first >= 0 { append(mut &lines, "min/max: the first value in the scan's order") }
     if len(sel.groupBy) > 0 || (sel.aggQ && sel.first < 0) { append(mut &lines, "aggregate") }
     if sel.having.isSome() { append(mut &lines, "having") }
@@ -4875,6 +5129,7 @@ fn orderX(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, o: &Expr
 // subquery: EXISTS 1, in any order; a scalar 2).
 fn execSel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params: &[]Val, cap: int,
            rs: mut &Run): Result[Res, DbErr] {
+    if len(sel.srf) > 0 { return execSrf(st, txn, sel, params, cap, rs) }
     let m = try prepare(st, txn, &sel.q, params, rs)
     let q = &sel.q
     let limit = if cap >= 0 && (sel.limit < 0 || cap < sel.limit) { cap } else { sel.limit }
@@ -5048,6 +5303,7 @@ fn execSel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
 fn paramTypes(st: &lexdb_store.Store, s: &lexdb_sql.Stmt, given: &[]int, path: &[]str): []int {
     var out: []int = []
     for i in 0..s.params { append(mut &out, if i < len(given) { given[i] } else { 0 }) }
+    stmtCasts(s, mut &out)              // $1::int[]: the cast's type
     if s.kind == lexdb_sql.S_EXPLAIN && len(s.inner) > 0 {
         guessParams(st, &s.inner[0], mut &out, path)
     } else {
@@ -5055,6 +5311,46 @@ fn paramTypes(st: &lexdb_store.Store, s: &lexdb_sql.Stmt, given: &[]int, path: &
     }
     for i in 0..len(out) { if out[i] == 0 { out[i] = lexdb_sql.OID_TEXT } }
     return out
+}
+
+// A parameter cast where it is used ($1::int[]) is of the cast's type.
+fn castParams(x: &Expr, out: mut &[]int) {
+    match x {
+        Expr.Cast(a, t) {
+            setParam(&a, t.oid, out)
+            castParams(&a, out)
+        }
+        Expr.Unary(_, a) { castParams(&a, out) }
+        Expr.Bin(_, a, b) {
+            castParams(&a, out)
+            castParams(&b, out)
+        }
+        Expr.IsNull(a, _) { castParams(&a, out) }
+        Expr.Call(_, args, _) { for a in args { castParams(&a, out) } }
+        else {}
+    }
+}
+
+fn optCasts(x: &Option[Expr], out: mut &[]int) {
+    match x {
+        Some(v) { castParams(&v, out) }
+        None {}
+    }
+}
+
+fn stmtCasts(s: &lexdb_sql.Stmt, out: mut &[]int) {
+    for it in s.items { optCasts(&it.expr, out) }
+    for r in s.rows { for x in r { castParams(&x, out) } }
+    for si in s.sets { castParams(&si.expr, out) }
+    for g in s.group { castParams(&g, out) }
+    for o in s.order { castParams(&o.expr, out) }
+    optCasts(&s.where, out)
+    optCasts(&s.having, out)
+    optCasts(&s.limit, out)
+    optCasts(&s.offset, out)
+    for f in s.from { optCasts(&f.on, out) }
+    for b in s.subs { stmtCasts(&b, out) }
+    for b in s.inner { stmtCasts(&b, out) }
 }
 
 fn setParam(x: &Expr, oid: int, out: mut &[]int) {
@@ -5387,6 +5683,8 @@ pub fn paramVals(texts: &[]Option[str], ptypes: &[]int): Result[[]Val, DbErr] {
                     ty = lexdb_sql.TypeName{kind: lexdb_sql.K_BOOL, oid: oid, prec: 0, scale: 0, len: 0}
                 } else if oid == lexdb_sql.OID_NUMERIC {
                     ty = lexdb_sql.TypeName{kind: lexdb_sql.K_NUM, oid: oid, prec: 0, scale: 0, len: 0}
+                } else if lexdb_sql.elemOid(oid) > 0 {
+                    ty = oidType(oid)
                 }
                 append(mut &out, try coerce(Val.Text(s), &ty))
             }

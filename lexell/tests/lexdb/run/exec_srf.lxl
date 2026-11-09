@@ -1,0 +1,113 @@
+// lexdb_exec: functions in FROM, generate_series and unnest, and arrays
+// (design/lexdb.md 9.27).
+// expect: series: 1 2 3 4 5 | 10 7 4 1 | 0.5 1.0 1.5 2.0 | 5000000000 5000000001
+// expect: empty, null: 0 0
+// expect: errors: 22023 42883 42883
+// expect: alias names the column: 1 2, ordinality: a|1 b|2
+// expect: lateral: 1|1 1|2 2|1 2|2 2|3
+// expect: lookup per value: join t: primary key lookup per row, rows: 2|b 3|c
+// expect: unnest: 1|a 2|b c 3| |d
+// expect: unnest one, ordinality: x|1 y|2
+// expect: repeated names: 1|a 2|b, 1|2, ambiguous 42702 42702
+// expect: unnest empty, null: 0 0
+// expect: casts: {1,2,3} {"a b",NULL,"\"q\"",""} {t,f}
+// expect: cast errors: 22P02 22P02 0A000
+// expect: array[]: {1,2,NULL} {x,"y z"}
+// expect: types: int4[] text int8 int4
+// expect: param types: 1007 1009
+// expect: insert from arrays: INSERT 0 3, rows 10|ten 11|eleven 12|
+// expect: memory: 53200
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_sql"
+
+type Val = lexdb_sql.Val
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if !r.hasRows { return r.tag }
+            var out: []str = []
+            for row in r.rows {
+                var vs: []str = []
+                for v in row { append(mut &vs, lexdb_exec.text(&v)) }
+                append(mut &out, strings.join(&vs, "|"))
+            }
+            return strings.join(&out, " ")
+        }
+        Err(e) { return e.state }
+    }
+}
+
+fn line(s: mut &lexdb_exec.Session, sql: &str, prefix: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            for row in rs[0].rows {
+                let l = strings.trim(lexdb_exec.text(&row[0]))
+                if strings.startsWith(l, prefix) { return l }
+            }
+            return "none"
+        }
+        Err(e) { return e.state }
+    }
+}
+
+fn oidName(o: int): str {
+    if o == 1007 { return "int4[]" }
+    if o == 1009 { return "text[]" }
+    if o == 20 { return "int8" }
+    if o == 25 { return "text" }
+    if o == 23 { return "int4" }
+    return o.toStr()
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(53), lexdb_store.Options{cacheBytes: 16 * 1024 * 1024, segBytes: 1024 * 1024, ckptBytes: 1024 * 1024, snapNodes: 100000}, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        println("series: " + q(mut &s, &"select * from generate_series(1, 5)") + " | " + q(mut &s, &"select * from generate_series(10, 1, -3)") +
+                " | " + q(mut &s, &"select * from generate_series(0.5, 2, 0.5)") + " | " + q(mut &s, &"select * from generate_series(5000000000, 5000000001)"))
+        println("empty, null: " + q(mut &s, &"select count(*) from generate_series(5, 1)") + " " + q(mut &s, &"select count(*) from generate_series(1, null)"))
+        println("errors: " + q(mut &s, &"select * from generate_series(1, 3, 0)") + " " + q(mut &s, &"select * from generate_series(1)") +
+                " " + q(mut &s, &"select * from generate_series(true, false)"))
+        println("alias names the column: " + q(mut &s, &"select g from generate_series(1, 2) g") +
+                ", ordinality: " + q(mut &s, &"select * from unnest(array['a', 'b']) with ordinality as t(v, n)"))
+        let a = q(mut &s, &"create table t (id int primary key, v text)")
+        let b = q(mut &s, &"insert into t values (1, 'a'), (2, 'b'), (3, 'c')")
+        let c = q(mut &s, &"create table p (id int primary key, n int)")
+        let d = q(mut &s, &"insert into p values (1, 2), (2, 3)")
+        println("lateral: " + q(mut &s, &"select p.id, g from p, generate_series(1, p.n) g order by 1, 2"))
+        println("lookup per value: " + line(mut &s, &"explain select t.id, t.v from generate_series(2, 3) g join t on t.id = g", &"join t") +
+                ", rows: " + q(mut &s, &"select t.id, t.v from generate_series(2, 3) g join t on t.id = g order by 1"))
+        println("unnest: " + q(mut &s, &"select * from unnest('{1,2,3}'::int[], array['a', 'b c', null, 'd']) as u(id, name)"))
+        println("unnest one, ordinality: " + q(mut &s, &"select * from unnest('{x,y}'::text[]) with ordinality"))
+        println("repeated names: " + q(mut &s, &"select * from unnest('{1,2}'::int[], '{a,b}'::text[])") + ", " +
+                q(mut &s, &"select * from (select 1 as a, 2 as a) x") + ", ambiguous " + q(mut &s, &"select a from (select 1 as a, 2 as a) x") +
+                " " + q(mut &s, &"select x.a from (select 1 as a, 2 as a) x"))
+        println("unnest empty, null: " + q(mut &s, &"select count(*) from unnest('{}'::int[])") + " " + q(mut &s, &"select count(*) from unnest(null::int[])"))
+        println("casts: " + q(mut &s, &"select ' { 1 , 2,3 } '::int[]") + " " + q(mut &s, &"select '{\"a b\", null, \"\\\"q\\\"\", \"\"}'::text[]") +
+                " " + q(mut &s, &"select '{true, f}'::boolean[]"))
+        println("cast errors: " + q(mut &s, &"select '{1,x}'::int[]") + " " + q(mut &s, &"select '1,2'::int[]") + " " + q(mut &s, &"select '{{1},{2}}'::int[]"))
+        println("array[]: " + q(mut &s, &"select array[1, 2, null]") + " " + q(mut &s, &"select array['x', 'y z']"))
+
+        // the column types a client is told, and the parameters' types
+        let ds = lexdb_sql.parse(&"select array[1], g, x from unnest('{a}'::text[]), generate_series(1, 5000000000) g, generate_series(1, 2) x").unwrap()
+        let dc = s.describe(&lexdb_sql.parse(&"select array[1], u from unnest('{a}'::text[]) u").unwrap()[0], &[]).unwrap()
+        let dg = s.describe(&lexdb_sql.parse(&"select g, x from generate_series(1, 5000000000) g, generate_series(1, 2) x").unwrap()[0], &[]).unwrap()
+        println("types: " + oidName(dc[0].oid) + " " + oidName(dc[1].oid) + " " + oidName(dg[0].oid) + " " + oidName(dg[1].oid))
+        let ins = lexdb_sql.parse(&"insert into t select * from unnest($1::int[], $2::text[])").unwrap()
+        let pt = s.paramTypes(&ins[0], &[])
+        println("param types: " + pt[0].toStr() + " " + pt[1].toStr())
+        let vals = lexdb_exec.paramVals(&[Some("{10,11,12}"), Some("{ten,eleven}")], &pt).unwrap()
+        var pc = lexdb_exec.oneShot()
+        let r = s.runCached(&ins[0], &vals, &pt, mut &pc)
+        let tag = match r { Ok(x) { x.tag } Err(x) { x.state } }
+        println("insert from arrays: " + tag + ", rows " + q(mut &s, &"select * from t where id >= 10 order by id"))
+        let m = q(mut &s, &"set max_statement_mem = '256kB'")
+        println("memory: " + q(mut &s, &"select count(*) from generate_series(1, 1000000)"))
+        return 0
+    }).unwrap()
+}

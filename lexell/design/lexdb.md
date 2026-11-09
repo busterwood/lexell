@@ -393,7 +393,7 @@ Built on 2026-11-09 on branch `lexdb`, about 6,300 lines in
 (cache, trees, transactions, log, checkpoints, recovery, snapshots),
 `lexdb_sql` (lexer, parser), `lexdb_exec` (catalog, rows, keys, planner,
 statements, sessions), `lexdb_wire` (protocol 3.0) and `lexdb` (the
-server). Tests: `python3 lexell/tests/lexdb.py` (36 programs in
+server). Tests: `python3 lexell/tests/lexdb.py` (37 programs in
 `tests/lexdb/run`, under `LXL_CHECK=1`).
 
     lexell/compiler/out/lxlc lexell/cmd/lexdb.lxl -o lexdb
@@ -534,6 +534,17 @@ is the comparison to make.
    Waiting for row counts (costs, which the user has left for now: section
    0): choosing hash or index per row (9.9), and when an IN subquery's
    values are too many for lookups (now a fixed 1,000: 9.21).
+   Functions in FROM and arrays (built: 9.27). Not done:
+   - `= ANY(array)` and `<> ALL(array)`, the usual way to pass a list of
+     keys as one parameter (`WHERE id = ANY($1)`);
+   - subscripts (`a[1]`), `array_length`, `cardinality`, `array_agg`,
+     `@>`, and array comparisons other than equality (now: by text);
+   - functions in the select list (`SELECT generate_series(1, 3)`);
+   - a function's rows are all made before they are read: a LIMIT does
+     not stop generate_series early (max_statement_mem bounds it);
+   - arrays of more than one dimension; binary numeric array parameters;
+   - other set-returning functions (`regexp_split_to_table`, the JSON
+     ones), and generate_series over dates (no date types yet).
 4. Schemas (built: 9.20). Not done:
    - `ALTER TABLE ... SET SCHEMA` and `ALTER SCHEMA ... RENAME`;
    - privileges (`GRANT`, `AUTHORIZATION`), which wait for logins (item 9);
@@ -1701,4 +1712,72 @@ Caught, each put back:
 
 Not caught, as expected: dropping the NULL-key check, since NULL keys are
 never stored and the lookup misses anyway.
+
+### 9.27 generate_series, unnest and arrays
+
+The user uses `generate_series`, and `unnest(a, b, ...)` to pass arrays of
+data as parameters and turn them into rows (`INSERT INTO t SELECT * FROM
+unnest($1::int[], $2::text[])`).
+
+- **Functions in FROM** are subqueries. `generate_series(start, stop [,
+  step])` or `unnest(array, ...)`, with `[WITH ORDINALITY] [AS alias
+  [(columns)]]`, parses as a FROM subquery whose select items are the
+  arguments and whose `srf` names the function. Planning is a subquery's:
+  - an argument using an earlier FROM item makes it LATERAL (implicitly,
+    as in PostgreSQL), run per row and memoized;
+  - its columns come from its arguments' types (`srfCols`);
+  - a single-column function with an alias and no column names takes
+    the alias as its column (`generate_series(1, 3) g`).
+
+  At run time `execSrf` evaluates the one row of arguments and makes the
+  rows.
+- **generate_series** over int4, int8 or numeric, by the arguments'
+  widest type. A step of 0 is an error. A NULL argument gives no rows.
+  Past the type's range it stops.
+- **unnest** sets the arrays side by side, the shorter padded with NULLs.
+  A NULL array gives no rows.
+- **Arrays** are one-dimensional. Their value is PostgreSQL's text form
+  (`{1,"a b",NULL}`), so `Val` is unchanged and results go out with the
+  array's OID as PostgreSQL sends them.
+  - A cast (`'{1,2}'::int[]`, `$1::text[]`) checks each element against
+    the element type and writes the canonical form. `ARRAY[a, b]` builds
+    one.
+  - A parameter cast where it is used (`$1::int[]`) is described to the
+    client as the array type. Binary array parameters (int2, int4, int8,
+    bool, text, varchar elements) become the text form at Bind.
+- **Fixed on the way:** a column name repeated in one FROM item (`(SELECT
+  1 AS a, 2 AS a) x`, and unnest's columns, all named `unnest`) resolved
+  to the first column, so `SELECT *` showed it twice. Now each is its own
+  column (marked internally, `DUPSEP`, the mark off in output names), and
+  a reference to the name is ambiguous (42702), as in PostgreSQL.
+
+`exec_srf` covers:
+
+- generate_series up, down, numeric, int8, empty, NULL and its errors;
+- the alias as the column; WITH ORDINALITY;
+- LATERAL per row of a table;
+- a series joined to a table's key (a lookup per value);
+- unnest of several arrays with padding, NULLs and quoting, empty and
+  NULL arrays;
+- casts and their errors (a bad element, no braces, two dimensions);
+- `ARRAY[]`;
+- the column types and parameter types a client is told;
+- `INSERT ... SELECT * FROM unnest($1::int[], $2::text[])`;
+- the rows over max_statement_mem.
+
+A raw-protocol client (Parse with unknown types, Describe, Bind with
+binary arrays, as pgx does) was checked by hand: the parameters are
+described as int4[] and text[], and three rows come back, a NULL and a
+quoted element among them.
+
+Caught, each put back:
+
+- repeated names shared;
+- no ordinality;
+- no padding;
+- descending series ending wrong;
+- casts not typing parameters;
+- functions not LATERAL;
+- the alias not the column;
+- elements unchecked.
 
