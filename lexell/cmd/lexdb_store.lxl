@@ -71,6 +71,10 @@ type Snap = value record { id: int; seq: int; cancelled: bool }
 
 type Deferred = value record { slot: int; seq: int }
 
+// A tree's root changed by commit seq (prev: the root before, -1 none): a
+// snapshot at an earlier commit starts from prev.
+type RootChange = value record { seq: int; tree: int; prev: int }
+
 type Waiter = record { batch: int; p: task.Promise[Result[Unit, lexdb_base.DbErr]] }
 
 // A page a checkpoint writes: a node's body (the node's own string since
@@ -120,6 +124,8 @@ pub type Db = record {
     histCount: int
     histSlots: []int            // the slots with old versions
     deferred: []Deferred        // slots freed while a snapshot may reach them
+    rootHist: []RootChange      // root changes a snapshot may still need
+    durableSeq: int             // the last commit the log holds: snapshots read as of it
     // counters
     pub snapshots: int
     pub tooOld: int
@@ -149,13 +155,15 @@ pub type Txn = record {
     writes: []TxWrite
     index: Map[str, int]        // tree:key -> the last write of it
     created: []int
-    snap: int                   // a snapshot's id (read only), -1 for none
+    snap: int                   // its reads' snapshot's id, -1 for none (reads of the live tree)
     snapSeq: int
     snapTrees: Map[int, int]    // the tree roots as the snapshot sees them
+    track: bool                 // a snapshot's reads are noted (Mark) for its writes' commit: a transaction block
+    pub live: bool              // a block's reads go to the live tree for now (its UPDATE and DELETE: 9.16)
 }
 
 pub fn begin(): Txn {
-    return Txn{reads: [], writes: [], index: newMap(), created: [], snap: -1, snapSeq: 0, snapTrees: newMap()}
+    return Txn{reads: [], writes: [], index: newMap(), created: [], snap: -1, snapSeq: 0, snapTrees: newMap(), track: false, live: false}
 }
 
 pub fn (t: &Txn) isSnapshot(): bool { return t.snap >= 0 }
@@ -244,7 +252,7 @@ fn (db: &Db) maxSnap(): int {
 // Frees a slot the tree no longer reaches; while a snapshot may still reach
 // it (it sees a version the slot holds), the slot is kept until then.
 fn (db: mut &Db) freeSlot(s: int) {
-    if db.maxSnap() >= 0 && !db.meta[s].pinned {
+    if (db.seq > db.durableSeq || db.maxSnap() >= 0) && !db.meta[s].pinned {
         db.meta[s].pinned = true
         append(mut &db.deferred, Deferred{slot: s, seq: db.seq})
         return
@@ -289,7 +297,6 @@ fn (db: mut &Db) dropSlot(s: int) {
 // Marks a node changed: its page belongs to the last checkpoint, and the
 // next one writes it elsewhere and frees that page.
 fn (db: mut &Db) markDirty(s: int) {
-    db.willChange(s)
     if !db.meta[s].dirty {
         db.meta[s].dirty = true
         if db.meta[s].disk >= 0 { db.freePage(db.meta[s].disk) }
@@ -305,12 +312,13 @@ fn copyNode(n: &lexdb_page.Node): lexdb_page.Node {
     return c
 }
 
-// Called before a commit changes node s: while a snapshot sees its current
-// version, that version is kept (4.5). Nothing is copied when no snapshot
-// is live.
+// Called before a commit changes node s's contents: its current version is
+// kept while a snapshot may read it (4.5): one that is live, or one that
+// begins before this commit is durable (snapshots read as of the last
+// durable commit, so readers never wait for the log: 9.16).
 fn (db: mut &Db) willChange(s: int) {
     if db.meta[s].since == db.seq { return }
-    if db.maxSnap() >= db.meta[s].since && db.meta[s].loaded {
+    if (db.seq > db.durableSeq || db.maxSnap() >= db.meta[s].since) && db.meta[s].loaded {
         if !db.meta[s].listed {
             append(mut &db.histSlots, s)
             db.meta[s].listed = true
@@ -321,10 +329,18 @@ fn (db: mut &Db) willChange(s: int) {
     db.meta[s].since = db.seq
 }
 
-// Drops the old versions and the kept slots no live snapshot needs.
+// Drops the old versions, kept slots and root changes no snapshot needs: a
+// live one, or one that may begin (as of a commit from durableSeq on).
 fn (db: mut &Db) prune() {
     var live: []int = []
     for sn in db.snaps { if !sn.cancelled { append(mut &live, sn.seq) } }
+    var roots: []RootChange = []
+    for rc in replace(mut &db.rootHist, []) {
+        var need = rc.seq > db.durableSeq
+        for q in live { if q < rc.seq { need = true } }
+        if need { append(mut &roots, rc) }
+    }
+    db.rootHist = roots
     var keepSlots: []int = []
     for s in replace(mut &db.histSlots, []) {
         db.meta[s].listed = false
@@ -332,7 +348,7 @@ fn (db: mut &Db) prune() {
         var old = replace(mut &db.hist[s], [])
         while len(old) > 0 {
             let h = pop(mut &old)
-            var need = false
+            var need = h.until > db.durableSeq
             for q in live { if h.since <= q && q < h.until { need = true } }
             if need { append(mut &kept, h) } else { db.histCount -= 1 }
         }
@@ -345,7 +361,7 @@ fn (db: mut &Db) prune() {
     db.histSlots = keepSlots
     var still: []Deferred = []
     for d in replace(mut &db.deferred, []) {
-        var need = false
+        var need = d.seq > db.durableSeq
         for q in live { if q < d.seq { need = true } }
         if need { append(mut &still, d) } else { db.releaseSlot(d.slot) }
     }
@@ -513,6 +529,7 @@ fn nodeSize(n: &lexdb_page.Node): int {
 
 // Splits an oversized node; the new right node's slot and separator.
 fn (db: mut &Db) split(s: int): Descent {
+    db.willChange(s)
     let leaf = db.nodes[s].leaf
     let total = db.nodes[s].size
     let n = len(db.nodes[s].keys)
@@ -580,10 +597,11 @@ fn (db: mut &Db) fixOverflow(tree: int, path: &[]int, from: int) {
             db.meta[s].root = false
             db.meta[ns].root = true
             db.recost(s)
-            db.trees.put(tree, ns)
+            db.setRoot(tree, ns)
             return
         }
         let p = path[j - 1]
+        db.willChange(p)
         var at = 0
         while db.nodes[p].kids[at] != s { at += 1 }
         collections.insert(mut &db.nodes[p].keys, at, sp.upper)
@@ -601,6 +619,7 @@ fn (db: mut &Db) applyPut(tree: int, key: &str, val: &str) {
     if len(d.path) == 0 { return }       // no such tree (recovery replays a dropped tree's rows)
     for s in d.path { db.markDirty(s) }
     let leaf = d.path[len(d.path) - 1]
+    db.willChange(leaf)
     let i = lowerIndex(&db.nodes[leaf].keys, key)
     if i < len(db.nodes[leaf].keys) && db.nodes[leaf].keys[i] == key {
         db.nodes[leaf].size += len(val) - len(db.nodes[leaf].vals[i])
@@ -623,6 +642,7 @@ fn (db: mut &Db) applyDel(tree: int, key: &str) {
     let i = lowerIndex(&db.nodes[leaf].keys, key)
     if i >= len(db.nodes[leaf].keys) || db.nodes[leaf].keys[i] != key { return }
     for s in d.path { db.markDirty(s) }
+    db.willChange(leaf)
     db.nodes[leaf].size -= lexdb_page.leafEntry(&db.nodes[leaf].keys[i], &db.nodes[leaf].vals[i])
     let k = collections.removeAt(mut &db.nodes[leaf].keys, i)
     let v = collections.removeAt(mut &db.nodes[leaf].vals, i)
@@ -636,6 +656,7 @@ fn (db: mut &Db) applyDel(tree: int, key: &str) {
         let empty = if db.nodes[c].leaf { len(db.nodes[c].keys) == 0 } else { len(db.nodes[c].kids) == 0 }
         if !empty { break }
         let p = d.path[j - 1]
+        db.willChange(p)
         var at = 0
         while db.nodes[p].kids[at] != c { at += 1 }
         let gone = collections.removeAt(mut &db.nodes[p].kids, at)
@@ -654,6 +675,7 @@ fn (db: mut &Db) applyDel(tree: int, key: &str) {
     // one with a single child in memory gives way to it.
     var root = d.path[0]
     if !db.nodes[root].leaf && len(db.nodes[root].kids) == 0 {
+        db.willChange(root)
         db.nodes[root] = lexdb_page.newLeaf()
         db.meta[root].version += 1
         db.recost(root)
@@ -662,18 +684,25 @@ fn (db: mut &Db) applyDel(tree: int, key: &str) {
         let only = db.nodes[root].kids[0]
         db.markDirty(only)
         db.meta[only].root = true
-        db.trees.put(tree, only)
+        db.setRoot(tree, only)
         db.meta[root].root = false
         db.freeSlot(root)
         root = only
     }
 }
 
+// Sets (slot >= 0) or removes a tree's root, noting the change for snapshots.
+fn (db: mut &Db) setRoot(tree: int, slot: int) {
+    let prev = match db.trees.get(&tree) { Some(x) { x } None { -1 } }
+    if db.seq > db.durableSeq || db.maxSnap() >= 0 { append(mut &db.rootHist, RootChange{seq: db.seq, tree: tree, prev: prev}) }
+    if slot >= 0 { db.trees.put(tree, slot) } else { let gone = db.trees.remove(&tree) }
+}
+
 fn (db: mut &Db) applyCreate(tree: int) {
     if db.trees.has(&tree) { return }
     let s = db.newNode(lexdb_page.newLeaf())
     db.meta[s].root = true
-    db.trees.put(tree, s)
+    db.setRoot(tree, s)
     if tree >= db.nextTree { db.nextTree = tree + 1 }
 }
 
@@ -682,7 +711,7 @@ fn (db: mut &Db) applyCreate(tree: int) {
 fn (db: mut &Db) applyDrop(tree: int) {
     let r = match db.trees.get(&tree) { Some(x) { x } None { -1 } }
     if r < 0 { return }
-    let gone = db.trees.remove(&tree)
+    db.setRoot(tree, -1)
     var stack = [r]
     while len(stack) > 0 {
         let s = pop(mut &stack)
@@ -764,20 +793,20 @@ fn frame(records: &[]byte, count: int, batchNo: int, seg: int): []byte {
 
 // Reads key in tree: the transaction's own write of it, else the store's.
 pub fn (st: &Store) get(t: mut &Txn, tree: int, key: str): Result[Option[str], lexdb_base.DbErr] {
-    if t.snap >= 0 {
-        var out: Option[str] = None
-        try st.snapScan(t, tree, key, "", true, fn(e: &Entry): bool {
-            if e.key == key { out = Some(e.val) }
-            return false
-        })
-        return Ok(out)
-    }
     match t.index.get(&wkey(tree, &key)) {
         Some(i) {
             if t.writes[i].op == OP_DEL { return Ok(None) }
             return Ok(Some(t.writes[i].val))
         }
         None {}
+    }
+    if t.snap >= 0 && !t.live {
+        var out: Option[str] = None
+        try st.scan(t, tree, key, key + "\x00", fn(e: &Entry): bool {
+            if e.key == key { out = Some(e.val) }
+            return false
+        })
+        return Ok(out)
     }
     while true {
         var need = -1
@@ -838,8 +867,8 @@ fn (t: &Txn) ownRange(tree: int, from: &str, to: &str): []TxWrite {
 // end) in key order, the transaction's own writes included, while f gives
 // true.
 pub fn (st: &Store) scan(t: mut &Txn, tree: int, from: str, to: str, f: &fn(&Entry): bool): Result[Unit, lexdb_base.DbErr] {
-    if t.snap >= 0 { return st.snapScan(t, tree, from, to, false, f) }
     let own = t.ownRange(tree, &from, &to)
+    let root = if t.snap >= 0 && !t.live { match t.snapTrees.get(&tree) { Some(r) { r } None { -1 } } } else { -1 }
     var oi = 0
     var cursor = from
     var more = true
@@ -852,6 +881,33 @@ pub fn (st: &Store) scan(t: mut &Txn, tree: int, from: str, to: str, f: &fn(&Ent
         st.sh.with(fn(db: mut &Db) {
             if len(db.failed) > 0 {
                 append(mut &bad, db.failed[0])
+                return
+            }
+            if t.snap >= 0 && !t.live {
+                if db.snapGone(t.snap) {
+                    append(mut &bad, snapCancelled())
+                    return
+                }
+                if root < 0 { return }
+                let d = db.snapDescend(root, t.snapSeq, &cursor, false)
+                if d.need >= 0 {
+                    need = d.need
+                    return
+                }
+                if d.missing {
+                    append(mut &bad, lexdb_base.err(lexdb_base.S_INTERNAL, "snapshot: a node version is missing"))
+                    return
+                }
+                if t.track { append(mut &t.reads, db.snapMark(d.leaf, d.ver)) }
+                let n = db.snapNode(d.leaf, d.ver)
+                var i = lowerIndex(&n.keys, &cursor)
+                while i < len(n.keys) {
+                    if len(to) > 0 && n.keys[i] >= to { break }
+                    append(mut &chunk, Entry{key: n.keys[i], val: n.vals[i]})
+                    i += 1
+                }
+                upper = d.fence
+                hasUpper = d.hasFence
                 return
             }
             let d = db.descend(tree, &cursor)
@@ -931,8 +987,8 @@ fn (db: mut &Db) descendBack(tree: int, k: &str): Descent {
 // from the last down, the transaction's own writes included, while f gives
 // true. Each leaf read is marked as scan marks it.
 pub fn (st: &Store) scanBack(t: mut &Txn, tree: int, from: str, to: str, f: &fn(&Entry): bool): Result[Unit, lexdb_base.DbErr] {
-    if t.snap >= 0 { return st.snapScanBack(t, tree, from, to, f) }
     let own = t.ownRange(tree, &from, &to)
+    let root = if t.snap >= 0 && !t.live { match t.snapTrees.get(&tree) { Some(r) { r } None { -1 } } } else { -1 }
     var oi = len(own) - 1
     var cursor = to
     var more = true
@@ -945,6 +1001,33 @@ pub fn (st: &Store) scanBack(t: mut &Txn, tree: int, from: str, to: str, f: &fn(
         st.sh.with(fn(db: mut &Db) {
             if len(db.failed) > 0 {
                 append(mut &bad, db.failed[0])
+                return
+            }
+            if t.snap >= 0 && !t.live {
+                if db.snapGone(t.snap) {
+                    append(mut &bad, snapCancelled())
+                    return
+                }
+                if root < 0 { return }
+                let d = db.snapDescend(root, t.snapSeq, &cursor, true)
+                if d.need >= 0 {
+                    need = d.need
+                    return
+                }
+                if d.missing {
+                    append(mut &bad, lexdb_base.err(lexdb_base.S_INTERNAL, "snapshot: a node version is missing"))
+                    return
+                }
+                if t.track { append(mut &t.reads, db.snapMark(d.leaf, d.ver)) }
+                let n = db.snapNode(d.leaf, d.ver)
+                var i = if len(cursor) == 0 { len(n.keys) } else { lowerIndex(&n.keys, &cursor) }
+                while i > 0 {
+                    i -= 1
+                    if n.keys[i] < from { break }
+                    append(mut &chunk, Entry{key: n.keys[i], val: n.vals[i]})
+                }
+                lower = d.fence
+                hasLower = d.hasFence
                 return
             }
             let d = db.descendBack(tree, &cursor)
@@ -1035,10 +1118,17 @@ fn (db: &Db) validate(t: &Txn): bool {
 // writes and waits until the log holds them. A transaction that only read
 // is checked too, and waits until what it saw is durable (4.4).
 pub fn (st: &Store) commit(t: Txn): Result[Unit, lexdb_base.DbErr] {
-    if t.snap >= 0 {
-        st.endSnapshot(&t)
+    let id = t.snap
+    if id >= 0 && len(t.writes) == 0 {
+        st.endSnap(id)
         return Ok(Unit{})
     }
+    let r = st.commitLive(t)
+    st.endSnap(id)
+    return r
+}
+
+fn (st: &Store) commitLive(t: Txn): Result[Unit, lexdb_base.DbErr] {
     var wait: []task.Future[Result[Unit, lexdb_base.DbErr]] = []
     var wake: []task.Promise[Unit] = []
     while true {
@@ -1141,11 +1231,18 @@ fn (db: mut &Db) overBudget() {
     }
 }
 
-// A read-only transaction on a snapshot. It waits first until every commit
-// it can see is durable, so nothing it shows can be lost in a crash.
-pub fn (st: &Store) beginSnapshot(): Result[Txn, lexdb_base.DbErr] {
+// A read-only transaction on a snapshot, as of the last durable commit:
+// nothing it shows can be lost in a crash, and it waits for nothing.
+pub fn (st: &Store) beginSnapshot(): Result[Txn, lexdb_base.DbErr] { return st.snapshotTxn(false) }
+
+// A transaction block: it reads a snapshot (as beginSnapshot), with its own
+// writes over it, so its reads never wait; its reads are noted, and a
+// commit with writes checks that none changed since (9.16).
+pub fn (st: &Store) beginBlock(): Result[Txn, lexdb_base.DbErr] { return st.snapshotTxn(true) }
+
+fn (st: &Store) snapshotTxn(track: bool): Result[Txn, lexdb_base.DbErr] {
     var t = begin()
-    var wait: []task.Future[Result[Unit, lexdb_base.DbErr]] = []
+    t.track = track
     var bad: []lexdb_base.DbErr = []
     st.sh.with(fn(db: mut &Db) {
         if len(db.failed) > 0 {
@@ -1154,42 +1251,35 @@ pub fn (st: &Store) beginSnapshot(): Result[Txn, lexdb_base.DbErr] {
         }
         t.snap = db.nextSnap
         db.nextSnap += 1
-        t.snapSeq = db.seq
-        append(mut &db.snaps, Snap{id: t.snap, seq: db.seq, cancelled: false})
+        // as of the last commit the log holds: what it shows is durable, and
+        // it waits for nothing (9.16)
+        let q = db.durableSeq
+        t.snapSeq = q
+        append(mut &db.snaps, Snap{id: t.snap, seq: q, cancelled: false})
         db.snapshots += 1
         for i in 0..db.trees.size() {
             let id: int = db.trees.keyAt(i)
             let r: int = db.trees.valAt(i)
             t.snapTrees.put(id, r)
         }
-        if db.appliedBatch > db.durableBatch {
-            let task.Handoff{promise: p, future: f} = task.promise[Result[Unit, lexdb_base.DbErr]]()
-            append(mut &db.waiters, Waiter{batch: db.appliedBatch, p: p})
-            append(mut &wait, f)
+        var k = len(db.rootHist) - 1
+        while k >= 0 {
+            let rc = db.rootHist[k]
+            if rc.seq > q {
+                if rc.prev >= 0 { t.snapTrees.put(rc.tree, rc.prev) } else { let gone = t.snapTrees.remove(&rc.tree) }
+            }
+            k -= 1
         }
     })
     if len(bad) > 0 { return Err(bad[0]) }
-    if len(wait) > 0 {
-        match pop(mut &wait).wait() {
-            Ok(r) {
-                if r.isErr() {
-                    st.endSnapshot(&t)
-                    return Err(r.unwrapErr())
-                }
-            }
-            Err(_) {
-                st.endSnapshot(&t)
-                return Err(lexdb_base.err(lexdb_base.S_INTERNAL, "snapshot: the log writer has gone"))
-            }
-        }
-    }
     return Ok(t)
 }
 
 // Ends a snapshot (its commit or rollback); its old versions go.
-pub fn (st: &Store) endSnapshot(t: &Txn) {
-    if t.snap < 0 { return }
-    let id = t.snap
+pub fn (st: &Store) endSnapshot(t: &Txn) { st.endSnap(t.snap) }
+
+fn (st: &Store) endSnap(id: int) {
+    if id < 0 { return }
     st.sh.with(fn(db: mut &Db) {
         var keep: []Snap = []
         for sn in db.snaps { if sn.id != id { append(mut &keep, sn) } }
@@ -1200,27 +1290,6 @@ pub fn (st: &Store) endSnapshot(t: &Txn) {
 
 // Ends a transaction without committing it.
 pub fn (st: &Store) abort(t: Txn) { st.endSnapshot(&t) }
-
-// Waits until every commit applied so far is durable: a transaction block
-// answers each statement before it commits, and must not show what a crash
-// could still lose (4.4).
-pub fn (st: &Store) syncReads(): Result[Unit, lexdb_base.DbErr] {
-    var wait: []task.Future[Result[Unit, lexdb_base.DbErr]] = []
-    st.sh.with(fn(db: mut &Db) {
-        if db.appliedBatch > db.durableBatch {
-            let task.Handoff{promise: p, future: f} = task.promise[Result[Unit, lexdb_base.DbErr]]()
-            append(mut &db.waiters, Waiter{batch: db.appliedBatch, p: p})
-            append(mut &wait, f)
-        }
-    })
-    if len(wait) > 0 {
-        match pop(mut &wait).wait() {
-            Ok(r) { return r }
-            Err(_) { return Err(lexdb_base.err(lexdb_base.S_INTERNAL, "the log writer has gone")) }
-        }
-    }
-    return Ok(Unit{})
-}
 
 // The version of slot s a snapshot at seq q sees: -1 the current one (in
 // memory), -2 the current one (to load), -3 none (a bug), else the index of
@@ -1243,129 +1312,63 @@ fn snapCancelled(): lexdb_base.DbErr {
     return lexdb_base.err("72000", "snapshot too old: the old versions it needed went over the budget")
 }
 
-// A snapshot's scan of [from, to) (to "": to the end); one: stop after the
-// first leaf (a point lookup).
-fn (st: &Store) snapScan(t: mut &Txn, tree: int, from: str, to: str, one: bool, f: &fn(&Entry): bool): Result[Unit, lexdb_base.DbErr] {
-    let root = match t.snapTrees.get(&tree) { Some(r) { r } None { -1 } }
-    if root < 0 { return Ok(Unit{}) }
-    let q = t.snapSeq
-    let id = t.snap
-    var cursor = from
+// A snapshot's descent to the leaf holding cursor (back: the leaf with the
+// largest keys below it, "" the last): the leaf's slot and version (verOf),
+// a slot to load first, or a version missing; and the fence on its path
+// (forward: the separator above it; back: the one below it).
+type SnapLeaf = value record { leaf: int; ver: int; need: int; missing: bool; fence: str; hasFence: bool }
+
+fn (db: mut &Db) snapDescend(root: int, q: int, cursor: &str, back: bool): SnapLeaf {
+    var r = SnapLeaf{leaf: -1, ver: -1, need: -1, missing: false, fence: "", hasFence: false}
+    var s = root
     while true {
-        var need = -1
-        var chunk: []Entry = []
-        var bad: []lexdb_base.DbErr = []
-        var upper = ""
-        var hasUpper = false
-        st.sh.with(fn(db: mut &Db) {
-            for sn in db.snaps {
-                if sn.id == id && sn.cancelled {
-                    append(mut &bad, snapCancelled())
-                    return
-                }
-            }
-            var s = root
-            while true {
-                let v = db.verOf(s, q)
-                if v == -2 {
-                    need = s
-                    return
-                }
-                if v == -3 {
-                    append(mut &bad, lexdb_base.err(lexdb_base.S_INTERNAL, "snapshot: a node version is missing"))
-                    return
-                }
-                db.meta[s].ref = true
-                let n = db.snapNode(s, v)
-                if n.leaf {
-                    var i = lowerIndex(&n.keys, &cursor)
-                    while i < len(n.keys) {
-                        if len(to) > 0 && n.keys[i] >= to { break }
-                        append(mut &chunk, Entry{key: n.keys[i], val: n.vals[i]})
-                        i += 1
-                    }
-                    return
-                }
-                let i = childIndex(&n.keys, &cursor)
-                if i < len(n.keys) {
-                    upper = n.keys[i]
-                    hasUpper = true
-                }
-                s = n.kids[i]
-            }
-        })
-        if len(bad) > 0 { return Err(bad[0]) }
-        if need >= 0 {
-            try st.load(need)
-            continue
+        let v = db.verOf(s, q)
+        if v == -2 {
+            r.need = s
+            return r
         }
-        for e in chunk { if !f(&e) { return Ok(Unit{}) } }
-        if one || !hasUpper || (len(to) > 0 && upper >= to) { break }
-        cursor = upper
+        if v == -3 {
+            r.missing = true
+            return r
+        }
+        db.meta[s].ref = true
+        let n = db.snapNode(s, v)
+        if n.leaf {
+            r.leaf = s
+            r.ver = v
+            return r
+        }
+        if back {
+            let j = if len(cursor) == 0 { len(n.keys) } else { lowerIndex(&n.keys, cursor) }
+            if j > 0 {
+                r.fence = n.keys[j - 1]
+                r.hasFence = true
+            }
+            s = n.kids[j]
+        } else {
+            let i = childIndex(&n.keys, cursor)
+            if i < len(n.keys) {
+                r.fence = n.keys[i]
+                r.hasFence = true
+            }
+            s = n.kids[i]
+        }
     }
-    return Ok(Unit{})
+    return r
 }
 
-// A snapshot's backward scan of [from, to) (to "": to the end).
-fn (st: &Store) snapScanBack(t: mut &Txn, tree: int, from: str, to: str, f: &fn(&Entry): bool): Result[Unit, lexdb_base.DbErr] {
-    let root = match t.snapTrees.get(&tree) { Some(r) { r } None { -1 } }
-    if root < 0 { return Ok(Unit{}) }
-    let q = t.snapSeq
-    let id = t.snap
-    var cursor = to
-    while true {
-        var need = -1
-        var chunk: []Entry = []
-        var bad: []lexdb_base.DbErr = []
-        var lower = ""
-        var hasLower = false
-        st.sh.with(fn(db: mut &Db) {
-            for sn in db.snaps {
-                if sn.id == id && sn.cancelled {
-                    append(mut &bad, snapCancelled())
-                    return
-                }
-            }
-            var s = root
-            while true {
-                let v = db.verOf(s, q)
-                if v == -2 {
-                    need = s
-                    return
-                }
-                if v == -3 {
-                    append(mut &bad, lexdb_base.err(lexdb_base.S_INTERNAL, "snapshot: a node version is missing"))
-                    return
-                }
-                db.meta[s].ref = true
-                let n = db.snapNode(s, v)
-                if n.leaf {
-                    var i = if len(cursor) == 0 { len(n.keys) } else { lowerIndex(&n.keys, &cursor) }
-                    while i > 0 {
-                        i -= 1
-                        if n.keys[i] < from { break }
-                        append(mut &chunk, Entry{key: n.keys[i], val: n.vals[i]})
-                    }
-                    return
-                }
-                let j = if len(cursor) == 0 { len(n.keys) } else { lowerIndex(&n.keys, &cursor) }
-                if j > 0 {
-                    lower = n.keys[j - 1]
-                    hasLower = true
-                }
-                s = n.kids[j]
-            }
-        })
-        if len(bad) > 0 { return Err(bad[0]) }
-        if need >= 0 {
-            try st.load(need)
-            continue
-        }
-        for e in chunk { if !f(&e) { return Ok(Unit{}) } }
-        if !hasLower || lower <= from { break }
-        cursor = lower
-    }
-    return Ok(Unit{})
+// A snapshot's read of leaf s at version v, for its commit's check: the
+// current version (v -1) must stay so until then; an older one is stale
+// already (the leaf changed after the snapshot), so a commit with writes
+// fails, as serializable PostgreSQL's does.
+fn (db: &Db) snapMark(s: int, v: int): Mark {
+    if v == -1 { return db.mark(s) }
+    return Mark{slot: s, gen: db.meta[s].gen, version: -1, page: -1, seq: db.seq}
+}
+
+fn (db: &Db) snapGone(id: int): bool {
+    for sn in db.snaps { if sn.id == id && sn.cancelled { return true } }
+    return false
 }
 
 // ---- the log writer: one task, one flush at a time; commits made while a
@@ -1433,6 +1436,7 @@ pub fn writer(st: Store): int {
         var job: []byte = []
         var count = 0
         var no = 0
+        var upto = 0
         var stop = false
         var idle: []task.Future[Unit] = []
         st.sh.with(fn(db: mut &Db) {
@@ -1442,6 +1446,7 @@ pub fn writer(st: Store): int {
             }
             if db.batchCount > 0 {
                 job = replace(mut &db.batch, [])
+                upto = db.seq                   // every commit applied so far is in this batch or before
                 count = db.batchCount
                 no = db.batchNo
                 db.batchNo += 1
@@ -1495,6 +1500,10 @@ pub fn writer(st: Store): int {
         var ck: []task.Promise[Unit] = []
         st.sh.with(fn(db: mut &Db) {
             db.durableBatch = no
+            if upto > db.durableSeq {
+                db.durableSeq = upto
+                db.prune()
+            }
             db.seg = segNo
             db.segOff = segOff
             db.flushes += 1
@@ -1744,7 +1753,7 @@ fn newDb(fs: lexdb_disk.Fs, data: lexdb_disk.File, opts: Options, m: &lexdb_page
               batch: [], batchCount: 0, batchNo: m.replayBatch, appliedBatch: m.replayBatch - 1,
               durableBatch: m.replayBatch - 1, waiters: [], writerWake: [], ckptWake: [], ckptDone: [], seg: m.replaySeg,
               segOff: m.replayOff, logSinceCkpt: 0, failed: [], closing: false, seq: 0, snaps: [], nextSnap: 0,
-              hist: [], histCount: 0, histSlots: [], deferred: [], snapshots: 0, tooOld: 0, commits: 0,
+              hist: [], histCount: 0, histSlots: [], deferred: [], rootHist: [], durableSeq: 0, snapshots: 0, tooOld: 0, commits: 0,
               conflicts: 0, loads: 0, evictions: 0, flushes: 0, checkpoints: 0, held: 0}
 }
 

@@ -393,7 +393,7 @@ Built on 2026-11-09 on branch `lexdb`, about 6,300 lines in
 (cache, trees, transactions, log, checkpoints, recovery, snapshots),
 `lexdb_sql` (lexer, parser), `lexdb_exec` (catalog, rows, keys, planner,
 statements, sessions), `lexdb_wire` (protocol 3.0) and `lexdb` (the
-server). Tests: `python3 lexell/tests/lexdb.py` (23 programs in
+server). Tests: `python3 lexell/tests/lexdb.py` (24 programs in
 `tests/lexdb/run`, under `LXL_CHECK=1`).
 
     lexell/compiler/out/lxlc lexell/cmd/lexdb.lxl -o lexdb
@@ -506,25 +506,30 @@ is the comparison to make.
 
 ### 9.4 Next
 
-1. Smaller items: a correlated subquery's value as a lookup's key (now it
+1. io_uring for the page file's and the log's reads and writes, in place of
+   the helper pool (the user's request: consider it; 9.17).
+2. Conflicts per row, not per leaf: a commit fails when a leaf it read
+   changed, even for another row in it. Transfers in blocks over 10,000
+   rows by 16 writers fail 1.6% of the time, most of it this.
+3. Smaller items: a correlated subquery's value as a lookup's key (now it
    is only a filter), a small uncorrelated IN set as an IN-list
    lookup, correlated subqueries in GROUP BY and in aggregates' arguments,
    hashing a correlated scalar subquery with an aggregate (a count per
    customer) as a grouped run, `WITH` before INSERT, UPDATE and DELETE.
    Choosing hash or index per row by row counts (9.9) waits for costs,
    which the user has left for now (section 0).
-2. Schemas (the user uses them extensively): `schema.table` names, the
+4. Schemas (the user uses them extensively): `schema.table` names, the
    catalog keyed by schema, `CREATE SCHEMA`/`DROP SCHEMA`, `search_path`,
    and three-part column names (`s.t.c`) in the resolver.
-3. Plans kept per prepared statement: since D4 every execution resolves
+5. Plans kept per prepared statement: since D4 every execution resolves
    names and chooses paths, and point selects fell from 26,700 to about
    24,000 tps.
-4. Whole-server crash tests through the wire protocol.
-5. COPY; then the cost questions (section 0), with EXPLAIN ANALYZE's
+6. Whole-server crash tests through the wire protocol.
+7. COPY; then the cost questions (section 0), with EXPLAIN ANALYZE's
    counts as the evidence.
-6. Overflow pages for large rows; reclaiming a dropped table's pages.
-7. Authentication (SCRAM) and TLS, so the server can leave loopback.
-8. The checkpoint pause under a large write load; io_uring if the helper
+8. Overflow pages for large rows; reclaiming a dropped table's pages.
+9. Authentication (SCRAM) and TLS, so the server can leave loopback.
+10. The checkpoint pause under a large write load; io_uring if the helper
    pool is the limit (D5).
 
 ### 9.5 Indexes and joins (D4)
@@ -1003,4 +1008,80 @@ Per session, as PostgreSQL's SET, kept until changed:
 
   Never yielding, no turn started, and optimistic SELECTs each change the
   output.
+
+### 9.16 Readers never wait for writers, writers never wait for readers
+
+The user's rule. There are no locks, so the only waits were for
+durability. A read showed only what the log held, and when it saw a
+commit not yet flushed it waited for the flush: a snapshot as it began,
+a read-only commit, and every statement in a transaction block
+(`syncReads`). Under write load that is a wait on the writers' flushes.
+Beside 16 writers, point selects took 2.2 ms instead of 0.27 ms, and
+6 to 14 ms when the drive was slow.
+
+- **Snapshots read as of the last durable commit** (`durableSeq`, moved by
+  the writer after each flush). What they show is durable, so they wait
+  for nothing; a commit shows once its flush is done, as in PostgreSQL. A
+  session's own autocommit write returns only after its flush, so the
+  session sees it next.
+- **What that needs.** Each change to a node's contents keeps its previous
+  version until the change is durable and no snapshot needs it.
+  `willChange` is called where contents change, no longer for every node
+  marked dirty: a parent on the path is not copied. Freed slots are kept
+  likewise (`deferred`), and root changes go into `rootHist`: a snapshot
+  starts from the roots as of its commit, through root splits, new and
+  dropped trees. `prune` runs after each flush. Replay does not advance
+  `seq`, so recovery copies nothing.
+- **Transaction blocks read a snapshot too** (`beginBlock`), taken at
+  BEGIN, with their own writes over it (forward, backward and point
+  reads). Reads are noted. A read of a leaf changed after the snapshot is
+  stale at once, as in serializable PostgreSQL. A block that only read
+  commits without a check and never fails. A block that wrote checks at
+  COMMIT that everything it read is still current, or fails with 40001.
+  Its UPDATE, DELETE and INSERT read the live tree (`Txn.live`), since
+  what they read is checked at COMMIT the same way and the latest is less
+  often stale. With every read checked against the state at COMMIT, the
+  block is serializable at its commit.
+- **Writers never wait for readers.** Snapshots cost writers only the copy
+  of a changed node's old version. A snapshot whose old versions pass
+  `snapNodes` is cancelled (72000) and, outside a block, retried.
+- **Measured** (16 writers, 8 point readers on a 10,000-row table, 6 s):
+
+| | readers | reader latency | writers | writers failed |
+|---|---|---|---|---|
+| autocommit writers, before | 3,600 tps | 2.2 ms | 3,480 tps | 0 |
+| autocommit writers, after | 12,400 tps | 0.65 ms | 4,430 tps | 0 |
+| writers in blocks, before | 3,950 tps | 2.0 ms | 2,300 tps | 3.8% |
+| blocks reading the snapshot for DML too | 10,800 tps | 0.74 ms | 2,880 tps | 6.3% |
+| blocks, DML reading the live tree (kept) | 11,000 tps | 0.72 ms | 3,000 tps | 1.6% |
+
+  The failures are per-leaf conflicts (9.4). Point selects alone are
+  unchanged over five pairs (23,602 and 23,340 tps).
+- **Tests.** `store_durable` holds the log's flushes open:
+  - a commit is then applied but not durable: it updates a value, splits
+    the root, empties and drops a tree and creates one;
+  - a snapshot begun meanwhile does not wait and sees the state before,
+    exactly, and still does after the flush;
+  - 40 rounds take two snapshots in each window (the second after the
+    first ended and pruned), each seeing the round before, whole;
+  - 20 blocks read their snapshot with their own writes, forward, backward
+    and point; a commit fails when a key it read changed after its
+    snapshot, and not when one far from its reads did.
+
+  `exec_turns` checks that a block that only reads commits with the right
+  sum, and that one that then writes fails. Caught, each put back:
+  - snapshots at the applied commit;
+  - copies only for live snapshots;
+  - root changes not noted;
+  - freed slots not kept;
+  - prune dropping pending versions;
+  - the durable point never moving;
+  - a parent not copied on a split;
+  - a stale read noted as current;
+  - block reads not noted;
+  - a commit with writes not checked;
+  - the backward fence wrong (by `store_back`).
+
+  Checking own writes before the snapshot in `get` turned out to be only
+  a shortcut: the scan merges them anyway.
 

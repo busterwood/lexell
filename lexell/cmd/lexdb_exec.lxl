@@ -4763,11 +4763,12 @@ pub type Session = record {
     timeoutMs: int              // SET statement_timeout: a statement's time at most; 0 no limit
     maxMem: int                 // SET max_statement_mem: the bytes of rows a statement holds at most; 0 no limit
     saved: []Limits             // in a transaction block: the settings at its BEGIN (a ROLLBACK restores them)
+    readOnly: bool              // the block is BEGIN READ ONLY
 }
 
 pub fn newSession(st: lexdb_store.Store): Session {
     return Session{st: st, txn: [], failed: false, maxRecursion: MAX_RECURSION, timeoutMs: 0, maxMem: MAX_STATEMENT_MEM,
-                   saved: []}
+                   saved: [], readOnly: false}
 }
 
 // max_statement_mem's default.
@@ -4947,8 +4948,9 @@ pub fn (s: mut &Session) run(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
                 if stmt.ifFlag {
                     append(mut &s.txn, try s.st.beginSnapshot())     // READ ONLY: a snapshot (4.5)
                 } else {
-                    append(mut &s.txn, lexdb_store.begin())
+                    append(mut &s.txn, try s.st.beginBlock())       // a snapshot with its writes (9.16)
                 }
+                s.readOnly = stmt.ifFlag
                 s.failed = false
                 s.saved = [Limits{rounds: s.maxRecursion, mem: s.maxMem, deadline: s.timeoutMs}]
             }
@@ -4979,19 +4981,20 @@ pub fn (s: mut &Session) run(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
         if s.failed {
             return Err(e("25P02", "current transaction is aborted, commands ignored until end of transaction block"))
         }
-        if s.txn[0].isSnapshot() && isWrite(stmt.kind) {
+        if s.readOnly && isWrite(stmt.kind) {
             s.failed = true
             return Err(e("25006", "cannot execute " + stmtName(stmt.kind) + " in a read-only transaction"))
         }
         let st = s.st
+        // UPDATE and DELETE read the live tree: the rows they change are
+        // checked at COMMIT either way, and the latest is less often stale
+        s.txn[0].live = stmt.kind == lexdb_sql.S_UPDATE || stmt.kind == lexdb_sql.S_DELETE || stmt.kind == lexdb_sql.S_INSERT
         let r = execIn(&st, mut &s.txn[0], stmt, params, ptypes, s.limits())
+        s.txn[0].live = false
         if r.isErr() {
             s.failed = true
             return r
         }
-        // The client sees this statement's result before the block commits:
-        // what it read must be durable first (a snapshot waited when it began).
-        if !s.txn[0].isSnapshot() { try s.st.syncReads() }
         return r
     }
     var tries = 0

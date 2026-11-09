@@ -3,12 +3,14 @@
 // session started after it ends first. A long SELECT outside a transaction
 // block reads one snapshot: while another session commits transfers that
 // keep the sum of a column, the long query's sum is the sum, and it never
-// conflicts; inside a block, the same query fails at COMMIT (40001), as
+// conflicts. A block reads a snapshot too: one that only reads commits,
+// with the sum; one that then writes fails at COMMIT (40001), as
 // serializable PostgreSQL would.
 // expect: order: short, long
 // expect: transfers all committed: true
 // expect: snapshot sum ok: true
-// expect: in a block: 40001
+// expect: a block that reads: COMMIT, sum ok: true
+// expect: a block that reads, then writes: 40001
 import "strings"
 import "task"
 import "../../../cmd/lexdb_store"
@@ -49,16 +51,24 @@ fn sums(a: Arg): int {
     if a.which == 0 {
         let got = one(mut &s, &"select sum(a) from big x, small y, small z")
         let r = one(mut &s, &("insert into log values (100, '" + got + "')"))
+        // a block that only reads: its snapshot, never a conflict
         let b = one(mut &s, &"begin")
         let inBlock = one(mut &s, &"select sum(a) from big x, small y, small z")
         let c = one(mut &s, &"commit")
+        let r3 = one(mut &s, &("insert into log values (103, '" + inBlock + "')"))
         let r2 = one(mut &s, &("insert into log values (101, '" + c + "')"))
+        // a block that reads, then writes: what it read changed, 40001
+        let b2 = one(mut &s, &"begin")
+        let again = one(mut &s, &"select sum(a) from big x, small y, small z")
+        let w = one(mut &s, &"insert into small values (99)")
+        let c2 = one(mut &s, &"commit")
+        let r4 = one(mut &s, &("insert into log values (104, '" + c2 + "')"))
     } else {
         // transfers until the long session has run its block
         var ok = 0
         var n = 0
         var i = 0
-        while one(mut &s, &"select count(*) from log where id = 101") == "0" {
+        while one(mut &s, &"select count(*) from log where id = 104") == "0" {
             let k = (i * 131) % 20000
             let b = one(mut &s, &"begin")
             let u1 = one(mut &s, &("update big set a = a + 5 where id = " + k.toStr()))
@@ -104,7 +114,9 @@ fn main() {
         println("transfers all committed: " + one(mut &s, &"select who from log where id = 102"))
         let want = (strings.parseIntOpt(total).unwrapOr(0) * 36).toStr()
         println("snapshot sum ok: " + (one(mut &s, &"select who from log where id = 100") == want).toStr())
-        println("in a block: " + one(mut &s, &"select who from log where id = 101"))
+        println("a block that reads: " + one(mut &s, &"select who from log where id = 101") + ", sum ok: " +
+                (one(mut &s, &"select who from log where id = 103") == want).toStr())
+        println("a block that reads, then writes: " + one(mut &s, &"select who from log where id = 104"))
         return 0
     }).unwrap()
 }
