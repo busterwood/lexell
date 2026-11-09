@@ -170,6 +170,7 @@ pub type Stmt = record {
     pub cte: int                // a CTE where it is used: its number in the statement; -1 none
     pub rec: bool               // a recursive CTE: inner[1] reads its working table
     pub cascade: bool           // DROP SCHEMA ... CASCADE
+    src: str                    // a scalar subquery: its tokens (one written twice is one subquery)
 }
 
 pub const SET_UNION = 1
@@ -186,7 +187,7 @@ fn newStmt(kind: int): Stmt {
     return Stmt{kind: kind, table: "", ifFlag: false, cols: [], pk: [], names: [], rows: [], items: [], where: None,
                 group: [], order: [], limit: None, offset: None, sets: [], params: 0, from: [], index: "",
                 unique: false, inner: [], distinct: false, having: None, subs: [], use: 0, setop: 0, setAll: false,
-                cte: -1, rec: false, cascade: false}
+                cte: -1, rec: false, cascade: false, src: ""}
 }
 
 // ---- the lexer
@@ -624,6 +625,7 @@ fn (p: mut &P) caseExpr(): Result[Expr, lexdb_base.DbErr] {
 // statement it is in gets it, numbered.
 fn (p: mut &P) subquery(use: int): Result[int, lexdb_base.DbErr] {
     p.depth += 1
+    let start = p.pos
     let saved = replace(mut &p.subs, [])
     var pushed = 0
     if p.acceptKw("with") { pushed = try p.withList() }
@@ -632,9 +634,28 @@ fn (p: mut &P) subquery(use: int): Result[int, lexdb_base.DbErr] {
     p.popCtes(pushed)
     sq.subs = replace(mut &p.subs, saved)
     sq.use = use
+    p.depth -= 1
+    // a scalar subquery written again in the same query is the same one:
+    // GROUP BY (subquery) then matches it in the select list, and it runs
+    // once per row
+    if use == SUB_SCALAR {
+        var kb = newStrBuf()
+        for i in start..p.pos {
+            kb.add(p.toks[i].kind.toStr())
+            kb.addByte(1)
+            kb.add(p.toks[i].text)
+            kb.addByte(0)
+        }
+        sq.src = kb.toStr()
+        for i in 0..len(p.subs) {
+            if p.subs[i].use == SUB_SCALAR && p.subs[i].src == sq.src {
+                try p.expectKw(")")
+                return Ok(i)
+            }
+        }
+    }
     try p.expectKw(")")
     append(mut &p.subs, sq)
-    p.depth -= 1
     return Ok(len(p.subs) - 1)
 }
 

@@ -4086,6 +4086,55 @@ fn numOf(v: &Val, fname: &str): Result[Val, DbErr] {
     }
 }
 
+// A grouped query's groups so far: per group its first row (for grouped
+// columns) and its accumulators.
+type Groups = record {
+    index: Map[str, int]        // GROUP BY key -> group
+    firsts: [][]Val
+    accs: [][]Acc
+}
+
+// Adds a row to its group (env: the row, and its correlated subqueries'
+// values if any).
+fn addToGroup(sel: &Sel, gs: mut &Groups, r: &[]Val, env: &Env, held: mut &int, room: int, rs0max: int): Result[Unit, DbErr] {
+    var g = 0
+    if len(sel.groupBy) > 0 {
+        var kb = newStrBuf()
+        for x in sel.groupBy { encIdxPart(mut &kb, &(try eval(&x, env))) }
+        let k = kb.toStr()
+        match gs.index.get(&k) {
+            Some(i) { g = i }
+            None {
+                g = len(gs.firsts)
+                held += rowBytes(r) + 64 * (len(sel.specs) + 1) + len(k)
+                if room >= 0 && held > room { return Err(memErr(rs0max)) }
+                gs.index.put(k, g)
+                append(mut &gs.firsts, copyRow(r))
+                append(mut &gs.accs, newAccs(len(sel.specs)))
+            }
+        }
+    } else if len(gs.firsts) == 0 {
+        append(mut &gs.firsts, copyRow(r))
+        append(mut &gs.accs, newAccs(len(sel.specs)))
+    }
+    for i in 0..len(sel.specs) { try accumulate(&sel.specs[i], mut &gs.accs[g][i], env) }
+    return Ok(Unit{})
+}
+
+// A correlated subquery in a GROUP BY key or an aggregate's argument or
+// FILTER.
+fn groupCorr(sel: &Sel): bool {
+    for g in sel.groupBy { if hasCorr(&g) { return true } }
+    for sp in sel.specs {
+        for a in sp.args { if hasCorr(&a) { return true } }
+        match sp.filter {
+            Some(f) { if hasCorr(&f) { return true } }
+            None {}
+        }
+    }
+    return false
+}
+
 // Adds one row (env) to an accumulator.
 fn accumulate(sp: &AggSpec, acc: mut &Acc, env: &Env): Result[Unit, DbErr] {
     match sp.filter {
@@ -4487,19 +4536,6 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             }
             append(mut &okLevels, all && len(groupBy) > 0 && len(lv.t.pk) > 0)
         }
-        if q.corr {
-            // these are evaluated while the rows are read: no subquery run per row there
-            for g in groupBy { if hasCorr(&g) { return Err(e("0A000", "correlated subqueries in GROUP BY are not supported yet")) } }
-            for sp in specs {
-                var bad = false
-                for a in sp.args { if hasCorr(&a) { bad = true } }
-                match sp.filter {
-                    Some(f) { if hasCorr(&f) { bad = true } }
-                    None {}
-                }
-                if bad { return Err(e("0A000", "correlated subqueries in aggregate arguments are not supported yet")) }
-            }
-        }
         for x in exprs { try checkGrouped(&x, &gtexts, &okLevels, &q) }
         for x in order { try checkGrouped(&x, &gtexts, &okLevels, &q) }
         match having {
@@ -4771,35 +4807,40 @@ fn execSel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
         // done above
     } else if sel.aggQ {
         // per group: its first row (for grouped columns) and its accumulators
-        var index: Map[str, int] = newMap()
-        var firsts: [][]Val = []
-        var accs: [][]Acc = []
+        var gs = Groups{index: newMap(), firsts: [], accs: []}
+        // A correlated subquery in a GROUP BY key or an aggregate's argument
+        // runs per row, which it cannot while the rows are read (runQuery
+        // holds the run): the rows are kept, then grouped (9.24).
+        let later = q.corr && groupCorr(sel)
+        var kept: [][]Val = []
         try runQuery(st, txn, q, &m, params, fn(r: &[]Val): Result[bool, DbErr] {
             if sel.first >= 0 && isNull(&r[sel.first]) { return Ok(true) }
-            let env = Env{cols: &q.cols, row: r, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs}
-            var g = 0
-            if len(sel.groupBy) > 0 {
-                var kb = newStrBuf()
-                for x in sel.groupBy { encIdxPart(mut &kb, &(try eval(&x, &env))) }
-                let k = kb.toStr()
-                match index.get(&k) {
-                    Some(i) { g = i }
-                    None {
-                        g = len(firsts)
-                        held += rowBytes(r) + 64 * (len(sel.specs) + 1) + len(k)
-                        if room >= 0 && held > room { return Err(memErr(rs0max)) }
-                        index.put(k, g)
-                        append(mut &firsts, copyRow(r))
-                        append(mut &accs, newAccs(len(sel.specs)))
-                    }
-                }
-            } else if len(firsts) == 0 {
-                append(mut &firsts, copyRow(r))
-                append(mut &accs, newAccs(len(sel.specs)))
+            if later {
+                held += rowBytes(r)
+                if room >= 0 && held > room { return Err(memErr(rs0max)) }
+                append(mut &kept, copyRow(r))
+                return Ok(sel.first < 0)
             }
-            for i in 0..len(sel.specs) { try accumulate(&sel.specs[i], mut &accs[g][i], &env) }
+            let env = Env{cols: &q.cols, row: r, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs}
+            try addToGroup(sel, mut &gs, r, &env, mut &held, room, rs0max)
             return Ok(sel.first < 0)        // MIN/MAX in order: its first value is the answer
         }, rs)
+        for r in kept {
+            let env = Env{cols: &q.cols, row: &r, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs}
+            var cur: []Val = array(len(q.subs), Val.Null)
+            for x in sel.groupBy { try fillCur(st, txn, q, &x, &env, rs, mut &cur) }
+            for sp in sel.specs {
+                for a in sp.args { try fillCur(st, txn, q, &a, &env, rs, mut &cur) }
+                match sp.filter {
+                    Some(f) { try fillCur(st, txn, q, &f, &env, rs, mut &cur) }
+                    None {}
+                }
+            }
+            let env2 = Env{cols: &q.cols, row: &r, aggs: &noAggs, params: params, subs: &m.subs, cur: &cur}
+            try addToGroup(sel, mut &gs, &r, &env2, mut &held, room, rs0max)
+        }
+        var firsts = replace(mut &gs.firsts, [])
+        var accs = replace(mut &gs.accs, [])
         if len(firsts) == 0 && len(sel.groupBy) == 0 {
             append(mut &firsts, [])         // no rows, no GROUP BY: one group, empty
             append(mut &accs, newAccs(len(sel.specs)))

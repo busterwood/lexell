@@ -393,7 +393,7 @@ Built on 2026-11-09 on branch `lexdb`, about 6,300 lines in
 (cache, trees, transactions, log, checkpoints, recovery, snapshots),
 `lexdb_sql` (lexer, parser), `lexdb_exec` (catalog, rows, keys, planner,
 statements, sessions), `lexdb_wire` (protocol 3.0) and `lexdb` (the
-server). Tests: `python3 lexell/tests/lexdb.py` (33 programs in
+server). Tests: `python3 lexell/tests/lexdb.py` (34 programs in
 `tests/lexdb/run`, under `LXL_CHECK=1`).
 
     lexell/compiler/out/lxlc lexell/cmd/lexdb.lxl -o lexdb
@@ -518,7 +518,10 @@ is the comparison to make.
      FROM`, the way to join a CTE into an UPDATE (now only through
      subqueries);
    - built: a correlated subquery's value as a lookup's key (9.23);
-   - correlated subqueries in GROUP BY and in aggregates' arguments;
+   - built: correlated subqueries in GROUP BY and in aggregates'
+     arguments (9.24); not done: an aggregate inside a correlated
+     subquery's reference to its parent (`HAVING (SELECT ... WHERE c.id =
+     min(o.cust))`), which PostgreSQL evaluates in the parent;
    - ORDER BY inside an aggregate (`string_agg(x, ',' ORDER BY x)`);
    - hashing a correlated scalar subquery with an aggregate (a count per
      customer) as a grouped run.
@@ -1560,4 +1563,48 @@ Caught, each put back:
 - such a level hashed once;
 - the values not computed before the scan;
 - the level's own columns allowed in the key.
+
+### 9.24 Correlated subqueries in GROUP BY and in aggregates
+
+`sum((SELECT count(*) FROM o WHERE o.cust = c.id))` and `GROUP BY (SELECT
+grp FROM c WHERE c.id = o.cust)` were refused: grouping happens in
+`runQuery`'s row callback, and a correlated subquery cannot run there
+(the run and the transaction are held by the read).
+
+- **Rows kept, then grouped.** When a GROUP BY key, an aggregate's
+  argument or its FILTER holds a correlated subquery (`groupCorr`), the
+  callback only keeps the rows, counted against `max_statement_mem`.
+  Then each row's subqueries run (`fillCur`, memoized by their
+  references' values) and it is grouped (`addToGroup`, the grouping
+  shared with the usual path). Without such a subquery nothing changes.
+- **A scalar subquery written twice is one.** `SELECT (subquery), count(*)
+  ... GROUP BY (subquery)` needs the two to match, as PostgreSQL matches
+  them by their text. The parser now gives a scalar subquery the same
+  number as an earlier one with the same tokens at the same level
+  (`Stmt.src`). It also runs once per row instead of twice. Only scalar
+  subqueries: a FROM subquery's rows are moved into its level, so two
+  levels cannot share one.
+
+`exec_groupcorr` compares each result with the same answer written with a
+join:
+
+- sum of a correlated count, max per group, count(DISTINCT ...);
+- GROUP BY a correlated subquery, and HAVING on it;
+- FILTER (WHERE EXISTS correlated);
+- MIN with a correlated argument;
+- two subqueries differing in one token kept apart; the same text twice
+  in FROM still two levels;
+- the kept rows over `max_statement_mem` (256 kB: an error; no limit:
+  the answer);
+- EXPLAIN ANALYZE's runs: 1,000, one per distinct reference.
+
+`exec_sub`'s refused sum of a correlated count now gives its answer.
+
+Caught, each put back:
+
+- the rows not kept (the old refusal's case);
+- the kept rows not charged;
+- FILTER's values not computed;
+- no merging;
+- merging regardless of the text.
 

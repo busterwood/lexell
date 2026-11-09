@@ -1,0 +1,118 @@
+// lexdb_exec: correlated subqueries in GROUP BY keys and in aggregates'
+// arguments and FILTERs (design/lexdb.md 9.24). The rows are kept while
+// read, then each row's subqueries run (memoized) and it is grouped. Each
+// result is compared with the same answer written with a join:
+// - sum of a correlated count; max of one per group; count(DISTINCT one);
+// - GROUP BY a correlated scalar subquery;
+// - FILTER (WHERE EXISTS correlated);
+// - HAVING on the grouped subquery (written again: the same subquery);
+// - MIN in index order with a correlated argument;
+// - subqueries differing in one token stay two; the same text twice in
+//   FROM stays two levels;
+// - the kept rows count against max_statement_mem;
+// - EXPLAIN ANALYZE: one run per distinct reference, the rest memoized
+//   (10 more: each group's output reads it again).
+// expect: sum of counts: 10000 same
+// expect: max per group: 0|10 1|10 2|10 3|10 4|10 5|10 6|10 7|10 8|10 9|10 same
+// expect: count distinct: 1 same
+// expect: group by subquery: 0|1000 1|1000 2|1000 3|1000 4|1000 5|1000 6|1000 7|1000 8|1000 9|1000 same
+// expect: filter: 500 same
+// expect: having: 3|1000 same
+// expect: min: 1 same
+// expect: not merged: 10|1, same text in FROM: 9
+// expect: memory: 53200, without the limit 1000000
+// expect: runs: subquery 1 (scalar): per row, on o.cust (runs 1000, from cache 9010)
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            var out: []str = []
+            for r in rs {
+                for row in r.rows {
+                    var vs: []str = []
+                    for v in row { append(mut &vs, lexdb_exec.text(&v)) }
+                    append(mut &out, strings.join(&vs, "|"))
+                }
+            }
+            return strings.join(&out, " ")
+        }
+        Err(e) { return e.state }
+    }
+}
+
+fn one(s: mut &lexdb_exec.Session, sql: &str) {
+    match s.exec(sql) {
+        Ok(_) {}
+        Err(e) { println(sql + ": " + e.state + " " + e.msg) }
+    }
+}
+
+fn cmp(s: mut &lexdb_exec.Session, label: &str, sql: &str, other: &str) {
+    let a = q(s, sql)
+    let b = q(s, other)
+    println(label + ": " + a + (if a == b { " same" } else { " DIFFERENT: " + b }))
+}
+
+// EXPLAIN ANALYZE's line starting with prefix
+fn line(s: mut &lexdb_exec.Session, sql: &str, prefix: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            for row in rs[0].rows {
+                let l = strings.trim(lexdb_exec.text(&row[0]))
+                if strings.startsWith(l, prefix) { return l }
+            }
+            return "none"
+        }
+        Err(e) { return e.state }
+    }
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(41), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 1024 * 1024, ckptBytes: 1024 * 1024, snapNodes: 100000}, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        one(mut &s, &"create table c (id int primary key, grp int)")
+        one(mut &s, &"create table o (id int primary key, cust int)")
+        one(mut &s, &"create index o_cust on o (cust)")
+        var vals: []str = []
+        for i in 0..1000 { append(mut &vals, "(" + i.toStr() + ", " + (i % 10).toStr() + ")") }
+        one(mut &s, &("insert into c values " + strings.join(&vals, ", ")))
+        for b in 0..10 {
+            var ov: []str = []
+            for j in 0..1000 {
+                let i = b * 1000 + j
+                append(mut &ov, "(" + i.toStr() + ", " + (i % 1000).toStr() + ")")
+            }
+            one(mut &s, &("insert into o values " + strings.join(&ov, ", ")))
+        }
+
+        cmp(mut &s, &"sum of counts", &"select sum((select count(*) from o where o.cust = c.id)) from c",
+            &"select count(*) from c join o on o.cust = c.id")
+        cmp(mut &s, &"max per group", &"select grp, max((select count(*) from o where o.cust = c.id)) from c group by grp order by grp",
+            &"select grp, max(n) from (select c.grp, count(o.id) as n from c left join o on o.cust = c.id group by c.id, c.grp) t group by grp order by grp")
+        cmp(mut &s, &"count distinct", &"select count(distinct (select count(*) from o where o.cust = c.id)) from c",
+            &"select count(distinct n) from (select count(o.id) as n from c left join o on o.cust = c.id group by c.id) t")
+        cmp(mut &s, &"group by subquery", &"select (select grp from c where c.id = o.cust), count(*) from o group by (select grp from c where c.id = o.cust) order by 1",
+            &"select c.grp, count(*) from o join c on c.id = o.cust group by c.grp order by 1")
+        cmp(mut &s, &"filter", &"select count(*) filter (where exists (select 1 from o where o.cust = c.id and o.id < 500)) from c",
+            &"select count(*) from c where exists (select 1 from o where o.cust = c.id and o.id < 500)")
+        cmp(mut &s, &"having", &"select (select grp from c where c.id = o.cust), count(*) from o group by (select grp from c where c.id = o.cust) having (select grp from c where c.id = o.cust) = 3",
+            &"select c.grp, count(*) from o join c on c.id = o.cust group by c.grp having c.grp = 3")
+        cmp(mut &s, &"min", &"select min((select count(*) from o where o.cust = c.id and o.id < 1001)) from c where c.id < 5",
+            &"select min(n) from (select count(o.id) as n from c left join o on o.cust = c.id and o.id < 1001 where c.id < 5 group by c.id) t")
+        println("not merged: " + q(mut &s, &"select (select count(*) from o where o.cust = c.id), (select count(*) from o where o.cust = c.id and o.id < 1000) from c where id = 1") +
+                ", same text in FROM: " + q(mut &s, &"select count(*) from (select id from c where id < 3) a, (select id from c where id < 3) b"))
+        one(mut &s, &"set max_statement_mem = '256kB'")
+        // 10 distinct references: the memo is small, the 10,000 kept rows are not
+        let few = "select sum((select count(*) from c where c.grp = o.cust % 10)) from o"
+        let limited = q(mut &s, &few)
+        one(mut &s, &"reset max_statement_mem")
+        println("memory: " + limited + ", without the limit " + q(mut &s, &few))
+        println("runs: " + line(mut &s, &"explain analyze select (select grp from c where c.id = o.cust), count(*) from o group by (select grp from c where c.id = o.cust)", &"subquery 1"))
+        return 0
+    }).unwrap()
+}
