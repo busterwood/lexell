@@ -1,0 +1,219 @@
+// pool.Pool over a scripted connection type (no server): eight tasks share a
+// pool of two, never more than two open; a waiter whose deadline passes
+// leaves the queue with waitFailed's error; an idle connection is handed out
+// again; one that release() refuses is closed and its place reopened; one
+// whose reuse() fails is closed and a new one opened in its place; a failed
+// open gives its place back, also to a task already waiting for it; every
+// connection is closed when the pools are gone.
+// expect: results 0 1 2 3 4 5 6 7
+// expect: most open at once: 2, opened 2
+// expect: after: open 2, idle 2, waiting 0
+// expect: waiter timeout: 1021 pool: timeout while waiting for a connection
+// expect: after timeout: open 1, idle 1, waiting 0
+// expect: same connection again: true
+// expect: refused by release: closed true, a new one true
+// expect: reuse failed: closed true, a new one true
+// expect: failed open: 7 open refused, open 0
+// expect: then: ok, open 1
+// expect: opener: 7 open refused
+// expect: waiter: ok, open 1, waiting 0
+// expect: live connections 0
+import "pool"
+import "task"
+
+type Error = value record { code: int; msg: str }
+
+fn (e: &Error) toStr(): str { return e.code.toStr() + " " + e.msg }
+
+// What the test steers and counts.
+type Ctl = record {
+    nextId: int
+    failOpens: int            // the next n opens fail
+    openMs: int               // how long an open parks
+    live: int
+    gone: []int
+}
+
+type Cfg = record { ctl: task.Shared[Ctl] }
+
+type Fake = record {
+    id: int
+    refuse: bool              // release() says no
+    badReuse: bool            // reuse() fails
+    ctl: task.Shared[Ctl]
+}
+
+fn (c: mut &Fake) drop() {
+    let id = c.id
+    c.ctl.with(fn(s: mut &Ctl) {
+        s.live -= 1
+        append(mut &s.gone, id)
+    })
+}
+
+fn (Fake) open(cfg: &Cfg, w: Where): Result[Fake, Error] {
+    var ms = 0
+    cfg.ctl.with(fn(s: mut &Ctl) { ms = s.openMs })
+    if ms > 0 {
+        match task.sleep(ms) {
+            Ok(_) {}
+            Err(e) { return Err(Fake.waitFailed(e)) }
+        }
+    }
+    var fail = false
+    var id = 0
+    cfg.ctl.with(fn(s: mut &Ctl) {
+        if s.failOpens > 0 {
+            s.failOpens -= 1
+            fail = true
+        } else {
+            id = s.nextId
+            s.nextId += 1
+            s.live += 1
+        }
+    })
+    if fail { return Err(Error{code: 7, msg: "open refused"}) }
+    return Ok(Fake{id: id, refuse: false, badReuse: false, ctl: cfg.ctl})
+}
+
+fn (Fake) waitFailed(why: task.Cancelled): Error {
+    let code = if why == task.Cancelled.Timeout { 1021 } else { 1020 }
+    return Error{code: code, msg: "pool: " + why.toStr() + " while waiting for a connection"}
+}
+
+fn (c: mut &Fake) release(): bool { return !c.refuse }
+
+fn (c: mut &Fake) reuse(w: Where): Result[Unit, Error] {
+    if c.badReuse { return Err(Error{code: 8, msg: "gone"}) }
+    return Ok(Unit{})
+}
+
+type Pool = pool.Pool[Fake, Cfg, Error]
+type Lease = pool.Lease[Fake, Cfg, Error]
+
+fn newPool(ctl: task.Shared[Ctl], size: int): Pool { return pool.newPool[Fake, Cfg, Error](Cfg{ctl: ctl}, size) }
+
+fn stats(p: &Pool): str {
+    let s = p.stats()
+    return "open " + s.open.toStr() + ", idle " + s.idle.toStr() + ", waiting " + s.waiting.toStr()
+}
+
+fn wasClosed(ctl: &task.Shared[Ctl], id: int): bool {
+    var r = false
+    ctl.with(fn(s: mut &Ctl) { for x in s.gone { if x == id { r = true } } })
+    return r
+}
+
+fn setCtl(ctl: &task.Shared[Ctl], failOpens: int, openMs: int) {
+    ctl.with(fn(s: mut &Ctl) {
+        s.failOpens = failOpens
+        s.openMs = openMs
+    })
+}
+
+type Work = value record { pool: Pool; k: int; peak: task.Shared[int] }
+
+fn work(w: Work): int {
+    var l = w.pool.acquire().unwrap()
+    let st = w.pool.stats()
+    w.peak.with(fn(p: mut &int) { if st.open > p { p = st.open } })
+    task.sleep(10).unwrap()
+    return w.k
+}
+
+type Hold = value record { pool: Pool; ms: int }
+
+fn hold(h: Hold): int {
+    var l = h.pool.acquire().unwrap()
+    task.sleep(h.ms).unwrap()
+    return 0
+}
+
+type Try = value record { pool: Pool; delay: int }
+
+fn tryAcquire(t: Try): str {
+    if t.delay > 0 { task.sleep(t.delay).unwrap() }
+    match t.pool.acquire() {
+        Ok(_) { return "ok" }
+        Err(e) { return e.toStr() }
+    }
+}
+
+fn main() {
+    let ctl = task.shared(Ctl{nextId: 1, failOpens: 0, openMs: 0, live: 0, gone: []})
+    run(ctl)
+    ctl.with(fn(s: mut &Ctl) { println("live connections " + s.live.toStr()) })
+}
+
+fn run(ctl: task.Shared[Ctl]) {
+    let p = newPool(ctl, 2)
+    let peak = task.shared(0)
+    task.scope(fn(s: mut &task.Scope) {
+        var fs: []task.Future[int] = []
+        for k in 0..8 { append(mut &fs, s.start(work, Work{pool: p, k: k, peak: peak})) }
+        var line = "results"
+        for r in task.all(fs).unwrap() { line = line + " " + r.toStr() }
+        println(line)
+    })
+    var opened = 0
+    ctl.with(fn(s: mut &Ctl) { opened = s.nextId - 1 })
+    peak.with(fn(n: mut &int) { println("most open at once: " + n.toStr() + ", opened " + opened.toStr()) })
+    println("after: " + stats(&p))
+
+    let one = newPool(ctl, 1)
+    task.scope(fn(s: mut &task.Scope) {
+        let h = s.start(hold, Hold{pool: one, ms: 200})
+        task.sleep(20).unwrap()
+        match task.within(50, fn(): Result[Lease, Error] { return one.acquire() }) {
+            Ok(_) { println("waiter timeout: got one?") }
+            Err(e) { println("waiter timeout: " + e.toStr()) }
+        }
+        h.wait().unwrap()
+    })
+    println("after timeout: " + stats(&one))
+
+    var first = 0
+    {
+        var l = one.acquire().unwrap()
+        first = l.conn().id
+    }
+    {
+        var l = one.acquire().unwrap()
+        println("same connection again: " + (l.conn().id == first).toStr())
+        l.conn().refuse = true
+    }
+    var second = 0
+    {
+        var l = one.acquire().unwrap()
+        second = l.conn().id
+        println("refused by release: closed " + wasClosed(&ctl, first).toStr() + ", a new one " + (second != first).toStr())
+        l.conn().badReuse = true
+    }
+    {
+        var l = one.acquire().unwrap()
+        println("reuse failed: closed " + wasClosed(&ctl, second).toStr() + ", a new one " + (l.conn().id != second).toStr())
+    }
+
+    let fresh = newPool(ctl, 1)
+    setCtl(&ctl, 1, 0)
+    match fresh.acquire() {
+        Ok(_) { println("failed open: got one?") }
+        Err(e) { println("failed open: " + e.toStr() + ", open " + fresh.stats().open.toStr()) }
+    }
+    {
+        let l = fresh.acquire()
+        println("then: " + (if l.isOk() { "ok" } else { "error" }) + ", open " + fresh.stats().open.toStr())
+    }
+
+    // The opener parks in a failing open; a second task queues for the only
+    // place meanwhile and gets it when the open fails.
+    let race = newPool(ctl, 1)
+    setCtl(&ctl, 1, 30)
+    task.scope(fn(s: mut &task.Scope) {
+        let a = s.start(tryAcquire, Try{pool: race, delay: 0})
+        let b = s.start(tryAcquire, Try{pool: race, delay: 5})
+        println("opener: " + a.wait().unwrap())
+        println("waiter: " + b.wait().unwrap() + ", open " + race.stats().open.toStr() + ", waiting " + race.stats().waiting.toStr())
+    })
+    setCtl(&ctl, 0, 0)
+}

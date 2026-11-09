@@ -43,12 +43,20 @@ default is `host=/var/run/postgresql dbname=postgres`. Without a pool size
 
 ## The database code
 
-**Startup.** The second argument is the pool size. No connection is opened
-until a request needs one.
+**Startup.** The second argument is the pool size. The connection string is
+checked here, but no connection is opened until a request needs one.
 
 ```lxl
-let db: Option[postgres.Pool] =
-    if size > 0 { Some(postgres.newPool(os.envOr("LXL_PG_DSN", "host=/var/run/postgresql dbname=postgres"), size)) } else { None }
+var db: Option[postgres.Pool] = None
+if size > 0 {
+    match postgres.newPool(os.envOr("LXL_PG_DSN", "host=/var/run/postgresql dbname=postgres"), size) {
+        Ok(p) { db = Some(p) }
+        Err(e) {
+            eprintln("httpd: LXL_PG_DSN: " + e.toStr())
+            os.quit(1)
+        }
+    }
+}
 ```
 
 **The route.** Every handler gets the application value (here `App`, which
@@ -86,8 +94,8 @@ that count plus one.
 ```lxl
 // One query on a connection of the pool, given back when the lease drops.
 fn query(pool: &postgres.Pool, n: int): Result[int, postgres.Error] {
-    let c = try pool.acquire()
-    let rows = try c.query("SELECT $1::int8 + 1", &[postgres.Value.Int(n)])
+    var c = try pool.acquire()
+    let rows = try c.conn().query("SELECT $1::int8 + 1", &[postgres.Value.Int(n)])
     return rows.int(0, 0)
 }
 ```

@@ -1,0 +1,188 @@
+// A pool of connections for the tasks of a program, shared by the clients
+// of the library (postgres, sqlserver, oracle, redis): design/pool.md.
+//
+// A connection type joins by satisfying Pooled: how it opens from its
+// configuration, the error acquire gives when its wait ends, whether it can
+// go back to the pool when its lease is dropped (no I/O), and what it does
+// before an idle one is handed out again (in the acquiring task: may do
+// I/O). Each client aliases the instance, so programs see `postgres.Pool`
+// and `postgres.Lease`:
+//
+//     pub type Pool = pool.Pool[Conn, Settings, Error]
+//     pub type Lease = pool.Lease[Conn, Settings, Error]
+//
+// acquire takes an idle connection, opens a new one while fewer than size
+// are open, or else parks until another task gives one back, first come
+// first served. A Lease gives its connection back when it is dropped, if
+// release() says it can go back; otherwise the connection is closed and its
+// place goes to the next waiter, which opens a new one. An idle connection
+// whose reuse() fails is closed the same way, and acquire opens a new one in
+// its place. A Pool is a counted handle (task.Shared): copies reach the same
+// pool, and the connections close when the last copy and the last lease are
+// gone.
+//
+//     let p = try postgres.newPool("host=/var/run/postgresql dbname=app", 16)
+//     // in any task:
+//     var l = try p.acquire()
+//     let rows = try l.conn().query("SELECT name FROM users WHERE id = $1", &[Value.Int(id)])
+
+import "task"
+
+// What a connection type gives the pool. Cfg is what it opens from, E its
+// error type.
+pub type Pooled[Cfg, E] = interface {
+    // Opens a connection (the client's connect).
+    fn open(cfg: &Cfg, w: Where): Result[Self, E]
+    // acquire's error when the task's deadline passes (Timeout) or it is
+    // cancelled while it waits for a connection.
+    fn waitFailed(why: task.Cancelled): E
+    // Called when a lease is dropped, maybe in a cancelled task: no I/O.
+    // true keeps the connection for the next acquire; false closes it.
+    fn (mut &Self) release(): bool
+    // Called before an idle connection is handed out, in the acquiring task.
+    // Err closes it, and acquire opens a new one in its place.
+    fn (mut &Self) reuse(w: Where): Result[Unit, E]
+}
+
+pub type Pool[C: Pooled[Cfg, E], Cfg, E] = value record {
+    sh: task.Shared[PoolState[C]]
+    cfg: task.Frozen[Cfg]     // read outside with: open parks
+}
+
+type PoolState[C] = record {
+    size: int
+    open: int                 // connections open or being opened, leased or idle
+    idle: []C
+    waiters: []Waiter[C]      // first come first served
+    nextId: int
+}
+
+// A task parked in acquire. Its promise brings a connection, or None: a
+// place to open one in.
+type Waiter[C] = record { id: int; p: task.Promise[Option[C]] }
+
+// A connection taken from a pool, given back when it is dropped.
+pub type Lease[C: Pooled[Cfg, E], Cfg, E] = record {
+    cs: []C                   // the leased connection: one element, none once given back
+    sh: task.Shared[PoolState[C]]
+}
+
+// What a pool holds: connections open (leased, idle or being opened), idle,
+// and tasks waiting for one.
+pub type PoolStats = value record { pub open: int; pub idle: int; pub waiting: int }
+
+// A pool of at most size connections (at least 1), opened from cfg as they
+// are needed.
+pub fn newPool[C: Pooled[Cfg, E], Cfg, E](cfg: Cfg, size: int): Pool[C, Cfg, E] {
+    let n = if size < 1 { 1 } else { size }
+    return Pool[C, Cfg, E]{sh: task.shared(PoolState[C]{size: n, open: 0, idle: [], waiters: [], nextId: 0}),
+                           cfg: task.freeze(cfg)}
+}
+
+pub fn (p: &Pool[C, Cfg, E]) stats(): PoolStats {
+    var r = PoolStats{open: 0, idle: 0, waiting: 0}
+    p.sh.with(fn(st: mut &PoolState[C]) { r = PoolStats{open: st.open, idle: len(st.idle), waiting: len(st.waiters)} })
+    return r
+}
+
+// A connection of the pool; parks while all size are leased. Err when a new
+// connection fails (open's error), or when the task's deadline passes or it
+// is cancelled while it waits (waitFailed's error).
+pub fn (p: &Pool[C, Cfg, E]) acquire(w: Where): Result[Lease[C, Cfg, E], E] {
+    var got: Option[C] = None
+    var wait: Option[task.Future[Option[C]]] = None
+    var id = 0
+    p.sh.with(fn(st: mut &PoolState[C]) {
+        if len(st.idle) > 0 {
+            got = Some(pop(mut &st.idle))
+        } else if st.open < st.size {
+            st.open += 1                  // a place: opened below
+        } else {
+            id = st.nextId
+            st.nextId += 1
+            let task.Handoff{promise: pr, future: f} = task.promise[Option[C]]()
+            append(mut &st.waiters, Waiter[C]{id: id, p: pr})
+            wait = Some(f)
+        }
+    })
+    match replace(mut &wait, None) {
+        Some(f) {
+            match f.wait(w) {
+                Ok(v) { got = v }         // a connection, or None: a place
+                Err(e) {
+                    // Still queued: leave the queue. Already served: what came was dropped
+                    // with the future (a connection closed, or a place), so its place goes on.
+                    var served = true
+                    p.sh.with(fn(st: mut &PoolState[C]) {
+                        for i in 0..len(st.waiters) {
+                            if st.waiters[i].id == id {
+                                for j in i..len(st.waiters) - 1 { swap(mut &st.waiters, j, j + 1) }
+                                let gone = pop(mut &st.waiters)
+                                served = false
+                                break
+                            }
+                        }
+                    })
+                    if served { handOn(&p.sh, None) }
+                    return Err(C.waitFailed(e))
+                }
+            }
+        }
+        None {}
+    }
+    match replace(mut &got, None) {
+        Some(c) {
+            var c2 = c
+            match c2.reuse(w) {
+                Ok(_) { return Ok(Lease[C, Cfg, E]{cs: [c2], sh: p.sh}) }
+                Err(_) {}                 // closed here (dropped); its place is reused
+            }
+        }
+        None {}
+    }
+    match p.cfg.read(fn(cfg: &Cfg): Result[C, E] { return C.open(cfg, w) }) {
+        Ok(c) { return Ok(Lease[C, Cfg, E]{cs: [c], sh: p.sh}) }
+        Err(e) {
+            handOn(&p.sh, None)
+            return Err(e)
+        }
+    }
+}
+
+// The leased connection, for the client's calls: `l.conn().query(...)`.
+pub fn (l: mut &Lease[C, Cfg, E]) conn(): mut &C { return mut &l.cs[0] }
+
+// Gives a connection (or, for None, a place to open one) to the first waiter;
+// with none, keeps the connection idle (or frees the place). The promise is
+// completed outside with: if its future is gone, what it carries is dropped
+// there, and that may come back here.
+fn handOn[C](sh: &task.Shared[PoolState[C]], var c: Option[C]) {
+    var p: Option[task.Promise[Option[C]]] = None
+    sh.with(fn(st: mut &PoolState[C]) {
+        if len(st.waiters) > 0 {
+            for j in 0..len(st.waiters) - 1 { swap(mut &st.waiters, j, j + 1) }
+            let Waiter{id: _, p: pr} = pop(mut &st.waiters)
+            p = Some(pr)
+        } else {
+            match replace(mut &c, None) {
+                Some(conn) { append(mut &st.idle, conn) }
+                None { st.open -= 1 }
+            }
+        }
+    })
+    match replace(mut &p, None) {
+        Some(pr) { pr.complete(replace(mut &c, None)) }
+        None {}
+    }
+}
+
+fn (l: mut &Lease[C, Cfg, E]) drop() {
+    if len(l.cs) == 0 { return }
+    var c = pop(mut &l.cs)
+    if c.release() {
+        handOn(&l.sh, Some(c))
+    } else {
+        { let bad = c }                   // closed now, before its place goes on
+        handOn(&l.sh, None)
+    }
+}

@@ -48,6 +48,7 @@ import "sqldialect"
 import "sqlrows"
 import "pgwire"
 import "task"
+import "pool"
 import "math"
 
 pub type Value = sqldialect.Value
@@ -100,9 +101,7 @@ fn (c: mut &Conn) drop() {
 // end the wait.
 pub fn connect(conninfo: str, w: Where): Result[Conn, Error] {
     let cfg = try pgwire.parseConfig(conninfo)
-    let s = try pgwire.connect(&cfg, w)
-    OPEN += 1
-    return Ok(Conn{s: s})
+    return Conn.open(&cfg, w)
 }
 
 // Closes the connection (dropping it does the same).
@@ -318,187 +317,47 @@ pub fn (r: &Rows) value(row: int, col: int): Result[Value, Error] {
 // -------------------------------------------------------------------- pools
 
 // A pool of at most `size` connections to one server, for the tasks of a
-// program (stage C1c). acquire takes an idle connection, opens a new one
-// while fewer than size are open, or else parks until another task gives one
-// back, first come first served. A Lease gives the connection back when it is
-// dropped, unless it is no longer idle (broken, in a transaction, a query
-// abandoned): that one is closed, and its place goes to the next waiter,
-// which opens a new connection. A Pool is a counted handle (task.Shared):
-// copies reach the same pool, and the connections close when the last copy
-// and the last lease are gone.
+// program: the shared pool of lib/pool.lxl (design/pool.md) over Conn.
+// acquire takes an idle connection, opens a new one while fewer than size
+// are open, or else parks until another task gives one back, first come
+// first served. A Lease gives the connection back when it is dropped, unless
+// it is no longer idle (broken, in a transaction, a query abandoned): that
+// one is closed, and its place goes to the next waiter, which opens a new
+// connection. A Pool is a counted handle: copies reach the same pool, and
+// the connections close when the last copy and the last lease are gone.
 //
-//     let pool = postgres.newPool("host=/var/run/postgresql dbname=app", 16)
+//     let pool = try postgres.newPool("host=/var/run/postgresql dbname=app", 16)
 //     // in any task:
-//     let c = try pool.acquire()
-//     let rows = try c.query("SELECT name FROM users WHERE id = $1", &[Value.Int(id)])
-pub type Pool = value record { sh: task.Shared[PoolState] }
+//     var l = try pool.acquire()
+//     let rows = try l.conn().query("SELECT name FROM users WHERE id = $1", &[Value.Int(id)])
+pub type Pool = pool.Pool[Conn, pgwire.Config, Error]
+pub type Lease = pool.Lease[Conn, pgwire.Config, Error]
+pub type PoolStats = pool.PoolStats
 
-type PoolState = record {
-    conninfo: str
-    size: int
-    open: int                 // connections open or being opened, leased or idle
-    idle: []Conn
-    waiters: []Waiter         // first come first served
-    nextId: int
+// A pool over a libpq connection string, parsed now: one that cannot be
+// parsed is E_INPUT here, not at the first acquire.
+pub fn newPool(conninfo: str, size: int): Result[Pool, Error] {
+    let cfg = try pgwire.parseConfig(conninfo)
+    return Ok(pool.newPool[Conn, pgwire.Config, Error](cfg, size))
 }
 
-// A task parked in acquire. Its promise brings a connection, or None: a
-// place to open one in.
-type Waiter = record { id: int; p: task.Promise[Option[Conn]] }
-
-// A connection taken from a pool, given back when it is dropped.
-pub type Lease = record {
-    cs: []Conn                // the leased connection: one element, none once given back
-    pool: task.Shared[PoolState]
+// pool.Pooled: how the pool opens, judges and reuses a connection.
+pub fn (Conn) open(cfg: &pgwire.Config, w: Where): Result[Conn, Error] {
+    let s = try pgwire.connect(cfg, w)
+    OPEN += 1
+    return Ok(Conn{s: s})
 }
 
-// What a pool holds: connections open (leased, idle or being opened), idle,
-// and tasks waiting for one.
-pub type PoolStats = value record { pub open: int; pub idle: int; pub waiting: int }
-
-pub fn newPool(conninfo: str, size: int): Pool {
-    let n = if size < 1 { 1 } else { size }
-    return Pool{sh: task.shared(PoolState{conninfo: conninfo, size: n, open: 0, idle: [], waiters: [], nextId: 0})}
+pub fn (Conn) waitFailed(why: task.Cancelled): Error {
+    return sqldialect.dbError(if why == task.Cancelled.Timeout { sqldialect.E_TIMEOUT } else { sqldialect.E_CANCELLED },
+        "pool: " + why.toStr() + " while waiting for a connection")
 }
 
-pub fn (p: &Pool) stats(): PoolStats {
-    var r = PoolStats{open: 0, idle: 0, waiting: 0}
-    p.sh.with(fn(st: mut &PoolState) { r = PoolStats{open: st.open, idle: len(st.idle), waiting: len(st.waiters)} })
-    return r
-}
+pub fn (c: mut &Conn) release(): bool { return c.idle() }
 
-// A connection of the pool; parks while all size are leased. Err when a new
-// connection fails (connect's errors), or when the task is cancelled
-// (E_CANCELLED) or its deadline passes (E_TIMEOUT) while it waits.
-pub fn (p: &Pool) acquire(w: Where): Result[Lease, Error] {
-    var got: Option[Conn] = None
-    var place = false
-    var wait: Option[task.Future[Option[Conn]]] = None
-    var id = 0
-    var conninfo = ""
-    p.sh.with(fn(st: mut &PoolState) {
-        conninfo = st.conninfo
-        if len(st.idle) > 0 {
-            got = Some(pop(mut &st.idle))
-        } else if st.open < st.size {
-            st.open += 1
-            place = true
-        } else {
-            id = st.nextId
-            st.nextId += 1
-            let task.Handoff{promise: pr, future: f} = task.promise[Option[Conn]]()
-            append(mut &st.waiters, Waiter{id: id, p: pr})
-            wait = Some(f)
-        }
-    })
-    match replace(mut &wait, None) {
-        Some(f) {
-            match f.wait(w) {
-                Ok(v) {
-                    got = v
-                    place = got.isNone()
-                }
-                Err(e) {
-                    // Still queued: leave the queue. Already served: what came was dropped
-                    // with the future (a connection closed, or a place), so its place goes on.
-                    var served = true
-                    p.sh.with(fn(st: mut &PoolState) {
-                        for i in 0..len(st.waiters) {
-                            if st.waiters[i].id == id {
-                                for j in i..len(st.waiters) - 1 { swap(mut &st.waiters, j, j + 1) }
-                                let gone = pop(mut &st.waiters)
-                                served = false
-                                break
-                            }
-                        }
-                    })
-                    if served { handOn(&p.sh, None) }
-                    return Err(sqldialect.dbError(if e == task.Cancelled.Timeout { sqldialect.E_TIMEOUT } else { sqldialect.E_CANCELLED },
-                        "pool: " + e.toStr() + " while waiting for a connection"))
-                }
-            }
-        }
-        None {}
-    }
-    match replace(mut &got, None) {
-        Some(c) {
-            if c.idle() { return Ok(Lease{cs: [c], pool: p.sh}) }
-            place = true                  // went bad while idle: closed here, its place reused
-        }
-        None {}
-    }
-    match connect(conninfo, w) {
-        Ok(c) { return Ok(Lease{cs: [c], pool: p.sh}) }
-        Err(e) {
-            handOn(&p.sh, None)
-            return Err(e)
-        }
-    }
-}
-
-// Gives a connection (or, for None, a place to open one) to the first waiter;
-// with none, keeps the connection idle (or frees the place). The promise is
-// completed outside with: if its future is gone, what it carries is dropped
-// there, and that may come back here.
-fn handOn(sh: &task.Shared[PoolState], var c: Option[Conn]) {
-    var p: Option[task.Promise[Option[Conn]]] = None
-    sh.with(fn(st: mut &PoolState) {
-        if len(st.waiters) > 0 {
-            for j in 0..len(st.waiters) - 1 { swap(mut &st.waiters, j, j + 1) }
-            let Waiter{id: _, p: pr} = pop(mut &st.waiters)
-            p = Some(pr)
-        } else {
-            match replace(mut &c, None) {
-                Some(conn) { append(mut &st.idle, conn) }
-                None { st.open -= 1 }
-            }
-        }
-    })
-    match replace(mut &p, None) {
-        Some(pr) { pr.complete(replace(mut &c, None)) }
-        None {}
-    }
-}
-
-fn (l: mut &Lease) drop() {
-    if len(l.cs) == 0 { return }
-    let c = pop(mut &l.cs)
-    if c.idle() {
-        handOn(&l.pool, Some(c))
-    } else {
-        c.close()                          // closed now; its place goes on
-        handOn(&l.pool, None)
-    }
-}
-
-fn gone(): Error { return sqldialect.inputError("the lease is gone") }
-
-pub fn (l: mut &Lease) exec(script: str, w: Where): Result[Unit, Error] {
-    if len(l.cs) == 0 { return Err(gone()) }
-    return l.cs[0].exec(script, w)
-}
-
-pub fn (l: mut &Lease) query(sql: str, args: &[Value], w: Where): Result[Rows, Error] {
-    if len(l.cs) == 0 { return Err(gone()) }
-    return l.cs[0].query(sql, args, w)
-}
-
-pub fn (l: mut &Lease) querySql(q: &Sql, w: Where): Result[Rows, Error] {
-    if len(l.cs) == 0 { return Err(gone()) }
-    return l.cs[0].querySql(q, w)
-}
-
-// A stream over the leased connection (Conn.stream); the lease is held
-// while the stream is in scope.
-pub fn (l: mut &Lease) stream[B, T](sql: str, args: []Value, bind: fn(&Columns): Result[B, Error],
-                                    read: fn(&B, &RowView): Result[T, Error], w: Where): Result[Stream[B, T], Error] {
-    if len(l.cs) == 0 { return Err(gone()) }
-    return l.cs[0].stream(sql, args, bind, read, w)
-}
-
-pub fn (l: mut &Lease) transaction[T](body: &fn(mut &Conn): Result[T, Error], w: Where): Result[T, Error] {
-    if len(l.cs) == 0 { return Err(gone()) }
-    return l.cs[0].transaction(body, w)
+pub fn (c: mut &Conn) reuse(w: Where): Result[Unit, Error] {
+    if c.idle() { return Ok(Unit{}) }
+    return Err(sqldialect.dbError(sqldialect.E_IO, "pool: the idle connection went bad"))
 }
 
 // ------------------------------------------------------------------ streams

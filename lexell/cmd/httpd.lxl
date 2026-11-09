@@ -99,7 +99,7 @@ fn shutdown(app: &App, rq: mut &http.Request, w: mut &http.Response): Result[Uni
 // One query on a connection of the pool, given back when the lease drops.
 fn query(pool: &postgres.Pool, n: int): Result[int, postgres.Error] {
     var c = try pool.acquire()
-    let rows = try c.query("SELECT $1::int8 + 1", &[postgres.Value.Int(n)])
+    let rows = try c.conn().query("SELECT $1::int8 + 1", &[postgres.Value.Int(n)])
     return rows.int(0, 0)
 }
 
@@ -116,8 +116,16 @@ fn routes(): http.Router[App] {
 
 // Serves on ln until /shutdown, SIGTERM or SIGINT; then prints its counters.
 fn run(ln: net.Listener, size: int, worker: int) {
-    let pool: Option[postgres.Pool] =
-        if size > 0 { Some(postgres.newPool(os.envOr("LXL_PG_DSN", "host=/var/run/postgresql dbname=postgres"), size)) } else { None }
+    var pool: Option[postgres.Pool] = None
+    if size > 0 {
+        match postgres.newPool(os.envOr("LXL_PG_DSN", "host=/var/run/postgresql dbname=postgres"), size) {
+            Ok(p) { pool = Some(p) }
+            Err(e) {
+                eprintln("httpd: LXL_PG_DSN: " + e.toStr())
+                os.quit(1)
+            }
+        }
+    }
     var cfg = http.defaults()
     cfg.maxConns = 30000                  // the gates hold 10,000 idle connections and more
     let who = if worker >= 0 { "worker " + intToStr(worker) + ": " } else { "" }

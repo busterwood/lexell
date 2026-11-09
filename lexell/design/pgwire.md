@@ -109,10 +109,10 @@ the lines in "Changes"; the receivers are `mut &Conn` and `mut &Lease` and
 |---|---|
 | types | `Value`, `Error`, `Conn`, `Rows`, `DecimalType`, `Pool`, `Lease`, `PoolStats`, `Columns`, `RowView`, `Kind`, `Stream[B, T]` |
 | constants | `CONNECTION_OK` 0, `CONNECTION_BAD` 1, `PGRES_EMPTY_QUERY` 0, `PGRES_COMMAND_OK` 1, `PGRES_TUPLES_OK` 2, `PGRES_FATAL_ERROR` 7, `PGRES_SINGLE_TUPLE` 9, `OID_BOOL` ... `OID_TIMESTAMPTZ` (the 17 OIDs) |
-| functions | `openHandles()`, `connect(conninfo, w)`, `decimalParam(d, p, s)`, `newPool(conninfo, size)` |
+| functions | `openHandles()`, `connect(conninfo, w)`, `decimalParam(d, p, s)`, `newPool(conninfo, size)` (a `Result` since design/pool.md) |
 | `Conn` | `close()`, `serverVersion()`, `idle()`, `exec(script, w)`, `query(sql, args, w)`, `querySql(q, w)`, `transaction[T](body, w)`, `stream[B, T](sql, args, bind, read, w)` |
 | `Rows` | `close()`, `rowCount()`, `columnCount()`, `affected()`, `columnName(c)`, `columnType(c)`, `columnTypmod(c)`, `decimalType(c)`, `isNull(r, c)`, `text(r, c)`, `int(r, c)`, `bool(r, c)`, `float(r, c)`, `bytes(r, c)`, `decimal(r, c)`, `decimalOrNull(r, c)`, `value(r, c)` |
-| `Pool`, `Lease` | `stats()`, `acquire(w)`; `exec`, `query`, `querySql`, `stream`, `transaction` |
+| `Pool`, `Lease` | `stats()`, `acquire(w)`; `conn()` (since design/pool.md; the Lease's `exec`, `query`, `querySql`, `stream` and `transaction` are gone) |
 | `Stream` | `columns()`, `rowsRead()`, `fill(out, w)`, `next(w)`, `close(w)` |
 
 Additions (new names only; nothing existing changes for them):
