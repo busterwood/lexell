@@ -14,18 +14,23 @@
 //   (Before the drop loaded the trees' first leaves, so that the nodes in
 //   memory had their heights, it read the leaves under them: 41.)
 // - b's rows written again: the file does not grow.
+// - A file whose free pages are a flat list, as before runs (9.33): it
+//   opens with them as runs, and its next checkpoint writes runs.
 // - Crashes at random points of a drop and its walk, with commits to tree
 //   a going on: each recovers with nothing lost or freed twice, and a's rows
 //   all there (some crashes come with the walk partway done).
-// expect: built: pages 785: trees 3 775, dropped 0, free 8, lists 2, lost 0, twice 0; internal 24
-// expect: one checkpoint: pages 785: trees 1 1, dropped 671, free 110, lists 3, lost 0, twice 0; internal 15
+// expect: built: pages 785: trees 3 775, dropped 0, free 8 in 2 runs, lists 2, lost 0, twice 0; internal 24
+// expect: one checkpoint: pages 785: trees 1 1, dropped 671, free 110 in 9 runs, lists 3, lost 0, twice 0; internal 15
 // expect: reopened: still to free yes, checkpoints to free it 8
-// expect: walked: pages 785: trees 1 1, dropped 0, free 781, lists 3, lost 0, twice 0; internal 0
+// expect: walked: pages 785: trees 1 1, dropped 0, free 782 in 2 runs, lists 2, lost 0, twice 0; internal 0
 // expect: refilled: file grew no
+// expect: a flat free list: pages 786: trees 3 775, dropped 0, free 9 in 0 runs, lists 2, lost 0, twice 0; internal 24
+// expect: opened: free 9 in 3 runs; written again: pages 786: trees 3 775, dropped 0, free 9 in 4 runs, lists 2, lost 0, twice 0; internal 24
 // expect: crashes 12: ok 12, with the walk partway done some
 import "../../../cmd/lexdb_store"
 import "../../../cmd/lexdb_disk"
 import "../../../cmd/lexdb_base"
+import "../../../cmd/lexdb_page"
 import "strings"
 
 fn opts(): lexdb_store.Options {
@@ -69,6 +74,46 @@ fn grow(st: &lexdb_store.Store, a: int, from: int, n: int) {
 
 fn audit(fs: lexdb_disk.Fs): str {
     return match lexdb_store.audit(fs) { Ok(s) { s } Err(e) { "audit: " + e.toStr() } }
+}
+
+// Rewrites the last checkpoint's free runs as a flat list (files before
+// runs), on pages at the file's end; the runs' list pages join the list.
+fn toFlat(fs: lexdb_disk.Fs) {
+    let f = fs.open(lexdb_store.DATA, false).unwrap()
+    var b = array(4096, byte(0))
+    var at = -1
+    var m = lexdb_page.Meta{ckpt: -1, npages: 0, roots: 0, free: 0, replaySeg: 0, replayOff: 0, replayBatch: 0, nextTree: 0, dropped: 0, runs: 0}
+    for i in 0..2 {
+        f.read(i * 4096, mut &b[0..4096], 4096).unwrap()
+        match lexdb_page.decodeMeta(&b, i) {
+            Some(x) {
+                if x.ckpt > m.ckpt {
+                    m = x
+                    at = i
+                }
+            }
+            None {}
+        }
+    }
+    var lists: []int = []
+    let runs = lexdb_page.readList(&f, m.runs, mut &lists).unwrap()
+    var flat: []int = []
+    var r = 0
+    while r + 1 < len(runs) {
+        for p in runs[r]..runs[r] + runs[r + 1] { append(mut &flat, p) }
+        r += 2
+    }
+    for p in lists { append(mut &flat, p) }
+    var pages: []int = []
+    for i in 0..lexdb_page.listPages(len(flat)) { append(mut &pages, m.npages + i) }
+    let enc = lexdb_page.encodeList(&flat, &pages)
+    for i in 0..len(pages) { f.write(pages[i] * 4096, &enc[i]).unwrap() }
+    m.npages += len(pages)
+    m.free = pages[0]
+    m.runs = 0
+    f.write(at * 4096, &lexdb_page.encodeMeta(&m, at)).unwrap()
+    f.flush().unwrap()
+    f.close()
 }
 
 fn main() {
@@ -116,6 +161,7 @@ fn main() {
         let c = st.createTree(mut &t)
         st.commit(t).unwrap()
         fill(&st, c)
+        st.checkpointAll().unwrap()
         return 0
     }).unwrap()
     var after = 0
@@ -124,6 +170,17 @@ fn main() {
         return 0
     }).unwrap()
     println("refilled: file grew " + (if after > npages { "yes, " + npages.toStr() + " to " + after.toStr() } else { "no" }))
+    toFlat(fs)
+    println("a flat free list: " + audit(fs))
+    var opened = ""
+    lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int {
+        opened = st.stats().free.toStr() + " in " + st.stats().freeRuns.toStr() + " runs"
+        var t = lexdb_store.begin()
+        t.put(a, "a-one-more", "x").unwrap()
+        st.commit(t).unwrap()
+        return 0
+    }).unwrap()
+    println("opened: free " + opened + "; written again: " + audit(fs))
 
     // crashes during a drop and its walk
     var ok = 0

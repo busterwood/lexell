@@ -2110,10 +2110,60 @@ later.
 Not done:
 - **The free list is written whole by every checkpoint.** After this drop
   it is 26,800 pages, 53 list pages. A 10 GB table would add 2.5 million,
-  20 MB a checkpoint until they are used again. Extents, a bitmap, or
-  cutting the file's free tail would fix this; measure first.
+  20 MB a checkpoint until they are used again. (Built: 9.33, the free
+  pages as runs.)
 - **A large drop is freed over many checkpoints.** A 10 GB table has
   about 10,000 internal pages: about 40 checkpoints, and checkpoints come
   with the log's growth (`ckptBytes`). With few writes after the drop,
   the space comes back slowly. The reads are one at a time; several at
   once would shorten each checkpoint's share.
+
+### 9.33 Free pages as runs
+
+Every checkpoint wrote the free list whole, and an open read it whole: a
+page number for each free page (9.32). Measured on real files, a table of
+4 million rows (1 GB, 268,000 pages) dropped and freed:
+
+| | free pages 6 | 268,000, a list | 268,000, runs |
+|---|---:|---:|---:|
+| a checkpoint of one row | 2.1 ms | 44 ms | 2.1 ms |
+| an open | | 43 ms | 1 ms |
+
+A 10 GB table would have added about 0.4 s to every checkpoint.
+
+**Runs.** The free pages are now kept, in memory and on disk, as runs of
+consecutive pages: `(first, count)` pairs, highest first, no two touching
+(`runsOf`, `mergeRuns`). The pages of a dropped table are mostly
+consecutive: those 268,000 pages are 2 runs. A checkpoint turns the pages
+it frees into runs (sorting them) and merges them with the free runs. The
+list is written as before, on list pages named by a new meta field,
+`Meta.runs`. A file written before keeps its flat list in `Meta.free`;
+an open reads either and takes both as runs, and the file's next
+checkpoint writes runs. The free page count is summed from the runs
+(`Stats.free`; a separate counter was one more thing to keep right).
+
+**The lowest page first.** `allocPage` takes the lowest free page, from
+the last run. Before, it took the last page freed. Lowest first keeps the
+free pages at the file's end together, where they could later be cut off.
+Checkpoints before the drop are not slower: 1.9 to 2.4 ms both ways, on
+100 MB and 1 GB.
+
+**The worst case** is a free page between every two used ones: then a
+run is a page, and the list is twice what a flat one was.
+
+**Checked** by `store_drop`. The audit gives runs, and the earlier steps'
+counts are unchanged but for one list page fewer. Added: a file whose
+free list was rewritten flat, as before runs, opens with its pages as
+runs, and after a write its checkpoint has runs, nothing lost.
+
+Planted, each caught:
+- a page given out, its run not shortened;
+- touching runs not joined;
+- a run one page short;
+- freed pages not added when the checkpoint is durable;
+- a flat list ignored at open;
+- runs ignored at open;
+- this checkpoint's freed pages not written;
+- the highest page given out.
+
+Not done: cutting the file's free tail; a file does not shrink.

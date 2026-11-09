@@ -103,9 +103,9 @@ pub type Db = record {
     trees: Map[int, int]        // tree id -> root slot
     nextTree: int
     npages: int
-    free: []int                 // pages free now
+    free: []int                 // pages free now: runs, (first, count) pairs, highest first (9.33)
     freeAfterNext: []int        // pages the next checkpoint frees
-    pendingFree: []int          // pages the checkpoint in flight frees when durable
+    pendingFree: []int          // runs the checkpoint in flight frees when durable
     dropped: []int              // subtrees no tree reaches, their pages to free: (page, height or -1) pairs (9.32)
     dropReads: int              // the most of their pages a checkpoint reads (DROP_READS; tests set fewer)
     listPages: []int            // the list pages of the last durable checkpoint
@@ -1980,11 +1980,94 @@ pub fn writer(st: Store): int {
 
 // ---- checkpoints (4.5)
 
+// The lowest free page, or a new one at the file's end.
 fn (db: mut &Db) allocPage(): int {
-    if len(db.free) > 0 { return pop(mut &db.free) }
+    let n = len(db.free)
+    if n > 0 {
+        let p = db.free[n - 2]
+        if db.free[n - 1] == 1 {
+            let c = pop(mut &db.free)
+            let f = pop(mut &db.free)
+        } else {
+            db.free[n - 2] = p + 1
+            db.free[n - 1] -= 1
+        }
+        return p
+    }
     let p = db.npages
     db.npages += 1
     return p
+}
+
+// ---- free runs (9.33)
+//
+// Free pages are kept, and written, as runs of consecutive pages:
+// (first, count) pairs, highest first, none touching another. A dropped
+// table's pages are mostly consecutive, so its many pages are a few runs.
+
+// The runs of a list of pages.
+fn runsOf(pages: &[]int): []int {
+    var ps: []int = []
+    for p in pages { append(mut &ps, p) }
+    collections.sortStable(mut &ps)
+    var up: []int = []
+    for p in ps {
+        let n = len(up)
+        if n > 0 && up[n - 2] + up[n - 1] > p { panic("lexdb: page " + p.toStr() + " freed twice") }
+        if n > 0 && up[n - 2] + up[n - 1] == p { up[n - 1] += 1 }
+        else {
+            append(mut &up, p)
+            append(mut &up, 1)
+        }
+    }
+    var out: []int = []
+    var i = len(up) - 2
+    while i >= 0 {
+        append(mut &out, up[i])
+        append(mut &out, up[i + 1])
+        i -= 2
+    }
+    return out
+}
+
+// Two lists of runs as one, runs that touch joined.
+fn mergeRuns(a: &[]int, b: &[]int): []int {
+    var out: []int = []
+    var i = 0
+    var j = 0
+    while i < len(a) || j < len(b) {
+        var f = 0
+        var c = 0
+        if j >= len(b) || (i < len(a) && a[i] > b[j]) {
+            f = a[i]
+            c = a[i + 1]
+            i += 2
+        } else {
+            f = b[j]
+            c = b[j + 1]
+            j += 2
+        }
+        let n = len(out)
+        if n > 0 && f + c > out[n - 2] { panic("lexdb: page " + out[n - 2].toStr() + " freed twice") }
+        if n > 0 && f + c == out[n - 2] {
+            out[n - 2] = f
+            out[n - 1] += c
+        } else {
+            append(mut &out, f)
+            append(mut &out, c)
+        }
+    }
+    return out
+}
+
+fn runPages(runs: &[]int): int {
+    var n = 0
+    var i = 1
+    while i < len(runs) {
+        n += runs[i]
+        i += 2
+    }
+    return n
 }
 
 // The most pages of dropped subtrees one checkpoint reads (9.32).
@@ -2159,11 +2242,12 @@ pub fn (st: &Store) checkpoint(): Result[Unit, lexdb_base.DbErr] {
         }
         var dropPages: []int = []
         for j in 0..lexdb_page.listPages(len(dropVals)) { append(mut &dropPages, db.allocPage()) }
+        // As many list pages as the runs if none join (taking the lowest
+        // free pages for them joins none and splits none).
+        let freedRuns = runsOf(&freed)
         var freePages: []int = []
-        for j in 0..lexdb_page.listPages(len(db.free) + len(freed)) { append(mut &freePages, db.allocPage()) }
-        var freeVals: []int = []
-        for p in db.free { append(mut &freeVals, p) }
-        for p in freed { append(mut &freeVals, p) }
+        for j in 0..lexdb_page.listPages(len(db.free) + len(freedRuns)) { append(mut &freePages, db.allocPage()) }
+        let freeVals = mergeRuns(&db.free, &freedRuns)
         var dl = lexdb_page.encodeList(&dropVals, &dropPages)
         i = len(dl) - 1
         while i >= 0 {
@@ -2185,11 +2269,11 @@ pub fn (st: &Store) checkpoint(): Result[Unit, lexdb_base.DbErr] {
         for p in rootPages { append(mut &newLists, p) }
         for p in dropPages { append(mut &newLists, p) }
         for p in freePages { append(mut &newLists, p) }
-        db.pendingFree = freed
+        db.pendingFree = freedRuns
         target = db.appliedBatch
         let m = lexdb_page.Meta{ckpt: n, npages: db.npages,
                                 roots: if len(rootPages) > 0 { rootPages[0] } else { 0 },
-                                free: if len(freePages) > 0 { freePages[0] } else { 0 },
+                                free: 0, runs: if len(freePages) > 0 { freePages[0] } else { 0 },
                                 replaySeg: db.seg, replayOff: db.segOff, replayBatch: db.durableBatch + 1,
                                 nextTree: db.nextTree, dropped: if len(dropPages) > 0 { dropPages[0] } else { 0 }}
         metaPage = lexdb_page.encodeMeta(&m, n % 2)
@@ -2209,7 +2293,7 @@ pub fn (st: &Store) checkpoint(): Result[Unit, lexdb_base.DbErr] {
     st.sh.with(fn(db: mut &Db) {
         db.durableCkpt = n
         let pf = replace(mut &db.pendingFree, [])
-        for p in pf { append(mut &db.free, p) }
+        db.free = mergeRuns(&db.free, &pf)
         db.listPages = replace(mut &newLists, [])
         db.ckptRunning = false
         db.logSinceCkpt = 0
@@ -2323,13 +2407,14 @@ pub fn open(fs: lexdb_disk.Fs, opts: Options): Result[Store, lexdb_base.DbErr] {
         return Err(lexdb_base.corrupt("no valid meta page, and the log does not start at its beginning"))
     }
     let m = best.unwrapOr(lexdb_page.Meta{ckpt: 0, npages: 2, roots: 0, free: 0, replaySeg: 1, replayOff: 0,
-                                          replayBatch: 1, nextTree: 1, dropped: 0})
+                                          replayBatch: 1, nextTree: 1, dropped: 0, runs: 0})
     var lists: []int = []
     let roots = try lexdb_page.readList(&data, m.roots, mut &lists)
     let free = try lexdb_page.readList(&data, m.free, mut &lists)
+    let runs = try lexdb_page.readList(&data, m.runs, mut &lists)
     let dropped = try lexdb_page.readList(&data, m.dropped, mut &lists)
     var db = newDb(fs, data, opts, &m)
-    db.free = free
+    db.free = mergeRuns(&runsOf(&free), &runs)
     var d = 0
     while d + 1 < len(dropped) {
         append(mut &db.dropped, dropped[d])
@@ -2374,10 +2459,21 @@ pub fn audit(fs: lexdb_disk.Fs): Result[str, lexdb_base.DbErr] {
     }
     var lists: []int = []
     let roots = try lexdb_page.readList(&data, m.roots, mut &lists)
-    let free = try lexdb_page.readList(&data, m.free, mut &lists)
+    let flat = try lexdb_page.readList(&data, m.free, mut &lists)
+    let runs = try lexdb_page.readList(&data, m.runs, mut &lists)
     let dropped = try lexdb_page.readList(&data, m.dropped, mut &lists)
     var uses = array(m.npages, 0)
     for p in lists { uses[p] += 1 }
+    var free: []int = []
+    for p in flat { append(mut &free, p) }
+    var r = 0
+    while r + 1 < len(runs) {
+        for p in runs[r]..runs[r] + runs[r + 1] {
+            if p < 2 || p >= m.npages { return Err(lexdb_base.corrupt("free page " + p.toStr() + " is past the file's pages")) }
+            append(mut &free, p)
+        }
+        r += 2
+    }
     for p in free { uses[p] += 1 }
     var inTrees = 0
     var inDropped = 0
@@ -2411,7 +2507,7 @@ pub fn audit(fs: lexdb_disk.Fs): Result[str, lexdb_base.DbErr] {
     }
     data.close()
     return Ok("pages " + (m.npages - 2).toStr() + ": trees " + (len(roots) / 2).toStr() + " " + inTrees.toStr() +
-              ", dropped " + inDropped.toStr() + ", free " + len(free).toStr() + ", lists " + len(lists).toStr() +
+              ", dropped " + inDropped.toStr() + ", free " + len(free).toStr() + " in " + (len(runs) / 2).toStr() + " runs, lists " + len(lists).toStr() +
               ", lost " + lost.toStr() + ", twice " + twice.toStr() + "; internal " + internal.toStr())
 }
 
@@ -2533,6 +2629,7 @@ pub type Stats = value record {
     pub held: int
     pub pages: int
     pub free: int
+    pub freeRuns: int
     pub dropped: int            // dropped subtrees whose pages are still to free
     pub wholes: int
 }
@@ -2542,12 +2639,12 @@ pub fn (st: &Store) setDropReads(n: int) { st.sh.with(fn(db: mut &Db) { db.dropR
 
 pub fn (st: &Store) stats(): Stats {
     var s = Stats{commits: 0, conflicts: 0, loads: 0, evictions: 0, flushes: 0, checkpoints: 0, loaded: 0,
-                  cacheUsed: 0, held: 0, pages: 0, free: 0, dropped: 0, wholes: 0}
+                  cacheUsed: 0, held: 0, pages: 0, free: 0, freeRuns: 0, dropped: 0, wholes: 0}
     st.sh.with(fn(db: mut &Db) {
         s = Stats{commits: db.commits, conflicts: db.conflicts, loads: db.loads, evictions: db.evictions,
                   flushes: db.flushes, checkpoints: db.checkpoints, loaded: db.loadedCount,
                   cacheUsed: db.cacheUsed, held: db.held, pages: db.npages,
-                  free: len(db.free), dropped: len(db.dropped) / 2, wholes: db.wholes}
+                  free: runPages(&db.free), freeRuns: len(db.free) / 2, dropped: len(db.dropped) / 2, wholes: db.wholes}
     })
     return s
 }
