@@ -199,6 +199,10 @@ fn (w: mut &Wire) error(e: &lexdb_base.DbErr) {
     addC(mut &b, &e.state)
     b.addByte('M')
     addC(mut &b, &e.msg)
+    if e.context != "" {
+        b.addByte('W')
+        addC(mut &b, &e.context)
+    }
     b.addByte(0)
     w.msg('E', &b)
 }
@@ -232,20 +236,33 @@ fn (w: mut &Wire) rowDesc(cols: &[]lexdb_exec.OutCol) {
     w.msg('T', &b)
 }
 
+// DataRows, written straight into the output (each value's text made once).
 fn (w: mut &Wire) dataRows(rows: &[][]Val) {
+    var ts: []str = []
     for r in rows {
-        var b = newStrBuf()
-        binary.addU16BE(mut &b, len(r))
+        replace(mut &ts, [])
+        var size = 4 + 2
         for v in r {
             if lexdb_exec.isNull(&v) {
-                binary.addU32BE(mut &b, 0xFFFFFFFF)
+                append(mut &ts, "")
+                size += 4
             } else {
                 let t = lexdb_exec.text(&v)
-                binary.addU32BE(mut &b, len(t))
-                b.add(t)
+                size += 4 + len(t)
+                append(mut &ts, t)
             }
         }
-        w.msg('D', &b)
+        w.out.addByte('D')
+        binary.addU32BE(mut &w.out, size)
+        binary.addU16BE(mut &w.out, len(r))
+        for k in 0..len(r) {
+            if lexdb_exec.isNull(&r[k]) {
+                binary.addU32BE(mut &w.out, 0xFFFFFFFF)
+            } else {
+                binary.addU32BE(mut &w.out, len(ts[k]))
+                w.out.add(ts[k])
+            }
+        }
     }
 }
 
@@ -256,6 +273,57 @@ fn (w: mut &Wire) complete(tag: &str) {
 }
 
 fn protoErr(msg: str): lexdb_base.DbErr { return lexdb_base.err("08P01", msg) }
+
+// ---- COPY (9.45)
+
+// CopyInResponse ('G') or CopyOutResponse ('H'): text, n columns.
+fn (w: mut &Wire) copyResponse(typ: byte, n: int) {
+    var b = newStrBuf()
+    b.addByte(byte(0))
+    binary.addU16BE(mut &b, n)
+    for i in 0..n { binary.addU16BE(mut &b, 0) }
+    w.msg(typ, &b)
+}
+
+// COPY TO STDOUT: its lines, a CopyData each, then CopyDone.
+fn (w: mut &Wire) copyOut(r: &lexdb_exec.Res) {
+    w.copyResponse('H', len(r.cols))
+    for row in r.rows {
+        let l = lexdb_exec.text(&row[0])
+        w.out.addByte('d')
+        binary.addU32BE(mut &w.out, len(l) + 4)
+        w.out.add(l)
+        if w.out.size() > 65536 { let f = w.flush() }
+    }
+    w.empty('c')
+}
+
+// COPY FROM STDIN: asks for the data (n columns) and takes it until
+// CopyDone or CopyFail. Flush and Sync are ignored meanwhile, as
+// PostgreSQL does; another message ends it with an error.
+fn (w: mut &Wire) copyData(cols: []lexdb_exec.OutCol): Result[lexdb_exec.CopyInput, io.IoError] {
+    w.copyResponse('G', len(cols))
+    try w.flush()
+    var b = newStrBuf()
+    while true {
+        match try w.readMsg(false) {
+            None { return Ok(lexdb_exec.CopyInput{have: true, data: "", fail: "the connection was lost during COPY", proto: true}) }
+            Some(m) {
+                if m.typ == 'd' { b.add(m.body) }
+                else if m.typ == 'c' { return Ok(lexdb_exec.CopyInput{have: true, data: b.toStr(), fail: "", proto: false}) }
+                else if m.typ == 'f' {
+                    var r = Rd{s: m.body, at: 0, bad: false}
+                    let msg = r.cstr()
+                    return Ok(lexdb_exec.CopyInput{have: true, data: "", fail: if msg == "" { "canceled by the client" } else { msg }, proto: false})
+                } else if m.typ != 'H' && m.typ != 'S' {
+                    return Ok(lexdb_exec.CopyInput{have: true, data: "", proto: true,
+                                                   fail: "unexpected message type " + int(m.typ).toStr() + " during COPY from stdin"})
+                }
+            }
+        }
+    }
+    return Ok(lexdb_exec.CopyInput{have: true, data: "", fail: "unreachable", proto: true})
+}
 
 // ---- the simple query protocol
 
@@ -269,13 +337,27 @@ fn (w: mut &Wire) query(sql: &str): Result[Unit, io.IoError] {
                 w.empty('I')
             } else {
                 for s in stmts {
-                    match w.sess.run(&s, &none, &nt) {
-                        Ok(r) {
-                            if r.hasRows {
-                                w.rowDesc(&r.cols)
-                                w.dataRows(&r.rows)
+                    var r = w.sess.run(&s, &none, &nt)
+                    var cols: []lexdb_exec.OutCol = []
+                    var copyIn = false
+                    match r {
+                        Ok(x) {
+                            if x.copy == lexdb_exec.COPY_IN {
+                                copyIn = true
+                                for c in x.cols { append(mut &cols, c) }
                             }
-                            w.complete(&r.tag)
+                        }
+                        Err(_) {}
+                    }
+                    if copyIn { r = w.sess.copyIn(&s, try w.copyData(cols)) }
+                    match r {
+                        Ok(res) {
+                            if res.copy == lexdb_exec.COPY_OUT { w.copyOut(&res) }
+                            if res.hasRows {
+                                w.rowDesc(&res.cols)
+                                w.dataRows(&res.rows)
+                            }
+                            w.complete(&res.tag)
                         }
                         Err(e) {
                             w.error(&e)
@@ -470,7 +552,18 @@ fn (w: mut &Wire) executeMsg(ps: mut &Ps, body: &str): Result[Unit, lexdb_base.D
     var plan = replace(mut &ps.stmts.atMut(name).plan, lexdb_exec.oneShot())
     let ran = w.runPortal(ps, &portal, &name, mut &plan)
     ps.stmts.atMut(name).plan = plan
-    let res = try ran
+    var res = try ran
+    if res.copy == lexdb_exec.COPY_IN {
+        match w.copyData(replace(mut &res.cols, [])) {
+            Ok(input) { res = try w.sess.copyIn(&ps.stmts.at(name).stmts[0], input) }
+            Err(_) { return Err(protoErr("the connection was lost during COPY")) }
+        }
+    }
+    if res.copy == lexdb_exec.COPY_OUT {
+        w.copyOut(&res)
+        w.complete(&res.tag)
+        return Ok(Unit{})
+    }
     // Rows unlike those Describe gave (an ALTER TABLE since): the client
     // would read them by the old description (PostgreSQL refuses too).
     let p = ps.stmts.at(name)

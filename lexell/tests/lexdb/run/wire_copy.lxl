@@ -1,0 +1,201 @@
+// lexdb_wire: COPY's messages (design/lexdb.md 9.45), from a raw client.
+// Simple query: COPY FROM STDIN (CopyInResponse, then CopyData split in
+// the middle of a line, CopyDone), COPY TO STDOUT (CopyOutResponse, a
+// CopyData per line, CopyDone), CopyFail, a message that is not COPY's,
+// Flush and Sync ignored in the middle; two statements with a COPY between.
+// Extended query: Parse, Bind, Execute of a COPY each way, the Sync sent
+// before the data ignored as PostgreSQL's.
+// expect: in: G cols 2 | C COPY 3 | Z
+// expect: out: H cols 3 | d 1	a	1 | d 2	b	2 | d 3	c	3 | c | C COPY 3 | Z
+// expect: failed: G cols 1 | E 57014 COPY from stdin failed: stop | Z
+// expect: not copy's: G cols 1 | E 08P01 unexpected message type 81 during COPY from stdin | Z
+// expect: sync inside: G cols 1 | C COPY 1 | Z
+// expect: around: C INSERT 0 1 | G cols 1 | C COPY 1 | T | D 7 | C SELECT 1 | Z
+// expect: extended in: 1 | 2 | G cols 1 | C COPY 2 | Z
+// expect: extended out: 1 | 2 | H cols 1 | d x | d y | c | C COPY 2 | Z
+// expect: error before data: E 42P01 relation "nope" does not exist | Z
+// expect: bad data: G cols 1 | E 22P02 invalid input syntax for type integer: "x" (COPY w, line 2, column id: "x") | Z
+import "task"
+import "net"
+import "pgwire"
+import "binary"
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_wire"
+
+type Rx = record { buf: []byte }
+
+type Msg = record { typ: byte; body: []byte }
+
+fn next(c: &net.Conn, rx: mut &Rx): Msg {
+    var chunk = array(65536, byte(0))
+    while len(rx.buf) < 5 || len(rx.buf) < 1 + binary.readI32BE(&rx.buf, 1) {
+        let n = c.read(mut &chunk).unwrap()
+        if n == 0 { return Msg{typ: '?', body: []} }
+        for i in 0..n { append(mut &rx.buf, chunk[i]) }
+    }
+    let size = binary.readI32BE(&rx.buf, 1)
+    var body: []byte = []
+    for i in 5..1 + size { append(mut &body, rx.buf[i]) }
+    var rest: []byte = []
+    for i in 1 + size..len(rx.buf) { append(mut &rest, rx.buf[i]) }
+    let typ = rx.buf[0]
+    rx.buf = rest
+    return Msg{typ: typ, body: body}
+}
+
+fn cstr(b: &[]byte, at: int): str {
+    var i = at
+    while i < len(b) && b[i] != 0 { i += 1 }
+    return strFromBytes(&b[at..i])
+}
+
+// A message as the test shows it.
+fn show(m: &Msg): str {
+    let t = strFromBytes(&[m.typ])
+    if m.typ == 'G' || m.typ == 'H' { return t + " cols " + binary.readU16BE(&m.body, 1).toStr() }
+    if m.typ == 'd' {
+        let l = strFromBytes(&m.body)
+        return "d " + l[0..len(l) - 1]
+    }
+    if m.typ == 'C' { return "C " + cstr(&m.body, 0) }
+    if m.typ == 'D' {
+        let n = binary.readI32BE(&m.body, 2)
+        return "D " + strFromBytes(&m.body[6..6 + n])
+    }
+    if m.typ == 'E' {
+        var code = ""
+        var msg = ""
+        var at = 0
+        while at < len(m.body) && m.body[at] != 0 {
+            let f = m.body[at]
+            let v = cstr(&m.body, at + 1)
+            if f == 'C' { code = v }
+            if f == 'M' { msg = v }
+            if f == 'W' { msg = msg + " (" + v + ")" }
+            at += 2 + len(v)
+        }
+        return "E " + code + " " + msg
+    }
+    return t
+}
+
+// Messages until one of type stop (shown, joined by " | ").
+fn until(c: &net.Conn, rx: mut &Rx, stop: byte): str {
+    var out: []str = []
+    while true {
+        let m = next(c, rx)
+        append(mut &out, show(&m))
+        if m.typ == stop || m.typ == '?' { break }
+    }
+    return strings.join(&out, " | ")
+}
+
+fn raw(c: &net.Conn, typ: byte, body: &str) {
+    var b = newStrBuf()
+    b.addByte(typ)
+    binary.addU32BE(mut &b, len(body) + 4)
+    b.add(body)
+    let s = b.toStr()
+    var out: []byte = []
+    for i in 0..len(s) { append(mut &out, s[i]) }
+    c.write(&out).unwrap()
+}
+
+fn query(c: &net.Conn, sql: str) {
+    var o = pgwire.newOut()
+    pgwire.putQuery(mut &o, sql)
+    c.write(o.bytes()).unwrap()
+}
+
+fn client(addr: str) {
+    let c = net.connect(addr).unwrap()
+    var rx = Rx{buf: []}
+    var o = pgwire.newOut()
+    let settings: []pgwire.Setting = []
+    pgwire.putStartup(mut &o, "test", "test", &settings)
+    c.write(o.bytes()).unwrap()
+    let hello = until(&c, mut &rx, 'Z')
+    query(&c, "create table w (id int primary key, v text, n int)")
+    let made = until(&c, mut &rx, 'Z')
+
+    query(&c, "copy w (id, v) from stdin")
+    let g = until(&c, mut &rx, 'G')
+    raw(&c, 'd', &"1\ta\n2\t")
+    raw(&c, 'd', &"b\n3\tc\n")
+    raw(&c, 'c', &"")
+    println("in: " + g + " | " + until(&c, mut &rx, 'Z'))
+    query(&c, "update w set n = id")
+    let u = until(&c, mut &rx, 'Z')
+    query(&c, "copy w to stdout")
+    println("out: " + until(&c, mut &rx, 'Z'))
+
+    query(&c, "copy w (v) from stdin")
+    let g2 = until(&c, mut &rx, 'G')
+    raw(&c, 'd', &"4\tz\n")
+    raw(&c, 'f', &"stop\x00")
+    println("failed: " + g2 + " | " + until(&c, mut &rx, 'Z'))
+    query(&c, "copy w (id) from stdin")
+    let g3 = until(&c, mut &rx, 'G')
+    query(&c, "select 1")
+    println("not copy's: " + g3 + " | " + until(&c, mut &rx, 'Z'))
+    query(&c, "copy w (id) from stdin")
+    let g4 = until(&c, mut &rx, 'G')
+    raw(&c, 'd', &"5\n")
+    raw(&c, 'H', &"")
+    raw(&c, 'S', &"")
+    raw(&c, 'c', &"")
+    println("sync inside: " + g4 + " | " + until(&c, mut &rx, 'Z'))
+    query(&c, "insert into w values (6, 'six', 6); copy w (id) from stdin; select max(id) from w")
+    let a1 = until(&c, mut &rx, 'G')
+    raw(&c, 'd', &"7\n")
+    raw(&c, 'c', &"")
+    println("around: " + a1 + " | " + until(&c, mut &rx, 'Z'))
+
+    var p = pgwire.newOut()
+    let none: []pgwire.Param = []
+    pgwire.putParse(mut &p, "", "copy w (id) from stdin", &none)
+    pgwire.putBind(mut &p, "", "", &none)
+    pgwire.putExecute(mut &p, "", 0)
+    pgwire.putSync(mut &p)
+    c.write(p.bytes()).unwrap()
+    let e1 = until(&c, mut &rx, 'G')
+    raw(&c, 'd', &"8\n9\n")
+    raw(&c, 'c', &"")
+    var s = pgwire.newOut()
+    pgwire.putSync(mut &s)
+    c.write(s.bytes()).unwrap()
+    println("extended in: " + e1 + " | " + until(&c, mut &rx, 'Z'))
+    var p2 = pgwire.newOut()
+    pgwire.putParse(mut &p2, "", "copy (select v from w where v in ('x', 'y') union all select 'x' union all select 'y') to stdout", &none)
+    pgwire.putBind(mut &p2, "", "", &none)
+    pgwire.putExecute(mut &p2, "", 0)
+    pgwire.putSync(mut &p2)
+    c.write(p2.bytes()).unwrap()
+    println("extended out: " + until(&c, mut &rx, 'Z'))
+    query(&c, "copy nope from stdin")
+    println("error before data: " + until(&c, mut &rx, 'Z'))
+    query(&c, "copy w (id) from stdin")
+    let g5 = until(&c, mut &rx, 'G')
+    raw(&c, 'd', &"10\nx\n")
+    raw(&c, 'c', &"")
+    println("bad data: " + g5 + " | " + until(&c, mut &rx, 'Z'))
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        let f = s.start(lexdb_wire.acceptLoop, lexdb_wire.AcceptArg{ln: ln, st: st})
+        client(addr)
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(6), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, body).unwrap()
+}

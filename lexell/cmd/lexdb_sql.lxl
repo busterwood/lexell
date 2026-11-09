@@ -214,6 +214,27 @@ pub const S_ALTER_SCHEMA = 19   // ALTER SCHEMA table RENAME TO alters[0].name
 pub const S_CREATE_SEQ = 20     // CREATE SEQUENCE table, its options in seq (9.43)
 pub const S_ALTER_SEQ = 21
 pub const S_DROP_SEQ = 22
+pub const S_COPY = 23           // COPY table [(names)] FROM STDIN / TO STDOUT, COPY (inner[0]) TO STDOUT (9.45)
+
+// COPY's options (Stmt.copy).
+pub type CopyOpts = record {
+    pub from: bool              // FROM STDIN; else TO STDOUT
+    pub csv: bool               // FORMAT csv; else text
+    pub delim: str              // one byte
+    pub null: str               // the text of a NULL
+    pub header: bool
+    pub quote: str              // CSV: one byte
+    pub escape: str             // CSV: one byte
+    pub forceQuote: []str       // CSV TO: these columns' values quoted always
+    pub quoteAll: bool          // ... FORCE_QUOTE *: every column's
+    pub forceNotNull: []str     // CSV FROM: these columns never NULL (o.null is a value)
+    pub forceNull: []str        // CSV FROM: these columns NULL when o.null even quoted
+}
+
+fn noCopyOpts(): CopyOpts {
+    return CopyOpts{from: false, csv: false, delim: "", null: "", header: false, quote: "", escape: "",
+                    forceQuote: [], quoteAll: false, forceNotNull: [], forceNull: []}
+}
 
 // INSERT's OVERRIDING (Stmt.overriding).
 pub const OVR_NONE = 0
@@ -312,6 +333,7 @@ pub type Stmt = record {
     pub seq: SeqOpts            // CREATE and ALTER SEQUENCE's options
     pub idOpts: []IdOpts        // CREATE TABLE, ADD COLUMN: identity columns' sequence options
     pub overriding: int         // INSERT: OVR_*
+    pub copy: CopyOpts          // COPY's
 }
 
 pub const SET_UNION = 1
@@ -328,7 +350,8 @@ fn newStmt(kind: int): Stmt {
     return Stmt{kind: kind, table: "", ifFlag: false, cols: [], pk: [], names: [], rows: [], items: [], where: None,
                 group: [], order: [], limit: None, offset: None, sets: [], params: 0, from: [], index: "",
                 unique: false, inner: [], distinct: false, having: None, subs: [], use: 0, setop: 0, setAll: false,
-                cte: -1, rec: false, cascade: false, src: "", srf: "", ordin: false, alters: [], cons: [], seqNames: [], seq: noSeqOpts(), idOpts: [], overriding: OVR_NONE}
+                cte: -1, rec: false, cascade: false, src: "", srf: "", ordin: false, alters: [], cons: [], seqNames: [], seq: noSeqOpts(), idOpts: [], overriding: OVR_NONE,
+                copy: noCopyOpts()}
 }
 
 // ---- the lexer
@@ -348,6 +371,46 @@ fn syntax(msg: str): lexdb_base.DbErr { return lexdb_base.err("42601", msg) }
 fn isIdentStart(c: byte): bool { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || c >= 128 }
 fn isIdentChar(c: byte): bool { return isIdentStart(c) || (c >= '0' && c <= '9') || c == '$' }
 fn isDigit(c: byte): bool { return c >= '0' && c <= '9' }
+
+// A backslash escape's character, s[i] the one after the backslash, added
+// to b: \b \f \n \r \t \v, \ooo octal, \xh[h] hex, else the character
+// itself (E'' strings, COPY's text format). The index after it.
+pub fn unescape(s: &str, i: int, b: mut &StrBuf): int {
+    let c = s[i]
+    if c == 'b' { b.addByte(byte(8)) }
+    else if c == 'f' { b.addByte(byte(12)) }
+    else if c == 'n' { b.addByte('\n') }
+    else if c == 'r' { b.addByte('\r') }
+    else if c == 't' { b.addByte('\t') }
+    else if c == 'v' { b.addByte(byte(11)) }
+    else if c >= '0' && c <= '7' {
+        var v = 0
+        var j = i
+        while j < len(s) && j < i + 3 && s[j] >= '0' && s[j] <= '7' {
+            v = v * 8 + (int(s[j]) - int('0'))
+            j += 1
+        }
+        b.addByte(byte(v & 255))
+        return j
+    } else if c == 'x' && i + 1 < len(s) && hexVal(s[i + 1]) >= 0 {
+        var v = hexVal(s[i + 1])
+        var j = i + 2
+        if j < len(s) && hexVal(s[j]) >= 0 {
+            v = v * 16 + hexVal(s[j])
+            j += 1
+        }
+        b.addByte(byte(v))
+        return j
+    } else { b.addByte(c) }
+    return i + 1
+}
+
+fn hexVal(c: byte): int {
+    if c >= '0' && c <= '9' { return int(c) - int('0') }
+    if c >= 'a' && c <= 'f' { return int(c) - int('a') + 10 }
+    if c >= 'A' && c <= 'F' { return int(c) - int('A') + 10 }
+    return -1
+}
 
 fn lex(s: &str): Result[[]Tok, lexdb_base.DbErr] {
     var out: []Tok = []
@@ -370,6 +433,33 @@ fn lex(s: &str): Result[[]Tok, lexdb_base.DbErr] {
             continue
         }
         let start = i
+        if (c == 'e' || c == 'E') && i + 1 < n && s[i + 1] == '\'' {
+            // E'...': an escape string (\n, \t, \\, \', octal, \xhh, ...)
+            var b = newStrBuf()
+            i += 2
+            while true {
+                if i >= n { return Err(syntax("unterminated quoted string")) }
+                let d = s[i]
+                if d == '\'' {
+                    if i + 1 < n && s[i + 1] == '\'' {
+                        b.addByte('\'')
+                        i += 2
+                        continue
+                    }
+                    i += 1
+                    break
+                }
+                if d == '\\' && i + 1 < n {
+                    i += 1
+                    i = unescape(s, i, mut &b)
+                    continue
+                }
+                b.addByte(d)
+                i += 1
+            }
+            append(mut &out, Tok{kind: T_STR, text: b.toStr(), at: start})
+            continue
+        }
         if isIdentStart(c) {
             while i < n && isIdentChar(s[i]) { i += 1 }
             append(mut &out, Tok{kind: T_IDENT, text: strings.toLowerAscii(s[start..i]), at: start})
@@ -1902,6 +1992,190 @@ fn (p: mut &P) delete(): Result[Stmt, lexdb_base.DbErr] {
     return Ok(s)
 }
 
+// COPY (9.45), after its keyword:
+//   COPY table [(col, ...)] FROM STDIN [options]
+//   COPY {table [(col, ...)] | (query)} TO STDOUT [options]
+// options: [WITH] (FORMAT text|csv, DELIMITER 'c', NULL 's', HEADER [bool],
+// QUOTE 'c', ESCAPE 'c', ENCODING 'utf8'), or the old form [WITH] [BINARY]
+// [DELIMITER [AS] 'c'] [NULL [AS] 's'] [CSV [HEADER] [QUOTE [AS] 'c']
+// [ESCAPE [AS] 'c']]. A table's TO is the query SELECT cols FROM table.
+fn (p: mut &P) copyStmt(): Result[Stmt, lexdb_base.DbErr] {
+    var s = newStmt(S_COPY)
+    var query = false
+    if p.isKw("(") {
+        p.pos += 1
+        query = true
+        var q: Stmt = newStmt(S_SELECT)
+        if p.acceptKw("select") { q = try p.select() }
+        else if p.acceptKw("with") {
+            let n = try p.withList()
+            try p.expectKw("select")
+            let r = p.select()
+            p.popCtes(n)
+            q = try r
+        } else { return Err(lexdb_base.err("0A000", "lexdb: COPY's query must be a SELECT")) }
+        try p.expectKw(")")
+        q.subs = replace(mut &p.subs, [])
+        q.params = p.params
+        append(mut &s.inner, q)
+    } else {
+        s.table = try p.qname()
+        if p.acceptKw("(") {
+            append(mut &s.names, try p.name())
+            while p.acceptKw(",") { append(mut &s.names, try p.name()) }
+            try p.expectKw(")")
+        }
+    }
+    if p.acceptKw("from") {
+        if query { return Err(lexdb_base.err("42601", "COPY FROM takes a table, not a query")) }
+        s.copy.from = true
+        if !p.acceptKw("stdin") { return Err(lexdb_base.err("0A000", "lexdb: COPY FROM reads only STDIN (a file on the server: use psql's \\copy)")) }
+    } else {
+        try p.expectKw("to")
+        if !p.acceptKw("stdout") { return Err(lexdb_base.err("0A000", "lexdb: COPY TO writes only STDOUT (a file on the server: use psql's \\copy)")) }
+    }
+    var format = ""
+    var hasQuote = false
+    var hasEscape = false
+    var delim: Option[str] = None
+    var null: Option[str] = None
+    let with = p.acceptKw("with")
+    if p.acceptKw("(") {
+        while true {
+            let t = p.peek()
+            if t.kind != T_IDENT { return Err(near(&t)) }
+            p.pos += 1
+            let v = p.peek()
+            match t.text {
+                "format" {
+                    if v.kind != T_IDENT && v.kind != T_STR { return Err(near(&v)) }
+                    p.pos += 1
+                    format = strings.toLowerAscii(v.text)
+                }
+                "header" {
+                    if v.kind == T_IDENT && v.text != "match" { p.pos += 1; s.copy.header = !(v.text == "false" || v.text == "off") }
+                    else if v.kind == T_NUM { p.pos += 1; s.copy.header = v.text != "0" }
+                    else if v.kind == T_IDENT { return Err(lexdb_base.err("0A000", "lexdb: COPY's HEADER MATCH is not supported")) }
+                    else { s.copy.header = true }
+                }
+                "delimiter" { delim = Some(try p.copyStr()) }
+                "null" { null = Some(try p.copyStr()) }
+                "quote" { s.copy.quote = try p.copyStr(); hasQuote = true }
+                "escape" { s.copy.escape = try p.copyStr(); hasEscape = true }
+                "encoding" {
+                    let enc = strings.toLowerAscii(try p.copyStr())
+                    if enc != "utf8" && enc != "utf-8" && enc != "unicode" && enc != "sql_ascii" {
+                        return Err(lexdb_base.err("0A000", "lexdb: COPY's encoding is UTF8 only"))
+                    }
+                }
+                "freeze" {
+                    // a hint: accepted (with its boolean) and ignored
+                    if v.kind == T_IDENT && (v.text == "true" || v.text == "false" || v.text == "on" || v.text == "off") { p.pos += 1 }
+                }
+                "force_quote" {
+                    if p.acceptKw("*") { s.copy.quoteAll = true } else { s.copy.forceQuote = try p.nameList() }
+                }
+                "force_not_null" { s.copy.forceNotNull = try p.nameList() }
+                "force_null" { s.copy.forceNull = try p.nameList() }
+                "on_error", "default", "log_verbosity", "reject_limit" {
+                    return Err(lexdb_base.err("0A000", "lexdb: COPY's option \"" + t.text + "\" is not supported"))
+                }
+                else { return Err(lexdb_base.err("42601", "option \"" + t.text + "\" not recognized")) }
+            }
+            if !p.acceptKw(",") { break }
+        }
+        try p.expectKw(")")
+    } else {
+        while true {
+            if p.acceptKw("binary") { format = "binary" }
+            else if p.acceptKw("delimiter") { let a = p.acceptKw("as"); delim = Some(try p.copyStr()) }
+            else if p.acceptKw("null") { let a = p.acceptKw("as"); null = Some(try p.copyStr()) }
+            else if p.acceptKw("csv") { format = "csv" }
+            else if p.acceptKw("header") { s.copy.header = true }
+            else if p.acceptKw("quote") { let a = p.acceptKw("as"); s.copy.quote = try p.copyStr(); hasQuote = true }
+            else if p.acceptKw("escape") { let a = p.acceptKw("as"); s.copy.escape = try p.copyStr(); hasEscape = true }
+            else if p.acceptKw("force") {
+                // FORCE QUOTE {* | col, ...}, FORCE NOT NULL col, ...
+                if p.acceptKw("quote") {
+                    if p.acceptKw("*") { s.copy.quoteAll = true } else { s.copy.forceQuote = try p.bareNames() }
+                } else {
+                    try p.expectKw("not")
+                    try p.expectKw("null")
+                    s.copy.forceNotNull = try p.bareNames()
+                }
+            }
+            else { break }
+        }
+    }
+    if format == "binary" { return Err(lexdb_base.err("0A000", "lexdb: COPY's binary format is not supported")) }
+    if format != "" && format != "text" && format != "csv" { return Err(lexdb_base.err("22023", "COPY format \"" + format + "\" not recognized")) }
+    s.copy.csv = format == "csv"
+    s.copy.delim = delim.unwrapOr(if s.copy.csv { "," } else { "\t" })
+    s.copy.null = null.unwrapOr(if s.copy.csv { "" } else { "\\N" })
+    if !s.copy.csv && (hasQuote || hasEscape) {
+        return Err(lexdb_base.err("0A000", "COPY " + (if hasQuote { "quote" } else { "escape" }) + " available only in CSV mode"))
+    }
+    if !hasQuote { s.copy.quote = "\"" }
+    if !hasEscape { s.copy.escape = s.copy.quote }
+    if len(s.copy.delim) != 1 { return Err(lexdb_base.err("22023", "COPY delimiter must be a single one-byte character")) }
+    if s.copy.delim == "\n" || s.copy.delim == "\r" { return Err(lexdb_base.err("22023", "COPY delimiter cannot be newline or carriage return")) }
+    if !s.copy.csv && strings.indexOf(&"\\.abcdefghijklmnopqrstuvwxyz0123456789", s.copy.delim, 0) >= 0 {
+        return Err(lexdb_base.err("22023", "COPY delimiter cannot be \"" + s.copy.delim + "\""))
+    }
+    if s.copy.csv {
+        if len(s.copy.quote) != 1 { return Err(lexdb_base.err("22023", "COPY quote must be a single one-byte character")) }
+        if len(s.copy.escape) != 1 { return Err(lexdb_base.err("22023", "COPY escape must be a single one-byte character")) }
+        if s.copy.quote == s.copy.delim { return Err(lexdb_base.err("22023", "COPY delimiter and quote must be different")) }
+    }
+    let anyQuote = s.copy.quoteAll || len(s.copy.forceQuote) > 0
+    if (anyQuote || len(s.copy.forceNotNull) > 0 || len(s.copy.forceNull) > 0) && !s.copy.csv {
+        let which = if anyQuote { "force quote" } else if len(s.copy.forceNotNull) > 0 { "force not null" } else { "force null" }
+        return Err(lexdb_base.err("0A000", "COPY " + which + " available only in CSV mode"))
+    }
+    if anyQuote && s.copy.from { return Err(lexdb_base.err("0A000", "COPY force quote only available using COPY TO")) }
+    if len(s.copy.forceNotNull) > 0 && !s.copy.from { return Err(lexdb_base.err("0A000", "COPY force not null only available using COPY FROM")) }
+    if len(s.copy.forceNull) > 0 && !s.copy.from { return Err(lexdb_base.err("0A000", "COPY force null only available using COPY FROM")) }
+    if strings.indexOf(&s.copy.null, s.copy.delim, 0) >= 0 {
+        return Err(lexdb_base.err("22023", "COPY delimiter character must not appear in the NULL specification"))
+    }
+    if strings.indexOf(&s.copy.null, "\n", 0) >= 0 || strings.indexOf(&s.copy.null, "\r", 0) >= 0 {
+        return Err(lexdb_base.err("22023", "COPY null representation cannot use newline or carriage return"))
+    }
+    if !query && !s.copy.from {
+        // TO from a table: its query
+        var q = newStmt(S_SELECT)
+        if len(s.names) == 0 { append(mut &q.items, SelItem{star: true, qual: "", expr: None, alias: ""}) }
+        for n in s.names { append(mut &q.items, SelItem{star: false, qual: "", expr: Some(Expr.Col(n)), alias: ""}) }
+        append(mut &q.from, FromItem{table: s.table, alias: baseName(&s.table), join: J_FIRST, on: None, sub: -1, cols: [], work: -1, lateral: false})
+        append(mut &s.inner, q)
+    }
+    return Ok(s)
+}
+
+// (col, ...): COPY's FORCE options.
+fn (p: mut &P) nameList(): Result[[]str, lexdb_base.DbErr] {
+    try p.expectKw("(")
+    let ns = try p.bareNames()
+    try p.expectKw(")")
+    return Ok(ns)
+}
+
+// col, ...: in the old options' form no comma separates options, so one
+// here always continues the list.
+fn (p: mut &P) bareNames(): Result[[]str, lexdb_base.DbErr] {
+    var ns: []str = [try p.name()]
+    while p.acceptKw(",") { append(mut &ns, try p.name()) }
+    return Ok(ns)
+}
+
+// A COPY option's value: a string.
+fn (p: mut &P) copyStr(): Result[str, lexdb_base.DbErr] {
+    let t = p.peek()
+    if t.kind != T_STR { return Err(near(&t)) }
+    p.pos += 1
+    return Ok(t.text)
+}
+
 fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
     let t = p.peek()
     if t.kind == T_EOF || (t.kind == T_OP && t.text == ";") { return Ok(newStmt(S_EMPTY)) }
@@ -1950,6 +2224,7 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
         }
         "update" { return p.update() }
         "delete" { return p.delete() }
+        "copy" { return p.copyStmt() }
         "create" {
             if p.acceptKw("table") { return p.createTable() }
             if p.acceptKw("sequence") { return p.seqStmt(S_CREATE_SEQ) }

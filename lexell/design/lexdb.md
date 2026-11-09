@@ -393,7 +393,7 @@ Built on 2026-11-09 on branch `lexdb`, about 6,300 lines in
 (cache, trees, transactions, log, checkpoints, recovery, snapshots),
 `lexdb_sql` (lexer, parser), `lexdb_exec` (catalog, rows, keys, planner,
 statements, sessions), `lexdb_wire` (protocol 3.0) and `lexdb` (the
-server). Tests: `python3 lexell/tests/lexdb.py` (54 programs in
+server). Tests: `python3 lexell/tests/lexdb.py` (56 programs in
 `tests/lexdb/run`, under `LXL_CHECK=1`).
 
     lexell/compiler/out/lxlc lexell/cmd/lexdb.lxl -o lexdb
@@ -598,7 +598,7 @@ is the comparison to make.
    (built: 9.42).
 15. SERIAL and COPY (the user's request, 2026-11-09), in steps: (1)
    sequences, SERIAL and identity columns (built: 9.43); (2) RETURNING, for
-   clients to read the ids back (built: 9.44); (3) COPY.
+   clients to read the ids back (built: 9.44); (3) COPY (built: 9.45).
 
 ### 9.5 Indexes and joins (D4)
 
@@ -3017,3 +3017,156 @@ each caught:
 - RETURNING not described, at the wire or by `describe`;
 - VALUES left unresolved with RETURNING (caught once the test had
   `VALUES (t.v)`).
+
+### 9.45 COPY
+
+**What is built.**
+- `COPY table [(cols)] FROM STDIN`, `COPY table [(cols)] TO STDOUT` and
+  `COPY (SELECT ...) TO STDOUT`.
+- Options in both forms PostgreSQL takes:
+  - `WITH (FORMAT text|csv, DELIMITER, NULL, HEADER, QUOTE, ESCAPE,
+    ENCODING 'utf8', FREEZE, FORCE_QUOTE, FORCE_NOT_NULL, FORCE_NULL)`;
+  - the old `[BINARY] [DELIMITER [AS] 'c'] [NULL [AS] 's'] [CSV [HEADER]
+    [QUOTE ...] [ESCAPE ...] [FORCE QUOTE ...] [FORCE NOT NULL ...]]`.
+- The lexer now takes `E'...'` strings, with their backslash escapes
+  (`lexdb_sql.unescape`, shared with COPY's text format), for `DELIMITER
+  E'\t'`.
+
+**Checked against PostgreSQL 16 itself.** A scratch cluster
+(`initdb` and `postgres` from /usr/lib/postgresql/16) ran the same psql
+scripts as lexdb, and the outputs were diffed. They covered:
+- every escape both ways;
+- `\N` and NULL strings;
+- CSV quoting, doubled quotes, other escapes and newlines in fields;
+- headers, end markers and the FORCE options;
+- the errors and their CONTEXT lines.
+
+They agree byte for byte, except that a duplicate key's DETAIL stays in
+lexdb's message, as it does for INSERT. A 1M-row dump through psql's
+`\copy` is identical to PostgreSQL's.
+
+**The text format.**
+- Fields are split by the delimiter (tab by default).
+- `\b \f \n \r \t \v`, `\ooo` octal and `\xhh` hex escapes; any other
+  `\c` is c.
+- NULL is the NULL string (`\N`), compared before the escapes are undone.
+- A line `\.` ends the data.
+- Written out: backslash, newline, carriage return, tab and the other
+  control characters escaped, and the delimiter after a backslash.
+
+**CSV.**
+- Fields are quoted with QUOTE; inside quotes, ESCAPE (QUOTE by default)
+  writes a quote or itself, and newlines are data.
+- An unquoted field equal to the NULL string ('' by default) is NULL; a
+  quoted empty field is an empty string.
+- Written out, a field is quoted if it holds the delimiter, the quote or a
+  newline, equals the NULL string, or is `\.` alone on its line.
+- FORCE_QUOTE quotes a column's non-NULL values; FORCE_NOT_NULL never
+  reads a column as NULL; FORCE_NULL reads a quoted NULL string as NULL.
+
+**One statement.** The wire collects the client's CopyData until CopyDone,
+then runs the COPY with it (`Session.copyIn`, `CopyInput`). It is then a
+statement like any other: retried whole on a commit conflict, all or
+nothing, inside a transaction block or not.
+- `Session.run` of a COPY FROM checks the table and its columns and
+  returns `Res.copy = COPY_IN`. The wire then sends CopyInResponse. A
+  wrong table is an error before any data is asked for, as in PostgreSQL;
+  psql then reads the rest of its script as the data it would have sent,
+  as it does with PostgreSQL.
+- Rows go through `insertOne`, as INSERT's do: defaults, sequences,
+  NOT NULL, CHECK, unique keys, foreign keys (at the end) and indexes.
+  Identity columns take the values given, as PostgreSQL's COPY does.
+- Each value is turned to its column's type before the insert, so an
+  error names the column: CONTEXT `COPY t, line 2, column n: "x"`.
+- `DbErr` has a new `context` field, sent as the ErrorResponse's W
+  field.
+- A CopyFail is 57014. A message other than CopyData, CopyDone, CopyFail,
+  Flush or Sync is 08P01. Flush and Sync in the middle are ignored, so the
+  extended protocol's Sync, sent before the data, does no harm.
+- COPY TO runs its query on a snapshot, as SELECT does. It returns
+  `COPY_OUT` with the lines as rows, which the wire sends as a CopyData
+  each between CopyOutResponse and CopyDone.
+- A read-only block refuses COPY FROM (25006) and allows COPY TO.
+
+**Measured** with 100K rows of three columns, in the executor:
+
+| Operation | Time |
+|---|---|
+| 100 INSERTs of 1000 rows | 341-361 ms |
+| COPY FROM | 167-202 ms |
+| COPY TO | 61-92 ms |
+| The same SELECT alone | 58-61 ms |
+
+COPY TO's cost is its query's. Through psql with 1M rows (22 MB):
+
+| | PostgreSQL 16 | lexdb |
+|---|---|---|
+| `\copy from` | 0.89 s | 1.84 s |
+| `\copy to`, warm | 0.19 s | 0.66-0.72 s |
+
+The difference is the executor's per-row cost: insertOne, about 1.7 µs a
+row, and the scan, about 0.6 µs. That is item 11's work (batches), not
+COPY's.
+
+A profile of the server's dump (the C build) showed:
+- a third of the samples were the runtime's idle threads spinning;
+- the rest spread thin, libc's copying the largest share.
+
+Each line was copied four times on its way out. The wire now writes
+CopyData and DataRow messages straight into its output buffer. In an A/B
+of three runs each, alternating, the dump went from 0.70-0.75 s to
+0.66-0.72 s and a 1M-row SELECT from 1.02-1.04 s to 0.98-1.05 s: small,
+but it is less code.
+
+**Memory, measured.** Loading 1M rows peaked at 546 MB, and 251 MB were
+left (the 128 MB cache and the allocator's). The transaction holds every
+row's writes until it commits, as a 1M-row INSERT's would; the input
+held whole adds 22 MB (its buffer a little more). Dumping 1M rows peaked
+at 1006 MB, as `SELECT *` does (1055 MB): results are made whole before
+they are sent.
+
+**Not done:**
+- Streaming: results sent as they are made, and a large COPY FROM
+  committed in parts. Both are matters of the executor and the store,
+  not COPY's syntax.
+- The binary format (0A000).
+- Files and programs on the server (0A000: psql's `\copy` reads and
+  writes the client's).
+- `WHERE`, `ON_ERROR`, `DEFAULT` and `HEADER MATCH`.
+- Mixed newlines: lexdb takes `\r\n` and `\n` in one input, where
+  PostgreSQL fixes the newline from the first line and refuses the other.
+  A lone `\r` as the newline is not taken.
+- A duplicate key's DETAIL is part of the message, for INSERT too.
+
+**Checked** by:
+- `exec_copy` (25 lines), through the session;
+- `wire_copy` (10 lines), raw protocol messages both ways, in both query
+  protocols;
+- the psql scripts above, against PostgreSQL (not in the suite: they need
+  the PostgreSQL server).
+
+Planted (39), each caught but one:
+- in the text format: escapes not undone; NULL compared after undoing
+  them; `\r\n` kept; no end marker; header not skipped; the default
+  delimiter a comma;
+- in CSV: a doubled quote not one; a quoted newline (and `\r\n`) ending
+  the record; an unterminated field accepted; FORCE_NOT_NULL or
+  FORCE_NULL ignored; CSV's NULL not ''; the escape not the quote;
+- in checks and errors: missing or extra data accepted; no column in the
+  context; duplicate columns allowed; the binary format, files, or a long
+  delimiter accepted;
+- in writing rows: foreign keys not checked at the end; the client's
+  CopyFail ignored; a read-only block allowing COPY FROM;
+- in writing out: no escaping; the delimiter not escaped; quotes not
+  doubled; commas not quoted; FORCE_QUOTE ignored; no header; the tag
+  counting the header;
+- in escapes: octal and hex read wrongly;
+- at the wire: CopyData dropped; Sync ending the copy; no CopyDone; the
+  column count wrong; the extended protocol's COPY not run; no CONTEXT
+  field.
+
+Seven survived the first run. The tests then gained a quoted empty field,
+`\r\n` CSV, values holding the delimiter, quote and comma, a header's
+tag, the delimiter `||`, and CONTEXT at the wire. The one left, a quoted
+empty field read as NULL by its unquoted branch, is equivalent: an
+unquoted field's raw and decoded text are the same.
