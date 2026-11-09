@@ -282,7 +282,7 @@ pub type Stmt = record {
     pub pk: []str
     pub names: []str            // INSERT's column list
     pub rows: [][]Expr          // INSERT's VALUES
-    pub items: []SelItem        // SELECT
+    pub items: []SelItem        // SELECT; INSERT, UPDATE and DELETE: RETURNING's (9.44)
     pub where: Option[Expr]
     pub group: []Expr
     pub order: []OrderItem
@@ -507,7 +507,7 @@ const RESERVED: []str = ["select", "from", "where", "group", "order", "by", "lim
                   "null", "as", "values", "set", "into", "insert", "update", "delete", "create", "table",
                   "primary", "key", "asc", "desc", "true", "false", "cast", "on", "join", "inner", "left",
                   "right", "full", "outer", "cross", "using", "natural", "having", "distinct", "in", "like", "ilike", "between",
-                  "case", "when", "then", "else", "end", "union", "intersect", "except", "with"]
+                  "case", "when", "then", "else", "end", "union", "intersect", "except", "with", "returning"]
 
 fn isReserved(w: &str): bool {
     for r in RESERVED { if r == w { return true } }
@@ -1552,12 +1552,14 @@ fn (p: mut &P) insert(): Result[Stmt, lexdb_base.DbErr] {
         q.subs = replace(mut &p.subs, [])
         q.params = p.params
         append(mut &s.inner, q)
+        try p.returning(mut &s)
         return Ok(s)
     }
     if p.acceptKw("default") {
         // DEFAULT VALUES: one row, every column its default
         try p.expectKw("values")
         append(mut &s.rows, [])
+        try p.returning(mut &s)
         return Ok(s)
     }
     try p.expectKw("values")
@@ -1570,6 +1572,7 @@ fn (p: mut &P) insert(): Result[Stmt, lexdb_base.DbErr] {
         append(mut &s.rows, row)
         if !p.acceptKw(",") { break }
     }
+    try p.returning(mut &s)
     return Ok(s)
 }
 
@@ -1636,23 +1639,16 @@ fn (p: mut &P) setBranch(): Result[Stmt, lexdb_base.DbErr] {
     return Ok(b)
 }
 
-// A query: the select list to HAVING.
-fn (p: mut &P) selectCore(): Result[Stmt, lexdb_base.DbErr] {
-    var s = newStmt(S_SELECT)
-    if p.acceptKw("distinct") {
-        if p.isKw("on") { return Err(lexdb_base.err("0A000", "SELECT DISTINCT ON is not supported")) }
-        s.distinct = true
-    } else {
-        let all = p.acceptKw("all")
-    }
+// A SELECT's output list, or RETURNING's: *, t.*, expr [[AS] alias], ...
+fn (p: mut &P) itemList(items: mut &[]SelItem): Result[Unit, lexdb_base.DbErr] {
     while true {
         let q = p.peek()
         if p.acceptKw("*") {
-            append(mut &s.items, SelItem{star: true, qual: "", expr: None, alias: ""})
+            append(items, SelItem{star: true, qual: "", expr: None, alias: ""})
         } else if (q.kind == T_IDENT || q.kind == T_QIDENT) && p.peekAt(1).kind == T_OP && p.peekAt(1).text == "." &&
                   p.peekAt(2).kind == T_OP && p.peekAt(2).text == "*" {
             p.pos += 3
-            append(mut &s.items, SelItem{star: true, qual: q.text, expr: None, alias: ""})
+            append(items, SelItem{star: true, qual: q.text, expr: None, alias: ""})
         } else {
             let e = try p.expr()
             var alias = ""
@@ -1665,10 +1661,29 @@ fn (p: mut &P) selectCore(): Result[Stmt, lexdb_base.DbErr] {
                     p.pos += 1
                 }
             }
-            append(mut &s.items, SelItem{star: false, qual: "", expr: Some(e), alias: alias})
+            append(items, SelItem{star: false, qual: "", expr: Some(e), alias: alias})
         }
         if !p.acceptKw(",") { break }
     }
+    return Ok(Unit{})
+}
+
+// RETURNING items, after INSERT, UPDATE or DELETE (9.44).
+fn (p: mut &P) returning(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
+    if p.acceptKw("returning") { try p.itemList(mut &s.items) }
+    return Ok(Unit{})
+}
+
+// A query: the select list to HAVING.
+fn (p: mut &P) selectCore(): Result[Stmt, lexdb_base.DbErr] {
+    var s = newStmt(S_SELECT)
+    if p.acceptKw("distinct") {
+        if p.isKw("on") { return Err(lexdb_base.err("0A000", "SELECT DISTINCT ON is not supported")) }
+        s.distinct = true
+    } else {
+        let all = p.acceptKw("all")
+    }
+    try p.itemList(mut &s.items)
     if p.acceptKw("from") {
         append(mut &s.from, try p.fromItem(J_FIRST))
         while true {
@@ -1874,6 +1889,7 @@ fn (p: mut &P) update(): Result[Stmt, lexdb_base.DbErr] {
         if !p.acceptKw(",") { break }
     }
     if p.acceptKw("where") { s.where = Some(try p.expr()) }
+    try p.returning(mut &s)
     return Ok(s)
 }
 
@@ -1882,6 +1898,7 @@ fn (p: mut &P) delete(): Result[Stmt, lexdb_base.DbErr] {
     var s = newStmt(S_DELETE)
     s.table = try p.qname()
     if p.acceptKw("where") { s.where = Some(try p.expr()) }
+    try p.returning(mut &s)
     return Ok(s)
 }
 

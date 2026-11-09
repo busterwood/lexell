@@ -3921,8 +3921,8 @@ fn fillCur(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, x: &Exp
 // eval, running x's correlated subqueries for env's row first.
 fn evalX(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, x: &Expr, env: &Env,
          rs: mut &Run): Result[Val, DbErr] {
-    let sqe = seqEnv(st, txn)
     if !q.corr || !hasCorr(x) { return eval(x, env) }
+    let sqe = seqEnv(st, txn)
     var cur: []Val = array(len(q.subs), Val.Null)
     try fillCur(st, txn, q, x, env, rs, mut &cur)
     let env2 = Env{cols: env.cols, row: env.row, aggs: env.aggs, params: env.params, subs: env.subs, cur: &cur, seq: sqe}
@@ -5158,6 +5158,28 @@ fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
             append(mut &targets, i)
         }
     }
+    // its subqueries are run first; with RETURNING, over the table's columns
+    var sc = newScope(params, &[])
+    let noFrom: []lexdb_sql.FromItem = []
+    let noWhere: Option[Expr] = None
+    let from = if len(s.items) > 0 { oneTable(&s.table) } else { noFrom }
+    var q = try buildQuery(st, txn, &from, &noWhere, params, &s.subs, mut &sc)
+    var rows: [][]Expr = []
+    let resolved = len(s.subs) > 0 || len(s.items) > 0
+    if resolved && len(s.inner) == 0 {
+        for r in s.rows {
+            var rr: []Expr = []
+            for x in r { append(mut &rr, try resolve(&x, &q.cols, 0, mut &sc)) }
+            append(mut &rows, rr)
+        }
+    }
+    var ret = try retOf(s, &q, mut &sc)
+    endScope(mut &sc, mut &q)
+    var rs = newRun(&q)
+    rs.limit(&lim)
+    let m = try prepare(st, txn, &q, params, mut &rs)
+    var kept: [][]Val = []
+    var count = 0
     if len(s.inner) > 0 {
         // INSERT ... SELECT: the query runs to its end first, so it never
         // reads the rows it inserts
@@ -5167,7 +5189,6 @@ fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
         let defs = try defaultsOf(st, txn, &t)
         let fw = try fkTables(st, txn, &t, true, false)
         var later: []FkLater = []
-        var count = 0
         for r in res.rows {
             var vs: []Val = []
             for k in 0..len(r) {
@@ -5177,33 +5198,57 @@ fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
                     append(mut &vs, r[k])
                 }
             }
-            try insertOne(st, txn, &t, &targets, &vs, &defs, &fw, mut &later)
+            let row = try insertOne(st, txn, &t, &targets, &vs, &defs, &fw, mut &later)
+            if ret.on { append(mut &kept, row) }
             count += 1
         }
         try fkFinish(st, txn, &fw, mut &later)
-        return Ok(tagOnly("INSERT 0 " + count.toStr()))
+    } else {
+        let noAggs: []Val = []
+        let env = Env{cols: &q.cols, row: &noAggs, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: sqe}
+        count = if resolved { try insertRows(st, txn, &t, &targets, &rows, &env, s.overriding, ret.on, mut &kept) }
+                else { try insertRows(st, txn, &t, &targets, &s.rows, &env, s.overriding, ret.on, mut &kept) }
     }
-    // its subqueries are run first
-    var sc = newScope(params, &[])
-    let noFrom: []lexdb_sql.FromItem = []
-    let noWhere: Option[Expr] = None
-    var q = try buildQuery(st, txn, &noFrom, &noWhere, params, &s.subs, mut &sc)
-    var rows: [][]Expr = []
-    if len(s.subs) > 0 {
-        for r in s.rows {
-            var rr: []Expr = []
-            for x in r { append(mut &rr, try resolve(&x, &q.cols, 0, mut &sc)) }
-            append(mut &rows, rr)
-        }
+    for row in kept { try retAdd(st, txn, &q, &m, params, mut &ret, &row, mut &rs) }
+    return Ok(retRes(ret, "INSERT 0 " + count.toStr()))
+}
+
+// ---- RETURNING (9.44): rows of values per row written, over the table's
+// columns (an INSERT's or UPDATE's new row, a DELETE's old one)
+
+type Ret = record {
+    on: bool                    // the statement has RETURNING
+    outs: []OutCol
+    exprs: []Expr
+    rows: [][]Val
+}
+
+// Its items resolved over q's columns (q: the statement's table alone).
+fn retOf(s: &lexdb_sql.Stmt, q: &Query, sc: mut &Scope): Result[Ret, DbErr] {
+    var r = Ret{on: len(s.items) > 0, outs: [], exprs: [], rows: []}
+    if !r.on { return Ok(r) }
+    r.outs = try itemCols(&s.items, true, &q.cols, sc, mut &r.exprs)
+    for x in r.exprs {
+        if hasAgg(&x) { return Err(e("42803", "aggregate functions are not allowed in RETURNING")) }
     }
-    endScope(mut &sc, mut &q)
-    var rs = newRun(&q)
-    rs.limit(&lim)
-    let m = try prepare(st, txn, &q, params, mut &rs)
+    return Ok(r)
+}
+
+fn retAdd(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Mats, params: &[]Val, r: mut &Ret,
+          row: &[]Val, rs: mut &Run): Result[Unit, DbErr] {
+    if !r.on { return Ok(Unit{}) }
     let noAggs: []Val = []
-    let env = Env{cols: &q.cols, row: &noAggs, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: sqe}
-    if len(s.subs) > 0 { return insertRows(st, txn, &t, &targets, &rows, &env, s.overriding) }
-    return insertRows(st, txn, &t, &targets, &s.rows, &env, s.overriding)
+    let env = Env{cols: &q.cols, row: row, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: seqEnv(st, txn)}
+    var out: []Val = []
+    for x in r.exprs { append(mut &out, try evalX(st, txn, q, &x, &env, rs)) }
+    append(mut &r.rows, out)
+    return Ok(Unit{})
+}
+
+fn retRes(r: Ret, tag: str): Res {
+    if !r.on { return tagOnly(tag) }
+    let Ret{on: _, outs: outs, exprs: _, rows: rows} = move(r)
+    return Res{cols: outs, rows: rows, tag: tag, hasRows: true}
 }
 
 // Whether column i of t takes its default though a value was given (an
@@ -5219,8 +5264,9 @@ fn idDefault(t: &Table, i: int, isDef: bool, ovr: int): Result[bool, DbErr] {
     return Ok(false)
 }
 
+// The rows of VALUES inserted: their count (each kept, with keep).
 fn insertRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, targets: &[]int, rows: &[][]Expr,
-              env: &Env, ovr: int): Result[Res, DbErr] {
+              env: &Env, ovr: int, keep: bool, kept: mut &[][]Val): Result[int, DbErr] {
     let defs = try defaultsOf(st, txn, t)
     let fw = try fkTables(st, txn, t, true, false)
     var later: []FkLater = []
@@ -5236,16 +5282,18 @@ fn insertRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, targ
                 append(mut &vs, try eval(&r[k], env))
             }
         }
-        try insertOne(st, txn, t, targets, &vs, &defs, &fw, mut &later)
+        let row = try insertOne(st, txn, t, targets, &vs, &defs, &fw, mut &later)
+        if keep { append(kept, row) }
         count += 1
     }
     try fkFinish(st, txn, &fw, mut &later)
-    return Ok(tagOnly("INSERT 0 " + count.toStr()))
+    return Ok(count)
 }
 
-// A row of values for the target columns (the rest NULL).
+// A row of values for the target columns (the rest their defaults): the
+// row inserted.
 fn insertOne(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, targets: &[]int, vs: &[]Val,
-             defs: &Defs, fw: &[]Table, later: mut &[]FkLater): Result[Unit, DbErr] {
+             defs: &Defs, fw: &[]Table, later: mut &[]FkLater): Result[[]Val, DbErr] {
     if len(vs) > len(targets) { return Err(e("42601", "INSERT has more expressions than target columns")) }
     var row = nullRow(len(t.cols))
     var given: []bool = []
@@ -5268,7 +5316,7 @@ fn insertOne(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, targe
         let none: []Val = []
         try childSide(st, txn, t, fw, &row, &none, later)
     }
-    return Ok(Unit{})
+    return Ok(row)
 }
 
 fn update(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, lim: Limits): Result[Res, DbErr] {
@@ -5285,6 +5333,7 @@ fn update(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
         append(mut &targets, i)
         append(mut &sets, try resolve(&set.expr, &q.cols, len(q.cols), mut &sc))
     }
+    var ret = try retOf(s, &q, mut &sc)
     endScope(mut &sc, mut &q)
     let t = &q.levels[0].t
     var found: [][]Val = []
@@ -5317,14 +5366,16 @@ fn update(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
             else { row[targets[k]] = try coerce(try evalX(st, txn, &q, &sets[k], &env, mut &rs), &t.cols[targets[k]].typ) }
         }
         try updRow(st, txn, t, &old, &row, &fw, mut &later)
+        try retAdd(st, txn, &q, &m, params, mut &ret, &row, mut &rs)
     }
     try fkFinish(st, txn, &fw, mut &later)
-    return Ok(tagOnly("UPDATE " + len(found).toStr()))
+    return Ok(retRes(ret, "UPDATE " + len(found).toStr()))
 }
 
 fn delete(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, lim: Limits): Result[Res, DbErr] {
     var sc = newScope(params, &[])
     var q = try buildQuery(st, txn, &oneTable(&s.table), &s.where, params, &s.subs, mut &sc)
+    var ret = try retOf(s, &q, mut &sc)
     endScope(mut &sc, mut &q)
     let t = &q.levels[0].t
     var found: [][]Val = []
@@ -5342,9 +5393,12 @@ fn delete(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     }, mut &rs)
     let fw = try fkTables(st, txn, t, false, true)
     var later: []FkLater = []
-    for row in found { try delRow(st, txn, t, &row, &fw, mut &later) }
+    for row in found {
+        try retAdd(st, txn, &q, &m, params, mut &ret, &row, mut &rs)
+        try delRow(st, txn, t, &row, &fw, mut &later)
+    }
     try fkFinish(st, txn, &fw, mut &later)
-    return Ok(tagOnly("DELETE " + len(found).toStr()))
+    return Ok(retRes(ret, "DELETE " + len(found).toStr()))
 }
 
 fn explain(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, x: &lexdb_sql.Stmt, params: &[]Val, lim: Limits,
@@ -5473,10 +5527,16 @@ pub fn exprOid(x: &Expr, cols: &[]lexdb_sql.ColDef, ptypes: &[]int): int {
 // The output columns of a SELECT: (name, OID), and the expressions behind
 // them (* expanded).
 fn selectCols(s: &lexdb_sql.Stmt, cols: &[]lexdb_sql.ColDef, sc: mut &Scope, exprs: mut &[]Expr): Result[[]OutCol, DbErr] {
+    return itemCols(&s.items, len(s.from) > 0, cols, sc, exprs)
+}
+
+// An item list's output columns (a SELECT's or RETURNING's), over cols.
+fn itemCols(items: &[]lexdb_sql.SelItem, from: bool, cols: &[]lexdb_sql.ColDef, sc: mut &Scope,
+            exprs: mut &[]Expr): Result[[]OutCol, DbErr] {
     var out: []OutCol = []
-    for it in s.items {
+    for it in items {
         if it.star {
-            if len(s.from) == 0 { return Err(e("42601", "SELECT * with no tables specified is not valid")) }
+            if !from { return Err(e("42601", "SELECT * with no tables specified is not valid")) }
             var any = false
             for c in cols {
                 if it.qual != "" && c.name[0..dotAt(&c.name)] != it.qual { continue }
@@ -6796,13 +6856,30 @@ fn compared(c: &Expr, q: &Query, out: mut &[]int) {
     }
 }
 
-// The columns a statement returns (none unless it is a SELECT or EXPLAIN).
+// Whether a statement returns rows (so Describe has columns for it).
+pub fn returnsRows(s: &lexdb_sql.Stmt): bool {
+    let k = s.kind
+    if k == lexdb_sql.S_SELECT || k == lexdb_sql.S_SHOW || k == lexdb_sql.S_EXPLAIN { return true }
+    return (k == lexdb_sql.S_INSERT || k == lexdb_sql.S_UPDATE || k == lexdb_sql.S_DELETE) && len(s.items) > 0
+}
+
+// The columns a statement returns (none unless it is a SELECT, EXPLAIN,
+// SHOW, or has RETURNING).
 fn describe(st: &lexdb_store.Store, s: &lexdb_sql.Stmt, ptypes: &[]int, path: &[]str): Result[[]OutCol, DbErr] {
     if s.kind == lexdb_sql.S_EXPLAIN { return Ok([OutCol{name: "QUERY PLAN", oid: lexdb_sql.OID_TEXT}]) }
     if s.kind == lexdb_sql.S_SHOW { return Ok(showCols(&s.table)) }
-    if s.kind != lexdb_sql.S_SELECT { return Ok([]) }
+    let dml = s.kind == lexdb_sql.S_INSERT || s.kind == lexdb_sql.S_UPDATE || s.kind == lexdb_sql.S_DELETE
+    if s.kind != lexdb_sql.S_SELECT && !(dml && len(s.items) > 0) { return Ok([]) }
     var txn = lexdb_store.begin()
     for x in path { append(mut &txn.path, x) }
+    if dml {
+        let none: Option[Expr] = None
+        let np: []Val = array(if s.params > len(ptypes) { s.params } else { len(ptypes) }, Val.Null)
+        var sc = newScope(&np, ptypes)
+        let q = try buildQuery(st, mut &txn, &oneTable(&s.table), &none, &np, &s.subs, mut &sc)
+        var exprs: []Expr = []
+        return itemCols(&s.items, true, &q.cols, mut &sc, mut &exprs)
+    }
     if s.setop != 0 {
         let np: []Val = array(if s.params > len(ptypes) { s.params } else { len(ptypes) }, Val.Null)
         var sc = newScope(&np, ptypes)

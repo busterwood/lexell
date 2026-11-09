@@ -1,0 +1,116 @@
+// lexdb_exec: RETURNING (design/lexdb.md 9.44) on INSERT (VALUES, DEFAULT
+// VALUES, SELECT), UPDATE (the new rows) and DELETE (the old ones): *, t.*,
+// expressions with their names, subqueries, a serial id and a column's
+// default; the tag still the statement's; errors; a rolled-back statement
+// returning nothing; a prepared statement's described columns.
+// expect: insert: 1|a|10 2|b|20, columns id,v,n, tag INSERT 0 2
+// expect: expressions: 3|C|31, columns id,upper,next
+// expect: default values: 4|d
+// expect: insert select: 5 6, tag INSERT 0 2
+// expect: update: 1|11 2|21, tag UPDATE 2
+// expect: delete: 5|e 6|e, tag DELETE 2, left 4
+// expect: none: columns id, rows 0, tag UPDATE 0
+// expect: subquery: 7|4 , correlated 7|2
+// expect: qualified: 1|a
+// expect: errors: 42803 42703 42P01 23505; on no rows 42803; a column in VALUES 42703 42P01 missing FROM-clause entry for table "t"
+// expect: a key conflict rolls back the rows returned: 4
+// expect: described: id:23,twice:23; plain insert: 0 columns
+// expect: a foreign key cascade: 1|1, child gone 0
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_sql"
+import "../../../cmd/lexdb_exec"
+
+fn rows(r: &lexdb_exec.Res): str {
+    var out: []str = []
+    for row in r.rows {
+        var vs: []str = []
+        for v in row { append(mut &vs, lexdb_exec.text(&v)) }
+        append(mut &out, strings.join(&vs, "|"))
+    }
+    return strings.join(&out, " ")
+}
+
+fn cols(r: &lexdb_exec.Res): str {
+    var ns: []str = []
+    for c in r.cols { append(mut &ns, c.name) }
+    return strings.join(&ns, ",")
+}
+
+fn one(s: mut &lexdb_exec.Session, sql: &str): Result[lexdb_exec.Res, str] {
+    match s.exec(sql) {
+        Ok(rs) {
+            var all = rs
+            return Ok(pop(mut &all))
+        }
+        Err(e) { return Err(e.state + " " + e.msg) }
+    }
+}
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match one(s, sql) {
+        Ok(r) { return if r.hasRows { rows(&r) } else { r.tag } }
+        Err(m) { return m }
+    }
+}
+
+fn state(s: mut &lexdb_exec.Session, sql: &str): str { return q(s, sql)[0..5] }
+
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: 256 * 1024, segBytes: 1024 * 1024, ckptBytes: 512 * 1024, snapNodes: 100000}
+}
+
+fn main() {
+    let fs = lexdb_disk.sim(44)
+    lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        let c1 = q(mut &s, &"create table t (id serial primary key, v text, n int default 10)")
+        let i1 = one(mut &s, &"insert into t (v, n) values ('a', default), ('b', 20) returning *").unwrap()
+        println("insert: " + rows(&i1) + ", columns " + cols(&i1) + ", tag " + i1.tag)
+        let i2 = one(mut &s, &"insert into t (v, n) values ('c', 30) returning id, upper(v), n + 1 as next").unwrap()
+        println("expressions: " + rows(&i2) + ", columns " + cols(&i2))
+        let i3 = one(mut &s, &"insert into t (v) select 'd' returning id, v").unwrap()
+        let i4 = one(mut &s, &"create table src (k int primary key, x text); insert into src values (1, 'e'), (2, 'e')").unwrap()
+        let i5 = one(mut &s, &"insert into t (v) select x from src order by k returning id").unwrap()
+        let i6 = one(mut &s, &"create table dv (id serial primary key, w text default 'd'); insert into dv default values returning id, w").unwrap()
+        println("default values: " + rows(&i3) + "")
+        println("insert select: " + rows(&i5) + ", tag " + i5.tag)
+
+        let u1 = one(mut &s, &"update t set n = n + 1 where id <= 2 returning id, n").unwrap()
+        println("update: " + rows(&u1) + ", tag " + u1.tag)
+        let d1 = one(mut &s, &"delete from t where v = 'e' returning id, v").unwrap()
+        println("delete: " + rows(&d1) + ", tag " + d1.tag + ", left " + q(mut &s, &"select count(*) from t"))
+        let n1 = one(mut &s, &"update t set n = 0 where id > 100 returning id").unwrap()
+        println("none: columns " + cols(&n1) + ", rows " + len(n1.rows).toStr() + ", tag " + n1.tag)
+
+        let sq1 = q(mut &s, &"insert into t (v) values ('f') returning id, (select count(*) from t)")
+        let sq2 = q(mut &s, &"update t set n = 2 where id = 7 returning id, (select count(*) from t u where u.n = t.n)")
+        let sq3 = q(mut &s, &"update t set n = 2 where id = 1")
+        let sq4 = q(mut &s, &"update t set n = 2 where id = 7 returning id, (select count(*) from t u where u.n = t.n)")
+        println("subquery: " + sq1 + " " + ", correlated " + sq4)
+        println("qualified: " + q(mut &s, &"delete from t where id = 1 returning t.id, t.v"))
+
+        println("errors: " + state(mut &s, &"insert into t (v) values ('x') returning count(*)") + " " +
+                state(mut &s, &"update t set n = 1 returning nope") + " " + state(mut &s, &"delete from t returning u.*") + " " +
+                state(mut &s, &"insert into t (id, v) values (2, 'dup') returning id") + "; on no rows " +
+                state(mut &s, &"update t set n = 0 where id > 100 returning count(*)") + "; a column in VALUES " +
+                state(mut &s, &"insert into t (v) values (v) returning id") + " " + q(mut &s, &"insert into t (v) values (t.v) returning id"))
+        let k1 = q(mut &s, &"insert into t (id, v) values (50, 'p'), (2, 'dup') returning id")
+        println("a key conflict rolls back the rows returned: " + q(mut &s, &"select count(*) from t"))
+
+        let ps = lexdb_sql.parse(&"insert into t (v) values ($1) returning id, id * 2 as twice").unwrap()
+        let ds = s.describe(&ps[0], &[lexdb_sql.OID_TEXT]).unwrap()
+        var dn: []str = []
+        for c in ds { append(mut &dn, c.name + ":" + c.oid.toStr()) }
+        let pl = lexdb_sql.parse(&"insert into t (v) values ($1)").unwrap()
+        println("described: " + strings.join(&dn, ",") + "; plain insert: " + len(s.describe(&pl[0], &[lexdb_sql.OID_TEXT]).unwrap()).toStr() + " columns")
+
+        let f1 = q(mut &s, &"create table fp (id int primary key); create table fc (id int primary key, p int references fp on delete cascade)")
+        let f2 = q(mut &s, &"insert into fp values (1); insert into fc values (1, 1)")
+        println("a foreign key cascade: " + q(mut &s, &"delete from fp returning id, (select count(*) from fc)") + ", child gone " +
+                q(mut &s, &"select count(*) from fc"))
+        return 0
+    }).unwrap()
+}

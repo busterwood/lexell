@@ -393,7 +393,7 @@ Built on 2026-11-09 on branch `lexdb`, about 6,300 lines in
 (cache, trees, transactions, log, checkpoints, recovery, snapshots),
 `lexdb_sql` (lexer, parser), `lexdb_exec` (catalog, rows, keys, planner,
 statements, sessions), `lexdb_wire` (protocol 3.0) and `lexdb` (the
-server). Tests: `python3 lexell/tests/lexdb.py` (53 programs in
+server). Tests: `python3 lexell/tests/lexdb.py` (54 programs in
 `tests/lexdb/run`, under `LXL_CHECK=1`).
 
     lexell/compiler/out/lxlc lexell/cmd/lexdb.lxl -o lexdb
@@ -598,7 +598,7 @@ is the comparison to make.
    (built: 9.42).
 15. SERIAL and COPY (the user's request, 2026-11-09), in steps: (1)
    sequences, SERIAL and identity columns (built: 9.43); (2) RETURNING, for
-   clients to read the ids back; (3) COPY.
+   clients to read the ids back (built: 9.44); (3) COPY.
 
 ### 9.5 Indexes and joins (D4)
 
@@ -2954,3 +2954,66 @@ caught:
 gcc (its cached C build), which took several minutes for the suite and
 timed out under load. With `LXL_NOCACHE=1` it calls `lxlc src -o out`,
 the native backend: 10 s for the suite. The C build is for profiling only.
+
+### 9.44 RETURNING
+
+**What is built.** `INSERT ... RETURNING`, `UPDATE ... RETURNING` and
+`DELETE ... RETURNING`, with a SELECT's item list: `*`, `t.*`,
+expressions, aliases and subqueries. INSERT's every form takes it: VALUES,
+DEFAULT VALUES and SELECT. An INSERT or UPDATE returns its rows as
+written, so defaults, sequences' values and coerced types show; a DELETE
+returns the rows as they were. The command tag stays the statement's
+(`INSERT 0 n`), and clients read the count from it as before.
+
+**How.** The parser's item list is now one function (`itemList`) for
+SELECT and RETURNING. A DML statement keeps its RETURNING items in
+`Stmt.items`, which it did not use. `returning` is now a reserved word, so
+`INSERT ... SELECT x FROM u RETURNING id` does not take it as an alias.
+
+In the executor, `itemCols` (SELECT's `selectCols`, generalized) resolves
+the items over the table's columns. A `Ret` collects a row of values per
+row written (`retAdd`, through `evalX`, so correlated subqueries work),
+and `retRes` makes the result.
+- UPDATE and DELETE already have a query over their table.
+- INSERT builds one over its table only when it has RETURNING. Its VALUES
+  are then resolved with no columns visible, as before, so `VALUES (t.v)`
+  is still 42P01 and a plain INSERT keeps its old path. `insertOne` now
+  returns the row it wrote.
+- An aggregate in RETURNING is 42803 even on no rows.
+
+A subquery in RETURNING runs before the statement's writes, unless it is
+correlated. So it sees the table as the statement began, as PostgreSQL's
+snapshot does.
+
+**The wire.** Describe asked whether a statement was a SELECT or SHOW, and
+sent NoData for anything else. libpq and Lexell's client then refused the
+DataRows of an `INSERT ... RETURNING` ("a DataRow before a
+RowDescription"). `lexdb_exec.returnsRows` now decides, for EXPLAIN too,
+which had the same gap. `describe` gives RETURNING's columns.
+`wire_client` reads serial ids back through the extended protocol.
+
+**Measured** with 100K serial rows in 100 INSERTs: 0.34-0.37 s, and
+0.37-0.39 s with `RETURNING id`. A 100K-row UPDATE: 189 ms, and 223 ms
+returning two columns.
+
+**Not done:**
+- Data-modifying statements in WITH: `WITH x AS (INSERT ... RETURNING)
+  SELECT ...` is a syntax error.
+- `INSERT ... ON CONFLICT`.
+- RETURNING's values are evaluated after all of an INSERT's rows are
+  written, not as each is. Only a volatile function in RETURNING could
+  tell.
+
+**Checked** by `exec_returning` (13 lines) and `wire_client`. Planted,
+each caught:
+- UPDATE returning nothing, or the old rows;
+- DELETE returning nothing;
+- INSERT ... SELECT or VALUES keeping no rows;
+- INSERT returning the values given rather than the row written;
+- aggregates allowed (caught once the test had one on no rows);
+- the rows flag lost;
+- the tag replaced;
+- `*` refused;
+- RETURNING not described, at the wire or by `describe`;
+- VALUES left unresolved with RETURNING (caught once the test had
+  `VALUES (t.v)`).
