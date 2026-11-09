@@ -99,6 +99,14 @@ pub const C_UNIQUE = 1
 pub const C_CHECK = 2
 pub const C_FOREIGN = 3
 
+// A foreign key's action when the row it references is deleted or its key
+// changed (9.41).
+pub const FK_NO_ACTION = 0      // checked at the statement's end
+pub const FK_RESTRICT = 1       // checked at once
+pub const FK_CASCADE = 2
+pub const FK_SET_NULL = 3
+pub const FK_SET_DEFAULT = 4
+
 pub type Constraint = record {
     pub kind: int
     pub name: str               // "" when not given: one is made
@@ -191,6 +199,7 @@ pub type Alter = record {
     pub ifFlag: bool            // ADD COLUMN IF NOT EXISTS, DROP COLUMN IF EXISTS
     pub using: Option[Expr]     // A_TYPE: the new value, of the row as it was
     pub cons: []Constraint      // A_ADD_CON: the constraint
+    pub cascade: bool           // DROP COLUMN, DROP CONSTRAINT: CASCADE (foreign keys on it dropped)
 }
 
 // A qualified name, schema.name, as the parser gives it: the two joined by
@@ -250,7 +259,7 @@ pub type Stmt = record {
     pub setAll: bool            // ... ALL
     pub cte: int                // a CTE where it is used: its number in the statement; -1 none
     pub rec: bool               // a recursive CTE: inner[1] reads its working table
-    pub cascade: bool           // DROP SCHEMA ... CASCADE
+    pub cascade: bool           // DROP SCHEMA, DROP TABLE ... CASCADE
     src: str                    // a scalar subquery: its tokens (one written twice is one subquery)
     pub srf: str                // in FROM, a function: generate_series or unnest; its arguments are items
     pub ordin: bool             // ... WITH ORDINALITY
@@ -1016,8 +1025,11 @@ fn (p: mut &P) createTable(): Result[Stmt, lexdb_base.DbErr] {
                     var ck = try p.checkTail(cn)
                     append(mut &ck.cols, n)         // a column's: named for it
                     append(mut &s.cons, ck)
-                } else if p.isKw("references") {
-                    return Err(p.notYet())
+                } else if p.acceptKw("references") {
+                    var fk = newConstraint(C_FOREIGN, cn)
+                    append(mut &fk.cols, n)
+                    try p.fkTail(mut &fk)
+                    append(mut &s.cons, fk)
                 } else if len(cn) > 0 {
                     return Err(near(&p.peek()))
                 } else {
@@ -1032,10 +1044,21 @@ fn (p: mut &P) createTable(): Result[Stmt, lexdb_base.DbErr] {
     return Ok(s)
 }
 
-// A table constraint, after [CONSTRAINT name]: UNIQUE (cols) or CHECK
-// (expr). (FOREIGN KEY comes with 9.41.)
+// A table constraint, after [CONSTRAINT name]: UNIQUE (cols), CHECK (expr)
+// or FOREIGN KEY (cols) REFERENCES ....
 fn (p: mut &P) tableConstraint(name: str): Result[Constraint, lexdb_base.DbErr] {
     if p.acceptKw("check") { return p.checkTail(name) }
+    if p.acceptKw("foreign") {
+        try p.expectKw("key")
+        var c = newConstraint(C_FOREIGN, name)
+        try p.expectKw("(")
+        append(mut &c.cols, try p.name())
+        while p.acceptKw(",") { append(mut &c.cols, try p.name()) }
+        try p.expectKw(")")
+        try p.expectKw("references")
+        try p.fkTail(mut &c)
+        return Ok(c)
+    }
     if p.acceptKw("unique") {
         var c = newConstraint(C_UNIQUE, name)
         try p.uniqueTail()
@@ -1075,10 +1098,61 @@ fn (p: mut &P) checkTail(name: str): Result[Constraint, lexdb_base.DbErr] {
     return Ok(c)
 }
 
-fn (p: &P) notYet(): lexdb_base.DbErr {
-    if p.isKw("foreign") || p.isKw("references") || p.isKw("exclude") {
-        return lexdb_base.err("0A000", "lexdb: foreign keys and EXCLUDE constraints are not supported yet")
+// After REFERENCES: table [(cols)], then in any order MATCH SIMPLE, ON
+// DELETE action, ON UPDATE action, [NOT] DEFERRABLE, INITIALLY IMMEDIATE.
+// MATCH FULL and PARTIAL and deferred checks are not lexdb's.
+fn (p: mut &P) fkTail(c: mut &Constraint): Result[Unit, lexdb_base.DbErr] {
+    c.refTable = try p.qname()
+    if p.acceptKw("(") {
+        append(mut &c.refCols, try p.name())
+        while p.acceptKw(",") { append(mut &c.refCols, try p.name()) }
+        try p.expectKw(")")
     }
+    while true {
+        if p.acceptKw("match") {
+            if p.isKw("full") || p.isKw("partial") {
+                return Err(lexdb_base.err("0A000", "lexdb: MATCH FULL and MATCH PARTIAL are not supported (MATCH SIMPLE is)"))
+            }
+            try p.expectKw("simple")
+        } else if p.isKw("on") && p.pos + 1 < len(p.toks) && (p.toks[p.pos + 1].text == "delete" || p.toks[p.pos + 1].text == "update") {
+            p.pos += 1
+            let del = p.acceptKw("delete")
+            if !del { try p.expectKw("update") }
+            let act = try p.fkAction()
+            if del { c.onDelete = act } else { c.onUpdate = act }
+        } else if p.acceptKw("deferrable") {
+            return Err(lexdb_base.err("0A000", "lexdb: deferrable constraints are not supported"))
+        } else if p.isKw("not") && p.pos + 1 < len(p.toks) && p.toks[p.pos + 1].text == "deferrable" {
+            p.pos += 2
+        } else if p.acceptKw("initially") {
+            if p.isKw("deferred") { return Err(lexdb_base.err("0A000", "lexdb: deferrable constraints are not supported")) }
+            try p.expectKw("immediate")
+        } else {
+            break
+        }
+    }
+    return Ok(Unit{})
+}
+
+fn (p: mut &P) fkAction(): Result[int, lexdb_base.DbErr] {
+    if p.acceptKw("no") {
+        try p.expectKw("action")
+        return Ok(FK_NO_ACTION)
+    }
+    if p.acceptKw("restrict") { return Ok(FK_RESTRICT) }
+    if p.acceptKw("cascade") { return Ok(FK_CASCADE) }
+    try p.expectKw("set")
+    var act = FK_SET_NULL
+    if !p.acceptKw("null") {
+        try p.expectKw("default")
+        act = FK_SET_DEFAULT
+    }
+    if p.isKw("(") { return Err(lexdb_base.err("0A000", "lexdb: SET NULL and SET DEFAULT of some columns are not supported")) }
+    return Ok(act)
+}
+
+fn (p: &P) notYet(): lexdb_base.DbErr {
+    if p.isKw("exclude") { return lexdb_base.err("0A000", "lexdb: EXCLUDE constraints are not supported") }
     return near(&p.peek())
 }
 
@@ -1116,18 +1190,18 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
     s.table = try p.qname()
     if p.isKw("set") && p.pos + 1 < len(p.toks) && p.toks[p.pos + 1].kind == T_IDENT && p.toks[p.pos + 1].text == "schema" {
         p.pos += 2
-        append(mut &s.alters, Alter{kind: A_SET_SCHEMA, col: noCol(), name: try p.name(), to: "", ifFlag: false, using: None, cons: []})
+        append(mut &s.alters, Alter{kind: A_SET_SCHEMA, col: noCol(), name: try p.name(), to: "", ifFlag: false, using: None, cons: [], cascade: false})
         return Ok(s)
     }
     if p.acceptKw("rename") {
         if p.acceptKw("to") {
-            append(mut &s.alters, Alter{kind: A_RENAME, col: noCol(), name: try p.name(), to: "", ifFlag: false, using: None, cons: []})
+            append(mut &s.alters, Alter{kind: A_RENAME, col: noCol(), name: try p.name(), to: "", ifFlag: false, using: None, cons: [], cascade: false})
             return Ok(s)
         }
         let c = p.acceptKw("column")
         let from = try p.name()
         try p.expectKw("to")
-        append(mut &s.alters, Alter{kind: A_RENAME_COL, col: noCol(), name: from, to: try p.name(), ifFlag: false, using: None, cons: []})
+        append(mut &s.alters, Alter{kind: A_RENAME_COL, col: noCol(), name: from, to: try p.name(), ifFlag: false, using: None, cons: [], cascade: false})
         return Ok(s)
     }
     while true {
@@ -1139,14 +1213,14 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
                 var cname = ""
                 if p.acceptKw("constraint") { cname = try p.name() }
                 if p.isKw("primary") { return Err(lexdb_base.err("0A000", "lexdb: a table's primary key cannot be changed")) }
-                var a = Alter{kind: A_ADD_CON, col: noCol(), name: "", to: "", ifFlag: false, using: None, cons: []}
+                var a = Alter{kind: A_ADD_CON, col: noCol(), name: "", to: "", ifFlag: false, using: None, cons: [], cascade: false}
                 append(mut &a.cons, try p.tableConstraint(cname))
                 append(mut &s.alters, a)
                 if !p.acceptKw(",") { break }
                 continue
             }
             let c = p.acceptKw("column")
-            var a = Alter{kind: A_ADD, col: noCol(), name: "", to: "", ifFlag: false, using: None, cons: []}
+            var a = Alter{kind: A_ADD, col: noCol(), name: "", to: "", ifFlag: false, using: None, cons: [], cascade: false}
             if p.acceptKw("if") {
                 try p.expectKw("not")
                 try p.expectKw("exists")
@@ -1172,25 +1246,25 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
             append(mut &s.alters, a)
         } else if p.acceptKw("drop") {
             if p.acceptKw("constraint") {
-                var a = Alter{kind: A_DROP_CON, col: noCol(), name: "", to: "", ifFlag: false, using: None, cons: []}
+                var a = Alter{kind: A_DROP_CON, col: noCol(), name: "", to: "", ifFlag: false, using: None, cons: [], cascade: false}
                 if p.acceptKw("if") {
                     try p.expectKw("exists")
                     a.ifFlag = true
                 }
                 a.name = try p.name()
-                if !p.acceptKw("cascade") { let r = p.acceptKw("restrict") }
+                if p.acceptKw("cascade") { a.cascade = true } else { let r = p.acceptKw("restrict") }
                 append(mut &s.alters, a)
                 if !p.acceptKw(",") { break }
                 continue
             }
             let c = p.acceptKw("column")
-            var a = Alter{kind: A_DROP_COL, col: noCol(), name: "", to: "", ifFlag: false, using: None, cons: []}
+            var a = Alter{kind: A_DROP_COL, col: noCol(), name: "", to: "", ifFlag: false, using: None, cons: [], cascade: false}
             if p.acceptKw("if") {
                 try p.expectKw("exists")
                 a.ifFlag = true
             }
             a.name = try p.name()
-            if !p.acceptKw("cascade") { let r = p.acceptKw("restrict") }
+            if p.acceptKw("cascade") { a.cascade = true } else { let r = p.acceptKw("restrict") }
             append(mut &s.alters, a)
         } else if p.acceptKw("alter") {
             let c = p.acceptKw("column")
@@ -1201,7 +1275,7 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
                 try p.expectKw("type")
             }
             if data || p.acceptKw("type") {
-                var a = Alter{kind: A_TYPE, col: noCol(), name: n, to: "", ifFlag: false, using: None, cons: []}
+                var a = Alter{kind: A_TYPE, col: noCol(), name: n, to: "", ifFlag: false, using: None, cons: [], cascade: false}
                 a.col.typ = try p.typeName()
                 if p.acceptKw("using") {
                     let subs = len(p.subs)
@@ -1213,7 +1287,7 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
                 append(mut &s.alters, a)
             } else if p.acceptKw("set") {
                 if p.acceptKw("default") {
-                    var a = Alter{kind: A_SET_DEFAULT, col: noCol(), name: n, to: "", ifFlag: false, using: None, cons: []}
+                    var a = Alter{kind: A_SET_DEFAULT, col: noCol(), name: n, to: "", ifFlag: false, using: None, cons: [], cascade: false}
                     a.col.def = Some(try p.defaultExpr())
                     append(mut &s.alters, a)
                     if !p.acceptKw(",") { break }
@@ -1221,16 +1295,16 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
                 }
                 try p.expectKw("not")
                 try p.expectKw("null")
-                append(mut &s.alters, Alter{kind: A_SET_NOT_NULL, col: noCol(), name: n, to: "", ifFlag: false, using: None, cons: []})
+                append(mut &s.alters, Alter{kind: A_SET_NOT_NULL, col: noCol(), name: n, to: "", ifFlag: false, using: None, cons: [], cascade: false})
             } else if p.acceptKw("drop") {
                 if p.acceptKw("default") {
-                    append(mut &s.alters, Alter{kind: A_DROP_DEFAULT, col: noCol(), name: n, to: "", ifFlag: false, using: None, cons: []})
+                    append(mut &s.alters, Alter{kind: A_DROP_DEFAULT, col: noCol(), name: n, to: "", ifFlag: false, using: None, cons: [], cascade: false})
                     if !p.acceptKw(",") { break }
                     continue
                 }
                 try p.expectKw("not")
                 try p.expectKw("null")
-                append(mut &s.alters, Alter{kind: A_DROP_NOT_NULL, col: noCol(), name: n, to: "", ifFlag: false, using: None, cons: []})
+                append(mut &s.alters, Alter{kind: A_DROP_NOT_NULL, col: noCol(), name: n, to: "", ifFlag: false, using: None, cons: [], cascade: false})
             } else {
                 return Err(lexdb_base.err("0A000", "lexdb: ALTER COLUMN takes TYPE, SET or DROP NOT NULL, SET or DROP DEFAULT"))
             }
@@ -1640,7 +1714,7 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
                     return Err(lexdb_base.err("0A000", "lexdb: ALTER " + (if idx { "INDEX" } else { "SCHEMA" }) + " takes RENAME TO only"))
                 }
                 try p.expectKw("to")
-                append(mut &s.alters, Alter{kind: A_RENAME, col: noCol(), name: try p.name(), to: "", ifFlag: false, using: None, cons: []})
+                append(mut &s.alters, Alter{kind: A_RENAME, col: noCol(), name: try p.name(), to: "", ifFlag: false, using: None, cons: [], cascade: false})
                 return Ok(s)
             }
             return Err(lexdb_base.err("0A000", "only ALTER TABLE, ALTER INDEX and ALTER SCHEMA are supported"))
@@ -1708,6 +1782,7 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
                 s.ifFlag = true
             }
             s.table = try p.qname()
+            if p.acceptKw("cascade") { s.cascade = true } else { let r = p.acceptKw("restrict") }
             return Ok(s)
         }
         "begin", "start" {

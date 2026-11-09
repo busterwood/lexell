@@ -53,6 +53,23 @@ pub type Table = record {
     pub slots: []int
     pub width: int              // the places a row has (with slots)
     pub checks: []Check         // CHECK constraints (9.40)
+    pub fks: []ForeignKey       // its foreign keys (9.41)
+    pub refBy: []str            // the tables with foreign keys to it (itself among them if so)
+}
+
+// A foreign key: cols of its table hold a key of table ref, refCols (a
+// primary key or a unique index's columns, in any order). Columns by name.
+pub type ForeignKey = record {
+    pub name: str
+    pub cols: []str
+    pub ref: str                // the table's catalog key
+    pub refCols: []str
+    pub onDelete: int           // lexdb_sql.FK_*
+    pub onUpdate: int
+}
+
+fn emptyTable(name: str): Table {
+    return Table{name: name, tree: 0, cols: [], pk: [], indexes: [], slots: [], width: 0, checks: [], fks: [], refBy: []}
 }
 
 // A CHECK constraint: a row may not make expr false (column names bare).
@@ -1424,7 +1441,8 @@ fn encTable(t: &Table): str {
     // defaults)
     var defs = false
     for c in t.cols { if c.def.isSome() || !isNull(&c.missing) { defs = true } }
-    let checks = len(t.checks) > 0
+    let fkx = len(t.fks) > 0 || len(t.refBy) > 0
+    let checks = len(t.checks) > 0 || fkx
     if len(t.slots) > 0 || defs || checks {
         binary.addU32LE(mut &b, t.width)
         binary.addU32LE(mut &b, len(t.slots))
@@ -1460,11 +1478,60 @@ fn encTable(t: &Table): str {
             b.add(text)
         }
     }
+    // then the foreign keys, and the tables referencing it
+    if fkx {
+        binary.addU32LE(mut &b, len(t.fks))
+        for f in t.fks {
+            addStr(mut &b, &f.name)
+            addStrs(mut &b, &f.cols)
+            addStr(mut &b, &f.ref)
+            addStrs(mut &b, &f.refCols)
+            b.addByte(byte(f.onDelete))
+            b.addByte(byte(f.onUpdate))
+        }
+        addStrs(mut &b, &t.refBy)
+    }
     return b.toStr()
 }
 
+fn addStr(b: mut &StrBuf, x: &str) {
+    binary.addU32LE(b, len(x))
+    b.add(x)
+}
+
+fn addStrs(b: mut &StrBuf, xs: &[]str) {
+    binary.addU32LE(b, len(xs))
+    for x in xs { addStr(b, &x) }
+}
+
+// A string addStr wrote at at (it takes 4 + its length).
+fn strAt(s: &str, at: int): str {
+    let l = binary.readU32LEStr(s, at)
+    return s[at + 4..at + 4 + l]
+}
+
+// The strings addStrs wrote at at.
+fn strsAt(s: &str, at: int): []str {
+    let n = binary.readU32LEStr(s, at)
+    var p = at + 4
+    var out: []str = []
+    for i in 0..n {
+        let x = strAt(s, p)
+        p += 4 + len(x)
+        append(mut &out, x)
+    }
+    return out
+}
+
+fn strsLen(xs: &[]str): int {
+    var n = 4
+    for x in xs { n += 4 + len(x) }
+    return n
+}
+
 fn decTable(name: str, s: &str): Result[Table, DbErr] {
-    var t = Table{name: name, tree: binary.readU32LEStr(s, 0), cols: [], pk: [], indexes: [], slots: [], width: 0, checks: []}
+    var t = emptyTable(name)
+    t.tree = binary.readU32LEStr(s, 0)
     let n = binary.readU32LEStr(s, 4)
     var at = 8
     for i in 0..n {
@@ -1554,6 +1621,23 @@ fn decTable(name: str, s: &str): Result[Table, DbErr] {
             }
             at += 4 + xl
         }
+    }
+    if at + 4 <= len(s) {
+        let nf = binary.readU32LEStr(s, at)
+        at += 4
+        for i in 0..nf {
+            let fname = strAt(s, at)
+            at += 4 + len(fname)
+            let fcols = strsAt(s, at)
+            at += strsLen(&fcols)
+            let fref = strAt(s, at)
+            at += 4 + len(fref)
+            let frefCols = strsAt(s, at)
+            at += strsLen(&frefCols)
+            append(mut &t.fks, ForeignKey{name: fname, cols: fcols, ref: fref, refCols: frefCols, onDelete: int(s[at]), onUpdate: int(s[at + 1])})
+            at += 2
+        }
+        t.refBy = strsAt(s, at)
     }
     return Ok(t)
 }
@@ -2682,7 +2766,7 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
         for lv in q.levels {
             if lv.alias == f.alias { return Err(e("42712", "table name \"" + f.alias + "\" specified more than once")) }
         }
-        var t = Table{name: f.alias, tree: -1, cols: [], pk: [], indexes: [], slots: [], width: 0, checks: []}
+        var t = Table{name: f.alias, tree: -1, cols: [], pk: [], indexes: [], slots: [], width: 0, checks: [], fks: [], refBy: []}
         var lateral = false
         if f.sub >= 0 {
             sc.frames[me].hidden = !f.lateral
@@ -4103,7 +4187,7 @@ fn createTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
     if len(s.pk) == 0 {
         return Err(e("42P16", "lexdb: table \"" + base + "\" needs a PRIMARY KEY"))
     }
-    var t = Table{name: key, tree: 0, cols: [], pk: [], indexes: [], slots: [], width: 0, checks: []}
+    var t = emptyTable(key)
     for c in s.cols {
         if colIndex(&t.cols, &c.name) >= 0 { return Err(e("42701", "column \"" + c.name + "\" specified more than once")) }
         var col = lexdb_sql.colDef(c.name, c.typ, c.notNull)
@@ -4130,7 +4214,8 @@ fn createTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
         }
     }
     t.tree = st.createTree(txn)
-    for c in s.cons { try addConstraint(st, txn, mut &t, &c) }
+    for c in s.cons { if c.kind != lexdb_sql.C_FOREIGN { try addConstraint(st, txn, mut &t, &c) } }
+    for c in s.cons { if c.kind == lexdb_sql.C_FOREIGN { try addConstraint(st, txn, mut &t, &c) } }
     try txn.put(CATALOG, key, encTable(&t))
     try bumpCatalog(st, txn)
     return Ok(tagOnly("CREATE TABLE"))
@@ -4139,7 +4224,9 @@ fn createTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
 fn dropTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
     match try findTable(st, txn, &s.table) {
         Some(t) {
-            dropOne(txn, &t)
+            var d = t
+            try unlinkTable(st, txn, mut &d, s.cascade)
+            dropOne(txn, &d)
             try bumpCatalog(st, txn)
             return Ok(tagOnly("DROP TABLE"))
         }
@@ -4285,9 +4372,11 @@ fn dropColumn(txn: mut &lexdb_store.Txn, t: mut &Table, i: int): Result[Unit, Db
 
 // Moves table t and its indexes to schema sc, their names kept: their
 // catalog rows under the new keys, the index rows naming the table's.
-fn moveTable(txn: mut &lexdb_store.Txn, t: mut &Table, sc: &str): Result[Unit, DbErr] {
+fn moveTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, sc: &str): Result[Unit, DbErr] {
     txn.del(CATALOG, t.name)
+    let old = t.name
     t.name = lexdb_sql.qual(sc, &lexdb_sql.baseName(&t.name))
+    try relink(st, txn, t, &old)
     for k in 0..len(t.indexes) {
         txn.del(CATALOG, idxName(&t.indexes[k].name))
         t.indexes[k].name = lexdb_sql.qual(sc, &lexdb_sql.baseName(&t.indexes[k].name))
@@ -4314,7 +4403,7 @@ fn setSchema(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, s
             return Err(e("42P07", "relation \"" + n + "\" already exists in schema \"" + sc + "\""))
         }
     }
-    return moveTable(txn, t, sc)
+    return moveTable(st, txn, t, sc)
 }
 
 fn alterIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
@@ -4351,10 +4440,10 @@ fn alterSchema(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
         return true
     })
     for k in keys {
-        match try findTable(st, txn, &k) {
+        match try byKeyOpt(st, txn, &k) {
             Some(t) {
                 var m = t
-                try moveTable(txn, mut &m, &to)
+                try moveTable(st, txn, mut &m, &to)
             }
             None {}
         }
@@ -4524,7 +4613,7 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         } else if a.kind == lexdb_sql.A_ADD_CON {
             try addConstraint(st, txn, mut &t, &a.cons[0])
         } else if a.kind == lexdb_sql.A_DROP_CON {
-            if !dropConstraint(txn, mut &t, &a.name) {
+            if !(try dropConstraint(st, txn, mut &t, &a.name, a.cascade)) {
                 if a.name == rel + "_pkey" { return Err(e("0A000", "lexdb: a table's primary key cannot be changed")) }
                 if !a.ifFlag {
                     return Err(e("42704", "constraint \"" + a.name + "\" of relation \"" + rel + "\" does not exist"))
@@ -4561,6 +4650,7 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
                 if a.ifFlag { continue }
                 return Err(e("42703", "column \"" + a.name + "\" of relation \"" + rel + "\" does not exist"))
             }
+            try fkDropColumn(st, txn, mut &t, &a.name, a.cascade)
             try dropColumn(txn, mut &t, i)
         } else if a.kind == lexdb_sql.A_RENAME {
             let key = lexdb_sql.qual(&lexdb_sql.schemaOf(&t.name), &a.name)
@@ -4569,7 +4659,9 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
                 return Err(e("42P07", "relation \"" + a.name + "\" already exists"))
             }
             txn.del(CATALOG, t.name)
+            let old = t.name
             t.name = key
+            try relink(st, txn, mut &t, &old)
             for ix in t.indexes { try txn.put(CATALOG, idxName(&ix.name), key) }
         } else {
             let i = colIndex(&t.cols, &a.name)
@@ -4590,6 +4682,7 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
                     if renamed.isSome() { t.indexes[k].pred = renamed }
                 }
                 for k in 0..len(t.checks) { t.checks[k].expr = renameCol(&t.checks[k].expr, &a.name, &a.to) }
+                try renameFkCol(st, txn, mut &t, &a.name, &a.to)
             } else if a.kind == lexdb_sql.A_SET_NOT_NULL {
                 let nulls = !t.cols[i].notNull && try anyRow(st, txn, &t, i)
                 if nulls {
@@ -4623,6 +4716,9 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         if i < 0 { return Err(e("42703", "column \"" + a.name + "\" of relation \"" + lexdb_sql.baseName(&t.name) + "\" does not exist")) }
         for ch in changes {
             if ch.col == i { return Err(e("42601", "multiple changes of the type of column \"" + a.name + "\"")) }
+        }
+        if try fkUses(st, txn, &t, &a.name) {
+            return Err(e("0A000", "lexdb: column \"" + a.name + "\" is in a foreign key, so its type cannot be changed (drop the constraint first)"))
         }
         if a.using.isNone() && !autoCast(&t.cols[i].typ, &a.col.typ) {
             return Err(e("42804", "column \"" + a.name + "\" cannot be cast automatically to type " + lexdb_sql.typeText(&a.col.typ) +
@@ -4675,8 +4771,12 @@ fn dropSchema(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         return Err(e("2BP01", "cannot drop schema " + s.table + " because other objects depend on it"))
     }
     for k in keys {
-        match try findTable(st, txn, &k) {
-            Some(t) { dropOne(txn, &t) }
+        match try byKeyOpt(st, txn, &k) {
+            Some(t) {
+                var d = t
+                try unlinkTable(st, txn, mut &d, true)
+                dropOne(txn, &d)
+            }
             None {}
         }
     }
@@ -4779,13 +4879,14 @@ fn makeName(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, cols: 
 fn hasConName(t: &Table, name: &str): bool {
     for ix in t.indexes { if ix.con && lexdb_sql.baseName(&ix.name) == name { return true } }
     for c in t.checks { if c.name == name { return true } }
+    for f in t.fks { if f.name == name { return true } }
     return false
 }
 
 // Adds constraint c to table t (its rows checked against it).
 fn addConstraint(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, c: &lexdb_sql.Constraint): Result[Unit, DbErr] {
     if c.kind == lexdb_sql.C_CHECK { return addCheck(st, txn, t, c) }
-    if c.kind != lexdb_sql.C_UNIQUE { return Err(e("0A000", "lexdb: foreign keys are not supported yet")) }
+    if c.kind == lexdb_sql.C_FOREIGN { return addForeign(st, txn, t, c) }
     var cols: []int = []
     for n in c.cols {
         let i = colIndex(&t.cols, &n)
@@ -4885,23 +4986,32 @@ fn checkChecks(t: &Table, row: &[]Val): Result[Unit, DbErr] {
     return Ok(Unit{})
 }
 
-// Drops table t's constraint named name: false when it has none.
-fn dropConstraint(txn: mut &lexdb_store.Txn, t: mut &Table, name: &str): bool {
+// Drops table t's constraint named name: false when it has none. A unique
+// constraint a foreign key needs is refused, or with cascade the foreign
+// key dropped too.
+fn dropConstraint(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, name: &str, cascade: bool): Result[bool, DbErr] {
     for k in 0..len(t.checks) {
         if t.checks[k].name == name {
             let gone = collections.removeAt(mut &t.checks, k)
-            return true
+            return Ok(true)
+        }
+    }
+    for k in 0..len(t.fks) {
+        if t.fks[k].name == name {
+            try dropOwnFk(st, txn, t, k)
+            return Ok(true)
         }
     }
     for k in 0..len(t.indexes) {
         if t.indexes[k].con && lexdb_sql.baseName(&t.indexes[k].name) == name {
+            try dropNeeded(st, txn, t, k, cascade, &("constraint " + name + " on table " + lexdb_sql.baseName(&t.name)))
             let ix = collections.removeAt(mut &t.indexes, k)
             txn.dropTree(ix.tree)
             txn.del(CATALOG, idxName(&ix.name))
-            return true
+            return Ok(true)
         }
     }
-    return false
+    return Ok(false)
 }
 
 fn dropIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
@@ -4909,11 +5019,14 @@ fn dropIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.St
     match try st.get(txn, CATALOG, idxName(&ixKey)) {
         Some(tn) {
             var t = try needTable(st, txn, &tn)
-            for ix in t.indexes {
-                if ix.name == ixKey && ix.con {
+            for k in 0..len(t.indexes) {
+                if t.indexes[k].name == ixKey && t.indexes[k].con {
                     let n = lexdb_sql.baseName(&ixKey)
                     return Err(e("2BP01", "cannot drop index " + n + " because constraint " + n + " on table " + lexdb_sql.baseName(&t.name) +
                                  " requires it (drop the constraint instead)"))
+                }
+                if t.indexes[k].name == ixKey {
+                    try dropNeeded(st, txn, mut &t, k, false, &("index " + lexdb_sql.baseName(&ixKey)))
                 }
             }
             var old = replace(mut &t.indexes, [])
@@ -4975,11 +5088,14 @@ fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
         var pc = oneShot()
         let res = try select(st, txn, &s.inner[0], params, &noTypes, lim, mut &pc)
         let defs = try defaultsOf(&t)
+        let fw = try fkTables(st, txn, &t, true, false)
+        var later: []FkLater = []
         var count = 0
         for r in res.rows {
-            try insertOne(st, txn, &t, &targets, &r, &defs)
+            try insertOne(st, txn, &t, &targets, &r, &defs, &fw, mut &later)
             count += 1
         }
+        try fkFinish(st, txn, &fw, &later)
         return Ok(tagOnly("INSERT 0 " + count.toStr()))
     }
     // its subqueries are run first
@@ -5008,6 +5124,8 @@ fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
 fn insertRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, targets: &[]int, rows: &[][]Expr,
               env: &Env): Result[Res, DbErr] {
     let defs = try defaultsOf(t)
+    let fw = try fkTables(st, txn, t, true, false)
+    var later: []FkLater = []
     var count = 0
     for r in rows {
         var vs: []Val = []
@@ -5019,15 +5137,16 @@ fn insertRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, targ
                 append(mut &vs, try eval(&r[k], env))
             }
         }
-        try insertOne(st, txn, t, targets, &vs, &defs)
+        try insertOne(st, txn, t, targets, &vs, &defs, &fw, mut &later)
         count += 1
     }
+    try fkFinish(st, txn, &fw, &later)
     return Ok(tagOnly("INSERT 0 " + count.toStr()))
 }
 
 // A row of values for the target columns (the rest NULL).
 fn insertOne(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, targets: &[]int, vs: &[]Val,
-             defs: &[]Val): Result[Unit, DbErr] {
+             defs: &[]Val, fw: &[]Table, later: mut &[]FkLater): Result[Unit, DbErr] {
     if len(vs) > len(targets) { return Err(e("42601", "INSERT has more expressions than target columns")) }
     var row: []Val = copyRow(defs)
     for k in 0..len(vs) {
@@ -5041,6 +5160,10 @@ fn insertOne(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, targe
     let enc = encRowOf(t, &row)
     try txn.putRow(t.tree, key, enc, rowHead(&enc))
     try addIndexes(st, txn, t, &row, &key)
+    if len(t.fks) > 0 {
+        let none: []Val = []
+        try childSide(st, txn, t, fw, &row, &none, later)
+    }
     return Ok(Unit{})
 }
 
@@ -5074,6 +5197,8 @@ fn update(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     }, mut &rs)
     let noAggs: []Val = []
     let defs = try defaultsOf(t)
+    let fw = try fkTables(st, txn, t, true, true)
+    var later: []FkLater = []
     for old in found {
         let env = Env{cols: &q.cols, row: &old, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs}
         var row = copyRow(&old)
@@ -5092,7 +5217,10 @@ fn update(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
         let enc = encRowOf(t, &row)
         try txn.putRow(t.tree, key, enc, rowHead(&enc))
         try changeIndexes(st, txn, t, &old, &oldKey, &row, &key)
+        if len(t.fks) > 0 { try childSide(st, txn, t, &fw, &row, &old, mut &later) }
+        if len(t.refBy) > 0 { try parentSide(st, txn, t, &fw, &old, &row, true, mut &later) }
     }
+    try fkFinish(st, txn, &fw, &later)
     return Ok(tagOnly("UPDATE " + len(found).toStr()))
 }
 
@@ -5114,11 +5242,16 @@ fn delete(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
         append(mut &found, copyRow(r))
         return Ok(true)
     }, mut &rs)
+    let fw = try fkTables(st, txn, t, false, true)
+    var later: []FkLater = []
+    let none: []Val = []
     for row in found {
         let key = keyOf(t, &row)
         txn.del(t.tree, key)
         for ix in t.indexes { if try inIndex(t, &ix, &row) { txn.del(ix.tree, idxEntry(&ix, &row, &key)) } }
+        if len(t.refBy) > 0 { try parentSide(st, txn, t, &fw, &row, &none, false, mut &later) }
     }
+    try fkFinish(st, txn, &fw, &later)
     return Ok(tagOnly("DELETE " + len(found).toStr()))
 }
 
@@ -6974,4 +7107,523 @@ pub fn (s: mut &Session) exec(sql: &str): Result[[]Res, DbErr] {
     let nt: []int = []
     for st in stmts { append(mut &out, try s.run(&st, &none, &nt)) }
     return Ok(out)
+}
+
+// ---- foreign keys (9.41)
+//
+// A foreign key is kept in its table's catalog row (Table.fks), and the
+// table it references names it back (Table.refBy), so that a statement on
+// either finds the other. Columns are kept by name.
+//
+// MATCH SIMPLE: a row with a NULL in the key's columns references nothing.
+// A row's key is looked up in the referenced table as it is written; one
+// not there (it may come later in the statement: a table referencing
+// itself) is looked up again at the statement's end. A referenced key
+// deleted or changed: RESTRICT refuses at once while a row references it;
+// NO ACTION looks again at the statement's end (the key may be back, or the
+// rows referencing it gone).
+
+// Table k from the catalog (k a catalog key, not a name to look up).
+fn byKeyOpt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, k: &str): Result[Option[Table], DbErr] {
+    match try st.get(txn, CATALOG, k) {
+        Some(v) { return Ok(Some(try decTable(k, &v))) }
+        None { return Ok(None) }
+    }
+}
+
+fn byKey(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, k: &str): Result[Table, DbErr] {
+    match try byKeyOpt(st, txn, k) {
+        Some(t) { return Ok(t) }
+        None { return Err(lexdb_base.corrupt("table \"" + lexdb_sql.shown(k) + "\", which a foreign key names")) }
+    }
+}
+
+fn putTable(txn: mut &lexdb_store.Txn, t: &Table): Result[Unit, DbErr] {
+    try txn.put(CATALOG, t.name, encTable(t))
+    return Ok(Unit{})
+}
+
+fn addKey(xs: mut &[]str, k: &str) {
+    for i in 0..len(xs) { if xs[i] == k { return } }
+    append(xs, k)
+}
+
+fn dropKey(xs: mut &[]str, k: &str) {
+    var i = 0
+    while i < len(xs) {
+        if xs[i] == k { let gone = collections.removeAt(xs, i) } else { i += 1 }
+    }
+}
+
+fn colsOf(t: &Table, names: &[]str): []int {
+    var out: []int = []
+    for n in names { append(mut &out, colIndex(&t.cols, &n)) }
+    return out
+}
+
+// Whether the first n of xs are cols, in any order.
+fn prefixSame(xs: &[]int, n: int, cols: &[]int): bool {
+    if len(xs) < n || len(cols) != n { return false }
+    for j in 0..n {
+        var found = false
+        for c in cols { if c == xs[j] { found = true } }
+        if !found { return false }
+    }
+    return true
+}
+
+// Which of table p's unique keys is cols, in any order: -1 its primary key,
+// else an index of p's (unique and not filtered), other than except; -2
+// none.
+fn keyIndex(p: &Table, cols: &[]int, except: int): int {
+    if len(p.pk) == len(cols) && prefixSame(&p.pk, len(cols), cols) { return -1 }
+    for k in 0..len(p.indexes) {
+        let ix = &p.indexes[k]
+        if k != except && ix.unique && ix.pred.isNone() && len(ix.cols) == len(cols) && prefixSame(&ix.cols, len(cols), cols) { return k }
+    }
+    return -2
+}
+
+// A foreign key's columns as numbers: its table's, the referenced table's,
+// and the referenced table's key holding them (keyIndex).
+type FkCols = record { cols: []int; refCols: []int; via: int }
+
+fn fkCols(c: &Table, f: &ForeignKey, p: &Table): FkCols {
+    let rc = colsOf(p, &f.refCols)
+    let via = keyIndex(p, &rc, -1)
+    return FkCols{cols: colsOf(c, &f.cols), refCols: rc, via: via}
+}
+
+fn valsAt(row: &[]Val, cols: &[]int): []Val {
+    var out: []Val = []
+    for c in cols { append(mut &out, row[c]) }
+    return out
+}
+
+fn hasNullAt(row: &[]Val, cols: &[]int): bool {
+    for c in cols { if isNull(&row[c]) { return true } }
+    return false
+}
+
+// Values as a key: equal values (1.5 and 1.50) the same.
+fn encVals(vs: &[]Val): str {
+    var b = newStrBuf()
+    for v in vs { encIdxPart(mut &b, &v) }
+    return b.toStr()
+}
+
+fn nullRow(n: int): []Val {
+    var out: []Val = []
+    for i in 0..n { append(mut &out, Val.Null) }
+    return out
+}
+
+// Whether table p has a row with key vals (in fc.refCols' order).
+fn parentHas(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, p: &Table, fc: &FkCols, vals: &[]Val): Result[bool, DbErr] {
+    var prow = nullRow(len(p.cols))
+    for k in 0..len(vals) { prow[fc.refCols[k]] = vals[k] }
+    if fc.via == -1 { return Ok((try st.get(txn, p.tree, keyOf(p, &prow))).isSome()) }
+    if fc.via < 0 { return Ok(false) }
+    let ix = &p.indexes[fc.via]
+    let pre = idxPrefix(ix, &prow)
+    var found = false
+    try st.scan(txn, ix.tree, pre, succ(&pre), fn(en: &lexdb_store.Entry): bool {
+        found = true
+        return false
+    })
+    return Ok(found)
+}
+
+// Whether a row of table c has vals in its columns cols: through its
+// primary key or an index starting with them, else read whole (as
+// PostgreSQL, lexdb makes no index for a foreign key).
+fn referenced(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, c: &Table, cols: &[]int, vals: &[]Val): Result[bool, DbErr] {
+    let n = len(cols)
+    var crow = nullRow(len(c.cols))
+    for j in 0..n { crow[cols[j]] = vals[j] }
+    var path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: []}
+    var sc = Scan{empty: false, point: false, lo: "", hi: "", whole: false}
+    if prefixSame(&c.pk, n, cols) {
+        var b = newStrBuf()
+        for j in 0..n { encKeyPart(mut &b, &crow[c.pk[j]]) }
+        let pre = b.toStr()
+        sc.lo = pre
+        sc.hi = succ(&pre)
+    } else {
+        for k in 0..len(c.indexes) {
+            if path.index < 0 && c.indexes[k].pred.isNone() && prefixSame(&c.indexes[k].cols, n, cols) {
+                var b = newStrBuf()
+                for j in 0..n { encIdxPart(mut &b, &crow[c.indexes[k].cols[j]]) }
+                let pre = b.toStr()
+                path.index = k
+                sc.lo = pre
+                sc.hi = succ(&pre)
+            }
+        }
+    }
+    let want = encVals(vals)
+    let all: []bool = []
+    var cur = newCursor()
+    while !cur.done {
+        var batch: [][]Val = []
+        try fetch(st, txn, c, &path, &sc, &all, mut &cur, mut &batch)
+        for r in batch { if encVals(&valsAt(&r, cols)) == want { return Ok(true) } }
+    }
+    return Ok(false)
+}
+
+fn keyText(names: &[]str, vals: &[]Val): str {
+    var vs: []str = []
+    for v in vals { append(mut &vs, text(&v)) }
+    return "Key (" + strings.join(names, ", ") + ")=(" + strings.join(&vs, ", ") + ")"
+}
+
+fn notPresent(c: &Table, f: &ForeignKey, p: &Table, vals: &[]Val): DbErr {
+    return e("23503", "insert or update on table \"" + lexdb_sql.baseName(&c.name) + "\" violates foreign key constraint \"" + f.name + "\": " +
+             keyText(&f.cols, vals) + " is not present in table \"" + lexdb_sql.baseName(&p.name) + "\".")
+}
+
+fn stillRef(p: &Table, c: &Table, f: &ForeignKey, vals: &[]Val): DbErr {
+    return e("23503", "update or delete on table \"" + lexdb_sql.baseName(&p.name) + "\" violates foreign key constraint \"" + f.name +
+             "\" on table \"" + lexdb_sql.baseName(&c.name) + "\": " + keyText(&f.refCols, vals) + " is still referenced from table \"" +
+             lexdb_sql.baseName(&c.name) + "\".")
+}
+
+// What a statement looks at again at its end: a row's key not found in the
+// table it references (gone false), or a referenced key deleted or changed
+// while rows referenced it (gone true). child is the referencing table, fk
+// its foreign key's number, vals the key.
+type FkLater = record { gone: bool; child: str; fk: int; vals: []Val }
+
+// The tables a statement on t needs for its foreign keys, t itself among
+// them: those it references (parents), those referencing it (children).
+// None when t has no foreign key either way.
+fn fkTables(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, parents: bool, children: bool): Result[[]Table, DbErr] {
+    var out: []Table = []
+    if len(t.fks) == 0 && len(t.refBy) == 0 { return Ok(out) }
+    var keys = [t.name]
+    if parents { for f in t.fks { addKey(mut &keys, &f.ref) } }
+    if children { for k in t.refBy { addKey(mut &keys, &k) } }
+    for k in keys { append(mut &out, try byKey(st, txn, &k)) }
+    return Ok(out)
+}
+
+fn findTab(fw: &[]Table, k: &str): int {
+    for i in 0..len(fw) { if fw[i].name == k { return i } }
+    return -1
+}
+
+// Row of table t written (old the row it was, [] for an INSERT): its keys
+// in the tables it references.
+fn childSide(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, fw: &[]Table, row: &[]Val, old: &[]Val,
+             later: mut &[]FkLater): Result[Unit, DbErr] {
+    for k in 0..len(t.fks) {
+        let f = &t.fks[k]
+        let pi = findTab(fw, &f.ref)
+        let fc = fkCols(t, f, &fw[pi])
+        if hasNullAt(row, &fc.cols) { continue }
+        let vals = valsAt(row, &fc.cols)
+        if len(old) > 0 && encVals(&valsAt(old, &fc.cols)) == encVals(&vals) { continue }
+        let has = try parentHas(st, txn, &fw[pi], &fc, &vals)
+        if !has { append(later, FkLater{gone: false, child: t.name, fk: k, vals: vals}) }
+    }
+    return Ok(Unit{})
+}
+
+// Row old of table t deleted, or changed to row (upd): the rows
+// referencing its keys.
+fn parentSide(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, fw: &[]Table, old: &[]Val, row: &[]Val, upd: bool,
+              later: mut &[]FkLater): Result[Unit, DbErr] {
+    for ck in t.refBy {
+        let c = &fw[findTab(fw, &ck)]
+        for k in 0..len(c.fks) {
+            if c.fks[k].ref != t.name { continue }
+            let fc = fkCols(c, &c.fks[k], t)
+            if hasNullAt(old, &fc.refCols) { continue }
+            let vals = valsAt(old, &fc.refCols)
+            if upd && encVals(&valsAt(row, &fc.refCols)) == encVals(&vals) { continue }
+            let act = if upd { c.fks[k].onUpdate } else { c.fks[k].onDelete }
+            let refd = try referenced(st, txn, c, &fc.cols, &vals)
+            if refd {
+                if act == lexdb_sql.FK_RESTRICT { return Err(stillRef(t, c, &c.fks[k], &vals)) }
+                append(later, FkLater{gone: true, child: ck, fk: k, vals: vals})
+            }
+        }
+    }
+    return Ok(Unit{})
+}
+
+// A statement's end: what it left to look at again.
+fn fkFinish(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, fw: &[]Table, later: &[]FkLater): Result[Unit, DbErr] {
+    for l in later {
+        let c = &fw[findTab(fw, &l.child)]
+        let f = &c.fks[l.fk]
+        let p = &fw[findTab(fw, &f.ref)]
+        let fc = fkCols(c, f, p)
+        let has = try parentHas(st, txn, p, &fc, &l.vals)
+        if !l.gone {
+            if !has { return Err(notPresent(c, f, p, &l.vals)) }
+        } else if !has {
+            let refd = try referenced(st, txn, c, &fc.cols, &l.vals)
+            if refd { return Err(stillRef(p, c, f, &l.vals)) }
+        }
+    }
+    return Ok(Unit{})
+}
+
+// ---- foreign keys made, dropped, renamed
+
+// Adds foreign key c to table t, the table it references naming t back.
+fn addForeign(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, c: &lexdb_sql.Constraint): Result[Unit, DbErr] {
+    if c.onDelete >= lexdb_sql.FK_CASCADE || c.onUpdate >= lexdb_sql.FK_CASCADE {
+        return Err(e("0A000", "lexdb: CASCADE, SET NULL and SET DEFAULT actions are not supported yet"))
+    }
+    let refKey = try catKey(st, txn, &c.refTable, false)
+    if refKey == t.name {
+        let f = try makeFk(st, txn, t, t, c, &refKey)
+        append(mut &t.fks, f)
+        addKey(mut &t.refBy, &t.name)
+        return Ok(Unit{})
+    }
+    match try byKeyOpt(st, txn, &refKey) {
+        Some(p) {
+            let f = try makeFk(st, txn, t, &p, c, &refKey)
+            append(mut &t.fks, f)
+            var pm = p
+            addKey(mut &pm.refBy, &t.name)
+            return putTable(txn, &pm)
+        }
+        None { return Err(e("42P01", "relation \"" + lexdb_sql.shown(&c.refTable) + "\" does not exist")) }
+    }
+}
+
+// Foreign key c of table t to table p, checked, and the rows of t there
+// checked against p.
+fn makeFk(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, p: &Table, c: &lexdb_sql.Constraint, refKey: &str): Result[ForeignKey, DbErr] {
+    var refCols: []str = []
+    if len(c.refCols) == 0 { for i in p.pk { append(mut &refCols, p.cols[i].name) } }
+    else { for n in c.refCols { append(mut &refCols, n) } }
+    if len(refCols) != len(c.cols) {
+        return Err(e("42830", "number of referencing and referenced columns for foreign key disagree"))
+    }
+    var cols: []int = []
+    for n in c.cols {
+        let i = colIndex(&t.cols, &n)
+        if i < 0 { return Err(e("42703", "column \"" + n + "\" referenced in foreign key constraint does not exist")) }
+        for k in cols { if k == i { return Err(e("42701", "column \"" + n + "\" appears twice in foreign key constraint")) } }
+        append(mut &cols, i)
+    }
+    var rc: []int = []
+    for n in refCols {
+        let i = colIndex(&p.cols, &n)
+        if i < 0 { return Err(e("42703", "column \"" + n + "\" referenced in foreign key constraint does not exist")) }
+        for k in rc { if k == i { return Err(e("42701", "column \"" + n + "\" appears twice in foreign key constraint")) } }
+        append(mut &rc, i)
+    }
+    let via = keyIndex(p, &rc, -1)
+    if via == -2 {
+        return Err(e("42830", "there is no unique constraint matching given keys for referenced table \"" + lexdb_sql.baseName(&p.name) + "\""))
+    }
+    var name = c.name
+    if len(name) == 0 { name = try makeName(st, txn, t, &c.cols, &"fkey", false) }
+    if hasConName(t, &name) { return Err(e("42710", "constraint \"" + name + "\" for relation \"" + lexdb_sql.baseName(&t.name) + "\" already exists")) }
+    for j in 0..len(cols) {
+        let a = &t.cols[cols[j]]
+        let b = &p.cols[rc[j]]
+        if a.typ.kind != b.typ.kind {
+            return Err(e("42804", "foreign key constraint \"" + name + "\" cannot be implemented: Key columns \"" + a.name + "\" and \"" + b.name +
+                         "\" are of incompatible types: " + lexdb_sql.typeText(&a.typ) + " and " + lexdb_sql.typeText(&b.typ) + "."))
+        }
+    }
+    var own: []str = []
+    for n in c.cols { append(mut &own, n) }
+    let f = ForeignKey{name: name, cols: own, ref: refKey, refCols: refCols, onDelete: c.onDelete, onUpdate: c.onUpdate}
+    // the rows there
+    let fc = FkCols{cols: cols, refCols: rc, via: via}
+    let path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: []}
+    let sc = Scan{empty: false, point: false, lo: "", hi: "", whole: false}
+    var cur = newCursor()
+    while !cur.done {
+        var batch: [][]Val = []
+        let all: []bool = []
+        try fetch(st, txn, t, &path, &sc, &all, mut &cur, mut &batch)
+        for r in batch {
+            if hasNullAt(&r, &fc.cols) { continue }
+            let vals = valsAt(&r, &fc.cols)
+            let has = try parentHas(st, txn, p, &fc, &vals)
+            if !has { return Err(notPresent(t, &f, p, &vals)) }
+        }
+    }
+    return Ok(f)
+}
+
+// Drops table t's foreign key k; the table it references no longer names t
+// when no other does.
+fn dropOwnFk(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, k: int): Result[Unit, DbErr] {
+    let f = collections.removeAt(mut &t.fks, k)
+    for g in t.fks { if g.ref == f.ref { return Ok(Unit{}) } }
+    if f.ref == t.name {
+        dropKey(mut &t.refBy, &f.ref)
+        return Ok(Unit{})
+    }
+    var p = try byKey(st, txn, &f.ref)
+    dropKey(mut &p.refBy, &t.name)
+    return putTable(txn, &p)
+}
+
+fn depends(what: &str): DbErr {
+    return e("2BP01", "cannot drop " + what + " because other objects depend on it (with CASCADE the foreign keys on it are dropped)")
+}
+
+// The foreign keys referencing table t (its own among them) that hit says
+// depend on what is dropped: refused, or with cascade dropped.
+fn dropReferencing(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, cascade: bool, what: &str,
+                   hit: &fn(&ForeignKey, &Table): bool): Result[Unit, DbErr] {
+    var kids: []str = []
+    for k in t.refBy { append(mut &kids, k) }
+    for ck in kids {
+        if ck == t.name {
+            var k = 0
+            while k < len(t.fks) {
+                let h = t.fks[k].ref == t.name && hit(&t.fks[k], t)
+                if h {
+                    if !cascade { return Err(depends(what)) }
+                    try dropOwnFk(st, txn, t, k)
+                } else {
+                    k += 1
+                }
+            }
+        } else {
+            var c = try byKey(st, txn, &ck)
+            var changed = false
+            var k = 0
+            while k < len(c.fks) {
+                let h = c.fks[k].ref == t.name && hit(&c.fks[k], t)
+                if h {
+                    if !cascade { return Err(depends(what)) }
+                    let gone = collections.removeAt(mut &c.fks, k)
+                    changed = true
+                } else {
+                    k += 1
+                }
+            }
+            if changed {
+                var still = false
+                for f in c.fks { if f.ref == t.name { still = true } }
+                if !still { dropKey(mut &t.refBy, &ck) }
+                try putTable(txn, &c)
+            }
+        }
+    }
+    return Ok(Unit{})
+}
+
+// Index ix of table t to be dropped: the foreign keys referencing t through
+// it, with no other unique key of the same columns.
+fn dropNeeded(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, ix: int, cascade: bool, what: &str): Result[Unit, DbErr] {
+    return dropReferencing(st, txn, t, cascade, what, fn(f: &ForeignKey, p: &Table): bool {
+        return keyIndex(p, &colsOf(p, &f.refCols), ix) == -2
+    })
+}
+
+// Table t to be dropped: the tables referencing it (refused, or with
+// cascade their foreign keys dropped), and those it references no longer
+// naming it.
+fn unlinkTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, cascade: bool): Result[Unit, DbErr] {
+    var k = 0
+    while k < len(t.fks) {
+        if t.fks[k].ref == t.name { try dropOwnFk(st, txn, t, k) } else { k += 1 }
+    }
+    try dropReferencing(st, txn, t, cascade, &("table " + lexdb_sql.baseName(&t.name)), fn(f: &ForeignKey, p: &Table): bool { return true })
+    var parents: []str = []
+    for f in t.fks { addKey(mut &parents, &f.ref) }
+    for pn in parents {
+        var p = try byKey(st, txn, &pn)
+        dropKey(mut &p.refBy, &t.name)
+        try putTable(txn, &p)
+    }
+    return Ok(Unit{})
+}
+
+// Column name of table t to be dropped: its foreign keys on it go (as
+// PostgreSQL's do); those of other tables referencing it are refused, or
+// with cascade dropped.
+fn fkDropColumn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, name: &str, cascade: bool): Result[Unit, DbErr] {
+    var k = 0
+    while k < len(t.fks) {
+        var uses = false
+        for n in t.fks[k].cols { if n == name { uses = true } }
+        if uses { try dropOwnFk(st, txn, t, k) } else { k += 1 }
+    }
+    let col = name + ""
+    return dropReferencing(st, txn, t, cascade, &("column " + name + " of table " + lexdb_sql.baseName(&t.name)),
+                           fn(f: &ForeignKey, p: &Table): bool {
+        for n in f.refCols { if n == col { return true } }
+        return false
+    })
+}
+
+// Whether column name of table t is in a foreign key, either way.
+fn fkUses(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, name: &str): Result[bool, DbErr] {
+    for f in t.fks { for n in f.cols { if n == name { return Ok(true) } } }
+    for ck in t.refBy {
+        if ck == t.name {
+            for f in t.fks { if f.ref == t.name { for n in f.refCols { if n == name { return Ok(true) } } } }
+        } else {
+            let c = try byKey(st, txn, &ck)
+            for f in c.fks { if f.ref == t.name { for n in f.refCols { if n == name { return Ok(true) } } } }
+        }
+    }
+    return Ok(false)
+}
+
+// Column from of table t renamed to: in its foreign keys, and in those
+// referencing it.
+fn renameFkCol(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, from: &str, to: &str): Result[Unit, DbErr] {
+    for k in 0..len(t.fks) {
+        for j in 0..len(t.fks[k].cols) { if t.fks[k].cols[j] == from { t.fks[k].cols[j] = to } }
+    }
+    var kids: []str = []
+    for k in t.refBy { append(mut &kids, k) }
+    for ck in kids {
+        if ck == t.name {
+            for k in 0..len(t.fks) {
+                if t.fks[k].ref == t.name {
+                    for j in 0..len(t.fks[k].refCols) { if t.fks[k].refCols[j] == from { t.fks[k].refCols[j] = to } }
+                }
+            }
+        } else {
+            var c = try byKey(st, txn, &ck)
+            for k in 0..len(c.fks) {
+                if c.fks[k].ref == t.name {
+                    for j in 0..len(c.fks[k].refCols) { if c.fks[k].refCols[j] == from { c.fks[k].refCols[j] = to } }
+                }
+            }
+            try putTable(txn, &c)
+        }
+    }
+    return Ok(Unit{})
+}
+
+// Table t's catalog key changed from old (a rename, another schema): the
+// tables it references and those referencing it name the new one.
+fn relink(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, old: &str): Result[Unit, DbErr] {
+    let now = t.name
+    for k in 0..len(t.fks) { if t.fks[k].ref == old { t.fks[k].ref = now } }
+    for k in 0..len(t.refBy) { if t.refBy[k] == old { t.refBy[k] = now } }
+    var parents: []str = []
+    for f in t.fks { if f.ref != now { addKey(mut &parents, &f.ref) } }
+    for pn in parents {
+        var p = try byKey(st, txn, &pn)
+        for k in 0..len(p.refBy) { if p.refBy[k] == old { p.refBy[k] = now } }
+        try putTable(txn, &p)
+    }
+    var kids: []str = []
+    for ck in t.refBy { if ck != now { addKey(mut &kids, &ck) } }
+    for ck in kids {
+        var c = try byKey(st, txn, &ck)
+        for k in 0..len(c.fks) { if c.fks[k].ref == old { c.fks[k].ref = now } }
+        try putTable(txn, &c)
+    }
+    return Ok(Unit{})
 }

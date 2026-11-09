@@ -393,7 +393,7 @@ Built on 2026-11-09 on branch `lexdb`, about 6,300 lines in
 (cache, trees, transactions, log, checkpoints, recovery, snapshots),
 `lexdb_sql` (lexer, parser), `lexdb_exec` (catalog, rows, keys, planner,
 statements, sessions), `lexdb_wire` (protocol 3.0) and `lexdb` (the
-server). Tests: `python3 lexell/tests/lexdb.py` (48 programs in
+server). Tests: `python3 lexell/tests/lexdb.py` (49 programs in
 `tests/lexdb/run`, under `LXL_CHECK=1`).
 
     lexell/compiler/out/lxlc lexell/cmd/lexdb.lxl -o lexdb
@@ -593,8 +593,8 @@ is the comparison to make.
    SCHEMA, ALTER INDEX ... RENAME, ALTER SCHEMA ... RENAME. Column
    defaults, ADD COLUMN ... DEFAULT among them, are built (9.38).
 14. Constraints (the user's request, 2026-11-09), in steps: (1) UNIQUE
-   (built: 9.39); (2) CHECK (built: 9.40); (3) FOREIGN KEY, with its ON DELETE and ON
-   UPDATE actions.
+   (built: 9.39); (2) CHECK (built: 9.40); (3) FOREIGN KEY, with NO ACTION and RESTRICT
+   (built: 9.41); (4) the CASCADE, SET NULL and SET DEFAULT actions.
 
 ### 9.5 Indexes and joins (D4)
 
@@ -2610,3 +2610,117 @@ Planted, each caught:
 - a table's one-column check named `t_check`;
 - an unknown column, an aggregate or a non-boolean allowed;
 - DROP CONSTRAINT doing nothing.
+
+### 9.41 Foreign keys
+
+**Where.**
+- In CREATE TABLE: `REFERENCES t [(cols)]` on a column, `FOREIGN KEY
+  (cols) REFERENCES t [(cols)]` among the columns, either after
+  `CONSTRAINT name`. Without columns, t's primary key.
+- `ALTER TABLE ADD [CONSTRAINT name] FOREIGN KEY ...`, which checks the
+  rows there; DROP CONSTRAINT.
+- `ON DELETE` and `ON UPDATE` with NO ACTION (the default) or RESTRICT.
+  CASCADE, SET NULL and SET DEFAULT are parsed and refused (0A000) until
+  the next step.
+- MATCH SIMPLE, NOT DEFERRABLE and INITIALLY IMMEDIATE are accepted.
+  MATCH FULL and PARTIAL, DEFERRABLE and INITIALLY DEFERRED are 0A000.
+
+**When made**, as PostgreSQL:
+- the referenced columns must be the primary key or a unique index that is
+  not filtered (unique constraint or index), in any order (42830);
+- as many columns on each side (42830);
+- each pair of the same kind of type: the key is looked up by its encoded
+  value, equal for int and bigint or for numerics of other scales (42804);
+- columns missing (42703) or twice (42701);
+- a name taken (42710).
+
+Names are made as PostgreSQL makes them: `t_col_fkey`.
+
+**Kept** in both catalog rows, after the checks: the referencing table's
+`fks`, each with its name, columns, referenced table's catalog key and
+columns (by name) and actions; and the referenced table's `refBy`, the
+tables referencing it (itself among them if so). A statement on either
+table finds the other through them, and `fkTables` loads the tables a
+statement needs once. A table with neither does no foreign-key work.
+
+**Checked, as PostgreSQL checks them:**
+- *A row written to the referencing table* (INSERT, UPDATE of the key's
+  columns): a NULL in the key's columns references nothing (MATCH SIMPLE).
+  Otherwise the key is looked up in the referenced table, through its
+  primary key or the unique index (`parentHas`). A key not there may be
+  inserted later in the same statement (a table referencing itself, a
+  child row before its parent), so it is looked up again at the
+  statement's end (`fkFinish`), then refused (23503 "... is not present
+  in table ...").
+- *A referenced key deleted or changed:* the rows referencing it are
+  looked for (`referenced`) through the referencing table's primary key or
+  an index starting with the key's columns; failing both, the whole table
+  is read. With rows found, RESTRICT refuses at once. NO ACTION looks again
+  at the statement's end (23503 "... is still referenced from table ...").
+  By then the key may be back, or the rows referencing it gone: a table
+  referencing itself can be emptied with one DELETE.
+- *Two transactions racing* (a parent deleted while a child referencing it
+  is inserted) are caught by serializable validation: the insert read the
+  parent's row.
+
+**What depends on a foreign key:**
+- *DROP TABLE of a referenced table* is 2BP01 unless CASCADE (new to DROP
+  TABLE), which drops the foreign keys referencing it. Dropping the
+  referencing table removes it from the referenced table's list.
+- *DROP SCHEMA ... CASCADE* does the same for each table.
+- *DROP COLUMN:* the table's own foreign keys on the column are dropped
+  (as PostgreSQL's are). A column other tables reference is 2BP01 unless
+  CASCADE.
+- *DROP CONSTRAINT or DROP INDEX of a unique key* a foreign key needs, with
+  no other unique key of those columns, is 2BP01. DROP CONSTRAINT ...
+  CASCADE drops the foreign key too.
+- *RENAME COLUMN, RENAME TO, SET SCHEMA and ALTER SCHEMA RENAME* rewrite
+  the names in the other tables' rows (`renameFkCol`, `relink`).
+- *A type change* of a column in a foreign key, on either side, is 0A000:
+  drop the constraint first.
+
+**Cost**, on a real file:
+
+| Operation | Time |
+|---|---:|
+| 100K rows in 1000-row INSERTs, no key | 317 ms |
+| Same, with a foreign key | 386 ms (0.7 µs a row, one lookup) |
+| Delete of a parent row, no referencing table | 1.06 ms (the commit's fdatasync) |
+| Same, 100K referencing rows, an index on the key's column | 1.05 ms |
+| Same, 100K referencing rows, no index | 19.9 ms (every row read) |
+
+As in PostgreSQL, an index on the referencing columns is the user's to
+make.
+
+**Checked** by `exec_fkey`:
+- missing keys, present keys, NULLs, a unique key referenced, updates;
+- deletes and key changes, referenced and not;
+- a table referencing itself (a parent later in the statement, the whole
+  table deleted); RESTRICT against NO ACTION;
+- ADD over violating rows and then without;
+- errors when made;
+- the unique key, an index, a table and columns that keys need, with and
+  without CASCADE;
+- renames, moves, a schema renamed, with the keys checked under the new
+  names;
+- type changes refused;
+- two sessions racing;
+- a rollback;
+- a dropped key's table no longer named;
+- a reopen.
+
+Planted, each caught:
+- INSERT, UPDATE (either side) or DELETE not checked;
+- the statement's end not checked, or a missing key let through there;
+- NO ACTION as RESTRICT and the reverse;
+- NULLs looked up;
+- foreign keys or `refBy` not saved;
+- the rows there not checked;
+- a unique key always found;
+- DROP CONSTRAINT, DROP INDEX or DROP TABLE of what a key needs allowed;
+- a dropped table or key still named;
+- renames not carried to the other table (table, column), caught once the
+  test checked the keys while the columns were renamed;
+- a type change allowed;
+- a dropped column's own key kept, or a referenced column dropped;
+- names, types or the referenced key not compared.

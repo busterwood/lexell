@@ -1,0 +1,174 @@
+// lexdb_exec: foreign keys (design/lexdb.md 9.41). REFERENCES on a column
+// and FOREIGN KEY (...) REFERENCES on the table, to a primary key or a
+// unique constraint, named or not; ALTER TABLE ADD ... FOREIGN KEY over the
+// rows there; DROP CONSTRAINT. Checked: inserts and updates of the
+// referencing table (NULLs reference nothing; a key inserted later in the
+// statement counts), deletes and key changes of the referenced one (NO
+// ACTION at the statement's end, RESTRICT at once). What DROP TABLE, DROP
+// COLUMN, DROP CONSTRAINT and DROP INDEX of what a key needs do (refused,
+// or with CASCADE the foreign key dropped); renames and moves keep the
+// keys; a type change is refused. Two sessions racing; rolled back; after
+// a reopen.
+// expect: created: CREATE TABLE CREATE TABLE
+// expect: missing: 23503 insert or update on table "c" violates foreign key constraint "c_pid_fkey": Key (pid)=(9) is not present in table "p".
+// expect: present: INSERT 0 1, NULL: INSERT 0 1, by the unique key: 23503 "c_code_fk", then INSERT 0 1
+// expect: update: 23503 "c_pid_fkey", other columns: UPDATE 1
+// expect: referenced: 23503 update or delete on table "p" violates foreign key constraint "c_pid_fkey" on table "c": Key (id)=(1) is still referenced from table "c".
+// expect: unreferenced: DELETE 1; key changed: 23503 "c_pid_fkey", other columns: UPDATE 1, the unique key: 23503 "c_code_fk"
+// expect: itself: INSERT 0 2, missing 23503 "tree_parent_fkey", whole table: DELETE 3
+// expect: restrict: 23503 "tr_parent_fkey", 3 left
+// expect: added over rows: 23503 insert or update on table "a" violates foreign key constraint "a_pid_fkey": Key (pid)=(7) is not present in table "p".; then ALTER TABLE, 23503 "a_pid_fkey"
+// expect: made: 42P01 42830 42830 42804 42703 42701 0A000 0A000 0A000 42710
+// expect: drop the unique key: 2BP01, cascade ALTER TABLE, then INSERT 0 1; an index it needs: 2BP01, with another: DROP INDEX
+// expect: drop table: 2BP01, the referencing one DROP TABLE, then DROP TABLE; cascade DROP TABLE, its key gone INSERT 0 1
+// expect: drop column: own ALTER TABLE INSERT 0 1; referenced 2BP01, cascade ALTER TABLE INSERT 0 1
+// expect: renamed: 23503 insert or update on table "kid2" violates foreign key constraint "k_fk": Key (ppx)=(5) is not present in table "par2".; 23503 update or delete on table "par2" violates foreign key constraint "k_fk" on table "kid2": Key (pkx)=(1) is still referenced from table "kid2".
+// expect: moved: 23503 "k_fk", schema renamed: 23503 "k_fk", 23503 update or delete on table "par2" violates foreign key constraint "k_fk" on table "kid2": Key (pk)=(1) is still referenced from table "kid2".
+// expect: type change: 0A000 0A000
+// expect: racing: INSERT 0 1, other session DELETE 1, commit 40001
+// expect: rolled back: INSERT 0 1
+// expect: dropped key: ALTER TABLE DROP TABLE, then DELETE 1
+// expect: reopened: 23503 "c_pid_fkey", 23503 "c_pid_fkey", INSERT 0 1
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if !r.hasRows { return r.tag }
+            var out: []str = []
+            for row in r.rows {
+                var vs: []str = []
+                for v in row { append(mut &vs, lexdb_exec.text(&v)) }
+                append(mut &out, strings.join(&vs, "|"))
+            }
+            return strings.join(&out, " ")
+        }
+        Err(e) { return e.state + " " + e.msg }
+    }
+}
+
+fn state(s: mut &lexdb_exec.Session, sql: &str): str { return q(s, sql)[0..5] }
+
+// A violation's state and constraint.
+fn which(s: mut &lexdb_exec.Session, sql: &str): str {
+    let r = q(s, sql)
+    if !strings.startsWith(r, "23503") { return r }
+    let i = strings.indexOf(&r, "constraint \"", 0)
+    let j = strings.indexOf(&r, "\"", i + 12)
+    return "23503 " + r[i + 11..j + 1]
+}
+
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: 256 * 1024, segBytes: 1024 * 1024, ckptBytes: 512 * 1024, snapNodes: 100000}
+}
+
+fn main() {
+    let fs = lexdb_disk.sim(41)
+    lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        let p1 = q(mut &s, &"create table p (id int primary key, code text unique, note text)")
+        let c1 = q(mut &s, &"create table c (id int primary key, pid int references p, pcode text, constraint c_code_fk foreign key (pcode) references p (code))")
+        println("created: " + p1 + " " + c1)
+        let i1 = q(mut &s, &"insert into p values (1, 'a', 'x'), (2, 'b', 'y'), (3, 'c', 'z')")
+        println("missing: " + q(mut &s, &"insert into c values (1, 9, null)"))
+        println("present: " + q(mut &s, &"insert into c values (1, 1, null)") + ", NULL: " + q(mut &s, &"insert into c values (2, null, null)") +
+                ", by the unique key: " + which(mut &s, &"insert into c values (3, 1, 'q')") + ", then " + q(mut &s, &"insert into c values (3, 1, 'b')"))
+        println("update: " + which(mut &s, &"update c set pid = 8 where id = 1") + ", other columns: " + q(mut &s, &"update c set pcode = 'a' where id = 2"))
+        println("referenced: " + q(mut &s, &"delete from p where id = 1"))
+        println("unreferenced: " + q(mut &s, &"delete from p where id = 3") + "; key changed: " + which(mut &s, &"update p set id = 10 where id = 1") +
+                ", other columns: " + q(mut &s, &"update p set note = 'w' where id = 1") + ", the unique key: " + which(mut &s, &"update p set code = 'aa' where id = 1"))
+
+        // a table referencing itself: a parent may come later in the statement
+        let t1 = q(mut &s, &"create table tree (id int primary key, parent int references tree (id))")
+        let t4 = q(mut &s, &"insert into tree values (2, 1), (1, null)")
+        let t5 = which(mut &s, &"insert into tree values (3, 9)")
+        let t6 = q(mut &s, &"insert into tree values (3, 2)")
+        println("itself: " + t4 + ", missing " + t5 + ", whole table: " + q(mut &s, &"delete from tree"))
+        let t2 = q(mut &s, &"create table tr (id int primary key, parent int references tr on delete restrict on update restrict)")
+        let t3 = q(mut &s, &"insert into tr values (1, null), (2, 1), (3, 2)")
+        println("restrict: " + which(mut &s, &"delete from tr") + ", " + q(mut &s, &"select count(*) from tr") + " left")
+
+        let a1 = q(mut &s, &"create table a (id int primary key, pid int)")
+        let a2 = q(mut &s, &"insert into a values (1, 1), (2, 7), (3, null)")
+        let a3 = q(mut &s, &"alter table a add foreign key (pid) references p")
+        let a4 = q(mut &s, &"update a set pid = 2 where id = 2")
+        println("added over rows: " + a3 + "; then " + q(mut &s, &"alter table a add foreign key (pid) references p") + ", " + which(mut &s, &"insert into a values (4, 5)"))
+
+        let m0 = q(mut &s, &"create table n (id int primary key, x int, t text)")
+        println("made: " + state(mut &s, &"create table e1 (id int primary key, x int references nope)") + " " +
+                state(mut &s, &"create table e2 (id int primary key, x int, foreign key (id, x) references p)") + " " +
+                state(mut &s, &"create table e3 (id int primary key, x int references p (note))") + " " +
+                state(mut &s, &"create table e4 (id int primary key, x text references p)") + " " +
+                state(mut &s, &"create table e5 (id int primary key, foreign key (zz) references p)") + " " +
+                state(mut &s, &"create table e6 (id int primary key, x int, foreign key (x, x) references n (id, x))") + " " +
+                state(mut &s, &"create table e7 (id int primary key, x int references p on delete cascade)") + " " +
+                state(mut &s, &"create table e8 (id int primary key, x int references p match full)") + " " +
+                state(mut &s, &"create table e9 (id int primary key, x int references p deferrable)") + " " +
+                state(mut &s, &"create table e10 (id int primary key, x int constraint f references p, y int constraint f references p)"))
+
+        // what a foreign key needs
+        let d1 = state(mut &s, &"alter table p drop constraint p_code_key")
+        let d2 = q(mut &s, &"alter table p drop constraint p_code_key cascade")
+        let d3 = q(mut &s, &"insert into c values (4, 2, 'nope')")
+        let u1 = q(mut &s, &"create table u (id int primary key, k int); create unique index u_k on u (k); create table uk (id int primary key, k int references u (k))")
+        let d4 = state(mut &s, &"drop index u_k")
+        let d5 = q(mut &s, &"create unique index u_k2 on u (k)")
+        println("drop the unique key: " + d1 + ", cascade " + d2 + ", then " + d3 + "; an index it needs: " + d4 + ", with another: " + q(mut &s, &"drop index u_k"))
+        let x1 = q(mut &s, &"create table xp (id int primary key); create table xc (id int primary key, r int references xp)")
+        let x2 = state(mut &s, &"drop table xp")
+        let x3 = q(mut &s, &"drop table xc")
+        let x4 = q(mut &s, &"drop table xp")
+        let y1 = q(mut &s, &"create table yp (id int primary key); create table yc (id int primary key, r int references yp)")
+        let y2 = q(mut &s, &"drop table yp cascade")
+        println("drop table: " + x2 + ", the referencing one " + x3 + ", then " + x4 + "; cascade " + y2 + ", its key gone " + q(mut &s, &"insert into yc values (1, 99)"))
+        let z1 = q(mut &s, &"create table zp (id int primary key, k int unique); create table zc (id int primary key, r int references zp, rk int references zp (k))")
+        let z2 = q(mut &s, &"alter table zc drop column r")
+        let z3 = q(mut &s, &"insert into zc values (1, null)")
+        let z4 = state(mut &s, &"alter table zp drop column k")
+        let z5 = q(mut &s, &"alter table zp drop column k cascade")
+        println("drop column: own " + z2 + " " + q(mut &s, &"insert into zc values (2, null)") + "; referenced " + z4 + ", cascade " + z5 + " " +
+                q(mut &s, &"insert into zc values (3)"))
+
+        // renames and moves keep the keys
+        let r1 = q(mut &s, &"create table par (pk int primary key); create table kid (id int primary key, pp int, constraint k_fk foreign key (pp) references par)")
+        let r2 = q(mut &s, &"insert into par values (1); insert into kid values (1, 1)")
+        let r3 = q(mut &s, &"alter table par rename to par2; alter table kid rename to kid2; alter table kid2 rename pp to ppx; alter table par2 rename pk to pkx")
+        println("renamed: " + q(mut &s, &"insert into kid2 values (2, 5)") + "; " + q(mut &s, &"delete from par2"))
+        let r4 = q(mut &s, &"alter table kid2 rename ppx to pp; alter table par2 rename pkx to pk")
+        let r5 = q(mut &s, &"create schema sx; alter table par2 set schema sx")
+        let r6 = which(mut &s, &"insert into kid2 values (2, 5)")
+        let r7 = q(mut &s, &"alter table kid2 set schema sx; alter schema sx rename to sy")
+        println("moved: " + r6 + ", schema renamed: " + which(mut &s, &"insert into sy.kid2 values (2, 5)") + ", " + q(mut &s, &"delete from sy.par2"))
+        println("type change: " + state(mut &s, &"alter table sy.kid2 alter pp type bigint") + " " + state(mut &s, &"alter table sy.par2 alter pk type bigint"))
+
+        // a parent deleted while a child referencing it is inserted
+        var s2 = lexdb_exec.newSession(st)
+        let g1 = q(mut &s, &"insert into p values (5, 'e', null)")
+        let g2 = q(mut &s, &"begin")
+        let g3 = q(mut &s, &"insert into c values (5, 5, null)")
+        let g4 = q(mut &s2, &"delete from p where id = 5")
+        println("racing: " + g3 + ", other session " + g4 + ", commit " + state(mut &s, &"commit"))
+
+        let b1 = q(mut &s, &"begin")
+        let b2 = q(mut &s, &"alter table n add constraint n_fk foreign key (x) references p")
+        let b3 = q(mut &s, &"rollback")
+        println("rolled back: " + q(mut &s, &"insert into n values (1, 99, 'x')"))
+        // a foreign key dropped, then its table: the referenced table no longer names it
+        let k1 = q(mut &s, &"alter table a drop constraint a_pid_fkey")
+        let k2 = q(mut &s, &"drop table a")
+        println("dropped key: " + k1 + " " + k2 + ", then " + q(mut &s, &"insert into p values (6, 'f', null); delete from p where id = 6"))
+        return 0
+    }).unwrap()
+
+    lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int {
+        var s = lexdb_exec.newSession(st)
+        println("reopened: " + which(mut &s, &"insert into c values (9, 9, null)") + ", " + which(mut &s, &"delete from p where id = 1") + ", " +
+                q(mut &s, &"insert into c values (9, 1, null)"))
+        return 0
+    }).unwrap()
+}
