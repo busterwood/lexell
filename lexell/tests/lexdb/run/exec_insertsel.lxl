@@ -1,0 +1,108 @@
+// lexdb_exec: INSERT ... SELECT, and WITH before INSERT, UPDATE and
+// DELETE (design/lexdb.md 9.22):
+// - all columns, a column list with expressions, a query in parentheses;
+// - a table into itself (the query reads none of the rows it inserts);
+// - a duplicate key from the query: an error, and nothing inserted;
+// - more columns than targets; NULL into a NOT NULL column;
+// - WITH ... INSERT, a recursive WITH ... INSERT, WITH ... UPDATE and
+//   WITH ... DELETE using the CTE in subqueries;
+// - a parameter in the query, its type guessed from the comparison;
+// - in a block, rolled back;
+// - WITH before anything else: an error.
+// expect: all columns: INSERT 0 3, rows 1 2 3
+// expect: column list: INSERT 0 2, rows 101|ax 102|bx
+// expect: in parentheses: INSERT 0 1, rows 3|c
+// expect: into itself: INSERT 0 3, count 6
+// expect: duplicate: 23505, count 6
+// expect: too many columns: 42601
+// expect: null into not null: 23502
+// expect: with insert: INSERT 0 2, rows 1|w 2|w
+// expect: recursive: INSERT 0 5, sum 15
+// expect: with update: UPDATE 2, rows 1|u 2|u 3|c
+// expect: with delete: DELETE 2, left 4
+// expect: parameter: INSERT 0 2, type int4
+// expect: rolled back: INSERT 0 4, then 0
+// expect: with then create: 42601
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_sql"
+
+type Val = lexdb_sql.Val
+
+// the rows (values joined by |), or the tag, or the error's state
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if !r.hasRows { return r.tag }
+            var out: []str = []
+            for row in r.rows {
+                var vs: []str = []
+                for v in row { append(mut &vs, lexdb_exec.text(&v)) }
+                append(mut &out, strings.join(&vs, "|"))
+            }
+            return strings.join(&out, " ")
+        }
+        Err(e) { return e.state }
+    }
+}
+
+fn one(s: mut &lexdb_exec.Session, sql: &str) {
+    match s.exec(sql) {
+        Ok(_) {}
+        Err(e) { println(sql + ": " + e.state + " " + e.msg) }
+    }
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(31), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 1024 * 1024, ckptBytes: 1024 * 1024, snapNodes: 100000}, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        one(mut &s, &"create table a (id int primary key, v text)")
+        one(mut &s, &"insert into a values (1, 'a'), (2, 'b'), (3, 'c')")
+        one(mut &s, &"create table b (id int primary key, v text not null)")
+
+        println("all columns: " + q(mut &s, &"insert into b select * from a") + ", rows " + q(mut &s, &"select id from b order by id"))
+        one(mut &s, &"delete from b")
+        println("column list: " + q(mut &s, &"insert into b (v, id) select v || 'x', id + 100 from a where id < 3") +
+                ", rows " + q(mut &s, &"select id, v from b order by id"))
+        one(mut &s, &"delete from b")
+        println("in parentheses: " + q(mut &s, &"insert into b (select * from a where id = 3)") + ", rows " + q(mut &s, &"select * from b"))
+
+        println("into itself: " + q(mut &s, &"insert into a select id + 1000, v from a") + ", count " + q(mut &s, &"select count(*) from a"))
+        println("duplicate: " + q(mut &s, &"insert into a select id + 2000, v from a union all select 2001, 'dup'") +
+                ", count " + q(mut &s, &"select count(*) from a"))
+        println("too many columns: " + q(mut &s, &"insert into b (id) select id, v from a"))
+        println("null into not null: " + q(mut &s, &"insert into b select id + 50, null from a"))
+
+        one(mut &s, &"delete from b")
+        println("with insert: " + q(mut &s, &"with x as (select id from a where id < 3) insert into b select id, 'w' from x") +
+                ", rows " + q(mut &s, &"select * from b order by id"))
+        one(mut &s, &"create table n (i int primary key, tag text)")
+        println("recursive: " + q(mut &s, &"with recursive r(i) as (select 1 union all select i + 1 from r where i < 5) insert into n select i, 'r' from r") +
+                ", sum " + q(mut &s, &"select sum(i) from n"))
+        println("with update: " + q(mut &s, &"with x as (select id from a where id < 3) update a set v = 'u' where id in (select id from x)") +
+                ", rows " + q(mut &s, &"select id, v from a where id < 4 order by id"))
+        println("with delete: " + q(mut &s, &"with gone as (select id from a where v = 'u') delete from a where id in (select id from gone)") +
+                ", left " + q(mut &s, &"select count(*) from a"))
+
+        // a parameter: its type from the comparison in the query
+        one(mut &s, &"delete from b")
+        let ps = lexdb_sql.parse(&"insert into b select id, v from a where id > $1 and id < 1004").unwrap()
+        let pt = s.paramTypes(&ps[0], &[])
+        var pc = lexdb_exec.oneShot()
+        let pr = s.runCached(&ps[0], &[Val.Int(1001)], &pt, mut &pc)
+        let tag = match pr { Ok(r) { r.tag } Err(x) { x.state } }
+        println("parameter: " + tag + ", type " + (if pt[0] == lexdb_sql.OID_INT8 { "int8" } else if pt[0] == lexdb_sql.OID_INT4 { "int4" } else { pt[0].toStr() }))
+
+        one(mut &s, &"delete from b")
+        one(mut &s, &"begin")
+        let inBlock = q(mut &s, &"insert into b select id + 10, v from a where id < 1004")
+        one(mut &s, &"rollback")
+        println("rolled back: " + inBlock + ", then " + q(mut &s, &"select count(*) from b"))
+        println("with then create: " + q(mut &s, &"with x as (select 1) create table z (id int primary key)"))
+        return 0
+    }).unwrap()
+}

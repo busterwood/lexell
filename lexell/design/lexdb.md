@@ -393,7 +393,7 @@ Built on 2026-11-09 on branch `lexdb`, about 6,300 lines in
 (cache, trees, transactions, log, checkpoints, recovery, snapshots),
 `lexdb_sql` (lexer, parser), `lexdb_exec` (catalog, rows, keys, planner,
 statements, sessions), `lexdb_wire` (protocol 3.0) and `lexdb` (the
-server). Tests: `python3 lexell/tests/lexdb.py` (31 programs in
+server). Tests: `python3 lexell/tests/lexdb.py` (32 programs in
 `tests/lexdb/run`, under `LXL_CHECK=1`).
 
     lexell/compiler/out/lxlc lexell/cmd/lexdb.lxl -o lexdb
@@ -512,7 +512,11 @@ is the comparison to make.
 2. Conflicts per row, not per leaf (built: 9.19).
 3. Smaller items, in the order the user set (after schemas):
    - built: an uncorrelated `IN (subquery)` as lookups (9.21);
-   - `WITH` before INSERT, UPDATE and DELETE;
+   - built: `WITH` before INSERT, UPDATE and DELETE, and `INSERT ...
+     SELECT` (9.22); not done: data-modifying CTEs (`WITH d AS (DELETE
+     ... RETURNING ...)`), which wait for `RETURNING`, and `UPDATE ...
+     FROM`, the way to join a CTE into an UPDATE (now only through
+     subqueries);
    - a correlated subquery's value as a lookup's key (now it is only a
      filter);
    - correlated subqueries in GROUP BY and in aggregates' arguments;
@@ -1474,4 +1478,46 @@ Caught, each put back:
 Not caught, as expected: the fallback reading the whole index (the same
 rows, only slower), and NULLs looked up (the subquery's values never hold
 them).
+
+### 9.22 INSERT ... SELECT, and WITH before INSERT, UPDATE and DELETE
+
+- **`INSERT INTO t [(cols)] SELECT ...`**, or the query in parentheses.
+  The query is kept as the statement's `inner[0]`, with its own
+  subqueries. It runs to its end before the first row goes in, so `INSERT
+  INTO t SELECT ... FROM t` never reads its own rows. Its rows go through
+  the same checks as VALUES' (`insertOne`): types, NOT NULL, the key,
+  the indexes. A parameter in the query takes its type from what it is
+  compared with there.
+- **`WITH ... INSERT | UPDATE | DELETE`.** A CTE is parsed again where it
+  is named (9.10), so it needs no executor change: it is used in an
+  INSERT's query, or in an UPDATE's or a DELETE's subqueries. Recursive
+  CTEs work too.
+
+Not done:
+
+- `RETURNING`, and with it data-modifying CTEs;
+- `UPDATE ... FROM` and `DELETE ... USING`;
+- `INSERT ... ON CONFLICT`;
+- `DEFAULT VALUES` and `DEFAULT` in a VALUES row (there are no column
+  defaults yet).
+
+`exec_insertsel` covers:
+
+- all columns, a column list with expressions, a query in parentheses;
+- a table into itself;
+- a duplicate key from the query (an error, nothing inserted);
+- too many columns, and NULL into NOT NULL;
+- WITH before INSERT (plain and recursive), UPDATE and DELETE;
+- a parameter's guessed type;
+- a block rolled back;
+- WITH before CREATE (an error).
+
+`exec_with`'s case of a refused `WITH ... INSERT` now uses CREATE TABLE.
+
+Caught, each put back:
+
+- the query's rows cut short;
+- the query's subqueries not its own;
+- no parameter type from the query;
+- the column count unchecked.
 

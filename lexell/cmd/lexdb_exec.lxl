@@ -3585,6 +3585,19 @@ fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
             append(mut &targets, i)
         }
     }
+    if len(s.inner) > 0 {
+        // INSERT ... SELECT: the query runs to its end first, so it never
+        // reads the rows it inserts
+        let noTypes: []int = []
+        var pc = oneShot()
+        let res = try select(st, txn, &s.inner[0], params, &noTypes, lim, mut &pc)
+        var count = 0
+        for r in res.rows {
+            try insertOne(st, txn, &t, &targets, &r)
+            count += 1
+        }
+        return Ok(tagOnly("INSERT 0 " + count.toStr()))
+    }
     // its subqueries are run first
     var sc = newScope(params, &[])
     let noFrom: []lexdb_sql.FromItem = []
@@ -3612,20 +3625,28 @@ fn insertRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, targ
               env: &Env): Result[Res, DbErr] {
     var count = 0
     for r in rows {
-        if len(r) > len(targets) { return Err(e("42601", "INSERT has more expressions than target columns")) }
-        var row: []Val = array(len(t.cols), Val.Null)
-        for k in 0..len(r) {
-            let ci = targets[k]
-            row[ci] = try coerce(try eval(&r[k], env), &t.cols[ci].typ)
-        }
-        try checkRow(t, &row)
-        let key = keyOf(t, &row)
-        if (try st.get(txn, t.tree, key)).isSome() { return Err(dupKey(t, &row)) }
-        try txn.put(t.tree, key, encRow(&row))
-        try addIndexes(st, txn, t, &row, &key)
+        var vs: []Val = []
+        for x in r { append(mut &vs, try eval(&x, env)) }
+        try insertOne(st, txn, t, targets, &vs)
         count += 1
     }
     return Ok(tagOnly("INSERT 0 " + count.toStr()))
+}
+
+// A row of values for the target columns (the rest NULL).
+fn insertOne(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, targets: &[]int, vs: &[]Val): Result[Unit, DbErr] {
+    if len(vs) > len(targets) { return Err(e("42601", "INSERT has more expressions than target columns")) }
+    var row: []Val = array(len(t.cols), Val.Null)
+    for k in 0..len(vs) {
+        let ci = targets[k]
+        row[ci] = try coerce(vs[k], &t.cols[ci].typ)
+    }
+    try checkRow(t, &row)
+    let key = keyOf(t, &row)
+    if (try st.get(txn, t.tree, key)).isSome() { return Err(dupKey(t, &row)) }
+    try txn.put(t.tree, key, encRow(&row))
+    try addIndexes(st, txn, t, &row, &key)
+    return Ok(Unit{})
 }
 
 fn update(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, lim: Limits): Result[Res, DbErr] {
@@ -4865,6 +4886,7 @@ fn setParam(x: &Expr, oid: int, out: mut &[]int) {
 }
 
 fn guessParams(st: &lexdb_store.Store, s: &lexdb_sql.Stmt, out: mut &[]int, path: &[]str) {
+    if s.kind == lexdb_sql.S_INSERT && len(s.inner) > 0 { guessParams(st, &s.inner[0], out, path) }
     if s.setop != 0 {
         for b in s.inner { guessParams(st, &b, out, path) }
         return

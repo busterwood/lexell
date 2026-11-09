@@ -845,14 +845,32 @@ fn (p: mut &P) createTable(): Result[Stmt, lexdb_base.DbErr] {
     return Ok(s)
 }
 
+// "(" then SELECT: a query in parentheses, not a column list.
+fn (p: &P) selectNext(): bool {
+    return p.pos + 1 < len(p.toks) && p.toks[p.pos + 1].kind == T_IDENT && p.toks[p.pos + 1].text == "select"
+}
+
 fn (p: mut &P) insert(): Result[Stmt, lexdb_base.DbErr] {
     try p.expectKw("into")
     var s = newStmt(S_INSERT)
     s.table = try p.qname()
-    if p.acceptKw("(") {
+    if p.isKw("(") && !p.selectNext() {
+        p.pos += 1
         append(mut &s.names, try p.name())
         while p.acceptKw(",") { append(mut &s.names, try p.name()) }
         try p.expectKw(")")
+    }
+    // INSERT ... SELECT: the query in inner[0], with its own subqueries
+    let paren = p.isKw("(") && p.selectNext()
+    if paren || p.isKw("select") {
+        if paren { p.pos += 1 }
+        try p.expectKw("select")
+        var q = try p.select()
+        if paren { try p.expectKw(")") }
+        q.subs = replace(mut &p.subs, [])
+        q.params = p.params
+        append(mut &s.inner, q)
+        return Ok(s)
     }
     try p.expectKw("values")
     while true {
@@ -1146,10 +1164,14 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
     match t.text {
         "select" { return p.select() }
         "with" {
+            // its queries are used where they are named (cteRef): in an
+            // INSERT's SELECT, an UPDATE's or a DELETE's subqueries
             let n = try p.withList()
-            if !p.isKw("select") { return Err(lexdb_base.err("0A000", "WITH is supported before SELECT only")) }
-            p.pos += 1
-            let r = p.select()
+            var r: Result[Stmt, lexdb_base.DbErr] = Err(lexdb_base.err("42601", "WITH must be followed by SELECT, INSERT, UPDATE or DELETE"))
+            if p.acceptKw("select") { r = p.select() }
+            else if p.acceptKw("insert") { r = p.insert() }
+            else if p.acceptKw("update") { r = p.update() }
+            else if p.acceptKw("delete") { r = p.delete() }
             p.popCtes(n)
             return r
         }
