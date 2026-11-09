@@ -393,7 +393,7 @@ Built on 2026-11-09 on branch `lexdb`, about 6,300 lines in
 (cache, trees, transactions, log, checkpoints, recovery, snapshots),
 `lexdb_sql` (lexer, parser), `lexdb_exec` (catalog, rows, keys, planner,
 statements, sessions), `lexdb_wire` (protocol 3.0) and `lexdb` (the
-server). Tests: `python3 lexell/tests/lexdb.py` (43 programs in
+server). Tests: `python3 lexell/tests/lexdb.py` (44 programs in
 `tests/lexdb/run`, under `LXL_CHECK=1`).
 
     lexell/compiler/out/lxlc lexell/cmd/lexdb.lxl -o lexdb
@@ -590,7 +590,7 @@ is the comparison to make.
 13. ALTER (the user's request, 2026-11-09), in steps: (1) the actions that
    rewrite no row: ADD COLUMN, RENAME COLUMN, RENAME TO, SET and DROP NOT
    NULL (built: 9.34); (2) DROP COLUMN (built: 9.35); (3) ALTER COLUMN
-   TYPE; (4) SET
+   TYPE (built: 9.36); (4) SET
    SCHEMA, ALTER INDEX ... RENAME, ALTER SCHEMA ... RENAME. Column
    defaults (and so ADD COLUMN ... DEFAULT) are a feature of their own.
 
@@ -2286,3 +2286,81 @@ The last was caught only after the test counted the store's trees.
 
 Not done: the places are never compacted (a table that drops and adds
 many columns keeps a NULL a place in each row written).
+
+### 9.36 ALTER COLUMN TYPE
+
+`ALTER [COLUMN] name [SET DATA] TYPE type [USING expr]`, one of ALTER
+TABLE's actions. Several in one statement are done together, after the
+statement's other actions, and USING sees the row as it was. USING may
+use any of the row's columns; a subquery or an aggregate in it is refused
+(0A000, 42803), as PostgreSQL does.
+
+**Without USING**, only PostgreSQL's assignment casts among lexdb's types:
+within a kind (int widths, numeric precision, varchar length), int to
+numeric and back, and anything to text. Others (text to int, bool to
+int) are 42804, naming the USING that would do it.
+
+**A widening rewrites nothing**: int2 to int4 to int8, a varchar made
+longer or text, numeric with more precision and the same scale (or
+none). Its values are stored as they are, so only the catalog changes
+(`widens`).
+
+**Any other change rewrites the table** (`retype`), as PostgreSQL does.
+The rows are read as the table stands, and each gets its new values
+(USING, or the column) converted to the new type (`coerce`: 22P02,
+22003, 22001 as an assignment). It is checked for NOT NULL and written
+to a new tree; two rows whose keys become equal are 23505. Indexes on a
+changed column, or whose predicate names one, are made again into new
+trees (all of them when the key changes, since their entries hold it). A
+unique one made equal is 23505. The old trees are dropped, and their pages
+freed by checkpoints (9.32). It is one transaction: an error leaves the
+table as it was, and a block's rollback undoes it. The rows are held in
+memory, as an UPDATE's are, bounded by `max_statement_mem`.
+
+**Cost**, on real files, 200,000 rows of five columns:
+
+| | |
+|---|---:|
+| widen an int column to bigint | 5.6 ms |
+| UPDATE of every row (for comparison) | 455 ms |
+| a column to text, no index on it | 524 ms |
+| an indexed column to text | 869 ms |
+| the key, with USING | 914 ms |
+
+**Checked** by `exec_retype`. Widenings leave the store's trees as they
+were; a rewrite changes them, and their number stays the same (the old
+ones dropped). Cases covered:
+- int to text and back with USING, an index used after each;
+- no automatic cast, bool to text;
+- bad values (the statement undone);
+- varchar shorter (22001) and longer;
+- numeric rounding, to int, and overflow;
+- the key to text and back, with another index used after;
+- keys made equal;
+- a unique index made equal;
+- a filtered index whose predicate holds other rows under the new type;
+- NOT NULL kept;
+- USING with other columns;
+- two changes at once;
+- large values moved with their rows;
+- a rollback, and a reopen.
+
+Planted, each caught:
+- every change taken as a widening, or none;
+- a shorter varchar taken as one;
+- every cast automatic;
+- the old table tree kept;
+- an old index tree kept;
+- indexes not filled again;
+- the key's change not felt by the other indexes;
+- keys made equal not seen;
+- unique indexes not checked;
+- NOT NULL not checked;
+- USING ignored;
+- a filtered index naming the column not made again;
+- values not converted.
+
+Three were not caught at first. The test read the other index only after
+the key was changed back, which made its stale entries right again. It
+never used a filtered index whose rows change. And the unique-check
+mutant did not compile.

@@ -137,6 +137,7 @@ pub const A_RENAME = 3          // RENAME TO name
 pub const A_SET_NOT_NULL = 4    // ALTER COLUMN name SET NOT NULL
 pub const A_DROP_NOT_NULL = 5   // ALTER COLUMN name DROP NOT NULL
 pub const A_DROP_COL = 6        // DROP COLUMN name
+pub const A_TYPE = 7            // ALTER COLUMN name TYPE col.typ [USING using]
 
 pub type Alter = record {
     pub kind: int
@@ -144,6 +145,7 @@ pub type Alter = record {
     pub name: str               // the column changed; A_RENAME: the table's new name
     pub to: str                 // A_RENAME_COL: the column's new name
     pub ifFlag: bool            // ADD COLUMN IF NOT EXISTS, DROP COLUMN IF EXISTS
+    pub using: Option[Expr]     // A_TYPE: the new value, of the row as it was
 }
 
 // A qualified name, schema.name, as the parser gives it: the two joined by
@@ -966,8 +968,8 @@ fn noCol(): ColDef { return ColDef{name: "", typ: TypeName{kind: 0, oid: 0, prec
 // ALTER TABLE [IF EXISTS] [ONLY] name, then RENAME [COLUMN] a TO b, or
 // RENAME TO name (each alone), or actions separated by commas: ADD
 // [COLUMN] [IF NOT EXISTS] name type [NOT NULL | NULL], DROP [COLUMN] [IF
-// EXISTS] name [RESTRICT | CASCADE], ALTER [COLUMN] name SET NOT NULL or
-// DROP NOT NULL.
+// EXISTS] name [RESTRICT | CASCADE], ALTER [COLUMN] name [SET DATA] TYPE
+// type [USING expr], ALTER [COLUMN] name SET NOT NULL or DROP NOT NULL.
 fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
     var s = newStmt(S_ALTER)
     if p.acceptKw("if") {
@@ -978,13 +980,13 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
     s.table = try p.qname()
     if p.acceptKw("rename") {
         if p.acceptKw("to") {
-            append(mut &s.alters, Alter{kind: A_RENAME, col: noCol(), name: try p.name(), to: "", ifFlag: false})
+            append(mut &s.alters, Alter{kind: A_RENAME, col: noCol(), name: try p.name(), to: "", ifFlag: false, using: None})
             return Ok(s)
         }
         let c = p.acceptKw("column")
         let from = try p.name()
         try p.expectKw("to")
-        append(mut &s.alters, Alter{kind: A_RENAME_COL, col: noCol(), name: from, to: try p.name(), ifFlag: false})
+        append(mut &s.alters, Alter{kind: A_RENAME_COL, col: noCol(), name: from, to: try p.name(), ifFlag: false, using: None})
         return Ok(s)
     }
     while true {
@@ -993,7 +995,7 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
                 return Err(lexdb_base.err("0A000", "lexdb: ALTER TABLE cannot add a constraint (a unique index can be created)"))
             }
             let c = p.acceptKw("column")
-            var a = Alter{kind: A_ADD, col: noCol(), name: "", to: "", ifFlag: false}
+            var a = Alter{kind: A_ADD, col: noCol(), name: "", to: "", ifFlag: false, using: None}
             if p.acceptKw("if") {
                 try p.expectKw("not")
                 try p.expectKw("exists")
@@ -1022,7 +1024,7 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
                 return Err(lexdb_base.err("0A000", "lexdb: ALTER TABLE cannot drop a constraint (a unique index can be dropped)"))
             }
             let c = p.acceptKw("column")
-            var a = Alter{kind: A_DROP_COL, col: noCol(), name: "", to: "", ifFlag: false}
+            var a = Alter{kind: A_DROP_COL, col: noCol(), name: "", to: "", ifFlag: false, using: None}
             if p.acceptKw("if") {
                 try p.expectKw("exists")
                 a.ifFlag = true
@@ -1033,18 +1035,34 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
         } else if p.acceptKw("alter") {
             let c = p.acceptKw("column")
             let n = try p.name()
-            if p.acceptKw("set") {
+            let data = p.isKw("set") && p.pos + 1 < len(p.toks) && p.toks[p.pos + 1].kind == T_IDENT && p.toks[p.pos + 1].text == "data"
+            if data {
+                p.pos += 2
+                try p.expectKw("type")
+            }
+            if data || p.acceptKw("type") {
+                var a = Alter{kind: A_TYPE, col: noCol(), name: n, to: "", ifFlag: false, using: None}
+                a.col.typ = try p.typeName()
+                if p.acceptKw("using") {
+                    let subs = len(p.subs)
+                    let params = p.params
+                    a.using = Some(try p.expr())
+                    if len(p.subs) > subs { return Err(lexdb_base.err("0A000", "cannot use subquery in transform expression")) }
+                    if p.params > params { return Err(lexdb_base.err("42P02", "there is no parameter $" + p.params.toStr())) }
+                }
+                append(mut &s.alters, a)
+            } else if p.acceptKw("set") {
                 if p.isKw("default") { return Err(lexdb_base.err("0A000", "lexdb: column defaults are not supported")) }
                 try p.expectKw("not")
                 try p.expectKw("null")
-                append(mut &s.alters, Alter{kind: A_SET_NOT_NULL, col: noCol(), name: n, to: "", ifFlag: false})
+                append(mut &s.alters, Alter{kind: A_SET_NOT_NULL, col: noCol(), name: n, to: "", ifFlag: false, using: None})
             } else if p.acceptKw("drop") {
                 if p.isKw("default") { return Err(lexdb_base.err("0A000", "lexdb: column defaults are not supported")) }
                 try p.expectKw("not")
                 try p.expectKw("null")
-                append(mut &s.alters, Alter{kind: A_DROP_NOT_NULL, col: noCol(), name: n, to: "", ifFlag: false})
+                append(mut &s.alters, Alter{kind: A_DROP_NOT_NULL, col: noCol(), name: n, to: "", ifFlag: false, using: None})
             } else {
-                return Err(lexdb_base.err("0A000", "lexdb: ALTER COLUMN takes SET NOT NULL or DROP NOT NULL"))
+                return Err(lexdb_base.err("0A000", "lexdb: ALTER COLUMN takes TYPE, SET NOT NULL or DROP NOT NULL"))
             }
         } else {
             return Err(lexdb_base.err("0A000", "lexdb: ALTER TABLE takes ADD COLUMN, DROP COLUMN, RENAME, and ALTER COLUMN ... SET or DROP NOT NULL"))

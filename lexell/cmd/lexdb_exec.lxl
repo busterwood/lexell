@@ -4143,20 +4143,160 @@ fn dropColumn(txn: mut &lexdb_store.Txn, t: mut &Table, i: int): Result[Unit, Db
     return Ok(Unit{})
 }
 
+// ---- ALTER COLUMN TYPE (9.36)
+
+// A column's new type: col its number, using its new value (None: the
+// column's value converted).
+type Retype = record { col: int; typ: lexdb_sql.TypeName; using: Option[Expr] }
+
+fn intRank(oid: int): int {
+    if oid == lexdb_sql.OID_INT2 { return 1 }
+    if oid == lexdb_sql.OID_INT4 { return 2 }
+    return 3
+}
+
+// Whether a column of type a may become b with no USING: PostgreSQL's
+// assignment casts among lexdb's types.
+fn autoCast(a: &lexdb_sql.TypeName, b: &lexdb_sql.TypeName): bool {
+    if a.kind == b.kind && (a.kind != lexdb_sql.K_ARRAY || a.oid == b.oid) { return true }
+    if b.kind == lexdb_sql.K_TEXT { return true }
+    return (a.kind == lexdb_sql.K_INT && b.kind == lexdb_sql.K_NUM) || (a.kind == lexdb_sql.K_NUM && b.kind == lexdb_sql.K_INT)
+}
+
+// Whether every value of type a is one of type b as it is stored: then
+// the rows need not change.
+fn widens(a: &lexdb_sql.TypeName, b: &lexdb_sql.TypeName): bool {
+    if a.kind != b.kind { return false }
+    if a.kind == lexdb_sql.K_INT { return intRank(b.oid) >= intRank(a.oid) }
+    if a.kind == lexdb_sql.K_BOOL { return true }
+    if a.kind == lexdb_sql.K_TEXT { return b.len == 0 || (a.len > 0 && b.len >= a.len) }
+    if a.kind == lexdb_sql.K_NUM { return b.prec == 0 || (a.prec > 0 && b.scale == a.scale && b.prec >= a.prec) }
+    return a.oid == b.oid
+}
+
+// Rewrites table t with its columns' new types, as PostgreSQL does: each
+// row, its new values converted to the column's type, goes to a new tree,
+// and the indexes on a column changed (on any, when one is in the key) are
+// made again; the old trees are dropped. All in the transaction, the rows
+// held in memory as an UPDATE's are (max_statement_mem).
+fn retype(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, changes: &[]Retype, lim: Limits): Result[Unit, DbErr] {
+    // the rows, read as the table stands (the statement's other actions done)
+    try txn.put(CATALOG, t.name, encTable(t))
+    var sc = newScope(&[], &[])
+    let noWhere: Option[Expr] = None
+    let noParams: []Val = []
+    let noSubs: []lexdb_sql.Stmt = []
+    var q = try buildQuery(st, txn, &oneTable(&t.name), &noWhere, &noParams, &noSubs, mut &sc)
+    var xs: []Expr = []
+    for ch in changes {
+        let x = match ch.using {
+            Some(u) { clone(&u) }
+            None { Expr.Col(t.cols[ch.col].name) }
+        }
+        if hasAgg(&x) { return Err(e("42803", "cannot use aggregate function in transform expression")) }
+        append(mut &xs, try resolve(&x, &q.cols, len(q.cols), mut &sc))
+    }
+    endScope(mut &sc, mut &q)
+    var found: [][]Val = []
+    var rs = newRun(&q)
+    rs.limit(&lim)
+    let m = try prepare(st, txn, &q, &noParams, mut &rs)
+    let room = rs.room()
+    let max = rs.maxHeld
+    var held = 0
+    try runQuery(st, txn, &q, &m, &noParams, fn(r: &[]Val): Result[bool, DbErr] {
+        held += 2 * rowBytes(r)             // the row found, and its new one
+        if room >= 0 && held > room { return Err(memErr(max)) }
+        append(mut &found, copyRow(r))
+        return Ok(true)
+    }, mut &rs)
+
+    var changed: []bool = array(len(t.cols), false)
+    var keyChanged = false
+    for ch in changes {
+        t.cols[ch.col].typ = ch.typ
+        changed[ch.col] = true
+        for k in t.pk { if k == ch.col { keyChanged = true } }
+    }
+    let old = t.tree
+    t.tree = st.createTree(txn)
+    txn.dropTree(old)
+    var rows: [][]Val = []
+    var keys: []str = []
+    let noAggs: []Val = []
+    for f in found {
+        let env = Env{cols: &q.cols, row: &f, aggs: &noAggs, params: &noParams, subs: &m.subs, cur: &noAggs}
+        var row = copyRow(&f)
+        for k in 0..len(changes) {
+            row[changes[k].col] = try coerce(try evalX(st, txn, &q, &xs[k], &env, mut &rs), &changes[k].typ)
+        }
+        try checkRow(t, &row)
+        let key = keyOf(t, &row)
+        if (try st.get(txn, t.tree, key)).isSome() { return Err(dupKey(t, &row)) }
+        let enc = encRowOf(t, &row)
+        try txn.putRow(t.tree, key, enc, rowHead(&enc))
+        append(mut &rows, row)
+        append(mut &keys, key)
+    }
+
+    // the indexes whose entries change
+    var redo: []int = []
+    for k in 0..len(t.indexes) {
+        var uses = keyChanged
+        for c in t.indexes[k].cols { if changed[c] { uses = true } }
+        match t.indexes[k].pred {
+            Some(x) {
+                var ns: []str = []
+                colNames(&x, mut &ns)
+                for n in ns {
+                    let c = colIndex(&t.cols, &n)
+                    if c >= 0 && changed[c] { uses = true }
+                }
+            }
+            None {}
+        }
+        if uses {
+            txn.dropTree(t.indexes[k].tree)
+            t.indexes[k].tree = st.createTree(txn)
+            append(mut &redo, k)
+        }
+    }
+    for k in redo {
+        let ix = &t.indexes[k]
+        for r in 0..len(rows) {
+            if !(try inIndex(t, ix, &rows[r])) { continue }
+            match checkUnique(st, txn, t, ix, &rows[r], &keys[r]) {
+                Ok(_) {}
+                Err(x) {
+                    if x.state != "23505" { return Err(x) }
+                    return Err(e("23505", "could not create unique index \"" + lexdb_sql.baseName(&ix.name) + "\": a value is duplicated"))
+                }
+            }
+            try txn.put(ix.tree, idxEntry(ix, &rows[r], &keys[r]), keys[r])
+        }
+    }
+    return Ok(Unit{})
+}
+
 // ALTER TABLE: its actions in order, on the table's catalog row. None
 // rewrites a row: a row written before a column was added has fewer
 // values, read as NULL (decRowNeed); a dropped column's place is skipped
 // (Table.slots).
-fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
+fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, lim: Limits): Result[Res, DbErr] {
     let found = try findTable(st, txn, &s.table)
     if found.isNone() {
         if s.ifFlag { return Ok(tagOnly("ALTER TABLE")) }
         return Err(e("42P01", "relation \"" + lexdb_sql.shown(&s.table) + "\" does not exist"))
     }
     var t = found.unwrap()
-    for a in s.alters {
+    // TYPE actions are done together, after the others, by the names then
+    var types: []int = []
+    for j in 0..len(s.alters) {
+        let a = &s.alters[j]
         let rel = lexdb_sql.baseName(&t.name)
-        if a.kind == lexdb_sql.A_ADD {
+        if a.kind == lexdb_sql.A_TYPE {
+            append(mut &types, j)
+        } else if a.kind == lexdb_sql.A_ADD {
             if colIndex(&t.cols, &a.col.name) >= 0 {
                 if a.ifFlag { continue }
                 return Err(e("42701", "column \"" + a.col.name + "\" of relation \"" + rel + "\" already exists"))
@@ -4218,6 +4358,25 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             }
         }
     }
+    var changes: []Retype = []
+    var rewrite = false
+    for j in types {
+        let a = &s.alters[j]
+        let i = colIndex(&t.cols, &a.name)
+        if i < 0 { return Err(e("42703", "column \"" + a.name + "\" of relation \"" + lexdb_sql.baseName(&t.name) + "\" does not exist")) }
+        for ch in changes {
+            if ch.col == i { return Err(e("42601", "multiple changes of the type of column \"" + a.name + "\"")) }
+        }
+        if a.using.isNone() && !autoCast(&t.cols[i].typ, &a.col.typ) {
+            return Err(e("42804", "column \"" + a.name + "\" cannot be cast automatically to type " + lexdb_sql.typeText(&a.col.typ) +
+                         " (USING " + a.name + "::" + lexdb_sql.typeText(&a.col.typ) + " would)"))
+        }
+        if a.using.isSome() || !widens(&t.cols[i].typ, &a.col.typ) { rewrite = true }
+        let u = match a.using { Some(x) { Some(clone(&x)) } None { None } }
+        append(mut &changes, Retype{col: i, typ: a.col.typ, using: u})
+    }
+    if rewrite { try retype(st, txn, mut &t, &changes, lim) }
+    else { for ch in changes { t.cols[ch.col].typ = ch.typ } }
     try txn.put(CATALOG, t.name, encTable(&t))
     try bumpCatalog(st, txn)
     return Ok(tagOnly("ALTER TABLE"))
@@ -6196,7 +6355,7 @@ fn execStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
         lexdb_sql.S_DROP_INDEX { return dropIndex(st, txn, s) }
         lexdb_sql.S_CREATE_SCHEMA { return createSchemaStmt(st, txn, s) }
         lexdb_sql.S_DROP_SCHEMA { return dropSchema(st, txn, s) }
-        lexdb_sql.S_ALTER { return alterTable(st, txn, s) }
+        lexdb_sql.S_ALTER { return alterTable(st, txn, s, lim) }
         lexdb_sql.S_EXPLAIN { return explain(st, txn, s, params, lim, ptypes) }
         else { return Err(e("XX000", "not a data statement")) }
     }
