@@ -4,7 +4,10 @@
 // than two open, the others parked in acquire until a lease is dropped; a
 // waiter whose deadline passes leaves the queue; an idle connection is
 // handed out again; a lease left in a transaction is closed and its place
-// reopened; a string that does not parse fails newPool; a pool that cannot
+// reopened; a query past its deadline, and one whose task is cancelled,
+// end early with the session idle and handed out again (ATTENTION); a
+// lease's temporary table, language and database are gone for the next
+// lease (RESETCONNECTION); a string that does not parse fails newPool; a pool that cannot
 // connect reports it and keeps no place. No handle stays open.
 // expect: results 0 1 2 3 4 5 6 7
 // expect: most open at once: 2
@@ -13,6 +16,9 @@
 // expect: after timeout: open 1, idle 1, waiting 0
 // expect: same connection again: true
 // expect: not idle: true, closed, a new one: true
+// expect: past its deadline: error 1021, early true | idle true | same session true | then 7
+// expect: cancelled: error 1020, early true | same session true | then 8
+// expect: reset: #mark gone true | language us_english | database back true, known true
 // expect: bad string: error 1000
 // expect: bad server: failed true, open 0
 // expect: open handles 0
@@ -21,6 +27,7 @@ import "task"
 import "io"
 import "os"
 import "strings"
+import "time" as tm
 
 type V = sqlserver.Value
 type Error = sqlserver.Error
@@ -48,11 +55,48 @@ fn work(w: Work): int {
     return r
 }
 
-// Which session this is: the server may give a closed session's id to the
-// next one, so its login time too.
-fn session(l: mut &sqlserver.Lease): str {
-    let rows = l.conn().query("SELECT CAST(@@SPID AS nvarchar(10)) + N' ' + CONVERT(nvarchar(30), login_time, 126) FROM sys.dm_exec_sessions WHERE session_id = @@SPID", &[]).unwrap()
-    return rows.text(0, 0).unwrap()
+// Which session this is: its SPID, and how many times the pool has reset it
+// (read after the query, so a reset that query carried counts). A server
+// may give a closed session's SPID to the next one, and a reset changes its
+// login_time; a reopened connection's count starts again at 0.
+type Ident = value record { spid: str; resets: int }
+
+fn session(l: mut &sqlserver.Lease): Ident {
+    let rows = l.conn().query("SELECT CAST(@@SPID AS nvarchar(10))", &[]).unwrap()
+    return Ident{spid: rows.text(0, 0).unwrap(), resets: l.conn().resets()}
+}
+
+// b is a after its lease went back (reset once more), or within one lease.
+fn later(a: &Ident, b: &Ident): bool { return a.spid == b.spid && b.resets > a.resets }
+
+fn same(a: &Ident, b: &Ident): bool { return a.spid == b.spid && b.resets == a.resets }
+
+fn nowMs(): int { return tm.monotonicNs() / 1000000 }
+
+type Slow = value record { pool: sqlserver.Pool; out: task.Shared[str] }
+
+// A query of 5 s; the task is cancelled while it waits.
+fn slow(x: Slow): int {
+    var l = x.pool.acquire().unwrap()
+    let t0 = nowMs()
+    let r = l.conn().query("WAITFOR DELAY '00:00:05'; SELECT 1", &[])
+    let early = nowMs() - t0 < 3000
+    let line = match r {
+        Ok(_) { "finished?" }
+        Err(e) { "error " + e.code.toStr() + ", early " + early.toStr() }
+    }
+    x.out.with(fn(o: mut &str) { o = line })
+    return 0
+}
+
+fn cell(l: mut &sqlserver.Lease, sql: str): str {
+    match l.conn().query(sql, &[]) {
+        Ok(rows) {
+            if rows.isNull(0, 0).unwrap() { return "NULL" }
+            return rows.text(0, 0).unwrap()
+        }
+        Err(e) { return "error " + e.code.toStr() }
+    }
 }
 
 fn stats(p: &sqlserver.Pool): str {
@@ -106,20 +150,61 @@ fn run(d: str) {
         h.wait().unwrap()
     })
     println("after timeout: " + stats(&one))
-    var first = ""
+    var first = Ident{spid: "", resets: 0}
     {
         var l = one.acquire().unwrap()
         first = session(mut &l)
     }
     {
         var l = one.acquire().unwrap()
-        println("same connection again: " + (session(mut &l) == first).toStr())
+        println("same connection again: " + later(&first, &session(mut &l)).toStr())
         l.conn().exec("BEGIN TRANSACTION").unwrap()
         print("not idle: " + (!l.conn().idle()).toStr())
     }
     {
         var l = one.acquire().unwrap()
-        println(", closed, a new one: " + (session(mut &l) != first).toStr())
+        println(", closed, a new one: " + (session(mut &l).resets == 0).toStr())
+    }
+
+    var before = Ident{spid: "", resets: 0}
+    {
+        var l = one.acquire().unwrap()
+        before = session(mut &l)
+        let t0 = nowMs()
+        let r = task.within(100, fn(): Result[sqlserver.Rows, Error] { return l.conn().query("WAITFOR DELAY '00:00:05'; SELECT 1", &[]) })
+        let early = nowMs() - t0 < 3000
+        let what = match r {
+            Ok(_) { "finished?" }
+            Err(e) { "error " + e.code.toStr() }
+        }
+        println("past its deadline: " + what + ", early " + early.toStr() + " | idle " + l.conn().idle().toStr() +
+                " | same session " + same(&before, &session(mut &l)).toStr() + " | then " + cell(mut &l, "SELECT CAST(7 AS nvarchar(5))"))
+    }
+    let out = task.shared("")
+    task.scope(fn(s: mut &task.Scope) {
+        let f = s.start(slow, Slow{pool: one, out: out})
+        task.sleep(300).unwrap()
+        { let cancelled = f }             // dropping the future cancels the task
+    })
+    {
+        var l = one.acquire().unwrap()
+        var line = ""
+        out.with(fn(o: mut &str) { line = o })
+        println("cancelled: " + line + " | same session " + later(&before, &session(mut &l)).toStr() + " | then " + cell(mut &l, "SELECT CAST(8 AS nvarchar(5))"))
+    }
+    var db = ""
+    {
+        var l = one.acquire().unwrap()
+        db = cell(mut &l, "SELECT DB_NAME()")
+        l.conn().exec("CREATE TABLE #mark (x int); SET LANGUAGE Deutsch; USE tempdb").unwrap()
+    }
+    {
+        var l = one.acquire().unwrap()
+        let mark = cell(mut &l, "SELECT CAST(OBJECT_ID('tempdb..#mark') AS nvarchar(20))")
+        let lang = cell(mut &l, "SELECT @@LANGUAGE")
+        let now = cell(mut &l, "SELECT DB_NAME()")
+        println("reset: #mark gone " + (mark == "NULL").toStr() + " | language " + lang + " | database back " + (now == db).toStr() +
+                ", known " + (l.conn().database() == now).toStr())
     }
 
     match sqlserver.newPool("nonsense", 2) {

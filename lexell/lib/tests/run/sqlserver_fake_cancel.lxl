@@ -1,0 +1,321 @@
+// sqlserver when a task's deadline passes while it waits for the server,
+// against a scripted fake server on 127.0.0.1 (a task of this program),
+// without TLS, in packets of 512 bytes: part of a reply has come (the client
+// sends ATTENTION, reads the rest up to the acknowledgement, and the
+// connection is used again), none has come, a stream past its deadline, a
+// server that never acknowledges (broken after tds.ABORT_MS); and through a
+// pool: a lease that leaves a stream open (ended with ATTENTION when the
+// connection is acquired again) and RESETCONNECTION on every request after
+// a lease went back.
+// needs: ssl
+// timeout: 30
+// expect: deadline mid-reply: error 1021 | idle true | after: 3
+// expect: deadline before any reply: error 1021 | idle true | after: 4
+// expect: stream past its deadline: rows true, then error 1021 | idle true | after: 5
+// expect: no acknowledgement: error 1021 | idle false | after: error 1023
+// expect: pool: first 1 | stream 5 rows, left open | then 2 | open 1, idle 1
+// expect: server: attention after part of a reply | attention before any reply | attention in a stream | attention unanswered, the client closed | pool: UPDATE a reset false | SELECT rows reset true | attention | UPDATE c reset true
+// expect: open handles: 0
+
+import "sqlserver"
+import "tds"
+import "net"
+import "task"
+import "strings"
+import "../support/tdstest" as tt
+
+type Kind = sqlserver.Kind
+type Error = sqlserver.Error
+
+var ADDR: str = ""
+
+type Wire = record { c: net.Conn; pending: str; rest: str }
+
+fn (x: mut &Wire) fill(n: int): bool {
+    var tmp = array(4096, byte(0))
+    while len(x.pending) < n {
+        match x.c.read(mut &tmp) {
+            Ok(k) {
+                if k == 0 { return false }
+                x.pending = x.pending + strFromBytes(&tmp[0..k])
+            }
+            Err(_) { return false }
+        }
+    }
+    return true
+}
+
+// A message, and the status of its first packet.
+type Msg = value record { ptype: int; status: int; data: str }
+
+fn (x: mut &Wire) message(): Option[Msg] {
+    var data = ""
+    var ptype = -1
+    var status = -1
+    while true {
+        if !x.fill(8) { return None }
+        let n = (int(x.pending[2]) << 8) | int(x.pending[3])
+        if n < 8 || !x.fill(n) { return None }
+        ptype = int(x.pending[0])
+        if status < 0 { status = int(x.pending[1]) }
+        let eom = (int(x.pending[1]) & 1) != 0
+        data = data + x.pending[8..n]
+        x.pending = x.pending[n..]
+        if eom { break }
+    }
+    return Some(Msg{ptype: ptype, status: status, data: data})
+}
+
+// The request's text (a batch: after ALL_HEADERS, UTF-16).
+fn sqlOf(m: &Msg): str {
+    if m.ptype != tds.PT_SQLBATCH || len(m.data) < 4 { return "type " + m.ptype.toStr() }
+    let skip = int(m.data[0]) | (int(m.data[1]) << 8) | (int(m.data[2]) << 16)
+    return tds.fromUtf16(m.data[skip..]).unwrap()
+}
+
+fn (x: &Wire) send(payload: str) { let r = x.c.write(&tds.packets(tds.PT_REPLY, payload, 512)) }
+
+// The first k packets of a reply (none with EOM); the rest is kept for
+// attention: a server stops between tokens, so it ends the message it is
+// sending before it acknowledges, as SQL Server does when the reply is
+// already on its way.
+fn (x: mut &Wire) sendPart(payload: str, k: int) {
+    let b = tds.packets(tds.PT_REPLY, payload, 512)
+    var end = 0
+    for i in 0..k { end += (int(b[end + 2]) << 8) | int(b[end + 3]) }
+    let r = x.c.write(&b[0..end])
+    x.rest = strFromBytes(&b[end..])
+}
+
+// The rest of an interrupted reply, then the acknowledgement in a message
+// of its own.
+fn (x: mut &Wire) acknowledge() {
+    if len(x.rest) > 0 {
+        let r = x.c.writeStr(x.rest)
+        x.rest = ""
+    }
+    x.send(acknowledged())
+}
+
+fn done(status: int, count: int): str {
+    var b = tt.bytesOf()
+    b.done(tds.TK_DONE, status, 0xC1, count)
+    return b.str()
+}
+
+fn acknowledged(): str { return done(0x20, 0) }
+
+// Accepts a connection and logs it in (packet size 512).
+fn session(ln: &net.Listener): Option[Wire] {
+    let a = ln.accept()
+    if a.isErr() { return None }
+    var w = Wire{c: a.unwrap(), pending: "", rest: ""}
+    if w.message().isNone() { return None }
+    var p = tt.bytesOf()
+    for v in [0, 0, 11, 0, 6, 1, 0, 17, 0, 1, 0xff] { p.u8(v) }
+    for v in [17, 0, 0x13, 0xab, 0, 0] { p.u8(v) }
+    p.u8(tds.ENCRYPT_NOT_SUP)
+    w.send(p.str())
+    if w.message().isNone() { return None }
+    var l = tt.bytesOf()
+    l.loginAck()
+    l.envText(1, "app", "master")
+    l.envText(4, "512", "4096")
+    l.raw(done(0, 0))
+    w.send(l.str())
+    return Some(w)
+}
+
+// n rows of (id int, name nvarchar(80)).
+fn rowsReply(n: int): str {
+    var b = tt.bytesOf()
+    b.u8(tds.TK_COLMETADATA)
+    b.u16(2)
+    b.col("id", tds.T_INTN)
+    b.u8(4)
+    b.name("id")
+    b.col("name", tds.T_NVARCHAR)
+    b.u16(160)
+    b.collation(0x0409, 1, 52)
+    b.name("name")
+    for i in 0..n {
+        b.u8(tds.TK_ROW)
+        b.u8(4)
+        b.u32(i)
+        b.utf16Value("row " + i.toStr())
+    }
+    b.raw(done(0x10, n))
+    return b.str()
+}
+
+// The next message is an ATTENTION: acknowledged, and logged as what.
+fn attention(w: mut &Wire, log: mut &[]str, what: str) {
+    match w.message() {
+        Some(m) {
+            if m.ptype == tds.PT_ATTENTION {
+                append(log, "attention " + what)
+                w.acknowledge()
+            } else {
+                append(log, "no attention " + what + ": " + sqlOf(&m))
+            }
+        }
+        None { append(log, "closed instead of attention " + what) }
+    }
+}
+
+fn expect(w: mut &Wire, log: mut &[]str, sql: str): bool {
+    match w.message() {
+        Some(m) {
+            if sqlOf(&m) == sql { return true }
+            append(log, "unexpected " + sqlOf(&m))
+        }
+        None { append(log, "closed before " + sql) }
+    }
+    return false
+}
+
+fn serve(ln: net.Listener): str {
+    var log: []str = []
+    var w = match session(&ln) {
+        Some(x) { x }
+        None { return "no session" }
+    }
+    if expect(mut &w, mut &log, "SELECT slow") {
+        w.sendPart(rowsReply(400), 3)
+        attention(mut &w, mut &log, "after part of a reply")
+    }
+    if expect(mut &w, mut &log, "UPDATE x") { w.send(done(0x10, 3)) }
+    if expect(mut &w, mut &log, "SELECT silent") { attention(mut &w, mut &log, "before any reply") }
+    if expect(mut &w, mut &log, "UPDATE x") { w.send(done(0x10, 4)) }
+    if expect(mut &w, mut &log, "SELECT rows") {
+        w.sendPart(rowsReply(2000), 4)
+        attention(mut &w, mut &log, "in a stream")
+    }
+    if expect(mut &w, mut &log, "UPDATE x") { w.send(done(0x10, 5)) }
+    if expect(mut &w, mut &log, "SELECT deaf") {
+        match w.message() {
+            Some(m) {
+                if m.ptype == tds.PT_ATTENTION {
+                    if w.message().isNone() { append(mut &log, "attention unanswered, the client closed") }
+                }
+            }
+            None { append(mut &log, "closed instead of attention") }
+        }
+    }
+
+    var p = match session(&ln) {
+        Some(x) { x }
+        None { return "no pool session" }
+    }
+    var steps: []str = []
+    while true {
+        match p.message() {
+            Some(m) {
+                if m.ptype == tds.PT_ATTENTION {
+                    append(mut &steps, "attention")
+                    p.acknowledge()
+                } else {
+                    let sql = sqlOf(&m)
+                    append(mut &steps, sql + " reset " + ((m.status & tds.STATUS_RESET) != 0).toStr())
+                    if sql == "SELECT rows" {
+                        p.sendPart(rowsReply(2000), 4)
+                    } else {
+                        p.send(done(0x10, if sql == "UPDATE a" { 1 } else { 2 }))
+                    }
+                }
+            }
+            None { break }
+        }
+    }
+    append(mut &log, "pool: " + strings.join(&steps, " | "))
+    return strings.join(&log, " | ")
+}
+
+type Row = value record { id: int; name: str }
+type Cols = value record { id: int; name: int }
+
+fn bindRow(c: &sqlserver.Columns): Result[Cols, Error] {
+    return Ok(Cols{id: try c.index("id", Kind.Int), name: try c.index("name", Kind.Text)})
+}
+
+fn readRow(b: &Cols, r: &sqlserver.RowView): Result[Row, Error] {
+    return Ok(Row{id: try r.int(b.id), name: try r.text(b.name)})
+}
+
+fn connStr(): str { return "Server=tcp:" + strings.replaceAll(ADDR, ":", ",") + ";UID=u;PWD=p;Database=app;Encrypt=no" }
+
+fn code[T](r: &Result[T, Error]): str {
+    match r {
+        Ok(_) { return "ok" }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+fn after(c: mut &sqlserver.Conn): str {
+    match c.run("UPDATE x", &[]) {
+        Ok(n) { return n.toStr() }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+fn client() {
+    var c = sqlserver.connect(connStr()).unwrap()
+    let a = task.within(50, fn(): Result[int, Error] { return c.run("SELECT slow", &[]) })
+    println("deadline mid-reply: " + code(&a) + " | idle " + c.idle().toStr() + " | after: " + after(mut &c))
+    let b = task.within(50, fn(): Result[int, Error] { return c.run("SELECT silent", &[]) })
+    println("deadline before any reply: " + code(&b) + " | idle " + c.idle().toStr() + " | after: " + after(mut &c))
+
+    var rows = 0
+    let s = task.within(50, fn(): Result[Unit, Error] {
+        var src = try c.stream("SELECT rows", [], bindRow, readRow)
+        var buf = array(7, Row{id: 0, name: ""})
+        while true {
+            let n = try src.fill(mut &buf)
+            if n == 0 { break }
+            rows += n
+        }
+        return Ok(Unit{})
+    })
+    println("stream past its deadline: rows " + (rows > 0).toStr() + ", then " + code(&s) + " | idle " + c.idle().toStr() +
+            " | after: " + after(mut &c))
+
+    let d = task.within(50, fn(): Result[int, Error] { return c.run("SELECT deaf", &[]) })
+    println("no acknowledgement: " + code(&d) + " | idle " + c.idle().toStr() + " | after: " + after(mut &c))
+}
+
+fn viaPool() {
+    let pool = sqlserver.newPool(connStr(), 1).unwrap()
+    var first = 0
+    {
+        var l = pool.acquire().unwrap()
+        first = l.conn().run("UPDATE a", &[]).unwrap()
+    }
+    var got = 0
+    {
+        var l = pool.acquire().unwrap()
+        var src = l.conn().stream("SELECT rows", [], bindRow, readRow).unwrap()
+        var buf = array(5, Row{id: 0, name: ""})
+        got = src.fill(mut &buf).unwrap()
+    }
+    var then = 0
+    {
+        var l = pool.acquire().unwrap()
+        then = l.conn().run("UPDATE c", &[]).unwrap()
+    }
+    let st = pool.stats()
+    println("pool: first " + first.toStr() + " | stream " + got.toStr() + " rows, left open | then " + then.toStr() +
+            " | open " + st.open.toStr() + ", idle " + st.idle.toStr())
+}
+
+fn main() {
+    let log = task.scoped(fn(sc: mut &task.Scope): str {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        ADDR = ln.localAddr()
+        let srv = sc.start(serve, ln)
+        client()
+        viaPool()
+        return srv.wait().unwrap()
+    })
+    println("server: " + log)
+    println("open handles: " + sqlserver.openHandles().toStr())
+}

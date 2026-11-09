@@ -426,8 +426,9 @@ Branch `tds-t2`. No change to the compiler, time.lxl, decimal or sqldialect;
 
 Branch `streaming`; the shared design is design/db-streaming.md. This is
 the streaming part of T3 only. `Pool`/`Lease` came after, on the shared
-pool (design/pool.md, stage 4, 2026-11-09); ATTENTION on a task's deadline
-or cancellation (design/pool.md, stage 5) and the load test are still to do.
+pool (design/pool.md, stage 4, 2026-11-09), and ATTENTION on a task's
+deadline or cancellation with RESETCONNECTION (design/pool.md, stage 5 and
+section 11, which settles D2); the load test is still to do.
 
 - **Shape (D3):** `Conn.stream(sql, args, bind, read)` gives a `Stream[B,
   T]` holding `mut &Conn`, the borrow-class design of section 3, not the

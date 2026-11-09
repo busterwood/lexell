@@ -25,8 +25,7 @@
 // types are an E_TYPE error naming the type for their cells. query reads
 // rows whole; stream (T3, design/db-streaming.md) reads them a buffer at a
 // time into the program's records, and ends early with ATTENTION. Pool and
-// Lease are the shared pool's (design/pool.md); ATTENTION on a task's
-// deadline comes later in T3.
+// Lease are the shared pool's (design/pool.md), with RESETCONNECTION.
 //
 // Connection strings (design/tds.md, section 4) take the ADO.NET keywords
 // and the ODBC ones that mssql is given, so one string serves both modules:
@@ -56,8 +55,12 @@
 // codes: E_IO (the socket or TLS: the server cannot be reached, its
 // certificate is refused, it closed the connection), E_PROTOCOL, E_TIMEOUT
 // and E_CANCELLED (the task's deadline or cancellation), E_INPUT, E_TYPE,
-// E_NULL, E_LIMIT. A failure on the wire leaves the connection broken (no
-// ATTENTION yet, stage T3): its later calls are E_IO, and idle() is false.
+// E_NULL, E_LIMIT. A call that the task's cancellation or deadline ends
+// while it waits for the reply sends ATTENTION and reads the rest of the
+// reply (at most tds.ABORT_MS, whatever the task's state): the call is
+// E_CANCELLED or E_TIMEOUT and the connection is idle again. Any other
+// failure on the wire, or one while sending, leaves the connection broken:
+// its later calls are E_IO, and idle() is false.
 
 import "tds"
 import "sqldialect"
@@ -339,9 +342,12 @@ pub fn (c: Conn) close() {}
 // acquire takes an idle connection, opens a new one while fewer than size
 // are open, or else parks until another task gives one back, first come
 // first served. A Lease gives the connection back when it is dropped, unless
-// it is no longer idle (broken, in a transaction, a stream left unfinished): that one is
-// closed, and its place goes to the next waiter, which opens a new
-// connection. A Pool is a counted handle: copies reach the same pool, and the
+// it is broken or in a transaction: that one is closed, and its place goes
+// to the next waiter, which opens a new connection. The next request on a
+// connection given back asks for RESETCONNECTION, so the next lease starts
+// with the login's state (no temporary tables, SET options, USE or
+// language of the last one); a stream it left unfinished is ended (ATTENTION)
+// when it is acquired again. A Pool is a counted handle: copies reach the same pool, and the
 // connections close when the last copy and the last lease are gone.
 //
 //     let pool = try sqlserver.newPool(connStr, 16)
@@ -367,9 +373,17 @@ pub fn (Conn) waitFailed(why: task.Cancelled): Error {
         "pool: " + why.toStr() + " while waiting for a connection")
 }
 
-pub fn (c: mut &Conn) release(): bool { return c.idle() }
+pub fn (c: mut &Conn) release(): bool {
+    if c.s.broken || c.s.inTransaction() { return false }
+    c.s.resetOnNext()
+    return true
+}
 
 pub fn (c: mut &Conn) reuse(w: Where): Result[Unit, Error] {
+    match c.s.settle(w) {                  // a stream left unfinished: its reply ended now
+        Ok(_) {}
+        Err(e) { return Err(e) }
+    }
     if c.idle() { return Ok(Unit{}) }
     return Err(sqldialect.dbError(sqldialect.E_IO, "pool: the idle connection went bad"))
 }
@@ -424,6 +438,10 @@ pub fn (c: &Conn) errors(): []Message {
 
 // The session's language (ENVCHANGE): "us_english".
 pub fn (c: &Conn) language(): str { return c.s.language }
+
+// How many times the server has reset the session (RESETCONNECTION: once per
+// lease of a pool after the first). A connection a pool reopens starts at 0.
+pub fn (c: &Conn) resets(): int { return c.s.resets }
 
 // The reply of one request, its first ERROR as the Err.
 fn checked(r: tds.Reply): Result[tds.Reply, Error] {

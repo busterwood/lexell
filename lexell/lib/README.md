@@ -1694,8 +1694,12 @@ SQL Server over its own protocol, TDS 7.4, written in Lexell from Microsoft's
 MS-TDS specification (design/tds.md; stages T1 and T2 of its plan): no driver and no
 helper threads. Every call that waits for the server parks only its task on
 the socket, as net's calls do, so the task's cancellation and `task.within`
-deadlines end it (`E_CANCELLED`, `E_TIMEOUT`); the connection is then broken
-(no ATTENTION yet, T3). Imports tls, so a program is linked to OpenSSL.
+deadlines end it (`E_CANCELLED`, `E_TIMEOUT`). When that happens while the
+reply is awaited, the client sends ATTENTION and reads the rest of the reply
+in the same task, with I/O that ignores the task's cancellation and deadline,
+for `tds.ABORT_MS` (5 s) at most, so the connection is idle again; it is
+broken when that fails, or when the request could not be sent whole
+(design/pool.md, stage 5). Imports tls, so a program is linked to OpenSSL.
 
 - **sqlserver**: `connect(connStr)` (also `parseConnString(s): Settings`
   and `connectWith(&settings)`): ADO.NET or ODBC keywords, so the ODBC oracle's
@@ -1720,7 +1724,7 @@ deadlines end it (`E_CANCELLED`, `E_TIMEOUT`); the connection is then broken
   less, "Changed database context"), `database`, `language`, `collation`,
   `encryption` ("full", "login only", "off"), `serverVersion`,
   `tdsVersion`, `packetSize`, `inTransaction`, `idle`, `setMaxReply(n)`
-  (256 MiB), `close()`. Pools: `newPool(connStr, size): Result[Pool, Error]` (the string parsed then), `acquire()`, `stats()`, `Lease.conn()`: the shared `pool` module's, as postgres's (design/pool.md); a lease that is not `idle()` when dropped is closed (in a transaction, broken, a stream left unfinished). `Rows`: `rowCount`, `columnCount`, `affected`,
+  (256 MiB), `close()`. Pools: `newPool(connStr, size): Result[Pool, Error]` (the string parsed then), `acquire()`, `stats()`, `Lease.conn()`: the shared `pool` module's, as postgres's (design/pool.md); a lease broken or in a transaction when dropped is closed; one given back asks for RESETCONNECTION on its next request (the server drops its temporary tables, SET options, `USE` and language; `database()` and `language()` are the login's again), and a stream it left unfinished is ended with ATTENTION when it is acquired again; `resets()` counts the resets. `Rows`: `rowCount`, `columnCount`, `affected`,
   `resultSets`, `columnName`, `columnType` (the TDS code), `columnTypeName`,
   `columnSize`, `decimalType`, and per cell `isNull int bool float text
   bytes decimal decimalOrNull date timeOfDay localDateTime offsetDateTime
@@ -2021,9 +2025,9 @@ them and a NUL-terminated temporary copy otherwise (freed after the call).
 - `sqlserver` (design/tds.md): no sql_variant, table
   parameters or UDTs; parameters only of Value's variants (dates as text,
   a NULL typed nvarchar); varchar only in UTF-8 collations and code pages
-  1252 and 28591 (another code page is an error for that cell); no
-  ATTENTION on a task's deadline or cancellation (the connection breaks; a
-  stream ended early does send it), no routing (Azure
+  1252 and 28591 (another code page is an error for that cell); a call
+  cancelled while its request is still being sent breaks the connection
+  (part of a packet may have gone); no routing (Azure
   redirects), Encrypt=strict and integrated
   authentication not supported.
 - the ODBC oracle (`mssql`): no MARS (one open result per connection), no output or

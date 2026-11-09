@@ -74,6 +74,7 @@ pub const PT_LOGIN7 = 16
 pub const PT_PRELOGIN = 18
 
 pub const STATUS_EOM = 1
+pub const STATUS_RESET = 8        // RESETCONNECTION, on a request's first packet (MS-TDS 2.2.3.1.2)
 pub const HEADER = 8
 pub const MIN_PACKET = 512
 pub const MAX_PACKET = 32767
@@ -191,6 +192,7 @@ const F_NONE = 6         // NULLTYPE: no bytes, always NULL
 
 const PLP_NULL: u64 = 0xFFFFFFFFFFFFFFFF
 pub const MAX_REPLY = 268435456        // 256 MiB: the default limit of one reply
+pub const ABORT_MS = 5000              // how long ATTENTION's acknowledgement is waited for, whatever the task's state
 
 // ---------------------------------------------------------------- errors
 
@@ -314,7 +316,10 @@ fn utf16Of(b: &str): Result[str, str] {
 // The packets of one message of type ptype: the payload cut into pieces of
 // at most packetSize - 8 bytes, each after its header (SPID 0, packet ids
 // from 1, modulo 256); the last one has EOM. An empty payload is one packet.
-pub fn packets(ptype: int, payload: str, packetSize: int): []byte {
+pub fn packets(ptype: int, payload: str, packetSize: int): []byte { return packetsWith(ptype, payload, packetSize, 0) }
+
+// packets with first's bits in the first packet's status (STATUS_RESET).
+pub fn packetsWith(ptype: int, payload: str, packetSize: int, first: int): []byte {
     let room = packetSize - HEADER
     var out: []byte = []
     var off = 0
@@ -323,7 +328,7 @@ pub fn packets(ptype: int, payload: str, packetSize: int): []byte {
         let n = min(len(payload) - off, room)
         let last = off + n == len(payload)
         put8(mut &out, ptype)
-        put8(mut &out, if last { STATUS_EOM } else { 0 })
+        put8(mut &out, (if last { STATUS_EOM } else { 0 }) | (if id == 1 { first } else { 0 }))
         put16be(mut &out, n + HEADER)
         put16be(mut &out, 0)
         put8(mut &out, id % 256)
@@ -1936,10 +1941,22 @@ fn (s: mut &Stream) takeTls(): tls.Conn {
 
 fn (s: mut &Stream) put(t: tls.Conn) { let old = replace(s, Stream.Tls(t)) }
 
-fn (s: mut &Stream) read(b: mut &[byte], w: Where): Result[int, Error] {
+// The milliseconds left before the deadline dl (monotonic ns), at least 1;
+// E_TIMEOUT once it has passed.
+fn msLeft(dl: int): Result[int, Error] {
+    let left = dl - time.monotonicNs()
+    if left <= 0 { return Err(sqldialect.dbError(sqldialect.E_TIMEOUT, "tds: no acknowledgement of ATTENTION within " + ABORT_MS.toStr() + " ms")) }
+    return Ok(max(1, left / 1000000))
+}
+
+// Reads what has arrived. dl < 0: the task's own cancellation and deadline
+// apply; else they do not and dl (monotonic ns) is the deadline: cleanup
+// after a cancellation (design/pool.md, stage 5).
+fn (s: mut &Stream) read(b: mut &[byte], dl: int, w: Where): Result[int, Error] {
+    let ms = if dl < 0 { -1 } else { try msLeft(dl) }
     if s.isTls() {
         var t = s.takeTls()
-        let r = t.read(b, w)
+        let r = if ms < 0 { t.read(b, w) } else { t.readFor(b, ms, w) }
         s.put(t)
         return match r {
             Ok(n) { Ok(n) }
@@ -1948,7 +1965,7 @@ fn (s: mut &Stream) read(b: mut &[byte], w: Where): Result[int, Error] {
     }
     match s {
         Stream.Plain(c) {
-            return match c.read(b, w) {
+            return match if ms < 0 { c.read(b, w) } else { c.readFor(b, ms, w) } {
                 Ok(n) { Ok(n) }
                 Err(e) { Err(ioFail(e)) }
             }
@@ -1957,10 +1974,11 @@ fn (s: mut &Stream) read(b: mut &[byte], w: Where): Result[int, Error] {
     }
 }
 
-fn (s: mut &Stream) write(data: &[byte], w: Where): Result[Unit, Error] {
+fn (s: mut &Stream) write(data: &[byte], dl: int, w: Where): Result[Unit, Error] {
+    let ms = if dl < 0 { -1 } else { try msLeft(dl) }
     if s.isTls() {
         var t = s.takeTls()
-        let r = t.write(data, w)
+        let r = if ms < 0 { t.write(data, w) } else { t.writeFor(data, ms, w) }
         s.put(t)
         return match r {
             Ok(_) { Ok(Unit{}) }
@@ -1969,7 +1987,7 @@ fn (s: mut &Stream) write(data: &[byte], w: Where): Result[Unit, Error] {
     }
     match s {
         Stream.Plain(c) {
-            return match c.write(data, w) {
+            return match if ms < 0 { c.write(data, w) } else { c.writeFor(data, ms, w) } {
                 Ok(_) { Ok(Unit{}) }
                 Err(e) { Err(ioFail(e)) }
             }
@@ -1981,23 +1999,19 @@ fn (s: mut &Stream) write(data: &[byte], w: Where): Result[Unit, Error] {
 // Bytes read ahead from the stream: buf[pos..end].
 type Inbox = record { buf: []byte; pos: int; end: int }
 
-// Fills dst from the inbox, then from the stream (parking). E_IO when the
-// server closes the connection first.
-fn readFull(s: mut &Stream, ib: mut &Inbox, dst: mut &[byte], w: Where): Result[Unit, Error] {
-    var have = 0
-    while have < len(dst) {
-        if ib.pos < ib.end {
-            let n = min(ib.end - ib.pos, len(dst) - have)
-            for k in 0..n { dst[have + k] = ib.buf[ib.pos + k] }
-            ib.pos += n
-            have += n
-            continue
-        }
-        let n = try s.read(mut &ib.buf, w)
-        if n == 0 { return Err(ioErr("the server closed the connection")) }
+// Reads more of the stream onto the inbox, after what it holds (moved to
+// the front first). E_IO when the server closes the connection.
+fn fillInbox(s: mut &Stream, ib: mut &Inbox, dl: int, w: Where): Result[Unit, Error] {
+    if ib.pos > 0 {
+        let n = ib.end - ib.pos
+        for k in 0..n { ib.buf[k] = ib.buf[ib.pos + k] }
         ib.pos = 0
         ib.end = n
     }
+    let e = ib.end
+    let n = try s.read(mut &ib.buf[e..], dl, w)
+    if n == 0 { return Err(ioErr("the server closed the connection")) }
+    ib.end = e + n
     return Ok(Unit{})
 }
 
@@ -2006,17 +2020,22 @@ pub type Received = value record { pub ptype: int; pub data: str }
 
 // A connection's packets: written a message at a time, read a message at a
 // time (every packet up to the one with EOM).
+//
+// Reading is resumable: a packet is taken from the inbox only once all of it
+// is in, and the payloads of the message being received stay in msg until
+// its last packet. So a read that the task's cancellation or deadline ends
+// loses nothing, and the session can read the rest of the reply afterwards.
 pub type Transport = record {
     s: Stream
-    inbox: Inbox
-    hdr: []byte
-    pkt: []byte
+    inbox: Inbox             // 65,536 bytes: room for any packet (its length is 16 bits)
     pub packetSize: int
+    msg: []byte              // the payloads of the message being received
+    msgType: int             // its packets' type, -1 before its first
 }
 
 pub fn transport(sock: net.Conn): Transport {
-    return Transport{s: Stream.Plain(sock), inbox: Inbox{buf: array(16384, byte(0)), pos: 0, end: 0},
-                     hdr: array(HEADER, byte(0)), pkt: array(65536, byte(0)), packetSize: DEFAULT_PACKET}
+    return Transport{s: Stream.Plain(sock), inbox: Inbox{buf: array(65536, byte(0)), pos: 0, end: 0},
+                     packetSize: DEFAULT_PACKET, msg: [], msgType: -1}
 }
 
 // Sends one message as packets of the current packet size.
@@ -2024,52 +2043,77 @@ pub fn transport(sock: net.Conn): Transport {
 // Each packet is written by itself: under TLS, SQL Server reads a packet
 // from its own TLS records, and drops the connection when one record holds
 // the end of a packet and the start of the next.
-pub fn (t: mut &Transport) send(ptype: int, payload: str, w: Where): Result[Unit, Error] {
-    let b = packets(ptype, payload, t.packetSize)
-    if !t.s.isTls() { return t.s.write(&b, w) }
+pub fn (t: mut &Transport) send(ptype: int, payload: str, w: Where): Result[Unit, Error] { return t.sendWith(ptype, payload, 0, -1, w) }
+
+// send with first's bits in the first packet's status, and a deadline dl
+// as Stream.read has. A write that fails may have sent part of a packet:
+// the connection cannot be used after it.
+fn (t: mut &Transport) sendWith(ptype: int, payload: str, first: int, dl: int, w: Where): Result[Unit, Error] {
+    let b = packetsWith(ptype, payload, t.packetSize, first)
+    if !t.s.isTls() { return t.s.write(&b, dl, w) }
     var off = 0
     while off < len(b) {
         let n = (int(b[off + 2]) << 8) | int(b[off + 3])
-        try t.s.write(&b[off..off + n], w)
+        try t.s.write(&b[off..off + n], dl, w)
         off += n
     }
     return Ok(Unit{})
 }
 
 // Reads one message. E_LIMIT when its payload passes limit bytes (the rest
-// of it is not read), E_PROTOCOL for packets of different types.
+// of it is not read), E_PROTOCOL for packets of different types. When the
+// task's cancellation or deadline ends it, what has come stays (partial).
 pub fn (t: mut &Transport) receive(limit: int, w: Where): Result[Received, Error] {
-    var msg: []byte = []
-    var ptype = -1
     while true {
-        try readFull(mut &t.s, mut &t.inbox, mut &t.hdr, w)
-        let h = try parseHeader(&t.hdr)
-        if ptype < 0 {
-            ptype = h.ptype
-        } else if h.ptype != ptype {
-            return Err(proto("a packet of type " + h.ptype.toStr() + " inside a message of type " + ptype.toStr()))
+        let p = try t.nextPacket(-1, w)
+        if t.msgType < 0 {
+            t.msgType = p.ptype
+        } else if p.ptype != t.msgType {
+            return Err(proto("a packet of type " + p.ptype.toStr() + " inside a message of type " + t.msgType.toStr()))
         }
-        let n = h.length - HEADER
-        if len(msg) + n > limit {
+        if len(t.msg) + len(p.data) > limit {
             return Err(sqldialect.dbError(sqldialect.E_LIMIT, "tds: a reply larger than " + limit.toStr() + " bytes"))
         }
-        try readFull(mut &t.s, mut &t.inbox, mut &t.pkt[0..n], w)
-        appendStr(mut &msg, strFromBytes(&t.pkt[0..n]))
-        if (h.status & STATUS_EOM) != 0 { break }
+        appendStr(mut &t.msg, p.data)
+        if p.eom { break }
     }
-    return Ok(Received{ptype: ptype, data: strFromBytes(&msg)})
+    let r = Received{ptype: t.msgType, data: strFromBytes(&t.msg)}
+    t.msg = []
+    t.msgType = -1
+    return Ok(r)
+}
+
+// The part of a message that receive had read when it was ended, and its
+// packets' type (-1: none); the transport no longer holds it.
+fn (t: mut &Transport) takePartial(): Received {
+    let r = Received{ptype: t.msgType, data: strFromBytes(&t.msg)}
+    t.msg = []
+    t.msgType = -1
+    return r
 }
 
 // One packet of a message.
 pub type Packet = value record { pub ptype: int; pub eom: bool; pub data: str }
 
 // Reads one packet (a stream reads its reply a packet at a time).
-pub fn (t: mut &Transport) receivePacket(w: Where): Result[Packet, Error] {
-    try readFull(mut &t.s, mut &t.inbox, mut &t.hdr, w)
-    let h = try parseHeader(&t.hdr)
-    let n = h.length - HEADER
-    try readFull(mut &t.s, mut &t.inbox, mut &t.pkt[0..n], w)
-    return Ok(Packet{ptype: h.ptype, eom: (h.status & STATUS_EOM) != 0, data: strFromBytes(&t.pkt[0..n])})
+pub fn (t: mut &Transport) receivePacket(w: Where): Result[Packet, Error] { return t.nextPacket(-1, w) }
+
+// The next packet, taken from the inbox once all of it is in, reading the
+// stream as needed (dl as Stream.read has).
+fn (t: mut &Transport) nextPacket(dl: int, w: Where): Result[Packet, Error] {
+    while true {
+        let have = t.inbox.end - t.inbox.pos
+        if have >= HEADER {
+            let at = t.inbox.pos
+            let h = try parseHeader(&t.inbox.buf[at..at + HEADER])
+            if have >= h.length {
+                t.inbox.pos = at + h.length
+                return Ok(Packet{ptype: h.ptype, eom: (h.status & STATUS_EOM) != 0, data: strFromBytes(&t.inbox.buf[at + HEADER..at + h.length])})
+            }
+        }
+        try fillInbox(mut &t.s, mut &t.inbox, dl, w)
+    }
+    return Err(proto("unreachable"))
 }
 
 fn (t: &Transport) buffered(): bool { return t.inbox.pos < t.inbox.end }
@@ -2170,7 +2214,13 @@ pub type Session = record {
     pub userInstance: str        // ENVCHANGE 19
     pub resets: int              // ENVCHANGE 18: RESETCONNECTION acknowledged, so many times
     rr: RowReader                // a reply read a row at a time (stream)
+    resetNext: bool              // the next request asks for RESETCONNECTION
+    login: Restored              // the login's database, language and collation: a reset returns to them
 }
+
+// What RESETCONNECTION gives back: the session's state after its login. The
+// server sends no ENVCHANGE for them with the reset's acknowledgement.
+type Restored = value record { database: str; language: str; collation: Collation }
 
 fn addrOf(host: str, port: int): str {
     if strings.indexOf(host, ":", 0) >= 0 { return "[" + host + "]:" + port.toStr() }
@@ -2235,9 +2285,10 @@ pub fn open(cfg: &Config, w: Where): Result[Session, Error] {
     }
     var s = Session{t: t, encryption: enc, tdsVersion: ack.tdsVersion, serverName: ack.progName,
                     serverVersion: ack.version, preloginVersion: pre.version, database: "", collation: noCollation(),
-                    utf8: false, maxReply: MAX_REPLY, broken: false, txn: noTransaction(), infos: replace(mut &r.infos, []),
+                    utf8: false, maxReply: MAX_REPLY, broken: false, resetNext: false, txn: noTransaction(), infos: replace(mut &r.infos, []),
                     errors: [], language: "", charset: "", sortLocale: "", sortFlags: "", mirrorPartner: "",
-                    userInstance: "", resets: 0, rr: noReader()}
+                    userInstance: "", resets: 0, rr: noReader(),
+                    login: Restored{database: "", language: "", collation: noCollation()}}
     for f in r.features {
         if f.id == FEATURE_UTF8 && len(f.data) >= 1 && f.data[0] != 0 { s.utf8 = true }
     }
@@ -2245,6 +2296,7 @@ pub fn open(cfg: &Config, w: Where): Result[Session, Error] {
         if e.kind == ENV_ROUTING { return Err(ioErr("the server redirects the connection elsewhere (routing), which is not supported yet")) }
     }
     try s.apply(&r.envs)
+    s.login = Restored{database: s.database, language: s.language, collation: s.collation}
     return Ok(s)
 }
 
@@ -2308,7 +2360,12 @@ fn (s: mut &Session) apply(envs: &[]EnvChange): Result[Unit, Error] {
             6 { s.sortFlags = e.newValue }
             13 { s.mirrorPartner = e.newValue }
             19 { s.userInstance = e.newValue }
-            ENV_RESETACK { s.resets += 1 }
+            ENV_RESETACK {
+                s.resets += 1
+                s.database = s.login.database
+                s.language = s.login.language
+                s.collation = s.login.collation
+            }
             ENV_COLLATION { if len(e.newValue) == 5 { s.collation = try parseCollation(e.newValue) } }
             ENV_PACKETSIZE {
                 let n = match strings.parseIntOpt(e.newValue) {
@@ -2359,14 +2416,41 @@ pub fn (s: mut &Session) transact(kind: int, w: Where): Result[Reply, Error] {
     return s.request(PT_TRANSACTION, tmRequest(kind, s.txn), w)
 }
 
+// Asks for RESETCONNECTION on the next request (a pool gives the session
+// back): the server resets the session's state (temporary tables, SET
+// options, the database and language of the login) before running it. No
+// I/O.
+pub fn (s: mut &Session) resetOnNext() { s.resetNext = true }
+
+// Sends a request, with RESETCONNECTION when it was asked for. A failure
+// breaks the session: part of a packet may have gone.
+fn (s: mut &Session) sendRequest(ptype: int, payload: str, w: Where): Result[Unit, Error] {
+    let first = if s.resetNext { STATUS_RESET } else { 0 }
+    match s.t.sendWith(ptype, payload, first, -1, w) {
+        Ok(_) {}
+        Err(e) {
+            s.broken = true
+            return Err(e)
+        }
+    }
+    s.resetNext = false
+    return Ok(Unit{})
+}
+
 fn (s: mut &Session) request(ptype: int, payload: str, w: Where): Result[Reply, Error] {
     try s.settle(w)
-    let r = s.roundTrip(ptype, payload, w)
-    match r {
-        Ok(_) {}
-        Err(_) { s.broken = true }
+    try s.sendRequest(ptype, payload, w)
+    let got = match s.t.receive(s.maxReply, w) {
+        Ok(x) { x }
+        Err(e) { return Err(s.abandon(e, w)) }
     }
-    let reply = try r
+    if got.ptype != PT_REPLY {
+        s.broken = true
+        return Err(proto("a reply in a packet of type " + got.ptype.toStr()))
+    }
+    let decoded = decode(got.data, s.maxReply / 8)
+    if decoded.isErr() { s.broken = true }
+    let reply = try decoded
     s.infos = []
     for m in reply.infos { append(mut &s.infos, m) }
     s.errors = []
@@ -2375,11 +2459,28 @@ fn (s: mut &Session) request(ptype: int, payload: str, w: Where): Result[Reply, 
     return Ok(reply)
 }
 
-fn (s: mut &Session) roundTrip(ptype: int, payload: str, w: Where): Result[Reply, Error] {
-    try s.t.send(ptype, payload, w)
-    let m = try s.t.receive(s.maxReply, w)
-    if m.ptype != PT_REPLY { return Err(proto("a reply in a packet of type " + m.ptype.toStr())) }
-    return decode(m.data, s.maxReply / 8)
+fn recoverable(e: &Error): bool { return e.code == sqldialect.E_CANCELLED || e.code == sqldialect.E_TIMEOUT }
+
+// receive was ended while it read a reply. When the task's cancellation or
+// deadline ended it, the server is told to stop (ATTENTION) and the rest of
+// the reply is read and dropped, its ENVCHANGEs applied (settle, within
+// ABORT_MS whatever the task's state), so the session is usable again and
+// e is the call's error. Any other failure, or one of that cleanup, breaks
+// the session.
+fn (s: mut &Session) abandon(e: Error, w: Where): Error {
+    let part = s.t.takePartial()
+    if !recoverable(&e) || (part.ptype >= 0 && part.ptype != PT_REPLY) {
+        s.broken = true
+        return e
+    }
+    s.rr = noReader()
+    s.rr.active = true
+    s.rr.data = part.data
+    match s.settle(w) {
+        Ok(_) {}
+        Err(_) {}                         // broken by settle
+    }
+    return e
 }
 
 // ---------------------------------------------------------------- streamed replies (stage T3)
@@ -2507,10 +2608,11 @@ fn scanRow(d: &str, at: int, cols: &[]Column, nbc: bool, starts: mut &[]int, len
     return Ok(p)
 }
 
-// Reads the next packet of the reply onto what is left of data.
-fn (s: mut &Session) more(w: Where): Result[Unit, Error] {
+// Reads the next packet of the reply onto what is left of data (dl as
+// Stream.read has).
+fn (s: mut &Session) more(dl: int, w: Where): Result[Unit, Error] {
     if s.rr.eom { return Err(proto("the reply ends inside a token")) }
-    let p = try s.t.receivePacket(w)
+    let p = try s.t.nextPacket(dl, w)
     if p.ptype != PT_REPLY { return Err(proto("a reply in a packet of type " + p.ptype.toStr())) }
     let rest = len(s.rr.data) - s.rr.pos
     if rest + len(p.data) > s.maxReply {
@@ -2533,16 +2635,16 @@ fn knownToken(t: int): bool {
 
 // Decodes the token at data[pos..] (EV_*), reading packets as it needs
 // them. A token is applied only once it is whole.
-fn (s: mut &Session) step(w: Where): Result[int, Error] {
+fn (s: mut &Session) step(dl: int, w: Where): Result[int, Error] {
     while true {
         if s.rr.pos >= len(s.rr.data) {
             if s.rr.eom { return Ok(EV_END) }
-            try s.more(w)
+            try s.more(dl, w)
             continue
         }
         let ev = try s.token()
         if ev != EV_SHORT { return Ok(ev) }
-        try s.more(w)
+        try s.more(dl, w)
     }
     return Ok(EV_END)
 }
@@ -2620,6 +2722,19 @@ fn (s: mut &Session) fail(e: Error): Error {
     return e
 }
 
+// A stream's read ended by e. The task's cancellation or deadline loses no
+// bytes (the transport's reads resume), so the reply is cancelled
+// (settle, within ABORT_MS whatever the task's state) and the session stays
+// usable; any other failure breaks it.
+fn (s: mut &Session) interrupted(e: Error, w: Where): Error {
+    if !recoverable(&e) { return s.fail(e) }
+    match s.settle(w) {
+        Ok(_) {}
+        Err(_) {}                         // broken by settle
+    }
+    return e
+}
+
 // Sends a request whose reply is read a row at a time, and reads it up to
 // its first result set with columns: Ok(true), its columns streamColumns()
 // and its rows nextRow(); Ok(false) when the reply ended without one. The
@@ -2631,14 +2746,14 @@ fn (s: mut &Session) startStream(ptype: int, payload: str, w: Where): Result[boo
     s.rr.active = true
     s.infos = []
     s.errors = []
-    match s.t.send(ptype, payload, w) {
+    match s.sendRequest(ptype, payload, w) {
         Ok(_) {}
         Err(e) { return Err(s.fail(e)) }
     }
     while true {
-        let ev = match s.step(w) {
+        let ev = match s.step(-1, w) {
             Ok(x) { x }
-            Err(e) { return Err(s.fail(e)) }
+            Err(e) { return Err(s.interrupted(e, w)) }
         }
         if ev == EV_COLS {
             if len(s.errors) > 0 {
@@ -2691,17 +2806,17 @@ pub fn (s: &Session) rowLens(): &[]int { return &s.rr.lens }
 pub fn (s: mut &Session) nextRow(w: Where): Result[bool, Error] {
     if !s.rr.inRows { return Ok(false) }
     while true {
-        let ev = match s.step(w) {
+        let ev = match s.step(-1, w) {
             Ok(x) { x }
-            Err(e) { return Err(s.fail(e)) }
+            Err(e) { return Err(s.interrupted(e, w)) }
         }
         if ev == EV_ROW { return Ok(true) }
         if ev == EV_DONE || ev == EV_COLS || ev == EV_END {
             s.rr.inRows = false
             while ev != EV_END {
-                let e2 = match s.step(w) {
+                let e2 = match s.step(-1, w) {
                     Ok(x) { x }
-                    Err(e) { return Err(s.fail(e)) }
+                    Err(e) { return Err(s.interrupted(e, w)) }
                 }
                 if e2 == EV_END { break }
             }
@@ -2714,9 +2829,13 @@ pub fn (s: mut &Session) nextRow(w: Where): Result[bool, Error] {
     return Ok(false)
 }
 
-// Ends a streamed reply that is still being read: sends ATTENTION and reads
-// up to the DONE that acknowledges it, so the connection is idle again. Its
-// rows and messages are dropped. Nothing to do when no reply is open.
+// Ends a reply that is still being read (a stream, or a request whose task
+// was cancelled or passed its deadline): sends ATTENTION and reads up to the
+// DONE that acknowledges it, so the connection is idle again. Its rows and
+// messages are dropped; its ENVCHANGEs are applied. The I/O ignores the
+// task's cancellation and deadline and takes ABORT_MS at most (E_TIMEOUT
+// after, and the session is broken), so a cancelled task can end its own
+// reply. Nothing to do when no reply is open.
 pub fn (s: mut &Session) settle(w: Where): Result[Unit, Error] {
     if !s.rr.active { return Ok(Unit{}) }
     s.rr.inRows = false
@@ -2724,13 +2843,14 @@ pub fn (s: mut &Session) settle(w: Where): Result[Unit, Error] {
         s.rr = noReader()
         return Ok(Unit{})
     }
+    let dl = time.monotonicNs() + ABORT_MS * 1000000
     s.rr.attnDone = false
-    match s.t.send(PT_ATTENTION, "", w) {
+    match s.t.sendWith(PT_ATTENTION, "", 0, dl, w) {
         Ok(_) {}
         Err(e) { return Err(s.fail(e)) }
     }
     while true {
-        let ev = match s.step(w) {
+        let ev = match s.step(dl, w) {
             Ok(x) { x }
             Err(e) { return Err(s.fail(e)) }
         }

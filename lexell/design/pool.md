@@ -1,9 +1,10 @@
 # One connection pool for every client
 
-Status: agreed with the user (2026-11-09). Stages 1 to 4 are built on
+Status: agreed with the user (2026-11-09). Stages 1 to 5 are built on
 branch `pool`: `lib/pool.lxl` with its test `pool_fake`, then postgres,
-redis, sqlserver and oracle on it (sections 7 to 10). Stage 5, sqlserver's
-cleanup after a cancelled request, is next.
+redis, sqlserver and oracle on it, then sqlserver's cleanup after a
+cancelled request and RESETCONNECTION (sections 7 to 11). Section 11
+records where stage 5 departs from section 2.
 
 ## 1. Why
 
@@ -75,7 +76,7 @@ recommended, the next user, with no runtime change.
 | client | `release()` | `reuse(w)` |
 |---|---|---|
 | postgres | `idle()` | `Ok`; later the alive check of pgwire-stages P4 |
-| sqlserver | `idle()`, or true when the only problem is a cancelled request whose reply is unread; marks RESETCONNECTION (section 5) | sends ATTENTION and reads the rest of that reply (T3); the reset goes out with the next request |
+| sqlserver | not broken and not in a transaction (a stream left open is kept); marks RESETCONNECTION | ends a stream left open (ATTENTION); the reset goes out with the next request. A cancelled request is ended by its own task, not here (section 11) |
 | oracle | `idle()` (not broken; a statement outside `transaction[T]` commits with its execute, so a lease is never dropped inside a transaction) | `idle()`; later a ping after the connection has been idle a while |
 | redis | `idle()` (no MULTI, not in subscribe mode, not broken) | `Ok` |
 
@@ -121,12 +122,10 @@ Two things are new:
 
 ## 5. Open questions
 
-- **Resetting session state.** SQL Server's RESETCONNECTION (a status bit on
-  the next request, no round trip) clears temp tables, SET options and the
-  database a `USE` chose, as ADO.NET's pool does. Postgres's pool resets
-  nothing (DISCARD ALL would cost a round trip), and Oracle has no cheap
-  reset. Should the clients agree here, or should each do what its server
-  makes cheap? To be decided with sqlserver's stage (6.4).
+- **Resetting session state.** Decided (the user, 2026-11-09): sqlserver
+  resets with RESETCONNECTION (a status bit on the next request, no round
+  trip), as ADO.NET's pool does; each client does what its server makes
+  cheap, so postgres and oracle reset nothing.
 - **The reuse error.** `reuse`'s `Err` is dropped silently. A count in
   `PoolStats` (`replaced`) would make a server that keeps dropping idle
   connections visible. Not needed yet.
@@ -139,7 +138,7 @@ Two things are new:
 | 2 (built) | postgres on `pool`: `Conn.open` from a `pgwire.Config`, `waitFailed` with the errors of today (`E_TIMEOUT`, `E_CANCELLED`, "pool: timeout while waiting for a connection"), `release` = `idle()`, `reuse` = `Ok`; its pool code removed; callers on `l.conn()` and `newPool`'s Result: `cmd/httpd.lxl`, the doc comment in `lib/httpserver.lxl`, `task_postgres_pool`, `postgres_live_stream` | the live postgres tests and `http_gate --db` unchanged |
 | 3 (built) | redis on `pool`, its copy removed; `redis_basic`, `redis_live` on `l.conn()` | the redis tests pass |
 | 4 (built) | sqlserver and oracle: the four members, the aliases, `newPool`; `sqlserver_live_pool`, `oracle_live_pool` (the shape of `task_postgres_pool`) | the live tests pass on both backends |
-| 5 | sqlserver T3: a cancelled request leaves the connection unsettled, not broken; `release` keeps it, `reuse` settles it with ATTENTION; RESETCONNECTION (section 5) | a cancelled query's connection is reused, not reopened, in a live test |
+| 5 (built) | sqlserver T3: a cancelled request leaves the connection unsettled, not broken; `release` keeps it, `reuse` settles it with ATTENTION; RESETCONNECTION (section 5) | a cancelled query's connection is reused, not reopened, in a live test |
 
 ## 7. Stage 1, as built (2026-11-09)
 
@@ -226,3 +225,57 @@ Two things are new:
   give a closed session's id to the next one. Neither prints the
   connection string or a connect message. Both pass live on the C backend
   under LXL_CHECK=1 (four runs) and on the native backend.
+
+## 11. Stage 5, as built: sqlserver's cancellation and reset (2026-11-09)
+
+**Where it departs from section 2.** Section 2 had `reuse` settle a
+cancelled request in the next acquiring task. Built instead: the cancelled
+task ends its own request, as postgres already does (design/pgwire.md,
+section 13). A cancelled or expired task cannot do ordinary I/O (SPEC 16),
+but `net`'s and `tls`'s `readFor`/`writeFor` ignore the task's cancellation
+and deadline with a limit of their own, which is what pgwire uses. So:
+
+- A call that the task's cancellation or deadline ends while the reply is
+  awaited is `E_CANCELLED` / `E_TIMEOUT` as before, and the connection is
+  idle again, pooled or not: the client sends ATTENTION and reads the rest
+  of the reply, its ENVCHANGEs applied (a transaction the request began is
+  seen), up to the DONE that acknowledges it, within `tds.ABORT_MS` (5 s)
+  in all. No acknowledgement in that time breaks the connection.
+- A failure while the request is being sent still breaks it: a cancelled
+  write may have sent part of a packet.
+- `reuse` keeps one job: a stream left unfinished when its lease was
+  dropped (`release` now keeps it) is ended with ATTENTION when the
+  connection is acquired again. `settle` uses the bounded I/O everywhere,
+  so `Stream.close()` in a cancelled task works too.
+
+**tds.** Reading is resumable: a packet is taken from the inbox (now 64 KiB,
+room for any packet) only once all of it is in, and a message's payloads
+stay in the transport until its last packet, so a read ended by
+cancellation loses nothing. Before, the bytes of a half-read packet were
+lost, which is why a cancelled call had to break the connection.
+`Stream.read`/`write` take a deadline (-1: the task's own rules apply).
+
+**RESETCONNECTION.** `release` (no I/O) calls `Session.resetOnNext()`; the
+next request's first packet carries status 0x08 (`STATUS_RESET`,
+`packetsWith`). The server's acknowledgement (ENVCHANGE 18) comes without
+ENVCHANGEs for the database, language or collation it restores, so the
+session restores the login's own (kept at login). Found live: the reset
+also moves the session's `login_time` in `sys.dm_exec_sessions` to the
+reset's time, so `login_time` does not identify a session across leases;
+`Conn.resets()` (the count of acknowledgements, 0 on a new connection) does,
+with the SPID.
+
+**Tests.** `sqlserver_fake_cancel` (hermetic; a scripted server, plain TDS,
+512-byte packets): a deadline mid-reply, one before any reply, a stream past
+its deadline (each: ATTENTION, the rest read, the connection used again), a
+server that never acknowledges (broken after 5 s), and through a pool a
+stream left open (ATTENTION when acquired again) and the reset bit on every
+request after the first lease went back. The scripted server first sends
+the rest of an interrupted reply and then the acknowledgement as a message
+of its own: a server stops between tokens, never inside one.
+`sqlserver_live_pool` adds a `WAITFOR` of 5 s under a 100 ms deadline and in
+a task that is cancelled (both end early; the same session is used again),
+and a temporary table, `SET LANGUAGE Deutsch` and `USE tempdb` gone for the
+next lease, with `database()` right again. Both pass on the C backend under
+LXL_CHECK=1 (four runs) and on the native backend; so does every live
+database test (40) and the library suites (301 C, 627 native).
