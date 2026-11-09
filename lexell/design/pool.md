@@ -1,8 +1,9 @@
 # One connection pool for every client
 
-Status: agreed with the user (2026-11-09). Stages 1 and 2 are built on
-branch `pool`: `lib/pool.lxl` with its test `pool_fake`, and postgres on it
-(sections 7 and 8). Redis, sqlserver and oracle are not moved yet (section 6).
+Status: agreed with the user (2026-11-09). Stages 1 to 3 are built on
+branch `pool`: `lib/pool.lxl` with its test `pool_fake`, then postgres and
+redis on it (sections 7 to 9). sqlserver and oracle have no pool yet
+(section 6).
 
 ## 1. Why
 
@@ -136,7 +137,7 @@ Two things are new:
 |---|---|---|
 | 1 (built) | `lib/pool.lxl`; `pool_fake`: a scripted connection type, no server | built (2026-11-09): passes on both backends under LXL_CHECK=1 |
 | 2 (built) | postgres on `pool`: `Conn.open` from a `pgwire.Config`, `waitFailed` with the errors of today (`E_TIMEOUT`, `E_CANCELLED`, "pool: timeout while waiting for a connection"), `release` = `idle()`, `reuse` = `Ok`; its pool code removed; callers on `l.conn()` and `newPool`'s Result: `cmd/httpd.lxl`, the doc comment in `lib/httpserver.lxl`, `task_postgres_pool`, `postgres_live_stream` | the live postgres tests and `http_gate --db` unchanged |
-| 3 | redis on `pool`, its copy removed; `redis_basic`, `redis_live` on `l.conn()` | the redis tests pass |
+| 3 (built) | redis on `pool`, its copy removed; `redis_basic`, `redis_live` on `l.conn()` | the redis tests pass |
 | 4 | sqlserver and oracle: the four members, the aliases, `newPool`; `sqlserver_live_pool`, `oracle_live_pool` (the shape of `task_postgres_pool`) | the live tests pass on both backends |
 | 5 | sqlserver T3: a cancelled request leaves the connection unsettled, not broken; `release` keeps it, `reuse` settles it with ATTENTION; RESETCONNECTION (section 5) | a cancelled query's connection is reused, not reopened, in a live test |
 
@@ -179,3 +180,21 @@ Two things are new:
   in every row (pool 16, 100 clients: 22,963 native and 25,049 C against
   21,217). One short run each, on a machine whose numbers move 1% to 8%
   between runs: no slowdown, not a measured speedup.
+
+## 9. Stage 3, as built: redis (2026-11-09)
+
+- `redis.lxl` lost its copy of the pool (1,530 lines to 1,380). `Pool`,
+  `Lease` and `PoolStats` are aliases of `pool`'s over `Config`; `newPool`
+  and `newPoolWith` keep their signatures. `Conn.open` is `connectWith`,
+  `waitFailed` gives `Kind.Timeout` or `Kind.Cancelled` with the text of
+  before, `release` and `reuse` are `idle()` (no MULTI open, not broken).
+- The six commands the lease forwarded (`command`, `get`, `set`, `del`,
+  `hget`, `hset`) are gone (D1): `l.conn().set(...)`. `conn()` was already
+  there. `redis_basic` and `redis_live` are moved.
+- Tests: `redis_basic` (a scripted server, a pool shared by six tasks) and
+  `pool_fake` pass on both backends under LXL_CHECK=1. No Redis server runs
+  on this machine, so `redis_live` and `redis_live_extra` were skipped
+  (exit 77); they need a run with `LXL_REDIS_LIVE=1` before a merge.
+- Still as before: a subscribed connection is not detected. `Conn` does
+  not track subscribe mode, so a lease dropped while subscribed goes back
+  to the pool. Tracking it would let `release` refuse it; a follow-up.

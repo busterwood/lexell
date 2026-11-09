@@ -49,6 +49,7 @@ import "net"
 import "strings"
 import "tls"
 import "task"
+import "pool"
 
 pub const DEFAULT_HOST = "127.0.0.1"
 pub const DEFAULT_PORT = 6379
@@ -1335,43 +1336,25 @@ pub fn (c: &Conn) address(): str { return c.addr }
 // ---------------------------------------------------------------- pools
 
 // A pool of at most `size` connections to one server, for the tasks of a
-// program: acquire takes an idle connection, opens a new one while fewer
-// than size are open, or else parks until another task gives one back, first
-// come first served. A Lease gives its connection back when it is dropped,
+// program: the shared pool of lib/pool.lxl (design/pool.md) over Conn.
+// acquire takes an idle connection, opens a new one while fewer than size
+// are open, or else parks until another task gives one back, first come
+// first served. A Lease gives its connection back when it is dropped,
 // unless a MULTI is open or the connection broke; that one is closed and its
 // place goes to the next waiter, which opens a new connection. A Pool is a
-// counted handle (task.Shared): copies reach the same pool, and the
-// connections close when the last copy and the last lease are gone.
+// counted handle: copies reach the same pool, and the connections close when
+// the last copy and the last lease are gone.
 //
 //     let pool = try redis.newPool("redis://127.0.0.1:6379/0", 16)
 //     // in any task:
-//     let lease = try pool.acquire()
-//     try lease.set("order:42", "24.49")
+//     var lease = try pool.acquire()
+//     try lease.conn().set("order:42", "24.49")
 //
 // A connection in subscribe mode is not reusable by the pool; subscribe on a
 // connection of your own, not on a lease.
-pub type Pool = value record { sh: task.Shared[PoolState] }
-
-type PoolState = record {
-    cfg: Config
-    size: int
-    open: int                 // connections open or being opened, leased or idle
-    idle: []Conn
-    waiters: []Waiter         // first come first served
-    nextId: int
-}
-
-type Waiter = record { id: int; p: task.Promise[Option[Conn]] }
-
-// A connection taken from a pool, given back when it is dropped.
-pub type Lease = record {
-    cs: []Conn                // the leased connection: one element, none once given back
-    pool: task.Shared[PoolState]
-}
-
-// What a pool holds: connections open (leased, idle or being opened), idle,
-// and tasks waiting for one.
-pub type PoolStats = value record { pub open: int; pub idle: int; pub waiting: int }
+pub type Pool = pool.Pool[Conn, Config, Error]
+pub type Lease = pool.Lease[Conn, Config, Error]
+pub type PoolStats = pool.PoolStats
 
 // A pool over a redis://, rediss:// or unix:// URL; an invalid URL is Err.
 pub fn newPool(text: str, size: int): Result[Pool, Error] {
@@ -1379,152 +1362,19 @@ pub fn newPool(text: str, size: int): Result[Pool, Error] {
     return Ok(newPoolWith(cfg, size))
 }
 
-pub fn newPoolWith(cfg: Config, size: int): Pool {
-    let n = if size < 1 { 1 } else { size }
-    return Pool{sh: task.shared(PoolState{cfg: cfg, size: n, open: 0, idle: [], waiters: [], nextId: 0})}
+pub fn newPoolWith(cfg: Config, size: int): Pool { return pool.newPool[Conn, Config, Error](cfg, size) }
+
+// pool.Pooled: how the pool opens, judges and reuses a connection.
+pub fn (Conn) open(cfg: &Config, w: Where): Result[Conn, Error] { return connectWith(cfg, w) }
+
+pub fn (Conn) waitFailed(why: task.Cancelled): Error {
+    let k = if why == task.Cancelled.Timeout { Kind.Timeout } else { Kind.Cancelled }
+    return fail(k, "pool: " + why.toStr() + " while waiting for a connection")
 }
 
-pub fn (p: &Pool) stats(): PoolStats {
-    var r = PoolStats{open: 0, idle: 0, waiting: 0}
-    p.sh.with(fn(st: mut &PoolState) { r = PoolStats{open: st.open, idle: len(st.idle), waiting: len(st.waiters)} })
-    return r
-}
+pub fn (c: mut &Conn) release(): bool { return c.idle() }
 
-// A connection of the pool; parks while all size are leased. Err when a new
-// connection fails (connect's errors), or when the task is cancelled or its
-// deadline passes while it waits.
-pub fn (p: &Pool) acquire(w: Where): Result[Lease, Error] {
-    var got: Option[Conn] = None
-    var place = false
-    var wait: Option[task.Future[Option[Conn]]] = None
-    var id = 0
-    var cfg = defaults()
-    p.sh.with(fn(st: mut &PoolState) {
-        cfg = st.cfg
-        if len(st.idle) > 0 {
-            got = Some(pop(mut &st.idle))
-        } else if st.open < st.size {
-            st.open += 1
-            place = true
-        } else {
-            id = st.nextId
-            st.nextId += 1
-            let task.Handoff{promise: pr, future: f} = task.promise[Option[Conn]]()
-            append(mut &st.waiters, Waiter{id: id, p: pr})
-            wait = Some(f)
-        }
-    })
-    match replace(mut &wait, None) {
-        Some(f) {
-            match f.wait(w) {
-                Ok(v) {
-                    got = v
-                    place = got.isNone()
-                }
-                Err(e) {
-                    var served = true
-                    p.sh.with(fn(st: mut &PoolState) {
-                        for i in 0..len(st.waiters) {
-                            if st.waiters[i].id == id {
-                                for j in i..len(st.waiters) - 1 { swap(mut &st.waiters, j, j + 1) }
-                                let dropped = pop(mut &st.waiters)
-                                served = false
-                                break
-                            }
-                        }
-                    })
-                    if served { handOn(&p.sh, None) }
-                    let k = if e == task.Cancelled.Timeout { Kind.Timeout } else { Kind.Cancelled }
-                    return Err(fail(k, "pool: " + e.toStr() + " while waiting for a connection"))
-                }
-            }
-        }
-        None {}
-    }
-    match replace(mut &got, None) {
-        Some(c) {
-            if c.idle() { return Ok(Lease{cs: [c], pool: p.sh}) }
-            place = true                  // went bad while idle: closed here, its place reused
-        }
-        None {}
-    }
-    match connectWith(&cfg, w) {
-        Ok(c) { return Ok(Lease{cs: [c], pool: p.sh}) }
-        Err(e) {
-            handOn(&p.sh, None)
-            return Err(e)
-        }
-    }
-}
-
-// Gives a connection (or, for None, a place to open one) to the first waiter;
-// with none, keeps the connection idle (or frees the place). The promise is
-// completed outside with: if its future is gone, what it carries is dropped
-// there, and that may come back here.
-fn handOn(sh: &task.Shared[PoolState], var c: Option[Conn]) {
-    var p: Option[task.Promise[Option[Conn]]] = None
-    sh.with(fn(st: mut &PoolState) {
-        if len(st.waiters) > 0 {
-            for j in 0..len(st.waiters) - 1 { swap(mut &st.waiters, j, j + 1) }
-            let Waiter{id: _, p: pr} = pop(mut &st.waiters)
-            p = Some(pr)
-        } else {
-            match replace(mut &c, None) {
-                Some(conn) { append(mut &st.idle, conn) }
-                None { st.open -= 1 }
-            }
-        }
-    })
-    match replace(mut &p, None) {
-        Some(pr) { pr.complete(replace(mut &c, None)) }
-        None {}
-    }
-}
-
-fn (l: mut &Lease) drop() {
-    if len(l.cs) == 0 { return }
-    let c = pop(mut &l.cs)
-    if c.idle() {
-        handOn(&l.pool, Some(c))
-    } else {
-        c.close()
-        handOn(&l.pool, None)
-    }
-}
-
-// The leased connection, for a command this module does not wrap. The lease
-// must stay in scope while the borrow is used.
-pub fn (l: mut &Lease) conn(): mut &Conn {
-    if len(l.cs) == 0 { panic("redis: the lease is gone") }
-    return mut &l.cs[0]
-}
-
-pub fn (l: mut &Lease) command(args: &[str], w: Where): Result[Value, Error] {
-    if len(l.cs) == 0 { return Err(fail(Kind.Config, "the lease is gone")) }
-    return l.cs[0].command(args, w)
-}
-
-pub fn (l: mut &Lease) get(key: str, w: Where): Result[Option[str], Error] {
-    if len(l.cs) == 0 { return Err(fail(Kind.Config, "the lease is gone")) }
-    return l.cs[0].get(key, w)
-}
-
-pub fn (l: mut &Lease) set(key: str, value: str, w: Where): Result[Unit, Error] {
-    if len(l.cs) == 0 { return Err(fail(Kind.Config, "the lease is gone")) }
-    return l.cs[0].set(key, value, w)
-}
-
-pub fn (l: mut &Lease) del(keys: &[str], w: Where): Result[int, Error] {
-    if len(l.cs) == 0 { return Err(fail(Kind.Config, "the lease is gone")) }
-    return l.cs[0].del(keys, w)
-}
-
-pub fn (l: mut &Lease) hget(key: str, field: str, w: Where): Result[Option[str], Error] {
-    if len(l.cs) == 0 { return Err(fail(Kind.Config, "the lease is gone")) }
-    return l.cs[0].hget(key, field, w)
-}
-
-pub fn (l: mut &Lease) hset(key: str, field: str, value: str, w: Where): Result[int, Error] {
-    if len(l.cs) == 0 { return Err(fail(Kind.Config, "the lease is gone")) }
-    return l.cs[0].hset(key, field, value, w)
+pub fn (c: mut &Conn) reuse(w: Where): Result[Unit, Error] {
+    if c.idle() { return Ok(Unit{}) }
+    return Err(fail(Kind.Io, "pool: the idle connection went bad"))
 }
