@@ -393,7 +393,7 @@ Built on 2026-11-09 on branch `lexdb`, about 6,300 lines in
 (cache, trees, transactions, log, checkpoints, recovery, snapshots),
 `lexdb_sql` (lexer, parser), `lexdb_exec` (catalog, rows, keys, planner,
 statements, sessions), `lexdb_wire` (protocol 3.0) and `lexdb` (the
-server). Tests: `python3 lexell/tests/lexdb.py` (28 programs in
+server). Tests: `python3 lexell/tests/lexdb.py` (29 programs in
 `tests/lexdb/run`, under `LXL_CHECK=1`).
 
     lexell/compiler/out/lxlc lexell/cmd/lexdb.lxl -o lexdb
@@ -509,9 +509,7 @@ is the comparison to make.
 1. io_uring: measured (9.17), the decision is the user's (a runtime
    change). For file reads only it saves at most 17 us of system calls per
    cache miss on the SQL thread; for the whole event loop, sockets too.
-2. Conflicts per row, not per leaf: a commit fails when a leaf it read
-   changed, even for another row in it. Transfers in blocks over 10,000
-   rows by 16 writers fail 1.6% of the time, most of it this.
+2. Conflicts per row, not per leaf (built: 9.19).
 3. Smaller items: a correlated subquery's value as a lookup's key (now it
    is only a filter), a small uncorrelated IN set as an IN-list
    lookup, correlated subqueries in GROUP BY and in aggregates' arguments,
@@ -1304,4 +1302,65 @@ It also shows the cost of page-level conflicts. About 15% of all
 operations failed with 40001 (43,339 of about 284,000): transfers among
 1,000 accounts in a few leaves collide even when they touch different
 accounts. That is the baseline for per-row conflicts (9.4), next.
+
+### 9.19 Conflicts per row
+
+A commit failed when any leaf it read had changed since, even for another
+row in that leaf. Transfers between 1,000 accounts in a few leaves failed
+15% of the time in the crash test (43,339 of about 284,000 operations),
+and 3% in the mixed benchmark.
+
+- **A read is a key range** (`Mark{tree, lo, hi, seq}`), as of the commit
+  it saw:
+  - a point read, found or not, is `[key, key+"\x00")`;
+  - a scan's chunk runs from its cursor to the leaf's fence, or to the
+    key where its callback stopped (a backward scan the other way);
+  - adjacent chunks merge, so a long scan is one range.
+- **Committed writes are kept** in commit order (`Db.wlog`: seq, tree,
+  key; a dropped tree is a write to all of it). There are at most
+  `WLOG_MAX` (131,072). Past that the older half goes, and a read older
+  than what is kept fails its check (a conflict).
+- **A commit fails only when a write committed after a read falls in the
+  read's range.** That is the check of backward-validating OCC, in key
+  ranges, so an insert into a range a transaction scanned conflicts with
+  it: no phantoms. A block's reads are its snapshot's, as of `snapSeq`,
+  so a write applied but not yet durable when it began counts as after.
+- **Leaf identity no longer matters.** A split, an eviction or a freed
+  page used to need care (`Mark.page`, `freedAt`), and both are gone.
+
+| | before | after |
+|---|---:|---:|
+| crash test, conflicts by round 10 (seed 2) | 11,739 | 122 |
+| crash test, acknowledged writes by round 10 | 63,839 | 68,177 |
+| mixed: 16 writers in blocks, failed | 2.96% (814) | 0.04% (11) |
+| mixed: 8 point readers | 20,800/s | 20,300/s |
+
+The 11 failures left are real: two writers updating the same one of
+10,000 rows. The write log costs about 70 bytes a write kept, at most a
+few MB, outside the cache's budget.
+
+`store_rowconflict` covers, all in one leaf:
+
+- two transactions updating different rows (both commit), and the same
+  row (the second fails);
+- an insert into a scanned range (a phantom: fails), and at its exclusive
+  end (commits);
+- scans stopped by their callback, forward and backward: an insert inside
+  the read part conflicts, one past it does not;
+- a missing key read and then inserted (fails), and its neighbour
+  (commits);
+- a tree dropped after a read of it;
+- a block, where a neighbouring row passes and its own row fails;
+- a read older than the kept log (`setWriteLogMax`).
+
+Caught, each put back:
+
+- exact keys only, no ranges;
+- an inclusive range end;
+- writes of the read's own commit counted;
+- a drop not logged;
+- the floor ignored;
+- blocks' reads not noted;
+- a scan's stop ignored;
+- a missing key not noted.
 
