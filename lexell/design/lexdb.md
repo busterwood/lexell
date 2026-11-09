@@ -561,8 +561,10 @@ is the comparison to make.
    counts as the evidence.
 8. Large rows (built: 9.29). Not done:
    - reclaiming a dropped table's pages (its companion tree's too);
-   - reading a large row's columns only when used (TOAST fetches a
-     column when it is used; lexdb reads the whole row as it scans);
+   - a large row whose columns before its long texts are more than its
+     leaf holds (about 1.3 KB less the key) is read whole by any query; so
+     is one whose large part is not a text (many medium texts, a large
+     numeric);
    - compression;
    - space: a page holds three chunks; values loaded in random order fill
      84% of the pages with data, in key order 90% (9.30).
@@ -1992,6 +1994,47 @@ This is done in three steps; the first is built:
    whole, and checks each long text's first and last bytes. Planted:
    the long texts' offsets not advancing, caught by those bytes (lengths
    alone did not catch it).
-3. A large row's start kept in its stub, so a scan whose columns are all
-   there reads no chunks: to come.
+3. **A large row's start stays in its leaf.** A stub is now version 2: the
+   length and CRC, then the value's first bytes, the chunks holding the
+   rest (version 1 stubs are still read). How many is the writer's
+   choice: `Txn.putRow`'s head, as many as the leaf holds. The executor
+   gives a row's columns before its long texts (`rowHead`), so the table's
+   leaves stay small. A store-chosen amount (all the leaf holds) left three
+   rows a leaf and a random-order load 80% data. The head is in the write
+   and in the log: a put with a head is log op 5, its length after the
+   value, and `frameLen` counts it.
+
+   `getPart`, `scanPart` and `scanBackPart` give a large value's stub as
+   it is; `partOf` gives its first bytes and `whole` the value. A SELECT
+   with columns narrowed reads this way. A row whose used columns are all
+   in its first bytes (`fitsIn`: the columns before the long texts are
+   there, and no long text is used) is decoded from them; any other is
+   read whole.
+
+   Measured as in 9.30, scanning `d` for its titles:
+
+   | | before | after | e (no bodies) |
+   |---|---:|---:|---:|
+   | key order | 9.1 ms | 0.48 ms | 0.20 ms |
+   | random order | 11.4 ms | 0.30 ms | 0.21 ms |
+
+   Space is as before: 90% and 84%.
+
+   `exec_big` counts the large values read whole (`Stats.wholes`):
+   - none for a scan of titles, an index scan, or a backward scan;
+   - every row for a sum of the bodies, one for a body by key, and one for
+     a long text column.
+
+   `store_big` writes values with a head and reads them in part, again
+   after a crash: recovered from the log. One value's length puts its log
+   frame 2 bytes into a page.
+
+   Planted, each caught:
+   - no head passed;
+   - a used long text taken as being in the first bytes;
+   - a Part scan, forward or backward, reading whole;
+   - the log losing the head;
+   - a frame's length counted without the head's 4 bytes. Not caught
+     until the frame was placed on a page boundary: frames are padded to
+     pages, so 4 bytes matter only there.
 

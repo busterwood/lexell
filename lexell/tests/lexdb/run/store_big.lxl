@@ -26,6 +26,7 @@
 // expect: dropped: chunks 0
 // expect: refilled in one commit: rounds 300 rows 3000
 // expect: random order: 96% of the pages data
+// expect: a row's start in its leaf: 100 HEAD-OK, whole 8143 same; after a crash: 100 HEAD-OK, whole 8143 same; plain 0, whole 8143 same
 import "../../../cmd/lexdb_store"
 import "../../../cmd/lexdb_disk"
 import "../../../cmd/lexdb_base"
@@ -255,6 +256,52 @@ fn space(): str {
     return r.unwrap()
 }
 
+fn headCheck(st: &lexdb_store.Store, tree: int, v: &str): str {
+    var t = lexdb_store.begin()
+    let got = st.getPart(mut &t, tree, "h1").unwrap().unwrapOr("")
+    let p = lexdb_store.partOf(&got).unwrapOr("")
+    let w = st.whole(mut &t, tree, &"h1", &got).unwrap()
+    return len(p).toStr() + (if p == v[0..100] { " HEAD-OK" } else { " HEAD-WRONG" }) + ", whole " + len(w).toStr() + (if w == v { " same" } else { " DIFFERENT" })
+}
+
+// A large value's first bytes kept in its leaf (putRow's head), read in part,
+// and again after a crash: recovered from the log (a put with a head). The
+// value's length puts its frame 2 bytes into a page: a frame's length
+// counted without the head's 4 bytes would lose the commit after it.
+fn heads(): str {
+    let fs = lexdb_disk.sim(12)
+    let opts = lexdb_store.Options{cacheBytes: 1024 * 1024, segBytes: 1024 * 1024, ckptBytes: 64 * 1024 * 1024, snapNodes: 1000}
+    var tree = 0
+    var v = ""
+    for i in 0..8143 { v = v + (if i < 100 { "h" } else { "b" }) }
+    var out = ""
+    var crashed = fs
+    let r = lexdb_store.run(fs, opts, fn(st: lexdb_store.Store): int {
+        var t = lexdb_store.begin()
+        tree = st.createTree(mut &t)
+        st.commit(t).unwrap()
+        var w = lexdb_store.begin()
+        w.putRow(tree, "h1", v, 100).unwrap()
+        st.commit(w).unwrap()
+        var w2 = lexdb_store.begin()
+        w2.putRow(tree, "h2", v, 100).unwrap()       // a second record after it in the log
+        w2.put(tree, "plain", v).unwrap()
+        st.commit(w2).unwrap()
+        out = headCheck(&st, tree, &v)
+        crashed = fs.crash(3)
+        return 0
+    })
+    r.unwrap()
+    let r2 = lexdb_store.run(crashed, opts, fn(st: lexdb_store.Store): str {
+        var t = lexdb_store.begin()
+        let pl = st.getPart(mut &t, tree, "plain").unwrap().unwrapOr("")
+        let pw = st.get(mut &t, tree, "plain").unwrap().unwrapOr("")
+        return headCheck(&st, tree, &v) + "; plain " + len(lexdb_store.partOf(&pl).unwrapOr("")).toStr() + ", whole " + len(pw).toStr() +
+               (if pw == v { " same" } else { " DIFFERENT" })
+    })
+    return "a row's start in its leaf: " + out + "; after a crash: " + r2.unwrap()
+}
+
 fn main() {
     println(crashes())
     let r = lexdb_store.run(lexdb_disk.sim(7), lexdb_store.Options{cacheBytes: 4 * 2048, segBytes: 1024 * 1024, ckptBytes: 64 * 1024, snapNodes: 100000}, fn(st: lexdb_store.Store): int {
@@ -319,4 +366,5 @@ fn main() {
     r.unwrap()
     println("refilled in one commit: " + refill())
     println(space())
+    println(heads())
 }

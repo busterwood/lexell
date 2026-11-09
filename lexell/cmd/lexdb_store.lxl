@@ -33,6 +33,7 @@ pub const OP_PUT = 1
 pub const OP_DEL = 2
 pub const OP_CREATE = 3
 pub const OP_DROP = 4
+const OP_PUT_HEAD = 5       // in the log only: a put with its head (TxWrite.head)
 
 fn segName(g: int): str { return "log." + g.toStr() }
 
@@ -142,6 +143,7 @@ pub type Db = record {
     pub flushes: int
     pub checkpoints: int
     pub held: int               // commits held for a checkpoint (the cache over twice its budget)
+    pub wholes: int             // large values read whole: their chunks read (9.31)
 }
 
 // A handle to an open store; copies reach the same store.
@@ -170,7 +172,8 @@ var WLOG_MAX: int = 131072
 // For the tests: keeps fewer writes.
 pub fn setWriteLogMax(n: int) { WLOG_MAX = n }
 
-type TxWrite = value record { op: int; tree: int; key: str; val: str }
+// head: a large value's first bytes its writer wants kept in its leaf (9.31).
+type TxWrite = value record { op: int; tree: int; key: str; val: str; head: int }
 
 pub type Txn = record {
     reads: []Mark
@@ -215,7 +218,12 @@ fn (t: &Txn) noting(): bool { return t.snap < 0 || t.live || t.track }
 
 fn wkey(tree: int, key: &str): str { return tree.toStr() + ":" + key }
 
-pub fn (t: mut &Txn) put(tree: int, key: str, val: str): Result[Unit, lexdb_base.DbErr] {
+pub fn (t: mut &Txn) put(tree: int, key: str, val: str): Result[Unit, lexdb_base.DbErr] { return t.putRow(tree, key, val, 0) }
+
+// put; if the value is stored in chunks, its first head bytes stay in its
+// leaf (as many as the leaf holds), so getPart and the Part scans give them
+// without reading the chunks (9.31).
+pub fn (t: mut &Txn) putRow(tree: int, key: str, val: str, head: int): Result[Unit, lexdb_base.DbErr] {
     if len(key) > lexdb_page.MAX_KEY {
         return Err(lexdb_base.err(lexdb_base.S_LIMIT, "key too large: " + len(key).toStr() + " bytes, at most " + lexdb_page.MAX_KEY.toStr()))
     }
@@ -223,17 +231,17 @@ pub fn (t: mut &Txn) put(tree: int, key: str, val: str): Result[Unit, lexdb_base
         return Err(lexdb_base.err(lexdb_base.S_LIMIT, "row too large: " + len(val).toStr() + " bytes, at most " + MAX_VALUE.toStr()))
     }
     t.index.put(wkey(tree, &key), len(t.writes))
-    append(mut &t.writes, TxWrite{op: OP_PUT, tree: tree, key: key, val: val})
+    append(mut &t.writes, TxWrite{op: OP_PUT, tree: tree, key: key, val: val, head: head})
     return Ok(Unit{})
 }
 
 pub fn (t: mut &Txn) del(tree: int, key: str) {
     t.index.put(wkey(tree, &key), len(t.writes))
-    append(mut &t.writes, TxWrite{op: OP_DEL, tree: tree, key: key, val: ""})
+    append(mut &t.writes, TxWrite{op: OP_DEL, tree: tree, key: key, val: "", head: 0})
 }
 
 pub fn (t: mut &Txn) dropTree(tree: int) {
-    append(mut &t.writes, TxWrite{op: OP_DROP, tree: tree, key: "", val: ""})
+    append(mut &t.writes, TxWrite{op: OP_DROP, tree: tree, key: "", val: "", head: 0})
 }
 
 pub fn (t: &Txn) hasWrites(): bool { return len(t.writes) > 0 }
@@ -851,7 +859,7 @@ fn (db: mut &Db) applyDrop(tree: int) {
 
 fn (db: mut &Db) applyWrite(w: &TxWrite) {
     if w.tree == db.watched { db.watchedWrites += 1 }
-    if w.op == OP_PUT { db.putValue(w.tree, &w.key, &w.val) }
+    if w.op == OP_PUT { db.putValue(w.tree, &w.key, &w.val, w.head) }
     else if w.op == OP_DEL {
         db.dropChunks(w.tree, &w.key)
         db.applyDel(w.tree, &w.key)
@@ -904,7 +912,28 @@ const LAST_CHUNK = 0xFFFFFFFF                 // past every chunk's number: a ke
 
 fn isOvf(tree: int): bool { return tree >= OVF }
 fn marked(v: &str): bool { return len(v) > 0 && v[0] == BIG }
-fn isStub(v: &str): bool { return len(v) == STUB_LEN && v[0] == BIG && v[1] == 1 }
+// A stub: version 1 (9.29) has no row start; version 2 (9.31) is followed
+// by the value's first bytes, the chunks holding the rest.
+fn isStub(v: &str): bool { return len(v) >= STUB_LEN && v[0] == BIG && ((v[1] == 1 && len(v) == STUB_LEN) || v[1] == 2) }
+
+// How a scan gives large values: whole; RAW, as stored (a companion's
+// chunks); PART, as their stubs (partOf, whole).
+const M_FULL = 0
+const M_RAW = 1
+const M_PART = 2
+
+// A large value's stored form as getPart and the Part scans give it: its
+// first bytes (as many as its leaf holds), or None for any other value.
+pub fn partOf(v: &str): Option[str] {
+    if isStub(v) && v[1] == 2 { return Some(v[STUB_LEN..len(v)]) }
+    return None
+}
+
+// A value given in part (partOf), whole.
+pub fn (st: &Store) whole(t: mut &Txn, tree: int, key: &str, v: &str): Result[str, lexdb_base.DbErr] {
+    if !isStub(v) { return Ok(lexdb_base.own(v)) }
+    return st.unstore(t, tree, key, v)
+}
 
 fn chunkKey(key: &str, i: int): str {
     var b = newStrBuf()
@@ -972,7 +1001,7 @@ fn (db: mut &Db) dropChunks(tree: int, key: &str) {
 }
 
 // Writes a value in its stored form: itself, escaped, or chunks and a stub.
-fn (db: mut &Db) putValue(tree: int, key: &str, val: &str) {
+fn (db: mut &Db) putValue(tree: int, key: &str, val: &str, want: int) {
     db.dropChunks(tree, key)
     let esc = marked(val)
     if lexdb_page.leafEntry(key, val) + (if esc { 1 } else { 0 }) <= lexdb_page.MAX_ENTRY {
@@ -989,9 +1018,13 @@ fn (db: mut &Db) putValue(tree: int, key: &str, val: &str) {
     let ovf = tree + OVF
     if !db.trees.has(&ovf) { db.applyCreate(ovf) }
     let room = chunkRoom(key)
-    var crc: u32 = 0
+    // the first bytes the writer asked for, as many as the leaf entry
+    // holds, stay in the stub
+    let room0 = lexdb_page.MAX_ENTRY - lexdb_page.leafEntry(key, &"") - STUB_LEN
+    let head = if want < 0 { 0 } else if want > room0 { room0 } else { want }
+    var crc: u32 = crcOf(0, &val[0..head])
     var i = 0
-    var at = 0
+    var at = head
     while at < len(val) {
         let end = if at + room < len(val) { at + room } else { len(val) }
         let part = lexdb_base.own(&val[at..end])
@@ -1002,9 +1035,10 @@ fn (db: mut &Db) putValue(tree: int, key: &str, val: &str) {
     }
     var b = newStrBuf()
     b.addByte(BIG)
-    b.addByte(1)
+    b.addByte(2)
     binary.addU64LE(mut &b, len(val))
     binary.addU32LE(mut &b, int(crc))
+    b.add(&val[0..head])
     db.applyPut(tree, key, &b.toStr())
 }
 
@@ -1016,15 +1050,18 @@ fn (st: &Store) unstore(t: mut &Txn, tree: int, key: &str, v: &str): Result[str,
     if !isStub(v) { return Ok(v[1..len(v)]) }
     let total = int(binary.readU64LEStr(v, 2))
     let want = binary.readU32LEStr(v, 10)
+    let head = v[STUB_LEN..len(v)]
+    st.sh.with(fn(db: mut &Db) { db.wholes += 1 })
     var b = newStrBuf()
-    var got = 0
-    var crc: u32 = 0
+    b.add(&head)
+    var got = len(head)
+    var crc: u32 = crcOf(0, &head)
     try st.scanIn(t, tree + OVF, chunkKey(key, 0), chunkKey(key, LAST_CHUNK), fn(e: &Entry): bool {
         b.add(e.val)
         got += len(e.val)
         crc = crcOf(crc, &e.val)
         return got <= total
-    }, true)
+    }, M_RAW)
     if got != total || int(crc) != want {
         if t.snap < 0 || t.live { return Err(lexdb_base.conflict()) }
         return Err(lexdb_base.err(lexdb_base.S_INTERNAL, "a large value's chunks do not match it"))
@@ -1035,12 +1072,14 @@ fn (st: &Store) unstore(t: mut &Txn, tree: int, key: &str, v: &str): Result[str,
 // ---- the log record format
 
 fn addRecord(b: mut &[]byte, w: &TxWrite) {
-    append(b, byte(w.op))
+    let withHead = w.op == OP_PUT && w.head > 0
+    append(b, byte(if withHead { OP_PUT_HEAD } else { w.op }))
     binary.appendU32LE(b, w.tree)
     binary.appendU32LE(b, len(w.key))
     appendStr(b, w.key)
     binary.appendU32LE(b, len(w.val))
     appendStr(b, w.val)
+    if withHead { binary.appendU32LE(b, w.head) }
 }
 
 fn parseRecords(b: &[]byte, from: int, to: int): Result[[]TxWrite, lexdb_base.DbErr] {
@@ -1057,8 +1096,15 @@ fn parseRecords(b: &[]byte, from: int, to: int): Result[[]TxWrite, lexdb_base.Db
         let vs = at + 13 + kl
         if vs + vl > to { return Err(lexdb_base.corrupt("log record cut short")) }
         let val = strFromBytes(&b[vs..vs + vl])
-        append(mut &out, TxWrite{op: op, tree: tree, key: key, val: val})
-        at = vs + vl
+        var head = 0
+        var end = vs + vl
+        if op == OP_PUT_HEAD {
+            if end + 4 > to { return Err(lexdb_base.corrupt("log record cut short")) }
+            head = binary.readU32LE(b, end)
+            end += 4
+        }
+        append(mut &out, TxWrite{op: if op == OP_PUT_HEAD { OP_PUT } else { op }, tree: tree, key: key, val: val, head: head})
+        at = end
     }
     return Ok(out)
 }
@@ -1083,7 +1129,12 @@ fn frame(records: &[]byte, count: int, batchNo: int, seg: int): []byte {
 // ---- transactions
 
 // Reads key in tree: the transaction's own write of it, else the store's.
-pub fn (st: &Store) get(t: mut &Txn, tree: int, key: str): Result[Option[str], lexdb_base.DbErr] {
+pub fn (st: &Store) get(t: mut &Txn, tree: int, key: str): Result[Option[str], lexdb_base.DbErr] { return st.getIn(t, tree, key, M_FULL) }
+
+// get, a large value given in part (partOf, whole).
+pub fn (st: &Store) getPart(t: mut &Txn, tree: int, key: str): Result[Option[str], lexdb_base.DbErr] { return st.getIn(t, tree, key, M_PART) }
+
+fn (st: &Store) getIn(t: mut &Txn, tree: int, key: str, mode: int): Result[Option[str], lexdb_base.DbErr] {
     match t.index.get(&wkey(tree, &key)) {
         Some(i) {
             if t.writes[i].op == OP_DEL { return Ok(None) }
@@ -1093,10 +1144,10 @@ pub fn (st: &Store) get(t: mut &Txn, tree: int, key: str): Result[Option[str], l
     }
     if t.snap >= 0 && !t.live {
         var out: Option[str] = None
-        try st.scan(t, tree, key, key + "\x00", fn(e: &Entry): bool {
+        try st.scanIn(t, tree, key, key + "\x00", fn(e: &Entry): bool {
             if e.key == key { out = Some(e.val) }
             return false
-        })
+        }, mode)
         return Ok(out)
     }
     while true {
@@ -1124,7 +1175,9 @@ pub fn (st: &Store) get(t: mut &Txn, tree: int, key: str): Result[Option[str], l
         if len(bad) > 0 { return Err(bad[0]) }
         if need < 0 {
             match out {
-                Some(v) { if marked(&v) && !isOvf(tree) { return Ok(Some(try st.unstore(t, tree, &key, &v))) } }
+                Some(v) {
+                    if marked(&v) && !isOvf(tree) && !(mode == M_PART && isStub(&v)) { return Ok(Some(try st.unstore(t, tree, &key, &v))) }
+                }
                 None {}
             }
             return Ok(out)
@@ -1164,11 +1217,17 @@ fn (t: &Txn) ownRange(tree: int, from: &str, to: &str): []TxWrite {
 // end) in key order, the transaction's own writes included, while f gives
 // true.
 pub fn (st: &Store) scan(t: mut &Txn, tree: int, from: str, to: str, f: &fn(&Entry): bool): Result[Unit, lexdb_base.DbErr] {
-    return st.scanIn(t, tree, from, to, f, false)
+    return st.scanIn(t, tree, from, to, f, M_FULL)
+}
+
+// scan, large values given in part (partOf, whole).
+pub fn (st: &Store) scanPart(t: mut &Txn, tree: int, from: str, to: str, f: &fn(&Entry): bool): Result[Unit, lexdb_base.DbErr] {
+    return st.scanIn(t, tree, from, to, f, M_PART)
 }
 
 // scan; raw: the stored forms, no reads noted (a companion tree's chunks).
-fn (st: &Store) scanIn(t: mut &Txn, tree: int, from: str, to: str, f: &fn(&Entry): bool, raw: bool): Result[Unit, lexdb_base.DbErr] {
+fn (st: &Store) scanIn(t: mut &Txn, tree: int, from: str, to: str, f: &fn(&Entry): bool, mode: int): Result[Unit, lexdb_base.DbErr] {
+    let raw = mode == M_RAW
     let own: []TxWrite = if raw { [] } else { t.ownRange(tree, &from, &to) }
     let root = if t.snap >= 0 && !t.live { match t.snapTrees.get(&tree) { Some(r) { r } None { -1 } } } else { -1 }
     var oi = 0
@@ -1255,7 +1314,7 @@ fn (st: &Store) scanIn(t: mut &Txn, tree: int, from: str, to: str, f: &fn(&Entry
                     }
                 }
             } else {
-                if !raw && marked(&chunk[ci].val) && !isOvf(tree) {
+                if !raw && marked(&chunk[ci].val) && !isOvf(tree) && !(mode == M_PART && isStub(&chunk[ci].val)) {
                     let v = try st.unstore(t, tree, &chunk[ci].key, &chunk[ci].val)
                     chunk[ci].val = v
                 }
@@ -1302,6 +1361,15 @@ fn (db: mut &Db) descendBack(tree: int, k: &str): Descent {
 // from the last down, the transaction's own writes included, while f gives
 // true. Each leaf read is marked as scan marks it.
 pub fn (st: &Store) scanBack(t: mut &Txn, tree: int, from: str, to: str, f: &fn(&Entry): bool): Result[Unit, lexdb_base.DbErr] {
+    return st.scanBackIn(t, tree, from, to, f, M_FULL)
+}
+
+// scanBack, large values given in part (partOf, whole).
+pub fn (st: &Store) scanBackPart(t: mut &Txn, tree: int, from: str, to: str, f: &fn(&Entry): bool): Result[Unit, lexdb_base.DbErr] {
+    return st.scanBackIn(t, tree, from, to, f, M_PART)
+}
+
+fn (st: &Store) scanBackIn(t: mut &Txn, tree: int, from: str, to: str, f: &fn(&Entry): bool, mode: int): Result[Unit, lexdb_base.DbErr] {
     let own = t.ownRange(tree, &from, &to)
     let root = if t.snap >= 0 && !t.live { match t.snapTrees.get(&tree) { Some(r) { r } None { -1 } } } else { -1 }
     var oi = len(own) - 1
@@ -1388,7 +1456,7 @@ pub fn (st: &Store) scanBack(t: mut &Txn, tree: int, from: str, to: str, f: &fn(
                     }
                 }
             } else {
-                if marked(&chunk[ci].val) && !isOvf(tree) {
+                if marked(&chunk[ci].val) && !isOvf(tree) && !(mode == M_PART && isStub(&chunk[ci].val)) {
                     let v = try st.unstore(t, tree, &chunk[ci].key, &chunk[ci].val)
                     chunk[ci].val = v
                 }
@@ -1414,7 +1482,7 @@ pub fn (st: &Store) createTree(t: mut &Txn): int {
         id = db.nextTree
         db.nextTree += 1
     })
-    append(mut &t.writes, TxWrite{op: OP_CREATE, tree: id, key: "", val: ""})
+    append(mut &t.writes, TxWrite{op: OP_CREATE, tree: id, key: "", val: "", head: 0})
     append(mut &t.created, id)
     return id
 }
@@ -2096,7 +2164,7 @@ fn newDb(fs: lexdb_disk.Fs, data: lexdb_disk.File, opts: Options, m: &lexdb_page
               durableBatch: m.replayBatch - 1, waiters: [], writerWake: [], ckptWake: [], ckptDone: [], seg: m.replaySeg,
               segOff: m.replayOff, logSinceCkpt: 0, failed: [], closing: false, seq: 0, snaps: [], nextSnap: 0,
               hist: [], histCount: 0, histSlots: [], deferred: [], rootHist: [], durableSeq: 0, snapshots: 0, tooOld: 0, commits: 0,
-              conflicts: 0, loads: 0, evictions: 0, flushes: 0, checkpoints: 0, held: 0}
+              conflicts: 0, loads: 0, evictions: 0, flushes: 0, checkpoints: 0, held: 0, wholes: 0}
 }
 
 // Opens the store in fs (creating it when it is new) and recovers: the last
@@ -2178,7 +2246,7 @@ fn readFrame(f: &lexdb_disk.File, off: int, size: int, seg: int, batch: int): Re
 
 fn frameLen(recs: &[]TxWrite): int {
     var n = FRAME_HDR
-    for w in recs { n += 13 + len(w.key) + len(w.val) }
+    for w in recs { n += 13 + len(w.key) + len(w.val) + (if w.op == OP_PUT && w.head > 0 { 4 } else { 0 }) }
     return (n + PAGE - 1) / PAGE * PAGE
 }
 
@@ -2261,16 +2329,17 @@ pub type Stats = value record {
     pub held: int
     pub pages: int
     pub free: int
+    pub wholes: int
 }
 
 pub fn (st: &Store) stats(): Stats {
     var s = Stats{commits: 0, conflicts: 0, loads: 0, evictions: 0, flushes: 0, checkpoints: 0, loaded: 0,
-                  cacheUsed: 0, held: 0, pages: 0, free: 0}
+                  cacheUsed: 0, held: 0, pages: 0, free: 0, wholes: 0}
     st.sh.with(fn(db: mut &Db) {
         s = Stats{commits: db.commits, conflicts: db.conflicts, loads: db.loads, evictions: db.evictions,
                   flushes: db.flushes, checkpoints: db.checkpoints, loaded: db.loadedCount,
                   cacheUsed: db.cacheUsed, held: db.held, pages: db.npages,
-                  free: len(db.free)}
+                  free: len(db.free), wholes: db.wholes}
     })
     return s
 }
