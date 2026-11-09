@@ -1094,7 +1094,11 @@ pub type Level = record {
     hashCols: []int         // hash: its columns ...
     hashVals: []Expr        // ... equal to these values from earlier tables
     src: int                // a subquery in FROM (or a CTE): its number, its rows read from the run; -1 a table
+    work: int               // a recursive CTE's working table: the CTE's number; -1
 }
+
+// A level of rows held by the run (a subquery's, a working table), not a table's.
+fn (lv: &Level) virt(): bool { return lv.src >= 0 || lv.work >= 0 }
 
 // What one table of a query did (EXPLAIN ANALYZE).
 type Counts = value record {
@@ -1114,8 +1118,13 @@ type Run = record {
     seen: [][]bool
     memo: []Map[str, int]       // per subquery (correlated): its outer values -> its result in memoRes
     memoRes: [][]SubRes
-    stats: []SubStat            // per subquery: its runs (EXPLAIN ANALYZE)
+    stats: []SubStat            // per subquery (or part of a UNION): its runs (EXPLAIN ANALYZE)
+    cache: CteCache
+    maxRounds: int              // a recursive CTE's rounds at most (the session's max_recursion); 0 no limit
 }
+
+// max_recursion's default: rounds of a recursive CTE.
+pub const MAX_RECURSION = 1000
 
 // What a subquery did: runs, results taken from the cache, and its own
 // counts and subqueries' over all its runs.
@@ -1133,7 +1142,7 @@ fn newRun(q: &Query): Run {
         append(mut &stats, SubStat{runs: 0, hits: 0, cnt: [], inner: []})
     }
     return Run{cnt: array(len(q.levels), Counts{starts: 0, read: 0, joined: 0, nulls: 0, built: 0, kept: 0, unmatched: 0}),
-               seen: seen, memo: memo, memoRes: memoRes, stats: stats}
+               seen: seen, memo: memo, memoRes: memoRes, stats: stats, cache: newCache(), maxRounds: MAX_RECURSION}
 }
 
 fn keepsRight(join: int): bool { return join == lexdb_sql.J_RIGHT || join == lexdb_sql.J_FULL }
@@ -1784,7 +1793,7 @@ fn allTrue(cs: &[]Expr, cols: &[]lexdb_sql.ColDef, row: &[]Val, params: &[]Val):
 
 fn newLevel(t: Table, alias: str, join: int, first: int): Level {
     return Level{t: t, alias: alias, join: join, first: first, path: Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: []}, cond: [],
-                 post: [], local: [], perRow: true, hashCols: [], hashVals: [], src: -1}
+                 post: [], local: [], perRow: true, hashCols: [], hashVals: [], src: -1, work: -1}
 }
 
 // Plans a query over the tables of FROM (4.8): the tables are joined in the
@@ -1814,6 +1823,20 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
                 append(mut &t.cols, lexdb_sql.ColDef{name: name, typ: oidType(sp.sel.outs[i].oid), notNull: false})
             }
             append(mut &planned[f.sub], sp)
+        } else if f.work >= 0 {
+            var w = -1
+            for i in 0..len(sc.works) { if sc.works[i].id == f.work { w = i } }
+            if w < 0 {
+                return Err(e("42P19", "recursive reference to query \"" + f.table + "\" must not appear within its non-recursive term"))
+            }
+            if len(f.cols) > len(sc.works[w].cols) {
+                return Err(e("42P10", "table \"" + f.alias + "\" has " + len(sc.works[w].cols).toStr() + " columns available but " +
+                             len(f.cols).toStr() + " columns specified"))
+            }
+            for i in 0..len(sc.works[w].cols) {
+                let name = if i < len(f.cols) { f.cols[i] } else { sc.works[w].cols[i].name }
+                append(mut &t.cols, lexdb_sql.ColDef{name: name, typ: sc.works[w].cols[i].typ, notNull: false})
+            }
         } else {
             t = try needTable(st, txn, &f.table)
         }
@@ -1823,6 +1846,7 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
         }
         var lv = newLevel(t, f.alias, f.join, first)
         lv.src = f.sub
+        lv.work = f.work
         append(mut &q.levels, lv)
     }
     // its scope: its columns, for its own expressions and its subqueries' (planned first)
@@ -1891,7 +1915,7 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
     for k in 0..nl {
         let m = replace(mut &ms[k], [])
         // a subquery's rows have no key: read them all
-        var path = if q.levels[k].src >= 0 { Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: []} } else {
+        var path = if q.levels[k].virt() { Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: []} } else {
             choosePath(&q, k, &m, params)
         }
         var perRow = k == 0 || q.pathOuter(&path)
@@ -1964,8 +1988,8 @@ fn materialize(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: 
         {
             let lv = &q.levels[k]
             var full: []Val = array(len(q.cols), Val.Null)
-            if lv.src >= 0 {
-                for r in m.subs[lv.src].data { append(mut &rows, copyRow(&r)) }
+            if lv.virt() {
+                for r in m.vrows[k] { append(mut &rows, copyRow(&r)) }
             } else {
                 let noAggs: []Val = []
                 let env = Env{cols: &q.cols, row: &full, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs}
@@ -1985,7 +2009,7 @@ fn materialize(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: 
                 var nul = false
                 for c in lv.hashCols {
                     if isNull(&r[c]) { nul = true }
-                    if lv.src >= 0 { keyPart(mut &kb, &r[c]) } else { encIdxPart(mut &kb, &r[c]) }
+                    if lv.virt() { keyPart(mut &kb, &r[c]) } else { encIdxPart(mut &kb, &r[c]) }
                 }
                 if nul {
                     // NULL equals nothing; a RIGHT or FULL JOIN still keeps the row
@@ -2048,7 +2072,7 @@ fn runLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Ma
             let noAggs: []Val = []
             let env = Env{cols: &q.cols, row: row, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs}
             for i in 0..len(lv.hashCols) {
-                if lv.src >= 0 {
+                if lv.virt() {
                     let v = try eval(&lv.hashVals[i], &env)
                     if isNull(&v) { nul = true }
                     keyPart(mut &kb, &v)
@@ -2071,8 +2095,8 @@ fn runLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Ma
                 None {}
             }
         }
-    } else if lv.src >= 0 {
-        for r in m.subs[lv.src].data {
+    } else if lv.virt() {
+        for r in m.vrows[k] {
             let got = try tryRow(st, txn, q, m, k, &r, -1, row, params, emit, rs)
             if got < 0 { return Ok(false) }
             if got > 0 { matched = true }
@@ -2155,6 +2179,7 @@ type SubPlan = record {
     hashed: bool                // correlated, run once into a hash: sel outputs the key (then IN's value)
     keyOuter: []Expr            // per key column: what it equals, of outer values only (refs as parameters)
     keyText: []str              // EXPLAIN: "inner = outer"
+    cte: int                    // a CTE's use: the CTE's number (its rows shared); -1
 }
 
 // A subquery's result: a scalar's value, how many rows, IN's values.
@@ -2186,12 +2211,15 @@ pub type Scope = record {
     frames: []Frame
     base: int                   // the statement's parameters
     ptypes: []int
+    works: []Work               // the working tables of recursive CTEs being planned
 }
+
+type Work = record { id: int; cols: []lexdb_sql.ColDef }
 
 fn newScope(params: &[]Val, ptypes: &[]int): Scope {
     var pt: []int = []
     for i in 0..len(params) { append(mut &pt, if i < len(ptypes) { ptypes[i] } else { 0 }) }
-    return Scope{frames: [], base: len(params), ptypes: pt}
+    return Scope{frames: [], base: len(params), ptypes: pt, works: []}
 }
 
 // The parameter types of the query being planned: the statement's, then
@@ -2253,7 +2281,7 @@ fn planSub(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
     let oid = if s.use == lexdb_sql.SUB_EXISTS || len(sel.outs) == 0 { lexdb_sql.OID_BOOL } else { sel.outs[0].oid }
     let name = if s.use == lexdb_sql.SUB_EXISTS { "exists" } else if s.use == lexdb_sql.SUB_SCALAR { sel.outs[0].name } else { "?column?" }
     // (in FROM: its columns are its outs)
-    var sp = SubPlan{use: s.use, sel: sel, oid: oid, name: name, hashed: false, keyOuter: [], keyText: []}
+    var sp = SubPlan{use: s.use, sel: sel, oid: oid, name: name, hashed: false, keyOuter: [], keyText: [], cte: s.cte}
     if (s.use == lexdb_sql.SUB_EXISTS || s.use == lexdb_sql.SUB_IN) && len(sp.sel.q.refs) > 0 { hashSub(mut &sp, sc.base) }
     return Ok(sp)
 }
@@ -2443,13 +2471,9 @@ fn keyPart(b: mut &StrBuf, v: &Val) {
 
 // Runs a hashed subquery once: its keys (a NULL key matches nothing), and
 // for IN its values per key.
-fn runHashed(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sp: &SubPlan, params: &[]Val,
-             stat: mut &SubStat): Result[SubRes, DbErr] {
-    var rs = newRun(&sp.sel.q)
-    let res = try execSel(st, txn, &sp.sel, params, -1, mut &rs)
-    stat.runs += 1
-    addCounts(mut &stat.cnt, &rs.cnt)
-    mergeStats(mut &stat.inner, &rs.stats)
+fn runHashed(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sp: &SubPlan, params: &[]Val, parent: mut &Run,
+             i: int): Result[SubRes, DbErr] {
+    let res = try runChild(st, txn, &sp.sel, params, -1, parent, i)
     var out = emptyRes()
     out.rows = len(res.rows)
     let nk = len(sp.keyOuter)
@@ -2608,17 +2632,71 @@ fn mergeStats(a: mut &[]SubStat, b: &[]SubStat) {
 }
 
 // A subquery in FROM: its rows.
-fn runFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sp: &SubPlan, params: &[]Val,
-           stat: mut &SubStat): Result[SubRes, DbErr] {
-    var rs = newRun(&sp.sel.q)
-    var res = try execSel(st, txn, &sp.sel, params, -1, mut &rs)
-    stat.runs += 1
-    addCounts(mut &stat.cnt, &rs.cnt)
-    mergeStats(mut &stat.inner, &rs.stats)
+fn runFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sp: &SubPlan, params: &[]Val, parent: mut &Run,
+           i: int): Result[SubRes, DbErr] {
     var out = emptyRes()
+    // a CTE: run once in the statement, its rows kept for its other uses
+    let key = "c" + sp.cte.toStr()
+    if sp.cte >= 0 {
+        let at = cacheAt(&parent.cache, &key)
+        if at >= 0 {
+            out.data = copyRows(&parent.cache.rows[at])
+            out.rows = len(out.data)
+            parent.stats[i].hits += 1
+            return Ok(out)
+        }
+    }
+    var res = try runChild(st, txn, &sp.sel, params, -1, parent, i)
     out.rows = len(res.rows)
     out.data = replace(mut &res.rows, [])
+    if sp.cte >= 0 { cachePut(mut &parent.cache, key, copyRows(&out.data)) }
     return Ok(out)
+}
+
+// Rows the statement's queries share while it runs: a CTE's ("c" and its
+// number), a recursive CTE's working table ("w"). A query's run hands them
+// to the runs inside it and takes them back.
+type CteCache = record { index: Map[str, int]; rows: [][][]Val }
+
+fn newCache(): CteCache { return CteCache{index: newMap(), rows: []} }
+
+fn cacheAt(c: &CteCache, key: &str): int {
+    match c.index.get(key) {
+        Some(i) { return i }
+        None { return -1 }
+    }
+}
+
+fn cachePut(c: mut &CteCache, key: str, rows: [][]Val) {
+    let at = cacheAt(c, &key)
+    if at >= 0 {
+        c.rows[at] = rows
+        return
+    }
+    c.index.put(key, len(c.rows))
+    append(mut &c.rows, rows)
+}
+
+fn copyRows(rows: &[][]Val): [][]Val {
+    var out: [][]Val = []
+    for r in rows { append(mut &out, copyRow(&r)) }
+    return out
+}
+
+// Runs a planned query inside another's run: the shared rows go with it,
+// and its counts add to the parent's slot i (EXPLAIN ANALYZE).
+fn runChild(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params: &[]Val, cap: int, parent: mut &Run,
+            i: int): Result[Res, DbErr] {
+    var rs = newRun(&sel.q)
+    rs.maxRounds = parent.maxRounds
+    rs.cache = replace(mut &parent.cache, newCache())
+    let r = execSel(st, txn, sel, params, cap, mut &rs)
+    parent.cache = replace(mut &rs.cache, newCache())
+    while len(parent.stats) <= i { append(mut &parent.stats, SubStat{runs: 0, hits: 0, cnt: [], inner: []}) }
+    parent.stats[i].runs += 1
+    addCounts(mut &parent.stats[i].cnt, &rs.cnt)
+    mergeStats(mut &parent.stats[i].inner, &rs.stats)
+    return r
 }
 
 // A column type for a result's OID.
@@ -2633,14 +2711,10 @@ fn oidType(oid: int): lexdb_sql.TypeName {
 }
 
 // Runs a subquery: EXISTS stops at its first row, a scalar at its second.
-fn runSub(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sp: &SubPlan, params: &[]Val,
-          stat: mut &SubStat): Result[SubRes, DbErr] {
+fn runSub(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sp: &SubPlan, params: &[]Val, parent: mut &Run,
+          i: int): Result[SubRes, DbErr] {
     let cap = if sp.use == lexdb_sql.SUB_EXISTS { 1 } else if sp.use == lexdb_sql.SUB_SCALAR { 2 } else { -1 }
-    var rs = newRun(&sp.sel.q)
-    let res = try execSel(st, txn, &sp.sel, params, cap, mut &rs)
-    stat.runs += 1
-    addCounts(mut &stat.cnt, &rs.cnt)
-    mergeStats(mut &stat.inner, &rs.stats)
+    let res = try runChild(st, txn, &sp.sel, params, cap, parent, i)
     var out = emptyRes()
     out.rows = len(res.rows)
     if sp.use == lexdb_sql.SUB_SCALAR {
@@ -2722,7 +2796,7 @@ fn fillCur(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, x: &Exp
             var ps: []Val = []
             for j in 0..q.base { append(mut &ps, env.params[j]) }
             for v in refVals { append(mut &ps, v) }
-            let r = try runSub(st, txn, &q.subs[i], &ps, mut &rs.stats[i])
+            let r = try runSub(st, txn, &q.subs[i], &ps, rs, i)
             cur[i] = subValue(&n, &r, &xv)
             if len(rs.memoRes[i]) < MEMO_MAX {
                 rs.memo[i].put(key, len(rs.memoRes[i]))
@@ -2756,6 +2830,7 @@ fn allTrueX(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Ma
 // What a query's run reads besides its tables: per hash-joined level its
 // rows, and the results of the subqueries run once.
 type Mats = record {
+    vrows: [][][]Val            // per level of rows held by the run: its rows
     mat: [][][]Val
     keys: []Map[str, int]       // hash key -> bucket
     buckets: [][][]int          // rows of mat
@@ -2765,8 +2840,9 @@ type Mats = record {
 // Before a query runs: its subqueries without refs, then its hash tables.
 fn prepare(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, params: &[]Val,
            rs: mut &Run): Result[Mats, DbErr] {
-    var m = Mats{mat: [], keys: [], buckets: [], subs: []}
+    var m = Mats{vrows: [], mat: [], keys: [], buckets: [], subs: []}
     for k in 0..len(q.levels) {
+        append(mut &m.vrows, [])
         append(mut &m.mat, [])
         append(mut &m.keys, newMap())
         append(mut &m.buckets, [])
@@ -2780,11 +2856,20 @@ fn prepare(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, params:
         var ps: []Val = []
         for j in 0..q.base { append(mut &ps, params[j]) }
         if sp.use == lexdb_sql.SUB_FROM {
-            append(mut &m.subs, try runFrom(st, txn, sp, &ps, mut &rs.stats[i]))
+            append(mut &m.subs, try runFrom(st, txn, sp, &ps, rs, i))
         } else if sp.hashed {
-            append(mut &m.subs, try runHashed(st, txn, sp, &ps, mut &rs.stats[i]))
+            append(mut &m.subs, try runHashed(st, txn, sp, &ps, rs, i))
         } else {
-            append(mut &m.subs, try runSub(st, txn, sp, &ps, mut &rs.stats[i]))
+            append(mut &m.subs, try runSub(st, txn, sp, &ps, rs, i))
+        }
+    }
+    // the levels' rows: a subquery's (each is read by one level), a working table's
+    for k in 0..len(q.levels) {
+        if q.levels[k].src >= 0 { m.vrows[k] = replace(mut &m.subs[q.levels[k].src].data, []) }
+        if q.levels[k].work >= 0 {
+            let at = cacheAt(&rs.cache, &("w" + q.levels[k].work.toStr()))
+            if at < 0 { return Err(e("XX000", "a working table is missing")) }
+            m.vrows[k] = copyRows(&rs.cache.rows[at])
         }
     }
     try materialize(st, txn, q, mut &m, params, rs)
@@ -2830,6 +2915,7 @@ fn subLines(q: &Query, stats: &[]SubStat, out: mut &[]str) {
 
 fn pathText(lv: &Level): str {
     if lv.src >= 0 { return "rows of subquery " + (lv.src + 1).toStr() }
+    if lv.work >= 0 { return "rows of the working table" }
     let p = &lv.path
     let cols = keyCols(&lv.t, p.index)
     if len(p.ins) > 0 {
@@ -2903,7 +2989,7 @@ fn copyRow(r: &[]Val): []Val {
 }
 
 fn oneTable(name: &str): []lexdb_sql.FromItem {
-    return [lexdb_sql.FromItem{table: name, alias: name, join: lexdb_sql.J_FIRST, on: None, sub: -1, cols: []}]
+    return [lexdb_sql.FromItem{table: name, alias: name, join: lexdb_sql.J_FIRST, on: None, sub: -1, cols: [], work: -1}]
 }
 
 // ---- indexes: an entry per row, its key the indexed columns then the
@@ -3148,7 +3234,7 @@ fn dupKey(t: &Table, row: &[]Val): DbErr {
              strings.join(&names, ", ") + ")=(" + strings.join(&vals, ", ") + ") already exists.")
 }
 
-fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val): Result[Res, DbErr] {
+fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, lim: int): Result[Res, DbErr] {
     let t = try needTable(st, txn, &s.table)
     var targets: []int = []
     if len(s.names) == 0 {
@@ -3175,6 +3261,7 @@ fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     }
     endScope(mut &sc, mut &q)
     var rs = newRun(&q)
+    rs.maxRounds = lim
     let m = try prepare(st, txn, &q, params, mut &rs)
     let noAggs: []Val = []
     let env = Env{cols: &q.cols, row: &noAggs, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs}
@@ -3202,7 +3289,7 @@ fn insertRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, targ
     return Ok(tagOnly("INSERT 0 " + count.toStr()))
 }
 
-fn update(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val): Result[Res, DbErr] {
+fn update(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, lim: int): Result[Res, DbErr] {
     var sc = newScope(params, &[])
     var q = try buildQuery(st, txn, &oneTable(&s.table), &s.where, params, &s.subs, mut &sc)
     var targets: []int = []
@@ -3219,6 +3306,7 @@ fn update(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     let t = &q.levels[0].t
     var found: [][]Val = []
     var rs = newRun(&q)
+    rs.maxRounds = lim
     let m = try prepare(st, txn, &q, params, mut &rs)
     try runQuery(st, txn, &q, &m, params, fn(r: &[]Val): Result[bool, DbErr] {
         append(mut &found, copyRow(r))
@@ -3244,13 +3332,14 @@ fn update(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     return Ok(tagOnly("UPDATE " + len(found).toStr()))
 }
 
-fn delete(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val): Result[Res, DbErr] {
+fn delete(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, lim: int): Result[Res, DbErr] {
     var sc = newScope(params, &[])
     var q = try buildQuery(st, txn, &oneTable(&s.table), &s.where, params, &s.subs, mut &sc)
     endScope(mut &sc, mut &q)
     let t = &q.levels[0].t
     var found: [][]Val = []
     var rs = newRun(&q)
+    rs.maxRounds = lim
     let m = try prepare(st, txn, &q, params, mut &rs)
     try runQuery(st, txn, &q, &m, params, fn(r: &[]Val): Result[bool, DbErr] {
         append(mut &found, copyRow(r))
@@ -3264,7 +3353,7 @@ fn delete(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     return Ok(tagOnly("DELETE " + len(found).toStr()))
 }
 
-fn explain(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, x: &lexdb_sql.Stmt, params: &[]Val,
+fn explain(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, x: &lexdb_sql.Stmt, params: &[]Val, lim: int,
            ptypes: &[]int): Result[Res, DbErr] {
     let s = &x.inner[0]
     var res = Res{cols: [OutCol{name: "QUERY PLAN", oid: lexdb_sql.OID_TEXT}], rows: [], tag: "EXPLAIN", hasRows: true}
@@ -3273,7 +3362,7 @@ fn explain(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, x: &lexdb_sql.Stmt
     if x.ifFlag {
         // ANALYZE: run it, counting what each table does
         let t0 = time.monotonicNs()
-        let r = try selectWith(st, txn, s, params, ptypes, true, mut &lines)
+        let r = try selectWith(st, txn, s, params, ptypes, lim, true, mut &lines)
         let us = (time.monotonicNs() - t0) / 1000
         append(mut &lines, "result: " + len(r.rows).toStr() + " rows in " + (us / 1000).toStr() + "." +
                strings.padLeft((us % 1000).toStr(), 3, '0') + " ms")
@@ -3482,9 +3571,10 @@ fn orderValue(o: &Expr, outs: &[]OutCol, vals: &[]Val, env: &Env): Result[Val, D
     return eval(o, env)
 }
 
-fn select(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int): Result[Res, DbErr] {
+fn select(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int,
+          lim: int): Result[Res, DbErr] {
     var none: []str = []
-    return selectWith(st, txn, s, params, ptypes, false, mut &none)
+    return selectWith(st, txn, s, params, ptypes, lim, false, mut &none)
 }
 
 // ---- aggregates: one accumulator per call and group, so a grouped
@@ -3732,6 +3822,11 @@ type Sel = record {
     specs: []AggSpec        // the aggregate calls; exprs, having and order use their slots
     distinct: bool
     desc: []bool            // per ORDER BY item
+    parts: []Sel            // UNION, INTERSECT, EXCEPT: its two queries (q has no tables, refs theirs)
+    setop: int
+    setAll: bool
+    split: int              // refs: the first query's, then the second's
+    rec: int                // a recursive CTE: its number; -1
 }
 
 // The column of level 0 an expression is, else -1.
@@ -3826,6 +3921,10 @@ fn minMax(q: &Query, exprs: &[]Expr, dir: mut &int): int {
 
 fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val,
               sc: mut &Scope): Result[Sel, DbErr] {
+    if s.rec && s.setop != lexdb_sql.SET_UNION {
+        return Err(e("42P19", "recursive query does not have the form non-recursive-term UNION [ALL] recursive-term"))
+    }
+    if s.setop != 0 { return planSet(st, txn, s, params, sc) }
     var q = try buildQuery(st, txn, &s.from, &s.where, params, &s.subs, sc)
     var exprs: []Expr = []
     let outs = try selectCols(s, &q.cols, sc, mut &exprs)
@@ -3866,7 +3965,7 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
     var first = -1
     // The first table's order holds through the joins, unless a RIGHT or
     // FULL JOIN adds its unmatched rows at the end.
-    var keeps = len(q.levels) > 0 && q.levels[0].src < 0
+    var keeps = len(q.levels) > 0 && !q.levels[0].virt()
     for lv in q.levels { if keepsRight(lv.join) { keeps = false } }
     var setIndex = -2               // the first table's path, changed: its index, its direction
     var setDesc = false
@@ -3979,11 +4078,163 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
     var desc: []bool = []
     for o in s.order { append(mut &desc, o.desc) }
     return Ok(Sel{q: q, exprs: exprs, outs: outs, groupBy: groupBy, order: order, aggQ: aggQ, sort: sort,
-                  first: first, limit: limit, offset: offset, having: having, specs: specs, distinct: s.distinct, desc: desc})
+                  first: first, limit: limit, offset: offset, having: having, specs: specs, distinct: s.distinct, desc: desc,
+                  parts: [], setop: 0, setAll: false, split: 0, rec: -1})
+}
+
+// UNION, INTERSECT, EXCEPT: its two queries, planned on their own; the
+// whole has their output (the first's names), ORDER BY over that output,
+// LIMIT and OFFSET. A recursive CTE's second query reads the working table,
+// with the first's columns.
+fn planSet(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val,
+           sc: mut &Scope): Result[Sel, DbErr] {
+    let l = try planSelect(st, txn, &s.inner[0], params, sc)
+    if s.rec {
+        var cols: []lexdb_sql.ColDef = []
+        for o in l.outs { append(mut &cols, lexdb_sql.ColDef{name: o.name, typ: oidType(o.oid), notNull: false}) }
+        append(mut &sc.works, Work{id: s.cte, cols: cols})
+    }
+    let rr = planSelect(st, txn, &s.inner[1], params, sc)
+    if s.rec { let w = pop(mut &sc.works) }
+    let r = try rr
+    let what = if s.setop == lexdb_sql.SET_UNION { "UNION" } else if s.setop == lexdb_sql.SET_INTERSECT { "INTERSECT" } else { "EXCEPT" }
+    if len(l.outs) != len(r.outs) { return Err(e("42601", "each " + what + " query must have the same number of columns")) }
+    var outs: []OutCol = []
+    for o in l.outs { append(mut &outs, o) }
+    var order: []Expr = []
+    for o in s.order {
+        var ok = false
+        match o.expr {
+            Expr.Lit(v) { match v { Val.Int(n) { ok = n >= 1 && n <= len(outs) } else {} } }
+            Expr.Col(n) { for oc in outs { if oc.name == n { ok = true } } }
+            else {}
+        }
+        if !ok { return Err(e("42P10", "invalid " + what + " ORDER BY clause: name or number an output column")) }
+        append(mut &order, clone(&o.expr))
+    }
+    var desc: []bool = []
+    for o in s.order { append(mut &desc, o.desc) }
+    var refs = cloneAll(&l.q.refs)
+    for x in r.q.refs { append(mut &refs, clone(&x)) }
+    let split = len(l.q.refs)
+    let limit = try evalInt(&s.limit, params, "LIMIT")
+    let offset = try evalInt(&s.offset, params, "OFFSET")
+    let q = Query{levels: [], cols: [], top: [], subs: [], base: sc.base, corr: false, refs: refs}
+    return Ok(Sel{q: q, exprs: [], outs: outs, groupBy: [], order: order, aggQ: false, sort: len(order) > 0, first: -1,
+                  limit: limit, offset: offset, having: None, specs: [], distinct: false, desc: desc, parts: [l, r],
+                  setop: s.setop, setAll: s.setAll, split: split, rec: if s.rec { s.cte } else { -1 }})
+}
+
+// A row's key for UNION and the like (NULLs alike; 2 = 2.0).
+fn rowKey(vs: &[]Val): str {
+    var kb = newStrBuf()
+    for v in vs { keyPart(mut &kb, &v) }
+    return kb.toStr()
+}
+
+fn distinctRows(rows: [][]Val, seen: mut &Map[str, int]): [][]Val {
+    var all = rows
+    var out: [][]Val = []
+    for i in 0..len(all) {
+        let k = rowKey(&all[i])
+        if seen.get(&k).isSome() { continue }
+        seen.put(k, 1)
+        append(mut &out, replace(mut &all[i], []))
+    }
+    return out
+}
+
+fn combine(op: int, all: bool, l: [][]Val, r: [][]Val): [][]Val {
+    var la = l
+    var ra = r
+    if op == lexdb_sql.SET_UNION {
+        if all {
+            for i in 0..len(ra) { append(mut &la, replace(mut &ra[i], [])) }
+            return la
+        }
+        var seen: Map[str, int] = newMap()
+        var out = distinctRows(la, mut &seen)
+        let more = distinctRows(ra, mut &seen)
+        var mo = more
+        for i in 0..len(mo) { append(mut &out, replace(mut &mo[i], [])) }
+        return out
+    }
+    var cnt: Map[str, int] = newMap()
+    for row in ra {
+        let k = rowKey(&row)
+        let n = cnt.get(&k).unwrapOr(0)
+        cnt.put(k, n + 1)
+    }
+    var out: [][]Val = []
+    var done: Map[str, int] = newMap()
+    for i in 0..len(la) {
+        let k = rowKey(&la[i])
+        let n = cnt.get(&k).unwrapOr(0)
+        if op == lexdb_sql.SET_INTERSECT {
+            if n > 0 {
+                append(mut &out, replace(mut &la[i], []))
+                cnt.put(k, if all { n - 1 } else { 0 })
+            }
+        } else if all {
+            if n > 0 { cnt.put(k, n - 1) } else { append(mut &out, replace(mut &la[i], [])) }
+        } else if n == 0 && done.get(&k).isNone() {
+            done.put(k, 1)
+            append(mut &out, replace(mut &la[i], []))
+        }
+    }
+    return out
+}
+
+// The rows of a UNION, INTERSECT or EXCEPT: each query with the statement's
+// parameters and its own refs.
+fn runSet(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params: &[]Val,
+          rs: mut &Run): Result[[][]Val, DbErr] {
+    let base = sel.q.base
+    var lp: []Val = []
+    var rp: []Val = []
+    for j in 0..base {
+        append(mut &lp, params[j])
+        append(mut &rp, params[j])
+    }
+    for j in base..base + sel.split { append(mut &lp, params[j]) }
+    for j in base + sel.split..len(params) { append(mut &rp, params[j]) }
+    if sel.rec >= 0 { return runRecursive(st, txn, sel, &lp, &rp, rs) }
+    var lres = try runChild(st, txn, &sel.parts[0], &lp, -1, rs, 0)
+    var rres = try runChild(st, txn, &sel.parts[1], &rp, -1, rs, 1)
+    return Ok(combine(sel.setop, sel.setAll, replace(mut &lres.rows, []), replace(mut &rres.rows, [])))
+}
+
+// A recursive CTE: the first query's rows, then rounds of the second over
+// the rows the last round added (the working table) until a round adds
+// none; with UNION (not ALL), rows seen before are not added.
+fn runRecursive(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, lp: &[]Val, rp: &[]Val,
+                rs: mut &Run): Result[[][]Val, DbErr] {
+    let key = "w" + sel.rec.toStr()
+    var seen: Map[str, int] = newMap()
+    var lres = try runChild(st, txn, &sel.parts[0], lp, -1, rs, 0)
+    var work = replace(mut &lres.rows, [])
+    if !sel.setAll { work = distinctRows(work, mut &seen) }
+    var out: [][]Val = []
+    // max_recursion: rounds that add rows (the last round, adding none, is free)
+    var rounds = 0
+    while len(work) > 0 {
+        for r in work { append(mut &out, copyRow(&r)) }
+        cachePut(mut &rs.cache, key, work)
+        var rres = try runChild(st, txn, &sel.parts[1], rp, -1, rs, 1)
+        work = replace(mut &rres.rows, [])
+        if !sel.setAll { work = distinctRows(work, mut &seen) }
+        rounds += 1
+        if rs.maxRounds > 0 && rounds > rs.maxRounds && len(work) > 0 {
+            return Err(e("54001", "recursive query still adding rows after " + rs.maxRounds.toStr() +
+                         " rounds (max_recursion); SET max_recursion = n to allow more, 0 for no limit"))
+        }
+    }
+    return Ok(out)
 }
 
 // EXPLAIN's lines for a planned SELECT.
 fn selLines(sel: &Sel, cnt: &[]Counts, stats: &[]SubStat): []str {
+    if sel.setop != 0 { return setLines(sel, stats) }
     var lines = explainLines(&sel.q, cnt)
     if len(sel.q.levels) == 0 { append(mut &lines, "result") }
     if sel.first >= 0 { append(mut &lines, "min/max: the first value in the scan's order") }
@@ -3996,13 +4247,36 @@ fn selLines(sel: &Sel, cnt: &[]Counts, stats: &[]SubStat): []str {
     return lines
 }
 
+fn setLines(sel: &Sel, stats: &[]SubStat): []str {
+    var lines: []str = []
+    let op = if sel.setop == lexdb_sql.SET_UNION { "union" } else if sel.setop == lexdb_sql.SET_INTERSECT { "intersect" } else { "except" }
+    append(mut &lines, (if sel.rec >= 0 { "recursive " } else { "" }) + op + (if sel.setAll { " all" } else { "" }))
+    let none: []Counts = []
+    let noStats: []SubStat = []
+    for i in 0..len(sel.parts) {
+        var head = if sel.rec >= 0 { if i == 0 { "first" } else { "then, per round, over the working table" } } else { "query " + (i + 1).toStr() }
+        var inner: []str = []
+        if i < len(stats) {
+            head = head + " (runs " + stats[i].runs.toStr() + ")"
+            inner = selLines(&sel.parts[i], &stats[i].cnt, &stats[i].inner)
+        } else {
+            inner = selLines(&sel.parts[i], &none, &noStats)
+        }
+        append(mut &lines, "  " + head + ":")
+        for l in inner { append(mut &lines, "    " + l) }
+    }
+    if len(sel.order) > 0 { append(mut &lines, "order: sort") }
+    return lines
+}
+
 // A SELECT; with analyze, plan gets EXPLAIN ANALYZE's lines (a line per
 // table, with what it did). The counts are kept for every query: an add each.
 fn selectWith(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int,
-              analyze: bool, plan: mut &[]str): Result[Res, DbErr] {
+              lim: int, analyze: bool, plan: mut &[]str): Result[Res, DbErr] {
     var sc = newScope(params, ptypes)
     let sel = try planSelect(st, txn, s, params, mut &sc)
     var rs = newRun(&sel.q)
+    rs.maxRounds = lim
     let res = try execSel(st, txn, &sel, params, -1, mut &rs)
     if analyze {
         let lines = selLines(&sel, &rs.cnt, &rs.stats)
@@ -4034,11 +4308,27 @@ fn execSel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
         if sorting { for x in sel.order { if hasCorr(&x) { late = true } } }
     }
     var outRows: []OutRow = []
+    if sel.setop != 0 {
+        var rows = try runSet(st, txn, sel, params, rs)
+        let noCols: []lexdb_sql.ColDef = []
+        for i in 0..len(rows) {
+            let vals = replace(mut &rows[i], [])
+            var ord: []Val = []
+            if sorting {
+                let none: []Val = []
+                let env = Env{cols: &noCols, row: &vals, aggs: &none, params: params, subs: &m.subs, cur: &none}
+                for o in sel.order { append(mut &ord, try orderValue(&o, &sel.outs, &vals, &env)) }
+            }
+            append(mut &outRows, OutRow{vals: vals, ord: ord})
+        }
+    }
     let early = !sel.aggQ && !sorting && limit >= 0 && !(late && sel.distinct)
     let stopAt = if offset > 0 { limit + offset } else { limit }
     let noAggs: []Val = []
     var seen: Map[str, int] = newMap()      // SELECT DISTINCT
-    if sel.aggQ {
+    if sel.setop != 0 {
+        // done above
+    } else if sel.aggQ {
         // per group: its first row (for grouped columns) and its accumulators
         var index: Map[str, int] = newMap()
         var firsts: [][]Val = []
@@ -4176,6 +4466,10 @@ fn setParam(x: &Expr, oid: int, out: mut &[]int) {
 }
 
 fn guessParams(st: &lexdb_store.Store, s: &lexdb_sql.Stmt, out: mut &[]int) {
+    if s.setop != 0 {
+        for b in s.inner { guessParams(st, &b, out) }
+        return
+    }
     var txn = lexdb_store.begin()
     match findTable(st, mut &txn, &s.table) {
         Ok(found) {
@@ -4250,6 +4544,14 @@ pub fn describe(st: &lexdb_store.Store, s: &lexdb_sql.Stmt, ptypes: &[]int): Res
     if s.kind == lexdb_sql.S_EXPLAIN { return Ok([OutCol{name: "QUERY PLAN", oid: lexdb_sql.OID_TEXT}]) }
     if s.kind != lexdb_sql.S_SELECT { return Ok([]) }
     var txn = lexdb_store.begin()
+    if s.setop != 0 {
+        let np: []Val = array(if s.params > len(ptypes) { s.params } else { len(ptypes) }, Val.Null)
+        var sc = newScope(&np, ptypes)
+        let sel = try planSelect(st, mut &txn, s, &np, mut &sc)
+        var outs: []OutCol = []
+        for o in sel.outs { append(mut &outs, o) }
+        return Ok(outs)
+    }
     let none: Option[Expr] = None
     let np: []Val = array(if s.params > len(ptypes) { s.params } else { len(ptypes) }, Val.Null)
     var sc = newScope(&np, ptypes)
@@ -4264,9 +4566,12 @@ pub type Session = record {
     st: lexdb_store.Store
     txn: []lexdb_store.Txn      // the open transaction block, if any
     failed: bool                // an error in the block: only ROLLBACK (or COMMIT) now
+    maxRecursion: int           // SET max_recursion: a recursive CTE's rounds at most; 0 no limit
 }
 
-pub fn newSession(st: lexdb_store.Store): Session { return Session{st: st, txn: [], failed: false} }
+pub fn newSession(st: lexdb_store.Store): Session {
+    return Session{st: st, txn: [], failed: false, maxRecursion: MAX_RECURSION}
+}
 
 // Ends the session: an open block is rolled back (a snapshot released).
 pub fn (s: mut &Session) close() {
@@ -4298,31 +4603,39 @@ pub fn (s: &Session) status(): byte {
     return if s.failed { 'E' } else { 'T' }
 }
 
-fn execIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int): Result[Res, DbErr] {
+fn execIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int,
+          lim: int): Result[Res, DbErr] {
     // with subqueries, the outer values they use are numbered after all the
     // statement's parameters: those not sent are NULL
-    let subs = len(s.subs) > 0 || (len(s.inner) > 0 && len(s.inner[0].subs) > 0)
+    let subs = hasSubs(s)
     let want = if s.params > len(ptypes) { s.params } else { len(ptypes) }
     if subs && len(params) < want {
         var ps: []Val = []
         for v in params { append(mut &ps, v) }
         while len(ps) < want { append(mut &ps, Val.Null) }
-        return execStmt(st, txn, s, &ps, ptypes)
+        return execStmt(st, txn, s, &ps, ptypes, lim)
     }
-    return execStmt(st, txn, s, params, ptypes)
+    return execStmt(st, txn, s, params, ptypes, lim)
 }
 
-fn execStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int): Result[Res, DbErr] {
+fn hasSubs(s: &lexdb_sql.Stmt): bool {
+    if len(s.subs) > 0 { return true }
+    for x in s.inner { if hasSubs(&x) { return true } }
+    return false
+}
+
+fn execStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int,
+            lim: int): Result[Res, DbErr] {
     match s.kind {
         lexdb_sql.S_CREATE { return createTable(st, txn, s) }
         lexdb_sql.S_DROP { return dropTable(st, txn, s) }
-        lexdb_sql.S_INSERT { return insert(st, txn, s, params) }
-        lexdb_sql.S_SELECT { return select(st, txn, s, params, ptypes) }
-        lexdb_sql.S_UPDATE { return update(st, txn, s, params) }
-        lexdb_sql.S_DELETE { return delete(st, txn, s, params) }
+        lexdb_sql.S_INSERT { return insert(st, txn, s, params, lim) }
+        lexdb_sql.S_SELECT { return select(st, txn, s, params, ptypes, lim) }
+        lexdb_sql.S_UPDATE { return update(st, txn, s, params, lim) }
+        lexdb_sql.S_DELETE { return delete(st, txn, s, params, lim) }
         lexdb_sql.S_CREATE_INDEX { return createIndex(st, txn, s) }
         lexdb_sql.S_DROP_INDEX { return dropIndex(st, txn, s) }
-        lexdb_sql.S_EXPLAIN { return explain(st, txn, s, params, ptypes) }
+        lexdb_sql.S_EXPLAIN { return explain(st, txn, s, params, lim, ptypes) }
         else { return Err(e("XX000", "not a data statement")) }
     }
 }
@@ -4356,7 +4669,18 @@ pub fn paramVals(texts: &[]Option[str], ptypes: &[]int): Result[[]Val, DbErr] {
 pub fn (s: mut &Session) run(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int): Result[Res, DbErr] {
     match stmt.kind {
         lexdb_sql.S_EMPTY { return Ok(tagOnly("")) }
-        lexdb_sql.S_SET { return Ok(tagOnly("SET")) }
+        lexdb_sql.S_SET {
+            if stmt.table == "max_recursion" {
+                match stmt.limit {
+                    Some(x) {
+                        let v = try evalInt(&Some(clone(&x)), params, "max_recursion")
+                        s.maxRecursion = if v < 0 { MAX_RECURSION } else { v }
+                    }
+                    None { s.maxRecursion = MAX_RECURSION }     // RESET
+                }
+            }
+            return Ok(tagOnly(if stmt.ifFlag { "RESET" } else { "SET" }))
+        }
         lexdb_sql.S_BEGIN {
             if len(s.txn) == 0 {
                 if stmt.ifFlag {
@@ -4395,7 +4719,7 @@ pub fn (s: mut &Session) run(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
             return Err(e("25006", "cannot execute " + stmtName(stmt.kind) + " in a read-only transaction"))
         }
         let st = s.st
-        let r = execIn(&st, mut &s.txn[0], stmt, params, ptypes)
+        let r = execIn(&st, mut &s.txn[0], stmt, params, ptypes, s.maxRecursion)
         if r.isErr() {
             s.failed = true
             return r
@@ -4408,7 +4732,7 @@ pub fn (s: mut &Session) run(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
     var tries = 0
     while true {
         var t = lexdb_store.begin()
-        let r = try execIn(&s.st, mut &t, stmt, params, ptypes)
+        let r = try execIn(&s.st, mut &t, stmt, params, ptypes, s.maxRecursion)
         match s.st.commit(t) {
             Ok(_) { return Ok(r) }
             Err(x) {

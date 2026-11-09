@@ -427,7 +427,7 @@ server). Tests: `python3 lexell/tests/lexdb.py` (20 programs in
   statement waits, after it runs, until what it read is durable, since its
   result goes out before COMMIT (4.4).
 - **Interpreted, not bytecode.** The executor walks the statement's tree.
-- **No WITH RECURSIVE, LATERAL, schemas, bytea, dates or times yet.**
+- **No LATERAL, schemas, bytea, dates or times yet.**
 - **Trust login**: no password, no TLS. The server listens on loopback by
   default.
 - **A simple query with several statements** runs each in its own
@@ -506,9 +506,10 @@ is the comparison to make.
 
 ### 9.4 Next
 
-1. The rest of subqueries and CTEs (9.8 to 9.10): `WITH RECURSIVE`; a CTE
-   used twice run once; `LATERAL` (a subquery in FROM using the tables
-   before it). Smaller: a correlated subquery's value as a lookup's key
+1. The rest of subqueries (9.8 to 9.11): `LATERAL` (a subquery in FROM
+   using the tables before it). A statement's memory and time: a limit on
+   the rows a statement holds and a statement timeout (a recursive CTE
+   within max_recursion can still grow without bound, 9.11). Smaller: a correlated subquery's value as a lookup's key
    (now it is only a filter), a small uncorrelated IN set as an IN-list
    lookup, correlated subqueries in GROUP BY and in aggregates' arguments,
    hashing a correlated scalar subquery with an aggregate (a count per
@@ -767,4 +768,51 @@ is the comparison to make.
   column aliases ignored (2 lines).
 - pgbench point selects, the last commit and this one, two rounds each:
   26,666 / 26,173 and 23,823 / 24,054 tps. The binary is 1.13 MB.
+
+### 9.11 UNION, INTERSECT, EXCEPT and WITH RECURSIVE
+
+- `UNION`, `INTERSECT` and `EXCEPT`, with `ALL` or `DISTINCT`, INTERSECT
+  binding first, a query in parentheses with its own ORDER BY and LIMIT;
+  ORDER BY (an output column's name or number), LIMIT and OFFSET of the
+  whole. Each query is planned on its own (its outer values too); the
+  first gives the names. Rows are equal with NULLs alike and numbers by
+  value (`SELECT 2 UNION SELECT 2.0` is one row). A different number of
+  columns is 42601.
+- A CTE used more than once runs once per statement: its rows are kept,
+  by its number, in rows the statement's runs share (a run hands them to
+  the runs inside it and takes them back); its other uses copy them.
+  EXPLAIN ANALYZE shows a use served so: `runs 0, from cache 1`.
+- `WITH RECURSIVE x AS (first UNION [ALL] then)`: the first query's rows,
+  then rounds of the second over the working table (the rows the last
+  round added) until a round adds none. With UNION (not ALL) a row seen
+  before is not added, so a cycle ends. The working table is in the
+  shared rows; in its own body the CTE names it, only directly in the
+  second query (in a subquery, in the first query, or a body not of that
+  form: 42P19, as in PostgreSQL). A WITH RECURSIVE CTE that does not
+  name itself is an ordinary one.
+- **max_recursion.** PostgreSQL has no limit; lexdb has one, as SQL
+  Server's MAXRECURSION: at most 1,000 rounds that add rows, then error
+  54001. `SET max_recursion = n` (or `TO n`) per session, 0 for no limit,
+  `RESET max_recursion` (or `= DEFAULT`) for 1,000. It bounds rounds, not
+  rows: a query whose rows multiply each round can still use much memory
+  within the limit (a limit on a statement's rows and a timeout are in
+  9.4). Other SETs are still accepted and ignored.
+- EXPLAIN: `recursive union all`, `first` and `then, per round, over the
+  working table` with their plans; ANALYZE adds runs (rounds).
+- Tests: `exec_with` (89 statements now, checked by hand): the set
+  operations with NULLs and duplicates, precedence, ORDER BY rules; a
+  CTE used twice; series, a hierarchy both ways, a cycle with UNION and
+  with UNION ALL (the limit), max_recursion set, 0, reset, and at its
+  edge; the 42P19 errors. `exec_index_diff` compares UNION with DISTINCT
+  over UNION ALL and UNION ALL with the counts added, INTERSECT with AND,
+  EXCEPT with AND NOT (a NULL condition: not in the second), and a
+  recursive walk (x, x + 1, ...; the working table first or second in the
+  join) with the walk done by the test: no differences over four seeds.
+  Mutations caught: INTERSECT keeping duplicates, EXCEPT ALL taking all,
+  UNION not removing duplicates across its sides, recursion without
+  UNION's repeats removed, the limit one round early, the CTE store
+  ignoring which CTE; the working table holding all rows so far makes
+  `exec_with` run without end (rows multiply), so it fails by time.
+- pgbench point selects, the last commit and this one: 25,523 / 25,516
+  and 23,467 / 26,871 tps. The binary is 1.19 MB.
 

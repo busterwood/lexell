@@ -13,7 +13,9 @@
 // unmatched rows, a correlated count with a grouped LEFT JOIN, a scalar with
 // its value; UPDATE uses them too. b has an index on x and b0 none, so a
 // subquery correlated on x is per row on one side and hashed on the other.
-// A subquery in FROM and a CTE are compared with the tables they read.
+// A subquery in FROM and a CTE are compared with the tables they read;
+// UNION with DISTINCT, INTERSECT and EXCEPT with AND and AND NOT; WITH RECURSIVE with
+// the same walk done by the test.
 // expect: statements ok, queries 1204 differ 0, index paths used true, hash joins used true, index order used true, backward true, min/max true, filtered true, in-lists true, subqueries per row true and once true, hashed true
 import "strings"
 import "collections"
@@ -172,7 +174,7 @@ fn body(st: lexdb_store.Store): int {
             var sql = ""
             let c = cond(mut &r)
             let n = (r.below(9) + 1).toStr()
-            let j = r.below(29)
+            let j = r.below(33)
             var q1 = ""
             var q0 = ""
             var got1 = ""
@@ -266,6 +268,51 @@ fn body(st: lexdb_store.Store): int {
                 q0 = "select t.id, u.id from a0 t left join b0 u on u.x = t.x and (" + qual(&c, &"u") + ") order by 1, 2"
                 got1 = rows(mut &s, &q1)
                 got0 = rows(mut &s, &q0)
+            } else if j == 29 {
+                // UNION = DISTINCT of UNION ALL; UNION ALL = the counts added
+                let c2 = cond(mut &r)
+                if r.below(2) == 0 {
+                    q1 = "select x from a where " + c + " union select x from b where " + c2 + " order by 1"
+                    q0 = "select distinct x from (select x from a0 where " + c + " union all select x from b0 where " + c2 + ") u order by 1"
+                    got0 = rows(mut &s, &q0)
+                } else {
+                    q1 = "select count(*) from (select id from a where " + c + " union all select id from b where " + c2 + ") u"
+                    let n1 = strings.parseIntOpt(rows(mut &s, &("select count(*) from a0 where " + c))).unwrapOr(-1)
+                    let n2 = strings.parseIntOpt(rows(mut &s, &("select count(*) from b0 where " + c2))).unwrapOr(-1)
+                    q0 = "(counts added)"
+                    got0 = (n1 + n2).toStr()
+                }
+                got1 = rows(mut &s, &q1)
+            } else if j == 30 {
+                // INTERSECT = AND; EXCEPT = AND NOT (a NULL condition: not in the second)
+                let c2 = cond(mut &r)
+                if r.below(2) == 0 {
+                    q1 = "select id, x from a where " + c + " intersect select id, x from a where " + c2 + " order by 1"
+                    q0 = "select id, x from a0 where (" + c + ") and (" + c2 + ") order by 1"
+                } else {
+                    q1 = "select id, x from a where " + c + " except select id, x from a where " + c2 + " order by 1"
+                    q0 = "select id, x from a0 where (" + c + ") and case when (" + c2 + ") then false else true end order by 1"
+                }
+                got1 = rows(mut &s, &q1)
+                got0 = rows(mut &s, &q0)
+            } else if j == 31 || j == 32 {
+                // WITH RECURSIVE: from the smallest x, the run of x + 1, x + 2, ... in the table
+                let walk = if j == 31 { "from r join a on a.x = r.v + 1" } else { "from a join r on a.x = r.v + 1" }
+                q1 = "with recursive r(v) as (select min(x) from a where " + c + " union select a.x " + walk + ") select v from r where v is not null order by v"
+                q0 = "(the run, from the rows)"
+                let lo = rows(mut &s, &("select min(x) from a0 where " + c))
+                var run: []str = []
+                if lo != "N" {
+                    var v = strings.parseIntOpt(lo).unwrapOr(0)
+                    while true {
+                        append(mut &run, v.toStr())
+                        let more = rows(mut &s, &("select count(*) from a0 where x = " + (v + 1).toStr()))
+                        if more == "0" { break }
+                        v += 1
+                    }
+                }
+                got0 = strings.join(&run, ";")
+                got1 = rows(mut &s, &q1)
             } else if j == 24 || j == 25 {
                 // correlated IN and NOT IN as values (NULLs and all): per row
                 // through b's index against b0 hashed

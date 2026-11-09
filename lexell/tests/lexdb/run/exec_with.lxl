@@ -1,6 +1,7 @@
 // lexdb_exec: subqueries in FROM and CTEs (WITH): as tables, joined (hash,
-// both sides), grouped, nested, in subqueries; scope and shadowing; the
-// errors. Expected output checked by hand when written.
+// both sides), grouped, nested, in subqueries; scope and shadowing; a CTE
+// used twice run once; UNION, INTERSECT, EXCEPT (ALL); WITH RECURSIVE, its
+// cycles and max_recursion; the errors. Expected output checked by hand when written.
 // expect: create table c (id int primary key, name text, city text) -> CREATE TABLE
 // expect: create table o (id int primary key, cust int, amount numeric(8,2), status text) -> CREATE TABLE
 // expect: insert into c values (1,'ann','paris'),(2,'bob','rome'),(3,'cy','paris'),(4,'dee',null),(5,'eve','oslo') -> INSERT 0 5
@@ -29,13 +30,56 @@
 // expect: with x as (select 1 as v) select * from (with x as (select 2 as v) select v from x) inner_q, x -> 2|1
 // expect: with a as (select 1 as v), b as (select v + 1 as v from a) select v from b -> 2
 // expect: with b as (select v from a), a as (select 1 as v) select * from b -> 42P01 relation "a" does not exist
-// expect: with recursive r as (select 1) select * from r -> 0A000 WITH RECURSIVE is not supported yet
+// expect: with recursive r as (select 1) select * from r -> 1
 // expect: with x as (select 1 as v), x as (select 2 as v) select * from x -> 42712 WITH query name "x" specified more than once
 // expect: with x as (select 1 as v) insert into c values (9, 'z', 'z') -> 0A000 WITH is supported before SELECT only
 // expect: select id from c where id in (with w as (select cust from o where status = 'open') select cust from w) order by 1 -> 1; 3
 // expect: with w as (select cust from o where status = 'open') select id from c where exists (select 1 from w where w.cust = c.id) order by 1 -> 1; 3
 // expect: with w as (select id, city from c) select city, count(*) from w group by city order by city -> oslo|1; paris|2; rome|1; NULL|1
 // expect: with w as (select id, city from c) select city, max(id) from w group by city having count(*) > 1 -> paris|3
+// expect: select id from c where city = 'paris' union select cust from o order by 1 -> 1; 2; 3; 9; NULL
+// expect: select count(*) from (select id from c union all select cust from o) u -> 11
+// expect: select id from c intersect select cust from o order by 1 -> 1; 2; 3
+// expect: select id from c except select cust from o order by 1 -> 4; 5
+// expect: select cust from o intersect select id from c order by 1 -> 1; 2; 3
+// expect: select cust from o except select id from c where id > 2 order by 1 -> 1; 2; 9; NULL
+// expect: select cust from o intersect all select cust from o where status = 'paid' order by 1 -> 1; 2; 9; NULL
+// expect: select cust from o except all select cust from o where status = 'paid' order by 1 -> 1; 3
+// expect: select 1 union select 2 intersect select 3 -> 1
+// expect: select 2 union select 2.0 -> 2
+// expect: select null union select null -> NULL
+// expect: select id as k from c union select cust from o order by k desc limit 2 -> NULL; 9
+// expect: select 0 union all (select id from c order by id desc limit 1) -> 0; 5
+// expect: select name from c where id in (select 1 union select 3) order by 1 -> ann; cy
+// expect: select max(x) from (select 1 as x union all select 5) t -> 5
+// expect: select id from c where exists (select 1 from o where o.cust = c.id union all select 1 where c.city = 'oslo') order by 1 -> 1; 2; 3; 5
+// expect: explain select id from c union all select cust from o where status = 'open' -> union all;   query 1:;     scan c: full scan;   query 2:;     scan o: full scan
+// expect: select id, name from c union select 1 -> 42601 each UNION query must have the same number of columns
+// expect: select id from c union select cust from o order by id + 1 -> 42P10 invalid UNION ORDER BY clause: name or number an output column
+// expect: explain analyze with x as (select id from c where city = 'paris') select a.id, b.id from x a join x b on b.id >= a.id order by 1, 2 -> scan a: rows of subquery 1 (rows read 2, kept 2); join b: loop over rows of subquery 2 (table rows 2 of 2 read, probes 2, rows read 4, joined 3); order: sort; subquery 1 (from): run once (runs 1, from cache 0);   scan c: full scan (rows read 5, kept 2); subquery 2 (from): run once (runs 0, from cache 1);   scan c: full scan; result: 3 rows
+// expect: with recursive t(n) as (select 1 union all select n + 1 from t where n < 5) select n from t -> 1; 2; 3; 4; 5
+// expect: with recursive t(n) as (select 1 union all select n + 1 from t where n < 100) select count(*), sum(n) from t -> 100|5050
+// expect: create table emp (id int primary key, boss int, name text) -> CREATE TABLE
+// expect: insert into emp values (1, null, 'root'), (2, 1, 'a'), (3, 1, 'b'), (4, 2, 'c'), (5, 4, 'd'), (6, 99, 'orphan') -> INSERT 0 6
+// expect: with recursive sub(id, lvl) as (select id, 0 from emp where id = 1 union all select e.id, s.lvl + 1 from emp e join sub s on e.boss = s.id) select id, lvl from sub order by id -> 1|0; 2|1; 3|1; 4|2; 5|3
+// expect: with recursive up(id, boss) as (select id, boss from emp where id = 5 union all select e.id, e.boss from up join emp e on e.id = up.boss) select id from up -> 5; 4; 2; 1
+// expect: explain analyze with recursive sub(id) as (select id from emp where id = 1 union all select e.id from emp e join sub s on e.boss = s.id) select count(*) from sub -> scan sub: rows of subquery 1 (rows read 5, kept 5); aggregate; subquery 1 (from): run once (runs 1, from cache 0);   recursive union all;     first (runs 1):;       scan emp: primary key lookup (rows read 1, kept 1);     then, per round, over the working table (runs 4):;       scan emp e: full scan (rows read 24, kept 24);       join s: hash on (id) over rows of the working table (table rows 5 of 5 read, probes 24, rows read 4, joined 4); result: 1 rows
+// expect: create table edge (a int primary key, b int) -> CREATE TABLE
+// expect: insert into edge values (1, 2), (2, 3), (3, 1) -> INSERT 0 3
+// expect: with recursive r(n) as (select 1 union select e.b from edge e join r on e.a = r.n) select n from r order by n -> 1; 2; 3
+// expect: with recursive r(n) as (select 1 union all select e.b from edge e join r on e.a = r.n) select count(*) from r -> 54001 recursive query still adding rows after 1000 rounds (max_recursion); SET max_recursion = n to allow more, 0 for no limit
+// expect: set max_recursion = 10 -> SET
+// expect: with recursive t(n) as (select 1 union all select n + 1 from t where n < 20) select count(*) from t -> 54001 recursive query still adding rows after 10 rounds (max_recursion); SET max_recursion = n to allow more, 0 for no limit
+// expect: with recursive t(n) as (select 1 union all select n + 1 from t where n < 11) select count(*) from t -> 11
+// expect: set max_recursion to 0 -> SET
+// expect: with recursive t(n) as (select 1 union all select n + 1 from t where n < 2000) select count(*) from t -> 2000
+// expect: reset max_recursion -> RESET
+// expect: with recursive t(n) as (select 1 union all select n + 1 from t where n < 2000) select count(*) from t -> 54001 recursive query still adding rows after 1000 rounds (max_recursion); SET max_recursion = n to allow more, 0 for no limit
+// expect: with recursive t(n) as (select 1 union all select n + 1 from t where n < 5) select count(*) from t a, t b -> 25
+// expect: with recursive r as (select * from r union select 1) select * from r -> 42P19 recursive reference to query "r" must not appear within its non-recursive term
+// expect: with recursive r(n) as (select n from r) select * from r -> 42P19 recursive query does not have the form non-recursive-term UNION [ALL] recursive-term
+// expect: with recursive r(n) as (select 1 union all select n + 1 from r where n < (select max(n) from r)) select * from r -> 42P19 recursive reference to query "r" must not appear within a subquery
+// expect: with recursive r(n) as (select 1 intersect select n from r) select * from r -> 42P19 recursive query does not have the form non-recursive-term UNION [ALL] recursive-term
 // expect: explain analyze select c.name, s.total from c join (select cust, sum(amount) total from o group by cust) s on s.cust = c.id -> scan c: full scan (rows read 5, kept 5); join s: hash on (cust) over rows of subquery 1 (table rows 4 of 5 read, probes 5, rows read 3, joined 3); subquery 1 (from): run once (runs 1, from cache 0);   scan o: full scan (rows read 6, kept 6);   aggregate; result: 3 rows
 // expect: update c set city = 'lyon' where id in (select cust from (select cust from o where status = 'open') t) -> UPDATE 2
 // expect: delete from o where exists (select 1 from (select id from c where city = 'lyon') l where l.id = o.cust) -> DELETE 3
@@ -107,6 +151,49 @@ fn main() {
         show(mut &s, "with w as (select cust from o where status = 'open') select id from c where exists (select 1 from w where w.cust = c.id) order by 1")
         show(mut &s, "with w as (select id, city from c) select city, count(*) from w group by city order by city")
         show(mut &s, "with w as (select id, city from c) select city, max(id) from w group by city having count(*) > 1")
+        show(mut &s, "select id from c where city = 'paris' union select cust from o order by 1")
+        show(mut &s, "select count(*) from (select id from c union all select cust from o) u")
+        show(mut &s, "select id from c intersect select cust from o order by 1")
+        show(mut &s, "select id from c except select cust from o order by 1")
+        show(mut &s, "select cust from o intersect select id from c order by 1")
+        show(mut &s, "select cust from o except select id from c where id > 2 order by 1")
+        show(mut &s, "select cust from o intersect all select cust from o where status = 'paid' order by 1")
+        show(mut &s, "select cust from o except all select cust from o where status = 'paid' order by 1")
+        show(mut &s, "select 1 union select 2 intersect select 3")
+        show(mut &s, "select 2 union select 2.0")
+        show(mut &s, "select null union select null")
+        show(mut &s, "select id as k from c union select cust from o order by k desc limit 2")
+        show(mut &s, "select 0 union all (select id from c order by id desc limit 1)")
+        show(mut &s, "select name from c where id in (select 1 union select 3) order by 1")
+        show(mut &s, "select max(x) from (select 1 as x union all select 5) t")
+        show(mut &s, "select id from c where exists (select 1 from o where o.cust = c.id union all select 1 where c.city = 'oslo') order by 1")
+        show(mut &s, "explain select id from c union all select cust from o where status = 'open'")
+        show(mut &s, "select id, name from c union select 1")
+        show(mut &s, "select id from c union select cust from o order by id + 1")
+        show(mut &s, "explain analyze with x as (select id from c where city = 'paris') select a.id, b.id from x a join x b on b.id >= a.id order by 1, 2")
+        show(mut &s, "with recursive t(n) as (select 1 union all select n + 1 from t where n < 5) select n from t")
+        show(mut &s, "with recursive t(n) as (select 1 union all select n + 1 from t where n < 100) select count(*), sum(n) from t")
+        show(mut &s, "create table emp (id int primary key, boss int, name text)")
+        show(mut &s, "insert into emp values (1, null, 'root'), (2, 1, 'a'), (3, 1, 'b'), (4, 2, 'c'), (5, 4, 'd'), (6, 99, 'orphan')")
+        show(mut &s, "with recursive sub(id, lvl) as (select id, 0 from emp where id = 1 union all select e.id, s.lvl + 1 from emp e join sub s on e.boss = s.id) select id, lvl from sub order by id")
+        show(mut &s, "with recursive up(id, boss) as (select id, boss from emp where id = 5 union all select e.id, e.boss from up join emp e on e.id = up.boss) select id from up")
+        show(mut &s, "explain analyze with recursive sub(id) as (select id from emp where id = 1 union all select e.id from emp e join sub s on e.boss = s.id) select count(*) from sub")
+        show(mut &s, "create table edge (a int primary key, b int)")
+        show(mut &s, "insert into edge values (1, 2), (2, 3), (3, 1)")
+        show(mut &s, "with recursive r(n) as (select 1 union select e.b from edge e join r on e.a = r.n) select n from r order by n")
+        show(mut &s, "with recursive r(n) as (select 1 union all select e.b from edge e join r on e.a = r.n) select count(*) from r")
+        show(mut &s, "set max_recursion = 10")
+        show(mut &s, "with recursive t(n) as (select 1 union all select n + 1 from t where n < 20) select count(*) from t")
+        show(mut &s, "with recursive t(n) as (select 1 union all select n + 1 from t where n < 11) select count(*) from t")
+        show(mut &s, "set max_recursion to 0")
+        show(mut &s, "with recursive t(n) as (select 1 union all select n + 1 from t where n < 2000) select count(*) from t")
+        show(mut &s, "reset max_recursion")
+        show(mut &s, "with recursive t(n) as (select 1 union all select n + 1 from t where n < 2000) select count(*) from t")
+        show(mut &s, "with recursive t(n) as (select 1 union all select n + 1 from t where n < 5) select count(*) from t a, t b")
+        show(mut &s, "with recursive r as (select * from r union select 1) select * from r")
+        show(mut &s, "with recursive r(n) as (select n from r) select * from r")
+        show(mut &s, "with recursive r(n) as (select 1 union all select n + 1 from r where n < (select max(n) from r)) select * from r")
+        show(mut &s, "with recursive r(n) as (select 1 intersect select n from r) select * from r")
         show(mut &s, "explain analyze select c.name, s.total from c join (select cust, sum(amount) total from o group by cust) s on s.cust = c.id")
         show(mut &s, "update c set city = 'lyon' where id in (select cust from (select cust from o where status = 'open') t)")
         show(mut &s, "delete from o where exists (select 1 from (select id from c where city = 'lyon') l where l.id = o.cust)")

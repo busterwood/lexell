@@ -82,6 +82,7 @@ pub type FromItem = record {
     pub on: Option[Expr]
     pub sub: int                // a subquery (in FROM, or a CTE's): its number; -1: a table
     pub cols: []str             // names for its columns (AS x(a, b)); the rest keep theirs
+    pub work: int               // a recursive CTE in its own body: the CTE's number (its working table); -1
 }
 
 pub type OrderItem = record { pub expr: Expr; pub desc: bool }
@@ -127,7 +128,15 @@ pub type Stmt = record {
     pub having: Option[Expr]
     pub subs: []Stmt            // its subqueries: an expression names one by number (#sub, #exists, #in)
     pub use: int                // a subquery: what it is used as (SUB_SCALAR, SUB_EXISTS, SUB_IN)
+    pub setop: int              // UNION, INTERSECT or EXCEPT of inner[0] and inner[1] (SET_*); 0 none
+    pub setAll: bool            // ... ALL
+    pub cte: int                // a CTE where it is used: its number in the statement; -1 none
+    pub rec: bool               // a recursive CTE: inner[1] reads its working table
 }
+
+pub const SET_UNION = 1
+pub const SET_INTERSECT = 2
+pub const SET_EXCEPT = 3
 
 // What a subquery is used as.
 pub const SUB_SCALAR = 1
@@ -138,7 +147,8 @@ pub const SUB_FROM = 4          // in FROM: a subquery, or a CTE where it is use
 fn newStmt(kind: int): Stmt {
     return Stmt{kind: kind, table: "", ifFlag: false, cols: [], pk: [], names: [], rows: [], items: [], where: None,
                 group: [], order: [], limit: None, offset: None, sets: [], params: 0, from: [], index: "",
-                unique: false, inner: [], distinct: false, having: None, subs: [], use: 0}
+                unique: false, inner: [], distinct: false, having: None, subs: [], use: 0, setop: 0, setAll: false,
+                cte: -1, rec: false}
 }
 
 // ---- the lexer
@@ -265,11 +275,17 @@ type P = record {
     params: int
     subs: []Stmt        // the subqueries of the statement being parsed
     ctes: []Cte         // the CTEs in scope, innermost last
+    nextCte: int        // the statement's CTEs are numbered
+    inCte: []InCte      // the recursive CTEs whose bodies are being parsed
+    depth: int          // subqueries deep
 }
 
 // A CTE: kept as its text (where its tokens start), parsed again as a
-// subquery in FROM wherever it is used, seeing the CTEs before it.
-type Cte = record { name: str; cols: []str; start: int }
+// subquery in FROM wherever it is used, seeing the CTEs before it (and a
+// recursive one itself).
+type Cte = record { name: str; cols: []str; start: int; id: int; rec: bool }
+
+type InCte = record { id: int; depth: int; refs: int }
 
 fn (p: &P) peek(): Tok { return p.toks[p.pos] }
 fn (p: &P) peekAt(k: int): Tok {
@@ -310,7 +326,7 @@ const RESERVED: []str = ["select", "from", "where", "group", "order", "by", "lim
                   "null", "as", "values", "set", "into", "insert", "update", "delete", "create", "table",
                   "primary", "key", "asc", "desc", "true", "false", "cast", "on", "join", "inner", "left",
                   "right", "full", "outer", "cross", "using", "natural", "having", "distinct", "in", "like", "ilike", "between",
-                  "case", "when", "then", "else", "end"]
+                  "case", "when", "then", "else", "end", "union", "intersect", "except", "with"]
 
 fn isReserved(w: &str): bool {
     for r in RESERVED { if r == w { return true } }
@@ -562,6 +578,7 @@ fn (p: mut &P) caseExpr(): Result[Expr, lexdb_base.DbErr] {
 // A subquery, after its "(": its own subqueries go with it, and the
 // statement it is in gets it, numbered.
 fn (p: mut &P) subquery(use: int): Result[int, lexdb_base.DbErr] {
+    p.depth += 1
     let saved = replace(mut &p.subs, [])
     var pushed = 0
     if p.acceptKw("with") { pushed = try p.withList() }
@@ -572,13 +589,14 @@ fn (p: mut &P) subquery(use: int): Result[int, lexdb_base.DbErr] {
     sq.use = use
     try p.expectKw(")")
     append(mut &p.subs, sq)
+    p.depth -= 1
     return Ok(len(p.subs) - 1)
 }
 
 // WITH's list, after "with": the CTEs go in scope (how many: the result).
 // Each is parsed now to check it, and again where it is used.
 fn (p: mut &P) withList(): Result[int, lexdb_base.DbErr] {
-    if p.isKw("recursive") { return Err(lexdb_base.err("0A000", "WITH RECURSIVE is not supported yet")) }
+    let rec = p.acceptKw("recursive")
     var n = 0
     while true {
         let name = try p.name()
@@ -591,16 +609,26 @@ fn (p: mut &P) withList(): Result[int, lexdb_base.DbErr] {
         try p.expectKw("as")
         if p.acceptKw("not") { try p.expectKw("materialized") } else { let m = p.acceptKw("materialized") }
         try p.expectKw("(")
-        let start = p.pos
-        let keep = len(p.subs)
-        let i = try p.subquery(SUB_FROM)
-        while len(p.subs) > keep { let x = pop(mut &p.subs) }
         for k in len(p.ctes) - n..len(p.ctes) {
             if p.ctes[k].name == name {
                 return Err(lexdb_base.err("42712", "WITH query name \"" + name + "\" specified more than once"))
             }
         }
-        append(mut &p.ctes, Cte{name: name, cols: cols, start: start})
+        let id = p.nextCte
+        p.nextCte += 1
+        let start = p.pos
+        // a recursive one is in scope in its own body
+        if rec {
+            var cs: []str = []
+            for c in cols { append(mut &cs, c) }
+            append(mut &p.ctes, Cte{name: name, cols: cs, start: start, id: id, rec: true})
+        }
+        let keep = len(p.subs)
+        if rec { append(mut &p.inCte, InCte{id: id, depth: p.depth + 1, refs: 0}) }
+        let i = try p.subquery(SUB_FROM)
+        if rec { let x = pop(mut &p.inCte) }
+        while len(p.subs) > keep { let x = pop(mut &p.subs) }
+        if !rec { append(mut &p.ctes, Cte{name: name, cols: cols, start: start, id: id, rec: false}) }
         n += 1
         if !p.acceptKw(",") { break }
     }
@@ -613,17 +641,26 @@ fn (p: mut &P) popCtes(n: int) { for i in 0..n { let c = pop(mut &p.ctes) } }
 // scope.
 fn (p: mut &P) cteRef(ci: int): Result[int, lexdb_base.DbErr] {
     let saved = replace(mut &p.ctes, [])
-    for i in 0..ci {
+    let rec = saved[ci].rec
+    let id = saved[ci].id
+    let upto = if rec { ci + 1 } else { ci }
+    for i in 0..upto {
         var cols: []str = []
         for c in saved[i].cols { append(mut &cols, c) }
-        append(mut &p.ctes, Cte{name: saved[i].name, cols: cols, start: saved[i].start})
+        append(mut &p.ctes, Cte{name: saved[i].name, cols: cols, start: saved[i].start, id: saved[i].id, rec: saved[i].rec})
     }
     let pos = p.pos
     p.pos = saved[ci].start
+    if rec { append(mut &p.inCte, InCte{id: id, depth: p.depth + 1, refs: 0}) }
     let r = p.subquery(SUB_FROM)
+    var selfRefs = 0
+    if rec { selfRefs = pop(mut &p.inCte).refs }
     p.pos = pos
     p.ctes = saved
-    return r
+    let i = try r
+    p.subs[i].cte = id
+    p.subs[i].rec = selfRefs > 0
+    return Ok(i)
 }
 
 fn subRef(name: str, i: int): Expr { return Expr.Call(name, [Expr.Lit(Val.Int(i))], false) }
@@ -779,7 +816,71 @@ fn (p: mut &P) insert(): Result[Stmt, lexdb_base.DbErr] {
     return Ok(s)
 }
 
+// SELECT, after its keyword: a query, or queries joined by UNION,
+// INTERSECT (first) and EXCEPT; then ORDER BY, LIMIT and OFFSET, of the
+// whole. The queries joined each keep their subqueries.
 fn (p: mut &P) select(): Result[Stmt, lexdb_base.DbErr] {
+    var first = try p.selectCore()
+    if !p.isKw("union") && !p.isKw("intersect") && !p.isKw("except") {
+        try p.orderLimit(mut &first)
+        return Ok(first)
+    }
+    first.subs = replace(mut &p.subs, [])
+    var lhs = try p.intersects(first)
+    while p.isKw("union") || p.isKw("except") {
+        var op = SET_EXCEPT
+        if p.acceptKw("union") { op = SET_UNION } else { let x = p.acceptKw("except") }
+        let all = p.setAll()
+        let rhs = try p.intersects(try p.setBranch())
+        lhs = setOf(op, all, lhs, rhs)
+    }
+    try p.orderLimit(mut &lhs)
+    return Ok(lhs)
+}
+
+fn (p: mut &P) setAll(): bool {
+    if p.acceptKw("all") { return true }
+    let d = p.acceptKw("distinct")
+    return false
+}
+
+fn setOf(op: int, all: bool, l: Stmt, r: Stmt): Stmt {
+    var s = newStmt(S_SELECT)
+    s.setop = op
+    s.setAll = all
+    append(mut &s.inner, l)
+    append(mut &s.inner, r)
+    return s
+}
+
+fn (p: mut &P) intersects(first: Stmt): Result[Stmt, lexdb_base.DbErr] {
+    var lhs = first
+    while p.acceptKw("intersect") {
+        let all = p.setAll()
+        let rhs = try p.setBranch()
+        lhs = setOf(SET_INTERSECT, all, lhs, rhs)
+    }
+    return Ok(lhs)
+}
+
+// One query of a UNION (and the like): SELECT ..., or one in parentheses
+// with its own ORDER BY and LIMIT.
+fn (p: mut &P) setBranch(): Result[Stmt, lexdb_base.DbErr] {
+    var b = newStmt(S_SELECT)
+    if p.acceptKw("(") {
+        try p.expectKw("select")
+        b = try p.select()
+        try p.expectKw(")")
+    } else {
+        try p.expectKw("select")
+        b = try p.selectCore()
+    }
+    b.subs = replace(mut &p.subs, [])
+    return Ok(b)
+}
+
+// A query: the select list to HAVING.
+fn (p: mut &P) selectCore(): Result[Stmt, lexdb_base.DbErr] {
     var s = newStmt(S_SELECT)
     if p.acceptKw("distinct") {
         if p.isKw("on") { return Err(lexdb_base.err("0A000", "SELECT DISTINCT ON is not supported")) }
@@ -853,6 +954,10 @@ fn (p: mut &P) select(): Result[Stmt, lexdb_base.DbErr] {
         while p.acceptKw(",") { append(mut &s.group, try p.expr()) }
     }
     if p.acceptKw("having") { s.having = Some(try p.expr()) }
+    return Ok(s)
+}
+
+fn (p: mut &P) orderLimit(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
     if p.acceptKw("order") {
         try p.expectKw("by")
         while true {
@@ -872,7 +977,7 @@ fn (p: mut &P) select(): Result[Stmt, lexdb_base.DbErr] {
             let r = p.acceptKw("rows") || p.acceptKw("row")
         }
     }
-    return Ok(s)
+    return Ok(Unit{})
 }
 
 fn (p: mut &P) fromItem(join: int): Result[FromItem, lexdb_base.DbErr] {
@@ -883,7 +988,7 @@ fn (p: mut &P) fromItem(join: int): Result[FromItem, lexdb_base.DbErr] {
         var alias = "unnamed_subquery"
         var cols: []str = []
         try p.aliasOf(mut &alias, mut &cols)
-        return Ok(FromItem{table: "", alias: alias, join: join, on: None, sub: i, cols: cols})
+        return Ok(FromItem{table: "", alias: alias, join: join, on: None, sub: i, cols: cols, work: -1})
     }
     let table = try p.name()
     var alias = table
@@ -894,11 +999,21 @@ fn (p: mut &P) fromItem(join: int): Result[FromItem, lexdb_base.DbErr] {
     for i in 0..len(p.ctes) { if p.ctes[i].name == table { ci = i } }
     if ci >= 0 {
         if len(cols) == 0 { for c in p.ctes[ci].cols { append(mut &cols, c) } }
+        // in its own body: its working table
+        for k in 0..len(p.inCte) {
+            if p.inCte[k].id == p.ctes[ci].id {
+                if p.inCte[k].depth != p.depth {
+                    return Err(lexdb_base.err("42P19", "recursive reference to query \"" + table + "\" must not appear within a subquery"))
+                }
+                p.inCte[k].refs += 1
+                return Ok(FromItem{table: table, alias: alias, join: join, on: None, sub: -1, cols: cols, work: p.ctes[ci].id})
+            }
+        }
         let i = try p.cteRef(ci)
-        return Ok(FromItem{table: table, alias: alias, join: join, on: None, sub: i, cols: cols})
+        return Ok(FromItem{table: table, alias: alias, join: join, on: None, sub: i, cols: cols, work: -1})
     }
     if len(cols) > 0 { return Err(lexdb_base.err("0A000", "column aliases for a table are not supported")) }
-    return Ok(FromItem{table: table, alias: alias, join: join, on: None, sub: -1, cols: cols})
+    return Ok(FromItem{table: table, alias: alias, join: join, on: None, sub: -1, cols: cols, work: -1})
 }
 
 // [AS] alias [(column, ...)]
@@ -1055,8 +1170,22 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
             return Ok(newStmt(S_ROLLBACK))
         }
         "set", "reset", "discard", "deallocate" {
+            // lexdb's own settings: SET max_recursion = n, RESET max_recursion;
+            // the rest are accepted and ignored
+            var st = newStmt(S_SET)
+            st.ifFlag = t.text == "reset"
+            let u = p.acceptKw("session")
+            if p.isKw("max_recursion") && (t.text == "set" || t.text == "reset") {
+                p.pos += 1
+                st.table = "max_recursion"
+                if t.text == "set" {
+                    if !p.acceptKw("to") { try p.expectKw("=") }
+                    if p.acceptKw("default") { st.limit = None } else { st.limit = Some(try p.expr()) }
+                }
+                return Ok(st)
+            }
             p.skipToEnd()
-            return Ok(newStmt(S_SET))
+            return Ok(st)
         }
         else {}
     }
@@ -1072,12 +1201,15 @@ fn (p: mut &P) skipToEnd() {
 // highest $n in each.
 pub fn parse(sql: &str): Result[[]Stmt, lexdb_base.DbErr] {
     let toks = try lex(sql)
-    var p = P{toks: toks, pos: 0, params: 0, subs: [], ctes: []}
+    var p = P{toks: toks, pos: 0, params: 0, subs: [], ctes: [], nextCte: 0, inCte: [], depth: 0}
     var out: []Stmt = []
     while true {
         p.params = 0
         p.subs = []
         p.ctes = []
+        p.nextCte = 0
+        p.inCte = []
+        p.depth = 0
         var s = try p.statement()
         s.params = p.params
         if s.kind != S_EXPLAIN { s.subs = replace(mut &p.subs, []) }
@@ -1189,7 +1321,7 @@ pub fn exprText(x: &Expr): str {
 // One expression and nothing after it.
 pub fn parseExpr(sql: &str): Result[Expr, lexdb_base.DbErr] {
     let toks = try lex(sql)
-    var p = P{toks: toks, pos: 0, params: 0, subs: [], ctes: []}
+    var p = P{toks: toks, pos: 0, params: 0, subs: [], ctes: [], nextCte: 0, inCte: [], depth: 0}
     let x = try p.expr()
     let t = p.peek()
     if t.kind != T_EOF { return Err(near(&t)) }
