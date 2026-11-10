@@ -3522,7 +3522,8 @@ better scan format, but it would rebuild the store. Section 0 keeps the
 store free of the schema, and its write paths all work on whole entries.
 
 **What was tried.** A, as an experiment beside the tagged form
-(`LEXDB_ROWFMT=fixed`; the default stays tagged).
+(`LEXDB_ROWFMT=fixed`; the default stayed tagged). 9.50 replaced it with
+the real layout; its rows (byte 7) are no longer read.
 - **The row.** Byte 7 (no tag uses it), the place count, a kind byte per
   place, the NULL bitmap, the fixed part (8 bytes an integer, 1 a boolean,
   4 the end of a text's or numeric's bytes, 0 a dropped place), then the
@@ -3698,3 +3699,96 @@ the columns come late.
   gained a write-skew check. A transaction counts rows in batches, another
   inserts into that range and commits, then the first writes and commits:
   40001, with batches as without.
+
+### 9.50 The row layout, for real
+
+The user said yes (2026-11-10) to making 9.48's layout real. They then
+said no table rewrite is needed and no old file need stay readable, since
+lexdb is not released. So there is no `VACUUM FULL`, and the experiment's
+rows (byte 7) are no longer read.
+
+**The row.**
+- Byte 8, then the row's layout number (2 bytes), then the NULL bitmap.
+- Then the fixed part, per place: an integer at its column's width (8, 4
+  or 2 bytes), a boolean in 1, a text or numeric as the end of its bytes in
+  2, and a dropped place in none.
+- Then the variable part: texts, and numerics in binary
+  (`Decimal.toBin`, added to the library for this: 2 to 22 bytes, read
+  back with `Decimal.fromBin`, no text parsed per read).
+- Two-byte ends suffice: a row in the layout has at most 255 places, each
+  text under 256 bytes (LONG), and numerics of at most 22.
+
+**The layouts.**
+- **Kept in the catalog.** Each table's catalog row ends with its layouts,
+  each a kind per place, the last the current one.
+- **A new one per schema change.** `encTable` adds one when the table's
+  kinds have changed: a column added, dropped or retyped.
+- **No rewrite.**
+  - A row keeps its layout number.
+  - ADD COLUMN, DROP COLUMN and a widening retype (int4 to int8, say)
+    rewrite no row: old rows are read through their own layout.
+  - A retype that does rewrite (`retype`) puts its rows in the new layout
+    first (`syncLayouts`).
+- **Read through the table.** `decTable` makes each layout's offsets once
+  (`Table.lays`). A row's decoding is then an index into them, in
+  `decRowNeed` and in the batches' `bRowInto`. `fetch`'s fast path for
+  the experiment's rows is gone: every row goes through `rowOf`.
+
+**The tagged form stays for** a row with a long text (encLong), a row of
+over 255 places, a value that does not fit its place's kind, and
+`LEXDB_ROWFMT=tagged`, kept to compare the two and to test the tagged
+reader. The fixed layout is now the default.
+
+**Row sizes,** computed from the two formats:
+
+| Table | tagged | 9.48's experiment | the layout |
+|---|---:|---:|---:|
+| big: 4 int4, a 6-byte text | 47 | 50 | 28 |
+| wide: 12 int4, 8 texts of 43 bytes in all | 191 | 196 | 113 |
+
+**Speed,** 1M rows (big) and 500K (wide), warm, in ms, two runs each:
+
+| Query, batches | tagged | the layout | PostgreSQL, one core | PostgreSQL, parallel |
+|---|---:|---:|---:|---:|
+| `count(*)` | 27.9–28.7 | 22.8–27.1 | 30.1–31.4 | 15.0–17.8 |
+| 4 aggregates `WHERE n > 10` | 65.5–67.4 | 55.2–60.9 | 60.3–67.9 | 25.4–25.7 |
+| `sum(v)` with 3 conditions | 77.7–78.1 | 68.5–71.0 | 46.1–50.1 | 19.9–21.5 |
+| `GROUP BY g` | 105.1–109.3 | 96.3–105.5 | 103.7–112.0 | 38.9–45.7 |
+| `GROUP BY n WHERE v % 2 = 0` | 82.0–84.4 | 71.6–77.6 | 77.8–83.2 | 58.4–68.7 |
+| wide: `sum(c18) WHERE c17 > 50` | 85.8–86.1 | 41.2–42.2 | 38.3–42.4 | 19.8–25.0 |
+| wide: `GROUP BY c19` | 99.4–102.3 | 57.5–59.6 | 65.8–67.6 | 28.7–30.5 |
+| wide: `c1 = 3 AND c13 < 5` | 71.9–72.8 | 41.1–41.6 | 30.4–31.6 | 16.9–20.3 |
+
+- **The layout against tagged:** 3 to 12% faster on the narrow table, and
+  twice as fast on the wide one.
+- **Loads:** 12 to 23% faster: 2.8 s against 3.6 s for 1M rows, 4.4 s
+  against 5.1 s for 500K wide ones.
+- **Unchanged:** updates and 1,000 point lookups (10.5 to 11.1 ms).
+- **Against PostgreSQL 16 on one core** (`max_parallel_workers_per_gather
+  = 0`; the same data and results, timed through psql, best of five):
+  - lexdb is ahead or level on five queries;
+  - it is behind on `sum(v)` with three conditions (1.4 times) and on the
+    wide table's two-condition count (1.3 times).
+
+  PostgreSQL's default runs two workers. lexdb has one thread, so against
+  that it is 1.2 to 2.7 times slower.
+
+**Checked.**
+- **The suite.** All 58 programs pass in both forms.
+- **exec_rowfmt** now also covers:
+  - a widening retype, whose old rows keep 4-byte integers;
+  - a smallint added;
+  - the integer types' limits and numerics' edges;
+  - a rewriting retype, int to numeric.
+
+  It shows each table's rows by layout: five layouts and the tagged form,
+  then one layout after the rewrite. Its 33 queries give the same results
+  as an all-tagged copy, batches on and off.
+- **Planted bugs.** Eleven were planted, and ten were caught: widths,
+  offsets, layouts not stored or not placed, the layout number ignored,
+  missing values, numerics as text, and retype not syncing.
+- **The one that survived** is `encFixed`'s check that the table's last
+  layout is its current one. No path now writes rows between a schema
+  change and its layout's being made, so it is kept as a guard for
+  future code.
+

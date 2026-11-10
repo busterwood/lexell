@@ -1,17 +1,23 @@
-// lexdb_exec: the fixed row layout (design/lexdb.md 9.48, an experiment)
-// beside the tagged one, in one table. Table m is written in both: rows in
-// the tagged layout, then in the fixed one, then old rows updated (written
-// again in the fixed layout), a column added and one dropped between
-// inserts, so its rows have three sets of places. Table r gets the same
-// statements, always in the tagged layout. Each query runs on both, with
+// lexdb_exec: the row layout (design/lexdb.md 9.50) beside the tagged form,
+// in one table. Table m is written in both: rows in the tagged form, then
+// in the fixed layout, then old rows updated (written again in the
+// layout), a column added and one dropped between inserts, a column
+// widened to bigint (old rows keep their 4 bytes) and a smallint added, so
+// its rows have five layouts and the tagged form. Table r gets the same
+// statements, always in the tagged form. Each query runs on both, with
 // batches on and off: all four results must be the same. The columns:
-// integers of three sizes, a boolean, a numeric, a text, a long text
-// (kept tagged: encLong), NULLs in each.
-// 627 of m's rows are in the fixed layout: rows 201 to 700 and those of 1
-// to 200 updated after, less those with a long text.
-// expect: m's rows: 700, in the fixed layout: 627
-// expect: 26 queries, 26 the same on both tables, with and without batches
-// expect: a few: 700|700|8|-9|7 / 350|175 / 91
+// integers of three sizes with their limits, a boolean, a numeric (binary
+// in the layout), a text, a long text (kept tagged: encLong), NULLs in each.
+// Then a retype that rewrites the rows (int to numeric) puts every row but
+// the long ones in a sixth layout.
+// 642 of m's rows are in the fixed layout: all but those of 1 to 200 not
+// updated after, and those with a long text.
+// expect: m's rows: 704, in the fixed layout: 642
+// expect: by layout: 0:192 1:90 2:230 4:130 tagged:62 of 5 layouts
+// expect: 30 queries, 30 the same on both tables, with and without batches
+// expect: after a rewrite: 5:690 tagged:14 of 6 layouts
+// expect: 3 queries, 3 the same
+// expect: a few: 704|704|2147483647.00|-5000000009|5000000000 / 352|176 / 91
 import "strings"
 import "../../../cmd/lexdb_store"
 import "../../../cmd/lexdb_disk"
@@ -62,6 +68,25 @@ fn rows(from: int, to: int, withB: bool, withE: bool): str {
     return strings.join(&out, ", ")
 }
 
+// How many of queries qs give the same on m and r, batches on and off.
+fn compare(s: mut &lexdb_exec.Session, qs: &[]str): int {
+    var same = 0
+    for x in qs {
+        var res: []str = []
+        for tb in ["m", "r"] {
+            for mode in ["on", "off"] {
+                let sw = q(s, &("set lexdb_batch = " + mode))
+                append(mut &res, q(s, &strings.replaceAll(x, "T", tb)))
+            }
+        }
+        if res[0] == res[1] && res[0] == res[2] && res[0] == res[3] { same += 1 } else {
+            println("DIFFERENT: " + x)
+            for r in res { println("  " + r) }
+        }
+    }
+    return same
+}
+
 fn opts(): lexdb_store.Options {
     return lexdb_store.Options{cacheBytes: 1024 * 1024, segBytes: 4 * 1024 * 1024, ckptBytes: 2 * 1024 * 1024, snapNodes: 100000}
 }
@@ -80,11 +105,20 @@ fn main() {
         both(mut &s, "alter table T drop column b", true)
         both(mut &s, "update T set c = c - 1 where id % 4 = 0", true)
         both(mut &s, "insert into T (id, a, c, f, n, t, big, e) values " + rows(551, 701, false, true), true)
+        // a widened type (no rewrite: old rows keep 4-byte a), a smallint
+        // added, the integer types' limits and numerics' edges
+        both(mut &s, "alter table T alter column a type bigint", true)
+        both(mut &s, "alter table T add column s smallint", true)
+        both(mut &s, "insert into T (id, a, c, f, n, t, big, e, s) values (701, 5000000000, -9223372036854775807, true, -123456.78, 'edge', 's', -2147483648, -32768), " +
+                     "(702, -5000000000, 9223372036854775807, false, 999999.99, '', 's', 2147483647, 32767), (703, 0, 0, null, 0.00, 't1', 's', 0, 0), " +
+                     "(704, null, null, null, -0.01, null, null, null, null)", true)
+        both(mut &s, "update T set s = id % 300 - 150, n = n * 3 where id % 5 = 0 and id <= 700", true)
         lexdb_exec.setFixedRows(false)
         // the rows' layouts, from the stored bytes' first byte (7: fixed)
         let all = q(mut &s, &"select count(*) from m")
         let fixedN = lexdb_exec.countFixedRows(&st, &"m")
         println("m's rows: " + all + ", in the fixed layout: " + fixedN.toStr())
+        println("by layout: " + lexdb_exec.rowLayouts(&st, &"m"))
         let qs = ["select count(*), count(a), count(c), count(f), count(n), count(t), count(big), count(e) from T",
                   "select sum(a), min(a), max(a), avg(a) from T",
                   "select sum(c), min(c), max(c) from T where c > 5000000",
@@ -110,22 +144,19 @@ fn main() {
                   "select sum(id) from T where id between 150 and 450",
                   "select count(*), sum(a) from T where id > 400",
                   "select t, max(n), min(c) from T where f is not null group by t order by 1",
-                  "select count(distinct a), sum(distinct e) from T"]
-        var same = 0
-        for x in qs {
-            var res: []str = []
-            for tb in ["m", "r"] {
-                for mode in ["on", "off"] {
-                    let sw = q(mut &s, &("set lexdb_batch = " + mode))
-                    append(mut &res, q(mut &s, &strings.replaceAll(x, "T", tb)))
-                }
-            }
-            if res[0] == res[1] && res[0] == res[2] && res[0] == res[3] { same += 1 } else {
-                println("DIFFERENT: " + x)
-                for r in res { println("  " + r) }
-            }
-        }
-        println(len(qs).toStr() + " queries, " + same.toStr() + " the same on both tables, with and without batches")
+                  "select count(distinct a), sum(distinct e) from T",
+                  "select sum(a), sum(s), min(s), max(s), count(s), sum(n), min(e), max(e) from T",
+                  "select min(c), max(c), count(c), min(a), max(a) from T where id > 600",
+                  "select id, a, c, f, n, t, e, s from T where id > 698 order by id",
+                  "select s, count(*), sum(a) from T where s is not null group by s order by 1 limit 5"]
+        println(len(qs).toStr() + " queries, " + compare(mut &s, &qs).toStr() + " the same on both tables, with and without batches")
+        // a retype that rewrites the rows: all in the new layout
+        both(mut &s, "alter table T alter column e type numeric(12,2)", true)
+        lexdb_exec.setFixedRows(false)
+        println("after a rewrite: " + lexdb_exec.rowLayouts(&st, &"m"))
+        let qs2 = ["select sum(e), min(e), max(e), count(e) from T", "select id, e, a, s from T where id in (1, 400, 701, 702) order by id",
+                   "select e, count(*) from T group by e order by 1"]
+        println(len(qs2).toStr() + " queries, " + compare(mut &s, &qs2).toStr() + " the same")
         println("a few: " + q(mut &s, &"select count(*), sum(case when f then 1 else 0 end) + sum(case when f then 0 else 1 end), max(e), min(a - 9), max(a) from m") +
                 " / " + q(mut &s, &"select count(*), count(*) / 2 from m where id % 2 = 0") + " / " + q(mut &s, &"select count(*) from m where t = 't1' and a > 2"))
         return 0
