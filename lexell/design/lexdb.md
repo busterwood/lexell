@@ -3619,3 +3619,37 @@ throwaway build, gave 2 to 10% more.
 - **The batches decode every column for `count(*)`** (the planner's "all
   columns" for no column named). With no GROUP BY, only the columns of
   the conditions and aggregates are needed.
+
+### 9.49 Scans: the columns read, and pages loaded
+
+The steps after 9.48 that need no decision of the user's (approved
+2026-11-10), each measured on 9.48's tables (1M rows of 5 columns, 500K
+of 20).
+
+**Page loads on warm scans: none.** A profile over 30 runs put 9% of the
+time in `Store.load`. Timing each run shows that it is the first run's:
+- **The first run:** 1,873 ms.
+- **Every later run:** 73 to 81 ms, with no loads.
+
+A cold scan is thus 25 times a warm one: about 15,000 pages at about 120
+µs each, read one at a time though the file was in the OS's cache.
+Section 3 says the drive wants many reads in flight. The scan should read
+ahead.
+
+**Only the columns used.**
+- **Which columns.** With no GROUP BY, an aggregate query can use a column
+  only inside an aggregate (42803). So the batches read the columns of
+  the conditions and aggregates alone, none for `count(*)`, where the
+  planner's set said "all". With such a set, large rows are read in part.
+- **Tagged rows.** Read up to their last place used, not to their end.
+
+| Query, batches | tagged before | after | fixed before | after |
+|---|---:|---:|---:|---:|
+| `count(*)`, 5 columns | 52.8 | 38.7–39.9 | 40.6 | 41.2–41.5 |
+| 4 aggregates `WHERE n > 10` | 86.2 | 72.7–73.0 | 75.5 | 73.8–74.0 |
+| `GROUP BY g` | 126.8 | 113.2–114.2 | 129.0 | 123.7–125.2 |
+| 20 columns: `sum(c18) WHERE c17 > 50` | 96.2 | 94.7–99.9 | 63.4 | 63.3–64.1 |
+
+On the 5-column table the tagged rows now read as fast as the fixed ones,
+since their columns used come first. The fixed layout's gain stays where
+the columns come late.

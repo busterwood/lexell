@@ -10272,6 +10272,8 @@ fn bDecode(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, raw: &R
     // the columns used, by place: for rows in the fixed layout
     var usedP: []int = []
     for pl in 0..width { if placeCol[pl] >= 0 { append(mut &usedP, pl) } }
+    // a tagged row is read up to its last place used (none: not at all)
+    let stopAt = if len(usedP) == 0 { 0 } else { usedP[len(usedP) - 1] + 1 }
     var lay = FixedLay{sig: [], off: [], prev: [], bm: 0, v0: 0}
     for r in 0..n {
         let s = &raw.vals[r]
@@ -10327,7 +10329,7 @@ fn bDecode(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, raw: &R
             continue
         }
         var at = 0
-        for pl in 0..width {
+        for pl in 0..stopAt {
             let c = placeCol[pl]
             if at >= len(s) {
                 // a column added after the row was written: its value then
@@ -10406,6 +10408,33 @@ fn bKeyVal(c: &BComp, kv: &BVec, j: int, b: &Batch, r: int): Val {
     if kv.nul[j] { return Val.Null }
     if c.typ == BT_BOOL { return Val.Bool(kv.v[j] == 1) }
     return Val.Int(kv.v[j])
+}
+
+// Marks the columns n reads.
+fn bColsOf(n: &BNode, used: mut &[]bool) {
+    match n {
+        BNode.Const(_, _) {}
+        BNode.Col(c) { used[c] = true }
+        BNode.Arith(_, a, b) {
+            bColsOf(&a, used)
+            bColsOf(&b, used)
+        }
+        BNode.Neg(a) { bColsOf(&a, used) }
+        BNode.Cmp(_, a, b) {
+            bColsOf(&a, used)
+            bColsOf(&b, used)
+        }
+        BNode.And(a, b) {
+            bColsOf(&a, used)
+            bColsOf(&b, used)
+        }
+        BNode.Or(a, b) {
+            bColsOf(&a, used)
+            bColsOf(&b, used)
+        }
+        BNode.Not(a) { bColsOf(&a, used) }
+        BNode.IsNull(a, _) { bColsOf(&a, used) }
+    }
 }
 
 // Adds the rows (gids: their groups) of a batch to an aggregate's counts,
@@ -10541,6 +10570,28 @@ fn batchGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
         }
         append(mut &specs, BSpec{kind: kind, arg: arg, filter: filt})
     }
+    // With no GROUP BY no column is used outside an aggregate (42803): the
+    // columns read are those of the conditions and the aggregates only
+    // (none for count(*)), large rows read in part.
+    var part = len(lv.need) > 0
+    if len(keys) == 0 {
+        var used: []bool = array(len(t.cols), false)
+        for c in conds { bColsOf(&c, mut &used) }
+        for sp in specs {
+            match sp.arg {
+                Some(x) { bColsOf(&x, mut &used) }
+                None {}
+            }
+            match sp.filter {
+                Some(x) { bColsOf(&x, mut &used) }
+                None {}
+            }
+        }
+        needCol = used
+        part = true
+    }
+    var needList: []bool = []
+    for x in needCol { append(mut &needList, x) }
     let scans = try pathScans(t, p, &env)
     // where each column used is in a stored row
     let width = rowWidth(t)
@@ -10549,8 +10600,7 @@ fn batchGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
         if needCol[i] { placeCol[if len(t.slots) == 0 { i } else { t.slots[i] }] = i }
     }
     let missing = placesMissing(t)
-    let needP = placesNeeded(t, &lv.need)
-    let part = len(lv.need) > 0
+    let needP = placesNeeded(t, &needList)
     // the groups: their first rows, and per aggregate its counts, sums and minima or maxima
     let ns = len(specs)
     var firsts: [][]Val = []
