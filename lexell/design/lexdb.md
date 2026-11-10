@@ -4194,3 +4194,69 @@ its 23 GB. The server now takes a quarter of `/proc/meminfo`'s MemTotal
 - **The suites.** 62 programs pass in both row forms; the crash test
   passes 4 rounds.
 
+### 9.55 io_uring again: not for sockets, not yet for files
+
+The user asked (2026-11-10) whether now is the time to switch to
+io_uring, since 9.17 measured it using less CPU.
+
+**Where the SQL thread's time goes now.** pgbench's select with the cache
+warm (no disk reads), CPU per select from `/proc`:
+
+| Through, mode, clients | selects/s | user | system |
+|---|---:|---:|---:|
+| Unix socket, prepared, 32 | 35,135 | 13.0 us | 15.1 us |
+| Unix socket, simple, 32 | 23,195 | 27.3 us | 16.1 us |
+| TCP, prepared, 32 | 44,360 | 11.7 us | 10.7 us |
+| TCP, simple, 32 | 33,491 | 18.5 us | 11.0 us |
+
+System time is now about half of a prepared select (a third in 9.17),
+because user time fell. The runtime registers a socket with epoll once,
+edge-triggered, so a select costs three system calls (the read, the read
+that finds nothing more, the write) and a share of an `epoll_wait`.
+
+**Sockets measured** (`sockbench.c` in the scratchpad: a C server on one
+thread answering 60-byte requests with 80 bytes, clients on other cores,
+over a Unix socket; kernel time per message):
+
+| Server | 1 client | 8 clients | 32 clients | messages/s at 32 |
+|---|---:|---:|---:|---:|
+| epoll, edge-triggered (as the runtime) | 25.4 us | 18.3 us | 18.1 us | 53,900 |
+| io_uring, a receive then a send per message | 27.2 us | 30.6 us | 30.4 us | 32,500 |
+| the same, with SINGLE_ISSUER, DEFER_TASKRUN or COOP_TASKRUN | | 30.3 us | 30.2 us | 32,700 |
+| io_uring, a receive per message, send by `write` | | 30.2 us | 29.9 us | 32,600 |
+| io_uring, multishot receive into provided buffers | 26.0 us | 29.9 us | 29.4 us | 33,600 |
+| the same, send by `write` | 25.2 us | 26.3 us | 27.0 us | 36,200 |
+
+- **On this kernel** (6.18, WSL2), io_uring's socket receive costs about
+  10 us more per message than epoll, in every form tried: re-armed or
+  multishot, with or without the setup flags.
+- **The floor.** Even epoll in C spends 18 us of kernel time per message;
+  lexdb's 10.7 to 16 us is at that floor already. Most of it is the
+  socket's own work (copying, waking the client), which no interface
+  removes.
+
+**Files.** 9.17 still holds: io_uring would save at most 17 us of the SQL
+thread's time per cache miss. Since 9.54 the server's cache is a quarter
+of memory, so the measured workloads miss only when cold. A cold scan
+reads a run of up to 64 pages in one `pread` (9.51), so its per-read cost
+is shared.
+
+**So: not now.**
+- **Sockets:** io_uring would cost more here, not less.
+- **Files:** it would matter only for data well beyond the cache, which
+  none of the benchmarks are.
+
+Two things would change this:
+- **Bare metal** (section 8's open question). WSL2's virtual machine may
+  make io_uring's receive dearer than a host kernel does; it should be
+  measured there before being ruled out.
+- **Working sets past the cache.** Then the file half of 9.17 applies
+  again.
+
+**What would pay instead.** One SQL thread tops out at 35,000 to 44,000
+selects/s even if the kernel cost nothing: 13 us of user time a select
+alone gives 77,000. Statements on several cores (a runtime change, the
+user's decision) would also spread the sockets' kernel time over the
+cores. That is what PostgreSQL does, with a process per connection, to
+reach 287,000.
+
