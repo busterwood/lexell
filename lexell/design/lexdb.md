@@ -4433,3 +4433,70 @@ when the wait after spinning was long).
 - Adaptive spinning (above).
 - Files through the ring (9.17).
 
+### 9.58 Files through the ring; one server per data directory
+
+Step 1 of the plan the user agreed (2026-11-10): io_uring in the runtime
+for sockets and files where the kernel has it; files first.
+
+**`fs.pread`, `pwrite`, `fdatasync`, `fsync`, `fallocate`** (new in
+`lib/fs`): positioned I/O on a descriptor with C buffers (O_DIRECT's
+aligned ones), a count or 0, or -errno. Each asks the runtime first
+(`lxllib_file_op`): with a ring (`LXL_URING=1`, native backend) it queues
+IORING_OP_READ, WRITE, FSYNC (DATASYNC for fdatasync) or FALLOCATE and
+parks, not cancellably, until the completion; without one, or when no
+other task could run (as `rt_blocking` decides), the call is the blocking
+C call it was. `fallocate` falls back to `posix_fallocate` on EOPNOTSUPP.
+lexdb's disk layer uses these instead of its own blocking externs. The
+ring's completions now go to an `rt_uop` on the waiting task's stack (many
+tasks read one file at once), receives included. Test: `fs_pread` (eight
+tasks writing and reading back their regions of one file at once; short
+reads at the end; EBADF), passing natively with and without the ring and
+through C.
+
+With the ring the helper pool never starts: the server ran 2 threads (the
+second io_uring's own worker, for `fdatasync`, which the kernel always
+hands to one) against 33.
+
+**Measured** (`bench/sock/pgsel.sh`, `LEXDB_CACHE_MB=64` so most selects
+miss, Unix socket, 8 s runs, averages of two rounds; the server's CPU per
+operation from `/proc`, every thread):
+
+| Selects, clients | epoll and the pool | io_uring |
+|---|---|---|
+| 1 | 6,980/s, 88.6 us | 8,340/s (+20%), 49.2 us (-44%) |
+| 8 | 24,480/s, 55.6 us | 28,050/s (+15%), 34.3 us (-38%) |
+| 32 | 26,660/s, 52.4 us | 30,730/s (+15%), 31.5 us (-40%) |
+
+| Updates (a commit each), clients | epoll and the pool | io_uring |
+|---|---|---|
+| 1 | 760/s, 514 us | 800/s, 192 us (-63%) |
+| 8 | 3,500/s, 172 us | 3,440/s, 84 us (-51%) |
+| 32 | 7,150/s, 128 us | 6,990/s, 60 us (-53%) |
+
+Commits are bound by the drive's flush (about 1.3 ms here), so their rate
+does not change; the CPU does, most of it the pool's helpers (spinning
+for jobs, futex wakes) and the eventfd's trips through the loop. A read
+that misses costs the SQL thread one queued SQE instead of a job handed
+to another thread.
+
+The crash test (`tests/lexdb/crash.py`, 20 rounds of SIGKILL and SIGTERM
+under load, killed again during recovery) passes with `LXL_URING=1` and
+without.
+
+**One server per data directory.** The first run of these benchmarks
+started the next server while the last still wrote its shutdown
+checkpoint (the script waited 0.3 s after SIGTERM); the new one met a
+page in the middle of being written (`page 76: type 5`) and refused to
+open. Nothing was damaged: copies of the directory opened in both modes,
+and the balance column's sum equalled the commits the three servers had
+logged (12,003 + 11,782 + 128,420 = 152,205). But two servers writing one
+directory would corrupt it, and nothing stopped one. Now lexdb takes an
+exclusive `flock` on `DATADIR/lock` before opening the store and exits 1
+("in use by another lexdb") when it cannot; the kernel drops the lock
+when the process ends, however it ends. `crash.py` checks that a second
+server is refused. The script now waits for the old server to exit.
+
+**Not done (steps 2 to 4):** why one client over a socket is 4 to 8%
+slower through the ring (9.57); the ring as the default where the kernel
+allows it, with both modes in the gate; socket writes through the ring.
+

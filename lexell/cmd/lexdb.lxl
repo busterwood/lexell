@@ -11,6 +11,9 @@
 // - any other path with a "/": the Unix socket file itself.
 // A socket file left by a server that is gone is replaced; one a server
 // still answers on is an error. The files are removed when lexdb stops.
+// One server per DATADIR: a second one exits 1 ("in use") while the first
+// holds DATADIR/lock (flock; the kernel drops it when the process ends,
+// however it ends).
 // There is no authentication yet: keep TCP on loopback, and a socket in a
 // directory only its users can reach. SIGTERM or SIGINT stops it: no new
 // connections, the open ones are cut off, and the log is flushed before it
@@ -26,6 +29,11 @@ import "./lexdb_disk"
 import "./lexdb_store"
 import "./lexdb_exec"
 import "./lexdb_wire"
+
+extern "c" fn openLock(path: str, flags: i32, mode: u32): i32 as "open"
+extern "c" fn flock(fd: i32, op: i32): i32
+extern "c" fn lockErrno(): int as "lxl_errno"
+extern "c" fn lockStrerror(e: i32): str as "strerror"
 
 fn main() {
     let args = os.arguments()
@@ -44,6 +52,25 @@ fn main() {
             eprintln("lexdb: " + dir + ": " + e.toStr())
             exit(1)
         }
+    }
+    // One server per data directory: two writing the same files would
+    // corrupt them (a benchmark started a second server while the first
+    // still wrote its shutdown checkpoint, 9.58). The lock is held, its
+    // descriptor open, until the process ends.
+    let lockPath = dir + "/lock"
+    let lfd = openLock(lockPath, i32(2 | 64 | 524288), u32(384))    // O_RDWR|O_CREAT|O_CLOEXEC, 0600
+    if lfd < 0 {
+        eprintln("lexdb: " + lockPath + ": " + lockStrerror(i32(lockErrno())))
+        exit(1)
+    }
+    if flock(lfd, i32(2 | 4)) != 0 {                                // LOCK_EX|LOCK_NB
+        let e = lockErrno()
+        if e == 11 {                                                // EWOULDBLOCK
+            eprintln("lexdb: " + dir + " is in use by another lexdb (" + lockPath + " is locked)")
+        } else {
+            eprintln("lexdb: " + lockPath + ": " + lockStrerror(i32(e)))
+        }
+        exit(1)
     }
     task.watchSignals(&[task.SIGTERM, task.SIGINT])
     // LEXDB_CACHE_MB: the cache's budget (lexdb_store.Options.cacheBytes);

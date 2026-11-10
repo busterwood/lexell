@@ -1833,8 +1833,8 @@ struct k_epoll_event { uint32_t events; uint64_t data; } __attribute__((packed))
 #define K_O_NONBLOCK 0x800
 #define K_O_CLOEXEC 0x80000
 #define K_EPOLLEXCLUSIVE (1u << 28)
-/* ur, upend, udone, ures: io_uring's receives (below); not in rt.h, whose sockets are epoll's only */
-typedef struct { rt_task *rd, *wr; uint8_t reg, lazy; rt_task* hup; uint8_t hupmode, gone, halves; uint8_t ur, upend, udone; int32_t ures; } rt_fdw;    /* see rt.h */
+/* ur: a socket read through io_uring (below); not in rt.h, whose sockets are epoll's only */
+typedef struct { rt_task *rd, *wr; uint8_t reg, lazy; rt_task* hup; uint8_t hupmode, gone, halves, ur; } rt_fdw;    /* see rt.h */
 static rt_fdw* rt_fds;
 static int64_t rt_nfds;
 static int rt_epfd = -1;
@@ -1917,11 +1917,15 @@ static void rt_epoll_events(struct k_epoll_event* ev, i64 n) {
     }
 }
 
-/* ---- io_uring for socket reads (LXL_URING=1; design/lexdb.md 9.57). A read that parks queues a
-   receive (IORING_OP_RECV) into the caller's buffer instead of waiting for readiness; the event
-   loop's wait is one io_uring_enter that submits every queued receive and waits for the first
-   completion. A turn of the scheduler (every task run until it parks) thus costs one system call
-   for all its reads, where epoll costs a read that finds nothing per socket and an epoll_wait.
+/* ---- io_uring for socket reads and file I/O (LXL_URING=1; design/lexdb.md 9.57, 9.58). A read
+   that parks queues a receive (IORING_OP_RECV) into the caller's buffer instead of waiting for
+   readiness, and fs's pread, pwrite, fdatasync, fsync and fallocate queue their operation instead
+   of running on a helper thread; the event loop's wait is one io_uring_enter that submits all
+   that is queued and waits for the first completion. A turn of the scheduler (every task run
+   until it parks) thus costs one system call for all its I/O, where epoll costs a read that finds
+   nothing per socket and an epoll_wait, and the helper pool a futex wake, a thread switch and an
+   eventfd write per call. Each operation is an rt_uop on its task's stack, which the task does
+   not leave before the completion has arrived (the kernel may write its buffer until then).
    Everything else stays with epoll: the epoll set itself is watched from the ring (a multishot
    poll on its descriptor), and sockets are in it for hangups only (EPOLLRDHUP), with EPOLLIN or
    EPOLLOUT added for the time of a readiness wait (a write that found the buffer full, a timed
@@ -1938,7 +1942,11 @@ struct k_ur_params { uint32_t sq_entries, cq_entries, flags, sq_thread_cpu, sq_t
 #define K_UR_RECV 27
 #define K_UR_POLL 6
 #define K_UR_CANCEL 14
-#define K_UR_TAG_RECV (1ull << 56)
+#define K_UR_FSYNC 3
+#define K_UR_FALLOCATE 17
+#define K_UR_READ 22
+#define K_UR_WRITE 23
+#define K_UR_TAG_OP (1ull << 56)
 #define K_UR_TAG_EPOLL (2ull << 56)
 #define K_UR_TAG_CANCEL (3ull << 56)
 #define K_ECANCELED 125
@@ -1949,6 +1957,8 @@ static uint32_t rt_sqmask, rt_sqn, rt_cqmask, rt_sqlocal;
 static struct k_sqe* rt_sqes;
 static struct k_cqe* rt_cqes;
 static bool rt_ur_epoll_armed;
+typedef struct { rt_task* t; int32_t res; uint8_t done; } rt_uop;
+static uint64_t rt_uop_ud(rt_uop* o) { return K_UR_TAG_OP | (uint64_t)o; }
 static i64 rt_ur_submit(uint32_t minc, int ms) {
     __atomic_store_n(rt_sqt, rt_sqlocal, __ATOMIC_RELEASE);
     uint32_t sub = rt_sqlocal - __atomic_load_n(rt_sqh, __ATOMIC_ACQUIRE);
@@ -1976,11 +1986,13 @@ static void rt_ur_arm_epoll(void) {
 }
 /* Decides, at the first socket (the epoll set exists by then), whether sockets read through the
    ring: LXL_URING=1 and a kernel that sets one up with these flags (6.1 and later). */
+static i64 rt_fd_room(i64 fd);
 static bool rt_uring_on(void) {
     if (rt_uring >= 0) return rt_uring;
     rt_uring = 0;
     const char* v = getenv("LXL_URING");
     if (!v || v[0] != '1') return false;
+    if (rt_fd_room(0) < 0) return false;                            /* the epoll set, watched from the ring */
     struct k_ur_params p;
     memset(&p, 0, sizeof p);
     p.flags = (1u << 12) | (1u << 13);                              /* SINGLE_ISSUER | DEFER_TASKRUN */
@@ -2011,22 +2023,19 @@ static bool rt_uring_on(void) {
     rt_ur_arm_epoll();
     return true;
 }
-/* Takes the completions: a receive's result goes to its socket and wakes its reader; the epoll
-   set's poll firing collects its events without waiting. */
+/* Takes the completions: an operation's result goes to its rt_uop and wakes its task; the
+   epoll set's poll firing collects its events without waiting. */
 static void rt_ur_reap(struct k_epoll_event* ev, i64 nev) {
     uint32_t h = *rt_cqh, t = __atomic_load_n(rt_cqt, __ATOMIC_ACQUIRE);
     bool ep = false;
     for (; h != t; h++) {
         struct k_cqe* c = &rt_cqes[h & rt_cqmask];
         uint64_t kind = c->ud & (0xffull << 56);
-        if (kind == K_UR_TAG_RECV) {
-            int64_t fd = (int64_t)(c->ud & 0xffffffffu);
-            if (fd < rt_nfds && rt_fds[fd].upend) {
-                rt_fds[fd].upend = 0;
-                rt_fds[fd].udone = 1;
-                rt_fds[fd].ures = c->res;
-                if (rt_fds[fd].rd) rt_wake(rt_fds[fd].rd);
-            }
+        if (kind == K_UR_TAG_OP) {
+            rt_uop* o = (rt_uop*)(c->ud & ((1ull << 56) - 1));
+            o->res = c->res;
+            o->done = 1;
+            rt_wake(o->t);
         } else if (kind == K_UR_TAG_EPOLL) {
             ep = true;
             if (!(c->flags & 2)) rt_ur_epoll_armed = false;       /* IORING_CQE_F_MORE: still armed */
@@ -2317,7 +2326,6 @@ static int64_t rt_net_new(i64 fd) {
     if (r < 0) { SYS(S_CLOSE, fd, 0, 0); return r; }
     rt_fds[fd].reg = 1;
     rt_fds[fd].ur = ur;
-    rt_fds[fd].upend = rt_fds[fd].udone = 0;
     rt_fds[fd].lazy = 0;
     rt_fds[fd].hup = 0;
     rt_fds[fd].hupmode = rt_fds[fd].gone = rt_fds[fd].halves = 0;
@@ -2405,7 +2413,7 @@ void lxllib_net_close(int64_t fd) {
         rt_fds[fd].reg = rt_fds[fd].lazy = 0;
         rt_fds[fd].hup = 0;
         rt_fds[fd].hupmode = rt_fds[fd].gone = rt_fds[fd].halves = 0;
-        rt_fds[fd].ur = rt_fds[fd].upend = rt_fds[fd].udone = 0;
+        rt_fds[fd].ur = 0;
     }
     SYS(S_CLOSE, fd, 0, 0);
 }
@@ -2457,39 +2465,74 @@ int64_t lxllib_net_recv(int64_t fd, void* b, int64_t n, const char* w, int64_t* 
     rt_nopark(w);
     if (rt_cur->cancelled) { *stop = 1; return 0; }
     if (rt_expired()) { *stop = 3; return 0; }
+    rt_uop o = {rt_cur, 0, 0};
     struct k_sqe* q = rt_sqe();
     q->op = K_UR_RECV;
     q->fd = (int32_t)fd;
     q->addr = (uint64_t)b;
     q->len = (uint32_t)(n > 0x7fffffff ? 0x7fffffff : n);
-    q->ud = K_UR_TAG_RECV | (uint64_t)fd;
-    rt_fds[fd].upend = 1;
-    rt_fds[fd].udone = 0;
-    rt_fds[fd].rd = rt_cur;
+    q->ud = rt_uop_ud(&o);
+    rt_fds[fd].rd = rt_cur;             /* a hangup wakes it too (it parks again until o is done) */
     rt_nio++;
     int r = RT_WOK;
-    while (!rt_fds[fd].udone) {
+    while (!o.done) {
         r = rt_park_until(true, rt_cur->deadline, w);
-        if (r != RT_WOK && !rt_fds[fd].udone) {
+        if (r != RT_WOK && !o.done) {
             struct k_sqe* c = rt_sqe();
             c->op = K_UR_CANCEL;
-            c->addr = K_UR_TAG_RECV | (uint64_t)fd;
+            c->addr = rt_uop_ud(&o);
             c->ud = K_UR_TAG_CANCEL;
             /* submitted and reaped now: a receive waiting for data is cancelled inline, so the
                task goes on in this turn as with epoll; one in progress is awaited */
             struct k_epoll_event ev[64];
             rt_ur_submit(0, 0);
             rt_ur_reap(ev, 64);
-            while (!rt_fds[fd].udone) rt_park_until(false, RT_NEVER, w);
+            while (!o.done) rt_park_until(false, RT_NEVER, w);
         }
     }
     rt_nio--;
     rt_fds[fd].rd = 0;
-    rt_fds[fd].udone = 0;
-    i64 res = rt_fds[fd].ures;
+    i64 res = o.res;
     if (r == RT_WOK || res >= 0) return res == -K_ECANCELED ? -4 : res;
     *stop = r;
     return 0;
+}
+/* fs's file operations (op 0 pread, 1 pwrite, 2 fdatasync, 3 fsync, 4 fallocate with mode 0)
+   through the ring: the result (a count, 0, or -errno), parking the task until it completes; not
+   cancellable (the operation is not undone by stopping the wait). RT_NORING when there is no
+   ring, or when no other task could run meanwhile: then fs makes the call itself (a blocking C
+   call, which then runs on this thread, as rt_blocking would). */
+#define RT_NORING (-((int64_t)1 << 40))
+static bool rt_cc_timed(void);
+int64_t lxllib_file_op(int64_t op, int64_t fd, void* b, int64_t n, int64_t off, const char* w) {
+    if (!rt_uring_on()) return RT_NORING;
+    rt_nopark(w);
+    if (!rt_rq_head && !rt_nio && !rt_nheap && !rt_njobs && !rt_cc_timed()) return RT_NORING;
+    rt_uop o = {rt_cur, 0, 0};
+    struct k_sqe* q = rt_sqe();
+    q->fd = (int32_t)fd;
+    q->ud = rt_uop_ud(&o);
+    switch (op) {
+    case 0: case 1:
+        q->op = op ? K_UR_WRITE : K_UR_READ;
+        q->addr = (uint64_t)b;
+        q->len = (uint32_t)(n > 0x7ffff000 ? 0x7ffff000 : n);     /* as read(2) caps a call */
+        q->off = (uint64_t)off;
+        break;
+    case 2: case 3:
+        q->op = K_UR_FSYNC;
+        q->opflags = op == 2;                                       /* IORING_FSYNC_DATASYNC */
+        break;
+    default:
+        q->op = K_UR_FALLOCATE;
+        q->off = (uint64_t)off;
+        q->addr = (uint64_t)n;                                      /* the length; len is the mode */
+        break;
+    }
+    rt_nio++;
+    while (!o.done) rt_park_until(false, RT_NEVER, w);
+    rt_nio--;
+    return o.res;
 }
 void* lxllib_task_promise(void* resdrop) {
     rt_task* t = rt_alloc(sizeof *t);

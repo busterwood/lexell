@@ -128,6 +128,10 @@ def main():
     r = subprocess.run([client, 'setup', dsn, recs], capture_output=True, text=True, timeout=120)
     if r.returncode != 0:
         fail('setup: ' + r.stdout + r.stderr)
+    # one server per data directory: a second is refused while the first runs
+    second = subprocess.run([exe, data, '127.0.0.1:%d' % free_port()], capture_output=True, text=True, timeout=60)
+    if second.returncode != 1 or 'in use' not in second.stderr:
+        fail('a second server on the same data directory: exit %s: %s' % (second.returncode, (second.stdout + second.stderr).strip()))
     for rnd in range(1, a.rounds + 1):
         load = subprocess.Popen([client, 'load', dsn, recs, str(rnd)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         time.sleep(rng.uniform(0.3, 3.0))

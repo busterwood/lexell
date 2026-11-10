@@ -1,8 +1,9 @@
 // lexdb: files, real and simulated (design/lexdb.md 4.1 and stage D0).
 //
 // A Fs is a directory of files. The real one opens files with O_DIRECT and
-// does its reads, writes and flushes as blocking C calls, which park the
-// task on the helper pool. Offsets and lengths are multiples of 4 KiB, and
+// does its reads, writes and flushes with fs.pread, pwrite and fdatasync,
+// which park the task: through io_uring when the runtime has a ring
+// (LXL_URING=1), else on the helper pool. Offsets and lengths are multiples of 4 KiB, and
 // the bytes go through a 4 KiB-aligned C buffer, as O_DIRECT requires.
 //
 // The simulated one keeps each file in memory twice: what reads see, and
@@ -26,11 +27,6 @@ extern "c" fn openFile(path: str, flags: i32, mode: u32): i32 as "open"
 extern "c" fn closeFd(fd: i32): i32 as "close"
 extern "c" fn posix_memalign(out: mut &ptr, align: int, size: int): i32
 extern "c" fn freeMem(p: ptr) as "free"
-extern "c" fn pread(fd: i32, buf: ptr, n: int, off: int): int blocking
-extern "c" fn pwrite(fd: i32, buf: ptr, n: int, off: int): int blocking
-extern "c" fn fdatasync(fd: i32): i32 blocking
-extern "c" fn fsyncFd(fd: i32): i32 as "fsync" blocking
-extern "c" fn posix_fallocate(fd: i32, off: int, n: int): i32 blocking
 extern "c" fn lseek(fd: i32, off: int, whence: i32): int
 extern "c" fn errno(): int as "lxl_errno"
 extern "c" fn copyIn(dst: ptr, at: int, src: &[byte], n: int) as "lxllib_copy_in"
@@ -187,10 +183,9 @@ pub fn (f: &Fs) syncDir(): Result[Unit, lexdb_base.DbErr] {
         Fs.Real(dir) {
             let fd = openFile(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0)
             if fd < 0 { return Err(lexdb_base.ioErr("open " + dir, errno())) }
-            let r = fsyncFd(fd)
-            let e = errno()
+            let r = fs.fsync(int(fd))
             closeFd(fd)
-            if r != 0 { return Err(lexdb_base.ioErr("fsync " + dir, e)) }
+            if r != 0 { return Err(lexdb_base.ioErr("fsync " + dir, -r)) }
             return Ok(Unit{})
         }
         Fs.Sim(_) { return Ok(Unit{}) }
@@ -293,8 +288,8 @@ pub fn (f: &File) size(): Result[int, lexdb_base.DbErr] {
 pub fn (f: &File) grow(n: int): Result[Unit, lexdb_base.DbErr] {
     match f {
         File.Real(fd) {
-            let r = posix_fallocate(fd, 0, n)
-            if r != 0 { return Err(lexdb_base.ioErr("fallocate", int(r))) }
+            let r = fs.fallocate(int(fd), 0, n)
+            if r != 0 { return Err(lexdb_base.ioErr("fallocate", -r)) }
             return Ok(Unit{})
         }
         File.Sim(sh, i) {
@@ -318,11 +313,10 @@ pub fn (f: &File) readPages(off: int, dst: mut &[][]byte): Result[Unit, lexdb_ba
         File.Real(fd) {
             var buf = nullPtr()
             if posix_memalign(mut &buf, PAGE, n) != 0 { panic("lexdb: out of memory (an I/O buffer)") }
-            let got = pread(fd, buf, n, off)
-            let e = errno()
+            let got = fs.pread(int(fd), buf, n, off)
             if got < 0 {
                 freeMem(buf)
-                return Err(lexdb_base.ioErr("pread", e))
+                return Err(lexdb_base.ioErr("pread", -got))
             }
             for j in 0..np {
                 let have = min(max(got - j * PAGE, 0), PAGE)
@@ -347,11 +341,10 @@ pub fn (f: &File) read(off: int, dst: mut &[byte], n: int): Result[Unit, lexdb_b
         File.Real(fd) {
             var buf = nullPtr()
             if posix_memalign(mut &buf, PAGE, n) != 0 { panic("lexdb: out of memory (an I/O buffer)") }
-            let got = pread(fd, buf, n, off)
-            let e = errno()
+            let got = fs.pread(int(fd), buf, n, off)
             if got < 0 {
                 freeMem(buf)
-                return Err(lexdb_base.ioErr("pread", e))
+                return Err(lexdb_base.ioErr("pread", -got))
             }
             copyOut(dst, buf, 0, got)
             freeMem(buf)
@@ -383,10 +376,9 @@ pub fn (f: &File) write(off: int, src: &[byte]): Result[Unit, lexdb_base.DbErr] 
             var buf = nullPtr()
             if posix_memalign(mut &buf, PAGE, n) != 0 { panic("lexdb: out of memory (an I/O buffer)") }
             copyIn(buf, 0, src, n)
-            let put = pwrite(fd, buf, n, off)
-            let e = errno()
+            let put = fs.pwrite(int(fd), buf, n, off)
             freeMem(buf)
-            if put < 0 { return Err(lexdb_base.ioErr("pwrite", e)) }
+            if put < 0 { return Err(lexdb_base.ioErr("pwrite", -put)) }
             if put != n { return Err(lexdb_base.ioErr("pwrite (short)", 5)) }
             return Ok(Unit{})
         }
@@ -416,7 +408,8 @@ pub fn (f: &File) write(off: int, src: &[byte]): Result[Unit, lexdb_base.DbErr] 
 pub fn (f: &File) flush(): Result[Unit, lexdb_base.DbErr] {
     match f {
         File.Real(fd) {
-            if fdatasync(fd) != 0 { return Err(lexdb_base.ioErr("fdatasync", errno())) }
+            let r = fs.fdatasync(int(fd))
+            if r != 0 { return Err(lexdb_base.ioErr("fdatasync", -r)) }
             return Ok(Unit{})
         }
         File.Sim(sh, idx) {

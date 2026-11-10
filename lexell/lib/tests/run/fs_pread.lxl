@@ -1,0 +1,74 @@
+// fs: pread, pwrite, fdatasync, fsync and fallocate on a descriptor, with C
+// buffers. Eight tasks write and read back their own 64 KiB regions of one
+// file at once, so each call parks with others runnable: through io_uring
+// under LXL_URING=1 (the native backend), on the helper pool otherwise; the
+// results must be the same. Then a read past the end is short, a read at
+// the end is 0, and calls on a closed descriptor give -EBADF.
+// expect: fallocate 0, size 524288
+// expect: 8 tasks: 8 regions written, 8 read back equal
+// expect: fdatasync 0, fsync 0
+// expect: past the end: 4096 then 0
+// expect: closed: -9 -9 -9 -9
+import "task"
+import "fs"
+import "os"
+
+extern "c" fn openFile(path: str, flags: i32, mode: u32): i32 as "open"
+extern "c" fn closeFd(fd: i32): i32 as "close"
+extern "c" fn malloc(n: int): ptr
+extern "c" fn free(p: ptr)
+extern "c" fn copyIn(dst: ptr, at: int, src: &[byte], n: int) as "lxllib_copy_in"
+extern "c" fn copyOut(dst: mut &[byte], src: ptr, at: int, n: int) as "lxllib_copy_out"
+
+const REGION = 65536
+
+type Job = record { fd: int; k: int }
+
+fn region(j: Job): bool {
+    let fd = j.fd
+    let k = j.k
+    var data = array(REGION, byte(0))
+    for i in 0..REGION { data[i] = byte((i * 7 + k * 13) % 251) }
+    let buf = malloc(REGION)
+    copyIn(buf, 0, &data, REGION)
+    let put = fs.pwrite(fd, buf, REGION, k * REGION)
+    for i in 0..REGION { data[i] = 0 }
+    copyIn(buf, 0, &data, REGION)
+    let yd = task.yield()
+    let got = fs.pread(fd, buf, REGION, k * REGION)
+    copyOut(mut &data, buf, 0, REGION)
+    free(buf)
+    if put != REGION || got != REGION { return false }
+    for i in 0..REGION {
+        if data[i] != byte((i * 7 + k * 13) % 251) { return false }
+    }
+    return true
+}
+
+fn main() {
+    let path = os.tempDir() + "/lxl_fs_pread_" + intToStr(os.pid())
+    let fd = int(openFile(path, i32(2 | 64 | 512 | 524288), u32(384)))   // O_RDWR|O_CREAT|O_TRUNC|O_CLOEXEC
+    if fd < 0 { panic("open failed") }
+    let fa = fs.fallocate(fd, 0, 8 * REGION)
+    match fs.stat(path) {
+        Ok(st) { println("fallocate " + intToStr(fa) + ", size " + intToStr(st.size)) }
+        Err(e) { println("stat: " + e.toStr()) }
+    }
+    var ok = 0
+    task.scope(fn(s: mut &task.Scope) {
+        var fs8: []task.Future[bool] = []
+        for k in 0..8 { append(mut &fs8, s.start(region, Job{fd: fd, k: k})) }
+        for good in task.all(fs8).unwrap() { if good { ok += 1 } }
+    })
+    println("8 tasks: 8 regions written, " + intToStr(ok) + " read back equal")
+    println("fdatasync " + intToStr(fs.fdatasync(fd)) + ", fsync " + intToStr(fs.fsync(fd)))
+    let buf = malloc(8192)
+    let short = fs.pread(fd, buf, 8192, 8 * REGION - 4096)
+    let none = fs.pread(fd, buf, 8192, 8 * REGION)
+    println("past the end: " + intToStr(short) + " then " + intToStr(none))
+    closeFd(i32(fd))
+    println("closed: " + intToStr(fs.pread(fd, buf, 16, 0)) + " " + intToStr(fs.pwrite(fd, buf, 16, 0)) + " "
+            + intToStr(fs.fdatasync(fd)) + " " + intToStr(fs.fsync(fd)))
+    free(buf)
+    let rm = fs.remove(path)
+}

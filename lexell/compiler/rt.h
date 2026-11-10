@@ -1569,6 +1569,12 @@ int64_t lxllib_net_recv(int64_t fd, void* b, int64_t n, const char* w, int64_t* 
         } else if (errno != EINTR) return -errno;
     }
 }
+/* fs's file operations through io_uring: the native runtime's (LXL_URING=1). Here there is no
+   ring: RT_NORING always, and fs makes the call itself on the helper pool. */
+int64_t lxllib_file_op(int64_t op, int64_t fd, void* b, int64_t n, int64_t off, const char* w) {
+    (void)op; (void)fd; (void)b; (void)n; (void)off; (void)w;
+    return -((int64_t)1 << 40);
+}
 static int64_t rt_fd_until(int64_t ms, bool cancellable) {
     int64_t at = cancellable ? rt_cur->deadline : RT_NEVER;
     if (ms > 0 && rt_after(ms) < at) at = rt_after(ms);

@@ -466,7 +466,11 @@ chunk).
   cycles, and returns the first list/stat error. `createTemp(dir, prefix)`
   returns an `io.Writer` with mode 0600; `writeAtomic(path, data)` writes a
   temp in the same directory and renames it over `path`; `realpath(path)`
-  resolves links with the 40-link `ELOOP` limit. `Stat` keeps its existing
+  resolves links with the 40-link `ELOOP` limit. Positioned I/O on a
+  descriptor: `pread`/`pwrite(fd, buf: ptr, n, off)`, `fdatasync(fd)`,
+  `fsync(fd)`, `fallocate(fd, off, n)` return a count or 0, or -errno, and
+  park the task until done: through io_uring with the native backend's
+  `LXL_URING=1`, else as blocking calls on the helper pool. `Stat` keeps its existing
   fields (no atime/ctime: the compiler imports `fs`, so changing the record
   forces a seed reseed, and no caller needs them yet).
 - **os**: `argv()`, `arguments()`, `env(name): Option[str]`, `envOr`,

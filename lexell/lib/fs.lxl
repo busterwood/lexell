@@ -23,6 +23,12 @@ extern "c" fn statInto(path: str, follow: int): int as "lxl_stat"
 extern "c" fn statField(i: int): int as "lxl_stat_field"
 extern "c" fn cReadlink(path: str): int as "lxllib_readlink"
 extern "c" fn readlinkText(): str as "lxllib_readlink_text"
+extern "c" fn rtFileOp(op: int, fd: int, buf: ptr, n: int, off: int, w: ptr): int as "lxllib_file_op"
+extern "c" fn cPread(fd: i32, buf: ptr, n: int, off: int): int as "pread" blocking
+extern "c" fn cPwrite(fd: i32, buf: ptr, n: int, off: int): int as "pwrite" blocking
+extern "c" fn cFdatasync(fd: i32): i32 as "fdatasync" blocking
+extern "c" fn cFsync(fd: i32): i32 as "fsync" blocking
+extern "c" fn cFallocate(fd: i32, off: int, n: int): i32 as "posix_fallocate" blocking
 
 // The type of a file: regular, directory, symbolic link, named pipe, Unix
 // socket, character or block device, or Other (not known).
@@ -483,3 +489,54 @@ fn trimSlashes(path: str): str {
     while n > 0 && strByte(path, n - 1) == '/' { n -= 1 }
     return strSlice(path, 0, n)
 }
+
+// ---- positioned I/O on a descriptor (design/lexdb.md 9.58)
+//
+// pread, pwrite, fdatasync, fsync and fallocate on a descriptor the caller
+// opened (O_DIRECT allowed: buf is C memory, aligned as the caller needs).
+// Each parks its task until done: through io_uring when the runtime has a
+// ring (the native backend with LXL_URING=1), else as a blocking C call on
+// the helper pool. The result is the count (pread, pwrite: short at the end
+// of the file, as the system calls) or 0, or -errno. Not cancellable: the
+// call finishes before its task goes on.
+
+const NORING = -1099511627776     // lxllib_file_op: no ring here, make the call
+const EOPNOTSUPP = 95
+
+fn negErrno(r: int): int { return if r < 0 { -errno() } else { r } }
+
+pub fn pread(fd: int, buf: ptr, n: int, off: int, w: Where): int {
+    let r = rtFileOp(0, fd, buf, n, off, w.cstr())
+    if r != NORING { return r }
+    return negErrno(cPread(i32(fd), buf, n, off))
+}
+
+pub fn pwrite(fd: int, buf: ptr, n: int, off: int, w: Where): int {
+    let r = rtFileOp(1, fd, buf, n, off, w.cstr())
+    if r != NORING { return r }
+    return negErrno(cPwrite(i32(fd), buf, n, off))
+}
+
+// Makes the file's data written so far durable (and the metadata needed to
+// read it back).
+pub fn fdatasync(fd: int, w: Where): int {
+    let r = rtFileOp(2, fd, nullPtr(), 0, 0, w.cstr())
+    if r != NORING { return r }
+    return negErrno(int(cFdatasync(i32(fd))))
+}
+
+// fdatasync and all the file's metadata; on a directory, its entries.
+pub fn fsync(fd: int, w: Where): int {
+    let r = rtFileOp(3, fd, nullPtr(), 0, 0, w.cstr())
+    if r != NORING { return r }
+    return negErrno(int(cFsync(i32(fd))))
+}
+
+// Reserves [off, off + n) on disk, as posix_fallocate: a file system that
+// cannot allocate is filled with zeros instead.
+pub fn fallocate(fd: int, off: int, n: int, w: Where): int {
+    let r = rtFileOp(4, fd, nullPtr(), n, off, w.cstr())
+    if r != NORING && r != -EOPNOTSUPP { return r }
+    return -int(cFallocate(i32(fd), off, n))     // posix_fallocate returns the error itself
+}
+
