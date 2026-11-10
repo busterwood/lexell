@@ -6018,9 +6018,11 @@ fn accumulate(sp: &AggSpec, acc: mut &Acc, env: &Env): Result[Unit, DbErr] {
     if f == "sum" || f == "avg" {
         acc.sum = if isNull(&acc.sum) { v } else { try arith(&"+", &acc.sum, &v) }
     } else if f == "min" {
-        if isNull(&acc.val) || (try compare(&v, &acc.val)) < 0 { acc.val = v }
+        // of equal values the last, as PostgreSQL's numeric_smaller gives
+        // (0.5 and 0.500: 0.500 if it comes after)
+        if isNull(&acc.val) || (try compare(&v, &acc.val)) <= 0 { acc.val = v }
     } else if f == "max" {
-        if isNull(&acc.val) || (try compare(&v, &acc.val)) > 0 { acc.val = v }
+        if isNull(&acc.val) || (try compare(&v, &acc.val)) >= 0 { acc.val = v }
     } else if f == "bool_and" || f == "every" || f == "bool_or" {
         let b = match truth(&v) {
             Some(x) { x }
@@ -10055,6 +10057,10 @@ type BSpec = record {
     kind: int
     arg: Option[BNode]
     filter: Option[BNode]
+    // a column of values (BK_VAL) whose min, max, or numeric sum or avg
+    // this is (9.52): its values kept per group as the row path keeps
+    // them (bAccVal); -1 an integer aggregate
+    vcol: int
 }
 
 type RawRows = record {
@@ -10787,6 +10793,30 @@ fn bColsOf(n: &BNode, used: mut &[]bool) {
     }
 }
 
+// Adds the rows (gids: their groups) of a batch to a value aggregate's
+// counts and values (sp.vcol): row by row, in order, with eval's arith and
+// compare, as accumulate does (the last of equal values kept).
+fn bAccVal(sp: &BSpec, b: &Batch, rows: &[]int, gids: &[]int, cn: mut &[]int, av: mut &[]Val): Result[Unit, DbErr] {
+    let c = sp.vcol
+    let summing = sp.kind == BA_SUM || sp.kind == BA_AVG
+    let mx = sp.kind == BA_MAX
+    for j in 0..len(rows) {
+        let r = rows[j]
+        if b.cols[c].nul[r] { continue }
+        let g = gids[j]
+        if isNull(&av[g]) {
+            av[g] = b.vals[c][r]
+        } else if summing {
+            av[g] = try arith(&"+", &av[g], &b.vals[c][r])
+        } else {
+            let x = try compare(&b.vals[c][r], &av[g])
+            if (mx && x >= 0) || (!mx && x <= 0) { av[g] = b.vals[c][r] }
+        }
+        cn[g] += 1
+    }
+    return Ok(Unit{})
+}
+
 // Adds the rows (gids: their groups) of a batch to an aggregate's counts,
 // sums and minima or maxima per group; one: a single group (its values
 // kept in registers through the loop).
@@ -11018,12 +11048,20 @@ fn batchGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
         else if f == "avg" { kind = BA_AVG } else if f == "min" { kind = BA_MIN } else if f == "max" { kind = BA_MAX }
         if kind < 0 { return Ok(false) }
         var arg: Option[BNode] = None
+        var vcol = -1
         if kind != BA_STAR {
             if len(sp.args) != 1 { return Ok(false) }
             let c = bCompile(&sp.args[0], q, &kinds, &env)
             if c.isNone() { return Ok(false) }
             let cc = c.unwrap()
-            if kind != BA_COUNT && cc.typ != BT_INT { return Ok(false) }
+            if kind != BA_COUNT && cc.typ != BT_INT {
+                // min or max of a column of values, sum or avg of a numeric one
+                let vc = bValCol(&sp.args[0], q, &kinds)
+                if vc < 0 { return Ok(false) }
+                let numeric = t.cols[vc].typ.oid == lexdb_sql.OID_NUMERIC
+                if !(kind == BA_MIN || kind == BA_MAX || ((kind == BA_SUM || kind == BA_AVG) && numeric)) { return Ok(false) }
+                vcol = vc
+            }
             arg = Some(takeN(cc))
         }
         var filt: Option[BNode] = None
@@ -11037,7 +11075,7 @@ fn batchGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
             }
             None {}
         }
-        append(mut &specs, BSpec{kind: kind, arg: arg, filter: filt})
+        append(mut &specs, BSpec{kind: kind, arg: arg, filter: filt, vcol: vcol})
     }
     // With no GROUP BY no column is used outside an aggregate (42803): the
     // columns read are those of the conditions and the aggregates only
@@ -11080,10 +11118,12 @@ fn batchGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
     var an: [][]int = []
     var asum: [][]int = []
     var amm: [][]int = []
+    var aval: [][]Val = []              // per value aggregate (vcol) and group: its sum, min or max
     for i in 0..ns {
         append(mut &an, [])
         append(mut &asum, [])
         append(mut &amm, [])
+        append(mut &aval, [])
     }
     var byInt: Map[int, int] = newMap()
     var byKey: Map[str, int] = newMap()
@@ -11134,6 +11174,7 @@ fn batchGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
                         append(mut &an[i], 0)
                         append(mut &asum[i], 0)
                         append(mut &amm[i], 0)
+                        append(mut &aval[i], Val.Null)
                     }
                 }
             } else {
@@ -11175,6 +11216,7 @@ fn batchGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
                             append(mut &an[i], 0)
                             append(mut &asum[i], 0)
                             append(mut &amm[i], 0)
+                            append(mut &aval[i], Val.Null)
                         }
                         if oneKey {
                             if kvs[0].nul[j] { nullGroup = g } else { byInt.put(kvs[0].v[j], g) }
@@ -11197,9 +11239,13 @@ fn batchGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
                             append(mut &r2, idx[j])
                             append(mut &g2, gid[j])
                         }
-                        try bAccum(sp, &b, &r2, &g2, len(keys) == 0, mut &an[si], mut &asum[si], mut &amm[si])
+                        if sp.vcol >= 0 { try bAccVal(sp, &b, &r2, &g2, mut &an[si], mut &aval[si]) }
+                        else { try bAccum(sp, &b, &r2, &g2, len(keys) == 0, mut &an[si], mut &asum[si], mut &amm[si]) }
                     }
-                    None { try bAccum(sp, &b, &idx, &gid, len(keys) == 0, mut &an[si], mut &asum[si], mut &amm[si]) }
+                    None {
+                        if sp.vcol >= 0 { try bAccVal(sp, &b, &idx, &gid, mut &an[si], mut &aval[si]) }
+                        else { try bAccum(sp, &b, &idx, &gid, len(keys) == 0, mut &an[si], mut &asum[si], mut &amm[si]) }
+                    }
                 }
             }
         }
@@ -11210,7 +11256,10 @@ fn batchGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
         for si in 0..ns {
             let kd = specs[si].kind
             accs[si].n = an[si][g]
-            if an[si][g] > 0 {
+            if an[si][g] > 0 && specs[si].vcol >= 0 {
+                if kd == BA_SUM || kd == BA_AVG { accs[si].sum = aval[si][g] }
+                if kd == BA_MIN || kd == BA_MAX { accs[si].val = aval[si][g] }
+            } else if an[si][g] > 0 {
                 if kd == BA_SUM || kd == BA_AVG { accs[si].sum = Val.Int(asum[si][g]) }
                 if kd == BA_MIN || kd == BA_MAX { accs[si].val = Val.Int(amm[si][g]) }
             }

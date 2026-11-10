@@ -3985,3 +3985,32 @@ The last three still take the row path:
   - **Not planted:** keeping rows tied with the bar (`> 0` for `>= 0`)
     would only cost time, since the next cut drops them.
 
+**Aggregates of values.**
+- **What batches.** `batchGroups` takes `min` and `max` of a column of
+  other values (texts, numerics) and `sum` and `avg` of a numeric one.
+- **How.** Each group keeps a value, updated row by row in the scan's
+  order with eval's own `arith` and `compare` (`bAccVal`), as `accumulate`
+  does.
+- **Ties.** Checking that showed the row path keeping the first of equal
+  values. PostgreSQL keeps the last: for a plain numeric holding 1.0,
+  1.00, 0.50, 0.5 and 0.500, its `min` and `max` are 0.500 and 1.00.
+  Both paths now keep the last.
+- **Time.** `min(t), max(t)` on 1M rows: 384 to 88 ms (PostgreSQL on one
+  core: 71).
+- **exec_batch** gained:
+  - in its generator: `min` and `max` of texts, and the four aggregates of
+    a numeric added after the rows, so its default is their missing value;
+  - that tie case, with PostgreSQL's answers.
+- **Planted bugs.** Of seven, five were caught:
+  - max taken as min;
+  - NULLs counted;
+  - the count not given;
+  - the first of equal values kept, in the batches;
+  - the first of equal values kept, in the row path.
+
+  The two not caught give the same results:
+  - keeping the first of equal values in a column whose equal values are
+    identical (a typed numeric, a text), before the tie case was added;
+  - `sum` of a text in batches, which gives the row path's error through
+    the same `arith`.
+
