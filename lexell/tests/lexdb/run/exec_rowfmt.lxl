@@ -1,0 +1,133 @@
+// lexdb_exec: the fixed row layout (design/lexdb.md 9.48, an experiment)
+// beside the tagged one, in one table. Table m is written in both: rows in
+// the tagged layout, then in the fixed one, then old rows updated (written
+// again in the fixed layout), a column added and one dropped between
+// inserts, so its rows have three sets of places. Table r gets the same
+// statements, always in the tagged layout. Each query runs on both, with
+// batches on and off: all four results must be the same. The columns:
+// integers of three sizes, a boolean, a numeric, a text, a long text
+// (kept tagged: encLong), NULLs in each.
+// 627 of m's rows are in the fixed layout: rows 201 to 700 and those of 1
+// to 200 updated after, less those with a long text.
+// expect: m's rows: 700, in the fixed layout: 627
+// expect: 26 queries, 26 the same on both tables, with and without batches
+// expect: a few: 700|700|8|-9|7 / 350|175 / 91
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            var out: []str = []
+            for r in rs {
+                if !r.hasRows { append(mut &out, r.tag) }
+                for row in r.rows {
+                    var vs: []str = []
+                    for v in row { append(mut &vs, lexdb_exec.text(&v)) }
+                    append(mut &out, strings.join(&vs, "|"))
+                }
+            }
+            return strings.join(&out, " ")
+        }
+        Err(e) { return "ERROR " + e.state + " " + e.msg }
+    }
+}
+
+// Runs sql (with "T" for the table) on m in the layout given and on r in
+// the tagged one.
+fn both(s: mut &lexdb_exec.Session, sql: str, fixed: bool) {
+    lexdb_exec.setFixedRows(fixed)
+    let a = q(s, &strings.replaceAll(sql, "T", "m"))
+    lexdb_exec.setFixedRows(false)
+    let b = q(s, &strings.replaceAll(sql, "T", "r"))
+    if a != b { println("writes differ: " + sql + ": " + a + " / " + b) }
+}
+
+// The rows from..to; withB: with column b (dropped later), withE: with e
+// (added later).
+fn rows(from: int, to: int, withB: bool, withE: bool): str {
+    var out: []str = []
+    for i in from..to {
+        var vs: []str = [i.toStr(), if i % 9 == 0 { "null" } else { (i % 7).toStr() }]
+        if withB { append(mut &vs, if i % 11 == 0 { "null" } else { (i % 5 - 2).toStr() }) }
+        let more: []str = [if i % 13 == 0 { "null" } else { (i * 1000003).toStr() }, if i % 6 == 0 { "null" } else if i % 2 == 0 { "true" } else { "false" },
+                         if i % 8 == 0 { "null" } else { (i % 100).toStr() + "." + (i % 7).toStr() }, if i % 10 == 0 { "null" } else { "'t" + (i % 4).toStr() + "'" },
+                         if i % 50 == 0 { "'" + strings.repeat("long ", 80) + i.toStr() + "'" } else { "'s'" }]
+        for m in more { append(mut &vs, m) }
+        if withE { append(mut &vs, if i % 3 == 0 { "null" } else { (i % 9).toStr() }) }
+        append(mut &out, "(" + strings.join(&vs, ", ") + ")")
+    }
+    return strings.join(&out, ", ")
+}
+
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: 1024 * 1024, segBytes: 4 * 1024 * 1024, ckptBytes: 2 * 1024 * 1024, snapNodes: 100000}
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(48), opts(), fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        let ddl = "create table T (id int primary key, a int, b smallint, c bigint, f boolean, n numeric(8,2), t text, big text)"
+        both(mut &s, ddl, false)
+        both(mut &s, "insert into T values " + rows(1, 201, true, false), false)
+        both(mut &s, "insert into T values " + rows(201, 401, true, false), true)
+        both(mut &s, "update T set a = a + 1 where id <= 120", true)
+        both(mut &s, "alter table T add column e int default 4", true)
+        both(mut &s, "insert into T values " + rows(401, 551, true, true), true)
+        both(mut &s, "alter table T drop column b", true)
+        both(mut &s, "update T set c = c - 1 where id % 4 = 0", true)
+        both(mut &s, "insert into T (id, a, c, f, n, t, big, e) values " + rows(551, 701, false, true), true)
+        lexdb_exec.setFixedRows(false)
+        // the rows' layouts, from the stored bytes' first byte (7: fixed)
+        let all = q(mut &s, &"select count(*) from m")
+        let fixedN = lexdb_exec.countFixedRows(&st, &"m")
+        println("m's rows: " + all + ", in the fixed layout: " + fixedN.toStr())
+        let qs = ["select count(*), count(a), count(c), count(f), count(n), count(t), count(big), count(e) from T",
+                  "select sum(a), min(a), max(a), avg(a) from T",
+                  "select sum(c), min(c), max(c) from T where c > 5000000",
+                  "select sum(e), min(e), max(e), count(*) from T where e is not null",
+                  "select count(*) from T where f",
+                  "select count(*) from T where not f or f is null",
+                  "select f, count(*), sum(a) from T group by f order by 1",
+                  "select t, count(*), sum(e) from T group by t order by 1",
+                  "select a, f, count(*) from T group by a, f order by 1, 2",
+                  "select e, count(*), min(id) from T group by e order by 1",
+                  "select sum(a * e) filter (where e > 2), count(*) filter (where a is null) from T",
+                  "select sum(n), min(n), max(n) from T",
+                  "select n, count(*) from T where id < 100 group by n order by 1",
+                  "select count(*) from T where t = 't1' and a > 2",
+                  "select length(big), count(*) from T group by length(big) order by 1",
+                  "select id, a, c, f, n, t, e from T where id in (1, 50, 200, 201, 250, 400, 401, 450, 550, 551, 600, 700) order by id",
+                  "select id, big from T where id % 50 = 0 and id > 300 order by id",
+                  "select * from T where id = 333",
+                  "select * from T where id = 650",
+                  "select max(id), min(id) from T where a = 3 and e = 4",
+                  "select count(*) from T where c is null or n is null",
+                  "select a % 3, count(*), sum(c) from T group by a % 3 order by 1",
+                  "select sum(id) from T where id between 150 and 450",
+                  "select count(*), sum(a) from T where id > 400",
+                  "select t, max(n), min(c) from T where f is not null group by t order by 1",
+                  "select count(distinct a), sum(distinct e) from T"]
+        var same = 0
+        for x in qs {
+            var res: []str = []
+            for tb in ["m", "r"] {
+                for mode in ["on", "off"] {
+                    let sw = q(mut &s, &("set lexdb_batch = " + mode))
+                    append(mut &res, q(mut &s, &strings.replaceAll(x, "T", tb)))
+                }
+            }
+            if res[0] == res[1] && res[0] == res[2] && res[0] == res[3] { same += 1 } else {
+                println("DIFFERENT: " + x)
+                for r in res { println("  " + r) }
+            }
+        }
+        println(len(qs).toStr() + " queries, " + same.toStr() + " the same on both tables, with and without batches")
+        println("a few: " + q(mut &s, &"select count(*), sum(case when f then 1 else 0 end) + sum(case when f then 0 else 1 end), max(e), min(a - 9), max(a) from m") +
+                " / " + q(mut &s, &"select count(*), count(*) / 2 from m where id % 2 = 0") + " / " + q(mut &s, &"select count(*) from m where t = 't1' and a > 2"))
+        return 0
+    }).unwrap()
+}

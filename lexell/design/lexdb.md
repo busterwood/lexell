@@ -393,7 +393,7 @@ Built on 2026-11-09 on branch `lexdb`, about 6,300 lines in
 (cache, trees, transactions, log, checkpoints, recovery, snapshots),
 `lexdb_sql` (lexer, parser), `lexdb_exec` (catalog, rows, keys, planner,
 statements, sessions), `lexdb_wire` (protocol 3.0) and `lexdb` (the
-server). Tests: `python3 lexell/tests/lexdb.py` (58 programs in
+server). Tests: `python3 lexell/tests/lexdb.py` (59 programs in
 `tests/lexdb/run`, under `LXL_CHECK=1`).
 
     lexell/compiler/out/lxlc lexell/cmd/lexdb.lxl -o lexdb
@@ -3470,3 +3470,152 @@ query):
   user's decision.
 - **Parallel scans,** which PostgreSQL uses on these queries: the
   multi-core question.
+
+### 9.48 The row format: options, and the fixed layout tried
+
+The user asked (2026-11-10) for a better storage format, weighing inserts,
+updates, ALTER and dropped columns, tried on the batches of 9.47.
+
+**What the format costs now.** A row is its values in their places, each
+a tag byte and its bytes:
+- an integer takes 9 bytes;
+- a numeric is stored as text and parsed on every read;
+- a text is 5 bytes and its own.
+
+Reading column k means walking columns 0 to k - 1. In the batches that
+walk was the largest cost, at 39% (9.47).
+
+**Three ways to go.**
+
+- **A. A fixed layout per row,** as PostgreSQL's heap tuples but with
+  every column's offset fixed:
+  - a NULL bitmap;
+  - each fixed-width column at a constant offset;
+  - then the variable-length values' ends, and their bytes.
+
+  A table keeps a list of layouts, and each row names its own. Reading a
+  column is one load and a bit test, with no walk.
+- **B. Column-grouped leaves (PAX).** A leaf page keeps its keys, then each
+  column's NULL bitmap and values together. Decoding becomes nearly a
+  copy, a scan reads only the bytes of the columns it uses, and a column
+  of a page can be compressed.
+- **C. A columnar cache.** The format stays. Decoded column arrays are kept
+  per leaf version in memory, dropped when the leaf changes.
+
+| | Tagged (now) | A: fixed layout | B: PAX leaves | C: column cache |
+|---|---|---|---|---|
+| Scan of a few columns | walks the columns before each | one load per column | a column's array, its bytes only | as B on a cached leaf, else as now |
+| Point read | walks | direct | gathers from each column | as now |
+| INSERT | encode, put | the same | shifts every column array of its leaf | as now, the leaf's cache dropped |
+| UPDATE of a column | the row again | the row again (a fixed-width value could be patched in place) | one element; the leaf's version copied whole | as now, cache dropped |
+| ADD COLUMN | no rewrite: older rows lack it (its default) | no rewrite: a new layout | no rewrite: a leaf without it gives the default | cache dropped |
+| DROP COLUMN | no rewrite; every later row keeps a NULL in its place | no rewrite; a new layout without it, later rows smaller | no rewrite; a leaf converted when next written | cache dropped |
+| Widening a type (int4 to int8) | no rewrite | a new layout: old rows keep the old width | per leaf | cache dropped |
+| Other type changes | rewrite | rewrite | rewrite | rewrite |
+| Space | a tag per value | a bit per value; a NULL fixed column keeps its bytes; int4 can take 4 | per-column compression possible | the cached copies in memory |
+| The store | — | unchanged: values are still bytes | must know the schema; splits, merges, versions and conflicts by column | needs a leaf version to cache by |
+| Risk | — | small: the encoder and decoders | large | moderate |
+
+A changes only how a row's bytes are laid out. Everything else stays: the
+B+tree, copy-on-write versions, per-row conflicts, large rows. B is the
+better scan format, but it would rebuild the store. Section 0 keeps the
+store free of the schema, and its write paths all work on whole entries.
+
+**What was tried.** A, as an experiment beside the tagged form
+(`LEXDB_ROWFMT=fixed`; the default stays tagged).
+- **The row.** Byte 7 (no tag uses it), the place count, a kind byte per
+  place, the NULL bitmap, the fixed part (8 bytes an integer, 1 a boolean,
+  4 the end of a text's or numeric's bytes, 0 a dropped place), then the
+  variable bytes.
+- **What it stands in for.** The kind bytes stand for a layout number, so
+  rows describe themselves without catalog changes. They cost as much
+  space as today's tags; a layout number would take 2 bytes.
+- **What stays tagged.** A row with a long text, or a value of another kind
+  than its column's.
+- **Readers.** Both layouts are read everywhere, so a table may hold both,
+  as a migration would leave it.
+- **Layouts.** Readers take a row's offsets from the table's current
+  layout (made once per fetch of 256 rows, or per batch) when its kinds
+  match; a catalog's layout number would do the same. A row of an older
+  layout, from before an ALTER, makes its own.
+
+**Checked.**
+- **The suite in both layouts.** All 58 programs pass with every row
+  written fixed (`LEXDB_ROWFMT=fixed`) and with the tagged default. That
+  covers ALTER of every kind, COPY, the crash tests, the wire protocol
+  and exec_batch's 400 random queries.
+- **`exec_rowfmt`.** One table holds both layouts and three sets of places:
+  rows written tagged, then fixed, old rows updated, a column added and
+  one dropped between inserts. Another table gets the same statements,
+  always tagged. 26 queries (aggregates, groups, filters, whole rows, long
+  texts, numerics, DISTINCT) give the same results on both tables, with
+  batches on and off.
+- **Bugs found while building it.** Two showed up only in the batches:
+  - the batch decoder took byte 7 for a tag;
+  - an empty layout cache matched every row, which read the bitmap from
+    byte 0.
+
+**Writes, measured** (1M rows, in the executor; one run each):
+
+| | Tagged | Fixed |
+|---|---:|---:|
+| INSERT ... SELECT 1M rows (5 columns) | 3,335 ms | 2,838 ms |
+| INSERT ... SELECT 500K rows (20 columns) | 4,929 ms | 4,558 ms |
+| UPDATE all 1M rows (an integer) | 2,449 ms | 2,343 ms |
+| UPDATE 100K rows (a text longer) | 799 ms | 772 ms |
+| Data file after the load | 59.6 MB | 63.2 MB |
+
+Writes cost the same or a little less. The file is 6% larger only because
+this experiment stores a kind byte per place. A 5-column row is 47 bytes
+tagged and 50 here. With a 2-byte layout number it would be 46, and 30
+with int4 kept in 4 bytes.
+
+**Reads, measured.** Best of two rounds of five, in ms; "+b" is with
+batches on:
+
+| Query | tagged+b | fixed+b | tagged | fixed |
+|---|---:|---:|---:|---:|
+| `count(*)`, 5 columns | 52.8 | 40.6 | 226 | 206 |
+| 4 aggregates `WHERE n > 10` | 86.2 | 75.5 | 475 | 449 |
+| `sum(v)` with 3 conditions | 95.3 | 89.8 | 455 | 434 |
+| `GROUP BY g`, 3 aggregates | 126.8 | 129.0 | 470 | 471 |
+| `GROUP BY n WHERE v % 2 = 0` | 101.0 | 92.7 | 474 | 460 |
+| 20 columns: `sum(c18) WHERE c17 > 50` | 96.2 | 63.4 | 347 | 347 |
+| 20 columns: `GROUP BY c19`, 3 aggregates | 108.2 | 81.2 | 442 | 450 |
+| 20 columns: `WHERE c1 = 3 AND c13 < 5` | 91.2 | 60.5 | 287 | 280 |
+| 1,000 point lookups | 10.5 | 10.4 | 10.2 | 10.7 |
+
+- **The 20-column table, with batches:** 1.3 to 1.5 times faster. Its
+  columns used come late in the row, so the tagged walk was long.
+- **The 5-column table:** 0 to 23% faster; its columns came early.
+- **The row path and point lookups:** about the same. Their cost is
+  elsewhere (making values, parsing and planning).
+
+A check of a 2-byte layout number, taking only the place count in a
+throwaway build, gave 2 to 10% more.
+
+**Where the time goes now** (fixed layout, batches, native profile):
+
+| Part | 4 aggregates | 20 columns, `sum(c18)` |
+|---|---:|---:|
+| The store's scan (`scanIn`, `fetchRaw`): copying each entry out of its leaf, then into the batch; `Store.load` 9 to 11% even when warm | 42% | 48% |
+| Decoding (`bDecode`): now array writes with their bounds checks, and a batch's arrays made, more than reading the row | 33% | 39% |
+| Evaluating and aggregating | about 20% | about 10% |
+
+**What this says.**
+- **A is worth having.** It is faster where the columns used come late,
+  costs nothing on writes, and handles ADD and DROP COLUMN better than
+  now: dropped columns stop costing space in new rows.
+- **Making it real:**
+  - a layout number per row, with each table's layouts in the catalog;
+  - int2 and int4 at their width;
+  - numerics in binary, not text parsed per read;
+  - rewriting a table to the current layout when the user asks.
+- **B's further gain is bounded by decoding's share,** a third of the batch
+  time now, and costs the store's rewrite. Not now.
+- **The next cost is the store's scan.** A scan that gives a leaf's entries
+  in place, not copied twice, and a look at why `Store.load` runs on warm
+  scans. Both help any format, and come before B or C would.
+- **The batches decode every column for `count(*)`** (the planner's "all
+  columns" for no column named). With no GROUP BY, only the columns of
+  the conditions and aggregates are needed.

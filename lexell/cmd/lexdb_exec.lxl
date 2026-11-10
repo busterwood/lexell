@@ -20,6 +20,7 @@ import "strings"
 import "collections"
 import "time"
 import "task"
+import "os"
 import "./lexdb_base"
 import "./lexdb_store"
 import "./lexdb_sql"
@@ -1263,6 +1264,23 @@ fn placesNeeded(t: &Table, need: &[]bool): []bool {
 // A table's row as stored: its values at their places, NULL at a dropped
 // column's.
 fn encRowOf(t: &Table, row: &[]Val): str {
+    if fixedRows {
+        // the fixed layout (9.48) when every value fits it
+        let kinds = placeKinds(t)
+        if len(t.slots) == 0 {
+            match encFixed(&kinds, row) {
+                Some(f) { return f }
+                None {}
+            }
+        } else {
+            var ps: []Val = array(t.width, Val.Null)
+            for i in 0..len(t.slots) { ps[t.slots[i]] = row[i] }
+            match encFixed(&kinds, &ps) {
+                Some(f) { return f }
+                None {}
+            }
+        }
+    }
     if len(t.slots) == 0 { return encRow(row) }
     var places: []Val = array(t.width, Val.Null)
     for i in 0..len(t.slots) { places[t.slots[i]] = row[i] }
@@ -1326,6 +1344,7 @@ fn decRow(s: &str, n: int): Result[[]Val, DbErr] {
 // A row's values; need: the columns used ([] all), the others NULL and not
 // decoded (9.31).
 fn decRowNeed(s: &str, n: int, need: &[]bool, missing: &[]Val): Result[[]Val, DbErr] {
+    if len(s) > 0 && s[0] == FIXED { return decFixed(s, n, need, missing) }
     var out: []Val = []
     var at = 0
     let some = len(need) > 0
@@ -2762,8 +2781,11 @@ fn fetch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, p: &Path,
         }
         if len(vals) < BATCH { cur.done = true } else { cur.at = after(&last) }
     }
+    let lay = layOfKinds(&placeKinds(t))
     for k in 0..len(vals) {
-        if !byIndex {
+        if !byIndex && len(vals[k]) > 1 && vals[k][0] == FIXED && sameLay(&vals[k], &lay) {
+            append(out, try rowOfLay(t, &vals[k], n, &places, &missing, &lay))
+        } else if !byIndex {
             append(out, try rowOf(st, txn, t, &keys[k], &vals[k], n, &places, &missing))
         } else {
             let got = if part { try st.getPart(txn, t.tree, vals[k]) } else { try st.get(txn, t.tree, vals[k]) }
@@ -7137,6 +7159,11 @@ fn (s: &Session) show(name: &str): Result[Res, DbErr] {
 }
 
 pub fn newSession(st: lexdb_store.Store): Session {
+    // LEXDB_ROWFMT=fixed: rows written in the fixed layout (9.48, an experiment)
+    match os.env("LEXDB_ROWFMT") {
+        Some(v) { fixedRows = v == "fixed" }
+        None {}
+    }
     let id = num(&st.memoGet(&"sessions").unwrapOr("0")) + 1
     st.memoPut(&"sessions", &id.toStr())
     return Session{st: st, txn: [], failed: false, maxRecursion: MAX_RECURSION, timeoutMs: 0, maxMem: MAX_STATEMENT_MEM,
@@ -10242,8 +10269,55 @@ fn bDecode(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, raw: &R
         if needCol[i] { append(mut &b.cols, bvec(n)) } else { append(mut &b.cols, bvec(0)) }
         if needCol[i] && kinds[i] == BK_VAL { append(mut &b.vals, array(n, Val.Null)) } else { append(mut &b.vals, []) }
     }
+    // the columns used, by place: for rows in the fixed layout
+    var usedP: []int = []
+    for pl in 0..width { if placeCol[pl] >= 0 { append(mut &usedP, pl) } }
+    var lay = FixedLay{sig: [], off: [], prev: [], bm: 0, v0: 0}
     for r in 0..n {
         let s = &raw.vals[r]
+        if len(s) > 1 && s[0] == FIXED {
+            // one load per column used, at its offset (9.48)
+            if !sameLay(s, &lay) { lay = fixedLay(s) }
+            let np = len(lay.sig) - 1
+            for pl in usedP {
+                let c = placeCol[pl]
+                let k = kinds[c]
+                if pl >= np {
+                    let mv = if pl < len(missing) { missing[pl] } else { Val.Null }
+                    if !bPut(b, c, r, mv, k) { return Ok(false) }
+                    continue
+                }
+                let pk = lay.sig[1 + pl]
+                if (int(s[lay.bm + pl / 8]) >> (pl % 8)) & 1 == 1 {
+                    b.cols[c].nul[r] = true
+                } else if pk == PK_INT && k == BK_INT {
+                    b.cols[c].v[r] = binary.readI64LEStr(s, lay.off[pl])
+                } else if pk == PK_BOOL && k == BK_BOOL {
+                    b.cols[c].v[r] = if s[lay.off[pl]] == 1 { 1 } else { 0 }
+                } else if k != BK_VAL {
+                    return Ok(false)
+                } else if pk == PK_INT {
+                    b.vals[c][r] = Val.Int(binary.readI64LEStr(s, lay.off[pl]))
+                } else if pk == PK_BOOL {
+                    b.vals[c][r] = Val.Bool(s[lay.off[pl]] == 1)
+                } else if pk == PK_NUM || pk == PK_TEXT {
+                    let end = binary.readU32LEStr(s, lay.off[pl])
+                    let start = if lay.prev[pl] < 0 { 0 } else { binary.readU32LEStr(s, lay.prev[pl]) }
+                    let x = s[lay.v0 + start..lay.v0 + end]
+                    if pk == PK_TEXT {
+                        b.vals[c][r] = Val.Text(x)
+                    } else {
+                        match Decimal.parse(x) {
+                            Ok(d) { b.vals[c][r] = Val.Num(d) }
+                            Err(_) { return Err(lexdb_base.corrupt("a numeric value in a row")) }
+                        }
+                    }
+                } else {
+                    b.cols[c].nul[r] = true
+                }
+            }
+            continue
+        }
         if lexdb_store.partOf(s).isSome() || (len(s) > 0 && s[0] == 6) {
             // a large row: as the row path reads it
             let row = try rowOf(st, txn, t, &raw.keys[r], s, width, needP, missing)
@@ -10626,4 +10700,212 @@ fn batchGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
     rs.cnt[0].joined += nJoined
     rs.cnt[0].batches += nBatches
     return Ok(true)
+}
+
+// ---- The fixed row layout (design/lexdb.md 9.48, an experiment)
+//
+// A row: FIXED; its place count; a kind per place (PK_*); a NULL bitmap
+// (bit p%8 of byte p/8); the fixed part, per place in order: 8 bytes an
+// integer, 1 a boolean, 4 a variable-length value's end (from the start of
+// the variable part), none a dropped place; then the variable part, the
+// texts and numerics' bytes. Every column has a constant offset for one set
+// of kinds, so reading one is a load, not a walk over the columns before it.
+// A row with a long text (LONG) keeps the tagged form (encLong). The kinds
+// stand for a layout number in a real version (one per ALTER).
+
+const FIXED: byte = 7
+const PK_NONE: byte = 0     // a dropped column's place
+const PK_INT: byte = 1
+const PK_BOOL: byte = 2
+const PK_NUM: byte = 3
+const PK_TEXT: byte = 4
+
+var fixedRows: bool = false
+
+pub fn setFixedRows(on: bool) { fixedRows = on }
+
+// How many of table name's stored rows are in the fixed layout (a test's
+// look at the bytes).
+pub fn countFixedRows(st: &lexdb_store.Store, name: &str): int {
+    var txn = lexdb_store.begin()
+    var n = 0
+    let found = findTable(st, mut &txn, name).unwrapOr(None)
+    match found {
+        Some(t) {
+            let r = st.scan(mut &txn, t.tree, "", "", fn(en: &lexdb_store.Entry): bool {
+                if len(en.val) > 0 && en.val[0] == FIXED { n += 1 }
+                return true
+            })
+        }
+        None {}
+    }
+    st.abort(txn)
+    return n
+}
+
+// Each place's kind, from its column's type.
+fn placeKinds(t: &Table): []byte {
+    var out: []byte = array(rowWidth(t), PK_NONE)
+    for i in 0..len(t.cols) {
+        let o = t.cols[i].typ.oid
+        var k = PK_TEXT
+        if o == lexdb_sql.OID_INT2 || o == lexdb_sql.OID_INT4 || o == lexdb_sql.OID_INT8 { k = PK_INT }
+        else if o == lexdb_sql.OID_BOOL { k = PK_BOOL }
+        else if o == lexdb_sql.OID_NUMERIC { k = PK_NUM }
+        out[if len(t.slots) == 0 { i } else { t.slots[i] }] = k
+    }
+    return out
+}
+
+fn fixedSize(k: byte): int {
+    if k == PK_INT { return 8 }
+    if k == PK_BOOL { return 1 }
+    if k == PK_NUM || k == PK_TEXT { return 4 }
+    return 0
+}
+
+// The places' values in the fixed layout; None when one does not fit it (a
+// value of another kind than its place's, a long text, over 255 places).
+fn encFixed(kinds: &[]byte, places: &[]Val): Option[str] {
+    let n = len(kinds)
+    if n > 255 || len(places) != n { return None }
+    var bits: []byte = array((n + 7) / 8, byte(0))
+    var vars: []str = []
+    for p in 0..n {
+        let k = kinds[p]
+        match places[p] {
+            Val.Null { bits[p / 8] = bits[p / 8] | byte(1 << (p % 8)) }
+            Val.Int(_) { if k != PK_INT { return None } }
+            Val.Bool(_) { if k != PK_BOOL { return None } }
+            Val.Num(d) {
+                if k != PK_NUM { return None }
+                append(mut &vars, d.toStr())
+            }
+            Val.Text(x) {
+                if k != PK_TEXT || len(x) >= LONG { return None }
+                append(mut &vars, x)
+            }
+        }
+    }
+    var b = newStrBuf()
+    b.addByte(FIXED)
+    b.addByte(byte(n))
+    for k in kinds { b.addByte(k) }
+    for x in bits { b.addByte(x) }
+    var end = 0
+    var vi = 0
+    for p in 0..n {
+        let k = kinds[p]
+        if k == PK_INT {
+            binary.addU64LE(mut &b, match places[p] { Val.Int(v) { v } else { 0 } })
+        } else if k == PK_BOOL {
+            b.addByte(match places[p] { Val.Bool(x) { if x { 1 } else { 0 } } else { 0 } })
+        } else if k == PK_NUM || k == PK_TEXT {
+            if !isNull(&places[p]) {
+                end += len(vars[vi])
+                vi += 1
+            }
+            binary.addU32LE(mut &b, end)
+        }
+    }
+    for x in vars { b.add(x) }
+    return Some(b.toStr())
+}
+
+// decRowNeed for a row in the fixed layout.
+fn decFixed(s: &str, n: int, need: &[]bool, missing: &[]Val): Result[[]Val, DbErr] {
+    let lay = fixedLay(s)
+    return decFixedLay(s, n, need, missing, &lay)
+}
+
+// decFixed with the row's layout given (the table's, made once per fetch:
+// what a layout number would give from the catalog).
+fn decFixedLay(s: &str, n: int, need: &[]bool, missing: &[]Val, lay: &FixedLay): Result[[]Val, DbErr] {
+    let np = len(lay.sig) - 1
+    if lay.v0 > len(s) { return Err(lexdb_base.corrupt("a row's fixed part")) }
+    let some = len(need) > 0
+    var out: []Val = array(n, Val.Null)
+    for p in 0..n {
+        if p >= np {
+            if p < len(missing) { out[p] = missing[p] }
+            continue
+        }
+        if some && !need[p] { continue }
+        if (int(s[lay.bm + p / 8]) >> (p % 8)) & 1 == 1 { continue }
+        let k = lay.sig[1 + p]
+        let at = lay.off[p]
+        if k == PK_INT {
+            out[p] = Val.Int(binary.readI64LEStr(s, at))
+        } else if k == PK_BOOL {
+            out[p] = Val.Bool(s[at] == 1)
+        } else if k == PK_NUM || k == PK_TEXT {
+            let end = binary.readU32LEStr(s, at)
+            let start = if lay.prev[p] < 0 { 0 } else { binary.readU32LEStr(s, lay.prev[p]) }
+            let x = s[lay.v0 + start..lay.v0 + end]
+            if k == PK_TEXT {
+                out[p] = Val.Text(x)
+            } else {
+                match Decimal.parse(x) {
+                    Ok(d) { out[p] = Val.Num(d) }
+                    Err(_) { return Err(lexdb_base.corrupt("a numeric value in a row")) }
+                }
+            }
+        }
+    }
+    return Ok(out)
+}
+
+// A table's row as rowOf gives it, from a row in its current fixed layout.
+fn rowOfLay(t: &Table, s: &str, n: int, need: &[]bool, missing: &[]Val, lay: &FixedLay): Result[[]Val, DbErr] {
+    let places = try decFixedLay(s, n, need, missing, lay)
+    if len(t.slots) == 0 { return Ok(places) }
+    var out: []Val = []
+    for k in t.slots { append(mut &out, places[k]) }
+    return Ok(out)
+}
+
+// Where the batches read a place of fixed-layout rows: its offset in the
+// row, and for a variable-length value the offset of the previous one's end
+// (-1: it starts the variable part). Kept while rows have the same kinds.
+type FixedLay = record {
+    sig: []byte             // the place count and kinds this is for
+    off: []int              // per place
+    prev: []int
+    bm: int                 // the bitmap's offset
+    v0: int                 // the variable part's
+}
+
+fn fixedLay(s: &str): FixedLay {
+    var kinds: []byte = []
+    for i in 0..int(s[1]) { append(mut &kinds, s[2 + i]) }
+    return layOfKinds(&kinds)
+}
+
+// The layout of rows with these places' kinds.
+fn layOfKinds(kinds: &[]byte): FixedLay {
+    let np = len(kinds)
+    var sig: []byte = [byte(np)]
+    for k in kinds { append(mut &sig, k) }
+    let bm = 2 + np
+    var at = bm + (np + 7) / 8
+    var off: []int = array(np, 0)
+    var prev: []int = array(np, -1)
+    var lastVar = -1
+    for p in 0..np {
+        off[p] = at
+        let k = kinds[p]
+        if k == PK_NUM || k == PK_TEXT {
+            prev[p] = lastVar
+            lastVar = at
+        }
+        at += fixedSize(k)
+    }
+    return FixedLay{sig: sig, off: off, prev: prev, bm: bm, v0: at}
+}
+
+fn sameLay(s: &str, l: &FixedLay): bool {
+    let n = len(l.sig)
+    if n == 0 || len(s) < n + 1 { return false }
+    for i in 0..n { if s[1 + i] != l.sig[i] { return false } }
+    return true
 }
