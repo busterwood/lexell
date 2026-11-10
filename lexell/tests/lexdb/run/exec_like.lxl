@@ -1,0 +1,304 @@
+// lexdb_exec: LIKE, NOT LIKE, ILIKE and text compared with constants
+// (design/lexdb.md 9.52), over texts with multi-byte characters, empty and
+// NULL ones. Each pattern is used two ways: rows given (the first table's
+// scan in batches, string_agg not batched) and an aggregate over batches
+// (count with FILTER). Patterns of literal text and % are matched as bytes
+// (likePieces): their pieces at the start, the end and in between, with
+// overlaps; _, escapes and ILIKE go the general way. The expected lines
+// are PostgreSQL 16's own output for the same statements (psql -At).
+// expect: like |1|1
+// expect: like  cnt|1|1
+// expect: not like |2,3,4,5,6,7,8,9,10,11,12,13,14,15,16|15
+// expect: not like  cnt|15|15
+// expect: ilike |1
+// expect: like %|1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16|16
+// expect: like % cnt|16|16
+// expect: not like %||0
+// expect: not like % cnt|0|0
+// expect: ilike %|16
+// expect: like %%|1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16|16
+// expect: like %% cnt|16|16
+// expect: not like %%||0
+// expect: not like %% cnt|0|0
+// expect: ilike %%|16
+// expect: like a%|2,3,4,5,6,12,13,15,16|9
+// expect: like a% cnt|9|9
+// expect: not like a%|1,7,8,9,10,11,14|7
+// expect: not like a% cnt|7|7
+// expect: ilike a%|9
+// expect: like %a|2,9|2
+// expect: like %a cnt|2|2
+// expect: not like %a|1,3,4,5,6,7,8,10,11,12,13,14,15,16|14
+// expect: not like %a cnt|14|14
+// expect: ilike %a|2
+// expect: like %a%|2,3,4,5,6,7,9,12,13,15,16|11
+// expect: like %a% cnt|11|11
+// expect: not like %a%|1,8,10,11,14|5
+// expect: not like %a% cnt|5|5
+// expect: ilike %a%|11
+// expect: like a%b|3,4,5,12,13,15,16|7
+// expect: like a%b cnt|7|7
+// expect: not like a%b|1,2,6,7,8,9,10,11,14|9
+// expect: not like a%b cnt|9|9
+// expect: ilike a%b|7
+// expect: like a%b%c|6|1
+// expect: like a%b%c cnt|1|1
+// expect: not like a%b%c|1,2,3,4,5,7,8,9,10,11,12,13,14,15,16|15
+// expect: not like a%b%c cnt|15|15
+// expect: ilike a%b%c|1
+// expect: like %ab%ab%|4,12|2
+// expect: like %ab%ab% cnt|2|2
+// expect: not like %ab%ab%|1,2,3,5,6,7,8,9,10,11,13,14,15,16|14
+// expect: not like %ab%ab% cnt|14|14
+// expect: ilike %ab%ab%|2
+// expect: like é%|8,9|2
+// expect: like é% cnt|2|2
+// expect: not like é%|1,2,3,4,5,6,7,10,11,12,13,14,15,16|14
+// expect: not like é% cnt|14|14
+// expect: ilike é%|2
+// expect: like %本|10,11|2
+// expect: like %本 cnt|2|2
+// expect: not like %本|1,2,3,4,5,6,7,8,9,12,13,14,15,16|14
+// expect: not like %本 cnt|14|14
+// expect: ilike %本|2
+// expect: like 日%本|10,11|2
+// expect: like 日%本 cnt|2|2
+// expect: not like 日%本|1,2,3,4,5,6,7,8,9,12,13,14,15,16|14
+// expect: not like 日%本 cnt|14|14
+// expect: ilike 日%本|2
+// expect: like ab|3|1
+// expect: like ab cnt|1|1
+// expect: not like ab|1,2,4,5,6,7,8,9,10,11,12,13,14,15,16|15
+// expect: not like ab cnt|15|15
+// expect: ilike ab|1
+// expect: like abc%%|6|1
+// expect: like abc%% cnt|1|1
+// expect: not like abc%%|1,2,3,4,5,7,8,9,10,11,12,13,14,15,16|15
+// expect: not like abc%% cnt|15|15
+// expect: ilike abc%%|1
+// expect: like ab%ab|4,12|2
+// expect: like ab%ab cnt|2|2
+// expect: not like ab%ab|1,2,3,5,6,7,8,9,10,11,13,14,15,16|14
+// expect: not like ab%ab cnt|14|14
+// expect: ilike ab%ab|2
+// expect: like %b%b|4,5,12,16|4
+// expect: like %b%b cnt|4|4
+// expect: not like %b%b|1,2,3,6,7,8,9,10,11,13,14,15|12
+// expect: not like %b%b cnt|12|12
+// expect: ilike %b%b|4
+// expect: like a%%b|3,4,5,12,13,15,16|7
+// expect: like a%%b cnt|7|7
+// expect: not like a%%b|1,2,6,7,8,9,10,11,14|9
+// expect: not like a%%b cnt|9|9
+// expect: ilike a%%b|7
+// expect: like %ab|3,4,5,7,12,15|6
+// expect: like %ab cnt|6|6
+// expect: not like %ab|1,2,6,8,9,10,11,13,14,16|10
+// expect: not like %ab cnt|10|10
+// expect: ilike %ab|6
+// expect: like ab%|3,4,6,12,16|5
+// expect: like ab% cnt|5|5
+// expect: not like ab%|1,2,5,7,8,9,10,11,13,14,15|11
+// expect: not like ab% cnt|11|11
+// expect: ilike ab%|5
+// expect: like %x%|11,14|2
+// expect: like %x% cnt|2|2
+// expect: not like %x%|1,2,3,4,5,6,7,8,9,10,12,13,15,16|14
+// expect: not like %x% cnt|14|14
+// expect: ilike %x%|3
+// expect: like a_b|13,15,16|3
+// expect: like a_b cnt|3|3
+// expect: not like a_b|1,2,3,4,5,6,7,8,9,10,11,12,14|13
+// expect: not like a_b cnt|13|13
+// expect: ilike a_b|3
+// expect: like %b_|6,16|2
+// expect: like %b_ cnt|2|2
+// expect: not like %b_|1,2,3,4,5,7,8,9,10,11,12,13,14,15|14
+// expect: not like %b_ cnt|14|14
+// expect: ilike %b_|2
+// expect: like A%||0
+// expect: like A% cnt|0|0
+// expect: not like A%|1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16|16
+// expect: not like A% cnt|16|16
+// expect: ilike A%|9
+// expect: like a\%b|13|1
+// expect: like a\%b cnt|1|1
+// expect: not like a\%b|1,2,3,4,5,6,7,8,9,10,11,12,14,15,16|15
+// expect: not like a\%b cnt|15|15
+// expect: ilike a\%b|1
+// expect: like a#%b||0
+// expect: like a#%b cnt|0|0
+// expect: not like a#%b|1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16|16
+// expect: not like a#%b cnt|16|16
+// expect: ilike a#%b|0
+// expect: esc|1
+// expect: cmp|5
+// expect: cmp2|3,4,7,8,9,10,11,12,14,16
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            var out: []str = []
+            for r in rs {
+                for row in r.rows {
+                    var vs: []str = []
+                    for v in row { append(mut &vs, lexdb_exec.text(&v)) }
+                    append(mut &out, strings.join(&vs, "|"))
+                }
+            }
+            return strings.join(&out, "\n")
+        }
+        Err(e) { return "ERROR " + e.state + " " + e.msg }
+    }
+}
+
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: 1024 * 1024, segBytes: 4 * 1024 * 1024, ckptBytes: 2 * 1024 * 1024, snapNodes: 100000}
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(61), opts(), fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        let x0 = q(mut &s, &"create table ls (i int primary key, s text)")
+        let x1 = q(mut &s, &"insert into ls values (1, ''), (2, 'a'), (3, 'ab'), (4, 'abab'), (5, 'aXbXab'), (6, 'abc'), (7, 'cab'), (8, 'é'), (9, 'éa'), (10, '日本'), (11, '日x本'), (12, 'ababab'), (13, 'a%b'), (14, 'xyz'), (15, 'aab'), (16, 'abb'), (17, null)")
+        let x2 = q(mut &s, &"create table lp (j int primary key, p text)")
+        let x3 = q(mut &s, &"insert into lp values (1, ''), (2, '%'), (3, '%%'), (4, 'a%'), (5, '%a'), (6, '%a%'), (7, 'a%b'), (8, 'a%b%c'), (9, '%ab%ab%'), (10, 'é%'), (11, '%本'), (12, '日%本'), (13, 'ab'), (14, 'abc%%'), (15, 'ab%ab'), (16, '%b%b'), (17, 'a%%b'), (18, '%ab'), (19, 'ab%'), (20, '%x%'), (21, 'a_b'), (22, '%b_'), (23, null)")
+        let qs = [
+            "select 'like ', string_agg(i::text, ',' order by i), count(*) from ls where s like ''",
+            "select 'like  cnt', count(*), count(s) filter (where s like '') from ls where i > 0 and s like ''",
+            "select 'not like ', string_agg(i::text, ',' order by i), count(*) from ls where s not like ''",
+            "select 'not like  cnt', count(*), count(s) filter (where s not like '') from ls where i > 0 and s not like ''",
+            "select 'ilike ', count(*) from ls where s ilike ''",
+            "select 'like %', string_agg(i::text, ',' order by i), count(*) from ls where s like '%'",
+            "select 'like % cnt', count(*), count(s) filter (where s like '%') from ls where i > 0 and s like '%'",
+            "select 'not like %', string_agg(i::text, ',' order by i), count(*) from ls where s not like '%'",
+            "select 'not like % cnt', count(*), count(s) filter (where s not like '%') from ls where i > 0 and s not like '%'",
+            "select 'ilike %', count(*) from ls where s ilike '%'",
+            "select 'like %%', string_agg(i::text, ',' order by i), count(*) from ls where s like '%%'",
+            "select 'like %% cnt', count(*), count(s) filter (where s like '%%') from ls where i > 0 and s like '%%'",
+            "select 'not like %%', string_agg(i::text, ',' order by i), count(*) from ls where s not like '%%'",
+            "select 'not like %% cnt', count(*), count(s) filter (where s not like '%%') from ls where i > 0 and s not like '%%'",
+            "select 'ilike %%', count(*) from ls where s ilike '%%'",
+            "select 'like a%', string_agg(i::text, ',' order by i), count(*) from ls where s like 'a%'",
+            "select 'like a% cnt', count(*), count(s) filter (where s like 'a%') from ls where i > 0 and s like 'a%'",
+            "select 'not like a%', string_agg(i::text, ',' order by i), count(*) from ls where s not like 'a%'",
+            "select 'not like a% cnt', count(*), count(s) filter (where s not like 'a%') from ls where i > 0 and s not like 'a%'",
+            "select 'ilike a%', count(*) from ls where s ilike 'a%'",
+            "select 'like %a', string_agg(i::text, ',' order by i), count(*) from ls where s like '%a'",
+            "select 'like %a cnt', count(*), count(s) filter (where s like '%a') from ls where i > 0 and s like '%a'",
+            "select 'not like %a', string_agg(i::text, ',' order by i), count(*) from ls where s not like '%a'",
+            "select 'not like %a cnt', count(*), count(s) filter (where s not like '%a') from ls where i > 0 and s not like '%a'",
+            "select 'ilike %a', count(*) from ls where s ilike '%a'",
+            "select 'like %a%', string_agg(i::text, ',' order by i), count(*) from ls where s like '%a%'",
+            "select 'like %a% cnt', count(*), count(s) filter (where s like '%a%') from ls where i > 0 and s like '%a%'",
+            "select 'not like %a%', string_agg(i::text, ',' order by i), count(*) from ls where s not like '%a%'",
+            "select 'not like %a% cnt', count(*), count(s) filter (where s not like '%a%') from ls where i > 0 and s not like '%a%'",
+            "select 'ilike %a%', count(*) from ls where s ilike '%a%'",
+            "select 'like a%b', string_agg(i::text, ',' order by i), count(*) from ls where s like 'a%b'",
+            "select 'like a%b cnt', count(*), count(s) filter (where s like 'a%b') from ls where i > 0 and s like 'a%b'",
+            "select 'not like a%b', string_agg(i::text, ',' order by i), count(*) from ls where s not like 'a%b'",
+            "select 'not like a%b cnt', count(*), count(s) filter (where s not like 'a%b') from ls where i > 0 and s not like 'a%b'",
+            "select 'ilike a%b', count(*) from ls where s ilike 'a%b'",
+            "select 'like a%b%c', string_agg(i::text, ',' order by i), count(*) from ls where s like 'a%b%c'",
+            "select 'like a%b%c cnt', count(*), count(s) filter (where s like 'a%b%c') from ls where i > 0 and s like 'a%b%c'",
+            "select 'not like a%b%c', string_agg(i::text, ',' order by i), count(*) from ls where s not like 'a%b%c'",
+            "select 'not like a%b%c cnt', count(*), count(s) filter (where s not like 'a%b%c') from ls where i > 0 and s not like 'a%b%c'",
+            "select 'ilike a%b%c', count(*) from ls where s ilike 'a%b%c'",
+            "select 'like %ab%ab%', string_agg(i::text, ',' order by i), count(*) from ls where s like '%ab%ab%'",
+            "select 'like %ab%ab% cnt', count(*), count(s) filter (where s like '%ab%ab%') from ls where i > 0 and s like '%ab%ab%'",
+            "select 'not like %ab%ab%', string_agg(i::text, ',' order by i), count(*) from ls where s not like '%ab%ab%'",
+            "select 'not like %ab%ab% cnt', count(*), count(s) filter (where s not like '%ab%ab%') from ls where i > 0 and s not like '%ab%ab%'",
+            "select 'ilike %ab%ab%', count(*) from ls where s ilike '%ab%ab%'",
+            "select 'like é%', string_agg(i::text, ',' order by i), count(*) from ls where s like 'é%'",
+            "select 'like é% cnt', count(*), count(s) filter (where s like 'é%') from ls where i > 0 and s like 'é%'",
+            "select 'not like é%', string_agg(i::text, ',' order by i), count(*) from ls where s not like 'é%'",
+            "select 'not like é% cnt', count(*), count(s) filter (where s not like 'é%') from ls where i > 0 and s not like 'é%'",
+            "select 'ilike é%', count(*) from ls where s ilike 'é%'",
+            "select 'like %本', string_agg(i::text, ',' order by i), count(*) from ls where s like '%本'",
+            "select 'like %本 cnt', count(*), count(s) filter (where s like '%本') from ls where i > 0 and s like '%本'",
+            "select 'not like %本', string_agg(i::text, ',' order by i), count(*) from ls where s not like '%本'",
+            "select 'not like %本 cnt', count(*), count(s) filter (where s not like '%本') from ls where i > 0 and s not like '%本'",
+            "select 'ilike %本', count(*) from ls where s ilike '%本'",
+            "select 'like 日%本', string_agg(i::text, ',' order by i), count(*) from ls where s like '日%本'",
+            "select 'like 日%本 cnt', count(*), count(s) filter (where s like '日%本') from ls where i > 0 and s like '日%本'",
+            "select 'not like 日%本', string_agg(i::text, ',' order by i), count(*) from ls where s not like '日%本'",
+            "select 'not like 日%本 cnt', count(*), count(s) filter (where s not like '日%本') from ls where i > 0 and s not like '日%本'",
+            "select 'ilike 日%本', count(*) from ls where s ilike '日%本'",
+            "select 'like ab', string_agg(i::text, ',' order by i), count(*) from ls where s like 'ab'",
+            "select 'like ab cnt', count(*), count(s) filter (where s like 'ab') from ls where i > 0 and s like 'ab'",
+            "select 'not like ab', string_agg(i::text, ',' order by i), count(*) from ls where s not like 'ab'",
+            "select 'not like ab cnt', count(*), count(s) filter (where s not like 'ab') from ls where i > 0 and s not like 'ab'",
+            "select 'ilike ab', count(*) from ls where s ilike 'ab'",
+            "select 'like abc%%', string_agg(i::text, ',' order by i), count(*) from ls where s like 'abc%%'",
+            "select 'like abc%% cnt', count(*), count(s) filter (where s like 'abc%%') from ls where i > 0 and s like 'abc%%'",
+            "select 'not like abc%%', string_agg(i::text, ',' order by i), count(*) from ls where s not like 'abc%%'",
+            "select 'not like abc%% cnt', count(*), count(s) filter (where s not like 'abc%%') from ls where i > 0 and s not like 'abc%%'",
+            "select 'ilike abc%%', count(*) from ls where s ilike 'abc%%'",
+            "select 'like ab%ab', string_agg(i::text, ',' order by i), count(*) from ls where s like 'ab%ab'",
+            "select 'like ab%ab cnt', count(*), count(s) filter (where s like 'ab%ab') from ls where i > 0 and s like 'ab%ab'",
+            "select 'not like ab%ab', string_agg(i::text, ',' order by i), count(*) from ls where s not like 'ab%ab'",
+            "select 'not like ab%ab cnt', count(*), count(s) filter (where s not like 'ab%ab') from ls where i > 0 and s not like 'ab%ab'",
+            "select 'ilike ab%ab', count(*) from ls where s ilike 'ab%ab'",
+            "select 'like %b%b', string_agg(i::text, ',' order by i), count(*) from ls where s like '%b%b'",
+            "select 'like %b%b cnt', count(*), count(s) filter (where s like '%b%b') from ls where i > 0 and s like '%b%b'",
+            "select 'not like %b%b', string_agg(i::text, ',' order by i), count(*) from ls where s not like '%b%b'",
+            "select 'not like %b%b cnt', count(*), count(s) filter (where s not like '%b%b') from ls where i > 0 and s not like '%b%b'",
+            "select 'ilike %b%b', count(*) from ls where s ilike '%b%b'",
+            "select 'like a%%b', string_agg(i::text, ',' order by i), count(*) from ls where s like 'a%%b'",
+            "select 'like a%%b cnt', count(*), count(s) filter (where s like 'a%%b') from ls where i > 0 and s like 'a%%b'",
+            "select 'not like a%%b', string_agg(i::text, ',' order by i), count(*) from ls where s not like 'a%%b'",
+            "select 'not like a%%b cnt', count(*), count(s) filter (where s not like 'a%%b') from ls where i > 0 and s not like 'a%%b'",
+            "select 'ilike a%%b', count(*) from ls where s ilike 'a%%b'",
+            "select 'like %ab', string_agg(i::text, ',' order by i), count(*) from ls where s like '%ab'",
+            "select 'like %ab cnt', count(*), count(s) filter (where s like '%ab') from ls where i > 0 and s like '%ab'",
+            "select 'not like %ab', string_agg(i::text, ',' order by i), count(*) from ls where s not like '%ab'",
+            "select 'not like %ab cnt', count(*), count(s) filter (where s not like '%ab') from ls where i > 0 and s not like '%ab'",
+            "select 'ilike %ab', count(*) from ls where s ilike '%ab'",
+            "select 'like ab%', string_agg(i::text, ',' order by i), count(*) from ls where s like 'ab%'",
+            "select 'like ab% cnt', count(*), count(s) filter (where s like 'ab%') from ls where i > 0 and s like 'ab%'",
+            "select 'not like ab%', string_agg(i::text, ',' order by i), count(*) from ls where s not like 'ab%'",
+            "select 'not like ab% cnt', count(*), count(s) filter (where s not like 'ab%') from ls where i > 0 and s not like 'ab%'",
+            "select 'ilike ab%', count(*) from ls where s ilike 'ab%'",
+            "select 'like %x%', string_agg(i::text, ',' order by i), count(*) from ls where s like '%x%'",
+            "select 'like %x% cnt', count(*), count(s) filter (where s like '%x%') from ls where i > 0 and s like '%x%'",
+            "select 'not like %x%', string_agg(i::text, ',' order by i), count(*) from ls where s not like '%x%'",
+            "select 'not like %x% cnt', count(*), count(s) filter (where s not like '%x%') from ls where i > 0 and s not like '%x%'",
+            "select 'ilike %x%', count(*) from ls where s ilike '%x%'",
+            "select 'like a_b', string_agg(i::text, ',' order by i), count(*) from ls where s like 'a_b'",
+            "select 'like a_b cnt', count(*), count(s) filter (where s like 'a_b') from ls where i > 0 and s like 'a_b'",
+            "select 'not like a_b', string_agg(i::text, ',' order by i), count(*) from ls where s not like 'a_b'",
+            "select 'not like a_b cnt', count(*), count(s) filter (where s not like 'a_b') from ls where i > 0 and s not like 'a_b'",
+            "select 'ilike a_b', count(*) from ls where s ilike 'a_b'",
+            "select 'like %b_', string_agg(i::text, ',' order by i), count(*) from ls where s like '%b_'",
+            "select 'like %b_ cnt', count(*), count(s) filter (where s like '%b_') from ls where i > 0 and s like '%b_'",
+            "select 'not like %b_', string_agg(i::text, ',' order by i), count(*) from ls where s not like '%b_'",
+            "select 'not like %b_ cnt', count(*), count(s) filter (where s not like '%b_') from ls where i > 0 and s not like '%b_'",
+            "select 'ilike %b_', count(*) from ls where s ilike '%b_'",
+            "select 'like A%', string_agg(i::text, ',' order by i), count(*) from ls where s like 'A%'",
+            "select 'like A% cnt', count(*), count(s) filter (where s like 'A%') from ls where i > 0 and s like 'A%'",
+            "select 'not like A%', string_agg(i::text, ',' order by i), count(*) from ls where s not like 'A%'",
+            "select 'not like A% cnt', count(*), count(s) filter (where s not like 'A%') from ls where i > 0 and s not like 'A%'",
+            "select 'ilike A%', count(*) from ls where s ilike 'A%'",
+            "select 'like a\\%b', string_agg(i::text, ',' order by i), count(*) from ls where s like 'a\\%b'",
+            "select 'like a\\%b cnt', count(*), count(s) filter (where s like 'a\\%b') from ls where i > 0 and s like 'a\\%b'",
+            "select 'not like a\\%b', string_agg(i::text, ',' order by i), count(*) from ls where s not like 'a\\%b'",
+            "select 'not like a\\%b cnt', count(*), count(s) filter (where s not like 'a\\%b') from ls where i > 0 and s not like 'a\\%b'",
+            "select 'ilike a\\%b', count(*) from ls where s ilike 'a\\%b'",
+            "select 'like a#%b', string_agg(i::text, ',' order by i), count(*) from ls where s like 'a#%b'",
+            "select 'like a#%b cnt', count(*), count(s) filter (where s like 'a#%b') from ls where i > 0 and s like 'a#%b'",
+            "select 'not like a#%b', string_agg(i::text, ',' order by i), count(*) from ls where s not like 'a#%b'",
+            "select 'not like a#%b cnt', count(*), count(s) filter (where s not like 'a#%b') from ls where i > 0 and s not like 'a#%b'",
+            "select 'ilike a#%b', count(*) from ls where s ilike 'a#%b'",
+            "select 'esc', count(*) from ls where s like 'a#%b' escape '#'",
+            "select 'cmp', count(*) from ls where s < 'ab'",
+            "select 'cmp2', string_agg(i::text, ',' order by i) from ls where 'ab' <= s and s <> 'abc'"
+        ]
+        for x in qs { println(q(mut &s, &x)) }
+        return 0
+    }).unwrap()
+}

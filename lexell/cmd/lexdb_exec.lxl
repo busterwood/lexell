@@ -852,13 +852,79 @@ fn intArg(v: Val, fname: &str): Result[int, DbErr] {
     }
 }
 
+// Whether LIKE pattern pat is literal text and % only (no _, no escape
+// character): matched as bytes (likePieces). UTF-8 text matches a literal
+// piece only at a character's start, so bytes give what characters do.
+fn likeSimple(pat: &str, esc: &str): bool {
+    for i in 0..len(pat) { if pat[i] == '_' { return false } }
+    if len(esc) == 0 { return true }
+    var i = 0
+    while i + len(esc) <= len(pat) {
+        if bytesAt(pat, i, esc) { return false }
+        i += 1
+    }
+    return true
+}
+
+// pat's pieces between its %s ("a%b%" gives "a", "b", "").
+fn likeSplit(pat: &str): []str {
+    var out: []str = []
+    var from = 0
+    for i in 0..len(pat) {
+        if pat[i] == '%' {
+            append(mut &out, pat[from..i])
+            from = i + 1
+        }
+    }
+    append(mut &out, pat[from..len(pat)])
+    return out
+}
+
+fn bytesAt(s: &str, at: int, p: &str): bool {
+    if at < 0 || at + len(p) > len(s) { return false }
+    for i in 0..len(p) { if s[at + i] != p[i] { return false } }
+    return true
+}
+
+// Whether s matches the pattern of these pieces (likeSplit): the first at
+// its start, the last at its end, the others in order between, each at the
+// first place it is found.
+fn likePieces(s: &str, ps: &[]str): bool {
+    let n = len(ps)
+    if n == 1 { return len(s) == len(ps[0]) && bytesAt(s, 0, &ps[0]) }
+    let first = &ps[0]
+    let last = &ps[n - 1]
+    if len(s) < len(first) + len(last) { return false }
+    if !bytesAt(s, 0, first) || !bytesAt(s, len(s) - len(last), last) { return false }
+    var at = len(first)
+    let end = len(s) - len(last)
+    for k in 1..n - 1 {
+        let p = &ps[k]
+        if len(p) == 0 { continue }
+        var found = -1
+        var i = at
+        while i + len(p) <= end {
+            if s[i] == p[0] && bytesAt(s, i, p) {
+                found = i
+                break
+            }
+            i += 1
+        }
+        if found < 0 { return false }
+        at = found + len(p)
+    }
+    return true
+}
+
 // LIKE: % any run of characters, _ one character, the escape character
 // (backslash unless given; '' for none) before either for itself.
 fn likeMatch(s: str, pat: str, esc: str, fold: bool): Result[bool, DbErr] {
-    let sr = strings.runes(if fold { strings.toLowerAscii(s) } else { s })
-    let pr = strings.runes(if fold { strings.toLowerAscii(pat) } else { pat })
     let er = strings.runes(esc)
     if len(er) > 1 { return Err(e("22019", "invalid escape string")) }
+    // literal text and % only: its pieces, found in order as bytes (9.52)
+    if !fold && likeSimple(&pat, &esc) { return Ok(likePieces(&s, &likeSplit(&pat))) }
+    let sr = strings.runes(if fold { strings.toLowerAscii(s) } else { s })
+    let pr = strings.runes(if fold { strings.toLowerAscii(pat) } else { pat })
     let ec = if len(er) == 1 { er[0] } else { -1 }
     var kind: []int = []            // 0 a character, 1 _, 2 %
     var lit: []int = []
@@ -3147,7 +3213,12 @@ fn runLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Ma
     let lv = &q.levels[k]
     var matched = false
     rs.cnt[k].starts += 1
-    if !lv.perRow {
+    // the first level scanned in batches (9.52), or -1
+    let bl = if k == 0 { try batchLevel(st, txn, q, m, row, params, emit, rs, mut &matched) } else { -1 }
+    if bl == 1 { return Ok(false) }
+    if bl == 0 {
+        // done: its rows went on
+    } else if !lv.perRow {
         var kb = newStrBuf()
         var nul = false
         {
@@ -6724,6 +6795,30 @@ fn orderX(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, o: &Expr
     return orderValue(o, outs, vals, env)
 }
 
+// How ORDER BY places rows with sort values a and b: negative a first.
+fn ordCmp(sel: &Sel, a: &[]Val, b: &[]Val): int {
+    for i in 0..len(sel.desc) {
+        let na = isNull(&a[i])
+        let nb = isNull(&b[i])
+        if na && nb { continue }
+        if na { return if sel.nullsFirst[i] { -1 } else { 1 } }
+        if nb { return if sel.nullsFirst[i] { 1 } else { -1 } }
+        var c = sortCmp(&a[i], &b[i])
+        if sel.desc[i] { c = -c }
+        if c != 0 { return c }
+    }
+    return 0
+}
+
+// Top-N (9.52): rows sorted and cut to the first k, in the order the full
+// sort gives (sortBy is stable, and the rows kept came before those added
+// after them). The last one's sort values, for the rows to come.
+fn keepFirst(sel: &Sel, rows: mut &[]OutRow, k: int): []Val {
+    collections.sortBy(rows, fn(a: &OutRow, b: &OutRow): int { return ordCmp(sel, &a.ord, &b.ord) })
+    while len(rows) > k { let gone = pop(rows) }
+    return copyRow(&rows[len(rows) - 1].ord)
+}
+
 // Runs a planned SELECT. cap >= 0: at most that many rows are wanted (a
 // subquery: EXISTS 1, in any order; a scalar 2).
 fn execSel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params: &[]Val, cap: int,
@@ -6868,6 +6963,11 @@ fn execSel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
             append(mut &outRows, OutRow{vals: vals, ord: ord})
         }
     } else {
+        // ORDER BY with LIMIT: only the first limit + offset rows are kept
+        // (top-N); a row that sorts after the last of them is dropped
+        let topK = if sorting && limit >= 0 && !sel.distinct { limit + max(offset, 0) } else { -1 }
+        var bar: []Val = []                 // the last kept row's sort values, once cut
+        var barSet = false
         try runQuery(st, txn, q, &m, params, fn(r: &[]Val): Result[bool, DbErr] {
             let env = Env{cols: &q.cols, row: r, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: sqe}
             var vals: []Val = []
@@ -6879,9 +6979,20 @@ fn execSel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
             }
             var ord: []Val = []
             if sorting { for o in sel.order { append(mut &ord, try orderValue(&o, &sel.outs, &vals, &env)) } }
+            if topK >= 0 {
+                if topK == 0 { return Ok(true) }
+                // after the last kept, or tied with it: the full sort puts it after
+                if barSet && ordCmp(sel, &ord, &bar) >= 0 { return Ok(true) }
+            }
             held += rowBytes(&vals) + rowBytes(&ord)
             if room >= 0 && held > room { return Err(memErr(rs0max)) }
             append(mut &outRows, OutRow{vals: vals, ord: ord})
+            if topK > 0 && len(outRows) >= 2 * topK + 16 {
+                bar = keepFirst(sel, mut &outRows, topK)
+                barSet = true
+                held = 0
+                for o in outRows { held += rowBytes(&o.vals) + rowBytes(&o.ord) }
+            }
             return Ok(!early || len(outRows) < stopAt)
         }, rs)
     }
@@ -6906,21 +7017,7 @@ fn execSel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
         }
     }
     try rs.hold(held)
-    if sorting {
-        collections.sortBy(mut &outRows, fn(a: &OutRow, b: &OutRow): int {
-            for i in 0..len(sel.desc) {
-                let na = isNull(&a.ord[i])
-                let nb = isNull(&b.ord[i])
-                if na && nb { continue }
-                if na { return if sel.nullsFirst[i] { -1 } else { 1 } }
-                if nb { return if sel.nullsFirst[i] { 1 } else { -1 } }
-                var c = sortCmp(&a.ord[i], &b.ord[i])
-                if sel.desc[i] { c = -c }
-                if c != 0 { return c }
-            }
-            return 0
-        })
-    }
+    if sorting { collections.sortBy(mut &outRows, fn(a: &OutRow, b: &OutRow): int { return ordCmp(sel, &a.ord, &b.ord) }) }
     var outs: []OutCol = []
     for oc in sel.outs { append(mut &outs, oc) }
     var res = Res{cols: outs, rows: [], tag: "", hasRows: true, copy: COPY_NONE}
@@ -9897,6 +9994,7 @@ const BROWS = 1024
 const BK_INT = 0        // a column's kind in a batch: an integer ...
 const BK_BOOL = 1       // ... a boolean (0, 1) ...
 const BK_VAL = 2        // ... or any other, as values
+const BK_NONE = -1      // a query's column not in the batch (of another table)
 
 const BT_INT = 0        // an expression's type in a batch
 const BT_BOOL = 1
@@ -9934,6 +10032,18 @@ type BNode = closed {
     Or(BNode, BNode)
     Not(BNode)
     IsNull(BNode, bool)     // true: IS NOT NULL
+    // a column of values (BK_VAL) compared with a constant, as eval
+    // compares them (compare); true: the constant on the left
+    ValCmp(int, int, Val, bool)
+    Like(int, LikePat)      // a column of values LIKE (ILIKE) a constant pattern
+}
+
+type LikePat = record {
+    pat: str
+    esc: str
+    fold: bool              // ILIKE
+    simple: bool            // literal text and % only (likeSimple): pieces
+    pieces: []str
 }
 
 type BComp = record {
@@ -10020,7 +10130,8 @@ fn bCompile(x: &Expr, q: &Query, kinds: &[]int, env: &Env): Option[BComp] {
     match x {
         Expr.Col(name) {
             let i = colIndex(&q.cols, &name)
-            if i < 0 { return None }
+            // (a column of another table than the one batched: BK_NONE)
+            if i < 0 || i >= len(kinds) || kinds[i] == BK_NONE { return None }
             let k = kinds[i]
             return Some(BComp{n: BNode.Col(i), typ: if k == BK_INT { BT_INT } else if k == BK_BOOL { BT_BOOL } else { BT_OTHER }})
         }
@@ -10034,6 +10145,8 @@ fn bCompile(x: &Expr, q: &Query, kinds: &[]int, env: &Env): Option[BComp] {
             return None
         }
         Expr.Bin(op, a, b) {
+            let vc = bValCmp(&op, &a, &b, q, kinds, env)
+            if vc.isSome() { return vc }
             let ca = bCompile(&a, q, kinds, env)
             if ca.isNone() { return None }
             let cb = bCompile(&b, q, kinds, env)
@@ -10064,7 +10177,60 @@ fn bCompile(x: &Expr, q: &Query, kinds: &[]int, env: &Env): Option[BComp] {
             if ca.isNone() { return None }
             return Some(BComp{n: BNode.IsNull(takeN(ca.unwrap()), neg), typ: BT_BOOL})
         }
+        Expr.Call(name, args, star) {
+            if star || (name != "like" && name != "ilike") || len(args) < 2 || len(args) > 3 { return None }
+            let c = bValCol(&args[0], q, kinds)
+            if c < 0 { return None }
+            var cs: []Val = []
+            for i in 1..len(args) {
+                if !bConst(&args[i]) { return None }
+                match eval(&args[i], env) {
+                    Ok(v) { append(mut &cs, v) }
+                    Err(_) { return None }
+                }
+            }
+            for v in cs { if isNull(&v) { return Some(BComp{n: BNode.Const(0, true), typ: BT_NULL}) } }
+            let pat = text(&cs[0])
+            let esc = if len(cs) > 1 { text(&cs[1]) } else { "\\" }
+            let fold = name == "ilike"
+            let simple = !fold && likeSimple(&pat, &esc) && len(strings.runes(esc)) <= 1
+            let pieces = if simple { likeSplit(&pat) } else { [] }
+            return Some(BComp{n: BNode.Like(c, LikePat{pat: pat, esc: esc, fold: fold, simple: simple, pieces: pieces}), typ: BT_BOOL})
+        }
         else { return None }
+    }
+}
+
+// The batch column of x when it is a column of values (BK_VAL), else -1.
+fn bValCol(x: &Expr, q: &Query, kinds: &[]int): int {
+    match x {
+        Expr.Col(name) {
+            let i = colIndex(&q.cols, &name)
+            if i < 0 || i >= len(kinds) || kinds[i] != BK_VAL { return -1 }
+            return i
+        }
+        else { return -1 }
+    }
+}
+
+// a op b, one a column of values and the other a constant (its value made
+// once): ValCmp. None otherwise, or when the constant gives an error (the
+// row path gives it).
+fn bValCmp(op: &str, a: &Expr, b: &Expr, q: &Query, kinds: &[]int, env: &Env): Option[BComp] {
+    let cc = cmpCode(op)
+    if cc < 0 { return None }
+    let ca = bValCol(a, q, kinds)
+    if ca >= 0 { return bValCmpOf(cc, ca, b, false, env) }
+    let cb = bValCol(b, q, kinds)
+    if cb >= 0 { return bValCmpOf(cc, cb, a, true, env) }
+    return None
+}
+
+fn bValCmpOf(cc: int, c: int, k: &Expr, left: bool, env: &Env): Option[BComp] {
+    if !bConst(k) { return None }
+    match eval(k, env) {
+        Ok(v) { return Some(BComp{n: BNode.ValCmp(cc, c, v, left), typ: BT_BOOL}) }
+        Err(_) { return None }
     }
 }
 
@@ -10136,6 +10302,42 @@ fn bEval(n: &BNode, b: &Batch, idx: &[]int): Result[BVec, DbErr] {
                 }
             }
             return Ok(a)
+        }
+        BNode.ValCmp(op, c, k, left) {
+            var out = bvec(m)
+            let kn = isNull(&k)
+            for j in 0..m {
+                let r = idx[j]
+                if kn || b.cols[c].nul[r] {
+                    out.nul[j] = true
+                    continue
+                }
+                let x = if left { try compare(&k, &b.vals[c][r]) } else { try compare(&b.vals[c][r], &k) }
+                let t = if op == 0 { x == 0 } else if op == 1 { x != 0 } else if op == 2 { x < 0 } else if op == 3 { x <= 0 }
+                        else if op == 4 { x > 0 } else { x >= 0 }
+                out.v[j] = if t { 1 } else { 0 }
+            }
+            return Ok(out)
+        }
+        BNode.Like(c, lp) {
+            var out = bvec(m)
+            for j in 0..m {
+                let r = idx[j]
+                if b.cols[c].nul[r] {
+                    out.nul[j] = true
+                    continue
+                }
+                let hit = if lp.simple {
+                    match b.vals[c][r] {
+                        Val.Text(x) { likePieces(&x, &lp.pieces) }
+                        else { likePieces(&text(&b.vals[c][r]), &lp.pieces) }
+                    }
+                } else {
+                    try likeMatch(text(&b.vals[c][r]), lp.pat, lp.esc, lp.fold)
+                }
+                out.v[j] = if hit { 1 } else { 0 }
+            }
+            return Ok(out)
         }
         BNode.Cmp(op, x, y) {
             var a = try bEval(&x, b, idx)
@@ -10580,6 +10782,8 @@ fn bColsOf(n: &BNode, used: mut &[]bool) {
         }
         BNode.Not(a) { bColsOf(&a, used) }
         BNode.IsNull(a, _) { bColsOf(&a, used) }
+        BNode.ValCmp(_, c, _, _) { used[c] = true }
+        BNode.Like(c, _) { used[c] = true }
     }
 }
 
@@ -10643,6 +10847,125 @@ fn bAccum(sp: &BSpec, b: &Batch, rows: &[]int, gids: &[]int, one: bool, cn: mut 
         cn[g] += 1
     }
     return Ok(Unit{})
+}
+
+// Scans the first level's table in batches (9.52): the level's
+// conditions that batches can evaluate pick the rows, and only those are
+// made into rows and go on as the row path's would (tryRow, which checks
+// all the level's conditions). -1: not a level the batches scan (nothing
+// done); 0 done; 1 done, emit asked to stop. matched: whether a row went
+// on. A batch with a value its column's batch cannot hold, or whose
+// conditions give an error on one of its rows, ends the batches: the row
+// path reads the rest of that scan from the batch's start (and gives the
+// error only if it gets to that row).
+fn batchLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Mats, row: mut &[]Val,
+              params: &[]Val, emit: &fn(&[]Val): Result[bool, DbErr], rs: mut &Run, matched: mut &bool): Result[int, DbErr] {
+    if !rs.batch || len(q.levels) == 0 { return Ok(-1) }
+    let lv = &q.levels[0]
+    if lv.first != 0 || !lv.perRow || lv.lateral || lv.virt() || (q.corr && pathCorr(&lv.path)) { return Ok(-1) }
+    let p = &lv.path
+    if p.index >= 0 || p.desc || len(p.ins) > 0 || p.inSub >= 0 || len(p.inArr) > 0 { return Ok(-1) }
+    let t = &lv.t
+    var kinds: []int = []
+    for c in t.cols { append(mut &kinds, colKind(&c)) }
+    var qkinds: []int = array(len(q.cols), BK_NONE)
+    for i in 0..len(t.cols) { qkinds[i] = kinds[i] }
+    let noAggs: []Val = []
+    let env = Env{cols: &q.cols, row: row, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: None}
+    // the conditions batches evaluate. Any of them, in any order: tryRow
+    // checks every condition on the rows they keep, and a batch on one of
+    // whose rows one gives an error goes to the row path, which tries them
+    // in order (an error the row path would not reach is not given).
+    var conds: []BNode = []
+    for x in lv.cond {
+        let c = bCompile(&x, q, &qkinds, &env)
+        if c.isNone() { continue }
+        let cc = c.unwrap()
+        if !boolLike(cc.typ) { continue }
+        append(mut &conds, takeN(cc))
+    }
+    if len(conds) == 0 { return Ok(-1) }
+    var needCol: []bool = []
+    for i in 0..len(t.cols) { append(mut &needCol, len(lv.need) == 0 || lv.need[i]) }
+    let part = len(lv.need) > 0
+    let width = rowWidth(t)
+    var placeCol: []int = array(width, -1)
+    for i in 0..len(t.cols) {
+        if needCol[i] { placeCol[if len(t.slots) == 0 { i } else { t.slots[i] }] = i }
+    }
+    var usedP: []int = []
+    for pl in 0..width { if placeCol[pl] >= 0 { append(mut &usedP, pl) } }
+    let stopAt = if len(usedP) == 0 { 0 } else { usedP[len(usedP) - 1] + 1 }
+    var needList: []bool = []
+    for x in lv.need { append(mut &needList, x) }
+    let bp = BPlan{kinds: kinds, needCol: needCol, placeCol: placeCol, usedP: usedP, stopAt: stopAt,
+                   missing: placesMissing(t), needP: placesNeeded(t, &needList), width: width}
+    let scans = try pathScans(t, p, &env)
+    // key lookups: a row each, not worth a batch
+    var ranges = false
+    for sc in scans { if !sc.point && !sc.empty { ranges = true } }
+    if !ranges { return Ok(-1) }
+    for sc in scans {
+        var cur = newCursor()
+        var rowPath = false
+        while !cur.done {
+            let saved = Cursor{at: cur.at, started: cur.started, done: cur.done}
+            let got = try fillBatch(st, txn, t, &sc, part, mut &cur, &bp)
+            if got.isNone() {
+                cur = saved
+                rowPath = true
+                break
+            }
+            let b = got.unwrap()
+            let nr = b.n
+            if nr == 0 { continue }
+            var idx: []int = []
+            for r in 0..nr { append(mut &idx, r) }
+            var failed = false
+            for c in conds {
+                if len(idx) == 0 { break }
+                match bTrue(&c, &b, &idx) {
+                    Ok(pos) {
+                        var next: []int = []
+                        for j in pos { append(mut &next, idx[j]) }
+                        idx = next
+                    }
+                    Err(_) {
+                        failed = true
+                        break
+                    }
+                }
+            }
+            if failed {
+                // an error on some row of the batch: the row path reads it,
+                // and gives the error only if it gets to that row (a LIMIT
+                // may stop it first)
+                cur = saved
+                rowPath = true
+                break
+            }
+            rs.cnt[0].batches += 1
+            // the rows dropped count as read, as the row path counts them
+            try rs.tickN(nr - len(idx))
+            rs.cnt[0].read += nr - len(idx)
+            for j in idx {
+                let r = bRow(&b, j, &bp.kinds, &bp.needCol)
+                let got2 = try tryRow(st, txn, q, m, 0, &r, -1, row, params, emit, rs)
+                if got2 < 0 { return Ok(1) }
+                if got2 > 0 { matched = true }
+            }
+        }
+        while rowPath && !cur.done {
+            var batch: [][]Val = []
+            try fetch(st, txn, t, p, &sc, &lv.need, mut &cur, mut &batch)
+            for r in batch {
+                let got2 = try tryRow(st, txn, q, m, 0, &r, -1, row, params, emit, rs)
+                if got2 < 0 { return Ok(1) }
+                if got2 > 0 { matched = true }
+            }
+        }
+    }
+    return Ok(0)
 }
 
 // Runs sel's grouping over batches into gs; false: the query is not one

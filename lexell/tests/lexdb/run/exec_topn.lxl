@@ -1,0 +1,114 @@
+// lexdb_exec: ORDER BY with LIMIT keeps only the first rows (top-N,
+// design/lexdb.md 9.52). Each random query, with LIMIT and OFFSET, must
+// give exactly the rows of the same query without them, sorted in full,
+// from OFFSET on: ties in the order the full sort leaves them, NULLs where
+// NULLS FIRST or LAST puts them.
+// - A table of 3,000 rows whose sort keys have many ties and NULLs (an
+//   integer of 7 values, a boolean, a text of 5, a numeric), so the rows
+//   kept are cut many times over.
+// - ORDER BY one to three keys, ASC or DESC, NULLS FIRST or LAST,
+//   expressions, output columns by number; LIMIT 0 to 60, OFFSET 0 to 30;
+//   WHERE sometimes; a join; batches on and off.
+// expect: 300 queries, 300 the same as the full sort's rows; 0 errors, 300 with rows past LIMIT + OFFSET
+// expect: limit 0: 0 rows, limit past the end: 3000 rows
+import "strings"
+import "../../../cmd/lexdb_base"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+
+// The rows of sql, each as "v|v|v", or the error.
+fn rows(s: mut &lexdb_exec.Session, sql: &str): []str {
+    var out: []str = []
+    match s.exec(sql) {
+        Ok(rs) {
+            for r in rs {
+                for row in r.rows {
+                    var vs: []str = []
+                    for v in row { append(mut &vs, lexdb_exec.text(&v)) }
+                    append(mut &out, strings.join(&vs, "|"))
+                }
+            }
+        }
+        Err(e) { append(mut &out, "ERROR " + e.state + " " + e.msg) }
+    }
+    return out
+}
+
+fn pick(r: mut &lexdb_base.Rng, xs: &[]str): str { return xs[r.below(len(xs))] }
+
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: 1024 * 1024, segBytes: 4 * 1024 * 1024, ckptBytes: 2 * 1024 * 1024, snapNodes: 100000}
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(53), opts(), fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        var r = lexdb_base.rng(53)
+        let c1 = rows(mut &s, &"create table t (id int primary key, a int, f boolean, x text, n numeric(6,2), b bigint)")
+        let c2 = rows(mut &s, &"create table u (uid int primary key, label text)")
+        let c3 = rows(mut &s, &"insert into u select i, 'u' || (i % 3) from generate_series(0, 6) as g(i)")
+        var id = 1
+        for chunk in 0..30 {
+            var vs: []str = []
+            for i in 0..100 {
+                let a = if r.below(8) == 0 { "null" } else { r.below(7).toStr() }
+                let f = if r.below(6) == 0 { "null" } else if r.below(2) == 0 { "true" } else { "false" }
+                let x = if r.below(9) == 0 { "null" } else { "'x" + r.below(5).toStr() + "'" }
+                let n = if r.below(7) == 0 { "null" } else { r.below(40).toStr() + "." + r.below(4).toStr() + "5" }
+                append(mut &vs, "(" + id.toStr() + ", " + a + ", " + f + ", " + x + ", " + n + ", " + r.below(1000).toStr() + ")")
+                id += 1
+            }
+            let ins = rows(mut &s, &("insert into t values " + strings.join(&vs, ", ")))
+        }
+        let keys = ["a", "f", "x", "n", "b", "a + b % 3", "-a", "x || 'y'", "1", "2", "3"]
+        let dirs = ["", " asc", " desc"]
+        let nulls = ["", "", " nulls first", " nulls last"]
+        var same = 0
+        var failed = 0
+        var cut = 0             // queries with more rows than LIMIT + OFFSET: rows dropped
+        for i in 0..300 {
+            var ks: []str = []
+            for j in 0..1 + r.below(3) { append(mut &ks, pick(mut &r, &keys) + pick(mut &r, &dirs) + pick(mut &r, &nulls)) }
+            let joined = r.below(6) == 0
+            var base = if joined { "select t.id, t.a, u.label, t.x from t join u on u.uid = t.a" } else { "select id, a, f, x, n, b from t" }
+            if r.below(3) == 0 { base = base + " where b % " + (2 + r.below(4)).toStr() + " = 0" }
+            // the key columns qualified where the join needs it
+            var order = strings.join(&ks, ", ")
+            if joined {
+                for c in ["a", "f", "x", "n", "b"] { order = strings.replaceAll(order, c + " ", "t." + c + " ") }
+            }
+            let full = base + " order by " + order + ", id"
+            let lim = r.below(61)
+            let off = r.below(31)
+            let mode = if r.below(2) == 0 { "on" } else { "off" }
+            let sw = rows(mut &s, &("set lexdb_batch = " + mode))
+            // the id last makes the full order total: the same rows either way
+            let all = rows(mut &s, &full)
+            let top = rows(mut &s, &(full + " limit " + lim.toStr() + " offset " + off.toStr()))
+            // and without the id: ties among the rows kept as the full sort leaves them
+            let full2 = base + " order by " + order
+            let all2 = rows(mut &s, &full2)
+            let top2 = rows(mut &s, &(full2 + " limit " + lim.toStr() + " offset " + off.toStr()))
+            var want: []str = []
+            for k in off..min(off + lim, len(all)) { append(mut &want, all[k]) }
+            var want2: []str = []
+            for k in off..min(off + lim, len(all2)) { append(mut &want2, all2[k]) }
+            let ok = strings.join(&top, ";") == strings.join(&want, ";") && strings.join(&top2, ";") == strings.join(&want2, ";")
+            if len(all) > 0 && strings.startsWith(all[0], "ERROR") { failed += 1 }
+            if len(all) > lim + off { cut += 1 }
+            if ok { same += 1 } else {
+                println("DIFFERENT: " + full2 + " limit " + lim.toStr() + " offset " + off.toStr())
+                println("  top-N: " + strings.join(&top2, "; "))
+                println("  sort:  " + strings.join(&want2, "; "))
+            }
+        }
+        println("300 queries, " + same.toStr() + " the same as the full sort's rows; " + failed.toStr() + " errors, " + cut.toStr() +
+                " with rows past LIMIT + OFFSET")
+        let z = rows(mut &s, &"select id from t order by a limit 0")
+        let p = rows(mut &s, &"select id from t order by a desc limit 5000")
+        println("limit 0: " + len(z).toStr() + " rows, limit past the end: " + len(p).toStr() + " rows")
+        return 0
+    }).unwrap()
+}

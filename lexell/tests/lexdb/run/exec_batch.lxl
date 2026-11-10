@@ -9,28 +9,37 @@
 // - The queries: count(*), count, sum, avg, min and max of columns and of
 //   arithmetic (/ and % by a column that is sometimes 0, unary minus), with
 //   FILTER; WHERE of comparisons (with NULL constants too), IS NULL, AND, OR
-//   and NOT; GROUP BY none, one integer, a boolean, a text, two columns,
+//   and NOT, texts compared with constants, LIKE, NOT LIKE and ILIKE; GROUP BY none, one integer, a boolean, a text, two columns,
 //   an expression.
 // - Again inside a transaction with its own inserts, updates and deletes
 //   not committed.
 // - Sums that overflow (22003), as the row path gives them.
 // - How many of the queries ran in batches (EXPLAIN ANALYZE shows them).
-//   Of those that did not, 51 are errors (EXPLAIN ANALYZE fails on them);
+//   Of those that did not, 42 are errors (EXPLAIN ANALYZE fails on them);
 //   the rest read no rows (an empty range of the key: id < NULL) or are
 //   max(id), read from the key's end by the row path.
 // - A batched read in a transaction is noted as read: another session's
 //   insert in its range, committed first, fails the transaction's commit
 //   (40001), with batches as without.
+// - Queries giving rows, their first table scanned in batches (9.52):
+//   plain, LIMIT and OFFSET, inner and left joins, an aggregate over a
+//   join, DISTINCT; committed and in a transaction with its own writes.
+// - A LIMIT reached before a row whose condition fails gives its rows, not
+//   the error, with batches as without; a LIMIT stops the scan with the
+//   batch it ends in (EXPLAIN ANALYZE's rows read).
 // - The shapes the batches leave to the row path: the same results.
 // A query with two errors may give the other first with batches (an
 // aggregate is run over a batch before the next one is): those are
 // counted, and none comes up in these queries.
 // expect: committed: 300 queries, 300 the same with and without batches, 0 with two errors, another first
 // expect: in a transaction: 100 queries, 100 the same with and without batches, 0 errors, its writes: INSERT 0 50, UPDATE 264, DELETE 168
-// expect: batched: 338 of 400, 51 errors (EXPLAIN ANALYZE fails on them)
+// expect: batched: 355 of 400, 42 errors (EXPLAIN ANALYZE fails on them)
 // expect: overflow: ERROR 22003 bigint out of range | ERROR 22003 bigint out of range
 // expect: overflow filtered out: 6 | 6
 // expect: write skew: off: ERROR 40001 could not serialize access due to concurrent update; on: batched, ERROR 40001 could not serialize access due to concurrent update
+// expect: rows: 200 queries, 200 the same with and without batches, 0 with two errors, another first; batched 193, 4 errors
+// expect: limit before an error: 1|2 2|3 3|5 | 1|2 2|3 3|5
+// expect: limit stops: scan b: full scan (rows read 514, kept 3, batches 1) order: the scan's limit: stops the scan
 // expect: not batched: min(t), sum(distinct), a join, a subquery, an index path: 5 the same
 import "strings"
 import "../../../cmd/lexdb_base"
@@ -78,8 +87,20 @@ fn intExpr(r: mut &lexdb_base.Rng, depth: int, safe: bool): str {
     return (if r.below(8) == 0 { "n" } else { pick(r, &small) }) + " * " + pick(r, &small)
 }
 
+// A condition on a text: compared with a constant (either side, NULL
+// among them), LIKE, NOT LIKE or ILIKE a constant pattern (9.52).
+fn textCond(r: mut &lexdb_base.Rng): str {
+    let col = pick(r, &["t", "t", "t", "big"])
+    let c = r.below(6)
+    if c < 2 { return col + " " + cmpOp(r) + " " + pick(r, &["'a'", "'b'", "'bb'", "''", "null", "'short'"]) }
+    if c < 3 { return pick(r, &["'a'", "'b'", "'c'"]) + " " + cmpOp(r) + " " + col }
+    let pats = ["'a%'", "'%b'", "'%'", "'s%t'", "'%or%'", "'_'", "'%x%'", "'sh%r%t'", "null", "'%%'", "'A%'"]
+    return col + pick(r, &[" like ", " not like ", " ilike "]) + pick(r, &pats)
+}
+
 fn cond(r: mut &lexdb_base.Rng, depth: int, safe: bool): str {
-    let c = r.below(12)
+    let c = r.below(14)
+    if c >= 12 { return textCond(r) }
     if depth < 2 && c < 2 { return "(" + cond(r, depth + 1, safe) + ") and (" + cond(r, depth + 1, safe) + ")" }
     if depth < 2 && c < 4 { return "(" + cond(r, depth + 1, safe) + ") or (" + cond(r, depth + 1, safe) + ")" }
     if depth < 2 && c < 5 { return "not (" + cond(r, depth + 1, safe) + ")" }
@@ -121,6 +142,26 @@ fn query(r: mut &lexdb_base.Rng, safe: bool): str {
     if r.below(4) != 0 { sql = sql + " where " + cond(r, 0, safe) }
     if len(gb) > 0 { sql = sql + " group by " + gb + " order by " + strings.join(&ord, ", ") }
     return sql
+}
+
+// A random query whose rows the first table's batched scan gives (9.52):
+// rows of b chosen by a condition, plain, with LIMIT and OFFSET, joined to
+// c (inner, left, aggregated) or DISTINCT.
+fn rowQuery(r: mut &lexdb_base.Rng, safe: bool): str {
+    let w = cond(r, 0, safe)
+    let cols = ["id", "g", "h", "n", "f", "t", "k", "a"]
+    var items: []str = []
+    for i in 0..1 + r.below(4) { append(mut &items, pick(r, &cols)) }
+    let shape = r.below(6)
+    if shape == 0 { return "select " + strings.join(&items, ", ") + " from b where " + w + " order by id" }
+    if shape == 1 {
+        return "select " + strings.join(&items, ", ") + " from b where " + w + " order by id limit " + (1 + r.below(20)).toStr() +
+               " offset " + r.below(5).toStr()
+    }
+    if shape == 2 { return "select b.id, c.cname, b.g from b join c on c.cid = b.g where " + w + " order by b.id" }
+    if shape == 3 { return "select b.id, c.cname from b left join c on c.cid = b.k where " + w + " order by b.id" }
+    if shape == 4 { return "select c.cname, count(*), sum(b.h) from b join c on c.cid = b.g where " + w + " group by c.cname order by 1" }
+    return "select distinct g, f from b where " + w + " order by 1, 2"
 }
 
 // A random value for an insert: NULL about one time in seven.
@@ -256,6 +297,43 @@ fn main() {
             append(mut &skew, mode + ": " + (if strings.contains(skE, "batches") { "batched, " } else { "" }) + skC)
         }
         println("write skew: " + strings.join(&skew, "; "))
+        // queries giving rows: the first table scanned in batches (9.52)
+        let cc = q(mut &s, &"create table c (cid int primary key, cg int, cname text)")
+        var crows: []str = []
+        for i in 0..12 { append(mut &crows, "(" + i.toStr() + ", " + (i % 4).toStr() + ", 'c" + (i % 5).toStr() + "')") }
+        let ci = q(mut &s, &("insert into c values " + strings.join(&crows, ", ")))
+        var rsame = 0
+        var rbatched = 0
+        var rerrs = 0
+        var rother = 0
+        for i in 0..150 {
+            let sql = rowQuery(mut &r, false)
+            let k = both(mut &s, &sql, mut &rerrs)
+            if k == 0 { rsame += 1 } else if k == 1 { rother += 1 }
+            if strings.contains(q(mut &s, &("explain analyze " + sql)), "batches") { rbatched += 1 }
+        }
+        let bg2 = q(mut &s, &"begin")
+        let up2 = q(mut &s, &"update b set g = g + 1 where id % 5 = 0")
+        let del2 = q(mut &s, &"delete from b where id % 13 = 0")
+        for i in 0..50 {
+            let sql = rowQuery(mut &r, true)
+            let k = both(mut &s, &sql, mut &rerrs)
+            if k == 0 { rsame += 1 } else if k == 1 { rother += 1 }
+            if strings.contains(q(mut &s, &("explain analyze " + sql)), "batches") { rbatched += 1 }
+        }
+        let rb2 = q(mut &s, &"rollback")
+        println("rows: 200 queries, " + rsame.toStr() + " the same with and without batches, " + rother.toStr() +
+                " with two errors, another first; batched " + rbatched.toStr() + ", " + rerrs.toStr() + " errors")
+        // a LIMIT reached before a row whose condition fails: no error
+        let lim = "select id, g from b where 100 / (id - 500) > -1000 order by id limit 3"
+        let offL = q(mut &s, &"set lexdb_batch = off")
+        let la = q(mut &s, &lim)
+        let onL = q(mut &s, &"set lexdb_batch = on")
+        let lb = q(mut &s, &lim)
+        println("limit before an error: " + la + " | " + lb)
+        // a LIMIT stops the scan: at the end of the batch it is in
+        let ex = q(mut &s, &"explain analyze select id from b where g > 2 and n is not null order by id limit 3")
+        println("limit stops: " + strings.split(&ex, " result:")[0])
         // shapes the batches leave to the row path
         let c5 = q(mut &s, &"create index b_k on b (k); create table d (g int primary key, label text); insert into d values (1, 'one'), (2, 'two')")
         let others = ["select min(t), max(t) from b", "select sum(distinct g) from b",

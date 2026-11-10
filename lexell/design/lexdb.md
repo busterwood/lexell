@@ -393,7 +393,7 @@ Built on 2026-11-09 on branch `lexdb`, about 6,300 lines in
 (cache, trees, transactions, log, checkpoints, recovery, snapshots),
 `lexdb_sql` (lexer, parser), `lexdb_exec` (catalog, rows, keys, planner,
 statements, sessions), `lexdb_wire` (protocol 3.0) and `lexdb` (the
-server). Tests: `python3 lexell/tests/lexdb.py` (59 programs in
+server). Tests: `python3 lexell/tests/lexdb.py` (61 programs in
 `tests/lexdb/run`, under `LXL_CHECK=1`).
 
     lexell/compiler/out/lxlc lexell/cmd/lexdb.lxl -o lexdb
@@ -3865,4 +3865,123 @@ task per scan, not done yet.
 
   The survivor installs a run without its first page. The scan then
   reads that page again alone: one extra read, no wrong result.
+
+### 9.52 Batches beyond aggregates: scans, top-N, texts
+
+The user asked (2026-11-10) to extend the batches. Ten query shapes the
+row path still ran, timed through psql against lexdb and PostgreSQL 16
+(the same 1M-row table, warm, best of five), showed where it was
+furthest behind:
+- a filtered scan giving rows: 10 times behind;
+- `ORDER BY ... LIMIT`: 35 times, the whole result sorted;
+- `LIKE`: 13 times;
+- an aggregate over a join: 8 times.
+
+**The first table scanned in batches (`batchLevel`).**
+- **What runs it.** A query's first level, when it is a forward scan of
+  its table's key (not an index, nor key lookups only, nor correlated)
+  and has a condition the batches evaluate. This covers queries giving
+  rows, joins from their first table, and aggregates `batchGroups` does
+  not take.
+- **How.** Rows are decoded a batch at a time (`fillBatch`, in place);
+  the level's conditions pick the rows over the batch. Only the rows kept
+  become rows and go on through `tryRow`, as the row path's, which checks
+  every condition again.
+- **Any condition, in any order.** Every condition is pure and `tryRow`
+  checks them all, so the batches may use any of them in any order.
+- **Errors.** A batch on one of whose rows a condition gives an error is
+  read by the row path from the batch's start. The row path tries the
+  conditions in order and gives the error only if it reaches that row: a
+  LIMIT may stop it first. A value a batch cannot hold falls back the
+  same way.
+- **Counting.** The rows a batch drops count as read, so EXPLAIN ANALYZE
+  gives the row path's counts, with "batches N". A LIMIT stops the scan
+  in the batch it ends in.
+
+**Top-N.** `ORDER BY` with `LIMIT` keeps only the first `LIMIT + OFFSET`
+rows.
+- **Cutting.** The rows kept are sorted and cut when they reach twice
+  that (`keepFirst`). The sort is stable and earlier rows stay first, so
+  ties come out as the full sort gives them.
+- **The bar.** A row that sorts at or after the last kept row is dropped
+  on one comparison.
+- **Memory.** `max_statement_mem` now counts only the rows kept, so
+  `exec_limits`' LIMIT 5 sort is no longer stopped. One with LIMIT 15000
+  is.
+
+**Texts in batches.**
+- **Comparisons.** A column of other values (texts, numerics) compared
+  with a constant, on either side, is `ValCmp`. It runs eval's own
+  `compare` per row, the constant made once.
+- **LIKE.** `LIKE`, `NOT LIKE` and `ILIKE` with a constant pattern are
+  `Like`.
+- **A faster LIKE everywhere.** `likeMatch` turned the text and the
+  pattern into code points on every call. A pattern of literal text and %
+  only (no _, no escape character, not ILIKE) is now matched as bytes:
+  its pieces at the start, at the end and in order between (`likePieces`).
+  UTF-8 text matches a literal piece only at a character's start, so this
+  gives what code points did. The row path uses it too.
+
+**Results,** ms, through psql:
+
+| Query | before | now | PostgreSQL, one core | parallel |
+|---|---:|---:|---:|---:|
+| `select id, v from big where n = 5` | 346 | 86–104 | 36 | 17 |
+| `... where v > 90000` (100K rows out) | 399 | 173–200 | 51 | 49 |
+| `where n < 50 order by v desc limit 10` | 2,017 | 261–274 | 57 | 25 |
+| join, `where b.n = 7` | 361 | 94–102 | 34 | 17 |
+| `count(*) where t like 'row1%'` | 580 | 79 | 43 | 20 |
+| aggregate over a join, no condition | 1,209 | 1,200 | 149 | 56 |
+| `count(distinct n), count(distinct g)` | 444 | 448 | 209 | 211 |
+| `min(t), max(t)` | 382 | 384 | 71 | 29 |
+
+The last three still take the row path:
+- **The join's aggregate** joins by a key lookup per row: a million
+  lookups into a 10-row table. PostgreSQL hashes the small side. That is
+  the planner's choice, left for now (section 0).
+- **DISTINCT aggregates, and min or max of a text,** are not batch
+  aggregates yet.
+
+**Checked.**
+- **The suite.** 61 programs pass in both row forms.
+- **exec_batch** gained:
+  - 200 random queries giving rows, in six shapes: plain, LIMIT and
+    OFFSET, inner and left joins, an aggregate over a join, DISTINCT.
+    Some ran committed, some in a transaction with its own writes;
+    batches on and off give the same.
+  - Text conditions in its generator, on the aggregate path too.
+  - A LIMIT reached before a row whose condition fails: rows, not the
+    error.
+  - EXPLAIN ANALYZE of a LIMIT, stopping in its first batch.
+- **exec_topn,** new: 300 random `ORDER BY ... LIMIT ... OFFSET` queries,
+  with ties, NULLs, `NULLS FIRST` and `LAST`, expressions, output columns
+  by number, a join, and batches on and off. Each gives exactly the full
+  sort's rows from OFFSET on, with and without a key to break ties.
+- **exec_like,** new: 128 LIKE, NOT LIKE, ILIKE, ESCAPE and text-comparison
+  queries over multi-byte, empty and NULL texts, both through the rows
+  and through the aggregates. The expected lines are PostgreSQL 16's own
+  output.
+- **EXPLAIN ANALYZE.** `exec_join` and `exec_with` now show "batches 1"
+  on scans that batch; their counts are unchanged.
+- **Planted bugs.** 17 were planted, and 15 were caught.
+  - **The scan:** rows dropped not counted; an error not left to the
+    row path; the cursor not put back; emit's stop ignored (caught once
+    the LIMIT check was added).
+  - **Top-N:** the offset's rows; the comparison's direction; the bar
+    from the wrong row; a cut one short.
+  - **LIKE and comparisons:**
+    - a middle piece found over the last;
+    - the end not checked;
+    - the escape character not looked for;
+    - `_` taken as literal;
+    - a constant on the left;
+    - ILIKE as LIKE;
+    - NULL texts.
+  - **Not caught, and why:**
+    - Another table's column taken as a batch column: the planner never
+      puts one in the first level's conditions, so that check is a guard.
+    - Trying the conditions after one that does not compile: harmless,
+      as shown above, so the code now does it on purpose.
+  - **Not planted:** keeping rows tied with the bar (`> 0` for `>= 0`)
+    would only cost time, since the next cut drops them.
 
