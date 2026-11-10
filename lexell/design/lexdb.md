@@ -4196,6 +4196,9 @@ its 23 GB. The server now takes a quarter of `/proc/meminfo`'s MemTotal
 
 ### 9.55 io_uring again: not for sockets, not yet for files
 
+*Corrected by 9.56: the socket result below measured a test client's
+spurious wakeups under WSL2, not io_uring.*
+
 The user asked (2026-11-10) whether now is the time to switch to
 io_uring, since 9.17 measured it using less CPU.
 
@@ -4259,4 +4262,86 @@ alone gives 77,000. Statements on several cores (a runtime change, the
 user's decision) would also spread the sockets' kernel time over the
 cores. That is what PostgreSQL does, with a process per connection, to
 reach 287,000.
+
+### 9.56 io_uring for sockets, measured properly: it wins
+
+The user had read Jasny et al., "io_uring for High-Performance DBMSs: When
+and How to Use It" (VLDB 2026, arXiv 2512.04859), doubted 9.55, and asked
+whether the disk or the drive count was to blame. Neither: the socket test
+touches no disk. `bench/sock/sockbench.c` (rewritten from 9.55's, now in the
+tree) has one C server thread answering 60-byte requests with 80 bytes,
+the server's CPU per message (its thread plus any SQPOLL thread) and IPIs
+per message from `/proc/interrupts`.
+
+**Batching was not the problem.** Every `io_uring_enter` carried a turn's
+sends and re-armed receives for all connections (64 SQEs at 32 clients)
+and waited in the same call. Neither POLL_FIRST, nor waiting for 4 or 8
+completions, nor dropping the wait's timeout, changed the 31 us a message.
+SQPOLL moved the work to its kernel thread and cost more in total (40 us).
+
+**Wakeups are.** With clients that poll instead of sleeping, so no task is
+ever woken on another CPU (8 clients, no work):
+
+| | epoll | io_uring |
+|---|---:|---:|
+| clients sleep in `read()` | 18.7 us, 1.0 IPI | 30.6 us, 2.0 IPIs |
+| clients spin | 2.8 us | 1.9 us (358,700 / 489,500 msgs/s) |
+
+Every IPI costs the sender about 15 us under WSL2 (Hyper-V); on bare
+metal about a microsecond. Pinning tasks to CPUs changed nothing, and a
+server that polls 50 us before sleeping did not remove the second IPI.
+
+**Where the second IPI comes from** (tracefs `ipi_send_cpu` with stack
+traces; root was needed once). Both IPIs are sent by the server and both
+wake the client:
+
+- `sock_def_readable < unix_stream_sendmsg`: the reply. Expected.
+- `unix_write_space < sock_wfree < unix_wfree`: the server's *read* of the
+  request frees its skb, which returns send-buffer space to the client's
+  socket, and Unix sockets then wake every sleeper on that socket,
+  including a client blocked in `read()` (`autoremove_wake_function` does
+  not look at the event mask). The client wakes for nothing and sleeps
+  again. epoll without work replied before it slept again, so it showed one
+  IPI; io_uring holds the reply until the turn's batch is submitted, and
+  any real work does the same for epoll, so both then pay two.
+
+A client waiting in `poll(POLLIN)`, as libpq and pgbench do, filters the
+write-space wakeup out (`pollwake` checks the mask); TCP wakes for write
+space only when a writer was blocked for it. 9.55's client was the worst
+case and not a realistic one.
+
+**Realistic clients** (32 clients, 13 us of work a message, about lexdb's
+SQL time for a prepared point select):
+
+| Through, client waits in | epoll | io_uring | io_uring saves |
+|---|---|---|---:|
+| Unix, `read()` (9.55's test) | 21,600/s, 44.6 us | 22,700/s, 43.6 us | 2% |
+| Unix, `poll()` (as libpq) | 30,700/s, 31.7 us | 33,700/s, 29.4 us | 7% |
+| TCP | 41,200/s, 23.6 us | 45,100/s, 19.9 us | 16% |
+
+Over TCP the overhead beyond the 13 us of work falls from 10.6 to 6.9 us,
+a third, with 23 SQEs per call. TCP costs the server less than Unix sockets
+here, as lexdb's own numbers in 9.55 showed (10.7 against 15.1 us of
+system time).
+
+**Polling before sleeping.** One client at a time (`poll()` client, 13 us
+of work): a server that polls up to 50 us before blocking goes from 13,500
+to 20,800 round trips a second (74 to 48 us each), one IPI fewer, for 5 us
+more CPU a message (the polling). Under load it changes nothing, since the
+server never gets as far as sleeping.
+
+**What applies from the paper here:** batched submission and the
+completion model, DEFER_TASKRUN with a single issuer, and (for later, with
+larger messages) registered buffers. Not here: IOPOLL and NVMe passthrough
+(WSL2's disks are virtual, `io_poll` 0); SQPOLL (costs more in total);
+`fsync` through io_uring (a worker thread, as 9.17 found: 78 us against 33).
+More drives would matter only past one drive's IOPS, which lexdb's one SQL
+thread is far from.
+
+**So 9.55's "not for sockets" is withdrawn.** io_uring with a turn's
+operations batched into the waiting call saves 7 to 16% of the server's
+CPU a select here, and should save more where wakeups are cheap. The user
+said to go ahead (2026-11-10) with: an io_uring event loop in the Lexell
+runtime, beside epoll behind a switch, measured with pgbench against lexdb
+over TCP and Unix sockets; then polling before sleeping.
 
