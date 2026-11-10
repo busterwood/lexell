@@ -1371,6 +1371,92 @@ fn (st: &Store) scanIn(t: mut &Txn, tree: int, from: str, to: str, f: &fn(&Entry
     return Ok(Unit{})
 }
 
+// The entries of tree with keys in [from, to) (to "": to the end), read in
+// place: f gets each leaf's arrays and the range [i, j) of them in the
+// range, inside the store's lock, in key order, while it gives true. f
+// must not use the store; a value stored apart (marked) is given as
+// stored. Ok(false): nothing done, the transaction having its own writes
+// in the range (scan merges them). Each leaf's whole range is noted as
+// read, even when f stops in it (a wider read is safe).
+pub fn (st: &Store) scanLeaves(t: mut &Txn, tree: int, from: str, to: str,
+                               f: &fn(&[]str, &[]str, int, int): bool): Result[bool, lexdb_base.DbErr] {
+    if len(t.ownRange(tree, &from, &to)) > 0 { return Ok(false) }
+    let root = if t.snap >= 0 && !t.live { match t.snapTrees.get(&tree) { Some(r) { r } None { -1 } } } else { -1 }
+    var cursor = from
+    var more = true
+    let noting = t.noting()
+    while more {
+        var rseq = 0
+        var need = -1
+        var bad: []lexdb_base.DbErr = []
+        var upper = ""
+        var hasUpper = false
+        var go = true
+        var empty = false
+        st.sh.with(fn(db: mut &Db) {
+            if len(db.failed) > 0 {
+                append(mut &bad, db.failed[0])
+                return
+            }
+            rseq = if t.snap >= 0 && !t.live { t.snapSeq } else { db.seq }
+            if t.snap >= 0 && !t.live {
+                if db.snapGone(t.snap) {
+                    append(mut &bad, snapCancelled())
+                    return
+                }
+                if root < 0 {
+                    empty = true
+                    return
+                }
+                let d = db.snapDescend(root, t.snapSeq, &cursor, false)
+                if d.need >= 0 {
+                    need = d.need
+                    return
+                }
+                if d.missing {
+                    append(mut &bad, lexdb_base.err(lexdb_base.S_INTERNAL, "snapshot: a node version is missing"))
+                    return
+                }
+                let n = db.snapNode(d.leaf, d.ver)
+                let i = lowerIndex(&n.keys, &cursor)
+                var j = len(n.keys)
+                if len(to) > 0 { j = lowerIndex(&n.keys, &to) }
+                if j > i { go = f(&n.keys, &n.vals, i, j) }
+                upper = d.fence
+                hasUpper = d.hasFence
+                return
+            }
+            let d = db.descend(tree, &cursor)
+            if d.need >= 0 {
+                need = d.need
+                return
+            }
+            if len(d.path) == 0 {
+                empty = true
+                return
+            }
+            let leaf = d.path[len(d.path) - 1]
+            let n = &db.pool[db.meta[leaf].frame]
+            let i = lowerIndex(&n.keys, &cursor)
+            var j = len(n.keys)
+            if len(to) > 0 { j = lowerIndex(&n.keys, &to) }
+            if j > i { go = f(&n.keys, &n.vals, i, j) }
+            upper = d.upper
+            hasUpper = d.hasUpper
+        })
+        if len(bad) > 0 { return Err(bad[0]) }
+        if need >= 0 {
+            try st.load(need)
+            continue
+        }
+        if empty { return Ok(true) }
+        let last = !hasUpper || (len(to) > 0 && upper >= to)
+        if noting { t.noteRead(tree, cursor, if !last { upper } else if len(to) > 0 { to } else { "" }, rseq) }
+        if !go || last { more = false } else { cursor = upper }
+    }
+    return Ok(true)
+}
+
 // A descent for a backward scan: the leaf with the largest keys below k (k
 // "": the last leaf). lower is the largest separator above it on the path:
 // the leaf holds no key below it, so the next leaf back is the one below it.

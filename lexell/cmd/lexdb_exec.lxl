@@ -10258,130 +10258,245 @@ fn bPut(b: mut &Batch, c: int, r: int, v: Val, kind: int): bool {
     return true
 }
 
-// The columns used of a batch of stored rows; false: a value of a kind
-// its column's batch does not hold (the row path reads the query).
-fn bDecode(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, raw: &RawRows, kinds: &[]int,
-           needCol: &[]bool, placeCol: &[]int, missing: &[]Val, needP: &[]bool, b: mut &Batch): Result[bool, DbErr] {
-    let n = len(raw.vals)
-    let width = rowWidth(t)
-    let noVals: []Val = []
-    for i in 0..len(kinds) {
-        if needCol[i] { append(mut &b.cols, bvec(n)) } else { append(mut &b.cols, bvec(0)) }
-        if needCol[i] && kinds[i] == BK_VAL { append(mut &b.vals, array(n, Val.Null)) } else { append(mut &b.vals, []) }
+// Where a batch reads the columns used: per place its column (-1 none),
+// the places used in order, the last one's end (a tagged row is read to it).
+type BPlan = record {
+    kinds: []int            // per column of the table: BK_*
+    needCol: []bool
+    placeCol: []int
+    usedP: []int
+    stopAt: int
+    missing: []Val          // by place
+    needP: []bool           // by place, for decRowNeed and rowOf
+    width: int
+}
+
+fn newBatch(bp: &BPlan, cap: int): Batch {
+    var b = Batch{cols: [], vals: [], n: 0}
+    for i in 0..len(bp.kinds) {
+        if bp.needCol[i] { append(mut &b.cols, bvec(cap)) } else { append(mut &b.cols, bvec(0)) }
+        if bp.needCol[i] && bp.kinds[i] == BK_VAL { append(mut &b.vals, array(cap, Val.Null)) } else { append(mut &b.vals, []) }
     }
-    // the columns used, by place: for rows in the fixed layout
-    var usedP: []int = []
-    for pl in 0..width { if placeCol[pl] >= 0 { append(mut &usedP, pl) } }
-    // a tagged row is read up to its last place used (none: not at all)
-    let stopAt = if len(usedP) == 0 { 0 } else { usedP[len(usedP) - 1] + 1 }
-    var lay = FixedLay{sig: [], off: [], prev: [], bm: 0, v0: 0}
-    for r in 0..n {
-        let s = &raw.vals[r]
-        if len(s) > 1 && s[0] == FIXED {
-            // one load per column used, at its offset (9.48)
-            if !sameLay(s, &lay) { lay = fixedLay(s) }
-            let np = len(lay.sig) - 1
-            for pl in usedP {
-                let c = placeCol[pl]
-                let k = kinds[c]
-                if pl >= np {
-                    let mv = if pl < len(missing) { missing[pl] } else { Val.Null }
-                    if !bPut(b, c, r, mv, k) { return Ok(false) }
-                    continue
-                }
-                let pk = lay.sig[1 + pl]
-                if (int(s[lay.bm + pl / 8]) >> (pl % 8)) & 1 == 1 {
-                    b.cols[c].nul[r] = true
-                } else if pk == PK_INT && k == BK_INT {
-                    b.cols[c].v[r] = binary.readI64LEStr(s, lay.off[pl])
-                } else if pk == PK_BOOL && k == BK_BOOL {
-                    b.cols[c].v[r] = if s[lay.off[pl]] == 1 { 1 } else { 0 }
-                } else if k != BK_VAL {
-                    return Ok(false)
-                } else if pk == PK_INT {
-                    b.vals[c][r] = Val.Int(binary.readI64LEStr(s, lay.off[pl]))
-                } else if pk == PK_BOOL {
-                    b.vals[c][r] = Val.Bool(s[lay.off[pl]] == 1)
-                } else if pk == PK_NUM || pk == PK_TEXT {
-                    let end = binary.readU32LEStr(s, lay.off[pl])
-                    let start = if lay.prev[pl] < 0 { 0 } else { binary.readU32LEStr(s, lay.prev[pl]) }
-                    let x = s[lay.v0 + start..lay.v0 + end]
-                    if pk == PK_TEXT {
-                        b.vals[c][r] = Val.Text(x)
-                    } else {
-                        match Decimal.parse(x) {
-                            Ok(d) { b.vals[c][r] = Val.Num(d) }
-                            Err(_) { return Err(lexdb_base.corrupt("a numeric value in a row")) }
-                        }
-                    }
-                } else {
-                    b.cols[c].nul[r] = true
-                }
-            }
-            continue
-        }
-        if lexdb_store.partOf(s).isSome() || (len(s) > 0 && s[0] == 6) {
-            // a large row: as the row path reads it
-            let row = try rowOf(st, txn, t, &raw.keys[r], s, width, needP, missing)
-            for i in 0..len(kinds) {
-                if needCol[i] && !bPut(b, i, r, row[i], kinds[i]) { return Ok(false) }
-            }
-            continue
-        }
-        var at = 0
-        for pl in 0..stopAt {
+    return b
+}
+
+// Decodes stored row s into row r of b: 0 done, 1 a value of a kind its
+// column's batch does not hold (the row path reads the query), 2 a value
+// stored apart (the store must be read: the caller's).
+fn bRowInto(s: &str, r: int, b: mut &Batch, bp: &BPlan, t: &Table, lay: mut &FixedLay): Result[int, DbErr] {
+    let kinds = &bp.kinds
+    let placeCol = &bp.placeCol
+    let missing = &bp.missing
+    if len(s) > 1 && s[0] == FIXED {
+        // one load per column used, at its offset (9.48)
+        if !sameLay(s, lay) { lay = fixedLay(s) }
+        let np = len(lay.sig) - 1
+        for pl in bp.usedP {
             let c = placeCol[pl]
-            if at >= len(s) {
-                // a column added after the row was written: its value then
-                if c >= 0 {
-                    let mv = if pl < len(missing) { missing[pl] } else { Val.Null }
-                    if !bPut(b, c, r, mv, kinds[c]) { return Ok(false) }
-                }
-                continue
-            }
-            let tag = s[at]
-            at += 1
-            if c < 0 {
-                if tag == 1 { at += 8 } else if tag == 2 { at += 1 } else if tag == 3 || tag == 4 { at += 4 + binary.readU32LEStr(s, at) }
-                else if tag != 0 { return Err(lexdb_base.corrupt("a row's value tag")) }
-                continue
-            }
             let k = kinds[c]
-            if tag == 0 {
+            if pl >= np {
+                let mv = if pl < len(missing) { missing[pl] } else { Val.Null }
+                if !bPut(b, c, r, mv, k) { return Ok(1) }
+                continue
+            }
+            let pk = lay.sig[1 + pl]
+            if (int(s[lay.bm + pl / 8]) >> (pl % 8)) & 1 == 1 {
                 b.cols[c].nul[r] = true
-            } else if tag == 1 && k == BK_INT {
-                b.cols[c].v[r] = binary.readI64LEStr(s, at)
-                at += 8
-            } else if tag == 2 && k == BK_BOOL {
-                b.cols[c].v[r] = if s[at] == 1 { 1 } else { 0 }
-                at += 1
+            } else if pk == PK_INT && k == BK_INT {
+                b.cols[c].v[r] = binary.readI64LEStr(s, lay.off[pl])
+            } else if pk == PK_BOOL && k == BK_BOOL {
+                b.cols[c].v[r] = if s[lay.off[pl]] == 1 { 1 } else { 0 }
             } else if k != BK_VAL {
-                return Ok(false)
-            } else if tag == 1 {
-                b.vals[c][r] = Val.Int(binary.readI64LEStr(s, at))
-                at += 8
-            } else if tag == 2 {
-                b.vals[c][r] = Val.Bool(s[at] == 1)
-                at += 1
-            } else if tag == 3 || tag == 4 {
-                let l = binary.readU32LEStr(s, at)
-                let tx = s[at + 4..at + 4 + l]
-                at += 4 + l
-                if tag == 4 {
-                    b.vals[c][r] = Val.Text(tx)
+                return Ok(1)
+            } else if pk == PK_INT {
+                b.vals[c][r] = Val.Int(binary.readI64LEStr(s, lay.off[pl]))
+            } else if pk == PK_BOOL {
+                b.vals[c][r] = Val.Bool(s[lay.off[pl]] == 1)
+            } else if pk == PK_NUM || pk == PK_TEXT {
+                let end = binary.readU32LEStr(s, lay.off[pl])
+                let start = if lay.prev[pl] < 0 { 0 } else { binary.readU32LEStr(s, lay.prev[pl]) }
+                let x = s[lay.v0 + start..lay.v0 + end]
+                if pk == PK_TEXT {
+                    b.vals[c][r] = Val.Text(x)
                 } else {
-                    match Decimal.parse(tx) {
+                    match Decimal.parse(x) {
                         Ok(d) { b.vals[c][r] = Val.Num(d) }
                         Err(_) { return Err(lexdb_base.corrupt("a numeric value in a row")) }
                     }
                 }
             } else {
-                return Err(lexdb_base.corrupt("a row's value tag"))
+                b.cols[c].nul[r] = true
             }
         }
+        return Ok(0)
+    }
+    if lexdb_store.partOf(s).isSome() || (len(s) > 0 && s[0] == 0xFF) { return Ok(2) }
+    if len(s) > 0 && s[0] == 6 {
+        // a row with long texts, kept whole in its leaf: read as the row path reads it
+        let places = try decRowNeed(s, bp.width, &bp.needP, missing)
+        for i in 0..len(kinds) {
+            if !bp.needCol[i] { continue }
+            let pl = if len(t.slots) == 0 { i } else { t.slots[i] }
+            if !bPut(b, i, r, places[pl], kinds[i]) { return Ok(1) }
+        }
+        return Ok(0)
+    }
+    var at = 0
+    for pl in 0..bp.stopAt {
+        let c = placeCol[pl]
+        if at >= len(s) {
+            // a column added after the row was written: its value then
+            if c >= 0 {
+                let mv = if pl < len(missing) { missing[pl] } else { Val.Null }
+                if !bPut(b, c, r, mv, kinds[c]) { return Ok(1) }
+            }
+            continue
+        }
+        let tag = s[at]
+        at += 1
+        if c < 0 {
+            if tag == 1 { at += 8 } else if tag == 2 { at += 1 } else if tag == 3 || tag == 4 { at += 4 + binary.readU32LEStr(s, at) }
+            else if tag != 0 { return Err(lexdb_base.corrupt("a row's value tag")) }
+            continue
+        }
+        let k = kinds[c]
+        if tag == 0 {
+            b.cols[c].nul[r] = true
+        } else if tag == 1 && k == BK_INT {
+            b.cols[c].v[r] = binary.readI64LEStr(s, at)
+            at += 8
+        } else if tag == 2 && k == BK_BOOL {
+            b.cols[c].v[r] = if s[at] == 1 { 1 } else { 0 }
+            at += 1
+        } else if k != BK_VAL {
+            return Ok(1)
+        } else if tag == 1 {
+            b.vals[c][r] = Val.Int(binary.readI64LEStr(s, at))
+            at += 8
+        } else if tag == 2 {
+            b.vals[c][r] = Val.Bool(s[at] == 1)
+            at += 1
+        } else if tag == 3 || tag == 4 {
+            let l = binary.readU32LEStr(s, at)
+            let tx = s[at + 4..at + 4 + l]
+            at += 4 + l
+            if tag == 4 {
+                b.vals[c][r] = Val.Text(tx)
+            } else {
+                match Decimal.parse(tx) {
+                    Ok(d) { b.vals[c][r] = Val.Num(d) }
+                    Err(_) { return Err(lexdb_base.corrupt("a numeric value in a row")) }
+                }
+            }
+        } else {
+            return Err(lexdb_base.corrupt("a row's value tag"))
+        }
+    }
+    return Ok(0)
+}
+
+// A row read whole by the row path (a value stored apart) into row r of b;
+// false: a value of a kind its column's batch does not hold.
+fn bRowOf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, key: &str, v: &str, r: int, b: mut &Batch,
+          bp: &BPlan): Result[bool, DbErr] {
+    let row = try rowOf(st, txn, t, key, v, bp.width, &bp.needP, &bp.missing)
+    for i in 0..len(bp.kinds) {
+        if bp.needCol[i] && !bPut(b, i, r, row[i], bp.kinds[i]) { return Ok(false) }
+    }
+    return Ok(true)
+}
+
+// The columns used of a batch of stored rows (copied out by fetchRaw);
+// None: a value of a kind its column's batch does not hold.
+fn bDecode(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, raw: &RawRows, bp: &BPlan): Result[Option[Batch], DbErr] {
+    let n = len(raw.vals)
+    var b = newBatch(bp, n)
+    var lay = FixedLay{sig: [], off: [], prev: [], bm: 0, v0: 0}
+    for r in 0..n {
+        let code = try bRowInto(&raw.vals[r], r, mut &b, bp, t, mut &lay)
+        if code == 1 { return Ok(None) }
+        if code == 2 && !(try bRowOf(st, txn, t, &raw.keys[r], &raw.vals[r], r, mut &b, bp)) { return Ok(None) }
     }
     b.n = n
-    return Ok(true)
+    return Ok(Some(b))
+}
+
+// The next batch of a scan, its rows decoded from the leaves in place
+// (lexdb_store.scanLeaves: no entry copied out); None: a value of a kind
+// its column's batch does not hold. A key lookup, and a scan whose range
+// the transaction has written, go through fetchRaw (it merges those
+// writes); a value stored apart is read by the row path.
+fn fillBatch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, sc: &Scan, part: bool, cur: mut &Cursor,
+             bp: &BPlan): Result[Option[Batch], DbErr] {
+    if sc.empty || sc.point {
+        let raw = try fetchRaw(st, txn, t, sc, part, cur)
+        return bDecode(st, txn, t, &raw, bp)
+    }
+    var b = newBatch(bp, BROWS)
+    var lay = FixedLay{sig: [], off: [], prev: [], bm: 0, v0: 0}
+    while b.n < BROWS && !cur.done {
+        let from = if cur.started { cur.at } else { sc.lo }
+        cur.started = true
+        var stopKey = ""
+        var stop = 0                // 1 the batch is full, 2 a value stored apart
+        var bail = false
+        var bad: []DbErr = []
+        let inPlace = try st.scanLeaves(txn, t.tree, from, sc.hi, fn(ks: &[]str, vs: &[]str, i: int, j: int): bool {
+            for k in i..j {
+                if b.n == BROWS {
+                    stop = 1
+                    stopKey = ks[k]
+                    return false
+                }
+                match bRowInto(&vs[k], b.n, mut &b, bp, t, mut &lay) {
+                    Ok(code) {
+                        if code == 1 {
+                            bail = true
+                            return false
+                        }
+                        if code == 2 {
+                            stop = 2
+                            stopKey = ks[k]
+                            return false
+                        }
+                    }
+                    Err(x) {
+                        append(mut &bad, x)
+                        return false
+                    }
+                }
+                b.n += 1
+            }
+            return true
+        })
+        if len(bad) > 0 { return Err(bad[0]) }
+        if bail { return Ok(None) }
+        if !inPlace {
+            // the transaction's own writes in the range: copied and merged
+            cur.at = from
+            if b.n > 0 { return Ok(Some(b)) }
+            let raw = try fetchRaw(st, txn, t, sc, part, cur)
+            return bDecode(st, txn, t, &raw, bp)
+        }
+        if stop == 1 {
+            cur.at = stopKey
+            return Ok(Some(b))
+        }
+        if stop == 2 {
+            let got = if part { try st.getPart(txn, t.tree, stopKey) } else { try st.get(txn, t.tree, stopKey) }
+            match got {
+                Some(v) {
+                    if !(try bRowOf(st, txn, t, &stopKey, &v, b.n, mut &b, bp)) { return Ok(None) }
+                    b.n += 1
+                }
+                None {}
+            }
+            cur.at = after(&stopKey)
+            continue
+        }
+        cur.done = true
+    }
+    return Ok(Some(b))
 }
 
 // Row r of a batch as the row path gives it: its columns used, NULL for
@@ -10599,8 +10714,12 @@ fn batchGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
     for i in 0..len(t.cols) {
         if needCol[i] { placeCol[if len(t.slots) == 0 { i } else { t.slots[i] }] = i }
     }
-    let missing = placesMissing(t)
-    let needP = placesNeeded(t, &needList)
+    var usedP: []int = []
+    for pl in 0..width { if placeCol[pl] >= 0 { append(mut &usedP, pl) } }
+    // a tagged row is read up to its last place used (none: not at all)
+    let stopAt = if len(usedP) == 0 { 0 } else { usedP[len(usedP) - 1] + 1 }
+    let bp = BPlan{kinds: kinds, needCol: needCol, placeCol: placeCol, usedP: usedP, stopAt: stopAt,
+                   missing: placesMissing(t), needP: placesNeeded(t, &needList), width: width}
     // the groups: their first rows, and per aggregate its counts, sums and minima or maxima
     let ns = len(specs)
     var firsts: [][]Val = []
@@ -10623,15 +10742,15 @@ fn batchGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
     for sc in scans {
         var cur = newCursor()
         while !cur.done {
-            let raw = try fetchRaw(st, txn, t, &sc, part, mut &cur)
-            let nr = len(raw.vals)
-            if nr == 0 { continue }
-            try rs.tickN(nr)
-            var b = Batch{cols: [], vals: [], n: 0}
-            if !(try bDecode(st, txn, t, &raw, &kinds, &needCol, &placeCol, &missing, &needP, mut &b)) {
+            let got = try fillBatch(st, txn, t, &sc, part, mut &cur, &bp)
+            if got.isNone() {
                 held -= added
                 return Ok(false)
             }
+            let b = got.unwrap()
+            let nr = b.n
+            if nr == 0 { continue }
+            try rs.tickN(nr)
             nRead += nr
             nBatches += 1
             // WHERE: the rows chosen, narrowed condition by condition
@@ -10651,7 +10770,7 @@ fn batchGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
             var gid: []int = array(nc, 0)
             if len(keys) == 0 {
                 if len(firsts) == 0 {
-                    let row = bRow(&b, idx[0], &kinds, &needCol)
+                    let row = bRow(&b, idx[0], &bp.kinds, &bp.needCol)
                     let cost = rowBytes(&row) + 64 * (len(sel.specs) + 1)
                     held += cost
                     added += cost
@@ -10692,7 +10811,7 @@ fn batchGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
                     }
                     if g < 0 {
                         g = len(firsts)
-                        let row = bRow(&b, idx[j], &kinds, &needCol)
+                        let row = bRow(&b, idx[j], &bp.kinds, &bp.needCol)
                         let cost = rowBytes(&row) + 64 * (len(sel.specs) + 1) + klen
                         held += cost
                         added += cost

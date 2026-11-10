@@ -3653,3 +3653,48 @@ ahead.
 On the 5-column table the tagged rows now read as fast as the fixed ones,
 since their columns used come first. The fixed layout's gain stays where
 the columns come late.
+
+**Leaves read in place.**
+- **The store call.** `Store.scanLeaves` gives a callback each leaf's own
+  key and value arrays, and the range of them in the scan's range, inside
+  the store's lock (snapshot or live tree). The scan used to copy each
+  entry into a list in the store, then again into the batch.
+- **The batches.** `fillBatch` decodes rows from the leaves straight into
+  the batch's arrays (`bRowInto`, no store call). It stops when the batch
+  is full, then resumes at the first row not taken, with a new descent per
+  batch.
+- **Read tracking.** Each leaf's whole range is noted as read, for
+  serializable transactions. A batch that stops inside a leaf notes a
+  little more than it read, which is safe.
+- **What goes the old way:**
+  - a range the transaction has written itself, since only `scan` merges
+    its writes;
+  - a key lookup;
+  - a value stored apart, read by the row path. Its key is where the
+    batch resumes.
+
+| Query, batches | tagged before | after | fixed before | after |
+|---|---:|---:|---:|---:|
+| `count(*)`, 5 columns | 38.7–39.9 | 25.1–27.1 | 41.2–41.5 | 28.4–28.8 |
+| 4 aggregates `WHERE n > 10` | 72.7–73.0 | 61.9–64.3 | 73.8–74.0 | 62.1–64.2 |
+| `sum(v)` with 3 conditions | 85.3–87.7 | 72.7–75.3 | 90.2–91.3 | 75.9–77.0 |
+| `GROUP BY g` | 113.2–114.2 | 104.3–105.8 | 123.7–125.2 | 113.1–116.6 |
+| 20 columns: `sum(c18) WHERE c17 > 50` | 94.7–99.9 | 83.4–87.1 | 63.3–64.1 | 44.8–45.8 |
+| 20 columns: `WHERE c1 = 3 AND c13 < 5` | 83.3–86.1 | 74.1–75.7 | 62.0–62.6 | 45.5–46.8 |
+
+**Checked.**
+- **The suite.** All 58 programs pass in both layouts.
+- **Planted bugs.** Nine were planted in the scan and its use; each was
+  caught:
+  - the end of the range ignored;
+  - the transaction's own writes not looked for;
+  - a snapshot reading the live tree;
+  - resuming after the row not taken;
+  - a row stored apart skipped;
+  - the conditions' columns not read;
+  - tagged rows read one place short;
+  - reads not noted (twice: see below).
+- **The bug that survived.** Reads not noted survived exec_batch until it
+  gained a write-skew check. A transaction counts rows in batches, another
+  inserts into that range and commits, then the first writes and commits:
+  40001, with batches as without.
