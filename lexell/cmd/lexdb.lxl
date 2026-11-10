@@ -1,12 +1,20 @@
 // lexdb: a small SQL server on disk behind the PostgreSQL wire protocol
 // (design/lexdb.md).
 //
-//     lexdb DATADIR [ADDR]
+//     lexdb DATADIR [ADDR ...]
 //
-// DATADIR is made when it does not exist; ADDR defaults to 127.0.0.1:5433.
-// There is no authentication yet: keep it on loopback. SIGTERM or SIGINT
-// stops it: no new connections, the open ones are cut off, and the log is
-// flushed before it exits.
+// DATADIR is made when it does not exist. Each ADDR is listened on:
+// - HOST:PORT, TCP; with no ADDR, 127.0.0.1:5433;
+// - a directory (an ADDR with a "/"): a Unix socket in it named as
+//   PostgreSQL names one, .s.PGSQL.PORT, PORT the first TCP address's (5433
+//   without one), so `psql -h DIR -p PORT` finds it;
+// - any other path with a "/": the Unix socket file itself.
+// A socket file left by a server that is gone is replaced; one a server
+// still answers on is an error. The files are removed when lexdb stops.
+// There is no authentication yet: keep TCP on loopback, and a socket in a
+// directory only its users can reach. SIGTERM or SIGINT stops it: no new
+// connections, the open ones are cut off, and the log is flushed before it
+// exits.
 import "task"
 import "net"
 import "io"
@@ -21,12 +29,14 @@ import "./lexdb_wire"
 
 fn main() {
     let args = os.arguments()
-    if len(args) < 1 || len(args) > 2 {
-        eprintln("usage: lexdb DATADIR [ADDR]")
+    if len(args) < 1 {
+        eprintln("usage: lexdb DATADIR [ADDR ...]")
         exit(2)
     }
     let dir = args[0]
-    let addr = if len(args) > 1 { args[1] } else { "127.0.0.1:5433" }
+    var addrs: []str = []
+    for i in 1..len(args) { append(mut &addrs, args[i]) }
+    if len(addrs) == 0 { append(mut &addrs, "127.0.0.1:5433") }
     if os.env("LXL_HELPERS").isNone() { os.setEnv("LXL_HELPERS", "32") }   // reads in flight (section 3)
     match fs.mkdirAll(dir) {
         Ok(_) {}
@@ -36,8 +46,12 @@ fn main() {
         }
     }
     task.watchSignals(&[task.SIGTERM, task.SIGINT])
-    // LEXDB_CACHE_MB: the cache's budget (lexdb_store.Options.cacheBytes)
+    // LEXDB_CACHE_MB: the cache's budget (lexdb_store.Options.cacheBytes);
+    // without it a quarter of the memory, 128 MB at least (9.54): the data
+    // file is read past the kernel's cache (O_DIRECT), so this cache is all
+    // there is
     var opts = lexdb_store.defaults()
+    opts.cacheBytes = max(opts.cacheBytes, memBytes() / 4)
     match os.env("LEXDB_CACHE_MB") {
         Some(v) {
             match strings.parseIntOpt(v) {
@@ -73,20 +87,24 @@ fn main() {
                 return
             }
         }
-        match net.listen(addr) {
-            Ok(ln) {
-                println("lexdb: listening on " + ln.localAddr() + ", data in " + dir)
+        var files: []str = []                       // the Unix sockets made: removed at the end
+        match lexdb_wire.listenAll(&addrs, mut &files) {
+            Ok(lns) {
+                var names: []str = []
+                for ln in lns { append(mut &names, ln.localAddr()) }
+                println("lexdb: listening on " + strings.join(&names, ", ") + ", data in " + dir)
                 let fl = io.flushStdout()
-                let f = s.start(lexdb_wire.acceptLoop, lexdb_wire.AcceptArg{ln: ln, st: st})
+                let f = s.start(lexdb_wire.acceptAll, lexdb_wire.ListenArg{lns: lns, st: st})
                 let sig = task.terminated()
-                { let stop = f }                       // cancels the accept loop and the connections
+                { let stop = f }                       // cancels the accept loops and the connections
                 println("lexdb: stopping")
             }
-            Err(e) {
-                eprintln("lexdb: listen " + addr + ": " + e.toStr())
+            Err(msg) {
+                eprintln("lexdb: " + msg)
                 code = 1
             }
         }
+        for p in files { let gone = fs.remove(p) }
         let ck = st.checkpointAll()
         let x = st.stats()
         println("lexdb: " + x.commits.toStr() + " commits, " + x.loads.toStr() + " pages read, " + x.evictions.toStr() +
@@ -95,6 +113,28 @@ fn main() {
         st.close()
     })
     if code != 0 { exit(code) }
+}
+
+// The machine's memory in bytes (/proc/meminfo's MemTotal), 0 when it is
+// not known.
+fn memBytes(): int {
+    match io.read("/proc/meminfo") {
+        Ok(text) {
+            for line in strings.split(&text, &"\n") {
+                if strings.startsWith(line, "MemTotal:") {
+                    let f = strings.fields(&line)
+                    if len(f) >= 2 {
+                        match strings.parseIntOpt(f[1]) {
+                            Some(kb) { return kb * 1024 }
+                            None {}
+                        }
+                    }
+                }
+            }
+        }
+        Err(_) {}
+    }
+    return 0
 }
 
 // The environment variable name in KiB as bytes, else d.

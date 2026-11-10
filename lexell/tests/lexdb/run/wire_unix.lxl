@@ -1,0 +1,127 @@
+// lexdb_wire: Unix sockets (design/lexdb.md 9.54). listenAll with a TCP
+// address and a directory, server and client (lib/postgres) in one process
+// on the simulated disk.
+// - The directory's socket is named as PostgreSQL names one, .s.PGSQL.PORT
+//   with the TCP address's port, so a client given the directory and the
+//   port (host=DIR port=PORT) finds it; what is written through the socket
+//   is read through TCP and back.
+// - A second listenAll on the same socket is refused while it is served.
+// - After the server stops, its socket file is stale: listening again
+//   replaces it, and clients connect.
+// - A path that is not a socket is never replaced; a path given as a file
+//   (not a directory) is the socket itself.
+// expect: listening: tcp true, socket named .s.PGSQL.<port> true, files 1
+// expect: unix: inserted 3, count 3
+// expect: tcp: 1|ann; 2|bob; 3|cy
+// expect: unix: sum 6
+// expect: second server: a server is listening on it
+// expect: stale socket replaced: count 3
+// expect: plain file: exists and is not a socket, still a file true
+// expect: socket file: connected true, the file made true
+import "task"
+import "net"
+import "os"
+import "fs"
+import "strings"
+import "postgres"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_wire"
+
+// The rows of sql through the DSN, as "v|v; v|v", or the error.
+fn rows(dsn: &str, sql: str): str {
+    match postgres.connect(dsn) {
+        Ok(c0) {
+            var c = c0
+            match c.query(sql, &[]) {
+                Ok(r) {
+                    var out: []str = []
+                    for i in 0..r.rowCount() {
+                        var vs: []str = []
+                        for j in 0..r.columnCount() { append(mut &vs, r.text(i, j).unwrapOr("?")) }
+                        append(mut &out, strings.join(&vs, "|"))
+                    }
+                    return strings.join(&out, "; ")
+                }
+                Err(e) { return "ERROR " + e.toStr() }
+            }
+        }
+        Err(e) { return "CONNECT " + e.toStr() }
+    }
+}
+
+// The listeners' error, without the path before it.
+fn why(msg: &str): str {
+    let i = strings.lastIndexOf(msg, ": ")
+    return if i >= 0 { msg[i + 2..len(msg)] } else { msg }
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    let dir = fs.join(os.tempDir(), "lexdb_unix_" + os.pid().toStr())
+    let made = fs.mkdirAll(dir)
+    task.scope(fn(s: mut &task.Scope) {
+        var files: []str = []
+        let lns = lexdb_wire.listenAll(&["127.0.0.1:0", dir], mut &files).unwrap()
+        let tcp = lns[0].localAddr()
+        let port = tcp[strings.lastIndexOf(tcp, ":") + 1..len(tcp)]
+        let sock = lns[1].localAddr()
+        println("listening: tcp " + strings.startsWith(tcp, "127.0.0.1:").toStr() + ", socket named .s.PGSQL.<port> " +
+                (sock == "unix:" + dir + "/.s.PGSQL." + port).toStr() + ", files " + len(files).toStr())
+        let viaUnix = "host=" + dir + " port=" + port + " user=test dbname=test"
+        let viaTcp = "host=127.0.0.1 port=" + port + " user=test dbname=test sslmode=disable"
+        let f = s.start(lexdb_wire.acceptAll, lexdb_wire.ListenArg{lns: lns, st: st})
+        let c1 = rows(&viaUnix, "create table p (id int primary key, name text)")
+        let c2 = rows(&viaUnix, "insert into p values (1, 'ann'), (2, 'bob'), (3, 'cy')")
+        println("unix: inserted 3, count " + rows(&viaUnix, "select count(*) from p"))
+        println("tcp: " + rows(&viaTcp, "select id, name from p order by id"))
+        println("unix: sum " + rows(&viaUnix, "select sum(id) from p"))
+        // the same socket again, while served (named by its file: a directory
+        // alone would take port 5433)
+        let pgFile = dir + "/.s.PGSQL." + port
+        var f2: []str = []
+        match lexdb_wire.listenAll(&[pgFile], mut &f2) {
+            Ok(_) { println("second server: listening?") }
+            Err(msg) { println("second server: " + why(&msg)) }
+        }
+        { let stop = f }
+        // the server gone (its task cancelled, and run once this one parks:
+        // the listener closed), its file stays: stale
+        let z = task.sleep(100)
+        var f3: []str = []
+        let again = lexdb_wire.listenAll(&[pgFile], mut &f3)
+        if again.isErr() { println("again: " + again.unwrapErr()) } else {
+            let g = s.start(lexdb_wire.acceptAll, lexdb_wire.ListenArg{lns: again.unwrap(), st: st})
+            println("stale socket replaced: count " + rows(&viaUnix, "select count(*) from p"))
+            { let stop = g }
+        }
+        // a file that is not a socket; a socket at a path of its own
+        let plain = dir + "/plain"
+        let w = fs.writeAtomic(plain, "x")
+        var f4: []str = []
+        match lexdb_wire.listenAll(&[plain], mut &f4) {
+            Ok(_) { println("plain file: listening?") }
+            Err(msg) {
+                let still = match fs.lstat(plain) { Ok(x) { x.isFile() } Err(_) { false } }
+                println("plain file: " + why(&msg) + ", still a file " + still.toStr())
+            }
+        }
+        var f5: []str = []
+        let own = dir + "/own.sock"
+        let l5 = lexdb_wire.listenAll(&[own], mut &f5)
+        if l5.isErr() { println("own: " + l5.unwrapErr()) } else {
+            let h = s.start(lexdb_wire.acceptAll, lexdb_wire.ListenArg{lns: l5.unwrap(), st: st})
+            let ok = net.connectUnix(own).isOk()
+            let named = len(f5) == 1 && f5[0] == own
+            println("socket file: connected " + ok.toStr() + ", the file made " + named.toStr())
+            { let stop = h }
+        }
+    })
+    let gone = fs.removeAll(dir)
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(9), lexdb_store.Options{cacheBytes: 128 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, body).unwrap()
+}

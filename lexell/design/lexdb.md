@@ -393,12 +393,17 @@ Built on 2026-11-09 on branch `lexdb`, about 6,300 lines in
 (cache, trees, transactions, log, checkpoints, recovery, snapshots),
 `lexdb_sql` (lexer, parser), `lexdb_exec` (catalog, rows, keys, planner,
 statements, sessions), `lexdb_wire` (protocol 3.0) and `lexdb` (the
-server). Tests: `python3 lexell/tests/lexdb.py` (61 programs in
+server). Tests: `python3 lexell/tests/lexdb.py` (62 programs in
 `tests/lexdb/run`, under `LXL_CHECK=1`).
 
     lexell/compiler/out/lxlc lexell/cmd/lexdb.lxl -o lexdb
-    ./lexdb /path/to/data 127.0.0.1:5433
+    ./lexdb /path/to/data 127.0.0.1:5433 /path/to/sockets
     psql "host=127.0.0.1 port=5433 user=me dbname=lexdb"
+    psql "host=/path/to/sockets port=5433 user=me dbname=lexdb"
+
+Each address after the data directory is listened on: `HOST:PORT` over
+TCP, a directory as a Unix socket named `.s.PGSQL.PORT` in it, or any other
+path with a `/` as the socket file itself (9.54).
 
 ### 9.1 What differs from the design
 
@@ -429,7 +434,8 @@ server). Tests: `python3 lexell/tests/lexdb.py` (61 programs in
 - **Interpreted, not bytecode.** The executor walks the statement's tree.
 - **No bytea, dates or times yet.** Schemas are built (9.20).
 - **Trust login**: no password, no TLS. The server listens on loopback by
-  default.
+  default; a Unix socket gets the umask's mode (0755 under 022: only its
+  owner can connect), not PostgreSQL's 0777.
 - **A simple query with several statements** runs each in its own
   transaction, not one implicit transaction as PostgreSQL does.
 - **Log segments are zero-filled** when made, not only allocated: a flush
@@ -915,7 +921,7 @@ proposed order of work, is in [lexdb-gaps.md](lexdb-gaps.md).
 ### 9.13 The cache in bytes
 
 - **The budget.** `Options.cacheBytes` (128 MB by default; the server takes
-  `LEXDB_CACHE_MB`) replaces a count of nodes. Each loaded node counts an
+  `LEXDB_CACHE_MB`, else a quarter of the memory since 9.54) replaces a count of nodes. Each loaded node counts an
   estimate of its memory, `lexdb_page.nodeCost`, kept per slot and summed;
   clean nodes are evicted while the sum is over the budget. The estimate
   was fitted to measurements: a node read from disk, its entries' bytes and
@@ -4095,4 +4101,96 @@ five):
   The survivor reads a dropped place. That cannot happen: a used column's
   place is never a dropped one in any layout, since places are not
   reused.
+
+**Point lookups,** after the batches. A profile of 500,000 lookups by key
+in one process (10 to 11 us each) put:
+- 30% in parsing;
+- 25% in planning;
+- 19% in the read.
+
+Two changes:
+- **A snapshot's get.** A statement's read was a one-key scan: a scan's
+  setup for one entry. `snapGet` descends to the key's leaf in the
+  snapshot once.
+- **Reserved words.** `isReserved` looped over 56 words for each name the
+  parser read. A `match` on the words is three times faster (89 to 28 ns
+  a word). `isKw` reads the token in place, not a copy.
+
+Together they take a lookup from 11.4 to 10.1 us in one process. Parsing
+and planning are still about half: a statement cache keyed by its text,
+or the extended protocol's prepared statements, skip both.
+
+### 9.54 Unix sockets; the cache sized from memory
+
+The user asked (2026-11-10) for Unix sockets.
+
+**Addresses.** `lexdb DATADIR [ADDR ...]` listens on every ADDR:
+- `HOST:PORT` over TCP; with none given, 127.0.0.1:5433 as before.
+- A directory: a socket in it named as PostgreSQL names one,
+  `.s.PGSQL.PORT`, with the first TCP address's port (its real one when
+  given as 0; 5433 without one). `psql -h DIR -p PORT` and libpq's
+  `host=DIR` find it.
+- Any other path with a `/`: the socket file itself.
+
+Each listener has its own accept loop (`lexdb_wire.acceptAll`), so
+connections come in through any of them. A connection is the same over
+either: the wire code's one TCP call, `setNoDelay`, fails harmlessly on a
+socket.
+
+**The socket file.**
+- **Left by a server that is gone** (a SIGKILL): a connect to it is
+  refused, and it is removed and made again.
+- **A server still answers on it:** an error, not replaced.
+- **Not a socket:** an error; it is never removed.
+- **On stop** (SIGTERM, SIGINT): the files made are removed.
+
+**The cache.** Measuring pgbench through the sockets showed lexdb's
+latency unchanged (233 us) where PostgreSQL's halved. The cause was not
+the socket: a Lexell echo server over a Unix socket answers in 55 us, as
+a C one does. It was the cache. The server's 128 MB default holds about
+two thirds of pgbench's 1M-row table. lexdb reads its data file past the
+kernel's cache (O_DIRECT), so every miss went to the disk: 189,086 pages
+read and 169,455 evicted in that run. PostgreSQL's 128 MB of shared
+buffers is backed by the kernel's cache, which on this machine is most of
+its 23 GB. The server now takes a quarter of `/proc/meminfo`'s MemTotal
+(128 MB at least; `LEXDB_CACHE_MB` still decides when set).
+
+**Results,** pgbench's select (`SELECT abalance FROM acct WHERE aid = :aid`,
+1M rows), both through Unix sockets, cache warm, transactions/s:
+
+| Mode, clients | lexdb, 128 MB | lexdb, cache warm | PostgreSQL 16 |
+|---|---:|---:|---:|
+| simple, 1 | 4,283 | 11,371 | 9,867 |
+| prepared, 1 | 7,052 | 13,250 | 12,401 |
+| simple, 8 | 19,881 | 22,398 | 64,038 |
+| prepared, 8 | 24,824 | 29,614 | 79,836 |
+| simple, 32 | 20,283 | 22,558 | 203,881 |
+| prepared, 32 | 26,615 | 34,230 | 287,495 |
+
+- **One client:** lexdb is ahead, by 15% simple and 7% prepared.
+- **Eight and more clients:** PostgreSQL runs a process per connection on
+  the 16 cores. lexdb runs its statements on one thread, which tops out
+  at 22,000 to 34,000 statements/s. Running statements on several cores is
+  a runtime change, the user's to decide.
+
+**Checked.**
+- **`wire_unix`.** Server and client (lib/postgres) in one process:
+  - a TCP address and a directory;
+  - rows written through the socket, read through TCP;
+  - a second server on a served socket refused;
+  - a stale socket replaced;
+  - a plain file left alone;
+  - a socket at a path of its own.
+- **Planted bugs.** Six were planted, and all six were caught:
+  - a live socket replaced;
+  - a plain file replaced;
+  - the directory's socket on 5433 whatever the port;
+  - a stale socket kept;
+  - one listener served;
+  - a socket file not recorded for removal.
+- **By hand.** The real server was tried with psql through the socket,
+  SIGKILL then a restart over the stale file, a second server, a plain
+  file, and SIGTERM (which removes the file).
+- **The suites.** 62 programs pass in both row forms; the crash test
+  passes 4 rounds.
 

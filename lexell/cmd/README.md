@@ -555,7 +555,7 @@ it. The design and its state are in
 
 | File | Contents |
 |---|---|
-| `lexdb.lxl` | the server: `lexdb DATADIR [ADDR]` (ADDR defaults to 127.0.0.1:5433) |
+| `lexdb.lxl` | the server: `lexdb DATADIR [ADDR ...]`; an ADDR is HOST:PORT (default 127.0.0.1:5433), a directory for a Unix socket `.s.PGSQL.PORT`, or a socket path |
 | `lexdb_wire.lxl` | protocol 3.0: startup, simple and extended queries |
 | `lexdb_sql.lxl` | the SQL lexer and parser |
 | `lexdb_exec.lxl` | the catalog, rows, keys, indexes, the planner's rules, joins, EXPLAIN, statements, sessions |

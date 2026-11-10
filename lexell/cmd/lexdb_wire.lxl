@@ -10,6 +10,7 @@
 // skipped, as PostgreSQL does. Results are text; parameters may be text or
 // binary integers, booleans and text.
 import "net"
+import "fs"
 import "task"
 import "io"
 import "binary"
@@ -705,6 +706,79 @@ pub fn serve(a: ConnArg): int {
 }
 
 pub type AcceptArg = record { pub ln: net.Listener; pub st: lexdb_store.Store }
+
+// Listens on each address (cmd/lexdb.lxl's ADDR, design/lexdb.md 9.54): the TCP ones first,
+// so a directory's socket can take the first one's port (its real one when
+// it was 0). The Unix socket files made are added to files, on an error too.
+pub fn listenAll(addrs: &[]str, files: mut &[]str): Result[[]net.Listener, str] {
+    var lns: []net.Listener = []
+    var port = "5433"
+    for a in addrs {
+        if strings.contains(a, "/") { continue }
+        match net.listen(a) {
+            Ok(ln) {
+                if len(lns) == 0 {
+                    let at = ln.localAddr()
+                    let i = strings.lastIndexOf(at, ":")
+                    if i >= 0 { port = at[i + 1..len(at)] }
+                }
+                append(mut &lns, ln)
+            }
+            Err(e) { return Err("listen " + a + ": " + e.toStr()) }
+        }
+    }
+    for a in addrs {
+        if !strings.contains(a, "/") { continue }
+        let isDir = match fs.stat(a) { Ok(x) { x.isDir() } Err(_) { false } }
+        let path = if !isDir { a } else if strings.endsWith(a, "/") { a + ".s.PGSQL." + port } else { a + "/.s.PGSQL." + port }
+        try clearStale(&path)
+        match net.listenUnix(path) {
+            Ok(ln) {
+                append(files, path)
+                append(mut &lns, ln)
+            }
+            Err(e) { return Err("listen " + path + ": " + e.toStr()) }
+        }
+    }
+    return Ok(lns)
+}
+
+// Removes a Unix socket file left at path by a server that is gone. A
+// socket a server answers on, or a file that is not a socket, is an error:
+// neither is replaced.
+pub fn clearStale(path: &str): Result[Unit, str] {
+    match fs.lstat(path) {
+        Ok(x) {
+            if x.kind() != fs.Kind.Socket { return Err("listen " + path + ": exists and is not a socket") }
+            match net.connectUnixFor(path, 500) {
+                Ok(c) { return Err("listen " + path + ": a server is listening on it") }
+                Err(_) {
+                    match fs.remove(path) {
+                        Ok(_) {}
+                        Err(e) { return Err("listen " + path + ": removing the stale socket: " + e.toStr()) }
+                    }
+                }
+            }
+        }
+        Err(_) {}
+    }
+    return Ok(Unit{})
+}
+
+pub type ListenArg = record { pub lns: []net.Listener; pub st: lexdb_store.Store }
+
+// Serves each listener (TCP or a Unix socket, design/lexdb.md 9.54) in an
+// accept loop of its own, until the task running it is cancelled.
+pub fn acceptAll(a: ListenArg): int {
+    var ListenArg{lns: lns, st: st} = move(a)
+    task.scope(fn(s: mut &task.Scope) {
+        while len(lns) > 0 {
+            let ln = pop(mut &lns)
+            s.spawn(acceptLoop, AcceptArg{ln: ln, st: st})
+        }
+    })
+    return 0
+}
 
 // Accepts connections and serves each in a task of its own, until the task
 // running it is cancelled (which cancels the connections' tasks too).
