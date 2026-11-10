@@ -155,7 +155,11 @@ methods of the primitive types there.
   scale (`0.50`), `format()` is the same as a Result (an error when the scale
   would drop digits), `canonical()` has no trailing zeros; `scale`, `exponent`,
   `coefficient`, `sign`, `isZero`, `isNeg`, `abs`, `neg`, `toFloat`,
-  `sumDecimals`. **Rounding** (written qualified, `Rounding.HALF_EVEN`):
+  `sumDecimals`. For storage, `toBin()` writes the fields as 2 to 22 bytes
+  (a flag byte, the display scale, the exponent if not 0, the coefficient's
+  bytes little-endian), and `Decimal.fromBin(s, at, n): Result[Decimal,
+  DecError]` reads them back with the same display scale; bytes `toBin`
+  never writes are DecError.Invalid. **Rounding** (written qualified, `Rounding.HALF_EVEN`):
   `HALF_EVEN HALF_AWAY HALF_TOWARD_ZERO TOWARD_ZERO AWAY FLOOR CEILING
   UNNECESSARY`. A fractional literal is `fromFraction(units: i128, scale:
   int)` (`1.5e3` is units 15, scale -2); a scale over 38 stops with

@@ -599,6 +599,90 @@ pub fn (a: Decimal) hash(): u64 {
     return hash.sipWords(u64(a.coef & M64), u64(a.coef >> 64) | u64(decB2i(a.neg)) << 63, decBitsOf(a.exp))
 }
 
+// ---- binary form
+
+// The value's fields as bytes, for storage: a flag byte (1 negative; 2 the
+// display scale takes two bytes, else one; 4 an exponent follows; 8 it
+// takes two bytes, else one, signed), the display scale (low byte first),
+// the exponent, then the coefficient's bytes, least significant first, as
+// few as it needs (none for zero). fromBin gives back the same value and
+// display scale. From 2 bytes (5: 3; 1.50: 4) to 22.
+pub fn (d: Decimal) toBin(): str {
+    var out: []byte = []
+    var flags = 0
+    if d.neg { flags += 1 }
+    if d.dscale > 255 { flags += 2 }
+    if d.exp != 0 {
+        flags += 4
+        if d.exp < -128 || d.exp > 127 { flags += 8 }
+    }
+    append(mut &out, byte(flags))
+    append(mut &out, byte(d.dscale & 255))
+    if flags & 2 != 0 { append(mut &out, byte(d.dscale >> 8)) }
+    if flags & 4 != 0 {
+        let e = d.exp & 0xFFFF
+        append(mut &out, byte(e & 255))
+        if flags & 8 != 0 { append(mut &out, byte(e >> 8)) }
+    }
+    var c = d.coef
+    while c != 0 {
+        append(mut &out, byte(c & 255))
+        c = c >> 8
+    }
+    return strFromBytes(&out)
+}
+
+// The value toBin wrote in s[at..at + n]. DecError.Invalid if the bytes are
+// not one toBin writes (too short or long, unknown flags, a coefficient
+// with a trailing zero digit or a high zero byte, a zero not written as
+// toBin writes it); Overflow if the coefficient has more than 38 digits.
+pub fn (Decimal) fromBin(s: &str, at: int, n: int): Result[Decimal, DecError] {
+    let end = at + n
+    if n < 2 || at < 0 || end > len(s) { return Err(DecError.Invalid) }
+    let flags = int(s[at])
+    if flags > 15 { return Err(DecError.Invalid) }
+    var p = at + 1
+    var dscale = int(s[p])
+    p += 1
+    if flags & 2 != 0 {
+        if p >= end { return Err(DecError.Invalid) }
+        dscale += int(s[p]) << 8
+        p += 1
+        if dscale < 256 { return Err(DecError.Invalid) }
+    }
+    var exp = 0
+    if flags & 4 != 0 {
+        if flags & 8 != 0 {
+            if p + 2 > end { return Err(DecError.Invalid) }
+            exp = int(s[p]) + (int(s[p + 1]) << 8)
+            if exp >= 32768 { exp -= 65536 }
+            p += 2
+            if exp >= -128 && exp <= 127 { return Err(DecError.Invalid) }
+        } else {
+            if p >= end { return Err(DecError.Invalid) }
+            exp = int(s[p])
+            if exp >= 128 { exp -= 256 }
+            p += 1
+        }
+        if exp == 0 { return Err(DecError.Invalid) }
+    } else if flags & 8 != 0 {
+        return Err(DecError.Invalid)
+    }
+    let m = end - p
+    if m > 16 { return Err(DecError.Invalid) }
+    if m > 0 && s[end - 1] == 0 { return Err(DecError.Invalid) }
+    var coef = u128(0)
+    for i in 0..m { coef = coef | (u128(s[p + i]) << (8 * i)) }
+    if coef > COEF_MAX { return Err(DecError.Overflow) }
+    let neg = flags & 1 != 0
+    if coef == 0 {
+        if neg || exp != 0 { return Err(DecError.Invalid) }
+    } else if coef % 10 == 0 {
+        return Err(DecError.Invalid)
+    }
+    return Ok(Decimal{coef: coef, exp: exp, dscale: dscale, neg: neg})
+}
+
 // ---- text
 
 // The display text: fixed notation with exactly scale() fraction digits.
