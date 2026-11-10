@@ -1260,14 +1260,7 @@ fn (st: &Store) getIn(t: mut &Txn, tree: int, key: str, mode: int): Result[Optio
         }
         None {}
     }
-    if t.snap >= 0 && !t.live {
-        var out: Option[str] = None
-        try st.scanIn(t, tree, key, key + "\x00", fn(e: &Entry): bool {
-            if e.key == key { out = Some(e.val) }
-            return false
-        }, mode)
-        return Ok(out)
-    }
+    if t.snap >= 0 && !t.live { return st.snapGet(t, tree, key, mode) }
     while true {
         var need = -1
         var out: Option[str] = None
@@ -1301,6 +1294,55 @@ fn (st: &Store) getIn(t: mut &Txn, tree: int, key: str, mode: int): Result[Optio
             return Ok(out)
         }
         try st.load(need)
+    }
+    return Ok(None)
+}
+
+// getIn for a snapshot's reads: the key's leaf as the snapshot sees it,
+// one descent (9.53; a one-key scan, as before, cost a point lookup 15%).
+fn (st: &Store) snapGet(t: mut &Txn, tree: int, key: str, mode: int): Result[Option[str], lexdb_base.DbErr] {
+    let root = match t.snapTrees.get(&tree) { Some(r) { r } None { -1 } }
+    let noting = t.noting()
+    while true {
+        var need = -1
+        var out: Option[str] = None
+        var bad: []lexdb_base.DbErr = []
+        st.sh.with(fn(db: mut &Db) {
+            if len(db.failed) > 0 {
+                append(mut &bad, db.failed[0])
+                return
+            }
+            if db.snapGone(t.snap) {
+                append(mut &bad, snapCancelled())
+                return
+            }
+            if root < 0 { return }
+            let d = db.snapDescend(root, t.snapSeq, &key, false)
+            if d.need >= 0 {
+                need = d.need
+                return
+            }
+            if d.missing {
+                append(mut &bad, lexdb_base.err(lexdb_base.S_INTERNAL, "snapshot: a node version is missing"))
+                return
+            }
+            let n = db.snapNode(d.leaf, d.ver)
+            let i = lowerIndex(&n.keys, &key)
+            if i < len(n.keys) && n.keys[i] == key { out = Some(n.vals[i]) }
+        })
+        if len(bad) > 0 { return Err(bad[0]) }
+        if need >= 0 {
+            try st.load(need)
+            continue
+        }
+        if noting { t.noteRead(tree, key, key + "\x00", t.snapSeq) }
+        match out {
+            Some(v) {
+                if marked(&v) && !isOvf(tree) && !(mode == M_PART && isStub(&v)) { return Ok(Some(try st.unstore(t, tree, &key, &v))) }
+            }
+            None {}
+        }
+        return Ok(out)
     }
     return Ok(None)
 }
