@@ -307,6 +307,38 @@ pub fn (f: &File) grow(n: int): Result[Unit, lexdb_base.DbErr] {
     }
 }
 
+// Reads len(dst) pages from off, dst[j] the page at off + j * PAGE, in one
+// call: a run of pages read ahead together (a scan's). Past the end of the
+// file the bytes are zeros.
+pub fn (f: &File) readPages(off: int, dst: mut &[][]byte): Result[Unit, lexdb_base.DbErr] {
+    let np = len(dst)
+    let n = np * PAGE
+    try alignedCheck(off, n, "read")
+    match f {
+        File.Real(fd) {
+            var buf = nullPtr()
+            if posix_memalign(mut &buf, PAGE, n) != 0 { panic("lexdb: out of memory (an I/O buffer)") }
+            let got = pread(fd, buf, n, off)
+            let e = errno()
+            if got < 0 {
+                freeMem(buf)
+                return Err(lexdb_base.ioErr("pread", e))
+            }
+            for j in 0..np {
+                let have = min(max(got - j * PAGE, 0), PAGE)
+                if have > 0 { copyOut(mut &dst[j][0..have], buf, j * PAGE, have) }
+                for i in have..PAGE { dst[j][i] = 0 }
+            }
+            freeMem(buf)
+            return Ok(Unit{})
+        }
+        File.Sim(_, _) {
+            for j in 0..np { try f.read(off + j * PAGE, mut &dst[j][0..PAGE], PAGE) }
+            return Ok(Unit{})
+        }
+    }
+}
+
 // Reads n bytes at off into dst[0..n). Past the end of the file the bytes
 // are zeros.
 pub fn (f: &File) read(off: int, dst: mut &[byte], n: int): Result[Unit, lexdb_base.DbErr] {

@@ -1,0 +1,208 @@
+// lexdb_store: read-ahead (design/lexdb.md 9.51). A tree of 8,000 keys, a
+// few hundred rewritten after its first checkpoint (so their leaves move
+// to other pages), checkpointed, then read from a cold cache: the store is
+// reopened before each read.
+// - A scan, a scan of the leaves in place (scanLeaves), a snapshot's scan
+//   and a scan merged with the transaction's own writes give the model's
+//   entries in key order, and read most of their pages ahead.
+// - A scan read in parts (a new scan per 500 entries, as the batches read)
+//   keeps its runs long: its reads ahead average over 16 pages.
+// - Lookups read their one page each: none ahead.
+// All on the simulated disk, then on a real directory (O_DIRECT, a run in
+// one pread: lexdb_disk.readPages).
+// expect: sim: scan: 8000 entries ok, most pages read ahead true
+// expect: sim: leaves in place: 8000 entries ok, most pages read ahead true
+// expect: sim: snapshot: 8000 entries ok, most pages read ahead true
+// expect: sim: own writes: 8050 entries ok, most pages read ahead true
+// expect: sim: in parts: 8000 entries ok, long runs true
+// expect: sim: lookups: 200 found, pages read ahead 0
+// expect: real: scan: 8000 entries ok, most pages read ahead true
+// expect: real: leaves in place: 8000 entries ok, most pages read ahead true
+// expect: real: snapshot: 8000 entries ok, most pages read ahead true
+// expect: real: own writes: 8050 entries ok, most pages read ahead true
+// expect: real: in parts: 8000 entries ok, long runs true
+// expect: real: lookups: 200 found, pages read ahead 0
+import "strings"
+import "os"
+import "fs"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+
+const N = 8000
+
+fn key(i: int): str { return strings.padLeft(i.toStr(), 8, '0') }
+
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: 4 * 1024 * 1024, segBytes: 1024 * 1024, ckptBytes: 512 * 1024, snapNodes: 100000}
+}
+
+// Whether keys and vals are the model's entries, in key order.
+fn same(keys: &[]str, vals: &[]str, model: &Map[str, str]): bool {
+    if len(keys) != model.size() { return false }
+    for i in 0..len(keys) {
+        if i > 0 && keys[i - 1] >= keys[i] { return false }
+        match model.get(&keys[i]) {
+            Some(v) { if v != vals[i] { return false } }
+            None { return false }
+        }
+    }
+    return true
+}
+
+fn report(what: str, keys: &[]str, vals: &[]str, model: &Map[str, str], x: lexdb_store.Stats): str {
+    let okText = if same(keys, vals, model) { " entries ok" } else { " entries WRONG" }
+    return what + ": " + len(keys).toStr() + okText + ", most pages read ahead " + (x.aheadPages * 2 > x.loads).toStr()
+}
+
+fn main() {
+    for l in readAll(lexdb_disk.sim(7)) { println("sim: " + l) }
+    // on a real directory: O_DIRECT reads of a run in one pread
+    let dir = fs.join(os.tempDir(), "lexdb_ahead_" + os.pid().toStr())
+    let made = fs.mkdirAll(dir)
+    for l in readAll(lexdb_disk.real(dir)) { println("real: " + l) }
+    let gone = fs.removeAll(dir)
+}
+
+fn readAll(d: lexdb_disk.Fs): []str {
+    var model: Map[str, str] = newMap()
+    var tree = -1
+    lexdb_store.run(d, opts(), fn(st: lexdb_store.Store): int {
+        var t0 = lexdb_store.begin()
+        tree = st.createTree(mut &t0)
+        st.commit(t0).unwrap()
+        var i = 0
+        while i < N {
+            var t = lexdb_store.begin()
+            for j in i..i + 400 {
+                let v = strings.repeat("v", 60) + j.toStr()
+                t.put(tree, key(j), v).unwrap()
+                model.put(key(j), v)
+            }
+            st.commit(t).unwrap()
+            i += 400
+        }
+        st.checkpointAll().unwrap()
+        // some leaves rewritten: their pages are elsewhere now
+        var t = lexdb_store.begin()
+        var j = 0
+        while j < N {
+            let v = "w" + j.toStr()
+            t.put(tree, key(j), v).unwrap()
+            model.put(key(j), v)
+            j += 37
+        }
+        st.commit(t).unwrap()
+        st.checkpointAll().unwrap()
+        return 0
+    }).unwrap()
+
+    var lines: []str = []
+    // a scan
+    lexdb_store.run(d, opts(), fn(st: lexdb_store.Store): int {
+        var t = lexdb_store.begin()
+        var ks: []str = []
+        var vs: []str = []
+        st.scan(mut &t, tree, "", "", fn(e: &lexdb_store.Entry): bool {
+            append(mut &ks, e.key)
+            append(mut &vs, e.val)
+            return true
+        }).unwrap()
+        st.abort(t)
+        append(mut &lines, report("scan", &ks, &vs, &model, st.stats()))
+        return 0
+    }).unwrap()
+    // the leaves in place
+    lexdb_store.run(d, opts(), fn(st: lexdb_store.Store): int {
+        var t = lexdb_store.begin()
+        var ks: []str = []
+        var vs: []str = []
+        let done = st.scanLeaves(mut &t, tree, "", "", fn(lk: &[]str, lv: &[]str, a: int, b: int): bool {
+            for k in a..b {
+                append(mut &ks, lk[k])
+                append(mut &vs, lv[k])
+            }
+            return true
+        }).unwrap()
+        st.abort(t)
+        append(mut &lines, report("leaves in place", &ks, &vs, &model, st.stats()))
+        return 0
+    }).unwrap()
+    // a snapshot's scan
+    lexdb_store.run(d, opts(), fn(st: lexdb_store.Store): int {
+        var t = st.beginSnapshot().unwrap()
+        var ks: []str = []
+        var vs: []str = []
+        st.scan(mut &t, tree, "", "", fn(e: &lexdb_store.Entry): bool {
+            append(mut &ks, e.key)
+            append(mut &vs, e.val)
+            return true
+        }).unwrap()
+        st.abort(t)
+        append(mut &lines, report("snapshot", &ks, &vs, &model, st.stats()))
+        return 0
+    }).unwrap()
+    // a scan with the transaction's own writes in its range
+    lexdb_store.run(d, opts(), fn(st: lexdb_store.Store): int {
+        var t = lexdb_store.begin()
+        var m2: Map[str, str] = newMap()
+        for k in 0..N { m2.put(key(k), model.get(&key(k)).unwrap()) }
+        for k in 0..50 {
+            let nk = key(k * 150) + "x"
+            t.put(tree, nk, "own").unwrap()
+            m2.put(nk, "own")
+        }
+        var ks: []str = []
+        var vs: []str = []
+        st.scan(mut &t, tree, "", "", fn(e: &lexdb_store.Entry): bool {
+            append(mut &ks, e.key)
+            append(mut &vs, e.val)
+            return true
+        }).unwrap()
+        st.abort(t)
+        append(mut &lines, report("own writes", &ks, &vs, &m2, st.stats()))
+        return 0
+    }).unwrap()
+    // a scan in parts
+    lexdb_store.run(d, opts(), fn(st: lexdb_store.Store): int {
+        var t = lexdb_store.begin()
+        var ks: []str = []
+        var vs: []str = []
+        var from = ""
+        var more = true
+        while more {
+            var n = 0
+            var next = ""
+            st.scan(mut &t, tree, from, "", fn(e: &lexdb_store.Entry): bool {
+                if n == 500 {
+                    next = e.key
+                    return false
+                }
+                append(mut &ks, e.key)
+                append(mut &vs, e.val)
+                n += 1
+                return true
+            }).unwrap()
+            if next == "" { more = false } else { from = next }
+        }
+        st.abort(t)
+        let x = st.stats()
+        let okText = if same(&ks, &vs, &model) { " entries ok" } else { " entries WRONG" }
+        append(mut &lines, "in parts: " + len(ks).toStr() + okText + ", long runs " + (x.aheadReads > 0 && x.aheadPages > 16 * x.aheadReads).toStr())
+        return 0
+    }).unwrap()
+    // lookups
+    lexdb_store.run(d, opts(), fn(st: lexdb_store.Store): int {
+        var t = lexdb_store.begin()
+        var found = 0
+        for k in 0..200 {
+            match st.get(mut &t, tree, key((k * 7919) % N)).unwrap() {
+                Some(v) { if v == model.get(&key((k * 7919) % N)).unwrap() { found += 1 } }
+                None {}
+            }
+        }
+        st.abort(t)
+        append(mut &lines, "lookups: " + found.toStr() + " found, pages read ahead " + st.stats().aheadPages.toStr())
+        return 0
+    }).unwrap()
+    return lines
+}

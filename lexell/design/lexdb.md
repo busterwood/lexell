@@ -3792,3 +3792,77 @@ reader. The fixed layout is now the default.
   change and its layout's being made, so it is kept as a guard for
   future code.
 
+### 9.51 Read-ahead
+
+The user asked for read-ahead (2026-11-10) after 9.49 found cold scans
+25 times slower than warm ones.
+
+**Why cold scans were slow.** The data file is opened with O_DIRECT, so
+every page read is a disk read: the operating system caches none of it. A
+scan read one 4 KiB page at a time. A probe in C, on this machine's disk:
+
+| O_DIRECT reads | per page |
+|---|---:|
+| random 4 KiB | 131 µs |
+| sequential 4 KiB | 65 µs |
+| 4 threads, 4 KiB each | 37 µs |
+| sequential 64 KiB | 7.6 µs |
+| sequential 256 KiB | 4.2 µs |
+
+Larger reads cost far less per page than parallel small ones. The pages
+a cold `count(*)` read were 98% each one after the last: checkpoints
+write a tree's leaves in key order, with the internal nodes between runs
+of about 60.
+
+**The read-ahead.**
+- **Which reads.** A forward scan (`scanIn`, and `scanLeaves` for the
+  batches), on the live tree or a snapshot, that needs a leaf not in
+  memory.
+- **What it reads.** That leaf, and the leaves after it under the same
+  parent that are not in memory and are on the pages right after it
+  (`runAt`). They are read in one `pread` (`File.readPages`) and
+  installed together (`loadAhead`).
+- **How much.** A run starts at 8 pages and doubles with each read, up to
+  64 (256 KiB). It is capped at a 32nd of the cache's budget, so a small
+  cache does not evict a run before the scan reaches it.
+- **Scans in parts.** The transaction keeps the run's size for its tree,
+  so a scan its caller takes in parts (a batch at a time) keeps its long
+  runs.
+- **Not lookups.** A lookup reads its one page, as before.
+- **Counted.** The store's stats count reads ahead and their pages.
+
+**Cold runs,** the first query after opening the store, 1M and 500K rows
+in the layout:
+
+| Query | before | runs restarting per call | runs kept |
+|---|---:|---:|---:|
+| `count(*)`, batches | 886 ms | 213 ms | 127 ms |
+| `count(*)`, row path | 1,171 ms | 455 ms | 351 ms |
+| 20 columns: `sum(c18) WHERE c17 > 50`, batches | 1,354 ms | 236 ms | 177 ms |
+| `sum(length(t)) WHERE id < 100000` | 172 ms | 97 ms | 88–97 ms |
+
+Warm runs are unchanged. A cold batch scan is still 4 to 5 times its warm
+time. Disk time is now about 4 µs a page, so most of what is left is
+decoding pages and the scan itself, done one after the other. Reading
+the next run while the last is decoded would overlap them. It needs a
+task per scan, not done yet.
+
+**Checked.**
+- **store_ahead,** new: a tree of 8,000 keys, a few hundred rewritten
+  after a checkpoint so their leaves move. Read from a cold cache, on the
+  simulated disk and a real directory:
+  - a scan, the leaves in place, a snapshot's scan, and a scan with the
+    transaction's own writes give the model's entries in order, with most
+    pages read ahead;
+  - a scan in parts keeps runs over 16 pages on average;
+  - lookups read none ahead.
+- **Planted bugs.** Five were planted, and four were caught:
+  - pages not checked to follow one another;
+  - every page copied from the run's start (caught only on the real
+    directory, which is why the test runs there too);
+  - the run's size not kept between scans;
+  - a snapshot's run taken from the wrong child.
+
+  The survivor installs a run without its first page. The scan then
+  reads that page again alone: one extra read, no wrong result.
+

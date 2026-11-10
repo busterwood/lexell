@@ -142,6 +142,8 @@ pub type Db = record {
     pub commits: int
     pub conflicts: int
     pub loads: int
+    pub aheadReads: int         // reads of pages ahead (loadAhead), and their pages
+    pub aheadPages: int
     pub evictions: int
     pub flushes: int
     pub checkpoints: int
@@ -190,10 +192,16 @@ pub type Txn = record {
     pub live: bool              // a block's reads go to the live tree for now (its UPDATE and DELETE: 9.16)
     pub path: []str             // the SQL layer's search path for its names (lexdb_exec); [] the default
     pub sess: int               // the SQL layer's session running it (its sequences' values, 9.43)
+    // Read-ahead's run size where the last scan left it, and its tree: a
+    // scan the caller goes on with in parts (a batch at a time) keeps
+    // growing its runs, not starting again at AHEAD_MIN.
+    raTree: int
+    ra: int
 }
 
 pub fn begin(): Txn {
-    return Txn{reads: [], writes: [], index: newMap(), created: [], snap: -1, snapSeq: 0, snapTrees: newMap(), track: false, live: false, path: [], sess: 0}
+    return Txn{reads: [], writes: [], index: newMap(), created: [], snap: -1, snapSeq: 0, snapTrees: newMap(), track: false, live: false, path: [], sess: 0,
+               raTree: -1, ra: AHEAD_MIN}
 }
 
 pub fn (t: &Txn) isSnapshot(): bool { return t.snap >= 0 }
@@ -560,6 +568,77 @@ fn (st: &Store) load(slot: int): Result[Unit, lexdb_base.DbErr] {
     try f.read(r.page * PAGE, mut &b[0..PAGE], PAGE)
     var res: Result[Unit, lexdb_base.DbErr] = Ok(Unit{})
     st.sh.with(fn(db: mut &Db) { res = db.install(r, &b) })
+    return res
+}
+
+// Read-ahead (9.51): a scan that needs a page loads it with the pages of
+// the leaves after it under the same parent, when those are not in memory
+// and are at the pages after its own, in one read. Checkpoints write a
+// tree's leaves in key order, so a run is most of a parent's children. A
+// scan's first read is AHEAD_MIN pages, each next one twice its last, up to
+// AHEAD_MAX (256 KiB): a short scan reads little ahead, a long one reads
+// at the disk's sequential speed. A lookup reads its one page (load).
+const AHEAD_MIN = 8
+const AHEAD_MAX = 64
+
+// The slots to read from kids[i] on, when kids[i] is not in memory: those
+// in a row whose pages follow its own, at most max.
+// A run is at most a 32nd of the cache's budget in pages (a decoded page
+// costs more than its 4 KiB), so a small cache does not evict a run's
+// pages before the scan reaches them.
+fn (db: &Db) runAt(kids: &[]int, i: int, most: int): []LoadReq {
+    var out: []LoadReq = []
+    if i < 0 || i >= len(kids) { return out }
+    let max = min(most, db.opts.cacheBytes / (32 * PAGE))
+    let first = kids[i]
+    let p0 = db.meta[first].disk
+    if p0 < 0 { return out }
+    var j = i
+    while j < len(kids) && len(out) < max {
+        let s = kids[j]
+        if !db.meta[s].used || db.meta[s].loaded || db.meta[s].disk != p0 + (j - i) { break }
+        append(mut &out, db.loadReq(s))
+        j += 1
+    }
+    return out
+}
+
+// The run of slots to read for slot need, which descend reached under
+// parent par (live tree) by key k: runAt there, if need is its child at k.
+fn (db: &Db) runFor(par: int, k: &str, need: int, max: int): []LoadReq {
+    let none: []LoadReq = []
+    if par < 0 || !db.meta[par].loaded { return none }
+    let pn = &db.pool[db.meta[par].frame]
+    if pn.leaf { return none }
+    let i = childIndex(&pn.keys, k)
+    if i >= len(pn.kids) || pn.kids[i] != need { return none }
+    return db.runAt(&pn.kids, i, max)
+}
+
+// Loads slot need, and the run read ahead with it (runAt) when there is
+// one: the pages in one read, installed together.
+fn (st: &Store) loadAhead(need: int, run: &[]LoadReq): Result[Unit, lexdb_base.DbErr] {
+    let n = len(run)
+    if n <= 1 || run[0].slot != need { return st.load(need) }
+    var f = lexdb_disk.File.Real(-1)
+    st.sh.with(fn(db: mut &Db) { f = db.data })
+    var bufs: [][]byte = []
+    for j in 0..n { append(mut &bufs, array(PAGE, byte(0))) }
+    try f.readPages(run[0].page * PAGE, mut &bufs)
+    var res: Result[Unit, lexdb_base.DbErr] = Ok(Unit{})
+    st.sh.with(fn(db: mut &Db) {
+        for j in 0..n {
+            match db.install(run[j], &bufs[j]) {
+                Ok(_) {}
+                Err(x) {
+                    res = Err(x)
+                    return
+                }
+            }
+        }
+        db.aheadReads += 1
+        db.aheadPages += n
+    })
     return res
 }
 
@@ -1273,9 +1352,11 @@ fn (st: &Store) scanIn(t: mut &Txn, tree: int, from: str, to: str, f: &fn(&Entry
     var cursor = from
     var more = true
     let noting = !raw && t.noting()
+    var ahead = if t.raTree == tree { t.ra } else { AHEAD_MIN }
     while more {
         var rseq = 0
         var need = -1
+        var run: []LoadReq = []
         var chunk: []Entry = []
         var bad: []lexdb_base.DbErr = []
         var upper = ""
@@ -1295,6 +1376,7 @@ fn (st: &Store) scanIn(t: mut &Txn, tree: int, from: str, to: str, f: &fn(&Entry
                 let d = db.snapDescend(root, t.snapSeq, &cursor, false)
                 if d.need >= 0 {
                     need = d.need
+                    if d.par >= 0 { run = db.runAt(&db.snapNode(d.par, d.pver).kids, d.at, ahead) }
                     return
                 }
                 if d.missing {
@@ -1315,6 +1397,7 @@ fn (st: &Store) scanIn(t: mut &Txn, tree: int, from: str, to: str, f: &fn(&Entry
             let d = db.descend(tree, &cursor)
             if d.need >= 0 {
                 need = d.need
+                if len(d.path) > 0 { run = db.runFor(d.path[len(d.path) - 1], &cursor, need, ahead) }
                 return
             }
             if len(d.path) == 0 { return }
@@ -1331,7 +1414,12 @@ fn (st: &Store) scanIn(t: mut &Txn, tree: int, from: str, to: str, f: &fn(&Entry
         })
         if len(bad) > 0 { return Err(bad[0]) }
         if need >= 0 {
-            try st.load(need)
+            try st.loadAhead(need, &run)
+            if len(run) > 1 {
+                ahead = min(ahead * 2, AHEAD_MAX)
+                t.raTree = tree
+                t.ra = ahead
+            }
             continue
         }
         let last = !hasUpper || (len(to) > 0 && upper >= to)
@@ -1385,9 +1473,11 @@ pub fn (st: &Store) scanLeaves(t: mut &Txn, tree: int, from: str, to: str,
     var cursor = from
     var more = true
     let noting = t.noting()
+    var ahead = if t.raTree == tree { t.ra } else { AHEAD_MIN }
     while more {
         var rseq = 0
         var need = -1
+        var run: []LoadReq = []
         var bad: []lexdb_base.DbErr = []
         var upper = ""
         var hasUpper = false
@@ -1411,6 +1501,7 @@ pub fn (st: &Store) scanLeaves(t: mut &Txn, tree: int, from: str, to: str,
                 let d = db.snapDescend(root, t.snapSeq, &cursor, false)
                 if d.need >= 0 {
                     need = d.need
+                    if d.par >= 0 { run = db.runAt(&db.snapNode(d.par, d.pver).kids, d.at, ahead) }
                     return
                 }
                 if d.missing {
@@ -1429,6 +1520,7 @@ pub fn (st: &Store) scanLeaves(t: mut &Txn, tree: int, from: str, to: str,
             let d = db.descend(tree, &cursor)
             if d.need >= 0 {
                 need = d.need
+                if len(d.path) > 0 { run = db.runFor(d.path[len(d.path) - 1], &cursor, need, ahead) }
                 return
             }
             if len(d.path) == 0 {
@@ -1446,7 +1538,12 @@ pub fn (st: &Store) scanLeaves(t: mut &Txn, tree: int, from: str, to: str,
         })
         if len(bad) > 0 { return Err(bad[0]) }
         if need >= 0 {
-            try st.load(need)
+            try st.loadAhead(need, &run)
+            if len(run) > 1 {
+                ahead = min(ahead * 2, AHEAD_MAX)
+                t.raTree = tree
+                t.ra = ahead
+            }
             continue
         }
         if empty { return Ok(true) }
@@ -1871,10 +1968,12 @@ fn snapCancelled(): lexdb_base.DbErr {
 // largest keys below it, "" the last): the leaf's slot and version (verOf),
 // a slot to load first, or a version missing; and the fence on its path
 // (forward: the separator above it; back: the one below it).
-type SnapLeaf = value record { leaf: int; ver: int; need: int; missing: bool; fence: str; hasFence: bool }
+// par, pver, at: where need was reached (the parent's slot and version,
+// the child's index), for read-ahead; par -1 at the root.
+type SnapLeaf = value record { leaf: int; ver: int; need: int; missing: bool; fence: str; hasFence: bool; par: int; pver: int; at: int }
 
 fn (db: mut &Db) snapDescend(root: int, q: int, cursor: &str, back: bool): SnapLeaf {
-    var r = SnapLeaf{leaf: -1, ver: -1, need: -1, missing: false, fence: "", hasFence: false}
+    var r = SnapLeaf{leaf: -1, ver: -1, need: -1, missing: false, fence: "", hasFence: false, par: -1, pver: -1, at: -1}
     var s = root
     while true {
         let v = db.verOf(s, q)
@@ -1899,6 +1998,9 @@ fn (db: mut &Db) snapDescend(root: int, q: int, cursor: &str, back: bool): SnapL
                 r.fence = n.keys[j - 1]
                 r.hasFence = true
             }
+            r.par = s
+            r.pver = v
+            r.at = j
             s = n.kids[j]
         } else {
             let i = childIndex(&n.keys, cursor)
@@ -1906,6 +2008,9 @@ fn (db: mut &Db) snapDescend(root: int, q: int, cursor: &str, back: bool): SnapL
                 r.fence = n.keys[i]
                 r.hasFence = true
             }
+            r.par = s
+            r.pver = v
+            r.at = i
             s = n.kids[i]
         }
     }
@@ -2480,7 +2585,7 @@ fn newDb(fs: lexdb_disk.Fs, data: lexdb_disk.File, opts: Options, m: &lexdb_page
               durableBatch: m.replayBatch - 1, waiters: [], writerWake: [], ckptWake: [], ckptDone: [], seg: m.replaySeg,
               segOff: m.replayOff, logSinceCkpt: 0, failed: [], closing: false, seq: 0, snaps: [], nextSnap: 0,
               hist: [], histCount: 0, histSlots: [], deferred: [], rootHist: [], durableSeq: 0, snapshots: 0, tooOld: 0, commits: 0,
-              conflicts: 0, loads: 0, evictions: 0, flushes: 0, checkpoints: 0, held: 0, wholes: 0}
+              conflicts: 0, loads: 0, aheadReads: 0, aheadPages: 0, evictions: 0, flushes: 0, checkpoints: 0, held: 0, wholes: 0}
 }
 
 // Opens the store in fs (creating it when it is new) and recovers: the last
@@ -2720,6 +2825,8 @@ pub type Stats = value record {
     pub commits: int
     pub conflicts: int
     pub loads: int
+    pub aheadReads: int
+    pub aheadPages: int
     pub evictions: int
     pub flushes: int
     pub checkpoints: int
@@ -2752,10 +2859,11 @@ pub fn (st: &Store) memoPut(k: &str, v: &str) { st.sh.with(fn(db: mut &Db) { db.
 pub fn (st: &Store) memoDel(k: &str) { st.sh.with(fn(db: mut &Db) { let gone = db.memo.remove(k) }) }
 
 pub fn (st: &Store) stats(): Stats {
-    var s = Stats{commits: 0, conflicts: 0, loads: 0, evictions: 0, flushes: 0, checkpoints: 0, loaded: 0,
+    var s = Stats{commits: 0, conflicts: 0, loads: 0, aheadReads: 0, aheadPages: 0, evictions: 0, flushes: 0, checkpoints: 0, loaded: 0,
                   cacheUsed: 0, held: 0, pages: 0, free: 0, freeRuns: 0, dropped: 0, wholes: 0}
     st.sh.with(fn(db: mut &Db) {
-        s = Stats{commits: db.commits, conflicts: db.conflicts, loads: db.loads, evictions: db.evictions,
+        s = Stats{commits: db.commits, conflicts: db.conflicts, loads: db.loads, aheadReads: db.aheadReads,
+                  aheadPages: db.aheadPages, evictions: db.evictions,
                   flushes: db.flushes, checkpoints: db.checkpoints, loaded: db.loadedCount,
                   cacheUsed: db.cacheUsed, held: db.held, pages: db.npages,
                   free: runPages(&db.free), freeRuns: len(db.free) / 2, dropped: len(db.dropped) / 2, wholes: db.wholes}
