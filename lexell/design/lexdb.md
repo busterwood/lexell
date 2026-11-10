@@ -393,7 +393,7 @@ Built on 2026-11-09 on branch `lexdb`, about 6,300 lines in
 (cache, trees, transactions, log, checkpoints, recovery, snapshots),
 `lexdb_sql` (lexer, parser), `lexdb_exec` (catalog, rows, keys, planner,
 statements, sessions), `lexdb_wire` (protocol 3.0) and `lexdb` (the
-server). Tests: `python3 lexell/tests/lexdb.py` (57 programs in
+server). Tests: `python3 lexell/tests/lexdb.py` (58 programs in
 `tests/lexdb/run`, under `LXL_CHECK=1`).
 
     lexell/compiler/out/lxlc lexell/cmd/lexdb.lxl -o lexdb
@@ -579,6 +579,8 @@ is the comparison to make.
    decoded into a plain array (ints as `[]int`, a NULL bitmap), and run
    conditions and aggregates over the arrays. Measure first: the share of a
    scan's time now in decoding, dispatch and the B+tree walk.
+    A prototype is built for aggregates over one table (9.47): 4 to 5 times
+    faster.
 12. Fast aggregation with SIMD (the user's backlog, 2026-11-09), on top of
    item 11: `sum`, `count`, `min`, `max` and filters over a column array
    with AVX2 (Lexell already requires x86-64-v3). Lexell has no vector
@@ -3322,3 +3324,149 @@ Five survived the first run; the test then gained:
 - a bare `OVER w` with a frame;
 - a window's DESC with its default NULLs;
 - the `ROWS n PRECEDING` shorthand.
+
+### 9.47 Batches, not rows: a prototype for aggregates
+
+The user's idea (item 11 of 9.4), prototyped so that the two can be
+compared: rows processed in batches of up to 1,024, not one at a time.
+
+**Where it applies.** An aggregate query (with or without GROUP BY) over
+one table read in primary key order: no join, no subquery, no index path,
+no window calls, no DISTINCT or ORDER BY inside an aggregate. The parts
+the batches evaluate:
+- **Columns:** integers and booleans; columns of other types only for
+  IS NULL, count and GROUP BY.
+- **Expressions:** constants and parameters (each evaluated once), + - * /
+  %, unary minus, the six comparisons, AND, OR, NOT, IS [NOT] NULL.
+- **Aggregates:** count(*), count, sum, avg, min and max over integers,
+  with FILTER.
+- **Group keys:** one integer or boolean key, hashed as an integer; other
+  keys as encoded strings.
+
+Anything else, and any stored value of an unexpected kind (an integer
+column holding another tag), returns before anything is done, and the row
+path runs the query as before. `SET lexdb_batch = off` turns the batches
+off; they are on by default. EXPLAIN ANALYZE shows them ("batches N").
+
+**How** (`batchGroups` and the functions before it, at the end of
+lexdb_exec.lxl).
+- **Compiling.** The WHERE's conditions, the group keys and the
+  aggregates' arguments and FILTERs are compiled into `BNode` trees.
+- **Reading.** `fetchRaw` scans up to 1,024 stored rows. `bDecode` reads
+  each row's tags once and writes the columns used into arrays (`BVec`:
+  ints and NULL flags; values for other types). Large rows go through
+  `rowOf`, as in the row path.
+- **WHERE.** It is a list of the rows chosen, narrowed one condition at a
+  time: one loop per node over the batch, not a tree walk per row. A
+  comparison with a constant keeps the constant in a register. AND and OR
+  evaluate their right side only on the rows the left leaves open, as
+  `eval` does, so a division by zero in a row the left side excludes is
+  not an error.
+- **Groups.** Each chosen row's group is found or made, in the rows' order.
+- **Aggregates.** `bAccum` adds each aggregate's values into plain
+  integers per group, in one loop per aggregate. With no GROUP BY the
+  running sum and count stay in registers.
+- **The end.** The accumulators become the row path's `Groups` and `Acc`
+  records, so `finish`, HAVING, the output and ORDER BY are unchanged.
+  Sums overflow with 22003, as `arith` does.
+- **Limits.** `tickN` counts a batch's rows for statement_timeout and
+  turn-taking. Groups count toward max_statement_mem as in `addToGroup`.
+
+**One difference.** A query whose rows hit two errors may report the other
+one first, because each aggregate runs over a whole batch before the next.
+In the row path every aggregate takes a row before the next row. Both
+report an error. PostgreSQL does not promise which of several errors comes
+first either.
+
+**Checked.**
+- **`exec_batch`:** 400 random aggregate queries, each run with batches
+  off and on, must give the same results and errors.
+  - **The table:** 1,800 rows (two batches and part of a third) with NULLs
+    in every column; int, smallint and bigint, a boolean, texts; large
+    rows of both kinds; a dropped column and an added one with a default.
+  - **The queries:** arithmetic with division by zero and overflow, nested
+    AND, OR and NOT, NULL constants, FILTER, and six kinds of GROUP BY.
+  - **In a transaction:** 100 of them run inside a block whose own inserts,
+    updates and deletes are not committed.
+  - **Also:** overflowing sums, and the shapes left to the row path.
+  - **The result:** all 400 the same. 338 ran in batches. 51 others were
+    errors, which EXPLAIN ANALYZE cannot show. The rest read no rows or
+    were max(id) read from the key's end.
+- **The other tests.** Batches are on by default, so the suite exercises
+  them too: about 1,400 queries in 27 test programs ran in batches, all
+  with their expected results. exec_with's EXPLAIN ANALYZE line now shows
+  "batches 5", for a LATERAL subquery's count, its outer value a
+  parameter.
+
+**Measured** in the executor, 1M rows of (id, g = i % 10, n = i % 97, v,
+t), all in the cache. Best of five, in ms; the two rounds agreed within 4%:
+
+| Query | Rows | Batches | Faster |
+|---|---:|---:|---:|
+| `count(*)` | 227 | 52 | 4.4× |
+| 4 aggregates `WHERE n > 10` | 466 | 82–85 | 5.6× |
+| `sum(v)` with three conditions | 450 | 93 | 4.8× |
+| `GROUP BY g`, 3 aggregates | 479–491 | 124–129 | 3.8× |
+| `GROUP BY n WHERE v % 2 = 0` | 465 | 99–102 | 4.6× |
+
+**The hardware counters** per row (perf stat; 11 runs less 1, divided by
+10):
+
+| Per row | 4 aggregates, rows | batches | GROUP BY g, rows | batches |
+|---|---:|---:|---:|---:|
+| Instructions | 6,689 | 1,633 | 7,370 | 2,735 |
+| Cycles | 2,191 | 404 | 2,221 | 593 |
+| Instructions per cycle | 3.05 | 4.04 | 3.32 | 4.61 |
+| Branch misses | 0.91 | 0.18 | 0.65 | 0.16 |
+| Cache misses | 0.90 | 0.57 | 0.89 | 0.53 |
+
+The user's reasons for batches were better branch prediction, prefetching
+and use of the caches and registers.
+- **Instructions.** Most of the gain is executing 3 to 4 times fewer:
+  no tree walk, no tagged values and no allocation per row.
+- **Instructions per cycle.** The rest: the CPU runs the tight loops
+  better (3.0–3.3 rises to 4.0–4.6).
+- **Branch misses.** Rare before (0.05–0.08% of branches; under one per
+  row, about 15 of 2,200 cycles), so the predictor was not the limit.
+- **Cache misses.** Below one per row either way, with the data in
+  lexdb's cache. Prefetching would matter on rows read from the disk,
+  which this did not measure.
+
+**Against PostgreSQL 16**, the same table and queries through psql (the
+results identical), best of five, in ms:
+
+| Query | PostgreSQL, parallel | PostgreSQL, one core | lexdb rows | lexdb batches |
+|---|---:|---:|---:|---:|
+| `count(*)` | 15 | 26–27 | 233 | 54–56 |
+| 4 aggregates `WHERE n > 10` | 26–27 | 59–60 | 468–470 | 88 |
+| `sum(v)` with three conditions | 22 | 44–45 | 449–455 | 96–99 |
+| `GROUP BY g`, 3 aggregates | 41–43 | 103 | 467–479 | 127–129 |
+| `GROUP BY n WHERE v % 2 = 0` | 60–61 | 72–73 | 477–486 | 103–105 |
+
+PostgreSQL runs these on two workers and its own process by default; on
+one core (`max_parallel_workers_per_gather = 0`) it compares per core. The
+row path was 7 to 18 times slower than PostgreSQL on one core; batches are
+1.2 to 2.2 times slower.
+
+**Where the batches' time goes now** (a native profile of the 4-aggregate
+query):
+- **Decoding: about 39%.** bDecode walks every row's tags.
+- **The store's scan: about 37%.** It copies each entry out of its leaf
+  (`scanIn`), then into the batch (`fetchRaw`), and loads the pages on the
+  first run.
+- **The evaluation itself: about 20%** (bEval, bAccum, and `checkedAdd`,
+  which is a call, not inlined).
+
+**What would come next:**
+- **A scan that gives a leaf's entries in place,** not copied twice. Most
+  of the store's 37%.
+- **Decoding:** stop at the last column used; skip `partOf` for rows that
+  cannot be large; decode nothing for `count(*)`.
+- **More shapes:** filters and projections without aggregates (most of
+  `SELECT ... WHERE`), joins' probe side, numeric columns (stored as text
+  now, parsed per value), index paths.
+- **The row format itself:** a page that keeps each column's values
+  together would make decoding a copy. A storage format change, so the
+  user's decision.
+- **Parallel scans,** which PostgreSQL uses on these queries: the
+  multi-core question.

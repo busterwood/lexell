@@ -1,0 +1,255 @@
+// lexdb_exec: aggregates over batches of rows (design/lexdb.md 9.47)
+// against the row path. Random aggregate queries over a table of 1,800
+// rows (two batches and part of a third) run with SET lexdb_batch = off and
+// on; their results, errors included, must be the same.
+// - The table has NULLs in every column, integers of three sizes, a
+//   boolean, texts, large rows (a long text kept in the row's leaf, and one
+//   longer than a leaf entry, kept apart), a dropped column (its place
+//   skipped) and an added one (its default in the rows before it).
+// - The queries: count(*), count, sum, avg, min and max of columns and of
+//   arithmetic (/ and % by a column that is sometimes 0, unary minus), with
+//   FILTER; WHERE of comparisons (with NULL constants too), IS NULL, AND, OR
+//   and NOT; GROUP BY none, one integer, a boolean, a text, two columns,
+//   an expression.
+// - Again inside a transaction with its own inserts, updates and deletes
+//   not committed.
+// - Sums that overflow (22003), as the row path gives them.
+// - How many of the queries ran in batches (EXPLAIN ANALYZE shows them).
+//   Of those that did not, 51 are errors (EXPLAIN ANALYZE fails on them);
+//   the rest read no rows (an empty range of the key: id < NULL) or are
+//   max(id), read from the key's end by the row path.
+// - The shapes the batches leave to the row path: the same results.
+// A query with two errors may give the other first with batches (an
+// aggregate is run over a batch before the next one is): those are
+// counted, and none comes up in these queries.
+// expect: committed: 300 queries, 300 the same with and without batches, 0 with two errors, another first
+// expect: in a transaction: 100 queries, 100 the same with and without batches, 0 errors, its writes: INSERT 0 50, UPDATE 264, DELETE 168
+// expect: batched: 338 of 400, 51 errors (EXPLAIN ANALYZE fails on them)
+// expect: overflow: ERROR 22003 bigint out of range | ERROR 22003 bigint out of range
+// expect: overflow filtered out: 6 | 6
+// expect: not batched: min(t), sum(distinct), a join, a subquery, an index path: 5 the same
+import "strings"
+import "../../../cmd/lexdb_base"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            var out: []str = []
+            for r in rs {
+                if !r.hasRows { append(mut &out, r.tag) }
+                for row in r.rows {
+                    var vs: []str = []
+                    for v in row { append(mut &vs, lexdb_exec.text(&v)) }
+                    append(mut &out, strings.join(&vs, "|"))
+                }
+            }
+            return strings.join(&out, " ")
+        }
+        Err(e) { return "ERROR " + e.state + " " + e.msg }
+    }
+}
+
+fn pick(r: mut &lexdb_base.Rng, xs: &[]str): str { return xs[r.below(len(xs))] }
+
+fn intCol(r: mut &lexdb_base.Rng): str { return pick(r, &["g", "h", "n", "a", "id", "k"]) }
+
+fn anyCol(r: mut &lexdb_base.Rng): str { return pick(r, &["g", "h", "n", "a", "id", "k", "f", "t", "big"]) }
+
+fn cmpOp(r: mut &lexdb_base.Rng): str { return pick(r, &["=", "<>", "<", "<=", ">", ">="]) }
+
+// safe: no division and no product of two columns (no error: in a
+// transaction an error would end it).
+fn intExpr(r: mut &lexdb_base.Rng, depth: int, safe: bool): str {
+    let c = r.below(10)
+    if depth > 1 || c < 4 { return intCol(r) }
+    if c < 6 { return intCol(r) + " " + pick(r, &["+", "-", "*"]) + " " + r.below(20).toStr() }
+    if c < 7 && !safe { return "(" + intExpr(r, depth + 1, safe) + ") " + pick(r, &["/", "%"]) + " (" + intCol(r) + " - " + r.below(4).toStr() + ")" }
+    if c < 8 { return "-" + intCol(r) }
+    if safe { return intCol(r) + " - " + intCol(r) }
+    // n times n overflows for n = 10^15; the small columns' products do not
+    let small = ["g", "h", "a", "k"]
+    return (if r.below(8) == 0 { "n" } else { pick(r, &small) }) + " * " + pick(r, &small)
+}
+
+fn cond(r: mut &lexdb_base.Rng, depth: int, safe: bool): str {
+    let c = r.below(12)
+    if depth < 2 && c < 2 { return "(" + cond(r, depth + 1, safe) + ") and (" + cond(r, depth + 1, safe) + ")" }
+    if depth < 2 && c < 4 { return "(" + cond(r, depth + 1, safe) + ") or (" + cond(r, depth + 1, safe) + ")" }
+    if depth < 2 && c < 5 { return "not (" + cond(r, depth + 1, safe) + ")" }
+    if c < 6 { return anyCol(r) + " is " + pick(r, &["null", "not null"]) }
+    if c < 7 { return pick(r, &["f", "not f", "f = true", "f <> (g > 3)", "f is not null and f"]) }
+    if c < 8 { return intExpr(r, 0, safe) + " " + cmpOp(r) + " " + intExpr(r, 0, safe) }
+    if c < 9 { return intCol(r) + " " + cmpOp(r) + " null" }
+    return intExpr(r, 0, safe) + " " + cmpOp(r) + " " + (r.below(60) - 10).toStr()
+}
+
+fn agg(r: mut &lexdb_base.Rng, safe: bool): str {
+    let c = r.below(6)
+    var a = ""
+    if c == 0 { a = "count(*)" }
+    else if c == 1 { a = "count(" + anyCol(r) + ")" }
+    else if c == 2 { a = "sum(" + intExpr(r, 0, safe) + ")" }
+    else if c == 3 { a = "avg(" + intExpr(r, 0, safe) + ")" }
+    else if c == 4 { a = "min(" + intExpr(r, 0, safe) + ")" }
+    else { a = "max(" + intExpr(r, 0, safe) + ")" }
+    if r.below(4) == 0 { a = a + " filter (where " + cond(r, 1, safe) + ")" }
+    return a
+}
+
+fn query(r: mut &lexdb_base.Rng, safe: bool): str {
+    let groups = ["", "", "g", "f", "t", "g, f", "n % 5", "a", "h, t", "k"]
+    let gb = pick(r, &groups)
+    var items: []str = []
+    var ord: []str = []
+    if len(gb) > 0 {
+        let parts = strings.split(&gb, ", ")
+        for i in 0..len(parts) {
+            append(mut &items, parts[i])
+            append(mut &ord, (i + 1).toStr())
+        }
+    }
+    let na = 1 + r.below(3)
+    for i in 0..na { append(mut &items, agg(r, safe)) }
+    var sql = "select " + strings.join(&items, ", ") + " from b"
+    if r.below(4) != 0 { sql = sql + " where " + cond(r, 0, safe) }
+    if len(gb) > 0 { sql = sql + " group by " + gb + " order by " + strings.join(&ord, ", ") }
+    return sql
+}
+
+// A random value for an insert: NULL about one time in seven.
+fn val(r: mut &lexdb_base.Rng, s: str): str { return if r.below(7) == 0 { "null" } else { s } }
+
+fn bigText(n: int): str {
+    var b = newStrBuf()
+    for i in 0..n { b.add(if i % 10 == 9 { " " } else { "x" }) }
+    return b.toStr()
+}
+
+fn rowSql(r: mut &lexdb_base.Rng, id: int, withA: bool): str {
+    let big = r.below(40)
+    var bt = "'short'"
+    if big == 0 { bt = "'" + bigText(300) + "'" } else if big == 1 { bt = "'" + bigText(2000) + "'" }
+    var vs: []str = [id.toStr(), val(r, r.below(10).toStr()), val(r, (r.below(11) - 5).toStr())]
+    if !withA { append(mut &vs, "0") }      // the column dropped later
+    let more: []str = [val(r, if r.below(20) == 0 { "1000000000000000" } else { (r.below(2001) - 1000).toStr() }),
+                     val(r, pick(r, &["true", "false"])), val(r, pick(r, &["'a'", "'b'", "'c'"])), val(r, bt),
+                     val(r, r.below(4).toStr())]
+    for m in more { append(mut &vs, m) }
+    if withA { append(mut &vs, val(r, (r.below(9) - 2).toStr())) }
+    return "(" + strings.join(&vs, ", ") + ")"
+}
+
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: 1024 * 1024, segBytes: 4 * 1024 * 1024, ckptBytes: 2 * 1024 * 1024, snapNodes: 100000}
+}
+
+// Runs sql without and with batches: 0 the same, 1 an error both ways but
+// not the same one (a query with two errors: which comes first differs,
+// 9.47), 2 different (printed).
+fn both(s: mut &lexdb_exec.Session, sql: &str, errs: mut &int): int {
+    let a = q(s, &"set lexdb_batch = off")
+    let off = q(s, sql)
+    let b = q(s, &"set lexdb_batch = on")
+    let on = q(s, sql)
+    if strings.startsWith(on, "ERROR") { errs += 1 }
+    if off == on { return 0 }
+    if strings.startsWith(on, "ERROR") && strings.startsWith(off, "ERROR") { return 1 }
+    println("DIFFERENT: " + sql)
+    println("  rows:    " + off)
+    println("  batches: " + on)
+    return 2
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(47), opts(), fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        var r = lexdb_base.rng(47)
+        let c1 = q(mut &s, &"create table b (id int primary key, g int, h smallint, dropme int, n bigint, f boolean, t text, big text, k int)")
+        var id = 1
+        for chunk in 0..15 {
+            var rows: []str = []
+            for i in 0..100 {
+                append(mut &rows, rowSql(mut &r, id, false))
+                id += 1
+            }
+            let ins = q(mut &s, &("insert into b values " + strings.join(&rows, ", ")))
+            if ins != "INSERT 0 100" { println("insert: " + ins) }
+        }
+        let c2 = q(mut &s, &"alter table b drop column dropme")
+        let c3 = q(mut &s, &"alter table b add column a int default 7")
+        for chunk in 0..3 {
+            var rows: []str = []
+            for i in 0..100 {
+                append(mut &rows, rowSql(mut &r, id, true))
+                id += 1
+            }
+            let ins = q(mut &s, &("insert into b (id, g, h, n, f, t, big, k, a) values " + strings.join(&rows, ", ")))
+            if ins != "INSERT 0 100" { println("insert: " + ins) }
+        }
+        var errs = 0
+        var batched = 0
+        var same = 0
+        var otherErr = 0
+        for i in 0..300 {
+            let sql = query(mut &r, false)
+            let k = both(mut &s, &sql, mut &errs)
+            if k == 0 { same += 1 } else if k == 1 { otherErr += 1 }
+            if strings.contains(q(mut &s, &("explain analyze " + sql)), "batches") { batched += 1 }
+        }
+        println("committed: 300 queries, " + same.toStr() + " the same with and without batches, " + otherErr.toStr() +
+                " with two errors, another first")
+        // inside a transaction: its own writes, not committed, merged into the scan
+        let bg = q(mut &s, &"begin")
+        var rows: []str = []
+        for i in 0..50 {
+            append(mut &rows, rowSql(mut &r, id, true))
+            id += 1
+        }
+        let ins = q(mut &s, &("insert into b (id, g, h, n, f, t, big, k, a) values " + strings.join(&rows, ", ")))
+        let up = q(mut &s, &"update b set n = n + 1, g = null where id % 7 = 0")
+        let del = q(mut &s, &"delete from b where id % 11 = 0")
+        var same2 = 0
+        let errs0 = errs
+        for i in 0..100 {
+            let sql = query(mut &r, true)
+            if both(mut &s, &sql, mut &errs) == 0 { same2 += 1 }
+            if strings.contains(q(mut &s, &("explain analyze " + sql)), "batches") { batched += 1 }
+        }
+        let rb = q(mut &s, &"rollback")
+        println("in a transaction: 100 queries, " + same2.toStr() + " the same with and without batches, " +
+                (errs - errs0).toStr() + " errors, its writes: " + ins + ", " + up + ", " + del)
+        println("batched: " + batched.toStr() + " of 400, " + errs.toStr() + " errors (EXPLAIN ANALYZE fails on them)")
+        // sums past 2^63 - 1
+        let c4 = q(mut &s, &"create table o (id int primary key, n bigint); insert into o values (1, 4611686018427387904), (2, 4611686018427387904), (3, 5)")
+        let ov = "select count(*), sum(n) from o"
+        let off1 = q(mut &s, &"set lexdb_batch = off")
+        let a1 = q(mut &s, &ov)
+        let on1 = q(mut &s, &"set lexdb_batch = on")
+        let b1 = q(mut &s, &ov)
+        println("overflow: " + a1 + " | " + b1)
+        let fil = "select sum(n) filter (where id > 2) + count(*) - 2 from o"
+        let off2 = q(mut &s, &"set lexdb_batch = off")
+        let a2 = q(mut &s, &fil)
+        let on2 = q(mut &s, &"set lexdb_batch = on")
+        let b2 = q(mut &s, &fil)
+        println("overflow filtered out: " + a2 + " | " + b2)
+        // shapes the batches leave to the row path
+        let c5 = q(mut &s, &"create index b_k on b (k); create table d (g int primary key, label text); insert into d values (1, 'one'), (2, 'two')")
+        let others = ["select min(t), max(t) from b", "select sum(distinct g) from b",
+                      "select d.label, count(*) from b join d on d.g = b.g group by d.label order by 1",
+                      "select count(*) from b where g in (select g from d)", "select count(*), sum(n) from b where k = 2"]
+        var same3 = 0
+        var unbatched = 0
+        for o in others {
+            if both(mut &s, &o, mut &errs) == 0 { same3 += 1 }
+            if !strings.contains(q(mut &s, &("explain analyze " + o)), "batches") { unbatched += 1 }
+        }
+        println("not batched: min(t), sum(distinct), a join, a subquery, an index path: " + same3.toStr() + " the same" +
+                (if unbatched == 5 { "" } else { " (" + (5 - unbatched).toStr() + " batched)" }))
+        return 0
+    }).unwrap()
+}
