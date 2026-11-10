@@ -601,6 +601,9 @@ is the comparison to make.
    clients to read the ids back (built: 9.44); (3) COPY (built: 9.45).
 16. Window functions (the user's request, 2026-11-09; built: 9.46).
 
+A review against PostgreSQL 16 (2026-11-10), with the gaps in tiers and a
+proposed order of work, is in [lexdb-gaps.md](lexdb-gaps.md).
+
 ### 9.5 Indexes and joins (D4)
 
 - **An index is a tree of its own.** Per row, its key is the indexed
