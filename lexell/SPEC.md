@@ -1239,6 +1239,15 @@ loop for sockets (`net`) and timers. The rules the language relies on:
   its task through the event loop. A task parked in a blocking call is not a
   deadlock: the program waits for the call. The helper threads end with the
   program; a call still running then is abandoned with them.
+- Two experimental switches of the native backend's event loop, both off by
+  default (design/lexdb.md 9.57). `LXL_URING=1`: socket reads (`net`'s
+  `read`) go through io_uring: each parked read queues a receive, and the
+  loop's wait is one `io_uring_enter` that submits them all; without a
+  kernel that sets the ring up (Linux 6.1), epoll as before. `LXL_SPIN_US=N`:
+  when the loop would sleep with tasks waiting for sockets, it first looks
+  without waiting for up to N microseconds (never past the nearest timer).
+  Observable behaviour is the same either way; only CPU time and latency
+  change.
 - `Future[T]` is owned (one place waits for it). Dropping it without
   waiting cancels its task; its scope still waits for the task to finish,
   and its result is dropped then.

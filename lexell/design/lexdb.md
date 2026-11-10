@@ -4345,3 +4345,91 @@ said to go ahead (2026-11-10) with: an io_uring event loop in the Lexell
 runtime, beside epoll behind a switch, measured with pgbench against lexdb
 over TCP and Unix sockets; then polling before sleeping.
 
+### 9.57 io_uring in the runtime, behind a switch; polling before sleeping
+
+Built as 9.56 proposed (the user: "go ahead", 2026-11-10), in the native
+runtime (`compiler/native/rt.c`); the C backend's runtime keeps epoll.
+
+**`LXL_URING=1`.** `net`'s `Conn.read` and `ReadHalf.read` now call one
+runtime function, `lxllib_net_recv`, that parks until data (before, the
+library looped over a non-blocking read and a readiness wait). Through the
+ring it queues an `IORING_OP_RECV` into the caller's buffer and parks; the
+loop's wait is one `io_uring_enter` that submits every queued receive and
+waits for the first completion (SINGLE_ISSUER | DEFER_TASKRUN, so
+completions are made only inside that call, on this thread). A turn of the
+scheduler costs one system call for all its reads, where epoll costs a read
+that finds nothing per socket plus an `epoll_wait`. Writes stay `send`.
+
+- **Everything else stays with epoll.** The epoll set is watched from the
+  ring by a multishot poll on its descriptor. A ring socket is in the set
+  for hangups only (EPOLLRDHUP): with EPOLLIN or EPOLLOUT in it, every
+  message, and every write-space wakeup (9.56), would also fire the set.
+  A readiness wait (a write that found the buffer full, a timed wait) adds
+  the bit for its duration with EPOLL_CTL_MOD, which reports readiness
+  already there.
+- **Stopping a read.** A read whose task is cancelled, or whose deadline
+  passes, queues an `IORING_OP_ASYNC_CANCEL` and submits and reaps it at
+  once: a receive waiting for data is cancelled inline, so the task goes
+  on in the same turn as with epoll (`net_accept_cancel` checks the order).
+  Data that arrived meanwhile is returned rather than lost; the buffer is
+  never written after the call returns.
+- **One ring per process**, made at the first socket; a `task.workers`
+  child closes the parent's and makes its own.
+- **Tests:** the library's 306, lexdb's 62 and the 797 of the conformance
+  suite pass with epoll; the library's and lexdb's pass with `LXL_URING=1`
+  too, and the library's with `LXL_URING=1 LXL_SPIN_US=50`.
+
+**pgbench point selects** (`bench/sock/pgsel.sh`: 1M rows, prepared,
+cache warm, 10 s runs, the server's CPU per select from `/proc`; averages
+of two rounds, the server restarted per mode):
+
+| Through, clients | epoll | io_uring | |
+|---|---|---|---:|
+| Unix, 32 | 34,160/s, 28.3 us | 38,950/s, 24.9 us | +14% |
+| Unix, 8 | 28,880/s, 33.3 us | 30,620/s, 31.4 us | +6% |
+| Unix, 1 | 13,350/s, 45.3 us | 12,780/s, 43.2 us | -4% |
+| TCP, 32 | 42,560/s, 22.8 us | 45,720/s, 21.2 us | +7% |
+| TCP, 8 | 29,910/s, 21.5 us | 29,430/s, 21.6 us | 0 |
+| TCP, 1 | 5,050/s, 33.1 us | 4,660/s, 34.8 us | -8% |
+
+Under load io_uring saves 7 to 12% of the server's CPU a select and gains
+up to 14% throughput, as `sockbench` predicted (9.56). With one client
+there is nothing to batch, and it is a little slower. Runs vary: a second
+series gave io_uring at Unix/32 34,560 once against about 38,700 three
+times.
+
+One client over TCP manages only 5,000 round trips a second in both modes:
+200 us each, against 75 us over a Unix socket. A C ping-pong over loopback
+TCP shows the same (4,300 to 4,500/s), so it is WSL2's loopback TCP, not
+lexdb.
+
+**`LXL_SPIN_US=N`: polling before sleeping.** When the loop would sleep
+with tasks waiting for sockets, it looks without waiting for up to N us
+first (never past the nearest timer). 50 us, averages of two rounds:
+
+| Through, clients | without | with 50 us |
+|---|---|---|
+| Unix, 1 | 13,340/s, 45 us | 19,370/s (+45%), 49 us |
+| TCP, 1 | 4,500/s, 34 us | 3,400/s (-25%), 82 us |
+| TCP, 8 | 29,300/s, 22 us | 31,100/s (+6%), 27 us |
+| 32 clients | | no change |
+
+It pays only when the next request comes within the window. Over a Unix
+socket pgbench's next request is back in about 50 us, so the loop is still
+awake for it; over WSL2's loopback TCP a round trip is 200 us, so the loop
+spins 50 us for nothing and sleeps anyway, which costs CPU and, here,
+throughput. A fixed spin is therefore not a default. The shape that would
+be: adaptive, as KVM's halt polling (spin only while recent waits were
+shorter than the window; grow the window when spinning succeeds, drop it
+when the wait after spinning was long).
+
+**Not done:**
+- Writes through the ring. They usually complete at once, so the saving
+  is one system call per batch at most; it needs buffers kept alive until
+  completion, and ordering for partial sends.
+- The C backend's runtime (`rt.h`): epoll only.
+- io_uring as the default: it needs measurements where wakeups are cheap
+  (bare metal), and the one-client case is 4 to 8% slower here.
+- Adaptive spinning (above).
+- Files through the ring (9.17).
+

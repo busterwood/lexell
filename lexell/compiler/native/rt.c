@@ -1833,7 +1833,8 @@ struct k_epoll_event { uint32_t events; uint64_t data; } __attribute__((packed))
 #define K_O_NONBLOCK 0x800
 #define K_O_CLOEXEC 0x80000
 #define K_EPOLLEXCLUSIVE (1u << 28)
-typedef struct { rt_task *rd, *wr; uint8_t reg, lazy; rt_task* hup; uint8_t hupmode, gone, halves; } rt_fdw;    /* see rt.h */
+/* ur, upend, udone, ures: io_uring's receives (below); not in rt.h, whose sockets are epoll's only */
+typedef struct { rt_task *rd, *wr; uint8_t reg, lazy; rt_task* hup; uint8_t hupmode, gone, halves; uint8_t ur, upend, udone; int32_t ures; } rt_fdw;    /* see rt.h */
 static rt_fdw* rt_fds;
 static int64_t rt_nfds;
 static int rt_epfd = -1;
@@ -1903,8 +1904,159 @@ static void rt_timer_del(rt_task* t) {
     t->hidx = 0;
     if (i < rt_nheap) { rt_hset(i, last); rt_hup(i); rt_hdown(last->hidx - 1); }
 }
+static void rt_epoll_events(struct k_epoll_event* ev, i64 n) {
+    for (i64 i = 0; i < n; i++) {
+        if (ev[i].data == RT_POOL_TAG) { rt_pool_drain(true); continue; }
+        if (ev[i].data == RT_SIG_TAG) { rt_sig_read(); continue; }
+        int64_t fd = (int64_t)ev[i].data;
+        uint32_t e = ev[i].events;
+        if (fd >= rt_nfds) continue;
+        if (e & (K_EPOLLRDHUP | K_EPOLLHUP | K_EPOLLERR)) rt_hup_seen(fd, e);
+        if (rt_fds[fd].rd && (e & (K_EPOLLIN | K_EPOLLRDHUP | K_EPOLLHUP | K_EPOLLERR))) rt_wake(rt_fds[fd].rd);
+        if (rt_fds[fd].wr && (e & (K_EPOLLOUT | K_EPOLLHUP | K_EPOLLERR))) rt_wake(rt_fds[fd].wr);
+    }
+}
+
+/* ---- io_uring for socket reads (LXL_URING=1; design/lexdb.md 9.57). A read that parks queues a
+   receive (IORING_OP_RECV) into the caller's buffer instead of waiting for readiness; the event
+   loop's wait is one io_uring_enter that submits every queued receive and waits for the first
+   completion. A turn of the scheduler (every task run until it parks) thus costs one system call
+   for all its reads, where epoll costs a read that finds nothing per socket and an epoll_wait.
+   Everything else stays with epoll: the epoll set itself is watched from the ring (a multishot
+   poll on its descriptor), and sockets are in it for hangups only (EPOLLRDHUP), with EPOLLIN or
+   EPOLLOUT added for the time of a readiness wait (a write that found the buffer full, a timed
+   wait). One ring per process, made at the first socket (so a task.workers child makes its own);
+   SINGLE_ISSUER | DEFER_TASKRUN: completions are produced only inside io_uring_enter, on this
+   thread, with no interrupt of the running code. */
+enum { S_IO_URING_SETUP = 425, S_IO_URING_ENTER = 426 };
+struct k_sqe { uint8_t op, flags; uint16_t ioprio; int32_t fd; uint64_t off, addr; uint32_t len, opflags;
+               uint64_t ud; uint16_t bufi, pers; int32_t splice; uint64_t addr3, pad; };
+struct k_cqe { uint64_t ud; int32_t res; uint32_t flags; };
+struct k_ur_params { uint32_t sq_entries, cq_entries, flags, sq_thread_cpu, sq_thread_idle, features, wq_fd, resv[3];
+                     uint32_t sq_head, sq_tail, sq_mask, sq_n, sq_flags, sq_dropped, sq_array, sq_r1; uint64_t sq_ua;
+                     uint32_t cq_head, cq_tail, cq_mask, cq_n, cq_overflow, cq_cqes, cq_flags, cq_r1; uint64_t cq_ua; };
+#define K_UR_RECV 27
+#define K_UR_POLL 6
+#define K_UR_CANCEL 14
+#define K_UR_TAG_RECV (1ull << 56)
+#define K_UR_TAG_EPOLL (2ull << 56)
+#define K_UR_TAG_CANCEL (3ull << 56)
+#define K_ECANCELED 125
+static int rt_uring = -1;                 /* -1 not decided yet, 0 epoll only, 1 the ring */
+static int rt_ring = -1;
+static uint32_t *rt_sqh, *rt_sqt, *rt_cqh, *rt_cqt;
+static uint32_t rt_sqmask, rt_sqn, rt_cqmask, rt_sqlocal;
+static struct k_sqe* rt_sqes;
+static struct k_cqe* rt_cqes;
+static bool rt_ur_epoll_armed;
+static i64 rt_ur_submit(uint32_t minc, int ms) {
+    __atomic_store_n(rt_sqt, rt_sqlocal, __ATOMIC_RELEASE);
+    uint32_t sub = rt_sqlocal - __atomic_load_n(rt_sqh, __ATOMIC_ACQUIRE);
+    struct { uint64_t sigmask; uint32_t sigsz, pad; uint64_t ts; } arg = {0, 0, 0, 0};
+    struct { i64 s, ns; } ts = {ms / 1000, (i64)(ms % 1000) * 1000000};
+    uint32_t flags = 1;                                             /* IORING_ENTER_GETEVENTS */
+    if (minc && ms > 0) { arg.ts = (uint64_t)&ts; flags |= 8; }    /* IORING_ENTER_EXT_ARG */
+    return sys6(S_IO_URING_ENTER, rt_ring, sub, minc, flags, (flags & 8) ? (i64)&arg : 0, (flags & 8) ? sizeof arg : 0);
+}
+static struct k_sqe* rt_sqe(void) {
+    if (rt_sqlocal - __atomic_load_n(rt_sqh, __ATOMIC_ACQUIRE) >= rt_sqn) rt_ur_submit(0, 0);
+    struct k_sqe* q = &rt_sqes[rt_sqlocal & rt_sqmask];
+    rt_sqlocal++;
+    memset(q, 0, sizeof *q);
+    return q;
+}
+static void rt_ur_arm_epoll(void) {
+    struct k_sqe* q = rt_sqe();
+    q->op = K_UR_POLL;
+    q->fd = rt_epfd;
+    q->opflags = 1;                                                 /* POLLIN */
+    q->len = 1;                                                     /* IORING_POLL_ADD_MULTI */
+    q->ud = K_UR_TAG_EPOLL;
+    rt_ur_epoll_armed = true;
+}
+/* Decides, at the first socket (the epoll set exists by then), whether sockets read through the
+   ring: LXL_URING=1 and a kernel that sets one up with these flags (6.1 and later). */
+static bool rt_uring_on(void) {
+    if (rt_uring >= 0) return rt_uring;
+    rt_uring = 0;
+    const char* v = getenv("LXL_URING");
+    if (!v || v[0] != '1') return false;
+    struct k_ur_params p;
+    memset(&p, 0, sizeof p);
+    p.flags = (1u << 12) | (1u << 13);                              /* SINGLE_ISSUER | DEFER_TASKRUN */
+    i64 fd = SYS(S_IO_URING_SETUP, 1024, &p, 0);
+    if (fd < 0 || !(p.features & 1)) { if (fd >= 0) SYS(S_CLOSE, fd, 0, 0); return false; }   /* FEAT_SINGLE_MMAP */
+    i64 sl = p.sq_array + p.sq_entries * 4, cl = p.cq_cqes + (i64)p.cq_entries * sizeof(struct k_cqe);
+    if (cl > sl) sl = cl;
+    i64 m = sys6(S_MMAP, 0, sl, 3, 0x8001, fd, 0);                    /* MAP_SHARED|MAP_POPULATE, IORING_OFF_SQ_RING */
+    i64 e = sys6(S_MMAP, 0, (i64)p.sq_entries * sizeof(struct k_sqe), 3, 0x8001, fd, 0x10000000);
+    if (m < 0 && m > -4096) m = 0;
+    if (e < 0 && e > -4096) e = 0;
+    if (!m || !e) { SYS(S_CLOSE, fd, 0, 0); return false; }
+    char* b = (char*)m;
+    rt_sqh = (uint32_t*)(b + p.sq_head);
+    rt_sqt = (uint32_t*)(b + p.sq_tail);
+    rt_sqmask = *(uint32_t*)(b + p.sq_mask);
+    rt_sqn = p.sq_entries;
+    uint32_t* arr = (uint32_t*)(b + p.sq_array);
+    for (uint32_t i = 0; i < p.sq_entries; i++) arr[i] = i;
+    rt_cqh = (uint32_t*)(b + p.cq_head);
+    rt_cqt = (uint32_t*)(b + p.cq_tail);
+    rt_cqmask = *(uint32_t*)(b + p.cq_mask);
+    rt_cqes = (struct k_cqe*)(b + p.cq_cqes);
+    rt_sqes = (struct k_sqe*)e;
+    rt_sqlocal = *rt_sqt;
+    rt_ring = (int)fd;
+    rt_uring = 1;
+    rt_ur_arm_epoll();
+    return true;
+}
+/* Takes the completions: a receive's result goes to its socket and wakes its reader; the epoll
+   set's poll firing collects its events without waiting. */
+static void rt_ur_reap(struct k_epoll_event* ev, i64 nev) {
+    uint32_t h = *rt_cqh, t = __atomic_load_n(rt_cqt, __ATOMIC_ACQUIRE);
+    bool ep = false;
+    for (; h != t; h++) {
+        struct k_cqe* c = &rt_cqes[h & rt_cqmask];
+        uint64_t kind = c->ud & (0xffull << 56);
+        if (kind == K_UR_TAG_RECV) {
+            int64_t fd = (int64_t)(c->ud & 0xffffffffu);
+            if (fd < rt_nfds && rt_fds[fd].upend) {
+                rt_fds[fd].upend = 0;
+                rt_fds[fd].udone = 1;
+                rt_fds[fd].ures = c->res;
+                if (rt_fds[fd].rd) rt_wake(rt_fds[fd].rd);
+            }
+        } else if (kind == K_UR_TAG_EPOLL) {
+            ep = true;
+            if (!(c->flags & 2)) rt_ur_epoll_armed = false;       /* IORING_CQE_F_MORE: still armed */
+        }
+    }
+    __atomic_store_n(rt_cqh, h, __ATOMIC_RELEASE);
+    if (ep) rt_epoll_events(ev, SYS4(S_EPOLL_WAIT, rt_epfd, ev, nev, 0));
+    if (!rt_ur_epoll_armed) rt_ur_arm_epoll();
+}
+/* A ring socket's epoll interest: hangups, and in or out for the time of a readiness wait. */
+static void rt_ur_interest(int64_t fd, uint32_t extra) {
+    struct k_epoll_event ev = {K_EPOLLRDHUP | K_EPOLLET | extra, (uint64_t)fd};
+    SYS4(S_EPOLL_CTL, rt_epfd, 3, fd, &ev);                        /* EPOLL_CTL_MOD */
+}
+
+/* Polling before sleeping (LXL_SPIN_US, design/lexdb.md 9.57): when the loop would block with
+   tasks waiting for sockets, it first looks without waiting for up to that long (never past the
+   nearest timer). A client's next request then finds the loop awake, which saves the wakeup of
+   this thread (an interrupt from the CPU the request arrived on; costly in a virtual machine) at
+   the price of the CPU time spent looking. */
+static int64_t rt_spin_ns = -1;
 static void rt_poll(bool block, const char* w) {
     struct k_epoll_event ev[256];
+    bool spun = false;
+    if (rt_spin_ns < 0) {
+        const char* v = getenv("LXL_SPIN_US");
+        int64_t us = 0;
+        if (v) for (; *v >= '0' && *v <= '9'; v++) us = us * 10 + (*v - '0');
+        rt_spin_ns = us > 1000000 ? 1000000000 : us * 1000;
+    }
     for (;;) {
         int64_t wait = block && !rt_rq_head ? -1 : 0;
         if (rt_nheap) {
@@ -1919,21 +2071,29 @@ static void rt_poll(bool block, const char* w) {
             else if (rt_nheap && wait) wait = rt_heap[0]->wake_at - now;
         }
         if (wait < 0 && !rt_nio && !rt_njobs) rt_trap(14, "deadlock: every task is parked", w);
+        if (wait != 0 && rt_nio && rt_spin_ns && !spun) {
+            spun = true;
+            int64_t now = rt_mono(), end = now + (wait > 0 && wait < rt_spin_ns ? wait : rt_spin_ns);
+            do {
+                if (rt_ring >= 0) { rt_ur_submit(0, 0); rt_ur_reap(ev, 256); }
+                else rt_epoll_events(ev, SYS4(S_EPOLL_WAIT, rt_epfd, ev, 256, 0));
+            } while (!rt_rq_head && rt_mono() < end);
+            continue;                       /* timers again; then sleep if still nothing */
+        }
         if (rt_nio || rt_njobs) {
             int ms = wait < 0 ? -1 : wait > (int64_t)INT32_MAX * 1000000 ? INT32_MAX
                    : (int)(wait / 1000000 + (wait % 1000000 != 0));
             if (rt_njobs) ms = rt_pool_check(ms);
-            i64 n = rt_nio || ms ? SYS4(S_EPOLL_WAIT, rt_epfd, ev, 256, ms) : 0;
-            __atomic_store_n(&rt_pool_asleep, 0, __ATOMIC_RELAXED);
-            for (i64 i = 0; i < n; i++) {
-                if (ev[i].data == RT_POOL_TAG) { rt_pool_drain(true); continue; }
-                if (ev[i].data == RT_SIG_TAG) { rt_sig_read(); continue; }
-                int64_t fd = (int64_t)ev[i].data;
-                uint32_t e = ev[i].events;
-                if (fd >= rt_nfds) continue;
-                if (e & (K_EPOLLRDHUP | K_EPOLLHUP | K_EPOLLERR)) rt_hup_seen(fd, e);
-                if (rt_fds[fd].rd && (e & (K_EPOLLIN | K_EPOLLRDHUP | K_EPOLLHUP | K_EPOLLERR))) rt_wake(rt_fds[fd].rd);
-                if (rt_fds[fd].wr && (e & (K_EPOLLOUT | K_EPOLLHUP | K_EPOLLERR))) rt_wake(rt_fds[fd].wr);
+            if (rt_ring >= 0) {
+                /* one call: submit the queued receives, wait for a completion unless one is in */
+                bool have = *rt_cqh != __atomic_load_n(rt_cqt, __ATOMIC_ACQUIRE);
+                if (rt_nio || ms) rt_ur_submit(have || !ms ? 0 : 1, ms);
+                __atomic_store_n(&rt_pool_asleep, 0, __ATOMIC_RELAXED);
+                rt_ur_reap(ev, 256);
+            } else {
+                i64 n = rt_nio || ms ? SYS4(S_EPOLL_WAIT, rt_epfd, ev, 256, ms) : 0;
+                __atomic_store_n(&rt_pool_asleep, 0, __ATOMIC_RELAXED);
+                rt_epoll_events(ev, n);
             }
         } else if (wait > 0) {
             struct { i64 s, ns; } d = {wait / 1000000000, wait % 1000000000};
@@ -2151,10 +2311,13 @@ static i64 rt_fd_room(i64 fd) {
 static int64_t rt_net_new(i64 fd) {
     i64 e = rt_fd_room(fd);
     if (e < 0) { SYS(S_CLOSE, fd, 0, 0); return e; }
-    struct k_epoll_event ev = {K_EPOLLIN | K_EPOLLOUT | K_EPOLLRDHUP | K_EPOLLET, (uint64_t)fd};
+    bool ur = rt_uring_on();
+    struct k_epoll_event ev = {(ur ? 0 : K_EPOLLIN | K_EPOLLOUT) | K_EPOLLRDHUP | K_EPOLLET, (uint64_t)fd};
     i64 r = SYS4(S_EPOLL_CTL, rt_epfd, 1, fd, &ev);             /* EPOLL_CTL_ADD */
     if (r < 0) { SYS(S_CLOSE, fd, 0, 0); return r; }
     rt_fds[fd].reg = 1;
+    rt_fds[fd].ur = ur;
+    rt_fds[fd].upend = rt_fds[fd].udone = 0;
     rt_fds[fd].lazy = 0;
     rt_fds[fd].hup = 0;
     rt_fds[fd].hupmode = rt_fds[fd].gone = rt_fds[fd].halves = 0;
@@ -2242,6 +2405,7 @@ void lxllib_net_close(int64_t fd) {
         rt_fds[fd].reg = rt_fds[fd].lazy = 0;
         rt_fds[fd].hup = 0;
         rt_fds[fd].hupmode = rt_fds[fd].gone = rt_fds[fd].halves = 0;
+        rt_fds[fd].ur = rt_fds[fd].upend = rt_fds[fd].udone = 0;
     }
     SYS(S_CLOSE, fd, 0, 0);
 }
@@ -2261,12 +2425,71 @@ int64_t lxllib_net_wait(int64_t fd, int64_t dir, const char* w) {
         rt_fds[fd].reg = 1;
         rt_nreg++;
     }
+    bool ur = rt_fds[fd].ur;
+    if (ur) rt_ur_interest(fd, dir ? K_EPOLLOUT : K_EPOLLIN);
     if (dir) rt_fds[fd].wr = rt_cur; else rt_fds[fd].rd = rt_cur;
     rt_nio++;
     int r = rt_park_until(true, rt_cur->deadline, w);
     rt_nio--;
     if (dir) rt_fds[fd].wr = 0; else rt_fds[fd].rd = 0;
+    if (ur) rt_ur_interest(fd, 0);
     return r;
+}
+/* Reads what has arrived, up to n bytes, parking until there is something: the count (0 at the
+   end of the stream), -errno, or 0 with *stop 1 (cancelled) or 3 (the deadline passed). Through
+   the ring, a receive is queued and the task parks until it completes; if the task is stopped
+   first, the receive is cancelled and its completion still awaited (the kernel may be writing
+   into b until then), and data that arrived meanwhile is returned rather than lost. */
+int64_t lxllib_net_recv(int64_t fd, void* b, int64_t n, const char* w, int64_t* stop) {
+    *stop = 0;
+    if (fd >= rt_nfds || !rt_fds[fd].ur) {
+        for (;;) {
+            i64 k = SYS(S_READ, fd, b, n);
+            if (k >= 0) return k;
+            if (k == -K_EAGAIN) {
+                int64_t r = lxllib_net_wait(fd, 0, w);
+                if (r < 0) return r;
+                if (r) { *stop = r; return 0; }
+            } else if (k != -4) return k;                           /* EINTR: again */
+        }
+    }
+    if (n <= 0) return 0;
+    rt_nopark(w);
+    if (rt_cur->cancelled) { *stop = 1; return 0; }
+    if (rt_expired()) { *stop = 3; return 0; }
+    struct k_sqe* q = rt_sqe();
+    q->op = K_UR_RECV;
+    q->fd = (int32_t)fd;
+    q->addr = (uint64_t)b;
+    q->len = (uint32_t)(n > 0x7fffffff ? 0x7fffffff : n);
+    q->ud = K_UR_TAG_RECV | (uint64_t)fd;
+    rt_fds[fd].upend = 1;
+    rt_fds[fd].udone = 0;
+    rt_fds[fd].rd = rt_cur;
+    rt_nio++;
+    int r = RT_WOK;
+    while (!rt_fds[fd].udone) {
+        r = rt_park_until(true, rt_cur->deadline, w);
+        if (r != RT_WOK && !rt_fds[fd].udone) {
+            struct k_sqe* c = rt_sqe();
+            c->op = K_UR_CANCEL;
+            c->addr = K_UR_TAG_RECV | (uint64_t)fd;
+            c->ud = K_UR_TAG_CANCEL;
+            /* submitted and reaped now: a receive waiting for data is cancelled inline, so the
+               task goes on in this turn as with epoll; one in progress is awaited */
+            struct k_epoll_event ev[64];
+            rt_ur_submit(0, 0);
+            rt_ur_reap(ev, 64);
+            while (!rt_fds[fd].udone) rt_park_until(false, RT_NEVER, w);
+        }
+    }
+    rt_nio--;
+    rt_fds[fd].rd = 0;
+    rt_fds[fd].udone = 0;
+    i64 res = rt_fds[fd].ures;
+    if (r == RT_WOK || res >= 0) return res == -K_ECANCELED ? -4 : res;
+    *stop = r;
+    return 0;
 }
 void* lxllib_task_promise(void* resdrop) {
     rt_task* t = rt_alloc(sizeof *t);
@@ -2681,6 +2904,7 @@ int64_t lxllib_proc_fork(void) {
         rt_worker_parent = parent;
         rt_worker_base = rt_live;
         if (rt_epfd >= 0) { SYS(S_CLOSE, rt_epfd, 0, 0); rt_epfd = -1; }
+        if (rt_ring >= 0) { SYS(S_CLOSE, rt_ring, 0, 0); rt_ring = -1; rt_uring = -1; }
         SYS4(S_RT_SIGPROCMASK, 2, &rt_sup_old, 0, 8);
         SYS(S_PRCTL, 1, K_SIGTERM, 0);                             /* PR_SET_PDEATHSIG */
         if (SYS(S_GETPPID, 0, 0, 0) != parent) SYS(S_KILL, SYS(S_GETPID, 0, 0, 0), K_SIGTERM, 0);
@@ -3135,10 +3359,13 @@ int64_t lxllib_net_wait_for(int64_t fd, int64_t dir, int64_t ms, bool cancellabl
         return r;
     }
     if (fd >= rt_nfds || !rt_fds[fd].reg) return -K_EINVAL_;
+    bool ur = rt_fds[fd].ur;
+    if (ur) rt_ur_interest(fd, dir ? K_EPOLLOUT : K_EPOLLIN);
     if (dir) rt_fds[fd].wr = rt_cur; else rt_fds[fd].rd = rt_cur;
     rt_nio++;
     int r = rt_park_until(cancellable, rt_fd_until(ms, cancellable), w);
     rt_nio--;
     if (dir) rt_fds[fd].wr = 0; else rt_fds[fd].rd = 0;
+    if (ur) rt_ur_interest(fd, 0);
     return r;
 }
