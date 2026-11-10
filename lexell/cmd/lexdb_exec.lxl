@@ -10636,6 +10636,100 @@ fn bRowInto(s: &str, r: int, b: mut &Batch, bp: &BPlan, t: &Table): Result[int, 
     return Ok(0)
 }
 
+// Decodes the rows vs[from..] that are in the fixed layout of vs[from],
+// up to vs[to], into rows b.n on of b, a column at a time: per column used
+// its offset, kind and NULL bit are the run's, and an integer is read in
+// place (9.53). The number of rows decoded: 0 when vs[from] is not in the
+// fixed layout (bRowInto reads it), -1 a value of a kind its column's
+// batch does not hold (as bRowInto's 1).
+fn bRunInto(vs: &[]str, from: int, to: int, b: mut &Batch, bp: &BPlan, t: &Table): Result[int, DbErr] {
+    let s0 = &vs[from]
+    if len(s0) < 3 || s0[0] != FIXED { return Ok(0) }
+    let id = try layOf(s0, &t.lays)
+    let lay = &t.lays[id]
+    let id0 = s0[1]
+    let id1 = s0[2]
+    let v0 = lay.v0
+    var end = from + 1
+    while end < to {
+        let s = &vs[end]
+        if len(s) < v0 || s[0] != FIXED || s[1] != id0 || s[2] != id1 { break }
+        end += 1
+    }
+    let n = end - from
+    let r0 = b.n
+    let np = len(lay.kinds)
+    for pl in bp.usedP {
+        let c = bp.placeCol[pl]
+        let k = bp.kinds[c]
+        if pl >= np {
+            let mv = if pl < len(bp.missing) { bp.missing[pl] } else { Val.Null }
+            for q in 0..n { if !bPut(b, c, r0 + q, mv, k) { return Ok(-1) } }
+            continue
+        }
+        let pk = lay.kinds[pl]
+        if pk == PK_NONE {
+            for q in 0..n { b.cols[c].nul[r0 + q] = true }
+            continue
+        }
+        let at = lay.bm + pl / 8
+        let bit = pl % 8
+        let o = lay.off[pl]
+        if k == BK_INT && pk == PK_INT4 {
+            var col = replace(mut &b.cols[c], bvec(0))
+            for q in 0..n {
+                let s = &vs[from + q]
+                if (int(s[at]) >> bit) & 1 == 1 {
+                    col.nul[r0 + q] = true
+                } else {
+                    let u = int(s[o]) | (int(s[o + 1]) << 8) | (int(s[o + 2]) << 16) | (int(s[o + 3]) << 24)
+                    col.v[r0 + q] = if u >= 0x80000000 { u - 0x100000000 } else { u }
+                }
+            }
+            b.cols[c] = col
+        } else if k == BK_INT && pk == PK_INT {
+            var col = replace(mut &b.cols[c], bvec(0))
+            for q in 0..n {
+                let s = &vs[from + q]
+                if (int(s[at]) >> bit) & 1 == 1 {
+                    col.nul[r0 + q] = true
+                } else {
+                    col.v[r0 + q] = int(s[o]) | (int(s[o + 1]) << 8) | (int(s[o + 2]) << 16) | (int(s[o + 3]) << 24) |
+                                    (int(s[o + 4]) << 32) | (int(s[o + 5]) << 40) | (int(s[o + 6]) << 48) | (int(s[o + 7]) << 56)
+                }
+            }
+            b.cols[c] = col
+        } else if k == BK_INT && pk == PK_INT2 {
+            var col = replace(mut &b.cols[c], bvec(0))
+            for q in 0..n {
+                let s = &vs[from + q]
+                if (int(s[at]) >> bit) & 1 == 1 {
+                    col.nul[r0 + q] = true
+                } else {
+                    let u = int(s[o]) | (int(s[o + 1]) << 8)
+                    col.v[r0 + q] = if u >= 0x8000 { u - 0x10000 } else { u }
+                }
+            }
+            b.cols[c] = col
+        } else if k == BK_BOOL && pk == PK_BOOL {
+            var col = replace(mut &b.cols[c], bvec(0))
+            for q in 0..n {
+                let s = &vs[from + q]
+                if (int(s[at]) >> bit) & 1 == 1 { col.nul[r0 + q] = true } else { col.v[r0 + q] = if s[o] == 1 { 1 } else { 0 } }
+            }
+            b.cols[c] = col
+        } else if k == BK_VAL {
+            for q in 0..n {
+                let s = &vs[from + q]
+                if (int(s[at]) >> bit) & 1 == 1 { b.cols[c].nul[r0 + q] = true } else { b.vals[c][r0 + q] = try fixedVal(s, pl, pk, lay) }
+            }
+        } else {
+            return Ok(-1)
+        }
+    }
+    return Ok(n)
+}
+
 // A row read whole by the row path (a value stored apart) into row r of b;
 // false: a value of a kind its column's batch does not hold.
 fn bRowOf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, key: &str, v: &str, r: int, b: mut &Batch,
@@ -10681,11 +10775,30 @@ fn fillBatch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, sc: &
         var bail = false
         var bad: []DbErr = []
         let inPlace = try st.scanLeaves(txn, t.tree, from, sc.hi, fn(ks: &[]str, vs: &[]str, i: int, j: int): bool {
-            for k in i..j {
+            var k = i
+            while k < j {
                 if b.n == BROWS {
                     stop = 1
                     stopKey = ks[k]
                     return false
+                }
+                // a run of rows in one fixed layout: a column at a time
+                match bRunInto(vs, k, min(j, k + BROWS - b.n), mut &b, bp, t) {
+                    Ok(got) {
+                        if got < 0 {
+                            bail = true
+                            return false
+                        }
+                        if got > 0 {
+                            b.n += got
+                            k += got
+                            continue
+                        }
+                    }
+                    Err(x) {
+                        append(mut &bad, x)
+                        return false
+                    }
                 }
                 match bRowInto(&vs[k], b.n, mut &b, bp, t) {
                     Ok(code) {
@@ -10705,6 +10818,7 @@ fn fillBatch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, sc: &
                     }
                 }
                 b.n += 1
+                k += 1
             }
             return true
         })

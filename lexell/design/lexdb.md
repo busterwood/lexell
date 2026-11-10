@@ -4014,3 +4014,85 @@ The last three still take the row path:
   - `sum` of a text in batches, which gives the row path's error through
     the same `arith`.
 
+### 9.53 Decoding: the byte readers, and a column at a time
+
+The user said (2026-11-10) that lexdb was still slower across the
+benchmarks. A native profile of `sum(v)` with three conditions showed
+decoding at about 70% of the time:
+- `binary.readI32LEStr` alone: 28%;
+- `bRowInto`: 28%;
+- `layOf`: 8%.
+
+**The byte readers.** `lib/binary` read an integer with a loop over its
+bytes. The native code for that loop does all of this for each byte:
+- takes and drops a reference to the string;
+- copies the string's pointer and length;
+- checks the index's addition for overflow, and the bounds;
+- multiplies for the shift, and checks the shift's range.
+
+That is about 35 instructions a byte. A micro-benchmark over the same
+4 KiB, per value read:
+
+| Read | ns |
+|---|---:|
+| `s[i]` in a plain loop (borrowed string) | 0.32 a byte |
+| `readI32LEStr`, the loop | 7.5 |
+| `readI32LEStr`, unrolled into statements | 2.8 |
+| `readI32LEStr`, one expression | 2.7 |
+| the expression written in place | 1.0 |
+
+- **The change.** The library's 24 byte loops (readers and writers,
+  strings and arrays) are unrolled, and its readers are single
+  expressions. Same bytes, same results; the language suites pass.
+- **What is left.** The rest of the 2.7 ns is the call, which the native
+  compiler does not inline, and a reference to the string taken and
+  dropped per call. Removing it is a compiler change (inlining small
+  functions, no reference count on a borrowed string's index), the
+  user's to decide.
+
+**A column at a time (`bRunInto`).**
+- **The run.** In a leaf, consecutive rows nearly always share a layout.
+  `fillBatch` now takes the rows from one in the fixed layout up to the
+  first in another layout (or not fixed, or the batch full).
+- **The loops.** Per column used, the run has one offset, one kind and
+  one NULL bit, so each column is a tight loop over the run's rows. An
+  integer is read with the expression in place (8, 4 or 2 bytes), into
+  the batch's array taken out of its record for the loop.
+- **The rest.** Other rows (tagged, stored apart, another layout) go
+  through `bRowInto` as before.
+
+**Results,** in process, warm, ms (PostgreSQL 16 through psql, best of
+five):
+
+| Query | 9.52 | readers | + columns | PG one core | PG parallel |
+|---|---:|---:|---:|---:|---:|
+| `count(*)` | 23–27 | 22 | 14 | 30–31 | 15 |
+| 4 aggregates `WHERE n > 10` | 55–61 | 49–51 | 33 | 60–68 | 25 |
+| `sum(v)` with 3 conditions | 68–71 | 57–59 | 33 | 46–50 | 20 |
+| `GROUP BY g` | 96–106 | 83–86 | 54 | 104–112 | 39–46 |
+| `GROUP BY n WHERE v % 2 = 0` | 72–78 | 62–65 | 37–38 | 78–83 | 58–69 |
+| wide: `sum(c18) WHERE c17 > 50` | 41–42 | 37–38 | 22–23 | 38–42 | 20–25 |
+| wide: `GROUP BY c19` | 58–60 | 51 | 32 | 66–68 | 29–31 |
+| wide: `c1 = 3 AND c13 < 5` | 41 | 33–34 | 21 | 30–32 | 17–20 |
+| row path: `count(*)` of a subquery | 389 | 219 | 219 | | |
+
+- **Against one core:** lexdb is ahead on all eight aggregate queries, by
+  1.4 to 2 times.
+- **Against PostgreSQL's two workers:** lexdb is ahead or level on four,
+  and behind by 1.3 to 1.7 times on the other four.
+
+**Checked.**
+- **The suites.** 61 lexdb programs pass in both row forms; the 413
+  native and 797 run tests of the language pass with the new library.
+- **Planted bugs.** Seven were planted in the run decoder, and six were
+  caught:
+  - a run not ended at another layout;
+  - int4 or int2 not sign-extended;
+  - the NULL bit of the next place;
+  - missing values not given;
+  - a run longer than asked.
+
+  The survivor reads a dropped place. That cannot happen: a used column's
+  place is never a dropped one in any layout, since places are not
+  reused.
+
