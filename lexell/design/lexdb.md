@@ -4728,3 +4728,49 @@ differently (a link to America/New_York, with EWT in 1942-45, or the old
 rule-based zone; `gen_tz.py` still draws its instants, so the other
 zones' stay as they were); and the conformance runner allows 90 s to
 compile (gcc 16 takes about 25 s for a lexdb test).
+
+### 9.62 Cache-missing selects: where the loop's time goes; reads to io-wq when busy
+
+9.60 left the ring behind epoll and the pool on cache-missing selects with
+many clients (`LEXDB_CACHE_MB=64`, Unix, 32 clients: 101,000/s against
+120,000), though it costs half the CPU a select: all of it is on the one
+loop thread, which is then the bottleneck.
+
+**Profile** (`perf record -g` of the server, 4 s at 32 clients through
+the ring; lexdb's own functions named from `LXL_NATIVE_MAP`):
+
+| The loop thread | |
+|---|---:|
+| lexdb (SQL, decoding, the wire), spread thin: the top function 2.8% | 55% |
+| reads from the drive: submitting (iomap, btrfs, the block layer, plug flush) | 16% |
+| the drive's completions: interrupts and softirqs on this CPU | 8% |
+| `sendto` (replies) | 10% |
+| receives (requests) | 7% |
+| system call entry and exit, the ring's wait | 2% |
+
+Within the reads, pinning the buffer's pages costs 0.5% and the file's
+lookup (fget, fput) 0.6%: registered buffers and files, the obvious
+io_uring step, would save about 1%, and are not done. The I/O scheduler
+(kyber, this distribution's default for NVMe) costs 2.4%, dm-crypt 2.7%.
+
+**Reads to io-wq when the loop is busy.** A read queued while other tasks
+are runnable now carries IOSQE_ASYNC: an io-wq worker issues it, so the
+block layer's work, and the drive's interrupt, which comes on the CPU that
+issued the read, leave the loop thread; the completion reaches it as task
+work as before. With nothing else runnable the read is issued inline, the
+quicker way for the one waiting. Unix, `LEXDB_CACHE_MB=64`, 6 s, two
+rounds (server CPU from `/proc`, every thread, io-wq's included):
+
+| Selects, clients | epoll and the pool | ring | ring, async when busy | ring, async always |
+|---|---|---|---|---|
+| 1 | 28,700/s, 38 us | 29,900/s, 13 us | 29,900/s, 13 us | 28,800/s, 14 us |
+| 8 | 102,000/s, 18.5 us | 103,400/s, 9.0 us | 120,300/s, 9.5 us | 63,000 and 132,000 |
+| 32 | 119,900/s, 17.3 us | 101,400/s, 9.2 us | 126,100/s, 9.6 us | 121,000 and 133,000 |
+
+The ring now leads at every client count, at half the CPU. Always async
+was erratic and is not kept. Writes async too (the log's) did not help
+updates (21,000 to 24,600/s at 32 clients against 23,500 to 26,000 with
+reads alone) and are not kept.
+
+Tests: the quick gate passes; the library's natively with `LXL_URING=1`;
+lexdb's; the crash test in both modes.

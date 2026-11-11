@@ -2542,6 +2542,11 @@ int64_t lxllib_file_op(int64_t op, int64_t fd, void* b, int64_t n, int64_t off, 
         q->addr = (uint64_t)n;                                      /* the length; len is the mode */
         break;
     }
+    /* A read while other tasks are runnable goes to the kernel's io-wq workers (IOSQE_ASYNC):
+       issuing it inline costs this thread the block layer's work and the drive's interrupt,
+       about a quarter of its time when it is the bottleneck (design/lexdb.md 9.62). With
+       nothing else to run it is issued inline, which is quicker for the one waiting. */
+    if (op == 0 && rt_rq_head) q->flags |= 16;                       /* IOSQE_ASYNC */
     /* Started now, not at the loop's next look at the ring: with other tasks runnable that may be
        64 task switches away, and lexdb's log writer waits on this (design/lexdb.md 9.60). */
     if (rt_rq_head) rt_ur_submit(0, 0);
