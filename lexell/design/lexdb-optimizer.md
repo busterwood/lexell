@@ -34,8 +34,9 @@ section and the decision list below win.
 
 **Built so far (uncommitted on `exp/optimizer`):** the index-to-scan switch
 (section 19) and stage A, ANALYZE with the tie-break and `SET lexdb_planner`
-(section 20). Next, in order: `stat4`-style samples and per-parameter plans,
-then join ordering (constraint-bound first).
+(section 20), the review fixes (section 21), and plans kept per parameter
+outcome (section 22). Next, in order: `stat4`-style samples as a new look, then
+estimates deciding beyond ties, then join ordering (constraint-bound first).
 
 ## 1. Summary
 
@@ -1248,6 +1249,44 @@ step 2 before stat4).
 
 New test cases (passing): exec_switch: a LIMIT, an EXISTS, an INSERT ... SELECT;
 exec_analyze: RESET ALL in a block, a renamed table, an ANALYZE rolled back.
+
+## 22. Plans kept per outcome of the parameter looks (2026-11-11)
+
+The plan cache's change the second review put before `stat4`.
+
+**Before.** `select()` kept one plan per prepared statement, and none at all
+when planning looked at a parameter's value (`PARAM_LOOKS`): a LIMIT or OFFSET
+given as a parameter, or the check whether `x > $1` implies a partial index's
+predicate. Such statements were planned on every run.
+
+**Now.** Each look is noted while planning, with what it gave
+(`Look`, collected in `Scope.looks`, which every planning function of a
+statement shares):
+- a partial index's implication: yes or no;
+- a LIMIT or OFFSET: its value, which the plan keeps.
+
+`PlanCache` keeps up to `PLAN_VARIANTS` (4) plans per statement, each with its
+looks. A run re-evaluates each kept plan's looks with the new parameters
+(`looksHold`) and takes the first that gives the same outcomes; otherwise it
+plans, and keeps the new plan while there are fewer than four. A plan with no
+looks fits every run, as before. The key around them is unchanged: the
+catalog's version, the search path, and the statistics' version or the rules
+mode.
+
+This is the mechanism the per-parameter plans of section 18 need: a `stat4`
+estimate for `kind = $1` becomes one more look (say, "expected rows over a
+threshold"), and the cache keeps a plan per outcome without replanning per
+value. The set of plans is finite and each is listed by its looks.
+
+**Tests.** `exec_plancache`: LIMIT kept per value and taken again for a value
+seen before, the cap of four, a partial index's two outcomes and a third value
+taking the first again, and the rolled-back version from the second review
+(a plan kept under a version made in a block that rolled back is not taken
+for the version another session commits next).
+
+**Not done.** EXPLAIN of a prepared statement does not name the plan it would
+take; the cap does not replace old plans (past four, new outcomes are planned
+every run).
 
 ## Sources
 
