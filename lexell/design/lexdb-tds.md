@@ -175,3 +175,64 @@ parallel, each in its own worktree.
 - **Left for S2:** RPC (sp_executesql, prepare/execute), Transaction
   Manager requests and ENVCHANGE for transactions, RESETCONNECTION, ATTENTION
   that interrupts a running statement, streaming large results.
+
+## 7. Review before T-SQL (2026-11-11)
+
+An independent review (Fable) of sections 3 to 6, read against the code.
+The claims checked hold: unquoted names are lowercased by the lexer
+(`lexdb_sql.lxl:631`); text keys are their raw bytes (`encKeyPart`,
+`lexdb_exec.lxl:1972`); any error in a transaction block fails it until
+ROLLBACK (`lexdb_exec.lxl:9507`); there is no CREATE DATABASE.
+
+- **L1 holds, with more than a flag:** the lexer and parser take options
+  (`LexOpts{tsql, quotedIdent}`): SET QUOTED_IDENTIFIER OFF makes `"x"` a
+  string; `[x]`, `#t` and `@v` are T-SQL tokens; statements need no `;`, so
+  the batch interpreter drives the parser statement by statement; `+` on
+  strings is a distinct operator the typer resolves. Views, defaults and
+  checks are stored as text and re-parsed with the PostgreSQL parser: one
+  made over TDS must be stored in lexdb's dialect or tagged with its own.
+- **L2 changes:** per column, not per database (there is no database to hang
+  it on; a session cannot disagree with a unique index). A column carries a
+  collation in the catalog: tables made over TDS default to
+  SQL_Latin1_General_CP1_CI_AS (case-insensitive, trailing spaces ignored),
+  over PostgreSQL to bytes; comparison, hashing, DISTINCT/GROUP BY keys,
+  sorting and LIKE take it from the column. COLLATE is already parsed and
+  dropped. And it moves before S3, not S5: every table and every recorded
+  oracle answer with string =, ORDER BY or GROUP BY made before it would be
+  wrong, and the key encoding is a format change.
+- **L6 (new): identifier case.** SQL Server keeps a name's spelling and
+  returns it in COLMETADATA (`SELECT Name FROM T` gives `Name`) while
+  matching names case-insensitively. Fold for lookup, keep the spelling for
+  display: a catalog change, decided before S3.
+- **L3 holds:** `dbo` an alias of `public` on both protocols; T-SQL has no
+  search path (the user's default schema, then dbo); three- and four-part
+  names and `db..t`; sys.*, INFORMATION_SCHEMA and `tempdb..#t` are needed
+  earlier than S5. "One database" is stated as a lasting decision.
+- **L4 changes for S2:** sp_executesql's `@p1` does not lex in lexdb's
+  dialect, and OUTPUT parameters need `SET @o = ...`. So S2 brings the lexer
+  options, `@name` as a parameter, and a minimal variable frame (RPC
+  parameters are the batch's pre-declared variables). lexdb's dialect stays
+  reachable over TDS for debugging (`SET lexdb_dialect ...`).
+- **Transactions in S2, not S4:** T-SQL rolls back only the failing
+  statement (unless XACT_ABORT, or an error that dooms the transaction):
+  each statement over TDS runs under an implicit savepoint (they exist:
+  `SavePt`). Also `@@TRANCOUNT` and nested BEGIN TRAN, ENVCHANGE 8/9/10 for
+  BEGIN TRAN in SQL text, and SET IMPLICIT_TRANSACTIONS ON (JDBC's and
+  ODBC's manual commit). Errors carry a class (statement abort, batch
+  abort, transaction doomed) beside SQL Server's number.
+- **S1's code:** a statement sink instead of one buffer per request (DONE,
+  DONEINPROC, DONEPROC, RETURNSTATUS, the reset's ENVCHANGE); a row count on
+  `Res` instead of parsing command tags; column types from the plan
+  (`describe`) rather than the values, which streaming, sp_prepare and
+  sp_describe_first_result_set need; ATTENTION needs a reader task per
+  connection and a cancel flag in the executor (PostgreSQL's CancelRequest
+  is ignored today too). The SET pre-parser (`setBatch`) is replaced by the
+  T-SQL front end, not extended.
+- **S3's slices are not independent:** SELECT INTO #t, SCOPE_IDENTITY and
+  TOP (@n) need S4's frames; there are no temporary tables at all yet; and
+  parallel slices would collide in `primary()` and `typeName()`.
+
+Revised order: S2 (RPC; lexer options and `@` parameters; transactions with
+statement-level rollback; the statement sink), then L2 and L6 (the catalog's
+collation and spelling, keys folded), then S3 and S4 largely in sequence,
+then S5.
