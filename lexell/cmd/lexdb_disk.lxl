@@ -404,6 +404,29 @@ pub fn (f: &File) write(off: int, src: &[byte]): Result[Unit, lexdb_base.DbErr] 
     }
 }
 
+// Writes len(pages) pages from off, pages[j] at off + j * PAGE (each PAGE
+// bytes), in one call: a checkpoint's run of consecutive pages.
+pub fn (f: &File) writePages(off: int, pages: &[][]byte): Result[Unit, lexdb_base.DbErr] {
+    let n = len(pages) * PAGE
+    try alignedCheck(off, n, "write")
+    match f {
+        File.Real(fd) {
+            var buf = nullPtr()
+            if posix_memalign(mut &buf, PAGE, n) != 0 { panic("lexdb: out of memory (an I/O buffer)") }
+            for j in 0..len(pages) { copyIn(buf, j * PAGE, &pages[j], PAGE) }
+            let put = fs.pwrite(int(fd), buf, n, off)
+            freeMem(buf)
+            if put < 0 { return Err(lexdb_base.ioErr("pwrite", -put)) }
+            if put != n { return Err(lexdb_base.ioErr("pwrite (short)", 5)) }
+            return Ok(Unit{})
+        }
+        File.Sim(_, _) {
+            for j in 0..len(pages) { try f.write(off + j * PAGE, &pages[j]) }
+            return Ok(Unit{})
+        }
+    }
+}
+
 // Makes every write before it durable (fdatasync).
 pub fn (f: &File) flush(): Result[Unit, lexdb_base.DbErr] {
     match f {

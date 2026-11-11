@@ -4774,3 +4774,52 @@ reads alone) and are not kept.
 
 Tests: the quick gate passes; the library's natively with `LXL_URING=1`;
 lexdb's; the crash test in both modes.
+
+### 9.63 Checkpoints write runs of pages, several at once; the log's flush not linked
+
+A commit writes no pages: its records join the log writer's batch, and
+the writer writes each batch as one frame with one write, then one
+fdatasync (at 32 clients about 15 commits a flush). Pages go to the data
+file at checkpoints, and `finishCheckpoint` wrote them one at a time,
+each write waited for before the next was queued: one write in flight,
+a round trip (40 to 50 us on NVMe) per page.
+
+**Now** (`writeCheckpointPages`): the pages sorted by number, in runs of
+consecutive pages (at most 64, 256 KiB), each run one write
+(`File.writePages`, one aligned buffer), 16 runs at once (tasks in a
+scope). A checkpoint may hold every page in the cache (a quarter of the
+memory by default), so it is never encoded whole: only the runs being
+written are, at most 16 * 64 pages (4 MiB, and as much again in the
+writes' aligned buffers), where encoding them all first would have held
+a second copy of the checkpoint. A page listed twice is written once, as
+its later entry (as the writes in order left it).
+
+Measured (the shutdown's checkpoint, time from SIGTERM to exit, two
+rounds; the no-COW directory):
+
+| | after a 1M-row insert (contiguous pages) | after 30 s of random updates, through the ring |
+|---|---|---|
+| a page at a time (before) | 1.17, 1.18 s (epoll 1.02, 1.03) | 0.26, 0.26 s |
+| runs, one at a time | 0.33, 0.42 s | 0.18, 0.32 s |
+| runs, 16 at once | 0.31, 0.32 s | 0.16, 0.13 s |
+| 32 at once | 0.31, 0.32 s | 0.14, 0.19 s |
+| 64 at once | 0.32, 0.31 s | 0.14, 0.14 s |
+
+Contiguous pages gain from the runs; scattered ones from the writes in
+flight too. 32 and 64 are no faster than 16. Update rates do not change
+(the table here is about 3,000 leaf pages, so its checkpoints are small).
+
+**Not done: the log's flush linked to its write.** A `pwriteSync` (the
+write and an fdatasync linked with IOSQE_IO_LINK, one submission, the
+writer woken once) was built and measured: a log write to the next took
+591 us against 597 (traced, 32 clients), and update rates were within
+noise. Since 9.60 the writer runs 13 us after its flush completes, so
+the round trip linking saves was a few microseconds. Not kept.
+
+**Not done: I/O straight from lexdb's arrays.** A vectored write (or
+read) of lexdb's own page arrays would save the copy into an aligned C
+buffer, but O_DIRECT here needs 4 KiB-aligned memory (dm-crypt's
+`dma_alignment` is 4095; btrfs reports no STATX_DIOALIGN), and arrays
+are not page-aligned. With aligned page arrays from the runtime it could
+be done; for reads it would save `malloc`, `memcpy` and `free`, about 3
+to 4% of the loop thread on cache-missing selects (9.62).

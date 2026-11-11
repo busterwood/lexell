@@ -2558,12 +2558,73 @@ pub fn (st: &Store) checkpoint(): Result[Unit, lexdb_base.DbErr] {
     return Ok(Unit{})
 }
 
-fn (st: &Store) finishCheckpoint(f: &lexdb_disk.File, out: &[]PageOut, metaPage: &[]byte, n: int, target: int): Result[Unit, lexdb_base.DbErr] {
-    for p in out {
-        if len(p.raw) > 0 { try f.write(p.no * PAGE, &p.raw) } else {
-            try f.write(p.no * PAGE, &lexdb_page.bodyPage(p.leaf, p.n, &p.body, p.no))
+// A run of consecutive pages, written with one call (writePages).
+type PageRun = record { f: lexdb_disk.File; off: int; pages: [][]byte }
+
+fn writeRun(r: PageRun): Result[Unit, lexdb_base.DbErr] { return r.f.writePages(r.off, &r.pages) }
+
+const RUN_PAGES = 64            // a run's pages at most: 256 KiB a write
+const RUNS_IN_FLIGHT = 16       // runs written at once (32 and 64 measured no faster, 9.63)
+
+// A checkpoint's pages, in runs of consecutive page numbers, each run one
+// write, RUNS_IN_FLIGHT at a time (9.63). One page at a time, as before, a
+// checkpoint waited a write's round trip (40-50 us on NVMe) per page. Only
+// the runs being written are encoded: a checkpoint can hold every page the
+// cache has (a quarter of the memory by default), so it is never encoded
+// whole; what is in flight is at most RUNS_IN_FLIGHT * RUN_PAGES pages
+// (4 MiB, and as much again in the writes' aligned buffers). A page listed
+// twice is written once, as the later of its entries (as the writes in
+// order left it).
+fn writeCheckpointPages(f: &lexdb_disk.File, out: &[]PageOut): Result[Unit, lexdb_base.DbErr] {
+    var ix: []int = []
+    for i in 0..len(out) { append(mut &ix, i) }
+    collections.sortBy(mut &ix, fn(a, b) {
+        if out[a].no != out[b].no { return out[a].no.cmp(&out[b].no) }
+        return a.cmp(&b)
+    })
+    // the entries to write (the later of a page's), and where each run starts
+    var keep: []int = []
+    for i in 0..len(ix) {
+        if i + 1 < len(ix) && out[ix[i + 1]].no == out[ix[i]].no { continue }
+        append(mut &keep, ix[i])
+    }
+    var starts: []int = []
+    for i in 0..len(keep) {
+        let k = len(starts)
+        if k == 0 || i - starts[k - 1] >= RUN_PAGES || out[keep[i]].no != out[keep[i - 1]].no + 1 {
+            append(mut &starts, i)
         }
     }
+    append(mut &starts, len(keep))
+    var res: Result[Unit, lexdb_base.DbErr] = Ok(Unit{})
+    var r = 0
+    while r + 1 < len(starts) && res.isOk() {
+        var batch: []PageRun = []
+        while r + 1 < len(starts) && len(batch) < RUNS_IN_FLIGHT {
+            var pages: [][]byte = []
+            for i in starts[r]..starts[r + 1] {
+                let p = &out[keep[i]]
+                if len(p.raw) > 0 { append(mut &pages, collections.copyOf(&p.raw)) } else {
+                    append(mut &pages, lexdb_page.bodyPage(p.leaf, p.n, &p.body, p.no))
+                }
+            }
+            append(mut &batch, PageRun{f: f, off: out[keep[starts[r]]].no * PAGE, pages: pages})
+            r += 1
+        }
+        task.scope(fn(s: mut &task.Scope) {
+            var fs: []task.Future[Result[Unit, lexdb_base.DbErr]] = []
+            while len(batch) > 0 { append(mut &fs, s.start(writeRun, pop(mut &batch))) }
+            match task.all(fs) {
+                Ok(rs) { for x in rs { if x.isErr() && res.isOk() { res = x } } }
+                Err(_) { res = Err(lexdb_base.err(lexdb_base.S_INTERNAL, "checkpoint: a page write was cancelled")) }
+            }
+        })
+    }
+    return res
+}
+
+fn (st: &Store) finishCheckpoint(f: &lexdb_disk.File, out: &[]PageOut, metaPage: &[]byte, n: int, target: int): Result[Unit, lexdb_base.DbErr] {
+    try writeCheckpointPages(f, out)
     // The log must hold every commit this checkpoint includes before its
     // meta page may name it (otherwise recovery could mix a commit's rows).
     var wait: []task.Future[Result[Unit, lexdb_base.DbErr]] = []
