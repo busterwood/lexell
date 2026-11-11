@@ -1,0 +1,146 @@
+// lexdb_exec: ANALYZE's statistics (9.54). ANALYZE [table] counts each
+// table's rows and, per index, the distinct values of each leading prefix.
+// The planner uses them only to break a tie the rules leave between indexes:
+// the fewer expected rows. SET lexdb_planner = rules turns them off. Checked
+// by hand.
+// expect: -- ev: 1000 rows; kind 1 for 990 of them, uid 100 values
+// expect: create table ev (id int primary key, kind int, uid int) -> CREATE TABLE
+// expect: insert into ev select g, case when g <= 990 then 1 else 2 end, g % 100 from generate_series(1, 1000) g -> INSERT 0 1000
+// expect: create index ev_kind on ev (kind) -> CREATE INDEX
+// expect: create index ev_uid on ev (uid) -> CREATE INDEX
+// expect: explain select id from ev where kind = 1 and uid = 5 -> [QUERY PLAN] scan ev: index ev_kind lookup
+// expect: analyze ev -> ANALYZE
+// expect: explain select id from ev where kind = 1 and uid = 5 -> [QUERY PLAN] scan ev: index ev_uid lookup (estimated 10 rows)
+// expect: explain analyze select id from ev where kind = 1 and uid = 5 -> scan ev: index ev_uid lookup (estimated 10 rows) (rows read 10, kept 10)
+// expect: select count(*) from ev where kind = 1 and uid = 5 -> [count] 10
+// expect: explain select id from ev where kind = 2 -> [QUERY PLAN] scan ev: index ev_kind lookup (estimated 500 rows)
+// expect: -- the rules, by SET; RESET gives cost back
+// expect: show lexdb_planner -> [lexdb_planner] cost
+// expect: set lexdb_planner = rules -> SET
+// expect: show lexdb_planner -> [lexdb_planner] rules
+// expect: explain select id from ev where kind = 1 and uid = 5 -> [QUERY PLAN] scan ev: index ev_kind lookup
+// expect: select count(*) from ev where kind = 1 and uid = 5 -> [count] 10
+// expect: reset lexdb_planner -> RESET
+// expect: explain select id from ev where kind = 1 and uid = 5 -> [QUERY PLAN] scan ev: index ev_uid lookup (estimated 10 rows)
+// expect: set lexdb_planner = 'fast' -> 22023 invalid value for parameter "lexdb_planner": use cost or rules
+// expect: -- a SET in a block is undone by its ROLLBACK
+// expect: begin -> BEGIN
+// expect: set lexdb_planner = 'rules' -> SET
+// expect: explain select id from ev where kind = 1 and uid = 5 -> [QUERY PLAN] scan ev: index ev_kind lookup
+// expect: rollback -> ROLLBACK
+// expect: show lexdb_planner -> [lexdb_planner] cost
+// expect: -- uniqueness the rules cannot see: c unique in the data, not declared
+// expect: create table t (id int primary key, a int, c int) -> CREATE TABLE
+// expect: insert into t select g, g % 2, g from generate_series(1, 2000) g -> INSERT 0 2000
+// expect: create index t_a on t (a) -> CREATE INDEX
+// expect: create index t_c on t (c) -> CREATE INDEX
+// expect: explain select id from t where a = 1 and c = 7 -> [QUERY PLAN] scan t: index t_a lookup
+// expect: analyze -> ANALYZE
+// expect: explain select id from t where a = 1 and c = 7 -> [QUERY PLAN] scan t: index t_c lookup (estimated 1 rows)
+// expect: select id from t where a = 1 and c = 7 -> [id] 7
+// expect: -- statistics of a dropped table are not used by a new one of the name
+// expect: drop table t -> DROP TABLE
+// expect: create table t (id int primary key, a int, c int) -> CREATE TABLE
+// expect: create index t_a on t (a) -> CREATE INDEX
+// expect: create index t_c on t (c) -> CREATE INDEX
+// expect: explain select id from t where a = 1 and c = 7 -> [QUERY PLAN] scan t: index t_a lookup
+// expect: -- errors
+// expect: analyze nope -> 42P01 relation "nope" does not exist
+// expect: -- SHOW ALL lists the lexdb settings (it panicked on lexdb_batch before)
+// expect: show lexdb_batch -> [lexdb_batch] on
+// expect: show all -> [name,setting] max_recursion|1000; statement_timeout|0; max_statement_mem|262144kB; search_path|public; lexdb_batch|on; lexdb_planner|cost
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "strings"
+
+fn show(s: mut &lexdb_exec.Session, sql: str) {
+    match s.exec(&sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if !r.hasRows {
+                println(sql + " -> " + r.tag)
+                return
+            }
+            var lines: []str = []
+            for row in r.rows {
+                var cells: []str = []
+                for v in row { append(mut &cells, if lexdb_exec.isNull(&v) { "NULL" } else { lexdb_exec.text(&v) }) }
+                append(mut &lines, strings.join(&cells, "|"))
+            }
+            var names: []str = []
+            for c in r.cols { append(mut &names, c.name) }
+            println(sql + " -> [" + strings.join(&names, ",") + "]" + (if len(lines) > 0 { " " } else { "" }) + strings.join(&lines, "; "))
+        }
+        Err(e) { println(sql + " -> " + e.state + " " + e.msg) }
+    }
+}
+
+// EXPLAIN ANALYZE without its last line (the time).
+fn analyze(s: mut &lexdb_exec.Session, sql: str) {
+    match s.exec(&sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            var lines: []str = []
+            for i in 0..len(r.rows) - 1 { append(mut &lines, lexdb_exec.text(&r.rows[i][0])) }
+            println(sql + " -> " + strings.join(&lines, "; "))
+        }
+        Err(e) { println(sql + " -> " + e.state + " " + e.msg) }
+    }
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    var s = lexdb_exec.newSession(st)
+    println("-- ev: 1000 rows; kind 1 for 990 of them, uid 100 values")
+    show(mut &s, "create table ev (id int primary key, kind int, uid int)")
+    show(mut &s, "insert into ev select g, case when g <= 990 then 1 else 2 end, g % 100 from generate_series(1, 1000) g")
+    show(mut &s, "create index ev_kind on ev (kind)")
+    show(mut &s, "create index ev_uid on ev (uid)")
+    show(mut &s, "explain select id from ev where kind = 1 and uid = 5")
+    show(mut &s, "analyze ev")
+    show(mut &s, "explain select id from ev where kind = 1 and uid = 5")
+    analyze(mut &s, "explain analyze select id from ev where kind = 1 and uid = 5")
+    show(mut &s, "select count(*) from ev where kind = 1 and uid = 5")
+    show(mut &s, "explain select id from ev where kind = 2")
+    println("-- the rules, by SET; RESET gives cost back")
+    show(mut &s, "show lexdb_planner")
+    show(mut &s, "set lexdb_planner = rules")
+    show(mut &s, "show lexdb_planner")
+    show(mut &s, "explain select id from ev where kind = 1 and uid = 5")
+    show(mut &s, "select count(*) from ev where kind = 1 and uid = 5")
+    show(mut &s, "reset lexdb_planner")
+    show(mut &s, "explain select id from ev where kind = 1 and uid = 5")
+    show(mut &s, "set lexdb_planner = 'fast'")
+    println("-- a SET in a block is undone by its ROLLBACK")
+    show(mut &s, "begin")
+    show(mut &s, "set lexdb_planner = 'rules'")
+    show(mut &s, "explain select id from ev where kind = 1 and uid = 5")
+    show(mut &s, "rollback")
+    show(mut &s, "show lexdb_planner")
+    println("-- uniqueness the rules cannot see: c unique in the data, not declared")
+    show(mut &s, "create table t (id int primary key, a int, c int)")
+    show(mut &s, "insert into t select g, g % 2, g from generate_series(1, 2000) g")
+    show(mut &s, "create index t_a on t (a)")
+    show(mut &s, "create index t_c on t (c)")
+    show(mut &s, "explain select id from t where a = 1 and c = 7")
+    show(mut &s, "analyze")
+    show(mut &s, "explain select id from t where a = 1 and c = 7")
+    show(mut &s, "select id from t where a = 1 and c = 7")
+    println("-- statistics of a dropped table are not used by a new one of the name")
+    show(mut &s, "drop table t")
+    show(mut &s, "create table t (id int primary key, a int, c int)")
+    show(mut &s, "create index t_a on t (a)")
+    show(mut &s, "create index t_c on t (c)")
+    show(mut &s, "explain select id from t where a = 1 and c = 7")
+    println("-- errors")
+    show(mut &s, "analyze nope")
+    println("-- SHOW ALL lists the lexdb settings (it panicked on lexdb_batch before)")
+    show(mut &s, "show lexdb_batch")
+    show(mut &s, "show all")
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(5), lexdb_store.Options{cacheBytes: 128 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000, bufferedPages: false}, body).unwrap()
+}
