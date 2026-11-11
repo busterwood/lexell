@@ -5571,3 +5571,54 @@ shares):
   - a write refused;
   - SIGTERM stopping all of them with exit 0.
 - All 65 lexdb tests, the crash test, and `replica.py` with 20 rounds pass.
+
+### 9.74 A connection per user: what a connection costs (a note, nothing built)
+
+The user's thought: databases have needed connection pools between web
+servers and themselves because a connection is expensive (PostgreSQL's is
+a process). lexdb's is a task in one event loop. Could each real user of a
+website have a connection of their own, 10,000 or 50,000 at once?
+
+**Measured** (the master; Unix-socket connections, each through startup
+and then idle; RSS of the process; the 9.67 data cached):
+
+| idle connections | RSS | per connection | after one query on each | a query on one, the others open |
+|---:|---:|---:|---:|---:|
+| 1,000 | 39 to 115 MB | 78 KB | 86 KB | 14 us |
+| 10,000 | 112 to 807 MB | 71 KB | 79 KB | 13 us |
+
+Opening 10,000 took 0.5 s.
+
+- **Where it goes:** a connection's read buffer is a 64 KiB array, zeroed
+  when the connection opens (`Wire.inBuf`), so it is resident at once:
+  most of the cost. The rest is the task's stack (256 KiB reserved with
+  `MAP_NORESERVE`, only the pages touched resident), the session, the
+  output buffer, and after a query the plan cache. The kernel's socket
+  memory is not in RSS.
+- **At 50,000:** about 4 GB as it is.
+- **What would shrink it:** the read buffer made only while a message is
+  being read, or started at 4 KiB, would bring an idle connection to about
+  15 to 20 KB (1 GB for 50,000).
+
+**Limits besides memory:**
+- Each task's stack is two mappings (the stack and its guard).
+  `vm.max_map_count` is 65,530 on many distributions, which caps a process
+  at about 32,000 connections (this machine allows 1,048,576). Stacks in
+  slabs would lift that.
+- File descriptors: the soft limit must be raised to the hard one.
+- **A transaction left open by a user** holds a snapshot. On the master
+  its old versions are bounded (`snapNodes`); on a replica it holds a
+  checkpoint and the master's pages. A pool keeps transactions short by
+  itself; a connection per user would want something like PostgreSQL's
+  `idle_in_transaction_session_timeout`.
+- Throughput is unchanged: one process runs its sessions' SQL on one core,
+  so many active users queue on it (replicas spread them).
+
+**For comparison:** PostgreSQL's backend is a process with a few MB of its
+own memory, and taking a snapshot costs more as connections grow;
+pgbouncer exists for this. SQL Server, and CockroachDB and TiDB (one
+goroutine each), also take many connections. So this is not new in
+databases, but it is new for a server speaking PostgreSQL's protocol
+without a pooler.
+
+Not planned: recorded for later.
