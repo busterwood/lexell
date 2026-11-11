@@ -5,7 +5,7 @@
 #
 #   bench/sock/trace1.sh LEXDB_BINARY WORKDIR MODE OUT
 #
-# MODE: epoll or uring (LXL_URING=1). WORKDIR is pgsel.sh's (its data
+# MODE: epoll (LXL_URING=0) or uring. WORKDIR is pgsel.sh's (its data
 # directory and sel.sql must exist: run pgsel.sh once first). OUT gets the
 # raw trace. SOCK (default /tmp/lxs) is the Unix socket's directory.
 # Needs write access to /sys/kernel/tracing, once per boot:
@@ -18,7 +18,7 @@ T=/sys/kernel/tracing
 SOCK=${SOCK:-/tmp/lxs}
 PORT=5497
 mkdir -p "$SOCK"
-[ "$MODE" = uring ] && export LXL_URING=1 || unset LXL_URING
+[ "$MODE" = uring ] && export LXL_URING=1 || export LXL_URING=0
 NAME=$(basename "$BIN" | cut -c1-15)
 "$BIN" "$W/data" 127.0.0.1:$PORT "$SOCK" > "$OUT.server.log" 2>&1 &
 SP=$!

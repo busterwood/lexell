@@ -1,5 +1,5 @@
 #!/bin/bash
-# pgbench point selects against lexdb, epoll against io_uring (LXL_URING=1),
+# pgbench point selects against lexdb, epoll (LXL_URING=0) against io_uring,
 # over TCP and a Unix socket, with the server's CPU per select from /proc.
 # MODES (default "epoll uring"): each epoll or uring, optionally +spinN for
 # LXL_SPIN_US=N (poll N us before sleeping), e.g. MODES="epoll uring+spin50".
@@ -29,7 +29,7 @@ stop() {   # SIGTERM, then wait: its shutdown checkpoint may take seconds
 }
 start() {  # mode
     stop
-    case $1 in *uring*) export LXL_URING=1 ;; *) unset LXL_URING ;; esac
+    case $1 in *uring*) export LXL_URING=1 ;; *) export LXL_URING=0 ;; esac
     case $1 in *spin*) export LXL_SPIN_US=${1##*spin} ;; *) unset LXL_SPIN_US ;; esac
     "$BIN" "$W/data" 127.0.0.1:$PORT "$SOCK" > "$W/server.log" 2>&1 &
     SPID=$!

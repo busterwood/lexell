@@ -2,7 +2,8 @@
 # usage: lexell/tools/gate.sh quick|full|live
 # quick: the C seed's fixed point (it also builds compiler/out/lxlc from the seed, the compiler
 #        every later step uses), the conformance suite, the compiler tests, the library tests,
-#        the native backend against the C backend (run + lib tests) and the native self-build.
+#        the native backend against the C backend (run + lib tests; with io_uring where the kernel
+#        has it, and again with epoll and the helper pool, LXL_URING=0) and the native self-build.
 # full:  quick, then the red-team harnesses (rounds 1-5) and the task, net, url, http and http
 #        server library tests under ASan+UBSan, the helper-pool and net tests under TSan, then
 #        the native backend on the red-team corpora and on generated value-record and array-loop
@@ -34,6 +35,7 @@ else
     "lib|python3 lexell/lib/run_tests.py -j 8"
     "native lib+run|python3 lexell/tests/run_native.py --lib"
     "native -O lib+run|python3 lexell/tests/run_native.py --lib --opt"
+    "native lib epoll|LXL_URING=0 python3 lexell/tests/run_native.py --lib"
     "native selfbuild|bash lexell/tools/native_selfbuild.sh"
   )
 fi

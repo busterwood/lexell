@@ -1994,14 +1994,16 @@ static void rt_ur_arm_epoll(void) {
     q->ud = K_UR_TAG_EPOLL;
     rt_ur_epoll_armed = true;
 }
-/* Decides, at the first socket (the epoll set exists by then), whether sockets read through the
-   ring: LXL_URING=1 and a kernel that sets one up with these flags (6.1 and later). */
+/* Decides, at the first socket or file operation (the epoll set exists by then), whether I/O goes
+   through the ring: unless LXL_URING=0, when the kernel sets one up with these flags (6.1 and
+   later; not where io_uring is disabled, kernel.io_uring_disabled or a seccomp filter), else
+   epoll and the helper pool (design/lexdb.md 9.65). */
 static i64 rt_fd_room(i64 fd);
 static bool rt_uring_on(void) {
     if (rt_uring >= 0) return rt_uring;
     rt_uring = 0;
     const char* v = getenv("LXL_URING");
-    if (!v || v[0] != '1') return false;
+    if (v && v[0] == '0') return false;
     if (rt_fd_room(0) < 0) return false;                            /* the epoll set, watched from the ring */
     struct k_ur_params p;
     memset(&p, 0, sizeof p);

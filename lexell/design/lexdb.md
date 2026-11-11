@@ -4879,3 +4879,28 @@ With it, one client is faster through the ring than with epoll without
 it, in both transports. It is now the runtime's default (native backend,
 both modes): `LXL_SPIN_US=N` polls a fixed N us, `0` never, `aN` adapts
 up to N us.
+
+### 9.65 io_uring by default; both modes in the gate
+
+Step 3 of 9.58's plan. With 9.60 to 9.64 the ring is ahead of epoll and
+the helper pool everywhere measured on this machine, at less CPU:
+
+| | epoll and the pool | the ring |
+|---|---|---|
+| warm selects, 8 and 32 clients, Unix | ~148,000/s, 6.8 us | ~170,000/s, 5.9 us |
+| warm selects, one client, Unix (with 9.64's polling) | 94,000/s, 10.6 us | 94,300/s, 10.6 us |
+| `LEXDB_CACHE_MB=64`, 32 clients | 119,900/s, 17.3 us | 126,100/s, 9.6 us |
+| updates, 32 clients | ~25,500/s, 26 us | ~25,800/s, 18 us |
+
+So the native runtime now uses the ring unless `LXL_URING=0`. Where the
+kernel will not set one up (before 6.1, `kernel.io_uring_disabled`, a
+seccomp filter as containers have), it falls back to epoll and the pool
+as before: checked by running lexdb under a systemd unit with
+`SystemCallFilter=~io_uring_setup` (no ring, the 32 helpers, queries
+answered). The C backend's runtime stays with epoll.
+
+`tools/gate.sh quick` runs the native library tests a third time with
+`LXL_URING=0`, so both modes are gated; the other native steps now run
+through the ring. The benchmark scripts' `epoll` mode sets `LXL_URING=0`.
+
+Left of the plan: step 4, socket writes through the ring.

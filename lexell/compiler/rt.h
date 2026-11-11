@@ -1556,7 +1556,7 @@ int64_t lxllib_net_wait(int64_t fd, int64_t dir, const char* w) {
 }
 /* Reads what has arrived, up to n bytes, parking until there is something: the count (0 at the
    end of the stream), -errno, or 0 with *stop 1 (cancelled) or 3 (the deadline passed). The
-   native runtime can do this through io_uring (LXL_URING=1); here it is always read and epoll. */
+   native runtime does this through io_uring (unless LXL_URING=0); here it is always read and epoll. */
 int64_t lxllib_net_recv(int64_t fd, void* b, int64_t n, const char* w, int64_t* stop) {
     *stop = 0;
     for (;;) {
@@ -1569,7 +1569,7 @@ int64_t lxllib_net_recv(int64_t fd, void* b, int64_t n, const char* w, int64_t* 
         } else if (errno != EINTR) return -errno;
     }
 }
-/* fs's file operations through io_uring: the native runtime's (LXL_URING=1). Here there is no
+/* fs's file operations through io_uring: the native runtime's (unless LXL_URING=0). Here there is no
    ring: RT_NORING always, and fs makes the call itself on the helper pool. */
 int64_t lxllib_file_op(int64_t op, int64_t fd, void* b, int64_t n, int64_t off, const char* w) {
     (void)op; (void)fd; (void)b; (void)n; (void)off; (void)w;
