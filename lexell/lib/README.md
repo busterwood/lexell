@@ -31,7 +31,7 @@ for leaks.
 | `io.lxl` | 454 | IoError, whole-file read/write/append, readLines, readStdin, streaming Reader, buffered Writer, ChunkReader/copy/count/readAll |
 | `fs.lxl` | 485 | stat/lstat, list, mkdirAll, remove/removeAll, rename, symlink, chmod, paths, walk, realpath, temp/atomic write |
 | `os.lxl` | 263 | arguments, environment, pid, working directory, quit, ids, user database, tempDir |
-| `time.lxl` | 908 | wall and monotonic clocks, sleep, UTC dates, ISO 8601, Tm/strftime/strptime, HTTP date |
+| `time.lxl` | 1,298 | wall and monotonic clocks, sleep, UTC dates, ISO 8601, Tm/strftime/strptime, HTTP date; Duration (exact: seconds and nanoseconds), Period (years, months, days) and Interval (SQL's: months, days and a Duration), with ISO 8601 text; date arithmetic (addDays, addMonths clamped, until), Time and LocalDateTime plus a duration, period or interval (design/time-types.md); tested against Python by `tests/gen_time_arith.py` |
 | `fmt.lxl` | 115 | number padding and eza's permission string |
 | `paths.lxl` | 135 | lexical Rust Path components: join, lastComponent, parentOf, ext |
 | `cli.lxl` | 451 | the eza/obo option grammar: Spec, Command, parse, structured Error |
@@ -43,7 +43,7 @@ for leaks.
 | `glob.lxl` | 408 | Unix path globbing: `*`, `?`, sets, ASCII POSIX classes, dotfiles, optional `**`, options, `escape`, and `expand` under a root |
 | `base64.lxl` | 107 | standard base64, strict and jq-lenient decoders |
 | `uuid.lxl` | 260 | RFC 9562 UUIDs: parse/format, v4/v5/v7, bytes, version/variant |
-| `tz.lxl` | 421 | time zones from TZif files (version 2+, 64-bit transitions) and their POSIX footer rules, as glibc applies them: utc, local (TZ or /etc/localtime), fromSpec, load, at, localTime; tested against zoneinfo by `tests/gen_tz.py` |
+| `tz.lxl` | 447 | time zones from TZif files (version 2+, 64-bit transitions) and their POSIX footer rules, as glibc applies them: utc, local (TZ or /etc/localtime), fromSpec, load, at, localTime; instantOf (local time to an instant: the earlier of an overlap, the offset before a gap, as PostgreSQL), offsetDateTime; tested against zoneinfo by `tests/gen_tz.py` and `tests/gen_tz_local.py` |
 | `sqldialect.lxl` | 260 | Value, DbError and its codes, SQL fragments with placeholders per dialect, exact decimal text and (p, s) checks |
 | `ffi.lxl` | 129 | C memory for modules that call C: owned `Mem` (alloc, cstr, copyBytes), unchecked peek/poke/bytes |
 | `sqlite.lxl` | 433 | SQLite 3 through libsqlite3: Db, Stmt |

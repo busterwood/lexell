@@ -182,3 +182,65 @@ database needs.
 4. The client probes of lexdb 9.75 as the test: the CREATE TABLEs that
    failed, and values round-tripped through psycopg, node-postgres and
    SQLAlchemy.
+
+## 6. Built: the library (2026-11-11)
+
+The user chose B, with two changes:
+- `Interval` belongs in the library too: it is SQL's INTERVAL, which
+  Lexell's own PostgreSQL client needs as well;
+- a microsecond family of types was weighed and not taken. Precision
+  belongs to the column (PostgreSQL's `timestamp(3)`, as `numeric(10,2)`
+  rounds a `Decimal`), the library stays exact in nanoseconds, and lexdb
+  rounds when it stores. Rounding is a few integer operations, only when a
+  value is made, and never on reads.
+
+`Duration` took the shape of `Time` (64-bit seconds and nanoseconds), not
+int64 nanoseconds: PostgreSQL's interval time is int64 microseconds, about
+±292,000 years, which int64 nanoseconds (±292 years) cannot hold.
+
+**In `lib/time.lxl`:**
+- `Duration`: `duration`, `hours`, `minutes`, `seconds`, `millis`,
+  `micros`, `nanos`; `plus`, `minus`, `neg`, `times`, `abs`, `cmp`;
+  `totalMicros`, `totalNanos`; `roundTo(unit)` (halves away from zero, as
+  PostgreSQL rounds to a column's precision); ISO 8601 `toStr` and
+  `parseDuration` (`PT1H30M`, each part signed, as java.time writes).
+- `Period` (years, months, days): `plus`, `neg`, `totalMonths`,
+  `normalized`; ISO 8601 (`P1Y2M3D`, weeks read as 7 days).
+- `Interval` (months, days, a `Duration`): `plus`, `minus`, `neg`, exact
+  `eq`; `Period.toInterval`, `Duration.toInterval`; ISO 8601
+  (`P1Y2M3DT4H5M6.5S`).
+- `Date`: `addDays`, `addMonths` (clamped to the month's end), `addYears`,
+  `plusPeriod`, `daysUntil`, `dayOfYear`, and `until`. Forward, `until`
+  is java.time's; backward it counts the days from where the months land,
+  so `d.plusPeriod(d.until(o))` is always `o`. java.time's is not, going
+  backward over a month's end (2026-10-31 back to 2026-09-01).
+- `Time`: `plus`, `minus`, `until`, `fromMicros`, `unixMicros`.
+- `TimeOfDay`: `plus` (around the clock), `until`.
+- `LocalDateTime`: `plus`, `minus`, `plusPeriod`, `plusInterval` (months,
+  then days, then time, as PostgreSQL), `until`.
+
+**In `lib/tz.lxl`:**
+- `instantOf(LocalDateTime)`: a local time that happens twice is the
+  earlier instant; one in a gap is read with the offset before the change
+  (PostgreSQL's rules, and Python's fold 0). It reads the offsets a day
+  either side, then the offset at the local time less the larger of them,
+  which is before any change near it.
+- `offsetDateTime(Time)`.
+
+**Tests:**
+- `tz_local`: 6,678 local times across the transitions of 2025 to 2028,
+  1970 and 1945 in 24 zones (inside every gap and overlap), and random ones
+  from 1900 to 2100, against zoneinfo (`gen_tz_local.py`).
+- `time_arith`: 1,500 rows against Python (`gen_time_arith.py`):
+  - days added, `daysUntil` and `dayOfYear` against `datetime`;
+  - months added against a clamped month count;
+  - `until`'s round trip and the sign of its parts;
+  - Duration plus, minus, times and rounding against exact integers;
+  - `plusInterval` against `datetime`.
+- `time_lengths`: the ISO text both ways and the edge cases, by hand.
+- Eight bugs put back were each caught. One real bug was found on the
+  way: the backward `until` described above.
+
+`run_native.py` compares the C build with the native build, not with a
+test's expectations: a test both get wrong passes it. `lib/run_tests.py`
+(the gate's `lib`) checks the expectations.

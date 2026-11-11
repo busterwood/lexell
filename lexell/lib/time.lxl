@@ -6,7 +6,10 @@
 // instant. A TimeOfDay, a LocalDateTime (a date and a time of day, with no
 // zone: SQL datetime2, Postgres timestamp) and an OffsetDateTime (a local
 // date-time and its offset from UTC: SQL datetimeoffset, Postgres timestamptz)
-// are civil values; there are no leap seconds and no time zone rules.
+// are civil values; there are no leap seconds and no time zone rules (tz has
+// those). Lengths of time: a Duration is exact (seconds and nanoseconds), a
+// Period is calendar years, months and days, and an Interval is SQL's
+// INTERVAL, months, days and a Duration (design/time-types.md).
 
 extern "c" fn clockNs(which: int): int as "lxl_clock_ns"
 extern "c" fn usleep(us: u32): i32
@@ -340,6 +343,393 @@ pub fn parseOffsetDateTime(s: str): Option[OffsetDateTime] {
         None { return None }
     }
 }
+
+// ---- Duration ----
+
+pub const NANOS_PER_SECOND = 1000000000
+
+// An exact length of time: seconds and nanoseconds, as a Time is (the sign
+// is in sec: -1.5 s is sec -2, nsec 500000000). Its range is that of the
+// seconds, so it holds any SQL interval's time; it is exact to the
+// nanosecond (a database rounds to its column's precision when it stores).
+pub type Duration = value record {
+    pub sec: int
+    pub nsec: int   // 0..999999999
+}
+
+pub const ZERO_DURATION: Duration = Duration{sec: 0, nsec: 0}
+
+// The duration sec seconds plus nsec nanoseconds (nsec may be any int, of
+// either sign).
+pub fn duration(sec: int, nsec: int): Duration {
+    return Duration{sec: sec + floorDiv(nsec, NANOS_PER_SECOND), nsec: floorMod(nsec, NANOS_PER_SECOND)}
+}
+
+pub fn hours(h: int): Duration { return Duration{sec: h * 3600, nsec: 0} }
+pub fn minutes(m: int): Duration { return Duration{sec: m * 60, nsec: 0} }
+pub fn seconds(s: int): Duration { return Duration{sec: s, nsec: 0} }
+pub fn millis(ms: int): Duration { return duration(floorDiv(ms, 1000), floorMod(ms, 1000) * 1000000) }
+pub fn micros(us: int): Duration { return duration(floorDiv(us, 1000000), floorMod(us, 1000000) * 1000) }
+pub fn nanos(ns: int): Duration { return duration(0, ns) }
+
+pub fn (d: Duration) plus(o: Duration): Duration { return duration(d.sec + o.sec, d.nsec + o.nsec) }
+pub fn (d: Duration) minus(o: Duration): Duration { return duration(d.sec - o.sec, d.nsec - o.nsec) }
+pub fn (d: Duration) neg(): Duration { return duration(-d.sec, -d.nsec) }
+pub fn (d: Duration) times(n: int): Duration { return duration(d.sec * n, d.nsec * n) }
+pub fn (d: Duration) isZero(): bool { return d.sec == 0 && d.nsec == 0 }
+pub fn (d: Duration) isNegative(): bool { return d.sec < 0 }
+pub fn (d: Duration) abs(): Duration { return if d.sec < 0 { d.neg() } else { d } }
+pub fn (d: Duration) eq(o: &Duration): bool { return d.sec == o.sec && d.nsec == o.nsec }
+
+pub fn (d: Duration) cmp(o: &Duration): int {
+    if d.sec != o.sec { return d.sec.cmp(&o.sec) }
+    return d.nsec.cmp(&o.nsec)
+}
+
+// The whole microseconds, rounded down (toward minus infinity).
+pub fn (d: Duration) totalMicros(): int { return d.sec * 1000000 + d.nsec / 1000 }
+
+// The whole nanoseconds; beyond about ±292 years this does not fit an int.
+pub fn (d: Duration) totalNanos(): int { return d.sec * NANOS_PER_SECOND + d.nsec }
+
+// The duration rounded to a whole number of unit nanoseconds (1000 for
+// microseconds; unit divides a second, or is a whole number of seconds),
+// halves away from zero: as PostgreSQL rounds a value to its column's
+// precision.
+pub fn (d: Duration) roundTo(unit: int): Duration {
+    if unit <= 1 { return d }
+    if unit < NANOS_PER_SECOND {
+        if d.sec >= 0 {
+            return duration(d.sec, (d.nsec + unit / 2) / unit * unit)
+        }
+        // negative: round the magnitude
+        return d.neg().roundTo(unit).neg()
+    }
+    let us = unit / NANOS_PER_SECOND
+    let a = d.abs()
+    var s = a.sec / us * us
+    let rest = duration(a.sec - s, a.nsec)
+    if rest.cmp(&duration(us / 2, (us % 2) * NANOS_PER_SECOND / 2)) >= 0 { s += us }
+    return if d.isNegative() { seconds(-s) } else { seconds(s) }
+}
+
+// ISO 8601: "PT1H30M", "PT0.5S", "PT0S"; a negative duration has each
+// part negative ("PT-1H-30M"), as java.time writes it. Days are not used:
+// a duration counts exact hours.
+pub fn (d: Duration) toStr(): str { return "P" + timePart(d, true) }
+
+// "T1H30M": the hours, minutes and seconds of d, each with d's sign;
+// "" (or "T0S" when always) for zero.
+fn timePart(d: Duration, always: bool): str {
+    if d.isZero() { return if always { "T0S" } else { "" } }
+    let neg = d.isNegative()
+    let a = d.abs()
+    let sign = if neg { "-" } else { "" }
+    let h = a.sec / 3600
+    let m = a.sec / 60 % 60
+    let s = a.sec % 60
+    var out = "T"
+    if h != 0 { out = out + sign + intToStr(h) + "H" }
+    if m != 0 { out = out + sign + intToStr(m) + "M" }
+    if s != 0 || a.nsec != 0 { out = out + sign + intToStr(s) + fraction(a.nsec) + "S" }
+    return out
+}
+
+// Parses ISO 8601 "PnDTnHnMnS" (days count as 24 hours; any part may be
+// left out, each may have a sign, the seconds a fraction of up to 9
+// digits; a leading "-" negates the whole). As toStr writes it, and as
+// java.time's Duration reads it.
+pub fn parseDuration(s: str): Option[Duration] {
+    match parseIso(s, false) {
+        Some(p) {
+            if p.months != 0 { return None }
+            return Some(p.time.plus(seconds(p.days * 86400)))
+        }
+        None { return None }
+    }
+}
+
+// ---- Period ----
+
+// An amount of calendar time: years, months and days. Its length depends
+// on where it is added: a month is 28 to 31 days.
+pub type Period = value record {
+    pub years: int
+    pub months: int
+    pub days: int
+}
+
+pub fn period(years: int, months: int, days: int): Period { return Period{years: years, months: months, days: days} }
+
+pub fn (p: Period) plus(o: Period): Period { return Period{years: p.years + o.years, months: p.months + o.months, days: p.days + o.days} }
+pub fn (p: Period) neg(): Period { return Period{years: -p.years, months: -p.months, days: -p.days} }
+pub fn (p: Period) isZero(): bool { return p.years == 0 && p.months == 0 && p.days == 0 }
+pub fn (p: Period) eq(o: &Period): bool { return p.years == o.years && p.months == o.months && p.days == o.days }
+
+// The years and months as months.
+pub fn (p: Period) totalMonths(): int { return p.years * 12 + p.months }
+
+// The same period with its months under 12 in size, the rest in years
+// (days are not touched: a month has no fixed number of them).
+pub fn (p: Period) normalized(): Period {
+    let t = p.totalMonths()
+    return Period{years: t / 12, months: t % 12, days: p.days}
+}
+
+// ISO 8601: "P1Y2M3D", "P0D"; each part with its own sign ("P-1Y2M").
+pub fn (p: Period) toStr(): str {
+    if p.isZero() { return "P0D" }
+    return "P" + datePart(p.years, p.months, p.days)
+}
+
+fn datePart(years: int, months: int, days: int): str {
+    var out = ""
+    if years != 0 { out = out + intToStr(years) + "Y" }
+    if months != 0 { out = out + intToStr(months) + "M" }
+    if days != 0 { out = out + intToStr(days) + "D" }
+    return out
+}
+
+// Parses ISO 8601 "PnYnMnWnD" (a week is 7 days; each part may have a
+// sign; a leading "-" negates the whole).
+pub fn parsePeriod(s: str): Option[Period] {
+    match parseIso(s, false) {
+        Some(p) {
+            if !p.time.isZero() { return None }
+            return Some(Period{years: p.months / 12, months: p.months % 12, days: p.days})
+        }
+        None { return None }
+    }
+}
+
+// ---- Interval ----
+
+// SQL's INTERVAL, as PostgreSQL keeps it: months, days and an exact
+// duration, apart, because none converts to another exactly (a month is 28
+// to 31 days, a day in a time zone 23 to 25 hours). Added to a date-time,
+// the months go first, then the days, then the duration.
+pub type Interval = value record {
+    pub months: int
+    pub days: int
+    pub time: Duration
+}
+
+pub const ZERO_INTERVAL: Interval = Interval{months: 0, days: 0, time: Duration{sec: 0, nsec: 0}}
+
+pub fn interval(months: int, days: int, time: Duration): Interval { return Interval{months: months, days: days, time: time} }
+
+// A period as an interval (its years as months).
+pub fn (p: Period) toInterval(): Interval { return Interval{months: p.totalMonths(), days: p.days, time: ZERO_DURATION} }
+
+// A duration as an interval (no months or days).
+pub fn (d: Duration) toInterval(): Interval { return Interval{months: 0, days: 0, time: d} }
+
+pub fn (i: Interval) plus(o: Interval): Interval { return Interval{months: i.months + o.months, days: i.days + o.days, time: i.time.plus(o.time)} }
+pub fn (i: Interval) minus(o: Interval): Interval { return i.plus(o.neg()) }
+pub fn (i: Interval) neg(): Interval { return Interval{months: -i.months, days: -i.days, time: i.time.neg()} }
+pub fn (i: Interval) isZero(): bool { return i.months == 0 && i.days == 0 && i.time.isZero() }
+
+// The same months, days and time (PostgreSQL's interval equality, which
+// counts a month as 30 days, is the database's: this one is exact).
+pub fn (i: Interval) eq(o: &Interval): bool { return i.months == o.months && i.days == o.days && i.time.eq(&o.time) }
+
+// ISO 8601: "P1Y2M3DT4H5M6.5S", "PT0S" for zero; each part with its own sign.
+pub fn (i: Interval) toStr(): str {
+    if i.isZero() { return "PT0S" }
+    return "P" + datePart(i.months / 12, i.months % 12, i.days) + timePart(i.time, false)
+}
+
+// Parses ISO 8601 "PnYnMnWnDTnHnMnS": each part may be left out or have a
+// sign, the seconds a fraction of up to 9 digits; a leading "-" negates
+// the whole.
+pub fn parseInterval(s: str): Option[Interval] { return parseIso(s, true) }
+
+// The ISO 8601 duration grammar, shared: months (years as 12), days
+// (weeks as 7) and the time.
+fn parseIso(s: str, any: bool): Option[Interval] {
+    let n = len(s)
+    var i = 0
+    var negAll = false
+    if i < n && (strByte(s, i) == '-' || strByte(s, i) == '+') {
+        negAll = strByte(s, i) == '-'
+        i += 1
+    }
+    if i >= n || (strByte(s, i) != 'P' && strByte(s, i) != 'p') { return None }
+    i += 1
+    var months = 0
+    var days = 0
+    var t = ZERO_DURATION
+    var inTime = false
+    var parts = 0
+    var lastRank = 0        // the order the parts must come in
+    while i < n {
+        var c = strByte(s, i)
+        if c == 'T' || c == 't' {
+            if inTime { return None }
+            inTime = true
+            i += 1
+            if i >= n { return None }
+            continue
+        }
+        // a number: sign, digits, a fraction (seconds only)
+        var neg = false
+        if c == '-' || c == '+' {
+            neg = c == '-'
+            i += 1
+        }
+        let a = i
+        while i < n && strByte(s, i) >= '0' && strByte(s, i) <= '9' { i += 1 }
+        if i == a { return None }
+        let whole = digits(s, a, i)
+        if whole < 0 { return None }
+        var frac = 0
+        var hasFrac = false
+        if i < n && (strByte(s, i) == '.' || strByte(s, i) == ',') {
+            i += 1
+            let f = i
+            while i < n && strByte(s, i) >= '0' && strByte(s, i) <= '9' { i += 1 }
+            if i == f || i - f > 9 { return None }
+            frac = digits(s, f, i)
+            for k in 0..9 - (i - f) { frac *= 10 }
+            hasFrac = true
+        }
+        if i >= n { return None }
+        c = strByte(s, i)
+        i += 1
+        var v = if neg { -whole } else { whole }
+        var rank = 0
+        if !inTime {
+            if hasFrac { return None }
+            if c == 'Y' || c == 'y' {
+                months += v * 12
+                rank = 1
+            } else if c == 'M' || c == 'm' {
+                months += v
+                rank = 2
+            } else if c == 'W' || c == 'w' {
+                days += v * 7
+                rank = 3
+            } else if c == 'D' || c == 'd' {
+                days += v
+                rank = 4
+            } else {
+                return None
+            }
+        } else {
+            if hasFrac && c != 'S' && c != 's' { return None }
+            if c == 'H' || c == 'h' {
+                t = t.plus(hours(v))
+                rank = 5
+            } else if c == 'M' || c == 'm' {
+                t = t.plus(minutes(v))
+                rank = 6
+            } else if c == 'S' || c == 's' {
+                let f = if neg { -frac } else { frac }
+                t = t.plus(duration(v, f))
+                rank = 7
+            } else {
+                return None
+            }
+        }
+        if rank <= lastRank { return None }
+        lastRank = rank
+        parts += 1
+    }
+    if parts == 0 { return None }
+    var r = Interval{months: months, days: days, time: t}
+    if negAll { r = r.neg() }
+    return Some(r)
+}
+
+// ---- arithmetic ----
+
+// The instant d later (earlier when d is negative).
+pub fn (t: Time) plus(d: Duration): Time {
+    let x = duration(t.sec + d.sec, t.nsec + d.nsec)
+    return Time{sec: x.sec, nsec: x.nsec}
+}
+
+pub fn (t: Time) minus(d: Duration): Time { return t.plus(d.neg()) }
+
+// The duration from t to o (negative when o is earlier).
+pub fn (t: Time) until(o: Time): Duration { return duration(o.sec - t.sec, o.nsec - t.nsec) }
+
+// The instant us microseconds after the epoch, and the microseconds of an
+// instant (rounded down): PostgreSQL's timestamps are microseconds.
+pub fn fromMicros(us: int): Time { return Time{sec: floorDiv(us, 1000000), nsec: floorMod(us, 1000000) * 1000} }
+pub fn (t: Time) unixMicros(): int { return t.sec * 1000000 + t.nsec / 1000 }
+
+// The date n days later.
+pub fn (d: Date) addDays(n: int): Date { return dateOfDays(daysOfDate(d) + n) }
+
+// The date n months later, its day clamped to the month's last: January 31
+// and one month is February 28 (29 in a leap year).
+pub fn (d: Date) addMonths(n: int): Date {
+    let m0 = d.year * 12 + (d.month - 1) + n
+    let y = floorDiv(m0, 12)
+    let m = floorMod(m0, 12) + 1
+    let last = daysInMonth(y, m)
+    return Date{year: y, month: m, day: if d.day > last { last } else { d.day }}
+}
+
+// The date n years later (February 29 becomes 28 in a year that has none).
+pub fn (d: Date) addYears(n: int): Date { return d.addMonths(n * 12) }
+
+// The date a period later: its years and months together (clamped once,
+// as addMonths), then its days.
+pub fn (d: Date) plusPeriod(p: Period): Date { return d.addMonths(p.totalMonths()).addDays(p.days) }
+
+// The days from d to o (negative when o is earlier).
+pub fn (d: Date) daysUntil(o: Date): int { return daysOfDate(o) - daysOfDate(d) }
+
+// The period from d to o: the most whole months that d.addMonths does not
+// take past o, then the days left; every part has the same sign, and
+// d.plusPeriod(d.until(o)) is o. Forward this is java.time's
+// LocalDate.until; backward java.time counts the days from o's day of the
+// month (2026-10-31 back to 2026-09-01 is P-1M-30D there, which does not
+// lead back to 2026-09-01: October 31 less a month is September 30), where
+// this counts them from where the months land (P-1M-29D).
+pub fn (d: Date) until(o: Date): Period {
+    var total = (o.year * 12 + o.month) - (d.year * 12 + d.month)
+    if total > 0 && d.addMonths(total).cmp(&o) > 0 { total -= 1 }
+    if total < 0 && d.addMonths(total).cmp(&o) < 0 { total += 1 }
+    let days = d.addMonths(total).daysUntil(o)
+    return Period{years: total / 12, months: total % 12, days: days}
+}
+
+// The day of the year, 1 to 366.
+pub fn (d: Date) dayOfYear(): int { return daysOfDate(d) - daysOfDate(Date{year: d.year, month: 1, day: 1}) + 1 }
+
+// The time of day d later, around the clock.
+pub fn (t: TimeOfDay) plus(d: Duration): TimeOfDay {
+    let day = Duration{sec: 86400, nsec: 0}
+    var x = duration(t.nanos / NANOS_PER_SECOND + d.sec % 86400, t.nanos % NANOS_PER_SECOND + d.nsec)
+    while x.isNegative() { x = x.plus(day) }
+    while x.cmp(&day) >= 0 { x = x.minus(day) }
+    return TimeOfDay{nanos: x.sec * NANOS_PER_SECOND + x.nsec}
+}
+
+// The duration from t to o (negative when o is earlier).
+pub fn (t: TimeOfDay) until(o: TimeOfDay): Duration { return nanos(o.nanos - t.nanos) }
+
+// The date-time d later.
+pub fn (l: LocalDateTime) plus(d: Duration): LocalDateTime { return localOf(l.atUtc().plus(d)) }
+
+pub fn (l: LocalDateTime) minus(d: Duration): LocalDateTime { return l.plus(d.neg()) }
+
+// The date-time a period later (its date moved as plusPeriod; the time of
+// day kept).
+pub fn (l: LocalDateTime) plusPeriod(p: Period): LocalDateTime { return LocalDateTime{date: l.date.plusPeriod(p), time: l.time} }
+
+// The date-time an interval later: its months (clamped), then its days,
+// then its time, as PostgreSQL adds an interval to a timestamp.
+pub fn (l: LocalDateTime) plusInterval(i: Interval): LocalDateTime {
+    let d = l.date.addMonths(i.months).addDays(i.days)
+    return LocalDateTime{date: d, time: l.time}.plus(i.time)
+}
+
+// The duration from l to o (negative when o is earlier).
+pub fn (l: LocalDateTime) until(o: LocalDateTime): Duration { return l.atUtc().until(o.atUtc()) }
 
 // The decimal value of s[a..b] if it is all ASCII digits (at most 18), else -1.
 fn digits(s: str, a: int, b: int): int {
