@@ -1,0 +1,95 @@
+// lexdb_exec: indexes on expressions, checked against PostgreSQL 18 (generated
+// by tests/lexdb/gen_pg.py from exprindex_queries.txt): unique ones, mixed with
+// columns, filtered, with options; queries using them (=, ranges, on either
+// side); UPDATE and DELETE keeping them; the catalog's rows; a column renamed,
+// retyped and dropped under one; the expressions refused (9.89).
+// Each expect line: a query's rows or tag, or ERROR and its SQLSTATE.
+// expect: CREATE TABLE
+// expect: INSERT 0 3
+// expect: CREATE INDEX
+// expect: CREATE INDEX
+// expect: CREATE INDEX
+// expect: CREATE INDEX
+// expect: CREATE INDEX
+// expect: ERROR 23505
+// expect: INSERT 0 1
+// expect: INSERT 0 2
+// expect: 2
+// expect: 1
+// expect: 4
+// expect: 1;2;5;6
+// expect: 1;2;4;5;6
+// expect: 2
+// expect: 1
+// expect: 1
+// expect: 5;6
+// expect: 3;5;6
+// expect: UPDATE 1
+// expect: 2
+// expect: 
+// expect: ERROR 23505
+// expect: UPDATE 1
+// expect: 1
+// expect: DELETE 1
+// expect: 
+// expect: account_pkey|CREATE UNIQUE INDEX account_pkey ON public.account USING btree (id);ix_coal|CREATE INDEX ix_coal ON public.account USING btree (COALESCE(mail, ''::text)) WHERE (n > 0);ix_lower|CREATE UNIQUE INDEX ix_lower ON public.account USING btree (lower(mail));ix_sum|CREATE INDEX ix_sum ON public.account USING btree (((n + id)));ix_two|CREATE INDEX ix_two ON public.account USING btree (upper(mail), ((price * 2.0)) DESC);ix_year|CREATE INDEX ix_year ON public.account USING btree (EXTRACT(year FROM born))
+// expect: account_pkey|1|f|f;ix_coal|0|t|t;ix_lower|0|t|f;ix_sum|0|t|f;ix_two|0 0|t|f;ix_year|0|t|f
+// expect: CREATE INDEX ix_two ON public.account USING btree (upper(mail), ((price * 2.0)) DESC)
+// expect: ALTER TABLE
+// expect: CREATE UNIQUE INDEX ix_lower ON public.account USING btree (lower(email))
+// expect: 4
+// expect: ALTER TABLE
+// expect: 1
+// expect: ERROR 42P17
+// expect: ERROR 42703
+// expect: ERROR 42803
+// expect: ERROR 42P17
+// expect: ERROR 23505
+// expect: ALTER TABLE
+// expect: account_pkey;ix_sum;ix_year
+// expect: CREATE TABLE
+// expect: INSERT 0 3
+// expect: ERROR 23505
+// expect: CREATE INDEX
+// expect: INSERT 0 1
+// expect: 1
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+
+const QUERIES = "create table account (id int primary key, mail text, n int, price numeric(8,2), born date)\ninsert into account values (1, 'Ann@X.org', 5, 10.50, '2001-02-03'), (2, 'bob@x.org', 7, 3, '1999-12-31'), (3, null, null, null, null)\ncreate unique index ix_lower on account (lower(mail))\ncreate index ix_sum on account ((n + id))\ncreate index ix_two on account (upper(mail), (price * 2.0) desc)\ncreate index ix_year on account ((extract(year from born)))\ncreate index ix_coal on account (coalesce(mail, '')) where n > 0\ninsert into account values (4, 'ANN@x.org', 1, 1, null)\ninsert into account values (4, 'cid@x.org', 1, 1, null)\ninsert into account values (5, null, 2, 2, null), (6, null, 3, 3, null)\nselect id from account where lower(mail) = 'bob@x.org'\nselect id from account where lower(mail) = lower('ANN@X.ORG')\nselect id from account where 'cid@x.org' = lower(mail)\nselect id from account where n + id > 5 order by id\nselect id from account where n + id between 3 and 9 order by id\nselect id from account where upper(mail) = 'BOB@X.ORG' and price * 2.0 = 6\nselect id from account where price * 2.0 >= 20 order by id\nselect id from account where extract(year from born) = 2001\nselect id from account where coalesce(mail, '') = '' and n > 0 order by id\nselect id from account where lower(mail) is null order by id\nupdate account set mail = 'Bob2@x.org' where id = 2\nselect id from account where lower(mail) = 'bob2@x.org'\nselect id from account where lower(mail) = 'bob@x.org'\nupdate account set mail = 'ann@x.org' where id = 4\nupdate account set n = n + 100 where id = 1\nselect id from account where n + id = 106\ndelete from account where id = 2\nselect id from account where lower(mail) = 'bob2@x.org'\nselect indexname, indexdef from pg_indexes where tablename = 'account' order by 1\nselect c.relname, i.indkey, i.indexprs is not null, i.indpred is not null from pg_index i join pg_class c on c.oid = i.indexrelid where i.indrelid = 'account'::regclass order by 1\nselect pg_get_indexdef('ix_two'::regclass)\nalter table account rename column mail to email\nselect indexdef from pg_indexes where indexname = 'ix_lower'\nselect id from account where lower(email) = 'cid@x.org'\nalter table account alter column n type bigint\nselect id from account where n + id = 106\ncreate index ix_bad on account (now())\ncreate index ix_bad2 on account (lower(nope))\ncreate index ix_bad3 on account ((count(*)))\ncreate index ix_rand on account ((random()))\ncreate unique index ix_dup on account ((n % 2))\nalter table account drop column email\nselect indexname from pg_indexes where tablename = 'account' order by 1\ncreate table t2 (a int, b int)\ninsert into t2 values (1, 2), (2, 1), (3, 0)\ncreate unique index t2_sum on t2 ((a + b))\ncreate unique index t2_diff on t2 ((a - b))\ninsert into t2 values (0, 4)\nselect a from t2 where a - b = -1"
+
+// every row of the last result, columns joined by |, rows by ;; or the tag
+fn show(s: mut &lexdb_exec.Session, q: &str): str {
+    match s.exec(q) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if !r.hasRows { return r.tag }
+            var rows: []str = []
+            for row in r.rows {
+                var cells: []str = []
+                for v in row { append(mut &cells, lexdb_exec.text(&v)) }
+                append(mut &rows, strings.join(&cells, "|"))
+            }
+            // psql shows a statement's tag after its RETURNING rows, not a SELECT's
+            if r.tag != "" && !strings.startsWith(r.tag, "SELECT") && r.tag != "SHOW" { append(mut &rows, r.tag) }
+            return strings.join(&rows, ";")
+        }
+        Err(e) { return "ERROR " + e.state }
+    }
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    var s = lexdb_exec.newSession(st)
+    let text: str = QUERIES
+    for q in strings.lines(&text) { println(show(mut &s, &q)) }
+    s.close()
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(89), lexdb_store.Options{cacheBytes: 16 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024,
+                                                           snapNodes: 50000, bufferedPages: false}, body).unwrap()
+}

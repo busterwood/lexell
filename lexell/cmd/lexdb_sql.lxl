@@ -452,6 +452,7 @@ pub type Stmt = record {
     pub lockWait: int           // WAIT_BLOCK, WAIT_NOWAIT, WAIT_SKIP
     pub noData: bool            // CREATE TABLE ... AS ... WITH NO DATA (9.88)
     pub into: str               // SELECT ... INTO t: t (9.88); made a CREATE TABLE ... AS
+    pub exprs: []Expr           // CREATE INDEX: per column, its expression (9.89; a Lit NULL for a column, whose name is in names)
 }
 
 pub const CONFLICT_NONE = 0
@@ -519,7 +520,7 @@ pub fn newStmt(kind: int): Stmt {
                 group: [], order: [], limit: None, offset: None, sets: [], params: 0, from: [], index: "",
                 unique: false, inner: [], distinct: false, having: None, subs: [], use: 0, setop: 0, setAll: false,
                 cte: -1, rec: false, cascade: false, src: "", srf: "", ordin: false, alters: [], cons: [], seqNames: [], seq: noSeqOpts(), idOpts: [], overriding: OVR_NONE,
-                copy: noCopyOpts(), wins: [], windows: [], conflict: CONFLICT_NONE, conflictCols: [], conflictCon: "", alias: "", conc: false, lockMode: 0, lockOf: [], lockWait: 0, noData: false, into: ""}
+                copy: noCopyOpts(), wins: [], windows: [], conflict: CONFLICT_NONE, conflictCols: [], conflictCon: "", alias: "", conc: false, lockMode: 0, lockOf: [], lockWait: 0, noData: false, into: "", exprs: []}
 }
 
 // ---- the lexer
@@ -2841,9 +2842,18 @@ fn isOpClass(n: &str): bool {
 // the pattern operator classes are for), and a B+tree is read either way.
 fn (p: mut &P) indexCol(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
     if p.isKw("(") || (p.peekAt(1).kind == T_OP && p.peekAt(1).text == "(") {
-        return Err(lexdb_base.err("0A000", "lexdb: indexes on expressions are not supported"))
+        // an expression (9.89): (expr), or a function's call
+        let subs = len(p.subs)
+        let params = p.params
+        let x = try p.unary()
+        if len(p.subs) > subs { return Err(lexdb_base.err("0A000", "cannot use subquery in index expression")) }
+        if p.params > params { return Err(lexdb_base.err("42P02", "there is no parameter $" + p.params.toStr())) }
+        append(mut &s.names, "")
+        append(mut &s.exprs, x)
+    } else {
+        append(mut &s.names, try p.name())
+        append(mut &s.exprs, Expr.Lit(Val.Null))
     }
-    append(mut &s.names, try p.name())
     var opts: []str = []
     if p.acceptKw("collate") {
         let c = try p.qname()
@@ -3667,7 +3677,11 @@ pub fn exprText(x: &Expr): str {
                 Val.Null { return "null" }
                 Val.Int(n) { return n.toStr() }
                 Val.Bool(b) { return if b { "true" } else { "false" } }
-                Val.Num(d) { return d.canonical() }
+                Val.Num(d) {
+                    // a point kept: read back, 2.0 stays numeric, not an integer (9.89)
+                    let c = d.canonical()
+                    return if strings.contains(&c, ".") || strings.contains(&c, "e") || strings.contains(&c, "E") { c } else { c + ".0" }
+                }
                 Val.Text(t) { return "'" + strings.replaceAll(t, "'", "''") + "'" }
                 Val.Date(d) { return "'" + lexdb_time.fmtDate(d) + "'::date" }
                 Val.Time(u) { return "'" + lexdb_time.fmtTime(u) + "'::time" }

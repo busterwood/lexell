@@ -6947,3 +6947,90 @@ several at its end).
 - a very large CREATE TABLE AS holds its result in memory while it
   inserts;
 - TEMPORARY tables (the word is accepted by SELECT INTO and ignored).
+
+### 9.89 Indexes on expressions
+
+Asked for after 9.88. Alembic's probe (9.85) wrote `CREATE UNIQUE INDEX ...
+ON account (lower(mail))`, the usual way to make a column unique without
+regard to case, and Django's functional indexes write the same. lexdb
+refused them (0A000).
+
+**What an index holds.**
+- An index column is now a table column or an expression: `(expr)`, or a
+  function's call, with the column options of 9.85 after it.
+- `Index.cols` holds -1 for an expression, and `Index.exprs` holds the
+  expressions, their column names bare as a filtered index's predicate's
+  are. The catalog row keeps them as text under flag 16; an older row
+  has none.
+- An entry's values come from `idxVal`: the column's, or the expression
+  evaluated over the row and coerced to the expression's type
+  (`exprType`, from `exprOid` over the table's columns).
+- Making a key can now fail, as an expression can (a division by zero on
+  a new row), so `idxPrefix`, `idxEntry` and `hasNull` return a Result and
+  take the table.
+- An UPDATE makes an entry only for a row the index holds: outside a
+  filtered index's rows, the expression need not have a value.
+- A unique index's error names the expression, as PostgreSQL's does:
+  `Key (lower(mail))=(ann@x.org) already exists.`
+- Foreign keys, ON CONFLICT's targets and the primary key never match an
+  index with an expression, because no column number is -1.
+
+**What is refused when the index is made, as PostgreSQL refuses it:** a
+column not there (42703), an aggregate (42803), a subquery or a parameter,
+and a function whose value changes over time: now() and the other clocks,
+random(), gen_random_uuid(), the sequence functions, current_user. That is
+PostgreSQL's IMMUTABLE rule, 42P17.
+
+**The planner.** For an expression's place in an index, `choosePath` takes
+the conjuncts comparing the same expression with a value known before the
+table (`exprBounds`: `=`, `<`, `<=`, `>`, `>=`, on either side).
+- "The same" means the expression qualified with the table's alias
+  (`qualified`) gives the same text (`sameExpr`) as the conjunct's side.
+- The bound values are coerced to the expression's type (`keyType`,
+  which `pathScan` and `pathScans` now use for every place). An equality
+  on all of a unique index's expressions is a lookup.
+- The conditions stay and are checked on each row read, so the index only
+  narrows the scan.
+- Not matched yet: IN lists, LIKE prefixes, and ORDER BY by an expression.
+
+**Kept up by ALTER TABLE.**
+- DROP COLUMN drops an index whose expression names the column.
+- ALTER COLUMN TYPE rebuilds the indexes whose expressions name a changed
+  column.
+- RENAME COLUMN renames the column inside the expressions (`renameCol`, as
+  for predicates).
+
+**The catalog.**
+- `pg_index.indkey` holds 0 for an expression, and `indexprs` is not NULL
+  (Django's introspection tests it, then reads `pg_get_indexdef`).
+- `pg_get_indexdef` and `pg_indexes` show a call as it is and any other
+  expression in parentheses, as PostgreSQL does: `(lower(mail))`,
+  `(((n + id)))`.
+
+**Two fixes on the way, found by the test generated from PostgreSQL:**
+- **`exprText` wrote a whole numeric constant without its point.** 2.0
+  was written as 2, which reads back as an integer, so a stored expression
+  (an index's, a CHECK, a predicate, a DEFAULT) changed type: `n / 2.0`
+  read back as integer division. It now keeps the point.
+- **`pgExprText` wrote a call's arguments with `exprText`,** which quotes
+  column names: `lower("mail")`, `length("title")` in a CHECK. A call's
+  arguments are now written as PostgreSQL's deparser writes them: columns
+  bare, text constants typed (`''::text`), COALESCE, NULLIF, GREATEST and
+  LEAST in capitals, `date_part` with a constant field as `EXTRACT(year
+  FROM born)`.
+- Still not matched: the casts PostgreSQL shows where an operator's types
+  differ (`price * (2)::numeric`), which need the columns' types.
+
+**Tests:** `exec_exprindex`, 49 statements generated from PostgreSQL 18 by
+`gen_pg.py exprindex`, all the same. They cover:
+- unique, mixed with columns, filtered and DESC expression indexes;
+- a duplicate refused;
+- queries using them: `=` on either side, ranges, BETWEEN, two places, IS
+  NULL;
+- UPDATE, DELETE and a key changed under them;
+- the catalog's rows and `pg_get_indexdef`;
+- a column renamed, retyped and dropped under one;
+- the refusals; two unique expression indexes over the same columns.
+
+Alembic's probe now runs past the expression index, to CREATE TYPE ... AS
+ENUM (not yet).

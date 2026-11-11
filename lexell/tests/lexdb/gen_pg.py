@@ -14,7 +14,8 @@ double precision, 9.79) and catalog (catalog_queries.txt to
 run/exec_catalog.lxl: pg_catalog and information_schema, 9.80) and views (views_queries.txt to
 run/exec_views.lxl, 9.82) and privs (privs_queries.txt to run/exec_privs.lxl, 9.83)
 and migrate (migrate_queries.txt to run/exec_migrate.lxl, 9.85 and 9.86)
-and keyless (keyless_queries.txt to run/exec_keyless.lxl, 9.88).
+and keyless (keyless_queries.txt to run/exec_keyless.lxl, 9.88)
+and exprindex (exprindex_queries.txt to run/exec_exprindex.lxl, 9.89).
 Each runs in a new database with TimeZone UTC, DateStyle ISO and
 IntervalStyle postgres, the defaults lexdb has. A result is every row,
 columns joined by |, rows by ;, NULL as nothing; or ERROR and the error's
@@ -93,6 +94,13 @@ SUITES = {
         'indexes and ON CONFLICT on them, a view, the catalog not showing the hidden',
         'key, a foreign key to one refused; the forms of CREATE TABLE ... AS and',
         'SELECT INTO, their column names and types, WITH NO DATA, in a block (9.88).',
+        'Each expect line: a query\'s rows or tag, or ERROR and its SQLSTATE.']),
+    'exprindex': ('exprindex_queries.txt', 'exec_exprindex.lxl', 89, [
+        'lexdb_exec: indexes on expressions, checked against PostgreSQL 18 (generated',
+        'by tests/lexdb/gen_pg.py from exprindex_queries.txt): unique ones, mixed with',
+        'columns, filtered, with options; queries using them (=, ranges, on either',
+        'side); UPDATE and DELETE keeping them; the catalog\'s rows; a column renamed,',
+        'retyped and dropped under one; the expressions refused (9.89).',
         'Each expect line: a query\'s rows or tag, or ERROR and its SQLSTATE.']),
 }
 

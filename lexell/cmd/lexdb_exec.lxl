@@ -49,6 +49,9 @@ pub type Index = record {
     pub pred: Option[Expr]      // a filtered index: the rows it holds (column names bare)
     pub con: bool               // a UNIQUE constraint's (9.39): dropped with the constraint, not by DROP INDEX
     pub opts: []str             // per column, its options as shown (opclass, DESC, NULLS ...: 9.85); [] none
+    // per column, an expression's (9.89): where cols holds -1, its value is
+    // exprs' (column names bare); [] none
+    pub exprs: []Expr
 }
 
 pub type Table = record {
@@ -2600,9 +2603,11 @@ fn encTable(t: &Table): str {
         let filtered = ix.pred.isSome()
         var shown = false
         for o in ix.opts { if len(o) > 0 { shown = true } }
-        b.addByte((if ix.unique { 1 } else { 0 }) + (if filtered { 2 } else { 0 }) + (if ix.con { 4 } else { 0 }) + (if shown { 8 } else { 0 }))
+        let exprd = len(ix.exprs) > 0
+        b.addByte((if ix.unique { 1 } else { 0 }) + (if filtered { 2 } else { 0 }) + (if ix.con { 4 } else { 0 }) + (if shown { 8 } else { 0 }) +
+                  (if exprd { 16 } else { 0 }))
         binary.addU32LE(mut &b, len(ix.cols))
-        for c in ix.cols { binary.addU32LE(mut &b, c) }
+        for c in ix.cols { binary.addU32LE(mut &b, c & 0xFFFFFFFF) }
         match ix.pred {
             Some(x) {
                 let text = lexdb_sql.exprText(&x)
@@ -2612,6 +2617,11 @@ fn encTable(t: &Table): str {
             None {}
         }
         if shown { addStrs(mut &b, &ix.opts) }
+        if exprd {
+            var texts: []str = []
+            for k in 0..len(ix.cols) { append(mut &texts, if ix.cols[k] < 0 { lexdb_sql.exprText(&ix.exprs[k]) } else { "" }) }
+            addStrs(mut &b, &texts)
+        }
     }
     // then defaults, after the places (written, with none, when there are
     // defaults)
@@ -2767,7 +2777,7 @@ fn decTable(name: str, s: &str): Result[Table, DbErr] {
     at += 4
     for i in 0..ni {
         let l = binary.readU32LEStr(s, at)
-        var ix = Index{name: s[at + 4..at + 4 + l], tree: 0, cols: [], unique: false, pred: None, con: false, opts: []}
+        var ix = Index{name: s[at + 4..at + 4 + l], tree: 0, cols: [], unique: false, pred: None, con: false, opts: [], exprs: []}
         at += 4 + l
         ix.tree = binary.readU32LEStr(s, at)
         let flags = s[at + 4]
@@ -2776,7 +2786,8 @@ fn decTable(name: str, s: &str): Result[Table, DbErr] {
         let nc = binary.readU32LEStr(s, at + 5)
         at += 9
         for j in 0..nc {
-            append(mut &ix.cols, binary.readU32LEStr(s, at))
+            let c = binary.readU32LEStr(s, at)
+            append(mut &ix.cols, if c == 0xFFFFFFFF { -1 } else { c })
             at += 4
         }
         if flags & 2 != 0 {
@@ -2790,6 +2801,20 @@ fn decTable(name: str, s: &str): Result[Table, DbErr] {
         if flags & 8 != 0 {
             ix.opts = strsAt(s, at)
             at += strsLen(&ix.opts)
+        }
+        if flags & 16 != 0 {
+            let texts = strsAt(s, at)
+            at += strsLen(&texts)
+            for x in texts {
+                if len(x) == 0 {
+                    append(mut &ix.exprs, Expr.Lit(Val.Null))
+                    continue
+                }
+                match lexdb_sql.parseExpr(&x) {
+                    Ok(e1) { append(mut &ix.exprs, e1) }
+                    Err(_) { return Err(lexdb_base.corrupt("an expression of index \"" + ix.name + "\"")) }
+                }
+            }
         }
         append(mut &t.indexes, ix)
     }
@@ -3435,6 +3460,49 @@ fn bounds(cs: &[]Expr, col: &str, k: int, q: &Query): []Bound {
     return out
 }
 
+// An index expression with its columns named as a query names them
+// (alias.column).
+fn qualified(x: &Expr, alias: &str): Expr {
+    match x {
+        Expr.Col(n) { return Expr.Col(alias + "." + n) }
+        Expr.Unary(op, a) { return Expr.Unary(op, qualified(&a, alias)) }
+        Expr.Bin(op, a, b) { return Expr.Bin(op, qualified(&a, alias), qualified(&b, alias)) }
+        Expr.IsNull(a, neg) { return Expr.IsNull(qualified(&a, alias), neg) }
+        Expr.Call(n, args, star) {
+            var out: []Expr = []
+            for a in args { append(mut &out, qualified(&a, alias)) }
+            return Expr.Call(n, out, star)
+        }
+        Expr.Cast(a, t) { return Expr.Cast(qualified(&a, alias), t) }
+        else { return clone(x) }
+    }
+}
+
+// Whether two expressions are the same.
+fn sameExpr(a: &Expr, b: &Expr): bool { return lexdb_sql.exprText(a) == lexdb_sql.exprText(b) }
+
+// bounds for an index expression (9.89): conjuncts comparing target with a
+// value known before level k.
+fn exprBounds(cs: &[]Expr, target: &Expr, k: int, q: &Query): []Bound {
+    var out: []Bound = []
+    for c in cs {
+        match c {
+            Expr.Bin(op, a, b) {
+                if op == "=" || op == "<" || op == "<=" || op == ">" || op == ">=" {
+                    if sameExpr(&a, target) && q.keyBefore(&b, k) {
+                        append(mut &out, Bound{op: op, val: clone(&b)})
+                    } else if sameExpr(&b, target) && q.keyBefore(&a, k) {
+                        let flip = match op { "<" { ">" } "<=" { ">=" } ">" { "<" } ">=" { "<=" } else { "=" } }
+                        append(mut &out, Bound{op: flip, val: clone(&a)})
+                    }
+                }
+            }
+            else {}
+        }
+    }
+    return out
+}
+
 // ---- filtered indexes: when a query's conditions imply the predicate
 
 // The value of an expression without columns, if it has one now (NULL: none).
@@ -3721,7 +3789,21 @@ fn choosePath(q: &Query, k: int, cs: &[]Expr, params: &[]Val): Path {
         var ins: []Expr = []
         var inSub = -1
         var inArr: []Expr = []
-        for ci in cols {
+        for pos in 0..len(cols) {
+            let ci = cols[pos]
+            if ci < 0 {
+                // an expression's (9.89): the conditions on the same expression
+                let target = qualified(&lv.t.indexes[c].exprs[pos], &lv.alias)
+                var xb = exprBounds(cs, &target, k, q)
+                var xeq = -1
+                for i in 0..len(xb) { if xb[i].op == "=" && xeq < 0 { xeq = i } }
+                if xeq < 0 {
+                    rng = xb
+                    break
+                }
+                append(mut &eqs, replace(mut &xb[xeq].val, Expr.Lit(Val.Null)))
+                continue
+            }
             let name = lv.alias + "." + lv.t.cols[ci].name
             var bs = bounds(cs, &name, k, q)
             var eqAt = -1
@@ -3803,12 +3885,12 @@ fn pathScans(t: &Table, p: &Path, env: &Env): Result[[]Scan, DbErr] {
     let cols = keyCols(t, p.index)
     var prefix = newStrBuf()
     for k in 0..len(p.eqs) {
-        let v = try coerce(try eval(&p.eqs[k], env), &boundType(&t.cols[cols[k]].typ))
+        let v = try coerce(try eval(&p.eqs[k], env), &keyType(t, p.index, k))
         if isNull(&v) { return Ok([]) }
         encPart(mut &prefix, &v, ix)
     }
     let pre = prefix.toStr()
-    let typ = boundType(&t.cols[cols[len(p.eqs)]].typ)
+    let typ = keyType(t, p.index, len(p.eqs))
     var vs: []Val = []
     if p.inSub >= 0 {
         // the subquery's values; one not of the column's type is left to
@@ -3872,7 +3954,7 @@ fn pathScan(t: &Table, p: &Path, env: &Env): Result[Scan, DbErr] {
     let cols = keyCols(t, p.index)
     var prefix = newStrBuf()
     for k in 0..len(p.eqs) {
-        let v = try coerce(try eval(&p.eqs[k], env), &boundType(&t.cols[cols[k]].typ))
+        let v = try coerce(try eval(&p.eqs[k], env), &keyType(t, p.index, k))
         if isNull(&v) { return Ok(none) }
         encPart(mut &prefix, &v, ix)
     }
@@ -3881,7 +3963,7 @@ fn pathScan(t: &Table, p: &Path, env: &Env): Result[Scan, DbErr] {
     var lo = pre
     var hi = if len(pre) > 0 { succ(&pre) } else { "" }
     if len(p.rng) > 0 {
-        let typ = boundType(&t.cols[cols[len(p.eqs)]].typ)
+        let typ = keyType(t, p.index, len(p.eqs))
         for b in p.rng {
             let v = try coerce(try eval(&b.val, env), &typ)
             if isNull(&v) { return Ok(none) }
@@ -5454,17 +5536,65 @@ fn idxName(name: &str): str {
     return b.toStr()
 }
 
-fn idxPrefix(ix: &Index, row: &[]Val): str {
-    var b = newStrBuf()
-    for c in ix.cols { encIdxPart(mut &b, &row[c]) }
-    return b.toStr()
+// An index's k-th value for row of t: its column's, or its expression's
+// (9.89), of the expression's type.
+fn idxVal(t: &Table, ix: &Index, k: int, row: &[]Val): Result[Val, DbErr] {
+    let c = ix.cols[k]
+    if c >= 0 { return Ok(row[c]) }
+    let none: []Val = []
+    let noSubs: []SubRes = []
+    let env = Env{cols: &t.cols, row: row, aggs: &none, params: &none, subs: &noSubs, cur: &none, seq: None}
+    let v = try eval(&ix.exprs[k], &env)
+    if isNull(&v) { return Ok(v) }
+    return coerce(v, &exprType(t, &ix.exprs[k]))
 }
 
-fn idxEntry(ix: &Index, row: &[]Val, pk: &str): str { return idxPrefix(ix, row) + pk }
+// An index expression's type, from the table's columns.
+fn exprType(t: &Table, x: &Expr): lexdb_sql.TypeName {
+    let none: []int = []
+    let o = exprOid(x, &t.cols, &none)
+    return boundType(&oidType(if o == 0 || o == 705 { lexdb_sql.OID_TEXT } else { o }))
+}
 
-fn hasNull(ix: &Index, row: &[]Val): bool {
-    for c in ix.cols { if isNull(&row[c]) { return true } }
-    return false
+// The type of an index's (or the primary key's: index -1) k-th value, for
+// its bounds.
+fn keyType(t: &Table, index: int, k: int): lexdb_sql.TypeName {
+    if index >= 0 && t.indexes[index].cols[k] < 0 { return exprType(t, &t.indexes[index].exprs[k]) }
+    let cols = keyCols(t, index)
+    return boundType(&t.cols[cols[k]].typ)
+}
+
+fn idxPrefix(t: &Table, ix: &Index, row: &[]Val): Result[str, DbErr] {
+    var b = newStrBuf()
+    for k in 0..len(ix.cols) { encIdxPart(mut &b, &(try idxVal(t, ix, k, row))) }
+    return Ok(b.toStr())
+}
+
+fn idxEntry(t: &Table, ix: &Index, row: &[]Val, pk: &str): Result[str, DbErr] { return Ok((try idxPrefix(t, ix, row)) + pk) }
+
+fn hasNull(t: &Table, ix: &Index, row: &[]Val): Result[bool, DbErr] {
+    for k in 0..len(ix.cols) { if isNull(&(try idxVal(t, ix, k, row))) { return Ok(true) } }
+    return Ok(false)
+}
+
+// Whether an index expression's value depends on the row alone: no
+// function whose value changes (time, random, sequences).
+fn immutable(x: &Expr): bool {
+    match x {
+        Expr.Call(n, args, _) {
+            if isVolatile(x) || n == "now" || n == "random" || n == "clock_timestamp" || n == "statement_timestamp" ||
+               n == "transaction_timestamp" || n == "timeofday" || n == "current_timestamp" || n == "current_date" ||
+               n == "current_time" || n == "localtimestamp" || n == "localtime" || n == "gen_random_uuid" || n == "current_user" ||
+               n == "session_user" || n == "current_schema" || n == "version" { return false }
+            for a in args { if !immutable(&a) { return false } }
+            return true
+        }
+        Expr.Unary(_, a) { return immutable(&a) }
+        Expr.Bin(_, a, b) { return immutable(&a) && immutable(&b) }
+        Expr.IsNull(a, _) { return immutable(&a) }
+        Expr.Cast(a, _) { return immutable(&a) }
+        else { return true }
+    }
 }
 
 // A unique index may hold a value once, NULLs aside (they are all distinct).
@@ -5472,8 +5602,8 @@ fn hasNull(ix: &Index, row: &[]Val): bool {
 // meanwhile fails one of the two with 40001.
 fn checkUnique(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, ix: &Index, row: &[]Val,
                pk: &str): Result[Unit, DbErr] {
-    if !ix.unique || hasNull(ix, row) { return Ok(Unit{}) }
-    let pre = idxPrefix(ix, row)
+    if !ix.unique || (try hasNull(t, ix, row)) { return Ok(Unit{}) }
+    let pre = try idxPrefix(t, ix, row)
     var clash = false
     try st.scan(txn, ix.tree, pre, succ(&pre), fn(en: &lexdb_store.Entry): bool {
         if en.val != pk {
@@ -5485,9 +5615,13 @@ fn checkUnique(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, ix:
     if !clash { return Ok(Unit{}) }
     var names: []str = []
     var vals: []str = []
-    for c in ix.cols {
-        append(mut &names, t.cols[c].name)
-        append(mut &vals, text(&row[c]))
+    for k in 0..len(ix.cols) {
+        let c = ix.cols[k]
+        if c >= 0 { append(mut &names, t.cols[c].name) } else {
+            let none: Option[lexdb_sql.TypeName] = None
+            append(mut &names, pgExprText(&ix.exprs[k], &none))
+        }
+        append(mut &vals, text(&(try idxVal(t, ix, k, row))))
     }
     return Err(e("23505", "duplicate key value violates unique constraint \"" + lexdb_sql.baseName(&ix.name) + "\": Key (" +
                  strings.join(&names, ", ") + ")=(" + strings.join(&vals, ", ") + ") already exists."))
@@ -5511,7 +5645,7 @@ fn addIndexes(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, row:
     for ix in t.indexes {
         if !(try inIndex(t, &ix, row)) { continue }
         try checkUnique(st, txn, t, &ix, row, pk)
-        try txn.put(ix.tree, idxEntry(&ix, row, pk), pk)
+        try txn.put(ix.tree, try idxEntry(t, &ix, row, pk), pk)
     }
     return Ok(Unit{})
 }
@@ -5519,10 +5653,12 @@ fn addIndexes(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, row:
 fn changeIndexes(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, old: &[]Val, oldPk: &str, row: &[]Val,
                  pk: &str): Result[Unit, DbErr] {
     for ix in t.indexes {
-        let a = idxEntry(&ix, old, oldPk)
-        let b = idxEntry(&ix, row, pk)
         let was = try inIndex(t, &ix, old)
         let now = try inIndex(t, &ix, row)
+        // (an entry made only for a row the index holds: an expression
+        // need not have a value outside a filtered index's rows)
+        let a = if was { try idxEntry(t, &ix, old, oldPk) } else { "" }
+        let b = if now { try idxEntry(t, &ix, row, pk) } else { "" }
         if a == b && was == now { continue }
         if was { txn.del(ix.tree, a) }
         if now {
@@ -5796,6 +5932,11 @@ fn dropColumn(txn: mut &lexdb_store.Txn, t: mut &Table, i: int): Result[Unit, Db
         var ix = pop(mut &old)
         var uses = false
         for c in ix.cols { if c == i { uses = true } }
+        for ixe in ix.exprs {
+            var ixn: []str = []
+            colNames(&ixe, mut &ixn)
+            for n in ixn { if n == name { uses = true } }
+        }
         match ix.pred {
             Some(x) {
                 var ns: []str = []
@@ -6039,7 +6180,15 @@ fn retype(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, chan
     var redo: []int = []
     for k in 0..len(t.indexes) {
         var uses = keyChanged
-        for c in t.indexes[k].cols { if changed[c] { uses = true } }
+        for c in t.indexes[k].cols { if c >= 0 && changed[c] { uses = true } }
+        for ixe in t.indexes[k].exprs {
+            var ixn: []str = []
+            colNames(&ixe, mut &ixn)
+            for n in ixn {
+                let ci = colIndex(&t.cols, &n)
+                if ci >= 0 && changed[ci] { uses = true }
+            }
+        }
         match t.indexes[k].pred {
             Some(x) {
                 var ns: []str = []
@@ -6068,7 +6217,7 @@ fn retype(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, chan
                     return Err(e("23505", "could not create unique index \"" + lexdb_sql.baseName(&ix.name) + "\": a value is duplicated"))
                 }
             }
-            try txn.put(ix.tree, idxEntry(ix, &rows[r], &keys[r]), keys[r])
+            try txn.put(ix.tree, try idxEntry(t, ix, &rows[r], &keys[r]), keys[r])
         }
     }
     return Ok(Unit{})
@@ -6197,6 +6346,9 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
                         None {}
                     }
                     if renamed.isSome() { t.indexes[k].pred = renamed }
+                    var rx: []Expr = []
+                    for x in t.indexes[k].exprs { append(mut &rx, renameCol(&x, &a.name, &a.to)) }
+                    t.indexes[k].exprs = rx
                 }
                 for k in 0..len(t.checks) { t.checks[k].expr = renameCol(&t.checks[k].expr, &a.name, &a.to) }
                 try renameFkCol(st, txn, mut &t, &a.name, &a.to)
@@ -6352,11 +6504,30 @@ fn createIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
         return Err(e("42P07", "relation \"" + s.index + "\" already exists"))
     }
     var cols: []int = []
-    for n in s.names {
+    var exprs: []Expr = []
+    var anyExpr = false
+    for k in 0..len(s.names) {
+        let n = s.names[k]
+        if len(n) == 0 && k < len(s.exprs) {
+            // an expression (9.89): of the table's columns, no aggregate,
+            // nothing whose value changes (PostgreSQL's IMMUTABLE)
+            let x = &s.exprs[k]
+            var ns: []str = []
+            colNames(x, mut &ns)
+            for cn in ns { if colIndex(&t.cols, &cn) < 0 { return Err(e("42703", "column \"" + cn + "\" does not exist")) } }
+            if hasAgg(x) { return Err(e("42803", "aggregate functions are not allowed in index expressions")) }
+            if !immutable(x) { return Err(e("42P17", "functions in index expression must be marked IMMUTABLE")) }
+            append(mut &cols, -1)
+            append(mut &exprs, clone(x))
+            anyExpr = true
+            continue
+        }
         let i = colIndex(&t.cols, &n)
         if i < 0 { return Err(e("42703", "column \"" + n + "\" does not exist")) }
         append(mut &cols, i)
+        append(mut &exprs, Expr.Lit(Val.Null))
     }
+    if !anyExpr { exprs = [] }
     var pred: Option[Expr] = None
     match s.where {
         Some(w) {
@@ -6374,7 +6545,7 @@ fn createIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
         }
         None {}
     }
-    let ix = Index{name: ixKey, tree: st.createTree(txn), cols: cols, unique: s.unique, pred: pred, con: false, opts: copyStrs(&s.pk)}
+    let ix = Index{name: ixKey, tree: st.createTree(txn), cols: cols, unique: s.unique, pred: pred, con: false, opts: copyStrs(&s.pk), exprs: exprs}
     try addIndex(st, txn, mut &t, ix)
     try txn.put(CATALOG, t.name, encTable(&t))
     try bumpCatalog(st, txn)
@@ -6401,7 +6572,7 @@ fn addIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, ix
                     return Err(e("23505", "could not create unique index \"" + lexdb_sql.baseName(&ix.name) + "\": a value is duplicated"))
                 }
             }
-            try txn.put(ix.tree, idxEntry(&ix, &r, &pk), pk)
+            try txn.put(ix.tree, try idxEntry(t, &ix, &r, &pk), pk)
         }
     }
     try txn.put(CATALOG, idxName(&ix.name), t.name)
@@ -6455,7 +6626,7 @@ fn addConstraint(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Tabl
     let key = lexdb_sql.qual(&lexdb_sql.schemaOf(&t.name), &name)
     if hasConName(t, &name) { return Err(e("42710", "constraint \"" + name + "\" for relation \"" + lexdb_sql.baseName(&t.name) + "\" already exists")) }
     if try relExists(st, txn, &key) { return Err(e("42P07", "relation \"" + name + "\" already exists")) }
-    let ix = Index{name: key, tree: st.createTree(txn), cols: cols, unique: true, pred: None, con: true, opts: []}
+    let ix = Index{name: key, tree: st.createTree(txn), cols: cols, unique: true, pred: None, con: true, opts: [], exprs: []}
     return addIndex(st, txn, t, ix)
 }
 
@@ -6906,8 +7077,8 @@ fn conflictOf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, up: 
             pk = keyOf(t, row)
         } else {
             let ix = &t.indexes[a]
-            if hasNull(ix, row) || !(try inIndex(t, ix, row)) { continue }
-            let pre = idxPrefix(ix, row)
+            if (try hasNull(t, ix, row)) || !(try inIndex(t, ix, row)) { continue }
+            let pre = try idxPrefix(t, ix, row)
             var hit: []str = []
             try st.scan(txn, ix.tree, pre, succ(&pre), fn(en: &lexdb_store.Entry): bool {
                 append(mut &hit, en.val)
@@ -9764,7 +9935,7 @@ fn parentHas(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, p: &Table, fc: &
     if fc.via == -1 { return Ok((try st.get(txn, p.tree, keyOf(p, &prow))).isSome()) }
     if fc.via < 0 { return Ok(false) }
     let ix = &p.indexes[fc.via]
-    let pre = idxPrefix(ix, &prow)
+    let pre = try idxPrefix(p, ix, &prow)
     var found = false
     try st.scan(txn, ix.tree, pre, succ(&pre), fn(en: &lexdb_store.Entry): bool {
         found = true
@@ -9928,7 +10099,7 @@ fn delRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, row: &[]
           later: mut &[]FkLater): Result[Unit, DbErr] {
     let key = keyOf(t, row)
     txn.del(t.tree, key)
-    for ix in t.indexes { if try inIndex(t, &ix, row) { txn.del(ix.tree, idxEntry(&ix, row, &key)) } }
+    for ix in t.indexes { if try inIndex(t, &ix, row) { txn.del(ix.tree, try idxEntry(t, &ix, row, &key)) } }
     if len(t.refBy) > 0 {
         let none: []Val = []
         try parentSide(st, txn, t, fw, row, &none, false, later)
@@ -14104,6 +14275,7 @@ type CatIdx = record {
     con: bool               // a constraint's (primary key, UNIQUE)
     pred: Option[Expr]
     opts: []str             // per column: opclass, DESC, NULLS ... as shown; [] none
+    exprs: []str            // per column: an expression's text as PostgreSQL shows it ("" a column's; cols 0); [] none
 }
 
 type CatTab = record {
@@ -14189,8 +14361,16 @@ fn colOpts(t: &Table, ix: &CatIdx): str {
     var parts: []str = []
     for k in 0..len(ix.cols) {
         let n = ix.cols[k]
-        if n < 1 || n > len(t.cols) { continue }
-        var p = quoteIfNeeded(&t.cols[n - 1].name)
+        var p = ""
+        if n == 0 && k < len(ix.exprs) {
+            // an expression: a function's call as it is, any other in parentheses
+            let x = ix.exprs[k]
+            let call = len(x) > 0 && x[len(x) - 1] == ')' && x[0] != '('
+            p = if call { x } else { "(" + x + ")" }
+        } else {
+            if n < 1 || n > len(t.cols) { continue }
+            p = quoteIfNeeded(&t.cols[n - 1].name)
+        }
         if k < len(ix.opts) && len(ix.opts[k]) > 0 { p = p + " " + ix.opts[k] }
         append(mut &parts, p)
     }
@@ -14286,7 +14466,25 @@ fn pgExprText(x: &Expr, typ: &Option[lexdb_sql.TypeName]): str {
                 }
                 return n + "()"
             }
-            return lexdb_sql.exprText(x)
+            // as PostgreSQL's deparser: arguments as expressions (columns
+            // bare, constants typed), its special forms (9.89)
+            let none: Option[lexdb_sql.TypeName] = None
+            if n == "date_part" && len(args) == 2 {
+                match args[0] {
+                    Expr.Lit(v) {
+                        match v {
+                            Val.Text(f) { return "EXTRACT(" + f + " FROM " + pgExprText(&args[1], &none) + ")" }
+                            else {}
+                        }
+                    }
+                    else {}
+                }
+            }
+            if strings.contains(n, " ") || strings.startsWith(n, "#") || strings.startsWith(n, "case") { return lexdb_sql.exprText(x) }
+            var parts: []str = []
+            for a in args { append(mut &parts, pgExprText(&a, &none)) }
+            let shownName = if n == "coalesce" || n == "nullif" || n == "greatest" || n == "least" { strings.toUpperAscii(n) } else { n }
+            return shownName + "(" + strings.join(&parts, ", ") + ")"
         }
         else { return lexdb_sql.exprText(x) }
     }
@@ -14346,14 +14544,19 @@ fn catSnap(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[CatSnap, D
             for p in t.pk { append(mut &cs, p + 1) }
             let pn = name + "_pkey"
             append(mut &idxs, CatIdx{name: pn, oid: catOid(&"i", &lexdb_sql.qual(&schema, &pn)), cols: cs, unique: true, primary: true,
-                                     con: true, pred: None, opts: []})
+                                     con: true, pred: None, opts: [], exprs: []})
         }
         for ix in t.indexes {
             var cs: []int = []
-            for c in ix.cols { append(mut &cs, c + 1) }
+            for c in ix.cols { append(mut &cs, if c < 0 { 0 } else { c + 1 }) }
+            var xs: []str = []
+            for k in 0..len(ix.exprs) {
+                let none: Option[lexdb_sql.TypeName] = None
+                append(mut &xs, if ix.cols[k] < 0 { pgExprText(&ix.exprs[k], &none) } else { "" })
+            }
             let iname = lexdb_sql.baseName(&ix.name)
             append(mut &idxs, CatIdx{name: iname, oid: catOid(&"i", &lexdb_sql.qual(&schema, &iname)), cols: cs, unique: ix.unique,
-                                     primary: false, con: ix.con, pred: cloneOptE(&ix.pred), opts: copyStrs(&ix.opts)})
+                                     primary: false, con: ix.con, pred: cloneOptE(&ix.pred), opts: copyStrs(&ix.opts), exprs: xs})
         }
         append(mut &snap.tabs, CatTab{key: keys[i], t: t, oid: catOid(&"r", &keys[i]), schema: schema, name: name,
                                       shown: shownIn(&txn.path, &schema, &name), idxs: idxs})
@@ -15160,7 +15363,8 @@ fn catRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &str): Result
                     let pred = predVal(&ix.pred)
                     append(mut &rows, [iv(ix.oid), iv(ct.oid), iv(len(ix.cols)), iv(len(ix.cols)), bv(ix.unique), bv(false), bv(ix.primary),
                                        bv(false), bv(true), bv(false), bv(true), bv(false), bv(true), bv(true), bv(false),
-                                       vecOf(&ix.cols), vecOf(&colls), zeros(len(ix.cols)), indOptions(&ix), Val.Null, pred])
+                                       vecOf(&ix.cols), vecOf(&colls), zeros(len(ix.cols)), indOptions(&ix),
+                                       if len(ix.exprs) > 0 { tv(&strings.join(&ix.exprs, " ")) } else { Val.Null }, pred])
                 }
             }
         }
