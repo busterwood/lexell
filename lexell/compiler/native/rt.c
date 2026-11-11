@@ -2563,8 +2563,8 @@ int64_t lxllib_file_op(int64_t op, int64_t fd, void* b, int64_t n, int64_t off, 
     q->fd = (int32_t)fd;
     q->ud = rt_uop_ud(&o);
     switch (op) {
-    case 0: case 1:
-        q->op = op ? K_UR_WRITE : K_UR_READ;
+    case 0: case 1: case 5:
+        q->op = op == 1 ? K_UR_WRITE : K_UR_READ;
         q->addr = (uint64_t)b;
         q->len = (uint32_t)(n > 0x7ffff000 ? 0x7ffff000 : n);     /* as read(2) caps a call */
         q->off = (uint64_t)off;
@@ -2579,11 +2579,13 @@ int64_t lxllib_file_op(int64_t op, int64_t fd, void* b, int64_t n, int64_t off, 
         q->addr = (uint64_t)n;                                      /* the length; len is the mode */
         break;
     }
-    /* A read while other tasks are runnable goes to the kernel's io-wq workers (IOSQE_ASYNC):
-       issuing it inline costs this thread the block layer's work and the drive's interrupt,
-       about a quarter of its time when it is the bottleneck (design/lexdb.md 9.62). With
-       nothing else to run it is issued inline, which is quicker for the one waiting. */
-    if (op == 0 && rt_rq_head) q->flags |= 16;                       /* IOSQE_ASYNC */
+    /* A read of an O_DIRECT descriptor (op 5, fs.preadDirect) while other tasks are runnable goes
+       to the kernel's io-wq workers (IOSQE_ASYNC): issuing it inline costs this thread the block
+       layer's work and the drive's interrupt, about a quarter of its time when it is the
+       bottleneck (design/lexdb.md 9.62). With nothing else to run it is issued inline, which is
+       quicker for the one waiting. A buffered read (op 0) is always tried inline first: from the
+       page cache it completes there, a copy; a miss goes to io-wq by itself (9.69). */
+    if (op == 5 && rt_rq_head) q->flags |= 16;                       /* IOSQE_ASYNC */
     /* Started now, not at the loop's next look at the ring: with other tasks runnable that may be
        64 task switches away, and lexdb's log writer waits on this (design/lexdb.md 9.60). */
     if (rt_rq_head) rt_ur_submit(0, 0);

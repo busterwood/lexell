@@ -4982,3 +4982,298 @@ aggregate queries' results are the same on both (checksummed).
   times); against its default two workers behind on four (1.2 to 1.9
   times), level on one.
 - **Loads:** PostgreSQL 1.7 times faster.
+
+### 9.68 A read-only replica on the same machine: design, and the page cache
+
+The user asked whether read-only transactions could run beside the SQL
+thread. Lexell has no threads (reference counts are not atomic and the
+allocator is per process), so the step is a second process: one master
+(read-write) and one read-only replica, on the same machine and data
+directory, with clients choosing at connection time (as PostgreSQL's
+`target_session_attrs=read-write` / `read-only`). The user's worry is
+that the page cache would be held twice. This note measures that cost
+and designs around it. Nothing is built yet.
+
+**What the cache costs now** (the 9.67 data: acct and t, 1M rows each;
+a cache of 4 GB, so everything read stays; RSS of the process):
+
+| | RSS |
+|---|---:|
+| started | 3 MB |
+| acct read whole | 62 MB |
+| acct and t read whole | 146 MB |
+| their pages on disk (live; estimated: 2.0M of the 3.0M keys on valid leaf pages, the rest in free pages) | about 62 MB |
+
+Decoded nodes take about 2.4 times their pages: per key, a `str` for
+the key and the value, and the arrays (`nodeCost`: 64 bytes a key plus
+the entries, 9.13). A second process caching the same data would double
+the larger number.
+
+**Misses served by the kernel's page cache.** Variant: the page file
+opened without `O_DIRECT` (log segments unchanged), so a page not in
+lexdb's cache is copied from the kernel's page cache, which every
+process on the machine shares. pgbench point selects on acct, 8 s
+(CPU from `/proc`, every thread of the process):
+
+| page file, lexdb cache | 1 client | 8 clients | RSS |
+|---|---|---|---:|
+| O_DIRECT, 4 GB (now) | 95,600/s, 10.4 us | 173,800/s, 5.7 us | 62 MB |
+| buffered, 4 GB | 95,300/s, 10.5 us | 173,600/s, 5.7 us | 62 MB |
+| buffered, 32 MB | 72,300/s, 13.8 us | 110,000/s, 10.4 us | 26 MB |
+| buffered, 8 MB | 68,500/s, 14.5 us | 99,400/s, 11.7 us | 11 MB |
+| O_DIRECT, 8 MB (from the drive) | 53,500/s, 21.8 us | 97,800/s, 13.2 us | 11 MB |
+
+- Buffered costs nothing when the cache holds everything.
+- With 8 MB nearly every select misses its leaf. A miss from the kernel
+  costs about 4 to 6 us of CPU: the read, CRC, decode and install. The
+  kernel's part (`filemap_read`, the copy) is under 5% of the profile.
+- These reads still went through io_uring's worker threads (the profile
+  shows `io_worker_handle_work`). `IOSQE_ASYNC` is set when other tasks
+  are runnable (9.62), which suits the drive. A page already in the
+  kernel's cache would complete inline without it, so a buffered page
+  file should not force it. Not yet measured.
+
+So the kernel can be the one shared copy, in page form (1x), with a
+small decoded cache in each process in front of it. Today one process
+holds everything decoded (2.4x). One master and one replica with small
+private caches would take less memory than one server does now, at
+about 5 us a miss.
+
+**How the replica gets its state: base and delta.** The page file is
+written only by checkpoints, and a page is never written in place
+(4.1). The log holds rows' after-images (4.6). So the replica:
+
+- **reads the master's pages,** as of a checkpoint (its base: the roots
+  from that checkpoint's meta page). Its cache is keyed by page number
+  and holds only clean pages. A page stays valid across checkpoints
+  until it is freed and reused, so most of the cache survives each one;
+- **keeps the rows changed since its base** in a delta per tree: key to
+  versions, (batch, value or deletion), sorted by key. A read-only
+  transaction is a snapshot at a batch: the newest delta version at or
+  below it, else the base tree. Scans merge the two, as transaction
+  blocks already merge their own writes over a snapshot (`ownRange`);
+- **never writes a page, never checkpoints, and has no dirty nodes.**
+  The delta takes about the log since the last checkpoint (at most
+  `ckptBytes`, 32 MB, plus the map's overhead).
+
+Rejected: replaying into a B+tree of its own, as recovery does. The
+replica could not checkpoint that tree into the master's file, and its
+dirty nodes would grow without end. Adopting the master's checkpoints
+would need the two trees to split identically, which nothing promises.
+Also rejected: a shared buffer pool in shared memory (PostgreSQL's
+shared_buffers). That needs atomics and an allocator in shared memory,
+and Lexell has neither.
+
+**The stream** (a Unix socket in the data directory, master to replica):
+
+- **Frames,** as written to the log, sent after their flush, so the
+  replica only ever sees durable batches. A replica that is behind, or
+  just started, reads the segments on disk with recovery's `readFrame`,
+  then switches to the socket.
+- **Checkpoint n done:** its meta page (roots, the batch it covers B_n),
+  and the pages it frees.
+- **Back from the replica:** the batch it has applied, and the oldest
+  base a live snapshot uses.
+
+**Checkpoints.** A new snapshot uses base n with the delta above B_n.
+One begun earlier keeps base n-1. When none is left on n-1, the replica
+drops the delta at or below B_n, evicts the pages checkpoint n freed,
+and acknowledges. The master reuses those pages, and the log segments
+before B_n, only after the acknowledgement. This is the rule it already
+keeps for its own snapshots (pages free once no live snapshot reads
+them), and LMDB's reader table, across a process boundary. When a
+checkpoint rewrites many leaves, the replica rereads them. If checkpoint
+pages are written through the kernel's cache, those rereads are copies,
+not drive reads. Whether buffered checkpoint writes cost anything has to
+be measured.
+
+**Isolation.** A snapshot on the replica sees a prefix of the master's
+commit order at a batch boundary, the same thing `durableSeq` gives on
+the master (9.16), so read-only transactions there are serializable.
+They can lag: a client that commits on the master and then reads on the
+replica may miss its own commit by one batch on the socket. For clients
+that need it, a session setting could make the replica ask the master
+for its durable batch and wait until it has applied it: one round trip
+on a local socket. A write on the replica fails with SQLSTATE 25006, as
+on a PostgreSQL standby.
+
+**Applying a batch** costs parsing its records and one sorted insert
+per row. That is far below the master's work for the same commit:
+updates cost the master 17.5 us each, mostly SQL.
+
+**Processes.** `task.workers(2, ...)`: worker 0 the master, worker 1 the
+replica, each with its own listener (one replica needs no
+`SO_REUSEPORT`). The supervisor restarts either one:
+
+- **The replica crashes:** the master releases whatever it held for it
+  when the socket closes.
+- **The master crashes:** it recovers on restart. The replica holds only
+  flushed batches, so it reconnects from its applied batch. It keeps
+  serving meanwhile, falling further behind.
+
+**Elsewhere:**
+
+- LMDB: one writer and readers in other processes share a read-only
+  mmap of a copy-on-write B+tree. A reader table pins old pages.
+- SQLite WAL: readers find newer page versions through a shared index
+  over the log (here, the delta).
+- Aurora replicas: they apply the log to the pages they have cached and
+  read the rest from shared storage at the right position.
+- PostgreSQL standbys: they replay pages into their own copy, normally
+  on another machine.
+
+**Next, in order:**
+
+1. A buffered page file without `IOSQE_ASYNC` for its reads, and
+   buffered checkpoint writes: measure a miss and a checkpoint.
+2. The delta and base read path in one process, tested against the
+   store (the same rows at every snapshot).
+3. The stream, the acknowledgements, and the replica process.
+4. Measure: point selects on the replica beside updates on the master,
+   with memory, against one server.
+
+Later, perhaps: search pages in their disk form instead of decoding
+them, so the cache is 1x. The pages would be read into memory lexdb owns,
+not mapped. A read-only mmap of the page file avoids the worst objection
+to mmap in a database (the kernel writing pages back behind the log's
+back: Crotty, Leis and Pavlo, "Are You Sure You Want to Use MMAP in Your
+Database Management System?", CIDR 2022). The others remain:
+- a fault stalls the thread, and here that is every session's;
+- an I/O error arrives as SIGBUS;
+- eviction is the kernel's, with TLB shootdowns.
+
+Reads through the page cache give the same one shared copy without any
+of these.
+
+### 9.69 The page file through the page cache (step 1 of 9.68)
+
+- **`LEXDB_PAGES=buffered`** (`Options.bufferedPages`) opens the page
+  file without `O_DIRECT` (`Fs.openBuffered`; `File.Real` carries the
+  flag). Log segments stay `O_DIRECT`. Pages, CRCs, writes and flushes
+  are unchanged: a checkpoint's pages are written, then `fdatasync`ed,
+  then the meta page. The default stays `direct` until the replica uses
+  this.
+- **Reads tried inline.** The runtime set `IOSQE_ASYNC` on every read
+  issued while other tasks were runnable (9.62), so a page the kernel
+  held was copied by an io-wq worker and woke the loop from there. Now
+  `fs.pread` lets the kernel try inline: from the page cache it is a
+  copy, and a miss goes to io-wq by itself. The new `fs.preadDirect`
+  (op 5) keeps the flag for `O_DIRECT` descriptors, and lexdb uses it
+  for them.
+
+**Point selects on acct** (1M rows; the page file in the kernel's cache;
+CPU per select from `/proc`; 8 s each):
+
+| page file, lexdb cache | 1 client | 8 clients | 32 clients | RSS |
+|---|---|---|---|---:|
+| direct, 4 GB | 96,000/s, 10.4 us | 171,900/s, 5.8 us | 168,900/s, 5.9 us | 62 MB |
+| buffered, 4 GB | 95,900/s, 10.4 us | 172,900/s, 5.8 us | 171,200/s, 5.8 us | 62 MB |
+| buffered, 8 MB, through io-wq (9.68) | 68,500/s, 14.5 us | 99,400/s, 11.7 us | | 11 MB |
+| buffered, 8 MB, inline | 68,200/s, 14.6 us | 100,700/s, 9.9 us | 85,600/s, 11.6 us | 11 MB |
+| direct, 8 MB (the drive) | 53,700/s, 21.8 us | 97,900/s, 13.2 us | 94,000/s, 13.5 us | 11 MB |
+
+Inline saves about 1.8 us of CPU a miss at 8 clients. At 32 clients the
+SQL thread now does the copies itself, and with the drive the reads
+overlap more, so it is behind.
+
+**Where a miss goes** (perf, buffered, 8 MB, 8 clients; inclusive):
+
+| | share |
+|---|---:|
+| `Store.load` | 30% |
+| `Db.install` | 28% |
+| `decodeNode` (`unpack` 8%, itself 7%, slicing 4%) | 19% |
+| eviction | 4% |
+| the kernel's read (`io_read`) | 5% |
+| CRC | 3% |
+
+Decoding is most of a miss: a leaf of acct holds about 200 rows, each
+made into a key slice and a value slice to read one. The same decoded
+form is why the cache takes 2.4 times its pages (9.68).
+
+**Checkpoints:** updates, 32 clients, a checkpoint every 4 MB of log
+(17 in 15 s), two rounds:
+
+| mode | round 1 | round 2 |
+|---|---|---|
+| direct | 19,800/s, 29.9 us | 20,800/s, 29.7 us |
+| buffered | 19,700/s, 30.3 us | 19,200/s, 28.5 us |
+
+The difference is noise.
+
+**Next: decode lazily.** A node read from disk would keep its body and
+an array of entry offsets, not a slice per key and value. A key or
+value would be sliced only when used, and a node is unpacked into
+arrays only when a commit changes it. Search would compare a key
+against the body in place. A slice of a str allocates nothing: it is the
+same buffer with an offset and a reference (`rt_str_sub`, or
+`rt_str_view` without the reference). That would remove most of the decode from a miss and
+bring the cache to near 1x. Both the master and the replica need it.
+The work is confined to lexdb_page and lexdb_store, about 150 uses of
+`keys`, `vals` and `kids`, plus `scanLeaves`' callback, which hands the
+executor whole arrays.
+
+### 9.70 Lazy leaves
+
+A leaf read from disk, or written by a checkpoint, is now *lazy*. It
+keeps its page's entries as one string (`body`) and, per entry, one int
+packing where its key and value are (start and length, 16 bits each:
+`ents`). It makes no slice per key or value. The accessors are `count`,
+`key`, `val`, `lower` and `valView` (a view: nothing counted). A change
+first calls `loosen`, which makes the `keys` and `vals` arrays as before.
+Each checkpoint's `repack` makes the leaf lazy again. Internal nodes
+are unchanged. A lazy leaf costs `160 + entries + 8 a key`, against 64
+bytes a key decoded.
+
+**Scans.** `scanLeaves` hands the executor the leaf, not its arrays.
+`bRunInto` takes each row's view once per run (`valView`, kept in an
+array of views) and reads it once per column. Two things lost on the way:
+- reading the value's lengths from the page for every row and column
+  (aggregates 15 to 50% slower);
+- a value start per row with `if lazy { body } else { ... }`: the native
+  backend made that `str` counted, and so incremented and decremented its
+  count at every byte read (aggregates up to 2 times slower).
+
+`lower` compares the first key before searching, since a scan going on
+into the next leaf always starts there. That shortcut is why scans are
+now faster than before.
+
+**Measured** (the 9.67 data; before: 9.69's build):
+
+| | before | lazy |
+|---|---:|---:|
+| RSS, acct cached | 61 MB | 38 MB |
+| RSS, acct and t cached (about 62 MB of pages) | 145 MB | 96 MB |
+
+| point selects on acct | before | lazy |
+|---|---|---|
+| all cached, 1 / 8 / 32 clients | 94,900 / 169,900 / 168,000 | 96,100 / 172,100 / 170,400 |
+| buffered, 8 MB cache, 1 / 8 / 32 | 67,400 / 98,500 / 86,700 | 76,700 / 117,400 / 105,000 |
+| buffered, 32 MB cache, 1 / 8 / 32 | 71,300 / 106,800 / 101,000 | 96,200 / 169,800 / 168,000 (acct fits) |
+| O_DIRECT, 8 MB, 1 / 8 (same hour, two runs) | 27,100 / 85,700 | 33,000 / 105,600 |
+
+| aggregates, ms, best of 7, two rounds the same within 0.2 | before | lazy |
+|---|---:|---:|
+| `count(*)` on t | 15.0 | 12.6 |
+| 4 aggregates `WHERE n > 10` | 37.5 | 35.5 |
+| `sum(v)`, three conditions | 43.3 | 41.0 |
+| `GROUP BY g` | 48.3 | 45.9 |
+| `GROUP BY n WHERE v % 2 = 0` | 36.1 | 34.1 |
+| `sum(abalance)` on acct | 22.0 | 21.0 |
+
+Updates (32 clients, a checkpoint every 4 MB of log): 20,800 and
+20,400/s before, 20,800 and 19,300/s after, at 29.9 to 30.3 us each.
+
+- **Memory:** the cache is now 1.5 times the pages, not 2.3.
+- **A miss from the page cache** costs about 2.7 us of CPU, not 4.3.
+- **Hits and updates** are unchanged; scans are 5 to 16% faster.
+
+**For the replica (9.68):**
+- a 32 MB private cache now holds all of acct;
+- one master and one replica, each with a small cache over the shared
+  page cache, take less memory than one server did before this note.
+
+**Tests.** `page_codec` checks a decoded leaf is lazy, its `lower` at
+five keys, and `loosen`. `store_ahead` reads its leaves through the node.
+All 62 lexdb tests, the crash test (20 rounds, direct and buffered) and
+the native library tests pass.

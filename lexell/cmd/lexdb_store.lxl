@@ -42,10 +42,11 @@ pub type Options = value record {
     pub segBytes: int       // the size of a log segment
     pub ckptBytes: int      // log bytes after which the checkpointer runs (an eighth when the cache is full)
     pub snapNodes: int      // old node versions kept for snapshots before the oldest is cancelled
+    pub bufferedPages: bool // the page file through the kernel's page cache, not O_DIRECT (9.69)
 }
 
 pub fn defaults(): Options {
-    return Options{cacheBytes: 128 * 1024 * 1024, segBytes: 64 * 1024 * 1024, ckptBytes: 32 * 1024 * 1024, snapNodes: 50000}
+    return Options{cacheBytes: 128 * 1024 * 1024, segBytes: 64 * 1024 * 1024, ckptBytes: 32 * 1024 * 1024, snapNodes: 50000, bufferedPages: false}
 }
 
 type SlotMeta = value record {
@@ -410,7 +411,15 @@ fn (db: mut &Db) markDirty(s: int) {
 }
 
 fn copyNode(n: &lexdb_page.Node): lexdb_page.Node {
-    var c = lexdb_page.Node{leaf: n.leaf, keys: [], vals: [], kids: [], size: n.size, packed: false}
+    var c = lexdb_page.newNode(n.leaf)
+    c.size = n.size
+    if n.lazy {
+        c.lazy = true
+        c.packed = true
+        c.body = n.body
+        for e in n.ents { append(mut &c.ents, e) }
+        return c
+    }
     for k in n.keys { append(mut &c.keys, k) }
     for v in n.vals { append(mut &c.vals, v) }
     for k in n.kids { append(mut &c.kids, k) }
@@ -558,7 +567,7 @@ fn (db: mut &Db) install(r: LoadReq, b: &[]byte): Result[Unit, lexdb_base.DbErr]
 // Loads the page of a slot that is not in memory (parks).
 fn (st: &Store) load(slot: int): Result[Unit, lexdb_base.DbErr] {
     var r = LoadReq{slot: 0, gen: 0, page: -1}
-    var f = lexdb_disk.File.Real(-1)
+    var f = lexdb_disk.File.Real(-1, false)
     st.sh.with(fn(db: mut &Db) {
         r = db.loadReq(slot)
         f = db.data
@@ -620,7 +629,7 @@ fn (db: &Db) runFor(par: int, k: &str, need: int, max: int): []LoadReq {
 fn (st: &Store) loadAhead(need: int, run: &[]LoadReq): Result[Unit, lexdb_base.DbErr] {
     let n = len(run)
     if n <= 1 || run[0].slot != need { return st.load(need) }
-    var f = lexdb_disk.File.Real(-1)
+    var f = lexdb_disk.File.Real(-1, false)
     st.sh.with(fn(db: mut &Db) { f = db.data })
     var bufs: [][]byte = []
     for j in 0..n { append(mut &bufs, array(PAGE, byte(0))) }
@@ -689,8 +698,8 @@ fn (db: mut &Db) descend(tree: int, k: &str): Descent {
         append(mut &d.path, s)
         if db.pool[db.meta[s].frame].leaf { return d }
         let i = childIndex(&db.pool[db.meta[s].frame].keys, k)
-        if i < len(db.pool[db.meta[s].frame].keys) {
-            d.upper = db.pool[db.meta[s].frame].keys[i]
+        if i < db.pool[db.meta[s].frame].count() {
+            d.upper = db.pool[db.meta[s].frame].key(i)
             d.hasUpper = true
         }
         s = db.pool[db.meta[s].frame].kids[i]
@@ -703,7 +712,7 @@ fn (db: mut &Db) descend(tree: int, k: &str): Descent {
 fn nodeSize(n: &lexdb_page.Node): int {
     var size = 0
     if n.leaf {
-        for i in 0..len(n.keys) { size += lexdb_page.leafEntry(&n.keys[i], &n.vals[i]) }
+        for i in 0..n.count() { size += lexdb_page.leafEntry(&n.key(i), &n.val(i)) }
     } else {
         size = 8
         for k in n.keys { size += lexdb_page.kidEntry(&k) }
@@ -719,16 +728,17 @@ fn nodeSize(n: &lexdb_page.Node): int {
 // in the tree the run goes (9.30).
 fn (db: mut &Db) split(s: int, atEnd: bool, at: int): Descent {
     db.willChange(s)
+    db.pool[db.meta[s].frame].loosen()
     let leaf = db.pool[db.meta[s].frame].leaf
     let total = db.pool[db.meta[s].frame].size
-    let n = len(db.pool[db.meta[s].frame].keys)
-    var right = lexdb_page.Node{leaf: leaf, keys: [], vals: [], kids: [], size: 0, packed: false}
+    let n = db.pool[db.meta[s].frame].count()
+    var right = lexdb_page.newNode(leaf)
     var sep = ""
     if leaf {
         var acc = 0
         var m = 0
         while m < n - 1 {
-            let e = lexdb_page.leafEntry(&db.pool[db.meta[s].frame].keys[m], &db.pool[db.meta[s].frame].vals[m])
+            let e = lexdb_page.leafEntry(&db.pool[db.meta[s].frame].key(m), &db.pool[db.meta[s].frame].val(m))
             if m > 0 && acc + e > total / 2 { break }
             acc += e
             m += 1
@@ -759,14 +769,14 @@ fn (db: mut &Db) split(s: int, atEnd: bool, at: int): Descent {
         var acc = 8
         var m = 1
         while m < n - 1 {
-            let e = lexdb_page.kidEntry(&db.pool[db.meta[s].frame].keys[m - 1])
+            let e = lexdb_page.kidEntry(&db.pool[db.meta[s].frame].key(m - 1))
             if acc + e > total / 2 { break }
             acc += e
             m += 1
         }
         if atEnd && n >= 3 { m = n - 2 }        // the left stays full: the last two children go right
         // keys[m] goes up; keys after it and kids after m go right
-        sep = lexdb_base.own(&db.pool[db.meta[s].frame].keys[m])
+        sep = lexdb_base.own(&db.pool[db.meta[s].frame].key(m))
         for i in m + 1..n { append(mut &right.keys, db.pool[db.meta[s].frame].keys[i]) }
         for i in m + 1..n + 1 { append(mut &right.kids, db.pool[db.meta[s].frame].kids[i]) }
         for i in m..n {
@@ -794,7 +804,7 @@ fn (db: mut &Db) fixOverflow(tree: int, path: &[]int, from: int, atEnd: bool, in
         let sp = db.split(s, end, if j == len(path) - 1 { ins } else { -1 })
         let r = sp.path[0]
         if j == 0 {
-            let root = lexdb_page.Node{leaf: false, keys: [sp.upper], vals: [], kids: [s, r], size: 0, packed: false}
+            let root = lexdb_page.Node{leaf: false, keys: [sp.upper], vals: [], kids: [s, r], size: 0, packed: false, lazy: false, body: "", ents: []}
             var rn = root
             rn.size = nodeSize(&rn)
             let ns = db.newNode(rn)
@@ -825,14 +835,15 @@ fn (db: mut &Db) applyPut(tree: int, key: &str, val: &str) {
     for s in d.path { db.markDirty(s) }
     let leaf = d.path[len(d.path) - 1]
     db.willChange(leaf)
-    let i = lowerIndex(&db.pool[db.meta[leaf].frame].keys, key)
+    db.pool[db.meta[leaf].frame].loosen()
+    let i = db.pool[db.meta[leaf].frame].lower(key)
     // A key past every key in the tree (the rightmost leaf, at its end): an
     // ascending load. Its splits leave the left node full, not half (as
     // PostgreSQL's rightmost split and SQLite's quick balance do): a table
     // loaded in key order then takes half the pages.
-    let atEnd = !d.hasUpper && i == len(db.pool[db.meta[leaf].frame].keys)
-    if i < len(db.pool[db.meta[leaf].frame].keys) && db.pool[db.meta[leaf].frame].keys[i] == key {
-        db.pool[db.meta[leaf].frame].size += len(val) - len(db.pool[db.meta[leaf].frame].vals[i])
+    let atEnd = !d.hasUpper && i == db.pool[db.meta[leaf].frame].count()
+    if i < db.pool[db.meta[leaf].frame].count() && db.pool[db.meta[leaf].frame].key(i) == key {
+        db.pool[db.meta[leaf].frame].size += len(val) - len(db.pool[db.meta[leaf].frame].val(i))
         db.pool[db.meta[leaf].frame].vals[i] = val
     } else {
         collections.insert(mut &db.pool[db.meta[leaf].frame].keys, i, key)
@@ -849,11 +860,12 @@ fn (db: mut &Db) applyDel(tree: int, key: &str) {
     let d = db.descend(tree, key)
     if len(d.path) == 0 { return }
     let leaf = d.path[len(d.path) - 1]
-    let i = lowerIndex(&db.pool[db.meta[leaf].frame].keys, key)
-    if i >= len(db.pool[db.meta[leaf].frame].keys) || db.pool[db.meta[leaf].frame].keys[i] != key { return }
+    let i = db.pool[db.meta[leaf].frame].lower(key)
+    if i >= db.pool[db.meta[leaf].frame].count() || db.pool[db.meta[leaf].frame].key(i) != key { return }
     for s in d.path { db.markDirty(s) }
     db.willChange(leaf)
-    db.pool[db.meta[leaf].frame].size -= lexdb_page.leafEntry(&db.pool[db.meta[leaf].frame].keys[i], &db.pool[db.meta[leaf].frame].vals[i])
+    db.pool[db.meta[leaf].frame].loosen()
+    db.pool[db.meta[leaf].frame].size -= lexdb_page.leafEntry(&db.pool[db.meta[leaf].frame].key(i), &db.pool[db.meta[leaf].frame].val(i))
     let k = collections.removeAt(mut &db.pool[db.meta[leaf].frame].keys, i)
     let v = collections.removeAt(mut &db.pool[db.meta[leaf].frame].vals, i)
     db.meta[leaf].version += 1
@@ -867,7 +879,7 @@ fn (db: mut &Db) applyDel(tree: int, key: &str) {
     var j = len(d.path) - 1
     while j > 0 {
         let c = d.path[j]
-        let empty = if db.pool[db.meta[c].frame].leaf { len(db.pool[db.meta[c].frame].keys) == 0 } else { len(db.pool[db.meta[c].frame].kids) == 0 }
+        let empty = if db.pool[db.meta[c].frame].leaf { db.pool[db.meta[c].frame].count() == 0 } else { len(db.pool[db.meta[c].frame].kids) == 0 }
         if !empty { break }
         let p = d.path[j - 1]
         var at = 0
@@ -877,7 +889,7 @@ fn (db: mut &Db) applyDel(tree: int, key: &str) {
         if at == 0 && nk > 1 && !db.edgeLoaded(db.pool[db.meta[p].frame].kids[1], false) { break }
         db.willChange(p)
         let gone = collections.removeAt(mut &db.pool[db.meta[p].frame].kids, at)
-        if len(db.pool[db.meta[p].frame].keys) > 0 {
+        if db.pool[db.meta[p].frame].count() > 0 {
             let ki = if at == 0 { 0 } else { at - 1 }
             let sk = collections.removeAt(mut &db.pool[db.meta[p].frame].keys, ki)
         }
@@ -1071,9 +1083,9 @@ fn (db: mut &Db) leafVal(tree: int, key: &str): Option[str] {
     let d = db.descend(tree, key)
     if len(d.path) == 0 || d.need >= 0 { return None }
     let leaf = d.path[len(d.path) - 1]
-    let i = lowerIndex(&db.pool[db.meta[leaf].frame].keys, key)
-    if i < len(db.pool[db.meta[leaf].frame].keys) && db.pool[db.meta[leaf].frame].keys[i] == key {
-        return Some(db.pool[db.meta[leaf].frame].vals[i])
+    let i = db.pool[db.meta[leaf].frame].lower(key)
+    if i < db.pool[db.meta[leaf].frame].count() && db.pool[db.meta[leaf].frame].key(i) == key {
+        return Some(db.pool[db.meta[leaf].frame].val(i))
     }
     return None
 }
@@ -1107,9 +1119,9 @@ fn (db: mut &Db) dropChunks(tree: int, key: &str) {
         let d = db.descend(ovf, &cursor)
         if len(d.path) == 0 || d.need >= 0 { break }
         let leaf = d.path[len(d.path) - 1]
-        var i = lowerIndex(&db.pool[db.meta[leaf].frame].keys, &cursor)
-        while i < len(db.pool[db.meta[leaf].frame].keys) && db.pool[db.meta[leaf].frame].keys[i] < hi {
-            append(mut &gone, lexdb_base.own(&db.pool[db.meta[leaf].frame].keys[i]))
+        var i = db.pool[db.meta[leaf].frame].lower(&cursor)
+        while i < db.pool[db.meta[leaf].frame].count() && db.pool[db.meta[leaf].frame].key(i) < hi {
+            append(mut &gone, lexdb_base.own(&db.pool[db.meta[leaf].frame].key(i)))
             i += 1
         }
         if !d.hasUpper || d.upper >= hi { break }
@@ -1278,9 +1290,9 @@ fn (st: &Store) getIn(t: mut &Txn, tree: int, key: str, mode: int): Result[Optio
             t.noteRead(tree, key, key + "\x00", db.seq)         // an empty tree too: an insert of key conflicts
             if len(d.path) == 0 { return }
             let leaf = d.path[len(d.path) - 1]
-            let i = lowerIndex(&db.pool[db.meta[leaf].frame].keys, &key)
-            if i < len(db.pool[db.meta[leaf].frame].keys) && db.pool[db.meta[leaf].frame].keys[i] == key {
-                out = Some(db.pool[db.meta[leaf].frame].vals[i])
+            let i = db.pool[db.meta[leaf].frame].lower(&key)
+            if i < db.pool[db.meta[leaf].frame].count() && db.pool[db.meta[leaf].frame].key(i) == key {
+                out = Some(db.pool[db.meta[leaf].frame].val(i))
             }
         })
         if len(bad) > 0 { return Err(bad[0]) }
@@ -1327,8 +1339,8 @@ fn (st: &Store) snapGet(t: mut &Txn, tree: int, key: str, mode: int): Result[Opt
                 return
             }
             let n = db.snapNode(d.leaf, d.ver)
-            let i = lowerIndex(&n.keys, &key)
-            if i < len(n.keys) && n.keys[i] == key { out = Some(n.vals[i]) }
+            let i = n.lower(&key)
+            if i < n.count() && n.key(i) == key { out = Some(n.val(i)) }
         })
         if len(bad) > 0 { return Err(bad[0]) }
         if need >= 0 {
@@ -1426,10 +1438,10 @@ fn (st: &Store) scanIn(t: mut &Txn, tree: int, from: str, to: str, f: &fn(&Entry
                     return
                 }
                 let n = db.snapNode(d.leaf, d.ver)
-                var i = lowerIndex(&n.keys, &cursor)
-                while i < len(n.keys) {
-                    if len(to) > 0 && n.keys[i] >= to { break }
-                    append(mut &chunk, Entry{key: n.keys[i], val: n.vals[i]})
+                var i = n.lower(&cursor)
+                while i < n.count() {
+                    if len(to) > 0 && n.key(i) >= to { break }
+                    append(mut &chunk, Entry{key: n.key(i), val: n.val(i)})
                     i += 1
                 }
                 upper = d.fence
@@ -1444,11 +1456,11 @@ fn (st: &Store) scanIn(t: mut &Txn, tree: int, from: str, to: str, f: &fn(&Entry
             }
             if len(d.path) == 0 { return }
             let leaf = d.path[len(d.path) - 1]
-            var i = lowerIndex(&db.pool[db.meta[leaf].frame].keys, &cursor)
-            while i < len(db.pool[db.meta[leaf].frame].keys) {
-                let k = db.pool[db.meta[leaf].frame].keys[i]
+            var i = db.pool[db.meta[leaf].frame].lower(&cursor)
+            while i < db.pool[db.meta[leaf].frame].count() {
+                let k = db.pool[db.meta[leaf].frame].key(i)
                 if len(to) > 0 && k >= to { break }
-                append(mut &chunk, Entry{key: k, val: db.pool[db.meta[leaf].frame].vals[i]})
+                append(mut &chunk, Entry{key: k, val: db.pool[db.meta[leaf].frame].val(i)})
                 i += 1
             }
             upper = d.upper
@@ -1502,14 +1514,14 @@ fn (st: &Store) scanIn(t: mut &Txn, tree: int, from: str, to: str, f: &fn(&Entry
 }
 
 // The entries of tree with keys in [from, to) (to "": to the end), read in
-// place: f gets each leaf's arrays and the range [i, j) of them in the
+// place: f gets each leaf and the range [i, j) of its entries in the
 // range, inside the store's lock, in key order, while it gives true. f
 // must not use the store; a value stored apart (marked) is given as
 // stored. Ok(false): nothing done, the transaction having its own writes
 // in the range (scan merges them). Each leaf's whole range is noted as
 // read, even when f stops in it (a wider read is safe).
 pub fn (st: &Store) scanLeaves(t: mut &Txn, tree: int, from: str, to: str,
-                               f: &fn(&[]str, &[]str, int, int): bool): Result[bool, lexdb_base.DbErr] {
+                               f: &fn(&lexdb_page.Node, int, int): bool): Result[bool, lexdb_base.DbErr] {
     if len(t.ownRange(tree, &from, &to)) > 0 { return Ok(false) }
     let root = if t.snap >= 0 && !t.live { match t.snapTrees.get(&tree) { Some(r) { r } None { -1 } } } else { -1 }
     var cursor = from
@@ -1551,10 +1563,10 @@ pub fn (st: &Store) scanLeaves(t: mut &Txn, tree: int, from: str, to: str,
                     return
                 }
                 let n = db.snapNode(d.leaf, d.ver)
-                let i = lowerIndex(&n.keys, &cursor)
-                var j = len(n.keys)
-                if len(to) > 0 { j = lowerIndex(&n.keys, &to) }
-                if j > i { go = f(&n.keys, &n.vals, i, j) }
+                let i = n.lower(&cursor)
+                var j = n.count()
+                if len(to) > 0 { j = n.lower(&to) }
+                if j > i { go = f(n, i, j) }
                 upper = d.fence
                 hasUpper = d.hasFence
                 return
@@ -1571,10 +1583,10 @@ pub fn (st: &Store) scanLeaves(t: mut &Txn, tree: int, from: str, to: str,
             }
             let leaf = d.path[len(d.path) - 1]
             let n = &db.pool[db.meta[leaf].frame]
-            let i = lowerIndex(&n.keys, &cursor)
-            var j = len(n.keys)
-            if len(to) > 0 { j = lowerIndex(&n.keys, &to) }
-            if j > i { go = f(&n.keys, &n.vals, i, j) }
+            let i = n.lower(&cursor)
+            var j = n.count()
+            if len(to) > 0 { j = n.lower(&to) }
+            if j > i { go = f(n, i, j) }
             upper = d.upper
             hasUpper = d.hasUpper
         })
@@ -1611,9 +1623,9 @@ fn (db: mut &Db) descendBack(tree: int, k: &str): Descent {
         db.meta[s].ref = true
         append(mut &d.path, s)
         if db.pool[db.meta[s].frame].leaf { return d }
-        let j = if len(k) == 0 { len(db.pool[db.meta[s].frame].keys) } else { lowerIndex(&db.pool[db.meta[s].frame].keys, k) }
+        let j = if len(k) == 0 { db.pool[db.meta[s].frame].count() } else { db.pool[db.meta[s].frame].lower(k) }
         if j > 0 {
-            d.upper = db.pool[db.meta[s].frame].keys[j - 1]       // here: the lower fence
+            d.upper = db.pool[db.meta[s].frame].key(j - 1)       // here: the lower fence
             d.hasUpper = true
         }
         s = db.pool[db.meta[s].frame].kids[j]
@@ -1669,11 +1681,11 @@ fn (st: &Store) scanBackIn(t: mut &Txn, tree: int, from: str, to: str, f: &fn(&E
                     return
                 }
                 let n = db.snapNode(d.leaf, d.ver)
-                var i = if len(cursor) == 0 { len(n.keys) } else { lowerIndex(&n.keys, &cursor) }
+                var i = if len(cursor) == 0 { n.count() } else { n.lower(&cursor) }
                 while i > 0 {
                     i -= 1
-                    if n.keys[i] < from { break }
-                    append(mut &chunk, Entry{key: n.keys[i], val: n.vals[i]})
+                    if n.key(i) < from { break }
+                    append(mut &chunk, Entry{key: n.key(i), val: n.val(i)})
                 }
                 lower = d.fence
                 hasLower = d.hasFence
@@ -1686,12 +1698,12 @@ fn (st: &Store) scanBackIn(t: mut &Txn, tree: int, from: str, to: str, f: &fn(&E
             }
             if len(d.path) == 0 { return }
             let leaf = d.path[len(d.path) - 1]
-            var i = if len(cursor) == 0 { len(db.pool[db.meta[leaf].frame].keys) } else { lowerIndex(&db.pool[db.meta[leaf].frame].keys, &cursor) }
+            var i = if len(cursor) == 0 { db.pool[db.meta[leaf].frame].count() } else { db.pool[db.meta[leaf].frame].lower(&cursor) }
             while i > 0 {
                 i -= 1
-                let k = db.pool[db.meta[leaf].frame].keys[i]
+                let k = db.pool[db.meta[leaf].frame].key(i)
                 if k < from { break }
-                append(mut &chunk, Entry{key: k, val: db.pool[db.meta[leaf].frame].vals[i]})
+                append(mut &chunk, Entry{key: k, val: db.pool[db.meta[leaf].frame].val(i)})
             }
             lower = d.upper
             hasLower = d.hasUpper
@@ -2035,9 +2047,9 @@ fn (db: mut &Db) snapDescend(root: int, q: int, cursor: &str, back: bool): SnapL
             return r
         }
         if back {
-            let j = if len(cursor) == 0 { len(n.keys) } else { lowerIndex(&n.keys, cursor) }
+            let j = if len(cursor) == 0 { n.count() } else { n.lower(cursor) }
             if j > 0 {
-                r.fence = n.keys[j - 1]
+                r.fence = n.key(j - 1)
                 r.hasFence = true
             }
             r.par = s
@@ -2046,8 +2058,8 @@ fn (db: mut &Db) snapDescend(root: int, q: int, cursor: &str, back: bool): SnapL
             s = n.kids[j]
         } else {
             let i = childIndex(&n.keys, cursor)
-            if i < len(n.keys) {
-                r.fence = n.keys[i]
+            if i < n.count() {
+                r.fence = n.key(i)
                 r.hasFence = true
             }
             r.par = s
@@ -2117,7 +2129,7 @@ pub fn writer(st: Store): int {
         segOff = db.segOff
         segBytes = db.opts.segBytes
     })
-    var segF = lexdb_disk.File.Real(-1)
+    var segF = lexdb_disk.File.Real(-1, false)
     match st.openSeg(segNo, segBytes) {
         Ok(f) { segF = f }
         Err(e) {
@@ -2386,7 +2398,7 @@ fn (db: mut &Db) encodeSlot(s: int, n: int, out: mut &[]PageOut): int {
     db.meta[s].dirty = false
     db.meta[s].disk = p
     db.meta[s].ckpt = n
-    append(mut &out, PageOut{no: p, leaf: db.pool[db.meta[s].frame].leaf, n: len(db.pool[db.meta[s].frame].keys), body: body, raw: []})
+    append(mut &out, PageOut{no: p, leaf: db.pool[db.meta[s].frame].leaf, n: db.pool[db.meta[s].frame].count(), body: body, raw: []})
     return p
 }
 
@@ -2412,7 +2424,7 @@ pub fn (st: &Store) checkpointAll(): Result[Unit, lexdb_base.DbErr] {
 pub fn (st: &Store) checkpoint(): Result[Unit, lexdb_base.DbErr] {
     var out: []PageOut = []
     var metaPage: []byte = []
-    var f = lexdb_disk.File.Real(-1)
+    var f = lexdb_disk.File.Real(-1, false)
     var busy = false
     var bad: []lexdb_base.DbErr = []
     var target = 0
@@ -2694,7 +2706,7 @@ fn newDb(fs: lexdb_disk.Fs, data: lexdb_disk.File, opts: Options, m: &lexdb_page
 // Opens the store in fs (creating it when it is new) and recovers: the last
 // checkpoint, then the log after it.
 pub fn open(fs: lexdb_disk.Fs, opts: Options): Result[Store, lexdb_base.DbErr] {
-    let data = try fs.open(DATA, true)
+    let data = try if opts.bufferedPages { fs.openBuffered(DATA, true) } else { fs.open(DATA, true) }
     let size = try data.size()
     var best: Option[lexdb_page.Meta] = None
     if size >= 2 * PAGE {

@@ -22,6 +22,7 @@ import "time"
 import "task"
 import "os"
 import "./lexdb_base"
+import "./lexdb_page"
 import "./lexdb_store"
 import "./lexdb_sql"
 
@@ -10642,18 +10643,22 @@ fn bRowInto(s: &str, r: int, b: mut &Batch, bp: &BPlan, t: &Table): Result[int, 
 // place (9.53). The number of rows decoded: 0 when vs[from] is not in the
 // fixed layout (bRowInto reads it), -1 a value of a kind its column's
 // batch does not hold (as bRowInto's 1).
-fn bRunInto(vs: &[]str, from: int, to: int, b: mut &Batch, bp: &BPlan, t: &Table): Result[int, DbErr] {
-    let s0 = &vs[from]
+fn bRunInto(leaf: &lexdb_page.Node, from: int, to: int, b: mut &Batch, bp: &BPlan, t: &Table): Result[int, DbErr] {
+    let s0 = leaf.valView(from)
     if len(s0) < 3 || s0[0] != FIXED { return Ok(0) }
     let id = try layOf(s0, &t.lays)
     let lay = &t.lays[id]
     let id0 = s0[1]
     let id1 = s0[2]
     let v0 = lay.v0
+    // each row's bytes, found once (a lazy leaf's are in its page's body:
+    // lexdb_page.valView) and read below once per column
+    var rows: []&str = [s0]
     var end = from + 1
     while end < to {
-        let s = &vs[end]
+        let s = leaf.valView(end)
         if len(s) < v0 || s[0] != FIXED || s[1] != id0 || s[2] != id1 { break }
+        append(mut &rows, s)
         end += 1
     }
     let n = end - from
@@ -10678,7 +10683,7 @@ fn bRunInto(vs: &[]str, from: int, to: int, b: mut &Batch, bp: &BPlan, t: &Table
         if k == BK_INT && pk == PK_INT4 {
             var col = replace(mut &b.cols[c], bvec(0))
             for q in 0..n {
-                let s = &vs[from + q]
+                let s = rows[q]
                 if (int(s[at]) >> bit) & 1 == 1 {
                     col.nul[r0 + q] = true
                 } else {
@@ -10690,7 +10695,7 @@ fn bRunInto(vs: &[]str, from: int, to: int, b: mut &Batch, bp: &BPlan, t: &Table
         } else if k == BK_INT && pk == PK_INT {
             var col = replace(mut &b.cols[c], bvec(0))
             for q in 0..n {
-                let s = &vs[from + q]
+                let s = rows[q]
                 if (int(s[at]) >> bit) & 1 == 1 {
                     col.nul[r0 + q] = true
                 } else {
@@ -10702,7 +10707,7 @@ fn bRunInto(vs: &[]str, from: int, to: int, b: mut &Batch, bp: &BPlan, t: &Table
         } else if k == BK_INT && pk == PK_INT2 {
             var col = replace(mut &b.cols[c], bvec(0))
             for q in 0..n {
-                let s = &vs[from + q]
+                let s = rows[q]
                 if (int(s[at]) >> bit) & 1 == 1 {
                     col.nul[r0 + q] = true
                 } else {
@@ -10714,13 +10719,13 @@ fn bRunInto(vs: &[]str, from: int, to: int, b: mut &Batch, bp: &BPlan, t: &Table
         } else if k == BK_BOOL && pk == PK_BOOL {
             var col = replace(mut &b.cols[c], bvec(0))
             for q in 0..n {
-                let s = &vs[from + q]
+                let s = rows[q]
                 if (int(s[at]) >> bit) & 1 == 1 { col.nul[r0 + q] = true } else { col.v[r0 + q] = if s[o] == 1 { 1 } else { 0 } }
             }
             b.cols[c] = col
         } else if k == BK_VAL {
             for q in 0..n {
-                let s = &vs[from + q]
+                let s = rows[q]
                 if (int(s[at]) >> bit) & 1 == 1 { b.cols[c].nul[r0 + q] = true } else { b.vals[c][r0 + q] = try fixedVal(s, pl, pk, lay) }
             }
         } else {
@@ -10774,16 +10779,16 @@ fn fillBatch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, sc: &
         var stop = 0                // 1 the batch is full, 2 a value stored apart
         var bail = false
         var bad: []DbErr = []
-        let inPlace = try st.scanLeaves(txn, t.tree, from, sc.hi, fn(ks: &[]str, vs: &[]str, i: int, j: int): bool {
+        let inPlace = try st.scanLeaves(txn, t.tree, from, sc.hi, fn(leaf: &lexdb_page.Node, i: int, j: int): bool {
             var k = i
             while k < j {
                 if b.n == BROWS {
                     stop = 1
-                    stopKey = ks[k]
+                    stopKey = leaf.key(k)
                     return false
                 }
                 // a run of rows in one fixed layout: a column at a time
-                match bRunInto(vs, k, min(j, k + BROWS - b.n), mut &b, bp, t) {
+                match bRunInto(leaf, k, min(j, k + BROWS - b.n), mut &b, bp, t) {
                     Ok(got) {
                         if got < 0 {
                             bail = true
@@ -10800,7 +10805,7 @@ fn fillBatch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, sc: &
                         return false
                     }
                 }
-                match bRowInto(&vs[k], b.n, mut &b, bp, t) {
+                match bRowInto(leaf.valView(k), b.n, mut &b, bp, t) {
                     Ok(code) {
                         if code == 1 {
                             bail = true
@@ -10808,7 +10813,7 @@ fn fillBatch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, sc: &
                         }
                         if code == 2 {
                             stop = 2
-                            stopKey = ks[k]
+                            stopKey = leaf.key(k)
                             return false
                         }
                     }

@@ -34,6 +34,16 @@ const LIST_ROOM = (PAGE - 28) / 8
 
 // A B+tree node as the store holds it in memory. kids are slot numbers of
 // the store's node table (page numbers between decode and install).
+//
+// A leaf read from disk, or written by a checkpoint, is lazy: it keeps its
+// page's entries as one string (body) and where each entry's key and value
+// are (ents),
+// and a key or value is sliced from body only when asked for (key, val).
+// Nothing else is made per entry, so a miss costs a scan of the entry
+// lengths, and the node about its page's bytes (design/lexdb.md 9.70).
+// Before a change, loosen makes keys and vals arrays (slices of body). Read
+// a leaf with count, key, val and lower; keys and vals are empty while it
+// is lazy. Internal nodes are never lazy.
 pub type Node = record {
     pub leaf: bool
     pub keys: []str
@@ -41,9 +51,109 @@ pub type Node = record {
     pub kids: []int
     pub size: int        // the bytes its entries take on a page
     pub packed: bool     // its keys and values are slices of one string (read or written as a page since it changed)
+    pub lazy: bool       // a leaf whose entries are body's, at ents (keys and vals empty)
+    pub body: str
+    pub ents: []int      // a lazy leaf: where entry i's key and value are in body (kStart and the others)
 }
 
-pub fn newLeaf(): Node { return Node{leaf: true, keys: [], vals: [], kids: [], size: 0, packed: false} }
+pub fn newNode(leaf: bool): Node { return Node{leaf: leaf, keys: [], vals: [], kids: [], size: 0, packed: false, lazy: false, body: "", ents: []} }
+
+pub fn newLeaf(): Node { return newNode(true) }
+
+// Its entries (a leaf's) or keys (an internal node's).
+pub fn (n: &Node) count(): int { return if n.lazy { len(n.ents) } else { len(n.keys) } }
+
+// A lazy leaf's entry i: where its key and value are in body, 16 bits each
+// (a page is 4 KiB): key start, key length, value start, value length.
+fn kStart(e: int): int { return e & 0xffff }
+fn kEnd(e: int): int { return (e & 0xffff) + ((e >> 16) & 0xffff) }
+fn vStart(e: int): int { return (e >> 32) & 0xffff }
+fn vEnd(e: int): int { return ((e >> 32) & 0xffff) + ((e >> 48) & 0xffff) }
+
+// Key i.
+pub fn (n: &Node) key(i: int): str {
+    if !n.lazy { return n.keys[i] }
+    let e = n.ents[i]
+    return n.body[kStart(e)..kEnd(e)]
+}
+
+// Value i (a leaf's).
+pub fn (n: &Node) val(i: int): str {
+    if !n.lazy { return n.vals[i] }
+    let e = n.ents[i]
+    return n.body[vStart(e)..vEnd(e)]
+}
+
+// Value i as a view of the node's bytes: nothing made or counted (a scan's
+// rows are read through it).
+pub fn (n: &Node) valView(i: int): &str {
+    if !n.lazy { return &n.vals[i] }
+    let e = n.ents[i]
+    return &n.body[vStart(e)..vEnd(e)]
+}
+
+// Where a lazy leaf's value i starts in its body.
+pub fn valStart(n: &Node, i: int): int { return vStart(n.ents[i]) }
+
+// The first i whose key is >= k (count() when none).
+pub fn (n: &Node) lower(k: &str): int {
+    var lo = 0
+    if !n.lazy {
+        var hi = len(n.keys)
+        while lo < hi {
+            let m = (lo + hi) / 2
+            if n.keys[m] < k { lo = m + 1 } else { hi = m }
+        }
+        return lo
+    }
+    var hi = len(n.ents)
+    if hi > 0 {
+        // a scan going on into the next leaf asks for its first key
+        let e0 = n.ents[0]
+        let k0 = &n.body[kStart(e0)..kEnd(e0)]
+        if k0 >= k { return 0 }
+    }
+    while lo < hi {
+        let m = (lo + hi) / 2
+        let e = n.ents[m]
+        let km = &n.body[kStart(e)..kEnd(e)]
+        if km < k { lo = m + 1 } else { hi = m }
+    }
+    return lo
+}
+
+// Makes a lazy leaf's keys and vals arrays, slices of its body, so that it
+// can be changed.
+pub fn (n: mut &Node) loosen() {
+    if !n.lazy { return }
+    let cnt = len(n.ents)
+    var keys: []str = array(cnt, "")
+    var vals: []str = array(cnt, "")
+    for i in 0..cnt {
+        let e = n.ents[i]
+        keys[i] = n.body[kStart(e)..kEnd(e)]
+        vals[i] = n.body[vStart(e)..vEnd(e)]
+    }
+    n.keys = keys
+    n.vals = vals
+    n.lazy = false
+    n.packed = true
+    n.body = ""
+    n.ents = []
+}
+
+// A lazy leaf over body, a leaf page's entries from byte 18 (cnt of them).
+fn lazyLeaf(body: str, cnt: int): Node {
+    var ents: []int = array(cnt, 0)
+    var at = 0
+    for i in 0..cnt {
+        let kl = binary.readU16LEStr(&body, at)
+        let vl = binary.readU16LEStr(&body, at + 2)
+        ents[i] = (at + 4) | (kl << 16) | ((at + 4 + kl) << 32) | (vl << 48)
+        at += 4 + kl + vl
+    }
+    return Node{leaf: true, keys: [], vals: [], kids: [], size: at, packed: true, lazy: true, body: body, ents: ents}
+}
 
 pub fn leafEntry(k: &str, v: &str): int { return 4 + len(k) + len(v) }
 pub fn kidEntry(k: &str): int { return 2 + len(k) + 8 }
@@ -121,8 +231,8 @@ pub fn decodeNode(b: &[]byte): Node {
     for i in 0..n {
         end += if leaf { 4 + binary.readU16LE(b, end) + binary.readU16LE(b, end + 2) } else { 2 + binary.readU16LE(b, end) + 8 }
     }
-    var node = Node{leaf: leaf, keys: array(n, ""), vals: [], kids: [], size: end - 18, packed: true}
-    if leaf { node.vals = array(n, "") } else { node.kids = array(n + 1, 0) }
+    if leaf { return lazyLeaf(getStr(b, 18, end - 18), n) }
+    var node = Node{leaf: false, keys: array(n, ""), vals: [], kids: array(n + 1, 0), size: end - 18, packed: true, lazy: false, body: "", ents: []}
     unpack(mut &node, &getStr(b, 18, end - 18), true)
     return node
 }
@@ -130,6 +240,7 @@ pub fn decodeNode(b: &[]byte): Node {
 // The bytes of n's page after its header and count: its entries (with an
 // internal node's kids' pages, pages[i] for kid i).
 pub fn nodeBody(n: &Node, pages: &[]int): str {
+    if n.lazy { return n.body }
     let b = encodeNode(n, pages, 0)
     return getStr(&b, 18, n.size)
 }
@@ -148,6 +259,18 @@ pub fn bodyPage(leaf: bool, n: int, body: &str, pageNo: int): []byte {
 // its own allocation in arrays with room to spare, takes less memory
 // after this.
 pub fn repack(n: mut &Node, body: &str) {
+    if n.leaf {
+        let cnt = n.count()
+        n.keys = []
+        n.vals = []
+        var l = lazyLeaf(body, cnt)
+        n.ents = replace(mut &l.ents, [])
+        n.body = l.body
+        n.size = l.size
+        n.lazy = true
+        n.packed = true
+        return
+    }
     var keys: []str = array(len(n.keys), "")
     n.keys = keys
     if n.leaf {
@@ -197,6 +320,7 @@ fn unpack(n: mut &Node, body: &str, kids: bool) {
 // keeps for it, loaded or not: its SlotMeta and history list, about 120
 // bytes (measured, 9.17; a slot not in memory holds no node).
 pub fn nodeCost(n: &Node): int {
+    if n.lazy { return 160 + n.size + 8 * len(n.ents) }
     let keys = n.size + (if n.packed { 64 } else { 144 }) * len(n.keys)
     return 160 + keys + 120 * len(n.kids)
 }

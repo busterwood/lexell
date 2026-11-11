@@ -467,7 +467,9 @@ chunk).
   returns an `io.Writer` with mode 0600; `writeAtomic(path, data)` writes a
   temp in the same directory and renames it over `path`; `realpath(path)`
   resolves links with the 40-link `ELOOP` limit. Positioned I/O on a
-  descriptor: `pread`/`pwrite(fd, buf: ptr, n, off)`, `fdatasync(fd)`,
+  descriptor: `pread`/`pwrite(fd, buf: ptr, n, off)` (`preadDirect` for an
+  `O_DIRECT` descriptor: through the ring it goes to the kernel's workers at once,
+  where `pread` tries inline first, for the page cache), `fdatasync(fd)`,
   `fsync(fd)`, `fallocate(fd, off, n)` return a count or 0, or -errno, and
   park the task until done: through io_uring with the native backend
   (unless `LXL_URING=0`), else as blocking calls on the helper pool. `Stat` keeps its existing

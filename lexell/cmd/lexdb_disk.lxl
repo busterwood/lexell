@@ -1,7 +1,8 @@
 // lexdb: files, real and simulated (design/lexdb.md 4.1 and stage D0).
 //
-// A Fs is a directory of files. The real one opens files with O_DIRECT and
-// does its reads, writes and flushes with fs.pread, pwrite and fdatasync,
+// A Fs is a directory of files. The real one opens files with O_DIRECT
+// (or through the page cache: openBuffered) and
+// does its reads, writes and flushes with fs.preadDirect (fs.pread), pwrite and fdatasync,
 // which park the task: through io_uring when the runtime has a ring
 // (the native backend unless LXL_URING=0), else on the helper pool. Offsets and lengths are multiples of 4 KiB, and
 // the bytes go through a 4 KiB-aligned C buffer, as O_DIRECT requires.
@@ -45,7 +46,8 @@ pub type Fs = value closed {
 }
 
 pub type File = value closed {
-    Real(i32)                       // the descriptor
+    Real(i32, bool)                 // the descriptor; opened without O_DIRECT (openBuffered): its reads,
+                                    // which the page cache may serve, are tried inline (fs.pread, not preadDirect: 9.69)
     Sim(task.Shared[SimFs], int)    // the file's index in the SimFs
 }
 
@@ -93,17 +95,25 @@ fn simFind(st: &SimFs, name: &str): int {
 }
 
 // Opens a file, creating it (empty) when create is true and it does not exist.
-pub fn (f: &Fs) open(name: str, create: bool): Result[File, lexdb_base.DbErr] {
+pub fn (f: &Fs) open(name: str, create: bool): Result[File, lexdb_base.DbErr] { return f.openWith(name, create, true) }
+
+// open, through the kernel's page cache: reads of pages it holds are copies
+// from memory every process shares, and writes stay there too until
+// evicted. Offsets and lengths are still whole pages. A simulated file is
+// the same either way.
+pub fn (f: &Fs) openBuffered(name: str, create: bool): Result[File, lexdb_base.DbErr] { return f.openWith(name, create, false) }
+
+fn (f: &Fs) openWith(name: str, create: bool, direct: bool): Result[File, lexdb_base.DbErr] {
     match f {
         Fs.Real(dir) {
             let path = fs.join(dir, name)
-            var flags = O_RDWR | O_DIRECT | O_CLOEXEC
+            var flags = if direct { O_RDWR | O_DIRECT | O_CLOEXEC } else { O_RDWR | O_CLOEXEC }
             let isNew = create && !fs.exists(path)
             if create { flags = flags | O_CREAT }
             let fd = openFile(path, flags, 420)
             if fd < 0 { return Err(lexdb_base.ioErr("open " + path, errno())) }
             if isNew { try f.syncDir() }
-            return Ok(File.Real(fd))
+            return Ok(File.Real(fd, !direct))
         }
         Fs.Sim(sh) {
             var idx = -1
@@ -271,7 +281,7 @@ fn simIo(st: mut &SimFs): bool {
 
 pub fn (f: &File) size(): Result[int, lexdb_base.DbErr] {
     match f {
-        File.Real(fd) {
+        File.Real(fd, _) {
             let n = lseek(fd, 0, 2)
             if n < 0 { return Err(lexdb_base.ioErr("lseek", errno())) }
             return Ok(n)
@@ -287,7 +297,7 @@ pub fn (f: &File) size(): Result[int, lexdb_base.DbErr] {
 // Makes the file at least n bytes long (zeros), with the space allocated.
 pub fn (f: &File) grow(n: int): Result[Unit, lexdb_base.DbErr] {
     match f {
-        File.Real(fd) {
+        File.Real(fd, _) {
             let r = fs.fallocate(int(fd), 0, n)
             if r != 0 { return Err(lexdb_base.ioErr("fallocate", -r)) }
             return Ok(Unit{})
@@ -310,10 +320,10 @@ pub fn (f: &File) readPages(off: int, dst: mut &[][]byte): Result[Unit, lexdb_ba
     let n = np * PAGE
     try alignedCheck(off, n, "read")
     match f {
-        File.Real(fd) {
+        File.Real(fd, buffered) {
             var buf = nullPtr()
             if posix_memalign(mut &buf, PAGE, n) != 0 { panic("lexdb: out of memory (an I/O buffer)") }
-            let got = fs.pread(int(fd), buf, n, off)
+            let got = if buffered { fs.pread(int(fd), buf, n, off) } else { fs.preadDirect(int(fd), buf, n, off) }
             if got < 0 {
                 freeMem(buf)
                 return Err(lexdb_base.ioErr("pread", -got))
@@ -338,10 +348,10 @@ pub fn (f: &File) readPages(off: int, dst: mut &[][]byte): Result[Unit, lexdb_ba
 pub fn (f: &File) read(off: int, dst: mut &[byte], n: int): Result[Unit, lexdb_base.DbErr] {
     try alignedCheck(off, n, "read")
     match f {
-        File.Real(fd) {
+        File.Real(fd, buffered) {
             var buf = nullPtr()
             if posix_memalign(mut &buf, PAGE, n) != 0 { panic("lexdb: out of memory (an I/O buffer)") }
-            let got = fs.pread(int(fd), buf, n, off)
+            let got = if buffered { fs.pread(int(fd), buf, n, off) } else { fs.preadDirect(int(fd), buf, n, off) }
             if got < 0 {
                 freeMem(buf)
                 return Err(lexdb_base.ioErr("pread", -got))
@@ -372,7 +382,7 @@ pub fn (f: &File) write(off: int, src: &[byte]): Result[Unit, lexdb_base.DbErr] 
     let n = len(src)
     try alignedCheck(off, n, "write")
     match f {
-        File.Real(fd) {
+        File.Real(fd, _) {
             var buf = nullPtr()
             if posix_memalign(mut &buf, PAGE, n) != 0 { panic("lexdb: out of memory (an I/O buffer)") }
             copyIn(buf, 0, src, n)
@@ -410,7 +420,7 @@ pub fn (f: &File) writePages(off: int, pages: &[][]byte): Result[Unit, lexdb_bas
     let n = len(pages) * PAGE
     try alignedCheck(off, n, "write")
     match f {
-        File.Real(fd) {
+        File.Real(fd, _) {
             var buf = nullPtr()
             if posix_memalign(mut &buf, PAGE, n) != 0 { panic("lexdb: out of memory (an I/O buffer)") }
             for j in 0..len(pages) { copyIn(buf, j * PAGE, &pages[j], PAGE) }
@@ -430,7 +440,7 @@ pub fn (f: &File) writePages(off: int, pages: &[][]byte): Result[Unit, lexdb_bas
 // Makes every write before it durable (fdatasync).
 pub fn (f: &File) flush(): Result[Unit, lexdb_base.DbErr] {
     match f {
-        File.Real(fd) {
+        File.Real(fd, _) {
             let r = fs.fdatasync(int(fd))
             if r != 0 { return Err(lexdb_base.ioErr("fdatasync", -r)) }
             return Ok(Unit{})
@@ -465,7 +475,7 @@ pub fn (f: &File) flush(): Result[Unit, lexdb_base.DbErr] {
 
 pub fn (f: &File) close() {
     match f {
-        File.Real(fd) { closeFd(fd) }
+        File.Real(fd, _) { closeFd(fd) }
         File.Sim(_, _) {}
     }
 }
