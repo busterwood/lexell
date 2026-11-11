@@ -555,7 +555,8 @@ it. The design and its state are in
 
 | File | Contents |
 |---|---|
-| `lexdb.lxl` | the server: `lexdb DATADIR [ADDR ...]`; an ADDR is HOST:PORT (default 127.0.0.1:5433), a directory for a Unix socket `.s.PGSQL.PORT`, or a socket path |
+| `lexdb.lxl` | the server: `lexdb DATADIR [ADDR ...] [--replicas N [--replica-addr ADDR ...]]`; an ADDR is HOST:PORT (default 127.0.0.1:5433), a directory for a Unix socket `.s.PGSQL.PORT`, or a socket path |
+| `lexdb_repl.lxl` | the link between the master and its read-only replicas |
 | `lexdb_wire.lxl` | protocol 3.0: startup, simple and extended queries |
 | `lexdb_sql.lxl` | the SQL lexer and parser |
 | `lexdb_exec.lxl` | the catalog, rows, keys, indexes, the planner's rules, joins, EXPLAIN, statements, sessions |
@@ -570,4 +571,20 @@ it. The design and its state are in
 
 There is no authentication yet: keep it on loopback. SIGTERM or SIGINT stops
 it after a checkpoint. `python3 lexell/tests/lexdb.py` runs its tests.
+
+**Read-only replicas** (design/lexdb.md 9.72, 9.73): `--replicas N` runs
+the master and N replicas, each a process of its own, under one
+supervisor, which restarts any that crash. The replicas serve read-only
+sessions (writes fail with 25006) on `--replica-addr`, by default each
+ADDR with the port one higher:
+
+    ./lexdb /tmp/lexdb-data 127.0.0.1:5433 /tmp --replicas 4
+    psql "host=127.0.0.1 port=5433 ..."     # read-write: the master
+    psql "host=127.0.0.1 port=5434 ..."     # read-only: one of the replicas
+    psql "host=/tmp port=5434 ..."          # the replicas' Unix socket
+
+The replicas share the TCP port (SO_REUSEPORT) and the Unix socket. A
+replica sees a commit once the master's log holds it, a few microseconds
+later. `lexdb --replica DATADIR ADDR...` runs one replica by hand beside a
+running master. `python3 lexell/tests/lexdb/replica.py` tests both forms.
 

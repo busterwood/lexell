@@ -15,11 +15,16 @@
 // read its state then, exactly. Twice: a follower cache of 48 KB (pages
 // come and go) and of 16 MB (every page stays, so a page the master frees
 // and reuses must leave it). With the follower closed and the store too,
-// the page file's accounting holds (the pages held for it were freed).
+// the page file's accounting holds (the pages held for it were freed). A
+// second follower with a hold of its own stops at round 10 for 50 rounds,
+// a snapshot open, while the first goes on: the master keeps what the
+// older hold needs (9.73), so the snapshot still reads its state.
+// expect: cache 48 KB: a second follower: at round 10 true, its snapshot 50 rounds later true, caught up true
 // expect: cache 48 KB: rounds 79, same 79, point reads same true
 // expect: cache 48 KB: kept snapshots 7, still same 7
 // expect: cache 48 KB: checkpoints taken up more than 5 true, pages evicted for reuse true
 // expect: cache 48 KB: audit ok true
+// expect: cache 16384 KB: a second follower: at round 10 true, its snapshot 50 rounds later true, caught up true
 // expect: cache 16384 KB: rounds 79, same 79, point reads same true
 // expect: cache 16384 KB: kept snapshots 7, still same 7
 // expect: cache 16384 KB: checkpoints taken up more than 5 true, pages evicted for reuse true
@@ -152,7 +157,14 @@ fn phase(seed: int, followerCache: int): []str {
         for i in 0..3000 { t.put(known[i % 3], key(i), "init" + i.toStr()).unwrap() }
         st.commit(t).unwrap()
         st.checkpoint().unwrap()
-        let fo = lexdb_store.openFollower(lexdb_store.Link.Local(st), fs, followerCache).unwrap()
+        let fo = lexdb_store.openFollower(lexdb_store.Link.LocalId(st, 1), fs, followerCache).unwrap()
+        // a second follower, its own hold (id 2): it stops at round 10 for
+        // 50 rounds, a snapshot open, while the first goes on
+        let fo2 = lexdb_store.openFollower(lexdb_store.Link.LocalId(st, 2), fs, followerCache).unwrap()
+        var s2: []lexdb_store.FSnap = []
+        var s2dumps: []str = []
+        var s2trees: []int = []
+        var two = "not checked"
         var r = lexdb_base.rng(seed + 5)
         let made = task.shared[[]int]([])
         var compared = 0
@@ -198,6 +210,27 @@ fn phase(seed: int, followerCache: int): []str {
                 }
             }
             st.endSnapshot(&ms)
+            if round <= 10 || round >= 60 {
+                fo2.poll(rec.batch).unwrap()
+                if round == 10 || round == 60 {
+                    let sn = fo2.begin().unwrap()
+                    var ok = sn.batch == rec.batch
+                    for i in 0..len(rec.trees) { if dumpFollower(&fo2, &sn, rec.trees[i]) != rec.dumps[i] { ok = false } }
+                    if round == 10 {
+                        append(mut &s2, sn)
+                        for i in 0..len(rec.trees) { append(mut &s2dumps, rec.dumps[i]) }
+                        s2trees = copyInts(&rec.trees)
+                        two = "at round 10 " + ok.toStr()
+                    } else {
+                        // the snapshot of round 10, held all along
+                        var held = true
+                        for i in 0..len(s2trees) { if dumpFollower(&fo2, &s2[0], s2trees[i]) != s2dumps[i] { held = false } }
+                        fo2.end(&s2[0])
+                        fo2.end(&sn)
+                        two = two + ", its snapshot 50 rounds later " + held.toStr() + ", caught up " + ok.toStr()
+                    }
+                }
+            }
             // the follower, a round behind (12 for rounds 30 to 49: it falls
             // behind across checkpoints and log segments, then catches up)
             append(mut &prev, rec)
@@ -263,7 +296,9 @@ fn phase(seed: int, followerCache: int): []str {
             }
         }
         let fst = fo.stats()
+        fo2.close()
         fo.close()
+        append(mut &lines, tag + "a second follower: " + two)
         append(mut &lines, tag + "rounds 79, same " + same.toStr() + ", point reads same " + pointsSame.toStr())
         append(mut &lines, tag + "kept snapshots " + keptCount.toStr() + ", still same " + keptSame.toStr())
         append(mut &lines, tag + "checkpoints taken up more than 5 " + (len(ckpts) > 5).toStr() + ", pages evicted for reuse " + (fst.freed > 0).toStr())

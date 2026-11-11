@@ -56,23 +56,52 @@ fn noCow(dir: str) {
     closeDir(fd)
 }
 
+// lexdb DATADIR [ADDR ...] [--replicas N [--replica-addr ADDR ...]]
+// lexdb --replica DATADIR [ADDR ...]
+//
+// ADDR: host:port (TCP), or a directory for a Unix socket (.s.PGSQL.<the
+// first TCP port>, as PostgreSQL names it). With --replicas N the process
+// supervises the master and N read-only replicas (design/lexdb.md 9.73),
+// each a process of its own, started again when it ends badly; the
+// replicas serve --replica-addr (by default each of ADDR with the port one
+// higher), sharing its TCP port (SO_REUSEPORT) and its Unix socket.
+// --replica runs one replica by hand, of a master already serving DATADIR.
 fn main() {
     let args = os.arguments()
-    // --replica: a read-only replica of the master serving DATADIR, in a
-    // process of its own on the same machine (design/lexdb.md 9.72)
-    let replica = len(args) > 0 && args[0] == "--replica"
-    let a0 = if replica { 1 } else { 0 }
-    if len(args) < a0 + 1 {
-        eprintln("usage: lexdb [--replica] DATADIR [ADDR ...]")
-        exit(2)
+    var replica = false
+    var replicas = 0
+    var raddrs: []str = []
+    var pos: []str = []
+    var i = 0
+    while i < len(args) {
+        let a = args[i]
+        if a == "--replica" {
+            replica = true
+        } else if a == "--replicas" || a == "--replica-addr" {
+            if i + 1 >= len(args) { usage() }
+            if a == "--replicas" {
+                replicas = strings.parseIntOpt(args[i + 1]).unwrapOr(-1)
+                if replicas < 0 || replicas > 64 { usage() }
+            } else {
+                append(mut &raddrs, args[i + 1])
+            }
+            i += 1
+        } else if strings.startsWith(a, "--") {
+            usage()
+        } else {
+            append(mut &pos, a)
+        }
+        i += 1
     }
-    let dir = args[a0]
+    if len(pos) < 1 || (replica && replicas > 0) { usage() }
+    let dir = pos[0]
     var addrs: []str = []
-    for i in a0 + 1..len(args) { append(mut &addrs, args[i]) }
-    if len(addrs) == 0 { append(mut &addrs, "127.0.0.1:5433") }
+    for k in 1..len(pos) { append(mut &addrs, pos[k]) }
+    if len(addrs) == 0 { append(mut &addrs, if replica { "127.0.0.1:5434" } else { "127.0.0.1:5433" }) }
     if os.env("LXL_HELPERS").isNone() { os.setEnv("LXL_HELPERS", "32") }   // reads in flight (section 3)
     if replica {
-        runReplica(dir, &addrs, opts0())
+        let none: []net.Listener = []
+        runReplica(dir, &addrs, opts0(), false, none, 10000)
         return
     }
     match fs.mkdirAll(dir) {
@@ -83,6 +112,106 @@ fn main() {
         }
     }
     noCow(dir)
+    if replicas == 0 {
+        runMaster(dir, &addrs)
+        return
+    }
+    supervise(dir, &addrs, replicas, &raddrs)
+}
+
+fn usage() {
+    eprintln("usage: lexdb DATADIR [ADDR ...] [--replicas N [--replica-addr ADDR ...]]")
+    eprintln("       lexdb --replica DATADIR [ADDR ...]")
+    exit(2)
+}
+
+// The master and n replicas, each a worker process (task.workers): worker
+// 0 the master, the others replicas. A worker that ends badly is started
+// again; a replica ends when its master does, and so is started again with
+// it. SIGTERM or SIGINT stops them all.
+fn supervise(dir: str, addrs: &[]str, n: int, given: &[]str) {
+    // the replicas' addresses: given, or each of the master's one port up
+    var raddrs: []str = []
+    for a in given { append(mut &raddrs, a) }
+    if len(raddrs) == 0 {
+        for a in addrs {
+            if strings.contains(a, "/") {
+                append(mut &raddrs, a)
+            } else {
+                let c = strings.lastIndexOf(a, ":")
+                let port = strings.parseIntOpt(a[c + 1..len(a)]).unwrapOr(-1)
+                if c < 0 || port <= 0 {
+                    eprintln("lexdb: --replicas needs the master's TCP port to pick the replicas' (or --replica-addr): " + a)
+                    exit(2)
+                }
+                append(mut &raddrs, a[0..c + 1] + (port + 1).toStr())
+            }
+        }
+    }
+    // their Unix sockets, made here: every replica accepts from them (a
+    // Unix socket's path cannot be shared with SO_REUSEPORT)
+    var tcpPort = ""
+    for a in raddrs {
+        if !strings.contains(a, "/") && tcpPort == "" {
+            let c = strings.lastIndexOf(a, ":")
+            if c >= 0 { tcpPort = a[c + 1..len(a)] }
+        }
+    }
+    var shared: []net.Listener = []
+    var files: []str = []
+    for a in raddrs {
+        if !strings.contains(a, "/") { continue }
+        if tcpPort == "" {
+            eprintln("lexdb: the replicas' Unix socket is named by their TCP port: give one with --replica-addr")
+            exit(2)
+        }
+        let path = if strings.endsWith(a, "/") { a + ".s.PGSQL." + tcpPort } else { a + "/.s.PGSQL." + tcpPort }
+        match lexdb_wire.clearStale(&path) {
+            Ok(_) {}
+            Err(msg) {
+                eprintln("lexdb: " + msg)
+                exit(1)
+            }
+        }
+        match net.listenUnix(path) {
+            Ok(ln) {
+                append(mut &files, path)
+                append(mut &shared, ln)
+            }
+            Err(e) {
+                eprintln("lexdb: listen " + path + ": " + e.toStr())
+                exit(1)
+            }
+        }
+    }
+    var tcp: []str = []
+    for a in raddrs { if !strings.contains(a, "/") { append(mut &tcp, a) } }
+    println("lexdb: supervising a master and " + n.toStr() + " replica" + (if n == 1 { "" } else { "s" }) + " of " + dir)
+    let fl = io.flushStdout()
+    var policy = task.workerPolicy()
+    policy.maxBackoffMs = 2000
+    let ends = task.workersWith(n + 1, policy, fn(w: int) {
+        if w == 0 {
+            runMaster(dir, addrs)
+        } else {
+            // each replica a copy of the shared sockets (this process's own
+            // memory: the supervisor keeps its)
+            runReplica(dir, &tcp, opts0(), true, replace(mut &shared, []), 60000)
+        }
+    })
+    for f in files { let gone = fs.remove(f) }
+    match ends {
+        Ok(_) {}
+        Err(g) {
+            eprintln("lexdb: the workers ended too often (" + g.crashes.toStr() + " times): stopped")
+            exit(1)
+        }
+    }
+}
+
+// The master: the data directory's lock, the store, its listeners and the
+// replication socket, until SIGTERM or SIGINT.
+fn runMaster(dir: str, addrs: &[]str) {
     // One server per data directory: two writing the same files would
     // corrupt them (a benchmark started a second server while the first
     // still wrote its shutdown checkpoint, 9.58). The lock is held, its
@@ -130,12 +259,13 @@ fn main() {
         // replicas (--replica) connect here
         let repl = s.start(lexdb_repl.serve, lexdb_repl.Serve{st: st, dir: dir})
         var files: []str = []                       // the Unix sockets made: removed at the end
-        match lexdb_wire.listenAll(&addrs, mut &files) {
+        match lexdb_wire.listenAll(addrs, mut &files) {
             Ok(lns) {
                 var names: []str = []
                 for ln in lns { append(mut &names, ln.localAddr()) }
                 println("lexdb: listening on " + strings.join(&names, ", ") + ", data in " + dir)
                 let fl = io.flushStdout()
+                let ready = task.workerReady()             // (outside task.workers, nothing)
                 let f = s.start(lexdb_wire.acceptAll, lexdb_wire.ListenArg{lns: lns, st: st})
                 let sig = task.terminated()
                 { let stop = f }                       // cancels the accept loops and the connections
@@ -234,9 +364,10 @@ fn opts0(): lexdb_store.Options {
 // A read-only replica (--replica): follows the master of dir over its
 // replication socket and serves addrs with the same SQL, refusing writes
 // (25006). It stops when the master does (exit 1) or on SIGTERM/SIGINT.
-fn runReplica(dir: str, addrs: &[]str, opts: lexdb_store.Options) {
+fn runReplica(dir: str, addrs: &[]str, opts: lexdb_store.Options, reusePort: bool, shared: []net.Listener, waitMs: int) {
     task.watchSignals(&[task.SIGTERM, task.SIGINT])
-    let conn = lexdb_repl.connect(dir, opts, 10000)
+    var sharedLns = shared
+    let conn = lexdb_repl.connect(dir, opts, waitMs)
     if conn.isErr() {
         eprintln("lexdb: replica of " + dir + ": " + conn.unwrapErr().toStr())
         exit(1)
@@ -261,12 +392,14 @@ fn runReplica(dir: str, addrs: &[]str, opts: lexdb_store.Options) {
             }
         }
         var files: []str = []
-        match lexdb_wire.listenAll(addrs, mut &files) {
+        let listening = if reusePort { listenShared(addrs, replace(mut &sharedLns, [])) } else { lexdb_wire.listenAll(addrs, mut &files) }
+        match move(listening) {
             Ok(lns) {
                 var names: []str = []
                 for ln in lns { append(mut &names, ln.localAddr()) }
                 println("lexdb: replica listening on " + strings.join(&names, ", ") + ", following the master of " + dir)
                 let fl = io.flushStdout()
+                let marked = task.workerReady()
                 let acc = s.start(lexdb_wire.acceptAll, lexdb_wire.ListenArg{lns: lns, st: st})
                 let sig = s.start(waitStop, 0)
                 match task.any([fol, sig]) {
@@ -295,6 +428,20 @@ fn runReplica(dir: str, addrs: &[]str, opts: lexdb_store.Options) {
     })
     st.close()
     if code != 0 { exit(code) }
+}
+
+// A supervised replica's listeners: its TCP addresses with SO_REUSEPORT
+// (each replica a socket of its own on the one port; the kernel spreads
+// the connections), and the Unix sockets the supervisor made, shared.
+fn listenShared(addrs: &[]str, shared: []net.Listener): Result[[]net.Listener, str] {
+    var lns = shared
+    for a in addrs {
+        match net.listenReusePort(a) {
+            Ok(ln) { append(mut &lns, ln) }
+            Err(e) { return Err("listen " + a + ": " + e.toStr()) }
+        }
+    }
+    return Ok(lns)
 }
 
 // Waits for SIGTERM or SIGINT; 2 (follow gives 0 or 1).

@@ -79,6 +79,8 @@ type Deferred = value record { slot: int; seq: int; height: int }
 // snapshot at an earlier commit starts from prev.
 type RootChange = value record { seq: int; tree: int; prev: int }
 
+type HoldAt = value record { ckpt: int; seg: int }
+
 // The pages checkpoint ckpt freed, as runs, kept from reuse while a
 // follower may read an earlier checkpoint (hold).
 type HeldRuns = record { ckpt: int; runs: []int }
@@ -141,6 +143,7 @@ pub type Db = record {
     deferred: []Deferred        // slots freed while a snapshot may reach them
     rootHist: []RootChange      // root changes a snapshot may still need
     durableSeq: int             // the last commit the log holds: snapshots read as of it
+    holds: Map[int, HoldAt]     // each follower's hold (9.73); the fields below are the oldest's
     holdCkpt: int               // a follower reads checkpoints from this one on (9.71), -1 none:
     holdSeg: int                //   pages later checkpoints free stay unused (heldFree), and
     heldFree: []HeldRuns        //   log segments from holdSeg on are kept
@@ -2759,7 +2762,7 @@ fn newDb(fs: lexdb_disk.Fs, data: lexdb_disk.File, opts: Options, m: &lexdb_page
               batch: [], batchCount: 0, batchNo: m.replayBatch, appliedBatch: m.replayBatch - 1,
               durableBatch: m.replayBatch - 1, waiters: [], writerWake: [], ckptWake: [], ckptDone: [], seg: m.replaySeg,
               segOff: m.replayOff, logSinceCkpt: 0, failed: [], closing: false, seq: 0, snaps: [], nextSnap: 0,
-              hist: [], histCount: 0, histSlots: [], deferred: [], rootHist: [], durableSeq: 0, holdCkpt: -1, holdSeg: -1, heldFree: [], changeWake: [], ckptCovers: m.covers, snapshots: 0, tooOld: 0, commits: 0,
+              hist: [], histCount: 0, histSlots: [], deferred: [], rootHist: [], durableSeq: 0, holds: newMap(), holdCkpt: -1, holdSeg: -1, heldFree: [], changeWake: [], ckptCovers: m.covers, snapshots: 0, tooOld: 0, commits: 0,
               conflicts: 0, loads: 0, aheadReads: 0, aheadPages: 0, evictions: 0, flushes: 0, checkpoints: 0, held: 0, wholes: 0}
 }
 
@@ -3053,17 +3056,36 @@ pub fn (st: &Store) durableBatch(): int {
 // are not reused, and log segments from seg on are kept. A follower moves
 // it up as it lets go of older checkpoints; ckpt -1 lets go of all. The
 // pages held become free once ckpt reaches the checkpoint that freed them.
-pub fn (st: &Store) hold(ckpt: int, seg: int) {
+// (The follower in this process: holdFor's 0.)
+pub fn (st: &Store) hold(ckpt: int, seg: int) { st.holdFor(0, ckpt, seg) }
+
+// hold, for follower id (each replica its own, 9.73): what is kept is what
+// the oldest hold needs.
+pub fn (st: &Store) holdFor(id: int, ckpt: int, seg: int) {
     st.sh.with(fn(db: mut &Db) {
-        db.holdCkpt = ckpt
-        db.holdSeg = if ckpt < 0 { -1 } else { seg }
-        var keep: []HeldRuns = []
-        while len(db.heldFree) > 0 {
-            let h = pop(mut &db.heldFree)
-            if ckpt >= 0 && ckpt < h.ckpt { append(mut &keep, h) } else { db.free = mergeRuns(&db.free, &h.runs) }
-        }
-        db.heldFree = keep
+        if ckpt < 0 { let x = db.holds.remove(&id) } else { db.holds.put(id, HoldAt{ckpt: ckpt, seg: seg}) }
+        db.rehold()
     })
+}
+
+// The effective hold, the oldest of the followers', and the pages it no
+// longer keeps freed.
+fn (db: mut &Db) rehold() {
+    var ck = -1
+    var sg = -1
+    for i in 0..db.holds.size() {
+        let h: HoldAt = db.holds.valAt(i)
+        if ck < 0 || h.ckpt < ck { ck = h.ckpt }
+        if sg < 0 || h.seg < sg { sg = h.seg }
+    }
+    db.holdCkpt = ck
+    db.holdSeg = sg
+    var keep: []HeldRuns = []
+    while len(db.heldFree) > 0 {
+        let h = pop(mut &db.heldFree)
+        if ck >= 0 && ck < h.ckpt { append(mut &keep, h) } else { db.free = mergeRuns(&db.free, &h.runs) }
+    }
+    db.heldFree = keep
 }
 
 // Whether the last durable checkpoint says which batch it covers (one
@@ -3103,12 +3125,15 @@ pub fn (st: &Store) waitChange(): bool {
 // Starts a hold at the last durable checkpoint, and every log segment,
 // in one step (a follower's first; it then holds the checkpoint it reads,
 // which is this one or a later one), and gives that checkpoint.
-pub fn (st: &Store) holdNow(): int {
+pub fn (st: &Store) holdNow(): int { return st.holdNowFor(0) }
+
+// holdNow, for follower id.
+pub fn (st: &Store) holdNowFor(id: int): int {
     var c = 0
     st.sh.with(fn(db: mut &Db) {
         c = db.durableCkpt
-        db.holdCkpt = c
-        db.holdSeg = 0
+        db.holds.put(id, HoldAt{ckpt: c, seg: 0})
+        db.rehold()
     })
     return c
 }
@@ -3214,6 +3239,7 @@ pub fn run[R](fs: lexdb_disk.Fs, opts: Options, f: &fn(Store): R): Result[R, lex
 // (9.72).
 pub type Link = value closed {
     Local(Store)
+    LocalId(Store, int)         // Local, holding as follower id (several in one process: the tests)
     Remote(task.Shared[Outbox])
 }
 
@@ -3236,6 +3262,7 @@ pub fn newOutbox(first: int): task.Shared[Outbox] {
 fn (l: &Link) hold(ckpt: int, seg: int) {
     match l {
         Link.Local(st) { st.hold(ckpt, seg) }
+        Link.LocalId(st, id) { st.holdFor(id, ckpt, seg) }
         Link.Remote(ob) {
             var wake: []task.Promise[Unit] = []
             ob.with(fn(o: mut &Outbox) {
@@ -3254,12 +3281,13 @@ fn (l: &Link) holdNow(): int {
     var c = 0
     match l {
         Link.Local(st) { c = st.holdNow() }
+        Link.LocalId(st, id) { c = st.holdNowFor(id) }
         Link.Remote(ob) { ob.with(fn(o: mut &Outbox) { c = o.first }) }
     }
     return c
 }
 
-fn (l: &Link) local(): bool { return match l { Link.Local(_) { true } Link.Remote(_) { false } } }
+fn (l: &Link) local(): bool { return match l { Link.Local(_) { true } Link.LocalId(_, _) { true } Link.Remote(_) { false } } }
 
 
 // A checkpoint the follower reads.

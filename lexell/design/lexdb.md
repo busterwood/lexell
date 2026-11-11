@@ -5499,3 +5499,75 @@ with its own port; pgbench prepared, 8 s; CPU from `/proc`):
   again from the new checkpoint itself, not exit;
 - more than one replica: a hold per replica;
 - the scans' delta merge (9.71).
+
+### 9.73 Several replicas, under one command
+
+```
+lexdb DATADIR ADDR... --replicas N [--replica-addr ADDR...]
+```
+
+This runs a supervisor (`task.workers`): worker 0 is the master, workers 1
+to N are replicas.
+
+- **Addresses:** the replicas serve `--replica-addr`, by default each
+  master address with the port one higher.
+  - They share the TCP port: each listens with `SO_REUSEPORT`, and the
+    kernel spreads connections by a hash.
+  - They share the Unix socket: the supervisor makes it before forking,
+    and each worker takes its own copy of the listener, so all accept from
+    one queue (`EPOLLEXCLUSIVE`).
+- **Restarts:** each worker marks itself ready (`workerReady`) once
+  serving, so its later ends never count toward the supervisor giving up.
+  - A crashed master is started again. The replicas see the link end,
+    exit 1, and are started again with it. A replica waits up to 60 s for
+    the master's socket.
+  - A crashed replica is started again on its own.
+- **Stopping:** SIGTERM or SIGINT to the supervisor stops them all, and it
+  removes the replicas' Unix socket.
+
+`lexdb --replica` (9.72) is still there, to run one by hand.
+
+**A hold per replica.** `Store.holds` maps each follower's id to its
+checkpoint and segment. The effective hold, which decides what the master
+does not reuse, is the oldest, recomputed on each change (`rehold`). A
+replica's connection is its id, and its hold goes when the connection
+does. `hold` and `holdNow` are follower 0, the one in this process. The
+link no longer refuses a second replica.
+
+**Measured** (the 9.67 data; pgbench point selects, prepared, 8 clients
+per replica, on the replicas' shared Unix socket; 16 CPUs, which pgbench
+shares):
+
+| replicas | clients | selects/s | against one | CPU per replica |
+|---:|---:|---:|---:|---|
+| 1 | 8 | 167,200 | 1.0 | 1.00 |
+| 2 | 16 | 324,700 | 1.94 | 1.00 each |
+| 4 | 32 | 538,000 | 3.2 | 1.00 each |
+| 8 | 64 | 686,700 | 4.1 | 0.85 to 0.96 |
+
+- **Up to four** the replicas are each a busy core, and the shared socket
+  spreads the connections evenly.
+- **At eight** the machine runs out: pgbench's 16 threads and the
+  kernel share its 16 CPUs. PostgreSQL's best on this machine was 711,000
+  (9.67).
+- **Over TCP** (`SO_REUSEPORT`), four replicas give 396,000/s, each 0.84 of
+  a core. The spread is even; the TCP stack costs more on both sides.
+- **Memory:** each replica held 38 to 40 MB with acct cached.
+
+**Tests:**
+- `follow_basic` has a second follower with its own hold (`Link.LocalId`).
+  It stops at round 10 for 50 rounds with a snapshot open, while the first
+  goes on through many checkpoints. Its snapshot must still read round
+  10's state, and then it must catch up. Two more bugs put back were
+  caught (the newest hold kept, not the oldest; one hold for all), fifteen
+  in all.
+- `replica.py` adds the supervised form:
+  - a master and two replicas, both replicas answering on the replicas'
+    port;
+  - the master (the worker holding the data directory's lock) killed with
+    SIGKILL: the supervisor starts it again, the replicas with it, the
+    data intact;
+  - a replica killed and started again on its own;
+  - a write refused;
+  - SIGTERM stopping all of them with exit 0.
+- All 65 lexdb tests, the crash test, and `replica.py` with 20 rounds pass.

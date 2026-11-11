@@ -17,6 +17,12 @@ by many checkpoints. Through psql:
   itself (exit 1) within 10 s; both start again, the master recovering;
 - at the end the master stops (SIGTERM) and the replica must stop too.
 
+Then the supervised form, lexdb DATADIR ADDR --replicas 2: both replicas
+answer on the replicas' port; the master (a worker) killed with SIGKILL is
+started again by the supervisor, and the replicas with it, the data
+intact; a replica killed is started again on its own; SIGTERM to the
+supervisor stops them all (exit 0).
+
 Exit 0 when all of that holds; 77 when psql is not installed.
 """
 import argparse
@@ -131,6 +137,87 @@ def writes(rng, rnd):
     return sql
 
 
+def children(pid):
+    try:
+        return [int(x) for x in open('/proc/%d/task/%d/children' % (pid, pid)).read().split()]
+    except OSError:
+        return []
+
+
+def holds_lock(pid, data):
+    lock = os.path.join(data, 'lock')
+    try:
+        for fd in os.listdir('/proc/%d/fd' % pid):
+            try:
+                if os.readlink('/proc/%d/fd/%s' % (pid, fd)) == lock:
+                    return True
+            except OSError:
+                pass
+    except OSError:
+        pass
+    return False
+
+
+def wait_for(cond, timeout):
+    end = time.time() + timeout
+    while time.time() < end:
+        if cond():
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def supervised(exe, work, env, fail):
+    data = os.path.join(work, 'sdata')
+    mport = free_port()
+    rport = free_port()
+    log = os.path.join(work, 'supervised.log')
+    sup = Proc([exe, data, '127.0.0.1:%d' % mport, '--replicas', '2', '--replica-addr', '127.0.0.1:%d' % rport],
+               mport, log, env)
+    sup.start()
+    if not sup.ready():
+        fail('supervised: the master did not start')
+    replica_up = lambda: psql(rport, 'select 1', check=False).returncode == 0
+    if not wait_for(replica_up, 60):
+        fail('supervised: the replicas did not start')
+    psql(mport, 'create table s (id int primary key, v int not null)')
+    psql(mport, 'insert into s select i, i from generate_series(1, 5000) i')
+    want = psql(mport, 'select count(*), sum(v) from s').stdout
+    same = lambda: psql(rport, 'select count(*), sum(v) from s', check=False).stdout == want
+    # every replica: enough connections that both answer
+    if not wait_for(lambda: all(same() for _ in range(8)), 10):
+        fail('supervised: the replicas did not catch up')
+    kids = children(sup.p.pid)
+    if len(kids) != 3:
+        fail('supervised: %d workers, not 3' % len(kids))
+    masters = [k for k in kids if holds_lock(k, data)]
+    if len(masters) != 1:
+        fail('supervised: %d workers hold the lock' % len(masters))
+    os.kill(masters[0], signal.SIGKILL)
+    if not wait_for(lambda: len(children(sup.p.pid)) == 3 and masters[0] not in children(sup.p.pid), 10):
+        fail('supervised: the master was not started again')
+    if not wait_for(lambda: psql(mport, 'select count(*), sum(v) from s', check=False).stdout == want, 60):
+        fail('supervised: the master did not come back with the data')
+    psql(mport, 'insert into s values (5001, 5001)')
+    want = psql(mport, 'select count(*), sum(v) from s').stdout
+    if not wait_for(lambda: all(same() for _ in range(8)), 60):
+        fail('supervised: the replicas did not come back after the master')
+    reps = [k for k in children(sup.p.pid) if not holds_lock(k, data)]
+    os.kill(reps[0], signal.SIGKILL)
+    if not wait_for(lambda: len(children(sup.p.pid)) == 3 and reps[0] not in children(sup.p.pid), 10):
+        fail('supervised: the replica was not started again')
+    if not wait_for(lambda: all(same() for _ in range(8)), 60):
+        fail('supervised: the replica did not come back')
+    w = psql(rport, 'delete from s', check=False)
+    if '25006' not in w.stderr and 'read-only' not in w.stderr:
+        fail('supervised: a write on a replica was not refused')
+    code = sup.stop()
+    if code != 0:
+        fail('supervised: the supervisor stopped with %s' % code)
+    print('replica test: supervised, a master and 2 replicas: the master killed and started again with the replicas, '
+          'a replica killed and started again, stopped by SIGTERM: passed', flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--rounds', type=int, default=12)
@@ -243,7 +330,8 @@ def main():
     except subprocess.TimeoutExpired:
         fail('the replica did not stop after the master did')
     print('replica test: %d rounds, the replica caught up every round, %d writes refused, killed and started again %d times, '
-          'the master killed once: passed' % (a.rounds, refused, a.rounds // 3))
+          'the master killed once: passed' % (a.rounds, refused, a.rounds // 3), flush=True)
+    supervised(exe, work, env, fail)
     if not a.keep:
         shutil.rmtree(work)
 
