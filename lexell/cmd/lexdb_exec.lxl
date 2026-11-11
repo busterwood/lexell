@@ -23,6 +23,7 @@ import "task"
 import "os"
 import "./lexdb_base"
 import "./lexdb_time"
+import "base64"
 import "./lexdb_page"
 import "./lexdb_store"
 import "./lexdb_sql"
@@ -111,6 +112,8 @@ pub fn text(v: &Val): str {
         Val.Ts(u) { return lexdb_time.fmtTs(u) }
         Val.Tstz(u) { return lexdb_time.fmtTstz(u) }
         Val.Ival(iv) { return lexdb_time.fmtIval(&iv) }
+        Val.Uuid(u) { return u }
+        Val.Bytes(b) { return lexdb_sql.bytesHex(&b) }
     }
 }
 
@@ -128,6 +131,8 @@ fn kindName(t: &lexdb_sql.TypeName): str {
     if t.kind == lexdb_sql.K_BOOL { return "boolean" }
     if t.kind == lexdb_sql.K_NUM { return "numeric" }
     if isTimeKind(t.kind) { return lexdb_sql.typeText(&lexdb_sql.timeType(t.oid)) }
+    if t.kind == lexdb_sql.K_UUID { return "uuid" }
+    if t.kind == lexdb_sql.K_BYTEA { return "bytea" }
     return if t.oid == lexdb_sql.OID_VARCHAR { "character varying" } else { "text" }
 }
 
@@ -218,6 +223,18 @@ pub fn coerce(v: Val, t: &lexdb_sql.TypeName): Result[Val, DbErr] {
         return Ok(Val.Num(d))
     } else if isTimeKind(t.kind) {
         return coerceTime(v, t)
+    } else if t.kind == lexdb_sql.K_UUID {
+        match v {
+            Val.Uuid(u) { return Ok(Val.Uuid(u)) }
+            Val.Text(x) { return Ok(Val.Uuid(try parseUuid(&x))) }
+            else { return Err(e("42846", "cannot cast type " + kindName(&oidType(kindOid(&v))) + " to uuid")) }
+        }
+    } else if t.kind == lexdb_sql.K_BYTEA {
+        match v {
+            Val.Bytes(x) { return Ok(Val.Bytes(x)) }
+            Val.Text(x) { return Ok(Val.Bytes(try parseBytea(&x))) }
+            else { return Err(e("42846", "cannot cast type " + kindName(&oidType(kindOid(&v))) + " to bytea")) }
+        }
     } else if t.kind == lexdb_sql.K_ARRAY {
         match v {
             Val.Text(x) {
@@ -765,6 +782,8 @@ fn kindOid(v: &Val): int {
         Val.Ts(_) { return lexdb_sql.OID_TS }
         Val.Tstz(_) { return lexdb_sql.OID_TSTZ }
         Val.Ival(_) { return lexdb_sql.OID_IVAL }
+        Val.Uuid(_) { return lexdb_sql.OID_UUID }
+        Val.Bytes(_) { return lexdb_sql.OID_BYTEA }
         else { return lexdb_sql.OID_TEXT }
     }
 }
@@ -895,6 +914,8 @@ fn kindOf(v: &Val): int {
         Val.Ts(_) { return lexdb_sql.K_TS }
         Val.Tstz(_) { return lexdb_sql.K_TSTZ }
         Val.Ival(_) { return lexdb_sql.K_IVAL }
+        Val.Uuid(_) { return lexdb_sql.K_UUID }
+        Val.Bytes(_) { return lexdb_sql.K_BYTEA }
     }
 }
 
@@ -918,6 +939,14 @@ fn compare(a: &Val, b: &Val): Result[int, DbErr] {
     let ka = kindOf(a)
     let kb = kindOf(b)
     if isTimeKind(ka) || isTimeKind(kb) { return compareTime(a, b) }
+    if ka == lexdb_sql.K_UUID || kb == lexdb_sql.K_UUID || ka == lexdb_sql.K_BYTEA || kb == lexdb_sql.K_BYTEA {
+        // a text with either is read as its type; then as bytes, which is their order
+        let k = if ka == lexdb_sql.K_UUID || kb == lexdb_sql.K_UUID { lexdb_sql.K_UUID } else { lexdb_sql.K_BYTEA }
+        let ty = oidType(if k == lexdb_sql.K_UUID { lexdb_sql.OID_UUID } else { lexdb_sql.OID_BYTEA })
+        let x = try coerce(a, &ty)
+        let y = try coerce(b, &ty)
+        return Ok(text(&x).cmp(&text(&y)))
+    }
     match a {
         Val.Int(x) {
             match b {
@@ -1088,7 +1117,7 @@ fn aggBase(name: &str): str {
     return if i < 0 { name } else { name[0..i] }
 }
 
-const AGGS: []str = ["count", "sum", "avg", "min", "max", "string_agg", "bool_and", "bool_or", "every", "stddev",
+const AGGS: []str = ["count", "sum", "avg", "min", "max", "string_agg", "array_agg", "bool_and", "bool_or", "every", "stddev",
                      "stddev_samp", "stddev_pop", "variance", "var_samp", "var_pop"]
 
 fn isAgg(name: &str): bool {
@@ -1185,6 +1214,12 @@ pub fn eval(x: &Expr, env: &Env): Result[Val, DbErr] {
             let r = try eval(&b, env)
             if op == "||" {
                 if isNull(&l) || isNull(&r) { return Ok(Val.Null) }
+                if kindOf(&l) == lexdb_sql.K_BYTEA || kindOf(&r) == lexdb_sql.K_BYTEA {
+                    let ty = oidType(lexdb_sql.OID_BYTEA)
+                    let lb = try coerce(l, &ty)
+                    let rb = try coerce(r, &ty)
+                    match lb { Val.Bytes(p) { match rb { Val.Bytes(q) { return Ok(Val.Bytes(p + q)) } else {} } } else {} }
+                }
                 return Ok(Val.Text(text(&l) + text(&r)))
             }
             if op == "=" || op == "<>" || op == "<" || op == "<=" || op == ">" || op == ">=" {
@@ -1409,6 +1444,15 @@ fn call(name: &str, vs: &[]Val): Result[Val, DbErr] { return callAt(name, vs, 0)
 
 // call, with now the transaction's start (microseconds since 2000; 0: the clock).
 fn callAt(name: &str, vs: &[]Val, now: int): Result[Val, DbErr] {
+    if name == "gen_random_uuid" && len(vs) == 0 { return randomUuid() }
+    if (name == "encode" || name == "decode") && len(vs) == 2 {
+        if isNull(&vs[0]) || isNull(&vs[1]) { return Ok(Val.Null) }
+        if name == "encode" {
+            let b = try coerce(vs[0], &oidType(lexdb_sql.OID_BYTEA))
+            match b { Val.Bytes(x) { return Ok(Val.Text(try encodeBytes(&x, &text(&vs[1])))) } else {} }
+        }
+        return Ok(Val.Bytes(try decodeBytes(&text(&vs[0]), &text(&vs[1]))))
+    }
     match try callTime(name, vs, now) {
         Some(v) { return Ok(v) }
         None {}
@@ -1505,7 +1549,18 @@ fn callAt(name: &str, vs: &[]Val, now: int): Result[Val, DbErr] {
             "ltrim" { return Ok(Val.Text(strings.trimLeft(text(&v)))) }
             "rtrim" { return Ok(Val.Text(strings.trimRight(text(&v)))) }
             "upper" { return Ok(Val.Text(strings.toUpperAscii(text(&v)))) }
-            "length", "char_length" { return Ok(Val.Int(strings.runeCount(&text(&v)))) }
+            "length", "char_length" {
+                match v {
+                    Val.Bytes(x) { return Ok(Val.Int(len(x))) }
+                    else { return Ok(Val.Int(strings.runeCount(&text(&v)))) }
+                }
+            }
+            "octet_length" {
+                match v {
+                    Val.Bytes(x) { return Ok(Val.Int(len(x))) }
+                    else { return Ok(Val.Int(len(text(&v)))) }
+                }
+            }
             "abs" {
                 match v {
                     Val.Int(x) { return Ok(Val.Int(if x < 0 { try arithInt(0, x) } else { x })) }
@@ -1570,16 +1625,21 @@ fn encKeyPart(b: mut &StrBuf, v: &Val) {
         }
         Val.Bool(x) { b.addByte(if x { 1 } else { 0 }) }
         Val.Num(d) { encNum(b, &d) }
-        Val.Text(s) {
-            for i in 0..len(s) {
-                b.addByte(s[i])
-                if s[i] == 0 { b.addByte(0xFF) }
-            }
-            b.addByte(0)
-            b.addByte(0)
-        }
+        Val.Text(s) { encBytesKey(b, &s) }
+        Val.Uuid(u) { encBytesKey(b, &u) }       // its lowercase form sorts as its bytes do
+        Val.Bytes(x) { encBytesKey(b, &x) }
         else {}
     }
+}
+
+// Bytes in key order: a 0 byte as 0 FF, the end as 0 0.
+fn encBytesKey(b: mut &StrBuf, s: &str) {
+    for i in 0..len(s) {
+        b.addByte(s[i])
+        if s[i] == 0 { b.addByte(0xFF) }
+    }
+    b.addByte(0)
+    b.addByte(0)
 }
 
 // A numeric in key order: 0x80 zero; 0x81, the exponent of its leading
@@ -1706,17 +1766,185 @@ fn encVal(b: mut &StrBuf, v: &Val) {
             binary.addU64LE(b, iv.days)
             binary.addU64LE(b, iv.us)
         }
+        Val.Uuid(u) {
+            b.addByte(12)
+            b.add(uuidBytes(&u))
+        }
+        Val.Bytes(x) {
+            b.addByte(13)
+            binary.addU32LE(b, len(x))
+            b.add(x)
+        }
     }
 }
 
-// A date or time value of tag (7 to 11) in a row at s[at..].
+// A value of tag 7 to 13 in a row at s[at..]: a date or time kind, a
+// uuid or a bytea.
 fn timeVal(s: &str, at: int, tag: byte): Val {
+    if tag == 12 { return Val.Uuid(uuidText(&s[at..at + 16])) }
+    if tag == 13 { return Val.Bytes(s[at + 4..at + 4 + binary.readU32LEStr(s, at)]) }
     let x = binary.readI64LEStr(s, at)
     if tag == 7 { return Val.Date(x) }
     if tag == 8 { return Val.Time(x) }
     if tag == 9 { return Val.Ts(x) }
     if tag == 10 { return Val.Tstz(x) }
     return Val.Ival(lexdb_time.Ival{months: x, days: binary.readI64LEStr(s, at + 8), us: binary.readI64LEStr(s, at + 16)})
+}
+
+// ---- uuid and bytea (9.78)
+
+extern "c" fn getrandom(buf: mut &[byte], n: int, flags: u32): int
+
+fn hexVal(c: byte): int {
+    if c >= '0' && c <= '9' { return int(c - '0') }
+    if c >= 'a' && c <= 'f' { return int(c - 'a') + 10 }
+    if c >= 'A' && c <= 'F' { return int(c - 'A') + 10 }
+    return -1
+}
+
+// A uuid in any of PostgreSQL's forms (upper or lower case, in braces, a
+// hyphen after any group of four digits or none), as its canonical form.
+fn parseUuid(s: &str): Result[str, DbErr] {
+    let bad = e("22P02", "invalid input syntax for type uuid: \"" + s + "\"")
+    var t = strings.trim(s)
+    if len(t) > 0 && t[0] == '{' {
+        if len(t) < 2 || t[len(t) - 1] != '}' { return Err(bad) }
+        t = t[1..len(t) - 1]
+    }
+    var hex = newStrBuf()
+    var n = 0
+    for i in 0..len(t) {
+        let c = t[i]
+        if c == '-' {
+            if n == 0 || n % 4 != 0 || n >= 32 || t[i - 1] == '-' { return Err(bad) }
+            continue
+        }
+        let v = hexVal(c)
+        if v < 0 || n >= 32 { return Err(bad) }
+        hex.addByte(if c >= 'A' && c <= 'F' { c + 32 } else { c })
+        n += 1
+    }
+    if n != 32 || t[len(t) - 1] == '-' { return Err(bad) }
+    let h = hex.toStr()
+    return Ok(h[0..8] + "-" + h[8..12] + "-" + h[12..16] + "-" + h[16..20] + "-" + h[20..32])
+}
+
+// A canonical uuid's 16 bytes, and back.
+fn uuidBytes(u: &str): str {
+    var b = newStrBuf()
+    var i = 0
+    while i < len(u) {
+        if u[i] == '-' {
+            i += 1
+            continue
+        }
+        b.addByte(byte(hexVal(u[i]) * 16 + hexVal(u[i + 1])))
+        i += 2
+    }
+    return b.toStr()
+}
+
+fn uuidText(raw: &str): str {
+    let h = lexdb_sql.bytesHex(raw)
+    return h[2..10] + "-" + h[10..14] + "-" + h[14..18] + "-" + h[18..22] + "-" + h[22..34]
+}
+
+// gen_random_uuid(): version 4, from the kernel's random bytes.
+fn randomUuid(): Result[Val, DbErr] {
+    var b = array(16, byte(0))
+    if getrandom(mut &b, 16, u32(0)) != 16 { return Err(e("58000", "could not generate random values")) }
+    b[6] = byte((int(b[6]) & 0x0f) | 0x40)
+    b[8] = byte((int(b[8]) & 0x3f) | 0x80)
+    return Ok(Val.Uuid(uuidText(&strFromBytes(&b))))
+}
+
+// A bytea from its text: hex (\x0001ff, pairs perhaps spaced) or the
+// escape form (\\ a backslash, \nnn an octal byte, the rest as is).
+fn parseBytea(s: &str): Result[str, DbErr] {
+    let bad = e("22P02", "invalid input syntax for type bytea")
+    var b = newStrBuf()
+    if len(s) >= 2 && s[0] == '\\' && (s[1] == 'x' || s[1] == 'X') {
+        var i = 2
+        while i < len(s) {
+            if s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r' {
+                i += 1
+                continue
+            }
+            if i + 1 >= len(s) { return Err(e("22023", "invalid hexadecimal data: odd number of digits")) }
+            let hi = hexVal(s[i])
+            let lo = hexVal(s[i + 1])
+            if hi < 0 || lo < 0 { return Err(e("22023", "invalid hexadecimal digit: \"" + s[if hi < 0 { i } else { i + 1 }..if hi < 0 { i + 1 } else { i + 2 }] + "\"")) }
+            b.addByte(byte(hi * 16 + lo))
+            i += 2
+        }
+        return Ok(b.toStr())
+    }
+    var i = 0
+    while i < len(s) {
+        if s[i] != '\\' {
+            b.addByte(s[i])
+            i += 1
+        } else if i + 1 < len(s) && s[i + 1] == '\\' {
+            b.addByte('\\')
+            i += 2
+        } else if i + 3 < len(s) && s[i + 1] >= '0' && s[i + 1] <= '3' && s[i + 2] >= '0' && s[i + 2] <= '7' && s[i + 3] >= '0' && s[i + 3] <= '7' {
+            b.addByte(byte((int(s[i + 1] - '0') * 8 + int(s[i + 2] - '0')) * 8 + int(s[i + 3] - '0')))
+            i += 4
+        } else {
+            return Err(bad)
+        }
+    }
+    return Ok(b.toStr())
+}
+
+// encode(bytes, format): hex, base64 or escape.
+fn encodeBytes(b: &str, f: &str): Result[str, DbErr] {
+    let fmt = strings.toLowerAscii(f)
+    if fmt == "hex" { return Ok(lexdb_sql.bytesHex(b)[2..]) }
+    if fmt == "base64" {
+        // 76 characters a line, as PostgreSQL writes it
+        let x = base64.encode(b.toStr())
+        var out = newStrBuf()
+        var i = 0
+        while i < len(x) {
+            if i > 0 { out.addByte('\n') }
+            let end = if i + 76 < len(x) { i + 76 } else { len(x) }
+            out.add(&x[i..end])
+            i = end
+        }
+        return Ok(out.toStr())
+    }
+    if fmt == "escape" {
+        var out = newStrBuf()
+        for i in 0..len(b) {
+            let c = b[i]
+            if c == '\\' { out.add("\\\\") }
+            else if c < 32 || c > 126 {
+                out.addByte('\\')
+                out.addByte('0' + (c >> 6))
+                out.addByte('0' + ((c >> 3) & 7))
+                out.addByte('0' + (c & 7))
+            } else { out.addByte(c) }
+        }
+        return Ok(out.toStr())
+    }
+    return Err(e("22023", "unrecognized encoding: \"" + f + "\""))
+}
+
+// decode(text, format): hex, base64 or escape.
+fn decodeBytes(t: &str, f: &str): Result[str, DbErr] {
+    let fmt = strings.toLowerAscii(f)
+    if fmt == "hex" { return parseBytea(&("\\x" + t)) }
+    if fmt == "base64" {
+        var clean = newStrBuf()
+        for i in 0..len(t) { if t[i] != '\n' && t[i] != '\r' && t[i] != ' ' && t[i] != '\t' { clean.addByte(t[i]) } }
+        match base64.decodeStrict(clean.toStr()) {
+            Some(x) { return Ok(x) }
+            None { return Err(e("22023", "invalid base64 input")) }
+        }
+    }
+    if fmt == "escape" { return parseBytea(t) }
+    return Err(e("22023", "unrecognized encoding: \"" + f + "\""))
 }
 
 // The bytes after its tag a value of tag takes in a row at s[at..]; -1 for
@@ -1728,6 +1956,8 @@ fn valSize(s: &str, at: int, tag: byte): int {
     if tag == 3 || tag == 4 { return 4 + binary.readU32LEStr(s, at) }
     if tag == 5 { return 4 }
     if tag == 11 { return 24 }
+    if tag == 12 { return 16 }
+    if tag == 13 { return 4 + binary.readU32LEStr(s, at) }
     return -1
 }
 
@@ -1848,7 +2078,7 @@ fn fitsIn(p: &str, n: int, need: &[]bool): bool {
             if i < n && need[i] { return false }
             at += 4
         } else {
-            if (tag == 3 || tag == 4) && at + 4 > len(p) { return false }
+            if (tag == 3 || tag == 4 || tag == 13) && at + 4 > len(p) { return false }
             let sz = valSize(p, at, tag)
             if sz < 0 { return false }
             at += sz
@@ -1938,7 +2168,7 @@ fn decRowNeed(s: &str, n: int, need: &[]bool, missing: &[]Val, lays: &[]FixedLay
                     Err(_) { return Err(lexdb_base.corrupt("a numeric value in a row")) }
                 }
             }
-        } else if tag >= 7 && tag <= 11 {
+        } else if tag >= 7 && tag <= 13 {
             append(mut &out, timeVal(s, at, tag))
             at += valSize(s, at, tag)
         } else {
@@ -4437,6 +4667,8 @@ fn runChild(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params
 // A column type for a result's OID.
 fn oidType(oid: int): lexdb_sql.TypeName {
     if lexdb_sql.timeKind(oid) > 0 { return lexdb_sql.timeType(oid) }
+    if oid == lexdb_sql.OID_UUID { return lexdb_sql.TypeName{kind: lexdb_sql.K_UUID, oid: oid, prec: 0, scale: 0, len: 0} }
+    if oid == lexdb_sql.OID_BYTEA { return lexdb_sql.TypeName{kind: lexdb_sql.K_BYTEA, oid: oid, prec: 0, scale: 0, len: 0} }
     if lexdb_sql.elemOid(oid) > 0 { return lexdb_sql.TypeName{kind: lexdb_sql.K_ARRAY, oid: oid, prec: 0, scale: 0, len: 0} }
     var kind = lexdb_sql.K_TEXT
     var o = oid
@@ -6266,6 +6498,8 @@ pub fn exprOid(x: &Expr, cols: &[]lexdb_sql.ColDef, ptypes: &[]int): int {
                 Val.Ts(_) { return lexdb_sql.OID_TS }
                 Val.Tstz(_) { return lexdb_sql.OID_TSTZ }
                 Val.Ival(_) { return lexdb_sql.OID_IVAL }
+                Val.Uuid(_) { return lexdb_sql.OID_UUID }
+                Val.Bytes(_) { return lexdb_sql.OID_BYTEA }
                 else { return lexdb_sql.OID_TEXT }
             }
         }
@@ -6279,7 +6513,11 @@ pub fn exprOid(x: &Expr, cols: &[]lexdb_sql.ColDef, ptypes: &[]int): int {
         }
         Expr.Unary(op, a) { return if op == "not" { lexdb_sql.OID_BOOL } else { exprOid(&a, cols, ptypes) } }
         Expr.Bin(op, a, b) {
-            if op == "||" { return lexdb_sql.OID_TEXT }
+            if op == "||" {
+                let l = exprOid(&a, cols, ptypes)
+                let r = exprOid(&b, cols, ptypes)
+                return if l == lexdb_sql.OID_BYTEA || r == lexdb_sql.OID_BYTEA { lexdb_sql.OID_BYTEA } else { lexdb_sql.OID_TEXT }
+            }
             if op == "+" || op == "-" || op == "*" || op == "/" || op == "%" {
                 let l = exprOid(&a, cols, ptypes)
                 let r = exprOid(&b, cols, ptypes)
@@ -6318,6 +6556,11 @@ pub fn exprOid(x: &Expr, cols: &[]lexdb_sql.ColDef, ptypes: &[]int): int {
                 "count" { return lexdb_sql.OID_INT8 }
                 "bool_and", "bool_or", "every" { return lexdb_sql.OID_BOOL }
                 "string_agg" { return lexdb_sql.OID_TEXT }
+                "array_agg" {
+                    let el = if len(args) > 0 { exprOid(&args[0], cols, ptypes) } else { lexdb_sql.OID_TEXT }
+                    let ao = lexdb_sql.arrayOid(if el == lexdb_sql.OID_UNKNOWN { lexdb_sql.OID_TEXT } else { el })
+                    return if ao > 0 { ao } else { lexdb_sql.arrayOid(lexdb_sql.OID_TEXT) }
+                }
                 "like", "ilike", "in", "distinct", "any", "all" { return lexdb_sql.OID_BOOL }
                 "case" { return if len(args) > 1 { exprOid(&args[1], cols, ptypes) } else { lexdb_sql.OID_TEXT } }
                 "nullif", "greatest", "least" { return if len(args) > 0 { exprOid(&args[0], cols, ptypes) } else { lexdb_sql.OID_TEXT } }
@@ -6340,7 +6583,10 @@ pub fn exprOid(x: &Expr, cols: &[]lexdb_sql.ColDef, ptypes: &[]int): int {
                 "min", "max", "abs", "coalesce" {
                     return if len(args) > 0 { exprOid(&args[0], cols, ptypes) } else { lexdb_sql.OID_TEXT }
                 }
-                "length", "char_length" { return lexdb_sql.OID_INT4 }
+                "length", "char_length", "octet_length" { return lexdb_sql.OID_INT4 }
+                "gen_random_uuid" { return lexdb_sql.OID_UUID }
+                "encode" { return lexdb_sql.OID_TEXT }
+                "decode" { return lexdb_sql.OID_BYTEA }
                 "now", "current_timestamp", "transaction_timestamp", "statement_timestamp", "clock_timestamp", "to_timestamp" {
                     return lexdb_sql.OID_TSTZ
                 }
@@ -6666,7 +6912,7 @@ fn accumulate(sp: &AggSpec, acc: mut &Acc, env: &Env): Result[Unit, DbErr] {
         return Ok(Unit{})
     }
     let v = try eval(&sp.args[0], env)
-    if isNull(&v) { return Ok(Unit{}) }
+    if isNull(&v) && sp.fname != "array_agg" { return Ok(Unit{}) }      // array_agg keeps NULLs, as elements
     if sp.distinct {
         var kb = newStrBuf()
         encIdxPart(mut &kb, &v)
@@ -6690,6 +6936,15 @@ fn accumulate(sp: &AggSpec, acc: mut &Acc, env: &Env): Result[Unit, DbErr] {
         }
         let prev = match acc.val { Val.Bool(x) { x } else { f != "bool_or" } }
         acc.val = Val.Bool(if f == "bool_or" { prev || b } else { prev && b })
+    } else if f == "array_agg" {
+        // the values, and their ORDER BY keys (parts keeps orderIdx's count)
+        append(mut &acc.seps, v)
+        append(mut &acc.parts, "")
+        if len(sp.order) > 0 {
+            var ks: []Val = []
+            for o in sp.order { append(mut &ks, try eval(&o, env)) }
+            append(mut &acc.ords, ks)
+        }
     } else if f == "string_agg" {
         let sep = try eval(&sp.args[1], env)
         if len(sp.order) > 0 {
@@ -6736,6 +6991,19 @@ fn sqrtNum(v: &Val): Result[Val, DbErr] {
 // string_agg with ORDER BY: its values sorted by their keys (stable: equal
 // keys keep their order), each after its own separator but the first.
 fn orderedParts(sp: &AggSpec, acc: &Acc): Result[str, DbErr] {
+    let idx = try orderIdx(sp, acc)
+    var b = newStrBuf()
+    for j in 0..len(idx) {
+        let i = idx[j]
+        if j > 0 && !isNull(&acc.seps[i]) { b.add(text(&acc.seps[i])) }
+        b.add(acc.parts[i])
+    }
+    return Ok(b.toStr())
+}
+
+// The order of an ordered aggregate's values (string_agg's, array_agg's):
+// by its ORDER BY keys, ties as they came.
+fn orderIdx(sp: &AggSpec, acc: &Acc): Result[[]int, DbErr] {
     var idx: []int = []
     for i in 0..len(acc.parts) { append(mut &idx, i) }
     var bad = false
@@ -6759,14 +7027,8 @@ fn orderedParts(sp: &AggSpec, acc: &Acc): Result[str, DbErr] {
         }
         return a - b
     })
-    if bad { return Err(e("42804", "string_agg: its ORDER BY keys cannot be compared")) }
-    var b = newStrBuf()
-    for j in 0..len(idx) {
-        let i = idx[j]
-        if j > 0 && !isNull(&acc.seps[i]) { b.add(text(&acc.seps[i])) }
-        b.add(acc.parts[i])
-    }
-    return Ok(b.toStr())
+    if bad { return Err(e("42804", sp.fname + ": its ORDER BY keys cannot be compared")) }
+    return Ok(idx)
 }
 
 // An accumulator's result.
@@ -6778,6 +7040,13 @@ fn finish(sp: &AggSpec, acc: &Acc): Result[Val, DbErr] {
     if f == "avg" { return arith(&"/", &(try numOf(&acc.sum, &f)), &Val.Num(Decimal.fromInt(acc.n))) }
     if f == "string_agg" && len(sp.order) > 0 { return Ok(Val.Text(try orderedParts(sp, acc))) }
     if f == "string_agg" { return Ok(Val.Text(strings.join(&acc.parts, ""))) }
+    if f == "array_agg" {
+        // its values in order, as an array's text (9.27)
+        let idx = if len(sp.order) > 0 { try orderIdx(sp, acc) } else { [] }
+        var vals: []Val = []
+        if len(sp.order) > 0 { for i in idx { append(mut &vals, acc.seps[i]) } } else { for v in acc.seps { append(mut &vals, v) } }
+        return Ok(Val.Text(arrayText(&vals)))
+    }
     if f == "min" || f == "max" || f == "bool_and" || f == "bool_or" || f == "every" { return Ok(acc.val) }
     // variance: (n * sum of squares - sum * sum) / (n * (n - 1)), or n * n for the population's
     let pop = f == "var_pop" || f == "stddev_pop"
@@ -8165,7 +8434,7 @@ pub fn paramVals(texts: &[]Option[str], ptypes: &[]int): Result[[]Val, DbErr] {
                     ty = lexdb_sql.TypeName{kind: lexdb_sql.K_BOOL, oid: oid, prec: 0, scale: 0, len: 0}
                 } else if oid == lexdb_sql.OID_NUMERIC {
                     ty = lexdb_sql.TypeName{kind: lexdb_sql.K_NUM, oid: oid, prec: 0, scale: 0, len: 0}
-                } else if lexdb_sql.elemOid(oid) > 0 || lexdb_sql.timeKind(oid) > 0 {
+                } else if lexdb_sql.elemOid(oid) > 0 || lexdb_sql.timeKind(oid) > 0 || oid == lexdb_sql.OID_UUID || oid == lexdb_sql.OID_BYTEA {
                     ty = oidType(oid)
                 }
                 append(mut &out, try coerce(Val.Text(s), &ty))
@@ -11315,7 +11584,7 @@ fn bRowInto(s: &str, r: int, b: mut &Batch, bp: &BPlan, t: &Table): Result[int, 
                     Err(_) { return Err(lexdb_base.corrupt("a numeric value in a row")) }
                 }
             }
-        } else if tag >= 7 && tag <= 11 {
+        } else if tag >= 7 && tag <= 13 {
             b.vals[c][r] = timeVal(s, at, tag)
             at += valSize(s, at, tag)
         } else {

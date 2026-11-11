@@ -23,6 +23,8 @@ pub const K_TIME = 7
 pub const K_TS = 8
 pub const K_TSTZ = 9
 pub const K_IVAL = 10
+pub const K_UUID = 11       // its value Val.Uuid (9.78)
+pub const K_BYTEA = 12      // its value Val.Bytes
 
 // Postgres type OIDs.
 pub const OID_BOOL = 16
@@ -37,11 +39,13 @@ pub const OID_TIME = 1083
 pub const OID_TS = 1114
 pub const OID_TSTZ = 1184
 pub const OID_IVAL = 1186
+pub const OID_UUID = 2950
+pub const OID_BYTEA = 17
 pub const OID_UNKNOWN = 705
 
 // The array types: element OIDs and, at the same places, their arrays'.
-const ELEM_OIDS: []int = [16, 21, 23, 25, 1043, 20, 1700, 1082, 1083, 1114, 1184, 1186]
-const ARRAY_OIDS: []int = [1000, 1005, 1007, 1009, 1015, 1016, 1231, 1182, 1183, 1115, 1185, 1187]
+const ELEM_OIDS: []int = [16, 21, 23, 25, 1043, 20, 1700, 1082, 1083, 1114, 1184, 1186, 2950, 17]
+const ARRAY_OIDS: []int = [1000, 1005, 1007, 1009, 1015, 1016, 1231, 1182, 1183, 1115, 1185, 1187, 2951, 1001]
 
 // The array type of an element type (0: none).
 pub fn arrayOid(elem: int): int {
@@ -74,6 +78,20 @@ pub type Val = value closed {
     Ts(int)                 // a timestamp: microseconds since 2000-01-01 00:00, local
     Tstz(int)               // a timestamptz: microseconds since 2000-01-01 00:00 UTC
     Ival(lexdb_time.Ival)   // an interval
+    Uuid(str)               // a uuid: its 36-character lowercase form (9.78)
+    Bytes(str)              // a bytea: its bytes
+}
+
+// A bytea's text: PostgreSQL's hex form, \x0001ff.
+pub fn bytesHex(b: &str): str {
+    let digits = "0123456789abcdef"
+    var out = newStrBuf()
+    out.add("\\x")
+    for i in 0..len(b) {
+        out.addByte(digits[int(b[i]) >> 4])
+        out.addByte(digits[int(b[i]) & 15])
+    }
+    return out.toStr()
 }
 
 // The kind of a date or time type's OID (K_DATE ...), else 0.
@@ -727,6 +745,8 @@ fn (p: mut &P) typeName(): Result[TypeName, lexdb_base.DbErr] {
         "regclass" { t = TypeName{kind: K_TEXT, oid: OID_TEXT, prec: 0, scale: 0, len: 0} }     // a relation's name, as text
         "varchar" { t = TypeName{kind: K_TEXT, oid: OID_VARCHAR, prec: 0, scale: 0, len: 0} }
         "date" { t = timeType(OID_DATE) }
+        "uuid" { t = TypeName{kind: K_UUID, oid: OID_UUID, prec: 0, scale: 0, len: 0} }
+        "bytea" { t = TypeName{kind: K_BYTEA, oid: OID_BYTEA, prec: 0, scale: 0, len: 0} }
         "time", "timestamp", "timestamptz", "timetz", "interval" {
             var oid = if w == "time" { OID_TIME } else if w == "interval" { OID_IVAL } else if w == "timestamptz" { OID_TSTZ } else if w == "timetz" { 0 } else { OID_TS }
             t = timeType(oid)
@@ -2798,7 +2818,7 @@ pub fn parse(sql: &str): Result[[]Stmt, lexdb_base.DbErr] {
 pub fn typeText(t: &TypeName): str {
     if t.kind == K_ARRAY {
         let e = elemOid(t.oid)
-        let k = if e == OID_BOOL { K_BOOL } else if e == OID_NUMERIC { K_NUM } else if e == OID_INT2 || e == OID_INT4 || e == OID_INT8 { K_INT } else if timeKind(e) > 0 { timeKind(e) } else { K_TEXT }
+        let k = if e == OID_BOOL { K_BOOL } else if e == OID_NUMERIC { K_NUM } else if e == OID_INT2 || e == OID_INT4 || e == OID_INT8 { K_INT } else if timeKind(e) > 0 { timeKind(e) } else if e == OID_UUID { K_UUID } else if e == OID_BYTEA { K_BYTEA } else { K_TEXT }
         return typeText(&TypeName{kind: k, oid: e, prec: 0, scale: 0, len: 0}) + "[]"
     }
     if t.oid == OID_INT2 { return "smallint" }
@@ -2815,6 +2835,8 @@ pub fn typeText(t: &TypeName): str {
     }
     let p = if t.prec == 1 { "(" + t.scale.toStr() + ")" } else { "" }
     if t.oid == OID_DATE { return "date" }
+    if t.oid == OID_UUID { return "uuid" }
+    if t.oid == OID_BYTEA { return "bytea" }
     if t.oid == OID_TIME { return "time" + p + " without time zone" }
     if t.oid == OID_TS { return "timestamp" + p + " without time zone" }
     if t.oid == OID_TSTZ { return "timestamp" + p + " with time zone" }
@@ -2842,6 +2864,8 @@ pub fn exprText(x: &Expr): str {
                 Val.Ts(u) { return "'" + lexdb_time.fmtTs(u) + "'::timestamp" }
                 Val.Tstz(u) { return "'" + lexdb_time.fmtTstz(u) + "'::timestamptz" }
                 Val.Ival(iv) { return "'" + lexdb_time.fmtIval(&iv) + "'::interval" }
+                Val.Uuid(u) { return "'" + u + "'::uuid" }
+                Val.Bytes(b) { return "'" + bytesHex(&b) + "'::bytea" }
             }
         }
         Expr.Param(n) { return "$" + n.toStr() }

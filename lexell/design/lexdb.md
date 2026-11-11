@@ -5864,3 +5864,43 @@ Run: `exec_upsert`, `exec_time`, and the INSERT tests one by one
 `exec_fkaction`, `exec_insertsel`, `exec_copy`, `exec_default`,
 `exec_seq`, `exec_seqcrash`, `exec_check`); not the whole suite, at the
 user's asking, while another session benchmarks.
+
+### 9.78 array_agg, uuid and bytea
+
+- **`array_agg(x [ORDER BY ...]) [FILTER (WHERE ...)]`,** with DISTINCT.
+  - It keeps NULLs as elements (the other aggregates skip them), and gives
+    NULL for no rows.
+  - Its type is the array of x's type: an array of dates is `date[]`.
+  - Its ORDER BY shares `string_agg`'s sort (`orderIdx`).
+- **`uuid`** (`Val.Uuid`, OID 2950).
+  - It is read in all of PostgreSQL's forms: upper case, braces, no
+    hyphens, or a hyphen after any group of four digits.
+  - It is shown, compared and keyed as its 36-character lowercase form,
+    which sorts as its bytes do, and stored in a row as 16 bytes (tag 12).
+  - `gen_random_uuid()` is version 4, from the kernel's random bytes
+    (`getrandom`), not `lib/uuid`'s OpenSSL: lexdb links no OpenSSL yet.
+- **`bytea`** (`Val.Bytes`, OID 17).
+  - It is read in hex (`\x0001ff`, pairs perhaps spaced) or the escape form
+    (`\\`, `\nnn`), and shown in hex.
+  - `encode` and `decode` take hex, base64 (76 characters a line) and
+    escape; with `||`, `length`, and `octet_length` (a text's in bytes).
+  - It is compared and keyed as its bytes, and stored with its length (tag
+    13).
+- **The kinds** join the dates' row tags (`valSize` and `timeVal` read tags 7 to
+  13), the row decoder and the batch decoder.
+
+**Tests.** `exec_types`, 40 queries generated from PostgreSQL 18 by
+`gen_pg.py types`:
+- `array_agg`'s cases;
+- uuid's forms and four malformed ones, a uuid key's order and lookups,
+  its duplicate, its text;
+- gen_random_uuid's version and variant digits, and two calls differing;
+- bytea's forms and three malformed ones, encode and decode both ways and
+  an unknown format, `||` and the lengths, a bytea key's order and
+  lookups.
+
+`gen_pg.py` dropped empty lines from psql's output, so a row of one empty
+text vanished. It now drops only the last newline; `exec_time` and
+`exec_upsert` came out the same. Run one by one, besides `exec_types`:
+`exec_time`, `exec_upsert`, `exec_aggorder`, `exec_agg`, `exec_srf`,
+`exec_hashagg`, `exec_any`.
