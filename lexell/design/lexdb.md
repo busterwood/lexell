@@ -4904,3 +4904,35 @@ answered). The C backend's runtime stays with epoll.
 through the ring. The benchmark scripts' `epoll` mode sets `LXL_URING=0`.
 
 Left of the plan: step 4, socket writes through the ring.
+
+### 9.66 Socket writes through the ring: measured, not kept
+
+Step 4 of 9.58's plan. A send through the ring saves a system call only
+if the task does not wait for it: the reply's bytes copied, a SEND queued
+(MSG_WAITALL), the write returned at once, and the SEND submitted with
+the next receive in the loop's next `io_uring_enter`. A prototype did
+that for writes up to 64 KiB, one SEND in flight a socket (a second
+write waited for the first), errors kept for the socket's next write.
+Warm selects (`pgsel.sh`, 5 s, two rounds, the ring and 9.64's polling):
+
+| | sendto | queued SEND |
+|---|---|---|
+| one client, Unix / TCP | 94,500 / 71,200/s | 93,800 / 70,400/s |
+| 8 clients, Unix | 170,300/s, 5.87 us | 172,800/s, 5.77 us |
+| 32 clients, Unix | 167,100/s, 5.96 us | 171,200/s, 5.83 us |
+| 32 clients, TCP | 120,000/s, 6.93 us | 123,900/s, 6.79 us |
+
+2 to 3% with many clients, a little worse with one. Most of `sendto`'s
+cost (10% of the loop thread, 9.62) is the socket's work, copying into
+the peer's buffer and waking it, which the ring does on the same thread
+when it submits; only the system call's entry and exit go. A real
+version needs per-socket ordering of queued sends, a cap on queued bytes
+(backpressure when the peer does not read), errors reported later, the
+queue drained at exit and across `task.workers`' fork, write deadlines
+(`writeFor`, `writeStalled`), and a completion that cannot be confused
+with a later socket on the same descriptor. That is not worth 2 to 3%.
+Not kept; writes stay `sendto`.
+
+That ends 9.58's plan: the ring is the default (9.65), with file I/O
+through it (9.58), commits keeping up (9.60), reads off the loop when it
+is busy (9.62), checkpoints in runs (9.63) and adaptive polling (9.64).
