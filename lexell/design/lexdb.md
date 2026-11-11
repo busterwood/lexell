@@ -4821,5 +4821,12 @@ read) of lexdb's own page arrays would save the copy into an aligned C
 buffer, but O_DIRECT here needs 4 KiB-aligned memory (dm-crypt's
 `dma_alignment` is 4095; btrfs reports no STATX_DIOALIGN), and arrays
 are not page-aligned. With aligned page arrays from the runtime it could
-be done; for reads it would save `malloc`, `memcpy` and `free`, about 3
-to 4% of the loop thread on cache-missing selects (9.62).
+be done, but it is not worth it: by the profile's call stacks (9.62) the
+read path's own buffer and copies cost under 1% of the loop thread
+(`File.read`'s aligned buffer 0.40%, `Store.load`'s copies 0.23%, the
+body string's allocation 0.20%); the rest of `malloc`, `memcpy` and
+`free` (4.6% together) is the SQL engine's. And a cached node cannot
+keep its page without a copy: a string's bytes follow its reference
+count in one block, so a page's bytes cannot start 4 KiB-aligned with
+the count before them unless each page wastes most of another 4 KiB, or
+strings change representation.
