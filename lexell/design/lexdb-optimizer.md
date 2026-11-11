@@ -1203,6 +1203,52 @@ makes every test recompile and many hit the compile timeout).
 - A renamed table's statistics are lost (they are keyed by name); a new index
   has none until the next ANALYZE.
 
+## 21. Second review and fixes (2026-11-11, after commit 5a6dae89)
+
+A Fable review of the commit found five bugs; all are fixed, uncommitted. The
+full lexdb suite passes, 72 of 72 (four parallel jobs; a first run while
+another session loaded the machine had 13 compile timeouts and nothing else).
+
+Testing found one more change needed: a standalone EXPLAIN ran on a live
+transaction, whose reads are noted, while the SELECT it explains runs on a
+snapshot. With the new guard, EXPLAIN ANALYZE never showed the switch the
+SELECT makes. EXPLAIN now runs on a snapshot as SELECT does (it writes
+nothing, and EXPLAIN ANALYZE runs only a SELECT).
+
+1. **A cached plan could be reused for another schema.** A version bumped in a
+   block that rolled back could equal a version another session committed
+   later, and a prepared plan kept under it was reused (the review saw a wrong
+   count after a DROP INDEX). Versions are now unique in the process
+   (`nextVersion`: the count, a bump counter and the clock). The mechanism
+   predated this branch.
+2. **LIMIT and EXISTS paid for the count.** `Level.stops` keeps the switch off
+   when the first table's reading may stop early: a LIMIT without a sort or
+   grouping, EXISTS, a scalar subquery without aggregates.
+3. **ANALYZE made read-write blocks fail.** It bumped the catalog's version,
+   which every SELECT reads. It now bumps a version of its own
+   (`\x02stats`), and both that version and the statistics rows are read
+   without noting (`Store.getUnnoted`), since they change plans, never
+   results. ANALYZE reads the tables on a snapshot of its own, so its noted
+   reads are only the catalog's, and it no longer retries against concurrent
+   writes.
+4. **The write guard missed autocommit INSERT ... SELECT.** The guard now asks
+   the store whether the transaction's reads are noted (`Txn.noting()`).
+5. **RESET ALL in a block left the block on the rules.** Fixed.
+
+Smaller fixes: ANALYZE stops counting distinct values per prefix at 100,000
+(memory bounded; the estimate is then an upper bound) and honours
+`statement_timeout`; statistics rows are deleted with their table and moved on
+RENAME and SET SCHEMA; statistics are read only for tables with two indexes or
+more, so other plans pay nothing for them.
+
+Not fixed: a candidate without statistics listed first still blocks the
+tie-break; the primary key has no estimate; on a replica the table is counted
+entry by entry. The plan cache does not yet keep several plans (the reviewer's
+step 2 before stat4).
+
+New test cases (passing): exec_switch: a LIMIT, an EXISTS, an INSERT ... SELECT;
+exec_analyze: RESET ALL in a block, a renamed table, an ANALYZE rolled back.
+
 ## Sources
 
 - SQLite, Query Planner Next Generation: https://sqlite.org/queryplanner-ng.html
