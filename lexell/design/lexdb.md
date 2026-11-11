@@ -4830,3 +4830,52 @@ keep its page without a copy: a string's bytes follow its reference
 count in one block, so a page's bytes cannot start 4 KiB-aligned with
 the count before them unless each page wastes most of another 4 KiB, or
 strings change representation.
+
+### 9.64 Adaptive polling before sleeping, by default
+
+9.60 left one client over a Unix socket 7% slower through the ring than
+with epoll (the wakeup's 2 us), and a fixed 20 us of polling before
+sleeping closing it, and more, for about 25% more CPU a select. A fixed
+window is wrong when requests come further apart: the loop looks for
+nothing, then sleeps anyway.
+
+**First try: grow and shrink** (KVM's halt polling): after a sleep, the
+window doubles (from 10 us, to at most 50) when the next event came
+within the maximum, and halves (to 0 below 10 us) when it did not. Busy
+clients kept the gain, but paced ones (`pgbench -R`, one client, Unix,
+6 s) still paid for it, since pgbench's gaps are exponential and a share
+of them is always short:
+
+| One paced client, server CPU a select | no polling | fixed 20 us | grow and shrink |
+|---|---|---|---|
+| 20,000/s (gaps of 50 us on average) | 8.8 us | 17.8 us | 12.6 us |
+| 5,000/s (200 us) | 11.6 us | 26.5 us | 14.3 us |
+| 1,000/s (1 ms) | 28.5 us | 43.7 us | 33.4 us |
+
+Latency did not improve with any of them (0.054 to 0.056 ms at
+20,000/s): a paced client sends on its schedule, not on the reply.
+
+**Kept: the window that catches most gaps.** The loop remembers its last
+32 idle gaps (from finding nothing to run to the event that ended it,
+whether found by polling or after sleeping), and polls for the least
+multiple of 10 us, up to 50, that would have caught 80% of them; when
+none would, it does not poll. A client waiting on its reply (gaps of
+about 15 us, every time) gets a window of 20 us; scattered or long gaps
+get none.
+
+| | no polling | fixed 20 us | adaptive |
+|---|---|---|---|
+| paced 20,000/s, CPU a select | 9.20 us | | 9.18 us |
+| paced 5,000/s | 11.31 us | | 11.71 us |
+| paced 1,000/s | 32.21 us | | 29.30 us |
+| warm, one client, Unix (ring) | 79,300/s, 8.7 us | 95,500/s, 10.4 us | 94,300/s, 10.6 us |
+| warm, one client, TCP (ring) | 62,600/s, 9.4 us | 72,200/s, 12.4 us | 71,800/s, 12.5 us |
+| warm, one client, Unix (epoll) | 85,200/s, 8.5 us | | 94,000/s, 10.6 us |
+| warm, 8 and 32 clients | | | unchanged (the loop never idles) |
+| `LEXDB_CACHE_MB=64`, one client (ring) | 29,900/s, 13.1 us | | 30,700/s, 14.6 us |
+| updates, 1 to 32 clients (ring) | | | unchanged (gaps are flushes, ~600 us) |
+
+With it, one client is faster through the ring than with epoll without
+it, in both transports. It is now the runtime's default (native backend,
+both modes): `LXL_SPIN_US=N` polls a fixed N us, `0` never, `aN` adapts
+up to N us.

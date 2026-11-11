@@ -2061,18 +2061,43 @@ static void rt_ur_interest(int64_t fd, uint32_t extra) {
     SYS4(S_EPOLL_CTL, rt_epfd, 3, fd, &ev);                        /* EPOLL_CTL_MOD */
 }
 
-/* Polling before sleeping (LXL_SPIN_US, design/lexdb.md 9.57): when the loop would block with
-   tasks waiting for sockets, it first looks without waiting for up to that long (never past the
-   nearest timer). A client's next request then finds the loop awake, which saves the wakeup of
-   this thread (an interrupt from the CPU the request arrived on; costly in a virtual machine) at
-   the price of the CPU time spent looking. */
+/* Polling before sleeping (design/lexdb.md 9.57, 9.64): when the loop would block with tasks
+   waiting for I/O, it first looks without waiting (never past the nearest timer). A client's next
+   request then finds the loop awake, which saves the wakeup of this thread (some microseconds of
+   latency; an interrupt from the CPU the request arrived on) at the price of the CPU time spent
+   looking. By default the window adapts (rt_spin_note), up to 50 us; LXL_SPIN_US=N polls N us
+   every time, LXL_SPIN_US=0 never, LXL_SPIN_US=aN adapts up to N us. */
 static int64_t rt_spin_ns = -1;
+static bool rt_spin_adapt;                 /* the window adapts, up to rt_spin_ns */
+static int64_t rt_spin_cur;                /* the adaptive window now */
+#define RT_SPIN_STEP 10000                 /* windows are multiples of 10 us */
+#define RT_SPIN_N 32                       /* idle gaps remembered */
+static int64_t rt_spin_gaps[RT_SPIN_N];
+static int rt_spin_ngap;
+/* An idle gap (the loop found nothing to run until an event came, took ns later) is noted; the
+   window becomes the least multiple of RT_SPIN_STEP, up to the maximum, that would have caught
+   80% of the last RT_SPIN_N gaps, else 0: polling pays when the next event nearly always comes
+   within it (a client waiting on the reply), not when gaps are long or scattered. */
+static void rt_spin_note(int64_t took) {
+    rt_spin_gaps[rt_spin_ngap++ % RT_SPIN_N] = took;
+    int n = rt_spin_ngap < RT_SPIN_N ? rt_spin_ngap : RT_SPIN_N;
+    rt_spin_cur = 0;
+    if (n < RT_SPIN_N / 2) return;
+    for (int64_t w = RT_SPIN_STEP; w <= rt_spin_ns; w += RT_SPIN_STEP) {
+        int in = 0;
+        for (int i = 0; i < n; i++) in += rt_spin_gaps[i] <= w;
+        if (in * 5 >= n * 4) { rt_spin_cur = w; return; }
+    }
+}
 static void rt_poll(bool block, const char* w) {
     struct k_epoll_event ev[256];
     bool spun = false;
+    int64_t idle_from = 0;                 /* adaptive: when the loop found nothing to run */
     if (rt_spin_ns < 0) {
         const char* v = getenv("LXL_SPIN_US");
         int64_t us = 0;
+        if (!v) { v = "50"; rt_spin_adapt = true; }
+        else if (*v == 'a') { rt_spin_adapt = true; v++; }
         if (v) for (; *v >= '0' && *v <= '9'; v++) us = us * 10 + (*v - '0');
         rt_spin_ns = us > 1000000 ? 1000000000 : us * 1000;
     }
@@ -2092,11 +2117,17 @@ static void rt_poll(bool block, const char* w) {
         if (wait < 0 && !rt_nio && !rt_njobs) rt_trap(14, "deadlock: every task is parked", w);
         if (wait != 0 && rt_nio && rt_spin_ns && !spun) {
             spun = true;
-            int64_t now = rt_mono(), end = now + (wait > 0 && wait < rt_spin_ns ? wait : rt_spin_ns);
-            do {
-                if (rt_ring >= 0) { rt_ur_submit(0, 0); rt_ur_reap(ev, 256); }
-                else rt_epoll_events(ev, SYS4(S_EPOLL_WAIT, rt_epfd, ev, 256, 0));
-            } while (!rt_rq_head && rt_mono() < end);
+            int64_t win = rt_spin_adapt ? rt_spin_cur : rt_spin_ns;
+            int64_t now = rt_mono();
+            if (rt_spin_adapt) idle_from = now;
+            if (win) {
+                int64_t end = now + (wait > 0 && wait < win ? wait : win);
+                do {
+                    if (rt_ring >= 0) { rt_ur_submit(0, 0); rt_ur_reap(ev, 256); }
+                    else rt_epoll_events(ev, SYS4(S_EPOLL_WAIT, rt_epfd, ev, 256, 0));
+                } while (!rt_rq_head && rt_mono() < end);
+                if (rt_rq_head && idle_from) { rt_spin_note(rt_mono() - idle_from); idle_from = 0; }
+            }
             continue;                       /* timers again; then sleep if still nothing */
         }
         if (rt_nio || rt_njobs) {
@@ -2117,6 +2148,10 @@ static void rt_poll(bool block, const char* w) {
         } else if (wait > 0) {
             struct { i64 s, ns; } d = {wait / 1000000000, wait % 1000000000};
             SYS(S_NANOSLEEP, &d, 0, 0);
+        }
+        if (idle_from && rt_rq_head) {      /* slept: how long the next event took */
+            rt_spin_note(rt_mono() - idle_from);
+            idle_from = 0;
         }
         if (!block || rt_rq_head) return;
     }
