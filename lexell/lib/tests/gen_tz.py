@@ -108,6 +108,12 @@ def transitions(zone, years):
     return out
 
 
+# Zones that distributions build differently: EST5EDT is a link to America/New_York in some
+# (EWT and EPT in 1942-45) and the old rule-based zone in others (EDT). Their instants are still
+# drawn, so that the other zones' random instants stay as they were.
+UNSTABLE = {'EST5EDT'}
+
+
 def rows():
     """(zone, spec, sec): spec is '' for a zone name, else a POSIX TZ string."""
     rng = random.Random(20261106)
@@ -120,6 +126,8 @@ def rows():
             times.update([t - 1, t])
         for _ in range(40):
             times.add(rng.randrange(lo, hi))
+        if zone in UNSTABLE:
+            continue
         for sec in sorted(times):
             out.append((zone, '', sec))
     for zone in FOOTER_ZONES:

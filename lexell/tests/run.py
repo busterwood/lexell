@@ -28,7 +28,7 @@ def missing_lib(path):
             if m and not any(glob.glob(os.path.join(d, 'lib%s.so*' % m.group(1))) for d in LIBDIRS):
                 return m.group(1)
     return None
-COMPILE_TIMEOUT = 20
+COMPILE_TIMEOUT = 90         # gcc 16 takes ~25 s on a lexdb test (4.5 MB of C) when the cache misses
 RUN_TIMEOUT = 10
 
 

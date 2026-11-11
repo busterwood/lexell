@@ -34,6 +34,26 @@ extern "c" fn openLock(path: str, flags: i32, mode: u32): i32 as "open"
 extern "c" fn flock(fd: i32, op: i32): i32
 extern "c" fn lockErrno(): int as "lxl_errno"
 extern "c" fn lockStrerror(e: i32): str as "strerror"
+extern "c" fn closeDir(fd: i32): i32 as "close"
+extern "c" fn ioctlFlags(fd: i32, req: int, flags: mut &int): i32 as "ioctl"
+
+// Copy-on-write off for the files made in the data directory (design/lexdb.md
+// 9.61): on btrfs an O_DIRECT write to a copy-on-write file must allocate,
+// so io_uring hands every log write to a kernel worker, and a flush costs
+// more. Its checksums are not needed: every page carries a CRC32C. Set on
+// the directory, the flag (FS_NOCOW_FL) is taken by files created in it;
+// a file that already has data keeps copy-on-write. Other file systems
+// refuse the flag, and any failure is ignored: it is an optimisation.
+fn noCow(dir: str) {
+    let fd = openLock(dir, i32(65536 | 524288), u32(0))           // O_RDONLY|O_DIRECTORY|O_CLOEXEC
+    if fd < 0 { return }
+    var fl = 0                                                      // the kernel uses the low 4 bytes
+    if ioctlFlags(fd, 0x80086601, mut &fl) == 0 && (fl & 0x800000) == 0 {     // FS_IOC_GETFLAGS
+        fl = fl | 0x800000                                          // FS_NOCOW_FL
+        ioctlFlags(fd, 0x40086602, mut &fl)                        // FS_IOC_SETFLAGS
+    }
+    closeDir(fd)
+}
 
 fn main() {
     let args = os.arguments()
@@ -53,6 +73,7 @@ fn main() {
             exit(1)
         }
     }
+    noCow(dir)
     // One server per data directory: two writing the same files would
     // corrupt them (a benchmark started a second server while the first
     // still wrote its shutdown checkpoint, 9.58). The lock is held, its

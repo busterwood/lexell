@@ -4704,3 +4704,27 @@ with and without the ring.
 5. Should lexdb set copy-on-write off (`FS_NOCOW_FL`) on its data
    directory when it makes it on btrfs? It gives up btrfs's checksums for
    those files; lexdb's pages carry their own CRC32C.
+
+### 9.61 Copy-on-write off for the data directory; the gate on gcc 16
+
+Decided (the user, 2026-11-11: what lexdb checks itself the file system
+need not check too). At start, after making DATADIR, lexdb sets
+FS_NOCOW_FL on it (`FS_IOC_GETFLAGS`, `FS_IOC_SETFLAGS`), so files
+created in it are written in place: on btrfs an O_DIRECT write then need
+not allocate, io_uring issues it inline, and the flush is cheaper (9.60:
+commits at 32 clients 21,700/s to 26,400 with epoll). btrfs keeps no
+checksums for such files; lexdb's pages carry CRC32C, and its log
+records theirs. A file that already has data keeps copy-on-write (the
+kernel converts only empty files), so an existing directory gains it for
+new log segments only. Other file systems refuse the flag (ext4,
+EOPNOTSUPP; tmpfs, ENOTTY) and every failure is ignored. Checked on
+btrfs with both backends: the directory, `lock`, `data.lxdb` and
+`log.1` all have it.
+
+The gate's failures on this machine are fixed in the tests: `tls_memory`
+compares the first of OpenSSL's reasons (3.6 adds "; record layer
+failure"); `tz_zones` no longer has EST5EDT, which distributions build
+differently (a link to America/New_York, with EWT in 1942-45, or the old
+rule-based zone; `gen_tz.py` still draws its instants, so the other
+zones' stay as they were); and the conformance runner allows 90 s to
+compile (gcc 16 takes about 25 s for a lexdb test).
