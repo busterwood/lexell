@@ -5682,8 +5682,22 @@ node-postgres and psycopg (text format) worked wherever the SQL did.
    decided; the probes decide it.
 4. **Authentication and TLS:** SCRAM-SHA-256 (and password), TLS through
    `lib/tls`, as 4.7 planned. Until then lexdb is for loopback only.
-5. **Binary formats** for the common types: asyncpg needs them, and JDBC
-   and psycopg's binary mode use them.
+5. **Views** (added after 9.81): `CREATE [OR REPLACE] VIEW`, `DROP VIEW`,
+   a view's query inlined where it is named, dependencies (a table a view
+   reads is not dropped without CASCADE), and their catalog rows
+   (`pg_views`, `information_schema.views`, relkind `v`,
+   `pg_get_viewdef`, psql's `\dv` and `\d`). Before privileges, because
+   views are part of PostgreSQL's privilege model: a view is how a role
+   is given some columns or rows of a table, and it reads with its owner's
+   privileges.
+6. **Privileges** (added after 9.81): owners for tables, views, schemas
+   and sequences; GRANT and REVOKE of their privileges (SELECT, INSERT,
+   UPDATE, DELETE, TRUNCATE; a schema's USAGE and CREATE; a sequence's
+   USAGE); role membership (GRANT role TO role); `relacl`,
+   `has_table_privilege` and psql's `\dp` true to them.
+7. **Binary formats** for the common types: asyncpg needs them, and JDBC
+   and psycopg's binary mode use them. Last, as the user decided after
+   9.81.
 
 **The values for the new types.** The executor's values (`Val`) are null,
 int, bool, numeric and text. Arrays were added as text in PostgreSQL's
