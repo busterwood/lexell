@@ -5384,3 +5384,118 @@ segments and the lag. All 64 lexdb tests and the crash test pass.
   flush (with this as catch-up), and hold and the durable batch become
   messages. The executor reads through the follower for read-only
   sessions, and refuses writes with 25006.
+
+### 9.72 The replica process (step 3 of 9.68)
+
+`lexdb --replica DATADIR ADDR...` runs a read-only replica of the master
+that serves `DATADIR`. It is a process of its own, with its own TCP port
+and Unix socket. Clients choose at connection time: the master's address
+for read-write sessions, the replica's for read-only ones. Nothing is
+forwarded between them, and no client socket moves.
+
+**Between the two** (`cmd/lexdb_repl.lxl`): a Unix socket in the data
+directory, `repl.sock`, carries short lines:
+
+| line | direction | meaning |
+|---|---|---|
+| `N` | replica to master | the handshake: hold what I will read |
+| `C ckpt` | master to replica | held from that checkpoint |
+| `D batch ckpt` | master to replica | the log holds batches up to `batch`; the last checkpoint is `ckpt` |
+| `H ckpt seg` | replica to master | `Store.hold` |
+
+- The master sends `D` after each flush and each checkpoint, coalesced,
+  so a replica that is behind gets the newest only. The replica reads the
+  log and the pages itself, and nothing else crosses.
+- The replica reads the meta page only when the checkpoint number has
+  changed. It used to read it on every poll: two page reads per batch.
+- The follower cannot write to the socket from inside its lock, so it
+  leaves its newest hold in an outbox (`Link.Remote`), and a task sends
+  it.
+- At the handshake, a master whose last checkpoint does not record
+  `covers` (a new store, or a file from before 9.71) takes one first.
+  `covers` is now kept as `covers + 1`, so 0 means not known, and a real
+  `covers` of 0 (a new store) is usable.
+- **When the replica goes**, the master releases the hold. **When the
+  master goes**, the replica stops with exit 1. A master that restarts may
+  reuse pages the replica reads, so the replica starts again from scratch.
+- One replica at a time, since the hold is one. A replica started again
+  retries its handshake until the master has seen the old one go.
+
+**The replica's store** (`openReplica`) has the follower in it
+(`Store.fo`). The follower now lives in `lexdb_store`, since Lexell
+modules cannot import each other in a cycle.
+- **Reads:** `get`, `scan` and `scanBack` (a backward scan, new in the
+  follower) are served from a follower snapshot. The transaction takes it
+  at its first read (a snapshot or block, at its start) and keeps it to
+  its end, so a block on the replica reads one state.
+- **Batch scans:** `scanLeaves` answers "not in place", and the executor
+  uses its row path.
+- **Writes:** the executor refuses writing statements before running
+  them, as a PostgreSQL standby does: SQLSTATE 25006, "cannot execute
+  INSERT in a read-only transaction". COPY TO and EXPLAIN without ANALYZE
+  are allowed. A write that gets past that, such as `nextval`'s, fails at
+  commit.
+- **Catalog changes** the replica applies are counted for the plan cache
+  (`watch`).
+- **A snapshot ends when its transaction is dropped.** The SQL layer drops
+  some transactions without ending them: a prepared statement's Describe
+  reads the catalog in one. That is harmless on the master, whose plain
+  transactions pin nothing. On a replica, pgbench's prepared selects left
+  two snapshots per connection, pinning the first checkpoint for good. In
+  15 s of updates that held 3 checkpoints and 268,777 delta keys, and kept
+  the master's pages and log segments; the replica's memory went from
+  95 MB to 270 MB. The transaction now holds its snapshot as a `RepPin`
+  whose `drop` ends it.
+
+**Measured** (the 9.67 data; master and replica on one machine, each
+with its own port; pgbench prepared, 8 s; CPU from `/proc`):
+
+| load | master | replica |
+|---|---|---|
+| point selects, 8 clients, on the master only | 169,900/s | |
+| the same, on the replica only | | 167,400/s |
+| both at once, 8 clients each | 163,800/s | 162,900/s |
+| updates, 32 clients, on the master | 22,400/s, 4.32 s CPU | applies them: 0.58 s CPU |
+| updates on the master, selects on the replica | 21,900/s | 142,900/s |
+| updates and selects both on the master | 20,800/s, selects 101,000/s | |
+
+- **Selects:** two processes serve 1.92 times what one does.
+- **Selects beside writes:** on the replica they do not slow the master's
+  commits, and the replica serves 41% more of them than the master did
+  beside its own commits.
+- **Applying the master's writes** costs the replica about 2.6 us of CPU
+  each, 7% of a core at 22,000 a second.
+- **Memory** (RSS, LEXDB_PAGES direct, all data cached): 40 MB and 39 MB
+  warm. Under updates the master reaches 96 MB and the replica 61 to
+  67 MB: one checkpoint's delta, and a 31 MB page cache with 11,892 pages
+  evicted as freed in 15 s.
+
+**Tests:**
+- `exec_replica` runs SQL on a master and a replica store in one process:
+  - twelve queries give the same rows on both;
+  - later commits show after a poll, and a block keeps its snapshot;
+  - a column added and an index created on the master show on the
+    replica, its plans made again;
+  - six kinds of write are refused with 25006, and the session goes on;
+  - the page file audits clean.
+- `follow_basic` checks backward scans of random ranges against the
+  master's, and three more bugs put back are caught (a backward scan's
+  deletes, its descent, its stop).
+- `tests/lexdb/replica.py` runs the two processes through psql:
+  - rounds of writes on the master, after each of which the replica must
+    give the master's answers;
+  - the replica refuses a write every round;
+  - every third round it is killed with SIGKILL during the writes and
+    started again;
+  - the master is killed with SIGKILL halfway: the replica must stop
+    (exit 1), and both start again;
+  - the master stops with SIGTERM at the end, and the replica with it.
+
+  Four runs passed (12 and 3 × 20 rounds). It needs psql, and skips (77)
+  without it.
+
+**Next:**
+- a replica that outlives a master restart, if wanted: it would start
+  again from the new checkpoint itself, not exit;
+- more than one replica: a hold per replica;
+- the scans' delta merge (9.71).

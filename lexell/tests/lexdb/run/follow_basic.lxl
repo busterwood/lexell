@@ -1,10 +1,11 @@
-// lexdb_follow: a follower reads the master's checkpoint pages and log, and
+// lexdb_store, the follower: a follower reads the master's checkpoint pages and log, and
 // as of a batch sees exactly what a master snapshot saw at that batch.
 // 80 rounds of random commits (several at once, so batches hold more than
 // one): puts and deletes, values that start with the escape byte, large
 // values (chunks in the companion tree), trees created and dropped,
 // checkpoints every few rounds and on their own as the log grows. Each
-// round records every tree as a master snapshot sees it, and some keys'
+// round records every tree as a master snapshot sees it, a random range of
+// it backward, and some keys'
 // values; the follower runs a round behind (twelve, for twenty rounds: it
 // falls behind across checkpoints and log segments, then catches up): it
 // applies the batches up to a recorded round's durable one (a checkpoint
@@ -29,7 +30,6 @@ import "strings"
 import "../../../cmd/lexdb_base"
 import "../../../cmd/lexdb_store"
 import "../../../cmd/lexdb_disk"
-import "../../../cmd/lexdb_follow"
 
 fn key(i: int): str { return "k" + strings.padLeft(i.toStr(), 5, '0') }
 
@@ -52,7 +52,28 @@ fn dumpMaster(st: &lexdb_store.Store, t: mut &lexdb_store.Txn, tree: int): str {
     return len(out).toStr() + ":" + strings.join(&out, ",")
 }
 
-fn dumpFollower(fo: &lexdb_follow.Follower, s: &lexdb_follow.FSnap, tree: int): str {
+// tree's entries in [from, to) from the last down, as a master snapshot sees them
+fn backMaster(st: &lexdb_store.Store, t: mut &lexdb_store.Txn, tree: int, from: str, to: str): str {
+    var out: []str = []
+    let r = st.scanBack(t, tree, from, to, fn(e: &lexdb_store.Entry): bool {
+        append(mut &out, e.key + "=" + e.val)
+        return true
+    })
+    if r.isErr() { return "error " + r.unwrapErr().state + " " + r.unwrapErr().msg }
+    return len(out).toStr() + ":" + strings.join(&out, ",")
+}
+
+fn backFollower(fo: &lexdb_store.Follower, s: &lexdb_store.FSnap, tree: int, from: &str, to: &str): str {
+    var out: []str = []
+    let r = fo.scanBack(s, tree, from, to, fn(e: &lexdb_store.Entry): bool {
+        append(mut &out, e.key + "=" + e.val)
+        return true
+    })
+    if r.isErr() { return "error " + r.unwrapErr().state + " " + r.unwrapErr().msg }
+    return len(out).toStr() + ":" + strings.join(&out, ",")
+}
+
+fn dumpFollower(fo: &lexdb_store.Follower, s: &lexdb_store.FSnap, tree: int): str {
     var out: []str = []
     let r = fo.scan(s, tree, &"", &"", fn(e: &lexdb_store.Entry): bool {
         append(mut &out, e.key + "=" + e.val)
@@ -113,10 +134,10 @@ fn has(xs: &[]int, x: int): bool {
 
 fn cut(s: &str, n: int): str { return if len(s) > n { s[0..n] + "..." } else { lexdb_base.own(s) } }
 
-type Kept = record { snap: lexdb_follow.FSnap; dumps: []str; trees: []int; until: int }
+type Kept = record { snap: lexdb_store.FSnap; dumps: []str; trees: []int; until: int }
 
 // A round's record: the master's view at its durable batch.
-type Rec = record { batch: int; trees: []int; dumps: []str; ptree: []int; pkey: []str; pval: []str }
+type Rec = record { batch: int; trees: []int; dumps: []str; backs: []str; bfrom: []str; bto: []str; ptree: []int; pkey: []str; pval: []str }
 
 fn phase(seed: int, followerCache: int): []str {
     let fs = lexdb_disk.sim(seed)
@@ -131,7 +152,7 @@ fn phase(seed: int, followerCache: int): []str {
         for i in 0..3000 { t.put(known[i % 3], key(i), "init" + i.toStr()).unwrap() }
         st.commit(t).unwrap()
         st.checkpoint().unwrap()
-        let fo = lexdb_follow.open(st, fs, followerCache).unwrap()
+        let fo = lexdb_store.openFollower(lexdb_store.Link.Local(st), fs, followerCache).unwrap()
         var r = lexdb_base.rng(seed + 5)
         let made = task.shared[[]int]([])
         var compared = 0
@@ -159,9 +180,15 @@ fn phase(seed: int, followerCache: int): []str {
             made.with(fn(m: mut &[]int) { while len(m) > 0 { append(mut &known, pop(m)) } })
             // this round's record
             var ms = st.beginSnapshot().unwrap()
-            var rec = Rec{batch: st.durableBatch(), trees: copyInts(&known), dumps: [], ptree: [], pkey: [], pval: []}
+            var rec = Rec{batch: st.durableBatch(), trees: copyInts(&known), dumps: [], backs: [], bfrom: [], bto: [], ptree: [], pkey: [], pval: []}
             for tr in known {
                 append(mut &rec.dumps, dumpMaster(&st, mut &ms, tr))
+                // a range backward ("" ends: from the start, to the end)
+                let bf = if r.below(3) == 0 { "" } else { key(r.below(3000)) }
+                let bt = if r.below(3) == 0 { "" } else { key(r.below(3000)) }
+                append(mut &rec.backs, backMaster(&st, mut &ms, tr, bf, bt))
+                append(mut &rec.bfrom, bf)
+                append(mut &rec.bto, bt)
                 for _ in 0..20 {
                     let ky = key(r.below(3000))
                     let ma = st.get(mut &ms, tr, ky)
@@ -191,6 +218,11 @@ fn phase(seed: int, followerCache: int): []str {
                         if len(lines) < 5 { append(mut &lines, tag + "round " + round.toStr() + " tree " + p.trees[i].toStr() + ": master " + cut(&p.dumps[i], 200) + " follower " + cut(&b, 200)) }
                     }
                     append(mut &dumps, b)
+                    let bk = backFollower(&fo, &fsnap, p.trees[i], &p.bfrom[i], &p.bto[i])
+                    if bk != p.backs[i] {
+                        allSame = false
+                        if len(lines) < 5 { append(mut &lines, tag + "round " + round.toStr() + " tree " + p.trees[i].toStr() + " backward [" + p.bfrom[i] + ", " + p.bto[i] + "): master " + cut(&p.backs[i], 200) + " follower " + cut(&bk, 200)) }
+                    }
                 }
                 for i in 0..len(p.pkey) {
                     let fa = fo.get(&fsnap, p.ptree[i], &p.pkey[i])

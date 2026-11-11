@@ -29,6 +29,7 @@ import "./lexdb_disk"
 import "./lexdb_store"
 import "./lexdb_exec"
 import "./lexdb_wire"
+import "./lexdb_repl"
 
 extern "c" fn openLock(path: str, flags: i32, mode: u32): i32 as "open"
 extern "c" fn flock(fd: i32, op: i32): i32
@@ -57,15 +58,23 @@ fn noCow(dir: str) {
 
 fn main() {
     let args = os.arguments()
-    if len(args) < 1 {
-        eprintln("usage: lexdb DATADIR [ADDR ...]")
+    // --replica: a read-only replica of the master serving DATADIR, in a
+    // process of its own on the same machine (design/lexdb.md 9.72)
+    let replica = len(args) > 0 && args[0] == "--replica"
+    let a0 = if replica { 1 } else { 0 }
+    if len(args) < a0 + 1 {
+        eprintln("usage: lexdb [--replica] DATADIR [ADDR ...]")
         exit(2)
     }
-    let dir = args[0]
+    let dir = args[a0]
     var addrs: []str = []
-    for i in 1..len(args) { append(mut &addrs, args[i]) }
+    for i in a0 + 1..len(args) { append(mut &addrs, args[i]) }
     if len(addrs) == 0 { append(mut &addrs, "127.0.0.1:5433") }
     if os.env("LXL_HELPERS").isNone() { os.setEnv("LXL_HELPERS", "32") }   // reads in flight (section 3)
+    if replica {
+        runReplica(dir, &addrs, opts0())
+        return
+    }
     match fs.mkdirAll(dir) {
         Ok(_) {}
         Err(e) {
@@ -98,35 +107,7 @@ fn main() {
     // without it a quarter of the memory, 128 MB at least (9.54): the data
     // file is read past the kernel's cache (O_DIRECT), so this cache is all
     // there is
-    var opts = lexdb_store.defaults()
-    opts.cacheBytes = max(opts.cacheBytes, memBytes() / 4)
-    match os.env("LEXDB_CACHE_MB") {
-        Some(v) {
-            match strings.parseIntOpt(v) {
-                Some(mb) { if mb > 0 { opts.cacheBytes = mb * 1024 * 1024 } }
-                None {
-                    eprintln("lexdb: LEXDB_CACHE_MB: not a number: " + v)
-                    exit(2)
-                }
-            }
-        }
-        None {}
-    }
-    // LEXDB_SEG_KB, LEXDB_CKPT_KB: a log segment's size and the log bytes
-    // between checkpoints (small for the crash test: tests/lexdb/crash.py)
-    opts.segBytes = envKb("LEXDB_SEG_KB", opts.segBytes)
-    opts.ckptBytes = envKb("LEXDB_CKPT_KB", opts.ckptBytes)
-    // LEXDB_PAGES=buffered: the page file through the kernel's page cache
-    // (design/lexdb.md 9.69); direct (O_DIRECT) by default
-    match os.env("LEXDB_PAGES") {
-        Some(v) {
-            if v == "buffered" { opts.bufferedPages = true } else if v != "direct" {
-                eprintln("lexdb: LEXDB_PAGES: buffered or direct, not " + v)
-                exit(2)
-            }
-        }
-        None {}
-    }
+    let opts = opts0()
     let opened = lexdb_store.open(lexdb_disk.real(dir), opts)
     if opened.isErr() {
         eprintln("lexdb: open " + dir + ": " + opened.unwrapErr().toStr())
@@ -146,6 +127,8 @@ fn main() {
                 return
             }
         }
+        // replicas (--replica) connect here
+        let repl = s.start(lexdb_repl.serve, lexdb_repl.Serve{st: st, dir: dir})
         var files: []str = []                       // the Unix sockets made: removed at the end
         match lexdb_wire.listenAll(&addrs, mut &files) {
             Ok(lns) {
@@ -163,6 +146,7 @@ fn main() {
                 code = 1
             }
         }
+        { let stop = repl }                         // replicas see the link end
         for p in files { let gone = fs.remove(p) }
         let ck = st.checkpointAll()
         let x = st.stats()
@@ -213,3 +197,108 @@ fn envKb(name: str, d: int): int {
     return d
 }
 
+// The store's options: the defaults, and the environment's.
+fn opts0(): lexdb_store.Options {
+    var opts = lexdb_store.defaults()
+    opts.cacheBytes = max(opts.cacheBytes, memBytes() / 4)
+    match os.env("LEXDB_CACHE_MB") {
+        Some(v) {
+            match strings.parseIntOpt(v) {
+                Some(mb) { if mb > 0 { opts.cacheBytes = mb * 1024 * 1024 } }
+                None {
+                    eprintln("lexdb: LEXDB_CACHE_MB: not a number: " + v)
+                    exit(2)
+                }
+            }
+        }
+        None {}
+    }
+    // LEXDB_SEG_KB, LEXDB_CKPT_KB: a log segment's size and the log bytes
+    // between checkpoints (small for the crash test: tests/lexdb/crash.py)
+    opts.segBytes = envKb("LEXDB_SEG_KB", opts.segBytes)
+    opts.ckptBytes = envKb("LEXDB_CKPT_KB", opts.ckptBytes)
+    // LEXDB_PAGES=buffered: the page file through the kernel's page cache
+    // (design/lexdb.md 9.69); direct (O_DIRECT) by default
+    match os.env("LEXDB_PAGES") {
+        Some(v) {
+            if v == "buffered" { opts.bufferedPages = true } else if v != "direct" {
+                eprintln("lexdb: LEXDB_PAGES: buffered or direct, not " + v)
+                exit(2)
+            }
+        }
+        None {}
+    }
+    return opts
+}
+
+// A read-only replica (--replica): follows the master of dir over its
+// replication socket and serves addrs with the same SQL, refusing writes
+// (25006). It stops when the master does (exit 1) or on SIGTERM/SIGINT.
+fn runReplica(dir: str, addrs: &[]str, opts: lexdb_store.Options) {
+    task.watchSignals(&[task.SIGTERM, task.SIGINT])
+    let conn = lexdb_repl.connect(dir, opts, 10000)
+    if conn.isErr() {
+        eprintln("lexdb: replica of " + dir + ": " + conn.unwrapErr().toStr())
+        exit(1)
+    }
+    var rps = [conn.unwrap()]
+    let st = rps[0].st
+    var code = 0
+    task.scope(fn(s: mut &task.Scope) {
+        let task.Handoff{promise: p, future: ready} = task.promise[Unit]()
+        let fol = s.start(lexdb_repl.follow, lexdb_repl.Follow{rp: pop(mut &rps), ready: p})
+        if ready.wait().isErr() {
+            eprintln("lexdb: replica: the link to the master ended before the replica was ready")
+            code = 1
+            return
+        }
+        match lexdb_exec.bootstrap(&st) {
+            Ok(_) {}
+            Err(e) {
+                eprintln("lexdb: replica: " + e.toStr())
+                code = 1
+                return
+            }
+        }
+        var files: []str = []
+        match lexdb_wire.listenAll(addrs, mut &files) {
+            Ok(lns) {
+                var names: []str = []
+                for ln in lns { append(mut &names, ln.localAddr()) }
+                println("lexdb: replica listening on " + strings.join(&names, ", ") + ", following the master of " + dir)
+                let fl = io.flushStdout()
+                let acc = s.start(lexdb_wire.acceptAll, lexdb_wire.ListenArg{lns: lns, st: st})
+                let sig = s.start(waitStop, 0)
+                match task.any([fol, sig]) {
+                    Ok(which) {
+                        if which != 2 {                     // follow ended: the master went
+                            eprintln("lexdb: replica: the link to the master ended")
+                            code = 1
+                        }
+                    }
+                    Err(_) {}
+                }
+                { let stop = acc }
+                println("lexdb: replica stopping")
+                let fs0 = st.follower().unwrap().stats()
+                println("lexdb: replica applied batch " + fs0.applied.toStr() + ", checkpoint " + fs0.ckpt.toStr() + " (" +
+                        fs0.bases.toStr() + " held), " + fs0.deltaKeys.toStr() + " keys in the delta, cache " +
+                        (fs0.cacheBytes / 1048576).toStr() + " MB in " + fs0.cached.toStr() + " pages, " + fs0.loads.toStr() +
+                        " pages read, " + fs0.freed.toStr() + " evicted as freed, " + fs0.snaps.toStr() + " snapshots open")
+            }
+            Err(msg) {
+                eprintln("lexdb: " + msg)
+                code = 1
+            }
+        }
+        for f in files { let gone = fs.remove(f) }
+    })
+    st.close()
+    if code != 0 { exit(code) }
+}
+
+// Waits for SIGTERM or SIGINT; 2 (follow gives 0 or 1).
+fn waitStop(u: int): int {
+    let r = task.terminated()
+    return 2
+}

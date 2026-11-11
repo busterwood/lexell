@@ -1,0 +1,130 @@
+// lexdb_store's replica mode under the SQL layer: a replica store reads
+// through its follower of the master (here in one process, the simulated
+// files shared). Its sessions run the same SQL and see what the master's
+// saw as of the batch it has applied:
+// - a list of queries (point reads, an index, ORDER BY ... DESC LIMIT,
+//   joins, grouping, a large value) gives the same rows on both;
+// - the master's later commits show once the replica applies them, and a
+//   block on the replica keeps its snapshot until it ends;
+// - DDL on the master (a column added, an index) shows, with the replica's
+//   prepared plans made again;
+// - writes are refused with 25006 (INSERT, UPDATE, CREATE TABLE, COPY
+//   FROM, DELETE, and nextval at its commit), and the
+//   session goes on;
+// - the replica's snapshots are let go: the master's pages held for them
+//   are free again once it closes, and the page file audits clean.
+// expect: queries 12, same on both 12
+// expect: before the poll: 200 / after: 201
+// expect: block: 201 then 201 after the master's insert, 202 after COMMIT
+// expect: DDL: column w on the replica true, index used true
+// expect: refused: 25006 25006 25006 25006 25006 25006; then 202
+// expect: audit ok true
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+
+// every row of the last result, or its tag, or the error's state
+fn all(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if !r.hasRows { return r.tag }
+            var rows: []str = []
+            for row in r.rows {
+                var cells: []str = []
+                for v in row { append(mut &cells, lexdb_exec.text(&v)) }
+                append(mut &rows, strings.join(&cells, "|"))
+            }
+            return strings.join(&rows, ";")
+        }
+        Err(e) { return e.state }
+    }
+}
+
+fn poll(rep: &lexdb_store.Store, st: &lexdb_store.Store) {
+    let n = rep.follower().unwrap().poll(st.durableBatch()).unwrap()
+}
+
+fn main() {
+    let fs = lexdb_disk.sim(17)
+    let opts = lexdb_store.Options{cacheBytes: 16 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000,
+                                   bufferedPages: false}
+    var lines: []str = []
+    lexdb_store.run(fs, opts, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var m = lexdb_exec.newSession(st)
+        let setup = ["create table t (id int primary key, v int not null, g int not null, s text)",
+                     "create index t_g on t (g)",
+                     "create table u (g int primary key, name text)",
+                     "insert into t select i, i * 7 % 100, i % 5, 'row ' || i from generate_series(1, 200) i",
+                     "insert into u values (0, 'zero'), (1, 'one'), (2, 'two'), (3, 'three')",
+                     "update t set s = '" + strings.repeat("x", 5000) + "' where id = 77",
+                     "create sequence q"]
+        for q in setup {
+            let r = all(mut &m, &q)
+            if strings.startsWith(r, "4") || strings.startsWith(r, "0") || strings.startsWith(r, "X") { append(mut &lines, "setup failed: " + r) }
+        }
+        st.checkpoint().unwrap()
+        let more = all(mut &m, &"update t set v = v + 1 where id < 50")     // in the log, after the checkpoint
+        let rep = lexdb_store.openReplica(fs, opts, lexdb_store.Link.Local(st)).unwrap()
+        poll(&rep, &st)
+        lexdb_exec.bootstrap(&rep).unwrap()
+        var r = lexdb_exec.newSession(rep)
+        let queries = ["select count(*), sum(v) from t",
+                       "select v, s from t where id = 42",
+                       "select id from t where g = 3 order by id limit 5",
+                       "select id, v from t order by id desc limit 4",
+                       "select id from t where id between 10 and 20 order by id desc",
+                       "select g, count(*), max(v) from t group by g order by g",
+                       "select t.id, u.name from t join u on t.g = u.g where t.id < 8 order by t.id",
+                       "select length(s) from t where id = 77",
+                       "select count(*) from t where s like 'row 1%'",
+                       "select id from t where v > 95 order by v desc, id limit 3",
+                       "select name from u where g not in (select g from t where id < 3) order by g",
+                       "select sum(v) filter (where g = 1) from t"]
+        var same = 0
+        for q in queries {
+            let a = all(mut &m, &q)
+            let b = all(mut &r, &q)
+            if a == b { same += 1 } else { append(mut &lines, q + ": master " + a + " replica " + b) }
+        }
+        append(mut &lines, "queries " + len(queries).toStr() + ", same on both " + same.toStr())
+        // later commits
+        let i1 = all(mut &m, &"insert into t values (201, 1, 1, 'new')")
+        let before = all(mut &r, &"select count(*) from t")
+        poll(&rep, &st)
+        append(mut &lines, "before the poll: " + before + " / after: " + all(mut &r, &"select count(*) from t"))
+        // a block keeps its snapshot
+        let b0 = all(mut &r, &"begin")
+        let c1 = all(mut &r, &"select count(*) from t")
+        let i2 = all(mut &m, &"insert into t values (202, 1, 1, 'newer')")
+        poll(&rep, &st)
+        let c2 = all(mut &r, &"select count(*) from t")
+        let cm = all(mut &r, &"commit")
+        append(mut &lines, "block: " + c1 + " then " + c2 + " after the master's insert, " + all(mut &r, &"select count(*) from t") + " after COMMIT")
+        // DDL on the master: a prepared statement's columns, an index
+        let p1 = all(mut &r, &"select * from t where id = 1")
+        let d1 = all(mut &m, &"alter table t add column w int default 5")
+        let d2 = all(mut &m, &"create index t_v on t (v)")
+        poll(&rep, &st)
+        let p2 = all(mut &r, &"select * from t where id = 1")
+        let ex = all(mut &r, &"explain select id from t where v = 3")
+        append(mut &lines, "DDL: column w on the replica " + strings.endsWith(p2, "|5").toStr() + ", index used " + strings.contains(&ex, &"t_v").toStr())
+        // writes refused
+        var refused: []str = []
+        for q in ["insert into t values (300, 1, 1, 'no')", "update t set v = 0 where id = 1", "create table z (a int primary key)",
+                  "copy t from stdin", "delete from t where id = 1", "select nextval('q')"] {
+            append(mut &refused, all(mut &r, &q))
+        }
+        append(mut &lines, "refused: " + strings.join(&refused, " ") + "; then " + all(mut &r, &"select count(*) from t"))
+        r.close()
+        m.close()
+        rep.close()
+        return 0
+    }).unwrap()
+    let a = lexdb_store.audit(fs)
+    append(mut &lines, "audit ok " + a.isOk().toStr())
+    if a.isErr() { append(mut &lines, a.unwrapErr().msg) }
+    for l in lines { println(l) }
+}

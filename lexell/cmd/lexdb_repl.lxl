@@ -1,0 +1,347 @@
+// lexdb: the replication link between a master and its read-only replica,
+// two processes on one machine sharing the data directory (design/lexdb.md
+// 9.68, 9.72). A Unix socket in the data directory (SOCK) carries lines:
+//
+//   replica -> master   N              the handshake: hold what I will read
+//   master -> replica   C <ckpt>       held from this checkpoint on
+//   master -> replica   D <batch> <ckpt>   the log holds batches to <batch>;
+//                                      the last checkpoint is <ckpt>
+//   replica -> master   H <ckpt> <seg> keep checkpoints from <ckpt> on and
+//                                      log segments from <seg> on (Store.hold)
+//
+// The master sends D after each flush and each checkpoint, coalesced: a
+// replica that is behind gets the newest only. The replica reads the
+// batches from the log itself and the pages from the page file: nothing
+// else crosses. When the replica goes, the master lets go of its hold; when
+// the master goes, the replica stops (a master that starts again may reuse
+// pages the replica reads). One replica at a time: the hold is one.
+import "task"
+import "net"
+import "strings"
+import "time"
+import "./lexdb_base"
+import "./lexdb_disk"
+import "./lexdb_store"
+
+pub const SOCK = "repl.sock"
+
+// Lines from a connection's read side.
+type Lines = record { buf: []byte; at: int; end: int }
+
+fn newLines(): Lines { return Lines{buf: array(4096, byte(0)), at: 0, end: 0} }
+
+// The next line (without its newline), or None at the end of the stream.
+fn (l: mut &Lines) next(r: &net.ReadHalf): Result[Option[str], lexdb_base.DbErr] {
+    while true {
+        var i = l.at
+        while i < l.end {
+            if l.buf[i] == '\n' {
+                let line = strFromBytes(&l.buf[l.at..i])
+                l.at = i + 1
+                return Ok(Some(line))
+            }
+            i += 1
+        }
+        // keep what is left of a line at the start
+        let rest = l.end - l.at
+        for j in 0..rest { l.buf[j] = l.buf[l.at + j] }
+        l.at = 0
+        l.end = rest
+        if l.end == len(l.buf) { return Err(lexdb_base.corrupt("replication: a line too long")) }
+        match r.read(mut &l.buf[l.end..len(l.buf)]) {
+            Ok(n) {
+                if n == 0 { return Ok(None) }
+                l.end += n
+            }
+            Err(e) { return Err(lexdb_base.ioErr("replication: read", 5)) }
+        }
+    }
+    return Ok(None)
+}
+
+// A line just read, if one is whole in the buffer: what is ready now,
+// without waiting.
+fn (l: mut &Lines) ready(): Option[str] {
+    var i = l.at
+    while i < l.end {
+        if l.buf[i] == '\n' {
+            let line = strFromBytes(&l.buf[l.at..i])
+            l.at = i + 1
+            return Some(line)
+        }
+        i += 1
+    }
+    return None
+}
+
+// A line read, or "" at the end of the stream or on an error (no line the
+// link sends is empty).
+fn lineOr(r: Result[Option[str], lexdb_base.DbErr]): str {
+    if r.isErr() { return "" }
+    return r.unwrap().unwrapOr("")
+}
+
+fn ints(line: &str): []int {
+    var out: []int = []
+    let f = strings.fields(line)
+    for i in 1..len(f) { append(mut &out, strings.parseIntOpt(f[i]).unwrapOr(-1)) }
+    return out
+}
+
+// ---- the master's side
+
+type Serving = record { busy: bool }
+
+pub type Serve = record { pub st: lexdb_store.Store; pub dir: str }
+
+// Serves replicas on the data directory dir's socket until it is cancelled
+// (run as a task beside the writer). A replica's hold lasts while it is
+// connected.
+pub fn serve(x: Serve): int {
+    let st = x.st
+    let dir = x.dir
+    let path = dir + "/" + SOCK
+    let gone = lexdb_disk.real(dir).remove(SOCK)       // one left by a crash
+    let lr = net.listenUnix(path)
+    if lr.isErr() {
+        eprintln("lexdb: replication socket " + path + ": " + lr.unwrapErr().toStr())
+        return 1
+    }
+    var ln = lr.unwrap()
+    let serving = task.shared(Serving{busy: false})
+    task.scope(fn(s: mut &task.Scope) {
+        while true {
+            match ln.accept() {
+                Ok(c) {
+                    var one = false
+                    serving.with(fn(v: mut &Serving) {
+                        one = !v.busy
+                        v.busy = true
+                    })
+                    if !one {
+                        let r = c.writeStr("E one replica at a time\n")
+                        continue
+                    }
+                    s.spawn(serveOne, Peer{st: st, c: c, serving: serving})
+                }
+                Err(e) { break }
+            }
+        }
+    })
+    return 0
+}
+
+type Peer = record { st: lexdb_store.Store; c: net.Conn; serving: task.Shared[Serving] }
+
+fn serveOne(p: Peer): int {
+    let Peer{st: st, c: c, serving: serving} = move(p)
+    let net.Halves{read: r, write: w} = c.split()
+    var lines = newLines()
+    // the handshake
+    let first = lineOr(lines.next(&r))
+    if first == "N" {
+        // a new store has no checkpoint, and one from before covers was
+        // kept cannot be read: one now (or the one running: checkpoint
+        // returns at once when one is)
+        var tries = 0
+        while !st.checkpointCovers() && tries < 100 {
+            match st.checkpoint() {
+                Ok(_) {}
+                Err(e) { eprintln("lexdb: replication: a checkpoint for the replica: " + e.toStr()) }
+            }
+            if !st.checkpointCovers() && !st.waitChange() { break }
+            tries += 1
+        }
+        let held = st.holdNow()
+        if w.writeStr("C " + held.toStr() + "\n").isOk() {
+            var ws = [w]
+            task.scope(fn(s: mut &task.Scope) {
+                let sender = s.start(sendChanges, Changes{st: st, w: pop(mut &ws)})
+                // the replica's holds, until it goes
+                while true {
+                    let l = lineOr(lines.next(&r))
+                    if len(l) == 0 { break }
+                    if strings.startsWith(l, "H ") {
+                        let v = ints(&l)
+                        if len(v) == 2 { st.hold(v[0], v[1]) }
+                    }
+                }
+                { let stop = sender }
+            })
+        }
+    }
+    st.hold(-1, -1)
+    serving.with(fn(v: mut &Serving) { v.busy = false })
+    return 0
+}
+
+type Changes = record { st: lexdb_store.Store; w: net.WriteHalf }
+
+// D lines: the durable batch and checkpoint, after each change.
+fn sendChanges(x: Changes): int {
+    var lastB = -1
+    var lastC = -1
+    while true {
+        let b = x.st.durableBatch()
+        let c = x.st.durableCheckpoint()
+        if b != lastB || c != lastC {
+            if x.w.writeStr("D " + b.toStr() + " " + c.toStr() + "\n").isErr() { return 1 }
+            lastB = b
+            lastC = c
+        }
+        if !x.st.waitChange() { return 0 }
+    }
+    return 0
+}
+
+// ---- the replica's side
+
+// A replica's link to its master: the store that reads through it, and
+// the connection.
+pub type Replica = record { pub st: lexdb_store.Store; c: net.Conn; ob: task.Shared[lexdb_store.Outbox]; ckpt: int }
+
+// Connects to the master of the data directory dir (waiting up to waitMs
+// for its socket), and opens a replica store on it, ready (applied up to
+// its first checkpoint's covers batch) when this returns.
+pub fn connect(dir: str, opts: lexdb_store.Options, waitMs: int): Result[Replica, lexdb_base.DbErr] {
+    // tried again until waitMs has passed: the master may not be up yet, or
+    // not yet have seen a replica before this one go (one at a time)
+    let end = time.monotonicNs() + waitMs * 1000000
+    var last = lexdb_base.ioErr("replication: no master", 111)
+    while true {
+        var cs: []net.Conn = []
+        var held = -1
+        match handshake(dir, maxInt(end - time.monotonicNs(), 0) / 1000000, mut &cs) {
+            Ok(h) { held = h }
+            Err(e) { last = e }
+        }
+        if held >= 0 {
+            let ob = lexdb_store.newOutbox(held)
+            let st = try lexdb_store.openReplica(lexdb_disk.real(dir), opts, lexdb_store.Link.Remote(ob))
+            return Ok(Replica{st: st, c: pop(mut &cs), ob: ob, ckpt: held})
+        }
+        if time.monotonicNs() >= end { return Err(last) }
+        let z = task.sleep(100)
+    }
+    return Err(last)
+}
+
+fn maxInt(a: int, b: int): int { return if a > b { a } else { b } }
+
+// Connects and asks for a hold: the checkpoint held from, the connection
+// left in out.
+fn handshake(dir: str, waitMs: int, out: mut &[]net.Conn): Result[int, lexdb_base.DbErr] {
+    let path = dir + "/" + SOCK
+    let cr = net.connectUnixFor(path, maxInt(waitMs, 1))
+    if cr.isErr() { return Err(lexdb_base.ioErr("connect " + path + ": " + cr.unwrapErr().toStr(), 111)) }
+    var c = cr.unwrap()
+    if c.writeStr("N\n").isErr() { return Err(lexdb_base.ioErr("replication: handshake", 5)) }
+    // the reply, read a byte at a time: what follows is the link task's
+    var line: []byte = []
+    var one = array(1, byte(0))
+    while true {
+        match c.read(mut &one) {
+            Ok(n) {
+                if n == 0 { return Err(lexdb_base.ioErr("replication: the master closed the link", 104)) }
+                if one[0] == '\n' { break }
+                append(mut &line, one[0])
+            }
+            Err(e) { return Err(lexdb_base.ioErr("replication: handshake", 5)) }
+        }
+    }
+    let reply = strFromBytes(&line)
+    if !strings.startsWith(reply, "C ") { return Err(lexdb_base.err(lexdb_base.S_INTERNAL, "replication: the master says " + reply)) }
+    append(out, c)
+    return Ok(ints(&reply)[0])
+}
+
+// Follows the master until the link ends (run as a task): applies the
+// batches each D line names, reads a newer checkpoint when one is named,
+// and sends the follower's holds. ready is completed once the replica can
+// serve (its first checkpoint taken up). Gives 0 when the master closed
+// the link, 1 on an error.
+pub type Follow = record { pub rp: Replica; pub ready: task.Promise[Unit] }
+
+pub fn follow(x: Follow): int {
+    let Follow{rp: rp, ready: ready} = move(x)
+    let Replica{st: st, c: c, ob: ob, ckpt: ckpt0} = move(rp)
+    let fo = st.follower().unwrap()
+    let net.Halves{read: r, write: w} = c.split()
+    var code = 0
+    var waiting = [ready]
+    var ws = [w]
+    task.scope(fn(s: mut &task.Scope) {
+        let sender = s.start(sendHolds, Holds{ob: ob, w: pop(mut &ws)})
+        var lines = newLines()
+        var lastC = ckpt0
+        while true {
+            let got = lines.next(&r)
+            if got.isErr() {
+                code = 1
+                break
+            }
+            match got.unwrap() {
+                Some(l) {
+                    // the newest of the lines already here: a replica behind
+                    // applies up to it at once
+                    var cur = l
+                    while true {
+                        match lines.ready() {
+                            Some(m) { cur = m }
+                            None { break }
+                        }
+                    }
+                    if !strings.startsWith(cur, "D ") { continue }
+                    let v = ints(&cur)
+                    if len(v) != 2 { continue }
+                    if v[1] > lastC {
+                        fo.checkpointed()
+                        lastC = v[1]
+                    }
+                    match fo.poll(v[0]) {
+                        Ok(_) {}
+                        Err(e) {
+                            eprintln("lexdb: replica: " + e.toStr())
+                            code = 1
+                            break
+                        }
+                    }
+                    if len(waiting) > 0 && fo.ready() { pop(mut &waiting).complete(Unit{}) }
+                }
+                None { break }
+            }
+        }
+        { let stop = sender }
+    })
+    return code                 // ready, if never completed, is dropped: its waiter gets an error
+}
+
+type Holds = record { ob: task.Shared[lexdb_store.Outbox]; w: net.WriteHalf }
+
+// H lines: the follower's hold, each time it moves.
+fn sendHolds(x: Holds): int {
+    var lastC = -2
+    var lastS = -2
+    while true {
+        var ck = -1
+        var sg = -1
+        var fut: []task.Future[Unit] = []
+        x.ob.with(fn(o: mut &lexdb_store.Outbox) {
+            ck = o.ckpt
+            sg = o.seg
+            if ck == lastC && sg == lastS {
+                let task.Handoff{promise: p, future: f} = task.promise[Unit]()
+                append(mut &o.wake, p)
+                append(mut &fut, f)
+            }
+        })
+        if len(fut) > 0 {
+            if pop(mut &fut).wait().isErr() { return 0 }
+            continue
+        }
+        if ck >= 0 && x.w.writeStr("H " + ck.toStr() + " " + sg.toStr() + "\n").isErr() { return 1 }
+        lastC = ck
+        lastS = sg
+    }
+    return 0
+}

@@ -144,6 +144,8 @@ pub type Db = record {
     holdCkpt: int               // a follower reads checkpoints from this one on (9.71), -1 none:
     holdSeg: int                //   pages later checkpoints free stay unused (heldFree), and
     heldFree: []HeldRuns        //   log segments from holdSeg on are kept
+    changeWake: []task.Promise[Unit]    // woken after a flush or a checkpoint (waitChange)
+    ckptCovers: int             // the last durable checkpoint's covers batch, -1 not known (9.72)
     // counters
     pub snapshots: int
     pub tooOld: int
@@ -159,8 +161,9 @@ pub type Db = record {
     pub wholes: int             // large values read whole: their chunks read (9.31)
 }
 
-// A handle to an open store; copies reach the same store.
-pub type Store = value record { sh: task.Shared[Db] }
+// A handle to an open store; copies reach the same store. A replica's
+// (openReplica) reads through its follower (fo), and takes no writes.
+pub type Store = value record { sh: task.Shared[Db]; fo: Option[Follower] }
 
 // A read mark: a leaf seen at a version (4.4).
 // A leaf a transaction read: its slot as it was then, and its page if it
@@ -205,11 +208,12 @@ pub type Txn = record {
     // growing its runs, not starting again at AHEAD_MIN.
     raTree: int
     ra: int
+    fsnap: []RepPin             // on a replica: its follower snapshot, from its first read to its end (or its drop)
 }
 
 pub fn begin(): Txn {
     return Txn{reads: [], writes: [], index: newMap(), created: [], snap: -1, snapSeq: 0, snapTrees: newMap(), track: false, live: false, path: [], sess: 0,
-               raTree: -1, ra: AHEAD_MIN}
+               raTree: -1, ra: AHEAD_MIN, fsnap: []}
 }
 
 pub fn (t: &Txn) isSnapshot(): bool { return t.snap >= 0 }
@@ -1279,6 +1283,13 @@ fn (st: &Store) getIn(t: mut &Txn, tree: int, key: str, mode: int): Result[Optio
         }
         None {}
     }
+    match st.fo {
+        Some(fo) {
+            let s = try repSnap(&fo, t)
+            return fo.get(&s, tree, &key)
+        }
+        None {}
+    }
     if t.snap >= 0 && !t.live { return st.snapGet(t, tree, key, mode) }
     while true {
         var need = -1
@@ -1406,6 +1417,13 @@ pub fn (st: &Store) scanPart(t: mut &Txn, tree: int, from: str, to: str, f: &fn(
 
 // scan; raw: the stored forms, no reads noted (a companion tree's chunks).
 fn (st: &Store) scanIn(t: mut &Txn, tree: int, from: str, to: str, f: &fn(&Entry): bool, mode: int): Result[Unit, lexdb_base.DbErr] {
+    match st.fo {
+        Some(fo) {
+            let s = try repSnap(&fo, t)
+            return fo.scan(&s, tree, &from, &to, f)
+        }
+        None {}
+    }
     let raw = mode == M_RAW
     let own: []TxWrite = if raw { [] } else { t.ownRange(tree, &from, &to) }
     let root = if t.snap >= 0 && !t.live { match t.snapTrees.get(&tree) { Some(r) { r } None { -1 } } } else { -1 }
@@ -1529,6 +1547,7 @@ fn (st: &Store) scanIn(t: mut &Txn, tree: int, from: str, to: str, f: &fn(&Entry
 // read, even when f stops in it (a wider read is safe).
 pub fn (st: &Store) scanLeaves(t: mut &Txn, tree: int, from: str, to: str,
                                f: &fn(&lexdb_page.Node, int, int): bool): Result[bool, lexdb_base.DbErr] {
+    if st.fo.isSome() { return Ok(false) }         // a replica's reads go through scan
     if len(t.ownRange(tree, &from, &to)) > 0 { return Ok(false) }
     let root = if t.snap >= 0 && !t.live { match t.snapTrees.get(&tree) { Some(r) { r } None { -1 } } } else { -1 }
     var cursor = from
@@ -1653,6 +1672,13 @@ pub fn (st: &Store) scanBackPart(t: mut &Txn, tree: int, from: str, to: str, f: 
 }
 
 fn (st: &Store) scanBackIn(t: mut &Txn, tree: int, from: str, to: str, f: &fn(&Entry): bool, mode: int): Result[Unit, lexdb_base.DbErr] {
+    match st.fo {
+        Some(fo) {
+            let s = try repSnap(&fo, t)
+            return fo.scanBack(&s, tree, &from, &to, f)
+        }
+        None {}
+    }
     let own = t.ownRange(tree, &from, &to)
     let root = if t.snap >= 0 && !t.live { match t.snapTrees.get(&tree) { Some(r) { r } None { -1 } } } else { -1 }
     var oi = len(own) - 1
@@ -1819,6 +1845,7 @@ fn (db: mut &Db) logWrites(t: &Txn) {
 // writes and waits until the log holds them. A transaction that only read
 // is checked too, and waits until what it saw is durable (4.4).
 pub fn (st: &Store) commit(t: Txn): Result[Unit, lexdb_base.DbErr] {
+    if st.fo.isSome() { return st.repEnd(&t) }
     let id = t.snap
     if id >= 0 && len(t.writes) == 0 {
         st.endSnap(id)
@@ -1834,6 +1861,7 @@ pub fn (st: &Store) commit(t: Txn): Result[Unit, lexdb_base.DbErr] {
 // is (a sequence's block, 9.43: no transaction using its values can be
 // durable before it). A crash before then loses it.
 pub fn (st: &Store) commitAhead(t: Txn): Result[Unit, lexdb_base.DbErr] {
+    if st.fo.isSome() { return st.repEnd(&t) }
     let id = t.snap
     let r = st.commitLive(t, false)
     st.endSnap(id)
@@ -1956,6 +1984,13 @@ pub fn (st: &Store) beginBlock(): Result[Txn, lexdb_base.DbErr] { return st.snap
 fn (st: &Store) snapshotTxn(track: bool): Result[Txn, lexdb_base.DbErr] {
     var t = begin()
     t.track = track
+    match st.fo {
+        Some(fo) {
+            let s = try repSnap(&fo, mut &t)       // as of now, as on the master
+            return Ok(t)
+        }
+        None {}
+    }
     var bad: []lexdb_base.DbErr = []
     st.sh.with(fn(db: mut &Db) {
         if len(db.failed) > 0 {
@@ -1989,7 +2024,12 @@ fn (st: &Store) snapshotTxn(track: bool): Result[Txn, lexdb_base.DbErr] {
 }
 
 // Ends a snapshot (its commit or rollback); its old versions go.
-pub fn (st: &Store) endSnapshot(t: &Txn) { st.endSnap(t.snap) }
+pub fn (st: &Store) endSnapshot(t: &Txn) {
+    match st.fo {
+        Some(fo) { for p in t.fsnap { fo.end(&p.s) } }       // (ending twice is harmless: the drop does again)
+        None { st.endSnap(t.snap) }
+    }
+}
 
 fn (st: &Store) endSnap(id: int) {
     if id < 0 { return }
@@ -2212,6 +2252,7 @@ pub fn writer(st: Store): int {
         var ck: []task.Promise[Unit] = []
         st.sh.with(fn(db: mut &Db) {
             db.durableBatch = no
+            while len(db.changeWake) > 0 { append(mut &ck, pop(mut &db.changeWake)) }
             if upto > db.durableSeq {
                 db.durableSeq = upto
                 db.prune()
@@ -2413,6 +2454,7 @@ fn (db: mut &Db) encodeSlot(s: int, n: int, out: mut &[]PageOut): int {
 // is running (checkpoint returns at once then): at shutdown, so the next
 // start replays nothing.
 pub fn (st: &Store) checkpointAll(): Result[Unit, lexdb_base.DbErr] {
+    if st.fo.isSome() { return Ok(Unit{}) }        // a replica writes nothing
     while true {
         var running = false
         st.sh.with(fn(db: mut &Db) { running = db.ckptRunning && len(db.failed) == 0 })
@@ -2562,6 +2604,8 @@ pub fn (st: &Store) checkpoint(): Result[Unit, lexdb_base.DbErr] {
     }
     st.sh.with(fn(db: mut &Db) {
         db.durableCkpt = n
+        db.ckptCovers = target
+        while len(db.changeWake) > 0 { append(mut &done, pop(mut &db.changeWake)) }
         let pf = replace(mut &db.pendingFree, [])
         if db.holdCkpt >= 0 && db.holdCkpt < n {
             append(mut &db.heldFree, HeldRuns{ckpt: n, runs: pf})        // base n - 1's: a follower may read them
@@ -2715,7 +2759,7 @@ fn newDb(fs: lexdb_disk.Fs, data: lexdb_disk.File, opts: Options, m: &lexdb_page
               batch: [], batchCount: 0, batchNo: m.replayBatch, appliedBatch: m.replayBatch - 1,
               durableBatch: m.replayBatch - 1, waiters: [], writerWake: [], ckptWake: [], ckptDone: [], seg: m.replaySeg,
               segOff: m.replayOff, logSinceCkpt: 0, failed: [], closing: false, seq: 0, snaps: [], nextSnap: 0,
-              hist: [], histCount: 0, histSlots: [], deferred: [], rootHist: [], durableSeq: 0, holdCkpt: -1, holdSeg: -1, heldFree: [], snapshots: 0, tooOld: 0, commits: 0,
+              hist: [], histCount: 0, histSlots: [], deferred: [], rootHist: [], durableSeq: 0, holdCkpt: -1, holdSeg: -1, heldFree: [], changeWake: [], ckptCovers: m.covers, snapshots: 0, tooOld: 0, commits: 0,
               conflicts: 0, loads: 0, aheadReads: 0, aheadPages: 0, evictions: 0, flushes: 0, checkpoints: 0, held: 0, wholes: 0}
 }
 
@@ -2742,7 +2786,7 @@ pub fn open(fs: lexdb_disk.Fs, opts: Options): Result[Store, lexdb_base.DbErr] {
         return Err(lexdb_base.corrupt("no valid meta page, and the log does not start at its beginning"))
     }
     let m = best.unwrapOr(lexdb_page.Meta{ckpt: 0, npages: 2, roots: 0, free: 0, replaySeg: 1, replayOff: 0,
-                                          replayBatch: 1, nextTree: 1, dropped: 0, runs: 0, covers: 0})
+                                          replayBatch: 1, nextTree: 1, dropped: 0, runs: 0, covers: -1})
     var lists: []int = []
     let roots = try lexdb_page.readList(&data, m.roots, mut &lists)
     let free = try lexdb_page.readList(&data, m.free, mut &lists)
@@ -2766,7 +2810,7 @@ pub fn open(fs: lexdb_disk.Fs, opts: Options): Result[Store, lexdb_base.DbErr] {
         db.trees.put(roots[i], s)
         i += 2
     }
-    let st = Store{sh: task.shared(db)}
+    let st = Store{sh: task.shared(db), fo: None}
     try st.replay(&m)
     return Ok(st)
 }
@@ -2942,6 +2986,13 @@ fn (st: &Store) replay(m: &lexdb_page.Meta): Result[Unit, lexdb_base.DbErr] {
 // Asks the writer and the checkpointer to stop once the log holds every
 // commit.
 pub fn (st: &Store) close() {
+    match st.fo {
+        Some(fo) {
+            fo.close()
+            return
+        }
+        None {}
+    }
     var wake: []task.Promise[Unit] = []
     st.sh.with(fn(db: mut &Db) {
         db.closing = true
@@ -2977,7 +3028,7 @@ pub fn (st: &Store) setDropReads(n: int) { st.sh.with(fn(db: mut &Db) { db.dropR
 // The memo: values the SQL layer keeps while the store is open, outside any
 // transaction (lost when it closes).
 // A copy of the store's handle (it is a reference to the one store).
-pub fn (st: &Store) handle(): Store { return Store{sh: st.sh} }
+pub fn (st: &Store) handle(): Store { return Store{sh: st.sh, fo: st.fo} }
 
 pub fn (st: &Store) memoGet(k: &str): Option[str] {
     var out: Option[str] = None
@@ -3015,6 +3066,40 @@ pub fn (st: &Store) hold(ckpt: int, seg: int) {
     })
 }
 
+// Whether the last durable checkpoint says which batch it covers (one
+// written before covers was kept does not: a follower cannot use it).
+pub fn (st: &Store) checkpointCovers(): bool {
+    var k = false
+    st.sh.with(fn(db: mut &Db) { k = db.ckptCovers >= 0 })
+    return k
+}
+
+// The last durable checkpoint.
+pub fn (st: &Store) durableCheckpoint(): int {
+    var c = 0
+    st.sh.with(fn(db: mut &Db) { c = db.durableCkpt })
+    return c
+}
+
+// Waits until the next flush of the log or the next checkpoint (the
+// replication link's master side sends what changed), or until the store
+// closes or fails; false then.
+pub fn (st: &Store) waitChange(): bool {
+    var fut: []task.Future[Unit] = []
+    var over = false
+    st.sh.with(fn(db: mut &Db) {
+        if db.closing || len(db.failed) > 0 {
+            over = true
+            return
+        }
+        let task.Handoff{promise: p, future: f} = task.promise[Unit]()
+        append(mut &db.changeWake, p)
+        append(mut &fut, f)
+    })
+    if over { return false }
+    return pop(mut &fut).wait().isOk()
+}
+
 // Starts a hold at the last durable checkpoint, and every log segment,
 // in one step (a follower's first; it then holds the checkpoint it reads,
 // which is this one or a later one), and gives that checkpoint.
@@ -3045,6 +3130,10 @@ pub fn (st: &Store) stats(): Stats {
 // its catalog, so what it derived from the schema (a prepared statement's
 // columns) is known to be current while the count is the same.
 pub fn (st: &Store) watch(tree: int) {
+    match st.fo {
+        Some(fo) { fo.watch(tree) }
+        None {}
+    }
     st.sh.with(fn(db: mut &Db) {
         db.watched = tree
         db.watchedWrites = 0
@@ -3053,6 +3142,10 @@ pub fn (st: &Store) watch(tree: int) {
 
 // The writes to the watched tree applied so far.
 pub fn (st: &Store) changes(): int {
+    match st.fo {
+        Some(fo) { return fo.changes() }
+        None {}
+    }
     var n = 0
     st.sh.with(fn(db: mut &Db) { n = db.watchedWrites })
     return n
@@ -3060,6 +3153,10 @@ pub fn (st: &Store) changes(): int {
 
 // The ids of the trees, in no order.
 pub fn (st: &Store) trees(): []int {
+    match st.fo {
+        Some(fo) { return fo.trees() }
+        None {}
+    }
     var out: []int = []
     st.sh.with(fn(db: mut &Db) {
         for i in 0..db.trees.size() {
@@ -3082,4 +3179,1097 @@ pub fn run[R](fs: lexdb_disk.Fs, opts: Options, f: &fn(Store): R): Result[R, lex
         st.close()
     })
     return Ok(pop(mut &out))
+}
+
+// ==== the follower (design/lexdb.md 9.68, 9.71)
+//
+//
+// It reads the store as the master leaves it on disk, and changes nothing:
+//
+// - the base: the trees of a checkpoint, from the master's page file. A page
+//   is never written in place (4.1), so a page read once stays right for
+//   every checkpoint that still names it. The cache keeps pages by number,
+//   decoded (leaves lazy, internal nodes' kids as page numbers);
+// - the delta: the rows of every batch since, from the master's log, each
+//   key's versions by batch, whole values (the log holds rows, not pages).
+//
+// A snapshot reads as of a batch: a key's newest version at or below it,
+// else the base. A checkpoint's trees hold every commit up to its covers
+// batch (and perhaps some after its replay point, which the delta has as
+// well), so a base serves snapshots at batches >= its covers.
+//
+// The master keeps what the follower may still read (Store.hold): the
+// pages that checkpoints after the oldest base in use free, and the log
+// segments from the follower's position on. When no snapshot uses a base
+// but the newest, the follower lets it go: it evicts the pages the newer
+// base lists as free (the master may reuse them from then on), drops the
+// versions that base holds, and moves the hold up.
+//
+// Here the follower shares a process with the master (it calls the Store
+// for durableBatch and hold); a replica process will get both from a
+// stream instead (9.68).
+
+// Where a follower's master is. Local: a Store in this process (the
+// tests); a replica process's follower talks to its master over a socket
+// (9.72).
+pub type Link = value closed {
+    Local(Store)
+    Remote(task.Shared[Outbox])
+}
+
+// What a replica's follower has for its master, sent by the link's task
+// (lexdb_repl): the hold as it now is (a newer one replaces one not yet
+// sent: only the last matters). The follower may not park (it asks inside
+// its lock), so it only leaves it here.
+pub type Outbox = record {
+    pub first: int              // the checkpoint the master's hold began at (the handshake's)
+    pub ckpt: int               // the hold to send, ckpt -1 none
+    pub seg: int
+    pub wake: []task.Promise[Unit]
+}
+
+pub fn newOutbox(first: int): task.Shared[Outbox] {
+    return task.shared(Outbox{first: first, ckpt: -1, seg: -1, wake: []})
+}
+
+// Asks the master to keep what the follower reads (Store.hold).
+fn (l: &Link) hold(ckpt: int, seg: int) {
+    match l {
+        Link.Local(st) { st.hold(ckpt, seg) }
+        Link.Remote(ob) {
+            var wake: []task.Promise[Unit] = []
+            ob.with(fn(o: mut &Outbox) {
+                o.ckpt = ckpt
+                o.seg = seg
+                while len(o.wake) > 0 { append(mut &wake, pop(mut &o.wake)) }
+            })
+            while len(wake) > 0 { pop(mut &wake).complete(Unit{}) }
+        }
+    }
+}
+
+// Starts a hold at the master's last durable checkpoint (Store.holdNow);
+// over a link, the master did at the handshake.
+fn (l: &Link) holdNow(): int {
+    var c = 0
+    match l {
+        Link.Local(st) { c = st.holdNow() }
+        Link.Remote(ob) { ob.with(fn(o: mut &Outbox) { c = o.first }) }
+    }
+    return c
+}
+
+fn (l: &Link) local(): bool { return match l { Link.Local(_) { true } Link.Remote(_) { false } } }
+
+
+// A checkpoint the follower reads.
+type Base = record {
+    ckpt: int
+    covers: int
+    replayBatch: int
+    replaySeg: int
+    roots: Map[int, int]    // tree -> root page
+    free: []int             // its free pages, as (first, count) runs
+}
+
+type Ver = value record { batch: int; val: str; gone: bool }
+
+// A tree's rows since the base: each key's versions, oldest first, and the
+// keys in sorted runs of their numbers (each key in one run; runs merge as
+// they grow, so a scan merges a few).
+type Delta = record {
+    idx: Map[str, int]      // key -> its number: keys and vers index
+    keys: []str
+    vers: [][]Ver
+    runs: [][]int
+}
+
+fn newDelta(): Delta { return Delta{idx: newMap(), keys: [], vers: [], runs: []} }
+
+// A tree created (or dropped) by the batch.
+type Life = value record { batch: int; created: bool }
+
+type FolSnap = value record { id: int; batch: int; ckpt: int }
+
+type Fol = record {
+    link: Link
+    data: lexdb_disk.File
+    fs: lexdb_disk.Fs
+    bases: []Base           // oldest first; snapshots begin on the last
+    next: []Base            // a newer checkpoint, used once applied reaches its covers
+    pool: []lexdb_page.Node // cached pages
+    pageOf: []int           // pool[i]'s page
+    refd: []bool            // clock bits
+    at: Map[int, int]       // page -> pool index
+    used: int               // the cached pages' cost (lexdb_page.nodeCost)
+    budget: int
+    hand: int
+    deltas: Map[int, Delta]
+    life: Map[int, []Life]
+    applied: int            // the last batch applied
+    seg: int                // where the next batch's frame is
+    off: int
+    segF: []lexdb_disk.File // the segment open for reading, if any
+    segNo: int
+    snaps: []FolSnap
+    nextSnap: int
+    pub loads: int
+    pub evictions: int
+    pub batches: int
+    pub freed: int          // pages evicted as the master may reuse them (release)
+    watched: int            // a tree whose applied writes are counted (Store.watch), -1 none
+    watchedWrites: int
+    metaDue: bool           // a newer checkpoint may be on disk (checkpointed); a local link's always
+}
+
+pub type Follower = value record { sh: task.Shared[Fol] }
+
+// A snapshot: the store as of batch, read through checkpoint ckpt.
+pub type FSnap = value record { pub id: int; pub batch: int; pub ckpt: int }
+
+// ---- opening
+
+// The newer valid meta page of the page file.
+fn readMeta(f: &lexdb_disk.File): Result[lexdb_page.Meta, lexdb_base.DbErr] {
+    var best: Option[lexdb_page.Meta] = None
+    var b = array(PAGE, byte(0))
+    for i in 0..2 {
+        try f.read(i * PAGE, mut &b[0..PAGE], PAGE)
+        match lexdb_page.decodeMeta(&b, i) {
+            Some(m) {
+                let better = match best { Some(o) { m.ckpt > o.ckpt } None { true } }
+                if better { best = Some(m) }
+            }
+            None {}
+        }
+    }
+    return match best {
+        Some(m) { Ok(m) }
+        None { Err(lexdb_base.corrupt("follower: no valid meta page")) }
+    }
+}
+
+fn loadBase(f: &lexdb_disk.File, m: &lexdb_page.Meta): Result[Base, lexdb_base.DbErr] {
+    var lists: []int = []
+    let pairs = if m.roots > 0 { try lexdb_page.readList(f, m.roots, mut &lists) } else { [] }
+    var roots: Map[int, int] = newMap()
+    var i = 0
+    while i + 1 < len(pairs) {
+        roots.put(pairs[i], pairs[i + 1])
+        i += 2
+    }
+    let free = if m.runs > 0 { try lexdb_page.readList(f, m.runs, mut &lists) } else { [] }
+    return Ok(Base{ckpt: m.ckpt, covers: m.covers, replayBatch: m.replayBatch, replaySeg: m.replaySeg, roots: roots, free: free})
+}
+
+// A follower of st, whose files are fs's, with a page cache of about
+// cacheBytes. It is ready (ready) once it has applied the log up to its
+// first checkpoint's covers batch.
+pub fn openFollower(link: Link, fs: lexdb_disk.Fs, cacheBytes: int): Result[Follower, lexdb_base.DbErr] {
+    return openFollowerHow(link, fs, cacheBytes, false)
+}
+
+// openFollower, the page file read through the kernel's page cache when
+// buffered (9.69).
+fn openFollowerHow(link: Link, fs: lexdb_disk.Fs, cacheBytes: int, buffered: bool): Result[Follower, lexdb_base.DbErr] {
+    let held = link.holdNow()
+    let data = try if buffered { fs.openBuffered(DATA, false) } else { fs.open(DATA, false) }
+    let m = try readMeta(&data)
+    if m.ckpt < held { return Err(lexdb_base.corrupt("follower: the meta page is older than the store's checkpoint")) }
+    let b = try loadBase(&data, &m)
+    link.hold(m.ckpt, m.replaySeg)
+    let fol = Fol{link: link, data: data, fs: fs, bases: [], next: [b], pool: [], pageOf: [], refd: [], at: newMap(),
+                  used: 0, budget: cacheBytes, hand: 0, deltas: newMap(), life: newMap(), applied: m.replayBatch - 1,
+                  seg: m.replaySeg, off: m.replayOff, segF: [], segNo: -1, snaps: [], nextSnap: 0,
+                  loads: 0, evictions: 0, batches: 0, freed: 0, watched: -1, watchedWrites: 0, metaDue: false}
+    let fo = Follower{sh: task.shared(fol)}
+    fo.adopt()
+    return Ok(fo)
+}
+
+// The master has written a newer checkpoint: the next poll reads the meta
+// page.
+pub fn (fo: &Follower) checkpointed() {
+    fo.sh.with(fn(f: mut &Fol) { f.metaDue = true })
+}
+
+pub fn (fo: &Follower) ready(): bool {
+    var r = false
+    fo.sh.with(fn(f: mut &Fol) { r = len(f.bases) > 0 })
+    return r
+}
+
+pub fn (fo: &Follower) applied(): int {
+    var a = 0
+    fo.sh.with(fn(f: mut &Fol) { a = f.applied })
+    return a
+}
+
+pub fn (fo: &Follower) close() {
+    fo.sh.with(fn(f: mut &Fol) {
+        f.data.close()
+        while len(f.segF) > 0 { pop(mut &f.segF).close() }
+        f.link.hold(-1, -1)
+    })
+}
+
+// ---- following the log
+
+// Applies the log's batches up to upto (at most the last durable one), and
+// takes up a newer checkpoint when there is one. Gives the batches applied.
+// A batch up to upto that the log does not have is an error.
+pub fn (fo: &Follower) poll(upto: int): Result[int, lexdb_base.DbErr] {
+    var n = 0
+    while true {
+        var seg = 0
+        var off = 0
+        var batch = 0
+        var open: []lexdb_disk.File = []
+        var fs = lexdb_disk.Fs.Real("")
+        fo.sh.with(fn(f: mut &Fol) {
+            seg = f.seg
+            off = f.off
+            batch = f.applied + 1
+            fs = f.fs
+            if f.segNo == seg && len(f.segF) > 0 { append(mut &open, f.segF[0]) }
+        })
+        if batch > upto { break }
+        if len(open) == 0 {
+            if !fs.exists(segName(seg)) { return Err(logGone(batch, seg)) }
+            append(mut &open, try fs.open(segName(seg), false))
+            let fresh = open[0]
+            fo.sh.with(fn(f: mut &Fol) {
+                while len(f.segF) > 0 { pop(mut &f.segF).close() }
+                append(mut &f.segF, fresh)
+                f.segNo = seg
+            })
+        }
+        let size = try open[0].size()
+        var got = try readFrame(&open[0], off, size, seg, batch)
+        var at = off
+        var sg = seg
+        if got.isNone() {
+            // the writer may have gone on to the next segment
+            if !fs.exists(segName(seg + 1)) { return Err(logGone(batch, seg)) }
+            let g = try fs.open(segName(seg + 1), false)
+            let gs = try g.size()
+            got = try readFrame(&g, 0, gs, seg + 1, batch)
+            if got.isNone() {
+                g.close()
+                return Err(logGone(batch, seg))
+            }
+            sg = seg + 1
+            at = 0
+            fo.sh.with(fn(f: mut &Fol) {
+                while len(f.segF) > 0 { pop(mut &f.segF).close() }
+                append(mut &f.segF, g)
+                f.segNo = seg + 1
+            })
+        }
+        let recs = got.unwrap()
+        let flen = frameLen(&recs)
+        fo.sh.with(fn(f: mut &Fol) {
+            for w in recs { f.apply(batch, &w) }
+            f.applied = batch
+            f.seg = sg
+            f.off = at + flen
+            f.batches += 1
+        })
+        n += 1
+    }
+    // the meta page only when there may be a new checkpoint: a link says so
+    var due = false
+    fo.sh.with(fn(f: mut &Fol) {
+        due = f.metaDue || f.link.local()
+        f.metaDue = false
+    })
+    if due { try fo.checkMeta() } else { fo.adopt() }
+    return Ok(n)
+}
+
+// A durable batch the log no longer has where the follower looks: its
+// segments were reused (the hold was not kept), or the master is not the
+// one it follows.
+fn logGone(batch: int, seg: int): lexdb_base.DbErr {
+    return lexdb_base.corrupt("follower: batch " + batch.toStr() + " is not in log segment " + seg.toStr() + " or the next")
+}
+
+fn (f: mut &Fol) apply(batch: int, w: &TxWrite) {
+    if w.tree == f.watched { f.watchedWrites += 1 }
+    if w.op == OP_PUT || w.op == OP_DEL {
+        if !f.deltas.has(&w.tree) { f.deltas.put(w.tree, newDelta()) }
+        let gone = w.op == OP_DEL
+        f.deltas.atMut(w.tree).add(&w.key, Ver{batch: batch, val: if gone { "" } else { w.val }, gone: gone})
+    } else if w.op == OP_CREATE || w.op == OP_DROP {
+        if !f.life.has(&w.tree) { f.life.put(w.tree, []) }
+        append(f.life.atMut(w.tree), Life{batch: batch, created: w.op == OP_CREATE})
+    }
+}
+
+fn (d: mut &Delta) add(key: &str, v: Ver) {
+    match d.idx.get(key) {
+        Some(i) {
+            append(mut &d.vers[i], v)
+            return
+        }
+        None {}
+    }
+    let n = len(d.vers)
+    d.idx.put(lexdb_base.own(key), n)
+    append(mut &d.keys, lexdb_base.own(key))
+    append(mut &d.vers, [v])
+    append(mut &d.runs, [n])
+    // runs as a binary counter: a run merges into the one before it while
+    // that one is no longer
+    while len(d.runs) >= 2 && len(d.runs[len(d.runs) - 2]) <= len(d.runs[len(d.runs) - 1]) {
+        let b = pop(mut &d.runs)
+        let a = pop(mut &d.runs)
+        append(mut &d.runs, mergeKeys(&d.keys, &a, &b))
+    }
+}
+
+// Two sorted runs of key numbers as one.
+fn mergeKeys(keys: &[]str, a: &[int], b: &[int]): []int {
+    var out: []int = withCapacity(len(a) + len(b))
+    var i = 0
+    var j = 0
+    while i < len(a) && j < len(b) {
+        if keys[a[i]] < keys[b[j]] {
+            append(mut &out, a[i])
+            i += 1
+        } else {
+            append(mut &out, b[j])
+            j += 1
+        }
+    }
+    while i < len(a) {
+        append(mut &out, a[i])
+        i += 1
+    }
+    while j < len(b) {
+        append(mut &out, b[j])
+        j += 1
+    }
+    return out
+}
+
+// A newer checkpoint on disk becomes the next base; the next base becomes
+// the one snapshots begin on once the log is applied to its covers batch.
+fn (fo: &Follower) checkMeta(): Result[Unit, lexdb_base.DbErr] {
+    var data = lexdb_disk.File.Real(-1, false)
+    var newest = 0
+    fo.sh.with(fn(f: mut &Fol) {
+        data = f.data
+        newest = if len(f.next) > 0 { f.next[0].ckpt } else if len(f.bases) > 0 { f.bases[len(f.bases) - 1].ckpt } else { 0 }
+    })
+    let m = try readMeta(&data)
+    // covers -1: a file from before covers was kept; not used
+    if m.ckpt > newest && m.covers >= 0 {
+        var nb = [try loadBase(&data, &m)]
+        fo.sh.with(fn(f: mut &Fol) { f.next = replace(mut &nb, []) })
+    }
+    fo.adopt()
+    return Ok(Unit{})
+}
+
+fn (fo: &Follower) adopt() {
+    fo.sh.with(fn(f: mut &Fol) {
+        if len(f.next) > 0 && f.next[0].covers >= 0 && f.next[0].covers <= f.applied {
+            append(mut &f.bases, pop(mut &f.next))
+            f.release()
+        }
+    })
+}
+
+// Lets go of the bases no snapshot uses (all but the newest): the pages
+// the oldest kept base lists as free leave the cache, as the master may
+// reuse them once the hold moves; the versions it holds go; the hold moves
+// up to it.
+fn (f: mut &Fol) release() {
+    if len(f.bases) == 0 { return }
+    var keep = f.bases[len(f.bases) - 1].ckpt
+    for s in f.snaps { if s.ckpt < keep { keep = s.ckpt } }
+    if f.bases[0].ckpt >= keep { return }
+    var kept: []Base = []
+    while len(f.bases) > 0 {
+        let b = pop(mut &f.bases)
+        if b.ckpt >= keep { append(mut &kept, b) }
+    }
+    while len(kept) > 0 { append(mut &f.bases, pop(mut &kept)) }
+    // pages free in the oldest kept base: not in it nor in any later one
+    // until the master reuses them, which it may from now on
+    var r = 0
+    while r + 1 < len(f.bases[0].free) {
+        let first = f.bases[0].free[r]
+        let cnt = f.bases[0].free[r + 1]
+        for p in first..first + cnt {
+            match f.at.get(&p) {
+                Some(i) {
+                    f.evictAt(i)
+                    f.freed += 1
+                }
+                None {}
+            }
+        }
+        r += 2
+    }
+    f.prune(f.bases[0].replayBatch)
+    f.link.hold(f.bases[0].ckpt, f.seg)
+}
+
+// Drops the versions before batch floor (the oldest base in use holds
+// them), and rebuilds each tree's runs from the keys left.
+fn (f: mut &Fol) prune(floor: int) {
+    var trees: []int = []
+    for i in 0..f.deltas.size() {
+        let t: int = f.deltas.keyAt(i)
+        append(mut &trees, t)
+    }
+    for t in trees {
+        var d = f.deltas.remove(&t).unwrap()
+        var nd = newDelta()
+        // the keys in order: the runs merged
+        var order: []int = []
+        for run in d.runs { order = mergeKeys(&d.keys, &order, &run) }
+        var run: []int = withCapacity(len(order))
+        for i in order {
+            var vs: []Ver = []
+            for v in d.vers[i] { if v.batch >= floor { append(mut &vs, v) } }
+            if len(vs) > 0 {
+                let n = len(nd.vers)
+                nd.idx.put(lexdb_base.own(&d.keys[i]), n)
+                append(mut &nd.keys, lexdb_base.own(&d.keys[i]))
+                append(mut &nd.vers, vs)
+                append(mut &run, n)
+            }
+        }
+        if len(nd.vers) > 0 {
+            append(mut &nd.runs, run)
+            f.deltas.put(t, nd)
+        }
+    }
+    var lt: []int = []
+    for i in 0..f.life.size() {
+        let t: int = f.life.keyAt(i)
+        append(mut &lt, t)
+    }
+    for t in lt {
+        // a tree's life before the floor is in the base
+        var ls = f.life.remove(&t).unwrap()
+        var keep: []Life = []
+        for l in ls { if l.batch >= floor { append(mut &keep, l) } }
+        if len(keep) > 0 { f.life.put(t, keep) }
+    }
+}
+
+// ---- the cache
+
+const MIN_PAGES = 16        // never evicted below: a descent's whole path fits
+
+// What a cached page takes: a lazy leaf, its page's entries and 8 bytes an
+// entry; an internal node, its keys decoded (64 bytes a key, 9.13) and its
+// kids' page numbers. (lexdb_page.nodeCost charges the store's slots for
+// kids, which a follower has none of.)
+fn pageCost(n: &lexdb_page.Node): int {
+    if n.leaf { return lexdb_page.nodeCost(n) }
+    return 160 + n.size + 64 * len(n.keys) + 8 * len(n.kids)
+}
+
+fn (f: mut &Fol) evictAt(i: int) {
+    let p = f.pageOf[i]
+    f.used -= pageCost(&f.pool[i])
+    let last = len(f.pool) - 1
+    if i != last {
+        swap(mut &f.pool, i, last)
+        swap(mut &f.pageOf, i, last)
+        swap(mut &f.refd, i, last)
+        f.at.put(f.pageOf[i], i)
+    }
+    let gone = pop(mut &f.pool)
+    let gp = pop(mut &f.pageOf)
+    let gr = pop(mut &f.refd)
+    let x = f.at.remove(&p)
+    f.evictions += 1
+}
+
+fn (f: mut &Fol) install(p: int, n: lexdb_page.Node) {
+    if f.at.has(&p) { return }
+    f.used += pageCost(&n)
+    f.at.put(p, len(f.pool))
+    append(mut &f.pool, n)
+    append(mut &f.pageOf, p)
+    append(mut &f.refd, true)
+    // the clock: a page looked at since the hand last passed is kept once
+    var turns = 0
+    while f.used > f.budget && len(f.pool) > MIN_PAGES && turns < 4 * len(f.pool) {
+        if f.hand >= len(f.pool) { f.hand = 0 }
+        if f.pageOf[f.hand] == p || f.refd[f.hand] {
+            f.refd[f.hand] = false
+            f.hand += 1
+        } else {
+            f.evictAt(f.hand)
+        }
+        turns += 1
+    }
+}
+
+fn (fo: &Follower) load(p: int): Result[Unit, lexdb_base.DbErr] {
+    var data = lexdb_disk.File.Real(-1, false)
+    fo.sh.with(fn(f: mut &Fol) { data = f.data })
+    var b = array(PAGE, byte(0))
+    try data.read(p * PAGE, mut &b[0..PAGE], PAGE)
+    try lexdb_page.check(&b, p, lexdb_page.T_LEAF)          // a leaf or an internal page
+    var n = [lexdb_page.decodeNode(&b)]
+    fo.sh.with(fn(f: mut &Fol) {
+        f.loads += 1
+        f.install(p, pop(mut &n))
+    })
+    return Ok(Unit{})
+}
+
+// ---- snapshots
+
+// A snapshot as of the last batch applied, on the newest base.
+pub fn (fo: &Follower) begin(): Result[FSnap, lexdb_base.DbErr] {
+    var out: []FSnap = []
+    fo.sh.with(fn(f: mut &Fol) {
+        if len(f.bases) == 0 { return }
+        let s = FolSnap{id: f.nextSnap, batch: f.applied, ckpt: f.bases[len(f.bases) - 1].ckpt}
+        f.nextSnap += 1
+        append(mut &f.snaps, s)
+        append(mut &out, FSnap{id: s.id, batch: s.batch, ckpt: s.ckpt})
+    })
+    if len(out) == 0 { return Err(lexdb_base.err(lexdb_base.S_INTERNAL, "follower: not ready")) }
+    return Ok(out[0])
+}
+
+pub fn (fo: &Follower) end(s: &FSnap) {
+    fo.sh.with(fn(f: mut &Fol) {
+        var keep: []FolSnap = []
+        for x in f.snaps { if x.id != s.id { append(mut &keep, x) } }
+        f.snaps = keep
+        f.release()
+    })
+}
+
+fn (f: &Fol) baseOf(ckpt: int): int {
+    for i in 0..len(f.bases) { if f.bases[i].ckpt == ckpt { return i } }
+    return -1
+}
+
+// Whether tree is there as of the snapshot: its last create or drop at or
+// before the batch, else whether the base has it.
+fn (f: &Fol) live(s: &FSnap, tree: int, bi: int): bool {
+    if f.life.has(&tree) {
+        let ls = f.life.at(tree)
+        var i = len(ls) - 1
+        while i >= 0 {
+            if ls[i].batch <= s.batch { return ls[i].created }
+            i -= 1
+        }
+    }
+    return f.bases[bi].roots.has(&tree)
+}
+
+// The key's newest version at or before the batch: 0 none, 1 a value, 2 gone.
+fn (f: &Fol) version(tree: int, key: &str, batch: int, out: mut &[]str): int {
+    if !f.deltas.has(&tree) { return 0 }
+    let d = f.deltas.at(tree)
+    return match d.idx.get(key) {
+        Some(i) { versionAt(d, i, batch, out) }
+        None { 0 }
+    }
+}
+
+// version, for key number i of d.
+fn versionAt(d: &Delta, i: int, batch: int, out: mut &[]str): int {
+    var j = len(d.vers[i]) - 1
+    while j >= 0 {
+        if d.vers[i][j].batch <= batch {
+            if d.vers[i][j].gone { return 2 }
+            append(out, d.vers[i][j].val)
+            return 1
+        }
+        j -= 1
+    }
+    return 0
+}
+
+
+// One step of a descent through the base for key k: the leaf's pool index
+// (leaf), or the page to load first (need), with the smallest separator
+// above k on the way (the leaf holds no key >= it).
+type Step = record { leaf: int; need: int; upper: str; hasUpper: bool }
+
+fn (f: mut &Fol) descend(root: int, k: &str): Step {
+    var st = Step{leaf: -1, need: -1, upper: "", hasUpper: false}
+    var p = root
+    while true {
+        match f.at.get(&p) {
+            Some(i) {
+                f.refd[i] = true
+                if f.pool[i].leaf {
+                    st.leaf = i
+                    return st
+                }
+                let c = childIndex(&f.pool[i].keys, k)
+                if c < len(f.pool[i].keys) {
+                    st.upper = f.pool[i].keys[c]
+                    st.hasUpper = true
+                }
+                p = f.pool[i].kids[c]
+            }
+            None {
+                st.need = p
+                return st
+            }
+        }
+    }
+    return st
+}
+
+// The value the base holds for key in tree, as stored (marked when large
+// or escaped), if any.
+fn (fo: &Follower) baseGet(bi: int, tree: int, key: &str): Result[Option[str], lexdb_base.DbErr] {
+    while true {
+        var need = -1
+        var out: []str = []
+        fo.sh.with(fn(f: mut &Fol) {
+            match f.bases[bi].roots.get(&tree) {
+                Some(root) {
+                    let st = f.descend(root, key)
+                    if st.need >= 0 {
+                        need = st.need
+                        return
+                    }
+                    let n = &f.pool[st.leaf]
+                    let i = n.lower(key)
+                    if i < n.count() && n.key(i) == key { append(mut &out, n.val(i)) }
+                }
+                None {}
+            }
+        })
+        if need >= 0 {
+            try fo.load(need)
+            continue
+        }
+        if len(out) == 0 { return Ok(None) }
+        return Ok(Some(pop(mut &out)))
+    }
+    return Ok(None)
+}
+
+// The entries of the base's tree with keys in [from, to) (to "": to the
+// end), in order, while f gives true; as stored.
+fn (fo: &Follower) baseScan(bi: int, tree: int, from: &str, to: &str, f: &fn(&Entry): bool): Result[Unit, lexdb_base.DbErr] {
+    var cursor = lexdb_base.own(from)
+    while true {
+        var need = -1
+        var chunk: []Entry = []
+        var upper = ""
+        var last = true
+        var none = false
+        fo.sh.with(fn(fl: mut &Fol) {
+            match fl.bases[bi].roots.get(&tree) {
+                Some(root) {
+                    let st = fl.descend(root, &cursor)
+                    if st.need >= 0 {
+                        need = st.need
+                        return
+                    }
+                    let n = &fl.pool[st.leaf]
+                    var i = n.lower(&cursor)
+                    while i < n.count() {
+                        let k = n.key(i)
+                        if len(to) > 0 && k >= to { break }
+                        append(mut &chunk, Entry{key: k, val: n.val(i)})
+                        i += 1
+                    }
+                    last = !st.hasUpper || (len(to) > 0 && st.upper >= to)
+                    upper = st.upper
+                }
+                None { none = true }
+            }
+        })
+        if none { return Ok(Unit{}) }
+        if need >= 0 {
+            try fo.load(need)
+            continue
+        }
+        for e in chunk { if !f(&e) { return Ok(Unit{}) } }
+        if last { return Ok(Unit{}) }
+        cursor = upper
+    }
+    return Ok(Unit{})
+}
+
+// A value as stored in the base, as written: an escaped value without its
+// mark, a large one's chunks read back (from the base's companion tree)
+// and checked.
+fn (fo: &Follower) unstore(bi: int, tree: int, key: &str, v: str): Result[str, lexdb_base.DbErr] {
+    if !marked(&v) { return Ok(v) }
+    if !isStub(&v) { return Ok(v[1..len(v)]) }
+    let total = int(binary.readU64LEStr(&v, 2))
+    let want = binary.readU32LEStr(&v, 10)
+    let head = v[STUB_LEN..len(v)]
+    var b = newStrBuf()
+    b.add(&head)
+    var got = len(head)
+    var crc: u32 = crcOf(0, &head)
+    try fo.baseScan(bi, tree + OVF, &chunkKey(key, 0), &chunkKey(key, LAST_CHUNK),
+                    fn(e: &Entry): bool {
+        b.add(&e.val)
+        got += len(e.val)
+        crc = crcOf(crc, &e.val)
+        return got <= total
+    })
+    if got != total || int(crc) != want {
+        return Err(lexdb_base.err(lexdb_base.S_INTERNAL, "follower: a large value's chunks do not match it"))
+    }
+    return Ok(b.toStr())
+}
+
+// The value of key in tree as of the snapshot.
+pub fn (fo: &Follower) get(s: &FSnap, tree: int, key: &str): Result[Option[str], lexdb_base.DbErr] {
+    var bi = -1
+    var live = false
+    var kind = 0
+    var vs: []str = []
+    fo.sh.with(fn(f: mut &Fol) {
+        bi = f.baseOf(s.ckpt)
+        if bi < 0 { return }
+        live = f.live(s, tree, bi)
+        if live { kind = f.version(tree, key, s.batch, mut &vs) }
+    })
+    if bi < 0 { return Err(lexdb_base.err(lexdb_base.S_INTERNAL, "follower: the snapshot has ended")) }
+    if !live || kind == 2 { return Ok(None) }
+    if kind == 1 { return Ok(Some(pop(mut &vs))) }
+    match try fo.baseGet(bi, tree, key) {
+        Some(v) { return Ok(Some(try fo.unstore(bi, tree, key, v))) }
+        None { return Ok(None) }
+    }
+}
+
+// The entries of tree with keys in [from, to) (to "": to the end) as of
+// the snapshot, in order, while f gives true.
+// The delta's keys in [from, to) as of the snapshot, in order, each a
+// value or gone; and the snapshot's base and whether the tree is there.
+type DRange = record { bi: int; live: bool; keys: []str; vals: []str; gone: []bool }
+
+fn (fo: &Follower) deltaRange(s: &FSnap, tree: int, from: &str, to: &str): DRange {
+    var r = DRange{bi: -1, live: false, keys: [], vals: [], gone: []}
+    fo.sh.with(fn(fl: mut &Fol) {
+        r.bi = fl.baseOf(s.ckpt)
+        if r.bi < 0 { return }
+        r.live = fl.live(s, tree, r.bi)
+        if !r.live || !fl.deltas.has(&tree) { return }
+        let d = fl.deltas.at(tree)
+        // each run's keys in the range, merged (the runs are sorted, and
+        // hold no key twice)
+        var ks: []int = []
+        for run in d.runs {
+            var lo = 0
+            var hi = len(run)
+            while lo < hi {
+                let m = (lo + hi) / 2
+                if d.keys[run[m]] < from { lo = m + 1 } else { hi = m }
+            }
+            var end = lo
+            if len(to) == 0 { end = len(run) } else {
+                var h = len(run)
+                while end < h {
+                    let m = (end + h) / 2
+                    if d.keys[run[m]] < to { end = m + 1 } else { h = m }
+                }
+            }
+            if end > lo { ks = mergeKeys(&d.keys, &ks, &run[lo..end]) }
+        }
+        for k in ks {
+            var vs: []str = []
+            let kind = versionAt(d, k, s.batch, mut &vs)
+            if kind > 0 {
+                append(mut &r.keys, d.keys[k])
+                append(mut &r.gone, kind == 2)
+                append(mut &r.vals, if kind == 1 { pop(mut &vs) } else { "" })
+            }
+        }
+    })
+    return r
+}
+
+pub fn (fo: &Follower) scan(s: &FSnap, tree: int, from: &str, to: &str, f: &fn(&Entry): bool): Result[Unit, lexdb_base.DbErr] {
+    let dr = fo.deltaRange(s, tree, from, to)
+    let bi = dr.bi
+    let live = dr.live
+    let dkeys = &dr.keys
+    let dvals = &dr.vals
+    let dgone = &dr.gone
+    if bi < 0 { return Err(lexdb_base.err(lexdb_base.S_INTERNAL, "follower: the snapshot has ended")) }
+    if !live { return Ok(Unit{}) }
+    var j = 0
+    var go = true
+    var bad: []lexdb_base.DbErr = []
+    try fo.baseScan(bi, tree, from, to, fn(e: &Entry): bool {
+        // the delta's keys before this one, then this one, its version first
+        while j < len(dkeys) && dkeys[j] < e.key {
+            if !dgone[j] && !f(&Entry{key: dkeys[j], val: dvals[j]}) {
+                go = false
+                return false
+            }
+            j += 1
+        }
+        if j < len(dkeys) && dkeys[j] == e.key {
+            let gone = dgone[j]
+            let v = dvals[j]
+            j += 1
+            if gone { return true }
+            if !f(&Entry{key: e.key, val: v}) {
+                go = false
+                return false
+            }
+            return true
+        }
+        match fo.unstore(bi, tree, &e.key, e.val) {
+            Ok(v) {
+                if !f(&Entry{key: e.key, val: v}) {
+                    go = false
+                    return false
+                }
+            }
+            Err(x) {
+                append(mut &bad, x)
+                go = false
+                return false
+            }
+        }
+        return true
+    })
+    if len(bad) > 0 { return Err(bad[0]) }
+    while go && j < len(dkeys) {
+        if !dgone[j] && !f(&Entry{key: dkeys[j], val: dvals[j]}) { return Ok(Unit{}) }
+        j += 1
+    }
+    return Ok(Unit{})
+}
+
+pub type FStats = value record { pub applied: int; pub bases: int; pub ckpt: int; pub cached: int; pub cacheBytes: int; pub loads: int; pub evictions: int; pub freed: int; pub deltaKeys: int; pub snaps: int }
+
+pub fn (fo: &Follower) stats(): FStats {
+    var s = FStats{applied: 0, bases: 0, ckpt: -1, cached: 0, cacheBytes: 0, loads: 0, evictions: 0, freed: 0, deltaKeys: 0, snaps: 0}
+    fo.sh.with(fn(f: mut &Fol) {
+        var dk = 0
+        for i in 0..f.deltas.size() { dk += f.deltas.valAt(i).idx.size() }
+        s = FStats{applied: f.applied, bases: len(f.bases), ckpt: if len(f.bases) > 0 { f.bases[len(f.bases) - 1].ckpt } else { -1 },
+                   cached: len(f.pool), cacheBytes: f.used, loads: f.loads, evictions: f.evictions, freed: f.freed, deltaKeys: dk, snaps: len(f.snaps)}
+    })
+    return s
+}
+
+// A descent through the base for a backward scan: the leaf holding the
+// largest keys below k (k "": the last leaf), with its lower fence (the
+// largest separator at or below its keys on the way).
+fn (f: mut &Fol) descendBack(root: int, k: &str): Step {
+    var st = Step{leaf: -1, need: -1, upper: "", hasUpper: false}
+    var p = root
+    while true {
+        match f.at.get(&p) {
+            Some(i) {
+                f.refd[i] = true
+                if f.pool[i].leaf {
+                    st.leaf = i
+                    return st
+                }
+                let j = if len(k) == 0 { len(f.pool[i].keys) } else { lowerIndex(&f.pool[i].keys, k) }
+                if j > 0 {
+                    st.upper = f.pool[i].keys[j - 1]        // here: the lower fence
+                    st.hasUpper = true
+                }
+                p = f.pool[i].kids[j]
+            }
+            None {
+                st.need = p
+                return st
+            }
+        }
+    }
+    return st
+}
+
+// baseScan, backward: from the last key below to (to "": the end) down to
+// from.
+fn (fo: &Follower) baseScanBack(bi: int, tree: int, from: &str, to: &str, f: &fn(&Entry): bool): Result[Unit, lexdb_base.DbErr] {
+    var cursor = lexdb_base.own(to)
+    while true {
+        var need = -1
+        var chunk: []Entry = []
+        var fence = ""
+        var last = true
+        var none = false
+        fo.sh.with(fn(fl: mut &Fol) {
+            match fl.bases[bi].roots.get(&tree) {
+                Some(root) {
+                    let st = fl.descendBack(root, &cursor)
+                    if st.need >= 0 {
+                        need = st.need
+                        return
+                    }
+                    let n = &fl.pool[st.leaf]
+                    var i = if len(cursor) == 0 { n.count() } else { n.lower(&cursor) }
+                    while i > 0 {
+                        i -= 1
+                        let k = n.key(i)
+                        if k < from { break }
+                        append(mut &chunk, Entry{key: k, val: n.val(i)})
+                    }
+                    last = !st.hasUpper || st.upper <= from
+                    fence = st.upper
+                }
+                None { none = true }
+            }
+        })
+        if none { return Ok(Unit{}) }
+        if need >= 0 {
+            try fo.load(need)
+            continue
+        }
+        for e in chunk { if !f(&e) { return Ok(Unit{}) } }
+        if last { return Ok(Unit{}) }
+        cursor = fence
+    }
+    return Ok(Unit{})
+}
+
+// scan, backward: the entries of tree with keys in [from, to) as of the
+// snapshot, from the last down, while f gives true.
+pub fn (fo: &Follower) scanBack(s: &FSnap, tree: int, from: &str, to: &str, f: &fn(&Entry): bool): Result[Unit, lexdb_base.DbErr] {
+    let dr = fo.deltaRange(s, tree, from, to)
+    if dr.bi < 0 { return Err(lexdb_base.err(lexdb_base.S_INTERNAL, "follower: the snapshot has ended")) }
+    if !dr.live { return Ok(Unit{}) }
+    let bi = dr.bi
+    var j = len(dr.keys) - 1
+    var go = true
+    var bad: []lexdb_base.DbErr = []
+    try fo.baseScanBack(bi, tree, from, to, fn(e: &Entry): bool {
+        // the delta's keys after this one, then this one, its version first
+        while j >= 0 && dr.keys[j] > e.key {
+            if !dr.gone[j] && !f(&Entry{key: dr.keys[j], val: dr.vals[j]}) {
+                go = false
+                return false
+            }
+            j -= 1
+        }
+        if j >= 0 && dr.keys[j] == e.key {
+            let gone = dr.gone[j]
+            let v = dr.vals[j]
+            j -= 1
+            if gone { return true }
+            if !f(&Entry{key: e.key, val: v}) {
+                go = false
+                return false
+            }
+            return true
+        }
+        match fo.unstore(bi, tree, &e.key, e.val) {
+            Ok(v) {
+                if !f(&Entry{key: e.key, val: v}) {
+                    go = false
+                    return false
+                }
+            }
+            Err(x) {
+                append(mut &bad, x)
+                go = false
+                return false
+            }
+        }
+        return true
+    })
+    if len(bad) > 0 { return Err(bad[0]) }
+    while go && j >= 0 {
+        if !dr.gone[j] && !f(&Entry{key: dr.keys[j], val: dr.vals[j]}) { return Ok(Unit{}) }
+        j -= 1
+    }
+    return Ok(Unit{})
+}
+
+// The trees there as of the last batch applied (tree ids, no companions).
+pub fn (fo: &Follower) trees(): []int {
+    var out: []int = []
+    fo.sh.with(fn(f: mut &Fol) {
+        if len(f.bases) == 0 { return }
+        let s = FSnap{id: -1, batch: f.applied, ckpt: f.bases[len(f.bases) - 1].ckpt}
+        let bi = len(f.bases) - 1
+        var ids: []int = []
+        for i in 0..f.bases[bi].roots.size() {
+            let id: int = f.bases[bi].roots.keyAt(i)
+            append(mut &ids, id)
+        }
+        for i in 0..f.life.size() {
+            let id: int = f.life.keyAt(i)
+            if !f.bases[bi].roots.has(&id) { append(mut &ids, id) }
+        }
+        for id in ids { if !isOvf(id) && f.live(&s, id, bi) { append(mut &out, id) } }
+    })
+    return out
+}
+
+// Counts the writes applied to tree from now on (changes): Store.watch.
+pub fn (fo: &Follower) watch(tree: int) {
+    fo.sh.with(fn(f: mut &Fol) {
+        f.watched = tree
+        f.watchedWrites = 0
+    })
+}
+
+pub fn (fo: &Follower) changes(): int {
+    var n = 0
+    fo.sh.with(fn(f: mut &Fol) { n = f.watchedWrites })
+    return n
+}
+
+// ==== a replica's store (design/lexdb.md 9.72)
+
+// A store that reads through a follower of the master that link names, in
+// the data directory fs: the SQL layer runs on it as on the master's, and
+// its writes fail (25006, read_only_sql_transaction). It is ready once the
+// follower is (Follower.ready); poll applies the master's batches.
+pub fn openReplica(fs: lexdb_disk.Fs, opts: Options, link: Link): Result[Store, lexdb_base.DbErr] {
+    let fo = try openFollowerHow(link, fs, opts.cacheBytes, opts.bufferedPages)
+    // the Db keeps what the SQL layer keeps (the memo) and the counters
+    let m = lexdb_page.Meta{ckpt: 0, npages: 2, roots: 0, free: 0, replaySeg: 1, replayOff: 0, replayBatch: 1, nextTree: 1,
+                            dropped: 0, runs: 0, covers: -1}
+    let db = newDb(fs, lexdb_disk.File.Real(-1, false), opts, &m)
+    return Ok(Store{sh: task.shared(db), fo: Some(fo)})
+}
+
+pub fn (st: &Store) isReplica(): bool { return st.fo.isSome() }
+
+// A replica's follower.
+pub fn (st: &Store) follower(): Option[Follower] { return st.fo }
+
+// A replica transaction's follower snapshot. Dropping it ends the
+// snapshot: the SQL layer drops some transactions without ending them (a
+// prepared statement's Describe reads the catalog in one), harmless on the
+// master, whose plain transactions read the live trees and pin nothing; on
+// a replica every read pins a base, and one never let go keeps the master's
+// pages and log held, and the delta growing.
+type RepPin = record { fo: Follower; s: FSnap }
+
+fn (p: mut &RepPin) drop() { p.fo.end(&p.s) }
+
+// The transaction's follower snapshot, taken at its first read.
+fn repSnap(fo: &Follower, t: mut &Txn): Result[FSnap, lexdb_base.DbErr] {
+    if len(t.fsnap) == 0 { append(mut &t.fsnap, RepPin{fo: fo, s: try fo.begin()}) }
+    return Ok(t.fsnap[0].s)
+}
+
+pub fn readOnly(what: &str): lexdb_base.DbErr {
+    return lexdb_base.err(lexdb_base.S_READ_ONLY, "cannot execute " + what + " in a read-only transaction")
+}
+
+// A replica transaction's end: its snapshot ends; one with writes fails.
+fn (st: &Store) repEnd(t: &Txn): Result[Unit, lexdb_base.DbErr] {
+    st.endSnapshot(t)
+    if len(t.writes) > 0 { return Err(readOnly(&"a write on a replica")) }
+    return Ok(Unit{})
 }

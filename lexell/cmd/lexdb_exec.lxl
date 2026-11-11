@@ -7444,6 +7444,12 @@ fn hasSubs(s: &lexdb_sql.Stmt): bool {
 
 fn execStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int,
             lim: Limits, pc: mut &PlanCache, input: &CopyInput): Result[Res, DbErr] {
+    if st.isReplica() {
+        match writesOn(s) {
+            Some(what) { return Err(lexdb_store.readOnly(&what)) }
+            None {}
+        }
+    }
     if len(s.wins) > 0 && s.kind != lexdb_sql.S_SELECT {
         let what = if len(s.items) > 0 && s.kind != lexdb_sql.S_SELECT { "RETURNING" } else { stmtName(s.kind) }
         return Err(e("42P20", "window functions are not allowed in " + what))
@@ -7469,6 +7475,20 @@ fn execStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
         lexdb_sql.S_EXPLAIN { return explain(st, txn, s, params, lim, ptypes) }
         else { return Err(e("XX000", "not a data statement")) }
     }
+}
+
+// What a statement would write, refused on a replica before it runs (as a
+// PostgreSQL standby does): None for a query, COPY TO, and EXPLAIN without
+// ANALYZE of a write. A write the statement gets to anyway (a sequence's
+// nextval) fails at its commit (lexdb_store.readOnly).
+fn writesOn(s: &lexdb_sql.Stmt): Option[str] {
+    if s.kind == lexdb_sql.S_SELECT { return None }
+    if s.kind == lexdb_sql.S_COPY { return if s.copy.from { Some("COPY FROM") } else { None } }
+    if s.kind == lexdb_sql.S_EXPLAIN {
+        if s.ifFlag && len(s.inner) > 0 { return writesOn(&s.inner[0]) }
+        return None
+    }
+    return Some(stmtName(s.kind))
 }
 
 // Converts the parameters a client sent as text to values of their types.
