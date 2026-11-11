@@ -366,7 +366,17 @@ pub type Stmt = record {
     pub copy: CopyOpts          // COPY's
     pub wins: []WinDef          // its window calls: an expression names one by number (#win, 9.46)
     pub windows: []NamedWin     // WINDOW name AS (...), ...
+    // INSERT ... ON CONFLICT (9.77): CONFLICT_*; its target (columns, or a
+    // constraint's name); DO UPDATE's SET in sets, its WHERE in where
+    pub conflict: int
+    pub conflictCols: []str
+    pub conflictCon: str
+    pub alias: str              // INSERT INTO t AS alias
 }
+
+pub const CONFLICT_NONE = 0
+pub const CONFLICT_NOTHING = 1
+pub const CONFLICT_UPDATE = 2
 
 // A window call: f(args) OVER (...). In its query's expressions it is
 // Call("#win", [Lit(i), the call]), i its number in Stmt.wins (the call
@@ -429,7 +439,7 @@ fn newStmt(kind: int): Stmt {
                 group: [], order: [], limit: None, offset: None, sets: [], params: 0, from: [], index: "",
                 unique: false, inner: [], distinct: false, having: None, subs: [], use: 0, setop: 0, setAll: false,
                 cte: -1, rec: false, cascade: false, src: "", srf: "", ordin: false, alters: [], cons: [], seqNames: [], seq: noSeqOpts(), idOpts: [], overriding: OVR_NONE,
-                copy: noCopyOpts(), wins: [], windows: []}
+                copy: noCopyOpts(), wins: [], windows: [], conflict: CONFLICT_NONE, conflictCols: [], conflictCon: "", alias: ""}
 }
 
 // ---- the lexer
@@ -1778,6 +1788,7 @@ fn (p: mut &P) insert(): Result[Stmt, lexdb_base.DbErr] {
     try p.expectKw("into")
     var s = newStmt(S_INSERT)
     s.table = try p.qname()
+    if p.acceptKw("as") { s.alias = try p.name() }
     if p.isKw("(") && !p.selectNext() {
         p.pos += 1
         append(mut &s.names, try p.name())
@@ -1802,6 +1813,7 @@ fn (p: mut &P) insert(): Result[Stmt, lexdb_base.DbErr] {
         q.wins = replace(mut &p.wins, [])
         q.params = p.params
         append(mut &s.inner, q)
+        try p.onConflict(mut &s)
         try p.returning(mut &s)
         return Ok(s)
     }
@@ -1809,6 +1821,7 @@ fn (p: mut &P) insert(): Result[Stmt, lexdb_base.DbErr] {
         // DEFAULT VALUES: one row, every column its default
         try p.expectKw("values")
         append(mut &s.rows, [])
+        try p.onConflict(mut &s)
         try p.returning(mut &s)
         return Ok(s)
     }
@@ -1822,8 +1835,58 @@ fn (p: mut &P) insert(): Result[Stmt, lexdb_base.DbErr] {
         append(mut &s.rows, row)
         if !p.acceptKw(",") { break }
     }
+    try p.onConflict(mut &s)
     try p.returning(mut &s)
     return Ok(s)
+}
+
+// ON CONFLICT [(col, ...) [WHERE pred] | ON CONSTRAINT name]
+//   DO NOTHING | DO UPDATE SET col = expr, ... [WHERE cond]  (9.77)
+// A target's WHERE (a partial unique index's predicate) is read and not
+// kept: the index is chosen by its columns.
+fn (p: mut &P) onConflict(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
+    if !p.isKw("on") { return Ok(Unit{}) }
+    p.pos += 1
+    try p.expectKw("conflict")
+    if p.acceptKw("(") {
+        append(mut &s.conflictCols, try p.name())
+        while p.acceptKw(",") { append(mut &s.conflictCols, try p.name()) }
+        try p.expectKw(")")
+        if p.acceptKw("where") { let pred = try p.expr() }
+    } else if p.acceptKw("on") {
+        try p.expectKw("constraint")
+        s.conflictCon = try p.name()
+    }
+    try p.expectKw("do")
+    if p.acceptKw("nothing") {
+        s.conflict = CONFLICT_NOTHING
+        return Ok(Unit{})
+    }
+    try p.expectKw("update")
+    try p.expectKw("set")
+    s.conflict = CONFLICT_UPDATE
+    while true {
+        if p.acceptKw("(") {
+            // (a, b) = (x, y)
+            var cols: []str = [try p.name()]
+            while p.acceptKw(",") { append(mut &cols, try p.name()) }
+            try p.expectKw(")")
+            try p.expectKw("=")
+            try p.expectKw("(")
+            for i in 0..len(cols) {
+                if i > 0 { try p.expectKw(",") }
+                append(mut &s.sets, SetItem{col: cols[i], expr: try p.valueOrDefault()})
+            }
+            try p.expectKw(")")
+        } else {
+            let c = try p.name()
+            try p.expectKw("=")
+            append(mut &s.sets, SetItem{col: c, expr: try p.valueOrDefault()})
+        }
+        if !p.acceptKw(",") { break }
+    }
+    if p.acceptKw("where") { s.where = Some(try p.expr()) }
+    return Ok(Unit{})
 }
 
 // SELECT, after its keyword: a query, or queries joined by UNION,

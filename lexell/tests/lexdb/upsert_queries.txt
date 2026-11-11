@@ -1,0 +1,47 @@
+# INSERT ... ON CONFLICT, compared with PostgreSQL (tests/lexdb/gen_pg.py upsert).
+create table u (id int primary key, email text unique, name text, hits int not null default 0)
+insert into u values (1, 'a@x', 'Ann', 0), (2, 'b@x', 'Bob', 0)
+# DO NOTHING: on the primary key, a unique column, any key
+insert into u values (1, 'z@x', 'Zed', 0) on conflict do nothing
+insert into u values (3, 'a@x', 'Ann2', 0) on conflict do nothing
+insert into u values (1, 'q@x', 'Q', 0) on conflict (id) do nothing
+insert into u values (4, 'b@x', 'B2', 0) on conflict (email) do nothing
+insert into u values (5, 'e@x', 'Eve', 0) on conflict do nothing
+select * from u order by id
+# DO UPDATE with EXCLUDED, the row there by bare name and by table name
+insert into u values (1, 'a@x', 'Annie', 0) on conflict (id) do update set name = excluded.name, hits = u.hits + 1
+insert into u values (9, 'b@x', 'Bobby', 0) on conflict (email) do update set name = excluded.name || '!', hits = hits + 10
+select * from u order by id
+# WHERE on DO UPDATE: false leaves the row and counts nothing
+insert into u values (1, 'a@x', 'Never', 0) on conflict (id) do update set name = excluded.name where u.hits > 100
+insert into u values (2, 'b@x', 'Maybe', 0) on conflict (id) do update set name = excluded.name where u.hits >= 10
+select * from u order by id
+# RETURNING: the rows inserted and updated, not those left
+insert into u values (1, 'a@x', 'R1', 0), (6, 'f@x', 'R6', 0) on conflict (id) do update set name = excluded.name returning id, name, hits
+insert into u values (1, 'a@x', 'R1', 0), (7, 'g@x', 'R7', 0) on conflict do nothing returning id
+# a row the statement already touched: an error, and nothing done
+insert into u values (8, 'h@x', 'H', 0), (8, 'h2@x', 'H2', 0) on conflict (id) do update set name = excluded.name
+insert into u values (8, 'h@x', 'H', 0), (8, 'h2@x', 'H2', 0) on conflict (id) do nothing
+select * from u order by id
+# targets: ON CONSTRAINT, several columns, none matching, DO UPDATE without one
+insert into u values (2, 'b@x', 'C', 0) on conflict on constraint u_pkey do update set name = 'by constraint'
+insert into u values (2, 'b@x', 'C', 0) on conflict (name) do nothing
+insert into u values (2, 'b@x', 'C', 0) on conflict do update set name = 'x'
+insert into u values (2, 'b@x', 'C', 0) on conflict on constraint nope do nothing
+create table pair (a int, b int, v text, primary key (a, b))
+insert into pair values (1, 1, 'one'), (1, 2, 'two')
+insert into pair values (1, 2, 'TWO'), (2, 1, 'new') on conflict (b, a) do update set v = excluded.v
+select * from pair order by a, b
+# another unique key still raises its error
+insert into u values (2, 'a@x', 'D', 0) on conflict (id) do update set email = excluded.email
+# an alias, a DEFAULT, a column list, multi-column SET, INSERT ... SELECT
+insert into u as t (id, email, name) values (2, 'b@x', 'Alias') on conflict (id) do update set name = excluded.name, hits = t.hits + 1
+insert into u values (2, 'b@x', 'Def', 5) on conflict (id) do update set hits = default
+insert into u (id, email) values (2, 'b@x') on conflict (id) do update set (name, hits) = ('pair', 42)
+insert into u select id, email, name || '+', 0 from u where id <= 2 on conflict (id) do update set name = excluded.name
+select * from u order by id
+# with a transaction rolled back, nothing stays
+begin
+insert into u values (1, 'a@x', 'Rolled', 0) on conflict (id) do update set name = excluded.name
+rollback
+select name from u where id = 1

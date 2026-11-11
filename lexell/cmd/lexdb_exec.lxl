@@ -5809,12 +5809,14 @@ fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
         }
     }
     var ret = try retOf(s, &q, mut &sc)
+    var up = try upsertOf(s, &t, mut &sc)
     endScope(mut &sc, mut &q)
     var rs = newRun(&q)
     rs.limit(&lim)
     let m = try prepare(st, txn, &q, params, mut &rs)
     var kept: [][]Val = []
     var count = 0
+    let parents = up.mode == lexdb_sql.CONFLICT_UPDATE        // an update may change a key other rows refer to
     if len(s.inner) > 0 {
         // INSERT ... SELECT: the query runs to its end first, so it never
         // reads the rows it inserts
@@ -5822,8 +5824,10 @@ fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
         var pc = oneShot()
         let res = try select(st, txn, &s.inner[0], params, &noTypes, lim, mut &pc)
         let defs = try defaultsOf(st, txn, &t)
-        let fw = try fkTables(st, txn, &t, true, false)
+        let fw = try fkTables(st, txn, &t, true, parents)
         var later: []FkLater = []
+        let noAggs: []Val = []
+        let env = Env{cols: &q.cols, row: &noAggs, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: sqe}
         for r in res.rows {
             var vs: []Val = []
             for k in 0..len(r) {
@@ -5833,16 +5837,20 @@ fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
                     append(mut &vs, r[k])
                 }
             }
-            let row = try insertOne(st, txn, &t, &targets, &vs, &defs, &fw, mut &later)
-            if ret.on { append(mut &kept, row) }
-            count += 1
+            match try insertOne(st, txn, &t, &targets, &vs, &defs, &fw, mut &later, mut &up, &env) {
+                Some(row) {
+                    if ret.on { append(mut &kept, row) }
+                    count += 1
+                }
+                None {}
+            }
         }
         try fkFinish(st, txn, &fw, mut &later)
     } else {
         let noAggs: []Val = []
         let env = Env{cols: &q.cols, row: &noAggs, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: sqe}
-        count = if resolved { try insertRows(st, txn, &t, &targets, &rows, &env, s.overriding, ret.on, mut &kept) }
-                else { try insertRows(st, txn, &t, &targets, &s.rows, &env, s.overriding, ret.on, mut &kept) }
+        count = if resolved { try insertRows(st, txn, &t, &targets, &rows, &env, s.overriding, ret.on, mut &kept, mut &up) }
+                else { try insertRows(st, txn, &t, &targets, &s.rows, &env, s.overriding, ret.on, mut &kept, mut &up) }
     }
     for row in kept { try retAdd(st, txn, &q, &m, params, mut &ret, &row, mut &rs) }
     return Ok(retRes(ret, "INSERT 0 " + count.toStr()))
@@ -5901,9 +5909,9 @@ fn idDefault(t: &Table, i: int, isDef: bool, ovr: int): Result[bool, DbErr] {
 
 // The rows of VALUES inserted: their count (each kept, with keep).
 fn insertRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, targets: &[]int, rows: &[][]Expr,
-              env: &Env, ovr: int, keep: bool, kept: mut &[][]Val): Result[int, DbErr] {
+              env: &Env, ovr: int, keep: bool, kept: mut &[][]Val, up: mut &Upsert): Result[int, DbErr] {
     let defs = try defaultsOf(st, txn, t)
-    let fw = try fkTables(st, txn, t, true, false)
+    let fw = try fkTables(st, txn, t, true, up.mode == lexdb_sql.CONFLICT_UPDATE)
     var later: []FkLater = []
     var count = 0
     for r in rows {
@@ -5917,18 +5925,23 @@ fn insertRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, targ
                 append(mut &vs, try eval(&r[k], env))
             }
         }
-        let row = try insertOne(st, txn, t, targets, &vs, &defs, &fw, mut &later)
-        if keep { append(kept, row) }
-        count += 1
+        match try insertOne(st, txn, t, targets, &vs, &defs, &fw, mut &later, up, env) {
+            Some(row) {
+                if keep { append(kept, row) }
+                count += 1
+            }
+            None {}
+        }
     }
     try fkFinish(st, txn, &fw, mut &later)
     return Ok(count)
 }
 
 // A row of values for the target columns (the rest their defaults): the
-// row inserted.
+// row inserted, or under ON CONFLICT the row it updated instead (9.77);
+// None when it did neither (DO NOTHING, or DO UPDATE's WHERE false).
 fn insertOne(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, targets: &[]int, vs: &[]Val,
-             defs: &Defs, fw: &[]Table, later: mut &[]FkLater): Result[[]Val, DbErr] {
+             defs: &Defs, fw: &[]Table, later: mut &[]FkLater, up: mut &Upsert, env: &Env): Result[Option[[]Val], DbErr] {
     if len(vs) > len(targets) { return Err(e("42601", "INSERT has more expressions than target columns")) }
     var row = nullRow(len(t.cols))
     var given: []bool = []
@@ -5942,6 +5955,160 @@ fn insertOne(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, targe
     for i in 0..len(t.cols) { if !given[i] { row[i] = try defAt(st, txn, defs, t, i) } }
     try checkRow(t, &row)
     try checkChecks(t, &row)
+    if up.mode != lexdb_sql.CONFLICT_NONE {
+        match try conflictOf(st, txn, t, up, &row) {
+            Some(old) { return upsertOld(st, txn, t, defs, fw, later, up, env, &old, &row) }
+            None {}
+        }
+    }
+    let r = try storeRow(st, txn, t, row, fw, later)
+    if up.mode != lexdb_sql.CONFLICT_NONE { up.touched.put(keyOf(t, &r), 1) }
+    return Ok(Some(r))
+}
+
+// ---- INSERT ... ON CONFLICT (9.77)
+
+// What an INSERT does on a conflict: nothing, or update the row there.
+type Upsert = record {
+    mode: int                   // lexdb_sql.CONFLICT_*
+    arb: []int                  // the unique keys that count: -1 the primary key, else an index of t.indexes
+    targets: []int              // DO UPDATE SET's columns
+    sets: []Expr                // ... and values, over cols
+    cond: Option[Expr]          // DO UPDATE's WHERE, over cols
+    cols: []lexdb_sql.ColDef    // the table's columns (alias.column), then EXCLUDED's (excluded.column)
+    touched: Map[str, int]      // the rows the statement inserted or updated, by primary key
+}
+
+fn noUpsert(): Upsert {
+    return Upsert{mode: lexdb_sql.CONFLICT_NONE, arb: [], targets: [], sets: [], cond: None, cols: [], touched: newMap()}
+}
+
+fn sameCols(a: &[]int, b: &[]int): bool {
+    if len(a) != len(b) { return false }
+    for x in a {
+        var found = false
+        for y in b { if x == y { found = true } }
+        if !found { return false }
+    }
+    return true
+}
+
+// The ON CONFLICT of s on table t: its unique keys (the target's, or every
+// one for DO NOTHING without a target) and DO UPDATE's assignments,
+// resolved over the table's columns as alias.column and EXCLUDED's as
+// excluded.column: a bare name in an expression is in both, so ambiguous
+// (42702), as in PostgreSQL; only the column SET names stands alone.
+fn upsertOf(s: &lexdb_sql.Stmt, t: &Table, sc: mut &Scope): Result[Upsert, DbErr] {
+    var up = noUpsert()
+    up.mode = s.conflict
+    if s.conflict == lexdb_sql.CONFLICT_NONE { return Ok(up) }
+    let tname = lexdb_sql.baseName(&t.name)
+    if len(s.conflictCols) > 0 {
+        var cs: []int = []
+        for n in s.conflictCols {
+            let i = colIndex(&t.cols, &n)
+            if i < 0 { return Err(e("42703", "column \"" + n + "\" does not exist")) }
+            append(mut &cs, i)
+        }
+        if sameCols(&cs, &t.pk) { append(mut &up.arb, -1) }
+        for i in 0..len(t.indexes) { if t.indexes[i].unique && sameCols(&cs, &t.indexes[i].cols) { append(mut &up.arb, i) } }
+        if len(up.arb) == 0 {
+            return Err(e("42P10", "there is no unique or exclusion constraint matching the ON CONFLICT specification"))
+        }
+    } else if s.conflictCon != "" {
+        if s.conflictCon == tname + "_pkey" { append(mut &up.arb, -1) }
+        for i in 0..len(t.indexes) {
+            if t.indexes[i].unique && lexdb_sql.baseName(&t.indexes[i].name) == s.conflictCon { append(mut &up.arb, i) }
+        }
+        if len(up.arb) == 0 { return Err(e("42704", "constraint \"" + s.conflictCon + "\" for table \"" + tname + "\" does not exist")) }
+    } else {
+        if s.conflict == lexdb_sql.CONFLICT_UPDATE {
+            return Err(e("42601", "ON CONFLICT DO UPDATE requires inference specification or constraint name"))
+        }
+        append(mut &up.arb, -1)
+        for i in 0..len(t.indexes) { if t.indexes[i].unique { append(mut &up.arb, i) } }
+    }
+    if s.conflict == lexdb_sql.CONFLICT_NOTHING { return Ok(up) }
+    let alias = if s.alias != "" { s.alias } else { tname }
+    for c in t.cols { append(mut &up.cols, lexdb_sql.colDef(alias + "." + c.name, c.typ, false)) }
+    for c in t.cols { append(mut &up.cols, lexdb_sql.colDef("excluded." + c.name, c.typ, false)) }
+    for set in s.sets {
+        let i = colIndex(&t.cols, &set.col)
+        if i < 0 { return Err(e("42703", "column \"" + set.col + "\" of relation \"" + tname + "\" does not exist")) }
+        if t.cols[i].identity == lexdb_sql.ID_ALWAYS && !lexdb_sql.isDefault(&set.expr) {
+            return Err(e("428C9", "column \"" + t.cols[i].name + "\" can only be updated to DEFAULT"))
+        }
+        append(mut &up.targets, i)
+        append(mut &up.sets, try resolve(&set.expr, &up.cols, len(up.cols), sc))
+    }
+    match s.where {
+        Some(w) { up.cond = Some(try resolve(&w, &up.cols, len(up.cols), sc)) }
+        None {}
+    }
+    return Ok(up)
+}
+
+// The row already in t that row conflicts with on one of up's unique keys,
+// if any.
+fn conflictOf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, up: &Upsert, row: &[]Val): Result[Option[[]Val], DbErr] {
+    for a in up.arb {
+        var pk = ""
+        if a < 0 {
+            pk = keyOf(t, row)
+        } else {
+            let ix = &t.indexes[a]
+            if hasNull(ix, row) || !(try inIndex(t, ix, row)) { continue }
+            let pre = idxPrefix(ix, row)
+            var hit: []str = []
+            try st.scan(txn, ix.tree, pre, succ(&pre), fn(en: &lexdb_store.Entry): bool {
+                append(mut &hit, en.val)
+                return false
+            })
+            if len(hit) == 0 { continue }
+            pk = hit[0]
+        }
+        match try st.get(txn, t.tree, pk) {
+            Some(v) {
+                let all: []bool = []
+                return Ok(Some(try rowOf(st, txn, t, &pk, &v, rowWidth(t), &all, &placesMissing(t))))
+            }
+            None {}
+        }
+    }
+    return Ok(None)
+}
+
+// The row there (old), the row proposed (row): DO NOTHING leaves it; DO
+// UPDATE sets its columns, unless its WHERE is not true, and may not touch
+// a row the statement inserted or updated already (21000).
+fn upsertOld(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, defs: &Defs, fw: &[]Table, later: mut &[]FkLater,
+             up: mut &Upsert, env: &Env, old: &[]Val, row: &[]Val): Result[Option[[]Val], DbErr] {
+    if up.mode == lexdb_sql.CONFLICT_NOTHING { return Ok(None) }
+    let oldKey = keyOf(t, old)
+    if up.touched.has(&oldKey) {
+        return Err(e("21000", "ON CONFLICT DO UPDATE command cannot affect row a second time"))
+    }
+    var both: []Val = copyRow(old)
+    for v in row { append(mut &both, v) }
+    let uenv = Env{cols: &up.cols, row: &both, aggs: env.aggs, params: env.params, subs: env.subs, cur: env.cur, seq: env.seq}
+    match up.cond {
+        Some(c) { if truth(&(try eval(&c, &uenv))) != Some(true) { return Ok(None) } }
+        None {}
+    }
+    var next = copyRow(old)
+    for k in 0..len(up.sets) {
+        let ci = up.targets[k]
+        if lexdb_sql.isDefault(&up.sets[k]) { next[ci] = try defAt(st, txn, defs, t, ci) }
+        else { next[ci] = try coerce(try eval(&up.sets[k], &uenv), &t.cols[ci].typ) }
+    }
+    try updRow(st, txn, t, old, &next, fw, later)
+    up.touched.put(keyOf(t, &next), 1)
+    return Ok(Some(next))
+}
+
+// A built row stored: its key free, its indexes and foreign keys checked.
+fn storeRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, row: []Val, fw: &[]Table,
+            later: mut &[]FkLater): Result[[]Val, DbErr] {
     let key = keyOf(t, &row)
     if (try st.get(txn, t.tree, key)).isSome() { return Err(dupKey(t, &row)) }
     let enc = encRowOf(t, &row)
@@ -9595,6 +9762,11 @@ fn copyStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
     var count = 0
     let data = &input.data
     let where = "COPY " + lexdb_sql.baseName(&s.table) + ", line "
+    var noUp = noUpsert()                   // COPY has no ON CONFLICT
+    let noCols: []lexdb_sql.ColDef = []
+    let none: []Val = []
+    let noSubs: []SubRes = []
+    let noEnv = Env{cols: &noCols, row: &none, aggs: &none, params: &none, subs: &noSubs, cur: &none, seq: None}
     if s.copy.header {
         match copyRecord(data, &s.copy, mut &rd, mut &vs) {
             Ok(_) {}
@@ -9621,7 +9793,7 @@ fn copyStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
                 Err(x) { return Err(within(x, at + ", column " + names[k] + ": " + quoted(&text(&vs[k])))) }
             }
         }
-        match insertOne(st, txn, &t, &targets, &vs, &defs, &fw, mut &later) {
+        match insertOne(st, txn, &t, &targets, &vs, &defs, &fw, mut &later, mut &noUp, &noEnv) {
             Ok(_) {}
             Err(x) { return Err(within(x, at)) }
         }

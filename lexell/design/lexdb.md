@@ -5777,7 +5777,7 @@ output at the range's ends and in BC, infinity, precision, the interval
 forms (PostgreSQL's words, `hh:mm:ss`, ISO 8601, fractions, `ago`),
 casts, every operator, comparisons across the types, `extract` and
 `date_trunc` fields, `age`, errors, and the types stored, keyed, indexed,
-sorted, aggregated and updated. `tests/lexdb/gen_time.py` runs them on
+sorted, aggregated and updated. `tests/lexdb/gen_pg.py` runs them on
 PostgreSQL (18.6 here) and writes `exec_time`, which expects PostgreSQL's
 answers from lexdb's executor; all 93 agree.
 
@@ -5796,3 +5796,71 @@ Found on the way:
 
 All 66 lexdb tests pass. The crash test was not run: storage changed
 only in the new tags.
+
+### 9.77 INSERT ... ON CONFLICT
+
+```
+INSERT INTO t [AS alias] ... ON CONFLICT [(col, ...) [WHERE pred] | ON CONSTRAINT name]
+    DO NOTHING | DO UPDATE SET col = expr, ... | (a, b) = (x, y) [WHERE cond]
+```
+
+It works after VALUES, `DEFAULT VALUES` and `INSERT ... SELECT`.
+
+- **The keys that count:**
+  - a target's columns choose the primary key or a unique index with the
+    same columns, in any order;
+  - `ON CONSTRAINT` names one (the primary key is `t_pkey`);
+  - DO NOTHING without a target counts every unique key, and DO UPDATE
+    needs a target (42601);
+  - no key matches the target: 42P10; an unknown constraint: 42704;
+  - a target's WHERE (a partial index's predicate) is read and not used.
+- **Each proposed row** is made as an INSERT would make it (defaults,
+  coercion, NOT NULL and CHECK). Then the rows there are looked up by
+  each key, the primary key by its key and an index by its prefix.
+  - **DO NOTHING** skips the row.
+  - **DO UPDATE** updates the row there through UPDATE's path, so other
+    unique keys, CHECKs and foreign keys still hold, and its tree is
+    written as an UPDATE's.
+- **In DO UPDATE's expressions:**
+  - `excluded.col` is the proposed row, `t.col` or `alias.col` the row
+    there;
+  - a bare name is in both, so ambiguous (42702), as in PostgreSQL; only
+    the column SET names stands alone;
+  - `DEFAULT` is the column's default;
+  - the WHERE decides whether the row is updated (not, if it is not true).
+- **A row the statement already inserted or updated,** met again by DO
+  UPDATE, is 21000 ("cannot affect row a second time"). DO NOTHING skips
+  it.
+- **RETURNING** gives the rows inserted and updated, and the tag `INSERT
+  0 n` counts both.
+
+`insertOne` is now in three parts: building the row, the conflict and its
+update (`conflictOf`, `upsertOld`), and storing it (`storeRow`). COPY uses
+it with no conflict clause.
+
+**Tests:** `exec_upsert`, 37 statements generated from PostgreSQL 18.
+- **The cases:**
+  - DO NOTHING on the primary key, a unique column, and any key;
+  - DO UPDATE with EXCLUDED and the row there, and its WHERE true and
+    false;
+  - RETURNING;
+  - a row touched twice, under both actions;
+  - ON CONSTRAINT, a two-column key named in the other order, a target no
+    key matches, DO UPDATE without a target, an unknown constraint;
+  - another unique key's 23505;
+  - an alias, DEFAULT, a column list, `(a, b) = (x, y)`, `INSERT ...
+    SELECT`;
+  - ROLLBACK.
+- **The bare-name ambiguity** was found by them: lexdb first made a bare
+  name mean the row there, and PostgreSQL refuses it.
+
+`tests/lexdb/gen_pg.py` replaces `gen_time.py`. It makes every test
+checked against PostgreSQL (`gen_pg.py CONN [time] [upsert]`), each
+suite's queries in one session, so a `BEGIN ... ROLLBACK` across several
+queries runs as in the test; `exec_time`'s 93 answers came out the same.
+
+Run: `exec_upsert`, `exec_time`, and the INSERT tests one by one
+(`exec_sql`, `exec_returning`, `exec_unique`, `exec_fkey`,
+`exec_fkaction`, `exec_insertsel`, `exec_copy`, `exec_default`,
+`exec_seq`, `exec_seqcrash`, `exec_check`); not the whole suite, at the
+user's asking, while another session benchmarks.
