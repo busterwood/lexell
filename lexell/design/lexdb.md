@@ -5622,3 +5622,80 @@ databases, but it is new for a server speaking PostgreSQL's protocol
 without a pooler.
 
 Not planned: recorded for later.
+
+### 9.75 Usable by real applications: what four clients need
+
+The user's next aim: lexdb usable by real applications. Four common
+clients were pointed at a new lexdb, each doing what a web application
+does: create tables, insert with parameters, select, update, transactions,
+upsert, introspection. The clients were psycopg 3.3, asyncpg 0.32,
+SQLAlchemy 2.1 on psycopg, and node-postgres 8.23, plus psql's `\dt` and
+`\d`. The probes are in the session's scratch folder: to become a test.
+
+**What failed, and why:**
+
+| what | client | cause |
+|---|---|---|
+| almost every CREATE TABLE | all | no `timestamptz` (or `timestamp`, `date`, `time`, `interval`), `bytea`, `real`/`double precision`, `uuid`, `json`/`jsonb`. lexdb has int2/4/8, bool, numeric, text/varchar, and arrays of them. 4.8 planned `timestamptz` and `bytea`; they were never built |
+| upsert | psycopg | no `INSERT ... ON CONFLICT` |
+| connecting | SQLAlchemy | its first query, `select pg_catalog.version()`: no schema-qualified function names, no `version()` |
+| create_all, reflection | SQLAlchemy | `pg_catalog.pg_class`, `pg_namespace` and the rest: no catalog views |
+| `information_schema.tables`, `pg_tables` | psycopg | the same |
+| `\dt`, `\d` | psql | its catalog queries; `~` (regular expression match) |
+| binary results | psycopg (binary=True), asyncpg | "results in binary are not supported" |
+| typed parameters | asyncpg | it reads the parameter types lexdb describes and sends values to match: an untyped parameter is text |
+
+node-postgres and psycopg (text format) worked wherever the SQL did.
+
+**A plan, in stages, each tested by these clients:**
+
+1. **Types:**
+   - `timestamptz`, `timestamp`, `date`, `time`, `interval`, with
+     `now()`, `current_timestamp`, `current_date`, `extract`,
+     `date_trunc`, and date and interval arithmetic;
+   - `double precision`/`real`, `bytea` (hex output), `uuid`
+     (`gen_random_uuid()`), `json`/`jsonb` (validated; `->`, `->>`,
+     `@>` perhaps);
+   - `char(n)`.
+
+   Each needs: parsing, text input and output, comparison, an
+   order-keeping key encoding, a place in the fixed row layout,
+   coercion of parameters, and its OID in RowDescription.
+2. **SQL that applications use:**
+   - `INSERT ... ON CONFLICT (cols) DO NOTHING / DO UPDATE SET ... =
+     EXCLUDED.col [WHERE]`;
+   - schema-qualified function names;
+   - `version()`, `current_schema()`, `current_user`, `string_agg`,
+     `array_agg`, `ilike`, `~`;
+   - the error codes clients test for (23505 and the rest).
+3. **The catalog,** as read-only views made from lexdb's own:
+   - `information_schema` (tables, columns, key_column_usage,
+     table_constraints);
+   - `pg_catalog`: `pg_namespace`, `pg_class`, `pg_attribute`, `pg_type`,
+     `pg_index`, `pg_constraint`, `pg_attrdef`, `pg_tables`, `pg_database`,
+     `pg_settings` perhaps;
+   - the functions their queries call: `pg_table_is_visible`,
+     `format_type`, `pg_get_indexdef`, `pg_get_constraintdef`, `obj_description`.
+
+   Enough for SQLAlchemy's create_all and reflection, the usual
+   migration tools, and psql's `\dt` and `\d`. 0 left this to be
+   decided; the probes decide it.
+4. **Authentication and TLS:** SCRAM-SHA-256 (and password), TLS through
+   `lib/tls`, as 4.7 planned. Until then lexdb is for loopback only.
+5. **Binary formats** for the common types: asyncpg needs them, and JDBC
+   and psycopg's binary mode use them.
+
+**The values for the new types.** The executor's values (`Val`) are null,
+int, bool, numeric and text. Arrays were added as text in PostgreSQL's
+text form (9.27), which keeps every value printable without its type. Two
+ways for the new types:
+- **New kinds of value** (a timestamp as microseconds, a date as days, a
+  double, bytes). Exact and fast, but every match on `Val` in the executor
+  learns them, and output must know types.
+- **Text in a canonical form,** typed by the column, as arrays are (a
+  timestamptz as `2026-01-02 03:04:05.123456+00` in UTC, which sorts as
+  it compares). Fewer changes; arithmetic and functions parse and format.
+
+The recommendation is new kinds for the time types and doubles (they are
+compared, sorted and computed with all the time) and text for json, uuid
+and bytea, which are mostly stored and returned.
