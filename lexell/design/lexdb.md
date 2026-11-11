@@ -5699,3 +5699,100 @@ ways for the new types:
 The recommendation is new kinds for the time types and doubles (they are
 compared, sorted and computed with all the time) and text for json, uuid
 and bytea, which are mostly stored and returned.
+
+### 9.76 Dates, times, timestamps and intervals
+
+Stage 1 of 9.75, built on the standard library's new types
+(design/time-types.md). `cmd/lexdb_time.lxl` holds PostgreSQL's side: its
+input forms, its output (DateStyle ISO, IntervalStyle postgres), interval
+text, `extract`, `date_trunc`, `age`, and the arithmetic.
+
+**Types:**
+- `date`;
+- `time` and `time(p)`;
+- `timestamp` and `timestamp(p)` (also `timestamp without time zone`);
+- `timestamptz` (`timestamp with time zone`);
+- `interval`;
+- arrays of each.
+
+`time with time zone` is refused (0A000), as PostgreSQL advises against
+it.
+
+**Values** are new kinds of `Val`: `Date` (days), `Time` (microseconds
+since midnight), `Ts` and `Tstz` (microseconds) and `Ival` (months, days,
+microseconds).
+- **The numbers count from 2000-01-01, PostgreSQL's zero point.** That is
+  not a limit: a date before it is negative, as a Unix time before 1970 is.
+  The range is PostgreSQL's: dates from 4714-11-24 BC to 5874897 AD,
+  timestamps to 294276 AD, BC years written " BC". Counting from 2000 is
+  what lets the whole range fit 64 bits of microseconds; from 1970 it would
+  end about 30 years short. PostgreSQL's binary format is the same numbers.
+- `infinity` and `-infinity` are the largest and smallest ints.
+- A timestamptz is an instant, shown in the session's zone, which is
+  always UTC so far (`SET TimeZone` is to come). Input with an offset or a
+  zone name (`Europe/London`) is converted, using `tz.instantOf`'s rules.
+
+**Stored:**
+- **In rows:** tags 7 to 10 (8 bytes) and 11 (an interval, 24 bytes). One
+  function now gives each tag's size (`valSize`), where four copies of
+  that rule were. The fixed layout (9.50) does not take them yet: a row
+  with one is in the tagged form.
+- **In keys:** as integers. An interval's key is PostgreSQL's comparison,
+  a month as 30 days, then the time left of a day, so
+  `interval '1 month' = interval '30 days'` in an index as in a `WHERE`.
+
+**What PostgreSQL does, done the same:**
+- **Coercion and comparison:** input rounded to the column's precision,
+  halves away from zero. A date, timestamp and timestamptz compare with
+  each other (a date at midnight, a timestamp in the session's zone), and
+  a text with any of them is read as the other's type.
+- **The operators:**
+  - a date and days;
+  - a date's difference in days;
+  - a date plus a time or an interval;
+  - a timestamp or timestamptz plus or minus an interval (months clamped
+    to the month's end, then days, then time; a timestamptz's months and
+    days in the session's zone);
+  - the difference of two date-times, as days and a time of one sign;
+  - intervals added, negated, and multiplied or divided by a number, with
+    PostgreSQL's spill of fractions and its rounding;
+  - `timestamp + '1 day'` reads the text as an interval, and `timestamp -
+    '1 day'` as a timestamp, which fails as there.
+- **`now()`, `current_timestamp`, `transaction_timestamp()`, `localtimestamp`,
+  `current_date`, `current_time`:** the transaction's start (`Txn.now`),
+  so they agree within a statement and within a block. `clock_timestamp()`
+  is the clock.
+- **`extract`/`date_part`:** every field PostgreSQL has, including `epoch`
+  (an interval's year as 365.25 days), `julian`, the ISO week, and BC
+  years. A date's fields are whole numbers, and it has no time fields
+  (0A000). A field nobody has is 22023.
+- **The rest:** `date_trunc` (a week starts on Monday), `age` (borrowing
+  the earlier date's month's days), `make_date`, `to_timestamp`,
+  `isfinite`.
+- **Errors:** a well-formed value with no such day or hour is 22008
+  (`2026-02-30`, `25:00`); a malformed one is 22007.
+
+**Tests.** `tests/lexdb/time_queries.txt` holds 93 queries: literals and
+output at the range's ends and in BC, infinity, precision, the interval
+forms (PostgreSQL's words, `hh:mm:ss`, ISO 8601, fractions, `ago`),
+casts, every operator, comparisons across the types, `extract` and
+`date_trunc` fields, `age`, errors, and the types stored, keyed, indexed,
+sorted, aggregated and updated. `tests/lexdb/gen_time.py` runs them on
+PostgreSQL (18.6 here) and writes `exec_time`, which expects PostgreSQL's
+answers from lexdb's executor; all 93 agree.
+
+Found on the way:
+- the batch decoder (count, filtered scans) had its own copy of the row
+  tags and failed on the new ones with XX001;
+- the time functions' NULL rule ran for every function, so `coalesce` and
+  `ANY` with a NULL gave NULL (7 tests caught it).
+
+**The clients** (9.75):
+- node-postgres: everything passes now;
+- psycopg: everything with dates does, its timestamptz read as Python
+  datetimes;
+- still to do: `ON CONFLICT`, bytea, uuid, double precision, `array_agg`,
+  the catalog, and binary formats (asyncpg).
+
+All 66 lexdb tests pass. The crash test was not run: storage changed
+only in the new tags.

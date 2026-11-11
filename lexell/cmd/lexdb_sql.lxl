@@ -10,6 +10,7 @@
 // casts (::type and CAST(x AS type)) and function calls.
 import "strings"
 import "./lexdb_base"
+import "./lexdb_time"
 
 // Column kinds.
 pub const K_INT = 1
@@ -17,6 +18,11 @@ pub const K_BOOL = 2
 pub const K_NUM = 3
 pub const K_TEXT = 4
 pub const K_ARRAY = 5       // one dimension; its value is PostgreSQL's text form, {1,2,NULL} (9.27)
+pub const K_DATE = 6        // the date and time kinds (9.76, lexdb_time): their values Val.Date and so on
+pub const K_TIME = 7
+pub const K_TS = 8
+pub const K_TSTZ = 9
+pub const K_IVAL = 10
 
 // Postgres type OIDs.
 pub const OID_BOOL = 16
@@ -26,11 +32,16 @@ pub const OID_INT4 = 23
 pub const OID_TEXT = 25
 pub const OID_VARCHAR = 1043
 pub const OID_NUMERIC = 1700
+pub const OID_DATE = 1082
+pub const OID_TIME = 1083
+pub const OID_TS = 1114
+pub const OID_TSTZ = 1184
+pub const OID_IVAL = 1186
 pub const OID_UNKNOWN = 705
 
 // The array types: element OIDs and, at the same places, their arrays'.
-const ELEM_OIDS: []int = [16, 21, 23, 25, 1043, 20, 1700]
-const ARRAY_OIDS: []int = [1000, 1005, 1007, 1009, 1015, 1016, 1231]
+const ELEM_OIDS: []int = [16, 21, 23, 25, 1043, 20, 1700, 1082, 1083, 1114, 1184, 1186]
+const ARRAY_OIDS: []int = [1000, 1005, 1007, 1009, 1015, 1016, 1231, 1182, 1183, 1115, 1185, 1187]
 
 // The array type of an element type (0: none).
 pub fn arrayOid(elem: int): int {
@@ -47,8 +58,8 @@ pub fn elemOid(arr: int): int {
 pub type TypeName = value record {
     pub kind: int
     pub oid: int
-    pub prec: int       // numeric precision, 0 when not given
-    pub scale: int      // numeric scale
+    pub prec: int       // numeric precision, 0 when not given; a time type's: 1 when given (in scale)
+    pub scale: int      // numeric scale; a time type's fractional digits (0 to 6) when prec is 1
     pub len: int        // varchar length, 0 when not given
 }
 
@@ -58,7 +69,24 @@ pub type Val = value closed {
     Bool(bool)
     Num(Decimal)
     Text(str)
+    Date(int)               // days since 2000-01-01 (negative before: 4713 BC to 5874897 AD)
+    Time(int)               // microseconds since midnight
+    Ts(int)                 // a timestamp: microseconds since 2000-01-01 00:00, local
+    Tstz(int)               // a timestamptz: microseconds since 2000-01-01 00:00 UTC
+    Ival(lexdb_time.Ival)   // an interval
 }
+
+// The kind of a date or time type's OID (K_DATE ...), else 0.
+pub fn timeKind(oid: int): int {
+    if oid == OID_DATE { return K_DATE }
+    if oid == OID_TIME { return K_TIME }
+    if oid == OID_TS { return K_TS }
+    if oid == OID_TSTZ { return K_TSTZ }
+    if oid == OID_IVAL { return K_IVAL }
+    return 0
+}
+
+pub fn timeType(oid: int): TypeName { return TypeName{kind: timeKind(oid), oid: oid, prec: 0, scale: 0, len: 0} }
 
 pub type Expr = closed {
     Lit(Val)
@@ -688,6 +716,30 @@ fn (p: mut &P) typeName(): Result[TypeName, lexdb_base.DbErr] {
         "text" { t = TypeName{kind: K_TEXT, oid: OID_TEXT, prec: 0, scale: 0, len: 0} }
         "regclass" { t = TypeName{kind: K_TEXT, oid: OID_TEXT, prec: 0, scale: 0, len: 0} }     // a relation's name, as text
         "varchar" { t = TypeName{kind: K_TEXT, oid: OID_VARCHAR, prec: 0, scale: 0, len: 0} }
+        "date" { t = timeType(OID_DATE) }
+        "time", "timestamp", "timestamptz", "timetz", "interval" {
+            var oid = if w == "time" { OID_TIME } else if w == "interval" { OID_IVAL } else if w == "timestamptz" { OID_TSTZ } else if w == "timetz" { 0 } else { OID_TS }
+            t = timeType(oid)
+            if p.acceptKw("(") {
+                let n = try p.intLit()
+                if n < 0 || n > 6 { return Err(lexdb_base.err("22023", "precision " + n.toStr() + " must be between 0 and 6")) }
+                t.prec = 1
+                t.scale = n
+                try p.expectKw(")")
+            }
+            if (w == "time" || w == "timestamp") && (p.isKw("with") || p.isKw("without")) {
+                let with = p.acceptKw("with")
+                if !with { try p.expectKw("without") }
+                try p.expectKw("time")
+                try p.expectKw("zone")
+                if with { oid = if w == "time" { 0 } else { OID_TSTZ } }
+            }
+            if oid == 0 { return Err(lexdb_base.err("0A000", "lexdb: time with time zone is not supported (use timestamptz)")) }
+            t.kind = timeKind(oid)
+            t.oid = oid
+            if w == "interval" { t.prec = 0 }       // fields (interval day to second) are not read
+            return Ok(try p.arraySuffix(t))
+        }
         "character" {
             if p.acceptKw("varying") {
                 t = TypeName{kind: K_TEXT, oid: OID_VARCHAR, prec: 0, scale: 0, len: 0}
@@ -715,9 +767,13 @@ fn (p: mut &P) typeName(): Result[TypeName, lexdb_base.DbErr] {
         }
         try p.expectKw(")")
     }
+    return p.arraySuffix(t)
+}
+
+// T[]: an array of T (its length, if given, is not kept: PostgreSQL does
+// not check it either); else t.
+fn (p: mut &P) arraySuffix(t: TypeName): Result[TypeName, lexdb_base.DbErr] {
     if p.acceptKw("[") {
-        // T[]: an array of T (its length, if given, is not kept: PostgreSQL
-        // does not check it either)
         if p.peek().kind == T_NUM { let n = try p.intLit() }
         try p.expectKw("]")
         return Ok(TypeName{kind: K_ARRAY, oid: arrayOid(t.oid), prec: 0, scale: 0, len: 0})
@@ -1101,6 +1157,42 @@ fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
                 let ty = try p.typeName()
                 try p.expectKw(")")
                 return Ok(Expr.Cast(e, ty))
+            }
+            // the date and time keywords that are not called (9.76)
+            "current_date", "current_timestamp", "localtimestamp", "current_time", "localtime" {
+                if p.acceptKw("(") {
+                    let n = try p.intLit()        // a precision: rounded to it
+                    try p.expectKw(")")
+                    return Ok(Expr.Call(t.text, [Expr.Lit(Val.Int(n))], false))
+                }
+                return Ok(Expr.Call(t.text, [], false))
+            }
+            "extract" {
+                if p.isKw("(") {
+                    // EXTRACT(field FROM x): date_part('field', x)
+                    p.pos += 1
+                    let f = p.next()
+                    if f.kind != T_IDENT && f.kind != T_STR && f.kind != T_QIDENT { return Err(near(&f)) }
+                    try p.expectKw("from")
+                    let x = try p.expr()
+                    try p.expectKw(")")
+                    return Ok(Expr.Call("date_part", [Expr.Lit(Val.Text(strings.toLowerAscii(f.text))), x], false))
+                }
+            }
+            "date", "time", "timestamp", "timestamptz", "interval" {
+                // a typed literal: date '2026-11-11', timestamp(3) with time zone '...'
+                let at = p.pos
+                p.pos -= 1
+                match p.typeName() {
+                    Ok(ty) {
+                        if p.peek().kind == T_STR {
+                            let lit = p.next().text
+                            return Ok(Expr.Cast(Expr.Lit(Val.Text(lit)), ty))
+                        }
+                    }
+                    Err(_) {}
+                }
+                p.pos = at
             }
             else {}
         }
@@ -2643,7 +2735,7 @@ pub fn parse(sql: &str): Result[[]Stmt, lexdb_base.DbErr] {
 pub fn typeText(t: &TypeName): str {
     if t.kind == K_ARRAY {
         let e = elemOid(t.oid)
-        let k = if e == OID_BOOL { K_BOOL } else if e == OID_NUMERIC { K_NUM } else if e == OID_INT2 || e == OID_INT4 || e == OID_INT8 { K_INT } else { K_TEXT }
+        let k = if e == OID_BOOL { K_BOOL } else if e == OID_NUMERIC { K_NUM } else if e == OID_INT2 || e == OID_INT4 || e == OID_INT8 { K_INT } else if timeKind(e) > 0 { timeKind(e) } else { K_TEXT }
         return typeText(&TypeName{kind: k, oid: e, prec: 0, scale: 0, len: 0}) + "[]"
     }
     if t.oid == OID_INT2 { return "smallint" }
@@ -2658,6 +2750,12 @@ pub fn typeText(t: &TypeName): str {
         if t.len > 0 { return "varchar(" + t.len.toStr() + ")" }
         return "varchar"
     }
+    let p = if t.prec == 1 { "(" + t.scale.toStr() + ")" } else { "" }
+    if t.oid == OID_DATE { return "date" }
+    if t.oid == OID_TIME { return "time" + p + " without time zone" }
+    if t.oid == OID_TS { return "timestamp" + p + " without time zone" }
+    if t.oid == OID_TSTZ { return "timestamp" + p + " with time zone" }
+    if t.oid == OID_IVAL { return "interval" + p }
     return "text"
 }
 
@@ -2676,6 +2774,11 @@ pub fn exprText(x: &Expr): str {
                 Val.Bool(b) { return if b { "true" } else { "false" } }
                 Val.Num(d) { return d.canonical() }
                 Val.Text(t) { return "'" + strings.replaceAll(t, "'", "''") + "'" }
+                Val.Date(d) { return "'" + lexdb_time.fmtDate(d) + "'::date" }
+                Val.Time(u) { return "'" + lexdb_time.fmtTime(u) + "'::time" }
+                Val.Ts(u) { return "'" + lexdb_time.fmtTs(u) + "'::timestamp" }
+                Val.Tstz(u) { return "'" + lexdb_time.fmtTstz(u) + "'::timestamptz" }
+                Val.Ival(iv) { return "'" + lexdb_time.fmtIval(&iv) + "'::interval" }
             }
         }
         Expr.Param(n) { return "$" + n.toStr() }

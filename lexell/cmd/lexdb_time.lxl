@@ -1,0 +1,957 @@
+// lexdb: dates, times, timestamps and intervals as PostgreSQL has them
+// (design/time-types.md; design/lexdb.md 9.76), built on the standard
+// library's time and tz.
+//
+// Values are PostgreSQL's: a date is a day number, a time microseconds
+// since midnight, a timestamp (local) and a timestamptz (an instant, UTC)
+// microseconds, an interval months, days and microseconds. The numbers
+// count from 2000-01-01 00:00, PostgreSQL's zero point: that is not a
+// limit, a date before it is negative (as a Unix time before 1970 is).
+// The range is PostgreSQL's: dates from 4713 BC to 5874897 AD, timestamps
+// from 4713 BC to 294276 AD; BC years are read and written with " BC".
+// Counting from 2000 is what lets that whole range fit 64 bits of
+// microseconds (from 1970 it would end some 30 years short of 294276), and
+// PostgreSQL's binary format is the same numbers. infinity and -infinity
+// are the largest and smallest ints.
+//
+// Text is PostgreSQL's with DateStyle ISO and IntervalStyle postgres. A
+// timestamptz is shown and read in the session's time zone, UTC for now.
+import "strings"
+import "time"
+import "tz"
+import "./lexdb_base"
+
+pub const DAY_US = 86400000000
+pub const INF = 9223372036854775807
+pub const NINF = -9223372036854775807 - 1
+const SEC_US = 1000000
+const UNIX_DAYS = 10957                    // days from 1970-01-01 to 2000-01-01
+const UNIX_US = 946684800000000            // microseconds from 1970 to 2000
+
+// PostgreSQL's limits: dates from 4713-11-24 BC (Julian day 0) to
+// 5874897-12-31 AD; timestamps from the same day to 294276-12-31 AD.
+const MIN_DAY = -2451545
+const MAX_DAY = 2145031948
+const MIN_TS = -211813488000000000
+const MAX_TS = 9223371331200000000         // 294277-01-01 00:00: the first instant past the range
+
+// An interval: months, days and microseconds, kept apart (a month is 28 to
+// 31 days, a day in a time zone 23 to 25 hours).
+pub type Ival = value record { pub months: int; pub days: int; pub us: int }
+
+fn bad(kind: &str, s: &str): lexdb_base.DbErr {
+    return lexdb_base.err("22007", "invalid input syntax for type " + kind + ": \"" + s + "\"")
+}
+
+fn fieldRange(s: &str): lexdb_base.DbErr {
+    return lexdb_base.err("22008", "date/time field value out of range: \"" + s + "\"")
+}
+
+fn range(kind: &str, s: &str): lexdb_base.DbErr {
+    return lexdb_base.err("22008", kind + " out of range: \"" + s + "\"")
+}
+
+fn floorDiv(a: int, b: int): int {
+    let q = a / b
+    if a % b != 0 && (a < 0) != (b < 0) { return q - 1 }
+    return q
+}
+
+fn floorMod(a: int, b: int): int { return a - floorDiv(a, b) * b }
+
+// ---- to and from the library's types
+
+pub fn dateOf(days: int): time.Date { return time.dateOfDays(days + UNIX_DAYS) }
+pub fn daysOf(d: time.Date): int { return time.daysOfDate(d) - UNIX_DAYS }
+
+pub fn localOf(us: int): time.LocalDateTime {
+    return time.LocalDateTime{date: dateOf(floorDiv(us, DAY_US)), time: time.TimeOfDay{nanos: floorMod(us, DAY_US) * 1000}}
+}
+
+// A local date-time as microseconds; None past the range.
+pub fn tsOf(l: time.LocalDateTime): Option[int] {
+    let days = daysOf(l.date)
+    if days < MIN_DAY || days >= MAX_TS / DAY_US { return None }
+    let us = days * DAY_US + l.time.nanos / 1000
+    if us < MIN_TS || us >= MAX_TS { return None }
+    return Some(us)
+}
+
+pub fn instantOf(us: int): time.Time { return time.fromMicros(us + UNIX_US) }
+pub fn usOfInstant(t: time.Time): int { return t.unixMicros() - UNIX_US }
+
+pub fn durOf(us: int): time.Duration { return time.micros(us) }
+
+pub fn ivalOf(i: &time.Interval): Ival { return Ival{months: i.months, days: i.days, us: i.time.roundTo(1000).totalMicros()} }
+pub fn libIval(v: &Ival): time.Interval { return time.interval(v.months, v.days, time.micros(v.us)) }
+
+// The session's time zone: UTC for now (SET TimeZone is to come).
+fn zone(): tz.Zone { return tz.utc() }
+
+// ---- now
+
+pub fn nowTstz(): int { return usOfInstant(time.now()) }
+
+// Unix microseconds as microseconds since 2000.
+pub fn fromUnixUs(us: int): int { return us - UNIX_US }
+
+pub fn nowTs(): int { return tstzToTs(nowTstz()) }
+
+pub fn today(): int { return floorDiv(nowTs(), DAY_US) }
+
+// ---- text out
+
+fn pad(n: int, w: int): str { return strings.padLeft(n.toStr(), w, '0') }
+
+// ".25" for 250000 microseconds; "" for none.
+fn frac(us: int): str {
+    if us == 0 { return "" }
+    var s = pad(us, 6)
+    var n = 6
+    while s[n - 1] == '0' { n -= 1 }
+    return "." + s[0..n]
+}
+
+// The year as PostgreSQL writes it: 2026, 0044 (BC handled by the caller).
+fn yearOf(d: &time.Date): str { return if d.year > 0 { pad(d.year, 4) } else { pad(1 - d.year, 4) } }
+
+fn dateText(d: &time.Date): str { return yearOf(d) + "-" + pad(d.month, 2) + "-" + pad(d.day, 2) }
+
+fn bc(d: &time.Date): str { return if d.year <= 0 { " BC" } else { "" } }
+
+pub fn fmtDate(days: int): str {
+    if days == INF { return "infinity" }
+    if days == NINF { return "-infinity" }
+    let d = dateOf(days)
+    return dateText(&d) + bc(&d)
+}
+
+fn todText(us: int): str {
+    let s = us / SEC_US
+    return pad(s / 3600, 2) + ":" + pad(s / 60 % 60, 2) + ":" + pad(s % 60, 2) + frac(us % SEC_US)
+}
+
+pub fn fmtTime(us: int): str { return todText(us) }
+
+pub fn fmtTs(us: int): str {
+    if us == INF { return "infinity" }
+    if us == NINF { return "-infinity" }
+    let l = localOf(us)
+    return dateText(&l.date) + " " + todText(floorMod(us, DAY_US)) + bc(&l.date)
+}
+
+// "+00", "+05:30", "-03:30", "+00:01:15"
+fn offText(sec: int): str {
+    let a = if sec < 0 { -sec } else { sec }
+    var s = (if sec < 0 { "-" } else { "+" }) + pad(a / 3600, 2)
+    if a % 3600 != 0 { s = s + ":" + pad(a / 60 % 60, 2) }
+    if a % 60 != 0 { s = s + ":" + pad(a % 60, 2) }
+    return s
+}
+
+pub fn fmtTstz(us: int): str {
+    if us == INF { return "infinity" }
+    if us == NINF { return "-infinity" }
+    let z = zone()
+    let off = z.at(floorDiv(us + UNIX_US, SEC_US)).offset
+    let local = us + off * SEC_US
+    let l = localOf(local)
+    return dateText(&l.date) + " " + todText(floorMod(local, DAY_US)) + offText(off) + bc(&l.date)
+}
+
+// PostgreSQL's interval style "postgres": "1 year 2 mons 3 days 04:05:06.5",
+// "-1 days +02:00:00", "00:00:00".
+pub fn fmtIval(v: &Ival): str {
+    var out = ""
+    var zero = true
+    var before = false         // the last part written was negative
+    let years = v.months / 12
+    let mons = v.months % 12
+    for k in 0..3 {
+        let n = if k == 0 { years } else if k == 1 { mons } else { v.days }
+        if n == 0 { continue }
+        let unit = if k == 0 { "year" } else if k == 1 { "mon" } else { "day" }
+        out = out + (if zero { "" } else { " " }) + (if before && n > 0 { "+" } else { "" }) + n.toStr() + " " + unit +
+              (if n != 1 { "s" } else { "" })
+        before = n < 0
+        zero = false
+    }
+    if zero || v.us != 0 {
+        let neg = v.us < 0
+        let a = if neg { -v.us } else { v.us }
+        let s = a / SEC_US
+        out = out + (if zero { "" } else { " " }) + (if neg { "-" } else if before { "+" } else { "" }) +
+              pad(s / 3600, 2) + ":" + pad(s / 60 % 60, 2) + ":" + pad(s % 60, 2) + frac(a % SEC_US)
+    }
+    return out
+}
+
+// ---- text in
+
+fn isDigit(c: byte): bool { return c >= '0' && c <= '9' }
+
+// The number in s[a..b] if all digits (at most 18), else -1.
+fn num(s: &str, a: int, b: int): int {
+    if b <= a || b - a > 18 || b > len(s) { return -1 }
+    var v = 0
+    for i in a..b {
+        if !isDigit(s[i]) { return -1 }
+        v = v * 10 + int(s[i] - '0')
+    }
+    return v
+}
+
+// A date: YYYY-MM-DD (more year digits allowed), and its end in s.
+type DatePart = value record { d: time.Date; end: int; ok: bool }
+
+fn parseYmd(s: &str): Option[DatePart] {
+    var i = 0
+    while i < len(s) && isDigit(s[i]) { i += 1 }
+    if i < 4 || i + 6 > len(s) || s[i] != '-' || s[i + 3] != '-' { return None }
+    let y = num(s, 0, i)
+    let m = num(s, i + 1, i + 3)
+    let d = num(s, i + 4, i + 6)
+    if y < 0 || m < 0 || d < 0 { return None }
+    let date = time.Date{year: y, month: m, day: d}
+    // well formed but no such day (2026-02-30): out of range, as PostgreSQL says
+    return Some(DatePart{d: date, end: i + 6, ok: date.valid() && y != 0})
+}
+
+// A time of day: HH:MM[:SS[.f]] (24:00:00 allowed), microseconds and its
+// end; fractions past microseconds are rounded.
+type TodPart = value record { us: int; end: int; ok: bool }
+
+fn parseTod(s: &str, from: int): Option[TodPart] {
+    var i = from
+    let h = num(s, i, i + 2)
+    if h < 0 || i + 5 > len(s) || s[i + 2] != ':' { return None }
+    let m = num(s, i + 3, i + 5)
+    if m < 0 { return None }
+    var ok = m <= 59
+    i += 5
+    var sec = 0
+    var us = 0
+    if i < len(s) && s[i] == ':' {
+        sec = num(s, i + 1, i + 3)
+        if sec < 0 { return None }
+        if sec > 60 { ok = false }
+        i += 3
+        if i < len(s) && s[i] == '.' {
+            i += 1
+            let f = i
+            while i < len(s) && isDigit(s[i]) { i += 1 }
+            if i == f { return None }
+            // round to microseconds
+            var digits = s[f..i]
+            var n = 0
+            var k = 0
+            while k < 6 {
+                n = n * 10 + (if k < len(digits) { int(digits[k] - '0') } else { 0 })
+                k += 1
+            }
+            if len(digits) > 6 && digits[6] >= '5' { n += 1 }
+            us = n
+        }
+    }
+    let total = ((h * 60 + m) * 60 + sec) * SEC_US + us
+    if total > DAY_US { ok = false }
+    return Some(TodPart{us: total, end: i, ok: ok})
+}
+
+fn lower(s: &str): str { return strings.toLowerAscii(strings.trim(s)) }
+
+// The special words of the date and time types, as days or microseconds
+// (of a timestamp: midnight for today's).
+fn special(w: &str, forDate: bool): Option[int] {
+    if w == "infinity" || w == "+infinity" { return Some(INF) }
+    if w == "-infinity" { return Some(NINF) }
+    let day = if forDate { 1 } else { DAY_US }
+    if w == "epoch" { return Some(-UNIX_DAYS * day) }
+    if w == "today" { return Some(today() * day) }
+    if w == "tomorrow" { return Some((today() + 1) * day) }
+    if w == "yesterday" { return Some((today() - 1) * day) }
+    if w == "now" { return Some(if forDate { today() } else { nowTs() }) }
+    return None
+}
+
+// A trailing " BC" or " AD": the year made astronomical (1 BC is year 0).
+type Era = value record { body: str; bc: bool }
+
+fn era(s: &str): Era {
+    let l = strings.toLowerAscii(s)
+    if strings.endsWith(l, " bc") { return Era{body: strings.trim(&s[0..len(s) - 3]), bc: true} }
+    if strings.endsWith(l, " ad") { return Era{body: strings.trim(&s[0..len(s) - 3]), bc: false} }
+    return Era{body: s.toStr(), bc: false}
+}
+
+fn withEra(d: time.Date, bc: bool): time.Date { return if bc { time.Date{year: 1 - d.year, month: d.month, day: d.day} } else { d } }
+
+pub fn parseDate(s: &str): Result[int, lexdb_base.DbErr] {
+    let w = lower(s)
+    match special(&w, true) {
+        Some(v) { return Ok(v) }
+        None {}
+    }
+    let e = era(&strings.trim(s))
+    match parseYmd(&e.body) {
+        Some(p) {
+            // a time after the date is allowed and ignored, as PostgreSQL
+            if p.end < len(e.body) && e.body[p.end] != ' ' && e.body[p.end] != 'T' && e.body[p.end] != 't' { return Err(bad(&"date", s)) }
+            if !p.ok { return Err(fieldRange(s)) }
+            let days = daysOf(withEra(p.d, e.bc))
+            if days < MIN_DAY || days > MAX_DAY { return Err(range(&"date", s)) }
+            return Ok(days)
+        }
+        None { return Err(bad(&"date", s)) }
+    }
+}
+
+pub fn parseTime(s: &str): Result[int, lexdb_base.DbErr] {
+    let t = strings.trim(s)
+    match parseTod(&t, 0) {
+        Some(p) {
+            if p.end != len(t) { return Err(bad(&"time without time zone", s)) }
+            if !p.ok { return Err(fieldRange(s)) }
+            return Ok(p.us)
+        }
+        None { return Err(bad(&"time without time zone", s)) }
+    }
+}
+
+// A zone at the end of a timestamp's text: the offset in seconds east, or
+// None for none; Err when it is not one.
+type ZonePart = value record { body: str; has: bool; off: int; named: str }
+
+fn zonePart(s: &str): ZonePart {
+    let n = len(s)
+    if n == 0 { return ZonePart{body: "", has: false, off: 0, named: ""} }
+    let last = s[n - 1]
+    if last == 'Z' || last == 'z' { return ZonePart{body: strings.trim(&s[0..n - 1]), has: true, off: 0, named: ""} }
+    // a numeric offset: the last + or - after the time (position > 10)
+    var i = n - 1
+    while i > 10 && s[i] != '+' && s[i] != '-' && s[i] != ' ' { i -= 1 }
+    if i > 10 && (s[i] == '+' || s[i] == '-') {
+        let r = s[i + 1..n]
+        var hh = -1
+        var mm = 0
+        var ss = 0
+        if len(r) == 2 || len(r) == 1 {
+            hh = num(&r, 0, len(r))
+        } else if len(r) == 4 && r[2] != ':' {
+            hh = num(&r, 0, 2)
+            mm = num(&r, 2, 4)
+        } else if len(r) == 5 && r[2] == ':' {
+            hh = num(&r, 0, 2)
+            mm = num(&r, 3, 5)
+        } else if len(r) == 8 && r[2] == ':' && r[5] == ':' {
+            hh = num(&r, 0, 2)
+            mm = num(&r, 3, 5)
+            ss = num(&r, 6, 8)
+        }
+        if hh >= 0 && hh <= 15 && mm >= 0 && mm < 60 && ss >= 0 && ss < 60 {
+            var off = (hh * 60 + mm) * 60 + ss
+            if s[i] == '-' { off = -off }
+            return ZonePart{body: strings.trim(&s[0..i]), has: true, off: off, named: ""}
+        }
+    }
+    // a zone name after a space: UTC, GMT, Europe/London
+    let sp = strings.lastIndexOf(s, " ")
+    if sp > 9 {
+        let name = s[sp + 1..n]
+        if len(name) > 0 && !isDigit(name[0]) {
+            let l = strings.toLowerAscii(name)
+            if l == "utc" || l == "gmt" || l == "z" || l == "zulu" { return ZonePart{body: strings.trim(&s[0..sp]), has: true, off: 0, named: ""} }
+            return ZonePart{body: strings.trim(&s[0..sp]), has: true, off: 0, named: name}
+        }
+    }
+    return ZonePart{body: s.toStr(), has: false, off: 0, named: ""}
+}
+
+// A date and time without its zone: microseconds as local, and whether a
+// zone came with it (and which).
+type TsParse = value record { us: int; z: ZonePart }
+
+fn parseTsText(s: &str, kind: &str): Result[TsParse, lexdb_base.DbErr] {
+    let e0 = era(&strings.trim(s))
+    let z = zonePart(&e0.body)
+    let body = z.body
+    match parseYmd(&body) {
+        Some(p) {
+            var tod = 0
+            if p.end < len(body) {
+                let sep = body[p.end]
+                if sep != ' ' && sep != 'T' && sep != 't' { return Err(bad(kind, s)) }
+                var at = p.end + 1
+                while at < len(body) && body[at] == ' ' { at += 1 }
+                match parseTod(&body, at) {
+                    Some(t) {
+                        if t.end != len(body) { return Err(bad(kind, s)) }
+                        if !t.ok { return Err(fieldRange(s)) }
+                        tod = t.us
+                    }
+                    None { return Err(bad(kind, s)) }
+                }
+            }
+            if !p.ok { return Err(fieldRange(s)) }
+            let d = withEra(p.d, e0.bc)
+            let days = daysOf(d)
+            if days < MIN_DAY || days > MAX_TS / DAY_US { return Err(range(kind, s)) }
+            let us = days * DAY_US + tod
+            if us < MIN_TS || us >= MAX_TS { return Err(range(kind, s)) }
+            return Ok(TsParse{us: us, z: z})
+        }
+        None { return Err(bad(kind, s)) }
+    }
+}
+
+// A timestamp: a zone given with it is ignored, as PostgreSQL ignores it.
+pub fn parseTs(s: &str): Result[int, lexdb_base.DbErr] {
+    match special(&lower(s), false) {
+        Some(v) { return Ok(v) }
+        None {}
+    }
+    let p = try parseTsText(s, &"timestamp")
+    return Ok(p.us)
+}
+
+// A timestamptz: the zone given (an offset, UTC, or a zone's name), else
+// the session's.
+pub fn parseTstz(s: &str): Result[int, lexdb_base.DbErr] {
+    let w = lower(s)
+    match special(&w, false) {
+        Some(v) {
+            if v == INF || v == NINF { return Ok(v) }
+            if w == "now" { return Ok(nowTstz()) }
+            return Ok(tsToTstz(v))
+        }
+        None {}
+    }
+    let p = try parseTsText(s, &"timestamp with time zone")
+    if !p.z.has { return Ok(tsToTstz(p.us)) }
+    if p.z.named != "" {
+        match tz.load(p.z.named) {
+            Ok(z) {
+                let t = z.instantOf(localOf(p.us))
+                return Ok(usOfInstant(t))
+            }
+            Err(_) { return Err(lexdb_base.err("22023", "time zone \"" + p.z.named + "\" not recognized")) }
+        }
+    }
+    return Ok(p.us - p.z.off * SEC_US)
+}
+
+// ---- conversions between the types
+
+// A timestamp read in the session's zone; and back.
+pub fn tsToTstz(us: int): int {
+    if us == INF || us == NINF { return us }
+    let z = zone()
+    let t = z.instantOf(localOf(us))
+    return usOfInstant(t)
+}
+
+pub fn tstzToTs(us: int): int {
+    if us == INF || us == NINF { return us }
+    let z = zone()
+    let off = z.at(floorDiv(us + UNIX_US, SEC_US)).offset
+    return us + off * SEC_US
+}
+
+pub fn dateToTs(days: int): int {
+    if days == INF || days == NINF { return days }
+    return days * DAY_US
+}
+
+pub fn tsToDate(us: int): int {
+    if us == INF || us == NINF { return us }
+    return floorDiv(us, DAY_US)
+}
+
+// ---- intervals
+
+// Parses an interval: PostgreSQL's words ("1 year 2 mons", "3 days
+// 04:05:06", "-1 day", "1.5 hours", "2 weeks ago", "@ 1 day"), a bare
+// "hh:mm[:ss]", or ISO 8601 ("P1Y2M3DT4H5M6S"). Fractions of a unit spill
+// into the smaller units as PostgreSQL's do (a month as 30 days, a day as
+// 24 hours).
+pub fn parseIval(s: &str): Result[Ival, lexdb_base.DbErr] {
+    let t = strings.trim(s)
+    if len(t) > 0 && (t[0] == 'P' || t[0] == 'p') {
+        match time.parseInterval(t) {
+            Some(i) { return Ok(ivalOf(&i)) }
+            None { return Err(bad(&"interval", s)) }
+        }
+    }
+    let low = strings.toLowerAscii(t)
+    var toks: []str = []
+    for f in strings.fields(&low) { if len(toks) > 0 || f != "@" { append(mut &toks, f) } }
+    var ago = false
+    if len(toks) > 0 && toks[len(toks) - 1] == "ago" {
+        let x = pop(mut &toks)
+        ago = true
+    }
+    if len(toks) == 0 { return Err(bad(&"interval", s)) }
+    var months = 0
+    var days = 0
+    var us = 0
+    var i = 0
+    while i < len(toks) {
+        let tk = toks[i]
+        if strings.contains(&tk, ":") {
+            // [-]hh:mm[:ss[.f]]
+            var neg = false
+            var body = tk
+            if len(body) > 0 && (body[0] == '-' || body[0] == '+') {
+                neg = body[0] == '-'
+                body = body[1..len(body)]
+            }
+            let parts = strings.split(&body, &":")
+            if len(parts) < 2 || len(parts) > 3 { return Err(bad(&"interval", s)) }
+            let h = num(&parts[0], 0, len(parts[0]))
+            let m = num(&parts[1], 0, len(parts[1]))
+            if h < 0 || m < 0 { return Err(bad(&"interval", s)) }
+            var x = (h * 60 + m) * 60 * SEC_US
+            if len(parts) == 3 {
+                let sec = try secondsUs(&parts[2], s)
+                x += sec
+            }
+            us += if neg { -x } else { x }
+            i += 1
+            continue
+        }
+        // a number and a unit ("1 day", "1day" too)
+        var numText = tk
+        var unit = ""
+        var k = 0
+        while k < len(tk) && (isDigit(tk[k]) || tk[k] == '.' || tk[k] == '-' || tk[k] == '+') { k += 1 }
+        if k < len(tk) {
+            numText = tk[0..k]
+            unit = tk[k..len(tk)]
+        } else if i + 1 < len(toks) {
+            unit = toks[i + 1]
+            i += 1
+        } else {
+            unit = "second"
+        }
+        let n = try decOf(&numText, s)
+        let u = unitOf(&unit)
+        if u == "" { return Err(bad(&"interval", s)) }
+        try addUnit(mut &months, mut &days, mut &us, &n, &u, s)
+        i += 1
+    }
+    var r = Ival{months: months, days: days, us: us}
+    if ago { r = Ival{months: -months, days: -days, us: -us} }
+    return Ok(r)
+}
+
+fn secondsUs(t: &str, s: &str): Result[int, lexdb_base.DbErr] {
+    let d = try decOf(t, s)
+    match d.mul(Decimal.fromInt(SEC_US)).roundAway(0) {
+        Ok(r) {
+            match r.toInt(Rounding.HALF_AWAY) {
+                Ok(v) { return Ok(v) }
+                Err(_) { return Err(range(&"interval", s)) }
+            }
+        }
+        Err(_) { return Err(range(&"interval", s)) }
+    }
+}
+
+fn decOf(t: &str, s: &str): Result[Decimal, lexdb_base.DbErr] {
+    match Decimal.parse(t.toStr()) {
+        Ok(d) { return Ok(d) }
+        Err(_) { return Err(bad(&"interval", s)) }
+    }
+}
+
+fn unitOf(u: &str): str {
+    match u {
+        "microsecond", "microseconds", "us", "usec", "usecs" { return "us" }
+        "millisecond", "milliseconds", "ms", "msec", "msecs" { return "ms" }
+        "second", "seconds", "s", "sec", "secs" { return "s" }
+        "minute", "minutes", "m", "min", "mins" { return "min" }
+        "hour", "hours", "h", "hr", "hrs" { return "h" }
+        "day", "days", "d" { return "d" }
+        "week", "weeks", "w" { return "w" }
+        "month", "months", "mon", "mons" { return "mon" }
+        "year", "years", "y", "yr", "yrs" { return "y" }
+        "decade", "decades" { return "dec" }
+        "century", "centuries" { return "c" }
+        "millennium", "millennia", "millenniums" { return "mil" }
+        else { return "" }
+    }
+}
+
+// n of unit added: whole units where they belong, a fraction spilled into
+// the next smaller (months to 30 days, days to 24 hours).
+fn addUnit(months: mut &int, days: mut &int, us: mut &int, n: &Decimal, u: &str, s: &str): Result[Unit, lexdb_base.DbErr] {
+    if u == "us" || u == "ms" || u == "s" || u == "min" || u == "h" {
+        let per = if u == "us" { 1 } else if u == "ms" { 1000 } else if u == "s" { SEC_US } else if u == "min" { 60 * SEC_US } else { 3600 * SEC_US }
+        us = us + (try roundInt(&n.mul(Decimal.fromInt(per)), s))
+        return Ok(Unit{})
+    }
+    if u == "d" || u == "w" {
+        let x = if u == "w" { n.mul(Decimal.fromInt(7)) } else { n }
+        let whole = try truncInt(&x, s)
+        days = days + whole
+        let rest = x.sub(Decimal.fromInt(whole))
+        us = us + (try roundInt(&rest.mul(Decimal.fromInt(DAY_US)), s))
+        return Ok(Unit{})
+    }
+    let per = if u == "mon" { 1 } else if u == "y" { 12 } else if u == "dec" { 120 } else if u == "c" { 1200 } else { 12000 }
+    let x = n.mul(Decimal.fromInt(per))
+    let whole = try truncInt(&x, s)
+    months = months + whole
+    let rest = x.sub(Decimal.fromInt(whole)).mul(Decimal.fromInt(30))
+    let wd = try truncInt(&rest, s)
+    days = days + wd
+    us = us + (try roundInt(&rest.sub(Decimal.fromInt(wd)).mul(Decimal.fromInt(DAY_US)), s))
+    return Ok(Unit{})
+}
+
+fn roundInt(d: &Decimal, s: &str): Result[int, lexdb_base.DbErr] {
+    match d.toInt(Rounding.HALF_AWAY) {
+        Ok(v) { return Ok(v) }
+        Err(_) { return Err(range(&"interval", s)) }
+    }
+}
+
+fn truncInt(d: &Decimal, s: &str): Result[int, lexdb_base.DbErr] {
+    match d.toInt(Rounding.TOWARD_ZERO) {
+        Ok(v) { return Ok(v) }
+        Err(_) { return Err(range(&"interval", s)) }
+    }
+}
+
+pub fn ivalPlus(a: &Ival, b: &Ival): Ival { return Ival{months: a.months + b.months, days: a.days + b.days, us: a.us + b.us} }
+pub fn ivalNeg(a: &Ival): Ival { return Ival{months: -a.months, days: -a.days, us: -a.us} }
+
+// An interval times a number, as PostgreSQL's (interval_mul): the
+// months' fraction spills into days (30 a month), rounded to six places
+// of a day, the days' fraction into seconds, rounded to microseconds; a
+// spill of a day or more of seconds goes to the days.
+pub fn ivalTimes(a: &Ival, f: &Decimal): Result[Ival, lexdb_base.DbErr] {
+    let s: &str = "interval"
+    let mf = Decimal.fromInt(a.months).mul(f)
+    let months = try truncInt(&mf, s)
+    let mrd = round6(&mf.sub(Decimal.fromInt(months)).mul(Decimal.fromInt(30)))
+    let df = Decimal.fromInt(a.days).mul(f)
+    var days = try truncInt(&df, s)
+    let mrdWhole = try truncInt(&mrd, s)
+    var secRem = round6(&df.sub(Decimal.fromInt(days)).add(mrd.sub(Decimal.fromInt(mrdWhole))).mul(Decimal.fromInt(86400)))
+    let dayCarry = try truncInt(&secRem, s) / 86400
+    if dayCarry != 0 {
+        days += dayCarry
+        secRem = secRem.sub(Decimal.fromInt(dayCarry * 86400))
+    }
+    days += mrdWhole
+    let us = try roundInt(&Decimal.fromInt(a.us).mul(f).add(secRem.mul(Decimal.fromInt(SEC_US))), s)
+    return Ok(Ival{months: months, days: days, us: us})
+}
+
+fn round6(d: &Decimal): Decimal {
+    match d.quantize(6, Rounding.HALF_EVEN) {
+        Ok(x) { return x }
+        Err(_) { return d }
+    }
+}
+
+pub fn ivalDiv(a: &Ival, f: &Decimal): Result[Ival, lexdb_base.DbErr] {
+    if f.isZero() { return Err(lexdb_base.err("22012", "division by zero")) }
+    match Decimal.fromInt(1).div(f, 20, Rounding.HALF_EVEN) {
+        Ok(inv) { return ivalTimes(a, &inv) }
+        Err(_) { return Err(range(&"interval", &"")) }
+    }
+}
+
+// PostgreSQL compares intervals as a month of 30 days and a day of 24
+// hours: the days so counted, and the microseconds left of a day.
+pub type IvalKey = value record { pub days: int; pub us: int }
+
+pub fn ivalKey(a: &Ival): IvalKey {
+    return IvalKey{days: a.months * 30 + a.days + floorDiv(a.us, DAY_US), us: floorMod(a.us, DAY_US)}
+}
+
+pub fn ivalCmp(a: &Ival, b: &Ival): int {
+    let x = ivalKey(a)
+    let y = ivalKey(b)
+    if x.days != y.days { return x.days.cmp(&y.days) }
+    return x.us.cmp(&y.us)
+}
+
+// ---- arithmetic with timestamps
+
+fn ovf(): lexdb_base.DbErr { return lexdb_base.err("22008", "timestamp out of range") }
+
+// A timestamp plus an interval: the months (the day clamped to the
+// month's end), then the days, then the time.
+pub fn tsPlus(us: int, v: &Ival): Result[int, lexdb_base.DbErr] {
+    if us == INF || us == NINF { return Ok(us) }
+    let l = localOf(us).plusInterval(libIval(v))
+    match tsOf(l) {
+        Some(x) { return Ok(x) }
+        None { return Err(ovf()) }
+    }
+}
+
+// A timestamptz plus an interval: the months and days in the session's
+// zone (a day across a change of offset is 23 or 25 hours), then the time.
+pub fn tstzPlus(us: int, v: &Ival): Result[int, lexdb_base.DbErr] {
+    if us == INF || us == NINF { return Ok(us) }
+    var x = us
+    if v.months != 0 || v.days != 0 {
+        let local = tstzToTs(us)
+        let l = localOf(local)
+        let moved = time.LocalDateTime{date: l.date.addMonths(v.months).addDays(v.days), time: l.time}
+        match tsOf(moved) {
+            Some(m) { x = tsToTstz(m) }
+            None { return Err(ovf()) }
+        }
+    }
+    x = x + v.us
+    if x < MIN_TS || x >= MAX_TS { return Err(ovf()) }
+    return Ok(x)
+}
+
+// The difference of two timestamps (or two timestamptz): whole days and
+// the time left, of the same sign, as PostgreSQL gives it.
+pub fn tsDiff(a: int, b: int): Result[Ival, lexdb_base.DbErr] {
+    if a == INF || a == NINF || b == INF || b == NINF { return Err(lexdb_base.err("22008", "cannot subtract infinite timestamps")) }
+    let d = a - b
+    return Ok(Ival{months: 0, days: d / DAY_US, us: d % DAY_US})
+}
+
+// age(a, b): years, months and days of the calendar between them, and the
+// time, as PostgreSQL's: each field's difference, borrowing from the next
+// larger field (a month borrows the days of b's month).
+pub fn age(a: int, b: int): Result[Ival, lexdb_base.DbErr] {
+    if a == INF || a == NINF || b == INF || b == NINF { return Err(lexdb_base.err("22008", "interval out of range")) }
+    let neg = a < b
+    let x = localOf(if neg { b } else { a })
+    let y = localOf(if neg { a } else { b })
+    var us = x.time.nanos / 1000 - y.time.nanos / 1000
+    var day = x.date.day - y.date.day
+    var mon = x.date.month - y.date.month
+    var year = x.date.year - y.date.year
+    if us < 0 {
+        us += DAY_US
+        day -= 1
+    }
+    while day < 0 {
+        // the days of y's month (the earlier date's), as PostgreSQL
+        day += time.daysInMonth(y.date.year, y.date.month)
+        mon -= 1
+    }
+    while mon < 0 {
+        mon += 12
+        year -= 1
+    }
+    let r = Ival{months: year * 12 + mon, days: day, us: us}
+    return Ok(if neg { ivalNeg(&r) } else { r })
+}
+
+// ---- extract and date_trunc
+
+fn decInt(n: int): Decimal { return Decimal.fromInt(n) }
+
+// n / 1000000 exactly, as a numeric
+fn decUs(n: int): Decimal {
+    match Decimal.fromInt(n).div(Decimal.fromInt(SEC_US), 6, Rounding.HALF_EVEN) {
+        Ok(d) { return d }
+        Err(_) { return Decimal.zero() }
+    }
+}
+
+// The ISO week of a date: (week, its year).
+fn isoWeek(d: &time.Date): []int {
+    let wd = (time.weekday(d) + 6) % 7          // Monday 0
+    let thursday = d.addDays(3 - wd)
+    let w = (thursday.dayOfYear() - 1) / 7 + 1
+    return [w, thursday.year]
+}
+
+// A unit lexdb does not know (22023, "not recognized"), or one the type
+// has not (0A000, "not supported"), as PostgreSQL tells them apart.
+fn unknownField(f: &str, kind: &str): lexdb_base.DbErr {
+    match strings.toLowerAscii(f) {
+        "year", "years", "month", "months", "mon", "mons", "day", "days", "hour", "hours", "minute", "minutes",
+        "second", "seconds", "millisecond", "milliseconds", "microsecond", "microseconds", "dow", "isodow", "doy",
+        "week", "weeks", "isoyear", "quarter", "decade", "decades", "century", "centuries", "millennium", "millennia",
+        "julian", "epoch", "timezone", "timezone_hour", "timezone_minute" {
+            return lexdb_base.err("0A000", "unit \"" + f + "\" not supported for type " + kind)
+        }
+        else { return lexdb_base.err("22023", "unit \"" + f + "\" not recognized for type " + kind) }
+    }
+}
+
+// The fields a date has (no time of day), else an error: extract from a date.
+pub fn dateField(f: &str): Result[Unit, lexdb_base.DbErr] {
+    match strings.toLowerAscii(f) {
+        "hour", "hours", "minute", "minutes", "second", "seconds", "millisecond", "milliseconds", "microsecond",
+        "microseconds", "timezone", "timezone_hour", "timezone_minute" {
+            return Err(lexdb_base.err("0A000", "unit \"" + f + "\" not supported for type date"))
+        }
+        else { return Ok(Unit{}) }
+    }
+}
+
+// extract(field from a date-time): days are given (and time) for a date,
+// a timestamp's local fields, a timestamptz's in the session's zone.
+pub fn extractTs(field: &str, local: int, epochUs: int, kind: &str): Result[Decimal, lexdb_base.DbErr] {
+    if local == INF || local == NINF {
+        return Err(lexdb_base.err("22008", "extract of an infinite " + kind))
+    }
+    let l = localOf(local)
+    let d = l.date
+    let tod = floorMod(local, DAY_US)
+    let f = strings.toLowerAscii(field)
+    match f {
+        "year", "years" { return Ok(decInt(if d.year > 0 { d.year } else { d.year - 1 })) }
+        "month", "months", "mon", "mons" { return Ok(decInt(d.month)) }
+        "day", "days" { return Ok(decInt(d.day)) }
+        "hour", "hours" { return Ok(decInt(tod / (3600 * SEC_US))) }
+        "minute", "minutes" { return Ok(decInt(tod / (60 * SEC_US) % 60)) }
+        "second", "seconds" { return Ok(decUs(tod % (60 * SEC_US))) }
+        "millisecond", "milliseconds" {
+            match decInt(tod % (60 * SEC_US)).div(decInt(1000), 3, Rounding.HALF_EVEN) {
+                Ok(x) { return Ok(x) }
+                Err(_) { return Ok(Decimal.zero()) }
+            }
+        }
+        "microsecond", "microseconds" { return Ok(decInt(tod % (60 * SEC_US))) }
+        "dow" { return Ok(decInt(time.weekday(d))) }
+        "isodow" { return Ok(decInt(if time.weekday(d) == 0 { 7 } else { time.weekday(d) })) }
+        "doy" { return Ok(decInt(d.dayOfYear())) }
+        "week" { return Ok(decInt(isoWeek(&d)[0])) }
+        "isoyear" { return Ok(decInt(isoWeek(&d)[1])) }
+        "quarter" { return Ok(decInt((d.month - 1) / 3 + 1)) }
+        "decade" { return Ok(decInt(floorDiv(d.year, 10))) }
+        "century" { return Ok(decInt(if d.year > 0 { (d.year + 99) / 100 } else { -((99 - (d.year - 1)) / 100) })) }
+        "millennium" { return Ok(decInt(if d.year > 0 { (d.year + 999) / 1000 } else { -((999 - (d.year - 1)) / 1000) })) }
+        "julian" {
+            let jd = decInt(daysOf(d) + 2451545)
+            match decInt(tod).div(decInt(DAY_US), 20, Rounding.HALF_EVEN) {
+                Ok(x) { return Ok(jd.add(x)) }
+                Err(_) { return Ok(jd) }
+            }
+        }
+        "epoch" { return Ok(decUs(epochUs + UNIX_US)) }
+        "timezone" { return Ok(Decimal.zero()) }
+        else { return Err(unknownField(field, kind)) }
+    }
+}
+
+pub fn extractIval(field: &str, v: &Ival): Result[Decimal, lexdb_base.DbErr] {
+    let f = strings.toLowerAscii(field)
+    match f {
+        "year", "years" { return Ok(decInt(v.months / 12)) }
+        "month", "months", "mon", "mons" { return Ok(decInt(v.months % 12)) }
+        "day", "days" { return Ok(decInt(v.days)) }
+        "hour", "hours" { return Ok(decInt(v.us / (3600 * SEC_US))) }
+        "minute", "minutes" { return Ok(decInt(v.us / (60 * SEC_US) % 60)) }
+        "second", "seconds" { return Ok(decUs(v.us % (60 * SEC_US))) }
+        "millisecond", "milliseconds" {
+            match decInt(v.us % (60 * SEC_US)).div(decInt(1000), 3, Rounding.HALF_EVEN) {
+                Ok(x) { return Ok(x) }
+                Err(_) { return Ok(Decimal.zero()) }
+            }
+        }
+        "microsecond", "microseconds" { return Ok(decInt(v.us % (60 * SEC_US))) }
+        "quarter" { return Ok(decInt(v.months % 12 / 3 + 1)) }
+        "decade" { return Ok(decInt(v.months / 120)) }
+        "century" { return Ok(decInt(v.months / 1200)) }
+        "millennium" { return Ok(decInt(v.months / 12000)) }
+        "epoch" {
+            // a year as 365.25 days, the months left over as 30 (PostgreSQL's)
+            let secs = decUs(v.us).add(decInt(v.days * 86400)).add(decInt(v.months % 12 * 30 * 86400))
+            match decInt(v.months / 12).mul(decInt(36525 * 864)).div(decInt(1), 6, Rounding.HALF_EVEN) {
+                Ok(m) { return Ok(secs.add(m)) }
+                Err(_) { return Ok(secs) }
+            }
+        }
+        else { return Err(unknownField(field, &"interval")) }
+    }
+}
+
+// date_trunc(field, local microseconds): the local date-time cut to the
+// field (a week starts on Monday).
+pub fn truncTs(field: &str, local: int): Result[int, lexdb_base.DbErr] {
+    if local == INF || local == NINF { return Ok(local) }
+    let f = strings.toLowerAscii(field)
+    let l = localOf(local)
+    let d = l.date
+    let tod = floorMod(local, DAY_US)
+    let day = floorDiv(local, DAY_US) * DAY_US
+    match f {
+        "microseconds", "microsecond" { return Ok(local) }
+        "milliseconds", "millisecond" { return Ok(day + tod / 1000 * 1000) }
+        "second", "seconds" { return Ok(day + tod / SEC_US * SEC_US) }
+        "minute", "minutes" { return Ok(day + tod / (60 * SEC_US) * 60 * SEC_US) }
+        "hour", "hours" { return Ok(day + tod / (3600 * SEC_US) * 3600 * SEC_US) }
+        "day", "days" { return Ok(day) }
+        "week", "weeks" {
+            let wd = (time.weekday(d) + 6) % 7
+            return Ok(day - wd * DAY_US)
+        }
+        "month", "months" { return Ok(daysOf(time.Date{year: d.year, month: d.month, day: 1}) * DAY_US) }
+        "quarter" { return Ok(daysOf(time.Date{year: d.year, month: (d.month - 1) / 3 * 3 + 1, day: 1}) * DAY_US) }
+        "year", "years" { return Ok(daysOf(time.Date{year: d.year, month: 1, day: 1}) * DAY_US) }
+        "decade", "decades" { return Ok(daysOf(time.Date{year: floorDiv(d.year, 10) * 10, month: 1, day: 1}) * DAY_US) }
+        "century", "centuries" {
+            let y = if d.year > 0 { (d.year - 1) / 100 * 100 + 1 } else { -((99 - d.year) / 100 * 100) + 1 }
+            return Ok(daysOf(time.Date{year: y, month: 1, day: 1}) * DAY_US)
+        }
+        "millennium", "millennia" {
+            let y = if d.year > 0 { (d.year - 1) / 1000 * 1000 + 1 } else { -((999 - d.year) / 1000 * 1000) + 1 }
+            return Ok(daysOf(time.Date{year: y, month: 1, day: 1}) * DAY_US)
+        }
+        else { return Err(unknownField(field, &"timestamp")) }
+    }
+}
+
+pub fn truncIval(field: &str, v: &Ival): Result[Ival, lexdb_base.DbErr] {
+    let f = strings.toLowerAscii(field)
+    match f {
+        "microseconds", "microsecond" { return Ok(v) }
+        "milliseconds", "millisecond" { return Ok(Ival{months: v.months, days: v.days, us: v.us / 1000 * 1000}) }
+        "second", "seconds" { return Ok(Ival{months: v.months, days: v.days, us: v.us / SEC_US * SEC_US}) }
+        "minute", "minutes" { return Ok(Ival{months: v.months, days: v.days, us: v.us / (60 * SEC_US) * 60 * SEC_US}) }
+        "hour", "hours" { return Ok(Ival{months: v.months, days: v.days, us: v.us / (3600 * SEC_US) * 3600 * SEC_US}) }
+        "day", "days" { return Ok(Ival{months: v.months, days: v.days, us: 0}) }
+        "month", "months" { return Ok(Ival{months: v.months, days: 0, us: 0}) }
+        "quarter" { return Ok(Ival{months: v.months / 3 * 3, days: 0, us: 0}) }
+        "year", "years" { return Ok(Ival{months: v.months / 12 * 12, days: 0, us: 0}) }
+        else { return Err(unknownField(field, &"interval")) }
+    }
+}
+
+// make_date(year, month, day)
+pub fn makeDate(y: int, m: int, d: int): Result[int, lexdb_base.DbErr] {
+    let date = time.Date{year: if y < 0 { y + 1 } else { y }, month: m, day: d}
+    if y == 0 || !date.valid() {
+        return Err(lexdb_base.err("22008", "date field value out of range: " + y.toStr() + "-" + pad(m, 2) + "-" + pad(d, 2)))
+    }
+    return Ok(daysOf(date))
+}
+
+// to_timestamp(seconds since 1970)
+pub fn fromEpochSeconds(d: &Decimal): Result[int, lexdb_base.DbErr] {
+    match d.mul(Decimal.fromInt(SEC_US)).toInt(Rounding.HALF_AWAY) {
+        Ok(us) {
+            let x = us - UNIX_US
+            if x < MIN_TS || x >= MAX_TS { return Err(ovf()) }
+            return Ok(x)
+        }
+        Err(_) { return Err(ovf()) }
+    }
+}
+
+// A value rounded to p fractional digits of a second (0 to 6), halves
+// away from zero: a column's precision (timestamp(3)).
+pub fn roundUs(us: int, p: int): int {
+    if p >= 6 || us == INF || us == NINF { return us }
+    var unit = 1
+    for i in 0..6 - p { unit *= 10 }
+    let d = time.micros(us).roundTo(unit * 1000)
+    return d.totalMicros()
+}

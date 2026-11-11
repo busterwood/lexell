@@ -22,6 +22,7 @@ import "time"
 import "task"
 import "os"
 import "./lexdb_base"
+import "./lexdb_time"
 import "./lexdb_page"
 import "./lexdb_store"
 import "./lexdb_sql"
@@ -105,6 +106,11 @@ pub fn text(v: &Val): str {
         Val.Bool(b) { return if b { "t" } else { "f" } }
         Val.Num(d) { return d.toStr() }
         Val.Text(s) { return s }
+        Val.Date(d) { return lexdb_time.fmtDate(d) }
+        Val.Time(u) { return lexdb_time.fmtTime(u) }
+        Val.Ts(u) { return lexdb_time.fmtTs(u) }
+        Val.Tstz(u) { return lexdb_time.fmtTstz(u) }
+        Val.Ival(iv) { return lexdb_time.fmtIval(&iv) }
     }
 }
 
@@ -121,8 +127,11 @@ fn kindName(t: &lexdb_sql.TypeName): str {
     }
     if t.kind == lexdb_sql.K_BOOL { return "boolean" }
     if t.kind == lexdb_sql.K_NUM { return "numeric" }
+    if isTimeKind(t.kind) { return lexdb_sql.typeText(&lexdb_sql.timeType(t.oid)) }
     return if t.oid == lexdb_sql.OID_VARCHAR { "character varying" } else { "text" }
 }
+
+fn isTimeKind(k: int): bool { return k >= lexdb_sql.K_DATE && k <= lexdb_sql.K_IVAL }
 
 fn badInput(t: &lexdb_sql.TypeName, s: &str): DbErr {
     return e("22P02", "invalid input syntax for type " + kindName(t) + ": \"" + s + "\"")
@@ -207,6 +216,8 @@ pub fn coerce(v: Val, t: &lexdb_sql.TypeName): Result[Val, DbErr] {
             }
         }
         return Ok(Val.Num(d))
+    } else if isTimeKind(t.kind) {
+        return coerceTime(v, t)
     } else if t.kind == lexdb_sql.K_ARRAY {
         match v {
             Val.Text(x) {
@@ -229,7 +240,7 @@ pub fn coerce(v: Val, t: &lexdb_sql.TypeName): Result[Val, DbErr] {
             Val.Int(n) { s = n.toStr() }
             Val.Num(d) { s = d.toStr() }
             Val.Bool(b) { s = if b { "true" } else { "false" } }
-            else {}
+            else { s = text(&v) }
         }
         if t.len > 0 && strings.runeCount(&s) > t.len {
             return Err(e("22001", "value too long for type character varying(" + t.len.toStr() + ")"))
@@ -237,6 +248,391 @@ pub fn coerce(v: Val, t: &lexdb_sql.TypeName): Result[Val, DbErr] {
         return Ok(Val.Text(s))
     }
     return Err(e("42804", "column is of type " + kindName(t) + " but the expression is of another type"))
+}
+
+// ---- dates, times, timestamps and intervals (9.76; lexdb_time)
+
+// A value made a date or time type: text read in PostgreSQL's forms, the
+// date and time kinds converted (a timestamp to a timestamptz in the
+// session's zone, and back), rounded to the type's fractional digits.
+fn coerceTime(v: Val, t: &lexdb_sql.TypeName): Result[Val, DbErr] {
+    let k = t.kind
+    let p = if t.prec == 1 { t.scale } else { 6 }
+    match v {
+        Val.Text(s) {
+            if k == lexdb_sql.K_DATE { return Ok(Val.Date(try lexdb_time.parseDate(&s))) }
+            if k == lexdb_sql.K_TIME { return Ok(Val.Time(lexdb_time.roundUs(try lexdb_time.parseTime(&s), p))) }
+            if k == lexdb_sql.K_TS { return Ok(Val.Ts(lexdb_time.roundUs(try lexdb_time.parseTs(&s), p))) }
+            if k == lexdb_sql.K_TSTZ { return Ok(Val.Tstz(lexdb_time.roundUs(try lexdb_time.parseTstz(&s), p))) }
+            let iv = try lexdb_time.parseIval(&s)
+            return Ok(Val.Ival(lexdb_time.Ival{months: iv.months, days: iv.days, us: lexdb_time.roundUs(iv.us, p)}))
+        }
+        Val.Date(d) {
+            if k == lexdb_sql.K_DATE { return Ok(Val.Date(d)) }
+            if k == lexdb_sql.K_TS { return Ok(Val.Ts(lexdb_time.dateToTs(d))) }
+            if k == lexdb_sql.K_TSTZ { return Ok(Val.Tstz(lexdb_time.tsToTstz(lexdb_time.dateToTs(d)))) }
+        }
+        Val.Ts(u) {
+            if k == lexdb_sql.K_TS { return Ok(Val.Ts(lexdb_time.roundUs(u, p))) }
+            if k == lexdb_sql.K_DATE { return Ok(Val.Date(lexdb_time.tsToDate(u))) }
+            if k == lexdb_sql.K_TSTZ { return Ok(Val.Tstz(lexdb_time.roundUs(lexdb_time.tsToTstz(u), p))) }
+            if k == lexdb_sql.K_TIME { return Ok(Val.Time(lexdb_time.roundUs(floorModInt(u, lexdb_time.DAY_US), p))) }
+        }
+        Val.Tstz(u) {
+            if k == lexdb_sql.K_TSTZ { return Ok(Val.Tstz(lexdb_time.roundUs(u, p))) }
+            let local = lexdb_time.tstzToTs(u)
+            if k == lexdb_sql.K_TS { return Ok(Val.Ts(lexdb_time.roundUs(local, p))) }
+            if k == lexdb_sql.K_DATE { return Ok(Val.Date(lexdb_time.tsToDate(local))) }
+            if k == lexdb_sql.K_TIME { return Ok(Val.Time(lexdb_time.roundUs(floorModInt(local, lexdb_time.DAY_US), p))) }
+        }
+        Val.Time(u) {
+            if k == lexdb_sql.K_TIME { return Ok(Val.Time(lexdb_time.roundUs(u, p))) }
+            if k == lexdb_sql.K_IVAL { return Ok(Val.Ival(lexdb_time.Ival{months: 0, days: 0, us: u})) }
+        }
+        Val.Ival(iv) {
+            if k == lexdb_sql.K_IVAL { return Ok(Val.Ival(lexdb_time.Ival{months: iv.months, days: iv.days, us: lexdb_time.roundUs(iv.us, p)})) }
+            if k == lexdb_sql.K_TIME { return Ok(Val.Time(floorModInt(iv.us, lexdb_time.DAY_US))) }
+        }
+        else {}
+    }
+    return Err(e("42846", "cannot cast type " + kindName(&oidType(kindOid(&v))) + " to " + lexdb_sql.typeText(t)))
+}
+
+fn floorModInt(a: int, b: int): int {
+    let r = a % b
+    return if r < 0 { r + b } else { r }
+}
+
+// The type of a date or time value (a text's: the other side's type).
+fn timeTypeOf(v: &Val): lexdb_sql.TypeName { return lexdb_sql.timeType(kindOid(v)) }
+
+// A timestamp-like value as a timestamptz's microseconds (a date at
+// midnight, a timestamp in the session's zone), for comparing across them.
+fn asTstz(v: &Val): Option[int] {
+    match v {
+        Val.Date(d) { return Some(lexdb_time.tsToTstz(lexdb_time.dateToTs(d))) }
+        Val.Ts(u) { return Some(lexdb_time.tsToTstz(u)) }
+        Val.Tstz(u) { return Some(u) }
+        else { return None }
+    }
+}
+
+// Compares two values of which one is a date or time kind: the same kind
+// directly, a date, timestamp and timestamptz with each other, a text read
+// as the other's type.
+fn compareTime(a: &Val, b: &Val): Result[int, DbErr] {
+    match a {
+        Val.Text(s) {
+            let x = try coerce(Val.Text(s), &timeTypeOf(b))
+            return compareTime(&x, b)
+        }
+        else {}
+    }
+    match b {
+        Val.Text(s) {
+            let y = try coerce(Val.Text(s), &timeTypeOf(a))
+            return compareTime(a, &y)
+        }
+        else {}
+    }
+    match a {
+        Val.Date(x) { match b { Val.Date(y) { return Ok(x.cmp(&y)) } else {} } }
+        Val.Ts(x) { match b { Val.Ts(y) { return Ok(x.cmp(&y)) } else {} } }
+        Val.Tstz(x) { match b { Val.Tstz(y) { return Ok(x.cmp(&y)) } else {} } }
+        Val.Time(x) { match b { Val.Time(y) { return Ok(x.cmp(&y)) } else {} } }
+        Val.Ival(x) { match b { Val.Ival(y) { return Ok(lexdb_time.ivalCmp(&x, &y)) } else {} } }
+        else {}
+    }
+    match asTstz(a) {
+        Some(x) {
+            match asTstz(b) {
+                Some(y) { return Ok(x.cmp(&y)) }
+                None {}
+            }
+        }
+        None {}
+    }
+    return Err(e("42883", "operator does not exist: " + kindName(&oidType(kindOid(a))) + " compared with " +
+                 kindName(&oidType(kindOid(b)))))
+}
+
+fn opErr(op: &str, a: &Val, b: &Val): DbErr {
+    return e("42883", "operator does not exist: " + kindName(&oidType(kindOid(a))) + " " + op + " " + kindName(&oidType(kindOid(b))))
+}
+
+fn intOf(v: &Val): Option[int] {
+    match v {
+        Val.Int(n) { return Some(n) }
+        Val.Text(s) { return strings.parseIntOpt(strings.trim(s)) }
+        else { return None }
+    }
+}
+
+fn ivalOfVal(v: &Val): Result[Option[lexdb_time.Ival], DbErr] {
+    match v {
+        Val.Ival(iv) { return Ok(Some(iv)) }
+        Val.Text(s) { return Ok(Some(try lexdb_time.parseIval(&s))) }
+        else { return Ok(None) }
+    }
+}
+
+// Arithmetic with a date or time kind, as PostgreSQL's operators: a date
+// and days, dates' difference in days, a date-time and an interval, the
+// difference of two date-times, intervals with each other and times a
+// number. A text on one side is read as the type the operator needs.
+fn arithTime(op: &str, a: &Val, b: &Val): Result[Val, DbErr] {
+    let plus = op == "+"
+    let minus = op == "-"
+    match a {
+        Val.Date(d) {
+            if plus || minus {
+                match b {
+                    Val.Date(d2) { if minus { return Ok(Val.Int(d - d2)) } }
+                    Val.Time(t) { if plus { return Ok(Val.Ts(lexdb_time.dateToTs(d) + t)) } }
+                    Val.Ival(iv) {
+                        let x = if minus { lexdb_time.ivalNeg(&iv) } else { iv }
+                        return Ok(Val.Ts(try lexdb_time.tsPlus(lexdb_time.dateToTs(d), &x)))
+                    }
+                    Val.Int(n) { return Ok(Val.Date(if plus { d + n } else { d - n })) }
+                    Val.Text(s) {
+                        match strings.parseIntOpt(strings.trim(s)) {
+                            Some(n) { return Ok(Val.Date(if plus { d + n } else { d - n })) }
+                            None {}
+                        }
+                        if minus {
+                            match lexdb_time.parseDate(&s) {
+                                Ok(d2) { return Ok(Val.Int(d - d2)) }
+                                Err(_) {}
+                            }
+                        }
+                        return arithTime(op, a, &Val.Ival(try lexdb_time.parseIval(&s)))
+                    }
+                    else {}
+                }
+            }
+        }
+        Val.Ts(u) {
+            if plus || minus {
+                match b {
+                    Val.Ts(u2) { if minus { return Ok(Val.Ival(try lexdb_time.tsDiff(u, u2))) } }
+                    Val.Text(s) {
+                        // timestamp - '...': a timestamp, as PostgreSQL reads it
+                        if minus { return arithTime(op, a, &Val.Ts(try lexdb_time.parseTs(&s))) }
+                    }
+                    else {}
+                }
+                match try ivalOfVal(b) {
+                    Some(iv) {
+                        let x = if minus { lexdb_time.ivalNeg(&iv) } else { iv }
+                        return Ok(Val.Ts(try lexdb_time.tsPlus(u, &x)))
+                    }
+                    None {}
+                }
+            }
+        }
+        Val.Tstz(u) {
+            if plus || minus {
+                match b {
+                    Val.Tstz(u2) { if minus { return Ok(Val.Ival(try lexdb_time.tsDiff(u, u2))) } }
+                    Val.Text(s) {
+                        if minus { return arithTime(op, a, &Val.Tstz(try lexdb_time.parseTstz(&s))) }
+                    }
+                    else {}
+                }
+                match try ivalOfVal(b) {
+                    Some(iv) {
+                        let x = if minus { lexdb_time.ivalNeg(&iv) } else { iv }
+                        return Ok(Val.Tstz(try lexdb_time.tstzPlus(u, &x)))
+                    }
+                    None {}
+                }
+            }
+        }
+        Val.Time(t) {
+            if plus || minus {
+                match b {
+                    Val.Time(t2) { if minus { return Ok(Val.Ival(lexdb_time.Ival{months: 0, days: 0, us: t - t2})) } }
+                    Val.Date(d) { if plus { return Ok(Val.Ts(lexdb_time.dateToTs(d) + t)) } }
+                    else {}
+                }
+                match try ivalOfVal(b) {
+                    Some(iv) { return Ok(Val.Time(floorModInt(if plus { t + iv.us } else { t - iv.us }, lexdb_time.DAY_US))) }
+                    None {}
+                }
+            }
+        }
+        Val.Ival(iv) {
+            if plus || minus {
+                match b {
+                    Val.Ival(iv2) { return Ok(Val.Ival(lexdb_time.ivalPlus(&iv, &(if minus { lexdb_time.ivalNeg(&iv2) } else { iv2 })))) }
+                    Val.Text(s) { return arithTime(op, a, &Val.Ival(try lexdb_time.parseIval(&s))) }
+                    else {}
+                }
+                if plus { return arithTime(op, b, a) }      // interval + a date-time
+            }
+            if op == "*" || op == "/" {
+                match asNum(b) {
+                    Some(f) {
+                        return Ok(Val.Ival(if op == "*" { try lexdb_time.ivalTimes(&iv, &f) } else { try lexdb_time.ivalDiv(&iv, &f) }))
+                    }
+                    None {}
+                }
+            }
+        }
+        else {
+            // a number times an interval; a text before a date-time
+            if op == "*" {
+                match b { Val.Ival(_) { return arithTime(op, b, a) } else {} }
+            }
+            if plus {
+                match b {
+                    Val.Date(_) { return arithTime(op, b, a) }
+                    Val.Ts(_) { return arithTime(op, b, a) }
+                    Val.Tstz(_) { return arithTime(op, b, a) }
+                    Val.Time(_) { return arithTime(op, b, a) }
+                    else {}
+                }
+            }
+            match a {
+                Val.Text(s) {
+                    // '2026-01-02' - date '2026-01-01', '...' - interval: the text as the other's type
+                    match b {
+                        Val.Ival(_) {}
+                        else {
+                            if isTimeKind(kindOf(b)) { return arithTime(op, &(try coerce(Val.Text(s), &timeTypeOf(b))), b) }
+                        }
+                    }
+                }
+                else {}
+            }
+        }
+    }
+    return Err(opErr(op, a, b))
+}
+
+// The date and time functions (9.76): None when name is not one.
+// now: the transaction's start (microseconds since 2000), 0 for the clock.
+fn callTime(name: &str, vs: &[]Val, now: int): Result[Option[Val], DbErr] {
+    let n = len(vs)
+    let prec = if n == 1 { intOf(&vs[0]).unwrapOr(6) } else { 6 }
+    // the transaction's start, as PostgreSQL's now(); clock_timestamp() the clock
+    let at = if now != 0 && name != "clock_timestamp" { now } else { lexdb_time.nowTstz() }
+    let local = lexdb_time.tstzToTs(at)
+    match name {
+        "now", "current_timestamp", "transaction_timestamp", "statement_timestamp", "clock_timestamp" {
+            return Ok(Some(Val.Tstz(lexdb_time.roundUs(at, prec))))
+        }
+        "localtimestamp" { return Ok(Some(Val.Ts(lexdb_time.roundUs(local, prec)))) }
+        "current_date" { return Ok(Some(Val.Date(lexdb_time.tsToDate(local)))) }
+        "current_time", "localtime" { return Ok(Some(Val.Time(lexdb_time.roundUs(floorModInt(local, lexdb_time.DAY_US), prec)))) }
+        "date_part", "date_trunc", "age", "make_date", "to_timestamp", "isfinite" {}
+        else { return Ok(None) }                // not a date or time function
+    }
+    for v in vs { if isNull(&v) { return Ok(Some(Val.Null)) } }
+    if (name == "date_part" || name == "date_trunc") && n == 2 {
+        let field = text(&vs[0])
+        var x = vs[1]
+        match x {
+            Val.Text(s) { x = Val.Tstz(try lexdb_time.parseTstz(&s)) }
+            else {}
+        }
+        if name == "date_part" {
+            match x {
+                Val.Date(d) {
+                    // a date's fields are whole numbers (its epoch and Julian day too)
+                    try lexdb_time.dateField(&field)
+                    let u = lexdb_time.dateToTs(d)
+                    let xd = try lexdb_time.extractTs(&field, u, u, &"date")
+                    return Ok(Some(Val.Num(xd.trunc(0).unwrapOr(xd))))
+                }
+                Val.Ts(u) { return Ok(Some(Val.Num(try lexdb_time.extractTs(&field, u, u, &"timestamp without time zone")))) }
+                Val.Tstz(u) { return Ok(Some(Val.Num(try lexdb_time.extractTs(&field, lexdb_time.tstzToTs(u), u, &"timestamp with time zone")))) }
+                Val.Time(u) { return Ok(Some(Val.Num(try lexdb_time.extractIval(&field, &lexdb_time.Ival{months: 0, days: 0, us: u})))) }
+                Val.Ival(iv) { return Ok(Some(Val.Num(try lexdb_time.extractIval(&field, &iv)))) }
+                else { return Err(e("42883", "function date_part(text, " + kindName(&oidType(kindOid(&x))) + ") does not exist")) }
+            }
+        }
+        match x {
+            Val.Date(d) { return Ok(Some(Val.Tstz(lexdb_time.tsToTstz(try lexdb_time.truncTs(&field, lexdb_time.dateToTs(d)))))) }
+            Val.Ts(u) { return Ok(Some(Val.Ts(try lexdb_time.truncTs(&field, u)))) }
+            Val.Tstz(u) { return Ok(Some(Val.Tstz(lexdb_time.tsToTstz(try lexdb_time.truncTs(&field, lexdb_time.tstzToTs(u)))))) }
+            Val.Ival(iv) { return Ok(Some(Val.Ival(try lexdb_time.truncIval(&field, &iv)))) }
+            else { return Err(e("42883", "function date_trunc(text, " + kindName(&oidType(kindOid(&x))) + ") does not exist")) }
+        }
+    }
+    if name == "age" && (n == 1 || n == 2) {
+        let a = if n == 2 { try tsOfVal(&vs[0]) } else { lexdb_time.dateToTs(lexdb_time.today()) }
+        let b = try tsOfVal(&vs[n - 1])
+        return Ok(Some(Val.Ival(try lexdb_time.age(a, b))))
+    }
+    if name == "make_date" && n == 3 {
+        match intOf(&vs[0]) {
+            Some(y) {
+                match intOf(&vs[1]) {
+                    Some(m) {
+                        match intOf(&vs[2]) {
+                            Some(d) { return Ok(Some(Val.Date(try lexdb_time.makeDate(y, m, d)))) }
+                            None {}
+                        }
+                    }
+                    None {}
+                }
+            }
+            None {}
+        }
+        return Err(e("42883", "function make_date needs three integers"))
+    }
+    if name == "to_timestamp" && n == 1 {
+        match asNum(&vs[0]) {
+            Some(d) { return Ok(Some(Val.Tstz(try lexdb_time.fromEpochSeconds(&d)))) }
+            None { return Err(e("42883", "function to_timestamp(text) does not exist")) }
+        }
+    }
+    if name == "isfinite" && n == 1 {
+        match vs[0] {
+            Val.Date(d) { return Ok(Some(Val.Bool(d != lexdb_time.INF && d != lexdb_time.NINF))) }
+            Val.Ts(u) { return Ok(Some(Val.Bool(u != lexdb_time.INF && u != lexdb_time.NINF))) }
+            Val.Tstz(u) { return Ok(Some(Val.Bool(u != lexdb_time.INF && u != lexdb_time.NINF))) }
+            Val.Ival(_) { return Ok(Some(Val.Bool(true))) }
+            else {}
+        }
+    }
+    return Ok(None)
+}
+
+// A timestamp's local microseconds for age(): a date at midnight, a
+// timestamptz in the session's zone.
+fn tsOfVal(v: &Val): Result[int, DbErr] {
+    match v {
+        Val.Date(d) { return Ok(lexdb_time.dateToTs(d)) }
+        Val.Ts(u) { return Ok(u) }
+        Val.Tstz(u) { return Ok(lexdb_time.tstzToTs(u)) }
+        Val.Text(s) { return Ok(try lexdb_time.parseTs(&s)) }
+        else { return Err(e("42883", "function age(" + kindName(&oidType(kindOid(v))) + ") does not exist")) }
+    }
+}
+
+// The result type of a date or time operator (0: not one).
+fn timeOpOid(op: &str, l: int, r: int): int {
+    let tl = lexdb_sql.timeKind(l)
+    let tr = lexdb_sql.timeKind(r)
+    if tl == 0 && tr == 0 { return 0 }
+    let D = lexdb_sql.OID_DATE
+    let T = lexdb_sql.OID_TIME
+    let TS = lexdb_sql.OID_TS
+    let TZ = lexdb_sql.OID_TSTZ
+    let IV = lexdb_sql.OID_IVAL
+    if op == "*" || op == "/" { return IV }
+    if l == D && r == D { return if op == "-" { lexdb_sql.OID_INT4 } else { 0 } }
+    if l == D && r == IV || l == IV && r == D { return TS }
+    if l == D && r == T || l == T && r == D { return TS }
+    if l == D { return D }                              // a date and days
+    if r == D && op == "+" { return D }
+    if (l == TS && r == TS) || (l == TZ && r == TZ) || (l == T && r == T) { return if op == "-" { IV } else { 0 } }
+    if l == TS || r == TS { return TS }
+    if l == TZ || r == TZ { return TZ }
+    if l == T || r == T { return T }
+    return IV
 }
 
 // ---- arrays (9.27): one dimension, held as PostgreSQL's text form
@@ -364,6 +760,11 @@ fn kindOid(v: &Val): int {
         Val.Int(_) { return lexdb_sql.OID_INT8 }
         Val.Bool(_) { return lexdb_sql.OID_BOOL }
         Val.Num(_) { return lexdb_sql.OID_NUMERIC }
+        Val.Date(_) { return lexdb_sql.OID_DATE }
+        Val.Time(_) { return lexdb_sql.OID_TIME }
+        Val.Ts(_) { return lexdb_sql.OID_TS }
+        Val.Tstz(_) { return lexdb_sql.OID_TSTZ }
+        Val.Ival(_) { return lexdb_sql.OID_IVAL }
         else { return lexdb_sql.OID_TEXT }
     }
 }
@@ -489,6 +890,11 @@ fn kindOf(v: &Val): int {
         Val.Bool(_) { return lexdb_sql.K_BOOL }
         Val.Num(_) { return lexdb_sql.K_NUM }
         Val.Text(_) { return lexdb_sql.K_TEXT }
+        Val.Date(_) { return lexdb_sql.K_DATE }
+        Val.Time(_) { return lexdb_sql.K_TIME }
+        Val.Ts(_) { return lexdb_sql.K_TS }
+        Val.Tstz(_) { return lexdb_sql.K_TSTZ }
+        Val.Ival(_) { return lexdb_sql.K_IVAL }
     }
 }
 
@@ -511,6 +917,7 @@ fn asNum(v: &Val): Option[Decimal] {
 fn compare(a: &Val, b: &Val): Result[int, DbErr] {
     let ka = kindOf(a)
     let kb = kindOf(b)
+    if isTimeKind(ka) || isTimeKind(kb) { return compareTime(a, b) }
     match a {
         Val.Int(x) {
             match b {
@@ -573,6 +980,7 @@ fn decErr(): DbErr { return e("22003", "numeric value out of range") }
 
 fn arith(op: &str, a: &Val, b: &Val): Result[Val, DbErr] {
     if isNull(a) || isNull(b) { return Ok(Val.Null) }
+    if isTimeKind(kindOf(a)) || isTimeKind(kindOf(b)) { return arithTime(op, a, b) }
     var x = 0
     var y = 0
     var ints = false
@@ -748,6 +1156,7 @@ pub fn eval(x: &Expr, env: &Env): Result[Val, DbErr] {
                         }
                     }
                     Val.Num(d) { return Ok(Val.Num(d.neg())) }
+                    Val.Ival(iv) { return Ok(Val.Ival(lexdb_time.ivalNeg(&iv))) }
                     else { return arith(&"-", &Val.Int(0), &v) }
                 }
             }
@@ -836,6 +1245,11 @@ pub fn eval(x: &Expr, env: &Env): Result[Val, DbErr] {
             var vs: []Val = []
             for a in args { append(mut &vs, try eval(&a, env)) }
             if isSeqFn(&name) { return seqCall(&name, &vs, env) }
+            // now() and the rest: the transaction's start (9.76)
+            match env.seq {
+                Some(se) { return callAt(&name, &vs, lexdb_time.fromUnixUs(se.now)) }
+                None {}
+            }
             return call(&name, &vs)
         }
     }
@@ -991,7 +1405,14 @@ fn substr(s: str, from: int, count: int, hasCount: bool): Result[str, DbErr] {
     return Ok(strings.fromRunes(&out))
 }
 
-fn call(name: &str, vs: &[]Val): Result[Val, DbErr] {
+fn call(name: &str, vs: &[]Val): Result[Val, DbErr] { return callAt(name, vs, 0) }
+
+// call, with now the transaction's start (microseconds since 2000; 0: the clock).
+fn callAt(name: &str, vs: &[]Val, now: int): Result[Val, DbErr] {
+    match try callTime(name, vs, now) {
+        Some(v) { return Ok(v) }
+        None {}
+    }
     if name == "array" { return Ok(Val.Text(arrayText(vs))) }
     if lexdb_sql.isQuant(name) { return quantified(name, &vs[0], &vs[1]) }
     let n = len(vs)
@@ -1137,6 +1558,16 @@ fn arithInt(a: int, b: int): Result[int, DbErr] {
 fn encKeyPart(b: mut &StrBuf, v: &Val) {
     match v {
         Val.Int(n) { binary.addU64BE(b, n ^ (-9223372036854775807 - 1)) }
+        Val.Date(n) { binary.addU64BE(b, n ^ (-9223372036854775807 - 1)) }
+        Val.Time(n) { binary.addU64BE(b, n ^ (-9223372036854775807 - 1)) }
+        Val.Ts(n) { binary.addU64BE(b, n ^ (-9223372036854775807 - 1)) }
+        Val.Tstz(n) { binary.addU64BE(b, n ^ (-9223372036854775807 - 1)) }
+        Val.Ival(iv) {
+            // as PostgreSQL compares intervals: a month as 30 days, then the time of day left
+            let k = lexdb_time.ivalKey(&iv)
+            binary.addU64BE(b, k.days ^ (-9223372036854775807 - 1))
+            binary.addU64BE(b, k.us ^ (-9223372036854775807 - 1))
+        }
         Val.Bool(x) { b.addByte(if x { 1 } else { 0 }) }
         Val.Num(d) { encNum(b, &d) }
         Val.Text(s) {
@@ -1224,31 +1655,80 @@ fn encRow(row: &[]Val): str {
     }
     if long { return encLong(row) }
     var b = newStrBuf()
-    for v in row {
-        match v {
-            Val.Null { b.addByte(0) }
-            Val.Int(n) {
-                b.addByte(1)
-                binary.addU64LE(mut &b, n)
-            }
-            Val.Bool(x) {
-                b.addByte(2)
-                b.addByte(if x { 1 } else { 0 })
-            }
-            Val.Num(d) {
-                b.addByte(3)
-                let s = d.toStr()
-                binary.addU32LE(mut &b, len(s))
-                b.add(s)
-            }
-            Val.Text(s) {
-                b.addByte(4)
-                binary.addU32LE(mut &b, len(s))
-                b.add(s)
-            }
+    for v in row { encVal(mut &b, &v) }
+    return b.toStr()
+}
+
+// A value in a row: its tag and its bytes (a text of any length in place).
+// Tags 7 to 10 are a date, time, timestamp and timestamptz (8 bytes), 11 an
+// interval (months, days, microseconds: 24 bytes) (9.76).
+fn encVal(b: mut &StrBuf, v: &Val) {
+    match v {
+        Val.Null { b.addByte(0) }
+        Val.Int(n) {
+            b.addByte(1)
+            binary.addU64LE(b, n)
+        }
+        Val.Bool(x) {
+            b.addByte(2)
+            b.addByte(if x { 1 } else { 0 })
+        }
+        Val.Num(d) {
+            b.addByte(3)
+            let s = d.toStr()
+            binary.addU32LE(b, len(s))
+            b.add(s)
+        }
+        Val.Text(s) {
+            b.addByte(4)
+            binary.addU32LE(b, len(s))
+            b.add(s)
+        }
+        Val.Date(n) {
+            b.addByte(7)
+            binary.addU64LE(b, n)
+        }
+        Val.Time(n) {
+            b.addByte(8)
+            binary.addU64LE(b, n)
+        }
+        Val.Ts(n) {
+            b.addByte(9)
+            binary.addU64LE(b, n)
+        }
+        Val.Tstz(n) {
+            b.addByte(10)
+            binary.addU64LE(b, n)
+        }
+        Val.Ival(iv) {
+            b.addByte(11)
+            binary.addU64LE(b, iv.months)
+            binary.addU64LE(b, iv.days)
+            binary.addU64LE(b, iv.us)
         }
     }
-    return b.toStr()
+}
+
+// A date or time value of tag (7 to 11) in a row at s[at..].
+fn timeVal(s: &str, at: int, tag: byte): Val {
+    let x = binary.readI64LEStr(s, at)
+    if tag == 7 { return Val.Date(x) }
+    if tag == 8 { return Val.Time(x) }
+    if tag == 9 { return Val.Ts(x) }
+    if tag == 10 { return Val.Tstz(x) }
+    return Val.Ival(lexdb_time.Ival{months: x, days: binary.readI64LEStr(s, at + 8), us: binary.readI64LEStr(s, at + 16)})
+}
+
+// The bytes after its tag a value of tag takes in a row at s[at..]; -1 for
+// a tag that is not one.
+fn valSize(s: &str, at: int, tag: byte): int {
+    if tag == 0 { return 0 }
+    if tag == 1 || (tag >= 7 && tag <= 10) { return 8 }
+    if tag == 2 { return 1 }
+    if tag == 3 || tag == 4 { return 4 + binary.readU32LEStr(s, at) }
+    if tag == 5 { return 4 }
+    if tag == 11 { return 24 }
+    return -1
 }
 
 fn encLong(row: &[]Val): str {
@@ -1257,31 +1737,15 @@ fn encLong(row: &[]Val): str {
     binary.addU32LE(mut &b, len(row))
     for v in row {
         match v {
-            Val.Null { b.addByte(0) }
-            Val.Int(n) {
-                b.addByte(1)
-                binary.addU64LE(mut &b, n)
-            }
-            Val.Bool(x) {
-                b.addByte(2)
-                b.addByte(if x { 1 } else { 0 })
-            }
-            Val.Num(d) {
-                b.addByte(3)
-                let s = d.toStr()
-                binary.addU32LE(mut &b, len(s))
-                b.add(s)
-            }
             Val.Text(s) {
                 if len(s) >= LONG {
                     b.addByte(5)
                     binary.addU32LE(mut &b, len(s))
                 } else {
-                    b.addByte(4)
-                    binary.addU32LE(mut &b, len(s))
-                    b.add(s)
+                    encVal(mut &b, &v)
                 }
             }
+            else { encVal(mut &b, &v) }
         }
     }
     for v in row {
@@ -1383,10 +1847,12 @@ fn fitsIn(p: &str, n: int, need: &[]bool): bool {
         if tag == 5 {
             if i < n && need[i] { return false }
             at += 4
-        } else if tag == 1 { at += 8 } else if tag == 2 { at += 1 } else if tag == 3 || tag == 4 {
-            if at + 4 > len(p) { return false }
-            at += 4 + binary.readU32LEStr(p, at)
-        } else if tag != 0 { return false }
+        } else {
+            if (tag == 3 || tag == 4) && at + 4 > len(p) { return false }
+            let sz = valSize(p, at, tag)
+            if sz < 0 { return false }
+            at += sz
+        }
         if at > len(p) { return false }
     }
     return true
@@ -1401,7 +1867,7 @@ fn rowHead(s: &str): int {
     for i in 0..cols {
         let tag = s[at]
         at += 1
-        if tag == 1 { at += 8 } else if tag == 2 { at += 1 } else if tag == 3 || tag == 4 { at += 4 + binary.readU32LEStr(s, at) } else if tag == 5 { at += 4 }
+        at += valSize(s, at, tag)
     }
     return at
 }
@@ -1446,8 +1912,9 @@ fn decRowNeed(s: &str, n: int, need: &[]bool, missing: &[]Val, lays: &[]FixedLay
             continue
         }
         if some && !need[i] {
-            if tag == 1 { at += 8 } else if tag == 2 { at += 1 } else if tag == 3 || tag == 4 { at += 4 + binary.readU32LEStr(s, at) }
-            else if tag != 0 { return Err(lexdb_base.corrupt("a row's value tag")) }
+            let sz = valSize(s, at, tag)
+            if sz < 0 { return Err(lexdb_base.corrupt("a row's value tag")) }
+            at += sz
             append(mut &out, Val.Null)
             continue
         }
@@ -1471,6 +1938,9 @@ fn decRowNeed(s: &str, n: int, need: &[]bool, missing: &[]Val, lays: &[]FixedLay
                     Err(_) { return Err(lexdb_base.corrupt("a numeric value in a row")) }
                 }
             }
+        } else if tag >= 7 && tag <= 11 {
+            append(mut &out, timeVal(s, at, tag))
+            at += valSize(s, at, tag)
         } else {
             return Err(lexdb_base.corrupt("a row's value tag"))
         }
@@ -1484,7 +1954,7 @@ fn decRowNeed(s: &str, n: int, need: &[]bool, missing: &[]Val, lays: &[]FixedLay
                 append(mut &longAt, i)
                 append(mut &longLen, binary.readU32LEStr(s, at))
                 at += 4
-            } else if tag == 1 { at += 8 } else if tag == 2 { at += 1 } else if tag == 3 || tag == 4 { at += 4 + binary.readU32LEStr(s, at) }
+            } else { at += valSize(s, at, tag) }
         }
         for k in 0..len(longAt) {
             let l = longLen[k]
@@ -2087,6 +2557,7 @@ fn rowBytes(r: &[]Val): int {
         match v {
             Val.Text(t) { n += len(t) }
             Val.Num(_) { n += 32 }
+            Val.Ival(_) { n += 24 }
             else {}
         }
     }
@@ -3965,6 +4436,7 @@ fn runChild(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params
 
 // A column type for a result's OID.
 fn oidType(oid: int): lexdb_sql.TypeName {
+    if lexdb_sql.timeKind(oid) > 0 { return lexdb_sql.timeType(oid) }
     if lexdb_sql.elemOid(oid) > 0 { return lexdb_sql.TypeName{kind: lexdb_sql.K_ARRAY, oid: oid, prec: 0, scale: 0, len: 0} }
     var kind = lexdb_sql.K_TEXT
     var o = oid
@@ -5622,6 +6094,11 @@ pub fn exprOid(x: &Expr, cols: &[]lexdb_sql.ColDef, ptypes: &[]int): int {
                 Val.Int(n) { return if n >= -2147483648 && n <= 2147483647 { lexdb_sql.OID_INT4 } else { lexdb_sql.OID_INT8 } }
                 Val.Bool(_) { return lexdb_sql.OID_BOOL }
                 Val.Num(_) { return lexdb_sql.OID_NUMERIC }
+                Val.Date(_) { return lexdb_sql.OID_DATE }
+                Val.Time(_) { return lexdb_sql.OID_TIME }
+                Val.Ts(_) { return lexdb_sql.OID_TS }
+                Val.Tstz(_) { return lexdb_sql.OID_TSTZ }
+                Val.Ival(_) { return lexdb_sql.OID_IVAL }
                 else { return lexdb_sql.OID_TEXT }
             }
         }
@@ -5639,6 +6116,8 @@ pub fn exprOid(x: &Expr, cols: &[]lexdb_sql.ColDef, ptypes: &[]int): int {
             if op == "+" || op == "-" || op == "*" || op == "/" || op == "%" {
                 let l = exprOid(&a, cols, ptypes)
                 let r = exprOid(&b, cols, ptypes)
+                let to = timeOpOid(&op, l, r)
+                if to > 0 { return to }
                 if l == lexdb_sql.OID_NUMERIC || r == lexdb_sql.OID_NUMERIC { return lexdb_sql.OID_NUMERIC }
                 if l == lexdb_sql.OID_INT8 || r == lexdb_sql.OID_INT8 { return lexdb_sql.OID_INT8 }
                 return lexdb_sql.OID_INT4
@@ -5695,6 +6174,19 @@ pub fn exprOid(x: &Expr, cols: &[]lexdb_sql.ColDef, ptypes: &[]int): int {
                     return if len(args) > 0 { exprOid(&args[0], cols, ptypes) } else { lexdb_sql.OID_TEXT }
                 }
                 "length", "char_length" { return lexdb_sql.OID_INT4 }
+                "now", "current_timestamp", "transaction_timestamp", "statement_timestamp", "clock_timestamp", "to_timestamp" {
+                    return lexdb_sql.OID_TSTZ
+                }
+                "localtimestamp" { return lexdb_sql.OID_TS }
+                "current_date", "make_date" { return lexdb_sql.OID_DATE }
+                "current_time", "localtime" { return lexdb_sql.OID_TIME }
+                "date_part" { return lexdb_sql.OID_NUMERIC }
+                "age" { return lexdb_sql.OID_IVAL }
+                "isfinite" { return lexdb_sql.OID_BOOL }
+                "date_trunc" {
+                    let a = if len(args) > 1 { exprOid(&args[1], cols, ptypes) } else { lexdb_sql.OID_TSTZ }
+                    return if a == lexdb_sql.OID_TS || a == lexdb_sql.OID_IVAL { a } else { lexdb_sql.OID_TSTZ }
+                }
                 "nextval", "currval", "setval", "lastval" { return lexdb_sql.OID_INT8 }
                 "round" { return lexdb_sql.OID_NUMERIC }
                 else { return lexdb_sql.OID_TEXT }
@@ -7506,7 +7998,7 @@ pub fn paramVals(texts: &[]Option[str], ptypes: &[]int): Result[[]Val, DbErr] {
                     ty = lexdb_sql.TypeName{kind: lexdb_sql.K_BOOL, oid: oid, prec: 0, scale: 0, len: 0}
                 } else if oid == lexdb_sql.OID_NUMERIC {
                     ty = lexdb_sql.TypeName{kind: lexdb_sql.K_NUM, oid: oid, prec: 0, scale: 0, len: 0}
-                } else if lexdb_sql.elemOid(oid) > 0 {
+                } else if lexdb_sql.elemOid(oid) > 0 || lexdb_sql.timeKind(oid) > 0 {
                     ty = oidType(oid)
                 }
                 append(mut &out, try coerce(Val.Text(s), &ty))
@@ -8379,10 +8871,10 @@ const SEQ_TREE: str = "\x02seqs"
 fn seqRow(k: &str): str { return "\x04" + k }
 
 // What a session's evaluation needs for nextval and its kind (Env.seq).
-pub type SeqEnv = value record { st: lexdb_store.Store; sess: int }
+pub type SeqEnv = value record { st: lexdb_store.Store; sess: int; now: int }
 
 fn seqEnv(st: &lexdb_store.Store, txn: &lexdb_store.Txn): Option[SeqEnv] {
-    return Some(SeqEnv{st: st.handle(), sess: txn.sess})
+    return Some(SeqEnv{st: st.handle(), sess: txn.sess, now: txn.now})
 }
 
 fn encSeq(d: &Seq): str {
@@ -10617,8 +11109,9 @@ fn bRowInto(s: &str, r: int, b: mut &Batch, bp: &BPlan, t: &Table): Result[int, 
         let tag = s[at]
         at += 1
         if c < 0 {
-            if tag == 1 { at += 8 } else if tag == 2 { at += 1 } else if tag == 3 || tag == 4 { at += 4 + binary.readU32LEStr(s, at) }
-            else if tag != 0 { return Err(lexdb_base.corrupt("a row's value tag")) }
+            let sz = valSize(s, at, tag)
+            if sz < 0 { return Err(lexdb_base.corrupt("a row's value tag")) }
+            at += sz
             continue
         }
         let k = kinds[c]
@@ -10650,6 +11143,9 @@ fn bRowInto(s: &str, r: int, b: mut &Batch, bp: &BPlan, t: &Table): Result[int, 
                     Err(_) { return Err(lexdb_base.corrupt("a numeric value in a row")) }
                 }
             }
+        } else if tag >= 7 && tag <= 11 {
+            b.vals[c][r] = timeVal(s, at, tag)
+            at += valSize(s, at, tag)
         } else {
             return Err(lexdb_base.corrupt("a row's value tag"))
         }
@@ -11561,6 +12057,7 @@ fn encFixed(t: &Table, places: &[]Val): Option[str] {
                 if k != PK_TEXT || len(x) >= LONG { return None }
                 append(mut &vars, x)
             }
+            else { return None }        // the date and time kinds: the tagged form (9.76)
         }
     }
     var b = newStrBuf()
