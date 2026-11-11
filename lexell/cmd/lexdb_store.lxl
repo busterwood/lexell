@@ -19,6 +19,7 @@ import "task"
 import "hash"
 import "binary"
 import "collections"
+import "strings"
 import "time"
 import "./lexdb_base"
 import "./lexdb_disk"
@@ -127,6 +128,12 @@ pub type Db = record {
     appliedBatch: int           // the highest batch with an applied commit
     durableBatch: int
     waiters: []Waiter
+    // Row locks (9.86): "tree:key" -> its holders, "id mode" each, joined
+    // by ";"; the transactions waiting for one, and what each waits for.
+    locks: Map[str, str]
+    lockWaits: []LockWait
+    waitFor: Map[int, str]
+    nextLock: int
     writerWake: []task.Promise[Unit]
     ckptWake: []task.Promise[Unit]
     ckptDone: []task.Promise[Unit]  // commits held while the cache is over twice its budget (see commit)
@@ -223,14 +230,31 @@ pub type Txn = record {
     ra: int
     fsnap: []RepPin             // on a replica: its follower snapshot, from its first read to its end (or its drop)
     pub now: int                // when it began, Unix microseconds: SQL's now() (9.76)
+    // The SQL layer's deferred foreign key checks, encoded (lexdb_exec,
+    // 9.85), and SET CONSTRAINTS: consAll 0 none, 1 ALL DEFERRED, 2 ALL
+    // IMMEDIATE; then per name (later ones win).
+    pub pending: []str
+    pub consAll: int
+    pub consNames: []str
+    pub consDeferred: []bool
+    lockId: int                 // its row locks' owner (9.86); 0 none yet
+    held: []str                 // the rows it has locked ("tree:key")
+    // Its reads not noted for the commit's check, for now: a SELECT that
+    // locks the rows it gives (9.86), as PostgreSQL's READ COMMITTED: the
+    // locks keep those rows as they were read
+    pub quiet: bool
 }
 
 pub fn begin(): Txn {
     return Txn{reads: [], writes: [], idxTrees: [], idx: [], created: [], snap: -1, snapSeq: 0, snapTrees: newMap(), track: false, live: false, path: [], sess: 0,
-               raTree: -1, ra: AHEAD_MIN, fsnap: [], now: time.now().unixMicros()}
+               raTree: -1, ra: AHEAD_MIN, fsnap: [], now: time.now().unixMicros(),
+               pending: [], consAll: 0, consNames: [], consDeferred: [], lockId: 0, held: [], quiet: false}
 }
 
 pub fn (t: &Txn) isSnapshot(): bool { return t.snap >= 0 }
+
+// A transaction block's (BEGIN ... COMMIT), not a statement's own.
+pub fn (t: &Txn) inBlock(): bool { return t.track }
 
 // Notes a read of [lo, hi) of tree as of commit seq; one adjacent to the
 // last (a scan's next leaf) extends it.
@@ -252,7 +276,13 @@ fn (t: mut &Txn) noteRead(tree: int, lo: str, hi: str, seq: int) {
 
 // Whether the transaction's reads are noted: a live transaction's, and a
 // block's (a read-only snapshot's are not).
-fn (t: &Txn) noting(): bool { return t.snap < 0 || t.live || t.track }
+fn (t: &Txn) noting(): bool { return !t.quiet && (t.snap < 0 || t.live || t.track) }
+
+// The reads noted so far; forgetReads(n) forgets those after the first n
+// (a statement run again after waiting for a lock, which reads again).
+pub fn (t: &Txn) readCount(): int { return len(t.reads) }
+
+pub fn (t: mut &Txn) forgetReads(n: int) { while len(t.reads) > n { let r = pop(mut &t.reads) } }
 
 // The transaction's last write of key in tree (its index in writes).
 fn (t: &Txn) lastWrite(tree: int, key: &str): Option[int] {
@@ -1373,7 +1403,7 @@ fn (st: &Store) getIn(t: mut &Txn, tree: int, key: str, mode: int): Result[Optio
             // one range, not a mark per row)
             let nr = len(t.reads)
             var widened = false
-            if nr > 0 && t.reads[nr - 1].tree == tree && t.reads[nr - 1].seq == db.seq && len(t.reads[nr - 1].hi) > 0 && key >= t.reads[nr - 1].hi {
+            if !t.quiet && nr > 0 && t.reads[nr - 1].tree == tree && t.reads[nr - 1].seq == db.seq && len(t.reads[nr - 1].hi) > 0 && key >= t.reads[nr - 1].hi {
                 var clear = len(d.path) == 0
                 if !clear {
                     let lf = db.meta[d.path[len(d.path) - 1]].frame
@@ -1387,7 +1417,7 @@ fn (st: &Store) getIn(t: mut &Txn, tree: int, key: str, mode: int): Result[Optio
                     widened = true
                 }
             }
-            if !widened { t.noteRead(tree, key, key + "\x00", db.seq) }
+            if !widened && !t.quiet { t.noteRead(tree, key, key + "\x00", db.seq) }
             if len(d.path) == 0 { return }
             let leaf = d.path[len(d.path) - 1]
             let i = db.pool[db.meta[leaf].frame].lower(&key)
@@ -1958,15 +1988,20 @@ fn (db: mut &Db) logWrites(t: &Txn) {
 // Commits: checks that nothing the transaction read has changed, applies its
 // writes and waits until the log holds them. A transaction that only read
 // is checked too, and waits until what it saw is durable (4.4).
-pub fn (st: &Store) commit(t: Txn): Result[Unit, lexdb_base.DbErr] {
-    if st.fo.isSome() { return st.repEnd(&t) }
+pub fn (st: &Store) commit(t0: Txn): Result[Unit, lexdb_base.DbErr] {
+    if st.fo.isSome() { return st.repEnd(&t0) }
+    var t = t0
     let id = t.snap
+    let lid = t.lockId
+    let held = replace(mut &t.held, [])
     if id >= 0 && len(t.writes) == 0 {
         st.endSnap(id)
+        st.unlockAll(lid, &held)
         return Ok(Unit{})
     }
     let r = st.commitLive(t, true)
     st.endSnap(id)
+    st.unlockAll(lid, &held)            // after the commit: those woken read what it wrote
     return r
 }
 
@@ -1974,11 +2009,15 @@ pub fn (st: &Store) commit(t: Txn): Result[Unit, lexdb_base.DbErr] {
 // the log ahead of every commit after it, so durable once any later commit
 // is (a sequence's block, 9.43: no transaction using its values can be
 // durable before it). A crash before then loses it.
-pub fn (st: &Store) commitAhead(t: Txn): Result[Unit, lexdb_base.DbErr] {
-    if st.fo.isSome() { return st.repEnd(&t) }
+pub fn (st: &Store) commitAhead(t0: Txn): Result[Unit, lexdb_base.DbErr] {
+    if st.fo.isSome() { return st.repEnd(&t0) }
+    var t = t0
     let id = t.snap
+    let lid = t.lockId
+    let held = replace(mut &t.held, [])
     let r = st.commitLive(t, false)
     st.endSnap(id)
+    st.unlockAll(lid, &held)
     return r
 }
 
@@ -2157,7 +2196,202 @@ fn (st: &Store) endSnap(id: int) {
 }
 
 // Ends a transaction without committing it.
-pub fn (st: &Store) abort(t: Txn) { st.endSnapshot(&t) }
+pub fn (st: &Store) abort(t: Txn) {
+    st.unlockAll(t.lockId, &t.held)
+    st.endSnapshot(&t)
+}
+
+// ---- row locks (9.86)
+//
+// SELECT ... FOR UPDATE and the like, and a block's UPDATE and DELETE, lock
+// the rows they return or change until the transaction ends. A lock is kept
+// here, not in the row: a table of "tree:key" to holders, as many as their
+// modes allow (PostgreSQL's four, and its table of which conflict). A
+// transaction a lock keeps out waits for the holders to end, woken then to
+// try again; one whose wait would close a cycle fails (40P01).
+
+type LockWait = record { key: str; id: int; p: task.Promise[Unit] }
+
+// Whether lock modes a and b (LOCK_*: 1 key share, 2 share, 3 no key
+// update, 4 update) keep each other out.
+fn lockConflict(a: int, b: int): bool {
+    let hi = if a > b { a } else { b }
+    let lo = if a > b { b } else { a }
+    if hi == 4 { return true }
+    if hi == 3 { return lo >= 2 }
+    return false
+}
+
+// A row's holders: ids and their modes.
+fn holdersOf(s: &str, ids: mut &[]int, modes: mut &[]int) {
+    if len(s) == 0 { return }
+    for h in strings.split(s, ";") {
+        let sp = strings.indexOf(&h, " ", 0)
+        append(ids, strings.parseIntOpt(h[0..sp].toStr()).unwrapOr(0))
+        append(modes, strings.parseIntOpt(h[sp + 1..len(h)].toStr()).unwrapOr(0))
+    }
+}
+
+fn holdersText(ids: &[]int, modes: &[]int): str {
+    var parts: []str = []
+    for i in 0..len(ids) { append(mut &parts, ids[i].toStr() + " " + modes[i].toStr()) }
+    return strings.join(&parts, ";")
+}
+
+// Whether transaction me waiting for the holders hs would wait for itself:
+// a holder that is me, or waits (in turn) for a row me holds.
+fn (db: &Db) cycle(me: int, hs: &[]int): bool {
+    var todo: []int = []
+    for h in hs { append(mut &todo, h) }
+    var seen: []int = []
+    while len(todo) > 0 {
+        let h = pop(mut &todo)
+        if h == me { return true }
+        var was = false
+        for x in seen { if x == h { was = true } }
+        if was { continue }
+        append(mut &seen, h)
+        match db.waitFor.get(&h) {
+            Some(k) {
+                var ids: []int = []
+                var modes: []int = []
+                holdersOf(&db.locks.get(&k).unwrapOr(""), mut &ids, mut &modes)
+                for i in ids { append(mut &todo, i) }
+            }
+            None {}
+        }
+    }
+    return false
+}
+
+// What lockRow did.
+pub const LOCKED = 0
+pub const LOCKED_AFTER_WAIT = 1     // the row may have changed meanwhile
+pub const LOCK_SKIPPED = 2          // SKIP LOCKED: another holds it
+
+// Locks key of tree in mode (LOCK_*) for t, waiting while others hold it
+// in a mode that conflicts (wait 0), or failing (1: 55P03), or skipping
+// (2). keep false: only waits for others, takes no lock (an UPDATE outside
+// a block: its own commit ends it at once).
+pub fn (st: &Store) lockRow(t: mut &Txn, tree: int, key: &str, mode: int, wait: int, keep: bool): Result[int, lexdb_base.DbErr] {
+    if t.lockId == 0 {
+        var id = 0
+        st.sh.with(fn(db: mut &Db) {
+            db.nextLock += 1
+            id = db.nextLock
+        })
+        t.lockId = id
+    }
+    let lk = tree.toStr() + ":" + key
+    var added = false
+    let r = try st.lockAs(t.lockId, &lk, mode, wait, keep, mut &added)
+    if added { append(mut &t.held, lk) }
+    return Ok(r)
+}
+
+// lockRow for lock owner me (a transaction's lockId, or a session's own
+// for advisory locks: negative) and lock key lk. added: me did not hold it.
+pub fn (st: &Store) lockAs(me: int, lk: &str, mode: int, wait: int, keep: bool, added: mut &bool): Result[int, lexdb_base.DbErr] {
+    var waited = false
+    while true {
+        var out = -1
+        var bad: []lexdb_base.DbErr = []
+        var fut: []task.Future[Unit] = []
+        st.sh.with(fn(db: mut &Db) {
+            let gone = db.waitFor.remove(&me)
+            var ids: []int = []
+            var modes: []int = []
+            holdersOf(&db.locks.get(&lk).unwrapOr(""), mut &ids, mut &modes)
+            var others: []int = []
+            var mine = -1
+            for i in 0..len(ids) {
+                if ids[i] == me { mine = i } else if lockConflict(mode, modes[i]) { append(mut &others, ids[i]) }
+            }
+            if len(others) == 0 {
+                if keep {
+                    if mine < 0 {
+                        append(mut &ids, me)
+                        append(mut &modes, mode)
+                        added = true
+                    } else if modes[mine] < mode {
+                        modes[mine] = mode
+                    }
+                    db.locks.put(lk.toStr(), holdersText(&ids, &modes))
+                }
+                out = if waited { LOCKED_AFTER_WAIT } else { LOCKED }
+                return
+            }
+            if wait == 1 {
+                append(mut &bad, lexdb_base.err("55P03", "could not obtain lock on row"))
+                return
+            }
+            if wait == 2 {
+                out = LOCK_SKIPPED
+                return
+            }
+            if db.cycle(me, &others) {
+                append(mut &bad, lexdb_base.err("40P01", "deadlock detected"))
+                return
+            }
+            let task.Handoff{promise: p, future: f} = task.promise[Unit]()
+            append(mut &db.lockWaits, LockWait{key: lk.toStr(), id: me, p: p})
+            db.waitFor.put(me, lk.toStr())
+            append(mut &fut, f)
+        })
+        if len(bad) > 0 { return Err(bad[0]) }
+        if out >= 0 { return Ok(out) }
+        match pop(mut &fut).wait() {
+            Ok(_) {}
+            Err(_) { return Err(lexdb_base.err(lexdb_base.S_INTERNAL, "lock: the waker has gone")) }
+        }
+        waited = true
+    }
+    return Ok(LOCKED)
+}
+
+// Releases the row locks of lock owner id (held, its rows), waking those
+// waiting for them.
+pub fn (st: &Store) unlockAll(id: int, held: &[]str) {
+    if id == 0 { return }
+    var wake: []task.Promise[Unit] = []
+    st.sh.with(fn(db: mut &Db) {
+        let w = db.waitFor.remove(&id)
+        for lk in held {
+            var ids: []int = []
+            var modes: []int = []
+            holdersOf(&db.locks.get(&lk).unwrapOr(""), mut &ids, mut &modes)
+            var ki: []int = []
+            var km: []int = []
+            for i in 0..len(ids) {
+                if ids[i] != id {
+                    append(mut &ki, ids[i])
+                    append(mut &km, modes[i])
+                }
+            }
+            if len(ki) == 0 { let r = db.locks.remove(&lk) } else { db.locks.put(lk.toStr(), holdersText(&ki, &km)) }
+        }
+        if len(held) == 0 { return }
+        var keep: []LockWait = []
+        while len(db.lockWaits) > 0 {
+            let lw = pop(mut &db.lockWaits)
+            var mine = false
+            for lk in held { if lk == lw.key { mine = true } }
+            if mine {
+                let LockWait{key: _, id: _, p: p} = move(lw)
+                append(mut &wake, p)
+            } else { append(mut &keep, lw) }
+        }
+        db.lockWaits = keep
+    })
+    while len(wake) > 0 { pop(mut &wake).complete(Unit{}) }
+}
+
+// The rows locked now (for tests and EXPLAIN-like checks): count.
+pub fn (st: &Store) lockCount(): int {
+    var n = 0
+    st.sh.with(fn(db: mut &Db) { n = db.locks.size() })
+    return n
+}
 
 // The version of slot s a snapshot at seq q sees: -1 the current one (in
 // memory), -2 the current one (to load), -3 none (a bug), else the index of
@@ -2874,7 +3108,7 @@ fn newDb(fs: lexdb_disk.Fs, data: lexdb_disk.File, opts: Options, m: &lexdb_page
               trees: newMap(), nextTree: m.nextTree, npages: m.npages, free: [], freeAfterNext: [],
               pendingFree: [], dropped: [], dropReads: DROP_READS, memo: newMap(), listPages: [], ckpt: m.ckpt, durableCkpt: m.ckpt, ckptRunning: false,
               batch: [], batchCount: 0, batchNo: m.replayBatch, appliedBatch: m.replayBatch - 1,
-              durableBatch: m.replayBatch - 1, waiters: [], writerWake: [], ckptWake: [], ckptDone: [], seg: m.replaySeg,
+              durableBatch: m.replayBatch - 1, waiters: [], locks: newMap(), lockWaits: [], waitFor: newMap(), nextLock: 0, writerWake: [], ckptWake: [], ckptDone: [], seg: m.replaySeg,
               segOff: m.replayOff, logSinceCkpt: 0, failed: [], closing: false, seq: 0, snaps: [], nextSnap: 0,
               hist: [], histCount: 0, histSlots: [], deferred: [], rootHist: [], durableSeq: 0, holds: newMap(), holdCkpt: -1, holdSeg: -1, heldFree: [], changeWake: [], ckptCovers: m.covers, snapshots: 0, tooOld: 0, commits: 0,
               conflicts: 0, loads: 0, aheadReads: 0, aheadPages: 0, evictions: 0, flushes: 0, checkpoints: 0, held: 0, wholes: 0}

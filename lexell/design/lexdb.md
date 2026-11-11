@@ -5699,6 +5699,10 @@ node-postgres and psycopg (text format) worked wherever the SQL did.
    and psycopg's binary mode use them. Last, as the user decided after
    9.81.
 
+Added after 9.83, at the user's choice, before binary formats: COPY's speed
+and memory (9.84), then what migration tools need (9.85) and row locks
+(9.86).
+
 **The values for the new types.** The executor's values (`Val`) are null,
 int, bool, numeric and text. Arrays were added as text in PostgreSQL's
 text form (9.27), which keeps every value printable without its type. Two
@@ -6596,3 +6600,218 @@ each time; that is not done.
 
 The suite passes (76). The benchmark scripts are in the session's scratch
 folder.
+
+### 9.85 What migration tools need
+
+The user's next items, after COPY (9.84): first what migration tools need,
+then row locking (9.86). Probed the way 9.75 did: two tools pointed at a
+new lexdb.
+- **Alembic 1.20** ran four revisions. They:
+  - made tables with foreign keys, identity and defaults;
+  - added constraints after the fact;
+  - changed a column's type, NOT NULL and default, and renamed a column and
+    a table;
+  - made an expression index, a partial index, an enum and a JSON column.
+
+  It then went down to base and up again.
+- **Django 6.1** ran `migrate`: its own apps (auth, contenttypes, sessions,
+  admin) and a shop app with foreign keys, a many-to-many through a model,
+  unique_together and an index. Then its ORM ran select_for_update,
+  get_or_create, update_or_create, bulk upserts, aggregates over joins,
+  PROTECT and CASCADE deletes, and its introspection.
+
+**What already worked:** ADD CONSTRAINT (FOREIGN KEY, UNIQUE, CHECK), ALTER
+COLUMN TYPE, SET and DROP NOT NULL, SET DEFAULT, renames of columns and
+tables, partial indexes. Alembic's first three revisions ran, and went down
+and up again.
+
+**What failed, and is now built:**
+- **DEFERRABLE foreign keys.** Django makes every foreign key DEFERRABLE
+  INITIALLY DEFERRED, and adds a column's with SET CONSTRAINTS ...
+  IMMEDIATE after it.
+  - A foreign key keeps DEFERRABLE and INITIALLY DEFERRED. In its catalog
+    row they are in high bits of the byte that holds ON UPDATE, so a row
+    written before reads as neither.
+  - In a transaction block, a deferred key's checks are not done at the
+    statement's end (9.41). They wait in `Txn.pending` until COMMIT, or
+    until SET CONSTRAINTS ... IMMEDIATE names the key.
+  - A check is done again from the key alone: it fails if the key is still
+    missing from the parent and some row still references it. So a row
+    deleted since, or written and then undone by ROLLBACK TO, leaves
+    nothing to fail.
+  - A failing COMMIT rolls back, as in PostgreSQL. Outside a block, a
+    statement is its own transaction: its end is its commit.
+  - RESTRICT is never deferred.
+- **SET CONSTRAINTS ALL | names DEFERRED | IMMEDIATE.** It used to be
+  accepted and ignored.
+  - It now sets the mode for the transaction (`Txn.consAll`,
+    `consNames`).
+  - A name that is not a deferrable foreign key is 42809, and an unknown
+    one 42704.
+  - Outside a block it does nothing, as PostgreSQL does after its warning.
+  - `pg_constraint.condeferrable`, `condeferred`, `pg_get_constraintdef`
+    and `information_schema.table_constraints` show the flags.
+- **An index column's options** (`varchar_pattern_ops`, DESC, NULLS
+  FIRST/LAST, COLLATE). Django makes a `_like` index with the pattern
+  operator class for every indexed varchar.
+  - They change nothing. lexdb's text compares bytewise, which is what the
+    pattern classes give PostgreSQL, and a B+tree is read either way.
+  - They are kept (`Index.opts`, flag 8 in the catalog row) for
+    `pg_get_indexdef` and `pg_index.indoption`, which Django's
+    introspection reads.
+  - An operator class not among PostgreSQL's B-tree ones is 42704.
+- **CREATE INDEX CONCURRENTLY and DROP INDEX CONCURRENTLY.** They are
+  accepted, and inside a block they are 25001, as in PostgreSQL. lexdb's
+  build is one transaction either way.
+- **ADD COLUMN with constraints.** `ADD COLUMN x int REFERENCES t`,
+  `UNIQUE` and `CHECK` become the column's ADD then an ADD CONSTRAINT each.
+  IF NOT EXISTS on a column already there adds neither.
+- **The bitwise operators** `& | # << >>` and prefix `~`, at PostgreSQL's
+  "other operator" precedence. Django's introspection uses `(option & 1)`.
+- **`key` is no longer reserved.** It isn't in PostgreSQL, and Django's
+  introspection names a column `key`. `for` is reserved now, as it is
+  there: `FROM t FOR UPDATE` took it as t's alias.
+- **A CHECK constraint's conkey** lists the columns it uses. Django finds a
+  field's checks by their columns when it alters the field.
+
+**Not built, found by the probe:**
+- **Indexes on expressions** (`CREATE UNIQUE INDEX ON t (lower(email))`),
+  which Alembic and Django's functional indexes write. They are refused
+  with a clear 0A000. They need an index entry made from an expression, and
+  the planner matching the expression where it is used.
+- **CREATE TYPE ... AS ENUM**, which SQLAlchemy's Enum writes on
+  PostgreSQL.
+- JSON (the user's decision: not yet).
+
+After these, Django's `migrate` runs whole and all of its ORM probe passes.
+Alembic's revisions run apart from the expression index and the enum.
+
+**Tests:**
+- `exec_migrate`: 105 statements generated from PostgreSQL 18 by
+  `gen_pg.py migrate`, all the same. They cover:
+  - deferred keys at COMMIT, a failing COMMIT, SET CONSTRAINTS each way and
+    its errors;
+  - the catalog's flags;
+  - ADD COLUMN with constraints;
+  - index options as `pg_indexes` shows them, and `indoption`;
+  - CONCURRENTLY in and out of a block;
+  - the operators, `key` as a column;
+  - in one session, the locking clauses, their errors and the advisory
+    functions (9.86).
+- `exec_fkey`'s refused DEFERRABLE became NOT DEFERRABLE INITIALLY
+  DEFERRED's 42601.
+
+### 9.86 Row locks and advisory locks
+
+**Why lexdb needs them.** lexdb's read-write transactions are optimistic
+and serializable (4.4): one that read a row another then changed fails at
+its COMMIT (40001). That keeps data right, but applications written for
+PostgreSQL do not retry:
+- Django's `select_for_update()` (in `update_or_create`, too), Rails'
+  `lock`, and SQLAlchemy's `with_for_update()` expect the second
+  transaction to wait for the first, then go on with what it committed.
+- Job queues (good_job, Oban, river, pg-boss) take work with `FOR UPDATE
+  SKIP LOCKED`, and expect two workers never to get the same row, or to
+  fail.
+- Migration runners (Rails, Prisma, Flyway) take `pg_advisory_lock` so
+  that two deploys do not migrate at once.
+
+**The lock table** (`lexdb_store`: `Db.locks`, `lockAs`, `lockRow`,
+`unlockAll`).
+- Locks are kept in the store, not in the rows. A lock key is "tree:key"
+  for a row, or "adv:" and the numbers for an advisory lock. Its holders
+  are owner ids with their modes.
+- The modes are PostgreSQL's four, with its table of which conflict: FOR
+  KEY SHARE, FOR SHARE, FOR NO KEY UPDATE, FOR UPDATE. An owner holds a key
+  once, in its strongest mode.
+- An owner is a transaction (`Txn.lockId`, given at its first lock; its
+  keys in `Txn.held`), or a session for advisory locks (minus its id).
+- Commit and abort release a transaction's locks. Commit releases them
+  after the commit is applied, so those it wakes read what it wrote. The
+  session's close aborts its block, so a dropped connection's locks go
+  too.
+- A transaction a lock keeps out waits on a promise, woken when a holder
+  releases the key, and tries again.
+- Before it waits, `Db.waitFor` (owner to the key it waits for) is followed
+  from the holders. A wait that would close a cycle is 40P01.
+
+**SELECT ... FOR UPDATE | NO KEY UPDATE | SHARE | KEY SHARE [OF t] [NOWAIT
+| SKIP LOCKED]:**
+- **Rows are locked in the output's order, as PostgreSQL's LockRows below
+  its Limit.**
+  - Locking the rows as the scan chose them was tried first. It locked
+    every row the WHERE passed, before ORDER BY and LIMIT, so a job
+    queue's first worker locked every waiting job and the second found
+    none.
+  - Now each locked table's key columns are read as extra outputs after
+    the query's own (`Sel.locks`, `nOut`). The query runs without its LIMIT
+    and OFFSET (`Run.noLimit`), and `runLocking` locks the rows in order.
+  - A row SKIP LOCKED leaves out does not count towards the LIMIT. A row
+    that OFFSET passes over is locked too, as in PostgreSQL.
+  - The cost is that the query makes all its rows before the first lock: a
+    LIMIT does not stop the scan early.
+- **A lock waited for means the rows may have changed**, so the query runs
+  again holding the locks it has. It then reads what the other committed,
+  where PostgreSQL re-checks the row. It reads the latest commit, not the
+  block's snapshot, as UPDATE does (9.16). Outside a block it runs on a
+  live transaction, not a snapshot.
+- **Its reads are not noted for COMMIT's check** (`Txn.quiet`): the locks
+  keep the rows it gives. Noted, they made the waiter of a lock fail at
+  its COMMIT, and a SKIP LOCKED worker fail when another committed the job
+  it skipped. That is PostgreSQL's READ COMMITTED for this statement; the
+  block's other statements stay serializable.
+- **Errors, as PostgreSQL's:**
+  - with aggregates, GROUP BY, HAVING, DISTINCT, windows or a set
+    operation: 0A000;
+  - the nullable side of an outer join: 0A000;
+  - OF a table not in FROM: 42P01;
+  - NOWAIT on a held row: 55P03;
+  - in a READ ONLY block, or on a replica: 25006.
+
+**UPDATE and DELETE** take the row's lock before they write it: FOR UPDATE
+for a DELETE or a key change, FOR NO KEY UPDATE otherwise.
+- In a block they keep it to the end, so a FOR UPDATE in another session
+  waits for the block.
+- Outside one they only wait for others' locks and take none: their commit
+  follows at once. A table-wide UPDATE does not fill the lock table, and
+  with no locks anywhere it costs one check.
+- A lock waited for runs the statement's search again, with the first
+  try's reads forgotten (`Txn.forgetReads`).
+- INSERT ... ON CONFLICT DO UPDATE does not lock the row it updates yet.
+
+**Advisory locks** (`pg_advisory_lock`, `_shared`, `pg_try_*`, `*_xact_*`,
+`pg_advisory_unlock`, `_shared`, `_all`; one bigint, or two ints, which
+are keys apart from one bigint's):
+- They use the same table, owned by the session.
+- The session counts its holds in the store memo, so they are re-entrant;
+  the table's lock goes with the last hold.
+- A transaction's are released when no block is open after a statement,
+  and all of them when the session closes.
+- Unlocking one not held gives false. A NULL key gives NULL.
+
+**Tests:**
+- `exec_locks` (new): sessions in tasks of their own.
+  - A waiter reads the holder's commit: 105, then 115, with no 40001.
+  - Six sessions × ten increments by FOR UPDATE: 60, none failing.
+  - Four SKIP LOCKED workers do twenty jobs, each once, none failing.
+  - NOWAIT; a block's UPDATE holding its row; an UPDATE outside a block
+    waiting.
+  - A deadlock: 40P01, and the other then gets its row.
+  - Locks gone with ROLLBACK and with the session's close.
+  - Advisory locks between sessions; none left at the end.
+- `exec_migrate` (9.85): the clauses and functions in one session.
+- `exec_snapshot`: its two blocks writing one row would now wait for each
+  other, in one task. It is now write skew: both read a row, one writes it
+  and the other another, and the second COMMIT is still 40001.
+
+Checked by hand with Python's psycopg against a server: the same
+scenarios, and Django's select_for_update, skip_locked, nowait and of. The
+suite passes (78).
+
+**Not done:**
+- statement_timeout does not end a wait for a lock, and there is no
+  lock_timeout;
+- `pg_locks` is not shown;
+- ROLLBACK TO keeps the locks taken after the savepoint (PostgreSQL drops
+  them);
+- a view in FROM is not locked through.

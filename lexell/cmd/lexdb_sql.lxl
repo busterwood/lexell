@@ -235,10 +235,13 @@ pub type Constraint = record {
     pub refCols: []str
     pub onDelete: int
     pub onUpdate: int
+    pub deferrable: bool        // a foreign key's DEFERRABLE (9.85)
+    pub deferred: bool          // INITIALLY DEFERRED
 }
 
 pub fn newConstraint(kind: int, name: str): Constraint {
-    return Constraint{kind: kind, name: name, cols: [], expr: None, refTable: "", refCols: [], onDelete: 0, onUpdate: 0}
+    return Constraint{kind: kind, name: name, cols: [], expr: None, refTable: "", refCols: [], onDelete: 0, onUpdate: 0,
+                      deferrable: false, deferred: false}
 }
 
 pub type SelItem = record {
@@ -442,6 +445,10 @@ pub type Stmt = record {
     pub conflictCols: []str
     pub conflictCon: str
     pub alias: str              // INSERT INTO t AS alias
+    pub conc: bool              // CREATE INDEX CONCURRENTLY, DROP INDEX CONCURRENTLY (9.85)
+    pub lockMode: int           // SELECT ... FOR UPDATE and the like (9.86): LOCK_*; 0 none
+    pub lockOf: []str           // ... OF these tables (names or aliases); [] all
+    pub lockWait: int           // WAIT_BLOCK, WAIT_NOWAIT, WAIT_SKIP
 }
 
 pub const CONFLICT_NONE = 0
@@ -509,7 +516,7 @@ fn newStmt(kind: int): Stmt {
                 group: [], order: [], limit: None, offset: None, sets: [], params: 0, from: [], index: "",
                 unique: false, inner: [], distinct: false, having: None, subs: [], use: 0, setop: 0, setAll: false,
                 cte: -1, rec: false, cascade: false, src: "", srf: "", ordin: false, alters: [], cons: [], seqNames: [], seq: noSeqOpts(), idOpts: [], overriding: OVR_NONE,
-                copy: noCopyOpts(), wins: [], windows: [], conflict: CONFLICT_NONE, conflictCols: [], conflictCon: "", alias: ""}
+                copy: noCopyOpts(), wins: [], windows: [], conflict: CONFLICT_NONE, conflictCols: [], conflictCon: "", alias: "", conc: false, lockMode: 0, lockOf: [], lockWait: 0}
 }
 
 // ---- the lexer
@@ -683,10 +690,11 @@ fn lex(s: &str): Result[[]Tok, lexdb_base.DbErr] {
         var op = s[i..i + 1]
         if i + 1 < n {
             let two = s[i..i + 2]
-            if two == "<=" || two == ">=" || two == "<>" || two == "!=" || two == "||" || two == "::" || two == "!~" || two == "~*" { op = two }
+            if two == "<=" || two == ">=" || two == "<>" || two == "!=" || two == "||" || two == "::" || two == "!~" || two == "~*" ||
+               two == "<<" || two == ">>" { op = two }
             if two == "!~" && i + 2 < n && s[i + 2] == '*' { op = "!~*" }
         }
-        if !strings.contains(&"(),;.*+-/%=<>|:![]~", &op[0..1]) {
+        if !strings.contains(&"(),;.*+-/%=<>|:![]~&#", &op[0..1]) {
             return Err(syntax("syntax error at or near \"" + op + "\""))
         }
         i += len(op)
@@ -757,9 +765,9 @@ fn (p: mut &P) expectKw(w: str): Result[Unit, lexdb_base.DbErr] {
 
 const RESERVED: []str = ["select", "from", "where", "group", "order", "by", "limit", "offset", "and", "or", "not", "is",
                   "null", "as", "values", "set", "into", "insert", "update", "delete", "create", "table",
-                  "primary", "key", "asc", "desc", "true", "false", "cast", "on", "join", "inner", "left",
+                  "primary", "asc", "desc", "true", "false", "cast", "on", "join", "inner", "left",
                   "right", "full", "outer", "cross", "using", "natural", "having", "distinct", "in", "like", "ilike", "between",
-                  "case", "when", "then", "else", "end", "union", "intersect", "except", "with", "returning", "window"]
+                  "case", "when", "then", "else", "end", "union", "intersect", "except", "with", "returning", "window", "for"]
 
 // Whether w is a reserved word (RESERVED's): a match on the words, three
 // times faster than a loop over the list (9.53; the parser asks per name).
@@ -767,7 +775,7 @@ pub fn isReservedWord(w: &str): bool { return isReserved(w) }
 
 fn isReserved(w: &str): bool {
     match w {
-        "select", "from", "where", "group", "order", "by", "limit", "offset", "and", "or", "not", "is", "null", "as", "values", "set", "into", "insert", "update", "delete", "create", "table", "primary", "key", "asc", "desc", "true", "false", "cast", "on", "join", "inner", "left", "right", "full", "outer", "cross", "using", "natural", "having", "distinct", "in", "like", "ilike", "between", "case", "when", "then", "else", "end", "union", "intersect", "except", "with", "returning", "window" { return true }
+        "select", "from", "where", "group", "order", "by", "limit", "offset", "and", "or", "not", "is", "null", "as", "values", "set", "into", "insert", "update", "delete", "create", "table", "primary", "asc", "desc", "true", "false", "cast", "on", "join", "inner", "left", "right", "full", "outer", "cross", "using", "natural", "having", "distinct", "in", "like", "ilike", "between", "case", "when", "then", "else", "end", "union", "intersect", "except", "with", "returning", "window", "for" { return true }
         else { return false }
     }
 }
@@ -1044,11 +1052,14 @@ fn (p: mut &P) cmpExpr(): Result[Expr, lexdb_base.DbErr] {
     return Ok(e)
 }
 
+// ||, and the bitwise & | # << >> (9.85): PostgreSQL's "any other
+// operator", between + - and the comparisons, left to right.
 fn (p: mut &P) catExpr(): Result[Expr, lexdb_base.DbErr] {
     var e = try p.addExpr()
-    while p.acceptKw("||") {
+    while p.isKw("||") || p.isKw("&") || p.isKw("|") || p.isKw("#") || p.isKw("<<") || p.isKw(">>") {
+        let op = p.next().text
         let r = try p.addExpr()
-        e = Expr.Bin("||", e, r)
+        e = Expr.Bin(op, e, r)
     }
     return Ok(e)
 }
@@ -1077,6 +1088,10 @@ fn (p: mut &P) unary(): Result[Expr, lexdb_base.DbErr] {
     if p.acceptKw("-") {
         let e = try p.unary()
         return Ok(Expr.Unary("-", e))
+    }
+    if p.acceptKw("~") {
+        let e = try p.unary()
+        return Ok(Expr.Unary("~", e))
     }
     if p.acceptKw("+") { return p.unary() }
     var e = try p.primary()
@@ -1612,9 +1627,10 @@ fn (p: mut &P) checkTail(name: str): Result[Constraint, lexdb_base.DbErr] {
 }
 
 // After REFERENCES: table [(cols)], then in any order MATCH SIMPLE, ON
-// DELETE action, ON UPDATE action, [NOT] DEFERRABLE, INITIALLY IMMEDIATE.
-// MATCH FULL and PARTIAL and deferred checks are not lexdb's.
+// DELETE action, ON UPDATE action, [NOT] DEFERRABLE, INITIALLY IMMEDIATE |
+// DEFERRED (9.85). MATCH FULL and PARTIAL are not lexdb's.
 fn (p: mut &P) fkTail(c: mut &Constraint): Result[Unit, lexdb_base.DbErr] {
+    var notDeferrable = false
     c.refTable = try p.qname()
     if p.acceptKw("(") {
         append(mut &c.refCols, try p.name())
@@ -1634,15 +1650,20 @@ fn (p: mut &P) fkTail(c: mut &Constraint): Result[Unit, lexdb_base.DbErr] {
             let act = try p.fkAction()
             if del { c.onDelete = act } else { c.onUpdate = act }
         } else if p.acceptKw("deferrable") {
-            return Err(lexdb_base.err("0A000", "lexdb: deferrable constraints are not supported"))
+            c.deferrable = true
         } else if p.isKw("not") && p.pos + 1 < len(p.toks) && p.toks[p.pos + 1].text == "deferrable" {
             p.pos += 2
+            c.deferrable = false
+            notDeferrable = true
         } else if p.acceptKw("initially") {
-            if p.isKw("deferred") { return Err(lexdb_base.err("0A000", "lexdb: deferrable constraints are not supported")) }
-            try p.expectKw("immediate")
+            if p.acceptKw("deferred") { c.deferred = true } else { try p.expectKw("immediate") }
         } else {
             break
         }
+    }
+    if c.deferred {
+        if notDeferrable { return Err(lexdb_base.err("42601", "constraint declared INITIALLY DEFERRED must be DEFERRABLE")) }
+        c.deferrable = true
     }
     return Ok(Unit{})
 }
@@ -1885,7 +1906,12 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
             }
             a.col.name = try p.name()
             try p.colType(mut &a.col)
+            // its UNIQUE, CHECK and REFERENCES: added after it, as ADD
+            // CONSTRAINT would (9.85)
+            var cons: []Constraint = []
             while true {
+                var cn = ""
+                if p.acceptKw("constraint") { cn = try p.name() }
                 if p.acceptKw("not") {
                     try p.expectKw("null")
                     a.col.notNull = true
@@ -1896,13 +1922,42 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
                     return Err(lexdb_base.err("0A000", "lexdb: a table's primary key cannot be changed"))
                 } else if p.acceptKw("default") {
                     a.col.def = Some(try p.defaultExpr())
-                } else if p.isKw("unique") || p.isKw("check") || p.isKw("references") || p.isKw("constraint") {
-                    return Err(lexdb_base.err("0A000", "lexdb: ADD COLUMN takes no constraint but NOT NULL and DEFAULT (ADD UNIQUE (...) after it)"))
+                } else if p.acceptKw("unique") {
+                    try p.uniqueTail()
+                    var u = newConstraint(C_UNIQUE, cn)
+                    append(mut &u.cols, a.col.name)
+                    append(mut &cons, u)
+                } else if p.acceptKw("check") {
+                    var ck = try p.checkTail(cn)
+                    append(mut &ck.cols, a.col.name)
+                    append(mut &cons, ck)
+                } else if p.acceptKw("references") {
+                    var fk = newConstraint(C_FOREIGN, cn)
+                    append(mut &fk.cols, a.col.name)
+                    try p.fkTail(mut &fk)
+                    append(mut &cons, fk)
+                } else if len(cn) > 0 {
+                    return Err(near(&p.peek()))
                 } else {
                     break
                 }
             }
+            let added = a.col.name
+            let ifNot = a.ifFlag
             append(mut &s.alters, a)
+            // in the order written
+            var k = 0
+            while k < len(cons) / 2 {
+                swap(mut &cons, k, len(cons) - 1 - k)
+                k += 1
+            }
+            while len(cons) > 0 {
+                var ac = Alter{kind: A_ADD_CON, col: noCol(), name: "", to: "", ifFlag: false, using: None, cons: [], cascade: false}
+                // ADD COLUMN IF NOT EXISTS of a column there: its constraints not added either
+                if ifNot { ac.name = added }
+                append(mut &ac.cons, pop(mut &cons))
+                append(mut &s.alters, ac)
+            }
         } else if p.acceptKw("drop") {
             if p.acceptKw("constraint") {
                 var a = Alter{kind: A_DROP_CON, col: noCol(), name: "", to: "", ifFlag: false, using: None, cons: [], cascade: false}
@@ -2471,6 +2526,53 @@ fn (p: mut &P) selectCore(): Result[Stmt, lexdb_base.DbErr] {
     return Ok(s)
 }
 
+// A row lock's strength (9.86), weakest first, as PostgreSQL's.
+pub const LOCK_KEY_SHARE = 1
+pub const LOCK_SHARE = 2
+pub const LOCK_NO_KEY_UPDATE = 3
+pub const LOCK_UPDATE = 4
+
+// What a lock held by another transaction does: wait, fail (NOWAIT), or
+// leave the row out (SKIP LOCKED).
+pub const WAIT_BLOCK = 0
+pub const WAIT_NOWAIT = 1
+pub const WAIT_SKIP = 2
+
+pub fn lockName(m: int): str {
+    if m == LOCK_KEY_SHARE { return "FOR KEY SHARE" }
+    if m == LOCK_SHARE { return "FOR SHARE" }
+    if m == LOCK_NO_KEY_UPDATE { return "FOR NO KEY UPDATE" }
+    return "FOR UPDATE"
+}
+
+// FOR UPDATE | NO KEY UPDATE | SHARE | KEY SHARE [OF t, ...] [NOWAIT |
+// SKIP LOCKED], after FOR. Several: the strongest, the tables of all.
+fn (p: mut &P) lockClause(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
+    var m = LOCK_UPDATE
+    if p.acceptKw("update") { m = LOCK_UPDATE }
+    else if p.acceptKw("share") { m = LOCK_SHARE }
+    else if p.acceptKw("no") {
+        try p.expectKw("key")
+        try p.expectKw("update")
+        m = LOCK_NO_KEY_UPDATE
+    } else {
+        try p.expectKw("key")
+        try p.expectKw("share")
+        m = LOCK_KEY_SHARE
+    }
+    if m > s.lockMode { s.lockMode = m }
+    if p.acceptKw("of") {
+        append(mut &s.lockOf, try p.qname())
+        while p.acceptKw(",") { append(mut &s.lockOf, try p.qname()) }
+    }
+    if p.acceptKw("nowait") { s.lockWait = WAIT_NOWAIT }
+    else if p.acceptKw("skip") {
+        try p.expectKw("locked")
+        s.lockWait = WAIT_SKIP
+    }
+    return Ok(Unit{})
+}
+
 fn (p: mut &P) orderLimit(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
     if p.acceptKw("order") {
         try p.expectKw("by")
@@ -2489,8 +2591,10 @@ fn (p: mut &P) orderLimit(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
             if !p.acceptKw(",") { break }
         }
     }
-    while p.isKw("limit") || p.isKw("offset") {
-        if p.acceptKw("limit") {
+    while p.isKw("limit") || p.isKw("offset") || p.isKw("for") {
+        if p.acceptKw("for") {
+            try p.lockClause(s)
+        } else if p.acceptKw("limit") {
             if p.acceptKw("all") { s.limit = None } else { s.limit = Some(try p.expr()) }
         } else {
             let o = p.acceptKw("offset")
@@ -2632,6 +2736,7 @@ fn (p: mut &P) aliasOf(alias: mut &str, cols: mut &[]str): Result[Unit, lexdb_ba
 fn (p: mut &P) createIndex(unique: bool): Result[Stmt, lexdb_base.DbErr] {
     var s = newStmt(S_CREATE_INDEX)
     s.unique = unique
+    s.conc = p.acceptKw("concurrently")
     if p.acceptKw("if") {
         try p.expectKw("not")
         try p.expectKw("exists")
@@ -2645,11 +2750,56 @@ fn (p: mut &P) createIndex(unique: bool): Result[Stmt, lexdb_base.DbErr] {
         if m != "btree" { return Err(lexdb_base.err("0A000", "index method \"" + m + "\" is not supported")) }
     }
     try p.expectKw("(")
-    append(mut &s.names, try p.name())
-    while p.acceptKw(",") { append(mut &s.names, try p.name()) }
+    try p.indexCol(mut &s)
+    while p.acceptKw(",") { try p.indexCol(mut &s) }
     try p.expectKw(")")
     if p.acceptKw("where") { s.where = Some(try p.expr()) }      // a filtered index
     return Ok(s)
+}
+
+// PostgreSQL's B-tree operator classes for the types lexdb has.
+fn isOpClass(n: &str): bool {
+    match n {
+        "text_ops", "text_pattern_ops", "varchar_ops", "varchar_pattern_ops", "bpchar_ops", "bpchar_pattern_ops", "name_ops",
+        "int2_ops", "int4_ops", "int8_ops", "numeric_ops", "float4_ops", "float8_ops", "bool_ops", "oid_ops", "char_ops",
+        "uuid_ops", "bytea_ops", "date_ops", "time_ops", "timestamp_ops", "timestamptz_ops", "interval_ops", "array_ops" { return true }
+        else { return false }
+    }
+}
+
+// An index's column: name [COLLATE c] [opclass] [ASC | DESC] [NULLS FIRST |
+// LAST] (9.85). The name in names; the rest in pk, as PostgreSQL shows it
+// ("" none). They change nothing: lexdb's text compares bytewise (C, which
+// the pattern operator classes are for), and a B+tree is read either way.
+fn (p: mut &P) indexCol(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
+    if p.isKw("(") || (p.peekAt(1).kind == T_OP && p.peekAt(1).text == "(") {
+        return Err(lexdb_base.err("0A000", "lexdb: indexes on expressions are not supported"))
+    }
+    append(mut &s.names, try p.name())
+    var opts: []str = []
+    if p.acceptKw("collate") {
+        let c = try p.qname()
+        append(mut &opts, "COLLATE \"" + c + "\"")
+    }
+    let t = p.peek()
+    if t.kind == T_IDENT && t.text != "asc" && t.text != "desc" && t.text != "nulls" {
+        let oc = try p.qname()
+        if !isOpClass(&baseName(&oc)) {
+            return Err(lexdb_base.err("42704", "operator class \"" + oc + "\" does not exist for access method \"btree\""))
+        }
+        append(mut &opts, oc)
+    }
+    var desc = false
+    if p.acceptKw("desc") { desc = true } else { let asc = p.acceptKw("asc") }
+    if desc { append(mut &opts, "DESC") }
+    if p.acceptKw("nulls") {
+        // shown when not the default: last ascending, first descending
+        let first = p.acceptKw("first")
+        if !first { try p.expectKw("last") }
+        if first != desc { append(mut &opts, if first { "NULLS FIRST" } else { "NULLS LAST" }) }
+    }
+    append(mut &s.pk, strings.join(&opts, " "))
+    return Ok(Unit{})
 }
 
 fn (p: mut &P) update(): Result[Stmt, lexdb_base.DbErr] {
@@ -3152,6 +3302,7 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
             }
             if p.acceptKw("index") {
                 var s = newStmt(S_DROP_INDEX)
+                s.conc = p.acceptKw("concurrently")
                 if p.acceptKw("if") {
                     try p.expectKw("exists")
                     s.ifFlag = true
@@ -3258,6 +3409,20 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
                         let v = p.peek()
                         if v.kind == T_STR { p.pos += 1; append(mut &st.names, v.text) } else { append(mut &st.names, try p.name()) }
                     }
+                }
+                return Ok(st)
+            }
+            // SET CONSTRAINTS ALL | name, ... DEFERRED | IMMEDIATE (9.85):
+            // table "constraints:deferred" or ":immediate", the names in
+            // names (none for ALL)
+            if t.text == "set" && p.acceptKw("constraints") {
+                if !p.acceptKw("all") {
+                    append(mut &st.names, try p.qname())
+                    while p.acceptKw(",") { append(mut &st.names, try p.qname()) }
+                }
+                if p.acceptKw("deferred") { st.table = "constraints:deferred" } else {
+                    try p.expectKw("immediate")
+                    st.table = "constraints:immediate"
                 }
                 return Ok(st)
             }

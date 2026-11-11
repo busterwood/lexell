@@ -1,0 +1,197 @@
+// lexdb_exec: row locks and advisory locks between sessions (design/lexdb.md
+// 9.86), each session in a task of its own:
+// - a SELECT ... FOR UPDATE waiting for another's lock, then reading what
+//   it committed (no lost update, no 40001);
+// - six sessions incrementing a row by read, FOR UPDATE, write: none lost;
+// - four workers taking jobs with SKIP LOCKED: each job done once, none
+//   failing;
+// - NOWAIT; a block's UPDATE locks its rows; an UPDATE outside a block waits
+//   for a lock; a deadlock (40P01) and the other then getting its lock;
+//   locks gone with ROLLBACK and with the session;
+// - advisory locks between sessions, and gone with the session.
+// expect: wait: saw 105, final 115
+// expect: increments: 60, failures 0
+// expect: jobs: 20 done, each once: t, failures 0
+// expect: nowait: 55P03
+// expect: block update locks: 55P03
+// expect: autocommit update waits: 401
+// expect: deadlock: 40P01, the other then: 2
+// expect: after rollback: 1; after close: 1
+// expect: advisory: f then t
+// expect: no locks left: 0
+import "task"
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+
+fn one(s: mut &lexdb_exec.Session, sql: str): str {
+    match s.exec(&sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if r.hasRows {
+                var rows: []str = []
+                for row in r.rows {
+                    var cells: []str = []
+                    for v in row { append(mut &cells, lexdb_exec.text(&v)) }
+                    append(mut &rows, strings.join(&cells, "|"))
+                }
+                return strings.join(&rows, ";")
+            }
+            return r.tag
+        }
+        Err(e) { return e.state }
+    }
+}
+
+// A session's statements, run in a task: their results joined by " / ".
+type Job = record { s: lexdb_exec.Session; sqls: []str }
+type Done = record { s: lexdb_exec.Session; out: str }
+
+fn runJob(j: Job): Done {
+    let Job{s: s0, sqls: sqls} = move(j)
+    var s = s0
+    var outs: []str = []
+    for q in sqls { append(mut &outs, one(mut &s, q.toStr())) }
+    return Done{s: s, out: strings.join(&outs, " / ")}
+}
+
+type Inc = record { st: lexdb_store.Store; n: int }
+
+// n increments of acct 1, by read, FOR UPDATE, write; the failures.
+fn incrementer(a: Inc): int {
+    var s = lexdb_exec.newSession(a.st)
+    var bad = 0
+    for i in 0..a.n {
+        let b = one(mut &s, "begin")
+        let v = one(mut &s, "select bal from acct where id = 1 for update")
+        let yd = task.yield()
+        let u = one(mut &s, "update acct set bal = " + (strings.parseIntOpt(v).unwrapOr(-1000) + 1).toStr() + " where id = 1")
+        if one(mut &s, "commit") != "COMMIT" || u != "UPDATE 1" { bad += 1 }
+    }
+    s.close()
+    return bad
+}
+
+type Worker = record { st: lexdb_store.Store; id: int }
+
+// Jobs taken until none is left: the failures (a job done twice counts).
+fn worker(a: Worker): int {
+    var s = lexdb_exec.newSession(a.st)
+    var bad = 0
+    while true {
+        let b = one(mut &s, "begin")
+        let j = one(mut &s, "select id from jobs where state = 'new' order by id limit 1 for update skip locked")
+        if j == "" {
+            let c = one(mut &s, "commit")
+            break
+        }
+        if strings.parseIntOpt(j).isNone() {
+            // an error, not a job: counted, and the worker stops
+            let r = one(mut &s, "rollback")
+            bad += 1
+            break
+        }
+        for k in 0..2 { let yd = task.yield() }
+        let u = one(mut &s, "update jobs set state = 'done', times = times + 1, who = " + a.id.toStr() + " where id = " + j)
+        if u != "UPDATE 1" || one(mut &s, "commit") != "COMMIT" { bad += 1 }
+    }
+    s.close()
+    return bad
+}
+
+fn pause() { let z = task.sleep(30) }
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(29), lexdb_store.Options{cacheBytes: 16 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000, bufferedPages: false}, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var a = lexdb_exec.newSession(st)
+        let m1 = one(mut &a, "create table acct (id int primary key, bal int)")
+        let m2 = one(mut &a, "insert into acct values (1, 100), (2, 200), (3, 300)")
+        let m3 = one(mut &a, "create table jobs (id int primary key, state text, times int, who int)")
+        let m4 = one(mut &a, "insert into jobs select g, 'new', 0, 0 from generate_series(1, 20) g")
+        task.scope(fn(sc: mut &task.Scope) {
+            // waits for a's lock, then reads what a committed
+            let x1 = one(mut &a, "begin")
+            let x2 = one(mut &a, "select bal from acct where id = 1 for update")
+            let fb = sc.start(runJob, Job{s: lexdb_exec.newSession(st), sqls: ["begin", "select bal from acct where id = 1 for update",
+                                                                                 "update acct set bal = bal + 10 where id = 1", "commit"]})
+            pause()
+            let x3 = one(mut &a, "update acct set bal = bal + 5 where id = 1")
+            let x4 = one(mut &a, "commit")
+            let Done{s: bs0, out: bout} = fb.wait().unwrap()
+            println("wait: saw " + strings.split(&bout, " / ")[1] + ", final " + one(mut &a, "select bal from acct where id = 1"))
+
+            let y0 = one(mut &a, "update acct set bal = 0 where id = 1")
+            var incs: []task.Future[int] = []
+            for i in 0..6 { append(mut &incs, sc.start(incrementer, Inc{st: st, n: 10})) }
+            var bad = 0
+            while len(incs) > 0 { bad += pop(mut &incs).wait().unwrap() }
+            println("increments: " + one(mut &a, "select bal from acct where id = 1") + ", failures " + bad.toStr())
+
+            var ws: []task.Future[int] = []
+            for i in 0..4 { append(mut &ws, sc.start(worker, Worker{st: st, id: i + 1})) }
+            var wbad = 0
+            while len(ws) > 0 { wbad += pop(mut &ws).wait().unwrap() }
+            println("jobs: " + one(mut &a, "select count(*) from jobs where state = 'done'") + " done, each once: " +
+                    one(mut &a, "select bool_and(times = 1) from jobs") + ", failures " + wbad.toStr())
+
+            // NOWAIT, and a block's UPDATE locking its rows
+            var bs = bs0
+            let n1 = one(mut &a, "begin")
+            let n2 = one(mut &a, "select id from acct where id = 2 for update")
+            println("nowait: " + one(mut &bs, "select id from acct where id = 2 for update nowait"))
+            let n3 = one(mut &a, "rollback")
+            let u1 = one(mut &a, "begin")
+            let u2 = one(mut &a, "update acct set bal = bal + 1 where id = 3")
+            println("block update locks: " + one(mut &bs, "select id from acct where id = 3 for update nowait"))
+            let u3 = one(mut &a, "rollback")
+
+            // an UPDATE outside a block waits for a block's lock
+            let w1 = one(mut &a, "begin")
+            let w2 = one(mut &a, "select id from acct where id = 2 for update")
+            let fc = sc.start(runJob, Job{s: bs, sqls: ["update acct set bal = bal + 1 where id = 2"]})
+            pause()
+            let w3 = one(mut &a, "update acct set bal = bal * 2 where id = 2")
+            let w4 = one(mut &a, "commit")
+            let Done{s: cs0, out: cout} = fc.wait().unwrap()
+            println("autocommit update waits: " + one(mut &a, "select bal from acct where id = 2"))
+
+            // a deadlock: a waits for c's row, c then for a's
+            var cs = cs0
+            var da = lexdb_exec.newSession(st)
+            let d1 = one(mut &da, "begin")
+            let d2 = one(mut &cs, "begin")
+            let d3 = one(mut &da, "select id from acct where id = 1 for update")
+            let d4 = one(mut &cs, "select id from acct where id = 2 for update")
+            let fa = sc.start(runJob, Job{s: da, sqls: ["select id from acct where id = 2 for update", "rollback"]})
+            pause()
+            let dl = one(mut &cs, "select id from acct where id = 1 for update")
+            let d5 = one(mut &cs, "rollback")
+            let Done{s: aa0, out: aout} = fa.wait().unwrap()
+            println("deadlock: " + dl + ", the other then: " + strings.split(&aout, " / ")[0])
+            var aa = aa0
+
+            // locks gone with ROLLBACK, and with the session
+            let r1 = one(mut &aa, "begin")
+            let r2 = one(mut &aa, "select id from acct where id = 1 for update")
+            let r3 = one(mut &aa, "rollback")
+            let r4 = one(mut &cs, "select id from acct where id = 1 for update nowait")
+            var gone = lexdb_exec.newSession(st)
+            let g1 = one(mut &gone, "begin")
+            let g2 = one(mut &gone, "select id from acct where id = 1 for update")
+            gone.close()
+            println("after rollback: " + r4 + "; after close: " + one(mut &cs, "select id from acct where id = 1 for update nowait"))
+
+            // advisory locks between sessions
+            let v1 = one(mut &aa, "select pg_advisory_lock(7)")
+            let v2 = one(mut &cs, "select pg_try_advisory_lock(7)")
+            aa.close()
+            println("advisory: " + v2 + " then " + one(mut &cs, "select pg_try_advisory_lock(7)"))
+            cs.close()
+            a.close()
+            println("no locks left: " + st.lockCount().toStr())
+        })
+        return 0
+    }).unwrap()
+}

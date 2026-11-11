@@ -48,6 +48,7 @@ pub type Index = record {
     pub unique: bool
     pub pred: Option[Expr]      // a filtered index: the rows it holds (column names bare)
     pub con: bool               // a UNIQUE constraint's (9.39): dropped with the constraint, not by DROP INDEX
+    pub opts: []str             // per column, its options as shown (opclass, DESC, NULLS ...: 9.85); [] none
 }
 
 pub type Table = record {
@@ -84,6 +85,8 @@ pub type ForeignKey = record {
     pub refCols: []str
     pub onDelete: int           // lexdb_sql.FK_*
     pub onUpdate: int
+    pub deferrable: bool        // DEFERRABLE, INITIALLY DEFERRED (9.85)
+    pub deferred: bool
 }
 
 fn emptyTable(name: str): Table {
@@ -1375,6 +1378,12 @@ fn arith(op: &str, a: &Val, b: &Val): Result[Val, DbErr] {
                 if y == 0 { return Err(e("22012", "division by zero")) }
                 r = x.checkedRem(y)
             }
+            "&" { r = Some(x & y) }
+            "|" { r = Some(x | y) }
+            "#" { r = Some(x ^ y) }
+            // PostgreSQL shifts by the count modulo 64
+            "<<" { r = Some(x << (y & 63)) }
+            ">>" { r = Some(x >> (y & 63)) }
             else {}
         }
         match r {
@@ -1485,6 +1494,13 @@ pub fn eval(x: &Expr, env: &Env): Result[Val, DbErr] {
         }
         Expr.Unary(op, a) {
             let v = try eval(&a, env)
+            if op == "~" {
+                match v {
+                    Val.Null { return Ok(Val.Null) }
+                    Val.Int(n) { return Ok(Val.Int(~n)) }
+                    else { return Err(e("42883", "operator does not exist: ~ " + kindName(&oidType(kindOid(&v))))) }
+                }
+            }
             if op == "-" {
                 match v {
                     Val.Null { return Ok(Val.Null) }
@@ -1593,6 +1609,7 @@ pub fn eval(x: &Expr, env: &Env): Result[Val, DbErr] {
             var vs: []Val = []
             for a in args { append(mut &vs, try eval(&a, env)) }
             if isSeqFn(&name) { return seqCall(&name, &vs, env) }
+            if isAdvFn(&name) { return advCall(&name, &vs, env) }
             if lexdb_sql.isCatFn(&name) || name == "current_schema" {
                 match env.seq {
                     Some(se) {
@@ -2581,7 +2598,9 @@ fn encTable(t: &Table): str {
         b.add(ix.name)
         binary.addU32LE(mut &b, ix.tree)
         let filtered = ix.pred.isSome()
-        b.addByte((if ix.unique { 1 } else { 0 }) + (if filtered { 2 } else { 0 }) + (if ix.con { 4 } else { 0 }))
+        var shown = false
+        for o in ix.opts { if len(o) > 0 { shown = true } }
+        b.addByte((if ix.unique { 1 } else { 0 }) + (if filtered { 2 } else { 0 }) + (if ix.con { 4 } else { 0 }) + (if shown { 8 } else { 0 }))
         binary.addU32LE(mut &b, len(ix.cols))
         for c in ix.cols { binary.addU32LE(mut &b, c) }
         match ix.pred {
@@ -2592,6 +2611,7 @@ fn encTable(t: &Table): str {
             }
             None {}
         }
+        if shown { addStrs(mut &b, &ix.opts) }
     }
     // then defaults, after the places (written, with none, when there are
     // defaults)
@@ -2647,7 +2667,9 @@ fn encTable(t: &Table): str {
             addStr(mut &b, &f.ref)
             addStrs(mut &b, &f.refCols)
             b.addByte(byte(f.onDelete))
-            b.addByte(byte(f.onUpdate))
+            // DEFERRABLE and INITIALLY DEFERRED in the high bits (9.85: a
+            // row written before has none)
+            b.addByte(byte(f.onUpdate | (if f.deferrable { 16 } else { 0 }) | (if f.deferred { 32 } else { 0 })))
         }
         addStrs(mut &b, &t.refBy)
     }
@@ -2745,7 +2767,7 @@ fn decTable(name: str, s: &str): Result[Table, DbErr] {
     at += 4
     for i in 0..ni {
         let l = binary.readU32LEStr(s, at)
-        var ix = Index{name: s[at + 4..at + 4 + l], tree: 0, cols: [], unique: false, pred: None, con: false}
+        var ix = Index{name: s[at + 4..at + 4 + l], tree: 0, cols: [], unique: false, pred: None, con: false, opts: []}
         at += 4 + l
         ix.tree = binary.readU32LEStr(s, at)
         let flags = s[at + 4]
@@ -2764,6 +2786,10 @@ fn decTable(name: str, s: &str): Result[Table, DbErr] {
                 Err(_) { return Err(lexdb_base.corrupt("the predicate of index \"" + ix.name + "\"")) }
             }
             at += 4 + pl
+        }
+        if flags & 8 != 0 {
+            ix.opts = strsAt(s, at)
+            at += strsLen(&ix.opts)
         }
         append(mut &t.indexes, ix)
     }
@@ -2828,7 +2854,9 @@ fn decTable(name: str, s: &str): Result[Table, DbErr] {
             at += 4 + len(fref)
             let frefCols = strsAt(s, at)
             at += strsLen(&frefCols)
-            append(mut &t.fks, ForeignKey{name: fname, cols: fcols, ref: fref, refCols: frefCols, onDelete: int(s[at]), onUpdate: int(s[at + 1])})
+            let ub = int(s[at + 1])
+            append(mut &t.fks, ForeignKey{name: fname, cols: fcols, ref: fref, refCols: frefCols, onDelete: int(s[at]), onUpdate: ub & 15,
+                                          deferrable: ub & 16 != 0, deferred: ub & 32 != 0})
             at += 2
         }
         t.refBy = strsAt(s, at)
@@ -3035,6 +3063,8 @@ pub type Level = record {
     work: int               // a recursive CTE's working table: the CTE's number; -1
     lateral: bool           // a subquery in FROM using outer values (LATERAL): run per row
     need: []bool            // a table's columns the statement uses (the others are read as NULL); [] all (9.31)
+    lock: int               // SELECT ... FOR UPDATE and the like: its rows locked (lexdb_sql.LOCK_*, 9.86); 0 none
+    lockWait: int           // lexdb_sql.WAIT_*
 }
 
 // A level of rows held by the run (a subquery's, a working table), not a table's.
@@ -3055,6 +3085,7 @@ type Counts = value record {
 // A query's run: the counts, and per RIGHT or FULL JOIN table which of its
 // rows have joined.
 type Run = record {
+    noLimit: bool               // the SELECT's LIMIT and OFFSET not applied (a locking one applies them as it locks, 9.86)
     cnt: []Counts
     seen: [][]bool
     memo: []Map[str, int]       // per subquery (correlated): its outer values -> its result in memoRes
@@ -3188,7 +3219,7 @@ fn newRun(q: &Query): Run {
         append(mut &memoRes, [])
         append(mut &stats, SubStat{runs: 0, hits: 0, cnt: [], inner: []})
     }
-    return Run{cnt: array(len(q.levels), Counts{starts: 0, read: 0, joined: 0, nulls: 0, built: 0, kept: 0, unmatched: 0, batches: 0}),
+    return Run{noLimit: false, cnt: array(len(q.levels), Counts{starts: 0, read: 0, joined: 0, nulls: 0, built: 0, kept: 0, unmatched: 0, batches: 0}),
                seen: seen, memo: memo, memoRes: memoRes, stats: stats, cache: newCache(), maxRounds: MAX_RECURSION,
                held: 0, maxHeld: 0, deadline: 0, ticks: 0, turnEnd: 0, batch: true}
 }
@@ -3989,7 +4020,8 @@ fn allTrue(cs: &[]Expr, cols: &[]lexdb_sql.ColDef, row: &[]Val, params: &[]Val):
 
 fn newLevel(t: Table, alias: str, join: int, first: int): Level {
     return Level{t: t, alias: alias, join: join, first: first, path: Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: []}, cond: [],
-                 post: [], local: [], perRow: true, hashCols: [], hashVals: [], src: -1, work: -1, lateral: false, need: []}
+                 post: [], local: [], perRow: true, hashCols: [], hashVals: [], src: -1, work: -1, lateral: false, need: [],
+                 lock: 0, lockWait: 0}
 }
 
 // Plans a query over the tables of FROM (4.8): the tables are joined in the
@@ -6004,13 +6036,16 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
     var t = found.unwrap()
     // TYPE actions are done together, after the others, by the names then
     var types: []int = []
+    var skipped: []str = []             // columns ADD COLUMN IF NOT EXISTS found there: their constraints not added
     for j in 0..len(s.alters) {
         let a = &s.alters[j]
         let rel = lexdb_sql.baseName(&t.name)
         if a.kind == lexdb_sql.A_TYPE {
             append(mut &types, j)
         } else if a.kind == lexdb_sql.A_ADD_CON {
-            try addConstraint(st, txn, mut &t, &a.cons[0])
+            var skip = false
+            for n in skipped { if len(a.name) > 0 && n == a.name { skip = true } }
+            if !skip { try addConstraint(st, txn, mut &t, &a.cons[0]) }
         } else if a.kind == lexdb_sql.A_DROP_CON {
             if !(try dropConstraint(st, txn, mut &t, &a.name, a.cascade)) {
                 if a.name == rel + "_pkey" { return Err(e("0A000", "lexdb: a table's primary key cannot be changed")) }
@@ -6022,7 +6057,10 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             try setSchema(st, txn, mut &t, &a.name)
         } else if a.kind == lexdb_sql.A_ADD {
             if colIndex(&t.cols, &a.col.name) >= 0 {
-                if a.ifFlag { continue }
+                if a.ifFlag {
+                    append(mut &skipped, a.col.name)
+                    continue
+                }
                 return Err(e("42701", "column \"" + a.col.name + "\" of relation \"" + rel + "\" already exists"))
             }
             // the rows there read the default as it is now (no row is written)
@@ -6235,6 +6273,7 @@ fn dropSchema(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
 // CREATE [UNIQUE] INDEX: a tree of its own, filled from the table's rows in
 // the same transaction.
 fn createIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
+    if s.conc && txn.inBlock() { return Err(e("25001", "CREATE INDEX CONCURRENTLY cannot run inside a transaction block")) }
     var t = try needTable(st, txn, &s.table)
     try needRelOwner(st, txn, &t.name, &"table")
     let ixKey = lexdb_sql.qual(&lexdb_sql.schemaOf(&t.name), &s.index)     // in its table's schema
@@ -6266,7 +6305,7 @@ fn createIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
         }
         None {}
     }
-    let ix = Index{name: ixKey, tree: st.createTree(txn), cols: cols, unique: s.unique, pred: pred, con: false}
+    let ix = Index{name: ixKey, tree: st.createTree(txn), cols: cols, unique: s.unique, pred: pred, con: false, opts: copyStrs(&s.pk)}
     try addIndex(st, txn, mut &t, ix)
     try txn.put(CATALOG, t.name, encTable(&t))
     try bumpCatalog(st, txn)
@@ -6347,7 +6386,7 @@ fn addConstraint(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Tabl
     let key = lexdb_sql.qual(&lexdb_sql.schemaOf(&t.name), &name)
     if hasConName(t, &name) { return Err(e("42710", "constraint \"" + name + "\" for relation \"" + lexdb_sql.baseName(&t.name) + "\" already exists")) }
     if try relExists(st, txn, &key) { return Err(e("42P07", "relation \"" + name + "\" already exists")) }
-    let ix = Index{name: key, tree: st.createTree(txn), cols: cols, unique: true, pred: None, con: true}
+    let ix = Index{name: key, tree: st.createTree(txn), cols: cols, unique: true, pred: None, con: true, opts: []}
     return addIndex(st, txn, t, ix)
 }
 
@@ -6463,6 +6502,7 @@ fn dropConstraint(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Tab
 }
 
 fn dropIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
+    if s.conc && txn.inBlock() { return Err(e("25001", "DROP INDEX CONCURRENTLY cannot run inside a transaction block")) }
     let ixKey = try catKey(st, txn, &s.index, true)
     match try st.get(txn, CATALOG, idxName(&ixKey)) {
         Some(tn) {
@@ -6884,16 +6924,30 @@ fn update(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     var found: [][]Val = []
     var rs = newRun(&q)
     rs.limit(&lim)
-    let m = try prepare(st, txn, &q, params, mut &rs)
+    var m = try prepare(st, txn, &q, params, mut &rs)
     let room = rs.room()
     let max = rs.maxHeld
     var held = 0
-    try runQuery(st, txn, &q, &m, params, fn(r: &[]Val): Result[bool, DbErr] {
-        held += 2 * rowBytes(r)             // the row found, and its write
-        if room >= 0 && held > room { return Err(memErr(max)) }
-        append(mut &found, copyRow(r))
-        return Ok(true)
-    }, mut &rs)
+    // a key changed: FOR UPDATE's lock, else FOR NO KEY UPDATE's (9.86)
+    var lmode = lexdb_sql.LOCK_NO_KEY_UPDATE
+    for k in targets { for p in t.pk { if p == k { lmode = lexdb_sql.LOCK_UPDATE } } }
+    let reads0 = txn.readCount()
+    while true {
+        try runQuery(st, txn, &q, &m, params, fn(r: &[]Val): Result[bool, DbErr] {
+            held += 2 * rowBytes(r)             // the row found, and its write
+            if room >= 0 && held > room { return Err(memErr(max)) }
+            append(mut &found, copyRow(r))
+            return Ok(true)
+        }, mut &rs)
+        if !(try lockFound(st, txn, t, &found, lmode)) { break }
+        // a lock waited for: the rows found again, holding the locks
+        found = []
+        held = 0
+        txn.forgetReads(reads0)
+        rs = newRun(&q)
+        rs.limit(&lim)
+        m = try prepare(st, txn, &q, params, mut &rs)
+    }
     let noAggs: []Val = []
     let defs = try defaultsOf(st, txn, t)
     for k in 0..len(sets) {
@@ -6929,16 +6983,26 @@ fn delete(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     var found: [][]Val = []
     var rs = newRun(&q)
     rs.limit(&lim)
-    let m = try prepare(st, txn, &q, params, mut &rs)
+    var m = try prepare(st, txn, &q, params, mut &rs)
     let room = rs.room()
     let max = rs.maxHeld
     var held = 0
-    try runQuery(st, txn, &q, &m, params, fn(r: &[]Val): Result[bool, DbErr] {
-        held += 2 * rowBytes(r)             // the row found, and its write
-        if room >= 0 && held > room { return Err(memErr(max)) }
-        append(mut &found, copyRow(r))
-        return Ok(true)
-    }, mut &rs)
+    let reads0 = txn.readCount()
+    while true {
+        try runQuery(st, txn, &q, &m, params, fn(r: &[]Val): Result[bool, DbErr] {
+            held += 2 * rowBytes(r)             // the row found, and its write
+            if room >= 0 && held > room { return Err(memErr(max)) }
+            append(mut &found, copyRow(r))
+            return Ok(true)
+        }, mut &rs)
+        if !(try lockFound(st, txn, t, &found, lexdb_sql.LOCK_UPDATE)) { break }
+        found = []
+        held = 0
+        txn.forgetReads(reads0)
+        rs = newRun(&q)
+        rs.limit(&lim)
+        m = try prepare(st, txn, &q, params, mut &rs)
+    }
     let fw = try fkTables(st, txn, t, false, true)
     var later: []FkLater = []
     for row in found {
@@ -7037,7 +7101,7 @@ pub fn exprOid(x: &Expr, cols: &[]lexdb_sql.ColDef, ptypes: &[]int): int {
                 let r = exprOid(&b, cols, ptypes)
                 return if l == lexdb_sql.OID_BYTEA || r == lexdb_sql.OID_BYTEA { lexdb_sql.OID_BYTEA } else { lexdb_sql.OID_TEXT }
             }
-            if op == "+" || op == "-" || op == "*" || op == "/" || op == "%" {
+            if op == "+" || op == "-" || op == "*" || op == "/" || op == "%" || op == "&" || op == "|" || op == "#" || op == "<<" || op == ">>" {
                 let l = exprOid(&a, cols, ptypes)
                 let r = exprOid(&b, cols, ptypes)
                 let to = timeOpOid(&op, l, r)
@@ -7119,7 +7183,8 @@ pub fn exprOid(x: &Expr, cols: &[]lexdb_sql.ColDef, ptypes: &[]int): int {
                     return lexdb_sql.OID_TEXT
                 }
                 "current_user", "session_user", "current_schema", "pg_encoding_to_char" { return lexdb_sql.OID_NAME }
-                "has_sequence_privilege", "has_any_column_privilege" { return lexdb_sql.OID_BOOL }
+                "has_sequence_privilege", "has_any_column_privilege", "pg_try_advisory_lock", "pg_try_advisory_lock_shared",
+                "pg_try_advisory_xact_lock", "pg_try_advisory_xact_lock_shared", "pg_advisory_unlock", "pg_advisory_unlock_shared" { return lexdb_sql.OID_BOOL }
                 "pg_table_is_visible", "pg_type_is_visible", "pg_function_is_visible", "pg_collation_is_visible", "~", "!~", "~*",
                 "!~*", "has_table_privilege", "has_schema_privilege", "has_database_privilege", "pg_relation_is_publishable" {
                     return lexdb_sql.OID_BOOL
@@ -7309,9 +7374,58 @@ fn select(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
 }
 
 fn runSel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params: &[]Val, lim: Limits): Result[Res, DbErr] {
+    if len(sel.locks) > 0 { return runLocking(st, txn, sel, params, lim) }
     var rs = newRun(&sel.q)
     rs.limit(&lim)
     return execSel(st, txn, sel, params, -1, mut &rs)
+}
+
+// A SELECT ... FOR UPDATE (9.86). Its rows are made without LIMIT and
+// OFFSET, then locked in their order, as PostgreSQL's LockRows below its
+// Limit: a row SKIP LOCKED leaves out does not count towards the LIMIT,
+// one OFFSET passes over is locked too. A lock waited for means the rows
+// may have changed: the query runs again, holding the locks it has.
+fn runLocking(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params: &[]Val, lim: Limits): Result[Res, DbErr] {
+    while true {
+        var rs = newRun(&sel.q)
+        rs.limit(&lim)
+        rs.noLimit = true
+        // its reads not noted: the rows it gives are kept by their locks
+        let quiet = txn.quiet
+        txn.quiet = true
+        let ran = execSel(st, txn, sel, params, -1, mut &rs)
+        txn.quiet = quiet
+        var res = try ran
+        var out: [][]Val = []
+        var passed = 0
+        var waited = false
+        for i in 0..len(res.rows) {
+            if sel.limit >= 0 && len(out) >= sel.limit { break }
+            var skip = false
+            for lk in sel.locks {
+                var b = newStrBuf()
+                for j in 0..lk.n { encKeyPart(mut &b, &res.rows[i][lk.at + j]) }
+                let got = try lockOf(st, txn, &sel.q.levels[lk.level].t, &b.toStr(), lk.mode, lk.wait, true)
+                if got == lexdb_store.LOCK_SKIPPED { skip = true }
+                if got == lexdb_store.LOCKED_AFTER_WAIT { waited = true }
+                if skip || waited { break }
+            }
+            if waited { break }
+            if skip { continue }
+            if passed < sel.offset {
+                passed += 1
+                continue
+            }
+            var r = replace(mut &res.rows[i], [])
+            while len(r) > sel.nOut { let x = pop(mut &r) }
+            append(mut &out, r)
+        }
+        if waited { continue }
+        res.tag = "SELECT " + len(out).toStr()
+        res.rows = out
+        return Ok(res)
+    }
+    return Err(e("XX000", "unreachable"))
 }
 
 // Calls each on the rows of a planned SELECT, in order, while it gives
@@ -7323,7 +7437,7 @@ fn eachRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
     var rs = newRun(&sel.q)
     rs.limit(&lim)
     if !streams(sel) {
-        var res = try execSel(st, txn, sel, params, -1, mut &rs)
+        var res = try runSel(st, txn, sel, params, lim)
         for i in 0..len(res.rows) {
             let r = replace(mut &res.rows[i], [])
             if !(try each(&r)) { break }
@@ -7350,7 +7464,7 @@ fn eachRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
 // Whether a planned SELECT's rows can be given as the scan reads them
 // (eachRow): execSel's last branch, with nothing kept for after it.
 fn streams(sel: &Sel): bool {
-    if sel.setop != 0 || len(sel.srf) > 0 || sel.aggQ || sel.sort || len(sel.wins) > 0 || sel.distinct || sel.offset > 0 { return false }
+    if sel.setop != 0 || len(sel.srf) > 0 || sel.aggQ || sel.sort || len(sel.wins) > 0 || sel.distinct || sel.offset > 0 || len(sel.locks) > 0 { return false }
     if sel.q.corr { for x in sel.exprs { if hasCorr(&x) { return false } } }
     return !hasSrfCall(&sel.exprs)
 }
@@ -7761,7 +7875,13 @@ type Sel = record {
     ordin: bool             // ... WITH ORDINALITY
     wins: []WinPlan         // its window calls (9.46): exprs and order read their values from slots nAggs + i
     nAggs: int
+    // FOR UPDATE and the like (9.86): per table locked, its key's columns,
+    // added to exprs after the output's (nOut of them)
+    locks: []SelLock
+    nOut: int
 }
+
+type SelLock = value record { level: int; at: int; n: int; mode: int; wait: int }
 
 // The column of level 0 an expression is, else -1.
 fn (q: &Query) firstCol(x: &Expr): int {
@@ -7895,14 +8015,75 @@ fn narrow(q: mut &Query, s: &lexdb_sql.Stmt) {
     }
 }
 
+// ---- row locks (9.86)
+
+// FOR UPDATE and the like on the query's tables: those OF names, or all.
+// A locked table's rows are read whole (their keys) and from the latest
+// commit (Session.runIn); a lock waited for runs the query again (runSel).
+fn applyLocks(q: mut &Query, s: &lexdb_sql.Stmt): Result[Unit, DbErr] {
+    let what = lexdb_sql.lockName(s.lockMode)
+    for n in s.lockOf {
+        var found = false
+        for lv in q.levels { if lv.alias == n || lv.t.name == n { found = true } }
+        if !found { return Err(e("42P01", "relation \"" + lexdb_sql.shown(&n) + "\" in " + what + " clause not found in FROM clause")) }
+    }
+    for k in 0..len(q.levels) {
+        var named = len(s.lockOf) == 0
+        for n in s.lockOf { if q.levels[k].alias == n || q.levels[k].t.name == n { named = true } }
+        if !named || q.levels[k].virt() { continue }
+        // the nullable side of an outer join has no row to lock
+        var nullable = k > 0 && keepsLeft(q.levels[k].join)
+        for j in k + 1..len(q.levels) { if keepsRight(q.levels[j].join) { nullable = true } }
+        if nullable { return Err(e("0A000", what + " cannot be applied to the nullable side of an outer join")) }
+        q.levels[k].lock = s.lockMode
+        q.levels[k].lockWait = s.lockWait
+        q.levels[k].need = []
+    }
+    return Ok(Unit{})
+}
+
+// Locks row key of table t (lexdb_store.lockRow), NOWAIT's error naming t.
+fn lockOf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, key: &str, mode: int, wait: int, keep: bool): Result[int, DbErr] {
+    match st.lockRow(txn, t.tree, key, mode, wait, keep) {
+        Ok(g) { return Ok(g) }
+        Err(x) {
+            if x.state == "55P03" { return Err(e("55P03", "could not obtain lock on row in relation \"" + lexdb_sql.baseName(&t.name) + "\"")) }
+            return Err(x)
+        }
+    }
+}
+
+// UPDATE and DELETE: the rows found locked before they are written, in a
+// block until it ends; outside one only waited for (its commit follows at
+// once). true: one was waited for, so what was found may have changed.
+fn lockFound(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, found: &[][]Val, mode: int): Result[bool, DbErr] {
+    let keep = txn.inBlock()
+    if !keep && st.lockCount() == 0 { return Ok(false) }
+    var waited = false
+    for r in found {
+        let got = try lockOf(st, txn, t, &keyOf(t, &r), mode, lexdb_sql.WAIT_BLOCK, keep)
+        if got == lexdb_store.LOCKED_AFTER_WAIT { waited = true }
+    }
+    return Ok(waited)
+}
+
 fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val,
               sc: mut &Scope): Result[Sel, DbErr] {
     if s.rec && s.setop != lexdb_sql.SET_UNION {
         return Err(e("42P19", "recursive query does not have the form non-recursive-term UNION [ALL] recursive-term"))
     }
+    if s.lockMode > 0 {
+        let what = lexdb_sql.lockName(s.lockMode) + " is not allowed with "
+        if s.setop != 0 { return Err(e("0A000", what + "UNION/INTERSECT/EXCEPT")) }
+        if len(s.group) > 0 { return Err(e("0A000", what + "GROUP BY clause")) }
+        if s.having.isSome() { return Err(e("0A000", what + "HAVING clause")) }
+        if s.distinct { return Err(e("0A000", what + "DISTINCT clause")) }
+        if len(s.wins) > 0 { return Err(e("0A000", what + "window functions")) }
+    }
     if s.setop != 0 { return planSet(st, txn, s, params, sc) }
     var q = try buildQuery(st, txn, &s.from, &s.where, params, &s.subs, sc)
     if s.kind == lexdb_sql.S_SELECT { narrow(mut &q, s) }
+    if s.lockMode > 0 { try applyLocks(mut &q, s) }
     var exprs: []Expr = []
     let outs = try selectCols(s, &q.cols, sc, mut &exprs)
     var groupBy: []Expr = []
@@ -7953,6 +8134,7 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
     for x in exprs { if hasAgg(&x) { aggQ = true } }
     for x in order { if hasAgg(&x) { aggQ = true } }
     for d in wdefs { if winHasAgg(&d) { aggQ = true } }
+    if aggQ && s.lockMode > 0 { return Err(e("0A000", lexdb_sql.lockName(s.lockMode) + " is not allowed with aggregate functions")) }
     if s.distinct {
         // SELECT DISTINCT: ORDER BY may use only what it outputs
         for o in order {
@@ -8107,6 +8289,16 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         order = wo
         for d in wdefs { append(mut &wins, try winPlan(&d)) }
     }
+    // FOR UPDATE and the like (9.86): each locked table's key read with
+    // the output, after it
+    let nOut = len(exprs)
+    var locks: []SelLock = []
+    for k in 0..len(q.levels) {
+        if q.levels[k].lock == 0 { continue }
+        let at = len(exprs)
+        for p in q.levels[k].t.pk { append(mut &exprs, Expr.Col(q.cols[q.levels[k].first + p].name)) }
+        append(mut &locks, SelLock{level: k, at: at, n: len(exprs) - at, mode: q.levels[k].lock, wait: q.levels[k].lockWait})
+    }
     var desc: []bool = []
     var nullsFirst: []bool = []
     for o in s.order {
@@ -8115,7 +8307,8 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
     }
     return Ok(Sel{q: q, exprs: exprs, outs: outs, groupBy: groupBy, order: order, aggQ: aggQ, sort: sort,
                   first: first, limit: limit, offset: offset, having: having, specs: specs, distinct: s.distinct, desc: desc, nullsFirst: nullsFirst,
-                  parts: [], setop: 0, setAll: false, split: 0, rec: -1, srf: s.srf, ordin: s.ordin, wins: wins, nAggs: nAggs})
+                  parts: [], setop: 0, setAll: false, split: 0, rec: -1, srf: s.srf, ordin: s.ordin, wins: wins, nAggs: nAggs,
+                  locks: locks, nOut: nOut})
 }
 
 // UNION, INTERSECT, EXCEPT: its two queries, planned on their own; the
@@ -8164,7 +8357,7 @@ fn planSet(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
     return Ok(Sel{q: q, exprs: [], outs: outs, groupBy: [], order: order, aggQ: false, sort: len(order) > 0, first: -1,
                   limit: limit, offset: offset, having: None, specs: [], distinct: false, desc: desc, nullsFirst: nullsFirst, parts: [l, r],
                   setop: s.setop, setAll: s.setAll, split: split, rec: if s.rec { s.cte } else { -1 }, srf: "", ordin: false,
-                  wins: [], nAggs: 0})
+                  wins: [], nAggs: 0, locks: [], nOut: len(outs)})
 }
 
 // A row's key for UNION and the like (NULLs alike; 2 = 2.0).
@@ -8371,8 +8564,8 @@ fn execSel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
     if len(sel.srf) > 0 { return execSrf(st, txn, sel, params, cap, rs) }
     let m = try prepare(st, txn, &sel.q, params, rs)
     let q = &sel.q
-    let limit = if cap >= 0 && (sel.limit < 0 || cap < sel.limit) { cap } else { sel.limit }
-    let offset = sel.offset
+    let limit = if rs.noLimit { -1 } else if cap >= 0 && (sel.limit < 0 || cap < sel.limit) { cap } else { sel.limit }
+    let offset = if rs.noLimit { -1 } else { sel.offset }
     let sorting = sel.sort && cap != 1
     // correlated subqueries in the output run after the scan, from its rows kept
     var late = false
@@ -8952,10 +9145,12 @@ fn settingValue(name: &str, v: &Val): Result[int, DbErr] {
     return Ok(n)
 }
 
-// Ends the session: an open block is rolled back (a snapshot released).
+// Ends the session: an open block is rolled back (a snapshot released,
+// its locks), and its advisory locks released.
 pub fn (s: mut &Session) close() {
     if len(s.txn) > 0 { s.st.abort(pop(mut &s.txn)) }
     s.failed = false
+    advRelease(&s.st, s.id, true)
 }
 
 fn isWrite(kind: int): bool {
@@ -9073,6 +9268,7 @@ fn execStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
 // ANALYZE of a write. A write the statement gets to anyway (a sequence's
 // nextval) fails at its commit (lexdb_store.readOnly).
 fn writesOn(s: &lexdb_sql.Stmt): Option[str] {
+    if s.kind == lexdb_sql.S_SELECT && s.lockMode > 0 { return Some("SELECT " + lexdb_sql.lockName(s.lockMode)) }
     if s.kind == lexdb_sql.S_SELECT { return None }
     if s.kind == lexdb_sql.S_COPY { return if s.copy.from { Some("COPY FROM") } else { None } }
     if s.kind == lexdb_sql.S_EXPLAIN {
@@ -9117,7 +9313,9 @@ pub fn (s: mut &Session) run(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
 
 // run, keeping a SELECT's plan in pc for the next run of the same statement.
 pub fn (s: mut &Session) runCached(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int, pc: mut &PlanCache): Result[Res, DbErr] {
-    return s.runIn(stmt, params, ptypes, pc, &noInput(), noOut)
+    let r = s.runIn(stmt, params, ptypes, pc, &noInput(), noOut)
+    if len(s.txn) == 0 { advRelease(&s.st, s.id, false) }      // its transaction over: its advisory locks (9.86)
+    return r
 }
 
 // runCached for COPY ... TO STDOUT, its lines given to out as they are
@@ -9127,7 +9325,9 @@ pub fn (s: mut &Session) runCached(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes
 // COPY_NONE with its tag only.
 pub fn (s: mut &Session) runOut(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int, pc: mut &PlanCache,
                                 out: &fn(int, &[]byte): bool): Result[Res, DbErr] {
-    return s.runIn(stmt, params, ptypes, pc, &CopyInput{have: false, data: "", fail: "", proto: false, stream: true}, out)
+    let r = s.runIn(stmt, params, ptypes, pc, &CopyInput{have: false, data: "", fail: "", proto: false, stream: true}, out)
+    if len(s.txn) == 0 { advRelease(&s.st, s.id, false) }
+    return r
 }
 
 fn noOut(n: int, b: &[]byte): bool { return false }
@@ -9148,6 +9348,19 @@ fn (s: mut &Session) runIn(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int
         lexdb_sql.S_SHOW { return s.show(&stmt.table) }
         lexdb_sql.S_SET {
             if stmt.table == "role" || stmt.table == "session_authorization" { return s.setRole(stmt) }
+            if strings.startsWith(&stmt.table, "constraints:") {
+                // outside a block it does nothing (PostgreSQL warns)
+                if len(s.txn) == 0 { return Ok(tagOnly("SET CONSTRAINTS")) }
+                if s.failed { return Err(e("25P02", "current transaction is aborted, commands ignored until end of transaction block")) }
+                let st = s.st
+                match setConstraints(&st, mut &s.txn[0], stmt) {
+                    Ok(_) { return Ok(tagOnly("SET CONSTRAINTS")) }
+                    Err(x) {
+                        s.failed = true
+                        return Err(x)
+                    }
+                }
+            }
             if stmt.table == "search_path" {
                 if stmt.ifFlag || len(stmt.names) == 0 { s.setPath(&["public"]) } else { s.setPath(&stmt.names) }
                 return Ok(tagOnly(if stmt.ifFlag { "RESET" } else { "SET" }))
@@ -9219,6 +9432,19 @@ fn (s: mut &Session) runIn(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int
         lexdb_sql.S_COMMIT {
             if len(s.txn) == 0 { return Ok(tagOnly("COMMIT")) }
             s.saves = []
+            // the deferred foreign key checks (9.85): one failing rolls back
+            if !s.failed && len(s.txn[0].pending) > 0 {
+                let st = s.st
+                let all: Option[[]str] = None
+                match checkPending(&st, mut &s.txn[0], &all) {
+                    Ok(_) {}
+                    Err(x) {
+                        s.st.abort(pop(mut &s.txn))
+                        s.restore()
+                        return Err(x)
+                    }
+                }
+            }
             let t = pop(mut &s.txn)
             if s.failed {
                 s.failed = false
@@ -9275,11 +9501,15 @@ fn (s: mut &Session) runIn(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int
             s.failed = true
             return Err(e("25006", "cannot execute " + stmtName(stmt.kind) + " in a read-only transaction"))
         }
+        if s.readOnly && stmt.kind == lexdb_sql.S_SELECT && stmt.lockMode > 0 {
+            s.failed = true
+            return Err(e("25006", "cannot execute SELECT " + lexdb_sql.lockName(stmt.lockMode) + " in a read-only transaction"))
+        }
         let st = s.st
         // UPDATE and DELETE read the live tree: the rows they change are
         // checked at COMMIT either way, and the latest is less often stale
         s.txn[0].live = stmt.kind == lexdb_sql.S_UPDATE || stmt.kind == lexdb_sql.S_DELETE || stmt.kind == lexdb_sql.S_INSERT ||
-                        (stmt.kind == lexdb_sql.S_COPY && stmt.copy.from)
+                        (stmt.kind == lexdb_sql.S_COPY && stmt.copy.from) || (stmt.kind == lexdb_sql.S_SELECT && stmt.lockMode > 0)
         let r = execIn(&st, mut &s.txn[0], stmt, params, ptypes, s.limits(), pc, input, out)
         s.txn[0].live = false
         if r.isErr() {
@@ -9296,7 +9526,8 @@ fn (s: mut &Session) runIn(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int
         // meanwhile; run optimistically, it would conflict with them and
         // run again (design/lexdb.md 9.15). A snapshot whose old versions
         // went over their budget (72000) is tried again on a new one.
-        let snap = stmt.kind == lexdb_sql.S_SELECT || (stmt.kind == lexdb_sql.S_COPY && !stmt.copy.from)
+        // (a SELECT that locks reads the latest, as UPDATE does)
+        let snap = (stmt.kind == lexdb_sql.S_SELECT && stmt.lockMode == 0) || (stmt.kind == lexdb_sql.S_COPY && !stmt.copy.from)
         var t = if snap { try s.st.beginSnapshot() } else { lexdb_store.begin() }
         for n in s.path { append(mut &t.path, n) }
         t.sess = s.id
@@ -9668,6 +9899,132 @@ fn parentSide(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, fw: 
     return Ok(Unit{})
 }
 
+// ---- deferred foreign key checks (9.85)
+//
+// In a transaction block, a DEFERRABLE foreign key's checks, deferred by
+// INITIALLY DEFERRED or SET CONSTRAINTS, wait in Txn.pending until COMMIT
+// (or SET CONSTRAINTS ... IMMEDIATE). A check is done again then from the
+// key alone: the key is still missing from the parent, and some row still
+// references it. So a row deleted since, or written and then undone by
+// ROLLBACK TO, leaves nothing to fail.
+
+fn deferredNow(txn: &lexdb_store.Txn, c: &Table, f: &ForeignKey): bool {
+    if !f.deferrable { return false }
+    var d = f.deferred
+    if txn.consAll == 1 { d = true } else if txn.consAll == 2 { d = false }
+    for i in 0..len(txn.consNames) { if consNamed(&txn.consNames[i], c, &f.name) { d = txn.consDeferred[i] } }
+    return d
+}
+
+// Whether SET CONSTRAINTS' name n (schema-qualified or not) is foreign key
+// fname of table c.
+fn consNamed(n: &str, c: &Table, fname: &str): bool {
+    if lexdb_sql.baseName(n) != fname { return false }
+    return lexdb_sql.baseName(n) == n || lexdb_sql.schemaOf(n) == lexdb_sql.schemaOf(&c.name)
+}
+
+// A check kept: its kind, the child table's key, the constraint, the key.
+fn pendingCheck(kind: int, child: &str, fname: &str, vals: &[]Val): str {
+    var b = newStrBuf()
+    b.addByte(byte(kind))
+    addStr(mut &b, child)
+    addStr(mut &b, fname)
+    binary.addU32LE(mut &b, len(vals))
+    b.add(encRow(vals))
+    return b.toStr()
+}
+
+// Does the pending checks of txn (those of constraints which says, all
+// when which is None) and forgets them.
+fn checkPending(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, which: &Option[[]str]): Result[Unit, DbErr] {
+    let all = replace(mut &txn.pending, [])
+    var keep: []str = []
+    var err: Option[DbErr] = None
+    let live = txn.live
+    txn.live = true                     // as UPDATE's reads: the latest, checked at COMMIT either way
+    for pc in all {
+        if err.isSome() {
+            append(mut &keep, pc)
+            continue
+        }
+        let kind = int(pc[0])
+        let child = strAt(&pc, 1)
+        let fname = strAt(&pc, 5 + len(child))
+        let at = 9 + len(child) + len(fname)
+        let n = binary.readU32LEStr(&pc, at)
+        let vals = try decRow(&pc[at + 4..len(pc)], n)
+        match try byKeyOpt(st, txn, &child) {
+            None {}                     // the table dropped since
+            Some(c) {
+                var fi = -1
+                for k in 0..len(c.fks) { if c.fks[k].name == fname { fi = k } }
+                if fi < 0 { continue }  // the constraint dropped
+                let f = &c.fks[fi]
+                match which {
+                    Some(names) {
+                        var named = false
+                        for nm in names { if consNamed(&nm, &c, &fname) { named = true } }
+                        if !named {
+                            append(mut &keep, pc)
+                            continue
+                        }
+                    }
+                    None {}
+                }
+                let p = try byKey(st, txn, &f.ref)
+                let fc = fkCols(&c, f, &p)
+                if !(try parentHas(st, txn, &p, &fc, &vals)) && (try referenced(st, txn, &c, &fc.cols, &vals)) {
+                    err = Some(if kind == FK_MISSING { notPresent(&c, f, &p, &vals) } else { stillRef(&p, &c, f, &vals) })
+                }
+            }
+        }
+    }
+    txn.live = live
+    txn.pending = keep
+    match err {
+        Some(x) { return Err(x) }
+        None { return Ok(Unit{}) }
+    }
+}
+
+// SET CONSTRAINTS ALL | names DEFERRED | IMMEDIATE, in a block: the names
+// must be deferrable foreign keys; IMMEDIATE does their waiting checks now.
+fn setConstraints(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, stmt: &lexdb_sql.Stmt): Result[Unit, DbErr] {
+    let deferred = stmt.table == "constraints:deferred"
+    if len(stmt.names) == 0 {
+        txn.consAll = if deferred { 1 } else { 2 }
+        txn.consNames = []
+        txn.consDeferred = []
+        if !deferred {
+            let all: Option[[]str] = None
+            try checkPending(st, txn, &all)
+        }
+        return Ok(Unit{})
+    }
+    for n in stmt.names {
+        var found = false
+        var deferrable = true
+        for t in try allTables(st, txn) {
+            for f in t.fks {
+                if consNamed(&n, &t, &f.name) {
+                    found = true
+                    if !f.deferrable { deferrable = false }
+                }
+            }
+        }
+        if !found {
+            var other = false
+            for t in try allTables(st, txn) { if hasConName(&t, &lexdb_sql.baseName(&n)) { other = true } }
+            if !other { return Err(e("42704", "constraint \"" + lexdb_sql.baseName(&n) + "\" does not exist")) }
+        }
+        if !found || !deferrable { return Err(e("42809", "constraint \"" + lexdb_sql.baseName(&n) + "\" is not deferrable")) }
+        append(mut &txn.consNames, n)
+        append(mut &txn.consDeferred, deferred)
+    }
+    if !deferred { try checkPending(st, txn, &Some(copyStrs(&stmt.names))) }
+    return Ok(Unit{})
+}
+
 // A statement's end: what it left, in order; deleting and setting rows
 // may add more.
 fn fkFinish(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, fw: &[]Table, later: mut &[]FkLater): Result[Unit, DbErr] {
@@ -9684,6 +10041,12 @@ fn fkFinish(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, fw: &[]Table, lat
         let f = &c.fks[k]
         let p = &fw[findTab(fw, &f.ref)]
         let fc = fkCols(c, f, p)
+        // a check a deferred constraint waits for the block's COMMIT with
+        // (RESTRICT never waits: PostgreSQL's is not deferrable)
+        if (kind == FK_MISSING || (kind == FK_GONE && act != lexdb_sql.FK_RESTRICT)) && txn.inBlock() && deferredNow(txn, c, f) {
+            append(mut &txn.pending, pendingCheck(kind, &child, &f.name, &vals))
+            continue
+        }
         if kind == FK_MISSING {
             let has = try parentHas(st, txn, p, &fc, &vals)
             if !has { return Err(notPresent(c, f, p, &vals)) }
@@ -9779,7 +10142,8 @@ fn makeFk(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, p: &Tabl
     }
     var own: []str = []
     for n in c.cols { append(mut &own, n) }
-    let f = ForeignKey{name: name, cols: own, ref: refKey, refCols: refCols, onDelete: c.onDelete, onUpdate: c.onUpdate}
+    let f = ForeignKey{name: name, cols: own, ref: refKey, refCols: refCols, onDelete: c.onDelete, onUpdate: c.onUpdate,
+                       deferrable: c.deferrable, deferred: c.deferred}
     // the rows there
     let fc = FkCols{cols: cols, refCols: rc, via: via}
     let path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: []}
@@ -10375,6 +10739,99 @@ fn boundSeq(q: &SeqEnv, name: &str, f: &str): Result[Seq, DbErr] {
 
 fn isSeqFn(name: &str): bool { return name == "nextval" || name == "currval" || name == "setval" || name == "lastval" }
 
+// ---- advisory locks (9.86)
+//
+// pg_advisory_lock and the rest, on the store's lock table (row locks'):
+// key "adv:" and the bigint, or "adv:" a "," b for two ints. The owner is
+// the session (-its id), so a lock outlives its transaction; the session
+// counts its holds (memo "\x00adv\x00" + id: a line each, "s" or "x" for
+// session or transaction, "e" or "s" exclusive or shared, the key) and
+// the store's lock goes with the last. A transaction's are released at its
+// end (Session.advEnd), all of them at the session's.
+
+fn isAdvFn(n: &str): bool {
+    return strings.startsWith(n, "pg_advisory_") || strings.startsWith(n, "pg_try_advisory_")
+}
+
+fn advMemo(sess: int): str { return "\x00adv\x00" + sess.toStr() }
+
+fn advCall(name: &str, vs: &[]Val, env: &Env): Result[Val, DbErr] {
+    let known = name == "pg_advisory_lock" || name == "pg_advisory_lock_shared" || name == "pg_try_advisory_lock" ||
+                name == "pg_try_advisory_lock_shared" || name == "pg_advisory_xact_lock" || name == "pg_advisory_xact_lock_shared" ||
+                name == "pg_try_advisory_xact_lock" || name == "pg_try_advisory_xact_lock_shared" || name == "pg_advisory_unlock" ||
+                name == "pg_advisory_unlock_shared" || name == "pg_advisory_unlock_all"
+    if !known { return Err(e("42883", "function " + name + " does not exist")) }
+    match env.seq {
+        None { return Err(e("0A000", "lexdb: " + name + " is not allowed here")) }
+        Some(q) {
+            let me = 0 - q.sess
+            if name == "pg_advisory_unlock_all" {
+                advRelease(&q.st, q.sess, true)
+                return Ok(Val.Text(""))
+            }
+            if len(vs) != 1 && len(vs) != 2 { return Err(e("42883", "function " + name + " takes one bigint or two integers")) }
+            for v in vs { if isNull(&v) { return Ok(Val.Null) } }
+            var k = "adv:"
+            let i8 = lexdb_sql.TypeName{kind: lexdb_sql.K_INT, oid: lexdb_sql.OID_INT8, prec: 0, scale: 0, len: 0}
+            for i in 0..len(vs) {
+                let iv = try coerce(vs[i], &i8)
+                k = k + (if i > 0 { "," } else { "" }) + text(&iv)
+            }
+            let shared = strings.endsWith(name, "_shared")
+            let line = (if strings.contains(name, "_xact_") { "x" } else { "s" }) + (if shared { "s" } else { "e" }) + k
+            var lines: []str = []
+            match q.st.memoGet(&advMemo(q.sess)) {
+                Some(m) { for l in strings.split(&m, "\n") { if len(l) > 0 { append(mut &lines, l.toStr()) } } }
+                None {}
+            }
+            if strings.contains(name, "unlock") {
+                // one session hold of this mode, if there is one
+                var at = -1
+                for i in 0..len(lines) { if at < 0 && lines[i][0] == 's' && lines[i][1..len(lines[i])] == line[1..len(line)] { at = i } }
+                if at < 0 { return Ok(Val.Bool(false)) }
+                var keep: []str = []
+                var still = false
+                for i in 0..len(lines) {
+                    if i == at { continue }
+                    append(mut &keep, lines[i])
+                    if lines[i][2..len(lines[i])] == k { still = true }
+                }
+                q.st.memoPut(&advMemo(q.sess), &strings.join(&keep, "\n"))
+                if !still { q.st.unlockAll(me, &[k]) }
+                return Ok(Val.Bool(true))
+            }
+            let tryIt = strings.startsWith(name, "pg_try_")
+            var added = false
+            let got = try q.st.lockAs(me, &k, if shared { lexdb_sql.LOCK_SHARE } else { lexdb_sql.LOCK_UPDATE },
+                                     if tryIt { lexdb_sql.WAIT_SKIP } else { lexdb_sql.WAIT_BLOCK }, true, mut &added)
+            if got == lexdb_store.LOCK_SKIPPED { return Ok(Val.Bool(false)) }
+            append(mut &lines, line)
+            q.st.memoPut(&advMemo(q.sess), &strings.join(&lines, "\n"))
+            return Ok(if tryIt { Val.Bool(true) } else { Val.Text("") })
+        }
+    }
+}
+
+// Releases a session's transaction-level advisory locks (all: every one).
+fn advRelease(st: &lexdb_store.Store, sess: int, all: bool) {
+    let m = st.memoGet(&advMemo(sess)).unwrapOr("")
+    if len(m) == 0 { return }
+    var keep: []str = []
+    var gone: []str = []
+    for l in strings.split(&m, "\n") {
+        if len(l) == 0 { continue }
+        if all || l[0] == 'x' { append(mut &gone, l[2..len(l)].toStr()) } else { append(mut &keep, l.toStr()) }
+    }
+    st.memoPut(&advMemo(sess), &strings.join(&keep, "\n"))
+    var free: []str = []
+    for k in gone {
+        var still = false
+        for l in keep { if l[2..len(l)] == k { still = true } }
+        if !still { append(mut &free, k) }
+    }
+    if len(free) > 0 { st.unlockAll(0 - sess, &free) }
+}
+
 // nextval, currval, setval, lastval.
 fn seqCall(name: &str, vs: &[]Val, env: &Env): Result[Val, DbErr] {
     match env.seq {
@@ -10425,7 +10882,7 @@ fn seqCall(name: &str, vs: &[]Val, env: &Env): Result[Val, DbErr] {
 fn isVolatile(x: &Expr): bool {
     match x {
         Expr.Call(n, args, _) {
-            if isSeqFn(&n) { return true }
+            if isSeqFn(&n) || isAdvFn(&n) { return true }
             for a in args { if isVolatile(&a) { return true } }
             return false
         }
@@ -13494,6 +13951,7 @@ type CatIdx = record {
     primary: bool
     con: bool               // a constraint's (primary key, UNIQUE)
     pred: Option[Expr]
+    opts: []str             // per column: opclass, DESC, NULLS ... as shown; [] none
 }
 
 type CatTab = record {
@@ -13520,6 +13978,8 @@ type CatCon = record {
     upd: str
     del: str
     check: str              // a CHECK's expression, as PostgreSQL shows it
+    deferrable: bool
+    deferred: bool
 }
 
 type CatSnap = record {
@@ -13570,6 +14030,31 @@ fn fkActionText(a: &str): str {
     if a == "n" { return "SET NULL" }
     if a == "d" { return "SET DEFAULT" }
     return "NO ACTION"
+}
+
+// An index's columns with their options, as pg_get_indexdef shows them.
+fn colOpts(t: &Table, ix: &CatIdx): str {
+    var parts: []str = []
+    for k in 0..len(ix.cols) {
+        let n = ix.cols[k]
+        if n < 1 || n > len(t.cols) { continue }
+        var p = quoteIfNeeded(&t.cols[n - 1].name)
+        if k < len(ix.opts) && len(ix.opts[k]) > 0 { p = p + " " + ix.opts[k] }
+        append(mut &parts, p)
+    }
+    return strings.join(&parts, ", ")
+}
+
+// pg_index.indoption: per column, 1 DESC, 2 NULLS FIRST.
+fn indOptions(ix: &CatIdx): Val {
+    var ns: []int = []
+    for k in 0..len(ix.cols) {
+        let o = if k < len(ix.opts) { ix.opts[k] } else { "" }
+        let desc = strings.contains(&o, "DESC")
+        let first = if desc { !strings.contains(&o, "NULLS LAST") } else { strings.contains(&o, "NULLS FIRST") }
+        append(mut &ns, (if desc { 1 } else { 0 }) + (if first { 2 } else { 0 }))
+    }
+    return vecOf(&ns)
 }
 
 fn colList(t: &Table, nums: &[]int): str {
@@ -13707,14 +14192,14 @@ fn catSnap(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[CatSnap, D
             for p in t.pk { append(mut &cs, p + 1) }
             let pn = name + "_pkey"
             append(mut &idxs, CatIdx{name: pn, oid: catOid(&"i", &lexdb_sql.qual(&schema, &pn)), cols: cs, unique: true, primary: true,
-                                     con: true, pred: None})
+                                     con: true, pred: None, opts: []})
         }
         for ix in t.indexes {
             var cs: []int = []
             for c in ix.cols { append(mut &cs, c + 1) }
             let iname = lexdb_sql.baseName(&ix.name)
             append(mut &idxs, CatIdx{name: iname, oid: catOid(&"i", &lexdb_sql.qual(&schema, &iname)), cols: cs, unique: ix.unique,
-                                     primary: false, con: ix.con, pred: cloneOptE(&ix.pred)})
+                                     primary: false, con: ix.con, pred: cloneOptE(&ix.pred), opts: copyStrs(&ix.opts)})
         }
         append(mut &snap.tabs, CatTab{key: keys[i], t: t, oid: catOid(&"r", &keys[i]), schema: schema, name: name,
                                       shown: shownIn(&txn.path, &schema, &name), idxs: idxs})
@@ -13729,7 +14214,7 @@ fn catSnap(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[CatSnap, D
             let def = (if ix.primary { "PRIMARY KEY (" } else { "UNIQUE (" }) + colList(&ct.t, &ix.cols) + ")"
             append(mut &cons, CatCon{oid: catOid(&"c", &(ct.key + "\x00" + ix.name)), name: ix.name, typ: ty, rel: ct.oid,
                                           schema: ct.schema, cols: copyInts(&ix.cols), refRel: 0, refCols: [], idx: ix.oid, def: def,
-                                          upd: " ", del: " ", check: ""})
+                                          upd: " ", del: " ", check: "", deferrable: false, deferred: false})
         }
         for fk in ct.t.fks {
             var cs: []int = []
@@ -13764,17 +14249,28 @@ fn catSnap(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[CatSnap, D
             var def = "FOREIGN KEY (" + strings.join(&fcols, ", ") + ") REFERENCES " + refShown + "(" + strings.join(&refNames, ", ") + ")"
             if upd != "a" { def = def + " ON UPDATE " + fkActionText(&upd) }
             if del != "a" { def = def + " ON DELETE " + fkActionText(&del) }
+            if fk.deferrable { def = def + " DEFERRABLE" }
+            if fk.deferred { def = def + " INITIALLY DEFERRED" }
             append(mut &cons, CatCon{oid: catOid(&"c", &(ct.key + "\x00" + fk.name)), name: fk.name, typ: "f", rel: ct.oid,
                                           schema: ct.schema, cols: cs, refRel: refRel, refCols: refCols, idx: refIdx, def: def,
-                                          upd: upd, del: del, check: ""})
+                                          upd: upd, del: del, check: "", deferrable: fk.deferrable, deferred: fk.deferred})
         }
         for ck in ct.t.checks {
             let none: Option[lexdb_sql.TypeName] = None
             let x = pgExprText(&ck.expr, &none)
             let body = if strings.startsWith(&x, "(") { x } else { "(" + x + ")" }
+            // conkey: the columns it uses, in the table's order
+            var used: []str = []
+            colNames(&ck.expr, mut &used)
+            var ccols: []int = []
+            for i in 0..len(ct.t.cols) {
+                var uses = false
+                for n in used { if n == ct.t.cols[i].name { uses = true } }
+                if uses { append(mut &ccols, colNum(&ct.t, &ct.t.cols[i].name)) }
+            }
             append(mut &cons, CatCon{oid: catOid(&"c", &(ct.key + "\x00" + ck.name)), name: ck.name, typ: "c", rel: ct.oid,
-                                          schema: ct.schema, cols: [], refRel: 0, refCols: [], idx: 0, def: "CHECK (" + body + ")",
-                                          upd: " ", del: " ", check: body})
+                                          schema: ct.schema, cols: ccols, refRel: 0, refCols: [], idx: 0, def: "CHECK (" + body + ")",
+                                          upd: " ", del: " ", check: body, deferrable: false, deferred: false})
         }
     }
     snap.cons = cons
@@ -13783,7 +14279,7 @@ fn catSnap(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[CatSnap, D
 
 fn idxDef(ct: &CatTab, ix: &CatIdx): str {
     var d = "CREATE " + (if ix.unique { "UNIQUE " } else { "" }) + "INDEX " + quoteIfNeeded(&ix.name) + " ON " +
-            quoteIfNeeded(&ct.schema) + "." + quoteIfNeeded(&ct.name) + " USING btree (" + colList(&ct.t, &ix.cols) + ")"
+            quoteIfNeeded(&ct.schema) + "." + quoteIfNeeded(&ct.name) + " USING btree (" + colOpts(&ct.t, ix) + ")"
     match ix.pred {
         Some(p) {
             let none: Option[lexdb_sql.TypeName] = None
@@ -14508,16 +15004,16 @@ fn catRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &str): Result
                     let pred = predVal(&ix.pred)
                     append(mut &rows, [iv(ix.oid), iv(ct.oid), iv(len(ix.cols)), iv(len(ix.cols)), bv(ix.unique), bv(false), bv(ix.primary),
                                        bv(false), bv(true), bv(false), bv(true), bv(false), bv(true), bv(true), bv(false),
-                                       vecOf(&ix.cols), vecOf(&colls), zeros(len(ix.cols)), zeros(len(ix.cols)), Val.Null, pred])
+                                       vecOf(&ix.cols), vecOf(&colls), zeros(len(ix.cols)), indOptions(&ix), Val.Null, pred])
                 }
             }
         }
         "pg_constraint" {
             for c in snap.cons {
                 let isF = c.typ == "f"
-                append(mut &rows, [iv(c.oid), tv(&c.name), iv(nspOid(&c.schema)), tv(&c.typ), bv(false), bv(false), bv(true), iv(c.rel),
+                append(mut &rows, [iv(c.oid), tv(&c.name), iv(nspOid(&c.schema)), tv(&c.typ), bv(c.deferrable), bv(c.deferred), bv(true), iv(c.rel),
                                    iv(0), iv(c.idx), iv(0), iv(c.refRel), tv(&c.upd), tv(&c.del), tv(&if isF { "s" } else { " " }),
-                                   bv(true), iv(0), bv(false), if c.typ == "c" { Val.Null } else { intsArr(&c.cols) },
+                                   bv(true), iv(0), bv(false), if c.typ == "c" && len(c.cols) == 0 { Val.Null } else { intsArr(&c.cols) },
                                    if isF { intsArr(&c.refCols) } else { Val.Null }, Val.Null, Val.Null, Val.Null, Val.Null, Val.Null,
                                    if c.typ == "c" { tv(&c.check) } else { Val.Null }, bv(false)])
             }
@@ -14696,7 +15192,8 @@ fn catRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &str): Result
             for c in snap.cons {
                 let ct = catTabOf(&snap, c.rel)
                 let ty = if c.typ == "p" { "PRIMARY KEY" } else if c.typ == "u" { "UNIQUE" } else if c.typ == "f" { "FOREIGN KEY" } else { "CHECK" }
-                append(mut &rows, [tv(&db), tv(&c.schema), tv(&c.name), tv(&db), tv(&c.schema), tv(&ct), tv(&ty), tv(&"NO"), tv(&"NO"),
+                append(mut &rows, [tv(&db), tv(&c.schema), tv(&c.name), tv(&db), tv(&c.schema), tv(&ct), tv(&ty),
+                                   tv(&if c.deferrable { "YES" } else { "NO" }), tv(&if c.deferred { "YES" } else { "NO" }),
                                    tv(&"YES"), if c.typ == "u" || c.typ == "p" { tv(&"YES") } else { Val.Null }])
             }
         }
@@ -15042,6 +15539,22 @@ fn allViews(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[[]Table, 
         return true
     })
     for i in 0..len(keys) { append(mut &out, decView(keys[i], &vals[i])) }
+    return Ok(out)
+}
+
+// Every table (not views), from the catalog.
+fn allTables(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[[]Table, DbErr] {
+    var keys: []str = []
+    var vals: []str = []
+    try st.scan(txn, CATALOG, "\x06", "", fn(en: &lexdb_store.Entry): bool {
+        if !strings.startsWith(&en.val, VIEW_MARK) {
+            append(mut &keys, en.key)
+            append(mut &vals, en.val)
+        }
+        return true
+    })
+    var out: []Table = []
+    for i in 0..len(keys) { append(mut &out, try decTable(&keys[i], &vals[i])) }
     return Ok(out)
 }
 
