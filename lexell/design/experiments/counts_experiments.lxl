@@ -1,0 +1,110 @@
+// lexdb count experiments (no timings). Three questions, answered from row
+// counts that EXPLAIN ANALYZE and plain counts give:
+//   A. ranking: does the rule plan's choice match the cheapest path, counted?
+//   B. miss ratio: how many index probes find no row, in an FK-like and an
+//      anti-join-like workload (is a filter worth building?).
+//   C. crossover in counts: index range versus full scan, by selectivity.
+// Build: lexell/compiler/out/lxlc counts_experiments.lxl -o <binary>
+// (run from this directory). The database is simulated in memory.
+import "../../cmd/lexdb_store"
+import "../../cmd/lexdb_disk"
+import "../../cmd/lexdb_exec"
+import "strings"
+
+fn show(s: mut &lexdb_exec.Session, sql: str) {
+    match s.exec(&sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if !r.hasRows {
+                println(sql + " -> " + r.tag)
+                return
+            }
+            var lines: []str = []
+            for row in r.rows {
+                var cells: []str = []
+                for v in row { append(mut &cells, if lexdb_exec.isNull(&v) { "NULL" } else { lexdb_exec.text(&v) }) }
+                append(mut &lines, strings.join(&cells, "|"))
+            }
+            println(sql + " -> " + strings.join(&lines, "; "))
+        }
+        Err(e) { println(sql + " -> " + e.state + " " + e.msg) }
+    }
+}
+
+// EXPLAIN ANALYZE: the plan's lines, without the final time line.
+fn analyze(s: mut &lexdb_exec.Session, sql: str) {
+    match s.exec(&sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            var lines: []str = []
+            for i in 0..len(r.rows) - 1 { append(mut &lines, lexdb_exec.text(&r.rows[i][0])) }
+            println(sql + " -> " + strings.join(&lines, "; "))
+        }
+        Err(e) { println(sql + " -> " + e.state + " " + e.msg) }
+    }
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    var s = lexdb_exec.newSession(st)
+
+    // A. Ranking. 10,000 rows: a = id % 2 (50%), b = id % 100 (1%), c = id % 10000 (unique).
+    // Indexes are created in the order a, b, c, so ties go to a.
+    println("-- A. ranking: rule choice and counted matches")
+    show(mut &s, "create table t (id int primary key, a int, b int, c int)")
+    show(mut &s, "insert into t select g, g % 2, g % 100, g % 10000 from generate_series(1, 10000) g")
+    show(mut &s, "create index t_a on t (a)")
+    show(mut &s, "create index t_b on t (b)")
+    show(mut &s, "create index t_c on t (c)")
+    show(mut &s, "explain select id from t where a = 1 and b = 5")
+    show(mut &s, "select count(*) from t where a = 1")
+    show(mut &s, "select count(*) from t where b = 5")
+    show(mut &s, "select count(*) from t where a = 1 and b = 5")
+    show(mut &s, "explain select id from t where a = 1 and c = 7")
+    show(mut &s, "select count(*) from t where c = 7")
+    show(mut &s, "explain select id from t where b = 5 and c = 7")
+    show(mut &s, "explain select id from t where b = 5")
+    show(mut &s, "explain select id from t where a = 1")
+    analyze(mut &s, "explain analyze select id from t where a = 1 and b = 5")
+    analyze(mut &s, "explain analyze select id from t where b = 5 and c = 7")
+    // the same data with c declared unique: the rules then pick c
+    show(mut &s, "create table u (id int primary key, a int, b int, c int)")
+    show(mut &s, "insert into u select g, g % 2, g % 100, g % 10000 from generate_series(1, 10000) g")
+    show(mut &s, "create index u_a on u (a)")
+    show(mut &s, "create unique index u_c on u (c)")
+    show(mut &s, "explain select id from u where a = 1 and c = 7")
+
+    // B. Miss ratio. Probes into cust by primary key, one per order row.
+    println("-- B. miss ratio: probes that find no row")
+    show(mut &s, "create table cust (id int primary key)")
+    show(mut &s, "insert into cust select g from generate_series(1, 1000) g")
+    // FK-like: 90% of orders point at a customer
+    show(mut &s, "create table ord_fk (id int primary key, cust int)")
+    show(mut &s, "insert into ord_fk select g, case when g % 10 < 9 then g % 1000 + 1 else 5000 + g end from generate_series(1, 10000) g")
+    analyze(mut &s, "explain analyze select o.id from ord_fk o join cust c on c.id = o.cust")
+    // anti-join-like: 10% of orders point at a customer
+    show(mut &s, "create table ord_anti (id int primary key, cust int)")
+    show(mut &s, "insert into ord_anti select g, case when g % 10 = 0 then g % 1000 + 1 else 5000 + g end from generate_series(1, 10000) g")
+    analyze(mut &s, "explain analyze select o.id from ord_anti o join cust c on c.id = o.cust")
+
+    // C. Crossover in counts. kind = id % 100, so kind < f matches f% of 10,000 rows.
+    println("-- C. crossover: index range versus scan, rows read")
+    show(mut &s, "create table w (id int primary key, kind int)")
+    show(mut &s, "insert into w select g, g % 100 from generate_series(1, 10000) g")
+    show(mut &s, "create index w_kind on w (kind)")
+    analyze(mut &s, "explain analyze select id from w where kind < 1")
+    analyze(mut &s, "explain analyze select id from w where kind + 0 < 1")
+    analyze(mut &s, "explain analyze select id from w where kind < 10")
+    analyze(mut &s, "explain analyze select id from w where kind + 0 < 10")
+    analyze(mut &s, "explain analyze select id from w where kind < 50")
+    analyze(mut &s, "explain analyze select id from w where kind + 0 < 50")
+    analyze(mut &s, "explain analyze select id from w where kind < 90")
+    analyze(mut &s, "explain analyze select id from w where kind + 0 < 90")
+    analyze(mut &s, "explain analyze select id from w where kind < 99")
+    analyze(mut &s, "explain analyze select id from w where kind + 0 < 99")
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(5), lexdb_store.Options{cacheBytes: 128 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000, bufferedPages: false}, body).unwrap()
+}

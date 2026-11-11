@@ -3461,6 +3461,100 @@ fn bumpCatalog(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[Unit, 
     return Ok(Unit{})
 }
 
+// ---- statistics (9.54): ANALYZE's row per table, keyed 5 then the table's
+// catalog key (between the sequences' 4 and the tables), its text
+// "tree;rows" then ";indextree:entries:d1,d2,..." per index. The table's tree
+// is in it, so an older table of the same name's statistics are not used.
+
+fn statKey(name: &str): str { return "\x05" + name }
+
+// A table's statistics as the transaction sees them (none with SET
+// lexdb_planner = rules).
+fn loadEst(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table): Result[Est, DbErr] {
+    if txn.rules || t.tree < 0 { return Ok(noEst()) }
+    let got = try st.get(txn, CATALOG, statKey(&t.name))
+    if got.isNone() { return Ok(noEst()) }
+    let v = got.unwrap()
+    let parts = strings.split(&v, ";")
+    if len(parts) < 2 || strings.parseIntOpt(parts[0].toStr()).unwrapOr(-1) != t.tree { return Ok(noEst()) }
+    var es = Est{rows: strings.parseIntOpt(parts[1].toStr()).unwrapOr(-1), trees: [], entries: [], dist: []}
+    for i in 2..len(parts) {
+        let f = strings.split(parts[i], ":")
+        if len(f) != 3 { continue }
+        var ds: []int = []
+        for x in strings.split(f[2], ",") { append(mut &ds, strings.parseIntOpt(x.toStr()).unwrapOr(0)) }
+        append(mut &es.trees, strings.parseIntOpt(f[0].toStr()).unwrapOr(-1))
+        append(mut &es.entries, strings.parseIntOpt(f[1].toStr()).unwrapOr(0))
+        append(mut &es.dist, ds)
+    }
+    return Ok(es)
+}
+
+// ANALYZE [table]: the statistics of the table, or of every table, counted
+// exactly from a full read. The catalog's version is bumped, so prepared
+// statements are planned again with them (9.54).
+fn analyzeStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
+    if s.table != "" {
+        let t = try needTable(st, txn, &s.table)
+        try analyzeTable(st, txn, &t)
+    } else {
+        var keys: []str = []
+        var raw: []str = []
+        try st.scan(txn, CATALOG, "\x06", "", fn(en: &lexdb_store.Entry): bool {
+            append(mut &keys, en.key)
+            append(mut &raw, en.val)
+            return true
+        })
+        for i in 0..len(keys) {
+            let t = try decTable(&keys[i], &raw[i])
+            try analyzeTable(st, txn, &t)
+        }
+    }
+    try bumpCatalog(st, txn)
+    return Ok(tagOnly("ANALYZE"))
+}
+
+fn analyzeTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table): Result[Unit, DbErr] {
+    var rows = 0
+    var entries: []int = []
+    var seen: [][]Map[str, int] = []
+    for ix in t.indexes {
+        var ms: []Map[str, int] = []
+        for j in 0..len(ix.cols) { append(mut &ms, newMap()) }
+        append(mut &seen, ms)
+        append(mut &entries, 0)
+    }
+    let all: []bool = []
+    let path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: []}
+    let sc = Scan{empty: false, point: false, lo: "", hi: "", whole: true}
+    var cur = newCursor()
+    while !cur.done {
+        var batch: [][]Val = []
+        try fetch(st, txn, t, &path, &sc, &all, mut &cur, mut &batch)
+        for r in batch {
+            rows += 1
+            for i in 0..len(t.indexes) {
+                if !(try inIndex(t, &t.indexes[i], &r)) { continue }
+                entries[i] += 1
+                var b = newStrBuf()
+                for j in 0..len(t.indexes[i].cols) {
+                    encIdxPart(mut &b, &r[t.indexes[i].cols[j]])
+                    seen[i][j].put(b.toStr(), 1)
+                }
+            }
+        }
+    }
+    var out = newStrBuf()
+    out.add(t.tree.toStr() + ";" + rows.toStr())
+    for i in 0..len(t.indexes) {
+        var ds: []str = []
+        for m in seen[i] { append(mut &ds, m.size().toStr()) }
+        out.add(";" + t.indexes[i].tree.toStr() + ":" + entries[i].toStr() + ":" + strings.join(&ds, ","))
+    }
+    try txn.put(CATALOG, statKey(&t.name), out.toStr())
+    return Ok(Unit{})
+}
+
 // ---- schemas (9.20): a table's catalog key is its name qualified by its
 // schema (lexdb_sql.qual: schema QSEP name), public's unqualified. A schema
 // is a catalog row of its own (schemaKey). An unqualified name is looked up
@@ -3755,6 +3849,27 @@ type Path = record {
 // path reads the whole table instead (no row counts to choose by yet).
 const IN_LOOKUP_MAX: int = 1000
 
+// ANALYZE's statistics for a table (9.54): its rows, and per index (by its
+// tree) its entries and the distinct values of each leading prefix of its
+// columns (a NULL counted as a value). rows -1: none (no ANALYZE, an ANALYZE of
+// an older table of the name, or SET lexdb_planner = rules).
+type Est = record { rows: int; trees: []int; entries: []int; dist: [][]int }
+
+fn noEst(): Est { return Est{rows: -1, trees: [], entries: [], dist: []} }
+
+// The rows an index path with eqs leading equalities is expected to read
+// (its entries over the distinct values of that prefix); -1 unknown.
+fn (es: &Est) eqRows(tree: int, eqs: int): int {
+    if es.rows < 0 || eqs <= 0 { return -1 }
+    for i in 0..len(es.trees) {
+        if es.trees[i] == tree && eqs <= len(es.dist[i]) {
+            let d = es.dist[i][eqs - 1]
+            if d > 0 { return (es.entries[i] + d - 1) / d }
+        }
+    }
+    return -1
+}
+
 type Scan = record {
     empty: bool         // a bound is NULL: no row can match
     point: bool         // one primary key (lo)
@@ -3786,6 +3901,8 @@ pub type Level = record {
     need: []bool            // a table's columns the statement uses (the others are read as NULL); [] all (9.31)
     lock: int               // SELECT ... FOR UPDATE and the like: its rows locked (lexdb_sql.LOCK_*, 9.86); 0 none
     lockWait: int           // lexdb_sql.WAIT_*
+    keeps: bool             // the path is chosen for ORDER BY or MIN/MAX: no switch to a scan (9.53)
+    est: Est                // its table's statistics from ANALYZE, for choosePath (9.54)
 }
 
 // A level of rows held by the run (a subquery's, a working table), not a table's.
@@ -3801,6 +3918,7 @@ type Counts = value record {
     kept: int
     unmatched: int      // RIGHT and FULL JOIN: its rows that joined nothing
     batches: int        // the batches its rows were read and aggregated in (9.47)
+    switched: int       // 1 when an index range over the budget was run as a scan (9.53)
 }
 
 // A query's run: the counts, and per RIGHT or FULL JOIN table which of its
@@ -3820,6 +3938,7 @@ type Run = record {
     ticks: int
     turnEnd: int                // the monotonic clock's ns after which the statement lets other sessions run
     batch: bool                 // aggregates over batches of rows (SET lexdb_batch: 9.47)
+    writes: bool                // an INSERT, UPDATE or DELETE's run: no index-to-scan switch (9.53)
 }
 
 // A statement that does not wait (its pages in the cache) lets the other
@@ -3834,9 +3953,10 @@ pub type Limits = value record {
     pub mem: int                // bytes of rows held; 0 no limit
     pub deadline: int           // time.monotonicNs() to stop at; 0 none
     pub batch: bool             // SET lexdb_batch: aggregates over batches of rows (9.47)
+    pub rules: bool             // SET lexdb_planner = rules: kept with the others for a block's ROLLBACK (9.54)
 }
 
-pub fn noLimits(): Limits { return Limits{rounds: 0, mem: 0, deadline: 0, batch: true} }
+pub fn noLimits(): Limits { return Limits{rounds: 0, mem: 0, deadline: 0, batch: true, rules: false} }
 
 fn (rs: mut &Run) limit(l: &Limits) {
     rs.maxRounds = l.rounds
@@ -3940,9 +4060,9 @@ fn newRun(q: &Query): Run {
         append(mut &memoRes, [])
         append(mut &stats, SubStat{runs: 0, hits: 0, cnt: [], inner: []})
     }
-    return Run{noLimit: false, cnt: array(len(q.levels), Counts{starts: 0, read: 0, joined: 0, nulls: 0, built: 0, kept: 0, unmatched: 0, batches: 0}),
+    return Run{noLimit: false, cnt: array(len(q.levels), Counts{starts: 0, read: 0, joined: 0, nulls: 0, built: 0, kept: 0, unmatched: 0, batches: 0, switched: 0}),
                seen: seen, memo: memo, memoRes: memoRes, stats: stats, cache: newCache(), maxRounds: MAX_RECURSION,
-               held: 0, maxHeld: 0, deadline: 0, ticks: 0, turnEnd: 0, batch: true}
+               held: 0, maxHeld: 0, deadline: 0, ticks: 0, turnEnd: 0, batch: true, writes: false}
 }
 
 fn keepsRight(join: int): bool { return join == lexdb_sql.J_RIGHT || join == lexdb_sql.J_FULL }
@@ -4531,6 +4651,7 @@ fn choosePath(q: &Query, k: int, cs: &[]Expr, params: &[]Val): Path {
     let lv = &q.levels[k]
     var best = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: []}
     var bestScore = 0
+    var bestEst = -1                    // the best's expected rows from ANALYZE (9.54); -1 unknown
     for c0 in 0..len(lv.t.indexes) + 1 {
         let c = c0 - 1
         if !q.usable(k, c, cs, params) { continue }
@@ -4577,8 +4698,11 @@ fn choosePath(q: &Query, k: int, cs: &[]Expr, params: &[]Val): Path {
         } else if hasIn && len(eqs) + 1 == len(cols) {
             if c < 0 { score = 500 } else if lv.t.indexes[c].unique { score = 499 }
         }
-        if score > bestScore {
+        // statistics (9.54) only break a tie the rules leave: the fewer rows
+        let est = if c >= 0 && !hasIn { lv.est.eqRows(lv.t.indexes[c].tree, len(eqs)) } else { -1 }
+        if score > bestScore || (score == bestScore && score > 0 && est >= 0 && bestEst >= 0 && est < bestEst) {
             bestScore = score
+            bestEst = est
             best = Path{index: c, eqs: eqs, rng: rng, desc: false, noNulls: false, ins: ins, inSub: inSub, inArr: inArr}
         }
     }
@@ -4854,7 +4978,7 @@ fn allTrue(cs: &[]Expr, cols: &[]lexdb_sql.ColDef, row: &[]Val, params: &[]Val):
 fn newLevel(t: Table, alias: str, join: int, first: int): Level {
     return Level{t: t, alias: alias, join: join, first: first, path: Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: []}, cond: [],
                  post: [], local: [], perRow: true, hashCols: [], hashVals: [], src: -1, work: -1, lateral: false, need: [],
-                 lock: 0, lockWait: 0}
+                 lock: 0, lockWait: 0, keeps: false, est: noEst()}
 }
 
 // Plans a query over the tables of FROM (4.8): the tables are joined in the
@@ -4969,6 +5093,7 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
         lv.src = if viewSrc >= 0 { viewSrc } else { f.sub }
         lv.work = f.work
         lv.lateral = lateral
+        if f.sub < 0 && f.work < 0 { lv.est = try loadEst(st, txn, &lv.t) }
         append(mut &q.levels, lv)
         if len(subs) > 0 {
             // only its subqueries look here
@@ -5267,6 +5392,76 @@ fn tryRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Mats
     return Ok(1)
 }
 
+// The index-to-scan switch (9.53) is decided by counting, before any row is
+// read. An index entry costs about two reads (the entry, then its row by
+// primary key) and a scanned row one, so a scan is cheaper when the range
+// holds more than half the table. A range of at most SWITCH_ENTRIES entries
+// always takes the index (its keys are kept, so it is read once). A longer one
+// is counted up to n entries and the table up to 2n rows, n doubling, until one
+// of them ends; when the range ends first, the table is counted up to twice
+// the range. So a scan is chosen exactly when the table has at most twice the
+// range's entries, and the counting costs a small multiple of the path chosen.
+// The table is counted a leaf at a time. No statistics are needed.
+const SWITCH_ENTRIES: int = 1024
+
+// The table's rows, counted until there are more than most.
+fn countRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, most: int): Result[int, DbErr] {
+    var n = 0
+    let done = try st.scanLeaves(txn, t.tree, "", "", fn(leaf: &lexdb_page.Node, i: int, j: int): bool {
+        n += j - i
+        return n <= most
+    })
+    if !done {
+        // the transaction's own writes in the table (or a replica): entry by entry
+        n = 0
+        try st.scan(txn, t.tree, "", "", fn(en: &lexdb_store.Entry): bool {
+            n += 1
+            return n <= most
+        })
+    }
+    return Ok(n)
+}
+
+// 0: the index, keys holding its range's primary keys (the range ended within
+// SWITCH_ENTRIES, so it is read once); 2: the index, its range read again;
+// 1: a scan.
+fn indexOrScan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, p: &Path, sc: &Scan,
+               keys: mut &[]str): Result[int, DbErr] {
+    let tree = t.indexes[p.index].tree
+    var lim = SWITCH_ENTRIES
+    var from = sc.lo
+    var n = 0
+    var got: []str = []
+    while true {
+        var more = false
+        var last = ""
+        let first = lim == SWITCH_ENTRIES
+        try st.scan(txn, tree, from, sc.hi, fn(en: &lexdb_store.Entry): bool {
+            if n == lim {
+                more = true
+                return false
+            }
+            n += 1
+            last = en.key
+            if first { append(mut &got, en.val) }
+            return true
+        })
+        if !more {
+            if first {
+                for x in got { append(keys, x) }
+                return Ok(0)
+            }
+            // the range has n entries: a scan if the table has at most 2n rows
+            if try countRows(st, txn, t, 2 * n) <= 2 * n { return Ok(1) }
+            return Ok(2)
+        }
+        from = after(&last)
+        if try countRows(st, txn, t, 2 * lim) <= 2 * lim { return Ok(1) }
+        lim = lim * 2
+    }
+    return Ok(2)
+}
+
 // Joins the rows of level k on to the joined row (levels before k filled),
 // calling emit for each complete row; false: emit asked to stop.
 fn runLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Mats, k: int, row: mut &[]Val,
@@ -5368,15 +5563,58 @@ fn runLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Ma
                 scans = try pathScans(&lv.t, &lv.path, &env)
             }
         }
-        for sc in scans {
-            var cur = newCursor()
-            while !cur.done {
-                var batch: [][]Val = []
-                try fetch(st, txn, &lv.t, &lv.path, &sc, &lv.need, mut &cur, mut &batch)
-                for r in batch {
-                    let got = try tryRow(st, txn, q, m, k, &r, -1, row, params, emit, rs)
-                    if got < 0 { return Ok(false) }
-                    if got > 0 { matched = true }
+        // 9.53: the first table's index range may be run as a scan, decided by
+        // counting before any row is read (indexOrScan), so nothing returned
+        // needs skipping. Not for:
+        // - a path chosen for its order (ORDER BY, MIN/MAX);
+        // - a query run once per outer row (a correlated subquery, LATERAL):
+        //   a scan there would be paid per row;
+        // - a write, or any statement of a block that may write: a scan's read
+        //   is the whole table, checked at commit, so it would conflict with
+        //   every write to the table.
+        var keys: []str = []
+        var byKeys = false
+        if k == 0 && !lv.keeps && !rs.writes && !txn.tracked() && !txn.live && len(q.refs) == 0 && !(q.corr && pathCorr(&lv.path)) &&
+           len(scans) == 1 && lv.path.index >= 0 && len(lv.path.ins) == 0 && lv.path.inSub < 0 && len(lv.path.inArr) == 0 &&
+           !scans[0].point && !scans[0].empty && !scans[0].whole {
+            let how = try indexOrScan(st, txn, &lv.t, &lv.path, &scans[0], mut &keys)
+            if how == 1 {
+                scans = [Scan{empty: false, point: false, lo: "", hi: "", whole: true}]
+                rs.cnt[0].switched = 1
+            } else if how == 0 {
+                byKeys = true
+            }
+        }
+        if byKeys {
+            // the range's primary keys, already read: its rows, one by one
+            let t = &lv.t
+            let n = rowWidth(t)
+            let places = placesNeeded(t, &lv.need)
+            let missing = placesMissing(t)
+            let part = len(lv.need) > 0
+            for i in 0..len(keys) {
+                let got = if part { try st.getPart(txn, t.tree, keys[i]) } else { try st.get(txn, t.tree, keys[i]) }
+                match got {
+                    Some(rv) {
+                        let r = try rowOf(st, txn, t, &keys[i], &rv, n, &places, &missing)
+                        let g = try tryRow(st, txn, q, m, k, &r, -1, row, params, emit, rs)
+                        if g < 0 { return Ok(false) }
+                        if g > 0 { matched = true }
+                    }
+                    None { return Err(lexdb_base.corrupt("an index entry of \"" + t.name + "\" without its row")) }
+                }
+            }
+        } else {
+            for sc in scans {
+                var cur = newCursor()
+                while !cur.done {
+                    var batch: [][]Val = []
+                    try fetch(st, txn, &lv.t, &lv.path, &sc, &lv.need, mut &cur, mut &batch)
+                    for r in batch {
+                        let got = try tryRow(st, txn, q, m, k, &r, -1, row, params, emit, rs)
+                        if got < 0 { return Ok(false) }
+                        if got > 0 { matched = true }
+                    }
                 }
             }
         }
@@ -6031,6 +6269,7 @@ fn runChild(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params
     rs.maxHeld = parent.maxHeld
     rs.deadline = parent.deadline
     rs.batch = parent.batch
+    rs.writes = parent.writes
     rs.held = parent.held
     rs.ticks = parent.ticks
     rs.turnEnd = parent.turnEnd
@@ -6301,7 +6540,9 @@ fn pathText(lv: &Level): str {
     }
     let what = if len(p.eqs) == len(cols) { " lookup" } else if len(p.eqs) > 0 || len(p.rng) > 0 { " range" } else { " scan" }
     let filtered = if lv.t.indexes[p.index].pred.isSome() { " (filtered)" } else { "" }
-    return "index " + lexdb_sql.baseName(&lv.t.indexes[p.index].name) + filtered + what + (if p.desc { " backward" } else { "" })
+    let est = lv.est.eqRows(lv.t.indexes[p.index].tree, len(p.eqs))
+    let estText = if est >= 0 { " (estimated " + est.toStr() + " rows)" } else { "" }
+    return "index " + lexdb_sql.baseName(&lv.t.indexes[p.index].name) + filtered + what + (if p.desc { " backward" } else { "" }) + estText
 }
 
 // EXPLAIN: a line per table; with counts (EXPLAIN ANALYZE), what each did.
@@ -6323,6 +6564,7 @@ fn explainLines(q: &Query, cnt: &[]Counts): []str {
             if keepsLeft(q.levels[k].join) { append(mut &parts, "null rows " + c.nulls.toStr()) }
             if keepsRight(q.levels[k].join) { append(mut &parts, "unmatched rows " + c.unmatched.toStr()) }
             if c.batches > 0 { append(mut &parts, "batches " + c.batches.toStr()) }
+            if c.switched > 0 { append(mut &parts, "switched to scan: the range holds over half the table") }
             tail = " (" + strings.join(&parts, ", ") + ")"
         }
         let lv = &q.levels[k]
@@ -7466,6 +7708,7 @@ fn retype(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, chan
     var found: [][]Val = []
     var rs = newRun(&q)
     rs.limit(&lim)
+    rs.writes = true                // 9.53: a write keeps its index paths (its read set)
     let m = try prepare(st, txn, &q, &noParams, mut &rs)
     let room = rs.room()
     let max = rs.maxHeld
@@ -8254,6 +8497,7 @@ fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     endScope(mut &sc, mut &q)
     var rs = newRun(&q)
     rs.limit(&lim)
+    rs.writes = true                // 9.53: a write keeps its index paths (its read set)
     let m = try prepare(st, txn, &q, params, mut &rs)
     var kept: [][]Val = []
     var count = 0
@@ -8589,6 +8833,7 @@ fn update(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     var found: [][]Val = []
     var rs = newRun(&q)
     rs.limit(&lim)
+    rs.writes = true                // 9.53: a write keeps its index paths (its read set)
     var m = try prepare(st, txn, &q, params, mut &rs)
     let room = rs.room()
     let max = rs.maxHeld
@@ -8654,6 +8899,7 @@ fn delete(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     var found: [][]Val = []
     var rs = newRun(&q)
     rs.limit(&lim)
+    rs.writes = true                // 9.53: a write keeps its index paths (its read set)
     var m = try prepare(st, txn, &q, params, mut &rs)
     let room = rs.room()
     let max = rs.maxHeld
@@ -9146,6 +9392,7 @@ fn select(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
         Some(r) { if len(r) > 0 { ver = ver + "|s" + r } }
         None {}
     }
+    if txn.rules { ver = ver + "|rules" }                                           // SET lexdb_planner (9.54)
     if len(pc.sels) == 0 || pc.ver != ver {
         pc.sels = []
         var sc = newScope(params, ptypes)
@@ -10158,6 +10405,7 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         q.levels[0].path.index = setIndex
         q.levels[0].path.desc = setDesc
         q.levels[0].path.noNulls = setNoNulls
+        q.levels[0].keeps = true
     }
     // A grouped query: its aggregate calls become accumulators, and its
     // columns must be grouped.
@@ -11029,6 +11277,7 @@ pub type Session = record {
     savedPath: [][]str          // in a transaction block: the path at its BEGIN
     id: int                     // its number while the store is open (its sequences' currval: 9.43)
     batch: bool                 // SET lexdb_batch (9.47)
+    rules: bool                 // SET lexdb_planner = rules: no statistics in planning (9.54)
     saves: []SavePt             // the open block's savepoints, oldest first (9.80)
     savedRoles: []str           // in a transaction block: SET ROLE's and SET SESSION AUTHORIZATION's at its BEGIN (9.83)
     custom: []str               // the settings with a dot in their names (SET my.x, set_config): "name\x00value" (9.92)
@@ -11109,6 +11358,7 @@ fn (s: &Session) setUp(t: mut &lexdb_store.Txn) {
     t.tmp = s.tmp
     t.sess = s.id
     t.zone = s.zone
+    t.rules = s.rules
 }
 
 // A transaction ended without committing: if it changed temporary objects'
@@ -11155,6 +11405,8 @@ fn (s: &Session) setting(name: &str): Option[str] {
         "max_identifier_length" { return Some("63") }
         "application_name" { return Some("") }
         "bytea_output" { return Some("hex") }
+        "lexdb_planner" { return Some(if s.rules { "rules" } else { "cost" }) }
+        "lexdb_batch" { return Some(if s.batch { "on" } else { "off" }) }
         else {}
     }
     let k = strings.toLowerAscii(name)
@@ -11171,7 +11423,7 @@ const SHOWN: []str = ["search_path", "max_recursion", "statement_timeout", "max_
                       "transaction_read_only", "default_transaction_read_only", "in_hot_standby", "server_version",
                       "server_version_num", "server_encoding", "client_encoding", "datestyle", "timezone", "log_timezone",
                       "intervalstyle", "lc_collate", "lc_ctype", "lc_messages", "lc_monetary", "lc_numeric", "lc_time",
-                      "max_identifier_length", "application_name", "bytea_output", "lexdb_batch"]
+                      "max_identifier_length", "application_name", "bytea_output", "lexdb_batch", "lexdb_planner"]
 
 // The session's settings for current_setting and set_config (9.92), in the
 // memo while a statement calling them runs: a line each, name TAB value.
@@ -11299,7 +11551,7 @@ fn (s: &Session) show(name: &str): Result[Res, DbErr] {
 // lexdb_wire): no id of its own, never run.
 pub fn parkedSession(st: lexdb_store.Store): Session {
     return Session{st: st, txn: [], failed: false, maxRecursion: MAX_RECURSION, timeoutMs: 0, maxMem: MAX_STATEMENT_MEM,
-                   saved: [], readOnly: false, path: [], pathAt: 0, savedPath: [], id: 0, batch: true, saves: [], savedRoles: [],
+                   saved: [], readOnly: false, path: [], pathAt: 0, savedPath: [], id: 0, batch: true, rules: false, saves: [], savedRoles: [],
                    custom: [], savedCustom: [], localUndo: [], zone: lexdb_time.utc(), savedZone: [], tmp: "", onCommit: []}
 }
 
@@ -11313,7 +11565,7 @@ pub fn newSession(st: lexdb_store.Store): Session {
     let id = num(&st.memoGet(&"sessions").unwrapOr("0")) + 1
     st.memoPut(&"sessions", &id.toStr())
     return Session{st: st, txn: [], failed: false, maxRecursion: MAX_RECURSION, timeoutMs: 0, maxMem: MAX_STATEMENT_MEM,
-                   saved: [], readOnly: false, path: [], pathAt: 0, savedPath: [], id: id, batch: true, saves: [], savedRoles: [],
+                   saved: [], readOnly: false, path: [], pathAt: 0, savedPath: [], id: id, batch: true, rules: false, saves: [], savedRoles: [],
                    custom: [], savedCustom: [], localUndo: [], zone: lexdb_time.utc(), savedZone: [], tmp: "", onCommit: []}
 }
 
@@ -11343,12 +11595,13 @@ fn (s: mut &Session) restore() {
     s.maxMem = l.mem
     s.timeoutMs = l.deadline                // saved there: the timeout in ms
     s.batch = l.batch
+    s.rules = l.rules
 }
 
 // The limits for a statement starting now.
 fn (s: &Session) limits(): Limits {
     let dl = if s.timeoutMs > 0 { time.monotonicNs() + s.timeoutMs * 1000000 } else { 0 }
-    return Limits{rounds: s.maxRecursion, mem: s.maxMem, deadline: dl, batch: s.batch}
+    return Limits{rounds: s.maxRecursion, mem: s.maxMem, deadline: dl, batch: s.batch, rules: s.rules}
 }
 
 // A setting's value: a number (statement_timeout in ms, max_statement_mem
@@ -11480,6 +11733,7 @@ fn (s: mut &Session) resetAll() {
     s.timeoutMs = 0
     s.maxMem = MAX_STATEMENT_MEM
     s.batch = true
+    s.rules = false
 }
 
 // Whether a statement a READ ONLY block refuses writes only temporary
@@ -11506,7 +11760,7 @@ fn isWrite(kind: int): bool {
            kind == lexdb_sql.S_CREATE_VIEW || kind == lexdb_sql.S_DROP_VIEW || kind == lexdb_sql.S_ALTER_VIEW ||
            kind == lexdb_sql.S_GRANT || kind == lexdb_sql.S_REVOKE || kind == lexdb_sql.S_OWNER ||
            kind == lexdb_sql.S_CREATE_TYPE || kind == lexdb_sql.S_DROP_TYPE || kind == lexdb_sql.S_ALTER_TYPE ||
-           kind == lexdb_sql.S_TRUNCATE
+           kind == lexdb_sql.S_TRUNCATE || kind == lexdb_sql.S_ANALYZE
 }
 
 fn stmtName(kind: int): str {
@@ -11516,6 +11770,7 @@ fn stmtName(kind: int): str {
         lexdb_sql.S_INSERT { "INSERT" }
         lexdb_sql.S_UPDATE { "UPDATE" }
         lexdb_sql.S_CREATE_INDEX { "CREATE INDEX" }
+        lexdb_sql.S_ANALYZE { "ANALYZE" }
         lexdb_sql.S_DROP_INDEX { "DROP INDEX" }
         lexdb_sql.S_CREATE_SCHEMA { "CREATE SCHEMA" }
         lexdb_sql.S_DROP_SCHEMA { "DROP SCHEMA" }
@@ -11594,6 +11849,7 @@ fn execStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
         lexdb_sql.S_UPDATE { return update(st, txn, s, params, lim) }
         lexdb_sql.S_DELETE { return delete(st, txn, s, params, lim) }
         lexdb_sql.S_CREATE_INDEX { return createIndex(st, txn, s) }
+        lexdb_sql.S_ANALYZE { return analyzeStmt(st, txn, s) }
         lexdb_sql.S_DROP_INDEX { return dropIndex(st, txn, s) }
         lexdb_sql.S_CREATE_SCHEMA { return createSchemaStmt(st, txn, s) }
         lexdb_sql.S_CREATE_ROLE, lexdb_sql.S_ALTER_ROLE, lexdb_sql.S_DROP_ROLE { return roleStmt(st, txn, s) }
@@ -11762,6 +12018,25 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
             }
             if stmt.table == "all" {
                 s.resetAll()
+            } else if stmt.table == "lexdb_planner" {
+                // cost (the default): statistics from ANALYZE break the rules'
+                // ties; rules: they are not read (9.54)
+                var rules = false                   // DEFAULT, RESET
+                match stmt.limit {
+                    Some(x) {
+                        let noCols: []lexdb_sql.ColDef = []
+                        let none: []Val = []
+                        let noSubs: []SubRes = []
+                        let env = Env{cols: &noCols, row: &none, aggs: &none, params: params, subs: &noSubs, cur: &none, seq: None}
+                        let v = match try eval(&x, &env) { Val.Text(t) { strings.toLowerAscii(t) } else { "" } }
+                        if v == "rules" { rules = true } else if v != "cost" {
+                            return Err(e("22023", "invalid value for parameter \"lexdb_planner\": use cost or rules"))
+                        }
+                    }
+                    None {}
+                }
+                s.rules = rules
+                if len(s.txn) > 0 { s.txn[0].rules = rules }
             } else if stmt.table == "lexdb_batch" {
                 var on = true                       // DEFAULT, RESET
                 match stmt.limit {
@@ -11808,7 +12083,7 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
                 s.readOnly = stmt.ifFlag
                 s.failed = false
                 s.saves = []
-                s.saved = [Limits{rounds: s.maxRecursion, mem: s.maxMem, deadline: s.timeoutMs, batch: s.batch}]
+                s.saved = [Limits{rounds: s.maxRecursion, mem: s.maxMem, deadline: s.timeoutMs, batch: s.batch, rules: s.rules}]
                 var p: []str = []
                 for n in s.path { append(mut &p, n) }
                 s.savedPath = [p]
@@ -11823,6 +12098,7 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
                 s.txn[0].tmp = s.tmp
                 s.txn[0].sess = s.id
                 s.txn[0].zone = s.zone
+                s.txn[0].rules = s.rules
             }
             return Ok(tagOnly("BEGIN"))
         }
