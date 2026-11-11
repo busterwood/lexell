@@ -306,6 +306,10 @@ pub const S_ROLLBACK_TO = 43    // ROLLBACK [WORK | TRANSACTION] TO [SAVEPOINT] 
 pub const S_CREATE_ROLE = 44    // CREATE ROLE | USER name [WITH] options (9.81): its name in table, options in names
 pub const S_ALTER_ROLE = 45     // ALTER ROLE | USER name [WITH] options | RENAME TO new
 pub const S_DROP_ROLE = 46      // DROP ROLE | USER [IF EXISTS] name, ...: the names in names
+pub const S_CREATE_VIEW = 47    // CREATE [OR REPLACE] VIEW name [(cols)] AS query (9.82): name in table, columns in names,
+                                // the query's text in index, OR REPLACE in ifFlag
+pub const S_DROP_VIEW = 48      // DROP VIEW [IF EXISTS] name, ... [CASCADE]: the names in cols
+pub const S_ALTER_VIEW = 49     // ALTER VIEW [IF EXISTS] name RENAME TO new: the new name in index
 
 // COPY's options (Stmt.copy).
 pub type CopyOpts = record {
@@ -700,6 +704,7 @@ type P = record {
     depth: int          // subqueries deep
     seqs: []str         // the sequences named by nextval, currval and setval so far
     wins: []WinDef      // the window calls of the query being parsed (9.46)
+    src: str            // the SQL text (a view keeps its query's, 9.82)
 }
 
 // A CTE: kept as its text (where its tokens start), parsed again as a
@@ -1252,6 +1257,33 @@ fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
     }
     let t = p.next()
     if t.kind == T_IDENT && t.text == "case" { return p.caseExpr() }
+    if t.kind == T_IDENT && t.text == "trim" && p.isKw("(") {
+        // trim([LEADING | TRAILING | BOTH] [chars] FROM x), or trim(x [, chars]):
+        // ltrim, rtrim or btrim of x and chars (9.82)
+        p.pos += 1
+        var f = "btrim"
+        var std = false
+        if p.acceptKw("leading") { f = "ltrim"; std = true } else if p.acceptKw("trailing") { f = "rtrim"; std = true } else if p.acceptKw("both") { std = true }
+        var chars: []Expr = []
+        if !p.isKw("from") {
+            let first = try p.expr()
+            if p.acceptKw("from") {
+                let x = try p.expr()
+                try p.expectKw(")")
+                return Ok(Expr.Call(f, [x, first], false))
+            }
+            if std { return Err(near(&p.peek())) }
+            // trim(x [, chars])
+            var args: []Expr = [first]
+            while p.acceptKw(",") { append(mut &args, try p.expr()) }
+            try p.expectKw(")")
+            return Ok(Expr.Call("btrim", args, false))
+        }
+        try p.expectKw("from")
+        let x = try p.expr()
+        try p.expectKw(")")
+        return Ok(Expr.Call(f, [x], false))
+    }
     if t.kind == T_IDENT && (t.text == "current_user" || t.text == "session_user" || t.text == "user" || t.text == "current_role" ||
                              t.text == "current_schema" || t.text == "current_catalog") && !p.isKw("(") && !p.isKw(".") {
         append(mut &p.seqs, CAT_MARK)
@@ -2096,6 +2128,49 @@ fn (p: mut &P) intersects(first: Stmt): Result[Stmt, lexdb_base.DbErr] {
     return Ok(lhs)
 }
 
+// CREATE [OR REPLACE] VIEW name [(column, ...)] AS query, after "view":
+// the query is parsed to check it, and kept as its text (from its first
+// token to the statement's end), to be parsed again where it is used (9.82).
+fn (p: mut &P) createView(orReplace: bool): Result[Stmt, lexdb_base.DbErr] {
+    var v = newStmt(S_CREATE_VIEW)
+    v.ifFlag = orReplace
+    v.table = try p.qname()
+    if p.acceptKw("(") {
+        while true {
+            append(mut &v.names, try p.name())
+            if !p.acceptKw(",") { break }
+        }
+        try p.expectKw(")")
+    }
+    if p.isKw("with") { return Err(lexdb_base.err("0A000", "lexdb: view options (WITH (...)) are not supported")) }
+    try p.expectKw("as")
+    let start = p.peek().at
+    let t = p.next()
+    var q = newStmt(S_SELECT)
+    if t.kind == T_IDENT && t.text == "select" {
+        q = try p.select()
+    } else if t.kind == T_IDENT && t.text == "values" {
+        q = try p.valuesQuery()
+        try p.orderLimit(mut &q)
+    } else if t.kind == T_IDENT && t.text == "with" {
+        let n = try p.withList()
+        try p.expectKw("select")
+        q = try p.select()
+        p.popCtes(n)
+    } else {
+        return Err(near(&t))
+    }
+    let end = p.peek().at
+    if p.isKw("with") { return Err(lexdb_base.err("0A000", "lexdb: WITH CHECK OPTION is not supported")) }
+    v.index = strings.trim(&p.src[start..end]).toStr()
+    // the query's subqueries were parsed into the statement's: dropped (the
+    // text is parsed again where the view is used)
+    p.subs = []
+    p.wins = []
+    if q.params > 0 || p.params > 0 { return Err(lexdb_base.err("42P02", "there is no parameter $1")) }
+    return Ok(v)
+}
+
 // A role's options, after its name: [WITH] LOGIN, NOLOGIN, SUPERUSER,
 // NOSUPERUSER, [ENCRYPTED] PASSWORD 'text' | NULL into s.names ("login",
 // "nologin", "superuser", "nosuperuser", "password:" and the text,
@@ -2394,7 +2469,6 @@ fn (p: mut &P) fromItem(join: int): Result[FromItem, lexdb_base.DbErr] {
         let i = try p.cteRef(ci)
         return Ok(FromItem{table: table, alias: alias, join: join, on: None, sub: i, cols: cols, work: -1, lateral: false})
     }
-    if len(cols) > 0 { return Err(lexdb_base.err("0A000", "column aliases for a table are not supported")) }
     return Ok(FromItem{table: table, alias: alias, join: join, on: None, sub: -1, cols: cols, work: -1, lateral: false})
 }
 
@@ -2823,6 +2897,18 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
         }
         "insert" { return p.insert() }
         "alter" {
+            if p.acceptKw("view") {
+                var v = newStmt(S_ALTER_VIEW)
+                if p.acceptKw("if") {
+                    try p.expectKw("exists")
+                    v.ifFlag = true
+                }
+                v.table = try p.qname()
+                if !p.acceptKw("rename") { return Err(lexdb_base.err("0A000", "lexdb: ALTER VIEW supports RENAME TO only")) }
+                try p.expectKw("to")
+                v.index = try p.name()
+                return Ok(v)
+            }
             if p.acceptKw("table") { return p.alterTable() }
             if p.acceptKw("role") || p.acceptKw("user") {
                 var r = newStmt(S_ALTER_ROLE)
@@ -2866,6 +2952,13 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
         "delete" { return p.delete() }
         "copy" { return p.copyStmt() }
         "create" {
+            var orReplace = false
+            if p.isKw("or") && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "replace" {
+                p.pos += 2
+                orReplace = true
+                if !p.isKw("view") { return Err(lexdb_base.err("0A000", "lexdb: CREATE OR REPLACE is supported for views only")) }
+            }
+            if p.acceptKw("view") { return p.createView(orReplace) }
             if p.acceptKw("table") { return p.createTable() }
             if p.isKw("role") || p.isKw("user") {
                 let user = p.next().text == "user"
@@ -2910,6 +3003,19 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
             return Ok(s)
         }
         "drop" {
+            if p.acceptKw("view") {
+                var v = newStmt(S_DROP_VIEW)
+                if p.acceptKw("if") {
+                    try p.expectKw("exists")
+                    v.ifFlag = true
+                }
+                while true {
+                    append(mut &v.cols, colDef(try p.qname(), TypeName{kind: K_TEXT, oid: OID_TEXT, prec: 0, scale: 0, len: 0}, false))
+                    if !p.acceptKw(",") { break }
+                }
+                if p.acceptKw("cascade") { v.cascade = true } else { let r = p.acceptKw("restrict") }
+                return Ok(v)
+            }
             if p.acceptKw("role") || p.acceptKw("user") {
                 var r = newStmt(S_DROP_ROLE)
                 if p.acceptKw("if") {
@@ -3084,7 +3190,7 @@ fn (p: mut &P) skipToEnd() {
 // highest $n in each.
 pub fn parse(sql: &str): Result[[]Stmt, lexdb_base.DbErr] {
     let toks = try lex(sql)
-    var p = P{toks: toks, pos: 0, params: 0, subs: [], ctes: [], nextCte: 0, inCte: [], depth: 0, seqs: [], wins: []}
+    var p = P{toks: toks, pos: 0, params: 0, subs: [], ctes: [], nextCte: 0, inCte: [], depth: 0, seqs: [], wins: [], src: sql.toStr()}
     var out: []Stmt = []
     while true {
         p.params = 0
@@ -3262,7 +3368,7 @@ pub fn exprText(x: &Expr): str {
 // One expression and nothing after it.
 pub fn parseExpr(sql: &str): Result[Expr, lexdb_base.DbErr] {
     let toks = try lex(sql)
-    var p = P{toks: toks, pos: 0, params: 0, subs: [], ctes: [], nextCte: 0, inCte: [], depth: 0, seqs: [], wins: []}
+    var p = P{toks: toks, pos: 0, params: 0, subs: [], ctes: [], nextCte: 0, inCte: [], depth: 0, seqs: [], wins: [], src: sql.toStr()}
     let x = try p.expr()
     let t = p.peek()
     if t.kind != T_EOF { return Err(near(&t)) }

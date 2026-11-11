@@ -1,0 +1,70 @@
+// lexdb_exec: what lexdb's views do that PostgreSQL's do not (design/lexdb.md
+// 9.82), so written by hand: INSERT, UPDATE and DELETE on a view refused
+// (no updatable views); a table, or a column, that a view reads not
+// renamed or dropped under it, as its text names them (2BP01); ALTER VIEW
+// RENAME, refused while another view reads the view; a view's text as
+// written (pg_get_viewdef, pg_views); a view that reads itself refused.
+// expect: CREATE TABLE
+// expect: INSERT 0 3
+// expect: CREATE VIEW
+// expect: CREATE VIEW
+// expect: ERROR 0A000
+// expect: ERROR 0A000
+// expect: ERROR 0A000
+// expect: ERROR 2BP01
+// expect: ERROR 2BP01
+// expect: ERROR 2BP01
+// expect: ALTER TABLE
+// expect: x;y
+// expect: ERROR 2BP01
+// expect: ALTER VIEW
+// expect: x;y
+// expect: select a from v;|select id, a from t where b > 5;
+// expect: select id, a from t where b > 5;
+// expect: ERROR 42809
+// expect: CREATE VIEW
+// expect: ERROR 42P17
+// expect: DROP VIEW
+// expect: ERROR 2BP01
+// expect: DROP VIEW
+// expect: ALTER TABLE
+// expect: x;y;z
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+
+const QUERIES = "create table t (id int primary key, a text, b int)\ninsert into t values (1, 'x', 10), (2, 'y', 20), (3, 'z', 1)\ncreate view v as select id, a from t where b > 5\ncreate view w as select a from v\ninsert into v values (3, 'z')\nupdate v set a = 'q'\ndelete from v\nalter table t rename column a to aa\nalter table t rename to t2\nalter table t drop column b\nalter table t add column c int\nselect * from w order by a\nalter view v rename to v2\nalter view w rename to w2\nselect * from w2 order by 1\nselect pg_get_viewdef('w2'), pg_get_viewdef('v'::regclass)\nselect definition from pg_views where viewname = 'v'\nalter table v add column z int\ncreate view r1 as select 1 as x\ncreate or replace view r1 as select x from r1\ndrop view w2\nalter table t rename column a to aa\ndrop view v\nalter table t rename column a to aa\nselect aa from t order by id"
+
+fn show(s: mut &lexdb_exec.Session, q: &str): str {
+    match s.exec(q) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if !r.hasRows { return r.tag }
+            var rows: []str = []
+            for row in r.rows {
+                var cells: []str = []
+                for v in row { append(mut &cells, lexdb_exec.text(&v)) }
+                append(mut &rows, strings.join(&cells, "|"))
+            }
+            // psql shows a statement's tag after its RETURNING rows, not a SELECT's
+            if r.tag != "" && !strings.startsWith(r.tag, "SELECT") && r.tag != "SHOW" { append(mut &rows, r.tag) }
+            return strings.join(&rows, ";")
+        }
+        Err(e) { return "ERROR " + e.state }
+    }
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    var s = lexdb_exec.newSession(st)
+    let text: str = QUERIES
+    for q in strings.lines(&text) { println(show(mut &s, &q)) }
+    s.close()
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(82), lexdb_store.Options{cacheBytes: 16 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024,
+                                                           snapNodes: 50000, bufferedPages: false}, body).unwrap()
+}

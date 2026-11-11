@@ -69,6 +69,10 @@ pub type Table = record {
     // column is added, dropped or retyped, and rows are not rewritten.
     layouts: [][]byte
     lays: []FixedLay            // where each layout's places are (layOfKinds), not stored
+    // A view (9.82): its query's text ("" a table), and the catalog keys of
+    // the relations it reads; its cols are its output columns.
+    pub view: str
+    pub deps: []str
 }
 
 // A foreign key: cols of its table hold a key of table ref, refCols (a
@@ -83,7 +87,8 @@ pub type ForeignKey = record {
 }
 
 fn emptyTable(name: str): Table {
-    return Table{name: name, tree: 0, cols: [], pk: [], indexes: [], slots: [], width: 0, checks: [], fks: [], refBy: [], layouts: [], lays: []}
+    return Table{name: name, tree: 0, cols: [], pk: [], indexes: [], slots: [], width: 0, checks: [], fks: [], refBy: [], layouts: [], lays: [],
+                 view: "", deps: []}
 }
 
 // A CHECK constraint: a row may not make expr false (column names bare).
@@ -2713,6 +2718,7 @@ fn strsLen(xs: &[]str): int {
 }
 
 fn decTable(name: str, s: &str): Result[Table, DbErr] {
+    if strings.startsWith(s, VIEW_MARK) { return Ok(decView(name, s)) }
     var t = emptyTable(name)
     t.tree = binary.readU32LEStr(s, 0)
     let n = binary.readU32LEStr(s, 4)
@@ -2913,7 +2919,10 @@ fn findTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, name: &str): Res
 
 fn needTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, name: &str): Result[Table, DbErr] {
     match try findTable(st, txn, name) {
-        Some(t) { return Ok(t) }
+        Some(t) {
+            if len(t.view) > 0 { return Err(e("42809", "\"" + lexdb_sql.shown(name) + "\" is a view")) }
+            return Ok(t)
+        }
         None { return Err(e("42P01", "relation \"" + lexdb_sql.shown(name) + "\" does not exist")) }
     }
 }
@@ -3997,11 +4006,14 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
     // LATERAL subquery sees the tables before it, another none of them
     append(mut &sc.frames, Frame{cols: [], refs: [], refOids: [], subRefs: [], subOids: [], subNames: [], hidden: false})
     let me = len(sc.frames) - 1
+    var views: []SubPlan = []              // the views read, planned (9.82)
     for f in from {
         for lv in q.levels {
             if lv.alias == f.alias { return Err(e("42712", "table name \"" + f.alias + "\" specified more than once")) }
         }
-        var t = Table{name: f.alias, tree: -1, cols: [], pk: [], indexes: [], slots: [], width: 0, checks: [], fks: [], refBy: [], layouts: [], lays: []}
+        var viewSrc = -1
+        var t = Table{name: f.alias, tree: -1, cols: [], pk: [], indexes: [], slots: [], width: 0, checks: [], fks: [], refBy: [], layouts: [], lays: [],
+                      view: "", deps: []}
         var lateral = false
         if f.sub >= 0 {
             sc.frames[me].hidden = !f.lateral
@@ -4037,7 +4049,39 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
                 append(mut &t.cols, lexdb_sql.colDef(name, sc.works[w].cols[i].typ, false))
             }
         } else {
-            t = try needTable(st, txn, &f.table)
+            let found = try findTable(st, txn, &f.table)
+            if found.isNone() { return Err(e("42P01", "relation \"" + lexdb_sql.shown(&f.table) + "\" does not exist")) }
+            t = found.unwrap()
+            if len(t.view) > 0 {
+                // a view: its query planned as a subquery in FROM (9.82),
+                // its plan after the statement's own subqueries
+                if len(sc.frames) > 64 { return Err(e("42P17", "infinite recursion detected in rules for relation \"" + lexdb_sql.shown(&f.table) + "\"")) }
+                let vs = try viewQuery(&t)
+                sc.frames[me].hidden = true
+                let planning = planSub(st, txn, &vs, params, sc)
+                sc.frames[me].hidden = false
+                let sp = try planning
+                if len(f.cols) > len(t.cols) {
+                    return Err(e("42P10", "table \"" + f.alias + "\" has " + len(t.cols).toStr() + " columns available but " +
+                                 len(f.cols).toStr() + " columns specified"))
+                }
+                var vt = Table{name: f.alias, tree: -1, cols: [], pk: [], indexes: [], slots: [], width: 0, checks: [], fks: [], refBy: [], layouts: [], lays: [],
+                               view: "", deps: []}
+                for i in 0..len(sp.sel.outs) {
+                    let name = if i < len(f.cols) { f.cols[i] } else if i < len(t.cols) { t.cols[i].name } else { sp.sel.outs[i].name }
+                    append(mut &vt.cols, lexdb_sql.colDef(name, oidType(sp.sel.outs[i].oid), false))
+                }
+                viewSrc = len(subs) + len(views)
+                append(mut &views, sp)
+                t = vt
+            } else if len(f.cols) > 0 {
+                // t AS x(a, b): its first columns named so
+                if len(f.cols) > len(t.cols) {
+                    return Err(e("42P10", "table \"" + f.alias + "\" has " + len(t.cols).toStr() + " columns available but " +
+                                 len(f.cols).toStr() + " columns specified"))
+                }
+                for i in 0..len(f.cols) { t.cols[i].name = f.cols[i] }
+            }
         }
         let first = len(q.cols)
         for k in 0..len(t.cols) {
@@ -4048,7 +4092,7 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
             append(mut &q.cols, lexdb_sql.colDef(f.alias + "." + name, t.cols[k].typ, t.cols[k].notNull))
         }
         var lv = newLevel(t, f.alias, f.join, first)
-        lv.src = f.sub
+        lv.src = if viewSrc >= 0 { viewSrc } else { f.sub }
         lv.work = f.work
         lv.lateral = lateral
         append(mut &q.levels, lv)
@@ -4068,6 +4112,17 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
         append(mut &sc.frames[top].subNames, sp.name)
         if len(sp.sel.q.refs) > 0 { q.corr = true }
         append(mut &q.subs, sp)
+    }
+    // the views' plans, numbered after the statement's subqueries
+    var later: []SubPlan = []
+    while len(views) > 0 { append(mut &later, pop(mut &views)) }
+    while len(later) > 0 {
+        let vp = pop(mut &later)
+        let top = len(sc.frames) - 1
+        append(mut &sc.frames[top].subRefs, [])
+        append(mut &sc.frames[top].subOids, vp.oid)
+        append(mut &sc.frames[top].subNames, vp.name)
+        append(mut &q.subs, vp)
     }
     let nl = len(q.levels)
     // A RIGHT or FULL JOIN can make the columns before it NULL: no WHERE
@@ -5481,6 +5536,8 @@ fn createTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
 fn dropTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
     match try findTable(st, txn, &s.table) {
         Some(t) {
+            if len(t.view) > 0 { return Err(e("42809", "\"" + lexdb_sql.shown(&s.table) + "\" is not a table (use DROP VIEW)")) }
+            try dropDependentViews(st, txn, &t.name, s.cascade, &"table")
             var d = t
             try unlinkTable(st, txn, mut &d, s.cascade)
             try dropOwnedSeqs(st, txn, &d, &"")
@@ -5874,6 +5931,23 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         if s.ifFlag { return Ok(tagOnly("ALTER TABLE")) }
         return Err(e("42P01", "relation \"" + lexdb_sql.shown(&s.table) + "\" does not exist"))
     }
+    match found {
+        Some(ft) {
+            if len(ft.view) > 0 { return Err(e("42809", "\"" + lexdb_sql.shown(&s.table) + "\" is a view (use ALTER VIEW)")) }
+            // a view keeps its query's text: names it reads may not change under it
+            for a in s.alters {
+                if a.kind == lexdb_sql.A_RENAME || a.kind == lexdb_sql.A_RENAME_COL || a.kind == lexdb_sql.A_DROP_COL ||
+                   a.kind == lexdb_sql.A_TYPE || a.kind == lexdb_sql.A_SET_SCHEMA {
+                    let deps = try dependentViews(st, txn, &ft.name)
+                    if len(deps) > 0 {
+                        return Err(e("2BP01", "cannot alter table " + lexdb_sql.shown(&ft.name) + " because view " +
+                                     lexdb_sql.shown(&deps[0]) + " depends on it (lexdb keeps a view's text: drop the view, then make it again)"))
+                    }
+                }
+            }
+        }
+        None {}
+    }
     var t = found.unwrap()
     // TYPE actions are done together, after the others, by the names then
     var types: []int = []
@@ -6073,9 +6147,15 @@ fn dropSchema(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
     for k in keys {
         match try byKeyOpt(st, txn, &k) {
             Some(t) {
-                var d = t
-                try unlinkTable(st, txn, mut &d, true)
-                dropOne(txn, &d)
+                if len(t.view) > 0 {
+                    try dropDependentViews(st, txn, &t.name, true, &"view")
+                    txn.del(CATALOG, t.name)
+                } else {
+                    var d = t
+                    try dropDependentViews(st, txn, &d.name, true, &"table")
+                    try unlinkTable(st, txn, mut &d, true)
+                    dropOne(txn, &d)
+                }
             }
             None {}
         }
@@ -6371,6 +6451,7 @@ fn dupKey(t: &Table, row: &[]Val): DbErr {
 }
 
 fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, lim: Limits): Result[Res, DbErr] {
+    try notView(st, txn, &s.table, &"insert into")
     let sqe = seqEnv(st, txn)
     let t = try needTable(st, txn, &s.table)
     var targets: []int = []
@@ -6712,6 +6793,7 @@ fn storeRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, row: [
 }
 
 fn update(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, lim: Limits): Result[Res, DbErr] {
+    try notView(st, txn, &s.table, &"update")
     let sqe = seqEnv(st, txn)
     var sc = newScope(params, &[])
     var q = try buildQuery(st, txn, &oneTable(&s.table), &s.where, params, &s.subs, mut &sc)
@@ -6765,6 +6847,7 @@ fn update(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
 }
 
 fn delete(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, lim: Limits): Result[Res, DbErr] {
+    try notView(st, txn, &s.table, &"delete from")
     var sc = newScope(params, &[])
     var q = try buildQuery(st, txn, &oneTable(&s.table), &s.where, params, &s.subs, mut &sc)
     var ret = try retOf(s, &q, mut &sc)
@@ -6958,7 +7041,7 @@ pub fn exprOid(x: &Expr, cols: &[]lexdb_sql.ColDef, ptypes: &[]int): int {
                 "sqrt", "cbrt", "exp", "ln", "log10", "power", "pow", "random" { return lexdb_sql.OID_FLOAT8 }
                 "format_type", "pg_get_expr", "pg_get_constraintdef", "pg_get_indexdef", "pg_get_serial_sequence", "quote_ident",
                 "array_to_string", "obj_description", "col_description", "shobj_description", "pg_get_viewdef", "json_build_object",
-                "jsonb_build_object", "pg_get_userbyid", "repeat", "pg_get_triggerdef", "pg_get_statisticsobjdef_columns",
+                "jsonb_build_object", "pg_get_userbyid", "repeat", "pg_get_triggerdef", "pg_get_ruledef", "pg_get_statisticsobjdef_columns",
                 "pg_get_function_result", "pg_get_function_arguments" {
                     return lexdb_sql.OID_TEXT
                 }
@@ -8743,7 +8826,8 @@ fn isWrite(kind: int): bool {
            kind == lexdb_sql.S_DROP_INDEX || kind == lexdb_sql.S_CREATE_SCHEMA || kind == lexdb_sql.S_DROP_SCHEMA ||
            kind == lexdb_sql.S_ALTER || kind == lexdb_sql.S_ALTER_INDEX || kind == lexdb_sql.S_ALTER_SCHEMA ||
            kind == lexdb_sql.S_CREATE_SEQ || kind == lexdb_sql.S_ALTER_SEQ || kind == lexdb_sql.S_DROP_SEQ ||
-           kind == lexdb_sql.S_CREATE_ROLE || kind == lexdb_sql.S_ALTER_ROLE || kind == lexdb_sql.S_DROP_ROLE
+           kind == lexdb_sql.S_CREATE_ROLE || kind == lexdb_sql.S_ALTER_ROLE || kind == lexdb_sql.S_DROP_ROLE ||
+           kind == lexdb_sql.S_CREATE_VIEW || kind == lexdb_sql.S_DROP_VIEW || kind == lexdb_sql.S_ALTER_VIEW
 }
 
 fn stmtName(kind: int): str {
@@ -8757,6 +8841,9 @@ fn stmtName(kind: int): str {
         lexdb_sql.S_CREATE_SCHEMA { "CREATE SCHEMA" }
         lexdb_sql.S_DROP_SCHEMA { "DROP SCHEMA" }
         lexdb_sql.S_CREATE_ROLE { "CREATE ROLE" }
+        lexdb_sql.S_CREATE_VIEW { "CREATE VIEW" }
+        lexdb_sql.S_DROP_VIEW { "DROP VIEW" }
+        lexdb_sql.S_ALTER_VIEW { "ALTER VIEW" }
         lexdb_sql.S_ALTER_ROLE { "ALTER ROLE" }
         lexdb_sql.S_DROP_ROLE { "DROP ROLE" }
         lexdb_sql.S_ALTER { "ALTER TABLE" }
@@ -8821,6 +8908,9 @@ fn execStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
         lexdb_sql.S_DROP_INDEX { return dropIndex(st, txn, s) }
         lexdb_sql.S_CREATE_SCHEMA { return createSchemaStmt(st, txn, s) }
         lexdb_sql.S_CREATE_ROLE, lexdb_sql.S_ALTER_ROLE, lexdb_sql.S_DROP_ROLE { return roleStmt(st, txn, s) }
+        lexdb_sql.S_CREATE_VIEW { return createView(st, txn, s) }
+        lexdb_sql.S_DROP_VIEW { return dropView(st, txn, s) }
+        lexdb_sql.S_ALTER_VIEW { return alterView(st, txn, s) }
         lexdb_sql.S_DROP_SCHEMA { return dropSchema(st, txn, s) }
         lexdb_sql.S_ALTER { return alterTable(st, txn, s, lim) }
         lexdb_sql.S_ALTER_INDEX { return alterIndex(st, txn, s) }
@@ -13180,6 +13270,7 @@ type CatCon = record {
 
 type CatSnap = record {
     tabs: []CatTab
+    views: []CatTab         // views (9.82): t.view their text, t.cols their columns
     cons: []CatCon
     seqs: []Seq
     schemas: []str          // public and those made
@@ -13336,12 +13427,17 @@ fn catSnap(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[CatSnap, D
         append(mut &raw, en.val)
         return true
     })
-    var snap = CatSnap{tabs: [], cons: [], seqs: try allSeqs(st, txn, &""), schemas: schemas, path: copyStrs(&txn.path),
+    var snap = CatSnap{tabs: [], views: [], cons: [], seqs: try allSeqs(st, txn, &""), schemas: schemas, path: copyStrs(&txn.path),
                        user: st.memoGet(&userKey(txn.sess)).unwrapOr("lexdb")}
     for i in 0..len(keys) {
         let t = try decTable(&keys[i], &raw[i])
         let schema = lexdb_sql.schemaOf(&keys[i])
         let name = lexdb_sql.baseName(&keys[i])
+        if len(t.view) > 0 {
+            append(mut &snap.views, CatTab{key: keys[i], t: t, oid: catOid(&"r", &keys[i]), schema: schema, name: name,
+                                           shown: shownIn(&txn.path, &schema, &name), idxs: []})
+            continue
+        }
         var idxs: []CatIdx = []
         if len(t.pk) > 0 {
             var cs: []int = []
@@ -13461,6 +13557,10 @@ fn bindCatalog(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[Unit, 
                       quoteIfNeeded(&lexdb_sql.baseName(&c.seq)) + "\n")
             }
         }
+    }
+    for v in snap.views {
+        b.add("r\t" + v.oid.toStr() + "\t" + v.shown + "\t" + v.schema + "\t" + v.name + "\n")
+        b.add("w\t" + v.oid.toStr() + "\t" + clean(&v.t.view) + "\n")
     }
     for d in snap.seqs {
         let sc = lexdb_sql.schemaOf(&d.key)
@@ -13784,6 +13884,17 @@ fn callMisc(name: &str, vs: &[]Val): Result[Option[Val], DbErr] {
         let m = if isNull(&vs[1]) { -1 } else { oidArg(&vs[1]).unwrapOr(-1) }
         return Ok(Some(Val.Text(lexdb_pgcat.formatType(oidArg(&vs[0]).unwrapOr(0), m))))
     }
+    if (name == "btrim" || name == "ltrim" || name == "rtrim") && n == 2 {
+        // the characters of vs[1] off the start, the end, or both
+        if isNull(&vs[0]) || isNull(&vs[1]) { return Ok(Some(Val.Null)) }
+        let x = text(&vs[0])
+        let cs = text(&vs[1])
+        var a = 0
+        var b = len(x)
+        if name != "rtrim" { while a < b && strings.contains(&cs, &x[a..a + 1]) { a += 1 } }
+        if name != "ltrim" { while b > a && strings.contains(&cs, &x[b - 1..b]) { b -= 1 } }
+        return Ok(Some(Val.Text(x[a..b].toStr())))
+    }
     if name == "repeat" && n == 2 {
         if isNull(&vs[0]) || isNull(&vs[1]) { return Ok(Some(Val.Null)) }
         let k = oidArg(&vs[1]).unwrapOr(0)
@@ -13828,8 +13939,8 @@ fn callMisc(name: &str, vs: &[]Val): Result[Option[Val], DbErr] {
     if (name == "pg_type_is_visible" || name == "pg_function_is_visible" || name == "pg_collation_is_visible") && n == 1 {
         return Ok(Some(if isNull(&vs[0]) { Val.Null } else { Val.Bool(true) }))
     }
-    if (name == "obj_description" || name == "col_description" || name == "shobj_description" || name == "pg_get_viewdef" ||
-        name == "pg_get_triggerdef" || name == "pg_get_statisticsobjdef_columns" || name == "pg_get_function_result" ||
+    if (name == "obj_description" || name == "col_description" || name == "shobj_description" ||
+        name == "pg_get_triggerdef" || name == "pg_get_ruledef" || name == "pg_get_statisticsobjdef_columns" || name == "pg_get_function_result" ||
         name == "pg_get_function_arguments") {
         return Ok(Some(Val.Null))
     }
@@ -13900,6 +14011,13 @@ fn callCat(name: &str, vs: &[]Val, se: &SeqEnv): Result[Option[Val], DbErr] {
             Ok(v) { return Ok(Some(v)) }
             Err(_) { return Ok(Some(Val.Null)) }
         }
+    }
+    if name == "pg_get_viewdef" && (n == 1 || n == 2) {
+        // by OID, or by name; the text as it was written, with PostgreSQL's ;
+        var o = oidArg(&vs[0]).unwrapOr(0)
+        if o == 0 { o = relOidOf(se, &text(&vs[0])) }
+        for l in catLines(se, &"w") { if l[0] == o.toStr() { return Ok(Some(Val.Text(l[1] + ";"))) } }
+        return Ok(Some(Val.Null))
     }
     if name == "pg_partition_ancestors" && n == 1 {
         let o = oidArg(&vs[0]).unwrapOr(0)
@@ -14006,6 +14124,12 @@ fn catRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &str): Result
                                        iv(0), iv(0), iv(0), Val.Null, Val.Null, Val.Null])
                 }
             }
+            for v in snap.views {
+                append(mut &rows, [iv(v.oid), tv(&v.name), iv(nspOid(&v.schema)), iv(0), iv(0), iv(OID_OWNER), iv(0), iv(0), iv(0),
+                                   iv(0), Val.Real(-1.0f), iv(0), iv(0), bv(false), bv(false), tv(&"p"), tv(&"v"), iv(len(v.t.cols)),
+                                   iv(0), bv(true), bv(false), bv(false), bv(false), bv(false), bv(true), tv(&"n"),
+                                   bv(false), iv(0), iv(0), iv(0), Val.Null, Val.Null, Val.Null])
+            }
             for d in snap.seqs {
                 let sc = lexdb_sql.schemaOf(&d.key)
                 append(mut &rows, [iv(seqOid(&d)), tv(&lexdb_sql.baseName(&d.key)), iv(nspOid(&sc)), iv(0), iv(0), iv(OID_OWNER), iv(0),
@@ -14041,6 +14165,12 @@ fn catRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &str): Result
                         let c = &ct.t.cols[cn - 1]
                         append(mut &rows, attRow(ix.oid, &c.name, c.typ.oid, typmodOf(&c.typ), k + 1, false, false, ""))
                     }
+                }
+            }
+            for v in snap.views {
+                for i in 0..len(v.t.cols) {
+                    let c = &v.t.cols[i]
+                    append(mut &rows, attRow(v.oid, &c.name, c.typ.oid, typmodOf(&c.typ), i + 1, false, false, ""))
                 }
             }
             for r in lexdb_pgcat.relNames() {
@@ -14171,9 +14301,23 @@ fn catRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &str): Result
                 append(mut &rows, [tv(&db), tv(&ct.schema), tv(&ct.name), tv(&"BASE TABLE"), Val.Null, Val.Null, Val.Null, Val.Null, Val.Null,
                                    tv(&"YES"), tv(&"NO"), Val.Null])
             }
+            for v in snap.views {
+                append(mut &rows, [tv(&db), tv(&v.schema), tv(&v.name), tv(&"VIEW"), Val.Null, Val.Null, Val.Null, Val.Null, Val.Null,
+                                   tv(&"NO"), tv(&"NO"), Val.Null])
+            }
+        }
+        "information_schema.views" {
+            for v in snap.views {
+                append(mut &rows, [tv(&db), tv(&v.schema), tv(&v.name), tv(&(v.t.view + ";")), tv(&"NONE"), tv(&"NO"), tv(&"NO"),
+                                   tv(&"NO"), tv(&"NO"), tv(&"NO")])
+            }
+        }
+        "pg_views" {
+            for v in snap.views { append(mut &rows, [tv(&v.schema), tv(&v.name), tv(&owner), tv(&(v.t.view + ";"))]) }
         }
         "information_schema.columns" {
-            for ct in snap.tabs {
+            for which in 0..2 {
+            for ct in (if which == 0 { &snap.tabs } else { &snap.views }) {
                 for i in 0..len(ct.t.cols) {
                     let c = &ct.t.cols[i]
                     var nn = c.notNull
@@ -14212,8 +14356,9 @@ fn catRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &str): Result
                                        if isId { tv(&sq.start.toStr()) } else { Val.Null }, if isId { tv(&sq.inc.toStr()) } else { Val.Null },
                                        if isId { tv(&sq.max.toStr()) } else { Val.Null }, if isId { tv(&sq.min.toStr()) } else { Val.Null },
                                        if isId { tv(&if sq.cycle { "YES" } else { "NO" }) } else { tv(&"NO") },
-                                       tv(&"NEVER"), Val.Null, tv(&"YES")])
+                                       tv(&"NEVER"), Val.Null, tv(&(if len(ct.t.view) > 0 { "NO" } else { "YES" }))])
                 }
+            }
             }
         }
         "information_schema.table_constraints" {
@@ -14436,4 +14581,260 @@ fn roleStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
     try applyRoleOpts(mut &r, &s.names)
     try txn.put(CATALOG, k, encRole(&r))
     return Ok(tagOnly("ALTER ROLE"))
+}
+
+// ---- views (9.82)
+//
+// A view is a catalog row under its name, as a table is (the two share
+// names): VIEW_MARK, then its columns (name and type), its query's text, and
+// the catalog keys of the relations that query reads. Where it is named in
+// FROM, the text is parsed and planned as a subquery (buildQuery). Its text
+// names relations by name, so a relation it reads is not renamed, dropped,
+// or changed in a column under it (dependentViews).
+
+const VIEW_MARK: str = "\xff\xff\xff\xffview"
+
+fn encView(cols: &[]lexdb_sql.ColDef, text: &str, deps: &[]str): str {
+    var b = newStrBuf()
+    b.add(VIEW_MARK)
+    var names: []str = []
+    var oids: []str = []
+    var mods: []str = []
+    for c in cols {
+        append(mut &names, c.name)
+        append(mut &oids, c.typ.oid.toStr())
+        append(mut &mods, typmodOf(&c.typ).toStr())
+    }
+    addStrs(mut &b, &names)
+    addStrs(mut &b, &oids)
+    addStrs(mut &b, &mods)
+    addStrs(mut &b, &[text.toStr()])
+    addStrs(mut &b, deps)
+    return b.toStr()
+}
+
+// A column's type from its OID and typmod (varchar's length, numeric's
+// precision and scale), as a view keeps it.
+fn typeOfMod(oid: int, mod: int): lexdb_sql.TypeName {
+    var t = oidType(oid)
+    if mod >= 4 && t.oid == lexdb_sql.OID_VARCHAR { t.len = mod - 4 }
+    if mod >= 4 && t.kind == lexdb_sql.K_NUM {
+        t.prec = (mod - 4) >> 16
+        t.scale = (mod - 4) & 0xFFFF
+    }
+    if mod >= 0 && isTimeKind(t.kind) && t.oid != lexdb_sql.OID_DATE {
+        t.prec = 1
+        t.scale = mod
+    }
+    return t
+}
+
+fn decView(name: str, s: &str): Table {
+    var t = emptyTable(name)
+    var at = len(VIEW_MARK)
+    let names = strsAt(s, at)
+    at += strsLen(&names)
+    let oids = strsAt(s, at)
+    at += strsLen(&oids)
+    let mods = strsAt(s, at)
+    at += strsLen(&mods)
+    let text = strsAt(s, at)
+    at += strsLen(&text)
+    t.deps = strsAt(s, at)
+    t.tree = -1
+    t.view = if len(text) > 0 { text[0] } else { "select" }
+    for i in 0..len(names) {
+        let o = strings.parseIntOpt(oids[i]).unwrapOr(lexdb_sql.OID_TEXT)
+        let m = if i < len(mods) { strings.parseIntOpt(mods[i]).unwrapOr(-1) } else { -1 }
+        append(mut &t.cols, lexdb_sql.colDef(names[i], typeOfMod(o, m), false))
+    }
+    return t
+}
+
+// A view's query, parsed to be planned where the view is used.
+fn viewQuery(t: &Table): Result[lexdb_sql.Stmt, DbErr] {
+    var ss = try lexdb_sql.parse(&t.view)
+    if len(ss) != 1 || ss[0].kind != lexdb_sql.S_SELECT { return Err(lexdb_base.corrupt("the query of view \"" + t.name + "\"")) }
+    var q = pop(mut &ss)
+    q.use = lexdb_sql.SUB_FROM
+    return Ok(q)
+}
+
+// INSERT, UPDATE and DELETE on a view: refused (no updatable views yet).
+fn notView(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, name: &str, what: &str): Result[Unit, DbErr] {
+    match try findTable(st, txn, name) {
+        Some(t) {
+            if len(t.view) > 0 {
+                return Err(e("0A000", "cannot " + what + " view \"" + lexdb_sql.shown(name) + "\" (lexdb's views are read-only)"))
+            }
+        }
+        None {}
+    }
+    return Ok(Unit{})
+}
+
+// The catalog keys of the relations a statement reads by name, its
+// subqueries' and set operations' too (CTEs are among its subqueries).
+fn readsOf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, out: mut &[]str): Result[Unit, DbErr] {
+    for f in s.from {
+        if f.sub >= 0 || f.work >= 0 || len(f.table) == 0 { continue }
+        let k = try catKey(st, txn, &f.table, false)
+        if (try st.get(txn, CATALOG, k)).isSome() {
+            var have = false
+            for x in out { if x == k { have = true } }
+            if !have { append(out, k) }
+        }
+    }
+    for q in s.subs { try readsOf(st, txn, &q, out) }
+    for q in s.inner { try readsOf(st, txn, &q, out) }
+    return Ok(Unit{})
+}
+
+// Every view, by catalog key.
+fn allViews(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[[]Table, DbErr] {
+    var out: []Table = []
+    var keys: []str = []
+    var vals: []str = []
+    try st.scan(txn, CATALOG, "\x06", "", fn(en: &lexdb_store.Entry): bool {
+        if strings.startsWith(&en.val, VIEW_MARK) {
+            append(mut &keys, en.key)
+            append(mut &vals, en.val)
+        }
+        return true
+    })
+    for i in 0..len(keys) { append(mut &out, decView(keys[i], &vals[i])) }
+    return Ok(out)
+}
+
+// The views that read relation k, directly or through other views.
+fn dependentViews(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, k: &str): Result[[]str, DbErr] {
+    let vs = try allViews(st, txn)
+    var out: []str = []
+    var todo: []str = [k.toStr()]
+    while len(todo) > 0 {
+        let cur = pop(mut &todo)
+        for v in vs {
+            var reads = false
+            for d in v.deps { if d == cur { reads = true } }
+            var seen = false
+            for x in out { if x == v.name { seen = true } }
+            if reads && !seen {
+                append(mut &out, v.name)
+                append(mut &todo, v.name)
+            }
+        }
+    }
+    return Ok(out)
+}
+
+// Before relation k is dropped: the views on it dropped (CASCADE), or 2BP01.
+fn dropDependentViews(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, k: &str, cascade: bool, kind: &str): Result[Unit, DbErr] {
+    let deps = try dependentViews(st, txn, k)
+    if len(deps) == 0 { return Ok(Unit{}) }
+    if !cascade {
+        return Err(e("2BP01", "cannot drop " + kind + " " + lexdb_sql.shown(k) + " because other objects depend on it"))
+    }
+    for d in deps { txn.del(CATALOG, d) }
+    return Ok(Unit{})
+}
+
+fn createView(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
+    var key = s.table
+    if lexdb_sql.isQual(&s.table) {
+        let sn = lexdb_sql.schemaOf(&s.table)
+        if !(try schemaExists(st, txn, &sn)) { return Err(e("3F000", "schema \"" + sn + "\" does not exist")) }
+    } else {
+        let sn = try createSchema(st, txn)
+        if len(sn) == 0 { return Err(e("3F000", "no schema has been selected to create in")) }
+        key = try catKey(st, txn, &s.table, false)
+        if !(try relExists(st, txn, &key)) { key = lexdb_sql.qual(&sn, &s.table) }
+    }
+    let base = lexdb_sql.baseName(&key)
+    var old: Option[Table] = None
+    if try relExists(st, txn, &key) {
+        let have = try st.get(txn, CATALOG, key)
+        let isView = match have {
+            Some(v) { strings.startsWith(&v, VIEW_MARK) }
+            None { false }
+        }
+        if !isView { return Err(e(if s.ifFlag { "42809" } else { "42P07" }, if s.ifFlag { "\"" + base + "\" is not a view" } else { "relation \"" + base + "\" already exists" })) }
+        if !s.ifFlag { return Err(e("42P07", "relation \"" + base + "\" already exists")) }
+        old = Some(decView(key, &have.unwrap()))
+    }
+    // the query planned: its columns, and the relations it reads
+    var q = try viewQuery(&decView(key, &encView(&[], &s.index, &[])))
+    q.use = lexdb_sql.SUB_SCALAR - lexdb_sql.SUB_SCALAR     // a statement of its own
+    var sc = newScope(&[], &[])
+    let sel = try planSelect(st, txn, &q, &[], mut &sc)
+    if len(s.names) > len(sel.outs) { return Err(e("42601", "CREATE VIEW specifies more column names than columns")) }
+    var cols: []lexdb_sql.ColDef = []
+    for i in 0..len(sel.outs) {
+        let n = if i < len(s.names) { s.names[i] } else { sel.outs[i].name }
+        for c in cols { if c.name == n { return Err(e("42701", "column \"" + n + "\" specified more than once")) } }
+        append(mut &cols, lexdb_sql.colDef(n, oidType(sel.outs[i].oid), false))
+    }
+    // a column's typmod, where the query's column is a table's
+    var deps: []str = []
+    try readsOf(st, txn, &q, mut &deps)
+    for d in deps { if d == key { return Err(e("42P17", "infinite recursion detected in rules for relation \"" + base + "\"")) } }
+    match old {
+        Some(o) {
+            // OR REPLACE: the old columns kept, in order, with their names and types; new ones after
+            if len(cols) < len(o.cols) { return Err(e("42P16", "cannot drop columns from view")) }
+            for i in 0..len(o.cols) {
+                if cols[i].name != o.cols[i].name {
+                    return Err(e("42P16", "cannot change name of view column \"" + o.cols[i].name + "\" to \"" + cols[i].name + "\""))
+                }
+                if cols[i].typ.oid != o.cols[i].typ.oid {
+                    return Err(e("42P16", "cannot change data type of view column \"" + o.cols[i].name + "\" from " +
+                                 lexdb_pgcat.formatType(o.cols[i].typ.oid, -1) + " to " + lexdb_pgcat.formatType(cols[i].typ.oid, -1)))
+                }
+                cols[i].typ = o.cols[i].typ
+            }
+        }
+        None {}
+    }
+    try txn.put(CATALOG, key, encView(&cols, &s.index, &deps))
+    try bumpCatalog(st, txn)
+    return Ok(tagOnly("CREATE VIEW"))
+}
+
+fn dropView(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
+    for c in s.cols {
+        match try findTable(st, txn, &c.name) {
+            Some(t) {
+                if len(t.view) == 0 { return Err(e("42809", "\"" + lexdb_sql.shown(&c.name) + "\" is not a view (use DROP TABLE)")) }
+                try dropDependentViews(st, txn, &t.name, s.cascade, &"view")
+                txn.del(CATALOG, t.name)
+            }
+            None {
+                if !s.ifFlag { return Err(e("42P01", "view \"" + lexdb_sql.shown(&c.name) + "\" does not exist")) }
+            }
+        }
+    }
+    try bumpCatalog(st, txn)
+    return Ok(tagOnly("DROP VIEW"))
+}
+
+// ALTER VIEW name RENAME TO new: refused while another view reads it.
+fn alterView(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
+    let found = try findTable(st, txn, &s.table)
+    if found.isNone() {
+        if s.ifFlag { return Ok(tagOnly("ALTER VIEW")) }
+        return Err(e("42P01", "relation \"" + lexdb_sql.shown(&s.table) + "\" does not exist"))
+    }
+    let t = found.unwrap()
+    if len(t.view) == 0 { return Err(e("42809", "\"" + lexdb_sql.shown(&s.table) + "\" is not a view")) }
+    let deps = try dependentViews(st, txn, &t.name)
+    if len(deps) > 0 {
+        return Err(e("2BP01", "cannot rename view " + lexdb_sql.shown(&t.name) + " because view " + lexdb_sql.shown(&deps[0]) +
+                     " depends on it (lexdb keeps a view's text)"))
+    }
+    let to = lexdb_sql.qual(&lexdb_sql.schemaOf(&t.name), &s.index)
+    if try relExists(st, txn, &to) { return Err(e("42P07", "relation \"" + s.index + "\" already exists")) }
+    let v = (try st.get(txn, CATALOG, t.name)).unwrap()
+    txn.del(CATALOG, t.name)
+    try txn.put(CATALOG, to, v)
+    try bumpCatalog(st, txn)
+    return Ok(tagOnly("ALTER VIEW"))
 }

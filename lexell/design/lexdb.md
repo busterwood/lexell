@@ -6253,3 +6253,87 @@ pgwire). The certificates are made at test time by lib's test PKI
   role`);
 - privileges on tables. Any role that logs in may read and write
   everything, as a superuser may in PostgreSQL.
+
+### 9.82 Views
+
+Stage 5 of 9.75 as reordered: views before privileges, because a view is
+how PostgreSQL gives a role some columns or rows of a table.
+
+- **`CREATE [OR REPLACE] VIEW name [(column, ...)] AS query`.**
+  - The query may be a SELECT, `WITH ... SELECT`, or VALUES. It is checked
+    by planning it, which gives the view's columns.
+  - A view shares a table's names (a catalog row under its name), so the
+    two cannot have the same one (42P07).
+  - More column names than columns is 42601, and the same name twice is
+    42701.
+  - A view that reads itself is refused (42P17), and so is a chain of views
+    more than 64 deep.
+  - **OR REPLACE** keeps PostgreSQL's rules. The old columns stay, in order,
+    with their names and types (42P16 otherwise); new ones may follow. On a
+    table it is 42809.
+  - `WITH CHECK OPTION` and view options are refused (0A000). A parameter is
+    42P02.
+- **What is kept:** the query's text, cut from the statement by its tokens'
+  positions; the columns' names, types and typmods; and the catalog keys of
+  the relations the query reads (`readsOf`: FROM items, subqueries, CTEs,
+  set operations). The row starts with `VIEW_MARK`, four `0xFF` bytes, where
+  a table's starts with its tree's number.
+- **Where a view is named in FROM,** `buildQuery` finds it where it finds a
+  table, parses its text, and plans it as a subquery in FROM (`planSub`,
+  not seeing the query around it).
+  - The plan goes after the statement's own subqueries in `Query.subs`, and
+    its level reads its rows as a FROM subquery's.
+  - So a view costs a statement nothing until it is used. Kept plans hold
+    the view's plan, and DDL bumps the catalog's version.
+  - Views of views plan the same way. Column aliases (`v AS x(a, b)`)
+    rename the view's columns.
+  - Column aliases on a table are now allowed too: lexdb refused them
+    before, and PostgreSQL does not.
+- **Dependencies,** found through the views' kept keys:
+  - `DROP TABLE` of a table a view reads is refused (2BP01) unless CASCADE,
+    which drops the views too, and the views on them;
+  - `DROP VIEW [IF EXISTS] name, ... [CASCADE]` works the same way;
+  - `DROP SCHEMA ... CASCADE` drops its views, and the views elsewhere that
+    read its tables;
+  - DROP VIEW on a table, DROP TABLE on a view, and ALTER TABLE on a view
+    are 42809.
+- **Where lexdb differs from PostgreSQL** (deliberately, for now;
+  `exec_viewsx` holds its own answers):
+  - **Views are read-only.** INSERT, UPDATE and DELETE on a view are
+    refused (0A000). PostgreSQL updates a simple view's table.
+  - **A view keeps its text, not a tree of OIDs.** So renaming a table it
+    reads, or renaming, dropping or retyping a column of one, or moving it
+    to another schema, is refused (2BP01, saying to drop the view and make
+    it again). PostgreSQL follows a rename. Adding a column is allowed.
+  - `ALTER VIEW name RENAME TO new` works while no other view reads it.
+  - `pg_get_viewdef`, `pg_views.definition` and
+    `information_schema.views.view_definition` give the text as written,
+    with a `;`. PostgreSQL gives its own formatting.
+  - A view's columns keep their types but not a table column's typmod
+    (`numeric`, not `numeric(10,2)`).
+- **The catalog:**
+  - `pg_class` (relkind `v`), `pg_attribute`, `pg_views`, and
+    information_schema's `tables` (`VIEW`), `columns` and `views`;
+  - `'v'::regclass`, and `pg_get_viewdef` by OID or name.
+  - psql's `\dv`, `\d v` and `\d+ v` show views as PostgreSQL's psql does,
+    the definition included. SQLAlchemy's `get_view_names` and
+    `get_view_definition` work.
+- **For psql's `\d+` on a view,** two things were added: SQL's `trim([LEADING
+  | TRAILING | BOTH] [chars] FROM x)`, with `btrim`, `ltrim` and `rtrim`
+  taking the characters to remove; and `pg_get_ruledef` (NULL: lexdb has no
+  rules).
+
+**Tests.**
+- `exec_views`: 56 statements generated from PostgreSQL 18, all the same.
+  They cover:
+  - views over a filter, a join, a grouped join, a CTE and VALUES; a column
+    list; a view of a view; one in another schema;
+  - reads with WHERE, joins to tables, IN, scalar subqueries and column
+    aliases, on views and tables;
+  - OR REPLACE's three errors and its added column;
+  - the name clashes, the catalog's rows;
+  - DROP's dependencies and CASCADE, IF EXISTS, a schema's CASCADE;
+  - the `trim` forms.
+- `exec_viewsx`, by hand: lexdb's own answers above (writes refused, renames
+  and column changes refused, ALTER VIEW, the text kept, a view reading
+  itself).
