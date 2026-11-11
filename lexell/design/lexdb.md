@@ -4936,3 +4936,49 @@ Not kept; writes stay `sendto`.
 That ends 9.58's plan: the ring is the default (9.65), with file I/O
 through it (9.58), commits keeping up (9.60), reads off the loop when it
 is busy (9.62), checkpoints in runs (9.63) and adaptive polling (9.64).
+
+### 9.67 Against PostgreSQL 18, on bare metal
+
+`bench/sock/vspg.sh`: lexdb and PostgreSQL 18.6 on the same machine (16
+CPUs, NVMe, btrfs over dm-crypt), the same data and Unix sockets, both
+data directories with copy-on-write off. PostgreSQL: shared_buffers 4GB,
+otherwise its defaults (fsync and synchronous_commit on); lexdb: its
+defaults (io_uring, adaptive polling). Both hold all the data in memory.
+Each server is a transient systemd user service and its CPU is its
+cgroup's, PostgreSQL's backends included. Three rounds of 10 s; the five
+aggregate queries' results are the same on both (checksummed).
+
+| pgbench, 1M rows | lexdb | PostgreSQL | lexdb / PG |
+|---|---|---|---|
+| point selects, 1 client | 94,700/s, 10.5 us | 80,100/s, 8.5 us | 1.18x |
+| point selects, 8 clients | 173,900/s, 5.7 us | 489,800/s, 11.4 us | 0.36x |
+| point selects, 32 clients | 172,300/s, 5.8 us | 710,900/s, 14.6 us | 0.24x |
+| updates, 1 client | 1,663/s, 92 us | 1,669/s, 87 us | 1.00x |
+| updates, 8 clients | 6,690/s, 35 us | 6,900/s, 60 us | 0.97x |
+| updates, 32 clients | 26,140/s, 17.5 us | 26,810/s, 50.7 us | 0.98x |
+
+| Query on t (1M rows), ms, best of 5 | lexdb | PG, one core | PG, parallel |
+|---|---:|---:|---:|
+| `count(*)` | 13.9 | 19.4 | 11.4 |
+| 4 aggregates `WHERE n > 10` | 36.8 | 58.9 | 25.9 |
+| `sum(v)` with three conditions | 42.2 | 46.1 | 21.8 |
+| `GROUP BY g`, 3 aggregates | 47.4 | 86.4 | 36.4 |
+| `GROUP BY n WHERE v % 2 = 0` | 35.1 | 59.3 | 33.9 |
+
+| Load, 1M rows (INSERT ... generate_series) | lexdb | PostgreSQL |
+|---|---:|---:|
+| acct (2 ints) | 1.49 s | 0.87 s |
+| t (4 ints and a text) | 2.52 s | 1.45 s |
+
+- **A select's CPU:** lexdb's is half PostgreSQL's under load (5.7 us
+  against 11.4 to 14.6); with one client PostgreSQL's is lower (8.5
+  against 10.5, of which about 2 us is lexdb's polling).
+- **Throughput with many clients** is PostgreSQL's: a process per
+  connection on 16 CPUs (at 32 clients about 10 CPUs busy), against
+  lexdb's one loop thread. One client: lexdb 18% ahead.
+- **Commits** are the drive's: the same rate within 3%, lexdb at a third
+  of PostgreSQL's CPU an update with many clients.
+- **Aggregates:** ahead of PostgreSQL on one core on all five (1.1 to 1.8
+  times); against its default two workers behind on four (1.2 to 1.9
+  times), level on one.
+- **Loads:** PostgreSQL 1.7 times faster.
