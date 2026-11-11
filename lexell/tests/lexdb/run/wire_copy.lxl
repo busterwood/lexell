@@ -4,7 +4,9 @@
 // CopyData per line, CopyDone), CopyFail, a message that is not COPY's,
 // Flush and Sync ignored in the middle; two statements with a COPY between.
 // Extended query: Parse, Bind, Execute of a COPY each way, the Sync sent
-// before the data ignored as PostgreSQL's.
+// before the data ignored as PostgreSQL's. COPY TO sent as it runs (9.84):
+// many rows (parts of 64 kB, still a CopyData a line), a sorted query
+// (kept whole first), an error after lines went out (no CopyDone), LIMIT.
 // expect: in: G cols 2 | C COPY 3 | Z
 // expect: out: H cols 3 | d 1	a	1 | d 2	b	2 | d 3	c	3 | c | C COPY 3 | Z
 // expect: failed: G cols 1 | E 57014 COPY from stdin failed: stop | Z
@@ -15,6 +17,13 @@
 // expect: extended out: 1 | 2 | H cols 1 | d x | d y | c | C COPY 2 | Z
 // expect: error before data: E 42P01 relation "nope" does not exist | Z
 // expect: bad data: G cols 1 | E 22P02 invalid input syntax for type integer: "x" (COPY w, line 2, column id: "x") | Z
+// expect: many: H cols 3 | d*5000 [1	zzzzzzzzzzzzzzzzzzzz	2 .. 5000	zzzzzzzzzzzzzzzzzzzz	10000] | c | C COPY 5000 | Z
+// expect: sorted: H cols 1 | d*5000 [5000 .. 1] | c | C COPY 5000 | Z
+// expect: header, csv: H cols 2 | d*4 [g,v .. 3,zzzzzzzzzzzzzzzzzzzz] | c | C COPY 3 | Z
+// expect: limit: H cols 1 | d*5 [1 .. 5] | c | C COPY 5 | Z
+// expect: error midway: H cols 1 | some lines | E 22012 division by zero | Z
+// expect: extended many: 1 | 2 | H cols 1 | d*5000 [1 .. 5000] | c | C COPY 5000 | Z
+// expect: after: T | D 5000 | C SELECT 1 | Z
 import "task"
 import "net"
 import "pgwire"
@@ -80,6 +89,34 @@ fn show(m: &Msg): str {
         return "E " + code + " " + msg
     }
     return t
+}
+
+// until 'Z', the CopyData shown as their count, first and last line, each
+// checked to be one line.
+fn lines(c: &net.Conn, rx: mut &Rx): str {
+    var out: []str = []
+    var n = 0
+    var first = ""
+    var last = ""
+    var bad = 0
+    while true {
+        let m = next(c, rx)
+        if m.typ == 'd' {
+            let l = strFromBytes(&m.body)
+            if len(l) == 0 || l[len(l) - 1] != '\n' || strings.indexOf(&l[0..len(l) - 1], "\n", 0) >= 0 { bad += 1 }
+            if n == 0 { first = l[0..len(l) - 1] }
+            last = l[0..len(l) - 1]
+            n += 1
+            continue
+        }
+        if n > 0 {
+            append(mut &out, "d*" + n.toStr() + " [" + first + " .. " + last + "]" + (if bad > 0 { " " + bad.toStr() + " not one line" } else { "" }))
+            n = 0
+        }
+        append(mut &out, show(&m))
+        if m.typ == 'Z' || m.typ == '?' { break }
+    }
+    return strings.join(&out, " | ")
 }
 
 // Messages until one of type stop (shown, joined by " | ").
@@ -182,6 +219,32 @@ fn client(addr: str) {
     raw(&c, 'd', &"10\nx\n")
     raw(&c, 'c', &"")
     println("bad data: " + g5 + " | " + until(&c, mut &rx, 'Z'))
+
+    query(&c, "create table big (g int primary key, v text, h int); insert into big select g, repeat('z', 20), 2 * g from generate_series(1, 5000) g")
+    let mk = until(&c, mut &rx, 'Z')
+    query(&c, "copy big to stdout")
+    println("many: " + lines(&c, mut &rx))
+    query(&c, "copy (select g from big order by g desc) to stdout")
+    println("sorted: " + lines(&c, mut &rx))
+    query(&c, "copy (select g, v from big where g < 4) to stdout with (format csv, header)")
+    println("header, csv: " + lines(&c, mut &rx))
+    query(&c, "copy (select g from big limit 5) to stdout")
+    println("limit: " + lines(&c, mut &rx))
+    query(&c, "copy (select v || v || (100 / (g - 4500)) from big) to stdout")
+    let mid = lines(&c, mut &rx)
+    // the lines sent before the error: as many as fill whole parts
+    let k = strings.indexOf(&mid, "d*", 0)
+    let shown = if k > 0 && strings.indexOf(&mid, "| c |", 0) < 0 { mid[0..k] + "some lines" + mid[strings.indexOf(&mid, "] |", k) + 1..len(mid)] } else { mid }
+    println("error midway: " + shown)
+    var p3 = pgwire.newOut()
+    pgwire.putParse(mut &p3, "", "copy (select g from big) to stdout", &none)
+    pgwire.putBind(mut &p3, "", "", &none)
+    pgwire.putExecute(mut &p3, "", 0)
+    pgwire.putSync(mut &p3)
+    c.write(p3.bytes()).unwrap()
+    println("extended many: " + lines(&c, mut &rx))
+    query(&c, "select count(*) from big")
+    println("after: " + until(&c, mut &rx, 'Z'))
 }
 
 fn body(st: lexdb_store.Store): int {

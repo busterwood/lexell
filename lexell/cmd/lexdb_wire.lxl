@@ -238,16 +238,22 @@ fn (w: mut &Wire) empty(typ: byte) {
 
 fn (w: mut &Wire) flush(): Result[Unit, io.IoError] {
     if w.out.size() == 0 { return Ok(Unit{}) }
-    let s = w.out.toStr()
+    let r = sendTo(&w.c, mut &w.eng, w.out.view())
     w.out.clear()
-    if len(w.eng) > 0 {
-        match w.eng[0].write(&strToBytes(s)) {
+    return r
+}
+
+// Bytes to the client, through TLS if the connection has it.
+fn sendTo(c: &net.Conn, eng: mut &[]tls.Engine, b: &[]byte): Result[Unit, io.IoError] {
+    if len(b) == 0 { return Ok(Unit{}) }
+    if len(eng) > 0 {
+        match eng[0].write(b) {
             Ok(_) {}
             Err(x) { return Err(tlsErr(&x)) }
         }
-        return tlsSend(mut &w.eng[0], &w.c)
+        return tlsSend(mut &eng[0], c)
     }
-    return w.c.writeStr(s)
+    return c.write(b)
 }
 
 // A FATAL error, sent now: the connection ends after it.
@@ -391,6 +397,28 @@ fn (w: mut &Wire) copyOut(r: &lexdb_exec.Res) {
     w.empty('c')
 }
 
+fn isCopyTo(s: &lexdb_sql.Stmt): bool { return s.kind == lexdb_sql.S_COPY && !s.copy.from }
+
+// COPY ... TO STDOUT, its lines sent as they are made (Session.runOut):
+// CopyOutResponse before the first, CopyDone after the last. The session
+// is out of w while it runs, so that the closure sending the lines can use
+// w's connection.
+fn (w: mut &Wire) copyTo(s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int, pc: mut &lexdb_exec.PlanCache): Result[lexdb_exec.Res, lexdb_base.DbErr] {
+    var sess = replace(mut &w.sess, lexdb_exec.parkedSession(w.st))
+    var started = false
+    let r = sess.runOut(s, params, ptypes, pc, fn(n: int, b: &[]byte): bool {
+        if !started {
+            w.copyResponse('H', n)
+            started = true
+        }
+        if w.flush().isErr() { return false }
+        return sendTo(&w.c, mut &w.eng, b).isOk()
+    })
+    let parked = replace(mut &w.sess, sess)
+    if started && r.isOk() { w.empty('c') }
+    return r
+}
+
 // COPY FROM STDIN: asks for the data (n columns) and takes it until
 // CopyDone or CopyFail. Flush and Sync are ignored meanwhile, as
 // PostgreSQL does; another message ends it with an error.
@@ -400,22 +428,22 @@ fn (w: mut &Wire) copyData(cols: []lexdb_exec.OutCol): Result[lexdb_exec.CopyInp
     var b = newStrBuf()
     while true {
         match try w.readMsg(false) {
-            None { return Ok(lexdb_exec.CopyInput{have: true, data: "", fail: "the connection was lost during COPY", proto: true}) }
+            None { return Ok(lexdb_exec.CopyInput{have: true, data: "", fail: "the connection was lost during COPY", proto: true, stream: false}) }
             Some(m) {
                 if m.typ == 'd' { b.add(m.body) }
-                else if m.typ == 'c' { return Ok(lexdb_exec.CopyInput{have: true, data: b.toStr(), fail: "", proto: false}) }
+                else if m.typ == 'c' { return Ok(lexdb_exec.CopyInput{have: true, data: b.toStr(), fail: "", proto: false, stream: false}) }
                 else if m.typ == 'f' {
                     var r = Rd{s: m.body, at: 0, bad: false}
                     let msg = r.cstr()
-                    return Ok(lexdb_exec.CopyInput{have: true, data: "", fail: if msg == "" { "canceled by the client" } else { msg }, proto: false})
+                    return Ok(lexdb_exec.CopyInput{have: true, data: "", fail: if msg == "" { "canceled by the client" } else { msg }, proto: false, stream: false})
                 } else if m.typ != 'H' && m.typ != 'S' {
-                    return Ok(lexdb_exec.CopyInput{have: true, data: "", proto: true,
+                    return Ok(lexdb_exec.CopyInput{have: true, data: "", proto: true, stream: false,
                                                    fail: "unexpected message type " + int(m.typ).toStr() + " during COPY from stdin"})
                 }
             }
         }
     }
-    return Ok(lexdb_exec.CopyInput{have: true, data: "", fail: "unreachable", proto: true})
+    return Ok(lexdb_exec.CopyInput{have: true, data: "", fail: "unreachable", proto: true, stream: false})
 }
 
 // ---- the simple query protocol
@@ -430,7 +458,8 @@ fn (w: mut &Wire) query(sql: &str): Result[Unit, io.IoError] {
                 w.empty('I')
             } else {
                 for s in stmts {
-                    var r = w.sess.run(&s, &none, &nt)
+                    var pc1 = lexdb_exec.oneShot()
+                    var r = if isCopyTo(&s) { w.copyTo(&s, &none, &nt, mut &pc1) } else { w.sess.run(&s, &none, &nt) }
                     var cols: []lexdb_exec.OutCol = []
                     var copyIn = false
                     match r {
@@ -679,6 +708,7 @@ fn sameCols(a: &[]lexdb_exec.OutCol, b: &[]lexdb_exec.OutCol): bool {
 fn (w: mut &Wire) runPortal(ps: &Ps, portal: &str, name: &str, plan: mut &lexdb_exec.PlanCache): Result[lexdb_exec.Res, lexdb_base.DbErr] {
     let po = ps.portals.at(portal)
     let p = ps.stmts.at(name)
+    if isCopyTo(&p.stmts[0]) { return w.copyTo(&p.stmts[0], &po.params, &p.ptypes, plan) }
     return w.sess.runCached(&p.stmts[0], &po.params, &p.ptypes, plan)
 }
 

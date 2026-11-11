@@ -7314,6 +7314,47 @@ fn runSel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params: 
     return execSel(st, txn, sel, params, -1, mut &rs)
 }
 
+// Calls each on the rows of a planned SELECT, in order, while it gives
+// true. A query whose rows need nothing after the scan (no sort, grouping,
+// DISTINCT, window, set operation or OFFSET) gives them as they are read,
+// so they are not kept; any other runs whole first (execSel).
+fn eachRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params: &[]Val, lim: Limits,
+           each: &fn(&[]Val): Result[bool, DbErr]): Result[Unit, DbErr] {
+    var rs = newRun(&sel.q)
+    rs.limit(&lim)
+    if !streams(sel) {
+        var res = try execSel(st, txn, sel, params, -1, mut &rs)
+        for i in 0..len(res.rows) {
+            let r = replace(mut &res.rows[i], [])
+            if !(try each(&r)) { break }
+        }
+        return Ok(Unit{})
+    }
+    if sel.limit == 0 { return Ok(Unit{}) }
+    let sqe = seqEnv(st, txn)
+    let m = try prepare(st, txn, &sel.q, params, mut &rs)
+    let q = &sel.q
+    let noAggs: []Val = []
+    var n = 0
+    try runQuery(st, txn, q, &m, params, fn(r: &[]Val): Result[bool, DbErr] {
+        let env = Env{cols: &q.cols, row: r, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: sqe}
+        var vals: []Val = []
+        for x in sel.exprs { append(mut &vals, try eval(&x, &env)) }
+        if !(try each(&vals)) { return Ok(false) }
+        n += 1
+        return Ok(sel.limit < 0 || n < sel.limit)
+    }, mut &rs)
+    return Ok(Unit{})
+}
+
+// Whether a planned SELECT's rows can be given as the scan reads them
+// (eachRow): execSel's last branch, with nothing kept for after it.
+fn streams(sel: &Sel): bool {
+    if sel.setop != 0 || len(sel.srf) > 0 || sel.aggQ || sel.sort || len(sel.wins) > 0 || sel.distinct || sel.offset > 0 { return false }
+    if sel.q.corr { for x in sel.exprs { if hasCorr(&x) { return false } } }
+    return !hasSrfCall(&sel.exprs)
+}
+
 // A prepared statement's plan (select), with the catalog version it was
 // made for. keep false: never kept (a statement run once).
 pub type PlanCache = record { sels: []Sel; ver: str; keep: bool; pub plans: int }
@@ -8825,6 +8866,13 @@ fn (s: &Session) show(name: &str): Result[Res, DbErr] {
     return Ok(res)
 }
 
+// A Session holding a Wire's place while its own is out (a COPY TO's run,
+// lexdb_wire): no id of its own, never run.
+pub fn parkedSession(st: lexdb_store.Store): Session {
+    return Session{st: st, txn: [], failed: false, maxRecursion: MAX_RECURSION, timeoutMs: 0, maxMem: MAX_STATEMENT_MEM,
+                   saved: [], readOnly: false, path: [], pathAt: 0, savedPath: [], id: 0, batch: true, saves: [], savedRoles: []}
+}
+
 pub fn newSession(st: lexdb_store.Store): Session {
     // LEXDB_ROWFMT=tagged: rows written in the tagged form, not the fixed
     // layout (9.50): to compare the two, and to test the tagged reader
@@ -8958,7 +9006,7 @@ pub fn (s: &Session) status(): byte {
 }
 
 fn execIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int,
-          lim: Limits, pc: mut &PlanCache, input: &CopyInput): Result[Res, DbErr] {
+          lim: Limits, pc: mut &PlanCache, input: &CopyInput, out: &fn(int, &[]byte): bool): Result[Res, DbErr] {
     try bindSeqs(st, txn, &s.seqNames)
     // with subqueries, the outer values they use are numbered after all the
     // statement's parameters: those not sent are NULL
@@ -8968,9 +9016,9 @@ fn execIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
         var ps: []Val = []
         for v in params { append(mut &ps, v) }
         while len(ps) < want { append(mut &ps, Val.Null) }
-        return execStmt(st, txn, s, &ps, ptypes, lim, pc, input)
+        return execStmt(st, txn, s, &ps, ptypes, lim, pc, input, out)
     }
-    return execStmt(st, txn, s, params, ptypes, lim, pc, input)
+    return execStmt(st, txn, s, params, ptypes, lim, pc, input, out)
 }
 
 fn hasSubs(s: &lexdb_sql.Stmt): bool {
@@ -8980,7 +9028,7 @@ fn hasSubs(s: &lexdb_sql.Stmt): bool {
 }
 
 fn execStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int,
-            lim: Limits, pc: mut &PlanCache, input: &CopyInput): Result[Res, DbErr] {
+            lim: Limits, pc: mut &PlanCache, input: &CopyInput, out: &fn(int, &[]byte): bool): Result[Res, DbErr] {
     if st.isReplica() {
         match writesOn(s) {
             Some(what) { return Err(lexdb_store.readOnly(&what)) }
@@ -9014,7 +9062,7 @@ fn execStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
         lexdb_sql.S_CREATE_SEQ { return createSeq(st, txn, s) }
         lexdb_sql.S_ALTER_SEQ { return alterSeq(st, txn, s) }
         lexdb_sql.S_DROP_SEQ { return dropSeq(st, txn, s) }
-        lexdb_sql.S_COPY { return copyStmt(st, txn, s, params, ptypes, lim, pc, input) }
+        lexdb_sql.S_COPY { return copyStmt(st, txn, s, params, ptypes, lim, pc, input, out) }
         lexdb_sql.S_EXPLAIN { return explain(st, txn, s, params, lim, ptypes) }
         else { return Err(e("XX000", "not a data statement")) }
     }
@@ -9069,8 +9117,20 @@ pub fn (s: mut &Session) run(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
 
 // run, keeping a SELECT's plan in pc for the next run of the same statement.
 pub fn (s: mut &Session) runCached(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int, pc: mut &PlanCache): Result[Res, DbErr] {
-    return s.runIn(stmt, params, ptypes, pc, &noInput())
+    return s.runIn(stmt, params, ptypes, pc, &noInput(), noOut)
 }
+
+// runCached for COPY ... TO STDOUT, its lines given to out as they are
+// made, not kept: out(n, b) is given b, CopyData messages (a line each) of
+// a query of n columns, at least once (b may be empty), and gives false if
+// they could not be sent (the statement then ends, 08006). The result is
+// COPY_NONE with its tag only.
+pub fn (s: mut &Session) runOut(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int, pc: mut &PlanCache,
+                                out: &fn(int, &[]byte): bool): Result[Res, DbErr] {
+    return s.runIn(stmt, params, ptypes, pc, &CopyInput{have: false, data: "", fail: "", proto: false, stream: true}, out)
+}
+
+fn noOut(n: int, b: &[]byte): bool { return false }
 
 // COPY FROM STDIN with the client's input (after run gave COPY_IN): its
 // rows inserted, as one statement.
@@ -9078,11 +9138,11 @@ pub fn (s: mut &Session) copyIn(stmt: &lexdb_sql.Stmt, input: CopyInput): Result
     var pc = oneShot()
     let none: []Val = []
     let nt: []int = []
-    return s.runIn(stmt, &none, &nt, mut &pc, &input)
+    return s.runIn(stmt, &none, &nt, mut &pc, &input, noOut)
 }
 
 fn (s: mut &Session) runIn(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int, pc: mut &PlanCache,
-                           input: &CopyInput): Result[Res, DbErr] {
+                           input: &CopyInput, out: &fn(int, &[]byte): bool): Result[Res, DbErr] {
     match stmt.kind {
         lexdb_sql.S_EMPTY { return Ok(tagOnly("")) }
         lexdb_sql.S_SHOW { return s.show(&stmt.table) }
@@ -9220,7 +9280,7 @@ fn (s: mut &Session) runIn(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int
         // checked at COMMIT either way, and the latest is less often stale
         s.txn[0].live = stmt.kind == lexdb_sql.S_UPDATE || stmt.kind == lexdb_sql.S_DELETE || stmt.kind == lexdb_sql.S_INSERT ||
                         (stmt.kind == lexdb_sql.S_COPY && stmt.copy.from)
-        let r = execIn(&st, mut &s.txn[0], stmt, params, ptypes, s.limits(), pc, input)
+        let r = execIn(&st, mut &s.txn[0], stmt, params, ptypes, s.limits(), pc, input, out)
         s.txn[0].live = false
         if r.isErr() {
             s.failed = true
@@ -9240,7 +9300,7 @@ fn (s: mut &Session) runIn(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int
         var t = if snap { try s.st.beginSnapshot() } else { lexdb_store.begin() }
         for n in s.path { append(mut &t.path, n) }
         t.sess = s.id
-        match execIn(&s.st, mut &t, stmt, params, ptypes, lim, pc, input) {
+        match execIn(&s.st, mut &t, stmt, params, ptypes, lim, pc, input, out) {
             Ok(r) {
                 match s.st.commit(t) {
                     Ok(_) { return Ok(r) }
@@ -9253,7 +9313,8 @@ fn (s: mut &Session) runIn(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int
             Err(x) {
                 s.st.abort(t)
                 tries += 1
-                if !(snap && x.state == "72000") || tries >= 10 { return Err(x) }
+                // (a COPY TO sent as it ran is not run again)
+                if !(snap && x.state == "72000") || tries >= 10 || input.stream { return Err(x) }
             }
         }
     }
@@ -10654,13 +10715,17 @@ pub const COPY_OUT = 2
 
 // What the client sent for COPY FROM STDIN: its data, or its CopyFail's
 // message (proto: a message not of COPY's, the wire's own error).
-pub type CopyInput = record { pub have: bool; pub data: str; pub fail: str; pub proto: bool }
+// stream: COPY TO's lines go to the caller's out as they are made (runOut).
+pub type CopyInput = record { pub have: bool; pub data: str; pub fail: str; pub proto: bool; pub stream: bool }
 
-fn noInput(): CopyInput { return CopyInput{have: false, data: "", fail: "", proto: false} }
+fn noInput(): CopyInput { return CopyInput{have: false, data: "", fail: "", proto: false, stream: false} }
 
 fn copyStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int,
-            lim: Limits, pc: mut &PlanCache, input: &CopyInput): Result[Res, DbErr] {
-    if !s.copy.from { return copyOut(st, txn, s, params, ptypes, lim, pc) }
+            lim: Limits, pc: mut &PlanCache, input: &CopyInput, out: &fn(int, &[]byte): bool): Result[Res, DbErr] {
+    if !s.copy.from {
+        if input.stream { return copyStream(st, txn, s, params, ptypes, lim, out) }
+        return copyOut(st, txn, s, params, ptypes, lim, pc)
+    }
     let t = try needTable(st, txn, &s.table)
     try needRel(st, txn, &(try whoNow(st, txn)), &t.name, &"a", &"table")
     var targets: []int = []
@@ -10711,24 +10776,25 @@ fn copyStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
             Ok(more) { if !more { break } }
             Err(x) { return Err(within(x, where + rd.line.toStr() + ": " + quoted(&recordText(data, &rd)))) }
         }
-        let at = where + rd.line.toStr()
         if len(vs) < len(targets) {
-            return Err(within(e("22P04", "missing data for column \"" + names[len(vs)] + "\""), at + ": " + quoted(&recordText(data, &rd))))
+            return Err(within(e("22P04", "missing data for column \"" + names[len(vs)] + "\""), where + rd.line.toStr() + ": " + quoted(&recordText(data, &rd))))
         }
         if len(vs) > len(targets) {
-            return Err(within(e("22P04", "extra data after last expected column"), at + ": " + quoted(&recordText(data, &rd))))
-        }
-        // each value its column's type here, to say which column is wrong
-        for k in 0..len(vs) {
-            let raw = vs[k]
-            match coerce(raw, &t.cols[targets[k]].typ) {
-                Ok(v) { vs[k] = v }
-                Err(x) { return Err(within(x, at + ", column " + names[k] + ": " + quoted(&text(&vs[k])))) }
-            }
+            return Err(within(e("22P04", "extra data after last expected column"), where + rd.line.toStr() + ": " + quoted(&recordText(data, &rd))))
         }
         match insertOne(st, txn, &t, &targets, &vs, &defs, &fw, mut &later, mut &noUp, &noEnv) {
             Ok(_) {}
-            Err(x) { return Err(within(x, at)) }
+            Err(x) {
+                // a value not of its column's type (insertOne turns them
+                // first, in order): which column, said as PostgreSQL does
+                for k in 0..len(vs) {
+                    match coerce(vs[k], &t.cols[targets[k]].typ) {
+                        Ok(_) {}
+                        Err(y) { return Err(within(y, where + rd.line.toStr() + ", column " + names[k] + ": " + quoted(&text(&vs[k])))) }
+                    }
+                }
+                return Err(within(x, where + rd.line.toStr()))
+            }
         }
         count += 1
     }
@@ -10817,13 +10883,17 @@ fn textRecord(data: &str, o: &lexdb_sql.CopyOpts, at: int, vs: mut &[]Val): int 
     let n = len(data)
     let d = o.delim[0]
     var b = newStrBuf()
+    var esc = false                     // the field has an escape: b holds it, else it is data[raw..i]
     var raw = at
     var i = at
     while true {
         let end = i >= n || data[i] == '\n' || (data[i] == '\r' && i + 1 < n && data[i + 1] == '\n')
         if end || data[i] == d {
-            if data[raw..i] == o.null { append(vs, Val.Null) } else { append(vs, Val.Text(b.toStr())) }
-            b.clear()
+            if data[raw..i] == o.null { append(vs, Val.Null) }
+            else if esc { append(vs, Val.Text(b.toStr())) }
+            else { append(vs, Val.Text(data[raw..i])) }
+            if esc { b.clear() }
+            esc = false
             if end {
                 if i < n && data[i] == '\r' { i += 1 }
                 return if i < n { i + 1 } else { n }
@@ -10833,10 +10903,14 @@ fn textRecord(data: &str, o: &lexdb_sql.CopyOpts, at: int, vs: mut &[]Val): int 
             continue
         }
         if data[i] == '\\' && i + 1 < n {
+            if !esc {
+                b.add(data[raw..i])
+                esc = true
+            }
             i = lexdb_sql.unescape(data, i + 1, mut &b)
             continue
         }
-        b.addByte(data[i])
+        if esc { b.addByte(data[i]) }
         i += 1
     }
     return n
@@ -10909,51 +10983,119 @@ fn copyOut(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
     var fq = try forced(&s.copy.forceQuote, &names, &"FORCE_QUOTE")
     if s.copy.quoteAll { for k in 0..len(fq) { fq[k] = true } }
     var lines: [][]Val = []
-    var b = newStrBuf()
+    var b: []byte = []
     if s.copy.header {
-        for k in 0..len(res.cols) {
-            if k > 0 { b.add(s.copy.delim) }
-            copyField(&Val.Text(res.cols[k].name), &s.copy, len(res.cols) == 1, false, mut &b)
-        }
-        b.addByte('\n')
-        append(mut &lines, [Val.Text(b.toStr())])
+        copyHeader(&res.cols, &s.copy, mut &b)
+        append(mut &lines, [Val.Text(strFromBytes(&b))])
     }
     for r in res.rows {
-        b.clear()
-        for k in 0..len(r) {
-            if k > 0 { b.add(s.copy.delim) }
-            copyField(&r[k], &s.copy, len(r) == 1, k < len(fq) && fq[k], mut &b)
-        }
-        b.addByte('\n')
-        append(mut &lines, [Val.Text(b.toStr())])
+        replace(mut &b, [])
+        copyLine(&r, &s.copy, &fq, mut &b)
+        append(mut &lines, [Val.Text(strFromBytes(&b))])
     }
     let n = len(res.rows)
     return Ok(Res{cols: replace(mut &res.cols, []), rows: lines, tag: "COPY " + n.toStr(), hasRows: false, copy: COPY_OUT})
 }
 
+// COPY TO STDOUT as its query runs (runOut): CopyData messages, a line
+// each, given to out in parts of about 64 kB; the rows are not kept.
+fn copyStream(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int,
+              lim: Limits, out: &fn(int, &[]byte): bool): Result[Res, DbErr] {
+    var sc = newScope(params, ptypes)
+    let sel = try planSelect(st, txn, &s.inner[0], params, mut &sc)
+    let n = len(sel.outs)
+    var names: []str = []
+    for c in sel.outs { append(mut &names, c.name) }
+    var fq = try forced(&s.copy.forceQuote, &names, &"FORCE_QUOTE")
+    if s.copy.quoteAll { for k in 0..len(fq) { fq[k] = true } }
+    var b: []byte = withCapacity(COPY_PART * 2)
+    if s.copy.header {
+        let at = copyMsgStart(mut &b)
+        copyHeader(&sel.outs, &s.copy, mut &b)
+        copyMsgEnd(mut &b, at)
+    }
+    var count = 0
+    try eachRow(st, txn, &sel, params, lim, fn(r: &[]Val): Result[bool, DbErr] {
+        let at = copyMsgStart(mut &b)
+        copyLine(r, &s.copy, &fq, mut &b)
+        copyMsgEnd(mut &b, at)
+        count += 1
+        if len(b) >= COPY_PART {
+            if !out(n, &b) { return Err(e("08006", "lexdb: the connection was lost during COPY")) }
+            b = withCapacity(COPY_PART * 2)
+        }
+        return Ok(true)
+    })
+    if !out(n, &b) { return Err(e("08006", "lexdb: the connection was lost during COPY")) }
+    return Ok(Res{cols: [], rows: [], tag: "COPY " + count.toStr(), hasRows: false, copy: COPY_NONE})
+}
+
+const COPY_PART = 65536
+
+// A CopyData message begun in b: its type and room for its length.
+fn copyMsgStart(b: mut &[]byte): int {
+    let at = len(b)
+    append(b, 'd')
+    for i in 0..4 { append(b, byte(0)) }
+    return at
+}
+
+fn copyMsgEnd(b: mut &[]byte, at: int) { binary.setU32BE(b, at + 1, len(b) - at - 1) }
+
+// The column names as COPY's HEADER line.
+fn copyHeader(cols: &[]OutCol, o: &lexdb_sql.CopyOpts, b: mut &[]byte) {
+    for k in 0..len(cols) {
+        if k > 0 { appendStr(b, o.delim) }
+        copyField(&Val.Text(cols[k].name), o, len(cols) == 1, false, b)
+    }
+    append(b, '\n')
+}
+
+// A row as COPY's line (fq: the columns FORCE_QUOTE names).
+fn copyLine(r: &[]Val, o: &lexdb_sql.CopyOpts, fq: &[]bool, b: mut &[]byte) {
+    for k in 0..len(r) {
+        if k > 0 { appendStr(b, o.delim) }
+        copyField(&r[k], o, len(r) == 1, k < len(fq) && fq[k], b)
+    }
+    append(b, '\n')
+}
+
 // A value as COPY writes it: in the text format escaped, in CSV quoted
 // where it must be.
-fn copyField(v: &Val, o: &lexdb_sql.CopyOpts, single: bool, force: bool, b: mut &StrBuf) {
+fn copyField(v: &Val, o: &lexdb_sql.CopyOpts, single: bool, force: bool, b: mut &[]byte) {
     if isNull(v) {
-        b.add(o.null)
+        appendStr(b, o.null)
         return
     }
     let t = text(v)
     let d = o.delim[0]
     if !o.csv {
+        // most values have nothing to escape: added whole
+        var plain = true
         for k in 0..len(t) {
             let c = t[k]
-            if c == '\\' { b.add("\\\\") }
-            else if c == '\n' { b.add("\\n") }
-            else if c == '\r' { b.add("\\r") }
-            else if c == '\t' { b.add("\\t") }
-            else if c == byte(8) { b.add("\\b") }
-            else if c == byte(12) { b.add("\\f") }
-            else if c == byte(11) { b.add("\\v") }
+            if c == '\\' || c < byte(14) || c == d {
+                plain = false
+                break
+            }
+        }
+        if plain {
+            appendStr(b, t)
+            return
+        }
+        for k in 0..len(t) {
+            let c = t[k]
+            if c == '\\' { appendStr(b, "\\\\") }
+            else if c == '\n' { appendStr(b, "\\n") }
+            else if c == '\r' { appendStr(b, "\\r") }
+            else if c == '\t' { appendStr(b, "\\t") }
+            else if c == byte(8) { appendStr(b, "\\b") }
+            else if c == byte(12) { appendStr(b, "\\f") }
+            else if c == byte(11) { appendStr(b, "\\v") }
             else if c == d {
-                b.addByte('\\')
-                b.addByte(c)
-            } else { b.addByte(c) }
+                append(b, '\\')
+                append(b, c)
+            } else { append(b, c) }
         }
         return
     }
@@ -10966,16 +11108,16 @@ fn copyField(v: &Val, o: &lexdb_sql.CopyOpts, single: bool, force: bool, b: mut 
         if c == d || c == q || c == '\n' || c == '\r' { must = true }
     }
     if !must {
-        b.add(t)
+        appendStr(b, t)
         return
     }
-    b.addByte(q)
+    append(b, q)
     for k in 0..len(t) {
         let c = t[k]
-        if c == q || c == esc { b.addByte(esc) }
-        b.addByte(c)
+        if c == q || c == esc { append(b, esc) }
+        append(b, c)
     }
-    b.addByte(q)
+    append(b, q)
 }
 
 // ---- window functions (9.46)

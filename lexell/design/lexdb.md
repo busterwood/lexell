@@ -3140,7 +3140,7 @@ they are sent.
 **Not done:**
 - Streaming: results sent as they are made, and a large COPY FROM
   committed in parts. Both are matters of the executor and the store,
-  not COPY's syntax.
+  not COPY's syntax. (COPY TO is sent as it runs since 9.84.)
 - The binary format (0A000).
 - Files and programs on the server (0A000: psql's `\copy` reads and
   writes the client's).
@@ -6463,3 +6463,136 @@ and write everything.
   for it);
 - REFERENCES, checked when a foreign key is made;
 - privileges on functions and types.
+
+### 9.84 COPY: lines sent as they are made; what a bulk load keeps
+
+The user's request: COPY's speed and memory, before migrations and row
+locking. Measured with psql's `\copy` of 1M rows of three columns (26 MB:
+`id int primary key, n int, s text`), on a fresh data directory, the
+server's peak RSS from `/proc`:
+
+| | before | after | PostgreSQL 18 |
+|---|---|---|---|
+| `\copy from` | 1.55 s, 512 MB | 1.07 s, 339 MB | 0.57-0.87 s |
+| `\copy to` | 0.76 s, 813 MB | 0.41 s, 57 MB | 0.11 s |
+
+**COPY TO is sent as it runs.** Before, the query's rows were made whole,
+then a second copy of them as lines, then sent.
+- `Session.runOut` runs a COPY TO with `out`, a closure the wire gives:
+  `out(n, b)` gets `b`, CopyData messages for a query of n columns, about
+  64 kB at a time. The executor frames the messages, a line each, as
+  PostgreSQL sends them (psycopg reads a row per message). The wire sends
+  CopyOutResponse before the first part and CopyDone after the last.
+- A closure cannot be stored (SPEC 4.6), so `out` is a parameter from
+  `runIn` down to `copyStmt`. The wire's closure uses its connection while
+  the session runs: the session is moved out of the Wire for the run
+  (`parkedSession` holds its place).
+- `eachRow` gives a planned SELECT's rows to a callback. A plain query
+  (no sort, grouping, DISTINCT, window, set operation, OFFSET or
+  set-returning function in its list) gives each row as the scan reads it,
+  so nothing is kept. Any other query is made whole first, as before; only
+  the copy as lines is saved.
+- An error after lines went out is an ErrorResponse with no CopyDone, as
+  in PostgreSQL. A snapshot too old (72000) is not retried once lines have
+  been sent.
+- A value with nothing to escape is added whole. Before, every byte was
+  looked at and added one at a time.
+- `Wire.flush` writes its buffer's bytes (`StrBuf.view`, new). Before, it
+  copied them twice (`toStr`, then `writeStr`). This holds for every
+  result, not only COPY's.
+
+The 57 MB left is the table's pages read into the cache. The time left is
+the scan's per-row cost (decoding, `eval`, `text` per value), which every
+query pays.
+
+**COPY FROM: where the memory went**, measured at each step:
+
+| step | RSS before | RSS after |
+|---|---|---|
+| input held | 34 MB (61 MB peak while it came) | the same |
+| rows written, before the commit | 290 MB | 211 MB |
+| peak during the commit | 473 MB | 347 MB |
+| left after it | 202 MB | 171 MB |
+
+Four changes:
+- **A transaction's writes are indexed per tree, by their own key**
+  (`Txn.idxTrees`, `Txn.idx`). Before, there was one map keyed by a new
+  string `"tree:key"` per write.
+- **Reads of keys in order, with no key of the tree between them, are one
+  range.**
+  - An insert reads its key first (the unique check), and each read was a
+    mark with a string of its own: 1M marks for 1M rows.
+  - Now a read just after the last one widens it, when the leaf shows no
+    key between them, or the tree is empty. The leaf's key before the new
+    one is checked; at a leaf's start nothing is looked for.
+  - A load in key order is then a few marks.
+  - The range is wider than what was read: a commit into the gap between
+    two loaded keys now conflicts. That is the safe side, and a load's own
+    keys fill the gap anyway.
+- **A commit of more than 1024 writes to a tree logs their range**
+  (`WEntry.hi`), not each key, for the checks of transactions still
+  running. Before, a 1M-row commit added 1M entries to `Db.wlog`, and half
+  of them stayed there afterwards.
+- **A commit's log records go into room made for them once**
+  (`reserveBatch`), and the batch starts with room for its frame's header.
+  `frame` fills in the header and padding in place. Before, the batch grew
+  by doubling, holding the old and new arrays at once, and `frame` copied
+  it whole.
+
+What is left grows with the rows: about 176 bytes a row for the
+transaction's writes until it commits, and about 130 a row for the tree's
+nodes in the cache after. A transaction's writes stay in memory until its
+commit (4.4), and a COPY is one statement, so it is all or nothing. Loading
+10M rows would hold about 1.8 GB until the commit. Bounding that would need
+one of:
+- a COPY committed in parts, an option rather than the default, since
+  PostgreSQL's COPY is all or nothing;
+- a transaction's writes spilled to disk past a size, as PostgreSQL's
+  sorts spill.
+
+Neither is built.
+
+**COPY FROM: where the time went.** 1M rows, timed in the server: the
+input took 25 ms, the rows 930 ms, the commit 410 ms. Fixed:
+- **A field with no escape is a slice of the input,** not a copy made a
+  byte at a time.
+- **The error's CONTEXT** (`COPY t, line n`) is made only on an error, not
+  for every row.
+- **Each value is turned to its column's type once,** by `insertOne`.
+  Before, COPY's loop did it first so that an error could name the column;
+  now, on an error, the values are checked again to find which.
+- **A put no longer looks for an old large value to drop** (`dropChunks`)
+  when the table has no companion tree, so none can exist. It was a
+  descent of the tree per row in the commit: 31% of the commit's time.
+- **The commit checks that a tree still exists** once per run of writes to
+  it, not once per write.
+
+After: the rows take 740 ms and the commit 310 ms. What is left:
+- the executor's per-row cost (`insertOne`, encoding the row, two map
+  lookups);
+- two descents of the tree per row: the unique check, and the commit's
+  put;
+- a third in the commit's `writeNeeds`, which makes sure every leaf a
+  write needs is in the cache before it starts.
+
+A load in key order could reuse the last leaf rather than descending again
+each time; that is not done.
+
+**Tests:**
+- `wire_copy`, nine new lines, from a raw client:
+  - 5000 rows in parts, each CopyData one line;
+  - a sorted query (made whole first);
+  - CSV with a header, and LIMIT;
+  - an error after some parts went out: ErrorResponse, no CopyDone;
+  - the extended protocol's COPY TO.
+- `store_bulk` (new):
+  - reads widened across a gap, and the gap's conflicts;
+  - reads with a key between them kept apart;
+  - an empty tree;
+  - a 2000-write commit logged as a range (a key inside it, written or
+    not, conflicts; one outside does not), and a 100-write one logged key
+    by key;
+  - one transaction's own writes to two trees, with the same key in each.
+
+The suite passes (76). The benchmark scripts are in the session's scratch
+folder.

@@ -1,0 +1,134 @@
+// lexdb_store: what a bulk load (a large COPY) keeps for its commit checks
+// (design/lexdb.md 9.84).
+// - Reads of keys in order with no key of the tree between them are one
+//   range: a commit into the gap between them conflicts (a conflict the
+//   separate reads would not have had: the safe side), one outside it does
+//   not; reads with a key of the tree between them stay apart, so a write
+//   of that key does not conflict. An empty tree's reads are one range.
+// - A commit of more than WLOG_RANGE writes to a tree is logged as their
+//   range: a transaction that read a key inside it (written or not)
+//   conflicts, one that read outside it does not. A smaller commit is
+//   logged key by key: a key between its writes does not conflict.
+// - Its own writes are found by key per tree (two trees, the same key).
+// expect: gap: inside 40001, outside ok
+// expect: key between: ok
+// expect: empty tree: inside 40001, after ok
+// expect: big commit: unwritten inside 40001, written 40001, outside ok
+// expect: small commit: unwritten inside ok, written 40001
+// expect: own writes: a1 b1 none
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_base"
+
+fn res(r: &Result[Unit, lexdb_base.DbErr]): str {
+    match r {
+        Ok(_) { return "ok" }
+        Err(e) { return e.state }
+    }
+}
+
+fn tree(st: &lexdb_store.Store, keys: &[]str): int {
+    var t = lexdb_store.begin()
+    let id = st.createTree(mut &t)
+    for k in keys { t.put(id, k.toStr(), "v").unwrap() }
+    st.commit(t).unwrap()
+    return id
+}
+
+fn put1(st: &lexdb_store.Store, id: int, k: str): str {
+    var t = lexdb_store.begin()
+    t.put(id, k, "w").unwrap()
+    let r = st.commit(t)
+    return res(&r)
+}
+
+// A transaction that reads each of keys (missing) and writes them: an
+// insert's unique checks.
+fn loader(st: &lexdb_store.Store, id: int, keys: &[]str): lexdb_store.Txn {
+    var t = lexdb_store.begin()
+    for k in keys {
+        let got = st.get(mut &t, id, k.toStr()).unwrap()
+        t.put(id, k.toStr(), "new").unwrap()
+    }
+    return t
+}
+
+fn n4(i: int): str { return strings.padLeft(i.toStr(), 4, '0') }
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(23), lexdb_store.Options{cacheBytes: 16 * 1024 * 1024, segBytes: 1024 * 1024, ckptBytes: 1024 * 1024, snapNodes: 100000, bufferedPages: false}, fn(st: lexdb_store.Store): int {
+        // the gap between a and z
+        let g = tree(&st, &["a", "z"])
+        let t1 = loader(&st, g, &["b", "c", "d"])
+        let in1 = put1(&st, g, "c5")
+        let c1 = st.commit(t1)
+        let t2 = loader(&st, g, &["f", "g", "h"])
+        let out1 = put1(&st, g, "k")
+        let c2 = st.commit(t2)
+        println("gap: inside " + res(&c1) + ", outside " + res(&c2) + (if in1 != "ok" || out1 != "ok" { " (" + in1 + " " + out1 + ")" } else { "" }))
+
+        // m is the tree's: the reads of l and n stay apart
+        let h = tree(&st, &["a", "m", "z"])
+        let t3 = loader(&st, h, &["l", "n"])
+        let mid = put1(&st, h, "m")
+        let c3 = st.commit(t3)
+        println("key between: " + res(&c3) + (if mid != "ok" { " (" + mid + ")" } else { "" }))
+
+        // an empty tree
+        let none: []str = []
+        let e = tree(&st, &none)
+        let t4 = loader(&st, e, &["k1", "k2", "k3", "k4", "k5"])
+        let in2 = put1(&st, e, "k3x")
+        let c4 = st.commit(t4)
+        let t5 = loader(&st, e, &["k6", "k7"])
+        let after = put1(&st, e, "k9")
+        let c5 = st.commit(t5)
+        println("empty tree: inside " + res(&c4) + ", after " + res(&c5) + (if in2 != "ok" || after != "ok" { " (" + in2 + " " + after + ")" } else { "" }))
+
+        // a commit of 2000 writes (b0000, b0002, ..., b3998): its range
+        let b = tree(&st, &["a", "z"])
+        var r1 = lexdb_store.begin()
+        var r2 = lexdb_store.begin()
+        var r3 = lexdb_store.begin()
+        let x1 = st.get(mut &r1, b, "b0001").unwrap()      // not written, inside
+        let x2 = st.get(mut &r2, b, "b1000").unwrap()      // written
+        let x3 = st.get(mut &r3, b, "c").unwrap()          // outside
+        var big = lexdb_store.begin()
+        for i in 0..2000 { big.put(b, "b" + n4(2 * i), "v").unwrap() }
+        st.commit(big).unwrap()
+        r1.put(b, "r1", "x").unwrap()
+        r2.put(b, "r2", "x").unwrap()
+        r3.put(b, "r3", "x").unwrap()
+        let cr1 = st.commit(r1)
+        let cr2 = st.commit(r2)
+        let cr3 = st.commit(r3)
+        println("big commit: unwritten inside " + res(&cr1) + ", written " + res(&cr2) + ", outside " + res(&cr3))
+
+        // 100 writes: key by key
+        let s = tree(&st, &["a", "z"])
+        var q1 = lexdb_store.begin()
+        var q2 = lexdb_store.begin()
+        let y1 = st.get(mut &q1, s, "b0001").unwrap()
+        let y2 = st.get(mut &q2, s, "b0010").unwrap()
+        var small = lexdb_store.begin()
+        for i in 0..100 { small.put(s, "b" + n4(2 * i), "v").unwrap() }
+        st.commit(small).unwrap()
+        q1.put(s, "q1", "x").unwrap()
+        q2.put(s, "q2", "x").unwrap()
+        let cq1 = st.commit(q1)
+        let cq2 = st.commit(q2)
+        println("small commit: unwritten inside " + res(&cq1) + ", written " + res(&cq2))
+
+        // the same key in two trees, its own writes
+        var o = lexdb_store.begin()
+        o.put(g, "same", "a1").unwrap()
+        o.put(h, "same", "b1").unwrap()
+        let va = st.get(mut &o, g, "same").unwrap().unwrapOr("none")
+        let vb = st.get(mut &o, h, "same").unwrap().unwrapOr("none")
+        let vc = st.get(mut &o, e, "same").unwrap().unwrapOr("none")
+        println("own writes: " + va + " " + vb + " " + vc)
+        st.abort(o)
+        return 0
+    }).unwrap()
+}

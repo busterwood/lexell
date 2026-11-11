@@ -183,7 +183,13 @@ type Mark = value record { tree: int; lo: str; hi: str; seq: int }
 
 // A committed write, kept for the commit checks (Db.wlog): all, a dropped
 // tree (every key).
-type WEntry = value record { seq: int; tree: int; key: str; all: bool }
+// A key range [key, hi] (hi "": the key alone): a commit of many writes to
+// a tree logs their range, not each (a large COPY's commit would otherwise
+// add an entry per row).
+type WEntry = value record { seq: int; tree: int; key: str; hi: str; all: bool }
+
+// Past this many writes to one tree, a commit logs their range.
+const WLOG_RANGE = 1024
 
 // The writes kept: past this many, the older half goes, and a transaction
 // whose read is older than what is kept fails its check (a conflict).
@@ -198,7 +204,10 @@ pub type TxWrite = value record { pub op: int; pub tree: int; pub key: str; pub 
 pub type Txn = record {
     reads: []Mark
     writes: []TxWrite
-    index: Map[str, int]        // tree:key -> the last write of it
+    // Per tree written (idxTrees[k]), key -> the last write of it: keyed by
+    // the write's own key string (shared, not copied), one map per tree.
+    idxTrees: []int
+    idx: []Map[str, int]
     created: []int
     snap: int                   // its reads' snapshot's id, -1 for none (reads of the live tree)
     snapSeq: int
@@ -217,7 +226,7 @@ pub type Txn = record {
 }
 
 pub fn begin(): Txn {
-    return Txn{reads: [], writes: [], index: newMap(), created: [], snap: -1, snapSeq: 0, snapTrees: newMap(), track: false, live: false, path: [], sess: 0,
+    return Txn{reads: [], writes: [], idxTrees: [], idx: [], created: [], snap: -1, snapSeq: 0, snapTrees: newMap(), track: false, live: false, path: [], sess: 0,
                raTree: -1, ra: AHEAD_MIN, fsnap: [], now: time.now().unixMicros()}
 }
 
@@ -245,7 +254,24 @@ fn (t: mut &Txn) noteRead(tree: int, lo: str, hi: str, seq: int) {
 // block's (a read-only snapshot's are not).
 fn (t: &Txn) noting(): bool { return t.snap < 0 || t.live || t.track }
 
-fn wkey(tree: int, key: &str): str { return tree.toStr() + ":" + key }
+// The transaction's last write of key in tree (its index in writes).
+fn (t: &Txn) lastWrite(tree: int, key: &str): Option[int] {
+    for k in 0..len(t.idxTrees) { if t.idxTrees[k] == tree { return t.idx[k].get(key) } }
+    return None
+}
+
+fn (t: mut &Txn) noteWrite(tree: int, key: str, i: int) {
+    for k in 0..len(t.idxTrees) {
+        if t.idxTrees[k] == tree {
+            t.idx[k].put(key, i)
+            return
+        }
+    }
+    var m: Map[str, int] = newMap()
+    m.put(key, i)
+    append(mut &t.idxTrees, tree)
+    append(mut &t.idx, m)
+}
 
 pub fn (t: mut &Txn) put(tree: int, key: str, val: str): Result[Unit, lexdb_base.DbErr] { return t.putRow(tree, key, val, 0) }
 
@@ -259,13 +285,13 @@ pub fn (t: mut &Txn) putRow(tree: int, key: str, val: str, head: int): Result[Un
     if len(val) > MAX_VALUE {
         return Err(lexdb_base.err(lexdb_base.S_LIMIT, "row too large: " + len(val).toStr() + " bytes, at most " + MAX_VALUE.toStr()))
     }
-    t.index.put(wkey(tree, &key), len(t.writes))
+    t.noteWrite(tree, key, len(t.writes))
     append(mut &t.writes, TxWrite{op: OP_PUT, tree: tree, key: key, val: val, head: head})
     return Ok(Unit{})
 }
 
 pub fn (t: mut &Txn) del(tree: int, key: str) {
-    t.index.put(wkey(tree, &key), len(t.writes))
+    t.noteWrite(tree, key, len(t.writes))
     append(mut &t.writes, TxWrite{op: OP_DEL, tree: tree, key: key, val: "", head: 0})
 }
 
@@ -276,8 +302,9 @@ pub fn (t: &Txn) mark(): int { return len(t.writes) }
 
 pub fn (t: mut &Txn) undoTo(n: int) {
     while len(t.writes) > n { let w = pop(mut &t.writes) }
-    t.index = newMap()
-    for i in 0..len(t.writes) { t.index.put(wkey(t.writes[i].tree, &t.writes[i].key), i) }
+    t.idxTrees = []
+    t.idx = []
+    for i in 0..len(t.writes) { t.noteWrite(t.writes[i].tree, t.writes[i].key, i) }
 }
 
 pub fn (t: mut &Txn) dropTree(tree: int) {
@@ -1133,6 +1160,8 @@ fn (db: mut &Db) rangeNeeds(tree: int, lo: &str, hi: &str): int {
 // there (writeNeeds loaded their leaves), not as many as the stub's length
 // says, so a damaged stub cannot make a commit run on.
 fn (db: mut &Db) dropChunks(tree: int, key: &str) {
+    // no companion tree, no chunks: not looked for (a put's descent saved)
+    if !db.trees.has(&(tree + OVF)) { return }
     let big = match db.leafVal(tree, key) {
         Some(v) { isStub(&v) }
         None { false }
@@ -1268,19 +1297,36 @@ fn parseRecords(b: &[]byte, from: int, to: int): Result[[]TxWrite, lexdb_base.Db
 
 // A frame: the header, the records, padded to whole pages so that a block
 // once flushed is never written again (4.6).
-fn frame(records: &[]byte, count: int, batchNo: int, seg: int): []byte {
-    var n = FRAME_HDR + len(records)
-    n = (n + PAGE - 1) / PAGE * PAGE
-    var b = array(n, byte(0))
-    binary.setU32LE(mut &b, 0, LOG_MAGIC)
-    binary.setU64LE(mut &b, 8, batchNo)
-    binary.setU32LE(mut &b, 16, seg)
-    binary.setU32LE(mut &b, 20, len(records))
-    binary.setU32LE(mut &b, 24, count)
-    for i in 0..len(records) { b[FRAME_HDR + i] = records[i] }
-    let c = lexdb_base.crc32c(&b, 8, FRAME_HDR + len(records))
-    binary.setU32LE(mut &b, 4, int(c))
-    return b
+// A batch's frame, made in place: b is the batch, its first FRAME_HDR
+// bytes kept for the header (reserveBatch), then its records; padded to
+// whole pages.
+fn frame(b: mut &[]byte, count: int, batchNo: int, seg: int) {
+    let plen = len(b) - FRAME_HDR
+    while len(b) % PAGE != 0 { append(b, byte(0)) }
+    binary.setU32LE(b, 0, LOG_MAGIC)
+    binary.setU64LE(b, 8, batchNo)
+    binary.setU32LE(b, 16, seg)
+    binary.setU32LE(b, 20, plen)
+    binary.setU32LE(b, 24, count)
+    let c = lexdb_base.crc32c(b, 8, FRAME_HDR + plen)
+    binary.setU32LE(b, 4, int(c))
+}
+
+// Room in the batch for t's records, made before they are added: a large
+// commit's grow it once, not by doubling (which held the old and the new
+// at once). A new batch starts with room for its frame's header.
+fn (db: mut &Db) reserveBatch(t: &Txn) {
+    var need = 0
+    for w in t.writes { need += 17 + len(w.key) + len(w.val) }
+    if len(db.batch) == 0 {
+        var nb: []byte = withCapacity(FRAME_HDR + need + PAGE)
+        for i in 0..FRAME_HDR { append(mut &nb, byte(0)) }
+        db.batch = nb
+    } else if need > 1048576 {
+        var nb: []byte = withCapacity(len(db.batch) + need + PAGE)
+        for x in db.batch { append(mut &nb, x) }
+        db.batch = nb
+    }
 }
 
 // ---- transactions
@@ -1292,7 +1338,7 @@ pub fn (st: &Store) get(t: mut &Txn, tree: int, key: str): Result[Option[str], l
 pub fn (st: &Store) getPart(t: mut &Txn, tree: int, key: str): Result[Option[str], lexdb_base.DbErr] { return st.getIn(t, tree, key, M_PART) }
 
 fn (st: &Store) getIn(t: mut &Txn, tree: int, key: str, mode: int): Result[Option[str], lexdb_base.DbErr] {
-    match t.index.get(&wkey(tree, &key)) {
+    match t.lastWrite(tree, &key) {
         Some(i) {
             if t.writes[i].op == OP_DEL { return Ok(None) }
             return Ok(Some(t.writes[i].val))
@@ -1321,7 +1367,27 @@ fn (st: &Store) getIn(t: mut &Txn, tree: int, key: str, mode: int): Result[Optio
                 need = d.need
                 return
             }
-            t.noteRead(tree, key, key + "\x00", db.seq)         // an empty tree too: an insert of key conflicts
+            // an empty tree too: an insert of key conflicts. A read of a
+            // key after the last one read, with no key of the tree between
+            // them, widens that read instead (a load of rows in key order:
+            // one range, not a mark per row)
+            let nr = len(t.reads)
+            var widened = false
+            if nr > 0 && t.reads[nr - 1].tree == tree && t.reads[nr - 1].seq == db.seq && len(t.reads[nr - 1].hi) > 0 && key >= t.reads[nr - 1].hi {
+                var clear = len(d.path) == 0
+                if !clear {
+                    let lf = db.meta[d.path[len(d.path) - 1]].frame
+                    let li = db.pool[lf].lower(&key)
+                    // (an empty leaf: an empty tree; at a leaf's start, the key before
+                    // is in another leaf: not looked for)
+                    clear = db.pool[lf].count() == 0 || (li > 0 && db.pool[lf].key(li - 1) < t.reads[nr - 1].hi)
+                }
+                if clear {
+                    t.reads[nr - 1].hi = key + "\x00"
+                    widened = true
+                }
+            }
+            if !widened { t.noteRead(tree, key, key + "\x00", db.seq) }
             if len(d.path) == 0 { return }
             let leaf = d.path[len(d.path) - 1]
             let i = db.pool[db.meta[leaf].frame].lower(&key)
@@ -1409,7 +1475,7 @@ fn (t: &Txn) ownRange(tree: int, from: &str, to: &str): []TxWrite {
         let w = t.writes[i]
         if w.tree != tree || (w.op != OP_PUT && w.op != OP_DEL) { continue }
         if w.key < from || (len(to) > 0 && w.key >= to) { continue }
-        match t.index.get(&wkey(tree, &w.key)) {
+        match t.lastWrite(tree, &w.key) {
             Some(last) { if last != i { continue } }
             None {}
         }
@@ -1827,12 +1893,18 @@ fn (db: &Db) validate(t: &Txn): bool {
         var i = lo
         while i < len(db.wlog) {
             let e = &db.wlog[i]
-            if e.tree == m.tree && (e.all || (e.key >= m.lo && (len(m.hi) == 0 || e.key < m.hi))) { return false }
+            if e.tree == m.tree {
+                if e.all { return false }
+                let top = if len(e.hi) > 0 { &e.hi } else { &e.key }
+                if top >= m.lo && (len(m.hi) == 0 || e.key < m.hi) { return false }
+            }
             i += 1
         }
     }
+    var last = -1                       // a tree just checked (a large write's rows are of one or a few)
     for w in t.writes {
-        if w.op == OP_CREATE { continue }
+        if w.op == OP_CREATE || w.tree == last { continue }
+        last = w.tree
         if !db.trees.has(&w.tree) {
             var mine = false
             for c in t.created { if c == w.tree { mine = true } }
@@ -1844,9 +1916,35 @@ fn (db: &Db) validate(t: &Txn): bool {
 
 // Keeps a commit's writes for the checks of transactions still running.
 fn (db: mut &Db) logWrites(t: &Txn) {
+    // per tree: its writes' count and range
+    var trees: []int = []
+    var counts: []int = []
+    var los: []str = []
+    var his: []str = []
     for w in t.writes {
-        if w.op == OP_PUT || w.op == OP_DEL { append(mut &db.wlog, WEntry{seq: db.seq, tree: w.tree, key: w.key, all: false}) }
-        else if w.op == OP_DROP { append(mut &db.wlog, WEntry{seq: db.seq, tree: w.tree, key: "", all: true}) }
+        if w.op != OP_PUT && w.op != OP_DEL { continue }
+        var k = 0
+        while k < len(trees) && trees[k] != w.tree { k += 1 }
+        if k == len(trees) {
+            append(mut &trees, w.tree)
+            append(mut &counts, 0)
+            append(mut &los, w.key)
+            append(mut &his, w.key)
+        }
+        counts[k] += 1
+        if w.key < los[k] { los[k] = w.key }
+        if w.key > his[k] { his[k] = w.key }
+    }
+    for k in 0..len(trees) {
+        if counts[k] > WLOG_RANGE { append(mut &db.wlog, WEntry{seq: db.seq, tree: trees[k], key: los[k], hi: his[k], all: false}) }
+    }
+    for w in t.writes {
+        if w.op == OP_PUT || w.op == OP_DEL {
+            var k = 0
+            while trees[k] != w.tree { k += 1 }
+            if counts[k] <= WLOG_RANGE { append(mut &db.wlog, WEntry{seq: db.seq, tree: w.tree, key: w.key, hi: "", all: false}) }
+        }
+        else if w.op == OP_DROP { append(mut &db.wlog, WEntry{seq: db.seq, tree: w.tree, key: "", hi: "", all: true}) }
     }
     if len(db.wlog) > WLOG_MAX {
         let half = len(db.wlog) / 2
@@ -1929,6 +2027,7 @@ fn (st: &Store) commitLive(t: Txn, durable: bool): Result[Unit, lexdb_base.DbErr
             if len(t.writes) > 0 {
                 db.seq += 1
                 db.logWrites(&t)
+                db.reserveBatch(&t)
                 for w in t.writes {
                     db.applyWrite(&w)
                     addRecord(mut &db.batch, &w)
@@ -2233,13 +2332,15 @@ pub fn writer(st: Store): int {
             }
             continue
         }
-        var fr = frame(&job, count, no, segNo)
+        let plen = len(job) - FRAME_HDR
+        frame(mut &job, count, no, segNo)
+        var fr = move(job)
         if segOff > 0 && segOff + len(fr) > segBytes {
             segF.close()
             segNo += 1
             segOff = 0
             binary.setU32LE(mut &fr, 16, segNo)
-            let c = lexdb_base.crc32c(&fr, 8, FRAME_HDR + len(job))
+            let c = lexdb_base.crc32c(&fr, 8, FRAME_HDR + plen)
             binary.setU32LE(mut &fr, 4, int(c))
             match st.openSeg(segNo, if len(fr) > segBytes { len(fr) } else { segBytes }) {
                 Ok(f) { segF = f }
