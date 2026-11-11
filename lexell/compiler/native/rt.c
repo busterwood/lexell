@@ -1814,6 +1814,16 @@ static void rt_switch(rt_task* to) {
 static void rt_wake(rt_task* t) {
     if (t->state == RT_PARKED) { t->state = RT_RUN; rt_enqueue(t); }
 }
+/* Wakes a task to run next rather than after every runnable task: for a file operation's
+   completion, whose task (lexdb's log writer, with sessions waiting on its flush) is often what
+   the runnable ones wait for (design/lexdb.md 9.60). */
+static void rt_wake_front(rt_task* t) {
+    if (t->state != RT_PARKED) return;
+    t->state = RT_RUN;
+    t->next = rt_rq_head;
+    rt_rq_head = t;
+    if (!rt_rq_tail) rt_rq_tail = t;
+}
 
 /* ---- the event loop (stage C1b): rt.h's timers (a heap of parked tasks by deadline) and
    sockets (registered with epoll, edge-triggered, when made), with raw system calls */
@@ -1957,7 +1967,7 @@ static uint32_t rt_sqmask, rt_sqn, rt_cqmask, rt_sqlocal;
 static struct k_sqe* rt_sqes;
 static struct k_cqe* rt_cqes;
 static bool rt_ur_epoll_armed;
-typedef struct { rt_task* t; int32_t res; uint8_t done; } rt_uop;
+typedef struct { rt_task* t; int32_t res; uint8_t done, file; } rt_uop;   /* file: a file operation */
 static uint64_t rt_uop_ud(rt_uop* o) { return K_UR_TAG_OP | (uint64_t)o; }
 static i64 rt_ur_submit(uint32_t minc, int ms) {
     __atomic_store_n(rt_sqt, rt_sqlocal, __ATOMIC_RELEASE);
@@ -2035,7 +2045,7 @@ static void rt_ur_reap(struct k_epoll_event* ev, i64 nev) {
             rt_uop* o = (rt_uop*)(c->ud & ((1ull << 56) - 1));
             o->res = c->res;
             o->done = 1;
-            rt_wake(o->t);
+            if (o->file) rt_wake_front(o->t); else rt_wake(o->t);
         } else if (kind == K_UR_TAG_EPOLL) {
             ep = true;
             if (!(c->flags & 2)) rt_ur_epoll_armed = false;       /* IORING_CQE_F_MORE: still armed */
@@ -2493,7 +2503,10 @@ int64_t lxllib_net_recv(int64_t fd, void* b, int64_t n, const char* w, int64_t* 
     rt_nio--;
     rt_fds[fd].rd = 0;
     i64 res = o.res;
-    if (r == RT_WOK || res >= 0) return res == -K_ECANCELED ? -4 : res;
+    /* stopped: bytes that arrived are returned (they were taken from the socket); the end of the
+       stream is not, it consumes nothing and a later read sees it again (a peer's close can be
+       completed before the cancel: net_read_cancel on Linux 7.2) */
+    if (r == RT_WOK || res > 0) return res == -K_ECANCELED ? -4 : res;
     *stop = r;
     return 0;
 }
@@ -2508,7 +2521,7 @@ int64_t lxllib_file_op(int64_t op, int64_t fd, void* b, int64_t n, int64_t off, 
     if (!rt_uring_on()) return RT_NORING;
     rt_nopark(w);
     if (!rt_rq_head && !rt_nio && !rt_nheap && !rt_njobs && !rt_cc_timed()) return RT_NORING;
-    rt_uop o = {rt_cur, 0, 0};
+    rt_uop o = {rt_cur, 0, 0, 1};
     struct k_sqe* q = rt_sqe();
     q->fd = (int32_t)fd;
     q->ud = rt_uop_ud(&o);
@@ -2529,6 +2542,9 @@ int64_t lxllib_file_op(int64_t op, int64_t fd, void* b, int64_t n, int64_t off, 
         q->addr = (uint64_t)n;                                      /* the length; len is the mode */
         break;
     }
+    /* Started now, not at the loop's next look at the ring: with other tasks runnable that may be
+       64 task switches away, and lexdb's log writer waits on this (design/lexdb.md 9.60). */
+    if (rt_rq_head) rt_ur_submit(0, 0);
     rt_nio++;
     while (!o.done) rt_park_until(false, RT_NEVER, w);
     rt_nio--;

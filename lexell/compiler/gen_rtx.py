@@ -49,6 +49,11 @@ K_CODE, K_RODATA, K_DATA, K_BSS = 0, 1, 2, 3
 # Relocation types (ELF x86-64), as rtx.lxl's REL_TYPE keeps them; PLT32 becomes PC32 (no PLT:
 # every function is the runtime's own).
 R_64, R_PC32, R_PLT32, R_32, R_32S = 1, 2, 4, 10, 11
+# A call or jump through the GOT (`call/jmp *f@GOTPCREL(%rip)`, as a libgcc built with -fno-plt
+# has: gcc 16's __fixdfti) is relaxed as a linker relaxes it, to a direct one with a PC32: there
+# is no GOT, every function is the runtime's own.
+R_GOTPCREL, R_GOTPCRELX, R_REX_GOTPCRELX = 9, 41, 42
+GOT = '_GLOBAL_OFFSET_TABLE_'
 
 SHT_PROGBITS, SHT_SYMTAB, SHT_NOBITS, SHT_RELA, SHT_REL = 1, 2, 8, 4, 9
 SHF_WRITE, SHF_ALLOC, SHF_EXEC, SHF_TLS = 1, 2, 4, 0x400
@@ -118,7 +123,8 @@ class Obj:
 
     def undefined(self):
         return [y['name'] for y in self.syms
-                if y['bind'] in (STB_GLOBAL, STB_WEAK) and y['shndx'] == SHN_UNDEF and y['name']]
+                if y['bind'] in (STB_GLOBAL, STB_WEAK) and y['shndx'] == SHN_UNDEF and y['name']
+                and y['name'] != GOT]   # referenced by GOT-relative code, which is relaxed (collect)
 
 
 def cstr(b, off):
@@ -232,6 +238,20 @@ def collect(objs):
             for off, ty, symi, add in rs:
                 y = o.syms[symi]
                 if ty == R_PLT32:
+                    ty = R_PC32
+                if ty in (R_GOTPCREL, R_GOTPCRELX, R_REX_GOTPCRELX):
+                    d = secs[sec]['data']
+                    op = bytes(d[off - 2:off])
+                    if add != -4 or op not in (b'\xff\x15', b'\xff\x25'):
+                        fail(f'{o.name}: {o.secs[si]["name"]}+{off:#x}: a GOT-relative access other than a call or jump')
+                    d = bytearray(d)
+                    if op == b'\xff\x15':       # call *f@GOT(%rip) -> addr32 call f
+                        d[off - 2:off] = b'\x67\xe8'
+                    else:                       # jmp *f@GOT(%rip) -> jmp f; nop
+                        d[off - 2] = 0xe9
+                        d[off + 3] = 0x90
+                        off -= 1
+                    secs[sec]['data'] = bytes(d)
                     ty = R_PC32
                 if ty not in (R_64, R_PC32, R_32, R_32S):
                     fail(f'{o.name}: {o.secs[si]["name"]}+{off:#x}: relocation type {ty}')

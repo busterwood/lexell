@@ -4561,3 +4561,146 @@ so filter by process name; and warm the cache first (an epoll capture had
    ext4 with NVMe poll queues, `nvme.poll_queues=N` at boot; a second ring,
    since an IOPOLL ring cannot wait on sockets); the paper measured +21%.
 
+
+### 9.60 On bare metal: wakeups are cheap; commits waited for the scheduler
+
+9.59's list, run on the new machine: Linux 7.2 directly on the hardware,
+16 CPUs, `/home` on btrfs over dm-crypt on an NVMe drive. gcc 16 there
+builds `libgcc.a` with `-fno-plt`: its `__fixdfti` calls `__fixunsdfti`
+through the GOT, which `gen_rtx.py` now relaxes to a direct call or jump,
+as a linker does (`rtx.lxl` changes with the gcc anyway).
+
+**`sockbench`, one client, 13 us of work a message** (round trip in us,
+three runs each):
+
+| | epoll | io_uring |
+|---|---|---|
+| Unix, client sleeping | 21.0 to 21.5 | 20.6 to 20.9 |
+| TCP, client sleeping | 24.2 to 24.5 | 24.3 to 24.5 |
+| Unix, client spinning | 18.4 | 18.4 to 18.6 |
+| TCP, client spinning | 22.4 | 22.4 to 22.6 |
+
+A wakeup costs a few microseconds where WSL2 took about 60 (71 to 74 us
+over Unix, 237 to 280 over TCP, 9.59); 0.03 to 0.3 function-call IPIs a
+message. Loopback TCP is no longer ten times slower than a Unix socket.
+
+**`pgsel.sh`** (6 s runs; warm cache 3 rounds, the others 2; averages):
+
+| | epoll | io_uring |
+|---|---|---|
+| Warm, Unix, 1 client | 86,100/s, 8.3 us | 79,400/s, 8.6 us |
+| Warm, Unix, 8 and 32 | ~150,000/s, 6.6 us | ~170,000/s, 5.9 us |
+| Warm, TCP, 1 | 62,000/s, 9.4 us | 63,100/s, 9.3 us |
+| Warm, TCP, 8 and 32 | ~114,000/s, 7.4 us | ~120,000/s, 7.0 us |
+| `LEXDB_CACHE_MB=64`, Unix, 32 | 118,000/s, 16.9 us | 99,000/s, 9.2 us |
+| Updates, Unix, 1 | 1,310/s, 358 us | 1,260/s, 182 us |
+| Updates, Unix, 32 | 21,700/s, 33 us | 17,600/s, 26 us |
+
+Five to seven times WSL2's rates. The warm io_uring rows at 8 and 32
+clients are rounds 1 and 2: the third came in 15% low in every row
+through the ring (144,000 and 137,000 over Unix); the one-client rerun
+below did not repeat it.
+
+**The one-client gap (step 2) is the wakeup.** `trace1.sh`, both modes,
+warm: a request's round trip is 14 us with epoll, 16 through the ring.
+The server's own part is 1 us shorter through the ring (no `read`), but
+with epoll it is woken inside pgbench's `send`, and through the ring 2 us
+later: the receive's completion is queued as task work
+(`io_uring_task_add`), and the waiting thread woken from that. Polling
+before sleeping closes it (one client, 5 s, three rounds each):
+
+| | epoll | io_uring | epoll, 20 us | io_uring, 20 us |
+|---|---|---|---|---|
+| Unix | 85,600/s, 8.4 us | 79,400/s, 8.6 us | 95,700/s, 10.4 us | 96,400/s, 10.3 us |
+| TCP | 61,200/s, 9.7 us | 63,100/s, 9.2 us | 72,000/s, 12.5 us | 72,700/s, 12.4 us |
+
+Here, unlike WSL2, spinning pays: the next request comes back within
+20 us. It costs about 25% more CPU a select, so it is still not a
+default; the adaptive shape of 9.57 is.
+
+**Commits through the ring were slower: the scheduler, not the kernel.**
+With 32 clients, updates ran at 17,600/s through the ring against 21,700
+with epoll. Traced (fdatasync and pwrite, or the ring's FSYNC and WRITE,
+2 s at 32 clients):
+
+| A flush | epoll and the pool | io_uring |
+|---|---|---|
+| fdatasync | 638 us | 632 us |
+| the log write | 37 us | 147 us |
+| a flush's end to the next's start | 64 us | 231 us |
+
+Two causes. First btrfs: an O_DIRECT write to a copy-on-write file must
+allocate, so it cannot be issued without blocking and the ring hands
+every log write to an io-wq worker (`io_uring_queue_async_work ... WRITE,
+hashed queue`); zeroing a segment ahead (`openSeg`) does not help on a
+copy-on-write file system. A data directory with copy-on-write off
+(`chattr +C` on the empty directory) removes that: the write is issued
+inline, and both modes commit faster (epoll 26,400/s at 32 clients).
+But the ring still lagged (19,900/s), its write still taking 160 us.
+
+Second, and the main one: the loop looks at the ring only when it would
+sleep or every 64 task switches (`rt_next`). With 32 sessions runnable it
+never sleeps, so the log write's SQE waited up to 64 switches to be
+submitted, and its completion up to 64 more to be reaped; then the
+woken writer queued behind every runnable session. The helper pool starts
+a job at once on another thread. Now a file operation is submitted when
+it is queued if other tasks are runnable (one `io_uring_enter`, as the
+pool's futex wake was one system call), and a file operation's
+completion wakes its task to run next (`rt_wake_front`). Measured
+(no-COW directory, Unix, 6 s, two rounds):
+
+| Updates, 32 clients | /s | CPU an update |
+|---|---|---|
+| epoll and the pool | 26,200 | 25.7 us |
+| io_uring before | 19,900 | 17.6 us |
+| submitted at once | 21,300 | 17.7 us |
+| polled every 8 switches with a file operation out | 22,400 | 17.6 us |
+| both | 23,600 | 17.7 us |
+| at once, completions first | 25,600 | 17.7 us |
+| all three | 25,800 | 18.0 us |
+
+The third and fourth together are the change: the same commit rate as
+epoll for 30% less CPU, the write back to 49 us. Polling more often adds
+nothing beyond noise and is not kept. At 8 clients every variant is
+within noise of the others (6,100 to 6,800/s). Cache-missing selects
+are unchanged by it (`LEXDB_CACHE_MB=64`, Unix, 32 clients: 100,000/s at
+9 us before and after).
+
+**Cache-missing selects with many clients: one thread's limit.** At 32
+clients the ring serves 100,000 selects/s at 9 us of server CPU each,
+epoll and the pool 118,000 at 17 us. The ring's 9 us are all on the one
+loop thread, which is then busy (0.9 of a CPU); the pool spreads its
+`pread`s over helper threads. More throughput through the ring needs more
+than one loop (task.workers), not a cheaper read.
+
+The crash test passes, 20 rounds each, with and without `LXL_URING=1`.
+
+**A cancelled read and the end of the stream.** `net_read_cancel` failed
+natively with `LXL_URING=1` on Linux 7.2, with the runtime as committed
+too: its reader, parked in a receive, is cancelled as its scope ends, and
+the scope's end also closes the peer. Here the receive's completion with
+the end of the stream (res 0) comes before the cancel's, and the runtime
+returned any res >= 0 as data that arrived meanwhile, so the reader saw
+`read 0`, not the cancellation. Bytes must be returned (they were taken
+from the socket); the end of the stream need not be (it consumes
+nothing, a later read sees it again). Now only res > 0 is. The kernel
+itself completes a cancelled receive with -ECANCELED (a liburing probe).
+
+**The tests on this machine.** Two library tests differ for reasons of
+the machine, not the runtime: `tls_memory` (OpenSSL 3.6 appends "; record
+layer failure" to the bad-MAC error) and `tz_zones` (the system's tzdata).
+lexdb's tests hit the conformance runner's 20 s compile limit: gcc 16
+takes 24.5 s for one test's 4.5 MB of C; with a longer limit all 62 pass,
+with and without the ring.
+
+**Next:**
+1. Step 3: the ring by default where the kernel allows it, both modes in
+   `tools/gate.sh`. The commit regression is gone; the one-client gap (2
+   us over a Unix socket) remains, and adaptive polling is its answer.
+2. Adaptive polling before sleeping (9.57's shape).
+3. Step 4: socket writes through the ring.
+4. IOPOLL for the data file needs ext4 or a raw partition (this
+   `/home` is btrfs over dm-crypt) and `nvme.poll_queues` at boot.
+5. Should lexdb set copy-on-write off (`FS_NOCOW_FL`) on its data
+   directory when it makes it on btrfs? It gives up btrfs's checksums for
+   those files; lexdb's pages carry their own CRC32C.
