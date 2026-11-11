@@ -1,0 +1,189 @@
+// lexdb_auth: SCRAM-SHA-256 (RFC 5802, 7677), the server's side, as
+// PostgreSQL does it (9.81): a role's password is kept as PostgreSQL keeps
+// it, a verifier "SCRAM-SHA-256$iterations:salt$StoredKey:ServerKey"
+// (base64), never the password; SCRAM-SHA-256-PLUS binds the exchange to
+// the TLS connection (tls-server-end-point, RFC 5929).
+//
+// Not done: SASLprep (a password is used as its UTF-8 bytes, which is what
+// SASLprep gives for ASCII).
+
+import "strings"
+import "crypto"
+import "./lexdb_base"
+
+pub const ITERATIONS = 4096
+pub const MECH = "SCRAM-SHA-256"
+pub const MECH_PLUS = "SCRAM-SHA-256-PLUS"
+
+type DbErr = lexdb_base.DbErr
+
+fn e(state: str, msg: str): DbErr { return lexdb_base.err(state, msg) }
+
+pub type Verifier = record {
+    pub iter: int
+    pub salt: str           // raw bytes
+    pub stored: str         // StoredKey, raw
+    pub server: str         // ServerKey, raw
+}
+
+fn cryptoErr(x: crypto.Error): DbErr { return e("XX000", x.toStr()) }
+
+fn hmac(key: &str, data: &str): Result[str, DbErr] {
+    match crypto.hmacSha256(key.toStr(), data.toStr()) {
+        Ok(h) { return Ok(h) }
+        Err(x) { return Err(cryptoErr(x)) }
+    }
+}
+
+fn sha(data: &str): Result[str, DbErr] {
+    match crypto.sha256(data.toStr()) {
+        Ok(h) { return Ok(h) }
+        Err(x) { return Err(cryptoErr(x)) }
+    }
+}
+
+fn random(n: int): Result[str, DbErr] {
+    match crypto.randomBytes(n) {
+        Ok(b) { return Ok(b) }
+        Err(x) { return Err(cryptoErr(x)) }
+    }
+}
+
+fn xorStr(a: &str, b: &str): str {
+    var out = newStrBuf()
+    for i in 0..len(a) { out.addByte(a[i] ^ b[i]) }
+    return out.toStr()
+}
+
+// A password's verifier, with a new random salt.
+pub fn makeVerifier(password: &str): Result[str, DbErr] {
+    let salt = try random(16)
+    let salted = match crypto.pbkdf2Sha256(password.toStr(), salt, ITERATIONS, 32) {
+        Ok(k) { k }
+        Err(x) { return Err(cryptoErr(x)) }
+    }
+    let stored = try sha(&(try hmac(&salted, &"Client Key")))
+    let server = try hmac(&salted, &"Server Key")
+    return Ok(MECH + "$" + ITERATIONS.toStr() + ":" + crypto.base64(salt) + "$" + crypto.base64(stored) + ":" + crypto.base64(server))
+}
+
+// A verifier's parts; None if s is not one.
+pub fn parseVerifier(s: &str): Option[Verifier] {
+    if !strings.startsWith(s, MECH + "$") { return None }
+    let parts = strings.split(&s[len(MECH) + 1..len(s)], "$")
+    if len(parts) != 2 { return None }
+    let a = strings.split(&parts[0], ":")
+    let b = strings.split(&parts[1], ":")
+    if len(a) != 2 || len(b) != 2 { return None }
+    let iter = strings.parseIntOpt(a[0].toStr()).unwrapOr(0)
+    if iter < 1 { return None }
+    match crypto.unbase64(a[1].toStr()) {
+        Some(salt) {
+            match crypto.unbase64(b[0].toStr()) {
+                Some(st) {
+                    match crypto.unbase64(b[1].toStr()) {
+                        Some(sv) {
+                            if len(st) != 32 || len(sv) != 32 { return None }
+                            return Some(Verifier{iter: iter, salt: salt, stored: st, server: sv})
+                        }
+                        None {}
+                    }
+                }
+                None {}
+            }
+        }
+        None {}
+    }
+    return None
+}
+
+// One SCRAM exchange's state.
+pub type Scram = record {
+    v: Verifier
+    real: bool              // the role exists with a password: else the exchange runs and fails
+    plusOffered: bool       // SCRAM-SHA-256-PLUS was offered (a TLS connection that can bind)
+    plus: bool              // the client chose it
+    gs2: str                // the client's GS2 header ("n,," and the like)
+    bare: str               // client-first-message-bare
+    first: str              // server-first-message
+    nonce: str              // the whole nonce, the client's then ours
+}
+
+// A new exchange for a role's verifier (None: no such role, or no password:
+// a made-up verifier, so the exchange looks the same and fails at its end).
+pub fn begin(v: Option[Verifier], plusOffered: bool): Result[Scram, DbErr] {
+    let real = v.isSome()
+    var ver = Verifier{iter: ITERATIONS, salt: try random(16), stored: try random(32), server: try random(32)}
+    if real { ver = v.unwrap() }
+    return Ok(Scram{v: ver, real: real, plusOffered: plusOffered, plus: false, gs2: "", bare: "", first: "", nonce: ""})
+}
+
+fn proto(msg: &str): DbErr { return e("08P01", msg.toStr()) }
+
+// The SASLInitialResponse: its mechanism and client-first-message; the
+// server-first-message to send.
+pub fn serverFirst(sc: mut &Scram, mech: &str, clientFirst: &str): Result[str, DbErr] {
+    if mech != MECH && !(mech == MECH_PLUS && sc.plusOffered) {
+        return Err(proto(&"client selected an invalid SASL authentication mechanism"))
+    }
+    sc.plus = mech == MECH_PLUS
+    // gs2-header: n | y | p=tls-server-end-point, then an authzid (none), then ","
+    let c1 = strings.indexOf(clientFirst, ",", 0)
+    if c1 < 0 { return Err(proto(&"malformed SCRAM message")) }
+    let flag = clientFirst[0..c1]
+    let c2 = strings.indexOf(clientFirst, ",", c1 + 1)
+    if c2 < 0 { return Err(proto(&"malformed SCRAM message")) }
+    if c2 != c1 + 1 { return Err(e("0A000", "client uses authorization identity, but it is not supported")) }
+    if sc.plus {
+        if flag != "p=tls-server-end-point" {
+            return Err(proto(&"channel binding type is not supported by the server or the client chose SCRAM-SHA-256-PLUS without it"))
+        }
+    } else if flag == "y" {
+        // the client can bind and thinks we cannot: a downgrade, if we offered it
+        if sc.plusOffered { return Err(e("28000", "SCRAM channel binding negotiation error")) }
+    } else if flag != "n" {
+        return Err(proto(&"unexpected SCRAM channel-binding flag"))
+    }
+    sc.gs2 = clientFirst[0..c2 + 1].toStr()
+    sc.bare = clientFirst[c2 + 1..len(clientFirst)].toStr()
+    // n=user (ignored: the startup message names the role), r=nonce
+    var cnonce = ""
+    for f in strings.split(&sc.bare, ",") {
+        if strings.startsWith(&f, "r=") { cnonce = f[2..len(f)].toStr() }
+        if strings.startsWith(&f, "m=") { return Err(proto(&"unsupported SCRAM extension")) }
+    }
+    if len(cnonce) == 0 { return Err(proto(&"malformed SCRAM message: no nonce")) }
+    sc.nonce = cnonce + crypto.base64(try random(18))
+    sc.first = "r=" + sc.nonce + ",s=" + crypto.base64(sc.v.salt) + ",i=" + sc.v.iter.toStr()
+    return Ok(sc.first)
+}
+
+// The SASLResponse: client-final-message, with endPoint the TLS channel
+// binding data (when bound); the server-final-message to send, or 28P01.
+pub fn serverFinal(sc: mut &Scram, clientFinal: &str, endPoint: &str): Result[str, DbErr] {
+    let pi = strings.lastIndexOf(clientFinal, ",p=")
+    if pi < 0 { return Err(proto(&"malformed SCRAM message: no proof")) }
+    let withoutProof = clientFinal[0..pi]
+    var cb = ""
+    var nonce = ""
+    for f in strings.split(&withoutProof, ",") {
+        if strings.startsWith(&f, "c=") { cb = f[2..len(f)].toStr() }
+        if strings.startsWith(&f, "r=") { nonce = f[2..len(f)].toStr() }
+    }
+    let want = sc.gs2 + (if sc.plus { endPoint.toStr() } else { "" })
+    match crypto.unbase64(cb) {
+        Some(got) { if got != want { return Err(proto(&"SCRAM channel binding check failed")) } }
+        None { return Err(proto(&"malformed SCRAM message: channel binding")) }
+    }
+    if nonce != sc.nonce { return Err(proto(&"SCRAM nonce mismatch")) }
+    let proof = match crypto.unbase64(clientFinal[pi + 3..len(clientFinal)].toStr()) {
+        Some(p) { p }
+        None { return Err(proto(&"malformed SCRAM message: proof")) }
+    }
+    if len(proof) != 32 { return Err(proto(&"malformed SCRAM message: proof")) }
+    let authMsg = sc.bare + "," + sc.first + "," + withoutProof
+    // ClientKey = proof XOR HMAC(StoredKey, AuthMessage); its hash must be StoredKey
+    let clientKey = xorStr(&proof, &(try hmac(&sc.v.stored, &authMsg)))
+    if !sc.real || (try sha(&clientKey)) != sc.v.stored { return Err(e("28P01", "")) }
+    return Ok("v=" + crypto.base64(try hmac(&sc.v.server, &authMsg)))
+}

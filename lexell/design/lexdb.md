@@ -6143,3 +6143,99 @@ SHOW's: psql shows none.
 - not-null constraints are not rows of `pg_constraint` (PostgreSQL 18
   makes them some);
 - `current_database()` is `lexdb` whatever database the client named.
+
+### 9.81 Authentication and TLS
+
+Stage 4 of 9.75. Until now lexdb let any connection in as any user, in
+plaintext: fit for loopback only.
+
+- **Roles** are rows of the catalog (`\x05name`): whether one may log in,
+  whether it is a superuser, and its password's SCRAM verifier. The
+  verifier is PostgreSQL's form, `SCRAM-SHA-256$4096:salt$StoredKey:ServerKey`;
+  the password itself is never kept.
+  - The statements:
+    - `CREATE ROLE | USER name [WITH] options`, where USER implies LOGIN;
+    - `ALTER ROLE | USER name [WITH] options`, `ALTER ROLE name RENAME TO
+      new`;
+    - `DROP ROLE | USER [IF EXISTS] name, ...`.
+  - Their options are LOGIN, SUPERUSER and their NOs, and `[ENCRYPTED]
+    PASSWORD 'text' | NULL`. The other options PostgreSQL has are read and
+    not kept.
+  - A PASSWORD that is already a SCRAM verifier is kept as given (pg_dump
+    writes them). An MD5 one is refused (0A000), and an empty one is none.
+  - **Who may:** a superuser role, or a session that is no role (one that
+    came in by trust). A role may change its own password (42501
+    otherwise).
+  - **Errors** as PostgreSQL's: 42710 exists, 42704 does not exist, 55006
+    dropping yourself, 42939 for a `pg_` name.
+  - `pg_roles` and `pg_user` list the roles (and the trusted session's user
+    when it is none). Roles replicate with the catalog, and a replica
+    refuses role DDL as it refuses any write.
+- **Methods**, by the connection's kind: `--auth` for TCP, `--auth-local`
+  for the Unix socket. Each is `trust` (the default, as initdb's) or
+  `scram-sha-256`.
+  - **trust** lets any user name in, as before.
+  - **SCRAM-SHA-256** (`cmd/lexdb_auth.lxl`, RFC 5802 and 7677) checks the
+    role's verifier.
+    - The server offers `SCRAM-SHA-256-PLUS` too over TLS, binding the
+      exchange to the connection (tls-server-end-point: a hash of the
+      server's certificate, `tls.Engine.ownEndPoint`, new in lib/tls). A
+      client that can bind but says it cannot ("y") is refused, as a
+      downgrade.
+    - An unknown role, or one with no password, goes through the same
+      exchange with a made-up verifier and fails at its end (28P01, the
+      same message), so a client cannot tell which roles exist.
+    - A role that may not log in is refused after the exchange (28000).
+    - With no roles yet, nobody gets in by SCRAM. The first roles are made
+      over the trusted Unix socket, as PostgreSQL's are made by peer
+      authentication.
+- **TLS:** `--tls-cert FILE [--tls-key FILE]`.
+  - An SSLRequest is answered `S`, and the handshake is lib/tls's memory
+    engine. `Wire.fill` and `Wire.flush` read and write through it, so
+    every message, COPY included, goes over TLS.
+  - Bytes the client sent after the SSLRequest, before TLS, are refused
+    (CVE-2021-23214).
+  - Each accept loop loads the certificate once, and every connection
+    shares that context.
+  - `--require-tls` refuses a TCP connection without TLS (28000).
+  - GSSAPI encryption is answered `N`. Direct TLS (PostgreSQL 17's
+    `sslnegotiation=direct`) is not done.
+- **The settings** are checked when the server starts: a method it does not
+  know, or a certificate it cannot load, stops it with a message. They are
+  then kept in the store's memo (`lexdb_wire.configure`), where the accept
+  loops read them, so the tests' accept loops did not change. The master,
+  the replicas and the supervisor all take the same flags.
+- `current_user` is the authenticated role.
+- `repeat(text, n)`, which the test wanted, was missing; it is added.
+
+**Clients, against a server with `--auth scram-sha-256` and TLS:**
+- **psql (libpq 18):** connects with `sslmode=verify-full`,
+  `channel_binding=require` and TLS 1.3. Wrong passwords, unknown roles and
+  NOLOGIN roles get PostgreSQL's messages. 5 MB of SELECT and COPY go
+  through TLS both ways.
+- **psycopg** (channel binding required) and **node-postgres** (TLS
+  verified against the CA) connect and query.
+- **asyncpg** connects and authenticates over TLS. It then stops at binary
+  results (stage 5).
+
+**Tests.** `wire_auth`, against Lexell's own client (lib/postgres over
+pgwire). The certificates are made at test time by lib's test PKI
+(`tlstest.pki()`, the openssl command; skipped without it). It covers:
+- roles made over trust, and `pg_roles` and `pg_user`;
+- SCRAM without TLS: the right password, a wrong one, an unknown role, a
+  NOLOGIN role;
+- SCRAM-SHA-256-PLUS with `verify-full` against the test CA, and a 1 MB
+  result over TLS;
+- a role changing its own password and refused CREATE ROLE, a superuser's
+  ALTER and DROP, and the errors;
+- `--require-tls` both ways.
+
+**Not done:**
+- per-database or per-address rules (pg_hba.conf);
+- `password` (cleartext), `md5`, client certificates (`cert`), GSSAPI;
+- SASLprep of passwords: they are used as their UTF-8 bytes, which is
+  SASLprep's answer for ASCII;
+- the role's own settings (`ALTER ROLE ... SET`) and memberships (`GRANT
+  role`);
+- privileges on tables. Any role that logs in may read and write
+  everything, as a superuser may in PostgreSQL.

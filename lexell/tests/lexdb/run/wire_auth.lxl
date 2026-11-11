@@ -1,0 +1,138 @@
+// lexdb_wire's authentication and TLS (design/lexdb.md 9.81) against
+// Lexell's own PostgreSQL client (lib/postgres over pgwire): roles made by
+// a trusted session, then SCRAM-SHA-256 with and without TLS, channel
+// binding (SCRAM-SHA-256-PLUS) with the certificate verified, the errors,
+// and --require-tls. The PKI is made at test time by the openssl command
+// (lib/tests/support/tlstest; skipped without it).
+// needs: ssl
+// expect: roles made
+// expect: admin|t|t|t|********;app|t|f|t|********;ro|f|f|f|********
+// expect: scram: app
+// expect: wrong password: 28P01 password authentication failed for user "app"
+// expect: no such role: 28P01 password authentication failed for user "ghost"
+// expect: no login: 28000 role "ro" is not permitted to log in
+// expect: tls, bound, verified: app|t
+// expect: 2000 rows, 1016000 bytes
+// expect: create role as app: 42501
+// expect: own password changed: ok
+// expect: new password: app
+// expect: old password: 28P01
+// expect: admin alters and drops: ok
+// expect: drop again: 42704
+// expect: create again: 42710
+// expect: md5: 0A000
+// expect: require tls, plain: 28000 lexdb: a TCP connection must use TLS (sslmode=require)
+// expect: require tls, tls: app
+import "task"
+import "net"
+import "postgres"
+import "strings"
+import "../../../lib/tests/support/tlstest"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_wire"
+
+fn connStr(port: &str, user: &str, pw: &str, ssl: &str): str {
+    var s = "host=127.0.0.1 port=" + port + " user=" + user + " dbname=x " + ssl
+    if len(pw) > 0 { s = s + " password=" + pw }
+    return s
+}
+
+// The connection's first value of q, or its error's state and message.
+fn one(cs: &str, q: &str): str {
+    match postgres.connect(cs.toStr()) {
+        Ok(c) {
+            var cc = c
+            match cc.query(q.toStr(), &[]) {
+                Ok(r) {
+                    var rows: []str = []
+                    for i in 0..r.rowCount() {
+                        var cells: []str = []
+                        for j in 0..r.columnCount() { append(mut &cells, r.text(i, j).unwrapOr("")) }
+                        append(mut &rows, strings.join(&cells, "|"))
+                    }
+                    return strings.join(&rows, ";")
+                }
+                Err(e) { return e.state }
+            }
+        }
+        Err(e) {
+            // libpq's form: connection to server at ..., port N failed: FATAL:  message
+            let i = strings.indexOf(&e.msg, "FATAL:  ", 0)
+            return e.state + " " + (if i >= 0 { e.msg[i + 8..len(e.msg)].toStr() } else { e.msg })
+        }
+    }
+}
+
+fn client(st: &lexdb_store.Store, port: &str) {
+    let cert = tlstest.path("srv.pem")
+    let key = tlstest.path("srv.key")
+    var conf = lexdb_wire.noAuth()
+    conf.cert = cert
+    conf.key = key
+    lexdb_wire.configure(st, &conf).unwrap()
+    // trust: the roles made
+    let boot = connStr(port, &"boot", &"", &"sslmode=disable")
+    var b = postgres.connect(boot).unwrap()
+    b.exec("create role app login password 'secret'").unwrap()
+    b.exec("create role ro password 'pw2'").unwrap()
+    b.exec("create user admin superuser password 'adm'").unwrap()
+    println("roles made")
+    println(one(&boot, &"select rolname, rolcanlogin, rolsuper, rolname in (select usename from pg_user), rolpassword from pg_roles where rolname <> 'boot' order by 1"))
+    conf.tcp = "scram-sha-256"
+    lexdb_wire.configure(st, &conf).unwrap()
+    let plain = "sslmode=disable"
+    println("scram: " + one(&connStr(port, &"app", &"secret", &plain), &"select current_user"))
+    println("wrong password: " + one(&connStr(port, &"app", &"nope", &plain), &"select 1"))
+    println("no such role: " + one(&connStr(port, &"ghost", &"x", &plain), &"select 1"))
+    println("no login: " + one(&connStr(port, &"ro", &"pw2", &plain), &"select 1"))
+    let bound = "sslmode=verify-full sslrootcert=" + tlstest.path("ca.pem") + " channel_binding=require"
+    println("tls, bound, verified: " + one(&connStr(port, &"app", &"secret", &bound), &"select current_user, true"))
+    // a result of many TLS records
+    println(one(&connStr(port, &"app", &"secret", &bound),
+                &"select count(*) || ' rows, ' || sum(length(x)) || ' bytes' from (select repeat('y', 500) || g || g as x from generate_series(1000, 2999) g) s"))
+    let app = connStr(port, &"app", &"secret", &plain)
+    println("create role as app: " + one(&app, &"create role z"))
+    var a = postgres.connect(app).unwrap()
+    match a.query("alter role app password 'secret2'", &[]) {
+        Ok(_) { println("own password changed: ok") }
+        Err(e) { println("own password: " + e.state) }
+    }
+    println("new password: " + one(&connStr(port, &"app", &"secret2", &plain), &"select current_user"))
+    println("old password: " + one(&connStr(port, &"app", &"secret", &plain), &"select 1")[0..5])
+    var ad = postgres.connect(connStr(port, &"admin", &"adm", &plain)).unwrap()
+    let r1 = ad.query("alter role app password 'secret'", &[]).unwrap()
+    let r2 = ad.query("drop role ro", &[]).unwrap()
+    println("admin alters and drops: ok")
+    let adm = connStr(port, &"admin", &"adm", &plain)
+    println("drop again: " + one(&adm, &"drop role ro"))
+    println("create again: " + one(&adm, &"create role app"))
+    println("md5: " + one(&adm, &"create role m password 'md5a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4'"))
+    conf.requireTls = true
+    lexdb_wire.configure(st, &conf).unwrap()
+    println("require tls, plain: " + one(&connStr(port, &"app", &"secret", &plain), &"select 1"))
+    println("require tls, tls: " + one(&connStr(port, &"app", &"secret", &"sslmode=require"), &"select current_user"))
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        // the accept loop reads the TLS files when it starts: configured first
+        var conf = lexdb_wire.noAuth()
+        conf.cert = tlstest.path("srv.pem")
+        conf.key = tlstest.path("srv.key")
+        lexdb_wire.configure(&st, &conf).unwrap()
+        let f = s.start(lexdb_wire.acceptLoop, lexdb_wire.AcceptArg{ln: ln, st: st})
+        client(&st, &addr[10..len(addr)])
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    tlstest.pki()
+    lexdb_store.run(lexdb_disk.sim(5), lexdb_store.Options{cacheBytes: 128 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000, bufferedPages: false}, body).unwrap()
+}

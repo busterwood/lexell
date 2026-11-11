@@ -25,6 +25,7 @@ import "./lexdb_base"
 import "./lexdb_time"
 import "./lexdb_float"
 import "./lexdb_pgcat"
+import "./lexdb_auth"
 import "regex"
 import "math"
 import "base64"
@@ -6957,7 +6958,7 @@ pub fn exprOid(x: &Expr, cols: &[]lexdb_sql.ColDef, ptypes: &[]int): int {
                 "sqrt", "cbrt", "exp", "ln", "log10", "power", "pow", "random" { return lexdb_sql.OID_FLOAT8 }
                 "format_type", "pg_get_expr", "pg_get_constraintdef", "pg_get_indexdef", "pg_get_serial_sequence", "quote_ident",
                 "array_to_string", "obj_description", "col_description", "shobj_description", "pg_get_viewdef", "json_build_object",
-                "jsonb_build_object", "pg_get_userbyid", "pg_get_triggerdef", "pg_get_statisticsobjdef_columns",
+                "jsonb_build_object", "pg_get_userbyid", "repeat", "pg_get_triggerdef", "pg_get_statisticsobjdef_columns",
                 "pg_get_function_result", "pg_get_function_arguments" {
                     return lexdb_sql.OID_TEXT
                 }
@@ -8741,7 +8742,8 @@ fn isWrite(kind: int): bool {
            kind == lexdb_sql.S_UPDATE || kind == lexdb_sql.S_DELETE || kind == lexdb_sql.S_CREATE_INDEX ||
            kind == lexdb_sql.S_DROP_INDEX || kind == lexdb_sql.S_CREATE_SCHEMA || kind == lexdb_sql.S_DROP_SCHEMA ||
            kind == lexdb_sql.S_ALTER || kind == lexdb_sql.S_ALTER_INDEX || kind == lexdb_sql.S_ALTER_SCHEMA ||
-           kind == lexdb_sql.S_CREATE_SEQ || kind == lexdb_sql.S_ALTER_SEQ || kind == lexdb_sql.S_DROP_SEQ
+           kind == lexdb_sql.S_CREATE_SEQ || kind == lexdb_sql.S_ALTER_SEQ || kind == lexdb_sql.S_DROP_SEQ ||
+           kind == lexdb_sql.S_CREATE_ROLE || kind == lexdb_sql.S_ALTER_ROLE || kind == lexdb_sql.S_DROP_ROLE
 }
 
 fn stmtName(kind: int): str {
@@ -8754,6 +8756,9 @@ fn stmtName(kind: int): str {
         lexdb_sql.S_DROP_INDEX { "DROP INDEX" }
         lexdb_sql.S_CREATE_SCHEMA { "CREATE SCHEMA" }
         lexdb_sql.S_DROP_SCHEMA { "DROP SCHEMA" }
+        lexdb_sql.S_CREATE_ROLE { "CREATE ROLE" }
+        lexdb_sql.S_ALTER_ROLE { "ALTER ROLE" }
+        lexdb_sql.S_DROP_ROLE { "DROP ROLE" }
         lexdb_sql.S_ALTER { "ALTER TABLE" }
         lexdb_sql.S_ALTER_INDEX { "ALTER INDEX" }
         lexdb_sql.S_ALTER_SCHEMA { "ALTER SCHEMA" }
@@ -8815,6 +8820,7 @@ fn execStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
         lexdb_sql.S_CREATE_INDEX { return createIndex(st, txn, s) }
         lexdb_sql.S_DROP_INDEX { return dropIndex(st, txn, s) }
         lexdb_sql.S_CREATE_SCHEMA { return createSchemaStmt(st, txn, s) }
+        lexdb_sql.S_CREATE_ROLE, lexdb_sql.S_ALTER_ROLE, lexdb_sql.S_DROP_ROLE { return roleStmt(st, txn, s) }
         lexdb_sql.S_DROP_SCHEMA { return dropSchema(st, txn, s) }
         lexdb_sql.S_ALTER { return alterTable(st, txn, s, lim) }
         lexdb_sql.S_ALTER_INDEX { return alterIndex(st, txn, s) }
@@ -13778,6 +13784,13 @@ fn callMisc(name: &str, vs: &[]Val): Result[Option[Val], DbErr] {
         let m = if isNull(&vs[1]) { -1 } else { oidArg(&vs[1]).unwrapOr(-1) }
         return Ok(Some(Val.Text(lexdb_pgcat.formatType(oidArg(&vs[0]).unwrapOr(0), m))))
     }
+    if name == "repeat" && n == 2 {
+        if isNull(&vs[0]) || isNull(&vs[1]) { return Ok(Some(Val.Null)) }
+        let k = oidArg(&vs[1]).unwrapOr(0)
+        let t = text(&vs[0])
+        if k > 0 && len(t) * k > 1073741823 { return Err(e("54000", "requested length too large")) }
+        return Ok(Some(Val.Text(if k <= 0 { "" } else { strings.repeat(t, k) })))
+    }
     if name == "quote_ident" && n == 1 {
         if isNull(&vs[0]) { return Ok(Some(Val.Null)) }
         return Ok(Some(Val.Text(quoteIfNeeded(&text(&vs[0])))))
@@ -14113,12 +14126,21 @@ fn catRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &str): Result
             append(mut &rows, [iv(1663), tv(&"pg_default"), iv(OID_OWNER), Val.Null, Val.Null])
             append(mut &rows, [iv(1664), tv(&"pg_global"), iv(OID_OWNER), Val.Null, Val.Null])
         }
-        "pg_roles" {
-            append(mut &rows, [tv(&owner), bv(true), bv(true), bv(true), bv(true), bv(true), bv(true), iv(-1), tv(&"********"), Val.Null,
-                               bv(true), Val.Null, iv(OID_OWNER)])
-        }
-        "pg_user" {
-            append(mut &rows, [tv(&owner), iv(OID_OWNER), bv(true), bv(true), bv(true), bv(true), tv(&"********"), Val.Null, Val.Null])
+        "pg_roles", "pg_user" {
+            var rs = try rolesIn(st, txn)
+            var seen = false
+            for r in rs { if r.name == owner { seen = true } }
+            if !seen { append(mut &rs, Role{name: owner, login: true, superuser: true, verifier: ""}) }
+            for r in rs {
+                let o = if r.name == owner { OID_OWNER } else { catOid(&"a", &r.name) }
+                let pw = if len(r.verifier) > 0 { tv(&"********") } else { Val.Null }
+                if rel == "pg_roles" {
+                    append(mut &rows, [tv(&r.name), bv(r.superuser), bv(true), bv(r.superuser), bv(r.superuser), bv(r.login), bv(false),
+                                       iv(-1), pw, Val.Null, bv(r.superuser), Val.Null, iv(o)])
+                } else if r.login {
+                    append(mut &rows, [tv(&r.name), iv(o), bv(r.superuser), bv(r.superuser), bv(false), bv(r.superuser), pw, Val.Null, Val.Null])
+                }
+            }
         }
         "pg_tables" {
             for ct in snap.tabs {
@@ -14293,4 +14315,125 @@ fn checkCols(t: &Table, c: &CatCon): []int {
         if strings.contains(&c.check, &t.cols[i].name) { append(mut &out, i + 1) }
     }
     return out
+}
+
+// ---- roles (9.81)
+//
+// A role is a catalog row of its own, roleKey(name): whether it may log in,
+// whether it is a superuser, and its password's SCRAM verifier ("" none).
+// Roles matter to SCRAM authentication (lexdb_wire); a session that came in
+// by trust is not checked against them.
+
+pub type Role = record {
+    pub name: str
+    pub login: bool
+    pub superuser: bool
+    pub verifier: str
+}
+
+fn roleKey(n: &str): str { return "\x05" + n }
+
+fn encRole(r: &Role): str { return (if r.login { "1" } else { "0" }) + "\t" + (if r.superuser { "1" } else { "0" }) + "\t" + r.verifier }
+
+fn decRole(name: &str, v: &str): Role {
+    let f = strings.split(v, "\t")
+    return Role{name: name.toStr(), login: len(f) > 0 && f[0] == "1", superuser: len(f) > 1 && f[1] == "1",
+                verifier: if len(f) > 2 { f[2].toStr() } else { "" }}
+}
+
+fn rolesIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[[]Role, DbErr] {
+    var out: []Role = []
+    try st.scan(txn, CATALOG, "\x05", "\x06", fn(en: &lexdb_store.Entry): bool {
+        append(mut &out, decRole(&en.key[1..len(en.key)], &en.val))
+        return true
+    })
+    return Ok(out)
+}
+
+// The roles as committed (the wire's authentication reads them).
+pub fn roles(st: &lexdb_store.Store): Result[[]Role, DbErr] {
+    var t = try st.beginSnapshot()
+    let r = rolesIn(st, mut &t)
+    st.abort(t)
+    return r
+}
+
+// A role's options applied: LOGIN, SUPERUSER, PASSWORD and their NOs.
+fn applyRoleOpts(r: mut &Role, opts: &[]str): Result[Unit, DbErr] {
+    for o in opts {
+        if o == "login" { r.login = true }
+        else if o == "nologin" { r.login = false }
+        else if o == "superuser" { r.superuser = true }
+        else if o == "nosuperuser" { r.superuser = false }
+        else if o == "password-null" { r.verifier = "" }
+        else if strings.startsWith(&o, "password:") {
+            let pw = o[9..len(o)]
+            if lexdb_auth.parseVerifier(&pw).isSome() {
+                r.verifier = pw.toStr()                 // a verifier given (pg_dump writes them): kept
+            } else if len(pw) == 35 && strings.startsWith(&pw, "md5") {
+                return Err(e("0A000", "lexdb: MD5 passwords are not supported; give the password, or a SCRAM-SHA-256 verifier"))
+            } else if len(pw) == 0 {
+                r.verifier = ""                         // as PostgreSQL: an empty password is none
+            } else {
+                r.verifier = try lexdb_auth.makeVerifier(&pw)
+            }
+        }
+    }
+    return Ok(Unit{})
+}
+
+// CREATE ROLE, ALTER ROLE, DROP ROLE. Who may: a superuser role, or a
+// session that is no role (trust); a role may change its own password.
+fn roleStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
+    let me = st.memoGet(&userKey(txn.sess)).unwrapOr("")
+    let all = try rolesIn(st, txn)
+    var mine = false
+    var su = true
+    for r in all {
+        if r.name == me {
+            mine = true
+            su = r.superuser
+        }
+    }
+    let ownPassword = s.kind == lexdb_sql.S_ALTER_ROLE && s.table == me && mine && len(s.names) > 0 &&
+                      (strings.startsWith(&s.names[0], "password") && len(s.names) == 1)
+    if !su && !ownPassword { return Err(e("42501", "permission denied to " + (if s.kind == lexdb_sql.S_CREATE_ROLE { "create" } else if s.kind == lexdb_sql.S_DROP_ROLE { "drop" } else { "alter" }) + " role")) }
+    if s.kind == lexdb_sql.S_DROP_ROLE {
+        for c in s.cols {
+            let had = (try st.get(txn, CATALOG, roleKey(&c.name))).isSome()
+            if !had {
+                if s.ifFlag { continue }
+                return Err(e("42704", "role \"" + c.name + "\" does not exist"))
+            }
+            if c.name == me { return Err(e("55006", "current user cannot be dropped")) }
+            txn.del(CATALOG, roleKey(&c.name))
+        }
+        return Ok(tagOnly("DROP ROLE"))
+    }
+    let k = roleKey(&s.table)
+    let have = try st.get(txn, CATALOG, k)
+    if s.kind == lexdb_sql.S_CREATE_ROLE {
+        if have.isSome() { return Err(e("42710", "role \"" + s.table + "\" already exists")) }
+        if strings.startsWith(&s.table, "pg_") { return Err(e("42939", "role name \"" + s.table + "\" is reserved")) }
+        var r = Role{name: s.table, login: false, superuser: false, verifier: ""}
+        try applyRoleOpts(mut &r, &s.names)
+        try txn.put(CATALOG, k, encRole(&r))
+        return Ok(tagOnly("CREATE ROLE"))
+    }
+    var r = match have {
+        Some(v) { decRole(&s.table, &v) }
+        None { return Err(e("42704", "role \"" + s.table + "\" does not exist")) }
+    }
+    if len(s.names) == 1 && strings.startsWith(&s.names[0], "rename:") {
+        let to = s.names[0][7..len(s.names[0])]
+        if s.table == me { return Err(e("0A000", "session user cannot be renamed")) }
+        if (try st.get(txn, CATALOG, roleKey(&to))).isSome() { return Err(e("42710", "role \"" + to + "\" already exists")) }
+        txn.del(CATALOG, k)
+        r.name = to.toStr()
+        try txn.put(CATALOG, roleKey(&to), encRole(&r))
+        return Ok(tagOnly("ALTER ROLE"))
+    }
+    try applyRoleOpts(mut &r, &s.names)
+    try txn.put(CATALOG, k, encRole(&r))
+    return Ok(tagOnly("ALTER ROLE"))
 }

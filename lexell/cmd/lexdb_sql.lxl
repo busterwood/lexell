@@ -303,6 +303,9 @@ pub const S_COPY = 23           // COPY table [(names)] FROM STDIN / TO STDOUT, 
 pub const S_SAVEPOINT = 41      // SAVEPOINT name (9.80); its name in table
 pub const S_RELEASE = 42        // RELEASE [SAVEPOINT] name
 pub const S_ROLLBACK_TO = 43    // ROLLBACK [WORK | TRANSACTION] TO [SAVEPOINT] name
+pub const S_CREATE_ROLE = 44    // CREATE ROLE | USER name [WITH] options (9.81): its name in table, options in names
+pub const S_ALTER_ROLE = 45     // ALTER ROLE | USER name [WITH] options | RENAME TO new
+pub const S_DROP_ROLE = 46      // DROP ROLE | USER [IF EXISTS] name, ...: the names in names
 
 // COPY's options (Stmt.copy).
 pub type CopyOpts = record {
@@ -2093,6 +2096,50 @@ fn (p: mut &P) intersects(first: Stmt): Result[Stmt, lexdb_base.DbErr] {
     return Ok(lhs)
 }
 
+// A role's options, after its name: [WITH] LOGIN, NOLOGIN, SUPERUSER,
+// NOSUPERUSER, [ENCRYPTED] PASSWORD 'text' | NULL into s.names ("login",
+// "nologin", "superuser", "nosuperuser", "password:" and the text,
+// "password-null"); the rest PostgreSQL has are read and not kept.
+fn (p: mut &P) roleOptions(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
+    let w = p.acceptKw("with")
+    while p.peek().kind == T_IDENT {
+        let o = p.next().text
+        match o {
+            "login", "nologin", "superuser", "nosuperuser" { append(mut &s.names, o) }
+            "encrypted", "password" {
+                if o == "encrypted" { try p.expectKw("password") }
+                if p.acceptKw("null") {
+                    append(mut &s.names, "password-null")
+                } else {
+                    let t = p.next()
+                    if t.kind != T_STR { return Err(near(&t)) }
+                    append(mut &s.names, "password:" + t.text)
+                }
+            }
+            "createdb", "nocreatedb", "createrole", "nocreaterole", "inherit", "noinherit", "replication", "noreplication",
+            "bypassrls", "nobypassrls" {}
+            "connection" {
+                try p.expectKw("limit")
+                if p.acceptKw("-") {}
+                let n = try p.intLit()
+            }
+            "valid" {
+                try p.expectKw("until")
+                let t = p.next()
+                if t.kind != T_STR { return Err(near(&t)) }
+            }
+            "sysid" { let n = try p.intLit() }
+            "in", "role", "admin", "user" {
+                if o == "in" { if !p.acceptKw("role") { try p.expectKw("group") } }
+                let n = try p.name()
+                while p.acceptKw(",") { let m = try p.name() }
+            }
+            else { return Err(lexdb_base.err("42601", "unrecognized role option \"" + o + "\"")) }
+        }
+    }
+    return Ok(Unit{})
+}
+
 // VALUES (a, b), (c, d), ... after "values": a function in FROM
 // ("#values:" and its width) whose arguments are the rows' values, row by
 // row; its number in p.subs (9.80).
@@ -2777,6 +2824,20 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
         "insert" { return p.insert() }
         "alter" {
             if p.acceptKw("table") { return p.alterTable() }
+            if p.acceptKw("role") || p.acceptKw("user") {
+                var r = newStmt(S_ALTER_ROLE)
+                r.table = try p.name()
+                if p.acceptKw("rename") {
+                    try p.expectKw("to")
+                    append(mut &r.names, "rename:" + (try p.name()))
+                    return Ok(r)
+                }
+                if p.isKw("set") || p.isKw("reset") {
+                    return Err(lexdb_base.err("0A000", "lexdb: a role's own settings (ALTER ROLE ... SET) are not supported"))
+                }
+                try p.roleOptions(mut &r)
+                return Ok(r)
+            }
             if p.acceptKw("sequence") { return p.seqStmt(S_ALTER_SEQ) }
             // ALTER INDEX [IF EXISTS] name RENAME TO new, ALTER SCHEMA name
             // RENAME TO new
@@ -2806,6 +2867,14 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
         "copy" { return p.copyStmt() }
         "create" {
             if p.acceptKw("table") { return p.createTable() }
+            if p.isKw("role") || p.isKw("user") {
+                let user = p.next().text == "user"
+                var r = newStmt(S_CREATE_ROLE)
+                r.table = try p.name()
+                if user { append(mut &r.names, "login") }       // CREATE USER: LOGIN unless NOLOGIN
+                try p.roleOptions(mut &r)
+                return Ok(r)
+            }
             if p.acceptKw("sequence") { return p.seqStmt(S_CREATE_SEQ) }
             if p.acceptKw("schema") {
                 var s = newStmt(S_CREATE_SCHEMA)
@@ -2841,6 +2910,18 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
             return Ok(s)
         }
         "drop" {
+            if p.acceptKw("role") || p.acceptKw("user") {
+                var r = newStmt(S_DROP_ROLE)
+                if p.acceptKw("if") {
+                    try p.expectKw("exists")
+                    r.ifFlag = true
+                }
+                append(mut &r.cols, colDef(try p.name(), TypeName{kind: K_TEXT, oid: OID_TEXT, prec: 0, scale: 0, len: 0}, false))
+                while p.acceptKw(",") {
+                    append(mut &r.cols, colDef(try p.name(), TypeName{kind: K_TEXT, oid: OID_TEXT, prec: 0, scale: 0, len: 0}, false))
+                }
+                return Ok(r)
+            }
             if p.acceptKw("index") {
                 var s = newStmt(S_DROP_INDEX)
                 if p.acceptKw("if") {

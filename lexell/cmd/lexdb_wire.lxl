@@ -21,6 +21,8 @@ import "./lexdb_store"
 import "./lexdb_sql"
 import "./lexdb_exec"
 import "./lexdb_float"
+import "./lexdb_auth"
+import "tls"
 
 type Val = lexdb_sql.Val
 
@@ -30,7 +32,7 @@ const CANCEL_REQUEST = 80877102
 const PROTOCOL_3 = 196608
 const MAX_MESSAGE = 64 * 1024 * 1024
 
-pub type ConnArg = record { pub conn: net.Conn; pub st: lexdb_store.Store; pub id: int }
+pub type ConnArg = record { pub conn: net.Conn; pub st: lexdb_store.Store; pub id: int; ctx: []tls.Context }
 
 type Prepared = record {
     stmts: []lexdb_sql.Stmt     // none (an empty query) or one
@@ -48,6 +50,9 @@ type Portal = record {
 
 type Wire = record {
     c: net.Conn
+    eng: []tls.Engine           // after an SSLRequest answered S: the connection's TLS (9.81); [] plain
+    raw: []byte                 // with TLS: what is read from the socket, before it is decrypted
+    bind: str                   // with TLS: the channel binding data (our certificate's hash); "" none
     inBuf: []byte               // read into directly; [inPos, inEnd) not yet taken
     inPos: int
     inEnd: int
@@ -80,10 +85,69 @@ fn (w: mut &Wire) fill(n: int): Result[bool, io.IoError] {
             w.inPos = 0
             w.inEnd = have
         }
-        let got = try w.c.read(mut &w.inBuf[w.inEnd..len(w.inBuf)])
+        var got = 0
+        if len(w.eng) == 0 {
+            got = try w.c.read(mut &w.inBuf[w.inEnd..len(w.inBuf)])
+        } else {
+            got = try tlsRead(mut &w.eng[0], &w.c, mut &w.raw, mut &w.inBuf[w.inEnd..len(w.inBuf)])
+        }
         if got == 0 { return Ok(false) }
         w.inEnd += got
     }
+    return Ok(true)
+}
+
+// ---- TLS (9.81): lib/tls's engine between the socket and the messages
+
+fn tlsErr(x: &tls.Error): io.IoError { return io.ioError(71, "tls: " + x.toStr(), "") }
+
+// What the engine has to send (handshake records, alerts, tickets), sent.
+fn tlsSend(e: mut &tls.Engine, c: &net.Conn): Result[Unit, io.IoError] {
+    if e.pending() > 0 {
+        let out = e.takeOutput()
+        try c.write(&out)
+    }
+    return Ok(Unit{})
+}
+
+// Plaintext into buf: as many bytes as are there, reading the socket for
+// more when the engine needs it; 0 at the end (close_notify, or the socket's).
+fn tlsRead(e: mut &tls.Engine, c: &net.Conn, raw: mut &[]byte, buf: mut &[byte]): Result[int, io.IoError] {
+    while true {
+        let n = match e.read(buf) {
+            Ok(k) { k }
+            Err(x) { return Err(tlsErr(&x)) }
+        }
+        try tlsSend(e, c)
+        if n != tls.WANT_INPUT { return Ok(n) }
+        let got = try c.read(mut &raw[0..len(raw)])
+        if got == 0 { return Ok(0) }
+        e.feed(&raw[0..got])
+    }
+    return Ok(0)
+}
+
+// The handshake, after S was sent: Ok(false) if it failed or the client went.
+fn (w: mut &Wire) tlsAccept(ctx: &tls.Context): Result[bool, io.IoError] {
+    var e = match ctx.engine("") {
+        Ok(x) { x }
+        Err(_) { return Ok(false) }
+    }
+    var raw = array(16384, byte(0))
+    while true {
+        let r = e.handshake()
+        try tlsSend(mut &e, &w.c)
+        match r {
+            Ok(done) { if done { break } }
+            Err(_) { return Ok(false) }
+        }
+        let got = try w.c.read(mut &raw)
+        if got == 0 { return Ok(false) }
+        e.feed(&raw[0..got])
+    }
+    w.bind = e.ownEndPoint().unwrapOr("")
+    w.raw = raw
+    w.eng = [e]
     return Ok(true)
 }
 
@@ -176,7 +240,31 @@ fn (w: mut &Wire) flush(): Result[Unit, io.IoError] {
     if w.out.size() == 0 { return Ok(Unit{}) }
     let s = w.out.toStr()
     w.out.clear()
+    if len(w.eng) > 0 {
+        match w.eng[0].write(&strToBytes(s)) {
+            Ok(_) {}
+            Err(x) { return Err(tlsErr(&x)) }
+        }
+        return tlsSend(mut &w.eng[0], &w.c)
+    }
     return w.c.writeStr(s)
+}
+
+// A FATAL error, sent now: the connection ends after it.
+fn (w: mut &Wire) fatal(state: &str, msg: &str): Result[bool, io.IoError] {
+    var b = newStrBuf()
+    b.addByte('S')
+    addC(mut &b, &"FATAL")
+    b.addByte('V')
+    addC(mut &b, &"FATAL")
+    b.addByte('C')
+    addC(mut &b, state)
+    b.addByte('M')
+    addC(mut &b, msg)
+    b.addByte(0)
+    w.msg('E', &b)
+    try w.flush()
+    return Ok(false)
 }
 
 fn addC(b: mut &StrBuf, s: &str) {
@@ -609,12 +697,19 @@ fn (w: mut &Wire) closeMsg(ps: mut &Ps, body: &str): Result[Unit, lexdb_base.DbE
 
 // ---- a connection
 
-fn startup(w: mut &Wire): Result[bool, io.IoError] {
+fn startup(w: mut &Wire, ctx: &[]tls.Context): Result[bool, io.IoError] {
     while true {
         match try w.readMsg(true) {
             None { return Ok(false) }
             Some(m) {
                 let code = if len(m.body) >= 4 { binary.readI32BEStr(&m.body, 0) } else { 0 }
+                if code == SSL_REQUEST && len(ctx) > 0 && len(w.eng) == 0 {
+                    // bytes after the request, before TLS: refused (CVE-2021-23214)
+                    if w.inPos < w.inEnd { return w.fatal(&"08P01", &"received unencrypted data after SSL request") }
+                    try w.c.writeStr("S")
+                    if !(try w.tlsAccept(&ctx[0])) { return Ok(false) }
+                    continue
+                }
                 if code == SSL_REQUEST || code == GSS_REQUEST {
                     try w.c.writeStr("N")
                     continue
@@ -627,14 +722,18 @@ fn startup(w: mut &Wire): Result[bool, io.IoError] {
                 }
                 // the startup parameters: name, value, ..., then an empty name
                 var at = 4
+                var user = ""
                 while at < len(m.body) {
                     let ke = strings.indexOf(&m.body, "\x00", at)
                     if ke <= at { break }
                     let ve = strings.indexOf(&m.body, "\x00", ke + 1)
                     if ve < 0 { break }
-                    if m.body[at..ke] == "user" { w.sess.setUser(&m.body[ke + 1..ve]) }
+                    if m.body[at..ke] == "user" { user = m.body[ke + 1..ve].toStr() }
                     at = ve + 1
                 }
+                if len(user) == 0 { return w.fatal(&"28000", &"no PostgreSQL user name specified in startup packet") }
+                w.sess.setUser(&user)
+                if !(try w.authenticate(&user)) { return Ok(false) }
                 var b = newStrBuf()
                 binary.addU32BE(mut &b, 0)
                 w.msg('R', &b)                       // AuthenticationOk
@@ -657,6 +756,132 @@ fn startup(w: mut &Wire): Result[bool, io.IoError] {
         }
     }
     return Ok(false)
+}
+
+// ---- authentication (9.81): as configure set it (the store's memo), by
+// the connection's kind: trust, or SCRAM-SHA-256 against the role's verifier
+
+pub type AuthConf = record {
+    pub tcp: str                // "trust" or "scram-sha-256": TCP connections
+    pub local: str              // ... Unix socket ones
+    pub cert: str               // TLS: the certificate chain (PEM) and its key; "" no TLS
+    pub key: str
+    pub requireTls: bool        // a TCP connection must use TLS
+}
+
+pub fn noAuth(): AuthConf { return AuthConf{tcp: "trust", local: "trust", cert: "", key: "", requireTls: false} }
+
+const AUTH_KEY = "\x00auth"
+
+fn authOk(m: &str): bool { return m == "trust" || m == "scram-sha-256" }
+
+// The server's authentication, for its accept loops: checked here (its TLS
+// files loaded once), then kept in the store's memo.
+pub fn configure(st: &lexdb_store.Store, a: &AuthConf): Result[Unit, str] {
+    try checkAuth(a)
+    st.memoPut(&AUTH_KEY, &(a.tcp + "\n" + a.local + "\n" + a.cert + "\n" + a.key + "\n" + (if a.requireTls { "1" } else { "0" })))
+    return Ok(Unit{})
+}
+
+// The settings checked: the methods known, the TLS files loadable.
+pub fn checkAuth(a: &AuthConf): Result[Unit, str] {
+    if !authOk(&a.tcp) { return Err("unknown authentication method \"" + a.tcp + "\" (trust or scram-sha-256)") }
+    if !authOk(&a.local) { return Err("unknown authentication method \"" + a.local + "\" (trust or scram-sha-256)") }
+    if a.requireTls && len(a.cert) == 0 { return Err("--require-tls needs --tls-cert") }
+    if len(a.cert) > 0 {
+        match tlsContext(a) {
+            Ok(_) {}
+            Err(x) { return Err(x.toStr()) }
+        }
+    }
+    return Ok(Unit{})
+}
+
+fn confOf(st: &lexdb_store.Store): AuthConf {
+    match st.memoGet(&AUTH_KEY) {
+        Some(v) {
+            let f = strings.split(&v, "\n")
+            if len(f) == 5 { return AuthConf{tcp: f[0].toStr(), local: f[1].toStr(), cert: f[2].toStr(), key: f[3].toStr(), requireTls: f[4] == "1"} }
+        }
+        None {}
+    }
+    return noAuth()
+}
+
+fn tlsContext(a: &AuthConf): Result[tls.Context, tls.Error] {
+    var o = tls.defaults()
+    o.certFile = a.cert
+    o.keyFile = if len(a.key) > 0 { a.key } else { a.cert }
+    return tls.server(o)
+}
+
+fn (w: mut &Wire) authenticate(user: &str): Result[bool, io.IoError] {
+    let conf = confOf(&w.st)
+    let local = w.c.isUnix()
+    if !local && conf.requireTls && len(w.eng) == 0 {
+        return w.fatal(&"28000", &"lexdb: a TCP connection must use TLS (sslmode=require)")
+    }
+    if (if local { conf.local } else { conf.tcp }) != "scram-sha-256" { return Ok(true) }
+    let rs = match lexdb_exec.roles(&w.st) {
+        Ok(x) { x }
+        Err(x) { return w.fatal(&x.state, &x.msg) }
+    }
+    var ver: Option[lexdb_auth.Verifier] = None
+    var login = false
+    for r in rs {
+        if r.name == user {
+            ver = lexdb_auth.parseVerifier(&r.verifier)
+            login = r.login
+        }
+    }
+    let plus = len(w.eng) > 0 && len(w.bind) > 0
+    // AuthenticationSASL: the mechanisms, the bound one first when there is TLS
+    var b = newStrBuf()
+    binary.addU32BE(mut &b, 10)
+    if plus { addC(mut &b, &lexdb_auth.MECH_PLUS) }
+    addC(mut &b, &lexdb_auth.MECH)
+    b.addByte(0)
+    w.msg('R', &b)
+    try w.flush()
+    let fail = "password authentication failed for user \"" + user + "\""
+    var sc = match lexdb_auth.begin(ver, plus) {
+        Ok(x) { x }
+        Err(x) { return w.fatal(&x.state, &x.msg) }
+    }
+    // SASLInitialResponse: the mechanism, then the client-first-message's length and bytes
+    let m1 = match try w.readMsg(false) {
+        Some(m) { m }
+        None { return Ok(false) }
+    }
+    if m1.typ != 'p' { return w.fatal(&"08P01", &"expected SASL response") }
+    var r1 = Rd{s: m1.body, at: 0, bad: false}
+    let mech = r1.cstr()
+    let n1 = r1.i32()
+    if r1.bad || n1 < 0 || r1.at + n1 > len(m1.body) { return w.fatal(&"08P01", &"malformed SASL message") }
+    let first = match lexdb_auth.serverFirst(mut &sc, &mech, &m1.body[r1.at..r1.at + n1]) {
+        Ok(x) { x }
+        Err(x) { return w.fatal(&x.state, &x.msg) }
+    }
+    var c = newStrBuf()
+    binary.addU32BE(mut &c, 11)                 // AuthenticationSASLContinue
+    c.add(first)
+    w.msg('R', &c)
+    try w.flush()
+    let m2 = match try w.readMsg(false) {
+        Some(m) { m }
+        None { return Ok(false) }
+    }
+    if m2.typ != 'p' { return w.fatal(&"08P01", &"expected SASL response") }
+    let fin = match lexdb_auth.serverFinal(mut &sc, &m2.body, &w.bind) {
+        Ok(x) { x }
+        Err(x) { return w.fatal(&x.state, &(if x.state == "28P01" { fail } else { x.msg })) }
+    }
+    if !login { return w.fatal(&"28000", &("role \"" + user + "\" is not permitted to log in")) }
+    var f = newStrBuf()
+    binary.addU32BE(mut &f, 12)                 // AuthenticationSASLFinal
+    f.add(fin)
+    w.msg('R', &f)
+    return Ok(true)
 }
 
 fn (w: mut &Wire) step(ps: mut &Ps, m: &Msg): Result[bool, io.IoError] {
@@ -700,12 +925,12 @@ fn (w: mut &Wire) step(ps: mut &Ps, m: &Msg): Result[bool, io.IoError] {
 
 // Serves one client until it says goodbye or goes away.
 pub fn serve(a: ConnArg): int {
-    let ConnArg{conn: c, st: st, id: _} = move(a)
+    let ConnArg{conn: c, st: st, id: _, ctx: ctx} = move(a)
     let nd = c.setNoDelay(true)
-    var w = Wire{c: c, inBuf: array(65536, byte(0)), inPos: 0, inEnd: 0, out: newStrBuf(), sess: lexdb_exec.newSession(st), st: st,
+    var w = Wire{c: c, eng: [], raw: [], bind: "", inBuf: array(65536, byte(0)), inPos: 0, inEnd: 0, out: newStrBuf(), sess: lexdb_exec.newSession(st), st: st,
                  skipping: false}
     var ps = Ps{stmts: newMap(), portals: newMap()}
-    if startup(mut &w).unwrapOr(false) {
+    if startup(mut &w, &ctx).unwrapOr(false) {
         while true {
             let got = w.readMsg(false)
             if got.isErr() { break }
@@ -801,12 +1026,23 @@ pub fn acceptAll(a: ListenArg): int {
 pub fn acceptLoop(a: AcceptArg): int {
     let AcceptArg{ln: ln, st: st} = move(a)
     var id = 0
+    // TLS, if configured: one context, shared by the connections
+    var ctxs: []tls.Context = []
+    let conf = confOf(&st)
+    if len(conf.cert) > 0 {
+        match tlsContext(&conf) {
+            Ok(x) { append(mut &ctxs, x) }
+            Err(x) { eprintln("lexdb: tls: " + x.toStr()) }
+        }
+    }
     task.scope(fn(s: mut &task.Scope) {
         while true {
             match ln.accept() {
                 Ok(c) {
                     id += 1
-                    s.spawn(serve, ConnArg{conn: c, st: st, id: id})
+                    var mine: []tls.Context = []
+                    if len(ctxs) > 0 { append(mut &mine, ctxs[0].share()) }
+                    s.spawn(serve, ConnArg{conn: c, st: st, id: id, ctx: mine})
                 }
                 Err(e) {
                     if e.isCancelled() || e.isTimeout() { return }

@@ -88,6 +88,7 @@ extern "ssl" fn SSL_get_version(s: ptr): str
 extern "ssl" fn SSL_get_current_cipher(s: ptr): ptr
 extern "ssl" fn SSL_CIPHER_get_name(c: ptr): str
 extern "ssl" fn SSL_get1_peer_certificate(s: ptr): ptr
+extern "ssl" fn SSL_get_certificate(s: ptr): ptr
 extern "ssl" fn SSL_get0_alpn_selected(s: ptr, d: mut &ptr, n: mut &int)
 extern "ssl" fn SSL_session_reused(s: ptr): i32
 extern "ssl" fn SSL_has_pending(s: ptr): i32
@@ -796,6 +797,20 @@ const NID_sha1 = 64
 pub fn (e: &Engine) endPoint(): Result[str, Error] {
     let x = SSL_get1_peer_certificate(e.ssl)
     if isNull(x) { return Err(fail(Kind.Verify, "no server certificate to take the channel binding data from", 0, e.host)) }
+    let r = certEndPoint(x, e.host)
+    X509_free(x)
+    return r
+}
+
+// The same for this side's own certificate: a server's channel binding data
+// (SCRAM-SHA-256-PLUS, as PostgreSQL's server computes it).
+pub fn (e: &Engine) ownEndPoint(): Result[str, Error] {
+    let x = SSL_get_certificate(e.ssl)          // not a new reference: not freed
+    if isNull(x) { return Err(fail(Kind.Verify, "no certificate of our own to take the channel binding data from", 0, e.host)) }
+    return certEndPoint(x, e.host)
+}
+
+fn certEndPoint(x: ptr, host: str): Result[str, Error] {
     var dig = array(1, i32(0))
     var pk = array(1, i32(0))
     var md = nullPtr()
@@ -803,16 +818,12 @@ pub fn (e: &Engine) endPoint(): Result[str, Error] {
     if sig != i32(0) && OBJ_find_sigid_algs(sig, mut &dig, mut &pk) == 1 && dig[0] != i32(0) {
         md = if int(dig[0]) == NID_md5 || int(dig[0]) == NID_sha1 { EVP_sha256() } else { EVP_get_digestbyname(OBJ_nid2sn(dig[0])) }
     }
-    if isNull(md) {
-        X509_free(x)
-        return Err(fail(Kind.Verify, "could not determine server certificate signature algorithm", 0, e.host))
-    }
+    if isNull(md) { return Err(fail(Kind.Verify, "could not determine server certificate signature algorithm", 0, host)) }
     var out = array(64, byte(0))
     var n = 0
     let ok = X509_digest(x, md, mut &out, mut &n) == 1
-    X509_free(x)
     ERR_clear_error()
-    if !ok { return Err(fail(Kind.Verify, "could not hash the server certificate", 0, e.host)) }
+    if !ok { return Err(fail(Kind.Verify, "could not hash the server certificate", 0, host)) }
     return Ok(strFromBytes(&out[0..(n & 255)]))
 }
 

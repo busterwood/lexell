@@ -66,17 +66,31 @@ fn noCow(dir: str) {
 // replicas serve --replica-addr (by default each of ADDR with the port one
 // higher), sharing its TCP port (SO_REUSEPORT) and its Unix socket.
 // --replica runs one replica by hand, of a master already serving DATADIR.
+//
+// Authentication (design/lexdb.md 9.81): --auth METHOD for TCP connections,
+// --auth-local METHOD for Unix socket ones: trust (the default for both) or
+// scram-sha-256 (a role's password, CREATE ROLE ... PASSWORD). TLS with
+// --tls-cert FILE [--tls-key FILE] (PEM; the key may be in the certificate's
+// file); --require-tls refuses TCP connections without it.
 fn main() {
     let args = os.arguments()
     var replica = false
     var replicas = 0
     var raddrs: []str = []
     var pos: []str = []
+    var auth = lexdb_wire.noAuth()
     var i = 0
     while i < len(args) {
         let a = args[i]
         if a == "--replica" {
             replica = true
+        } else if a == "--require-tls" {
+            auth.requireTls = true
+        } else if a == "--auth" || a == "--auth-local" || a == "--tls-cert" || a == "--tls-key" {
+            if i + 1 >= len(args) { usage() }
+            let v = args[i + 1]
+            if a == "--auth" { auth.tcp = v } else if a == "--auth-local" { auth.local = v } else if a == "--tls-cert" { auth.cert = v } else { auth.key = v }
+            i += 1
         } else if a == "--replicas" || a == "--replica-addr" {
             if i + 1 >= len(args) { usage() }
             if a == "--replicas" {
@@ -94,6 +108,13 @@ fn main() {
         i += 1
     }
     if len(pos) < 1 || (replica && replicas > 0) { usage() }
+    match lexdb_wire.checkAuth(&auth) {
+        Ok(_) {}
+        Err(msg) {
+            eprintln("lexdb: " + msg)
+            exit(2)
+        }
+    }
     let dir = pos[0]
     var addrs: []str = []
     for k in 1..len(pos) { append(mut &addrs, pos[k]) }
@@ -101,7 +122,7 @@ fn main() {
     if os.env("LXL_HELPERS").isNone() { os.setEnv("LXL_HELPERS", "32") }   // reads in flight (section 3)
     if replica {
         let none: []net.Listener = []
-        runReplica(dir, &addrs, opts0(), false, none, 10000)
+        runReplica(dir, &addrs, opts0(), false, none, 10000, &auth)
         return
     }
     match fs.mkdirAll(dir) {
@@ -113,15 +134,17 @@ fn main() {
     }
     noCow(dir)
     if replicas == 0 {
-        runMaster(dir, &addrs)
+        runMaster(dir, &addrs, &auth)
         return
     }
-    supervise(dir, &addrs, replicas, &raddrs)
+    supervise(dir, &addrs, replicas, &raddrs, &auth)
 }
 
 fn usage() {
-    eprintln("usage: lexdb DATADIR [ADDR ...] [--replicas N [--replica-addr ADDR ...]]")
-    eprintln("       lexdb --replica DATADIR [ADDR ...]")
+    eprintln("usage: lexdb DATADIR [ADDR ...] [--replicas N [--replica-addr ADDR ...]] [AUTH]")
+    eprintln("       lexdb --replica DATADIR [ADDR ...] [AUTH]")
+    eprintln("AUTH:  [--auth trust|scram-sha-256] [--auth-local trust|scram-sha-256]")
+    eprintln("       [--tls-cert FILE [--tls-key FILE]] [--require-tls]")
     exit(2)
 }
 
@@ -129,7 +152,7 @@ fn usage() {
 // 0 the master, the others replicas. A worker that ends badly is started
 // again; a replica ends when its master does, and so is started again with
 // it. SIGTERM or SIGINT stops them all.
-fn supervise(dir: str, addrs: &[]str, n: int, given: &[]str) {
+fn supervise(dir: str, addrs: &[]str, n: int, given: &[]str, auth: &lexdb_wire.AuthConf) {
     // the replicas' addresses: given, or each of the master's one port up
     var raddrs: []str = []
     for a in given { append(mut &raddrs, a) }
@@ -192,11 +215,11 @@ fn supervise(dir: str, addrs: &[]str, n: int, given: &[]str) {
     policy.maxBackoffMs = 2000
     let ends = task.workersWith(n + 1, policy, fn(w: int) {
         if w == 0 {
-            runMaster(dir, addrs)
+            runMaster(dir, addrs, auth)
         } else {
             // each replica a copy of the shared sockets (this process's own
             // memory: the supervisor keeps its)
-            runReplica(dir, &tcp, opts0(), true, replace(mut &shared, []), 60000)
+            runReplica(dir, &tcp, opts0(), true, replace(mut &shared, []), 60000, auth)
         }
     })
     for f in files { let gone = fs.remove(f) }
@@ -211,7 +234,7 @@ fn supervise(dir: str, addrs: &[]str, n: int, given: &[]str) {
 
 // The master: the data directory's lock, the store, its listeners and the
 // replication socket, until SIGTERM or SIGINT.
-fn runMaster(dir: str, addrs: &[]str) {
+fn runMaster(dir: str, addrs: &[]str, auth: &lexdb_wire.AuthConf) {
     // One server per data directory: two writing the same files would
     // corrupt them (a benchmark started a second server while the first
     // still wrote its shutdown checkpoint, 9.58). The lock is held, its
@@ -251,6 +274,15 @@ fn runMaster(dir: str, addrs: &[]str) {
             Ok(_) {}
             Err(e) {
                 eprintln("lexdb: " + e.toStr())
+                code = 1
+                st.close()
+                return
+            }
+        }
+        match lexdb_wire.configure(&st, auth) {
+            Ok(_) {}
+            Err(msg) {
+                eprintln("lexdb: " + msg)
                 code = 1
                 st.close()
                 return
@@ -364,7 +396,8 @@ fn opts0(): lexdb_store.Options {
 // A read-only replica (--replica): follows the master of dir over its
 // replication socket and serves addrs with the same SQL, refusing writes
 // (25006). It stops when the master does (exit 1) or on SIGTERM/SIGINT.
-fn runReplica(dir: str, addrs: &[]str, opts: lexdb_store.Options, reusePort: bool, shared: []net.Listener, waitMs: int) {
+fn runReplica(dir: str, addrs: &[]str, opts: lexdb_store.Options, reusePort: bool, shared: []net.Listener, waitMs: int,
+              auth: &lexdb_wire.AuthConf) {
     task.watchSignals(&[task.SIGTERM, task.SIGINT])
     var sharedLns = shared
     let conn = lexdb_repl.connect(dir, opts, waitMs)
@@ -387,6 +420,14 @@ fn runReplica(dir: str, addrs: &[]str, opts: lexdb_store.Options, reusePort: boo
             Ok(_) {}
             Err(e) {
                 eprintln("lexdb: replica: " + e.toStr())
+                code = 1
+                return
+            }
+        }
+        match lexdb_wire.configure(&st, auth) {
+            Ok(_) {}
+            Err(msg) {
+                eprintln("lexdb: replica: " + msg)
                 code = 1
                 return
             }
