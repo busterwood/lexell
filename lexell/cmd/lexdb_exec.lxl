@@ -5552,9 +5552,6 @@ fn createTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
         return Err(e("42P07", "relation \"" + base + "\" already exists"))
     }
     try needCreate(st, txn, &key)
-    if len(s.pk) == 0 {
-        return Err(e("42P16", "lexdb: table \"" + base + "\" needs a PRIMARY KEY"))
-    }
     var t = emptyTable(key)
     for c in s.cols {
         if colIndex(&t.cols, &c.name) >= 0 { return Err(e("42701", "column \"" + c.name + "\" specified more than once")) }
@@ -5582,6 +5579,13 @@ fn createTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
             }
         }
     }
+    if len(t.pk) == 0 {
+        // no primary key: the rows keyed by a hidden one (9.88)
+        var rc = lexdb_sql.colDef(ROWID, lexdb_sql.TypeName{kind: lexdb_sql.K_INT, oid: lexdb_sql.OID_INT8, prec: 0, scale: 0, len: 0}, true)
+        rc.identity = lexdb_sql.ID_ALWAYS
+        append(mut &t.pk, len(t.cols))
+        append(mut &t.cols, rc)
+    }
     t.tree = st.createTree(txn)
     try makeColSeqs(st, txn, mut &t, -1, &s.idOpts)
     for c in t.cols { try defaultSeqs(st, txn, &c) }
@@ -5601,10 +5605,75 @@ fn createTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
     return Ok(tagOnly("CREATE TABLE"))
 }
 
+// ---- tables without a primary key (9.88)
+//
+// Their rows are keyed by a hidden bigint column, ROWID, the last of those
+// the table was made with, whose identity sequence numbers them: so UPDATE,
+// DELETE, indexes, COPY and replication find a row by its key as for any
+// table. No SQL can name it (its name starts with a NUL byte, which no
+// statement text holds), and what shows a table's columns leaves it out:
+// SELECT *, INSERT's and COPY's columns, the catalog (pg_attribute and the
+// rest, whose attnums are the others' own, so a column added later leaves a
+// gap, as a dropped one does in PostgreSQL), its key's index and sequence.
+
+pub const ROWID: str = "\x00rowid"
+
+// A name of the hidden column (a table's, a query's "alias.column", its
+// sequence's).
+fn hiddenName(n: &str): bool { return strings.contains(n, "\x00rowid") }
+
+// Whether t's key is the hidden column.
+fn rowidKeyed(t: &Table): bool { return len(t.pk) == 1 && t.pk[0] < len(t.cols) && t.cols[t.pk[0]].name == ROWID }
+
+// CREATE TABLE t [(names)] AS query [WITH [NO] DATA], and SELECT ... INTO t
+// (9.88): t's columns the query's (named as given, else as its output),
+// of their types; no primary key (a hidden one); the rows inserted as the
+// query makes them. The tag, as PostgreSQL's: SELECT and the rows.
+fn createTableAs(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int,
+                 lim: Limits): Result[Res, DbErr] {
+    if s.ifFlag && (try findTable(st, txn, &s.table)).isSome() { return Ok(tagOnly("CREATE TABLE AS")) }
+    var sc = newScope(params, ptypes)
+    let sel = try planSelect(st, txn, &s.inner[0], params, mut &sc)
+    if len(s.names) > len(sel.outs) { return Err(e("42601", "too many column names were specified")) }
+    var mk = lexdb_sql.newStmt(lexdb_sql.S_CREATE)
+    mk.table = s.table
+    for i in 0..len(sel.outs) {
+        let n = if i < len(s.names) { s.names[i] } else { sel.outs[i].name }
+        for c in mk.cols { if c.name == n { return Err(e("42701", "column \"" + n + "\" specified more than once")) } }
+        let o = sel.outs[i].oid
+        let ty = if o == 0 || o == 705 { oidType(lexdb_sql.OID_TEXT) } else { oidType(o) }
+        append(mut &mk.cols, lexdb_sql.colDef(n, ty, false))
+    }
+    let made = try createTable(st, txn, &mk)
+    if s.noData { return Ok(tagOnly("CREATE TABLE AS")) }
+    let t = try needTable(st, txn, &s.table)
+    var targets: []int = []
+    for i in 0..len(t.cols) { if t.cols[i].name != ROWID { append(mut &targets, i) } }
+    let defs = try defaultsOf(st, txn, &t)
+    let fw: []Table = []
+    var later: []FkLater = []
+    var noUp = noUpsert()
+    let noCols: []lexdb_sql.ColDef = []
+    let none: []Val = []
+    let noSubs: []SubRes = []
+    let noEnv = Env{cols: &noCols, row: &none, aggs: &none, params: &none, subs: &noSubs, cur: &none, seq: None}
+    // the query's rows made whole first: it reads in the same transaction
+    // (a table made earlier in the block), which the inserts write
+    let res = try runSel(st, txn, &sel, params, lim)
+    for r in res.rows { let got = try insertOne(st, txn, &t, &targets, &r, &defs, &fw, mut &later, mut &noUp, &noEnv) }
+    return Ok(tagOnly("SELECT " + len(res.rows).toStr()))
+}
+
 fn dropTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
-    match try findTable(st, txn, &s.table) {
+    try dropTableNamed(st, txn, &s.table, s)
+    for n in s.names { try dropTableNamed(st, txn, &n, s) }
+    return Ok(tagOnly("DROP TABLE"))
+}
+
+fn dropTableNamed(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, name: &str, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
+    match try findTable(st, txn, name) {
         Some(t) {
-            if len(t.view) > 0 { return Err(e("42809", "\"" + lexdb_sql.shown(&s.table) + "\" is not a table (use DROP VIEW)")) }
+            if len(t.view) > 0 { return Err(e("42809", "\"" + lexdb_sql.shown(name) + "\" is not a table (use DROP VIEW)")) }
             try needRelOwner(st, txn, &t.name, &"table")
             try dropDependentViews(st, txn, &t.name, s.cascade, &"table")
             var d = t
@@ -5616,7 +5685,7 @@ fn dropTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.St
         }
         None {
             if s.ifFlag { return Ok(tagOnly("DROP TABLE")) }
-            return Err(e("42P01", "table \"" + lexdb_sql.shown(&s.table) + "\" does not exist"))
+            return Err(e("42P01", "table \"" + lexdb_sql.shown(name) + "\" does not exist"))
         }
     }
 }
@@ -6565,7 +6634,7 @@ fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     let t = try needTable(st, txn, &s.table)
     var targets: []int = []
     if len(s.names) == 0 {
-        for i in 0..len(t.cols) { append(mut &targets, i) }
+        for i in 0..len(t.cols) { if t.cols[i].name != ROWID { append(mut &targets, i) } }
     } else {
         for n in s.names {
             let i = colIndex(&t.cols, &n)
@@ -7247,6 +7316,7 @@ fn itemCols(items: &[]lexdb_sql.SelItem, from: bool, cols: &[]lexdb_sql.ColDef, 
             for c in cols {
                 if it.qual != "" && c.name[0..dotAt(&c.name)] != it.qual { continue }
                 any = true
+                if hiddenName(&c.name) { continue }
                 append(mut &out, OutCol{name: colPart(&c.name), oid: c.typ.oid})
                 append(exprs, Expr.Col(c.name))
             }
@@ -9235,7 +9305,10 @@ fn execStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
         return Err(e("42P20", "window functions are not allowed in " + what))
     }
     match s.kind {
-        lexdb_sql.S_CREATE { return createTable(st, txn, s) }
+        lexdb_sql.S_CREATE {
+            if len(s.inner) > 0 { return createTableAs(st, txn, s, params, ptypes, lim) }
+            return createTable(st, txn, s)
+        }
         lexdb_sql.S_DROP { return dropTable(st, txn, s) }
         lexdb_sql.S_INSERT { return insert(st, txn, s, params, lim) }
         lexdb_sql.S_SELECT { return select(st, txn, s, params, ptypes, lim, pc) }
@@ -10118,6 +10191,9 @@ fn addForeign(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, 
 // checked against p.
 fn makeFk(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, p: &Table, c: &lexdb_sql.Constraint, refKey: &str): Result[ForeignKey, DbErr] {
     var refCols: []str = []
+    if len(c.refCols) == 0 && rowidKeyed(p) {
+        return Err(e("42704", "there is no primary key for referenced table \"" + lexdb_sql.baseName(&p.name) + "\""))
+    }
     if len(c.refCols) == 0 { for i in p.pk { append(mut &refCols, p.cols[i].name) } }
     else { for n in c.refCols { append(mut &refCols, n) } }
     if len(refCols) != len(c.cols) {
@@ -11209,7 +11285,7 @@ fn copyStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
     var targets: []int = []
     var names: []str = []
     if len(s.names) == 0 {
-        for i in 0..len(t.cols) { append(mut &targets, i) }
+        for i in 0..len(t.cols) { if t.cols[i].name != ROWID { append(mut &targets, i) } }
     } else {
         for n in s.names {
             let i = colIndex(&t.cols, &n)
@@ -14243,7 +14319,9 @@ fn catSnap(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[CatSnap, D
         append(mut &raw, en.val)
         return true
     })
-    var snap = CatSnap{acls: newMap(), tabs: [], views: [], cons: [], seqs: try allSeqs(st, txn, &""), schemas: schemas, path: copyStrs(&txn.path),
+    var seqs: []Seq = []
+    for d in try allSeqs(st, txn, &"") { if !hiddenName(&d.key) { append(mut &seqs, seqCopy(&d)) } }
+    var snap = CatSnap{acls: newMap(), tabs: [], views: [], cons: [], seqs: seqs, schemas: schemas, path: copyStrs(&txn.path),
                        user: st.memoGet(&userKey(txn.sess)).unwrapOr("lexdb")}
     var aclKeys: []str = []
     var aclVals: []str = []
@@ -14263,7 +14341,7 @@ fn catSnap(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[CatSnap, D
             continue
         }
         var idxs: []CatIdx = []
-        if len(t.pk) > 0 {
+        if len(t.pk) > 0 && !rowidKeyed(&t) {
             var cs: []int = []
             for p in t.pk { append(mut &cs, p + 1) }
             let pn = name + "_pkey"
@@ -14402,7 +14480,7 @@ fn bindCatalog(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[Unit, 
             b.add("x\t" + ix.oid.toStr() + "\t" + clean(&idxDef(&ct, &ix)) + "\t" + strings.join(&cols, "\x1e") + "\n")
         }
         for c in ct.t.cols {
-            if len(c.seq) > 0 {
+            if len(c.seq) > 0 && c.name != ROWID {
                 b.add("s\t" + ct.oid.toStr() + "\t" + c.name + "\t" + quoteIfNeeded(&lexdb_sql.schemaOf(&c.seq)) + "." +
                       quoteIfNeeded(&lexdb_sql.baseName(&c.seq)) + "\n")
             }
@@ -14983,7 +15061,7 @@ fn catRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &str): Result
                 let trig = len(ct.t.fks) > 0 || len(ct.t.refBy) > 0
                 let ta = aclOf(&snap, &relObj(&ct.key))
                 append(mut &rows, [iv(ct.oid), tv(&ct.name), iv(nspOid(&ct.schema)), iv(0), iv(0), iv(roleOid(&ownerName(&snap, &ta), &roles)), iv(2), iv(ct.oid), iv(0),
-                                   iv(0), Val.Real(-1.0f), iv(0), iv(0), bv(hasIdx), bv(false), tv(&"p"), tv(&"r"), iv(len(ct.t.cols)),
+                                   iv(0), Val.Real(-1.0f), iv(0), iv(0), bv(hasIdx), bv(false), tv(&"p"), tv(&"r"), iv(len(ct.t.cols) - (if rowidKeyed(&ct.t) { 1 } else { 0 })),
                                    iv(len(ct.t.checks)), bv(false), bv(trig), bv(false), bv(false), bv(false), bv(true), tv(&"d"),
                                    bv(false), iv(0), iv(0), iv(0), aclText(&snap, &ta, &"arwdDxt"), Val.Null, Val.Null])
                 for ix in ct.idxs {
@@ -15025,6 +15103,7 @@ fn catRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &str): Result
             for ct in snap.tabs {
                 for i in 0..len(ct.t.cols) {
                     let c = &ct.t.cols[i]
+                    if c.name == ROWID { continue }
                     var nn = c.notNull
                     for p in ct.t.pk { if p == i { nn = true } }
                     append(mut &rows, attRow(ct.oid, &c.name, c.typ.oid, typmodOf(&c.typ), i + 1, nn, defaultText(&snap, c).isSome(), identOf(c)))
@@ -15054,6 +15133,7 @@ fn catRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &str): Result
         "pg_attrdef" {
             for ct in snap.tabs {
                 for i in 0..len(ct.t.cols) {
+                    if ct.t.cols[i].name == ROWID { continue }
                     match defaultText(&snap, &ct.t.cols[i]) {
                         Some(d) { append(mut &rows, [iv(catOid(&"d", &(ct.key + "\x00" + ct.t.cols[i].name))), iv(ct.oid), iv(i + 1), tv(&d)]) }
                         None {}
@@ -15103,7 +15183,7 @@ fn catRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &str): Result
             for ct in snap.tabs {
                 for i in 0..len(ct.t.cols) {
                     let c = &ct.t.cols[i]
-                    if len(c.seq) == 0 { continue }
+                    if len(c.seq) == 0 || c.name == ROWID { continue }
                     append(mut &rows, [iv(1259), iv(catOid(&"S", &c.seq)), iv(0), iv(1259), iv(ct.oid), iv(i + 1),
                                        tv(&if c.identity == lexdb_sql.ID_SERIAL { "a" } else { "i" })])
                 }
@@ -15223,6 +15303,7 @@ fn catRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &str): Result
             for ct in (if which == 0 { &snap.tabs } else { &snap.views }) {
                 for i in 0..len(ct.t.cols) {
                     let c = &ct.t.cols[i]
+                    if c.name == ROWID { continue }
                     var nn = c.notNull
                     for p in ct.t.pk { if p == i { nn = true } }
                     let o = c.typ.oid

@@ -6880,3 +6880,70 @@ Without batches, the transaction's writes still grow with the rows, about
     the third batch keeps four rows.
   - The refusals.
 - `wire_copy`: its CopyFail case changed as above.
+
+### 9.88 Tables without a primary key; CREATE TABLE AS and SELECT INTO
+
+The user asked whether CREATE TABLE AS worked. It did not, and it could
+not: lexdb required every table to have a primary key (42P16), and a table
+CREATE TABLE AS makes has none. Plain `CREATE TABLE t (a int)`, common in
+schemas, scripts and pg_dump's output, was refused too. Among the two ways
+offered, the user chose keyless tables first, with CREATE TABLE AS on top.
+
+**A hidden key.**
+- A table made with no primary key gets a last column ROWID: a bigint,
+  GENERATED ALWAYS AS IDENTITY, which is its key.
+- Its identity sequence numbers the rows, as SERIAL's does, owned by the
+  table and dropped with it.
+- So UPDATE, DELETE, indexes, foreign keys from it, COPY, row locks and
+  replication find a row by its key, as for any table: nothing below the
+  catalog changed.
+
+**Hidden everywhere it would show.** The name starts with a NUL byte, which
+no statement text can hold, so no SQL names it. `hiddenName` and
+`rowidKeyed` find it, and these leave it out:
+- `SELECT *` and `t.*` (and so RETURNING *, views, `INSERT ... SELECT *`);
+- INSERT's and COPY's columns when none are named;
+- `pg_attribute`, `pg_attrdef`, `pg_depend`, `information_schema.columns`;
+- `relnatts`, the `_pkey` index and constraint, and its sequence (in
+  `pg_class` and the catalog's sequences).
+
+Attribute numbers are the columns' own places, so a column added later
+leaves a gap where the hidden one is, as a dropped column leaves one in
+PostgreSQL. A foreign key that references a keyless table without naming
+columns is 42704 "there is no primary key for referenced table".
+
+**CREATE TABLE [IF NOT EXISTS] t [(names)] AS query [WITH [NO] DATA]**, the
+query a SELECT, VALUES or WITH ... SELECT, in parentheses or not. **SELECT
+... INTO [TEMPORARY | UNLOGGED] [TABLE] t** is parsed into the same.
+- The query is planned. Its output names (or the names given; more names
+  than columns is 42601, a name twice 42701) and types become t's
+  columns. t has no primary key.
+- The query's rows are then inserted. They are made whole first, because
+  the query reads in the transaction the inserts write, which may hold a
+  table made earlier in the block.
+- The tag is PostgreSQL's: `SELECT n`, or `CREATE TABLE AS` for WITH NO
+  DATA and for IF NOT EXISTS of a table already there.
+- A column keeps its type's OID, not its typmod: `varchar(20)` becomes
+  `varchar`.
+
+**DROP TABLE a, b, ...** takes several names (the generated test drops
+several at its end).
+
+**Tests:** `exec_keyless`, 55 statements generated from PostgreSQL 18 by
+`gen_pg.py keyless`, all the same. They cover:
+- duplicate rows, UPDATE, DELETE, RETURNING *, `t.*`, a self-join;
+- a unique index and ON CONFLICT on it; a view;
+- the catalog not showing the hidden column, its index, its constraint or
+  its sequence;
+- the foreign key refused; ADD COLUMN;
+- each form of CREATE TABLE AS and SELECT INTO: names, types, WITH NO
+  DATA, IF NOT EXISTS, grouping, LIMIT in parentheses, WITH, VALUES;
+- in a block rolled back; a duplicate column name.
+
+**Not done:**
+- ALTER TABLE ADD PRIMARY KEY on a keyless table: still 0A000, since a
+  table's key cannot change;
+- CREATE TABLE AS's typmods;
+- a very large CREATE TABLE AS holds its result in memory while it
+  inserts;
+- TEMPORARY tables (the word is accepted by SELECT INTO and ignored).

@@ -450,6 +450,8 @@ pub type Stmt = record {
     pub lockMode: int           // SELECT ... FOR UPDATE and the like (9.86): LOCK_*; 0 none
     pub lockOf: []str           // ... OF these tables (names or aliases); [] all
     pub lockWait: int           // WAIT_BLOCK, WAIT_NOWAIT, WAIT_SKIP
+    pub noData: bool            // CREATE TABLE ... AS ... WITH NO DATA (9.88)
+    pub into: str               // SELECT ... INTO t: t (9.88); made a CREATE TABLE ... AS
 }
 
 pub const CONFLICT_NONE = 0
@@ -512,12 +514,12 @@ pub const SUB_EXISTS = 2
 pub const SUB_IN = 3
 pub const SUB_FROM = 4          // in FROM: a subquery, or a CTE where it is used
 
-fn newStmt(kind: int): Stmt {
+pub fn newStmt(kind: int): Stmt {
     return Stmt{kind: kind, table: "", ifFlag: false, cols: [], pk: [], names: [], rows: [], items: [], where: None,
                 group: [], order: [], limit: None, offset: None, sets: [], params: 0, from: [], index: "",
                 unique: false, inner: [], distinct: false, having: None, subs: [], use: 0, setop: 0, setAll: false,
                 cte: -1, rec: false, cascade: false, src: "", srf: "", ordin: false, alters: [], cons: [], seqNames: [], seq: noSeqOpts(), idOpts: [], overriding: OVR_NONE,
-                copy: noCopyOpts(), wins: [], windows: [], conflict: CONFLICT_NONE, conflictCols: [], conflictCon: "", alias: "", conc: false, lockMode: 0, lockOf: [], lockWait: 0}
+                copy: noCopyOpts(), wins: [], windows: [], conflict: CONFLICT_NONE, conflictCols: [], conflictCon: "", alias: "", conc: false, lockMode: 0, lockOf: [], lockWait: 0, noData: false, into: ""}
 }
 
 // ---- the lexer
@@ -1511,6 +1513,7 @@ fn (p: mut &P) createTable(): Result[Stmt, lexdb_base.DbErr] {
         s.ifFlag = true
     }
     s.table = try p.qname()
+    if p.isKw("as") || (p.isKw("(") && p.nameListThenAs()) { return p.createTableAs(s) }
     try p.expectKw("(")
     while true {
         var cname = ""
@@ -1571,6 +1574,64 @@ fn (p: mut &P) createTable(): Result[Stmt, lexdb_base.DbErr] {
     }
     try p.expectKw(")")
     return Ok(s)
+}
+
+// Whether ( names ) AS follows: CREATE TABLE ... AS's column names, not a
+// table's definition.
+fn (p: &P) nameListThenAs(): bool {
+    var k = 1
+    while true {
+        let t = p.peekAt(k)
+        if t.kind != T_IDENT && t.kind != T_QIDENT { return false }
+        let u = p.peekAt(k + 1)
+        if u.kind == T_OP && u.text == ")" { return p.peekAt(k + 2).kind == T_IDENT && p.peekAt(k + 2).text == "as" }
+        if !(u.kind == T_OP && u.text == ",") { return false }
+        k += 2
+    }
+    return false
+}
+
+// CREATE TABLE name [(names)] AS query [WITH [NO] DATA] (9.88): the query
+// in inner[0], with its own subqueries; the column names in names.
+fn (p: mut &P) createTableAs(s0: Stmt): Result[Stmt, lexdb_base.DbErr] {
+    var s = s0
+    if p.acceptKw("(") {
+        append(mut &s.names, try p.name())
+        while p.acceptKw(",") { append(mut &s.names, try p.name()) }
+        try p.expectKw(")")
+    }
+    try p.expectKw("as")
+    var q = try p.query()
+    if p.acceptKw("with") {
+        s.noData = p.acceptKw("no")
+        try p.expectKw("data")
+    }
+    append(mut &s.inner, q)
+    return Ok(s)
+}
+
+// A query where a statement takes one (CREATE TABLE ... AS): SELECT,
+// VALUES or WITH ... SELECT, in parentheses or not, with its own
+// subqueries, window calls and parameters.
+fn (p: mut &P) query(): Result[Stmt, lexdb_base.DbErr] {
+    let paren = p.acceptKw("(")
+    var n = 0
+    if p.acceptKw("with") { n = try p.withList() }
+    var q = newStmt(S_SELECT)
+    if p.acceptKw("select") {
+        q = try p.select()
+    } else if p.acceptKw("values") {
+        q = try p.valuesQuery()
+        try p.orderLimit(mut &q)
+    } else {
+        return Err(near(&p.peek()))
+    }
+    if paren { try p.expectKw(")") }
+    q.subs = replace(mut &p.subs, [])
+    q.wins = replace(mut &p.wins, [])
+    q.params = p.params
+    if n > 0 { p.popCtes(n) }
+    return Ok(q)
 }
 
 // A table constraint, after [CONSTRAINT name]: UNIQUE (cols), CHECK (expr)
@@ -2470,6 +2531,12 @@ fn (p: mut &P) selectCore(): Result[Stmt, lexdb_base.DbErr] {
         let all = p.acceptKw("all")
     }
     try p.itemList(mut &s.items)
+    if p.acceptKw("into") {
+        // SELECT ... INTO [TEMPORARY | UNLOGGED] [TABLE] name (9.88)
+        let tm = p.acceptKw("temporary") || p.acceptKw("temp") || p.acceptKw("unlogged")
+        let tb = p.acceptKw("table")
+        s.into = try p.qname()
+    }
     if p.acceptKw("from") {
         append(mut &s.from, try p.fromItem(J_FIRST))
         while true {
@@ -3132,7 +3199,18 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
     if t.kind != T_IDENT { return Err(near(&t)) }
     p.pos += 1
     match t.text {
-        "select" { return p.select() }
+        "select" {
+            var q = try p.select()
+            if len(q.into) == 0 { return Ok(q) }
+            // SELECT ... INTO t: CREATE TABLE t AS the query (9.88)
+            var c = newStmt(S_CREATE)
+            c.table = replace(mut &q.into, "")
+            q.subs = replace(mut &p.subs, [])
+            q.wins = replace(mut &p.wins, [])
+            q.params = p.params
+            append(mut &c.inner, q)
+            return Ok(c)
+        }
         "values" {
             var vq = try p.valuesQuery()
             try p.orderLimit(mut &vq)
@@ -3346,6 +3424,8 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
                 s.ifFlag = true
             }
             s.table = try p.qname()
+            // DROP TABLE a, b, ...: the others in names (9.88)
+            while p.acceptKw(",") { append(mut &s.names, try p.qname()) }
             if p.acceptKw("cascade") { s.cascade = true } else { let r = p.acceptKw("restrict") }
             return Ok(s)
         }
