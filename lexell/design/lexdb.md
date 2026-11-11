@@ -4500,3 +4500,64 @@ server is refused. The script now waits for the old server to exit.
 slower through the ring (9.57); the ring as the default where the kernel
 allows it, with both modes in the gate; socket writes through the ring.
 
+### 9.59 Step 2 so far: the one-client gap; what to measure on bare metal
+
+Step 2 of 9.58's plan: why one client over a socket is slower through the
+ring (9.57: 4 to 8%). Unfinished; the user is moving development to a
+machine running Linux directly on a dedicated NVMe (PCIe 3) drive, so the
+rest is better measured there.
+
+**Not the kernel's io_uring.** `sockbench`, one client waiting in `poll`,
+13 us of work a message, three runs each (round trip in us):
+
+| | epoll | io_uring | io_uring, POLL_FIRST |
+|---|---|---|---|
+| Unix | 74.1, 71.7, 70.7 | 76.9, 70.5, 73.4 | 79.1, 70.9, 73.1 |
+| TCP | 256, 259, 237 | 280, 212, 215 | 232, 225, 220 |
+
+No gap beyond the noise (about 5% over Unix sockets, 10% over TCP).
+
+**In lexdb it is small and real over a Unix socket only** (pgsel.sh, one
+client, warm cache, 6 s runs, three rounds, the server restarted for each):
+
+| | epoll | io_uring |
+|---|---|---|
+| Unix, selects/s | 12,203, 12,247, 11,760 | 11,828, 11,637, 11,751 |
+| Unix, server CPU a select | 50.0 us | 46.9 us |
+| TCP, selects/s | 4,506, 4,010, 3,759 | 3,858, 4,093, 4,204 |
+
+About 2.5 us more per round trip (of about 83), with 6% less CPU; over TCP
+nothing beyond noise. Another series: epoll 12,922, 13,192, 13,031;
+io_uring 12,828, 12,441, 12,809. `IORING_RECVSEND_POLL_FIRST` on the
+receive (a throwaway build) did not help: 12,442, 12,579, 12,089. So the
+2.5 us is in how the runtime meets the kernel on the wake-up path, not in
+the receive's first attempt.
+
+**Tracing it** (`bench/sock/trace1.sh`: tracefs, 0.3 s of one warm client,
+system calls, wakeups and switches of both processes, io_uring events).
+One io_uring capture so far, on a cold cache, so indicative only: per
+request the server waits; about 14 us later pgbench's send queues the
+receive's completion (`io_uring_task_add`); the server is running and has
+completed it 25 to 28 us after that (the wake-up, about 15 us of it the
+IPI under WSL2, 9.56); it then works about 34 us before queueing the next
+receive. Two traps met: under WSL2 the distro's pids are not the kernel's,
+so filter by process name; and warm the cache first (an epoll capture had
+0.24 `pread`s a request). Tracing itself slows both modes (7,900 and
+8,900 selects/s under it), so compare its intervals, not its rates.
+
+**Next, on the new machine (bare metal, NVMe PCIe 3):**
+1. `sockbench` with sleeping and with spinning clients, and IPIs a message:
+   wakeups should cost about a microsecond, not 15 (9.56).
+2. `pgsel.sh`, both modes, TCP and Unix, 1, 8 and 32 clients; again with
+   `LEXDB_CACHE_MB=64`, and `QUERY=upd`. A consumer drive without
+   power-loss protection still flushes in milliseconds (the paper's Figure
+   9: 1.6 ms), so commits stay flush-bound.
+3. The one-client gap, with `trace1.sh` in both modes; it may be gone with
+   cheap wakeups.
+4. `tests/lexdb/crash.py` with and without `LXL_URING=1`.
+5. Then step 3 (the ring by default where the kernel allows it, both modes
+   in `tools/gate.sh`) and step 4 (socket writes through the ring).
+6. Possible there and not here: IOPOLL for the data file (O_DIRECT on
+   ext4 with NVMe poll queues, `nvme.poll_queues=N` at boot; a second ring,
+   since an IOPOLL ring cannot wait on sockets); the paper measured +21%.
+
