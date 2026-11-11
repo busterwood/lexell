@@ -938,7 +938,8 @@ of the same name, still counts.
 ## 11. Built-in functions
 
 These are the only functions the compiler implements. Their names are
-reserved: declaring a top-level name that is one of them is an error. Everything else,
+reserved, except `withCapacity`: declaring a top-level name that is one of the
+others is an error (a module's own `withCapacity` is called instead of it). Everything else,
 including `print`, `println`, string formatting and parsing, is in `std`.
 
 | Function | Meaning |
@@ -950,6 +951,7 @@ including `print`, `println`, string formatting and parsing, is in `std`.
 | `replace(mut &p, v)` | store `v` at place `p` and return the old value |
 | `move(x)` | the value of local `x`, which is then moved |
 | `array(n, v)` | `n` copies of the copy value `v` |
+| `withCapacity(n)` | an empty array with room for `n` elements before it grows (`n` rounded up to a power of two; negative stops the program, exit 2); its type is the array type expected where it is used (`var rows: []&str = withCapacity(n)`), so its elements may be views or of any type |
 | `panic(msg)` | print `Lexell: panic: msg` and stop with exit code 12 |
 | `assert(c)` | `panic("assertion failed")` with the line, when `c` is false |
 | `exit(code)` | stop the program with `code`, without drops (and without the `LXL_CHECK` leak check) |

@@ -1386,6 +1386,18 @@ lxl_arr rt_arr_fill(int64_t n, size_t size, const char* w) {
     if (n > (int64_t)1 << 40) rt_trap(2, "out of memory", w);
     return rt_arr_new(n, size);
 }
+/* withCapacity(n): an empty array with room for n elements, n rounded up to a power of two */
+lxl_arr rt_arr_cap(int64_t n, size_t size, const char* w) {
+    if (n < 0) rt_trap(2, "negative array capacity", w);
+    if (n > (int64_t)1 << 40) rt_trap(2, "out of memory", w);
+    lxl_arr a = {0, 0, 0};
+    if (n == 0) return a;
+    int64_t c = 1;
+    while (c < n) c *= 2;
+    a.data = rt_alloc((size_t)c * size);
+    a.cap = c;
+    return a;
+}
 void rt_arr_free(lxl_arr a) { if (a.data) rt_free(a.data); }
 void* rt_arr_push(lxl_arr* a, size_t size) {
     if (a->len == a->cap) {

@@ -5277,3 +5277,16 @@ Updates (32 clients, a checkpoint every 4 MB of log): 20,800 and
 five keys, and `loosen`. `store_ahead` reads its leaves through the node.
 All 62 lexdb tests, the crash test (20 rounds, direct and buffered) and
 the native library tests pass.
+
+**`withCapacity`** (a built-in added for this, at the user's suggestion:
+SPEC 11). `bRunInto` used to grow its array of row views by appending.
+Lexell had no way to size an array of views ahead, since `array(n, v)`
+makes owned values. `var rows: []&str = withCapacity(to - from)` makes an
+empty array with that room, rounded up to a power of two. Its element
+type comes from where it is used. It is in both runtimes as
+`rt_arr_cap`.
+
+| aggregates, ms (as in the table above), two rounds | appending | withCapacity |
+|---|---|---|
+| round 1 | 12.5 / 35.6 / 41.0 / 46.0 / 34.0 / 21.1 | 12.0 / 34.8 / 40.5 / 45.5 / 33.5 / 20.7 |
+| round 2 | 12.5 / 35.6 / 41.5 / 46.1 / 34.1 / 21.2 | 12.2 / 35.0 / 40.8 / 45.5 / 33.4 / 20.7 |
