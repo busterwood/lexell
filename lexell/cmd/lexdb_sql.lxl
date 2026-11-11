@@ -12,6 +12,7 @@ import "strings"
 import "./lexdb_base"
 import "./lexdb_time"
 import "./lexdb_float"
+import "./lexdb_pgcat"
 
 // Column kinds.
 pub const K_INT = 1
@@ -27,6 +28,7 @@ pub const K_IVAL = 10
 pub const K_UUID = 11       // its value Val.Uuid (9.78)
 pub const K_BYTEA = 12      // its value Val.Bytes
 pub const K_FLOAT = 13      // real (OID 700, Val.Real) and double precision (701, Val.Float): 9.79
+pub const K_REG = 14        // regclass, regtype, regnamespace, regproc: Val.Reg, an OID and its name (9.80)
 
 // Postgres type OIDs.
 pub const OID_BOOL = 16
@@ -44,12 +46,21 @@ pub const OID_IVAL = 1186
 pub const OID_UUID = 2950
 pub const OID_BYTEA = 17
 pub const OID_FLOAT4 = 700
+pub const OID_OID = 26
+pub const OID_NAME = 19
+pub const OID_CHAR = 18
+pub const OID_REGCLASS = 2205
+pub const OID_REGTYPE = 2206
+pub const OID_REGNAMESPACE = 4089
+pub const OID_REGPROC = 24
 pub const OID_FLOAT8 = 701
 pub const OID_UNKNOWN = 705
 
 // The array types: element OIDs and, at the same places, their arrays'.
-const ELEM_OIDS: []int = [16, 21, 23, 25, 1043, 20, 1700, 1082, 1083, 1114, 1184, 1186, 2950, 17, 700, 701]
-const ARRAY_OIDS: []int = [1000, 1005, 1007, 1009, 1015, 1016, 1231, 1182, 1183, 1115, 1185, 1187, 2951, 1001, 1021, 1022]
+// int2vector (22) and oidvector (30) are arrays of int2 and oid here, after
+// int2[] and oid[] so that those are the arrays of int2 and oid (9.80).
+const ELEM_OIDS: []int = [16, 21, 23, 25, 1043, 20, 1700, 1082, 1083, 1114, 1184, 1186, 2950, 17, 700, 701, 26, 19, 18, 2205, 2206, 21, 26]
+const ARRAY_OIDS: []int = [1000, 1005, 1007, 1009, 1015, 1016, 1231, 1182, 1183, 1115, 1185, 1187, 2951, 1001, 1021, 1022, 1028, 1003, 1002, 2210, 2211, 22, 30]
 
 // The array type of an element type (0: none).
 pub fn arrayOid(elem: int): int {
@@ -86,9 +97,27 @@ pub type Val = value closed {
     Bytes(str)              // a bytea: its bytes
     Float(float)            // a double precision (9.79)
     Real(float)             // a real: a double holding a single-precision value
+    Reg(int, str)           // a regclass, regtype, ...: its OID and the name it shows (9.80)
 }
 
 pub fn floatType(oid: int): TypeName { return TypeName{kind: K_FLOAT, oid: oid, prec: 0, scale: 0, len: 0} }
+
+// In a statement's seqNames: it reads the catalog (a catalog relation, a
+// reg type, a catalog function), so the catalog is bound before it runs.
+pub const CAT_MARK: str = "\x00catalog"
+
+// The functions that read the catalog (9.80).
+const CAT_FNS: []str = ["pg_get_userbyid", "pg_table_is_visible", "pg_type_is_visible", "pg_function_is_visible",
+                        "pg_collation_is_visible", "pg_get_expr", "pg_get_constraintdef", "pg_get_indexdef",
+                        "pg_get_serial_sequence", "to_regclass", "to_regtype", "to_regnamespace", "obj_description",
+                        "col_description", "pg_relation_is_publishable", "pg_partition_ancestors", "current_user",
+                        "session_user", "current_schema", "has_table_privilege", "has_schema_privilege", "has_database_privilege",
+                        "pg_get_viewdef", "pg_relation_size", "pg_total_relation_size", "pg_table_size", "pg_indexes_size"]
+
+pub fn isCatFn(n: &str): bool {
+    for f in CAT_FNS { if f == n { return true } }
+    return false
+}
 
 // A bytea's text: PostgreSQL's hex form, \x0001ff.
 pub fn bytesHex(b: &str): str {
@@ -271,6 +300,9 @@ pub const S_CREATE_SEQ = 20     // CREATE SEQUENCE table, its options in seq (9.
 pub const S_ALTER_SEQ = 21
 pub const S_DROP_SEQ = 22
 pub const S_COPY = 23           // COPY table [(names)] FROM STDIN / TO STDOUT, COPY (inner[0]) TO STDOUT (9.45)
+pub const S_SAVEPOINT = 41      // SAVEPOINT name (9.80); its name in table
+pub const S_RELEASE = 42        // RELEASE [SAVEPOINT] name
+pub const S_ROLLBACK_TO = 43    // ROLLBACK [WORK | TRANSACTION] TO [SAVEPOINT] name
 
 // COPY's options (Stmt.copy).
 pub type CopyOpts = record {
@@ -639,9 +671,10 @@ fn lex(s: &str): Result[[]Tok, lexdb_base.DbErr] {
         var op = s[i..i + 1]
         if i + 1 < n {
             let two = s[i..i + 2]
-            if two == "<=" || two == ">=" || two == "<>" || two == "!=" || two == "||" || two == "::" { op = two }
+            if two == "<=" || two == ">=" || two == "<>" || two == "!=" || two == "||" || two == "::" || two == "!~" || two == "~*" { op = two }
+            if two == "!~" && i + 2 < n && s[i + 2] == '*' { op = "!~*" }
         }
-        if !strings.contains(&"(),;.*+-/%=<>|:![]", &op[0..1]) {
+        if !strings.contains(&"(),;.*+-/%=<>|:![]~", &op[0..1]) {
             return Err(syntax("syntax error at or near \"" + op + "\""))
         }
         i += len(op)
@@ -717,6 +750,8 @@ const RESERVED: []str = ["select", "from", "where", "group", "order", "by", "lim
 
 // Whether w is a reserved word (RESERVED's): a match on the words, three
 // times faster than a loop over the list (9.53; the parser asks per name).
+pub fn isReservedWord(w: &str): bool { return isReserved(w) }
+
 fn isReserved(w: &str): bool {
     match w {
         "select", "from", "where", "group", "order", "by", "limit", "offset", "and", "or", "not", "is", "null", "as", "values", "set", "into", "insert", "update", "delete", "create", "table", "primary", "key", "asc", "desc", "true", "false", "cast", "on", "join", "inner", "left", "right", "full", "outer", "cross", "using", "natural", "having", "distinct", "in", "like", "ilike", "between", "case", "when", "then", "else", "end", "union", "intersect", "except", "with", "returning", "window" { return true }
@@ -741,16 +776,29 @@ fn (p: mut &P) qname(): Result[str, lexdb_base.DbErr] {
 }
 
 fn (p: mut &P) typeName(): Result[TypeName, lexdb_base.DbErr] {
+    // pg_catalog.type: the type
+    if p.peek().kind == T_IDENT && p.peek().text == "pg_catalog" && p.peekAt(1).kind == T_OP && p.peekAt(1).text == "." { p.pos += 2 }
+    let quoted = p.peek().kind == T_QIDENT
     let w = try p.name()
     var t = TypeName{kind: 0, oid: 0, prec: 0, scale: 0, len: 0}
+    if quoted && w == "char" { return p.arraySuffix(TypeName{kind: K_TEXT, oid: OID_CHAR, prec: 0, scale: 0, len: 0}) }
     match w {
+        "oid" { t = TypeName{kind: K_INT, oid: OID_OID, prec: 0, scale: 0, len: 0} }
+        "name" { t = TypeName{kind: K_TEXT, oid: OID_NAME, prec: 0, scale: 0, len: 0} }
+        "regclass", "regtype", "regnamespace", "regproc", "regprocedure", "regrole" {
+            // catalog lookups: the statement binds the catalog (9.80)
+            append(mut &p.seqs, CAT_MARK)
+            let o = if w == "regclass" { OID_REGCLASS } else if w == "regtype" { OID_REGTYPE } else if w == "regnamespace" { OID_REGNAMESPACE } else { OID_REGPROC }
+            t = TypeName{kind: K_REG, oid: o, prec: 0, scale: 0, len: 0}
+        }
+        "int2vector" { return Ok(TypeName{kind: K_ARRAY, oid: 22, prec: 0, scale: 0, len: 0}) }
+        "oidvector" { return Ok(TypeName{kind: K_ARRAY, oid: 30, prec: 0, scale: 0, len: 0}) }
         "int", "integer", "int4" { t = TypeName{kind: K_INT, oid: OID_INT4, prec: 0, scale: 0, len: 0} }
         "bigint", "int8" { t = TypeName{kind: K_INT, oid: OID_INT8, prec: 0, scale: 0, len: 0} }
         "smallint", "int2" { t = TypeName{kind: K_INT, oid: OID_INT2, prec: 0, scale: 0, len: 0} }
         "boolean", "bool" { t = TypeName{kind: K_BOOL, oid: OID_BOOL, prec: 0, scale: 0, len: 0} }
         "numeric", "decimal" { t = TypeName{kind: K_NUM, oid: OID_NUMERIC, prec: 0, scale: 0, len: 0} }
         "text" { t = TypeName{kind: K_TEXT, oid: OID_TEXT, prec: 0, scale: 0, len: 0} }
-        "regclass" { t = TypeName{kind: K_TEXT, oid: OID_TEXT, prec: 0, scale: 0, len: 0} }     // a relation's name, as text
         "varchar" { t = TypeName{kind: K_TEXT, oid: OID_VARCHAR, prec: 0, scale: 0, len: 0} }
         "date" { t = timeType(OID_DATE) }
         "uuid" { t = TypeName{kind: K_UUID, oid: OID_UUID, prec: 0, scale: 0, len: 0} }
@@ -904,6 +952,28 @@ fn (p: mut &P) cmpExpr(): Result[Expr, lexdb_base.DbErr] {
         let r = try p.catExpr()
         return Ok(Expr.Bin(op, e, r))
     }
+    // x ~ pattern, !~, ~*, !~*; OPERATOR(pg_catalog.op) as op (9.80)
+    var rop = ""
+    if t.kind == T_OP && (t.text == "~" || t.text == "!~" || t.text == "~*" || t.text == "!~*") {
+        p.pos += 1
+        rop = t.text
+    } else if t.kind == T_IDENT && t.text == "operator" && p.peekAt(1).kind == T_OP && p.peekAt(1).text == "(" {
+        p.pos += 2
+        if p.peek().kind == T_IDENT && p.peekAt(1).kind == T_OP && p.peekAt(1).text == "." { p.pos += 2 }
+        let o = p.next()
+        if o.kind != T_OP { return Err(near(&o)) }
+        try p.expectKw(")")
+        rop = if o.text == "!=" { "<>" } else { o.text }
+        if rop == "=" || rop == "<>" || rop == "<" || rop == "<=" || rop == ">" || rop == ">=" {
+            let r = try p.catExpr()
+            return Ok(Expr.Bin(rop, e, r))
+        }
+        if rop != "~" && rop != "!~" && rop != "~*" && rop != "!~*" { return Err(lexdb_base.err("42883", "operator does not exist: " + rop)) }
+    }
+    if len(rop) > 0 {
+        let r = try p.catExpr()
+        return Ok(Expr.Call(rop, [e, r], false))
+    }
     // [NOT] LIKE, ILIKE, IN, BETWEEN
     var neg = false
     let nt = p.peekAt(1)
@@ -997,9 +1067,22 @@ fn (p: mut &P) unary(): Result[Expr, lexdb_base.DbErr] {
     }
     if p.acceptKw("+") { return p.unary() }
     var e = try p.primary()
-    while p.acceptKw("::") {
-        let t = try p.typeName()
-        e = Expr.Cast(e, t)
+    while true {
+        if p.acceptKw("::") {
+            let t = try p.typeName()
+            e = Expr.Cast(e, t)
+        } else if p.acceptKw("[") {
+            // x[i]: an array's element (9.80)
+            let i = try p.expr()
+            try p.expectKw("]")
+            e = Expr.Call("#elem", [e, i], false)
+        } else if p.acceptKw("collate") {
+            // COLLATE name: read, not used (lexdb compares by bytes)
+            let c = try p.name()
+            if p.acceptKw(".") { let c2 = try p.name() }
+        } else {
+            break
+        }
     }
     return Ok(e)
 }
@@ -1159,8 +1242,34 @@ fn (p: mut &P) cteRef(ci: int): Result[int, lexdb_base.DbErr] {
 fn subRef(name: str, i: int): Expr { return Expr.Call(name, [Expr.Lit(Val.Int(i))], false) }
 
 fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
+    // pg_catalog.f(...): f (9.80)
+    if p.peek().kind == T_IDENT && p.peek().text == "pg_catalog" && p.peekAt(1).kind == T_OP && p.peekAt(1).text == "." &&
+       p.peekAt(2).kind == T_IDENT && p.peekAt(3).kind == T_OP && p.peekAt(3).text == "(" {
+        p.pos += 2
+    }
     let t = p.next()
     if t.kind == T_IDENT && t.text == "case" { return p.caseExpr() }
+    if t.kind == T_IDENT && (t.text == "current_user" || t.text == "session_user" || t.text == "user" || t.text == "current_role" ||
+                             t.text == "current_schema" || t.text == "current_catalog") && !p.isKw("(") && !p.isKw(".") {
+        append(mut &p.seqs, CAT_MARK)
+        return Ok(Expr.Call(if t.text == "user" || t.text == "current_role" { "current_user" } else { t.text }, [], false))
+    }
+    if t.kind == T_IDENT && t.text == "array" && p.isKw("(") && (p.peekAt(1).text == "select" || p.peekAt(1).text == "with") {
+        // ARRAY(subquery): (SELECT array_agg(a) FROM (subquery) AS "#arr"(a)), '{}' for no rows
+        p.pos += 1
+        p.depth += 1
+        let saved = replace(mut &p.subs, [])
+        let inner = try p.subquery(SUB_FROM)
+        var w = newStmt(S_SELECT)
+        append(mut &w.from, FromItem{table: "", alias: "#arr", join: J_FIRST, on: None, sub: inner, cols: ["#a"], work: -1, lateral: false})
+        let agg = Expr.Call("array_agg", [Expr.Col("#arr.#a")], false)
+        append(mut &w.items, SelItem{star: false, qual: "", expr: Some(Expr.Call("coalesce", [agg, Expr.Lit(Val.Text("{}"))], false)), alias: "array"})
+        w.subs = replace(mut &p.subs, saved)
+        w.use = SUB_SCALAR
+        p.depth -= 1
+        append(mut &p.subs, w)
+        return Ok(subRef("#sub", len(p.subs) - 1))
+    }
     if t.kind == T_IDENT && t.text == "array" && p.isKw("[") {
         // ARRAY[a, b, ...]: an array of the values
         p.pos += 1
@@ -1302,6 +1411,7 @@ fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
                 try p.expectKw(")")
                 fname = fname + " filter"
             }
+            if isCatFn(&fname) { append(mut &p.seqs, CAT_MARK) }
             if (fname == "nextval" || fname == "currval" || fname == "setval") && len(args) > 0 {
                 match litText(&args[0]) {
                     Some(n) { append(mut &p.seqs, n) }
@@ -1983,11 +2093,52 @@ fn (p: mut &P) intersects(first: Stmt): Result[Stmt, lexdb_base.DbErr] {
     return Ok(lhs)
 }
 
-// One query of a UNION (and the like): SELECT ..., or one in parentheses
-// with its own ORDER BY and LIMIT.
+// VALUES (a, b), (c, d), ... after "values": a function in FROM
+// ("#values:" and its width) whose arguments are the rows' values, row by
+// row; its number in p.subs (9.80).
+fn (p: mut &P) valuesSub(): Result[int, lexdb_base.DbErr] {
+    p.depth += 1
+    let saved = replace(mut &p.subs, [])
+    let savedW = replace(mut &p.wins, [])
+    var s = newStmt(S_SELECT)
+    s.use = SUB_FROM
+    var k = -1
+    while true {
+        try p.expectKw("(")
+        var n = 0
+        while true {
+            append(mut &s.items, SelItem{star: false, qual: "", expr: Some(try p.expr()), alias: ""})
+            n += 1
+            if !p.acceptKw(",") { break }
+        }
+        try p.expectKw(")")
+        if k < 0 { k = n } else if k != n { return Err(lexdb_base.err("42601", "VALUES lists must all be the same length")) }
+        if !p.acceptKw(",") { break }
+    }
+    s.srf = "#values:" + k.toStr()
+    s.subs = replace(mut &p.subs, saved)
+    s.wins = replace(mut &p.wins, savedW)
+    p.depth -= 1
+    append(mut &p.subs, s)
+    return Ok(len(p.subs) - 1)
+}
+
+// VALUES ... as a query: SELECT * FROM (VALUES ...) AS "*VALUES*".
+fn (p: mut &P) valuesQuery(): Result[Stmt, lexdb_base.DbErr] {
+    let i = try p.valuesSub()
+    var s = newStmt(S_SELECT)
+    append(mut &s.items, SelItem{star: true, qual: "", expr: None, alias: ""})
+    append(mut &s.from, FromItem{table: "", alias: "*VALUES*", join: J_FIRST, on: None, sub: i, cols: [], work: -1, lateral: false})
+    return Ok(s)
+}
+
+// One query of a UNION (and the like): SELECT ..., VALUES ..., or one in
+// parentheses with its own ORDER BY and LIMIT.
 fn (p: mut &P) setBranch(): Result[Stmt, lexdb_base.DbErr] {
     var b = newStmt(S_SELECT)
-    if p.acceptKw("(") {
+    if p.acceptKw("values") {
+        b = try p.valuesQuery()
+    } else if p.acceptKw("(") {
         try p.expectKw("select")
         b = try p.select()
         try p.expectKw(")")
@@ -2134,11 +2285,25 @@ fn (p: mut &P) orderLimit(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
 
 fn (p: mut &P) fromItem(join: int): Result[FromItem, lexdb_base.DbErr] {
     let lateral = p.acceptKw("lateral")
-    if p.peek().kind == T_IDENT && (p.peek().text == "generate_series" || p.peek().text == "unnest") &&
+    if p.peek().kind == T_IDENT && p.peek().text == "pg_catalog" && p.peekAt(1).kind == T_OP && p.peekAt(1).text == "." &&
+       p.peekAt(3).kind == T_OP && p.peekAt(3).text == "(" {
+        p.pos += 2
+    }
+    if p.peek().kind == T_IDENT && (p.peek().text == "generate_series" || p.peek().text == "unnest" || p.peek().text == "pg_partition_ancestors") &&
        p.pos + 1 < len(p.toks) && p.toks[p.pos + 1].kind == T_OP && p.toks[p.pos + 1].text == "(" {
         return p.fromFunction(join)
     }
     if lateral && !p.isKw("(") { return Err(lexdb_base.err("0A000", "LATERAL is supported before a subquery or a function only")) }
+    if p.isKw("(") && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "values" {
+        // (VALUES (...), ...) [AS] alias [(columns)] (9.80)
+        p.pos += 2
+        let vi = try p.valuesSub()
+        try p.expectKw(")")
+        var valias = "*VALUES*"
+        var vcols: []str = []
+        try p.aliasOf(mut &valias, mut &vcols)
+        return Ok(FromItem{table: "", alias: valias, join: join, on: None, sub: vi, cols: vcols, work: -1, lateral: false})
+    }
     if p.acceptKw("(") {
         // a subquery in FROM
         if !p.isKw("select") && !p.isKw("with") { return Err(lexdb_base.err("0A000", "parenthesized joins are not supported")) }
@@ -2156,6 +2321,17 @@ fn (p: mut &P) fromItem(join: int): Result[FromItem, lexdb_base.DbErr] {
     // qualified name is always a table
     var ci = -1
     for i in 0..len(p.ctes) { if p.ctes[i].name == table { ci = i } }
+    let rel = if ci >= 0 { "" } else { lexdb_pgcat.relOf(&(if isQual(&table) { schemaOf(&table) } else { "" }), &baseName(&table)) }
+    if len(rel) > 0 {
+        // a pg_catalog or information_schema relation (9.80): a function
+        // in FROM whose rows the executor makes from its catalog
+        var s = newStmt(S_SELECT)
+        s.srf = "#" + rel
+        s.use = SUB_FROM
+        append(mut &p.subs, s)
+        append(mut &p.seqs, CAT_MARK)
+        return Ok(FromItem{table: rel, alias: alias, join: join, on: None, sub: len(p.subs) - 1, cols: cols, work: -1, lateral: false})
+    }
     if ci >= 0 {
         if len(cols) == 0 { for c in p.ctes[ci].cols { append(mut &cols, c) } }
         // in its own body: its working table
@@ -2581,6 +2757,11 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
     p.pos += 1
     match t.text {
         "select" { return p.select() }
+        "values" {
+            var vq = try p.valuesQuery()
+            try p.orderLimit(mut &vq)
+            return Ok(vq)
+        }
         "with" {
             // its queries are used where they are named (cteRef): in an
             // INSERT's SELECT, an UPDATE's or a DELETE's subqueries
@@ -2721,7 +2902,24 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
         }
         "rollback", "abort" {
             let a = p.acceptKw("transaction") || p.acceptKw("work")
+            if t.text == "rollback" && p.acceptKw("to") {
+                let sp = p.acceptKw("savepoint")
+                var r = newStmt(S_ROLLBACK_TO)
+                r.table = try p.name()
+                return Ok(r)
+            }
             return Ok(newStmt(S_ROLLBACK))
+        }
+        "savepoint" {
+            var r = newStmt(S_SAVEPOINT)
+            r.table = try p.name()
+            return Ok(r)
+        }
+        "release" {
+            let sp = p.acceptKw("savepoint")
+            var r = newStmt(S_RELEASE)
+            r.table = try p.name()
+            return Ok(r)
         }
         "show" {
             var st = newStmt(S_SHOW)
@@ -2844,7 +3042,7 @@ pub fn parse(sql: &str): Result[[]Stmt, lexdb_base.DbErr] {
 pub fn typeText(t: &TypeName): str {
     if t.kind == K_ARRAY {
         let e = elemOid(t.oid)
-        let k = if e == OID_BOOL { K_BOOL } else if e == OID_NUMERIC { K_NUM } else if e == OID_INT2 || e == OID_INT4 || e == OID_INT8 { K_INT } else if timeKind(e) > 0 { timeKind(e) } else if e == OID_UUID { K_UUID } else if e == OID_BYTEA { K_BYTEA } else if e == OID_FLOAT4 || e == OID_FLOAT8 { K_FLOAT } else { K_TEXT }
+        let k = if e == OID_BOOL { K_BOOL } else if e == OID_NUMERIC { K_NUM } else if e == OID_INT2 || e == OID_INT4 || e == OID_INT8 { K_INT } else if timeKind(e) > 0 { timeKind(e) } else if e == OID_UUID { K_UUID } else if e == OID_BYTEA { K_BYTEA } else if e == OID_FLOAT4 || e == OID_FLOAT8 { K_FLOAT } else if e == OID_OID { K_INT } else if e == OID_REGCLASS || e == OID_REGTYPE { K_REG } else { K_TEXT }
         return typeText(&TypeName{kind: k, oid: e, prec: 0, scale: 0, len: 0}) + "[]"
     }
     if t.oid == OID_INT2 { return "smallint" }
@@ -2863,6 +3061,13 @@ pub fn typeText(t: &TypeName): str {
     if t.oid == OID_DATE { return "date" }
     if t.oid == OID_UUID { return "uuid" }
     if t.oid == OID_FLOAT4 { return "real" }
+    if t.oid == OID_OID { return "oid" }
+    if t.oid == OID_NAME { return "name" }
+    if t.oid == OID_CHAR { return "\"char\"" }
+    if t.oid == OID_REGCLASS { return "regclass" }
+    if t.oid == OID_REGTYPE { return "regtype" }
+    if t.oid == OID_REGNAMESPACE { return "regnamespace" }
+    if t.oid == OID_REGPROC { return "regproc" }
     if t.oid == OID_FLOAT8 { return "double precision" }
     if t.oid == OID_BYTEA { return "bytea" }
     if t.oid == OID_TIME { return "time" + p + " without time zone" }
@@ -2896,6 +3101,7 @@ pub fn exprText(x: &Expr): str {
                 Val.Bytes(b) { return "'" + bytesHex(&b) + "'::bytea" }
                 Val.Float(fx) { return "'" + lexdb_float.fmt8(fx) + "'::double precision" }
                 Val.Real(fx) { return "'" + lexdb_float.fmt4(fx) + "'::real" }
+                Val.Reg(o, _) { return o.toStr() }
             }
         }
         Expr.Param(n) { return "$" + n.toStr() }

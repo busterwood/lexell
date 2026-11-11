@@ -24,6 +24,8 @@ import "os"
 import "./lexdb_base"
 import "./lexdb_time"
 import "./lexdb_float"
+import "./lexdb_pgcat"
+import "regex"
 import "math"
 import "base64"
 import "./lexdb_page"
@@ -118,6 +120,7 @@ pub fn text(v: &Val): str {
         Val.Bytes(b) { return lexdb_sql.bytesHex(&b) }
         Val.Float(x) { return lexdb_float.fmt8(x) }
         Val.Real(x) { return lexdb_float.fmt4(x) }
+        Val.Reg(_, n) { return n }
     }
 }
 
@@ -138,6 +141,7 @@ fn kindName(t: &lexdb_sql.TypeName): str {
     if t.kind == lexdb_sql.K_UUID { return "uuid" }
     if t.kind == lexdb_sql.K_BYTEA { return "bytea" }
     if t.kind == lexdb_sql.K_FLOAT { return if t.oid == lexdb_sql.OID_FLOAT4 { "real" } else { "double precision" } }
+    if t.kind == lexdb_sql.K_REG || t.oid == lexdb_sql.OID_OID || t.oid == lexdb_sql.OID_NAME || t.oid == lexdb_sql.OID_CHAR { return lexdb_sql.typeText(t) }
     return if t.oid == lexdb_sql.OID_VARCHAR { "character varying" } else { "text" }
 }
 
@@ -185,6 +189,7 @@ pub fn coerce(v: Val, t: &lexdb_sql.TypeName): Result[Val, DbErr] {
             }
             Val.Float(x) { return Ok(Val.Int(try floatToInt(x, t))) }
             Val.Real(x) { return Ok(Val.Int(try floatToInt(x, t))) }
+            Val.Reg(o, _) { return Ok(Val.Int(o)) }
             Val.Text(s) {
                 match strings.parseIntOpt(strings.trim(s)) {
                     Some(n) { return Ok(Val.Int(try intRange(t, n))) }
@@ -234,6 +239,17 @@ pub fn coerce(v: Val, t: &lexdb_sql.TypeName): Result[Val, DbErr] {
         return coerceTime(v, t)
     } else if t.kind == lexdb_sql.K_FLOAT {
         return coerceFloat(v, t)
+    } else if t.kind == lexdb_sql.K_REG {
+        // without the catalog (eval's casts look names up: regCast)
+        match v {
+            Val.Reg(o, n) { return Ok(Val.Reg(o, n)) }
+            else {
+                match oidArg(&v) {
+                    Some(o) { return Ok(Val.Reg(o, o.toStr())) }
+                    None { return Err(e("0A000", "lexdb: a name cast to " + kindName(t) + " is not supported here")) }
+                }
+            }
+        }
     } else if t.kind == lexdb_sql.K_UUID {
         match v {
             Val.Uuid(u) { return Ok(Val.Uuid(u)) }
@@ -864,7 +880,13 @@ fn arrayParts(s: &str): Result[[]Option[str], DbErr] {
     var i = 0
     let n = len(s)
     while i < n && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n') { i += 1 }
-    if i >= n || s[i] != '{' { return Err(bad) }
+    if i < n && s[i] != '{' {
+        // an int2vector's or oidvector's form: numbers and spaces (9.80)
+        for c in 0..n { if !((s[c] >= '0' && s[c] <= '9') || s[c] == ' ' || s[c] == '-') { return Err(bad) } }
+        for f in strings.split(s, " ") { if len(f) > 0 { append(mut &out, Some(f.toStr())) } }
+        return Ok(out)
+    }
+    if i >= n { return Err(bad) }
     i += 1
     while i < n && s[i] == ' ' { i += 1 }
     if i < n && s[i] == '}' { return Ok(out) }
@@ -989,6 +1011,7 @@ fn kindOid(v: &Val): int {
         Val.Bytes(_) { return lexdb_sql.OID_BYTEA }
         Val.Float(_) { return lexdb_sql.OID_FLOAT8 }
         Val.Real(_) { return lexdb_sql.OID_FLOAT4 }
+        Val.Reg(_, _) { return lexdb_sql.OID_REGCLASS }
         else { return lexdb_sql.OID_TEXT }
     }
 }
@@ -996,6 +1019,31 @@ fn kindOid(v: &Val): int {
 // A function in FROM: its columns, from its arguments' types.
 fn srfCols(name: &str, ordin: bool, args: &[]OutCol): Result[[]OutCol, DbErr] {
     var out: []OutCol = []
+    if name == "pg_partition_ancestors" {
+        append(mut &out, OutCol{name: "relid", oid: lexdb_sql.OID_REGCLASS})
+        if ordin { append(mut &out, OutCol{name: "ordinality", oid: lexdb_sql.OID_INT8}) }
+        return Ok(out)
+    }
+    if strings.startsWith(name, "#values:") {
+        // VALUES (9.80): a column's type is its first typed value's
+        let k = strings.parseIntOpt(name[8..len(name)]).unwrapOr(1)
+        for c in 0..k {
+            var oid = lexdb_sql.OID_TEXT
+            var r = c
+            while r < len(args) {
+                if args[r].oid != lexdb_sql.OID_TEXT && args[r].oid != lexdb_sql.OID_UNKNOWN { oid = args[r].oid }
+                if oid != lexdb_sql.OID_TEXT { break }
+                r += k
+            }
+            append(mut &out, OutCol{name: "column" + (c + 1).toStr(), oid: oid})
+        }
+        return Ok(out)
+    }
+    if strings.startsWith(name, "#") {
+        // a catalog relation (9.80)
+        for c in lexdb_pgcat.relCols(&name[1..len(name)]) { append(mut &out, OutCol{name: c.name, oid: c.oid}) }
+        return Ok(out)
+    }
     if name == "generate_series" {
         if len(args) < 2 || len(args) > 3 {
             return Err(e("42883", "function generate_series with " + len(args).toStr() + " arguments does not exist"))
@@ -1038,7 +1086,29 @@ fn execSrf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
     var rows: [][]Val = []
     let room = rs.room()
     var bytes = 0
-    if sel.srf == "generate_series" {
+    if sel.srf == "pg_partition_ancestors" {
+        // no partitions in lexdb: a relation is its only ancestor
+        if len(args) == 1 && !isNull(&args[0]) {
+            let o = oidArg(&args[0]).unwrapOr(0)
+            var row: []Val = [Val.Reg(o, o.toStr())]
+            if sel.ordin { append(mut &row, Val.Int(1)) }
+            append(mut &rows, row)
+        }
+    } else if strings.startsWith(&sel.srf, "#values:") {
+        let k = len(sel.outs)
+        var i = 0
+        while i + k <= len(args) {
+            var row: []Val = []
+            for c in 0..k {
+                let ty = oidType(sel.outs[c].oid)
+                append(mut &row, if ty.kind == lexdb_sql.K_TEXT { args[i + c] } else { try coerce(args[i + c], &ty) })
+            }
+            append(mut &rows, row)
+            i += k
+        }
+    } else if strings.startsWith(&sel.srf, "#") {
+        rows = try catRows(st, txn, &sel.srf[1..len(sel.srf)])
+    } else if sel.srf == "generate_series" {
         for a in args { if isNull(&a) { return Ok(Res{cols: [], rows: [], tag: "", hasRows: true, copy: COPY_NONE}) } }
         let ty = oidType(sel.outs[0].oid)
         let start = try coerce(args[0], &ty)
@@ -1123,6 +1193,7 @@ fn kindOf(v: &Val): int {
         Val.Bytes(_) { return lexdb_sql.K_BYTEA }
         Val.Float(_) { return lexdb_sql.K_FLOAT }
         Val.Real(_) { return lexdb_sql.K_FLOAT }
+        Val.Reg(_, _) { return lexdb_sql.K_REG }
     }
 }
 
@@ -1155,6 +1226,18 @@ fn compare(a: &Val, b: &Val): Result[int, DbErr] {
         let x = try coerce(a, &ty)
         let y = try coerce(b, &ty)
         return Ok(text(&x).cmp(&text(&y)))
+    }
+    if ka == lexdb_sql.K_REG || kb == lexdb_sql.K_REG {
+        // a reg type compares as its OID
+        match oidArg(a) {
+            Some(x) {
+                match oidArg(b) {
+                    Some(y) { return Ok(x.cmp(&y)) }
+                    None {}
+                }
+            }
+            None {}
+        }
     }
     if ka == lexdb_sql.K_FLOAT || kb == lexdb_sql.K_FLOAT {
         match asFloat(a) {
@@ -1466,6 +1549,7 @@ pub fn eval(x: &Expr, env: &Env): Result[Val, DbErr] {
         }
         Expr.Cast(a, t) {
             let v = try eval(&a, env)
+            if t.kind == lexdb_sql.K_REG { return regCast(&v, t.oid, &env.seq) }
             return coerce(v, &t)
         }
         Expr.Call(name, args, star) {
@@ -1503,6 +1587,17 @@ pub fn eval(x: &Expr, env: &Env): Result[Val, DbErr] {
             var vs: []Val = []
             for a in args { append(mut &vs, try eval(&a, env)) }
             if isSeqFn(&name) { return seqCall(&name, &vs, env) }
+            if lexdb_sql.isCatFn(&name) || name == "current_schema" {
+                match env.seq {
+                    Some(se) {
+                        match try callCat(&name, &vs, &se) {
+                            Some(r) { return Ok(r) }
+                            None {}
+                        }
+                    }
+                    None { return Err(e("0A000", "lexdb: " + name + " is not allowed here")) }
+                }
+            }
             // now() and the rest: the transaction's start (9.76)
             match env.seq {
                 Some(se) { return callAt(&name, &vs, lexdb_time.fromUnixUs(se.now)) }
@@ -1667,6 +1762,10 @@ fn call(name: &str, vs: &[]Val): Result[Val, DbErr] { return callAt(name, vs, 0)
 
 // call, with now the transaction's start (microseconds since 2000; 0: the clock).
 fn callAt(name: &str, vs: &[]Val, now: int): Result[Val, DbErr] {
+    match try callMisc(name, vs) {
+        Some(r) { return Ok(r) }
+        None {}
+    }
     if name == "gen_random_uuid" && len(vs) == 0 { return randomUuid() }
     if name == "random" && len(vs) == 0 { return randomFloat() }
     if (name == "encode" || name == "decode") && len(vs) == 2 {
@@ -1866,6 +1965,7 @@ fn encKeyPart(b: mut &StrBuf, v: &Val) {
         Val.Uuid(u) { encBytesKey(b, &u) }       // its lowercase form sorts as its bytes do
         Val.Float(x) { binary.addU64BE(b, floatKey(x)) }
         Val.Real(x) { binary.addU64BE(b, floatKey(x)) }
+        Val.Reg(o, _) { binary.addU64BE(b, o ^ (-9223372036854775807 - 1)) }
         Val.Bytes(x) { encBytesKey(b, &x) }
         else {}
     }
@@ -2022,6 +2122,7 @@ fn encVal(b: mut &StrBuf, v: &Val) {
             b.addByte(15)
             binary.addU32LE(b, math.bitsOf32Int(x))
         }
+        Val.Reg(o, _) { encVal(b, &Val.Int(o)) }      // stored as its OID
     }
 }
 
@@ -6760,6 +6861,7 @@ pub fn exprOid(x: &Expr, cols: &[]lexdb_sql.ColDef, ptypes: &[]int): int {
                 Val.Bytes(_) { return lexdb_sql.OID_BYTEA }
         Val.Float(_) { return lexdb_sql.OID_FLOAT8 }
         Val.Real(_) { return lexdb_sql.OID_FLOAT4 }
+        Val.Reg(_, _) { return lexdb_sql.OID_REGCLASS }
                 else { return lexdb_sql.OID_TEXT }
             }
         }
@@ -6853,6 +6955,27 @@ pub fn exprOid(x: &Expr, cols: &[]lexdb_sql.ColDef, ptypes: &[]int): int {
                     return if isFloatOid(a) { lexdb_sql.OID_FLOAT8 } else { lexdb_sql.OID_NUMERIC }
                 }
                 "sqrt", "cbrt", "exp", "ln", "log10", "power", "pow", "random" { return lexdb_sql.OID_FLOAT8 }
+                "format_type", "pg_get_expr", "pg_get_constraintdef", "pg_get_indexdef", "pg_get_serial_sequence", "quote_ident",
+                "array_to_string", "obj_description", "col_description", "shobj_description", "pg_get_viewdef", "json_build_object",
+                "jsonb_build_object", "pg_get_userbyid", "pg_get_triggerdef", "pg_get_statisticsobjdef_columns",
+                "pg_get_function_result", "pg_get_function_arguments" {
+                    return lexdb_sql.OID_TEXT
+                }
+                "current_user", "session_user", "current_schema", "pg_encoding_to_char" { return lexdb_sql.OID_NAME }
+                "pg_table_is_visible", "pg_type_is_visible", "pg_function_is_visible", "pg_collation_is_visible", "~", "!~", "~*",
+                "!~*", "has_table_privilege", "has_schema_privilege", "has_database_privilege", "pg_relation_is_publishable" {
+                    return lexdb_sql.OID_BOOL
+                }
+                "array_length", "array_upper", "array_lower", "cardinality", "generate_subscripts" { return lexdb_sql.OID_INT4 }
+                "pg_relation_size", "pg_total_relation_size", "pg_table_size", "pg_indexes_size" { return lexdb_sql.OID_INT8 }
+                "to_regclass", "pg_partition_ancestors" { return lexdb_sql.OID_REGCLASS }
+                "to_regtype" { return lexdb_sql.OID_REGTYPE }
+                "to_regnamespace" { return lexdb_sql.OID_REGNAMESPACE }
+                "unnest", "#elem" {
+                    let a = if len(args) > 0 { exprOid(&args[0], cols, ptypes) } else { lexdb_sql.OID_TEXT }
+                    let el = lexdb_sql.elemOid(a)
+                    return if el > 0 { el } else { lexdb_sql.OID_TEXT }
+                }
                 "min", "max", "abs", "coalesce" {
                     return if len(args) > 0 { exprOid(&args[0], cols, ptypes) } else { lexdb_sql.OID_TEXT }
                 }
@@ -8230,6 +8353,7 @@ fn execSel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
         }
     }
     try rs.hold(held)
+    if hasSrfCall(&sel.exprs) { try expandSrfs(mut &outRows, &sel.outs) }
     if sorting { collections.sortBy(mut &outRows, fn(a: &OutRow, b: &OutRow): int { return ordCmp(sel, &a.ord, &b.ord) }) }
     var outs: []OutCol = []
     for oc in sel.outs { append(mut &outs, oc) }
@@ -8456,7 +8580,11 @@ pub type Session = record {
     savedPath: [][]str          // in a transaction block: the path at its BEGIN
     id: int                     // its number while the store is open (its sequences' currval: 9.43)
     batch: bool                 // SET lexdb_batch (9.47)
+    saves: []SavePt             // the open block's savepoints, oldest first (9.80)
 }
+
+// A savepoint: its name and the block's writes when it was made.
+type SavePt = record { name: str; mark: int }
 
 // The columns a statement returns, its names looked up along the session's
 // search path.
@@ -8498,7 +8626,20 @@ fn (s: &Session) setting(name: &str): Option[str] {
         "max_recursion" { return Some(s.maxRecursion.toStr()) }
         "statement_timeout" { return Some(if s.timeoutMs == 0 { "0" } else { s.timeoutMs.toStr() + "ms" }) }
         "max_statement_mem" { return Some(if s.maxMem == 0 { "0" } else { (s.maxMem / 1024).toStr() + "kB" }) }
-        "transaction_isolation" { return Some("serializable") }
+        "transaction_isolation", "default_transaction_isolation" { return Some("serializable") }
+        // PostgreSQL's that clients ask for, fixed in lexdb (9.80)
+        "standard_conforming_strings", "integer_datetimes", "is_superuser" { return Some("on") }
+        "transaction_read_only", "default_transaction_read_only", "in_hot_standby" { return Some("off") }
+        "server_version" { return Some("16.0") }
+        "server_version_num" { return Some("160000") }
+        "server_encoding", "client_encoding" { return Some("UTF8") }
+        "datestyle" { return Some("ISO, MDY") }
+        "timezone", "log_timezone" { return Some("UTC") }
+        "intervalstyle" { return Some("postgres") }
+        "lc_collate", "lc_ctype", "lc_messages", "lc_monetary", "lc_numeric", "lc_time" { return Some("C") }
+        "max_identifier_length" { return Some("63") }
+        "application_name" { return Some("") }
+        "bytea_output" { return Some("hex") }
         else { return None }
     }
 }
@@ -8526,7 +8667,7 @@ pub fn newSession(st: lexdb_store.Store): Session {
     let id = num(&st.memoGet(&"sessions").unwrapOr("0")) + 1
     st.memoPut(&"sessions", &id.toStr())
     return Session{st: st, txn: [], failed: false, maxRecursion: MAX_RECURSION, timeoutMs: 0, maxMem: MAX_STATEMENT_MEM,
-                   saved: [], readOnly: false, path: [], pathAt: 0, savedPath: [], id: id, batch: true}
+                   saved: [], readOnly: false, path: [], pathAt: 0, savedPath: [], id: id, batch: true, saves: []}
 }
 
 // max_statement_mem's default.
@@ -8809,6 +8950,7 @@ fn (s: mut &Session) runIn(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int
                 }
                 s.readOnly = stmt.ifFlag
                 s.failed = false
+                s.saves = []
                 s.saved = [Limits{rounds: s.maxRecursion, mem: s.maxMem, deadline: s.timeoutMs, batch: s.batch}]
                 var p: []str = []
                 for n in s.path { append(mut &p, n) }
@@ -8822,6 +8964,7 @@ fn (s: mut &Session) runIn(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int
         }
         lexdb_sql.S_COMMIT {
             if len(s.txn) == 0 { return Ok(tagOnly("COMMIT")) }
+            s.saves = []
             let t = pop(mut &s.txn)
             if s.failed {
                 s.failed = false
@@ -8837,7 +8980,34 @@ fn (s: mut &Session) runIn(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int
         lexdb_sql.S_ROLLBACK {
             if len(s.txn) > 0 { s.st.abort(pop(mut &s.txn)) }
             s.failed = false
+            s.saves = []
             s.restore()
+            return Ok(tagOnly("ROLLBACK"))
+        }
+        lexdb_sql.S_SAVEPOINT, lexdb_sql.S_RELEASE, lexdb_sql.S_ROLLBACK_TO {
+            let what = if stmt.kind == lexdb_sql.S_SAVEPOINT { "SAVEPOINT" } else if stmt.kind == lexdb_sql.S_RELEASE { "RELEASE SAVEPOINT" } else { "ROLLBACK TO SAVEPOINT" }
+            if len(s.txn) == 0 { return Err(e("25P01", what + " can only be used in transaction blocks")) }
+            if s.failed && stmt.kind != lexdb_sql.S_ROLLBACK_TO {
+                return Err(e("25P02", "current transaction is aborted, commands ignored until end of transaction block"))
+            }
+            if stmt.kind == lexdb_sql.S_SAVEPOINT {
+                append(mut &s.saves, SavePt{name: stmt.table, mark: s.txn[0].mark()})
+                return Ok(tagOnly("SAVEPOINT"))
+            }
+            var i = len(s.saves) - 1
+            while i >= 0 && s.saves[i].name != stmt.table { i -= 1 }
+            if i < 0 {
+                s.failed = true
+                return Err(e("3B001", "savepoint \"" + stmt.table + "\" does not exist"))
+            }
+            if stmt.kind == lexdb_sql.S_RELEASE {
+                while len(s.saves) > i { let x = pop(mut &s.saves) }
+                return Ok(tagOnly("RELEASE"))
+            }
+            // ROLLBACK TO: its writes since, and the error if any, gone; it stays
+            s.txn[0].undoTo(s.saves[i].mark)
+            while len(s.saves) > i + 1 { let x = pop(mut &s.saves) }
+            s.failed = false
             return Ok(tagOnly("ROLLBACK"))
         }
         else {}
@@ -9917,6 +10087,10 @@ fn bindSeqs(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, names: &[]str): R
     let no = num(&st.memoGet(&stmtKey(txn.sess)).unwrapOr("0")) + 1
     st.memoPut(&stmtKey(txn.sess), &no.toStr())
     for n in names {
+        if n == lexdb_sql.CAT_MARK {
+            try bindCatalog(st, txn)
+            continue
+        }
         let d = try needSeq(st, txn, &nameOfText(&n))
         st.memoPut(&bindKey(txn.sess, &n), &(no.toStr() + "\n" + encSeq(&d)))
     }
@@ -12885,4 +13059,1238 @@ fn layOfKinds(kinds: &[]byte): FixedLay {
         at += fixedSize(k)
     }
     return FixedLay{kinds: ks, off: off, prev: prev, bm: bm, v0: at}
+}
+
+// ---- pg_catalog and information_schema (9.80)
+//
+// The catalog relations are functions in FROM ("#pg_class", ...) whose
+// rows are made here from lexdb's own catalog when a statement runs. OIDs
+// are made from names (catOid), so a relation keeps its OID while it keeps
+// its name. The catalog functions (pg_get_constraintdef, regclass, ...)
+// read the catalog as the statement bound it (bindCatalog): a summary in the
+// store's memo, keyed by the session, as nextval's sequences are bound.
+
+const OID_PUBLIC = 2200
+const OID_PG_CATALOG = 11
+const OID_INFO_SCHEMA = 13000
+const OID_OWNER = 10
+
+fn copyStrs(xs: &[]str): []str {
+    var out: []str = []
+    for x in xs { append(mut &out, x) }
+    return out
+}
+
+fn copyInts(xs: &[]int): []int {
+    var out: []int = []
+    for x in xs { append(mut &out, x) }
+    return out
+}
+
+fn cloneOptE(x: &Option[Expr]): Option[Expr] {
+    match x {
+        Some(e) { return Some(clone(&e)) }
+        None { return None }
+    }
+}
+
+fn catOid(kind: &str, key: &str): int {
+    var h = 2166136261
+    let s = kind + "\x00" + key
+    for i in 0..len(s) { h = ((h ^ int(s[i])) * 16777619) & 0xFFFFFFFF }
+    return 16384 + h % 2000000000
+}
+
+fn nspOid(n: &str): int {
+    if n == "public" { return OID_PUBLIC }
+    if n == "pg_catalog" { return OID_PG_CATALOG }
+    if n == "information_schema" { return OID_INFO_SCHEMA }
+    return catOid(&"n", n)
+}
+
+// PostgreSQL's own OIDs for the relations clients name (as classoid).
+fn sysRelOid(rel: &str): int {
+    match rel {
+        "pg_class" { return 1259 }
+        "pg_type" { return 1247 }
+        "pg_attribute" { return 1249 }
+        "pg_proc" { return 1255 }
+        "pg_namespace" { return 2615 }
+        "pg_constraint" { return 2606 }
+        "pg_index" { return 2610 }
+        "pg_description" { return 2609 }
+        "pg_attrdef" { return 2604 }
+        "pg_database" { return 1262 }
+        else { return catOid(&"r", &("pg_catalog\x1f" + rel)) }
+    }
+}
+
+// quote_ident: the name as is when it needs no quotes.
+fn quoteIfNeeded(n: &str): str {
+    var plain = len(n) > 0 && ((n[0] >= 'a' && n[0] <= 'z') || n[0] == '_')
+    for i in 0..len(n) {
+        let c = n[i]
+        if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_') { plain = false }
+    }
+    if plain && lexdb_sql.isReservedWord(n) { plain = false }
+    return if plain { n.toStr() } else { "\"" + strings.replaceAll(n, "\"", "\"\"") + "\"" }
+}
+
+type CatIdx = record {
+    name: str
+    oid: int
+    cols: []int             // attnums
+    unique: bool
+    primary: bool
+    con: bool               // a constraint's (primary key, UNIQUE)
+    pred: Option[Expr]
+}
+
+type CatTab = record {
+    key: str
+    t: Table
+    oid: int
+    schema: str
+    name: str
+    shown: str              // as regclass shows it: qualified unless on the path
+    idxs: []CatIdx
+}
+
+type CatCon = record {
+    oid: int
+    name: str
+    typ: str                // p u f c
+    rel: int                // its table's OID
+    schema: str
+    cols: []int
+    refRel: int
+    refCols: []int
+    idx: int                // conindid
+    def: str
+    upd: str
+    del: str
+    check: str              // a CHECK's expression, as PostgreSQL shows it
+}
+
+type CatSnap = record {
+    tabs: []CatTab
+    cons: []CatCon
+    seqs: []Seq
+    schemas: []str          // public and those made
+    path: []str
+    user: str
+}
+
+fn userKey(sess: int): str { return "\x00user\x00" + sess.toStr() }
+fn catMemoKey(sess: int): str { return "\x00cat\x00" + sess.toStr() }
+
+// The session's user, from its startup message.
+pub fn (s: &Session) setUser(u: &str) { s.st.memoPut(&userKey(s.id), u) }
+
+fn visibleIn(path: &[]str, schema: &str): bool {
+    if schema == "pg_catalog" { return true }
+    if len(path) == 0 { return schema == "public" }
+    for p in path { if p == schema { return true } }
+    return false
+}
+
+fn shownIn(path: &[]str, schema: &str, name: &str): str {
+    if visibleIn(path, schema) { return quoteIfNeeded(name) }
+    return quoteIfNeeded(schema) + "." + quoteIfNeeded(name)
+}
+
+fn colNum(t: &Table, name: &str): int {
+    for i in 0..len(t.cols) { if t.cols[i].name == name { return i + 1 } }
+    return 0
+}
+
+fn fkAction(a: int): str {
+    if a == lexdb_sql.FK_RESTRICT { return "r" }
+    if a == lexdb_sql.FK_CASCADE { return "c" }
+    if a == lexdb_sql.FK_SET_NULL { return "n" }
+    if a == lexdb_sql.FK_SET_DEFAULT { return "d" }
+    return "a"
+}
+
+fn fkActionText(a: &str): str {
+    if a == "r" { return "RESTRICT" }
+    if a == "c" { return "CASCADE" }
+    if a == "n" { return "SET NULL" }
+    if a == "d" { return "SET DEFAULT" }
+    return "NO ACTION"
+}
+
+fn colList(t: &Table, nums: &[]int): str {
+    var parts: []str = []
+    for n in nums { if n >= 1 && n <= len(t.cols) { append(mut &parts, quoteIfNeeded(&t.cols[n - 1].name)) } }
+    return strings.join(&parts, ", ")
+}
+
+// An expression as PostgreSQL's deparser writes it (near enough): names
+// bare where they can be, constants typed, AND and OR in capitals.
+fn pgExprText(x: &Expr, typ: &Option[lexdb_sql.TypeName]): str {
+    match x {
+        Expr.Lit(v) {
+            let tn = match typ {
+                Some(t) { lexdb_pgcat.formatType(t.oid, -1) }
+                None { "" }
+            }
+            match v {
+                Val.Null { return if len(tn) > 0 { "NULL::" + tn } else { "NULL" } }
+                Val.Int(n) {
+                    if n >= 0 { return n.toStr() }
+                    return "'" + n.toStr() + "'::" + (if n < -2147483648 { "bigint" } else { "integer" })
+                }
+                Val.Num(d) { return if d.isNeg() { "'" + d.toStr() + "'::numeric" } else { d.toStr() } }
+                Val.Bool(b) { return if b { "true" } else { "false" } }
+                Val.Text(s) { return "'" + strings.replaceAll(s, "'", "''") + "'::" + (if len(tn) > 0 { tn } else { "text" }) }
+                else { return lexdb_sql.exprText(x) }
+            }
+        }
+        Expr.Col(n) {
+            let d = strings.indexOf(&n, ".", 0)
+            return quoteIfNeeded(&(if d < 0 { n } else { n[d + 1..len(n)] }))
+        }
+        Expr.Bin(op, a, b) {
+            let o = if op == "and" { "AND" } else if op == "or" { "OR" } else { op }
+            let none: Option[lexdb_sql.TypeName] = None
+            return "(" + pgExprText(&a, &none) + " " + o + " " + pgExprText(&b, &none) + ")"
+        }
+        Expr.Unary(op, a) {
+            let none: Option[lexdb_sql.TypeName] = None
+            if op == "-" {
+                // a negative constant: as PostgreSQL folds it, '-1'::integer
+                match a {
+                    Expr.Lit(v) {
+                        match v {
+                            Val.Int(n) { return pgExprText(&Expr.Lit(Val.Int(-n)), &none) }
+                            Val.Num(d) { return pgExprText(&Expr.Lit(Val.Num(d.neg())), &none) }
+                            else {}
+                        }
+                    }
+                    else {}
+                }
+            }
+            return if op == "not" { "(NOT " + pgExprText(&a, &none) + ")" } else { "(- " + pgExprText(&a, &none) + ")" }
+        }
+        Expr.IsNull(a, neg) {
+            let none: Option[lexdb_sql.TypeName] = None
+            return "(" + pgExprText(&a, &none) + (if neg { " IS NOT NULL)" } else { " IS NULL)" })
+        }
+        Expr.Cast(a, t) {
+            match a {
+                Expr.Lit(v) {
+                    match v {
+                        Val.Text(s) { return "'" + strings.replaceAll(s, "'", "''") + "'::" + lexdb_pgcat.formatType(t.oid, -1) }
+                        else {}
+                    }
+                }
+                else {}
+            }
+            let none: Option[lexdb_sql.TypeName] = None
+            return "(" + pgExprText(&a, &none) + ")::" + lexdb_pgcat.formatType(t.oid, -1)
+        }
+        Expr.Call(n, args, _) {
+            if len(args) == 0 {
+                if n == "current_timestamp" || n == "current_date" || n == "current_time" || n == "localtimestamp" || n == "localtime" {
+                    return strings.toUpperAscii(n)
+                }
+                return n + "()"
+            }
+            return lexdb_sql.exprText(x)
+        }
+        else { return lexdb_sql.exprText(x) }
+    }
+}
+
+// A column's DEFAULT as pg_attrdef shows it; None for none (an identity
+// column has none: its sequence is its own).
+fn defaultText(snap: &CatSnap, c: &lexdb_sql.ColDef): Option[str] {
+    if c.identity == lexdb_sql.ID_ALWAYS || c.identity == lexdb_sql.ID_BY_DEFAULT { return None }
+    if c.identity == lexdb_sql.ID_SERIAL && len(c.seq) > 0 {
+        return Some("nextval('" + shownIn(&snap.path, &lexdb_sql.schemaOf(&c.seq), &lexdb_sql.baseName(&c.seq)) + "'::regclass)")
+    }
+    match c.def {
+        Some(d) { return Some(pgExprText(&d, &Some(c.typ))) }
+        None { return None }
+    }
+}
+
+// The catalog as the transaction sees it.
+fn catSnap(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[CatSnap, DbErr] {
+    var keys: []str = []
+    var schemas: []str = ["public"]
+    try st.scan(txn, CATALOG, "\x03", "\x04", fn(en: &lexdb_store.Entry): bool {
+        append(mut &schemas, en.key[1..len(en.key)])
+        return true
+    })
+    var raw: []str = []
+    try st.scan(txn, CATALOG, "\x06", "", fn(en: &lexdb_store.Entry): bool {
+        append(mut &keys, en.key)
+        append(mut &raw, en.val)
+        return true
+    })
+    var snap = CatSnap{tabs: [], cons: [], seqs: try allSeqs(st, txn, &""), schemas: schemas, path: copyStrs(&txn.path),
+                       user: st.memoGet(&userKey(txn.sess)).unwrapOr("lexdb")}
+    for i in 0..len(keys) {
+        let t = try decTable(&keys[i], &raw[i])
+        let schema = lexdb_sql.schemaOf(&keys[i])
+        let name = lexdb_sql.baseName(&keys[i])
+        var idxs: []CatIdx = []
+        if len(t.pk) > 0 {
+            var cs: []int = []
+            for p in t.pk { append(mut &cs, p + 1) }
+            let pn = name + "_pkey"
+            append(mut &idxs, CatIdx{name: pn, oid: catOid(&"i", &lexdb_sql.qual(&schema, &pn)), cols: cs, unique: true, primary: true,
+                                     con: true, pred: None})
+        }
+        for ix in t.indexes {
+            var cs: []int = []
+            for c in ix.cols { append(mut &cs, c + 1) }
+            let iname = lexdb_sql.baseName(&ix.name)
+            append(mut &idxs, CatIdx{name: iname, oid: catOid(&"i", &lexdb_sql.qual(&schema, &iname)), cols: cs, unique: ix.unique,
+                                     primary: false, con: ix.con, pred: cloneOptE(&ix.pred)})
+        }
+        append(mut &snap.tabs, CatTab{key: keys[i], t: t, oid: catOid(&"r", &keys[i]), schema: schema, name: name,
+                                      shown: shownIn(&txn.path, &schema, &name), idxs: idxs})
+    }
+    // the constraints, now that every table's OID is known
+    var cons: []CatCon = []
+    for ti in 0..len(snap.tabs) {
+        let ct = &snap.tabs[ti]
+        for ix in ct.idxs {
+            if !ix.con { continue }
+            let ty = if ix.primary { "p" } else { "u" }
+            let def = (if ix.primary { "PRIMARY KEY (" } else { "UNIQUE (" }) + colList(&ct.t, &ix.cols) + ")"
+            append(mut &cons, CatCon{oid: catOid(&"c", &(ct.key + "\x00" + ix.name)), name: ix.name, typ: ty, rel: ct.oid,
+                                          schema: ct.schema, cols: copyInts(&ix.cols), refRel: 0, refCols: [], idx: ix.oid, def: def,
+                                          upd: " ", del: " ", check: ""})
+        }
+        for fk in ct.t.fks {
+            var cs: []int = []
+            for c in fk.cols { append(mut &cs, colNum(&ct.t, &c)) }
+            var refRel = 0
+            var refCols: []int = []
+            var refIdx = 0
+            var refShown = lexdb_sql.shown(&fk.ref)
+            for rt in snap.tabs {
+                if rt.key != fk.ref { continue }
+                refRel = rt.oid
+                refShown = rt.shown
+                for c in fk.refCols { append(mut &refCols, colNum(&rt.t, &c)) }
+                for ix in rt.idxs {
+                    if ix.unique && len(ix.cols) == len(refCols) {
+                        var same = true
+                        for c in refCols {
+                            var has = false
+                            for d in ix.cols { if d == c { has = true } }
+                            if !has { same = false }
+                        }
+                        if same && refIdx == 0 { refIdx = ix.oid }
+                    }
+                }
+            }
+            var refNames: []str = []
+            for c in fk.refCols { append(mut &refNames, quoteIfNeeded(&c)) }
+            var fcols: []str = []
+            for c in fk.cols { append(mut &fcols, quoteIfNeeded(&c)) }
+            let upd = fkAction(fk.onUpdate)
+            let del = fkAction(fk.onDelete)
+            var def = "FOREIGN KEY (" + strings.join(&fcols, ", ") + ") REFERENCES " + refShown + "(" + strings.join(&refNames, ", ") + ")"
+            if upd != "a" { def = def + " ON UPDATE " + fkActionText(&upd) }
+            if del != "a" { def = def + " ON DELETE " + fkActionText(&del) }
+            append(mut &cons, CatCon{oid: catOid(&"c", &(ct.key + "\x00" + fk.name)), name: fk.name, typ: "f", rel: ct.oid,
+                                          schema: ct.schema, cols: cs, refRel: refRel, refCols: refCols, idx: refIdx, def: def,
+                                          upd: upd, del: del, check: ""})
+        }
+        for ck in ct.t.checks {
+            let none: Option[lexdb_sql.TypeName] = None
+            let x = pgExprText(&ck.expr, &none)
+            let body = if strings.startsWith(&x, "(") { x } else { "(" + x + ")" }
+            append(mut &cons, CatCon{oid: catOid(&"c", &(ct.key + "\x00" + ck.name)), name: ck.name, typ: "c", rel: ct.oid,
+                                          schema: ct.schema, cols: [], refRel: 0, refCols: [], idx: 0, def: "CHECK (" + body + ")",
+                                          upd: " ", del: " ", check: body})
+        }
+    }
+    snap.cons = cons
+    return Ok(snap)
+}
+
+fn idxDef(ct: &CatTab, ix: &CatIdx): str {
+    var d = "CREATE " + (if ix.unique { "UNIQUE " } else { "" }) + "INDEX " + quoteIfNeeded(&ix.name) + " ON " +
+            quoteIfNeeded(&ct.schema) + "." + quoteIfNeeded(&ct.name) + " USING btree (" + colList(&ct.t, &ix.cols) + ")"
+    match ix.pred {
+        Some(p) {
+            let none: Option[lexdb_sql.TypeName] = None
+            let x = pgExprText(&p, &none)
+            d = d + " WHERE " + (if strings.startsWith(&x, "(") { x } else { "(" + x + ")" })
+        }
+        None {}
+    }
+    return d
+}
+
+fn seqOid(d: &Seq): int { return catOid(&"S", &d.key) }
+
+fn clean(s: &str): str { return strings.replaceAll(strings.replaceAll(s, "\t", " "), "\n", " ") }
+
+// What the catalog functions look up, in the memo: one line a fact.
+fn bindCatalog(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[Unit, DbErr] {
+    let snap = try catSnap(st, txn)
+    var b = newStrBuf()
+    b.add("u\t" + snap.user + "\n")
+    let cur = if len(snap.path) == 0 { "public" } else { snap.path[0] }
+    b.add("p\t" + cur + "\n")
+    for ct in snap.tabs {
+        b.add("r\t" + ct.oid.toStr() + "\t" + ct.shown + "\t" + ct.schema + "\t" + ct.name + "\n")
+        for ix in ct.idxs {
+            b.add("r\t" + ix.oid.toStr() + "\t" + shownIn(&snap.path, &ct.schema, &ix.name) + "\t" + ct.schema + "\t" + ix.name + "\n")
+            var cols: []str = []
+            for c in ix.cols { append(mut &cols, if c >= 1 && c <= len(ct.t.cols) { ct.t.cols[c - 1].name } else { "" }) }
+            b.add("x\t" + ix.oid.toStr() + "\t" + clean(&idxDef(&ct, &ix)) + "\t" + strings.join(&cols, "\x1e") + "\n")
+        }
+        for c in ct.t.cols {
+            if len(c.seq) > 0 {
+                b.add("s\t" + ct.oid.toStr() + "\t" + c.name + "\t" + quoteIfNeeded(&lexdb_sql.schemaOf(&c.seq)) + "." +
+                      quoteIfNeeded(&lexdb_sql.baseName(&c.seq)) + "\n")
+            }
+        }
+    }
+    for d in snap.seqs {
+        let sc = lexdb_sql.schemaOf(&d.key)
+        let nm = lexdb_sql.baseName(&d.key)
+        b.add("r\t" + seqOid(&d).toStr() + "\t" + shownIn(&snap.path, &sc, &nm) + "\t" + sc + "\t" + nm + "\n")
+    }
+    for r in lexdb_pgcat.relNames() {
+        let dot = strings.indexOf(&r, ".", 0)
+        let sc = if dot < 0 { "pg_catalog" } else { r[0..dot] }
+        let nm = if dot < 0 { r } else { r[dot + 1..len(r)] }
+        b.add("r\t" + (if dot < 0 { sysRelOid(&r) } else { catOid(&"r", &(sc + "\x1f" + nm)) }).toStr() + "\t" +
+              shownIn(&snap.path, &sc, &nm) + "\t" + sc + "\t" + nm + "\n")
+    }
+    for c in snap.cons { b.add("c\t" + c.oid.toStr() + "\t" + clean(&c.def) + "\n") }
+    for s in snap.schemas { b.add("n\t" + nspOid(&s).toStr() + "\t" + s + "\n") }
+    b.add("n\t11\tpg_catalog\nn\t13000\tinformation_schema\n")
+    st.memoPut(&catMemoKey(txn.sess), &b.toStr())
+    return Ok(Unit{})
+}
+
+// The bound catalog's lines of a kind, split at tabs.
+fn catLines(se: &SeqEnv, kind: &str): [][]str {
+    let all = se.st.memoGet(&catMemoKey(se.sess)).unwrapOr("")
+    var out: [][]str = []
+    for l in strings.split(&all, "\n") {
+        if len(l) > 2 && l[0..1] == kind && l[1] == '\t' {
+            var fs: []str = []
+            for f in strings.split(&l[2..len(l)], "\t") { append(mut &fs, f.toStr()) }
+            append(mut &out, fs)
+        }
+    }
+    return out
+}
+
+fn catUser(se: &SeqEnv): str {
+    for l in catLines(se, &"u") { return l[0] }
+    return se.st.memoGet(&userKey(se.sess)).unwrapOr("lexdb")
+}
+
+// A relation's OID by its name as written (schema.name, or a name on the
+// path; quoted parts as they are), 0 if none.
+fn relOidOf(se: &SeqEnv, s: &str): int {
+    var sc = ""
+    var nm = strings.trim(s)
+    var parts: []str = []
+    var cur = newStrBuf()
+    var q = false
+    for i in 0..len(nm) {
+        let c = nm[i]
+        if c == '"' { q = !q }
+        else if c == '.' && !q {
+            append(mut &parts, cur.toStr())
+            cur = newStrBuf()
+        } else { cur.addByte(if !q && c >= 'A' && c <= 'Z' { c + 32 } else { c }) }
+    }
+    append(mut &parts, cur.toStr())
+    if len(parts) == 2 { sc = parts[0] }
+    let name = parts[len(parts) - 1]
+    for l in catLines(se, &"r") {
+        if l[3] != name { continue }
+        if len(sc) > 0 && l[2] != sc { continue }
+        if len(sc) == 0 && strings.indexOf(&l[1], ".", 0) >= 0 && l[1] != quoteIfNeeded(&name) { continue }
+        return strings.parseIntOpt(l[0]).unwrapOr(0)
+    }
+    return 0
+}
+
+fn relShown(se: &SeqEnv, oid: int): Option[str] {
+    let k = oid.toStr()
+    for l in catLines(se, &"r") { if l[0] == k { return Some(l[1]) } }
+    return None
+}
+
+fn oidArg(v: &Val): Option[int] {
+    match v {
+        Val.Int(n) { return Some(n) }
+        Val.Reg(o, _) { return Some(o) }
+        Val.Text(s) { return strings.parseIntOpt(strings.trim(s)) }
+        else { return None }
+    }
+}
+
+// A value cast to a reg type: a name looked up, an OID shown by its name.
+fn regCast(v: &Val, oid: int, se: &Option[SeqEnv]): Result[Val, DbErr] {
+    if isNull(v) { return Ok(Val.Null) }
+    let num = oidArg(v)
+    let name = match v {
+        Val.Text(s) { s }
+        else { "" }
+    }
+    if oid == lexdb_sql.OID_REGTYPE {
+        match num {
+            Some(n) { return Ok(Val.Reg(n, if lexdb_pgcat.typeOf(n).isSome() { lexdb_pgcat.formatType(n, -1) } else { n.toStr() })) }
+            None {}
+        }
+        let t = lexdb_pgcat.typeByName(&name)
+        if t == 0 { return Err(e("42704", "type \"" + name + "\" does not exist")) }
+        return Ok(Val.Reg(t, lexdb_pgcat.formatType(t, -1)))
+    }
+    let q = match se {
+        Some(x) { x }
+        None { return Err(e("0A000", "lexdb: a reg type is not allowed here")) }
+    }
+    if oid == lexdb_sql.OID_REGNAMESPACE {
+        for l in catLines(&q, &"n") {
+            match num {
+                Some(n) { if l[0] == n.toStr() { return Ok(Val.Reg(n, quoteIfNeeded(&l[1]))) } }
+                None { if l[1] == name { return Ok(Val.Reg(strings.parseIntOpt(l[0]).unwrapOr(0), quoteIfNeeded(&l[1]))) } }
+            }
+        }
+        match num {
+            Some(n) { return Ok(Val.Reg(n, n.toStr())) }
+            None { return Err(e("3F000", "schema \"" + name + "\" does not exist")) }
+        }
+    }
+    match num {
+        Some(n) { return Ok(Val.Reg(n, relShown(&q, n).unwrapOr(n.toStr()))) }
+        None {}
+    }
+    let o = relOidOf(&q, &name)
+    if o == 0 {
+        if oid == lexdb_sql.OID_REGCLASS { return Err(e("42P01", "relation \"" + name + "\" does not exist")) }
+        return Err(e("42883", "function \"" + name + "\" does not exist"))
+    }
+    return Ok(Val.Reg(o, relShown(&q, o).unwrapOr(name)))
+}
+
+// A set-returning function in a select list (unnest, generate_subscripts,
+// pg_partition_ancestors): its values, marked, expanded into rows when the
+// query's rows are made (expandSrfs).
+const SRF_MARK: str = "\x00srf"
+
+// Whether a select list calls a set-returning function: only then are its
+// rows looked through for marked values.
+fn hasSrfCall(xs: &[]Expr): bool {
+    for x in xs { if srfIn(&x) { return true } }
+    return false
+}
+
+fn srfIn(x: &Expr): bool {
+    match x {
+        Expr.Call(n, args, _) {
+            if n == "unnest" || n == "generate_subscripts" || n == "pg_partition_ancestors" { return true }
+            for a in args { if srfIn(&a) { return true } }
+            return false
+        }
+        Expr.Unary(_, a) { return srfIn(&a) }
+        Expr.Bin(_, a, b) { return srfIn(&a) || srfIn(&b) }
+        Expr.IsNull(a, _) { return srfIn(&a) }
+        Expr.Cast(a, _) { return srfIn(&a) }
+        else { return false }
+    }
+}
+
+fn srfMark(vals: &[]Val): Val { return Val.Text(SRF_MARK + arrayText(vals)) }
+
+fn srfParts(v: &Val): Option[[]Option[str]] {
+    match v {
+        Val.Text(s) {
+            if strings.startsWith(&s, SRF_MARK) {
+                match arrayParts(&s[len(SRF_MARK)..len(s)]) {
+                    Ok(p) { return Some(p) }
+                    Err(_) {}
+                }
+            }
+        }
+        else {}
+    }
+    return None
+}
+
+// Each row with set-returning values made into as many rows as the longest
+// has values (the others NULL past their end), as PostgreSQL 10 on does;
+// none if every one is empty.
+fn expandSrfs(rows: mut &[]OutRow, outs: &[]OutCol): Result[Unit, DbErr] {
+    var any = false
+    for r in rows { for v in r.vals { if srfParts(&v).isSome() { any = true } } }
+    if !any { return Ok(Unit{}) }
+    var out: []OutRow = []
+    for ri in 0..len(rows) {
+        let r = replace(mut &rows[ri], OutRow{vals: [], ord: []})
+        var parts: []Option[[]Option[str]] = []
+        var n = -1
+        for v in r.vals {
+            let p = srfParts(&v)
+            match p {
+                Some(ps) { if len(ps) > n { n = len(ps) } }
+                None {}
+            }
+            append(mut &parts, p)
+        }
+        if n < 0 {
+            append(mut &out, r)
+            continue
+        }
+        for k in 0..n {
+            var vals: []Val = []
+            for c in 0..len(r.vals) {
+                match parts[c] {
+                    Some(ps) {
+                        if k < len(ps) {
+                            match ps[k] {
+                                Some(t) {
+                                    let ty = oidType(if c < len(outs) { outs[c].oid } else { lexdb_sql.OID_TEXT })
+                                    append(mut &vals, if ty.kind == lexdb_sql.K_REG { Val.Reg(strings.parseIntOpt(t).unwrapOr(0), t) } else { try coerce(Val.Text(t), &ty) })
+                                }
+                                None { append(mut &vals, Val.Null) }
+                            }
+                        } else {
+                            append(mut &vals, Val.Null)
+                        }
+                    }
+                    None { append(mut &vals, r.vals[c]) }
+                }
+            }
+            append(mut &out, OutRow{vals: vals, ord: copyRow(&r.ord)})
+        }
+    }
+    let gone = replace(rows, out)
+    return Ok(Unit{})
+}
+
+// s without the parentheses around the whole of it, if it has them.
+fn unwrapParens(s: &str): str {
+    if len(s) < 2 || s[0] != '(' || s[len(s) - 1] != ')' { return s.toStr() }
+    var depth = 0
+    var q = false
+    for i in 0..len(s) {
+        let c = s[i]
+        if c == '\'' { q = !q }
+        if q { continue }
+        if c == '(' { depth += 1 }
+        if c == ')' {
+            depth -= 1
+            if depth == 0 && i < len(s) - 1 { return s.toStr() }
+        }
+    }
+    return s[1..len(s) - 1].toStr()
+}
+
+fn jsonText(v: &Val): str {
+    match v {
+        Val.Null { return "null" }
+        Val.Int(n) { return n.toStr() }
+        Val.Num(d) { return d.toStr() }
+        Val.Bool(b) { return if b { "true" } else { "false" } }
+        Val.Float(_) { return text(v) }
+        else {
+            var b = newStrBuf()
+            b.addByte('"')
+            let s = text(v)
+            for i in 0..len(s) {
+                let c = s[i]
+                if c == '"' { b.add("\\\"") }
+                else if c == '\\' { b.add("\\\\") }
+                else if c == '\n' { b.add("\\n") }
+                else if c == '\t' { b.add("\\t") }
+                else if c == '\r' { b.add("\\r") }
+                else { b.addByte(c) }
+            }
+            b.addByte('"')
+            return b.toStr()
+        }
+    }
+}
+
+// The functions that need no catalog: None if name is none of them.
+fn callMisc(name: &str, vs: &[]Val): Result[Option[Val], DbErr] {
+    let n = len(vs)
+    if name == "~" || name == "!~" || name == "~*" || name == "!~*" {
+        if n != 2 { return Ok(None) }
+        if isNull(&vs[0]) || isNull(&vs[1]) { return Ok(Some(Val.Null)) }
+        let pat = (if strings.contains(name, "*") { "(?i)" } else { "" }) + text(&vs[1])
+        match regex.compile(pat) {
+            Ok(re) {
+                let m = re.isMatch(text(&vs[0]))
+                return Ok(Some(Val.Bool(if strings.startsWith(name, "!") { !m } else { m })))
+            }
+            Err(err) { return Err(e("2201B", "invalid regular expression: " + err.toStr())) }
+        }
+    }
+    if name == "#elem" && n == 2 {
+        if isNull(&vs[0]) || isNull(&vs[1]) { return Ok(Some(Val.Null)) }
+        let i = oidArg(&vs[1]).unwrapOr(0)
+        let ps = try arrayParts(&text(&vs[0]))
+        if i < 1 || i > len(ps) { return Ok(Some(Val.Null)) }
+        match ps[i - 1] {
+            Some(p) { return Ok(Some(Val.Text(p))) }
+            None { return Ok(Some(Val.Null)) }
+        }
+    }
+    if name == "unnest" && n == 1 {
+        if isNull(&vs[0]) { return Ok(Some(srfMark(&[]))) }
+        var vals: []Val = []
+        for p in try arrayParts(&text(&vs[0])) {
+            match p {
+                Some(x) { append(mut &vals, Val.Text(x)) }
+                None { append(mut &vals, Val.Null) }
+            }
+        }
+        return Ok(Some(srfMark(&vals)))
+    }
+    if name == "generate_subscripts" && (n == 2 || n == 3) {
+        if isNull(&vs[0]) { return Ok(Some(srfMark(&[]))) }
+        let k = len(try arrayParts(&text(&vs[0])))
+        var vals: []Val = []
+        for i in 1..k + 1 { append(mut &vals, Val.Int(i)) }
+        if n == 3 && truth(&vs[2]) == Some(true) {
+            var rev: []Val = []
+            var j = len(vals) - 1
+            while j >= 0 {
+                append(mut &rev, vals[j])
+                j -= 1
+            }
+            return Ok(Some(srfMark(&rev)))
+        }
+        return Ok(Some(srfMark(&vals)))
+    }
+    if name == "format_type" && n == 2 {
+        if isNull(&vs[0]) { return Ok(Some(Val.Null)) }
+        let m = if isNull(&vs[1]) { -1 } else { oidArg(&vs[1]).unwrapOr(-1) }
+        return Ok(Some(Val.Text(lexdb_pgcat.formatType(oidArg(&vs[0]).unwrapOr(0), m))))
+    }
+    if name == "quote_ident" && n == 1 {
+        if isNull(&vs[0]) { return Ok(Some(Val.Null)) }
+        return Ok(Some(Val.Text(quoteIfNeeded(&text(&vs[0])))))
+    }
+    if (name == "array_to_string" && (n == 2 || n == 3)) {
+        if isNull(&vs[0]) || isNull(&vs[1]) { return Ok(Some(Val.Null)) }
+        var parts: []str = []
+        for p in try arrayParts(&text(&vs[0])) {
+            match p {
+                Some(x) { append(mut &parts, x) }
+                None { if n == 3 && !isNull(&vs[2]) { append(mut &parts, text(&vs[2])) } }
+            }
+        }
+        return Ok(Some(Val.Text(strings.join(&parts, &text(&vs[1])))))
+    }
+    if (name == "array_length" || name == "array_upper" || name == "array_lower" || name == "cardinality") && (n == 2 || (n == 1 && name == "cardinality")) {
+        if isNull(&vs[0]) { return Ok(Some(Val.Null)) }
+        let k = len(try arrayParts(&text(&vs[0])))
+        if k == 0 { return Ok(Some(if name == "cardinality" { Val.Int(0) } else { Val.Null })) }
+        if n == 2 && oidArg(&vs[1]).unwrapOr(0) != 1 { return Ok(Some(Val.Null)) }
+        return Ok(Some(Val.Int(if name == "array_lower" { 1 } else { k })))
+    }
+    if name == "pg_encoding_to_char" && n == 1 { return Ok(Some(Val.Text(if oidArg(&vs[0]) == Some(6) { "UTF8" } else { "SQL_ASCII" }))) }
+    if (name == "json_build_object" || name == "jsonb_build_object") {
+        if n % 2 != 0 { return Err(e("22023", "argument list must have even number of elements")) }
+        var parts: []str = []
+        var k = 0
+        while k < n {
+            if isNull(&vs[k]) { return Err(e("22004", "null value not allowed for object key")) }
+            append(mut &parts, jsonText(&Val.Text(text(&vs[k]))) + " : " + jsonText(&vs[k + 1]))
+            k += 2
+        }
+        return Ok(Some(Val.Text("{" + strings.join(&parts, ", ") + "}")))
+    }
+    if (name == "pg_type_is_visible" || name == "pg_function_is_visible" || name == "pg_collation_is_visible") && n == 1 {
+        return Ok(Some(if isNull(&vs[0]) { Val.Null } else { Val.Bool(true) }))
+    }
+    if (name == "obj_description" || name == "col_description" || name == "shobj_description" || name == "pg_get_viewdef" ||
+        name == "pg_get_triggerdef" || name == "pg_get_statisticsobjdef_columns" || name == "pg_get_function_result" ||
+        name == "pg_get_function_arguments") {
+        return Ok(Some(Val.Null))
+    }
+    if name == "pg_get_expr" && (n == 2 || n == 3) {
+        // pretty: without the parentheses around the whole
+        if n == 3 && truth(&vs[2]) == Some(true) && !isNull(&vs[0]) { return Ok(Some(Val.Text(unwrapParens(&text(&vs[0]))))) }
+        return Ok(Some(vs[0]))
+    }
+    return Ok(None)
+}
+
+// The functions that read the bound catalog: None if name is none of them.
+fn callCat(name: &str, vs: &[]Val, se: &SeqEnv): Result[Option[Val], DbErr] {
+    let n = len(vs)
+    if name == "current_user" || name == "session_user" { return Ok(Some(Val.Text(catUser(se)))) }
+    if name == "current_schema" && n == 0 {
+        for l in catLines(se, &"p") { return Ok(Some(Val.Text(l[0]))) }
+        return Ok(Some(Val.Text("public")))
+    }
+    if name == "pg_get_userbyid" && n == 1 { return Ok(Some(if isNull(&vs[0]) { Val.Null } else { Val.Text(catUser(se)) })) }
+    if (name == "has_table_privilege" || name == "has_schema_privilege" || name == "has_database_privilege") { return Ok(Some(Val.Bool(true))) }
+    if name == "pg_relation_is_publishable" { return Ok(Some(Val.Bool(false))) }
+    if (name == "pg_relation_size" || name == "pg_total_relation_size" || name == "pg_table_size" || name == "pg_indexes_size") {
+        return Ok(Some(Val.Int(0)))
+    }
+    if n >= 1 && isNull(&vs[0]) { return Ok(Some(Val.Null)) }
+    if name == "pg_table_is_visible" && n == 1 {
+        match relShown(se, oidArg(&vs[0]).unwrapOr(0)) {
+            Some(s) { return Ok(Some(Val.Bool(strings.indexOf(&s, ".", 0) < 0 || strings.startsWith(&s, "\"")))) }
+            None { return Ok(Some(Val.Null)) }
+        }
+    }
+    if name == "pg_get_constraintdef" && (n == 1 || n == 2) {
+        let k = oidArg(&vs[0]).unwrapOr(0).toStr()
+        let pretty = n == 2 && truth(&vs[1]) == Some(true)
+        for l in catLines(se, &"c") {
+            if l[0] != k { continue }
+            // pretty: CHECK (x), not CHECK ((x))
+            if pretty && strings.startsWith(&l[1], "CHECK (") && strings.endsWith(&l[1], ")") {
+                return Ok(Some(Val.Text("CHECK (" + unwrapParens(&l[1][7..len(l[1]) - 1]) + ")")))
+            }
+            return Ok(Some(Val.Text(l[1])))
+        }
+        return Ok(Some(Val.Null))
+    }
+    if name == "pg_get_indexdef" && (n == 1 || n == 3) {
+        let k = oidArg(&vs[0]).unwrapOr(0).toStr()
+        let col = if n == 3 { oidArg(&vs[1]).unwrapOr(0) } else { 0 }
+        for l in catLines(se, &"x") {
+            if l[0] != k { continue }
+            if col == 0 { return Ok(Some(Val.Text(l[1]))) }
+            let cs = strings.split(&l[2], "\x1e")
+            if col <= len(cs) { return Ok(Some(Val.Text(quoteIfNeeded(&cs[col - 1])))) }
+            return Ok(Some(Val.Text("")))
+        }
+        return Ok(Some(Val.Null))
+    }
+    if name == "pg_get_serial_sequence" && n == 2 {
+        let rel = relOidOf(se, &text(&vs[0]))
+        if rel == 0 { return Err(e("42P01", "relation \"" + text(&vs[0]) + "\" does not exist")) }
+        let col = text(&vs[1])
+        for l in catLines(se, &"s") { if l[0] == rel.toStr() && l[1] == col { return Ok(Some(Val.Text(l[2]))) } }
+        return Ok(Some(Val.Null))
+    }
+    if (name == "to_regclass" || name == "to_regtype" || name == "to_regnamespace") && n == 1 {
+        let o = if name == "to_regclass" { lexdb_sql.OID_REGCLASS } else if name == "to_regtype" { lexdb_sql.OID_REGTYPE } else { lexdb_sql.OID_REGNAMESPACE }
+        match regCast(&Val.Text(text(&vs[0])), o, &Some(se)) {
+            Ok(v) { return Ok(Some(v)) }
+            Err(_) { return Ok(Some(Val.Null)) }
+        }
+    }
+    if name == "pg_partition_ancestors" && n == 1 {
+        let o = oidArg(&vs[0]).unwrapOr(0)
+        return Ok(Some(srfMark(&[Val.Int(o)])))
+    }
+    return Ok(None)
+}
+
+// ---- the catalog relations' rows
+
+fn bv(b: bool): Val { return Val.Bool(b) }
+fn tv(s: &str): Val { return Val.Text(s.toStr()) }
+fn iv(n: int): Val { return Val.Int(n) }
+fn intsArr(ns: &[]int): Val {
+    var vs: []Val = []
+    for x in ns { append(mut &vs, Val.Int(x)) }
+    return Val.Text(arrayText(&vs))
+}
+// An int2vector or oidvector: its numbers, spaced.
+fn vecOf(ns: &[]int): Val {
+    var parts: []str = []
+    for x in ns { append(mut &parts, x.toStr()) }
+    return Val.Text(strings.join(&parts, " "))
+}
+
+fn zeros(n: int): Val {
+    var ns: []int = []
+    for i in 0..n { append(mut &ns, 0) }
+    return vecOf(&ns)
+}
+
+fn typLenOf(oid: int): int {
+    match lexdb_pgcat.typeOf(oid) {
+        Some(t) { return t.len }
+        None { return -1 }
+    }
+}
+
+// A column's typmod: varchar's length + 4, numeric's precision << 16 |
+// scale + 4, a time type's precision; -1 none.
+fn typmodOf(t: &lexdb_sql.TypeName): int {
+    if t.oid == lexdb_sql.OID_VARCHAR && t.len > 0 { return t.len + 4 }
+    if t.kind == lexdb_sql.K_NUM && t.prec > 0 { return ((t.prec << 16) | t.scale) + 4 }
+    if isTimeKind(t.kind) && t.prec > 0 { return t.scale }
+    return -1
+}
+
+fn collOf(oid: int): int {
+    return if oid == lexdb_sql.OID_TEXT || oid == lexdb_sql.OID_VARCHAR || oid == lexdb_sql.OID_NAME || oid == 1009 || oid == 1015 { 100 } else { 0 }
+}
+
+fn attRow(rel: int, name: &str, typ: int, mod: int, num: int, notNull: bool, hasDef: bool, ident: str): []Val {
+    let ty = lexdb_pgcat.typeOf(typ)
+    let byval = match ty {
+        Some(t) { t.byval }
+        None { false }
+    }
+    let align = match lexdb_pgcat.typeOf(typ) {
+        Some(t) { t.align }
+        None { "i" }
+    }
+    let isArr = lexdb_sql.elemOid(typ) > 0 && typ != 22 && typ != 30
+    return [iv(rel), tv(&name), iv(typ), iv(typLenOf(typ)), iv(num), iv(-1), iv(mod), iv(if isArr { 1 } else { 0 }), bv(byval),
+            tv(&align), tv(&if byval { "p" } else { "x" }), tv(&""), bv(notNull), bv(hasDef), bv(false), tv(&ident), tv(&""),
+            bv(false), bv(true), iv(0), iv(-1), iv(collOf(typ)), Val.Null, Val.Null, Val.Null, Val.Null]
+}
+
+fn identOf(c: &lexdb_sql.ColDef): str {
+    if c.identity == lexdb_sql.ID_ALWAYS { return "a" }
+    if c.identity == lexdb_sql.ID_BY_DEFAULT { return "d" }
+    return ""
+}
+
+fn infoType(t: &lexdb_sql.TypeName): str {
+    if t.kind == lexdb_sql.K_ARRAY { return "ARRAY" }
+    let f = lexdb_pgcat.formatType(t.oid, -1)
+    return f
+}
+
+// The rows of catalog relation rel.
+fn catRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &str): Result[[][]Val, DbErr] {
+    let snap = try catSnap(st, txn)
+    var rows: [][]Val = []
+    let db = "lexdb"
+    let owner = snap.user
+    match rel {
+        "pg_namespace" {
+            append(mut &rows, [iv(OID_PG_CATALOG), tv(&"pg_catalog"), iv(OID_OWNER), Val.Null])
+            append(mut &rows, [iv(OID_INFO_SCHEMA), tv(&"information_schema"), iv(OID_OWNER), Val.Null])
+            for s in snap.schemas { append(mut &rows, [iv(nspOid(&s)), tv(&s), iv(OID_OWNER), Val.Null]) }
+        }
+        "pg_class" {
+            for ct in snap.tabs {
+                let hasIdx = len(ct.idxs) > 0
+                let trig = len(ct.t.fks) > 0 || len(ct.t.refBy) > 0
+                append(mut &rows, [iv(ct.oid), tv(&ct.name), iv(nspOid(&ct.schema)), iv(0), iv(0), iv(OID_OWNER), iv(2), iv(ct.oid), iv(0),
+                                   iv(0), Val.Real(-1.0f), iv(0), iv(0), bv(hasIdx), bv(false), tv(&"p"), tv(&"r"), iv(len(ct.t.cols)),
+                                   iv(len(ct.t.checks)), bv(false), bv(trig), bv(false), bv(false), bv(false), bv(true), tv(&"d"),
+                                   bv(false), iv(0), iv(0), iv(0), Val.Null, Val.Null, Val.Null])
+                for ix in ct.idxs {
+                    append(mut &rows, [iv(ix.oid), tv(&ix.name), iv(nspOid(&ct.schema)), iv(0), iv(0), iv(OID_OWNER), iv(403), iv(ix.oid),
+                                       iv(0), iv(0), Val.Real(0.0f), iv(0), iv(0), bv(false), bv(false), tv(&"p"), tv(&"i"), iv(len(ix.cols)),
+                                       iv(0), bv(false), bv(false), bv(false), bv(false), bv(false), bv(true), tv(&"n"), bv(false),
+                                       iv(0), iv(0), iv(0), Val.Null, Val.Null, Val.Null])
+                }
+            }
+            for d in snap.seqs {
+                let sc = lexdb_sql.schemaOf(&d.key)
+                append(mut &rows, [iv(seqOid(&d)), tv(&lexdb_sql.baseName(&d.key)), iv(nspOid(&sc)), iv(0), iv(0), iv(OID_OWNER), iv(0),
+                                   iv(seqOid(&d)), iv(0), iv(1), Val.Real(1.0f), iv(0), iv(0), bv(false), bv(false), tv(&"p"), tv(&"S"),
+                                   iv(3), iv(0), bv(false), bv(false), bv(false), bv(false), bv(false), bv(true), tv(&"n"), bv(false),
+                                   iv(0), iv(0), iv(0), Val.Null, Val.Null, Val.Null])
+            }
+            for r in lexdb_pgcat.relNames() {
+                let dot = strings.indexOf(&r, ".", 0)
+                let sc = if dot < 0 { "pg_catalog" } else { r[0..dot] }
+                let nm = if dot < 0 { r } else { r[dot + 1..len(r)] }
+                let o = if dot < 0 { sysRelOid(&r) } else { catOid(&"r", &(sc + "\x1f" + nm)) }
+                let view = dot >= 0 || strings.startsWith(&r, "pg_tables") || r == "pg_indexes" || r == "pg_views" ||
+                           r == "pg_matviews" || r == "pg_sequences" || r == "pg_settings" || r == "pg_roles" || r == "pg_user"
+                append(mut &rows, [iv(o), tv(&nm), iv(nspOid(&sc)), iv(0), iv(0), iv(OID_OWNER), iv(if view { 0 } else { 2 }), iv(o),
+                                   iv(0), iv(0), Val.Real(-1.0f), iv(0), iv(0), bv(false), bv(false), tv(&"p"), tv(&if view { "v" } else { "r" }),
+                                   iv(len(lexdb_pgcat.relCols(&r))), iv(0), bv(view), bv(false), bv(false), bv(false), bv(false),
+                                   bv(true), tv(&if view { "n" } else { "d" }), bv(false), iv(0), iv(0), iv(0), Val.Null, Val.Null, Val.Null])
+            }
+        }
+        "pg_attribute" {
+            for ct in snap.tabs {
+                for i in 0..len(ct.t.cols) {
+                    let c = &ct.t.cols[i]
+                    var nn = c.notNull
+                    for p in ct.t.pk { if p == i { nn = true } }
+                    append(mut &rows, attRow(ct.oid, &c.name, c.typ.oid, typmodOf(&c.typ), i + 1, nn, defaultText(&snap, c).isSome(), identOf(c)))
+                }
+                for ix in ct.idxs {
+                    for k in 0..len(ix.cols) {
+                        let cn = ix.cols[k]
+                        if cn < 1 || cn > len(ct.t.cols) { continue }
+                        let c = &ct.t.cols[cn - 1]
+                        append(mut &rows, attRow(ix.oid, &c.name, c.typ.oid, typmodOf(&c.typ), k + 1, false, false, ""))
+                    }
+                }
+            }
+            for r in lexdb_pgcat.relNames() {
+                let dot = strings.indexOf(&r, ".", 0)
+                let o = if dot < 0 { sysRelOid(&r) } else { catOid(&"r", &(r[0..dot] + "\x1f" + r[dot + 1..len(r)])) }
+                let cs = lexdb_pgcat.relCols(&r)
+                for k in 0..len(cs) { append(mut &rows, attRow(o, &cs[k].name, cs[k].oid, -1, k + 1, false, false, "")) }
+            }
+        }
+        "pg_attrdef" {
+            for ct in snap.tabs {
+                for i in 0..len(ct.t.cols) {
+                    match defaultText(&snap, &ct.t.cols[i]) {
+                        Some(d) { append(mut &rows, [iv(catOid(&"d", &(ct.key + "\x00" + ct.t.cols[i].name))), iv(ct.oid), iv(i + 1), tv(&d)]) }
+                        None {}
+                    }
+                }
+            }
+        }
+        "pg_type" {
+            for t in lexdb_pgcat.types() {
+                let arr = t.cat == "A"
+                append(mut &rows, [iv(t.oid), tv(&t.name), iv(OID_PG_CATALOG), iv(OID_OWNER), iv(t.len), bv(t.byval), tv(&"b"), tv(&t.cat),
+                                   bv(t.pref), bv(true), tv(&","), iv(0), tv(&if arr { "array_subscript_handler" } else { "-" }),
+                                   iv(t.elem), iv(t.array), tv(&if arr { "array_in" } else { t.name + "in" }),
+                                   tv(&if arr { "array_out" } else { t.name + "out" }), tv(&"-"), tv(&"-"), tv(&"-"), tv(&"-"), tv(&"-"),
+                                   tv(&t.align), tv(&if t.byval { "p" } else { "x" }), bv(false), iv(0), iv(-1), iv(0), iv(t.coll),
+                                   Val.Null, Val.Null, Val.Null])
+            }
+        }
+        "pg_index" {
+            for ct in snap.tabs {
+                for ix in ct.idxs {
+                    var colls: []int = []
+                    for c in ix.cols { append(mut &colls, if c >= 1 && c <= len(ct.t.cols) { collOf(ct.t.cols[c - 1].typ.oid) } else { 0 }) }
+                    let pred = predVal(&ix.pred)
+                    append(mut &rows, [iv(ix.oid), iv(ct.oid), iv(len(ix.cols)), iv(len(ix.cols)), bv(ix.unique), bv(false), bv(ix.primary),
+                                       bv(false), bv(true), bv(false), bv(true), bv(false), bv(true), bv(true), bv(false),
+                                       vecOf(&ix.cols), vecOf(&colls), zeros(len(ix.cols)), zeros(len(ix.cols)), Val.Null, pred])
+                }
+            }
+        }
+        "pg_constraint" {
+            for c in snap.cons {
+                let isF = c.typ == "f"
+                append(mut &rows, [iv(c.oid), tv(&c.name), iv(nspOid(&c.schema)), tv(&c.typ), bv(false), bv(false), bv(true), iv(c.rel),
+                                   iv(0), iv(c.idx), iv(0), iv(c.refRel), tv(&c.upd), tv(&c.del), tv(&if isF { "s" } else { " " }),
+                                   bv(true), iv(0), bv(false), if c.typ == "c" { Val.Null } else { intsArr(&c.cols) },
+                                   if isF { intsArr(&c.refCols) } else { Val.Null }, Val.Null, Val.Null, Val.Null, Val.Null, Val.Null,
+                                   if c.typ == "c" { tv(&c.check) } else { Val.Null }, bv(false)])
+            }
+        }
+        "pg_sequence" {
+            for d in snap.seqs {
+                append(mut &rows, [iv(seqOid(&d)), iv(d.typ), iv(d.start), iv(d.inc), iv(d.max), iv(d.min), iv(d.cache), bv(d.cycle)])
+            }
+        }
+        "pg_depend" {
+            for ct in snap.tabs {
+                for i in 0..len(ct.t.cols) {
+                    let c = &ct.t.cols[i]
+                    if len(c.seq) == 0 { continue }
+                    append(mut &rows, [iv(1259), iv(catOid(&"S", &c.seq)), iv(0), iv(1259), iv(ct.oid), iv(i + 1),
+                                       tv(&if c.identity == lexdb_sql.ID_SERIAL { "a" } else { "i" })])
+                }
+            }
+        }
+        "pg_collation" {
+            append(mut &rows, [iv(100), tv(&"default"), iv(OID_PG_CATALOG), iv(OID_OWNER), tv(&"d"), bv(true), iv(-1), Val.Null, Val.Null, Val.Null, Val.Null, Val.Null])
+            append(mut &rows, [iv(950), tv(&"C"), iv(OID_PG_CATALOG), iv(OID_OWNER), tv(&"c"), bv(true), iv(-1), tv(&"C"), tv(&"C"), Val.Null, Val.Null, Val.Null])
+            append(mut &rows, [iv(951), tv(&"POSIX"), iv(OID_PG_CATALOG), iv(OID_OWNER), tv(&"c"), bv(true), iv(-1), tv(&"POSIX"), tv(&"POSIX"), Val.Null, Val.Null, Val.Null])
+        }
+        "pg_am" {
+            append(mut &rows, [iv(2), tv(&"heap"), tv(&"heap_tableam_handler"), tv(&"t")])
+            append(mut &rows, [iv(403), tv(&"btree"), tv(&"bthandler"), tv(&"i")])
+            append(mut &rows, [iv(405), tv(&"hash"), tv(&"hashhandler"), tv(&"i")])
+        }
+        "pg_database" {
+            append(mut &rows, [iv(16384), tv(&db), iv(OID_OWNER), iv(6), tv(&"c"), bv(false), bv(true), iv(-1), iv(0), iv(1), iv(1663),
+                               tv(&"C"), tv(&"C"), Val.Null, Val.Null, Val.Null, Val.Null, Val.Null])
+        }
+        "pg_tablespace" {
+            append(mut &rows, [iv(1663), tv(&"pg_default"), iv(OID_OWNER), Val.Null, Val.Null])
+            append(mut &rows, [iv(1664), tv(&"pg_global"), iv(OID_OWNER), Val.Null, Val.Null])
+        }
+        "pg_roles" {
+            append(mut &rows, [tv(&owner), bv(true), bv(true), bv(true), bv(true), bv(true), bv(true), iv(-1), tv(&"********"), Val.Null,
+                               bv(true), Val.Null, iv(OID_OWNER)])
+        }
+        "pg_user" {
+            append(mut &rows, [tv(&owner), iv(OID_OWNER), bv(true), bv(true), bv(true), bv(true), tv(&"********"), Val.Null, Val.Null])
+        }
+        "pg_tables" {
+            for ct in snap.tabs {
+                append(mut &rows, [tv(&ct.schema), tv(&ct.name), tv(&owner), Val.Null, bv(len(ct.idxs) > 0), bv(false),
+                                   bv(len(ct.t.fks) > 0 || len(ct.t.refBy) > 0), bv(false)])
+            }
+        }
+        "pg_indexes" {
+            for ct in snap.tabs {
+                for ix in ct.idxs { append(mut &rows, [tv(&ct.schema), tv(&ct.name), tv(&ix.name), Val.Null, tv(&idxDef(&ct, &ix))]) }
+            }
+        }
+        "pg_sequences" {
+            for d in snap.seqs {
+                append(mut &rows, [tv(&lexdb_sql.schemaOf(&d.key)), tv(&lexdb_sql.baseName(&d.key)), tv(&owner),
+                                   Val.Reg(d.typ, lexdb_pgcat.formatType(d.typ, -1)), iv(d.start), iv(d.min), iv(d.max), iv(d.inc),
+                                   bv(d.cycle), iv(d.cache), Val.Null])
+            }
+        }
+        "information_schema.schemata" {
+            for s in ["pg_catalog", "information_schema"] {
+                append(mut &rows, [tv(&db), tv(&s), tv(&owner), Val.Null, Val.Null, Val.Null, Val.Null])
+            }
+            for s in snap.schemas { append(mut &rows, [tv(&db), tv(&s), tv(&owner), Val.Null, Val.Null, Val.Null, Val.Null]) }
+        }
+        "information_schema.tables" {
+            for ct in snap.tabs {
+                append(mut &rows, [tv(&db), tv(&ct.schema), tv(&ct.name), tv(&"BASE TABLE"), Val.Null, Val.Null, Val.Null, Val.Null, Val.Null,
+                                   tv(&"YES"), tv(&"NO"), Val.Null])
+            }
+        }
+        "information_schema.columns" {
+            for ct in snap.tabs {
+                for i in 0..len(ct.t.cols) {
+                    let c = &ct.t.cols[i]
+                    var nn = c.notNull
+                    for p in ct.t.pk { if p == i { nn = true } }
+                    let o = c.typ.oid
+                    let isInt = o == lexdb_sql.OID_INT2 || o == lexdb_sql.OID_INT4 || o == lexdb_sql.OID_INT8
+                    let isFl = o == lexdb_sql.OID_FLOAT4 || o == lexdb_sql.OID_FLOAT8
+                    let isNumT = o == lexdb_sql.OID_NUMERIC
+                    let isChar = o == lexdb_sql.OID_VARCHAR || o == lexdb_sql.OID_TEXT
+                    let prec = if o == lexdb_sql.OID_INT2 { iv(16) } else if o == lexdb_sql.OID_INT4 { iv(32) } else if o == lexdb_sql.OID_INT8 { iv(64) }
+                               else if o == lexdb_sql.OID_FLOAT4 { iv(24) } else if o == lexdb_sql.OID_FLOAT8 { iv(53) }
+                               else if isNumT && c.typ.prec > 0 { iv(c.typ.prec) } else { Val.Null }
+                    let radix = if isInt || isFl { iv(2) } else if isNumT { iv(10) } else { Val.Null }
+                    let scale = if isInt { iv(0) } else if isNumT && c.typ.prec > 0 { iv(c.typ.scale) } else { Val.Null }
+                    let dtp = if o == lexdb_sql.OID_DATE { iv(0) } else if isTimeKind(c.typ.kind) { iv(if c.typ.prec > 0 { c.typ.scale } else { 6 }) } else { Val.Null }
+                    let maxLen = if o == lexdb_sql.OID_VARCHAR && c.typ.len > 0 { iv(c.typ.len) } else { Val.Null }
+                    let octLen = if o == lexdb_sql.OID_VARCHAR && c.typ.len > 0 { iv(c.typ.len * 4) } else if isChar { iv(1073741824) } else { Val.Null }
+                    let udt = match lexdb_pgcat.typeOf(o) {
+                        Some(t) { t.name }
+                        None { "text" }
+                    }
+                    let ident = identOf(c)
+                    let isId = len(ident) > 0
+                    var sq = noSeq()
+                    if isId { for d in snap.seqs { if d.key == c.seq { sq = seqCopy(&d) } } }
+                    let dflt = match defaultText(&snap, c) {
+                        Some(d) { tv(&d) }
+                        None { Val.Null }
+                    }
+                    append(mut &rows, [tv(&db), tv(&ct.schema), tv(&ct.name), tv(&c.name), iv(i + 1), dflt, tv(&if nn { "NO" } else { "YES" }),
+                                       tv(&infoType(&c.typ)), maxLen, octLen, prec, radix, scale, dtp, Val.Null, Val.Null,
+                                       Val.Null, Val.Null, Val.Null, Val.Null, Val.Null, Val.Null, Val.Null, Val.Null, Val.Null,
+                                       tv(&db), tv(&"pg_catalog"), tv(&udt), Val.Null, Val.Null, Val.Null, Val.Null, tv(&(i + 1).toStr()),
+                                       tv(&"NO"), tv(&if isId { "YES" } else { "NO" }),
+                                       if isId { tv(&if ident == "a" { "ALWAYS" } else { "BY DEFAULT" }) } else { Val.Null },
+                                       if isId { tv(&sq.start.toStr()) } else { Val.Null }, if isId { tv(&sq.inc.toStr()) } else { Val.Null },
+                                       if isId { tv(&sq.max.toStr()) } else { Val.Null }, if isId { tv(&sq.min.toStr()) } else { Val.Null },
+                                       if isId { tv(&if sq.cycle { "YES" } else { "NO" }) } else { tv(&"NO") },
+                                       tv(&"NEVER"), Val.Null, tv(&"YES")])
+                }
+            }
+        }
+        "information_schema.table_constraints" {
+            for c in snap.cons {
+                let ct = catTabOf(&snap, c.rel)
+                let ty = if c.typ == "p" { "PRIMARY KEY" } else if c.typ == "u" { "UNIQUE" } else if c.typ == "f" { "FOREIGN KEY" } else { "CHECK" }
+                append(mut &rows, [tv(&db), tv(&c.schema), tv(&c.name), tv(&db), tv(&c.schema), tv(&ct), tv(&ty), tv(&"NO"), tv(&"NO"),
+                                   tv(&"YES"), if c.typ == "u" || c.typ == "p" { tv(&"YES") } else { Val.Null }])
+            }
+        }
+        "information_schema.key_column_usage" {
+            for c in snap.cons {
+                if c.typ == "c" { continue }
+                let ti = catTabIdx(&snap, c.rel)
+                if ti < 0 { continue }
+                for k in 0..len(c.cols) {
+                    let cn = c.cols[k]
+                    if cn < 1 || cn > len(snap.tabs[ti].t.cols) { continue }
+                    var pos = Val.Null
+                    if c.typ == "f" { pos = iv(k + 1) }
+                    append(mut &rows, [tv(&db), tv(&c.schema), tv(&c.name), tv(&db), tv(&c.schema), tv(&snap.tabs[ti].name),
+                                       tv(&snap.tabs[ti].t.cols[cn - 1].name), iv(k + 1), pos])
+                }
+            }
+        }
+        "information_schema.referential_constraints" {
+            for c in snap.cons {
+                if c.typ != "f" { continue }
+                var uname = Val.Null
+                var usch = Val.Null
+                for u in snap.cons {
+                    if (u.typ == "p" || u.typ == "u") && u.idx == c.idx && u.rel == c.refRel {
+                        uname = tv(&u.name)
+                        usch = tv(&u.schema)
+                    }
+                }
+                append(mut &rows, [tv(&db), tv(&c.schema), tv(&c.name), tv(&db), usch, uname, tv(&"NONE"), tv(&fkActionText(&c.upd)),
+                                   tv(&fkActionText(&c.del))])
+            }
+        }
+        "information_schema.constraint_column_usage" {
+            for c in snap.cons {
+                let ti = catTabIdx(&snap, if c.typ == "f" { c.refRel } else { c.rel })
+                if ti < 0 { continue }
+                let cols = if c.typ == "f" { copyInts(&c.refCols) } else if c.typ == "c" { checkCols(&snap.tabs[ti].t, &c) } else { copyInts(&c.cols) }
+                for cn in cols {
+                    if cn < 1 || cn > len(snap.tabs[ti].t.cols) { continue }
+                    append(mut &rows, [tv(&db), tv(&snap.tabs[ti].schema), tv(&snap.tabs[ti].name), tv(&snap.tabs[ti].t.cols[cn - 1].name),
+                                       tv(&db), tv(&c.schema), tv(&c.name)])
+                }
+            }
+        }
+        "information_schema.check_constraints" {
+            for c in snap.cons {
+                if c.typ == "c" { append(mut &rows, [tv(&db), tv(&c.schema), tv(&c.name), tv(&c.check)]) }
+            }
+        }
+        "information_schema.sequences" {
+            // not an identity column's (PostgreSQL leaves those out)
+            var idSeqs: []str = []
+            for ct in snap.tabs { for c in ct.t.cols { if len(identOf(&c)) > 0 { append(mut &idSeqs, c.seq) } } }
+            for d in snap.seqs {
+                var skip = false
+                for k in idSeqs { if k == d.key { skip = true } }
+                if skip { continue }
+                let p = if d.typ == lexdb_sql.OID_INT2 { 16 } else if d.typ == lexdb_sql.OID_INT4 { 32 } else { 64 }
+                append(mut &rows, [tv(&db), tv(&lexdb_sql.schemaOf(&d.key)), tv(&lexdb_sql.baseName(&d.key)), tv(&lexdb_pgcat.formatType(d.typ, -1)),
+                                   iv(p), iv(2), iv(0), tv(&d.start.toStr()), tv(&d.min.toStr()), tv(&d.max.toStr()), tv(&d.inc.toStr()),
+                                   tv(&if d.cycle { "YES" } else { "NO" })])
+            }
+        }
+        else {}         // the rest have no rows: no comments, triggers, policies, views, ...
+    }
+    return Ok(rows)
+}
+
+fn predVal(p: &Option[Expr]): Val {
+    let none: Option[lexdb_sql.TypeName] = None
+    match p {
+        Some(x) { return tv(&pgExprText(&x, &none)) }
+        None { return Val.Null }
+    }
+}
+
+fn catTabIdx(snap: &CatSnap, oid: int): int {
+    for i in 0..len(snap.tabs) { if snap.tabs[i].oid == oid { return i } }
+    return -1
+}
+
+fn catTabOf(snap: &CatSnap, oid: int): str {
+    let i = catTabIdx(snap, oid)
+    return if i < 0 { "" } else { snap.tabs[i].name }
+}
+
+// The columns a CHECK names.
+fn checkCols(t: &Table, c: &CatCon): []int {
+    var out: []int = []
+    for i in 0..len(t.cols) {
+        if strings.contains(&c.check, &t.cols[i].name) { append(mut &out, i + 1) }
+    }
+    return out
 }

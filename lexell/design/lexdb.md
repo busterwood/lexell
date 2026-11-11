@@ -5978,3 +5978,168 @@ text vanished. It now drops only the last newline; `exec_time` and
 Run one by one, besides `exec_float`: `exec_types`, `exec_time`,
 `exec_upsert`, `exec_agg`, `exec_aggorder`, `exec_sql`, `exec_retype`,
 `exec_window`, `wire_client`, `wire_describe`, `wire_prepared`.
+
+### 9.80 pg_catalog, information_schema, savepoints and VALUES
+
+Stage 3 of 9.75. **What clients send** was captured from PostgreSQL 18 with
+`log_statement = all` and from `psql -E`:
+- SQLAlchemy's connect, `create_all`, every inspector call Alembic makes
+  (columns, keys, foreign keys, indexes, unique and check constraints,
+  `has_table`, schemas, views, sequences, comments), and `drop_all`;
+- psycopg's;
+- psql's `\dt \d \di \dn \ds \dv \l`, and `\d` on a table, an index and a
+  sequence.
+
+Those queries are the specification, and they now run against lexdb.
+
+- **The relations** are in `cmd/lexdb_pgcat.lxl`: their columns, and
+  PostgreSQL's built-in types (pg_type's rows) with `format_type`.
+  - pg_catalog's:
+    - `pg_namespace`, `pg_class`, `pg_attribute`, `pg_attrdef`, `pg_type`,
+      `pg_index`, `pg_constraint`, `pg_sequence`, `pg_depend`,
+      `pg_collation`, `pg_am`, `pg_database`, `pg_roles`, `pg_user`,
+      `pg_tablespace`;
+    - the views `pg_tables`, `pg_indexes` and `pg_sequences`;
+    - with no rows (lexdb has none of the things they describe):
+      `pg_description`, `pg_shdescription`, `pg_proc`, `pg_opclass`,
+      `pg_inherits`, `pg_policy`, `pg_statistic_ext`, the
+      `pg_publication` three, `pg_trigger`, `pg_rewrite`, `pg_enum`,
+      `pg_extension`, `pg_foreign_table`, `pg_views`, `pg_matviews` and
+      `pg_settings`.
+  - information_schema's: `schemata`, `tables`, `columns`,
+    `table_constraints`, `key_column_usage`, `referential_constraints`,
+    `constraint_column_usage`, `check_constraints`, `sequences`, and
+    `views` (no rows).
+- **How a relation is read.**
+  - The parser makes `pg_class` (bare, or `pg_catalog.pg_class`) and
+    `information_schema.tables` a function in FROM, `#pg_class`, as
+    `generate_series` is one. A CTE of the same name comes first.
+  - `execSrf` makes its rows from lexdb's catalog as the statement's
+    transaction sees it (`catSnap`, `catRows`), so DDL earlier in the same
+    block shows.
+  - Joins, WHERE, subqueries and ORDER BY are the executor's own.
+- **OIDs.**
+  - lexdb has no OIDs, so they are made from names: a 32-bit FNV hash of
+    the kind and the catalog key, from 16384 up (`catOid`). A relation keeps
+    its OID while it keeps its name.
+  - public is 2200, pg_catalog 11, information_schema 13000; the catalog
+    relations clients name as a `classoid` have PostgreSQL's (pg_class
+    1259, ...).
+  - A primary key is an index of its own here (`t_pkey`), as in PostgreSQL;
+    in lexdb it is the table's tree.
+- **What the rows say,** as PostgreSQL would:
+  - `atttypmod` (varchar's length + 4, numeric's precision and scale);
+  - `attidentity`;
+  - DEFAULTs as `pg_attrdef` shows them (`nextval('t_id_seq'::regclass)`,
+    `'x'::text`, `'-1'::integer`, `now()`), but none for an identity
+    column;
+  - constraints and their definitions (`PRIMARY KEY (id)`, `FOREIGN KEY
+    (a) REFERENCES t(id) ON DELETE CASCADE`, `CHECK ((qty > 0))`);
+  - `indkey` as an `int2vector` (`2 3`);
+  - `pg_get_indexdef`'s `CREATE UNIQUE INDEX ... USING btree (...) WHERE
+    (...)`;
+  - `information_schema`'s data types, precisions, identity columns, and
+    its sequences, which leave out the identity columns' as PostgreSQL's
+    do.
+- **New types.**
+  - `oid` (an integer, OID 26), `name` (text, 19), `"char"` (text, 18),
+    and `int2vector` and `oidvector` (arrays of int2 and oid).
+  - The reg types `regclass`, `regtype`, `regnamespace` and `regproc` are
+    `Val.Reg`, an OID with the name it shows:
+    - compared and keyed as the OID, shown as the name;
+    - `'book'::regclass` looks the name up along the path (42P01 if none);
+    - `c.oid::regclass` shows a name, qualified if its schema is not on the
+      path;
+    - `'int4'::regtype` and `to_regtype` use the built-in types.
+- **The catalog functions:**
+  - `pg_table_is_visible`, `pg_get_constraintdef` (pretty: `CHECK (x)`),
+    `pg_get_indexdef` (whole, or a column), `pg_get_expr` (pretty: no outer
+    parentheses), `pg_get_serial_sequence`, `pg_get_userbyid`,
+    `format_type`;
+  - `to_regclass`, `to_regtype`, `to_regnamespace`, `current_schema`,
+    `current_user`;
+  - `quote_ident`, `array_to_string`, `array_length`, `cardinality`,
+    `json_build_object`, `pg_encoding_to_char`;
+  - with fixed answers: `obj_description`, `pg_get_triggerdef`, the
+    `has_*_privilege`s, `pg_relation_size` and the rest.
+  - They read the catalog through a summary the statement binds before it
+    runs: one line a fact, in the store's memo under the session. A
+    statement whose parse met a catalog relation, a reg type or one of
+    these functions carries `CAT_MARK` among its sequence names, and
+    `bindSeqs` binds it as it binds nextval's sequences.
+  - The session's user, from the startup message, is `current_user` and
+    every object's owner.
+- **The SQL these queries use:**
+  - `pg_catalog.f(...)` and `pg_catalog.type`;
+  - `~ !~ ~* !~*` (`lib/regex`), and `OPERATOR(pg_catalog.~)`;
+  - `COLLATE name` (read; lexdb compares bytes);
+  - subscripts `x[i]`;
+  - `ARRAY(subquery)`;
+  - set-returning functions in a select list (`unnest`,
+    `generate_subscripts`): marked values, made into rows when the query's
+    rows are (`expandSrfs`, PostgreSQL 10's zip), and
+    `pg_partition_ancestors` in FROM;
+  - `current_user`, `session_user`, `user` and `current_schema` without
+    parentheses;
+  - the settings clients SHOW (`standard_conforming_strings`,
+    `server_version_num`, ...).
+- **VALUES** (SQLAlchemy's bulk insert reads `FROM (VALUES ...) AS t(a,
+  b)`; psql uses `UNION ALL VALUES`).
+  - It works in FROM, as a branch of UNION and the rest, and as a
+    statement.
+  - It is a function in FROM (`#values:k`) whose arguments are the rows'
+    values; a column's type is its first typed value's, and the others are
+    coerced to it.
+- **Savepoints** (psycopg wraps its type lookups in one; Django and
+  SQLAlchemy's nested transactions use them). `SAVEPOINT name`, `RELEASE
+  [SAVEPOINT] name` and `ROLLBACK [WORK] TO [SAVEPOINT] name`.
+  - A savepoint is the block's count of writes (`Txn.mark`). ROLLBACK TO
+    drops the writes after it and rebuilds the key index (`Txn.undoTo`),
+    keeps the savepoint, and clears the error state.
+  - Its reads stay noted: a commit checks them all, the safe side.
+  - A tree made after it (a CREATE TABLE) stays, empty.
+  - Errors: 25P01 outside a block, 3B001 for an unknown name.
+
+**What the clients do now:**
+- **SQLAlchemy 2.1:** every step passes. That covers its connect,
+  `create_all`, ORM inserts (`INSERT ... SELECT ... FROM (VALUES ...)`) and
+  queries, every inspector call, and `drop_all`.
+- **node-postgres:** every step passes.
+- **psql:** `\dt`, `\d`, `\di`, `\dn`, `\ds`, `\dv` and `\l`, and `\d` on a
+  table, an index or a sequence, show what PostgreSQL's psql shows: columns
+  with types, collations, nullability and defaults; indexes with
+  predicates; check and foreign-key constraints; "Referenced by"; and a
+  sequence's owner.
+- **psycopg:** every step that does not use the binary format passes. Its
+  binary parameters (bytea, date) and binary results, and asyncpg's
+  binary results and COPY, are stage 5; `jsonb` is not done yet.
+
+**Tests.** `exec_catalog`, 66 statements generated from PostgreSQL 18 by
+`gen_pg.py catalog`, all the same:
+- a schema of two schemas: serial and identity keys, varchar(n),
+  numeric(p, s), a text array, defaults (a negative one among them),
+  CHECKs, a foreign key with actions, a partial unique index;
+- everything above that holds no OIDs: the information_schema relations;
+  pg_class, pg_attribute, pg_attrdef, pg_constraint (with
+  `pg_get_constraintdef`), pg_index (`indkey`, `pg_get_indexdef`,
+  `pg_get_expr`), pg_indexes, pg_tables, pg_namespace, pg_sequence and
+  pg_type;
+- the reg types and their errors, `to_regclass` and `to_regtype`,
+  `pg_get_serial_sequence` and `format_type`;
+- visibility under `SET search_path`, `current_schema`;
+- `~` and its kin, subscripts, `pg_catalog.`-qualified names;
+- VALUES three ways, select-list unnest zipped and crossed;
+- the array functions, `json_build_object`, `ARRAY(subquery)`;
+- savepoints: an error rolled back to, one released, and their errors.
+
+`gen_pg.py` writes a statement's tag after its RETURNING rows, but not
+SHOW's: psql shows none.
+
+**Differences from PostgreSQL, left as they are:**
+- the defaults and CHECKs of a numeric column keep the constant as written
+  (`0`, where PostgreSQL writes `0::numeric` in a CHECK);
+- `generate_subscripts` of an `int2vector` counts from 1 (PostgreSQL's
+  vectors count from 0);
+- not-null constraints are not rows of `pg_constraint` (PostgreSQL 18
+  makes them some);
+- `current_database()` is `lexdb` whatever database the client named.

@@ -1,0 +1,280 @@
+// lexdb_pgcat: the fixed parts of the pg_catalog and information_schema
+// relations (9.80): their columns, PostgreSQL's built-in types (pg_type's
+// rows), and format_type. The rows that describe the database's own tables
+// are made by lexdb_exec from its catalog.
+
+import "strings"
+
+// A catalog relation's column.
+pub type CatCol = record {
+    pub name: str
+    pub oid: int
+}
+
+// Column types by letter: o oid, n name, t text, b bool, s int2, i int4,
+// l int8, f float4, c "char", v int2vector, w oidvector, T text[], O oid[],
+// C "char"[], S int2[], x pg_node_tree (text), a aclitem[] (text[]), r
+// regproc, R regtype, z timestamptz, y bytea, k information_schema's
+// cardinal_number (int4), h its character_data (text).
+fn letterOid(c: byte): int {
+    match c {
+        'o' { return 26 }
+        'n' { return 19 }
+        'b' { return 16 }
+        's' { return 21 }
+        'i', 'k' { return 23 }
+        'l' { return 20 }
+        'f' { return 700 }
+        'c' { return 18 }
+        'v' { return 22 }
+        'w' { return 30 }
+        'T', 'a' { return 1009 }
+        'O' { return 1028 }
+        'C' { return 1002 }
+        'S' { return 1005 }
+        'r' { return 24 }
+        'R' { return 2206 }
+        'z' { return 1184 }
+        'y' { return 17 }
+        else { return 25 }
+    }
+}
+
+// Each relation: its name, then its columns as name:letter.
+const RELS: []str = [
+    "pg_namespace oid:o nspname:n nspowner:o nspacl:a",
+    "pg_class oid:o relname:n relnamespace:o reltype:o reloftype:o relowner:o relam:o relfilenode:o reltablespace:o " +
+        "relpages:i reltuples:f relallvisible:i reltoastrelid:o relhasindex:b relisshared:b relpersistence:c relkind:c " +
+        "relnatts:s relchecks:s relhasrules:b relhastriggers:b relhassubclass:b relrowsecurity:b relforcerowsecurity:b " +
+        "relispopulated:b relreplident:c relispartition:b relrewrite:o relfrozenxid:i relminmxid:i relacl:a reloptions:T relpartbound:x",
+    "pg_attribute attrelid:o attname:n atttypid:o attlen:s attnum:s attcacheoff:i atttypmod:i attndims:s attbyval:b " +
+        "attalign:c attstorage:c attcompression:c attnotnull:b atthasdef:b atthasmissing:b attidentity:c attgenerated:c " +
+        "attisdropped:b attislocal:b attinhcount:s attstattarget:s attcollation:o attacl:a attoptions:T attfdwoptions:T attmissingval:t",
+    "pg_attrdef oid:o adrelid:o adnum:s adbin:x",
+    "pg_type oid:o typname:n typnamespace:o typowner:o typlen:s typbyval:b typtype:c typcategory:c typispreferred:b " +
+        "typisdefined:b typdelim:c typrelid:o typsubscript:r typelem:o typarray:o typinput:r typoutput:r typreceive:r " +
+        "typsend:r typmodin:r typmodout:r typanalyze:r typalign:c typstorage:c typnotnull:b typbasetype:o typtypmod:i " +
+        "typndims:i typcollation:o typdefaultbin:x typdefault:t typacl:a",
+    "pg_index indexrelid:o indrelid:o indnatts:s indnkeyatts:s indisunique:b indnullsnotdistinct:b indisprimary:b " +
+        "indisexclusion:b indimmediate:b indisclustered:b indisvalid:b indcheckxmin:b indisready:b indislive:b " +
+        "indisreplident:b indkey:v indcollation:w indclass:w indoption:v indexprs:x indpred:x",
+    "pg_constraint oid:o conname:n connamespace:o contype:c condeferrable:b condeferred:b convalidated:b conrelid:o " +
+        "contypid:o conindid:o conparentid:o confrelid:o confupdtype:c confdeltype:c confmatchtype:c conislocal:b " +
+        "coninhcount:s connoinherit:b conkey:S confkey:S conpfeqop:O conppeqop:O conffeqop:O confdelsetcols:S " +
+        "conexclop:O conbin:x conperiod:b",
+    "pg_description objoid:o classoid:o objsubid:i description:t",
+    "pg_shdescription objoid:o classoid:o description:t",
+    "pg_sequence seqrelid:o seqtypid:o seqstart:l seqincrement:l seqmax:l seqmin:l seqcache:l seqcycle:b",
+    "pg_collation oid:o collname:n collnamespace:o collowner:o collprovider:c collisdeterministic:b collencoding:i " +
+        "collcollate:t collctype:t colllocale:t collicurules:t collversion:t",
+    "pg_am oid:o amname:n amhandler:r amtype:c",
+    "pg_opclass oid:o opcmethod:o opcname:n opcnamespace:o opcowner:o opcfamily:o opcintype:o opcdefault:b opckeytype:o",
+    "pg_database oid:o datname:n datdba:o encoding:i datlocprovider:c datistemplate:b datallowconn:b datconnlimit:i " +
+        "datfrozenxid:i datminmxid:i dattablespace:o datcollate:t datctype:t datlocale:t daticulocale:t daticurules:t datcollversion:t datacl:a",
+    "pg_proc oid:o proname:n pronamespace:o proowner:o prolang:o procost:f prorows:f provariadic:o prosupport:r " +
+        "prokind:c prosecdef:b proleakproof:b proisstrict:b proretset:b provolatile:c proparallel:c pronargs:s " +
+        "pronargdefaults:s prorettype:o proargtypes:w proallargtypes:O proargmodes:C proargnames:T proargdefaults:x " +
+        "protrftypes:O prosrc:t probin:t prosqlbody:x proconfig:T proacl:a",
+    "pg_roles rolname:n rolsuper:b rolinherit:b rolcreaterole:b rolcreatedb:b rolcanlogin:b rolreplication:b " +
+        "rolconnlimit:i rolpassword:t rolvaliduntil:z rolbypassrls:b rolconfig:T oid:o",
+    "pg_user usename:n usesysid:o usecreatedb:b usesuper:b userepl:b usebypassrls:b passwd:t valuntil:z useconfig:T",
+    "pg_inherits inhrelid:o inhparent:o inhseqno:i inhdetachpending:b",
+    "pg_depend classid:o objid:o objsubid:i refclassid:o refobjid:o refobjsubid:i deptype:c",
+    "pg_policy oid:o polname:n polrelid:o polcmd:c polpermissive:b polroles:O polqual:x polwithcheck:x",
+    "pg_statistic_ext oid:o stxrelid:o stxname:n stxnamespace:o stxowner:o stxstattarget:s stxkeys:v stxkind:C stxexprs:x",
+    "pg_publication oid:o pubname:n pubowner:o puballtables:b pubinsert:b pubupdate:b pubdelete:b pubtruncate:b pubviaroot:b",
+    "pg_publication_namespace oid:o pnpubid:o pnnspid:o",
+    "pg_publication_rel oid:o prpubid:o prrelid:o prqual:x prattrs:v",
+    "pg_trigger oid:o tgrelid:o tgparentid:o tgname:n tgfoid:o tgtype:s tgenabled:c tgisinternal:b tgconstrrelid:o " +
+        "tgconstrindid:o tgconstraint:o tgdeferrable:b tginitdeferred:b tgnargs:s tgattr:v tgargs:y tgqual:x tgoldtable:n tgnewtable:n",
+    "pg_rewrite oid:o rulename:n ev_class:o ev_type:c ev_enabled:c is_instead:b ev_qual:x ev_action:x",
+    "pg_enum oid:o enumtypid:o enumsortorder:f enumlabel:n",
+    "pg_extension oid:o extname:n extowner:o extnamespace:o extrelocatable:b extversion:t extconfig:O extcondition:T",
+    "pg_foreign_table ftrelid:o ftserver:o ftoptions:T",
+    "pg_tablespace oid:o spcname:n spcowner:o spcacl:a spcoptions:T",
+    "pg_tables schemaname:n tablename:n tableowner:n tablespace:n hasindexes:b hasrules:b hastriggers:b rowsecurity:b",
+    "pg_indexes schemaname:n tablename:n indexname:n tablespace:n indexdef:t",
+    "pg_views schemaname:n viewname:n viewowner:n definition:t",
+    "pg_matviews schemaname:n matviewname:n matviewowner:n tablespace:n hasindexes:b ispopulated:b definition:t",
+    "pg_sequences schemaname:n sequencename:n sequenceowner:n data_type:R start_value:l min_value:l max_value:l " +
+        "increment_by:l cycle:b cache_size:l last_value:l",
+    "pg_settings name:t setting:t unit:t category:t short_desc:t extra_desc:t context:t vartype:t source:t min_val:t " +
+        "max_val:t enumvals:T boot_val:t reset_val:t sourcefile:t sourceline:i pending_restart:b",
+    "information_schema.schemata catalog_name:n schema_name:n schema_owner:n default_character_set_catalog:n " +
+        "default_character_set_schema:n default_character_set_name:n sql_path:h",
+    "information_schema.tables table_catalog:n table_schema:n table_name:n table_type:h self_referencing_column_name:n " +
+        "reference_generation:h user_defined_type_catalog:n user_defined_type_schema:n user_defined_type_name:n " +
+        "is_insertable_into:h is_typed:h commit_action:h",
+    "information_schema.columns table_catalog:n table_schema:n table_name:n column_name:n ordinal_position:k " +
+        "column_default:h is_nullable:h data_type:h character_maximum_length:k character_octet_length:k " +
+        "numeric_precision:k numeric_precision_radix:k numeric_scale:k datetime_precision:k interval_type:h " +
+        "interval_precision:k character_set_catalog:n character_set_schema:n character_set_name:n collation_catalog:n " +
+        "collation_schema:n collation_name:n domain_catalog:n domain_schema:n domain_name:n udt_catalog:n udt_schema:n " +
+        "udt_name:n scope_catalog:n scope_schema:n scope_name:n maximum_cardinality:k dtd_identifier:n " +
+        "is_self_referencing:h is_identity:h identity_generation:h identity_start:h identity_increment:h " +
+        "identity_maximum:h identity_minimum:h identity_cycle:h is_generated:h generation_expression:h is_updatable:h",
+    "information_schema.table_constraints constraint_catalog:n constraint_schema:n constraint_name:n table_catalog:n " +
+        "table_schema:n table_name:n constraint_type:h is_deferrable:h initially_deferred:h enforced:h nulls_distinct:h",
+    "information_schema.key_column_usage constraint_catalog:n constraint_schema:n constraint_name:n table_catalog:n " +
+        "table_schema:n table_name:n column_name:n ordinal_position:k position_in_unique_constraint:k",
+    "information_schema.referential_constraints constraint_catalog:n constraint_schema:n constraint_name:n " +
+        "unique_constraint_catalog:n unique_constraint_schema:n unique_constraint_name:n match_option:h update_rule:h delete_rule:h",
+    "information_schema.constraint_column_usage table_catalog:n table_schema:n table_name:n column_name:n " +
+        "constraint_catalog:n constraint_schema:n constraint_name:n",
+    "information_schema.check_constraints constraint_catalog:n constraint_schema:n constraint_name:n check_clause:h",
+    "information_schema.sequences sequence_catalog:n sequence_schema:n sequence_name:n data_type:h numeric_precision:k " +
+        "numeric_precision_radix:k numeric_scale:k start_value:h minimum_value:h maximum_value:h increment:h cycle_option:h",
+    "information_schema.views table_catalog:n table_schema:n table_name:n view_definition:h check_option:h " +
+        "is_updatable:h is_insertable_into:h is_trigger_updatable:h is_trigger_deletable:h is_trigger_insertable_into:h",
+]
+
+// Every catalog relation's name.
+pub fn relNames(): []str {
+    var out: []str = []
+    for r in RELS {
+        let sp = strings.indexOf(&r, " ", 0)
+        append(mut &out, r[0..sp].toStr())
+    }
+    return out
+}
+
+fn relSpec(rel: &str): str {
+    for r in RELS {
+        let sp = strings.indexOf(&r, " ", 0)
+        if r[0..sp] == rel { return r[sp + 1..len(r)] }
+    }
+    return ""
+}
+
+// Whether rel ("pg_class", "information_schema.tables") is a catalog relation.
+pub fn isRel(rel: &str): bool { return len(relSpec(rel)) > 0 }
+
+// The catalog relation a FROM item names: pg_catalog's by its name or
+// qualified (pg_catalog QSEP name), information_schema's qualified; "" if
+// none.
+pub fn relOf(schema: &str, name: &str): str {
+    if schema == "information_schema" {
+        let r = "information_schema." + name
+        return if isRel(&r) { r } else { "" }
+    }
+    if (schema == "" || schema == "pg_catalog") && isRel(name) { return name }
+    return ""
+}
+
+pub fn relCols(rel: &str): []CatCol {
+    var out: []CatCol = []
+    let spec = relSpec(rel)
+    for part in strings.split(&spec, " ") {
+        let c = strings.indexOf(&part, ":", 0)
+        append(mut &out, CatCol{name: part[0..c], oid: letterOid(part[c + 1])})
+    }
+    return out
+}
+
+// ---- the built-in types (pg_type's rows)
+
+// A type: OID, name, length, by value, category, element, array, alignment,
+// collation, preferred.
+pub type PgType = record {
+    pub oid: int
+    pub name: str
+    pub len: int
+    pub byval: bool
+    pub cat: str
+    pub elem: int
+    pub array: int
+    pub align: str
+    pub coll: int
+    pub pref: bool
+}
+
+const TYPES: []str = [
+    "16 bool 1 t B 0 1000 c 0 t", "17 bytea -1 f U 0 1001 i 0 f", "18 char 1 t Z 0 1002 c 0 f",
+    "19 name 64 f S 0 1003 c 950 f", "20 int8 8 t N 0 1016 d 0 f", "21 int2 2 t N 0 1005 s 0 f",
+    "22 int2vector -1 f A 21 1006 i 0 f", "23 int4 4 t N 0 1007 i 0 f", "24 regproc 4 t N 0 1008 i 0 f",
+    "25 text -1 f S 0 1009 i 100 t", "26 oid 4 t N 0 1028 i 0 t", "30 oidvector -1 f A 26 1013 i 0 f",
+    "114 json -1 f U 0 199 i 0 f", "700 float4 4 t N 0 1021 i 0 f", "701 float8 8 t N 0 1022 d 0 t",
+    "1043 varchar -1 f S 0 1015 i 100 f", "1082 date 4 t D 0 1182 i 0 f", "1083 time 8 t D 0 1183 d 0 f",
+    "1114 timestamp 8 t D 0 1115 d 0 f", "1184 timestamptz 8 t D 0 1185 d 0 t", "1186 interval 16 f T 0 1187 d 0 t",
+    "1700 numeric -1 f N 0 1231 i 0 f", "2205 regclass 4 t N 0 2210 i 0 f", "2206 regtype 4 t N 0 2211 i 0 f",
+    "2950 uuid 16 f U 0 2951 c 0 f", "3802 jsonb -1 f U 0 3807 i 0 f", "4089 regnamespace 4 t N 0 4090 i 0 f",
+    "1000 _bool -1 f A 16 0 i 0 f", "1001 _bytea -1 f A 17 0 i 0 f", "1002 _char -1 f A 18 0 i 0 f",
+    "1003 _name -1 f A 19 0 i 950 f", "1005 _int2 -1 f A 21 0 i 0 f", "1006 _int2vector -1 f A 22 0 i 0 f",
+    "1007 _int4 -1 f A 23 0 i 0 f", "1008 _regproc -1 f A 24 0 i 0 f", "1009 _text -1 f A 25 0 i 100 f",
+    "1013 _oidvector -1 f A 30 0 i 0 f", "1015 _varchar -1 f A 1043 0 i 100 f", "1016 _int8 -1 f A 20 0 d 0 f",
+    "1021 _float4 -1 f A 700 0 i 0 f", "1022 _float8 -1 f A 701 0 d 0 f", "1028 _oid -1 f A 26 0 i 0 f",
+    "1115 _timestamp -1 f A 1114 0 d 0 f", "1182 _date -1 f A 1082 0 i 0 f", "1183 _time -1 f A 1083 0 d 0 f",
+    "1185 _timestamptz -1 f A 1184 0 d 0 f", "1187 _interval -1 f A 1186 0 d 0 f", "1231 _numeric -1 f A 1700 0 i 0 f",
+    "199 _json -1 f A 114 0 i 0 f", "2210 _regclass -1 f A 2205 0 i 0 f", "2211 _regtype -1 f A 2206 0 i 0 f",
+    "2951 _uuid -1 f A 2950 0 i 0 f", "3807 _jsonb -1 f A 3802 0 i 0 f", "4090 _regnamespace -1 f A 4089 0 i 0 f",
+]
+
+pub fn types(): []PgType {
+    var out: []PgType = []
+    for t in TYPES {
+        let f = strings.split(&t, " ")
+        append(mut &out, PgType{oid: strings.parseIntOpt(f[0]).unwrapOr(0), name: f[1], len: strings.parseIntOpt(f[2]).unwrapOr(0),
+                                byval: f[3] == "t", cat: f[4], elem: strings.parseIntOpt(f[5]).unwrapOr(0),
+                                array: strings.parseIntOpt(f[6]).unwrapOr(0), align: f[7],
+                                coll: strings.parseIntOpt(f[8]).unwrapOr(0), pref: f[9] == "t"})
+    }
+    return out
+}
+
+pub fn typeOf(oid: int): Option[PgType] {
+    var ts = types()
+    for i in 0..len(ts) { if ts[i].oid == oid { return Some(replace(mut &ts[i], noType())) } }
+    return None
+}
+
+fn noType(): PgType { return PgType{oid: 0, name: "", len: 0, byval: false, cat: "", elem: 0, array: 0, align: "", coll: 0, pref: false} }
+
+// A type's OID by its name (pg_type's, or as SQL writes it: integer,
+// character varying), 0 if none.
+pub fn typeByName(n: &str): int {
+    let l = strings.toLowerAscii(strings.trim(n))
+    for t in types() { if t.name == l { return t.oid } }
+    for t in types() { if formatType(t.oid, -1) == l { return t.oid } }
+    match l {
+        "int" { return 23 }
+        "decimal" { return 1700 }
+        "float" { return 701 }
+        "character varying" { return 1043 }
+        else { return 0 }
+    }
+}
+
+// format_type(oid, typmod): the type as SQL writes it, with its modifier
+// (varchar's length + 4, numeric's precision << 16 | scale + 4, a time
+// type's precision); -1 none.
+pub fn formatType(oid: int, mod: int): str {
+    match typeOf(oid) {
+        Some(t) {
+            if t.elem > 0 && t.cat == "A" && oid != 22 && oid != 30 { return formatType(t.elem, mod) + "[]" }
+        }
+        None { return "???" }
+    }
+    let base = match oid {
+        16 { "boolean" }
+        18 { "\"char\"" }
+        20 { "bigint" }
+        21 { "smallint" }
+        23 { "integer" }
+        700 { "real" }
+        701 { "double precision" }
+        1043 { "character varying" }
+        1114 { "timestamp" }
+        1184 { "timestamp" }
+        1083 { "time" }
+        else { typeOf(oid).unwrap().name }
+    }
+    var m = ""
+    if mod >= 0 {
+        if oid == 1043 && mod >= 4 { m = "(" + (mod - 4).toStr() + ")" }
+        if oid == 1700 && mod >= 4 { m = "(" + ((mod - 4) >> 16).toStr() + "," + ((mod - 4) & 0xFFFF).toStr() + ")" }
+        if oid == 1083 || oid == 1114 || oid == 1184 || oid == 1186 { m = "(" + mod.toStr() + ")" }
+    }
+    if oid == 1114 || oid == 1083 { return base + m + " without time zone" }
+    if oid == 1184 { return base + m + " with time zone" }
+    return base + m
+}
