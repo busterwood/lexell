@@ -5904,3 +5904,77 @@ text vanished. It now drops only the last newline; `exec_time` and
 `exec_upsert` came out the same. Run one by one, besides `exec_types`:
 `exec_time`, `exec_upsert`, `exec_aggorder`, `exec_agg`, `exec_srf`,
 `exec_hashagg`, `exec_any`.
+
+### 9.79 real and double precision
+
+- **The types.**
+  - `real` and `float4` are `Val.Real` (OID 700): a double that holds a
+    single-precision value.
+  - `double precision`, `float8` and `float` are `Val.Float` (OID 701).
+  - `float(p)` is a real for p up to 24 and a double precision to 53.
+  - Both are kind `K_FLOAT`; arrays are `real[]` and `double precision[]`.
+- **Their text** is in `cmd/lexdb_float.lxl`, as PostgreSQL 12 on
+  writes it.
+  - The value is the shortest decimal that reads back as the value. A real's
+    is the fewest digits that read back after rounding to single precision.
+  - It is plain for exponents -4 to 14 (5 for a real), else `1.5e-07`; with
+    `NaN`, `Infinity`, `-Infinity` and `-0`.
+  - Reading accepts spaces, `NaN`, and `[+-]Infinity` or `inf` in any case.
+    Out of range is 22003, as are nonzero digits that read as zero.
+- **Arithmetic** (`arithFloat`):
+  - two reals give a real, rounded to single precision; any other mix with a
+    float gives a double precision, as PostgreSQL resolves it;
+  - overflow and underflow from finite operands are 22003, a zero divisor is
+    22012, and `%` on floats is 42883.
+- **Conversions:**
+  - to an integer type, rounded half to even (`rint`);
+  - to numeric, at 15 significant digits (6 for a real), as
+    `float8_numeric`; NaN and the infinities are 0A000 for now, as lexdb's
+    numeric has neither;
+  - from numeric, by its text.
+- **Comparison** treats NaN as equal to itself and after every other value,
+  and `-0 = 0`.
+  - The key is the bits, turned to sort as the values do, with -0 as 0 and
+    every NaN as one.
+  - In rows, tag 14 is a double's 8 bytes and tag 15 a real's 4.
+- **Functions:**
+  - `abs`;
+  - `round`, `floor`, `ceil`, `ceiling` and `trunc` (a numeric stays numeric
+    and its own; an integer or float gives a double precision);
+  - `sqrt`, `cbrt`, `exp`, `ln`, `log10`, `power`/`pow`, `sign` and
+    `random()` (from `getrandom`), with PostgreSQL's 2201E and 2201F errors.
+- **Aggregates:**
+  - `sum` of reals is a real;
+  - `avg` and the variances of floats are double precision;
+  - `avg` squares its values as `float8_accum` does, so 1e300 overflows as
+    in PostgreSQL.
+- **`pg_typeof(x)`** is now known: the resolver replaces it with x's type
+  (`exprOid`) as text.
+- **Binary parameters** of both types are read, and `typLen` gives their
+  sizes.
+
+**Tests.** `exec_float`, 48 queries generated from PostgreSQL 18 by
+`gen_pg.py float`:
+- text both ways and the malformed or out-of-range cases;
+- arithmetic and its types (`pg_typeof`), overflow, underflow and division
+  by zero;
+- casts with integers and numeric;
+- comparisons with NaN, -0 and a real against a double;
+- the functions and their errors;
+- a table of float columns: their order, filters, aggregates and an
+  overflowing `avg`;
+- a float primary key with NaN, -0 (a duplicate of 0), -Infinity, and
+  lookups;
+- UPDATE ... RETURNING.
+
+**Two differences, left as they are:**
+- **cbrt.** PostgreSQL's `cbrt(27)` is glibc's 3.0000000000000004, and
+  Lexell's own `cbrt` gives exactly 3. The test leaves it out.
+- **Subnormals.** Lexell's float `toStr` is not shortest for subnormals
+  (`1e-310` prints as `9.99999999999997e-311`, though its bits are right),
+  so lexdb shows such values with more digits than PostgreSQL. That is for
+  the runtime to fix.
+
+Run one by one, besides `exec_float`: `exec_types`, `exec_time`,
+`exec_upsert`, `exec_agg`, `exec_aggorder`, `exec_sql`, `exec_retype`,
+`exec_window`, `wire_client`, `wire_describe`, `wire_prepared`.

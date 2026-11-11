@@ -1,0 +1,182 @@
+// lexdb_float: real and double precision (9.79): their text as PostgreSQL
+// reads and writes it, real's rounding to single precision, and their
+// conversion to numeric.
+//
+// PostgreSQL (12 on, extra_float_digits 1) writes the shortest decimal that
+// reads back as the value: plain when its exponent is from -4 to 14 (5 for
+// real), else d.ddde+XX; NaN, Infinity, -Infinity, and -0.
+
+import "strings"
+import "math"
+import "./lexdb_base"
+
+// x rounded to single precision (nearest, ties to even), as a double.
+pub fn round4(x: float): float { return math.fromBits32(math.bitsOf32(x)) }
+
+// The shortest decimal digits of a finite nonzero |x| ("15" for 0.015), and
+// the exponent of the first: x = d.ddd * 10^e.
+type Digits = record {
+    ds: str
+    e: int
+}
+
+fn digitsOf(x: float): Digits {
+    let s = x.abs().toStr()
+    let ei = strings.indexOf(&s, "e", 0)
+    let mant = if ei < 0 { s } else { s[0..ei] }
+    let exp = if ei < 0 { 0 } else { strings.parseIntOpt(s[ei + 1..len(s)]).unwrapOr(0) }
+    let dot = strings.indexOf(&mant, ".", 0)
+    var intLen = if dot < 0 { len(mant) } else { dot }
+    var ds = if dot < 0 { mant } else { mant[0..dot] + mant[dot + 1..len(mant)] }
+    var lead = 0
+    while lead < len(ds) - 1 && ds[lead] == '0' { lead += 1 }
+    ds = ds[lead..len(ds)]
+    intLen -= lead
+    var end = len(ds)
+    while end > 1 && ds[end - 1] == '0' { end -= 1 }
+    return Digits{ds: ds[0..end], e: intLen - 1 + exp}
+}
+
+// d rounded to n digits, half to even.
+fn roundDigits(d: &Digits, n: int): Digits {
+    if n >= len(d.ds) { return Digits{ds: d.ds, e: d.e} }
+    var up = false
+    let c = d.ds[n]
+    if c > '5' {
+        up = true
+    } else if c == '5' {
+        var rest = false
+        for i in n + 1..len(d.ds) { if d.ds[i] != '0' { rest = true } }
+        up = rest || (int(d.ds[n - 1] - '0') % 2 == 1)
+    }
+    var bs = strToBytes(d.ds[0..n])
+    var e = d.e
+    if up {
+        var i = n - 1
+        while i >= 0 && bs[i] == '9' {
+            bs[i] = '0'
+            i -= 1
+        }
+        if i < 0 {
+            bs = strToBytes("1" + strFromBytes(&bs)[0..n - 1])
+            e += 1
+        } else {
+            bs[i] = bs[i] + 1
+        }
+    }
+    var end = len(bs)
+    while end > 1 && bs[end - 1] == '0' { end -= 1 }
+    return Digits{ds: strFromBytes(&bs)[0..end], e: e}
+}
+
+fn valueOf(d: &Digits): float {
+    return math.parse(d.ds + "e" + (d.e - len(d.ds) + 1).toStr()).unwrapOr(0.0f)
+}
+
+// The shortest digits of a real (a single-precision value): the fewest that
+// read back, rounded to single precision, as x.
+fn digits4(x: float): Digits {
+    let d = digitsOf(x)
+    let ax = x.abs()
+    for n in 1..len(d.ds) {
+        let r = roundDigits(&d, n)
+        if round4(valueOf(&r)) == ax { return r }
+    }
+    return d
+}
+
+fn fmt(x: float, d: &Digits, plainMax: int): str {
+    let sign = if x < 0.0f { "-" } else { "" }
+    let ds = d.ds
+    let e = d.e
+    if e < -4 || e > plainMax {
+        let m = if len(ds) > 1 { ds[0..1] + "." + ds[1..len(ds)] } else { ds }
+        let ae = if e < 0 { -e } else { e }
+        return sign + m + "e" + (if e < 0 { "-" } else { "+" }) + (if ae < 10 { "0" } else { "" }) + ae.toStr()
+    }
+    if e < 0 { return sign + "0." + strings.repeat("0", -e - 1) + ds }
+    if len(ds) <= e + 1 { return sign + ds + strings.repeat("0", e + 1 - len(ds)) }
+    return sign + ds[0..e + 1] + "." + ds[e + 1..len(ds)]
+}
+
+fn special(x: float): Option[str] {
+    if x.isNaN() { return Some("NaN") }
+    if x.isInf() { return Some(if x > 0.0f { "Infinity" } else { "-Infinity" }) }
+    if x == 0.0f { return Some(if math.bitsOf(x) < 0 { "-0" } else { "0" }) }
+    return None
+}
+
+// A double precision's text.
+pub fn fmt8(x: float): str {
+    match special(x) {
+        Some(s) { return s }
+        None {}
+    }
+    let d = digitsOf(x)
+    return fmt(x, &d, 14)
+}
+
+// A real's text.
+pub fn fmt4(x: float): str {
+    match special(x) {
+        Some(s) { return s }
+        None {}
+    }
+    let d = digits4(x)
+    return fmt(x, &d, 5)
+}
+
+// The decimal text a float becomes as a numeric: rounded to 15 significant
+// digits (6 for a real), as PostgreSQL's float8_numeric; None for NaN and
+// the infinities.
+pub fn numericText(x: float, real: bool): Option[str] {
+    if x.isNaN() || x.isInf() { return None }
+    if x == 0.0f { return Some("0") }
+    let d0 = if real { digits4(x) } else { digitsOf(x) }
+    let d = roundDigits(&d0, if real { 6 } else { 15 })
+    let sign = if x < 0.0f { "-" } else { "" }
+    let ds = d.ds
+    if d.e < 0 { return Some(sign + "0." + strings.repeat("0", -d.e - 1) + ds) }
+    if len(ds) <= d.e + 1 { return Some(sign + ds + strings.repeat("0", d.e + 1 - len(ds))) }
+    return Some(sign + ds[0..d.e + 1] + "." + ds[d.e + 1..len(ds)])
+}
+
+// A float from its text, as float8in and float4in read it: spaces around,
+// NaN, [+-]Infinity or [+-]inf in any case, or a decimal; out of range (or
+// nonzero digits that round to zero) is 22003.
+pub fn parse(s: &str, real: bool): Result[float, lexdb_base.DbErr] {
+    let tname = if real { "real" } else { "double precision" }
+    let t = strings.trim(s)
+    let l = strings.toLowerAscii(t)
+    if l == "nan" { return Ok(math.nan()) }
+    if l == "infinity" || l == "+infinity" || l == "inf" || l == "+inf" { return Ok(math.inf()) }
+    if l == "-infinity" || l == "-inf" { return Ok(-math.inf()) }
+    var ok = len(t) > 0
+    var digit = false
+    var nonzero = false
+    var seenE = false
+    for i in 0..len(t) {
+        let c = t[i]
+        if c >= '0' && c <= '9' {
+            if !seenE {
+                digit = true
+                if c != '0' { nonzero = true }
+            }
+        } else if c == 'e' || c == 'E' {
+            seenE = true
+        } else if c != '.' && c != '+' && c != '-' {
+            ok = false
+        }
+    }
+    let bad = lexdb_base.err("22P02", "invalid input syntax for type " + tname + ": \"" + s + "\"")
+    if !ok || !digit { return Err(bad) }
+    let x = match math.parse(t) {
+        Some(v) { v }
+        None { return Err(bad) }
+    }
+    let r = if real { round4(x) } else { x }
+    if r.isInf() || (r == 0.0f && nonzero) {
+        return Err(lexdb_base.err("22003", "\"" + t + "\" is out of range for type " + tname))
+    }
+    return Ok(r)
+}

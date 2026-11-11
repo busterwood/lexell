@@ -11,6 +11,7 @@
 import "strings"
 import "./lexdb_base"
 import "./lexdb_time"
+import "./lexdb_float"
 
 // Column kinds.
 pub const K_INT = 1
@@ -25,6 +26,7 @@ pub const K_TSTZ = 9
 pub const K_IVAL = 10
 pub const K_UUID = 11       // its value Val.Uuid (9.78)
 pub const K_BYTEA = 12      // its value Val.Bytes
+pub const K_FLOAT = 13      // real (OID 700, Val.Real) and double precision (701, Val.Float): 9.79
 
 // Postgres type OIDs.
 pub const OID_BOOL = 16
@@ -41,11 +43,13 @@ pub const OID_TSTZ = 1184
 pub const OID_IVAL = 1186
 pub const OID_UUID = 2950
 pub const OID_BYTEA = 17
+pub const OID_FLOAT4 = 700
+pub const OID_FLOAT8 = 701
 pub const OID_UNKNOWN = 705
 
 // The array types: element OIDs and, at the same places, their arrays'.
-const ELEM_OIDS: []int = [16, 21, 23, 25, 1043, 20, 1700, 1082, 1083, 1114, 1184, 1186, 2950, 17]
-const ARRAY_OIDS: []int = [1000, 1005, 1007, 1009, 1015, 1016, 1231, 1182, 1183, 1115, 1185, 1187, 2951, 1001]
+const ELEM_OIDS: []int = [16, 21, 23, 25, 1043, 20, 1700, 1082, 1083, 1114, 1184, 1186, 2950, 17, 700, 701]
+const ARRAY_OIDS: []int = [1000, 1005, 1007, 1009, 1015, 1016, 1231, 1182, 1183, 1115, 1185, 1187, 2951, 1001, 1021, 1022]
 
 // The array type of an element type (0: none).
 pub fn arrayOid(elem: int): int {
@@ -80,7 +84,11 @@ pub type Val = value closed {
     Ival(lexdb_time.Ival)   // an interval
     Uuid(str)               // a uuid: its 36-character lowercase form (9.78)
     Bytes(str)              // a bytea: its bytes
+    Float(float)            // a double precision (9.79)
+    Real(float)             // a real: a double holding a single-precision value
 }
+
+pub fn floatType(oid: int): TypeName { return TypeName{kind: K_FLOAT, oid: oid, prec: 0, scale: 0, len: 0} }
 
 // A bytea's text: PostgreSQL's hex form, \x0001ff.
 pub fn bytesHex(b: &str): str {
@@ -746,6 +754,24 @@ fn (p: mut &P) typeName(): Result[TypeName, lexdb_base.DbErr] {
         "varchar" { t = TypeName{kind: K_TEXT, oid: OID_VARCHAR, prec: 0, scale: 0, len: 0} }
         "date" { t = timeType(OID_DATE) }
         "uuid" { t = TypeName{kind: K_UUID, oid: OID_UUID, prec: 0, scale: 0, len: 0} }
+        "real", "float4" { t = floatType(OID_FLOAT4) }
+        "float8" { t = floatType(OID_FLOAT8) }
+        "double" {
+            try p.expectKw("precision")
+            t = floatType(OID_FLOAT8)
+        }
+        "float" {
+            // float(p): real to 24 bits, double precision to 53
+            var oid = OID_FLOAT8
+            if p.acceptKw("(") {
+                let n = try p.intLit()
+                if n < 1 { return Err(lexdb_base.err("22023", "precision for type float must be at least 1 bit")) }
+                if n > 53 { return Err(lexdb_base.err("22023", "precision for type float must be less than 54 bits")) }
+                if n <= 24 { oid = OID_FLOAT4 }
+                try p.expectKw(")")
+            }
+            return Ok(try p.arraySuffix(floatType(oid)))
+        }
         "bytea" { t = TypeName{kind: K_BYTEA, oid: OID_BYTEA, prec: 0, scale: 0, len: 0} }
         "time", "timestamp", "timestamptz", "timetz", "interval" {
             var oid = if w == "time" { OID_TIME } else if w == "interval" { OID_IVAL } else if w == "timestamptz" { OID_TSTZ } else if w == "timetz" { 0 } else { OID_TS }
@@ -2818,7 +2844,7 @@ pub fn parse(sql: &str): Result[[]Stmt, lexdb_base.DbErr] {
 pub fn typeText(t: &TypeName): str {
     if t.kind == K_ARRAY {
         let e = elemOid(t.oid)
-        let k = if e == OID_BOOL { K_BOOL } else if e == OID_NUMERIC { K_NUM } else if e == OID_INT2 || e == OID_INT4 || e == OID_INT8 { K_INT } else if timeKind(e) > 0 { timeKind(e) } else if e == OID_UUID { K_UUID } else if e == OID_BYTEA { K_BYTEA } else { K_TEXT }
+        let k = if e == OID_BOOL { K_BOOL } else if e == OID_NUMERIC { K_NUM } else if e == OID_INT2 || e == OID_INT4 || e == OID_INT8 { K_INT } else if timeKind(e) > 0 { timeKind(e) } else if e == OID_UUID { K_UUID } else if e == OID_BYTEA { K_BYTEA } else if e == OID_FLOAT4 || e == OID_FLOAT8 { K_FLOAT } else { K_TEXT }
         return typeText(&TypeName{kind: k, oid: e, prec: 0, scale: 0, len: 0}) + "[]"
     }
     if t.oid == OID_INT2 { return "smallint" }
@@ -2836,6 +2862,8 @@ pub fn typeText(t: &TypeName): str {
     let p = if t.prec == 1 { "(" + t.scale.toStr() + ")" } else { "" }
     if t.oid == OID_DATE { return "date" }
     if t.oid == OID_UUID { return "uuid" }
+    if t.oid == OID_FLOAT4 { return "real" }
+    if t.oid == OID_FLOAT8 { return "double precision" }
     if t.oid == OID_BYTEA { return "bytea" }
     if t.oid == OID_TIME { return "time" + p + " without time zone" }
     if t.oid == OID_TS { return "timestamp" + p + " without time zone" }
@@ -2866,6 +2894,8 @@ pub fn exprText(x: &Expr): str {
                 Val.Ival(iv) { return "'" + lexdb_time.fmtIval(&iv) + "'::interval" }
                 Val.Uuid(u) { return "'" + u + "'::uuid" }
                 Val.Bytes(b) { return "'" + bytesHex(&b) + "'::bytea" }
+                Val.Float(fx) { return "'" + lexdb_float.fmt8(fx) + "'::double precision" }
+                Val.Real(fx) { return "'" + lexdb_float.fmt4(fx) + "'::real" }
             }
         }
         Expr.Param(n) { return "$" + n.toStr() }
