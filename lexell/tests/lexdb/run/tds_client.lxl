@@ -1,0 +1,210 @@
+// lexdb_tds, SQL Server's protocol (design/lexdb-tds.md, stage S1), against
+// Lexell's own SQL Server client (lib/sqlserver over tds): logins with TLS
+// for the login only (Encrypt=no) and for everything; batches of
+// lexdb's dialect with their row counts and result sets; every lexdb type
+// as its TDS type; errors by SQL Server's numbers, the batch ending at the
+// first; the SET options drivers send, NOCOUNT kept; passwords checked
+// against the roles' verifiers under scram-sha-256; the database asked for.
+// needs: ssl
+// expect: plain: login only tds 0x74000004 database lexdb version 16.0.4315 collation 1033
+// expect: create, insert: 3
+// expect: update: 2
+// expect: select: id int, name nvarchar, amount decimal, at datetime2 | 1 'café' 12.50 '2026-11-11 10:00:00.000000' | 2 NULL -3.10 NULL | 3 'naïve 😀' 0.00 '2000-01-01 00:00:00.000000'
+// expect: two sets: 2 sets, counts 3
+// expect: types: smallint int bigint bit float real decimal varbinary uniqueidentifier date time datetime2 datetimeoffset nvarchar nvarchar
+// expect: values: 7 -8 9000000000 true 1.5 0.25 123456789012345678901234567890.123 x'00ff' '00000000-0000-0000-0000-000000000001' '2026-11-11' '13:14:15.500000' '2026-11-11 10:00:00.250000' '2026-11-11 10:00:00.000000 +00:00' '1 day' 'text'
+// expect: nulls: NULL NULL NULL NULL NULL NULL NULL NULL NULL NULL NULL NULL NULL NULL
+// expect: long text: nvarchar 5000
+// expect: missing table: error 208
+// expect: divide: error 8134
+// expect: duplicate: error 2627
+// expect: syntax: error 102
+// expect: first error ends the batch: 1,2,3,4
+// expect: date out of range: error 8115
+// expect: set options: ok
+// expect: nocount: -1
+// expect: count again: 1
+// expect: implicit transactions: error 50000
+// expect: tls: full
+// expect: login only: login only
+// expect: scram: app
+// expect: wrong password: error 18456
+// expect: no login: error 18456
+// expect: no such role: error 18456
+// expect: master: lexdb
+// expect: other database: error 4060
+import "task"
+import "net"
+import "strings"
+import "sqlserver"
+import "../../../lib/tests/support/tlstest"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_wire"
+import "../../../cmd/lexdb_tds"
+
+fn cs(port: &str, user: &str, pw: &str, extra: &str): str {
+    return "Server=127.0.0.1," + port + ";UID=" + user + ";PWD=" + pw + ";" + extra
+}
+
+fn connect(s: &str): sqlserver.Conn {
+    match sqlserver.connect(s.toStr()) {
+        Ok(c) { return c }
+        Err(e) {
+            println("connect: error " + e.code.toStr() + " " + e.msg)
+            exit(1)
+        }
+    }
+}
+
+fn code(r: Result[sqlserver.Conn, sqlserver.Error]): str {
+    match r {
+        Ok(c) { return "connected as " + c.database() }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+fn values(rows: &sqlserver.Rows, row: int): str {
+    var out: []str = []
+    for i in 0..rows.columnCount() {
+        match rows.value(row, i) {
+            Ok(v) { append(mut &out, v.toStr()) }
+            Err(e) { append(mut &out, "error " + e.code.toStr()) }
+        }
+    }
+    return strings.join(&out, " ")
+}
+
+fn show(r: Result[sqlserver.Rows, sqlserver.Error]): str {
+    match r {
+        Ok(rows) {
+            var cols: []str = []
+            for j in 0..rows.columnCount() {
+                append(mut &cols, rows.columnName(j).unwrap() + " " + rows.columnTypeName(j).unwrap())
+            }
+            var out = strings.join(&cols, ", ")
+            for i in 0..rows.rowCount() { out = out + " | " + values(&rows, i) }
+            return out
+        }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+fn err(r: Result[int, sqlserver.Error]): str {
+    match r {
+        Ok(n) { return n.toStr() }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+fn client(st: &lexdb_store.Store, port: &str) {
+    let plain = cs(port, &"sa", &"anything", &"Encrypt=no;TrustServerCertificate=yes")
+    var c = connect(&plain)
+    println("plain: " + c.encryption() + " tds 0x" + strings.hex(c.tdsVersion()) + " database " + c.database() +
+            " version " + c.serverVersion() + " collation " + c.collation().lcid.toStr())
+    c.exec("create table t (id int primary key, name text, amount numeric(10,2), at timestamp)").unwrap()
+    println("create, insert: " + err(c.run("insert into t values (1, 'café', 12.5, '2026-11-11 10:00'), (2, null, -3.1, null), (3, 'naïve 😀', 0, '2000-01-01')", &[])))
+    println("update: " + err(c.run("update t set amount = amount where id < 3", &[])))
+    println("select: " + show(c.query("select * from t order by id", &[])))
+    match c.queryAll("select 1; select 2 as two; update t set id = id", &[]) {
+        Ok(r) { println("two sets: " + len(r.sets).toStr() + " sets, counts " + r.counts[len(r.counts) - 1].rows.toStr()) }
+        Err(e) { println("two sets: error " + e.code.toStr()) }
+    }
+    let typed = "select 7::int2 as a, -8 as b, 9000000000 as c, true as d, 1.5::float8 as e, 0.25::real as f, " +
+                "123456789012345678901234567890.123 as g, '\\x00ff'::bytea as h, '00000000-0000-0000-0000-000000000001'::uuid as i, " +
+                "'2026-11-11'::date as j, '13:14:15.5'::time as k, '2026-11-11 10:00:00.25'::timestamp as l, " +
+                "'2026-11-11 10:00:00+00'::timestamptz as m, interval '1 day' as n, 'text' as o"
+    match c.query(typed, &[]) {
+        Ok(rows) {
+            var ts: []str = []
+            for j in 0..rows.columnCount() { append(mut &ts, rows.columnTypeName(j).unwrap()) }
+            println("types: " + strings.join(&ts, " "))
+            println("values: " + values(&rows, 0))
+        }
+        Err(e) { println("types: error " + e.code.toStr() + " " + e.msg) }
+    }
+    let nulls = "select null::int2, null::int, null::int8, null::bool, null::float8, null::real, null::numeric, null::bytea, " +
+                "null::uuid, null::date, null::time, null::timestamp, null::timestamptz, null::text"
+    match c.query(nulls, &[]) {
+        Ok(rows) { println("nulls: " + values(&rows, 0)) }
+        Err(e) { println("nulls: error " + e.code.toStr() + " " + e.msg) }
+    }
+    match c.query("select repeat('x', 5000) as s", &[]) {
+        Ok(rows) { println("long text: " + rows.columnTypeName(0).unwrap() + " " + len(rows.text(0, 0).unwrap()).toStr()) }
+        Err(e) { println("long text: error " + e.code.toStr()) }
+    }
+    println("missing table: " + show(c.query("select * from nope", &[])))
+    println("divide: " + show(c.query("select 1 / 0", &[])))
+    println("duplicate: " + err(c.run("insert into t values (1, 'again', 0, null)", &[])))
+    println("syntax: " + err(c.run("selec 1", &[])))
+    let r = c.run("insert into t values (4, 'a', 0, null); insert into t values (1, 'dup', 0, null); insert into t values (5, 'b', 0, null)", &[])
+    println("first error ends the batch: " + c.query("select string_agg(id::text, ',' order by id) from t", &[]).unwrap().text(0, 0).unwrap())
+    println("date out of range: " + show(c.query("select '0044-03-15 BC'::date", &[])))
+    match c.exec("SET QUOTED_IDENTIFIER OFF; SET TEXTSIZE 4096\nSET ANSI_NULLS, ANSI_PADDING ON SET TRANSACTION ISOLATION LEVEL READ COMMITTED") {
+        Ok(_) { println("set options: ok") }
+        Err(e) { println("set options: error " + e.code.toStr() + " " + e.msg) }
+    }
+    c.exec("set nocount on").unwrap()
+    println("nocount: " + err(c.run("update t set amount = 1 where id = 1", &[])))
+    c.exec("SET NOCOUNT OFF").unwrap()
+    println("count again: " + err(c.run("update t set amount = 1 where id = 1", &[])))
+    match c.exec("SET IMPLICIT_TRANSACTIONS ON") {
+        Ok(_) { println("implicit transactions: accepted") }
+        Err(e) { println("implicit transactions: error " + e.code.toStr()) }
+    }
+    c.exec("create role app login password 'S3cret'").unwrap()
+    c.exec("create role ro password 'S3cret'").unwrap()
+    c.exec("grant select on t to app").unwrap()
+    c.close()
+
+    // TLS: the accept loop reads the certificate when it starts (body)
+    let tlsOn = cs(port, &"sa", &"x", &"Encrypt=yes;TrustServerCertificate=yes")
+    var e = connect(&tlsOn)
+    println("tls: " + e.encryption())
+    e.close()
+    var lo = connect(&cs(port, &"sa", &"x", &"Encrypt=no;TrustServerCertificate=yes"))
+    println("login only: " + lo.encryption())
+    lo.close()
+
+    // passwords: the roles' SCRAM verifiers
+    var conf = lexdb_wire.confOf(st)
+    conf.tcp = "scram-sha-256"
+    lexdb_wire.configure(st, &conf).unwrap()
+    var a = connect(&cs(port, &"app", &"S3cret", &"Encrypt=yes;TrustServerCertificate=yes"))
+    println("scram: " + a.query("select current_user", &[]).unwrap().text(0, 0).unwrap())
+    a.close()
+    println("wrong password: " + code(sqlserver.connect(cs(port, &"app", &"nope", &"Encrypt=yes;TrustServerCertificate=yes"))))
+    println("no login: " + code(sqlserver.connect(cs(port, &"ro", &"S3cret", &"Encrypt=yes;TrustServerCertificate=yes"))))
+    println("no such role: " + code(sqlserver.connect(cs(port, &"ghost", &"S3cret", &"Encrypt=yes;TrustServerCertificate=yes"))))
+    let m = sqlserver.connect(cs(port, &"app", &"S3cret", &"Encrypt=yes;TrustServerCertificate=yes;Database=master"))
+    match m {
+        Ok(x) { println("master: " + x.database()) }
+        Err(x) { println("master: error " + x.code.toStr()) }
+    }
+    println("other database: " + code(sqlserver.connect(cs(port, &"app", &"S3cret", &"Encrypt=yes;TrustServerCertificate=yes;Database=sales"))))
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        // the accept loop reads the TLS files when it starts: configured first;
+        // a client that asks for no encryption still gets none (Encrypt=no
+        // with a certificate is TLS for the login only)
+        var conf = lexdb_wire.noAuth()
+        conf.cert = tlstest.path("srv.pem")
+        conf.key = tlstest.path("srv.key")
+        lexdb_wire.configure(&st, &conf).unwrap()
+        let f = s.start(lexdb_tds.acceptLoop, lexdb_tds.AcceptArg{ln: ln, st: st})
+        client(&st, &addr[10..len(addr)])
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    tlstest.pki()
+    lexdb_store.run(lexdb_disk.sim(5), lexdb_store.Options{cacheBytes: 128 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000, bufferedPages: false}, body).unwrap()
+}
