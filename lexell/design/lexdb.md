@@ -7034,3 +7034,97 @@ table (`exprBounds`: `=`, `<`, `<=`, `>`, `>=`, on either side).
 
 Alembic's probe now runs past the expression index, to CREATE TYPE ... AS
 ENUM (not yet).
+
+### 9.90 Enum types
+
+The last thing Alembic's probe (9.85) stopped at, apart from JSON: SQLAlchemy
+writes `CREATE TYPE event_kind AS ENUM ('a', 'b')` for an `Enum` column.
+
+**The type.**
+- `CREATE TYPE name AS ENUM ('label', ...)` writes a catalog row keyed by
+  the type's OID (`"\x02enum\x00" + oid`), holding its name and labels
+  in order.
+- The OID comes from the name (`lexdb_sql.nameOid("T", key)`, moved from
+  lexdb_exec's `catOid` so that the parser can use it).
+- The errors:
+  - a type already there: 42710;
+  - a label used twice: 23505 (PostgreSQL's comes from pg_enum's unique
+    index);
+  - an empty label, or one longer than 63 bytes: 22P02.
+- An unqualified name is the type's key as given (public's). The search
+  path does not choose a schema for it, because the parser makes the OID.
+- Other forms of CREATE TYPE (composite, range, base) are 0A000.
+
+**A column of the type.**
+- The parser does not know the user's types, so a type name it does not
+  know is now `K_ENUM` with the OID of that name (it was 42704 at once).
+  The name is noted in the statement's `seqNames` after
+  `lexdb_sql.TYPE_MARK`, as catalog functions mark themselves.
+- `bindSeqs` then finds the type when the statement runs, or gives 42704
+  "type ... does not exist".
+- A value is a text, a label: `coerce` and the row layout treat the kind
+  as text.
+- As a row is written (`storeRow`, `updRow`: INSERT, UPDATE, COPY, upsert,
+  CREATE TABLE AS), `checkEnums` reads the type's labels and refuses a
+  value not among them: 22P02 `invalid input value for enum mood:
+  "angry"`. That is one catalog read per enum column per row.
+
+**Order.** An enum orders as its labels are listed, not as texts.
+- When a query is planned, a comparison (`<`, `<=`, `>`, `>=`, and so
+  BETWEEN) with an enum value on either side becomes a comparison of the
+  labels' places: `#enumpos(x, "mood\x1fsad\x1fok\x1fhappy")`. This is
+  done to WHERE and ON in `buildQuery`, before the paths are chosen.
+- An ORDER BY item of an enum type becomes its place too, in
+  `planSelect`.
+- `#enumpos` of a text not a label is 22P02, as PostgreSQL's cast of the
+  literal is.
+- So an index on an enum column, which is in the labels' text order,
+  serves equality and IN only. A range uses the places, read from the
+  rows.
+- GROUP BY needs only equality. MIN and MAX of an enum still compare
+  texts (not done).
+
+**ALTER TYPE name ADD VALUE [IF NOT EXISTS] 'v' [BEFORE | AFTER 'w'].**
+- The label is put in its place. The rows hold labels, so nothing is
+  rewritten and the order of those there follows at once.
+- The errors: a label there is 42710, or nothing with IF NOT EXISTS; a
+  neighbour not there is 22023; a type not there is 42704.
+- RENAME VALUE, RENAME TO and the rest are 0A000. A rename would have to
+  rewrite the rows, and RENAME TO would change the OID, which the
+  columns hold.
+
+**DROP TYPE [IF EXISTS] name, ...:**
+- refused (2BP01) while a table has a column of the type;
+- CASCADE, which would drop the columns, is 0A000.
+
+**The catalog.**
+- `pg_type` has a row per enum: typtype `e`, category `E`, `enum_in` and
+  `enum_out`.
+- `pg_enum` is new. Its sort orders are the places 1 to n, where
+  PostgreSQL gives a value added BEFORE a fraction; the order is the
+  same.
+- `format_type` is a catalog function now, so the statement's catalog
+  lines carry the enums' names (kind `e`) and psql's `\d` shows the
+  column's type by name.
+- `information_schema.columns` gives `USER-DEFINED` and the type's
+  schema and name as its udt.
+- psql's `\dT` lists them.
+
+**Checked:**
+- Alembic's four revisions, with the enum (and the expression index of
+  9.89), run up, down and up again once the JSON column is taken out.
+  JSON is not built (the user's decision).
+- `exec_enum`: 42 statements generated from PostgreSQL 18 by `gen_pg.py
+  enum`, all the same. They cover:
+  - a column with a default; a label refused;
+  - `=`, `<>`, `>`, IN, BETWEEN, ORDER BY and GROUP BY in the labels'
+    order, and with an index;
+  - ADD VALUE BEFORE, after, twice and IF NOT EXISTS; a neighbour not
+    there;
+  - pg_enum, pg_type, format_type, information_schema;
+  - a cast, CREATE TABLE AS, the refusals, DROP TYPE of two.
+
+**Not done:** arrays of an enum (0A000); RENAME VALUE and RENAME TO; DROP
+TYPE ... CASCADE; MIN and MAX in the labels' order; privileges on types
+(USAGE); a cast of a text that is not a label is checked only when it is
+written or compared.

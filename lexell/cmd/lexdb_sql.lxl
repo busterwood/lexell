@@ -29,6 +29,20 @@ pub const K_UUID = 11       // its value Val.Uuid (9.78)
 pub const K_BYTEA = 12      // its value Val.Bytes
 pub const K_FLOAT = 13      // real (OID 700, Val.Real) and double precision (701, Val.Float): 9.79
 pub const K_REG = 14        // regclass, regtype, regnamespace, regproc: Val.Reg, an OID and its name (9.80)
+pub const K_ENUM = 15       // a CREATE TYPE ... AS ENUM's (9.90): its OID the type's; its values texts, its labels
+
+// The marker in Stmt.seqNames of a type of the user's a statement names
+// (9.90), then its name: found (or 42704) when the statement runs.
+pub const TYPE_MARK: str = "\x00type\x00"
+
+// An object's OID from its kind and catalog key (lexdb has no OID counter:
+// a name's is the same each time). lexdb_exec's catOid.
+pub fn nameOid(kind: &str, key: &str): int {
+    var h = 2166136261
+    let s = kind + "\x00" + key
+    for i in 0..len(s) { h = ((h ^ int(s[i])) * 16777619) & 0xFFFFFFFF }
+    return 16384 + h % 2000000000
+}
 
 // Postgres type OIDs.
 pub const OID_BOOL = 16
@@ -113,7 +127,8 @@ const CAT_FNS: []str = ["pg_get_userbyid", "pg_table_is_visible", "pg_type_is_vi
                         "col_description", "pg_relation_is_publishable", "pg_partition_ancestors", "current_user",
                         "session_user", "current_schema", "has_table_privilege", "has_schema_privilege", "has_database_privilege",
                         "has_sequence_privilege", "has_any_column_privilege",
-                        "pg_get_viewdef", "pg_relation_size", "pg_total_relation_size", "pg_table_size", "pg_indexes_size"]
+                        "pg_get_viewdef", "pg_relation_size", "pg_total_relation_size", "pg_table_size", "pg_indexes_size",
+                        "format_type"]
 
 pub fn isCatFn(n: &str): bool {
     for f in CAT_FNS { if f == n { return true } }
@@ -318,6 +333,9 @@ pub const S_GRANT = 50          // GRANT (9.83): privileges in names, the object
                                 // the grantees in pk; a role's: index "role", the roles granted in cols
 pub const S_REVOKE = 51         // REVOKE: the same
 pub const S_OWNER = 52          // ALTER TABLE | VIEW | SEQUENCE | SCHEMA name OWNER TO role: the kind in index, the role in names
+pub const S_CREATE_TYPE = 53    // CREATE TYPE name AS ENUM (labels): the labels in names (9.90)
+pub const S_DROP_TYPE = 54      // DROP TYPE [IF EXISTS] name, ...: the others in names
+pub const S_ALTER_TYPE = 55     // ALTER TYPE name ADD VALUE [IF NOT EXISTS] 'v' [BEFORE | AFTER 'w']: v in names, w in index, "before" or "after" in alias
 
 // COPY's options (Stmt.copy).
 pub type CopyOpts = record {
@@ -876,7 +894,17 @@ fn (p: mut &P) typeName(): Result[TypeName, lexdb_base.DbErr] {
                 return Err(lexdb_base.err("0A000", "type character is not supported (use varchar or text)"))
             }
         }
-        else { return Err(lexdb_base.err("42704", "type \"" + w + "\" does not exist")) }
+        else {
+            // a type of the user's (9.90): an enum, found when the statement runs
+            var key = w
+            if p.isKw(".") && (p.peekAt(1).kind == T_IDENT || p.peekAt(1).kind == T_QIDENT) {
+                p.pos += 1
+                key = qual(&w, &(try p.name()))
+            }
+            if p.isKw("[") { return Err(lexdb_base.err("0A000", "lexdb: arrays of enum types are not supported")) }
+            append(mut &p.seqs, TYPE_MARK + key)
+            return Ok(TypeName{kind: K_ENUM, oid: nameOid(&"T", &key), prec: 0, scale: 0, len: 0})
+        }
     }
     if p.acceptKw("(") {
         let a = try p.intLit()
@@ -3271,6 +3299,30 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
                 return Ok(v)
             }
             if p.acceptKw("table") { return p.alterTable() }
+            if p.acceptKw("type") {
+                // ALTER TYPE name ADD VALUE [IF NOT EXISTS] 'v' [BEFORE | AFTER 'w'] (9.90)
+                var ty = newStmt(S_ALTER_TYPE)
+                ty.table = try p.qname()
+                if !p.acceptKw("add") {
+                    return Err(lexdb_base.err("0A000", "lexdb: ALTER TYPE supports ADD VALUE only"))
+                }
+                try p.expectKw("value")
+                if p.acceptKw("if") {
+                    try p.expectKw("not")
+                    try p.expectKw("exists")
+                    ty.ifFlag = true
+                }
+                let v = p.next()
+                if v.kind != T_STR { return Err(near(&v)) }
+                append(mut &ty.names, v.text)
+                if p.isKw("before") || p.isKw("after") {
+                    ty.alias = p.next().text
+                    let w = p.next()
+                    if w.kind != T_STR { return Err(near(&w)) }
+                    ty.index = w.text
+                }
+                return Ok(ty)
+            }
             if p.acceptKw("role") || p.acceptKw("user") {
                 var r = newStmt(S_ALTER_ROLE)
                 r.table = try p.name()
@@ -3321,6 +3373,24 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
             }
             if p.acceptKw("view") { return p.createView(orReplace) }
             if p.acceptKw("table") { return p.createTable() }
+            if p.acceptKw("type") {
+                // CREATE TYPE name AS ENUM ('a', ...) (9.90)
+                var ty = newStmt(S_CREATE_TYPE)
+                ty.table = try p.qname()
+                try p.expectKw("as")
+                if !p.acceptKw("enum") { return Err(lexdb_base.err("0A000", "lexdb: CREATE TYPE supports AS ENUM only")) }
+                try p.expectKw("(")
+                if !p.acceptKw(")") {
+                    while true {
+                        let v = p.next()
+                        if v.kind != T_STR { return Err(near(&v)) }
+                        append(mut &ty.names, v.text)
+                        if !p.acceptKw(",") { break }
+                    }
+                    try p.expectKw(")")
+                }
+                return Ok(ty)
+            }
             if p.isKw("role") || p.isKw("user") {
                 let user = p.next().text == "user"
                 var r = newStmt(S_CREATE_ROLE)
@@ -3405,6 +3475,17 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
                     s.ifFlag = true
                 }
                 s.index = try p.qname()
+                return Ok(s)
+            }
+            if p.acceptKw("type") {
+                var s = newStmt(S_DROP_TYPE)
+                if p.acceptKw("if") {
+                    try p.expectKw("exists")
+                    s.ifFlag = true
+                }
+                s.table = try p.qname()
+                while p.acceptKw(",") { append(mut &s.names, try p.qname()) }
+                if p.acceptKw("cascade") { s.cascade = true } else { let r = p.acceptKw("restrict") }
                 return Ok(s)
             }
             if p.acceptKw("sequence") {

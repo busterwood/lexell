@@ -4256,7 +4256,7 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
         match from[k].on {
             Some(on) {
                 // ON sees this table and those before it
-                let r = try resolve(&on, &q.cols, q.levels[k].first + len(q.levels[k].t.cols), sc)
+                let r = try enumOrder(st, txn, &(try resolve(&on, &q.cols, q.levels[k].first + len(q.levels[k].t.cols), sc)), &q.cols)
                 conjuncts(&r, mut &ms[k])
             }
             None {}
@@ -4264,7 +4264,7 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
     }
     match where {
         Some(w) {
-            let r = try resolve(&w, &q.cols, len(q.cols), sc)
+            let r = try enumOrder(st, txn, &(try resolve(&w, &q.cols, len(q.cols), sc)), &q.cols)
             var cs: []Expr = []
             conjuncts(&r, mut &cs)
             for i in 0..len(cs) {
@@ -5741,6 +5741,191 @@ fn createTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
     return Ok(tagOnly("CREATE TABLE"))
 }
 
+// ---- enum types (9.90)
+//
+// CREATE TYPE name AS ENUM (labels): a catalog row by the type's OID (from
+// its name, as every OID: lexdb_sql.nameOid "T"), its name and its labels
+// in order. A column of the type has kind K_ENUM and the type's OID; its
+// values are texts, each a label: checked as rows are written. They order
+// as their labels do: comparisons (< and the like) and ORDER BY of an enum
+// are made comparisons and orders of the labels' places (#enumpos), when
+// the query is planned, so an index on the column (in the labels' text
+// order) serves equality only.
+
+fn enumKey(oid: int): str { return "\x02enum\x00" + oid.toStr() }
+
+type EnumType = record { key: str; oid: int; labels: []str }
+
+fn encEnum(en: &EnumType): str {
+    var all: []str = [en.key]
+    for l in en.labels { append(mut &all, l) }
+    var b = newStrBuf()
+    addStrs(mut &b, &all)
+    return b.toStr()
+}
+
+fn decEnum(oid: int, v: &str): EnumType {
+    let all = strsAt(v, 0)
+    var labels: []str = []
+    for i in 1..len(all) { append(mut &labels, all[i]) }
+    return EnumType{key: all[0], oid: oid, labels: labels}
+}
+
+fn readEnum(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, oid: int): Result[Option[EnumType], DbErr] {
+    match try st.get(txn, CATALOG, enumKey(oid)) {
+        Some(v) { return Ok(Some(decEnum(oid, &v))) }
+        None { return Ok(None) }
+    }
+}
+
+fn allEnums(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[[]EnumType, DbErr] {
+    var keys: []str = []
+    var vals: []str = []
+    try st.scan(txn, CATALOG, "\x02enum\x00", "\x02enum\x01", fn(en: &lexdb_store.Entry): bool {
+        append(mut &keys, en.key)
+        append(mut &vals, en.val)
+        return true
+    })
+    var out: []EnumType = []
+    for i in 0..len(keys) { append(mut &out, decEnum(num(&keys[i][6..len(keys[i])]), &vals[i])) }
+    return Ok(out)
+}
+
+fn createType(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
+    let key = s.table
+    if lexdb_sql.isQual(&key) {
+        let sn = lexdb_sql.schemaOf(&key)
+        if !(try schemaExists(st, txn, &sn)) { return Err(e("3F000", "schema \"" + sn + "\" does not exist")) }
+    }
+    let oid = lexdb_sql.nameOid(&"T", &key)
+    if (try readEnum(st, txn, oid)).isSome() { return Err(e("42710", "type \"" + lexdb_sql.baseName(&key) + "\" already exists")) }
+    for i in 0..len(s.names) {
+        if len(s.names[i]) == 0 || len(s.names[i]) > 63 {
+            return Err(e("22P02", "invalid enum label \"" + s.names[i] + "\""))
+        }
+        // (PostgreSQL's: its pg_enum's unique index)
+        for j in 0..i { if s.names[j] == s.names[i] { return Err(e("23505", "duplicate key value violates unique constraint \"pg_enum_typid_label_index\"")) } }
+    }
+    try txn.put(CATALOG, enumKey(oid), encEnum(&EnumType{key: key, oid: oid, labels: copyStrs(&s.names)}))
+    try bumpCatalog(st, txn)
+    return Ok(tagOnly("CREATE TYPE"))
+}
+
+fn dropType(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
+    var names: []str = [s.table]
+    for n in s.names { append(mut &names, n) }
+    for n in names {
+        let oid = lexdb_sql.nameOid(&"T", &n)
+        if (try readEnum(st, txn, oid)).isNone() {
+            if s.ifFlag { continue }
+            return Err(e("42704", "type \"" + lexdb_sql.baseName(&n) + "\" does not exist"))
+        }
+        // a column of the type: refused (CASCADE would drop the columns)
+        for t in try allTables(st, txn) {
+            for c in t.cols {
+                if c.typ.kind == lexdb_sql.K_ENUM && c.typ.oid == oid {
+                    if s.cascade { return Err(e("0A000", "lexdb: DROP TYPE ... CASCADE is not supported (drop or change the columns first)")) }
+                    return Err(e("2BP01", "cannot drop type " + lexdb_sql.shown(&n) + " because other objects depend on it"))
+                }
+            }
+        }
+        txn.del(CATALOG, enumKey(oid))
+    }
+    try bumpCatalog(st, txn)
+    return Ok(tagOnly("DROP TYPE"))
+}
+
+fn alterType(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
+    let oid = lexdb_sql.nameOid(&"T", &s.table)
+    var en = match try readEnum(st, txn, oid) {
+        Some(x) { x }
+        None { return Err(e("42704", "type \"" + lexdb_sql.baseName(&s.table) + "\" does not exist")) }
+    }
+    let v = s.names[0]
+    for l in en.labels {
+        if l == v {
+            if s.ifFlag { return Ok(tagOnly("ALTER TYPE")) }
+            return Err(e("42710", "enum label \"" + v + "\" already exists"))
+        }
+    }
+    if len(v) == 0 || len(v) > 63 { return Err(e("22P02", "invalid enum label \"" + v + "\"")) }
+    var at = len(en.labels)
+    if len(s.alias) > 0 {
+        var w = -1
+        for i in 0..len(en.labels) { if en.labels[i] == s.index { w = i } }
+        if w < 0 { return Err(e("22023", "\"" + s.index + "\" is not an existing enum label")) }
+        at = if s.alias == "before" { w } else { w + 1 }
+    }
+    var labels: []str = []
+    for i in 0..len(en.labels) {
+        if i == at { append(mut &labels, v) }
+        append(mut &labels, en.labels[i])
+    }
+    if at == len(en.labels) { append(mut &labels, v) }
+    en.labels = labels
+    try txn.put(CATALOG, enumKey(oid), encEnum(&en))
+    try bumpCatalog(st, txn)
+    return Ok(tagOnly("ALTER TYPE"))
+}
+
+// A row's enum values each one of its type's labels.
+fn checkEnums(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, row: &[]Val): Result[Unit, DbErr] {
+    for i in 0..len(t.cols) {
+        if t.cols[i].typ.kind != lexdb_sql.K_ENUM || isNull(&row[i]) { continue }
+        match try readEnum(st, txn, t.cols[i].typ.oid) {
+            Some(en) {
+                let v = text(&row[i])
+                var found = false
+                for l in en.labels { if l == v { found = true } }
+                if !found { return Err(e("22P02", "invalid input value for enum " + lexdb_sql.baseName(&en.key) + ": \"" + v + "\"")) }
+            }
+            None { return Err(e("42704", "type of column \"" + t.cols[i].name + "\" does not exist")) }
+        }
+    }
+    return Ok(Unit{})
+}
+
+// The enum type x is of (by its OID), its name and labels joined by \x1f.
+fn enumOf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, x: &Expr, cols: &[]lexdb_sql.ColDef): Result[Option[str], DbErr] {
+    let none: []int = []
+    let o = exprOid(x, cols, &none)
+    if o < 16384 || lexdb_pgcat.typeOf(o).isSome() { return Ok(None) }
+    match try readEnum(st, txn, o) {
+        Some(en) {
+            var all: []str = [lexdb_sql.baseName(&en.key)]
+            for l in en.labels { append(mut &all, l) }
+            return Ok(Some(strings.join(&all, "\x1f")))
+        }
+        None { return Ok(None) }
+    }
+}
+
+fn enumPos(x: &Expr, enc: &str): Expr { return Expr.Call("#enumpos", [clone(x), Expr.Lit(Val.Text(enc.toStr()))], false) }
+
+// x with its comparisons of enum values made comparisons of their labels'
+// places (9.90).
+fn enumOrder(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, x: &Expr, cols: &[]lexdb_sql.ColDef): Result[Expr, DbErr] {
+    match x {
+        Expr.Bin(op, a, b) {
+            if op == "and" || op == "or" {
+                return Ok(Expr.Bin(op, try enumOrder(st, txn, &a, cols), try enumOrder(st, txn, &b, cols)))
+            }
+            if op == "<" || op == "<=" || op == ">" || op == ">=" {
+                var enc = try enumOf(st, txn, &a, cols)
+                if enc.isNone() { enc = try enumOf(st, txn, &b, cols) }
+                match enc {
+                    Some(en) { return Ok(Expr.Bin(op, enumPos(&a, &en), enumPos(&b, &en))) }
+                    None {}
+                }
+            }
+            return Ok(clone(x))
+        }
+        Expr.Unary(op, a) { if op == "not" { return Ok(Expr.Unary(op, try enumOrder(st, txn, &a, cols))) } }
+        else {}
+    }
+    return Ok(clone(x))
+}
+
 // ---- tables without a primary key (9.88)
 //
 // Their rows are keyed by a hidden bigint column, ROWID, the last of those
@@ -7129,6 +7314,7 @@ fn upsertOld(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, defs:
 // A built row stored: its key free, its indexes and foreign keys checked.
 fn storeRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, row: []Val, fw: &[]Table,
             later: mut &[]FkLater): Result[[]Val, DbErr] {
+    try checkEnums(st, txn, t, &row)
     let key = keyOf(t, &row)
     if (try st.get(txn, t.tree, key)).isSome() { return Err(dupKey(t, &row)) }
     let enc = encRowOf(t, &row)
@@ -8334,7 +8520,14 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         append(mut &groupBy, r)
     }
     var order: []Expr = []
-    for o in s.order { append(mut &order, try resolveOrder(&o.expr, &q.cols, &outs, sc)) }
+    for o in s.order {
+        // an enum's order is its labels' (9.90)
+        let r = try resolveOrder(&o.expr, &q.cols, &outs, sc)
+        match try enumOf(st, txn, &r, &q.cols) {
+            Some(en) { append(mut &order, enumPos(&r, &en)) }
+            None { append(mut &order, r) }
+        }
+    }
     var having: Option[Expr] = None
     match s.having {
         Some(h) { having = Some(try resolve(&h, &q.cols, len(q.cols), sc)) }
@@ -9402,7 +9595,8 @@ fn isWrite(kind: int): bool {
            kind == lexdb_sql.S_CREATE_SEQ || kind == lexdb_sql.S_ALTER_SEQ || kind == lexdb_sql.S_DROP_SEQ ||
            kind == lexdb_sql.S_CREATE_ROLE || kind == lexdb_sql.S_ALTER_ROLE || kind == lexdb_sql.S_DROP_ROLE ||
            kind == lexdb_sql.S_CREATE_VIEW || kind == lexdb_sql.S_DROP_VIEW || kind == lexdb_sql.S_ALTER_VIEW ||
-           kind == lexdb_sql.S_GRANT || kind == lexdb_sql.S_REVOKE || kind == lexdb_sql.S_OWNER
+           kind == lexdb_sql.S_GRANT || kind == lexdb_sql.S_REVOKE || kind == lexdb_sql.S_OWNER ||
+           kind == lexdb_sql.S_CREATE_TYPE || kind == lexdb_sql.S_DROP_TYPE || kind == lexdb_sql.S_ALTER_TYPE
 }
 
 fn stmtName(kind: int): str {
@@ -9420,6 +9614,9 @@ fn stmtName(kind: int): str {
         lexdb_sql.S_GRANT { "GRANT" }
         lexdb_sql.S_REVOKE { "REVOKE" }
         lexdb_sql.S_OWNER { "ALTER" }
+        lexdb_sql.S_CREATE_TYPE { "CREATE TYPE" }
+        lexdb_sql.S_DROP_TYPE { "DROP TYPE" }
+        lexdb_sql.S_ALTER_TYPE { "ALTER TYPE" }
         lexdb_sql.S_DROP_VIEW { "DROP VIEW" }
         lexdb_sql.S_ALTER_VIEW { "ALTER VIEW" }
         lexdb_sql.S_ALTER_ROLE { "ALTER ROLE" }
@@ -9492,6 +9689,9 @@ fn execStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
         lexdb_sql.S_CREATE_VIEW { return createView(st, txn, s) }
         lexdb_sql.S_GRANT, lexdb_sql.S_REVOKE { return grantStmt(st, txn, s) }
         lexdb_sql.S_OWNER { return ownerStmt(st, txn, s) }
+        lexdb_sql.S_CREATE_TYPE { return createType(st, txn, s) }
+        lexdb_sql.S_DROP_TYPE { return dropType(st, txn, s) }
+        lexdb_sql.S_ALTER_TYPE { return alterType(st, txn, s) }
         lexdb_sql.S_DROP_VIEW { return dropView(st, txn, s) }
         lexdb_sql.S_ALTER_VIEW { return alterView(st, txn, s) }
         lexdb_sql.S_DROP_SCHEMA { return dropSchema(st, txn, s) }
@@ -10080,6 +10280,7 @@ fn updRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, old: &[]
           later: mut &[]FkLater): Result[Unit, DbErr] {
     try checkRow(t, row)
     try checkChecks(t, row)
+    try checkEnums(st, txn, t, row)
     let oldKey = keyOf(t, old)
     let key = keyOf(t, row)
     if key != oldKey {
@@ -10968,6 +11169,14 @@ fn bindSeqs(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, names: &[]str): R
     for n in names {
         if n == lexdb_sql.CAT_MARK {
             try bindCatalog(st, txn)
+            continue
+        }
+        if strings.startsWith(&n, lexdb_sql.TYPE_MARK) {
+            // a type of the user's the statement names (9.90)
+            let key = n[len(lexdb_sql.TYPE_MARK)..len(n)]
+            if (try readEnum(st, txn, lexdb_sql.nameOid(&"T", &key))).isNone() {
+                return Err(e("42704", "type \"" + lexdb_sql.baseName(&key) + "\" does not exist"))
+            }
             continue
         }
         let d = try needSeq(st, txn, &nameOfText(&n))
@@ -14224,12 +14433,7 @@ fn cloneOptE(x: &Option[Expr]): Option[Expr] {
     }
 }
 
-fn catOid(kind: &str, key: &str): int {
-    var h = 2166136261
-    let s = kind + "\x00" + key
-    for i in 0..len(s) { h = ((h ^ int(s[i])) * 16777619) & 0xFFFFFFFF }
-    return 16384 + h % 2000000000
-}
+fn catOid(kind: &str, key: &str): int { return lexdb_sql.nameOid(kind, key) }
 
 fn nspOid(n: &str): int {
     if n == "public" { return OID_PUBLIC }
@@ -14315,6 +14519,7 @@ type CatSnap = record {
     schemas: []str          // public and those made
     path: []str
     user: str
+    enums: []EnumType       // enum types (9.90)
 }
 
 fn userKey(sess: int): str { return "\x00user\x00" + sess.toStr() }
@@ -14520,7 +14725,7 @@ fn catSnap(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[CatSnap, D
     var seqs: []Seq = []
     for d in try allSeqs(st, txn, &"") { if !hiddenName(&d.key) { append(mut &seqs, seqCopy(&d)) } }
     var snap = CatSnap{acls: newMap(), tabs: [], views: [], cons: [], seqs: seqs, schemas: schemas, path: copyStrs(&txn.path),
-                       user: st.memoGet(&userKey(txn.sess)).unwrapOr("lexdb")}
+                       user: st.memoGet(&userKey(txn.sess)).unwrapOr("lexdb"), enums: try allEnums(st, txn)}
     var aclKeys: []str = []
     var aclVals: []str = []
     try st.scan(txn, CATALOG, ACL_PRE, ACL_PRE + "\xff", fn(en: &lexdb_store.Entry): bool {
@@ -14692,6 +14897,11 @@ fn bindCatalog(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[Unit, 
     for v in snap.views {
         b.add("r\t" + v.oid.toStr() + "\t" + v.shown + "\t" + v.schema + "\t" + v.name + "\n")
         b.add("w\t" + v.oid.toStr() + "\t" + clean(&v.t.view) + "\n")
+    }
+    for en in snap.enums {
+        let sc = lexdb_sql.schemaOf(&en.key)
+        let nm = lexdb_sql.baseName(&en.key)
+        b.add("e\t" + en.oid.toStr() + "\t" + shownIn(&snap.path, &sc, &nm) + "\n")
     }
     for d in snap.seqs {
         let sc = lexdb_sql.schemaOf(&d.key)
@@ -14973,6 +15183,16 @@ fn callMisc(name: &str, vs: &[]Val): Result[Option[Val], DbErr] {
             Err(err) { return Err(e("2201B", "invalid regular expression: " + err.toStr())) }
         }
     }
+    if name == "#enumpos" && n == 2 {
+        // an enum value's place among its type's labels (9.90): vs[1] is
+        // the type's name and labels, joined by \x1f
+        if isNull(&vs[0]) { return Ok(Some(Val.Null)) }
+        let v = text(&vs[0])
+        let enc = text(&vs[1])
+        let parts = strings.split(&enc, "\x1f")
+        for i in 1..len(parts) { if parts[i] == v { return Ok(Some(Val.Int(i))) } }
+        return Err(e("22P02", "invalid input value for enum " + parts[0] + ": \"" + v + "\""))
+    }
     if name == "#elem" && n == 2 {
         if isNull(&vs[0]) || isNull(&vs[1]) { return Ok(Some(Val.Null)) }
         let i = oidArg(&vs[1]).unwrapOr(0)
@@ -15108,6 +15328,14 @@ fn callCat(name: &str, vs: &[]Val, se: &SeqEnv): Result[Option[Val], DbErr] {
         return Ok(Some(try hasPrivFn(se, name, vs)))
     }
     if name == "pg_relation_is_publishable" { return Ok(Some(Val.Bool(false))) }
+    if name == "format_type" && n == 2 {
+        // an enum type's name (9.90); the built-in types' as before
+        if isNull(&vs[0]) { return Ok(Some(Val.Null)) }
+        let fo = oidArg(&vs[0]).unwrapOr(0)
+        for l in catLines(se, &"e") { if l[0] == fo.toStr() { return Ok(Some(Val.Text(l[1]))) } }
+        let m = if isNull(&vs[1]) { -1 } else { oidArg(&vs[1]).unwrapOr(-1) }
+        return Ok(Some(Val.Text(lexdb_pgcat.formatType(fo, m))))
+    }
     if (name == "pg_relation_size" || name == "pg_total_relation_size" || name == "pg_table_size" || name == "pg_indexes_size") {
         return Ok(Some(Val.Int(0)))
     }
@@ -15354,6 +15582,14 @@ fn catRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &str): Result
                                    tv(&t.align), tv(&if t.byval { "p" } else { "x" }), bv(false), iv(0), iv(-1), iv(0), iv(t.coll),
                                    Val.Null, Val.Null, Val.Null])
             }
+            // enum types (9.90)
+            for en in snap.enums {
+                let nm = lexdb_sql.baseName(&en.key)
+                append(mut &rows, [iv(en.oid), tv(&nm), iv(nspOid(&lexdb_sql.schemaOf(&en.key))), iv(OID_OWNER), iv(4), bv(true), tv(&"e"), tv(&"E"),
+                                   bv(false), bv(true), tv(&","), iv(0), tv(&"-"), iv(0), iv(0), tv(&"enum_in"), tv(&"enum_out"),
+                                   tv(&"enum_recv"), tv(&"enum_send"), tv(&"-"), tv(&"-"), tv(&"-"), tv(&"i"), tv(&"p"), bv(false), iv(0),
+                                   iv(-1), iv(0), iv(0), Val.Null, Val.Null, Val.Null])
+            }
         }
         "pg_index" {
             for ct in snap.tabs {
@@ -15376,6 +15612,13 @@ fn catRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &str): Result
                                    bv(true), iv(0), bv(false), if c.typ == "c" && len(c.cols) == 0 { Val.Null } else { intsArr(&c.cols) },
                                    if isF { intsArr(&c.refCols) } else { Val.Null }, Val.Null, Val.Null, Val.Null, Val.Null, Val.Null,
                                    if c.typ == "c" { tv(&c.check) } else { Val.Null }, bv(false)])
+            }
+        }
+        "pg_enum" {
+            for en in snap.enums {
+                for i in 0..len(en.labels) {
+                    append(mut &rows, [iv(catOid(&"E", &(en.key + "\x00" + en.labels[i]))), iv(en.oid), Val.Real(float(i + 1)), tv(&en.labels[i])])
+                }
             }
         }
         "pg_sequence" {
@@ -15523,9 +15766,20 @@ fn catRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &str): Result
                     let dtp = if o == lexdb_sql.OID_DATE { iv(0) } else if isTimeKind(c.typ.kind) { iv(if c.typ.prec > 0 { c.typ.scale } else { 6 }) } else { Val.Null }
                     let maxLen = if o == lexdb_sql.OID_VARCHAR && c.typ.len > 0 { iv(c.typ.len) } else { Val.Null }
                     let octLen = if o == lexdb_sql.OID_VARCHAR && c.typ.len > 0 { iv(c.typ.len * 4) } else if isChar { iv(1073741824) } else { Val.Null }
-                    let udt = match lexdb_pgcat.typeOf(o) {
+                    var udt = match lexdb_pgcat.typeOf(o) {
                         Some(t) { t.name }
                         None { "text" }
+                    }
+                    var udtSchema = "pg_catalog"
+                    var dataType = infoType(&c.typ)
+                    if c.typ.kind == lexdb_sql.K_ENUM {
+                        for en in snap.enums {
+                            if en.oid == o {
+                                udt = lexdb_sql.baseName(&en.key)
+                                udtSchema = lexdb_sql.schemaOf(&en.key)
+                            }
+                        }
+                        dataType = "USER-DEFINED"
                     }
                     let ident = identOf(c)
                     let isId = len(ident) > 0
@@ -15536,9 +15790,9 @@ fn catRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &str): Result
                         None { Val.Null }
                     }
                     append(mut &rows, [tv(&db), tv(&ct.schema), tv(&ct.name), tv(&c.name), iv(i + 1), dflt, tv(&if nn { "NO" } else { "YES" }),
-                                       tv(&infoType(&c.typ)), maxLen, octLen, prec, radix, scale, dtp, Val.Null, Val.Null,
+                                       tv(&dataType), maxLen, octLen, prec, radix, scale, dtp, Val.Null, Val.Null,
                                        Val.Null, Val.Null, Val.Null, Val.Null, Val.Null, Val.Null, Val.Null, Val.Null, Val.Null,
-                                       tv(&db), tv(&"pg_catalog"), tv(&udt), Val.Null, Val.Null, Val.Null, Val.Null, tv(&(i + 1).toStr()),
+                                       tv(&db), tv(&udtSchema), tv(&udt), Val.Null, Val.Null, Val.Null, Val.Null, tv(&(i + 1).toStr()),
                                        tv(&"NO"), tv(&if isId { "YES" } else { "NO" }),
                                        if isId { tv(&if ident == "a" { "ALWAYS" } else { "BY DEFAULT" }) } else { Val.Null },
                                        if isId { tv(&sq.start.toStr()) } else { Val.Null }, if isId { tv(&sq.inc.toStr()) } else { Val.Null },
