@@ -4340,14 +4340,39 @@ fn mentions(x: &Expr, col: &str): bool {
 // Whether a query's conjunct c implies a predicate's conjunct p: the same
 // text; a comparison of a column for "column IS NOT NULL"; or comparisons
 // of a column with constants (x >= 3 implies x > 0).
-// Planning that looks at a parameter's value counts here (a partial index's
-// predicate implied, a LIMIT or OFFSET): a plan made with any look is not
-// kept for the next execution (PlanCache). The SQL thread is one, so a
-// module counter will do.
-var PARAM_LOOKS: int = 0
+//
+// Planning that looks at a parameter's value (9.55): whether a partial
+// index's predicate is implied for it (yes or no), and a LIMIT or OFFSET (its
+// value, which the plan keeps). Each look is noted in the planning's scope
+// (Scope.looks) with what it gave; select() keeps the plan with them and takes
+// it again only for parameters that give the same (looksHold). So a statement
+// keeps a plan per outcome, at most PLAN_VARIANTS.
+type Look = record { implies: bool; c: Expr; p: Expr; out: int }
 
-fn impliesOne(c: &Expr, p: &Expr, params: &[]Val): bool {
-    if len(params) > 0 { PARAM_LOOKS += 1 }
+fn impliesOne(c: &Expr, p: &Expr, params: &[]Val, lk: mut &[]Look): bool {
+    let r = impliesRaw(c, p, params)
+    if len(params) > 0 { append(lk, Look{implies: true, c: clone(c), p: clone(p), out: if r { 1 } else { 0 }}) }
+    return r
+}
+
+// Whether the parameters give what the plan's looks gave.
+fn looksHold(ls: &[]Look, params: &[]Val): bool {
+    for l in ls {
+        if l.implies {
+            if impliesRaw(&l.c, &l.p, params) != (l.out == 1) { return false }
+        } else {
+            let x = Some(clone(&l.c))
+            var none: []Look = []
+            match evalInt(&x, params, "LIMIT", mut &none) {
+                Ok(n) { if n != l.out { return false } }
+                Err(_) { return false }
+            }
+        }
+    }
+    return true
+}
+
+fn impliesRaw(c: &Expr, p: &Expr, params: &[]Val): bool {
     if lexdb_sql.exprText(c) == lexdb_sql.exprText(p) { return true }
     match p {
         Expr.IsNull(a, neg) {
@@ -4406,7 +4431,7 @@ fn qualify(x: &Expr, alias: &str): Expr {
 
 // Whether index c of level k may be used under conditions cs: it is not
 // filtered, or they imply each conjunct of its predicate.
-fn (q: &Query) usable(k: int, c: int, cs: &[]Expr, params: &[]Val): bool {
+fn (q: &Query) usable(k: int, c: int, cs: &[]Expr, params: &[]Val, lk: mut &[]Look): bool {
     if c < 0 { return true }
     let lv = &q.levels[k]
     match lv.t.indexes[c].pred {
@@ -4415,7 +4440,7 @@ fn (q: &Query) usable(k: int, c: int, cs: &[]Expr, params: &[]Val): bool {
             conjuncts(&qualify(&pr, &lv.alias), mut &ps)
             for pc in ps {
                 var ok = false
-                for cc in cs { if impliesOne(&cc, &pc, params) { ok = true } }
+                for cc in cs { if impliesOne(&cc, &pc, params, lk) { ok = true } }
                 if !ok { return false }
             }
             return true
@@ -4535,14 +4560,14 @@ fn keyCols(t: &Table, index: int): []int {
 // The rules (4.8): the whole primary key equal; then a unique index whose
 // columns are all equal; then the most leading equalities, then a range on
 // the next column; the primary key wins a tie. Nothing: a full scan.
-fn choosePath(q: &Query, k: int, cs: &[]Expr, params: &[]Val): Path {
+fn choosePath(q: &Query, k: int, cs: &[]Expr, params: &[]Val, lk: mut &[]Look): Path {
     let lv = &q.levels[k]
     var best = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: []}
     var bestScore = 0
     var bestEst = -1                    // the best's expected rows from ANALYZE (9.54); -1 unknown
     for c0 in 0..len(lv.t.indexes) + 1 {
         let c = c0 - 1
-        if !q.usable(k, c, cs, params) { continue }
+        if !q.usable(k, c, cs, params, lk) { continue }
         let cols = keyCols(&lv.t, c)
         var eqs: []Expr = []
         var rng: []Bound = []
@@ -5136,7 +5161,7 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
         let m = replace(mut &ms[k], [])
         // a subquery's rows have no key: read them all
         var path = if q.levels[k].virt() { Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: []} } else {
-            choosePath(&q, k, &m, params)
+            choosePath(&q, k, &m, params, mut &sc.looks)
         }
         var perRow = k == 0 || q.pathOuter(&path) || q.levels[k].lateral
         let right = keepsRight(q.levels[k].join)
@@ -5609,6 +5634,7 @@ pub type Scope = record {
     asRole: []str
     whos: []Who
     target: str
+    looks: []Look               // the planning's looks at parameters' values (9.55)
 }
 
 type Work = record { id: int; cols: []lexdb_sql.ColDef }
@@ -5631,7 +5657,7 @@ fn scCheck(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: mut &Scope, ke
 fn newScope(params: &[]Val, ptypes: &[]int): Scope {
     var pt: []int = []
     for i in 0..len(params) { append(mut &pt, if i < len(ptypes) { ptypes[i] } else { 0 }) }
-    return Scope{frames: [], base: len(params), ptypes: pt, works: [], asRole: [], whos: [], target: ""}
+    return Scope{frames: [], base: len(params), ptypes: pt, works: [], asRole: [], whos: [], target: "", looks: []}
 }
 
 // The parameter types of the query being planned: the statement's, then
@@ -9063,25 +9089,26 @@ fn sortCmp(a: &Val, b: &Val): int {
     }
 }
 
-fn evalInt(x: &Option[Expr], params: &[]Val, what: str): Result[int, DbErr] {
+fn evalInt(x: &Option[Expr], params: &[]Val, what: str, lk: mut &[]Look): Result[int, DbErr] {
     match x {
         Some(v) {
-            match v {
-                Expr.Lit(_) {}
-                else { PARAM_LOOKS += 1 }
-            }
+            let lit = match v { Expr.Lit(_) { true } else { false } }
             let noCols: []lexdb_sql.ColDef = []
             let noRow: []Val = []
             let noAggs: []Val = []
             let noSubs: []SubRes = []
             let env = Env{cols: &noCols, row: &noRow, aggs: &noAggs, params: params, subs: &noSubs, cur: &noAggs, seq: None}
+            var n = -1                      // NULL: no limit
             match try coerce(try eval(&v, &env), &lexdb_sql.TypeName{kind: lexdb_sql.K_INT, oid: lexdb_sql.OID_INT8, prec: 0, scale: 0, len: 0}) {
-                Val.Int(n) {
-                    if n < 0 { return Err(e("2201W", what + " must not be negative")) }
-                    return Ok(n)
+                Val.Int(i) {
+                    if i < 0 { return Err(e("2201W", what + " must not be negative")) }
+                    n = i
                 }
-                else { return Ok(-1) }
+                else {}
             }
+            // a look (9.55): the plan keeps the value
+            if !lit { append(lk, Look{implies: false, c: clone(&v), p: Expr.Lit(Val.Null), out: n}) }
+            return Ok(n)
         }
         None { return Ok(-1) }
     }
@@ -9131,8 +9158,10 @@ fn orderValue(o: &Expr, outs: &[]OutCol, vals: &[]Val, env: &Env): Result[Val, D
 
 fn select(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int,
           lim: Limits, pc: mut &PlanCache): Result[Res, DbErr] {
-    // A prepared statement's plan, kept while the schema the transaction
-    // sees is the same and the plan looked at no parameter's value.
+    // A prepared statement's plans, kept while the schema the transaction
+    // sees is the same (and the statistics and the planner's mode): one per
+    // outcome of the looks at its parameters' values (9.55), the first whose
+    // looks the parameters give again taken.
     var ver = try catVersion(st, txn)
     if len(txn.path) > 0 { ver = ver + "|" + strings.join(&txn.path, ",") }      // its names resolved by the path
     // the time zone (9.95): nothing planned depends on it now (a value is
@@ -9148,18 +9177,27 @@ fn select(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
         None {}
     }
     if txn.rules { ver = ver + "|rules" } else { ver = ver + "|" + (try statVersion(st, txn)) }   // 9.54
-    if len(pc.sels) == 0 || pc.ver != ver {
+    if pc.ver != ver {
         pc.sels = []
-        var sc = newScope(params, ptypes)
-        let looks = PARAM_LOOKS
-        let sel = try planSelect(st, txn, s, params, mut &sc)
-        if PARAM_LOOKS != looks || !pc.keep { return runSel(st, txn, &sel, params, lim) }
-        append(mut &pc.sels, sel)
+        pc.looks = []
         pc.ver = ver
-        pc.plans += 1
     }
-    return runSel(st, txn, &pc.sels[0], params, lim)
+    for i in 0..len(pc.sels) {
+        if looksHold(&pc.looks[i], params) { return runSel(st, txn, &pc.sels[i], params, lim) }
+    }
+    var sc = newScope(params, ptypes)
+    let sel = try planSelect(st, txn, s, params, mut &sc)
+    let looks = replace(mut &sc.looks, [])
+    if !pc.keep || len(pc.sels) >= PLAN_VARIANTS { return runSel(st, txn, &sel, params, lim) }
+    append(mut &pc.sels, sel)
+    append(mut &pc.looks, looks)
+    pc.plans += 1
+    return runSel(st, txn, &pc.sels[len(pc.sels) - 1], params, lim)
 }
+
+// The plans a prepared statement keeps at most (9.55): past them, a run with
+// parameters none of them fits is planned and not kept.
+const PLAN_VARIANTS: int = 4
 
 fn runSel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params: &[]Val, lim: Limits): Result[Res, DbErr] {
     if len(sel.locks) > 0 { return runLocking(st, txn, sel, params, lim) }
@@ -9259,11 +9297,11 @@ fn streams(sel: &Sel): bool {
 
 // A prepared statement's plan (select), with the catalog version it was
 // made for. keep false: never kept (a statement run once).
-pub type PlanCache = record { sels: []Sel; ver: str; keep: bool; pub plans: int }
+pub type PlanCache = record { sels: []Sel; looks: [][]Look; ver: str; keep: bool; pub plans: int }
 
-pub fn newPlanCache(): PlanCache { return PlanCache{sels: [], ver: "", keep: true, plans: 0} }
+pub fn newPlanCache(): PlanCache { return PlanCache{sels: [], looks: [], ver: "", keep: true, plans: 0} }
 
-pub fn oneShot(): PlanCache { return PlanCache{sels: [], ver: "", keep: false, plans: 0} }
+pub fn oneShot(): PlanCache { return PlanCache{sels: [], looks: [], ver: "", keep: false, plans: 0} }
 
 // ---- aggregates: one accumulator per call and group, so a grouped
 // query holds its groups, not its rows
@@ -9829,10 +9867,10 @@ fn servesOrder(t: &Table, p: &Path, cols: &[]int): bool {
 }
 
 // A full scan of the primary key or an index that gives the order, if one does.
-fn orderedScan(q: &Query, cols: &[]int, params: &[]Val): Option[int] {
+fn orderedScan(q: &Query, cols: &[]int, params: &[]Val, lk: mut &[]Look): Option[int] {
     let t = &q.levels[0].t
     for c0 in 0..len(t.indexes) + 1 {
-        if !q.usable(0, c0 - 1, &q.levels[0].cond, params) { continue }
+        if !q.usable(0, c0 - 1, &q.levels[0].cond, params, lk) { continue }
         let p = Path{index: c0 - 1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: []}
         if servesOrder(t, &p, cols) { return Some(c0 - 1) }
     }
@@ -10097,8 +10135,8 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             if !ok { return Err(e("42P10", "for SELECT DISTINCT, ORDER BY expressions must appear in select list")) }
         }
     }
-    let limit = try evalInt(&s.limit, params, "LIMIT")
-    let offset = try evalInt(&s.offset, params, "OFFSET")
+    let limit = try evalInt(&s.limit, params, "LIMIT", mut &sc.looks)
+    let offset = try evalInt(&s.offset, params, "OFFSET", mut &sc.looks)
     var sort = len(order) > 0
     var first = -1
     // The first table's order holds through the joins, unless a RIGHT or
@@ -10134,7 +10172,7 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             // saves reading everything: a LIMIT, or MIN/MAX. Else a sort is
             // cheaper than a lookup per row.
             if !use && full && (limit >= 0 || mm >= 0) {
-                match orderedScan(&q, &cols, params) {
+                match orderedScan(&q, &cols, params, mut &sc.looks) {
                     Some(x) {
                         ix = x
                         use = true
@@ -10350,8 +10388,8 @@ fn planSet(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
     var refs = cloneAll(&l.q.refs)
     for x in r.q.refs { append(mut &refs, clone(&x)) }
     let split = len(l.q.refs)
-    let limit = try evalInt(&s.limit, params, "LIMIT")
-    let offset = try evalInt(&s.offset, params, "OFFSET")
+    let limit = try evalInt(&s.limit, params, "LIMIT", mut &sc.looks)
+    let offset = try evalInt(&s.offset, params, "OFFSET", mut &sc.looks)
     let q = Query{levels: [], cols: [], top: [], subs: [], base: sc.base, corr: false, refs: refs}
     return Ok(Sel{q: q, exprs: [], outs: outs, groupBy: [], order: order, aggQ: false, sort: len(order) > 0, first: -1,
                   limit: limit, offset: offset, having: None, specs: [], distinct: false, desc: desc, nullsFirst: nullsFirst, parts: [l, r],
