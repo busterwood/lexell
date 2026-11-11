@@ -3441,9 +3441,23 @@ fn catVersion(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[str, Db
 }
 
 fn bumpCatalog(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[Unit, DbErr] {
-    let v = strings.parseIntOpt(try catVersion(st, txn)).unwrapOr(0)
-    try txn.put(CATALOG, CAT_VERSION, (v + 1).toStr())
+    let v = try catVersion(st, txn)
+    try txn.put(CATALOG, CAT_VERSION, nextVersion(&v))
     return Ok(Unit{})
+}
+
+// Bumps made in this process: with the number, a version a bump gives is
+// unique, so a bump in a block that rolls back cannot give the version a
+// later bump commits (a plan kept under the first would be taken for the
+// second: 9.54).
+var VERSION_BUMPS: int = 0
+
+// The version after v: its count plus one, and a token unique in this process.
+fn nextVersion(v: &str): str {
+    let dot = strings.indexOf(v, ".", 0)
+    let n = strings.parseIntOpt(if dot < 0 { v.toStr() } else { v[0..dot] }).unwrapOr(0)
+    VERSION_BUMPS += 1
+    return (n + 1).toStr() + "." + VERSION_BUMPS.toStr() + "." + time.monotonicNs().toStr()
 }
 
 // ---- statistics (9.54): ANALYZE's row per table, keyed 5 then the table's
@@ -3453,11 +3467,37 @@ fn bumpCatalog(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[Unit, 
 
 fn statKey(name: &str): str { return "\x05" + name }
 
+// The statistics' version: a row ANALYZE bumps, apart from the catalog's, so
+// that statements that read the catalog's version do not conflict with an
+// ANALYZE. It is read unnoted (getUnnoted), as the statistics are: they
+// change plans, never results. A prepared statement's plan is kept under it.
+const STAT_VERSION: str = "\x02stats"
+
+fn statVersion(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[str, DbErr] {
+    match try st.getUnnoted(txn, CATALOG, STAT_VERSION) {
+        Some(v) { return Ok(v) }
+        None { return Ok("0") }
+    }
+}
+
+// The statistics of a table moved to a new catalog key (RENAME, SET SCHEMA).
+fn moveStats(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, old: &str, new: &str): Result[Unit, DbErr] {
+    match try st.getUnnoted(txn, CATALOG, statKey(old)) {
+        Some(v) {
+            txn.del(CATALOG, statKey(old))
+            try txn.put(CATALOG, statKey(new), v)
+        }
+        None {}
+    }
+    return Ok(Unit{})
+}
+
 // A table's statistics as the transaction sees them (none with SET
 // lexdb_planner = rules).
 fn loadEst(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table): Result[Est, DbErr] {
-    if txn.rules || t.tree < 0 { return Ok(noEst()) }
-    let got = try st.get(txn, CATALOG, statKey(&t.name))
+    // ties need two candidates the statistics can tell apart: two indexes
+    if txn.rules || t.tree < 0 || len(t.indexes) < 2 { return Ok(noEst()) }
+    let got = try st.getUnnoted(txn, CATALOG, statKey(&t.name))
     if got.isNone() { return Ok(noEst()) }
     let v = got.unwrap()
     let parts = strings.split(&v, ";")
@@ -3476,12 +3516,14 @@ fn loadEst(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table): Result
 }
 
 // ANALYZE [table]: the statistics of the table, or of every table, counted
-// exactly from a full read. The catalog's version is bumped, so prepared
-// statements are planned again with them (9.54).
-fn analyzeStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
+// from a full read. The rows are read on a snapshot of their own, so the
+// statement's reads are only the catalog's and it does not conflict with the
+// writes it does not see; only the statistics' rows and version are written,
+// so prepared statements are planned again with them (9.54).
+fn analyzeStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, lim: Limits): Result[Res, DbErr] {
+    var tabs: []Table = []
     if s.table != "" {
-        let t = try needTable(st, txn, &s.table)
-        try analyzeTable(st, txn, &t)
+        append(mut &tabs, try needTable(st, txn, &s.table))
     } else {
         var keys: []str = []
         var raw: []str = []
@@ -3490,16 +3532,33 @@ fn analyzeStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
             append(mut &raw, en.val)
             return true
         })
-        for i in 0..len(keys) {
-            let t = try decTable(&keys[i], &raw[i])
-            try analyzeTable(st, txn, &t)
+        for i in 0..len(keys) { append(mut &tabs, try decTable(&keys[i], &raw[i])) }
+    }
+    var snap = try st.beginSnapshot()
+    var failed: []DbErr = []
+    for t in tabs {
+        match analyzeTable(st, txn, mut &snap, &t, &lim) {
+            Ok(_) {}
+            Err(x) {
+                append(mut &failed, x)
+                break
+            }
         }
     }
-    try bumpCatalog(st, txn)
+    st.endSnapshot(&snap)
+    if len(failed) > 0 { return Err(failed[0]) }
+    let v = try statVersion(st, txn)
+    try txn.put(CATALOG, STAT_VERSION, nextVersion(&v))
     return Ok(tagOnly("ANALYZE"))
 }
 
-fn analyzeTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table): Result[Unit, DbErr] {
+// Distinct values counted per prefix at most: past it the count stays here, a
+// lower bound, which keeps ANALYZE's memory bounded (the estimate it gives is
+// then an upper bound).
+const ANALYZE_DISTINCT_MAX: int = 100000
+
+fn analyzeTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, snap: mut &lexdb_store.Txn, t: &Table,
+                lim: &Limits): Result[Unit, DbErr] {
     var rows = 0
     var entries: []int = []
     var seen: [][]Map[str, int] = []
@@ -3514,8 +3573,9 @@ fn analyzeTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table): R
     let sc = Scan{empty: false, point: false, lo: "", hi: "", whole: true}
     var cur = newCursor()
     while !cur.done {
+        if lim.deadline != 0 && time.monotonicNs() > lim.deadline { return Err(e("57014", "canceling statement due to statement timeout")) }
         var batch: [][]Val = []
-        try fetch(st, txn, t, &path, &sc, &all, mut &cur, mut &batch)
+        try fetch(st, snap, t, &path, &sc, &all, mut &cur, mut &batch)
         for r in batch {
             rows += 1
             for i in 0..len(t.indexes) {
@@ -3524,7 +3584,7 @@ fn analyzeTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table): R
                 var b = newStrBuf()
                 for j in 0..len(t.indexes[i].cols) {
                     encIdxPart(mut &b, &r[t.indexes[i].cols[j]])
-                    seen[i][j].put(b.toStr(), 1)
+                    if seen[i][j].size() < ANALYZE_DISTINCT_MAX { seen[i][j].put(b.toStr(), 1) }
                 }
             }
         }
@@ -3730,6 +3790,7 @@ pub type Level = record {
     lockWait: int           // lexdb_sql.WAIT_*
     keeps: bool             // the path is chosen for ORDER BY or MIN/MAX: no switch to a scan (9.53)
     est: Est                // its table's statistics from ANALYZE, for choosePath (9.54)
+    stops: bool             // the first table's reading may stop early (a LIMIT, EXISTS): no switch to a scan (9.53)
 }
 
 // A level of rows held by the run (a subquery's, a working table), not a table's.
@@ -4805,7 +4866,7 @@ fn allTrue(cs: &[]Expr, cols: &[]lexdb_sql.ColDef, row: &[]Val, params: &[]Val):
 fn newLevel(t: Table, alias: str, join: int, first: int): Level {
     return Level{t: t, alias: alias, join: join, first: first, path: Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: []}, cond: [],
                  post: [], local: [], perRow: true, hashCols: [], hashVals: [], src: -1, work: -1, lateral: false, need: [],
-                 lock: 0, lockWait: 0, keeps: false, est: noEst()}
+                 lock: 0, lockWait: 0, keeps: false, est: noEst(), stops: false}
 }
 
 // Plans a query over the tables of FROM (4.8): the tables are joined in the
@@ -5396,12 +5457,15 @@ fn runLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Ma
         // - a path chosen for its order (ORDER BY, MIN/MAX);
         // - a query run once per outer row (a correlated subquery, LATERAL):
         //   a scan there would be paid per row;
-        // - a write, or any statement of a block that may write: a scan's read
-        //   is the whole table, checked at commit, so it would conflict with
-        //   every write to the table.
+        // - a reading that may stop early (LIMIT, EXISTS): the counting could
+        //   cost more than the rows it needs;
+        // - a write, or any transaction whose reads are noted (a block that may
+        //   write, an autocommit INSERT ... SELECT): a scan's read is the whole
+        //   table, checked at commit, so it would conflict with every write to
+        //   the table.
         var keys: []str = []
         var byKeys = false
-        if k == 0 && !lv.keeps && !rs.writes && !txn.tracked() && !txn.live && len(q.refs) == 0 && !(q.corr && pathCorr(&lv.path)) &&
+        if k == 0 && !lv.keeps && !lv.stops && !rs.writes && !txn.noting() && len(q.refs) == 0 && !(q.corr && pathCorr(&lv.path)) &&
            len(scans) == 1 && lv.path.index >= 0 && len(lv.path.ins) == 0 && lv.path.inSub < 0 && len(lv.path.inArr) == 0 &&
            !scans[0].point && !scans[0].empty && !scans[0].whole {
             let how = try indexOrScan(st, txn, &lv.t, &lv.path, &scans[0], mut &keys)
@@ -5628,6 +5692,9 @@ fn endScope(sc: mut &Scope, q: mut &Query) {
 fn planSub(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val,
            sc: mut &Scope): Result[SubPlan, DbErr] {
     var sel = try planSelect(st, txn, s, params, sc)
+    // EXISTS stops at its first row, a scalar at its second (runSub): its
+    // first table's reading may stop early, so no switch to a scan (9.53)
+    if len(sel.q.levels) > 0 && (s.use == lexdb_sql.SUB_EXISTS || (s.use == lexdb_sql.SUB_SCALAR && !sel.aggQ)) { sel.q.levels[0].stops = true }
     if len(s.srf) > 0 { sel.outs = try srfCols(&s.srf, s.ordin, &sel.outs) }
     if s.use == lexdb_sql.SUB_IN && len(sel.outs) != 1 { return Err(e("42601", "subquery has too many columns")) }
     if s.use == lexdb_sql.SUB_SCALAR && len(sel.outs) != 1 { return Err(e("42601", "subquery must return only one column")) }
@@ -7101,6 +7168,7 @@ fn dropOne(txn: mut &lexdb_store.Txn, t: &Table) {
     }
     txn.dropTree(t.tree)
     txn.del(CATALOG, t.name)
+    txn.del(CATALOG, statKey(&t.name))         // its statistics (9.54)
 }
 
 // ---- column defaults (9.38)
@@ -7244,6 +7312,7 @@ fn moveTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, s
     t.name = lexdb_sql.qual(sc, &lexdb_sql.baseName(&t.name))
     try moveAcl(st, txn, &relObj(&old), &relObj(&t.name))
     try relink(st, txn, t, &old)
+    try moveStats(st, txn, &old, &t.name)
     try ownerMoved(st, txn, t, &old, &"", &"", sc)
     for k in 0..len(t.indexes) {
         txn.del(CATALOG, idxName(&t.indexes[k].name))
@@ -7596,6 +7665,7 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             t.name = key
             try moveAcl(st, txn, &relObj(&old), &relObj(&key))
             try relink(st, txn, mut &t, &old)
+            try moveStats(st, txn, &old, &t.name)
             try ownerMoved(st, txn, mut &t, &old, &"", &"", &"")
             for ix in t.indexes { try txn.put(CATALOG, idxName(&ix.name), key) }
         } else {
@@ -9077,7 +9147,7 @@ fn select(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
         Some(r) { if len(r) > 0 { ver = ver + "|s" + r } }
         None {}
     }
-    if txn.rules { ver = ver + "|rules" }                                           // SET lexdb_planner (9.54)
+    if txn.rules { ver = ver + "|rules" } else { ver = ver + "|" + (try statVersion(st, txn)) }   // 9.54
     if len(pc.sels) == 0 || pc.ver != ver {
         pc.sels = []
         var sc = newScope(params, ptypes)
@@ -10092,6 +10162,9 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         q.levels[0].path.noNulls = setNoNulls
         q.levels[0].keeps = true
     }
+    // a LIMIT may stop the first table's reading early, unless a sort or the
+    // grouping reads it all first: the switch stays off (9.53)
+    if limit >= 0 && !aggQ && !sort && len(q.levels) > 0 { q.levels[0].stops = true }
     // A grouped query: its aggregate calls become accumulators, and its
     // columns must be grouped.
     var specs: []AggSpec = []
@@ -11395,7 +11468,7 @@ fn execStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
         lexdb_sql.S_UPDATE { return update(st, txn, s, params, lim) }
         lexdb_sql.S_DELETE { return delete(st, txn, s, params, lim) }
         lexdb_sql.S_CREATE_INDEX { return createIndex(st, txn, s) }
-        lexdb_sql.S_ANALYZE { return analyzeStmt(st, txn, s) }
+        lexdb_sql.S_ANALYZE { return analyzeStmt(st, txn, s, lim) }
         lexdb_sql.S_DROP_INDEX { return dropIndex(st, txn, s) }
         lexdb_sql.S_CREATE_SCHEMA { return createSchemaStmt(st, txn, s) }
         lexdb_sql.S_CREATE_ROLE, lexdb_sql.S_ALTER_ROLE, lexdb_sql.S_DROP_ROLE { return roleStmt(st, txn, s) }
@@ -11569,6 +11642,7 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
                 s.maxMem = MAX_STATEMENT_MEM
                 s.batch = true
                 s.rules = false
+                if len(s.txn) > 0 { s.txn[0].rules = false }
             } else if stmt.table == "lexdb_planner" {
                 // cost (the default): statistics from ANALYZE break the rules'
                 // ties; rules: they are not read (9.54)
@@ -11753,8 +11827,13 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
         // meanwhile; run optimistically, it would conflict with them and
         // run again (design/lexdb.md 9.15). A snapshot whose old versions
         // went over their budget (72000) is tried again on a new one.
-        // (a SELECT that locks reads the latest, as UPDATE does)
-        let snap = (stmt.kind == lexdb_sql.S_SELECT && stmt.lockMode == 0) || (stmt.kind == lexdb_sql.S_COPY && !stmt.copy.from)
+        // (a SELECT that locks reads the latest, as UPDATE does). EXPLAIN
+        // too (9.53): EXPLAIN ANALYZE runs only a SELECT, and on the same
+        // kind of transaction as the SELECT it shows, so that it shows what
+        // the SELECT does (the index-to-scan switch is off where reads are
+        // noted); EXPLAIN alone writes nothing
+        let explained = stmt.kind == lexdb_sql.S_EXPLAIN && len(stmt.inner) > 0 && stmt.inner[0].lockMode == 0
+        let snap = (stmt.kind == lexdb_sql.S_SELECT && stmt.lockMode == 0) || explained || (stmt.kind == lexdb_sql.S_COPY && !stmt.copy.from)
         var t = if snap { try s.st.beginSnapshot() } else { lexdb_store.begin() }
         for n in s.path { append(mut &t.path, n) }
         t.sess = s.id
