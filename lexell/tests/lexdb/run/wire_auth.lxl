@@ -21,6 +21,13 @@
 // expect: drop again: 42704
 // expect: create again: 42710
 // expect: md5: 0A000
+// expect: app reads ledger: 42501
+// expect: after grant: 100
+// expect: app writes ledger: 42501
+// expect: app's privileges: t|f|app
+// expect: prepared as admin: gold
+// expect: prepared as app: 42501
+// expect: prepared again as admin: gold
 // expect: require tls, plain: 28000 lexdb: a TCP connection must use TLS (sslmode=require)
 // expect: require tls, tls: app
 import "task"
@@ -109,6 +116,28 @@ fn client(st: &lexdb_store.Store, port: &str) {
     println("drop again: " + one(&adm, &"drop role ro"))
     println("create again: " + one(&adm, &"create role app"))
     println("md5: " + one(&adm, &"create role m password 'md5a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4'"))
+    // privileges (9.83): app logs in by SCRAM, a role that is no superuser
+    var bt = postgres.connect(connStr(port, &"admin", &"adm", &plain)).unwrap()
+    bt.exec("create table ledger (id int primary key, amount int)").unwrap()
+    bt.exec("insert into ledger values (1, 100)").unwrap()
+    println("app reads ledger: " + one(&app, &"select amount from ledger"))
+    bt.exec("grant select on ledger to app").unwrap()
+    println("after grant: " + one(&app, &"select amount from ledger"))
+    println("app writes ledger: " + one(&app, &"update ledger set amount = 0"))
+    println("app's privileges: " + one(&app, &"select has_table_privilege('ledger', 'select'), has_table_privilege('ledger', 'update'), current_user"))
+    // a kept plan is not reused across SET ROLE
+    bt.exec("create table vault (id int primary key, secret text)").unwrap()
+    bt.exec("insert into vault values (1, 'gold')").unwrap()
+    let ps = bt.prepare("select secret from vault").unwrap()
+    let pr1 = bt.queryPrepared(&ps, &[]).unwrap()
+    println("prepared as admin: " + pr1.text(0, 0).unwrap())
+    bt.exec("set role app").unwrap()
+    match bt.queryPrepared(&ps, &[]) {
+        Ok(_) { println("prepared as app: read!") }
+        Err(x) { println("prepared as app: " + x.state) }
+    }
+    bt.exec("reset role").unwrap()
+    println("prepared again as admin: " + bt.queryPrepared(&ps, &[]).unwrap().text(0, 0).unwrap())
     conf.requireTls = true
     lexdb_wire.configure(st, &conf).unwrap()
     println("require tls, plain: " + one(&connStr(port, &"app", &"secret", &plain), &"select 1"))

@@ -6337,3 +6337,129 @@ how PostgreSQL gives a role some columns or rows of a table.
 - `exec_viewsx`, by hand: lexdb's own answers above (writes refused, renames
   and column changes refused, ALTER VIEW, the text kept, a view reading
   itself).
+
+### 9.83 Privileges
+
+Stage 6 of 9.75: owners, GRANT and REVOKE, roles' memberships, and SET
+ROLE, as PostgreSQL has them. Until now any role that logged in could read
+and write everything.
+
+- **Who is checked:** the session's current role. That is SET ROLE's role,
+  else SET SESSION AUTHORIZATION's, else the login's.
+  - A superuser role is not checked.
+  - Neither is a session whose user is no role: one that came in by trust,
+    as every session did before 9.81. So existing deployments and the
+    tests run as before.
+- **What is kept:** catalog rows of their own, so tables' rows did not
+  change.
+  - `ACL_PRE` and an object hold its owner and its grants. The object is
+    `r:` and a relation's catalog key (a table, view or sequence), or `n:`
+    and a schema.
+  - Privileges are PostgreSQL's aclitem letters: `r` SELECT, `a` INSERT,
+    `w` UPDATE, `d` DELETE, `D` TRUNCATE, `x` REFERENCES, `t` TRIGGER, `U`
+    USAGE, `C` CREATE.
+  - `MEM_PRE`, a role and a member, holds a membership. A role acts as
+    itself, every role it is a member of (followed up the chain), and
+    PUBLIC.
+- **Owners.** CREATE TABLE, VIEW and SEQUENCE make the current role the
+  owner, and a table's serial and identity sequences go to the table's
+  owner. CREATE SCHEMA gives the schema to AUTHORIZATION's role, or to its
+  maker.
+  - Objects made before this have no owner: only superusers (and trusted
+    sessions) may do an owner's things with them.
+  - The schema public has PostgreSQL 15's grants: USAGE for PUBLIC, no
+    CREATE.
+- **The checks,** with PostgreSQL's 42501 messages:
+  - **Reading:** SELECT on each table and view a query reads (`scCheck` in
+    `buildQuery`), and USAGE on its schema.
+    - A view's own relations are read as the view's owner, so a view gives
+      a role exactly what it shows.
+    - The checks happen when a query is planned. A prepared statement's
+      kept plan is keyed by the catalog's version, which every GRANT,
+      REVOKE, role DDL and OWNER TO bumps, and by SET ROLE's role.
+  - **Writing** (`dmlCheck`):
+    - INSERT, UPDATE and DELETE need their privilege on the target;
+    - SELECT too where the statement reads rows: a WHERE, RETURNING, a SET
+      that reads a column, ON CONFLICT DO UPDATE (which needs UPDATE as
+      well);
+    - COPY FROM needs INSERT, and COPY TO is a query.
+  - **Sequences:** nextval and setval need USAGE or UPDATE, currval USAGE
+    or SELECT, checked when the statement binds the sequences it names.
+  - **DDL:** CREATE TABLE, VIEW and SEQUENCE need CREATE on the schema.
+    ALTER, DROP, CREATE INDEX, RENAME and OR REPLACE need the owner. CREATE
+    SCHEMA needs a superuser (PostgreSQL: the database's CREATE). DROP
+    SCHEMA needs the schema's owner.
+- **The statements:**
+  - `GRANT privileges | ALL ON [TABLE] t, ... | SEQUENCE s, ... | SCHEMA s,
+    ... | ALL TABLES IN SCHEMA s | ALL SEQUENCES IN SCHEMA s TO role |
+    PUBLIC | CURRENT_USER, ...`, and REVOKE ... FROM. The grant is the
+    owner's to give. A privilege that does not fit the object is 0LP01, an
+    unknown role 42704. ALL TABLES IN SCHEMA means the tables and views
+    there now.
+  - `GRANT role TO role` and REVOKE: a superuser's to give, with cycles
+    refused (0LP01).
+  - `ALTER TABLE | VIEW | SEQUENCE | SCHEMA name OWNER TO role`: a
+    superuser's, or the owner's when it is a member of the new owner.
+  - `CREATE SCHEMA [name] AUTHORIZATION role`.
+  - `GRANT ... ON DATABASE` is accepted with no effect: lexdb has no
+    database privileges, so everyone may connect.
+  - `SET [SESSION] ROLE name | NONE`, `RESET ROLE`: the session's user
+    must be a member of the role, or a superuser.
+  - `SET SESSION AUTHORIZATION name | DEFAULT`, `RESET SESSION
+    AUTHORIZATION`: for a superuser's login only. Both are restored by a
+    block's ROLLBACK, as `search_path` is.
+  - `current_user` is the current role, and `session_user` the session's
+    user.
+- **Keeping grants with their objects.**
+  - A dropped object's grants go with it, so a new table of the same name
+    gets none of them.
+  - A rename, SET SCHEMA, a schema's rename and a role's rename carry the
+    owner and grants along.
+  - DROP ROLE is refused while the role owns something (2BP01). Its grants
+    and memberships go with it, where PostgreSQL asks for them to be
+    revoked first.
+  - Renaming a schema that holds a view, or that holds a table a view
+    reads, is refused, as a view keeps names as text (9.82). This also
+    stops 9.82's schema rename from treating a view's row as a table's.
+- **The catalog:**
+  - `pg_class.relowner` and `relacl` (PostgreSQL 16's aclitem text:
+    `boot=arwdDxt/boot,team=ar/boot`), and `pg_namespace.nspowner` and
+    `nspacl`;
+  - `pg_roles` with each role's OID, and `pg_auth_members`;
+  - `pg_tables.tableowner` and `pg_views.viewowner`,
+    `information_schema.table_privileges`, and `pg_get_userbyid`;
+  - `has_table_privilege`, `has_schema_privilege`,
+    `has_sequence_privilege` and `has_any_column_privilege`, with or
+    without a role, by name or OID, true if any privilege named is held.
+    They read the bound catalog, roles and grants included.
+  - psql's `\dp`, `\du` and `\dn+` show what PostgreSQL's psql shows.
+
+**Tests.**
+- `exec_privs`: 106 statements generated from PostgreSQL 18, all the same.
+  A superuser acts as roles through SET ROLE, and the test covers:
+  - each DML statement, and when each needs SELECT as well;
+  - schema USAGE and CREATE, ALL TABLES IN SCHEMA;
+  - a view read as its owner; membership given and taken;
+  - owners: a role's own table, view and index; OWNER TO; who may not ALTER
+    or DROP;
+  - a sequence's USAGE; the catalog functions and views;
+  - the errors, and DROP ROLE's dependency.
+- `exec_privsx`, by hand: lexdb's own answers. These are SET ROLE undone
+  by ROLLBACK, SET SESSION AUTHORIZATION, grants following renames, a new
+  table of an old name with none, a view of a view read as each owner, and
+  DROP ROLE.
+- `wire_auth`: a role that logs in by SCRAM is refused, then granted
+  SELECT but not UPDATE. A prepared statement made as a superuser is
+  refused after SET ROLE, and works again after RESET ROLE.
+
+**Not done:**
+- column privileges (`GRANT SELECT (a) ON t`), grant options (`WITH GRANT
+  OPTION`), and `WITH ADMIN OPTION` and membership options;
+- `ALTER DEFAULT PRIVILEGES`, `REASSIGN OWNED`, `DROP OWNED`;
+- `CREATEROLE` and `CREATEDB` as their own attributes: a superuser does
+  their work;
+- row security (policies);
+- the USAGE a serial column's sequence needs for an INSERT (PostgreSQL asks
+  for it);
+- REFERENCES, checked when a foreign key is made;
+- privileges on functions and types.

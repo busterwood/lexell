@@ -1,0 +1,106 @@
+// lexdb_exec: what lexdb's privileges do that the PostgreSQL-generated test
+// (exec_privs) cannot show, by hand (design/lexdb.md 9.83): SET ROLE undone
+// by ROLLBACK; SET SESSION AUTHORIZATION; a grant following its table
+// through a rename, SET SCHEMA and its schema's rename, and its role through
+// a rename; a new table of a dropped one's name with none of its grants; a
+// view of a view read as each view's owner (cv's owner may read bv; rc may
+// not read bt); DROP ROLE taking its grants away (PostgreSQL asks for them
+// to be revoked first), and refused while the role owns a table.
+// expect: CREATE ROLE
+// expect: CREATE ROLE
+// expect: CREATE TABLE
+// expect: INSERT 0 1
+// expect: GRANT
+// expect: BEGIN
+// expect: SET
+// expect: ra
+// expect: ROLLBACK
+// expect: f
+// expect: SET
+// expect: ra|ra
+// expect: one
+// expect: RESET
+// expect: f
+// expect: ALTER TABLE
+// expect: SET
+// expect: one
+// expect: RESET
+// expect: CREATE SCHEMA
+// expect: ALTER TABLE
+// expect: GRANT
+// expect: SET
+// expect: one
+// expect: RESET
+// expect: ALTER SCHEMA
+// expect: SET
+// expect: one
+// expect: RESET
+// expect: ALTER ROLE
+// expect: SET
+// expect: rc|one
+// expect: RESET
+// expect: DROP TABLE
+// expect: CREATE TABLE
+// expect: SET
+// expect: ERROR 42501
+// expect: RESET
+// expect: GRANT
+// expect: SET
+// expect: CREATE TABLE
+// expect: INSERT 0 1
+// expect: CREATE VIEW
+// expect: RESET
+// expect: GRANT
+// expect: CREATE VIEW
+// expect: GRANT
+// expect: SET
+// expect: secret
+// expect: secret
+// expect: ERROR 42501
+// expect: RESET
+// expect: REVOKE
+// expect: SET
+// expect: secret
+// expect: RESET
+// expect: DROP ROLE
+// expect: 0
+// expect: ERROR 2BP01
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+
+const QUERIES = "create role ra login\ncreate role rb login\ncreate table t (id int primary key, v text)\ninsert into t values (1, 'one')\ngrant select on t to ra\nbegin\nset role ra\nselect current_user\nrollback\nselect current_user = 'ra'\nset session authorization ra\nselect session_user, current_user\nselect v from t\nreset session authorization\nselect session_user = 'ra'\nalter table t rename to t2\nset role ra\nselect v from t2\nreset role\ncreate schema sx\nalter table t2 set schema sx\ngrant usage on schema sx to ra\nset role ra\nselect v from sx.t2\nreset role\nalter schema sx rename to sy\nset role ra\nselect v from sy.t2\nreset role\nalter role ra rename to rc\nset role rc\nselect current_user, v from sy.t2\nreset role\ndrop table sy.t2\ncreate table sy.t2 (id int primary key, v text)\nset role rc\nselect v from sy.t2\nreset role\ngrant create on schema public to rb\nset role rb\ncreate table bt (id int primary key, s text)\ninsert into bt values (1, 'secret')\ncreate view bv as select s from bt\nreset role\ngrant select on bv to rc\ncreate view cv as select s from bv\ngrant select on cv to rc\nset role rc\nselect s from bv\nselect s from cv\nselect s from bt\nreset role\nrevoke select on bv from rc\nset role rc\nselect s from cv\nreset role\ndrop role rc\nselect count(*) from pg_roles where rolname = 'rc'\ndrop role rb"
+
+fn show(s: mut &lexdb_exec.Session, q: &str): str {
+    match s.exec(q) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if !r.hasRows { return r.tag }
+            var rows: []str = []
+            for row in r.rows {
+                var cells: []str = []
+                for v in row { append(mut &cells, lexdb_exec.text(&v)) }
+                append(mut &rows, strings.join(&cells, "|"))
+            }
+            // psql shows a statement's tag after its RETURNING rows, not a SELECT's
+            if r.tag != "" && !strings.startsWith(r.tag, "SELECT") && r.tag != "SHOW" { append(mut &rows, r.tag) }
+            return strings.join(&rows, ";")
+        }
+        Err(e) { return "ERROR " + e.state }
+    }
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    var s = lexdb_exec.newSession(st)
+    let text: str = QUERIES
+    for q in strings.lines(&text) { println(show(mut &s, &q)) }
+    s.close()
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(82), lexdb_store.Options{cacheBytes: 16 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024,
+                                                           snapNodes: 50000, bufferedPages: false}, body).unwrap()
+}

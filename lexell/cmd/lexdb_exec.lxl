@@ -4052,14 +4052,19 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
             let found = try findTable(st, txn, &f.table)
             if found.isNone() { return Err(e("42P01", "relation \"" + lexdb_sql.shown(&f.table) + "\" does not exist")) }
             t = found.unwrap()
+            if t.name != sc.target { try scCheck(st, txn, sc, &t.name, &(if len(t.view) > 0 { "view" } else { "table" })) }
             if len(t.view) > 0 {
                 // a view: its query planned as a subquery in FROM (9.82),
-                // its plan after the statement's own subqueries
+                // its plan after the statement's own subqueries; its
+                // relations read as its owner (9.83)
                 if len(sc.frames) > 64 { return Err(e("42P17", "infinite recursion detected in rules for relation \"" + lexdb_sql.shown(&f.table) + "\"")) }
                 let vs = try viewQuery(&t)
+                let vowner = (try readAcl(st, txn, &relObj(&t.name))).owner
+                if len(vowner) > 0 { append(mut &sc.asRole, vowner) }
                 sc.frames[me].hidden = true
                 let planning = planSub(st, txn, &vs, params, sc)
                 sc.frames[me].hidden = false
+                if len(vowner) > 0 { let x = pop(mut &sc.asRole) }
                 let sp = try planning
                 if len(f.cols) > len(t.cols) {
                     return Err(e("42P10", "table \"" + f.alias + "\" has " + len(t.cols).toStr() + " columns available but " +
@@ -4525,14 +4530,35 @@ pub type Scope = record {
     base: int                   // the statement's parameters
     ptypes: []int
     works: []Work               // the working tables of recursive CTEs being planned
+    // privileges (9.83): the roles a view's query is checked as (its
+    // owner's, innermost last; none: the session's), the role checks so
+    // far, and an UPDATE's or DELETE's target, checked by its statement
+    asRole: []str
+    whos: []Who
+    target: str
 }
 
 type Work = record { id: int; cols: []lexdb_sql.ColDef }
 
+// SELECT on relation key, for a query being planned: as its view's owner,
+// or the session's role (9.83).
+fn scCheck(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: mut &Scope, key: &str, kind: &str): Result[Unit, DbErr] {
+    let actAs = if len(sc.asRole) > 0 { sc.asRole[len(sc.asRole) - 1] } else { currentRole(st, txn.sess) }
+    var at = -1
+    for i in 0..len(sc.whos) { if sc.whos[i].name == actAs { at = i } }
+    if at < 0 {
+        append(mut &sc.whos, try whoIs(st, txn, &actAs))
+        at = len(sc.whos) - 1
+    }
+    if sc.whos[at].super { return Ok(Unit{}) }
+    let w = Who{name: sc.whos[at].name, super: false, roles: copyStrs(&sc.whos[at].roles)}
+    return needRel(st, txn, &w, key, &"r", kind)
+}
+
 fn newScope(params: &[]Val, ptypes: &[]int): Scope {
     var pt: []int = []
     for i in 0..len(params) { append(mut &pt, if i < len(ptypes) { ptypes[i] } else { 0 }) }
-    return Scope{frames: [], base: len(params), ptypes: pt, works: []}
+    return Scope{frames: [], base: len(params), ptypes: pt, works: [], asRole: [], whos: [], target: ""}
 }
 
 // The parameter types of the query being planned: the statement's, then
@@ -5493,6 +5519,7 @@ fn createTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
         if s.ifFlag { return Ok(tagOnly("CREATE TABLE")) }
         return Err(e("42P07", "relation \"" + base + "\" already exists"))
     }
+    try needCreate(st, txn, &key)
     if len(s.pk) == 0 {
         return Err(e("42P16", "lexdb: table \"" + base + "\" needs a PRIMARY KEY"))
     }
@@ -5530,6 +5557,15 @@ fn createTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
     for c in s.cons { if c.kind == lexdb_sql.C_FOREIGN { try addConstraint(st, txn, mut &t, &c) } }
     try txn.put(CATALOG, key, encTable(&t))
     try bumpCatalog(st, txn)
+    // its owner, and its columns' sequences' (9.83)
+    try ownNew(st, txn, &relObj(&key))
+    match try st.get(txn, CATALOG, key) {
+        Some(v) {
+            let made = try decTable(key, &v)
+            for c in made.cols { if len(c.seq) > 0 { try ownNew(st, txn, &relObj(&c.seq)) } }
+        }
+        None {}
+    }
     return Ok(tagOnly("CREATE TABLE"))
 }
 
@@ -5537,6 +5573,7 @@ fn dropTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.St
     match try findTable(st, txn, &s.table) {
         Some(t) {
             if len(t.view) > 0 { return Err(e("42809", "\"" + lexdb_sql.shown(&s.table) + "\" is not a table (use DROP VIEW)")) }
+            try needRelOwner(st, txn, &t.name, &"table")
             try dropDependentViews(st, txn, &t.name, s.cascade, &"table")
             var d = t
             try unlinkTable(st, txn, mut &d, s.cascade)
@@ -5554,6 +5591,7 @@ fn dropTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.St
 
 // A table's trees and catalog rows, its indexes' too.
 fn dropOne(txn: mut &lexdb_store.Txn, t: &Table) {
+    dropAcl(txn, &relObj(&t.name))
     for ix in t.indexes {
         txn.dropTree(ix.tree)
         txn.del(CATALOG, idxName(&ix.name))
@@ -5694,6 +5732,7 @@ fn moveTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, s
     txn.del(CATALOG, t.name)
     let old = t.name
     t.name = lexdb_sql.qual(sc, &lexdb_sql.baseName(&t.name))
+    try moveAcl(st, txn, &relObj(&old), &relObj(&t.name))
     try relink(st, txn, t, &old)
     try ownerMoved(st, txn, t, &old, &"", &"", sc)
     for k in 0..len(t.indexes) {
@@ -5734,6 +5773,7 @@ fn alterIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         return Err(e("42P01", "relation \"" + lexdb_sql.shown(&s.index) + "\" does not exist"))
     }
     var t = try needTable(st, txn, &owner.unwrap())
+    try needRelOwner(st, txn, &t.name, &"index")
     let to = s.alters[0].name
     let key = lexdb_sql.qual(&lexdb_sql.schemaOf(&ixKey), &to)
     if key == ixKey { return Ok(tagOnly("ALTER INDEX")) }
@@ -5753,6 +5793,15 @@ fn alterSchema(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
     if !(try schemaExists(st, txn, &s.table)) { return Err(e("3F000", "schema \"" + s.table + "\" does not exist")) }
     if try schemaExists(st, txn, &to) { return Err(e("42P06", "schema \"" + to + "\" already exists")) }
     if strings.startsWith(to, "pg_") { return Err(e("42939", "unacceptable schema name \"" + to + "\"")) }
+    try needOwner(st, txn, &(try whoNow(st, txn)), &nspObj(&s.table), &"schema", &s.table)
+    for v in try allViews(st, txn) {
+        var touches = lexdb_sql.schemaOf(&v.name) == s.table
+        for d in v.deps { if lexdb_sql.schemaOf(&d) == s.table { touches = true } }
+        if touches {
+            return Err(e("2BP01", "cannot rename schema " + s.table + " because view " + lexdb_sql.shown(&v.name) +
+                         " is in it or reads from it (lexdb keeps a view's text)"))
+        }
+    }
     let from = lexdb_sql.qual(&s.table, &"")
     var keys: []str = []
     try st.scan(txn, CATALOG, from, from + "\xff", fn(en: &lexdb_store.Entry): bool {
@@ -5771,11 +5820,14 @@ fn alterSchema(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
     for d in try allSeqs(st, txn, &s.table) {
         var m = seqCopy(&d)
         txn.del(CATALOG, seqRow(&m.key))
+        let was = m.key
         m.key = lexdb_sql.qual(&to, &lexdb_sql.baseName(&m.key))
+        try moveAcl(st, txn, &relObj(&was), &relObj(&m.key))
         try txn.put(CATALOG, seqRow(&m.key), encSeq(&m))
     }
     txn.del(CATALOG, schemaKey(&s.table))
     try txn.put(CATALOG, schemaKey(&to), "")
+    try moveAcl(st, txn, &nspObj(&s.table), &nspObj(&to))
     try bumpCatalog(st, txn)
     return Ok(tagOnly("ALTER SCHEMA"))
 }
@@ -5934,6 +5986,7 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
     match found {
         Some(ft) {
             if len(ft.view) > 0 { return Err(e("42809", "\"" + lexdb_sql.shown(&s.table) + "\" is a view (use ALTER VIEW)")) }
+            try needRelOwner(st, txn, &ft.name, &"table")
             // a view keeps its query's text: names it reads may not change under it
             for a in s.alters {
                 if a.kind == lexdb_sql.A_RENAME || a.kind == lexdb_sql.A_RENAME_COL || a.kind == lexdb_sql.A_DROP_COL ||
@@ -6016,6 +6069,7 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             txn.del(CATALOG, t.name)
             let old = t.name
             t.name = key
+            try moveAcl(st, txn, &relObj(&old), &relObj(&key))
             try relink(st, txn, mut &t, &old)
             try ownerMoved(st, txn, mut &t, &old, &"", &"", &"")
             for ix in t.indexes { try txn.put(CATALOG, idxName(&ix.name), key) }
@@ -6121,7 +6175,16 @@ fn createSchemaStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb
         return Err(e("42P06", "schema \"" + s.table + "\" already exists"))
     }
     if strings.startsWith(s.table, "pg_") { return Err(e("42939", "unacceptable schema name \"" + s.table + "\"")) }
+    // a superuser's (PostgreSQL: the database's CREATE, its owner's); owned by AUTHORIZATION's role, or its maker
+    let w = try whoNow(st, txn)
+    if !w.super { return Err(e("42501", "permission denied for database lexdb")) }
+    var owner = currentRole(st, txn.sess)
+    if len(s.names) > 0 {
+        owner = roleName(st, txn, &s.names[0])
+        if !(try roleExists(st, txn, &owner)) { return Err(e("42704", "role \"" + owner + "\" does not exist")) }
+    }
     try txn.put(CATALOG, schemaKey(&s.table), "")
+    try writeAcl(txn, &nspObj(&s.table), &Acl{owner: owner, grants: [], set: false})
     try bumpCatalog(st, txn)
     return Ok(tagOnly("CREATE SCHEMA"))
 }
@@ -6134,6 +6197,7 @@ fn dropSchema(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         if s.ifFlag { return Ok(tagOnly("DROP SCHEMA")) }
         return Err(e("3F000", "schema \"" + s.table + "\" does not exist"))
     }
+    try needOwner(st, txn, &(try whoNow(st, txn)), &nspObj(&s.table), &"schema", &s.table)
     let from = lexdb_sql.qual(&s.table, &"")
     var keys: []str = []
     try st.scan(txn, CATALOG, from, from + "\xff", fn(en: &lexdb_store.Entry): bool {
@@ -6150,6 +6214,7 @@ fn dropSchema(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
                 if len(t.view) > 0 {
                     try dropDependentViews(st, txn, &t.name, true, &"view")
                     txn.del(CATALOG, t.name)
+                    dropAcl(txn, &relObj(&t.name))
                 } else {
                     var d = t
                     try dropDependentViews(st, txn, &d.name, true, &"table")
@@ -6162,6 +6227,7 @@ fn dropSchema(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
     }
     for d in try allSeqs(st, txn, &s.table) { try dropSeqRows(st, txn, &d) }
     txn.del(CATALOG, schemaKey(&s.table))
+    dropAcl(txn, &nspObj(&s.table))
     try bumpCatalog(st, txn)
     return Ok(tagOnly("DROP SCHEMA"))
 }
@@ -6170,6 +6236,7 @@ fn dropSchema(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
 // the same transaction.
 fn createIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
     var t = try needTable(st, txn, &s.table)
+    try needRelOwner(st, txn, &t.name, &"table")
     let ixKey = lexdb_sql.qual(&lexdb_sql.schemaOf(&t.name), &s.index)     // in its table's schema
     let exists = try relExists(st, txn, &ixKey)
     if exists {
@@ -6400,6 +6467,7 @@ fn dropIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.St
     match try st.get(txn, CATALOG, idxName(&ixKey)) {
         Some(tn) {
             var t = try needTable(st, txn, &tn)
+            try needRelOwner(st, txn, &t.name, &"index")
             for k in 0..len(t.indexes) {
                 if t.indexes[k].name == ixKey && t.indexes[k].con {
                     let n = lexdb_sql.baseName(&ixKey)
@@ -6452,6 +6520,7 @@ fn dupKey(t: &Table, row: &[]Val): DbErr {
 
 fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, lim: Limits): Result[Res, DbErr] {
     try notView(st, txn, &s.table, &"insert into")
+    try dmlCheck(st, txn, s, &"a")
     let sqe = seqEnv(st, txn)
     let t = try needTable(st, txn, &s.table)
     var targets: []int = []
@@ -6794,8 +6863,10 @@ fn storeRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, row: [
 
 fn update(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, lim: Limits): Result[Res, DbErr] {
     try notView(st, txn, &s.table, &"update")
+    try dmlCheck(st, txn, s, &"w")
     let sqe = seqEnv(st, txn)
     var sc = newScope(params, &[])
+    sc.target = try catKey(st, txn, &s.table, false)
     var q = try buildQuery(st, txn, &oneTable(&s.table), &s.where, params, &s.subs, mut &sc)
     var targets: []int = []
     var sets: []Expr = []
@@ -6848,7 +6919,9 @@ fn update(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
 
 fn delete(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, lim: Limits): Result[Res, DbErr] {
     try notView(st, txn, &s.table, &"delete from")
+    try dmlCheck(st, txn, s, &"d")
     var sc = newScope(params, &[])
+    sc.target = try catKey(st, txn, &s.table, false)
     var q = try buildQuery(st, txn, &oneTable(&s.table), &s.where, params, &s.subs, mut &sc)
     var ret = try retOf(s, &q, mut &sc)
     endScope(mut &sc, mut &q)
@@ -7046,6 +7119,7 @@ pub fn exprOid(x: &Expr, cols: &[]lexdb_sql.ColDef, ptypes: &[]int): int {
                     return lexdb_sql.OID_TEXT
                 }
                 "current_user", "session_user", "current_schema", "pg_encoding_to_char" { return lexdb_sql.OID_NAME }
+                "has_sequence_privilege", "has_any_column_privilege" { return lexdb_sql.OID_BOOL }
                 "pg_table_is_visible", "pg_type_is_visible", "pg_function_is_visible", "pg_collation_is_visible", "~", "!~", "~*",
                 "!~*", "has_table_privilege", "has_schema_privilege", "has_database_privilege", "pg_relation_is_publishable" {
                     return lexdb_sql.OID_BOOL
@@ -7212,6 +7286,15 @@ fn select(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     // sees is the same and the plan looked at no parameter's value.
     var ver = try catVersion(st, txn)
     if len(txn.path) > 0 { ver = ver + "|" + strings.join(&txn.path, ",") }      // its names resolved by the path
+    // its privileges checked as the role: SET ROLE plans it again (9.83)
+    match st.memoGet(&roleKeyOf(txn.sess)) {
+        Some(r) { if len(r) > 0 { ver = ver + "|r" + r } }
+        None {}
+    }
+    match st.memoGet(&sessAuthKey(txn.sess)) {
+        Some(r) { if len(r) > 0 { ver = ver + "|s" + r } }
+        None {}
+    }
     if len(pc.sels) == 0 || pc.ver != ver {
         pc.sels = []
         var sc = newScope(params, ptypes)
@@ -8665,6 +8748,7 @@ pub type Session = record {
     id: int                     // its number while the store is open (its sequences' currval: 9.43)
     batch: bool                 // SET lexdb_batch (9.47)
     saves: []SavePt             // the open block's savepoints, oldest first (9.80)
+    savedRoles: []str           // in a transaction block: SET ROLE's and SET SESSION AUTHORIZATION's at its BEGIN (9.83)
 }
 
 // A savepoint: its name and the block's writes when it was made.
@@ -8751,7 +8835,7 @@ pub fn newSession(st: lexdb_store.Store): Session {
     let id = num(&st.memoGet(&"sessions").unwrapOr("0")) + 1
     st.memoPut(&"sessions", &id.toStr())
     return Session{st: st, txn: [], failed: false, maxRecursion: MAX_RECURSION, timeoutMs: 0, maxMem: MAX_STATEMENT_MEM,
-                   saved: [], readOnly: false, path: [], pathAt: 0, savedPath: [], id: id, batch: true, saves: []}
+                   saved: [], readOnly: false, path: [], pathAt: 0, savedPath: [], id: id, batch: true, saves: [], savedRoles: []}
 }
 
 // max_statement_mem's default.
@@ -8759,6 +8843,12 @@ pub const MAX_STATEMENT_MEM = 256 * 1024 * 1024
 
 // A transaction block rolled back: its SETs with it (as PostgreSQL's).
 fn (s: mut &Session) restore() {
+    if len(s.savedRoles) > 0 {
+        let r = pop(mut &s.savedRoles)
+        let nl = strings.indexOf(&r, "\n", 0)
+        s.st.memoPut(&roleKeyOf(s.id), &r[0..nl])
+        s.st.memoPut(&sessAuthKey(s.id), &r[nl + 1..len(r)])
+    }
     if len(s.saved) == 0 { return }
     let l = pop(mut &s.saved)
     if len(s.savedPath) > 0 {
@@ -8827,7 +8917,8 @@ fn isWrite(kind: int): bool {
            kind == lexdb_sql.S_ALTER || kind == lexdb_sql.S_ALTER_INDEX || kind == lexdb_sql.S_ALTER_SCHEMA ||
            kind == lexdb_sql.S_CREATE_SEQ || kind == lexdb_sql.S_ALTER_SEQ || kind == lexdb_sql.S_DROP_SEQ ||
            kind == lexdb_sql.S_CREATE_ROLE || kind == lexdb_sql.S_ALTER_ROLE || kind == lexdb_sql.S_DROP_ROLE ||
-           kind == lexdb_sql.S_CREATE_VIEW || kind == lexdb_sql.S_DROP_VIEW || kind == lexdb_sql.S_ALTER_VIEW
+           kind == lexdb_sql.S_CREATE_VIEW || kind == lexdb_sql.S_DROP_VIEW || kind == lexdb_sql.S_ALTER_VIEW ||
+           kind == lexdb_sql.S_GRANT || kind == lexdb_sql.S_REVOKE || kind == lexdb_sql.S_OWNER
 }
 
 fn stmtName(kind: int): str {
@@ -8842,6 +8933,9 @@ fn stmtName(kind: int): str {
         lexdb_sql.S_DROP_SCHEMA { "DROP SCHEMA" }
         lexdb_sql.S_CREATE_ROLE { "CREATE ROLE" }
         lexdb_sql.S_CREATE_VIEW { "CREATE VIEW" }
+        lexdb_sql.S_GRANT { "GRANT" }
+        lexdb_sql.S_REVOKE { "REVOKE" }
+        lexdb_sql.S_OWNER { "ALTER" }
         lexdb_sql.S_DROP_VIEW { "DROP VIEW" }
         lexdb_sql.S_ALTER_VIEW { "ALTER VIEW" }
         lexdb_sql.S_ALTER_ROLE { "ALTER ROLE" }
@@ -8909,6 +9003,8 @@ fn execStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
         lexdb_sql.S_CREATE_SCHEMA { return createSchemaStmt(st, txn, s) }
         lexdb_sql.S_CREATE_ROLE, lexdb_sql.S_ALTER_ROLE, lexdb_sql.S_DROP_ROLE { return roleStmt(st, txn, s) }
         lexdb_sql.S_CREATE_VIEW { return createView(st, txn, s) }
+        lexdb_sql.S_GRANT, lexdb_sql.S_REVOKE { return grantStmt(st, txn, s) }
+        lexdb_sql.S_OWNER { return ownerStmt(st, txn, s) }
         lexdb_sql.S_DROP_VIEW { return dropView(st, txn, s) }
         lexdb_sql.S_ALTER_VIEW { return alterView(st, txn, s) }
         lexdb_sql.S_DROP_SCHEMA { return dropSchema(st, txn, s) }
@@ -8991,6 +9087,7 @@ fn (s: mut &Session) runIn(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int
         lexdb_sql.S_EMPTY { return Ok(tagOnly("")) }
         lexdb_sql.S_SHOW { return s.show(&stmt.table) }
         lexdb_sql.S_SET {
+            if stmt.table == "role" || stmt.table == "session_authorization" { return s.setRole(stmt) }
             if stmt.table == "search_path" {
                 if stmt.ifFlag || len(stmt.names) == 0 { s.setPath(&["public"]) } else { s.setPath(&stmt.names) }
                 return Ok(tagOnly(if stmt.ifFlag { "RESET" } else { "SET" }))
@@ -9051,6 +9148,7 @@ fn (s: mut &Session) runIn(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int
                 var p: []str = []
                 for n in s.path { append(mut &p, n) }
                 s.savedPath = [p]
+                s.savedRoles = [s.st.memoGet(&roleKeyOf(s.id)).unwrapOr("") + "\n" + s.st.memoGet(&sessAuthKey(s.id)).unwrapOr("")]
                 var q: []str = []
                 for n in s.path { append(mut &q, n) }
                 s.txn[0].path = q
@@ -9070,6 +9168,7 @@ fn (s: mut &Session) runIn(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int
             }
             s.saved = []
             s.savedPath = []
+            s.savedRoles = []
             try s.st.commit(t)
             return Ok(tagOnly("COMMIT"))
         }
@@ -10188,6 +10287,13 @@ fn bindSeqs(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, names: &[]str): R
             continue
         }
         let d = try needSeq(st, txn, &nameOfText(&n))
+        // nextval, setval: USAGE or UPDATE; currval: USAGE or SELECT (9.83: checked
+        // for the sequences a statement names, not a column's own)
+        let w = try whoNow(st, txn)
+        if !w.super {
+            let a = try readAcl(st, txn, &relObj(&d.key))
+            if !allows(&w, &a, &"U") && !allows(&w, &a, &"w") && !allows(&w, &a, &"r") { return Err(denied(&"sequence", &d.key)) }
+        }
         st.memoPut(&bindKey(txn.sess, &n), &(no.toStr() + "\n" + encSeq(&d)))
     }
     return Ok(Unit{})
@@ -10368,6 +10474,8 @@ fn createSeq(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.St
         if s.ifFlag { return Ok(tagOnly("CREATE SEQUENCE")) }
         return Err(e("42P07", "relation \"" + lexdb_sql.baseName(&key) + "\" already exists"))
     }
+    try needCreate(st, txn, &key)
+    try ownNew(st, txn, &relObj(&key))
     var d = try newSeq(st, txn, &key, lexdb_sql.OID_INT8, &s.seq)
     if len(s.seq.owned) == 2 && len(s.seq.owned[0]) > 0 {
         try ownSeq(st, txn, mut &d, &s.seq.owned)
@@ -10404,6 +10512,7 @@ fn alterSeq(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
         return Err(e("42P01", "relation \"" + lexdb_sql.shown(&s.table) + "\" does not exist"))
     }
     let old = found.unwrap()
+    try needRelOwner(st, txn, &old.key, &"sequence")
     var d = try seqFrom(&s.seq, &old, false)
     if len(s.seq.owned) == 2 { try ownSeq(st, txn, mut &d, &s.seq.owned) }
     try txn.put(CATALOG, seqRow(&d.key), encSeq(&d))
@@ -10418,6 +10527,7 @@ fn alterSeq(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
 // Sequence d's rows deleted (its definition and last value).
 fn dropSeqRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, d: &Seq): Result[Unit, DbErr] {
     txn.del(CATALOG, seqRow(&d.key))
+    dropAcl(txn, &relObj(&d.key))
     txn.del(try seqTree(st, txn), d.id)
     return Ok(Unit{})
 }
@@ -10431,6 +10541,7 @@ fn dropSeq(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
         return Err(e("42P01", "sequence \"" + lexdb_sql.shown(&s.table) + "\" does not exist"))
     }
     let d = found.unwrap()
+    try needRelOwner(st, txn, &d.key, &"sequence")
     if len(d.ownerT) > 0 {
         match try byKeyOpt(st, txn, &d.ownerT) {
             Some(t) {
@@ -10551,6 +10662,7 @@ fn copyStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
             lim: Limits, pc: mut &PlanCache, input: &CopyInput): Result[Res, DbErr] {
     if !s.copy.from { return copyOut(st, txn, s, params, ptypes, lim, pc) }
     let t = try needTable(st, txn, &s.table)
+    try needRel(st, txn, &(try whoNow(st, txn)), &t.name, &"a", &"table")
     var targets: []int = []
     var names: []str = []
     if len(s.names) == 0 {
@@ -13269,6 +13381,7 @@ type CatCon = record {
 }
 
 type CatSnap = record {
+    acls: Map[str, str]     // owners and grants, by object, encoded (9.83)
     tabs: []CatTab
     views: []CatTab         // views (9.82): t.view their text, t.cols their columns
     cons: []CatCon
@@ -13427,8 +13540,16 @@ fn catSnap(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[CatSnap, D
         append(mut &raw, en.val)
         return true
     })
-    var snap = CatSnap{tabs: [], views: [], cons: [], seqs: try allSeqs(st, txn, &""), schemas: schemas, path: copyStrs(&txn.path),
+    var snap = CatSnap{acls: newMap(), tabs: [], views: [], cons: [], seqs: try allSeqs(st, txn, &""), schemas: schemas, path: copyStrs(&txn.path),
                        user: st.memoGet(&userKey(txn.sess)).unwrapOr("lexdb")}
+    var aclKeys: []str = []
+    var aclVals: []str = []
+    try st.scan(txn, CATALOG, ACL_PRE, ACL_PRE + "\xff", fn(en: &lexdb_store.Entry): bool {
+        append(mut &aclKeys, en.key[len(ACL_PRE)..len(en.key)].toStr())
+        append(mut &aclVals, en.val)
+        return true
+    })
+    for i in 0..len(aclKeys) { snap.acls.put(aclKeys[i], aclVals[i]) }
     for i in 0..len(keys) {
         let t = try decTable(&keys[i], &raw[i])
         let schema = lexdb_sql.schemaOf(&keys[i])
@@ -13540,7 +13661,22 @@ fn clean(s: &str): str { return strings.replaceAll(strings.replaceAll(s, "\t", "
 fn bindCatalog(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[Unit, DbErr] {
     let snap = try catSnap(st, txn)
     var b = newStrBuf()
-    b.add("u\t" + snap.user + "\n")
+    b.add("u\t" + currentRole(st, txn.sess) + "\n")
+    b.add("U\t" + sessionUser(st, txn.sess) + "\n")
+    // the roles: OID, name, superuser, the roles each acts as; and every owner and grant (9.83)
+    for r in try rolesIn(st, txn) {
+        let w = try whoIs(st, txn, &r.name)
+        b.add("R\t" + catOid(&"a", &r.name).toStr() + "\t" + r.name + "\t" + (if w.super { "1" } else { "0" }) + "\t" +
+              strings.join(&w.roles, "\x1e") + "\n")
+    }
+    var aks: []str = []
+    var avs: []str = []
+    try st.scan(txn, CATALOG, ACL_PRE, ACL_PRE + "\xff", fn(en: &lexdb_store.Entry): bool {
+        append(mut &aks, en.key[len(ACL_PRE)..len(en.key)].toStr())
+        append(mut &avs, strings.replaceAll(strings.replaceAll(en.val, "\n", "\x1e"), "\t", "\x1d"))
+        return true
+    })
+    for i in 0..len(aks) { b.add("A\t" + aks[i] + "\t" + avs[i] + "\n") }
     let cur = if len(snap.path) == 0 { "public" } else { snap.path[0] }
     b.add("p\t" + cur + "\n")
     for ct in snap.tabs {
@@ -13955,13 +14091,27 @@ fn callMisc(name: &str, vs: &[]Val): Result[Option[Val], DbErr] {
 // The functions that read the bound catalog: None if name is none of them.
 fn callCat(name: &str, vs: &[]Val, se: &SeqEnv): Result[Option[Val], DbErr] {
     let n = len(vs)
-    if name == "current_user" || name == "session_user" { return Ok(Some(Val.Text(catUser(se)))) }
+    if name == "current_user" { return Ok(Some(Val.Text(catUser(se)))) }
+    if name == "session_user" {
+        for l in catLines(se, &"U") { return Ok(Some(Val.Text(l[0]))) }
+        return Ok(Some(Val.Text(catUser(se))))
+    }
     if name == "current_schema" && n == 0 {
         for l in catLines(se, &"p") { return Ok(Some(Val.Text(l[0]))) }
         return Ok(Some(Val.Text("public")))
     }
-    if name == "pg_get_userbyid" && n == 1 { return Ok(Some(if isNull(&vs[0]) { Val.Null } else { Val.Text(catUser(se)) })) }
-    if (name == "has_table_privilege" || name == "has_schema_privilege" || name == "has_database_privilege") { return Ok(Some(Val.Bool(true))) }
+    if name == "pg_get_userbyid" && n == 1 {
+        if isNull(&vs[0]) { return Ok(Some(Val.Null)) }
+        let o = oidArg(&vs[0]).unwrapOr(0).toStr()
+        for l in catLines(se, &"R") { if l[0] == o { return Ok(Some(Val.Text(l[1]))) } }
+        for l in catLines(se, &"U") { return Ok(Some(Val.Text(l[0]))) }
+        return Ok(Some(Val.Text(catUser(se))))
+    }
+    if name == "has_database_privilege" { return Ok(Some(Val.Bool(true))) }
+    if name == "has_table_privilege" || name == "has_schema_privilege" || name == "has_sequence_privilege" || name == "has_any_column_privilege" {
+        for v in vs { if isNull(&v) { return Ok(Some(Val.Null)) } }
+        return Ok(Some(try hasPrivFn(se, name, vs)))
+    }
     if name == "pg_relation_is_publishable" { return Ok(Some(Val.Bool(false))) }
     if (name == "pg_relation_size" || name == "pg_total_relation_size" || name == "pg_table_size" || name == "pg_indexes_size") {
         return Ok(Some(Val.Int(0)))
@@ -14103,20 +14253,25 @@ fn catRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &str): Result
     var rows: [][]Val = []
     let db = "lexdb"
     let owner = snap.user
+    let roles = try rolesIn(st, txn)
     match rel {
         "pg_namespace" {
             append(mut &rows, [iv(OID_PG_CATALOG), tv(&"pg_catalog"), iv(OID_OWNER), Val.Null])
             append(mut &rows, [iv(OID_INFO_SCHEMA), tv(&"information_schema"), iv(OID_OWNER), Val.Null])
-            for s in snap.schemas { append(mut &rows, [iv(nspOid(&s)), tv(&s), iv(OID_OWNER), Val.Null]) }
+            for s in snap.schemas {
+                let na = aclOf(&snap, &nspObj(&s))
+                append(mut &rows, [iv(nspOid(&s)), tv(&s), iv(roleOid(&ownerName(&snap, &na), &roles)), aclText(&snap, &na, &"UC")])
+            }
         }
         "pg_class" {
             for ct in snap.tabs {
                 let hasIdx = len(ct.idxs) > 0
                 let trig = len(ct.t.fks) > 0 || len(ct.t.refBy) > 0
-                append(mut &rows, [iv(ct.oid), tv(&ct.name), iv(nspOid(&ct.schema)), iv(0), iv(0), iv(OID_OWNER), iv(2), iv(ct.oid), iv(0),
+                let ta = aclOf(&snap, &relObj(&ct.key))
+                append(mut &rows, [iv(ct.oid), tv(&ct.name), iv(nspOid(&ct.schema)), iv(0), iv(0), iv(roleOid(&ownerName(&snap, &ta), &roles)), iv(2), iv(ct.oid), iv(0),
                                    iv(0), Val.Real(-1.0f), iv(0), iv(0), bv(hasIdx), bv(false), tv(&"p"), tv(&"r"), iv(len(ct.t.cols)),
                                    iv(len(ct.t.checks)), bv(false), bv(trig), bv(false), bv(false), bv(false), bv(true), tv(&"d"),
-                                   bv(false), iv(0), iv(0), iv(0), Val.Null, Val.Null, Val.Null])
+                                   bv(false), iv(0), iv(0), iv(0), aclText(&snap, &ta, &"arwdDxt"), Val.Null, Val.Null])
                 for ix in ct.idxs {
                     append(mut &rows, [iv(ix.oid), tv(&ix.name), iv(nspOid(&ct.schema)), iv(0), iv(0), iv(OID_OWNER), iv(403), iv(ix.oid),
                                        iv(0), iv(0), Val.Real(0.0f), iv(0), iv(0), bv(false), bv(false), tv(&"p"), tv(&"i"), iv(len(ix.cols)),
@@ -14125,17 +14280,19 @@ fn catRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &str): Result
                 }
             }
             for v in snap.views {
-                append(mut &rows, [iv(v.oid), tv(&v.name), iv(nspOid(&v.schema)), iv(0), iv(0), iv(OID_OWNER), iv(0), iv(0), iv(0),
+                let va = aclOf(&snap, &relObj(&v.key))
+                append(mut &rows, [iv(v.oid), tv(&v.name), iv(nspOid(&v.schema)), iv(0), iv(0), iv(roleOid(&ownerName(&snap, &va), &roles)), iv(0), iv(0), iv(0),
                                    iv(0), Val.Real(-1.0f), iv(0), iv(0), bv(false), bv(false), tv(&"p"), tv(&"v"), iv(len(v.t.cols)),
                                    iv(0), bv(true), bv(false), bv(false), bv(false), bv(false), bv(true), tv(&"n"),
-                                   bv(false), iv(0), iv(0), iv(0), Val.Null, Val.Null, Val.Null])
+                                   bv(false), iv(0), iv(0), iv(0), aclText(&snap, &va, &"arwdDxt"), Val.Null, Val.Null])
             }
             for d in snap.seqs {
                 let sc = lexdb_sql.schemaOf(&d.key)
-                append(mut &rows, [iv(seqOid(&d)), tv(&lexdb_sql.baseName(&d.key)), iv(nspOid(&sc)), iv(0), iv(0), iv(OID_OWNER), iv(0),
+                let sa = aclOf(&snap, &relObj(&d.key))
+                append(mut &rows, [iv(seqOid(&d)), tv(&lexdb_sql.baseName(&d.key)), iv(nspOid(&sc)), iv(0), iv(0), iv(roleOid(&ownerName(&snap, &sa), &roles)), iv(0),
                                    iv(seqOid(&d)), iv(0), iv(1), Val.Real(1.0f), iv(0), iv(0), bv(false), bv(false), tv(&"p"), tv(&"S"),
                                    iv(3), iv(0), bv(false), bv(false), bv(false), bv(false), bv(false), bv(true), tv(&"n"), bv(false),
-                                   iv(0), iv(0), iv(0), Val.Null, Val.Null, Val.Null])
+                                   iv(0), iv(0), iv(0), aclText(&snap, &sa, &"rwU"), Val.Null, Val.Null])
             }
             for r in lexdb_pgcat.relNames() {
                 let dot = strings.indexOf(&r, ".", 0)
@@ -14259,10 +14416,11 @@ fn catRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &str): Result
         "pg_roles", "pg_user" {
             var rs = try rolesIn(st, txn)
             var seen = false
+            let sessUser = sessionUser(st, txn.sess)
             for r in rs { if r.name == owner { seen = true } }
             if !seen { append(mut &rs, Role{name: owner, login: true, superuser: true, verifier: ""}) }
             for r in rs {
-                let o = if r.name == owner { OID_OWNER } else { catOid(&"a", &r.name) }
+                let o = roleOid(&r.name, &roles)
                 let pw = if len(r.verifier) > 0 { tv(&"********") } else { Val.Null }
                 if rel == "pg_roles" {
                     append(mut &rows, [tv(&r.name), bv(r.superuser), bv(true), bv(r.superuser), bv(r.superuser), bv(r.login), bv(false),
@@ -14274,7 +14432,7 @@ fn catRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &str): Result
         }
         "pg_tables" {
             for ct in snap.tabs {
-                append(mut &rows, [tv(&ct.schema), tv(&ct.name), tv(&owner), Val.Null, bv(len(ct.idxs) > 0), bv(false),
+                append(mut &rows, [tv(&ct.schema), tv(&ct.name), tv(&ownerName(&snap, &aclOf(&snap, &relObj(&ct.key)))), Val.Null, bv(len(ct.idxs) > 0), bv(false),
                                    bv(len(ct.t.fks) > 0 || len(ct.t.refBy) > 0), bv(false)])
             }
         }
@@ -14306,6 +14464,37 @@ fn catRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &str): Result
                                    tv(&"NO"), tv(&"NO"), Val.Null])
             }
         }
+        "pg_auth_members" {
+            var mems: []str = []
+            try st.scan(txn, CATALOG, MEM_PRE, MEM_PRE + "\xff", fn(en: &lexdb_store.Entry): bool {
+                append(mut &mems, en.key[len(MEM_PRE)..len(en.key)].toStr())
+                return true
+            })
+            for pr in mems {
+                let z = strings.indexOf(&pr, "\x00", 0)
+                append(mut &rows, [iv(catOid(&"m", &pr)), iv(roleOid(&pr[0..z], &roles)), iv(roleOid(&pr[z + 1..len(pr)], &roles)), iv(OID_OWNER),
+                                   bv(false), bv(true), bv(true)])
+            }
+        }
+        "information_schema.table_privileges" {
+            // each grant, the owner's own included, as privilege names
+            for which in 0..2 {
+                for ct in (if which == 0 { &snap.tabs } else { &snap.views }) {
+                    let a = aclOf(&snap, &relObj(&ct.key))
+                    let o = ownerName(&snap, &a)
+                    var gs: []Grant = [Grant{to: o, privs: "arwdDxt"}]
+                    if a.set { for g in a.grants { if g.to != o { append(mut &gs, Grant{to: g.to, privs: g.privs}) } } }
+                    for g in gs {
+                        for k in 0..len(g.privs) {
+                            let pn = privName(&g.privs[k..k + 1])
+                            if len(pn) == 0 { continue }
+                            append(mut &rows, [tv(&o), tv(&(if len(g.to) > 0 { g.to } else { "PUBLIC" })), tv(&db), tv(&ct.schema), tv(&ct.name), tv(&pn),
+                                               tv(&(if g.to == o { "YES" } else { "NO" })), tv(&(if pn == "SELECT" { "YES" } else { "NO" }))])
+                        }
+                    }
+                }
+            }
+        }
         "information_schema.views" {
             for v in snap.views {
                 append(mut &rows, [tv(&db), tv(&v.schema), tv(&v.name), tv(&(v.t.view + ";")), tv(&"NONE"), tv(&"NO"), tv(&"NO"),
@@ -14313,7 +14502,7 @@ fn catRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &str): Result
             }
         }
         "pg_views" {
-            for v in snap.views { append(mut &rows, [tv(&v.schema), tv(&v.name), tv(&owner), tv(&(v.t.view + ";"))]) }
+            for v in snap.views { append(mut &rows, [tv(&v.schema), tv(&v.name), tv(&ownerName(&snap, &aclOf(&snap, &relObj(&v.key)))), tv(&(v.t.view + ";"))]) }
         }
         "information_schema.columns" {
             for which in 0..2 {
@@ -14530,7 +14719,7 @@ fn applyRoleOpts(r: mut &Role, opts: &[]str): Result[Unit, DbErr] {
 // CREATE ROLE, ALTER ROLE, DROP ROLE. Who may: a superuser role, or a
 // session that is no role (trust); a role may change its own password.
 fn roleStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
-    let me = st.memoGet(&userKey(txn.sess)).unwrapOr("")
+    let me = currentRole(st, txn.sess)
     let all = try rolesIn(st, txn)
     var mine = false
     var su = true
@@ -14543,6 +14732,7 @@ fn roleStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
     let ownPassword = s.kind == lexdb_sql.S_ALTER_ROLE && s.table == me && mine && len(s.names) > 0 &&
                       (strings.startsWith(&s.names[0], "password") && len(s.names) == 1)
     if !su && !ownPassword { return Err(e("42501", "permission denied to " + (if s.kind == lexdb_sql.S_CREATE_ROLE { "create" } else if s.kind == lexdb_sql.S_DROP_ROLE { "drop" } else { "alter" }) + " role")) }
+    try bumpCatalog(st, txn)
     if s.kind == lexdb_sql.S_DROP_ROLE {
         for c in s.cols {
             let had = (try st.get(txn, CATALOG, roleKey(&c.name))).isSome()
@@ -14551,6 +14741,12 @@ fn roleStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
                 return Err(e("42704", "role \"" + c.name + "\" does not exist"))
             }
             if c.name == me { return Err(e("55006", "current user cannot be dropped")) }
+            // what it owns stays: refused; its grants and memberships go with it
+            let owned = try renameInAcls(st, txn, &c.name, &"", true)
+            if len(owned) > 0 {
+                return Err(e("2BP01", "role \"" + c.name + "\" cannot be dropped because some objects depend on it (it owns " + owned + ")"))
+            }
+            let x = try renameInAcls(st, txn, &c.name, &"", false)
             txn.del(CATALOG, roleKey(&c.name))
         }
         return Ok(tagOnly("DROP ROLE"))
@@ -14576,6 +14772,7 @@ fn roleStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
         txn.del(CATALOG, k)
         r.name = to.toStr()
         try txn.put(CATALOG, roleKey(&to), encRole(&r))
+        let x = try renameInAcls(st, txn, &s.table, &to, false)
         return Ok(tagOnly("ALTER ROLE"))
     }
     try applyRoleOpts(mut &r, &s.names)
@@ -14734,7 +14931,10 @@ fn dropDependentViews(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, k: &str
     if !cascade {
         return Err(e("2BP01", "cannot drop " + kind + " " + lexdb_sql.shown(k) + " because other objects depend on it"))
     }
-    for d in deps { txn.del(CATALOG, d) }
+    for d in deps {
+        txn.del(CATALOG, d)
+        dropAcl(txn, &relObj(&d))
+    }
     return Ok(Unit{})
 }
 
@@ -14760,6 +14960,9 @@ fn createView(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         if !isView { return Err(e(if s.ifFlag { "42809" } else { "42P07" }, if s.ifFlag { "\"" + base + "\" is not a view" } else { "relation \"" + base + "\" already exists" })) }
         if !s.ifFlag { return Err(e("42P07", "relation \"" + base + "\" already exists")) }
         old = Some(decView(key, &have.unwrap()))
+        try needRelOwner(st, txn, &key, &"view")
+    } else {
+        try needCreate(st, txn, &key)
     }
     // the query planned: its columns, and the relations it reads
     var q = try viewQuery(&decView(key, &encView(&[], &s.index, &[])))
@@ -14795,6 +14998,7 @@ fn createView(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         None {}
     }
     try txn.put(CATALOG, key, encView(&cols, &s.index, &deps))
+    if old.isNone() { try ownNew(st, txn, &relObj(&key)) }
     try bumpCatalog(st, txn)
     return Ok(tagOnly("CREATE VIEW"))
 }
@@ -14804,8 +15008,10 @@ fn dropView(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
         match try findTable(st, txn, &c.name) {
             Some(t) {
                 if len(t.view) == 0 { return Err(e("42809", "\"" + lexdb_sql.shown(&c.name) + "\" is not a view (use DROP TABLE)")) }
+                try needRelOwner(st, txn, &t.name, &"view")
                 try dropDependentViews(st, txn, &t.name, s.cascade, &"view")
                 txn.del(CATALOG, t.name)
+                dropAcl(txn, &relObj(&t.name))
             }
             None {
                 if !s.ifFlag { return Err(e("42P01", "view \"" + lexdb_sql.shown(&c.name) + "\" does not exist")) }
@@ -14825,6 +15031,7 @@ fn alterView(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.St
     }
     let t = found.unwrap()
     if len(t.view) == 0 { return Err(e("42809", "\"" + lexdb_sql.shown(&s.table) + "\" is not a view")) }
+    try needRelOwner(st, txn, &t.name, &"view")
     let deps = try dependentViews(st, txn, &t.name)
     if len(deps) > 0 {
         return Err(e("2BP01", "cannot rename view " + lexdb_sql.shown(&t.name) + " because view " + lexdb_sql.shown(&deps[0]) +
@@ -14835,6 +15042,627 @@ fn alterView(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.St
     let v = (try st.get(txn, CATALOG, t.name)).unwrap()
     txn.del(CATALOG, t.name)
     try txn.put(CATALOG, to, v)
+    try moveAcl(st, txn, &relObj(&t.name), &relObj(&to))
     try bumpCatalog(st, txn)
     return Ok(tagOnly("ALTER VIEW"))
+}
+
+// ---- privileges (9.83)
+//
+// Owners and privileges as PostgreSQL's: an object's owner may do anything
+// with it; others what was granted to them, to a role they are a member of
+// (transitively), or to PUBLIC. A role that is a superuser, and a session
+// whose user is no role (it came in by trust), are not checked. The facts
+// are catalog rows of their own: ACL_PRE and an object ("r:" a relation's
+// catalog key, "n:" a schema) holds its owner and grants; MEM_PRE, a role
+// and a member, a membership. Privileges are letters, as in PostgreSQL's
+// aclitem: r SELECT, a INSERT, w UPDATE, d DELETE, x REFERENCES, t TRIGGER,
+// U USAGE, C CREATE.
+
+const ACL_PRE: str = "\x02acl\x00"
+const MEM_PRE: str = "\x02mem\x00"
+
+fn relObj(k: &str): str { return "r:" + k }
+fn nspObj(n: &str): str { return "n:" + n }
+
+type Grant = record { to: str; privs: str }
+
+type Acl = record {
+    owner: str              // "" unknown: made before privileges, or by no role
+    grants: []Grant         // "" PUBLIC
+    set: bool               // grants were given: relacl is not NULL
+}
+
+fn encAcl(a: &Acl): str {
+    var b = newStrBuf()
+    b.add(a.owner)
+    b.add(if a.set { "\n1" } else { "\n0" })
+    for g in a.grants {
+        b.addByte('\n')
+        b.add(g.to)
+        b.addByte('\t')
+        b.add(g.privs)
+    }
+    return b.toStr()
+}
+
+// The privileges an object has without a GRANT: the schema public's USAGE
+// for PUBLIC (PostgreSQL 15 on: not CREATE).
+fn defaultGrants(obj: &str): []Grant {
+    if obj == "n:public" { return [Grant{to: "", privs: "U"}] }
+    return []
+}
+
+fn readAcl(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, obj: &str): Result[Acl, DbErr] {
+    match try st.get(txn, CATALOG, ACL_PRE + obj) {
+        Some(v) { return Ok(decAcl(obj, &v)) }
+        None { return Ok(Acl{owner: "", grants: defaultGrants(obj), set: false}) }
+    }
+}
+
+fn decAcl(obj: &str, v: &str): Acl {
+    let ls = strings.split(v, "\n")
+    var a = Acl{owner: ls[0].toStr(), grants: [], set: len(ls) > 1 && ls[1] == "1"}
+    for i in 2..len(ls) {
+        let tb = strings.indexOf(&ls[i], "\t", 0)
+        if tb >= 0 { append(mut &a.grants, Grant{to: ls[i][0..tb].toStr(), privs: ls[i][tb + 1..len(ls[i])].toStr()}) }
+    }
+    if !a.set { a.grants = defaultGrants(obj) }
+    return a
+}
+
+fn writeAcl(txn: mut &lexdb_store.Txn, obj: &str, a: &Acl): Result[Unit, DbErr] {
+    try txn.put(CATALOG, ACL_PRE + obj, encAcl(a))
+    return Ok(Unit{})
+}
+
+fn dropAcl(txn: mut &lexdb_store.Txn, obj: &str) { txn.del(CATALOG, ACL_PRE + obj) }
+
+fn moveAcl(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &str, to: &str): Result[Unit, DbErr] {
+    match try st.get(txn, CATALOG, ACL_PRE + from) {
+        Some(v) {
+            txn.del(CATALOG, ACL_PRE + from)
+            try txn.put(CATALOG, ACL_PRE + to, v)
+        }
+        None {}
+    }
+    return Ok(Unit{})
+}
+
+// A new object's owner: the session's current role.
+fn ownNew(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, obj: &str): Result[Unit, DbErr] {
+    return writeAcl(txn, obj, &Acl{owner: currentRole(st, txn.sess), grants: [], set: false})
+}
+
+fn roleKeyOf(sess: int): str { return "\x00role\x00" + sess.toStr() }
+fn sessAuthKey(sess: int): str { return "\x00sessauth\x00" + sess.toStr() }
+
+// The session's user as SET SESSION AUTHORIZATION made it, else its login's.
+fn sessionUser(st: &lexdb_store.Store, sess: int): str {
+    match st.memoGet(&sessAuthKey(sess)) {
+        Some(u) { if len(u) > 0 { return u } }
+        None {}
+    }
+    return st.memoGet(&userKey(sess)).unwrapOr("lexdb")
+}
+
+// The role privileges are checked as: SET ROLE's, else the session user.
+fn currentRole(st: &lexdb_store.Store, sess: int): str {
+    match st.memoGet(&roleKeyOf(sess)) {
+        Some(r) { if len(r) > 0 { return r } }
+        None {}
+    }
+    return sessionUser(st, sess)
+}
+
+// Who a role is, for checks: whether it is a superuser (or no role: a
+// trusted session's user), and the roles it acts as: itself, the roles it is
+// a member of, PUBLIC ("").
+pub type Who = record { name: str; super: bool; roles: []str }
+
+fn hasStr(xs: &[]str, x: &str): bool {
+    for y in xs { if y == x { return true } }
+    return false
+}
+
+fn whoIs(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, name: &str): Result[Who, DbErr] {
+    match try st.get(txn, CATALOG, roleKey(name)) {
+        Some(v) {
+            let r = decRole(name, &v)
+            var w = Who{name: name.toStr(), super: r.superuser, roles: [name.toStr(), ""]}
+            if w.super { return Ok(w) }
+            // memberships: role, member pairs, followed from name up
+            var pairs: []str = []
+            try st.scan(txn, CATALOG, MEM_PRE, MEM_PRE + "\xff", fn(en: &lexdb_store.Entry): bool {
+                append(mut &pairs, en.key[len(MEM_PRE)..len(en.key)].toStr())
+                return true
+            })
+            var todo: []str = [name.toStr()]
+            while len(todo) > 0 {
+                let m = pop(mut &todo)
+                for pr in pairs {
+                    let z = strings.indexOf(&pr, "\x00", 0)
+                    let role = pr[0..z].toStr()
+                    if pr[z + 1..len(pr)] == m && !hasStr(&w.roles, &role) {
+                        append(mut &w.roles, role)
+                        append(mut &todo, role)
+                    }
+                }
+            }
+            return Ok(w)
+        }
+        None { return Ok(Who{name: name.toStr(), super: true, roles: [name.toStr(), ""]}) }
+    }
+}
+
+fn whoNow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[Who, DbErr] { return whoIs(st, txn, &currentRole(st, txn.sess)) }
+
+fn allows(w: &Who, a: &Acl, letter: &str): bool {
+    if w.super { return true }
+    if len(a.owner) > 0 && hasStr(&w.roles, &a.owner) { return true }
+    for g in a.grants { if hasStr(&w.roles, &g.to) && strings.contains(&g.privs, letter) { return true } }
+    return false
+}
+
+fn may(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, w: &Who, obj: &str, letter: &str): Result[bool, DbErr] {
+    if w.super { return Ok(true) }
+    return Ok(allows(w, &(try readAcl(st, txn, obj)), letter))
+}
+
+fn denied(kind: &str, name: &str): DbErr { return e("42501", "permission denied for " + kind + " " + lexdb_sql.baseName(name)) }
+
+// A relation's privilege (and its schema's USAGE): 42501 without them.
+fn needRel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, w: &Who, key: &str, letter: &str, kind: &str): Result[Unit, DbErr] {
+    if w.super { return Ok(Unit{}) }
+    let sc = lexdb_sql.schemaOf(key)
+    if !(try may(st, txn, w, &nspObj(&sc), &"U")) { return Err(denied(&"schema", &sc)) }
+    if !(try may(st, txn, w, &relObj(key), letter)) { return Err(denied(kind, key)) }
+    return Ok(Unit{})
+}
+
+fn needOwner(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, w: &Who, obj: &str, kind: &str, name: &str): Result[Unit, DbErr] {
+    if w.super { return Ok(Unit{}) }
+    let a = try readAcl(st, txn, obj)
+    if len(a.owner) > 0 && hasStr(&w.roles, &a.owner) { return Ok(Unit{}) }
+    return Err(e("42501", "must be owner of " + kind + " " + lexdb_sql.baseName(name)))
+}
+
+// CREATE in a schema.
+fn needCreate(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, key: &str): Result[Unit, DbErr] {
+    let w = try whoNow(st, txn)
+    let sc = lexdb_sql.schemaOf(key)
+    if !(try may(st, txn, &w, &nspObj(&sc), &"C")) { return Err(denied(&"schema", &sc)) }
+    return Ok(Unit{})
+}
+
+// The owner check for a relation's DDL (ALTER, DROP, CREATE INDEX on it).
+fn needRelOwner(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, key: &str, kind: &str): Result[Unit, DbErr] {
+    let w = try whoNow(st, txn)
+    return needOwner(st, txn, &w, &relObj(key), kind, key)
+}
+
+// The letters a privilege name stands for on an object of a kind
+// (table, sequence, schema); "" if it is not one of them.
+fn privLetters(name: &str, kind: &str): str {
+    if kind == "schema" {
+        return match name { "usage" { "U" } "create" { "C" } "all" { "UC" } else { "" } }
+    }
+    if kind == "sequence" {
+        return match name { "select" { "r" } "update" { "w" } "usage" { "U" } "all" { "rwU" } else { "" } }
+    }
+    return match name {
+        "select" { "r" }
+        "insert" { "a" }
+        "update" { "w" }
+        "delete" { "d" }
+        "references" { "x" }
+        "trigger" { "t" }
+        "truncate" { "D" }
+        "maintain" { "" }
+        "all" { "arwdDxt" }
+        else { "" }
+    }
+}
+
+fn addLetters(have: &str, more: &str): str {
+    var out = have.toStr()
+    for i in 0..len(more) { if !strings.contains(&out, &more[i..i + 1]) { out = out + more[i..i + 1] } }
+    // in PostgreSQL's order
+    var sorted = ""
+    for c in ["a", "r", "w", "d", "D", "x", "t", "U", "C"] { if strings.contains(&out, &c) { sorted = sorted + c } }
+    return sorted
+}
+
+fn dropLetters(have: &str, gone: &str): str {
+    var out = ""
+    for i in 0..len(have) { if !strings.contains(gone, &have[i..i + 1]) { out = out + have[i..i + 1] } }
+    return out
+}
+
+// A role spec's name: CURRENT_USER and SESSION_USER resolved.
+fn roleName(st: &lexdb_store.Store, txn: &lexdb_store.Txn, r: &str): str {
+    if r == "#current_user" { return currentRole(st, txn.sess) }
+    if r == "#session_user" { return sessionUser(st, txn.sess) }
+    return r.toStr()
+}
+
+fn roleExists(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, r: &str): Result[bool, DbErr] {
+    return Ok((try st.get(txn, CATALOG, roleKey(r))).isSome())
+}
+
+// The objects a GRANT or REVOKE names: (object, kind word, name) for each.
+type Target = record { obj: str; kind: str; name: str }
+
+fn grantTargets(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[[]Target, DbErr] {
+    var out: []Target = []
+    for c in s.cols {
+        if s.index == "schema" {
+            if !(try schemaExists(st, txn, &c.name)) { return Err(e("3F000", "schema \"" + c.name + "\" does not exist")) }
+            append(mut &out, Target{obj: nspObj(&c.name), kind: "schema", name: c.name})
+        } else if s.index == "all tables" || s.index == "all sequences" {
+            if !(try schemaExists(st, txn, &c.name)) { return Err(e("3F000", "schema \"" + c.name + "\" does not exist")) }
+            if s.index == "all tables" {
+                // its tables and views, as they are now
+                let from = lexdb_sql.qual(&c.name, &"")
+                var keys: []str = []
+                try st.scan(txn, CATALOG, if c.name == "public" { "\x06" } else { from }, if c.name == "public" { "" } else { from + "\xff" },
+                            fn(en: &lexdb_store.Entry): bool {
+                    if lexdb_sql.schemaOf(&en.key) == c.name { append(mut &keys, en.key) }
+                    return true
+                })
+                for k in keys { append(mut &out, Target{obj: relObj(&k), kind: "table", name: k}) }
+            } else {
+                for d in try allSeqs(st, txn, &(if c.name == "public" { "" } else { c.name })) {
+                    if lexdb_sql.schemaOf(&d.key) == c.name { append(mut &out, Target{obj: relObj(&d.key), kind: "sequence", name: d.key}) }
+                }
+            }
+        } else if s.index == "sequence" {
+            match try findSeq(st, txn, &c.name) {
+                Some(d) { append(mut &out, Target{obj: relObj(&d.key), kind: "sequence", name: d.key}) }
+                None { return Err(e("42P01", "relation \"" + lexdb_sql.shown(&c.name) + "\" does not exist")) }
+            }
+        } else {
+            // a table or a view; a sequence named as a table is one too, as in PostgreSQL
+            match try findTable(st, txn, &c.name) {
+                Some(t) { append(mut &out, Target{obj: relObj(&t.name), kind: if len(t.view) > 0 { "view" } else { "table" }, name: t.name}) }
+                None {
+                    match try findSeq(st, txn, &c.name) {
+                        Some(d) { append(mut &out, Target{obj: relObj(&d.key), kind: "sequence", name: d.key}) }
+                        None { return Err(e("42P01", "relation \"" + lexdb_sql.shown(&c.name) + "\" does not exist")) }
+                    }
+                }
+            }
+        }
+    }
+    return Ok(out)
+}
+
+fn grantStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
+    let grant = s.kind == lexdb_sql.S_GRANT
+    let tag = if grant { "GRANT" } else { "REVOKE" }
+    if s.index == "database" { return Ok(tagOnly(tag)) }       // lexdb has no database privileges: CONNECT and the rest hold
+    let w = try whoNow(st, txn)
+    var grantees: []str = []
+    for g in s.pk {
+        let r = roleName(st, txn, &g)
+        if len(r) > 0 && !(try roleExists(st, txn, &r)) { return Err(e("42704", "role \"" + r + "\" does not exist")) }
+        append(mut &grantees, r)
+    }
+    if s.index == "role" {
+        // memberships: a superuser's to give
+        if !w.super { return Err(e("42501", "permission denied to grant role")) }
+        for c in s.cols {
+            if !(try roleExists(st, txn, &c.name)) { return Err(e("42704", "role \"" + c.name + "\" does not exist")) }
+            for m in grantees {
+                if len(m) == 0 { return Err(e("0LP01", "role \"public\" cannot be a member of a role")) }
+                if m == c.name { return Err(e("0LP01", "role \"" + m + "\" is a member of role \"" + c.name + "\"")) }
+                if grant {
+                    // no cycles: c may not already be a member of m
+                    let up = try whoIs(st, txn, &c.name)
+                    if hasStr(&up.roles, &m) { return Err(e("0LP01", "role \"" + c.name + "\" is a member of role \"" + m + "\"")) }
+                    try txn.put(CATALOG, MEM_PRE + c.name + "\x00" + m, "")
+                } else {
+                    txn.del(CATALOG, MEM_PRE + c.name + "\x00" + m)
+                }
+            }
+        }
+        try bumpCatalog(st, txn)
+        return Ok(tagOnly(tag + " ROLE"))
+    }
+    let targets = try grantTargets(st, txn, s)
+    for tg in targets {
+        var letters = ""
+        for pn in s.names {
+            let l = privLetters(&pn, &(if tg.kind == "view" { "table" } else { tg.kind }))
+            if len(l) == 0 && pn != "maintain" {
+                return Err(e("0LP01", "invalid privilege type " + strings.toUpperAscii(pn) + " for " + tg.kind))
+            }
+            letters = addLetters(&letters, &l)
+        }
+        try needOwner(st, txn, &w, &tg.obj, &tg.kind, &tg.name)
+        var a = try readAcl(st, txn, &tg.obj)
+        if !a.set { a.set = true }
+        for g in grantees {
+            var found = -1
+            for i in 0..len(a.grants) { if a.grants[i].to == g { found = i } }
+            if grant {
+                if found < 0 { append(mut &a.grants, Grant{to: g, privs: addLetters(&"", &letters)}) }
+                else { a.grants[found].privs = addLetters(&a.grants[found].privs, &letters) }
+            } else if found >= 0 {
+                a.grants[found].privs = dropLetters(&a.grants[found].privs, &letters)
+            }
+        }
+        var kept: []Grant = []
+        for g in a.grants { if len(g.privs) > 0 { append(mut &kept, Grant{to: g.to, privs: g.privs}) } }
+        a.grants = kept
+        try writeAcl(txn, &tg.obj, &a)
+    }
+    try bumpCatalog(st, txn)
+    return Ok(tagOnly(tag))
+}
+
+// ALTER TABLE | VIEW | SEQUENCE | SCHEMA name OWNER TO role: a superuser's,
+// or the owner's when it is a member of the new owner (PostgreSQL's rule).
+fn ownerStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
+    let tag = "ALTER " + strings.toUpperAscii(s.index)
+    let to = roleName(st, txn, &s.names[0])
+    if len(to) == 0 || !(try roleExists(st, txn, &to)) { return Err(e("42704", "role \"" + (if len(to) == 0 { "public" } else { to }) + "\" does not exist")) }
+    var obj = ""
+    var name = s.table
+    if s.index == "schema" {
+        if !(try schemaExists(st, txn, &s.table)) { return Err(e("3F000", "schema \"" + s.table + "\" does not exist")) }
+        obj = nspObj(&s.table)
+    } else if s.index == "sequence" {
+        match try findSeq(st, txn, &s.table) {
+            Some(d) {
+                obj = relObj(&d.key)
+                name = d.key
+            }
+            None {}
+        }
+    } else {
+        match try findTable(st, txn, &s.table) {
+            Some(t) {
+                if (s.index == "view") != (len(t.view) > 0) {
+                    return Err(e("42809", "\"" + lexdb_sql.shown(&s.table) + "\" is not a " + s.index))
+                }
+                obj = relObj(&t.name)
+                name = t.name
+            }
+            None {}
+        }
+    }
+    if len(obj) == 0 {
+        if s.ifFlag { return Ok(tagOnly(tag)) }
+        return Err(e("42P01", "relation \"" + lexdb_sql.shown(&s.table) + "\" does not exist"))
+    }
+    let w = try whoNow(st, txn)
+    try needOwner(st, txn, &w, &obj, &s.index, &name)
+    if !w.super && !hasStr(&w.roles, &to) { return Err(e("42501", "must be able to SET ROLE \"" + to + "\"")) }
+    var a = try readAcl(st, txn, &obj)
+    a.owner = to
+    try writeAcl(txn, &obj, &a)
+    try bumpCatalog(st, txn)
+    return Ok(tagOnly(tag))
+}
+
+// INSERT, UPDATE, DELETE: the privilege (letter) on the target; and SELECT
+// where the statement reads its rows: a WHERE, RETURNING, a SET reading a
+// column, ON CONFLICT DO UPDATE (which needs UPDATE too).
+fn dmlCheck(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, letter: &str): Result[Unit, DbErr] {
+    let w = try whoNow(st, txn)
+    if w.super { return Ok(Unit{}) }
+    let key = try catKey(st, txn, &s.table, false)
+    if !(try relExists(st, txn, &key)) { return Ok(Unit{}) }      // the statement says it does not exist
+    try needRel(st, txn, &w, &key, letter, &"table")
+    var reads = s.where.isSome() || len(s.items) > 0
+    if letter == "w" { for set in s.sets { if colsIn(&set.expr) { reads = true } } }
+    if letter == "a" && s.conflict == lexdb_sql.CONFLICT_UPDATE {
+        try needRel(st, txn, &w, &key, &"w", &"table")
+        reads = true
+    }
+    if reads { try needRel(st, txn, &w, &key, &"r", &"table") }
+    return Ok(Unit{})
+}
+
+fn colsIn(x: &Expr): bool {
+    match x {
+        Expr.Col(_) { return true }
+        Expr.Unary(_, a) { return colsIn(&a) }
+        Expr.Bin(_, a, b) { return colsIn(&a) || colsIn(&b) }
+        Expr.IsNull(a, _) { return colsIn(&a) }
+        Expr.Cast(a, _) { return colsIn(&a) }
+        Expr.Call(_, args, _) {
+            for a in args { if colsIn(&a) { return true } }
+            return false
+        }
+        else { return false }
+    }
+}
+
+// SET ROLE name | NONE, RESET ROLE: privileges checked as the role, which
+// the session's user must be a member of (or a superuser). SET SESSION
+// AUTHORIZATION name | DEFAULT: the session's user, for a superuser's login
+// only; it ends SET ROLE.
+fn (s: mut &Session) setRole(stmt: &lexdb_sql.Stmt): Result[Res, DbErr] {
+    let name = if len(stmt.names) > 0 && !stmt.ifFlag { stmt.names[0] } else { "" }
+    let tag = if stmt.ifFlag { "RESET" } else { "SET" }
+    var t = try s.st.beginSnapshot()
+    let st = s.st
+    let r = setRoleIn(&st, mut &t, s.id, &stmt.table, &name)
+    st.abort(t)
+    try r
+    return Ok(tagOnly(tag))
+}
+
+fn setRoleIn(st: &lexdb_store.Store, t: mut &lexdb_store.Txn, id: int, what: &str, name: &str): Result[Unit, DbErr] {
+    if len(name) > 0 && !(try roleExists(st, t, name)) { return Err(e("22023", "role \"" + name + "\" does not exist")) }
+    if what == "session_authorization" {
+        let login = st.memoGet(&userKey(id)).unwrapOr("lexdb")
+        if !(try whoIs(st, t, &login)).super && name != login {
+            return Err(e("42501", "permission denied to set session authorization"))
+        }
+        st.memoPut(&sessAuthKey(id), name)
+        st.memoPut(&roleKeyOf(id), &"")
+        return Ok(Unit{})
+    }
+    if len(name) > 0 {
+        let w = try whoIs(st, t, &sessionUser(st, id))
+        if !w.super && !hasStr(&w.roles, name) { return Err(e("42501", "permission denied to set role \"" + name + "\"")) }
+    }
+    st.memoPut(&roleKeyOf(id), name)
+    return Ok(Unit{})
+}
+
+// A role's name in the owners, grants and memberships: renamed to to, or
+// ("" ) taken out of grants and memberships. With check, nothing changes:
+// the first object it owns, "" if none.
+fn renameInAcls(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &str, to: &str, check: bool): Result[str, DbErr] {
+    var keys: []str = []
+    var vals: []str = []
+    try st.scan(txn, CATALOG, ACL_PRE, ACL_PRE + "\xff", fn(en: &lexdb_store.Entry): bool {
+        append(mut &keys, en.key)
+        append(mut &vals, en.val)
+        return true
+    })
+    for i in 0..len(keys) {
+        let obj = keys[i][len(ACL_PRE)..len(keys[i])].toStr()
+        var a = try readAcl(st, txn, &obj)
+        if check {
+            if a.owner == from { return Ok(if strings.startsWith(&obj, "n:") { "schema " + obj[2..len(obj)] } else { lexdb_sql.shown(&obj[2..len(obj)]) }) }
+            continue
+        }
+        if a.owner == from { a.owner = to.toStr() }
+        var kept: []Grant = []
+        for g in a.grants {
+            if g.to == from { if len(to) > 0 { append(mut &kept, Grant{to: to.toStr(), privs: g.privs}) } }
+            else { append(mut &kept, Grant{to: g.to, privs: g.privs}) }
+        }
+        a.grants = kept
+        try writeAcl(txn, &obj, &a)
+    }
+    if check { return Ok("") }
+    var mems: []str = []
+    try st.scan(txn, CATALOG, MEM_PRE, MEM_PRE + "\xff", fn(en: &lexdb_store.Entry): bool {
+        append(mut &mems, en.key[len(MEM_PRE)..len(en.key)].toStr())
+        return true
+    })
+    for pr in mems {
+        let z = strings.indexOf(&pr, "\x00", 0)
+        let role = pr[0..z].toStr()
+        let member = pr[z + 1..len(pr)].toStr()
+        if role != from && member != from { continue }
+        txn.del(CATALOG, MEM_PRE + pr)
+        if len(to) > 0 {
+            try txn.put(CATALOG, MEM_PRE + (if role == from { to.toStr() } else { role }) + "\x00" + (if member == from { to.toStr() } else { member }), "")
+        }
+    }
+    return Ok("")
+}
+
+// The catalog's view of owners and grants (9.83).
+
+// A role's OID: the trusted session's user (no role) and the unknown owner 10.
+fn roleOid(r: &str, roles: &[]Role): int {
+    for x in roles { if x.name == r { return catOid(&"a", r) } }
+    return OID_OWNER
+}
+
+fn aclOf(snap: &CatSnap, obj: &str): Acl {
+    var a = match snap.acls.get(obj) {
+        Some(v) { decAcl(obj, &v) }
+        None { Acl{owner: "", grants: defaultGrants(obj), set: false} }
+    }
+    // the schema public's own grants are shown, as PostgreSQL shows them
+    if obj == "n:public" { a.set = true }
+    return a
+}
+
+fn copyGrants(gs: &[]Grant): []Grant {
+    var out: []Grant = []
+    for g in gs { append(mut &out, Grant{to: g.to, privs: g.privs}) }
+    return out
+}
+
+fn ownerName(snap: &CatSnap, a: &Acl): str { return if len(a.owner) > 0 { a.owner } else { snap.user } }
+
+// relacl, nspacl: PostgreSQL's aclitem[] text, NULL until a GRANT or REVOKE.
+fn aclText(snap: &CatSnap, a: &Acl, all: &str): Val {
+    if !a.set { return Val.Null }
+    let o = ownerName(snap, a)
+    var items: []str = [quoteIfNeeded(&o) + "=" + all + "/" + quoteIfNeeded(&o)]
+    for g in a.grants {
+        if g.to == o { continue }
+        append(mut &items, (if len(g.to) > 0 { quoteIfNeeded(&g.to) } else { "" }) + "=" + g.privs + "/" + quoteIfNeeded(&o))
+    }
+    return Val.Text("{" + strings.join(&items, ",") + "}")
+}
+
+fn privName(l: &str): str {
+    return match l {
+        "r" { "SELECT" } "a" { "INSERT" } "w" { "UPDATE" } "d" { "DELETE" } "D" { "TRUNCATE" } "x" { "REFERENCES" }
+        "t" { "TRIGGER" } "U" { "USAGE" } "C" { "CREATE" } else { "" }
+    }
+}
+
+// has_table_privilege([role,] relation, 'SELECT, INSERT'), and the schema's
+// and sequence's: true if the role holds any of the privileges named, by
+// the bound catalog's roles and grants.
+fn hasPrivFn(se: &SeqEnv, name: &str, vs: &[]Val): Result[Val, DbErr] {
+    let n = len(vs)
+    if n != 2 && n != 3 { return Err(e("42883", "function " + name + " with " + n.toStr() + " arguments does not exist")) }
+    // the role: a name or an OID; the session's current role by default
+    var role = catUser(se)
+    if n == 3 {
+        match vs[0] {
+            Val.Text(t) { role = t }
+            else {
+                let o = oidArg(&vs[0]).unwrapOr(0).toStr()
+                for l in catLines(se, &"R") { if l[0] == o { role = l[1] } }
+            }
+        }
+    }
+    var w = Who{name: role, super: true, roles: [role, ""]}
+    var known = false
+    for l in catLines(se, &"R") {
+        if l[1] == role {
+            known = true
+            w.super = l[2] == "1"
+            w.roles = []
+            for r in strings.split(&l[3], "\x1e") { append(mut &w.roles, r.toStr()) }
+        }
+    }
+    if !known && n == 3 && len(catLines(se, &"R")) > 0 && role != catUser(se) {
+        let sess = catLines(se, &"U")
+        if len(sess) == 0 || sess[0][0] != role { return Err(e("42704", "role \"" + role + "\" does not exist")) }
+    }
+    let target = &vs[n - 2]
+    let kind = if name == "has_schema_privilege" { "schema" } else if name == "has_sequence_privilege" { "sequence" } else { "table" }
+    var obj = ""
+    if kind == "schema" {
+        let sn = text(target)
+        for l in catLines(se, &"n") { if l[1] == sn || l[0] == sn { obj = nspObj(&l[1]) } }
+        if len(obj) == 0 { return Err(e("3F000", "schema \"" + sn + "\" does not exist")) }
+    } else {
+        var o = oidArg(target).unwrapOr(0)
+        if o == 0 { o = relOidOf(se, &text(target)) }
+        for l in catLines(se, &"r") { if l[0] == o.toStr() { obj = relObj(&lexdb_sql.qual(&l[2], &l[3])) } }
+        if len(obj) == 0 { return Err(e("42P01", "relation \"" + text(target) + "\" does not exist")) }
+    }
+    var a = Acl{owner: "", grants: defaultGrants(&obj), set: false}
+    for l in catLines(se, &"A") { if l[0] == obj { a = decAcl(&obj, &strings.replaceAll(strings.replaceAll(&l[1], "\x1e", "\n"), "\x1d", "\t")) } }
+    for part in strings.split(&text(&vs[n - 1]), ",") {
+        var p = strings.toLowerAscii(strings.trim(&part))
+        let grantOpt = strings.endsWith(&p, " with grant option")
+        if grantOpt { p = strings.trim(&p[0..len(p) - 18]) }
+        let letters = privLetters(&p, &kind)
+        if len(letters) == 0 { return Err(e("22023", "unrecognized privilege type: \"" + strings.trim(&part) + "\"")) }
+        if grantOpt {
+            // the owner's and a superuser's only: lexdb gives no grant options
+            if w.super || (len(a.owner) > 0 && hasStr(&w.roles, &a.owner)) { return Ok(Val.Bool(true)) }
+            continue
+        }
+        for k in 0..len(letters) { if allows(&w, &a, &letters[k..k + 1]) { return Ok(Val.Bool(true)) } }
+    }
+    return Ok(Val.Bool(false))
 }

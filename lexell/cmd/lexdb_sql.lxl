@@ -112,6 +112,7 @@ const CAT_FNS: []str = ["pg_get_userbyid", "pg_table_is_visible", "pg_type_is_vi
                         "pg_get_serial_sequence", "to_regclass", "to_regtype", "to_regnamespace", "obj_description",
                         "col_description", "pg_relation_is_publishable", "pg_partition_ancestors", "current_user",
                         "session_user", "current_schema", "has_table_privilege", "has_schema_privilege", "has_database_privilege",
+                        "has_sequence_privilege", "has_any_column_privilege",
                         "pg_get_viewdef", "pg_relation_size", "pg_total_relation_size", "pg_table_size", "pg_indexes_size"]
 
 pub fn isCatFn(n: &str): bool {
@@ -310,6 +311,10 @@ pub const S_CREATE_VIEW = 47    // CREATE [OR REPLACE] VIEW name [(cols)] AS que
                                 // the query's text in index, OR REPLACE in ifFlag
 pub const S_DROP_VIEW = 48      // DROP VIEW [IF EXISTS] name, ... [CASCADE]: the names in cols
 pub const S_ALTER_VIEW = 49     // ALTER VIEW [IF EXISTS] name RENAME TO new: the new name in index
+pub const S_GRANT = 50          // GRANT (9.83): privileges in names, the object's kind in index, the objects in cols,
+                                // the grantees in pk; a role's: index "role", the roles granted in cols
+pub const S_REVOKE = 51         // REVOKE: the same
+pub const S_OWNER = 52          // ALTER TABLE | VIEW | SEQUENCE | SCHEMA name OWNER TO role: the kind in index, the role in names
 
 // COPY's options (Stmt.copy).
 pub type CopyOpts = record {
@@ -2128,6 +2133,97 @@ fn (p: mut &P) intersects(first: Stmt): Result[Stmt, lexdb_base.DbErr] {
     return Ok(lhs)
 }
 
+// A role as GRANT and the like name it: a name, PUBLIC (""), CURRENT_USER
+// and the like (as "#current_user", resolved when run).
+fn (p: mut &P) roleSpec(): Result[str, lexdb_base.DbErr] {
+    let t = p.peek()
+    if t.kind == T_IDENT && t.text == "public" {
+        p.pos += 1
+        return Ok("")
+    }
+    if t.kind == T_IDENT && (t.text == "current_user" || t.text == "session_user" || t.text == "current_role") {
+        p.pos += 1
+        return Ok("#" + (if t.text == "session_user" { "session_user" } else { "current_user" }))
+    }
+    if t.kind == T_IDENT && t.text == "user" {
+        p.pos += 1
+        return Ok("#current_user")
+    }
+    return p.name()
+}
+
+// GRANT privileges ON object TO roles, REVOKE [GRANT OPTION FOR]
+// privileges ON object FROM roles [CASCADE | RESTRICT]; GRANT role, ... TO
+// role, ..., REVOKE role, ... FROM role, ... (9.83).
+fn (p: mut &P) grantStmt(grant: bool): Result[Stmt, lexdb_base.DbErr] {
+    var g = newStmt(if grant { S_GRANT } else { S_REVOKE })
+    if !grant && p.isKw("grant") && p.peekAt(1).text == "option" {
+        return Err(lexdb_base.err("0A000", "lexdb: grant options are not supported"))
+    }
+    // privileges, or roles: names until ON (privileges) or TO / FROM (roles)
+    if p.acceptKw("all") {
+        let pr = p.acceptKw("privileges")
+        append(mut &g.names, "all")
+    } else {
+        while true {
+            let w = p.next()
+            if w.kind != T_IDENT && w.kind != T_QIDENT { return Err(near(&w)) }
+            append(mut &g.names, w.text)
+            if p.isKw("(") { return Err(lexdb_base.err("0A000", "lexdb: column privileges are not supported")) }
+            if !p.acceptKw(",") { break }
+        }
+    }
+    if p.acceptKw("on") {
+        if p.acceptKw("all") {
+            let w = p.next().text
+            if w != "tables" && w != "sequences" { return Err(lexdb_base.err("0A000", "lexdb: GRANT ON ALL " + strings.toUpperAscii(w) + " is not supported")) }
+            try p.expectKw("in")
+            try p.expectKw("schema")
+            g.index = "all " + w
+        } else if p.acceptKw("sequence") {
+            g.index = "sequence"
+        } else if p.acceptKw("schema") {
+            g.index = "schema"
+        } else if p.acceptKw("database") {
+            g.index = "database"
+        } else if p.isKw("function") || p.isKw("procedure") || p.isKw("routine") || p.isKw("type") || p.isKw("domain") ||
+                  p.isKw("language") || p.isKw("tablespace") || p.isKw("foreign") || p.isKw("large") {
+            return Err(lexdb_base.err("0A000", "lexdb: privileges on " + p.peek().text + " are not supported"))
+        } else {
+            let tb = p.acceptKw("table")
+            g.index = "table"
+        }
+        while true {
+            let nm = if g.index == "table" || g.index == "sequence" { try p.qname() } else { try p.name() }
+            append(mut &g.cols, colDef(nm, TypeName{kind: K_TEXT, oid: OID_TEXT, prec: 0, scale: 0, len: 0}, false))
+            if !p.acceptKw(",") { break }
+        }
+    } else {
+        // GRANT role, ... TO ...: the roles were read as names
+        g.index = "role"
+        let granted = replace(mut &g.names, [])
+        for r in granted { append(mut &g.cols, colDef(r, TypeName{kind: K_TEXT, oid: OID_TEXT, prec: 0, scale: 0, len: 0}, false)) }
+    }
+    if grant { try p.expectKw("to") } else { try p.expectKw("from") }
+    while true {
+        let a = p.acceptKw("group")
+        append(mut &g.pk, try p.roleSpec())
+        if !p.acceptKw(",") { break }
+    }
+    if p.acceptKw("with") {
+        let w = p.next().text
+        if w == "grant" || w == "admin" { return Err(lexdb_base.err("0A000", "lexdb: grant and admin options are not supported")) }
+        if w == "inherit" || w == "set" { return Err(lexdb_base.err("0A000", "lexdb: membership options are not supported")) }
+        return Err(near(&p.toks[p.pos - 1]))
+    }
+    if p.acceptKw("granted") {
+        try p.expectKw("by")
+        let by = try p.roleSpec()
+    }
+    if p.acceptKw("cascade") { g.cascade = true } else { let r = p.acceptKw("restrict") }
+    return Ok(g)
+}
+
 // CREATE [OR REPLACE] VIEW name [(column, ...)] AS query, after "view":
 // the query is parsed to check it, and kept as its text (from its first
 // token to the statement's end), to be parsed again where it is used (9.82).
@@ -2897,6 +2993,24 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
         }
         "insert" { return p.insert() }
         "alter" {
+            // ALTER TABLE | VIEW | SEQUENCE | SCHEMA [IF EXISTS] name OWNER TO role (9.83)
+            if p.isKw("table") || p.isKw("view") || p.isKw("sequence") || p.isKw("schema") {
+                let back = p.pos
+                let kind = p.next().text
+                let ife = p.acceptKw("if")
+                if ife { try p.expectKw("exists") }
+                let nm = if kind == "schema" { try p.name() } else { try p.qname() }
+                if p.acceptKw("owner") {
+                    try p.expectKw("to")
+                    var o = newStmt(S_OWNER)
+                    o.index = kind
+                    o.table = nm
+                    o.ifFlag = ife
+                    append(mut &o.names, try p.roleSpec())
+                    return Ok(o)
+                }
+                p.pos = back
+            }
             if p.acceptKw("view") {
                 var v = newStmt(S_ALTER_VIEW)
                 if p.acceptKw("if") {
@@ -2976,7 +3090,15 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
                     try p.expectKw("exists")
                     s.ifFlag = true
                 }
+                // name [AUTHORIZATION role], or AUTHORIZATION role (the schema named for it)
+                if p.acceptKw("authorization") {
+                    let r = try p.roleSpec()
+                    s.table = r
+                    append(mut &s.names, r)
+                    return Ok(s)
+                }
                 s.table = try p.name()
+                if p.acceptKw("authorization") { append(mut &s.names, try p.roleSpec()) }
                 return Ok(s)
             }
             if p.acceptKw("index") { return p.createIndex(false) }
@@ -3108,6 +3230,7 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
             r.table = try p.name()
             return Ok(r)
         }
+        "grant", "revoke" { return p.grantStmt(t.text == "grant") }
         "show" {
             var st = newStmt(S_SHOW)
             if p.acceptKw("all") { st.table = "all" } else { st.table = try p.name() }
@@ -3123,6 +3246,19 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
             let u = p.acceptKw("session")
             if t.text == "reset" && p.acceptKw("all") {
                 st.table = "all"
+                return Ok(st)
+            }
+            // SET [SESSION] ROLE name | NONE, RESET ROLE, SET SESSION AUTHORIZATION name |
+            // DEFAULT, RESET SESSION AUTHORIZATION (9.83): the role in names, none for NONE and DEFAULT
+            if p.isKw("role") || p.isKw("authorization") {
+                st.table = if p.next().text == "role" { "role" } else { "session_authorization" }
+                if t.text == "set" {
+                    let eq = p.acceptKw("to") || p.acceptKw("=")
+                    if !p.acceptKw("none") && !p.acceptKw("default") {
+                        let v = p.peek()
+                        if v.kind == T_STR { p.pos += 1; append(mut &st.names, v.text) } else { append(mut &st.names, try p.name()) }
+                    }
+                }
                 return Ok(st)
             }
             if t.text == "set" && p.acceptKw("schema") {
