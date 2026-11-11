@@ -9201,7 +9201,7 @@ pub fn (s: &Session) status(): byte {
 }
 
 fn execIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int,
-          lim: Limits, pc: mut &PlanCache, input: &CopyInput, out: &fn(int, &[]byte): bool): Result[Res, DbErr] {
+          lim: Limits, pc: mut &PlanCache, input: &CopyInput, out: &fn(int, &[]byte): bool, pull: &fn(): CopyPart): Result[Res, DbErr] {
     try bindSeqs(st, txn, &s.seqNames)
     // with subqueries, the outer values they use are numbered after all the
     // statement's parameters: those not sent are NULL
@@ -9211,9 +9211,9 @@ fn execIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
         var ps: []Val = []
         for v in params { append(mut &ps, v) }
         while len(ps) < want { append(mut &ps, Val.Null) }
-        return execStmt(st, txn, s, &ps, ptypes, lim, pc, input, out)
+        return execStmt(st, txn, s, &ps, ptypes, lim, pc, input, out, pull)
     }
-    return execStmt(st, txn, s, params, ptypes, lim, pc, input, out)
+    return execStmt(st, txn, s, params, ptypes, lim, pc, input, out, pull)
 }
 
 fn hasSubs(s: &lexdb_sql.Stmt): bool {
@@ -9223,7 +9223,7 @@ fn hasSubs(s: &lexdb_sql.Stmt): bool {
 }
 
 fn execStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int,
-            lim: Limits, pc: mut &PlanCache, input: &CopyInput, out: &fn(int, &[]byte): bool): Result[Res, DbErr] {
+            lim: Limits, pc: mut &PlanCache, input: &CopyInput, out: &fn(int, &[]byte): bool, pull: &fn(): CopyPart): Result[Res, DbErr] {
     if st.isReplica() {
         match writesOn(s) {
             Some(what) { return Err(lexdb_store.readOnly(&what)) }
@@ -9257,7 +9257,7 @@ fn execStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
         lexdb_sql.S_CREATE_SEQ { return createSeq(st, txn, s) }
         lexdb_sql.S_ALTER_SEQ { return alterSeq(st, txn, s) }
         lexdb_sql.S_DROP_SEQ { return dropSeq(st, txn, s) }
-        lexdb_sql.S_COPY { return copyStmt(st, txn, s, params, ptypes, lim, pc, input, out) }
+        lexdb_sql.S_COPY { return copyStmt(st, txn, s, params, ptypes, lim, pc, input, out, pull) }
         lexdb_sql.S_EXPLAIN { return explain(st, txn, s, params, lim, ptypes) }
         else { return Err(e("XX000", "not a data statement")) }
     }
@@ -9313,7 +9313,7 @@ pub fn (s: mut &Session) run(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
 
 // run, keeping a SELECT's plan in pc for the next run of the same statement.
 pub fn (s: mut &Session) runCached(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int, pc: mut &PlanCache): Result[Res, DbErr] {
-    let r = s.runIn(stmt, params, ptypes, pc, &noInput(), noOut)
+    let r = s.runIn(stmt, params, ptypes, pc, &noInput(), noOut, noPull)
     if len(s.txn) == 0 { advRelease(&s.st, s.id, false) }      // its transaction over: its advisory locks (9.86)
     return r
 }
@@ -9325,7 +9325,7 @@ pub fn (s: mut &Session) runCached(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes
 // COPY_NONE with its tag only.
 pub fn (s: mut &Session) runOut(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int, pc: mut &PlanCache,
                                 out: &fn(int, &[]byte): bool): Result[Res, DbErr] {
-    let r = s.runIn(stmt, params, ptypes, pc, &CopyInput{have: false, data: "", fail: "", proto: false, stream: true}, out)
+    let r = s.runIn(stmt, params, ptypes, pc, &CopyInput{have: false, data: "", fail: "", proto: false, stream: true, pull: false}, out, noPull)
     if len(s.txn) == 0 { advRelease(&s.st, s.id, false) }
     return r
 }
@@ -9338,11 +9338,21 @@ pub fn (s: mut &Session) copyIn(stmt: &lexdb_sql.Stmt, input: CopyInput): Result
     var pc = oneShot()
     let none: []Val = []
     let nt: []int = []
-    return s.runIn(stmt, &none, &nt, mut &pc, &input, noOut)
+    return s.runIn(stmt, &none, &nt, mut &pc, &input, noOut, noPull)
+}
+
+// copyIn with the data as it arrives (9.87): pull gives its parts, the
+// last with end set. Not run again on a conflict at its commit (40001):
+// what was read is gone.
+pub fn (s: mut &Session) copyInFrom(stmt: &lexdb_sql.Stmt, pull: &fn(): CopyPart): Result[Res, DbErr] {
+    var pc = oneShot()
+    let none: []Val = []
+    let nt: []int = []
+    return s.runIn(stmt, &none, &nt, mut &pc, &CopyInput{have: true, data: "", fail: "", proto: false, stream: false, pull: true}, noOut, pull)
 }
 
 fn (s: mut &Session) runIn(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int, pc: mut &PlanCache,
-                           input: &CopyInput, out: &fn(int, &[]byte): bool): Result[Res, DbErr] {
+                           input: &CopyInput, out: &fn(int, &[]byte): bool, pull: &fn(): CopyPart): Result[Res, DbErr] {
     match stmt.kind {
         lexdb_sql.S_EMPTY { return Ok(tagOnly("")) }
         lexdb_sql.S_SHOW { return s.show(&stmt.table) }
@@ -9510,7 +9520,7 @@ fn (s: mut &Session) runIn(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int
         // checked at COMMIT either way, and the latest is less often stale
         s.txn[0].live = stmt.kind == lexdb_sql.S_UPDATE || stmt.kind == lexdb_sql.S_DELETE || stmt.kind == lexdb_sql.S_INSERT ||
                         (stmt.kind == lexdb_sql.S_COPY && stmt.copy.from) || (stmt.kind == lexdb_sql.S_SELECT && stmt.lockMode > 0)
-        let r = execIn(&st, mut &s.txn[0], stmt, params, ptypes, s.limits(), pc, input, out)
+        let r = execIn(&st, mut &s.txn[0], stmt, params, ptypes, s.limits(), pc, input, out, pull)
         s.txn[0].live = false
         if r.isErr() {
             s.failed = true
@@ -9531,13 +9541,15 @@ fn (s: mut &Session) runIn(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int
         var t = if snap { try s.st.beginSnapshot() } else { lexdb_store.begin() }
         for n in s.path { append(mut &t.path, n) }
         t.sess = s.id
-        match execIn(&s.st, mut &t, stmt, params, ptypes, lim, pc, input, out) {
+        match execIn(&s.st, mut &t, stmt, params, ptypes, lim, pc, input, out, pull) {
             Ok(r) {
                 match s.st.commit(t) {
                     Ok(_) { return Ok(r) }
                     Err(x) {
                         tries += 1
-                        if x.state != lexdb_base.S_CONFLICT || tries >= 10 { return Err(x) }
+                        // (a COPY whose data was read as it came, or that committed
+                        // batches, cannot run again)
+                        if x.state != lexdb_base.S_CONFLICT || tries >= 10 || input.pull || (stmt.kind == lexdb_sql.S_COPY && stmt.copy.batchRows > 0) { return Err(x) }
                     }
                 }
             }
@@ -11173,13 +11185,22 @@ pub const COPY_OUT = 2
 // What the client sent for COPY FROM STDIN: its data, or its CopyFail's
 // message (proto: a message not of COPY's, the wire's own error).
 // stream: COPY TO's lines go to the caller's out as they are made (runOut).
-pub type CopyInput = record { pub have: bool; pub data: str; pub fail: str; pub proto: bool; pub stream: bool }
+// pull: COPY FROM's data comes from the caller's pull as it arrives
+// (copyInFrom), not in data.
+pub type CopyInput = record { pub have: bool; pub data: str; pub fail: str; pub proto: bool; pub stream: bool; pub pull: bool }
 
-fn noInput(): CopyInput { return CopyInput{have: false, data: "", fail: "", proto: false, stream: false} }
+fn noInput(): CopyInput { return CopyInput{have: false, data: "", fail: "", proto: false, stream: false, pull: false} }
+
+// A part of COPY FROM's data as the client sent it: end, the last (its
+// CopyDone, or CopyFail's message in fail; proto: not a COPY message).
+pub type CopyPart = record { pub data: str; pub end: bool; pub fail: str; pub proto: bool }
+
+fn noPull(): CopyPart { return CopyPart{data: "", end: true, fail: "", proto: false} }
 
 fn copyStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int,
-            lim: Limits, pc: mut &PlanCache, input: &CopyInput, out: &fn(int, &[]byte): bool): Result[Res, DbErr] {
+            lim: Limits, pc: mut &PlanCache, input: &CopyInput, out: &fn(int, &[]byte): bool, pull: &fn(): CopyPart): Result[Res, DbErr] {
     if !s.copy.from {
+        if s.copy.batchRows > 0 { return Err(e("0A000", "lexdb: COPY's batch_rows only available using COPY FROM")) }
         if input.stream { return copyStream(st, txn, s, params, ptypes, lim, out) }
         return copyOut(st, txn, s, params, ptypes, lim, pc)
     }
@@ -11203,9 +11224,12 @@ fn copyStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
         append(mut &names, t.cols[i].name)
     }
     if !input.have { return Ok(Res{cols: cols, rows: [], tag: "", hasRows: false, copy: COPY_IN}) }
-    if input.fail != "" {
-        if input.proto { return Err(e("08P01", input.fail)) }
-        return Err(e("57014", "COPY from stdin failed: " + input.fail))
+    // WITH (batch_rows n): a commit each n rows (9.87), so a large load
+    // holds no more than n rows' writes; not inside a block, which commits
+    // once
+    let batch = s.copy.batchRows
+    if batch > 0 && txn.inBlock() {
+        return Err(e("25001", "lexdb: COPY with batch_rows cannot run inside a transaction block"))
     }
     // its identity columns take the values given (as OVERRIDING SYSTEM VALUE)
     let defs = try defaultsOf(st, txn, &t)
@@ -11215,29 +11239,65 @@ fn copyStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
                     forceNull: try forced(&s.copy.forceNull, &names, &"FORCE_NULL")}
     var vs: []Val = []
     var count = 0
-    let data = &input.data
     let where = "COPY " + lexdb_sql.baseName(&s.table) + ", line "
     var noUp = noUpsert()                   // COPY has no ON CONFLICT
     let noCols: []lexdb_sql.ColDef = []
     let none: []Val = []
     let noSubs: []SubRes = []
     let noEnv = Env{cols: &noCols, row: &none, aggs: &none, params: &none, subs: &noSubs, cur: &none, seq: None}
-    if s.copy.header {
-        match copyRecord(data, &s.copy, mut &rd, mut &vs) {
-            Ok(_) {}
-            Err(x) { return Err(within(x, where + rd.line.toStr() + ": " + quoted(&recordText(data, &rd)))) }
-        }
+    // The input as it comes (9.87): the client's parts, from pull, or
+    // input.data whole (Session.copyIn). buf holds what is not yet read:
+    // the record being read and what follows; a record that runs off its
+    // end waits for the next part.
+    var buf = ""
+    var ended = false
+    var given = false
+    let next = fn(): CopyPart {
+        if input.pull { return pull() }
+        if given { return CopyPart{data: "", end: true, fail: "", proto: false} }
+        given = true
+        return CopyPart{data: input.data, end: true, fail: input.fail, proto: input.proto}
     }
+    var header = s.copy.header
     while true {
-        match copyRecord(data, &s.copy, mut &rd, mut &vs) {
+        let at0 = rd.at
+        let line0 = rd.line
+        var res = copyRecord(&buf, &s.copy, mut &rd, mut &vs)
+        if !ended {
+            // ran off the end of what has come: wait for more
+            var short = false
+            match res {
+                Ok(more) { short = if more { rd.at >= len(buf) && buf[len(buf) - 1] != '\n' } else { at0 >= len(buf) } }
+                Err(_) { short = true }     // CSV's only error, an unterminated quote: the rest may yet come
+            }
+            if short {
+                rd.at = at0
+                rd.line = line0
+                let part = next()
+                if part.fail != "" {
+                    if part.proto { return Err(e("08P01", part.fail)) }
+                    return Err(e("57014", "COPY from stdin failed: " + part.fail))
+                }
+                buf = buf[at0..len(buf)] + part.data
+                rd.at = 0
+                rd.start = 0
+                if part.end { ended = true }
+                continue
+            }
+        }
+        match res {
             Ok(more) { if !more { break } }
-            Err(x) { return Err(within(x, where + rd.line.toStr() + ": " + quoted(&recordText(data, &rd)))) }
+            Err(x) { return Err(within(x, where + rd.line.toStr() + ": " + quoted(&recordText(&buf, &rd)))) }
+        }
+        if header {
+            header = false
+            continue
         }
         if len(vs) < len(targets) {
-            return Err(within(e("22P04", "missing data for column \"" + names[len(vs)] + "\""), where + rd.line.toStr() + ": " + quoted(&recordText(data, &rd))))
+            return Err(within(e("22P04", "missing data for column \"" + names[len(vs)] + "\""), where + rd.line.toStr() + ": " + quoted(&recordText(&buf, &rd))))
         }
         if len(vs) > len(targets) {
-            return Err(within(e("22P04", "extra data after last expected column"), where + rd.line.toStr() + ": " + quoted(&recordText(data, &rd))))
+            return Err(within(e("22P04", "extra data after last expected column"), where + rd.line.toStr() + ": " + quoted(&recordText(&buf, &rd))))
         }
         match insertOne(st, txn, &t, &targets, &vs, &defs, &fw, mut &later, mut &noUp, &noEnv) {
             Ok(_) {}
@@ -11254,7 +11314,23 @@ fn copyStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
             }
         }
         count += 1
+        if batch > 0 && count % batch == 0 {
+            // a batch's end: its foreign keys checked, then it commits; the
+            // rows after it go into a new transaction
+            try fkFinish(st, txn, &fw, mut &later)
+            later = []
+            var fresh = lexdb_store.begin()
+            for n in txn.path { append(mut &fresh.path, n) }
+            fresh.sess = txn.sess
+            fresh.now = txn.now
+            let done = replace(txn, fresh)
+            match st.commit(done) {
+                Ok(_) {}
+                Err(x) { return Err(within(x, where + rd.line.toStr() + " (" + (count - batch).toStr() + " rows committed before)")) }
+            }
+        }
     }
+    // what follows an end marker (\.) is not read; the wire drops it
     try fkFinish(st, txn, &fw, mut &later)
     return Ok(Res{cols: [], rows: [], tag: "COPY " + count.toStr(), hasRows: false, copy: COPY_NONE})
 }

@@ -6815,3 +6815,68 @@ suite passes (78).
 - ROLLBACK TO keeps the locks taken after the savepoint (PostgreSQL drops
   them);
 - a view in FROM is not locked through.
+
+### 9.87 COPY FROM read as it comes; batch_rows
+
+COPY TO was sent as it ran (9.84), but COPY FROM still was not. The wire
+collected the client's CopyData until CopyDone (26 MB of input held as
+34 MB, 61 MB while it came), then the statement read it. A 10 GB file
+needed more than 10 GB of memory.
+
+**Read as it comes.**
+- `Session.copyInFrom` takes `pull`, a closure the wire gives (threaded
+  like 9.84's `out`). Each call returns a `CopyPart`: the CopyData already
+  received, up to about 64 kB. The last part comes with CopyDone, or
+  carries CopyFail's message, or a protocol error.
+- `copyStmt` keeps what is not yet read in `buf`. A record that runs off
+  its end waits for the next part, and parsing starts again at the
+  record's start with the part added. That covers a text record with no
+  newline yet, and a CSV quote not yet closed (CSV's only parse error).
+  An end marker split across parts waits the same way.
+- `Session.copyIn(data)` gives its data as one part, so `exec_copy` runs
+  the same code.
+- An error part way is sent at once, as in PostgreSQL. The CopyData,
+  CopyDone and CopyFail that follow are dropped by the wire's `step`, as
+  PostgreSQL drops them. A CopyFail after rows that were read rolls them
+  back.
+- **The cost:** a COPY whose data was read as it came is not run again on
+  a conflict at its commit (40001), because the data is gone. Its reads
+  are few since 9.84 (its keys are one range), so conflicts are rare.
+- **The behaviour change:** a bad line is reported when it arrives, before
+  a CopyFail that comes after it, as PostgreSQL reports it. `wire_copy`'s
+  CopyFail case now sends a valid line first.
+
+**WITH (batch_rows n), lexdb's own.** The user's choice of how to bound a
+large load (instead of spilling a transaction's writes to disk):
+- COPY FROM commits each n rows: the batch's foreign keys checked, then its
+  commit, then a new transaction (the same path, session and now()) for
+  the rest.
+- It is not all or nothing: a failure keeps the batches before it. Its
+  error's context says how many rows were committed.
+- Inside a transaction block it is 25001, since the block commits once.
+  For COPY TO it is 0A000. n must be positive (22023). It is never run
+  again on a conflict.
+
+**Measured** with 1M rows (26 MB) through psql's `\copy`:
+
+| | before | read as it comes | with batch_rows 100000 |
+|---|---|---|---|
+| load | 1.07 s, 339 MB | 1.16 s, 314 MB | 1.48 s, 170 MB |
+
+With batches, what is left is the table's tree in the cache, which its
+budget bounds. The transaction's writes are flat: at most 100k rows'.
+Without batches, the transaction's writes still grow with the rows, about
+176 bytes a row (9.84).
+
+**Tests:**
+- `exec_copystream` (new): the same input given whole and in parts of
+  every size from 1 to 7 bytes, loading the same rows. In text it has
+  escapes, `\r\n`, an empty field and the end marker followed by more;
+  in CSV, a header, quoted commas, quoted newlines, doubled quotes and no
+  final newline.
+  - An error names the same line for every split.
+  - A CopyFail part way loads nothing.
+  - batch_rows commits ten rows in batches of three. A duplicate key in
+    the third batch keeps four rows.
+  - The refusals.
+- `wire_copy`: its CopyFail case changed as above.

@@ -1,0 +1,122 @@
+// lexdb_exec: COPY FROM read as its data comes (design/lexdb.md 9.87): the
+// same input given whole and in parts of every size from 1 to 7 bytes
+// (records, escapes, \r\n, CSV quotes holding newlines and delimiters, a
+// header and the end marker split anywhere) loads the same rows; an error
+// names the same line; CopyFail part way loads nothing. batch_rows commits
+// each n rows: a failure keeps the batches before it; refused in a block
+// and for COPY TO.
+// expect: text: same for every split: true (COPY 6)
+// expect: csv: same for every split: true (COPY 5)
+// expect: error: same for every split: true (22P02 COPY t, line 3, column n: "x")
+// expect: fail part way: 57014, rows 0
+// expect: batches: COPY 10, rows 10
+// expect: batch failure: 23505, rows 4
+// expect: in a block: 25001; to: 0A000; zero: 22023
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_sql"
+
+fn q(s: mut &lexdb_exec.Session, sql: str): str {
+    match s.exec(&sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if r.hasRows {
+                var rows: []str = []
+                for row in r.rows {
+                    var cells: []str = []
+                    for v in row { append(mut &cells, if lexdb_exec.isNull(&v) { "<null>" } else { lexdb_exec.text(&v) }) }
+                    append(mut &rows, strings.join(&cells, "|"))
+                }
+                return strings.join(&rows, ";")
+            }
+            return r.tag
+        }
+        Err(e) { return e.state }
+    }
+}
+
+// COPY sql with data in parts of size n (0: whole); fail: a CopyFail after
+// the first part. The tag, or the error's state and context.
+fn load(s: mut &lexdb_exec.Session, sql: str, data: &str, n: int, fail: bool): str {
+    let stmts = lexdb_sql.parse(&sql).unwrap()
+    var at = 0
+    let r = s.copyInFrom(&stmts[0], fn(): lexdb_exec.CopyPart {
+        if fail && at > 0 { return lexdb_exec.CopyPart{data: "", end: true, fail: "stop", proto: false} }
+        let k = if n == 0 { len(data) } else { n }
+        let end = if at + k > len(data) { len(data) } else { at + k }
+        let part = data[at..end].toStr()
+        at = end
+        return lexdb_exec.CopyPart{data: part, end: at >= len(data) && !fail, fail: "", proto: false}
+    })
+    match r {
+        Ok(x) { return x.tag }
+        Err(e) { return e.state + " " + e.context }
+    }
+}
+
+// Loads data whole and in every split, into t made afresh each time; the
+// rows each time compared with the whole's.
+fn splits(s: mut &lexdb_exec.Session, make: str, sql: str, data: &str): str {
+    var want = ""
+    var tag = ""
+    var same = true
+    for n in 0..8 {
+        let d = q(s, "drop table if exists t")
+        let m = q(s, make)
+        let got = load(s, sql, data, n, false)
+        let rows = q(s, "select * from t order by 1")
+        if n == 0 {
+            want = rows
+            tag = got
+        } else if rows != want || got != tag {
+            same = false
+            println("  split " + n.toStr() + ": " + got + " " + rows)
+        }
+    }
+    return "same for every split: " + (if same { "true" } else { "false" }) + " (" + tag + ")"
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(31), lexdb_store.Options{cacheBytes: 16 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000, bufferedPages: false}, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        let text = "1\ta\\tb\tone\r\n2\t\\N\ttwo\n3\tback\\\\slash\t\\x41\\101\n4\tnew\\nline\tfour\n5\t\t\n6\tlast\tsix\n\\.\nignored\tafter\tmarker\n"
+        println("text: " + splits(mut &s, "create table t (n int primary key, a text, b text)", "copy t from stdin", &text))
+        let csv = "n,a,b\n1,\"quoted, comma\",x\n2,\"line\none\",\"say \"\"hi\"\"\"\r\n3,,\"\"\n4,plain,\"\n\"\n5,last,end"
+        println("csv: " + splits(mut &s, "create table t (n int primary key, a text, b text)", "copy t from stdin with (format csv, header)", &csv))
+        let bad = "1\ta\n2\tb\nx\tc\n4\td\n"
+        var same = true
+        var first = ""
+        for n in 0..8 {
+            let d = q(mut &s, "drop table if exists t")
+            let m = q(mut &s, "create table t (n int primary key, a text)")
+            let got = load(mut &s, "copy t from stdin", &bad, n, false)
+            if n == 0 { first = got } else if got != first { same = false }
+        }
+        println("error: same for every split: " + (if same { "true" } else { "false" }) + " (" + first + ")")
+        let d1 = q(mut &s, "drop table if exists t")
+        let m1 = q(mut &s, "create table t (n int primary key, a text)")
+        let f = load(mut &s, "copy t from stdin", &"1\ta\n2\tb\n", 4, true)
+        println("fail part way: " + strings.split(&f, " ")[0] + ", rows " + q(mut &s, "select count(*) from t"))
+
+        // batch_rows
+        let d2 = q(mut &s, "drop table if exists t")
+        let m2 = q(mut &s, "create table t (n int primary key, a text)")
+        var ten = ""
+        for i in 1..11 { ten = ten + i.toStr() + "\tv\n" }
+        println("batches: " + load(mut &s, "copy t from stdin with (batch_rows 3)", &ten, 5, false) + ", rows " + q(mut &s, "select count(*) from t"))
+        let d3 = q(mut &s, "delete from t")
+        let dup = "1\ta\n2\tb\n3\tc\n4\td\n5\te\n1\tagain\n7\tf\n"
+        let bf = load(mut &s, "copy t from stdin with (batch_rows 2)", &dup, 3, false)
+        println("batch failure: " + strings.split(&bf, " ")[0] + ", rows " + q(mut &s, "select count(*) from t"))
+        let b1 = q(mut &s, "begin")
+        let inBlock = load(mut &s, "copy t from stdin with (batch_rows 2)", &"9\tz\n", 0, false)
+        let b2 = q(mut &s, "rollback")
+        println("in a block: " + strings.split(&inBlock, " ")[0] + "; to: " + q(mut &s, "copy t to stdout with (batch_rows 2)") +
+                "; zero: " + q(mut &s, "copy t from stdin with (batch_rows 0)"))
+        s.close()
+        return 0
+    }).unwrap()
+}

@@ -419,31 +419,54 @@ fn (w: mut &Wire) copyTo(s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int, pc:
     return r
 }
 
-// COPY FROM STDIN: asks for the data (n columns) and takes it until
-// CopyDone or CopyFail. Flush and Sync are ignored meanwhile, as
-// PostgreSQL does; another message ends it with an error.
-fn (w: mut &Wire) copyData(cols: []lexdb_exec.OutCol): Result[lexdb_exec.CopyInput, io.IoError] {
+// COPY FROM STDIN: asks for the data (n columns), and the session reads it
+// as it comes (Session.copyInFrom, 9.87): a part is the CopyData messages
+// here, up to about 64 kB, the last at CopyDone or CopyFail. Flush and Sync
+// are ignored meanwhile, as PostgreSQL does; another message ends it with
+// an error. The session is out of w while it runs, so that the closure can
+// read w's connection. CopyData after the statement ends (an error part
+// way) is dropped by step.
+fn (w: mut &Wire) copyFrom(s: &lexdb_sql.Stmt, cols: &[]lexdb_exec.OutCol): Result[lexdb_exec.Res, lexdb_base.DbErr] {
     w.copyResponse('G', len(cols))
-    try w.flush()
-    var b = newStrBuf()
-    while true {
-        match try w.readMsg(false) {
-            None { return Ok(lexdb_exec.CopyInput{have: true, data: "", fail: "the connection was lost during COPY", proto: true, stream: false}) }
-            Some(m) {
-                if m.typ == 'd' { b.add(m.body) }
-                else if m.typ == 'c' { return Ok(lexdb_exec.CopyInput{have: true, data: b.toStr(), fail: "", proto: false, stream: false}) }
-                else if m.typ == 'f' {
-                    var r = Rd{s: m.body, at: 0, bad: false}
-                    let msg = r.cstr()
-                    return Ok(lexdb_exec.CopyInput{have: true, data: "", fail: if msg == "" { "canceled by the client" } else { msg }, proto: false, stream: false})
-                } else if m.typ != 'H' && m.typ != 'S' {
-                    return Ok(lexdb_exec.CopyInput{have: true, data: "", proto: true, stream: false,
-                                                   fail: "unexpected message type " + int(m.typ).toStr() + " during COPY from stdin"})
+    if w.flush().isErr() { return Err(protoErr("the connection was lost during COPY")) }
+    var sess = replace(mut &w.sess, lexdb_exec.parkedSession(w.st))
+    let r = sess.copyInFrom(s, fn(): lexdb_exec.CopyPart {
+        var b = newStrBuf()
+        while true {
+            let got = match w.readMsg(false) {
+                Ok(m) { m }
+                Err(_) { None }
+            }
+            match got {
+                None { return lexdb_exec.CopyPart{data: b.toStr(), end: true, fail: "the connection was lost during COPY", proto: true} }
+                Some(m) {
+                    if m.typ == 'd' {
+                        b.add(m.body)
+                        if b.size() >= 65536 || !w.hasMsg() { return lexdb_exec.CopyPart{data: b.toStr(), end: false, fail: "", proto: false} }
+                    } else if m.typ == 'c' {
+                        return lexdb_exec.CopyPart{data: b.toStr(), end: true, fail: "", proto: false}
+                    } else if m.typ == 'f' {
+                        var rd = Rd{s: m.body, at: 0, bad: false}
+                        let msg = rd.cstr()
+                        return lexdb_exec.CopyPart{data: "", end: true, fail: if msg == "" { "canceled by the client" } else { msg }, proto: false}
+                    } else if m.typ != 'H' && m.typ != 'S' {
+                        return lexdb_exec.CopyPart{data: "", end: true, proto: true,
+                                                   fail: "unexpected message type " + int(m.typ).toStr() + " during COPY from stdin"}
+                    }
                 }
             }
         }
-    }
-    return Ok(lexdb_exec.CopyInput{have: true, data: "", fail: "unreachable", proto: true, stream: false})
+        return lexdb_exec.CopyPart{data: "", end: true, fail: "unreachable", proto: true}
+    })
+    let parked = replace(mut &w.sess, sess)
+    return r
+}
+
+// Whether a whole message has been read and waits in the buffer.
+fn (w: &Wire) hasMsg(): bool {
+    let have = w.inEnd - w.inPos
+    if have < 5 { return false }
+    return have >= 1 + binary.readI32BE(&w.inBuf, w.inPos + 1)
 }
 
 // ---- the simple query protocol
@@ -471,7 +494,7 @@ fn (w: mut &Wire) query(sql: &str): Result[Unit, io.IoError] {
                         }
                         Err(_) {}
                     }
-                    if copyIn { r = w.sess.copyIn(&s, try w.copyData(cols)) }
+                    if copyIn { r = w.copyFrom(&s, &cols) }
                     match r {
                         Ok(res) {
                             if res.copy == lexdb_exec.COPY_OUT { w.copyOut(&res) }
@@ -678,10 +701,8 @@ fn (w: mut &Wire) executeMsg(ps: mut &Ps, body: &str): Result[Unit, lexdb_base.D
     ps.stmts.atMut(name).plan = plan
     var res = try ran
     if res.copy == lexdb_exec.COPY_IN {
-        match w.copyData(replace(mut &res.cols, [])) {
-            Ok(input) { res = try w.sess.copyIn(&ps.stmts.at(name).stmts[0], input) }
-            Err(_) { return Err(protoErr("the connection was lost during COPY")) }
-        }
+        let cols = replace(mut &res.cols, [])
+        res = try w.copyFrom(&ps.stmts.at(name).stmts[0], &cols)
     }
     if res.copy == lexdb_exec.COPY_OUT {
         w.copyOut(&res)
@@ -934,6 +955,9 @@ fn (w: mut &Wire) step(ps: mut &Ps, m: &Msg): Result[bool, io.IoError] {
         try w.query(&sql)
         return Ok(true)
     }
+    // CopyData, CopyDone and CopyFail outside COPY (one that ended in an
+    // error part way): dropped, as PostgreSQL does
+    if t == 'd' || t == 'c' || t == 'f' { return Ok(true) }
     if w.skipping { return Ok(true) }
     var res: Result[Unit, lexdb_base.DbErr] = Ok(Unit{})
     if t == 'P' { res = w.parseMsg(ps, &m.body) }
