@@ -1,0 +1,69 @@
+// lexdb_follow: a checkpoint's trees can hold a commit that its log replay
+// point does not: one in the batch after the one being flushed. With the
+// log's flushes held, commit c1's batch waits for its flush and commit c2
+// goes into the next batch; a checkpoint then takes both. A follower that
+// has applied only c1's batch must not read that checkpoint's trees (its
+// covers batch is c2's): c2 is not there for it, and is once its batch is
+// applied.
+// expect: at c1's batch: c1 true, c2 absent true, the older checkpoint true
+// expect: at c2's batch: c2 true, the new checkpoint true
+import "task"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_follow"
+
+type Arg = record { st: lexdb_store.Store; tree: int; key: str }
+
+fn put(x: Arg): int {
+    var t = lexdb_store.begin()
+    t.put(x.tree, x.key, "v").unwrap()
+    x.st.commit(t).unwrap()
+    return 0
+}
+
+fn ckpt(st: lexdb_store.Store): int {
+    st.checkpoint().unwrap()
+    return 0
+}
+
+fn main() {
+    let fs = lexdb_disk.sim(9)
+    // no checkpoints but the test's
+    let opts = lexdb_store.Options{cacheBytes: 4 * 1024 * 1024, segBytes: 1024 * 1024, ckptBytes: 64 * 1024 * 1024, snapNodes: 100000,
+                                   bufferedPages: false}
+    var lines: []str = []
+    lexdb_store.run(fs, opts, fn(st: lexdb_store.Store): int {
+        var t = lexdb_store.begin()
+        let a = st.createTree(mut &t)
+        t.put(a, "x", "0").unwrap()
+        st.commit(t).unwrap()
+        st.checkpoint().unwrap()
+        let fo = lexdb_follow.open(st, fs, 1024 * 1024).unwrap()
+        fo.poll(st.durableBatch()).unwrap()
+        let b0 = st.durableBatch()
+        let first = fo.stats().ckpt
+        task.scope(fn(sc: mut &task.Scope) {
+            fs.holdFlushes("log.")
+            sc.spawn(put, Arg{st: st, tree: a, key: "c1"})
+            for i in 0..50 { let y = task.yield() }     // c1's batch is being flushed
+            sc.spawn(put, Arg{st: st, tree: a, key: "c2"})
+            for i in 0..50 { let y = task.yield() }     // c2 is applied, in the next batch
+            sc.spawn(ckpt, st)
+            for i in 0..50 { let y = task.yield() }     // the checkpoint has taken its trees
+            fs.holdFlushes("")
+        })
+        fo.poll(b0 + 1).unwrap()
+        let s1 = fo.begin().unwrap()
+        let c1 = fo.get(&s1, a, &"c1").unwrap().isSome()
+        let c2 = fo.get(&s1, a, &"c2").unwrap().isNone()
+        append(mut &lines, "at c1's batch: c1 " + c1.toStr() + ", c2 absent " + c2.toStr() + ", the older checkpoint " + (s1.ckpt == first).toStr())
+        fo.end(&s1)
+        fo.poll(st.durableBatch()).unwrap()
+        let s2 = fo.begin().unwrap()
+        append(mut &lines, "at c2's batch: c2 " + fo.get(&s2, a, &"c2").unwrap().isSome().toStr() + ", the new checkpoint " + (s2.ckpt > first).toStr())
+        fo.end(&s2)
+        fo.close()
+        return 0
+    }).unwrap()
+    for l in lines { println(l) }
+}

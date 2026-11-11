@@ -5290,3 +5290,97 @@ type comes from where it is used. It is in both runtimes as
 |---|---|---|
 | round 1 | 12.5 / 35.6 / 41.0 / 46.0 / 34.0 / 21.1 | 12.0 / 34.8 / 40.5 / 45.5 / 33.5 / 20.7 |
 | round 2 | 12.5 / 35.6 / 41.5 / 46.1 / 34.1 / 21.2 | 12.2 / 35.0 / 40.8 / 45.5 / 33.4 / 20.7 |
+
+### 9.71 The follower: base and delta, in one process (step 2 of 9.68)
+
+`cmd/lexdb_follow.lxl` is the read side of a replica. It reads the store
+from the master's files and changes nothing:
+
+- **Base:** a checkpoint's trees, read from the page file. It keeps its
+  own page cache, keyed by page number: lazy leaves (9.70), and internal
+  nodes with their children as page numbers. A page is never written in
+  place, so a cached page stays right for every checkpoint that names it.
+- **Delta:** every batch's rows since the base, read from the log
+  segments with recovery's `readFrame`. Per tree, each key has its
+  versions by batch (whole values: the log holds rows), and the keys are
+  in sorted runs of key numbers. A run merges into the one before it while
+  that one is no longer (a binary counter), so a scan merges about log n
+  runs. Tree creates and drops are kept by batch.
+- **A snapshot** is a batch and a base. A point read takes the newest
+  version at or before the batch, else the base. A scan merges the base's
+  leaves with the delta's keys in the range. A base value is unescaped,
+  and a large value's chunks are read from the base's companion tree, as
+  `unstore` does.
+
+**When a checkpoint can serve a snapshot.** A checkpoint takes the trees
+as they are, which can include commits in the batch still open, and
+replays from `durableBatch + 1`. So its trees can hold a commit that its
+replay point does not cover. The meta page now records `covers` (the
+batch of the last commit applied when the trees were taken), and a base
+serves only snapshots at batches >= it. Files from before this have
+`covers` 0, and a follower does not use their checkpoint. The next one
+the master writes, at the latest at shutdown, has it.
+
+**What the master keeps for a follower** (`Store.hold(ckpt, seg)`):
+- the pages that checkpoints after `ckpt` free stay unused (`heldFree`).
+  They are still written into the meta page's free list, so a restart,
+  which drops the hold, does not leak them;
+- log segments from `seg` on are not recycled.
+
+`holdNow` starts a hold at the durable checkpoint, and every segment, in
+one step. The follower then reads the meta page, which may be that
+checkpoint or a later one. When no snapshot uses a base but the newest,
+the follower lets the older ones go:
+1. it evicts the pages the oldest kept base lists as free (the master
+   may reuse them from then on);
+2. it drops the versions before that base's replay batch;
+3. it moves the hold up.
+
+A durable batch missing from the log is now an error, where the follower
+used to stop short of it without saying so.
+
+**Tests:**
+- `follow_basic`, twice: a follower cache of 48 KB (pages come and go)
+  and 16 MB (every page stays, so a page the master reuses must be
+  evicted). Each pass runs 80 rounds of concurrent random commits: puts,
+  deletes, escaped values, large values, trees created and dropped,
+  checkpoints, 64 KB log segments. Each round records every tree and 20
+  keys a tree as a master snapshot sees them. The follower runs a round
+  behind (twelve, for twenty rounds) and must match the record whole and
+  by point reads. Snapshots kept across about a dozen checkpoints must
+  still read their state. The page file audits clean at the end.
+- `follow_covers` holds the log's flushes so that a checkpoint takes a
+  commit beyond its replay point. A follower one batch short must not see
+  that commit.
+
+Ten bugs were put back, and each was caught:
+- versions read regardless of the batch;
+- freed pages kept in the cache;
+- an escaped value not unescaped;
+- the master ignoring the hold;
+- a base used before its covers batch;
+- the delta pruned to the newest base;
+- creates and drops ignored;
+- a deleted key not hiding the base's;
+- segments not held;
+- `covers` not written.
+
+The last needed `follow_covers`. Segments not held needed smaller
+segments and the lag. All 64 lexdb tests and the crash test pass.
+
+**Measured** (one process, the simulated files, everything cached;
+100,000 rows, then 20,000 updates in the delta, 18,116 keys):
+
+| | master | follower |
+|---|---:|---:|
+| point read | 390 to 400 ns | 382 to 393 ns |
+| full scan, empty delta | 2 ms | 4 ms |
+| full scan, 18,116 delta keys | 2 ms | 9 ms (15 before the runs held key numbers and merged instead of sorting) |
+
+**Next:**
+- **Scans:** stream the delta's merge rather than collecting it, and read
+  the base's entries without copying them out of the cache.
+- **Step 3:** the replica process. Batches come over a socket after their
+  flush (with this as catch-up), and hold and the durable batch become
+  messages. The executor reads through the follower for read-only
+  sessions, and refuses writes with 25006.

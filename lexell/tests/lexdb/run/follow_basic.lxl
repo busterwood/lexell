@@ -1,0 +1,250 @@
+// lexdb_follow: a follower reads the master's checkpoint pages and log, and
+// as of a batch sees exactly what a master snapshot saw at that batch.
+// 80 rounds of random commits (several at once, so batches hold more than
+// one): puts and deletes, values that start with the escape byte, large
+// values (chunks in the companion tree), trees created and dropped,
+// checkpoints every few rounds and on their own as the log grows. Each
+// round records every tree as a master snapshot sees it, and some keys'
+// values; the follower runs a round behind (twelve, for twenty rounds: it
+// falls behind across checkpoints and log segments, then catches up): it
+// applies the batches up to a recorded round's durable one (a checkpoint
+// taken since may cover more than that) and must match that round's
+// record, whole and by point reads.
+// A follower snapshot is kept across several checkpoints and must still
+// read its state then, exactly. Twice: a follower cache of 48 KB (pages
+// come and go) and of 16 MB (every page stays, so a page the master frees
+// and reuses must leave it). With the follower closed and the store too,
+// the page file's accounting holds (the pages held for it were freed).
+// expect: cache 48 KB: rounds 79, same 79, point reads same true
+// expect: cache 48 KB: kept snapshots 7, still same 7
+// expect: cache 48 KB: checkpoints taken up more than 5 true, pages evicted for reuse true
+// expect: cache 48 KB: audit ok true
+// expect: cache 16384 KB: rounds 79, same 79, point reads same true
+// expect: cache 16384 KB: kept snapshots 7, still same 7
+// expect: cache 16384 KB: checkpoints taken up more than 5 true, pages evicted for reuse true
+// expect: cache 16384 KB: audit ok true
+import "task"
+import "collections"
+import "strings"
+import "../../../cmd/lexdb_base"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_follow"
+
+fn key(i: int): str { return "k" + strings.padLeft(i.toStr(), 5, '0') }
+
+// a value: short, escaped (starts with 0xFF), or large (chunked)
+fn value(r: mut &lexdb_base.Rng, round: int): str {
+    let kind = r.below(10)
+    let tag = "r" + round.toStr() + "."
+    if kind == 0 { return strFromBytes(&[byte(0xFF), byte(1), byte(2)]) + tag }
+    if kind == 1 { return tag + strings.repeat("L", 1500 + r.below(6000)) }
+    return tag + strings.repeat("v", r.below(80))
+}
+
+fn dumpMaster(st: &lexdb_store.Store, t: mut &lexdb_store.Txn, tree: int): str {
+    var out: []str = []
+    let r = st.scan(t, tree, "", "", fn(e: &lexdb_store.Entry): bool {
+        append(mut &out, e.key + "=" + e.val)
+        return true
+    })
+    if r.isErr() { return "error " + r.unwrapErr().state + " " + r.unwrapErr().msg }
+    return len(out).toStr() + ":" + strings.join(&out, ",")
+}
+
+fn dumpFollower(fo: &lexdb_follow.Follower, s: &lexdb_follow.FSnap, tree: int): str {
+    var out: []str = []
+    let r = fo.scan(s, tree, &"", &"", fn(e: &lexdb_store.Entry): bool {
+        append(mut &out, e.key + "=" + e.val)
+        return true
+    })
+    if r.isErr() { return "error " + r.unwrapErr().state + " " + r.unwrapErr().msg }
+    return len(out).toStr() + ":" + strings.join(&out, ",")
+}
+
+type Job = record { st: lexdb_store.Store; seed: int; round: int; trees: []int; create: bool; drop: int; made: task.Shared[[]int] }
+
+// One commit: some puts and deletes across the trees, maybe a new tree, maybe a drop.
+fn commitOne(j: Job): int {
+    var r = lexdb_base.rng(j.seed)
+    var t = lexdb_store.begin()
+    for _ in 0..1 + r.below(40) {
+        let tree = j.trees[r.below(len(j.trees))]
+        let k = key(r.below(3000))
+        if r.below(4) == 0 { t.del(tree, k) } else { t.put(tree, k, value(mut &r, j.round)).unwrap() }
+    }
+    var c = -1
+    if j.create {
+        c = j.st.createTree(mut &t)
+        t.put(c, key(1), "new").unwrap()
+    }
+    if j.drop >= 0 { t.dropTree(j.drop) }
+    let res = j.st.commit(t)        // conflicts are fine: the commit just does not happen
+    if c >= 0 && res.isOk() { j.made.with(fn(m: mut &[]int) { append(m, c) }) }
+    return 0
+}
+
+fn treesOf(st: &lexdb_store.Store, known: &[]int): []int {
+    // the trees a master snapshot can see now
+    var s = st.beginSnapshot().unwrap()
+    var out: []int = []
+    for t in known {
+        var any = false
+        st.scan(mut &s, t, "", "", fn(e: &lexdb_store.Entry): bool {
+            any = true
+            return false
+        }).unwrap()
+        if any { append(mut &out, t) }
+    }
+    st.endSnapshot(&s)
+    return out
+}
+
+fn copyInts(xs: &[]int): []int {
+    var out: []int = []
+    for x in xs { append(mut &out, x) }
+    return out
+}
+
+fn has(xs: &[]int, x: int): bool {
+    for y in xs { if y == x { return true } }
+    return false
+}
+
+fn cut(s: &str, n: int): str { return if len(s) > n { s[0..n] + "..." } else { lexdb_base.own(s) } }
+
+type Kept = record { snap: lexdb_follow.FSnap; dumps: []str; trees: []int; until: int }
+
+// A round's record: the master's view at its durable batch.
+type Rec = record { batch: int; trees: []int; dumps: []str; ptree: []int; pkey: []str; pval: []str }
+
+fn phase(seed: int, followerCache: int): []str {
+    let fs = lexdb_disk.sim(seed)
+    let opts = lexdb_store.Options{cacheBytes: 4 * 1024 * 1024, segBytes: 64 * 1024, ckptBytes: 96 * 1024, snapNodes: 100000,
+                                   bufferedPages: false}
+    var lines: []str = []
+    let tag = "cache " + (followerCache / 1024).toStr() + " KB: "
+    lexdb_store.run(fs, opts, fn(st: lexdb_store.Store): int {
+        var known: []int = []
+        var t = lexdb_store.begin()
+        for _ in 0..3 { append(mut &known, st.createTree(mut &t)) }
+        for i in 0..3000 { t.put(known[i % 3], key(i), "init" + i.toStr()).unwrap() }
+        st.commit(t).unwrap()
+        st.checkpoint().unwrap()
+        let fo = lexdb_follow.open(st, fs, followerCache).unwrap()
+        var r = lexdb_base.rng(seed + 5)
+        let made = task.shared[[]int]([])
+        var compared = 0
+        var same = 0
+        var pointsSame = true
+        var keptCount = 0
+        var keptSame = 0
+        var kept: []Kept = []
+        var ckpts: []int = []
+        var prev: []Rec = []
+        for round in 0..80 {
+            // the trees commits may use: live ones
+            let live = treesOf(&st, &known)
+            var jobs: []Job = []
+            let n = 1 + r.below(5)
+            for i in 0..n {
+                let create = r.below(12) == 0
+                let drop = if r.below(30) == 0 && len(live) > 3 { live[r.below(len(live))] } else { -1 }
+                append(mut &jobs, Job{st: st, seed: seed * 10000 + round * 100 + i, round: round, trees: copyInts(&live), create: create, drop: drop, made: made})
+            }
+            task.scope(fn(s: mut &task.Scope) {
+                while len(jobs) > 0 { s.spawn(commitOne, pop(mut &jobs)) }
+            })
+            if round % 7 == 3 { st.checkpoint().unwrap() }
+            made.with(fn(m: mut &[]int) { while len(m) > 0 { append(mut &known, pop(m)) } })
+            // this round's record
+            var ms = st.beginSnapshot().unwrap()
+            var rec = Rec{batch: st.durableBatch(), trees: copyInts(&known), dumps: [], ptree: [], pkey: [], pval: []}
+            for tr in known {
+                append(mut &rec.dumps, dumpMaster(&st, mut &ms, tr))
+                for _ in 0..20 {
+                    let ky = key(r.below(3000))
+                    let ma = st.get(mut &ms, tr, ky)
+                    append(mut &rec.ptree, tr)
+                    append(mut &rec.pkey, ky)
+                    append(mut &rec.pval, if ma.isOk() { ma.unwrap().unwrapOr("-") } else { "err" })
+                }
+            }
+            st.endSnapshot(&ms)
+            // the follower, a round behind (12 for rounds 30 to 49: it falls
+            // behind across checkpoints and log segments, then catches up)
+            append(mut &prev, rec)
+            let lag = if round >= 30 && round < 50 { 12 } else { 1 }
+            while len(prev) > lag {
+                let p = collections.removeAt(mut &prev, 0)
+                fo.poll(p.batch).unwrap()
+                if !fo.ready() { continue }
+                let fsnap = fo.begin().unwrap()
+                if fsnap.batch != p.batch { append(mut &lines, tag + "batch " + fsnap.batch.toStr() + " recorded " + p.batch.toStr()) }
+                compared += 1
+                var allSame = true
+                var dumps: []str = []
+                for i in 0..len(p.trees) {
+                    let b = dumpFollower(&fo, &fsnap, p.trees[i])
+                    if b != p.dumps[i] {
+                        allSame = false
+                        if len(lines) < 5 { append(mut &lines, tag + "round " + round.toStr() + " tree " + p.trees[i].toStr() + ": master " + cut(&p.dumps[i], 200) + " follower " + cut(&b, 200)) }
+                    }
+                    append(mut &dumps, b)
+                }
+                for i in 0..len(p.pkey) {
+                    let fa = fo.get(&fsnap, p.ptree[i], &p.pkey[i])
+                    let fv = if fa.isOk() { fa.unwrap().unwrapOr("-") } else { "err " + fa.unwrapErr().msg }
+                    if fv != p.pval[i] {
+                        pointsSame = false
+                        if len(lines) < 5 { append(mut &lines, tag + "get " + p.ptree[i].toStr() + " " + p.pkey[i] + ": " + cut(&p.pval[i], 60) + " / " + cut(&fv, 60)) }
+                    }
+                }
+                if allSame { same += 1 }
+                let stats = fo.stats()
+                if len(ckpts) == 0 || ckpts[len(ckpts) - 1] != stats.ckpt { append(mut &ckpts, stats.ckpt) }
+                // every tenth round a snapshot is kept for a while
+                if round % 10 == 5 {
+                    append(mut &kept, Kept{snap: fsnap, dumps: dumps, trees: copyInts(&p.trees), until: round + 12})
+                    keptCount += 1
+                } else {
+                    fo.end(&fsnap)
+                }
+                var stay: []Kept = []
+                while len(kept) > 0 {
+                    let k = pop(mut &kept)
+                    if k.until <= round || round == 79 {
+                        var ok = true
+                        for i in 0..len(k.trees) {
+                            if dumpFollower(&fo, &k.snap, k.trees[i]) != k.dumps[i] {
+                                ok = false
+                                if len(lines) < 5 { append(mut &lines, tag + "kept snapshot at " + k.snap.batch.toStr() + " tree " + k.trees[i].toStr() + " changed") }
+                            }
+                        }
+                        if ok { keptSame += 1 }
+                        fo.end(&k.snap)
+                    } else {
+                        append(mut &stay, k)
+                    }
+                }
+                kept = stay
+            }
+        }
+        let fst = fo.stats()
+        fo.close()
+        append(mut &lines, tag + "rounds 79, same " + same.toStr() + ", point reads same " + pointsSame.toStr())
+        append(mut &lines, tag + "kept snapshots " + keptCount.toStr() + ", still same " + keptSame.toStr())
+        append(mut &lines, tag + "checkpoints taken up more than 5 " + (len(ckpts) > 5).toStr() + ", pages evicted for reuse " + (fst.freed > 0).toStr())
+        if compared != 79 { append(mut &lines, tag + "compared " + compared.toStr()) }
+        return 0
+    }).unwrap()
+    let a = lexdb_store.audit(fs)
+    append(mut &lines, tag + "audit ok " + a.isOk().toStr())
+    if a.isErr() { append(mut &lines, a.unwrapErr().msg) }
+    return lines
+}
+
+fn main() {
+    for l in phase(71, 48 * 1024) { println(l) }
+    for l in phase(72, 16 * 1024 * 1024) { println(l) }
+}

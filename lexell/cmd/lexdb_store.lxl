@@ -35,7 +35,7 @@ pub const OP_CREATE = 3
 pub const OP_DROP = 4
 const OP_PUT_HEAD = 5       // in the log only: a put with its head (TxWrite.head)
 
-fn segName(g: int): str { return "log." + g.toStr() }
+pub fn segName(g: int): str { return "log." + g.toStr() }
 
 pub type Options = value record {
     pub cacheBytes: int     // about the memory nodes take before clean ones are evicted (lexdb_page.nodeCost)
@@ -78,6 +78,10 @@ type Deferred = value record { slot: int; seq: int; height: int }
 // A tree's root changed by commit seq (prev: the root before, -1 none): a
 // snapshot at an earlier commit starts from prev.
 type RootChange = value record { seq: int; tree: int; prev: int }
+
+// The pages checkpoint ckpt freed, as runs, kept from reuse while a
+// follower may read an earlier checkpoint (hold).
+type HeldRuns = record { ckpt: int; runs: []int }
 
 type Waiter = record { batch: int; p: task.Promise[Result[Unit, lexdb_base.DbErr]] }
 
@@ -137,6 +141,9 @@ pub type Db = record {
     deferred: []Deferred        // slots freed while a snapshot may reach them
     rootHist: []RootChange      // root changes a snapshot may still need
     durableSeq: int             // the last commit the log holds: snapshots read as of it
+    holdCkpt: int               // a follower reads checkpoints from this one on (9.71), -1 none:
+    holdSeg: int                //   pages later checkpoints free stay unused (heldFree), and
+    heldFree: []HeldRuns        //   log segments from holdSeg on are kept
     // counters
     pub snapshots: int
     pub tooOld: int
@@ -179,7 +186,7 @@ var WLOG_MAX: int = 131072
 pub fn setWriteLogMax(n: int) { WLOG_MAX = n }
 
 // head: a large value's first bytes its writer wants kept in its leaf (9.31).
-type TxWrite = value record { op: int; tree: int; key: str; val: str; head: int }
+pub type TxWrite = value record { pub op: int; pub tree: int; pub key: str; pub val: str; pub head: int }
 
 pub type Txn = record {
     reads: []Mark
@@ -1037,14 +1044,14 @@ fn (db: mut &Db) writeNeeds(w: &TxWrite): int {
 pub const MAX_VALUE = 64 * 1024 * 1024       // the wire's largest message (lexdb_wire.MAX_MESSAGE)
 pub const OVF = 1 << 40                       // (public for the tests: a scan of tree + OVF gives its chunks)
 const BIG: byte = 0xFF
-const STUB_LEN = 14
-const LAST_CHUNK = 0xFFFFFFFF                 // past every chunk's number: a key range's end
+pub const STUB_LEN = 14
+pub const LAST_CHUNK = 0xFFFFFFFF                 // past every chunk's number: a key range's end
 
 fn isOvf(tree: int): bool { return tree >= OVF }
-fn marked(v: &str): bool { return len(v) > 0 && v[0] == BIG }
+pub fn marked(v: &str): bool { return len(v) > 0 && v[0] == BIG }
 // A stub: version 1 (9.29) has no row start; version 2 (9.31) is followed
 // by the value's first bytes, the chunks holding the rest.
-fn isStub(v: &str): bool { return len(v) >= STUB_LEN && v[0] == BIG && ((v[1] == 1 && len(v) == STUB_LEN) || v[1] == 2) }
+pub fn isStub(v: &str): bool { return len(v) >= STUB_LEN && v[0] == BIG && ((v[1] == 1 && len(v) == STUB_LEN) || v[1] == 2) }
 
 // How a scan gives large values: whole; RAW, as stored (a companion's
 // chunks); PART, as their stubs (partOf, whole).
@@ -1065,7 +1072,7 @@ pub fn (st: &Store) whole(t: mut &Txn, tree: int, key: &str, v: &str): Result[st
     return st.unstore(t, tree, key, v)
 }
 
-fn chunkKey(key: &str, i: int): str {
+pub fn chunkKey(key: &str, i: int): str {
     var b = newStrBuf()
     binary.addU16BE(mut &b, len(key))
     b.add(key)
@@ -1076,7 +1083,7 @@ fn chunkKey(key: &str, i: int): str {
 // The bytes of a value each chunk of key holds.
 fn chunkRoom(key: &str): int { return lexdb_page.MAX_ENTRY - lexdb_page.leafEntry(&chunkKey(key, 0), &"") }
 
-fn crcOf(crc: u32, s: &str): u32 { return hash.crc32cMore(crc, &strToBytes(s)) }
+pub fn crcOf(crc: u32, s: &str): u32 { return hash.crc32cMore(crc, &strToBytes(s)) }
 
 // The value at key in a tree whose leaf for it is in memory.
 fn (db: mut &Db) leafVal(tree: int, key: &str): Option[str] {
@@ -2504,8 +2511,12 @@ pub fn (st: &Store) checkpoint(): Result[Unit, lexdb_base.DbErr] {
         // free pages for them joins none and splits none).
         let freedRuns = runsOf(&freed)
         var freePages: []int = []
-        for j in 0..lexdb_page.listPages(len(db.free) + len(freedRuns)) { append(mut &freePages, db.allocPage()) }
-        let freeVals = mergeRuns(&db.free, &freedRuns)
+        var heldRuns = 0
+        for h in db.heldFree { heldRuns += len(h.runs) }
+        for j in 0..lexdb_page.listPages(len(db.free) + len(freedRuns) + heldRuns) { append(mut &freePages, db.allocPage()) }
+        // pages held for a follower are free as far as recovery goes
+        var freeVals = mergeRuns(&db.free, &freedRuns)
+        for h in db.heldFree { freeVals = mergeRuns(&freeVals, &h.runs) }
         var dl = lexdb_page.encodeList(&dropVals, &dropPages)
         i = len(dl) - 1
         while i >= 0 {
@@ -2533,9 +2544,10 @@ pub fn (st: &Store) checkpoint(): Result[Unit, lexdb_base.DbErr] {
                                 roots: if len(rootPages) > 0 { rootPages[0] } else { 0 },
                                 free: 0, runs: if len(freePages) > 0 { freePages[0] } else { 0 },
                                 replaySeg: db.seg, replayOff: db.segOff, replayBatch: db.durableBatch + 1,
-                                nextTree: db.nextTree, dropped: if len(dropPages) > 0 { dropPages[0] } else { 0 }}
+                                nextTree: db.nextTree, dropped: if len(dropPages) > 0 { dropPages[0] } else { 0 },
+                                covers: target}
         metaPage = lexdb_page.encodeMeta(&m, n % 2)
-        for s in 1..db.seg { append(mut &oldSegs, s) }
+        for s in 1..db.seg { if db.holdSeg < 0 || s < db.holdSeg { append(mut &oldSegs, s) } }
     })
     if len(bad) > 0 { return Err(bad[0]) }
     if busy { return Ok(Unit{}) }
@@ -2551,7 +2563,11 @@ pub fn (st: &Store) checkpoint(): Result[Unit, lexdb_base.DbErr] {
     st.sh.with(fn(db: mut &Db) {
         db.durableCkpt = n
         let pf = replace(mut &db.pendingFree, [])
-        db.free = mergeRuns(&db.free, &pf)
+        if db.holdCkpt >= 0 && db.holdCkpt < n {
+            append(mut &db.heldFree, HeldRuns{ckpt: n, runs: pf})        // base n - 1's: a follower may read them
+        } else {
+            db.free = mergeRuns(&db.free, &pf)
+        }
         db.listPages = replace(mut &newLists, [])
         db.ckptRunning = false
         db.logSinceCkpt = 0
@@ -2699,7 +2715,7 @@ fn newDb(fs: lexdb_disk.Fs, data: lexdb_disk.File, opts: Options, m: &lexdb_page
               batch: [], batchCount: 0, batchNo: m.replayBatch, appliedBatch: m.replayBatch - 1,
               durableBatch: m.replayBatch - 1, waiters: [], writerWake: [], ckptWake: [], ckptDone: [], seg: m.replaySeg,
               segOff: m.replayOff, logSinceCkpt: 0, failed: [], closing: false, seq: 0, snaps: [], nextSnap: 0,
-              hist: [], histCount: 0, histSlots: [], deferred: [], rootHist: [], durableSeq: 0, snapshots: 0, tooOld: 0, commits: 0,
+              hist: [], histCount: 0, histSlots: [], deferred: [], rootHist: [], durableSeq: 0, holdCkpt: -1, holdSeg: -1, heldFree: [], snapshots: 0, tooOld: 0, commits: 0,
               conflicts: 0, loads: 0, aheadReads: 0, aheadPages: 0, evictions: 0, flushes: 0, checkpoints: 0, held: 0, wholes: 0}
 }
 
@@ -2726,7 +2742,7 @@ pub fn open(fs: lexdb_disk.Fs, opts: Options): Result[Store, lexdb_base.DbErr] {
         return Err(lexdb_base.corrupt("no valid meta page, and the log does not start at its beginning"))
     }
     let m = best.unwrapOr(lexdb_page.Meta{ckpt: 0, npages: 2, roots: 0, free: 0, replaySeg: 1, replayOff: 0,
-                                          replayBatch: 1, nextTree: 1, dropped: 0, runs: 0})
+                                          replayBatch: 1, nextTree: 1, dropped: 0, runs: 0, covers: 0})
     var lists: []int = []
     let roots = try lexdb_page.readList(&data, m.roots, mut &lists)
     let free = try lexdb_page.readList(&data, m.free, mut &lists)
@@ -2845,7 +2861,7 @@ fn (st: &Store) applyRecovered(w: &TxWrite): Result[Unit, lexdb_base.DbErr] {
 
 // Reads one frame at off: its records and length, or None when there is no
 // valid frame with that batch number there.
-fn readFrame(f: &lexdb_disk.File, off: int, size: int, seg: int, batch: int): Result[Option[[]TxWrite], lexdb_base.DbErr] {
+pub fn readFrame(f: &lexdb_disk.File, off: int, size: int, seg: int, batch: int): Result[Option[[]TxWrite], lexdb_base.DbErr] {
     if off + PAGE > size { return Ok(None) }
     var h = array(PAGE, byte(0))
     try f.read(off, mut &h[0..PAGE], PAGE)
@@ -2863,7 +2879,7 @@ fn readFrame(f: &lexdb_disk.File, off: int, size: int, seg: int, batch: int): Re
     return Ok(Some(recs))
 }
 
-fn frameLen(recs: &[]TxWrite): int {
+pub fn frameLen(recs: &[]TxWrite): int {
     var n = FRAME_HDR
     for w in recs { n += 13 + len(w.key) + len(w.val) + (if w.op == OP_PUT && w.head > 0 { 4 } else { 0 }) }
     return (n + PAGE - 1) / PAGE * PAGE
@@ -2972,6 +2988,45 @@ pub fn (st: &Store) memoGet(k: &str): Option[str] {
 pub fn (st: &Store) memoPut(k: &str, v: &str) { st.sh.with(fn(db: mut &Db) { db.memo.put(k, v) }) }
 
 pub fn (st: &Store) memoDel(k: &str) { st.sh.with(fn(db: mut &Db) { let gone = db.memo.remove(k) }) }
+
+// ---- followers (9.71)
+
+// The last batch the log holds: a follower applies batches up to it.
+pub fn (st: &Store) durableBatch(): int {
+    var b = 0
+    st.sh.with(fn(db: mut &Db) { b = db.durableBatch })
+    return b
+}
+
+// Keeps what a follower reads: the pages that checkpoints after ckpt free
+// are not reused, and log segments from seg on are kept. A follower moves
+// it up as it lets go of older checkpoints; ckpt -1 lets go of all. The
+// pages held become free once ckpt reaches the checkpoint that freed them.
+pub fn (st: &Store) hold(ckpt: int, seg: int) {
+    st.sh.with(fn(db: mut &Db) {
+        db.holdCkpt = ckpt
+        db.holdSeg = if ckpt < 0 { -1 } else { seg }
+        var keep: []HeldRuns = []
+        while len(db.heldFree) > 0 {
+            let h = pop(mut &db.heldFree)
+            if ckpt >= 0 && ckpt < h.ckpt { append(mut &keep, h) } else { db.free = mergeRuns(&db.free, &h.runs) }
+        }
+        db.heldFree = keep
+    })
+}
+
+// Starts a hold at the last durable checkpoint, and every log segment,
+// in one step (a follower's first; it then holds the checkpoint it reads,
+// which is this one or a later one), and gives that checkpoint.
+pub fn (st: &Store) holdNow(): int {
+    var c = 0
+    st.sh.with(fn(db: mut &Db) {
+        c = db.durableCkpt
+        db.holdCkpt = c
+        db.holdSeg = 0
+    })
+    return c
+}
 
 pub fn (st: &Store) stats(): Stats {
     var s = Stats{commits: 0, conflicts: 0, loads: 0, aheadReads: 0, aheadPages: 0, evictions: 0, flushes: 0, checkpoints: 0, loaded: 0,
