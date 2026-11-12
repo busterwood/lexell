@@ -8237,13 +8237,12 @@ filter are read again at every wake, since the client's cursor cannot pass
 rows it never saw. An equality the index begins with costs nothing: `(subject,
 seq)` with `subject = 'x'` reads only x's rows. So a filter on an index's
 prefix suits a selective subscription, and a filter outside it suits one
-most rows pass. A filter on a column producers change after the insert is
-not checked at commit (the reads are not noted); the stream is taken to be
-append-only, as its cursor already requires.
+most rows pass. A filter on a column others change is checked at commit
+like any read (below).
 
 Why it is enforced:
-- Its reads are not noted (below), which is sound only for rows after a
-  cursor that producers only add to.
+- Its reads are checked at commit except past the last key read (below).
+  That gap is sound only for rows after a cursor that producers add to.
 - An aggregate always gives a row, so it would never wait.
 - Every waiter's query runs again at every flush, on the one SQL thread.
 
@@ -8263,24 +8262,43 @@ How the wake works:
   It shows nothing not yet flushed.
 - The check of `durableSeq` against seq and the promise's place are taken
   in one `Shared.with`, which cannot park, so no flush comes between them.
-- A wait that times out leaves its promise, completed at the next flush.
-  That is harmless: the runtime drops the result of a promise whose future
-  is gone (`lxllib_task_complete`).
+- The waiters are `Db.durWaits`, each with an id. A wait that times out
+  takes its own out again, so an idle store gathers none
+  (`Store.durWaiting`). `close` and `fail` wake them.
 - A timer that ends a little early is waited on again, so TIMEOUT is never
   short.
 
-**In a transaction block** it must be the first statement (`Session.fresh`,
-set by BEGIN, cleared by any statement the block runs; else 0A000).
+**In a transaction block** it must be the first statement (else 0A000).
+`Session.fresh` is set by BEGIN and cleared by any statement but SAVEPOINT
+and RELEASE. ROLLBACK TO a savepoint taken while it was set sets it again,
+so a WAITFOR that failed (T-SQL runs each statement under a savepoint)
+can be run again.
 - Its block's snapshot, taken at BEGIN, is taken again for each run
   (`Store.renewSnapshot`), with now(). So the block begins when the wait
   ends, and `BEGIN READ ONLY` sees the rows that woke it.
 - While it waits, the snapshot is let go (`Store.releaseSnapshot`): it
-  pins no old versions and cannot be cancelled (72000).
-- **Its reads are not noted** (`Txn.quiet`, as a locking SELECT's, 9.86).
-  A consumer that read to the stream's end would otherwise fail its commit
-  (40001) at any producer's commit after its snapshot. That happens almost
-  always under steady production; the test shows the plain SELECT doing so.
-  The offset row the block then updates is checked as usual.
+  pins no old versions and cannot be cancelled (72000). It is taken again
+  right after the wait, before any error is returned, so the block never
+  goes on without one. Each renewal drops the reads of the run before.
+- **Its reads are checked, but with an open end** (`Txn.openEnd`).
+  - A scan that reaches the end of its range (the tree's, or the `to` it
+    asked for) notes its read only up to the last key it read, not to the
+    end (`scanIn`, `scanLeaves`).
+  - Without that, a consumer that read to the stream's end would fail its
+    commit (40001) at any producer's commit after its snapshot: almost
+    always under steady production. The test shows a plain SELECT doing so.
+  - Every row it read, returned or skipped by a filter, is checked, and so
+    are the gaps between them. So:
+    - two workers taking the same row by a status column: one fails (40001);
+    - a row its filter skipped, changed by another, fails it;
+    - an event inserted between rows it read (a sequence given out of
+      order) fails it, and the retry sees the event.
+  - Only rows added past the last key read go unchecked, as a consumer that
+    read before them. That is the append the wait is for.
+  - The parameters' types reach the run, as a SELECT's (`waitForRun` takes
+    `ptypes`).
+- The query's shape is checked on each run's snapshot, so a table dropped
+  and made again while it waited is checked again.
 
 **Limits.**
 - `statement_timeout` ends a wait (57014): the wait is to the earlier of
@@ -8291,6 +8309,8 @@ set by BEGIN, cleared by any statement the block runs; else 0A000).
 - **Refused:**
   - on a replica, which flushes nothing of its own (0A000);
   - with a locking clause, which reads live data rather than a snapshot.
+- An autocommit WAITFOR whose snapshot was cancelled (72000) runs again,
+  as a SELECT does.
 - Not done (`lexdb-events.md`):
   - sequence numbers given at commit (a counter row is the way now);
   - a keyed wake-one;
@@ -8307,6 +8327,16 @@ set by BEGIN, cleared by any statement the block runs; else 0A000).
 - the refusals; `statement_timeout`;
 - a READ ONLY block seeing what woke it;
 - a partition's cursor; TIMEOUT and the cursor as parameters;
+- after the review:
+  - two workers updating the row both read: one commits, one gets 40001;
+  - a row the filter skipped, changed by another session: 40001;
+  - a WAITFOR timed out after a savepoint, then ROLLBACK TO: the block's
+    count is stable while another session inserts, and a WAITFOR runs
+    again;
+  - the client's parameter types kept (int4 stays 23);
+  - `AS e(a, b, c)` refused; `seq > -1` taken;
+  - timed-out waits leave no waiters behind;
+  - T-SQL's WAITFOR in a transaction;
 - filters: an equality the index does not hold, `OR` with a function and
   `LIKE`, and an index's prefix with a filter after it. An event failing
   the filter wakes the waiter, which waits on for one that passes;

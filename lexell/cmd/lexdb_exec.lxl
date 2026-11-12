@@ -14484,7 +14484,7 @@ fn (s: mut &Session) setZone(z: lexdb_time.Zone) {
 }
 
 // A savepoint: its name and the block's writes when it was made.
-type SavePt = record { name: str; mark: int }
+type SavePt = record { name: str; mark: int; fresh: bool }     // fresh: Session.fresh when it was set (a WAITFOR may follow a ROLLBACK TO it)
 
 // The columns a statement returns, its names looked up along the session's
 // search path.
@@ -15163,6 +15163,10 @@ fn (s: mut &Session) runIn(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int
 
 fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int, pc: mut &PlanCache,
                              input: &CopyInput, out: &fn(int, &[]byte): bool, pull: &fn(): CopyPart): Result[Res, DbErr] {
+    // a block's first statement may be a WAITFOR: any other but a
+    // savepoint's (and BEGIN's, which does nothing in a block) ends that
+    if !stmt.waitFor && stmt.kind != lexdb_sql.S_SAVEPOINT && stmt.kind != lexdb_sql.S_RELEASE &&
+       stmt.kind != lexdb_sql.S_ROLLBACK_TO && stmt.kind != lexdb_sql.S_BEGIN { s.fresh = false }
     match stmt.kind {
         lexdb_sql.S_EMPTY { return Ok(tagOnly("")) }
         lexdb_sql.S_SHOW { return s.show(&stmt.table) }
@@ -15367,7 +15371,7 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
                 return Err(e("25P02", "current transaction is aborted, commands ignored until end of transaction block"))
             }
             if stmt.kind == lexdb_sql.S_SAVEPOINT {
-                append(mut &s.saves, SavePt{name: stmt.table, mark: s.txn[0].mark()})
+                append(mut &s.saves, SavePt{name: stmt.table, mark: s.txn[0].mark(), fresh: s.fresh})
                 return Ok(tagOnly("SAVEPOINT"))
             }
             var i = len(s.saves) - 1
@@ -15385,6 +15389,7 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
             if s.txn[0].tmpDdl { tmpChanged(&s.st, s.id) }          // (temporary objects' DDL may be gone, 9.96)
             while len(s.saves) > i + 1 { let x = pop(mut &s.saves) }
             s.failed = false
+            s.fresh = s.saves[i].fresh
             return Ok(tagOnly("ROLLBACK"))
         }
         else {}
@@ -15394,12 +15399,11 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
             return Err(e("25P02", "current transaction is aborted, commands ignored until end of transaction block"))
         }
         if stmt.waitFor {
-            let r = s.waitForRun(stmt, params, pc)
+            let r = s.waitForRun(stmt, params, ptypes, pc)
             s.fresh = false
             if r.isErr() { s.failed = true }
             return r
         }
-        s.fresh = false
         if s.readOnly && (isWrite(stmt.kind) || (stmt.kind == lexdb_sql.S_COPY && stmt.copy.from)) && !s.tempWrite(stmt) {
             s.failed = true
             return Err(e("25006", "cannot execute " + stmtName(stmt.kind) + " in a read-only transaction"))
@@ -15423,7 +15427,7 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
         }
         return r
     }
-    if stmt.waitFor { return s.waitForRun(stmt, params, pc) }
+    if stmt.waitFor { return s.waitForRun(stmt, params, ptypes, pc) }
     var tries = 0
     let lim = s.limits()                    // retries share the statement's time
     while true {
@@ -15527,6 +15531,7 @@ fn waitConst(x: &Expr): bool {
         Expr.Lit(_) { return true }
         Expr.Param(_) { return true }
         Expr.Cast(a, _) { return waitConst(&a) }
+        Expr.Unary(op, a) { return op == "-" && waitConst(&a) }            // seq > -1
         else { return false }
     }
 }
@@ -15560,6 +15565,8 @@ fn waitShape(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, stmt: &lexdb_sql
     if stmt.setop != 0 || len(stmt.from) != 1 || stmt.from[0].sub >= 0 {
         return Err(waitRefused("needs a SELECT from one ordinary table"))
     }
+    // (AS e(a, b) would rename the columns the rules below name)
+    if len(stmt.from[0].cols) > 0 { return Err(waitRefused("cannot rename its table's columns (AS t(a, b, ...))")) }
     if len(stmt.subs) > 0 { return Err(waitRefused("cannot have subqueries")) }
     var gathers = len(stmt.group) > 0 || stmt.having.isSome() || stmt.distinct || len(stmt.distinctOn) > 0 || len(stmt.wins) > 0
     for it in stmt.items {
@@ -15634,7 +15641,9 @@ fn waitShape(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, stmt: &lexdb_sql
 }
 
 // Runs a WAITFOR: in the open block (its first statement), or on its own.
-fn (s: mut &Session) waitForRun(stmt: &lexdb_sql.Stmt, params: &[]Val, pc: mut &PlanCache): Result[Res, DbErr] {
+// The block's transaction keeps a snapshot on every way out: it is let go
+// only for the wait itself, and taken again before anything else.
+fn (s: mut &Session) waitForRun(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int, pc: mut &PlanCache): Result[Res, DbErr] {
     let inBlock = len(s.txn) > 0
     if inBlock && !s.fresh { return Err(waitRefused("must be the first statement of its transaction block")) }
     var nolk: []Look = []
@@ -15642,56 +15651,66 @@ fn (s: mut &Session) waitForRun(stmt: &lexdb_sql.Stmt, params: &[]Val, pc: mut &
     if ms < 0 || ms > WAITFOR_CAP_MS { ms = WAITFOR_CAP_MS }
     let lim = s.limits()
     let until = time.monotonicNs() + ms * 1000000
-    // its shape, on a snapshot of its own
-    var probe = try s.st.beginSnapshot()
-    s.setUp(mut &probe)
-    let shaped = waitShape(&s.st, mut &probe, stmt)
-    s.st.abort(probe)
-    try shaped
-    let ptypes: []int = []
+    if inBlock { try s.st.renewSnapshot(mut &s.txn[0]) }      // BEGIN's snapshot: the block begins with the wait's end
     var last = false
+    var tries = 0
     while true {
         let now = time.monotonicNs()
         if lim.deadline != 0 && now > lim.deadline { return Err(e("57014", "canceling statement due to statement timeout")) }
         if now >= until { last = true }
         var seq = 0
-        var got = false
         if inBlock {
-            try s.st.renewSnapshot(mut &s.txn[0])
+            // its shape on the snapshot it runs on (the table may have changed while it waited)
+            try waitShape(&s.st, mut &s.txn[0], stmt)
             seq = s.txn[0].snapshotSeq()
-            s.txn[0].quiet = true
-            let r = execIn(&s.st, mut &s.txn[0], stmt, params, &ptypes, lim, pc, &noInput(), noOut, noPull)
-            s.txn[0].quiet = false
+            // its reads noted, but not past the last key each read reached
+            // (Txn.openEnd): rows producers add after them do not fail the commit
+            s.txn[0].openEnd = true
+            let r = execIn(&s.st, mut &s.txn[0], stmt, params, ptypes, lim, pc, &noInput(), noOut, noPull)
+            s.txn[0].openEnd = false
             let res = try r
             if len(res.rows) > 0 || last { return Ok(res) }
-            s.st.releaseSnapshot(mut &s.txn[0])
         } else {
             var t = try s.st.beginSnapshot()
             s.setUp(mut &t)
             seq = t.snapshotSeq()
-            match execIn(&s.st, mut &t, stmt, params, &ptypes, lim, pc, &noInput(), noOut, noPull) {
-                Ok(res) {
-                    s.adopt(&t)
-                    if len(res.rows) > 0 || last {
-                        try s.st.commit(t)
-                        return Ok(res)
-                    }
-                    s.st.abort(t)
-                }
-                Err(x) {
-                    s.adopt(&t)
-                    s.st.abort(t)
-                    return Err(x)
+            var r = waitShape(&s.st, mut &t, stmt)
+            var out = tagOnly("")
+            if r.isOk() {
+                match execIn(&s.st, mut &t, stmt, params, ptypes, lim, pc, &noInput(), noOut, noPull) {
+                    Ok(x) { out = x }
+                    Err(x) { r = Err(x) }
                 }
             }
+            s.adopt(&t)
+            if r.isErr() {
+                s.st.abort(t)
+                let x = r.unwrapErr()
+                tries += 1
+                // a snapshot too old (72000) is tried again on a new one, as a SELECT's
+                if x.state == "72000" && tries < 10 { continue }
+                return Err(x)
+            }
+            if len(out.rows) > 0 || last {
+                try s.st.commit(t)
+                return Ok(out)
+            }
+            s.st.abort(t)
         }
         // no rows: wait for a flush past what it read, to its time's end
         let end = if lim.deadline != 0 && lim.deadline < until { lim.deadline } else { until }
         let left = (end - time.monotonicNs() + 999999) / 1000000
-        if left > 0 && !s.st.waitDurable(seq, left) {
-            if task.cancelled() { return Err(e("57014", "canceling statement: its session has ended")) }
-            if end != until { return Err(e("57014", "canceling statement due to statement timeout")) }
-            last = true                     // its time is up, or the store is closing: one last run
+        if left > 0 {
+            if inBlock { s.st.releaseSnapshot(mut &s.txn[0]) }
+            let woken = s.st.waitDurable(seq, left)
+            if inBlock { try s.st.renewSnapshot(mut &s.txn[0]) }
+            if !woken {
+                if task.cancelled() { return Err(e("57014", "canceling statement: its session has ended")) }
+                if end != until && time.monotonicNs() >= end { return Err(e("57014", "canceling statement due to statement timeout")) }
+                last = true                 // its time is up, or the store is closing: one last run
+            }
+        } else if inBlock {
+            try s.st.renewSnapshot(mut &s.txn[0])
         }
     }
     return Err(e("XX000", "unreachable"))

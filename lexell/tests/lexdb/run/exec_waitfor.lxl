@@ -17,7 +17,15 @@
 //   cursor (an equality, then the cursor, on the key); TIMEOUT $1 given;
 // - four producers numbering their events from a counter row, and a
 //   consumer reading them as they commit: every batch in order, no gaps;
-// - T-SQL's WAITFOR (SELECT TOP n ...), TIMEOUT n.
+// - T-SQL's WAITFOR (SELECT TOP n ...), TIMEOUT n, on its own and in a
+//   transaction;
+// - (the review's) the rows a block's WAITFOR read are checked at commit,
+//   though not the end past them: two workers updating the row both read,
+//   one fails (40001); a row its filter skipped, changed by another, fails
+//   it too; a block whose WAITFOR failed after a savepoint keeps its
+//   snapshot, and may WAITFOR again after ROLLBACK TO; the client's
+//   parameter types kept; AS e(a, b) refused, seq > -1 taken; timed-out
+//   waits leave nothing behind.
 // expect: there: 1;2
 // expect: timeout: empty, waited t
 // expect: woken: 3, soon t
@@ -37,6 +45,13 @@
 // expect: parameter: 1;2 then empty
 // expect: ordered: 40 events, in order t
 // expect: t-sql: 1;2
+// expect: t-sql in a transaction: 1 / 2
+// expect: same row: 1 committed, 1 40001
+// expect: skipped row changed: 40001
+// expect: after a savepoint: BEGIN / SAVEPOINT / 57014 / ROLLBACK / n / n / 1 / COMMIT
+// expect: parameter types: 23
+// expect: alias list: 0A000; minus: 1
+// expect: waits left: 0
 import "task"
 import "time"
 import "strings"
@@ -321,6 +336,77 @@ fn main() {
             if x.kind == lexdb_tsql.EV_ERROR { append(mut &tout, x.err.state + " " + x.err.msg) }
         }
         println("t-sql: " + strings.join(&tout, " / "))
+
+        // T-SQL in a transaction: each statement under a savepoint of its own
+        var evs2: []lexdb_tsql.Event = []
+        lexdb_tsql.run(mut &b, mut &ts, &"BEGIN TRAN; WAITFOR (SELECT TOP 1 seq FROM ev WHERE seq > 0 ORDER BY seq), TIMEOUT 1000; SELECT TOP 1 seq FROM ev WHERE seq > 1 ORDER BY seq; COMMIT", mut &fr, mut &evs2)
+        var tout2: []str = []
+        for x in evs2 {
+            if x.kind == lexdb_tsql.EV_ROWS { append(mut &tout2, rowsText(&x.rows)) }
+            if x.kind == lexdb_tsql.EV_ERROR { append(mut &tout2, x.err.state + " " + x.err.msg) }
+        }
+        println("t-sql in a transaction: " + strings.join(&tout2, " / "))
+
+        let mq = one(mut &a, "create table q (seq bigint primary key, status text)")
+        let mq2 = one(mut &a, "insert into q values (1, 'pending'), (2, 'other')")
+        task.scope(fn(sc: mut &task.Scope) {
+            // two workers take the same row: the second's read of it is checked
+            let w1 = sc.start(runJob, job(st, ["begin", "waitfor (select seq from q where seq > 0 and status = 'pending' order by seq limit 1)", "pause",
+                                               "update q set status = 'done' where seq = 1", "commit"]))
+            let w2 = sc.start(runJob, job(st, ["begin", "waitfor (select seq from q where seq > 0 and status = 'pending' order by seq limit 1)", "pause",
+                                               "update q set status = 'done' where seq = 1", "commit"]))
+            let o1 = outOf(w1)
+            let o2 = outOf(w2)
+            var ok = 0
+            var conflict = 0
+            for o in [o1, o2] {
+                if strings.endsWith(&o, "COMMIT") { ok += 1 }
+                if strings.endsWith(&o, "40001") { conflict += 1 }
+            }
+            println("same row: " + ok.toStr() + " committed, " + conflict.toStr() + " 40001")
+
+            // a row its filter skipped, changed meanwhile
+            let fk = sc.start(runJob, job(st, ["begin", "waitfor (select seq from q where seq > 0 and status = 'other' order by seq limit 5)", "pause",
+                                               "update offs set last = 99 where id = 'c'", "commit"]))
+            pause(20)
+            let ch = one(mut &a, "update q set status = 'x' where seq = 1")
+            let ko = outOf(fk)
+            println("skipped row changed: " + ko[len(ko) - 5..len(ko)])
+        })
+
+        // an error after the wait: the block keeps its snapshot, and may WAITFOR again
+        var c = lexdb_exec.newSession(st)
+        let c0 = one(mut &c, "set statement_timeout = 50")
+        var sp: []str = [one(mut &c, "begin"), one(mut &c, "savepoint a"),
+                         one(mut &c, "waitfor (select seq from ev where seq > 100 order by seq limit 1), timeout 5000"),
+                         one(mut &c, "rollback to a")]
+        let n1 = one(mut &c, "select count(*) from ev")
+        let ins = one(mut &a, "insert into ev values (12, 'x', 'twelve')")
+        let n2 = one(mut &c, "select count(*) from ev")
+        append(mut &sp, if n1 == n2 { "n" } else { n1 })
+        append(mut &sp, if n1 == n2 { "n" } else { n2 })
+        let c1 = one(mut &c, "set statement_timeout = 0")
+        let rb = one(mut &c, "rollback")
+        let bb = one(mut &c, "begin")
+        let sv = one(mut &c, "savepoint a")
+        let w0 = one(mut &c, "waitfor (select seq from ev where seq > 100 order by seq limit 1), timeout 10")
+        let rb2 = one(mut &c, "rollback to a")
+        append(mut &sp, one(mut &c, "waitfor (select seq from ev where seq > 0 order by seq limit 1), timeout 10"))
+        append(mut &sp, one(mut &c, "commit"))
+        // (the first ROLLBACK TO's result, then the block's counts)
+        println("after a savepoint: " + strings.join(&sp, " / "))
+        c.close()
+
+        // the client's parameter types
+        let pt = lexdb_sql.parse(&"waitfor (select seq, $2 from ev where seq > $1 order by seq limit 1), timeout 100").unwrap()
+        let r3 = b.run(&pt[0], &[Val.Int(0), Val.Int(5)], &[lexdb_sql.OID_INT8, lexdb_sql.OID_INT4]).unwrap()
+        println("parameter types: " + r3.cols[1].oid.toStr())
+
+        println("alias list: " + one(mut &b, "waitfor (select seq from ev as e(subject, seq, payload) where seq > '' order by seq limit 1)") +
+                "; minus: " + one(mut &b, "waitfor (select seq from ev where seq > -1 order by seq limit 1)"))
+
+        for k in 0..5 { let w = one(mut &b, "waitfor (select seq from ev where seq > 1000 order by seq limit 1), timeout 5") }
+        println("waits left: " + st.durWaiting().toStr())
 
         b.close()
         a.close()

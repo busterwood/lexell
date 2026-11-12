@@ -66,10 +66,10 @@ an index over `(part, seq)`.
 
 **Correctness depends on this shape, not only cost.** Every wake re-runs the
 whole query (section 5), but that is not enough:
-- **The reads are not recorded.** The waiting SELECT's reads are left out of
-  commit validation (section 3). That is sound only for rows after a cursor
-  that producers only add to. A join to a table that changes, or a filter
-  such as `status = 'pending'`, would escape serializable checking.
+- **The read's open end.** The waiting SELECT's read is checked at commit
+  except past the last key it read (section 3). That gap is sound only for
+  rows appended after a cursor. A join would read another table, whose
+  open end would be a real gap.
 - **"Not empty" must mean "something new arrived".** An aggregate or an
   outer join always gives a row, so it would never wait.
 - **The ordering guarantee is about a cursor.** Section 4 only means
@@ -78,8 +78,10 @@ whole query (section 5), but that is not enough:
   thread. For this shape that is one index probe that comes back empty.
 
 **Filters on the event row itself** (`AND subject = 'x'`, `OR`, functions)
-are safe for the unrecorded reads, because they read nothing but the
-appended row. Their cost is rescanning the rows after the cursor that fail
+are safe: they read nothing but the row. The rows a filter skips are
+checked at commit like those returned, so a filter on a column others
+change (`status = 'pending'`) fails the commit (40001) if one of them
+changes. Their cost is rescanning the rows after the cursor that fail
 them, at every wake, since the client cannot advance past rows it never
 saw. A filter on the index's leading columns costs nothing: with an index on
 `(subject, seq)`, `subject = 'x'` reads only x's rows. Anything that reads
@@ -104,10 +106,14 @@ A preceding SQL query must never be silently discarded or have its transactional
 - read counts cannot tell, because a `READ ONLY` block's reads are not noted;
 - under TDS every statement in a transaction runs under a savepoint (`lexdb-tds.md`), so "no savepoint yet" is not the test either.
 
-**The waiting SELECT's reads are not noted.** A scan that reaches the end of a tree notes the range from its cursor to the end, at the snapshot's sequence. Any event a producer commits after that snapshot falls in the range. So a caught-up consumer, whose batch is shorter than LIMIT, would fail at COMMIT with 40001 whenever a producer committed in the meantime: under steady production, almost always. The waiting SELECT therefore reads quietly, as FOR UPDATE already does (`Txn.quiet`, `lexdb.md` 9.86). This is safe because:
-- the stream is append-only;
-- section 4 guarantees that later events never become visible before earlier ones;
-- the offset row is still read and validated, so section 6's guarantee holds.
+**The waiting SELECT's read has an open end.** A scan that reaches the end of a tree notes the range from its cursor to the end, at the snapshot's sequence. Any event a producer commits after that snapshot falls in the range. So a caught-up consumer, whose batch is shorter than LIMIT, would fail at COMMIT with 40001 whenever a producer committed in the meantime: under steady production, almost always.
+
+So the waiting SELECT's scans note their reads only up to the last key they read (`Txn.openEnd`). The first version left its reads out entirely; the review showed two workers could then both commit an update of the same row.
+- **Checked:** every row it read, returned or skipped, and the gaps between them. An update or delete of one, or an event slipped in between, fails the commit (40001).
+- **Not checked:** only rows added after the last key read. This is safe because:
+  - the stream is appended to;
+  - section 4 guarantees that later events never become visible before earlier ones;
+  - the offset row is still read and validated, so section 6's guarantee holds.
 
 ## 4. Event sequence numbers must follow commit visibility
 
@@ -276,7 +282,7 @@ Start with one stream/table, a constrained indexed SELECT, timeout, generation-b
   - an accessor for `Txn.snapSeq`.
 - **`lexdb_exec.lxl`, `Session.runIn`:**
   - autocommit: within the existing snapshot-retry loop, take a snapshot and run; if the result is empty, abort, wait and repeat;
-  - in a block: the first-statement flag, the snapshot swap and the quiet reads (section 3);
+  - in a block: the first-statement flag, the snapshot swap and the open-ended reads (section 3);
   - the refusals of section 8.
 - **The wire and TDS front ends:** nothing.
 
@@ -359,6 +365,14 @@ The proposal was reviewed against the code the day it was written. What changed:
 - the query shape was made an enforced rule, and section 2 corrected: the
   shape matters for correctness, not only cost;
 - the first version was built (`lexdb.md` 9.98);
-- then filters on other columns.
+- then filters on other columns;
+- then a second review, of the code. It found:
+  - the unnoted reads let two workers commit the same row's update: the reads are now noted, with an open end;
+  - a block could go on without a snapshot after an error during the wait;
+  - the client's parameter types were dropped;
+  - timed-out waiters gathered on an idle store;
+  - smaller points: column alias lists, `seq > -1`, the shape checked once, and no 72000 retry.
+
+  All of these are fixed (`lexdb.md` 9.98).
 
 **The event log is the table; the waiting SELECT is the subscription API.**

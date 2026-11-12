@@ -157,6 +157,8 @@ pub type Db = record {
     holdSeg: int                //   pages later checkpoints free stay unused (heldFree), and
     heldFree: []HeldRuns        //   log segments from holdSeg on are kept
     changeWake: []task.Promise[Unit]    // woken after a flush or a checkpoint (waitChange)
+    durWaits: []DurWait                 // woken after a flush, or when the store closes or fails (waitDurable)
+    nextDurWait: int
     ckptCovers: int             // the last durable checkpoint's covers batch, -1 not known (9.72)
     // counters
     pub snapshots: int
@@ -247,6 +249,13 @@ pub type Txn = record {
     // locks the rows it gives (9.86), as PostgreSQL's READ COMMITTED: the
     // locks keep those rows as they were read
     pub quiet: bool
+    // A scan's read that reaches the end of what it asked for is noted only
+    // up to the last key it read: rows added after that key do not fail the
+    // commit. WAITFOR's (lexdb_exec, design/lexdb-events.md): a consumer
+    // that read to the stream's end is not failed by every producer's
+    // append, while the rows it read, and the gaps between them, are still
+    // checked.
+    pub openEnd: bool
     // The SQL layer's temporary objects (9.96): its session's temporary
     // schema ("" none yet); whether the transaction changed one of them in
     // the catalog; the tables made in it with ON COMMIT DELETE ROWS or DROP
@@ -258,7 +267,7 @@ pub type Txn = record {
 pub fn begin(): Txn {
     return Txn{reads: [], writes: [], idxTrees: [], idx: [], created: [], snap: -1, snapSeq: 0, snapTrees: newMap(), track: false, live: false, path: [], sess: 0, rules: false, memMax: 0,
                raTree: -1, ra: AHEAD_MIN, fsnap: [], now: time.now().unixMicros(), zone: lexdb_time.utc(),
-               pending: [], consAll: 0, consNames: [], consDeferred: [], lockId: 0, held: [], quiet: false,
+               pending: [], consAll: 0, consNames: [], consDeferred: [], lockId: 0, held: [], quiet: false, openEnd: false,
                tmp: "", tmpDdl: false, onCommit: []}
 }
 
@@ -1635,6 +1644,7 @@ fn (st: &Store) scanIn(t: mut &Txn, tree: int, from: str, to: str, f: &fn(&Entry
         var rseq = 0
         var need = -1
         var run: []LoadReq = []
+        var seen = ""                   // the last key given to f in this chunk
         var chunk: []Entry = []
         var bad: []lexdb_base.DbErr = []
         var upper = ""
@@ -1713,6 +1723,7 @@ fn (st: &Store) scanIn(t: mut &Txn, tree: int, from: str, to: str, f: &fn(&Entry
                 oi += 1
                 if ci < len(chunk) && chunk[ci].key == w.key { ci += 1 }
                 if w.op == OP_PUT {
+                    seen = w.key.toStr()
                     if !f(&Entry{key: w.key, val: w.val}) {
                         if noting { t.noteRead(tree, cursor, w.key + "\x00", rseq) }
                         return Ok(Unit{})
@@ -1723,6 +1734,7 @@ fn (st: &Store) scanIn(t: mut &Txn, tree: int, from: str, to: str, f: &fn(&Entry
                     let v = try st.unstore(t, tree, &chunk[ci].key, &chunk[ci].val)
                     chunk[ci].val = v
                 }
+                seen = chunk[ci].key.toStr()
                 if !f(&chunk[ci]) {
                     if noting { t.noteRead(tree, cursor, chunk[ci].key + "\x00", rseq) }
                     return Ok(Unit{})
@@ -1731,7 +1743,10 @@ fn (st: &Store) scanIn(t: mut &Txn, tree: int, from: str, to: str, f: &fn(&Entry
             }
         }
         // the read: from the cursor to the leaf's fence, or to the end asked
-        if noting { t.noteRead(tree, cursor, if !last { upper } else if len(to) > 0 { to } else { "" }, rseq) }
+        // (an open end: to the last key read, if any)
+        if noting && last && t.openEnd {
+            if len(seen) > 0 { t.noteRead(tree, cursor, seen + "\x00", rseq) }
+        } else if noting { t.noteRead(tree, cursor, if !last { upper } else if len(to) > 0 { to } else { "" }, rseq) }
         if last { more = false } else { cursor = upper }
     }
     return Ok(Unit{})
@@ -1762,6 +1777,7 @@ pub fn (st: &Store) scanLeaves(t: mut &Txn, tree: int, from: str, to: str,
         var hasUpper = false
         var go = true
         var empty = false
+        var seen = ""                   // the last key in the range given to f
         st.sh.with(fn(db: mut &Db) {
             if len(db.failed) > 0 {
                 append(mut &bad, db.failed[0])
@@ -1791,7 +1807,10 @@ pub fn (st: &Store) scanLeaves(t: mut &Txn, tree: int, from: str, to: str,
                 let i = n.lower(&cursor)
                 var j = n.count()
                 if len(to) > 0 { j = n.lower(&to) }
-                if j > i { go = f(n, i, j) }
+                if j > i {
+                    seen = n.key(j - 1)
+                    go = f(n, i, j)
+                }
                 upper = d.fence
                 hasUpper = d.hasFence
                 return
@@ -1811,7 +1830,10 @@ pub fn (st: &Store) scanLeaves(t: mut &Txn, tree: int, from: str, to: str,
             let i = n.lower(&cursor)
             var j = n.count()
             if len(to) > 0 { j = n.lower(&to) }
-            if j > i { go = f(n, i, j) }
+            if j > i {
+                seen = n.key(j - 1)
+                go = f(n, i, j)
+            }
             upper = d.upper
             hasUpper = d.hasUpper
         })
@@ -1827,7 +1849,9 @@ pub fn (st: &Store) scanLeaves(t: mut &Txn, tree: int, from: str, to: str,
         }
         if empty { return Ok(true) }
         let last = !hasUpper || (len(to) > 0 && upper >= to)
-        if noting { t.noteRead(tree, cursor, if !last { upper } else if len(to) > 0 { to } else { "" }, rseq) }
+        if noting && last && t.openEnd {
+            if len(seen) > 0 { t.noteRead(tree, cursor, seen + "\x00", rseq) }     // an open end (Txn.openEnd)
+        } else if noting { t.noteRead(tree, cursor, if !last { upper } else if len(to) > 0 { to } else { "" }, rseq) }
         if !go || last { more = false } else { cursor = upper }
     }
     return Ok(true)
@@ -2277,8 +2301,9 @@ pub fn (st: &Store) releaseSnapshot(t: mut &Txn) {
 }
 
 // A block's snapshot taken again, as of now, and its now() with it: for a
-// WAITFOR that is its block's first statement, which has read and written
-// nothing, so that the block begins when the wait ends. Not on a replica
+// WAITFOR that is its block's first statement, which has written nothing,
+// so that the block begins when the wait ends. Its reads go: they were of
+// the snapshot before (an earlier run of the WAITFOR, or BEGIN's). Not on a replica
 // (WAITFOR is refused there).
 pub fn (st: &Store) renewSnapshot(t: mut &Txn): Result[Unit, lexdb_base.DbErr] {
     var fresh = try st.snapshotTxn(t.track)
@@ -2287,6 +2312,7 @@ pub fn (st: &Store) renewSnapshot(t: mut &Txn): Result[Unit, lexdb_base.DbErr] {
     t.snapSeq = fresh.snapSeq
     t.snapTrees = replace(mut &fresh.snapTrees, newMap())
     t.now = fresh.now
+    t.reads = []                    // (an earlier run's, gone with its snapshot)
     return Ok(Unit{})
 }
 
@@ -2620,6 +2646,10 @@ fn (st: &Store) fail(e: lexdb_base.DbErr) {
         if len(db.failed) == 0 { append(mut &db.failed, e) }
         while len(db.waiters) > 0 { append(mut &ws, pop(mut &db.waiters)) }
         while len(db.ckptDone) > 0 { append(mut &held, pop(mut &db.ckptDone)) }
+        while len(db.durWaits) > 0 {
+            let DurWait{id: _, p: p} = pop(mut &db.durWaits)
+            append(mut &held, p)
+        }
     })
     while len(held) > 0 { pop(mut &held).complete(Unit{}) }
     while len(ws) > 0 {
@@ -2717,6 +2747,10 @@ pub fn writer(st: Store): int {
         st.sh.with(fn(db: mut &Db) {
             db.durableBatch = no
             while len(db.changeWake) > 0 { append(mut &ck, pop(mut &db.changeWake)) }
+            while len(db.durWaits) > 0 {
+                let DurWait{id: _, p: p} = pop(mut &db.durWaits)
+                append(mut &ck, p)
+            }
             if upto > db.durableSeq {
                 db.durableSeq = upto
                 db.prune()
@@ -3223,7 +3257,7 @@ fn newDb(fs: lexdb_disk.Fs, data: lexdb_disk.File, opts: Options, m: &lexdb_page
               batch: [], batchCount: 0, batchNo: m.replayBatch, appliedBatch: m.replayBatch - 1,
               durableBatch: m.replayBatch - 1, waiters: [], locks: newMap(), lockWaits: [], waitFor: newMap(), nextLock: 0, writerWake: [], ckptWake: [], ckptDone: [], seg: m.replaySeg,
               segOff: m.replayOff, logSinceCkpt: 0, failed: [], closing: false, seq: 0, snaps: [], nextSnap: 0,
-              hist: [], histCount: 0, histSlots: [], deferred: [], rootHist: [], durableSeq: 0, holds: newMap(), holdCkpt: -1, holdSeg: -1, heldFree: [], changeWake: [], ckptCovers: m.covers, snapshots: 0, tooOld: 0, commits: 0,
+              hist: [], histCount: 0, histSlots: [], deferred: [], rootHist: [], durableSeq: 0, holds: newMap(), holdCkpt: -1, holdSeg: -1, heldFree: [], changeWake: [], durWaits: [], nextDurWait: 0, ckptCovers: m.covers, snapshots: 0, tooOld: 0, commits: 0,
               conflicts: 0, loads: 0, aheadReads: 0, aheadPages: 0, evictions: 0, flushes: 0, checkpoints: 0, held: 0, wholes: 0}
 }
 
@@ -3462,6 +3496,10 @@ pub fn (st: &Store) close() {
         db.closing = true
         while len(db.writerWake) > 0 { append(mut &wake, pop(mut &db.writerWake)) }
         while len(db.ckptWake) > 0 { append(mut &wake, pop(mut &db.ckptWake)) }
+        while len(db.durWaits) > 0 {
+            let DurWait{id: _, p: p} = pop(mut &db.durWaits)
+            append(mut &wake, p)
+        }
     })
     while len(wake) > 0 { pop(mut &wake).complete(Unit{}) }
 }
@@ -3564,15 +3602,28 @@ pub fn (st: &Store) durableCheckpoint(): int {
     return c
 }
 
+// The waitDurable calls waiting now (for the tests).
+pub fn (st: &Store) durWaiting(): int {
+    var n = 0
+    st.sh.with(fn(db: mut &Db) { n = len(db.durWaits) })
+    return n
+}
+
+// A waitDurable's place: its promise, and its id to take it out again.
+type DurWait = record { id: int; p: task.Promise[Unit] }
+
 // Waits until a flush makes a commit after seq durable (durableSeq past
 // seq), for at most ms: true then; false at the timeout, or when the store
 // closes or fails, or the task is cancelled. WAITFOR's wait
 // (design/lexdb-events.md): seq is the snapshot it read (snapshotSeq), so
-// the snapshot taken next shows what woke it. Woken with waitChange's,
-// after the flush; a wait that times out leaves its promise, completed at
-// the next flush (harmless: its future is gone). The check and the
-// promise's place are taken in one with, which cannot park, so no flush
-// comes between them.
+// the snapshot taken next shows what woke it.
+// - Woken after the flush (the writer drains durWaits as it advances
+//   durableSeq), and by close and fail.
+// - The check and the promise's place are taken in one with, which cannot
+//   park, so no flush comes between them.
+// - A wait that times out takes its place out again, so an idle store
+//   does not gather them. A timer that ends a little early is waited on
+//   again.
 pub fn (st: &Store) waitDurable(seq: int, ms: int): bool {
     let until = time.monotonicNs() + ms * 1000000
     while true {
@@ -3580,6 +3631,7 @@ pub fn (st: &Store) waitDurable(seq: int, ms: int): bool {
         var fut: []task.Future[Unit] = []
         var done = false
         var over = false
+        var id = 0
         st.sh.with(fn(db: mut &Db) {
             if db.durableSeq > seq {
                 done = true
@@ -3590,14 +3642,30 @@ pub fn (st: &Store) waitDurable(seq: int, ms: int): bool {
                 return
             }
             let task.Handoff{promise: p, future: f} = task.promise[Unit]()
-            append(mut &db.changeWake, p)
+            id = db.nextDurWait
+            db.nextDurWait += 1
+            append(mut &db.durWaits, DurWait{id: id, p: p})
             append(mut &fut, f)
         })
         if done { return true }
         if over { return false }
         match pop(mut &fut).waitFor(left) {
             Ok(_) {}
-            Err(c) { if !c.eq(&task.Cancelled.Timeout) { return false } }     // (a timer may end a little early: looked at again)
+            Err(c) {
+                // its place out (dropped there, its future being gone)
+                var mine: []DurWait = []
+                st.sh.with(fn(db: mut &Db) {
+                    var i = 0
+                    while i < len(db.durWaits) {
+                        if db.durWaits[i].id == id {
+                            append(mut &mine, collections.swapRemove(mut &db.durWaits, i))
+                        } else {
+                            i += 1
+                        }
+                    }
+                })
+                if !c.eq(&task.Cancelled.Timeout) { return false }
+            }
         }
     }
     return false
