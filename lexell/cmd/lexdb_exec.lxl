@@ -4512,6 +4512,7 @@ pub type Query = record {
     refs: []Expr                // a subquery: the outer values it uses (in the outer query's terms)
     implied: bool               // its implied equalities were added (optimizer 27): a constant's equality is taken first
     colAt: Map[str, int]        // cols by name, once its tables are read (levelOf's; a name missing: colIndex)
+    pinned: bool                // its join starts from a pinned row (optimizer 35): an outer value's equality is taken first
 }
 
 fn dotAt(s: &str): int {
@@ -6008,8 +6009,16 @@ fn noTable(): Table {
                  view: "", deps: []}
 }
 
-// The new order of q's levels (old indexes), [] when FROM's stands. ms: the
-// conjuncts placed so far, per level.
+// Whether a table is pinned to one row by its key's equalities with
+// constants or parameters (optimizer 35).
+fn (q: &Query) hasPinned(ms: &[][]Expr): bool {
+    var cs: []Expr = []
+    for m in ms { for c in m { append(mut &cs, clone(&c)) } }
+    let none: []bool = array(len(q.levels), false)
+    for k in 0..len(q.levels) { if q.bindOf(k, &cs, &none) == 3 { return true } }
+    return false
+}
+
 // Whether every join is inner and none LATERAL: its tables may run in any
 // order, and its equalities imply others.
 fn (q: &Query) innerOnly(): bool {
@@ -6017,6 +6026,8 @@ fn (q: &Query) innerOnly(): bool {
     return true
 }
 
+// The new order of q's levels (old indexes), [] when FROM's stands. ms: the
+// conjuncts placed so far, per level.
 fn (q: &Query) joinOrder(ms: &[][]Expr): []int {
     let nl = len(q.levels)
     if !q.innerOnly() { return [] }
@@ -6154,6 +6165,11 @@ fn choosePath(q: &Query, k: int, cs: &[]Expr, params: &[]Val, lk: mut &[]Look): 
             // can be read once
             if q.implied {
                 for i in 0..len(bs) { if bs[i].op == "=" && eqAt < 0 && q.maxLevel(&bs[i].val) < 0 && !hasCorr(&bs[i].val) { eqAt = i } }
+            }
+            // from a pinned row, the lookup per row (one row): an outer
+            // value's equality before a constant's (optimizer 35)
+            if q.pinned {
+                for i in 0..len(bs) { if bs[i].op == "=" && eqAt < 0 && q.maxLevel(&bs[i].val) >= 0 { eqAt = i } }
             }
             for i in 0..len(bs) { if bs[i].op == "=" && eqAt < 0 { eqAt = i } }
             if eqAt < 0 {
@@ -6543,7 +6559,7 @@ fn newLevel(t: Table, alias: str, join: int, first: int): Level {
 // (a SELECT's; UPDATE ... FROM and DELETE ... USING keep their target first).
 fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_sql.FromItem,
               where: &Option[Expr], params: &[]Val, subs: &[]lexdb_sql.Stmt, sc: mut &Scope, reorder: bool): Result[Query, DbErr] {
-    var q = Query{levels: [], cols: [], top: [], subs: [], base: sc.base, corr: false, refs: [], implied: false, colAt: newMap()}
+    var q = Query{levels: [], cols: [], top: [], subs: [], base: sc.base, corr: false, refs: [], implied: false, colAt: newMap(), pinned: false}
     // this query's (its subqueries set their own)
     let early = sc.early
     sc.early = false
@@ -6656,7 +6672,8 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
         lv.src = if viewSrc >= 0 { viewSrc } else { f.sub }
         lv.work = f.work
         lv.lateral = lateral
-        if f.sub < 0 && f.work < 0 { lv.est = try loadEst(st, txn, &lv.t, reorder && len(from) >= 2) }
+        // (a join's other tables' statistics: when its order is costed, optimizer 35)
+        if f.sub < 0 && f.work < 0 { lv.est = try loadEst(st, txn, &lv.t, false) }
         append(mut &q.levels, lv)
         if len(subs) > 0 {
             // only its subqueries look here
@@ -6829,7 +6846,25 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
         var cap = HASH_MAX_BYTES
         if txn.memMax > 0 && float(txn.memMax) / 2.0f < cap { cap = float(txn.memMax) / 2.0f }
         let ordT = q.orderedLevel(&ordBy)
-        if txn.noting() || !q.costOrder(&ms, early, cap, ordT, float(ordLim), mut &perm, mut &ro) { perm = q.joinOrder(&ms) }
+        // A join that starts from a row its key pins (optimizer 35): the
+        // order bound by keys, at once; no statistics read for it and no
+        // search (most OLTP joins, planned on every run unless prepared).
+        let pinned = q.hasPinned(&ms)
+        // from one row, a lookup per row is one lookup: cheaper than a hash
+        // of what a constant reaches (the "constant first" rule, optimizer 27)
+        if pinned {
+            q.implied = false
+            q.pinned = true
+        }
+        if !pinned && !txn.noting() {
+            for k in 0..nl {
+                if q.levels[k].est.rows < 0 && !q.levels[k].virt() {
+                    let es = try loadEst(st, txn, &q.levels[k].t, true)
+                    q.levels[k].est = es
+                }
+            }
+        }
+        if pinned || txn.noting() || !q.costOrder(&ms, early, cap, ordT, float(ordLim), mut &perm, mut &ro) { perm = q.joinOrder(&ms) }
         if len(perm) == nl {
             var pool: []Expr = []
             for k in 0..nl {
@@ -12276,7 +12311,7 @@ fn planSet(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
     let split = len(l.q.refs)
     let limit = try evalInt(&s.limit, params, "LIMIT", mut &sc.looks)
     let offset = try evalInt(&s.offset, params, "OFFSET", mut &sc.looks)
-    let q = Query{levels: [], cols: [], top: [], subs: [], base: sc.base, corr: false, refs: refs, implied: false, colAt: newMap()}
+    let q = Query{levels: [], cols: [], top: [], subs: [], base: sc.base, corr: false, refs: refs, implied: false, colAt: newMap(), pinned: false}
     return Ok(Sel{q: q, exprs: [], outs: outs, groupBy: [], order: order, aggQ: false, sort: len(order) > 0, first: -1,
                   limit: limit, offset: offset, having: None, specs: [], distinct: false, desc: desc, nullsFirst: nullsFirst, parts: [l, r],
                   setop: s.setop, setAll: s.setAll, split: split, rec: if s.rec { s.cte } else { -1 }, srf: "", ordin: false,
