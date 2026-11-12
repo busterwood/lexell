@@ -142,7 +142,11 @@ cases neither engine does the work lexdb does:
 - **SQLite:** `OP_Column` parses a row's header lazily, caching types and
   offsets per cursor, with no allocation per value.
 - **Numeric** is binary in both: PostgreSQL's base-10000 digits, SQLite's
-  floats. lexdb stores its text and parses it on every read.
+  floats. So is lexdb's in the fixed layout (`Decimal.toBin`, 9.50): a
+  price in w is 6 bytes. Only the older tagged layout keeps a numeric's
+  text. An earlier version of this page said lexdb stores the text; the
+  page-layout study corrected it. Decoding is still costly:
+  `Decimal.fromBin` makes a value per row.
 - **lexdb's batches** decode every column a level uses before the first
   condition runs. Each text becomes a reference-counted value.
 
@@ -209,8 +213,12 @@ numbers. None has been built.
    - Expected: `a + b, price * 2, upper(city)` 1,600 to about 400.
    - Medium.
 6. **DELETE with an index:** profile the 2 to 12 s.
-7. **Numeric in binary** in rows: no parse per read. This is part of the
-   page-layout study (a Fable agent, running).
+7. **The page layout** ([lexdb-pages.md](lexdb-pages.md), measured):
+   - column leaves for table trees (PAX, with light encodings): scan-bound
+     queries 13 to 42% faster end to end, w 45% smaller;
+   - front-coded index leaves without their duplicated value: w_b from
+     42 MB to about 14;
+   - no page compression.
 8. **Hash tables:** keep each entry's hash, and compare it before the key.
    A cheaper hash than SipHash needs care: a client's values reach these
    maps, so hash flooding matters. SipHash's keyed design is there for
