@@ -829,6 +829,111 @@ fn reCompileFor(pat: &str, fl: &ReFlags, which: bool): Result[regex.Regex, DbErr
     }
 }
 
+// ---- SIMILAR TO (9.94)
+
+// An SQL regular expression (SIMILAR TO's, substring's SIMILAR) as a
+// regular expression, as PostgreSQL's similar_to_escape makes it: % is .*,
+// _ is ., ( is (?:, . ^ $ \ are literal, a bracket is passed as it is, the
+// escape character makes the next one literal (a letter: its class, \d);
+// all of it anchored, ^(?: ... )$. Two escape-double-quotes divide it in
+// three, ^(?:a){1,1}?(b){1,1}(?:c)$, so that substring gives b, a being as
+// short as can be and b as long. PostgreSQL's ARE makes a non-greedy as a
+// whole; here (Perl's rules) each of a's quantifiers is made non-greedy.
+// esc: the escape character, "" none.
+pub fn similarRe(pat: &str, esc: &str): Result[regex.Regex, DbErr] {
+    if strings.runeCount(esc.toStr()) > 1 { return Err(e("22025", "invalid escape string")) }
+    var b = newStrBuf()
+    b.add("(?s)^(?:")
+    var quotes = 0
+    var i = 0
+    var inBr = false
+    var brAt = 0                // the bracket's characters so far
+    var after = false           // after the escape character
+    let n = len(pat)
+    // with a separator to come, the first part's quantifiers are non-greedy
+    var lazy = false
+    if len(esc) > 0 { lazy = strings.indexOf(pat.toStr(), esc.toStr() + "\"", 0) >= 0 }
+    while i < n {
+        let d = strings.decodeAt(pat.toStr(), i)
+        let c = pat[i..i + d.size].toStr()
+        i += d.size
+        let lz = lazy && quotes == 0
+        if after {
+            after = false
+            if c == "\"" && !inBr {
+                if quotes == 0 { b.add("){1,1}?(") }
+                else if quotes == 1 { b.add("){1,1}(?:") }
+                else { return Err(e("2200C", "SQL regular expression may not contain more than two escape-double-quote separators")) }
+                quotes += 1
+            } else if len(c) == 1 && strings.isAlnum(c[0]) {
+                b.add("\\")
+                b.add(c)
+            } else if len(c) == 1 && c != "_" {
+                b.add("\\")
+                b.add(c)
+            } else {
+                b.add(c)
+            }
+            continue
+        }
+        if len(esc) > 0 && c == esc {
+            after = true
+            continue
+        }
+        if inBr {
+            if c == "\\" { b.add("\\") }
+            b.add(c)
+            if c == "]" && brAt > 1 { inBr = false }
+            else if !(c == "^" && brAt == 1) { brAt += 1 }
+            continue
+        }
+        if c == "[" {
+            b.add(c)
+            inBr = true
+            brAt = 1
+        } else if c == "%" {
+            b.add(if lz { ".*?" } else { ".*" })
+        } else if c == "_" {
+            b.add(".")
+        } else if c == "(" {
+            b.add("(?:")
+        } else if c == "\\" || c == "." || c == "^" || c == "$" {
+            b.add("\\")
+            b.add(c)
+        } else if lz && (c == "*" || c == "+" || c == "?" || c == "}") {
+            b.add(c)
+            b.add("?")
+        } else {
+            b.add(c)
+        }
+    }
+    b.add(")$")
+    let body = arePattern(&b.toStr(), false)
+    match regex.compile(body) {
+        Ok(re) { return Ok(re) }
+        Err(x) { return Err(e("2201B", "invalid regular expression: " + x.toStr())) }
+    }
+}
+
+// x SIMILAR TO pat (the escape esc).
+pub fn similarTo(x: &str, pat: &str, esc: &str): Result[bool, DbErr] {
+    let re = try similarRe(pat, esc)
+    return Ok(re.isMatch(x.toStr()))
+}
+
+// substring(x SIMILAR pat ESCAPE esc): the part between the separators, or
+// the whole when there are none; None when x does not match.
+pub fn similarSubstring(x: &str, pat: &str, esc: &str): Result[Option[str], DbErr] {
+    let re = try similarRe(pat, esc)
+    let m = re.submatchIndexAt(x.toStr(), 0)
+    if len(m) == 0 { return Ok(None) }
+    if len(m) > 2 {
+        if m[2] < 0 { return Ok(None) }
+        return Ok(Some(x[m[2]..m[3]].toStr()))
+    }
+    return Ok(Some(x[m[0]..m[1]].toStr()))
+}
+
 // The byte offset of character k (from 0) of s; len(s) past its end.
 fn byteAt(s: &str, k: int): int {
     var i = 0
