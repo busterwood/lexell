@@ -178,6 +178,7 @@ pub type ColDef = record {
     pub missing: Val            // a table's column: its value in rows written before it was added
     pub identity: int           // ID_*: SERIAL or an identity column (9.43)
     pub seq: str                // with one: the catalog key of its sequence, whose nextval is its default
+    pub spell: str              // its name as written, where that differs from name (L6); "" else
 }
 
 // A column's sequence (ColDef.identity).
@@ -188,7 +189,7 @@ pub const ID_SERIAL = 3         // serial, bigserial, smallserial
 
 // A column with no default.
 pub fn colDef(name: str, typ: TypeName, notNull: bool): ColDef {
-    return ColDef{name: name, typ: typ, notNull: notNull, def: None, missing: Val.Null, identity: ID_NONE, seq: ""}
+    return ColDef{name: name, typ: typ, notNull: notNull, def: None, missing: Val.Null, identity: ID_NONE, seq: "", spell: ""}
 }
 
 // A sequence's options as CREATE SEQUENCE, ALTER SEQUENCE and an identity
@@ -264,6 +265,7 @@ pub type SelItem = record {
     pub qual: str               // t.* : the table (or alias); "" for *
     pub expr: Option[Expr]
     pub alias: str
+    pub spell: str              // its column's name as written: the alias's, or a column's (L6); "" as name
 }
 
 // A table in FROM: how it joins the ones before it.
@@ -474,6 +476,11 @@ pub type Stmt = record {
     pub into: str               // SELECT ... INTO t: t (9.88); made a CREATE TABLE ... AS
     pub exprs: []Expr           // CREATE INDEX: per column, its expression (9.89; a Lit NULL for a column, whose name is in names)
     pub assign: []str           // T-SQL SELECT @v = expr, ...: each item's variable ("" none); [] no assignment (design/lexdb-tds.md)
+    // The spelling of the name the statement makes (CREATE TABLE, VIEW, ...
+    // AS, SELECT INTO; L6), "" as table's; and of names', parallel to them
+    // where they name columns it makes (CREATE VIEW, CREATE TABLE ... AS)
+    pub spell: str
+    pub spells: []str
 }
 
 pub const CONFLICT_NONE = 0
@@ -541,7 +548,7 @@ pub fn newStmt(kind: int): Stmt {
                 group: [], order: [], limit: None, offset: None, sets: [], params: 0, from: [], index: "",
                 unique: false, inner: [], distinct: false, having: None, subs: [], use: 0, setop: 0, setAll: false,
                 cte: -1, rec: false, cascade: false, src: "", srf: "", ordin: false, alters: [], cons: [], seqNames: [], seq: noSeqOpts(), idOpts: [], overriding: OVR_NONE,
-                copy: noCopyOpts(), wins: [], windows: [], conflict: CONFLICT_NONE, conflictCols: [], conflictCon: "", alias: "", conc: false, lockMode: 0, lockOf: [], lockWait: 0, noData: false, into: "", exprs: [], assign: []}
+                copy: noCopyOpts(), wins: [], windows: [], conflict: CONFLICT_NONE, conflictCols: [], conflictCon: "", alias: "", conc: false, lockMode: 0, lockOf: [], lockWait: 0, noData: false, into: "", exprs: [], assign: [], spell: "", spells: []}
 }
 
 // ---- the lexer
@@ -562,7 +569,16 @@ pub type Dialect = value record { pub tsql: bool; pub quotedIdent: bool }
 
 pub fn pgDialect(): Dialect { return Dialect{tsql: false, quotedIdent: true} }
 
-pub type Tok = value record { pub kind: int; pub text: str; pub at: int }
+// A token. A name's text is folded (lexdb_sql matches names without regard
+// to case, design/lexdb-tds.md L6); spell is its spelling where that differs
+// from text: a quoted name's, and in T-SQL a bare name's ("" else).
+pub type Tok = value record { pub kind: int; pub text: str; pub at: int; pub spell: str }
+
+// A name's token: its text folded, its spelling kept if that differs.
+fn nameTok(kind: int, raw: str, at: int): Tok {
+    let f = strings.toLowerAscii(raw)
+    return Tok{kind: kind, text: f, at: at, spell: if f == raw { "" } else { raw }}
+}
 
 fn syntax(msg: str): lexdb_base.DbErr { return lexdb_base.err("42601", msg) }
 
@@ -658,28 +674,25 @@ fn lexIn(s: &str, dialect: Dialect): Result[[]Tok, lexdb_base.DbErr] {
             if c == '@' && i + 1 < n && (isIdentStart(s[i + 1]) || s[i + 1] == '@') {
                 i += if s[i + 1] == '@' { 2 } else { 1 }
                 while i < n && (isIdentChar(s[i]) || s[i] == '@' || s[i] == '#') { i += 1 }
-                append(mut &out, Tok{kind: T_VAR, text: strings.toLowerAscii(s[start..i]), at: start})
+                append(mut &out, Tok{kind: T_VAR, text: strings.toLowerAscii(s[start..i]), at: start, spell: ""})
                 continue
             }
-            // a quoted name names what the bare name does: SQL Server matches
-            // names without regard to case (until L6 keeps their spelling, every
-            // name is folded)
             if c == '[' || (c == '"' && dialect.quotedIdent) {
                 var b = newStrBuf()
                 i = try quoted(s, i, if c == '[' { ']' } else { '"' }, mut &b)
-                append(mut &out, Tok{kind: T_QIDENT, text: strings.toLowerAscii(b.toStr()), at: start})
+                append(mut &out, nameTok(T_QIDENT, b.toStr(), start))
                 continue
             }
             if (c == 'n' || c == 'N') && i + 1 < n && s[i + 1] == '\'' {
                 var b = newStrBuf()
                 i = try quoted(s, i + 1, '\'', mut &b)
-                append(mut &out, Tok{kind: T_STR, text: b.toStr(), at: start})
+                append(mut &out, Tok{kind: T_STR, text: b.toStr(), at: start, spell: ""})
                 continue
             }
             if c == '"' && !dialect.quotedIdent {
                 var b = newStrBuf()
                 i = try quoted(s, i, '"', mut &b)
-                append(mut &out, Tok{kind: T_STR, text: b.toStr(), at: start})
+                append(mut &out, Tok{kind: T_STR, text: b.toStr(), at: start, spell: ""})
                 continue
             }
         }
@@ -707,12 +720,14 @@ fn lexIn(s: &str, dialect: Dialect): Result[[]Tok, lexdb_base.DbErr] {
                 b.addByte(d)
                 i += 1
             }
-            append(mut &out, Tok{kind: T_STR, text: b.toStr(), at: start})
+            append(mut &out, Tok{kind: T_STR, text: b.toStr(), at: start, spell: ""})
             continue
         }
         if isIdentStart(c) {
             while i < n && isIdentChar(s[i]) { i += 1 }
-            append(mut &out, Tok{kind: T_IDENT, text: strings.toLowerAscii(s[start..i]), at: start})
+            // a bare name: in T-SQL spelled as written, in PostgreSQL folded
+            if dialect.tsql { append(mut &out, nameTok(T_IDENT, s[start..i].toStr(), start)) }
+            else { append(mut &out, Tok{kind: T_IDENT, text: strings.toLowerAscii(s[start..i]), at: start, spell: ""}) }
             continue
         }
         if c == '"' {
@@ -732,7 +747,7 @@ fn lexIn(s: &str, dialect: Dialect): Result[[]Tok, lexdb_base.DbErr] {
                 b.addByte(s[i])
                 i += 1
             }
-            append(mut &out, Tok{kind: T_QIDENT, text: b.toStr(), at: start})
+            append(mut &out, nameTok(T_QIDENT, b.toStr(), start))
             continue
         }
         if isDigit(c) || (c == '.' && i + 1 < n && isDigit(s[i + 1])) {
@@ -742,7 +757,7 @@ fn lexIn(s: &str, dialect: Dialect): Result[[]Tok, lexdb_base.DbErr] {
                 if i < n && (s[i] == '+' || s[i] == '-') { i += 1 }
                 while i < n && isDigit(s[i]) { i += 1 }
             }
-            append(mut &out, Tok{kind: T_NUM, text: s[start..i], at: start})
+            append(mut &out, Tok{kind: T_NUM, text: s[start..i], at: start, spell: ""})
             continue
         }
         if c == '\'' {
@@ -762,13 +777,13 @@ fn lexIn(s: &str, dialect: Dialect): Result[[]Tok, lexdb_base.DbErr] {
                 b.addByte(s[i])
                 i += 1
             }
-            append(mut &out, Tok{kind: T_STR, text: b.toStr(), at: start})
+            append(mut &out, Tok{kind: T_STR, text: b.toStr(), at: start, spell: ""})
             continue
         }
         if c == '$' && i + 1 < n && isDigit(s[i + 1]) {
             i += 1
             while i < n && isDigit(s[i]) { i += 1 }
-            append(mut &out, Tok{kind: T_PARAM, text: s[start + 1..i], at: start})
+            append(mut &out, Tok{kind: T_PARAM, text: s[start + 1..i], at: start, spell: ""})
             continue
         }
         // operators
@@ -783,9 +798,9 @@ fn lexIn(s: &str, dialect: Dialect): Result[[]Tok, lexdb_base.DbErr] {
             return Err(syntax("syntax error at or near \"" + op + "\""))
         }
         i += len(op)
-        append(mut &out, Tok{kind: T_OP, text: op, at: start})
+        append(mut &out, Tok{kind: T_OP, text: op, at: start, spell: ""})
     }
-    append(mut &out, Tok{kind: T_EOF, text: "", at: n})
+    append(mut &out, Tok{kind: T_EOF, text: "", at: n, spell: ""})
     return Ok(out)
 }
 
@@ -805,6 +820,7 @@ type P = record {
     src: str            // the SQL text (a view keeps its query's, 9.82)
     tsql: bool          // T-SQL (design/lexdb-tds.md): its type names, SELECT @v = ...
     vars: []str         // T-SQL: the variables in scope, @name is $k for vars[k - 1]
+    spelled: str        // the spelling of the name name() read last, "" its text (L6)
 }
 
 // A CTE: kept as its text (where its tokens start), parsed again as a
@@ -871,6 +887,7 @@ fn (p: mut &P) name(): Result[str, lexdb_base.DbErr] {
     let t = p.peek()
     if t.kind == T_QIDENT || (t.kind == T_IDENT && !isReserved(&t.text)) {
         p.pos += 1
+        p.spelled = t.spell
         return Ok(t.text)
     }
     return Err(near(&t))
@@ -1421,7 +1438,7 @@ fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
         var w = newStmt(S_SELECT)
         append(mut &w.from, FromItem{table: "", alias: "#arr", join: J_FIRST, on: None, sub: inner, cols: ["#a"], work: -1, lateral: false})
         let agg = Expr.Call("array_agg", [Expr.Col("#arr.#a")], false)
-        append(mut &w.items, SelItem{star: false, qual: "", expr: Some(Expr.Call("coalesce", [agg, Expr.Lit(Val.Text("{}"))], false)), alias: "array"})
+        append(mut &w.items, SelItem{star: false, qual: "", expr: Some(Expr.Call("coalesce", [agg, Expr.Lit(Val.Text("{}"))], false)), alias: "array", spell: ""})
         w.subs = replace(mut &p.subs, saved)
         w.use = SUB_SCALAR
         p.depth -= 1
@@ -1614,6 +1631,7 @@ fn (p: mut &P) createTable(): Result[Stmt, lexdb_base.DbErr] {
         s.ifFlag = true
     }
     s.table = try p.qname()
+    s.spell = p.spelled
     if p.isKw("as") || (p.isKw("(") && p.nameListThenAs()) { return p.createTableAs(s) }
     try p.expectKw("(")
     while true {
@@ -1631,6 +1649,7 @@ fn (p: mut &P) createTable(): Result[Stmt, lexdb_base.DbErr] {
             let n = try p.name()
             var c = noCol()
             c.name = n
+            c.spell = p.spelled
             try p.colType(mut &c)
             while true {
                 // CONSTRAINT name names the one after it (a UNIQUE's; the
@@ -1697,8 +1716,11 @@ fn (p: &P) nameListThenAs(): bool {
 fn (p: mut &P) createTableAs(s0: Stmt): Result[Stmt, lexdb_base.DbErr] {
     var s = s0
     if p.acceptKw("(") {
-        append(mut &s.names, try p.name())
-        while p.acceptKw(",") { append(mut &s.names, try p.name()) }
+        while true {
+            append(mut &s.names, try p.name())
+            append(mut &s.spells, p.spelled)
+            if !p.acceptKw(",") { break }
+        }
         try p.expectKw(")")
     }
     try p.expectKw("as")
@@ -2035,14 +2057,20 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
         return Ok(s)
     }
     if p.acceptKw("rename") {
+        // the new name's spelling in col.spell (L6)
+        var sp = noCol()
         if p.acceptKw("to") {
-            append(mut &s.alters, Alter{kind: A_RENAME, col: noCol(), name: try p.name(), to: "", ifFlag: false, using: None, cons: [], cascade: false})
+            let to = try p.name()
+            sp.spell = p.spelled
+            append(mut &s.alters, Alter{kind: A_RENAME, col: sp, name: to, to: "", ifFlag: false, using: None, cons: [], cascade: false})
             return Ok(s)
         }
         let c = p.acceptKw("column")
         let from = try p.name()
         try p.expectKw("to")
-        append(mut &s.alters, Alter{kind: A_RENAME_COL, col: noCol(), name: from, to: try p.name(), ifFlag: false, using: None, cons: [], cascade: false})
+        let to = try p.name()
+        sp.spell = p.spelled
+        append(mut &s.alters, Alter{kind: A_RENAME_COL, col: sp, name: from, to: to, ifFlag: false, using: None, cons: [], cascade: false})
         return Ok(s)
     }
     while true {
@@ -2068,6 +2096,7 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
                 a.ifFlag = true
             }
             a.col.name = try p.name()
+            a.col.spell = p.spelled
             try p.colType(mut &a.col)
             // its UNIQUE, CHECK and REFERENCES: added after it, as ADD
             // CONSTRAINT would (9.85)
@@ -2455,9 +2484,11 @@ fn (p: mut &P) createView(orReplace: bool): Result[Stmt, lexdb_base.DbErr] {
     var v = newStmt(S_CREATE_VIEW)
     v.ifFlag = orReplace
     v.table = try p.qname()
+    v.spell = p.spelled
     if p.acceptKw("(") {
         while true {
             append(mut &v.names, try p.name())
+            append(mut &v.spells, p.spelled)
             if !p.acceptKw(",") { break }
         }
         try p.expectKw(")")
@@ -2549,7 +2580,7 @@ fn (p: mut &P) valuesSub(): Result[int, lexdb_base.DbErr] {
         try p.expectKw("(")
         var n = 0
         while true {
-            append(mut &s.items, SelItem{star: false, qual: "", expr: Some(try p.expr()), alias: ""})
+            append(mut &s.items, SelItem{star: false, qual: "", expr: Some(try p.expr()), alias: "", spell: ""})
             n += 1
             if !p.acceptKw(",") { break }
         }
@@ -2569,7 +2600,7 @@ fn (p: mut &P) valuesSub(): Result[int, lexdb_base.DbErr] {
 fn (p: mut &P) valuesQuery(): Result[Stmt, lexdb_base.DbErr] {
     let i = try p.valuesSub()
     var s = newStmt(S_SELECT)
-    append(mut &s.items, SelItem{star: true, qual: "", expr: None, alias: ""})
+    append(mut &s.items, SelItem{star: true, qual: "", expr: None, alias: "", spell: ""})
     append(mut &s.from, FromItem{table: "", alias: "*VALUES*", join: J_FIRST, on: None, sub: i, cols: [], work: -1, lateral: false})
     return Ok(s)
 }
@@ -2593,6 +2624,13 @@ fn (p: mut &P) setBranch(): Result[Stmt, lexdb_base.DbErr] {
     return Ok(b)
 }
 
+fn isColExpr(x: &Expr): bool {
+    match x {
+        Expr.Col(n) { return true }
+        else { return false }
+    }
+}
+
 // A SELECT's output list, or RETURNING's: *, t.*, expr [[AS] alias], ...
 fn (p: mut &P) itemList(items: mut &[]SelItem): Result[Unit, lexdb_base.DbErr] {
     var none: []str = []
@@ -2605,11 +2643,11 @@ fn (p: mut &P) itemListAssign(items: mut &[]SelItem, assign: mut &[]str): Result
     while true {
         let q = p.peek()
         if p.acceptKw("*") {
-            append(items, SelItem{star: true, qual: "", expr: None, alias: ""})
+            append(items, SelItem{star: true, qual: "", expr: None, alias: "", spell: ""})
         } else if (q.kind == T_IDENT || q.kind == T_QIDENT) && p.peekAt(1).kind == T_OP && p.peekAt(1).text == "." &&
                   p.peekAt(2).kind == T_OP && p.peekAt(2).text == "*" {
             p.pos += 3
-            append(items, SelItem{star: true, qual: q.text, expr: None, alias: ""})
+            append(items, SelItem{star: true, qual: q.text, expr: None, alias: "", spell: ""})
         } else if p.tsql && q.kind == T_VAR && p.peekAt(1).kind == T_OP && p.peekAt(1).text == "=" {
             // T-SQL: SELECT @v = expr (design/lexdb-tds.md)
             let target = try p.variable(&q)
@@ -2617,20 +2655,25 @@ fn (p: mut &P) itemListAssign(items: mut &[]SelItem, assign: mut &[]str): Result
             let e = try p.expr()
             while len(assign) < len(items) { append(assign, "") }
             append(assign, q.text)
-            append(items, SelItem{star: false, qual: "", expr: Some(e), alias: q.text})
+            append(items, SelItem{star: false, qual: "", expr: Some(e), alias: q.text, spell: ""})
         } else {
             let e = try p.expr()
+            // the column's name as written (L6): a bare column's, or the alias's
+            var spell = ""
+            if isColExpr(&e) && p.pos > 0 { spell = p.toks[p.pos - 1].spell }
             var alias = ""
             if p.acceptKw("as") {
                 alias = try p.name()
+                spell = p.spelled
             } else {
                 let t = p.peek()
                 if t.kind == T_QIDENT || (t.kind == T_IDENT && !isReserved(&t.text)) {
                     alias = t.text
+                    spell = t.spell
                     p.pos += 1
                 }
             }
-            append(items, SelItem{star: false, qual: "", expr: Some(e), alias: alias})
+            append(items, SelItem{star: false, qual: "", expr: Some(e), alias: alias, spell: spell})
         }
         if !p.acceptKw(",") { break }
     }
@@ -2664,6 +2707,7 @@ fn (p: mut &P) selectCore(): Result[Stmt, lexdb_base.DbErr] {
         let tm = p.acceptKw("temporary") || p.acceptKw("temp") || p.acceptKw("unlogged")
         let tb = p.acceptKw("table")
         s.into = try p.qname()
+        s.spell = p.spelled
     }
     if p.acceptKw("from") {
         try p.fromList(mut &s.from, J_FIRST)
@@ -2892,7 +2936,7 @@ fn (p: mut &P) fromFunction(join: int): Result[FromItem, lexdb_base.DbErr] {
     s.use = SUB_FROM
     if !p.isKw(")") {
         while true {
-            append(mut &s.items, SelItem{star: false, qual: "", expr: Some(try p.expr()), alias: ""})
+            append(mut &s.items, SelItem{star: false, qual: "", expr: Some(try p.expr()), alias: "", spell: ""})
             if !p.acceptKw(",") { break }
         }
     }
@@ -2990,8 +3034,10 @@ fn (p: mut &P) indexCol(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
     }
     var opts: []str = []
     if p.acceptKw("collate") {
+        // a collation's name as written: PostgreSQL's are matched by case ("C")
         let c = try p.qname()
-        append(mut &opts, "COLLATE \"" + c + "\"")
+        let sp = if len(p.spelled) > 0 { p.spelled } else { baseName(&c) }
+        append(mut &opts, "COLLATE \"" + (if isQual(&c) { qual(&schemaOf(&c), &sp) } else { sp }) + "\"")
     }
     let t = p.peek()
     if t.kind == T_IDENT && t.text != "asc" && t.text != "desc" && t.text != "nulls" {
@@ -3234,8 +3280,8 @@ fn (p: mut &P) copyStmt(): Result[Stmt, lexdb_base.DbErr] {
     if !query && !s.copy.from {
         // TO from a table: its query
         var q = newStmt(S_SELECT)
-        if len(s.names) == 0 { append(mut &q.items, SelItem{star: true, qual: "", expr: None, alias: ""}) }
-        for n in s.names { append(mut &q.items, SelItem{star: false, qual: "", expr: Some(Expr.Col(n)), alias: ""}) }
+        if len(s.names) == 0 { append(mut &q.items, SelItem{star: true, qual: "", expr: None, alias: "", spell: ""}) }
+        for n in s.names { append(mut &q.items, SelItem{star: false, qual: "", expr: Some(Expr.Col(n)), alias: "", spell: ""}) }
         append(mut &q.from, FromItem{table: s.table, alias: baseName(&s.table), join: J_FIRST, on: None, sub: -1, cols: [], work: -1, lateral: false})
         append(mut &s.inner, q)
     }
@@ -3383,6 +3429,7 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
             // SELECT ... INTO t: CREATE TABLE t AS the query (9.88)
             var c = newStmt(S_CREATE)
             c.table = replace(mut &q.into, "")
+            c.spell = replace(mut &q.spell, "")
             q.subs = replace(mut &p.subs, [])
             q.wins = replace(mut &p.wins, [])
             q.params = p.params
@@ -3812,7 +3859,7 @@ fn (p: mut &P) skipToEnd() {
 // highest $n in each.
 pub fn parse(sql: &str): Result[[]Stmt, lexdb_base.DbErr] {
     let toks = try lex(sql)
-    var p = P{toks: toks, pos: 0, params: 0, subs: [], ctes: [], nextCte: 0, inCte: [], depth: 0, seqs: [], wins: [], src: sql.toStr(), tsql: false, vars: []}
+    var p = P{toks: toks, pos: 0, params: 0, subs: [], ctes: [], nextCte: 0, inCte: [], depth: 0, seqs: [], wins: [], src: sql.toStr(), tsql: false, vars: [], spelled: ""}
     var out: []Stmt = []
     while true {
         p.params = 0
@@ -3994,7 +4041,7 @@ pub fn exprText(x: &Expr): str {
 // One expression and nothing after it.
 pub fn parseExpr(sql: &str): Result[Expr, lexdb_base.DbErr] {
     let toks = try lex(sql)
-    var p = P{toks: toks, pos: 0, params: 0, subs: [], ctes: [], nextCte: 0, inCte: [], depth: 0, seqs: [], wins: [], src: sql.toStr(), tsql: false, vars: []}
+    var p = P{toks: toks, pos: 0, params: 0, subs: [], ctes: [], nextCte: 0, inCte: [], depth: 0, seqs: [], wins: [], src: sql.toStr(), tsql: false, vars: [], spelled: ""}
     let x = try p.expr()
     let t = p.peek()
     if t.kind != T_EOF { return Err(near(&t)) }
@@ -4081,7 +4128,7 @@ pub fn tsqlParser(sql: &str, d: Dialect, vars: &[]str): Result[Parser, lexdb_bas
     let toks = try lexIn(sql, dt)
     var given: []str = []
     for v in vars { append(mut &given, v) }
-    return Ok(Parser{p: P{toks: toks, pos: 0, params: 0, subs: [], ctes: [], nextCte: 0, inCte: [], depth: 0, seqs: [], wins: [], src: sql.toStr(), tsql: true, vars: given}})
+    return Ok(Parser{p: P{toks: toks, pos: 0, params: 0, subs: [], ctes: [], nextCte: 0, inCte: [], depth: 0, seqs: [], wins: [], src: sql.toStr(), tsql: true, vars: given, spelled: ""}})
 }
 
 pub fn (q: &Parser) peek(): Tok { return q.p.peek() }
@@ -4117,7 +4164,7 @@ pub fn (q: mut &Parser) statement(): Result[Stmt, lexdb_base.DbErr] {
 // since the last fresh().
 pub fn (q: mut &Parser) assign(v: &str, e: Expr): Stmt {
     var s = newStmt(S_SELECT)
-    append(mut &s.items, SelItem{star: false, qual: "", expr: Some(e), alias: v.toStr()})
+    append(mut &s.items, SelItem{star: false, qual: "", expr: Some(e), alias: v.toStr(), spell: ""})
     append(mut &s.assign, v.toStr())
     q.p.finish(mut &s)
     return s

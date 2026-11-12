@@ -251,9 +251,9 @@ transactions, with the S1 code restructured around them.
 
 - **Parsing (`lexdb_sql`):** a `Dialect` (tsql, quotedIdent) for the lexer:
   `@name` and `@@name`, `[name]`, `N'...'`, and `"..."` as a string under
-  QUOTED_IDENTIFIER OFF; E'' strings are lexdb's only. Until L6, a quoted
-  name is folded like a bare one in T-SQL, so `[Orders]` and `Orders` are
-  one table. In T-SQL mode the parser takes SQL Server's type names
+  QUOTED_IDENTIFIER OFF; E'' strings are lexdb's only. A quoted
+  name is folded like a bare one (L6, section 9), so `[Orders]` and
+  `Orders` are one table. In T-SQL mode the parser takes SQL Server's type names
   (nvarchar(n|max), bit, tinyint, datetime, datetime2(n), datetimeoffset,
   uniqueidentifier, money, varbinary(max), and timestamp as rowversion) and
   `SELECT @v = expr`. It exports a `Parser`: a cursor over T-SQL text
@@ -305,3 +305,42 @@ transactions, with the S1 code restructured around them.
   task and a cancel flag in the executor; column types from the plan);
   sp_prepare's metadata; TDS errors' classes beyond the common ones; the
   rest of T-SQL (S3, S4) after L2 and L6.
+
+## 9. L6, identifier case, as built (2026-11-12)
+
+Names are matched without regard to case on both protocols and shown as
+written, as SQL Server does (checked against the oracle: a column's label
+is the query's spelling, `NAME`, `name` and `Name` side by side; `*`,
+INFORMATION_SCHEMA and the catalog give the spelling the table was made
+with; a second table whose name differs only in case is refused, 2714).
+
+- **Tokens:** a name's text is folded (ASCII lower case), quoted or not, in
+  both dialects; `Tok.spell` keeps its spelling where that differs: a
+  quoted name's always, a bare name's in T-SQL only (PostgreSQL folds bare
+  names, so over psql `CREATE TABLE Foo` makes `foo` and a label of
+  `SELECT Foo` is `foo`, as there). Everything lexdb matches on (catalog
+  keys, column names, aliases) stays folded; the spelling rides beside it.
+- **Where the spelling is kept:** a table's and a view's (`Table.spell`,
+  after the layouts in the catalog row), a column's (`ColDef.spell`: the
+  catalog row stores the spelling and its decoder folds it for the name, so
+  rows written before need nothing), CREATE TABLE, ADD COLUMN, RENAME TO,
+  RENAME COLUMN (a change of case alone too), CREATE VIEW and CREATE TABLE
+  ... AS with their column lists, SELECT ... INTO.
+- **Where it is shown:** a result column's label (`OutCol.spell`, from the
+  item's alias or bare column, or `*`'s column), through subqueries, views,
+  CTEs and set operations; RowDescription and COLMETADATA send `label()`.
+  pg_class, pg_attribute, pg_tables, information_schema (tables, columns,
+  views, privileges), `\d`, index and constraint definitions and regclass
+  show it; regclass input is folded, quoted parts too.
+- **Differences from PostgreSQL:** `"Foo"` and `foo` are one name (lexdb's
+  decision, so that a name made over TDS can be written either way from
+  psql). A table made before L6 with a quoted name not in lower case cannot
+  be reached (its key keeps the case; nothing migrates it); a column of one
+  can, folded.
+- **Not yet spelled** (shown folded): index, constraint, schema, sequence,
+  role and type names; `AS x(a, b)` column lists in FROM; CTE column lists.
+  Error messages give the folded name. String comparison (`WHERE
+  TABLE_NAME = 'orders'`) is still exact: that is L2.
+- **Tests:** `tds_client.lxl` (spelling of `*`, of a query's columns and
+  aliases, through a subquery, 2714 for a name in another case).
+
