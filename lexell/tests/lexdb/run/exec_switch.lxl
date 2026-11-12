@@ -5,6 +5,12 @@
 // index). Not switched: a path chosen for its order, a correlated subquery
 // (run per outer row), a write, a read-write block. The EXPLAIN ANALYZE lines
 // were checked by hand (the ranges read include the bound's value: 9.5).
+// The rules mode keeps that rule; the cost mode (optimizer 38) uses the
+// measured costs: a scan when the table has at most 3.75 times the range's
+// entries (a row through an index 45, a row scanned row by row 12), a short
+// range included (cases at the end).
+// expect: -- section 19's switch, which the rules mode keeps (the cost mode's, optimizer 38, at the end)
+// expect: set lexdb_planner = rules -> SET
 // expect: -- s: 5000 rows, kind = id % 10
 // expect: create table s (id int primary key, kind int, v int) -> CREATE TABLE
 // expect: insert into s select g, g % 10, g % 7 from generate_series(1, 5000) g -> INSERT 0 5000
@@ -55,6 +61,26 @@
 // expect: create index b_kind on b (kind) -> CREATE INDEX
 // expect: explain analyze select id from b where kind < 1 -> scan b: index b_kind range (rows read 4000, kept 2000)
 // expect: select count(*) from b where kind < 1 -> [count] 2000
+// expect: -- the cost mode (optimizer 38): a row through an index costs 45, a scanned row 12 (row by row), measured: a scan past 1/3.75 of the table
+// expect: reset lexdb_planner -> RESET
+// expect: create table w (id int primary key, x int) -> CREATE TABLE
+// expect: insert into w select g, g from generate_series(1, 20000) g -> INSERT 0 20000
+// expect: create index w_x on w (x) -> CREATE INDEX
+// expect: -- 5000 entries of 20,000 rows: the index; 6000: a scan (the rules: the index)
+// expect: explain analyze select count(*) from w where x <= 5000 -> scan w: index w_x range (rows read 5000, kept 5000); aggregate
+// expect: explain analyze select count(*) from w where x <= 6000 -> scan w: index w_x range (rows read 20000, kept 6000, switched to scan: cheaper than the range, by the measured costs); aggregate
+// expect: select count(*) from w where x <= 6000 -> [count] 6000
+// expect: -- a small table: a short range of 20 of 50 rows is scanned too; 10 is not
+// expect: create table tiny (id int primary key, x int) -> CREATE TABLE
+// expect: insert into tiny select g, g from generate_series(1, 50) g -> INSERT 0 50
+// expect: create index tiny_x on tiny (x) -> CREATE INDEX
+// expect: explain analyze select count(*) from tiny where x <= 20 -> scan tiny: index tiny_x range (rows read 50, kept 20, switched to scan: cheaper than the range, by the measured costs); aggregate
+// expect: explain analyze select count(*) from tiny where x <= 10 -> scan tiny: index tiny_x range (rows read 10, kept 10); aggregate
+// expect: select count(*) from tiny where x <= 20 -> [count] 20
+// expect: -- the rules mode keeps the index for each
+// expect: set lexdb_planner = rules -> SET
+// expect: explain analyze select count(*) from w where x <= 6000 -> scan w: index w_x range (rows read 6000, kept 6000); aggregate
+// expect: explain analyze select count(*) from tiny where x <= 20 -> scan tiny: index tiny_x range (rows read 20, kept 20); aggregate
 import "../../../cmd/lexdb_store"
 import "../../../cmd/lexdb_disk"
 import "../../../cmd/lexdb_exec"
@@ -113,6 +139,8 @@ fn switched(s: mut &lexdb_exec.Session, sql: str) {
 fn body(st: lexdb_store.Store): int {
     lexdb_exec.bootstrap(&st).unwrap()
     var s = lexdb_exec.newSession(st)
+    println("-- section 19's switch, which the rules mode keeps (the cost mode's, optimizer 38, at the end)")
+    show(mut &s, "set lexdb_planner = rules")
     println("-- s: 5000 rows, kind = id % 10")
     show(mut &s, "create table s (id int primary key, kind int, v int)")
     show(mut &s, "insert into s select g, g % 10, g % 7 from generate_series(1, 5000) g")
@@ -163,6 +191,26 @@ fn body(st: lexdb_store.Store): int {
     show(mut &s, "create index b_kind on b (kind)")
     analyze(mut &s, "explain analyze select id from b where kind < 1")
     show(mut &s, "select count(*) from b where kind < 1")
+    println("-- the cost mode (optimizer 38): a row through an index costs 45, a scanned row 12 (row by row), measured: a scan past 1/3.75 of the table")
+    show(mut &s, "reset lexdb_planner")
+    show(mut &s, "create table w (id int primary key, x int)")
+    show(mut &s, "insert into w select g, g from generate_series(1, 20000) g")
+    show(mut &s, "create index w_x on w (x)")
+    println("-- 5000 entries of 20,000 rows: the index; 6000: a scan (the rules: the index)")
+    analyze(mut &s, "explain analyze select count(*) from w where x <= 5000")
+    analyze(mut &s, "explain analyze select count(*) from w where x <= 6000")
+    show(mut &s, "select count(*) from w where x <= 6000")
+    println("-- a small table: a short range of 20 of 50 rows is scanned too; 10 is not")
+    show(mut &s, "create table tiny (id int primary key, x int)")
+    show(mut &s, "insert into tiny select g, g from generate_series(1, 50) g")
+    show(mut &s, "create index tiny_x on tiny (x)")
+    analyze(mut &s, "explain analyze select count(*) from tiny where x <= 20")
+    analyze(mut &s, "explain analyze select count(*) from tiny where x <= 10")
+    show(mut &s, "select count(*) from tiny where x <= 20")
+    println("-- the rules mode keeps the index for each")
+    show(mut &s, "set lexdb_planner = rules")
+    analyze(mut &s, "explain analyze select count(*) from w where x <= 6000")
+    analyze(mut &s, "explain analyze select count(*) from tiny where x <= 20")
     return 0
 }
 

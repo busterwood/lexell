@@ -42,7 +42,8 @@ review's fixes with filter and range estimates (29); the search to 24
 tables (30); the integration with lexdb 9.94 (31); ORDER BY ... LIMIT read
 in order (32); the second review's fixes (33); a workload comparison (34);
 the fast path for pinned joins (35); the read costs measured and
-calibrated (36); and ANALYZE's samples, the rest of SQLite's stat4 (37,
+calibrated (36); ANALYZE's samples, the rest of SQLite's stat4 (37); and
+the switch's threshold from the measured costs in the cost mode (38,
 uncommitted). Code comments cite these sections as "optimizer N".
 
 ## 1. Summary
@@ -2118,6 +2119,47 @@ well estimated by min and max, its dates being spread evenly.
 
 **Checked:** the suite, 96 of 96; the random differential sets, 6,616
 joins, 0 differences.
+
+## 38. The switch by the measured costs, in the cost mode (2026-11-12)
+
+After section 36 the planner had two cost models: the join order priced a
+row through an index at 45 batched scan rows, while the index-to-scan switch
+(section 19) still took a scan only when a range held over half the table
+(an index row 2, a scanned row 1). The user chose option B: the measured
+costs in the cost mode, section 19's rule kept in the rules mode, which
+stays the old planner to fall back to.
+
+**What.** In the cost mode the switch takes a scan when the table has at
+most `COST_KEY_ROW / COST_SCAN_INNER` times the range's entries (45/12, about
+3.75: a range over about a quarter of the table). It also checks a range
+that ends within `SWITCH_ENTRIES_COST` (64) entries, so a small table is
+scanned even for a short range. The rules mode is unchanged: twice the
+entries, and no check under 1,024 entries. EXPLAIN ANALYZE gives the rule
+that applied ("the range holds over half the table", or "cheaper than the
+range, by the measured costs").
+
+**A first version used the wrong ratio.** It took 45, a row through an
+index against a scanned row *in batches*. But the switched scan is not
+batched: the switch replaces the path of a level that `batchLevel` has
+already passed over, so its rows are read one at a time (12). With 45, the
+workload's Q13 went from 12 to 20.6 ms and Q9 from 31.7 to 41.5 ms. Both
+scanned 20,000 rows row by row where the index read 800. With 3.75 they are
+back (13.1 and 35.1 ms). Batching the switched scan would make 45 right and
+the scans faster; not done.
+
+**Tests.** `exec_switch` runs section 19's cases in the rules mode, as
+before, and adds cost-mode cases:
+- 5,000 entries of 20,000 rows: the index;
+- 6,000 entries: a scan (the rules: the index);
+- a 50-row table: a range of 20 is scanned, a range of 10 is not.
+`exec_ops`, one of lexdb's tests, has a LIKE range on a small table that is
+now scanned, so its two rows (no ORDER BY) come in key order: its
+expectation was updated.
+
+**The workload** (µs): total cost 396,081 against rules 6,299,106, Q13
+13,088 (rules 11,824), Q9 35,075 (rules 47,615); the rest as before.
+
+**Checked:** the suite, 96 of 96.
 
 ## Sources
 

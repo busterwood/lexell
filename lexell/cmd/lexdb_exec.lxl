@@ -4618,7 +4618,7 @@ type Counts = value record {
     kept: int
     unmatched: int      // RIGHT and FULL JOIN: its rows that joined nothing
     batches: int        // the batches its rows were read and aggregated in (9.47)
-    switched: int       // 1 when an index range over the budget was run as a scan (optimizer 19)
+    switched: int       // when an index range was run as a scan (optimizer 19): 1 by the rules mode's rule, 2 by the measured costs (optimizer 38)
 }
 
 // A query's run: the counts, and per RIGHT or FULL JOIN table which of its
@@ -7397,6 +7397,21 @@ fn tryRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Mats
 // The table is counted a leaf at a time. No statistics are needed.
 const SWITCH_ENTRIES: int = 1024
 
+// The cost mode's switch (optimizer 38) uses the measured costs, as the join
+// order does (optimizer 36): a row through an index costs COST_KEY_ROW (45),
+// and the switched scan's row COST_SCAN_INNER (12: it is read row by row,
+// not in batches), so a scan is taken when the table has at most 45/12 (3.75)
+// times the range's entries; and a range ended within SWITCH_ENTRIES_COST
+// entries is compared too (a small table is scanned even for a short
+// range). The rules mode keeps section 19's guess: 2, and SWITCH_ENTRIES.
+const SWITCH_ENTRIES_COST: int = 64
+
+// The table's rows at most for a scan in place of a range of n entries.
+fn switchMost(rules: bool, n: int): int {
+    if rules { return 2 * n }
+    return int(float(n) * COST_KEY_ROW / COST_SCAN_INNER)
+}
+
 // The table's rows, counted until there are more than most.
 fn countRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, most: int): Result[int, DbErr] {
     var n = 0
@@ -7421,14 +7436,15 @@ fn countRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, most:
 fn indexOrScan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, p: &Path, sc: &Scan,
                keys: mut &[]str): Result[int, DbErr] {
     let tree = t.indexes[p.index].tree
-    var lim = SWITCH_ENTRIES
+    let start = if txn.rules { SWITCH_ENTRIES } else { SWITCH_ENTRIES_COST }
+    var lim = start
     var from = sc.lo
     var n = 0
     var got: []str = []
     while true {
         var more = false
         var last = ""
-        let first = lim == SWITCH_ENTRIES
+        let first = lim == start
         try st.scan(txn, tree, from, sc.hi, fn(en: &lexdb_store.Entry): bool {
             if n == lim {
                 more = true
@@ -7441,15 +7457,20 @@ fn indexOrScan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, p: 
         })
         if !more {
             if first {
+                // a short range: the index, unless (cost mode) the table is
+                // smaller than r times it
+                if !txn.rules && n > 0 && try countRows(st, txn, t, switchMost(false, n)) <= switchMost(false, n) { return Ok(1) }
                 for x in got { append(keys, x) }
                 return Ok(0)
             }
-            // the range has n entries: a scan if the table has at most 2n rows
-            if try countRows(st, txn, t, 2 * n) <= 2 * n { return Ok(1) }
+            // the range has n entries: a scan if the table has at most switchMost rows
+            let most = switchMost(txn.rules, n)
+            if try countRows(st, txn, t, most) <= most { return Ok(1) }
             return Ok(2)
         }
         from = after(&last)
-        if try countRows(st, txn, t, 2 * lim) <= 2 * lim { return Ok(1) }
+        let most = switchMost(txn.rules, lim)
+        if try countRows(st, txn, t, most) <= most { return Ok(1) }
         lim = lim * 2
     }
     return Ok(2)
@@ -7582,7 +7603,7 @@ fn runLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Ma
             let how = try indexOrScan(st, txn, &lv.t, &lv.path, &scans[0], mut &keys)
             if how == 1 {
                 scans = [Scan{empty: false, point: false, lo: "", hi: "", whole: true}]
-                rs.cnt[0].switched = 1
+                rs.cnt[0].switched = if txn.rules { 1 } else { 2 }
             } else if how == 0 {
                 byKeys = true
             }
@@ -8588,7 +8609,8 @@ fn explainLines(q: &Query, cnt: &[]Counts): []str {
             if keepsLeft(q.levels[k].join) { append(mut &parts, "null rows " + c.nulls.toStr()) }
             if keepsRight(q.levels[k].join) { append(mut &parts, "unmatched rows " + c.unmatched.toStr()) }
             if c.batches > 0 { append(mut &parts, "batches " + c.batches.toStr()) }
-            if c.switched > 0 { append(mut &parts, "switched to scan: the range holds over half the table") }
+            if c.switched == 1 { append(mut &parts, "switched to scan: the range holds over half the table") }
+            if c.switched == 2 { append(mut &parts, "switched to scan: cheaper than the range, by the measured costs") }
             tail = " (" + strings.join(&parts, ", ") + ")"
         }
         let lv = &q.levels[k]
