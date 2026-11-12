@@ -120,6 +120,10 @@ pub fn floatType(oid: int): TypeName { return TypeName{kind: K_FLOAT, oid: oid, 
 // reg type, a catalog function), so the catalog is bound before it runs.
 pub const CAT_MARK: str = "\x00catalog"
 
+// In a statement's seqNames: it calls current_setting or set_config (9.92),
+// so the session's settings are put where they can read them.
+pub const SET_MARK: str = "\x00settings"
+
 // The functions that read the catalog (9.80).
 const CAT_FNS: []str = ["pg_get_userbyid", "pg_table_is_visible", "pg_type_is_visible", "pg_function_is_visible",
                         "pg_collation_is_visible", "pg_get_expr", "pg_get_constraintdef", "pg_get_indexdef",
@@ -713,10 +717,10 @@ fn lex(s: &str): Result[[]Tok, lexdb_base.DbErr] {
         if i + 1 < n {
             let two = s[i..i + 2]
             if two == "<=" || two == ">=" || two == "<>" || two == "!=" || two == "||" || two == "::" || two == "!~" || two == "~*" ||
-               two == "<<" || two == ">>" { op = two }
+               two == "<<" || two == ">>" || two == "@>" || two == "<@" || two == "&&" { op = two }
             if two == "!~" && i + 2 < n && s[i + 2] == '*' { op = "!~*" }
         }
-        if !strings.contains(&"(),;.*+-/%=<>|:![]~&#", &op[0..1]) {
+        if !strings.contains(&"(),;.*+-/%=<>|:![]~&#^@", &op[0..1]) {
             return Err(syntax("syntax error at or near \"" + op + "\""))
         }
         i += len(op)
@@ -1088,10 +1092,12 @@ fn (p: mut &P) cmpExpr(): Result[Expr, lexdb_base.DbErr] {
 // operator", between + - and the comparisons, left to right.
 fn (p: mut &P) catExpr(): Result[Expr, lexdb_base.DbErr] {
     var e = try p.addExpr()
-    while p.isKw("||") || p.isKw("&") || p.isKw("|") || p.isKw("#") || p.isKw("<<") || p.isKw(">>") {
+    while p.isKw("||") || p.isKw("&") || p.isKw("|") || p.isKw("#") || p.isKw("<<") || p.isKw(">>") || p.isKw("@>") ||
+          p.isKw("<@") || p.isKw("&&") {
         let op = p.next().text
         let r = try p.addExpr()
-        e = Expr.Bin(op, e, r)
+        // the array operators (9.92) are calls
+        e = if op == "@>" || op == "<@" || op == "&&" { Expr.Call(op, [e, r], false) } else { Expr.Bin(op, e, r) }
     }
     return Ok(e)
 }
@@ -1107,11 +1113,22 @@ fn (p: mut &P) addExpr(): Result[Expr, lexdb_base.DbErr] {
 }
 
 fn (p: mut &P) mulExpr(): Result[Expr, lexdb_base.DbErr] {
-    var e = try p.unary()
+    var e = try p.powExpr()
     while p.isKw("*") || p.isKw("/") || p.isKw("%") {
         let op = p.next().text
-        let r = try p.unary()
+        let r = try p.powExpr()
         e = Expr.Bin(op, e, r)
+    }
+    return Ok(e)
+}
+
+// x ^ y (9.92): above * and /, below a sign, left to right, as PostgreSQL's.
+fn (p: mut &P) powExpr(): Result[Expr, lexdb_base.DbErr] {
+    var e = try p.unary()
+    while p.isKw("^") {
+        p.pos += 1
+        let r = try p.unary()
+        e = Expr.Bin("^", e, r)
     }
     return Ok(e)
 }
@@ -1145,6 +1162,26 @@ fn (p: mut &P) unary(): Result[Expr, lexdb_base.DbErr] {
         }
     }
     return Ok(e)
+}
+
+// At a call's "(": whether its arguments are the SQL standard's words
+// (FROM, FOR, PLACING) rather than commas.
+fn (p: &P) sqlForm(): bool {
+    var depth = 0
+    var i = p.pos
+    while i < len(p.toks) {
+        let t = p.toks[i]
+        if t.kind == T_EOF { return false }
+        if t.kind == T_OP && (t.text == "(" || t.text == "[") { depth += 1 }
+        if t.kind == T_OP && (t.text == ")" || t.text == "]") {
+            depth -= 1
+            if depth == 0 { return false }
+        }
+        if depth == 1 && t.kind == T_OP && t.text == "," { return false }
+        if depth == 1 && t.kind == T_IDENT && (t.text == "from" || t.text == "for" || t.text == "placing") { return true }
+        i += 1
+    }
+    return false
 }
 
 fn negate(neg: bool, x: Expr): Expr { return if neg { Expr.Unary("not", x) } else { x } }
@@ -1309,6 +1346,44 @@ fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
     }
     let t = p.next()
     if t.kind == T_IDENT && t.text == "case" { return p.caseExpr() }
+    if t.kind == T_IDENT && t.text == "substring" && p.isKw("(") && p.sqlForm() {
+        // substring(x [FROM a] [FOR b]) (9.92): substring(x, a [, b]), FOR alone
+        // from 1; a text a is a pattern (lexdb_exec)
+        p.pos += 1
+        let x = try p.expr()
+        var args: []Expr = [x]
+        if p.acceptKw("from") {
+            append(mut &args, try p.expr())
+            if p.acceptKw("for") { append(mut &args, try p.expr()) }
+        } else {
+            try p.expectKw("for")
+            append(mut &args, Expr.Lit(Val.Int(1)))
+            append(mut &args, try p.expr())
+        }
+        try p.expectKw(")")
+        return Ok(Expr.Call("substring", args, false))
+    }
+    if t.kind == T_IDENT && t.text == "position" && p.isKw("(") {
+        // position(a IN b): b's place of a; a is read above IN's level
+        p.pos += 1
+        let a = try p.catExpr()
+        try p.expectKw("in")
+        let b = try p.expr()
+        try p.expectKw(")")
+        return Ok(Expr.Call("position", [b, a], false))
+    }
+    if t.kind == T_IDENT && t.text == "overlay" && p.isKw("(") && p.sqlForm() {
+        // overlay(x PLACING y FROM n [FOR m])
+        p.pos += 1
+        var args: []Expr = [try p.expr()]
+        try p.expectKw("placing")
+        append(mut &args, try p.expr())
+        try p.expectKw("from")
+        append(mut &args, try p.expr())
+        if p.acceptKw("for") { append(mut &args, try p.expr()) }
+        try p.expectKw(")")
+        return Ok(Expr.Call("overlay", args, false))
+    }
     if t.kind == T_IDENT && t.text == "trim" && p.isKw("(") {
         // trim([LEADING | TRAILING | BOTH] [chars] FROM x), or trim(x [, chars]):
         // ltrim, rtrim or btrim of x and chars (9.82)
@@ -1499,6 +1574,7 @@ fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
                 fname = fname + " filter"
             }
             if isCatFn(&fname) { append(mut &p.seqs, CAT_MARK) }
+            if fname == "current_setting" || fname == "set_config" { append(mut &p.seqs, SET_MARK) }
             if (fname == "nextval" || fname == "currval" || fname == "setval") && len(args) > 0 {
                 match litText(&args[0]) {
                     Some(n) { append(mut &p.seqs, n) }
@@ -2702,13 +2778,19 @@ fn (p: mut &P) orderLimit(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
     return Ok(Unit{})
 }
 
+// The functions that may be a FROM item.
+pub fn isFromFn(n: &str): bool {
+    return n == "generate_series" || n == "unnest" || n == "pg_partition_ancestors" || n == "regexp_matches" ||
+           n == "regexp_split_to_table" || n == "string_to_table"
+}
+
 fn (p: mut &P) fromItem(join: int): Result[FromItem, lexdb_base.DbErr] {
     let lateral = p.acceptKw("lateral")
     if p.peek().kind == T_IDENT && p.peek().text == "pg_catalog" && p.peekAt(1).kind == T_OP && p.peekAt(1).text == "." &&
        p.peekAt(3).kind == T_OP && p.peekAt(3).text == "(" {
         p.pos += 2
     }
-    if p.peek().kind == T_IDENT && (p.peek().text == "generate_series" || p.peek().text == "unnest" || p.peek().text == "pg_partition_ancestors") &&
+    if p.peek().kind == T_IDENT && isFromFn(&p.peek().text) &&
        p.pos + 1 < len(p.toks) && p.toks[p.pos + 1].kind == T_OP && p.toks[p.pos + 1].text == "(" {
         return p.fromFunction(join)
     }
@@ -2804,7 +2886,8 @@ fn (p: mut &P) fromFunction(join: int): Result[FromItem, lexdb_base.DbErr] {
     var cols: []str = []
     try p.aliasOf(mut &alias, mut &cols)
     // one column, an alias and no column names: the column is the alias
-    let single = name == "generate_series" || len(p.subs[i].items) == 1
+    let single = name == "generate_series" || name == "regexp_matches" || name == "regexp_split_to_table" || name == "string_to_table" ||
+                 len(p.subs[i].items) == 1
     if single && alias != name && len(cols) == 0 { append(mut &cols, alias) }
     return Ok(FromItem{table: name, alias: alias, join: join, on: None, sub: i, cols: cols, work: -1, lateral: true})
 }
@@ -3564,7 +3647,10 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
         "grant", "revoke" { return p.grantStmt(t.text == "grant") }
         "show" {
             var st = newStmt(S_SHOW)
-            if p.acceptKw("all") { st.table = "all" } else { st.table = try p.name() }
+            if p.acceptKw("all") { st.table = "all" } else {
+                st.table = try p.name()
+                if p.acceptKw(".") { st.table = st.table + "." + (try p.name()) }   // a custom setting (9.92)
+            }
             if st.table == "transaction" { st.table = "transaction_isolation" }   // SHOW TRANSACTION ISOLATION LEVEL
             p.skipToEnd()
             return Ok(st)
@@ -3652,6 +3738,38 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
                     if !p.acceptKw("to") { try p.expectKw("=") }
                     if p.acceptKw("default") { st.limit = None } else { st.limit = Some(try p.expr()) }
                 }
+                return Ok(st)
+            }
+            // a custom setting, a dot in its name (9.92): SET [LOCAL] a.b = value | TO value
+            // | DEFAULT, RESET a.b: the name in table, the value in names (then
+            // "local")
+            var at = p.pos
+            let local = t.text == "set" && p.isKw("local")
+            if local { at += 1 }
+            if (t.text == "set" || t.text == "reset") && (p.toks[at].kind == T_IDENT || p.toks[at].kind == T_QIDENT) &&
+               p.toks[at + 1].kind == T_OP && p.toks[at + 1].text == "." && (p.toks[at + 2].kind == T_IDENT || p.toks[at + 2].kind == T_QIDENT) {
+                p.pos = at + 3
+                st.table = p.toks[at].text + "." + p.toks[at + 2].text
+                if t.text == "reset" { return Ok(st) }
+                if !p.acceptKw("to") { try p.expectKw("=") }
+                if p.acceptKw("default") {
+                    st.ifFlag = true
+                    return Ok(st)
+                }
+                var vals: []str = []
+                while true {
+                    let v = p.next()
+                    if v.kind == T_EOF || (v.kind == T_OP && v.text != "-") { return Err(near(&v)) }
+                    if v.kind == T_OP {
+                        let w = p.next()
+                        append(mut &vals, "-" + w.text)
+                    } else {
+                        append(mut &vals, v.text)
+                    }
+                    if !p.acceptKw(",") { break }
+                }
+                append(mut &st.names, strings.join(&vals, ", "))
+                if local { append(mut &st.names, "local") }
                 return Ok(st)
             }
             p.skipToEnd()
@@ -3808,6 +3926,10 @@ pub fn exprText(x: &Expr): str {
                 return "(" + exprText(&args[0]) + " in (" + strings.join(&parts, ", ") + "))"
             }
             if n == "distinct from" { return "(" + exprText(&args[0]) + " is distinct from " + exprText(&args[1]) + ")" }
+            if (n == "~" || n == "!~" || n == "~*" || n == "!~*" || n == "@>" || n == "<@" || n == "&&") && len(args) == 2 {
+                return "(" + exprText(&args[0]) + " " + n + " " + exprText(&args[1]) + ")"
+            }
+            if n == "position" && len(args) == 2 { return "position(" + exprText(&args[1]) + " in " + exprText(&args[0]) + ")" }
             if isQuant(&n) {
                 let sp = strings.indexOf(n, " ", 0)
                 return "(" + exprText(&args[0]) + " " + n[sp + 1..len(n)] + " " + n[0..sp] + " (" + exprText(&args[1]) + "))"

@@ -7128,3 +7128,145 @@ writes `CREATE TYPE event_kind AS ENUM ('a', 'b')` for an `Enum` column.
 TYPE ... CASCADE; MIN and MAX in the labels' order; privileges on types
 (USAGE); a cast of a text that is not a label is checked only when it is
 written or compared.
+
+### 9.92 Built-in functions and operators
+
+PostgreSQL's functions that applications and tools call, and lexdb did not
+have ("function ... does not exist", or a syntax error). The ones that need
+no table or session are in a new module, `cmd/lexdb_func.lxl`; lexdb_exec
+turns values to and from it (`callFn`, called from `callAt` after
+`callMisc`).
+
+**Regular expressions** (`lib/regex`, RE2 syntax):
+- `regexp_replace` (flags, or PostgreSQL 16's start and N), `regexp_match`,
+  `regexp_matches` (set-returning, in a select list or FROM), `regexp_like`,
+  `regexp_count`, `regexp_instr`, `regexp_substr`, `regexp_split_to_table`
+  (both places) and `regexp_split_to_array`.
+- `substring(x FROM pattern)`: the first group's match, or the whole match.
+- **PostgreSQL's rules, kept:**
+  - the flags g i c n m s p w q x (x: white space and comments dropped
+    outside brackets); another is 22023;
+  - without n, `.` matches a newline. That now holds for `~` and its kin too;
+  - matches are found as `setup_regexp_matches` finds them: after an empty
+    match the search moves one character on, and a split skips empty
+    matches at the ends and just after a match;
+  - the replacement's `\1` to `\9`, `\&` and `\\`;
+  - the longest match is taken (RE2's leftmost-longest mode), as an ARE
+    with no non-greedy quantifier prefers; with one, the shortest;
+  - `\y \m \M \Y \Z` are spelled as RE2 spells them;
+  - start and N below their least are 22023; 'g' where it is refused is
+    22023; a bad pattern is 2201B.
+
+**Strings:** `lpad`, `rpad`, `split_part` (a negative field counts from the
+end; 0 is 22023), `concat_ws`, `md5` (lib crypto), `format` (%s %I %L %%,
+`%2$s`, widths `%10s` `%-10s` `%*s` `%*2$s`, and its errors), `chr` (0 is
+54000, negative 22023), `ascii`, `initcap`, `reverse`, `starts_with`,
+`to_hex`, `translate`, `quote_literal`, `quote_nullable`. The SQL forms
+`substring(x FROM n FOR m)` (and FROM or FOR alone), `position(a IN b)` and
+`overlay(x PLACING y FROM n [FOR m])`; the parser reads a call's FROM, FOR
+or PLACING (`sqlForm`) before its commas.
+
+**Math:**
+- `mod`, `div`, `gcd` and `lcm` over integers and numeric, each of the
+  type PostgreSQL gives; `width_bucket` over numeric (exactly) and double
+  precision; `pi`, `degrees`, `radians`, the trigonometric functions and
+  the degree ones (`sind` and the rest computed as PostgreSQL does, so
+  `sind(30)` is 0.5 exactly), the hyperbolic ones; `log(x)`, `log(b, x)`.
+- `x ^ y`: above `*` and `/`, below a sign, left to right, so `-2 ^ 2` is 4
+  and `2 ^ 3 ^ 2` 64. Double precision, or numeric when an operand is and
+  neither is a float; `power` the same.
+- **numeric's own `sqrt`, `exp`, `ln`, `log10`, `log` and `^`** (they were
+  0A000): each to PostgreSQL's result scale (`numeric_sqrt`'s, `ln`'s from
+  `estimate_ln_dweight`, `power_var_int`'s), rounded half away from zero.
+  A whole exponent is multiplied out exactly while it fits 38 digits. The
+  rest is computed in `Hp`, a decimal floating point of 19 digits in a
+  u128 (ln by atanh's series after halving into [1, 2), exp by Taylor's
+  after taking out powers of ten, sqrt by Newton's), then rounded.
+
+**Arrays:**
+- `array_append`, `array_prepend`, `array_cat`, `array_remove`,
+  `array_replace`, `array_position` (with a start), `array_positions`,
+  `string_to_array` (a NULL delimiter splits into characters, a third
+  argument names NULL), `string_to_table`, `array_ndims`, `array_dims`;
+- `@>`, `<@` and `&&`, as calls, at `||`'s level.
+- **Fixed: `||` with an array** gave a text (`{1,2}{3}`). The resolver now
+  makes it array_cat, array_append or array_prepend by the sides' types
+  (`arrayConcat`); a literal text or NULL beside an array is read as an
+  array, as PostgreSQL reads an unknown literal (so `array['a'] || 'b'` is
+  22P02 there and here). Its type is the array of the elements' common type
+  (`int[] || numeric` is `numeric[]`). An expression the resolver does not
+  see (INSERT's VALUES) decides the same way when a side's value starts
+  with `{`.
+- `ARRAY[1.0, 2]` is now `numeric[]` (its type was its last element's).
+- **Elements are compared as their type.** An array is its text, so the
+  resolver adds to the calls that compare elements (`TYPED_FNS`) a last
+  argument, a text no SQL can hold, with the arguments' type OIDs (`HINT`).
+  `array_remove(array[1.0, 2], 1)` then removes 1.0.
+
+**Settings and the session:**
+- `current_setting(name [, missing_ok])` and `set_config(name, value,
+  is_local)`. A statement that calls one carries `SET_MARK` among its
+  `seqNames`; the session then puts its settings in the store's memo before
+  it runs (`publishSettings`), the calls read them there, and `set_config`'s
+  changes are made after it succeeds (`takeSetConfigs`), through the same
+  code as SET (`applySetting`). `set_config('search_path', ...)`, which
+  pg_dump sends, sets the path.
+- **Custom settings** (a dot in the name, `myapp.user_id`): `SET`, `SET
+  LOCAL`, `RESET`, `SHOW`, `current_setting` and `set_config`. They are
+  rolled back with the block; a local one (`SET LOCAL`, `is_local` true)
+  goes back when the block ends.
+- `pg_backend_pid()` is the session's number; `txid_current()` and
+  `pg_current_xact_id()` a number from a count in the memo, the same within
+  a transaction and growing.
+
+**Formatting** (PostgreSQL's formatting.c, followed closely):
+- `to_char` of a date, timestamp, timestamptz and interval: every pattern
+  PostgreSQL has (with FM, TH, quoted text), in the C locale;
+- `to_char` of an integer, numeric, real and double precision: 9 0 . , D G
+  S MI PL SG PR FM TH V RN EEEE, PostgreSQL's NUM_processor's placing of
+  the sign, blanks and `#` for overflow. A float is rounded as C's printf
+  rounds its exact value (`floatFixed`: `to_char(12.345::float8, '99.99')`
+  is 12.35, `0.125` gives .12), to 15 digits (6 for a real);
+- `to_number`, `to_date`, `to_timestamp(text, format)` (with TZH and TZM;
+  no year is 1 BC, as there).
+
+**Tests.** `exec_funcs`, 174 statements generated from PostgreSQL 18 by
+`gen_pg.py funcs`, all the same: each function's cases, NULLs, `pg_typeof`
+and errors; `^`'s precedence; `||` on array literals, columns, in UPDATE and
+INSERT; `@>` and `&&` in WHERE; regexp_matches and regexp_split_to_table in
+FROM with aliases and ORDINALITY; settings across BEGIN, COMMIT, ROLLBACK and
+SET LOCAL; txid_current within a block; to_char's number and date patterns;
+the new operators in a CHECK, which keeps its text and reads it again
+(`exprText` writes `~`, `@>`, `<@`, `&&` and `position` as SQL). The numeric
+math was also compared over about two hundred values outside the test. The
+reference server was a scratch PostgreSQL 18.6 (en_US.UTF-8). The whole
+lexdb suite passes.
+
+**Differences from PostgreSQL, left as they are:**
+- **The regular expressions are RE2's:** no back references (`\1` in a
+  pattern), no lookahead, and `\b` is a word boundary (an ARE's is a
+  backspace); RE2 takes `(?P<name>...)`, which PostgreSQL refuses. Which
+  match a pattern with both greedy and non-greedy parts takes may differ.
+  A pattern is compiled on each call.
+- **numeric's math** is right where the result shows up to about 17
+  significant digits. Past that (many decimals in an argument, `exp(45.3)`)
+  the last digits may differ, and a result over 38 digits is 22003
+  (lexdb's numeric limit), where PostgreSQL gives it. Near a tie the 17th
+  digit may round the other way (`sqrt(0.99)`).
+- `to_char`'s L is a blank and D, G are `.` and `,`: the C locale, as
+  lexdb's `lc_monetary` says (the reference cluster's en_US gives `$`).
+  TM, SP and FX are read and ignored.
+- to_date and to_timestamp read in PostgreSQL's lenient mode only (FX is
+  ignored), and fewer of their errors are checked.
+- `set_config` returns the value as given (PostgreSQL shows it normalized,
+  `5s`); an unknown setting without a dot is 42704 for `set_config` and
+  `current_setting`, but `SET` of one is still accepted and ignored. A
+  custom setting reset after use is gone (PostgreSQL keeps it, empty).
+- `pg_current_xact_id()` is a bigint (PostgreSQL's xid8).
+- `gcd` and `lcm` of integers check bigint's range, not integer's.
+- `to_hex` of a negative number takes integer's width from the resolver's
+  type; where nothing is resolved, by the value.
+
+**Not done:** `SIMILAR TO` and `substring(x FROM pattern FOR escape)`
+(0A000); multi-dimensional arrays; `array_fill`, `array_reverse`,
+`array_sort`; json (a decision).
