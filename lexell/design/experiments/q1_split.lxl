@@ -1,0 +1,51 @@
+// Q1 of workload.lxl split: EXPLAIN (planning alone) against the query (planning
+// and execution), cost against rules, on a small copy of the schema.
+import "../../cmd/lexdb_store"
+import "../../cmd/lexdb_disk"
+import "../../cmd/lexdb_exec"
+import "time"
+
+fn exec(s: mut &lexdb_exec.Session, sql: &str) {
+    match s.exec(sql) {
+        Ok(_) {}
+        Err(e) { println(sql + " -> " + e.state + " " + e.msg) }
+    }
+}
+
+fn per(s: mut &lexdb_exec.Session, sql: &str): int {
+    for i in 0..200 { exec(s, sql) }
+    let t0 = time.monotonicNs()
+    for i in 0..5000 { exec(s, sql) }
+    return (time.monotonicNs() - t0) / 5000
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    var s = lexdb_exec.newSession(st)
+    for x in [
+        "create table part (id int primary key, brand text, type text, size int)",
+        "insert into part select g, 'Brand#' || (g % 25), 'type' || (g % 150), g % 50 + 1 from generate_series(1, 2000) g",
+        "create index part_brand on part (brand)",
+        "create table orders (id int primary key, cust int, odate date, status text, total int)",
+        "insert into orders select g, (g * 7) % 2000 + 1, date '2020-01-01' + (g % 1460), 'O', g from generate_series(1, 20000) g",
+        "create index orders_cust on orders (cust)",
+        "create index orders_odate on orders (odate)",
+        "create table lineitem (ord int, line int, part int, supp int, qty int, price int, shipdate date, primary key (ord, line))",
+        "insert into lineitem select (g - 1) / 4 + 1, (g - 1) % 4 + 1, (g * 13) % 2000 + 1, 1, g % 50 + 1, g % 1000, date '2020-01-01' from generate_series(1, 80000) g",
+        "create index lineitem_part on lineitem (part)",
+        "create index lineitem_ship on lineitem (shipdate)",
+        "analyze",
+    ] { exec(mut &s, &x) }
+    let q = "select o.id, o.odate, l.line, p.brand, l.qty from orders o join lineitem l on l.ord = o.id join part p on p.id = l.part where o.id = 12345 order by l.line"
+    let q2 = "select id, odate, total from orders where cust = 777 order by odate desc limit 10"
+    for mode in ["cost", "rules"] {
+        exec(mut &s, &("set lexdb_planner = " + mode))
+        println(mode + ": Q1 explain " + per(mut &s, &("explain " + q)).toStr() + " ns, run " + per(mut &s, &q).toStr() +
+                " ns; Q2 explain " + per(mut &s, &("explain " + q2)).toStr() + " ns, run " + per(mut &s, &q2).toStr() + " ns")
+    }
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(5), lexdb_store.Options{cacheBytes: 512 * 1024 * 1024, segBytes: 64 * 1024 * 1024, ckptBytes: 64 * 1024 * 1024, snapNodes: 500000, bufferedPages: false}, body).unwrap()
+}

@@ -1,14 +1,23 @@
-// lexdb_exec: a prepared statement keeps its SELECT's plan (PlanCache)
-// while the schema the transaction sees is the same, and the plan looked at
-// no parameter's value. Two sessions, A runs prepared statements, B changes
-// the schema:
+// lexdb_exec: a prepared statement keeps its SELECT's plans (PlanCache)
+// while the schema the transaction sees is the same: one per outcome of its
+// planning's looks at parameters' values (optimizer 22), at most 4. Two sessions, A
+// runs prepared statements, B changes the schema:
 // - a point select run three times plans once;
 // - B's CREATE INDEX: A's next run plans again;
 // - B drops the table and makes it again with other columns: A plans
 //   again and reads the new table;
-// - LIMIT $1 is never kept (each run plans), and gives the right rows;
-// - nor a plan that asked whether x > $1 implies a partial index's
-//   predicate (x > 50): true for 60, false for 10;
+// - LIMIT $1 keeps a plan per value, gives the right rows, and takes a kept
+//   plan again for a value seen before; past 4 values, plans are not kept;
+// - a plan that asked whether x > $1 implies a partial index's predicate
+//   (x > 50): one plan for true (60, then 70 takes it again), one for false;
+// - a plan kept under a schema version made in A's block that rolled back
+//   is not taken for the version B commits next (optimizer 20);
+// - after ANALYZE, kind = $1 and uid = $2 plans per value of kind (optimizer 23):
+//   kind 1 is 99% of the rows (its common value), kind 2 1% (no row of it has
+//   uid 5); a value of the same scale takes its plan again;
+// - the same for a primary key prefix against an index (optimizer 24): tenant 1 (95%
+//   of the rows) reads the index, tenant 1950 (one row) the key;
+// - a join ordered by cost keeps one plan whatever its parameter (optimizer 26);
 // - A in a block begun before B drops and remakes a table keeps the plan
 //   its snapshot's schema matches and sees the old rows; after COMMIT it
 //   plans again and sees the new table;
@@ -16,8 +25,16 @@
 // expect: point: b5 b6 b7, plans 1
 // expect: after create index: b8, plans 2
 // expect: after drop and create: five, plans 3
-// expect: limit: 1 row, 3 rows, plans 0
-// expect: partial index: 5 12, plans 0
+// expect: limit: 1 row, 3 rows, plans 2
+// expect: limit again: 1 row, plans 2
+// expect: limit past the cap: 7 rows, plans 4
+// expect: partial index: 5 12, plans 2
+// expect: partial index again: 4, plans 2
+// expect: rolled-back version: 10 10, plans 3
+// expect: per value: 10 0 10, plans 2
+// expect: primary key prefix: 38 1 38, plans 2
+// expect: join by cost: 200 2000, plans 1
+// expect: noted reads: 499 499, plans 2
 // expect: block before the drop: 3 3, plans 1
 // expect: after commit: 0, plans 2
 // expect: run once: plans 0
@@ -83,6 +100,13 @@ fn main() {
         let l3 = run(mut &a, &q2, &[Val.Int(3)], mut &pc2)
         println("limit: " + len(strings.split(&l1, " ")).toStr() + " row, " + len(strings.split(&l3, " ")).toStr() +
                 " rows, plans " + pc2.plans.toStr())
+        let l1b = run(mut &a, &q2, &[Val.Int(1)], mut &pc2)
+        println("limit again: " + len(strings.split(&l1b, " ")).toStr() + " row, plans " + pc2.plans.toStr())
+        one(mut &b, &"insert into t values (8, 4, 'eight'), (9, 5, 'nine'), (10, 6, 'ten'), (11, 7, 'eleven')")
+        let l4 = run(mut &a, &q2, &[Val.Int(4)], mut &pc2)
+        let l5 = run(mut &a, &q2, &[Val.Int(5)], mut &pc2)
+        let l7 = run(mut &a, &q2, &[Val.Int(7)], mut &pc2)
+        println("limit past the cap: " + len(strings.split(&l7, " ")).toStr() + " rows, plans " + pc2.plans.toStr())
 
         // a partial index usable for one value of $1 and not another
         one(mut &b, &"create table p (id int primary key, x int, z int)")
@@ -95,6 +119,79 @@ fn main() {
         let p60 = run(mut &a, &qp, &[Val.Int(60)], mut &pcp)
         let p10 = run(mut &a, &qp, &[Val.Int(10)], mut &pcp)
         println("partial index: " + p60 + " " + p10 + ", plans " + pcp.plans.toStr())
+        let p70 = run(mut &a, &qp, &[Val.Int(70)], mut &pcp)
+        println("partial index again: " + p70 + ", plans " + pcp.plans.toStr())
+
+        // A plans in a block whose DDL rolls back; B's DDL then commits the
+        // next version: A's kept plan (using w_k, which B drops) must not be taken
+        one(mut &b, &"create table w (id int primary key, k int, z int)")
+        var wv: []str = []
+        for i in 0..100 { append(mut &wv, "(" + i.toStr() + ", " + (i % 10).toStr() + ", " + i.toStr() + ")") }
+        one(mut &b, &("insert into w values " + strings.join(&wv, ", ")))
+        one(mut &b, &"create index w_k on w (k)")
+        let qw = stmt(&"select count(*) from w where k = $1")
+        var pcw = lexdb_exec.newPlanCache()
+        let w1 = run(mut &a, &qw, &[Val.Int(3)], mut &pcw)
+        one(mut &a, &"begin")
+        one(mut &a, &"create index w_z on w (z)")
+        let w2 = run(mut &a, &qw, &[Val.Int(3)], mut &pcw)
+        one(mut &a, &"rollback")
+        one(mut &b, &"drop index w_k")
+        let w3 = run(mut &a, &qw, &[Val.Int(3)], mut &pcw)
+        println("rolled-back version: " + w1 + " " + w3 + ", plans " + pcw.plans.toStr())
+
+        one(mut &b, &"create table e (id int primary key, kind int, uid int)")
+        one(mut &b, &"insert into e select g, case when g <= 990 then 1 else 2 end, g % 100 from generate_series(1, 1000) g")
+        one(mut &b, &"create index e_kind on e (kind)")
+        one(mut &b, &"create index e_uid on e (uid)")
+        one(mut &b, &"analyze e")
+        let qe = stmt(&"select count(*) from e where kind = $1 and uid = $2")
+        var pce = lexdb_exec.newPlanCache()
+        let e15 = run(mut &a, &qe, &[Val.Int(1), Val.Int(5)], mut &pce)
+        let e25 = run(mut &a, &qe, &[Val.Int(2), Val.Int(5)], mut &pce)
+        let e17 = run(mut &a, &qe, &[Val.Int(1), Val.Int(7)], mut &pce)
+        println("per value: " + e15 + " " + e25 + " " + e17 + ", plans " + pce.plans.toStr())
+
+        // a primary key prefix against an index (optimizer 24): tenant 1 is 95% of the
+        // rows, so its plan reads mt_kind; tenant 1950 has one row, the key
+        one(mut &b, &"create table mt (tenant int, id int, kind int, primary key (tenant, id))")
+        one(mut &b, &"insert into mt select case when g <= 1900 then 1 else g end, g, g % 50 from generate_series(1, 2000) g")
+        one(mut &b, &"create index mt_kind on mt (kind)")
+        one(mut &b, &"analyze mt")
+        let qm = stmt(&"select count(*) from mt where tenant = $1 and kind = $2")
+        var pcm = lexdb_exec.newPlanCache()
+        let m10 = run(mut &a, &qm, &[Val.Int(1), Val.Int(0)], mut &pcm)
+        let m19 = run(mut &a, &qm, &[Val.Int(1950), Val.Int(0)], mut &pcm)
+        let m13 = run(mut &a, &qm, &[Val.Int(1), Val.Int(3)], mut &pcm)
+        println("primary key prefix: " + m10 + " " + m19 + " " + m13 + ", plans " + pcm.plans.toStr())
+
+        // a join ordered by cost (optimizer 26) takes a parameter as an unknown
+        // value: one plan for every label
+        one(mut &b, &"create table js (id int primary key, label text)")
+        one(mut &b, &"insert into js select g, case when g = 7 then 'x' else 'l' || (g % 10) end from generate_series(1, 100) g")
+        one(mut &b, &"create index js_label on js (label)")
+        one(mut &b, &"create table jb (id int primary key, sid int)")
+        one(mut &b, &"insert into jb select g, g % 100 + 1 from generate_series(1, 20000) g")
+        one(mut &b, &"create index jb_sid on jb (sid)")
+        one(mut &b, &"analyze")
+        let qj = stmt(&"select count(*) from jb b join js s on b.sid = s.id where s.label = $1")
+        var pcj = lexdb_exec.newPlanCache()
+        let jx = run(mut &a, &qj, &[Val.Text("x")], mut &pcj)
+        let j1 = run(mut &a, &qj, &[Val.Text("l1")], mut &pcj)
+        println("join by cost: " + jx + " " + j1 + ", plans " + pcj.plans.toStr())
+
+        // a plan made where reads are not noted is not taken in a block that
+        // notes them (optimizer 33): there the order bound by keys, and B's
+        // insert into js does not make A's commit fail
+        let qr = stmt(&"select count(*) from jb b join js s on s.id = b.sid where b.id < $1")
+        var pcr = lexdb_exec.newPlanCache()
+        let r1 = run(mut &a, &qr, &[Val.Int(500)], mut &pcr)
+        one(mut &a, &"begin")
+        let r2 = run(mut &a, &qr, &[Val.Int(500)], mut &pcr)
+        one(mut &b, &"insert into js values (1000, 'new')")
+        one(mut &a, &"insert into jb values (99999, 1)")
+        one(mut &a, &"commit")
+        println("noted reads: " + r1 + " " + r2 + ", plans " + pcr.plans.toStr())
 
         one(mut &b, &"create table u (x int primary key)")
         one(mut &b, &"insert into u values (1), (2), (3)")

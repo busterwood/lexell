@@ -1,0 +1,158 @@
+// lexdb_exec: the join order (optimizer 25). A SELECT's inner joins run from the
+// first table a unique key's equalities pin to one row (constants or
+// parameters), then each time the first table a unique key binds to those
+// placed, else one a key or an index's leading column reaches (a lookup per
+// row), else one an equality links (a hash join), else the first left. Implied
+// equalities (optimizer 27) count: a = b and b = 5 give a = 5. No
+// statistics: the order depends only on the statement and the schema.
+// Outer joins, LATERAL, nothing pinned, SET lexdb_planner = rules, and
+// UPDATE ... FROM keep FROM's order. Results are the same as the rules';
+// ORDER BY, MIN/MAX and SELECT * see the columns where FROM put them.
+// Checked by hand.
+// expect: -- orders, their lines, products; customers with a unique email
+// expect: create table cust (id int primary key, email text unique, name text) -> CREATE TABLE
+// expect: insert into cust select g, 'c' || g || '@x', 'name ' || g from generate_series(1, 100) g -> INSERT 0 100
+// expect: create table orders (id int primary key, cust int) -> CREATE TABLE
+// expect: insert into orders select g, g % 100 + 1 from generate_series(1, 1000) g -> INSERT 0 1000
+// expect: create table lines (id int primary key, ord int, sku int) -> CREATE TABLE
+// expect: insert into lines select g, g % 1000 + 1, g % 50 + 1 from generate_series(1, 5000) g -> INSERT 0 5000
+// expect: create index lines_ord on lines (ord) -> CREATE INDEX
+// expect: create table products (sku int primary key, label text) -> CREATE TABLE
+// expect: insert into products select g, 'p' || g from generate_series(1, 50) g -> INSERT 0 50
+// expect: -- FROM lists the lines first; the order is pinned to one row: it runs first
+// expect: explain select l.id, p.label from lines l join orders o on l.ord = o.id join products p on p.sku = l.sku where o.id = 5 -> [QUERY PLAN] scan orders o: primary key lookup; join lines l: index lines_ord lookup per row; join products p: primary key lookup per row
+// expect: select l.id, p.label from lines l join orders o on l.ord = o.id join products p on p.sku = l.sku where o.id = 5 order by l.id -> [id,label] 4|p5; 1004|p5; 2004|p5; 3004|p5; 4004|p5
+// expect: set lexdb_planner = rules -> SET
+// expect: explain select l.id, p.label from lines l join orders o on l.ord = o.id join products p on p.sku = l.sku where o.id = 5 -> [QUERY PLAN] scan lines l: full scan; join orders o: primary key lookup per row; join products p: primary key lookup per row
+// expect: select l.id, p.label from lines l join orders o on l.ord = o.id join products p on p.sku = l.sku where o.id = 5 order by l.id -> [id,label] 4|p5; 1004|p5; 2004|p5; 3004|p5; 4004|p5
+// expect: reset lexdb_planner -> RESET
+// expect: explain analyze select l.id from lines l join orders o on l.ord = o.id where o.id = 5 -> scan orders o: primary key lookup (rows read 1, kept 1); join lines l: index lines_ord lookup per row (lookups 1, rows read 5, joined 5)
+// expect: -- commas and WHERE, the same
+// expect: explain select l.id from lines l, orders o where l.ord = o.id and o.id = 5 -> [QUERY PLAN] scan orders o: primary key lookup; join lines l: index lines_ord lookup per row
+// expect: -- a unique index pins too: the customer by email, then its orders, their lines
+// expect: explain select count(*) from lines l join orders o on l.ord = o.id join cust c on c.id = o.cust where c.email = 'c7@x' -> [QUERY PLAN] scan cust c: index cust_email_key lookup; join orders o: hash on (cust) over full scan; join lines l: index lines_ord lookup per row; aggregate
+// expect: select count(*) from lines l join orders o on l.ord = o.id join cust c on c.id = o.cust where c.email = 'c7@x' -> [count] 50
+// expect: -- nothing pinned: FROM order
+// expect: explain select count(*) from lines l join orders o on l.ord = o.id where o.cust = 7 -> [QUERY PLAN] scan lines l: full scan; join orders o: primary key lookup per row; aggregate
+// expect: -- an outer join: FROM order
+// expect: explain select count(*) from lines l left join orders o on l.ord = o.id where o.id = 5 -> [QUERY PLAN] scan lines l: full scan; left join orders o: primary key lookup per row; aggregate
+// expect: -- already in order: unchanged
+// expect: explain select l.id from orders o join lines l on l.ord = o.id where o.id = 5 -> [QUERY PLAN] scan orders o: primary key lookup; join lines l: index lines_ord lookup per row
+// expect: -- ORDER BY and MIN/MAX of the table that now runs first (its columns after the lines')
+// expect: select o.id, o.cust, l.id from lines l join orders o on l.ord = o.id where o.id = 5 order by o.id, l.id -> [id,cust,id] 5|6|4; 5|6|1004; 5|6|2004; 5|6|3004; 5|6|4004
+// expect: select max(o.cust) from lines l join orders o on l.ord = o.id where o.id = 5 -> [max] 6
+// expect: select * from lines l join orders o on l.ord = o.id where o.id = 5 order by l.id limit 2 -> [id,ord,sku,id,cust] 4|5|5|5|6; 1004|5|5|5|6
+// expect: -- a subquery in FROM: hashed after the pinned order
+// expect: explain select count(*) from (select sku, label from products where sku < 10) p join lines l on l.sku = p.sku join orders o on l.ord = o.id where o.id = 5 -> [QUERY PLAN] scan orders o: primary key lookup; join lines l: index lines_ord lookup per row; join p: hash on (sku) over rows of subquery 1; aggregate; subquery 1 (from): run once;   scan products: primary key range
+// expect: select count(*) from (select sku, label from products where sku < 10) p join lines l on l.sku = p.sku join orders o on l.ord = o.id where o.id = 5 -> [count] 5
+// expect: -- a correlated subquery on a table that moved
+// expect: select l.id from lines l join orders o on l.ord = o.id where o.id = 5 and exists (select 1 from products p where p.sku = l.sku and p.label = 'p5') order by l.id -> [id] 4; 1004; 2004; 3004; 4004
+// expect: -- implied equalities (optimizer 27): o.cust = 7 and c.id = o.cust give c.id = 7, so the customer is pinned
+// expect: explain select count(*) from lines l join orders o on l.ord = o.id join cust c on c.id = o.cust where o.cust = 7 -> [QUERY PLAN] scan cust c: primary key lookup; join orders o: hash on (cust) over full scan; join lines l: index lines_ord lookup per row; aggregate
+// expect: select count(*) from lines l join orders o on l.ord = o.id join cust c on c.id = o.cust where o.cust = 7 -> [count] 50
+// expect: set lexdb_planner = rules -> SET
+// expect: explain select count(*) from lines l join orders o on l.ord = o.id join cust c on c.id = o.cust where o.cust = 7 -> [QUERY PLAN] scan lines l: full scan; join orders o: primary key lookup per row; join cust c: primary key lookup per row; aggregate
+// expect: select count(*) from lines l join orders o on l.ord = o.id join cust c on c.id = o.cust where o.cust = 7 -> [count] 50
+// expect: reset lexdb_planner -> RESET
+// expect: -- UPDATE ... FROM keeps its target first
+// expect: explain update lines l set sku = 9 from orders o where l.ord = o.id and o.id = 5 -> [QUERY PLAN] scan lines l: full scan; cross join orders o: primary key lookup per row
+// expect: update lines l set sku = 9 from orders o where l.ord = o.id and o.id = 5 -> UPDATE 5
+// expect: select count(*) from lines where sku = 9 and ord = 5 -> [count] 5
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "strings"
+
+fn show(s: mut &lexdb_exec.Session, sql: str) {
+    match s.exec(&sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if !r.hasRows {
+                println(sql + " -> " + r.tag)
+                return
+            }
+            var lines: []str = []
+            for row in r.rows {
+                var cells: []str = []
+                for v in row { append(mut &cells, if lexdb_exec.isNull(&v) { "NULL" } else { lexdb_exec.text(&v) }) }
+                append(mut &lines, strings.join(&cells, "|"))
+            }
+            var names: []str = []
+            for c in r.cols { append(mut &names, c.name) }
+            println(sql + " -> [" + strings.join(&names, ",") + "]" + (if len(lines) > 0 { " " } else { "" }) + strings.join(&lines, "; "))
+        }
+        Err(e) { println(sql + " -> " + e.state + " " + e.msg) }
+    }
+}
+
+// EXPLAIN ANALYZE without its last line (the time).
+fn analyze(s: mut &lexdb_exec.Session, sql: str) {
+    match s.exec(&sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            var lines: []str = []
+            for i in 0..len(r.rows) - 1 { append(mut &lines, lexdb_exec.text(&r.rows[i][0])) }
+            println(sql + " -> " + strings.join(&lines, "; "))
+        }
+        Err(e) { println(sql + " -> " + e.state + " " + e.msg) }
+    }
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    var s = lexdb_exec.newSession(st)
+    println("-- orders, their lines, products; customers with a unique email")
+    show(mut &s, "create table cust (id int primary key, email text unique, name text)")
+    show(mut &s, "insert into cust select g, 'c' || g || '@x', 'name ' || g from generate_series(1, 100) g")
+    show(mut &s, "create table orders (id int primary key, cust int)")
+    show(mut &s, "insert into orders select g, g % 100 + 1 from generate_series(1, 1000) g")
+    show(mut &s, "create table lines (id int primary key, ord int, sku int)")
+    show(mut &s, "insert into lines select g, g % 1000 + 1, g % 50 + 1 from generate_series(1, 5000) g")
+    show(mut &s, "create index lines_ord on lines (ord)")
+    show(mut &s, "create table products (sku int primary key, label text)")
+    show(mut &s, "insert into products select g, 'p' || g from generate_series(1, 50) g")
+    println("-- FROM lists the lines first; the order is pinned to one row: it runs first")
+    show(mut &s, "explain select l.id, p.label from lines l join orders o on l.ord = o.id join products p on p.sku = l.sku where o.id = 5")
+    show(mut &s, "select l.id, p.label from lines l join orders o on l.ord = o.id join products p on p.sku = l.sku where o.id = 5 order by l.id")
+    show(mut &s, "set lexdb_planner = rules")
+    show(mut &s, "explain select l.id, p.label from lines l join orders o on l.ord = o.id join products p on p.sku = l.sku where o.id = 5")
+    show(mut &s, "select l.id, p.label from lines l join orders o on l.ord = o.id join products p on p.sku = l.sku where o.id = 5 order by l.id")
+    show(mut &s, "reset lexdb_planner")
+    analyze(mut &s, "explain analyze select l.id from lines l join orders o on l.ord = o.id where o.id = 5")
+    println("-- commas and WHERE, the same")
+    show(mut &s, "explain select l.id from lines l, orders o where l.ord = o.id and o.id = 5")
+    println("-- a unique index pins too: the customer by email, then its orders, their lines")
+    show(mut &s, "explain select count(*) from lines l join orders o on l.ord = o.id join cust c on c.id = o.cust where c.email = 'c7@x'")
+    show(mut &s, "select count(*) from lines l join orders o on l.ord = o.id join cust c on c.id = o.cust where c.email = 'c7@x'")
+    println("-- nothing pinned: FROM order")
+    show(mut &s, "explain select count(*) from lines l join orders o on l.ord = o.id where o.cust = 7")
+    println("-- an outer join: FROM order")
+    show(mut &s, "explain select count(*) from lines l left join orders o on l.ord = o.id where o.id = 5")
+    println("-- already in order: unchanged")
+    show(mut &s, "explain select l.id from orders o join lines l on l.ord = o.id where o.id = 5")
+    println("-- ORDER BY and MIN/MAX of the table that now runs first (its columns after the lines')")
+    show(mut &s, "select o.id, o.cust, l.id from lines l join orders o on l.ord = o.id where o.id = 5 order by o.id, l.id")
+    show(mut &s, "select max(o.cust) from lines l join orders o on l.ord = o.id where o.id = 5")
+    show(mut &s, "select * from lines l join orders o on l.ord = o.id where o.id = 5 order by l.id limit 2")
+    println("-- a subquery in FROM: hashed after the pinned order")
+    show(mut &s, "explain select count(*) from (select sku, label from products where sku < 10) p join lines l on l.sku = p.sku join orders o on l.ord = o.id where o.id = 5")
+    show(mut &s, "select count(*) from (select sku, label from products where sku < 10) p join lines l on l.sku = p.sku join orders o on l.ord = o.id where o.id = 5")
+    println("-- a correlated subquery on a table that moved")
+    show(mut &s, "select l.id from lines l join orders o on l.ord = o.id where o.id = 5 and exists (select 1 from products p where p.sku = l.sku and p.label = 'p5') order by l.id")
+    println("-- implied equalities (optimizer 27): o.cust = 7 and c.id = o.cust give c.id = 7, so the customer is pinned")
+    show(mut &s, "explain select count(*) from lines l join orders o on l.ord = o.id join cust c on c.id = o.cust where o.cust = 7")
+    show(mut &s, "select count(*) from lines l join orders o on l.ord = o.id join cust c on c.id = o.cust where o.cust = 7")
+    show(mut &s, "set lexdb_planner = rules")
+    show(mut &s, "explain select count(*) from lines l join orders o on l.ord = o.id join cust c on c.id = o.cust where o.cust = 7")
+    show(mut &s, "select count(*) from lines l join orders o on l.ord = o.id join cust c on c.id = o.cust where o.cust = 7")
+    show(mut &s, "reset lexdb_planner")
+    println("-- UPDATE ... FROM keeps its target first")
+    show(mut &s, "explain update lines l set sku = 9 from orders o where l.ord = o.id and o.id = 5")
+    show(mut &s, "update lines l set sku = 9 from orders o where l.ord = o.id and o.id = 5")
+    show(mut &s, "select count(*) from lines where sku = 9 and ord = 5")
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(5), lexdb_store.Options{cacheBytes: 128 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000, bufferedPages: false}, body).unwrap()
+}

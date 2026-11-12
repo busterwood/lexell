@@ -1,0 +1,110 @@
+// The cost model's read costs measured (lexdb-optimizer.md section 36): per
+// row, in nanoseconds, in memory, each operation the join model prices.
+//   scan     a full scan's row (sum of a column)
+//   pkrange  a primary key range's row
+//   ixrange  an index range's row (its entry, then the row by key)
+//   pklook   a lookup by the whole primary key, per outer row
+//   ixlook   a lookup by an index's leading column, per outer row (n rows each)
+//   scan1    a scan's row without batches (a join's inner table)
+//   hash     a hash join's row: the build per inner row, the probe per outer row
+//   rows     the time a joined row costs past its reads (sum over the join)
+// A driving table d (ids 1..N) joins t (200,000 rows; k: 20 rows a value, an
+// index on it) by key, by index, and by hash; each time is the median of 5.
+import "../../cmd/lexdb_store"
+import "../../cmd/lexdb_disk"
+import "../../cmd/lexdb_exec"
+import "time"
+
+fn exec(s: mut &lexdb_exec.Session, sql: &str) {
+    match s.exec(sql) {
+        Ok(_) {}
+        Err(e) { println(sql + " -> " + e.state + " " + e.msg) }
+    }
+}
+
+fn med(s: mut &lexdb_exec.Session, sql: &str): int {
+    exec(s, sql)
+    var ts: []int = []
+    for i in 0..5 {
+        let t0 = time.monotonicNs()
+        exec(s, sql)
+        append(mut &ts, time.monotonicNs() - t0)
+    }
+    for i in 1..len(ts) {
+        var j = i
+        while j > 0 && ts[j - 1] > ts[j] {
+            let x = ts[j - 1]
+            ts[j - 1] = ts[j]
+            ts[j] = x
+            j -= 1
+        }
+    }
+    return ts[2]
+}
+
+fn show(s: mut &lexdb_exec.Session, sql: &str) {
+    match s.exec(&("explain " + sql)) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            var out = ""
+            for row in r.rows { out = out + lexdb_exec.text(&row[0]) + "; " }
+            println("    plan: " + out)
+        }
+        Err(e) { println(e.msg) }
+    }
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    var s = lexdb_exec.newSession(st)
+    exec(mut &s, &"set max_statement_mem = 0")
+    for x in [
+        "create table t (id int primary key, k int, v int, pad text)",
+        "insert into t select g, g % 10000, g % 97, 'row ' || g from generate_series(1, 200000) g",
+        "create index t_k on t (k)",
+        "create table d (id int primary key, x int)",
+        "insert into d select g, (g * 37) % 200000 + 1 from generate_series(1, 20000) g",
+        "create table dk (id int primary key, x int)",
+        "insert into dk select g, (g * 37) % 10000 from generate_series(1, 1000) g",
+    ] { exec(mut &s, &x) }
+    exec(mut &s, &"set lexdb_planner = rules")
+    let scan = med(mut &s, &"select sum(v) from t")
+    println("scan     " + (scan / 200000).toStr() + " ns a row")
+    let pkr = med(mut &s, &"select sum(v) from t where id between 50001 and 150000")
+    println("pkrange  " + (pkr / 100000).toStr() + " ns a row")
+    let ixr = med(mut &s, &"select sum(v) from t where k between 2000 and 6999")
+    show(mut &s, &"select sum(v) from t where k between 2000 and 6999")
+    println("ixrange  " + (ixr / 100000).toStr() + " ns a row")
+    // per outer row: d's 20,000 rows read first, then t by key
+    let dscan = med(mut &s, &"select sum(x) from d")
+    let pkl = med(mut &s, &"select sum(t.v) from d join t on t.id = d.x")
+    show(mut &s, &"select sum(t.v) from d join t on t.id = d.x")
+    println("pklook   " + ((pkl - dscan) / 20000).toStr() + " ns an outer row (1 row each)")
+    let dkscan = med(mut &s, &"select sum(x) from dk")
+    let ixl = med(mut &s, &"select sum(t.v) from dk join t on t.k = dk.x")
+    show(mut &s, &"select sum(t.v) from dk join t on t.k = dk.x")
+    println("ixlook   " + ((ixl - dkscan) / 1000).toStr() + " ns an outer row (20 rows each: " + ((ixl - dkscan) / 20000).toStr() + " ns a row)")
+    // a scan without batches (the rows one at a time, as a join's inner table)
+    exec(mut &s, &"set lexdb_batch = off")
+    let scan1 = med(mut &s, &"select sum(v) from t")
+    println("scan1    " + (scan1 / 200000).toStr() + " ns a row (no batches)")
+    exec(mut &s, &"set lexdb_batch = on")
+    // a hash: d2's 200,000 rows probe t hashed on id (t read once)
+    exec(mut &s, &"create table d2 (id int primary key, x int)")
+    exec(mut &s, &"insert into d2 select g, (g * 37) % 200000 + 1 from generate_series(1, 200000) g")
+    exec(mut &s, &"set lexdb_planner = cost")
+    exec(mut &s, &"analyze")
+    let d2scan = med(mut &s, &"select sum(x) from d2")
+    let hj = med(mut &s, &"select sum(t.v) from d2 join t on t.id = d2.x")
+    show(mut &s, &"select sum(t.v) from d2 join t on t.id = d2.x")
+    println("hash     " + ((hj - d2scan) / 200000).toStr() + " ns an inner row read and hashed, with an outer row's probe")
+    exec(mut &s, &"set lexdb_planner = rules")
+    let lj = med(mut &s, &"select sum(t.v) from d2 join t on t.id = d2.x")
+    show(mut &s, &"select sum(t.v) from d2 join t on t.id = d2.x")
+    println("pklook2  " + ((lj - d2scan) / 200000).toStr() + " ns an outer row (the same join by lookups)")
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(5), lexdb_store.Options{cacheBytes: 1024 * 1024 * 1024, segBytes: 64 * 1024 * 1024, ckptBytes: 256 * 1024 * 1024, snapNodes: 1000000, bufferedPages: false}, body).unwrap()
+}

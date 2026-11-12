@@ -35,12 +35,18 @@ machine, through WSL2's virtual disk.
   transactions are snapshots (4.5): every statement sees the database as of
   the start, for a page built from several queries on one connection. Both
   are built (section 9).
-- **No cost-based optimizer for now.** The planner's rules (4.8) give
-  predictable plans. Costs are reconsidered with joins and secondary indexes
-  (D4), and then only a small model: a row count per table, distinct-value
-  estimates per index, join order over a few tables, plans fixed per
-  prepared statement and shown by `EXPLAIN`. With joins, indexes and
-  subqueries built, the user decided (2026-11-09): leave costs for now.
+- **A cost-based optimizer, the rules kept behind a setting.** The planner's
+  rules (4.8) gave predictable plans, and the user decided (2026-11-09) to
+  leave costs for now. Later that month the optimizer was built on branch
+  `exp/optimizer` and merged: `ANALYZE` statistics (row and distinct
+  counts, common values, SQLite stat4-style samples), estimates choosing
+  paths, plans kept per parameter value, the join order by measured costs
+  (exhaustive to 8 tables, SQLite's N-best search to 24) choosing between
+  lookups per row and hash joins, an index-to-scan switch at run time. The rules are still there, the planner
+  when there are no statistics for a choice and all of it with `SET
+  lexdb_planner = rules`. Its design, measurements and reviews are
+  `design/lexdb-optimizer.md` (sections 19 to 40; code comments cite them as
+  "optimizer N").
 
 ## 1. Recommendation
 
@@ -286,7 +292,8 @@ decided later (section 0).
 - **Left out.** Triggers, rules, inheritance, user-defined types,
   extensions, PL/pgSQL, and collations other than binary UTF-8. Views come
   later, if at all.
-- **Planner.** Rules, not costs:
+- **Planner.** Rules, not costs (as first built; the cost-based optimizer
+  that followed keeps them as its fallback: `design/lexdb-optimizer.md`):
   - an equality on the primary key gives a point lookup;
   - a prefix of the key gives a range scan;
   - otherwise the longest matching index prefix is used, then a full scan;

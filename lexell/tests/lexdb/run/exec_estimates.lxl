@@ -1,0 +1,152 @@
+// lexdb_exec: ANALYZE's estimates decide between access paths (optimizer 24), not
+// only the ties the rules leave: the fewest reads wins (an index entry two
+// reads, a primary key row one). A range of a leading column with literal
+// bounds is estimated from ANALYZE's samples (optimizer 37); another range,
+// an IN subquery or an array has only a bound (the rows of its equalities;
+// EXPLAIN says "at most"), so it is not taken on a guess. The rules still decide a whole-key equality, a choice
+// without statistics, and between a lookup per outer row and a table read
+// once. A primary key of several columns has statistics of its own, an index
+// on an expression too. Checked by hand.
+// expect: -- t: 2000 rows; a two values, b three, c unique in the data (not declared)
+// expect: create table t (id int primary key, a int, b int, c int) -> CREATE TABLE
+// expect: insert into t select g, g % 2, g % 3, g from generate_series(1, 2000) g -> INSERT 0 2000
+// expect: create index t_ab on t (a, b) -> CREATE INDEX
+// expect: create index t_c on t (c) -> CREATE INDEX
+// expect: -- more equalities lose to fewer rows: the rules take t_ab, the estimates t_c
+// expect: explain select id from t where a = 1 and b = 2 and c = 5 -> [QUERY PLAN] scan t: index t_ab lookup
+// expect: analyze t -> ANALYZE
+// expect: explain select id from t where a = 1 and b = 2 and c = 5 -> [QUERY PLAN] scan t: index t_c lookup (estimated 1 rows)
+// expect: select id from t where a = 1 and b = 2 and c = 5 -> [id] 5
+// expect: set lexdb_planner = rules -> SET
+// expect: explain select id from t where a = 1 and b = 2 and c = 5 -> [QUERY PLAN] scan t: index t_ab lookup
+// expect: reset lexdb_planner -> RESET
+// expect: -- a range of a leading column by the samples (optimizer 37): c > 1990 is 10 rows
+// expect: explain select id from t where a = 1 and b = 2 and c > 1990 -> [QUERY PLAN] scan t: index t_c range (estimated 10 rows)
+// expect: explain select id from t where c > 1990 -> [QUERY PLAN] scan t: index t_c range (estimated 10 rows)
+// expect: explain select id from t where a = 1 and c > 1990 -> [QUERY PLAN] scan t: index t_c range (estimated 10 rows)
+// expect: -- an IN list: a lookup per value
+// expect: explain select id from t where a = 1 and c in (3, 5, 9) -> [QUERY PLAN] scan t: index t_c lookup for each of 3 values (estimated 3 rows)
+// expect: select id from t where a = 1 and c in (3, 5, 9) order by id -> [id] 3; 5; 9
+// expect: -- a whole-key equality: the rules, one row
+// expect: explain select id from t where id = 5 and c = 5 -> [QUERY PLAN] scan t: primary key lookup
+// expect: -- m: a primary key of two columns; tenant 1 holds 1900 rows, tenants 1901 to 2000 one each
+// expect: create table m (tenant int, id int, kind int, primary key (tenant, id)) -> CREATE TABLE
+// expect: insert into m select case when g <= 1900 then 1 else g end, g, g % 50 from generate_series(1, 2000) g -> INSERT 0 2000
+// expect: create index m_kind on m (kind) -> CREATE INDEX
+// expect: explain select id from m where tenant = 1950 and kind = 3 -> [QUERY PLAN] scan m: primary key range
+// expect: explain select id from m where tenant = 1 and kind = 3 -> [QUERY PLAN] scan m: primary key range
+// expect: analyze m -> ANALYZE
+// expect: explain select id from m where tenant = 1950 and kind = 3 -> [QUERY PLAN] scan m: primary key range (estimated 1 rows)
+// expect: explain select id from m where tenant = 1 and kind = 3 -> [QUERY PLAN] scan m: index m_kind lookup (estimated 40 rows)
+// expect: select count(*) from m where tenant = 1 and kind = 3 -> [count] 38
+// expect: explain select id from m where tenant = 1950 -> [QUERY PLAN] scan m: primary key range (estimated 1 rows)
+// expect: -- a join: a lookup per outer row is compared only with lookups
+// expect: create table o (id int primary key, v int) -> CREATE TABLE
+// expect: insert into o select g, g from generate_series(1, 20) g -> INSERT 0 20
+// expect: explain select o.id from o join t on t.c = o.id where t.a = 1 and t.b = 2 -> [QUERY PLAN] scan o: full scan; join t: hash on (c) over index t_ab lookup (estimated 334 rows)
+// expect: explain select o.id from o join m on m.tenant = o.id where m.kind = 3 -> [QUERY PLAN] scan o: full scan; join m: primary key range (estimated 20 rows) per row
+// expect: -- an index on an expression (its values counted by ANALYZE, a literal's estimated)
+// expect: create table x (id int primary key, s text, n int) -> CREATE TABLE
+// expect: insert into x select g, case when g <= 950 then 'A' else 'b' || g end, g % 100 from generate_series(1, 1000) g -> INSERT 0 1000
+// expect: create index x_low on x (lower(s)) -> CREATE INDEX
+// expect: create index x_n on x (n) -> CREATE INDEX
+// expect: analyze x -> ANALYZE
+// expect: explain select id from x where lower(s) = 'a' and n = 5 -> [QUERY PLAN] scan x: index x_n lookup (estimated 10 rows)
+// expect: explain select id from x where lower(s) = 'b960' and n = 5 -> [QUERY PLAN] scan x: index x_low lookup (estimated 1 rows)
+// expect: select id from x where lower(s) = 'b960' and n = 60 -> [id] 960
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "strings"
+
+fn show(s: mut &lexdb_exec.Session, sql: str) {
+    match s.exec(&sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if !r.hasRows {
+                println(sql + " -> " + r.tag)
+                return
+            }
+            var lines: []str = []
+            for row in r.rows {
+                var cells: []str = []
+                for v in row { append(mut &cells, if lexdb_exec.isNull(&v) { "NULL" } else { lexdb_exec.text(&v) }) }
+                append(mut &lines, strings.join(&cells, "|"))
+            }
+            var names: []str = []
+            for c in r.cols { append(mut &names, c.name) }
+            println(sql + " -> [" + strings.join(&names, ",") + "]" + (if len(lines) > 0 { " " } else { "" }) + strings.join(&lines, "; "))
+        }
+        Err(e) { println(sql + " -> " + e.state + " " + e.msg) }
+    }
+}
+
+// EXPLAIN ANALYZE without its last line (the time).
+fn analyze(s: mut &lexdb_exec.Session, sql: str) {
+    match s.exec(&sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            var lines: []str = []
+            for i in 0..len(r.rows) - 1 { append(mut &lines, lexdb_exec.text(&r.rows[i][0])) }
+            println(sql + " -> " + strings.join(&lines, "; "))
+        }
+        Err(e) { println(sql + " -> " + e.state + " " + e.msg) }
+    }
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    var s = lexdb_exec.newSession(st)
+    println("-- t: 2000 rows; a two values, b three, c unique in the data (not declared)")
+    show(mut &s, "create table t (id int primary key, a int, b int, c int)")
+    show(mut &s, "insert into t select g, g % 2, g % 3, g from generate_series(1, 2000) g")
+    show(mut &s, "create index t_ab on t (a, b)")
+    show(mut &s, "create index t_c on t (c)")
+    println("-- more equalities lose to fewer rows: the rules take t_ab, the estimates t_c")
+    show(mut &s, "explain select id from t where a = 1 and b = 2 and c = 5")
+    show(mut &s, "analyze t")
+    show(mut &s, "explain select id from t where a = 1 and b = 2 and c = 5")
+    show(mut &s, "select id from t where a = 1 and b = 2 and c = 5")
+    show(mut &s, "set lexdb_planner = rules")
+    show(mut &s, "explain select id from t where a = 1 and b = 2 and c = 5")
+    show(mut &s, "reset lexdb_planner")
+    println("-- a range of a leading column by the samples (optimizer 37): c > 1990 is 10 rows")
+    show(mut &s, "explain select id from t where a = 1 and b = 2 and c > 1990")
+    show(mut &s, "explain select id from t where c > 1990")
+    show(mut &s, "explain select id from t where a = 1 and c > 1990")
+    println("-- an IN list: a lookup per value")
+    show(mut &s, "explain select id from t where a = 1 and c in (3, 5, 9)")
+    show(mut &s, "select id from t where a = 1 and c in (3, 5, 9) order by id")
+    println("-- a whole-key equality: the rules, one row")
+    show(mut &s, "explain select id from t where id = 5 and c = 5")
+    println("-- m: a primary key of two columns; tenant 1 holds 1900 rows, tenants 1901 to 2000 one each")
+    show(mut &s, "create table m (tenant int, id int, kind int, primary key (tenant, id))")
+    show(mut &s, "insert into m select case when g <= 1900 then 1 else g end, g, g % 50 from generate_series(1, 2000) g")
+    show(mut &s, "create index m_kind on m (kind)")
+    show(mut &s, "explain select id from m where tenant = 1950 and kind = 3")
+    show(mut &s, "explain select id from m where tenant = 1 and kind = 3")
+    show(mut &s, "analyze m")
+    show(mut &s, "explain select id from m where tenant = 1950 and kind = 3")
+    show(mut &s, "explain select id from m where tenant = 1 and kind = 3")
+    show(mut &s, "select count(*) from m where tenant = 1 and kind = 3")
+    show(mut &s, "explain select id from m where tenant = 1950")
+    println("-- a join: a lookup per outer row is compared only with lookups")
+    show(mut &s, "create table o (id int primary key, v int)")
+    show(mut &s, "insert into o select g, g from generate_series(1, 20) g")
+    show(mut &s, "explain select o.id from o join t on t.c = o.id where t.a = 1 and t.b = 2")
+    show(mut &s, "explain select o.id from o join m on m.tenant = o.id where m.kind = 3")
+    println("-- an index on an expression (its values counted by ANALYZE, a literal's estimated)")
+    show(mut &s, "create table x (id int primary key, s text, n int)")
+    show(mut &s, "insert into x select g, case when g <= 950 then 'A' else 'b' || g end, g % 100 from generate_series(1, 1000) g")
+    show(mut &s, "create index x_low on x (lower(s))")
+    show(mut &s, "create index x_n on x (n)")
+    show(mut &s, "analyze x")
+    show(mut &s, "explain select id from x where lower(s) = 'a' and n = 5")
+    show(mut &s, "explain select id from x where lower(s) = 'b960' and n = 5")
+    show(mut &s, "select id from x where lower(s) = 'b960' and n = 60")
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(5), lexdb_store.Options{cacheBytes: 128 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000, bufferedPages: false}, body).unwrap()
+}

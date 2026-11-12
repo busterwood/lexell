@@ -1,0 +1,77 @@
+// lexdb planner experiment (not a conformance test): what the rule-based
+// planner chooses on skewed data, from EXPLAIN ANALYZE's row counts. No
+// timings are taken. Build: lexell/compiler/out/lxlc optimizer_skew.lxl -o <binary>
+// (run from this directory); the database is simulated in memory.
+// Prints the plans and row counts; compare with the notes in design/lexdb-optimizer.md.
+import "../../cmd/lexdb_store"
+import "../../cmd/lexdb_disk"
+import "../../cmd/lexdb_exec"
+import "strings"
+
+fn show(s: mut &lexdb_exec.Session, sql: str) {
+    match s.exec(&sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if !r.hasRows {
+                println(sql + " -> " + r.tag)
+                return
+            }
+            var lines: []str = []
+            for row in r.rows {
+                var cells: []str = []
+                for v in row { append(mut &cells, if lexdb_exec.isNull(&v) { "NULL" } else { lexdb_exec.text(&v) }) }
+                append(mut &lines, strings.join(&cells, "|"))
+            }
+            var names: []str = []
+            for c in r.cols { append(mut &names, c.name) }
+            println(sql + " -> [" + strings.join(&names, ",") + "]" + (if len(lines) > 0 { " " } else { "" }) + strings.join(&lines, "; "))
+        }
+        Err(e) { println(sql + " -> " + e.state + " " + e.msg) }
+    }
+}
+
+// EXPLAIN ANALYZE without its last line (the time).
+fn analyze(s: mut &lexdb_exec.Session, sql: str) {
+    match s.exec(&sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            var lines: []str = []
+            for i in 0..len(r.rows) - 1 { append(mut &lines, lexdb_exec.text(&r.rows[i][0])) }
+            println(sql + " -> " + strings.join(&lines, "; "))
+        }
+        Err(e) { println(sql + " -> " + e.state + " " + e.msg) }
+    }
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    var s = lexdb_exec.newSession(st)
+
+    // 1. Skew: 990 of 1,000 rows have kind = 1; uid has 100 values.
+    println("-- skew: which index")
+    show(mut &s, "create table ev (id int primary key, kind int, uid int)")
+    show(mut &s, "insert into ev select g, case when g <= 990 then 1 else 2 end, g % 100 from generate_series(1, 1000) g")
+    show(mut &s, "create index ev_kind on ev (kind)")
+    show(mut &s, "create index ev_uid on ev (uid)")
+    // kind = 1 matches 99% of the table: the rules still take the index
+    analyze(mut &s, "explain analyze select id from ev where kind = 1")
+    // both are single-column equalities; the tie goes to the index created
+    // first (ev_kind reads 990 rows to keep the 10 with uid = 5)
+    analyze(mut &s, "explain analyze select id from ev where kind = 1 and uid = 5")
+    show(mut &s, "explain select id from ev where kind = 2 and uid = 5")
+
+    // 2. FROM order: the planner does not reorder joins.
+    println("-- join order")
+    show(mut &s, "create table big (id int primary key, grp int)")
+    show(mut &s, "insert into big select g, g % 10 from generate_series(1, 1000) g")
+    show(mut &s, "create table small (grp int primary key, label text)")
+    show(mut &s, "insert into small select g, 'g' || g from generate_series(0, 9) g")
+    show(mut &s, "create index big_grp on big (grp)")
+    analyze(mut &s, "explain analyze select b.id from big b join small s on s.grp = b.grp where s.label = 'g3'")
+    analyze(mut &s, "explain analyze select b.id from small s join big b on b.grp = s.grp where s.label = 'g3'")
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(5), lexdb_store.Options{cacheBytes: 128 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000, bufferedPages: false}, body).unwrap()
+}

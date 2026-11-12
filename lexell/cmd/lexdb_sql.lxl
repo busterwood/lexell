@@ -321,7 +321,7 @@ pub const S_SET = 10
 
 // The settings lexdb keeps per session (lexdb_exec.Session); SET of any
 // other is accepted and ignored.
-pub const SETTINGS: []str = ["max_recursion", "statement_timeout", "max_statement_mem", "search_path", "lexdb_batch"]
+pub const SETTINGS: []str = ["max_recursion", "statement_timeout", "max_statement_mem", "search_path", "lexdb_batch", "lexdb_planner"]
 pub const S_CREATE_INDEX = 11
 pub const S_DROP_INDEX = 12
 pub const S_EXPLAIN = 13
@@ -357,6 +357,8 @@ pub const S_TRUNCATE = 56      // TRUNCATE [TABLE] name, ... [RESTART IDENTITY] 
 pub const S_MAINT = 57          // VACUUM, ANALYZE, CHECKPOINT, REINDEX, CLUSTER (9.94), done as nothing: the tag in alias,
                                 // the tables to check in names (their columns in maintCols), an index in index; in table
                                 // what cannot run in a block ("" none); unique: a view is refused
+pub const S_ANALYZE = 58        // ANALYZE, or VACUUM with ANALYZE: S_MAINT's form, run (optimizer 20, 31): its tables in
+                                // names ([] every table), its tag in alias
 
 // COPY's options (Stmt.copy).
 pub type CopyOpts = record {
@@ -3609,6 +3611,8 @@ fn (p: mut &P) maint(w: str): Result[Stmt, lexdb_base.DbErr] {
     if full && parallel { return Err(lexdb_base.err("0A000", "VACUUM FULL cannot be performed in parallel")) }
     if kw == "vacuum" || kw == "analyze" {
         if kw == "vacuum" { s.table = "VACUUM" }
+        // ANALYZE gathers the planner's statistics (lexdb_exec, optimizer 31)
+        if analyze { s.kind = S_ANALYZE }
         while p.peek().kind == T_IDENT || p.peek().kind == T_QIDENT {
             let only = p.acceptKw("only")
             append(mut &s.names, try p.qname())
@@ -4430,8 +4434,9 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
                     if len(st.names) == 0 { return Err(lexdb_base.err("22023", "search_path names no schema")) }
                     return Ok(st)
                 }
-                if t.text == "set" && st.table == "lexdb_batch" {
-                    // on, off, true, false, 1, 0, a string of one of them, DEFAULT
+                if t.text == "set" && (st.table == "lexdb_batch" || st.table == "lexdb_planner") {
+                    // lexdb_batch: on, off, true, false, 1, 0, a string of one of
+                    // them, DEFAULT; lexdb_planner: cost, rules (optimizer 20), a word or a string
                     if !p.acceptKw("to") { try p.expectKw("=") }
                     let v = p.peek()
                     if v.kind == T_EOF { return Err(near(&v)) }
