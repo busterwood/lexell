@@ -165,6 +165,8 @@ In three tiers, by how soon a real application meets the gap.
   - `statement_timeout` does not end a wait for a lock;
   - no `pg_locks`.
 - **Collations:** `COLLATE` is read and ignored; text compares by bytes.
+- **Date input:** a day or month of one digit (`'2024-01-2'`) is refused
+  (22007); PostgreSQL reads it. Found writing `exec_batchjoin` (9.102).
 - **Privileges** (9.83):
   - column privileges;
   - `WITH GRANT OPTION`;

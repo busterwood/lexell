@@ -1,0 +1,204 @@
+// lexdb_exec: joins over batches (design/lexdb.md 9.102) against the row
+// path. Random queries joining a table of 1,800 rows (two batches and part
+// of a third) to one of 200 and one of 30, with SET lexdb_batch = off and
+// on: their results, errors included, must be the same.
+// - Hash joins, INNER and LEFT, on an integer (unique keys, and keys many
+//   rows share), a text, a numeric, a date, a varchar, two columns, an
+//   expression; a third table joined on a text; NULLs in every column.
+// - Conditions on either table and on both (comparisons of two columns of
+//   values, division by a column that is sometimes 0); LIMIT.
+// - Rows out (streamed), sorted, and grouped with aggregates.
+// - Again in a transaction with its own inserts, updates and deletes not
+//   committed.
+// - How many ran their joins over batches (EXPLAIN ANALYZE's first scan in
+//   batches, and a hash join after it); the counts of a LEFT JOIN on a text
+//   (probes, rows read, joined, NULL rows) as the row path's.
+// - A LIMIT reached before a row whose join condition fails gives its rows,
+//   not the error, with batches as without.
+// expect: committed: 300 queries, 300 the same with and without batches
+// expect: in a transaction: 100 queries, 100 the same with and without batches, its writes: INSERT 0 40, UPDATE 184, DELETE 122
+// expect: batched joins: 186 of 300
+// expect: counts: same: true
+// expect: limit before an error: same: true, 3 rows
+import "strings"
+import "../../../cmd/lexdb_base"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            var out: []str = []
+            for r in rs {
+                if !r.hasRows { append(mut &out, r.tag) }
+                for row in r.rows {
+                    var vs: []str = []
+                    for v in row { append(mut &vs, lexdb_exec.text(&v)) }
+                    append(mut &out, strings.join(&vs, "|"))
+                }
+            }
+            return strings.join(&out, " ")
+        }
+        Err(e) { return "ERROR " + e.state + " " + e.msg }
+    }
+}
+
+fn pick(r: mut &lexdb_base.Rng, xs: &[]str): str { return xs[r.below(len(xs))] }
+
+fn day(r: mut &lexdb_base.Rng): str {
+    let d = 1 + r.below(28)
+    return if d < 10 { "0" + d.toStr() } else { d.toStr() }
+}
+
+fn maybe(r: mut &lexdb_base.Rng, v: str): str { return if r.below(10) == 0 { "null" } else { v } }
+
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: 1024 * 1024, segBytes: 4 * 1024 * 1024, ckptBytes: 2 * 1024 * 1024, snapNodes: 100000, bufferedPages: false}
+}
+
+fn cond(r: mut &lexdb_base.Rng, safe: bool): str {
+    let c = r.below(13)
+    if c == 0 { return "f.x > " + r.below(200).toStr() }
+    if c == 1 { return "d.v < " + r.below(40).toStr() }
+    if c == 2 { return "f.tx like 'L1%'" }
+    if c == 3 { return "d.lab = 'L" + r.below(90).toStr() + "'" }
+    if c == 4 { return "f.bo" }
+    if c == 5 { return "d.fl is null" }
+    if c == 6 { return if safe { "f.y > d.v" } else { "f.y / (d.v - 20) > 0" } }
+    if c == 7 { return "f.nu > d.nu" }
+    if c == 8 { return if safe { "f.x <> d.k" } else { "f.x % (d.k - 100) = 0" } }
+    if c == 9 { return "f.id < " + r.below(1800).toStr() }
+    if c == 10 { return "d.dt >= '2024-01-15'" }
+    if c == 11 { return "f.w <> d.w" }
+    return "f.x + d.v < 100"
+}
+
+fn query(r: mut &lexdb_base.Rng, safe: bool): str {
+    let ons = ["f.x = d.k", "f.tx = d.lab", "f.x = d.v", "f.nu = d.nu", "f.dt = d.dt", "f.w = d.w", "f.x = d.k and f.tx = d.lab",
+               "f.tx = d.lab and f.bo = d.fl", "d.k = f.x + 1", "f.w = d.w and f.x > d.v"]
+    let cols = ["f.id", "f.x", "f.y", "f.bo", "f.tx", "f.nu", "f.dt", "f.w", "d.k", "d.v", "d.lab", "d.fl", "d.nu", "d.dt", "d.w",
+                "f.x + d.v", "f.id * 2", "d.k - f.x", "f.x > d.v"]
+    var items: []str = []
+    for i in 0..(1 + r.below(4)) { append(mut &items, pick(r, &cols)) }
+    var frm = "f " + pick(r, &["join", "join", "left join"]) + " d on " + pick(r, &ons)
+    if r.below(4) == 0 { frm = frm + " " + pick(r, &["join", "left join"]) + " e on e.lab = " + pick(r, &["d.lab", "f.tx"]) }
+    var wh = ""
+    if r.below(5) < 3 {
+        wh = " where " + cond(r, safe)
+        if r.below(2) == 0 { wh = wh + " and " + cond(r, safe) }
+    }
+    let shape = r.below(4)
+    if shape < 2 {
+        var sql = "select " + strings.join(&items, ", ") + " from " + frm + wh
+        if r.below(3) == 0 { sql = sql + " limit " + pick(r, &["1", "7", "1000"]) }
+        return sql
+    }
+    if shape == 2 {
+        let g = pick(r, &["d.lab", "f.bo", "d.k", "f.tx", "d.fl", "d.dt", ""])
+        var aggs: []str = []
+        for i in 0..(1 + r.below(3)) {
+            append(mut &aggs, pick(r, &["count(*)", "sum(f.x)", "max(d.lab)", "min(f.nu)", "sum(d.nu)", "count(d.v)", "avg(f.x + d.v)", "max(f.dt)"]))
+        }
+        if g == "" { return "select " + strings.join(&aggs, ", ") + " from " + frm + wh }
+        return "select " + g + ", " + strings.join(&aggs, ", ") + " from " + frm + wh + " group by " + g + " order by 1"
+    }
+    var ord: []str = []
+    for i in 0..len(items) { append(mut &ord, (i + 1).toStr()) }
+    return "select " + strings.join(&items, ", ") + " from " + frm + wh + " order by " + strings.join(&ord, ", ")
+}
+
+fn both(s: mut &lexdb_exec.Session, sql: &str): bool {
+    let a = q(s, &"set lexdb_batch = off")
+    let off = q(s, sql)
+    let b = q(s, &"set lexdb_batch = on")
+    let on = q(s, sql)
+    if off == on { return true }
+    println("DIFFERENT: " + sql)
+    println("  rows:    " + off)
+    println("  batches: " + on)
+    return false
+}
+
+fn load(s: mut &lexdb_exec.Session, r: mut &lexdb_base.Rng) {
+    let c1 = q(s, &"create table f (id int primary key, x int, y bigint, bo boolean, tx text, nu numeric(10,2), dt date, w varchar(20))")
+    let c2 = q(s, &"create table d (k int primary key, v int, lab text, fl boolean, nu numeric(10,2), dt date, w varchar(20))")
+    let c3 = q(s, &"create table e (id int primary key, lab text, n int, note text)")
+    var id = 1
+    for chunk in 0..18 {
+        var rows: []str = []
+        for i in 0..100 {
+            append(mut &rows, "(" + id.toStr() + ", " + maybe(r, (r.below(220) - 10).toStr()) + ", " + maybe(r, ((r.below(11) - 5) * 1000000007).toStr()) + ", " +
+                   maybe(r, pick(r, &["true", "false"])) + ", " + maybe(r, "'L" + r.below(80).toStr() + "'") + ", " +
+                   maybe(r, r.below(30).toStr() + "." + pick(r, &["0", "5"])) + ", " + maybe(r, "'2024-01-" + day(r) + "'") + ", " +
+                   maybe(r, "'w" + r.below(40).toStr() + "'") + ")")
+            id += 1
+        }
+        let ins = q(s, &("insert into f values " + strings.join(&rows, ", ")))
+        if ins != "INSERT 0 100" { println("insert: " + ins) }
+    }
+    var rows: []str = []
+    for k in 1..201 {
+        append(mut &rows, "(" + k.toStr() + ", " + maybe(r, r.below(40).toStr()) + ", " + maybe(r, "'L" + r.below(100).toStr() + "'") + ", " +
+               maybe(r, pick(r, &["true", "false"])) + ", " + maybe(r, r.below(30).toStr() + "." + pick(r, &["0", "5"])) + ", " +
+               maybe(r, "'2024-01-" + day(r) + "'") + ", " + maybe(r, "'w" + r.below(40).toStr() + "'") + ")")
+    }
+    let ins = q(s, &("insert into d values " + strings.join(&rows, ", ")))
+    var er: []str = []
+    for k in 1..31 { append(mut &er, "(" + k.toStr() + ", " + maybe(r, "'L" + r.below(50).toStr() + "'") + ", " + maybe(r, r.below(9).toStr()) + ", 'n" + k.toStr() + "')") }
+    let ins2 = q(s, &("insert into e values " + strings.join(&er, ", ")))
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(53), opts(), fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        var r = lexdb_base.rng(53)
+        load(mut &s, mut &r)
+        var same = 0
+        var batched = 0
+        for i in 0..300 {
+            let sql = query(mut &r, false)
+            if both(mut &s, &sql) { same += 1 }
+            let ex = q(mut &s, &("explain analyze " + sql))
+            let parts = strings.split(&ex, &" join ")
+            if strings.contains(parts[0], "batches") && strings.contains(ex, ": hash on") { batched += 1 }
+        }
+        println("committed: 300 queries, " + same.toStr() + " the same with and without batches")
+        // in a transaction with its own writes (read merged with them, not in place)
+        let b1 = q(mut &s, &"begin")
+        let w1 = q(mut &s, &"insert into f select id + 5000, x, y, bo, tx, nu, dt, w from f where id <= 40")
+        let w2 = q(mut &s, &"update f set tx = 'L7', x = x + 1 where id % 10 = 3")
+        let w3 = q(mut &s, &"delete from f where id % 15 = 4")
+        let w4 = q(mut &s, &"update d set lab = 'L7' where k % 5 = 0")
+        var same2 = 0
+        for i in 0..100 {
+            let sql = query(mut &r, true)
+            if both(mut &s, &sql) { same2 += 1 }
+        }
+        let b2 = q(mut &s, &"rollback")
+        println("in a transaction: 100 queries, " + same2.toStr() + " the same with and without batches, its writes: " + w1 + ", " + w2 + ", " + w3)
+        println("batched joins: " + batched.toStr() + " of 300")
+        // the counts: as the row path's
+        let cq = "explain analyze select f.id, d.k from f left join d on f.tx = d.lab where f.id < 1500"
+        let off1 = q(mut &s, &"set lexdb_batch = off")
+        let cOff = q(mut &s, &cq)
+        let on1 = q(mut &s, &"set lexdb_batch = on")
+        let cOn = q(mut &s, &cq)
+        println("counts: same: " + (plan(&cOn) == plan(&cOff) && strings.contains(cOn, "batches")).toStr())
+        // a LIMIT before the row whose join condition fails (10 / 0 at f.id 900)
+        let lq2 = "select f.id from f join d on d.k = f.x + 1 where 10 / (f.id - 900) <> 7 limit 3"
+        let ok = both(mut &s, &lq2)
+        let n = len(strings.split(&q(mut &s, &lq2), &" "))
+        println("limit before an error: same: " + ok.toStr() + ", " + n.toStr() + " rows")
+        return 0
+    }).unwrap()
+}
+
+// An EXPLAIN ANALYZE's lines without the batches and the result's time.
+fn plan(x: &str): str {
+    let parts = strings.split(x, &"result:")
+    var t = "" + parts[0]
+    for n in ["1", "2", "3"] { t = strings.replaceAll(t, ", batches " + n, "") }
+    return t
+}

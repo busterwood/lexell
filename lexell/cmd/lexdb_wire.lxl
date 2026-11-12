@@ -417,6 +417,118 @@ fn (w: mut &Wire) dataRow(r: &[]Val, cols: &[]lexdb_exec.OutCol, zone: &lexdb_ti
     }
 }
 
+// A batch of rows' DataRows (9.101), written from the batch's columns:
+// no row, and no value per integer or boolean, made. Into a buffer of
+// bytes, added to the output once: a message's length is written when it
+// is done, at its start.
+fn (w: mut &Wire) dataBatch(ob: &lexdb_exec.OutBatch, cols: &[]lexdb_exec.OutCol, zone: &lexdb_time.Zone) {
+    let utc = zone.isUtc()
+    let nc = len(ob.kinds)
+    var buf: []byte = withCapacity(ob.n * (7 + 12 * nc))
+    for j in 0..ob.n {
+        let at0 = len(buf)
+        append(mut &buf, 'D')
+        putU32(mut &buf, 0)
+        append(mut &buf, byte((nc >> 8) & 0xff))
+        append(mut &buf, byte(nc & 0xff))
+        for o in 0..nc {
+            let c = ob.src[o]
+            let k = ob.kinds[o]
+            if c < 0 {
+                let x = &ob.ex[o]
+                if x.nul[j] { putU32(mut &buf, 0xFFFFFFFF) }
+                else if k == lexdb_exec.BK_BOOL { putBool(mut &buf, x.v[j] == 1) }
+                else { putInt(mut &buf, x.v[j]) }
+                continue
+            }
+            let r = ob.idx[j]
+            if ob.cols[c].nul[r] {
+                putU32(mut &buf, 0xFFFFFFFF)
+            } else if k == lexdb_exec.BK_INT {
+                putInt(mut &buf, ob.cols[c].v[r])
+            } else if k == lexdb_exec.BK_BOOL {
+                putBool(mut &buf, ob.cols[c].v[r] == 1)
+            } else {
+                let oid = if o < len(cols) { cols[o].oid } else { 0 }
+                match ob.vals[c][r] {
+                    Val.Text(t) {
+                        if plainText(oid, utc) {
+                            putU32(mut &buf, len(t))
+                            appendStr(mut &buf, t)
+                        } else {
+                            let x = lexdb_exec.textOut(&ob.vals[c][r], oid, zone)
+                            putU32(mut &buf, len(x))
+                            appendStr(mut &buf, x)
+                        }
+                    }
+                    Val.Int(n) { putInt(mut &buf, n) }
+                    Val.Null { putU32(mut &buf, 0xFFFFFFFF) }
+                    else {
+                        let x = lexdb_exec.textOut(&ob.vals[c][r], oid, zone)
+                        putU32(mut &buf, len(x))
+                        appendStr(mut &buf, x)
+                    }
+                }
+            }
+        }
+        let size = len(buf) - at0 - 1
+        buf[at0 + 1] = byte((size >> 24) & 0xff)
+        buf[at0 + 2] = byte((size >> 16) & 0xff)
+        buf[at0 + 3] = byte((size >> 8) & 0xff)
+        buf[at0 + 4] = byte(size & 0xff)
+    }
+    w.out.add(strFromBytes(&buf))
+}
+
+fn putU32(out: mut &[]byte, n: int) {
+    append(out, byte((n >> 24) & 0xff))
+    append(out, byte((n >> 16) & 0xff))
+    append(out, byte((n >> 8) & 0xff))
+    append(out, byte(n & 0xff))
+}
+
+fn putBool(out: mut &[]byte, v: bool) {
+    putU32(out, 1)
+    append(out, if v { 't' } else { 'f' })
+}
+
+const PAIRS: str = "00010203040506070809101112131415161718192021222324252627282930313233343536373839404142434445464748495051525354555657585960616263646566676869707172737475767778798081828384858687888990919293949596979899"
+
+// An integer's text, its length first: its digits written from the end,
+// two at a time.
+fn putInt(out: mut &[]byte, n: int) {
+    if n < 0 {
+        let x = n.toStr()
+        putU32(out, len(x))
+        appendStr(out, x)
+        return
+    }
+    var nd = 1
+    var p = 10
+    while nd < 19 && n >= p {
+        nd += 1
+        if nd < 19 { p = p * 10 }
+    }
+    putU32(out, nd)
+    let at = len(out)
+    for i in 0..nd { append(out, '0') }
+    var v = n
+    var k = at + nd - 1
+    while v >= 100 {
+        let r = (v % 100) * 2
+        v = v / 100
+        out[k] = PAIRS[r + 1]
+        out[k - 1] = PAIRS[r]
+        k -= 2
+    }
+    if v >= 10 {
+        out[k] = PAIRS[v * 2 + 1]
+        out[k - 1] = PAIRS[v * 2]
+    } else {
+        out[k] = byte(48 + v)
+    }
+}
+
 // Whether a text value is sent as it is (textOut gives it unchanged): all
 // but a timestamptz held as text, or an array of them, outside UTC.
 fn plainText(oid: int, utc: bool): bool {
@@ -435,7 +547,7 @@ fn (w: mut &Wire) runStreamed(s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int
     let zone = w.sess.zone()
     w.streamed = false
     var sess = replace(mut &w.sess, lexdb_exec.parkedSession(w.st))
-    let r = sess.runRows(s, params, ptypes, pc, fn(cols: &[]lexdb_exec.OutCol, row: &[]Val, start: bool): bool {
+    let r = sess.runRows(s, params, ptypes, pc, fn(cols: &[]lexdb_exec.OutCol, row: &[]Val, ob: &lexdb_exec.OutBatch, start: bool): bool {
         if start {
             match check {
                 Some(want) { if !sameCols(cols, want) { return false } }
@@ -445,7 +557,7 @@ fn (w: mut &Wire) runStreamed(s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int
             w.streamed = true
             return true
         }
-        w.dataRow(row, cols, &zone)
+        if ob.n > 0 { w.dataBatch(ob, cols, &zone) } else { w.dataRow(row, cols, &zone) }
         if w.out.size() > 65536 { return w.flush().isOk() }
         return true
     })

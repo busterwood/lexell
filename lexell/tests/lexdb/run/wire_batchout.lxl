@@ -1,0 +1,118 @@
+// lexdb_wire: a streamed SELECT's rows sent a batch at a time from the
+// batch's columns (OutBatch, 9.101), against the same queries a row at a
+// time (lexdb_batch off): the same text for every value, of every type
+// (integers of each width, booleans, text, numeric, timestamptz in a zone
+// not UTC, date, float, varchar) and NULLs; integer and boolean
+// expressions; LIMITs across a batch's end; a condition on text; an error
+// part way (the batch it is in read by the row path, the rows before it
+// sent); a primary key range; outputs batches cannot make (the row path).
+// expect: columns: same, 3000 rows
+// expect: expressions: same, 3000 rows
+// expect: limit 1025: same, 1025 rows
+// expect: limit 1: same, 1 rows
+// expect: text filter: same, 82 rows
+// expect: key range: same, 1201 rows
+// expect: concat: same, 3000 rows
+// expect: error part way: 22012 22012
+// expect: after it: 1
+// expect: in UTC: same, 3000 rows
+import "task"
+import "net"
+import "postgres"
+import "sqldialect"
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_wire"
+
+fn state(e: &postgres.Error): str {
+    let t = e.toStr()
+    for code in ["22012", "22003", "42601"] { if strings.contains(t, code) { return code } }
+    return t
+}
+
+type Dumped = record { text: str; n: int }
+
+// A result's every value as text, NULL as \N; or its error's state (n -1).
+fn dump(c: mut &postgres.Conn, q: &str): Dumped {
+    match c.query(q, &[]) {
+        Ok(r) {
+            var b = newStrBuf()
+            for i in 0..r.rowCount() {
+                for j in 0..r.columnCount() {
+                    match r.text(i, j) {
+                        Ok(x) { b.add(x) }
+                        Err(_) { b.add("\\N") }
+                    }
+                    b.add("|")
+                }
+                b.add("\n")
+            }
+            return Dumped{text: b.toStr(), n: r.rowCount()}
+        }
+        Err(e) { return Dumped{text: state(&e), n: -1} }
+    }
+}
+
+fn same(c: mut &postgres.Conn, name: &str, q: &str): Result[Unit, postgres.Error] {
+    try c.exec("set lexdb_batch = on")
+    let a = dump(c, q)
+    try c.exec("set lexdb_batch = off")
+    let b = dump(c, q)
+    try c.exec("set lexdb_batch = on")
+    if a.n < 0 || b.n < 0 {
+        println(name + ": " + a.text + " " + b.text)
+    } else if a.text == b.text && a.n == b.n {
+        println(name + ": same, " + a.n.toStr() + " rows")
+    } else {
+        println(name + ": DIFFER " + a.n.toStr() + " " + b.n.toStr())
+    }
+    return Ok(Unit{})
+}
+
+fn client(addr: str): Result[Unit, postgres.Error] {
+    let port = addr[10..len(addr)]
+    let dsn = "host=127.0.0.1 port=" + port + " user=test dbname=test sslmode=disable"
+    var c = try postgres.connect(dsn)
+    try c.exec("create table f (id int primary key, x int, y bigint, s smallint, bo boolean, tx text, nu numeric(10,2), " +
+               "ts timestamptz, d date, fl float8, v varchar(40))")
+    try c.exec("insert into f select g, nullif(g % 50, 7) - 25, g * 3074457345618258, nullif(g % 300, 0), " +
+               "nullif(g % 3, 0) = 1, nullif('t' || (g % 37), 't5'), nullif((g % 1000) * 1.25 - 300, 25), " +
+               "nullif(timestamptz '2024-01-01 00:00:00+00' + g * interval '7 hours', timestamptz '2024-01-01 07:00:00+00'), " +
+               "nullif(date '2023-01-01' + (g % 400), date '2023-01-02'), nullif(g / 8.0, 2.5), nullif(repeat('ü', g % 9), '') " +
+               "from generate_series(1, 3000) g")
+    try c.exec("set timezone = 'Asia/Kolkata'")
+    try same(mut &c, "columns", "select * from f")
+    try same(mut &c, "expressions", "select id * 2 - x, x / 3, -s, bo, x > s or bo, y is null, id % 7 = 0 from f")
+    try same(mut &c, "limit 1025", "select id, tx, ts from f limit 1025")
+    try same(mut &c, "limit 1", "select id, nu from f where x > 0 limit 1")
+    try same(mut &c, "text filter", "select id, tx, v from f where tx = 't3'")
+    try same(mut &c, "key range", "select id, d, fl from f where id between 600 and 1800")
+    try same(mut &c, "concat", "select id, tx || '!' from f")
+    try same(mut &c, "error part way", "select id, 10 / (id - 2500) from f")
+    let one = dump(mut &c, "select 1")
+    println("after it: " + strings.trim(one.text[0..len(one.text) - 2]))
+    try c.exec("set timezone = 'UTC'")
+    try same(mut &c, "in UTC", "select ts, d, id from f")
+    return Ok(Unit{})
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        let f = s.start(lexdb_wire.acceptLoop, lexdb_wire.AcceptArg{ln: ln, st: st})
+        match client(addr) {
+            Ok(_) {}
+            Err(e) { println("client: " + e.toStr()) }
+        }
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(19), lexdb_store.Options{cacheBytes: 128 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000, bufferedPages: false}, body).unwrap()
+}

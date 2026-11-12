@@ -8568,3 +8568,174 @@ about twice PostgreSQL's time.
 - `exec_sub`: one EXPLAIN ANALYZE line shows "batches 1".
 
 The suite passes (107).
+
+### 9.101 A streamed SELECT's rows a batch at a time, to the wire
+
+Step one of the plan that followed the batch-only experiments (a Fable
+agent's report, 2026-11-12). There, a prototype writing DataRows from a
+batch's columns took a 3-column scan to psql from 366 to 133 ns a row of
+server CPU (PostgreSQL 130). This is that prototype done properly: a typed
+batch reaches the wire, not a marker row carrying bytes, and every column
+type goes, not integers only.
+
+**The sink.** The session's row sink (`Session.runRows`) also takes an
+`OutBatch`:
+- `sink(cols, row, ob, start)`, where `ob.n > 0` means a batch of rows;
+  otherwise it is one row, or the first call.
+- **An `OutBatch`** holds the scanned batch's own columns (moved, not
+  copied), the chosen rows' places, and per output:
+  - its kind: an integer, a boolean, or a value of any other type;
+  - its source: a column of the batch, or the values of an expression
+    evaluated over the batch.
+- **The wire** (`Wire.dataBatch`) writes a batch's DataRows into one
+  buffer, then adds it to the output once:
+  - integers' digits two at a time;
+  - booleans as `t` or `f`;
+  - texts as they are;
+  - other values through `textOut`, as `dataRow` does, a timestamptz in
+    the session's zone included.
+
+**When** (`outPlan`):
+- the SELECT streams (9.99);
+- its first table is scanned in batches;
+- every condition compiles to the batches' form;
+- every output is a column, of any type, or an integer or boolean
+  expression the batches evaluate.
+
+**How** (`eachOut`):
+- **Order:** the rows are chosen by the conditions, then the expressions
+  are evaluated, before any row of the batch is given.
+- **Errors:** an error in an expression sends the batch, and the rest of
+  that scan, to the row path. Its rows go to the sink one at a time, and
+  the error comes only if the row path reaches its row (as 9.52 does for
+  conditions).
+- **LIMIT** is applied inside the batch.
+- **Counts:** EXPLAIN ANALYZE's counts are the row path's.
+
+Lexell would not let the row closure and the batch closure share a count
+(two closures may not hold the same variable mutably in one call). So
+`eachOut` pulls the batches itself, and calls the row path (`tryRow`) for
+a fallen-back scan with a closure of its own. A sink that finds the client
+gone gives 08006 at once, rather than setting a flag.
+
+**Also:**
+- `bLevelPlan`: the batch plan of a first table, now shared by
+  `batchLevel` and `outPlan`.
+- `bChoose`: a batch's rows that every condition holds for.
+
+**Tests:**
+- **`wire_batchout`:** over the wire, batches on and off give the same
+  text for every value of a table of every type (integers of each width,
+  boolean, text, numeric, timestamptz in Asia/Kolkata and in UTC, date,
+  float8, varchar, NULLs in each). It also covers expressions, LIMITs
+  across a batch's end, a text condition, a key range, a concatenation
+  (row path), and an error at row 2,500 (22012 both ways, the session
+  usable after).
+- **Differential runs, outside the suite:** 1,600 random queries over a
+  5,000-row table of 11 types, four seeds (one in Asia/Kolkata), with the
+  same output on and off, errors included. An instrumented build showed
+  360 of 400 queries taking `eachOut`. 122 of those runs fell back to the
+  row path, for errors.
+
+### 9.102 Joins over batches, keys of any type
+
+Step two. The Fable agent's prototype batched one shape only: a hash join
+on a unique integer key, under an aggregate (920 to 56 ms of CPU, against
+PostgreSQL's 90). The user asked for the other types too, text keys first.
+This is the general form.
+
+**What runs** (`bJoinPlan`):
+- **Joins:** every table after the first is a hash join, INNER (or a cross
+  join with a hash key) or LEFT.
+- **Keys:** one or more columns, of any type: integer, text, numeric,
+  date, varchar, boolean.
+- **Shared keys:** many rows of the joined table may share a key.
+- **Tables:** a table, or a subquery's or a CTE's rows.
+- **Compiled:** the key's values, each join's conditions and a LEFT
+  JOIN's WHERE conjuncts all compile to the batches' form.
+- **Not:** RIGHT or FULL joins, LATERAL, or a table read per row (a key
+  lookup per row) leave the query to the row path.
+
+**How** (`bJoinAll`, `bProbe`):
+- **The first table's chosen rows** are gathered into a joined batch,
+  whose columns are the query's.
+- **Then, per table:**
+  1. **The keys:** each row's key is looked up in the table's hash. That
+     is the row path's own hash (`Mats.keys`), built with the same key
+     encoding, so a text, a numeric, several columns or a collation key
+     match exactly as they do in the row path.
+  2. **One integer key** under no collation gets a map of its own (an
+     integer to a bucket), built once.
+  3. **The matches** are listed in the row path's order: by the batch's
+     row, then the bucket's rows in turn.
+  4. **The columns:** the matches' columns are gathered from the table's
+     rows, which are held as columns, converted once per query.
+  5. **The join's conditions** run over the candidates.
+  6. **A LEFT JOIN** adds its NULL row for a batch row with no match,
+     then runs its WHERE conjuncts.
+- **Counts:** probes, rows read, joined and NULL rows are counted as the
+  row path counts them. `exec_join`'s and `exec_with`'s EXPLAIN ANALYZE
+  lines are unchanged, but for "batches N" on the first table.
+- **Errors:** a key or a condition giving an error on a row of the batch
+  sends the batch to the row path (from the batch's start), as for the
+  first table's conditions.
+
+**The batch compiler gained:**
+- **`base`:** where the batch's columns start in the query's, 0 for a
+  joined batch. It also fixes a latent slip: `bValCmpOf` read the type of
+  the batch's column number, not the query's, when the first table was
+  not FROM's first.
+- **`VCmp`:** two columns compared, one at least of values, as `eval`
+  compares them. A join's own condition `f.tx = d.lab` needs it. It is not
+  used for a date or time against another kind (`eval` compares those in
+  the session's zone).
+
+**Who uses the joined batches:**
+- **`batchLevel`:** each joined row straight to `emit`. Sorts, DISTINCT,
+  windows and set operations, which take their rows from `emit`, get
+  joined rows without `tryRow` or `runLevel`.
+- **`eachOut`:** a streamed join's rows to the wire as OutBatches.
+- **`batchGroups`:** GROUP BY and aggregates over the joined batches; its
+  columns are the query's.
+
+**Tests:**
+- **`exec_batchjoin`:** 300 random joins with batches off and on, the
+  same results, errors included. They cover:
+  - keys: an integer (unique, and shared), a text, a numeric, a date, a
+    varchar, two columns, an expression;
+  - INNER and LEFT joins, and a third table;
+  - rows out, sorted, and grouped;
+  - conditions comparing two columns of values, and dividing by zero;
+  - 100 more inside a transaction with its own writes.
+
+  186 of the 300 ran their joins over batches. The others are mostly key
+  lookups per row, which the planner chose. Also checked: the counts of a
+  LEFT JOIN on a text are the row path's, and a LIMIT reached before a
+  join condition's error gives the rows, not the error.
+- **`exec_join`, `exec_with`:** "batches N" added to three EXPLAIN ANALYZE
+  lines.
+- **Differential runs, outside the suite:** 1,200 random join queries
+  (four seeds, one in America/New_York) over tables of 5,000, 300 and 40
+  rows, the same output on and off.
+  - An instrumented build counted the joined batches per consumer:
+    `batchLevel` 875 (the EXPLAIN pass included), `eachOut` 465 and
+    `batchGroups` 400.
+  - Probes: 290 by the integer map, 1,812 by the general key.
+  - 42 batches fell back, for errors.
+
+**Not measured yet:** the speed. Benchmarks wait for the user's go-ahead.
+
+**Next:**
+- **Key lookups per row** (`f.x = d.k` against d's primary key) still take
+  the row path; they are the commonest join shape.
+  - **A batch of lookups:** it would remove the row machinery and keep
+    the store's descent per key.
+  - **The optimizer's costs:** batched hash joins are now much cheaper
+    than the costs the planner uses for them (optimizer 36). Measured
+    costs for batched hash joins would let it choose them more often.
+- **Expressions of other types** in outputs and conditions (concatenation,
+  `upper`, casts, numeric arithmetic): a batch form of each, or a generic
+  per-value adapter.
+- **Sort, top-N and DISTINCT** over batches.
+
+The suite passes (109).
