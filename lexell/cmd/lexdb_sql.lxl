@@ -121,7 +121,7 @@ pub fn floatType(oid: int): TypeName { return TypeName{kind: K_FLOAT, oid: oid, 
 pub const CAT_MARK: str = "\x00catalog"
 
 // The functions that read the catalog (9.80).
-const CAT_FNS: []str = ["pg_get_userbyid", "pg_table_is_visible", "pg_type_is_visible", "pg_function_is_visible",
+const CAT_FNS: []str = ["#object_id", "pg_get_userbyid", "pg_table_is_visible", "pg_type_is_visible", "pg_function_is_visible",
                         "pg_collation_is_visible", "pg_get_expr", "pg_get_constraintdef", "pg_get_indexdef",
                         "pg_get_serial_sequence", "to_regclass", "to_regtype", "to_regnamespace", "obj_description",
                         "col_description", "pg_relation_is_publishable", "pg_partition_ancestors", "current_user",
@@ -478,6 +478,7 @@ pub type Stmt = record {
     pub into: str               // SELECT ... INTO t: t (9.88); made a CREATE TABLE ... AS
     pub exprs: []Expr           // CREATE INDEX: per column, its expression (9.89; a Lit NULL for a column, whose name is in names)
     pub assign: []str           // T-SQL SELECT @v = expr, ...: each item's variable ("" none); [] no assignment (design/lexdb-tds.md)
+    pub assignAt: []int         // ... each one's parameter ($k: k; 0 none), parallel to assign
     pub topMode: int            // T-SQL TOP n (in limit): TOP_PERCENT, TOP_TIES (bits); 0 plain (design/lexdb-tds.md S3)
     // The spelling of the name the statement makes (CREATE TABLE, VIEW, ...
     // AS, SELECT INTO; L6), "" as table's; and of names', parallel to them
@@ -558,7 +559,7 @@ pub fn newStmt(kind: int): Stmt {
                 group: [], order: [], limit: None, offset: None, sets: [], params: 0, from: [], index: "",
                 unique: false, inner: [], distinct: false, having: None, subs: [], use: 0, setop: 0, setAll: false,
                 cte: -1, rec: false, cascade: false, src: "", srf: "", ordin: false, alters: [], cons: [], seqNames: [], seq: noSeqOpts(), idOpts: [], overriding: OVR_NONE,
-                copy: noCopyOpts(), wins: [], windows: [], conflict: CONFLICT_NONE, conflictCols: [], conflictCon: "", alias: "", conc: false, lockMode: 0, lockOf: [], lockWait: 0, noData: false, into: "", exprs: [], assign: [], topMode: 0, spell: "", spells: []}
+                copy: noCopyOpts(), wins: [], windows: [], conflict: CONFLICT_NONE, conflictCols: [], conflictCon: "", alias: "", conc: false, lockMode: 0, lockOf: [], lockWait: 0, noData: false, into: "", exprs: [], assign: [], assignAt: [], topMode: 0, spell: "", spells: []}
 }
 
 // ---- the lexer
@@ -691,6 +692,14 @@ fn lexIn(s: &str, dialect: Dialect): Result[[]Tok, lexdb_base.DbErr] {
                 var b = newStrBuf()
                 i = try quoted(s, i, if c == '[' { ']' } else { '"' }, mut &b)
                 append(mut &out, nameTok(T_QIDENT, b.toStr(), start))
+                continue
+            }
+            // #name, ##name: a temporary table's name (design/lexdb-tds.md S4)
+            if c == '#' && i + 1 < n && (isIdentStart(s[i + 1]) || s[i + 1] == '#') {
+                i += 1
+                while i < n && s[i] == '#' { i += 1 }
+                while i < n && isIdentChar(s[i]) { i += 1 }
+                append(mut &out, nameTok(T_IDENT, s[start..i].toStr(), start))
                 continue
             }
             if (c == 'n' || c == 'N') && i + 1 < n && s[i + 1] == '\'' {
@@ -905,6 +914,12 @@ fn (p: mut &P) name(): Result[str, lexdb_base.DbErr] {
 
 // A table's (or an index's) name: name or schema.name (qual).
 fn (p: mut &P) qname(): Result[str, lexdb_base.DbErr] {
+    // T-SQL: @t, a table variable: the temporary table #@t
+    if p.tsql && p.peek().kind == T_VAR && !strings.startsWith(p.peek().text, "@@") {
+        let t = p.next()
+        p.spelled = ""
+        return Ok("#" + t.text)
+    }
     let first = try p.name()
     if p.tsql {
         // T-SQL: [db.][schema.]name, db..name; dbo is public (design/lexdb-tds.md L3)
@@ -1824,6 +1839,15 @@ fn (p: mut &P) tsqlCall(name: &str, args: []Expr, star: bool): Result[Expr, lexd
     var a = args
     let float8 = TypeName{kind: K_FLOAT, oid: OID_FLOAT8, prec: 0, scale: 0, len: 0}
     if strings.startsWith(name, "count_big") { return Ok(Expr.Call("count" + name[9..len(name)], a, star)) }
+    if n == 0 && (name == "error_number" || name == "error_message" || name == "error_severity" || name == "error_state" ||
+                  name == "error_line" || name == "error_procedure" || name == "xact_state") {
+        // the batch's values for the error a CATCH block handles (lexdb_tsql)
+        return p.variable(&Tok{kind: T_VAR, text: "@@" + name, at: 0, spell: ""})
+    }
+    if name == "object_id" && n >= 1 {
+        append(mut &p.seqs, CAT_MARK)
+        return Ok(Expr.Call("#object_id", [replace(mut &a[0], Expr.Lit(Val.Null))], false))
+    }
     if name == "scope_identity" && n == 0 {
         // the batch's @@IDENTITY (refreshed before each statement): a value WHERE can read
         return p.variable(&Tok{kind: T_VAR, text: "@@identity", at: 0, spell: ""})
@@ -1898,6 +1922,12 @@ fn (p: mut &P) createTable(): Result[Stmt, lexdb_base.DbErr] {
     s.table = try p.qname()
     s.spell = p.spelled
     if p.isKw("as") || (p.isKw("(") && p.nameListThenAs()) { return p.createTableAs(s) }
+    return p.tableBody(s)
+}
+
+// A table's definition, ( ... ), after its name.
+fn (p: mut &P) tableBody(s0: Stmt): Result[Stmt, lexdb_base.DbErr] {
+    var s = s0
     try p.expectKw("(")
     while true {
         var cname = ""
@@ -3044,9 +3074,15 @@ fn (p: mut &P) selectCore(): Result[Stmt, lexdb_base.DbErr] {
     try p.itemListAssign(mut &s.items, mut &s.assign)
     if len(s.assign) > 0 {
         while len(s.assign) < len(s.items) { append(mut &s.assign, "") }
+        var ats: []int = []
         for a in s.assign {
             if len(a) == 0 { return Err(lexdb_base.err("TS141", "A SELECT statement that assigns a value to a variable must not be combined with data-retrieval operations.")) }
+            // its parameter: the variable's place
+            var at = 0
+            for k in 0..len(p.vars) { if p.vars[k] == a { at = k + 1 } }
+            append(mut &ats, at)
         }
+        s.assignAt = ats
     }
     if p.acceptKw("into") {
         // SELECT ... INTO [TEMPORARY | UNLOGGED] [TABLE] name (9.88)
@@ -4582,6 +4618,33 @@ pub fn (q: mut &Parser) assign(v: &str, e: Expr): Stmt {
     append(mut &s.assign, v.toStr())
     q.p.finish(mut &s)
     return s
+}
+
+// SELECT xs, as PRINT, RAISERROR and THROW have their arguments; xs parsed
+// since the last fresh().
+pub fn (q: mut &Parser) values(xs: []Expr): Stmt {
+    var s = newStmt(S_SELECT)
+    for x in xs { append(mut &s.items, SelItem{star: false, qual: "", expr: Some(cloneE(&x)), alias: "", spell: ""}) }
+    q.p.finish(mut &s)
+    return s
+}
+
+// DECLARE @t TABLE (...), after TABLE: CREATE TABLE name (...).
+pub fn (q: mut &Parser) tableDef(name: &str): Result[Stmt, lexdb_base.DbErr] {
+    q.p.fresh()
+    var s = newStmt(S_CREATE)
+    s.table = name.toStr()
+    var r = try q.p.tableBody(s)
+    q.p.finish(mut &r)
+    return Ok(r)
+}
+
+// IF's and WHILE's condition: SELECT CASE WHEN cond THEN 1 ELSE 0 END.
+pub fn (q: mut &Parser) condition(): Result[Stmt, lexdb_base.DbErr] {
+    q.p.fresh()
+    let c = try q.p.expr()
+    let e = Expr.Call("case else", [c, Expr.Lit(Val.Int(1)), Expr.Lit(Val.Int(0))], false)
+    return Ok(q.values([e]))
 }
 
 // Whether v is in scope; declare adds one.

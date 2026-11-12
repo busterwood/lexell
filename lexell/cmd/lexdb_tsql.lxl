@@ -41,6 +41,7 @@ pub const EV_ROWS = 1       // a result set: cols and rows
 pub const EV_DONE = 2       // a statement's end: count (-1: none to report), cmd, error
 pub const EV_ERROR = 3      // err
 pub const EV_TRAN = 4       // tran: the transaction began (8), committed (9) or was rolled back (10)
+pub const EV_INFO = 5       // a message (PRINT, RAISERROR under severity 11): err's text, number, sev and state
 
 pub type Event = record {
     pub kind: int
@@ -51,10 +52,28 @@ pub type Event = record {
     pub error: bool
     pub err: DbErr
     pub tran: int
+    pub number: int         // EV_ERROR, EV_INFO: SQL Server's number, severity and state
+    pub sev: int
+    pub state: int
 }
 
 fn ev0(kind: int): Event {
-    return Event{kind: kind, cols: [], rows: [], count: -1, cmd: 0, error: false, err: lexdb_base.err("", ""), tran: 0}
+    return Event{kind: kind, cols: [], rows: [], count: -1, cmd: 0, error: false, err: lexdb_base.err("", ""), tran: 0, number: 0, sev: 0, state: 0}
+}
+
+// An error as SQL Server tells it: its number, text, severity and state
+// (ERROR_NUMBER() and the rest in a CATCH block).
+pub type Caught = record { pub number: int; pub message: str; pub severity: int; pub state: int }
+
+fn caughtOf(e: &DbErr): Caught {
+    let n = sqlNumber(&e.state)
+    return Caught{number: n, message: sqlMessage(n, &e.msg), severity: sqlClass(n), state: 1}
+}
+
+// SQL Server's text for the errors programs look at, where lexdb's differs.
+fn sqlMessage(n: int, msg: &str): str {
+    if n == 8134 { return "Divide by zero error encountered." }
+    return msg.toStr()
 }
 
 // DONE's CurCmd: the statement it ends
@@ -74,6 +93,19 @@ fn cmdOf(kind: int): int {
 fn errorEv(ev: mut &[]Event, e: &DbErr) {
     var x = ev0(EV_ERROR)
     x.err = e
+    let c = caughtOf(e)
+    x.number = c.number
+    x.sev = c.severity
+    x.state = c.state
+    append(ev, x)
+}
+
+fn caughtEv(ev: mut &[]Event, c: &Caught, kind: int) {
+    var x = ev0(kind)
+    x.err = lexdb_base.err("TS" + c.number.toStr(), c.message.toStr())
+    x.number = c.number
+    x.sev = c.severity
+    x.state = c.state
     append(ev, x)
 }
 
@@ -151,12 +183,41 @@ pub type State = record {
     pub spid: int
     saves: []str                // SAVE TRAN names, in order
     committed: bool             // the last transaction to end was committed
+    // TRY ... CATCH (S4): TRY blocks in, the error that leaves one (jump),
+    // the errors CATCH blocks handle (innermost last)
+    tryDepth: int
+    jump: bool
+    pending: Caught
+    caught: []Caught
+    doomed: bool                // XACT_ABORT's error in a TRY block: the transaction can only be rolled back
+    temps: []str                // the #temporary tables made (dropped when the connection ends or is reset)
+    tableVars: []str            // the batch's table variables (#@name), dropped after it
 }
 
 pub fn newState(spid: int): State {
     return State{nocount: false, xactAbort: false, implicitTx: false, quotedIdent: true, postgres: false, trancount: 0,
-                 rowcount: 0, error: 0, spid: spid, saves: [], committed: false}
+                 rowcount: 0, error: 0, spid: spid, saves: [], committed: false, tryDepth: 0, jump: false,
+                 pending: Caught{number: 0, message: "", severity: 0, state: 0}, caught: [], doomed: false, temps: [], tableVars: []}
 }
+
+// An error: to the client, or (in a TRY block) to its CATCH block.
+fn (st: mut &State) fail(ev: mut &[]Event, c: Caught, cmd: int) { st.failAs(ev, c, cmd, true) }
+
+// fail; counted: a statement's (in a TRY block SQL Server ends it with a
+// count of 0; RAISERROR and THROW with none).
+fn (st: mut &State) failAs(ev: mut &[]Event, c: Caught, cmd: int, counted: bool) {
+    st.error = c.number
+    if st.tryDepth > 0 {
+        if counted { doneEv(ev, if st.nocount { -1 } else { 0 }, cmd, false) }
+        st.pending = c
+        st.jump = true
+        return
+    }
+    caughtEv(ev, &c, EV_ERROR)
+    doneEv(ev, -1, cmd, true)
+}
+
+fn (st: mut &State) failErr(ev: mut &[]Event, e: &DbErr, cmd: int) { st.fail(ev, caughtOf(e), cmd) }
 
 pub type Frame = record {
     pub names: []str
@@ -164,7 +225,9 @@ pub type Frame = record {
     pub vals: []Val
 }
 
-const SYSVARS: []str = ["@@trancount", "@@rowcount", "@@error", "@@spid", "@@version", "@@servername", "@@language", "@@identity"]
+const SYSVARS: []str = ["@@trancount", "@@rowcount", "@@error", "@@spid", "@@version", "@@servername", "@@language", "@@identity",
+                         "@@error_number", "@@error_message", "@@error_severity", "@@error_state", "@@error_line", "@@error_procedure",
+                         "@@xact_state"]
 
 fn intType(oid: int): TypeName { return TypeName{kind: lexdb_sql.K_INT, oid: oid, prec: 0, scale: 0, len: 0} }
 fn textType(): TypeName { return TypeName{kind: lexdb_sql.K_TEXT, oid: lexdb_sql.OID_TEXT, prec: 0, scale: 0, len: 0} }
@@ -174,7 +237,7 @@ pub fn newFrame(): Frame {
     var f = Frame{names: [], types: [], vals: []}
     for n in SYSVARS {
         append(mut &f.names, n.toStr())
-        append(mut &f.types, if n == "@@version" || n == "@@servername" || n == "@@language" { textType() }
+        append(mut &f.types, if n == "@@version" || n == "@@servername" || n == "@@language" || n == "@@error_message" || n == "@@error_procedure" { textType() }
                             else if n == "@@identity" { TypeName{kind: lexdb_sql.K_NUM, oid: lexdb_sql.OID_NUMERIC, prec: 38, scale: 0, len: 0} }
                             else { intType(lexdb_sql.OID_INT4) })
         append(mut &f.vals, Val.Null)
@@ -207,6 +270,20 @@ fn (st: &State) refresh(sess: &lexdb_exec.Session, f: mut &Frame) {
         Some(n) { Val.Num(Decimal.fromInt(n)) }
         None { Val.Null }
     }
+    // ERROR_NUMBER() and the rest: the error the innermost CATCH block handles, NULL outside one
+    let k = len(st.caught)
+    if k > 0 {
+        let c = &st.caught[k - 1]
+        f.vals[8] = Val.Int(c.number)
+        f.vals[9] = Val.Text(c.message)
+        f.vals[10] = Val.Int(c.severity)
+        f.vals[11] = Val.Int(c.state)
+        f.vals[12] = Val.Int(1)
+        f.vals[13] = Val.Null
+    } else {
+        for i in 8..14 { f.vals[i] = Val.Null }
+    }
+    f.vals[14] = Val.Int(if sess.status() == 'I' { 0 } else if st.doomed { -1 } else { 1 })
 }
 
 fn (f: &Frame) oids(): []int {
@@ -257,8 +334,7 @@ fn (st: mut &State) sqlStmt(sess: mut &lexdb_exec.Session, s: &lexdb_sql.Stmt, f
         match simple(sess, &"BEGIN") {
             Ok(_) {}
             Err(e) {
-                errorEv(ev, &e)
-                doneEv(ev, -1, 0, true)
+                st.failErr(ev, &e, 0)
                 return false
             }
         }
@@ -277,21 +353,21 @@ fn (st: mut &State) sqlStmt(sess: mut &lexdb_exec.Session, s: &lexdb_sql.Stmt, f
     let r = sess.run(s, &f.vals, &oids)
     if r.isErr() {
         let e = r.unwrapErr()
-        errorEv(ev, &e)
-        doneEv(ev, -1, cmd, true)
-        st.error = sqlNumber(&e.state)
+        st.failErr(ev, &e, cmd)
         st.rowcount = 0
         if inTx {
-            if st.xactAbort || dooms(&e) {
+            if (st.xactAbort || dooms(&e)) && st.tryDepth == 0 {
                 let rb = simple(sess, &"ROLLBACK")
                 return false
             }
             let back = simple(sess, &("ROLLBACK TO SAVEPOINT " + SAVE))
             let rel = simple(sess, &("RELEASE SAVEPOINT " + SAVE))
-        } else if st.xactAbort {
+            // in a TRY block: the transaction left open, to be rolled back (XACT_STATE() -1)
+            if st.xactAbort || dooms(&e) { st.doomed = true }
+        } else if st.xactAbort && st.tryDepth == 0 {
             return false
         }
-        return !endsBatch(&e)
+        return st.tryDepth > 0 || !endsBatch(&e)
     }
     var res = r.unwrap()
     if inTx {
@@ -308,9 +384,7 @@ fn (st: mut &State) sqlStmt(sess: mut &lexdb_exec.Session, s: &lexdb_sql.Stmt, f
                 match lexdb_exec.coerce(res.rows[n - 1][i], &f.types[k]) {
                     Ok(v) { f.vals[k] = v }
                     Err(e) {
-                        errorEv(ev, &e)
-                        doneEv(ev, -1, cmd, true)
-                        st.error = sqlNumber(&e.state)
+                        st.failErr(ev, &e, cmd)
                         return true
                     }
                 }
@@ -331,6 +405,8 @@ fn (st: mut &State) sqlStmt(sess: mut &lexdb_exec.Session, s: &lexdb_sql.Stmt, f
     if res.tag == "COMMIT" { st.committed = true }
     if res.tag == "ROLLBACK" && !txStmt(s.kind) { st.committed = false }
     doneEv(ev, if st.nocount { -1 } else { n }, cmd, false)
+    // a #temporary table made: dropped with the connection
+    if s.kind == lexdb_sql.S_CREATE && strings.startsWith(s.table, "#") && !strings.startsWith(s.table, "#@") { append(mut &st.temps, s.table) }
     return true
 }
 
@@ -344,9 +420,7 @@ fn (st: mut &State) control(sess: mut &lexdb_exec.Session, sql: &str, ev: mut &[
             return true
         }
         Err(e) {
-            errorEv(ev, &e)
-            doneEv(ev, -1, 0, true)
-            st.error = sqlNumber(&e.state)
+            st.failErr(ev, &e, 0)
             return false
         }
     }
@@ -356,7 +430,7 @@ fn tsErr(n: int, msg: str): DbErr { return lexdb_base.err("TS" + n.toStr(), msg)
 
 // One statement of the batch; false when the batch ends.
 fn (st: mut &State) exec(sess: mut &lexdb_exec.Session, t: &lexdb_tsqlparse.TStmt, f: mut &Frame, ev: mut &[]Event): bool {
-    if t.kind == lexdb_tsqlparse.TS_SQL { return st.sqlStmt(sess, &t.stmt[0], f, ev, t.value == "set") }
+    if t.kind == lexdb_tsqlparse.TS_SQL { return st.sqlStmt(sess, &t.stmt[0], f, ev, false) }
     if t.kind == lexdb_tsqlparse.TS_DECLARE {
         // DECLARE @a = x, @b = y counts one row, as SQL Server
         for i in 0..len(t.stmt) {
@@ -398,9 +472,7 @@ fn (st: mut &State) exec(sess: mut &lexdb_exec.Session, t: &lexdb_tsqlparse.TStm
     }
     if t.kind == lexdb_tsqlparse.TS_COMMIT {
         if st.trancount == 0 {
-            errorEv(ev, &tsErr(3902, "The COMMIT TRANSACTION request has no corresponding BEGIN TRANSACTION."))
-            doneEv(ev, -1, 0, true)
-            st.error = 3902
+            st.failErr(ev, &tsErr(3902, "The COMMIT TRANSACTION request has no corresponding BEGIN TRANSACTION."), 0)
             return true
         }
         st.trancount -= 1
@@ -421,9 +493,7 @@ fn (st: mut &State) exec(sess: mut &lexdb_exec.Session, t: &lexdb_tsqlparse.TStm
             return true
         }
         if st.trancount == 0 && sess.status() == 'I' {
-            errorEv(ev, &tsErr(3903, "The ROLLBACK TRANSACTION request has no corresponding BEGIN TRANSACTION."))
-            doneEv(ev, -1, 0, true)
-            st.error = 3903
+            st.failErr(ev, &tsErr(3903, "The ROLLBACK TRANSACTION request has no corresponding BEGIN TRANSACTION."), 0)
             return true
         }
         let ok = st.control(sess, &"ROLLBACK", ev)
@@ -457,6 +527,7 @@ fn (st: mut &State) after(sess: &lexdb_exec.Session, before: byte, ev: mut &[]Ev
     if now == 'I' {
         st.trancount = 0
         st.saves = []
+        st.doomed = false
     } else if st.trancount == 0 {
         st.trancount = 1
     }
@@ -496,14 +567,246 @@ pub fn run(sess: mut &lexdb_exec.Session, st: mut &State, sql: &str, f: mut &Fra
         doneEv(ev, -1, 0, false)
         return
     }
-    for t in b.stmts {
-        st.refresh(sess, f)
-        st.committed = false
-        let before = sess.status()
-        let go = st.exec(sess, &t, f, ev)
-        st.after(sess, before, ev)
-        if !go { break }
+    let r = st.block(sess, &b.stmts, f, ev)
+    // the batch's table variables go with it
+    while len(st.tableVars) > 0 {
+        let tv = pop(mut &st.tableVars)
+        let d = simple(sess, &("DROP TABLE IF EXISTS " + quoteName(&tv)))
     }
+}
+
+// The #temporary tables a connection made, dropped (it ends, or is reset).
+pub fn dropTemps(sess: mut &lexdb_exec.Session, st: mut &State) {
+    if sess.status() != 'I' { let rb = simple(sess, &"ROLLBACK") }
+    while len(st.temps) > 0 {
+        let t = pop(mut &st.temps)
+        let d = simple(sess, &("DROP TABLE IF EXISTS " + quoteName(&t)))
+    }
+}
+
+// How a block's statements ended: the next goes on; BREAK, CONTINUE,
+// RETURN; the batch ended (an error that ends it); an error left a TRY block.
+const F_NEXT = 0
+const F_BREAK = 1
+const F_CONTINUE = 2
+const F_RETURN = 3
+const F_END = 4
+const F_ERROR = 5
+
+fn (st: mut &State) block(sess: mut &lexdb_exec.Session, ts: &[]lexdb_tsqlparse.TStmt, f: mut &Frame, ev: mut &[]Event): int {
+    for t in ts {
+        let r = st.one(sess, &t, f, ev)
+        if r != F_NEXT { return r }
+    }
+    return F_NEXT
+}
+
+// IF's and WHILE's condition: 1 true, 0 not, -1 an error (its flow in fl).
+fn (st: mut &State) cond(sess: mut &lexdb_exec.Session, s: &lexdb_sql.Stmt, f: mut &Frame, ev: mut &[]Event): int {
+    let oids = f.oids()
+    match sess.run(s, &f.vals, &oids) {
+        Ok(r) {
+            if len(r.rows) > 0 && len(r.rows[0]) > 0 {
+                match r.rows[0][0] {
+                    Val.Int(n) { return if n == 1 { 1 } else { 0 } }
+                    else {}
+                }
+            }
+            return 0
+        }
+        Err(e) {
+            st.failErr(ev, &e, 0)
+            return -1
+        }
+    }
+}
+
+// The values of PRINT's, RAISERROR's and THROW's arguments; None after an error.
+fn (st: mut &State) args(sess: mut &lexdb_exec.Session, s: &lexdb_sql.Stmt, f: mut &Frame, ev: mut &[]Event): Option[[]Val] {
+    let oids = f.oids()
+    match sess.run(s, &f.vals, &oids) {
+        Ok(r0) {
+            var r = r0
+            if len(r.rows) > 0 { return Some(replace(mut &r.rows[0], [])) }
+            return Some([])
+        }
+        Err(e) {
+            st.failErr(ev, &e, 0)
+            return None
+        }
+    }
+}
+
+fn intVal(v: &Val): int {
+    match v {
+        Val.Int(n) { return n }
+        Val.Num(d) { return d.toInt(Rounding.TOWARD_ZERO).unwrapOr(0) }
+        Val.Text(t) { return strings.parseIntOpt(strings.trim(t)).unwrapOr(0) }
+        else { return 0 }
+    }
+}
+
+// RAISERROR's message: %d %i %u %s %x %X %o with the arguments, in order
+// (a width or flags between are read, not used); %% a %.
+fn raiseText(fmt: &str, args: &[]Val): str {
+    var out = newStrBuf()
+    var k = 0
+    var i = 0
+    while i < len(fmt) {
+        let c = fmt[i]
+        if c != '%' || i + 1 >= len(fmt) {
+            out.addByte(c)
+            i += 1
+            continue
+        }
+        var j = i + 1
+        if fmt[j] == '%' {
+            out.addByte('%')
+            i = j + 1
+            continue
+        }
+        while j < len(fmt) && (fmt[j] == '-' || fmt[j] == '+' || fmt[j] == ' ' || fmt[j] == '#' || fmt[j] == '0' || (fmt[j] >= '1' && fmt[j] <= '9') || fmt[j] == '.' || fmt[j] == 'l' || fmt[j] == 'h' || fmt[j] == 'I') { j += 1 }
+        if j >= len(fmt) { break }
+        let t = fmt[j]
+        if k < len(args) {
+            let v = args[k]
+            if t == 'x' || t == 'X' {
+                let h = strings.hex(intVal(&v))
+                out.add(if t == 'X' { strings.toUpperAscii(&h) } else { h })
+            } else if t == 'd' || t == 'i' || t == 'u' {
+                out.add(intVal(&v).toStr())
+            } else {
+                out.add(if lexdb_exec.isNull(&v) { "(null)" } else { lexdb_exec.text(&v) })
+            }
+        } else {
+            out.add("(null)")
+        }
+        k += 1
+        i = j + 1
+    }
+    return out.toStr()
+}
+
+// One statement of a batch or block, and how it ended.
+fn (st: mut &State) one(sess: mut &lexdb_exec.Session, t: &lexdb_tsqlparse.TStmt, f: mut &Frame, ev: mut &[]Event): int {
+    st.refresh(sess, f)
+    let k = t.kind
+    if k == lexdb_tsqlparse.TS_BLOCK { return st.block(sess, &t.body, f, ev) }
+    if k == lexdb_tsqlparse.TS_IF {
+        let c = st.cond(sess, &t.stmt[0], f, ev)
+        if c < 0 { return st.flowAfterError() }
+        return st.block(sess, if c == 1 { &t.body } else { &t.els }, f, ev)
+    }
+    if k == lexdb_tsqlparse.TS_WHILE {
+        while true {
+            st.refresh(sess, f)
+            let c = st.cond(sess, &t.stmt[0], f, ev)
+            if c < 0 { return st.flowAfterError() }
+            if c == 0 { break }
+            let r = st.block(sess, &t.body, f, ev)
+            if r == F_BREAK { break }
+            if r != F_NEXT && r != F_CONTINUE { return r }
+        }
+        return F_NEXT
+    }
+    if k == lexdb_tsqlparse.TS_BREAK { return F_BREAK }
+    if k == lexdb_tsqlparse.TS_CONTINUE { return F_CONTINUE }
+    if k == lexdb_tsqlparse.TS_RETURN { return F_RETURN }
+    if k == lexdb_tsqlparse.TS_TRY {
+        st.tryDepth += 1
+        let r = st.block(sess, &t.body, f, ev)
+        st.tryDepth -= 1
+        if r != F_ERROR { return r }
+        // the CATCH block, with the error it handles
+        let pc = Caught{number: st.pending.number, message: st.pending.message, severity: st.pending.severity, state: st.pending.state}
+        append(mut &st.caught, pc)
+        let r2 = st.block(sess, &t.els, f, ev)
+        let x = pop(mut &st.caught)
+        return r2
+    }
+    if k == lexdb_tsqlparse.TS_PRINT {
+        match st.args(sess, &t.stmt[0], f, ev) {
+            Some(vs) {
+                let msg = if len(vs) == 0 || lexdb_exec.isNull(&vs[0]) { "" } else { lexdb_exec.text(&vs[0]) }
+                caughtEv(ev, &Caught{number: 0, message: msg, severity: 0, state: 1}, EV_INFO)
+                return F_NEXT
+            }
+            None { return st.flowAfterError() }
+        }
+    }
+    if k == lexdb_tsqlparse.TS_RAISERROR {
+        match st.args(sess, &t.stmt[0], f, ev) {
+            Some(vs) {
+                var rest: []Val = []
+                for i in 3..len(vs) { append(mut &rest, vs[i]) }
+                let msg = raiseText(&(if lexdb_exec.isNull(&vs[0]) { "" } else { lexdb_exec.text(&vs[0]) }), &rest)
+                let sev = intVal(&vs[1])
+                let c = Caught{number: 50000, message: msg, severity: sev, state: intVal(&vs[2])}
+                if sev <= 10 {
+                    caughtEv(ev, &c, EV_INFO)
+                    return F_NEXT
+                }
+                st.failAs(ev, c, 0, false)
+                return st.flowAfterError()
+            }
+            None { return st.flowAfterError() }
+        }
+    }
+    if k == lexdb_tsqlparse.TS_THROW {
+        var c = Caught{number: 0, message: "", severity: 16, state: 1}
+        if len(t.stmt) == 0 {
+            // THROW in a CATCH block: the error it handles, again
+            if len(st.caught) == 0 {
+                st.fail(ev, Caught{number: 10704, message: "To rethrow an error, a THROW statement must be used inside a CATCH block. Insert the THROW statement inside a CATCH block, or add error parameters to the THROW statement.", severity: 15, state: 1}, 0)
+                return st.flowAfterError()
+            }
+            let top = &st.caught[len(st.caught) - 1]
+            c = Caught{number: top.number, message: top.message, severity: top.severity, state: top.state}
+        } else {
+            match st.args(sess, &t.stmt[0], f, ev) {
+                Some(vs) {
+                    c.number = intVal(&vs[0])
+                    c.message = if lexdb_exec.isNull(&vs[1]) { "" } else { lexdb_exec.text(&vs[1]) }
+                    c.state = intVal(&vs[2])
+                }
+                None { return st.flowAfterError() }
+            }
+        }
+        st.failAs(ev, c, 0, false)
+        // THROW ends the batch (and, with XACT_ABORT, the transaction)
+        if st.jump { return F_ERROR }
+        if st.xactAbort && sess.status() != 'I' { let rb = simple(sess, &"ROLLBACK") }
+        return F_END
+    }
+    if k == lexdb_tsqlparse.TS_TABLEVAR {
+        let go = st.sqlStmt(sess, &t.stmt[0], f, ev, true)
+        if go && !st.jump { append(mut &st.tableVars, "#" + t.names[0]) }
+        // (CREATE TABLE's DONE: a DECLARE reports none)
+        if len(ev) > 0 && ev[len(ev) - 1].kind == EV_DONE && !ev[len(ev) - 1].error { let x = pop(ev) }
+        if st.jump {
+            st.jump = false
+            return F_ERROR
+        }
+        return if go { F_NEXT } else { F_END }
+    }
+    st.committed = false
+    let before = sess.status()
+    let go = st.exec(sess, t, f, ev)
+    st.after(sess, before, ev)
+    if st.jump {
+        st.jump = false
+        return F_ERROR
+    }
+    return if go { F_NEXT } else { F_END }
+}
+
+// After an error in a condition or an argument: to the CATCH block, else on.
+fn (st: mut &State) flowAfterError(): int {
+    if st.jump {
+        st.jump = false
+        return F_ERROR
+    }
+    return F_NEXT
 }
 
 // A batch in lexdb's own dialect (SET LEXDB_DIALECT POSTGRES): the first

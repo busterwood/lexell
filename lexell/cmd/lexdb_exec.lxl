@@ -3104,10 +3104,20 @@ fn createSchema(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[str, 
     return Ok("")
 }
 
+// ---- T-SQL's temporary tables (design/lexdb-tds.md S4): #name (and a
+// table variable, #@name) is a session's own, in its schema #t<session>.
+
+fn isTempName(n: &str): bool { return len(n) > 1 && n[0] == '#' && n[1] != '#' }
+
+fn tempSchema(sess: int): str { return "#t" + sess.toStr() }
+
+fn tempKey(sess: int, n: &str): str { return lexdb_sql.qual(&tempSchema(sess), n) }
+
 // The catalog key of a table (idx false) or an index named n: n if it is
 // qualified or the path is public's; else the first schema on the path
 // holding it, or none: the schema new names would go in (it is not there).
 fn catKey(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, n: &str, idx: bool): Result[str, DbErr] {
+    if isTempName(n) { return Ok(tempKey(txn.sess, n)) }
     if len(txn.path) == 0 || lexdb_sql.isQual(n) { return Ok(n) }
     for i in 0..len(txn.path) {
         let sc = txn.path[i]
@@ -6256,7 +6266,9 @@ fn changeIndexes(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, o
 
 fn createTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
     var key = s.table
-    if lexdb_sql.isQual(&s.table) {
+    if isTempName(&s.table) {
+        key = tempKey(txn.sess, &s.table)
+    } else if lexdb_sql.isQual(&s.table) {
         let sn = lexdb_sql.schemaOf(&s.table)
         if !(try schemaExists(st, txn, &sn)) { return Err(e("3F000", "schema \"" + sn + "\" does not exist")) }
     } else {
@@ -9113,6 +9125,10 @@ type Sel = record {
     // topN the n, applied to the rows sorted
     topMode: int
     topN: int
+    // T-SQL's SELECT @v = f(@v, ...) (design/lexdb-tds.md S4): per output
+    // column the parameter it assigns (0 none), when one reads another's:
+    // the rows evaluated in their order, each seeing the last's values
+    feedback: []int
 }
 
 type SelLock = value record { level: int; at: int; n: int; mode: int; wait: int }
@@ -9571,7 +9587,7 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
                   first: first, limit: limit, offset: offset, having: having, specs: specs, distinct: s.distinct, desc: desc, nullsFirst: nullsFirst,
                   parts: [], setop: 0, setAll: false, split: 0, rec: -1, srf: s.srf, ordin: s.ordin, wins: wins, nAggs: nAggs,
                   locks: locks, nOut: nOut, groupKinds: groupKinds, ordKinds: ordKinds, outKinds: outKindsOf(&outs), topMode: s.topMode,
-                  topN: topN})
+                  topN: topN, feedback: if aggQ || s.distinct || len(wins) > 0 { [] } else { feedbackOf(s, &exprs) }})
 }
 
 // UNION, INTERSECT, EXCEPT: its two queries, planned on their own; the
@@ -9629,7 +9645,7 @@ fn planSet(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
                   limit: limit, offset: offset, having: None, specs: [], distinct: false, desc: desc, nullsFirst: nullsFirst, parts: [l, r],
                   setop: s.setop, setAll: s.setAll, split: split, rec: if s.rec { s.cte } else { -1 }, srf: "", ordin: false,
                   wins: [], nAggs: 0, locks: [], nOut: len(outs), groupKinds: [], ordKinds: ordKinds, outKinds: outKindsOf(&outs), topMode: 0,
-                  topN: -1})
+                  topN: -1, feedback: []})
 }
 
 // A row's key for UNION and the like (NULLs alike; 2 = 2.0).
@@ -9645,6 +9661,33 @@ fn collVal(k: int, v: &Val): Val {
     match v {
         Val.Text(s) { return Val.Text(if k == lexdb_sql.COLL_CI { ciKey(&s) } else { padKey(&s) }) }
         else { return v }
+    }
+}
+
+// A SELECT @v = ... whose expressions read what it assigns: its
+// parameters, per output column; [] none.
+fn feedbackOf(s: &lexdb_sql.Stmt, exprs: &[]Expr): []int {
+    if len(s.assignAt) == 0 { return [] }
+    var reads = false
+    for x in exprs { for k in s.assignAt { if k > 0 && usesParam(&x, k) { reads = true } } }
+    if !reads { return [] }
+    var out: []int = []
+    for k in s.assignAt { append(mut &out, k) }
+    return out
+}
+
+fn usesParam(x: &Expr, k: int): bool {
+    match x {
+        Expr.Param(n) { return n == k }
+        Expr.Unary(_, a) { return usesParam(&a, k) }
+        Expr.Bin(_, a, b) { return usesParam(&a, k) || usesParam(&b, k) }
+        Expr.IsNull(a, _) { return usesParam(&a, k) }
+        Expr.Cast(a, _) { return usesParam(&a, k) }
+        Expr.Call(_, args, _) {
+            for a in args { if usesParam(&a, k) { return true } }
+            return false
+        }
+        else { return false }
     }
 }
 
@@ -9898,6 +9941,7 @@ fn execSel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
     // with window calls the rows are kept first, then their values made (9.46)
     let windowed = len(sel.wins) > 0
     if windowed && !sel.aggQ { late = true }
+    if len(sel.feedback) > 0 { late = true }
     var bases: []WinRow = []
     var outRows: []OutRow = []
     // the rows kept here, counted in the row callbacks (they cannot reach rs)
@@ -10006,6 +10050,37 @@ fn execSel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
         if windowed {
             for i in 0..len(raws) { append(mut &bases, WinRow{row: replace(mut &raws[i], []), aggs: []}) }
         }
+        if len(sel.feedback) > 0 {
+            // SELECT @v = f(@v, ...): the rows in their order, each one's
+            // values the parameters of the next
+            var keyed: []OutRow = []
+            for i in 0..len(raws) {
+                let r = replace(mut &raws[i], [])
+                var ord: []Val = []
+                if sorting {
+                    let env = Env{cols: &q.cols, row: &r, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: sqe}
+                    let noVals: []Val = []
+                    for oi in 0..len(sel.order) { append(mut &ord, ordVal(sel, oi, try orderX(st, txn, q, &sel.order[oi], &sel.outs, &noVals, &env, rs))) }
+                }
+                append(mut &keyed, OutRow{vals: r, ord: ord})
+            }
+            if sorting { collections.sortBy(mut &keyed, fn(a: &OutRow, b: &OutRow): int { return ordCmp(sel, &a.ord, &b.ord) }) }
+            var pv = copyRow(params)
+            for kr in keyed {
+                var vals: []Val = []
+                {
+                    let env = Env{cols: &q.cols, row: &kr.vals, aggs: &noAggs, params: &pv, subs: &m.subs, cur: &noAggs, seq: sqe}
+                    for x in sel.exprs { append(mut &vals, try evalX(st, txn, q, &x, &env, rs)) }
+                }
+                for i in 0..len(sel.feedback) {
+                    let k = sel.feedback[i]
+                    if k > 0 && k <= len(pv) && i < len(vals) { pv[k - 1] = vals[i] }
+                }
+                held += rowBytes(&vals)
+                append(mut &outRows, OutRow{vals: vals, ord: []})
+            }
+            raws = []
+        }
         for r in raws {
             if windowed { break }
             let env = Env{cols: &q.cols, row: &r, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: sqe}
@@ -10077,7 +10152,8 @@ fn execSel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
     }
     try rs.hold(held)
     if hasSrfCall(&sel.exprs) { try expandSrfs(mut &outRows, &sel.outs) }
-    if sorting { collections.sortBy(mut &outRows, fn(a: &OutRow, b: &OutRow): int { return ordCmp(sel, &a.ord, &b.ord) }) }
+    // (rows assigned in their order are in it already)
+    if sorting && len(sel.feedback) == 0 { collections.sortBy(mut &outRows, fn(a: &OutRow, b: &OutRow): int { return ordCmp(sel, &a.ord, &b.ord) }) }
     var outs: []OutCol = []
     for oc in sel.outs { append(mut &outs, oc) }
     var res = Res{cols: outs, rows: [], tag: "", hasRows: true, copy: COPY_NONE}
@@ -16397,6 +16473,20 @@ fn callMisc(name: &str, vs: &[]Val): Result[Option[Val], DbErr] {
 // The functions that read the bound catalog: None if name is none of them.
 fn callCat(name: &str, vs: &[]Val, se: &SeqEnv): Result[Option[Val], DbErr] {
     let n = len(vs)
+    if name == "#object_id" {
+        // T-SQL's OBJECT_ID(name): a relation's id, NULL if there is none
+        // ([brackets], dbo., a database's name and #temporary names read)
+        if n < 1 || isNull(&vs[0]) { return Ok(Some(Val.Null)) }
+        let full = strings.replaceAll(strings.replaceAll(text(&vs[0]), "[", ""), "]", "")
+        let parts = strings.split(&full, ".")
+        let nm = parts[len(parts) - 1].toStr()
+        let sc = if len(parts) >= 2 { strings.toLowerAscii(parts[len(parts) - 2]) } else { "" }
+        var look = "\"" + strings.replaceAll(strings.toLowerAscii(&nm), "\"", "\"\"") + "\""
+        if isTempName(&strings.toLowerAscii(&nm)) { look = "\"" + tempSchema(se.sess) + "\"." + look }
+        else if sc != "" && sc != "dbo" { look = "\"" + sc + "\"." + look }
+        let o = relOidOf(se, &look)
+        return Ok(Some(if o == 0 { Val.Null } else { Val.Int(o) }))
+    }
     if name == "current_user" { return Ok(Some(Val.Text(catUser(se)))) }
     if name == "session_user" {
         for l in catLines(se, &"U") { return Ok(Some(Val.Text(l[0]))) }
@@ -17596,8 +17686,9 @@ fn needOwner(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, w: &Who, obj: &s
 
 // CREATE in a schema.
 fn needCreate(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, key: &str): Result[Unit, DbErr] {
-    let w = try whoNow(st, txn)
     let sc = lexdb_sql.schemaOf(key)
+    if sc == tempSchema(txn.sess) { return Ok(Unit{}) }        // a session's temporary tables
+    let w = try whoNow(st, txn)
     if !(try may(st, txn, &w, &nspObj(&sc), &"C")) { return Err(denied(&"schema", &sc)) }
     return Ok(Unit{})
 }
