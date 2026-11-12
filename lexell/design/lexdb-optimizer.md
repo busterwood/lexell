@@ -40,9 +40,10 @@ per-parameter plans (section 23), estimates deciding beyond ties with
 primary-key statistics (section 24), the constraint-bound join order
 (section 25), the cost-based join order with its planning-time measurement
 (section 26), implied equalities (section 27), SQLite's N-best search past
-8 tables (section 28), and the fixes from the join-order review with
-filter and range estimates (section 29, uncommitted). Code comments cite
-these sections as "optimizer N".
+8 tables (section 28), the fixes from the join-order review with filter
+and range estimates (section 29), and the join search raised to 24 tables
+(section 30, uncommitted). Code comments cite these sections as "optimizer
+N".
 
 ## 1. Summary
 
@@ -1703,6 +1704,51 @@ are kept in the session's scratchpad, not the repository.
 tables 32; 8 tables 72; a 12-table chain 194; a 12-table star 512. The
 extra over section 28 is mostly reading the larger statistics rows, once
 per table per planning.
+
+## 30. The join search to 24 tables (2026-11-12)
+
+The user's request, after the N-best search (section 28): double the bound.
+`JOIN_SEARCH_MAX` is now 24. Exact search stays to 8 tables and N-best
+covers 9 to 24. Past 24, the order bound by keys (section 25) stands.
+
+**What had to change.** The rows of every set of tables were computed up
+front, an array of 2^n. At 24 tables that is 16.7 million entries. The rows
+of a set are now computed when the search reaches it (`setRows`, kept in a
+map). They are defined by the set's lowest table, as before, so they do not
+depend on the order that reached the set, and the exact search's results
+are unchanged. The N-best search also keeps each extension as its parent
+and the table added, copying the order only for the 10 kept, and finds a
+set's earlier extension through a map instead of a scan.
+
+**Measured** (`plan_time.lxl`, load under 1, microseconds per EXPLAIN):
+
+| Tables | Chain | Star | Rules mode |
+|---|---|---|---|
+| 12 | 133 | 401 | 51 |
+| 16 | 198 | 877 | 69 |
+| 24 | 365 | 2,904 | about 105 |
+
+Up to 12 tables this is faster than section 29 (chain 194, star 512),
+because the 2^n rows are no longer computed. The 24-table star is the
+costly shape. Its spokes all join the centre's key, so implied equalities
+link every pair (276 derived), and each of about 5,760 extensions costs a
+lookup estimate and a set's rows. A profile (`perf`, C build) showed no
+single hot spot left: the cost search is about a sixth of the run, set rows
+a tenth, and the rest is spread over allocation and name lookups. Two tries
+that changed little: checking implied equalities against a set of texts
+(3.2 to 3.0 ms), and copying only the kept orders (3.0 to 2.9 ms).
+
+**Plans.** The 24-table chain and star choose the expected orders: the
+filtered table by its index, then each table by lookup. The star hashes a
+spoke once the joined rows grow past the lookups' cost; the hash is keyed on
+the same column several times (`hash on (p, p, p, ...)`), since the derived
+equalities repeat it. That is correct but wasteful, and not fixed.
+`exec_joincost`'s chain is now 20 tables, past the old bound, and its count
+matches the rules mode's.
+
+**Open (the user's call).** About 2.9 ms to plan a 24-table star, paid once
+per prepared statement. If too much: a narrower N past 16 tables, or not
+deriving equalities between spokes that only meet at the centre.
 
 ## Sources
 
