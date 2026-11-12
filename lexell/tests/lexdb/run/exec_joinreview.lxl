@@ -1,0 +1,163 @@
+// lexdb_exec: the review of the join order (optimizer 25, 26), its
+// findings fixed (optimizer 29), one case each: a key value a column cannot
+// hold matches no row; a hash join fits the statement's memory; ranges and
+// other filters count in the estimates; a LIMIT or EXISTS keeps lookups; a
+// block whose reads are noted keeps the order bound by keys (no
+// whole-table read to conflict with another session's write); the first
+// table is read in batches wherever FROM put it. Checked by hand against
+// the rules mode.
+// expect: -- tables as the review's: small (100 rows, one labelled x), big (20,000, 200 per small row, a pad column)
+// expect: create table small (id int primary key, label text) -> CREATE TABLE
+// expect: insert into small select g, case when g = 7 then 'x' else 'l' || (g % 10) end from generate_series(1, 100) g -> INSERT 0 100
+// expect: create index small_label on small (label) -> CREATE INDEX
+// expect: create table big (id int primary key, sid int, v int, pad text) -> CREATE TABLE
+// expect: insert into big select g, g % 100 + 1, g % 7, repeat('x', 50) from generate_series(1, 20000) g -> INSERT 0 20000
+// expect: create index big_sid on big (sid) -> CREATE INDEX
+// expect: -- 1. a key value the column cannot hold matches no row (it was an error in a hash probe or a lookup)
+// expect: create table bigv (id bigint primary key, x bigint, t text) -> CREATE TABLE
+// expect: insert into bigv values (1, 1, '1'), (2, 1099511627776, 'abc'), (3, 3, 'abcdef'), (4, null, null), (5, 5, ' 5') -> INSERT 0 5
+// expect: create table sm (id int primary key, vc varchar(3)) -> CREATE TABLE
+// expect: insert into sm values (1, '1'), (2, 'abc'), (3, 'ab'), (5, '5') -> INSERT 0 4
+// expect: create index sm_vc on sm (vc) -> CREATE INDEX
+// expect: analyze -> ANALYZE
+// expect: select count(*) from sm s join bigv b on s.id = b.x -> [count] 3
+// expect: select count(*) from bigv b join sm s on s.vc = b.t -> [count] 2
+// expect: select count(*) from bigv b join sm s on s.id = b.x -> [count] 3
+// expect: select count(*) from sm where id = 1099511627776 -> [count] 0
+// expect: select count(*) from sm where id = 'abc' -> 22P02 invalid input syntax for type integer: "abc"
+// expect: set lexdb_planner = rules -> SET
+// expect: select count(*) from sm s join bigv b on s.id = b.x -> [count] 3
+// expect: select count(*) from bigv b join sm s on s.vc = b.t -> [count] 2
+// expect: reset lexdb_planner -> RESET
+// expect: -- 2. a hash join fits the statement's memory: with 256kB, big is looked up per row
+// expect: set max_statement_mem = '256kB' -> SET
+// expect: explain select count(*), max(b.pad) from big a join big b on b.id = a.sid -> [QUERY PLAN] scan big a: full scan; join big b: primary key lookup per row; aggregate
+// expect: select count(*) from big a join big b on b.id = a.sid -> [count] 20000
+// expect: reset max_statement_mem -> RESET
+// expect: explain select count(*) from big a join big b on b.id = a.sid -> [QUERY PLAN] scan big a: full scan; join big b: hash on (id) over full scan; aggregate
+// expect: -- 3. ranges, IN lists and other filters count: the range's table first
+// expect: explain analyze select count(*) from big b join small s on b.sid = s.id where b.id < 5 and s.label = 'l3' -> scan big b: primary key range (at most 20000 rows) (rows read 5, kept 4, batches 1); join small s: primary key lookup per row (lookups 4, rows read 4, joined 1); aggregate
+// expect: explain analyze select count(*) from big a join big b on b.id = a.sid where a.id between 10 and 12 -> scan big a: primary key range (at most 20000 rows) (rows read 3, kept 3, batches 1); join big b: primary key lookup per row (lookups 3, rows read 3, joined 3); aggregate
+// expect: explain analyze select count(*) from big a join big b on b.id = a.sid where a.pad = 'none' -> scan big a: full scan (rows read 20000, kept 0, batches 20); join big b: primary key lookup per row (lookups 0, rows read 0, joined 0); aggregate
+// expect: -- 4. a LIMIT or EXISTS keeps lookups: no hash built for one row
+// expect: explain analyze select a.id from big a join big b on b.id = a.id limit 1 -> scan big a: full scan (rows read 1, kept 1); join big b: primary key lookup per row (lookups 1, rows read 1, joined 1); limit: stops the scan
+// expect: explain analyze select 1 where exists (select 1 from big a join big b on b.id = a.id) -> result; subquery 1 (exists): run once (runs 1, from cache 0);   scan big a: full scan (rows read 1, kept 1);   join big b: primary key lookup per row (lookups 1, rows read 1, joined 1)
+// expect: -- 5. in a block that writes, the order bound by keys: no whole-table read, no conflict with B's write
+// expect: create table cust (id int primary key, name text) -> CREATE TABLE
+// expect: insert into cust select g, 'c' || g from generate_series(1, 50) g -> INSERT 0 50
+// expect: create table ord (id int primary key, cid int, note text) -> CREATE TABLE
+// expect: insert into ord select g, g % 50 + 1, 'n' from generate_series(1, 5000) g -> INSERT 0 5000
+// expect: create index ord_cid on ord (cid) -> CREATE INDEX
+// expect: create table log (id int primary key, what text) -> CREATE TABLE
+// expect: analyze -> ANALYZE
+// expect: begin -> BEGIN
+// expect: explain select count(*) from ord o join cust c on c.id = o.cid where o.id < 20 -> [QUERY PLAN] scan ord o: primary key range (at most 5000 rows); join cust c: primary key lookup per row; aggregate
+// expect: select count(*) from ord o join cust c on c.id = o.cid where o.id < 20 -> [count] 19
+// expect: insert into log values (1, 'a') -> INSERT 0 1
+// expect: B: update cust set name = 'zz' where id = 45 -> UPDATE 1
+// expect: commit -> COMMIT
+// expect: -- 6. the first table in batches wherever FROM put it
+// expect: explain analyze select count(*) from small s join big b on b.sid = s.id where b.v = 3 -> scan big b: full scan (rows read 20000, kept 2857, batches 20); join small s: primary key lookup per row (lookups 2857, rows read 2857, joined 2857); aggregate
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "strings"
+
+fn show(s: mut &lexdb_exec.Session, sql: str) {
+    match s.exec(&sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if !r.hasRows {
+                println(sql + " -> " + r.tag)
+                return
+            }
+            var lines: []str = []
+            for row in r.rows {
+                var cells: []str = []
+                for v in row { append(mut &cells, if lexdb_exec.isNull(&v) { "NULL" } else { lexdb_exec.text(&v) }) }
+                append(mut &lines, strings.join(&cells, "|"))
+            }
+            var names: []str = []
+            for c in r.cols { append(mut &names, c.name) }
+            println(sql + " -> [" + strings.join(&names, ",") + "]" + (if len(lines) > 0 { " " } else { "" }) + strings.join(&lines, "; "))
+        }
+        Err(e) { println(sql + " -> " + e.state + " " + e.msg) }
+    }
+}
+
+// EXPLAIN ANALYZE without its last line (the time).
+fn analyze(s: mut &lexdb_exec.Session, sql: str) {
+    match s.exec(&sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            var lines: []str = []
+            for i in 0..len(r.rows) - 1 { append(mut &lines, lexdb_exec.text(&r.rows[i][0])) }
+            println(sql + " -> " + strings.join(&lines, "; "))
+        }
+        Err(e) { println(sql + " -> " + e.state + " " + e.msg) }
+    }
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    var a = lexdb_exec.newSession(st)
+    var b = lexdb_exec.newSession(st)
+    println("-- tables as the review's: small (100 rows, one labelled x), big (20,000, 200 per small row, a pad column)")
+    show(mut &a, "create table small (id int primary key, label text)")
+    show(mut &a, "insert into small select g, case when g = 7 then 'x' else 'l' || (g % 10) end from generate_series(1, 100) g")
+    show(mut &a, "create index small_label on small (label)")
+    show(mut &a, "create table big (id int primary key, sid int, v int, pad text)")
+    show(mut &a, "insert into big select g, g % 100 + 1, g % 7, repeat('x', 50) from generate_series(1, 20000) g")
+    show(mut &a, "create index big_sid on big (sid)")
+    println("-- 1. a key value the column cannot hold matches no row (it was an error in a hash probe or a lookup)")
+    show(mut &a, "create table bigv (id bigint primary key, x bigint, t text)")
+    show(mut &a, "insert into bigv values (1, 1, '1'), (2, 1099511627776, 'abc'), (3, 3, 'abcdef'), (4, null, null), (5, 5, ' 5')")
+    show(mut &a, "create table sm (id int primary key, vc varchar(3))")
+    show(mut &a, "insert into sm values (1, '1'), (2, 'abc'), (3, 'ab'), (5, '5')")
+    show(mut &a, "create index sm_vc on sm (vc)")
+    show(mut &a, "analyze")
+    show(mut &a, "select count(*) from sm s join bigv b on s.id = b.x")
+    show(mut &a, "select count(*) from bigv b join sm s on s.vc = b.t")
+    show(mut &a, "select count(*) from bigv b join sm s on s.id = b.x")
+    show(mut &a, "select count(*) from sm where id = 1099511627776")
+    show(mut &a, "select count(*) from sm where id = 'abc'")
+    show(mut &a, "set lexdb_planner = rules")
+    show(mut &a, "select count(*) from sm s join bigv b on s.id = b.x")
+    show(mut &a, "select count(*) from bigv b join sm s on s.vc = b.t")
+    show(mut &a, "reset lexdb_planner")
+    println("-- 2. a hash join fits the statement's memory: with 256kB, big is looked up per row")
+    show(mut &a, "set max_statement_mem = '256kB'")
+    show(mut &a, "explain select count(*), max(b.pad) from big a join big b on b.id = a.sid")
+    show(mut &a, "select count(*) from big a join big b on b.id = a.sid")
+    show(mut &a, "reset max_statement_mem")
+    show(mut &a, "explain select count(*) from big a join big b on b.id = a.sid")
+    println("-- 3. ranges, IN lists and other filters count: the range's table first")
+    analyze(mut &a, "explain analyze select count(*) from big b join small s on b.sid = s.id where b.id < 5 and s.label = 'l3'")
+    analyze(mut &a, "explain analyze select count(*) from big a join big b on b.id = a.sid where a.id between 10 and 12")
+    analyze(mut &a, "explain analyze select count(*) from big a join big b on b.id = a.sid where a.pad = 'none'")
+    println("-- 4. a LIMIT or EXISTS keeps lookups: no hash built for one row")
+    analyze(mut &a, "explain analyze select a.id from big a join big b on b.id = a.id limit 1")
+    analyze(mut &a, "explain analyze select 1 where exists (select 1 from big a join big b on b.id = a.id)")
+    println("-- 5. in a block that writes, the order bound by keys: no whole-table read, no conflict with B's write")
+    show(mut &a, "create table cust (id int primary key, name text)")
+    show(mut &a, "insert into cust select g, 'c' || g from generate_series(1, 50) g")
+    show(mut &a, "create table ord (id int primary key, cid int, note text)")
+    show(mut &a, "insert into ord select g, g % 50 + 1, 'n' from generate_series(1, 5000) g")
+    show(mut &a, "create index ord_cid on ord (cid)")
+    show(mut &a, "create table log (id int primary key, what text)")
+    show(mut &a, "analyze")
+    show(mut &a, "begin")
+    show(mut &a, "explain select count(*) from ord o join cust c on c.id = o.cid where o.id < 20")
+    show(mut &a, "select count(*) from ord o join cust c on c.id = o.cid where o.id < 20")
+    show(mut &a, "insert into log values (1, 'a')")
+    print("B: ")
+    show(mut &b, "update cust set name = 'zz' where id = 45")
+    show(mut &a, "commit")
+    println("-- 6. the first table in batches wherever FROM put it")
+    analyze(mut &a, "explain analyze select count(*) from small s join big b on b.sid = s.id where b.v = 3")
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(5), lexdb_store.Options{cacheBytes: 128 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000, bufferedPages: false}, body).unwrap()
+}
