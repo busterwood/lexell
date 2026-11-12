@@ -1,71 +1,98 @@
 # lexdb against PostgreSQL: where it stands and what is missing
 
-Status: a review taken on 2026-11-10, at commit 238ff702 (branch `lexdb`,
-after window functions, design/lexdb.md 9.46). The order of work at the end
-is a proposal; the choices in it are the user's.
+Status: a review taken on 2026-11-12, at commit 9133e91a (branch `lexdb`,
+after design/lexdb.md 9.91), brought up to date for 9.92 (merged as
+ffc59ecc). It replaces the review of 2026-11-10 (commit
+238ff702, after 9.46). The order of work at the end is a proposal; the
+choices in it are the user's.
 
-**How it was taken.** About 130 statements were sent through psql to a fresh
-lexdb server. They cover the features ordinary applications, ORMs and tools
-use: types, data changes, query forms, functions, DDL, transactions and the
-catalogs. Each was recorded as accepted or failed, with its error. Where
-PostgreSQL's behaviour was in question, a scratch PostgreSQL 16 on the same
-machine was the reference. The measurements are design/lexdb.md's (9.45 and
-9.46).
+**How it was taken.** About 200 statements were sent one at a time through
+psql to a fresh lexdb server. They cover:
+- every gap the first review listed;
+- the functions applications use most;
+- the statements tools send.
 
-## 1. What lexdb has
+Each statement was recorded as accepted or failed, with its error.
+Answers were not compared with PostgreSQL here: the suites that
+`tests/lexdb/gen_pg.py` generates from PostgreSQL 18 do that, feature by
+feature.
 
-- **Storage:**
-  - an on-disk B+tree with a write-ahead log, checkpoints and snapshots;
-  - crash tests on a simulated disk and through the wire protocol (9.18);
-  - readers never wait for writers, nor writers for readers (9.16).
-- **The wire protocol:**
-  - the simple and extended query protocols;
-  - plans kept per prepared statement;
-  - query cancel;
-  - COPY IN and OUT.
+## 1. Closed since the first review (9.75 to 9.92)
 
-  psql and the usual client libraries connect unchanged.
-- **Queries:**
-  - inner, left, right and full joins, and LATERAL;
-  - subqueries, correlated ones included;
-  - CTEs, recursive ones included;
-  - UNION, INTERSECT and EXCEPT;
-  - GROUP BY and HAVING;
-  - aggregates with FILTER and ORDER BY;
-  - window functions;
-  - CASE, generate_series, unnest, and `op ANY/ALL (array)`;
-  - ORDER BY with NULLS FIRST / LAST;
-  - EXPLAIN, and EXPLAIN ANALYZE with row counts.
-- **Data changes:**
-  - INSERT, UPDATE and DELETE, with WITH before them;
-  - INSERT ... SELECT;
-  - RETURNING;
-  - COPY, text and CSV.
-- **Tables and indexes:**
-  - indexes: unique, partial and multi-column;
-  - schemas;
-  - ALTER TABLE: add, drop, rename and retype columns; SET SCHEMA;
-  - defaults;
-  - UNIQUE, CHECK and FOREIGN KEY constraints, with CASCADE, SET NULL and
-    SET DEFAULT;
-  - sequences, SERIAL and identity columns.
+- **Types:**
+  - date, time, timestamp, timestamptz and interval, with their operators,
+    `extract`, `date_trunc` and `age` (9.76);
+  - `real` and `double precision` (9.79);
+  - `bytea`, and `uuid` with `gen_random_uuid()` (9.78);
+  - enum types (9.90).
+- **The catalogs:** `pg_catalog` and `information_schema`, as far as
+  SQLAlchemy, psycopg, Alembic, Django and psql use them (9.80). So these
+  now work:
+  - psql's `\d` commands;
+  - `version()`, `current_user` and `SHOW server_version`;
+  - the reg types.
+- **Writes:**
+  - `INSERT ... ON CONFLICT` (9.77);
+  - `UPDATE ... FROM`, `DELETE ... USING`, an alias on their target, and
+    `TRUNCATE` (9.91).
 - **Transactions:**
-  - read-write transactions are serializable;
-  - read-only transactions run on a snapshot;
-  - `statement_timeout` and `max_statement_mem`.
-- **Types:** int2, int4 and int8, numeric, text and varchar, bool, and
-  one-dimensional arrays.
+  - savepoints (9.80);
+  - `SELECT ... FOR UPDATE / SHARE`, with NOWAIT and SKIP LOCKED;
+  - advisory locks (9.86);
+  - deferrable foreign keys and `SET CONSTRAINTS` (9.85).
+- **Logins:**
+  - SCRAM-SHA-256 and TLS (9.81);
+  - roles, owners, `GRANT` and `REVOKE`, and `SET ROLE` (9.83).
+- **Tables and indexes:**
+  - views, read-only (9.82);
+  - tables without a primary key, `CREATE TABLE AS` and `SELECT INTO`
+    (9.88);
+  - indexes on expressions (9.89);
+  - index options and `CONCURRENTLY` (9.85).
+- **Queries:**
+  - `VALUES` as a query;
+  - `~` and its kin;
+  - subscripts, `ARRAY(subquery)` and set-returning functions in a select
+    list (9.80);
+  - `array_agg` (9.78);
+  - the bitwise operators (9.85).
+- **Functions and operators** (9.79, 9.92). Almost all that the first
+  review and the probe listed:
+  - the regular expression functions and `substring(x from pattern)`;
+  - the string functions, `format`, and the SQL forms of `position`,
+    `overlay` and `substring`;
+  - math with `^`, and numeric versions of `sqrt`, `exp`, `ln`, `log` and
+    `power`;
+  - the array functions, `@>`, `<@` and `&&`, and `||` on arrays (which
+    gave text before);
+  - `current_setting` and `set_config`, `pg_backend_pid` and
+    `txid_current`;
+  - `to_char`, `to_number`, `to_date` and `to_timestamp`.
+- **COPY:**
+  - COPY TO is sent as it runs (9.84);
+  - COPY FROM is read as it comes, and `batch_rows` bounds a large load
+    (9.87).
+- **Replication:** read-only replicas on the same machine (9.68 to 9.73).
 
-**Speed.** On 1M rows lexdb is about 2 to 5 times slower than PostgreSQL 16:
+**Speed** (9.67, PostgreSQL 18 on the same machine, all the data in
+memory):
 
-| Operation | Slower by |
+| Measure | lexdb against PostgreSQL |
 |---|---|
-| COPY load | about 2 times |
-| COPY dump | about 3.5 times |
-| Window queries | 3.5 to 5 times |
+| Point selects, 1 client | 1.18 times faster |
+| Point selects, 8 clients | 0.36 times |
+| Point selects, 32 clients | 0.24 times |
+| Updates | the same, within 3% |
+| Aggregates against one PostgreSQL core | 1.1 to 1.8 times faster |
+| Aggregates against PostgreSQL's two workers | 1.2 to 1.9 times slower on four queries of five |
+| Loads | PostgreSQL 1.7 times faster |
 
-The cost is the executor's work per row, not COPY's or the windows' own: item
-11 of design/lexdb.md 9.4 (batches, not rows).
+Points to note:
+- Point selects lose with many clients because lexdb runs one SQL thread
+  by design, while PostgreSQL runs a process per connection.
+- Updates are bound by the drive.
+- Loads (9.84, 9.87): COPY of 1M rows takes about 1.1 s, against
+  PostgreSQL's 0.6 to 0.9 s.
 
 ## 2. What is missing
 
@@ -73,126 +100,141 @@ In three tiers, by how soon a real application meets the gap.
 
 ### 2.1 Tier 1: almost every application or tool meets these
 
-1. **Types.**
-   - There is no date or time type at all. `timestamp`, `timestamptz`,
-     `date`, `interval`, `now()` and `current_timestamp` all fail. This is
-     the largest gap: nearly every real schema has a timestamp column.
-   - Also missing: `float8`/`real`, `bytea`, `uuid` (and
-     `gen_random_uuid()`), `json`/`jsonb`, and `char(n)`.
-2. **The system catalogs**, `pg_catalog` and `information_schema`. Without
-   them:
-   - psql's `\d` commands fail;
-   - ORMs cannot inspect a schema, nor migration tools check one;
-   - GUI tools (DBeaver, pgAdmin) cannot list tables;
-   - `pg_dump` cannot back the database up.
+1. **json and jsonb.** There is no type: `->`, `->>`, `@>`, `json_agg`,
+   `row_to_json` and the rest all fail. `json_build_object` alone exists,
+   for the catalog's queries.
+   - It is the last thing Alembic's probe stopped at (9.90), and Django's
+     JSONField needs it.
+   - Waiting is the user's decision (9.85).
+2. **Time zones.** `SET timezone` is accepted and ignored: `SHOW timezone`
+   stays `UTC`, and timestamptz is always shown in UTC. Now that there are
+   time types this gives silently wrong output, which is worse than an
+   error.
+   - `AT TIME ZONE` and `timezone()` fail.
+   - The zone rules exist already (`tz.instantOf`, 9.76).
+3. **What 9.92 left of the functions:**
+   - `SIMILAR TO`, and `substring(x from pattern for escape)`;
+   - `LIKE ANY (array)`;
+   - the row constructor `row(...)`;
+   - multi-dimensional arrays, `array_fill` and `array_sort`.
 
-   `current_user`, `current_setting()` and `SHOW server_version` are missing
-   too. Whether to emulate the catalogs is an open decision (design/lexdb.md
-   section 0).
-3. **Upsert and joined writes.** These are syntax errors:
-   - `INSERT ... ON CONFLICT` (DO UPDATE and DO NOTHING);
-   - `UPDATE ... FROM`;
-   - `DELETE ... USING`;
-   - `TRUNCATE`.
-4. **Savepoints and row locks.**
-   - `SAVEPOINT` and `ROLLBACK TO`: ORMs use them for nested transactions,
-     psql for its `ON_ERROR_ROLLBACK`.
-   - `SELECT ... FOR UPDATE`, common in ORM code.
-5. **Functions and operators.** Each is small; together they are much of
-   everyday SQL.
-   - Regular expressions: the `~` operator and the `regexp_*` functions.
-   - Strings: `lpad`, `split_part`, `repeat`, `position(... in ...)`,
-     `concat_ws`, `md5`, `format`, `chr`, `ascii`, `initcap`, `reverse`,
-     `starts_with`, `to_hex`.
-   - Math: `sqrt`, `power`, `floor`, `ceil`, `mod`, `div`, `trunc`, `sign`,
-     `exp`, `ln`, `random`.
-   - Operators: `^`, and the bitwise `&`, `|`, `<<` and `>>`.
-   - Arrays: subscripts (`a[1]`), `array_agg`, `array_length`.
-   - Formatting: `to_char`.
-6. **Logins and encryption.** There is no authentication (SCRAM) and no TLS,
-   so lexdb is safe only on the loopback address (item 9 of 9.4).
+   Regular expressions are RE2's: no back-references inside a pattern and
+   no lookahead, where PostgreSQL's have both (9.92).
+4. **`char(n)` and `character(n)`** are refused. They are common in older
+   schemas and in pg_dump's output.
 
 ### 2.2 Tier 2: common, each with a workaround
 
 - **Tables:**
-  - every table needs a primary key, and one cannot be added later;
-  - no `CREATE TABLE ... AS`;
-  - no temporary tables;
-  - no generated columns;
-  - no indexes on expressions, such as `lower(a)`;
-  - no views, plain or materialized.
+  - `ADD PRIMARY KEY` on a table made without one (a table's key cannot
+    change, 9.88);
+  - temporary tables (`CREATE TEMP TABLE`);
+  - generated columns;
+  - materialized views;
+  - views are read-only, and a rename of a table one reads is refused
+    (9.82);
+  - `CREATE INDEX` without a name (`CREATE INDEX ON t (a)`), which
+    PostgreSQL names itself.
 - **Queries:**
-  - no `VALUES` as a query;
-  - no `JOIN ... USING` or `NATURAL JOIN`;
-  - no `DISTINCT ON`;
-  - no `FETCH FIRST`;
-  - no row comparisons, `(a, b) < (c, d)`;
-  - no `BETWEEN SYMMETRIC` or `SIMILAR TO`;
-  - no `ROLLUP`, `CUBE` or `GROUPING SETS`. ROLLUP gives a misleading
-    error ("must appear in the GROUP BY clause") rather than "not
-    supported".
+  - `JOIN ... USING` and `NATURAL JOIN`;
+  - `DISTINCT ON`;
+  - `FETCH FIRST n ROWS ONLY`;
+  - row comparisons, `(a, b) < (c, d)`;
+  - `BETWEEN SYMMETRIC` and `SIMILAR TO`;
+  - `ROLLUP`, `CUBE` and `GROUPING SETS`. ROLLUP and CUBE still give a
+    misleading error ("must appear in the GROUP BY clause") rather than
+    "not supported".
 - **Data-modifying CTEs:** `WITH d AS (DELETE ... RETURNING ...)`.
-- **User-defined types:** enum types and domains.
-- **Comments:** `COMMENT ON`.
+- **User-defined types:**
+  - domains;
+  - arrays of an enum, enum renames, and `DROP TYPE ... CASCADE` (9.90).
+- **Comments:** `COMMENT ON`. `obj_description` exists but gives nothing.
 - **Statement-level SQL:**
   - `PREPARE` and `EXECUTE` (the protocol's prepared statements work);
   - cursors, `DECLARE` and `FETCH`;
   - `LISTEN` and `NOTIFY`;
   - `LOCK TABLE`.
-- **Collations:** `COLLATE` is not supported; text compares by bytes.
-- **Settings accepted silently:**
-  - `BEGIN ISOLATION LEVEL READ COMMITTED` runs serializable. That is
-    stricter, so applications written for read committed meet more
-    serialization failures to retry.
-  - `SET timezone` is accepted, with no time types for it to affect.
+- **Maintenance statements:** `VACUUM`, `ANALYZE`, `CHECKPOINT`,
+  `REINDEX` and `CLUSTER` are syntax errors. Scripts and tools send
+  them; accepting them as doing nothing would be enough for most.
+- **Isolation levels.** `BEGIN ISOLATION LEVEL READ COMMITTED` is accepted
+  and runs serializable (`SHOW transaction_isolation` says so).
+  Applications written for read committed meet more serialization
+  failures to retry. Row locks (9.86) remove the common case.
+- **Locks:**
+  - no `lock_timeout`;
+  - `statement_timeout` does not end a wait for a lock;
+  - no `pg_locks`.
+- **Collations:** `COLLATE` is read and ignored; text compares by bytes.
+- **Privileges** (9.83):
+  - column privileges;
+  - `WITH GRANT OPTION`;
+  - `ALTER DEFAULT PRIVILEGES`;
+  - row security.
+- **Binary formats:** asyncpg, JDBC and psycopg's binary mode need them
+  for results and COPY. They were planned last of 9.75's stages.
 
 ### 2.3 Tier 3: large subsystems, likely out of scope unless wanted
 
-- User functions and procedures (SQL and PL/pgSQL), `DO` blocks, triggers,
-  and `$$` quoting.
-- Roles, `GRANT`, and more than one database per server.
-- Partitioning, replication, extensions, and full-text search with its own
-  index types.
-- A cost-based planner: left for now by the user (section 0).
-- Parallel query: lexdb has one SQL thread by design.
+- **Procedural code:** user functions and procedures (SQL and PL/pgSQL),
+  `DO` blocks, triggers, and `$$` quoting.
+- **Databases and authentication:**
+  - more than one database per server (`current_database()` is always
+    `lexdb`);
+  - `pg_hba.conf`-style rules.
+- **Large subsystems:**
+  - partitioning;
+  - extensions;
+  - full-text search;
+  - `TABLESAMPLE`;
+  - replication to another machine.
+- **The planner and parallelism:**
+  - a cost-based planner: left for now by the user (section 0);
+  - parallel query: lexdb has one SQL thread by design.
 
 ### 2.4 Not SQL features
 
-- **Memory.** Results and COPY output are held whole in memory: dumping 1M
-  rows peaked at about 1 GB. Streaming results would fix both.
+- **Wrong types:** `percent_rank` and `cume_dist` return numeric, though
+  double precision now exists. (The probe's other wrong answer, `||` on
+  arrays, was fixed in 9.92.)
 - **Errors:**
-  - DETAIL is folded into the message rather than sent as its own field;
-  - no error position is sent, so psql shows no `LINE` and caret;
-  - `percent_rank` and `cume_dist` return numeric, as there is no float
-    type.
+  - DETAIL and HINT are folded into the message rather than sent as their
+    own fields;
+  - no error position is sent, so psql shows no `LINE` and caret.
+- **Memory:**
+  - a query that sorts, groups or uses a window is made whole before it
+    is sent (9.84; plain queries and COPY stream);
+  - a transaction's writes stay in memory until its commit, about 176
+    bytes a row (9.84);
+  - a large `CREATE TABLE AS` holds its result while it inserts (9.88).
 - **Storage** (items 8 and 10 of 9.4):
   - no compression;
-  - the file never shrinks;
-  - the checkpoint pause under a heavy write load.
-- **Speed:** batches rather than rows, and SIMD on top. SIMD needs a Lexell
-  language or runtime change: the user's decision (items 11 and 12 of 9.4).
+  - the file never shrinks.
+- **Speed:** SIMD needs a Lexell language or runtime change: the user's
+  decision (item 12 of 9.4).
 
 ## 3. A proposed order
 
-1. **Date and time types, and float8.** They unblock the most real schemas.
-   The largest item, mostly for the time-zone rules.
-2. **Upsert and its kin:** ON CONFLICT, UPDATE ... FROM, DELETE ... USING,
-   TRUNCATE and SAVEPOINT. Moderate in size; ORMs need them. The easy Tier
-   2 items can come with them:
-   - `VALUES` as a query;
-   - `JOIN ... USING`;
+1. **Time zones:** `SET timezone`, `AT TIME ZONE`, and timestamptz shown in
+   the session's zone. Small now that the rules exist, and it removes a
+   silent wrong answer.
+2. **The small Tier 2 query forms,** each cheap and each checkable against
+   PostgreSQL:
+   - `JOIN ... USING` and `NATURAL JOIN`;
    - `DISTINCT ON`;
    - `FETCH FIRST`;
-   - `CREATE TABLE ... AS`;
-   - tables without a primary key.
-3. **A sweep of functions:** regular expressions, strings, math and arrays.
-   Each is cheap, and each can be checked against PostgreSQL 16 itself.
-4. **A minimal `pg_catalog` and `information_schema`**, enough for psql's
-   `\d` and the common drivers. This waits for the user's decision.
-5. **Streaming results.**
-6. **SCRAM and TLS**, before lexdb listens beyond loopback.
+   - row comparisons;
+   - `char(n)`;
+   - an unnamed `CREATE INDEX`;
+   - `SIMILAR TO` and `LIKE ANY`;
+   - `percent_rank` as double precision;
+   - the maintenance statements accepted as doing nothing.
+3. **json and jsonb,** when the user decides.
+4. **Binary formats,** for asyncpg and JDBC.
+5. **Data-modifying CTEs, temporary tables and generated columns.**
 
 **Open questions for the user:**
 - Is this order right?
-- Should lexdb emulate the catalogs at all? That decides whether psql's
-  `\d`, GUI tools and `pg_dump` will ever work against it.
+- When should json come?
+- Should `READ COMMITTED` stay serializable underneath? Or should it be
+  refused, or built?
