@@ -12,6 +12,9 @@
 //   (x > 50): one plan for true (60, then 70 takes it again), one for false;
 // - a plan kept under a schema version made in A's block that rolled back
 //   is not taken for the version B commits next (9.54);
+// - after ANALYZE, kind = $1 and uid = $2 plans per value of kind (9.56):
+//   kind 1 is 99% of the rows (its common value), kind 2 1% (no row of it has
+//   uid 5); a value of the same scale takes its plan again;
 // - A in a block begun before B drops and remakes a table keeps the plan
 //   its snapshot's schema matches and sees the old rows; after COMMIT it
 //   plans again and sees the new table;
@@ -25,6 +28,7 @@
 // expect: partial index: 5 12, plans 2
 // expect: partial index again: 4, plans 2
 // expect: rolled-back version: 10 10, plans 3
+// expect: per value: 10 0 10, plans 2
 // expect: block before the drop: 3 3, plans 1
 // expect: after commit: 0, plans 2
 // expect: run once: plans 0
@@ -129,6 +133,18 @@ fn main() {
         one(mut &b, &"drop index w_k")
         let w3 = run(mut &a, &qw, &[Val.Int(3)], mut &pcw)
         println("rolled-back version: " + w1 + " " + w3 + ", plans " + pcw.plans.toStr())
+
+        one(mut &b, &"create table e (id int primary key, kind int, uid int)")
+        one(mut &b, &"insert into e select g, case when g <= 990 then 1 else 2 end, g % 100 from generate_series(1, 1000) g")
+        one(mut &b, &"create index e_kind on e (kind)")
+        one(mut &b, &"create index e_uid on e (uid)")
+        one(mut &b, &"analyze e")
+        let qe = stmt(&"select count(*) from e where kind = $1 and uid = $2")
+        var pce = lexdb_exec.newPlanCache()
+        let e15 = run(mut &a, &qe, &[Val.Int(1), Val.Int(5)], mut &pce)
+        let e25 = run(mut &a, &qe, &[Val.Int(2), Val.Int(5)], mut &pce)
+        let e17 = run(mut &a, &qe, &[Val.Int(1), Val.Int(7)], mut &pce)
+        println("per value: " + e15 + " " + e25 + " " + e17 + ", plans " + pce.plans.toStr())
 
         one(mut &b, &"create table u (x int primary key)")
         one(mut &b, &"insert into u values (1), (2), (3)")

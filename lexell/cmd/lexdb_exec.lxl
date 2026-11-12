@@ -3467,6 +3467,30 @@ fn nextVersion(v: &str): str {
 
 fn statKey(name: &str): str { return "\x05" + name }
 
+// A key's bytes as hex, and back (the statistics' text row).
+fn toHex(s: &str): str {
+    let digits = "0123456789abcdef"
+    var b = newStrBuf()
+    for i in 0..len(s) {
+        b.addByte(digits[int(s[i]) / 16])
+        b.addByte(digits[int(s[i]) % 16])
+    }
+    return b.toStr()
+}
+
+fn fromHex(s: &str): str {
+    var b = newStrBuf()
+    var i = 0
+    while i + 1 < len(s) {
+        let hi = hexVal(s[i])
+        let lo = hexVal(s[i + 1])
+        if hi < 0 || lo < 0 { return "" }
+        b.addByte(byte(hi * 16 + lo))
+        i += 2
+    }
+    return b.toStr()
+}
+
 // The statistics' version: a row ANALYZE bumps, apart from the catalog's, so
 // that statements that read the catalog's version do not conflict with an
 // ANALYZE. It is read unnoted (getUnnoted), as the statistics are: they
@@ -3502,15 +3526,26 @@ fn loadEst(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table): Result
     let v = got.unwrap()
     let parts = strings.split(&v, ";")
     if len(parts) < 2 || strings.parseIntOpt(parts[0].toStr()).unwrapOr(-1) != t.tree { return Ok(noEst()) }
-    var es = Est{rows: strings.parseIntOpt(parts[1].toStr()).unwrapOr(-1), trees: [], entries: [], dist: []}
+    var es = Est{rows: strings.parseIntOpt(parts[1].toStr()).unwrapOr(-1), trees: [], entries: [], dist: [], cm: []}
     for i in 2..len(parts) {
         let f = strings.split(parts[i], ":")
-        if len(f) != 3 { continue }
+        if len(f) < 3 { continue }
         var ds: []int = []
         for x in strings.split(f[2], ",") { append(mut &ds, strings.parseIntOpt(x.toStr()).unwrapOr(0)) }
+        let ents = strings.parseIntOpt(f[1].toStr()).unwrapOr(0)
+        var cm = Common{entries: ents, d: if len(ds) > 0 { ds[0] } else { -1 }, keys: [], cnts: []}
+        if len(f) >= 4 && len(f[3]) > 0 {
+            for kv in strings.split(f[3], ",") {
+                let eq = strings.indexOf(kv, "=", 0)
+                if eq < 0 { continue }
+                append(mut &cm.keys, fromHex(&kv[0..eq]))
+                append(mut &cm.cnts, strings.parseIntOpt(kv[eq + 1..len(kv)].toStr()).unwrapOr(0))
+            }
+        }
         append(mut &es.trees, strings.parseIntOpt(f[0].toStr()).unwrapOr(-1))
-        append(mut &es.entries, strings.parseIntOpt(f[1].toStr()).unwrapOr(0))
+        append(mut &es.entries, ents)
         append(mut &es.dist, ds)
+        append(mut &es.cm, cm)
     }
     return Ok(es)
 }
@@ -3584,7 +3619,10 @@ fn analyzeTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, snap: mut &le
                 var b = newStrBuf()
                 for j in 0..len(t.indexes[i].cols) {
                     encIdxPart(mut &b, &r[t.indexes[i].cols[j]])
-                    if seen[i][j].size() < ANALYZE_DISTINCT_MAX { seen[i][j].put(b.toStr(), 1) }
+                    let k = b.toStr()
+                    // the leading column's values are counted (its common values, 9.56)
+                    let n = if j == 0 { seen[i][j].getOr(&k, 0) } else { 0 }
+                    if n > 0 || seen[i][j].size() < ANALYZE_DISTINCT_MAX { seen[i][j].put(k, n + 1) }
                 }
             }
         }
@@ -3595,6 +3633,40 @@ fn analyzeTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, snap: mut &le
         var ds: []str = []
         for m in seen[i] { append(mut &ds, m.size().toStr()) }
         out.add(";" + t.indexes[i].tree.toStr() + ":" + entries[i].toStr() + ":" + strings.join(&ds, ","))
+        // the most common values of its leading column: above the average,
+        // at most COMMON_MAX, as hex=count (9.56)
+        if len(seen[i]) > 0 && seen[i][0].size() > 0 {
+            let m = &seen[i][0]
+            let avg = entries[i] / m.size()
+            var keys: []str = []
+            var cnts: []int = []
+            for x in 0..m.size() {
+                let c = m.getOr(m.keyAt(x), 0)
+                if c <= avg { continue }
+                // insert in count order, the largest first; the list stays at COMMON_MAX
+                var at = len(cnts)
+                while at > 0 && cnts[at - 1] < c { at -= 1 }
+                if at >= COMMON_MAX { continue }
+                append(mut &keys, m.keyAt(x).toStr())
+                append(mut &cnts, c)
+                var j = len(cnts) - 1
+                while j > at {
+                    let kk = replace(mut &keys[j - 1], "")
+                    keys[j - 1] = replace(mut &keys[j], kk)
+                    let cc = cnts[j - 1]
+                    cnts[j - 1] = cnts[j]
+                    cnts[j] = cc
+                    j -= 1
+                }
+                if len(cnts) > COMMON_MAX {
+                    let dk = pop(mut &keys)
+                    let dc = pop(mut &cnts)
+                }
+            }
+            var parts: []str = []
+            for x in 0..len(keys) { append(mut &parts, toHex(&keys[x]) + "=" + cnts[x].toStr()) }
+            out.add(":" + strings.join(&parts, ","))
+        }
     }
     try txn.put(CATALOG, statKey(&t.name), out.toStr())
     return Ok(Unit{})
@@ -3737,24 +3809,112 @@ type Path = record {
 const IN_LOOKUP_MAX: int = 1000
 
 // ANALYZE's statistics for a table (9.54): its rows, and per index (by its
-// tree) its entries and the distinct values of each leading prefix of its
-// columns (a NULL counted as a value). rows -1: none (no ANALYZE, an ANALYZE of
-// an older table of the name, or SET lexdb_planner = rules).
-type Est = record { rows: int; trees: []int; entries: []int; dist: [][]int }
+// tree) its entries, the distinct values of each leading prefix of its
+// columns (a NULL counted as a value), and its leading column's most common
+// values (cm, 9.56). rows -1: none (no ANALYZE, an ANALYZE of an older table
+// of the name, or SET lexdb_planner = rules).
+type Est = record { rows: int; trees: []int; entries: []int; dist: [][]int; cm: []Common }
 
-fn noEst(): Est { return Est{rows: -1, trees: [], entries: [], dist: []} }
+fn noEst(): Est { return Est{rows: -1, trees: [], entries: [], dist: [], cm: []} }
 
-// The rows an index path with eqs leading equalities is expected to read
-// (its entries over the distinct values of that prefix); -1 unknown.
-fn (es: &Est) eqRows(tree: int, eqs: int): int {
+// An index's leading column (9.56): its entries, its distinct values, and its
+// most common values (their encoded index parts) with their exact counts:
+// those above the average, at most COMMON_MAX. d -1: unknown.
+type Common = record { entries: int; d: int; keys: []str; cnts: []int }
+
+fn noCommon(): Common { return Common{entries: 0, d: -1, keys: [], cnts: []} }
+
+const COMMON_MAX: int = 16
+
+// The rows expected equal to key (an encoded index part; "" unknown): its
+// count when it is a common value, else the average of the other values.
+fn rowsOf(cm: &Common, key: &str): int {
+    if cm.d <= 0 { return -1 }
+    if len(key) > 0 && len(cm.keys) > 0 {
+        let k = key.toStr()
+        var inCommon = 0
+        for j in 0..len(cm.keys) {
+            if cm.keys[j] == k { return cm.cnts[j] }
+            inCommon += cm.cnts[j]
+        }
+        let rest = cm.d - len(cm.keys)
+        if rest <= 0 { return 0 }
+        return (cm.entries - inCommon + rest - 1) / rest
+    }
+    return (cm.entries + cm.d - 1) / cm.d
+}
+
+// The rows an index path with eqs leading equalities is expected to read, the
+// first equal to key ("" unknown): with one equality, by the common values;
+// else its entries over the distinct values of that prefix. -1 unknown.
+fn (es: &Est) rowsFor(tree: int, eqs: int, key: &str): int {
     if es.rows < 0 || eqs <= 0 { return -1 }
     for i in 0..len(es.trees) {
         if es.trees[i] == tree && eqs <= len(es.dist[i]) {
+            if eqs == 1 { return rowsOf(&es.cm[i], key) }
             let d = es.dist[i][eqs - 1]
             if d > 0 { return (es.entries[i] + d - 1) / d }
         }
     }
     return -1
+}
+
+// A copy of an index's common values, for a look (9.56).
+fn (es: &Est) commonOf(tree: int): Common {
+    for i in 0..len(es.trees) {
+        if es.trees[i] == tree {
+            let c = &es.cm[i]
+            var n: []int = []
+            for x in c.cnts { append(mut &n, x) }
+            return Common{entries: c.entries, d: c.d, keys: copyStrs(&c.keys), cnts: n}
+        }
+    }
+    return noCommon()
+}
+
+// The encoded index part of a constant equality value: a literal, or one of
+// the statement's parameters, coerced to the column's type. "" when it is
+// neither (a value from another table, an outer value), NULL, or not of the type.
+fn constKey(x: &Expr, typ: &lexdb_sql.TypeName, params: &[]Val): str {
+    var v = Val.Null
+    match x {
+        Expr.Lit(l) { v = l }
+        Expr.Param(n) {
+            if n < 1 || n > len(params) { return "" }
+            v = params[n - 1]
+        }
+        else { return "" }
+    }
+    if isNull(&v) { return "" }
+    match coerce(v, &boundType(typ)) {
+        Ok(cv) {
+            var b = newStrBuf()
+            encIdxPart(mut &b, &cv)
+            return b.toStr()
+        }
+        Err(_) { return "" }
+    }
+}
+
+// An estimate's scale: the looks compare scales, so values whose estimates
+// are within about a factor of two share a plan.
+fn scaleOf(n: int): int {
+    var s = 0
+    var x = n + 1
+    while x > 1 {
+        x = x / 2
+        s += 1
+    }
+    return s
+}
+
+// The expected rows of a level's index path, its first equality's value known
+// when it is constant (EXPLAIN).
+fn pathEst(lv: &Level, p: &Path, params: &[]Val): int {
+    if p.index < 0 || len(p.eqs) == 0 || len(p.ins) > 0 || p.inSub >= 0 || len(p.inArr) > 0 { return -1 }
+    let col = lv.t.indexes[p.index].cols[0]
+    let key = constKey(&p.eqs[0], &lv.t.cols[col].typ, params)
+    return lv.est.rowsFor(lv.t.indexes[p.index].tree, len(p.eqs), &key)
 }
 
 type Scan = record {
@@ -3791,6 +3951,7 @@ pub type Level = record {
     keeps: bool             // the path is chosen for ORDER BY or MIN/MAX: no switch to a scan (9.53)
     est: Est                // its table's statistics from ANALYZE, for choosePath (9.54)
     stops: bool             // the first table's reading may stop early (a LIMIT, EXISTS): no switch to a scan (9.53)
+    estRows: int            // its path's expected rows (EXPLAIN); -1 unknown (9.56)
 }
 
 // A level of rows held by the run (a subquery's, a working table), not a table's.
@@ -4347,19 +4508,26 @@ fn mentions(x: &Expr, col: &str): bool {
 // (Scope.looks) with what it gave; select() keeps the plan with them and takes
 // it again only for parameters that give the same (looksHold). So a statement
 // keeps a plan per outcome, at most PLAN_VARIANTS.
-type Look = record { implies: bool; c: Expr; p: Expr; out: int }
+// kind 0: an implication (c implies p; out 1 yes); 1: a LIMIT or OFFSET (c;
+// out its value); 2: an estimate (c a parameter equal to an index's leading
+// column of type typ, its common values cm; out the estimate's scale, 9.56).
+type Look = record { kind: int; c: Expr; p: Expr; out: int; typ: lexdb_sql.TypeName; cm: Common }
+
+fn noType(): lexdb_sql.TypeName { return lexdb_sql.TypeName{kind: 0, oid: 0, prec: 0, scale: 0, len: 0} }
 
 fn impliesOne(c: &Expr, p: &Expr, params: &[]Val, lk: mut &[]Look): bool {
     let r = impliesRaw(c, p, params)
-    if len(params) > 0 { append(lk, Look{implies: true, c: clone(c), p: clone(p), out: if r { 1 } else { 0 }}) }
+    if len(params) > 0 { append(lk, Look{kind: 0, c: clone(c), p: clone(p), out: if r { 1 } else { 0 }, typ: noType(), cm: noCommon()}) }
     return r
 }
 
 // Whether the parameters give what the plan's looks gave.
 fn looksHold(ls: &[]Look, params: &[]Val): bool {
     for l in ls {
-        if l.implies {
+        if l.kind == 0 {
             if impliesRaw(&l.c, &l.p, params) != (l.out == 1) { return false }
+        } else if l.kind == 2 {
+            if scaleOf(rowsOf(&l.cm, &constKey(&l.c, &l.typ, params))) != l.out { return false }
         } else {
             let x = Some(clone(&l.c))
             var none: []Look = []
@@ -4565,6 +4733,9 @@ fn choosePath(q: &Query, k: int, cs: &[]Expr, params: &[]Val, lk: mut &[]Look): 
     var best = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: []}
     var bestScore = 0
     var bestEst = -1                    // the best's expected rows from ANALYZE (9.54); -1 unknown
+    var scores: []int = []              // per candidate considered, and its estimate's look if a parameter set it (9.56)
+    var pend: []Look = []
+    var pendScore: []int = []
     for c0 in 0..len(lv.t.indexes) + 1 {
         let c = c0 - 1
         if !q.usable(k, c, cs, params, lk) { continue }
@@ -4611,12 +4782,34 @@ fn choosePath(q: &Query, k: int, cs: &[]Expr, params: &[]Val, lk: mut &[]Look): 
         } else if hasIn && len(eqs) + 1 == len(cols) {
             if c < 0 { score = 500 } else if lv.t.indexes[c].unique { score = 499 }
         }
-        // statistics (9.54) only break a tie the rules leave: the fewer rows
-        let est = if c >= 0 && !hasIn { lv.est.eqRows(lv.t.indexes[c].tree, len(eqs)) } else { -1 }
+        // statistics (9.54) only break a tie the rules leave: the fewer rows,
+        // by the first equality's value when it is known (9.56)
+        var est = -1
+        if c >= 0 && !hasIn && len(eqs) > 0 && lv.est.rows >= 0 {
+            let tree = lv.t.indexes[c].tree
+            let typ = boundType(&lv.t.cols[cols[0]].typ)
+            let key = constKey(&eqs[0], &typ, params)
+            est = lv.est.rowsFor(tree, len(eqs), &key)
+            let byParam = match eqs[0] { Expr.Param(_) { true } else { false } }
+            if byParam && len(eqs) == 1 && est >= 0 {
+                append(mut &pend, Look{kind: 2, c: clone(&eqs[0]), p: Expr.Lit(Val.Null), out: scaleOf(est), typ: typ, cm: lv.est.commonOf(tree)})
+                append(mut &pendScore, score)
+            }
+        }
+        append(mut &scores, score)
         if score > bestScore || (score == bestScore && score > 0 && est >= 0 && bestEst >= 0 && est < bestEst) {
             bestScore = score
             bestEst = est
             best = Path{index: c, eqs: eqs, rng: rng, desc: false, noNulls: false, ins: ins, inSub: inSub, inArr: inArr}
+        }
+    }
+    // a parameter's value decided between tied candidates: the estimates that
+    // did are looks, so the plan is kept for values of the same scale (9.56)
+    var tied = 0
+    for x in scores { if x == bestScore { tied += 1 } }
+    if tied >= 2 && bestScore > 0 {
+        for i in 0..len(pend) {
+            if pendScore[i] == bestScore { append(lk, replace(mut &pend[i], Look{kind: 1, c: Expr.Lit(Val.Null), p: Expr.Lit(Val.Null), out: 0, typ: noType(), cm: noCommon()})) }
         }
     }
     return best
@@ -4891,7 +5084,7 @@ fn allTrue(cs: &[]Expr, cols: &[]lexdb_sql.ColDef, row: &[]Val, params: &[]Val):
 fn newLevel(t: Table, alias: str, join: int, first: int): Level {
     return Level{t: t, alias: alias, join: join, first: first, path: Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: []}, cond: [],
                  post: [], local: [], perRow: true, hashCols: [], hashVals: [], src: -1, work: -1, lateral: false, need: [],
-                 lock: 0, lockWait: 0, keeps: false, est: noEst(), stops: false}
+                 lock: 0, lockWait: 0, keeps: false, est: noEst(), stops: false, estRows: -1}
 }
 
 // Plans a query over the tables of FROM (4.8): the tables are joined in the
@@ -5211,6 +5404,8 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
             }
         }
         q.levels[k].path = path
+        let er = pathEst(&q.levels[k], &q.levels[k].path, params)
+        q.levels[k].estRows = er
         q.levels[k].perRow = perRow
         q.levels[k].cond = m
         q.levels[k].post = replace(mut &ps[k], [])
@@ -6460,8 +6655,7 @@ fn pathText(lv: &Level): str {
     }
     let what = if len(p.eqs) == len(cols) { " lookup" } else if len(p.eqs) > 0 || len(p.rng) > 0 { " range" } else { " scan" }
     let filtered = if lv.t.indexes[p.index].pred.isSome() { " (filtered)" } else { "" }
-    let est = lv.est.eqRows(lv.t.indexes[p.index].tree, len(p.eqs))
-    let estText = if est >= 0 { " (estimated " + est.toStr() + " rows)" } else { "" }
+    let estText = if lv.estRows >= 0 { " (estimated " + lv.estRows.toStr() + " rows)" } else { "" }
     return "index " + lexdb_sql.baseName(&lv.t.indexes[p.index].name) + filtered + what + (if p.desc { " backward" } else { "" }) + estText
 }
 
@@ -9107,7 +9301,7 @@ fn evalInt(x: &Option[Expr], params: &[]Val, what: str, lk: mut &[]Look): Result
                 else {}
             }
             // a look (9.55): the plan keeps the value
-            if !lit { append(lk, Look{implies: false, c: clone(&v), p: Expr.Lit(Val.Null), out: n}) }
+            if !lit { append(lk, Look{kind: 1, c: clone(&v), p: Expr.Lit(Val.Null), out: n, typ: noType(), cm: noCommon()}) }
             return Ok(n)
         }
         None { return Ok(-1) }
@@ -10199,6 +10393,8 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         q.levels[0].path.desc = setDesc
         q.levels[0].path.noNulls = setNoNulls
         q.levels[0].keeps = true
+        let er = pathEst(&q.levels[0], &q.levels[0].path, params)
+        q.levels[0].estRows = er
     }
     // a LIMIT may stop the first table's reading early, unless a sort or the
     // grouping reads it all first: the switch stays off (9.53)
