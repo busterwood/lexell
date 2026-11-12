@@ -7,9 +7,12 @@
 //   while producers commit, where the same block with a plain SELECT fails
 //   (40001); two workers moving one offset by compare-and-set: one does;
 // - the refusals: not the block's first statement, the query's shape
-//   (aggregates, no ORDER BY or LIMIT, no index for the cursor, FOR
-//   UPDATE, subqueries, a temporary table, a view), and statement_timeout
-//   ending a wait (57014);
+//   (aggregates, no ORDER BY or LIMIT, no index for the cursor, nextval,
+//   FOR UPDATE, subqueries, a temporary table, a view), and
+//   statement_timeout ending a wait (57014);
+// - filters on other columns: an equality the index does not hold, OR and
+//   a function, and an index's prefix with a filter after it (an event
+//   failing the filter wakes the waiter, which waits on);
 // - a READ ONLY block whose snapshot is the WAITFOR's; a partition's
 //   cursor (an equality, then the cursor, on the key); TIMEOUT $1 given;
 // - four producers numbering their events from a counter row, and a
@@ -24,10 +27,13 @@
 // expect: plain select: BEGIN /  / pause / UPDATE 1 / 40001
 // expect: compare-and-set: updated 1, none 1
 // expect: not first: BEGIN / 1 / 0A000 / ROLLBACK
-// expect: refused: 0A000 0A000 0A000 0A000 0A000 0A000 0A000 0A000 0A000 42P01
+// expect: refused: 0A000 0A000 0A000 0A000 0A000 0A000 0A000 0A000 0A000 0A000 42P01
 // expect: statement_timeout: 57014
 // expect: read only: BEGIN / 7 / 7 / COMMIT
 // expect: partition: 2|2
+// expect: filter: 9|y
+// expect: or and a function: 11|Z
+// expect: prefix and filter: 1|2|b
 // expect: parameter: 1;2 then empty
 // expect: ordered: 40 events, in order t
 // expect: t-sql: 1;2
@@ -153,6 +159,7 @@ fn main() {
         let m7 = one(mut &a, "create table stream (seq bigint primary key, body text)")
         let m8 = one(mut &a, "create table ctr (stream text primary key, n bigint)")
         let m9 = one(mut &a, "insert into ctr values ('o', 0)")
+        let m10 = one(mut &a, "create table pev2 (part int, seq bigint, kind text, primary key (part, seq))")
 
         println("there: " + one(mut &a, "waitfor (select seq from ev where seq > 0 order by seq limit 10), timeout 1000"))
         let t0 = time.monotonicNs()
@@ -231,7 +238,8 @@ fn main() {
         for q in ["waitfor (select count(*) from ev where seq > 0 order by seq limit 1)",
                   "waitfor (select seq from ev where seq > 0 limit 1)",
                   "waitfor (select seq from ev where seq > 0 order by seq)",
-                  "waitfor (select seq from ev where subject = 'x' and seq > 0 order by seq limit 1)",
+                  "waitfor (select seq from ev where payload > 'a' order by payload limit 1)",
+                  "waitfor (select seq from ev where seq > 0 and nextval('s') > 0 order by seq limit 1)",
                   "waitfor (select seq from ev where seq > 0 order by seq desc limit 1)",
                   "waitfor (select seq from ev where seq > 0 order by seq limit 1 for update)",
                   "waitfor (select seq from ev where seq > (select 1) order by seq limit 1)",
@@ -260,6 +268,26 @@ fn main() {
             pause(30)
             let p2 = one(mut &a, "insert into pev values (2, 2)")
             println("partition: " + outOf(fq))
+
+            // filters: rows that fail them wake the waiter, which waits on
+            let ff = sc.start(runJob, job(st, ["waitfor (select seq, subject from ev where seq > 7 and subject = 'y' order by seq limit 5), timeout 5000"]))
+            pause(30)
+            let f8 = one(mut &a, "insert into ev values (8, 'x', 'no')")
+            pause(30)
+            let f9 = one(mut &a, "insert into ev values (9, 'y', 'yes')")
+            println("filter: " + outOf(ff))
+            let fo2 = sc.start(runJob, job(st, ["waitfor (select seq, subject from ev where seq > 9 and (lower(subject) = 'z' or payload like 'hot%') order by seq limit 5), timeout 5000"]))
+            pause(30)
+            let f10 = one(mut &a, "insert into ev values (10, 'q', 'cold')")
+            pause(30)
+            let f11 = one(mut &a, "insert into ev values (11, 'Z', 'x')")
+            println("or and a function: " + outOf(fo2))
+            let fp2 = sc.start(runJob, job(st, ["waitfor (select part, seq, kind from pev2 where part = 1 and seq > 0 and kind = 'b' order by seq limit 5), timeout 5000"]))
+            pause(30)
+            let q1 = one(mut &a, "insert into pev2 values (1, 1, 'a'), (2, 1, 'b')")
+            pause(30)
+            let q2 = one(mut &a, "insert into pev2 values (1, 2, 'b')")
+            println("prefix and filter: " + outOf(fp2))
         })
 
         // TIMEOUT and the cursor as parameters

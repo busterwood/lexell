@@ -15531,24 +15531,29 @@ fn waitConst(x: &Expr): bool {
     }
 }
 
-// Whether an index's columns are the equalities' (in any order), then the
-// cursor's.
+// Whether an index begins with some of the equalities' columns (in any
+// order, none at all), then the cursor's: its rows after the cursor are
+// read in order from one place.
 fn waitFits(cols: &[]int, eqs: &[]int, cur: int): bool {
-    if len(cols) <= len(eqs) || cols[len(eqs)] != cur { return false }
-    for i in 0..len(eqs) {
+    for i in 0..len(cols) {
+        if cols[i] == cur { return true }
         var found = false
         for c in eqs { if cols[i] == c { found = true } }
         if !found { return false }
     }
-    return true
+    return false
 }
 
-// The one query WAITFOR runs: from one ordinary table, WHERE [k = v AND
-// ...] c > v (or >=), ORDER BY c, a LIMIT, an index on (k ..., c), and no
-// grouping, aggregates, DISTINCT, windows, subqueries, OFFSET or locking.
-// Others are refused (0A000): their reads could not go unnoted, an
-// aggregate always gives a row, and each would run again for every
-// waiter at every flush.
+// The one query WAITFOR runs: from one ordinary table, ORDER BY c, WHERE
+// c > v (or >=, v a literal or a parameter), a LIMIT, and an index on (k
+// ..., c) whose k are columns WHERE gives with k = v. WHERE's other
+// conditions are filters: they read the row alone (one table, no
+// subqueries) and change nothing (no nextval or set_config). No grouping,
+// aggregates, DISTINCT, windows, OFFSET or locking. Others are refused
+// (0A000): their reads could not go unnoted, an aggregate always gives a
+// row, and each would run again for every waiter at every flush. A filter
+// the index does not hold is cheap only when most rows pass it: the rows
+// after the cursor that fail it are read again at every wake.
 fn waitShape(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, stmt: &lexdb_sql.Stmt): Result[Unit, DbErr] {
     if st.isReplica() { return Err(waitRefused("is not supported on a replica")) }
     if stmt.lockMode > 0 { return Err(waitRefused("cannot be used with FOR UPDATE, FOR SHARE and the like")) }
@@ -15580,45 +15585,46 @@ fn waitShape(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, stmt: &lexdb_sql
     if len(t.view) > 0 { return Err(waitRefused("reads an ordinary table: \"" + tn + "\" is a view")) }
     if tempRel(&t.name) { return Err(waitRefused("cannot read a temporary table: no other session can add to it")) }
     let alias = if len(f.alias) > 0 { f.alias.toStr() } else { lexdb_sql.baseName(&t.name) }
-    let shape = "needs WHERE [k = v AND ...] c > v, ORDER BY c and an index on (k ..., c)"
+    let shape = "needs ORDER BY c, WHERE c > v and an index on (k ..., c), its k from WHERE's k = v"
+    // the cursor: ORDER BY's column, ascending
+    if len(stmt.order) != 1 || stmt.order[0].desc { return Err(waitRefused(shape)) }
+    let cur = waitCol(&stmt.order[0].expr, &t, &alias)
+    if cur < 0 { return Err(waitRefused(shape)) }
+    // its bound (c > v or >=, or written the other way round); the
+    // equalities an index may begin with; every other condition a filter
     var conj: []Expr = []
     match stmt.where {
         Some(w) { conjuncts(&w, mut &conj) }
         None {}
     }
     var eqs: []int = []
-    var cur = -1
+    var bound = false
     for c in conj {
-        var ok = false
+        if hasAgg(&c) { return Err(waitRefused("cannot have aggregates, GROUP BY, DISTINCT or windows")) }
         match c {
             Expr.Bin(op, a, b) {
                 let ca = waitCol(&a, &t, &alias)
                 let cb = waitCol(&b, &t, &alias)
-                var eq = -1
-                if op == "=" && ca >= 0 && waitConst(&b) { eq = ca }
-                if op == "=" && cb >= 0 && waitConst(&a) { eq = cb }
-                if eq >= 0 {
-                    var have = false
-                    for k in eqs { if k == eq { have = true } }
-                    if !have { append(mut &eqs, eq) }
-                    ok = true
-                } else if cur < 0 && (op == ">" || op == ">=") && ca >= 0 && waitConst(&b) {
-                    cur = ca
-                    ok = true
-                } else if cur < 0 && (op == "<" || op == "<=") && cb >= 0 && waitConst(&a) {
-                    cur = cb
-                    ok = true
+                if !bound && ca == cur && (op == ">" || op == ">=") && waitConst(&b) { bound = true }
+                else if !bound && cb == cur && (op == "<" || op == "<=") && waitConst(&a) { bound = true }
+                else if op == "=" {
+                    var eq = -1
+                    if ca >= 0 && waitConst(&b) { eq = ca }
+                    if cb >= 0 && waitConst(&a) { eq = cb }
+                    if eq >= 0 && eq != cur {
+                        var have = false
+                        for k in eqs { if k == eq { have = true } }
+                        if !have { append(mut &eqs, eq) }
+                    }
                 }
             }
             else {}
         }
-        if !ok { return Err(waitRefused(shape)) }
     }
-    if cur < 0 { return Err(waitRefused(shape)) }
-    for k in eqs { if k == cur { return Err(waitRefused(shape)) } }
-    if len(stmt.order) != 1 || stmt.order[0].desc || waitCol(&stmt.order[0].expr, &t, &alias) != cur {
-        return Err(waitRefused(shape))
-    }
+    if !bound { return Err(waitRefused(shape)) }
+    // nextval, setval and set_config change things; current_setting is
+    // marked with them (SET_MARK)
+    if len(stmt.seqNames) > 0 { return Err(waitRefused("cannot call nextval, setval, currval, set_config or current_setting")) }
     var indexed = waitFits(&t.pk, &eqs, cur)
     for ix in t.indexes {
         if ix.pred.isNone() && waitFits(&ix.cols, &eqs, cur) { indexed = true }

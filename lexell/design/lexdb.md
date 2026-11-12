@@ -8219,13 +8219,27 @@ WAITFOR (SELECT seq, payload FROM events WHERE seq > $1 ORDER BY seq LIMIT 100),
 
 **The one query it runs (`waitShape`), else 0A000:**
 - one ordinary table: not a view, a catalog relation or a temporary table;
-- `WHERE [k = v AND ...] c > v` (or `>=`, or written the other way
-  round), each v a literal or a parameter, cast or not;
-- `ORDER BY c` ascending, and a LIMIT (or T-SQL's TOP);
-- an index, or the primary key, on the equalities' columns in any order,
-  then c;
+- `ORDER BY c` ascending, c the cursor, and a LIMIT (or T-SQL's TOP);
+- in WHERE, `c > v` (or `>=`, or written the other way round), v a
+  literal or a parameter, cast or not;
+- an index, or the primary key, that begins with columns WHERE gives with
+  `k = v` (any order, or none), then c;
+- every other condition in WHERE is a **filter**, read on the row alone:
+  - an equality the index does not hold, `OR`, `LIKE`, functions, and so on;
+  - one table and no subqueries, so a filter reads nothing else;
+  - no `nextval`, `setval`, `currval`, `set_config` or `current_setting`
+    (they change things, or are marked with those that do);
 - no aggregates, grouping, DISTINCT, windows, subqueries, OFFSET, WITH
   TIES or locking clause.
+
+**Filters cost what they skip.** The rows after the cursor that fail a
+filter are read again at every wake, since the client's cursor cannot pass
+rows it never saw. An equality the index begins with costs nothing: `(subject,
+seq)` with `subject = 'x'` reads only x's rows. So a filter on an index's
+prefix suits a selective subscription, and a filter outside it suits one
+most rows pass. A filter on a column producers change after the insert is
+not checked at commit (the reads are not noted); the stream is taken to be
+append-only, as its cursor already requires.
 
 Why it is enforced:
 - Its reads are not noted (below), which is sound only for rows after a
@@ -8280,7 +8294,6 @@ set by BEGIN, cleared by any statement the block runs; else 0A000).
 - Not done (`lexdb-events.md`):
   - sequence numbers given at commit (a counter row is the way now);
   - a keyed wake-one;
-  - filters on other columns;
   - a wake from a replica's follower.
 
 **Tests:** `exec_waitfor`, with sessions in tasks of their own:
@@ -8294,6 +8307,9 @@ set by BEGIN, cleared by any statement the block runs; else 0A000).
 - the refusals; `statement_timeout`;
 - a READ ONLY block seeing what woke it;
 - a partition's cursor; TIMEOUT and the cursor as parameters;
+- filters: an equality the index does not hold, `OR` with a function and
+  `LIKE`, and an index's prefix with a filter after it. An event failing
+  the filter wakes the waiter, which waits on for one that passes;
 - four producers numbering 40 events from a counter row, read by a
   consumer as they commit: in order, with no gaps;
 - T-SQL's `WAITFOR (SELECT TOP 2 ...), TIMEOUT 1000`.

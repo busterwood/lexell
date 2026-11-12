@@ -3,10 +3,9 @@
 Status: design proposal, 2026-11-12, revised the same day after a review
 against the code (section 13 lists what the review changed). **The first
 version is built: `lexdb.md` 9.98**, as sections 2, 3, 5, 8 and 11
-describe. Not built yet:
+describe. Filters on other columns followed (section 2). Not built yet:
 - commit-time sequence numbers;
 - the keyed wake-one;
-- filters on other columns;
 - a wake on replicas.
 
 ## 1. Idea
@@ -53,9 +52,12 @@ COMMIT;
 
 **The parentheses take one query shape, enforced (0A000 otherwise):**
 - one ordinary table: not a view, a catalog relation or a temporary table;
-- `WHERE [k = v AND ...] c > v` (or `>=`), each v a literal or a parameter;
 - `ORDER BY c` ascending, and a LIMIT (or T-SQL's TOP);
-- an index, or the primary key, on the equalities' columns, then c;
+- in WHERE, `c > v` (or `>=`), v a literal or a parameter;
+- an index, or the primary key, that begins with columns WHERE gives as
+  `k = v` (any or none), then c;
+- every other WHERE condition a filter on the row itself: no subqueries,
+  and no `nextval`, `set_config` and the like;
 - no aggregates, grouping, DISTINCT, windows, subqueries, OFFSET or locking
   clause.
 
@@ -75,9 +77,13 @@ whole query (section 5), but that is not enough:
 - **Cost:** every waiter's query runs again at every flush, on the one SQL
   thread. For this shape that is one index probe that comes back empty.
 
-Later, extra filters on the event row itself (`AND subject = 'x'`) would be
-safe for the unrecorded reads; their cost is rescanning rows that do not
-match (section 11). Anything that reads another table stays refused.
+**Filters on the event row itself** (`AND subject = 'x'`, `OR`, functions)
+are safe for the unrecorded reads, because they read nothing but the
+appended row. Their cost is rescanning the rows after the cursor that fail
+them, at every wake, since the client cannot advance past rows it never
+saw. A filter on the index's leading columns costs nothing: with an index on
+`(subject, seq)`, `subject = 'x'` reads only x's rows. Anything that reads
+another table stays refused.
 
 The table is an ordinary one, not a marked event table. A marked table becomes worthwhile with commit-time sequence numbers and an enforced append-only rule (section 4).
 
@@ -261,7 +267,7 @@ Built as `lexdb.md` 9.98 describes. It follows this section's plan, with
 `Store.releaseSnapshot` and `Store.renewSnapshot` for the snapshot swap, and
 the test `exec_waitfor`.
 
-Start with one stream/table, a constrained indexed SELECT, timeout, generation-based notification and offsets held in SQL tables. Avoid a new messaging protocol, consumer group subsystem or partitioning requirement. No subject filtering in version one: with a filter, the cursor cannot advance past rows that do not match, so each wake rescans them.
+Start with one stream/table, a constrained indexed SELECT, timeout, generation-based notification and offsets held in SQL tables. Avoid a new messaging protocol, consumer group subsystem or partitioning requirement. Subject filtering came just after version one (section 2): with a filter, the cursor cannot advance past rows that do not match, so each wake rescans them, unless the index leads with the filtered column.
 
 **What it touches:**
 - **`lexdb_sql.lxl`:** `WAITFOR (SELECT ...) [, TIMEOUT n]` as a statement, in the PostgreSQL and T-SQL dialects, giving an S_SELECT with a `waitMs` field (beside `lockWait`).
@@ -352,6 +358,7 @@ The proposal was reviewed against the code the day it was written. What changed:
 **Later the same day:**
 - the query shape was made an enforced rule, and section 2 corrected: the
   shape matters for correctness, not only cost;
-- the first version was built (`lexdb.md` 9.98).
+- the first version was built (`lexdb.md` 9.98);
+- then filters on other columns.
 
 **The event log is the table; the waiting SELECT is the subscription API.**
