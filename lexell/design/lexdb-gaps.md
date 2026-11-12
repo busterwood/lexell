@@ -1,8 +1,8 @@
 # lexdb against PostgreSQL: where it stands and what is missing
 
 Status: a review taken on 2026-11-12, at commit 9133e91a (branch `lexdb`,
-after design/lexdb.md 9.91), brought up to date for 9.92 (merged as
-ffc59ecc). It replaces the review of 2026-11-10 (commit
+after design/lexdb.md 9.91), brought up to date for 9.92 to 9.94
+(merged as 87d2a0b1). It replaces the review of 2026-11-10 (commit
 238ff702, after 9.46). The order of work at the end is a proposal; the
 choices in it are the user's.
 
@@ -17,7 +17,7 @@ Answers were not compared with PostgreSQL here: the suites that
 `tests/lexdb/gen_pg.py` generates from PostgreSQL 18 do that, feature by
 feature.
 
-## 1. Closed since the first review (9.75 to 9.92)
+## 1. Closed since the first review (9.75 to 9.94)
 
 - **Types:**
   - date, time, timestamp, timestamptz and interval, with their operators,
@@ -72,6 +72,17 @@ feature.
   - COPY TO is sent as it runs (9.84);
   - COPY FROM is read as it comes, and `batch_rows` bounds a large load
     (9.87).
+- **The small query forms** (9.93, 9.94):
+  - `JOIN ... USING` and `NATURAL JOIN`;
+  - `DISTINCT ON`, `FETCH FIRST` and `WITH TIES`;
+  - row comparisons, `(a, b) < (c, d)`, and rows in IN;
+  - `char(n)`;
+  - `CREATE INDEX` without a name;
+  - `SIMILAR TO`, `LIKE ANY / ALL` and `BETWEEN SYMMETRIC`;
+  - `ROLLUP`, `CUBE`, `GROUPING SETS` and `GROUPING()`;
+  - `percent_rank` and `cume_dist` as double precision;
+  - `VACUUM`, `ANALYZE`, `CHECKPOINT`, `REINDEX` and `CLUSTER`, accepted
+    as doing nothing.
 - **Replication:** read-only replicas on the same machine (9.68 to 9.73).
 
 **Speed** (9.67, PostgreSQL 18 on the same machine, all the data in
@@ -112,16 +123,12 @@ In three tiers, by how soon a real application meets the gap.
    error.
    - `AT TIME ZONE` and `timezone()` fail.
    - The zone rules exist already (`tz.instantOf`, 9.76).
-3. **What 9.92 left of the functions:**
-   - `SIMILAR TO`, and `substring(x from pattern for escape)`;
-   - `LIKE ANY (array)`;
-   - the row constructor `row(...)`;
+3. **What 9.92 and 9.94 left of the functions:**
+   - row values outside comparisons (`SELECT (1, 2)`, `row_to_json`);
    - multi-dimensional arrays, `array_fill` and `array_sort`.
 
    Regular expressions are RE2's: no back-references inside a pattern and
    no lookahead, where PostgreSQL's have both (9.92).
-4. **`char(n)` and `character(n)`** are refused. They are common in older
-   schemas and in pg_dump's output.
 
 ### 2.2 Tier 2: common, each with a workaround
 
@@ -132,18 +139,9 @@ In three tiers, by how soon a real application meets the gap.
   - generated columns;
   - materialized views;
   - views are read-only, and a rename of a table one reads is refused
-    (9.82);
-  - `CREATE INDEX` without a name (`CREATE INDEX ON t (a)`), which
-    PostgreSQL names itself.
-- **Queries:**
-  - `JOIN ... USING` and `NATURAL JOIN`;
-  - `DISTINCT ON`;
-  - `FETCH FIRST n ROWS ONLY`;
-  - row comparisons, `(a, b) < (c, d)`;
-  - `BETWEEN SYMMETRIC` and `SIMILAR TO`;
-  - `ROLLUP`, `CUBE` and `GROUPING SETS`. ROLLUP and CUBE still give a
-    misleading error ("must appear in the GROUP BY clause") rather than
-    "not supported".
+    (9.82).
+- **Queries:** window functions with grouping sets (0A000), and `USING
+  (...) AS alias` (9.93, 9.94).
 - **Data-modifying CTEs:** `WITH d AS (DELETE ... RETURNING ...)`.
 - **User-defined types:**
   - domains;
@@ -154,9 +152,6 @@ In three tiers, by how soon a real application meets the gap.
   - cursors, `DECLARE` and `FETCH`;
   - `LISTEN` and `NOTIFY`;
   - `LOCK TABLE`.
-- **Maintenance statements:** `VACUUM`, `ANALYZE`, `CHECKPOINT`,
-  `REINDEX` and `CLUSTER` are syntax errors. Scripts and tools send
-  them; accepting them as doing nothing would be enough for most.
 - **Isolation levels.** `BEGIN ISOLATION LEVEL READ COMMITTED` is accepted
   and runs serializable (`SHOW transaction_isolation` says so).
   Applications written for read committed meet more serialization
@@ -194,9 +189,8 @@ In three tiers, by how soon a real application meets the gap.
 
 ### 2.4 Not SQL features
 
-- **Wrong types:** `percent_rank` and `cume_dist` return numeric, though
-  double precision now exists. (The probe's other wrong answer, `||` on
-  arrays, was fixed in 9.92.)
+- **Wrong answers:** none left from the probe. `||` on arrays was fixed
+  in 9.92, and `percent_rank`'s type in 9.94.
 - **Errors:**
   - DETAIL and HINT are folded into the message rather than sent as their
     own fields;
@@ -218,20 +212,9 @@ In three tiers, by how soon a real application meets the gap.
 1. **Time zones:** `SET timezone`, `AT TIME ZONE`, and timestamptz shown in
    the session's zone. Small now that the rules exist, and it removes a
    silent wrong answer.
-2. **The small Tier 2 query forms,** each cheap and each checkable against
-   PostgreSQL:
-   - `JOIN ... USING` and `NATURAL JOIN`;
-   - `DISTINCT ON`;
-   - `FETCH FIRST`;
-   - row comparisons;
-   - `char(n)`;
-   - an unnamed `CREATE INDEX`;
-   - `SIMILAR TO` and `LIKE ANY`;
-   - `percent_rank` as double precision;
-   - the maintenance statements accepted as doing nothing.
-3. **json and jsonb,** when the user decides.
-4. **Binary formats,** for asyncpg and JDBC.
-5. **Data-modifying CTEs, temporary tables and generated columns.**
+2. **json and jsonb,** when the user decides.
+3. **Binary formats,** for asyncpg and JDBC.
+4. **Data-modifying CTEs, temporary tables and generated columns.**
 
 **Open questions for the user:**
 - Is this order right?
