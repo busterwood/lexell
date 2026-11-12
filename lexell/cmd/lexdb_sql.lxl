@@ -179,6 +179,7 @@ pub type ColDef = record {
     pub identity: int           // ID_*: SERIAL or an identity column (9.43)
     pub seq: str                // with one: the catalog key of its sequence, whose nextval is its default
     pub spell: str              // its name as written, where that differs from name (L6); "" else
+    pub coll: str               // a text column's collation, its name as written (L2); "" exact (lexdb's default)
 }
 
 // A column's sequence (ColDef.identity).
@@ -189,7 +190,7 @@ pub const ID_SERIAL = 3         // serial, bigserial, smallserial
 
 // A column with no default.
 pub fn colDef(name: str, typ: TypeName, notNull: bool): ColDef {
-    return ColDef{name: name, typ: typ, notNull: notNull, def: None, missing: Val.Null, identity: ID_NONE, seq: "", spell: ""}
+    return ColDef{name: name, typ: typ, notNull: notNull, def: None, missing: Val.Null, identity: ID_NONE, seq: "", spell: "", coll: ""}
 }
 
 // A sequence's options as CREATE SEQUENCE, ALTER SEQUENCE and an identity
@@ -1225,9 +1226,9 @@ fn (p: mut &P) unary(): Result[Expr, lexdb_base.DbErr] {
             try p.expectKw("]")
             e = Expr.Call("#elem", [e, i], false)
         } else if p.acceptKw("collate") {
-            // COLLATE name: read, not used (lexdb compares by bytes)
-            let c = try p.name()
-            if p.acceptKw(".") { let c2 = try p.name() }
+            // x COLLATE name: the call "#collate" (L2: an explicit collation)
+            let c = try p.collName()
+            e = Expr.Call("#collate", [e, Expr.Lit(Val.Text(c))], false)
         } else {
             break
         }
@@ -1907,7 +1908,41 @@ fn (p: mut &P) colType(c: mut &ColDef): Result[Unit, lexdb_base.DbErr] {
         }
     }
     c.typ = try p.typeName()
+    // its collation (L2): COLLATE name; in T-SQL a text column's is SQL
+    // Server's default, case-insensitive
+    if p.acceptKw("collate") { c.coll = try p.collName() }
+    else if p.tsql && c.typ.kind == K_TEXT { c.coll = TSQL_COLLATION }
     return Ok(Unit{})
+}
+
+// SQL Server's default collation: a T-SQL text column's, and a TDS
+// session's (design/lexdb-tds.md L2).
+pub const TSQL_COLLATION: str = "SQL_Latin1_General_CP1_CI_AS"
+
+// How a collation compares (L2): COLL_CI, SQL Server's *_CI_* (case
+// folded, trailing spaces ignored); COLL_PAD, SQL Server's other ones
+// (*_CS_*, *_BIN*: trailing spaces ignored, as SQL Server ignores them
+// under every collation); COLL_EXACT, "" and every other name (bytes).
+pub const COLL_EXACT = 0
+pub const COLL_PAD = 1
+pub const COLL_CI = 2
+
+pub fn collKind(name: &str): int {
+    let l = strings.toLowerAscii(name)
+    if strings.contains(&l, "_ci_") { return COLL_CI }
+    if strings.contains(&l, "_cs_") || strings.contains(&l, "_bin") { return COLL_PAD }
+    return COLL_EXACT
+}
+
+// A collation's name after COLLATE, as written: name or schema.name.
+fn (p: mut &P) collName(): Result[str, lexdb_base.DbErr] {
+    var n = try p.name()
+    var sp = if len(p.spelled) > 0 { p.spelled } else { n }
+    if p.acceptKw(".") {
+        n = try p.name()
+        sp = if len(p.spelled) > 0 { p.spelled } else { n }
+    }
+    return Ok(sp)
 }
 
 // After GENERATED: {ALWAYS | BY DEFAULT} AS IDENTITY [(options)].
