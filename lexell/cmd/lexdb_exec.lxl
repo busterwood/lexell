@@ -5032,37 +5032,44 @@ fn ufRoot(parent: &[]int, i: int): int {
     return x
 }
 
-// Whether cs holds a = b (either way round).
-fn hasEq(cs: &[]Expr, a: &str, b: &Expr): bool {
-    let bt = lexdb_sql.exprText(b)
+// The equalities cs holds, as text, each way round (a set, so that the
+// implied ones are checked against it at once: a star of 24 tables implies
+// hundreds).
+fn eqTexts(cs: &[]Expr): Map[str, int] {
+    var m: Map[str, int] = newMap()
     for c in cs {
         match c {
             Expr.Bin(op, l, r) {
                 if op == "=" {
-                    match l { Expr.Col(n) { if n == a && lexdb_sql.exprText(&r) == bt { return true } } else {} }
-                    match r { Expr.Col(n) { if n == a && lexdb_sql.exprText(&l) == bt { return true } } else {} }
+                    let a = lexdb_sql.exprText(&l)
+                    let b = lexdb_sql.exprText(&r)
+                    m.put(a + "\x00" + b, 1)
+                    m.put(b + "\x00" + a, 1)
                 }
             }
             else {}
         }
     }
-    return false
+    return m
 }
 
 // The equalities the classes imply that cs does not hold: between columns
 // of two tables, and of each column with its class's constant.
 fn (q: &Query) implied(cs: &[]Expr): []Expr {
     var out: []Expr = []
+    let have = eqTexts(cs)
     for cl in q.eqClasses(cs) {
+        var texts: []str = []
+        for n in cl.names { append(mut &texts, lexdb_sql.exprText(&Expr.Col(n.toStr()))) }
+        let kt = if len(cl.konst) > 0 { lexdb_sql.exprText(&cl.konst[0]) } else { "" }
         for i in 0..len(cl.names) {
             for j in i + 1..len(cl.names) {
                 if cl.levels[i] == cl.levels[j] { continue }
-                let b = Expr.Col(cl.names[j].toStr())
-                if !hasEq(cs, &cl.names[i], &b) && !hasEq(cs, &cl.names[j], &Expr.Col(cl.names[i].toStr())) {
-                    append(mut &out, Expr.Bin("=", Expr.Col(cl.names[i].toStr()), b))
+                if !have.has(&(texts[i] + "\x00" + texts[j])) {
+                    append(mut &out, Expr.Bin("=", Expr.Col(cl.names[i].toStr()), Expr.Col(cl.names[j].toStr())))
                 }
             }
-            if len(cl.konst) > 0 && !hasEq(cs, &cl.names[i], &cl.konst[0]) {
+            if len(cl.konst) > 0 && !have.has(&(texts[i] + "\x00" + kt)) {
                 append(mut &out, Expr.Bin("=", Expr.Col(cl.names[i].toStr()), clone(&cl.konst[0])))
             }
         }
@@ -5072,8 +5079,10 @@ fn (q: &Query) implied(cs: &[]Expr): []Expr {
 
 // ---- join order, step 2 (optimizer 26): by cost, with ANALYZE's statistics.
 // When every table of a SELECT's inner join has statistics and there are at
-// most JOIN_SEARCH_MAX, the order is the cheapest of all left-deep orders,
-// found exactly by dynamic programming over the sets of tables placed, and
+// most JOIN_SEARCH_MAX (24), the order is the cheapest left-deep order:
+// found exactly by dynamic programming over the sets of tables placed to
+// JOIN_EXACT_MAX tables, past that by SQLite's N-best search (optimizer 28,
+// 30); and
 // each table after the first is read either by a lookup per row of the
 // tables before it or once (a hash join), whichever costs less. Costs are
 // reads (optimizer 24): a lookup's descent one, a row by the primary key
@@ -5089,7 +5098,7 @@ fn (q: &Query) implied(cs: &[]Expr): []Expr {
 // 2^n). Without statistics for every table, the order bound by keys
 // (optimizer 25) stands.
 
-const JOIN_SEARCH_MAX: int = 12
+const JOIN_SEARCH_MAX: int = 24
 // Exact search to this many tables; past it SQLite's N-best search, keeping
 // the JOIN_BEST cheapest partial orders at each step (optimizer 28).
 const JOIN_EXACT_MAX: int = 8
@@ -5415,6 +5424,32 @@ fn (q: &Query) distinctOf(name: &str, k: int): float {
     return fmax(t / 10.0f, 1.0f)
 }
 
+// The rows of a set of levels (mask): its tables' by their constants,
+// times each class's share between its lowest table and the rest: 1 / the
+// largest distinct count among the class's columns there; at least one row.
+// Defined by the lowest table, so a set's rows do not depend on the order
+// that reached it. memo: the sets computed.
+fn (q: &Query) setRows(mask: int, nl: int, base: &[]Way, cmask: &[]int, cdist: &[]float, memo: mut &Map[int, float]): float {
+    if memo.has(&mask) { return memo.getOr(&mask, 1.0f) }
+    var low = 0
+    while (mask & (1 << low)) == 0 { low += 1 }
+    let rest = mask & ~(1 << low)
+    var r = base[low].rows * (if rest == 0 { 1.0f } else { q.setRows(rest, nl, base, cmask, cdist, memo) })
+    for ci in 0..len(cmask) {
+        let cm = cmask[ci]
+        if (cm & (1 << low)) == 0 { continue }
+        let other = cm & rest
+        if other == 0 { continue }
+        // the class's most selective column among the set's
+        var d = cdist[ci * nl + low]
+        for l in 0..nl { if (other & (1 << l)) != 0 { d = fmax(d, cdist[ci * nl + l]) } }
+        r = r / d
+    }
+    let v = fmax(r, 1.0f)
+    memo.put(mask, v)
+    return v
+}
+
 // The cost of joining level k to the set mask (rin its rows; rnext the rows
 // of the set with k): its constant way read once and hashed, then a probe
 // per row; or a lookup per row, whichever is cheaper (hashed: the first).
@@ -5535,51 +5570,33 @@ fn (q: &Query) costOrder(ms: &[][]Expr, lookups: bool, cap: float, perm: mut &[]
         append(mut &cmask, m)
         for d in ds { append(mut &cdist, d) }
     }
-    let ncl = len(cmask)
-    let full = (1 << nl) - 1
-    var rows: []float = array(full + 1, 0.0f)
-    var cost: []float = array(full + 1, -1.0f)
-    var last: []int = array(full + 1, -1)
-    var lastOnce: []bool = array(full + 1, false)
-    var nbr: []int = array(full + 1, 0)         // the levels linked to a set's
-    for mask in 1..full + 1 {
-        // the rows of the set: its tables' by their constants, times each
-        // class's share between the table added and the rest: 1 / the
-        // largest distinct count among its columns there (at least one row)
-        var low = 0
-        while (mask & (1 << low)) == 0 { low += 1 }
-        let rest = mask & ~(1 << low)
-        var r = base[low].rows * (if rest == 0 { 1.0f } else { rows[rest] })
-        for ci in 0..ncl {
-            let cm = cmask[ci]
-            if (cm & (1 << low)) == 0 { continue }
-            let other = cm & rest
-            if other == 0 { continue }
-            // the class's most selective column among the set's
-            var d = cdist[ci * nl + low]
-            for l in 0..nl { if (other & (1 << l)) != 0 { d = fmax(d, cdist[ci * nl + l]) } }
-            r = r / d
-        }
-        rows[mask] = fmax(r, 1.0f)
-        nbr[mask] = nbr[rest] | adj[low]
-        if rest == 0 {
-            cost[mask] = base[low].cost
-            last[mask] = low
-        }
-    }
     var order: []int = []
     var flags: []bool = []
+    // the rows of a set, as needed (2^n sets past JOIN_EXACT_MAX is too many
+    // to list: optimizer 30)
+    var memo: Map[int, float] = newMap()
     if nl <= JOIN_EXACT_MAX {
+        let full = (1 << nl) - 1
+        var cost: []float = array(full + 1, -1.0f)
+        var last: []int = array(full + 1, -1)
+        var lastOnce: []bool = array(full + 1, false)
+        for k in 0..nl {
+            cost[1 << k] = base[k].cost
+            last[1 << k] = k
+        }
         for mask in 1..full + 1 {
             if cost[mask] < 0.0f { continue }
-            let rin = rows[mask]
-            let linked = (nbr[mask] & ~mask) != 0
+            let rin = q.setRows(mask, nl, &base, &cmask, &cdist, mut &memo)
+            var nb = 0
+            for l in 0..nl { if (mask & (1 << l)) != 0 { nb = nb | adj[l] } }
+            let linked = (nb & ~mask) != 0
             for k in 0..nl {
                 if (mask & (1 << k)) != 0 { continue }
                 if linked && (adj[k] & mask) == 0 { continue }       // a cross product while a join is left
                 let next = mask | (1 << k)
                 var o = false
-                let total = cost[mask] + q.joinStep(k, &cands[k], &base[k], mask, rin, rows[next], lookups, cap, mut &o)
+                let rnext = q.setRows(next, nl, &base, &cmask, &cdist, mut &memo)
+                let total = cost[mask] + q.joinStep(k, &cands[k], &base[k], mask, rin, rnext, lookups, cap, mut &o)
                 if cost[next] < 0.0f || total < cost[next] {
                     cost[next] = total
                     last[next] = k
@@ -5616,44 +5633,67 @@ fn (q: &Query) costOrder(ms: &[][]Expr, lookups: bool, cap: float, perm: mut &[]
         }
         bestOf(mut &pm, mut &pc, mut &po, mut &pf)
         for step in 1..nl {
+            // the extensions: per set of tables the cheapest, as its parent
+            // path and the table added (copied only when kept)
             var nm: []int = []
             var nc: []float = []
-            var no: [][]int = []
-            var nf: [][]bool = []
+            var npar: []int = []
+            var nk: []int = []
+            var nh: []bool = []
+            var at: Map[int, int] = newMap()
             for p in 0..len(pm) {
                 let mask = pm[p]
-                let rin = rows[mask]
-                let linked = (nbr[mask] & ~mask) != 0
+                let rin = q.setRows(mask, nl, &base, &cmask, &cdist, mut &memo)
+                var nb = 0
+                for l in 0..nl { if (mask & (1 << l)) != 0 { nb = nb | adj[l] } }
+                let linked = (nb & ~mask) != 0
                 for k in 0..nl {
                     if (mask & (1 << k)) != 0 { continue }
                     if linked && (adj[k] & mask) == 0 { continue }
                     let next = mask | (1 << k)
                     var o = false
-                    let total = pc[p] + q.joinStep(k, &cands[k], &base[k], mask, rin, rows[next], lookups, cap, mut &o)
-                    var at = -1
-                    for j in 0..len(nm) { if nm[j] == next { at = j } }
-                    if at >= 0 && nc[at] <= total { continue }
-                    var ord = copyInts(&po[p])
-                    append(mut &ord, k)
-                    var fl = copyBools(&pf[p])
-                    append(mut &fl, o)
-                    if at < 0 {
+                    let rnext = q.setRows(next, nl, &base, &cmask, &cdist, mut &memo)
+                    let total = pc[p] + q.joinStep(k, &cands[k], &base[k], mask, rin, rnext, lookups, cap, mut &o)
+                    let j = at.getOr(&next, -1)
+                    if j >= 0 {
+                        if nc[j] <= total { continue }
+                        nc[j] = total
+                        npar[j] = p
+                        nk[j] = k
+                        nh[j] = o
+                    } else {
+                        at.put(next, len(nm))
                         append(mut &nm, next)
                         append(mut &nc, total)
-                        append(mut &no, ord)
-                        append(mut &nf, fl)
-                    } else {
-                        nc[at] = total
-                        no[at] = ord
-                        nf[at] = fl
+                        append(mut &npar, p)
+                        append(mut &nk, k)
+                        append(mut &nh, o)
                     }
                 }
             }
-            bestOf(mut &nm, mut &nc, mut &no, mut &nf)
-            pm = nm
-            pc = nc
-            po = no
-            pf = nf
+            // the JOIN_BEST cheapest, cheapest first (a tie: the earlier)
+            var taken: []bool = array(len(nm), false)
+            var m2: []int = []
+            var c2: []float = []
+            var o2: [][]int = []
+            var f2: [][]bool = []
+            while len(m2) < JOIN_BEST && len(m2) < len(nm) {
+                var b = -1
+                for i in 0..len(nm) { if !taken[i] && (b < 0 || nc[i] < nc[b]) { b = i } }
+                taken[b] = true
+                append(mut &m2, nm[b])
+                append(mut &c2, nc[b])
+                var ord = copyInts(&po[npar[b]])
+                append(mut &ord, nk[b])
+                var fl = copyBools(&pf[npar[b]])
+                append(mut &fl, nh[b])
+                append(mut &o2, ord)
+                append(mut &f2, fl)
+            }
+            pm = m2
+            pc = c2
+            po = o2
+            pf = f2
         }
         // the cheapest (the first: bestOf orders them)
         order = replace(mut &po[0], [])
