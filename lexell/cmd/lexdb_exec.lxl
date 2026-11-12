@@ -3351,13 +3351,41 @@ fn resolveName(cols: &[]lexdb_sql.ColDef, n: int, name: &str): Result[str, DbErr
     }
     var found = -1
     for i in 0..n {
-        if colPart(&cols[i].name) == name {
+        if colPart(&cols[i].name) == name && cols[i].using != lexdb_sql.USING_HIDDEN {
             if found >= 0 { return Err(e("42702", "column reference \"" + name + "\" is ambiguous")) }
             found = i
         }
     }
     if found < 0 { return Err(e("42703", "column \"" + name + "\" does not exist")) }
     return Ok(cols[found].name)
+}
+
+// A column named r (as resolveName gives it) as an expression: the column,
+// or after a FULL JOIN ... USING the COALESCE of the pair's sides (9.93).
+fn colExpr(cols: &[]lexdb_sql.ColDef, r: &str): Expr {
+    let i = colIndex(cols, r)
+    if i < 0 || len(cols[i].using) == 0 || cols[i].using == lexdb_sql.USING_HIDDEN { return Expr.Col(r) }
+    var args: []Expr = [Expr.Col(r)]
+    for o in strings.split(&cols[i].using, "\x1f") { append(mut &args, Expr.Col(o)) }
+    return Expr.Call("coalesce", args, false)
+}
+
+// JOIN ... USING's column name among cols[lo..hi] (one side of the join):
+// the one a bare name there means, or 42703 / 42702 (9.93).
+fn usingSide(cols: &[]lexdb_sql.ColDef, lo: int, hi: int, name: &str, side: &str): Result[int, DbErr] {
+    var found = -1
+    for i in lo..hi {
+        if colPart(&cols[i].name) != name || hiddenName(&cols[i].name) || cols[i].using == lexdb_sql.USING_HIDDEN { continue }
+        if found >= 0 { return Err(e("42702", "common column name \"" + name + "\" appears more than once in " + side + " table")) }
+        found = i
+    }
+    if found < 0 { return Err(e("42703", "column \"" + name + "\" specified in USING clause does not exist in " + side + " table")) }
+    return Ok(found)
+}
+
+fn hasIdx(xs: &[]int, x: int): bool {
+    for y in xs { if y == x { return true } }
+    return false
 }
 
 // An expression with its column names made alias.column.
@@ -3367,7 +3395,7 @@ fn resolve(x: &Expr, cols: &[]lexdb_sql.ColDef, n: int, sc: mut &Scope): Result[
     match x {
         Expr.Col(name) {
             match resolveName(cols, n, &name) {
-                Ok(r) { return Ok(Expr.Col(r)) }
+                Ok(r) { return Ok(colExpr(cols, &r)) }
                 Err(err) {
                     var mine = false
                     match resolveName(cols, len(cols), &name) {
@@ -4179,6 +4207,10 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
     append(mut &sc.frames, Frame{cols: [], refs: [], refOids: [], subRefs: [], subOids: [], subNames: [], hidden: false})
     let me = len(sc.frames) - 1
     var views: []SubPlan = []              // the views read, planned (9.82)
+    var usingOn: []Option[Expr] = []       // per FROM item, the ON its USING or NATURAL makes (9.93)
+    var order: []int = []                  // the columns in *'s order
+    var anyUsing = false
+    var tree = 0                           // the first column of the join tree being built (after the last comma)
     for f in from {
         for lv in q.levels {
             if lv.alias == f.alias { return Err(e("42712", "table name \"" + f.alias + "\" specified more than once")) }
@@ -4279,7 +4311,73 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
                 append(mut &sc.frames[me].cols, lexdb_sql.colDef(q.cols[i].name, q.cols[i].typ, q.cols[i].notNull))
             }
         }
+        // JOIN ... USING and NATURAL JOIN (9.93): an ON made of the names'
+        // equalities, and of each pair one side a bare name and * mean (the
+        // left's, a RIGHT JOIN's right's, a FULL JOIN's COALESCE of both)
+        var uon: Option[Expr] = None
+        var merged: []int = []
+        var gone: []int = []
+        if f.comma { tree = first }
+        if len(q.levels) > 1 && (len(f.using) > 0 || f.natural) {
+            anyUsing = true
+            var names: []str = []
+            if f.natural {
+                // the left's names in *'s order that the right has too
+                for i in order {
+                    if i < tree || i >= first || hiddenName(&q.cols[i].name) || q.cols[i].using == lexdb_sql.USING_HIDDEN { continue }
+                    let nm = colPart(&q.cols[i].name)
+                    if hasStr(&names, &nm) { continue }
+                    var both = false
+                    for j in first..len(q.cols) { if colPart(&q.cols[j].name) == nm && !hiddenName(&q.cols[j].name) { both = true } }
+                    if both { append(mut &names, nm) }
+                }
+            } else {
+                for u in f.using {
+                    if hasStr(&names, &u) { return Err(e("42701", "column name \"" + u + "\" appears more than once in USING clause")) }
+                    append(mut &names, u)
+                }
+            }
+            var conds: []Expr = []
+            for nm in names {
+                let li = try usingSide(&q.cols, tree, first, &nm, &"left")
+                let ri = try usingSide(&q.cols, first, len(q.cols), &nm, &"right")
+                let lx = colExpr(&q.cols, &q.cols[li].name)
+                append(mut &conds, Expr.Bin("=", lx, Expr.Col(q.cols[ri].name)))
+                if f.join == lexdb_sql.J_RIGHT {
+                    q.cols[li].using = lexdb_sql.USING_HIDDEN
+                    append(mut &merged, ri)
+                    append(mut &gone, li)
+                } else if f.join == lexdb_sql.J_FULL {
+                    let was = q.cols[li].using
+                    q.cols[li].using = if len(was) > 0 { was + "\x1f" + q.cols[ri].name } else { q.cols[ri].name }
+                    q.cols[ri].using = lexdb_sql.USING_HIDDEN
+                    append(mut &merged, li)
+                    append(mut &gone, ri)
+                } else {
+                    q.cols[ri].using = lexdb_sql.USING_HIDDEN
+                    append(mut &merged, li)
+                    append(mut &gone, ri)
+                }
+            }
+            if len(conds) > 0 {
+                var x = pop(mut &conds)
+                while len(conds) > 0 { x = Expr.Bin("and", pop(mut &conds), x) }
+                uon = Some(x)
+            }
+            // the subqueries see the same
+            for i in 0..len(sc.frames[me].cols) {
+                let ci = colIndex(&q.cols, &sc.frames[me].cols[i].name)
+                if ci >= 0 { sc.frames[me].cols[i].using = q.cols[ci].using }
+            }
+        }
+        append(mut &usingOn, uon)
+        var next: []int = []
+        for i in merged { append(mut &next, i) }
+        for i in order { if !hasIdx(&merged, i) && !hasIdx(&gone, i) { append(mut &next, i) } }
+        for i in first..len(q.cols) { if !hasIdx(&merged, i) && !hasIdx(&gone, i) { append(mut &next, i) } }
+        order = next
     }
+    if anyUsing { for j in 0..len(order) { q.cols[order[j]].pos = j } }
     for i in 0..len(subs) {
         if len(planned[i]) == 0 { append(mut &planned[i], try planSub(st, txn, &subs[i], params, sc)) }
         let sp = pop(mut &planned[i])
@@ -4317,6 +4415,10 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
                 let r = try enumOrder(st, txn, &(try resolve(&on, &q.cols, q.levels[k].first + len(q.levels[k].t.cols), sc)), &q.cols)
                 conjuncts(&r, mut &ms[k])
             }
+            None {}
+        }
+        match usingOn[k] {
+            Some(u) { conjuncts(&u, mut &ms[k]) }
             None {}
         }
     }
@@ -5581,7 +5683,7 @@ fn copyRow(r: &[]Val): []Val {
 }
 
 fn oneTable(name: &str): []lexdb_sql.FromItem {
-    return [lexdb_sql.FromItem{table: name, alias: lexdb_sql.baseName(name), join: lexdb_sql.J_FIRST, on: None, sub: -1, cols: [], work: -1, lateral: false}]
+    return [lexdb_sql.FromItem{table: name, alias: lexdb_sql.baseName(name), join: lexdb_sql.J_FIRST, on: None, sub: -1, cols: [], work: -1, lateral: false, using: [], natural: false, comma: false}]
 }
 
 // UPDATE's and DELETE's FROM items: the table written (under its alias),
@@ -5604,7 +5706,9 @@ fn dmlFrom(s: &lexdb_sql.Stmt): Result[[]lexdb_sql.FromItem, DbErr] {
         }
         var cols: []str = []
         for c in f.cols { append(mut &cols, c) }
-        append(mut &out, lexdb_sql.FromItem{table: f.table, alias: f.alias, join: f.join, on: on, sub: f.sub, cols: cols, work: f.work, lateral: f.lateral})
+        var us: []str = []
+        for u in f.using { append(mut &us, u) }
+        append(mut &out, lexdb_sql.FromItem{table: f.table, alias: f.alias, join: f.join, on: on, sub: f.sub, cols: cols, work: f.work, lateral: f.lateral, using: us, natural: f.natural, comma: f.comma})
     }
     return Ok(out)
 }
@@ -7902,6 +8006,21 @@ fn itemCols(items: &[]lexdb_sql.SelItem, from: bool, cols: &[]lexdb_sql.ColDef, 
         if it.star {
             if !from { return Err(e("42601", "SELECT * with no tables specified is not valid")) }
             var any = false
+            var placed = false
+            for c in cols { if c.pos >= 0 { placed = true } }
+            if placed && it.qual == "" {
+                // after JOIN ... USING: the merged columns, then the rest (9.93)
+                for p in 0..len(cols) {
+                    for c in cols {
+                        if c.pos != p || hiddenName(&c.name) { continue }
+                        any = true
+                        append(mut &out, OutCol{name: colPart(&c.name), oid: c.typ.oid})
+                        append(exprs, colExpr(cols, &c.name))
+                    }
+                }
+                if !any { return Err(e("42601", "SELECT * with no columns")) }
+                continue
+            }
             for c in cols {
                 if it.qual != "" && c.name[0..dotAt(&c.name)] != it.qual { continue }
                 any = true
@@ -7932,7 +8051,7 @@ fn resolveOrder(o: &Expr, cols: &[]lexdb_sql.ColDef, outs: &[]OutCol, sc: mut &S
     match o {
         Expr.Col(n) {
             match resolveName(cols, len(cols), &n) {
-                Ok(r) { return Ok(Expr.Col(r)) }
+                Ok(r) { return Ok(colExpr(cols, &r)) }
                 Err(x) {
                     for oc in outs { if oc.name == n { return Ok(Expr.Col(n)) } }
                     return Err(x)
@@ -8490,7 +8609,7 @@ fn resolveGroup(g: &Expr, cols: &[]lexdb_sql.ColDef, outs: &[]OutCol, exprs: &[]
         }
         Expr.Col(n) {
             match resolveName(cols, len(cols), &n) {
-                Ok(r) { return Ok(Expr.Col(r)) }
+                Ok(r) { return Ok(colExpr(cols, &r)) }
                 Err(x) {
                     for i in 0..len(outs) { if outs[i].name == n { return Ok(clone(&exprs[i])) } }
                     return Err(x)

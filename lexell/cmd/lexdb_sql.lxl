@@ -182,7 +182,14 @@ pub type ColDef = record {
     pub missing: Val            // a table's column: its value in rows written before it was added
     pub identity: int           // ID_*: SERIAL or an identity column (9.43)
     pub seq: str                // with one: the catalog key of its sequence, whose nextval is its default
+    // A query's column after JOIN ... USING (9.93): "" as any; USING_HIDDEN,
+    // the side of a merged pair a bare name does not mean (nor *); else the
+    // other sides' names (FULL JOIN), a bare name meaning COALESCE of them
+    pub using: str
+    pub pos: int                // its place in * when the query has a USING join; -1 none
 }
+
+pub const USING_HIDDEN: str = "\x00"
 
 // A column's sequence (ColDef.identity).
 pub const ID_NONE = 0
@@ -192,7 +199,7 @@ pub const ID_SERIAL = 3         // serial, bigserial, smallserial
 
 // A column with no default.
 pub fn colDef(name: str, typ: TypeName, notNull: bool): ColDef {
-    return ColDef{name: name, typ: typ, notNull: notNull, def: None, missing: Val.Null, identity: ID_NONE, seq: ""}
+    return ColDef{name: name, typ: typ, notNull: notNull, def: None, missing: Val.Null, identity: ID_NONE, seq: "", using: "", pos: -1}
 }
 
 // A sequence's options as CREATE SEQUENCE, ALTER SEQUENCE and an identity
@@ -287,6 +294,9 @@ pub type FromItem = record {
     pub cols: []str             // names for its columns (AS x(a, b)); the rest keep theirs
     pub work: int               // a recursive CTE in its own body: the CTE's number (its working table); -1
     pub lateral: bool           // LATERAL: a subquery that sees the FROM items before it
+    pub using: []str            // JOIN ... USING (names) (9.93)
+    pub natural: bool           // NATURAL JOIN: USING the names both sides have
+    pub comma: bool             // first in FROM or after a comma: a join tree starts here (USING's left side, 9.93)
 }
 
 // ORDER BY's item: NULLs first or last (by default last going up, first
@@ -1425,7 +1435,7 @@ fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
         let saved = replace(mut &p.subs, [])
         let inner = try p.subquery(SUB_FROM)
         var w = newStmt(S_SELECT)
-        append(mut &w.from, FromItem{table: "", alias: "#arr", join: J_FIRST, on: None, sub: inner, cols: ["#a"], work: -1, lateral: false})
+        append(mut &w.from, FromItem{table: "", alias: "#arr", join: J_FIRST, on: None, sub: inner, cols: ["#a"], work: -1, lateral: false, using: [], natural: false, comma: false})
         let agg = Expr.Call("array_agg", [Expr.Col("#arr.#a")], false)
         append(mut &w.items, SelItem{star: false, qual: "", expr: Some(Expr.Call("coalesce", [agg, Expr.Lit(Val.Text("{}"))], false)), alias: "array"})
         w.subs = replace(mut &p.subs, saved)
@@ -2576,7 +2586,7 @@ fn (p: mut &P) valuesQuery(): Result[Stmt, lexdb_base.DbErr] {
     let i = try p.valuesSub()
     var s = newStmt(S_SELECT)
     append(mut &s.items, SelItem{star: true, qual: "", expr: None, alias: ""})
-    append(mut &s.from, FromItem{table: "", alias: "*VALUES*", join: J_FIRST, on: None, sub: i, cols: [], work: -1, lateral: false})
+    append(mut &s.from, FromItem{table: "", alias: "*VALUES*", join: J_FIRST, on: None, sub: i, cols: [], work: -1, lateral: false, using: [], natural: false, comma: false})
     return Ok(s)
 }
 
@@ -2758,14 +2768,19 @@ fn (p: mut &P) orderLimit(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
 // FROM's list (after FROM; UPDATE's FROM and DELETE's USING, 9.91): its
 // first item joined as join, the rest by commas and JOINs.
 fn (p: mut &P) fromList(from: mut &[]FromItem, join: int): Result[Unit, lexdb_base.DbErr] {
-    append(from, try p.fromItem(join))
+    var first = try p.fromItem(join)
+    first.comma = true
+    append(from, first)
     while true {
         if p.acceptKw(",") {
-            append(from, try p.fromItem(J_CROSS))
+            var f = try p.fromItem(J_CROSS)
+            f.comma = true
+            append(from, f)
         } else if p.acceptKw("cross") {
             try p.expectKw("join")
             append(from, try p.fromItem(J_CROSS))
-        } else if p.isKw("join") || p.isKw("inner") || p.isKw("left") || p.isKw("right") || p.isKw("full") {
+        } else if p.isKw("join") || p.isKw("inner") || p.isKw("left") || p.isKw("right") || p.isKw("full") || p.isKw("natural") {
+            let natural = p.acceptKw("natural")
             var kind = J_INNER
             if p.acceptKw("left") {
                 let o = p.acceptKw("outer")
@@ -2781,11 +2796,20 @@ fn (p: mut &P) fromList(from: mut &[]FromItem, join: int): Result[Unit, lexdb_ba
             }
             try p.expectKw("join")
             var f = try p.fromItem(kind)
-            try p.expectKw("on")
-            f.on = Some(try p.expr())
+            if natural {
+                f.natural = true
+            } else if p.acceptKw("using") {
+                // USING (a, ...) (9.93)
+                try p.expectKw("(")
+                append(mut &f.using, try p.name())
+                while p.acceptKw(",") { append(mut &f.using, try p.name()) }
+                try p.expectKw(")")
+                if p.isKw("as") { return Err(lexdb_base.err("0A000", "lexdb: an alias for JOIN ... USING is not supported")) }
+            } else {
+                try p.expectKw("on")
+                f.on = Some(try p.expr())
+            }
             append(from, f)
-        } else if p.isKw("natural") {
-            return Err(lexdb_base.err("0A000", "NATURAL joins are not supported"))
         } else {
             break
         }
@@ -2818,7 +2842,7 @@ fn (p: mut &P) fromItem(join: int): Result[FromItem, lexdb_base.DbErr] {
         var valias = "*VALUES*"
         var vcols: []str = []
         try p.aliasOf(mut &valias, mut &vcols)
-        return Ok(FromItem{table: "", alias: valias, join: join, on: None, sub: vi, cols: vcols, work: -1, lateral: false})
+        return Ok(FromItem{table: "", alias: valias, join: join, on: None, sub: vi, cols: vcols, work: -1, lateral: false, using: [], natural: false, comma: false})
     }
     if p.acceptKw("(") {
         // a subquery in FROM
@@ -2827,7 +2851,7 @@ fn (p: mut &P) fromItem(join: int): Result[FromItem, lexdb_base.DbErr] {
         var alias = "unnamed_subquery"
         var cols: []str = []
         try p.aliasOf(mut &alias, mut &cols)
-        return Ok(FromItem{table: "", alias: alias, join: join, on: None, sub: i, cols: cols, work: -1, lateral: lateral})
+        return Ok(FromItem{table: "", alias: alias, join: join, on: None, sub: i, cols: cols, work: -1, lateral: lateral, using: [], natural: false, comma: false})
     }
     let table = try p.qname()
     var alias = baseName(&table)
@@ -2846,7 +2870,7 @@ fn (p: mut &P) fromItem(join: int): Result[FromItem, lexdb_base.DbErr] {
         s.use = SUB_FROM
         append(mut &p.subs, s)
         append(mut &p.seqs, CAT_MARK)
-        return Ok(FromItem{table: rel, alias: alias, join: join, on: None, sub: len(p.subs) - 1, cols: cols, work: -1, lateral: false})
+        return Ok(FromItem{table: rel, alias: alias, join: join, on: None, sub: len(p.subs) - 1, cols: cols, work: -1, lateral: false, using: [], natural: false, comma: false})
     }
     if ci >= 0 {
         if len(cols) == 0 { for c in p.ctes[ci].cols { append(mut &cols, c) } }
@@ -2857,13 +2881,13 @@ fn (p: mut &P) fromItem(join: int): Result[FromItem, lexdb_base.DbErr] {
                     return Err(lexdb_base.err("42P19", "recursive reference to query \"" + table + "\" must not appear within a subquery"))
                 }
                 p.inCte[k].refs += 1
-                return Ok(FromItem{table: table, alias: alias, join: join, on: None, sub: -1, cols: cols, work: p.ctes[ci].id, lateral: false})
+                return Ok(FromItem{table: table, alias: alias, join: join, on: None, sub: -1, cols: cols, work: p.ctes[ci].id, lateral: false, using: [], natural: false, comma: false})
             }
         }
         let i = try p.cteRef(ci)
-        return Ok(FromItem{table: table, alias: alias, join: join, on: None, sub: i, cols: cols, work: -1, lateral: false})
+        return Ok(FromItem{table: table, alias: alias, join: join, on: None, sub: i, cols: cols, work: -1, lateral: false, using: [], natural: false, comma: false})
     }
-    return Ok(FromItem{table: table, alias: alias, join: join, on: None, sub: -1, cols: cols, work: -1, lateral: false})
+    return Ok(FromItem{table: table, alias: alias, join: join, on: None, sub: -1, cols: cols, work: -1, lateral: false, using: [], natural: false, comma: false})
 }
 
 // [AS] alias [(column, ...)]
@@ -2904,7 +2928,7 @@ fn (p: mut &P) fromFunction(join: int): Result[FromItem, lexdb_base.DbErr] {
     let single = name == "generate_series" || name == "regexp_matches" || name == "regexp_split_to_table" || name == "string_to_table" ||
                  len(p.subs[i].items) == 1
     if single && alias != name && len(cols) == 0 { append(mut &cols, alias) }
-    return Ok(FromItem{table: name, alias: alias, join: join, on: None, sub: i, cols: cols, work: -1, lateral: true})
+    return Ok(FromItem{table: name, alias: alias, join: join, on: None, sub: i, cols: cols, work: -1, lateral: true, using: [], natural: false, comma: false})
 }
 
 fn (p: mut &P) aliasOf(alias: mut &str, cols: mut &[]str): Result[Unit, lexdb_base.DbErr] {
@@ -3228,7 +3252,7 @@ fn (p: mut &P) copyStmt(): Result[Stmt, lexdb_base.DbErr] {
         var q = newStmt(S_SELECT)
         if len(s.names) == 0 { append(mut &q.items, SelItem{star: true, qual: "", expr: None, alias: ""}) }
         for n in s.names { append(mut &q.items, SelItem{star: false, qual: "", expr: Some(Expr.Col(n)), alias: ""}) }
-        append(mut &q.from, FromItem{table: s.table, alias: baseName(&s.table), join: J_FIRST, on: None, sub: -1, cols: [], work: -1, lateral: false})
+        append(mut &q.from, FromItem{table: s.table, alias: baseName(&s.table), join: J_FIRST, on: None, sub: -1, cols: [], work: -1, lateral: false, using: [], natural: false, comma: false})
         append(mut &s.inner, q)
     }
     return Ok(s)

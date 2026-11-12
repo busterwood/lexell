@@ -7372,3 +7372,67 @@ lexdb suite passes.
 **Not done:** `SIMILAR TO` and `substring(x FROM pattern FOR escape)`
 (0A000); multi-dimensional arrays; `array_fill`, `array_reverse`,
 `array_sort`; json (a decision).
+
+### 9.93 JOIN ... USING and NATURAL JOIN
+
+From the small query forms of design/lexdb-gaps.md: `JOIN ... USING`
+was a syntax error, and NATURAL JOIN was refused. ORMs and hand-written
+SQL use USING for joins on a shared key (`JOIN dept USING (dept_id)`).
+
+**The forms:**
+- `[INNER | LEFT | RIGHT | FULL] JOIN t USING (a, ...)`;
+- `NATURAL [INNER | LEFT | RIGHT | FULL] JOIN t`.
+
+They work in a SELECT's FROM, UPDATE's FROM, DELETE's USING, views and
+subqueries. `FromItem.using` holds the names, and `natural` the NATURAL.
+
+**The join.** In `buildQuery`, as each FROM item is added, its USING
+becomes an ON: `left.a = right.a AND ...`. That ON's conjuncts join the
+item's own, so paths and hashing use them as any equality.
+- **The left side** is the join tree since the last comma (FromItem.comma),
+  as in PostgreSQL. So `FROM a, b JOIN c USING (id)` joins b and c, while
+  in `a CROSS JOIN b JOIN c USING (id)` id is ambiguous.
+- **NATURAL** uses the names that both sides have, in the left side's
+  order. With none it is a cross join.
+- **Errors, as PostgreSQL's:**
+  - a name missing from either side: 42703, "specified in USING clause
+    does not exist in left table";
+  - a name twice on one side: 42702, "common column name ... appears more
+    than once";
+  - a name twice in the list: 42701.
+
+**The merged column.** For each pair, one name stands for both sides
+(`ColDef.using`).
+- **Which side a bare name means:**
+  - in an inner or LEFT join, the left's; the right's is marked
+    `USING_HIDDEN`;
+  - in a RIGHT join, the right's; the left's is hidden;
+  - in a FULL join, `COALESCE(left, right)`: the left's `using` holds the
+    right's name, and `colExpr` makes the call.
+- `resolveName` passes over the hidden side, so a bare `dept` is not
+  ambiguous. A qualified `emp.dept` or `dept.dept` still names either
+  side.
+- **`*` puts the merged columns first,** then the rest of the left, then
+  the rest of the right, as PostgreSQL does. `ColDef.pos` holds each
+  column's place, set when the query has a USING. `t.*` gives all of t's
+  columns, the hidden one included.
+- WHERE, GROUP BY, HAVING, ORDER BY and the select list read the merged
+  column through the same lookup. A subquery sees the same marks.
+
+**Differences from PostgreSQL, left as they are:**
+- `USING (...) AS alias` (PostgreSQL 14) is refused (0A000).
+- In a subquery, a FULL JOIN's merged name means the left side, not the
+  COALESCE.
+
+**Tests:** `exec_joinusing`, 48 statements generated from PostgreSQL 18 by
+`gen_pg.py joinusing`, all the same. They cover:
+- inner, LEFT, RIGHT and FULL joins with USING, and with two names;
+- `*`, `e.*` and `d.*`, bare and qualified names;
+- a chain of three, NATURAL with and without common names, NATURAL LEFT
+  and FULL;
+- WHERE, GROUP BY, HAVING and ORDER BY on the merged column;
+- a view and a FROM subquery over a USING join, a scalar subquery beside
+  one (its bare name its own table's, as in PostgreSQL), UPDATE ... FROM
+  with one;
+- the comma's join tree;
+- the errors.
