@@ -2502,6 +2502,104 @@ d's primary key, looked up per outer row (memoised by the value).
 subquery. It is only done for the candidates above, and a prepared
 statement pays it once. Point selects have no subquery and pay nothing.
 
+## 43. Indexes in batches: the switch's ratio, an index way's cost (2026-11-12)
+
+lexdb 9.107 reads an index in batches:
+- alone, when its entries hold every column used;
+- else with its entries' rows read in key order (the store's `getMany`);
+- lookups per row by a primary key find each key from the last one's
+  leaf, sorted.
+
+Two of the planner's costs assumed rows read one by one through an index.
+
+**Measured** (`design/experiments/calib_index.lxl`, in memory, a
+200,000-row table, the median of 5 a run, the median of three runs; ns a
+row; batches on; before is 78731801):
+
+| | before | now | units now |
+|---|---|---|---|
+| a scan's row (the unit) | 28 | 28 | 1 |
+| an index range's entry, read alone | 911 | 57 | 2 |
+| an index range's entry and its row (2% of the table, rows scattered) | 1,093 | 483 | 17 |
+| the same, the reads noted (the rows in the index's order) | 1,173 | 569 | 20 |
+| a lookup by primary key per outer row, keys in no order | 984 | 709 | 25 |
+| the same, keys in order | 431 | 218 | 8 |
+| the same, the outer table read through an index on the key, alone | 964 | 266 | 9 |
+| a row read once and hashed | 565 | 560 | 20 |
+
+**Changed:**
+- **`COST_IX_ROW` = 16,** the first table's index range per entry, its
+  row included, in batches (`wayInto`, a way not using earlier tables'
+  values). It was `COST_KEY_ROW`, 45.
+  - **Unchanged:** an index looked up per row keeps 45 (the batches look
+    up by a primary key only: `bJoinPlan`), and so does a hashed table
+    read through an index (`materialize` reads it row by row).
+- **The switch's ratio** in the cost mode (section 38) is
+  `COST_IX_ROW / COST_SCAN`, 16. A range is scanned when the table has
+  at most 16 times its entries. It was 45/12 (3.75), a row by key
+  against a scanned row, both row by row. The switched scan now runs in
+  batches too.
+  - On the user's benchmark, `count(*), sum(c) where b < 10000` (10% of
+    `w`) is scanned in 54 ms; by the index's rows in key order it took
+    92.
+  - With batches off the switched scan is read row by row (12 a row), so
+    a range between 1/16 and 1/3.75 of a table is slower than it was.
+    The plans assume batches (section 41), so that on and off take the
+    same path and give rows in the same order.
+- **An index read alone is never switched:** its entries cost no more
+  than the table's rows (2 against 1, and fewer of them).
+- **Decided once a run** (`firstSwitch`), for the batches and the row
+  path, which may both look at the level (a batch that falls back).
+
+**Rules, not costs:** whether an index holds every column used is known
+only after the join order, when `narrow` has the statement's columns
+(lexdb 9.31). So these are rules applied after it:
+- **The first table, scanned whole, is read through an index on the
+  column a later table is looked up by** (`orderLookups`), when that
+  index holds its columns. The lookups' keys then come in order: 8 units
+  a lookup against 25. The scan it replaces costs about the same as the
+  index read alone.
+- **ORDER BY over a whole index that holds the columns** reads it in its
+  order, without a LIMIT too. `select id, b from w order by b`: 78 ms of
+  CPU against the typed sort's 226 (lexdb 9.105). An index that does not
+  hold them is not read so: at 16 a row (about 470 ns), 1M rows cost
+  more than the sort.
+
+**Not changed, and why:**
+- **The lookup's cost (`COST_DESCENT` + `COST_KEY_ROW`, 57).** Lookups
+  measure 25 now (35 before this change, by this program). Bringing the
+  model to 25 would move many hash-or-lookup choices: a hash's build is
+  20 a row, so lookups would win but against a smaller inner table. That
+  is a plan review of its own.
+- **The hash cap counting only the columns used** (section 41). `w JOIN
+  t ON t.id = w.b` would then pass the cap (`t.id`: 56 bytes a row, 56 MB
+  for 1M), and the model would hash `t`: 22M units against the lookups'
+  57M. Measured, a hash of `t` costs about 560 ms (560 ns a row built),
+  and the lookups in order now cost 101 ms in all. So the cap's change
+  needs both:
+  - the ordered lookup's cost (8), when the outer table is read through
+    an index on the key;
+  - the columns used, before the join order is chosen.
+
+  Neither is built; the cap stays as it was.
+
+**Plans changed in the suite:**
+- **`exec_joincost`'s 20-table chain** (section 36's case of a doubling
+  estimate) starts from `c1` by its index (10 rows), then each table by
+  its `p` index per row: the rules' plan. It started from `c11` and
+  hashed half the chain. The first table's index way now costs 16 a row,
+  not 45, and the N-best search past 8 tables (section 28) finds this
+  order cheaper. Both give the count 10.
+- **`exec_joincost`, `exec_joinorder`:** five plans whose first table was
+  scanned whole before lookups by its column now read it through that
+  column's index, alone (`orderLookups`). Every count is the same.
+- **`exec_switch`:** the switched queries read a column their index
+  lacks, and the cost mode's cases are at the new ratio (1,000 and 1,300
+  entries of 20,000 rows; 3 and 4 of 50).
+- **`exec_join`:** `status = 'open' and due > 5` is switched to a scan
+  now (the range holds over 1/16 of the table), so its two rows come in
+  the key's order.
+
 ## Sources
 
 - SQLite, Query Planner Next Generation: https://sqlite.org/queryplanner-ng.html

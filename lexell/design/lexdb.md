@@ -9313,3 +9313,270 @@ Found reviewing 9.104 against PostgreSQL:
 Tests: `exec_ops` has six queries, checked against PostgreSQL 18: the four
 NULL cases, UNKNOWN, and IS after a comparison, IN, LIKE and BETWEEN. The
 suite passes (110).
+
+### 9.107 Indexes in batches: read alone, their rows and lookups in key order
+
+Item 3 of [lexdb-engines.md](lexdb-engines.md). At 78731801:
+- the executor read a table's row for every index entry, even when the
+  entry held every column the query used;
+- batched lookups (9.103, `bLookup`) descended the tree from its root for
+  every key: about 40% of `w JOIN t ON t.id = w.b` (`memcmp`,
+  `Node.lower`, `childIndex`, the snapshot's descent);
+- an index path never ran in batches (`bLevelPlan` refused it);
+- `ORDER BY` over a whole index was read through it only with a LIMIT.
+
+PostgreSQL merges two index-only scans for the join (80 ms); SQLite reads
+the covering index `w_b` and looks `t` up by rowid in key order (29 ms).
+
+**An index read alone** (index-only).
+- **When** (`ixCovers`): a SELECT's level whose columns are narrowed
+  (9.31), not locking its rows, and whose index's entries hold every
+  column it uses: the index's columns, then the primary key's, which
+  every entry's key ends with.
+- **Read back:** integers of each width, booleans, texts and varchars
+  under no collation, dates, times, timestamps, uuids and byteas
+  (`idCode`). Not:
+  - a text under a collation (its key is the collation's: `ciKey`);
+  - a numeric (its key drops the scale);
+  - a float (-0 and 0 share a key);
+  - an interval;
+  - an expression's value (9.89).
+
+  Such an index is read with its rows.
+- **How:**
+  - **Batches** (`fillIdxOnly`): the entries' keys are decoded into the
+    batch's columns (`bIdxInto`, `IdxDec`): forward from the leaves in
+    place (`scanLeaves`), copied where the transaction has written the
+    range (`scan` merges its writes, as `fetchRaw` does for scans), and
+    backward copied (`scanBack`).
+  - **The row path:** `fetch` decodes them too (`idxRow`).
+  - **So:** batches on and off read the same entries, in the same order.
+- **EXPLAIN** says ", index only".
+- **Never switched to a scan** (optimizer 19): its entries cost no more
+  than the scan's rows.
+- **Reads noted** (serializable): the index's range, and no row. The
+  entries are versioned with the store, so what they hold is what the
+  rows held as of the read. Another transaction's write that could change
+  the result writes an entry in the range: an insert, a delete, a change
+  of an indexed column. Such a write conflicts, as a row read would. A
+  change to another column cannot change the result. The batches note
+  each leaf's whole range (`scanLeaves`), as for scans: a wider read.
+
+**The store's `getMany`** (new; no other store function changed).
+- **What:** many keys looked up in turn. It gives what that many
+  `get` (or `getPart`) calls give, and notes the reads as they note them,
+  in the same order: the live tree's widening included, and the
+  transaction's own writes first.
+- **How:** the lock is taken once for as many keys as it can. The path to
+  the last key's leaf is kept, each node with the key range it holds
+  (`Finger`). The next key goes up to the lowest node whose range holds
+  it, then down: on the same leaf, nothing above it is read.
+- **Interrupted:** by a node to load, and by a value stored apart (read
+  whole before the next key, as `get` does).
+- **The replica's reads** go key by key.
+
+**An index's range with its rows, in batches** (`fillIdxRows`).
+- **The keys:** a batch of entries, then their primary keys (the entries'
+  values, as `fetch` reads them), sorted (`sortKeysPerm`: by their first
+  8 bytes as an integer with `radixPerm` when they span less than 2^62,
+  an integer key's case; else by comparison).
+- **The rows** are read by `getMany`, and each is put at its entry's
+  place: the batch keeps the index's order, so the rows come out as the
+  row path gives them. That is a bitmap heap scan's reading without its
+  change of order.
+- **With reads noted** (a block that writes, a live transaction), the
+  rows are read in the index's order, as the row path's `get`s are: the
+  same reads, noted in the same order within a batch.
+- **Not where reading may stop early** (a LIMIT, `Level.stops`): 1,024
+  rows would be read for the few wanted. An index read alone does batch
+  there: its entries cost little.
+- **A short range the switch has counted** (at most a batch) is read from
+  the keys the count kept (`IxRead.byKeys`), not again, as the row path
+  does.
+
+**Lookups per row by a primary key** (`bLookup`, 9.103).
+- **The batch's keys** are made first, then read by `getMany`.
+- **Unless the reads are noted:**
+  - they are read in key order (`sortKeysPerm`; nothing to do when they
+    come in order);
+  - a key repeated is read once, its row given to each of its batch rows.
+- **With reads noted:** each key is read in the batch's order, as the row
+  path reads it.
+- **One integer key** of an integer column is encoded directly: a value
+  out of the column's range finds nothing, as `keyVal` gives it. That
+  replaced `keyVal`, `coerce` and their values' copies (about a quarter
+  of the join's profile): the join went from 218 to 102 ms with it.
+
+**The planner.**
+- **Lookups in key order** (`orderLookups`, after `narrow`). Its
+  conditions:
+  - the first table is scanned whole;
+  - a later table is looked up per row by its primary key, whose first
+    column's value is a column of the first table;
+  - an unfiltered index leading with that column holds every column the
+    first table uses.
+
+  Then the first table is read through that index, alone, so the lookups'
+  keys come in order. Not with a LIMIT and no sort (the rows it gives
+  would change), nor where the path was chosen for an order.
+- **ORDER BY over a whole index that holds the columns** is read in its
+  order, not sorted (`planSelect`). Without a LIMIT too, since no row is
+  read by key. An index that does not hold them still is not: its rows at
+  16 a row (below) cost more than the sort.
+- **The index-to-scan switch** (optimizer 19, 38) is decided once a run
+  (`firstSwitch`, `Run.sw`), by the batches (`bLevelPlan`, `batchGroups`)
+  or the row path, whichever reads first. The other uses it.
+  - **The cost mode's ratio is now 16:** an index range's entry with its
+    row in batches against a scanned row in batches (`calib_index.lxl`).
+    It was 45/12 when both were read row by row.
+  - **So a range of over 1/16 of the table is scanned in batches.** That
+    is cheaper than any reading of the index with rows:
+    `count(*), sum(c) where b < 10000` (10%) costs 54 ms scanned,
+    92 ms by the index's rows in key order.
+  - **With batches off,** such a scan is read row by row, and is slower
+    than the index would have been. The plans assume batches, as
+    optimizer 41's do: batches on and off take the same path.
+- **The first table's index way** costs 16 a row in the join order
+  (`COST_IX_ROW`), where it was 45. Optimizer 43 has the details.
+
+**Measured** (the user's benchmark, 1M-row `w` and `t`, `$S/vec/bench.py`,
+server CPU ms, median of five; base 78731801 and this build run
+alternately, two rounds; other agents' load was 2.7 to 3.9, so the base's
+times were higher than the 9.105 figures; earlier, at load 1, it gave
+226, 575, 170, 2, 158 and 597):
+
+| query | before | now | PostgreSQL, one core | SQLite |
+|---|---|---|---|---|
+| `select count(*), sum(t.id) from w join t on t.id = w.b` | 641 to 690 | **101 to 102** | 80 | 29 |
+| `select id, b, name from w where b > 90000` (100k rows) | 173 to 183 | **88 to 89** | 40 | 149 |
+| `select id, b from w order by b` | 277 to 282 | **78 to 79** | 400 | 152 |
+| `... where b between 500 and 600` (1k rows) | 3 | **2** | | |
+| `select count(*), sum(c) from w where b < 10000` | 159 to 161 | **52 to 54** | | |
+| 20,000 `select * from w where id = N` | 601 to 603 | **582 to 594** | | |
+
+- **The join:** `w_b` read alone (1M entries), each key `t.id` looked up
+  in order. A b value is repeated about ten times, and is read once. It
+  was 1M descents. What is left (profile): `bIdxInto` 18%, `bLookup`
+  15%, `bEval` 9%, the store's search (`getMany`, `Node.lower`,
+  `memcmp`) about 14%.
+- **The range of 100k rows** switches to a scan in batches (the counting
+  included). By its index's rows in key order it took 103 ms. Sorting a
+  batch's 1,024 keys puts few on a leaf (`w` has 23,332 pages), so the
+  store's search for them (`memcmp` 33%, `Node.lower` 13% in the
+  aggregate's profile) is most of it: cache misses on the leaves' pages,
+  we think (not measured).
+- **The sort** became an index read alone, in order: no sort, and the
+  wire reads the batch in order (9.105's 47% in `dataBatch` was reading
+  the sorted permutation).
+- **Point lookups:** an A/B of three rounds, alternating, gave 559 to 562
+  against the base's 591 to 598. `bLevelPlan` now makes no plan for a
+  primary key's point (every caller wanted a range). Before that change,
+  the first build was 1.7% slower than the base.
+- **`calib_index.lxl`** (in memory, a 200,000-row table, median of three
+  runs, ns; batches on):
+
+  | | before | now |
+  |---|---|---|
+  | a scan's row (the unit) | 28 | 28 |
+  | an index range's entry, the index holding the column | 911 | 57 |
+  | an index range's entry and its row (2%, rows scattered) | 1,093 | 483 |
+  | the same, reads noted (the index's order) | 1,173 | 569 |
+  | a lookup per outer row, keys in no order | 984 | 709 |
+  | the same, keys in order | 431 | 218 |
+  | the same, the outer table read through an index on the key | 964 | 266 |
+  | a row read once and hashed | 565 | 560 |
+
+**Checked against PostgreSQL 18:** 42 queries over a 3,000-row table
+with NULLs and repeats in its indexed columns, and over two smaller
+tables:
+- the indexes: one and two columns, unique with NULLs, text, date, a
+  varchar declared DESC, and a primary key of two columns;
+- the queries: ranges, points, IN lists, ORDER BY ASC and DESC with and
+  without LIMIT, MIN and MAX, aggregates, lookups INNER and LEFT, keys
+  missing, and divisions by zero.
+
+PostgreSQL and lexdb with batches on and off gave the same rows for 41.
+The texts were under COLLATE "C" in PostgreSQL. The 42nd is a LIMIT with
+no ORDER BY, where each picked other rows; lexdb gave the same rows on
+and off.
+
+**Tests:**
+- **`store_getmany`** (new): `getMany` against `get` key by key. 108
+  lists of keys, the same values and reads noted:
+  - live, snapshot and block transactions;
+  - with and without their own writes, in full and in part;
+  - keys sorted, random, repeated and past the ends;
+  - in a cache small enough that nodes are loaded meanwhile.
+
+  Four planted bugs, all caught: the widening dropped, a node's range
+  taken as closed, the own writes skipped, a node's lower bound lost.
+- **`exec_batchindex`** (new): 400 random queries over a 2,600-row table
+  with indexes of every kind above (and a collated one), run three ways:
+  batches off, on, and on to `runRows`' sink. They must agree, errors
+  included. 382 of them were also checked against the same table without
+  indexes (not a LIMIT with no order, nor an error).
+  - **What ran:** 73 read an index alone, 57 an index's rows, and 46
+    looked keys up in an index's order. 155 gave their rows as an
+    OutBatch.
+  - **Ten fixed queries:** backward over more than a batch, the whole of
+    an index, NULLs, and the collated text.
+  - **In a transaction:** 150 more with its own writes.
+  - **EXPLAIN ANALYZE's counts** are the row path's.
+  - **Write skew:** another session's insert into the range read, or of
+    a key looked up and missing, fails the commit with 40001, batches on
+    and off, through an index read alone, an index's rows and an ordered
+    lookup.
+
+  Eleven planted bugs:
+  - **Caught (nine):** NULL's marker misread, the collated text read
+    back, rows put in key order, a repeated key's row mixed up, the own
+    writes not merged, the lookups' reads not noted, the backward
+    cursor, the primary key's parts read as marked, and the noted
+    lookups' keys merged. The LIMIT guard taken off was caught by the
+    counts only: its rows were the same.
+  - **Not caught:** a change that does nothing (`ixCovers` for a level
+    reading every column: `idxDecOf` refuses it anyway), and a part
+    skipped wrongly (no query reaches a skipped part, so the skip was
+    taken out: such parts are decoded and dropped).
+- **Changed expectations:**
+  - **EXPLAIN:** ", index only", and "batches N" for index paths (12
+    tests).
+  - **Rows in another order,** both queries with no ORDER BY:
+    - `exec_ops`: `g like 'a_p%'` gives 6, 1, the index's order; it was
+      switched to a scan before.
+    - `exec_join`: `status = 'open' and due > 5` gives 2, 21: switched to
+      a scan now (a range over 1/16 of the table).
+  - **`exec_switch`:** its queries read a column their index lacks (v,
+    y), since an index read alone never switches. One query shows that
+    case. The cost mode's cases are at the new ratio: 1,000 and 1,300
+    entries of 20,000 rows, 3 and 4 of 50.
+  - **`exec_joincost`, `exec_joinorder`:** a full scan before lookups by
+    its column is read through that column's index (five plans).
+    `exec_joincost`'s 20-table chain now starts from `c1`'s index
+    (optimizer 43). Every count is the same.
+  - **`exec_batch`:** its index path now runs in batches (5 of 5).
+
+The suite passes (113).
+
+**Not done:**
+- **A merge join.** The ordered lookups took the join to 101 ms against
+  PostgreSQL's 80, so it was not tried. It would still remove the
+  lookups' per-row work, about 30% of what is left.
+- **The hash cap counting the columns used** (optimizer 41). A hash of
+  `t` builds at 560 ns a row: 560 ms for `w JOIN t`, five times the
+  ordered lookups. Counting only `t.id`, the cap would let the join
+  order hash it, since its lookup cost (57) knows nothing of the order.
+  It needs the columns used before the join order is chosen, and an
+  ordered lookup's cost (about 8). Left for its own change, with the
+  lookup's cost measured again: 709 ns now, 25 units, against the
+  model's 57.
+- **An index read alone in the join order's costs.** The columns used
+  are known after the order is chosen (`narrow`), so only the rules
+  after it (lookups in order, ORDER BY, the switch) use them.
+- **IN lists over an index, and a primary key read backward,** in
+  batches.
+- **Keys read in place:** `Node.key` makes a string per entry. The
+  store/index work is changing the index leaf, so no view of keys was
+  added.
+- **A range's rows read in key order across batches** (a true bitmap
+  heap scan): it would change the rows' order.
