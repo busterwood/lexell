@@ -8056,9 +8056,34 @@ fn runLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Ma
         }
         if at >= 0 { rs.memoRes[i][at].data = rows }
     } else if lv.virt() && lv.src >= 0 && m.subs[lv.src].series {
-        // generate_series, made as it is read (lazySeries); as execSrf's
+        // generate_series, made as it is read (lazySeries); as execSrf's.
+        // The query's only level with no conditions: each value straight to
+        // emit, counted as tryRow counts it (9.100)
         let sr = &m.subs[lv.src]
-        if len(sr.vals) == 3 {
+        let direct = len(q.levels) == 1 && len(lv.cond) == 0 && len(lv.post) == 0 && !sr.sOrdin
+        if len(sr.vals) == 3 && direct {
+            let ty = oidType(sr.sOid)
+            let dir = try compare(&sr.vals[2], &(try coerce(Val.Int(0), &ty)))
+            var v = sr.vals[0]
+            while true {
+                let c = try compare(&v, &sr.vals[1])
+                if (dir > 0 && c > 0) || (dir < 0 && c < 0) { break }
+                try rs.tick()
+                rs.cnt[k].read += 1
+                rs.cnt[k].joined += 1
+                row[lv.first] = v
+                matched = true
+                if !(try emit(txn, row)) { return Ok(false) }
+                match arithZ(&"+", &v, &sr.vals[2], &txn.zone) {
+                    Ok(x) { v = x }
+                    Err(_) { break }
+                }
+                match coerce(v, &ty) {
+                    Ok(x) { v = x }
+                    Err(_) { break }
+                }
+            }
+        } else if len(sr.vals) == 3 {
             let ty = oidType(sr.sOid)
             let dir = try compare(&sr.vals[2], &(try coerce(Val.Int(0), &ty)))
             var v = sr.vals[0]
@@ -12605,10 +12630,28 @@ fn eachRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
     let noAggs: []Val = []
     var n = 0
     var vals: []Val = []                // one row's values, the array used again for each (9.99)
+    // an output that is a column: its place in the row, found once, not by
+    // its name per row as eval does; -1 others (9.100)
+    var at: []int = []
+    var plain = true                    // every output a column: no Env made per row
+    for x in sel.exprs {
+        match x {
+            Expr.Col(name) { append(mut &at, colIndex(&q.cols, &name)) }
+            else { append(mut &at, -1) }
+        }
+        if at[len(at) - 1] < 0 { plain = false }
+    }
     try runQuery(st, txn, q, &m, params, fn(tx: mut &lexdb_store.Txn, r: &[]Val): Result[bool, DbErr] {
-        let env = Env{cols: &q.cols, row: r, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: sqe}
         while len(vals) > 0 { let x = pop(mut &vals) }
-        for x in sel.exprs { append(mut &vals, try eval(&x, &env)) }
+        if plain && len(r) == len(q.cols) {
+            for c in at { append(mut &vals, r[c]) }
+        } else {
+            let env = Env{cols: &q.cols, row: r, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: sqe}
+            for i in 0..len(sel.exprs) {
+                let c = at[i]
+                if c >= 0 && c < len(r) { append(mut &vals, r[c]) } else { append(mut &vals, try eval(&sel.exprs[i], &env)) }
+            }
+        }
         if !(try each(tx, &vals)) { return Ok(false) }
         n += 1
         return Ok(sel.limit < 0 || n < sel.limit)
@@ -19685,12 +19728,14 @@ fn batchLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &
     let noAggs: []Val = []
     // (its session: the time zone its constants are read in, 9.95; no
     // function is evaluated here, bConst)
+    var conds: []BNode = []
+    var scans: []Scan = []
+    {
     let env = Env{cols: &q.cols, row: row, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: seqEnv(st, txn)}
     // the conditions batches evaluate. Any of them, in any order: tryRow
     // checks every condition on the rows they keep, and a batch on one of
     // whose rows one gives an error goes to the row path, which tries them
     // in order (an error the row path would not reach is not given).
-    var conds: []BNode = []
     for x in lv.cond {
         let c = bCompile(&x, q, &qkinds, &env)
         if c.isNone() { continue }
@@ -19698,7 +19743,13 @@ fn batchLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &
         if !boolLike(cc.typ) { continue }
         append(mut &conds, takeN(cc))
     }
-    if len(conds) == 0 { return Ok(-1) }
+    scans = try pathScans(t, p, &env)
+    }
+    // The query's only level, every condition evaluated by the batches
+    // (none at all too): its rows go to emit straight from the batch, not
+    // through tryRow, which would check them again, and runLevel (9.100).
+    let direct = len(q.levels) == 1 && len(lv.post) == 0 && len(conds) == len(lv.cond)
+    if len(conds) == 0 && !direct { return Ok(-1) }
     var needCol: []bool = []
     for i in 0..len(t.cols) { append(mut &needCol, len(lv.need) == 0 || lv.need[i]) }
     let part = len(lv.need) > 0
@@ -19714,7 +19765,6 @@ fn batchLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &
     for x in lv.need { append(mut &needList, x) }
     let bp = BPlan{kinds: kinds, needCol: needCol, placeCol: placeCol, usedP: usedP, stopAt: stopAt,
                    missing: placesMissing(t), needP: placesNeeded(t, &needList), width: width}
-    let scans = try pathScans(t, p, &env)
     // key lookups: a row each, not worth a batch
     var ranges = false
     for sc in scans { if !sc.point && !sc.empty { ranges = true } }
@@ -19759,6 +19809,34 @@ fn batchLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &
                 break
             }
             rs.cnt[0].batches += 1
+            if direct {
+                // counted as the row path counts them: the rows dropped as
+                // read, each kept row as it goes on (a LIMIT may stop it)
+                // (counted and ticked once a batch, for the rows that went on)
+                var went = 0
+                var stopped = false
+                for j in idx {
+                    for i in 0..len(bp.kinds) {
+                        var v = Val.Null
+                        if bp.needCol[i] && !b.cols[i].nul[j] {
+                            let k = bp.kinds[i]
+                            v = if k == BK_INT { Val.Int(b.cols[i].v[j]) } else if k == BK_BOOL { Val.Bool(b.cols[i].v[j] == 1) } else { b.vals[i][j] }
+                        }
+                        row[lv.first + i] = v
+                    }
+                    matched = true
+                    went += 1
+                    if !(try emit(txn, row)) {
+                        stopped = true
+                        break
+                    }
+                }
+                rs.cnt[0].read += nr - len(idx) + went
+                rs.cnt[0].joined += went
+                try rs.tickN(nr - len(idx) + went)
+                if stopped { return Ok(1) }
+                continue
+            }
             // the rows dropped count as read, as the row path counts them
             try rs.tickN(nr - len(idx))
             rs.cnt[0].read += nr - len(idx)

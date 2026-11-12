@@ -8490,3 +8490,81 @@ give much. Running the executor a batch of rows at a time could.
     own table works.
 
 The suite passes (107).
+
+### 9.100 The executor's rows a batch at a time, to the output
+
+The user asked to look at batching the executor after 9.99. A query's
+rows already went to the client as made, but each went through the
+executor's row machinery:
+- `tryRow`, which checks the level's conditions again;
+- the joined row;
+- `runLevel` and `emit`;
+- `eval`, which looks up every output column by name;
+- an `Env` built per row, copying the store handle and the time zone.
+
+The batches of 9.47 and 9.52 decode and filter a scan a batch at a time,
+but they gave kept rows back to `tryRow`, and a scan with no condition did
+not batch at all.
+
+**The changes:**
+- **Direct rows from a batched scan** (`batchLevel`).
+  - **When:** the scanned table is the query's only level, it has no LEFT
+    JOIN conditions after, and every condition compiles to the batches'
+    form (or there is none).
+  - **What:** each kept row goes from the batch into the joined row and
+    straight to `emit`.
+  - **Counting:** rows read and kept are counted, and the statement's time
+    ticked, once a batch, for the rows that went on. EXPLAIN ANALYZE's
+    counts are the row path's, a LIMIT's stop included.
+  - **Unchanged:** an error in a batch, or a value a batch cannot hold,
+    still sends the rest of the scan to the row path.
+  - **Also:** scans with no condition now batch (EXPLAIN ANALYZE shows
+    "batches N").
+- **`generate_series` straight to `emit`:** an integer series that is the
+  query's only level, with no condition and no ordinality (9.99's lazy
+  series).
+- **Output columns found once** (`eachRow`): an output that is a column is
+  copied from its place in the row, found once, not by `eval` by name per
+  row. When every output is a column, no `Env` is made per row.
+- **An integer's text** in a DataRow is made by the runtime's conversion.
+  It beat writing its digits a byte at a time: 277 against 265 ms below.
+
+**Measured,** 1M rows to psql (`-A -t` to /dev/null), median of three, ms
+(server CPU in brackets):
+
+| | `SELECT id, code FROM t` | `generate_series` form |
+|---|---|---|
+| before streaming (4afc101b) | 696 (600) | 792 (700) |
+| streamed (9.99) | 480 (430) | 506 (450) |
+| DataRows written straight (9.99) | 452 (400) | 492 (440) |
+| these changes | **256 (190)** | **362 (300)** |
+| PostgreSQL 18, same machine | 123 | 212 |
+
+So a scan to the client is 2.7 times faster than before streaming, and
+about twice PostgreSQL's time.
+
+**What is left** (profile of the table scan):
+- the direct loop's per-row work, about 20%: a Val per column, assigned
+  into the joined row;
+- `Wire.dataRow`, about 13%, and `binary.addU32BE`'s four bytes at a time,
+  5%;
+- decoding (`bRunInto`), about 10%;
+- reference counting, about 10%;
+- a new batch's arrays for every batch (`newBatch`), 3.5%.
+
+**Next steps,** if wanted:
+- **A sink that takes a batch** (columns, not rows): the wire would write
+  DataRows from the batch's columns. That removes the joined row, the Val
+  per value and the callback per row.
+- **One batch's arrays used again.**
+- **Joins and index paths:** they still take the row path for their rows.
+
+**Tests:**
+- `exec_srf`: a series straight to the output, with its steps, the end of
+  bigint's and of integer's range, a LIMIT stopping it, and an empty one.
+- `exec_batch`: its "limit stops" EXPLAIN ANALYZE line is unchanged
+  (514 read, 3 kept). Three shapes the aggregate batches leave to the row
+  path now batch their scan, with the same results.
+- `exec_sub`: one EXPLAIN ANALYZE line shows "batches 1".
+
+The suite passes (107).
