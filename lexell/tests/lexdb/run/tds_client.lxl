@@ -3,7 +3,10 @@
 // for the login only (Encrypt=no) and for everything; batches of
 // lexdb's dialect with their row counts and result sets; every lexdb type
 // as its TDS type; errors by SQL Server's numbers, the batch ending at the
-// first; the SET options drivers send, NOCOUNT kept; passwords checked
+// first; the SET options drivers send, NOCOUNT kept; stage S2: parameters
+// (sp_executesql), OUTPUT parameters, Transaction Manager transactions,
+// T-SQL variables, nested transactions with statement-level rollback,
+// XACT_ABORT, savepoints, lexdb's dialect, RESETCONNECTION; passwords checked
 // against the roles' verifiers under scram-sha-256; the database asked for.
 // needs: ssl
 // expect: plain: login only tds 0x74000004 database lexdb version 16.0.4315 collation 1033
@@ -19,12 +22,32 @@
 // expect: divide: error 8134
 // expect: duplicate: error 2627
 // expect: syntax: error 102
-// expect: first error ends the batch: 1,2,3,4
+// expect: errors do not end the batch: 1,2,3,4,5
 // expect: date out of range: error 8115
 // expect: set options: ok
 // expect: nocount: -1
 // expect: count again: 1
-// expect: implicit transactions: error 50000
+// expect: implicit transactions: 1 then 0
+// expect: parameters: 42 'héllo' NULL true 2.5 12.34 x'78'
+// expect: parameter compared: 'café'
+// expect: parameters twice: 2,3
+// expect: output parameter: 42
+// expect: transaction committed: 7
+// expect: transaction rolled back: 0
+// expect: variables: 10 'ten' 3
+// expect: select assigns: 5 2
+// expect: undeclared: error 137
+// expect: nested: 2 1 0, rows 1
+// expect: statement rolled back: 2627 then 1 row, trancount 2
+// expect: xact_abort: 2627, trancount 0, rows 0
+// expect: savepoint: 1
+// expect: commit without begin: error 3902
+// expect: syntax error runs nothing: error 102, rows 0
+// expect: unknown table ends the batch: error 208, rows '40'
+// expect: quoted identifier off: 'str'
+// expect: brackets and N strings: 'café'
+// expect: postgres dialect: 4
+// expect: reset: resets 1, trancount 0, nocount off 1
 // expect: tls: full
 // expect: login only: login only
 // expect: scram: app
@@ -37,6 +60,7 @@ import "task"
 import "net"
 import "strings"
 import "sqlserver"
+import "sqldialect"
 import "../../../lib/tests/support/tlstest"
 import "../../../cmd/lexdb_store"
 import "../../../cmd/lexdb_disk"
@@ -98,12 +122,97 @@ fn err(r: Result[int, sqlserver.Error]): str {
     }
 }
 
+fn q1(c: mut &sqlserver.Conn, sql: &str): str {
+    match c.query(sql.toStr(), &[]) {
+        Ok(r) {
+            var out: []str = []
+            for i in 0..r.rowCount() { append(mut &out, values(&r, i)) }
+            return strings.join(&out, ",")
+        }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+// Stage S2: RPC, transactions, T-SQL variables.
+fn s2(c: mut &sqlserver.Conn) {
+    match c.query("SELECT @p1 + 1 AS a, @p2 AS b, @p3 AS c, @p4 AS d, @p5 AS e, @p6 AS f, @p7 AS g",
+                  &[sqldialect.Value.Int(41), sqldialect.Value.Text("héllo"), sqldialect.Value.Null, sqldialect.Value.Bool(true), sqldialect.Value.Float(2.5f), sqldialect.Value.Dec(12.34m), sqldialect.Value.Bytes("x")]) {
+        Ok(r) { println("parameters: " + values(&r, 0)) }
+        Err(e) { println("parameters: error " + e.code.toStr() + " " + e.msg) }
+    }
+    match c.query("select name from t where id = @p1", &[sqldialect.Value.Int(1)]) {
+        Ok(r) { println("parameter compared: " + values(&r, 0)) }
+        Err(e) { println("parameter compared: error " + e.code.toStr() + " " + e.msg) }
+    }
+    match c.query("select @p1 + 1 union all select @p1 + 2 order by 1", &[sqldialect.Value.Int(1)]) {
+        Ok(r) { println("parameters twice: " + r.text(0, 0).unwrap() + "," + r.text(1, 0).unwrap()) }
+        Err(e) { println("parameters twice: error " + e.code.toStr() + " " + e.msg) }
+    }
+    let outs = [sqlserver.Out{name: "@total", sqlType: "int"}]
+    match c.call("SET @total = @p1 * 2", &[sqldialect.Value.Int(21)], &outs) {
+        Ok(r) { println("output parameter: " + values(&r.outputs, 0)) }
+        Err(e) { println("output parameter: error " + e.code.toStr() + " " + e.msg) }
+    }
+    c.exec("create table acct (id int primary key, n int)").unwrap()
+    let tc = c.transaction(fn(x: mut &sqlserver.Conn): Result[int, sqlserver.Error] {
+        return x.run("insert into acct values (@p1, 7)", &[sqldialect.Value.Int(1)])
+    })
+    println("transaction committed: " + q1(c, &"select n from acct"))
+    let tr = c.transaction(fn(x: mut &sqlserver.Conn): Result[int, sqlserver.Error] {
+        let n = try x.run("insert into acct values (2, 8)", &[])
+        return Err(sqldialect.inputError("no"))
+    })
+    println("transaction rolled back: " + q1(c, &"select count(*) from acct where id = 2"))
+    println("variables: " + q1(c, &"DECLARE @n int = 10, @s nvarchar(10); SET @s = N'ten'; DECLARE @k int; SELECT @k = count(*) FROM t WHERE id < 4; SELECT @n, @s, @k"))
+    println("select assigns: " + q1(c, &"DECLARE @a int, @b int; SELECT @a = max(id), @b = count(*) FROM t WHERE id IN (2, 5); SELECT @a, @b"))
+    println("undeclared: " + q1(c, &"SELECT @nope"))
+    println("nested: " + q1(c, &"BEGIN TRAN; BEGIN TRANSACTION; INSERT INTO acct VALUES (10, 1); DECLARE @a int = @@TRANCOUNT; COMMIT; DECLARE @b int = @@TRANCOUNT; COMMIT TRAN; SELECT @a, @b, @@TRANCOUNT") +
+            ", rows " + q1(c, &"select count(*) from acct where id = 10"))
+    let sr = c.exec("BEGIN TRAN; INSERT INTO acct VALUES (10, 2); INSERT INTO acct VALUES (11, @@TRANCOUNT); COMMIT")
+    let srCode = match sr {
+        Ok(_) { 0 }
+        Err(e) { e.code }
+    }
+    println("statement rolled back: " + srCode.toStr() + " then " + q1(c, &"select count(*) from acct where id = 11") + " row, trancount " +
+            q1(c, &"select n from acct where id = 11"))
+    let xa = c.exec("SET XACT_ABORT ON; BEGIN TRAN; INSERT INTO acct VALUES (12, 1); INSERT INTO acct VALUES (10, 3); INSERT INTO acct VALUES (13, 1); COMMIT")
+    let xaCode = match xa {
+        Ok(_) { 0 }
+        Err(e) { e.code }
+    }
+    c.exec("SET XACT_ABORT OFF").unwrap()
+    println("xact_abort: " + xaCode.toStr() + ", trancount " + q1(c, &"select @@trancount") + ", rows " + q1(c, &"select count(*) from acct where id in (12, 13)"))
+    println("savepoint: " + q1(c, &"BEGIN TRAN; INSERT INTO acct VALUES (20, 1); SAVE TRAN s1; INSERT INTO acct VALUES (21, 1); ROLLBACK TRAN s1; COMMIT; SELECT count(*) FROM acct WHERE id IN (20, 21)"))
+    println("commit without begin: " + q1(c, &"COMMIT"))
+    let se = q1(c, &"INSERT INTO acct VALUES (30, 1); SELEC 1")
+    println("syntax error runs nothing: " + se + ", rows " + q1(c, &"select count(*) from acct where id = 30"))
+    let ut = c.exec("INSERT INTO acct VALUES (40, 1); SELECT * FROM nope; INSERT INTO acct VALUES (41, 1)")
+    let utCode = match ut {
+        Ok(_) { 0 }
+        Err(e) { e.code }
+    }
+    println("unknown table ends the batch: error " + utCode.toStr() + ", rows " + q1(c, &"select string_agg(id::text, ',') from acct where id in (40, 41)"))
+    println("quoted identifier off: " + q1(c, &"SET QUOTED_IDENTIFIER OFF; SELECT \"str\"") )
+    c.exec("SET QUOTED_IDENTIFIER ON").unwrap()
+    println("brackets and N strings: " + q1(c, &"SELECT [name] AS [the name] FROM [t] WHERE [id] = 1 AND N'ok' = N'ok'"))
+    c.exec("SET LEXDB_DIALECT POSTGRES").unwrap()
+    println("postgres dialect: " + q1(c, &"select count(*) from t where name is not null and \"id\" > 0"))
+    c.exec("SET LEXDB_DIALECT TSQL").unwrap()
+    // a pooled connection given back: the next request asks for RESETCONNECTION
+    c.exec("SET NOCOUNT ON; BEGIN TRAN").unwrap()
+    c.exec("COMMIT").unwrap()
+    let rel = c.release()
+    c.reuse().unwrap()
+    let n = c.run("update acct set n = n where id = 1", &[]).unwrap()
+    println("reset: resets " + c.resets().toStr() + ", trancount " + q1(c, &"select @@trancount") + ", nocount off " + n.toStr())
+}
+
 fn client(st: &lexdb_store.Store, port: &str) {
     let plain = cs(port, &"sa", &"anything", &"Encrypt=no;TrustServerCertificate=yes")
     var c = connect(&plain)
     println("plain: " + c.encryption() + " tds 0x" + strings.hex(c.tdsVersion()) + " database " + c.database() +
             " version " + c.serverVersion() + " collation " + c.collation().lcid.toStr())
-    c.exec("create table t (id int primary key, name text, amount numeric(10,2), at timestamp)").unwrap()
+    c.exec("create table t (id int primary key, name text, amount numeric(10,2), at datetime2)").unwrap()
     println("create, insert: " + err(c.run("insert into t values (1, 'café', 12.5, '2026-11-11 10:00'), (2, null, -3.1, null), (3, 'naïve 😀', 0, '2000-01-01')", &[])))
     println("update: " + err(c.run("update t set amount = amount where id < 3", &[])))
     println("select: " + show(c.query("select * from t order by id", &[])))
@@ -113,7 +222,7 @@ fn client(st: &lexdb_store.Store, port: &str) {
     }
     let typed = "select 7::int2 as a, -8 as b, 9000000000 as c, true as d, 1.5::float8 as e, 0.25::real as f, " +
                 "123456789012345678901234567890.123 as g, '\\x00ff'::bytea as h, '00000000-0000-0000-0000-000000000001'::uuid as i, " +
-                "'2026-11-11'::date as j, '13:14:15.5'::time as k, '2026-11-11 10:00:00.25'::timestamp as l, " +
+                "'2026-11-11'::date as j, '13:14:15.5'::time as k, '2026-11-11 10:00:00.25'::datetime2 as l, " +
                 "'2026-11-11 10:00:00+00'::timestamptz as m, interval '1 day' as n, 'text' as o"
     match c.query(typed, &[]) {
         Ok(rows) {
@@ -125,7 +234,7 @@ fn client(st: &lexdb_store.Store, port: &str) {
         Err(e) { println("types: error " + e.code.toStr() + " " + e.msg) }
     }
     let nulls = "select null::int2, null::int, null::int8, null::bool, null::float8, null::real, null::numeric, null::bytea, " +
-                "null::uuid, null::date, null::time, null::timestamp, null::timestamptz, null::text"
+                "null::uuid, null::date, null::time, null::datetime2, null::timestamptz, null::text"
     match c.query(nulls, &[]) {
         Ok(rows) { println("nulls: " + values(&rows, 0)) }
         Err(e) { println("nulls: error " + e.code.toStr() + " " + e.msg) }
@@ -139,7 +248,7 @@ fn client(st: &lexdb_store.Store, port: &str) {
     println("duplicate: " + err(c.run("insert into t values (1, 'again', 0, null)", &[])))
     println("syntax: " + err(c.run("selec 1", &[])))
     let r = c.run("insert into t values (4, 'a', 0, null); insert into t values (1, 'dup', 0, null); insert into t values (5, 'b', 0, null)", &[])
-    println("first error ends the batch: " + c.query("select string_agg(id::text, ',' order by id) from t", &[]).unwrap().text(0, 0).unwrap())
+    println("errors do not end the batch: " + c.query("select string_agg(id::text, ',' order by id) from t", &[]).unwrap().text(0, 0).unwrap())
     println("date out of range: " + show(c.query("select '0044-03-15 BC'::date", &[])))
     match c.exec("SET QUOTED_IDENTIFIER OFF; SET TEXTSIZE 4096\nSET ANSI_NULLS, ANSI_PADDING ON SET TRANSACTION ISOLATION LEVEL READ COMMITTED") {
         Ok(_) { println("set options: ok") }
@@ -149,10 +258,12 @@ fn client(st: &lexdb_store.Store, port: &str) {
     println("nocount: " + err(c.run("update t set amount = 1 where id = 1", &[])))
     c.exec("SET NOCOUNT OFF").unwrap()
     println("count again: " + err(c.run("update t set amount = 1 where id = 1", &[])))
-    match c.exec("SET IMPLICIT_TRANSACTIONS ON") {
-        Ok(_) { println("implicit transactions: accepted") }
-        Err(e) { println("implicit transactions: error " + e.code.toStr()) }
-    }
+    c.exec("SET IMPLICIT_TRANSACTIONS ON").unwrap()
+    let it1 = c.query("update t set amount = 2 where id = 1; select @@trancount", &[]).unwrap().text(0, 0).unwrap()
+    let it2 = c.query("commit; select @@trancount", &[]).unwrap().text(0, 0).unwrap()
+    c.exec("SET IMPLICIT_TRANSACTIONS OFF").unwrap()
+    println("implicit transactions: " + it1 + " then " + it2)
+    s2(mut &c)
     c.exec("create role app login password 'S3cret'").unwrap()
     c.exec("create role ro password 'S3cret'").unwrap()
     c.exec("grant select on t to app").unwrap()
