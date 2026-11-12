@@ -7387,8 +7387,13 @@ They work in a SELECT's FROM, UPDATE's FROM, DELETE's USING, views and
 subqueries. `FromItem.using` holds the names, and `natural` the NATURAL.
 
 **The join.** In `buildQuery`, as each FROM item is added, its USING
-becomes an ON: `left.a = right.a AND ...`. That ON's conjuncts join the
-item's own, so paths and hashing use them as any equality.
+becomes an ON: `left.a = right.a AND ...`. That ON is resolved as a
+written one is, so char(n)'s casts (9.94) and enums' order apply. Its
+conjuncts join the item's own, so paths and hashing use them as any
+equality.
+- **Columns read.** A SELECT reads only the columns it names (9.31).
+  USING's names count as named. NATURAL's names are known only from the
+  tables, so a NATURAL JOIN reads its tables whole.
 - **The left side** is the join tree since the last comma (FromItem.comma),
   as in PostgreSQL. So `FROM a, b JOIN c USING (id)` joins b and c, while
   in `a CROSS JOIN b JOIN c USING (id)` id is ambiguous.
@@ -7410,8 +7415,8 @@ item's own, so paths and hashing use them as any equality.
   - in a FULL join, `COALESCE(left, right)`: the left's `using` holds the
     right's name, and `colExpr` makes the call.
 - `resolveName` passes over the hidden side, so a bare `dept` is not
-  ambiguous. A qualified `emp.dept` or `dept.dept` still names either
-  side.
+  ambiguous. A qualified `emp.dept` or `dept.dept` still names that side
+  alone, after a FULL JOIN too.
 - **`*` puts the merged columns first,** then the rest of the left, then
   the rest of the right, as PostgreSQL does. `ColDef.pos` holds each
   column's place, set when the query has a USING. `t.*` gives all of t's
@@ -7424,7 +7429,7 @@ item's own, so paths and hashing use them as any equality.
 - In a subquery, a FULL JOIN's merged name means the left side, not the
   COALESCE.
 
-**Tests:** `exec_joinusing`, 48 statements generated from PostgreSQL 18 by
+**Tests:** `exec_joinusing`, 57 statements generated from PostgreSQL 18 by
 `gen_pg.py joinusing`, all the same. They cover:
 - inner, LEFT, RIGHT and FULL joins with USING, and with two names;
 - `*`, `e.*` and `d.*`, bare and qualified names;
@@ -7435,4 +7440,260 @@ item's own, so paths and hashing use them as any equality.
   one (its bare name its own table's, as in PostgreSQL), UPDATE ... FROM
   with one;
 - the comma's join tree;
+- after the merge with 9.94: char(3) against char(5) through USING and
+  NATURAL, a qualified name after a FULL JOIN, and `count(*)` over a USING
+  join (the columns read);
 - the errors.
+
+(0A000; done in 9.94); multi-dimensional arrays; `array_fill`,
+`array_reverse`, `array_sort`; json (a decision).
+
+### 9.94 DISTINCT ON, FETCH FIRST, row comparisons, char(n) and other small forms
+
+Item 2 of design/lexdb-gaps.md's proposed order: the small query forms
+applications meet, each refused or a syntax error before. `JOIN ... USING`
+and `NATURAL JOIN`, of the same item, are 9.93.
+
+**DISTINCT ON (exprs).**
+- Planned as PostgreSQL's `transformDistinctOnClause`. The ORDER BY items
+  that are DISTINCT ON's come first, else 42P10. The DISTINCT ON
+  expressions ORDER BY lacks are sorted by after it.
+- Items are matched by text; a position or an output name means that
+  output column's expression (`outText`), as both clauses read them.
+- After the sort, the first row of each run of equal keys is kept: the
+  first `donKey` sort values, NULLs equal. This is before OFFSET and LIMIT.
+- Such a query always sorts: no index order, no top-N cut, not streamed.
+- With FOR UPDATE it is 0A000, as in PostgreSQL.
+
+**FETCH FIRST | NEXT [n] ROW | ROWS ONLY | WITH TIES**, after `OFFSET n
+[ROW | ROWS]` or before it.
+- FETCH is LIMIT. Its n is a constant, a parameter or in parentheses; 1
+  when not given.
+- LIMIT with FETCH, or OFFSET twice, is 42601.
+- WITH TIES keeps the rows whose ORDER BY values equal the last row kept.
+  Without ORDER BY it is 42601, and with SKIP LOCKED 42601, as in
+  PostgreSQL. With FOR UPDATE it is 0A000 here, where PostgreSQL allows it.
+
+**Row comparisons.** `(a, b)` and `ROW(a, b)` are the call `row`, and are
+only compared. The parser expands each comparison into its fields'
+(`rowCmp`), with PostgreSQL's NULL rules:
+- `=` is the pairs ANDed, `<>` ORed.
+- `(a, b) < (c, d)` is `a <= c AND (a < c OR (a = c AND b < d))`.
+  - The first conjunct is true whenever the whole is, and lets an index on
+    a serve the comparison as a range.
+  - So keyset pagination, `WHERE (a, b) > ($1, $2) ORDER BY a, b LIMIT n`
+    on a two-column key, reads from a's bound. b's bound is checked on
+    each row read, where PostgreSQL's index starts exactly there.
+- Also expanded: IN lists of rows (the equalities ORed), NOT IN, BETWEEN
+  [SYMMETRIC] (`cmpOf`), IS [NOT] NULL (each field), IS [NOT] DISTINCT
+  FROM.
+- Rows of unequal length are 42601.
+
+**A row against a subquery:** `(a, b) op (SELECT x, y ...)`, `IN
+(SELECT ...)`, `= ANY` and `<> ALL`.
+- `rowSub` makes a scalar subquery over a derived table, `(SELECT ... FROM
+  (subquery) AS "#row"("#1", "#2"))`, which the row's columns reach as
+  outer values.
+- For op, it gives the row comparison of the one row: NULL for no rows,
+  21000 for two.
+- For IN, it gives the best of the rows' answers: true, else NULL, else
+  false (as max over 2, 1, 0).
+- It is correlated, so it runs once per outer row: no hash, no index.
+- Too many or too few columns is 42601. A subquery or window call inside
+  such a row is 0A000.
+- A row anywhere else (`SELECT (1, 2)`) is 0A000: lexdb has no composite
+  values.
+
+**char(n), character(n), bpchar** (OID 1042; its array 1014). `char` and
+`character` alone are char(1); `bpchar` has no length.
+- **Values.** A value is kept and shown padded with blanks to n. An
+  assignment longer than n is 22001 unless only blanks are cut; an explicit
+  cast cuts anything (`bpcharOf`).
+- **Casts put in by the resolver.** A value carries no type, so `resolve`
+  puts in the casts PostgreSQL's types imply:
+  - `#bptrim(x)` (the blanks taken off) wherever PostgreSQL casts bpchar to
+    text: `||`, a cast to text or varchar, and a comparison with a text;
+  - the same for the text functions (`length`, `upper`, `substr`,
+    `string_agg` ...). These keep the blanks, as PostgreSQL's do:
+    `concat`, `concat_ws`, `format`, `octet_length`, LIKE, SIMILAR TO, `~`,
+    COALESCE, CASE, GREATEST, LEAST, the other aggregates and the window
+    functions (`bpKeeps`);
+  - a comparison of a char with a char, a literal, a parameter or a varchar
+    compares both without their blanks (`bpCmp`). `=` between a char(n)
+    column and a value pads the value to n instead (`#bppad`), so an index
+    serves it; IN lists the same. NULLIF and IS DISTINCT FROM the same.
+  - IN (subquery) compares without blanks on both sides (`inVal`).
+- **Stored expressions:** a CHECK, an index's predicate and a DEFAULT get
+  the same casts when they are evaluated (`bpEval`, `bpFix`).
+- **Assignment:** a char given to a text or varchar column (UPDATE's SET,
+  DO UPDATE's SET, INSERT ... SELECT) loses its blanks.
+- **The catalog:** pg_type's rows; `format_type` gives `character(n)` or
+  `bpchar`; atttypmod is n + 4; information_schema gives `character` and the
+  lengths; psql's `\d` shows `character(3)`.
+
+**CREATE INDEX [CONCURRENTLY] ON t (...)** without a name takes
+PostgreSQL's (`chooseIndexName`, after `ChooseIndexName`).
+- The name is t, the columns' names joined by _, and `idx`: `t_a_b_idx`.
+- An expression's name (`indexColName`) is its call's name (`t_lower_idx`),
+  a cast's operand's (else its type's), `case`, or `expr`.
+- A name given twice is numbered: `t_a_a1_idx`.
+- It is cut to 63 bytes as `makeObjectName` cuts, the longer part first.
+- While a relation of t's schema has the name, `idx1`, `idx2` and on are
+  tried.
+- A unique index is `_idx` too, as PostgreSQL's CREATE UNIQUE INDEX.
+- IF NOT EXISTS without a name is 42601.
+
+**SIMILAR TO, NOT SIMILAR TO [ESCAPE e], `substring(x SIMILAR p ESCAPE
+e)`, `substring(x FROM p FOR e)`** (`lexdb_func.similarRe`). The pattern
+is turned into a regular expression as PostgreSQL's `similar_to_escape`
+turns it:
+- `%` is `.*`, `_` is `.`, `(` is `(?:`; `.`, `^`, `$` and `\` are literal;
+  a bracket is passed as it is;
+- the escape character makes the next character literal (a letter: its
+  class, `\d`). The default is `\`; `''` means none; a longer one is 22025;
+- the whole is anchored, `^(?:...)$`, and `.` matches a newline;
+- two escape-double-quotes divide it, `^(?:a){1,1}?(b){1,1}(?:c)$`, and
+  substring gives b; a third is 2200C.
+
+**x [NOT] LIKE | ILIKE ANY | SOME | ALL (array or subquery)** is the call
+`any like`, `all not like` and the like.
+- The NOT is each element's, as in PostgreSQL.
+- `quantified` gives ANY's and ALL's NULL rules.
+- A subquery is read as `ARRAY(subquery)` (`arrayOfSub`).
+- `x op ANY | ALL (subquery)` for the other comparison operators is done
+  the same way. It was 0A000 (only `= ANY` and `<> ALL` are IN), so
+  exec_any's expectation changed.
+
+**BETWEEN SYMMETRIC** is `(x >= a AND x <= b) OR (x >= b AND x <= a)`, as
+PostgreSQL's parser writes it. ASYMMETRIC is accepted.
+
+**percent_rank() and cume_dist()** are double precision, computed as
+floats (they were numeric). exec_window's described type changed.
+
+**VACUUM, ANALYZE (ANALYSE), CHECKPOINT, REINDEX and CLUSTER** are
+`S_MAINT`. lexdb has nothing for them to do, so they are checked as
+PostgreSQL checks them, do nothing, and give its tags (`maint`).
+- **The forms:**
+  - `VACUUM [(options)] [FULL] [FREEZE] [VERBOSE] [ANALYZE] [[ONLY] t
+    [(cols)], ...]`, and ANALYZE the same;
+  - `REINDEX [(options)] {INDEX | TABLE | SCHEMA | DATABASE | SYSTEM}
+    [CONCURRENTLY] [name]`;
+  - `CLUSTER [(options)] [VERBOSE] [t [USING index]]`.
+- **The checks:**
+  - an unknown option is 42601;
+  - columns without ANALYZE, FULL with PARALLEL, and REINDEX SYSTEM
+    CONCURRENTLY are 0A000;
+  - a table not there is 42P01;
+  - a column not there is 42703, and one named twice 42701;
+  - an index not there is 42P01, or 42704 for CLUSTER; an index not the
+    table's is 42809;
+  - a schema not there is 3F000; a database other than lexdb 0A000;
+  - REINDEX and CLUSTER of a view are 42809 (VACUUM and ANALYZE accept a
+    view, where PostgreSQL warns).
+- `t_pkey` is found, though lexdb keeps no index apart from the table for
+  it.
+- **In a block, 25001:** VACUUM; REINDEX CONCURRENTLY, DATABASE and SYSTEM;
+  CLUSTER without a table.
+
+**GROUP BY ROLLUP, CUBE, GROUPING SETS and (), GROUP BY DISTINCT, and
+GROUPING()** are built.
+- **The parser** (`groupBy`, `groupItem`) crosses the items' sets: ROLLUP's
+  prefixes; CUBE's subsets, the larger first as PostgreSQL lists them, at
+  most 12 elements; GROUPING SETS' items one after another, nested ones
+  too.
+  - An element may be `(a, b)`; `GROUP BY (a, b)` is `a, b`.
+  - Each expression goes in `group` once, and `gsets` holds the sets as
+    places in it.
+  - DISTINCT drops a set listed again.
+- **The planner** makes, per set, its select list, ORDER BY and HAVING
+  (`setSubst`):
+  - an expression grouped by but not in the set is NULL;
+  - GROUPING(a, ...) is its bits, the first argument's highest, 1 for an
+    argument not in the set. It is cast, so ORDER BY does not read it as a
+    column's place;
+  - a plain GROUP BY is one set of all, its GROUPING() 0;
+  - a GROUPING argument that is not grouped by, or GROUPING without GROUP
+    BY, is 42803.
+- **Execution:** each row joins a group of each set, keyed by the set and
+  its values (`addToGroup`). The batched grouping (9.47) does not run.
+  With no rows, each empty set gives its group, so `ROLLUP(a)` over nothing
+  gives one row, as in PostgreSQL.
+
+**Tests.** `exec_forms`, 300 statements generated from PostgreSQL 18 by
+`gen_pg.py forms` (a new suite, seed 94), all the same. The reference
+server was a scratch PostgreSQL 18.6 (en_US.UTF-8). They cover:
+- percent_rank's and cume_dist's values and types;
+- each maintenance statement, its options, errors, views, and its
+  behaviour in a block;
+- BETWEEN SYMMETRIC with NULLs and in WHERE;
+- LIKE, ILIKE and NOT LIKE ANY and ALL over arrays, NULLs and subqueries;
+  `> ALL` and `< ANY` over subqueries, correlated too;
+- SIMILAR TO's operators, escapes, brackets, classes and errors;
+  substring's three forms and their separators;
+- DISTINCT ON:
+  - with ORDER BY's directions, positions and aliases, expressions,
+    grouping, windows and joins;
+  - LIMIT, OFFSET and FETCH, in a subquery, a CTE, a view and IN;
+  - its 42P10, and FOR UPDATE;
+- FETCH FIRST's forms and errors; WITH TIES with NULLs, OFFSET, grouping,
+  UNION, VALUES and IN;
+- unnamed indexes: columns, expressions, repeats, numbering past a table of
+  the name, a schema, long names, `pg_indexes`;
+- row comparisons:
+  - each operator with NULLs; IN lists; IS NULL and IS DISTINCT FROM;
+  - in WHERE, correlated and not;
+  - against subqueries with =, <, IN, NOT IN and = ANY, and their errors;
+  - keyset pagination on a two-column key, BETWEEN of rows;
+- char(n):
+  - casts, padding, lengths and the text functions;
+  - comparisons with texts, varchars, literals and chars of other lengths;
+  - a char(3) key looked up, IN lists, ranges, LIKE;
+  - joins, GROUP BY, DISTINCT, aggregates, UPDATE, RETURNING, ON CONFLICT;
+  - CHECK, DEFAULT and a filtered index over one; INSERT ... SELECT into
+    text and varchar;
+  - information_schema, `pg_attribute`, `format_type`, `pg_type`, CREATE
+    TABLE AS, ALTER COLUMN TYPE;
+  - IN (subquery), correlated too;
+- ROLLUP, CUBE, GROUPING SETS (nested, mixed with plain columns, DISTINCT),
+  `()`, GROUPING with its errors, HAVING, FILTER, ORDER BY GROUPING, no
+  rows, char columns.
+
+The whole lexdb suite passes.
+
+**Differences from PostgreSQL, left as they are:**
+- **char:**
+  - ORDER BY, GROUP BY, DISTINCT, MIN, MAX, GREATEST and LEAST compare the
+    padded values. For a char(n) column's values, all n long, that is the
+    same order, except where a character below the blank (a tab) follows a
+    common start. For bpchar without a length, `'a'` and `'a '` are two
+    groups where PostgreSQL has one.
+  - A range (`<`, `>`, BETWEEN) on a char column, and an index on an
+    expression over one, do not use the index: the resolver's casts change
+    the expression. The results are right.
+  - The elements of an array of char(n) are not padded.
+  - `pg_get_constraintdef` shows `'x'::text` where PostgreSQL shows
+    `'x'::bpchar`.
+  - INSERT ... VALUES of a char expression into a text column keeps its
+    blanks.
+- **SIMILAR TO's substring:** PostgreSQL's ARE makes its first part as a
+  whole as short as can be. Here each of that part's quantifiers is made
+  non-greedy, under Perl's rules. Patterns whose first part has
+  alternatives may divide otherwise. The regular expressions are RE2's
+  (9.92).
+- **Rows against subqueries** run once per outer row.
+- **CLUSTER t without USING** is accepted. PostgreSQL gives 42704 unless t
+  was clustered before; lexdb keeps no clustered index.
+- **The maintenance statements:**
+  - those not in a block are accepted in a read-only transaction and on a
+    replica;
+  - a catalog table (`VACUUM pg_class`) is 42P01.
+- **FOR UPDATE with WITH TIES** is 0A000.
+- **Index names** come from lexdb's own call names, which differ for a few:
+  `trim` is `btrim`, `extract` is `date_part`.
+
+**Not done:**
+- window functions in a query with grouping sets (0A000);
+- the primary key's functional dependency with grouping sets (a column must
+  be grouped by);
+- row values outside comparisons (composite types);
+- `(SELECT x, y) = (a, b)` with the subquery on the left.

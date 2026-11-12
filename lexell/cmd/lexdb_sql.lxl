@@ -51,6 +51,7 @@ pub const OID_INT2 = 21
 pub const OID_INT4 = 23
 pub const OID_TEXT = 25
 pub const OID_VARCHAR = 1043
+pub const OID_BPCHAR = 1042     // char(n), character(n), bpchar (9.94): blank-padded to n (len), compared without them
 pub const OID_NUMERIC = 1700
 pub const OID_DATE = 1082
 pub const OID_TIME = 1083
@@ -73,8 +74,8 @@ pub const OID_UNKNOWN = 705
 // The array types: element OIDs and, at the same places, their arrays'.
 // int2vector (22) and oidvector (30) are arrays of int2 and oid here, after
 // int2[] and oid[] so that those are the arrays of int2 and oid (9.80).
-const ELEM_OIDS: []int = [16, 21, 23, 25, 1043, 20, 1700, 1082, 1083, 1114, 1184, 1186, 2950, 17, 700, 701, 26, 19, 18, 2205, 2206, 21, 26]
-const ARRAY_OIDS: []int = [1000, 1005, 1007, 1009, 1015, 1016, 1231, 1182, 1183, 1115, 1185, 1187, 2951, 1001, 1021, 1022, 1028, 1003, 1002, 2210, 2211, 22, 30]
+const ELEM_OIDS: []int = [16, 21, 23, 25, 1043, 20, 1700, 1082, 1083, 1114, 1184, 1186, 2950, 17, 700, 701, 26, 19, 18, 2205, 2206, 21, 26, 1042]
+const ARRAY_OIDS: []int = [1000, 1005, 1007, 1009, 1015, 1016, 1231, 1182, 1183, 1115, 1185, 1187, 2951, 1001, 1021, 1022, 1028, 1003, 1002, 2210, 2211, 22, 30, 1014]
 
 // The array type of an element type (0: none).
 pub fn arrayOid(elem: int): int {
@@ -93,7 +94,7 @@ pub type TypeName = value record {
     pub oid: int
     pub prec: int       // numeric precision, 0 when not given; a time type's: 1 when given (in scale)
     pub scale: int      // numeric scale; a time type's fractional digits (0 to 6) when prec is 1
-    pub len: int        // varchar length, 0 when not given
+    pub len: int        // varchar's and char's length, 0 when not given (char: 1; bpchar: none)
 }
 
 pub type Val = value closed {
@@ -352,6 +353,9 @@ pub const S_DROP_TYPE = 54      // DROP TYPE [IF EXISTS] name, ...: the others i
 pub const S_ALTER_TYPE = 55     // ALTER TYPE name ADD VALUE [IF NOT EXISTS] 'v' [BEFORE | AFTER 'w']: v in names, w in index, "before" or "after" in alias
 pub const S_TRUNCATE = 56      // TRUNCATE [TABLE] name, ... [RESTART IDENTITY] [CASCADE] (9.91): the first in table, the
                                 // rest in names; RESTART IDENTITY in ifFlag
+pub const S_MAINT = 57          // VACUUM, ANALYZE, CHECKPOINT, REINDEX, CLUSTER (9.94), done as nothing: the tag in alias,
+                                // the tables to check in names (their columns in maintCols), an index in index; in table
+                                // what cannot run in a block ("" none); unique: a view is refused
 
 // COPY's options (Stmt.copy).
 pub type CopyOpts = record {
@@ -487,6 +491,11 @@ pub type Stmt = record {
     pub noData: bool            // CREATE TABLE ... AS ... WITH NO DATA (9.88)
     pub into: str               // SELECT ... INTO t: t (9.88); made a CREATE TABLE ... AS
     pub exprs: []Expr           // CREATE INDEX: per column, its expression (9.89; a Lit NULL for a column, whose name is in names)
+    // 9.94
+    pub distinctOn: []Expr      // SELECT DISTINCT ON (exprs)
+    pub withTies: bool          // FETCH FIRST n ROWS WITH TIES (its n in limit)
+    pub gsets: [][]int          // GROUP BY ROLLUP, CUBE, GROUPING SETS: each set, places in group; [] a plain GROUP BY
+    pub maintCols: [][]str      // S_MAINT: per table in names, the columns named
 }
 
 pub const CONFLICT_NONE = 0
@@ -554,7 +563,8 @@ pub fn newStmt(kind: int): Stmt {
                 group: [], order: [], limit: None, offset: None, sets: [], params: 0, from: [], index: "",
                 unique: false, inner: [], distinct: false, having: None, subs: [], use: 0, setop: 0, setAll: false,
                 cte: -1, rec: false, cascade: false, src: "", srf: "", ordin: false, alters: [], cons: [], seqNames: [], seq: noSeqOpts(), idOpts: [], overriding: OVR_NONE,
-                copy: noCopyOpts(), wins: [], windows: [], conflict: CONFLICT_NONE, conflictCols: [], conflictCon: "", alias: "", conc: false, lockMode: 0, lockOf: [], lockWait: 0, noData: false, into: "", exprs: []}
+                copy: noCopyOpts(), wins: [], windows: [], conflict: CONFLICT_NONE, conflictCols: [], conflictCon: "", alias: "", conc: false, lockMode: 0, lockOf: [], lockWait: 0, noData: false, into: "", exprs: [],
+                distinctOn: [], withTies: false, gsets: [], maintCols: []}
 }
 
 // ---- the lexer
@@ -903,11 +913,19 @@ fn (p: mut &P) typeName(): Result[TypeName, lexdb_base.DbErr] {
             if w == "interval" { t.prec = 0 }       // fields (interval day to second) are not read
             return Ok(try p.arraySuffix(t))
         }
-        "character" {
-            if p.acceptKw("varying") {
+        "character", "char", "bpchar", "nchar" {
+            if w != "bpchar" && p.acceptKw("varying") {
                 t = TypeName{kind: K_TEXT, oid: OID_VARCHAR, prec: 0, scale: 0, len: 0}
             } else {
-                return Err(lexdb_base.err("0A000", "type character is not supported (use varchar or text)"))
+                // char(n) (9.94): char alone is char(1), bpchar has no length
+                t = TypeName{kind: K_TEXT, oid: OID_BPCHAR, prec: 0, scale: 0, len: if w == "bpchar" { 0 } else { 1 }}
+                if p.acceptKw("(") {
+                    t.len = try p.intLit()
+                    if t.len < 1 { return Err(lexdb_base.err("22023", "length for type " + (if w == "bpchar" { "bpchar" } else { "char" }) + " must be at least 1")) }
+                    if t.len > 10485760 { return Err(lexdb_base.err("22023", "length for type " + (if w == "bpchar" { "bpchar" } else { "char" }) + " cannot exceed 10485760")) }
+                    try p.expectKw(")")
+                }
+                return p.arraySuffix(t)
             }
         }
         else {
@@ -1007,18 +1025,33 @@ fn (p: mut &P) cmpExpr(): Result[Expr, lexdb_base.DbErr] {
             // (9.28); with a subquery, = ANY is IN and <> ALL is NOT IN
             let all = q.text == "all"
             p.pos += 2
+            if isRow(&e) {
+                // (a, b) = ANY (subquery) is IN, <> ALL NOT IN (9.94)
+                if (p.isKw("select") || p.isKw("with")) && ((op == "=" && !all) || (op == "<>" && all)) {
+                    return Ok(negate(all, try p.rowSub(&"in", &e)))
+                }
+                return Err(lexdb_base.err("0A000", "lexdb: a row before ANY or ALL is supported with = ANY (subquery) and <> ALL (subquery) only"))
+            }
             if p.isKw("select") || p.isKw("with") {
                 if (op == "=" && !all) || (op == "<>" && all) {
                     let i = try p.subquery(SUB_IN)
                     return Ok(negate(all, Expr.Call("#in", [Expr.Lit(Val.Int(i)), e], false)))
                 }
-                return Err(lexdb_base.err("0A000", "lexdb: a subquery after ANY or ALL is supported with = ANY and <> ALL only"))
+                // another op: over the array of the subquery's values (9.94)
+                let arr = try p.arrayOfSub()
+                return Ok(Expr.Call((if all { "all " } else { "any " }) + op, [e, arr], false))
             }
             let arr = try p.expr()
             try p.expectKw(")")
             return Ok(Expr.Call((if all { "all " } else { "any " }) + op, [e, arr], false))
         }
+        if isRow(&e) && p.isKw("(") && (p.peekAt(1).text == "select" || p.peekAt(1).text == "with") {
+            // (a, b) op (subquery) (9.94)
+            p.pos += 1
+            return p.rowSub(&op, &e)
+        }
         let r = try p.catExpr()
+        if isRow(&e) || isRow(&r) { return rowCmp(&op, &e, &r) }
         return Ok(Expr.Bin(op, e, r))
     }
     // x ~ pattern, !~, ~*, !~*; OPERATOR(pg_catalog.op) as op (9.80)
@@ -1043,22 +1076,54 @@ fn (p: mut &P) cmpExpr(): Result[Expr, lexdb_base.DbErr] {
         let r = try p.catExpr()
         return Ok(Expr.Call(rop, [e, r], false))
     }
-    // [NOT] LIKE, ILIKE, IN, BETWEEN
+    // [NOT] LIKE, ILIKE, SIMILAR TO, IN, BETWEEN
     var neg = false
     let nt = p.peekAt(1)
-    if p.isKw("not") && nt.kind == T_IDENT && (nt.text == "like" || nt.text == "ilike" || nt.text == "in" || nt.text == "between") {
+    if p.isKw("not") && nt.kind == T_IDENT && (nt.text == "like" || nt.text == "ilike" || nt.text == "in" || nt.text == "between" ||
+                                               nt.text == "similar") {
         p.pos += 1
         neg = true
     }
     if p.isKw("like") || p.isKw("ilike") {
         let kw = p.next().text
+        let q = p.peek()
+        if q.kind == T_IDENT && (q.text == "any" || q.text == "some" || q.text == "all") && p.peekAt(1).kind == T_OP && p.peekAt(1).text == "(" {
+            // x [NOT] LIKE ANY | ALL (array or subquery) (9.94): the call "any like",
+            // "all not like" and the like; NOT is the element's, as PostgreSQL's
+            let all = q.text == "all"
+            p.pos += 2
+            var arr = Expr.Lit(Val.Null)
+            if p.isKw("select") || p.isKw("with") {
+                arr = try p.arrayOfSub()
+            } else {
+                arr = try p.expr()
+                try p.expectKw(")")
+            }
+            return Ok(Expr.Call((if all { "all " } else { "any " }) + (if neg { "not " } else { "" }) + kw, [e, arr], false))
+        }
         var args: []Expr = [e]
         append(mut &args, try p.catExpr())
         if p.acceptKw("escape") { append(mut &args, try p.catExpr()) }
         return Ok(negate(neg, Expr.Call(kw, args, false)))
     }
+    if p.isKw("similar") && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "to" {
+        // x SIMILAR TO pattern [ESCAPE e] (9.94): the call "similar"
+        p.pos += 2
+        var args: []Expr = [e]
+        append(mut &args, try p.catExpr())
+        if p.acceptKw("escape") { append(mut &args, try p.catExpr()) }
+        return Ok(negate(neg, Expr.Call("similar", args, false)))
+    }
     if p.acceptKw("in") {
         try p.expectKw("(")
+        if isRow(&e) {
+            // (a, b) IN ((1, 2), (3, 4)): row equalities ORed; IN (subquery) (9.94)
+            if p.isKw("select") || p.isKw("with") { return Ok(negate(neg, try p.rowSub(&"in", &e))) }
+            var any = try rowCmp(&"=", &e, &(try p.expr()))
+            while p.acceptKw(",") { any = Expr.Bin("or", any, try rowCmp(&"=", &e, &(try p.expr()))) }
+            try p.expectKw(")")
+            return Ok(negate(neg, any))
+        }
         if p.isKw("select") || p.isKw("with") {
             let i = try p.subquery(SUB_IN)
             return Ok(negate(neg, Expr.Call("#in", [Expr.Lit(Val.Int(i)), e], false)))
@@ -1070,12 +1135,20 @@ fn (p: mut &P) cmpExpr(): Result[Expr, lexdb_base.DbErr] {
         return Ok(negate(neg, Expr.Call("in", args, false)))
     }
     if p.acceptKw("between") {
-        // a BETWEEN b AND c is a >= b AND a <= c: the planner knows those
+        // a BETWEEN b AND c is a >= b AND a <= c: the planner knows those.
+        // SYMMETRIC (9.94): either way round, (a >= b AND a <= c) OR (a >= c
+        // AND a <= b), as PostgreSQL rewrites it
+        let sym = p.acceptKw("symmetric")
+        if !sym { let asym = p.acceptKw("asymmetric") }
         let lo = try p.catExpr()
         try p.expectKw("and")
         let hi = try p.catExpr()
-        let again = cloneE(&e)
-        return Ok(negate(neg, Expr.Bin("and", Expr.Bin(">=", e, lo), Expr.Bin("<=", again, hi))))
+        let x = Expr.Bin("and", try cmpOf(&">=", &e, &lo), try cmpOf(&"<=", &e, &hi))
+        if sym {
+            let other = Expr.Bin("and", try cmpOf(&">=", &e, &hi), try cmpOf(&"<=", &e, &lo))
+            return Ok(negate(neg, Expr.Bin("or", x, other)))
+        }
+        return Ok(negate(neg, x))
     }
     if neg { return Err(near(&p.peek())) }
     if p.acceptKw("is") {
@@ -1083,10 +1156,28 @@ fn (p: mut &P) cmpExpr(): Result[Expr, lexdb_base.DbErr] {
         if p.acceptKw("distinct") {
             try p.expectKw("from")
             let r = try p.catExpr()
+            if isRow(&e) || isRow(&r) {
+                // rows (9.94): distinct when a pair of fields is
+                let ls = try rowItems(&e)
+                let rs = try rowItems(&r)
+                if len(ls) != len(rs) { return Err(lexdb_base.err("42601", "unequal number of entries in row expressions")) }
+                var d = Expr.Call("distinct from", [cloneE(&ls[0]), cloneE(&rs[0])], false)
+                for i in 1..len(ls) { d = Expr.Bin("or", d, Expr.Call("distinct from", [cloneE(&ls[i]), cloneE(&rs[i])], false)) }
+                return Ok(if isNot { Expr.Unary("not", d) } else { d })
+            }
             let d = Expr.Call("distinct from", [e, r], false)
             return Ok(if isNot { Expr.Unary("not", d) } else { d })
         }
-        if p.acceptKw("null") { return Ok(Expr.IsNull(e, isNot)) }
+        if p.acceptKw("null") {
+            if isRow(&e) {
+                // a row IS NULL: each field is; IS NOT NULL: none is (9.94)
+                let xs = try rowItems(&e)
+                var all = Expr.IsNull(cloneE(&xs[0]), isNot)
+                for i in 1..len(xs) { all = Expr.Bin("and", all, Expr.IsNull(cloneE(&xs[i]), isNot)) }
+                return Ok(all)
+            }
+            return Ok(Expr.IsNull(e, isNot))
+        }
         if p.acceptKw("true") {
             let x = Expr.Bin("=", e, Expr.Lit(Val.Bool(true)))
             return Ok(if isNot { Expr.Unary("not", x) } else { x })
@@ -1190,7 +1281,7 @@ fn (p: &P) sqlForm(): bool {
             if depth == 0 { return false }
         }
         if depth == 1 && t.kind == T_OP && t.text == "," { return false }
-        if depth == 1 && t.kind == T_IDENT && (t.text == "from" || t.text == "for" || t.text == "placing") { return true }
+        if depth == 1 && t.kind == T_IDENT && (t.text == "from" || t.text == "for" || t.text == "placing" || t.text == "similar") { return true }
         i += 1
     }
     return false
@@ -1350,6 +1441,141 @@ fn (p: mut &P) cteRef(ci: int): Result[int, lexdb_base.DbErr] {
 
 fn subRef(name: str, i: int): Expr { return Expr.Call(name, [Expr.Lit(Val.Int(i))], false) }
 
+// A row constructor, (a, b) or ROW(a, b) (9.94): the call "row". Rows are
+// compared, field by field, and nothing else.
+pub fn isRow(x: &Expr): bool {
+    match x {
+        Expr.Call(n, args, star) { return n == "row" && !star }
+        else { return false }
+    }
+}
+
+// Whether x names one of its statement's subqueries or window calls by
+// number (#sub, #win and the like).
+fn hasMark(x: &Expr): bool {
+    match x {
+        Expr.Unary(_, a) { return hasMark(&a) }
+        Expr.Bin(_, a, b) { return hasMark(&a) || hasMark(&b) }
+        Expr.IsNull(a, _) { return hasMark(&a) }
+        Expr.Cast(a, _) { return hasMark(&a) }
+        Expr.Call(n, args, _) {
+            if n == "#sub" || n == "#exists" || n == "#in" || n == "#win" { return true }
+            for a in args { if hasMark(&a) { return true } }
+            return false
+        }
+        else { return false }
+    }
+}
+
+fn rowItems(x: &Expr): Result[[]Expr, lexdb_base.DbErr] {
+    match x {
+        Expr.Call(n, args, star) {
+            if n == "row" {
+                var out: []Expr = []
+                for a in args { append(mut &out, cloneE(&a)) }
+                return Ok(out)
+            }
+        }
+        else {}
+    }
+    return Err(lexdb_base.err("42883", "operator does not exist: a row compared with a value that is not a row"))
+}
+
+// Two rows compared (9.94), as PostgreSQL: = when each pair is equal, <>
+// when one is not; <, <=, >, >= by the first pair not equal, NULL when a
+// pair before it is NULL: (a, b) < (c, d) is a < c OR (a = c AND b < d).
+// The order's comparisons start with a <= c (or a >= c), true whenever the
+// whole is, so that an index on a serves as a range.
+fn rowCmp(op: &str, l: &Expr, r: &Expr): Result[Expr, lexdb_base.DbErr] {
+    let ls = try rowItems(l)
+    let rs = try rowItems(r)
+    let n = len(ls)
+    if n != len(rs) { return Err(lexdb_base.err("42601", "unequal number of entries in row expressions")) }
+    if n == 0 { return Err(lexdb_base.err("42601", "cannot compare rows of zero length")) }
+    if op == "=" || op == "<>" {
+        var x = Expr.Bin(op.toStr(), cloneE(&ls[0]), cloneE(&rs[0]))
+        for i in 1..n { x = Expr.Bin(if op == "=" { "and" } else { "or" }, x, Expr.Bin(op.toStr(), cloneE(&ls[i]), cloneE(&rs[i]))) }
+        return Ok(x)
+    }
+    let strict = op[0..1].toStr()
+    var x = Expr.Bin(op.toStr(), cloneE(&ls[n - 1]), cloneE(&rs[n - 1]))
+    var i = n - 2
+    while i >= 0 {
+        x = Expr.Bin("or", Expr.Bin(strict, cloneE(&ls[i]), cloneE(&rs[i])), Expr.Bin("and", Expr.Bin("=", cloneE(&ls[i]), cloneE(&rs[i])), x))
+        i -= 1
+    }
+    if n > 1 { x = Expr.Bin("and", Expr.Bin(strict + "=", cloneE(&ls[0]), cloneE(&rs[0])), x) }
+    return Ok(x)
+}
+
+// l op r, rows too (rowCmp).
+fn cmpOf(op: &str, l: &Expr, r: &Expr): Result[Expr, lexdb_base.DbErr] {
+    if isRow(l) || isRow(r) { return rowCmp(op, l, r) }
+    return Ok(Expr.Bin(op.toStr(), cloneE(l), cloneE(r)))
+}
+
+// A row compared with a subquery's row, after the "(" (9.94): op, or "in"
+// (= ANY). A scalar subquery over the subquery, its columns named "#1",
+// "#2", ...: (SELECT row op (#1, #2) FROM (subquery) AS "#row"("#1", ...)),
+// NULL for no rows and an error for two; for IN, of its rows' answers the
+// best: true, else NULL, else false (none).
+fn (p: mut &P) rowSub(op: &str, row: &Expr): Result[Expr, lexdb_base.DbErr] {
+    let xs = try rowItems(row)
+    for x in xs {
+        if hasMark(&x) { return Err(lexdb_base.err("0A000", "lexdb: a subquery or window call in a row compared with a subquery is not supported")) }
+    }
+    p.depth += 1
+    let saved = replace(mut &p.subs, [])
+    let inner = try p.subquery(SUB_FROM)
+    var star = false
+    for it in p.subs[inner].items { if it.star { star = true } }
+    let k = len(p.subs[inner].items)
+    if !star && k > len(xs) { return Err(lexdb_base.err("42601", "subquery has too many columns")) }
+    if !star && k < len(xs) { return Err(lexdb_base.err("42601", "subquery has too few columns")) }
+    var w = newStmt(S_SELECT)
+    var names: []str = []
+    var cols: []Expr = []
+    for i in 0..len(xs) {
+        append(mut &names, "#" + (i + 1).toStr())
+        append(mut &cols, Expr.Col("#row.#" + (i + 1).toStr()))
+    }
+    append(mut &w.from, FromItem{table: "", alias: "#row", join: J_FIRST, on: None, sub: inner, cols: names, work: -1, lateral: false, using: [], natural: false, comma: false})
+    var item = Expr.Lit(Val.Null)
+    if op == "in" {
+        let c = try rowCmp(&"=", row, &Expr.Call("row", cols, false))
+        let rank = Expr.Call("case else", [cloneE(&c), Expr.Lit(Val.Int(2)), Expr.IsNull(c, false), Expr.Lit(Val.Int(1)), Expr.Lit(Val.Int(0))], false)
+        let best = Expr.Call("max", [rank], false)
+        item = Expr.Call("case else", [Expr.Bin("=", cloneE(&best), Expr.Lit(Val.Int(2))), Expr.Lit(Val.Bool(true)),
+                                       Expr.Bin("=", best, Expr.Lit(Val.Int(1))), Expr.Lit(Val.Null), Expr.Lit(Val.Bool(false))], false)
+    } else {
+        item = try rowCmp(op, row, &Expr.Call("row", cols, false))
+    }
+    append(mut &w.items, SelItem{star: false, qual: "", expr: Some(item), alias: "?column?"})
+    w.subs = replace(mut &p.subs, saved)
+    w.use = SUB_SCALAR
+    p.depth -= 1
+    append(mut &p.subs, w)
+    return Ok(subRef("#sub", len(p.subs) - 1))
+}
+
+// ARRAY(subquery), after its "(": (SELECT array_agg(a) FROM (subquery) AS
+// "#arr"(a)), '{}' for no rows. Also op ANY | ALL (subquery) other than = ANY
+// and <> ALL (9.94).
+fn (p: mut &P) arrayOfSub(): Result[Expr, lexdb_base.DbErr] {
+    p.depth += 1
+    let saved = replace(mut &p.subs, [])
+    let inner = try p.subquery(SUB_FROM)
+    var w = newStmt(S_SELECT)
+    append(mut &w.from, FromItem{table: "", alias: "#arr", join: J_FIRST, on: None, sub: inner, cols: ["#a"], work: -1, lateral: false, using: [], natural: false, comma: false})
+    let agg = Expr.Call("array_agg", [Expr.Col("#arr.#a")], false)
+    append(mut &w.items, SelItem{star: false, qual: "", expr: Some(Expr.Call("coalesce", [agg, Expr.Lit(Val.Text("{}"))], false)), alias: "array"})
+    w.subs = replace(mut &p.subs, saved)
+    w.use = SUB_SCALAR
+    p.depth -= 1
+    append(mut &p.subs, w)
+    return Ok(subRef("#sub", len(p.subs) - 1))
+}
+
 fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
     // pg_catalog.f(...): f (9.80)
     if p.peek().kind == T_IDENT && p.peek().text == "pg_catalog" && p.peekAt(1).kind == T_OP && p.peekAt(1).text == "." &&
@@ -1364,7 +1590,12 @@ fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
         p.pos += 1
         let x = try p.expr()
         var args: []Expr = [x]
-        if p.acceptKw("from") {
+        if p.acceptKw("similar") {
+            // substring(x SIMILAR pattern ESCAPE e) (9.94): as FROM pattern FOR e
+            append(mut &args, try p.expr())
+            try p.expectKw("escape")
+            append(mut &args, try p.expr())
+        } else if p.acceptKw("from") {
             append(mut &args, try p.expr())
             if p.acceptKw("for") { append(mut &args, try p.expr()) }
         } else {
@@ -1429,20 +1660,8 @@ fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
         return Ok(Expr.Call(if t.text == "user" || t.text == "current_role" { "current_user" } else { t.text }, [], false))
     }
     if t.kind == T_IDENT && t.text == "array" && p.isKw("(") && (p.peekAt(1).text == "select" || p.peekAt(1).text == "with") {
-        // ARRAY(subquery): (SELECT array_agg(a) FROM (subquery) AS "#arr"(a)), '{}' for no rows
         p.pos += 1
-        p.depth += 1
-        let saved = replace(mut &p.subs, [])
-        let inner = try p.subquery(SUB_FROM)
-        var w = newStmt(S_SELECT)
-        append(mut &w.from, FromItem{table: "", alias: "#arr", join: J_FIRST, on: None, sub: inner, cols: ["#a"], work: -1, lateral: false, using: [], natural: false, comma: false})
-        let agg = Expr.Call("array_agg", [Expr.Col("#arr.#a")], false)
-        append(mut &w.items, SelItem{star: false, qual: "", expr: Some(Expr.Call("coalesce", [agg, Expr.Lit(Val.Text("{}"))], false)), alias: "array"})
-        w.subs = replace(mut &p.subs, saved)
-        w.use = SUB_SCALAR
-        p.depth -= 1
-        append(mut &p.subs, w)
-        return Ok(subRef("#sub", len(p.subs) - 1))
+        return p.arrayOfSub()
     }
     if t.kind == T_IDENT && t.text == "array" && p.isKw("[") {
         // ARRAY[a, b, ...]: an array of the values
@@ -1481,6 +1700,13 @@ fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
     if t.kind == T_OP && t.text == "(" {
         if p.isKw("select") || p.isKw("with") { return Ok(subRef("#sub", try p.subquery(SUB_SCALAR))) }
         let e = try p.expr()
+        if p.isKw(",") {
+            // (a, b, ...): a row (9.94), for comparisons
+            var xs: []Expr = [e]
+            while p.acceptKw(",") { append(mut &xs, try p.expr()) }
+            try p.expectKw(")")
+            return Ok(Expr.Call("row", xs, false))
+        }
         try p.expectKw(")")
         return Ok(e)
     }
@@ -2648,8 +2874,15 @@ fn (p: mut &P) returning(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
 fn (p: mut &P) selectCore(): Result[Stmt, lexdb_base.DbErr] {
     var s = newStmt(S_SELECT)
     if p.acceptKw("distinct") {
-        if p.isKw("on") { return Err(lexdb_base.err("0A000", "SELECT DISTINCT ON is not supported")) }
-        s.distinct = true
+        if p.acceptKw("on") {
+            // DISTINCT ON (exprs) (9.94)
+            try p.expectKw("(")
+            append(mut &s.distinctOn, try p.expr())
+            while p.acceptKw(",") { append(mut &s.distinctOn, try p.expr()) }
+            try p.expectKw(")")
+        } else {
+            s.distinct = true
+        }
     } else {
         let all = p.acceptKw("all")
     }
@@ -2667,8 +2900,7 @@ fn (p: mut &P) selectCore(): Result[Stmt, lexdb_base.DbErr] {
     if p.acceptKw("where") { s.where = Some(try p.expr()) }
     if p.acceptKw("group") {
         try p.expectKw("by")
-        append(mut &s.group, try p.expr())
-        while p.acceptKw(",") { append(mut &s.group, try p.expr()) }
+        try p.groupBy(mut &s)
     }
     if p.acceptKw("having") { s.having = Some(try p.expr()) }
     if p.acceptKw("window") {
@@ -2684,6 +2916,140 @@ fn (p: mut &P) selectCore(): Result[Stmt, lexdb_base.DbErr] {
         }
     }
     return Ok(s)
+}
+
+// GROUP BY's list, after BY (9.94 for ROLLUP, CUBE, GROUPING SETS, () and
+// DISTINCT): its expressions, each once, in group; with any of those, the
+// grouping sets as places in group (gsets), the items' sets crossed. A row
+// (a, b) is its fields.
+fn (p: mut &P) groupBy(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
+    var distinct = false
+    if p.acceptKw("distinct") { distinct = true } else { let al = p.acceptKw("all") }
+    var sets: [][]Expr = [[]]          // the cross product so far
+    var special = false
+    while true {
+        let mine = try p.groupItem(true, mut &special)
+        var next: [][]Expr = []
+        for a in sets {
+            for b in mine {
+                var u: []Expr = []
+                for x in a { append(mut &u, cloneE(&x)) }
+                for x in b { append(mut &u, cloneE(&x)) }
+                append(mut &next, u)
+            }
+        }
+        sets = next
+        if !p.acceptKw(",") { break }
+    }
+    var texts: []str = []
+    for st in sets {
+        for x in st {
+            let t = exprText(&x)
+            var seen = false
+            for y in texts { if y == t { seen = true } }
+            if !seen {
+                append(mut &texts, t)
+                append(mut &s.group, cloneE(&x))
+            }
+        }
+    }
+    if !special { return Ok(Unit{}) }
+    var keys: []str = []
+    for st in sets {
+        var places: []int = []
+        for x in st {
+            let t = exprText(&x)
+            for i in 0..len(texts) {
+                if texts[i] == t {
+                    var dup = false
+                    for q in places { if q == i { dup = true } }
+                    if !dup { append(mut &places, i) }
+                }
+            }
+        }
+        if distinct {
+            // GROUP BY DISTINCT: a set listed again (in any order) once
+            var sorted: []int = []
+            for i in 0..len(texts) { for q in places { if q == i { append(mut &sorted, i) } } }
+            var kb = newStrBuf()
+            for q in sorted { kb.add(q.toStr() + ",") }
+            let k = kb.toStr()
+            var again = false
+            for y in keys { if y == k { again = true } }
+            if again { continue }
+            append(mut &keys, k)
+        }
+        append(mut &s.gsets, places)
+    }
+    return Ok(Unit{})
+}
+
+// One item of GROUP BY (top: of the list itself), as its grouping sets:
+// an expression [[x]]; (a, b) [[a, b]] (at the top, the same); () [[]];
+// ROLLUP (x, y) [[x, y], [x], []]; CUBE (x, y) every subset; GROUPING SETS
+// (...) its items' sets one after another.
+fn (p: mut &P) groupItem(top: bool, special: mut &bool): Result[[][]Expr, lexdb_base.DbErr] {
+    if p.isKw("(") && p.peekAt(1).kind == T_OP && p.peekAt(1).text == ")" {
+        p.pos += 2
+        special = true
+        return Ok([[]])
+    }
+    let t = p.peek()
+    let kw = if t.kind == T_IDENT && p.peekAt(1).kind == T_OP && p.peekAt(1).text == "(" { t.text } else { "" }
+    if kw == "rollup" || kw == "cube" {
+        p.pos += 2
+        special = true
+        var parts: [][]Expr = []
+        while true {
+            let x = try p.expr()
+            if isRow(&x) { append(mut &parts, try rowItems(&x)) } else { append(mut &parts, [x]) }
+            if !p.acceptKw(",") { break }
+        }
+        try p.expectKw(")")
+        var out: [][]Expr = []
+        let n = len(parts)
+        if kw == "rollup" {
+            var k = n
+            while k >= 0 {
+                var u: []Expr = []
+                for i in 0..k { for x in parts[i] { append(mut &u, cloneE(&x)) } }
+                append(mut &out, u)
+                k -= 1
+            }
+        } else {
+            if n > 12 { return Err(lexdb_base.err("54001", "CUBE is limited to 12 elements")) }
+            // as PostgreSQL lists them: the larger sets first
+            var size = n
+            while size >= 0 {
+                for mask in 0..(1 << n) {
+                    var bits = 0
+                    for i in 0..n { if (mask >> (n - 1 - i)) & 1 == 1 { bits += 1 } }
+                    if bits != size { continue }
+                    var u: []Expr = []
+                    for i in 0..n { if (mask >> (n - 1 - i)) & 1 == 1 { for x in parts[i] { append(mut &u, cloneE(&x)) } } }
+                    append(mut &out, u)
+                }
+                size -= 1
+            }
+        }
+        return Ok(out)
+    }
+    if t.kind == T_IDENT && t.text == "grouping" && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "sets" {
+        p.pos += 2
+        special = true
+        try p.expectKw("(")
+        var out: [][]Expr = []
+        while true {
+            var got = try p.groupItem(false, special)
+            for i in 0..len(got) { append(mut &out, replace(mut &got[i], [])) }
+            if !p.acceptKw(",") { break }
+        }
+        try p.expectKw(")")
+        return Ok(out)
+    }
+    let x = try p.expr()
+    if isRow(&x) { return Ok([try rowItems(&x)]) }
+    return Ok([[x]])
 }
 
 // A row lock's strength (9.86), weakest first, as PostgreSQL's.
@@ -2751,16 +3117,42 @@ fn (p: mut &P) orderLimit(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
             if !p.acceptKw(",") { break }
         }
     }
-    while p.isKw("limit") || p.isKw("offset") || p.isKw("for") {
+    var limited = false
+    var offset = false
+    while p.isKw("limit") || p.isKw("offset") || p.isKw("for") || p.isKw("fetch") {
         if p.acceptKw("for") {
             try p.lockClause(s)
-        } else if p.acceptKw("limit") {
-            if p.acceptKw("all") { s.limit = None } else { s.limit = Some(try p.expr()) }
+        } else if p.isKw("limit") || p.isKw("fetch") {
+            if limited { return Err(lexdb_base.err("42601", "multiple LIMIT clauses not allowed")) }
+            limited = true
+            if p.acceptKw("limit") {
+                if p.acceptKw("all") { s.limit = None } else { s.limit = Some(try p.expr()) }
+            } else {
+                // FETCH FIRST | NEXT [n] ROW | ROWS ONLY | WITH TIES (9.94): n a
+                // constant, a parameter or in parentheses; 1 when not given
+                p.pos += 1
+                if !p.acceptKw("first") { try p.expectKw("next") }
+                s.limit = Some(Expr.Lit(Val.Int(1)))
+                if !p.isKw("row") && !p.isKw("rows") { s.limit = Some(try p.unary()) }
+                if !p.acceptKw("rows") { try p.expectKw("row") }
+                if p.acceptKw("with") {
+                    try p.expectKw("ties")
+                    s.withTies = true
+                } else {
+                    try p.expectKw("only")
+                }
+            }
         } else {
+            if offset { return Err(lexdb_base.err("42601", "multiple OFFSET clauses not allowed")) }
+            offset = true
             let o = p.acceptKw("offset")
             s.offset = Some(try p.expr())
             let r = p.acceptKw("rows") || p.acceptKw("row")
         }
+    }
+    if s.withTies {
+        if len(s.order) == 0 { return Err(lexdb_base.err("42601", "WITH TIES cannot be specified without ORDER BY clause")) }
+        if s.lockWait == WAIT_SKIP { return Err(lexdb_base.err("42601", "SKIP LOCKED and WITH TIES options cannot be used together")) }
     }
     return Ok(Unit{})
 }
@@ -2961,7 +3353,8 @@ fn (p: mut &P) createIndex(unique: bool): Result[Stmt, lexdb_base.DbErr] {
         try p.expectKw("exists")
         s.ifFlag = true
     }
-    s.index = try p.name()                  // in its table's schema
+    // in its table's schema; none (9.94): PostgreSQL's name is chosen (lexdb_exec)
+    if s.ifFlag || !p.isKw("on") { s.index = try p.name() }
     try p.expectKw("on")
     s.table = try p.qname()
     if p.acceptKw("using") {
@@ -3088,6 +3481,117 @@ fn (p: mut &P) truncate(): Result[Stmt, lexdb_base.DbErr] {
     if p.acceptKw("cascade") { s.cascade = true } else { let r = p.acceptKw("restrict") }
     return Ok(s)
 }
+
+// The maintenance statements (9.94), after their keyword: checked, then
+// done as nothing.
+//   VACUUM [(option, ...)] [FULL] [FREEZE] [VERBOSE] [ANALYZE] [[ONLY] table [(col, ...)], ...]
+//   ANALYZE [(option, ...)] [VERBOSE] [[ONLY] table [(col, ...)], ...]
+//   CHECKPOINT
+//   REINDEX [(option, ...)] {INDEX | TABLE | SCHEMA | DATABASE | SYSTEM} [CONCURRENTLY] [name]
+//   CLUSTER [(option, ...)] [VERBOSE] [table [USING index]]
+fn (p: mut &P) maint(w: str): Result[Stmt, lexdb_base.DbErr] {
+    var s = newStmt(S_MAINT)
+    let kw = if w == "analyse" { "analyze" } else { w }
+    s.alias = strings.toUpperAscii(kw)
+    if kw == "checkpoint" { return Ok(s) }
+    var analyze = kw == "analyze"
+    var full = false
+    var parallel = false
+    var conc = false
+    if p.acceptKw("(") {
+        while true {
+            let o = p.next()
+            if o.kind != T_IDENT { return Err(near(&o)) }
+            let known = match kw {
+                "vacuum" { o.text == "full" || o.text == "freeze" || o.text == "verbose" || o.text == "analyze" || o.text == "disable_page_skipping" ||
+                           o.text == "skip_locked" || o.text == "index_cleanup" || o.text == "process_main" || o.text == "process_toast" ||
+                           o.text == "truncate" || o.text == "parallel" || o.text == "skip_database_stats" || o.text == "only_database_stats" ||
+                           o.text == "buffer_usage_limit" }
+                "analyze" { o.text == "verbose" || o.text == "skip_locked" || o.text == "buffer_usage_limit" }
+                "reindex" { o.text == "concurrently" || o.text == "tablespace" || o.text == "verbose" }
+                else { o.text == "verbose" }
+            }
+            if !known { return Err(lexdb_base.err("42601", "unrecognized \"" + s.alias + "\" option \"" + o.text + "\"")) }
+            // its value, if any: a word, a number or a text
+            var off = false
+            if !p.isKw(",") && !p.isKw(")") {
+                let v = p.next()
+                off = v.text == "false" || v.text == "off" || v.text == "0"
+            }
+            if !off {
+                if o.text == "analyze" { analyze = true }
+                if o.text == "full" { full = true }
+                if o.text == "parallel" { parallel = true }
+                if o.text == "concurrently" { conc = true }
+            }
+            if !p.acceptKw(",") { break }
+        }
+        try p.expectKw(")")
+    } else {
+        while true {
+            if p.acceptKw("verbose") { continue }
+            if kw == "vacuum" && (p.isKw("full") || p.isKw("freeze") || p.isKw("analyze") || p.isKw("analyse")) {
+                let o = p.next().text
+                if o == "full" { full = true }
+                if o == "analyze" || o == "analyse" { analyze = true }
+                continue
+            }
+            break
+        }
+    }
+    if full && parallel { return Err(lexdb_base.err("0A000", "VACUUM FULL cannot be performed in parallel")) }
+    if kw == "vacuum" || kw == "analyze" {
+        if kw == "vacuum" { s.table = "VACUUM" }
+        while p.peek().kind == T_IDENT || p.peek().kind == T_QIDENT {
+            let only = p.acceptKw("only")
+            append(mut &s.names, try p.qname())
+            var cols: []str = []
+            if p.acceptKw("(") {
+                append(mut &cols, try p.name())
+                while p.acceptKw(",") { append(mut &cols, try p.name()) }
+                try p.expectKw(")")
+                if !analyze { return Err(lexdb_base.err("0A000", "ANALYZE option must be specified when a column list is provided")) }
+            }
+            append(mut &s.maintCols, cols)
+            if !p.acceptKw(",") { break }
+        }
+        return Ok(s)
+    }
+    s.unique = true
+    if kw == "reindex" {
+        let what = p.next()
+        if what.kind != T_IDENT || (what.text != "index" && what.text != "table" && what.text != "schema" && what.text != "database" &&
+                                    what.text != "system") { return Err(near(&what)) }
+        if p.acceptKw("concurrently") { conc = true }
+        let whole = what.text == "database" || what.text == "system"
+        if whole && what.text == "system" && conc { return Err(lexdb_base.err("0A000", "cannot reindex system catalogs concurrently")) }
+        if conc { s.table = "REINDEX CONCURRENTLY" } else if whole { s.table = "REINDEX " + strings.toUpperAscii(what.text) }
+        if whole {
+            if p.peek().kind == T_IDENT || p.peek().kind == T_QIDENT {
+                let n = try p.name()
+                if n != "lexdb" { return Err(lexdb_base.err("0A000", "can only reindex the currently open database")) }
+            }
+        } else if what.text == "schema" {
+            s.index = SCHEMA_MARK + (try p.name())
+        } else if what.text == "index" {
+            s.index = try p.qname()
+        } else {
+            append(mut &s.names, try p.qname())
+        }
+        return Ok(s)
+    }
+    // CLUSTER
+    if p.peek().kind == T_IDENT || p.peek().kind == T_QIDENT {
+        append(mut &s.names, try p.qname())
+        if p.acceptKw("using") { s.index = try p.qname() }
+    } else {
+        s.table = "CLUSTER"
+    }
+    return Ok(s)
+}
+
+// In S_MAINT's index: REINDEX SCHEMA's schema, to check.
+pub const SCHEMA_MARK: str = "\x00schema:"
 
 // COPY (9.45), after its keyword:
 //   COPY table [(col, ...)] FROM STDIN [options]
@@ -3520,6 +4024,7 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
         "update" { return p.update() }
         "delete" { return p.delete() }
         "truncate" { return p.truncate() }
+        "vacuum", "analyze", "analyse", "checkpoint", "reindex", "cluster" { return p.maint(t.text) }
         "copy" { return p.copyStmt() }
         "create" {
             var orReplace = false
@@ -3917,6 +4422,10 @@ pub fn typeText(t: &TypeName): str {
         if t.len > 0 { return "varchar(" + t.len.toStr() + ")" }
         return "varchar"
     }
+    if t.oid == OID_BPCHAR {
+        if t.len > 0 { return "character(" + t.len.toStr() + ")" }
+        return "bpchar"
+    }
     let p = if t.prec == 1 { "(" + t.scale.toStr() + ")" } else { "" }
     if t.oid == OID_DATE { return "date" }
     if t.oid == OID_UUID { return "uuid" }
@@ -3989,8 +4498,8 @@ pub fn exprText(x: &Expr): str {
                 let at = if len(args) > 3 { 3 } else { 1 }
                 return "(" + exprText(&args[at]) + " in " + sq + ")"
             }
-            if n == "like" || n == "ilike" {
-                var out = "(" + exprText(&args[0]) + " " + n + " " + exprText(&args[1])
+            if n == "like" || n == "ilike" || n == "similar" {
+                var out = "(" + exprText(&args[0]) + " " + (if n == "similar" { "similar to" } else { n }) + " " + exprText(&args[1])
                 if len(args) > 2 { out = out + " escape " + exprText(&args[2]) }
                 return out + ")"
             }
