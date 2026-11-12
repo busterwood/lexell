@@ -305,6 +305,30 @@ pub fn (t: &Txn) readCount(): int { return len(t.reads) }
 
 pub fn (t: mut &Txn) forgetReads(n: int) { while len(t.reads) > n { let r = pop(mut &t.reads) } }
 
+fn hexTo(b: mut &StrBuf, s: &str) {
+    let ds = "0123456789abcdef"
+    for i in 0..len(s) {
+        b.addByte(ds[int(s[i]) >> 4])
+        b.addByte(ds[int(s[i]) & 15])
+    }
+}
+
+// The reads noted, as text (for the tests: tree, range, seq of each).
+pub fn (t: &Txn) readsText(): str {
+    var b = newStrBuf()
+    for r in t.reads {
+        b.add(r.tree.toStr())
+        b.add(" [")
+        hexTo(mut &b, &r.lo)
+        b.add(", ")
+        hexTo(mut &b, &r.hi)
+        b.add(") @")
+        b.add(r.seq.toStr())
+        b.add("\n")
+    }
+    return b.toStr()
+}
+
 // The transaction's last write of key in tree (its index in writes).
 fn (t: &Txn) lastWrite(tree: int, key: &str): Option[int] {
     for k in 0..len(t.idxTrees) { if t.idxTrees[k] == tree { return t.idx[k].get(key) } }
@@ -1471,6 +1495,201 @@ fn (st: &Store) getIn(t: mut &Txn, tree: int, key: str, mode: int): Result[Optio
         try st.load(need)
     }
     return Ok(None)
+}
+
+// ---- many keys at once (lexdb.md 9.107)
+
+// getMany's path from the root to the leaf of the last key: per node its
+// slot, its version as snapNode takes it (-1 the current), and the keys it
+// holds, [lo, hi) (each end bounded or not).
+type Finger = record { slots: []int; vers: []int; lo: []str; hasLo: []bool; hi: []str; hasHi: []bool }
+
+fn newFinger(): Finger { return Finger{slots: [], vers: [], lo: [], hasLo: [], hi: [], hasHi: []} }
+
+fn (f: &Finger) holds(d: int, k: &str): bool { return (!f.hasLo[d] || f.lo[d] <= k) && (!f.hasHi[d] || k < f.hi[d]) }
+
+fn (f: mut &Finger) push(s: int, v: int, lo: str, hasLo: bool, hi: str, hasHi: bool) {
+    append(mut &f.slots, s)
+    append(mut &f.vers, v)
+    append(mut &f.lo, lo)
+    append(mut &f.hasLo, hasLo)
+    append(mut &f.hi, hi)
+    append(mut &f.hasHi, hasHi)
+}
+
+fn (f: mut &Finger) pop() {
+    let s = pop(mut &f.slots)
+    let v = pop(mut &f.vers)
+    let l = pop(mut &f.lo)
+    let hl = pop(mut &f.hasLo)
+    let h = pop(mut &f.hi)
+    let hh = pop(mut &f.hasHi)
+}
+
+// A node's version for a read as of q (snap: a snapshot's; else the live
+// tree's, -1 when loaded): verOf's codes, -2 to load it, -3 missing.
+fn (db: &Db) fingerVer(s: int, snap: bool, q: int): int {
+    if snap { return db.verOf(s, q) }
+    return if db.meta[s].loaded { -1 } else { -2 }
+}
+
+// The leaf holding k, reached from the finger: up its path to the lowest
+// node whose range holds k, then down. Its depth in f; -1 with need set: a
+// node to load first; -2 a snapshot's version missing.
+fn (db: mut &Db) fingerTo(f: mut &Finger, root: int, snap: bool, q: int, k: &str, need: mut &int): int {
+    while len(f.slots) > 0 && !f.holds(len(f.slots) - 1, k) { f.pop() }
+    if len(f.slots) == 0 {
+        let v = db.fingerVer(root, snap, q)
+        if v == -2 {
+            need = root
+            return -1
+        }
+        if v == -3 { return -2 }
+        db.meta[root].ref = true
+        f.push(root, v, "", false, "", false)
+    }
+    while true {
+        let d = len(f.slots) - 1
+        var c = -1
+        var lo = ""
+        var hasLo = false
+        var hi = ""
+        var hasHi = false
+        {
+            let n = db.snapNode(f.slots[d], f.vers[d])
+            if n.leaf { return d }
+            let i = childIndex(&n.keys, k)
+            c = n.kids[i]
+            if i > 0 {
+                lo = n.key(i - 1)
+                hasLo = true
+            } else {
+                lo = f.lo[d]
+                hasLo = f.hasLo[d]
+            }
+            if i < n.count() {
+                hi = n.key(i)
+                hasHi = true
+            } else {
+                hi = f.hi[d]
+                hasHi = f.hasHi[d]
+            }
+        }
+        let v = db.fingerVer(c, snap, q)
+        if v == -2 {
+            need = c
+            return -1
+        }
+        if v == -3 { return -2 }
+        db.meta[c].ref = true
+        f.push(c, v, lo, hasLo, hi, hasHi)
+    }
+    return -1
+}
+
+// get (part: getPart) of each of keys in turn, their values (or None)
+// appended to out: what as many calls give, their reads noted as they note
+// them, in the same order. The store's lock is taken once for as many keys
+// as it can, and a key is found from the path to the key before's leaf,
+// not from the root: up to the lowest node whose range holds it, then down
+// (none up, on the same leaf). Keys in order (a batch's lookups sorted, or
+// an index's keys in its order) mostly stay on a leaf or go to the next.
+pub fn (st: &Store) getMany(t: mut &Txn, tree: int, keys: &[]str, part: bool, out: mut &[]Option[str]): Result[Unit, lexdb_base.DbErr] {
+    let mode = if part { M_PART } else { M_FULL }
+    let n = len(keys)
+    if st.fo.isSome() {
+        // a replica's reads: one by one
+        for k in keys { append(out, try st.getIn(t, tree, k, mode)) }
+        return Ok(Unit{})
+    }
+    let snap = t.snap >= 0 && !t.live
+    let sroot = if snap { match t.snapTrees.get(&tree) { Some(r) { r } None { -1 } } } else { -1 }
+    let noting = t.noting()
+    var i = 0
+    while i < n {
+        var need = -1
+        var bad: []lexdb_base.DbErr = []
+        var apart = false               // out's last value is stored apart: unstore it first
+        st.sh.with(fn(db: mut &Db) {
+            if len(db.failed) > 0 {
+                append(mut &bad, db.failed[0])
+                return
+            }
+            if snap && db.snapGone(t.snap) {
+                append(mut &bad, snapCancelled())
+                return
+            }
+            let root = if snap { sroot } else { match db.trees.get(&tree) { Some(r) { r } None { -1 } } }
+            let q = if snap { t.snapSeq } else { db.seq }
+            var f = newFinger()
+            while i < n {
+                // the transaction's own write of it
+                match t.lastWrite(tree, &keys[i]) {
+                    Some(w) {
+                        if t.writes[w].op == OP_DEL { append(out, None) } else { append(out, Some(t.writes[w].val)) }
+                        i += 1
+                        continue
+                    }
+                    None {}
+                }
+                var d = -1
+                if root >= 0 {
+                    d = db.fingerTo(mut &f, root, snap, q, &keys[i], mut &need)
+                    if d == -1 { return }
+                    if d == -2 {
+                        append(mut &bad, lexdb_base.err(lexdb_base.S_INTERNAL, "snapshot: a node version is missing"))
+                        return
+                    }
+                }
+                // noted as getIn notes it: a snapshot's key by key; the live
+                // tree's widening the last read when no key is between
+                if snap {
+                    if noting { t.noteRead(tree, keys[i], keys[i] + "\x00", q) }
+                } else {
+                    let nr = len(t.reads)
+                    var widened = false
+                    if !t.quiet && nr > 0 && t.reads[nr - 1].tree == tree && t.reads[nr - 1].seq == q && len(t.reads[nr - 1].hi) > 0 &&
+                       keys[i] >= t.reads[nr - 1].hi {
+                        var clear = d < 0
+                        if !clear {
+                            let lf = db.snapNode(f.slots[d], f.vers[d])
+                            let li = lf.lower(&keys[i])
+                            clear = lf.count() == 0 || (li > 0 && lf.key(li - 1) < t.reads[nr - 1].hi)
+                        }
+                        if clear {
+                            t.reads[nr - 1].hi = keys[i] + "\x00"
+                            widened = true
+                        }
+                    }
+                    if !widened && !t.quiet { t.noteRead(tree, keys[i], keys[i] + "\x00", q) }
+                }
+                var got: Option[str] = None
+                if d >= 0 {
+                    let lf = db.snapNode(f.slots[d], f.vers[d])
+                    let li = lf.lower(&keys[i])
+                    if li < lf.count() && lf.key(li) == keys[i] {
+                        let v = lf.val(li)
+                        apart = marked(&v) && !isOvf(tree) && !(mode == M_PART && isStub(&v))
+                        got = Some(v)
+                    }
+                }
+                append(out, got)
+                i += 1
+                if apart { return }
+            }
+        })
+        if len(bad) > 0 { return Err(bad[0]) }
+        if need >= 0 {
+            try st.load(need)
+            continue
+        }
+        if apart {
+            let at = len(out) - 1
+            let v = out[at].unwrap()
+            out[at] = Some(try st.unstore(t, tree, &keys[i - 1], &v))
+        }
+    }
+    return Ok(Unit{})
 }
 
 // The pages of tree and of its companion (large values), as the latest
