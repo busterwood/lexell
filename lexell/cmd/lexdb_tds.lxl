@@ -216,9 +216,10 @@ fn kindOf(oid: int): ColT {
     if oid == lexdb_sql.OID_BYTEA { return ColT{kind: C_BIN, n: 0, max: false} }
     if oid == lexdb_sql.OID_UUID { return ColT{kind: C_GUID, n: 0, max: false} }
     if oid == lexdb_sql.OID_DATE { return ColT{kind: C_DATE, n: 0, max: false} }
-    if oid == lexdb_sql.OID_TIME { return ColT{kind: C_TIME, n: 0, max: false} }
-    if oid == lexdb_sql.OID_TS { return ColT{kind: C_DT2, n: 0, max: false} }
-    if oid == lexdb_sql.OID_TSTZ { return ColT{kind: C_DTO, n: 0, max: false} }
+    // the time types: n their scale, SQL Server's default 7
+    if oid == lexdb_sql.OID_TIME { return ColT{kind: C_TIME, n: 7, max: false} }
+    if oid == lexdb_sql.OID_TS { return ColT{kind: C_DT2, n: 7, max: false} }
+    if oid == lexdb_sql.OID_TSTZ { return ColT{kind: C_DTO, n: 7, max: false} }
     return k
 }
 
@@ -258,8 +259,24 @@ fn colTypes(cols: &[]lexdb_exec.OutCol, rows: &[][]Val): []ColT {
     var ts: []ColT = []
     for i in 0..len(cols) {
         var t = kindOf(cols[i].oid)
-        for r in rows {
-            if i < len(r) && !fits(t.kind, &r[i]) { t = ColT{kind: C_TEXT, n: 0, max: false} }
+        var bad = false
+        for r in rows { if i < len(r) && !fits(t.kind, &r[i]) { bad = true } }
+        if bad {
+            // the values' own type where they all have one (ISNULL(NULL, 5)), else text
+            t = ColT{kind: C_TEXT, n: 0, max: false}
+            var own = -1
+            var same = true
+            for r in rows {
+                if i >= len(r) || lexdb_exec.isNull(&r[i]) { continue }
+                let o = lexdb_exec.kindOid(&r[i])
+                if own < 0 { own = o } else if o != own { same = false }
+            }
+            if same && own > 0 {
+                let k = kindOf(if own == lexdb_sql.OID_INT4 || own == lexdb_sql.OID_INT2 { lexdb_sql.OID_INT8 } else { own })
+                var all = true
+                for r in rows { if i < len(r) && !fits(k.kind, &r[i]) { all = false } }
+                if all { t = k }
+            }
         }
         for r in rows {
             if i >= len(r) { continue }
@@ -275,6 +292,7 @@ fn colTypes(cols: &[]lexdb_exec.OutCol, rows: &[][]Val): []ColT {
                 }
             }
         }
+        if (t.kind == C_TIME || t.kind == C_DT2 || t.kind == C_DTO) && cols[i].scale >= 0 { t.n = min(cols[i].scale, 7) }
         append(mut &ts, t)
     }
     return ts
@@ -318,7 +336,7 @@ fn (o: mut &Out) typeInfo(t: &ColT) {
             o.u8(tds.T_DATEN)
         } else if t.kind == C_TIME || t.kind == C_DT2 || t.kind == C_DTO {
             o.u8(if t.kind == C_TIME { tds.T_TIMEN } else if t.kind == C_DT2 { tds.T_DATETIME2N } else { tds.T_DATETIMEOFFSETN })
-            o.u8(6)
+            o.u8(t.n)
         } else {
             o.u8(tds.T_NVARCHAR)
             o.u16(if t.max { 0xFFFF } else { 8000 })
@@ -350,6 +368,19 @@ fn floorDiv(a: int, b: int): int {
 // 0001-01-01 in 3 (0001 to 9999, as SQL Server's)
 fn (o: mut &Out) time5(us: int) {
     for k in 0..5 { o.u8(us >> (8 * k)) }
+}
+
+// A time of day at scale n (its units 10^-n seconds), in timeLen(n) bytes.
+fn timeLen(n: int): int { return if n <= 2 { 3 } else if n <= 4 { 4 } else { 5 } }
+
+fn (o: mut &Out) timeN(us: int, n: int) {
+    var v = us
+    if n == 7 { v = us * 10 } else {
+        var d = 1
+        for k in 0..6 - n { d = d * 10 }
+        v = (us + d / 2) / d
+    }
+    for k in 0..timeLen(n) { o.u8(v >> (8 * k)) }
 }
 
 fn (o: mut &Out) date3(days2000: int): Result[Unit, DbErr] {
@@ -391,7 +422,9 @@ fn (o: mut &Out) value(t: &ColT, v: &Val): Result[Unit, DbErr] {
         }
         return Ok(Unit{})
     }
-    match v {
+    // a value that does not fit its column (whose type is text then): its text
+    let vv: Val = if fits(t.kind, v) { v } else { Val.Text(lexdb_exec.text(v)) }
+    match vv {
         Val.Int(n) {
             if t.n == 2 && (n < -32768 || n > 32767) { return Err(rangeErr(&"Arithmetic overflow error converting expression to data type smallint.")) }
             if t.n == 4 && (n < -2147483648 || n > 2147483647) { return Err(rangeErr(&"Arithmetic overflow error converting expression to data type int.")) }
@@ -450,19 +483,19 @@ fn (o: mut &Out) value(t: &ColT, v: &Val): Result[Unit, DbErr] {
             try o.date3(d)
         }
         Val.Time(us) {
-            o.u8(5)
-            o.time5(us)
+            o.u8(timeLen(t.n))
+            o.timeN(us, t.n)
         }
         Val.Ts(us) {
             let days = floorDiv(us, DAY_US)
-            o.u8(8)
-            o.time5(us - days * DAY_US)
+            o.u8(timeLen(t.n) + 3)
+            o.timeN(us - days * DAY_US, t.n)
             try o.date3(days)
         }
         Val.Tstz(us) {
             let days = floorDiv(us, DAY_US)
-            o.u8(10)
-            o.time5(us - days * DAY_US)
+            o.u8(timeLen(t.n) + 5)
+            o.timeN(us - days * DAY_US, t.n)
             try o.date3(days)
             o.u16(0)                // the offset: +00:00
         }
@@ -650,7 +683,7 @@ fn intOf(p: &tds.RpcParam): int {
 
 // RETURNVALUE: an output parameter's value.
 fn (o: mut &Out) returnValue(ordinal: int, name: &str, t: &lexdb_sql.TypeName, v: &Val) {
-    let cols = [lexdb_exec.OutCol{name: name.toStr(), oid: t.oid, spell: "", coll: ""}]
+    let cols = [lexdb_exec.OutCol{name: name.toStr(), oid: t.oid, spell: "", coll: "", scale: -1}]
     let rows = [[v]]
     let ts = colTypes(&cols, &rows)
     let mark = len(o.b)

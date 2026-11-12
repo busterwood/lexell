@@ -99,6 +99,7 @@ pub fn sqlNumber(state: &str): int {
         "42710" { return 2714 }
         "42501" { return 229 }      // permission was denied
         "42P21" { return 468 }      // Cannot resolve the collation conflict
+        "428C9" { return 544 }      // Cannot insert explicit value for identity column
         "23505" { return 2627 }     // Violation of PRIMARY KEY / UNIQUE KEY constraint
         "23502" { return 515 }      // Cannot insert the value NULL into column
         "23503" { return 547 }      // conflicted with the FOREIGN KEY constraint
@@ -163,7 +164,7 @@ pub type Frame = record {
     pub vals: []Val
 }
 
-const SYSVARS: []str = ["@@trancount", "@@rowcount", "@@error", "@@spid", "@@version", "@@servername", "@@language"]
+const SYSVARS: []str = ["@@trancount", "@@rowcount", "@@error", "@@spid", "@@version", "@@servername", "@@language", "@@identity"]
 
 fn intType(oid: int): TypeName { return TypeName{kind: lexdb_sql.K_INT, oid: oid, prec: 0, scale: 0, len: 0} }
 fn textType(): TypeName { return TypeName{kind: lexdb_sql.K_TEXT, oid: lexdb_sql.OID_TEXT, prec: 0, scale: 0, len: 0} }
@@ -173,7 +174,9 @@ pub fn newFrame(): Frame {
     var f = Frame{names: [], types: [], vals: []}
     for n in SYSVARS {
         append(mut &f.names, n.toStr())
-        append(mut &f.types, if n == "@@version" || n == "@@servername" || n == "@@language" { textType() } else { intType(lexdb_sql.OID_INT4) })
+        append(mut &f.types, if n == "@@version" || n == "@@servername" || n == "@@language" { textType() }
+                            else if n == "@@identity" { TypeName{kind: lexdb_sql.K_NUM, oid: lexdb_sql.OID_NUMERIC, prec: 38, scale: 0, len: 0} }
+                            else { intType(lexdb_sql.OID_INT4) })
         append(mut &f.vals, Val.Null)
     }
     return f
@@ -192,7 +195,7 @@ pub fn (f: &Frame) find(name: &str): int {
     return -1
 }
 
-fn (st: &State) refresh(f: mut &Frame) {
+fn (st: &State) refresh(sess: &lexdb_exec.Session, f: mut &Frame) {
     f.vals[0] = Val.Int(st.trancount)
     f.vals[1] = Val.Int(st.rowcount)
     f.vals[2] = Val.Int(st.error)
@@ -200,6 +203,10 @@ fn (st: &State) refresh(f: mut &Frame) {
     f.vals[4] = Val.Text(VERSION)
     f.vals[5] = Val.Text("lexdb")
     f.vals[6] = Val.Text("us_english")
+    f.vals[7] = match sess.lastIdentity() {
+        Some(n) { Val.Num(Decimal.fromInt(n)) }
+        None { Val.Null }
+    }
 }
 
 fn (f: &Frame) oids(): []int {
@@ -352,7 +359,7 @@ fn (st: mut &State) exec(sess: mut &lexdb_exec.Session, t: &lexdb_tsqlparse.TStm
     if t.kind == lexdb_tsqlparse.TS_SQL { return st.sqlStmt(sess, &t.stmt[0], f, ev, t.value == "set") }
     if t.kind == lexdb_tsqlparse.TS_DECLARE {
         for s in t.stmt {
-            if !st.sqlStmt(sess, &s, f, ev, true) { return false }
+            if !st.sqlStmt(sess, &s, f, ev, false) { return false }     // DECLARE @v = x counts its row, as SQL Server
         }
         return true
     }
@@ -363,6 +370,10 @@ fn (st: mut &State) exec(sess: mut &lexdb_exec.Session, t: &lexdb_tsqlparse.TStm
             else if n == "xact_abort" { st.xactAbort = on }
             else if n == "implicit_transactions" { st.implicitTx = on }
             else if n == "quoted_identifier" { st.quotedIdent = on }
+            else if n == "identity_insert" {
+                sess.setIdentityInsert(&(if on { t.names[1] } else { "" }))
+                break
+            }
             else if n == "lexdb_dialect" {
                 if t.value != "postgres" && t.value != "tsql" {
                     errorEv(ev, &lexdb_base.err("22023", "SET LEXDB_DIALECT takes POSTGRES or TSQL"))
@@ -462,7 +473,7 @@ fn (st: mut &State) after(sess: &lexdb_exec.Session, before: byte, ev: mut &[]Ev
 // Runs a batch: its events onto ev. f: its variables to start with
 // (newFrame's, and an RPC's parameters), and after it the values they have.
 pub fn run(sess: mut &lexdb_exec.Session, st: mut &State, sql: &str, f: mut &Frame, ev: mut &[]Event) {
-    st.refresh(f)
+    st.refresh(sess, f)
     if st.postgres {
         st.runPg(sess, sql, ev)
         return
@@ -485,7 +496,7 @@ pub fn run(sess: mut &lexdb_exec.Session, st: mut &State, sql: &str, f: mut &Fra
         return
     }
     for t in b.stmts {
-        st.refresh(f)
+        st.refresh(sess, f)
         st.committed = false
         let before = sess.status()
         let go = st.exec(sess, &t, f, ev)
