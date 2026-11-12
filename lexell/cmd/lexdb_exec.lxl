@@ -21,6 +21,7 @@ import "collections"
 import "time"
 import "task"
 import "os"
+import "hash"
 import "./lexdb_base"
 import "./lexdb_time"
 import "./lexdb_float"
@@ -3544,9 +3545,19 @@ fn loadEst(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, join: b
     let v = got.unwrap()
     let parts = strings.split(&v, ";")
     if len(parts) < 2 || strings.parseIntOpt(parts[0].toStr()).unwrapOr(-1) != t.tree { return Ok(noEst()) }
-    var es = Est{rows: strings.parseIntOpt(parts[1].toStr()).unwrapOr(-1), trees: [], entries: [], dist: [], cm: [], lo: [], hi: [], span: [], samp: []}
+    var es = Est{rows: strings.parseIntOpt(parts[1].toStr()).unwrapOr(-1), trees: [], entries: [], dist: [], cm: [], lo: [], hi: [], span: [], samp: [], cols: [], cnd: []}
     for i in 2..len(parts) {
         let f = strings.split(parts[i], ":")
+        if len(f) == 2 && f[0] == "d" {
+            // the other columns' distinct values (optimizer 39)
+            for kv in strings.split(f[1], ",") {
+                let eq = strings.indexOf(kv, "=", 0)
+                if eq < 0 { continue }
+                append(mut &es.cols, fromHex(&kv[0..eq]))
+                append(mut &es.cnd, strings.parseIntOpt(kv[eq + 1..len(kv)].toStr()).unwrapOr(-1))
+            }
+            continue
+        }
         if len(f) < 3 { continue }
         var ds: []int = []
         for x in strings.split(f[2], ",") { append(mut &ds, strings.parseIntOpt(x.toStr()).unwrapOr(0)) }
@@ -3808,10 +3819,16 @@ fn (sp: &Samp) below(key: &str, num: float, has: bool, incl: bool, upper: bool, 
     let from = if at >= 0 { sp.lt[at] + sp.eq[at] } else { 0 }
     let to = if at + 1 < len(sp.keys) { sp.lt[at + 1] } else { sp.nn }
     var frac = if upper { 2.0f / 3.0f } else { 1.0f / 3.0f }
-    if sp.numeric && has {
+    // NaN sorts above every number, infinity above every finite one: the
+    // whole gap; an infinite end is no number to interpolate by (optimizer 39)
+    if sp.numeric && has && (num.isNaN() || (!num.isFinite() && num > 0.0f)) {
+        frac = 1.0f
+    } else if sp.numeric && has && !num.isFinite() {
+        frac = 0.0f
+    } else if sp.numeric && has && num.isFinite() {
         let a = if at >= 0 { sp.nums[at] } else if span { mn } else { num }
         let b = if at + 1 < len(sp.keys) { sp.nums[at + 1] } else if span { mx } else { num }
-        if b > a {
+        if b > a && a.isFinite() && b.isFinite() {
             frac = (num - a) / (b - a)
             if frac < 0.0f { frac = 0.0f }
             if frac > 1.0f { frac = 1.0f }
@@ -3830,6 +3847,43 @@ fn (sp: &Samp) rangeShare(hasLo: bool, loKey: &str, loNum: float, loIncl: bool, 
     let b = if hasHi { sp.below(hiKey, hiNum, nums, hiIncl, true, span, mn, mx) } else { float(sp.nn) }
     let r = if b > a { b - a } else { 0.0f }
     return fmax(r, 1.0f) / float(entries)
+}
+
+// The distinct values of a column no key or index leads with (optimizer
+// 39), estimated in bounded memory: the KMV_K least hashes of its values
+// (Bar-Yossef et al. 2002, "k minimum values"): when there are fewer, their
+// number is the count; else (KMV_K - 1) / the KMV_K-th least as a share of
+// the hashes' range, within about 1 / sqrt(KMV_K - 2) (6%). The hash is
+// SipHash under a fixed key, so the same rows give the same count.
+const KMV_K: int = 256
+
+type Kmv = record { hs: []u64 }
+
+fn (k: mut &Kmv) add(v: &str) {
+    let h = hash.sipHash13(u64(0x6c657864), u64(0x62737461), v)
+    let n = len(k.hs)
+    if n >= KMV_K && h >= k.hs[n - 1] { return }
+    var lo = 0
+    var hi = n
+    while lo < hi {
+        let mid = (lo + hi) / 2
+        if k.hs[mid] < h { lo = mid + 1 } else { hi = mid }
+    }
+    if lo < n && k.hs[lo] == h { return }
+    append(mut &k.hs, h)
+    var j = n
+    while j > lo {
+        k.hs[j] = k.hs[j - 1]
+        j -= 1
+    }
+    k.hs[lo] = h
+    if len(k.hs) > KMV_K { let dropped = pop(mut &k.hs) }
+}
+
+fn (k: &Kmv) count(): int {
+    if len(k.hs) < KMV_K { return len(k.hs) }
+    let top = int(k.hs[KMV_K - 1] >> 11)      // 53 bits
+    return int(float(KMV_K - 1) * 9007199254740992.0f / float(top + 1))
 }
 
 // Distinct values counted per prefix at most: past it the count stays here, a
@@ -3881,6 +3935,17 @@ fn analyzeTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, snap: mut &le
         append(mut &nums, 0)
         append(mut &keyNums, newMap())
     }
+    // the columns no key or index leads with: their distinct values
+    // (optimizer 39)
+    var others: []int = []
+    var sketches: []Kmv = []
+    for ci in 0..len(t.cols) {
+        var leads = len(t.pk) > 0 && t.pk[0] == ci
+        for ix in t.indexes { if len(ix.cols) > 0 && ix.cols[0] == ci && ix.pred.isNone() { leads = true } }
+        if leads { continue }
+        append(mut &others, ci)
+        append(mut &sketches, Kmv{hs: []})
+    }
     var pkMin = 0.0f
     var pkMax = 0.0f
     var pkNums = 0
@@ -3908,6 +3973,12 @@ fn analyzeTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, snap: mut &le
         try fetch(st, snap, t, &path, &sc, &all, mut &cur, mut &batch)
         for r in batch {
             rows += 1
+            for x in 0..len(others) {
+                if isNull(&r[others[x]]) { continue }
+                var ob = newStrBuf()
+                encIdxPart(mut &ob, &r[others[x]])
+                sketches[x].add(&ob.toStr())
+            }
             if pkn > 0 {
                 var b = newStrBuf()
                 var changed = rows == 1
@@ -4008,6 +4079,12 @@ fn analyzeTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, snap: mut &le
         } else {
             out.add(":" + spanText(0, 0.0f, 0.0f) + ":")
         }
+    }
+    if len(others) > 0 {
+        // the other columns' distinct values, hexname=count
+        var parts: []str = []
+        for x in 0..len(others) { append(mut &parts, toHex(&t.cols[others[x]].name) + "=" + sketches[x].count().toStr()) }
+        out.add(";d:" + strings.join(&parts, ","))
     }
     try txn.put(CATALOG, statKey(&t.name), out.toStr())
     return Ok(Unit{})
@@ -4312,9 +4389,10 @@ const IN_LOOKUP_MAX: int = 1000
 // columns (a NULL counted as a value), and its leading column's most common
 // values (cm, optimizer 23). rows -1: none (no ANALYZE, an ANALYZE of an older table
 // of the name, or SET lexdb_planner = rules).
-type Est = record { rows: int; trees: []int; entries: []int; dist: [][]int; cm: []Common; lo: []float; hi: []float; span: []bool; samp: []str }
+type Est = record { rows: int; trees: []int; entries: []int; dist: [][]int; cm: []Common; lo: []float; hi: []float; span: []bool; samp: []str;
+                    cols: []str; cnd: []int }
 
-fn noEst(): Est { return Est{rows: -1, trees: [], entries: [], dist: [], cm: [], lo: [], hi: [], span: [], samp: []} }
+fn noEst(): Est { return Est{rows: -1, trees: [], entries: [], dist: [], cm: [], lo: [], hi: [], span: [], samp: [], cols: [], cnd: []} }
 
 // An index's leading column (optimizer 23): its entries, its distinct values, and its
 // most common values (their encoded index parts) with their exact counts:
@@ -5652,6 +5730,32 @@ fn (q: &Query) wayCands(k: int, cs: &[]Expr): []WayCand {
     return out
 }
 
+// Whether path choice has a way into level k by its constants (an equality,
+// a range or an IN list on a leading column) that does not give the order
+// of cols (its columns): it would not read the table in that order.
+fn (q: &Query) constWay(k: int, cands: &[]WayCand, cs: &[]Expr, cols: &[]int): bool {
+    let lv = &q.levels[k]
+    for wc in cands {
+        if len(wc.colIds) == 0 || wc.colIds[0] < 0 { continue }
+        let name = lv.alias + "." + lv.t.cols[wc.colIds[0]].name
+        if len(inList(cs, &name, k, q)) > 0 { return true }
+        var any = false
+        for b in bounds(cs, &name, k, q) { if q.maxLevel(&b.val) < 0 && !hasCorr(&b.val) { any = true } }
+        if !any { continue }
+        // its leading constant equalities, then (a range) in key order
+        var eqs: []Expr = []
+        for bc in wc.cols {
+            var konst = false
+            for d in bc.deps { if d == 0 { konst = true } }
+            if !konst { break }
+            append(mut &eqs, Expr.Lit(Val.Null))
+        }
+        let p = Path{index: wc.index, eqs: eqs, rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: []}
+        if !servesOrder(&lv.t, &p, cols) { return true }
+    }
+    return false
+}
+
 // The cheapest way into level k with the levels of mask placed: outer, one
 // using their values (a lookup per row; rows -1 when there is none); else
 // one by constants only (equalities, then a range of the next column, cs's:
@@ -5870,8 +5974,10 @@ fn (q: &Query) boundsShare(k: int, col: int, ops: &[]str, vals: &[]Expr): float 
 }
 
 // The share of level k's rows its own conditions among cs keep (masks:
-// the levels each uses).
-fn (q: &Query) localShare(k: int, cs: &[]Expr, masks: &[]int): float {
+// the levels each uses); guessed set when a condition's share is a guess (no
+// statistics say: an equality on a column no index leads with, or another
+// test).
+fn (q: &Query) localShare(k: int, cs: &[]Expr, masks: &[]int, guessed: mut &bool): float {
     let lv = &q.levels[k]
     var share = 1.0f
     var ranged: []int = []
@@ -5889,7 +5995,7 @@ fn (q: &Query) localShare(k: int, cs: &[]Expr, masks: &[]int): float {
             done = true
             let name = &names[col]
             if op == "=" {
-                share = share * q.eqShare(k, col, &v)
+                share = share * q.eqShare(k, col, &v, guessed)
             } else if op == "<>" {
                 share = share * (1.0f - 1.0f / q.distinctOf(name, k))
             } else {
@@ -5907,7 +6013,9 @@ fn (q: &Query) localShare(k: int, cs: &[]Expr, masks: &[]int): float {
                 if n == "in" && len(args) > 1 {
                     match args[0] {
                         Expr.Col(a) {
-                            share = share * fmin(1.0f, float(len(args) - 1) / q.distinctOf(&a, k))
+                            let d = q.distinctKnown(&a, k)
+                            if d <= 0.0f { guessed = true }
+                            share = share * fmin(1.0f, float(len(args) - 1) * (if d > 0.0f { 1.0f / d } else { EQ_GUESS }))
                             continue
                         }
                         else {}
@@ -5917,12 +6025,13 @@ fn (q: &Query) localShare(k: int, cs: &[]Expr, masks: &[]int): float {
             else {}
         }
         share = share * 0.5f
+        guessed = true
     }
     return share
 }
 
 // The share of level k's rows equal to v on column col.
-fn (q: &Query) eqShare(k: int, col: int, v: &Expr): float {
+fn (q: &Query) eqShare(k: int, col: int, v: &Expr, guessed: mut &bool): float {
     let lv = &q.levels[k]
     let e = q.leadEntry(k, col)
     if e >= 0 && lv.est.entries[e] > 0 {
@@ -5931,13 +6040,30 @@ fn (q: &Query) eqShare(k: int, col: int, v: &Expr): float {
         let r = rowsOf(&lv.est.cm[e], &key)
         if r >= 0 { return fmax(float(r), 1.0f) / float(lv.est.entries[e]) }
     }
-    return 1.0f / q.distinctOf(&(lv.alias + "." + lv.t.cols[col].name), k)
+    let d = q.distinctKnown(&(lv.alias + "." + lv.t.cols[col].name), k)
+    if d <= 0.0f { guessed = true }
+    return if d > 0.0f { 1.0f / d } else { EQ_GUESS }
 }
+
+// An equality with a constant on a column whose distinct values are not
+// known (no index leads with it): the share of the rows it keeps, SQLite's
+// guess (a quarter). The table's rows / 10 (distinctOf's guess) made it
+// about 10 rows whatever the table's size, which the measured costs
+// (optimizer 36) turned into a full scan of the largest table (optimizer 39).
+const EQ_GUESS: float = 0.25f
 
 fn fmin(a: float, b: float): float { return if a < b { a } else { b } }
 
 // A column's distinct values (level k's), for an equality's share.
 fn (q: &Query) distinctOf(name: &str, k: int): float {
+    let d = q.distinctKnown(name, k)
+    if d > 0.0f { return d }
+    return fmax(fmax(float(q.levels[k].est.rows), 1.0f) / 10.0f, 1.0f)
+}
+
+// A column's distinct values when a key or an index (with statistics) leads
+// with it; -1 not known.
+fn (q: &Query) distinctKnown(name: &str, k: int): float {
     let lv = &q.levels[k]
     let i = colIndex(&q.cols, name) - lv.first
     let t = fmax(float(lv.est.rows), 1.0f)
@@ -5951,7 +6077,14 @@ fn (q: &Query) distinctOf(name: &str, k: int): float {
         let tree = if c < 0 { lv.t.tree } else { lv.t.indexes[c].tree }
         for j in 0..len(lv.est.trees) { if lv.est.trees[j] == tree && lv.est.cm[j].d > 0 { return float(lv.est.cm[j].d) } }
     }
-    return fmax(t / 10.0f, 1.0f)
+    // ANALYZE's count of another column (optimizer 39); none but NULLs: an
+    // equality keeps a row at most
+    if i >= 0 && i < len(lv.t.cols) {
+        for j in 0..len(lv.est.cols) {
+            if lv.est.cols[j] == lv.t.cols[i].name && lv.est.cnd[j] >= 0 { return if lv.est.cnd[j] > 0 { float(lv.est.cnd[j]) } else { t } }
+        }
+    }
+    return -1.0f
 }
 
 // The rows of a set of levels (mask): its tables' by their constants,
@@ -6138,9 +6271,10 @@ fn copyBools(xs: &[]bool): []bool {
 // without statistics, an outer join, LATERAL, too many tables).
 // lookups: a table a lookup reaches is not read once instead.
 // cap: a hash's bytes at most where a lookup is possible. ordT: the level an
-// ORDER BY with a LIMIT can be read in order from (-1 none), lim the rows
+// ORDER BY with a LIMIT can be read in order from (-1 none), ordCols its
+// columns there, lim the rows
 // the LIMIT and OFFSET take (optimizer 32).
-fn (q: &Query) costOrder(ms: &[][]Expr, lookups: bool, cap: float, ordT: int, lim: float, perm: mut &[]int, ro: mut &[]bool): bool {
+fn (q: &Query) costOrder(ms: &[][]Expr, lookups: bool, cap: float, ordT: int, ordCols: &[]int, lim: float, perm: mut &[]int, ro: mut &[]bool): bool {
     let nl = len(q.levels)
     if nl < 2 || nl > JOIN_SEARCH_MAX { return false }
     for lv in q.levels {
@@ -6153,6 +6287,7 @@ fn (q: &Query) costOrder(ms: &[][]Expr, lookups: bool, cap: float, ordT: int, li
     for x in cs { append(mut &masks, q.levelMask(&x)) }
     var cands: [][]WayCand = []
     var base: []Way = []                // each level by its constants alone
+    var guessed: []bool = []            // per level: its rows by a guessed share
     for k in 0..nl {
         append(mut &cands, q.wayCands(k, &cs))
         // its own conditions (no other table's columns)
@@ -6168,7 +6303,9 @@ fn (q: &Query) costOrder(ms: &[][]Expr, lookups: bool, cap: float, ordT: int, li
         // own conditions keep (optimizer 29)
         let w = q.wayInto(k, &cands[k], 0, false, &own)
         let t = float(q.levels[k].est.rows)
-        append(mut &base, Way{rows: fmax(t * q.localShare(k, &own, &ownMasks), 1.0f), cost: w.cost, outer: false, inner: w.inner})
+        var g = false
+        append(mut &base, Way{rows: fmax(t * q.localShare(k, &own, &ownMasks, mut &g), 1.0f), cost: w.cost, outer: false, inner: w.inner})
+        append(mut &guessed, g)
     }
     // the levels each level shares a conjunct with
     var adj: []int = array(nl, 0)
@@ -6259,16 +6396,28 @@ fn (q: &Query) costOrder(ms: &[][]Expr, lookups: bool, cap: float, ordT: int, li
     // order's, times the share of the rows the LIMIT takes. It is taken when
     // that is cheaper than the best order's cost and a sort of its rows. Not
     // with a hash: a hash is built whole before the first row.
-    if ordT >= 0 && base[ordT].cost >= float(q.levels[ordT].est.rows) - 0.5f {
+    // Only when the table has no way in by its constants, so path choice
+    // will read it in order: its cost no longer says so, an index's way can
+    // cost more than the scan (optimizer 39).
+    //
+    // Not when another table's rows are a guess (optimizer 39): if it keeps
+    // far fewer than guessed, the LIMIT's rows come late and the ordered
+    // table is read whole, a lookup per row (a filter on a column without an
+    // index). A hash is built whole before the first row: its cost counts in
+    // full, not the LIMIT's share (a hash of one pinned row is no reason
+    // against it).
+    var sure = true
+    for k in 0..nl { if k != ordT && guessed[k] { sure = false } }
+    if ordT >= 0 && sure && !q.constWay(ordT, &cands[ordT], &cs, ordCols) {
         var o2: []int = []
         var f2: []bool = []
         let c2 = q.nBest(&[ordT], nl, &cands, &base, &adj, &cmask, &cdist, mut &memo, true, cap, mut &o2, mut &f2)
-        var hashed = false
-        for i in 1..nl { if f2[i] { hashed = true } }
+        var builds = 0.0f
+        for i in 1..nl { if f2[i] { builds += base[o2[i]].cost + base[o2[i]].rows * HASH_BUILD } }
         let rall = q.setRows((1 << nl) - 1, nl, &base, &cmask, &cdist, mut &memo)
         let frac = fmin(1.0f, lim / rall)
         let sortCost = rall * ROW_COST * float(scaleOf(int(rall)))
-        if !hashed && c2 * frac < bestCost + sortCost {
+        if fmax(c2 - builds, 0.0f) * frac + builds < bestCost + sortCost {
             order = o2
             flags = f2
         }
@@ -6313,7 +6462,7 @@ fn limitGuess(x: &Option[Expr]): int {
 // The level whose rows an ORDER BY sorts by, all its items plain columns of
 // that one table in one direction (NULLs where an index keeps them), and a
 // key or an unfiltered index of it giving that order: its index; else -1.
-fn (q: &Query) orderedLevel(items: &[]lexdb_sql.OrderItem): int {
+fn (q: &Query) orderedLevel(items: &[]lexdb_sql.OrderItem, out: mut &[]int): int {
     if len(items) == 0 { return -1 }
     var lv = -1
     var cols: []int = []
@@ -6340,7 +6489,10 @@ fn (q: &Query) orderedLevel(items: &[]lexdb_sql.OrderItem): int {
         let c = c0 - 1
         if c >= 0 && t.indexes[c].pred.isSome() { continue }
         let p = Path{index: c, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: []}
-        if servesOrder(t, &p, &cols) { return lv }
+        if servesOrder(t, &p, &cols) {
+            for x in cols { append(out, x) }
+            return lv
+        }
     }
     return -1
 }
@@ -6352,13 +6504,39 @@ fn noTable(): Table {
 }
 
 // Whether a table is pinned to one row by its key's equalities with
-// constants or parameters (optimizer 35).
-fn (q: &Query) hasPinned(ms: &[][]Expr): bool {
+// constants or parameters (optimizer 35), and the order bound by keys from
+// it reaches every other table by a key or an index of the tables before
+// (optimizer 39): a pinned row that binds nothing else (a settings row) says
+// nothing about how to read the rest, which costing decides. The order (old
+// indexes, every level) when it is so, else [].
+fn (q: &Query) pinnedOrder(ms: &[][]Expr): []int {
+    if !q.innerOnly() { return [] }
+    let nl = len(q.levels)
     var cs: []Expr = []
     for m in ms { for c in m { append(mut &cs, clone(&c)) } }
-    let none: []bool = array(len(q.levels), false)
-    for k in 0..len(q.levels) { if q.bindOf(k, &cs, &none) == 3 { return true } }
-    return false
+    var placed: []bool = array(nl, false)
+    var start = -1
+    for k in 0..nl { if start < 0 && q.bindOf(k, &cs, &placed) == 3 { start = k } }
+    if start < 0 { return [] }
+    placed[start] = true
+    var out: []int = [start]
+    for n in 1..nl {
+        var best = -1
+        var bb = -1
+        for k in 0..nl {
+            if placed[k] { continue }
+            let b = q.bindOf(k, &cs, &placed)
+            if b > bb {
+                bb = b
+                best = k
+            }
+        }
+        // a subquery's rows have no key: read once, wherever they go
+        if bb < 2 && !q.levels[best].virt() { return [] }
+        placed[best] = true
+        append(mut &out, best)
+    }
+    return out
 }
 
 // Whether every join is inner and none LATERAL: its tables may run in any
@@ -6484,6 +6662,8 @@ fn choosePath(q: &Query, k: int, cs: &[]Expr, params: &[]Val, lk: mut &[]Look): 
         var ins: []Expr = []
         var inSub = -1
         var inArr: []Expr = []
+        var feqs: []Expr = []           // from a pinned row: the equalities for the figure
+        var fdiff = false
         for pos in 0..len(cols) {
             let ci = cols[pos]
             if ci < 0 {
@@ -6496,6 +6676,7 @@ fn choosePath(q: &Query, k: int, cs: &[]Expr, params: &[]Val, lk: mut &[]Look): 
                     rng = xb
                     break
                 }
+                if q.pinned { append(mut &feqs, clone(&xb[xeq].val)) }
                 append(mut &eqs, replace(mut &xb[xeq].val, Expr.Lit(Val.Null)))
                 continue
             }
@@ -6523,6 +6704,14 @@ fn choosePath(q: &Query, k: int, cs: &[]Expr, params: &[]Val, lk: mut &[]Look): 
                 if len(ins) == 0 && inSub < 0 && len(inArr) == 0 { rng = bs }
                 break
             }
+            if q.pinned {
+                // the figure by the constant the outer value equals (it is
+                // implied: the same rows), not the average (optimizer 39)
+                var kAt = -1
+                for i in 0..len(bs) { if bs[i].op == "=" && kAt < 0 && q.maxLevel(&bs[i].val) < 0 && !hasCorr(&bs[i].val) { kAt = i } }
+                if kAt >= 0 && kAt != eqAt { fdiff = true }
+                append(mut &feqs, clone(&bs[if kAt >= 0 { kAt } else { eqAt }].val))
+            }
             append(mut &eqs, replace(mut &bs[eqAt].val, Expr.Lit(Val.Null)))
         }
         // an IN list counts as an equality; the full key by one is a lookup per value
@@ -6535,8 +6724,11 @@ fn choosePath(q: &Query, k: int, cs: &[]Expr, params: &[]Val, lk: mut &[]Look): 
             if c < 0 { score = 500 } else if lv.t.indexes[c].unique { score = 499 }
         }
         if score == 0 { continue }
-        let p = Path{index: c, eqs: eqs, rng: rng, desc: false, noNulls: false, ins: ins, inSub: inSub, inArr: inArr}
+        var p = Path{index: c, eqs: eqs, rng: rng, desc: false, noNulls: false, ins: ins, inSub: inSub, inArr: inArr}
         if lv.readOnce && q.pathOuter(&p) { continue }          // read once (optimizer 26)
+        let po = q.pathOuter(&p)
+        var saved: []Expr = []
+        if fdiff { saved = replace(mut &p.eqs, feqs) }
         let f = pathFig(lv, &p, params)
         // the first equality's value set the figure: a look (optimizer 23)
         var lo = Look{kind: -1, c: Expr.Lit(Val.Null), p: Expr.Lit(Val.Null), out: 0, typ: noType(), cm: noCommon()}
@@ -6548,7 +6740,8 @@ fn choosePath(q: &Query, k: int, cs: &[]Expr, params: &[]Val, lk: mut &[]Look): 
                 lo = Look{kind: 2, c: clone(&p.eqs[0]), p: Expr.Lit(Val.Null), out: scaleOf(f.rows), typ: typ, cm: lv.est.commonOf(tree)}
             }
         }
-        append(mut &outer, q.pathOuter(&p))
+        if fdiff { p.eqs = saved }
+        append(mut &outer, po)
         append(mut &paths, p)
         append(mut &scores, score)
         append(mut &figs, f)
@@ -6561,7 +6754,9 @@ fn choosePath(q: &Query, k: int, cs: &[]Expr, params: &[]Val, lk: mut &[]Look): 
         var pc = figCost(&figs[best], paths[best].index, k == 0)
         var group = 0
         for i in 0..len(paths) {
-            if outer[i] != outer[best] || figs[i].rows < 0 { continue }
+            // from a pinned row the tables before give one row, or rows of
+            // the same values: per row or read once compare (optimizer 39)
+            if (outer[i] != outer[best] && !q.pinned) || figs[i].rows < 0 { continue }
             group += 1
             let ci = figCost(&figs[i], paths[i].index, k == 0)
             if ci < pc || (ci == pc && scores[i] > scores[pick]) {
@@ -6573,7 +6768,7 @@ fn choosePath(q: &Query, k: int, cs: &[]Expr, params: &[]Val, lk: mut &[]Look): 
         // for values of the same scale
         if group >= 2 {
             for i in 0..len(paths) {
-                if outer[i] == outer[best] && figs[i].rows >= 0 && looks[i].kind == 2 {
+                if (outer[i] == outer[best] || q.pinned) && figs[i].rows >= 0 && looks[i].kind == 2 {
                     append(lk, replace(mut &looks[i], Look{kind: -1, c: Expr.Lit(Val.Null), p: Expr.Lit(Val.Null), out: 0, typ: noType(), cm: noCommon()}))
                 }
             }
@@ -7187,11 +7382,17 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
         // a hash holds at most half the statement's memory, 64 MB at most
         var cap = HASH_MAX_BYTES
         if txn.memMax > 0 && float(txn.memMax) / 2.0f < cap { cap = float(txn.memMax) / 2.0f }
-        let ordT = q.orderedLevel(&ordBy)
+        var ordCols: []int = []
+        let ordT = q.orderedLevel(&ordBy, mut &ordCols)
         // A join that starts from a row its key pins (optimizer 35): the
         // order bound by keys, at once; no statistics read for it and no
         // search (most OLTP joins, planned on every run unless prepared).
-        let pinned = q.hasPinned(&ms)
+        // Not with an ORDER BY ... LIMIT a table can serve: reading it in
+        // order and stopping early (optimizer 32) may beat starting from the
+        // pinned row (optimizer 39).
+        var po: []int = []
+        if ordT < 0 || ordLim < 0 { po = q.pinnedOrder(&ms) }
+        let pinned = len(po) > 0
         // from one row, a lookup per row is one lookup: cheaper than a hash
         // of what a constant reaches (the "constant first" rule, optimizer 27)
         if pinned {
@@ -7206,7 +7407,13 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
                 }
             }
         }
-        if pinned || txn.noting() || !q.costOrder(&ms, early, cap, ordT, float(ordLim), mut &perm, mut &ro) { perm = q.joinOrder(&ms) }
+        if pinned {
+            var ident = true
+            for i in 0..nl { if po[i] != i { ident = false } }
+            if !ident { perm = po }
+        } else if txn.noting() || !q.costOrder(&ms, early, cap, ordT, &ordCols, float(ordLim), mut &perm, mut &ro) {
+            perm = q.joinOrder(&ms)
+        }
         if len(perm) == nl {
             var pool: []Expr = []
             for k in 0..nl {

@@ -42,9 +42,10 @@ review's fixes with filter and range estimates (29); the search to 24
 tables (30); the integration with lexdb 9.94 (31); ORDER BY ... LIMIT read
 in order (32); the second review's fixes (33); a workload comparison (34);
 the fast path for pinned joins (35); the read costs measured and
-calibrated (36); ANALYZE's samples, the rest of SQLite's stat4 (37); and
-the switch's threshold from the measured costs in the cost mode (38,
-uncommitted). Code comments cite these sections as "optimizer N".
+calibrated (36); ANALYZE's samples, the rest of SQLite's stat4 (37); the
+switch's threshold from the measured costs in the cost mode (38); and the
+third review's fixes, with ANALYZE's distinct counts of the other columns
+(39, uncommitted). Code comments cite these sections as "optimizer N".
 
 ## 1. Summary
 
@@ -1936,7 +1937,7 @@ planner, though their plans were the same or equivalent.
 
 **What.** A join whose key-bound order (section 25) starts from a row that
 its key pins (after implied equalities) takes that order at once
-(`hasPinned`). It reads no statistics beyond those single-table path choice
+(`pinnedOrder`). It reads no statistics beyond those single-table path choice
 already reads, and does not search. Other joins load their tables'
 statistics only when they are costed (`loadEst` during FROM is now the
 single-table rule). From a pinned row:
@@ -2160,6 +2161,141 @@ expectation was updated.
 13,088 (rules 11,824), Q9 35,075 (rules 47,615); the rest as before.
 
 **Checked:** the suite, 96 of 96.
+
+## 39. Third review and fixes (2026-11-12)
+
+A Fable subagent reviewed sections 34 to 37 (at `ac0cef2b`), before
+section 38. It found no wrong results, crashes or wrongly reused plans:
+- the cost planner against the rules mode, with and without ANALYZE: 864
+  queries from the earlier generator, 1,579 from a new one (pins by primary
+  key, unique index with NULLs, composite key, partial and expression
+  unique indexes; constants that do not coerce; outer, full and LATERAL
+  joins; date expressions; EXISTS and derived tables);
+- the same queries in a block that has written (the noting path): 1,383;
+- hand-written pinned cases, prepared statements, 336 sampled ranges against
+  their counts, sample and literal edge cases.
+
+It found plan-quality regressions against section 33, mostly from the
+pinned fast path (35), plus two from the calibrated costs (36). Fixed:
+
+**1. From a pinned row, the constant's estimate.** `o.cid = c.id` and
+`c.id = 5` imply `o.cid = 5`. Section 35 took the outer equality, so the
+figure was the average (7 rows), not customer 5's count (6,005). And only
+candidates of the same kind (per row, read once) were compared, so `ord_cid`
+was never compared with `ord_d` (a constant date). From a pinned row, a
+column's outer value equals the constant for every row before, so
+`choosePath` now takes the figure from the constant (`feqs`) and compares
+all candidates. Customer 5's orders of one day: `ord_d` (20 rows read, 0.15
+ms), not `ord_cid` (6,005, 7.5 ms).
+
+**2. A pinned row that binds nothing else.** Any pinned table sent the
+whole join to the order bound by keys (section 35). Where the pinned row is
+a settings row, the rest went in FROM's order with lookups per row: 2,163
+rows read became 61,001 (2.0 ms to 65), and 300,000 at 100,000 rows. The
+fast path (`pinnedOrder`) now needs its greedy order to reach every other
+table by a key or an index of the tables before it (`bindOf >= 2`; a
+subquery in FROM, which has no key, may come anywhere). Otherwise the join
+is costed. The fast path's order is reused rather than built twice.
+
+**3. ORDER BY ... LIMIT from a pinned row.** The fast path never looked at
+the ORDER BY, so customer 5's first 10 orders by id sorted all 6,005 (5.2
+ms; 0.22 before). Two causes:
+- the fast path is not taken when the ORDER BY with a LIMIT can be served by
+  a table (section 32);
+- the LIMIT plan was refused whenever it needed a hash, as a hash is built
+  whole before the first row. A hash of the pinned row is one row. The hash
+  builds now count in full, and only the rest is scaled by the LIMIT's share.
+Both FROM orders now read 10 orders through `ord_cid`, in key order.
+
+**4. Equalities on columns no index leads with.** Their share was 1 /
+(rows / 10): about 10 rows whatever the table's size. Under the old 1:2
+ratio that did little harm. With the measured costs (36), "scan 30,000
+rows, then 10 lookups" beat 25 × 60 index rows, and the scan kept 4,286. A
+fixed share does not work either way:
+- a quarter (SQLite's guess) fixed `qty = 3` (7 values);
+- but it broke `name = 's42'` (one row): `sku` stopped leading, and one
+  case went 0.13 to 3 ms.
+
+So ANALYZE now counts every other column's distinct values. The count is a
+KMV sketch (Bar-Yossef et al. 2002): the 256 least SipHash values of the
+column's encoded values, under a fixed key so the same rows give the same
+count. With fewer than 256 the count is exact; else (K - 1) / the K-th
+least's share of the range, within about 6%. It is kept as a `d:` part of
+the statistics row (hex name = count), which older code skips. The share is
+1 / that count (all NULL: one row). A column without a count (statistics
+from before) takes a quarter.
+
+**5. The ORDER BY table's test.** "The ordered table has no constant way
+in" was tested as its cheapest constant way costing a full scan. Under the
+measured costs an index way can cost more than the scan, so the test passed
+for `ord_st` ranges. The LIMIT plan was costed as if reading in order, while
+`choosePath` took the index and sorted (17 ms to 22). Now `constWay` asks
+whether there is an equality, range or IN list on a leading column whose
+path does not give the ORDER BY's order (`servesOrder`). `ord_cid = 5` for
+`ORDER BY o.id` gives it; `st < 2` does not.
+
+**And a guard (found while fixing 3 and 4).** The LIMIT plan bets that the
+rows come early. If another table's filter is a guess (`localShare` marks
+equalities without a count, and the halving of other tests), that table
+may keep far fewer rows than estimated. The ordered table is then read
+whole, a lookup per row. Customer `c5` by name, first 10 orders by id read
+all 20,005 orders (25 ms; 5 before). Such a plan is not taken.
+
+**6. A NaN bound.** `f < 'NaN'` made the interpolation NaN, so the
+estimate was 1 row and the wrong index won. NaN and +Infinity now take the
+whole gap, -Infinity none, and an infinite sample end does not interpolate.
+
+**Not fixed.**
+- **7: a filter does not raise what a bound raises.** `f > 1e308 * 10`
+  raises 22003 where it bounds an index range, but as a filter it does not.
+  The samples now and then turn such a bound into a filter (another range
+  wins). This is lexdb's filter evaluation, not the planner.
+- **Minor.** An inclusive bound at the column's least value (not a sample)
+  counts none of the equal rows. Pinned lookups show the average estimate in
+  EXPLAIN. Literals are evaluated in UTC at plan time (estimates only). Long
+  text sample keys are kept whole. A single table has no scan candidate
+  against an index range: the switch (38) covers the large ranges.
+
+**Measured.** The review's comparison against section 33 (its random pinned
+and ORDER BY queries, 280 of them), rows read and time per query: one
+regression is left (two more flagged were an identical plan's timing and
+0.36 to 0.46 ms): `ORDER BY o.d DESC LIMIT 10`
+over orders, items, customers, skus and the settings row (1.0 ms to 5.2).
+It reads orders by date backward, and the 6,000 newest orders have no items.
+That is a correlation no statistic here sees, the LIMIT plan's known risk.
+
+The workload (µs):
+
+| | Before (38) | Now |
+|---|---|---|
+| Total, cost | 396,081 | 258,827 |
+| Q8 | about 41,000 | 15,933 |
+| Q10 | about 67,000 | 37,214 |
+| Q12 | about 70,000 | 15,596 |
+| Total, rules | 6,299,106 | 6,215,060 |
+
+The distinct counts put the filtered customers and orders in better places;
+every query gives the same rows under both planners. ANALYZE took 828 ms
+(581 before) for the sketches. Planning (`q1_split`, the same base): Q1
+33.7 µs (32.9 before), Q2 14.9 (14.5): the longer statistics rows. The
+chains and stars of `plan_time` are unchanged.
+
+**Tests.** `exec_joinreview` has a third-review part with each case: the
+skewed customer's day, the settings row, ORDER BY ... LIMIT from a pinned
+row in both FROM orders, `qty` and `name` equalities, a range that is not
+the ORDER BY's, a NaN bound. Two older expectations changed:
+- `b.v = 3` (7 values) now estimates 2,857 rows, so `small` is hashed rather
+  than looked up 2,857 times;
+- `a.pad = 'none'`: `pad` has one value, so the count says the filter keeps
+  every row and `big b` is hashed. It keeps none, but only the column's
+  values would say so.
+`exec_joinorder`'s FROM-subquery case kept its plan once subqueries were
+let through the fast path's check.
+
+**Checked:** the suite, 96 of 96. The review's differential sets, cost
+against rules: 864 queries (`gen4`, seeds 101 to 104) with and without
+ANALYZE, 1,579 (`gen5`, seeds 1 to 4), and gen5 seed 1 in a block that has
+written (389). 0 differences.
 
 ## Sources
 
