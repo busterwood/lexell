@@ -8422,6 +8422,44 @@ read** (`lazySeries`, `seriesRes`, `runLevel`).
   - a CTE;
   - one whose arguments depend on the row (LATERAL).
 
+**Sending, then made cheaper** (after the user asked about batching the
+output). It was batched already: DataRows go into the wire's buffer, which
+is written every 64 kB, so 1M rows are a few hundred writes. Timed on 1M
+rows to psql (`-A -t` to /dev/null), median of three, with the server's own
+CPU time:
+
+| | `SELECT id, code FROM t` | `generate_series` form | peak RSS |
+|---|---|---|---|
+| before streaming (4afc101b) | 696 ms (600 CPU) | 792 ms (700) | 813 MB |
+| streamed | 480 ms (430) | 506 ms (450) | 51 MB |
+| and the changes below | 452 ms (400) | 492 ms (440) | 51 MB |
+
+Streaming was most of the gain, in time as well as memory: making 1M rows
+whole cost more than sending them. The changes, from a profile
+(`LXL_NATIVE_MAP`):
+- **A DataRow is written straight into the output** (`Wire.dataRow`).
+  - A bigint's digits are written from the value, with no string made
+    (`digitsOf`, `addDigits`, by tens).
+  - A text is written as it is.
+  - Any other value's text is made once. It is kept in an array used again
+    for each row, between the pass that sizes the message and the one that
+    writes it.
+  - Before, there was a string per value and a new array per row.
+- **`eachRow` uses one array for each row's values.**
+- **`runLevel` no longer makes a `SeqEnv` for the row it only passes on.**
+  That was a store handle and a copy of the session's zone, with their
+  reference counts, for every row.
+
+What is left is the executor's own cost per row, about 400 ns, the same in
+both queries. In the profile:
+- decoding the stored row (`decFixed`), 10%;
+- the row callbacks (`eachRow`, `tryRow`, `runLevel`);
+- reference counting (the `dup` and `drop` glue), about 12%;
+- `eval`'s look-up of a column by name (`colIndex`).
+
+The wire's part is now about 15%, so batching the output further cannot
+give much. Running the executor a batch of rows at a time could.
+
 **Left as it was:**
 - **Held rows are costly:** a sorted query of one integer column still
   holds about 890 bytes a row (178 MB for 200k rows). Each row is two

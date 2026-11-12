@@ -63,6 +63,8 @@ type Wire = record {
     skipping: bool
     tzShown: str                // the TimeZone the client was last told (ParameterStatus, 9.95)
     streamed: bool              // the last runStreamed sent its rows as they came (its RowDescription too, if asked)
+    texts: []str                // dataRow's values' texts, the array used again for each row
+    digits: []byte              // addDigits' digits, the same
 }
 
 // The prepared statements and portals of a connection.
@@ -353,28 +355,101 @@ fn (w: mut &Wire) dataRows(rows: &[][]Val, cols: &[]lexdb_exec.OutCol) {
 }
 
 fn (w: mut &Wire) dataRow(r: &[]Val, cols: &[]lexdb_exec.OutCol, zone: &lexdb_time.Zone) {
-    var ts: []str = []
+    // Written straight into the output (9.99): a bigint's digits and a
+    // text's bytes need no string of their own; any other value's text is
+    // made once, kept in w.texts (used again for each row) between the
+    // pass that sizes the message and the one that writes it.
+    let utc = zone.isUtc()
+    while len(w.texts) > 0 { let x = pop(mut &w.texts) }
     var size = 4 + 2
-    for v in r {
-        if lexdb_exec.isNull(&v) {
-            append(mut &ts, "")
-            size += 4
-        } else {
-            let t = lexdb_exec.textOut(&v, if len(ts) < len(cols) { cols[len(ts)].oid } else { 0 }, zone)
-            size += 4 + len(t)
-            append(mut &ts, t)
+    for k in 0..len(r) {
+        let oid = if k < len(cols) { cols[k].oid } else { 0 }
+        match r[k] {
+            Val.Null { size += 4 }
+            Val.Int(n) { size += 4 + digitsOf(n) }
+            Val.Text(t) {
+                if plainText(oid, utc) { size += 4 + len(t) } else {
+                    let x = lexdb_exec.textOut(&r[k], oid, zone)
+                    size += 4 + len(x)
+                    append(mut &w.texts, x)
+                }
+            }
+            else {
+                let x = lexdb_exec.textOut(&r[k], oid, zone)
+                size += 4 + len(x)
+                append(mut &w.texts, x)
+            }
         }
     }
     w.out.addByte('D')
     binary.addU32BE(mut &w.out, size)
     binary.addU16BE(mut &w.out, len(r))
+    var j = 0
     for k in 0..len(r) {
-        if lexdb_exec.isNull(&r[k]) {
-            binary.addU32BE(mut &w.out, 0xFFFFFFFF)
-        } else {
-            binary.addU32BE(mut &w.out, len(ts[k]))
-            w.out.add(ts[k])
+        let oid = if k < len(cols) { cols[k].oid } else { 0 }
+        match r[k] {
+            Val.Null { binary.addU32BE(mut &w.out, 0xFFFFFFFF) }
+            Val.Int(n) {
+                binary.addU32BE(mut &w.out, digitsOf(n))
+                addDigits(mut &w.out, n, mut &w.digits)
+            }
+            Val.Text(t) {
+                if plainText(oid, utc) {
+                    binary.addU32BE(mut &w.out, len(t))
+                    w.out.add(t)
+                } else {
+                    binary.addU32BE(mut &w.out, len(w.texts[j]))
+                    w.out.add(w.texts[j])
+                    j += 1
+                }
+            }
+            else {
+                binary.addU32BE(mut &w.out, len(w.texts[j]))
+                w.out.add(w.texts[j])
+                j += 1
+            }
         }
+    }
+}
+
+// Whether a text value is sent as it is (textOut gives it unchanged): all
+// but a timestamptz held as text, or an array of them, outside UTC.
+fn plainText(oid: int, utc: bool): bool {
+    return utc || (oid != lexdb_sql.OID_TSTZ && (oid <= 0 || lexdb_sql.elemOid(oid) != lexdb_sql.OID_TSTZ))
+}
+
+// The characters of n in decimal, its sign too.
+fn digitsOf(n: int): int {
+    if n == 0 { return 1 }
+    if n == -9223372036854775807 - 1 { return 20 }
+    var m = if n < 0 { -n } else { n }
+    var d = if n < 0 { 1 } else { 0 }
+    while m > 0 {
+        d += 1
+        m = m / 10
+    }
+    return d
+}
+
+// n in decimal, as n.toStr() writes it, with no string made: its digits
+// from the last, by tens (a multiply each, not a division), into tmp.
+fn addDigits(b: mut &StrBuf, n: int, tmp: mut &[]byte) {
+    if n == -9223372036854775807 - 1 {
+        b.add("-9223372036854775808")
+        return
+    }
+    if n < 0 { b.addByte('-') }
+    var m = if n < 0 { -n } else { n }
+    while len(tmp) > 0 { let x = pop(tmp) }
+    while true {
+        append(tmp, byte(48 + m % 10))
+        m = m / 10
+        if m == 0 { break }
+    }
+    var i = len(tmp) - 1
+    while i >= 0 {
+        b.addByte(tmp[i])
+        i -= 1
     }
 }
 
@@ -1047,7 +1122,7 @@ pub fn serve(a: ConnArg): int {
     let ConnArg{conn: c, st: st, id: _, ctx: ctx} = move(a)
     let nd = c.setNoDelay(true)
     var w = Wire{c: c, eng: [], raw: [], bind: "", inBuf: array(65536, byte(0)), inPos: 0, inEnd: 0, out: newStrBuf(), sess: lexdb_exec.newSession(st), st: st,
-                 skipping: false, tzShown: "", streamed: false}
+                 skipping: false, tzShown: "", streamed: false, texts: [], digits: []}
     var ps = Ps{stmts: newMap(), portals: newMap()}
     if startup(mut &w, &ctx).unwrapOr(false) {
         while true {
