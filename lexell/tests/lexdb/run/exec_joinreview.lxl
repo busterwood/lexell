@@ -4,8 +4,10 @@
 // other filters count in the estimates; a LIMIT or EXISTS keeps lookups; a
 // block whose reads are noted keeps the order bound by keys (no
 // whole-table read to conflict with another session's write); the first
-// table is read in batches wherever FROM put it. Checked by hand against
-// the rules mode.
+// table is read in batches wherever FROM put it. The second review's
+// (optimizer 33): batches test the right column of a reordered first table;
+// a hashed table keeps its constant range; an aggregate subquery is planned
+// as the same query alone. Checked by hand against the rules mode.
 // expect: -- tables as the review's: small (100 rows, one labelled x), big (20,000, 200 per small row, a pad column)
 // expect: create table small (id int primary key, label text) -> CREATE TABLE
 // expect: insert into small select g, case when g = 7 then 'x' else 'l' || (g % 10) end from generate_series(1, 100) g -> INSERT 0 100
@@ -58,6 +60,29 @@
 // expect: commit -> COMMIT
 // expect: -- 6. the first table in batches wherever FROM put it
 // expect: explain analyze select count(*) from small s join big b on b.sid = s.id where b.v = 3 -> scan big b: full scan (rows read 20000, kept 2857, batches 20); join small s: primary key lookup per row (lookups 2857, rows read 2857, joined 2857); aggregate
+// expect: -- second review (optimizer 33)
+// expect: -- 1. the reordered first table's batches test text, LIKE and ranges on its own columns
+// expect: create table ra (id int primary key) -> CREATE TABLE
+// expect: create table rb (id int primary key, aid int, t1 text, t2 text) -> CREATE TABLE
+// expect: insert into ra select g from generate_series(1, 50) g -> INSERT 0 50
+// expect: insert into rb values (1, 1, 'x', 'y'), (2, 2, 'y', 'x'), (3, 3, 'z', 'z') -> INSERT 0 3
+// expect: analyze -> ANALYZE
+// expect: explain select ra.id, rb.id, rb.t1, rb.t2 from ra, rb where ra.id = rb.aid and rb.t1 = 'x' -> [QUERY PLAN] scan rb: full scan; join ra: primary key lookup per row
+// expect: select ra.id, rb.id, rb.t1, rb.t2 from ra, rb where ra.id = rb.aid and rb.t1 = 'x' -> [id,id,t1,t2] 1|1|x|y
+// expect: select ra.id, rb.id, rb.t1, rb.t2 from ra, rb where ra.id = rb.aid and rb.t1 like 'x%' -> [id,id,t1,t2] 1|1|x|y
+// expect: select ra.id, rb.id, rb.t1, rb.t2 from ra join rb on ra.id = rb.aid where rb.t1 >= 'y' order by rb.id -> [id,id,t1,t2] 2|2|y|x; 3|3|z|z
+// expect: select count(*), min(rb.t2) from ra join rb on ra.id = rb.aid where rb.t1 >= 'y' -> [count,min] 2|x
+// expect: -- 3. a hashed table keeps its constant range when its key is also joined
+// expect: create table ev (id int primary key, k int) -> CREATE TABLE
+// expect: create table dim (k int primary key, nm text) -> CREATE TABLE
+// expect: insert into ev select g, g from generate_series(1, 20000) g -> INSERT 0 20000
+// expect: insert into dim select g, 'n' || g from generate_series(1, 20000) g -> INSERT 0 20000
+// expect: analyze -> ANALYZE
+// expect: explain analyze select count(*) from ev join dim on dim.k = ev.k where dim.k < 10 and ev.id > 19000 -> scan ev: primary key range (at most 20000 rows) (rows read 1001, kept 1000, batches 1); join dim: hash on (k) over primary key range (at most 20000 rows) (table rows 9 of 10 read, probes 1000, rows read 0, joined 0); aggregate
+// expect: -- 4. an aggregate subquery reads everything: its join is planned as the same query alone
+// expect: explain select count(*) from big a join big b on b.id = a.sid -> [QUERY PLAN] scan big a: full scan; join big b: hash on (id) over full scan; aggregate
+// expect: explain select (select count(*) from big a join big b on b.id = a.sid) -> [QUERY PLAN] result; subquery 1 (scalar): run once;   scan big a: full scan;   join big b: hash on (id) over full scan;   aggregate
+// expect: explain select count(*) from big a join big b on b.id = a.sid limit 1 -> [QUERY PLAN] scan big a: full scan; join big b: hash on (id) over full scan; aggregate
 import "../../../cmd/lexdb_store"
 import "../../../cmd/lexdb_disk"
 import "../../../cmd/lexdb_exec"
@@ -155,6 +180,29 @@ fn body(st: lexdb_store.Store): int {
     show(mut &a, "commit")
     println("-- 6. the first table in batches wherever FROM put it")
     analyze(mut &a, "explain analyze select count(*) from small s join big b on b.sid = s.id where b.v = 3")
+    println("-- second review (optimizer 33)")
+    println("-- 1. the reordered first table's batches test text, LIKE and ranges on its own columns")
+    show(mut &a, "create table ra (id int primary key)")
+    show(mut &a, "create table rb (id int primary key, aid int, t1 text, t2 text)")
+    show(mut &a, "insert into ra select g from generate_series(1, 50) g")
+    show(mut &a, "insert into rb values (1, 1, 'x', 'y'), (2, 2, 'y', 'x'), (3, 3, 'z', 'z')")
+    show(mut &a, "analyze")
+    show(mut &a, "explain select ra.id, rb.id, rb.t1, rb.t2 from ra, rb where ra.id = rb.aid and rb.t1 = 'x'")
+    show(mut &a, "select ra.id, rb.id, rb.t1, rb.t2 from ra, rb where ra.id = rb.aid and rb.t1 = 'x'")
+    show(mut &a, "select ra.id, rb.id, rb.t1, rb.t2 from ra, rb where ra.id = rb.aid and rb.t1 like 'x%'")
+    show(mut &a, "select ra.id, rb.id, rb.t1, rb.t2 from ra join rb on ra.id = rb.aid where rb.t1 >= 'y' order by rb.id")
+    show(mut &a, "select count(*), min(rb.t2) from ra join rb on ra.id = rb.aid where rb.t1 >= 'y'")
+    println("-- 3. a hashed table keeps its constant range when its key is also joined")
+    show(mut &a, "create table ev (id int primary key, k int)")
+    show(mut &a, "create table dim (k int primary key, nm text)")
+    show(mut &a, "insert into ev select g, g from generate_series(1, 20000) g")
+    show(mut &a, "insert into dim select g, 'n' || g from generate_series(1, 20000) g")
+    show(mut &a, "analyze")
+    analyze(mut &a, "explain analyze select count(*) from ev join dim on dim.k = ev.k where dim.k < 10 and ev.id > 19000")
+    println("-- 4. an aggregate subquery reads everything: its join is planned as the same query alone")
+    show(mut &a, "explain select count(*) from big a join big b on b.id = a.sid")
+    show(mut &a, "explain select (select count(*) from big a join big b on b.id = a.sid)")
+    show(mut &a, "explain select count(*) from big a join big b on b.id = a.sid limit 1")
     return 0
 }
 

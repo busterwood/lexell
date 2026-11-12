@@ -5767,6 +5767,14 @@ fn (q: &Query) costOrder(ms: &[][]Expr, lookups: bool, cap: float, ordT: int, li
     return true
 }
 
+// Whether a SELECT reads all its rows before giving one: GROUP BY, an
+// aggregate, DISTINCT, a window (optimizer 33).
+fn stmtGathers(s: &lexdb_sql.Stmt): bool {
+    if len(s.group) > 0 || len(s.gsets) > 0 || s.having.isSome() || s.distinct || len(s.distinctOn) > 0 || len(s.wins) > 0 { return true }
+    for it in s.items { match it.expr { Some(x) { if hasAgg(&x) { return true } } None {} } }
+    return false
+}
+
 // A LIMIT's (or OFFSET's) rows for the join order: a literal's value, else
 // (a parameter, an expression) 100; none 0.
 fn limitGuess(x: &Option[Expr]): int {
@@ -5955,7 +5963,7 @@ fn choosePath(q: &Query, k: int, cs: &[]Expr, params: &[]Val, lk: mut &[]Look): 
             if ci < 0 {
                 // an expression's (9.89): the conditions on the same expression
                 let target = qualified(&lv.t.indexes[c].exprs[pos], &lv.alias)
-                var xb = exprBounds(cs, &target, k, q)
+                var xb = q.onceBounds(exprBounds(cs, &target, k, q), lv.readOnce)
                 var xeq = -1
                 for i in 0..len(xb) { if xb[i].op == "=" && xeq < 0 { xeq = i } }
                 if xeq < 0 {
@@ -5966,7 +5974,7 @@ fn choosePath(q: &Query, k: int, cs: &[]Expr, params: &[]Val, lk: mut &[]Look): 
                 continue
             }
             let name = lv.alias + "." + lv.t.cols[ci].name
-            var bs = bounds(cs, &name, k, q)
+            var bs = q.onceBounds(bounds(cs, &name, k, q), lv.readOnce)
             var eqAt = -1
             // a constant's equality first where they are implied (optimizer
             // 27): the same for every row of the tables before, so the table
@@ -5977,8 +5985,10 @@ fn choosePath(q: &Query, k: int, cs: &[]Expr, params: &[]Val, lk: mut &[]Look): 
             for i in 0..len(bs) { if bs[i].op == "=" && eqAt < 0 { eqAt = i } }
             if eqAt < 0 {
                 ins = inList(cs, &name, k, q)
+                if lv.readOnce && q.anyOuter(&ins) { ins = [] }
                 if len(ins) == 0 { inSub = inSubOf(cs, &name) }
                 if len(ins) == 0 && inSub < 0 { inArr = anyOf(cs, &name, k, q) }
+                if lv.readOnce && q.anyOuter(&inArr) { inArr = [] }
                 if len(ins) == 0 && inSub < 0 && len(inArr) == 0 { rng = bs }
                 break
             }
@@ -6039,6 +6049,27 @@ fn choosePath(q: &Query, k: int, cs: &[]Expr, params: &[]Val, lk: mut &[]Look): 
         }
     }
     return replace(mut &paths[pick], Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: []})
+}
+
+// A level read once (a hash join, optimizer 26) takes only the bounds whose
+// values are the same for every row of the tables before: a constant
+// equality or range is kept, an outer value's dropped, rather than the
+// whole path (optimizer 33).
+fn (q: &Query) onceBounds(bs: []Bound, readOnce: bool): []Bound {
+    if !readOnce { return bs }
+    var out: []Bound = []
+    var all = bs
+    for i in 0..len(all) {
+        if q.maxLevel(&all[i].val) < 0 && !hasCorr(&all[i].val) {
+            append(mut &out, Bound{op: all[i].op, val: replace(mut &all[i].val, Expr.Lit(Val.Null))})
+        }
+    }
+    return out
+}
+
+fn (q: &Query) anyOuter(xs: &[]Expr): bool {
+    for x in xs { if q.maxLevel(&x) >= 0 || hasCorr(&x) { return true } }
+    return false
 }
 
 // Whether the path's values change from row to row of the tables before
@@ -7232,7 +7263,10 @@ fn endScope(sc: mut &Scope, q: mut &Query) {
 
 fn planSub(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val,
            sc: mut &Scope): Result[SubPlan, DbErr] {
-    sc.early = s.use == lexdb_sql.SUB_EXISTS || s.use == lexdb_sql.SUB_SCALAR
+    // EXISTS stops at its first row; a scalar subquery at its second, unless
+    // it aggregates, groups or is DISTINCT (then it reads everything:
+    // optimizer 33)
+    sc.early = s.use == lexdb_sql.SUB_EXISTS || (s.use == lexdb_sql.SUB_SCALAR && !stmtGathers(s))
     var sel = try planSelect(st, txn, s, params, sc)
     // EXISTS stops at its first row, a scalar at its second (runSub): its
     // first table's reading may stop early, so no switch to a scan (optimizer 19)
@@ -10696,7 +10730,8 @@ fn select(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
         Some(r) { if len(r) > 0 { ver = ver + "|s" + r } }
         None {}
     }
-    if txn.rules { ver = ver + "|rules" } else { ver = ver + "|" + (try statVersion(st, txn)) + "|m" + txn.memMax.toStr() }   // optimizer 20
+    // the join order differs where reads are noted (optimizer 29, 33)
+    if txn.rules { ver = ver + "|rules" } else { ver = ver + "|" + (try statVersion(st, txn)) + "|m" + txn.memMax.toStr() + (if txn.noting() { "|n" } else { "" }) }   // optimizer 20
     if pc.ver != ver {
         pc.sels = []
         pc.looks = []
@@ -11530,7 +11565,7 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         if len(s.wins) > 0 { return Err(e("0A000", what + "window functions")) }
     }
     if s.setop != 0 { return planSet(st, txn, s, params, sc) }
-    sc.early = sc.early || (s.limit.isSome() && len(s.order) == 0 && len(s.group) == 0)
+    sc.early = sc.early || (s.limit.isSome() && len(s.order) == 0 && !stmtGathers(s))
     sc.ordLim = -1
     sc.ordBy = []
     if s.limit.isSome() && len(s.order) > 0 && len(s.group) == 0 && !s.distinct && len(s.distinctOn) == 0 && len(s.wins) == 0 &&
@@ -16391,7 +16426,9 @@ fn bValCol(x: &Expr, q: &Query, kinds: &[]int): int {
         Expr.Col(name) {
             let i = colIndex(&q.cols, &name)
             if i < 0 || i >= len(kinds) || kinds[i] != BK_VAL { return -1 }
-            return i
+            // the batch holds the first table's own columns (optimizer 33:
+            // the first table may not be FROM's first)
+            return i - (if len(q.levels) > 0 { q.levels[0].first } else { 0 })
         }
         else { return -1 }
     }
