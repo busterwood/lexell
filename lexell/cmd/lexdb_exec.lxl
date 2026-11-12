@@ -20930,6 +20930,49 @@ fn bEval(n: &BNode, b: &Batch, idx: &[]int): Result[BVec, DbErr] {
 fn bGenVals(g: &BGen, b: &Batch, idx: &[]int): Result[[]Val, DbErr] {
     let m = len(idx)
     let ns = len(g.cols)
+    // two shapes run without a row or a walk, as cEval would run them: a
+    // function of one argument bound to call1, of a column; an operator
+    // of a column and a constant
+    if ns == 1 {
+        let c = g.cols[0]
+        let k = g.kinds[0]
+        match g.cx {
+            CX.Call(fb, cs) {
+                if fb.way == FN_ONE && len(cs) == 1 && cxCol0(&cs[0]) {
+                    var out: []Val = withCapacity(m)
+                    for j in 0..m {
+                        let r = idx[j]
+                        if b.cols[c].nul[r] {
+                            append(mut &out, Val.Null)
+                            continue
+                        }
+                        let got = if k == BK_VAL { try call1(fb.id, &fb.name, &b.vals[c][r]) } else { try call1(fb.id, &fb.name, &bValAt(b, c, k, r)) }
+                        match got {
+                            Some(v) { append(mut &out, v) }
+                            None { append(mut &out, try callAt(&fb.name, &[bValAt(b, c, k, r)], g.ce.now, &g.ce.zone)) }
+                        }
+                    }
+                    return Ok(out)
+                }
+            }
+            CX.Bin(op, x, y) {
+                let lc = cxCol0(&x)
+                let rc = cxCol0(&y)
+                var kv = Val.Null
+                let lit = if lc { cxLit(&y, mut &kv) } else { cxLit(&x, mut &kv) }
+                if (lc || rc) && !(lc && rc) && lit {
+                    var out: []Val = withCapacity(m)
+                    for j in 0..m {
+                        let r = idx[j]
+                        let v = if b.cols[c].nul[r] { Val.Null } else { bValAt(b, c, k, r) }
+                        append(mut &out, if lc { try binVal(&op, v, kv, &g.ce.seq) } else { try binVal(&op, kv, v, &g.ce.seq) })
+                    }
+                    return Ok(out)
+                }
+            }
+            else {}
+        }
+    }
     var row: []Val = array(ns, Val.Null)
     let none: []Val = []
     var out: []Val = withCapacity(m)
@@ -20942,6 +20985,25 @@ fn bGenVals(g: &BGen, b: &Batch, idx: &[]int): Result[[]Val, DbErr] {
         append(mut &out, try cEval(&g.cx, &row, &none, &g.ce))
     }
     return Ok(out)
+}
+
+// Whether x is a constant (its value in v).
+fn cxLit(x: &CX, v: mut &Val): bool {
+    match x {
+        CX.Lit(k) {
+            v = k
+            return true
+        }
+        else { return false }
+    }
+}
+
+// Whether x is the column of a one-column row (cEval: its place 0).
+fn cxCol0(x: &CX): bool {
+    match x {
+        CX.Col(i) { return i == 0 }
+        else { return false }
+    }
 }
 
 // x compiled to run over a batch (BGen): the query's column i is the
