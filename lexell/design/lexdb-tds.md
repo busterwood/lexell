@@ -344,3 +344,101 @@ with; a second table whose name differs only in case is refused, 2714).
 - **Tests:** `tds_client.lxl` (spelling of `*`, of a query's columns and
   aliases, through a subquery, 2714 for a name in another case).
 
+## 10. L2, collation per column: the design (2026-11-12)
+
+Decided (the user, 2026-11-12): in two parts, equality first and SQL
+Server's order second; the column's collation holds on both protocols;
+over TDS literals and variables compare case-insensitively too; a column's
+collation is fixed when it is made.
+
+What the oracle (SQL Server 2022, SQL_Latin1_General_CP1_CI_AS, nvarchar)
+says the first part must do: `N'a' = N'A'`, and so for every script (`Σ`
+`σ`, `Я` `я`, `Ǆ` `ǆ`); `N'e' <> N'é'` (accent-sensitive); `N'a  ' =
+N'a'` (trailing spaces ignored) but `N' a' <> N'a'`; LIKE ignores case but
+not trailing spaces (`N'a ' LIKE N'a'` is false); GROUP BY and DISTINCT
+show the first value of each group (`bob`, `alice` for bob, Bob, BOB );
+`min` and `max` likewise; a primary key holding `'x'` refuses `'X '`
+(2627); two columns of different collations compared is 468 ("Cannot
+resolve the collation conflict between ... in the equal to operation").
+`N'straße' = N'strasse'` (an expansion) is the second part's.
+
+- **Collations.** Two behaviours: exact (bytes, lexdb's until now, and
+  PostgreSQL's "C", "POSIX", "default" and the like) and case-insensitive,
+  "ci" (SQL Server's `*_CI_*`: case folded by Unicode's lower case of the
+  upper case, trailing spaces dropped). A collation keeps its name, for
+  INFORMATION_SCHEMA and errors; names are mapped to a behaviour by `_CI_`
+  in them. Two collations conflict only when their behaviours differ.
+- **Columns.** `ColDef.coll`, stored in the catalog row after the existing
+  fields (a row without it: exact). Text columns made over TDS default to
+  SQL_Latin1_General_CP1_CI_AS; over PostgreSQL to exact. `COLLATE` on a
+  column definition is kept (it is read and dropped today). It travels
+  with the column through subqueries, views, CTEs and CREATE TABLE AS, as
+  the spelling does (section 9).
+- **The session's default.** A TDS session's default collation is the CI
+  one; a PostgreSQL session's exact. It is what a literal, a variable or a
+  parameter has (SQL Server's "coercible default").
+- **Expressions.** When a query is planned (`resolve`), each comparison
+  (`=`, `<>`, `<`, `<=`, `>`, `>=`, and so BETWEEN; IN; simple CASE;
+  NULLIF; LIKE) whose operands are text is given a collation by SQL
+  Server's precedence: `COLLATE` in the expression (explicit) over a
+  column's (implicit) over the session default (coercible); two implicit
+  ones that conflict are 468. Under "ci" its operands are wrapped in
+  `#ci(x)`, the sort key (folded, trailing spaces dropped); LIKE becomes a
+  case-insensitive LIKE (spaces kept). Values themselves are never
+  changed: a row keeps what was written.
+- **Keys.** A primary key, unique index or index on a "ci" column holds the
+  key of the value (`encKeyPart` of `#ci`); the row holds the value. So
+  `Bob` and `bob` collide, `WHERE name = 'BOB'` finds `Bob` through the
+  index, and a foreign key to a "ci" key looks it up so. An index is used
+  for a comparison only under its column's collation. Only new "ci"
+  columns are keyed so: every table made before is exact and unchanged.
+- **Grouping.** GROUP BY, DISTINCT, UNION, INTERSECT, EXCEPT, PARTITION BY,
+  `count(DISTINCT x)`, hash joins and `min`/`max` key "ci" columns by
+  `#ci` and show the group's first value; ORDER BY sorts by the key.
+- **Not in the first part:** SQL Server's order (accents between letters,
+  hyphens and apostrophes nearly ignored, `ß` as `ss`): ORDER BY and `<`
+  on "ci" text follow the folded bytes until then, and the differences
+  are recorded against the oracle. ALTER COLUMN ... COLLATE is refused.
+  String functions that compare (REPLACE, CHARINDEX) are S3's.
+
+### L2's first part, as built (2026-11-12)
+
+- **Three behaviours, not two:** SQL Server ignores trailing spaces under
+  every collation, its case-sensitive and binary ones too (`'BOB ' = 'BOB'
+  COLLATE Latin1_General_CS_AS` is true in the oracle). So
+  `lexdb_sql.collKind`: COLL_CI (`*_CI_*`: `#ci`, folded, spaces
+  dropped), COLL_PAD (`*_CS_*`, `*_BIN*`: `#pad`, spaces dropped),
+  COLL_EXACT (anything else, and none). 468 names the right operand's
+  collation first, as the oracle does.
+- **Where it is decided:** `resolve` gives each comparison (`=` `<>` `<`
+  `<=` `>` `>=`, and so BETWEEN and simple CASE), IN lists, LIKE and IS
+  DISTINCT FROM their collation (`exprColl`, `cmpColl`) and wraps their
+  operands. The session's default is `Scope.coll`, from a per-session memo
+  that lexdb_tds sets (`Session.setCollation`). A column's collation is
+  `ColDef.coll` (catalog: flag 8 of the column's defaults byte), carried
+  through FROM's subqueries, views and CTEs and into `OutCol.coll`, and
+  given to the columns CREATE TABLE ... AS and SELECT INTO make.
+- **Keys:** `keyOf` and `idxVal` key a collated column by `keyVal`; the
+  planner treats such a column as an index on `#ci(col)` (or `#pad`), so
+  the conditions the expression-index code (9.89) matches use the index:
+  `WHERE nm = 'BOB'` on a key or index is a lookup, `>` a range. Locks and
+  the foreign-key lookups of referencing rows use the same keys.
+- **Grouping:** `Sel.groupKinds`, `ordKinds` and `outKinds`: GROUP BY,
+  ORDER BY, DISTINCT, UNION, INTERSECT, EXCEPT and recursive UNION key and
+  sort by `collVal`; a group shows its first row's value. `min`, `max`
+  and `count(DISTINCT)` compare keys (`AggSpec.kind`; of equal keys the
+  first). The batch executor (9.47) leaves collated groups and aggregates
+  to the row path; it skips the `#ci` conditions it cannot compile.
+- **Checked against the oracle:** equality across scripts, accents kept,
+  trailing spaces, LIKE, literals, 468, a key refusing `'X '` after `'x'`,
+  GROUP BY, DISTINCT, min, max, count(DISTINCT), UNION, INTERSECT, ORDER BY
+  ties: the same answers. Over psql a TDS table is case-insensitive and a
+  psql one exact; `'a' = 'A'` is false there.
+- **Not yet:** window PARTITION BY and a window's ORDER BY (exact); a join
+  on collated columns runs as a nested loop with the condition, not a hash
+  join; `IN (subquery)` and `= ANY (array)` compare exactly; a correlated
+  subquery's outer column has the session's default, not its own; NULLIF
+  and the string functions compare exactly; a key violation's message shows
+  the folded key (`(ann@x.org)`) where SQL Server shows the value. SQL
+  Server's order (accents, punctuation, `ß`) is the second part.
+
