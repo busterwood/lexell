@@ -1,0 +1,335 @@
+// lexdb_exec: IN (subquery) and EXISTS (subquery) as semi-joins (design/
+// lexdb.md 9.104). Random queries over a table of 1,800 rows (two batches
+// and part of a third), a subquery's table of 200 with values repeated and
+// NULLs in every column, and one of 30:
+// - against the same query with its conjunct written (c) = true, which is
+//   no semi-join (the subquery's value per row, as before): the same rows;
+// - with SET lexdb_batch = off and on: the same results, errors included.
+// They cover IN uncorrelated (integer, text, numeric, date, varchar, an
+// expression, a subquery joining two tables, a LIMIT, DISTINCT, NULLs and
+// duplicates in its values), IN correlated by an equality, EXISTS
+// correlated by one or two equalities (hashed: 9.9), by the subquery's
+// primary key (a lookup per row before, hashed now by the statistics), an
+// expression; conditions inside the subquery, outside it, and dividing by
+// zero in either; NOT IN, NOT EXISTS and OR (no semi-join); rows out,
+// sorted, grouped, a join to a third table, LIMIT.
+// - How many ran as semi-joins (EXPLAIN), and over batches.
+// - EXPLAIN ANALYZE's counts with batches on and off (but "batches N"),
+//   for an IN whose values repeat and an EXISTS whose rows do: each outer
+//   row joined once.
+// - The plans: a semi-join for IN, for EXISTS on the subquery's primary
+//   key (1,800 outer rows: a hash of d's 200 costs less than 1,800
+//   lookups), with two keys, before a join; per row for NOT IN, OR, the
+//   select list, and one outer row (f.id = 7: one lookup costs less).
+// - Values of two types (integer and numeric, text and varchar) against
+//   the reference; a float stays per row.
+// - SELECT * has no column of the semi-join's, and its table's name is not
+//   in scope.
+// expect: reference: 300 queries, 300 the same as without semi-joins
+// expect: batches: 300 queries, 300 the same with and without batches
+// expect: in a transaction: 60 queries, 60 the same with and without batches
+// expect: semi-joins: 300 of 300, 162 over batches
+// expect: counts in: same: true
+// expect: counts exists: same: true
+// expect: plan in: scan f: full scan; semi join d: hash on (v) over rows of subquery 1; aggregate; subquery 1 (in): semi join, run once;   scan d: full scan
+// expect: plan exists pk: scan f: full scan; semi join d: hash on (k) over rows of subquery 1; aggregate; subquery 1 (exists): semi join on d.k = f.x, run once;   scan d: full scan
+// expect: plan exists two keys: scan f: full scan; semi join d: hash on (v, lab) over rows of subquery 1; aggregate; subquery 1 (exists): semi join on d.v = f.x, d.lab = f.tx, run once;   scan d: full scan
+// expect: plan not in: scan f: full scan; aggregate; subquery 1 (in): run once;   scan d: full scan
+// expect: plan or: scan f: full scan; aggregate; subquery 1 (exists): per row, on f.x;   scan d: primary key lookup
+// expect: plan select list: scan f: primary key range; subquery 1 (in): run once;   scan d: full scan
+// expect: plan pinned: scan f: primary key lookup; subquery 1 (exists): per row, on f.x;   scan d: primary key lookup
+// expect: plan join: scan f: full scan; semi join d: hash on (v) over rows of subquery 1; join e: hash on (lab) over full scan; subquery 1 (in): semi join, run once;   scan d: full scan
+// expect: types: 8 of 8 the same, 7 semi-joins
+// expect: star: 8 columns
+// expect: name d.v: ERROR 42P01 missing FROM-clause entry for table "d"
+import "strings"
+import "../../../cmd/lexdb_base"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            var out: []str = []
+            for r in rs {
+                if !r.hasRows { append(mut &out, r.tag) }
+                for row in r.rows {
+                    var vs: []str = []
+                    for v in row { append(mut &vs, lexdb_exec.text(&v)) }
+                    append(mut &out, strings.join(&vs, "|"))
+                }
+            }
+            return strings.join(&out, " ")
+        }
+        Err(e) { return "ERROR " + e.state + " " + e.msg }
+    }
+}
+
+// EXPLAIN's lines, joined by "; "
+fn ex(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            var out: []str = []
+            for r in rs { for row in r.rows { append(mut &out, lexdb_exec.text(&row[0])) } }
+            return strings.join(&out, "; ")
+        }
+        Err(e) { return "ERROR " + e.state + " " + e.msg }
+    }
+}
+
+fn pick(r: mut &lexdb_base.Rng, xs: &[]str): str { return xs[r.below(len(xs))] }
+
+fn day(r: mut &lexdb_base.Rng): str {
+    let d = 1 + r.below(28)
+    return if d < 10 { "0" + d.toStr() } else { d.toStr() }
+}
+
+fn maybe(r: mut &lexdb_base.Rng, v: str): str { return if r.below(10) == 0 { "null" } else { v } }
+
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: 1024 * 1024, segBytes: 4 * 1024 * 1024, ckptBytes: 2 * 1024 * 1024, snapNodes: 100000, bufferedPages: false}
+}
+
+// A condition inside the subquery (on d); safe: no error.
+fn inner(r: mut &lexdb_base.Rng, safe: bool): str {
+    let c = r.below(9)
+    if c == 0 { return "d.g = " + r.below(8).toStr() }
+    if c == 1 { return "d.v < " + r.below(40).toStr() }
+    if c == 2 { return "d.lab like 'L1%'" }
+    if c == 3 { return "d.nu > 10" }
+    if c == 4 { return "d.dt >= '2024-01-15'" }
+    if c == 5 { return if safe { "d.k > 50" } else { "d.v / (d.k - 100) >= 0" } }
+    if c == 6 { return "d.w is not null" }
+    if c == 7 { return "d.k % 3 = 0" }
+    return "d.fl"
+}
+
+// A condition outside (on f).
+fn outer(r: mut &lexdb_base.Rng, safe: bool): str {
+    let c = r.below(6)
+    if c == 0 { return "f.id < " + r.below(1800).toStr() }
+    if c == 1 { return "f.y > " + r.below(5).toStr() }
+    if c == 2 { return "f.tx like 'L2%'" }
+    if c == 3 { return if safe { "f.id % 7 <> 3" } else { "10 / (f.id - 900) <> 7" } }
+    if c == 4 { return "f.bo" }
+    return "f.nu < 20"
+}
+
+fn sw(r: mut &lexdb_base.Rng, safe: bool): str { return if r.below(2) == 0 { " where " + inner(r, safe) } else { "" } }
+fn sa(r: mut &lexdb_base.Rng, safe: bool): str { return if r.below(2) == 0 { " and " + inner(r, safe) } else { "" } }
+
+// The semi-join candidate: IN or EXISTS, as a WHERE conjunct.
+fn cand(r: mut &lexdb_base.Rng, safe: bool): str {
+    let c = r.below(16)
+    if c == 0 { return "f.x in (select v from d" + sw(r, safe) + ")" }
+    if c == 1 { return "f.tx in (select lab from d" + sw(r, safe) + ")" }
+    if c == 2 { return "f.nu in (select nu from d" + sw(r, safe) + ")" }
+    if c == 3 { return "f.dt in (select dt from d" + sw(r, safe) + ")" }
+    if c == 4 { return "f.w in (select w from d" + sw(r, safe) + ")" }
+    if c == 5 { return "f.x + 1 in (select k from d" + sw(r, safe) + ")" }
+    if c == 6 { return "f.x in (select d.v from d join e on e.lab = d.lab" + sw(r, safe) + ")" }
+    if c == 7 { return "f.x in (select distinct v from d" + sw(r, safe) + " order by v limit " + r.below(30).toStr() + ")" }
+    if c == 8 { return "f.x in (select v from d where d.g = f.y" + sa(r, safe) + ")" }
+    if c == 9 { return "exists (select 1 from d where d.v = f.x" + sa(r, safe) + ")" }
+    if c == 10 { return "exists (select 1 from d where d.k = f.x" + sa(r, safe) + ")" }
+    if c == 11 { return "exists (select 1 from d where d.lab = f.tx" + sa(r, safe) + ")" }
+    if c == 12 { return "exists (select 1 from d where d.v = f.x and d.lab = f.tx" + sa(r, safe) + ")" }
+    if c == 13 { return "exists (select 1 from d where d.k = f.x + 1" + sa(r, safe) + ")" }
+    if c == 14 { return "exists (select 1 from d where d.nu = f.nu and d.w = f.w" + sa(r, safe) + ")" }
+    return "f.tx in (select lab from d where d.k = f.x" + sa(r, safe) + ")"
+}
+
+// A query; its candidate is ref's "(c) = true" (no semi-join) when ref.
+fn query(r: mut &lexdb_base.Rng, safe: bool, out: mut &[]str) {
+    let k = r.below(3)
+    var cs: []str = []
+    var refs: []str = []
+    let c = cand(r, safe)
+    let other = r.below(6)
+    var cOther = ""
+    if other == 0 { cOther = "not " + cand(r, safe) } else if other == 1 { cOther = "(" + cand(r, safe) + " or f.id < 100)" } else if other == 2 { cOther = cand(r, safe) }
+    append(mut &cs, c.toStr())
+    append(mut &refs, "(" + c + ") = true")
+    if len(cOther) > 0 {
+        append(mut &cs, cOther.toStr())
+        append(mut &refs, if other == 2 { "(" + cOther + ") = true" } else { cOther.toStr() })
+    }
+    if r.below(2) == 0 {
+        let o = outer(r, safe)
+        append(mut &cs, o.toStr())
+        append(mut &refs, o)
+    }
+    if k == 0 { append(mut &cs, "f.id in (select k from d where d.v is null)") }
+    if k == 0 { append(mut &refs, "f.id in (select k from d where d.v is null)") }
+    let shape = r.below(5)
+    var head = ""
+    var tail = ""
+    var frm = "f"
+    if shape == 0 {
+        head = "select count(*), sum(f.x) from "
+    } else if shape == 1 {
+        head = "select f.id, f.tx from "
+        tail = " order by f.id"
+    } else if shape == 2 {
+        head = "select f.bo, count(*), max(f.tx) from "
+        tail = " group by f.bo order by 1"
+    } else if shape == 3 {
+        head = "select f.id, e.n from "
+        frm = "f join e on e.lab = f.tx"
+        tail = " order by 1, 2"
+    } else {
+        head = "select f.id, f.x from "
+        tail = " order by f.id limit " + pick(r, &["1", "5", "40"])
+    }
+    append(out, head + frm + " where " + strings.join(&cs, " and ") + tail)
+    append(out, head + frm + " where " + strings.join(&refs, " and ") + tail)
+}
+
+fn both(s: mut &lexdb_exec.Session, sql: &str): bool {
+    let a = q(s, &"set lexdb_batch = off")
+    let off = q(s, sql)
+    let b = q(s, &"set lexdb_batch = on")
+    let on = q(s, sql)
+    if off == on { return true }
+    println("DIFFERENT: " + sql)
+    println("  rows:    " + off)
+    println("  batches: " + on)
+    return false
+}
+
+fn load(s: mut &lexdb_exec.Session, r: mut &lexdb_base.Rng) {
+    let c1 = q(s, &"create table f (id int primary key, x int, y int, bo boolean, tx text, nu numeric(10,2), dt date, w varchar(20))")
+    let c2 = q(s, &"create table d (k int primary key, v int, g int, lab text, fl boolean, nu numeric(10,2), dt date, w varchar(20))")
+    let c3 = q(s, &"create table e (id int primary key, lab text, n int)")
+    var id = 1
+    for chunk in 0..18 {
+        var rows: []str = []
+        for i in 0..100 {
+            append(mut &rows, "(" + id.toStr() + ", " + maybe(r, (r.below(220) - 10).toStr()) + ", " + maybe(r, r.below(8).toStr()) + ", " +
+                   maybe(r, pick(r, &["true", "false"])) + ", " + maybe(r, "'L" + r.below(80).toStr() + "'") + ", " +
+                   maybe(r, r.below(30).toStr() + "." + pick(r, &["0", "5"])) + ", " + maybe(r, "'2024-01-" + day(r) + "'") + ", " +
+                   maybe(r, "'w" + r.below(40).toStr() + "'") + ")")
+            id += 1
+        }
+        let ins = q(s, &("insert into f values " + strings.join(&rows, ", ")))
+        if ins != "INSERT 0 100" { println("insert: " + ins) }
+    }
+    var rows: []str = []
+    for k in 1..201 {
+        append(mut &rows, "(" + k.toStr() + ", " + maybe(r, r.below(60).toStr()) + ", " + maybe(r, r.below(8).toStr()) + ", " +
+               maybe(r, "'L" + r.below(100).toStr() + "'") + ", " + maybe(r, pick(r, &["true", "false"])) + ", " +
+               maybe(r, r.below(30).toStr() + "." + pick(r, &["0", "5"])) + ", " + maybe(r, "'2024-01-" + day(r) + "'") + ", " +
+               maybe(r, "'w" + r.below(40).toStr() + "'") + ")")
+    }
+    let ins = q(s, &("insert into d values " + strings.join(&rows, ", ")))
+    var er: []str = []
+    for k in 1..31 { append(mut &er, "(" + k.toStr() + ", " + maybe(r, "'L" + r.below(50).toStr() + "'") + ", " + maybe(r, r.below(9).toStr()) + ")") }
+    let ins2 = q(s, &("insert into e values " + strings.join(&er, ", ")))
+    let an = q(s, &"analyze")
+}
+
+// An EXPLAIN ANALYZE's lines without the batches and the result's time.
+fn plan(x: &str): str {
+    let parts = strings.split(x, &"result:")
+    var t = "" + parts[0]
+    for n in ["1", "2", "3"] { t = strings.replaceAll(t, ", batches " + n, "") }
+    return t
+}
+
+fn counts(s: mut &lexdb_exec.Session, label: &str, sql: &str) {
+    let a = q(s, &"set lexdb_batch = off")
+    let off = ex(s, &("explain analyze " + sql))
+    let b = q(s, &"set lexdb_batch = on")
+    let on = ex(s, &("explain analyze " + sql))
+    let ok = plan(&on) == plan(&off) && strings.contains(on, "batches") && strings.contains(on, "semi join")
+    println("counts " + label + ": same: " + ok.toStr())
+    if !ok {
+        println("  off: " + off)
+        println("  on:  " + on)
+    }
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(71), opts(), fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        var r = lexdb_base.rng(71)
+        load(mut &s, mut &r)
+        // against the reference (safe: an error's place may differ there,
+        // as the conjuncts run in another order)
+        var same = 0
+        var semis = 0
+        var batched = 0
+        for i in 0..300 {
+            var two: []str = []
+            query(mut &r, true, mut &two)
+            let a = q(mut &s, &two[0])
+            let b = q(mut &s, &two[1])
+            if a == b { same += 1 } else {
+                println("DIFFERENT: " + two[0])
+                println("  semi:      " + a)
+                println("  reference: " + b)
+            }
+            let e = ex(mut &s, &("explain analyze " + two[0]))
+            if strings.contains(e, "semi join") { semis += 1 }
+            if strings.contains(e, "semi join") && strings.contains(strings.split(&e, &"; ")[0], "batches") { batched += 1 }
+        }
+        println("reference: 300 queries, " + same.toStr() + " the same as without semi-joins")
+        // batches on and off, errors included
+        var same2 = 0
+        for i in 0..300 {
+            var two: []str = []
+            query(mut &r, false, mut &two)
+            if both(mut &s, &two[0]) { same2 += 1 }
+        }
+        println("batches: 300 queries, " + same2.toStr() + " the same with and without batches")
+        // in a transaction with its own writes (read merged with them; an
+        // error would end it: safe)
+        let b1 = q(mut &s, &"begin")
+        let w1 = q(mut &s, &"insert into d select k + 1000, v + 1, g, lab, fl, nu, dt, w from d where k <= 40")
+        let w2 = q(mut &s, &"update d set lab = 'L7', v = v + 2 where k % 10 = 3")
+        let w3 = q(mut &s, &"delete from d where k % 15 = 4")
+        let w4 = q(mut &s, &"update f set x = x + 1 where id % 9 = 2")
+        var same3 = 0
+        for i in 0..60 {
+            var two: []str = []
+            query(mut &r, true, mut &two)
+            if both(mut &s, &two[0]) { same3 += 1 }
+        }
+        let b2 = q(mut &s, &"rollback")
+        println("in a transaction: 60 queries, " + same3.toStr() + " the same with and without batches")
+        println("semi-joins: " + semis.toStr() + " of 300, " + batched.toStr() + " over batches")
+        // the counts: each outer row joined once, however many rows match
+        counts(mut &s, &"in", &"select count(*) from f where f.x in (select v from d)")
+        counts(mut &s, &"exists", &"select f.id from f where exists (select 1 from d where d.g = f.y)")
+        // the plans
+        println("plan in: " + ex(mut &s, &"explain select count(*) from f where f.x in (select v from d)"))
+        println("plan exists pk: " + ex(mut &s, &"explain select count(*) from f where exists (select 1 from d where d.k = f.x)"))
+        println("plan exists two keys: " + ex(mut &s, &"explain select count(*) from f where exists (select 1 from d where d.v = f.x and d.lab = f.tx)"))
+        println("plan not in: " + ex(mut &s, &"explain select count(*) from f where f.x not in (select v from d)"))
+        println("plan or: " + ex(mut &s, &"explain select count(*) from f where exists (select 1 from d where d.k = f.x) or f.id < 5"))
+        println("plan select list: " + ex(mut &s, &"explain select f.x in (select v from d) from f where f.id < 5"))
+        println("plan pinned: " + ex(mut &s, &"explain select f.x from f where f.id = 7 and exists (select 1 from d where d.k = f.x)"))
+        println("plan join: " + ex(mut &s, &"explain select f.id, e.n from f join e on e.lab = f.tx where f.x in (select v from d)"))
+        // values of two types: integers and numerics by value, texts and
+        // varchars by their text; a float stays per row
+        let tcs = ["f.x in (select nu from d)", "f.nu in (select v from d)", "exists (select 1 from d where d.nu = f.x)",
+                   "f.x::float8 in (select v from d)", "f.tx in (select w from d)", "f.w in (select lab from d where d.k > 10)",
+                   "exists (select 1 from d where d.w = f.tx)", "f.nu + 0.5 in (select v from d where d.v > 3)"]
+        var tsame = 0
+        var tsemi = 0
+        for tc in tcs {
+            let a = q(mut &s, &("select count(*), sum(f.id) from f where " + tc))
+            let b = q(mut &s, &("select count(*), sum(f.id) from f where (" + tc + ") = true"))
+            if a == b { tsame += 1 } else { println("DIFFERENT: " + tc + ": " + a + " against " + b) }
+            if strings.contains(ex(mut &s, &("explain select count(*) from f where " + tc)), "semi join") { tsemi += 1 }
+        }
+        println("types: " + tsame.toStr() + " of " + len(tcs).toStr() + " the same, " + tsemi.toStr() + " semi-joins")
+        // its columns are no names
+        let st1 = q(mut &s, &"select * from f where f.x in (select v from d) and f.id = (select min(id) from f where x in (select v from d))")
+        println("star: " + len(strings.split(&st1, &"|")).toStr() + " columns")
+        println("name d.v: " + q(mut &s, &"select d.v from f where f.x in (select v from d)"))
+        return 0
+    }).unwrap()
+}
