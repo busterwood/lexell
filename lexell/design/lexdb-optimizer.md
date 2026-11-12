@@ -32,12 +32,13 @@ section and the decision list below win.
   per-parameter plans, and a fallback to rule-based planning through a SET
   command.** Section 18 has the consequences.
 
-**Built so far (uncommitted on `exp/optimizer`):** the index-to-scan switch
+**Built so far (on `exp/optimizer`, pushed):** the index-to-scan switch
 (section 19) and stage A, ANALYZE with the tie-break and `SET lexdb_planner`
 (section 20), the review fixes (section 21), plans kept per parameter
-outcome (section 22), and per-value estimates with per-parameter plans
-(section 23). Next, in order: estimates deciding beyond ties, then join
-ordering (constraint-bound first).
+outcome (section 22), per-value estimates with per-parameter plans
+(section 23), and estimates deciding beyond ties, with primary-key
+statistics (section 24, uncommitted). Next: join ordering (constraint-bound
+first).
 
 ## 1. Summary
 
@@ -1326,6 +1327,74 @@ again: two plans for three runs.
 **Not built.** Range estimates and even samples (the rest of `stat4`);
 estimates deciding beyond ties; join ordering; the database-wide planner
 setting; EXPLAIN naming which kept plan a prepared statement would take.
+
+## 24. Estimates decide beyond ties (2026-11-12)
+
+The user's option B (section 18): estimates decide plans. Until now they only
+broke ties between candidates the rules ranked equally. Now they decide
+between candidates of any rank (`choosePath`). The choices below were made
+without asking, under the standing "act without asking" rule; each is easy to
+change.
+
+**Each candidate's figure** (`pathFig`), from ANALYZE's statistics:
+- equalities: the estimate of section 23 (the first equality's value when it
+  is constant, else the distinct counts of the prefix);
+- an IN list: a lookup per value, each a literal's own count on a leading
+  column, else the next prefix's average; at most the rows of its equalities;
+- a range, an IN subquery, or an array: **only a bound**, the rows of its
+  equalities (the index's entries when it has none). No fraction is guessed
+  (SQLite assumes 1/4 for an open range and 1/64 for a closed one). A range is
+  therefore taken only when its bound already beats the others. Range
+  estimates wait for samples. EXPLAIN shows a bound as "(at most N rows)".
+
+**The cost** (`figCost`) is section 15's model: an index entry is two reads,
+the entry and then its row; a primary key row is one.
+
+**The choice.** The fewest reads wins; ties go to the higher rules score,
+then to the rules' order. The rules still decide:
+- a whole-key equality on the primary key or a unique index: one row, and
+  the no-statistics fast path section 18 asked for;
+- when the rules' own choice has no figure (an index created after the last
+  ANALYZE). A candidate without a figure takes no part otherwise;
+- at a join level after the first, between a path looked up per outer row
+  and one read once (hashed). Comparing those needs the number of outer
+  rows, which is join ordering's work. Estimates compare only candidates of
+  the same kind as the rules' choice. Level 0 has only one kind.
+
+**Primary key statistics.** A primary key of two or more columns now has
+statistics like an index's, stored under the table's tree: distinct values
+per prefix, and its leading column's common values. ANALYZE counts them
+without a map, since rows come in key order: a prefix's distinct values are
+counted where it changes, and the leading column's values by their runs. A
+single-column primary key needs none, since an equality on it is a whole-key
+lookup. Its range is bounded by the table's rows. Statistics are now loaded
+for a table with two indexes, or with one index and a primary key of several
+columns.
+
+**Per-parameter plans.** Section 23's looks are kept for every candidate
+whose figure a parameter set and that took part in the comparison, not only
+for tied candidates. The rule from section 23 still holds: a statement whose
+plan does not depend on the value keeps one plan.
+
+**Examples (tested, `exec_estimates`).**
+- `a = 1 and b = 2 and c = 5`, with indexes `t_ab (a, b)` and `t_c (c)`, and
+  `c` unique in the data but not declared. The rules take `t_ab`, which has
+  more equalities but about 334 rows; the estimates take `t_c`, about 1 row.
+- `a = 1 and b = 2 and c > 1990`: `t_ab` (estimated 334 rows). The range on
+  `t_c` is bounded at 2,000, so it is not taken.
+- `a = 1 and c in (3, 5, 9)`: `t_c`, a lookup per value (estimated 3 rows).
+- `m (tenant, id)` primary key, where tenant 1 holds 95% of the rows, with an
+  index on `kind`: `tenant = 1950 and kind = 3` reads the key (estimated 1
+  row); `tenant = 1 and kind = 3` reads `m_kind` (40 rows, 80 reads, against
+  1,900). The prepared form keeps two plans, one per tenant scale
+  (`exec_plancache`).
+- A join where the rules take a read-once `t_ab` (334 rows) over a per-row
+  `t_c` lookup keeps `t_ab`. This is the limit above: join ordering must
+  compare the two kinds.
+
+**Not built.** Comparing a lookup per outer row with a hash join (join
+ordering); range estimates (samples); a full scan as a candidate (the
+run-time switch covers level 0); EXPLAIN naming the kept plan.
 
 ## Sources
 
