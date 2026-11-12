@@ -9249,8 +9249,10 @@ output for all 48.
     of every kind and frame;
   - divisions by zero in outputs, keys and conditions, and an ORDER BY
     position not in the list;
-  - 10 fixed queries: DISTINCT and ORDER BY of one collated column, and
-    other single columns.
+  - 14 fixed queries: DISTINCT and ORDER BY of one collated column and of
+    other single columns; a sort of about 30,000 joined rows (the sink
+    asked to start once); keys of mixed kinds (integers and numerics,
+    from a CASE), which take the old sort.
 
   Also:
   - 198 of the 400 gave their rows as an OutBatch;
@@ -9259,8 +9261,12 @@ output for all 48.
     `batchLevel` did;
   - a LIMIT reached before an error gives rows, and a sort that reaches
     the error gives it.
-- **Planted bugs:** 20 were planted. 16 were caught at once, and a 17th
-  once the test gained its fixed queries.
+- **Found in review, then tested:** a window whose ORDER BY key is of
+  mixed kinds fell back to the old sort after the typed attempt had moved
+  the partition values out: the server stopped. The values are copied
+  now, and the fixed queries include that window.
+- **Planted bugs:** 22 were planted. 16 were caught by the test's first
+  version, 3 more once it gained its fixed queries, and 3 change nothing.
   - **Caught:**
     - NULLS FIRST ignored, in the comparator and in the packing;
     - DESC ignored in the packing, and in the comparator;
@@ -9275,9 +9281,11 @@ output for all 48.
     - a DISTINCT's LIMIT one row late;
     - its early stop counting the whole batch;
     - an expression's NULLs ignored.
-  - **Caught after a fix to the test:** a single DISTINCT text under its
-    collation, compared as raw text. The random queries had not made that
-    shape; the fixed queries do.
+  - **Caught once the fixed queries were added** (the random queries had
+    not made these shapes):
+    - a single DISTINCT text under its collation, compared as raw text;
+    - the sink asked to start for each OutBatch;
+    - the window's partition values moved before the fallback (above).
   - **Not caught, as they change nothing:**
     - the heap admitting ties: its comparison includes the scan's order,
       so it never ties;
