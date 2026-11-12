@@ -41,8 +41,9 @@ primary-key statistics (24); the join order bound by keys (25) and by cost
 review's fixes with filter and range estimates (29); the search to 24
 tables (30); the integration with lexdb 9.94 (31); ORDER BY ... LIMIT read
 in order (32); the second review's fixes (33); a workload comparison (34);
-and the fast path for pinned joins (35, uncommitted). Code comments cite
-these sections as "optimizer N".
+the fast path for pinned joins (35); and the read costs measured and
+calibrated (36, uncommitted). Code comments cite these sections as
+"optimizer N".
 
 ## 1. Summary
 
@@ -1964,6 +1965,73 @@ parsing the tables' statistics rows on every planning (about 3 us a table,
 statements pay it once. Simple queries would need a cache of parsed
 statistics that outlives a statement, which the store does not offer (its
 memo holds text). Not done.
+
+**Checked:** the suite, 92 of 92; the random differential sets, 6,616
+joins, 0 differences.
+
+## 36. The read costs, measured (2026-11-12)
+
+From section 34: Q9 was 1.5 times slower under the cost planner, and the
+model's two costs for it were within a few percent of each other. The
+model's units were guesses from section 15: a scanned row 1, a row through
+an index 2, a descent 1. `design/experiments/calib.lxl` measures them in
+memory on a 200,000-row table (median of 5; nanoseconds a row):
+
+| Operation | ns | units |
+|---|---|---|
+| a scan's row, in batches (the first table) | 25 | 1 |
+| a scan's row, row by row (a hashed table's read) | 307 | 12 |
+| a primary key range's row (the first table) | 42 | 1.7 |
+| an index range's row (the entry, then the row by key) | 972 | 39 |
+| a lookup by the whole primary key, per outer row | 1,409 | 56 |
+| a lookup by an index, per row (20 rows each) | 1,182 | 47 |
+| a hash join per inner row read and hashed, with an outer probe | 1,404 | |
+| the same join by lookups, per outer row | 1,425 | |
+
+A row fetched by its key costs 40 to 55 scanned rows, not 2: the batch scan
+is fast, and every fetch by key pays a descent and a row's decoding. A hash
+join and per-row lookups cost the same on this join. That is the 19 against
+21 ms measured on a 20,000-row join in section 29.
+
+**The model now** (units of a batched scan row): a scan's row 1 as the
+first table, 12 when read for a hash; a primary key range's row 1.7 first,
+12 after; a descent 12; a row by key, through an index or a primary key
+point, 45; a hash's row built 22, a probe 22; a joined row 2. Each way into
+a table has two costs, as the first table and as a hashed table
+(`Way.inner`). `figCost`, which compares one table's paths, uses the same
+units, in tenths.
+
+**Also found: `date '2021-06-01'` was not a literal to the estimates.** It
+is a cast of a text literal, so ranges written that way got the 1/16
+default instead of their span. `litValue` works out literal expressions
+(casts and arithmetic of literals, never parameters), and `litNum` and
+`constKey` use it.
+
+**The workload again** (section 34's, after this; µs):
+
+| Query | Cost before | Cost now | Rules |
+|---|---|---|---|
+| Q9 | 63,135 | 31,668 | 42,122 |
+| Q7 | 36,099 | 29,170 to 41,408 | 1,390,315 |
+| total | 401,703 | 375,769 | 6,037,808 |
+
+Q9 now starts from the brand's parts and hashes the month's lineitems,
+found through the ship-date index: faster than the rules. Q7's plan is the
+same in both of this section's runs; its time varied by run (29 to 41 ms),
+as the rules' Q6 did (1.68 to 2.04 s). The other queries are unchanged.
+
+**A plan that changed in the suite:** the 20-table chain of `exec_joincost`
+now starts from the middle and hashes half the chain. Its row estimates
+double at each step (two rows of the next table per id), where the data's
+real fanout is about one, so starting from the filtered end looks
+exponential. Both plans give the same count, and both are small. It is an
+estimate error that the cheaper hashes now expose, not a cost error.
+
+**Not changed: the index-to-scan switch (section 19).** It switches when a
+range holds over half the table, from the 2:1 guess. The measured ratio of
+an index range's row to a batched scan's row is about 39:1, which would put
+the break-even near 1/40 of the table. The switch applies in both planner
+modes and without statistics, so the change is left for the user to decide.
 
 **Checked:** the suite, 92 of 92; the random differential sets, 6,616
 joins, 0 differences.

@@ -4196,7 +4196,13 @@ fn constKey(x: &Expr, typ: &lexdb_sql.TypeName, params: &[]Val): str {
             if n < 1 || n > len(params) { return "" }
             v = params[n - 1]
         }
-        else { return "" }
+        else {
+            // a literal expression (a cast: date '2021-06-01'), worked out
+            match litValue(x) {
+                Some(l) { v = l }
+                None { return "" }
+            }
+        }
     }
     if isNull(&v) { return "" }
     match coerce(v, &boundType(typ)) {
@@ -4295,7 +4301,12 @@ fn pathEst(lv: &Level, p: &Path, params: &[]Val): Fig {
 
 // A figure's cost in reads (section 15's model): a primary key row is one
 // read, an index entry two (the entry, then its row).
-fn figCost(f: &Fig, index: int): int { return f.rows * (if index < 0 { 1 } else { 2 }) }
+// (optimizer 36: in tenths of the measured units of COST_*: a descent 12,
+// a row through an index 45, a primary key range's row 1.7 as the first
+// table, 12 after it)
+fn figCost(f: &Fig, index: int, first: bool): int {
+    return 120 + f.rows * (if index >= 0 { 450 } else if first { 17 } else { 120 })
+}
 
 type Scan = record {
     empty: bool         // a bound is NULL: no row can match
@@ -5291,9 +5302,21 @@ const JOIN_SEARCH_MAX: int = 24
 // the JOIN_BEST cheapest partial orders at each step (optimizer 28).
 const JOIN_EXACT_MAX: int = 8
 const JOIN_BEST: int = 10
-const HASH_PROBE: float = 0.1f
-const HASH_BUILD: float = 0.2f
-const ROW_COST: float = 0.1f
+// The costs, measured (optimizer 36, design/experiments/calib.lxl, in
+// memory), in units of a row of a scan in batches (25 ns): a scan read row
+// by row (a hashed table's) 12 (307 ns); a primary key range's row, first
+// table, 1.7 (42 ns); a descent of a tree 12; a row fetched by its key (a
+// lookup's, an index entry's) 45 (about 1,100 ns); a hash's row built 22 and
+// a probe 22 (a 200,000-row hash join: 1,404 ns a row with its read, the
+// same as its lookups, 1,425 ns); a joined row 2.
+const COST_SCAN: float = 1.0f
+const COST_SCAN_INNER: float = 12.0f
+const COST_PK_RANGE: float = 1.7f
+const COST_DESCENT: float = 12.0f
+const COST_KEY_ROW: float = 45.0f
+const HASH_PROBE: float = 22.0f
+const HASH_BUILD: float = 22.0f
+const ROW_COST: float = 2.0f
 
 // A key column's values among the conjuncts: per value, the levels it uses
 // (a bit each; 0 constants and parameters) and its key when it is a literal
@@ -5305,7 +5328,9 @@ type WayCand = record { index: int; tree: int; unique: bool; cols: []BindCol; co
 
 // Its expected rows and reads each time it is taken; outer: it uses values of
 // the levels placed. rows -1: none.
-type Way = record { rows: float; cost: float; outer: bool }
+// cost: as the first table (scanned in batches) or per lookup; inner: read
+// once as a hashed table (row by row, optimizer 36).
+type Way = record { rows: float; cost: float; outer: bool; inner: float }
 
 fn fmax(a: float, b: float): float { return if a > b { a } else { b } }
 
@@ -5376,7 +5401,9 @@ fn (q: &Query) wayCands(k: int, cs: &[]Expr): []WayCand {
 fn (q: &Query) wayInto(k: int, cands: &[]WayCand, mask: int, outer: bool, cs: &[]Expr): Way {
     let lv = &q.levels[k]
     let t = float(lv.est.rows)
-    var best = if outer { Way{rows: -1.0f, cost: 0.0f, outer: true} } else { Way{rows: t, cost: t, outer: false} }
+    var best = if outer { Way{rows: -1.0f, cost: 0.0f, outer: true, inner: 0.0f} } else {
+        Way{rows: t, cost: t * COST_SCAN, outer: false, inner: t * COST_SCAN_INNER}
+    }
     for ci in 0..len(cands) {
         let wc = &cands[ci]
         var n = 0
@@ -5412,8 +5439,14 @@ fn (q: &Query) wayInto(k: int, cands: &[]WayCand, mask: int, outer: bool, cs: &[
         } else if n == 0 {
             continue
         }
-        let cost = 1.0f + m * (if wc.index < 0 { 1.0f } else { 2.0f })
-        if best.rows < 0.0f || cost < best.cost { best = Way{rows: m, cost: cost, outer: outer} }
+        // a row by key through an index, or the primary key's own (one: a
+        // point; more: a range, in batches as the first table)
+        let point = wc.index < 0 && n == len(wc.cols) && wc.unique
+        let perRow = if wc.index >= 0 || point { COST_KEY_ROW } else if outer { COST_SCAN_INNER } else { COST_PK_RANGE }
+        let cost = COST_DESCENT + m * perRow
+        let inner = COST_DESCENT + m * (if wc.index >= 0 || point { COST_KEY_ROW } else { COST_SCAN_INNER })
+        if best.rows < 0.0f || cost < best.cost { best = Way{rows: m, cost: cost, outer: outer, inner: fmin(inner, best.inner)} }
+        else if !outer && inner < best.inner { best.inner = inner }
     }
     return best
 }
@@ -5443,17 +5476,47 @@ fn (q: &Query) leadEntry(k: int, col: int): int {
     return -1
 }
 
-// A literal as a number of column col's type; None: not a literal, or not a number.
+// A literal as a number of column col's type; None: not a literal (a cast
+// of one counts: date '2021-06-01', optimizer 36), or not a number.
 fn (q: &Query) litNum(k: int, col: int, x: &Expr): Option[float] {
-    match x {
-        Expr.Lit(v) {
+    match litValue(x) {
+        Some(v) {
             if isNull(&v) { return None }
             match coerce(v, &boundType(&q.levels[k].t.cols[col].typ)) {
                 Ok(cv) { return spanNum(&cv) }
                 Err(_) { return None }
             }
         }
-        else { return None }
+        None { return None }
+    }
+}
+
+// Whether x is made of literals only: no column, parameter or call.
+fn litOnly(x: &Expr): bool {
+    match x {
+        Expr.Lit(_) { return true }
+        Expr.Unary(_, a) { return litOnly(&a) }
+        Expr.Bin(_, a, b) { return litOnly(&a) && litOnly(&b) }
+        Expr.Cast(a, _) { return litOnly(&a) }
+        else { return false }
+    }
+}
+
+// A literal's value, or a literal expression's (a cast, arithmetic) worked
+// out; None: not one, or it gives an error.
+fn litValue(x: &Expr): Option[Val] {
+    match x {
+        Expr.Lit(v) { return Some(v) }
+        else {}
+    }
+    if !litOnly(x) { return None }
+    let noCols: []lexdb_sql.ColDef = []
+    let none: []Val = []
+    let noSubs: []SubRes = []
+    let env = Env{cols: &noCols, row: &none, aggs: &none, params: &none, subs: &noSubs, cur: &none, seq: None}
+    match eval(x, &env) {
+        Ok(v) { return Some(v) }
+        Err(_) { return None }
     }
 }
 
@@ -5735,7 +5798,7 @@ fn (q: &Query) nBest(init: &[]int, nl: int, cands: &[][]WayCand, base: &[]Way, a
 fn (q: &Query) joinStep(k: int, cands: &[]WayCand, base: &Way, mask: int, rin: float, rnext: float, lookups: bool,
                         cap: float, hashed: mut &bool): float {
     let out = rnext * ROW_COST
-    var add = base.cost + base.rows * HASH_BUILD + rin * HASH_PROBE + out
+    var add = base.inner + base.rows * HASH_BUILD + rin * HASH_PROBE + out
     hashed = true
     let none: []Expr = []
     let w = q.wayInto(k, cands, mask, true, &none)
@@ -5826,7 +5889,7 @@ fn (q: &Query) costOrder(ms: &[][]Expr, lookups: bool, cap: float, ordT: int, li
         // own conditions keep (optimizer 29)
         let w = q.wayInto(k, &cands[k], 0, false, &own)
         let t = float(q.levels[k].est.rows)
-        append(mut &base, Way{rows: fmax(t * q.localShare(k, &own, &ownMasks), 1.0f), cost: w.cost, outer: false})
+        append(mut &base, Way{rows: fmax(t * q.localShare(k, &own, &ownMasks), 1.0f), cost: w.cost, outer: false, inner: w.inner})
     }
     // the levels each level shares a conjunct with
     var adj: []int = array(nl, 0)
@@ -6216,12 +6279,12 @@ fn choosePath(q: &Query, k: int, cs: &[]Expr, params: &[]Val, lk: mut &[]Look): 
     if best < 0 { return Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: []} }
     var pick = best
     if scores[best] < 999 && figs[best].rows >= 0 {
-        var pc = figCost(&figs[best], paths[best].index)
+        var pc = figCost(&figs[best], paths[best].index, k == 0)
         var group = 0
         for i in 0..len(paths) {
             if outer[i] != outer[best] || figs[i].rows < 0 { continue }
             group += 1
-            let ci = figCost(&figs[i], paths[i].index)
+            let ci = figCost(&figs[i], paths[i].index, k == 0)
             if ci < pc || (ci == pc && scores[i] > scores[pick]) {
                 pick = i
                 pc = ci
