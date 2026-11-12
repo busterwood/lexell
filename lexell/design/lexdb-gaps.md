@@ -91,6 +91,9 @@ feature.
   - `VACUUM`, `ANALYZE`, `CHECKPOINT`, `REINDEX` and `CLUSTER`, accepted
     as doing nothing.
 - **Replication:** read-only replicas on the same machine (9.68 to 9.73).
+- **Event streams** (9.98, `lexdb-events.md`): `WAITFOR (SELECT ...),
+  TIMEOUT ms`, a SELECT on an ordinary table that waits for a commit to add
+  rows after a cursor.
 
 **Speed** (9.67, PostgreSQL 18 on the same machine, all the data in
 memory):
@@ -126,7 +129,8 @@ In three tiers, by how soon a real application meets the gap.
    - Waiting is the user's decision (9.85).
 2. **What 9.92 and 9.94 left of the functions:**
    - row values outside comparisons (`SELECT (1, 2)`, `row_to_json`);
-   - multi-dimensional arrays, `array_fill` and `array_sort`.
+   - multi-dimensional arrays, `array_fill` and `array_sort`;
+   - `pg_sleep` (found while testing 9.98).
 
    Regular expressions are RE2's: no back-references inside a pattern and
    no lookahead, where PostgreSQL's have both (9.92).

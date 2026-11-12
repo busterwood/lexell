@@ -8197,3 +8197,105 @@ index 11 MB.
 
 Sizes themselves differ from PostgreSQL's (4 kB pages, B+trees), so the
 test compares them only with zero and with each other.
+
+### 9.98 WAITFOR (SELECT ...): a SELECT that waits for an event stream's rows
+
+The user's design, `design/lexdb-events.md`: an event stream is a table,
+and a consumer reads the rows after its cursor with a SELECT that waits
+for them. Its first version is built. The spelling is SQL Server Service
+Broker's `WAITFOR (RECEIVE ...), TIMEOUT ms`, the same in both dialects:
+
+```sql
+WAITFOR (SELECT seq, payload FROM events WHERE seq > $1 ORDER BY seq LIMIT 100), TIMEOUT 30000;
+```
+
+**The statement.**
+- The parser reads `WAITFOR (SELECT ...) [, TIMEOUT n]` into an ordinary
+  S_SELECT with `Stmt.waitFor` set and `waitMs` (TIMEOUT's expression).
+  So Describe, the plan cache, the row description and T-SQL's batches
+  take it as a SELECT.
+- TIMEOUT may be a parameter (typed bigint). A NULL, a missing TIMEOUT,
+  or one over 60 s is capped at 60 s (`WAITFOR_CAP_MS`).
+
+**The one query it runs (`waitShape`), else 0A000:**
+- one ordinary table: not a view, a catalog relation or a temporary table;
+- `WHERE [k = v AND ...] c > v` (or `>=`, or written the other way
+  round), each v a literal or a parameter, cast or not;
+- `ORDER BY c` ascending, and a LIMIT (or T-SQL's TOP);
+- an index, or the primary key, on the equalities' columns in any order,
+  then c;
+- no aggregates, grouping, DISTINCT, windows, subqueries, OFFSET, WITH
+  TIES or locking clause.
+
+Why it is enforced:
+- Its reads are not noted (below), which is sound only for rows after a
+  cursor that producers only add to.
+- An aggregate always gives a row, so it would never wait.
+- Every waiter's query runs again at every flush, on the one SQL thread.
+
+**The wait (`Session.waitForRun`).**
+1. Run the SELECT on a snapshot. If it gives rows, or its time is up,
+   return them.
+2. Else let the snapshot go and wait for a flush past it:
+   `Store.waitDurable(seq, ms)`, where seq is the snapshot's commit
+   (`Txn.snapshotSeq`).
+3. Then run again on a new snapshot. At the timeout, run one last time
+   and return its rows or none.
+
+How the wake works:
+- Snapshots read as of `durableSeq` (9.16), which only the log writer's
+  flush advances. So the waiters are woken there, with `waitChange`'s
+  (`Db.changeWake`), and a woken waiter's snapshot shows what woke it.
+  It shows nothing not yet flushed.
+- The check of `durableSeq` against seq and the promise's place are taken
+  in one `Shared.with`, which cannot park, so no flush comes between them.
+- A wait that times out leaves its promise, completed at the next flush.
+  That is harmless: the runtime drops the result of a promise whose future
+  is gone (`lxllib_task_complete`).
+- A timer that ends a little early is waited on again, so TIMEOUT is never
+  short.
+
+**In a transaction block** it must be the first statement (`Session.fresh`,
+set by BEGIN, cleared by any statement the block runs; else 0A000).
+- Its block's snapshot, taken at BEGIN, is taken again for each run
+  (`Store.renewSnapshot`), with now(). So the block begins when the wait
+  ends, and `BEGIN READ ONLY` sees the rows that woke it.
+- While it waits, the snapshot is let go (`Store.releaseSnapshot`): it
+  pins no old versions and cannot be cancelled (72000).
+- **Its reads are not noted** (`Txn.quiet`, as a locking SELECT's, 9.86).
+  A consumer that read to the stream's end would otherwise fail its commit
+  (40001) at any producer's commit after its snapshot. That happens almost
+  always under steady production; the test shows the plain SELECT doing so.
+  The offset row the block then updates is checked as usual.
+
+**Limits.**
+- `statement_timeout` ends a wait (57014): the wait is to the earlier of
+  the two.
+- The connection is not read while it waits, so a client gone, or a
+  CancelRequest, is seen only when the wait ends. The cap bounds that.
+- A cancelled task (the server stopping) ends it with 57014.
+- **Refused:**
+  - on a replica, which flushes nothing of its own (0A000);
+  - with a locking clause, which reads live data rather than a snapshot.
+- Not done (`lexdb-events.md`):
+  - sequence numbers given at commit (a counter row is the way now);
+  - a keyed wake-one;
+  - filters on other columns;
+  - a wake from a replica's follower.
+
+**Tests:** `exec_waitfor`, with sessions in tasks of their own:
+- rows at once; an empty result after the full timeout;
+- woken by a commit within a second, and not by a rollback;
+- three waiters woken by one commit;
+- a consumer's block committing while producers commit, where the same
+  block with a plain SELECT fails with 40001;
+- two workers moving one offset by compare-and-set: one updates, the other
+  updates no row;
+- the refusals; `statement_timeout`;
+- a READ ONLY block seeing what woke it;
+- a partition's cursor; TIMEOUT and the cursor as parameters;
+- four producers numbering 40 events from a counter row, read by a
+  consumer as they commit: in order, with no gaps;
+- T-SQL's `WAITFOR (SELECT TOP 2 ...), TIMEOUT 1000`.
+
+Over psql, a waiter returned within 5 ms of the insert that woke it.

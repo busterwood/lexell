@@ -515,6 +515,10 @@ pub type Stmt = record {
     // where they name columns it makes (CREATE VIEW, CREATE TABLE ... AS)
     pub spell: str
     pub spells: []str
+    // WAITFOR (SELECT ...) [, TIMEOUT n] (design/lexdb-events.md): the
+    // SELECT, run again as commits reach the log until it gives rows
+    pub waitFor: bool
+    pub waitMs: Option[Expr]    // TIMEOUT's; None: the cap
 }
 
 // A result column with no name (T-SQL's 1 + 1, count(*)): its OutCol's
@@ -594,7 +598,7 @@ pub fn newStmt(kind: int): Stmt {
                 unique: false, inner: [], distinct: false, having: None, subs: [], use: 0, setop: 0, setAll: false,
                 cte: -1, rec: false, cascade: false, src: "", srf: "", ordin: false, alters: [], cons: [], seqNames: [], seq: noSeqOpts(), idOpts: [], overriding: OVR_NONE,
                 copy: noCopyOpts(), wins: [], windows: [], conflict: CONFLICT_NONE, conflictCols: [], conflictCon: "", alias: "", conc: false, lockMode: 0, lockOf: [], lockWait: 0, noData: false, into: "", exprs: [],
-                distinctOn: [], withTies: false, gsets: [], maintCols: [], temp: false, onCommit: ONC_NONE, assign: [], assignAt: [], topMode: 0, spell: "", spells: []}
+                distinctOn: [], withTies: false, gsets: [], maintCols: [], temp: false, onCommit: ONC_NONE, assign: [], assignAt: [], topMode: 0, spell: "", spells: [], waitFor: false, waitMs: None}
 }
 
 // ---- the lexer
@@ -4565,6 +4569,21 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
             q.params = p.params
             append(mut &c.inner, q)
             return Ok(c)
+        }
+        "waitfor" {
+            // WAITFOR (SELECT ...) [, TIMEOUT n]: as SQL Server's WAITFOR
+            // (RECEIVE ...), in both dialects (design/lexdb-events.md)
+            try p.expectKw("(")
+            if !p.acceptKw("select") { return Err(lexdb_base.err("0A000", "lexdb: WAITFOR supports (SELECT ...) only")) }
+            var q = try p.select()
+            if len(q.into) > 0 { return Err(lexdb_base.err("0A000", "lexdb: WAITFOR's SELECT cannot have INTO")) }
+            try p.expectKw(")")
+            q.waitFor = true
+            if p.acceptKw(",") {
+                try p.expectKw("timeout")
+                q.waitMs = Some(try p.expr())
+            }
+            return Ok(q)
         }
         "values" {
             var vq = try p.valuesQuery()

@@ -2264,6 +2264,32 @@ fn (st: &Store) snapshotTxn(track: bool): Result[Txn, lexdb_base.DbErr] {
     return Ok(t)
 }
 
+// The commit a snapshot shows: the last durable one when it began.
+pub fn (t: &Txn) snapshotSeq(): int { return t.snapSeq }
+
+// A snapshot let go while its transaction waits (WAITFOR,
+// design/lexdb-events.md): it pins no old versions and cannot be
+// cancelled (72000) meanwhile. Its transaction has read and written
+// nothing; renewSnapshot takes a new one before it reads again.
+pub fn (st: &Store) releaseSnapshot(t: mut &Txn) {
+    st.endSnap(t.snap)
+    t.snap = -1
+}
+
+// A block's snapshot taken again, as of now, and its now() with it: for a
+// WAITFOR that is its block's first statement, which has read and written
+// nothing, so that the block begins when the wait ends. Not on a replica
+// (WAITFOR is refused there).
+pub fn (st: &Store) renewSnapshot(t: mut &Txn): Result[Unit, lexdb_base.DbErr] {
+    var fresh = try st.snapshotTxn(t.track)
+    st.endSnap(t.snap)
+    t.snap = fresh.snap
+    t.snapSeq = fresh.snapSeq
+    t.snapTrees = replace(mut &fresh.snapTrees, newMap())
+    t.now = fresh.now
+    return Ok(Unit{})
+}
+
 // Ends a snapshot (its commit or rollback); its old versions go.
 pub fn (st: &Store) endSnapshot(t: &Txn) {
     match st.fo {
@@ -3536,6 +3562,45 @@ pub fn (st: &Store) durableCheckpoint(): int {
     var c = 0
     st.sh.with(fn(db: mut &Db) { c = db.durableCkpt })
     return c
+}
+
+// Waits until a flush makes a commit after seq durable (durableSeq past
+// seq), for at most ms: true then; false at the timeout, or when the store
+// closes or fails, or the task is cancelled. WAITFOR's wait
+// (design/lexdb-events.md): seq is the snapshot it read (snapshotSeq), so
+// the snapshot taken next shows what woke it. Woken with waitChange's,
+// after the flush; a wait that times out leaves its promise, completed at
+// the next flush (harmless: its future is gone). The check and the
+// promise's place are taken in one with, which cannot park, so no flush
+// comes between them.
+pub fn (st: &Store) waitDurable(seq: int, ms: int): bool {
+    let until = time.monotonicNs() + ms * 1000000
+    while true {
+        let left = (until - time.monotonicNs() + 999999) / 1000000
+        var fut: []task.Future[Unit] = []
+        var done = false
+        var over = false
+        st.sh.with(fn(db: mut &Db) {
+            if db.durableSeq > seq {
+                done = true
+                return
+            }
+            if db.closing || len(db.failed) > 0 || left <= 0 {
+                over = true
+                return
+            }
+            let task.Handoff{promise: p, future: f} = task.promise[Unit]()
+            append(mut &db.changeWake, p)
+            append(mut &fut, f)
+        })
+        if done { return true }
+        if over { return false }
+        match pop(mut &fut).waitFor(left) {
+            Ok(_) {}
+            Err(c) { if !c.eq(&task.Cancelled.Timeout) { return false } }     // (a timer may end a little early: looked at again)
+        }
+    }
+    return false
 }
 
 // Waits until the next flush of the log or the next checkpoint (the

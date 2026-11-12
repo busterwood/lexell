@@ -14278,6 +14278,7 @@ fn stmtCasts(s: &lexdb_sql.Stmt, out: mut &[]int) {
     optCasts(&s.having, out)
     optCasts(&s.limit, out)
     optCasts(&s.offset, out)
+    optCasts(&s.waitMs, out)
     for f in s.from { optCasts(&f.on, out) }
     for b in s.subs { stmtCasts(&b, out) }
     for b in s.inner { stmtCasts(&b, out) }
@@ -14291,6 +14292,10 @@ fn setParam(x: &Expr, oid: int, out: mut &[]int) {
 }
 
 fn guessParams(st: &lexdb_store.Store, s: &lexdb_sql.Stmt, out: mut &[]int, path: &[]str) {
+    match s.waitMs {
+        Some(x) { setParam(&x, lexdb_sql.OID_INT8, out) }         // WAITFOR's TIMEOUT $n
+        None {}
+    }
     if s.kind == lexdb_sql.S_INSERT && len(s.inner) > 0 { guessParams(st, &s.inner[0], out, path) }
     if s.setop != 0 {
         for b in s.inner { guessParams(st, &b, out, path) }
@@ -14450,6 +14455,7 @@ pub type Session = record {
     savedZone: []lexdb_time.Zone // in a transaction block: the zone at its BEGIN
     tmp: str                    // its temporary schema once it has made one (9.96): pg_temp_ and id
     onCommit: []str             // its temporary tables ON COMMIT DELETE ROWS (and DROP, made in the open block)
+    fresh: bool                 // the open block has run no statement yet: a WAITFOR may begin it (design/lexdb-events.md)
 }
 
 // The session's time zone (SET TimeZone, 9.95).
@@ -14724,7 +14730,7 @@ fn (s: &Session) show(name: &str): Result[Res, DbErr] {
 pub fn parkedSession(st: lexdb_store.Store): Session {
     return Session{st: st, txn: [], failed: false, maxRecursion: MAX_RECURSION, timeoutMs: 0, maxMem: MAX_STATEMENT_MEM,
                    saved: [], readOnly: false, path: [], pathAt: 0, savedPath: [], id: 0, batch: true, rules: false, saves: [], savedRoles: [],
-                   custom: [], savedCustom: [], localUndo: [], zone: lexdb_time.utc(), savedZone: [], tmp: "", onCommit: []}
+                   custom: [], savedCustom: [], localUndo: [], zone: lexdb_time.utc(), savedZone: [], tmp: "", onCommit: [], fresh: false}
 }
 
 pub fn newSession(st: lexdb_store.Store): Session {
@@ -14738,7 +14744,7 @@ pub fn newSession(st: lexdb_store.Store): Session {
     st.memoPut(&"sessions", &id.toStr())
     return Session{st: st, txn: [], failed: false, maxRecursion: MAX_RECURSION, timeoutMs: 0, maxMem: MAX_STATEMENT_MEM,
                    saved: [], readOnly: false, path: [], pathAt: 0, savedPath: [], id: id, batch: true, rules: false, saves: [], savedRoles: [],
-                   custom: [], savedCustom: [], localUndo: [], zone: lexdb_time.utc(), savedZone: [], tmp: "", onCommit: []}
+                   custom: [], savedCustom: [], localUndo: [], zone: lexdb_time.utc(), savedZone: [], tmp: "", onCommit: [], fresh: false}
 }
 
 // max_statement_mem's default.
@@ -15261,6 +15267,7 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
                 }
                 s.readOnly = stmt.ifFlag
                 s.failed = false
+                s.fresh = true
                 s.saves = []
                 s.saved = [Limits{rounds: s.maxRecursion, mem: s.maxMem, deadline: s.timeoutMs, batch: s.batch, rules: s.rules}]
                 var p: []str = []
@@ -15386,6 +15393,13 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
         if s.failed {
             return Err(e("25P02", "current transaction is aborted, commands ignored until end of transaction block"))
         }
+        if stmt.waitFor {
+            let r = s.waitForRun(stmt, params, pc)
+            s.fresh = false
+            if r.isErr() { s.failed = true }
+            return r
+        }
+        s.fresh = false
         if s.readOnly && (isWrite(stmt.kind) || (stmt.kind == lexdb_sql.S_COPY && stmt.copy.from)) && !s.tempWrite(stmt) {
             s.failed = true
             return Err(e("25006", "cannot execute " + stmtName(stmt.kind) + " in a read-only transaction"))
@@ -15409,6 +15423,7 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
         }
         return r
     }
+    if stmt.waitFor { return s.waitForRun(stmt, params, pc) }
     var tries = 0
     let lim = s.limits()                    // retries share the statement's time
     while true {
@@ -15464,6 +15479,213 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
                 // (a COPY TO sent as it ran is not run again)
                 if !(snap && x.state == "72000") || tries >= 10 || input.stream { return Err(x) }
             }
+        }
+    }
+    return Err(e("XX000", "unreachable"))
+}
+
+// ---- WAITFOR (SELECT ...) [, TIMEOUT ms] (design/lexdb-events.md)
+//
+// An event stream is a table; a consumer reads the rows after its cursor
+// with a SELECT that waits for them. The SELECT runs on a snapshot; given
+// no rows, the snapshot is let go and the session waits for a flush past
+// it (Store.waitDurable), then runs it again on a new one, until it gives
+// rows or its time is up (one last run then, its rows or none).
+// - Woken after the flush, as snapshots read: it shows only durable rows.
+// - In a block it must be the first statement: the block's snapshot is
+//   taken again for each run, so the block begins when the wait ends. Its
+//   reads are not noted (as a locking SELECT's, 9.86): else a consumer that
+//   read to the stream's end would fail its commit (40001) at every
+//   producer's commit. That is sound for its one shape (waitShape): rows
+//   after a cursor, in order, which producers only add to.
+// - TIMEOUT is capped (WAITFOR_CAP_MS), and none means the cap: the
+//   connection is not read while it waits, so a client gone or a cancel
+//   is seen only when it ends. statement_timeout ends it first (57014).
+
+pub const WAITFOR_CAP_MS = 60000
+
+fn waitRefused(m: str): DbErr { return e("0A000", "lexdb: WAITFOR " + m) }
+
+// The column of table t an expression names (bare, or qualified by the
+// FROM item's alias or the table's name); -1 none.
+fn waitCol(x: &Expr, t: &Table, alias: &str): int {
+    match x {
+        Expr.Col(n) {
+            let d = strings.indexOf(n, ".", 0)
+            if d < 0 { return colIndex(&t.cols, &n) }
+            let q = n[0..d]
+            if q != alias && q != lexdb_sql.baseName(&t.name) { return -1 }
+            return colIndex(&t.cols, &n[d + 1..len(n)])
+        }
+        else { return -1 }
+    }
+}
+
+// A value the statement is given: a literal or a parameter, cast or not.
+fn waitConst(x: &Expr): bool {
+    match x {
+        Expr.Lit(_) { return true }
+        Expr.Param(_) { return true }
+        Expr.Cast(a, _) { return waitConst(&a) }
+        else { return false }
+    }
+}
+
+// Whether an index's columns are the equalities' (in any order), then the
+// cursor's.
+fn waitFits(cols: &[]int, eqs: &[]int, cur: int): bool {
+    if len(cols) <= len(eqs) || cols[len(eqs)] != cur { return false }
+    for i in 0..len(eqs) {
+        var found = false
+        for c in eqs { if cols[i] == c { found = true } }
+        if !found { return false }
+    }
+    return true
+}
+
+// The one query WAITFOR runs: from one ordinary table, WHERE [k = v AND
+// ...] c > v (or >=), ORDER BY c, a LIMIT, an index on (k ..., c), and no
+// grouping, aggregates, DISTINCT, windows, subqueries, OFFSET or locking.
+// Others are refused (0A000): their reads could not go unnoted, an
+// aggregate always gives a row, and each would run again for every
+// waiter at every flush.
+fn waitShape(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, stmt: &lexdb_sql.Stmt): Result[Unit, DbErr] {
+    if st.isReplica() { return Err(waitRefused("is not supported on a replica")) }
+    if stmt.lockMode > 0 { return Err(waitRefused("cannot be used with FOR UPDATE, FOR SHARE and the like")) }
+    if stmt.setop != 0 || len(stmt.from) != 1 || stmt.from[0].sub >= 0 {
+        return Err(waitRefused("needs a SELECT from one ordinary table"))
+    }
+    if len(stmt.subs) > 0 { return Err(waitRefused("cannot have subqueries")) }
+    var gathers = len(stmt.group) > 0 || stmt.having.isSome() || stmt.distinct || len(stmt.distinctOn) > 0 || len(stmt.wins) > 0
+    for it in stmt.items {
+        match it.expr {
+            Some(x) { if hasAgg(&x) { gathers = true } }
+            None {}
+        }
+    }
+    if gathers { return Err(waitRefused("cannot have aggregates, GROUP BY, DISTINCT or windows")) }
+    if stmt.offset.isSome() || stmt.withTies || stmt.topMode != 0 { return Err(waitRefused("cannot have OFFSET, WITH TIES or TOP's options")) }
+    if stmt.limit.isNone() { return Err(waitRefused("needs a LIMIT (or TOP)")) }
+    let f = &stmt.from[0]
+    let found = try findTable(st, txn, &f.table)
+    if found.isNone() {
+        let n = lexdb_sql.shown(&f.table)
+        if len(lexdb_pgcat.relOf(&lexdb_sql.schemaOf(&f.table), &lexdb_sql.baseName(&f.table))) > 0 {
+            return Err(waitRefused("reads an ordinary table: \"" + n + "\" is a catalog relation"))
+        }
+        return Err(e("42P01", "relation \"" + n + "\" does not exist"))
+    }
+    let t = found.unwrap()
+    let tn = lexdb_sql.shown(&t.name)
+    if len(t.view) > 0 { return Err(waitRefused("reads an ordinary table: \"" + tn + "\" is a view")) }
+    if tempRel(&t.name) { return Err(waitRefused("cannot read a temporary table: no other session can add to it")) }
+    let alias = if len(f.alias) > 0 { f.alias.toStr() } else { lexdb_sql.baseName(&t.name) }
+    let shape = "needs WHERE [k = v AND ...] c > v, ORDER BY c and an index on (k ..., c)"
+    var conj: []Expr = []
+    match stmt.where {
+        Some(w) { conjuncts(&w, mut &conj) }
+        None {}
+    }
+    var eqs: []int = []
+    var cur = -1
+    for c in conj {
+        var ok = false
+        match c {
+            Expr.Bin(op, a, b) {
+                let ca = waitCol(&a, &t, &alias)
+                let cb = waitCol(&b, &t, &alias)
+                var eq = -1
+                if op == "=" && ca >= 0 && waitConst(&b) { eq = ca }
+                if op == "=" && cb >= 0 && waitConst(&a) { eq = cb }
+                if eq >= 0 {
+                    var have = false
+                    for k in eqs { if k == eq { have = true } }
+                    if !have { append(mut &eqs, eq) }
+                    ok = true
+                } else if cur < 0 && (op == ">" || op == ">=") && ca >= 0 && waitConst(&b) {
+                    cur = ca
+                    ok = true
+                } else if cur < 0 && (op == "<" || op == "<=") && cb >= 0 && waitConst(&a) {
+                    cur = cb
+                    ok = true
+                }
+            }
+            else {}
+        }
+        if !ok { return Err(waitRefused(shape)) }
+    }
+    if cur < 0 { return Err(waitRefused(shape)) }
+    for k in eqs { if k == cur { return Err(waitRefused(shape)) } }
+    if len(stmt.order) != 1 || stmt.order[0].desc || waitCol(&stmt.order[0].expr, &t, &alias) != cur {
+        return Err(waitRefused(shape))
+    }
+    var indexed = waitFits(&t.pk, &eqs, cur)
+    for ix in t.indexes {
+        if ix.pred.isNone() && waitFits(&ix.cols, &eqs, cur) { indexed = true }
+    }
+    if !indexed { return Err(waitRefused(shape + ": \"" + tn + "\" has no such index")) }
+    return Ok(Unit{})
+}
+
+// Runs a WAITFOR: in the open block (its first statement), or on its own.
+fn (s: mut &Session) waitForRun(stmt: &lexdb_sql.Stmt, params: &[]Val, pc: mut &PlanCache): Result[Res, DbErr] {
+    let inBlock = len(s.txn) > 0
+    if inBlock && !s.fresh { return Err(waitRefused("must be the first statement of its transaction block")) }
+    var nolk: []Look = []
+    var ms = try evalInt(&stmt.waitMs, params, "TIMEOUT", mut &nolk)
+    if ms < 0 || ms > WAITFOR_CAP_MS { ms = WAITFOR_CAP_MS }
+    let lim = s.limits()
+    let until = time.monotonicNs() + ms * 1000000
+    // its shape, on a snapshot of its own
+    var probe = try s.st.beginSnapshot()
+    s.setUp(mut &probe)
+    let shaped = waitShape(&s.st, mut &probe, stmt)
+    s.st.abort(probe)
+    try shaped
+    let ptypes: []int = []
+    var last = false
+    while true {
+        let now = time.monotonicNs()
+        if lim.deadline != 0 && now > lim.deadline { return Err(e("57014", "canceling statement due to statement timeout")) }
+        if now >= until { last = true }
+        var seq = 0
+        var got = false
+        if inBlock {
+            try s.st.renewSnapshot(mut &s.txn[0])
+            seq = s.txn[0].snapshotSeq()
+            s.txn[0].quiet = true
+            let r = execIn(&s.st, mut &s.txn[0], stmt, params, &ptypes, lim, pc, &noInput(), noOut, noPull)
+            s.txn[0].quiet = false
+            let res = try r
+            if len(res.rows) > 0 || last { return Ok(res) }
+            s.st.releaseSnapshot(mut &s.txn[0])
+        } else {
+            var t = try s.st.beginSnapshot()
+            s.setUp(mut &t)
+            seq = t.snapshotSeq()
+            match execIn(&s.st, mut &t, stmt, params, &ptypes, lim, pc, &noInput(), noOut, noPull) {
+                Ok(res) {
+                    s.adopt(&t)
+                    if len(res.rows) > 0 || last {
+                        try s.st.commit(t)
+                        return Ok(res)
+                    }
+                    s.st.abort(t)
+                }
+                Err(x) {
+                    s.adopt(&t)
+                    s.st.abort(t)
+                    return Err(x)
+                }
+            }
+        }
+        // no rows: wait for a flush past what it read, to its time's end
+        let end = if lim.deadline != 0 && lim.deadline < until { lim.deadline } else { until }
+        let left = (end - time.monotonicNs() + 999999) / 1000000
+        if left > 0 && !s.st.waitDurable(seq, left) {
+            if task.cancelled() { return Err(e("57014", "canceling statement: its session has ended")) }
+            if end != until { return Err(e("57014", "canceling statement due to statement timeout")) }
+            last = true                     // its time is up, or the store is closing: one last run
         }
     }
     return Err(e("XX000", "unreachable"))

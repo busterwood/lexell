@@ -1,8 +1,13 @@
 # LexDB: transactional event streams with a waiting SELECT
 
-Status: design proposal, 2026-11-12. Not implemented. Revised the same day
-after a review against the code (section 13 lists what the review
-changed). Syntax and sequence allocation are provisional.
+Status: design proposal, 2026-11-12, revised the same day after a review
+against the code (section 13 lists what the review changed). **The first
+version is built: `lexdb.md` 9.98**, as sections 2, 3, 5, 8 and 11
+describe. Not built yet:
+- commit-time sequence numbers;
+- the keyed wake-one;
+- filters on other columns;
+- a wake on replicas.
 
 ## 1. Idea
 
@@ -46,7 +51,33 @@ COMMIT;
 - `waitfor` is not a keyword in PostgreSQL's grammar or in lexdb's today.
 - Without `TIMEOUT`, the wait runs to the cap (section 8). `TIMEOUT $n` is allowed, as LIMIT allows a parameter.
 
-Initially support only an easily recognisable indexed query: one table, `seq > parameter`, `ORDER BY seq ASC`, bounded `LIMIT`. Arbitrary predicates, joins and general waiting SELECTs create a much larger query-dependency problem and are not needed to test the design. Correctness does not depend on the shape: every wake re-runs the whole query (section 5). The restriction keeps the re-run cheap. Section 7's partitioned groups widen it to an equality prefix, `part = $p AND seq > $1`, on an index over `(part, seq)`.
+**The parentheses take one query shape, enforced (0A000 otherwise):**
+- one ordinary table: not a view, a catalog relation or a temporary table;
+- `WHERE [k = v AND ...] c > v` (or `>=`), each v a literal or a parameter;
+- `ORDER BY c` ascending, and a LIMIT (or T-SQL's TOP);
+- an index, or the primary key, on the equalities' columns, then c;
+- no aggregates, grouping, DISTINCT, windows, subqueries, OFFSET or locking
+  clause.
+
+The equality prefix is section 7's partitions: `part = $p AND seq > $1`, on
+an index over `(part, seq)`.
+
+**Correctness depends on this shape, not only cost.** Every wake re-runs the
+whole query (section 5), but that is not enough:
+- **The reads are not recorded.** The waiting SELECT's reads are left out of
+  commit validation (section 3). That is sound only for rows after a cursor
+  that producers only add to. A join to a table that changes, or a filter
+  such as `status = 'pending'`, would escape serializable checking.
+- **"Not empty" must mean "something new arrived".** An aggregate or an
+  outer join always gives a row, so it would never wait.
+- **The ordering guarantee is about a cursor.** Section 4 only means
+  something for `c > cursor ORDER BY c`.
+- **Cost:** every waiter's query runs again at every flush, on the one SQL
+  thread. For this shape that is one index probe that comes back empty.
+
+Later, extra filters on the event row itself (`AND subject = 'x'`) would be
+safe for the unrecorded reads; their cost is rescanning rows that do not
+match (section 11). Anything that reads another table stays refused.
 
 The table is an ordinary one, not a marked event table. A marked table becomes worthwhile with commit-time sequence numbers and an enforced append-only rule (section 4).
 
@@ -195,7 +226,7 @@ So the first version:
 
 Real cancellation needs the connection loop to wait on "socket or wake": a separate project, shared with `LISTEN`/`NOTIFY`.
 
-**Refused with 0A000:**
+**Refused with 0A000** (besides the shapes of section 2):
 - **`WAITFOR` around a locking clause** (FOR UPDATE and the rest), which reads live data rather than a snapshot. It would break section 5's durability argument.
 - **`WAITFOR` on a replica.** Nothing flushes locally on a replica; the follower advances in its poll, and writes fail at commit. A wake from the follower's poll can come later, for autocommit consumers only.
 - **`WAITFOR` on a temporary table.** It is session-private (`lexdb.md` 9.96), so no other session can ever add to it.
@@ -225,6 +256,10 @@ Legitimate gaps in allocated sequence values are different from retention gaps.
 A timeout on the wire is simply zero rows and `SELECT 0`; it needs no new message.
 
 ## 11. First implementation and tests
+
+Built as `lexdb.md` 9.98 describes. It follows this section's plan, with
+`Store.releaseSnapshot` and `Store.renewSnapshot` for the snapshot swap, and
+the test `exec_waitfor`.
 
 Start with one stream/table, a constrained indexed SELECT, timeout, generation-based notification and offsets held in SQL tables. Avoid a new messaging protocol, consumer group subsystem or partitioning requirement. No subject filtering in version one: with a filter, the cursor cannot advance past rows that do not match, so each wake rescans them.
 
@@ -313,5 +348,10 @@ The proposal was reviewed against the code the day it was written. What changed:
 **Still open:**
 - the counter row's throughput, to be measured;
 - whether a keyed wake-one is ever needed.
+
+**Later the same day:**
+- the query shape was made an enforced rule, and section 2 corrected: the
+  shape matters for correctness, not only cost;
+- the first version was built (`lexdb.md` 9.98).
 
 **The event log is the table; the waiting SELECT is the subscription API.**

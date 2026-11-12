@@ -1,0 +1,301 @@
+// lexdb_exec: WAITFOR (SELECT ...) [, TIMEOUT ms] (design/lexdb-events.md),
+// each session in a task of its own:
+// - rows there: returned at once; none: an empty result at the timeout;
+// - a waiter woken by another session's commit, and not by a rollback;
+//   three waiters all woken by one commit;
+// - a consumer's block (WAITFOR first, then its offset's update) committing
+//   while producers commit, where the same block with a plain SELECT fails
+//   (40001); two workers moving one offset by compare-and-set: one does;
+// - the refusals: not the block's first statement, the query's shape
+//   (aggregates, no ORDER BY or LIMIT, no index for the cursor, FOR
+//   UPDATE, subqueries, a temporary table, a view), and statement_timeout
+//   ending a wait (57014);
+// - a READ ONLY block whose snapshot is the WAITFOR's; a partition's
+//   cursor (an equality, then the cursor, on the key); TIMEOUT $1 given;
+// - four producers numbering their events from a counter row, and a
+//   consumer reading them as they commit: every batch in order, no gaps;
+// - T-SQL's WAITFOR (SELECT TOP n ...), TIMEOUT n.
+// expect: there: 1;2
+// expect: timeout: empty, waited t
+// expect: woken: 3, soon t
+// expect: rollback: empty
+// expect: three waiters: 4 / 4 / 4
+// expect: consumer: BEGIN / 5 / pause / UPDATE 1 / COMMIT
+// expect: plain select: BEGIN /  / pause / UPDATE 1 / 40001
+// expect: compare-and-set: updated 1, none 1
+// expect: not first: BEGIN / 1 / 0A000 / ROLLBACK
+// expect: refused: 0A000 0A000 0A000 0A000 0A000 0A000 0A000 0A000 0A000 42P01
+// expect: statement_timeout: 57014
+// expect: read only: BEGIN / 7 / 7 / COMMIT
+// expect: partition: 2|2
+// expect: parameter: 1;2 then empty
+// expect: ordered: 40 events, in order t
+// expect: t-sql: 1;2
+import "task"
+import "time"
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_sql"
+import "../../../cmd/lexdb_tsql"
+
+type Val = lexdb_sql.Val
+
+fn rowsText(rows: &[][]Val): str {
+    var out: []str = []
+    for row in rows {
+        var cells: []str = []
+        for v in row { append(mut &cells, lexdb_exec.text(&v)) }
+        append(mut &out, strings.join(&cells, "|"))
+    }
+    return strings.join(&out, ";")
+}
+
+fn one(s: mut &lexdb_exec.Session, sql: str): str {
+    match s.exec(&sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if r.hasRows { return rowsText(&r.rows) }
+            return r.tag
+        }
+        Err(e) { return e.state }
+    }
+}
+
+// A session's statements, run in a task: their results joined by " / ";
+// "pause" sleeps 60 ms.
+type Job = record { s: lexdb_exec.Session; sqls: []str }
+type Done = record { s: lexdb_exec.Session; out: str }
+
+fn runJob(j: Job): Done {
+    let Job{s: s0, sqls: sqls} = move(j)
+    var s = s0
+    var outs: []str = []
+    for q in sqls {
+        if q == "pause" {
+            let z = task.sleep(60)
+            append(mut &outs, "pause")
+        } else {
+            append(mut &outs, one(mut &s, q.toStr()))
+        }
+    }
+    return Done{s: s, out: strings.join(&outs, " / ")}
+}
+
+fn job(st: lexdb_store.Store, sqls: []str): Job { return Job{s: lexdb_exec.newSession(st), sqls: sqls} }
+
+fn outOf(f: task.Future[Done]): str {
+    var d = f.wait().unwrap()
+    d.s.close()
+    return d.out
+}
+
+fn pause(ms: int) { let z = task.sleep(ms) }
+
+type Prod = record { st: lexdb_store.Store; n: int }
+
+// n events, each numbered from the counter row in its own block: the
+// failures.
+fn producer(a: Prod): int {
+    var s = lexdb_exec.newSession(a.st)
+    var bad = 0
+    for i in 0..a.n {
+        let b = one(mut &s, "begin")
+        let n = one(mut &s, "update ctr set n = n + 1 where stream = 'o' returning n")
+        let yd = task.yield()
+        let ins = one(mut &s, "insert into stream values (" + n + ", 'e')")
+        if ins != "INSERT 0 1" || one(mut &s, "commit") != "COMMIT" {
+            let r = one(mut &s, "rollback")
+            bad += 1
+        }
+    }
+    s.close()
+    return bad
+}
+
+type Cons = record { st: lexdb_store.Store; want: int }
+
+// Reads the stream from 0 until it has want events: whether every batch
+// began just after the last and was in order (no event seen before one
+// numbered below it).
+fn consumer(a: Cons): str {
+    var s = lexdb_exec.newSession(a.st)
+    var last = 0
+    var ordered = true
+    var got = 0
+    var rounds = 0
+    while got < a.want && rounds < 1000 {
+        rounds += 1
+        let r = one(mut &s, "waitfor (select seq from stream where seq > " + last.toStr() + " order by seq limit 7), timeout 2000")
+        if len(r) == 0 { continue }
+        for x in strings.split(&r, ";") {
+            let n = strings.parseIntOpt(x).unwrapOr(-1)
+            if n != last + 1 { ordered = false }
+            last = n
+            got += 1
+        }
+    }
+    s.close()
+    return got.toStr() + " events, in order " + (if ordered { "t" } else { "f" })
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(31), lexdb_store.Options{cacheBytes: 16 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000, bufferedPages: false}, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var a = lexdb_exec.newSession(st)
+        let m1 = one(mut &a, "create table ev (seq bigint primary key, subject text not null, payload text)")
+        let m2 = one(mut &a, "insert into ev values (1, 'x', 'one'), (2, 'x', 'two')")
+        let m3 = one(mut &a, "create table offs (id text primary key, last bigint)")
+        let m4 = one(mut &a, "insert into offs values ('a', 0), ('b', 5), ('c', 0)")
+        let m5 = one(mut &a, "create table pev (part int, seq bigint, primary key (part, seq))")
+        let m6 = one(mut &a, "insert into pev values (1, 1), (2, 1)")
+        let m7 = one(mut &a, "create table stream (seq bigint primary key, body text)")
+        let m8 = one(mut &a, "create table ctr (stream text primary key, n bigint)")
+        let m9 = one(mut &a, "insert into ctr values ('o', 0)")
+
+        println("there: " + one(mut &a, "waitfor (select seq from ev where seq > 0 order by seq limit 10), timeout 1000"))
+        let t0 = time.monotonicNs()
+        let empty = one(mut &a, "waitfor (select seq from ev where seq > 2 order by seq limit 10), timeout 80")
+        let waited = (time.monotonicNs() - t0) / 1000000
+        println("timeout: " + (if len(empty) == 0 { "empty" } else { empty }) + ", waited " + (if waited >= 80 { "t" } else { "f " + waited.toStr() }))
+
+        task.scope(fn(sc: mut &task.Scope) {
+            // woken by a commit
+            let fw = sc.start(runJob, job(st, ["waitfor (select seq from ev where seq > 2 order by seq limit 10), timeout 5000"]))
+            pause(30)
+            let t1 = time.monotonicNs()
+            let i3 = one(mut &a, "insert into ev values (3, 'x', 'three')")
+            let w = outOf(fw)
+            let soon = (time.monotonicNs() - t1) / 1000000 < 1000
+            println("woken: " + w + ", soon " + (if soon { "t" } else { "f" }))
+
+            // a rollback wakes nobody with rows
+            let fr = sc.start(runJob, job(st, ["waitfor (select seq from ev where seq > 3 order by seq limit 10), timeout 300"]))
+            pause(30)
+            let rb = one(mut &a, "begin")
+            let ri = one(mut &a, "insert into ev values (4, 'x', 'gone')")
+            let rr = one(mut &a, "rollback")
+            let ro = outOf(fr)
+            println("rollback: " + (if len(ro) == 0 { "empty" } else { ro }))
+
+            // three waiters, one commit
+            var fs: []task.Future[Done] = []
+            for k in 0..3 { append(mut &fs, sc.start(runJob, job(st, ["waitfor (select seq from ev where seq > 3 order by seq limit 10), timeout 5000"]))) }
+            pause(30)
+            let i4 = one(mut &a, "insert into ev values (4, 'x', 'four')")
+            var outs: []str = []
+            while len(fs) > 0 { append(mut &outs, outOf(pop(mut &fs))) }
+            println("three waiters: " + strings.join(&outs, " / "))
+
+            // a consumer's block: a producer commits between its WAITFOR and its COMMIT
+            let fc = sc.start(runJob, job(st, ["begin", "waitfor (select seq from ev where seq > 4 order by seq limit 1), timeout 5000", "pause",
+                                               "update offs set last = 5 where id = 'a' and last = 0", "commit"]))
+            pause(30)
+            let i5 = one(mut &a, "insert into ev values (5, 'x', 'five')")
+            pause(20)
+            let i6 = one(mut &a, "insert into ev values (6, 'x', 'six')")
+            println("consumer: " + outOf(fc))
+
+            // the same with a plain SELECT: its read of the stream's end is checked
+            let fp = sc.start(runJob, job(st, ["begin", "select seq from ev where seq > 6 order by seq limit 1", "pause",
+                                               "update offs set last = 6 where id = 'c' and last = 0", "commit"]))
+            pause(20)
+            let i7 = one(mut &a, "insert into ev values (7, 'x', 'seven')")
+            println("plain select: " + outOf(fp))
+
+            // two workers on one offset: compare-and-set
+            let w1 = sc.start(runJob, job(st, ["begin", "waitfor (select seq from ev where seq > 5 order by seq limit 1), timeout 5000", "pause",
+                                               "update offs set last = 6 where id = 'b' and last = 5", "commit"]))
+            let w2 = sc.start(runJob, job(st, ["begin", "waitfor (select seq from ev where seq > 5 order by seq limit 1), timeout 5000", "pause",
+                                               "update offs set last = 6 where id = 'b' and last = 5", "commit"]))
+            let o1 = outOf(w1)
+            let o2 = outOf(w2)
+            var upd = 0
+            var none = 0
+            for o in [o1, o2] {
+                if strings.contains(&o, "UPDATE 1 / COMMIT") { upd += 1 }
+                if strings.contains(&o, "UPDATE 0") { none += 1 }
+            }
+            println("compare-and-set: updated " + upd.toStr() + ", none " + none.toStr())
+        })
+
+        var b = lexdb_exec.newSession(st)
+        let nf = [one(mut &b, "begin"), one(mut &b, "select 1"),
+                  one(mut &b, "waitfor (select seq from ev where seq > 0 order by seq limit 1)"), one(mut &b, "rollback")]
+        println("not first: " + strings.join(&nf, " / "))
+
+        let v1 = one(mut &b, "create view evv as select * from ev")
+        let t1 = one(mut &b, "create temporary table tq (seq int primary key)")
+        var refused: []str = []
+        for q in ["waitfor (select count(*) from ev where seq > 0 order by seq limit 1)",
+                  "waitfor (select seq from ev where seq > 0 limit 1)",
+                  "waitfor (select seq from ev where seq > 0 order by seq)",
+                  "waitfor (select seq from ev where subject = 'x' and seq > 0 order by seq limit 1)",
+                  "waitfor (select seq from ev where seq > 0 order by seq desc limit 1)",
+                  "waitfor (select seq from ev where seq > 0 order by seq limit 1 for update)",
+                  "waitfor (select seq from ev where seq > (select 1) order by seq limit 1)",
+                  "waitfor (select seq from tq where seq > 0 order by seq limit 1)",
+                  "waitfor (select seq from evv where seq > 0 order by seq limit 1)",
+                  "waitfor (select seq from nope where seq > 0 order by seq limit 1)"] {
+            append(mut &refused, one(mut &b, q))
+        }
+        println("refused: " + strings.join(&refused, " "))
+
+        let so = one(mut &b, "set statement_timeout = 50")
+        println("statement_timeout: " + one(mut &b, "waitfor (select seq from ev where seq > 100 order by seq limit 1), timeout 5000"))
+        let sr = one(mut &b, "reset statement_timeout")
+
+        task.scope(fn(sc: mut &task.Scope) {
+            // READ ONLY: the block's snapshot is the one WAITFOR found rows in
+            let fo = sc.start(runJob, job(st, ["begin read only", "waitfor (select seq from ev where seq > 6 order by seq limit 1), timeout 5000",
+                                               "select max(seq) from ev", "commit"]))
+            pause(30)
+            println("read only: " + outOf(fo))
+
+            // a partition's cursor: part 1's event wakes it, part 2's is returned
+            let fq = sc.start(runJob, job(st, ["waitfor (select part, seq from pev where part = 2 and seq > 1 order by seq limit 5), timeout 5000"]))
+            pause(30)
+            let p1 = one(mut &a, "insert into pev values (1, 2)")
+            pause(30)
+            let p2 = one(mut &a, "insert into pev values (2, 2)")
+            println("partition: " + outOf(fq))
+        })
+
+        // TIMEOUT and the cursor as parameters
+        let ps = lexdb_sql.parse(&"waitfor (select seq from ev where seq > $1 order by seq limit 2), timeout $2").unwrap()
+        let nt: []int = []
+        let r1 = b.run(&ps[0], &[Val.Int(0), Val.Int(1000)], &nt).unwrap()
+        let r2 = b.run(&ps[0], &[Val.Int(99), Val.Int(30)], &nt).unwrap()
+        println("parameter: " + rowsText(&r1.rows) + " then " + (if len(r2.rows) == 0 { "empty" } else { rowsText(&r2.rows) }))
+
+        // four producers numbering from a counter row; a consumer as they commit
+        var ordered = ""
+        task.scope(fn(sc: mut &task.Scope) {
+            let fcon = sc.start(consumer, Cons{st: st, want: 40})
+            var ps2: []task.Future[int] = []
+            for k in 0..4 { append(mut &ps2, sc.start(producer, Prod{st: st, n: 10})) }
+            var bad = 0
+            while len(ps2) > 0 { bad += pop(mut &ps2).wait().unwrap() }
+            ordered = fcon.wait().unwrap()
+            if bad > 0 { ordered = ordered + ", producers failed " + bad.toStr() }
+        })
+        println("ordered: " + ordered)
+
+        // T-SQL: the same statement, with TOP
+        var ts = lexdb_tsql.newState(1)
+        var fr = lexdb_tsql.newFrame()
+        var evs: []lexdb_tsql.Event = []
+        lexdb_tsql.run(mut &b, mut &ts, &"WAITFOR (SELECT TOP 2 seq FROM ev WHERE seq > 0 ORDER BY seq), TIMEOUT 1000", mut &fr, mut &evs)
+        var tout: []str = []
+        for x in evs {
+            if x.kind == lexdb_tsql.EV_ROWS { append(mut &tout, rowsText(&x.rows)) }
+            if x.kind == lexdb_tsql.EV_ERROR { append(mut &tout, x.err.state + " " + x.err.msg) }
+        }
+        println("t-sql: " + strings.join(&tout, " / "))
+
+        b.close()
+        a.close()
+        return 0
+    }).unwrap()
+}
