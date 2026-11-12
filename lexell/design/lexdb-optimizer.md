@@ -32,13 +32,15 @@ section and the decision list below win.
   per-parameter plans, and a fallback to rule-based planning through a SET
   command.** Section 18 has the consequences.
 
-**Built so far (on `exp/optimizer`, pushed):** the index-to-scan switch
-(section 19) and stage A, ANALYZE with the tie-break and `SET lexdb_planner`
-(section 20), the review fixes (section 21), plans kept per parameter
-outcome (section 22), per-value estimates with per-parameter plans
-(section 23), and estimates deciding beyond ties, with primary-key
-statistics (section 24, uncommitted). Next: join ordering (constraint-bound
-first).
+**Built so far (on `exp/optimizer`, rebased onto `lexdb` 2026-11-12):** the
+index-to-scan switch (section 19) and stage A, ANALYZE with the tie-break
+and `SET lexdb_planner` (section 20), the review fixes (section 21), plans
+kept per parameter outcome (section 22), per-value estimates with
+per-parameter plans (section 23), estimates deciding beyond ties with
+primary-key statistics (section 24), and the constraint-bound join order
+(section 25, uncommitted). Next: the cost-based join order, which needs the
+planning-time measurement first (section 5.3). Code comments cite these
+sections as "optimizer N".
 
 ## 1. Summary
 
@@ -1395,6 +1397,63 @@ plan does not depend on the value keeps one plan.
 **Not built.** Comparing a lookup per outer row with a hash join (join
 ordering); range estimates (samples); a full scan as a candidate (the
 run-time switch covers level 0); EXPLAIN naming the kept plan.
+
+## 25. Join order, step 1: bound by keys (2026-11-12)
+
+The constraint-bound order from section 5.3, built after the rebase onto
+`lexdb` (views, privileges, tables without a primary key, indexes on
+expressions; the rebase's fixes are in commit e3bff230 and below).
+
+**The rule** (`Query.joinOrder`, `bindOf`). No statistics; the order depends
+only on the statement and the schema. A SELECT's inner joins start from the
+first table, in FROM order, that a unique key pins to one row: the primary
+key or an unfiltered unique index, every column equal to a constant or a
+parameter. Then, each time, the first remaining table in FROM order that is:
+1. bound by a unique key to the tables placed: at most one row per row;
+2. else reached by a key's or an index's leading column: a lookup per row;
+3. else linked by any equality: a hash join;
+4. else the first remaining: a cross product.
+With no pinned table, or when the order found is FROM's, nothing changes.
+
+**What keeps FROM's order.** Outer joins and LATERAL (both need their written
+order); `SET lexdb_planner = rules`; UPDATE ... FROM and DELETE ... USING,
+whose target must stay first (`buildQuery`'s new `order` argument is true only
+for SELECT).
+
+**How it is done.** Levels keep their columns' places in the joined row
+(`Level.first`), so `SELECT *`, the output, and every column position stay
+where FROM put them; only the order the levels run in changes. The
+conjuncts (ON and WHERE together, since all joins are inner) are placed again
+at the latest table they use in the new order. Three things assumed the
+first table's columns start at 0 and were fixed: `levelOf` (now by range),
+`firstCol` (ORDER BY and MIN/MAX use the first table's own column), and the
+MIN/MAX stop column (`Sel.first`, a place in the joined row). A batch scan
+needs the first table at column 0, so a reordered query reads row by row;
+the pinned start is a point lookup, so batches would not apply anyway.
+
+**Examples (tested, `exec_joinorder`).**
+- `FROM lines l JOIN orders o ON l.ord = o.id JOIN products p ON p.sku =
+  l.sku WHERE o.id = 5`: the rules scan all 5,000 lines; the new order looks
+  up the order, its 5 lines through `lines_ord`, and a product per line. Same
+  rows as the rules mode.
+- The customer by a unique email, its orders hashed on `cust` (no index),
+  then their lines by index. Before the hash-join tier was added, the lines
+  came second as a cross product (5,000 rows for one customer): the test
+  caught it.
+- Comma joins with WHERE, a subquery in FROM (hashed after the pinned
+  tables), a correlated EXISTS on a moved table, ORDER BY and MIN/MAX on the
+  moved first table, `SELECT *` column order, and the cases that keep FROM's
+  order.
+
+**Also fixed.** This branch's code comments cited `design/lexdb.md` sections
+9.53 to 9.58 for its own work. Those sections are about decoding, sockets
+and io_uring. They now cite this document's sections ("optimizer 19" to
+"optimizer 25").
+
+**Not done.** The cost-based order (section 5.3, step 2), which also decides
+between a lookup per outer row and a hash join; UPDATE ... FROM's join (its
+target is scanned in full even when the FROM table is pinned); outer-join
+reordering.
 
 ## Sources
 

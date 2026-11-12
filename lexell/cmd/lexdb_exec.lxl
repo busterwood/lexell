@@ -3464,7 +3464,7 @@ fn bumpCatalog(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[Unit, 
 // Bumps made in this process: with the number, a version a bump gives is
 // unique, so a bump in a block that rolls back cannot give the version a
 // later bump commits (a plan kept under the first would be taken for the
-// second: 9.54).
+// second: optimizer 20).
 var VERSION_BUMPS: int = 0
 
 // The version after v: its count plus one, and a token unique in this process.
@@ -3475,7 +3475,7 @@ fn nextVersion(v: &str): str {
     return (n + 1).toStr() + "." + VERSION_BUMPS.toStr() + "." + time.monotonicNs().toStr()
 }
 
-// ---- statistics (9.54): ANALYZE's row per table, keyed 5 then the table's
+// ---- statistics (optimizer 20): ANALYZE's row per table, keyed 5 then the table's
 // catalog key (between the sequences' 4 and the tables), its text
 // "tree;rows" then ";indextree:entries:d1,d2,..." per index. The table's tree
 // is in it, so an older table of the same name's statistics are not used.
@@ -3535,7 +3535,7 @@ fn moveStats(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, old: &str, new: 
 // lexdb_planner = rules).
 fn loadEst(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table): Result[Est, DbErr] {
     // the statistics choose between candidates: two indexes, or an index and
-    // a primary key of several columns (9.57)
+    // a primary key of several columns (optimizer 24)
     let cands = len(t.indexes) + (if len(t.pk) >= 2 { 1 } else { 0 })
     if txn.rules || t.tree < 0 || cands < 2 { return Ok(noEst()) }
     let got = try st.getUnnoted(txn, CATALOG, statKey(&t.name))
@@ -3571,7 +3571,7 @@ fn loadEst(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table): Result
 // from a full read. The rows are read on a snapshot of their own, so the
 // statement's reads are only the catalog's and it does not conflict with the
 // writes it does not see; only the statistics' rows and version are written,
-// so prepared statements are planned again with them (9.54).
+// so prepared statements are planned again with them (optimizer 20).
 fn analyzeStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, lim: Limits): Result[Res, DbErr] {
     var tabs: []Table = []
     if s.table != "" {
@@ -3646,7 +3646,7 @@ fn analyzeTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, snap: mut &le
     let all: []bool = []
     let path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: []}
     let sc = Scan{empty: false, point: false, lo: "", hi: "", whole: true}
-    // a primary key of several columns (9.57): rows come in its order, so
+    // a primary key of several columns (optimizer 24): rows come in its order, so
     // each prefix's distinct values are counted where it changes, and its
     // leading column's values by their runs
     let pkn = if len(t.pk) >= 2 { len(t.pk) } else { 0 }
@@ -3689,7 +3689,7 @@ fn analyzeTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, snap: mut &le
                 for j in 0..len(t.indexes[i].cols) {
                     encIdxPart(mut &b, &(try idxVal(t, &t.indexes[i], j, &r)))
                     let k = b.toStr()
-                    // the leading column's values are counted (its common values, 9.56)
+                    // the leading column's values are counted (its common values, optimizer 23)
                     let n = if j == 0 { seen[i][j].getOr(&k, 0) } else { 0 }
                     if n > 0 || seen[i][j].size() < ANALYZE_DISTINCT_MAX { seen[i][j].put(k, n + 1) }
                 }
@@ -3714,7 +3714,7 @@ fn analyzeTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, snap: mut &le
         for m in seen[i] { append(mut &ds, m.size().toStr()) }
         out.add(";" + t.indexes[i].tree.toStr() + ":" + entries[i].toStr() + ":" + strings.join(&ds, ","))
         // the most common values of its leading column: above the average,
-        // at most COMMON_MAX, as hex=count (9.56)
+        // at most COMMON_MAX, as hex=count (optimizer 23)
         if len(seen[i]) > 0 && seen[i][0].size() > 0 {
             let m = &seen[i][0]
             let avg = entries[i] / m.size()
@@ -4028,16 +4028,16 @@ type Path = record {
 // path reads the whole table instead (no row counts to choose by yet).
 const IN_LOOKUP_MAX: int = 1000
 
-// ANALYZE's statistics for a table (9.54): its rows, and per index (by its
+// ANALYZE's statistics for a table (optimizer 20): its rows, and per index (by its
 // tree) its entries, the distinct values of each leading prefix of its
 // columns (a NULL counted as a value), and its leading column's most common
-// values (cm, 9.56). rows -1: none (no ANALYZE, an ANALYZE of an older table
+// values (cm, optimizer 23). rows -1: none (no ANALYZE, an ANALYZE of an older table
 // of the name, or SET lexdb_planner = rules).
 type Est = record { rows: int; trees: []int; entries: []int; dist: [][]int; cm: []Common }
 
 fn noEst(): Est { return Est{rows: -1, trees: [], entries: [], dist: [], cm: []} }
 
-// An index's leading column (9.56): its entries, its distinct values, and its
+// An index's leading column (optimizer 23): its entries, its distinct values, and its
 // most common values (their encoded index parts) with their exact counts:
 // those above the average, at most COMMON_MAX. d -1: unknown.
 type Common = record { entries: int; d: int; keys: []str; cnts: []int }
@@ -4079,7 +4079,7 @@ fn (es: &Est) rowsFor(tree: int, eqs: int, key: &str): int {
     return -1
 }
 
-// A copy of an index's common values, for a look (9.56).
+// A copy of an index's common values, for a look (optimizer 23).
 fn (es: &Est) commonOf(tree: int): Common {
     for i in 0..len(es.trees) {
         if es.trees[i] == tree {
@@ -4134,7 +4134,7 @@ fn (es: &Est) entriesOf(tree: int): int {
     return -1
 }
 
-// What the statistics say a path reads (9.57): rows, and whether that is an
+// What the statistics say a path reads (optimizer 24): rows, and whether that is an
 // estimate or only a bound (at most rows). rows -1: no figure (no
 // statistics, or an index ANALYZE has not seen).
 type Fig = record { rows: int; bound: bool }
@@ -4235,11 +4235,11 @@ pub type Level = record {
     need: []bool            // a table's columns the statement uses (the others are read as NULL); [] all (9.31)
     lock: int               // SELECT ... FOR UPDATE and the like: its rows locked (lexdb_sql.LOCK_*, 9.86); 0 none
     lockWait: int           // lexdb_sql.WAIT_*
-    keeps: bool             // the path is chosen for ORDER BY or MIN/MAX: no switch to a scan (9.53)
-    est: Est                // its table's statistics from ANALYZE, for choosePath (9.54)
-    stops: bool             // the first table's reading may stop early (a LIMIT, EXISTS): no switch to a scan (9.53)
-    estRows: int            // its path's expected rows (EXPLAIN); -1 unknown (9.56)
-    estMax: bool            // estRows only bounds them: at most (9.57)
+    keeps: bool             // the path is chosen for ORDER BY or MIN/MAX: no switch to a scan (optimizer 19)
+    est: Est                // its table's statistics from ANALYZE, for choosePath (optimizer 20)
+    stops: bool             // the first table's reading may stop early (a LIMIT, EXISTS): no switch to a scan (optimizer 19)
+    estRows: int            // its path's expected rows (EXPLAIN); -1 unknown (optimizer 23)
+    estMax: bool            // estRows only bounds them: at most (optimizer 24)
 }
 
 // A level of rows held by the run (a subquery's, a working table), not a table's.
@@ -4255,7 +4255,7 @@ type Counts = value record {
     kept: int
     unmatched: int      // RIGHT and FULL JOIN: its rows that joined nothing
     batches: int        // the batches its rows were read and aggregated in (9.47)
-    switched: int       // 1 when an index range over the budget was run as a scan (9.53)
+    switched: int       // 1 when an index range over the budget was run as a scan (optimizer 19)
 }
 
 // A query's run: the counts, and per RIGHT or FULL JOIN table which of its
@@ -4275,7 +4275,7 @@ type Run = record {
     ticks: int
     turnEnd: int                // the monotonic clock's ns after which the statement lets other sessions run
     batch: bool                 // aggregates over batches of rows (SET lexdb_batch: 9.47)
-    writes: bool                // an INSERT, UPDATE or DELETE's run: no index-to-scan switch (9.53)
+    writes: bool                // an INSERT, UPDATE or DELETE's run: no index-to-scan switch (optimizer 19)
 }
 
 // A statement that does not wait (its pages in the cache) lets the other
@@ -4290,7 +4290,7 @@ pub type Limits = value record {
     pub mem: int                // bytes of rows held; 0 no limit
     pub deadline: int           // time.monotonicNs() to stop at; 0 none
     pub batch: bool             // SET lexdb_batch: aggregates over batches of rows (9.47)
-    pub rules: bool             // SET lexdb_planner = rules: kept with the others for a block's ROLLBACK (9.54)
+    pub rules: bool             // SET lexdb_planner = rules: kept with the others for a block's ROLLBACK (optimizer 20)
 }
 
 pub fn noLimits(): Limits { return Limits{rounds: 0, mem: 0, deadline: 0, batch: true, rules: false} }
@@ -4601,11 +4601,16 @@ fn (q: &Query) valBefore(x: &Expr, k: int): bool { return q.maxLevel(x) < k && !
 // (runLevel: pathCur), so it may be one too (9.23).
 fn (q: &Query) keyBefore(x: &Expr, k: int): bool { return q.maxLevel(x) < k }
 
+// The level whose columns hold name's (-1 none). Levels hold their columns
+// where FROM put them, whatever order they run in (join order, optimizer 25).
 fn (q: &Query) levelOf(name: &str): int {
     let i = colIndex(&q.cols, name)
-    var k = -1
-    for j in 0..len(q.levels) { if q.levels[j].first <= i { k = j } }
-    return k
+    if i < 0 { return -1 }
+    for j in 0..len(q.levels) {
+        let f = q.levels[j].first
+        if f <= i && i < f + len(q.levels[j].t.cols) { return j }
+    }
+    return -1
 }
 
 // The latest table an expression uses (-1: none) and the earliest (len: none).
@@ -4790,7 +4795,7 @@ fn mentions(x: &Expr, col: &str): bool {
 // text; a comparison of a column for "column IS NOT NULL"; or comparisons
 // of a column with constants (x >= 3 implies x > 0).
 //
-// Planning that looks at a parameter's value (9.55): whether a partial
+// Planning that looks at a parameter's value (optimizer 22): whether a partial
 // index's predicate is implied for it (yes or no), and a LIMIT or OFFSET (its
 // value, which the plan keeps). Each look is noted in the planning's scope
 // (Scope.looks) with what it gave; select() keeps the plan with them and takes
@@ -4798,7 +4803,7 @@ fn mentions(x: &Expr, col: &str): bool {
 // keeps a plan per outcome, at most PLAN_VARIANTS.
 // kind 0: an implication (c implies p; out 1 yes); 1: a LIMIT or OFFSET (c;
 // out its value); 2: an estimate (c a parameter equal to an index's leading
-// column of type typ, its common values cm; out the estimate's scale, 9.56).
+// column of type typ, its common values cm; out the estimate's scale, optimizer 23).
 type Look = record { kind: int; c: Expr; p: Expr; out: int; typ: lexdb_sql.TypeName; cm: Common }
 
 fn noType(): lexdb_sql.TypeName { return lexdb_sql.TypeName{kind: 0, oid: 0, prec: 0, scale: 0, len: 0} }
@@ -5013,11 +5018,116 @@ fn keyCols(t: &Table, index: int): []int {
     return out
 }
 
+// ---- join order (optimizer 25): the constraint-bound order, no statistics. A
+// SELECT's inner joins run from the first table (in FROM order) that a
+// unique key's equalities pin to one row, their values constants or
+// parameters; then, each time, the first table left that a unique key binds
+// to the tables placed (a row per row at most), else the first that a key's
+// or an index's leading column reaches from them (a lookup per row), else
+// the first an equality links to them (a hash join), else the first left (a
+// cross product). So most OLTP joins (one order, its lines, their products)
+// read from the row they are about, whatever FROM's order, and the order
+// never depends on the data. Outer joins and LATERAL keep FROM's order, and
+// so does SET lexdb_planner = rules. The tables keep their columns' places
+// in the joined row (Level.first): only the order they run in changes.
+
+// A table of nothing (a level's place while levels are moved).
+fn noTable(): Table {
+    return Table{name: "", tree: -1, cols: [], pk: [], indexes: [], slots: [], width: 0, checks: [], fks: [], refBy: [], layouts: [], lays: [],
+                 view: "", deps: []}
+}
+
+// The new order of q's levels (old indexes), [] when FROM's stands. ms: the
+// conjuncts placed so far, per level.
+fn (q: &Query) joinOrder(ms: &[][]Expr): []int {
+    let nl = len(q.levels)
+    for lv in q.levels { if isOuter(lv.join) || lv.lateral { return [] } }
+    var cs: []Expr = []
+    for m in ms { for c in m { append(mut &cs, clone(&c)) } }
+    var placed: []bool = array(nl, false)
+    var start = -1
+    for k in 0..nl { if start < 0 && q.bindOf(k, &cs, &placed) == 3 { start = k } }
+    if start < 0 { return [] }
+    var out: []int = [start]
+    placed[start] = true
+    while len(out) < nl {
+        var best = -1
+        var bb = -1
+        for k in 0..nl {
+            if placed[k] { continue }
+            let b = q.bindOf(k, &cs, &placed)
+            if b > bb {
+                bb = b
+                best = k
+            }
+        }
+        placed[best] = true
+        append(mut &out, best)
+    }
+    for i in 0..nl { if out[i] != i { return out } }
+    return []
+}
+
+// How the conjuncts cs bind level k's rows to the placed levels' (or to
+// constants and parameters): 3 a unique key (the primary key or a unique
+// index, not filtered) all equal: a row at most; 2 the leading column of a
+// key or an index equal: a lookup; 1 another column equal: a hash join; 0
+// none.
+fn (q: &Query) bindOf(k: int, cs: &[]Expr, placed: &[]bool): int {
+    let lv = &q.levels[k]
+    var got = 0
+    for ci in 0..len(lv.t.cols) {
+        if got == 0 && q.eqBound(cs, &(lv.alias + "." + lv.t.cols[ci].name), k, placed) { got = 1 }
+    }
+    if lv.virt() { return got }
+    for c0 in 0..len(lv.t.indexes) + 1 {
+        let c = c0 - 1
+        if c >= 0 && lv.t.indexes[c].pred.isSome() { continue }
+        let cols = keyCols(&lv.t, c)
+        var n = 0
+        for ci in cols {
+            if ci < 0 || !q.eqBound(cs, &(lv.alias + "." + lv.t.cols[ci].name), k, placed) { break }
+            n += 1
+        }
+        if n > 0 && n == len(cols) && (c < 0 || lv.t.indexes[c].unique) { return 3 }
+        if n > 0 { got = 2 }
+    }
+    return got
+}
+
+// Whether a conjunct makes column name (level k's) equal to a value of the
+// placed levels only, or of none.
+fn (q: &Query) eqBound(cs: &[]Expr, name: &str, k: int, placed: &[]bool): bool {
+    for c in cs {
+        match c {
+            Expr.Bin(op, a, b) {
+                if op == "=" {
+                    match a { Expr.Col(x) { if x == name && q.onlyPlaced(&b, k, placed) { return true } } else {} }
+                    match b { Expr.Col(x) { if x == name && q.onlyPlaced(&a, k, placed) { return true } } else {} }
+                }
+            }
+            else {}
+        }
+    }
+    return false
+}
+
+fn (q: &Query) onlyPlaced(x: &Expr, k: int, placed: &[]bool): bool {
+    if hasCorr(x) { return false }
+    var ns: []str = []
+    colNames(x, mut &ns)
+    for n in ns {
+        let l = q.levelOf(&n)
+        if l < 0 || l == k || !placed[l] { return false }
+    }
+    return true
+}
+
 // The rules (4.8): the whole primary key equal; then a unique index whose
 // columns are all equal; then the most leading equalities, then a range on
 // the next column; the primary key wins a tie. Nothing: a full scan.
 //
-// With ANALYZE's statistics (9.57) the estimates decide between the
+// With ANALYZE's statistics (optimizer 24) the estimates decide between the
 // candidates, not only their ties: the fewest reads (figCost) wins, a tie by
 // the rules' order. The rules still decide
 // - a whole-key equality on the primary key or a unique index (one row);
@@ -5032,7 +5142,7 @@ fn choosePath(q: &Query, k: int, cs: &[]Expr, params: &[]Val, lk: mut &[]Look): 
     var scores: []int = []
     var figs: []Fig = []
     var outer: []bool = []
-    var looks: []Look = []              // per candidate: its estimate's look if a parameter set it (9.56); kind -1 none
+    var looks: []Look = []              // per candidate: its estimate's look if a parameter set it (optimizer 23); kind -1 none
     var best = -1
     for c0 in 0..len(lv.t.indexes) + 1 {
         let c = c0 - 1
@@ -5083,7 +5193,7 @@ fn choosePath(q: &Query, k: int, cs: &[]Expr, params: &[]Val, lk: mut &[]Look): 
         if score == 0 { continue }
         let p = Path{index: c, eqs: eqs, rng: rng, desc: false, noNulls: false, ins: ins, inSub: inSub, inArr: inArr}
         let f = pathFig(lv, &p, params)
-        // the first equality's value set the figure: a look (9.56)
+        // the first equality's value set the figure: a look (optimizer 23)
         var lo = Look{kind: -1, c: Expr.Lit(Val.Null), p: Expr.Lit(Val.Null), out: 0, typ: noType(), cm: noCommon()}
         if f.rows >= 0 && len(p.eqs) >= 1 && !hasIn && score < 999 {
             let byParam = match p.eqs[0] { Expr.Param(_) { true } else { false } }
@@ -5402,8 +5512,10 @@ fn newLevel(t: Table, alias: str, join: int, first: int): Level {
 // Plans a query over the tables of FROM (4.8): the tables are joined in the
 // order written, and each WHERE conjunct is checked at the first table
 // where all its columns are known.
+// order: the tables of inner joins may run in another order than FROM's
+// (a SELECT's; UPDATE ... FROM and DELETE ... USING keep their target first).
 fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_sql.FromItem,
-              where: &Option[Expr], params: &[]Val, subs: &[]lexdb_sql.Stmt, sc: mut &Scope): Result[Query, DbErr] {
+              where: &Option[Expr], params: &[]Val, subs: &[]lexdb_sql.Stmt, sc: mut &Scope, order: bool): Result[Query, DbErr] {
     var q = Query{levels: [], cols: [], top: [], subs: [], base: sc.base, corr: false, refs: []}
     // a subquery in FROM is planned first: it sees the queries around this
     // one, not this one's tables
@@ -5654,6 +5766,28 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
         }
         None {}
     }
+    if order && nl >= 2 && !txn.rules {
+        // the join order (optimizer 25): the conjuncts go again to the latest table
+        // they use, in the new order
+        let perm = q.joinOrder(&ms)
+        if len(perm) == nl {
+            var pool: []Expr = []
+            for k in 0..nl {
+                var xs = replace(mut &ms[k], [])
+                for i in 0..len(xs) { append(mut &pool, replace(mut &xs[i], Expr.Lit(Val.Null))) }
+            }
+            var lvs: []Level = []
+            for i in 0..nl { append(mut &lvs, replace(mut &q.levels[perm[i]], newLevel(noTable(), "", 0, 0))) }
+            q.levels = lvs
+            for i in 0..nl { q.levels[i].join = if i == 0 { lexdb_sql.J_FIRST } else { lexdb_sql.J_INNER } }
+            for i in 0..len(pool) {
+                let c = replace(mut &pool[i], Expr.Lit(Val.Null))
+                var k = q.maxLevel(&c)
+                if k < 0 { k = 0 }
+                append(mut &ms[k], c)
+            }
+        }
+    }
     if q.corr {
         // a correlated subquery runs per row: its conjuncts go last
         for k in 0..nl {
@@ -5813,7 +5947,7 @@ fn tryRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Mats
     return Ok(1)
 }
 
-// The index-to-scan switch (9.53) is decided by counting, before any row is
+// The index-to-scan switch (optimizer 19) is decided by counting, before any row is
 // read. An index entry costs about two reads (the entry, then its row by
 // primary key) and a scanned row one, so a scan is cheaper when the range
 // holds more than half the table. A range of at most SWITCH_ENTRIES entries
@@ -5984,7 +6118,7 @@ fn runLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Ma
                 scans = try pathScans(&lv.t, &lv.path, &env)
             }
         }
-        // 9.53: the first table's index range may be run as a scan, decided by
+        // optimizer 19: the first table's index range may be run as a scan, decided by
         // counting before any row is read (indexOrScan), so nothing returned
         // needs skipping. Not for:
         // - a path chosen for its order (ORDER BY, MIN/MAX);
@@ -6142,7 +6276,7 @@ pub type Scope = record {
     asRole: []str
     whos: []Who
     target: str
-    looks: []Look               // the planning's looks at parameters' values (9.55)
+    looks: []Look               // the planning's looks at parameters' values (optimizer 22)
 }
 
 type Work = record { id: int; cols: []lexdb_sql.ColDef }
@@ -6227,7 +6361,7 @@ fn planSub(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
            sc: mut &Scope): Result[SubPlan, DbErr] {
     var sel = try planSelect(st, txn, s, params, sc)
     // EXISTS stops at its first row, a scalar at its second (runSub): its
-    // first table's reading may stop early, so no switch to a scan (9.53)
+    // first table's reading may stop early, so no switch to a scan (optimizer 19)
     if len(sel.q.levels) > 0 && (s.use == lexdb_sql.SUB_EXISTS || (s.use == lexdb_sql.SUB_SCALAR && !sel.aggQ)) { sel.q.levels[0].stops = true }
     if len(s.srf) > 0 { sel.outs = try srfCols(&s.srf, s.ordin, &sel.outs) }
     if s.use == lexdb_sql.SUB_IN && len(sel.outs) != 1 { return Err(e("42601", "subquery has too many columns")) }
@@ -6948,7 +7082,7 @@ fn subLines(q: &Query, stats: &[]SubStat, out: mut &[]str) {
     }
 }
 
-// A level's figure (9.56, 9.57): "" when none.
+// A level's figure (optimizer 23, optimizer 24): "" when none.
 fn estText(lv: &Level): str {
     if lv.estRows < 0 { return "" }
     return if lv.estMax { " (at most " } else { " (estimated " } + lv.estRows.toStr() + " rows)"
@@ -7840,7 +7974,7 @@ fn dropOne(txn: mut &lexdb_store.Txn, t: &Table) {
     }
     txn.dropTree(t.tree)
     txn.del(CATALOG, t.name)
-    txn.del(CATALOG, statKey(&t.name))         // its statistics (9.54)
+    txn.del(CATALOG, statKey(&t.name))         // its statistics (optimizer 20)
 }
 
 // ---- column defaults (9.38)
@@ -8128,7 +8262,7 @@ fn retype(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, chan
     let noWhere: Option[Expr] = None
     let noParams: []Val = []
     let noSubs: []lexdb_sql.Stmt = []
-    var q = try buildQuery(st, txn, &oneTable(&t.name), &noWhere, &noParams, &noSubs, mut &sc)
+    var q = try buildQuery(st, txn, &oneTable(&t.name), &noWhere, &noParams, &noSubs, mut &sc, false)
     var xs: []Expr = []
     for ch in changes {
         let x = match ch.using {
@@ -8142,7 +8276,7 @@ fn retype(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, chan
     var found: [][]Val = []
     var rs = newRun(&q)
     rs.limit(&lim)
-    rs.writes = true                // 9.53: a write keeps its index paths (its read set)
+    rs.writes = true                // optimizer 19: a write keeps its index paths (its read set)
     let m = try prepare(st, txn, &q, &noParams, mut &rs)
     let room = rs.room()
     let max = rs.maxHeld
@@ -8917,7 +9051,7 @@ fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     let noFrom: []lexdb_sql.FromItem = []
     let noWhere: Option[Expr] = None
     let from = if len(s.items) > 0 { oneTable(&s.table) } else { noFrom }
-    var q = try buildQuery(st, txn, &from, &noWhere, params, &s.subs, mut &sc)
+    var q = try buildQuery(st, txn, &from, &noWhere, params, &s.subs, mut &sc, false)
     var rows: [][]Expr = []
     let resolved = len(s.subs) > 0 || len(s.items) > 0
     if resolved && len(s.inner) == 0 {
@@ -8932,7 +9066,7 @@ fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     endScope(mut &sc, mut &q)
     var rs = newRun(&q)
     rs.limit(&lim)
-    rs.writes = true                // 9.53: a write keeps its index paths (its read set)
+    rs.writes = true                // optimizer 19: a write keeps its index paths (its read set)
     let m = try prepare(st, txn, &q, params, mut &rs)
     var kept: [][]Val = []
     var count = 0
@@ -9251,7 +9385,7 @@ fn update(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     let sqe = seqEnv(st, txn)
     var sc = newScope(params, &[])
     sc.target = try catKey(st, txn, &s.table, false)
-    var q = try buildQuery(st, txn, &(try dmlFrom(s)), &s.where, params, &s.subs, mut &sc)
+    var q = try buildQuery(st, txn, &(try dmlFrom(s)), &s.where, params, &s.subs, mut &sc, false)
     var targets: []int = []
     var sets: []Expr = []
     for set in s.sets {
@@ -9268,7 +9402,7 @@ fn update(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     var found: [][]Val = []
     var rs = newRun(&q)
     rs.limit(&lim)
-    rs.writes = true                // 9.53: a write keeps its index paths (its read set)
+    rs.writes = true                // optimizer 19: a write keeps its index paths (its read set)
     var m = try prepare(st, txn, &q, params, mut &rs)
     let room = rs.room()
     let max = rs.maxHeld
@@ -9327,14 +9461,14 @@ fn delete(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     try dmlCheck(st, txn, s, &"d")
     var sc = newScope(params, &[])
     sc.target = try catKey(st, txn, &s.table, false)
-    var q = try buildQuery(st, txn, &(try dmlFrom(s)), &s.where, params, &s.subs, mut &sc)
+    var q = try buildQuery(st, txn, &(try dmlFrom(s)), &s.where, params, &s.subs, mut &sc, false)
     var ret = try retOf(s, &q, mut &sc)
     endScope(mut &sc, mut &q)
     let t = &q.levels[0].t
     var found: [][]Val = []
     var rs = newRun(&q)
     rs.limit(&lim)
-    rs.writes = true                // 9.53: a write keeps its index paths (its read set)
+    rs.writes = true                // optimizer 19: a write keeps its index paths (its read set)
     var m = try prepare(st, txn, &q, params, mut &rs)
     let room = rs.room()
     let max = rs.maxHeld
@@ -9387,7 +9521,7 @@ fn explain(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, x: &lexdb_sql.Stmt
         lines = selLines(&sel, &none, &noStats)
     } else {
         var sc = newScope(params, ptypes)
-        var q = try buildQuery(st, txn, &(try dmlFrom(s)), &s.where, params, &s.subs, mut &sc)
+        var q = try buildQuery(st, txn, &(try dmlFrom(s)), &s.where, params, &s.subs, mut &sc, false)
         endScope(mut &sc, mut &q)
         lines = explainLines(&q, &none)
         let noStats: []SubStat = []
@@ -9758,7 +9892,7 @@ fn evalInt(x: &Option[Expr], params: &[]Val, what: str, lk: mut &[]Look): Result
                 }
                 else {}
             }
-            // a look (9.55): the plan keeps the value
+            // a look (optimizer 22): the plan keeps the value
             if !lit { append(lk, Look{kind: 1, c: clone(&v), p: Expr.Lit(Val.Null), out: n, typ: noType(), cm: noCommon()}) }
             return Ok(n)
         }
@@ -9812,7 +9946,7 @@ fn select(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
           lim: Limits, pc: mut &PlanCache): Result[Res, DbErr] {
     // A prepared statement's plans, kept while the schema the transaction
     // sees is the same (and the statistics and the planner's mode): one per
-    // outcome of the looks at its parameters' values (9.55), the first whose
+    // outcome of the looks at its parameters' values (optimizer 22), the first whose
     // looks the parameters give again taken.
     var ver = try catVersion(st, txn)
     if len(txn.path) > 0 { ver = ver + "|" + strings.join(&txn.path, ",") }      // its names resolved by the path
@@ -9830,7 +9964,7 @@ fn select(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
         Some(r) { if len(r) > 0 { ver = ver + "|s" + r } }
         None {}
     }
-    if txn.rules { ver = ver + "|rules" } else { ver = ver + "|" + (try statVersion(st, txn)) }   // 9.54
+    if txn.rules { ver = ver + "|rules" } else { ver = ver + "|" + (try statVersion(st, txn)) }   // optimizer 20
     if pc.ver != ver {
         pc.sels = []
         pc.looks = []
@@ -9849,7 +9983,7 @@ fn select(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     return runSel(st, txn, &pc.sels[len(pc.sels) - 1], params, lim)
 }
 
-// The plans a prepared statement keeps at most (9.55): past them, a run with
+// The plans a prepared statement keeps at most (optimizer 22): past them, a run with
 // parameters none of them fits is planned and not kept.
 const PLAN_VARIANTS: int = 4
 
@@ -10463,7 +10597,7 @@ type SelLock = value record { level: int; at: int; n: int; mode: int; wait: int 
 fn (q: &Query) firstCol(x: &Expr): int {
     match x {
         Expr.Col(n) {
-            if q.levelOf(&n) == 0 { return colIndex(&q.cols, &n) }
+            if q.levelOf(&n) == 0 { return colIndex(&q.cols, &n) - q.levels[0].first }
         }
         else {}
     }
@@ -10664,7 +10798,7 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         if len(s.wins) > 0 { return Err(e("0A000", what + "window functions")) }
     }
     if s.setop != 0 { return planSet(st, txn, s, params, sc) }
-    var q = try buildQuery(st, txn, &s.from, &s.where, params, &s.subs, sc)
+    var q = try buildQuery(st, txn, &s.from, &s.where, params, &s.subs, sc, true)
     if s.kind == lexdb_sql.S_SELECT { narrow(mut &q, s) }
     if s.lockMode > 0 { try applyLocks(mut &q, s) }
     var exprs: []Expr = []
@@ -10838,7 +10972,7 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
                 setIndex = ix
                 setDesc = dir == 1
                 if mm >= 0 {
-                    first = mm
+                    first = mm + q.levels[0].first        // its place in the joined row
                     // MIN and MAX skip NULLs: an index whose next column it is need not read them
                     let key = keyCols(t, ix)
                     setNoNulls = ix >= 0 && len(path.eqs) < len(key) && key[len(path.eqs)] == mm
@@ -10858,7 +10992,7 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         q.levels[0].estMax = er.bound
     }
     // a LIMIT may stop the first table's reading early, unless a sort or the
-    // grouping reads it all first: the switch stays off (9.53)
+    // grouping reads it all first: the switch stays off (optimizer 19)
     if limit >= 0 && !aggQ && !sort && len(q.levels) > 0 { q.levels[0].stops = true }
     // A grouped query: its aggregate calls become accumulators, and its
     // columns must be grouped.
@@ -11615,9 +11749,9 @@ fn guessParams(st: &lexdb_store.Store, s: &lexdb_sql.Stmt, out: mut &[]int, path
     let np: []Val = array(len(out), Val.Null)
     let noTypes: []int = []
     var sc = newScope(&np, &noTypes)
-    let built = if s.kind == lexdb_sql.S_SELECT { buildQuery(st, mut &txn, &s.from, &s.where, &np, &s.subs, mut &sc) } else {
+    let built = if s.kind == lexdb_sql.S_SELECT { buildQuery(st, mut &txn, &s.from, &s.where, &np, &s.subs, mut &sc, false) } else {
         match dmlFrom(s) {
-            Ok(from) { buildQuery(st, mut &txn, &from, &s.where, &np, &s.subs, mut &sc) }
+            Ok(from) { buildQuery(st, mut &txn, &from, &s.where, &np, &s.subs, mut &sc, false) }
             Err(x) { Err(x) }
         }
     }
@@ -11694,7 +11828,7 @@ fn describe(st: &lexdb_store.Store, s: &lexdb_sql.Stmt, ptypes: &[]int, path: &[
         let np: []Val = array(if s.params > len(ptypes) { s.params } else { len(ptypes) }, Val.Null)
         var sc = newScope(&np, ptypes)
         let from = if s.kind == lexdb_sql.S_INSERT { oneTable(&s.table) } else { try dmlFrom(s) }
-        let q = try buildQuery(st, mut &txn, &from, &none, &np, &s.subs, mut &sc)
+        let q = try buildQuery(st, mut &txn, &from, &none, &np, &s.subs, mut &sc, false)
         var exprs: []Expr = []
         return itemCols(&s.items, true, &q.cols, mut &sc, mut &exprs)
     }
@@ -11709,7 +11843,7 @@ fn describe(st: &lexdb_store.Store, s: &lexdb_sql.Stmt, ptypes: &[]int, path: &[
     let none: Option[Expr] = None
     let np: []Val = array(if s.params > len(ptypes) { s.params } else { len(ptypes) }, Val.Null)
     var sc = newScope(&np, ptypes)
-    let q = try buildQuery(st, mut &txn, &s.from, &none, &np, &s.subs, mut &sc)
+    let q = try buildQuery(st, mut &txn, &s.from, &none, &np, &s.subs, mut &sc, false)
     var exprs: []Expr = []
     return selectCols(s, &q.cols, mut &sc, mut &exprs)
 }
@@ -11730,7 +11864,7 @@ pub type Session = record {
     savedPath: [][]str          // in a transaction block: the path at its BEGIN
     id: int                     // its number while the store is open (its sequences' currval: 9.43)
     batch: bool                 // SET lexdb_batch (9.47)
-    rules: bool                 // SET lexdb_planner = rules: no statistics in planning (9.54)
+    rules: bool                 // SET lexdb_planner = rules: no statistics in planning (optimizer 20)
     saves: []SavePt             // the open block's savepoints, oldest first (9.80)
     savedRoles: []str           // in a transaction block: SET ROLE's and SET SESSION AUTHORIZATION's at its BEGIN (9.83)
     custom: []str               // the settings with a dot in their names (SET my.x, set_config): "name\x00value" (9.92)
@@ -12474,7 +12608,7 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
                 s.resetAll()
             } else if stmt.table == "lexdb_planner" {
                 // cost (the default): statistics from ANALYZE break the rules'
-                // ties; rules: they are not read (9.54)
+                // ties; rules: they are not read (optimizer 20)
                 var rules = false                   // DEFAULT, RESET
                 match stmt.limit {
                     Some(x) {
@@ -12692,7 +12826,7 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
         // run again (design/lexdb.md 9.15). A snapshot whose old versions
         // went over their budget (72000) is tried again on a new one.
         // (a SELECT that locks reads the latest, as UPDATE does). EXPLAIN
-        // too (9.53): EXPLAIN ANALYZE runs only a SELECT, and on the same
+        // too (optimizer 19): EXPLAIN ANALYZE runs only a SELECT, and on the same
         // kind of transaction as the SELECT it shows, so that it shows what
         // the SELECT does (the index-to-scan switch is off where reads are
         // noted); EXPLAIN alone writes nothing
