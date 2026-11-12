@@ -40,8 +40,8 @@ primary-key statistics (24); the join order bound by keys (25) and by cost
 (26); implied equalities (27); SQLite's N-best search (28); the join-order
 review's fixes with filter and range estimates (29); the search to 24
 tables (30); the integration with lexdb 9.94 (31); ORDER BY ... LIMIT read
-in order (32); and the second review's fixes (33, uncommitted). Code
-comments cite these sections as "optimizer N".
+in order (32); the second review's fixes (33); and a workload comparison
+(34). Code comments cite these sections as "optimizer N".
 
 ## 1. Summary
 
@@ -1872,6 +1872,59 @@ Its findings, all fixed, with cases in `exec_joinreview` and
 **Checked after the fixes:** the review's random joins again, 6,616
 queries over six seeds with ANALYZE, against the rules mode: 0 differences.
 The suite: 92 of 92.
+
+## 34. A workload: cost against rules (2026-11-12)
+
+The user's go-ahead for a load test. `design/experiments/workload.lxl`
+builds a TPC-H-like schema in one process, with everything in the cache,
+so the times are the plans' CPU: 5 regions, 25 nations, 1,000 suppliers,
+20,000 customers, 20,000 parts, 80,000 partsupp rows, 200,000 orders and
+800,000 lineitems, with indexes on the usual foreign keys, dates and
+brand. Loading took 22.7 s and ANALYZE 0.6 s. It runs 14 queries under
+both planners: the median of 5 runs after a warm-up, both plans, and a
+checksum of the rows. Idle machine.
+
+| Query | Cost (us) | Rules (us) | What |
+|---|---|---|---|
+| Q1 | 53 | 32 | an order's lines and parts |
+| Q2 | 24 | 20 | a customer's last 10 orders |
+| Q3 | 139 | 110 | a customer's orders, lines, parts |
+| Q4 | 42 | 30 | a part's cheapest supplier |
+| Q5 | 38 | 918,140 | an order's lines, FROM lists lineitem first |
+| Q6 | 105 | 1,655,115 | count of a customer's lines, FROM lists lineitem first |
+| Q7 | 36,099 | 1,399,973 | revenue by nation for a month |
+| Q8 | 41,436 | 297,281 | a 6-table local-supplier report for a month |
+| Q9 | 63,135 | 42,327 | a brand's lines shipped in a month |
+| Q10 | 67,159 | 67,035 | top customers of a segment for a quarter |
+| Q11 | 111,052 | 110,967 | status, quantity and size filters |
+| Q12 | 70,385 | 1,049,675 | a 5-table filtered count |
+| Q13 | 11,395 | 10,202 | EXISTS: a nation's customers with a recent order |
+| Q14 | 641 | 616 | a brand's 20 latest lines (ORDER BY ... LIMIT) |
+| **total** | **401,703** | **5,551,523** | |
+
+**Every query returned the same rows under both planners.**
+
+**Where the cost planner wins.** Q5 and Q6 are written with a poor FROM
+order; the rules scan 800,000 lineitems where the cost plan starts from the
+pinned order or the customer's orders. Q7, Q8 and Q12 are reports that the
+rules start from lineitem. Overall the cost plans take 14 times less time.
+
+**Where it loses.**
+- **Q9, 1.5 times slower.** It starts from the brand's 800 parts and looks
+  up their 32,000 lineitems, where the rules read a month of lineitems by
+  date (about 16,000) and look up each part. The model's two costs are
+  within a few percent of each other, so it is a calibration question: an
+  index entry's lookup and a range read are both priced at two reads per
+  row, and they are not equal in practice.
+- **Q1 to Q4, 4 to 30 us slower.** The plans are the same or equivalent.
+  The difference is planning: these are not prepared, so each run loads the
+  tables' statistics and runs the cost search. A prepared statement keeps
+  its plan and pays this once. A fast path would remove most of it: when
+  the order bound by keys (section 25) starts from a pinned row, take it
+  without loading statistics or searching.
+
+**Next, from this.** The fast path for pinned joins; calibrating the read
+costs (index entry, row by key, range) against measurements such as Q9's.
 
 ## Sources
 
