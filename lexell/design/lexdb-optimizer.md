@@ -39,9 +39,9 @@ outcome (22); per-value estimates (23); estimates deciding beyond ties and
 primary-key statistics (24); the join order bound by keys (25) and by cost
 (26); implied equalities (27); SQLite's N-best search (28); the join-order
 review's fixes with filter and range estimates (29); the search to 24
-tables (30); the integration with lexdb 9.94 (31); and ORDER BY ... LIMIT
-read in order (32, uncommitted). Code comments cite these sections as
-"optimizer N".
+tables (30); the integration with lexdb 9.94 (31); ORDER BY ... LIMIT read
+in order (32); and the second review's fixes (33, uncommitted). Code
+comments cite these sections as "optimizer N".
 
 ## 1. Summary
 
@@ -1820,6 +1820,58 @@ that gives the order, and the LIMIT stops the scan.
   where it has 1;
 - by hand, a filter with its own index on big (`b.v = 2`): small first and
   a sort, since big's way is not a full scan.
+
+## 33. Second review and fixes (2026-11-12)
+
+A Fable review of sections 27 to 31, at d745d52f. It compared the cost
+planner with the rules mode, with and without ANALYZE, on about 6,000
+random joins of 2 to 25 tables and a few hundred targeted queries: type
+kinds, char(n), parameters, range estimates, ANALYZE through `maint`, and
+the search sizes 8, 9, 24 and 25. Implied equalities, the N-best search,
+`keyVal`, the range estimates and the new ANALYZE gave no wrong results.
+Its findings, all fixed, with cases in `exec_joinreview` and
+`exec_plancache`:
+
+1. **Wrong rows or a crash** (from section 29's batch fix). When the cost
+   order put a table that FROM did not list first at level 0, and it was read
+   in batches, a text, numeric or date comparison or a LIKE on it tested the
+   column at the joined row's place, not the table's: rows were dropped, or
+   the process stopped (index out of range). `bValCol` now offsets by the
+   level's place, as section 29 did for `bCompile`. The suite had not
+   covered it: a reordered first table with a non-integer condition.
+2. **A plan made outside a block was reused in a block that notes its
+   reads**, so the hash over a whole table came back, and with it the
+   serialization failures of section 29. The plan cache's key now records
+   whether reads are noted.
+3. **A hashed table dropped its constant range** when its key column was
+   also joined (`dim.k = ev.k and dim.k < 10`). The path with the join
+   equality was discarded for a read-once table, and the range never tried,
+   so the table was read whole. A read-once table's path now takes only the
+   bounds that are the same for every outer row (`onceBounds`): 9 rows read,
+   not 20,000.
+4. **"May stop early" was set for queries that read everything:** an
+   aggregate, grouped or DISTINCT scalar subquery, a `count(*) ... LIMIT 1`.
+   It now needs a statement that does not gather its rows first
+   (`stmtGathers`), so such a join is planned as the same query alone.
+
+**Not fixed (minor, from the review).**
+- A range bound out of the column's type (`int_col < 3000000000`) is still
+  an error, in both modes and before this branch. PostgreSQL returns all
+  rows.
+- `int_col = '3000000000'` (an untyped literal) returns no rows where
+  PostgreSQL raises 22003. lexdb behaves the same on unindexed columns.
+- ANALYZE (now also VACUUM ANALYZE) is refused in a read-only transaction.
+  PostgreSQL allows it, but lexdb's ANALYZE writes the statistics rows.
+- For ill-typed queries, the error code can differ between the cost and
+  rules modes (42883 against 22P02). Both are errors.
+- `SET LOCAL lexdb_planner` does not show as set.
+- One 24-table random join on non-key columns hit a 1 s timeout under the
+  cost planner, where the FROM order reached an empty join early. One case
+  in 12 such queries; not explained.
+
+**Checked after the fixes:** the review's random joins again, 6,616
+queries over six seeds with ANALYZE, against the rules mode: 0 differences.
+The suite: 92 of 92.
 
 ## Sources
 
