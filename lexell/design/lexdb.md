@@ -6946,7 +6946,8 @@ several at its end).
 - CREATE TABLE AS's typmods;
 - a very large CREATE TABLE AS holds its result in memory while it
   inserts;
-- TEMPORARY tables (the word is accepted by SELECT INTO and ignored).
+- TEMPORARY tables (the word is accepted by SELECT INTO and ignored). Done
+  in 9.96.
 
 ### 9.89 Indexes on expressions
 
@@ -7861,7 +7862,7 @@ offset, in UTC: the form is the same whatever the zone that stored them.
 - `time with time zone` is still refused, so `current_time` is a time;
 - zones with leap seconds (`right/UTC`) are accepted where PostgreSQL
   refuses them;
-- `DISCARD ALL` does not reset the zone;
+- `DISCARD ALL` does not reset the zone (9.96: it does now);
 - a view's definition shows AT TIME ZONE as `timezone(z, x)`;
 - the startup check comes before authentication.
 
@@ -7918,3 +7919,212 @@ Found on the way:
 - `timezone(zone, timetz)`;
 - `pg_timezone_names`;
 - the zone in the places listed as UTC above.
+
+### 9.96 Temporary tables
+
+From tier 2 of design/lexdb-gaps.md. `CREATE TEMP TABLE` was refused, and
+`SELECT ... INTO TEMPORARY t` made a permanent table without a word (9.88).
+
+**The statements:**
+- `CREATE [GLOBAL | LOCAL] {TEMPORARY | TEMP} TABLE [IF NOT EXISTS] t (...)
+  [ON COMMIT PRESERVE ROWS | DELETE ROWS | DROP]`, with all a table has:
+  keys, the hidden key of a keyless table (9.88), defaults, serial and
+  identity columns, CHECK, UNIQUE, foreign keys, indexes on columns and on
+  expressions, ALTER TABLE, COPY. GLOBAL is accepted; PostgreSQL's warning
+  is not sent (lexdb sends no notices).
+- `CREATE TEMP TABLE t [(names)] [ON COMMIT ...] AS query`, `SELECT ...
+  INTO [GLOBAL | LOCAL] TEMP[ORARY] [TABLE] t`.
+- `CREATE TEMP SEQUENCE`, `CREATE [OR REPLACE] TEMP VIEW`. A view that reads
+  a temporary relation is temporary, as in PostgreSQL (without its
+  NOTICE); named in a permanent schema it is 42P16.
+- `CREATE TABLE pg_temp.t` makes a temporary table, as PostgreSQL does.
+- `DISCARD TEMP | ALL | PLANS | SEQUENCES`. DISCARD ALL drops the
+  temporary objects, does RESET ALL and releases the advisory locks; in a
+  block it is 25001. PLANS and SEQUENCES do nothing (kept plans follow the
+  catalog anyway; currval is kept).
+- `CREATE UNLOGGED TABLE` is accepted, as a table like any (logged), as
+  SELECT INTO UNLOGGED was.
+
+**The temporary schema.** A session's temporary objects are in its own
+schema, `pg_temp_N`, N its number (`Session.id`). It is made when the
+session first makes one (`useTmp`) and stays to the session's end, as
+PostgreSQL's does.
+- Statements carry it (`Txn.tmp`, set with the path in `runStmt` and at
+  BEGIN), and their path starts with it (`withTmp`, `Session.txnPath`), so
+  for relations it is searched first and a temporary table hides a
+  permanent one of its name. A path that names `pg_temp` puts it there
+  instead.
+- New unqualified permanent names never go in it (`createSchema`).
+- `pg_temp.t` names it (`tmpQual`). Another session's (`pg_temp_7.t`) is
+  0A000 `cannot access temporary tables of other sessions` when it holds
+  the name, as PostgreSQL's (its DROP too, which PostgreSQL allows its
+  owner), 42P01 otherwise.
+- **`public.t` as written.** The parser made `public.t` the key `t`, so a
+  temporary `t` found first on the path would have hidden it. Where a
+  statement reads or writes a relation (FROM, INSERT, UPDATE, DELETE,
+  COPY, TRUNCATE, DROP TABLE and VIEW, ALTER TABLE, CREATE INDEX ON, and
+  CREATE TABLE, VIEW and SEQUENCE), the name is now kept as written
+  (`lexdb_sql.rname`, `public` QSEP `t`), and the executor's lookups make it
+  `t` (`catKey`, `findSeq`, `createKey`). This also fixes `public.t` with
+  another schema's `t` earlier on the path (9.20 found that one).
+- Types are not looked up there (`CREATE TYPE pg_temp.x` is 0A000); lexdb
+  has no user functions.
+
+**Where they are kept: the catalog and the store, logged.** A temporary
+object is catalog rows and trees like a permanent one, under its schema's
+keys: `pg_temp_N` QSEP name, and the index, sequence and owner rows after
+`\x01`, `\x04` and `ACL_PRE r:` (`lexdb_base.tempCatKey`). Its writes go
+through the log, checkpoints and the cache like any.
+- Why: it needed nothing new below the catalog, and every path (snapshots,
+  savepoints, large values, COPY, row locks, ROLLBACK) works for it as it
+  is. Unlogged trees would need the store to keep trees out of the log
+  and the checkpoint, and recovery and the replicas to know of them.
+- The cost: temporary writes are as durable as any. A temporary DDL commit
+  waits for a log flush (a permanent one does too), as does an autocommit
+  write to a temporary table. PostgreSQL writes no WAL for them. Their
+  writes also fill the commit check's write log (`WLOG_MAX`, 9.19) and the
+  cache like any.
+- **Crash and restart.** Session numbers are counted in memory from 1 at
+  each start (they are not reused while the store is open), so a new
+  session 1 would meet a crashed session 1's leftovers. `bootstrap` drops
+  every temporary schema's objects when the store opens (`dropLeftTemps`),
+  in one transaction, before any session runs. That covers a crash and a
+  server stopped with sessions open (its connections are cut off without
+  `Session.close`).
+- **Replicas** follow the log, so they get the rows and trees, and the
+  master's drops. A replica refuses to make temporary objects, as it
+  refuses any write (25006): its sessions have none, so none of the
+  master's is on their path, `pg_temp_N.t` is 0A000 there, and catalog
+  scans leave them out. DISCARD TEMP there drops nothing.
+
+**Catalog contention: temporary DDL does not disturb other sessions.**
+DDL bumps the catalog's version, one row (`CAT_VERSION`). Statements read
+it: a kept plan's key (`select`), and the catalog summary of a statement
+with a catalog relation or function (`bindCatalog`). A read-write block
+that read it fails at COMMIT (40001) once another commit wrote it, and
+every session's kept plans are made again. Applications that make a
+temporary table per request would make every other session's blocks fail.
+So:
+- **Temporary DDL bumps only its session's version** (`bumpFor`,
+  `tmpBump`): a count in the memo (`tmpVerKey`), part of the session's plan
+  keys and of the wire's description version (`pathVersion`). A ROLLBACK
+  (or ROLLBACK TO, or a failed commit) of a transaction that did such DDL
+  bumps it again (`tmpUndo`), since the memo is not undone.
+- **Their rows are under keys no other session reads.** The scans of the
+  whole catalog (`catSnap`, `bindCatalog`'s owners, `allSeqs`) go round the
+  range of every `pg_temp_` key (`catScan`): they read it quietly (not
+  noted for the commit's check) and leave out other sessions' rows.
+  Point reads only ever name the session's own keys, or another's by an
+  explicit `pg_temp_N`.
+- **The wire's catalog change count** (`Store.changes`, which keeps
+  descriptions, 9.17) does not count temporary keys.
+- **Temporary DDL reads only its own keys** (and roles and owners): a
+  temporary relation's dependent views are looked for in its schema only
+  (`dependentViews`), its owned sequences likewise (`dropOwnedSeqs`), and
+  a temporary sequence's id does not read the catalog's version. So other
+  sessions' permanent DDL does not make it fail either, except through
+  roles and grants.
+- **Measured** (`exec_tempsessions`): four sessions run 30 read-write
+  blocks each (a read, a pg_class count, an update of their own row) while
+  a fifth makes and drops temporary tables, indexes, views and sequences
+  in 60 rounds. None fails. With temporary DDL bumping the shared version,
+  108 of the 120 blocks failed (40001); with the catalog scans not going
+  round the temporary range, 108 too.
+
+**ON COMMIT.** A temporary table keeps DELETE ROWS or DROP in its catalog
+row (`Table.onCommit`, a last byte). The session keeps the DELETE ROWS
+tables' keys (`Session.onCommit`), and the transaction the ones it made
+(`Txn.onCommit`). Before a commit that wrote (`onCommitDo`, in `runStmt`):
+- ON COMMIT DROP tables are dropped (with their views), so one made in a
+  block lasts to its end, and one made outside a block is gone at once;
+- ON COMMIT DELETE ROWS tables that hold rows get new, empty trees, as
+  TRUNCATE (9.91), the old ones freed with the commit. A table that is
+  not DELETE ROWS referencing one that is: 0A000 `unsupported ON COMMIT
+  and foreign key combination` at the commit, as in PostgreSQL;
+- a ROLLBACK drops nothing it did not make, and empties nothing.
+
+**PostgreSQL's restrictions, its SQLSTATEs:**
+- a foreign key from a temporary table to a permanent one, or back: 42P16
+  `constraints on temporary tables may reference only temporary tables`
+  (and `permanent ... permanent`);
+- `CREATE TEMP TABLE s.t` (and a sequence or view) in a permanent schema:
+  42P16 `cannot create temporary relation in non-temporary schema` (3F000
+  first if s does not exist);
+- ON COMMIT on a permanent table: 42P16;
+- `ALTER TABLE ... SET SCHEMA` into or out of a temporary schema: 0A000;
+- **READ ONLY blocks**, checked against PostgreSQL 18: INSERT, UPDATE,
+  DELETE (and COPY FROM) on a temporary table are allowed (`tempWrite`);
+  CREATE TEMP TABLE, TRUNCATE, DISCARD TEMP are 25006. Their writes read the
+  block's snapshot with its own writes; no other session writes the
+  table.
+- Privileges: anyone may make temporary objects (PostgreSQL's TEMP on the
+  database, granted to PUBLIC): the temporary schema grants USAGE and
+  CREATE to PUBLIC. The maker owns them.
+
+**The catalog:**
+- `pg_class.relpersistence` is `t` for temporary tables, indexes,
+  sequences and views; `pg_namespace` has the session's `pg_temp_N` (and
+  `information_schema.schemata`); `pg_tables`, `pg_indexes`,
+  `pg_sequences` and `information_schema.columns` list them in it;
+  `information_schema.tables.table_type` is `LOCAL TEMPORARY`.
+- `pg_my_temp_schema()` (0 before the session has one),
+  `pg_is_other_temp_schema(oid)`, `'pg_temp.t'::regclass`.
+- A permanent relation a temporary one hides is shown qualified
+  (`public.t`), and `pg_table_is_visible` is false for it, as in
+  PostgreSQL. `current_schema()` is not the temporary schema.
+- psql's `\dt`, `\d`, `\d t`, `\dv`, `\ds` and `\di` show them as
+  PostgreSQL's psql does (`pg_temp_N | t | table`, `Table "pg_temp_N.t"`,
+  `nextval('t_id_seq'::regclass)`).
+
+**When they go:** at `Session.close` (the wire calls it when the client
+says goodbye or the connection drops; tried again on a serialization
+failure), at DISCARD TEMP and ALL, and at the next start. `dropTempIn`
+drops a schema's views, then its tables (their foreign keys, indexes,
+sequences and grants with them), then its other sequences.
+
+**Differences from PostgreSQL:**
+- temporary objects are logged and durable until dropped (above);
+- other sessions' temporary tables are not in `pg_class` or
+  `pg_namespace` here (PostgreSQL lists them), so
+  `pg_is_other_temp_schema` is always false; nor is `pg_toast_temp_N`;
+- another session's temporary table cannot be dropped;
+- no NOTICE for a view made temporary, no WARNING for GLOBAL;
+- ON COMMIT DELETE ROWS empties a table only when it holds rows, and only
+  at the commit of a transaction that wrote; its kept plans are then made
+  again (its trees are new);
+- `DISCARD ALL` does not end SET ROLE, nor DEALLOCATE the wire's prepared
+  statements; DISCARD SEQUENCES keeps currval.
+
+**Tests:**
+- `exec_temp`: 150 statements generated from PostgreSQL 18 by `gen_pg.py
+  temp` (seed 96), all the same. They cover a temporary table hiding a
+  permanent one (reads, writes, `public.` and `pg_temp.` names, the
+  catalog, regclass, visibility); keys, defaults, serial, identity, CHECK,
+  UNIQUE, expression and partial indexes; LOCAL and GLOBAL; a keyless one;
+  ON COMMIT each way, with COMMIT and ROLLBACK, in and out of blocks;
+  CREATE TEMP TABLE AS, SELECT INTO TEMP, IF NOT EXISTS; sequences; views,
+  and a view made temporary; `pg_temp.t`; the foreign keys refused and one
+  allowed with its CASCADE; ALTER; SET SCHEMA refused; READ ONLY blocks;
+  savepoints; DISCARD TEMP in and out of a block, DISCARD ALL; the errors.
+- `exec_tempsessions`, sessions in tasks: two sessions' tables of one
+  name; another's refused; `pg_class` per session; close dropping them
+  (and freeing their trees); the contention test above, sequential (a
+  block of B's around A's temporary DDL commits, its kept plan is not made
+  again, `Store.changes` does not move; the same block with A's permanent
+  CREATE TABLE fails, the control) and concurrent; a session's own plan
+  made again after its temporary DDL and after its ROLLBACK.
+- `exec_tempcrash`: 20 restarts on the simulated disk, after a crash or a
+  stop with the session open. Each time the trees are the permanent
+  ones', `pg_temp_1.t` is not there, and the new session 1 makes the same
+  objects again.
+- Caught: the crash test found a temporary sequence left after a restart
+  (`allSeqs` of one schema went round it); the contention test, with each
+  of the two protections taken out, fails as measured above. Checked by
+  hand: a replica refusing and not seeing them, `\d` against psql, the
+  wire's kept descriptions after DROP and CREATE of a temporary table.
+- The whole lexdb suite passes, 92 tests.
+
+**Not done:**
+- unlogged storage for temporary (or UNLOGGED) tables;
+- `CREATE TEMP TABLE ... (LIKE t)`, `WITH (...)`, `TABLESPACE`;
+- temporary types and functions.

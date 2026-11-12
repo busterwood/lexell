@@ -1,0 +1,206 @@
+// lexdb_exec: temporary tables between sessions (design/lexdb.md 9.96):
+// - two sessions each make a temporary table of the same name, and each
+//   sees only its own; the other's, named by its schema, is refused
+//   (0A000); neither shows in the other's pg_class;
+// - closing a session drops its temporary objects: their schema's names
+//   are then not there (42P01), and its trees are freed;
+// - temporary DDL does not disturb other sessions: a read-write block of
+//   B's (a kept plan, a catalog query, an update) commits after A made and
+//   dropped temporary tables, indexes, sequences and views meanwhile; B's
+//   kept plan is not made again, and the count of catalog changes the wire
+//   keeps descriptions by does not move. The same block fails (40001) when
+//   A makes a permanent table instead, the control;
+// - the same, concurrently: B's tasks run read-write blocks while A's
+//   makes and drops temporary tables in a loop; none of B's fails;
+// - a session's own kept plan is made again after its temporary DDL, and
+//   after a ROLLBACK of it.
+// expect: a sees: a; b sees: b
+// expect: b names a's: 0A000; a names b's: 0A000
+// expect: pg_class: a 1, b 1
+// expect: after a closed: 42P01, trees back: true
+// expect: b's block: COMMIT, plans 1, changes the same: true
+// expect: control: 40001
+// expect: concurrent: 120 blocks, failures 0, temp rounds 60
+// expect: own plans: 1 2 3 4
+import "task"
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_sql"
+
+type Val = lexdb_sql.Val
+
+fn one(s: mut &lexdb_exec.Session, sql: str): str {
+    match s.exec(&sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if r.hasRows {
+                var rows: []str = []
+                for row in r.rows {
+                    var cells: []str = []
+                    for v in row { append(mut &cells, lexdb_exec.text(&v)) }
+                    append(mut &rows, strings.join(&cells, "|"))
+                }
+                return strings.join(&rows, ";")
+            }
+            return r.tag
+        }
+        Err(e) { return e.state }
+    }
+}
+
+fn stmt(sql: &str): lexdb_sql.Stmt {
+    var ss = lexdb_sql.parse(sql).unwrap()
+    return pop(mut &ss)
+}
+
+fn cached(s: mut &lexdb_exec.Session, st: &lexdb_sql.Stmt, pc: mut &lexdb_exec.PlanCache): str {
+    let none: []Val = []
+    let pt: []int = []
+    match s.runCached(st, &none, &pt, pc) {
+        Ok(r) {
+            var out: []str = []
+            for row in r.rows { append(mut &out, lexdb_exec.text(&row[0])) }
+            return strings.join(&out, " ")
+        }
+        Err(e) { return e.state }
+    }
+}
+
+// A's temporary DDL, round i: tables (one with a serial key, an index and
+// a view on it, one ON COMMIT DELETE ROWS), a sequence; then dropped.
+fn tempRound(a: mut &lexdb_exec.Session, i: int): int {
+    var bad = 0
+    let n = i.toStr()
+    let sqls = ["create temp table w" + n + " (id serial primary key, v text)", "create index on w" + n + " (v)",
+                "insert into w" + n + " (v) values ('x'), ('y')", "create temp view wv" + n + " as select * from w" + n,
+                "create temp table d" + n + " (a int) on commit delete rows", "begin", "insert into d" + n + " values (1)", "commit",
+                "create temp sequence q" + n, "select nextval('q" + n + "')", "drop view wv" + n, "drop table w" + n + ", d" + n,
+                "drop sequence q" + n]
+    for q in sqls {
+        let r = one(a, q)
+        if r == "40001" || r == "XX000" || r == "42P01" || r == "42P07" { bad += 1 }
+    }
+    return bad
+}
+
+type Blocks = record { st: lexdb_store.Store; n: int; id: int }
+
+// n read-write blocks: a read, an update of its own row, a commit; the
+// failures.
+fn blocks(a: Blocks): int {
+    var s = lexdb_exec.newSession(a.st)
+    var bad = 0
+    let k = a.id.toStr()
+    for i in 0..a.n {
+        let b = one(mut &s, "begin")
+        let v = one(mut &s, "select v from acct where id = " + k)
+        let yd = task.yield()
+        let c = one(mut &s, "select count(*) from pg_class where relkind = 'r'")
+        let u = one(mut &s, "update acct set v = v + 1 where id = " + k)
+        let y2 = task.yield()
+        if u != "UPDATE 1" || one(mut &s, "commit") != "COMMIT" { bad += 1 }
+    }
+    s.close()
+    return bad
+}
+
+type Temps = record { st: lexdb_store.Store; n: int }
+
+fn temps(a: Temps): int {
+    var s = lexdb_exec.newSession(a.st)
+    var bad = 0
+    for i in 0..a.n {
+        bad += tempRound(mut &s, i)
+        let yd = task.yield()
+    }
+    s.close()
+    return a.n - bad
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(97), lexdb_store.Options{cacheBytes: 16 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000, bufferedPages: false}, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var a = lexdb_exec.newSession(st)
+        var b = lexdb_exec.newSession(st)
+        let m1 = one(mut &a, "create table acct (id int primary key, v int)")
+        let m2 = one(mut &a, "insert into acct select g, 0 from generate_series(1, 10) g")
+
+        // the same name, a table each
+        let b1 = one(mut &b, "create temp table t (v text)")
+        let b2 = one(mut &b, "insert into t values ('b')")
+        let base = len(st.trees())
+        let a1 = one(mut &a, "create temp table t (v text)")
+        let a2 = one(mut &a, "insert into t values ('a')")
+        let a3 = one(mut &a, "create index on t (v)")
+        println("a sees: " + one(mut &a, "select v from t") + "; b sees: " + one(mut &b, "select v from t"))
+        let an = one(mut &a, "select nspname from pg_namespace where oid = pg_my_temp_schema()")
+        let bn = one(mut &b, "select nspname from pg_namespace where oid = pg_my_temp_schema()")
+        println("b names a's: " + one(mut &b, "select v from " + an + ".t") + "; a names b's: " + one(mut &a, "delete from " + bn + ".t"))
+        println("pg_class: a " + one(mut &a, "select count(*) from pg_class where relname = 't'") + ", b " +
+                one(mut &b, "select count(*) from pg_class where relname = 't'"))
+
+        // closing a session drops its objects
+        a.close()
+        var c = lexdb_exec.newSession(st)
+        let left = one(mut &c, "select v from " + an + ".t")
+        let after = len(st.trees())
+        println("after a closed: " + left + ", trees back: " + (after == base).toStr())
+        a = lexdb_exec.newSession(st)
+
+        // B's read-write block, A's temporary DDL in the middle of it
+        let q = stmt(&"select v from acct where id = 1")
+        var pc = lexdb_exec.newPlanCache()
+        let x1 = one(mut &b, "begin")
+        let x2 = cached(mut &b, &q, mut &pc)
+        let x3 = one(mut &b, "select count(*) from pg_class where relkind = 'r'")
+        let x4 = one(mut &b, "update acct set v = v + 1 where id = 1")
+        let changes = st.changes()
+        var bad = 0
+        for i in 0..5 { bad += tempRound(mut &a, i) }
+        let x5 = cached(mut &b, &q, mut &pc)
+        let x6 = one(mut &b, "insert into t values ('b2')")
+        let same = st.changes() == changes
+        println("b's block: " + one(mut &b, "commit") + ", plans " + pc.plans.toStr() + ", changes the same: " + same.toStr() +
+                (if bad > 0 { " (a's DDL failed " + bad.toStr() + ")" } else { "" }))
+        // the control: a permanent table bumps the catalog's version
+        let y1 = one(mut &b, "begin")
+        let y2 = cached(mut &b, &q, mut &pc)
+        let y3 = one(mut &b, "update acct set v = v + 1 where id = 1")
+        let y4 = one(mut &a, "create table perm2 (a int)")
+        println("control: " + one(mut &b, "commit"))
+
+        // concurrently
+        task.scope(fn(sc: mut &task.Scope) {
+            var fs: []task.Future[int] = []
+            for k in 0..4 { append(mut &fs, sc.start(blocks, Blocks{st: st, n: 30, id: k + 2})) }
+            let ft = sc.start(temps, Temps{st: st, n: 60})
+            var fails = 0
+            while len(fs) > 0 { fails += pop(mut &fs).wait().unwrap() }
+            let rounds = ft.wait().unwrap()
+            println("concurrent: " + one(mut &c, "select sum(v) from acct where id between 2 and 5") + " blocks, failures " + fails.toStr() +
+                    ", temp rounds " + rounds.toStr())
+        })
+
+        // a session's own plan follows its temporary DDL, and its ROLLBACK
+        let q2 = stmt(&"select count(*) from acct")
+        var pc2 = lexdb_exec.newPlanCache()
+        let z1 = cached(mut &b, &q2, mut &pc2)
+        let z2 = one(mut &b, "create temp table acct (v int)")
+        let z3 = cached(mut &b, &q2, mut &pc2)
+        var plans: []str = [pc2.plans.toStr()]
+        let z4 = one(mut &b, "begin")
+        let z5 = one(mut &b, "drop table acct")
+        let z6 = cached(mut &b, &q2, mut &pc2)
+        append(mut &plans, pc2.plans.toStr())
+        let z7 = one(mut &b, "rollback")
+        let z8 = cached(mut &b, &q2, mut &pc2)
+        append(mut &plans, pc2.plans.toStr())
+        println("own plans: 1 " + strings.join(&plans, " ") + (if z3 != "0" || z6 != "10" || z8 != "0" { " wrong: " + z3 + " " + z6 + " " + z8 } else { "" }))
+        b.close()
+        c.close()
+        a.close()
+        return 0
+    }).unwrap()
+}

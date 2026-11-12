@@ -245,12 +245,19 @@ pub type Txn = record {
     // locks the rows it gives (9.86), as PostgreSQL's READ COMMITTED: the
     // locks keep those rows as they were read
     pub quiet: bool
+    // The SQL layer's temporary objects (9.96): its session's temporary
+    // schema ("" none yet); whether the transaction changed one of them in
+    // the catalog; the tables made in it with ON COMMIT DELETE ROWS or DROP
+    pub tmp: str
+    pub tmpDdl: bool
+    pub onCommit: []str
 }
 
 pub fn begin(): Txn {
     return Txn{reads: [], writes: [], idxTrees: [], idx: [], created: [], snap: -1, snapSeq: 0, snapTrees: newMap(), track: false, live: false, path: [], sess: 0,
                raTree: -1, ra: AHEAD_MIN, fsnap: [], now: time.now().unixMicros(), zone: lexdb_time.utc(),
-               pending: [], consAll: 0, consNames: [], consDeferred: [], lockId: 0, held: [], quiet: false}
+               pending: [], consAll: 0, consNames: [], consDeferred: [], lockId: 0, held: [], quiet: false,
+               tmp: "", tmpDdl: false, onCommit: []}
 }
 
 pub fn (t: &Txn) isSnapshot(): bool { return t.snap >= 0 }
@@ -1065,7 +1072,8 @@ fn (db: mut &Db) applyDrop(tree: int) {
 }
 
 fn (db: mut &Db) applyWrite(w: &TxWrite) {
-    if w.tree == db.watched { db.watchedWrites += 1 }
+    // (a temporary object's row is its session's alone: 9.96)
+    if w.tree == db.watched && !lexdb_base.tempCatKey(&w.key) { db.watchedWrites += 1 }
     if w.op == OP_PUT { db.putValue(w.tree, &w.key, &w.val, w.head) }
     else if w.op == OP_DEL {
         db.dropChunks(w.tree, &w.key)

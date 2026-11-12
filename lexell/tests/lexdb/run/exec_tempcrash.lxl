@@ -1,0 +1,96 @@
+// lexdb_exec: temporary objects do not outlive their server (design/lexdb.md
+// 9.96). A session makes temporary tables (a serial key, an index, a view,
+// a sequence, one ON COMMIT DELETE ROWS, a foreign key between two), with
+// a permanent table beside them; then the simulated disk crashes, or the
+// server stops with the session not closed. When the store opens again,
+// bootstrap drops what was left: the trees are those of the permanent
+// table and the catalog's, the new session 1 (the number used again) does
+// not find pg_temp_1's tables, and makes its own of the same names.
+// expect: 20 restarts: the permanent rows there, nothing temporary left
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: 256 * 1024, segBytes: 1024 * 1024, ckptBytes: 512 * 1024, snapNodes: 100000, bufferedPages: false}
+}
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if !r.hasRows { return r.tag }
+            var out: []str = []
+            for row in r.rows {
+                var vs: []str = []
+                for v in row { append(mut &vs, lexdb_exec.text(&v)) }
+                append(mut &out, strings.join(&vs, "|"))
+            }
+            return strings.join(&out, " ")
+        }
+        Err(e) { return e.state + " " + e.msg }
+    }
+}
+
+const TEMPS: []str = ["create temp table t (id serial primary key, v text)", "create index t_v on t (v)",
+                      "insert into t (v) select 'v' || g from generate_series(1, 300) g", "create temp view tv as select * from t",
+                      "create temp sequence ts", "select nextval('ts')", "create temp table d (a int primary key) on commit delete rows",
+                      "create temp table c (a int references t (id))", "insert into c values (1), (2)", "begin",
+                      "insert into t (v) values ('in a block')", "commit"]
+
+fn main() {
+    var bad: []str = []
+    var restarts = 0
+    for seed in 0..10 {
+        for k in 0..2 {
+            var fs = lexdb_disk.sim(seed * 2 + k)
+            var base = 0
+            var crashed = fs
+            let r = lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): str {
+                lexdb_exec.bootstrap(&st).unwrap()
+                var s = lexdb_exec.newSession(st)
+                let p1 = q(mut &s, &"create table p (id int primary key, v text)")
+                let p2 = q(mut &s, &"insert into p select g, 'p' from generate_series(1, 50) g")
+                base = len(st.trees())
+                for sql in TEMPS {
+                    let got = q(mut &s, &sql)
+                    if strings.contains(&got, " ") && !strings.startsWith(got, "INSERT") && !strings.startsWith(got, "CREATE") { return sql + ": " + got }
+                }
+                if len(st.trees()) <= base { return "no temporary trees" }
+                // k 0: a crash; k 1: the server stops with the session open
+                if k == 0 { crashed = fs.crash(seed) }
+                return ""
+            }).unwrap()
+            if len(r) > 0 { append(mut &bad, "seed " + seed.toStr() + ": " + r) }
+            if k == 0 { fs = crashed }
+            restarts += 1
+            let c = lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): str {
+                lexdb_exec.bootstrap(&st).unwrap()
+                if len(st.trees()) != base { return "trees " + len(st.trees()).toStr() + ", not " + base.toStr() }
+                var s = lexdb_exec.newSession(st)
+                let n = q(mut &s, &"select count(*) from p")
+                if n != "50" { return "permanent rows: " + n }
+                let left = q(mut &s, &"select count(*) from pg_temp_1.t")
+                if !strings.startsWith(left, "42P01") { return "pg_temp_1.t: " + left }
+                let pc = q(mut &s, &"select count(*) from pg_class where relpersistence = 't'")
+                if pc != "0" { return "pg_class: " + pc }
+                for sql in TEMPS {
+                    let got = q(mut &s, &sql)
+                    if strings.contains(&got, " ") && !strings.startsWith(got, "INSERT") && !strings.startsWith(got, "CREATE") { return "again: " + sql + ": " + got }
+                }
+                let own = q(mut &s, &"select count(*) from t")
+                if own != "301" { return "the new t: " + own }
+                s.close()
+                if len(st.trees()) != base { return "after close: trees " + len(st.trees()).toStr() }
+                return ""
+            }).unwrap()
+            if len(c) > 0 { append(mut &bad, "seed " + seed.toStr() + " way " + k.toStr() + ": " + c) }
+        }
+    }
+    if len(bad) > 0 {
+        for b in bad { println(b) }
+    } else {
+        println(restarts.toStr() + " restarts: the permanent rows there, nothing temporary left")
+    }
+}

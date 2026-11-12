@@ -78,6 +78,9 @@ pub type Table = record {
     // the relations it reads; its cols are its output columns.
     pub view: str
     pub deps: []str
+    // A temporary table's ON COMMIT (lexdb_sql.ONC_*, 9.96): kept for
+    // DELETE ROWS and DROP
+    pub onCommit: int
 }
 
 // A foreign key: cols of its table hold a key of table ref, refCols (a
@@ -95,7 +98,7 @@ pub type ForeignKey = record {
 
 fn emptyTable(name: str): Table {
     return Table{name: name, tree: 0, cols: [], pk: [], indexes: [], slots: [], width: 0, checks: [], fks: [], refBy: [], layouts: [], lays: [],
-                 view: "", deps: []}
+                 view: "", deps: [], onCommit: 0}
 }
 
 // A CHECK constraint: a row may not make expr false (column names bare).
@@ -3213,6 +3216,8 @@ fn encTable(t: &Table): str {
     binary.addU32LE(mut &b, n + (if add { 1 } else { 0 }))
     for l in t.layouts { addKinds(mut &b, &l) }
     if add { addKinds(mut &b, &cur) }
+    // then a temporary table's ON COMMIT, when it is DELETE ROWS or DROP (9.96)
+    if t.onCommit > lexdb_sql.ONC_PRESERVE { b.addByte(byte(t.onCommit)) }
     return b.toStr()
 }
 
@@ -3424,6 +3429,7 @@ fn decTable(name: str, s: &str): Result[Table, DbErr] {
             append(mut &t.layouts, ks)
         }
     }
+    if at < len(s) { t.onCommit = int(s[at]) }
     return Ok(t)
 }
 
@@ -3455,15 +3461,18 @@ fn schemaKey(n: &str): str { return "\x03" + n }
 
 fn schemaExists(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, n: &str): Result[bool, DbErr] {
     if n == "public" { return Ok(true) }
+    // the session's temporary schema, once it has one (9.96); another's is none
+    if len(n) > 0 && n[0] == 'p' && (n == "pg_temp" || lexdb_base.isTempSchema(n)) { return Ok(len(txn.tmp) > 0 && (n == "pg_temp" || n == txn.tmp)) }
     return Ok((try st.get(txn, CATALOG, schemaKey(n))).isSome())
 }
 
 // The schema new unqualified names go in: the first on the path that
-// exists ("" none).
+// exists ("" none), never the temporary one (9.96).
 fn createSchema(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[str, DbErr] {
     if len(txn.path) == 0 { return Ok("public") }
     for i in 0..len(txn.path) {
         let sc = txn.path[i]
+        if len(txn.tmp) > 0 && sc == txn.tmp { continue }
         if try schemaExists(st, txn, &sc) { return Ok(sc) }
     }
     return Ok("")
@@ -3472,8 +3481,12 @@ fn createSchema(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[str, 
 // The catalog key of a table (idx false) or an index named n: n if it is
 // qualified or the path is public's; else the first schema on the path
 // holding it, or none: the schema new names would go in (it is not there).
+// pg_temp is the session's temporary schema; another session's is refused
+// (9.96).
 fn catKey(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, n: &str, idx: bool): Result[str, DbErr] {
-    if len(txn.path) == 0 || lexdb_sql.isQual(n) { return Ok(n) }
+    let q = lexdb_sql.isQual(n)
+    if q && n[0] == 'p' { return tmpQual(st, txn, n) }
+    if len(txn.path) == 0 || q { return Ok(n) }
     for i in 0..len(txn.path) {
         let sc = txn.path[i]
         let k = lexdb_sql.qual(&sc, n)
@@ -3481,8 +3494,156 @@ fn catKey(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, n: &str, idx: bool)
         if found.isSome() { return Ok(k) }
     }
     let sc = try createSchema(st, txn)
-    let first = txn.path[0]
+    var first = txn.path[0]
+    if len(txn.tmp) > 0 && first == txn.tmp && len(txn.path) > 1 { first = txn.path[1] }
     return Ok(lexdb_sql.qual(if len(sc) > 0 { &sc } else { &first }, n))
+}
+
+// ---- temporary objects (9.96)
+//
+// A session's temporary tables, views, sequences and indexes live in its
+// own schema, pg_temp_N (N the session's number, Session.id), made when
+// it first makes one: the transaction carries it (Txn.tmp) and its search
+// path starts with it (withTmp). Their catalog rows are under their own
+// keys (lexdb_base.tempCatKey), which no other session reads: the scans
+// of the whole catalog read other sessions' temporary ranges quietly and
+// leave them out (catScan). Their DDL bumps only the session's own
+// catalog version (tmpBump), in the memo. They go when the session ends
+// (Session.close), at DISCARD TEMP and ALL, and those a crash left at
+// the next start (bootstrap).
+
+fn tmpName(sess: int): str { return "pg_temp_" + sess.toStr() }
+
+// The session's temporary schema, in the memo once it has one; and the
+// version of its temporary objects' catalog.
+fn tmpMemo(sess: int): str { return "\x00tmp\x00" + sess.toStr() }
+fn tmpVerKey(sess: int): str { return "\x00tmpver\x00" + sess.toStr() }
+
+// Whether relation key k is a temporary one.
+fn tempRel(k: &str): bool {
+    if len(k) == 0 || k[0] != 'p' { return false }
+    return lexdb_base.isTempSchema(&lexdb_sql.schemaOf(k))
+}
+
+fn otherTemp(): DbErr { return e("0A000", "cannot access temporary tables of other sessions") }
+
+// A qualified name starting with p: pg_temp's names the session's
+// temporary schema; another session's is refused where it holds the name.
+fn tmpQual(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, n: &str): Result[str, DbErr] {
+    let sc = lexdb_sql.schemaOf(n)
+    if sc == "public" { return Ok(lexdb_sql.baseName(n)) }         // public.name as written (lexdb_sql.rname)
+    if sc == "pg_temp" {
+        if len(txn.tmp) > 0 { return Ok(lexdb_sql.qual(&txn.tmp, &lexdb_sql.baseName(n))) }
+        return Ok(n)
+    }
+    if lexdb_base.isTempSchema(&sc) && sc != txn.tmp && (try relExists(st, txn, n)) { return Err(otherTemp()) }
+    return Ok(n)
+}
+
+// A search path with the temporary schema tmp first, unless it names
+// pg_temp, which is then tmp; [] (public alone) becomes [tmp, public].
+pub fn withTmp(path: &[]str, tmp: &str): []str {
+    var out: []str = []
+    var named = false
+    for n in path { if n == "pg_temp" || n == tmp { named = true } }
+    if !named { append(mut &out, tmp.toStr()) }
+    for n in path { append(mut &out, if n == "pg_temp" { tmp.toStr() } else { n }) }
+    if len(path) == 0 { append(mut &out, "public") }
+    return out
+}
+
+// The transaction's session's temporary schema, made if it has none yet.
+fn useTmp(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): str {
+    if len(txn.tmp) > 0 { return txn.tmp }
+    let n = tmpName(txn.sess)
+    txn.path = withTmp(&txn.path, &n)
+    txn.tmp = n
+    st.memoPut(&tmpMemo(txn.sess), &n)
+    return n
+}
+
+// A temporary object's catalog changed: the session's kept plans and
+// descriptions are made again (and again if the transaction rolls back:
+// Session.tmpUndo). Other sessions' are not touched.
+fn tmpBump(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn) {
+    txn.tmpDdl = true
+    tmpChanged(st, txn.sess)
+}
+
+fn tmpChanged(st: &lexdb_store.Store, sess: int) {
+    let k = tmpVerKey(sess)
+    st.memoPut(&k, &(num(&st.memoGet(&k).unwrapOr("0")) + 1).toStr())
+}
+
+// The catalog's version bumped for DDL on relation key k: a temporary
+// one's bumps its session's only.
+fn bumpFor(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, k: &str): Result[Unit, DbErr] {
+    if tempRel(k) {
+        tmpBump(st, txn)
+        return Ok(Unit{})
+    }
+    return bumpCatalog(st, txn)
+}
+
+// The key CREATE of relation n makes (TEMPORARY when temp, or named in
+// pg_temp): in its schema, or the first on the path; a temporary one's in
+// the session's temporary schema, made if need be. Errors as PostgreSQL's.
+fn createKey(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, n: &str, temp: bool): Result[str, DbErr] {
+    var tmp = temp
+    if lexdb_sql.isQual(n) {
+        let sn = lexdb_sql.schemaOf(n)
+        if sn == "pg_temp" || sn == tmpName(txn.sess) {
+            tmp = true
+        } else {
+            if !(try schemaExists(st, txn, &sn)) { return Err(e("3F000", "schema \"" + sn + "\" does not exist")) }
+            if tmp { return Err(e("42P16", "cannot create temporary relation in non-temporary schema")) }
+            if sn == "public" { return Ok(lexdb_sql.baseName(n)) }        // public.name as written (lexdb_sql.rname)
+            return Ok(n)
+        }
+    }
+    if tmp { return Ok(lexdb_sql.qual(&useTmp(st, txn), &lexdb_sql.baseName(n))) }
+    let sn = try createSchema(st, txn)
+    if len(sn) == 0 { return Err(e("3F000", "no schema has been selected to create in")) }
+    return Ok(lexdb_sql.qual(&sn, n))
+}
+
+// Scans the catalog [lo, hi) as st.scan does, leaving out other sessions'
+// temporary objects: keys pre + "pg_temp_..." (pre "" a relation's, "\x01"
+// an index's, "\x04" a sequence's, ACL_PRE + "r:" an owner's), whose range
+// is read quietly, so their DDL never conflicts with this transaction.
+fn catScan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, lo: &str, hi: &str, pre: &str, f: &fn(&lexdb_store.Entry): bool): Result[Unit, DbErr] {
+    let tlo = pre + "pg_temp_"
+    let thi = pre + "pg_temp`"
+    var going = true
+    // below the temporary range
+    if lo < tlo {
+        let to = if len(hi) == 0 || hi > tlo { tlo } else { hi.toStr() }
+        try st.scan(txn, CATALOG, lo.toStr(), to, fn(en: &lexdb_store.Entry): bool {
+            going = f(en)
+            return going
+        })
+    }
+    if !going || (len(hi) > 0 && hi <= tlo) { return Ok(Unit{}) }
+    // in it: the session's own, and keys there of no temporary schema
+    let a = if lo > tlo { lo.toStr() } else { tlo }
+    let b = if len(hi) > 0 && hi < thi { hi.toStr() } else { thi }
+    if a < b {
+        let mine = txn.tmp
+        let quiet = txn.quiet
+        txn.quiet = true
+        let r = st.scan(txn, CATALOG, a, b, fn(en: &lexdb_store.Entry): bool {
+            let k = &en.key[len(pre)..len(en.key)]
+            let sc = lexdb_sql.schemaOf(k)
+            if lexdb_base.isTempSchema(&sc) && lexdb_sql.isQual(k) && sc != mine { return true }
+            going = f(en)
+            return going
+        })
+        txn.quiet = quiet
+        try r
+    }
+    if !going || (len(hi) > 0 && hi <= thi) { return Ok(Unit{}) }
+    // above it
+    return st.scan(txn, CATALOG, if lo > thi { lo.toStr() } else { thi }, hi.toStr(), f)
 }
 
 fn findTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, name: &str): Result[Option[Table], DbErr] {
@@ -3519,11 +3680,14 @@ pub fn bootstrap(st: &lexdb_store.Store): Result[Unit, DbErr] {
     let seqs = try st.get(mut &r, CATALOG, SEQ_TREE)
     if seqs.isSome() {
         st.abort(r)
-        return Ok(Unit{})
+    } else {
+        let tree = st.createTree(mut &r)
+        try r.put(CATALOG, SEQ_TREE, tree.toStr())
+        try st.commit(r)
     }
-    let tree = st.createTree(mut &r)
-    try r.put(CATALOG, SEQ_TREE, tree.toStr())
-    return st.commit(r)
+    // temporary objects left by a crash (9.96); a replica's go with the master's
+    if !st.isReplica() { try dropLeftTemps(st) }
+    return Ok(Unit{})
 }
 
 // ---- planning: access paths and joins
@@ -4709,7 +4873,7 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
         }
         var viewSrc = -1
         var t = Table{name: f.alias, tree: -1, cols: [], pk: [], indexes: [], slots: [], width: 0, checks: [], fks: [], refBy: [], layouts: [], lays: [],
-                      view: "", deps: []}
+                      view: "", deps: [], onCommit: 0}
         var lateral = false
         if f.sub >= 0 {
             sc.frames[me].hidden = !f.lateral
@@ -4767,7 +4931,7 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
                                  len(f.cols).toStr() + " columns specified"))
                 }
                 var vt = Table{name: f.alias, tree: -1, cols: [], pk: [], indexes: [], slots: [], width: 0, checks: [], fks: [], refBy: [], layouts: [], lays: [],
-                               view: "", deps: []}
+                               view: "", deps: [], onCommit: 0}
                 for i in 0..len(sp.sel.outs) {
                     let name = if i < len(f.cols) { f.cols[i] } else if i < len(t.cols) { t.cols[i].name } else { sp.sel.outs[i].name }
                     append(mut &vt.cols, lexdb_sql.colDef(name, oidType(sp.sel.outs[i].oid), false))
@@ -6388,15 +6552,8 @@ fn changeIndexes(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, o
 // ---- statements
 
 fn createTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
-    var key = s.table
-    if lexdb_sql.isQual(&s.table) {
-        let sn = lexdb_sql.schemaOf(&s.table)
-        if !(try schemaExists(st, txn, &sn)) { return Err(e("3F000", "schema \"" + sn + "\" does not exist")) }
-    } else {
-        let sn = try createSchema(st, txn)
-        if len(sn) == 0 { return Err(e("3F000", "no schema has been selected to create in")) }
-        key = lexdb_sql.qual(&sn, &s.table)
-    }
+    let key = try createKey(st, txn, &s.table, s.temp)
+    if s.onCommit != lexdb_sql.ONC_NONE && !tempRel(&key) { return Err(e("42P16", "ON COMMIT can only be used on temporary tables")) }
     let base = lexdb_sql.baseName(&key)
     let exists = try relExists(st, txn, &key)
     if exists {
@@ -6443,8 +6600,10 @@ fn createTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
     for c in t.cols { try defaultSeqs(st, txn, &c) }
     for c in s.cons { if c.kind != lexdb_sql.C_FOREIGN { try addConstraint(st, txn, mut &t, &c) } }
     for c in s.cons { if c.kind == lexdb_sql.C_FOREIGN { try addConstraint(st, txn, mut &t, &c) } }
+    t.onCommit = s.onCommit
+    if s.onCommit > lexdb_sql.ONC_PRESERVE { append(mut &txn.onCommit, key) }
     try txn.put(CATALOG, key, encTable(&t))
-    try bumpCatalog(st, txn)
+    try bumpFor(st, txn, &key)
     // its owner, and its columns' sequences' (9.83)
     try ownNew(st, txn, &relObj(&key))
     match try st.get(txn, CATALOG, key) {
@@ -6511,6 +6670,7 @@ fn createType(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
     let key = s.table
     if lexdb_sql.isQual(&key) {
         let sn = lexdb_sql.schemaOf(&key)
+        if sn == "pg_temp" || lexdb_base.isTempSchema(&sn) { return Err(e("0A000", "lexdb: types in the temporary schema are not supported")) }
         if !(try schemaExists(st, txn, &sn)) { return Err(e("3F000", "schema \"" + sn + "\" does not exist")) }
     }
     let oid = lexdb_sql.nameOid(&"T", &key)
@@ -6668,12 +6828,18 @@ fn rowidKeyed(t: &Table): bool { return len(t.pk) == 1 && t.pk[0] < len(t.cols) 
 // query makes them. The tag, as PostgreSQL's: SELECT and the rows.
 fn createTableAs(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int,
                  lim: Limits): Result[Res, DbErr] {
-    if s.ifFlag && (try findTable(st, txn, &s.table)).isSome() { return Ok(tagOnly("CREATE TABLE AS")) }
+    if s.ifFlag {
+        // (where it would be made: a temporary one in the session's schema)
+        let k = try createKey(st, txn, &s.table, s.temp)
+        if (try relExists(st, txn, &k)) { return Ok(tagOnly("CREATE TABLE AS")) }
+    }
     var sc = newScope(params, ptypes)
     let sel = try planSelect(st, txn, &s.inner[0], params, mut &sc)
     if len(s.names) > len(sel.outs) { return Err(e("42601", "too many column names were specified")) }
     var mk = lexdb_sql.newStmt(lexdb_sql.S_CREATE)
     mk.table = s.table
+    mk.temp = s.temp
+    mk.onCommit = s.onCommit
     for i in 0..len(sel.outs) {
         let n = if i < len(s.names) { s.names[i] } else { sel.outs[i].name }
         for c in mk.cols { if c.name == n { return Err(e("42701", "column \"" + n + "\" specified more than once")) } }
@@ -6683,7 +6849,7 @@ fn createTableAs(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sq
     }
     let made = try createTable(st, txn, &mk)
     if s.noData { return Ok(tagOnly("CREATE TABLE AS")) }
-    let t = try needTable(st, txn, &s.table)
+    let t = try byKey(st, txn, &(try createKey(st, txn, &s.table, s.temp)))
     var targets: []int = []
     for i in 0..len(t.cols) { if t.cols[i].name != ROWID { append(mut &targets, i) } }
     let defs = try defaultsOf(st, txn, &t)
@@ -6717,7 +6883,7 @@ fn dropTableNamed(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, name: &str,
             try unlinkTable(st, txn, mut &d, s.cascade)
             try dropOwnedSeqs(st, txn, &d, &"")
             dropOne(txn, &d)
-            try bumpCatalog(st, txn)
+            try bumpFor(st, txn, &d.name)
             return Ok(tagOnly("DROP TABLE"))
         }
         None {
@@ -6779,8 +6945,140 @@ fn truncate(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
         try putTable(txn, &t)
         for d in seqs { if d.ownerT == t.name { try setVal(st, &d, d.start, false) } }
     }
-    try bumpCatalog(st, txn)
+    try bumpKeys(st, txn, &keys)
     return Ok(tagOnly("TRUNCATE TABLE"))
+}
+
+// Every object in temporary schema sc dropped (9.96): its views, its
+// tables with their indexes, sequences, foreign keys and grants, and its
+// other sequences. Nothing is checked: they are the session's. The count.
+fn dropTempIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &str): Result[int, DbErr] {
+    var views: []str = []
+    var tabs: []str = []
+    try st.scan(txn, CATALOG, sc + "\x1f", sc + "\x20", fn(en: &lexdb_store.Entry): bool {
+        if strings.startsWith(&en.val, VIEW_MARK) { append(mut &views, en.key) } else { append(mut &tabs, en.key) }
+        return true
+    })
+    for v in views {
+        txn.del(CATALOG, v)
+        dropAcl(txn, &relObj(&v))
+    }
+    for k in tabs {
+        // read again: dropping one before may have changed it (its foreign keys)
+        match try byKeyOpt(st, txn, &k) {
+            Some(t) {
+                var d = t
+                try unlinkTable(st, txn, mut &d, true)
+                try dropOwnedSeqs(st, txn, &d, &"")
+                dropOne(txn, &d)
+            }
+            None {}
+        }
+    }
+    let seqs = try allSeqs(st, txn, sc)
+    for d in seqs { try dropSeqRows(st, txn, &d) }
+    let n = len(views) + len(tabs) + len(seqs)
+    if n > 0 { tmpBump(st, txn) }
+    return Ok(n)
+}
+
+// The temporary schemas a crash (or a server stopped with sessions open)
+// left, dropped when the store opens (9.96): a session's number is used
+// again after a restart, and must not find them.
+fn dropLeftTemps(st: &lexdb_store.Store): Result[Unit, DbErr] {
+    var r = lexdb_store.begin()
+    var scs: []str = []
+    for pre in ["", "\x04"] {
+        try st.scan(mut &r, CATALOG, pre + "pg_temp_", pre + "pg_temp`", fn(en: &lexdb_store.Entry): bool {
+            let k = &en.key[len(pre)..len(en.key)]
+            let sc = lexdb_sql.schemaOf(k)
+            if lexdb_sql.isQual(k) && lexdb_base.isTempSchema(&sc) && !hasStr(&scs, &sc) { append(mut &scs, sc) }
+            return true
+        })
+    }
+    if len(scs) == 0 {
+        st.abort(r)
+        return Ok(Unit{})
+    }
+    for sc in scs { let n = try dropTempIn(st, mut &r, &sc) }
+    // their owners' rows, should any be left without their objects
+    var acls: []str = []
+    try st.scan(mut &r, CATALOG, ACL_PRE + "r:pg_temp_", ACL_PRE + "r:pg_temp`", fn(en: &lexdb_store.Entry): bool {
+        if lexdb_base.tempCatKey(&en.key) { append(mut &acls, en.key) }
+        return true
+    })
+    for k in acls { r.del(CATALOG, k) }
+    return st.commit(r)
+}
+
+// Before a commit, the ON COMMIT of the session's temporary tables (9.96):
+// those ON COMMIT DROP dropped; those ON COMMIT DELETE ROWS emptied, as
+// TRUNCATE empties a table (new trees), when they hold rows. have: the
+// DELETE ROWS tables known before (Session.onCommit), the transaction's own
+// made ones added; gives those still there.
+fn onCommitDo(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, have: &[]str): Result[[]str, DbErr] {
+    var keys = copyStrs(have)
+    for k in txn.onCommit { addKey(mut &keys, &k) }
+    var kept: []str = []
+    var full: []str = []
+    for k in keys {
+        match try byKeyOpt(st, txn, &k) {
+            Some(t) {
+                if t.onCommit == lexdb_sql.ONC_DROP {
+                    var d = t
+                    try dropDependentViews(st, txn, &d.name, true, &"table")
+                    try unlinkTable(st, txn, mut &d, true)
+                    try dropOwnedSeqs(st, txn, &d, &"")
+                    dropOne(txn, &d)
+                    tmpBump(st, txn)
+                } else if t.onCommit == lexdb_sql.ONC_DELETE {
+                    append(mut &kept, k)
+                    var any = false
+                    try st.scan(txn, t.tree, "", "", fn(en: &lexdb_store.Entry): bool {
+                        any = true
+                        return false
+                    })
+                    if any { append(mut &full, k) }
+                }
+            }
+            None {}
+        }
+    }
+    // a table referencing one emptied must be emptied too (PostgreSQL's check)
+    for k in kept {
+        let t = try byKey(st, txn, &k)
+        for r in t.refBy {
+            if !hasStr(&kept, &r) {
+                return Err(e("0A000", "unsupported ON COMMIT and foreign key combination: Table \"" + lexdb_sql.baseName(&r) + "\" references \"" +
+                             lexdb_sql.baseName(&k) + "\", but they do not have the same ON COMMIT setting."))
+            }
+        }
+    }
+    for k in full {
+        var t = try byKey(st, txn, &k)
+        let old = t.tree
+        t.tree = st.createTree(txn)
+        txn.dropTree(old)
+        for x in 0..len(t.indexes) {
+            let oi = t.indexes[x].tree
+            t.indexes[x].tree = st.createTree(txn)
+            txn.dropTree(oi)
+        }
+        try putTable(txn, &t)
+    }
+    if len(full) > 0 { tmpBump(st, txn) }
+    return Ok(kept)
+}
+
+// bumpFor each relation key of ks: the catalog's version once if any is
+// not temporary.
+fn bumpKeys(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, ks: &[]str): Result[Unit, DbErr] {
+    var perm = false
+    var temp = false
+    for k in ks { if tempRel(&k) { temp = true } else { perm = true } }
+    if temp { tmpBump(st, txn) }
+    if perm { try bumpCatalog(st, txn) }
+    return Ok(Unit{})
 }
 
 // VACUUM, ANALYZE, CHECKPOINT, REINDEX and CLUSTER (9.94): lexdb has
@@ -7021,6 +7319,7 @@ fn relExists(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, k: &str): Result
 // ALTER TABLE ... SET SCHEMA: the table and its indexes, unless a name is
 // taken there.
 fn setSchema(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, sc: &str): Result[Unit, DbErr] {
+    if tempRel(&t.name) || sc == "pg_temp" || lexdb_base.isTempSchema(sc) { return Err(e("0A000", "cannot move objects into or out of temporary schemas")) }
     if !(try schemaExists(st, txn, sc)) { return Err(e("3F000", "schema \"" + sc + "\" does not exist")) }
     if lexdb_sql.schemaOf(&t.name) == sc { return Ok(Unit{}) }
     var names = [lexdb_sql.baseName(&t.name)]
@@ -7050,7 +7349,7 @@ fn alterIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
     txn.del(CATALOG, idxName(&ixKey))
     try txn.put(CATALOG, idxName(&key), t.name)
     try txn.put(CATALOG, t.name, encTable(&t))
-    try bumpCatalog(st, txn)
+    try bumpFor(st, txn, &t.name)
     return Ok(tagOnly("ALTER INDEX"))
 }
 
@@ -7265,6 +7564,9 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             try needRelOwner(st, txn, &ft.name, &"table")
             // a view keeps its query's text: names it reads may not change under it
             for a in s.alters {
+                if a.kind == lexdb_sql.A_SET_SCHEMA && (tempRel(&ft.name) || a.name == "pg_temp" || lexdb_base.isTempSchema(&a.name)) {
+                    return Err(e("0A000", "cannot move objects into or out of temporary schemas"))
+                }
                 if a.kind == lexdb_sql.A_RENAME || a.kind == lexdb_sql.A_RENAME_COL || a.kind == lexdb_sql.A_DROP_COL ||
                    a.kind == lexdb_sql.A_TYPE || a.kind == lexdb_sql.A_SET_SCHEMA {
                     let deps = try dependentViews(st, txn, &ft.name)
@@ -7450,7 +7752,7 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         }
     }
     try txn.put(CATALOG, t.name, encTable(&t))
-    try bumpCatalog(st, txn)
+    try bumpFor(st, txn, &t.name)
     return Ok(tagOnly("ALTER TABLE"))
 }
 
@@ -7583,7 +7885,7 @@ fn createIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
     let ix = Index{name: ixKey, tree: st.createTree(txn), cols: cols, unique: s.unique, pred: pred, con: false, opts: copyStrs(&s.pk), exprs: exprs}
     try addIndex(st, txn, mut &t, ix)
     try txn.put(CATALOG, t.name, encTable(&t))
-    try bumpCatalog(st, txn)
+    try bumpFor(st, txn, &t.name)
     return Ok(tagOnly("CREATE INDEX"))
 }
 
@@ -7877,7 +8179,7 @@ fn dropIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.St
             while len(rev) > 0 { append(mut &t.indexes, pop(mut &rev)) }
             txn.del(CATALOG, idxName(&ixKey))
             try txn.put(CATALOG, t.name, encTable(&t))
-            try bumpCatalog(st, txn)
+            try bumpFor(st, txn, &t.name)
             return Ok(tagOnly("DROP INDEX"))
         }
         None {
@@ -8601,6 +8903,8 @@ pub fn exprOid(x: &Expr, cols: &[]lexdb_sql.ColDef, ptypes: &[]int): int {
                     return if ao > 0 { ao } else { lexdb_sql.arrayOid(lexdb_sql.OID_TEXT) }
                 }
                 "pg_backend_pid" { return lexdb_sql.OID_INT4 }
+                "pg_my_temp_schema" { return lexdb_sql.OID_OID }
+                "pg_is_other_temp_schema" { return lexdb_sql.OID_BOOL }
                 "txid_current", "pg_current_xact_id" { return lexdb_sql.OID_INT8 }
                 "format_type", "pg_get_expr", "pg_get_constraintdef", "pg_get_indexdef", "pg_get_serial_sequence", "quote_ident",
                 "array_to_string", "obj_description", "col_description", "shobj_description", "pg_get_viewdef", "json_build_object",
@@ -8819,6 +9123,8 @@ fn select(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     // sees is the same and the plan looked at no parameter's value.
     var ver = try catVersion(st, txn)
     if len(txn.path) > 0 { ver = ver + "|" + strings.join(&txn.path, ",") }      // its names resolved by the path
+    // the session's temporary objects (9.96): their DDL bumps this, not the catalog's version
+    if len(txn.tmp) > 0 { ver = ver + "|t" + st.memoGet(&tmpVerKey(txn.sess)).unwrapOr("0") }
     // the time zone (9.95): nothing planned depends on it now (a value is
     // read in it when the plan runs), but a plan is not kept across it
     if !txn.zone.isUtc() { ver = ver + "|z" + txn.zone.name }
@@ -10572,6 +10878,7 @@ fn guessParams(st: &lexdb_store.Store, s: &lexdb_sql.Stmt, out: mut &[]int, path
     }
     var txn = lexdb_store.begin()
     for x in path { append(mut &txn.path, x) }
+    txn.tmp = tmpOf(path)
     match findTable(st, mut &txn, &s.table) {
         Ok(found) {
             match found {
@@ -10671,6 +10978,7 @@ fn describe(st: &lexdb_store.Store, s: &lexdb_sql.Stmt, ptypes: &[]int, path: &[
     if s.kind != lexdb_sql.S_SELECT && !(dml && len(s.items) > 0) { return Ok([]) }
     var txn = lexdb_store.begin()
     for x in path { append(mut &txn.path, x) }
+    txn.tmp = tmpOf(path)
     if dml {
         let none: Option[Expr] = None
         let np: []Val = array(if s.params > len(ptypes) { s.params } else { len(ptypes) }, Val.Null)
@@ -10719,6 +11027,8 @@ pub type Session = record {
     localUndo: []str            // in a transaction block: the settings SET LOCAL or set_config(..., true) changed, "name\x00old"
     zone: lexdb_time.Zone       // SET TimeZone (9.95): copied to each statement's Txn
     savedZone: []lexdb_time.Zone // in a transaction block: the zone at its BEGIN
+    tmp: str                    // its temporary schema once it has made one (9.96): pg_temp_ and id
+    onCommit: []str             // its temporary tables ON COMMIT DELETE ROWS (and DROP, made in the open block)
 }
 
 // The session's time zone (SET TimeZone, 9.95).
@@ -10752,17 +11062,52 @@ type SavePt = record { name: str; mark: int }
 // The columns a statement returns, its names looked up along the session's
 // search path.
 pub fn (s: &Session) describe(stmt: &lexdb_sql.Stmt, ptypes: &[]int): Result[[]OutCol, DbErr] {
-    return describe(&s.st, stmt, ptypes, &s.path)
+    return describe(&s.st, stmt, ptypes, &s.txnPath())
 }
 
 // A statement's parameter types (paramTypes), along the session's path.
 pub fn (s: &Session) paramTypes(stmt: &lexdb_sql.Stmt, given: &[]int): []int {
-    return paramTypes(&s.st, stmt, given, &s.path)
+    return paramTypes(&s.st, stmt, given, &s.txnPath())
 }
 
 // Changes when the search path does: a statement's description kept from
-// before may name other tables.
-pub fn (s: &Session) pathVersion(): int { return s.pathAt }
+// before may name other tables. And when its temporary objects change
+// (9.96).
+pub fn (s: &Session) pathVersion(): int {
+    if len(s.tmp) == 0 { return s.pathAt }
+    return s.pathAt + num(&s.st.memoGet(&tmpVerKey(s.id)).unwrapOr("0"))
+}
+
+// The path its statements' transactions carry: its temporary schema
+// first, once it has one (9.96).
+fn (s: &Session) txnPath(): []str {
+    if len(s.tmp) > 0 { return withTmp(&s.path, &s.tmp) }
+    var q: []str = []
+    for n in s.path { append(mut &q, n) }
+    return q
+}
+
+// The temporary schema on a transaction's path, "" none.
+fn tmpOf(path: &[]str): str {
+    for n in path { if lexdb_base.isTempSchema(&n) { return n } }
+    return ""
+}
+
+// A transaction of the session's: its path, temporary schema, number and
+// time zone.
+fn (s: &Session) setUp(t: mut &lexdb_store.Txn) {
+    t.path = s.txnPath()
+    t.tmp = s.tmp
+    t.sess = s.id
+    t.zone = s.zone
+}
+
+// A transaction ended without committing: if it changed temporary objects'
+// catalog, the session's kept plans and descriptions go (9.96).
+fn (s: &Session) tmpUndo(t: &lexdb_store.Txn) { if t.tmpDdl { tmpChanged(&s.st, s.id) } }
+
+// After a statement: the temporary schema it made, if it did.
+fn (s: mut &Session) adopt(t: &lexdb_store.Txn) { if len(s.tmp) == 0 && len(t.tmp) > 0 { s.tmp = t.tmp } }
 
 fn (s: mut &Session) setPath(names: &[]str) {
     var p: []str = []
@@ -10770,11 +11115,7 @@ fn (s: mut &Session) setPath(names: &[]str) {
     if len(p) == 1 && p[0] == "public" { p = [] }
     s.path = p
     s.pathAt += 1
-    if len(s.txn) > 0 {
-        var q: []str = []
-        for n in s.path { append(mut &q, n) }
-        s.txn[0].path = q
-    }
+    if len(s.txn) > 0 { s.txn[0].path = s.txnPath() }
 }
 
 // SHOW's columns: the setting's name, or SHOW ALL's name and setting.
@@ -10950,7 +11291,7 @@ fn (s: &Session) show(name: &str): Result[Res, DbErr] {
 pub fn parkedSession(st: lexdb_store.Store): Session {
     return Session{st: st, txn: [], failed: false, maxRecursion: MAX_RECURSION, timeoutMs: 0, maxMem: MAX_STATEMENT_MEM,
                    saved: [], readOnly: false, path: [], pathAt: 0, savedPath: [], id: 0, batch: true, saves: [], savedRoles: [],
-                   custom: [], savedCustom: [], localUndo: [], zone: lexdb_time.utc(), savedZone: []}
+                   custom: [], savedCustom: [], localUndo: [], zone: lexdb_time.utc(), savedZone: [], tmp: "", onCommit: []}
 }
 
 pub fn newSession(st: lexdb_store.Store): Session {
@@ -10964,7 +11305,7 @@ pub fn newSession(st: lexdb_store.Store): Session {
     st.memoPut(&"sessions", &id.toStr())
     return Session{st: st, txn: [], failed: false, maxRecursion: MAX_RECURSION, timeoutMs: 0, maxMem: MAX_STATEMENT_MEM,
                    saved: [], readOnly: false, path: [], pathAt: 0, savedPath: [], id: id, batch: true, saves: [], savedRoles: [],
-                   custom: [], savedCustom: [], localUndo: [], zone: lexdb_time.utc(), savedZone: []}
+                   custom: [], savedCustom: [], localUndo: [], zone: lexdb_time.utc(), savedZone: [], tmp: "", onCommit: []}
 }
 
 // max_statement_mem's default.
@@ -11039,9 +11380,111 @@ fn settingValue(name: &str, v: &Val): Result[int, DbErr] {
 // Ends the session: an open block is rolled back (a snapshot released,
 // its locks), and its advisory locks released.
 pub fn (s: mut &Session) close() {
-    if len(s.txn) > 0 { s.st.abort(pop(mut &s.txn)) }
+    if len(s.txn) > 0 {
+        let t = pop(mut &s.txn)
+        s.tmpUndo(&t)
+        s.st.abort(t)
+    }
     s.failed = false
+    // its temporary objects (9.96); should this fail, the next start drops them
+    if len(s.tmp) > 0 { let r = s.dropTemps() }
     advRelease(&s.st, s.id, true)
+}
+
+// Its temporary objects dropped, in a transaction of their own (tried
+// again on a serialization failure).
+fn (s: mut &Session) dropTemps(): Result[Unit, DbErr] {
+    var tries = 0
+    while true {
+        var t = lexdb_store.begin()
+        s.setUp(mut &t)
+        let st = s.st
+        match dropTempIn(&st, mut &t, &s.tmp) {
+            Ok(n) {
+                if n == 0 {
+                    st.abort(t)
+                    s.onCommit = []
+                    return Ok(Unit{})
+                }
+                match st.commit(t) {
+                    Ok(_) {
+                        s.onCommit = []
+                        return Ok(Unit{})
+                    }
+                    Err(x) {
+                        tmpChanged(&st, s.id)
+                        tries += 1
+                        if x.state != lexdb_base.S_CONFLICT || tries >= 10 { return Err(x) }
+                    }
+                }
+            }
+            Err(x) {
+                st.abort(t)
+                return Err(x)
+            }
+        }
+    }
+    return Err(e("XX000", "unreachable"))
+}
+
+// DISCARD TEMP | ALL | PLANS | SEQUENCES (9.96). ALL drops the temporary
+// objects, resets the settings (RESET ALL) and releases the advisory
+// locks; PLANS and SEQUENCES are accepted and do nothing (a kept plan
+// follows the catalog anyway; currval is not forgotten).
+fn (s: mut &Session) discard(what: &str): Result[Res, DbErr] {
+    let tag = "DISCARD " + strings.toUpperAscii(what)
+    if what == "all" && len(s.txn) > 0 {
+        s.failed = true
+        return Err(e("25001", "DISCARD ALL cannot run inside a transaction block"))
+    }
+    if (what == "temp" || what == "all") && len(s.tmp) > 0 {
+        if len(s.txn) > 0 {
+            if s.failed { return Err(e("25P02", "current transaction is aborted, commands ignored until end of transaction block")) }
+            if s.readOnly {
+                s.failed = true
+                return Err(e("25006", "cannot execute DISCARD TEMP in a read-only transaction"))
+            }
+            let st = s.st
+            match dropTempIn(&st, mut &s.txn[0], &s.tmp) {
+                Ok(_) {}
+                Err(x) {
+                    s.failed = true
+                    return Err(x)
+                }
+            }
+        } else {
+            try s.dropTemps()
+        }
+    }
+    if what == "all" {
+        s.resetAll()
+        advRelease(&s.st, s.id, true)
+    }
+    return Ok(tagOnly(tag))
+}
+
+// RESET ALL: lexdb's settings to their defaults.
+fn (s: mut &Session) resetAll() {
+    s.setZone(lexdb_time.utc())
+    if len(s.path) > 0 { s.setPath(&["public"]) }
+    s.maxRecursion = MAX_RECURSION
+    s.timeoutMs = 0
+    s.maxMem = MAX_STATEMENT_MEM
+    s.batch = true
+}
+
+// Whether a statement a READ ONLY block refuses writes only temporary
+// tables, which PostgreSQL allows (INSERT, UPDATE, DELETE, COPY FROM: not
+// DDL, nor TRUNCATE).
+fn (s: mut &Session) tempWrite(stmt: &lexdb_sql.Stmt): bool {
+    if len(s.tmp) == 0 || len(s.txn) == 0 { return false }
+    if !(stmt.kind == lexdb_sql.S_INSERT || stmt.kind == lexdb_sql.S_UPDATE || stmt.kind == lexdb_sql.S_DELETE ||
+         (stmt.kind == lexdb_sql.S_COPY && stmt.copy.from)) { return false }
+    let st = s.st
+    match catKey(&st, mut &s.txn[0], &stmt.table, false) {
+        Ok(k) { return tempRel(&k) }
+        Err(_) { return false }
+    }
 }
 
 fn isWrite(kind: int): bool {
@@ -11277,6 +11720,7 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
         lexdb_sql.S_EMPTY { return Ok(tagOnly("")) }
         lexdb_sql.S_SHOW { return s.show(&stmt.table) }
         lexdb_sql.S_SET {
+            if strings.startsWith(&stmt.table, "discard:") { return s.discard(&stmt.table[8..len(stmt.table)]) }
             if stmt.table == "role" || stmt.table == "session_authorization" { return s.setRole(stmt) }
             if strings.startsWith(&stmt.table, "constraints:") {
                 // outside a block it does nothing (PostgreSQL warns)
@@ -11308,12 +11752,7 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
                 return Ok(tagOnly(if stmt.ifFlag { "RESET" } else { "SET" }))
             }
             if stmt.table == "all" {
-                s.setZone(lexdb_time.utc())
-                if len(s.path) > 0 { s.setPath(&["public"]) }
-                s.maxRecursion = MAX_RECURSION
-                s.timeoutMs = 0
-                s.maxMem = MAX_STATEMENT_MEM
-                s.batch = true
+                s.resetAll()
             } else if stmt.table == "lexdb_batch" {
                 var on = true                       // DEFAULT, RESET
                 match stmt.limit {
@@ -11370,9 +11809,9 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
                 s.savedCustom = [cs]
                 s.localUndo = []
                 s.savedZone = [s.zone]
-                var q: []str = []
-                for n in s.path { append(mut &q, n) }
+                let q = s.txnPath()
                 s.txn[0].path = q
+                s.txn[0].tmp = s.tmp
                 s.txn[0].sess = s.id
                 s.txn[0].zone = s.zone
             }
@@ -11388,15 +11827,36 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
                 match checkPending(&st, mut &s.txn[0], &all) {
                     Ok(_) {}
                     Err(x) {
-                        s.st.abort(pop(mut &s.txn))
+                        let t = pop(mut &s.txn)
+                        s.tmpUndo(&t)
+                        s.st.abort(t)
                         s.restore()
                         return Err(x)
                     }
                 }
             }
+            // its temporary tables' ON COMMIT (9.96)
+            var kept: []str = []
+            if !s.failed && ((len(s.onCommit) > 0 && s.txn[0].hasWrites()) || len(s.txn[0].onCommit) > 0) {
+                let st = s.st
+                let have = copyStrs(&s.onCommit)
+                match onCommitDo(&st, mut &s.txn[0], &have) {
+                    Ok(k) { kept = k }
+                    Err(x) {
+                        let t = pop(mut &s.txn)
+                        s.tmpUndo(&t)
+                        s.st.abort(t)
+                        s.restore()
+                        return Err(x)
+                    }
+                }
+            } else {
+                kept = copyStrs(&s.onCommit)
+            }
             let t = pop(mut &s.txn)
             if s.failed {
                 s.failed = false
+                s.tmpUndo(&t)
                 s.st.abort(t)
                 s.restore()
                 return Ok(tagOnly("ROLLBACK"))
@@ -11407,11 +11867,22 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
             s.undoLocal()
             s.savedCustom = []
             s.savedZone = []
-            try s.st.commit(t)
+            let ddl = t.tmpDdl
+            match s.st.commit(t) {
+                Ok(_) { s.onCommit = kept }
+                Err(x) {
+                    if ddl { tmpChanged(&s.st, s.id) }
+                    return Err(x)
+                }
+            }
             return Ok(tagOnly("COMMIT"))
         }
         lexdb_sql.S_ROLLBACK {
-            if len(s.txn) > 0 { s.st.abort(pop(mut &s.txn)) }
+            if len(s.txn) > 0 {
+                let t = pop(mut &s.txn)
+                s.tmpUndo(&t)
+                s.st.abort(t)
+            }
             s.failed = false
             s.saves = []
             s.restore()
@@ -11439,6 +11910,7 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
             }
             // ROLLBACK TO: its writes since, and the error if any, gone; it stays
             s.txn[0].undoTo(s.saves[i].mark)
+            if s.txn[0].tmpDdl { tmpChanged(&s.st, s.id) }          // (temporary objects' DDL may be gone, 9.96)
             while len(s.saves) > i + 1 { let x = pop(mut &s.saves) }
             s.failed = false
             return Ok(tagOnly("ROLLBACK"))
@@ -11449,7 +11921,7 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
         if s.failed {
             return Err(e("25P02", "current transaction is aborted, commands ignored until end of transaction block"))
         }
-        if s.readOnly && (isWrite(stmt.kind) || (stmt.kind == lexdb_sql.S_COPY && stmt.copy.from)) {
+        if s.readOnly && (isWrite(stmt.kind) || (stmt.kind == lexdb_sql.S_COPY && stmt.copy.from)) && !s.tempWrite(stmt) {
             s.failed = true
             return Err(e("25006", "cannot execute " + stmtName(stmt.kind) + " in a read-only transaction"))
         }
@@ -11462,8 +11934,10 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
         // checked at COMMIT either way, and the latest is less often stale
         s.txn[0].live = stmt.kind == lexdb_sql.S_UPDATE || stmt.kind == lexdb_sql.S_DELETE || stmt.kind == lexdb_sql.S_INSERT ||
                         (stmt.kind == lexdb_sql.S_COPY && stmt.copy.from) || (stmt.kind == lexdb_sql.S_SELECT && stmt.lockMode > 0)
+        if s.readOnly { s.txn[0].live = false }       // (a temporary table's writes: its snapshot is the session's own, 9.96)
         let r = execIn(&st, mut &s.txn[0], stmt, params, ptypes, s.limits(), pc, input, out, pull)
         s.txn[0].live = false
+        if len(s.tmp) == 0 && len(s.txn[0].tmp) > 0 { s.tmp = s.txn[0].tmp }
         if r.isErr() {
             s.failed = true
             return r
@@ -11481,14 +11955,30 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
         // (a SELECT that locks reads the latest, as UPDATE does)
         let snap = (stmt.kind == lexdb_sql.S_SELECT && stmt.lockMode == 0) || (stmt.kind == lexdb_sql.S_COPY && !stmt.copy.from)
         var t = if snap { try s.st.beginSnapshot() } else { lexdb_store.begin() }
-        for n in s.path { append(mut &t.path, n) }
-        t.sess = s.id
-        t.zone = s.zone
+        s.setUp(mut &t)
         match execIn(&s.st, mut &t, stmt, params, ptypes, lim, pc, input, out, pull) {
             Ok(r) {
+                s.adopt(&t)
+                // its temporary tables' ON COMMIT (9.96)
+                var kept = copyStrs(&s.onCommit)
+                if (len(s.onCommit) > 0 && t.hasWrites()) || len(t.onCommit) > 0 {
+                    match onCommitDo(&s.st, mut &t, &kept) {
+                        Ok(k) { kept = k }
+                        Err(x) {
+                            s.tmpUndo(&t)
+                            s.st.abort(t)
+                            return Err(x)
+                        }
+                    }
+                }
+                let ddl = t.tmpDdl
                 match s.st.commit(t) {
-                    Ok(_) { return Ok(r) }
+                    Ok(_) {
+                        s.onCommit = kept
+                        return Ok(r)
+                    }
                     Err(x) {
+                        if ddl { tmpChanged(&s.st, s.id) }
                         tries += 1
                         // (a COPY whose data was read as it came, or that committed
                         // batches, cannot run again)
@@ -11497,6 +11987,8 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
                 }
             }
             Err(x) {
+                s.adopt(&t)
+                s.tmpUndo(&t)
                 s.st.abort(t)
                 tries += 1
                 // (a COPY TO sent as it ran is not run again)
@@ -12048,6 +12540,11 @@ fn addForeign(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, 
     }
     match try byKeyOpt(st, txn, &refKey) {
         Some(p) {
+            // temporary to temporary only, permanent to permanent (9.96)
+            if tempRel(&t.name) != tempRel(&p.name) {
+                return Err(e("42P16", "constraints on " + (if tempRel(&t.name) { "temporary" } else { "permanent" }) + " tables may reference only " +
+                             (if tempRel(&t.name) { "temporary" } else { "permanent" }) + " tables"))
+            }
             let f = try makeFk(st, txn, t, &p, c, &refKey)
             append(mut &t.fks, f)
             var pm = p
@@ -12412,7 +12909,9 @@ fn nameOfText(t: &str): str {
 // The sequence named n (a name as written: along the search path), or none.
 fn findSeq(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, n: &str): Result[Option[Seq], DbErr] {
     var keys: []str = []
-    if len(txn.path) == 0 || lexdb_sql.isQual(n) {
+    if lexdb_sql.isQual(n) {
+        append(mut &keys, if n[0] == 'p' { try tmpQual(st, txn, n) } else { n.toStr() })
+    } else if len(txn.path) == 0 {
         append(mut &keys, n)
     } else {
         for sc in txn.path { append(mut &keys, lexdb_sql.qual(&sc, n)) }
@@ -12472,7 +12971,9 @@ fn newSeq(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, key: &str, typ: int
     d.key = key
     d.typ = typ
     // unique: the catalog's version (one per DDL statement) and the time
-    d.id = (try catVersion(st, txn)) + "." + time.unixMillis().toStr() + "." + time.monotonicNs().toStr()
+    // (a temporary one's not: its DDL reads nothing others write, 9.96)
+    d.id = (if tempRel(key) { "t" + txn.sess.toStr() } else { try catVersion(st, txn) }) + "." + time.unixMillis().toStr() + "." +
+           time.monotonicNs().toStr()
     let r = try seqFrom(o, &d, true)
     try txn.put(CATALOG, seqRow(key), encSeq(&r))
     return Ok(r)
@@ -12947,15 +13448,7 @@ fn defAt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, d: &Defs, t: &Table,
 
 // CREATE SEQUENCE.
 fn createSeq(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
-    var key = s.table
-    if lexdb_sql.isQual(&s.table) {
-        let sn = lexdb_sql.schemaOf(&s.table)
-        if !(try schemaExists(st, txn, &sn)) { return Err(e("3F000", "schema \"" + sn + "\" does not exist")) }
-    } else {
-        let sn = try createSchema(st, txn)
-        if len(sn) == 0 { return Err(e("3F000", "no schema has been selected to create in")) }
-        key = lexdb_sql.qual(&sn, &s.table)
-    }
+    let key = try createKey(st, txn, &s.table, s.temp)
     if try relExists(st, txn, &key) {
         if s.ifFlag { return Ok(tagOnly("CREATE SEQUENCE")) }
         return Err(e("42P07", "relation \"" + lexdb_sql.baseName(&key) + "\" already exists"))
@@ -12967,7 +13460,7 @@ fn createSeq(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.St
         try ownSeq(st, txn, mut &d, &s.seq.owned)
         try txn.put(CATALOG, seqRow(&key), encSeq(&d))
     }
-    try bumpCatalog(st, txn)
+    try bumpFor(st, txn, &key)
     return Ok(tagOnly("CREATE SEQUENCE"))
 }
 
@@ -13006,7 +13499,7 @@ fn alterSeq(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
     if s.seq.restart > 0 {
         try setVal(st, &d, if s.seq.restart == 2 { s.seq.restartWith } else { d.start }, false)
     }
-    try bumpCatalog(st, txn)
+    try bumpFor(st, txn, &d.key)
     return Ok(tagOnly("ALTER SEQUENCE"))
 }
 
@@ -13050,7 +13543,7 @@ fn dropSeq(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
         }
     }
     try dropSeqRows(st, txn, &d)
-    try bumpCatalog(st, txn)
+    try bumpFor(st, txn, &d.key)
     return Ok(tagOnly("DROP SEQUENCE"))
 }
 
@@ -13059,10 +13552,18 @@ fn allSeqs(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &str): Result[
     let from = if len(sc) > 0 { seqRow(&lexdb_sql.qual(sc, &"")) } else { "\x04" }
     let to = if len(sc) > 0 { from + "\xff" } else { "\x05" }
     var out: []Seq = []
-    try st.scan(txn, CATALOG, from, to, fn(en: &lexdb_store.Entry): bool {
-        append(mut &out, decSeq(&en.val))
-        return true
-    })
+    // (all of them: not other sessions' temporary ones, 9.96)
+    if len(sc) == 0 {
+        try catScan(st, txn, &from, &to, &"\x04", fn(en: &lexdb_store.Entry): bool {
+            append(mut &out, decSeq(&en.val))
+            return true
+        })
+    } else {
+        try st.scan(txn, CATALOG, from, to, fn(en: &lexdb_store.Entry): bool {
+            append(mut &out, decSeq(&en.val))
+            return true
+        })
+    }
     return Ok(out)
 }
 
@@ -13101,7 +13602,8 @@ fn makeColSeqs(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table,
 
 // The sequences owned by table t (its column col; "" any) dropped.
 fn dropOwnedSeqs(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, col: &str): Result[Unit, DbErr] {
-    for d in try allSeqs(st, txn, &"") {
+    // (a temporary table's are in its schema: 9.96)
+    for d in try allSeqs(st, txn, &(if tempRel(&t.name) { lexdb_sql.schemaOf(&t.name) } else { "" })) {
         if d.ownerT == t.name && (len(col) == 0 || d.ownerC == col) { try dropSeqRows(st, txn, &d) }
     }
     return Ok(Unit{})
@@ -13278,6 +13780,7 @@ fn copyStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
             var fresh = lexdb_store.begin()
             for n in txn.path { append(mut &fresh.path, n) }
             fresh.sess = txn.sess
+            fresh.tmp = txn.tmp
             fresh.now = txn.now
             let done = replace(txn, fresh)
             match st.commit(done) {
@@ -16045,6 +16548,12 @@ fn shownIn(path: &[]str, schema: &str, name: &str): str {
     return quoteIfNeeded(schema) + "." + quoteIfNeeded(name)
 }
 
+// shownIn, a name a temporary relation hides (tnames, 9.96) qualified.
+fn shownBy(path: &[]str, tnames: &[]str, schema: &str, name: &str): str {
+    if len(tnames) > 0 && !lexdb_base.isTempSchema(schema) && hasStr(tnames, name) { return quoteIfNeeded(schema) + "." + quoteIfNeeded(name) }
+    return shownIn(path, schema, name)
+}
+
 fn colNum(t: &Table, name: &str): int {
     for i in 0..len(t.cols) { if t.cols[i].name == name { return i + 1 } }
     return 0
@@ -16221,8 +16730,9 @@ fn catSnap(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[CatSnap, D
         append(mut &schemas, en.key[1..len(en.key)])
         return true
     })
+    if len(txn.tmp) > 0 { append(mut &schemas, txn.tmp) }      // the session's temporary schema (9.96)
     var raw: []str = []
-    try st.scan(txn, CATALOG, "\x06", "", fn(en: &lexdb_store.Entry): bool {
+    try catScan(st, txn, &"\x06", &"", &"", fn(en: &lexdb_store.Entry): bool {
         append(mut &keys, en.key)
         append(mut &raw, en.val)
         return true
@@ -16233,19 +16743,23 @@ fn catSnap(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[CatSnap, D
                        user: st.memoGet(&userKey(txn.sess)).unwrapOr("lexdb"), enums: try allEnums(st, txn)}
     var aclKeys: []str = []
     var aclVals: []str = []
-    try st.scan(txn, CATALOG, ACL_PRE, ACL_PRE + "\xff", fn(en: &lexdb_store.Entry): bool {
+    try catScan(st, txn, &ACL_PRE, &(ACL_PRE + "\xff"), &(ACL_PRE + "r:"), fn(en: &lexdb_store.Entry): bool {
         append(mut &aclKeys, en.key[len(ACL_PRE)..len(en.key)].toStr())
         append(mut &aclVals, en.val)
         return true
     })
     for i in 0..len(aclKeys) { snap.acls.put(aclKeys[i], aclVals[i]) }
+    // the session's temporary relations' names: a permanent one of the same
+    // name is hidden by it (9.96)
+    var tnames: []str = []
+    if len(txn.tmp) > 0 { for k in keys { if lexdb_sql.schemaOf(&k) == txn.tmp { append(mut &tnames, lexdb_sql.baseName(&k)) } } }
     for i in 0..len(keys) {
         let t = try decTable(&keys[i], &raw[i])
         let schema = lexdb_sql.schemaOf(&keys[i])
         let name = lexdb_sql.baseName(&keys[i])
         if len(t.view) > 0 {
             append(mut &snap.views, CatTab{key: keys[i], t: t, oid: catOid(&"r", &keys[i]), schema: schema, name: name,
-                                           shown: shownIn(&txn.path, &schema, &name), idxs: []})
+                                           shown: shownBy(&txn.path, &tnames, &schema, &name), idxs: []})
             continue
         }
         var idxs: []CatIdx = []
@@ -16269,7 +16783,7 @@ fn catSnap(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[CatSnap, D
                                      primary: false, con: ix.con, pred: cloneOptE(&ix.pred), opts: copyStrs(&ix.opts), exprs: xs})
         }
         append(mut &snap.tabs, CatTab{key: keys[i], t: t, oid: catOid(&"r", &keys[i]), schema: schema, name: name,
-                                      shown: shownIn(&txn.path, &schema, &name), idxs: idxs})
+                                      shown: shownBy(&txn.path, &tnames, &schema, &name), idxs: idxs})
     }
     // the constraints, now that every table's OID is known
     var cons: []CatCon = []
@@ -16376,14 +16890,21 @@ fn bindCatalog(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[Unit, 
     }
     var aks: []str = []
     var avs: []str = []
-    try st.scan(txn, CATALOG, ACL_PRE, ACL_PRE + "\xff", fn(en: &lexdb_store.Entry): bool {
+    try catScan(st, txn, &ACL_PRE, &(ACL_PRE + "\xff"), &(ACL_PRE + "r:"), fn(en: &lexdb_store.Entry): bool {
         append(mut &aks, en.key[len(ACL_PRE)..len(en.key)].toStr())
         append(mut &avs, strings.replaceAll(strings.replaceAll(en.val, "\n", "\x1e"), "\t", "\x1d"))
         return true
     })
     for i in 0..len(aks) { b.add("A\t" + aks[i] + "\t" + avs[i] + "\n") }
-    let cur = if len(snap.path) == 0 { "public" } else { snap.path[0] }
+    var cur = "public"
+    for x in snap.path {
+        if x != txn.tmp {
+            cur = x
+            break
+        }
+    }
     b.add("p\t" + cur + "\n")
+    if len(txn.tmp) > 0 { b.add("T\t" + txn.tmp + "\n") }       // the session's temporary schema (9.96)
     for ct in snap.tabs {
         b.add("r\t" + ct.oid.toStr() + "\t" + ct.shown + "\t" + ct.schema + "\t" + ct.name + "\n")
         for ix in ct.idxs {
@@ -16464,6 +16985,10 @@ fn relOidOf(se: &SeqEnv, s: &str): int {
     }
     append(mut &parts, cur.toStr())
     if len(parts) == 2 { sc = parts[0] }
+    if sc == "pg_temp" {
+        sc = "pg_temp_"            // the session's temporary schema (9.96); none: no name matches
+        for l in catLines(se, &"T") { sc = l[0] }
+    }
     let name = parts[len(parts) - 1]
     for l in catLines(se, &"r") {
         if l[3] != name { continue }
@@ -17509,7 +18034,8 @@ fn gcdInt(a0: int, b0: int): int {
 
 // The functions that need the session (9.92).
 fn isSessFn(n: &str): bool {
-    return n == "current_setting" || n == "set_config" || n == "pg_backend_pid" || n == "txid_current" || n == "pg_current_xact_id"
+    return n == "current_setting" || n == "set_config" || n == "pg_backend_pid" || n == "txid_current" || n == "pg_current_xact_id" ||
+           n == "pg_my_temp_schema" || n == "pg_is_other_temp_schema"
 }
 
 fn sessCall(name: &str, vs: &[]Val, env: &Env): Result[Val, DbErr] {
@@ -17519,6 +18045,16 @@ fn sessCall(name: &str, vs: &[]Val, env: &Env): Result[Val, DbErr] {
     }
     let n = len(vs)
     if name == "pg_backend_pid" && n == 0 { return Ok(Val.Int(se.sess)) }
+    // the session's temporary schema's OID, 0 none; whether an OID is
+    // another session's (9.96: they are not in lexdb's pg_namespace, so
+    // no OID of one is known)
+    if name == "pg_my_temp_schema" && n == 0 {
+        match se.st.memoGet(&tmpMemo(se.sess)) {
+            Some(t) { return Ok(Val.Int(nspOid(&t))) }
+            None { return Ok(Val.Int(0)) }
+        }
+    }
+    if name == "pg_is_other_temp_schema" && n == 1 { return Ok(if isNull(&vs[0]) { Val.Null } else { Val.Bool(false) }) }
     if (name == "txid_current" || name == "pg_current_xact_id") && n == 0 {
         // a number per transaction: the next of the store's count the first time
         // a transaction asks, the same after
@@ -17869,6 +18405,9 @@ fn infoType(t: &lexdb_sql.TypeName): str {
 }
 
 // The rows of catalog relation rel.
+// pg_class.relpersistence: t for a temporary relation (9.96), else p.
+fn persistOf(schema: &str): str { return if lexdb_base.isTempSchema(schema) { "t" } else { "p" } }
+
 fn catRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &str): Result[[][]Val, DbErr] {
     let snap = try catSnap(st, txn)
     var rows: [][]Val = []
@@ -17890,12 +18429,12 @@ fn catRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &str): Result
                 let trig = len(ct.t.fks) > 0 || len(ct.t.refBy) > 0
                 let ta = aclOf(&snap, &relObj(&ct.key))
                 append(mut &rows, [iv(ct.oid), tv(&ct.name), iv(nspOid(&ct.schema)), iv(0), iv(0), iv(roleOid(&ownerName(&snap, &ta), &roles)), iv(2), iv(ct.oid), iv(0),
-                                   iv(0), Val.Real(-1.0f), iv(0), iv(0), bv(hasIdx), bv(false), tv(&"p"), tv(&"r"), iv(len(ct.t.cols) - (if rowidKeyed(&ct.t) { 1 } else { 0 })),
+                                   iv(0), Val.Real(-1.0f), iv(0), iv(0), bv(hasIdx), bv(false), tv(&persistOf(&ct.schema)), tv(&"r"), iv(len(ct.t.cols) - (if rowidKeyed(&ct.t) { 1 } else { 0 })),
                                    iv(len(ct.t.checks)), bv(false), bv(trig), bv(false), bv(false), bv(false), bv(true), tv(&"d"),
                                    bv(false), iv(0), iv(0), iv(0), aclText(&snap, &ta, &"arwdDxt"), Val.Null, Val.Null])
                 for ix in ct.idxs {
                     append(mut &rows, [iv(ix.oid), tv(&ix.name), iv(nspOid(&ct.schema)), iv(0), iv(0), iv(OID_OWNER), iv(403), iv(ix.oid),
-                                       iv(0), iv(0), Val.Real(0.0f), iv(0), iv(0), bv(false), bv(false), tv(&"p"), tv(&"i"), iv(len(ix.cols)),
+                                       iv(0), iv(0), Val.Real(0.0f), iv(0), iv(0), bv(false), bv(false), tv(&persistOf(&ct.schema)), tv(&"i"), iv(len(ix.cols)),
                                        iv(0), bv(false), bv(false), bv(false), bv(false), bv(false), bv(true), tv(&"n"), bv(false),
                                        iv(0), iv(0), iv(0), Val.Null, Val.Null, Val.Null])
                 }
@@ -17903,7 +18442,7 @@ fn catRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &str): Result
             for v in snap.views {
                 let va = aclOf(&snap, &relObj(&v.key))
                 append(mut &rows, [iv(v.oid), tv(&v.name), iv(nspOid(&v.schema)), iv(0), iv(0), iv(roleOid(&ownerName(&snap, &va), &roles)), iv(0), iv(0), iv(0),
-                                   iv(0), Val.Real(-1.0f), iv(0), iv(0), bv(false), bv(false), tv(&"p"), tv(&"v"), iv(len(v.t.cols)),
+                                   iv(0), Val.Real(-1.0f), iv(0), iv(0), bv(false), bv(false), tv(&persistOf(&v.schema)), tv(&"v"), iv(len(v.t.cols)),
                                    iv(0), bv(true), bv(false), bv(false), bv(false), bv(false), bv(true), tv(&"n"),
                                    bv(false), iv(0), iv(0), iv(0), aclText(&snap, &va, &"arwdDxt"), Val.Null, Val.Null])
             }
@@ -17911,7 +18450,7 @@ fn catRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &str): Result
                 let sc = lexdb_sql.schemaOf(&d.key)
                 let sa = aclOf(&snap, &relObj(&d.key))
                 append(mut &rows, [iv(seqOid(&d)), tv(&lexdb_sql.baseName(&d.key)), iv(nspOid(&sc)), iv(0), iv(0), iv(roleOid(&ownerName(&snap, &sa), &roles)), iv(0),
-                                   iv(seqOid(&d)), iv(0), iv(1), Val.Real(1.0f), iv(0), iv(0), bv(false), bv(false), tv(&"p"), tv(&"S"),
+                                   iv(seqOid(&d)), iv(0), iv(1), Val.Real(1.0f), iv(0), iv(0), bv(false), bv(false), tv(&persistOf(&sc)), tv(&"S"),
                                    iv(3), iv(0), bv(false), bv(false), bv(false), bv(false), bv(false), bv(true), tv(&"n"), bv(false),
                                    iv(0), iv(0), iv(0), aclText(&snap, &sa, &"rwU"), Val.Null, Val.Null])
             }
@@ -18095,7 +18634,7 @@ fn catRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &str): Result
         }
         "information_schema.tables" {
             for ct in snap.tabs {
-                append(mut &rows, [tv(&db), tv(&ct.schema), tv(&ct.name), tv(&"BASE TABLE"), Val.Null, Val.Null, Val.Null, Val.Null, Val.Null,
+                append(mut &rows, [tv(&db), tv(&ct.schema), tv(&ct.name), tv(&if persistOf(&ct.schema) == "t" { "LOCAL TEMPORARY" } else { "BASE TABLE" }), Val.Null, Val.Null, Val.Null, Val.Null, Val.Null,
                                    tv(&"YES"), tv(&"NO"), Val.Null])
             }
             for v in snap.views {
@@ -18541,11 +19080,14 @@ fn readsOf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
 }
 
 // Every view, by catalog key.
-fn allViews(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[[]Table, DbErr] {
+fn allViews(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[[]Table, DbErr] { return viewsIn(st, txn, &"\x06", &"") }
+
+// The views with keys in [lo, hi).
+fn viewsIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, lo: &str, hi: &str): Result[[]Table, DbErr] {
     var out: []Table = []
     var keys: []str = []
     var vals: []str = []
-    try st.scan(txn, CATALOG, "\x06", "", fn(en: &lexdb_store.Entry): bool {
+    try st.scan(txn, CATALOG, lo.toStr(), hi.toStr(), fn(en: &lexdb_store.Entry): bool {
         if strings.startsWith(&en.val, VIEW_MARK) {
             append(mut &keys, en.key)
             append(mut &vals, en.val)
@@ -18574,7 +19116,10 @@ fn allTables(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[[]Table,
 
 // The views that read relation k, directly or through other views.
 fn dependentViews(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, k: &str): Result[[]str, DbErr] {
-    let vs = try allViews(st, txn)
+    // a temporary relation's: its schema's views only (a view reading it is
+    // temporary, and no other session's can), 9.96
+    let sc = lexdb_sql.schemaOf(k)
+    let vs = if tempRel(k) { try viewsIn(st, txn, &(sc + "\x1f"), &(sc + "\x20")) } else { try allViews(st, txn) }
     var out: []str = []
     var todo: []str = [k.toStr()]
     while len(todo) > 0 {
@@ -18609,30 +19154,18 @@ fn dropDependentViews(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, k: &str
 
 fn createView(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
     var key = s.table
-    if lexdb_sql.isQual(&s.table) {
-        let sn = lexdb_sql.schemaOf(&s.table)
-        if !(try schemaExists(st, txn, &sn)) { return Err(e("3F000", "schema \"" + sn + "\" does not exist")) }
+    if s.temp || (lexdb_sql.isQual(&s.table) && lexdb_sql.schemaOf(&s.table) == "pg_temp") {
+        key = try createKey(st, txn, &s.table, true)
+    } else if lexdb_sql.isQual(&s.table) {
+        key = try createKey(st, txn, &s.table, false)
     } else {
         let sn = try createSchema(st, txn)
         if len(sn) == 0 { return Err(e("3F000", "no schema has been selected to create in")) }
         key = try catKey(st, txn, &s.table, false)
-        if !(try relExists(st, txn, &key)) { key = lexdb_sql.qual(&sn, &s.table) }
+        if !(try relExists(st, txn, &key)) || tempRel(&key) { key = lexdb_sql.qual(&sn, &s.table) }
     }
     let base = lexdb_sql.baseName(&key)
-    var old: Option[Table] = None
-    if try relExists(st, txn, &key) {
-        let have = try st.get(txn, CATALOG, key)
-        let isView = match have {
-            Some(v) { strings.startsWith(&v, VIEW_MARK) }
-            None { false }
-        }
-        if !isView { return Err(e(if s.ifFlag { "42809" } else { "42P07" }, if s.ifFlag { "\"" + base + "\" is not a view" } else { "relation \"" + base + "\" already exists" })) }
-        if !s.ifFlag { return Err(e("42P07", "relation \"" + base + "\" already exists")) }
-        old = Some(decView(key, &have.unwrap()))
-        try needRelOwner(st, txn, &key, &"view")
-    } else {
-        try needCreate(st, txn, &key)
-    }
+    var old = try viewOld(st, txn, &key, s)
     // the query planned: its columns, and the relations it reads
     var q = try viewQuery(&decView(key, &encView(&[], &s.index, &[])))
     q.use = lexdb_sql.SUB_SCALAR - lexdb_sql.SUB_SCALAR     // a statement of its own
@@ -18648,6 +19181,17 @@ fn createView(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
     // a column's typmod, where the query's column is a table's
     var deps: []str = []
     try readsOf(st, txn, &q, mut &deps)
+    // a view reading a temporary relation is temporary (PostgreSQL says so
+    // in a NOTICE; lexdb has none), and may not be made elsewhere (9.96)
+    if !tempRel(&key) {
+        var reads = false
+        for d in deps { if tempRel(&d) { reads = true } }
+        if reads {
+            if lexdb_sql.isQual(&s.table) { return Err(e("42P16", "cannot create temporary relation in non-temporary schema")) }
+            key = try createKey(st, txn, &s.table, true)
+            old = try viewOld(st, txn, &key, s)
+        }
+    }
     for d in deps { if d == key { return Err(e("42P17", "infinite recursion detected in rules for relation \"" + base + "\"")) } }
     match old {
         Some(o) {
@@ -18668,11 +19212,31 @@ fn createView(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
     }
     try txn.put(CATALOG, key, encView(&cols, &s.index, &deps))
     if old.isNone() { try ownNew(st, txn, &relObj(&key)) }
-    try bumpCatalog(st, txn)
+    try bumpFor(st, txn, &key)
     return Ok(tagOnly("CREATE VIEW"))
 }
 
+// CREATE [OR REPLACE] VIEW's view key there already (OR REPLACE), or none
+// (CREATE is then checked); errors if it may not be made there.
+fn viewOld(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, key: &str, s: &lexdb_sql.Stmt): Result[Option[Table], DbErr] {
+    let base = lexdb_sql.baseName(key)
+    if try relExists(st, txn, key) {
+        let have = try st.get(txn, CATALOG, key.toStr())
+        let isView = match have {
+            Some(v) { strings.startsWith(&v, VIEW_MARK) }
+            None { false }
+        }
+        if !isView { return Err(e(if s.ifFlag { "42809" } else { "42P07" }, if s.ifFlag { "\"" + base + "\" is not a view" } else { "relation \"" + base + "\" already exists" })) }
+        if !s.ifFlag { return Err(e("42P07", "relation \"" + base + "\" already exists")) }
+        try needRelOwner(st, txn, key, &"view")
+        return Ok(Some(decView(key.toStr(), &have.unwrap())))
+    }
+    try needCreate(st, txn, key)
+    return Ok(None)
+}
+
 fn dropView(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
+    var keys: []str = []
     for c in s.cols {
         match try findTable(st, txn, &c.name) {
             Some(t) {
@@ -18681,13 +19245,15 @@ fn dropView(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
                 try dropDependentViews(st, txn, &t.name, s.cascade, &"view")
                 txn.del(CATALOG, t.name)
                 dropAcl(txn, &relObj(&t.name))
+                append(mut &keys, t.name)
             }
             None {
                 if !s.ifFlag { return Err(e("42P01", "view \"" + lexdb_sql.shown(&c.name) + "\" does not exist")) }
             }
         }
     }
-    try bumpCatalog(st, txn)
+    if len(keys) == 0 { append(mut &keys, "") }
+    try bumpKeys(st, txn, &keys)
     return Ok(tagOnly("DROP VIEW"))
 }
 
@@ -18712,7 +19278,7 @@ fn alterView(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.St
     txn.del(CATALOG, t.name)
     try txn.put(CATALOG, to, v)
     try moveAcl(st, txn, &relObj(&t.name), &relObj(&to))
-    try bumpCatalog(st, txn)
+    try bumpFor(st, txn, &to)
     return Ok(tagOnly("ALTER VIEW"))
 }
 
@@ -18759,6 +19325,8 @@ fn encAcl(a: &Acl): str {
 // for PUBLIC (PostgreSQL 15 on: not CREATE).
 fn defaultGrants(obj: &str): []Grant {
     if obj == "n:public" { return [Grant{to: "", privs: "U"}] }
+    // a session's temporary schema (9.96): its own, to use and make in
+    if len(obj) > 2 && obj[0] == 'n' && lexdb_base.isTempSchema(&obj[2..len(obj)]) { return [Grant{to: "", privs: "UC"}] }
     return []
 }
 

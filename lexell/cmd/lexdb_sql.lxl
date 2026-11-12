@@ -496,7 +496,16 @@ pub type Stmt = record {
     pub withTies: bool          // FETCH FIRST n ROWS WITH TIES (its n in limit)
     pub gsets: [][]int          // GROUP BY ROLLUP, CUBE, GROUPING SETS: each set, places in group; [] a plain GROUP BY
     pub maintCols: [][]str      // S_MAINT: per table in names, the columns named
+    // 9.96: CREATE TEMPORARY TABLE, SEQUENCE or VIEW, SELECT ... INTO
+    // TEMPORARY; CREATE TABLE's ON COMMIT (ONC_*)
+    pub temp: bool
+    pub onCommit: int
 }
+
+pub const ONC_NONE = 0
+pub const ONC_PRESERVE = 1
+pub const ONC_DELETE = 2
+pub const ONC_DROP = 3
 
 pub const CONFLICT_NONE = 0
 pub const CONFLICT_NOTHING = 1
@@ -564,7 +573,7 @@ pub fn newStmt(kind: int): Stmt {
                 unique: false, inner: [], distinct: false, having: None, subs: [], use: 0, setop: 0, setAll: false,
                 cte: -1, rec: false, cascade: false, src: "", srf: "", ordin: false, alters: [], cons: [], seqNames: [], seq: noSeqOpts(), idOpts: [], overriding: OVR_NONE,
                 copy: noCopyOpts(), wins: [], windows: [], conflict: CONFLICT_NONE, conflictCols: [], conflictCon: "", alias: "", conc: false, lockMode: 0, lockOf: [], lockWait: 0, noData: false, into: "", exprs: [],
-                distinctOn: [], withTies: false, gsets: [], maintCols: []}
+                distinctOn: [], withTies: false, gsets: [], maintCols: [], temp: false, onCommit: ONC_NONE}
 }
 
 // ---- the lexer
@@ -843,6 +852,23 @@ fn (p: mut &P) qname(): Result[str, lexdb_base.DbErr] {
     if p.acceptKw(".") { return Ok(qual(&first, &(try p.name()))) }
     return Ok(first)
 }
+
+// A relation's name where a statement reads or writes it: qname, but
+// public.name kept so (PUBLIC_Q), not made name: a temporary relation of
+// the name, found first along the path, must not hide it (9.96). The
+// executor's lookups (lexdb_exec.catKey) make it name.
+fn (p: mut &P) rname(): Result[str, lexdb_base.DbErr] {
+    let first = try p.name()
+    if p.acceptKw(".") {
+        let n = try p.name()
+        if first == "public" { return Ok(PUBLIC_Q + n) }
+        return Ok(qual(&first, &n))
+    }
+    return Ok(first)
+}
+
+// "public" and QSEP: an explicitly public name (rname).
+pub const PUBLIC_Q: str = "public\x1f"
 
 fn (p: mut &P) typeName(): Result[TypeName, lexdb_base.DbErr] {
     // pg_catalog.type: the type
@@ -1874,8 +1900,8 @@ fn (p: mut &P) createTable(): Result[Stmt, lexdb_base.DbErr] {
         try p.expectKw("exists")
         s.ifFlag = true
     }
-    s.table = try p.qname()
-    if p.isKw("as") || (p.isKw("(") && p.nameListThenAs()) { return p.createTableAs(s) }
+    s.table = try p.rname()
+    if p.isKw("as") || p.isKw("on") || (p.isKw("(") && p.nameListThenAs()) { return p.createTableAs(s) }
     try p.expectKw("(")
     while true {
         var cname = ""
@@ -1935,7 +1961,24 @@ fn (p: mut &P) createTable(): Result[Stmt, lexdb_base.DbErr] {
         if !p.acceptKw(",") { break }
     }
     try p.expectKw(")")
+    try p.onCommit(mut &s)
     return Ok(s)
+}
+
+// [ON COMMIT PRESERVE ROWS | DELETE ROWS | DROP] (9.96).
+fn (p: mut &P) onCommit(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
+    if !p.acceptKw("on") { return Ok(Unit{}) }
+    try p.expectKw("commit")
+    if p.acceptKw("drop") {
+        s.onCommit = ONC_DROP
+        return Ok(Unit{})
+    }
+    if p.acceptKw("preserve") { s.onCommit = ONC_PRESERVE } else {
+        try p.expectKw("delete")
+        s.onCommit = ONC_DELETE
+    }
+    try p.expectKw("rows")
+    return Ok(Unit{})
 }
 
 // Whether ( names ) AS follows: CREATE TABLE ... AS's column names, not a
@@ -1946,7 +1989,7 @@ fn (p: &P) nameListThenAs(): bool {
         let t = p.peekAt(k)
         if t.kind != T_IDENT && t.kind != T_QIDENT { return false }
         let u = p.peekAt(k + 1)
-        if u.kind == T_OP && u.text == ")" { return p.peekAt(k + 2).kind == T_IDENT && p.peekAt(k + 2).text == "as" }
+        if u.kind == T_OP && u.text == ")" { return p.peekAt(k + 2).kind == T_IDENT && (p.peekAt(k + 2).text == "as" || p.peekAt(k + 2).text == "on") }
         if !(u.kind == T_OP && u.text == ",") { return false }
         k += 2
     }
@@ -1962,6 +2005,7 @@ fn (p: mut &P) createTableAs(s0: Stmt): Result[Stmt, lexdb_base.DbErr] {
         while p.acceptKw(",") { append(mut &s.names, try p.name()) }
         try p.expectKw(")")
     }
+    try p.onCommit(mut &s)
     try p.expectKw("as")
     var q = try p.query()
     if p.acceptKw("with") {
@@ -2250,7 +2294,7 @@ fn (p: mut &P) seqStmt(kind: int): Result[Stmt, lexdb_base.DbErr] {
         try p.expectKw("exists")
         s.ifFlag = true
     }
-    s.table = try p.qname()
+    s.table = try p.rname()
     if kind == S_ALTER_SEQ && (p.isKw("rename") || p.isKw("set") || p.isKw("owner")) {
         return Err(lexdb_base.err("0A000", "lexdb: ALTER SEQUENCE takes its options (RESTART, INCREMENT, ...), not RENAME, SET or OWNER"))
     }
@@ -2289,7 +2333,7 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
         s.ifFlag = true
     }
     let only = p.acceptKw("only")
-    s.table = try p.qname()
+    s.table = try p.rname()
     if p.isKw("set") && p.pos + 1 < len(p.toks) && p.toks[p.pos + 1].kind == T_IDENT && p.toks[p.pos + 1].text == "schema" {
         p.pos += 2
         append(mut &s.alters, Alter{kind: A_SET_SCHEMA, col: noCol(), name: try p.name(), to: "", ifFlag: false, using: None, cons: [], cascade: false})
@@ -2462,7 +2506,7 @@ fn (p: &P) selectNext(): bool {
 fn (p: mut &P) insert(): Result[Stmt, lexdb_base.DbErr] {
     try p.expectKw("into")
     var s = newStmt(S_INSERT)
-    s.table = try p.qname()
+    s.table = try p.rname()
     if p.acceptKw("as") { s.alias = try p.name() }
     if p.isKw("(") && !p.selectNext() {
         p.pos += 1
@@ -2715,7 +2759,7 @@ fn (p: mut &P) grantStmt(grant: bool): Result[Stmt, lexdb_base.DbErr] {
 fn (p: mut &P) createView(orReplace: bool): Result[Stmt, lexdb_base.DbErr] {
     var v = newStmt(S_CREATE_VIEW)
     v.ifFlag = orReplace
-    v.table = try p.qname()
+    v.table = try p.rname()
     if p.acceptKw("(") {
         while true {
             append(mut &v.names, try p.name())
@@ -2908,7 +2952,10 @@ fn (p: mut &P) selectCore(): Result[Stmt, lexdb_base.DbErr] {
     try p.itemList(mut &s.items)
     if p.acceptKw("into") {
         // SELECT ... INTO [TEMPORARY | UNLOGGED] [TABLE] name (9.88)
-        let tm = p.acceptKw("temporary") || p.acceptKw("temp") || p.acceptKw("unlogged")
+        let gl = p.acceptKw("global") || p.acceptKw("local")
+        s.temp = p.acceptKw("temporary") || p.acceptKw("temp")
+        if gl && !s.temp { return Err(near(&p.peek())) }
+        let ul = !s.temp && p.acceptKw("unlogged")
         let tb = p.acceptKw("table")
         s.into = try p.qname()
     }
@@ -3264,7 +3311,7 @@ fn (p: mut &P) fromItem(join: int): Result[FromItem, lexdb_base.DbErr] {
         try p.aliasOf(mut &alias, mut &cols)
         return Ok(FromItem{table: "", alias: alias, join: join, on: None, sub: i, cols: cols, work: -1, lateral: lateral, using: [], natural: false, comma: false})
     }
-    let table = try p.qname()
+    let table = try p.rname()
     var alias = baseName(&table)
     var cols: []str = []
     try p.aliasOf(mut &alias, mut &cols)
@@ -3375,7 +3422,7 @@ fn (p: mut &P) createIndex(unique: bool): Result[Stmt, lexdb_base.DbErr] {
     // in its table's schema; none (9.94): PostgreSQL's name is chosen (lexdb_exec)
     if s.ifFlag || !p.isKw("on") { s.index = try p.name() }
     try p.expectKw("on")
-    s.table = try p.qname()
+    s.table = try p.rname()
     if p.acceptKw("using") {
         let m = try p.name()
         if m != "btree" { return Err(lexdb_base.err("0A000", "index method \"" + m + "\" is not supported")) }
@@ -3470,7 +3517,7 @@ fn (p: mut &P) delete(): Result[Stmt, lexdb_base.DbErr] {
 // inheritance, so ONLY and * change nothing.
 fn (p: mut &P) dmlTarget(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
     let only = p.acceptKw("only")
-    s.table = try p.qname()
+    s.table = try p.rname()
     let star = p.acceptKw("*")
     var cols: []str = []
     try p.aliasOf(mut &s.alias, mut &cols)
@@ -3486,7 +3533,7 @@ fn (p: mut &P) truncate(): Result[Stmt, lexdb_base.DbErr] {
     let tb = p.acceptKw("table")
     while true {
         let only = p.acceptKw("only")
-        let n = try p.qname()
+        let n = try p.rname()
         let star = p.acceptKw("*")
         if len(s.table) == 0 { s.table = n } else { append(mut &s.names, n) }
         if !p.acceptKw(",") { break }
@@ -3640,7 +3687,7 @@ fn (p: mut &P) copyStmt(): Result[Stmt, lexdb_base.DbErr] {
         q.params = p.params
         append(mut &s.inner, q)
     } else {
-        s.table = try p.qname()
+        s.table = try p.rname()
         if p.acceptKw("(") {
             append(mut &s.names, try p.name())
             while p.acceptKw(",") { append(mut &s.names, try p.name()) }
@@ -3922,6 +3969,7 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
             // SELECT ... INTO t: CREATE TABLE t AS the query (9.88)
             var c = newStmt(S_CREATE)
             c.table = replace(mut &q.into, "")
+            c.temp = q.temp
             q.subs = replace(mut &p.subs, [])
             q.wins = replace(mut &p.wins, [])
             q.params = p.params
@@ -4050,10 +4098,39 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
             if p.isKw("or") && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "replace" {
                 p.pos += 2
                 orReplace = true
-                if !p.isKw("view") { return Err(lexdb_base.err("0A000", "lexdb: CREATE OR REPLACE is supported for views only")) }
+                if !p.isKw("view") && !p.isKw("temp") && !p.isKw("temporary") {
+                    return Err(lexdb_base.err("0A000", "lexdb: CREATE OR REPLACE is supported for views only"))
+                }
             }
-            if p.acceptKw("view") { return p.createView(orReplace) }
-            if p.acceptKw("table") { return p.createTable() }
+            // [GLOBAL | LOCAL] {TEMPORARY | TEMP}, or UNLOGGED (a table as any:
+            // lexdb's are logged), before TABLE, SEQUENCE or VIEW (9.96)
+            var temp = false
+            if p.isKw("global") || p.isKw("local") {
+                p.pos += 1
+                if !p.acceptKw("temporary") { try p.expectKw("temp") }
+                temp = true
+            } else if p.acceptKw("temporary") || p.acceptKw("temp") {
+                temp = true
+            } else if !orReplace && p.isKw("unlogged") && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "table" {
+                p.pos += 1
+            }
+            if p.acceptKw("view") {
+                var v = try p.createView(orReplace)
+                v.temp = temp
+                return Ok(v)
+            }
+            if orReplace && temp { return Err(near(&p.peek())) }
+            if p.acceptKw("table") {
+                var ct = try p.createTable()
+                ct.temp = temp
+                return Ok(ct)
+            }
+            if temp {
+                if !p.acceptKw("sequence") { return Err(near(&p.peek())) }
+                var q = try p.seqStmt(S_CREATE_SEQ)
+                q.temp = true
+                return Ok(q)
+            }
             if p.acceptKw("type") {
                 // CREATE TYPE name AS ENUM ('a', ...) (9.90)
                 var ty = newStmt(S_CREATE_TYPE)
@@ -4130,7 +4207,7 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
                     v.ifFlag = true
                 }
                 while true {
-                    append(mut &v.cols, colDef(try p.qname(), TypeName{kind: K_TEXT, oid: OID_TEXT, prec: 0, scale: 0, len: 0}, false))
+                    append(mut &v.cols, colDef(try p.rname(), TypeName{kind: K_TEXT, oid: OID_TEXT, prec: 0, scale: 0, len: 0}, false))
                     if !p.acceptKw(",") { break }
                 }
                 if p.acceptKw("cascade") { v.cascade = true } else { let r = p.acceptKw("restrict") }
@@ -4195,9 +4272,9 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
                 try p.expectKw("exists")
                 s.ifFlag = true
             }
-            s.table = try p.qname()
+            s.table = try p.rname()
             // DROP TABLE a, b, ...: the others in names (9.88)
-            while p.acceptKw(",") { append(mut &s.names, try p.qname()) }
+            while p.acceptKw(",") { append(mut &s.names, try p.rname()) }
             if p.acceptKw("cascade") { s.cascade = true } else { let r = p.acceptKw("restrict") }
             return Ok(s)
         }
@@ -4259,6 +4336,16 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
             // = DEFAULT, RESET name, RESET ALL; the rest are accepted and ignored
             var st = newStmt(S_SET)
             st.ifFlag = t.text == "reset"
+            if t.text == "discard" {
+                // DISCARD ALL | TEMP | TEMPORARY | PLANS | SEQUENCES (9.96): table
+                // "discard:" and what
+                let w = p.next()
+                if w.kind != T_IDENT || (w.text != "all" && w.text != "temp" && w.text != "temporary" && w.text != "plans" && w.text != "sequences") {
+                    return Err(near(&w))
+                }
+                st.table = "discard:" + (if w.text == "temporary" { "temp" } else { w.text })
+                return Ok(st)
+            }
             let u = p.acceptKw("session")
             if t.text == "reset" && p.acceptKw("all") {
                 st.table = "all"

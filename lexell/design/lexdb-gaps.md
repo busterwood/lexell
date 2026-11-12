@@ -1,7 +1,7 @@
 # lexdb against PostgreSQL: where it stands and what is missing
 
 Status: a review taken on 2026-11-12, at commit 9133e91a (branch `lexdb`,
-after design/lexdb.md 9.91), brought up to date for 9.92 to 9.95
+after design/lexdb.md 9.91), brought up to date for 9.92 to 9.96
 (9.94 merged as 87d2a0b1). It replaces the review of 2026-11-10 (commit
 238ff702, after 9.46). The order of work at the end is a proposal; the
 choices in it are the user's.
@@ -17,7 +17,7 @@ Answers were not compared with PostgreSQL here: the suites that
 `tests/lexdb/gen_pg.py` generates from PostgreSQL 18 do that, feature by
 feature.
 
-## 1. Closed since the first review (9.75 to 9.95)
+## 1. Closed since the first review (9.75 to 9.96)
 
 - **Types:**
   - date, time, timestamp, timestamptz and interval, with their operators,
@@ -52,7 +52,10 @@ feature.
   - tables without a primary key, `CREATE TABLE AS` and `SELECT INTO`
     (9.88);
   - indexes on expressions (9.89);
-  - index options and `CONCURRENTLY` (9.85).
+  - index options and `CONCURRENTLY` (9.85);
+  - temporary tables, sequences and views, `ON COMMIT`, `DISCARD TEMP`
+    and `ALL`, each session's `pg_temp_N` searched first; their DDL does
+    not disturb other sessions (9.96).
 - **Queries:**
   - `VALUES` as a query;
   - `~` and its kin;
@@ -133,7 +136,6 @@ In three tiers, by how soon a real application meets the gap.
 - **Tables:**
   - `ADD PRIMARY KEY` on a table made without one (a table's key cannot
     change, 9.88);
-  - temporary tables (`CREATE TEMP TABLE`);
   - generated columns;
   - materialized views;
   - views are read-only, and a rename of a table one reads is refused
@@ -201,7 +203,9 @@ In three tiers, by how soon a real application meets the gap.
   - a large `CREATE TABLE AS` holds its result while it inserts (9.88).
 - **Storage** (items 8 and 10 of 9.4):
   - no compression;
-  - the file never shrinks.
+  - the file never shrinks;
+  - temporary tables are written to the log like any (9.96): PostgreSQL
+    writes no WAL for them.
 - **Speed:** SIMD needs a Lexell language or runtime change: the user's
   decision (item 12 of 9.4).
 
@@ -209,7 +213,7 @@ In three tiers, by how soon a real application meets the gap.
 
 1. **json and jsonb,** when the user decides.
 2. **Binary formats,** for asyncpg and JDBC.
-3. **Data-modifying CTEs, temporary tables and generated columns.**
+3. **Data-modifying CTEs and generated columns.**
 
 **Open questions for the user:**
 - Is this order right?
