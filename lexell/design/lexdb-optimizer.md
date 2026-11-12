@@ -39,8 +39,9 @@ outcome (22); per-value estimates (23); estimates deciding beyond ties and
 primary-key statistics (24); the join order bound by keys (25) and by cost
 (26); implied equalities (27); SQLite's N-best search (28); the join-order
 review's fixes with filter and range estimates (29); the search to 24
-tables (30); and the integration with lexdb 9.94 (31). Code comments cite
-these sections as "optimizer N".
+tables (30); the integration with lexdb 9.94 (31); and ORDER BY ... LIMIT
+read in order (32, uncommitted). Code comments cite these sections as
+"optimizer N".
 
 ## 1. Summary
 
@@ -1782,6 +1783,43 @@ The full suite passes, 92 of 92, lexdb 9.94's new tests included. The
 rebased commits before the integration commit do not compile on 9.94 on
 their own: their ANALYZE parse clashes with lexdb's, and so does the name
 `order`.
+
+## 32. ORDER BY ... LIMIT read in order (2026-11-12)
+
+Section 29's known gap. A table that FROM put first, read in its key's
+order, can stop after a few rows; the cost order took another table first
+and sorted. With a common label, `big JOIN small ... ORDER BY b.id LIMIT 5`
+read 2,000 rows where the rules read 42.
+
+**What.** `planSelect` passes the ORDER BY and the LIMIT plus OFFSET to the
+join order (`Scope.ordBy`, `Scope.ordLim`; a parameter or an expression is
+taken as 100, so that the order does not depend on parameters). This
+happens only without GROUP BY, DISTINCT, aggregates or windows.
+`orderedLevel` finds the table the ORDER BY sorts by: its items must be
+plain columns of that one table, in one direction, with NULLs where an
+index keeps them, and the table must have a key or an unfiltered index that
+gives that order. `costOrder` then costs a second order (`nBest`, now a
+method taking its starting tables): that table first, every other table by
+lookup. Its cost is the whole order's times LIMIT / the estimated result
+rows. It is taken when that is less than the best order's cost plus a sort
+of its rows (rows x ROW_COST x log2 rows). It is not taken:
+- when the table has a better way by its constants than a full scan (the
+  planner turns only a full scan into an index read for an order);
+- when any other table would be hashed (a hash is built whole before the
+  first row comes out).
+`planSelect`'s existing rule then reads the first table through the index
+that gives the order, and the LIMIT stops the scan.
+
+**Tested** (`exec_joincost`; results equal the rules mode's):
+- a common label, LIMIT 5: big read in order, 42 rows (was 2,000 and a
+  sort); DESC: 49 rows, backward;
+- LIMIT 1000: small first and a sort (2,000 rows; in order it would read
+  about 10,000);
+- by hand, a rare label: in order, 406 rows. Starting from small would have
+  read about 200; ANALYZE's estimate for that label is the average, 5 rows
+  where it has 1;
+- by hand, a filter with its own index on big (`b.v = 2`): small first and
+  a sort, since big's way is not a full scan.
 
 ## Sources
 
