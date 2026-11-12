@@ -12,11 +12,19 @@
 // integrated (SSPI) logins are refused. The database asked for must be
 // lexdb's own ("lexdb"; "master" and none are taken as it).
 //
-// Then requests: SQLBatch, run by lexdb's own dialect (stage S1; T-SQL is
-// stage S3) except that a batch of T-SQL SET options alone, which drivers
-// send when they connect, is accepted (NOCOUNT is kept; the rest are not
-// acted on). ATTENTION is acknowledged once the request it interrupts has
-// answered. RPC and Transaction Manager requests are refused (stage S2).
+// Then requests. SQLBatch: T-SQL, run by lexdb_tsql (its variables,
+// transactions and errors as SQL Server has them). RPC: sp_executesql,
+// sp_prepare, sp_execute, sp_prepexec and sp_unprepare, by id or by name,
+// several in one request; the parameters declared in @params are the
+// batch's variables, OUTPUT ones come back as RETURNVALUE, then
+// RETURNSTATUS and DONEPROC. Transaction Manager requests: begin, commit,
+// rollback (each optionally beginning the next) and save, run as the
+// T-SQL statements; a transaction's start and end are ENVCHANGE 8, 9 and 10
+// with its 8-byte descriptor, however it began or ended. RESETCONNECTION
+// (the request's first packet's status) gives a fresh session as after the
+// login: an open transaction rolled back, the SET options and prepared
+// statements gone; ENVCHANGE 18. ATTENTION is acknowledged once the request
+// it interrupts has answered.
 //
 // Results: COLMETADATA, ROW and DONE tokens. A column's TDS type comes from
 // its lexdb type: int2/int4/int8 as smallint/int/bigint, bool as bit,
@@ -27,7 +35,8 @@
 // as datetimeoffset(6) at +00:00, and anything else (intervals, arrays,
 // json, ...) as nvarchar holding the text lexdb gives it over PostgreSQL's
 // protocol. An error is an ERROR token with SQL Server's number for the
-// same failure where there is one (sqlNumber), else 50000.
+// same failure where there is one (lexdb_tsql.sqlNumber), else 50000, and
+// SQL Server's severity for it.
 import "net"
 import "task"
 import "tls"
@@ -41,6 +50,9 @@ import "./lexdb_sql"
 import "./lexdb_exec"
 import "./lexdb_auth"
 import "./lexdb_wire"
+import "./lexdb_tsql"
+import "./lexdb_tsqlparse"
+import "./lexdb_time"
 
 type Val = lexdb_sql.Val
 type DbErr = lexdb_base.DbErr
@@ -58,17 +70,13 @@ const MAX_REQUEST = 67108864                         // 64 MiB: the largest requ
 // the login's ENVCHANGE carry (comparison in lexdb is still exact: L2)
 const COLLATION = "\x09\x04\xd0\x00\x34"
 
-// DONE's CurCmd: the statement it ends
-const CMD_SELECT = 0xC1
-const CMD_INSERT = 0xC3
-const CMD_DELETE = 0xC4
-const CMD_UPDATE = 0xC5
+const CMD_EXECUTE = 0xE0           // DONEPROC's CurCmd
 
 // ---- the reply's tokens: built in a byte array, sent as one message
 
 type Out = record {
     b: []byte
-    lastDone: int               // where the last DONE token's status is, -1 none
+    lastDone: int               // where the last DONE (or DONEPROC) token's status is, -1 none
 }
 
 fn newOut(): Out { return Out{b: [], lastDone: -1} }
@@ -115,9 +123,12 @@ fn (o: mut &Out) start(token: int): int {
 
 fn (o: mut &Out) end(at: int) { binary.setU16LE(mut &o.b, at - 2, len(o.b) - at) }
 
-fn (o: mut &Out) done(status: int, cmd: int, count: int) {
-    o.u8(tds.TK_DONE)
-    o.lastDone = len(o.b)
+fn (o: mut &Out) done(status: int, cmd: int, count: int) { o.doneTok(tds.TK_DONE, status, cmd, count) }
+
+// DONE, DONEINPROC or DONEPROC.
+fn (o: mut &Out) doneTok(token: int, status: int, cmd: int, count: int) {
+    o.u8(token)
+    if token != tds.TK_DONEINPROC { o.lastDone = len(o.b) }
     o.u16(status)
     o.u16(cmd)
     o.u64(count)
@@ -136,7 +147,21 @@ fn (o: mut &Out) message(token: int, number: int, state: int, class: int, text: 
     o.end(at)
 }
 
-fn (o: mut &Out) error(e: &DbErr) { o.message(tds.TK_ERROR, sqlNumber(&e.state), 1, 16, &e.msg) }
+fn (o: mut &Out) error(e: &DbErr) {
+    let n = lexdb_tsql.sqlNumber(&e.state)
+    o.message(tds.TK_ERROR, n, 1, lexdb_tsql.sqlClass(n), &e.msg)
+}
+
+// ENVCHANGE with byte values (B_VARBYTE): the transaction's (8, 9, 10), RESETCONNECTION's (18).
+fn (o: mut &Out) envchangeBytes(kind: int, newValue: &str, oldValue: &str) {
+    let at = o.start(tds.TK_ENVCHANGE)
+    o.u8(kind)
+    o.u8(len(newValue))
+    o.raw(newValue)
+    o.u8(len(oldValue))
+    o.raw(oldValue)
+    o.end(at)
+}
 
 fn (o: mut &Out) envchange(kind: int, newValue: &str, oldValue: &str) {
     let at = o.start(tds.TK_ENVCHANGE)
@@ -156,37 +181,6 @@ fn (o: mut &Out) take(): str {
     o.b = []
     o.lastDone = -1
     return s
-}
-
-// SQL Server's error number for a lexdb error (its SQLSTATE), where SQL
-// Server has one for the same failure; 50000 (a user error) for the rest.
-pub fn sqlNumber(state: &str): int {
-    match state.toStr() {
-        "42P01" { return 208 }      // Invalid object name
-        "42703" { return 207 }      // Invalid column name
-        "42601" { return 102 }      // Incorrect syntax near
-        "42883" { return 195 }      // is not a recognized built-in function name
-        "42P07" { return 2714 }     // There is already an object named
-        "42710" { return 2714 }
-        "42501" { return 229 }      // permission was denied
-        "23505" { return 2627 }     // Violation of PRIMARY KEY / UNIQUE KEY constraint
-        "23502" { return 515 }      // Cannot insert the value NULL into column
-        "23503" { return 547 }      // conflicted with the FOREIGN KEY constraint
-        "23514" { return 547 }      // conflicted with the CHECK constraint
-        "22012" { return 8134 }     // Divide by zero error encountered
-        "22003" { return 8115 }     // Arithmetic overflow error
-        "22001" { return 2628 }     // String or binary data would be truncated
-        "22P02" { return 245 }      // Conversion failed
-        "22007" { return 241 }      // Conversion failed when converting date and/or time
-        "22008" { return 517 }      // Adding a value to a 'datetime' column caused an overflow
-        "40001" { return 1205 }     // deadlock victim / serialization
-        "40P01" { return 1205 }
-        "25P02" { return 3930 }     // The current transaction cannot be committed
-        "28000" { return 18456 }    // Login failed
-        "28P01" { return 18456 }
-        "57014" { return 3617 }     // cancelled
-        else { return 50000 }
-    }
 }
 
 // ---- result columns: their TDS types, chosen from the lexdb type and the values
@@ -290,9 +284,16 @@ fn (o: mut &Out) colmetadata(cols: &[]lexdb_exec.OutCol, ts: &[]ColT) {
     o.u8(tds.TK_COLMETADATA)
     o.u16(len(cols))
     for i in 0..len(cols) {
-        let t = ts[i]
         o.u32(0)                    // UserType
         o.u16(0x0001)               // Flags: nullable
+        o.typeInfo(&ts[i])
+        let name = cols[i].name
+        o.bvarchar(&(if name == "?column?" { "" } else { name }))
+    }
+}
+
+// TYPE_INFO for a column's or an output parameter's type.
+fn (o: mut &Out) typeInfo(t: &ColT) {
         if t.kind == C_INT {
             o.u8(tds.T_INTN)
             o.u8(t.n)
@@ -323,9 +324,6 @@ fn (o: mut &Out) colmetadata(cols: &[]lexdb_exec.OutCol, ts: &[]ColT) {
             o.u16(if t.max { 0xFFFF } else { 8000 })
             o.raw(&COLLATION)
         }
-        let name = cols[i].name
-        o.bvarchar(&(if name == "?column?" { "" } else { name }))
-    }
 }
 
 fn rangeErr(what: &str): DbErr { return lexdb_base.err("22003", what.toStr()) }
@@ -503,89 +501,20 @@ fn (o: mut &Out) rowSet(cols: &[]lexdb_exec.OutCol, rows: &[][]Val): Result[Unit
     return Ok(Unit{})
 }
 
-// ---- T-SQL SET options: what drivers send as they connect (stage S1)
-
-const SET_OPTIONS: []str = ["quoted_identifier", "ansi_nulls", "ansi_padding", "ansi_warnings", "arithabort",
-    "arithignore", "concat_null_yields_null", "numeric_roundabort", "ansi_null_dflt_on", "ansi_null_dflt_off",
-    "cursor_close_on_commit", "implicit_transactions", "textsize", "nocount", "xact_abort", "lock_timeout",
-    "deadlock_priority", "language", "dateformat", "datefirst", "rowcount", "no_browsetable", "fmtonly",
-    "query_governor_cost_limit", "ansi_defaults", "forceplan", "statistics", "showplan_text", "showplan_all",
-    "showplan_xml", "parseonly", "noexec", "context_info", "transaction"]
-
-fn isWordChar(c: byte): bool { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '@' }
-
-fn has(xs: &[str], x: &str): bool {
-    for y in xs { if y == x { return true } }
-    return false
-}
-
-// The words of a batch of T-SQL SET statements, lowercase (';' and
-// commas dropped); None when it holds anything else.
-fn setWords(sql: &str): Option[[]str] {
-    var ws: []str = []
-    var i = 0
-    while i < len(sql) {
-        let c = sql[i]
-        if c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == ';' || c == ',' {
-            i += 1
-            continue
-        }
-        if !isWordChar(c) { return None }
-        var j = i
-        while j < len(sql) && isWordChar(sql[j]) { j += 1 }
-        append(mut &ws, strings.toLowerAscii(sql[i..j].toStr()))
-        i = j
-    }
-    return Some(ws)
-}
-
-// The effect of a batch made only of T-SQL SET options: Some(nocount) for
-// such a batch (nocount: SET NOCOUNT's new value, or the old one), None for
-// any other batch (lexdb's parser has it). Each SET is option names, then
-// ON, OFF, a number or a word (LANGUAGE us_english, DATEFORMAT mdy,
-// TRANSACTION ISOLATION LEVEL READ COMMITTED).
-fn setBatch(sql: &str, nocount: bool): Option[Result[bool, DbErr]] {
-    let ws = match setWords(sql) {
-        Some(x) { x }
-        None { return None }
-    }
-    if len(ws) == 0 || ws[0] != "set" { return None }
-    var nc = nocount
-    var i = 0
-    while i < len(ws) {
-        if ws[i] != "set" { return None }
-        i += 1
-        if i >= len(ws) { return None }
-        if ws[i] == "transaction" {
-            // TRANSACTION ISOLATION LEVEL READ UNCOMMITTED | READ COMMITTED | REPEATABLE READ | SNAPSHOT | SERIALIZABLE
-            i += 1
-            while i < len(ws) && ws[i] != "set" { i += 1 }
-            continue
-        }
-        var names: []str = []
-        while i < len(ws) && has(SET_OPTIONS, &ws[i]) {
-            append(mut &names, ws[i])
-            i += 1
-        }
-        if len(names) == 0 || i >= len(ws) { return None }
-        let v = ws[i]
-        i += 1
-        if has(&names, &"implicit_transactions") && v == "on" {
-            return Some(Err(lexdb_base.err("0A000", "SET IMPLICIT_TRANSACTIONS ON is not supported yet")))
-        }
-        if has(&names, &"nocount") { nc = v == "on" }
-    }
-    return Some(Ok(nc))
-}
-
 // ---- a connection
+
+// A prepared statement (sp_prepare, sp_prepexec): its parameters' declarations and its text.
+type Prep = record { decls: str; sql: str; live: bool }
 
 type Conn = record {
     t: tds.Transport
     sess: lexdb_exec.Session
     st: lexdb_store.Store
     o: Out
-    nocount: bool
+    ts: lexdb_tsql.State
+    user: str
+    txn: int                    // the transaction descriptor's number, 0 none
+    preps: []Prep               // by handle - 1
 }
 
 fn (c: mut &Conn) send(): Result[Unit, tds.Error] {
@@ -593,106 +522,403 @@ fn (c: mut &Conn) send(): Result[Unit, tds.Error] {
     return c.t.send(tds.PT_REPLY, msg)
 }
 
-// The row count in a command tag ("INSERT 0 3", "UPDATE 2", "SELECT 5"), -1 none.
-fn tagCount(tag: &str): int {
-    let sp = strings.lastIndexOf(tag, " ")
-    if sp < 0 { return -1 }
-    let w = tag[0..strings.indexOf(tag, " ", 0)].toStr()
-    if w != "INSERT" && w != "UPDATE" && w != "DELETE" && w != "SELECT" && w != "MERGE" && w != "COPY" && w != "FETCH" && w != "MOVE" {
-        return -1
-    }
-    return strings.parseIntOpt(tag[sp + 1..len(tag)].toStr()).unwrapOr(-1)
+fn descriptor(n: int): str {
+    var b: []byte = []
+    binary.appendU64LE(mut &b, n)
+    return strFromBytes(&b)
 }
 
-fn cmdOf(tag: &str): int {
-    if strings.startsWith(tag, "SELECT") { return CMD_SELECT }
-    if strings.startsWith(tag, "INSERT") { return CMD_INSERT }
-    if strings.startsWith(tag, "UPDATE") { return CMD_UPDATE }
-    if strings.startsWith(tag, "DELETE") { return CMD_DELETE }
-    return 0
+fn (c: mut &Conn) tran(kind: int) {
+    if kind == 8 {
+        c.txn += 1
+        c.o.envchangeBytes(8, &descriptor(c.txn), &"")
+    } else {
+        c.o.envchangeBytes(kind, &"", &descriptor(c.txn))
+    }
 }
 
-// One SQLBatch: its statements run in order, each answered by its result
-// set (if it has one) and a DONE; the first error ends the batch (stage S1:
-// lexdb's dialect, as over PostgreSQL's protocol).
-fn (c: mut &Conn) batch(sql: &str) {
-    match setBatch(sql, c.nocount) {
-        Some(r) {
-            match r {
-                Ok(nc) {
-                    c.nocount = nc
-                    c.o.done(0, 0, 0)
-                }
-                Err(e) {
-                    c.o.error(&e)
-                    c.o.done(tds.DONE_ERROR, 0, 0)
-                }
-            }
-            return
-        }
-        None {}
-    }
-    match lexdb_sql.parse(sql) {
-        Err(e) {
-            c.o.error(&e)
-            c.o.done(tds.DONE_ERROR, 0, 0)
-        }
-        Ok(stmts) {
-            let none: []Val = []
-            let nt: []int = []
-            var any = false
-            for s in stmts {
-                if s.kind == lexdb_sql.S_EMPTY { continue }
-                any = true
-                if s.kind == lexdb_sql.S_COPY {
-                    c.o.error(&lexdb_base.err("0A000", "COPY FROM STDIN and TO STDOUT need PostgreSQL's protocol"))
-                    c.o.done(tds.DONE_ERROR | tds.DONE_MORE, 0, 0)
-                    break
-                }
-                match c.sess.run(&s, &none, &nt) {
-                    Ok(res) {
-                        let n = tagCount(&res.tag)
-                        let cmd = cmdOf(&res.tag)
-                        if res.hasRows {
-                            match c.o.rowSet(&res.cols, &res.rows) {
-                                Ok(_) {}
-                                Err(e) {
-                                    c.o.error(&e)
-                                    c.o.done(tds.DONE_ERROR | tds.DONE_MORE, cmd, 0)
-                                    break
-                                }
-                            }
-                        }
-                        let counted = n >= 0 && !c.nocount
-                        c.o.done(tds.DONE_MORE | (if counted { tds.DONE_COUNT } else { 0 }), cmd, if counted { n } else { 0 })
-                    }
-                    Err(e) {
-                        c.o.error(&e)
-                        c.o.done(tds.DONE_ERROR | tds.DONE_MORE, 0, 0)
-                        break
-                    }
+// A batch's events as tokens: DONE (DONEINPROC inside an RPC) for each
+// statement, a transaction's ENVCHANGE before the DONE of the statement
+// that began or ended it. Whether there was an error.
+fn (c: mut &Conn) emit(ev: &[]lexdb_tsql.Event, inProc: bool): bool {
+    var failed = false
+    var rowsFailed = false
+    var i = 0
+    while i < len(ev) {
+        let e = &ev[i]
+        i += 1
+        if e.kind == lexdb_tsql.EV_ROWS {
+            match c.o.rowSet(&e.cols, &e.rows) {
+                Ok(_) {}
+                Err(x) {
+                    c.o.error(&x)
+                    rowsFailed = true
+                    failed = true
                 }
             }
-            if !any { c.o.done(0, 0, 0) }
+        } else if e.kind == lexdb_tsql.EV_ERROR {
+            c.o.error(&e.err)
+            failed = true
+        } else if e.kind == lexdb_tsql.EV_TRAN {
+            c.tran(e.tran)
+        } else if e.kind == lexdb_tsql.EV_DONE {
+            while i < len(ev) && ev[i].kind == lexdb_tsql.EV_TRAN {
+                c.tran(ev[i].tran)
+                i += 1
+            }
+            let err = e.error || rowsFailed
+            let counted = e.count >= 0 && !rowsFailed
+            c.o.doneTok(if inProc { tds.TK_DONEINPROC } else { tds.TK_DONE },
+                        tds.DONE_MORE | (if counted { tds.DONE_COUNT } else { 0 }) | (if err { tds.DONE_ERROR } else { 0 }),
+                        e.cmd, if counted { e.count } else { 0 })
+            rowsFailed = false
         }
     }
+    return failed
 }
 
 // The text of a SQLBatch: after ALL_HEADERS, UTF-16LE.
 fn batchText(d: &str): Result[str, DbErr] {
-    if len(d) < 4 { return Err(lexdb_base.err("08P01", "a SQLBatch without ALL_HEADERS")) }
-    let hl = binary.readU32LEStr(d, 0)
-    if hl < 4 || hl > len(d) { return Err(lexdb_base.err("08P01", "a SQLBatch's ALL_HEADERS is out of bounds")) }
-    match tds.fromUtf16(d[hl..len(d)].toStr()) {
+    let h = match tds.allHeadersOf(d) {
+        Ok(x) { x }
+        Err(e) { return Err(lexdb_base.err("08P01", e.msg)) }
+    }
+    match tds.fromUtf16(d[h.end..len(d)].toStr()) {
         Ok(s) { return Ok(s) }
         Err(m) { return Err(lexdb_base.err("08P01", m)) }
     }
+}
+
+fn (c: mut &Conn) batch(sql: &str) {
+    var f = lexdb_tsql.newFrame()
+    var ev: []lexdb_tsql.Event = []
+    lexdb_tsql.run(mut &c.sess, mut &c.ts, sql, mut &f, mut &ev)
+    let failed = c.emit(&ev, false)
+    if c.o.lastDone < 0 { c.o.done(0, 0, 0) }
+}
+
+// ---- RPC
+
+fn protoErr(msg: str): DbErr { return lexdb_base.err("08P01", msg) }
+
+fn tsErr(n: int, msg: str): DbErr { return lexdb_base.err("TS" + n.toStr(), msg) }
+
+// A parameter's value as lexdb's.
+fn valOf(p: &tds.RpcParam): Result[Val, DbErr] {
+    let t = p.column.tdsType
+    match p.value {
+        tds.Cell.Null { return Ok(Val.Null) }
+        tds.Cell.Int(n) { return Ok(if t == tds.T_BIT || t == tds.T_BITN { Val.Bool(n != 0) } else { Val.Int(n) }) }
+        tds.Cell.Float(x) { return Ok(if t == tds.T_FLT4 || (t == tds.T_FLTN && p.column.size == 4) { Val.Real(x) } else { Val.Float(x) }) }
+        tds.Cell.Text(s) { return Ok(Val.Text(s)) }
+        tds.Cell.Bytes(b) { return Ok(Val.Bytes(b)) }
+        tds.Cell.Dec(d) { return Ok(Val.Num(d)) }
+        tds.Cell.Date(d) { return Ok(Val.Date(lexdb_time.daysOf(d))) }
+        tds.Cell.Time(x) { return Ok(Val.Time(x.nanos / 1000)) }
+        tds.Cell.DateTime(l) {
+            match lexdb_time.tsOf(l) {
+                Some(us) { return Ok(Val.Ts(us)) }
+                None { return Err(lexdb_base.err("22008", "a datetime parameter out of range")) }
+            }
+        }
+        tds.Cell.Offset(o) {
+            match lexdb_time.tsOf(o.local) {
+                Some(us) { return Ok(Val.Tstz(us - o.offset * 60000000)) }
+                None { return Err(lexdb_base.err("22008", "a datetimeoffset parameter out of range")) }
+            }
+        }
+        tds.Cell.Guid(g) { return Ok(Val.Uuid(strings.toLowerAscii(g))) }
+        tds.Cell.Failed(why) { return Err(lexdb_base.err("0A000", "parameter " + p.name + ": " + why)) }
+    }
+}
+
+// A text parameter's value (sp_executesql's @stmt and @params).
+fn textOf(p: &tds.RpcParam): Result[str, DbErr] {
+    match p.value {
+        tds.Cell.Text(s) { return Ok(s) }
+        tds.Cell.Null { return Ok("") }
+        else { return Err(tsErr(214, "Procedure expects parameter '" + p.name + "' of type 'ntext/nchar/nvarchar'.")) }
+    }
+}
+
+fn intOf(p: &tds.RpcParam): int {
+    match p.value {
+        tds.Cell.Int(n) { return n }
+        else { return 0 }
+    }
+}
+
+// RETURNVALUE: an output parameter's value.
+fn (o: mut &Out) returnValue(ordinal: int, name: &str, t: &lexdb_sql.TypeName, v: &Val) {
+    let cols = [lexdb_exec.OutCol{name: name.toStr(), oid: t.oid}]
+    let rows = [[v]]
+    let ts = colTypes(&cols, &rows)
+    let mark = len(o.b)
+    o.u8(tds.TK_RETURNVALUE)
+    o.u16(ordinal)
+    o.bvarchar(name)
+    o.u8(1)                         // an output parameter
+    o.u32(0)                        // UserType
+    o.u16(0x0001)                   // Flags: nullable
+    o.typeInfo(&ts[0])
+    match o.value(&ts[0], v) {
+        Ok(_) {}
+        Err(e) {
+            truncate(mut &o.b, mark)
+            o.error(&e)
+        }
+    }
+}
+
+fn (o: mut &Out) returnStatus(n: int) {
+    o.u8(tds.TK_RETURNSTATUS)
+    o.u32(n)
+}
+
+// Runs sql with the declared parameters bound to the call's values (from
+// position first on: sp_executesql's after @stmt and @params, sp_execute's
+// after the handle), then answers: the batch's tokens, RETURNSTATUS, the
+// output parameters, DONEPROC. handle > 0: sp_prepexec's handle, returned
+// first.
+fn (c: mut &Conn) execute(sql: &str, decls: &str, call: &tds.RpcCall, first: int, handle: int, more: bool) {
+    var f = lexdb_tsql.newFrame()
+    var outs: []int = []                        // the frame's indexes of the output parameters
+    var outNames: []str = []
+    var bad: Option[DbErr] = None
+    let noDecls: []lexdb_tsqlparse.ParamDecl = []
+    let ds: Result[[]lexdb_tsqlparse.ParamDecl, DbErr] = if len(strings.trim(decls)) == 0 { Ok(noDecls) } else { lexdb_tsqlparse.parseParamDecls(decls) }
+    if ds.isErr() {
+        bad = Some(ds.unwrapErr())
+    } else {
+        let list = ds.unwrap()
+        var given: []bool = []
+        for d in list {
+            let k = f.add(&d.name, d.typ, Val.Null)
+            append(mut &given, false)
+            if d.output {
+                append(mut &outs, k)
+                append(mut &outNames, d.name)
+            }
+        }
+        let base = len(f.names) - len(list)
+        var pos = 0
+        for i in first..len(call.params) {
+            let p = &call.params[i]
+            var k = -1
+            if len(p.name) > 0 {
+                let low = strings.toLowerAscii(p.name)
+                for j in 0..len(list) { if list[j].name == low { k = j } }
+            } else {
+                k = pos
+            }
+            pos += 1
+            if k < 0 || k >= len(list) {
+                bad = Some(tsErr(8145, "" + p.name + " is not a parameter for procedure sp_executesql."))
+                break
+            }
+            match valOf(&p) {
+                Ok(v) {
+                    match lexdb_exec.coerce(v, &list[k].typ) {
+                        Ok(x) { f.vals[base + k] = x }
+                        Err(e) { bad = Some(e) }
+                    }
+                }
+                Err(e) { bad = Some(e) }
+            }
+            given[k] = true
+        }
+        if bad.isNone() {
+            for j in 0..len(list) {
+                if !given[j] && !list[j].output {
+                    bad = Some(tsErr(8178, "The parameterized query '(" + decls + ")" + sql + "' expects the parameter '" + list[j].name +
+                                           "', which was not supplied."))
+                    break
+                }
+            }
+        }
+    }
+    var status = 0
+    match bad {
+        Some(e) {
+            c.o.error(&e)
+            status = lexdb_tsql.sqlNumber(&e.state)
+        }
+        None {
+            var ev: []lexdb_tsql.Event = []
+            lexdb_tsql.run(mut &c.sess, mut &c.ts, sql, mut &f, mut &ev)
+            let failed = c.emit(&ev, true)
+            if failed { status = c.ts.error }
+        }
+    }
+    c.o.returnStatus(status)
+    var ordinal = 0
+    if handle > 0 {
+        c.o.returnValue(0, &call.params[0].name, &lexdb_sql.TypeName{kind: lexdb_sql.K_INT, oid: lexdb_sql.OID_INT4, prec: 0, scale: 0, len: 0}, &Val.Int(handle))
+        ordinal = 1
+    }
+    for i in 0..len(outs) {
+        c.o.returnValue(ordinal + i, &outNames[i], &f.types[outs[i]], &f.vals[outs[i]])
+    }
+    c.o.doneTok(tds.TK_DONEPROC, (if more { tds.DONE_MORE } else { 0 }) | (if status != 0 { tds.DONE_ERROR } else { 0 }), CMD_EXECUTE, 0)
+}
+
+// A procedure's id from its name: sp_executesql and the prepared-statement ones; 0 for another.
+fn procIdOf(name: &str): int {
+    var n = strings.toLowerAscii(name)
+    for pre in ["master.dbo.", "master..", "sys.", "dbo."] {
+        if strings.startsWith(n, pre) { n = n[len(pre)..len(n)].toStr() }
+    }
+    match n {
+        "sp_executesql" { return tds.PROC_EXECUTESQL }
+        "sp_prepare" { return tds.PROC_PREPARE }
+        "sp_execute" { return tds.PROC_EXECUTE }
+        "sp_prepexec" { return tds.PROC_PREPEXEC }
+        "sp_unprepare" { return tds.PROC_UNPREPARE }
+        else { return 0 }
+    }
+}
+
+fn (c: mut &Conn) procError(e: &DbErr, more: bool) {
+    c.o.error(e)
+    c.o.returnStatus(lexdb_tsql.sqlNumber(&e.state))
+    c.o.doneTok(tds.TK_DONEPROC, (if more { tds.DONE_MORE } else { 0 }) | tds.DONE_ERROR, CMD_EXECUTE, 0)
+}
+
+fn (c: mut &Conn) rpc(d: str) {
+    let parsed = tds.parseRpc(d)
+    if parsed.isErr() {
+        c.o.error(&protoErr(parsed.unwrapErr().msg))
+        c.o.done(tds.DONE_ERROR, 0, 0)
+        return
+    }
+    let calls = parsed.unwrap()
+    for ci in 0..len(calls) {
+        let call = &calls[ci]
+        let more = ci + 1 < len(calls)
+        let id = if call.procId > 0 { call.procId } else { procIdOf(&call.procName) }
+        let n = len(call.params)
+        if id == tds.PROC_EXECUTESQL {
+            if n < 1 {
+                c.procError(&tsErr(201, "Procedure or function 'sp_executesql' expects parameter '@statement', which was not supplied."), more)
+                continue
+            }
+            match textOf(&call.params[0]) {
+                Ok(sql) {
+                    let decls = if n >= 2 { textOf(&call.params[1]).unwrapOr("") } else { "" }
+                    c.execute(&sql, &decls, &call, 2, 0, more)
+                }
+                Err(e) { c.procError(&e, more) }
+            }
+        } else if id == tds.PROC_PREPARE || id == tds.PROC_PREPEXEC {
+            // @handle OUTPUT, @params, @stmt[, values ...]
+            if n < 3 {
+                c.procError(&tsErr(201, "Procedure or function expects parameter '@stmt', which was not supplied."), more)
+                continue
+            }
+            let decls = textOf(&call.params[1]).unwrapOr("")
+            match textOf(&call.params[2]) {
+                Ok(sql) {
+                    append(mut &c.preps, Prep{decls: decls, sql: sql, live: true})
+                    let h = len(c.preps)
+                    if id == tds.PROC_PREPEXEC {
+                        c.execute(&sql, &decls, &call, 3, h, more)
+                    } else {
+                        c.o.returnStatus(0)
+                        c.o.returnValue(0, &call.params[0].name, &lexdb_sql.TypeName{kind: lexdb_sql.K_INT, oid: lexdb_sql.OID_INT4, prec: 0, scale: 0, len: 0}, &Val.Int(h))
+                        c.o.doneTok(tds.TK_DONEPROC, if more { tds.DONE_MORE } else { 0 }, CMD_EXECUTE, 0)
+                    }
+                }
+                Err(e) { c.procError(&e, more) }
+            }
+        } else if id == tds.PROC_EXECUTE || id == tds.PROC_UNPREPARE {
+            let h = if n > 0 { intOf(&call.params[0]) } else { 0 }
+            if h < 1 || h > len(c.preps) || !c.preps[h - 1].live {
+                c.procError(&tsErr(8179, "Could not find prepared statement with handle " + h.toStr() + "."), more)
+                continue
+            }
+            if id == tds.PROC_UNPREPARE {
+                c.preps[h - 1].live = false
+                c.o.returnStatus(0)
+                c.o.doneTok(tds.TK_DONEPROC, if more { tds.DONE_MORE } else { 0 }, CMD_EXECUTE, 0)
+            } else {
+                let sql = c.preps[h - 1].sql
+                let decls = c.preps[h - 1].decls
+                c.execute(&sql, &decls, &call, 1, 0, more)
+            }
+        } else {
+            let name = if len(call.procName) > 0 { call.procName } else { "procedure " + call.procId.toStr() }
+            c.procError(&tsErr(2812, "Could not find stored procedure '" + name + "'."), more)
+        }
+    }
+}
+
+// ---- Transaction Manager requests: begin, commit, rollback, save
+
+fn (c: mut &Conn) transMgr(d: &str) {
+    let hr = tds.allHeadersOf(d)
+    if hr.isErr() {
+        c.o.error(&protoErr(hr.unwrapErr().msg))
+        c.o.done(tds.DONE_ERROR, 0, 0)
+        return
+    }
+    let h = hr.unwrap()
+    if h.end + 2 > len(d) {
+        c.o.error(&protoErr("a Transaction Manager request without its type"))
+        c.o.done(tds.DONE_ERROR, 0, 0)
+        return
+    }
+    let kind = binary.readU16LEStr(d, h.end)
+    // the name (B_VARCHAR) after the request type (and BEGIN's isolation level)
+    let at = h.end + 2 + (if kind == tds.TM_BEGIN_XACT { 1 } else { 0 })
+    var name = ""
+    if at < len(d) {
+        let n = int(d[at])
+        if at + 1 + 2 * n <= len(d) { name = tds.fromUtf16(d[at + 1..at + 1 + 2 * n].toStr()).unwrapOr("") }
+    }
+    let after = at + 1 + 2 * len(name)
+    let beginAfter = (kind == tds.TM_COMMIT_XACT || kind == tds.TM_ROLLBACK_XACT) && after < len(d) && d[after] != 0
+    var sql = ""
+    if kind == tds.TM_BEGIN_XACT { sql = "BEGIN TRANSACTION" }
+    else if kind == tds.TM_COMMIT_XACT { sql = "COMMIT TRANSACTION" }
+    else if kind == tds.TM_ROLLBACK_XACT { sql = "ROLLBACK TRANSACTION" }
+    else if kind == 9 { sql = "SAVE TRANSACTION [" + strings.replaceAll(name, "]", "]]") + "]" }
+    else {
+        c.o.error(&lexdb_base.err("0A000", "Transaction Manager request " + kind.toStr() + " (distributed transactions) is not supported"))
+        c.o.done(tds.DONE_ERROR, 0, 0)
+        return
+    }
+    if beginAfter { sql = sql + "; BEGIN TRANSACTION" }
+    c.batch(&sql)
+}
+
+// ---- requests
+
+// RESETCONNECTION: the session as it was after the login (an open
+// transaction rolled back), then ENVCHANGE 18.
+fn (c: mut &Conn) reset() {
+    if c.sess.status() != 'I' {
+        match lexdb_sql.parse(&"ROLLBACK") {
+            Ok(stmts) {
+                let none: []Val = []
+                let nt: []int = []
+                let r = c.sess.run(&stmts[0], &none, &nt)
+            }
+            Err(_) {}
+        }
+    }
+    c.sess.close()
+    c.sess = lexdb_exec.newSession(c.st)
+    c.sess.setUser(&c.user)
+    c.ts = lexdb_tsql.newState(c.ts.spid)
+    c.preps = []
+    c.o.envchangeBytes(18, &"", &"")
 }
 
 // Requests until the client goes: Ok(()) at its end, Err on the wire.
 fn (c: mut &Conn) requests(): Result[Unit, tds.Error] {
     while true {
         let m = try c.t.receive(MAX_REQUEST)
+        if (m.status & tds.STATUS_RESET) != 0 { c.reset() }
         if m.ptype == tds.PT_SQLBATCH {
             match batchText(&m.data) {
                 Ok(sql) { c.batch(&sql) }
@@ -704,8 +930,9 @@ fn (c: mut &Conn) requests(): Result[Unit, tds.Error] {
         } else if m.ptype == tds.PT_ATTENTION {
             c.o.done(tds.DONE_ATTN, 0, 0)
         } else if m.ptype == tds.PT_RPC {
-            c.o.error(&lexdb_base.err("0A000", "RPC requests (sp_executesql, prepared statements) are not supported yet"))
-            c.o.done(tds.DONE_ERROR, 0, 0)
+            c.rpc(m.data)
+        } else if m.ptype == 14 {
+            c.transMgr(&m.data)
         } else {
             c.o.error(&lexdb_base.err("08P01", "requests of packet type " + m.ptype.toStr() + " are not supported"))
             c.o.done(tds.DONE_ERROR, 0, 0)
@@ -917,6 +1144,7 @@ fn (c: mut &Conn) login(ctx: &[]tls.Context): Result[bool, tds.Error] {
         return Ok(false)
     }
     c.sess.setUser(&l.user)
+    c.user = l.user
     let ps = if l.packetSize == 0 { tds.DEFAULT_PACKET } else { min(max(l.packetSize, tds.MIN_PACKET), MAX_PACKET_SIZE) }
     c.welcome(ps)
     try c.send()
@@ -928,9 +1156,10 @@ pub type ConnArg = record { pub conn: net.Conn; pub st: lexdb_store.Store; pub i
 
 // Serves one client until it goes away.
 pub fn serve(a: ConnArg): int {
-    let ConnArg{conn: sock, st: st, id: _, ctx: ctx} = move(a)
+    let ConnArg{conn: sock, st: st, id: id, ctx: ctx} = move(a)
     let nd = sock.setNoDelay(true)
-    var c = Conn{t: tds.transport(sock), sess: lexdb_exec.newSession(st), st: st, o: newOut(), nocount: false}
+    var c = Conn{t: tds.transport(sock), sess: lexdb_exec.newSession(st), st: st, o: newOut(), ts: lexdb_tsql.newState(id),
+                 user: "", txn: 0, preps: []}
     if c.login(&ctx).unwrapOr(false) {
         let r = c.requests()
     }

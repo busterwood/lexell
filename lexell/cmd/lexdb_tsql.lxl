@@ -1,0 +1,542 @@
+// lexdb: T-SQL batches, run (design/lexdb-tds.md). lexdb_tsqlparse parses a
+// batch whole (parseBatch); this runs its statements against a session with SQL
+// Server's rules, and says what happened as events for the protocol
+// (lexdb_tds) to send.
+//
+// Variables: a batch's variables are its statements' parameters. The frame
+// holds them in order, @@ system values first (@@TRANCOUNT, @@ROWCOUNT,
+// @@ERROR, @@SPID, @@VERSION, @@SERVERNAME, @@LANGUAGE, kept current before
+// each statement), then an RPC's parameters, then what DECLARE adds; the
+// k-th is $k to the executor. SELECT @v = expr and SET @v = expr assign
+// (from the last row, as SQL Server does; none: unchanged).
+//
+// Transactions: BEGIN TRAN nests (@@TRANCOUNT); COMMIT ends the outermost;
+// ROLLBACK ends them all, or goes back to a SAVE TRAN point. An error rolls
+// back only its statement (each statement in a transaction runs under a
+// savepoint), unless SET XACT_ABORT ON or the error dooms the transaction
+// (serialization and deadlock), which roll it back and end the batch. SET
+// IMPLICIT_TRANSACTIONS ON begins one at the first statement that reads or
+// writes a table. Errors: the batch goes on after most; it ends after one
+// that SQL Server finds compiling (an unknown table, column or function,
+// an undeclared variable).
+//
+// SET LEXDB_DIALECT POSTGRES runs later batches in lexdb's own dialect, as
+// over PostgreSQL's protocol (the first error ends a batch); SET
+// LEXDB_DIALECT TSQL goes back.
+import "strings"
+import "./lexdb_base"
+import "./lexdb_sql"
+import "./lexdb_tsqlparse"
+import "./lexdb_exec"
+
+type Val = lexdb_sql.Val
+type DbErr = lexdb_base.DbErr
+type TypeName = lexdb_sql.TypeName
+
+pub const VERSION = "lexdb (SQL Server protocol, TDS 7.4; reports itself as Microsoft SQL Server 16.0.4315)"
+
+// ---- events
+
+pub const EV_ROWS = 1       // a result set: cols and rows
+pub const EV_DONE = 2       // a statement's end: count (-1: none to report), cmd, error
+pub const EV_ERROR = 3      // err
+pub const EV_TRAN = 4       // tran: the transaction began (8), committed (9) or was rolled back (10)
+
+pub type Event = record {
+    pub kind: int
+    pub cols: []lexdb_exec.OutCol
+    pub rows: [][]Val
+    pub count: int
+    pub cmd: int
+    pub error: bool
+    pub err: DbErr
+    pub tran: int
+}
+
+fn ev0(kind: int): Event {
+    return Event{kind: kind, cols: [], rows: [], count: -1, cmd: 0, error: false, err: lexdb_base.err("", ""), tran: 0}
+}
+
+// DONE's CurCmd: the statement it ends
+pub const CMD_SELECT = 0xC1
+pub const CMD_INSERT = 0xC3
+pub const CMD_DELETE = 0xC4
+pub const CMD_UPDATE = 0xC5
+
+fn cmdOf(kind: int): int {
+    if kind == lexdb_sql.S_SELECT { return CMD_SELECT }
+    if kind == lexdb_sql.S_INSERT { return CMD_INSERT }
+    if kind == lexdb_sql.S_UPDATE { return CMD_UPDATE }
+    if kind == lexdb_sql.S_DELETE { return CMD_DELETE }
+    return 0
+}
+
+fn errorEv(ev: mut &[]Event, e: &DbErr) {
+    var x = ev0(EV_ERROR)
+    x.err = e
+    append(ev, x)
+}
+
+fn doneEv(ev: mut &[]Event, count: int, cmd: int, error: bool) {
+    var x = ev0(EV_DONE)
+    x.count = count
+    x.cmd = cmd
+    x.error = error
+    append(ev, x)
+}
+
+// SQL Server's error number for a lexdb error: T-SQL's own errors carry
+// theirs in the state ("TS208"); for the rest, the number SQL Server gives
+// the same failure, where there is one, else 50000.
+pub fn sqlNumber(state: &str): int {
+    if strings.startsWith(state, "TS") { return strings.parseIntOpt(state[2..len(state)].toStr()).unwrapOr(50000) }
+    match state.toStr() {
+        "42P01" { return 208 }      // Invalid object name
+        "42703" { return 207 }      // Invalid column name
+        "42601" { return 102 }      // Incorrect syntax near
+        "42883" { return 195 }      // is not a recognized built-in function name
+        "42P07" { return 2714 }     // There is already an object named
+        "42710" { return 2714 }
+        "42501" { return 229 }      // permission was denied
+        "23505" { return 2627 }     // Violation of PRIMARY KEY / UNIQUE KEY constraint
+        "23502" { return 515 }      // Cannot insert the value NULL into column
+        "23503" { return 547 }      // conflicted with the FOREIGN KEY constraint
+        "23514" { return 547 }      // conflicted with the CHECK constraint
+        "22012" { return 8134 }     // Divide by zero error encountered
+        "22003" { return 8115 }     // Arithmetic overflow error
+        "22001" { return 2628 }     // String or binary data would be truncated
+        "22P02" { return 245 }      // Conversion failed
+        "22007" { return 241 }      // Conversion failed when converting date and/or time
+        "22008" { return 517 }      // Adding a value to a 'datetime' column caused an overflow
+        "40001" { return 1205 }     // deadlock victim / serialization
+        "40P01" { return 1205 }
+        "25P02" { return 3930 }     // The current transaction cannot be committed
+        "28000" { return 18456 }    // Login failed
+        "28P01" { return 18456 }
+        "57014" { return 3617 }     // cancelled
+        else { return 50000 }
+    }
+}
+
+// The severity SQL Server gives error n: 14 for a key's violation and a
+// failed login, 15 for a syntax error, else 16.
+pub fn sqlClass(n: int): int {
+    if n == 2627 || n == 2601 || n == 18456 || n == 229 { return 14 }
+    if n == 102 || n == 156 || n == 105 { return 15 }
+    return 16
+}
+
+// An error SQL Server finds compiling the batch's statement: the batch ends.
+fn endsBatch(e: &DbErr): bool {
+    let n = sqlNumber(&e.state)
+    return n == 208 || n == 207 || n == 102 || n == 195 || n == 137 || n == 134 || n == 2812
+}
+
+// An error after which the transaction cannot go on.
+fn dooms(e: &DbErr): bool { return e.state == "40001" || e.state == "40P01" || e.state == "25P02" }
+
+// ---- a connection's state, and a batch's variables
+
+pub type State = record {
+    pub nocount: bool
+    pub xactAbort: bool
+    pub implicitTx: bool
+    pub quotedIdent: bool
+    pub postgres: bool          // SET LEXDB_DIALECT POSTGRES
+    pub trancount: int
+    pub rowcount: int
+    pub error: int
+    pub spid: int
+    saves: []str                // SAVE TRAN names, in order
+    committed: bool             // the last transaction to end was committed
+}
+
+pub fn newState(spid: int): State {
+    return State{nocount: false, xactAbort: false, implicitTx: false, quotedIdent: true, postgres: false, trancount: 0,
+                 rowcount: 0, error: 0, spid: spid, saves: [], committed: false}
+}
+
+pub type Frame = record {
+    pub names: []str
+    pub types: []TypeName
+    pub vals: []Val
+}
+
+const SYSVARS: []str = ["@@trancount", "@@rowcount", "@@error", "@@spid", "@@version", "@@servername", "@@language"]
+
+fn intType(oid: int): TypeName { return TypeName{kind: lexdb_sql.K_INT, oid: oid, prec: 0, scale: 0, len: 0} }
+fn textType(): TypeName { return TypeName{kind: lexdb_sql.K_TEXT, oid: lexdb_sql.OID_TEXT, prec: 0, scale: 0, len: 0} }
+
+// A frame with the system values only.
+pub fn newFrame(): Frame {
+    var f = Frame{names: [], types: [], vals: []}
+    for n in SYSVARS {
+        append(mut &f.names, n.toStr())
+        append(mut &f.types, if n == "@@version" || n == "@@servername" || n == "@@language" { textType() } else { intType(lexdb_sql.OID_INT4) })
+        append(mut &f.vals, Val.Null)
+    }
+    return f
+}
+
+// A variable added (an RPC's parameter): its index.
+pub fn (f: mut &Frame) add(name: &str, t: TypeName, v: Val): int {
+    append(mut &f.names, name.toStr())
+    append(mut &f.types, t)
+    append(mut &f.vals, v)
+    return len(f.names) - 1
+}
+
+pub fn (f: &Frame) find(name: &str): int {
+    for i in 0..len(f.names) { if f.names[i] == name { return i } }
+    return -1
+}
+
+fn (st: &State) refresh(f: mut &Frame) {
+    f.vals[0] = Val.Int(st.trancount)
+    f.vals[1] = Val.Int(st.rowcount)
+    f.vals[2] = Val.Int(st.error)
+    f.vals[3] = Val.Int(st.spid)
+    f.vals[4] = Val.Text(VERSION)
+    f.vals[5] = Val.Text("lexdb")
+    f.vals[6] = Val.Text("us_english")
+}
+
+fn (f: &Frame) oids(): []int {
+    var o: []int = []
+    for t in f.types { append(mut &o, t.oid) }
+    return o
+}
+
+// ---- running
+
+// The row count in a command tag ("INSERT 0 3", "UPDATE 2", "SELECT 5"), -1 none.
+fn tagCount(tag: &str): int {
+    let sp = strings.lastIndexOf(tag, " ")
+    if sp < 0 { return -1 }
+    let w = tag[0..strings.indexOf(tag, " ", 0)].toStr()
+    if w != "INSERT" && w != "UPDATE" && w != "DELETE" && w != "SELECT" && w != "MERGE" && w != "COPY" && w != "FETCH" && w != "MOVE" {
+        return -1
+    }
+    return strings.parseIntOpt(tag[sp + 1..len(tag)].toStr()).unwrapOr(-1)
+}
+
+// A statement of lexdb's own, without parameters.
+fn simple(sess: mut &lexdb_exec.Session, sql: &str): Result[lexdb_exec.Res, DbErr] {
+    let stmts = try lexdb_sql.parse(sql)
+    let none: []Val = []
+    let nt: []int = []
+    return sess.run(&stmts[0], &none, &nt)
+}
+
+const SAVE = "\"lexdb tsql statement\""
+
+fn txStmt(kind: int): bool {
+    return kind == lexdb_sql.S_BEGIN || kind == lexdb_sql.S_COMMIT || kind == lexdb_sql.S_ROLLBACK ||
+           kind == lexdb_sql.S_SAVEPOINT || kind == lexdb_sql.S_RELEASE || kind == lexdb_sql.S_ROLLBACK_TO
+}
+
+// Whether SET IMPLICIT_TRANSACTIONS ON begins a transaction for s: one that
+// reads or writes a table.
+fn startsTx(s: &lexdb_sql.Stmt): bool {
+    if txStmt(s.kind) || s.kind == lexdb_sql.S_SET || s.kind == lexdb_sql.S_SHOW { return false }
+    if s.kind == lexdb_sql.S_SELECT { return len(s.from) > 0 }
+    return true
+}
+
+// Runs one statement of lexdb's parser; false when the batch ends.
+fn (st: mut &State) sqlStmt(sess: mut &lexdb_exec.Session, s: &lexdb_sql.Stmt, f: mut &Frame, ev: mut &[]Event, quiet: bool): bool {
+    if st.implicitTx && sess.status() == 'I' && startsTx(s) {
+        match simple(sess, &"BEGIN") {
+            Ok(_) {}
+            Err(e) {
+                errorEv(ev, &e)
+                doneEv(ev, -1, 0, true)
+                return false
+            }
+        }
+    }
+    let inTx = sess.status() != 'I' && !txStmt(s.kind)
+    if inTx {
+        let sp = simple(sess, &("SAVEPOINT " + SAVE))
+    }
+    let cmd = cmdOf(s.kind)
+    // as SQL Server: an INSERT, UPDATE or DELETE runs in a transaction of
+    // its own, nested, so @@TRANCOUNT inside it is one more
+    if s.kind == lexdb_sql.S_INSERT || s.kind == lexdb_sql.S_UPDATE || s.kind == lexdb_sql.S_DELETE {
+        f.vals[0] = Val.Int(max(st.trancount, if sess.status() == 'I' { 0 } else { 1 }) + 1)
+    }
+    let oids = f.oids()
+    let r = sess.run(s, &f.vals, &oids)
+    if r.isErr() {
+        let e = r.unwrapErr()
+        errorEv(ev, &e)
+        doneEv(ev, -1, cmd, true)
+        st.error = sqlNumber(&e.state)
+        st.rowcount = 0
+        if inTx {
+            if st.xactAbort || dooms(&e) {
+                let rb = simple(sess, &"ROLLBACK")
+                return false
+            }
+            let back = simple(sess, &("ROLLBACK TO SAVEPOINT " + SAVE))
+            let rel = simple(sess, &("RELEASE SAVEPOINT " + SAVE))
+        } else if st.xactAbort {
+            return false
+        }
+        return !endsBatch(&e)
+    }
+    var res = r.unwrap()
+    if inTx {
+        let rel = simple(sess, &("RELEASE SAVEPOINT " + SAVE))
+    }
+    st.error = 0
+    if len(s.assign) > 0 {
+        // SELECT @v = ...: the last row's values, each to its variable's type
+        let n = len(res.rows)
+        if n > 0 {
+            for i in 0..len(s.assign) {
+                let k = f.find(&s.assign[i])
+                if k < 0 || i >= len(res.rows[n - 1]) { continue }
+                match lexdb_exec.coerce(res.rows[n - 1][i], &f.types[k]) {
+                    Ok(v) { f.vals[k] = v }
+                    Err(e) {
+                        errorEv(ev, &e)
+                        doneEv(ev, -1, cmd, true)
+                        st.error = sqlNumber(&e.state)
+                        return true
+                    }
+                }
+            }
+        }
+        st.rowcount = n
+        if !quiet { doneEv(ev, if st.nocount { -1 } else { n }, cmd, false) }
+        return true
+    }
+    let n = tagCount(&res.tag)
+    st.rowcount = max(n, 0)
+    if res.hasRows {
+        var x = ev0(EV_ROWS)
+        x.cols = replace(mut &res.cols, [])
+        x.rows = replace(mut &res.rows, [])
+        append(ev, x)
+    }
+    if res.tag == "COMMIT" { st.committed = true }
+    if res.tag == "ROLLBACK" && !txStmt(s.kind) { st.committed = false }
+    doneEv(ev, if st.nocount { -1 } else { n }, cmd, false)
+    return true
+}
+
+// A statement of lexdb's own (BEGIN, COMMIT, ...) for transaction control:
+// an error as an event; false when there was one.
+fn (st: mut &State) control(sess: mut &lexdb_exec.Session, sql: &str, ev: mut &[]Event): bool {
+    match simple(sess, sql) {
+        Ok(r) {
+            if r.tag == "COMMIT" { st.committed = true }
+            if r.tag == "ROLLBACK" && sql == "ROLLBACK" { st.committed = false }
+            return true
+        }
+        Err(e) {
+            errorEv(ev, &e)
+            doneEv(ev, -1, 0, true)
+            st.error = sqlNumber(&e.state)
+            return false
+        }
+    }
+}
+
+fn tsErr(n: int, msg: str): DbErr { return lexdb_base.err("TS" + n.toStr(), msg) }
+
+// One statement of the batch; false when the batch ends.
+fn (st: mut &State) exec(sess: mut &lexdb_exec.Session, t: &lexdb_tsqlparse.TStmt, f: mut &Frame, ev: mut &[]Event): bool {
+    if t.kind == lexdb_tsqlparse.TS_SQL { return st.sqlStmt(sess, &t.stmt[0], f, ev, t.value == "set") }
+    if t.kind == lexdb_tsqlparse.TS_DECLARE {
+        for s in t.stmt {
+            if !st.sqlStmt(sess, &s, f, ev, true) { return false }
+        }
+        return true
+    }
+    if t.kind == lexdb_tsqlparse.TS_SETOPT {
+        let on = t.value == "on"
+        for n in t.names {
+            if n == "nocount" { st.nocount = on }
+            else if n == "xact_abort" { st.xactAbort = on }
+            else if n == "implicit_transactions" { st.implicitTx = on }
+            else if n == "quoted_identifier" { st.quotedIdent = on }
+            else if n == "lexdb_dialect" {
+                if t.value != "postgres" && t.value != "tsql" {
+                    errorEv(ev, &lexdb_base.err("22023", "SET LEXDB_DIALECT takes POSTGRES or TSQL"))
+                    doneEv(ev, -1, 0, true)
+                    return true
+                }
+                st.postgres = t.value == "postgres"
+            }
+        }
+        doneEv(ev, -1, 0, false)
+        return true
+    }
+    if t.kind == lexdb_tsqlparse.TS_BEGIN {
+        if sess.status() == 'I' {
+            if !st.control(sess, &"BEGIN", ev) { return true }
+            st.trancount = 0
+        }
+        st.trancount += 1
+        doneEv(ev, -1, 0, false)
+        return true
+    }
+    if t.kind == lexdb_tsqlparse.TS_COMMIT {
+        if st.trancount == 0 {
+            errorEv(ev, &tsErr(3902, "The COMMIT TRANSACTION request has no corresponding BEGIN TRANSACTION."))
+            doneEv(ev, -1, 0, true)
+            st.error = 3902
+            return true
+        }
+        st.trancount -= 1
+        if st.trancount == 0 {
+            if !st.control(sess, &"COMMIT", ev) { return true }
+        }
+        doneEv(ev, -1, 0, false)
+        return true
+    }
+    if t.kind == lexdb_tsqlparse.TS_ROLLBACK {
+        var known = false
+        if len(t.names) > 0 {
+            for sv in st.saves { if sv == t.names[0] { known = true } }
+        }
+        if known {
+            if !st.control(sess, &("ROLLBACK TO SAVEPOINT " + quoteName(&t.names[0])), ev) { return true }
+            doneEv(ev, -1, 0, false)
+            return true
+        }
+        if st.trancount == 0 && sess.status() == 'I' {
+            errorEv(ev, &tsErr(3903, "The ROLLBACK TRANSACTION request has no corresponding BEGIN TRANSACTION."))
+            doneEv(ev, -1, 0, true)
+            st.error = 3903
+            return true
+        }
+        let ok = st.control(sess, &"ROLLBACK", ev)
+        st.trancount = 0
+        st.saves = []
+        if ok { doneEv(ev, -1, 0, false) }
+        return true
+    }
+    if t.kind == lexdb_tsqlparse.TS_SAVE {
+        if sess.status() == 'I' {
+            errorEv(ev, &tsErr(628, "Cannot issue SAVE TRANSACTION when there is no active transaction."))
+            doneEv(ev, -1, 0, true)
+            st.error = 628
+            return true
+        }
+        if st.control(sess, &("SAVEPOINT " + quoteName(&t.names[0])), ev) {
+            append(mut &st.saves, t.names[0])
+            doneEv(ev, -1, 0, false)
+        }
+        return true
+    }
+    return true
+}
+
+fn quoteName(n: &str): str { return "\"" + strings.replaceAll(n, "\"", "\"\"") + "\"" }
+
+// After a statement: @@TRANCOUNT kept with the session's transaction, and
+// its start or end as an event.
+fn (st: mut &State) after(sess: &lexdb_exec.Session, before: byte, ev: mut &[]Event) {
+    let now = sess.status()
+    if now == 'I' {
+        st.trancount = 0
+        st.saves = []
+    } else if st.trancount == 0 {
+        st.trancount = 1
+    }
+    if before == 'I' && now != 'I' {
+        var x = ev0(EV_TRAN)
+        x.tran = 8
+        append(ev, x)
+    } else if before != 'I' && now == 'I' {
+        var x = ev0(EV_TRAN)
+        x.tran = if st.committed { 9 } else { 10 }
+        append(ev, x)
+    }
+}
+
+// Runs a batch: its events onto ev. f: its variables to start with
+// (newFrame's, and an RPC's parameters), and after it the values they have.
+pub fn run(sess: mut &lexdb_exec.Session, st: mut &State, sql: &str, f: mut &Frame, ev: mut &[]Event) {
+    st.refresh(f)
+    if st.postgres {
+        st.runPg(sess, sql, ev)
+        return
+    }
+    let parsed = lexdb_tsqlparse.parseBatch(sql, lexdb_sql.Dialect{tsql: true, quotedIdent: st.quotedIdent}, &f.names)
+    if parsed.isErr() {
+        let e = parsed.unwrapErr()
+        errorEv(ev, &e)
+        doneEv(ev, -1, 0, true)
+        st.error = sqlNumber(&e.state)
+        return
+    }
+    let b = parsed.unwrap()
+    let given = len(f.names)
+    for k in given..len(b.vars) {
+        let i = f.add(&b.vars[k], b.types[k - given], Val.Null)
+    }
+    if len(b.stmts) == 0 {
+        doneEv(ev, -1, 0, false)
+        return
+    }
+    for t in b.stmts {
+        st.refresh(f)
+        st.committed = false
+        let before = sess.status()
+        let go = st.exec(sess, &t, f, ev)
+        st.after(sess, before, ev)
+        if !go { break }
+    }
+}
+
+// A batch in lexdb's own dialect (SET LEXDB_DIALECT POSTGRES): the first
+// error ends it; SET LEXDB_DIALECT TSQL goes back.
+fn (st: mut &State) runPg(sess: mut &lexdb_exec.Session, sql: &str, ev: mut &[]Event) {
+    let low = strings.toLowerAscii(strings.trim(sql))
+    if strings.startsWith(low, "set lexdb_dialect") {
+        st.postgres = !strings.contains(low, "tsql")
+        doneEv(ev, -1, 0, false)
+        return
+    }
+    match lexdb_sql.parse(sql) {
+        Err(e) {
+            errorEv(ev, &e)
+            doneEv(ev, -1, 0, true)
+        }
+        Ok(stmts) {
+            let none: []Val = []
+            let nt: []int = []
+            var any = false
+            for s in stmts {
+                if s.kind == lexdb_sql.S_EMPTY { continue }
+                any = true
+                st.committed = false
+                let before = sess.status()
+                let r = sess.run(&s, &none, &nt)
+                if r.isErr() {
+                    let e = r.unwrapErr()
+                    errorEv(ev, &e)
+                    doneEv(ev, -1, cmdOf(s.kind), true)
+                    st.after(sess, before, ev)
+                    break
+                }
+                var res = r.unwrap()
+                if res.tag == "COMMIT" { st.committed = true }
+                if res.hasRows {
+                    var x = ev0(EV_ROWS)
+                    x.cols = replace(mut &res.cols, [])
+                    x.rows = replace(mut &res.rows, [])
+                    append(ev, x)
+                }
+                let n = tagCount(&res.tag)
+                doneEv(ev, if st.nocount { -1 } else { n }, cmdOf(s.kind), false)
+                st.after(sess, before, ev)
+            }
+            if !any { doneEv(ev, -1, 0, false) }
+        }
+    }
+}

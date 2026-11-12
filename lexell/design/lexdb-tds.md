@@ -97,7 +97,9 @@ parallel, each in its own worktree.
   that a T-SQL statement and its PostgreSQL twin give the same `Stmt` and
   share the planner and executor; T-SQL's own statements (batches, control
   flow, procedures) in a new `lexdb_tsql.lxl` that interprets a batch and
-  hands each statement to the shared parser. The alternative, a separate
+  hands each statement to the shared parser. (As built: T-SQL's own
+  statements are parsed in `lexdb_tsqlparse.lxl`, run in `lexdb_tsql.lxl`;
+  section 8.) The alternative, a separate
   T-SQL parser making the same `Stmt`, duplicates the expression grammar
   and drifts.
 - **L2. Case-insensitive comparison.** SQL Server's default collation
@@ -236,3 +238,70 @@ Revised order: S2 (RPC; lexer options and `@` parameters; transactions with
 statement-level rollback; the statement sink), then L2 and L6 (the catalog's
 collation and spelling, keys folded), then S3 and S4 largely in sequence,
 then S5.
+
+Decided (the user, 2026-11-11): L2 per column, case-insensitive by default
+for tables made over TDS and exact over PostgreSQL, built before S3; L6
+names matched case-insensitively, their spelling kept and returned (psql
+sees it too); one database, for good.
+
+## 8. Stage S2, as built (2026-11-11)
+
+Widened by section 7: RPC, T-SQL's lexing and variables, and T-SQL's
+transactions, with the S1 code restructured around them.
+
+- **Parsing (`lexdb_sql`):** a `Dialect` (tsql, quotedIdent) for the lexer:
+  `@name` and `@@name`, `[name]`, `N'...'`, and `"..."` as a string under
+  QUOTED_IDENTIFIER OFF; E'' strings are lexdb's only. Until L6, a quoted
+  name is folded like a bare one in T-SQL, so `[Orders]` and `Orders` are
+  one table. In T-SQL mode the parser takes SQL Server's type names
+  (nvarchar(n|max), bit, tinyint, datetime, datetime2(n), datetimeoffset,
+  uniqueidentifier, money, varbinary(max), and timestamp as rowversion) and
+  `SELECT @v = expr`. It exports a `Parser`: a cursor over T-SQL text
+  (peek, next, keywords) with lexdb's statement, expression and type-name
+  grammar behind it, and nothing T-SQL's own.
+- **Parsing a batch (`lexdb_tsqlparse`):** a module of its own, so the
+  T-SQL statements S4 adds (IF, WHILE, TRY ... CATCH, procedures) grow
+  there and not in lexdb_sql. `parseBatch` parses a whole batch before any
+  of it runs: DECLARE (with initialisers), SET @v = expr, SET options,
+  BEGIN TRAN, COMMIT, ROLLBACK [name], SAVE TRAN, and any other statement
+  through lexdb_sql's `Parser`, statement after statement with no `;`
+  needed. `parseParamDecls` reads sp_executesql's @params.
+- **Variables are parameters.** A batch's frame holds its variables in
+  order: the @@ values (@@TRANCOUNT, @@ROWCOUNT, @@ERROR, @@SPID,
+  @@VERSION, @@SERVERNAME, @@LANGUAGE), an RPC's parameters, then what
+  DECLARE adds; `@name` parses to `$k`. The executor is unchanged. As SQL
+  Server, @@TRANCOUNT inside an INSERT, UPDATE or DELETE is one more (the
+  oracle shows 2 inside a transaction).
+- **Running (`lexdb_tsql`):** nested BEGIN TRAN and @@TRANCOUNT; COMMIT
+  without one is 3902, ROLLBACK 3903, SAVE TRAN 628. Each statement in a
+  transaction runs under a savepoint and an error rolls back only it,
+  unless XACT_ABORT ON or the error dooms the transaction (40001, 40P01,
+  25P02): then the transaction is rolled back and the batch ends. The batch
+  goes on after most errors and ends after those SQL Server finds compiling
+  (208, 207, 102, 195, 137, 134, 2812); a syntax error anywhere runs none of
+  it. IMPLICIT_TRANSACTIONS ON begins one at a statement that reads or
+  writes a table. `SET LEXDB_DIALECT POSTGRES | TSQL` switches dialect.
+  The batch's results are events (result set, statement end, error,
+  transaction begun or ended) that lexdb_tds turns into tokens.
+- **RPC and the rest (`lexdb_tds`):** as its header says; `tds.parseRpc`
+  and `tds.allHeadersOf` read requests on the server side, and a received
+  message now carries its first packet's status (RESETCONNECTION). Error
+  severities are SQL Server's (14 for a key's violation, 15 for syntax).
+- **Checked against the oracle:** the batch semantics above (nested counts,
+  statement rollback, XACT_ABORT, SAVE TRAN, 3902, syntax and 208 ending the
+  batch, QUOTED_IDENTIFIER OFF, IMPLICIT_TRANSACTIONS, an OUTPUT parameter)
+  give the same answers from SQL Server 2022 as from lexdb, through
+  lib/sqlserver. `tests/lexdb/tds_dotnet/run.sh` (Microsoft.Data.SqlClient
+  6: parameters, Prepare, an OUTPUT parameter, BeginTransaction with
+  rollback and commit, error number and class, a pooled connection reset)
+  prints the same lines against both, but for the database's name. sqlcmd
+  (ODBC Driver 18) runs T-SQL batches with variables and transactions.
+- **Tests:** `tds_client.lxl` grew the S2 cases (parameters of every kind,
+  OUTPUT, transaction[T] committed and rolled back, variables, SELECT
+  assignment, 137, nesting, statement rollback, XACT_ABORT, savepoints,
+  3902, syntax and 208 ending the batch, QUOTED_IDENTIFIER OFF, brackets
+  and N strings, the dialect switch, RESETCONNECTION).
+- **Left:** ATTENTION during a statement and streamed results (a reader
+  task and a cancel flag in the executor; column types from the plan);
+  sp_prepare's metadata; TDS errors' classes beyond the common ones; the
+  rest of T-SQL (S3, S4) after L2 and L6.
