@@ -40,8 +40,9 @@ primary-key statistics (24); the join order bound by keys (25) and by cost
 (26); implied equalities (27); SQLite's N-best search (28); the join-order
 review's fixes with filter and range estimates (29); the search to 24
 tables (30); the integration with lexdb 9.94 (31); ORDER BY ... LIMIT read
-in order (32); the second review's fixes (33); and a workload comparison
-(34). Code comments cite these sections as "optimizer N".
+in order (32); the second review's fixes (33); a workload comparison (34);
+and the fast path for pinned joins (35, uncommitted). Code comments cite
+these sections as "optimizer N".
 
 ## 1. Summary
 
@@ -1925,6 +1926,47 @@ rules start from lineitem. Overall the cost plans take 14 times less time.
 
 **Next, from this.** The fast path for pinned joins; calibrating the read
 costs (index entry, row by key, range) against measurements such as Q9's.
+
+## 35. Pinned joins: a fast path (2026-11-12)
+
+From section 34: the point queries were 4 to 30 us slower under the cost
+planner, though their plans were the same or equivalent.
+
+**What.** A join whose key-bound order (section 25) starts from a row that
+its key pins (after implied equalities) takes that order at once
+(`hasPinned`). It reads no statistics beyond those single-table path choice
+already reads, and does not search. Other joins load their tables'
+statistics only when they are costed (`loadEst` during FROM is now the
+single-table rule). From a pinned row:
+- an equality on an outer value is taken before a constant's (`Query.pinned`),
+  so each table is looked up per row, one lookup in all;
+- the "constant first" rule of section 27 is off, since a hash of what the
+  constant reaches costs more than one lookup.
+The plan is then the same whatever FROM's order. `exec_joinorder`'s pinned
+cases are back to section 25's plans (a lookup per row, not a hash of 5
+rows).
+
+**Measured** (`design/experiments/q1_split.lxl`, a small copy of the
+schema, 5,000 runs each): planning is EXPLAIN alone, execution the run
+minus that.
+
+| | Cost: planning | Cost: execution | Rules: planning | Rules: execution |
+|---|---|---|---|---|
+| Q1 before | 32.4 us | 13.0 us | 21.8 us | 9.6 us |
+| Q1 now | 31.0 us | 11.3 us | 21.9 us | 9.7 us |
+| Q2 (one table) | 13.4 us | 10.7 us | 10.1 us | 9.7 us |
+
+Execution is now close to the rules'. Planning stays about 9 us dearer for
+Q1 and 3 us for Q2. The workload's run after the first step: Q1 48 us (was
+53), Q3 134 (139), the rest unchanged. Most of what is left is reading and
+parsing the tables' statistics rows on every planning (about 3 us a table,
+`loadEst`), plus the statistics version for the plan cache. Prepared
+statements pay it once. Simple queries would need a cache of parsed
+statistics that outlives a statement, which the store does not offer (its
+memo holds text). Not done.
+
+**Checked:** the suite, 92 of 92; the random differential sets, 6,616
+joins, 0 differences.
 
 ## Sources
 
