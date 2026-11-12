@@ -39,9 +39,10 @@ kept per parameter outcome (section 22), per-value estimates with
 per-parameter plans (section 23), estimates deciding beyond ties with
 primary-key statistics (section 24), the constraint-bound join order
 (section 25), the cost-based join order with its planning-time measurement
-(section 26), implied equalities (section 27), and SQLite's N-best search
-past 8 tables (section 28, uncommitted). Code comments cite these sections
-as "optimizer N".
+(section 26), implied equalities (section 27), SQLite's N-best search past
+8 tables (section 28), and the fixes from the join-order review with
+filter and range estimates (section 29, uncommitted). Code comments cite
+these sections as "optimizer N".
 
 ## 1. Summary
 
@@ -1636,6 +1637,72 @@ allow it (SQLite plans 64), but the rows of every set are computed up front
 the first version of the test was on an unindexed column, and the model
 ignored it (all ten tables estimated alike, FROM order kept). That is the
 known gap of section 26: filters on unindexed columns.
+
+## 29. Join-order review and fixes (2026-11-12)
+
+A Fable review of sections 25 and 26 ran about 730 queries under both
+planner modes, comparing result rows: about 220 written by hand and 510
+random joins of 2 to 13 tables. It found **no wrong results**. It did find
+queries that now failed and plans that got worse; each is fixed and has a
+case in `tests/lexdb/run/exec_joinreview.lxl`. The review's repro scripts
+are kept in the session's scratchpad, not the repository.
+
+1. **A key value the column cannot hold was an error** (22003 out of range,
+   22001 too long) in a hash probe or a key lookup. Example: a bigint
+   2^40 probing an int key. The bug predates this branch, but reordering
+   reached it more often. Now such a value matches no row (`keyVal`), and the
+   probe uses the column's type for bounds (`boundType`), as lookups do.
+   Other errors stand: `int_col = 'abc'` still gives 22P02. Range bounds
+   past a type's range are unchanged (an error in both modes, not reported).
+2. **A hash join could break `max_statement_mem`.** The planner now knows
+   the session's limit (`Txn.memMax`, in the plan cache's key). A hash is
+   chosen over a possible lookup only when its estimated rows
+   (`estRowBytes`) fit in half the limit and in 64 MB.
+3. **Filters other than index equalities counted for nothing.** A table's
+   rows by its own conditions now count:
+   - an equality's value by its common values, or 1/distinct;
+   - a range by the part of the column's span it covers, using its least
+     and greatest values, which ANALYZE now records for the leading column
+     of each index and of the primary key (numbers, dates and times; a
+     single-column primary key gets an entry too);
+   - SQLite's 1/4 or 1/16 when there is no span or the bound is a
+     parameter;
+   - an IN list n/distinct, `<>` 1 - 1/distinct, anything else 1/2.
+   A table's constant way also takes a range on the next key column. The
+   review's cases now read 3 to 5 rows, as the rules do, where they read up
+   to 20,000.
+4. **LIMIT and EXISTS paid for a full hash build.** `Scope.early` marks a
+   query whose reading may stop early: a LIMIT without ORDER BY or GROUP
+   BY, EXISTS, or a scalar subquery. Its lookups are not turned into
+   hashes.
+5. **A hash join in a read-write block caused serialization failures.** A
+   whole-table read conflicts with every write to the table, as optimizer
+   19 noted for the switch. The first fix (lookups only) was not enough:
+   the cost order then scanned the other table first, without range
+   estimates. Such transactions (`Txn.noting()`) now keep the order bound
+   by keys (section 25), which starts only from a pinned row.
+6. **Batch scans were skipped** when the first table was not FROM's first.
+   `batchLevel` and `bCompile` now offset by the level's place in the
+   joined row.
+
+**Known, not fixed.**
+- An ORDER BY ... LIMIT that FROM's first table could serve in index
+  order: the cost order may read 2,000 rows where the rules read 42 (a
+  common label). For a rare label the rules would read most of the table,
+  and the cost order a few rows. The search does not yet weigh "read in the
+  order and stop early".
+- Review finding 7, minor and not demonstrated: a read-once level drops a
+  path that mixes a constant and an outer value, where it could keep the
+  constant prefix; `wayInto` takes the first value for a column that has
+  both a constant and an outer one.
+- Hash against lookup, measured on one in-memory join of 20,000 rows: 19.2
+  ms against 21.5 ms, so the model's preference for hashing is right but
+  stronger than measured. Not calibrated further.
+
+**Planning time** (`plan_time.lxl`, load about 1): point select 7 us; 4
+tables 32; 8 tables 72; a 12-table chain 194; a 12-table star 512. The
+extra over section 28 is mostly reading the larger statistics rows, once
+per table per planning.
 
 ## Sources
 

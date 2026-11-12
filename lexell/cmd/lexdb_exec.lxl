@@ -3544,7 +3544,7 @@ fn loadEst(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, join: b
     let v = got.unwrap()
     let parts = strings.split(&v, ";")
     if len(parts) < 2 || strings.parseIntOpt(parts[0].toStr()).unwrapOr(-1) != t.tree { return Ok(noEst()) }
-    var es = Est{rows: strings.parseIntOpt(parts[1].toStr()).unwrapOr(-1), trees: [], entries: [], dist: [], cm: []}
+    var es = Est{rows: strings.parseIntOpt(parts[1].toStr()).unwrapOr(-1), trees: [], entries: [], dist: [], cm: [], lo: [], hi: [], span: []}
     for i in 2..len(parts) {
         let f = strings.split(parts[i], ":")
         if len(f) < 3 { continue }
@@ -3564,6 +3564,28 @@ fn loadEst(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, join: b
         append(mut &es.entries, ents)
         append(mut &es.dist, ds)
         append(mut &es.cm, cm)
+        // its leading column's least and greatest, as numbers (optimizer 29)
+        var lo = 0.0f
+        var hi = 0.0f
+        var span = false
+        if len(f) >= 6 {
+            match math.parse(f[4].toStr()) {
+                Some(a) {
+                    match math.parse(f[5].toStr()) {
+                        Some(b) {
+                            lo = a
+                            hi = b
+                            span = true
+                        }
+                        None {}
+                    }
+                }
+                None {}
+            }
+        }
+        append(mut &es.lo, lo)
+        append(mut &es.hi, hi)
+        append(mut &es.span, span)
     }
     return Ok(es)
 }
@@ -3605,6 +3627,29 @@ fn analyzeStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
     return Ok(tagOnly("ANALYZE"))
 }
 
+// A value as a number for range estimates (optimizer 29): numbers, dates,
+// times and timestamps (their counts of days or microseconds); None else.
+fn spanNum(v: &Val): Option[float] {
+    match v {
+        Val.Int(n) { return Some(float(n)) }
+        Val.Num(d) { return Some(d.toFloat()) }
+        Val.Float(x) { return Some(x) }
+        Val.Real(x) { return Some(x) }
+        Val.Date(n) { return Some(float(n)) }
+        Val.Time(n) { return Some(float(n)) }
+        Val.Ts(n) { return Some(float(n)) }
+        Val.Tstz(n) { return Some(float(n)) }
+        else { return None }
+    }
+}
+
+// An entry's least and greatest leading values, ":min:max" when they were
+// all numbers (n > 0), else "".
+fn spanText(n: int, lo: float, hi: float): str {
+    if n <= 0 { return "" }
+    return ":" + lexdb_float.fmt8(lo) + ":" + lexdb_float.fmt8(hi)
+}
+
 // Distinct values counted per prefix at most: past it the count stays here, a
 // lower bound, which keeps ANALYZE's memory bounded (the estimate it gives is
 // then an upper bound).
@@ -3638,19 +3683,31 @@ fn analyzeTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, snap: mut &le
     var rows = 0
     var entries: []int = []
     var seen: [][]Map[str, int] = []
+    // the leading column's least and greatest values as numbers, when they
+    // are numbers (dates and times too), for range estimates (optimizer 29)
+    var mins: []float = []
+    var maxs: []float = []
+    var nums: []int = []                // per index: values counted as numbers; -1 one was not a number
     for ix in t.indexes {
         var ms: []Map[str, int] = []
         for j in 0..len(ix.cols) { append(mut &ms, newMap()) }
         append(mut &seen, ms)
         append(mut &entries, 0)
+        append(mut &mins, 0.0f)
+        append(mut &maxs, 0.0f)
+        append(mut &nums, 0)
     }
+    var pkMin = 0.0f
+    var pkMax = 0.0f
+    var pkNums = 0
     let all: []bool = []
     let path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: []}
     let sc = Scan{empty: false, point: false, lo: "", hi: "", whole: true}
-    // a primary key of several columns (optimizer 24): rows come in its order, so
-    // each prefix's distinct values are counted where it changes, and its
-    // leading column's values by their runs
-    let pkn = if len(t.pk) >= 2 { len(t.pk) } else { 0 }
+    // the primary key (optimizer 24; of one column too, optimizer 29): rows
+    // come in its order, so each prefix's distinct values are counted where
+    // it changes, its leading column's values by their runs (of several
+    // columns), and its least and greatest are the first row's and the last's
+    let pkn = len(t.pk)
     var pkPrev: []str = array(pkn, "")
     var pkDist: []int = array(pkn, 0)
     var run = 0
@@ -3672,7 +3729,7 @@ fn analyzeTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, snap: mut &le
                     let k = b.toStr()
                     if changed || k != pkPrev[j] {
                         if j == 0 && rows > 1 {
-                            keepCommon(mut &pkKeys, mut &pkCnts, &runKey, run)
+                            if pkn >= 2 { keepCommon(mut &pkKeys, mut &pkCnts, &runKey, run) }
                             run = 0
                         }
                         if j == 0 { runKey = k.toStr() }
@@ -3682,10 +3739,31 @@ fn analyzeTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, snap: mut &le
                     }
                 }
                 run += 1
+                if pkNums >= 0 {
+                    match spanNum(&r[t.pk[0]]) {
+                        Some(x) {
+                            if pkNums == 0 { pkMin = x }
+                            pkMax = x
+                            pkNums += 1
+                        }
+                        None { if !isNull(&r[t.pk[0]]) { pkNums = -1 } }
+                    }
+                }
             }
             for i in 0..len(t.indexes) {
                 if !(try inIndex(t, &t.indexes[i], &r)) { continue }
                 entries[i] += 1
+                if nums[i] >= 0 && len(t.indexes[i].cols) > 0 {
+                    let lv0 = try idxVal(t, &t.indexes[i], 0, &r)
+                    match spanNum(&lv0) {
+                        Some(x) {
+                            if nums[i] == 0 || x < mins[i] { mins[i] = x }
+                            if nums[i] == 0 || x > maxs[i] { maxs[i] = x }
+                            nums[i] += 1
+                        }
+                        None { if !isNull(&lv0) { nums[i] = -1 } }
+                    }
+                }
                 var b = newStrBuf()
                 for j in 0..len(t.indexes[i].cols) {
                     encIdxPart(mut &b, &(try idxVal(t, &t.indexes[i], j, &r)))
@@ -3701,14 +3779,14 @@ fn analyzeTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, snap: mut &le
     out.add(t.tree.toStr() + ";" + rows.toStr())
     if pkn > 0 {
         // the primary key's, under the table's tree
-        if rows > 0 { keepCommon(mut &pkKeys, mut &pkCnts, &runKey, run) }
+        if rows > 0 && pkn >= 2 { keepCommon(mut &pkKeys, mut &pkCnts, &runKey, run) }
         var ds: []str = []
         for d in pkDist { append(mut &ds, d.toStr()) }
         out.add(";" + t.tree.toStr() + ":" + rows.toStr() + ":" + strings.join(&ds, ","))
         let avg = if pkDist[0] > 0 { rows / pkDist[0] } else { 0 }
         var parts: []str = []
         for x in 0..len(pkKeys) { if pkCnts[x] > avg { append(mut &parts, toHex(&pkKeys[x]) + "=" + pkCnts[x].toStr()) } }
-        out.add(":" + strings.join(&parts, ","))
+        out.add(":" + strings.join(&parts, ",") + spanText(pkNums, pkMin, pkMax))
     }
     for i in 0..len(t.indexes) {
         var ds: []str = []
@@ -3728,7 +3806,9 @@ fn analyzeTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, snap: mut &le
             }
             var parts: []str = []
             for x in 0..len(keys) { append(mut &parts, toHex(&keys[x]) + "=" + cnts[x].toStr()) }
-            out.add(":" + strings.join(&parts, ","))
+            out.add(":" + strings.join(&parts, ",") + spanText(nums[i], mins[i], maxs[i]))
+        } else {
+            out.add(":")
         }
     }
     try txn.put(CATALOG, statKey(&t.name), out.toStr())
@@ -4034,9 +4114,9 @@ const IN_LOOKUP_MAX: int = 1000
 // columns (a NULL counted as a value), and its leading column's most common
 // values (cm, optimizer 23). rows -1: none (no ANALYZE, an ANALYZE of an older table
 // of the name, or SET lexdb_planner = rules).
-type Est = record { rows: int; trees: []int; entries: []int; dist: [][]int; cm: []Common }
+type Est = record { rows: int; trees: []int; entries: []int; dist: [][]int; cm: []Common; lo: []float; hi: []float; span: []bool }
 
-fn noEst(): Est { return Est{rows: -1, trees: [], entries: [], dist: [], cm: []} }
+fn noEst(): Est { return Est{rows: -1, trees: [], entries: [], dist: [], cm: [], lo: [], hi: [], span: []} }
 
 // An index's leading column (optimizer 23): its entries, its distinct values, and its
 // most common values (their encoded index parts) with their exact counts:
@@ -5197,7 +5277,7 @@ const ROW_COST: float = 0.1f
 type BindCol = record { deps: []int; keys: []str }
 
 // A way into a level: its primary key (index -1) or an unfiltered index.
-type WayCand = record { index: int; tree: int; unique: bool; cols: []BindCol }
+type WayCand = record { index: int; tree: int; unique: bool; cols: []BindCol; colIds: []int }
 
 // Its expected rows and reads each time it is taken; outer: it uses values of
 // the levels placed. rows -1: none.
@@ -5260,15 +5340,16 @@ fn (q: &Query) wayCands(k: int, cs: &[]Expr): []WayCand {
             append(mut &bcs, b)
         }
         append(mut &out, WayCand{index: c, tree: if c < 0 { lv.t.tree } else { lv.t.indexes[c].tree },
-                                 unique: c < 0 || lv.t.indexes[c].unique, cols: bcs})
+                                 unique: c < 0 || lv.t.indexes[c].unique, cols: bcs, colIds: copyInts(&cols)})
     }
     return out
 }
 
 // The cheapest way into level k with the levels of mask placed: outer, one
 // using their values (a lookup per row; rows -1 when there is none); else
-// one by constants only, a full scan at worst.
-fn (q: &Query) wayInto(k: int, cands: &[]WayCand, mask: int, outer: bool): Way {
+// one by constants only (equalities, then a range of the next column, cs's:
+// optimizer 29), a full scan at worst.
+fn (q: &Query) wayInto(k: int, cands: &[]WayCand, mask: int, outer: bool, cs: &[]Expr): Way {
     let lv = &q.levels[k]
     let t = float(lv.est.rows)
     var best = if outer { Way{rows: -1.0f, cost: 0.0f, outer: true} } else { Way{rows: t, cost: t, outer: false} }
@@ -5290,17 +5371,204 @@ fn (q: &Query) wayInto(k: int, cands: &[]WayCand, mask: int, outer: bool): Way {
             if n == 0 { key = b.keys[found] }
             n += 1
         }
-        if n == 0 || (outer && !uses) { continue }
+        if outer && (n == 0 || !uses) { continue }
         var m = 1.0f
-        if n < len(wc.cols) || !wc.unique {
+        if n == 0 {
+            let e = lv.est.entriesOf(wc.tree)
+            m = if e >= 0 { float(e) } else { t }
+        } else if n < len(wc.cols) || !wc.unique {
             let r = lv.est.rowsFor(wc.tree, n, &key)
             m = if r >= 0 { float(r) } else { fmax(t / 10.0f, 1.0f) }
+        }
+        if !outer && n < len(wc.colIds) && wc.colIds[n] >= 0 {
+            // a range of the next column (optimizer 29)
+            let sh = q.rangeShare(k, wc.colIds[n], cs)
+            if n == 0 && sh >= 1.0f { continue }        // a whole index: no better than the full scan
+            m = m * sh
+        } else if n == 0 {
+            continue
         }
         let cost = 1.0f + m * (if wc.index < 0 { 1.0f } else { 2.0f })
         if best.rows < 0.0f || cost < best.cost { best = Way{rows: m, cost: cost, outer: outer} }
     }
     return best
 }
+
+// ---- a table's own conditions (optimizer 29): the share of its rows they
+// keep, for the join order's estimates. An equality with a literal on a
+// column leading an index or the primary key: its value's rows (the common
+// values); else 1 / the column's distinct values. A range on a column whose
+// least and greatest ANALYZE has (a leading column of numbers, dates or
+// times), with literal bounds: the part of that span it covers; else 1/4,
+// 1/16 bounded on both sides (SQLite's). An IN list of n: n / the distinct
+// values. Anything else: 1/2. A parameter is an unknown value (the order
+// does not depend on parameters).
+
+// Level k's statistics entry for a column leading its primary key or an
+// unfiltered index (-1 none).
+fn (q: &Query) leadEntry(k: int, col: int): int {
+    let lv = &q.levels[k]
+    for c0 in 0..len(lv.t.indexes) + 1 {
+        let c = c0 - 1
+        if c >= 0 && lv.t.indexes[c].pred.isSome() { continue }
+        let cols = keyCols(&lv.t, c)
+        if len(cols) == 0 || cols[0] != col { continue }
+        let tree = if c < 0 { lv.t.tree } else { lv.t.indexes[c].tree }
+        for j in 0..len(lv.est.trees) { if lv.est.trees[j] == tree { return j } }
+    }
+    return -1
+}
+
+// A literal as a number of column col's type; None: not a literal, or not a number.
+fn (q: &Query) litNum(k: int, col: int, x: &Expr): Option[float] {
+    match x {
+        Expr.Lit(v) {
+            if isNull(&v) { return None }
+            match coerce(v, &boundType(&q.levels[k].t.cols[col].typ)) {
+                Ok(cv) { return spanNum(&cv) }
+                Err(_) { return None }
+            }
+        }
+        else { return None }
+    }
+}
+
+// x compares the column name with a constant: its operator, the column on
+// the left ("" not such a comparison), and the constant in val.
+fn (q: &Query) colCmp(name: &str, x: &Expr, val: mut &Expr): str {
+    match x {
+        Expr.Bin(op, l, r) {
+            if !isCmp(&op) { return "" }
+            match l {
+                Expr.Col(n) {
+                    if n == name && q.levelMask(&r) == 0 && !hasCorr(&r) {
+                        val = clone(&r)
+                        return op
+                    }
+                }
+                else {}
+            }
+            match r {
+                Expr.Col(n) {
+                    if n == name && q.levelMask(&l) == 0 && !hasCorr(&l) {
+                        val = clone(&l)
+                        return if op == "<" { ">" } else if op == "<=" { ">=" } else if op == ">" { "<" } else if op == ">=" { "<=" } else { op }
+                    }
+                }
+                else {}
+            }
+            return ""
+        }
+        else { return "" }
+    }
+}
+
+// The share of level k's rows its range conditions on column col keep (1:
+// none).
+fn (q: &Query) rangeShare(k: int, col: int, cs: &[]Expr): float {
+    let lv = &q.levels[k]
+    let name = lv.alias + "." + lv.t.cols[col].name
+    var hasLo = false
+    var hasHi = false
+    var known = true
+    var lo = 0.0f
+    var hi = 0.0f
+    for c in cs {
+        var v = Expr.Lit(Val.Null)
+        let op = q.colCmp(&name, &c, mut &v)
+        if op != "<" && op != "<=" && op != ">" && op != ">=" { continue }
+        let x = q.litNum(k, col, &v)
+        if x.isNone() { known = false }
+        let f = x.unwrapOr(0.0f)
+        if op == ">" || op == ">=" {
+            if !hasLo || f > lo { lo = f }
+            hasLo = true
+        } else {
+            if !hasHi || f < hi { hi = f }
+            hasHi = true
+        }
+    }
+    if !hasLo && !hasHi { return 1.0f }
+    let e = q.leadEntry(k, col)
+    let t = fmax(float(lv.est.rows), 1.0f)
+    if known && e >= 0 && lv.est.span[e] {
+        let mn = lv.est.lo[e]
+        let mx = lv.est.hi[e]
+        if mx <= mn { return 1.0f }
+        let a = if hasLo && lo > mn { lo } else { mn }
+        let b = if hasHi && hi < mx { hi } else { mx }
+        if b < a { return 1.0f / t }
+        return fmax((b - a) / (mx - mn), 1.0f / t)
+    }
+    return if hasLo && hasHi { 1.0f / 16.0f } else { 0.25f }
+}
+
+// The share of level k's rows its own conditions among cs keep (masks:
+// the levels each uses).
+fn (q: &Query) localShare(k: int, cs: &[]Expr, masks: &[]int): float {
+    let lv = &q.levels[k]
+    var share = 1.0f
+    var ranged: []int = []
+    var names: []str = []
+    for i in 0..len(cs) {
+        if masks[i] != (1 << k) || hasCorr(&cs[i]) { continue }
+        if len(names) == 0 { for c in lv.t.cols { append(mut &names, lv.alias + "." + c.name) } }
+        let c = &cs[i]
+        var done = false
+        for col in 0..len(lv.t.cols) {
+            if done { break }
+            var v = Expr.Lit(Val.Null)
+            let op = q.colCmp(&names[col], c, mut &v)
+            if op == "" { continue }
+            done = true
+            let name = &names[col]
+            if op == "=" {
+                share = share * q.eqShare(k, col, &v)
+            } else if op == "<>" {
+                share = share * (1.0f - 1.0f / q.distinctOf(name, k))
+            } else {
+                var seen = false
+                for r in ranged { if r == col { seen = true } }
+                if !seen {
+                    append(mut &ranged, col)
+                    share = share * q.rangeShare(k, col, cs)
+                }
+            }
+        }
+        if done { continue }
+        match cs[i] {
+            Expr.Call(n, args, _) {
+                if n == "in" && len(args) > 1 {
+                    match args[0] {
+                        Expr.Col(a) {
+                            share = share * fmin(1.0f, float(len(args) - 1) / q.distinctOf(&a, k))
+                            continue
+                        }
+                        else {}
+                    }
+                }
+            }
+            else {}
+        }
+        share = share * 0.5f
+    }
+    return share
+}
+
+// The share of level k's rows equal to v on column col.
+fn (q: &Query) eqShare(k: int, col: int, v: &Expr): float {
+    let lv = &q.levels[k]
+    let e = q.leadEntry(k, col)
+    if e >= 0 && lv.est.entries[e] > 0 {
+        let noParams: []Val = []
+        let key = constKey(v, &boundType(&lv.t.cols[col].typ), &noParams)
+        let r = rowsOf(&lv.est.cm[e], &key)
+        if r >= 0 { return fmax(float(r), 1.0f) / float(lv.est.entries[e]) }
+    }
+    return 1.0f / q.distinctOf(&(lv.alias + "." + lv.t.cols[col].name), k)
+}
+
+fn fmin(a: float, b: float): float { return if a < b { a } else { b } }
 
 // A column's distinct values (level k's), for an equality's share.
 fn (q: &Query) distinctOf(name: &str, k: int): float {
@@ -5322,17 +5590,38 @@ fn (q: &Query) distinctOf(name: &str, k: int): float {
 
 // The cost of joining level k to the set mask (rin its rows; rnext the rows
 // of the set with k): its constant way read once and hashed, then a probe
-// per row; or a lookup per row, whichever is cheaper (once: the first).
-fn (q: &Query) joinStep(k: int, cands: &[]WayCand, base: &Way, mask: int, rin: float, rnext: float, hashed: mut &bool): float {
+// per row; or a lookup per row, whichever is cheaper (hashed: the first).
+// Where a lookup is possible, it is taken when lookups is set, or when the
+// hash would hold more than cap bytes (statement memory, optimizer 26
+// review).
+fn (q: &Query) joinStep(k: int, cands: &[]WayCand, base: &Way, mask: int, rin: float, rnext: float, lookups: bool,
+                        cap: float, hashed: mut &bool): float {
     let out = rnext * ROW_COST
     var add = base.cost + base.rows * HASH_BUILD + rin * HASH_PROBE + out
     hashed = true
-    let w = q.wayInto(k, cands, mask, true)
-    if w.rows >= 0.0f && rin * w.cost + out < add {
-        add = rin * w.cost + out
-        hashed = false
+    let none: []Expr = []
+    let w = q.wayInto(k, cands, mask, true, &none)
+    if w.rows >= 0.0f {
+        let big = base.rows * float(estRowBytes(&q.levels[k].t)) > cap
+        if lookups || big || rin * w.cost + out < add {
+            add = rin * w.cost + out
+            hashed = false
+        }
     }
     return add
+}
+
+// A hash join's rows at most, in bytes, unless there is no lookup: a
+// quarter of the default statement memory (MAX_STATEMENT_MEM); less when
+// the session's max_statement_mem is lower (half of it).
+const HASH_MAX_BYTES: float = 67108864.0f
+
+// A row's size in a hash, estimated as rowBytes counts a row held: 32
+// bytes, 24 a value, and a text's bytes (32 taken as its length).
+fn estRowBytes(t: &Table): int {
+    var n = 32
+    for c in t.cols { n += 24 + (if c.typ.kind == lexdb_sql.K_TEXT { 32 } else { 0 }) }
+    return n
 }
 
 // Keeps the JOIN_BEST cheapest of the partial orders, cheapest first (a tie:
@@ -5367,7 +5656,9 @@ fn copyBools(xs: &[]bool): []bool {
 // The cheapest order by cost: perm (old indexes, [] when it is FROM's) and
 // per new place whether it is read once. false: it does not apply (a table
 // without statistics, an outer join, LATERAL, too many tables).
-fn (q: &Query) costOrder(ms: &[][]Expr, perm: mut &[]int, ro: mut &[]bool): bool {
+// lookups: a table a lookup reaches is not read once instead.
+// cap: a hash's bytes at most where a lookup is possible.
+fn (q: &Query) costOrder(ms: &[][]Expr, lookups: bool, cap: float, perm: mut &[]int, ro: mut &[]bool): bool {
     let nl = len(q.levels)
     if nl < 2 || nl > JOIN_SEARCH_MAX { return false }
     for lv in q.levels {
@@ -5375,16 +5666,22 @@ fn (q: &Query) costOrder(ms: &[][]Expr, perm: mut &[]int, ro: mut &[]bool): bool
     }
     var cs: []Expr = []
     for m in ms { for c in m { append(mut &cs, clone(&c)) } }
+    // the levels each conjunct uses
+    var masks: []int = []
+    for x in cs { append(mut &masks, q.levelMask(&x)) }
     var cands: [][]WayCand = []
     var base: []Way = []                // each level by its constants alone
     for k in 0..nl {
         append(mut &cands, q.wayCands(k, &cs))
-        append(mut &base, q.wayInto(k, &cands[k], 0, false))
+        // read by its constants; its rows: the table's, times the share its
+        // own conditions keep (optimizer 29)
+        let w = q.wayInto(k, &cands[k], 0, false, &cs)
+        let t = float(q.levels[k].est.rows)
+        append(mut &base, Way{rows: fmax(t * q.localShare(k, &cs, &masks), 1.0f), cost: w.cost, outer: false})
     }
     // the levels each level shares a conjunct with
     var adj: []int = array(nl, 0)
-    for x in cs {
-        let m = q.levelMask(&x)
+    for m in masks {
         if m > 0 { for k in 0..nl { if (m & (1 << k)) != 0 { adj[k] = adj[k] | (m & ~(1 << k)) } } }
     }
     // the classes of equal columns (optimizer 27): a class joins the tables
@@ -5455,7 +5752,7 @@ fn (q: &Query) costOrder(ms: &[][]Expr, perm: mut &[]int, ro: mut &[]bool): bool
                 if linked && (adj[k] & mask) == 0 { continue }       // a cross product while a join is left
                 let next = mask | (1 << k)
                 var o = false
-                let total = cost[mask] + q.joinStep(k, &cands[k], &base[k], mask, rin, rows[next], mut &o)
+                let total = cost[mask] + q.joinStep(k, &cands[k], &base[k], mask, rin, rows[next], lookups, cap, mut &o)
                 if cost[next] < 0.0f || total < cost[next] {
                     cost[next] = total
                     last[next] = k
@@ -5505,7 +5802,7 @@ fn (q: &Query) costOrder(ms: &[][]Expr, perm: mut &[]int, ro: mut &[]bool): bool
                     if linked && (adj[k] & mask) == 0 { continue }
                     let next = mask | (1 << k)
                     var o = false
-                    let total = pc[p] + q.joinStep(k, &cands[k], &base[k], mask, rin, rows[next], mut &o)
+                    let total = pc[p] + q.joinStep(k, &cands[k], &base[k], mask, rin, rows[next], lookups, cap, mut &o)
                     var at = -1
                     for j in 0..len(nm) { if nm[j] == next { at = j } }
                     if at >= 0 && nc[at] <= total { continue }
@@ -5816,7 +6113,7 @@ fn pathScans(t: &Table, p: &Path, env: &Env): Result[[]Scan, DbErr] {
     let cols = keyCols(t, p.index)
     var prefix = newStrBuf()
     for k in 0..len(p.eqs) {
-        let v = try coerceZ(try eval(&p.eqs[k], env), &keyType(t, p.index, k), &envZone(env))
+        let v = match try keyVal(try eval(&p.eqs[k], env), &keyType(t, p.index, k), &envZone(env)) { Some(x) { x } None { return Ok([]) } }
         if isNull(&v) { return Ok([]) }
         encPart(mut &prefix, &v, ix)
     }
@@ -5852,7 +6149,12 @@ fn pathScans(t: &Table, p: &Path, env: &Env): Result[[]Scan, DbErr] {
             else {}
         }
     } else {
-        for x in p.ins { append(mut &vs, try coerceZ(try eval(&x, env), &typ, &envZone(env))) }
+        for x in p.ins {
+            match try keyVal(try eval(&x, env), &typ, &envZone(env)) {
+                Some(v) { append(mut &vs, v) }
+                None {}
+            }
+        }
     }
     var keys: []str = []
     for v in vs {
@@ -5879,13 +6181,27 @@ fn pathScans(t: &Table, p: &Path, env: &Env): Result[[]Scan, DbErr] {
     return Ok(out)
 }
 
+// A key's value v as the column's type (for its bounds: keyType, boundType):
+// None when it is out of the type's range (22003), as a bigint past an
+// int's: it equals no value of the column, so it matches no row rather than
+// failing (PostgreSQL compares the two as bigints). Other errors stand.
+fn keyVal(v: Val, typ: &lexdb_sql.TypeName, z: &lexdb_time.Zone): Result[Option[Val], DbErr] {
+    match coerceZ(v, typ, z) {
+        Ok(x) { return Ok(Some(x)) }
+        Err(x) {
+            if x.state == "22003" { return Ok(None) }
+            return Err(x)
+        }
+    }
+}
+
 fn pathScan(t: &Table, p: &Path, env: &Env): Result[Scan, DbErr] {
     let none = Scan{empty: true, point: false, lo: "", hi: "", whole: false}
     let ix = p.index >= 0
     let cols = keyCols(t, p.index)
     var prefix = newStrBuf()
     for k in 0..len(p.eqs) {
-        let v = try coerceZ(try eval(&p.eqs[k], env), &keyType(t, p.index, k), &envZone(env))
+        let v = match try keyVal(try eval(&p.eqs[k], env), &keyType(t, p.index, k), &envZone(env)) { Some(x) { x } None { return Ok(none) } }
         if isNull(&v) { return Ok(none) }
         encPart(mut &prefix, &v, ix)
     }
@@ -6045,6 +6361,9 @@ fn newLevel(t: Table, alias: str, join: int, first: int): Level {
 fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_sql.FromItem,
               where: &Option[Expr], params: &[]Val, subs: &[]lexdb_sql.Stmt, sc: mut &Scope, order: bool): Result[Query, DbErr] {
     var q = Query{levels: [], cols: [], top: [], subs: [], base: sc.base, corr: false, refs: [], implied: false}
+    // this query's (its subqueries set their own)
+    let early = sc.early
+    sc.early = false
     // a subquery in FROM is planned first: it sees the queries around this
     // one, not this one's tables
     var planned: [][]SubPlan = []
@@ -6312,7 +6631,16 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
         }
         var ro: []bool = []
         var perm: []int = []
-        if !q.costOrder(&ms, mut &perm, mut &ro) { perm = q.joinOrder(&ms) }
+        // By cost, except in a transaction whose reads are noted: there a
+        // whole-table read, a hash's or a first table's scan, would conflict
+        // with every write to the table (as the index-to-scan switch,
+        // optimizer 19), so the order bound by keys stands, which starts
+        // from a pinned row. Where reading may stop early, a lookup stays a
+        // lookup (optimizer 26 review).
+        // a hash holds at most half the statement's memory, 64 MB at most
+        var cap = HASH_MAX_BYTES
+        if txn.memMax > 0 && float(txn.memMax) / 2.0f < cap { cap = float(txn.memMax) / 2.0f }
+        if txn.noting() || !q.costOrder(&ms, early, cap, mut &perm, mut &ro) { perm = q.joinOrder(&ms) }
         if len(perm) == nl {
             var pool: []Expr = []
             for k in 0..nl {
@@ -6587,9 +6915,15 @@ fn runLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Ma
                     if isNull(&v) { nul = true }
                     keyPart(mut &kb, &v)
                 } else {
-                    let v = try coerceZ(try eval(&lv.hashVals[i], &env), &lv.t.cols[lv.hashCols[i]].typ, &txn.zone)
-                    if isNull(&v) { nul = true }
-                    encIdxPart(mut &kb, &v)
+                    // of the column's type for its bounds: a value it cannot
+                    // hold matches no row (optimizer 26 review)
+                    match try keyVal(try eval(&lv.hashVals[i], &env), &boundType(&lv.t.cols[lv.hashCols[i]].typ), &txn.zone) {
+                        Some(v) {
+                            if isNull(&v) { nul = true }
+                            encIdxPart(mut &kb, &v)
+                        }
+                        None { nul = true }
+                    }
                 }
             }
         }
@@ -6821,6 +7155,10 @@ pub type Scope = record {
     whos: []Who
     target: str
     looks: []Look               // the planning's looks at parameters' values (optimizer 22)
+    // the next query planned may stop reading early (a LIMIT without a sort,
+    // EXISTS, a scalar subquery): its join order keeps lookups (optimizer 26
+    // review). Set by planSub and planSelect, taken by buildQuery.
+    early: bool
 }
 
 type Work = record { id: int; cols: []lexdb_sql.ColDef }
@@ -6843,7 +7181,7 @@ fn scCheck(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: mut &Scope, ke
 fn newScope(params: &[]Val, ptypes: &[]int): Scope {
     var pt: []int = []
     for i in 0..len(params) { append(mut &pt, if i < len(ptypes) { ptypes[i] } else { 0 }) }
-    return Scope{frames: [], base: len(params), ptypes: pt, works: [], asRole: [], whos: [], target: "", looks: []}
+    return Scope{frames: [], base: len(params), ptypes: pt, works: [], asRole: [], whos: [], target: "", looks: [], early: false}
 }
 
 // The parameter types of the query being planned: the statement's, then
@@ -6903,6 +7241,7 @@ fn endScope(sc: mut &Scope, q: mut &Query) {
 
 fn planSub(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val,
            sc: mut &Scope): Result[SubPlan, DbErr] {
+    sc.early = s.use == lexdb_sql.SUB_EXISTS || s.use == lexdb_sql.SUB_SCALAR
     var sel = try planSelect(st, txn, s, params, sc)
     // EXISTS stops at its first row, a scalar at its second (runSub): its
     // first table's reading may stop early, so no switch to a scan (optimizer 19)
@@ -10508,7 +10847,7 @@ fn select(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
         Some(r) { if len(r) > 0 { ver = ver + "|s" + r } }
         None {}
     }
-    if txn.rules { ver = ver + "|rules" } else { ver = ver + "|" + (try statVersion(st, txn)) }   // optimizer 20
+    if txn.rules { ver = ver + "|rules" } else { ver = ver + "|" + (try statVersion(st, txn)) + "|m" + txn.memMax.toStr() }   // optimizer 20
     if pc.ver != ver {
         pc.sels = []
         pc.looks = []
@@ -11342,6 +11681,7 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         if len(s.wins) > 0 { return Err(e("0A000", what + "window functions")) }
     }
     if s.setop != 0 { return planSet(st, txn, s, params, sc) }
+    sc.early = sc.early || (s.limit.isSome() && len(s.order) == 0 && len(s.group) == 0)
     var q = try buildQuery(st, txn, &s.from, &s.where, params, &s.subs, sc, true)
     if s.kind == lexdb_sql.S_SELECT { narrow(mut &q, s) }
     if s.lockMode > 0 { try applyLocks(mut &q, s) }
@@ -12490,6 +12830,7 @@ fn (s: &Session) setUp(t: mut &lexdb_store.Txn) {
     t.sess = s.id
     t.zone = s.zone
     t.rules = s.rules
+    t.memMax = s.maxMem
 }
 
 // A transaction ended without committing: if it changed temporary objects'
@@ -12863,6 +13204,7 @@ fn (s: mut &Session) resetAll() {
     s.maxRecursion = MAX_RECURSION
     s.timeoutMs = 0
     s.maxMem = MAX_STATEMENT_MEM
+    if len(s.txn) > 0 { s.txn[0].memMax = s.maxMem }
     s.batch = true
     s.rules = false
     if len(s.txn) > 0 { s.txn[0].rules = false }
@@ -13201,7 +13543,10 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
                 }
                 if stmt.table == "max_recursion" { s.maxRecursion = if v < 0 { MAX_RECURSION } else { v } }
                 if stmt.table == "statement_timeout" { s.timeoutMs = if v < 0 { 0 } else { v } }
-                if stmt.table == "max_statement_mem" { s.maxMem = if v < 0 { MAX_STATEMENT_MEM } else { v } }
+                if stmt.table == "max_statement_mem" {
+                    s.maxMem = if v < 0 { MAX_STATEMENT_MEM } else { v }
+                    if len(s.txn) > 0 { s.txn[0].memMax = s.maxMem }
+                }
             }
             return Ok(tagOnly(if stmt.ifFlag { "RESET" } else { "SET" }))
         }
@@ -13231,6 +13576,7 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
                 s.txn[0].sess = s.id
                 s.txn[0].zone = s.zone
                 s.txn[0].rules = s.rules
+                s.txn[0].memMax = s.maxMem
             }
             return Ok(tagOnly("BEGIN"))
         }
@@ -16297,7 +16643,9 @@ fn bCompile(x: &Expr, q: &Query, kinds: &[]int, env: &Env): Option[BComp] {
             // (a column of another table than the one batched: BK_NONE)
             if i < 0 || i >= len(kinds) || kinds[i] == BK_NONE { return None }
             let k = kinds[i]
-            return Some(BComp{n: BNode.Col(i), typ: if k == BK_INT { BT_INT } else if k == BK_BOOL { BT_BOOL } else { BT_OTHER }})
+            // the batch holds the first table's own columns
+            let at = i - (if len(q.levels) > 0 { q.levels[0].first } else { 0 })
+            return Some(BComp{n: BNode.Col(at), typ: if k == BK_INT { BT_INT } else if k == BK_BOOL { BT_BOOL } else { BT_OTHER }})
         }
         Expr.Unary(op, a) {
             let ca = bCompile(&a, q, kinds, env)
@@ -17192,14 +17540,16 @@ fn batchLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &
               params: &[]Val, emit: &fn(&[]Val): Result[bool, DbErr], rs: mut &Run, matched: mut &bool): Result[int, DbErr] {
     if !rs.batch || len(q.levels) == 0 { return Ok(-1) }
     let lv = &q.levels[0]
-    if lv.first != 0 || !lv.perRow || lv.lateral || lv.virt() || (q.corr && pathCorr(&lv.path)) { return Ok(-1) }
+    if !lv.perRow || lv.lateral || lv.virt() || (q.corr && pathCorr(&lv.path)) { return Ok(-1) }
     let p = &lv.path
     if p.index >= 0 || p.desc || len(p.ins) > 0 || p.inSub >= 0 || len(p.inArr) > 0 { return Ok(-1) }
     let t = &lv.t
     var kinds: []int = []
     for c in t.cols { append(mut &kinds, colKind(&c)) }
     var qkinds: []int = array(len(q.cols), BK_NONE)
-    for i in 0..len(t.cols) { qkinds[i] = kinds[i] }
+    // its columns where they are in the joined row (the first table may
+    // not be FROM's first: join order, optimizer 25)
+    for i in 0..len(t.cols) { qkinds[lv.first + i] = kinds[i] }
     let noAggs: []Val = []
     // (its session: the time zone its constants are read in, 9.95; no
     // function is evaluated here, bConst)
