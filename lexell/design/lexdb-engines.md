@@ -211,12 +211,16 @@ numbers. None has been built.
 6. **DELETE with an index:** profile the 2 to 12 s.
 7. **Numeric in binary** in rows: no parse per read. This is part of the
    page-layout study (a Fable agent, running).
-8. **Hash tables:** keep each entry's hash, and use a cheaper hash than
-   SipHash for the executor's own maps (their keys are not attacker-chosen
-   at that point? to be checked: a client's values reach them).
+8. **Hash tables:** keep each entry's hash, and compare it before the key.
+   A cheaper hash than SipHash needs care: a client's values reach these
+   maps, so hash flooding matters. SipHash's keyed design is there for
+   that. A cheaper keyed hash, or a fallback on long chains, would be
+   needed.
    - Expected: 5 to 8% of hash joins and GROUP BY.
 
 Not proposed:
 - **Parallel query** (E).
-- **JIT:** PostgreSQL's `jit_above_cost` is reached by some of these
-  queries, but its numbers above are mostly not from JIT; see the notes.
+- **JIT:** PostgreSQL's JIT is on by default (`jit_above_cost` 100,000),
+  and some of these queries cost more than that. Whether it ran in the
+  timings above was not checked (EXPLAIN ANALYZE shows a JIT section when
+  it does).
