@@ -1,0 +1,146 @@
+// Index reads and lookups measured with batches (lexdb.md 9.107,
+// lexdb-optimizer.md section 43): per row, in nanoseconds, in memory, as
+// calib_batch.lxl measures (the median of 5), batches on and off.
+//   scan      a full scan's row (sum of a column): the unit
+//   ixonly    an index range read alone (t_k holds k): per entry
+//   ixrows    an index range's entry and its row (2% of t, the rows
+//             scattered: t.k is a permutation of t.id), read in key order
+//   ixnoted   the same in a transaction whose reads are noted (a block
+//             that writes): the rows read in the index's order
+//   look      a lookup by the whole primary key per outer row, the keys
+//             in no order (d.x scattered over t)
+//   lookord   the same, the keys in order (o.x = o.id: o read by its key)
+//   lookix    the same, the outer table read through an index on the key
+//             (dx_x, read alone: the keys come in order, 9.107)
+//   build     an inner row read once and hashed (as calib_batch's)
+// The rules planner runs the index ranges (the cost planner's own choice
+// is what is being measured); the switch to a scan stays off for a range
+// read alone, and for one of 2% under the rules' 2:1.
+import "../../cmd/lexdb_store"
+import "../../cmd/lexdb_disk"
+import "../../cmd/lexdb_exec"
+import "time"
+
+fn exec(s: mut &lexdb_exec.Session, sql: &str) {
+    match s.exec(sql) {
+        Ok(_) {}
+        Err(e) { println(sql + " -> " + e.state + " " + e.msg) }
+    }
+}
+
+fn med(s: mut &lexdb_exec.Session, sql: &str): int {
+    exec(s, sql)
+    var ts: []int = []
+    for i in 0..5 {
+        let t0 = time.monotonicNs()
+        exec(s, sql)
+        append(mut &ts, time.monotonicNs() - t0)
+    }
+    for i in 1..len(ts) {
+        var j = i
+        while j > 0 && ts[j - 1] > ts[j] {
+            let x = ts[j - 1]
+            ts[j - 1] = ts[j]
+            ts[j] = x
+            j -= 1
+        }
+    }
+    return ts[2]
+}
+
+fn plan(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(&("explain " + sql)) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            var out = ""
+            for row in r.rows { out = out + lexdb_exec.text(&row[0]) + "; " }
+            return out
+        }
+        Err(e) { return e.msg }
+    }
+}
+
+// sql's time in a block that writes (its reads noted), less the block's own
+fn noted(s: mut &lexdb_exec.Session, sql: &str): int {
+    var ts: []int = []
+    for i in 0..6 {
+        exec(s, &"begin")
+        exec(s, &"insert into w1 values (1)")
+        let t0 = time.monotonicNs()
+        exec(s, sql)
+        let t1 = time.monotonicNs()
+        exec(s, &"rollback")
+        if i > 0 { append(mut &ts, t1 - t0) }
+    }
+    for i in 1..len(ts) {
+        var j = i
+        while j > 0 && ts[j - 1] > ts[j] {
+            let x = ts[j - 1]
+            ts[j - 1] = ts[j]
+            ts[j] = x
+            j -= 1
+        }
+    }
+    return ts[2]
+}
+
+fn run(s: mut &lexdb_exec.Session, on: bool) {
+    exec(s, &(if on { "set lexdb_batch = on" } else { "set lexdb_batch = off" }))
+    println(if on { "batches on" } else { "batches off" })
+    exec(s, &"set lexdb_planner = rules")
+    let scan = med(s, &"select sum(v) from t")
+    println("  scan     " + (scan / 200000).toStr() + " ns a row")
+    let oq = "select sum(k) from t where k < 100000"
+    let ixo = med(s, &oq)
+    println("  ixonly   " + (ixo / 100000).toStr() + " ns an entry    plan: " + plan(s, &oq))
+    let rq = "select sum(v) from t where k < 4000"
+    let ixr = med(s, &rq)
+    println("  ixrows   " + (ixr / 4000).toStr() + " ns an entry    plan: " + plan(s, &rq))
+    let ixn = noted(s, &rq)
+    println("  ixnoted  " + (ixn / 4000).toStr() + " ns an entry")
+    let d = med(s, &"select sum(x) from d")
+    let lq = "select sum(t.v) from d join t on t.id = d.x"
+    let lk = med(s, &lq)
+    println("  look     " + ((lk - d) / 200000).toStr() + " ns an outer row    plan: " + plan(s, &lq))
+    let o = med(s, &"select sum(x) from o")
+    let oq2 = "select sum(t.v) from o join t on t.id = o.x"
+    let lo = med(s, &oq2)
+    println("  lookord  " + ((lo - o) / 200000).toStr() + " ns an outer row    plan: " + plan(s, &oq2))
+    let xq = "select sum(t.v) from dx join t on t.id = dx.x"
+    let lx = med(s, &xq)
+    println("  lookix   " + ((lx - d) / 200000).toStr() + " ns an outer row (less d's scan)    plan: " + plan(s, &xq))
+    exec(s, &"set lexdb_planner = cost")
+    let dk = med(s, &"select sum(x) from dk")
+    let bq = "select sum(t.v) from dk left join t on t.u = dk.x"
+    let bu = med(s, &bq)
+    println("  build    " + ((bu - dk) / 200000).toStr() + " ns an inner row read and hashed    plan: " + plan(s, &bq))
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    var s = lexdb_exec.newSession(st)
+    exec(mut &s, &"set max_statement_mem = 0")
+    for x in [
+        "create table t (id int primary key, u int, k int, v int, pad text)",
+        "insert into t select g, 300000 - g, (g * 7919) % 200000, g % 97, 'row ' || g from generate_series(1, 200000) g",
+        "create index t_k on t (k)",
+        "create table d (id int primary key, x int)",
+        "insert into d select g, (g * 7919) % 200000 + 1 from generate_series(1, 200000) g",
+        "create table dx (id int primary key, x int)",
+        "insert into dx select g, (g * 7919) % 200000 + 1 from generate_series(1, 200000) g",
+        "create index dx_x on dx (x)",
+        "create table o (id int primary key, x int)",
+        "insert into o select g, g from generate_series(1, 200000) g",
+        "create table dk (id int primary key, x int)",
+        "insert into dk select g, 300000 - (g * 37) % 200000 - 1 from generate_series(1, 1000) g",
+        "create table w1 (id int primary key)",
+        "analyze",
+    ] { exec(mut &s, &x) }
+    run(mut &s, true)
+    run(mut &s, false)
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(5), lexdb_store.Options{cacheBytes: 1024 * 1024 * 1024, segBytes: 64 * 1024 * 1024, ckptBytes: 256 * 1024 * 1024, snapNodes: 1000000, bufferedPages: false}, body).unwrap()
+}

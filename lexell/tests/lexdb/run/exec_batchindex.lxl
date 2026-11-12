@@ -1,0 +1,428 @@
+// lexdb_exec: indexes read in batches (design/lexdb.md 9.107) against the
+// row path. Random queries over indexed columns of a table of 2,600 rows
+// (two batches and part of a third), run three ways: SET lexdb_batch =
+// off, on with the rows held (Session.exec), and on with the rows given
+// to a sink (Session.runRows: an OutBatch when the batches made them).
+// The three must agree, errors included. And committed, they must give
+// what the same query gives over a copy of the table without indexes
+// (fr: the rows sorted where the query leaves their order open; not with
+// a LIMIT and no order, nor where either gives an error, which the rows
+// read decide).
+// - Indexes: on an integer (not unique, NULLs and repeats), a unique
+//   bigint (NULLs), two columns, a text, a date, a varchar declared DESC,
+//   a text under a case-insensitive collation (kept as its key: never
+//   read alone), a filtered one; the primary key of two columns in a
+//   second table, with an index on a text.
+// - Reads: an index alone (its columns and the primary key's used only),
+//   an index's entries with their rows, ranges and points, IN lists,
+//   ORDER BY an index's columns ASC and DESC (backward), with and without
+//   LIMIT, MIN and MAX.
+// - Lookups per row by a primary key whose keys come in an index's order
+//   (the first table read through it alone), and by one of two columns;
+//   INNER and LEFT, keys missing, NULL keys.
+// - Rows out, sorted, grouped, aggregated; conditions on other columns;
+//   divisions by zero.
+// - Again in a transaction with its own inserts, updates and deletes not
+//   committed (the index read merged with them).
+// - EXPLAIN ANALYZE's counts as the row path's; how many read an index in
+//   batches, alone or with their rows, and how many looked up keys in an
+//   index's order.
+// - A transaction's index read is noted: another session's insert into
+//   the range read, committed first, fails its commit (40001), with
+//   batches as without: an index read alone, an index's rows, an ordered
+//   lookup that missed a key.
+// expect: committed: 400 queries, 400 the same three ways, as without indexes: 382 of 382
+// expect: fixed: 10 queries, 10 the same three ways, as without indexes: 10
+// expect: in a transaction: 150 queries, 150 the same three ways, its writes: INSERT 0 60, UPDATE 266, DELETE 178
+// expect: index in batches: alone 73, with rows 57, ordered lookups 46, given as an OutBatch 155
+// expect: counts: same: true true true
+// expect: write skew: alone off: ERROR 40001; alone on: batched, ERROR 40001; rows off: ERROR 40001; rows on: batched, ERROR 40001; lookup off: ERROR 40001; lookup on: batched, ERROR 40001
+// expect: own reads: alone off: COMMIT; alone on: batched, COMMIT
+import "strings"
+import "../../../cmd/lexdb_base"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_sql"
+import "../../../cmd/lexdb_exec"
+import "collections"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            var out: []str = []
+            for r in rs {
+                if !r.hasRows { append(mut &out, r.tag) }
+                for row in r.rows {
+                    var vs: []str = []
+                    for v in row { append(mut &vs, lexdb_exec.text(&v)) }
+                    append(mut &out, strings.join(&vs, "|"))
+                }
+            }
+            return strings.join(&out, " ")
+        }
+        Err(e) { return "ERROR " + e.state + " " + e.msg }
+    }
+}
+
+// sql's rows through runRows' sink, as q gives them; batched: whether
+// they came as an OutBatch.
+fn viaSink(s: mut &lexdb_exec.Session, sql: &str, batched: mut &bool): str {
+    let stmts = match lexdb_sql.parse(sql) {
+        Ok(x) { x }
+        Err(e) { return "ERROR " + e.state + " " + e.msg }
+    }
+    var pc = lexdb_exec.newPlanCache()
+    let none: []lexdb_sql.Val = []
+    let nt: []int = []
+    var lines: []str = []
+    var nb = 0
+    let r = s.runRows(&stmts[0], &none, &nt, mut &pc, fn(cols: &[]lexdb_exec.OutCol, row: &[]lexdb_sql.Val, ob: &lexdb_exec.OutBatch, start: bool): bool {
+        if start { return true }
+        if ob.n > 0 {
+            nb += 1
+            for j in 0..ob.n {
+                var vs: []str = []
+                for o in 0..len(ob.kinds) {
+                    let c = ob.src[o]
+                    let k = ob.kinds[o]
+                    var v = lexdb_sql.Val.Null
+                    if c < 0 {
+                        if !ob.ex[o].nul[j] { v = if k == lexdb_exec.BK_BOOL { lexdb_sql.Val.Bool(ob.ex[o].v[j] == 1) } else { lexdb_sql.Val.Int(ob.ex[o].v[j]) } }
+                    } else {
+                        let at = ob.idx[j]
+                        if !ob.cols[c].nul[at] {
+                            v = if k == lexdb_exec.BK_INT { lexdb_sql.Val.Int(ob.cols[c].v[at]) } else if k == lexdb_exec.BK_BOOL { lexdb_sql.Val.Bool(ob.cols[c].v[at] == 1) } else { ob.vals[c][at] }
+                        }
+                    }
+                    append(mut &vs, lexdb_exec.text(&v))
+                }
+                append(mut &lines, strings.join(&vs, "|"))
+            }
+            return true
+        }
+        var vs: []str = []
+        for v in row { append(mut &vs, lexdb_exec.text(&v)) }
+        append(mut &lines, strings.join(&vs, "|"))
+        return true
+    })
+    batched = nb > 0
+    match r {
+        Ok(res) {
+            for row in res.rows {
+                var vs: []str = []
+                for v in row { append(mut &vs, lexdb_exec.text(&v)) }
+                append(mut &lines, strings.join(&vs, "|"))
+            }
+            return strings.join(&lines, " ")
+        }
+        Err(e) { return "ERROR " + e.state + " " + e.msg }
+    }
+}
+
+fn pick(r: mut &lexdb_base.Rng, xs: &[]str): str { return xs[r.below(len(xs))] }
+
+fn day(r: mut &lexdb_base.Rng): str {
+    let d = 1 + r.below(28)
+    return if d < 10 { "0" + d.toStr() } else { d.toStr() }
+}
+
+fn maybe(r: mut &lexdb_base.Rng, v: str): str { return if r.below(9) == 0 { "null" } else { v } }
+
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: 1024 * 1024, segBytes: 4 * 1024 * 1024, ckptBytes: 2 * 1024 * 1024, snapNodes: 100000, bufferedPages: false}
+}
+
+// A condition an index can serve (on f).
+fn icond(r: mut &lexdb_base.Rng): str {
+    let c = r.below(16)
+    if c == 0 { return "f.a = " + (r.below(60) - 5).toStr() }
+    if c == 1 { return "f.a < " + r.below(60).toStr() }
+    if c == 2 { return "f.a between " + r.below(30).toStr() + " and " + (20 + r.below(30)).toStr() }
+    if c == 3 { return "f.a = " + r.below(50).toStr() + " and f.b < " + r.below(300).toStr() }
+    if c == 4 { return "f.c > " + ((r.below(30) - 10) * 100000007).toStr() }
+    if c == 5 { return "f.c = " + ((r.below(20) - 10) * 100000007 + r.below(3)).toStr() }
+    if c == 6 { return "f.tx like 'L" + r.below(9).toStr() + "%'" }
+    if c == 7 { return "f.tx >= 'L" + r.below(80).toStr() + "'" }
+    if c == 8 { return "f.dt >= '2024-01-" + day(r) + "'" }
+    if c == 9 { return "f.dt between '2024-01-" + day(r) + "' and '2024-02-" + day(r) + "'" }
+    if c == 10 { return "f.vc < 'w" + r.below(40).toStr() + "'" }
+    if c == 11 { return "f.ci = 'k" + r.below(30).toStr() + "'" }
+    if c == 12 { return "f.a in (" + r.below(50).toStr() + ", " + r.below(50).toStr() + ", null)" }
+    if c == 13 { return "f.b > " + r.below(400).toStr() + " and f.b < 1000" }
+    if c == 14 { return "f.a > 40 and f.b < " + r.below(500).toStr() }
+    return "f.tx = 'L" + r.below(80).toStr() + "'"
+}
+
+// A condition on f's other columns.
+fn ocond(r: mut &lexdb_base.Rng, safe: bool): str {
+    let c = r.below(6)
+    if c == 0 { return "f.bo" }
+    if c == 1 { return "f.nu > " + r.below(30).toStr() }
+    if c == 2 { return if safe { "f.b <> 7" } else { "10 / (f.b - 7) > 0" } }
+    if c == 3 { return "f.id % 3 = " + r.below(3).toStr() }
+    if c == 4 { return "f.a + f.b < " + r.below(600).toStr() }
+    return "f.nu is null"
+}
+
+fn query(r: mut &lexdb_base.Rng, safe: bool): str {
+    // outputs an index holds (with the primary key), or others
+    let alone = [["f.id", "f.a"], ["f.a", "f.b", "f.id"], ["f.tx", "f.id"], ["f.dt"], ["f.c", "f.id"], ["f.vc"], ["f.a"], ["f.id"], ["f.ci", "f.id"]]
+    let more = ["f.nu", "f.bo", "f.tx", "f.b", "f.dt", "f.a * 2", "f.id + f.a", "f.w"]
+    var items: []str = []
+    for x in alone[r.below(len(alone))] { append(mut &items, x) }
+    if r.below(3) == 0 { append(mut &items, pick(r, &more)) }
+    var wh = " where " + icond(r)
+    if r.below(4) == 0 { wh = wh + " and " + ocond(r, safe) }
+    if r.below(8) == 0 { wh = "" }
+    let shape = r.below(9)
+    if shape < 2 {
+        var sql = "select " + strings.join(&items, ", ") + " from f" + wh
+        if r.below(4) == 0 { sql = sql + " limit " + pick(r, &["1", "7", "1500"]) }
+        return sql
+    }
+    if shape == 2 {
+        // ORDER BY an index's columns: in its order, forward or backward
+        let ob = pick(r, &["f.a", "f.a desc", "f.a, f.b", "f.a desc, f.b desc", "f.tx", "f.tx desc", "f.dt", "f.c desc", "f.vc desc", "f.b"])
+        var sql = "select " + strings.join(&items, ", ") + " from f" + wh + " order by " + ob + ", f.id" + (if strings.contains(ob, "desc") { " desc" } else { "" })
+        if r.below(2) == 0 { sql = sql + " limit " + pick(r, &["1", "5", "30", "2000"]) }
+        return sql
+    }
+    if shape == 3 {
+        let g = pick(r, &["f.a", "f.tx", "f.dt", ""])
+        var aggs: []str = []
+        for i in 0..(1 + r.below(3)) { append(mut &aggs, pick(r, &["count(*)", "sum(f.b)", "max(f.tx)", "min(f.dt)", "count(f.c)", "sum(f.nu)", "max(f.a)", "min(f.vc)"])) }
+        if g == "" { return "select " + strings.join(&aggs, ", ") + " from f" + wh }
+        return "select " + g + ", " + strings.join(&aggs, ", ") + " from f" + wh + " group by " + g + " order by 1"
+    }
+    if shape == 4 {
+        return "select " + pick(r, &["min(f.a)", "max(f.a)", "max(f.tx)", "min(f.dt)", "max(f.c)"]) + " from f" + wh
+    }
+    // a lookup per row by g's primary key (f.a's keys in f_a's order when f
+    // is read through it alone), or h's two columns
+    let join = pick(r, &["join", "join", "left join"])
+    var frm = "f " + join + " g on g.k = f.a"
+    var gi = ["g.v", "g.lab", "g.k"]
+    if r.below(4) == 0 {
+        frm = "f " + join + " h on h.p = f.a and h.q = f.b"
+        gi = ["h.w", "h.p", "h.q"]
+    }
+    var cols: []str = []
+    for x in items { append(mut &cols, x) }
+    if r.below(2) == 0 { append(mut &cols, pick(r, &gi)) }
+    var wh2 = if r.below(3) == 0 { "" } else { " where " + icond(r) }
+    if r.below(4) == 0 { wh2 = wh2 + (if wh2 == "" { " where " } else { " and " }) + pick(r, &["g.v < 20", "g.lab like 'G1%'", "f.b < 300"]) }
+    if strings.contains(frm, " h ") && strings.contains(wh2, "g.") { wh2 = "" }
+    if shape == 5 { return "select count(*), sum(f.a) from " + frm + wh2 }
+    if shape == 6 { return "select " + strings.join(&cols, ", ") + " from " + frm + wh2 }
+    if shape == 7 {
+        var ord: []str = []
+        for i in 0..len(cols) { append(mut &ord, (i + 1).toStr()) }
+        return "select " + strings.join(&cols, ", ") + " from " + frm + wh2 + " order by " + strings.join(&ord, ", ")
+    }
+    return "select f.a, count(*) from " + frm + wh2 + " group by f.a order by 1"
+}
+
+// sql over fr, the table without indexes: the same rows (sorted when
+// sql's order is open); 1 the same, 0 not, -1 not compared.
+fn ref(s: mut &lexdb_exec.Session, sql: &str): int {
+    let ordered = strings.contains(sql, " order by ") || !strings.contains(sql, " from f ") || strings.contains(sql, "count(*), sum(f.a)")
+    if strings.contains(sql, " limit ") && !strings.contains(sql, " order by ") { return -1 }
+    let a = q(s, sql)
+    let b = q(s, &strings.replaceAll(sql, " from f", " from fr f"))
+    if strings.startsWith(a, "ERROR") || strings.startsWith(b, "ERROR") { return -1 }
+    if ordered { return if a == b { 1 } else { 0 } }
+    var la: []str = []
+    var lb: []str = []
+    for x in strings.split(&a, &" ") { append(mut &la, "" + x) }
+    for x in strings.split(&b, &" ") { append(mut &lb, "" + x) }
+    collections.sort(mut &la)
+    collections.sort(mut &lb)
+    if strings.join(&la, " ") == strings.join(&lb, " ") { return 1 }
+    println("NOT AS WITHOUT INDEXES: " + sql)
+    println("  with:    " + a)
+    println("  without: " + b)
+    return 0
+}
+
+fn three(s: mut &lexdb_exec.Session, sql: &str, nb: mut &int): bool {
+    let a = q(s, &"set lexdb_batch = off")
+    let off = q(s, sql)
+    let b = q(s, &"set lexdb_batch = on")
+    let on = q(s, sql)
+    var batched = false
+    let sink = viaSink(s, sql, mut &batched)
+    if batched { nb += 1 }
+    if off == on && on == sink { return true }
+    println("DIFFERENT: " + sql)
+    println("  rows:    " + off)
+    println("  batches: " + on)
+    println("  sink:    " + sink)
+    return false
+}
+
+fn load(s: mut &lexdb_exec.Session, r: mut &lexdb_base.Rng) {
+    let c1 = q(s, &"create table f (id int primary key, a int, b int, c bigint, tx text, dt date, vc varchar(10), ci text collate \"Latin1_General_CI_AS\", nu numeric(10,2), bo boolean, w text)")
+    var id = 1
+    for chunk in 0..26 {
+        var rows: []str = []
+        for i in 0..100 {
+            // c unique (or NULL): id spread over the bigint's range
+            let c = if r.below(10) == 0 { "null" } else { ((id % 61 - 30) * 100000007 + id / 61).toStr() }
+            append(mut &rows, "(" + id.toStr() + ", " + maybe(r, r.below(50).toStr()) + ", " + maybe(r, r.below(1000).toStr()) + ", " + c + ", " +
+                   maybe(r, "'L" + r.below(80).toStr() + "'") + ", " + maybe(r, "'2024-0" + (1 + r.below(2)).toStr() + "-" + day(r) + "'") + ", " +
+                   maybe(r, "'w" + r.below(40).toStr() + "'") + ", " + maybe(r, "'" + pick(r, &["k", "K"]) + r.below(30).toStr() + "'") + ", " +
+                   maybe(r, r.below(30).toStr() + "." + pick(r, &["0", "5"])) + ", " + maybe(r, pick(r, &["true", "false"])) + ", 'pad" + id.toStr() + "')")
+            id += 1
+        }
+        let ins = q(s, &("insert into f values " + strings.join(&rows, ", ")))
+        if ins != "INSERT 0 100" { println("insert: " + ins) }
+    }
+    for x in ["create index f_a on f (a)", "create unique index f_c on f (c)", "create index f_ab on f (a, b)", "create index f_tx on f (tx)",
+              "create index f_dt on f (dt)", "create index f_vc on f (vc desc)", "create index f_ci on f (ci)", "create index f_bf on f (b) where b < 1000"] {
+        let ci = q(s, &x)
+        if ci != "CREATE INDEX" { println(x + ": " + ci) }
+    }
+    // g: every other key (lookups miss the odd ones)
+    var rows: []str = []
+    for k in 0..30 { append(mut &rows, "(" + (2 * k).toStr() + ", " + maybe(r, r.below(40).toStr()) + ", " + maybe(r, "'G" + r.below(30).toStr() + "'") + ")") }
+    let c2 = q(s, &"create table g (k int primary key, v int, lab text)")
+    let i2 = q(s, &("insert into g values " + strings.join(&rows, ", ")))
+    var hr: []str = []
+    for p in 0..50 {
+        for qq in 0..8 { append(mut &hr, "(" + p.toStr() + ", " + (qq * 120 + p).toStr() + ", " + maybe(r, "'h" + r.below(20).toStr() + "'") + ")") }
+    }
+    let c3 = q(s, &"create table h (p int, q int, w text, primary key (p, q))")
+    let i3 = q(s, &("insert into h values " + strings.join(&hr, ", ")))
+    let c4 = q(s, &"create index h_w on h (w)")
+    let c5 = q(s, &"create table fr (id int primary key, a int, b int, c bigint, tx text, dt date, vc varchar(10), ci text collate \"Latin1_General_CI_AS\", nu numeric(10,2), bo boolean, w text)")
+    let i5 = q(s, &"insert into fr select * from f")
+}
+
+// An EXPLAIN ANALYZE's lines without the batches and the result's time.
+fn plan(x: &str): str {
+    let parts = strings.split(x, &"result:")
+    var t = "" + parts[0]
+    for n in ["1", "2", "3"] { t = strings.replaceAll(t, ", batches " + n, "") }
+    return t
+}
+
+// Whether sql's batched EXPLAIN ANALYZE read an index alone, with its rows,
+// and looked up keys in an index's order.
+fn kinds(s: mut &lexdb_exec.Session, sql: &str, alone: mut &int, rows: mut &int, ord: mut &int) {
+    let ex = q(s, &("explain analyze " + sql))
+    let first = strings.split(&ex, &" join ")[0]
+    if !strings.contains(first, "batches") || !strings.contains(first, ": index ") { return }
+    if strings.contains(first, "index only") { alone += 1 } else if !strings.contains(first, "switched") { rows += 1 }
+    if strings.contains(first, " scan, index only") && strings.contains(ex, "primary key lookup per row") { ord += 1 }
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(61), opts(), fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        var r = lexdb_base.rng(61)
+        load(mut &s, mut &r)
+        var same = 0
+        var nb = 0
+        var alone = 0
+        var withRows = 0
+        var ordered = 0
+        var refN = 0
+        var refSame = 0
+        for i in 0..400 {
+            let sql = query(mut &r, false)
+            if three(mut &s, &sql, mut &nb) { same += 1 }
+            let on = q(mut &s, &"set lexdb_batch = on")
+            kinds(mut &s, &sql, mut &alone, mut &withRows, mut &ordered)
+            let rf = ref(mut &s, &sql)
+            if rf >= 0 { refN += 1 }
+            if rf > 0 { refSame += 1 }
+        }
+        println("committed: 400 queries, " + same.toStr() + " the same three ways, as without indexes: " + refSame.toStr() + " of " + refN.toStr())
+        // fixed: backward over more than a batch (alone, and with rows),
+        // the whole of an index, NULLs, the collated text (not read alone)
+        let fixed = ["select f.a, f.id from f order by f.a desc, f.id desc", "select f.a, f.nu, f.id from f where f.a < 45 order by f.a desc, f.id desc",
+                     "select f.vc from f order by f.vc desc", "select f.tx, f.id from f where f.tx > 'L1' order by f.tx desc, f.id desc",
+                     "select f.c from f order by f.c", "select count(*), min(f.id), max(f.id) from f where f.a is null",
+                     "select f.ci, f.id from f where f.ci = 'k5' order by f.id", "select f.ci, f.id from f where f.ci > 'k2' order by f.id",
+                     "select f.dt, f.id from f order by f.dt desc, f.id desc limit 1500", "select f.a, f.b, f.id from f where f.a > 2 order by f.a desc, f.b desc, f.id desc"]
+        var fsame = 0
+        var fref = 0
+        for sql in fixed {
+            if three(mut &s, &sql, mut &nb) { fsame += 1 }
+            if ref(mut &s, &sql) == 1 { fref += 1 } else { println("fixed, not as without indexes: " + sql) }
+        }
+        println("fixed: " + len(fixed).toStr() + " queries, " + fsame.toStr() + " the same three ways, as without indexes: " + fref.toStr())
+        // in a transaction with its own writes (the index read merged with them)
+        let b1 = q(mut &s, &"begin")
+        let w1 = q(mut &s, &"insert into f select id + 5000, a, b + 1, c + 50000003, tx, dt, vc, ci, nu, bo, w from f where id <= 60")
+        let w2 = q(mut &s, &"update f set a = a + 1, tx = 'L7', dt = dt + 3 where id % 10 = 3")
+        let w3 = q(mut &s, &"delete from f where id % 15 = 4")
+        let w4 = q(mut &s, &"update g set v = v + 1 where k % 4 = 0")
+        let w5 = q(mut &s, &"insert into g values (1, 5, 'G1'), (3, null, 'G3')")
+        var same2 = 0
+        var nb2 = 0
+        for i in 0..150 {
+            let sql = query(mut &r, true)
+            if three(mut &s, &sql, mut &nb2) { same2 += 1 }
+        }
+        let b2 = q(mut &s, &"rollback")
+        println("in a transaction: 150 queries, " + same2.toStr() + " the same three ways, its writes: " + w1 + ", " + w2 + ", " + w3)
+        println("index in batches: alone " + alone.toStr() + ", with rows " + withRows.toStr() + ", ordered lookups " + ordered.toStr() + ", given as an OutBatch " + nb.toStr())
+        // the counts: as the row path's
+        var cs: []str = []
+        for cq in ["explain analyze select f.id, f.a from f where f.a between 3 and 30", "explain analyze select f.id, f.nu from f where f.a between 3 and 30",
+                   "explain analyze select count(*), sum(g.v) from f left join g on g.k = f.a where f.b < 900"] {
+            let off1 = q(mut &s, &"set lexdb_batch = off")
+            let cOff = q(mut &s, &cq)
+            let on1 = q(mut &s, &"set lexdb_batch = on")
+            let cOn = q(mut &s, &cq)
+            append(mut &cs, (plan(&cOn) == plan(&cOff) && strings.contains(cOn, "batches")).toStr())
+            if plan(&cOn) != plan(&cOff) {
+                println(cOff)
+                println(cOn)
+            }
+        }
+        println("counts: same: " + strings.join(&cs, " "))
+        // A transaction's index read is noted: another's insert into the
+        // range it read, committed before it commits, fails it.
+        var skew: []str = []
+        var n = 0
+        for what in ["alone", "rows", "lookup"] {
+            for mode in ["off", "on"] {
+                var s2 = lexdb_exec.newSession(st)
+                let sw = q(mut &s, &("set lexdb_batch = " + mode))
+                let rq = if what == "alone" { "select count(*), sum(f.b) from f where f.a = 17 and f.b > 0" } else if what == "rows" {
+                    "select count(*), sum(f.nu) from f where f.a = 17"
+                } else { "select count(*), sum(g.v) from f join g on g.k = f.a" }
+                let bg = q(mut &s, &"begin")
+                let rd = q(mut &s, &rq)
+                let ex = q(mut &s, &("explain analyze " + rq))
+                // the other session's insert: into f_a's range a = 17, or g's key 17 (looked up, missing)
+                let ins = if what == "lookup" { "insert into g values (17, 1, 'G17')" } else {
+                    "insert into f (id, a, b) values (" + (90000 + n).toStr() + ", 17, 5)"
+                }
+                let i2 = q(mut &s2, &ins)
+                let ww = q(mut &s, &("insert into g values (" + (1001 + n).toStr() + ", 0, 'x')"))
+                let cm = q(mut &s, &"commit")
+                let undo = if what == "lookup" { q(mut &s2, &"delete from g where k = 17") } else { "" }
+                append(mut &skew, what + " " + mode + ": " + (if strings.contains(ex, "batches") { "batched, " } else { "" }) + strings.split(&cm, &" could")[0])
+                n += 1
+            }
+        }
+        println("write skew: " + strings.join(&skew, "; "))
+        // its own writes read back, and committed (nothing else written)
+        var own: []str = []
+        for mode in ["off", "on"] {
+            let sw = q(mut &s, &("set lexdb_batch = " + mode))
+            let bg = q(mut &s, &"begin")
+            let ins = q(mut &s, &("insert into f (id, a, b) values (" + (95000 + len(own)).toStr() + ", 17, 5)"))
+            let rq = "select count(*), sum(f.b) from f where f.a = 17 and f.b > 0"
+            let ex = q(mut &s, &("explain analyze " + rq))
+            let cm = q(mut &s, &"commit")
+            append(mut &own, "alone " + mode + ": " + (if strings.contains(ex, "batches") { "batched, " } else { "" }) + cm)
+        }
+        println("own reads: " + strings.join(&own, "; "))
+        return 0
+    }).unwrap()
+}
