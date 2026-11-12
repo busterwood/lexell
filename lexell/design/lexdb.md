@@ -7128,3 +7128,105 @@ writes `CREATE TYPE event_kind AS ENUM ('a', 'b')` for an `Enum` column.
 TYPE ... CASCADE; MIN and MAX in the labels' order; privileges on types
 (USAGE); a cast of a text that is not a label is checked only when it is
 written or compared.
+
+### 9.91 UPDATE ... FROM, DELETE ... USING, and TRUNCATE
+
+Tier 1 of design/lexdb-gaps.md's joined writes: all three were syntax
+errors. ORMs write them (Django's and SQLAlchemy's bulk updates, Rails'
+`update_all` with joins), and so do test suites and scripts, which clear
+tables with TRUNCATE.
+
+**The statements:**
+- `UPDATE [ONLY] t [*] [[AS] alias] SET ... [FROM list] [WHERE ...]
+  [RETURNING ...]`;
+- `DELETE FROM [ONLY] t [*] [[AS] alias] [USING list] [WHERE ...]
+  [RETURNING ...]`;
+- `TRUNCATE [TABLE] [ONLY] t [*], ... [RESTART IDENTITY | CONTINUE
+  IDENTITY] [CASCADE | RESTRICT]`.
+
+lexdb has no inheritance, so ONLY and `*` change nothing. The target's
+alias is new as well: UPDATE and DELETE took none before.
+
+**The parser.**
+- SELECT's FROM list is now `fromList`, shared with UPDATE's FROM and
+  DELETE's USING. The list holds tables, subqueries, VALUES, functions and
+  joins.
+- The target and its alias are read by `dmlTarget`.
+- UPDATE's SET list is now `setList`, shared with ON CONFLICT DO UPDATE. So
+  a plain UPDATE takes `(a, b) = (x, y)` too.
+
+**UPDATE ... FROM and DELETE ... USING** are planned as a query over the
+target and then the list (`dmlFrom`). The list is joined to the target as
+a cross join, which WHERE narrows.
+- **Column order.** Tables are joined in the order written, and UPDATE and
+  DELETE read rows whole. So the target's columns come first in each
+  joined row.
+  - The row written is that prefix (`rowPrefix`).
+  - SET, WHERE and RETURNING read the whole joined row, so `RETURNING *`
+    gives the FROM tables' columns too, as in PostgreSQL.
+- **Each target row is changed once,** even when several FROM rows join
+  it, as in PostgreSQL. `onceEach` keeps the first match by primary key,
+  before the rows are locked (9.86). PostgreSQL uses whichever match its
+  join gives first, so the value chosen may differ when the matches
+  disagree.
+- **Names, as PostgreSQL resolves them:**
+  - with an alias, the table's own name no longer names it (42P01);
+  - a bare column in both tables is ambiguous (42702);
+  - the target named again in the list is 42712.
+- **Privileges.** The FROM tables need SELECT, through `buildQuery`'s check
+  (9.83). The target's checks are as before.
+- **RIGHT and FULL JOINs in the list are refused (0A000).** In lexdb's
+  left-to-right order they would make the target's columns NULL, where
+  PostgreSQL joins the list first.
+- **One difference, left as it is:** an ON in the list may name the
+  target. PostgreSQL refuses this (42P01).
+- EXPLAIN, Describe and the guessing of parameter types (`guessParams`)
+  plan the same FROM list.
+
+**TRUNCATE** (`truncate`) gives each table, and each of its indexes, a new
+empty tree, and drops the old ones (`dropTree`, which takes the large
+values' companion tree too). It is the same swap as ALTER COLUMN TYPE's
+rewrite (`retype`), and like PostgreSQL's new file for the table.
+- No row is deleted one by one, so the transaction holds no write per row;
+  the old trees are freed when it commits. A ROLLBACK undoes it.
+  Concurrent transactions meet it as they meet the rewrite's DDL.
+- **Foreign keys.** No foreign key action runs.
+  - A table referenced from a table outside the list is refused, as in
+    PostgreSQL (0A000), with its DETAIL and HINT folded into the message.
+  - CASCADE adds the referencing tables, and the tables that reference
+    those.
+- **RESTART IDENTITY** restarts the sequences the tables own, serial and
+  identity columns alike, at their start.
+  - The restart is done at once, as setval is, so a ROLLBACK does not undo
+    it. PostgreSQL's restart is undone.
+  - Other sequences are not touched.
+- **Privileges and errors.** Each table, the cascaded ones included, needs
+  TRUNCATE (`D`). A view is 42809, and a table not there 42P01.
+- Its tag is `TRUNCATE TABLE`. It is a write, so a replica refuses it.
+
+**Tests:** `exec_joinwrite`, 90 statements generated from PostgreSQL 18 by
+`gen_pg.py joinwrite`, all the same. They cover:
+- **UPDATE ... FROM:**
+  - a table, an alias on each side, a JOIN in the list, a grouped
+    subquery and VALUES;
+  - a row joined twice, changed once;
+  - `(a, b) = (...)`, RETURNING of both sides, no row matched;
+  - a block rolled back;
+  - the errors: an ambiguous column, the target twice, the hidden name,
+    unknown columns.
+- **DELETE ... USING:** a table, an alias with RETURNING, a subquery, rows
+  joined twice, and the alias hiding the name.
+- **TRUNCATE:**
+  - a referenced table refused, then named with its child, and CASCADE
+    through two levels;
+  - CONTINUE and RESTART IDENTITY on serial and identity columns, with
+    another sequence left alone;
+  - a block rolled back;
+  - indexes, unique ones included, working after it;
+  - ONLY and RESTRICT;
+  - a view, and tables not there.
+
+**Not done:**
+- `WHERE CURRENT OF` (lexdb has no cursors);
+- data-modifying CTEs (`WITH d AS (DELETE ... RETURNING ...)`);
+- `TRUNCATE` firing ON TRUNCATE triggers (lexdb has no triggers).

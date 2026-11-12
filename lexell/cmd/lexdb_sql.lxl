@@ -336,6 +336,8 @@ pub const S_OWNER = 52          // ALTER TABLE | VIEW | SEQUENCE | SCHEMA name O
 pub const S_CREATE_TYPE = 53    // CREATE TYPE name AS ENUM (labels): the labels in names (9.90)
 pub const S_DROP_TYPE = 54      // DROP TYPE [IF EXISTS] name, ...: the others in names
 pub const S_ALTER_TYPE = 55     // ALTER TYPE name ADD VALUE [IF NOT EXISTS] 'v' [BEFORE | AFTER 'w']: v in names, w in index, "before" or "after" in alias
+pub const S_TRUNCATE = 56      // TRUNCATE [TABLE] name, ... [RESTART IDENTITY] [CASCADE] (9.91): the first in table, the
+                                // rest in names; RESTART IDENTITY in ifFlag
 
 // COPY's options (Stmt.copy).
 pub type CopyOpts = record {
@@ -2207,9 +2209,16 @@ fn (p: mut &P) onConflict(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
     try p.expectKw("update")
     try p.expectKw("set")
     s.conflict = CONFLICT_UPDATE
+    try p.setList(s)
+    if p.acceptKw("where") { s.where = Some(try p.expr()) }
+    return Ok(Unit{})
+}
+
+// SET's list (UPDATE's, ON CONFLICT DO UPDATE's): col = value, or (a, b) =
+// (x, y); a value may be DEFAULT.
+fn (p: mut &P) setList(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
     while true {
         if p.acceptKw("(") {
-            // (a, b) = (x, y)
             var cols: []str = [try p.name()]
             while p.acceptKw(",") { append(mut &cols, try p.name()) }
             try p.expectKw(")")
@@ -2227,7 +2236,6 @@ fn (p: mut &P) onConflict(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
         }
         if !p.acceptKw(",") { break }
     }
-    if p.acceptKw("where") { s.where = Some(try p.expr()) }
     return Ok(Unit{})
 }
 
@@ -2567,38 +2575,7 @@ fn (p: mut &P) selectCore(): Result[Stmt, lexdb_base.DbErr] {
         s.into = try p.qname()
     }
     if p.acceptKw("from") {
-        append(mut &s.from, try p.fromItem(J_FIRST))
-        while true {
-            if p.acceptKw(",") {
-                append(mut &s.from, try p.fromItem(J_CROSS))
-            } else if p.acceptKw("cross") {
-                try p.expectKw("join")
-                append(mut &s.from, try p.fromItem(J_CROSS))
-            } else if p.isKw("join") || p.isKw("inner") || p.isKw("left") || p.isKw("right") || p.isKw("full") {
-                var kind = J_INNER
-                if p.acceptKw("left") {
-                    let o = p.acceptKw("outer")
-                    kind = J_LEFT
-                } else if p.acceptKw("right") {
-                    let o = p.acceptKw("outer")
-                    kind = J_RIGHT
-                } else if p.acceptKw("full") {
-                    let o = p.acceptKw("outer")
-                    kind = J_FULL
-                } else {
-                    let i = p.acceptKw("inner")
-                }
-                try p.expectKw("join")
-                var f = try p.fromItem(kind)
-                try p.expectKw("on")
-                f.on = Some(try p.expr())
-                append(mut &s.from, f)
-            } else if p.isKw("natural") {
-                return Err(lexdb_base.err("0A000", "NATURAL joins are not supported"))
-            } else {
-                break
-            }
-        }
+        try p.fromList(mut &s.from, J_FIRST)
         s.table = s.from[0].table
     }
     if p.acceptKw("where") { s.where = Some(try p.expr()) }
@@ -2697,6 +2674,44 @@ fn (p: mut &P) orderLimit(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
             let o = p.acceptKw("offset")
             s.offset = Some(try p.expr())
             let r = p.acceptKw("rows") || p.acceptKw("row")
+        }
+    }
+    return Ok(Unit{})
+}
+
+// FROM's list (after FROM; UPDATE's FROM and DELETE's USING, 9.91): its
+// first item joined as join, the rest by commas and JOINs.
+fn (p: mut &P) fromList(from: mut &[]FromItem, join: int): Result[Unit, lexdb_base.DbErr] {
+    append(from, try p.fromItem(join))
+    while true {
+        if p.acceptKw(",") {
+            append(from, try p.fromItem(J_CROSS))
+        } else if p.acceptKw("cross") {
+            try p.expectKw("join")
+            append(from, try p.fromItem(J_CROSS))
+        } else if p.isKw("join") || p.isKw("inner") || p.isKw("left") || p.isKw("right") || p.isKw("full") {
+            var kind = J_INNER
+            if p.acceptKw("left") {
+                let o = p.acceptKw("outer")
+                kind = J_LEFT
+            } else if p.acceptKw("right") {
+                let o = p.acceptKw("outer")
+                kind = J_RIGHT
+            } else if p.acceptKw("full") {
+                let o = p.acceptKw("outer")
+                kind = J_FULL
+            } else {
+                let i = p.acceptKw("inner")
+            }
+            try p.expectKw("join")
+            var f = try p.fromItem(kind)
+            try p.expectKw("on")
+            f.on = Some(try p.expr())
+            append(from, f)
+        } else if p.isKw("natural") {
+            return Err(lexdb_base.err("0A000", "NATURAL joins are not supported"))
+        } else {
+            break
         }
     }
     return Ok(Unit{})
@@ -2908,28 +2923,62 @@ fn (p: mut &P) indexCol(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
     return Ok(Unit{})
 }
 
+// UPDATE [ONLY] t [[AS] alias] SET ... [FROM list] [WHERE ...] [RETURNING ...]
+// (FROM and the alias: 9.91). The alias in alias, FROM's items in from.
 fn (p: mut &P) update(): Result[Stmt, lexdb_base.DbErr] {
     var s = newStmt(S_UPDATE)
-    s.table = try p.qname()
+    try p.dmlTarget(mut &s)
     try p.expectKw("set")
-    while true {
-        let c = try p.name()
-        try p.expectKw("=")
-        let e = try p.valueOrDefault()
-        append(mut &s.sets, SetItem{col: c, expr: e})
-        if !p.acceptKw(",") { break }
-    }
+    try p.setList(mut &s)
+    if p.acceptKw("from") { try p.fromList(mut &s.from, J_CROSS) }
     if p.acceptKw("where") { s.where = Some(try p.expr()) }
     try p.returning(mut &s)
     return Ok(s)
 }
 
+// DELETE FROM [ONLY] t [[AS] alias] [USING list] [WHERE ...] [RETURNING ...]
 fn (p: mut &P) delete(): Result[Stmt, lexdb_base.DbErr] {
     try p.expectKw("from")
     var s = newStmt(S_DELETE)
-    s.table = try p.qname()
+    try p.dmlTarget(mut &s)
+    if p.acceptKw("using") { try p.fromList(mut &s.from, J_CROSS) }
     if p.acceptKw("where") { s.where = Some(try p.expr()) }
     try p.returning(mut &s)
+    return Ok(s)
+}
+
+// UPDATE's and DELETE's table: [ONLY] name [*] [[AS] alias]. lexdb has no
+// inheritance, so ONLY and * change nothing.
+fn (p: mut &P) dmlTarget(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
+    let only = p.acceptKw("only")
+    s.table = try p.qname()
+    let star = p.acceptKw("*")
+    var cols: []str = []
+    try p.aliasOf(mut &s.alias, mut &cols)
+    if len(cols) > 0 { return Err(lexdb_base.err("42601", "syntax error at or near \"(\"")) }
+    return Ok(Unit{})
+}
+
+// TRUNCATE [TABLE] [ONLY] name [*], ... [RESTART IDENTITY | CONTINUE
+// IDENTITY] [CASCADE | RESTRICT] (9.91): the first name in table, the
+// others in names; RESTART IDENTITY in ifFlag, CASCADE in cascade.
+fn (p: mut &P) truncate(): Result[Stmt, lexdb_base.DbErr] {
+    var s = newStmt(S_TRUNCATE)
+    let tb = p.acceptKw("table")
+    while true {
+        let only = p.acceptKw("only")
+        let n = try p.qname()
+        let star = p.acceptKw("*")
+        if len(s.table) == 0 { s.table = n } else { append(mut &s.names, n) }
+        if !p.acceptKw(",") { break }
+    }
+    if p.acceptKw("restart") {
+        try p.expectKw("identity")
+        s.ifFlag = true
+    } else if p.acceptKw("continue") {
+        try p.expectKw("identity")
+    }
+    if p.acceptKw("cascade") { s.cascade = true } else { let r = p.acceptKw("restrict") }
     return Ok(s)
 }
 
@@ -3363,6 +3412,7 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
         }
         "update" { return p.update() }
         "delete" { return p.delete() }
+        "truncate" { return p.truncate() }
         "copy" { return p.copyStmt() }
         "create" {
             var orReplace = false

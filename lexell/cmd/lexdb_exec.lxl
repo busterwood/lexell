@@ -5526,6 +5526,55 @@ fn oneTable(name: &str): []lexdb_sql.FromItem {
     return [lexdb_sql.FromItem{table: name, alias: lexdb_sql.baseName(name), join: lexdb_sql.J_FIRST, on: None, sub: -1, cols: [], work: -1, lateral: false}]
 }
 
+// UPDATE's and DELETE's FROM items: the table written (under its alias),
+// then UPDATE's FROM or DELETE's USING (9.91), joined to it as a cross join
+// that WHERE narrows. The table written is the first level, so its
+// columns come first in each row found. A RIGHT or FULL JOIN among the
+// others would make the table written NULL in this order (PostgreSQL joins
+// the list first): refused.
+fn dmlFrom(s: &lexdb_sql.Stmt): Result[[]lexdb_sql.FromItem, DbErr] {
+    var out = oneTable(&s.table)
+    if len(s.alias) > 0 { out[0].alias = s.alias }
+    for f in s.from {
+        if keepsRight(f.join) {
+            let what = if s.kind == lexdb_sql.S_UPDATE { "UPDATE ... FROM" } else { "DELETE ... USING" }
+            return Err(e("0A000", "lexdb: RIGHT and FULL joins in " + what + " are not supported"))
+        }
+        let on: Option[Expr] = match f.on {
+            Some(x) { Some(clone(&x)) }
+            None { None }
+        }
+        var cols: []str = []
+        for c in f.cols { append(mut &cols, c) }
+        append(mut &out, lexdb_sql.FromItem{table: f.table, alias: f.alias, join: f.join, on: on, sub: f.sub, cols: cols, work: f.work, lateral: f.lateral})
+    }
+    return Ok(out)
+}
+
+// The rows found by UPDATE ... FROM or DELETE ... USING, once per row of t
+// (its columns first): PostgreSQL also changes a row that several rows of
+// FROM join once, with one of them.
+fn onceEach(t: &Table, found: [][]Val, joined: bool): [][]Val {
+    if !joined { return found }
+    var seen: Map[str, int] = newMap()
+    var out: [][]Val = []
+    for r in found {
+        let k = keyOf(t, &r)
+        if seen.has(&k) { continue }
+        seen.put(k, 1)
+        append(mut &out, copyRow(&r))
+    }
+    return out
+}
+
+// The first n values of r: the table written's, in a joined row.
+fn rowPrefix(r: &[]Val, n: int): []Val {
+    if len(r) == n { return copyRow(r) }
+    var out: []Val = []
+    for i in 0..n { append(mut &out, r[i]) }
+    return out
+}
+
 // ---- indexes: an entry per row, its key the indexed columns then the
 // primary key, its value the primary key.
 
@@ -6009,6 +6058,62 @@ fn dropTableNamed(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, name: &str,
             return Err(e("42P01", "table \"" + lexdb_sql.shown(name) + "\" does not exist"))
         }
     }
+}
+
+// TRUNCATE (9.91): each table named given new, empty trees, its indexes
+// too, and the old trees dropped, as PostgreSQL gives it a new file. Rows
+// are not deleted one by one, so no foreign key action runs: a table a
+// foreign key outside the list references is refused, unless CASCADE adds
+// it. RESTART IDENTITY restarts the sequences the tables own (at once, as
+// setval: PostgreSQL's is undone by a ROLLBACK).
+fn truncate(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
+    var names: []str = [s.table]
+    for n in s.names { append(mut &names, n) }
+    var keys: []str = []
+    for n in names {
+        match try findTable(st, txn, &n) {
+            Some(t) {
+                if len(t.view) > 0 { return Err(e("42809", "\"" + lexdb_sql.baseName(&n) + "\" is not a table")) }
+                addKey(mut &keys, &t.name)
+            }
+            None { return Err(e("42P01", "relation \"" + lexdb_sql.shown(&n) + "\" does not exist")) }
+        }
+    }
+    let w = try whoNow(st, txn)
+    for k in keys { try needRel(st, txn, &w, &k, &"D", &"table") }
+    // the tables that reference them: named too, or added by CASCADE
+    var i = 0
+    while i < len(keys) {
+        let t = try byKey(st, txn, &keys[i])
+        for ck in t.refBy {
+            if hasStr(&keys, &ck) { continue }
+            if !s.cascade {
+                return Err(e("0A000", "cannot truncate a table referenced in a foreign key constraint: Table \"" + lexdb_sql.baseName(&ck) +
+                             "\" references \"" + lexdb_sql.baseName(&t.name) + "\". Truncate table \"" + lexdb_sql.baseName(&ck) +
+                             "\" at the same time, or use TRUNCATE ... CASCADE."))
+            }
+            try needRel(st, txn, &w, &ck, &"D", &"table")
+            append(mut &keys, ck)
+        }
+        i += 1
+    }
+    var seqs: []Seq = []
+    if s.ifFlag { seqs = try allSeqs(st, txn, &"") }
+    for k in keys {
+        var t = try byKey(st, txn, &k)
+        let old = t.tree
+        t.tree = st.createTree(txn)
+        txn.dropTree(old)
+        for x in 0..len(t.indexes) {
+            let oi = t.indexes[x].tree
+            t.indexes[x].tree = st.createTree(txn)
+            txn.dropTree(oi)
+        }
+        try putTable(txn, &t)
+        for d in seqs { if d.ownerT == t.name { try setVal(st, &d, d.start, false) } }
+    }
+    try bumpCatalog(st, txn)
+    return Ok(tagOnly("TRUNCATE TABLE"))
 }
 
 // A table's trees and catalog rows, its indexes' too.
@@ -7333,7 +7438,7 @@ fn update(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     let sqe = seqEnv(st, txn)
     var sc = newScope(params, &[])
     sc.target = try catKey(st, txn, &s.table, false)
-    var q = try buildQuery(st, txn, &oneTable(&s.table), &s.where, params, &s.subs, mut &sc)
+    var q = try buildQuery(st, txn, &(try dmlFrom(s)), &s.where, params, &s.subs, mut &sc)
     var targets: []int = []
     var sets: []Expr = []
     for set in s.sets {
@@ -7365,6 +7470,7 @@ fn update(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
             append(mut &found, copyRow(r))
             return Ok(true)
         }, mut &rs)
+        found = onceEach(t, found, len(s.from) > 0)
         if !(try lockFound(st, txn, t, &found, lmode)) { break }
         // a lock waited for: the rows found again, holding the locks
         found = []
@@ -7383,15 +7489,20 @@ fn update(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     }
     let fw = try fkTables(st, txn, t, true, true)
     var later: []FkLater = []
-    for old in found {
-        let env = Env{cols: &q.cols, row: &old, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: sqe}
-        var row = copyRow(&old)
+    // a joined row: t's columns, then FROM's, which SET, RETURNING and
+    // WHERE may read
+    let nt = len(t.cols)
+    for joined in found {
+        let env = Env{cols: &q.cols, row: &joined, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: sqe}
+        var all = copyRow(&joined)
         for k in 0..len(sets) {
-            if lexdb_sql.isDefault(&sets[k]) { row[targets[k]] = try defAt(st, txn, &defs, t, targets[k]) }
-            else { row[targets[k]] = try coerce(try evalX(st, txn, &q, &sets[k], &env, mut &rs), &t.cols[targets[k]].typ) }
+            if lexdb_sql.isDefault(&sets[k]) { all[targets[k]] = try defAt(st, txn, &defs, t, targets[k]) }
+            else { all[targets[k]] = try coerce(try evalX(st, txn, &q, &sets[k], &env, mut &rs), &t.cols[targets[k]].typ) }
         }
+        let old = rowPrefix(&joined, nt)
+        let row = rowPrefix(&all, nt)
         try updRow(st, txn, t, &old, &row, &fw, mut &later)
-        try retAdd(st, txn, &q, &m, params, mut &ret, &row, mut &rs)
+        try retAdd(st, txn, &q, &m, params, mut &ret, &all, mut &rs)
     }
     try fkFinish(st, txn, &fw, mut &later)
     return Ok(retRes(ret, "UPDATE " + len(found).toStr()))
@@ -7402,7 +7513,7 @@ fn delete(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     try dmlCheck(st, txn, s, &"d")
     var sc = newScope(params, &[])
     sc.target = try catKey(st, txn, &s.table, false)
-    var q = try buildQuery(st, txn, &oneTable(&s.table), &s.where, params, &s.subs, mut &sc)
+    var q = try buildQuery(st, txn, &(try dmlFrom(s)), &s.where, params, &s.subs, mut &sc)
     var ret = try retOf(s, &q, mut &sc)
     endScope(mut &sc, mut &q)
     let t = &q.levels[0].t
@@ -7421,6 +7532,7 @@ fn delete(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
             append(mut &found, copyRow(r))
             return Ok(true)
         }, mut &rs)
+        found = onceEach(t, found, len(s.from) > 0)
         if !(try lockFound(st, txn, t, &found, lexdb_sql.LOCK_UPDATE)) { break }
         found = []
         held = 0
@@ -7431,9 +7543,10 @@ fn delete(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     }
     let fw = try fkTables(st, txn, t, false, true)
     var later: []FkLater = []
-    for row in found {
-        try retAdd(st, txn, &q, &m, params, mut &ret, &row, mut &rs)
-        try delRow(st, txn, t, &row, &fw, mut &later)
+    let nt = len(t.cols)
+    for joined in found {
+        try retAdd(st, txn, &q, &m, params, mut &ret, &joined, mut &rs)
+        try delRow(st, txn, t, &rowPrefix(&joined, nt), &fw, mut &later)
     }
     try fkFinish(st, txn, &fw, mut &later)
     return Ok(retRes(ret, "DELETE " + len(found).toStr()))
@@ -7459,7 +7572,7 @@ fn explain(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, x: &lexdb_sql.Stmt
         lines = selLines(&sel, &none, &noStats)
     } else {
         var sc = newScope(params, ptypes)
-        var q = try buildQuery(st, txn, &oneTable(&s.table), &s.where, params, &s.subs, mut &sc)
+        var q = try buildQuery(st, txn, &(try dmlFrom(s)), &s.where, params, &s.subs, mut &sc)
         endScope(mut &sc, mut &q)
         lines = explainLines(&q, &none)
         let noStats: []SubStat = []
@@ -9306,7 +9419,10 @@ fn guessParams(st: &lexdb_store.Store, s: &lexdb_sql.Stmt, out: mut &[]int, path
     let noTypes: []int = []
     var sc = newScope(&np, &noTypes)
     let built = if s.kind == lexdb_sql.S_SELECT { buildQuery(st, mut &txn, &s.from, &s.where, &np, &s.subs, mut &sc) } else {
-        buildQuery(st, mut &txn, &oneTable(&s.table), &s.where, &np, &s.subs, mut &sc)
+        match dmlFrom(s) {
+            Ok(from) { buildQuery(st, mut &txn, &from, &s.where, &np, &s.subs, mut &sc) }
+            Err(x) { Err(x) }
+        }
     }
     match built {
         Ok(q) { comparedIn(&q, out) }
@@ -9379,7 +9495,8 @@ fn describe(st: &lexdb_store.Store, s: &lexdb_sql.Stmt, ptypes: &[]int, path: &[
         let none: Option[Expr] = None
         let np: []Val = array(if s.params > len(ptypes) { s.params } else { len(ptypes) }, Val.Null)
         var sc = newScope(&np, ptypes)
-        let q = try buildQuery(st, mut &txn, &oneTable(&s.table), &none, &np, &s.subs, mut &sc)
+        let from = if s.kind == lexdb_sql.S_INSERT { oneTable(&s.table) } else { try dmlFrom(s) }
+        let q = try buildQuery(st, mut &txn, &from, &none, &np, &s.subs, mut &sc)
         var exprs: []Expr = []
         return itemCols(&s.items, true, &q.cols, mut &sc, mut &exprs)
     }
@@ -9596,7 +9713,8 @@ fn isWrite(kind: int): bool {
            kind == lexdb_sql.S_CREATE_ROLE || kind == lexdb_sql.S_ALTER_ROLE || kind == lexdb_sql.S_DROP_ROLE ||
            kind == lexdb_sql.S_CREATE_VIEW || kind == lexdb_sql.S_DROP_VIEW || kind == lexdb_sql.S_ALTER_VIEW ||
            kind == lexdb_sql.S_GRANT || kind == lexdb_sql.S_REVOKE || kind == lexdb_sql.S_OWNER ||
-           kind == lexdb_sql.S_CREATE_TYPE || kind == lexdb_sql.S_DROP_TYPE || kind == lexdb_sql.S_ALTER_TYPE
+           kind == lexdb_sql.S_CREATE_TYPE || kind == lexdb_sql.S_DROP_TYPE || kind == lexdb_sql.S_ALTER_TYPE ||
+           kind == lexdb_sql.S_TRUNCATE
 }
 
 fn stmtName(kind: int): str {
@@ -9617,6 +9735,7 @@ fn stmtName(kind: int): str {
         lexdb_sql.S_CREATE_TYPE { "CREATE TYPE" }
         lexdb_sql.S_DROP_TYPE { "DROP TYPE" }
         lexdb_sql.S_ALTER_TYPE { "ALTER TYPE" }
+        lexdb_sql.S_TRUNCATE { "TRUNCATE TABLE" }
         lexdb_sql.S_DROP_VIEW { "DROP VIEW" }
         lexdb_sql.S_ALTER_VIEW { "ALTER VIEW" }
         lexdb_sql.S_ALTER_ROLE { "ALTER ROLE" }
@@ -9692,6 +9811,7 @@ fn execStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
         lexdb_sql.S_CREATE_TYPE { return createType(st, txn, s) }
         lexdb_sql.S_DROP_TYPE { return dropType(st, txn, s) }
         lexdb_sql.S_ALTER_TYPE { return alterType(st, txn, s) }
+        lexdb_sql.S_TRUNCATE { return truncate(st, txn, s) }
         lexdb_sql.S_DROP_VIEW { return dropView(st, txn, s) }
         lexdb_sql.S_ALTER_VIEW { return alterView(st, txn, s) }
         lexdb_sql.S_DROP_SCHEMA { return dropSchema(st, txn, s) }
