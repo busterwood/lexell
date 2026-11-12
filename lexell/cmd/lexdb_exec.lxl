@@ -33,6 +33,7 @@ import "base64"
 import "./lexdb_page"
 import "./lexdb_store"
 import "./lexdb_sql"
+import "./lexdb_sqlcoll"
 
 pub const CATALOG = 1
 
@@ -2056,6 +2057,26 @@ fn encIdxPart(b: mut &StrBuf, v: &Val) {
     encKeyPart(b, v)
 }
 
+// A column, bare or under a collation's key (#ci(col), #pad(col)): its
+// name and the kind; name "" when x is neither.
+type KeyedCol = value record { name: str; kind: int }
+
+fn keyedCol(x: &Expr): KeyedCol {
+    match x {
+        Expr.Col(n) { return KeyedCol{name: n, kind: lexdb_sql.COLL_EXACT} }
+        Expr.Call(f, args, _) {
+            if (f == "#ci" || f == "#pad") && len(args) == 1 {
+                match args[0] {
+                    Expr.Col(n) { return KeyedCol{name: n, kind: if f == "#ci" { lexdb_sql.COLL_CI } else { lexdb_sql.COLL_PAD }} }
+                    else {}
+                }
+            }
+        }
+        else {}
+    }
+    return KeyedCol{name: "", kind: lexdb_sql.COLL_EXACT}
+}
+
 // The key of a row: its primary key's values, in byte order = SQL order.
 fn keyOf(t: &Table, row: &[]Val): str {
     var b = newStrBuf()
@@ -3144,6 +3165,7 @@ pub type Level = record {
     perRow: bool
     hashCols: []int         // hash: its columns ...
     hashVals: []Expr        // ... equal to these values from earlier tables
+    hashKinds: []int        // ... per column, the collation its key is under (L2: #ci(col) = x)
     src: int                // a subquery in FROM (or a CTE): its number, its rows read from the run; -1 a table
     work: int               // a recursive CTE's working table: the CTE's number; -1
     lateral: bool           // a subquery in FROM using outer values (LATERAL): run per row
@@ -3412,7 +3434,18 @@ fn resolve(x: &Expr, cols: &[]lexdb_sql.ColDef, n: int, sc: mut &Scope): Result[
                 // a subquery: its number, type and name, (IN: the value), then the outer values it needs
                 let i = litInt(&args[0])
                 var xs: []Expr = []
-                if nm == "#in" { append(mut &xs, try resolve(&args[1], cols, n, sc)) }
+                if nm == "#in" {
+                    // x IN (subquery) under its collation (L2): x's and the
+                    // subquery's column's; the set is keyed so (endScope)
+                    let v = try resolve(&args[1], cols, n, sc)
+                    let top = len(sc.frames) - 1
+                    let sn = sc.frames[top].subColls[i]
+                    let c2 = if len(sn) > 0 { Coll{name: sn, level: COLL_IMPLICIT} } else { Coll{name: sc.coll, level: COLL_DEFAULT} }
+                    let c = try cmpColl(exprColl(&v, cols, sc), c2, &"=")
+                    let k = if c.level == COLL_NONE || !(isTextExpr(&v, cols, sc) || isTextOid(sc.frames[top].subOids[i])) { lexdb_sql.COLL_EXACT } else { lexdb_sql.collKind(&c.name) }
+                    sc.frames[top].subKinds[i] = k
+                    append(mut &xs, collKeyOf(k, v))
+                }
                 let f = &sc.frames[len(sc.frames) - 1]
                 append(mut &out, Expr.Lit(Val.Int(i)))
                 append(mut &out, Expr.Lit(Val.Int(f.subOids[i])))
@@ -3423,6 +3456,17 @@ fn resolve(x: &Expr, cols: &[]lexdb_sql.ColDef, n: int, sc: mut &Scope): Result[
             }
             for a in args { append(mut &out, try resolve(&a, cols, n, sc)) }
             if nm == "in" || nm == "like" || nm == "ilike" || nm == "distinct from" { out = try collateCall(&nm, out, cols, sc) }
+            if nm == "nullif" && len(out) == 2 && !star {
+                // NULLIF(a, b) under a collation's keys (L2): CASE WHEN a = b THEN NULL ELSE a END
+                let a0 = clone(&out[0])
+                let eq = try collateCmp(&"=", clone(&out[0]), clone(&out[1]), cols, sc)
+                match eq {
+                    Expr.Bin(_, l, _) {
+                        match l { Expr.Call(k, _, _) { if k == "#ci" || k == "#pad" { return Ok(Expr.Call("case else", [eq, Expr.Lit(Val.Null), a0], false)) } } else {} }
+                    }
+                    else {}
+                }
+            }
             if nm == "pg_typeof" && len(out) == 1 && !star {
                 // its argument's type, known now: a text (PostgreSQL's regtype, shown by name)
                 return Ok(Expr.Lit(Val.Text(lexdb_sql.typeText(&oidType(exprOid(&out[0], cols, &[]))))))
@@ -4168,7 +4212,7 @@ fn allTrue(cs: &[]Expr, cols: &[]lexdb_sql.ColDef, row: &[]Val, params: &[]Val):
 
 fn newLevel(t: Table, alias: str, join: int, first: int): Level {
     return Level{t: t, alias: alias, join: join, first: first, path: Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: []}, cond: [],
-                 post: [], local: [], perRow: true, hashCols: [], hashVals: [], src: -1, work: -1, lateral: false, need: [],
+                 post: [], local: [], perRow: true, hashCols: [], hashVals: [], hashKinds: [], src: -1, work: -1, lateral: false, need: [],
                  lock: 0, lockWait: 0}
 }
 
@@ -4184,7 +4228,7 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
     for i in 0..len(subs) { append(mut &planned, []) }
     // its scope comes first, its columns added as its tables are read: a
     // LATERAL subquery sees the tables before it, another none of them
-    append(mut &sc.frames, Frame{cols: [], refs: [], refOids: [], subRefs: [], subOids: [], subNames: [], hidden: false})
+    append(mut &sc.frames, Frame{cols: [], refs: [], refOids: [], subRefs: [], subOids: [], subNames: [], subColls: [], subKinds: [], hidden: false})
     let me = len(sc.frames) - 1
     var views: []SubPlan = []              // the views read, planned (9.82)
     for f in from {
@@ -4313,6 +4357,8 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
         append(mut &sc.frames[top].subRefs, cloneAll(&sp.sel.q.refs))
         append(mut &sc.frames[top].subOids, sp.oid)
         append(mut &sc.frames[top].subNames, sp.name)
+        append(mut &sc.frames[top].subColls, if len(sp.sel.outs) > 0 && isTextOid(sp.sel.outs[0].oid) { sp.sel.outs[0].coll } else { "" })
+        append(mut &sc.frames[top].subKinds, lexdb_sql.COLL_EXACT)
         if len(sp.sel.q.refs) > 0 { q.corr = true }
         append(mut &q.subs, sp)
     }
@@ -4325,6 +4371,8 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
         append(mut &sc.frames[top].subRefs, [])
         append(mut &sc.frames[top].subOids, vp.oid)
         append(mut &sc.frames[top].subNames, vp.name)
+        append(mut &sc.frames[top].subColls, "")
+        append(mut &sc.frames[top].subKinds, lexdb_sql.COLL_EXACT)
         append(mut &q.subs, vp)
     }
     let nl = len(q.levels)
@@ -4389,6 +4437,7 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
         var local: []Expr = []
         var hcols: []int = []
         var hvals: []Expr = []
+        var hkinds: []int = []
         if !perRow {
             for c in m {
                 if q.minLevel(&c) >= k {
@@ -4398,27 +4447,17 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
                 match c {
                     Expr.Bin(op, a, b) {
                         if op == "=" {
-                            var got = false
-                            match a {
-                                Expr.Col(n) {
-                                    if q.levelOf(&n) == k && q.valBefore(&b, k) {
-                                        append(mut &hcols, colIndex(&q.cols, &n) - q.levels[k].first)
-                                        append(mut &hvals, clone(&b))
-                                        got = true
-                                    }
-                                }
-                                else {}
-                            }
-                            if !got {
-                                match b {
-                                    Expr.Col(n) {
-                                        if q.levelOf(&n) == k && q.valBefore(&a, k) {
-                                            append(mut &hcols, colIndex(&q.cols, &n) - q.levels[k].first)
-                                            append(mut &hvals, clone(&a))
-                                        }
-                                    }
-                                    else {}
-                                }
+                            // col = x, or a collation's #ci(col) = #ci(x) (L2): hashed on the key
+                            let ka = keyedCol(&a)
+                            let kb = keyedCol(&b)
+                            if len(ka.name) > 0 && q.levelOf(&ka.name) == k && q.valBefore(&b, k) {
+                                append(mut &hcols, colIndex(&q.cols, &ka.name) - q.levels[k].first)
+                                append(mut &hvals, clone(&b))
+                                append(mut &hkinds, ka.kind)
+                            } else if len(kb.name) > 0 && q.levelOf(&kb.name) == k && q.valBefore(&a, k) {
+                                append(mut &hcols, colIndex(&q.cols, &kb.name) - q.levels[k].first)
+                                append(mut &hvals, clone(&a))
+                                append(mut &hkinds, kb.kind)
                             }
                         }
                     }
@@ -4433,6 +4472,7 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
         q.levels[k].local = local
         q.levels[k].hashCols = hcols
         q.levels[k].hashVals = hvals
+        q.levels[k].hashKinds = hkinds
     }
     return Ok(q)
 }
@@ -4470,9 +4510,11 @@ fn materialize(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: 
                 if !(try allTrueX(st, txn, q, m, &lv.local, &full, params, rs)) { continue }
                 var kb = newStrBuf()
                 var nul = false
-                for c in lv.hashCols {
+                for j in 0..len(lv.hashCols) {
+                    let c = lv.hashCols[j]
                     if isNull(&r[c]) { nul = true }
-                    if lv.virt() { keyPart(mut &kb, &r[c]) } else { encIdxPart(mut &kb, &r[c]) }
+                    let hv = if j < len(lv.hashKinds) { collVal(lv.hashKinds[j], &r[c]) } else { r[c] }
+                    if lv.virt() { keyPart(mut &kb, &hv) } else { encIdxPart(mut &kb, &hv) }
                 }
                 if nul {
                     // NULL equals nothing; a RIGHT or FULL JOIN still keeps the row
@@ -4547,7 +4589,10 @@ fn runLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Ma
                     if isNull(&v) { nul = true }
                     keyPart(mut &kb, &v)
                 } else {
-                    let v = try coerce(try eval(&lv.hashVals[i], &env), &lv.t.cols[lv.hashCols[i]].typ)
+                    // (a collation's key is no value of the column: its type without its length)
+                    let keyed = i < len(lv.hashKinds) && lv.hashKinds[i] != lexdb_sql.COLL_EXACT
+                    let ht = if keyed { boundType(&lv.t.cols[lv.hashCols[i]].typ) } else { lv.t.cols[lv.hashCols[i]].typ }
+                    let v = try coerce(try eval(&lv.hashVals[i], &env), &ht)
                     if isNull(&v) { nul = true }
                     encIdxPart(mut &kb, &v)
                 }
@@ -4694,6 +4739,7 @@ type SubPlan = record {
     keyOuter: []Expr            // per key column: what it equals, of outer values only (refs as parameters)
     keyText: []str              // EXPLAIN: "inner = outer"
     cte: int                    // a CTE's use: the CTE's number (its rows shared); -1
+    kind: int                   // IN: the collation kind its values are compared under (L2)
 }
 
 // A subquery's result: a scalar's value, how many rows, IN's values.
@@ -4720,6 +4766,8 @@ type Frame = record {
     subRefs: [][]Expr           // per subquery of it: the subquery's refs, in its terms
     subOids: []int
     subNames: []str
+    subColls: []str             // per subquery of it: its column's collation (L2)
+    subKinds: []int             // ... IN's: the kind its values are compared under, as resolve finds it
     hidden: bool                // its columns are not in scope (a FROM subquery that is not LATERAL)
 }
 
@@ -4823,9 +4871,9 @@ fn exprColl(x: &Expr, cols: &[]lexdb_sql.ColDef, sc: &Scope): Coll {
             return strongerColl(exprColl(&a, cols, sc), exprColl(&b, cols, sc))
         }
         Expr.Call(n, args, _) {
-            if n == "#collate" && len(args) == 2 {
+            if (n == "#collate" || n == "#coll") && len(args) == 2 {
                 match args[1] {
-                    Expr.Lit(v) { return Coll{name: text(&v), level: COLL_EXPLICIT} }
+                    Expr.Lit(v) { return Coll{name: text(&v), level: if n == "#coll" { COLL_IMPLICIT } else { COLL_EXPLICIT }} }
                     else {}
                 }
             }
@@ -4932,6 +4980,7 @@ fn outerRef(sc: mut &Scope, name: &str): Result[Option[Expr], DbErr] {
     var f = top - 1
     var found = ""
     var oid = 0
+    var coll = ""
     while f >= 0 && found == "" {
         if sc.frames[f].hidden {
             f -= 1
@@ -4939,7 +4988,9 @@ fn outerRef(sc: mut &Scope, name: &str): Result[Option[Expr], DbErr] {
         }
         match resolveName(&sc.frames[f].cols, len(sc.frames[f].cols), name) {
             Ok(n) {
-                oid = sc.frames[f].cols[colIndex(&sc.frames[f].cols, &n)].typ.oid
+                let fc = &sc.frames[f].cols[colIndex(&sc.frames[f].cols, &n)]
+                oid = fc.typ.oid
+                if fc.typ.kind == lexdb_sql.K_TEXT { coll = fc.coll }
                 found = n
             }
             Err(x) {
@@ -4962,6 +5013,8 @@ fn outerRef(sc: mut &Scope, name: &str): Result[Option[Expr], DbErr] {
         }
         x = Expr.Param(sc.base + at + 1)
     }
+    // a collated column keeps its collation (L2): #coll(x, name), implicit
+    if len(coll) > 0 { x = Expr.Call("#coll", [x, Expr.Lit(Val.Text(coll))], false) }
     return Ok(Some(x))
 }
 
@@ -4970,6 +5023,7 @@ fn outerRef(sc: mut &Scope, name: &str): Result[Option[Expr], DbErr] {
 fn endScope(sc: mut &Scope, q: mut &Query) {
     var f = pop(mut &sc.frames)
     q.refs = replace(mut &f.refs, [])
+    for i in 0..len(f.subKinds) { if i < len(q.subs) { q.subs[i].kind = f.subKinds[i] } }
 }
 
 fn planSub(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val,
@@ -4981,7 +5035,7 @@ fn planSub(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
     let oid = if s.use == lexdb_sql.SUB_EXISTS || len(sel.outs) == 0 { lexdb_sql.OID_BOOL } else { sel.outs[0].oid }
     let name = if s.use == lexdb_sql.SUB_EXISTS { "exists" } else if s.use == lexdb_sql.SUB_SCALAR { sel.outs[0].name } else { "?column?" }
     // (in FROM: its columns are its outs)
-    var sp = SubPlan{use: s.use, sel: sel, oid: oid, name: name, hashed: false, keyOuter: [], keyText: [], cte: s.cte}
+    var sp = SubPlan{use: s.use, sel: sel, oid: oid, name: name, hashed: false, keyOuter: [], keyText: [], cte: s.cte, kind: lexdb_sql.COLL_EXACT}
     if len(sp.sel.q.refs) > 0 && s.use != lexdb_sql.SUB_FROM { hashSub(mut &sp, sc.base) }
     return Ok(sp)
 }
@@ -5232,7 +5286,7 @@ fn runHashed(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sp: &SubPlan, pa
             } else {
                 var mk = newStrBuf()
                 mk.add(g)
-                keyPart(mut &mk, &r[nk])
+                keyPart(mut &mk, &collVal(sp.kind, &r[nk]))
                 out.set.put(mk.toStr(), 1)
             }
         }
@@ -5497,7 +5551,7 @@ fn runSub(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sp: &SubPlan, param
                 out.hasNull = true
                 continue
             }
-            match setKey(&r[0], out.numeric) {
+            match setKey(&collVal(sp.kind, &r[0]), out.numeric) {
                 Some(k) {
                     if out.set.get(&k).isNone() && len(out.vals) <= IN_LOOKUP_MAX { append(mut &out.vals, r[0]) }
                     out.set.put(k, 1)
@@ -5912,7 +5966,8 @@ fn checkUnique(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, ix:
             let none: Option[lexdb_sql.TypeName] = None
             append(mut &names, pgExprText(&ix.exprs[k], &none))
         }
-        append(mut &vals, text(&(try idxVal(t, ix, k, row))))
+        // the value as written, not its key (L2)
+        append(mut &vals, text(&(if c >= 0 { row[c] } else { try idxVal(t, ix, k, row) })))
     }
     return Err(e("23505", "duplicate key value violates unique constraint \"" + lexdb_sql.baseName(&ix.name) + "\": Key (" +
                  strings.join(&names, ", ") + ")=(" + strings.join(&vals, ", ") + ") already exists."))
@@ -8937,9 +8992,14 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             let d = try mergeWin(&w, &s.windows, 0)
             var r = lexdb_sql.WinDef{call: try resolve(&d.call, &q.cols, len(q.cols), sc), ref: "", bare: false, part: [], order: [],
                                      frame: cloneFrame(&d.frame)}
-            for x in d.part { append(mut &r.part, try resolve(&x, &q.cols, len(q.cols), sc)) }
+            // partitions and the window's order under their collations (L2): by keys
+            for x in d.part {
+                let rx = try resolve(&x, &q.cols, len(q.cols), sc)
+                append(mut &r.part, collKeyOf(exprKind(&rx, &q.cols, sc), rx))
+            }
             for o in d.order {
-                append(mut &r.order, lexdb_sql.WinOrder{expr: try resolve(&o.expr, &q.cols, len(q.cols), sc), desc: o.desc, nullsFirst: o.nullsFirst})
+                let ro = try resolve(&o.expr, &q.cols, len(q.cols), sc)
+                append(mut &r.order, lexdb_sql.WinOrder{expr: collKeyOf(exprKind(&ro, &q.cols, sc), ro), desc: o.desc, nullsFirst: o.nullsFirst})
             }
             var inDef = false
             for x in r.part { if hasWin(&x) { inDef = true } }
@@ -15634,24 +15694,124 @@ fn jsonText(v: &Val): str {
 
 // ---- collations (design/lexdb-tds.md L2)
 
-// The key of a text under a case-insensitive collation: equal for texts
-// the collation holds equal, in their order. Case folded (each code point
-// the lower case of its upper case: so the Kelvin sign is k, a long s is
-// s), trailing spaces dropped (SQL Server's padding).
+// The key of a text under SQL Server's default collation (L2): equal for
+// texts it holds equal, in its order, byte by byte. From lexdb_sqlcoll's
+// table (generated from SQL Server): a combining mark after a letter
+// composed with it where there is one letter for both; trailing spaces and
+// ignored characters dropped; then each letter's primary weight (3 bytes;
+// an expansion, as ae for ae's ligature, two), 0 0 0, each letter's
+// secondary weight (its accent: 2 bytes; a combining mark left over adds
+// to its letter's), and each hyphen-like mark: how many letters before it
+// (2 bytes), its weight. Case is in none of them.
 pub fn ciKey(s: &str): str {
-    var end = len(s)
-    while end > 0 && s[end - 1] == ' ' { end -= 1 }
-    var ascii = true
-    for i in 0..end { if s[i] >= 128 { ascii = false } }
-    if ascii { return strings.toLowerAscii(&s[0..end]) }
-    var b = newStrBuf()
+    var cps: []int = []
     var i = 0
-    while i < end {
+    while i < len(s) {
         let d = strings.decodeAt(s, i)
-        strings.addRune(mut &b, unicode.lower(unicode.upper(d.rune)))
         i += d.size
+        let r = d.rune
+        let n = len(cps)
+        if n > 0 && collClass(collAt(r)) == 2 {
+            let c = collCompose(cps[n - 1], r)
+            if c >= 0 && collClass(collAt(c)) == 1 {
+                cps[n - 1] = c
+                continue
+            }
+        }
+        append(mut &cps, r)
     }
-    return b.toStr()
+    while len(cps) > 0 && (cps[len(cps) - 1] == 32 || collClass(collAt(cps[len(cps) - 1])) == 0) { let x = pop(mut &cps) }
+    var prim = newStrBuf()
+    var sec: []int = []
+    var spec = newStrBuf()
+    for cp in cps {
+        let v = collAt(cp)
+        let k = collClass(v)
+        if k == 0 { continue }
+        if k == 2 {
+            if len(sec) > 0 { sec[len(sec) - 1] += 1000 + (v & 0xFFFFFF) }
+            continue
+        }
+        if k == 3 {
+            binary.addU16BE(mut &spec, len(sec))
+            spec.addByte(byte(v & 0xFF))
+            continue
+        }
+        let e = collExpansion(cp)
+        if e >= 0 {
+            let at = int(lexdb_sqlcoll.EXP_AT[e])
+            for j in 0..int(lexdb_sqlcoll.EXP_N[e]) {
+                let el = int(lexdb_sqlcoll.EXP_EL[at + j])
+                addU24(mut &prim, el >> 8)
+                append(mut &sec, el & 0xFF)
+            }
+        } else if v < 0 {
+            addU24(mut &prim, (1 << 20) + cp)       // not in the table: after all of it
+            append(mut &sec, 0)
+        } else {
+            addU24(mut &prim, (v >> 8) & 0xFFFF)
+            append(mut &sec, v & 0xFF)
+        }
+    }
+    addU24(mut &prim, 0)
+    for x in sec { binary.addU16BE(mut &prim, x + 1) }
+    prim.add(spec.toStr())
+    return prim.toStr()
+}
+
+fn addU24(b: mut &StrBuf, x: int) {
+    b.addByte(byte((x >> 16) & 0xFF))
+    b.addByte(byte((x >> 8) & 0xFF))
+    b.addByte(byte(x & 0xFF))
+}
+
+// A code point's value in lexdb_sqlcoll's table (kind << 24 | data), -1
+// if it is in none of its runs.
+fn collAt(cp: int): int {
+    if cp >= 0 && cp < 128 { return int(lexdb_sqlcoll.ASCII[cp]) }
+    var lo = 0
+    var hi = len(lexdb_sqlcoll.RUN_START)
+    while lo < hi {
+        let m = (lo + hi) / 2
+        if int(lexdb_sqlcoll.RUN_START[m]) <= cp { lo = m + 1 } else { hi = m }
+    }
+    let i = lo - 1
+    if i < 0 { return -1 }
+    let st = int(lexdb_sqlcoll.RUN_START[i])
+    if cp >= st + int(lexdb_sqlcoll.RUN_LEN[i]) { return -1 }
+    return int(lexdb_sqlcoll.RUN_VAL[i]) + (cp - st) * int(lexdb_sqlcoll.RUN_STEP[i])
+}
+
+// Its kind: 0 ignored, 1 a letter (one not in the table too), 2 a
+// combining mark, 3 hyphen-like.
+fn collClass(v: int): int { return if v < 0 { 1 } else { v >> 24 } }
+
+// The letter a letter and a combining mark make, -1 none.
+fn collCompose(base: int, mark: int): int {
+    var lo = 0
+    var hi = len(lexdb_sqlcoll.COMP_BASE)
+    while lo < hi {
+        let m = (lo + hi) / 2
+        let b = int(lexdb_sqlcoll.COMP_BASE[m])
+        let k = int(lexdb_sqlcoll.COMP_MARK[m])
+        if b < base || (b == base && k < mark) { lo = m + 1 } else { hi = m }
+    }
+    if lo < len(lexdb_sqlcoll.COMP_BASE) && int(lexdb_sqlcoll.COMP_BASE[lo]) == base && int(lexdb_sqlcoll.COMP_MARK[lo]) == mark {
+        return int(lexdb_sqlcoll.COMP_TO[lo])
+    }
+    return -1
+}
+
+// An expansion's number, -1 if cp is none.
+fn collExpansion(cp: int): int {
+    var lo = 0
+    var hi = len(lexdb_sqlcoll.EXP_CP)
+    while lo < hi {
+        let m = (lo + hi) / 2
+        if int(lexdb_sqlcoll.EXP_CP[m]) < cp { lo = m + 1 } else { hi = m }
+    }
+    if lo < len(lexdb_sqlcoll.EXP_CP) && int(lexdb_sqlcoll.EXP_CP[lo]) == cp { return lo }
+    return -1
 }
 
 // A text's key under SQL Server's case-sensitive collations: its trailing
@@ -15690,7 +15850,7 @@ fn ciVal(v: &Val): Val {
 fn callMisc(name: &str, vs: &[]Val): Result[Option[Val], DbErr] {
     let n = len(vs)
     // x COLLATE name: x (its collation used when planned); #ci(x): its key
-    if name == "#collate" && n == 2 { return Ok(Some(vs[0])) }
+    if (name == "#collate" || name == "#coll") && n == 2 { return Ok(Some(vs[0])) }
     if name == "#ci" && n == 1 { return Ok(Some(ciVal(&vs[0]))) }
     if name == "#pad" && n == 1 {
         match vs[0] {
