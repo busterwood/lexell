@@ -41,9 +41,9 @@ primary-key statistics (24); the join order bound by keys (25) and by cost
 review's fixes with filter and range estimates (29); the search to 24
 tables (30); the integration with lexdb 9.94 (31); ORDER BY ... LIMIT read
 in order (32); the second review's fixes (33); a workload comparison (34);
-the fast path for pinned joins (35); and the read costs measured and
-calibrated (36, uncommitted). Code comments cite these sections as
-"optimizer N".
+the fast path for pinned joins (35); the read costs measured and
+calibrated (36); and ANALYZE's samples, the rest of SQLite's stat4 (37,
+uncommitted). Code comments cite these sections as "optimizer N".
 
 ## 1. Summary
 
@@ -2034,6 +2034,89 @@ the break-even near 1/40 of the table. The switch applies in both planner
 modes and without statistics, so the change is left for the user to decide.
 
 **Checked:** the suite, 92 of 92; the random differential sets, 6,616
+joins, 0 differences.
+
+## 37. Samples: the rest of SQLite's stat4 (2026-11-12)
+
+The user's request. SQLite with STAT4 keeps, per index, about 24 sample keys
+with the rows below and equal to each (`sqlite_stat4`). lexdb had the
+common values (section 23) and the leading column's least and greatest
+(section 29), but no samples, so a clustered or skewed column's ranges were
+estimated as if its values were spread evenly.
+
+**What ANALYZE keeps now**, per index and per primary key, for the leading
+column: up to `SAMPLES` (24) keys spread evenly over its rows not NULL, each
+with the rows below it and equal to it, and its number when the column is
+numeric (numbers, dates, times). It also keeps the count of rows not NULL.
+- For an index, the keys come from ANALYZE's existing count of the leading
+  values: sorted, one at each (k + 1/2)/24 of the rows. There are none when
+  that count stopped at its cap (100,000 values).
+- For a primary key, rows come in key order, so a sampler keeps every
+  stride-th run of equal leading values and doubles the stride when 48 are
+  kept. A single-column key gets samples too.
+They are stored in the statistics row as a seventh field per entry
+(`nn/hex~lt~eq[~number],...`). Older rows simply have none.
+
+**How a range uses them** (`Samp.below`, `Samp.rangeShare`). The rows below
+a bound are the sample's own counts when the bound is a sample. Otherwise
+they are the rows to the gap the bound falls in, plus part of the gap. For
+numbers and dates that part comes from the neighbouring samples' values,
+with the column's least and greatest at the ends. For other types it is a
+third of the gap for a lower bound and two thirds for an upper one
+(SQLite's rule), so a range inside one gap gets a third of it. Keys
+compare as encoded index parts, in the index's order, so text works too.
+Samples take precedence over min/max interpolation, which takes precedence
+over the 1/4 and 1/16 defaults. A bound must be a literal (a cast of one
+counts); a parameter is an unknown value, so plans still do not depend on
+parameters.
+
+**Where.** The join model's range shares (`rangeShare`, `boundsShare`), and
+now also a single table's path figure (`pathFig`): a range on a leading
+column with literal bounds is an estimate, not "at most" the table. So the
+rules' "a range only when its bound beats the others" (section 24) now
+holds only where there are no samples.
+
+**Tested** (`exec_samples`): 20,000 rows, 90% dated in one month.
+
+| Range | Estimated | Actual |
+|---|---|---|
+| the clustered month | 18,175 | 18,165 |
+| a month outside the cluster | 159 | 137 |
+| after 1 December | 135 | 135 |
+| a text range (`name >= 'n5' and name < 'n6'`) | 1,933 | 2,220 |
+| `id between 100 and 199` | 98 | 100 |
+
+With `kind = 1`, the outside month reads the date index (159 rows) and the
+clustered month the kind index (6,667 rather than 18,175). A join hashes the
+outside month through its index. Before the interpolation within gaps, a
+range inside one gap was estimated at 1 row: both bounds landed at the
+gap's middle. `exec_estimates` changed for the better: `c > 1990` is 10
+rows, exactly, so `a = 1 and b = 2 and c > 1990` reads `t_c` (10 rows), not
+`t_ab` (334).
+
+**Planning time.** The first version parsed every sample of every table at
+each planning: a point select went from 7 to 22 us, a 4-table join from 40
+to 99. Samples are now kept as text and parsed only when a range needs
+them. Measured (`plan_time.lxl`, us; "before" is the calibration commit on
+the same lexdb 9.95 base):
+
+| | Before | Now | Rules |
+|---|---|---|---|
+| point select | 8 | 9 | 7 |
+| 2 tables | 23 | 26 | 14 |
+| 4 tables | 40 | 45 | 22 |
+| 8 tables | 81 | 91 | 40 |
+
+What is left is splitting the longer statistics rows, about 1 to 1.5 us a
+table. Separately, the 9.95 base plans about 15 to 20% slower than 9.94 in
+both modes (rules, 4 tables: 22 us, was 18 to 19), and sections 31 to 35
+added a few microseconds of checks in cost mode.
+
+**ANALYZE** on the workload (1.1 million rows): 604 ms, as before. **The
+workload** is unchanged (cost 0.39 s, rules 6.1 s); its ranges were already
+well estimated by min and max, its dates being spread evenly.
+
+**Checked:** the suite, 96 of 96; the random differential sets, 6,616
 joins, 0 differences.
 
 ## Sources

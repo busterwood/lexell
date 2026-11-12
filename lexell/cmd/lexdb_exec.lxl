@@ -3544,7 +3544,7 @@ fn loadEst(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, join: b
     let v = got.unwrap()
     let parts = strings.split(&v, ";")
     if len(parts) < 2 || strings.parseIntOpt(parts[0].toStr()).unwrapOr(-1) != t.tree { return Ok(noEst()) }
-    var es = Est{rows: strings.parseIntOpt(parts[1].toStr()).unwrapOr(-1), trees: [], entries: [], dist: [], cm: [], lo: [], hi: [], span: []}
+    var es = Est{rows: strings.parseIntOpt(parts[1].toStr()).unwrapOr(-1), trees: [], entries: [], dist: [], cm: [], lo: [], hi: [], span: [], samp: []}
     for i in 2..len(parts) {
         let f = strings.split(parts[i], ":")
         if len(f) < 3 { continue }
@@ -3586,6 +3586,9 @@ fn loadEst(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, join: b
         append(mut &es.lo, lo)
         append(mut &es.hi, hi)
         append(mut &es.span, span)
+        // the samples as text, parsed only when a range needs them (most
+        // plannings do not: optimizer 37)
+        append(mut &es.samp, if len(f) >= 7 { f[6].toStr() } else { "" })
     }
     return Ok(es)
 }
@@ -3656,10 +3659,177 @@ fn spanNum(v: &Val): Option[float] {
 }
 
 // An entry's least and greatest leading values, ":min:max" when they were
-// all numbers (n > 0), else "".
+// all numbers (n > 0), else "::" (the fields kept, so the samples' follow).
 fn spanText(n: int, lo: float, hi: float): str {
-    if n <= 0 { return "" }
+    if n <= 0 { return "::" }
     return ":" + lexdb_float.fmt8(lo) + ":" + lexdb_float.fmt8(hi)
+}
+
+// ---- samples (optimizer 37), the rest of SQLite's stat4: per index and
+// primary key, up to SAMPLES keys of the leading column spread evenly over
+// its rows, each with the rows below it and equal to it, and the rows not
+// NULL. A range's rows are counted from them: the samples it covers whole,
+// and half of each gap it ends in (SQLite's); so a range of skewed or
+// clustered values is estimated as it is, any type (keys compare as their
+// encoded index parts, in the index's order).
+
+const SAMPLES: int = 24
+
+// nums: the keys as numbers when the column's are (numeric), for
+// interpolating within a gap.
+type Samp = record { nn: int; keys: []str; lt: []int; eq: []int; nums: []float; numeric: bool }
+
+fn noSamp(): Samp { return Samp{nn: 0, keys: [], lt: [], eq: [], nums: [], numeric: false} }
+
+// The primary key's sampler: its leading values come in order, a run each;
+// every stride-th run is kept, the stride doubling (every other one
+// dropped) when 2 x SAMPLES are kept.
+type Sampler = record { keys: []str; lt: []int; eq: []int; nums: []float; stride: int; runs: int }
+
+fn newSampler(): Sampler { return Sampler{keys: [], lt: [], eq: [], nums: [], stride: 1, runs: 0} }
+
+fn (sp: mut &Sampler) add(key: &str, lt: int, eq: int, num: float) {
+    if sp.runs % sp.stride == 0 {
+        append(mut &sp.keys, key.toStr())
+        append(mut &sp.lt, lt)
+        append(mut &sp.eq, eq)
+        append(mut &sp.nums, num)
+        if len(sp.keys) > 2 * SAMPLES {
+            var k: []str = []
+            var l: []int = []
+            var q: []int = []
+            var u: []float = []
+            for i in 0..len(sp.keys) {
+                if i % 2 == 0 {
+                    append(mut &k, replace(mut &sp.keys[i], ""))
+                    append(mut &l, sp.lt[i])
+                    append(mut &q, sp.eq[i])
+                    append(mut &u, sp.nums[i])
+                }
+            }
+            sp.keys = k
+            sp.lt = l
+            sp.eq = q
+            sp.nums = u
+            sp.stride = sp.stride * 2
+        }
+    }
+    sp.runs += 1
+}
+
+fn (sp: mut &Sampler) done(rows: int, numeric: bool): Samp {
+    return Samp{nn: rows, keys: replace(mut &sp.keys, []), lt: replace(mut &sp.lt, []), eq: replace(mut &sp.eq, []),
+                nums: replace(mut &sp.nums, []), numeric: numeric}
+}
+
+// An index's samples from ANALYZE's count of its leading values (none when
+// the count stopped at ANALYZE_DISTINCT_MAX): the key holding each
+// (k + 1/2) / SAMPLES of its rows not NULL.
+fn mapSamples(m: &Map[str, int], vm: &Map[str, float], numeric: bool): Samp {
+    if m.size() >= ANALYZE_DISTINCT_MAX { return noSamp() }
+    var nb = newStrBuf()
+    encIdxPart(mut &nb, &Val.Null)
+    let nullKey = nb.toStr()
+    var keys: []str = []
+    for x in 0..m.size() {
+        let k = m.keyAt(x).toStr()
+        if k != nullKey { append(mut &keys, k) }
+    }
+    collections.sortBy(mut &keys, fn(a: &str, b: &str): int { return a.cmp(b) })
+    var nn = 0
+    for k in keys { nn += m.getOr(&k, 0) }
+    var out = Samp{nn: nn, keys: [], lt: [], eq: [], nums: [], numeric: numeric}
+    if nn == 0 { return out }
+    var lt = 0
+    var next = 0
+    for k in keys {
+        let c = m.getOr(&k, 0)
+        var took = false
+        while next < SAMPLES && float(lt + c) > (float(next) + 0.5f) * float(nn) / float(SAMPLES) {
+            if !took {
+                append(mut &out.keys, k.toStr())
+                append(mut &out.lt, lt)
+                append(mut &out.eq, c)
+                append(mut &out.nums, vm.getOr(&k, 0.0f))
+                took = true
+            }
+            next += 1
+        }
+        lt += c
+    }
+    return out
+}
+
+// "nn/hex~lt~eq[~number],..." ("" none; the numbers when numeric).
+fn sampText(sp: &Samp): str {
+    if len(sp.keys) == 0 { return "" }
+    var parts: []str = []
+    for i in 0..len(sp.keys) {
+        append(mut &parts, toHex(&sp.keys[i]) + "~" + sp.lt[i].toStr() + "~" + sp.eq[i].toStr() +
+                          (if sp.numeric { "~" + lexdb_float.fmt8(sp.nums[i]) } else { "" }))
+    }
+    return sp.nn.toStr() + "/" + strings.join(&parts, ",")
+}
+
+fn parseSamp(t: &str): Samp {
+    let sl = strings.indexOf(t, "/", 0)
+    if sl < 0 { return noSamp() }
+    var out = Samp{nn: strings.parseIntOpt(t[0..sl].toStr()).unwrapOr(0), keys: [], lt: [], eq: [], nums: [], numeric: true}
+    for part in strings.split(&t[sl + 1..len(t)], ",") {
+        let f = strings.split(part, "~")
+        if len(f) < 3 { continue }
+        append(mut &out.keys, fromHex(&f[0]))
+        append(mut &out.lt, strings.parseIntOpt(f[1].toStr()).unwrapOr(0))
+        append(mut &out.eq, strings.parseIntOpt(f[2].toStr()).unwrapOr(0))
+        var x = 0.0f
+        if len(f) >= 4 {
+            match math.parse(f[3].toStr()) {
+                Some(v) { x = v }
+                None { out.numeric = false }
+            }
+        } else {
+            out.numeric = false
+        }
+        append(mut &out.nums, x)
+    }
+    return out
+}
+
+// The rows below key (an encoded leading part, num its number when has),
+// and equal to it when incl: a sample's own counts when key is one; else the
+// rows to the gap it falls in and a part of the gap: by the numbers when the
+// samples have them (the gap's ends the samples', or the column's least and
+// greatest, span), else 1/3 for a lower bound and 2/3 for an upper one
+// (SQLite's).
+fn (sp: &Samp) below(key: &str, num: float, has: bool, incl: bool, upper: bool, span: bool, mn: float, mx: float): float {
+    var at = -1
+    for i in 0..len(sp.keys) { if sp.keys[i] <= key { at = i } }
+    if at >= 0 && sp.keys[at] == key { return float(sp.lt[at] + (if incl { sp.eq[at] } else { 0 })) }
+    let from = if at >= 0 { sp.lt[at] + sp.eq[at] } else { 0 }
+    let to = if at + 1 < len(sp.keys) { sp.lt[at + 1] } else { sp.nn }
+    var frac = if upper { 2.0f / 3.0f } else { 1.0f / 3.0f }
+    if sp.numeric && has {
+        let a = if at >= 0 { sp.nums[at] } else if span { mn } else { num }
+        let b = if at + 1 < len(sp.keys) { sp.nums[at + 1] } else if span { mx } else { num }
+        if b > a {
+            frac = (num - a) / (b - a)
+            if frac < 0.0f { frac = 0.0f }
+            if frac > 1.0f { frac = 1.0f }
+        }
+    }
+    return float(from) + float(to - from) * frac
+}
+
+// The share of the entries (entries) between a range's bounds (lower ">"
+// or ">=", upper "<" or "<=", keys their encoded parts) by the samples; -1
+// when there are none.
+fn (sp: &Samp) rangeShare(hasLo: bool, loKey: &str, loNum: float, loIncl: bool, hasHi: bool, hiKey: &str, hiNum: float, hiIncl: bool,
+                          nums: bool, span: bool, mn: float, mx: float, entries: int): float {
+    if len(sp.keys) == 0 || entries <= 0 { return -1.0f }
+    let a = if hasLo { sp.below(loKey, loNum, nums, !loIncl, false, span, mn, mx) } else { 0.0f }
+    let b = if hasHi { sp.below(hiKey, hiNum, nums, hiIncl, true, span, mn, mx) } else { float(sp.nn) }
+    let r = if b > a { b - a } else { 0.0f }
+    return fmax(r, 1.0f) / float(entries)
 }
 
 // Distinct values counted per prefix at most: past it the count stays here, a
@@ -3700,6 +3870,7 @@ fn analyzeTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, snap: mut &le
     var mins: []float = []
     var maxs: []float = []
     var nums: []int = []                // per index: values counted as numbers; -1 one was not a number
+    var keyNums: []Map[str, float] = [] // per index: its leading keys' numbers, for the samples (optimizer 37)
     for ix in t.indexes {
         var ms: []Map[str, int] = []
         for j in 0..len(ix.cols) { append(mut &ms, newMap()) }
@@ -3708,6 +3879,7 @@ fn analyzeTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, snap: mut &le
         append(mut &mins, 0.0f)
         append(mut &maxs, 0.0f)
         append(mut &nums, 0)
+        append(mut &keyNums, newMap())
     }
     var pkMin = 0.0f
     var pkMax = 0.0f
@@ -3724,6 +3896,9 @@ fn analyzeTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, snap: mut &le
     var pkDist: []int = array(pkn, 0)
     var run = 0
     var runKey = ""
+    var runLt = 0                       // the rows before the run (optimizer 37)
+    var runNum = 0.0f                   // its leading value as a number
+    var pkSamp = newSampler()
     var pkKeys: []str = []
     var pkCnts: []int = []
     var cur = newCursor()
@@ -3742,8 +3917,11 @@ fn analyzeTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, snap: mut &le
                     if changed || k != pkPrev[j] {
                         if j == 0 && rows > 1 {
                             if pkn >= 2 { keepCommon(mut &pkKeys, mut &pkCnts, &runKey, run) }
+                            pkSamp.add(&runKey, runLt, run, runNum)
+                            runLt = rows - 1
                             run = 0
                         }
+                        if j == 0 { runNum = spanNum(&r[t.pk[0]]).unwrapOr(0.0f) }
                         if j == 0 { runKey = k.toStr() }
                         changed = true
                         pkDist[j] += 1
@@ -3765,6 +3943,8 @@ fn analyzeTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, snap: mut &le
             for i in 0..len(t.indexes) {
                 if !(try inIndex(t, &t.indexes[i], &r)) { continue }
                 entries[i] += 1
+                var lnum = 0.0f
+                var lhas = false
                 if nums[i] >= 0 && len(t.indexes[i].cols) > 0 {
                     let lv0 = try idxVal(t, &t.indexes[i], 0, &r)
                     match spanNum(&lv0) {
@@ -3772,6 +3952,8 @@ fn analyzeTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, snap: mut &le
                             if nums[i] == 0 || x < mins[i] { mins[i] = x }
                             if nums[i] == 0 || x > maxs[i] { maxs[i] = x }
                             nums[i] += 1
+                            lnum = x
+                            lhas = true
                         }
                         None { if !isNull(&lv0) { nums[i] = -1 } }
                     }
@@ -3782,7 +3964,10 @@ fn analyzeTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, snap: mut &le
                     let k = b.toStr()
                     // the leading column's values are counted (its common values, optimizer 23)
                     let n = if j == 0 { seen[i][j].getOr(&k, 0) } else { 0 }
-                    if n > 0 || seen[i][j].size() < ANALYZE_DISTINCT_MAX { seen[i][j].put(k, n + 1) }
+                    if n > 0 || seen[i][j].size() < ANALYZE_DISTINCT_MAX {
+                        if j == 0 && n == 0 && lhas { keyNums[i].put(k.toStr(), lnum) }
+                        seen[i][j].put(k, n + 1)
+                    }
                 }
             }
         }
@@ -3792,13 +3977,14 @@ fn analyzeTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, snap: mut &le
     if pkn > 0 {
         // the primary key's, under the table's tree
         if rows > 0 && pkn >= 2 { keepCommon(mut &pkKeys, mut &pkCnts, &runKey, run) }
+        if rows > 0 { pkSamp.add(&runKey, runLt, run, runNum) }
         var ds: []str = []
         for d in pkDist { append(mut &ds, d.toStr()) }
         out.add(";" + t.tree.toStr() + ":" + rows.toStr() + ":" + strings.join(&ds, ","))
         let avg = if pkDist[0] > 0 { rows / pkDist[0] } else { 0 }
         var parts: []str = []
         for x in 0..len(pkKeys) { if pkCnts[x] > avg { append(mut &parts, toHex(&pkKeys[x]) + "=" + pkCnts[x].toStr()) } }
-        out.add(":" + strings.join(&parts, ",") + spanText(pkNums, pkMin, pkMax))
+        out.add(":" + strings.join(&parts, ",") + spanText(pkNums, pkMin, pkMax) + ":" + sampText(&pkSamp.done(rows, pkNums > 0)))
     }
     for i in 0..len(t.indexes) {
         var ds: []str = []
@@ -3818,9 +4004,9 @@ fn analyzeTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, snap: mut &le
             }
             var parts: []str = []
             for x in 0..len(keys) { append(mut &parts, toHex(&keys[x]) + "=" + cnts[x].toStr()) }
-            out.add(":" + strings.join(&parts, ",") + spanText(nums[i], mins[i], maxs[i]))
+            out.add(":" + strings.join(&parts, ",") + spanText(nums[i], mins[i], maxs[i]) + ":" + sampText(&mapSamples(m, &keyNums[i], nums[i] > 0)))
         } else {
-            out.add(":")
+            out.add(":" + spanText(0, 0.0f, 0.0f) + ":")
         }
     }
     try txn.put(CATALOG, statKey(&t.name), out.toStr())
@@ -4126,9 +4312,9 @@ const IN_LOOKUP_MAX: int = 1000
 // columns (a NULL counted as a value), and its leading column's most common
 // values (cm, optimizer 23). rows -1: none (no ANALYZE, an ANALYZE of an older table
 // of the name, or SET lexdb_planner = rules).
-type Est = record { rows: int; trees: []int; entries: []int; dist: [][]int; cm: []Common; lo: []float; hi: []float; span: []bool }
+type Est = record { rows: int; trees: []int; entries: []int; dist: [][]int; cm: []Common; lo: []float; hi: []float; span: []bool; samp: []str }
 
-fn noEst(): Est { return Est{rows: -1, trees: [], entries: [], dist: [], cm: [], lo: [], hi: [], span: []} }
+fn noEst(): Est { return Est{rows: -1, trees: [], entries: [], dist: [], cm: [], lo: [], hi: [], span: [], samp: []} }
 
 // An index's leading column (optimizer 23): its entries, its distinct values, and its
 // most common values (their encoded index parts) with their exact counts:
@@ -4284,8 +4470,80 @@ fn pathFig(lv: &Level, p: &Path, params: &[]Val): Fig {
         if n < pre { return Fig{rows: n, bound: false} }
         return Fig{rows: pre, bound: true}
     }
+    if ne == 0 && len(p.rng) > 0 && len(cols) > 0 && cols[0] >= 0 {
+        // a range of the leading column: by its samples, when its bounds are
+        // literals (optimizer 37); else only bounded
+        let e = q0LeadEntry(lv, cols[0])
+        if e >= 0 && len(lv.est.samp[e]) > 0 {
+            var ops: []str = []
+            var vals: []Expr = []
+            for b in p.rng {
+                if b.op == "<" || b.op == "<=" || b.op == ">" || b.op == ">=" {
+                    append(mut &ops, b.op)
+                    append(mut &vals, clone(&b.val))
+                }
+            }
+            if len(ops) == len(p.rng) {
+                let sh = sampOnly(lv, e, cols[0], &ops, &vals)
+                if sh >= 0.0f { return Fig{rows: int(fmax(sh * float(lv.est.entries[e]), 1.0f)), bound: false} }
+            }
+        }
+    }
     if p.inSub >= 0 || len(p.inArr) > 0 || len(p.rng) > 0 { return Fig{rows: pre, bound: true} }
     return Fig{rows: pre, bound: false}
+}
+
+// leadEntry for a level outside a Query (pathFig's).
+fn q0LeadEntry(lv: &Level, col: int): int {
+    for c0 in 0..len(lv.t.indexes) + 1 {
+        let c = c0 - 1
+        if c >= 0 && lv.t.indexes[c].pred.isSome() { continue }
+        let cols = keyCols(&lv.t, c)
+        if len(cols) == 0 || cols[0] != col { continue }
+        let tree = if c < 0 { lv.t.tree } else { lv.t.indexes[c].tree }
+        for j in 0..len(lv.est.trees) { if lv.est.trees[j] == tree { return j } }
+    }
+    return -1
+}
+
+// A range's share by entry e's samples alone (literal bounds); -1 none.
+fn sampOnly(lv: &Level, e: int, col: int, ops: &[]str, vals: &[]Expr): float {
+    let typ = boundType(&lv.t.cols[col].typ)
+    let noParams: []Val = []
+    var hasLo = false
+    var hasHi = false
+    var loKey = ""
+    var hiKey = ""
+    var loIncl = false
+    var hiIncl = false
+    var loNum = 0.0f
+    var hiNum = 0.0f
+    var nums = true
+    for i in 0..len(ops) {
+        let key = constKey(&vals[i], &typ, &noParams)
+        if len(key) == 0 { return -1.0f }
+        let xn = litNumOf(lv, col, &vals[i])
+        if xn.isNone() { nums = false }
+        let x = xn.unwrapOr(0.0f)
+        if ops[i] == ">" || ops[i] == ">=" {
+            if !hasLo || key > loKey || (key == loKey && ops[i] == ">") {
+                loKey = key
+                loIncl = ops[i] == ">="
+                loNum = x
+            }
+            hasLo = true
+        } else {
+            if !hasHi || key < hiKey || (key == hiKey && ops[i] == "<") {
+                hiKey = key
+                hiIncl = ops[i] == "<="
+                hiNum = x
+            }
+            hasHi = true
+        }
+    }
+    if len(lv.est.samp[e]) == 0 { return -1.0f }
+    return parseSamp(&lv.est.samp[e]).rangeShare(hasLo, &loKey, loNum, loIncl, hasHi, &hiKey, hiNum, hiIncl, nums,
+                                     lv.est.span[e], lv.est.lo[e], lv.est.hi[e], lv.est.entries[e])
 }
 
 // A path's figure for EXPLAIN: none for a whole-key lookup (one row, by the
@@ -5478,11 +5736,13 @@ fn (q: &Query) leadEntry(k: int, col: int): int {
 
 // A literal as a number of column col's type; None: not a literal (a cast
 // of one counts: date '2021-06-01', optimizer 36), or not a number.
-fn (q: &Query) litNum(k: int, col: int, x: &Expr): Option[float] {
+fn (q: &Query) litNum(k: int, col: int, x: &Expr): Option[float] { return litNumOf(&q.levels[k], col, x) }
+
+fn litNumOf(lv: &Level, col: int, x: &Expr): Option[float] {
     match litValue(x) {
         Some(v) {
             if isNull(&v) { return None }
-            match coerce(v, &boundType(&q.levels[k].t.cols[col].typ)) {
+            match coerce(v, &boundType(&lv.t.cols[col].typ)) {
                 Ok(cv) { return spanNum(&cv) }
                 Err(_) { return None }
             }
@@ -5551,23 +5811,39 @@ fn (q: &Query) colCmp(name: &str, x: &Expr, val: mut &Expr): str {
 }
 
 // The share of level k's rows its range conditions on column col keep (1:
-// none).
+// none). By the samples of the column when it leads the primary key or an
+// index and the bounds are literals (optimizer 37); else by its least and
+// greatest (optimizer 29); else 1/4, 1/16 bounded on both sides.
 fn (q: &Query) rangeShare(k: int, col: int, cs: &[]Expr): float {
     let lv = &q.levels[k]
     let name = lv.alias + "." + lv.t.cols[col].name
+    var ops: []str = []
+    var vals: []Expr = []
+    for c in cs {
+        var v = Expr.Lit(Val.Null)
+        let op = q.colCmp(&name, &c, mut &v)
+        if op != "<" && op != "<=" && op != ">" && op != ">=" { continue }
+        append(mut &ops, op)
+        append(mut &vals, v)
+    }
+    if len(ops) == 0 { return 1.0f }
+    return q.boundsShare(k, col, &ops, &vals)
+}
+
+// The share of level k's rows within bounds (ops: "<", "<=", ">", ">=") on
+// its column col.
+fn (q: &Query) boundsShare(k: int, col: int, ops: &[]str, vals: &[]Expr): float {
+    let lv = &q.levels[k]
     var hasLo = false
     var hasHi = false
     var known = true
     var lo = 0.0f
     var hi = 0.0f
-    for c in cs {
-        var v = Expr.Lit(Val.Null)
-        let op = q.colCmp(&name, &c, mut &v)
-        if op != "<" && op != "<=" && op != ">" && op != ">=" { continue }
-        let x = q.litNum(k, col, &v)
+    for i in 0..len(ops) {
+        let x = q.litNum(k, col, &vals[i])
         if x.isNone() { known = false }
         let f = x.unwrapOr(0.0f)
-        if op == ">" || op == ">=" {
+        if ops[i] == ">" || ops[i] == ">=" {
             if !hasLo || f > lo { lo = f }
             hasLo = true
         } else {
@@ -5575,9 +5851,12 @@ fn (q: &Query) rangeShare(k: int, col: int, cs: &[]Expr): float {
             hasHi = true
         }
     }
-    if !hasLo && !hasHi { return 1.0f }
     let e = q.leadEntry(k, col)
     let t = fmax(float(lv.est.rows), 1.0f)
+    if e >= 0 && e < len(lv.est.samp) {
+        let sh = sampOnly(lv, e, col, ops, vals)
+        if sh >= 0.0f { return fmax(sh, 1.0f / t) }
+    }
     if known && e >= 0 && lv.est.span[e] {
         let mn = lv.est.lo[e]
         let mx = lv.est.hi[e]
