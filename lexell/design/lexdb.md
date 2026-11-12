@@ -8723,11 +8723,71 @@ This is the general form.
   - Probes: 290 by the integer map, 1,812 by the general key.
   - 42 batches fell back, for errors.
 
-**Not measured yet:** the speed. Benchmarks wait for the user's go-ahead.
+**Made faster after the first measurement:**
+- **One text key** (a text or varchar column under no collation, its value
+  a text or varchar column's) gets its own map, from the text to a
+  bucket. That replaces `keyVal`, `coerce` and the key's encoding per row.
+- **Only the columns used are gathered** (`jpFinish`). Each table's
+  candidates get the columns its conditions use, plus those used after it
+  (the outputs, the aggregates, or every column for `emit`). A column
+  nothing after uses is not copied from batch to batch, so its value is
+  not counted up and down.
+- **Inner joins where every candidate joins:** the candidates are the
+  result, with no second gather.
+- **Conditions the hash has already applied are not run again:**
+  - those on the joined table's own columns (`materialize` kept only the
+    rows they hold for);
+  - with a key in its own map (integer or text), the key's equality.
+- **GROUP BY one text or varchar column** (in `batchGroups`, joined or
+  not) groups by the text, not by its encoded key.
+
+**Measured.** The tables are `w` (1M rows: id, 3 integers, 3 texts,
+numeric, boolean; an index on `b`), `d` (1,000 rows), `t` (1M rows), and
+`cr` (20 cities, text, not a key: `cr.city = w.city` is a text-keyed hash
+join). Each query went to psql (`-A -t`, to /dev/null), median of three,
+wall ms with server CPU ms in brackets. PostgreSQL 18.6 was on the same
+machine with `shared_buffers=1GB`; its CPU is counted in 10 ms steps.
+
+| query | rows | before (c66474b0) | now | PG one core | PG parallel |
+|---|---|---|---|---|---|
+| `select id, code from t` | 1M | 256 (200) | 150 (95) | 141 (90) | 142 (80) |
+| `select id, b, name from w` | 1M | 446 (364) | 216 (132) | 212 (120) | 211 (130) |
+| `select * from w` | 1M | 1041 (783) | 745 (489) | 524 (250) | 519 (250) |
+| `... where a < 10` | 103k | 116 (103) | 91 (78) | 59 (50) | 59 (50) |
+| `select id, a + b, c % 1000 from w` | 1M | 632 (550) | 199 (117) | 212 (120) | 214 (130) |
+| pk range | 100k | 51 (38) | 28 (16) | 31 (20) | 31 (20) |
+| hash join (int), count and sum | 1 | 910 (904) | 57 (53) | 97 (110) | 43 (110) |
+| hash join (int), rows | 103k | 595 (584) | 63 (53) | 64 (60) | 64 (60) |
+| hash join (int), rows sorted | 103k | 933 (919) | 389 (378) | 109 (100) | 60 (120) |
+| hash join (text), count and sum | 1 | 795 (788) | 117 (112) | 86 (80) | 39 (100) |
+| hash join (text), rows | 150k | 644 (630) | 128 (116) | 87 (80) | 86 (80) |
+| hash join (text), GROUP BY text | 13 | 1107 (1097) | 210 (205) | 163 (160) | 65 (180) |
+| LEFT JOIN, key lookup per row | 200k | 319 (304) | 318 (303) | 55 (40) | 56 (40) |
+| join, key lookup per row, count | 1 | 1594 (1584) | 1590 (1580) | 78 (70) | 37 (90) |
+
+So, on one core:
+- **At or under PostgreSQL's time:**
+  - narrow scans to the client;
+  - integer expressions;
+  - a key range;
+  - an integer-keyed hash join, rows or aggregate (half PostgreSQL's
+    CPU).
+- **About 1.4 times PostgreSQL's time:** a text-keyed hash join.
+- **Still behind:**
+  - a wide row (`select *`, numeric's text and a value per text): 2 times;
+  - a selective filter (every column decoded before it): 1.5 times;
+  - a sort of the joined rows (the sort itself, not batched): 3.7 times;
+  - key lookups per row: 6 to 20 times. The planner chose them; they are
+    not batched.
+
+GROUP BY a text alone, `select city, count(*), avg(price) from w group
+by city`: 252 ms of CPU before (the agent's figure), 188 now, against
+PostgreSQL's 130.
 
 **Next:**
 - **Key lookups per row** (`f.x = d.k` against d's primary key) still take
-  the row path; they are the commonest join shape.
+  the row path; they are the commonest join shape (the last two rows
+  above).
   - **A batch of lookups:** it would remove the row machinery and keep
     the store's descent per key.
   - **The optimizer's costs:** batched hash joins are now much cheaper

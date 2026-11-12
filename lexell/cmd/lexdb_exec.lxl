@@ -19665,7 +19665,7 @@ fn fillBatch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, sc: &
 fn bRow(b: &Batch, r: int, kinds: &[]int, needCol: &[]bool): []Val {
     var out: []Val = array(len(kinds), Val.Null)
     for i in 0..len(kinds) {
-        if !needCol[i] || b.cols[i].nul[r] { continue }
+        if !needCol[i] || len(b.cols[i].nul) == 0 || b.cols[i].nul[r] { continue }
         let k = kinds[i]
         out[i] = if k == BK_INT { Val.Int(b.cols[i].v[r]) } else if k == BK_BOOL { Val.Bool(b.cols[i].v[r] == 1) } else { b.vals[i][r] }
     }
@@ -19914,6 +19914,7 @@ fn bChoose(conds: &[]BNode, b: &Batch): Option[[]int] {
 
 const JK_GEN = 0        // a join's key looked up as the row path does (keyVal, encIdxPart or keyPart, Mats.keys)
 const JK_INT = 1        // one integer key: in a map of its own
+const JK_TEXT = 2       // one text key (text or varchar, no collation): in a map of its own, by its text
 
 type JLevel = record {
     k: int
@@ -19923,16 +19924,22 @@ type JLevel = record {
     keyCol: []int           // ... the batch's column for a BT_OTHER (a column of values)
     mode: int
     ints: Map[int, int]     // JK_INT: key -> bucket
+    txts: Map[str, int]     // JK_TEXT
     conds: []BNode
     post: []BNode
     rows: Batch             // its rows (Mats.mat) as columns: by its table's column
     rkinds: []int
+    // the query's columns gathered (jpFinish): into its candidates (those
+    // its conditions and the rest of the query use), and after it
+    cand: []bool
+    after: []bool
 }
 
 type JPlan = record {
     levels: []JLevel
     kinds: []int            // per column of the query: BK_*
-    need: []bool            // per column of the query: in the joined batch (else NULL)
+    need: []bool            // per column of the query: read (else NULL)
+    first: []bool           // the first table's columns gathered (jpFinish)
 }
 
 // The joins after q's first level over batches (its plan: lp); None: one
@@ -19984,14 +19991,6 @@ fn bJoinPlan(st: &lexdb_store.Store, txn: &lexdb_store.Txn, q: &Query, m: &Mats,
             kinds[lv.first + i] = kd
             need[lv.first + i] = len(lv.need) == 0 || lv.need[i]
         }
-        var conds: []BNode = []
-        for x in lv.cond {
-            let c = bCompile(&x, q, &kinds, &env, 0)
-            if c.isNone() { return Ok(None) }
-            let cc = c.unwrap()
-            if !boolLike(cc.typ) { return Ok(None) }
-            append(mut &conds, takeN(cc))
-        }
         var post: []BNode = []
         for x in lv.post {
             let c = bCompile(&x, q, &kinds, &env, 0)
@@ -20032,13 +20031,98 @@ fn bJoinPlan(st: &lexdb_store.Store, txn: &lexdb_store.Txn, q: &Query, m: &Mats,
                 if mode == JK_GEN { break }
             }
         }
+        // one text key, of a text or varchar column under no collation,
+        // the value a text or varchar column's: by its text
+        var txts: Map[str, int] = newMap()
+        let ho = lv.t.cols[hc].typ.oid
+        if mode == JK_GEN && len(key) == 1 && !lv.virt() && exact && keyTyp[0] == BT_OTHER && (ho == lexdb_sql.OID_TEXT || ho == lexdb_sql.OID_VARCHAR) {
+            let ko = q.cols[keyCol[0]].typ.oid
+            if ko == lexdb_sql.OID_TEXT || ko == lexdb_sql.OID_VARCHAR {
+                mode = JK_TEXT
+                let bs = &m.buckets[k]
+                for bi in 0..len(bs) {
+                    if len(bs[bi]) == 0 { continue }
+                    match mat[bs[bi][0]][hc] {
+                        Val.Text(x) { txts.put(x, bi) }
+                        else { mode = JK_GEN }
+                    }
+                    if mode == JK_GEN { break }
+                }
+            }
+        }
+        // its conditions, but those its hash has already applied: those on
+        // its own columns only (materialize kept only the rows they hold
+        // for), and with a key of its own map, the key's equality
+        var conds: []BNode = []
+        for x in lv.cond {
+            if q.minLevel(&x) >= k { continue }
+            if mode != JK_GEN && isKeyEq(&x, q, lv) { continue }
+            let c = bCompile(&x, q, &kinds, &env, 0)
+            if c.isNone() { return Ok(None) }
+            let cc = c.unwrap()
+            if !boolLike(cc.typ) { return Ok(None) }
+            append(mut &conds, takeN(cc))
+        }
         append(mut &levels, JLevel{k: k, left: lv.join == lexdb_sql.J_LEFT, key: key, keyTyp: keyTyp, keyCol: keyCol, mode: mode,
-                                   ints: ints, conds: conds, post: post, rows: rows, rkinds: rkinds})
+                                   ints: ints, txts: txts, conds: conds, post: post, rows: rows, rkinds: rkinds, cand: [], after: []})
     }
-    return Ok(Some(JPlan{levels: levels, kinds: kinds, need: need}))
+    var all: []bool = []
+    for x in need { append(mut &all, x) }
+    var jp = JPlan{levels: levels, kinds: kinds, need: need, first: []}
+    jpFinish(mut &jp, q, &all)
+    return Ok(Some(jp))
 }
 
-fn noJoins(): JPlan { return JPlan{levels: [], kinds: [], need: []} }
+// Whether x is the equality of level lv's one hash column with its value
+// (hashVals[0]): col = x or x = col, under no collation.
+fn isKeyEq(x: &Expr, q: &Query, lv: &Level): bool {
+    match x {
+        Expr.Bin(op, a, b) {
+            if op != "=" { return false }
+            let want = lv.first + lv.hashCols[0]
+            match a {
+                Expr.Col(n) { if colIndex(&q.cols, &n) == want && sameExpr(&b, &lv.hashVals[0]) { return true } }
+                else {}
+            }
+            match b {
+                Expr.Col(n) { if colIndex(&q.cols, &n) == want && sameExpr(&a, &lv.hashVals[0]) { return true } }
+                else {}
+            }
+            return false
+        }
+        else { return false }
+    }
+}
+
+fn noJoins(): JPlan { return JPlan{levels: [], kinds: [], need: [], first: []} }
+
+// Which columns each join gathers, given those its consumer uses (out):
+// each table's candidates, those its conditions use and those used after
+// it; before it, those and its keys'. A column nothing after uses is not
+// copied from batch to batch.
+fn jpFinish(jp: mut &JPlan, q: &Query, out: &[]bool) {
+    let nq = len(q.cols)
+    var after: []bool = array(nq, false)
+    for c in 0..nq { after[c] = c < len(out) && out[c] && jp.need[c] }
+    var li = len(jp.levels) - 1
+    while li >= 0 {
+        let lv = &q.levels[jp.levels[li].k]
+        var cand: []bool = []
+        for x in after { append(mut &cand, x) }
+        for ci in 0..len(jp.levels[li].conds) { bColsOf(&jp.levels[li].conds[ci], mut &cand) }
+        for ci in 0..len(jp.levels[li].post) { bColsOf(&jp.levels[li].post[ci], mut &cand) }
+        var inp: []bool = []
+        for x in cand { append(mut &inp, x) }
+        for i in 0..len(lv.t.cols) { inp[lv.first + i] = false }
+        for ki in 0..len(jp.levels[li].key) { bColsOf(&jp.levels[li].key[ki], mut &inp) }
+        jp.levels[li].cand = cand
+        jp.levels[li].after = after
+        after = inp
+        li -= 1
+    }
+    for c in 0..nq { after[c] = after[c] && jp.need[c] }
+    jp.first = after
+}
 
 // Column c's rows at (its rows' places in src) into a new column: out of
 // cols (and vals, when it is a column of values); -1: NULL.
@@ -20084,7 +20168,7 @@ fn bJoinAll(q: &Query, m: &Mats, jp: &JPlan, b0: &Batch, idx: &[]int, z: &lexdb_
     var cur = bJoined(nq, len(idx))
     for i in 0..len(b0.cols) {
         let c = l0.first + i
-        if jp.need[c] { bGather(b0, i, jp.kinds[c], idx, mut &cur, c) }
+        if jp.first[c] { bGather(b0, i, jp.kinds[c], idx, mut &cur, c) }
     }
     for li in 0..len(jp.levels) {
         let got = try bProbe(q, m, jp, &jp.levels[li], &cur, z, rs)
@@ -20123,6 +20207,19 @@ fn bProbe(q: &Query, m: &Mats, jp: &JPlan, jl: &JLevel, j: &Batch, z: &lexdb_tim
                 match jl.ints.get(&kv[0].v[r]) {
                     Some(x) { bk = x }
                     None {}
+                }
+            }
+        } else if jl.mode == JK_TEXT {
+            let c = jl.keyCol[0]
+            if !j.cols[c].nul[r] {
+                match j.vals[c][r] {
+                    Val.Text(x) {
+                        match jl.txts.get(&x) {
+                            Some(y) { bk = y }
+                            None {}
+                        }
+                    }
+                    else { return Ok(None) }
                 }
             }
         } else {
@@ -20176,15 +20273,17 @@ fn bProbe(q: &Query, m: &Mats, jp: &JPlan, jl: &JLevel, j: &Batch, z: &lexdb_tim
     let nq = len(q.cols)
     var cand = bJoined(nq, len(pj))
     for c in 0..nq {
-        if len(j.cols[c].v) > 0 { bGather(j, c, jp.kinds[c], &pj, mut &cand, c) }
+        if jl.cand[c] && (c < lv.first || c >= lv.first + len(jl.rkinds)) { bGather(j, c, jp.kinds[c], &pj, mut &cand, c) }
     }
     for i in 0..len(jl.rkinds) {
-        if jp.need[lv.first + i] { bGather(&jl.rows, i, jl.rkinds[i], &pi, mut &cand, lv.first + i) }
+        if jl.cand[lv.first + i] { bGather(&jl.rows, i, jl.rkinds[i], &pi, mut &cand, lv.first + i) }
     }
     let chosen = bChoose(&jl.conds, &cand)
     if chosen.isNone() { return Ok(None) }
     let keep = chosen.unwrap()
     rs.cnt[k].joined += len(keep)
+    // every candidate joined (an equality's usual case): the candidates are the rows
+    if !jl.left && len(keep) == cand.n { return Ok(Some(cand)) }
     // a LEFT JOIN: a row that joined nothing, with NULLs for the table
     var outJ: []int = []
     var outI: []int = []
@@ -20210,12 +20309,14 @@ fn bProbe(q: &Query, m: &Mats, jp: &JPlan, jl: &JLevel, j: &Batch, z: &lexdb_tim
             append(mut &outI, pi[x])
         }
     }
+    // (with WHERE conjuncts after it, the columns they use too)
+    let mask = if len(jl.post) > 0 { &jl.cand } else { &jl.after }
     var out = bJoined(nq, len(outJ))
     for c in 0..nq {
-        if len(j.cols[c].v) > 0 { bGather(j, c, jp.kinds[c], &outJ, mut &out, c) }
+        if mask[c] && (c < lv.first || c >= lv.first + len(jl.rkinds)) { bGather(j, c, jp.kinds[c], &outJ, mut &out, c) }
     }
     for i in 0..len(jl.rkinds) {
-        if jp.need[lv.first + i] { bGather(&jl.rows, i, jl.rkinds[i], &outI, mut &out, lv.first + i) }
+        if mask[lv.first + i] { bGather(&jl.rows, i, jl.rkinds[i], &outI, mut &out, lv.first + i) }
     }
     if len(jl.post) == 0 { return Ok(Some(out)) }
     // a LEFT JOIN's WHERE conjuncts, on its rows joined and its NULL rows
@@ -20225,7 +20326,7 @@ fn bProbe(q: &Query, m: &Mats, jp: &JPlan, jl: &JLevel, j: &Batch, z: &lexdb_tim
     if len(pk) == out.n { return Ok(Some(out)) }
     var fin = bJoined(nq, len(pk))
     for c in 0..nq {
-        if len(out.cols[c].v) > 0 { bGather(&out, c, jp.kinds[c], &pk, mut &fin, c) }
+        if jl.after[c] { bGather(&out, c, jp.kinds[c], &pk, mut &fin, c) }
     }
     return Ok(Some(fin))
 }
@@ -20429,6 +20530,12 @@ fn outPlan(st: &lexdb_store.Store, txn: &lexdb_store.Txn, sel: &Sel, m: &Mats, p
             append(mut &kinds, if cc.typ == BT_BOOL { BK_BOOL } else { BK_INT })
         }
         append(mut &nodes, takeN(cc))
+    }
+    if joined {
+        // the joins gather only the columns the outputs use
+        var used: []bool = array(len(q.cols), false)
+        for ni in 0..len(nodes) { bColsOf(&nodes[ni], mut &used) }
+        jpFinish(mut &jp, q, &used)
     }
     return Ok(Some(OutPlan{lp: lp, jp: jp, joined: joined, nodes: nodes, kinds: kinds, src: src}))
 }
@@ -20662,6 +20769,21 @@ fn batchGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
     // With no GROUP BY no column is used outside an aggregate (42803): the
     // columns read are those of the conditions and the aggregates only
     // (none for count(*)), large rows read in part.
+    if jn && len(keys) == 0 {
+        // the joins gather only the columns the aggregates use
+        var used: []bool = array(len(q.cols), false)
+        for sp in specs {
+            match sp.arg {
+                Some(x) { bColsOf(&x, mut &used) }
+                None {}
+            }
+            match sp.filter {
+                Some(x) { bColsOf(&x, mut &used) }
+                None {}
+            }
+        }
+        jpFinish(mut &jp, q, &used)
+    }
     var part = len(lv.need) > 0
     if len(keys) == 0 && !jn {
         var used: []bool = array(len(t.cols), false)
@@ -20727,6 +20849,19 @@ fn batchGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
     var byKey: Map[str, int] = newMap()
     var nullGroup = -1
     let oneKey = len(keys) == 1 && keys[0].typ != BT_OTHER
+    // one key a text or varchar column (under no collation: groupKinds):
+    // its groups by its text, not by its encoded key
+    var textCol = -1
+    if len(keys) == 1 && keys[0].typ == BT_OTHER {
+        match keys[0].n {
+            BNode.Col(c) {
+                let o = q.cols[c].typ.oid
+                if o == lexdb_sql.OID_TEXT || o == lexdb_sql.OID_VARCHAR { textCol = c }
+            }
+            else {}
+        }
+    }
+    var byText: Map[str, int] = newMap()
     var added = 0                       // the bytes counted in held (given back if the row path runs after all)
     var nRead = 0
     var nJoined = 0
@@ -20803,7 +20938,26 @@ fn batchGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
                         }
                     }
                     var kstr = ""
-                    if !oneKey {
+                    var ktext = ""
+                    if textCol >= 0 {
+                        let r = idx[j]
+                        if b.cols[textCol].nul[r] {
+                            g = nullGroup
+                        } else {
+                            match b.vals[textCol][r] {
+                                Val.Text(x) { ktext = x }
+                                else {
+                                    held -= added
+                                    return Ok(false)
+                                }
+                            }
+                            klen = len(ktext)
+                            match byText.get(&ktext) {
+                                Some(x) { g = x }
+                                None {}
+                            }
+                        }
+                    } else if !oneKey {
                         var kb = newStrBuf()
                         for ki in 0..len(keys) { encIdxPart(mut &kb, &bKeyVal(&keys[ki], &kvs[ki], j, &b, idx[j])) }
                         kstr = kb.toStr()
@@ -20827,7 +20981,9 @@ fn batchGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
                             append(mut &amm[i], 0)
                             append(mut &aval[i], Val.Null)
                         }
-                        if oneKey {
+                        if textCol >= 0 {
+                            if b.cols[textCol].nul[idx[j]] { nullGroup = g } else { byText.put(ktext, g) }
+                        } else if oneKey {
                             if kvs[0].nul[j] { nullGroup = g } else { byInt.put(kvs[0].v[j], g) }
                         } else {
                             byKey.put(kstr, g)
