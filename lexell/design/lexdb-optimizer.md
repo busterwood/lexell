@@ -32,18 +32,15 @@ section and the decision list below win.
   per-parameter plans, and a fallback to rule-based planning through a SET
   command.** Section 18 has the consequences.
 
-**Built so far (on `exp/optimizer`, rebased onto `lexdb` 2026-11-12):** the
-index-to-scan switch (section 19) and stage A, ANALYZE with the tie-break
-and `SET lexdb_planner` (section 20), the review fixes (section 21), plans
-kept per parameter outcome (section 22), per-value estimates with
-per-parameter plans (section 23), estimates deciding beyond ties with
-primary-key statistics (section 24), the constraint-bound join order
-(section 25), the cost-based join order with its planning-time measurement
-(section 26), implied equalities (section 27), SQLite's N-best search past
-8 tables (section 28), the fixes from the join-order review with filter
-and range estimates (section 29), and the join search raised to 24 tables
-(section 30, uncommitted). Code comments cite these sections as "optimizer
-N".
+**Built so far (on `exp/optimizer`, rebased onto `lexdb` 9.94 on 2026-11-12):**
+the index-to-scan switch (section 19); ANALYZE, the tie-break and `SET
+lexdb_planner` (20); the review fixes (21); plans kept per parameter
+outcome (22); per-value estimates (23); estimates deciding beyond ties and
+primary-key statistics (24); the join order bound by keys (25) and by cost
+(26); implied equalities (27); SQLite's N-best search (28); the join-order
+review's fixes with filter and range estimates (29); the search to 24
+tables (30); and the integration with lexdb 9.94 (31). Code comments cite
+these sections as "optimizer N".
 
 ## 1. Summary
 
@@ -1757,6 +1754,34 @@ matches the rules mode's.
 **Open (the user's call).** About 2.2 ms to plan a 24-table star, paid once
 per prepared statement. If too much: a narrower N past 16 tables, or not
 deriving equalities between spokes that only meet at the centre.
+
+## 31. On lexdb 9.94 (2026-11-12)
+
+The branch was rebased onto `lexdb` 9.94: missing functions and operators,
+JOIN ... USING and NATURAL JOIN, DISTINCT ON, FETCH FIRST, row comparisons,
+char(n). What changed for the optimizer:
+
+- **ANALYZE.** lexdb 9.94 parses VACUUM, ANALYZE, CHECKPOINT, REINDEX and
+  CLUSTER as maintenance statements that do nothing (`S_MAINT`). Its parser
+  takes ANALYZE's options, several tables and column lists, and VACUUM
+  ANALYZE. That parse is kept: an ANALYZE, or a VACUUM with ANALYZE, is
+  `S_ANALYZE`, which runs lexdb's checks (`maint`: the tables and columns
+  exist, VACUUM not in a block) and then gathers the statistics of the
+  tables named, or of every table. A view has none, so `ANALYZE view` does
+  nothing and gives no error, as before. This branch's own ANALYZE parse is
+  removed. `S_ANALYZE` is 58.
+- **Settings.** lexdb 9.94 added custom settings, `set_config` and
+  `SET LOCAL`. `lexdb_planner` is listed for SHOW ALL and the settings
+  memo, and `set_config('lexdb_planner', ...)` sets it, as SET does.
+- **USING and NATURAL joins.** They are inner joins with equalities, so they
+  reorder like any other: checked against the rules mode, with and without
+  ANALYZE (same rows). `buildQuery`'s argument is now `reorder`, since
+  lexdb's USING code has a local `order`.
+
+The full suite passes, 92 of 92, lexdb 9.94's new tests included. The
+rebased commits before the integration commit do not compile on 9.94 on
+their own: their ANALYZE parse clashes with lexdb's, and so does the name
+`order`.
 
 ## Sources
 

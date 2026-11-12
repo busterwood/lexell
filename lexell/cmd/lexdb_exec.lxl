@@ -3581,9 +3581,18 @@ fn loadEst(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, join: b
 // writes it does not see; only the statistics' rows and version are written,
 // so prepared statements are planned again with them (optimizer 20).
 fn analyzeStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, lim: Limits): Result[Res, DbErr] {
+    // lexdb's checks of the maintenance statement first (9.94): the
+    // tables and columns exist, VACUUM not in a block (optimizer 31)
+    let checked = try maint(st, txn, s)
     var tabs: []Table = []
-    if s.table != "" {
-        append(mut &tabs, try needTable(st, txn, &s.table))
+    if len(s.names) > 0 {
+        for n in s.names {
+            // (maint found each; a view has no rows of its own, nothing to count)
+            match try findTable(st, txn, &n) {
+                Some(t) { if len(t.view) == 0 { append(mut &tabs, t) } }
+                None {}
+            }
+        }
     } else {
         var keys: []str = []
         var raw: []str = []
@@ -3592,7 +3601,10 @@ fn analyzeStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
             append(mut &raw, en.val)
             return true
         })
-        for i in 0..len(keys) { append(mut &tabs, try decTable(&keys[i], &raw[i])) }
+        for i in 0..len(keys) {
+            let t = try decTable(&keys[i], &raw[i])
+            if len(t.view) == 0 { append(mut &tabs, t) }
+        }
     }
     var snap = try st.beginSnapshot()
     var failed: []DbErr = []
@@ -3609,7 +3621,7 @@ fn analyzeStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
     if len(failed) > 0 { return Err(failed[0]) }
     let v = try statVersion(st, txn)
     try txn.put(CATALOG, STAT_VERSION, nextVersion(&v))
-    return Ok(tagOnly("ANALYZE"))
+    return Ok(checked)
 }
 
 // A value as a number for range estimates (optimizer 29): numbers, dates,
@@ -6234,10 +6246,10 @@ fn newLevel(t: Table, alias: str, join: int, first: int): Level {
 // Plans a query over the tables of FROM (4.8): the tables are joined in the
 // order written, and each WHERE conjunct is checked at the first table
 // where all its columns are known.
-// order: the tables of inner joins may run in another order than FROM's
+// reorder: the tables of inner joins may run in another order than FROM's
 // (a SELECT's; UPDATE ... FROM and DELETE ... USING keep their target first).
 fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_sql.FromItem,
-              where: &Option[Expr], params: &[]Val, subs: &[]lexdb_sql.Stmt, sc: mut &Scope, order: bool): Result[Query, DbErr] {
+              where: &Option[Expr], params: &[]Val, subs: &[]lexdb_sql.Stmt, sc: mut &Scope, reorder: bool): Result[Query, DbErr] {
     var q = Query{levels: [], cols: [], top: [], subs: [], base: sc.base, corr: false, refs: [], implied: false, colAt: newMap()}
     // this query's (its subqueries set their own)
     let early = sc.early
@@ -6348,7 +6360,7 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
         lv.src = if viewSrc >= 0 { viewSrc } else { f.sub }
         lv.work = f.work
         lv.lateral = lateral
-        if f.sub < 0 && f.work < 0 { lv.est = try loadEst(st, txn, &lv.t, order && len(from) >= 2) }
+        if f.sub < 0 && f.work < 0 { lv.est = try loadEst(st, txn, &lv.t, reorder && len(from) >= 2) }
         append(mut &q.levels, lv)
         if len(subs) > 0 {
             // only its subqueries look here
@@ -6493,7 +6505,7 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
         }
         None {}
     }
-    if order && nl >= 2 && !txn.rules {
+    if reorder && nl >= 2 && !txn.rules {
         // the join order: by cost with statistics (optimizer 26), else bound
         // by keys (optimizer 25); the conjuncts go again to the latest table
         // they use, in the new order
@@ -12666,6 +12678,14 @@ fn (s: mut &Session) applySetting(name: &str, value: &str, local: bool): Result[
         if value == "\x01" || strings.toLowerAscii(value) == "default" { s.setZone(lexdb_time.utc()) } else { s.setZone(try lexdb_time.settingZone(value)) }
         return Ok(Unit{})
     }
+    if k == "lexdb_planner" {
+        // set_config (9.92) as SET (optimizer 20)
+        let v = strings.toLowerAscii(strings.trim(value.toStr()))
+        if v != "rules" && v != "cost" { return Err(e("22023", "invalid value for parameter \"lexdb_planner\": use cost or rules")) }
+        s.rules = v == "rules"
+        if len(s.txn) > 0 { s.txn[0].rules = s.rules }
+        return Ok(Unit{})
+    }
     if k == "lexdb_batch" {
         match parseBool(&strings.toLowerAscii(strings.trim(value.toStr()))) {
             Some(y) { s.batch = y }
@@ -12840,7 +12860,7 @@ fn stmtName(kind: int): str {
         lexdb_sql.S_INSERT { "INSERT" }
         lexdb_sql.S_UPDATE { "UPDATE" }
         lexdb_sql.S_CREATE_INDEX { "CREATE INDEX" }
-        lexdb_sql.S_ANALYZE { "ANALYZE" }
+        lexdb_sql.S_ANALYZE { "ANALYZE" }      // (or VACUUM ANALYZE: its tag is the statement's alias)
         lexdb_sql.S_DROP_INDEX { "DROP INDEX" }
         lexdb_sql.S_CREATE_SCHEMA { "CREATE SCHEMA" }
         lexdb_sql.S_DROP_SCHEMA { "DROP SCHEMA" }
