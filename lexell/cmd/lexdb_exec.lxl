@@ -5637,6 +5637,94 @@ fn (q: &Query) setRows(mask: int, nl: int, base: &[]Way, cmask: &[]int, cdist: &
     return v
 }
 
+// SQLite's N-best search from the levels init (each a one-table start):
+// the order (order, flags: read once) and its cost (optimizer 28; from a
+// given start, optimizer 32).
+fn (q: &Query) nBest(init: &[]int, nl: int, cands: &[][]WayCand, base: &[]Way, adj: &[]int, cmask: &[]int, cdist: &[]float,
+                     memo: mut &Map[int, float], lookups: bool, cap: float, order: mut &[]int, flags: mut &[]bool): float {
+    // SQLite's N-best search: at each step the JOIN_BEST cheapest
+    // partial orders are kept (one per set of tables), each extended by
+    // every table it may take next
+    var pm: []int = []
+    var pc: []float = []
+    var po: [][]int = []
+    var pf: [][]bool = []
+    for k in init {
+        append(mut &pm, 1 << k)
+        append(mut &pc, base[k].cost)
+        append(mut &po, [k])
+        append(mut &pf, [false])
+    }
+    bestOf(mut &pm, mut &pc, mut &po, mut &pf)
+    for step in 1..nl {
+        // the extensions: per set of tables the cheapest, as its parent
+        // path and the table added (copied only when kept)
+        var nm: []int = []
+        var nc: []float = []
+        var npar: []int = []
+        var nk: []int = []
+        var nh: []bool = []
+        var at: Map[int, int] = newMap()
+        for p in 0..len(pm) {
+            let mask = pm[p]
+            let rin = q.setRows(mask, nl, base, cmask, cdist, memo)
+            var nb = 0
+            for l in 0..nl { if (mask & (1 << l)) != 0 { nb = nb | adj[l] } }
+            let linked = (nb & ~mask) != 0
+            for k in 0..nl {
+                if (mask & (1 << k)) != 0 { continue }
+                if linked && (adj[k] & mask) == 0 { continue }
+                let next = mask | (1 << k)
+                var o = false
+                let rnext = q.setRows(next, nl, base, cmask, cdist, memo)
+                let total = pc[p] + q.joinStep(k, &cands[k], &base[k], mask, rin, rnext, lookups, cap, mut &o)
+                let j = at.getOr(&next, -1)
+                if j >= 0 {
+                    if nc[j] <= total { continue }
+                    nc[j] = total
+                    npar[j] = p
+                    nk[j] = k
+                    nh[j] = o
+                } else {
+                    at.put(next, len(nm))
+                    append(mut &nm, next)
+                    append(mut &nc, total)
+                    append(mut &npar, p)
+                    append(mut &nk, k)
+                    append(mut &nh, o)
+                }
+            }
+        }
+        // the JOIN_BEST cheapest, cheapest first (a tie: the earlier)
+        var taken: []bool = array(len(nm), false)
+        var m2: []int = []
+        var c2: []float = []
+        var o2: [][]int = []
+        var f2: [][]bool = []
+        while len(m2) < JOIN_BEST && len(m2) < len(nm) {
+            var b = -1
+            for i in 0..len(nm) { if !taken[i] && (b < 0 || nc[i] < nc[b]) { b = i } }
+            taken[b] = true
+            append(mut &m2, nm[b])
+            append(mut &c2, nc[b])
+            var ord = copyInts(&po[npar[b]])
+            append(mut &ord, nk[b])
+            var fl = copyBools(&pf[npar[b]])
+            append(mut &fl, nh[b])
+            append(mut &o2, ord)
+            append(mut &f2, fl)
+        }
+        pm = m2
+        pc = c2
+        po = o2
+        pf = f2
+    }
+    // the cheapest (the first: bestOf orders them)
+    order = replace(mut &po[0], [])
+    flags = replace(mut &pf[0], [])
+    return pc[0]
+}
+
 // The cost of joining level k to the set mask (rin its rows; rnext the rows
 // of the set with k): its constant way read once and hashed, then a probe
 // per row; or a lookup per row, whichever is cheaper (hashed: the first).
@@ -5706,8 +5794,10 @@ fn copyBools(xs: &[]bool): []bool {
 // per new place whether it is read once. false: it does not apply (a table
 // without statistics, an outer join, LATERAL, too many tables).
 // lookups: a table a lookup reaches is not read once instead.
-// cap: a hash's bytes at most where a lookup is possible.
-fn (q: &Query) costOrder(ms: &[][]Expr, lookups: bool, cap: float, perm: mut &[]int, ro: mut &[]bool): bool {
+// cap: a hash's bytes at most where a lookup is possible. ordT: the level an
+// ORDER BY with a LIMIT can be read in order from (-1 none), lim the rows
+// the LIMIT and OFFSET take (optimizer 32).
+fn (q: &Query) costOrder(ms: &[][]Expr, lookups: bool, cap: float, ordT: int, lim: float, perm: mut &[]int, ro: mut &[]bool): bool {
     let nl = len(q.levels)
     if nl < 2 || nl > JOIN_SEARCH_MAX { return false }
     for lv in q.levels {
@@ -5768,6 +5858,7 @@ fn (q: &Query) costOrder(ms: &[][]Expr, lookups: bool, cap: float, perm: mut &[]
     }
     var order: []int = []
     var flags: []bool = []
+    var bestCost = 0.0f
     // the rows of a set, as needed (2^n sets past JOIN_EXACT_MAX is too many
     // to list: optimizer 30)
     var memo: Map[int, float] = newMap()
@@ -5800,6 +5891,7 @@ fn (q: &Query) costOrder(ms: &[][]Expr, lookups: bool, cap: float, perm: mut &[]
                 }
             }
         }
+        bestCost = cost[full]
         var rev: []int = []
         var revOnce: []bool = []
         var m = full
@@ -5814,86 +5906,29 @@ fn (q: &Query) costOrder(ms: &[][]Expr, lookups: bool, cap: float, perm: mut &[]
             append(mut &flags, revOnce[nl - 1 - i])
         }
     } else {
-        // SQLite's N-best search: at each step the JOIN_BEST cheapest
-        // partial orders are kept (one per set of tables), each extended by
-        // every table it may take next
-        var pm: []int = []
-        var pc: []float = []
-        var po: [][]int = []
-        var pf: [][]bool = []
-        for k in 0..nl {
-            append(mut &pm, 1 << k)
-            append(mut &pc, base[k].cost)
-            append(mut &po, [k])
-            append(mut &pf, [false])
+        var starts: []int = []
+        for k in 0..nl { append(mut &starts, k) }
+        bestCost = q.nBest(&starts, nl, &cands, &base, &adj, &cmask, &cdist, mut &memo, lookups, cap, mut &order, mut &flags)
+    }
+    // ORDER BY ... LIMIT (optimizer 32): the ordered table first, read in its
+    // order (a full scan the planner turns into its index), each other table
+    // looked up per row, stopping after the LIMIT: its cost is the whole
+    // order's, times the share of the rows the LIMIT takes. It is taken when
+    // that is cheaper than the best order's cost and a sort of its rows. Not
+    // with a hash: a hash is built whole before the first row.
+    if ordT >= 0 && base[ordT].cost >= float(q.levels[ordT].est.rows) - 0.5f {
+        var o2: []int = []
+        var f2: []bool = []
+        let c2 = q.nBest(&[ordT], nl, &cands, &base, &adj, &cmask, &cdist, mut &memo, true, cap, mut &o2, mut &f2)
+        var hashed = false
+        for i in 1..nl { if f2[i] { hashed = true } }
+        let rall = q.setRows((1 << nl) - 1, nl, &base, &cmask, &cdist, mut &memo)
+        let frac = fmin(1.0f, lim / rall)
+        let sortCost = rall * ROW_COST * float(scaleOf(int(rall)))
+        if !hashed && c2 * frac < bestCost + sortCost {
+            order = o2
+            flags = f2
         }
-        bestOf(mut &pm, mut &pc, mut &po, mut &pf)
-        for step in 1..nl {
-            // the extensions: per set of tables the cheapest, as its parent
-            // path and the table added (copied only when kept)
-            var nm: []int = []
-            var nc: []float = []
-            var npar: []int = []
-            var nk: []int = []
-            var nh: []bool = []
-            var at: Map[int, int] = newMap()
-            for p in 0..len(pm) {
-                let mask = pm[p]
-                let rin = q.setRows(mask, nl, &base, &cmask, &cdist, mut &memo)
-                var nb = 0
-                for l in 0..nl { if (mask & (1 << l)) != 0 { nb = nb | adj[l] } }
-                let linked = (nb & ~mask) != 0
-                for k in 0..nl {
-                    if (mask & (1 << k)) != 0 { continue }
-                    if linked && (adj[k] & mask) == 0 { continue }
-                    let next = mask | (1 << k)
-                    var o = false
-                    let rnext = q.setRows(next, nl, &base, &cmask, &cdist, mut &memo)
-                    let total = pc[p] + q.joinStep(k, &cands[k], &base[k], mask, rin, rnext, lookups, cap, mut &o)
-                    let j = at.getOr(&next, -1)
-                    if j >= 0 {
-                        if nc[j] <= total { continue }
-                        nc[j] = total
-                        npar[j] = p
-                        nk[j] = k
-                        nh[j] = o
-                    } else {
-                        at.put(next, len(nm))
-                        append(mut &nm, next)
-                        append(mut &nc, total)
-                        append(mut &npar, p)
-                        append(mut &nk, k)
-                        append(mut &nh, o)
-                    }
-                }
-            }
-            // the JOIN_BEST cheapest, cheapest first (a tie: the earlier)
-            var taken: []bool = array(len(nm), false)
-            var m2: []int = []
-            var c2: []float = []
-            var o2: [][]int = []
-            var f2: [][]bool = []
-            while len(m2) < JOIN_BEST && len(m2) < len(nm) {
-                var b = -1
-                for i in 0..len(nm) { if !taken[i] && (b < 0 || nc[i] < nc[b]) { b = i } }
-                taken[b] = true
-                append(mut &m2, nm[b])
-                append(mut &c2, nc[b])
-                var ord = copyInts(&po[npar[b]])
-                append(mut &ord, nk[b])
-                var fl = copyBools(&pf[npar[b]])
-                append(mut &fl, nh[b])
-                append(mut &o2, ord)
-                append(mut &f2, fl)
-            }
-            pm = m2
-            pc = c2
-            po = o2
-            pf = f2
-        }
-        // the cheapest (the first: bestOf orders them)
-        order = replace(mut &po[0], [])
-        flags = replace(mut &pf[0], [])
     }
     var ident = true
     for i in 0..nl {
@@ -5903,6 +5938,60 @@ fn (q: &Query) costOrder(ms: &[][]Expr, lookups: bool, cap: float, perm: mut &[]
     }
     if ident { perm = [] }
     return true
+}
+
+// A LIMIT's (or OFFSET's) rows for the join order: a literal's value, else
+// (a parameter, an expression) 100; none 0.
+fn limitGuess(x: &Option[Expr]): int {
+    match x {
+        Some(e) {
+            match e {
+                Expr.Lit(v) {
+                    match v {
+                        Val.Int(n) { return if n < 0 { 0 } else { n } }
+                        else { return 100 }
+                    }
+                }
+                else { return 100 }
+            }
+        }
+        None { return 0 }
+    }
+}
+
+// The level whose rows an ORDER BY sorts by, all its items plain columns of
+// that one table in one direction (NULLs where an index keeps them), and a
+// key or an unfiltered index of it giving that order: its index; else -1.
+fn (q: &Query) orderedLevel(items: &[]lexdb_sql.OrderItem): int {
+    if len(items) == 0 { return -1 }
+    var lv = -1
+    var cols: []int = []
+    for it in items {
+        if it.desc != items[0].desc || it.nullsFirst != it.desc { return -1 }
+        match it.expr {
+            Expr.Col(n) {
+                match resolveName(&q.cols, len(q.cols), &n) {
+                    Ok(full) {
+                        let l = q.levelOf(&full)
+                        if l < 0 || (lv >= 0 && l != lv) { return -1 }
+                        lv = l
+                        append(mut &cols, colIndex(&q.cols, &full) - q.levels[l].first)
+                    }
+                    Err(_) { return -1 }
+                }
+            }
+            else { return -1 }
+        }
+    }
+    if q.levels[lv].virt() { return -1 }
+    let t = &q.levels[lv].t
+    for c0 in 0..len(t.indexes) + 1 {
+        let c = c0 - 1
+        if c >= 0 && t.indexes[c].pred.isSome() { continue }
+        let p = Path{index: c, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: []}
+        if servesOrder(t, &p, &cols) { return lv }
+    }
+    return -1
 }
 
 // A table of nothing (a level's place while levels are moved).
@@ -6427,6 +6516,9 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
     // this query's (its subqueries set their own)
     let early = sc.early
     sc.early = false
+    let ordBy = replace(mut &sc.ordBy, [])
+    let ordLim = sc.ordLim
+    sc.ordLim = -1
     // a subquery in FROM is planned first: it sees the queries around this
     // one, not this one's tables
     var planned: [][]SubPlan = []
@@ -6705,7 +6797,8 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
         // a hash holds at most half the statement's memory, 64 MB at most
         var cap = HASH_MAX_BYTES
         if txn.memMax > 0 && float(txn.memMax) / 2.0f < cap { cap = float(txn.memMax) / 2.0f }
-        if txn.noting() || !q.costOrder(&ms, early, cap, mut &perm, mut &ro) { perm = q.joinOrder(&ms) }
+        let ordT = q.orderedLevel(&ordBy)
+        if txn.noting() || !q.costOrder(&ms, early, cap, ordT, float(ordLim), mut &perm, mut &ro) { perm = q.joinOrder(&ms) }
         if len(perm) == nl {
             var pool: []Expr = []
             for k in 0..nl {
@@ -7224,6 +7317,12 @@ pub type Scope = record {
     // EXISTS, a scalar subquery): its join order keeps lookups (optimizer 26
     // review). Set by planSub and planSelect, taken by buildQuery.
     early: bool
+    // the next query's ORDER BY when it has a LIMIT (and no grouping or
+    // window), and its LIMIT plus OFFSET (a parameter's taken as 100);
+    // -1: none. The join order may read the table ordered by them first
+    // and stop early (optimizer 32). Set by planSelect, taken by buildQuery.
+    ordBy: []lexdb_sql.OrderItem
+    ordLim: int
 }
 
 type Work = record { id: int; cols: []lexdb_sql.ColDef }
@@ -7246,7 +7345,7 @@ fn scCheck(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: mut &Scope, ke
 fn newScope(params: &[]Val, ptypes: &[]int): Scope {
     var pt: []int = []
     for i in 0..len(params) { append(mut &pt, if i < len(ptypes) { ptypes[i] } else { 0 }) }
-    return Scope{frames: [], base: len(params), ptypes: pt, works: [], asRole: [], whos: [], target: "", looks: [], early: false}
+    return Scope{frames: [], base: len(params), ptypes: pt, works: [], asRole: [], whos: [], target: "", looks: [], early: false, ordBy: [], ordLim: -1}
 }
 
 // The parameter types of the query being planned: the statement's, then
@@ -11747,6 +11846,18 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
     }
     if s.setop != 0 { return planSet(st, txn, s, params, sc) }
     sc.early = sc.early || (s.limit.isSome() && len(s.order) == 0 && len(s.group) == 0)
+    sc.ordLim = -1
+    sc.ordBy = []
+    if s.limit.isSome() && len(s.order) > 0 && len(s.group) == 0 && !s.distinct && len(s.distinctOn) == 0 && len(s.wins) == 0 &&
+       s.having.isNone() && len(s.gsets) == 0 {
+        var agg = false
+        for it in s.items { match it.expr { Some(x) { if hasAgg(&x) { agg = true } } None {} } }
+        for o in s.order { if hasAgg(&o.expr) { agg = true } }
+        if !agg {
+            sc.ordLim = limitGuess(&s.limit) + limitGuess(&s.offset)
+            for o in s.order { append(mut &sc.ordBy, lexdb_sql.OrderItem{expr: clone(&o.expr), desc: o.desc, nullsFirst: o.nullsFirst}) }
+        }
+    }
     var q = try buildQuery(st, txn, &s.from, &s.where, params, &s.subs, sc, true)
     if s.kind == lexdb_sql.S_SELECT { narrow(mut &q, s) }
     if s.lockMode > 0 { try applyLocks(mut &q, s) }
