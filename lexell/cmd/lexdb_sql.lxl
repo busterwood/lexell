@@ -1227,11 +1227,30 @@ fn (p: mut &P) mulExpr(): Result[Expr, lexdb_base.DbErr] {
 
 // x ^ y (9.92): above * and /, below a sign, left to right, as PostgreSQL's.
 fn (p: mut &P) powExpr(): Result[Expr, lexdb_base.DbErr] {
-    var e = try p.unary()
+    var e = try p.atExpr()
     while p.isKw("^") {
         p.pos += 1
-        let r = try p.unary()
+        let r = try p.atExpr()
         e = Expr.Bin("^", e, r)
+    }
+    return Ok(e)
+}
+
+// x AT TIME ZONE zone, x AT LOCAL (9.95): above ^, as PostgreSQL's; the
+// calls timezone(zone, x) and timezone(x).
+fn (p: mut &P) atExpr(): Result[Expr, lexdb_base.DbErr] {
+    var e = try p.unary()
+    while p.isKw("at") && p.toks[p.pos + 1].kind == T_IDENT &&
+          ((p.toks[p.pos + 1].text == "time" && p.toks[p.pos + 2].kind == T_IDENT && p.toks[p.pos + 2].text == "zone") ||
+           p.toks[p.pos + 1].text == "local") {
+        p.pos += 1
+        if p.acceptKw("local") {
+            e = Expr.Call("timezone", [e], false)
+        } else {
+            p.pos += 2
+            let z = try p.unary()
+            e = Expr.Call("timezone", [z, e], false)
+        }
     }
     return Ok(e)
 }
@@ -4231,6 +4250,7 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
                 if p.acceptKw(".") { st.table = st.table + "." + (try p.name()) }   // a custom setting (9.92)
             }
             if st.table == "transaction" { st.table = "transaction_isolation" }   // SHOW TRANSACTION ISOLATION LEVEL
+            if st.table == "time" && p.acceptKw("zone") { st.table = "timezone" }  // SHOW TIME ZONE
             p.skipToEnd()
             return Ok(st)
         }
@@ -4242,6 +4262,24 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
             let u = p.acceptKw("session")
             if t.text == "reset" && p.acceptKw("all") {
                 st.table = "all"
+                return Ok(st)
+            }
+            // SET [SESSION | LOCAL] TIME ZONE value | LOCAL | DEFAULT, SET [SESSION | LOCAL]
+            // timezone = | TO value | DEFAULT, RESET timezone, RESET TIME ZONE (9.95):
+            // table "timezone", the value in names ("\x01": the default), then "local"
+            var tzAt = p.pos
+            let tzLocal = t.text == "set" && p.isKw("local")
+            if tzLocal { tzAt += 1 }
+            let tzWords = p.toks[tzAt].kind == T_IDENT && p.toks[tzAt].text == "time" && p.toks[tzAt + 1].kind == T_IDENT &&
+                          p.toks[tzAt + 1].text == "zone"
+            if (t.text == "set" || t.text == "reset") &&
+               (tzWords || ((p.toks[tzAt].kind == T_IDENT || p.toks[tzAt].kind == T_QIDENT) && strings.toLowerAscii(p.toks[tzAt].text) == "timezone")) {
+                p.pos = tzAt + (if tzWords { 2 } else { 1 })
+                st.table = "timezone"
+                if t.text == "reset" { return Ok(st) }
+                if !tzWords && !p.acceptKw("to") { try p.expectKw("=") }
+                append(mut &st.names, try p.zoneValue(tzWords))
+                if tzLocal { append(mut &st.names, "local") }
                 return Ok(st)
             }
             // SET [SESSION] ROLE name | NONE, RESET ROLE, SET SESSION AUTHORIZATION name |
@@ -4359,6 +4397,40 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
     return Err(near(&t))
 }
 
+// SET TIME ZONE's value (9.95): a string, a name, a number (an offset in
+// hours: "-5"), INTERVAL '...' [unit [TO unit]] ("INTERVAL '...'", a bare
+// number given its unit), DEFAULT; LOCAL after TIME ZONE. "\x01": the
+// default.
+fn (p: mut &P) zoneValue(words: bool): Result[str, lexdb_base.DbErr] {
+    if p.acceptKw("default") || (words && p.acceptKw("local")) { return Ok("\x01") }
+    if p.acceptKw("interval") {
+        let v = p.next()
+        if v.kind != T_STR { return Err(near(&v)) }
+        var body = v.text
+        var unit = ""
+        for u in ["year", "month", "day", "hour", "minute", "second"] { if unit == "" && p.acceptKw(u) { unit = u } }
+        var last = unit
+        if unit != "" && p.acceptKw("to") {
+            let u2 = p.next()
+            if u2.kind != T_IDENT { return Err(near(&u2)) }
+            last = u2.text
+        }
+        var bare = len(body) > 0
+        for i in 0..len(body) { if !((body[i] >= '0' && body[i] <= '9') || body[i] == '.' || body[i] == '-' || body[i] == '+' || body[i] == ' ') { bare = false } }
+        if bare && unit != "" { body = body + " " + unit }
+        // the qualifier's last unit cuts what is below it (HOUR TO MINUTE: no seconds)
+        return Ok("INTERVAL '" + body + "'" + (if last == "hour" || last == "minute" { " " + last } else { "" }))
+    }
+    let v = p.next()
+    if v.kind == T_STR || v.kind == T_IDENT || v.kind == T_QIDENT || v.kind == T_NUM { return Ok(v.text) }
+    if v.kind == T_OP && (v.text == "-" || v.text == "+") {
+        let n = p.next()
+        if n.kind != T_NUM { return Err(near(&n)) }
+        return Ok(v.text + n.text)
+    }
+    return Err(near(&v))
+}
+
 // Skips the rest of a statement (the options of BEGIN, a SET's value).
 fn (p: mut &P) skipToEnd() {
     while p.peek().kind != T_EOF && !(p.peek().kind == T_OP && p.peek().text == ";") { p.pos += 1 }
@@ -4468,7 +4540,7 @@ pub fn exprText(x: &Expr): str {
                 Val.Date(d) { return "'" + lexdb_time.fmtDate(d) + "'::date" }
                 Val.Time(u) { return "'" + lexdb_time.fmtTime(u) + "'::time" }
                 Val.Ts(u) { return "'" + lexdb_time.fmtTs(u) + "'::timestamp" }
-                Val.Tstz(u) { return "'" + lexdb_time.fmtTstz(u) + "'::timestamptz" }
+                Val.Tstz(u) { return "'" + lexdb_time.fmtTstz(u, &lexdb_time.utc()) + "'::timestamptz" }
                 Val.Ival(iv) { return "'" + lexdb_time.fmtIval(&iv) + "'::interval" }
                 Val.Uuid(u) { return "'" + u + "'::uuid" }
                 Val.Bytes(b) { return "'" + bytesHex(&b) + "'::bytea" }
@@ -4509,6 +4581,8 @@ pub fn exprText(x: &Expr): str {
                 return "(" + exprText(&args[0]) + " in (" + strings.join(&parts, ", ") + "))"
             }
             if n == "distinct from" { return "(" + exprText(&args[0]) + " is distinct from " + exprText(&args[1]) + ")" }
+            // the date and time keywords, read back without "()" (9.95)
+            if len(args) == 0 && (n == "current_date" || n == "current_timestamp" || n == "localtimestamp" || n == "current_time" || n == "localtime") { return n }
             if (n == "~" || n == "!~" || n == "~*" || n == "!~*" || n == "@>" || n == "<@" || n == "&&") && len(args) == 2 {
                 return "(" + exprText(&args[0]) + " " + n + " " + exprText(&args[1]) + ")"
             }

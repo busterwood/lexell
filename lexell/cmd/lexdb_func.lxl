@@ -1068,7 +1068,9 @@ pub type Tm = value record {
     pub us: int
     pub days: int           // since 2000-01-01
     pub interval: bool
-    pub tz: bool            // a timestamptz: TZ is UTC
+    pub tz: bool            // a timestamptz: TZ, OF, TZH and TZM are its zone's
+    pub off: int            // ... its offset there, seconds east
+    pub abbr: str           // ... its abbreviation there ("BST", "+05", "")
 }
 
 fn fdiv(a: int, b: int): int { return floorDiv(a, b) }
@@ -1081,13 +1083,13 @@ pub fn tmOfTs(local: int, tz: bool): Tm {
     let d = lexdb_time.dateOf(days)
     let s = tod / 1000000
     return Tm{year: d.year, mon: d.month, mday: d.day, hour: s / 3600, min: s / 60 % 60, sec: s % 60, us: tod % 1000000,
-              days: days, interval: false, tz: tz}
+              days: days, interval: false, tz: tz, off: 0, abbr: if tz { "UTC" } else { "" }}
 }
 
 pub fn tmOfIval(v: &lexdb_time.Ival): Tm {
     let s = v.us / 1000000
     return Tm{year: v.months / 12, mon: v.months % 12, mday: v.days, hour: s / 3600, min: s / 60 % 60, sec: s % 60,
-              us: v.us % 1000000, days: 0, interval: true, tz: false}
+              us: v.us % 1000000, days: 0, interval: true, tz: false, off: 0, abbr: ""}
 }
 
 const MONTHS: []str = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October",
@@ -1262,11 +1264,25 @@ pub fn toCharTm(t: &Tm, f: &str): str {
             "SSSS", "SSSSS" { s = (t.hour * 3600 + t.min * 60 + t.sec).toStr() }
             "TZ", "tz" {
                 numeric = false
-                if t.tz { s = if nd.key == "TZ" { "UTC" } else { "utc" } }
+                if t.tz { s = if nd.key == "TZ" { strings.toUpperAscii(t.abbr) } else { strings.toLowerAscii(t.abbr) } }
             }
-            "TZH" { s = "+00"; numeric = false }
-            "TZM" { s = "00" }
-            "OF" { s = if fm { "+0" } else { "+00" }; numeric = false }
+            "TZH" {
+                // the sign always; FM does not drop the zero (PostgreSQL's)
+                let a = if t.off < 0 { -t.off } else { t.off }
+                s = (if t.off < 0 { "-" } else { "+" }) + strings.padLeft((a / 3600).toStr(), 2, '0')
+                numeric = false
+            }
+            "TZM" {
+                let a = if t.off < 0 { -t.off } else { t.off }
+                s = zpad(a / 60 % 60, 2, fm)
+            }
+            "OF" {
+                // +05:30, +01, -00:01 (seconds dropped)
+                let a = if t.off < 0 { -t.off } else { t.off }
+                s = (if t.off < 0 { "-" } else { "+" }) + zpad(a / 3600, 2, fm)
+                if a / 60 % 60 != 0 { s = s + ":" + strings.padLeft((a / 60 % 60).toStr(), 2, '0') }
+                numeric = false
+            }
             "Y,YYY" { s = (adj / 1000).toStr() + "," + strings.padLeft((adj % 1000).toStr(), 3, '0') }
             "YYYY" { s = zpad(adj, 4, fm) }
             "YYY" { s = zpad(adj % 1000, 3, fm) }
@@ -1875,6 +1891,7 @@ pub type Parsed = value record {
     pub julian: int         // J, -1 none
     pub bc: bool
     pub tzoff: int          // seconds east, from TZH and TZM
+    pub hasTz: bool         // TZH was given
 }
 
 fn bad(f: &str): DbErr { return e("22007", f.toStr()) }
@@ -1919,7 +1936,7 @@ fn isDigitAt(s: &str, i: int): bool { return i < len(s) && s[i] >= '0' && s[i] <
 // Reads s by format f (PostgreSQL's DCH_from_char, not in FX mode: a
 // separator in the format matches any one in the text, spaces are skipped).
 pub fn parseDate(s: &str, f: &str): Result[Parsed, DbErr] {
-    var p = Parsed{year: -2147483648, mon: 0, mday: 0, hour: 0, min: 0, sec: 0, us: 0, pm: 0, yday: 0, julian: -1, bc: false, tzoff: 0}
+    var p = Parsed{year: -2147483648, mon: 0, mday: 0, hour: 0, min: 0, sec: 0, us: 0, pm: 0, yday: 0, julian: -1, bc: false, tzoff: 0, hasTz: false}
     let nodes = parseDch(f, DCH, false)
     var i = 0
     for k in 0..len(nodes) {
@@ -2041,6 +2058,7 @@ pub fn parseDate(s: &str, f: &str): Result[Parsed, DbErr] {
                 let neg = i < len(s) && s[i] == '-'
                 let h = try readNum(s, mut &i, 2, true, &nd.key)
                 p.tzoff = h * 3600
+                p.hasTz = true
                 if neg && h == 0 { p.tzoff = -1 }
             }
             "TZM" {

@@ -1,0 +1,121 @@
+// lexdb_exec: two sessions with different time zones (design/lexdb.md 9.95),
+// each in a task of its own, their statements running at once. Sessions
+// take turns inside a statement (a long one parks every 0.1 ms), so a zone
+// kept anywhere but with the statement would be the other session's after
+// a turn. Session A (Asia/Kolkata) runs long queries whose every row
+// formats, extracts and converts its timestamptz; session B (America/
+// New_York, then Australia/Lord_Howe and SET LOCAL) runs short ones, and
+// changes its zone, while A's run. Each sees only its own zone, every row.
+// expect: A: 3 long queries, every row in its zone: true
+// expect: B: short queries while A ran: true, every one in its zone: true
+// expect: B after its block: Australia/Lord_Howe
+// expect: A at the end: Asia/Kolkata 2026-07-01 05:30:00+05:30
+import "strings"
+import "task"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+
+type Arg = record { st: lexdb_store.Store; which: int }
+
+// The first row of the last result, its columns joined by | (as the
+// session's client sees them: its zone), or the error's SQLSTATE.
+fn one(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if len(r.rows) == 0 { return r.tag }
+            var cells: []str = []
+            for k in 0..len(r.rows[0]) { append(mut &cells, s.text(&r.rows[0][k], r.cols[k].oid)) }
+            return strings.join(&cells, "|")
+        }
+        Err(e) { return e.state }
+    }
+}
+
+// Every row's timestamptz as text, its hour and offset there, and the
+// local time AT LOCAL gives, checked in the statement itself: the rows
+// whose text has the offset and whose AT LOCAL is the text's time.
+const LONG = "select count(*), sum(case when x.at::text like '%+05:30' and extract(timezone from x.at) = 19800 and " +
+             "(x.at at local)::text || '+05:30' = x.at::text and extract(hour from x.at) = extract(hour from x.at at time zone 'Asia/Kolkata') " +
+             "then 1 else 0 end) from ev x, small y"
+
+fn session(a: Arg): int {
+    var s = lexdb_exec.newSession(a.st)
+    if a.which == 0 {
+        let z = one(mut &s, &"set timezone = 'Asia/Kolkata'")
+        var good = true
+        for i in 0..3 {
+            let r = one(mut &s, &LONG)
+            let p = strings.split(&r, "|")
+            if len(p) != 2 || p[0] != p[1] || p[0] != "60000" { good = false }
+        }
+        let m = one(mut &s, &("insert into log values (1, '" + good.toStr() + "')"))
+        let e = one(mut &s, &"select current_setting('TimeZone'), timestamptz '2026-07-01 00:00Z'")
+        let m2 = one(mut &s, &("insert into log values (3, '" + strings.replaceAll(e, "|", " ") + "')"))
+    } else {
+        let z = one(mut &s, &"set timezone = 'America/New_York'")
+        var n = 0
+        var good = true
+        var k = 0
+        while one(mut &s, &"select count(*) from log where id = 1") == "0" {
+            // its zone changed now and then while A's queries run
+            let zone = if k % 3 == 2 { "Australia/Lord_Howe" } else { "America/New_York" }
+            let want = if k % 3 == 2 { "+10:30" } else { "-04" }
+            let wantH = if k % 3 == 2 { "15" } else { "0" }       // 2026-07-01 04:30Z there
+            if k % 3 == 1 {
+                // SET LOCAL in a block: its own zone, then back
+                let b = one(mut &s, &"begin")
+                let l = one(mut &s, &"set local timezone = 'Europe/London'")
+                let r = one(mut &s, &"select at, extract(hour from at) from ev where id = 270")
+                if r != "2026-07-01 05:30:00+01|5" { good = false }
+                let c = one(mut &s, &"commit")
+            }
+            let set = one(mut &s, &("set timezone = '" + zone + "'"))
+            let r = one(mut &s, &"select at, extract(hour from at), at::date, current_setting('TimeZone') from ev where id = 270")
+            let p = strings.split(&r, "|")
+            if len(p) != 4 || !strings.endsWith(&p[0], want) || p[1] != wantH || p[3] != zone { good = false }
+            n += 1
+            k += 1
+            // (a client's next statement comes later: A runs meanwhile)
+            let y = task.yield()
+        }
+        let m = one(mut &s, &("insert into log values (2, '" + (n > 0).toStr() + "|" + good.toStr() + "')"))
+        let b = one(mut &s, &"begin")
+        let t = one(mut &s, &"set timezone = 'Australia/Lord_Howe'")
+        let c = one(mut &s, &"commit")
+        let m2 = one(mut &s, &("insert into log values (4, '" + one(mut &s, &"show timezone") + "')"))
+    }
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(9), lexdb_store.Options{cacheBytes: 128 * 1024 * 1024, segBytes: 4 * 1024 * 1024, ckptBytes: 2 * 1024 * 1024, snapNodes: 50000, bufferedPages: false}, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        let c1 = one(mut &s, &"create table ev (id int primary key, at timestamptz)")
+        let c2 = one(mut &s, &"create table small (id int primary key)")
+        let c3 = one(mut &s, &"create table log (id int primary key, what text)")
+        var i = 0
+        while i < 10000 {
+            var vals: []str = []
+            // 2026-07-01 00:00Z and a minute a row on: July, no change of offset in either zone
+            for j in i..i + 1000 { append(mut &vals, "(" + j.toStr() + ", timestamptz '2026-07-01 00:00Z' + interval '1 minute' * " + j.toStr() + ")") }
+            let r = one(mut &s, &("insert into ev values " + strings.join(&vals, ", ")))
+            i += 1000
+        }
+        let c4 = one(mut &s, &"insert into small values (1), (2), (3), (4), (5), (6)")
+        let warm = one(mut &s, &"select count(*) from ev")
+        task.scope(fn(sc: mut &task.Scope) {
+            sc.spawn(session, Arg{st: st, which: 0})
+            sc.spawn(session, Arg{st: st, which: 1})
+        })
+        println("A: 3 long queries, every row in its zone: " + one(mut &s, &"select what from log where id = 1"))
+        let bw = one(mut &s, &"select what from log where id = 2")
+        let b = strings.split(&bw, "|")
+        println("B: short queries while A ran: " + b[0] + ", every one in its zone: " + b[1])
+        println("B after its block: " + one(mut &s, &"select what from log where id = 4"))
+        println("A at the end: " + one(mut &s, &"select what from log where id = 3"))
+        return 0
+    }).unwrap()
+}

@@ -1,0 +1,219 @@
+// lexdb_wire: the session's time zone on the wire (design/lexdb.md 9.95),
+// from a raw client. ParameterStatus TimeZone at the start, and again
+// before ReadyForQuery whenever it changed: SET, SET LOCAL and the block's
+// end, ROLLBACK, set_config; none for a SET that failed. Rows, arrays of
+// timestamptz and COPY TO in the zone; a parameter bound in it. TimeZone
+// as a startup parameter (a bad one refused); two connections with
+// different zones, their queries interleaved, each in its own.
+// expect: hello: S TimeZone=UTC | Z
+// expect: set: C SET | S TimeZone=Asia/Kolkata | Z
+// expect: rows: T | D 2026-07-01 17:30:00+05:30|{"2026-07-01 17:30:00+05:30","2026-01-01 05:30:00+05:30"}|2026-07-01 05:30:00+05:30 | C SELECT 1 | Z
+// expect: bad: E 22023 invalid value for parameter "TimeZone": "Nowhere" | Z
+// expect: set local: C BEGIN | C SET | T | D 2026-07-01 08:00:00-04 | C SELECT 1 | S TimeZone=America/New_York | Z
+// expect: commit: C COMMIT | S TimeZone=Asia/Kolkata | Z
+// expect: rollback: C BEGIN | C SET | S TimeZone=Europe/London | Z | C ROLLBACK | S TimeZone=Asia/Kolkata | Z
+// expect: set_config: T | D Australia/Lord_Howe | C SELECT 1 | S TimeZone=Australia/Lord_Howe | Z
+// expect: same again: C SET | Z
+// expect: bound: 1 | 2 | D 2026-07-01 12:00:00+10|t | C SELECT 1 | Z
+// expect: copy: C SET | Z | H | d 2026-07-01 08:00:00-04	{"2026-07-01 08:00:00-04"} | c | C COPY 1 | Z
+// expect: startup: S TimeZone=America/St_Johns | Z | T | D 2026-07-01 09:30:00-02:30 | C SELECT 1 | Z
+// expect: bad startup: E 22023 invalid value for parameter "TimeZone": "Nowhere/Land"
+// expect: two at once: Asia/Tokyo 40 of 40, Pacific/Chatham 40 of 40
+import "task"
+import "net"
+import "pgwire"
+import "binary"
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_wire"
+
+type Rx = record { buf: []byte }
+
+type Msg = record { typ: byte; body: []byte }
+
+fn next(c: &net.Conn, rx: mut &Rx): Msg {
+    var chunk = array(65536, byte(0))
+    while len(rx.buf) < 5 || len(rx.buf) < 1 + binary.readI32BE(&rx.buf, 1) {
+        let n = c.read(mut &chunk).unwrap()
+        if n == 0 { return Msg{typ: '?', body: []} }
+        for i in 0..n { append(mut &rx.buf, chunk[i]) }
+    }
+    let size = binary.readI32BE(&rx.buf, 1)
+    var body: []byte = []
+    for i in 5..1 + size { append(mut &body, rx.buf[i]) }
+    var rest: []byte = []
+    for i in 1 + size..len(rx.buf) { append(mut &rest, rx.buf[i]) }
+    let typ = rx.buf[0]
+    rx.buf = rest
+    return Msg{typ: typ, body: body}
+}
+
+fn cstr(b: &[]byte, at: int): str {
+    var i = at
+    while i < len(b) && b[i] != 0 { i += 1 }
+    return strFromBytes(&b[at..i])
+}
+
+// A message as the test shows it ("": one it leaves out, the other
+// ParameterStatus, BackendKeyData, AuthenticationOk).
+fn show(m: &Msg): str {
+    let t = strFromBytes(&[m.typ])
+    if m.typ == 'S' {
+        let name = cstr(&m.body, 0)
+        if name != "TimeZone" { return "" }
+        return "S TimeZone=" + cstr(&m.body, len(name) + 1)
+    }
+    if m.typ == 'K' || m.typ == 'R' || m.typ == '1' || m.typ == '2' { return if m.typ == '1' || m.typ == '2' { t } else { "" } }
+    if m.typ == 'd' {
+        let l = strFromBytes(&m.body)
+        return "d " + l[0..len(l) - 1]
+    }
+    if m.typ == 'C' { return "C " + cstr(&m.body, 0) }
+    if m.typ == 'D' {
+        // the columns joined by |
+        let n = binary.readU16BE(&m.body, 0)
+        var at = 2
+        var cols: []str = []
+        for k in 0..n {
+            let len0 = binary.readI32BE(&m.body, at)
+            at += 4
+            if len0 < 0 { append(mut &cols, "NULL") } else {
+                append(mut &cols, strFromBytes(&m.body[at..at + len0]))
+                at += len0
+            }
+        }
+        return "D " + strings.join(&cols, "|")
+    }
+    if m.typ == 'E' {
+        var code = ""
+        var msg = ""
+        var at = 0
+        while at < len(m.body) && m.body[at] != 0 {
+            let f = m.body[at]
+            let v = cstr(&m.body, at + 1)
+            if f == 'C' { code = v }
+            if f == 'M' { msg = v }
+            at += 2 + len(v)
+        }
+        return "E " + code + " " + msg
+    }
+    return t
+}
+
+// Messages until one of type stop (shown, joined by " | ").
+fn until(c: &net.Conn, rx: mut &Rx, stop: byte): str {
+    var out: []str = []
+    while true {
+        let m = next(c, rx)
+        let s = show(&m)
+        if s != "" { append(mut &out, s) }
+        if m.typ == stop || m.typ == '?' { break }
+    }
+    return strings.join(&out, " | ")
+}
+
+fn query(c: &net.Conn, sql: str) {
+    var o = pgwire.newOut()
+    pgwire.putQuery(mut &o, sql)
+    c.write(o.bytes()).unwrap()
+}
+
+fn connect(addr: &str, settings: &[]pgwire.Setting): net.Conn {
+    let c = net.connect(addr.toStr()).unwrap()
+    var o = pgwire.newOut()
+    pgwire.putStartup(mut &o, "test", "test", settings)
+    c.write(o.bytes()).unwrap()
+    return c
+}
+
+fn client(addr: str) {
+    let none: []pgwire.Setting = []
+    let c = connect(&addr, &none)
+    var rx = Rx{buf: []}
+    println("hello: " + until(&c, mut &rx, 'Z'))
+    query(&c, "create table ev (id int primary key, at timestamptz, ats timestamptz[])")
+    let made = until(&c, mut &rx, 'Z')
+    query(&c, "insert into ev values (1, '2026-07-01 12:00Z', '{\"2026-07-01 12:00Z\"}')")
+    let ins = until(&c, mut &rx, 'Z')
+    query(&c, "set timezone = 'Asia/Kolkata'")
+    println("set: " + until(&c, mut &rx, 'Z'))
+    query(&c, "select at, array[at, timestamptz '2026-01-01 00:00Z'], timestamptz '2026-07-01 00:00Z' from ev")
+    println("rows: " + until(&c, mut &rx, 'Z'))
+    query(&c, "set timezone = 'Nowhere'")
+    println("bad: " + until(&c, mut &rx, 'Z'))
+    query(&c, "begin; set local timezone = 'America/New_York'; select at from ev")
+    println("set local: " + until(&c, mut &rx, 'Z'))
+    query(&c, "commit")
+    println("commit: " + until(&c, mut &rx, 'Z'))
+    query(&c, "begin; set timezone = 'Europe/London'")
+    let b = until(&c, mut &rx, 'Z')
+    query(&c, "rollback")
+    println("rollback: " + b + " | " + until(&c, mut &rx, 'Z'))
+    query(&c, "select set_config('timezone', 'australia/lord_howe', false)")
+    println("set_config: " + until(&c, mut &rx, 'Z'))
+    query(&c, "set timezone = 'Australia/Lord_Howe'")
+    println("same again: " + until(&c, mut &rx, 'Z'))
+    // a timestamptz parameter, sent as text: read in the session's zone
+    query(&c, "set timezone = 'Australia/Brisbane'")
+    let br = until(&c, mut &rx, 'Z')
+    var o = pgwire.newOut()
+    let tz = pgwire.Param{oid: 1184, binary: false, null: false, data: "2026-07-01 12:00"}
+    pgwire.putParse(mut &o, "", "select $1, $1 = timestamptz '2026-07-01 02:00Z'", &[tz])
+    pgwire.putBind(mut &o, "", "", &[tz])
+    pgwire.putExecute(mut &o, "", 0)
+    pgwire.putSync(mut &o)
+    c.write(o.bytes()).unwrap()
+    println("bound: " + until(&c, mut &rx, 'Z'))
+    query(&c, "set timezone = 'America/New_York'")
+    let s1 = until(&c, mut &rx, 'Z')
+    query(&c, "copy (select at, ats from ev) to stdout")
+    println("copy: " + strings.replaceAll(s1, " | S TimeZone=America/New_York", "") + " | " + until(&c, mut &rx, 'Z'))
+    // TimeZone as a startup parameter
+    let c2 = connect(&addr, &[pgwire.Setting{name: "TimeZone", value: "America/St_Johns"}])
+    var rx2 = Rx{buf: []}
+    let hello2 = until(&c2, mut &rx2, 'Z')
+    query(&c2, "select timestamptz '2026-07-01 12:00Z'")
+    println("startup: " + hello2 + " | " + until(&c2, mut &rx2, 'Z'))
+    let c3 = connect(&addr, &[pgwire.Setting{name: "timezone", value: "Nowhere/Land"}])
+    var rx3 = Rx{buf: []}
+    println("bad startup: " + until(&c3, mut &rx3, 'E'))
+    // two connections at once, their queries interleaved
+    let a = connect(&addr, &none)
+    var ra = Rx{buf: []}
+    let ha = until(&a, mut &ra, 'Z')
+    let d = connect(&addr, &none)
+    var rd = Rx{buf: []}
+    let hd = until(&d, mut &rd, 'Z')
+    query(&a, "set timezone = 'Asia/Tokyo'")
+    query(&d, "set timezone = 'Pacific/Chatham'")
+    let sa = until(&a, mut &ra, 'Z')
+    let sd = until(&d, mut &rd, 'Z')
+    var okA = 0
+    var okD = 0
+    for i in 0..40 {
+        let q = "select at, extract(hour from at), current_setting('TimeZone') from ev, generate_series(1, 200) g where g = 200"
+        query(&a, q)
+        query(&d, q)
+        if until(&a, mut &ra, 'Z') == "T | D 2026-07-01 21:00:00+09|21|Asia/Tokyo | C SELECT 1 | Z" { okA += 1 }
+        if until(&d, mut &rd, 'Z') == "T | D 2026-07-02 00:45:00+12:45|0|Pacific/Chatham | C SELECT 1 | Z" { okD += 1 }
+    }
+    println("two at once: Asia/Tokyo " + okA.toStr() + " of 40, Pacific/Chatham " + okD.toStr() + " of 40")
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        let f = s.start(lexdb_wire.acceptLoop, lexdb_wire.AcceptArg{ln: ln, st: st})
+        client(addr)
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(7), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000, bufferedPages: false}, body).unwrap()
+}

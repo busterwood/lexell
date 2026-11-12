@@ -1,8 +1,8 @@
 # lexdb against PostgreSQL: where it stands and what is missing
 
 Status: a review taken on 2026-11-12, at commit 9133e91a (branch `lexdb`,
-after design/lexdb.md 9.91), brought up to date for 9.92 to 9.94
-(merged as 87d2a0b1). It replaces the review of 2026-11-10 (commit
+after design/lexdb.md 9.91), brought up to date for 9.92 to 9.95
+(9.94 merged as 87d2a0b1). It replaces the review of 2026-11-10 (commit
 238ff702, after 9.46). The order of work at the end is a proposal; the
 choices in it are the user's.
 
@@ -17,11 +17,15 @@ Answers were not compared with PostgreSQL here: the suites that
 `tests/lexdb/gen_pg.py` generates from PostgreSQL 18 do that, feature by
 feature.
 
-## 1. Closed since the first review (9.75 to 9.94)
+## 1. Closed since the first review (9.75 to 9.95)
 
 - **Types:**
   - date, time, timestamp, timestamptz and interval, with their operators,
     `extract`, `date_trunc` and `age` (9.76);
+  - session time zones: `SET TIME ZONE` and its forms, timestamptz shown
+    and read in the session's zone (DST gaps and overlaps as PostgreSQL),
+    `AT TIME ZONE`, `AT LOCAL` and `timezone()`, and ParameterStatus
+    `TimeZone` (9.95);
   - `real` and `double precision` (9.79);
   - `bytea`, and `uuid` with `gen_random_uuid()` (9.78);
   - enum types (9.90).
@@ -117,13 +121,7 @@ In three tiers, by how soon a real application meets the gap.
    - It is the last thing Alembic's probe stopped at (9.90), and Django's
      JSONField needs it.
    - Waiting is the user's decision (9.85).
-2. **Time zones.** `SET timezone` is accepted and ignored: `SHOW timezone`
-   stays `UTC`, and timestamptz is always shown in UTC. Now that there are
-   time types this gives silently wrong output, which is worse than an
-   error.
-   - `AT TIME ZONE` and `timezone()` fail.
-   - The zone rules exist already (`tz.instantOf`, 9.76).
-3. **What 9.92 and 9.94 left of the functions:**
+2. **What 9.92 and 9.94 left of the functions:**
    - row values outside comparisons (`SELECT (1, 2)`, `row_to_json`);
    - multi-dimensional arrays, `array_fill` and `array_sort`.
 
@@ -209,12 +207,9 @@ In three tiers, by how soon a real application meets the gap.
 
 ## 3. A proposed order
 
-1. **Time zones:** `SET timezone`, `AT TIME ZONE`, and timestamptz shown in
-   the session's zone. Small now that the rules exist, and it removes a
-   silent wrong answer.
-2. **json and jsonb,** when the user decides.
-3. **Binary formats,** for asyncpg and JDBC.
-4. **Data-modifying CTEs, temporary tables and generated columns.**
+1. **json and jsonb,** when the user decides.
+2. **Binary formats,** for asyncpg and JDBC.
+3. **Data-modifying CTEs, temporary tables and generated columns.**
 
 **Open questions for the user:**
 - Is this order right?

@@ -60,6 +60,7 @@ type Wire = record {
     sess: lexdb_exec.Session
     st: lexdb_store.Store
     skipping: bool
+    tzShown: str                // the TimeZone the client was last told (ParameterStatus, 9.95)
 }
 
 // The prepared statements and portals of a connection.
@@ -305,6 +306,13 @@ fn (w: mut &Wire) error(e: &lexdb_base.DbErr) {
 }
 
 fn (w: mut &Wire) ready() {
+    // TimeZone changed (SET, set_config, a block's end): the client is told
+    // before ReadyForQuery, as PostgreSQL reports a GUC_REPORT setting (9.95)
+    let tz = w.sess.zone().name
+    if tz != w.tzShown {
+        w.paramStatus("TimeZone", tz)
+        w.tzShown = tz
+    }
     var b = newStrBuf()
     b.addByte(w.sess.status())
     w.msg('Z', &b)
@@ -335,8 +343,10 @@ fn (w: mut &Wire) rowDesc(cols: &[]lexdb_exec.OutCol) {
     w.msg('T', &b)
 }
 
-// DataRows, written straight into the output (each value's text made once).
-fn (w: mut &Wire) dataRows(rows: &[][]Val) {
+// DataRows, written straight into the output (each value's text made once;
+// a timestamptz's in the session's zone: 9.95).
+fn (w: mut &Wire) dataRows(rows: &[][]Val, cols: &[]lexdb_exec.OutCol) {
+    let zone = w.sess.zone()
     var ts: []str = []
     for r in rows {
         replace(mut &ts, [])
@@ -346,7 +356,7 @@ fn (w: mut &Wire) dataRows(rows: &[][]Val) {
                 append(mut &ts, "")
                 size += 4
             } else {
-                let t = lexdb_exec.text(&v)
+                let t = lexdb_exec.textOut(&v, if len(ts) < len(cols) { cols[len(ts)].oid } else { 0 }, &zone)
                 size += 4 + len(t)
                 append(mut &ts, t)
             }
@@ -500,7 +510,7 @@ fn (w: mut &Wire) query(sql: &str): Result[Unit, io.IoError] {
                             if res.copy == lexdb_exec.COPY_OUT { w.copyOut(&res) }
                             if res.hasRows {
                                 w.rowDesc(&res.cols)
-                                w.dataRows(&res.rows)
+                                w.dataRows(&res.rows, &res.cols)
                             }
                             w.complete(&res.tag)
                         }
@@ -637,7 +647,7 @@ fn (w: mut &Wire) bindMsg(ps: mut &Ps, body: &str): Result[Unit, lexdb_base.DbEr
         return Err(protoErr("bind message supplies " + np.toStr() + " parameters, but prepared statement \"" + name +
                             "\" requires " + need.toStr()))
     }
-    vals = try lexdb_exec.paramVals(&texts, &p.ptypes)
+    vals = try w.sess.paramVals(&texts, &p.ptypes)
     }
     ps.portals.put(portal, Portal{stmt: name, params: vals})
     w.empty('2')
@@ -715,7 +725,7 @@ fn (w: mut &Wire) executeMsg(ps: mut &Ps, body: &str): Result[Unit, lexdb_base.D
     if res.hasRows && p.colsAt >= 0 && !sameCols(&res.cols, &p.cols) {
         return Err(lexdb_base.err("0A000", "cached plan must not change result type"))
     }
-    if res.hasRows { w.dataRows(&res.rows) }
+    if res.hasRows { w.dataRows(&res.rows, &res.cols) }
     w.complete(&res.tag)
     return Ok(Unit{})
 }
@@ -774,16 +784,25 @@ fn startup(w: mut &Wire, ctx: &[]tls.Context): Result[bool, io.IoError] {
                 // the startup parameters: name, value, ..., then an empty name
                 var at = 4
                 var user = ""
+                var zone = ""
                 while at < len(m.body) {
                     let ke = strings.indexOf(&m.body, "\x00", at)
                     if ke <= at { break }
                     let ve = strings.indexOf(&m.body, "\x00", ke + 1)
                     if ve < 0 { break }
                     if m.body[at..ke] == "user" { user = m.body[ke + 1..ve].toStr() }
+                    // TimeZone as a startup parameter (pgJDBC sends it; PGTZ libpq's)
+                    if strings.toLowerAscii(m.body[at..ke]) == "timezone" { zone = m.body[ke + 1..ve].toStr() }
                     at = ve + 1
                 }
                 if len(user) == 0 { return w.fatal(&"28000", &"no PostgreSQL user name specified in startup packet") }
                 w.sess.setUser(&user)
+                if zone != "" {
+                    match w.sess.startupZone(&zone) {
+                        Ok(_) {}
+                        Err(x) { return w.fatal(&x.state, &x.msg) }
+                    }
+                }
                 if !(try w.authenticate(&user)) { return Ok(false) }
                 var b = newStrBuf()
                 binary.addU32BE(mut &b, 0)
@@ -794,7 +813,8 @@ fn startup(w: mut &Wire, ctx: &[]tls.Context): Result[bool, io.IoError] {
                 w.paramStatus("DateStyle", "ISO, MDY")
                 w.paramStatus("integer_datetimes", "on")
                 w.paramStatus("standard_conforming_strings", "on")
-                w.paramStatus("TimeZone", "UTC")
+                w.tzShown = w.sess.zone().name
+                w.paramStatus("TimeZone", w.tzShown)
                 w.paramStatus("application_name", "")
                 var k = newStrBuf()
                 binary.addU32BE(mut &k, 1)
@@ -982,7 +1002,7 @@ pub fn serve(a: ConnArg): int {
     let ConnArg{conn: c, st: st, id: _, ctx: ctx} = move(a)
     let nd = c.setNoDelay(true)
     var w = Wire{c: c, eng: [], raw: [], bind: "", inBuf: array(65536, byte(0)), inPos: 0, inEnd: 0, out: newStrBuf(), sess: lexdb_exec.newSession(st), st: st,
-                 skipping: false}
+                 skipping: false, tzShown: ""}
     var ps = Ps{stmts: newMap(), portals: newMap()}
     if startup(mut &w, &ctx).unwrapOr(false) {
         while true {

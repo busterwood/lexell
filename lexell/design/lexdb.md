@@ -5746,8 +5746,8 @@ microseconds).
   what lets the whole range fit 64 bits of microseconds; from 1970 it would
   end about 30 years short. PostgreSQL's binary format is the same numbers.
 - `infinity` and `-infinity` are the largest and smallest ints.
-- A timestamptz is an instant, shown in the session's zone, which is
-  always UTC so far (`SET TimeZone` is to come). Input with an offset or a
+- A timestamptz is an instant, shown in the session's zone, which was
+  always UTC then (`SET TimeZone` came in 9.95). Input with an offset or a
   zone name (`Europe/London`) is converted, using `tz.instantOf`'s rules.
 
 **Stored:**
@@ -7697,3 +7697,224 @@ The whole lexdb suite passes.
   be grouped by);
 - row values outside comparisons (composite types);
 - `(SELECT x, y) = (a, b)` with the subquery on the left.
+
+### 9.95 Session time zones and AT TIME ZONE
+
+Item 1 of design/lexdb-gaps.md's order. `SET timezone` was accepted and
+ignored, so a timestamptz was always shown and read in UTC: a silent wrong
+answer. Now the session has a time zone, as PostgreSQL 18's.
+
+**Setting it** (`lexdb_time.settingZone`, as PostgreSQL's `check_timezone`):
+- `SET [SESSION | LOCAL] TIME ZONE value | LOCAL | DEFAULT`, `SET
+  timezone = | TO value | DEFAULT`, `RESET timezone`, `RESET TIME ZONE`,
+  `RESET ALL`, `set_config('timezone', ...)`, and TimeZone as a startup
+  parameter (pgJDBC sends it). `SHOW TIME ZONE` and `SHOW timezone`
+  (column `TimeZone`), `current_setting('TimeZone')`.
+- **A name**, matched without regard to case: `europe/london` is shown
+  `Europe/London`, the file's spelling (`zoneNamed` looks each part up in
+  its directory when the exact name is not a file).
+- **A number of hours** (`-5`, `5.5`, `'+5'`), and `INTERVAL '...' [HOUR
+  [TO MINUTE]]`: east of UTC, the SQL sign. They are named as PostgreSQL
+  names them, `<-05>+05`, `<+05:30>-05:30` (`fixedZone`). Under 168 hours;
+  no months or days.
+- **Any other text is a POSIX rule**, its sign west: `'+05:30'` is five
+  and a half hours west, `UTC+3` three hours west, `EST5EDT`, `<+0330>-3:30`.
+- **LOCAL, DEFAULT and RESET** give lexdb's default, UTC: lexdb has no
+  server configuration.
+- **An unknown zone** is 22023 `invalid value for parameter "TimeZone":
+  "..."`.
+- **Transactions:** SET LOCAL and `set_config(..., true)` last to the
+  block's end (`localUndo`); a block rolled back takes its SET back
+  (`savedZone`), as the other settings.
+
+**The carrier.** `lexdb_time.Zone` is a value record: the name SHOW gives,
+and either a fixed offset or `Option[task.Frozen[tz.Zone]]`, the rules.
+- **Why it travels with the statement.** Sessions are tasks on one
+  thread, and a statement parks in the middle: its turns every 0.1 ms, a
+  row-lock wait, a disk read, a socket send. A global "current zone"
+  would be another session's by the time the statement reads it again.
+  Globals must be copy types anyway (SPEC 5.2).
+- **The path:** the Session's `zone` is copied to each statement's
+  `Txn.zone` (as `path`: in `runStmt`, at BEGIN, and on a SET in a block).
+  From there it goes to `SeqEnv.zone`, which eval reaches as `env.seq`
+  (`envZone`; UTC with no session). The wire takes the session's.
+- **The zones** are loaded once for the program: `var ZONES: once
+  task.Shared[ZoneReg]`, by lower-case name, with the names that are none.
+  A file is read outside `with` (the read may park). A Zone costs a count
+  to copy; UTC and fixed offsets have no rules.
+- **The functions with a zone:** lexdb_time's `fmtTstz`, `parseTstz`,
+  `parseDate` and `parseTs` ('today'), `tsToTstz`, `tstzToTs`, `tstzPlus`,
+  `extractTs`. In lexdb_exec, zone-aware variants sit beside the zone-free
+  functions: `textZ`/`textOut` beside `text`, `coerceZ` beside `coerce`,
+  `compareZ`/`compareTime` beside `compare`, `arithZ` beside `arith`, and
+  `callAt`, `callTime` and `callFn`. The zone-free ones (about 190 callers)
+  stay UTC. For UTC, `coerceZ` and `textOut` return at once; compare and
+  arith look at the zone only for the time kinds.
+- **Where the zone is used:**
+  - eval's comparisons, arithmetic, `||`, casts and calls;
+  - the index path's bounds (`pathScans`) and hash join keys;
+  - values stored by INSERT, UPDATE, ON CONFLICT, COPY FROM and ALTER
+    COLUMN TYPE, and DEFAULTs (`defaultValue` now gets the statement's
+    session: `DEFAULT current_date` is the session's date, and `now()` the
+    transaction's start, where it was the clock);
+  - VALUES lists, `generate_series`, and parameters at Bind
+    (`Session.paramVals`);
+  - the wire's DataRows and COPY TO (`textOut`, by the column's type);
+  - the batches' constants: `bValCmpOf` reads a text constant as the date
+    or time column's type in the zone, and leaves a constant of another
+    time kind to the row path when the zone is not UTC.
+- **Plans:** nothing zone-dependent is folded when a plan is made. The plan
+  cache's key has the zone's name anyway when it is not UTC, as it has the
+  role's (9.83).
+
+**PostgreSQL's rules for a local time** (`Zone.toUtc`, after
+`DetermineTimeZoneOffset`):
+- one in a spring-forward gap is read with the offset before the change:
+  02:30 on the day New York's clocks go forward is 03:30-04;
+- one that happens twice is the later instant, the offset after the change.
+  `tz.instantOf` takes the earlier, as Python does, so lexdb does not use
+  it. Its comment now says so.
+
+**Output.** Offsets as PostgreSQL writes them: `+01`, `+05:30`, `-03:30`,
+and the LMT era's seconds (`-00:01:15`).
+
+**Input.** A timestamptz without a zone is read in the session's. With one:
+- an offset;
+- an abbreviation: PostgreSQL's Default set, 195 of them; those whose
+  meaning changed over time (MSK) are fixed at today's offset;
+- a zone's name or a POSIX rule.
+An unknown name is 22023 `time zone "x" not recognized`, as PostgreSQL
+spells it, in lower case.
+
+**The functions:**
+- **Casts** between date, timestamp and timestamptz (and to time and text)
+  are in the session's zone; so are comparisons across them, IN, GREATEST,
+  LEAST and NULLIF. GREATEST and LEAST now give the common type, so a
+  timestamp among timestamptz is converted.
+- **`timestamptz ± interval`:** the months and days in the zone, so a day
+  across a change is 23 or 25 hours. `generate_series(timestamp | timestamptz,
+  ..., interval)` is new and steps the same way.
+- **`extract`/`date_part`:** a timestamptz's fields in the zone, and
+  `timezone`, `timezone_hour` and `timezone_minute` (a timestamp's are
+  0A000, as PostgreSQL's).
+- **`date_trunc`:** a timestamptz is cut in the zone, and a day or more is
+  read back by the rules above. `date_trunc(field, x, zone)` cuts in that
+  zone.
+- **`age`** takes a timestamptz's calendar in the zone.
+- **`current_date`, `localtimestamp`, `current_time`, `localtime`** are
+  the transaction's start in the zone.
+- **`to_char`:** `TZ` and `tz` give the abbreviation (`IST`, `+05`, `LMT`,
+  `""` for a POSIX rule without one); `OF` gives `+05:30` (`FMOF` `+5:30`);
+  `TZH` and `TZM`. A timestamp gives `""` and `+00`.
+- **`to_timestamp(text, format)`:** without TZH it reads in the zone.
+- **`make_timestamp` and `make_timestamptz`** (with an optional zone) are
+  new.
+- **AT TIME ZONE:**
+  - the parser makes `x AT TIME ZONE z` the call `timezone(z, x)`, and `x
+    AT LOCAL` the call `timezone(x)` (PostgreSQL 17's). It binds tighter
+    than `^`, as PostgreSQL's AT does;
+  - a timestamptz gives the local timestamp there;
+  - a timestamp is read there and gives a timestamptz;
+  - a date or an untyped text is a timestamptz first, as PostgreSQL
+    resolves them;
+  - the zone is an abbreviation, a name or a POSIX rule (`atZone`, as
+    PostgreSQL's `DecodeTimezoneName`: `'+5'` is five hours west here, not
+    east as in SET), or an interval (east; months or days are 22023).
+
+**The wire.** ParameterStatus `TimeZone` goes out at the start with the
+session's zone. After that it goes before ReadyForQuery whenever the zone
+differs from what the client was last told: after SET, `set_config`, a
+block's end undoing SET LOCAL, or ROLLBACK. That is when PostgreSQL reports
+a GUC_REPORT setting. No other parameter is sent again: none of them can
+change in lexdb. A bad TimeZone at the start is a FATAL 22023.
+
+**Arrays of timestamptz** are kept as text (9.27), each element with its
+offset, in UTC: the form is the same whatever the zone that stored them.
+- Their elements are read in the session's zone on the way in.
+- They are shown in the session's zone on the way out: `textOut` rewrites
+  each element for a column of type `timestamptz[]`, on the wire and in
+  COPY TO.
+- An element taken out (`x[i]`, `unnest`) is that text with the type
+  timestamptz, and is shown the same way.
+
+**Still UTC** (no session there):
+- CHECK constraints;
+- index expressions and partial index predicates. PostgreSQL refuses an
+  index expression that depends on the zone (`tstz::date`, `date_trunc` of
+  a timestamptz) as not IMMUTABLE. lexdb accepts it and computes it in
+  UTC, so a query on such an expression from another zone may get
+  different answers by the index than without it;
+- a partial index's implication check (`constVal`);
+- a DEFAULT checked at CREATE TABLE (only checked);
+- the catalog's text of a timestamptz literal (`exprText`; it carries
+  `+00`, so it reads back the same);
+- `json_build_object`;
+- the text functions given a timestamptz without a cast (`length`,
+  `upper`, ...). `||`, `concat`, `concat_ws` and `format` do use the zone;
+- a window's RANGE offset on a timestamptz (`rangeTarget`).
+
+**Differences from PostgreSQL:**
+- the default zone is UTC; `log_timezone` stays UTC;
+- the abbreviations are fixed: no `timezone_abbreviations` setting, no
+  `pg_timezone_names` or `pg_timezone_abbrevs`. `pg_settings` has no rows,
+  so none for TimeZone;
+- `time with time zone` is still refused, so `current_time` is a time;
+- zones with leap seconds (`right/UTC`) are accepted where PostgreSQL
+  refuses them;
+- `DISCARD ALL` does not reset the zone;
+- a view's definition shows AT TIME ZONE as `timezone(z, x)`;
+- the startup check comes before authentication.
+
+**Tests:**
+- **`exec_tz`**, 203 statements, a new `gen_pg.py` suite (seed 95, against
+  a scratch PostgreSQL 18.6 started with `timezone=UTC`), all the same. Its
+  queries SET timezone themselves. The test program now shows values as
+  the session's client sees them (`Session.text`), which changes nothing
+  for the suites made under UTC. It covers:
+  - SET's forms and errors, SHOW, `current_setting` and `set_config`;
+  - output in London, St John's, Kolkata, Lord Howe, LMT and BC;
+  - input in the DST gap and overlap of London, New York and Lord Howe's
+    half hour, with offsets, abbreviations and names;
+  - casts and comparisons across the types; `||`, `concat` and `format`;
+  - a day across DST, and `generate_series`;
+  - `extract`, `date_trunc` (two and three arguments), `age`, `to_char`'s
+    zone patterns, `to_timestamp`, `make_timestamptz`;
+  - AT TIME ZONE every way, and AT LOCAL;
+  - `current_date` and the rest checked against `now()` in two zones a day
+    apart;
+  - DEFAULT `current_date`, `localtimestamp` and `now()`;
+  - a column stored under Kolkata and read under London and UTC: its
+    index, ranges, grouping and UPDATE;
+  - arrays; SET LOCAL, COMMIT and ROLLBACK.
+- **`exec_tzsessions`:** two sessions in tasks of their own.
+  - A (Kolkata) runs three queries over 60000 rows. Each row's text,
+    offset, hour and AT LOCAL are checked in the statement itself.
+  - Meanwhile B changes its zone (New York, Lord Howe, SET LOCAL London)
+    between short queries, about 85 of them while A's run, so they interleave
+    inside A's statements.
+  - Each sees only its own zone, every row. This is the reason for the
+    carrier: a global zone would fail it.
+- **`wire_tz`**, a raw client:
+  - ParameterStatus at the start, after SET, SET LOCAL and COMMIT,
+    ROLLBACK and `set_config`; none after a failed SET or a SET to the same
+    zone;
+  - rows and arrays in the zone;
+  - a timestamptz parameter bound in it;
+  - COPY TO;
+  - TimeZone as a startup parameter, and a bad one;
+  - two connections with different zones, their queries interleaved.
+- `exec_time` (made under UTC) passes unchanged. The whole lexdb suite
+  passes, 89 tests.
+
+Found on the way:
+- `DEFAULT current_date` (and `localtimestamp`, `current_time`) made a
+  table that could not be read back (XX001): the catalog wrote the call as
+  `current_date()`. Its text is now `current_date`.
+- `generate_series` refused timestamps.
+
+**Not done:**
+- `generate_series(..., zone)` and `date_add`/`date_subtract` with a zone
+  (PostgreSQL 16's);
+- `timezone(zone, timetz)`;
+- `pg_timezone_names`;
+- the zone in the places listed as UTC above.

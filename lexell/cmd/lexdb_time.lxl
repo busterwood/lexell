@@ -15,10 +15,12 @@
 // are the largest and smallest ints.
 //
 // Text is PostgreSQL's with DateStyle ISO and IntervalStyle postgres. A
-// timestamptz is shown and read in the session's time zone, UTC for now.
+// timestamptz is shown and read in the session's time zone (Zone, 9.95).
 import "strings"
 import "time"
 import "tz"
+import "task"
+import "fs"
 import "./lexdb_base"
 
 pub const DAY_US = 86400000000
@@ -78,6 +80,8 @@ pub fn tsOf(l: time.LocalDateTime): Option[int] {
 }
 
 pub fn instantOf(us: int): time.Time { return time.fromMicros(us + UNIX_US) }
+// An instant's Unix second.
+pub fn unixSecOf(us: int): int { return floorDiv(us, SEC_US) + UNIX_US / SEC_US }
 pub fn usOfInstant(t: time.Time): int { return t.unixMicros() - UNIX_US }
 
 pub fn durOf(us: int): time.Duration { return time.micros(us) }
@@ -85,8 +89,309 @@ pub fn durOf(us: int): time.Duration { return time.micros(us) }
 pub fn ivalOf(i: &time.Interval): Ival { return Ival{months: i.months, days: i.days, us: i.time.roundTo(1000).totalMicros()} }
 pub fn libIval(v: &Ival): time.Interval { return time.interval(v.months, v.days, time.micros(v.us)) }
 
-// The session's time zone: UTC for now (SET TimeZone is to come).
-fn zone(): tz.Zone { return tz.utc() }
+// ---- time zones (design/lexdb.md 9.95)
+//
+// A session's time zone, as the statement carries it: what SHOW TimeZone
+// gives, and either a fixed offset or a zone's rules. The rules are loaded
+// once for the program (ZONES) and shared by a counted handle, so a Zone is
+// a copy value that costs a count to copy. It travels with the statement
+// (lexdb_store.Txn.zone, lexdb_exec's SeqEnv) and is passed to every
+// function here that needs one: sessions are tasks on one thread, and a
+// statement parks (its turns, row-lock waits, disk reads, socket sends), so
+// a global "current zone" would be another session's by the time it is read.
+pub type Zone = value record {
+    pub name: str                           // as SHOW TimeZone gives it
+    off: int                                // fixed: seconds east of UTC
+    abbr: str                               // fixed: its abbreviation (to_char's TZ)
+    rules: Option[task.Frozen[tz.Zone]]     // a zone's rules; None: fixed at off
+}
+
+pub fn utc(): Zone { return Zone{name: "UTC", off: 0, abbr: "UTC", rules: None} }
+
+// Whether the zone is UTC's offset always (no conversion to make).
+pub fn (z: &Zone) isUtc(): bool { return z.rules.isNone() && z.off == 0 }
+
+// The offset (seconds east), DST flag and abbreviation at Unix second sec.
+pub fn (z: &Zone) info(sec: int): tz.Info {
+    match z.rules {
+        Some(r) { return r.read(fn(t: &tz.Zone): tz.Info { return t.at(sec) }) }
+        None { return tz.Info{offset: z.off, dst: false, abbr: z.abbr} }
+    }
+}
+
+// The offset (seconds east) at Unix second sec.
+pub fn (z: &Zone) offsetAt(sec: int): int {
+    match z.rules {
+        Some(r) { return r.read(fn(t: &tz.Zone): int { return t.at(sec).offset }) }
+        None { return z.off }
+    }
+}
+
+// The offset in effect at an instant (microseconds since 2000).
+pub fn (z: &Zone) offsetOf(us: int): int {
+    if z.rules.isNone() { return z.off }
+    return z.offsetAt(floorDiv(us, SEC_US) + UNIX_US / SEC_US)
+}
+
+// The instant of a local time (microseconds since 2000) in the zone, by
+// PostgreSQL's rules (DetermineTimeZoneOffset): a local time that happens
+// twice, when clocks go back, is the later instant (the offset after the
+// change); one that never happens, when they go forward, is read with the
+// offset before the change. (tz.instantOf takes the earlier instant of an
+// overlap, as Python does.)
+pub fn (z: &Zone) toUtc(local: int): int {
+    if z.rules.isNone() { return local - z.off * SEC_US }
+    let sec = floorDiv(local, SEC_US) + UNIX_US / SEC_US
+    let a = z.offsetAt(sec - 86400)            // before any change near
+    let b = z.offsetAt(sec + 86400)            // after it
+    var off = a
+    if a != b {
+        let before = z.offsetAt(sec - a) == a
+        let after = z.offsetAt(sec - b) == b
+        if after && !before { off = b }
+        else if before && !after { off = a }
+        else if after { off = b }               // both: an overlap, the later
+        else { off = a }                        // neither: a gap, the offset before
+    } else {
+        off = z.offsetAt(sec - a)
+    }
+    return local - off * SEC_US
+}
+
+// A fixed offset (seconds east) as PostgreSQL names it for SET TIME ZONE
+// -5 or INTERVAL '...': "<-05>+05", "<+05:30>-05:30" (a POSIX rule: the
+// sign west), abbreviated "-05", "+05:30".
+pub fn fixedZone(east: int): Zone {
+    let a = if east < 0 { -east } else { east }
+    var t = pad(a / 3600, 2)
+    if a % 3600 != 0 {
+        t = t + ":" + pad(a / 60 % 60, 2)
+        if a % 60 != 0 { t = t + ":" + pad(a % 60, 2) }
+    }
+    let ab = (if east < 0 { "-" } else { "+" }) + t
+    let name = "<" + ab + ">" + (if east < 0 { "+" } else { "-" }) + t
+    return Zone{name: name, off: east, abbr: ab, rules: None}
+}
+
+// The zones loaded, by their names in lower case, and the names that are
+// none: each zone file is read once for the program.
+type ZoneReg = record { found: Map[str, Zone]; missing: Map[str, bool] }
+
+var ZONES: once task.Shared[ZoneReg]
+
+fn registry(): task.Shared[ZoneReg] {
+    if !ZONES.isSet() { ZONES.set(task.shared(ZoneReg{found: newMap(), missing: newMap()})) }
+    return ZONES.get()
+}
+
+// The zone with this name, as PostgreSQL's pg_tzset finds it: a file under
+// /usr/share/zoneinfo, its name matched without regard to case (the file's
+// own spelling is the zone's name), or a POSIX TZ rule ("UTC+3",
+// "<+0330>-3:30", "EST5EDT", and "+05:30" with no abbreviation, as
+// PostgreSQL allows: its sign is POSIX's, west). None: no such zone.
+pub fn zoneNamed(name: &str): Option[Zone] {
+    let key = strings.toLowerAscii(name)
+    if key == "utc" { return Some(utc()) }
+    let reg = registry()
+    var got: Option[Zone] = None
+    var miss = false
+    reg.with(fn(r: mut &ZoneReg) {
+        got = r.found.get(&key)
+        miss = r.missing.has(&key)
+    })
+    if got.isSome() || miss { return got }
+    // (read outside with: reading a file may park)
+    let z = loadZone(name)
+    reg.with(fn(r: mut &ZoneReg) {
+        match z {
+            Some(x) { r.found.put(key, x) }
+            None { r.missing.put(key, true) }
+        }
+    })
+    return z
+}
+
+fn loadZone(name: &str): Option[Zone] {
+    if len(name) == 0 || len(name) > 255 || name[0] == '/' || name[0] == ':' || strings.contains(name, "..") { return None }
+    match tz.load(name.toStr()) {
+        Ok(z) { return Some(Zone{name: name.toStr(), off: 0, abbr: "", rules: Some(task.freeze(z))}) }
+        Err(_) {}
+    }
+    // the name in another case: each part looked for in its directory
+    var path = ""
+    var ok = true
+    for part in strings.split(name, "/") {
+        let dir = "/usr/share/zoneinfo" + (if path == "" { "" } else { "/" + path })
+        let want = strings.toLowerAscii(part)
+        var found = ""
+        match fs.listNames(dir) {
+            Ok(ns) { for n in ns { if found == "" && strings.toLowerAscii(n) == want { found = n } } }
+            Err(_) {}
+        }
+        if found == "" {
+            ok = false
+            break
+        }
+        path = if path == "" { found } else { path + "/" + found }
+    }
+    if ok {
+        match tz.load(path) {
+            Ok(z) { return Some(Zone{name: path, off: 0, abbr: "", rules: Some(task.freeze(z))}) }
+            Err(_) {}
+        }
+    }
+    // a POSIX rule; with no abbreviation, an offset alone
+    match bareOffset(name) {
+        Some(o) { return Some(Zone{name: name.toStr(), off: -o, abbr: "", rules: None}) }
+        None {}
+    }
+    let p = tz.fromSpec(name.toStr())
+    if p.name != name.toStr() { return None }  // not a rule (fromSpec gave UTC)
+    return Some(Zone{name: name.toStr(), off: 0, abbr: "", rules: Some(task.freeze(p))})
+}
+
+// [+-]hh[:mm[:ss]] as seconds, the sign as written.
+fn bareOffset(s: &str): Option[int] {
+    var i = 0
+    var sign = 1
+    if len(s) > 0 && (s[0] == '+' || s[0] == '-') {
+        if s[0] == '-' { sign = -1 }
+        i = 1
+    }
+    let parts = strings.split(&s[i..len(s)], ":")
+    if len(parts) > 3 { return None }
+    var total = 0
+    for k in 0..len(parts) {
+        let n = num(&parts[k], 0, len(parts[k]))
+        if n < 0 || len(parts[k]) > 3 || (k > 0 && n > 59) { return None }
+        total = total * 60 + n
+    }
+    for k in len(parts)..3 { total = total * 60 }
+    if total > 167 * 3600 + 3599 { return None }
+    return Some(sign * total)
+}
+
+// PostgreSQL's time zone abbreviations (its Default set; those whose
+// meaning changed over time with their offset now): name and seconds east.
+const ABBREVS: []str = [
+                         "acdt 37800", "acsst 37800", "acst 34200", "act -18000", "acwst 31500", "adt -10800", "aedt 39600", "aesst 39600",
+                         "aest 36000", "aft 16200", "akdt -28800", "akst -32400", "almst 25200", "almt 21600", "amst 14400", "amt -14400",
+                         "anast 43200", "anat 43200", "arst -10800", "art -10800", "ast -14400", "awsst 32400", "awst 28800", "azost 0",
+                         "azot -3600", "azst 14400", "azt 14400", "bdst 7200", "bdt 21600", "bnt 28800", "bort 28800", "bot -14400",
+                         "bra -10800", "brst -7200", "brt -10800", "bst 3600", "btt 21600", "cadt 37800", "cast 34200", "cct 28800",
+                         "cdt -18000", "cest 7200", "cet 3600", "cetdst 7200", "chadt 49500", "chast 45900", "chut 36000", "ckt -36000",
+                         "clst -10800", "clt -10800", "cot -18000", "cst -21600", "cxt 25200", "davt 25200", "ddut 36000", "easst -18000",
+                         "east -18000", "eat 10800", "edt -14400", "eest 10800", "eet 7200", "eetdst 10800", "egst 0", "egt -3600",
+                         "est -18000", "fet 10800", "fjst 46800", "fjt 43200", "fkst -10800", "fkt -10800", "fnst -3600", "fnt -7200",
+                         "galt -21600", "gamt -32400", "gest 14400", "get 14400", "gft -10800", "gilt 43200", "gmt 0", "gyt -14400",
+                         "hkt 28800", "hst -36000", "ict 25200", "idt 10800", "iot 21600", "irkst 28800", "irkt 28800", "irt 12600",
+                         "ist 7200", "jayt 32400", "jst 32400", "kdt 36000", "kgst 21600", "kgt 21600", "kost 39600", "krast 25200",
+                         "krat 25200", "kst 32400", "lhdt 39600", "lhst 37800", "ligt 36000", "lint 50400", "lkt 19800", "magst 39600",
+                         "magt 39600", "mart -34200", "mawt 18000", "mdt -21600", "mest 7200", "mesz 7200", "met 3600", "metdst 7200",
+                         "mez 3600", "mht 43200", "mmt 23400", "mpt 36000", "msd 14400", "msk 10800", "mst -25200", "must 18000",
+                         "mut 14400", "mvt 18000", "myt 28800", "ndt -9000", "nft -12600", "novst 25200", "novt 25200", "npt 20700",
+                         "nst -12600", "nut -39600", "nzdt 46800", "nzst 43200", "nzt 43200", "omsst 21600", "omst 21600", "pdt -25200",
+                         "pet -18000", "petst 43200", "pett 43200", "pgt 36000", "pht 28800", "pkst 21600", "pkt 18000", "pmdt -7200",
+                         "pmst -10800", "pont 39600", "pst -28800", "pwt 32400", "pyst -10800", "pyt -10800", "ret 14400", "sadt 37800",
+                         "sast 7200", "sct 14400", "sgt 28800", "taht -36000", "tft 18000", "tjt 18000", "tkt 46800", "tmt 18000",
+                         "tot 46800", "trut 36000", "tvt 43200", "uct 0", "ulast 32400", "ulat 28800", "ut 0", "utc 0",
+                         "uyst -7200", "uyt -10800", "uzst 21600", "uzt 18000", "vet -14400", "vlast 36000", "vlat 36000", "volt 10800",
+                         "vut 39600", "wadt 28800", "wakt 43200", "wast 25200", "wat 3600", "wdt 32400", "wet 0", "wetdst 3600",
+                         "wft 43200", "wgst -7200", "wgt -10800", "xjt 21600", "yakst 32400", "yakt 32400", "yapt 36000", "yekst 21600",
+                         "yekt 18000", "z 0", "zulu 0"]
+
+// A time zone abbreviation's offset (seconds east): "pst", "cest".
+pub fn abbrevOffset(name: &str): Option[int] {
+    let l = strings.toLowerAscii(name)
+    for a in ABBREVS {
+        let sp = strings.indexOf(&a, " ", 0)
+        if a[0..sp] == l { return strings.parseIntOpt(a[sp + 1..len(a)]) }
+    }
+    return None
+}
+
+fn badSetting(v: &str): lexdb_base.DbErr {
+    return lexdb_base.err("22023", "invalid value for parameter \"TimeZone\": \"" + v + "\"")
+}
+
+// The zone SET TIME ZONE gives, as PostgreSQL's check_timezone: INTERVAL
+// '...' (from SET TIME ZONE INTERVAL; no months or days) and a number of
+// hours ('-5', 5.5) are offsets east, the SQL standard's sign; anything
+// else is a zone's name or a POSIX rule (zoneNamed: '+05:30' is POSIX's,
+// five and a half hours west). 22023 when it is none.
+pub fn settingZone(v: &str): Result[Zone, lexdb_base.DbErr] {
+    let lv = strings.toLowerAscii(v)
+    if strings.startsWith(&lv, "interval '") && strings.lastIndexOf(v, "'") > 9 {
+        // INTERVAL '...' [HOUR | MINUTE]: the qualifier's last unit, below which it is cut
+        let q = strings.lastIndexOf(v, "'")
+        let body = v[10..q]
+        let cut = strings.trim(&lv[q + 1..len(lv)])
+        let iv = try parseIval(&body)
+        let shown = "INTERVAL '" + fmtIval(&iv) + "'"
+        if iv.months != 0 || iv.days != 0 { return Err(badSetting(&shown)) }
+        var east = iv.us / SEC_US
+        if cut == "hour" { east = east / 3600 * 3600 }
+        if cut == "minute" { east = east / 60 * 60 }
+        if east <= -168 * 3600 || east >= 168 * 3600 { return Err(badSetting(&shown)) }
+        return Ok(fixedZone(east))
+    }
+    match hoursOf(&strings.trim(v)) {
+        Some(d) {
+            match d.mul(Decimal.fromInt(3600)).toInt(Rounding.HALF_EVEN) {
+                Ok(east) {
+                    if east <= -168 * 3600 || east >= 168 * 3600 { return Err(badSetting(v)) }
+                    return Ok(fixedZone(east))
+                }
+                Err(_) { return Err(badSetting(v)) }
+            }
+        }
+        None {}
+    }
+    match zoneNamed(v) {
+        Some(z) { return Ok(z) }
+        None { return Err(badSetting(v)) }
+    }
+}
+
+// A number of hours, as strtod reads one ("5", "-3", "+5.5", ".5", "1e1").
+fn hoursOf(s: &str): Option[Decimal] {
+    if len(s) == 0 { return None }
+    var digit = false
+    for i in 0..len(s) {
+        let c = s[i]
+        if isDigit(c) { digit = true } else if c != '+' && c != '-' && c != '.' && c != 'e' && c != 'E' { return None }
+    }
+    if !digit { return None }
+    var t = s.toStr()
+    if t[0] == '+' { t = t[1..len(t)].toStr() }
+    match Decimal.parse(t) {
+        Ok(d) { return Some(d) }
+        Err(_) { return None }
+    }
+}
+
+// The zone of AT TIME ZONE, timezone(zone, x) and date_trunc's third
+// argument, as PostgreSQL's DecodeTimezoneName: an abbreviation ('PST'), else
+// a zone's name or a POSIX rule ('+5' is five hours west); 22023 when none.
+pub fn atZone(name: &str): Result[Zone, lexdb_base.DbErr] {
+    match abbrevOffset(name) {
+        Some(o) { return Ok(Zone{name: name.toStr(), off: o, abbr: strings.toUpperAscii(name), rules: None}) }
+        None {}
+    }
+    match zoneNamed(name) {
+        Some(z) { return Ok(z) }
+        None { return Err(lexdb_base.err("22023", "time zone \"" + name + "\" not recognized")) }
+    }
+}
+
+// The zone of AT TIME ZONE INTERVAL '...': its time, east (no months or days).
+pub fn ivalZone(v: &Ival): Result[Zone, lexdb_base.DbErr] {
+    if v.months != 0 || v.days != 0 {
+        return Err(lexdb_base.err("22023", "interval time zone \"" + fmtIval(v) + "\" must not include months or days"))
+    }
+    let east = v.us / SEC_US
+    return Ok(Zone{name: fmtIval(v), off: east, abbr: offText(east), rules: None})
+}
 
 // ---- now
 
@@ -95,9 +400,9 @@ pub fn nowTstz(): int { return usOfInstant(time.now()) }
 // Unix microseconds as microseconds since 2000.
 pub fn fromUnixUs(us: int): int { return us - UNIX_US }
 
-pub fn nowTs(): int { return tstzToTs(nowTstz()) }
+pub fn nowTs(z: &Zone): int { return tstzToTs(nowTstz(), z) }
 
-pub fn today(): int { return floorDiv(nowTs(), DAY_US) }
+pub fn today(z: &Zone): int { return floorDiv(nowTs(z), DAY_US) }
 
 // ---- text out
 
@@ -141,7 +446,7 @@ pub fn fmtTs(us: int): str {
 }
 
 // "+00", "+05:30", "-03:30", "+00:01:15"
-fn offText(sec: int): str {
+pub fn offText(sec: int): str {
     let a = if sec < 0 { -sec } else { sec }
     var s = (if sec < 0 { "-" } else { "+" }) + pad(a / 3600, 2)
     if a % 3600 != 0 { s = s + ":" + pad(a / 60 % 60, 2) }
@@ -149,11 +454,11 @@ fn offText(sec: int): str {
     return s
 }
 
-pub fn fmtTstz(us: int): str {
+// A timestamptz as text in zone z: "2026-07-01 13:00:00+01".
+pub fn fmtTstz(us: int, z: &Zone): str {
     if us == INF { return "infinity" }
     if us == NINF { return "-infinity" }
-    let z = zone()
-    let off = z.at(floorDiv(us + UNIX_US, SEC_US)).offset
+    let off = z.offsetOf(us)
     let local = us + off * SEC_US
     let l = localOf(local)
     return dateText(&l.date) + " " + todText(floorMod(local, DAY_US)) + offText(off) + bc(&l.date)
@@ -262,15 +567,16 @@ fn lower(s: &str): str { return strings.toLowerAscii(strings.trim(s)) }
 
 // The special words of the date and time types, as days or microseconds
 // (of a timestamp: midnight for today's).
-fn special(w: &str, forDate: bool): Option[int] {
+// (today's in zone z).
+fn special(w: &str, forDate: bool, z: &Zone): Option[int] {
     if w == "infinity" || w == "+infinity" { return Some(INF) }
     if w == "-infinity" { return Some(NINF) }
     let day = if forDate { 1 } else { DAY_US }
     if w == "epoch" { return Some(-UNIX_DAYS * day) }
-    if w == "today" { return Some(today() * day) }
-    if w == "tomorrow" { return Some((today() + 1) * day) }
-    if w == "yesterday" { return Some((today() - 1) * day) }
-    if w == "now" { return Some(if forDate { today() } else { nowTs() }) }
+    if w == "today" { return Some(today(z) * day) }
+    if w == "tomorrow" { return Some((today(z) + 1) * day) }
+    if w == "yesterday" { return Some((today(z) - 1) * day) }
+    if w == "now" { return Some(if forDate { today(z) } else { nowTs(z) }) }
     return None
 }
 
@@ -286,9 +592,10 @@ fn era(s: &str): Era {
 
 fn withEra(d: time.Date, bc: bool): time.Date { return if bc { time.Date{year: 1 - d.year, month: d.month, day: d.day} } else { d } }
 
-pub fn parseDate(s: &str): Result[int, lexdb_base.DbErr] {
+// A date ('today' and the like in zone z).
+pub fn parseDate(s: &str, z: &Zone): Result[int, lexdb_base.DbErr] {
     let w = lower(s)
-    match special(&w, true) {
+    match special(&w, true, z) {
         Some(v) { return Ok(v) }
         None {}
     }
@@ -404,9 +711,10 @@ fn parseTsText(s: &str, kind: &str): Result[TsParse, lexdb_base.DbErr] {
     }
 }
 
-// A timestamp: a zone given with it is ignored, as PostgreSQL ignores it.
-pub fn parseTs(s: &str): Result[int, lexdb_base.DbErr] {
-    match special(&lower(s), false) {
+// A timestamp: a zone given with it is ignored, as PostgreSQL ignores it
+// ('today' and the like in zone z).
+pub fn parseTs(s: &str, z: &Zone): Result[int, lexdb_base.DbErr] {
+    match special(&lower(s), false, z) {
         Some(v) { return Ok(v) }
         None {}
     }
@@ -414,27 +722,28 @@ pub fn parseTs(s: &str): Result[int, lexdb_base.DbErr] {
     return Ok(p.us)
 }
 
-// A timestamptz: the zone given (an offset, UTC, or a zone's name), else
-// the session's.
-pub fn parseTstz(s: &str): Result[int, lexdb_base.DbErr] {
+// A timestamptz: the zone given (an offset, an abbreviation, a zone's
+// name), else the session's, z.
+pub fn parseTstz(s: &str, z: &Zone): Result[int, lexdb_base.DbErr] {
     let w = lower(s)
-    match special(&w, false) {
+    match special(&w, false, z) {
         Some(v) {
             if v == INF || v == NINF { return Ok(v) }
             if w == "now" { return Ok(nowTstz()) }
-            return Ok(tsToTstz(v))
+            return Ok(tsToTstz(v, z))
         }
         None {}
     }
     let p = try parseTsText(s, &"timestamp with time zone")
-    if !p.z.has { return Ok(tsToTstz(p.us)) }
+    if !p.z.has { return Ok(tsToTstz(p.us, z)) }
     if p.z.named != "" {
-        match tz.load(p.z.named) {
-            Ok(z) {
-                let t = z.instantOf(localOf(p.us))
-                return Ok(usOfInstant(t))
-            }
-            Err(_) { return Err(lexdb_base.err("22023", "time zone \"" + p.z.named + "\" not recognized")) }
+        match abbrevOffset(&p.z.named) {
+            Some(o) { return Ok(p.us - o * SEC_US) }
+            None {}
+        }
+        match zoneNamed(&p.z.named) {
+            Some(nz) { return Ok(nz.toUtc(p.us)) }
+            None { return Err(lexdb_base.err("22023", "time zone \"" + strings.toLowerAscii(p.z.named) + "\" not recognized")) }
         }
     }
     return Ok(p.us - p.z.off * SEC_US)
@@ -442,19 +751,15 @@ pub fn parseTstz(s: &str): Result[int, lexdb_base.DbErr] {
 
 // ---- conversions between the types
 
-// A timestamp read in the session's zone; and back.
-pub fn tsToTstz(us: int): int {
+// A timestamp read in zone z (the session's, or AT TIME ZONE's); and back.
+pub fn tsToTstz(us: int, z: &Zone): int {
     if us == INF || us == NINF { return us }
-    let z = zone()
-    let t = z.instantOf(localOf(us))
-    return usOfInstant(t)
+    return z.toUtc(us)
 }
 
-pub fn tstzToTs(us: int): int {
+pub fn tstzToTs(us: int, z: &Zone): int {
     if us == INF || us == NINF { return us }
-    let z = zone()
-    let off = z.at(floorDiv(us + UNIX_US, SEC_US)).offset
-    return us + off * SEC_US
+    return us + z.offsetOf(us) * SEC_US
 }
 
 pub fn dateToTs(days: int): int {
@@ -695,16 +1000,16 @@ pub fn tsPlus(us: int, v: &Ival): Result[int, lexdb_base.DbErr] {
 }
 
 // A timestamptz plus an interval: the months and days in the session's
-// zone (a day across a change of offset is 23 or 25 hours), then the time.
-pub fn tstzPlus(us: int, v: &Ival): Result[int, lexdb_base.DbErr] {
+// zone z (a day across a change of offset is 23 or 25 hours), then the time.
+pub fn tstzPlus(us: int, v: &Ival, z: &Zone): Result[int, lexdb_base.DbErr] {
     if us == INF || us == NINF { return Ok(us) }
     var x = us
     if v.months != 0 || v.days != 0 {
-        let local = tstzToTs(us)
+        let local = tstzToTs(us, z)
         let l = localOf(local)
         let moved = time.LocalDateTime{date: l.date.addMonths(v.months).addDays(v.days), time: l.time}
         match tsOf(moved) {
-            Some(m) { x = tsToTstz(m) }
+            Some(m) { x = tsToTstz(m, z) }
             None { return Err(ovf()) }
         }
     }
@@ -796,8 +1101,9 @@ pub fn dateField(f: &str): Result[Unit, lexdb_base.DbErr] {
 }
 
 // extract(field from a date-time): days are given (and time) for a date,
-// a timestamp's local fields, a timestamptz's in the session's zone.
-pub fn extractTs(field: &str, local: int, epochUs: int, kind: &str): Result[Decimal, lexdb_base.DbErr] {
+// a timestamp's local fields, a timestamptz's in the session's zone, off
+// its offset there (seconds east; the zone fields are a timestamptz's only).
+pub fn extractTs(field: &str, local: int, epochUs: int, kind: &str, off: int): Result[Decimal, lexdb_base.DbErr] {
     if local == INF || local == NINF {
         return Err(lexdb_base.err("22008", "extract of an infinite " + kind))
     }
@@ -836,7 +1142,12 @@ pub fn extractTs(field: &str, local: int, epochUs: int, kind: &str): Result[Deci
             }
         }
         "epoch" { return Ok(decUs(epochUs + UNIX_US)) }
-        "timezone" { return Ok(Decimal.zero()) }
+        "timezone", "timezone_hour", "timezone_minute" {
+            if kind != "timestamp with time zone" { return Err(unknownField(field, kind)) }
+            if f == "timezone" { return Ok(decInt(off)) }
+            if f == "timezone_hour" { return Ok(decInt(off / 3600)) }
+            return Ok(decInt(off / 60 % 60))
+        }
         else { return Err(unknownField(field, kind)) }
     }
 }
@@ -932,6 +1243,19 @@ pub fn makeDate(y: int, m: int, d: int): Result[int, lexdb_base.DbErr] {
         return Err(lexdb_base.err("22008", "date field value out of range: " + y.toStr() + "-" + pad(m, 2) + "-" + pad(d, 2)))
     }
     return Ok(daysOf(date))
+}
+
+// make_timestamp(year, month, day, hour, min, sec): local microseconds.
+pub fn makeTs(y: int, m: int, d: int, h: int, mi: int, sec: &Decimal): Result[int, lexdb_base.DbErr] {
+    let days = try makeDate(y, m, d)
+    let us = match sec.mul(Decimal.fromInt(SEC_US)).toInt(Rounding.HALF_EVEN) { Ok(x) { x } Err(_) { -1 } }
+    if h < 0 || h > 24 || mi < 0 || mi > 59 || us < 0 || us > 60 * SEC_US ||
+       (h * 3600 + mi * 60) * SEC_US + us > DAY_US {
+        return Err(lexdb_base.err("22008", "time field value out of range: " + pad(h, 2) + ":" + pad(mi, 2) + ":" + sec.toStr()))
+    }
+    let x = days * DAY_US + (h * 3600 + mi * 60) * SEC_US + us
+    if x < MIN_TS || x >= MAX_TS { return Err(ovf()) }
+    return Ok(x)
 }
 
 // to_timestamp(seconds since 1970)

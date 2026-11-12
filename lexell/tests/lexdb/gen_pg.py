@@ -22,7 +22,9 @@ and funcs (funcs_queries.txt to run/exec_funcs.lxl: built-in functions and
 operators, 9.92) and joinusing (joinusing_queries.txt to run/exec_joinusing.lxl:
 JOIN ... USING and NATURAL JOIN, 9.93)
 and forms (forms_queries.txt to run/exec_forms.lxl: DISTINCT ON, FETCH FIRST,
-row comparisons, char(n) and other small forms, 9.94).
+row comparisons, char(n) and other small forms, 9.94)
+and tz (tz_queries.txt to run/exec_tz.lxl: session time zones, AT TIME ZONE,
+9.95; its queries SET timezone themselves).
 Each runs in a new database with TimeZone UTC, DateStyle ISO and
 IntervalStyle postgres, the defaults lexdb has. A result is every row,
 columns joined by |, rows by ;, NULL as nothing; or ERROR and the error's
@@ -146,6 +148,15 @@ SUITES = {
         'SIMILAR TO, LIKE ANY and ALL, BETWEEN SYMMETRIC, percent_rank\'s type, the',
         'maintenance statements, ROLLUP, CUBE and GROUPING SETS (9.94).',
         'Each expect line: a query\'s rows or tag, or ERROR and its SQLSTATE.']),
+    'tz': ('tz_queries.txt', 'exec_tz.lxl', 95, [
+        'lexdb_exec: session time zones, checked against PostgreSQL 18 (generated',
+        'by tests/lexdb/gen_pg.py from tz_queries.txt): SET TIME ZONE\'s forms and',
+        'errors, SHOW, current_setting and set_config; timestamptz text out and in',
+        'in several zones (half hours, LMT, the DST gap and overlap); casts and',
+        'comparisons across the types; a day across DST; extract, date_trunc, age,',
+        'to_char\'s zone patterns; AT TIME ZONE every way; a column stored under one',
+        'zone and read under another; arrays; SET LOCAL and ROLLBACK (9.95).',
+        'Each expect line: a query\'s rows or tag, or ERROR and its SQLSTATE.']),
 }
 
 
@@ -225,7 +236,8 @@ fn show(s: mut &lexdb_exec.Session, q: &str): str {
             var rows: []str = []
             for row in r.rows {
                 var cells: []str = []
-                for v in row { append(mut &cells, lexdb_exec.text(&v)) }
+                // as a client sees them: a timestamptz in the session's zone (9.95)
+                for k in 0..len(row) { append(mut &cells, s.text(&row[k], if k < len(r.cols) { r.cols[k].oid } else { 0 })) }
                 append(mut &rows, strings.join(&cells, "|"))
             }
             // psql shows a statement's tag after its RETURNING rows, not a SELECT's

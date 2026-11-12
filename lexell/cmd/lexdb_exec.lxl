@@ -127,7 +127,7 @@ pub fn text(v: &Val): str {
         Val.Date(d) { return lexdb_time.fmtDate(d) }
         Val.Time(u) { return lexdb_time.fmtTime(u) }
         Val.Ts(u) { return lexdb_time.fmtTs(u) }
-        Val.Tstz(u) { return lexdb_time.fmtTstz(u) }
+        Val.Tstz(u) { return lexdb_time.fmtTstz(u, &lexdb_time.utc()) }
         Val.Ival(iv) { return lexdb_time.fmtIval(&iv) }
         Val.Uuid(u) { return u }
         Val.Bytes(b) { return lexdb_sql.bytesHex(&b) }
@@ -135,6 +135,57 @@ pub fn text(v: &Val): str {
         Val.Real(x) { return lexdb_float.fmt4(x) }
         Val.Reg(_, n) { return n }
     }
+}
+
+// text, a timestamptz in zone z (the session's: 9.95). text itself gives
+// UTC: the form kept (arrays, keys) and where no session is.
+pub fn textZ(v: &Val, z: &lexdb_time.Zone): str {
+    match v {
+        Val.Tstz(u) { return lexdb_time.fmtTstz(u, z) }
+        else { return text(v) }
+    }
+}
+
+// The text a client sees for a value of a column of type oid in zone z: a
+// timestamptz's in the zone, and an array of them (kept as text in UTC:
+// 9.27) with each element so; an element of one (x[i], unnest: its text
+// as kept) too. (What is kept has its offset; a text without one, as
+// coalesce(x, '...') gives, is read in the zone, as PostgreSQL would.)
+pub fn textOut(v: &Val, oid: int, z: &lexdb_time.Zone): str {
+    if z.isUtc() { return text(v) }
+    match v {
+        Val.Tstz(u) { return lexdb_time.fmtTstz(u, z) }
+        Val.Text(t) {
+            if oid == lexdb_sql.OID_TSTZ {
+                match lexdb_time.parseTstz(&t, z) {
+                    Ok(u) { return lexdb_time.fmtTstz(u, z) }
+                    Err(_) { return t }
+                }
+            }
+            if oid > 0 && lexdb_sql.elemOid(oid) == lexdb_sql.OID_TSTZ {
+                match arrayParts(&t) {
+                    Ok(ps) {
+                        var vals: []Val = []
+                        for p in ps {
+                            match p {
+                                Some(x) {
+                                    match lexdb_time.parseTstz(&x, z) {
+                                        Ok(u) { append(mut &vals, Val.Text(lexdb_time.fmtTstz(u, z))) }
+                                        Err(_) { return t }
+                                    }
+                                }
+                                None { append(mut &vals, Val.Null) }
+                            }
+                        }
+                        return arrayText(&vals)
+                    }
+                    Err(_) { return t }
+                }
+            }
+        }
+        else {}
+    }
+    return text(v)
 }
 
 pub fn isNull(v: &Val): bool {
@@ -186,7 +237,43 @@ fn intRange(t: &lexdb_sql.TypeName, n: int): Result[int, DbErr] {
     return Ok(n)
 }
 
+// coerce in zone z (the session's, 9.95): a text read as a timestamptz,
+// a timestamptz made a timestamp, date, time or text, a date or timestamp
+// made a timestamptz, in the zone.
+pub fn coerceZ(v: Val, t: &lexdb_sql.TypeName, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if z.isUtc() { return coerce(v, t) }
+    match v {
+        Val.Null { return Ok(Val.Null) }
+        else {}
+    }
+    if isTimeKind(t.kind) { return coerceTime(v, t, z) }
+    if t.kind == lexdb_sql.K_ARRAY && lexdb_sql.elemOid(t.oid) == lexdb_sql.OID_TSTZ {
+        match v {
+            Val.Text(x) {
+                let et = oidType(lexdb_sql.OID_TSTZ)
+                var vals: []Val = []
+                for part in try arrayParts(&x) {
+                    match part {
+                        Some(p) { append(mut &vals, try coerceTime(Val.Text(p), &et, z)) }
+                        None { append(mut &vals, Val.Null) }
+                    }
+                }
+                return Ok(Val.Text(arrayText(&vals)))
+            }
+            else {}
+        }
+    }
+    match v {
+        Val.Tstz(u) {
+            if t.kind == lexdb_sql.K_TEXT { return coerce(Val.Text(lexdb_time.fmtTstz(u, z)), t) }
+        }
+        else {}
+    }
+    return coerce(v, t)
+}
+
 // A value made fit for a column of type t (an assignment's conversion).
+// A timestamptz's zone is UTC here: coerceZ for a session's.
 pub fn coerce(v: Val, t: &lexdb_sql.TypeName): Result[Val, DbErr] {
     match v {
         Val.Null { return Ok(Val.Null) }
@@ -250,7 +337,7 @@ pub fn coerce(v: Val, t: &lexdb_sql.TypeName): Result[Val, DbErr] {
         }
         return Ok(Val.Num(d))
     } else if isTimeKind(t.kind) {
-        return coerceTime(v, t)
+        return coerceTime(v, t, &lexdb_time.utc())
     } else if t.kind == lexdb_sql.K_FLOAT {
         return coerceFloat(v, t)
     } else if t.kind == lexdb_sql.K_REG {
@@ -712,32 +799,32 @@ fn floatKey(x: float): int {
 // A value made a date or time type: text read in PostgreSQL's forms, the
 // date and time kinds converted (a timestamp to a timestamptz in the
 // session's zone, and back), rounded to the type's fractional digits.
-fn coerceTime(v: Val, t: &lexdb_sql.TypeName): Result[Val, DbErr] {
+fn coerceTime(v: Val, t: &lexdb_sql.TypeName, z: &lexdb_time.Zone): Result[Val, DbErr] {
     let k = t.kind
     let p = if t.prec == 1 { t.scale } else { 6 }
     match v {
         Val.Text(s) {
-            if k == lexdb_sql.K_DATE { return Ok(Val.Date(try lexdb_time.parseDate(&s))) }
+            if k == lexdb_sql.K_DATE { return Ok(Val.Date(try lexdb_time.parseDate(&s, z))) }
             if k == lexdb_sql.K_TIME { return Ok(Val.Time(lexdb_time.roundUs(try lexdb_time.parseTime(&s), p))) }
-            if k == lexdb_sql.K_TS { return Ok(Val.Ts(lexdb_time.roundUs(try lexdb_time.parseTs(&s), p))) }
-            if k == lexdb_sql.K_TSTZ { return Ok(Val.Tstz(lexdb_time.roundUs(try lexdb_time.parseTstz(&s), p))) }
+            if k == lexdb_sql.K_TS { return Ok(Val.Ts(lexdb_time.roundUs(try lexdb_time.parseTs(&s, z), p))) }
+            if k == lexdb_sql.K_TSTZ { return Ok(Val.Tstz(lexdb_time.roundUs(try lexdb_time.parseTstz(&s, z), p))) }
             let iv = try lexdb_time.parseIval(&s)
             return Ok(Val.Ival(lexdb_time.Ival{months: iv.months, days: iv.days, us: lexdb_time.roundUs(iv.us, p)}))
         }
         Val.Date(d) {
             if k == lexdb_sql.K_DATE { return Ok(Val.Date(d)) }
             if k == lexdb_sql.K_TS { return Ok(Val.Ts(lexdb_time.dateToTs(d))) }
-            if k == lexdb_sql.K_TSTZ { return Ok(Val.Tstz(lexdb_time.tsToTstz(lexdb_time.dateToTs(d)))) }
+            if k == lexdb_sql.K_TSTZ { return Ok(Val.Tstz(lexdb_time.tsToTstz(lexdb_time.dateToTs(d), z))) }
         }
         Val.Ts(u) {
             if k == lexdb_sql.K_TS { return Ok(Val.Ts(lexdb_time.roundUs(u, p))) }
             if k == lexdb_sql.K_DATE { return Ok(Val.Date(lexdb_time.tsToDate(u))) }
-            if k == lexdb_sql.K_TSTZ { return Ok(Val.Tstz(lexdb_time.roundUs(lexdb_time.tsToTstz(u), p))) }
+            if k == lexdb_sql.K_TSTZ { return Ok(Val.Tstz(lexdb_time.roundUs(lexdb_time.tsToTstz(u, z), p))) }
             if k == lexdb_sql.K_TIME { return Ok(Val.Time(lexdb_time.roundUs(floorModInt(u, lexdb_time.DAY_US), p))) }
         }
         Val.Tstz(u) {
             if k == lexdb_sql.K_TSTZ { return Ok(Val.Tstz(lexdb_time.roundUs(u, p))) }
-            let local = lexdb_time.tstzToTs(u)
+            let local = lexdb_time.tstzToTs(u, z)
             if k == lexdb_sql.K_TS { return Ok(Val.Ts(lexdb_time.roundUs(local, p))) }
             if k == lexdb_sql.K_DATE { return Ok(Val.Date(lexdb_time.tsToDate(local))) }
             if k == lexdb_sql.K_TIME { return Ok(Val.Time(lexdb_time.roundUs(floorModInt(local, lexdb_time.DAY_US), p))) }
@@ -764,11 +851,11 @@ fn floorModInt(a: int, b: int): int {
 fn timeTypeOf(v: &Val): lexdb_sql.TypeName { return lexdb_sql.timeType(kindOid(v)) }
 
 // A timestamp-like value as a timestamptz's microseconds (a date at
-// midnight, a timestamp in the session's zone), for comparing across them.
-fn asTstz(v: &Val): Option[int] {
+// midnight, a timestamp in the session's zone z), for comparing across them.
+fn asTstz(v: &Val, z: &lexdb_time.Zone): Option[int] {
     match v {
-        Val.Date(d) { return Some(lexdb_time.tsToTstz(lexdb_time.dateToTs(d))) }
-        Val.Ts(u) { return Some(lexdb_time.tsToTstz(u)) }
+        Val.Date(d) { return Some(lexdb_time.tsToTstz(lexdb_time.dateToTs(d), z)) }
+        Val.Ts(u) { return Some(lexdb_time.tsToTstz(u, z)) }
         Val.Tstz(u) { return Some(u) }
         else { return None }
     }
@@ -777,18 +864,18 @@ fn asTstz(v: &Val): Option[int] {
 // Compares two values of which one is a date or time kind: the same kind
 // directly, a date, timestamp and timestamptz with each other, a text read
 // as the other's type.
-fn compareTime(a: &Val, b: &Val): Result[int, DbErr] {
+fn compareTime(a: &Val, b: &Val, z: &lexdb_time.Zone): Result[int, DbErr] {
     match a {
         Val.Text(s) {
-            let x = try coerce(Val.Text(s), &timeTypeOf(b))
-            return compareTime(&x, b)
+            let x = try coerceTime(Val.Text(s), &timeTypeOf(b), z)
+            return compareTime(&x, b, z)
         }
         else {}
     }
     match b {
         Val.Text(s) {
-            let y = try coerce(Val.Text(s), &timeTypeOf(a))
-            return compareTime(a, &y)
+            let y = try coerceTime(Val.Text(s), &timeTypeOf(a), z)
+            return compareTime(a, &y, z)
         }
         else {}
     }
@@ -800,9 +887,9 @@ fn compareTime(a: &Val, b: &Val): Result[int, DbErr] {
         Val.Ival(x) { match b { Val.Ival(y) { return Ok(lexdb_time.ivalCmp(&x, &y)) } else {} } }
         else {}
     }
-    match asTstz(a) {
+    match asTstz(a, z) {
         Some(x) {
-            match asTstz(b) {
+            match asTstz(b, z) {
                 Some(y) { return Ok(x.cmp(&y)) }
                 None {}
             }
@@ -837,7 +924,7 @@ fn ivalOfVal(v: &Val): Result[Option[lexdb_time.Ival], DbErr] {
 // and days, dates' difference in days, a date-time and an interval, the
 // difference of two date-times, intervals with each other and times a
 // number. A text on one side is read as the type the operator needs.
-fn arithTime(op: &str, a: &Val, b: &Val): Result[Val, DbErr] {
+fn arithTime(op: &str, a: &Val, b: &Val, z: &lexdb_time.Zone): Result[Val, DbErr] {
     let plus = op == "+"
     let minus = op == "-"
     match a {
@@ -857,12 +944,12 @@ fn arithTime(op: &str, a: &Val, b: &Val): Result[Val, DbErr] {
                             None {}
                         }
                         if minus {
-                            match lexdb_time.parseDate(&s) {
+                            match lexdb_time.parseDate(&s, z) {
                                 Ok(d2) { return Ok(Val.Int(d - d2)) }
                                 Err(_) {}
                             }
                         }
-                        return arithTime(op, a, &Val.Ival(try lexdb_time.parseIval(&s)))
+                        return arithTime(op, a, &Val.Ival(try lexdb_time.parseIval(&s)), z)
                     }
                     else {}
                 }
@@ -874,7 +961,7 @@ fn arithTime(op: &str, a: &Val, b: &Val): Result[Val, DbErr] {
                     Val.Ts(u2) { if minus { return Ok(Val.Ival(try lexdb_time.tsDiff(u, u2))) } }
                     Val.Text(s) {
                         // timestamp - '...': a timestamp, as PostgreSQL reads it
-                        if minus { return arithTime(op, a, &Val.Ts(try lexdb_time.parseTs(&s))) }
+                        if minus { return arithTime(op, a, &Val.Ts(try lexdb_time.parseTs(&s, z)), z) }
                     }
                     else {}
                 }
@@ -892,14 +979,14 @@ fn arithTime(op: &str, a: &Val, b: &Val): Result[Val, DbErr] {
                 match b {
                     Val.Tstz(u2) { if minus { return Ok(Val.Ival(try lexdb_time.tsDiff(u, u2))) } }
                     Val.Text(s) {
-                        if minus { return arithTime(op, a, &Val.Tstz(try lexdb_time.parseTstz(&s))) }
+                        if minus { return arithTime(op, a, &Val.Tstz(try lexdb_time.parseTstz(&s, z)), z) }
                     }
                     else {}
                 }
                 match try ivalOfVal(b) {
                     Some(iv) {
                         let x = if minus { lexdb_time.ivalNeg(&iv) } else { iv }
-                        return Ok(Val.Tstz(try lexdb_time.tstzPlus(u, &x)))
+                        return Ok(Val.Tstz(try lexdb_time.tstzPlus(u, &x, z)))
                     }
                     None {}
                 }
@@ -922,10 +1009,10 @@ fn arithTime(op: &str, a: &Val, b: &Val): Result[Val, DbErr] {
             if plus || minus {
                 match b {
                     Val.Ival(iv2) { return Ok(Val.Ival(lexdb_time.ivalPlus(&iv, &(if minus { lexdb_time.ivalNeg(&iv2) } else { iv2 })))) }
-                    Val.Text(s) { return arithTime(op, a, &Val.Ival(try lexdb_time.parseIval(&s))) }
+                    Val.Text(s) { return arithTime(op, a, &Val.Ival(try lexdb_time.parseIval(&s)), z) }
                     else {}
                 }
-                if plus { return arithTime(op, b, a) }      // interval + a date-time
+                if plus { return arithTime(op, b, a, z) }      // interval + a date-time
             }
             if op == "*" || op == "/" {
                 match asNum(b) {
@@ -939,14 +1026,14 @@ fn arithTime(op: &str, a: &Val, b: &Val): Result[Val, DbErr] {
         else {
             // a number times an interval; a text before a date-time
             if op == "*" {
-                match b { Val.Ival(_) { return arithTime(op, b, a) } else {} }
+                match b { Val.Ival(_) { return arithTime(op, b, a, z) } else {} }
             }
             if plus {
                 match b {
-                    Val.Date(_) { return arithTime(op, b, a) }
-                    Val.Ts(_) { return arithTime(op, b, a) }
-                    Val.Tstz(_) { return arithTime(op, b, a) }
-                    Val.Time(_) { return arithTime(op, b, a) }
+                    Val.Date(_) { return arithTime(op, b, a, z) }
+                    Val.Ts(_) { return arithTime(op, b, a, z) }
+                    Val.Tstz(_) { return arithTime(op, b, a, z) }
+                    Val.Time(_) { return arithTime(op, b, a, z) }
                     else {}
                 }
             }
@@ -956,7 +1043,7 @@ fn arithTime(op: &str, a: &Val, b: &Val): Result[Val, DbErr] {
                     match b {
                         Val.Ival(_) {}
                         else {
-                            if isTimeKind(kindOf(b)) { return arithTime(op, &(try coerce(Val.Text(s), &timeTypeOf(b))), b) }
+                            if isTimeKind(kindOf(b)) { return arithTime(op, &(try coerceTime(Val.Text(s), &timeTypeOf(b), z)), b, z) }
                         }
                     }
                 }
@@ -968,29 +1055,40 @@ fn arithTime(op: &str, a: &Val, b: &Val): Result[Val, DbErr] {
 }
 
 // The date and time functions (9.76): None when name is not one.
-// now: the transaction's start (microseconds since 2000), 0 for the clock.
-fn callTime(name: &str, vs: &[]Val, now: int): Result[Option[Val], DbErr] {
+// now: the transaction's start (microseconds since 2000), 0 for the clock;
+// z: the session's time zone (9.95).
+fn callTime(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Option[Val], DbErr] {
     let n = len(vs)
     let prec = if n == 1 { intOf(&vs[0]).unwrapOr(6) } else { 6 }
     // the transaction's start, as PostgreSQL's now(); clock_timestamp() the clock
     let at = if now != 0 && name != "clock_timestamp" { now } else { lexdb_time.nowTstz() }
-    let local = lexdb_time.tstzToTs(at)
     match name {
         "now", "current_timestamp", "transaction_timestamp", "statement_timestamp", "clock_timestamp" {
             return Ok(Some(Val.Tstz(lexdb_time.roundUs(at, prec))))
         }
-        "localtimestamp" { return Ok(Some(Val.Ts(lexdb_time.roundUs(local, prec)))) }
-        "current_date" { return Ok(Some(Val.Date(lexdb_time.tsToDate(local)))) }
-        "current_time", "localtime" { return Ok(Some(Val.Time(lexdb_time.roundUs(floorModInt(local, lexdb_time.DAY_US), prec)))) }
-        "date_part", "date_trunc", "age", "make_date", "to_timestamp", "isfinite" {}
+        "localtimestamp" { return Ok(Some(Val.Ts(lexdb_time.roundUs(lexdb_time.tstzToTs(at, z), prec)))) }
+        "current_date" { return Ok(Some(Val.Date(lexdb_time.tsToDate(lexdb_time.tstzToTs(at, z))))) }
+        "current_time", "localtime" {
+            return Ok(Some(Val.Time(lexdb_time.roundUs(floorModInt(lexdb_time.tstzToTs(at, z), lexdb_time.DAY_US), prec))))
+        }
+        "date_part", "date_trunc", "age", "make_date", "to_timestamp", "isfinite", "timezone", "make_timestamp", "make_timestamptz" {}
         else { return Ok(None) }                // not a date or time function
     }
     for v in vs { if isNull(&v) { return Ok(Some(Val.Null)) } }
-    if (name == "date_part" || name == "date_trunc") && n == 2 {
+    if name == "timezone" && (n == 1 || n == 2) {
+        // x AT TIME ZONE zone, timezone(zone, x); AT LOCAL, timezone(x): the session's
+        let x = &vs[n - 1]
+        if n == 1 { return Ok(Some(try atTimeZone(x, z, z))) }
+        match vs[0] {
+            Val.Ival(iv) { return Ok(Some(try atTimeZone(x, &(try lexdb_time.ivalZone(&iv)), z))) }
+            else { return Ok(Some(try atTimeZone(x, &(try lexdb_time.atZone(&text(&vs[0]))), z))) }
+        }
+    }
+    if (name == "date_part" || name == "date_trunc") && (n == 2 || (n == 3 && name == "date_trunc")) {
         let field = text(&vs[0])
         var x = vs[1]
         match x {
-            Val.Text(s) { x = Val.Tstz(try lexdb_time.parseTstz(&s)) }
+            Val.Text(s) { x = Val.Tstz(try lexdb_time.parseTstz(&s, z)) }
             else {}
         }
         if name == "date_part" {
@@ -999,27 +1097,40 @@ fn callTime(name: &str, vs: &[]Val, now: int): Result[Option[Val], DbErr] {
                     // a date's fields are whole numbers (its epoch and Julian day too)
                     try lexdb_time.dateField(&field)
                     let u = lexdb_time.dateToTs(d)
-                    let xd = try lexdb_time.extractTs(&field, u, u, &"date")
+                    let xd = try lexdb_time.extractTs(&field, u, u, &"date", 0)
                     return Ok(Some(Val.Num(xd.trunc(0).unwrapOr(xd))))
                 }
-                Val.Ts(u) { return Ok(Some(Val.Num(try lexdb_time.extractTs(&field, u, u, &"timestamp without time zone")))) }
-                Val.Tstz(u) { return Ok(Some(Val.Num(try lexdb_time.extractTs(&field, lexdb_time.tstzToTs(u), u, &"timestamp with time zone")))) }
+                Val.Ts(u) { return Ok(Some(Val.Num(try lexdb_time.extractTs(&field, u, u, &"timestamp without time zone", 0)))) }
+                Val.Tstz(u) {
+                    let off = if u == lexdb_time.INF || u == lexdb_time.NINF { 0 } else { z.offsetOf(u) }
+                    return Ok(Some(Val.Num(try lexdb_time.extractTs(&field, lexdb_time.tstzToTs(u, z), u, &"timestamp with time zone", off))))
+                }
                 Val.Time(u) { return Ok(Some(Val.Num(try lexdb_time.extractIval(&field, &lexdb_time.Ival{months: 0, days: 0, us: u})))) }
                 Val.Ival(iv) { return Ok(Some(Val.Num(try lexdb_time.extractIval(&field, &iv)))) }
                 else { return Err(e("42883", "function date_part(text, " + kindName(&oidType(kindOid(&x))) + ") does not exist")) }
             }
         }
+        if n == 3 {
+            // date_trunc(field, x, zone): a timestamptz cut in that zone
+            let tz3 = try lexdb_time.atZone(&text(&vs[2]))
+            match x {
+                Val.Tstz(u) { return Ok(Some(Val.Tstz(try truncTstz(&field, u, &tz3)))) }
+                Val.Date(d) { return Ok(Some(Val.Tstz(try truncTstz(&field, lexdb_time.tsToTstz(lexdb_time.dateToTs(d), z), &tz3)))) }
+                Val.Ts(u) { return Ok(Some(Val.Tstz(try truncTstz(&field, lexdb_time.tsToTstz(u, z), &tz3)))) }
+                else { return Err(e("42883", "function date_trunc(text, " + kindName(&oidType(kindOid(&x))) + ", text) does not exist")) }
+            }
+        }
         match x {
-            Val.Date(d) { return Ok(Some(Val.Tstz(lexdb_time.tsToTstz(try lexdb_time.truncTs(&field, lexdb_time.dateToTs(d)))))) }
+            Val.Date(d) { return Ok(Some(Val.Tstz(lexdb_time.tsToTstz(try lexdb_time.truncTs(&field, lexdb_time.dateToTs(d)), z)))) }
             Val.Ts(u) { return Ok(Some(Val.Ts(try lexdb_time.truncTs(&field, u)))) }
-            Val.Tstz(u) { return Ok(Some(Val.Tstz(lexdb_time.tsToTstz(try lexdb_time.truncTs(&field, lexdb_time.tstzToTs(u)))))) }
+            Val.Tstz(u) { return Ok(Some(Val.Tstz(try truncTstz(&field, u, z)))) }
             Val.Ival(iv) { return Ok(Some(Val.Ival(try lexdb_time.truncIval(&field, &iv)))) }
             else { return Err(e("42883", "function date_trunc(text, " + kindName(&oidType(kindOid(&x))) + ") does not exist")) }
         }
     }
     if name == "age" && (n == 1 || n == 2) {
-        let a = if n == 2 { try tsOfVal(&vs[0]) } else { lexdb_time.dateToTs(lexdb_time.today()) }
-        let b = try tsOfVal(&vs[n - 1])
+        let a = if n == 2 { try tsOfVal(&vs[0], z) } else { lexdb_time.dateToTs(lexdb_time.tsToDate(lexdb_time.tstzToTs(at, z))) }
+        let b = try tsOfVal(&vs[n - 1], z)
         return Ok(Some(Val.Ival(try lexdb_time.age(a, b))))
     }
     if name == "make_date" && n == 3 {
@@ -1039,6 +1150,23 @@ fn callTime(name: &str, vs: &[]Val, now: int): Result[Option[Val], DbErr] {
         }
         return Err(e("42883", "function make_date needs three integers"))
     }
+    if (name == "make_timestamp" && n == 6) || (name == "make_timestamptz" && (n == 6 || n == 7)) {
+        // make_timestamp(year, month, day, hour, min, sec); make_timestamptz's
+        // in the session's zone, or the seventh argument's
+        var ns: []int = []
+        for i in 0..5 {
+            match intOf(&vs[i]) {
+                Some(x) { append(mut &ns, x) }
+                None { return Err(e("42883", "function " + name + " needs integers and a number of seconds")) }
+            }
+        }
+        let sec = asNum(&vs[5])
+        if sec.isNone() { return Err(e("42883", "function " + name + " needs integers and a number of seconds")) }
+        let local = try lexdb_time.makeTs(ns[0], ns[1], ns[2], ns[3], ns[4], &sec.unwrap())
+        if name == "make_timestamp" { return Ok(Some(Val.Ts(local))) }
+        if n == 7 { return Ok(Some(Val.Tstz(lexdb_time.tsToTstz(local, &(try lexdb_time.atZone(&text(&vs[6]))))))) }
+        return Ok(Some(Val.Tstz(lexdb_time.tsToTstz(local, z))))
+    }
     if name == "to_timestamp" && n == 1 {
         match asNum(&vs[0]) {
             Some(d) { return Ok(Some(Val.Tstz(try lexdb_time.fromEpochSeconds(&d)))) }
@@ -1057,14 +1185,45 @@ fn callTime(name: &str, vs: &[]Val, now: int): Result[Option[Val], DbErr] {
     return Ok(None)
 }
 
+// date_trunc of a timestamptz in zone z, as PostgreSQL's: the local time
+// cut; a day or more read back in the zone (by its rules for a time that
+// is not, or is twice), less with the offset it had.
+fn truncTstz(field: &str, u: int, z: &lexdb_time.Zone): Result[int, DbErr] {
+    if u == lexdb_time.INF || u == lexdb_time.NINF { return Ok(u) }
+    let off = z.offsetOf(u)
+    let local = u + off * 1000000
+    let cut = try lexdb_time.truncTs(field, local)
+    match strings.toLowerAscii(field) {
+        "microseconds", "microsecond", "milliseconds", "millisecond", "second", "seconds", "minute", "minutes", "hour", "hours" {
+            return Ok(cut - off * 1000000)
+        }
+        else { return Ok(lexdb_time.tsToTstz(cut, z)) }
+    }
+}
+
+// x AT TIME ZONE at (9.95): a timestamptz made the local time there; a
+// timestamp (a date, a text: a timestamptz, as PostgreSQL reads them, in
+// the session's zone z) read there, made a timestamptz.
+fn atTimeZone(x: &Val, at: &lexdb_time.Zone, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    match x {
+        Val.Ts(u) { return Ok(Val.Tstz(tsAt(u, at))) }
+        Val.Tstz(u) { return Ok(Val.Ts(lexdb_time.tstzToTs(u, at))) }
+        Val.Date(d) { return Ok(Val.Ts(lexdb_time.tstzToTs(lexdb_time.tsToTstz(lexdb_time.dateToTs(d), z), at))) }
+        Val.Text(s) { return Ok(Val.Ts(lexdb_time.tstzToTs(try lexdb_time.parseTstz(&s, z), at))) }
+        else { return Err(e("42883", "function timezone(text, " + kindName(&oidType(kindOid(x))) + ") does not exist")) }
+    }
+}
+
+fn tsAt(u: int, at: &lexdb_time.Zone): int { return lexdb_time.tsToTstz(u, at) }
+
 // A timestamp's local microseconds for age(): a date at midnight, a
-// timestamptz in the session's zone.
-fn tsOfVal(v: &Val): Result[int, DbErr] {
+// timestamptz in the session's zone z.
+fn tsOfVal(v: &Val, z: &lexdb_time.Zone): Result[int, DbErr] {
     match v {
         Val.Date(d) { return Ok(lexdb_time.dateToTs(d)) }
         Val.Ts(u) { return Ok(u) }
-        Val.Tstz(u) { return Ok(lexdb_time.tstzToTs(u)) }
-        Val.Text(s) { return Ok(try lexdb_time.parseTs(&s)) }
+        Val.Tstz(u) { return Ok(lexdb_time.tstzToTs(u, z)) }
+        Val.Text(s) { return Ok(try lexdb_time.parseTs(&s, z)) }
         else { return Err(e("42883", "function age(" + kindName(&oidType(kindOid(v))) + ") does not exist")) }
     }
 }
@@ -1282,6 +1441,17 @@ fn srfCols(name: &str, ordin: bool, args: &[]OutCol): Result[[]OutCol, DbErr] {
         if len(args) < 2 || len(args) > 3 {
             return Err(e("42883", "function generate_series with " + len(args).toStr() + " arguments does not exist"))
         }
+        // of timestamps (9.95): a timestamp's, else a timestamptz's (a date's too)
+        var tsOid = 0
+        for a in args {
+            if a.oid == lexdb_sql.OID_TSTZ || a.oid == lexdb_sql.OID_DATE { tsOid = lexdb_sql.OID_TSTZ }
+            if a.oid == lexdb_sql.OID_TS && tsOid == 0 { tsOid = lexdb_sql.OID_TS }
+        }
+        if tsOid != 0 {
+            if len(args) != 3 { return Err(e("42883", "function generate_series(" + lexdb_sql.typeText(&oidType(tsOid)) + ", ...) needs an interval step")) }
+            append(mut &out, OutCol{name: "generate_series", oid: tsOid})
+            return Ok(out)
+        }
         var oid = lexdb_sql.OID_INT4
         for a in args {
             if a.oid == lexdb_sql.OID_NUMERIC { oid = lexdb_sql.OID_NUMERIC }
@@ -1335,7 +1505,7 @@ fn execSrf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
             var row: []Val = []
             for c in 0..k {
                 let ty = oidType(sel.outs[c].oid)
-                append(mut &row, if ty.kind == lexdb_sql.K_TEXT { args[i + c] } else { try coerce(args[i + c], &ty) })
+                append(mut &row, if ty.kind == lexdb_sql.K_TEXT { args[i + c] } else { try coerceZ(args[i + c], &ty, &txn.zone) })
             }
             append(mut &rows, row)
             i += k
@@ -1360,9 +1530,36 @@ fn execSrf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
     } else if sel.srf == "generate_series" {
         for a in args { if isNull(&a) { return Ok(Res{cols: [], rows: [], tag: "", hasRows: true, copy: COPY_NONE}) } }
         let ty = oidType(sel.outs[0].oid)
-        let start = try coerce(args[0], &ty)
-        let stop = try coerce(args[1], &ty)
-        let step = if len(args) > 2 { try coerce(args[2], &ty) } else { try coerce(Val.Int(1), &ty) }
+        if ty.kind == lexdb_sql.K_TS || ty.kind == lexdb_sql.K_TSTZ {
+            // timestamps stepped by an interval; a timestamptz's days and months in the session's zone (9.95)
+            let zone = txn.zone
+            var v = try coerceZ(args[0], &ty, &zone)
+            let stop = try coerceZ(args[1], &ty, &zone)
+            let step = try coerceZ(args[2], &oidType(lexdb_sql.OID_IVAL), &zone)
+            let dir = match step { Val.Ival(iv) { lexdb_time.ivalCmp(&iv, &lexdb_time.Ival{months: 0, days: 0, us: 0}) } else { 0 } }
+            if dir == 0 { return Err(e("22023", "step size cannot equal zero")) }
+            var n = 0
+            while true {
+                let c = try compare(&v, &stop)
+                if (dir > 0 && c > 0) || (dir < 0 && c < 0) { break }
+                if cap >= 0 && len(rows) >= cap { break }
+                n += 1
+                var row: []Val = [v]
+                if sel.ordin { append(mut &row, Val.Int(n)) }
+                bytes += rowBytes(&row)
+                if room >= 0 && bytes > room { return Err(memErr(rs.maxHeld)) }
+                append(mut &rows, row)
+                try rs.tick()
+                match arithZ(&"+", &v, &step, &zone) {
+                    Ok(x) { v = x }
+                    Err(_) { break }
+                }
+            }
+            return Ok(Res{cols: [], rows: rows, tag: "", hasRows: true, copy: COPY_NONE})
+        }
+        let start = try coerceZ(args[0], &ty, &txn.zone)
+        let stop = try coerceZ(args[1], &ty, &txn.zone)
+        let step = if len(args) > 2 { try coerceZ(args[2], &ty, &txn.zone) } else { try coerce(Val.Int(1), &ty) }
         let zero = try coerce(Val.Int(0), &ty)
         let dir = try compare(&step, &zero)
         if dir == 0 { return Err(e("22023", "step size cannot equal zero")) }
@@ -1380,7 +1577,7 @@ fn execSrf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
             append(mut &rows, row)
             try rs.tick()
             // the next value; past the type's range: the end
-            match arith(&"+", &v, &step) {
+            match arithZ(&"+", &v, &step, &txn.zone) {
                 Ok(x) { v = x }
                 Err(_) { break }
             }
@@ -1462,12 +1659,27 @@ fn asNum(v: &Val): Option[Decimal] {
     }
 }
 
+// compare in zone z (the session's, 9.95): a date or timestamp with a
+// timestamptz, a text with a date or time kind.
+fn compareZ(a: &Val, b: &Val, z: &lexdb_time.Zone): Result[int, DbErr] {
+    if isTimeKind(kindOf(a)) || isTimeKind(kindOf(b)) { return compareTime(a, b, z) }
+    return compare(a, b)
+}
+
+// arith in zone z (the session's, 9.95): a timestamptz and an interval's
+// days and months.
+fn arithZ(op: &str, a: &Val, b: &Val, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if isNull(a) || isNull(b) || op == "^" || !(isTimeKind(kindOf(a)) || isTimeKind(kindOf(b))) { return arith(op, a, b) }
+    return arithTime(op, a, b, z)
+}
+
 // Compares two values that are not NULL; a text compared with a number or a
-// boolean is read as one (a parameter sent as text).
+// boolean is read as one (a parameter sent as text). In UTC: compareZ for
+// a session's zone.
 fn compare(a: &Val, b: &Val): Result[int, DbErr] {
     let ka = kindOf(a)
     let kb = kindOf(b)
-    if isTimeKind(ka) || isTimeKind(kb) { return compareTime(a, b) }
+    if isTimeKind(ka) || isTimeKind(kb) { return compareTime(a, b, &lexdb_time.utc()) }
     if ka == lexdb_sql.K_UUID || kb == lexdb_sql.K_UUID || ka == lexdb_sql.K_BYTEA || kb == lexdb_sql.K_BYTEA {
         // a text with either is read as its type; then as bytes, which is their order
         let k = if ka == lexdb_sql.K_UUID || kb == lexdb_sql.K_UUID { lexdb_sql.K_UUID } else { lexdb_sql.K_BYTEA }
@@ -1562,7 +1774,7 @@ fn decErr(): DbErr { return e("22003", "numeric value out of range") }
 fn arith(op: &str, a: &Val, b: &Val): Result[Val, DbErr] {
     if isNull(a) || isNull(b) { return Ok(Val.Null) }
     if op == "^" { return powOp(a, b) }
-    if isTimeKind(kindOf(a)) || isTimeKind(kindOf(b)) { return arithTime(op, a, b) }
+    if isTimeKind(kindOf(a)) || isTimeKind(kindOf(b)) { return arithTime(op, a, b, &lexdb_time.utc()) }
     if isFloat(a) || isFloat(b) { return arithFloat(op, a, b) }
     var x = 0
     var y = 0
@@ -1715,6 +1927,22 @@ pub type Env = value record {
     seq: Option[SeqEnv] // nextval and its kind: the store and session (none: not allowed here)
 }
 
+// The session's time zone an expression is evaluated in (9.95): UTC where
+// there is no session (a CHECK, a DEFAULT, an index's expression).
+fn envZone(env: &Env): lexdb_time.Zone {
+    match env.seq {
+        Some(se) { return se.zone }
+        None { return lexdb_time.utc() }
+    }
+}
+
+fn isTstz(v: &Val): bool {
+    match v {
+        Val.Tstz(_) { return true }
+        else { return false }
+    }
+}
+
 fn colIndex(cols: &[]lexdb_sql.ColDef, name: &str): int {
     for i in 0..len(cols) { if cols[i].name == name { return i } }
     return -1
@@ -1796,11 +2024,12 @@ pub fn eval(x: &Expr, env: &Env): Result[Val, DbErr] {
                     let rb = try coerce(r, &ty)
                     match lb { Val.Bytes(p) { match rb { Val.Bytes(q) { return Ok(Val.Bytes(p + q)) } else {} } } else {} }
                 }
+                if isTstz(&l) || isTstz(&r) { return Ok(Val.Text(textZ(&l, &envZone(env)) + textZ(&r, &envZone(env)))) }
                 return Ok(Val.Text(text(&l) + text(&r)))
             }
             if op == "=" || op == "<>" || op == "<" || op == "<=" || op == ">" || op == ">=" {
                 if isNull(&l) || isNull(&r) { return Ok(Val.Null) }
-                let c = try compare(&l, &r)
+                let c = if isTimeKind(kindOf(&l)) || isTimeKind(kindOf(&r)) { try compareTime(&l, &r, &envZone(env)) } else { try compare(&l, &r) }
                 let t = match op {
                     "=" { c == 0 }
                     "<>" { c != 0 }
@@ -1811,6 +2040,7 @@ pub fn eval(x: &Expr, env: &Env): Result[Val, DbErr] {
                 }
                 return Ok(Val.Bool(t))
             }
+            if isTimeKind(kindOf(&l)) || isTimeKind(kindOf(&r)) { return arithZ(&op, &l, &r, &envZone(env)) }
             return arith(&op, &l, &r)
         }
         Expr.IsNull(a, neg) {
@@ -1821,6 +2051,7 @@ pub fn eval(x: &Expr, env: &Env): Result[Val, DbErr] {
             let v = try eval(&a, env)
             if t.kind == lexdb_sql.K_REG { return regCast(&v, t.oid, &env.seq) }
             if t.oid == lexdb_sql.OID_BPCHAR && !isNull(&v) && kindOf(&v) == lexdb_sql.K_TEXT { return bpcharOf(text(&v), t.len, true) }
+            if isTimeKind(t.kind) || t.kind == lexdb_sql.K_ARRAY || isTstz(&v) { return coerceZ(v, &t, &envZone(env)) }
             return coerce(v, &t)
         }
         Expr.Call(name, args, star) {
@@ -1874,7 +2105,7 @@ pub fn eval(x: &Expr, env: &Env): Result[Val, DbErr] {
             }
             // now() and the rest: the transaction's start (9.76)
             match env.seq {
-                Some(se) { return callAt(&name, &vs, lexdb_time.fromUnixUs(se.now)) }
+                Some(se) { return callAt(&name, &vs, lexdb_time.fromUnixUs(se.now), &se.zone) }
                 None {}
             }
             return call(&name, &vs)
@@ -2032,15 +2263,16 @@ fn substr(s: str, from: int, count: int, hasCount: bool): Result[str, DbErr] {
     return Ok(strings.fromRunes(&out))
 }
 
-fn call(name: &str, vs: &[]Val): Result[Val, DbErr] { return callAt(name, vs, 0) }
+fn call(name: &str, vs: &[]Val): Result[Val, DbErr] { return callAt(name, vs, 0, &lexdb_time.utc()) }
 
 // call, with now the transaction's start (microseconds since 2000; 0: the clock).
-fn callAt(name: &str, vs: &[]Val, now: int): Result[Val, DbErr] {
+// z: the session's time zone (9.95).
+fn callAt(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
     match try callMisc(name, vs) {
         Some(r) { return Ok(r) }
         None {}
     }
-    match try callFn(name, vs) {
+    match try callFn(name, vs, z) {
         Some(r) { return Ok(r) }
         None {}
     }
@@ -2054,7 +2286,7 @@ fn callAt(name: &str, vs: &[]Val, now: int): Result[Val, DbErr] {
         }
         return Ok(Val.Bytes(try decodeBytes(&text(&vs[0]), &text(&vs[1]))))
     }
-    match try callTime(name, vs, now) {
+    match try callTime(name, vs, now, z) {
         Some(v) { return Ok(v) }
         None {}
     }
@@ -2070,7 +2302,7 @@ fn callAt(name: &str, vs: &[]Val, now: int): Result[Val, DbErr] {
                 sawNull = true
                 continue
             }
-            if (try compare(&vs[0], &vs[i])) == 0 { return Ok(Val.Bool(true)) }
+            if (try compareZ(&vs[0], &vs[i], z)) == 0 { return Ok(Val.Bool(true)) }
         }
         return Ok(if sawNull { Val.Null } else { Val.Bool(false) })
     }
@@ -2078,7 +2310,7 @@ fn callAt(name: &str, vs: &[]Val, now: int): Result[Val, DbErr] {
         let na = isNull(&vs[0])
         let nb = isNull(&vs[1])
         if na || nb { return Ok(Val.Bool(na != nb)) }
-        return Ok(Val.Bool((try compare(&vs[0], &vs[1])) != 0))
+        return Ok(Val.Bool((try compareZ(&vs[0], &vs[1], z)) != 0))
     }
     if name == "like" || name == "ilike" {
         for v in vs { if isNull(&v) { return Ok(Val.Null) } }
@@ -2103,23 +2335,29 @@ fn callAt(name: &str, vs: &[]Val, now: int): Result[Val, DbErr] {
     }
     if name == "nullif" && n == 2 {
         if isNull(&vs[0]) || isNull(&vs[1]) { return Ok(vs[0]) }
-        if (try compare(&vs[0], &vs[1])) == 0 { return Ok(Val.Null) }
+        if (try compareZ(&vs[0], &vs[1], z)) == 0 { return Ok(Val.Null) }
         return Ok(vs[0])
     }
     if (name == "greatest" || name == "least") && n >= 1 {
         var best = Val.Null
+        var widest = 0                  // a date, timestamp, timestamptz among them: the result's type
         for v in vs {
             if isNull(&v) { continue }
+            let k = kindOf(&v)
+            if (k == lexdb_sql.K_DATE || k == lexdb_sql.K_TS || k == lexdb_sql.K_TSTZ) && k > widest { widest = k }
             if isNull(&best) { best = v } else {
-                let c = try compare(&v, &best)
+                let c = try compareZ(&v, &best, z)
                 if (name == "greatest" && c > 0) || (name == "least" && c < 0) { best = v }
             }
+        }
+        if widest > 0 && kindOf(&best) != widest && isTimeKind(kindOf(&best)) {
+            return coerceTime(best, &oidType(if widest == lexdb_sql.K_TSTZ { lexdb_sql.OID_TSTZ } else { lexdb_sql.OID_TS }), z)
         }
         return Ok(best)
     }
     if name == "concat" {
         var out = ""
-        for v in vs { if !isNull(&v) { out = out + text(&v) } }
+        for v in vs { if !isNull(&v) { out = out + textZ(&v, z) } }
         return Ok(Val.Text(out))
     }
     let strFn = name == "substr" || name == "substring" || name == "strpos" || name == "replace" || name == "left" ||
@@ -4225,7 +4463,7 @@ fn pathScans(t: &Table, p: &Path, env: &Env): Result[[]Scan, DbErr] {
     let cols = keyCols(t, p.index)
     var prefix = newStrBuf()
     for k in 0..len(p.eqs) {
-        let v = try coerce(try eval(&p.eqs[k], env), &keyType(t, p.index, k))
+        let v = try coerceZ(try eval(&p.eqs[k], env), &keyType(t, p.index, k), &envZone(env))
         if isNull(&v) { return Ok([]) }
         encPart(mut &prefix, &v, ix)
     }
@@ -4236,7 +4474,7 @@ fn pathScans(t: &Table, p: &Path, env: &Env): Result[[]Scan, DbErr] {
         // the subquery's values; one not of the column's type is left to
         // the condition, which stays (it decides what IN means)
         for x in env.subs[p.inSub].vals {
-            match coerce(x, &typ) {
+            match coerceZ(x, &typ, &envZone(env)) {
                 Ok(v) { append(mut &vs, v) }
                 Err(_) {}
             }
@@ -4249,7 +4487,7 @@ fn pathScans(t: &Table, p: &Path, env: &Env): Result[[]Scan, DbErr] {
                 for part in try arrayParts(&a) {
                     match part {
                         Some(x) {
-                            match coerce(Val.Text(x), &typ) {
+                            match coerceZ(Val.Text(x), &typ, &envZone(env)) {
                                 Ok(v) { append(mut &vs, v) }
                                 Err(_) {}
                             }
@@ -4261,7 +4499,7 @@ fn pathScans(t: &Table, p: &Path, env: &Env): Result[[]Scan, DbErr] {
             else {}
         }
     } else {
-        for x in p.ins { append(mut &vs, try coerce(try eval(&x, env), &typ)) }
+        for x in p.ins { append(mut &vs, try coerceZ(try eval(&x, env), &typ, &envZone(env))) }
     }
     var keys: []str = []
     for v in vs {
@@ -4294,7 +4532,7 @@ fn pathScan(t: &Table, p: &Path, env: &Env): Result[Scan, DbErr] {
     let cols = keyCols(t, p.index)
     var prefix = newStrBuf()
     for k in 0..len(p.eqs) {
-        let v = try coerce(try eval(&p.eqs[k], env), &keyType(t, p.index, k))
+        let v = try coerceZ(try eval(&p.eqs[k], env), &keyType(t, p.index, k), &envZone(env))
         if isNull(&v) { return Ok(none) }
         encPart(mut &prefix, &v, ix)
     }
@@ -4305,7 +4543,7 @@ fn pathScan(t: &Table, p: &Path, env: &Env): Result[Scan, DbErr] {
     if len(p.rng) > 0 {
         let typ = keyType(t, p.index, len(p.eqs))
         for b in p.rng {
-            let v = try coerce(try eval(&b.val, env), &typ)
+            let v = try coerceZ(try eval(&b.val, env), &typ, &envZone(env))
             if isNull(&v) { return Ok(none) }
             var kb = newStrBuf()
             kb.add(pre)
@@ -4882,7 +5120,7 @@ fn runLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Ma
                     if isNull(&v) { nul = true }
                     keyPart(mut &kb, &v)
                 } else {
-                    let v = try coerce(try eval(&lv.hashVals[i], &env), &lv.t.cols[lv.hashCols[i]].typ)
+                    let v = try coerceZ(try eval(&lv.hashVals[i], &env), &lv.t.cols[lv.hashCols[i]].typ, &txn.zone)
                     if isNull(&v) { nul = true }
                     encIdxPart(mut &kb, &v)
                 }
@@ -6173,7 +6411,7 @@ fn createTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
         col.identity = c.identity
         match c.def {
             Some(x) {
-                let v = try defaultValue(&x, &col)
+                let v = try defaultValue(&x, &col, None)
                 col.def = Some(clone(&x))
             }
             None {}
@@ -6641,7 +6879,9 @@ fn defaultSeqs(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, c: &lexdb_sql.
 // A DEFAULT checked for column c: no column and no aggregate in it; its
 // value, of c's type. lexdb has no volatile function, so the value is the
 // same whenever it is made: a bad default fails here, not at each INSERT.
-fn defaultValue(x: &Expr, c: &lexdb_sql.ColDef): Result[Val, DbErr] {
+// se: the statement's session (its time zone and now(), 9.95), or None
+// (UTC) where it is only checked.
+fn defaultValue(x: &Expr, c: &lexdb_sql.ColDef, se: Option[SeqEnv]): Result[Val, DbErr] {
     var ns: []str = []
     colNames(x, mut &ns)
     if len(ns) > 0 { return Err(e("0A000", "cannot use column reference in DEFAULT expression")) }
@@ -6650,8 +6890,8 @@ fn defaultValue(x: &Expr, c: &lexdb_sql.ColDef): Result[Val, DbErr] {
     let none: []Val = []
     let noCols: []lexdb_sql.ColDef = []
     let noSubs: []SubRes = []
-    let env = Env{cols: &noCols, row: &none, aggs: &none, params: &none, subs: &noSubs, cur: &none, seq: None}
-    return coerce(try eval(&bpFix(x, &noCols), &env), &c.typ)
+    let env = Env{cols: &noCols, row: &none, aggs: &none, params: &none, subs: &noSubs, cur: &none, seq: se}
+    return coerceZ(try eval(&bpFix(x, &noCols), &env), &c.typ, &envZone(&env))
 }
 
 
@@ -6950,7 +7190,7 @@ fn retype(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, chan
         let env = Env{cols: &q.cols, row: &f, aggs: &noAggs, params: &noParams, subs: &m.subs, cur: &noAggs, seq: sqe}
         var row = copyRow(&f)
         for k in 0..len(changes) {
-            row[changes[k].col] = try coerce(try evalX(st, txn, &q, &xs[k], &env, mut &rs), &changes[k].typ)
+            row[changes[k].col] = try coerceZ(try evalX(st, txn, &q, &xs[k], &env, mut &rs), &changes[k].typ, &txn.zone)
         }
         try checkRow(t, &row)
         try checkChecks(t, &row)
@@ -7073,7 +7313,7 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             var perRow = a.col.identity != lexdb_sql.ID_NONE
             match a.col.def {
                 Some(x) {
-                    col.missing = try defaultValue(&x, &col)
+                    col.missing = try defaultValue(&x, &col, seqEnv(st, txn))
                     col.def = Some(clone(&x))
                     if isVolatile(&x) { perRow = true }
                 }
@@ -7153,7 +7393,7 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
                 }
                 match a.col.def {
                     Some(x) {
-                        let v = try defaultValue(&x, &t.cols[i])
+                        let v = try defaultValue(&x, &t.cols[i], None)
                         t.cols[i].def = Some(clone(&x))
                         try defaultSeqs(st, txn, &t.cols[i])
                     }
@@ -7205,7 +7445,7 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
     // a default must be one of the new type
     for ch in changes {
         match t.cols[ch.col].def {
-            Some(x) { let v = try defaultValue(&x, &t.cols[ch.col]) }
+            Some(x) { let v = try defaultValue(&x, &t.cols[ch.col], None) }
             None {}
         }
     }
@@ -7841,7 +8081,7 @@ fn insertOne(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, targe
     for i in 0..len(t.cols) { append(mut &given, false) }
     for k in 0..len(vs) {
         let ci = targets[k]
-        row[ci] = try coerce(vs[k], &t.cols[ci].typ)
+        row[ci] = try coerceZ(vs[k], &t.cols[ci].typ, &txn.zone)
         given[ci] = true
     }
     // the others their defaults (a sequence's taken only for these)
@@ -7992,7 +8232,7 @@ fn upsertOld(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, defs:
     for k in 0..len(up.sets) {
         let ci = up.targets[k]
         if lexdb_sql.isDefault(&up.sets[k]) { next[ci] = try defAt(st, txn, defs, t, ci) }
-        else { next[ci] = try coerce(try eval(&up.sets[k], &uenv), &t.cols[ci].typ) }
+        else { next[ci] = try coerceZ(try eval(&up.sets[k], &uenv), &t.cols[ci].typ, &txn.zone) }
     }
     try updRow(st, txn, t, old, &next, fw, later)
     up.touched.put(keyOf(t, &next), 1)
@@ -8080,7 +8320,7 @@ fn update(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
         var all = copyRow(&joined)
         for k in 0..len(sets) {
             if lexdb_sql.isDefault(&sets[k]) { all[targets[k]] = try defAt(st, txn, &defs, t, targets[k]) }
-            else { all[targets[k]] = try coerce(try evalX(st, txn, &q, &sets[k], &env, mut &rs), &t.cols[targets[k]].typ) }
+            else { all[targets[k]] = try coerceZ(try evalX(st, txn, &q, &sets[k], &env, mut &rs), &t.cols[targets[k]].typ, &txn.zone) }
         }
         let old = rowPrefix(&joined, nt)
         let row = rowPrefix(&all, nt)
@@ -8395,7 +8635,13 @@ pub fn exprOid(x: &Expr, cols: &[]lexdb_sql.ColDef, ptypes: &[]int): int {
                 "now", "current_timestamp", "transaction_timestamp", "statement_timestamp", "clock_timestamp", "to_timestamp" {
                     return lexdb_sql.OID_TSTZ
                 }
-                "localtimestamp" { return lexdb_sql.OID_TS }
+                "localtimestamp", "make_timestamp" { return lexdb_sql.OID_TS }
+                "make_timestamptz" { return lexdb_sql.OID_TSTZ }
+                "timezone" {
+                    // AT TIME ZONE (9.95): a timestamp made a timestamptz, the rest a timestamp
+                    let a = if len(args) > 0 { exprOid(&args[len(args) - 1], cols, ptypes) } else { lexdb_sql.OID_TSTZ }
+                    return if a == lexdb_sql.OID_TS { lexdb_sql.OID_TSTZ } else { lexdb_sql.OID_TS }
+                }
                 "current_date", "make_date" { return lexdb_sql.OID_DATE }
                 "current_time", "localtime" { return lexdb_sql.OID_TIME }
                 "date_part" { return lexdb_sql.OID_NUMERIC }
@@ -8573,6 +8819,9 @@ fn select(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     // sees is the same and the plan looked at no parameter's value.
     var ver = try catVersion(st, txn)
     if len(txn.path) > 0 { ver = ver + "|" + strings.join(&txn.path, ",") }      // its names resolved by the path
+    // the time zone (9.95): nothing planned depends on it now (a value is
+    // read in it when the plan runs), but a plan is not kept across it
+    if !txn.zone.isUtc() { ver = ver + "|z" + txn.zone.name }
     // its privileges checked as the role: SET ROLE plans it again (9.83)
     match st.memoGet(&roleKeyOf(txn.sess)) {
         Some(r) { if len(r) > 0 { ver = ver + "|r" + r } }
@@ -10468,6 +10717,33 @@ pub type Session = record {
     custom: []str               // the settings with a dot in their names (SET my.x, set_config): "name\x00value" (9.92)
     savedCustom: [][]str        // in a transaction block: custom at its BEGIN
     localUndo: []str            // in a transaction block: the settings SET LOCAL or set_config(..., true) changed, "name\x00old"
+    zone: lexdb_time.Zone       // SET TimeZone (9.95): copied to each statement's Txn
+    savedZone: []lexdb_time.Zone // in a transaction block: the zone at its BEGIN
+}
+
+// The session's time zone (SET TimeZone, 9.95).
+pub fn (s: &Session) zone(): lexdb_time.Zone { return s.zone }
+
+// The text a client sees for a value of a column of type oid, in the
+// session's zone (textOut).
+pub fn (s: &Session) text(v: &Val, oid: int): str { return textOut(v, oid, &s.zone) }
+
+// Values sent as text by a client for parameters of these types, read in
+// the session's zone (paramVals).
+pub fn (s: &Session) paramVals(texts: &[]Option[str], ptypes: &[]int): Result[[]Val, DbErr] {
+    return paramValsIn(texts, ptypes, &s.zone)
+}
+
+// A TimeZone given at the connection's start (9.95).
+pub fn (s: mut &Session) startupZone(v: &str): Result[Unit, DbErr] {
+    s.setZone(try lexdb_time.settingZone(v))
+    return Ok(Unit{})
+}
+
+// The session's zone made z, in its open block's transaction too.
+fn (s: mut &Session) setZone(z: lexdb_time.Zone) {
+    s.zone = z
+    if len(s.txn) > 0 { s.txn[0].zone = z }
 }
 
 // A savepoint: its name and the block's writes when it was made.
@@ -10504,6 +10780,7 @@ fn (s: mut &Session) setPath(names: &[]str) {
 // SHOW's columns: the setting's name, or SHOW ALL's name and setting.
 fn showCols(name: &str): []OutCol {
     if name == "all" { return [OutCol{name: "name", oid: lexdb_sql.OID_TEXT}, OutCol{name: "setting", oid: lexdb_sql.OID_TEXT}] }
+    if name == "timezone" { return [OutCol{name: "TimeZone", oid: lexdb_sql.OID_TEXT}] }
     return [OutCol{name: name, oid: lexdb_sql.OID_TEXT}]
 }
 
@@ -10521,7 +10798,8 @@ fn (s: &Session) setting(name: &str): Option[str] {
         "server_version_num" { return Some("160000") }
         "server_encoding", "client_encoding" { return Some("UTF8") }
         "datestyle" { return Some("ISO, MDY") }
-        "timezone", "log_timezone" { return Some("UTC") }
+        "timezone" { return Some(s.zone.name) }
+        "log_timezone" { return Some("UTC") }
         "intervalstyle" { return Some("postgres") }
         "lc_collate", "lc_ctype", "lc_messages", "lc_monetary", "lc_numeric", "lc_time" { return Some("C") }
         "max_identifier_length" { return Some("63") }
@@ -10608,6 +10886,11 @@ fn (s: mut &Session) applySetting(name: &str, value: &str, local: bool): Result[
         if len(names) == 0 { s.setPath(&["public"]) } else { s.setPath(&names) }
         return Ok(Unit{})
     }
+    if k == "timezone" {
+        // SET TIME ZONE (9.95): "\x01" or DEFAULT, lexdb's default, UTC
+        if value == "\x01" || strings.toLowerAscii(value) == "default" { s.setZone(lexdb_time.utc()) } else { s.setZone(try lexdb_time.settingZone(value)) }
+        return Ok(Unit{})
+    }
     if k == "lexdb_batch" {
         match parseBool(&strings.toLowerAscii(strings.trim(value.toStr()))) {
             Some(y) { s.batch = y }
@@ -10667,7 +10950,7 @@ fn (s: &Session) show(name: &str): Result[Res, DbErr] {
 pub fn parkedSession(st: lexdb_store.Store): Session {
     return Session{st: st, txn: [], failed: false, maxRecursion: MAX_RECURSION, timeoutMs: 0, maxMem: MAX_STATEMENT_MEM,
                    saved: [], readOnly: false, path: [], pathAt: 0, savedPath: [], id: 0, batch: true, saves: [], savedRoles: [],
-                   custom: [], savedCustom: [], localUndo: []}
+                   custom: [], savedCustom: [], localUndo: [], zone: lexdb_time.utc(), savedZone: []}
 }
 
 pub fn newSession(st: lexdb_store.Store): Session {
@@ -10681,7 +10964,7 @@ pub fn newSession(st: lexdb_store.Store): Session {
     st.memoPut(&"sessions", &id.toStr())
     return Session{st: st, txn: [], failed: false, maxRecursion: MAX_RECURSION, timeoutMs: 0, maxMem: MAX_STATEMENT_MEM,
                    saved: [], readOnly: false, path: [], pathAt: 0, savedPath: [], id: id, batch: true, saves: [], savedRoles: [],
-                   custom: [], savedCustom: [], localUndo: []}
+                   custom: [], savedCustom: [], localUndo: [], zone: lexdb_time.utc(), savedZone: []}
 }
 
 // max_statement_mem's default.
@@ -10690,6 +10973,7 @@ pub const MAX_STATEMENT_MEM = 256 * 1024 * 1024
 // A transaction block rolled back: its SETs with it (as PostgreSQL's).
 fn (s: mut &Session) restore() {
     s.localUndo = []
+    if len(s.savedZone) > 0 { s.zone = pop(mut &s.savedZone) }
     if len(s.savedCustom) > 0 { s.custom = pop(mut &s.savedCustom) }
     if len(s.savedRoles) > 0 {
         let r = pop(mut &s.savedRoles)
@@ -10900,7 +11184,10 @@ fn writesOn(s: &lexdb_sql.Stmt): Option[str] {
 }
 
 // Converts the parameters a client sent as text to values of their types.
-pub fn paramVals(texts: &[]Option[str], ptypes: &[]int): Result[[]Val, DbErr] {
+pub fn paramVals(texts: &[]Option[str], ptypes: &[]int): Result[[]Val, DbErr] { return paramValsIn(texts, ptypes, &lexdb_time.utc()) }
+
+// paramVals, a date or time read in zone z (the session's).
+fn paramValsIn(texts: &[]Option[str], ptypes: &[]int, z: &lexdb_time.Zone): Result[[]Val, DbErr] {
     var out: []Val = []
     for i in 0..len(texts) {
         match texts[i] {
@@ -10917,7 +11204,7 @@ pub fn paramVals(texts: &[]Option[str], ptypes: &[]int): Result[[]Val, DbErr] {
                 } else if lexdb_sql.elemOid(oid) > 0 || lexdb_sql.timeKind(oid) > 0 || oid == lexdb_sql.OID_UUID || oid == lexdb_sql.OID_BYTEA || oid == lexdb_sql.OID_FLOAT4 || oid == lexdb_sql.OID_FLOAT8 {
                     ty = oidType(oid)
                 }
-                append(mut &out, try coerce(Val.Text(s), &ty))
+                append(mut &out, try coerceZ(Val.Text(s), &ty, z))
             }
         }
     }
@@ -11014,7 +11301,14 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
                 if stmt.ifFlag || len(stmt.names) == 0 { s.setPath(&["public"]) } else { s.setPath(&stmt.names) }
                 return Ok(tagOnly(if stmt.ifFlag { "RESET" } else { "SET" }))
             }
+            if stmt.table == "timezone" {
+                // SET [LOCAL] TIME ZONE, SET timezone, RESET (9.95): the value in names (then "local")
+                let v = if stmt.ifFlag || len(stmt.names) == 0 { "\x01" } else { stmt.names[0] }
+                try s.applySetting(&stmt.table, &v, len(stmt.names) > 1)
+                return Ok(tagOnly(if stmt.ifFlag { "RESET" } else { "SET" }))
+            }
             if stmt.table == "all" {
+                s.setZone(lexdb_time.utc())
                 if len(s.path) > 0 { s.setPath(&["public"]) }
                 s.maxRecursion = MAX_RECURSION
                 s.timeoutMs = 0
@@ -11075,10 +11369,12 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
                 for c in s.custom { append(mut &cs, c) }
                 s.savedCustom = [cs]
                 s.localUndo = []
+                s.savedZone = [s.zone]
                 var q: []str = []
                 for n in s.path { append(mut &q, n) }
                 s.txn[0].path = q
                 s.txn[0].sess = s.id
+                s.txn[0].zone = s.zone
             }
             return Ok(tagOnly("BEGIN"))
         }
@@ -11110,6 +11406,7 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
             s.savedRoles = []
             s.undoLocal()
             s.savedCustom = []
+            s.savedZone = []
             try s.st.commit(t)
             return Ok(tagOnly("COMMIT"))
         }
@@ -11186,6 +11483,7 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
         var t = if snap { try s.st.beginSnapshot() } else { lexdb_store.begin() }
         for n in s.path { append(mut &t.path, n) }
         t.sess = s.id
+        t.zone = s.zone
         match execIn(&s.st, mut &t, stmt, params, ptypes, lim, pc, input, out, pull) {
             Ok(r) {
                 match s.st.commit(t) {
@@ -12040,10 +12338,10 @@ const SEQ_TREE: str = "\x02seqs"
 fn seqRow(k: &str): str { return "\x04" + k }
 
 // What a session's evaluation needs for nextval and its kind (Env.seq).
-pub type SeqEnv = value record { st: lexdb_store.Store; sess: int; now: int }
+pub type SeqEnv = value record { st: lexdb_store.Store; sess: int; now: int; zone: lexdb_time.Zone }
 
 fn seqEnv(st: &lexdb_store.Store, txn: &lexdb_store.Txn): Option[SeqEnv] {
-    return Some(SeqEnv{st: st.handle(), sess: txn.sess, now: txn.now})
+    return Some(SeqEnv{st: st.handle(), sess: txn.sess, now: txn.now, zone: txn.zone})
 }
 
 fn encSeq(d: &Seq): str {
@@ -12615,7 +12913,7 @@ fn defaultsOf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table): Res
                         seqNamesOf(&dx, mut &names)
                         x = Some(clone(&dx))
                     } else {
-                        v = try defaultValue(&dx, &c)
+                        v = try defaultValue(&dx, &c, seqEnv(st, txn))
                     }
                 }
                 None {}
@@ -12639,7 +12937,7 @@ fn defAt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, d: &Defs, t: &Table,
             let noCols: []lexdb_sql.ColDef = []
             let noSubs: []SubRes = []
             let env = Env{cols: &noCols, row: &none, aggs: &none, params: &none, subs: &noSubs, cur: &none, seq: sqe}
-            return coerce(try eval(&x, &env), &t.cols[i].typ)
+            return coerceZ(try eval(&x, &env), &t.cols[i].typ, &txn.zone)
         }
         None { return Ok(d.vals[i]) }
     }
@@ -12963,7 +13261,7 @@ fn copyStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
                 // a value not of its column's type (insertOne turns them
                 // first, in order): which column, said as PostgreSQL does
                 for k in 0..len(vs) {
-                    match coerce(vs[k], &t.cols[targets[k]].typ) {
+                    match coerceZ(vs[k], &t.cols[targets[k]].typ, &txn.zone) {
                         Ok(_) {}
                         Err(y) { return Err(within(y, where + rd.line.toStr() + ", column " + names[k] + ": " + quoted(&text(&vs[k])))) }
                     }
@@ -13179,9 +13477,10 @@ fn copyOut(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
         copyHeader(&res.cols, &s.copy, mut &b)
         append(mut &lines, [Val.Text(strFromBytes(&b))])
     }
+    let zone = txn.zone
     for r in res.rows {
         replace(mut &b, [])
-        copyLine(&r, &s.copy, &fq, mut &b)
+        copyLine(&r, &s.copy, &fq, &res.cols, &zone, mut &b)
         append(mut &lines, [Val.Text(strFromBytes(&b))])
     }
     let n = len(res.rows)
@@ -13206,9 +13505,10 @@ fn copyStream(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         copyMsgEnd(mut &b, at)
     }
     var count = 0
+    let zone = txn.zone
     try eachRow(st, txn, &sel, params, lim, fn(r: &[]Val): Result[bool, DbErr] {
         let at = copyMsgStart(mut &b)
-        copyLine(r, &s.copy, &fq, mut &b)
+        copyLine(r, &s.copy, &fq, &sel.outs, &zone, mut &b)
         copyMsgEnd(mut &b, at)
         count += 1
         if len(b) >= COPY_PART {
@@ -13237,28 +13537,29 @@ fn copyMsgEnd(b: mut &[]byte, at: int) { binary.setU32BE(b, at + 1, len(b) - at 
 fn copyHeader(cols: &[]OutCol, o: &lexdb_sql.CopyOpts, b: mut &[]byte) {
     for k in 0..len(cols) {
         if k > 0 { appendStr(b, o.delim) }
-        copyField(&Val.Text(cols[k].name), o, len(cols) == 1, false, b)
+        copyField(&Val.Text(cols[k].name), o, len(cols) == 1, false, lexdb_sql.OID_TEXT, &lexdb_time.utc(), b)
     }
     append(b, '\n')
 }
 
-// A row as COPY's line (fq: the columns FORCE_QUOTE names).
-fn copyLine(r: &[]Val, o: &lexdb_sql.CopyOpts, fq: &[]bool, b: mut &[]byte) {
+// A row as COPY's line (fq: the columns FORCE_QUOTE names; cols their
+// types; z the session's zone, 9.95).
+fn copyLine(r: &[]Val, o: &lexdb_sql.CopyOpts, fq: &[]bool, cols: &[]OutCol, z: &lexdb_time.Zone, b: mut &[]byte) {
     for k in 0..len(r) {
         if k > 0 { appendStr(b, o.delim) }
-        copyField(&r[k], o, len(r) == 1, k < len(fq) && fq[k], b)
+        copyField(&r[k], o, len(r) == 1, k < len(fq) && fq[k], if k < len(cols) { cols[k].oid } else { lexdb_sql.OID_TEXT }, z, b)
     }
     append(b, '\n')
 }
 
 // A value as COPY writes it: in the text format escaped, in CSV quoted
 // where it must be.
-fn copyField(v: &Val, o: &lexdb_sql.CopyOpts, single: bool, force: bool, b: mut &[]byte) {
+fn copyField(v: &Val, o: &lexdb_sql.CopyOpts, single: bool, force: bool, oid: int, z: &lexdb_time.Zone, b: mut &[]byte) {
     if isNull(v) {
         appendStr(b, o.null)
         return
     }
-    let t = text(v)
+    let t = textOut(v, oid, z)
     let d = o.delim[0]
     if !o.csv {
         // most values have nothing to escape: added whole
@@ -14158,16 +14459,35 @@ fn bValCmp(op: &str, a: &Expr, b: &Expr, q: &Query, kinds: &[]int, env: &Env): O
     let cc = cmpCode(op)
     if cc < 0 { return None }
     let ca = bValCol(a, q, kinds)
-    if ca >= 0 { return bValCmpOf(cc, ca, b, false, env) }
+    if ca >= 0 { return bValCmpOf(cc, ca, b, false, q, env) }
     let cb = bValCol(b, q, kinds)
-    if cb >= 0 { return bValCmpOf(cc, cb, a, true, env) }
+    if cb >= 0 { return bValCmpOf(cc, cb, a, true, q, env) }
     return None
 }
 
-fn bValCmpOf(cc: int, c: int, k: &Expr, left: bool, env: &Env): Option[BComp] {
+fn bValCmpOf(cc: int, c: int, k: &Expr, left: bool, q: &Query, env: &Env): Option[BComp] {
     if !bConst(k) { return None }
     match eval(k, env) {
-        Ok(v) { return Some(BComp{n: BNode.ValCmp(cc, c, v, left), typ: BT_BOOL}) }
+        Ok(v0) {
+            var v = v0
+            // a date, timestamp or timestamptz column: the value made its
+            // type here, in the session's zone (9.95), as compareTime
+            // would (a text read as it; the others compared as instants)
+            let ck = q.cols[c].typ.kind
+            let vk = kindOf(&v)
+            if (ck == lexdb_sql.K_DATE || ck == lexdb_sql.K_TS || ck == lexdb_sql.K_TSTZ) && vk != ck && !isNull(&v) {
+                let z = envZone(env)
+                if vk == lexdb_sql.K_TEXT {
+                    match coerceTime(v, &lexdb_sql.timeType(q.cols[c].typ.oid), &z) {
+                        Ok(x) { v = x }
+                        Err(_) { return None }
+                    }
+                } else if !z.isUtc() {
+                    return None
+                }
+            }
+            return Some(BComp{n: BNode.ValCmp(cc, c, v, left), typ: BT_BOOL})
+        }
         Err(_) { return None }
     }
 }
@@ -14956,7 +15276,9 @@ fn batchLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &
     var qkinds: []int = array(len(q.cols), BK_NONE)
     for i in 0..len(t.cols) { qkinds[i] = kinds[i] }
     let noAggs: []Val = []
-    let env = Env{cols: &q.cols, row: row, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: None}
+    // (its session: the time zone its constants are read in, 9.95; no
+    // function is evaluated here, bConst)
+    let env = Env{cols: &q.cols, row: row, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: seqEnv(st, txn)}
     // the conditions batches evaluate. Any of them, in any order: tryRow
     // checks every condition on the rows they keep, and a batch on one of
     // whose rows one gives an error goes to the row path, which tries them
@@ -15071,7 +15393,7 @@ fn batchGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
     for i in 0..len(t.cols) { append(mut &needCol, len(lv.need) == 0 || lv.need[i]) }
     let noAggs: []Val = []
     let nullRow: []Val = array(len(q.cols), Val.Null)
-    let env = Env{cols: &q.cols, row: &nullRow, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: None}
+    let env = Env{cols: &q.cols, row: &nullRow, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: seqEnv(st, txn)}
     // the conditions, the group keys and the aggregates over batches
     var conds: []BNode = []
     for x in lv.cond {
@@ -16670,7 +16992,7 @@ fn posArg(v: &Val, what: &str, min: int): Result[int, DbErr] {
 }
 
 // The functions of 9.92; None if name is none of them.
-fn callFn(name: &str, vs: &[]Val): Result[Option[Val], DbErr] {
+fn callFn(name: &str, vs: &[]Val, z: &lexdb_time.Zone): Result[Option[Val], DbErr] {
     let hint = hintOids(vs)
     let n = if hint.isSome() { len(vs) - 1 } else { len(vs) }
     var anyNull = false
@@ -16691,7 +17013,7 @@ fn callFn(name: &str, vs: &[]Val): Result[Option[Val], DbErr] {
             if n < 2 { return Err(e("42883", "function concat_ws with " + n.toStr() + " arguments does not exist")) }
             if isNull(&vs[0]) { return Ok(Some(Val.Null)) }
             var parts: []str = []
-            for i in 1..n { if !isNull(&vs[i]) { append(mut &parts, text(&vs[i])) } }
+            for i in 1..n { if !isNull(&vs[i]) { append(mut &parts, textZ(&vs[i], z)) } }
             return Ok(Some(Val.Text(strings.join(&parts, text(&vs[0])))))
         }
         "md5" {
@@ -16706,7 +17028,7 @@ fn callFn(name: &str, vs: &[]Val): Result[Option[Val], DbErr] {
             if n < 1 { return Ok(None) }
             if isNull(&vs[0]) { return Ok(Some(Val.Null)) }
             var args: []Option[str] = []
-            for i in 1..n { append(mut &args, if isNull(&vs[i]) { None } else { Some(text(&vs[i])) }) }
+            for i in 1..n { append(mut &args, if isNull(&vs[i]) { None } else { Some(textZ(&vs[i], z)) }) }
             return Ok(Some(Val.Text(try lexdb_func.format(&text(&vs[0]), &args))))
         }
         "chr" {
@@ -17089,7 +17411,12 @@ fn callFn(name: &str, vs: &[]Val): Result[Option[Val], DbErr] {
                 }
                 Val.Tstz(u) {
                     if u == lexdb_time.INF || u == lexdb_time.NINF { return Ok(Some(Val.Null)) }
-                    return Ok(Some(Val.Text(lexdb_func.toCharTm(&lexdb_func.tmOfTs(lexdb_time.tstzToTs(u), true), &f))))
+                    // in the session's zone: its offset and abbreviation for TZ, OF, TZH, TZM
+                    let inf = z.info(lexdb_time.unixSecOf(u))
+                    var tm = lexdb_func.tmOfTs(u + inf.offset * 1000000, true)
+                    tm.off = inf.offset
+                    tm.abbr = inf.abbr
+                    return Ok(Some(Val.Text(lexdb_func.toCharTm(&tm, &f))))
                 }
                 Val.Ival(iv) { return Ok(Some(Val.Text(lexdb_func.toCharTm(&lexdb_func.tmOfIval(&iv), &f)))) }
                 Val.Time(u) {
@@ -17111,8 +17438,10 @@ fn callFn(name: &str, vs: &[]Val): Result[Option[Val], DbErr] {
             let days = try lexdb_func.parsedDate(&pd)
             if name == "to_date" { return Ok(Some(Val.Date(days))) }
             let local = lexdb_time.dateToTs(days) + try lexdb_func.parsedTime(&pd)
+            // with TZH (and TZM) at that offset, else in the session's zone
+            if !pd.hasTz { return Ok(Some(Val.Tstz(lexdb_time.tsToTstz(local, z)))) }
             let off = if pd.tzoff == -1 { 0 } else { pd.tzoff }
-            return Ok(Some(Val.Tstz(lexdb_time.tsToTstz(local - off * 1000000))))
+            return Ok(Some(Val.Tstz(local - off * 1000000)))
         }
         "pi" {
             if n != 0 { return Ok(None) }
@@ -17219,7 +17548,8 @@ fn sessCall(name: &str, vs: &[]Val, env: &Env): Result[Val, DbErr] {
         var known = strings.contains(&k, ".")
         for x in SHOWN { if x == k { known = true } }
         if !known { return Err(e("42704", "unrecognized configuration parameter \"" + text(&vs[0]) + "\"")) }
-        let v = if isNull(&vs[1]) { "" } else { text(&vs[1]) }
+        var v = if isNull(&vs[1]) { "" } else { text(&vs[1]) }
+        if k == "timezone" { v = (try lexdb_time.settingZone(&v)).name }    // as SHOW will give it (9.95)
         if strings.contains(&v, "\n") || strings.contains(&v, "\t") { return Err(e("0A000", "lexdb: a setting's value may not hold a newline or a tab")) }
         if k == "max_recursion" || k == "statement_timeout" || k == "max_statement_mem" { let ok = try settingValue(&k, &Val.Text(v)) }
         let local = truth(&vs[2]) == Some(true)
