@@ -38,9 +38,9 @@ and `SET lexdb_planner` (section 20), the review fixes (section 21), plans
 kept per parameter outcome (section 22), per-value estimates with
 per-parameter plans (section 23), estimates deciding beyond ties with
 primary-key statistics (section 24), the constraint-bound join order
-(section 25), and the cost-based join order with its planning-time
-measurement (section 26, uncommitted). Code comments cite these sections as
-"optimizer N".
+(section 25), the cost-based join order with its planning-time measurement
+(section 26), and implied equalities (section 27, uncommitted). Code
+comments cite these sections as "optimizer N".
 
 ## 1. Summary
 
@@ -1538,6 +1538,65 @@ pays it each time. The 12-table bound stands unless the user lowers it.
   plans a lookup, then `choosePath`'s rules or estimates pick the level's
   path; `readOnce` is enforced, a lookup is not.
 - Bushy plans, outer-join reordering, and the run-time check of section 5.5.
+
+## 27. Implied equalities (2026-11-12)
+
+**What.** In an inner-join SELECT in cost mode, the equalities make classes
+of equal columns, perhaps with a constant (a literal or a parameter):
+`a = b` and `b = c` put a, b and c in one class, and `a = 5` gives the class
+a constant. The equalities the classes imply and the statement does not
+hold are added to the conjuncts (`Query.implied`, `eqClasses`):
+- between two columns of different tables: `a = c`;
+- of each column with the class's constant: `b = 5`, `c = 5`.
+Columns join a class only when their types are of one kind, so that a
+derived comparison means what the written ones mean. A row for which the
+written equalities are true makes the derived ones true, so results do not
+change. Outer joins, LATERAL and the rules mode derive nothing.
+
+**What it gives.**
+- A table is reached straight from any table of its class, and a constant
+  pins what it reaches: in `lines JOIN orders ON l.ord = o.id JOIN cust ON
+  c.id = o.cust WHERE o.cust = 7`, `c.id = 7` is derived, so the customer
+  is pinned and runs first. The rules mode scans all 5,000 lines (tested).
+- `small`, `big` and `mid` joined through `mid`: `b.sid = s.id` is derived,
+  so `big` is looked up from the one `small` row (200 rows), not per `mid`
+  row (about 4,000).
+- A constant's equality is taken before an outer value's when a key column
+  has both (`choosePath`, only where implied equalities were derived). The
+  value is the same for every outer row, so the table is read once:
+  `orders` pinned, then its lines by `lines_ord` on the constant, hashed.
+
+**The cost model counts a class once.** When a table joins a set, each class
+it shares with the set divides the rows by the largest distinct count among
+the class's columns there. A per-pair count would apply the same join two
+or three times over, since the derived pairs repeat it. A class with a
+constant divides nothing: each table's constant condition has counted.
+
+**Planning time.** Measured again with `plan_time.lxl`, load about 1.7, in
+microseconds per EXPLAIN:
+
+| Query | Before (section 26) | Now |
+|---|---|---|
+| point select | 6 | 6 |
+| 4 tables | 25 | 28 |
+| 8 tables | 52 | 63 |
+| 12 tables, chain | 147 | 168 |
+| 12 tables, star | 636 | about 1,600 |
+
+The star is the costly case. Every spoke joins the centre's key, so the
+derived spoke-to-spoke equalities link every table to every other, and the
+search visits all 4,096 sets again. Leaving derived equalities out of the
+linking kept the star near 800 us, but it hid the plan in the second
+example above (`small` to `big` counted as a cross product), so they link.
+Two measurement lessons: the first per-class loop indexed nested arrays of
+records in the loop over every set and tripled the chain's time (147 to
+450 us); flat arrays fixed it. A `for ... in` over records was measured and
+does not copy.
+
+**Open (the user's call).** The 12-table bound with about 1.6 ms for a
+12-table star, paid once per prepared statement and on every simple-query
+run. A bound of 10, or SQLite's N-best search for dense joins above 8
+tables, would cut it.
 
 ## Sources
 

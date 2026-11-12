@@ -4245,6 +4245,7 @@ pub type Query = record {
     base: int                   // the statement's parameters; then refs' values
     corr: bool                  // a subquery of it is correlated
     refs: []Expr                // a subquery: the outer values it uses (in the outer query's terms)
+    implied: bool               // its implied equalities were added (optimizer 27): a constant's equality is taken first
 }
 
 fn dotAt(s: &str): int {
@@ -4860,6 +4861,135 @@ fn keyCols(t: &Table, index: int): []int {
 // so does SET lexdb_planner = rules. The tables keep their columns' places
 // in the joined row (Level.first): only the order they run in changes.
 
+// ---- equal columns (optimizer 27): an inner join's equalities make
+// classes of columns equal to each other, and perhaps to a constant (a
+// literal or a parameter). Columns of one class are joined only when their
+// types are of one kind, so that a comparison means the same whichever two
+// are compared. The implied equalities (a = b and b = c: a = c; a = 5 and
+// a = b: b = 5) are added to the conjuncts, so that a table is reached
+// straight from any other of its class, or by the constant. They hold
+// whenever the written ones do (a row where a = b and b = c are true has
+// a = c true), so the results are the same.
+
+type EqClass = record { names: []str; levels: []int; konst: []Expr }
+
+fn (q: &Query) colKind(name: &str): int {
+    let i = colIndex(&q.cols, name)
+    return if i < 0 { -1 } else { q.cols[i].typ.kind }
+}
+
+// A constant for the classes: a literal (not NULL) or a parameter.
+fn eqConst(x: &Expr): bool {
+    match x {
+        Expr.Lit(v) { return !isNull(&v) }
+        Expr.Param(_) { return true }
+        else { return false }
+    }
+}
+
+fn (q: &Query) eqClasses(cs: &[]Expr): []EqClass {
+    var names: []str = []
+    var parent: []int = []
+    var konstOf: []int = []             // per constant conjunct: the name's index
+    var konsts: []Expr = []
+    for c in cs {
+        match c {
+            Expr.Bin(op, l, r) {
+                if op != "=" { continue }
+                var a = ""
+                var b = ""
+                match l { Expr.Col(n) { a = n } else {} }
+                match r { Expr.Col(n) { b = n } else {} }
+                if len(a) > 0 && len(b) > 0 {
+                    if q.levelOf(&a) < 0 || q.levelOf(&b) < 0 || q.colKind(&a) != q.colKind(&b) { continue }
+                    let i = nameIdx(mut &names, mut &parent, &a)
+                    let j = nameIdx(mut &names, mut &parent, &b)
+                    let ri = ufRoot(&parent, i)
+                    let rj = ufRoot(&parent, j)
+                    if ri != rj { parent[rj] = ri }
+                } else if len(a) > 0 && eqConst(&r) && q.levelOf(&a) >= 0 {
+                    append(mut &konstOf, nameIdx(mut &names, mut &parent, &a))
+                    append(mut &konsts, clone(&r))
+                } else if len(b) > 0 && eqConst(&l) && q.levelOf(&b) >= 0 {
+                    append(mut &konstOf, nameIdx(mut &names, mut &parent, &b))
+                    append(mut &konsts, clone(&l))
+                }
+            }
+            else {}
+        }
+    }
+    var roots: []int = []
+    var out: []EqClass = []
+    for i in 0..len(names) {
+        let r = ufRoot(&parent, i)
+        var at = -1
+        for j in 0..len(roots) { if roots[j] == r { at = j } }
+        if at < 0 {
+            append(mut &roots, r)
+            append(mut &out, EqClass{names: [], levels: [], konst: []})
+            at = len(out) - 1
+        }
+        append(mut &out[at].names, names[i].toStr())
+        append(mut &out[at].levels, q.levelOf(&names[i]))
+    }
+    for i in 0..len(konstOf) {
+        let r = ufRoot(&parent, konstOf[i])
+        for j in 0..len(roots) { if roots[j] == r && len(out[j].konst) == 0 { append(mut &out[j].konst, clone(&konsts[i])) } }
+    }
+    return out
+}
+
+fn nameIdx(names: mut &[]str, parent: mut &[]int, n: &str): int {
+    for i in 0..len(names) { if names[i] == n { return i } }
+    append(names, n.toStr())
+    append(parent, len(parent))
+    return len(names) - 1
+}
+
+fn ufRoot(parent: &[]int, i: int): int {
+    var x = i
+    while parent[x] != x { x = parent[x] }
+    return x
+}
+
+// Whether cs holds a = b (either way round).
+fn hasEq(cs: &[]Expr, a: &str, b: &Expr): bool {
+    let bt = lexdb_sql.exprText(b)
+    for c in cs {
+        match c {
+            Expr.Bin(op, l, r) {
+                if op == "=" {
+                    match l { Expr.Col(n) { if n == a && lexdb_sql.exprText(&r) == bt { return true } } else {} }
+                    match r { Expr.Col(n) { if n == a && lexdb_sql.exprText(&l) == bt { return true } } else {} }
+                }
+            }
+            else {}
+        }
+    }
+    return false
+}
+
+// The equalities the classes imply that cs does not hold: between columns
+// of two tables, and of each column with its class's constant.
+fn (q: &Query) implied(cs: &[]Expr): []Expr {
+    var out: []Expr = []
+    for cl in q.eqClasses(cs) {
+        for i in 0..len(cl.names) {
+            for j in i + 1..len(cl.names) {
+                if cl.levels[i] == cl.levels[j] { continue }
+                let b = Expr.Col(cl.names[j].toStr())
+                if !hasEq(cs, &cl.names[i], &b) && !hasEq(cs, &cl.names[j], &Expr.Col(cl.names[i].toStr())) {
+                    append(mut &out, Expr.Bin("=", Expr.Col(cl.names[i].toStr()), b))
+                }
+            }
+            if len(cl.konst) > 0 && !hasEq(cs, &cl.names[i], &cl.konst[0]) {
+                append(mut &out, Expr.Bin("=", Expr.Col(cl.names[i].toStr()), clone(&cl.konst[0])))
+            }
+        }
+    }
+    return out
+}
+
 // ---- join order, step 2 (optimizer 26): by cost, with ANALYZE's statistics.
 // When every table of a SELECT's inner join has statistics and there are at
 // most JOIN_SEARCH_MAX, the order is the cheapest of all left-deep orders,
@@ -4965,11 +5095,13 @@ fn (q: &Query) wayInto(k: int, cands: &[]WayCand, mask: int, outer: bool): Way {
     let lv = &q.levels[k]
     let t = float(lv.est.rows)
     var best = if outer { Way{rows: -1.0f, cost: 0.0f, outer: true} } else { Way{rows: t, cost: t, outer: false} }
-    for wc in cands {
+    for ci in 0..len(cands) {
+        let wc = &cands[ci]
         var n = 0
         var uses = false
         var key = ""
-        for b in wc.cols {
+        for bi in 0..len(wc.cols) {
+            let b = &wc.cols[bi]
             var found = -1
             for i in 0..len(b.deps) {
                 let d = b.deps[i]
@@ -5034,36 +5166,31 @@ fn (q: &Query) costOrder(ms: &[][]Expr, perm: mut &[]int, ro: mut &[]bool): bool
         let m = q.levelMask(&x)
         if m > 0 { for k in 0..nl { if (m & (1 << k)) != 0 { adj[k] = adj[k] | (m & ~(1 << k)) } } }
     }
-    // the equalities between two levels' columns: their share of the rows
-    var la: []int = []
-    var lb: []int = []
-    var lsel: []float = []
-    for x in cs {
-        match x {
-            Expr.Bin(op, l, r) {
-                if op == "=" {
-                    match l {
-                        Expr.Col(a) {
-                            match r {
-                                Expr.Col(b) {
-                                    let i = q.levelOf(&a)
-                                    let j = q.levelOf(&b)
-                                    if i >= 0 && j >= 0 && i != j {
-                                        append(mut &la, i)
-                                        append(mut &lb, j)
-                                        append(mut &lsel, 1.0f / fmax(q.distinctOf(&a, i), q.distinctOf(&b, j)))
-                                    }
-                                }
-                                else {}
-                            }
-                        }
-                        else {}
-                    }
-                }
+    // the classes of equal columns (optimizer 27): a class joins the tables
+    // holding its columns once, by 1 / the larger distinct count of the two
+    // sides; a class with a constant joins nothing (each table's constant
+    // condition has counted)
+    // flat, for the loop over every set: per class the levels holding it
+    // (a mask) and per class and level its column's distinct values
+    var cmask: []int = []
+    var cdist: []float = []             // class * nl + level
+    let all = q.eqClasses(&cs)
+    for x in 0..len(all) {
+        if len(all[x].konst) > 0 { continue }
+        var m = 0
+        var ds: []float = array(nl, 0.0f)
+        for i in 0..len(all[x].names) {
+            let l = all[x].levels[i]
+            if (m & (1 << l)) == 0 {
+                m = m | (1 << l)
+                ds[l] = q.distinctOf(&all[x].names[i], l)
             }
-            else {}
         }
+        if m & (m - 1) == 0 { continue }        // one table's columns only
+        append(mut &cmask, m)
+        for d in ds { append(mut &cdist, d) }
     }
+    let ncl = len(cmask)
     let full = (1 << nl) - 1
     var rows: []float = array(full + 1, 0.0f)
     var cost: []float = array(full + 1, -1.0f)
@@ -5071,16 +5198,22 @@ fn (q: &Query) costOrder(ms: &[][]Expr, perm: mut &[]int, ro: mut &[]bool): bool
     var lastOnce: []bool = array(full + 1, false)
     var nbr: []int = array(full + 1, 0)         // the levels linked to a set's
     for mask in 1..full + 1 {
-        // the rows of the set: its tables' by their constants, times the
-        // equalities' shares among them (at least one)
+        // the rows of the set: its tables' by their constants, times each
+        // class's share between the table added and the rest: 1 / the
+        // largest distinct count among its columns there (at least one row)
         var low = 0
         while (mask & (1 << low)) == 0 { low += 1 }
         let rest = mask & ~(1 << low)
         var r = base[low].rows * (if rest == 0 { 1.0f } else { rows[rest] })
-        for i in 0..len(la) {
-            let a = la[i]
-            let b = lb[i]
-            if (a == low && (rest & (1 << b)) != 0) || (b == low && (rest & (1 << a)) != 0) { r = r * lsel[i] }
+        for ci in 0..ncl {
+            let cm = cmask[ci]
+            if (cm & (1 << low)) == 0 { continue }
+            let other = cm & rest
+            if other == 0 { continue }
+            // the class's most selective column among the set's
+            var d = cdist[ci * nl + low]
+            for l in 0..nl { if (other & (1 << l)) != 0 { d = fmax(d, cdist[ci * nl + l]) } }
+            r = r / d
         }
         rows[mask] = fmax(r, 1.0f)
         nbr[mask] = nbr[rest] | adj[low]
@@ -5143,9 +5276,16 @@ fn noTable(): Table {
 
 // The new order of q's levels (old indexes), [] when FROM's stands. ms: the
 // conjuncts placed so far, per level.
+// Whether every join is inner and none LATERAL: its tables may run in any
+// order, and its equalities imply others.
+fn (q: &Query) innerOnly(): bool {
+    for lv in q.levels { if isOuter(lv.join) || lv.lateral { return false } }
+    return true
+}
+
 fn (q: &Query) joinOrder(ms: &[][]Expr): []int {
     let nl = len(q.levels)
-    for lv in q.levels { if isOuter(lv.join) || lv.lateral { return [] } }
+    if !q.innerOnly() { return [] }
     var cs: []Expr = []
     for m in ms { for c in m { append(mut &cs, clone(&c)) } }
     var placed: []bool = array(nl, false)
@@ -5275,6 +5415,12 @@ fn choosePath(q: &Query, k: int, cs: &[]Expr, params: &[]Val, lk: mut &[]Look): 
             let name = lv.alias + "." + lv.t.cols[ci].name
             var bs = bounds(cs, &name, k, q)
             var eqAt = -1
+            // a constant's equality first where they are implied (optimizer
+            // 27): the same for every row of the tables before, so the table
+            // can be read once
+            if q.implied {
+                for i in 0..len(bs) { if bs[i].op == "=" && eqAt < 0 && q.maxLevel(&bs[i].val) < 0 && !hasCorr(&bs[i].val) { eqAt = i } }
+            }
             for i in 0..len(bs) { if bs[i].op == "=" && eqAt < 0 { eqAt = i } }
             if eqAt < 0 {
                 ins = inList(cs, &name, k, q)
@@ -5621,7 +5767,7 @@ fn newLevel(t: Table, alias: str, join: int, first: int): Level {
 // (a SELECT's; UPDATE ... FROM and DELETE ... USING keep their target first).
 fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_sql.FromItem,
               where: &Option[Expr], params: &[]Val, subs: &[]lexdb_sql.Stmt, sc: mut &Scope, order: bool): Result[Query, DbErr] {
-    var q = Query{levels: [], cols: [], top: [], subs: [], base: sc.base, corr: false, refs: []}
+    var q = Query{levels: [], cols: [], top: [], subs: [], base: sc.base, corr: false, refs: [], implied: false}
     // a subquery in FROM is planned first: it sees the queries around this
     // one, not this one's tables
     var planned: [][]SubPlan = []
@@ -5875,6 +6021,18 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
         // the join order: by cost with statistics (optimizer 26), else bound
         // by keys (optimizer 25); the conjuncts go again to the latest table
         // they use, in the new order
+        if q.innerOnly() {
+            // the implied equalities (optimizer 27), at the latest table they use
+            var all: []Expr = []
+            for m in ms { for c in m { append(mut &all, clone(&c)) } }
+            let extra = q.implied(&all)
+            for i in 0..len(extra) {
+                var k = q.maxLevel(&extra[i])
+                if k < 0 { k = 0 }
+                append(mut &ms[k], clone(&extra[i]))
+            }
+            q.implied = true
+        }
         var ro: []bool = []
         var perm: []int = []
         if !q.costOrder(&ms, mut &perm, mut &ro) { perm = q.joinOrder(&ms) }
@@ -11148,7 +11306,7 @@ fn planSet(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
     let split = len(l.q.refs)
     let limit = try evalInt(&s.limit, params, "LIMIT", mut &sc.looks)
     let offset = try evalInt(&s.offset, params, "OFFSET", mut &sc.looks)
-    let q = Query{levels: [], cols: [], top: [], subs: [], base: sc.base, corr: false, refs: refs}
+    let q = Query{levels: [], cols: [], top: [], subs: [], base: sc.base, corr: false, refs: refs, implied: false}
     return Ok(Sel{q: q, exprs: [], outs: outs, groupBy: [], order: order, aggQ: false, sort: len(order) > 0, first: -1,
                   limit: limit, offset: offset, having: None, specs: [], distinct: false, desc: desc, nullsFirst: nullsFirst, parts: [l, r],
                   setop: s.setop, setAll: s.setAll, split: split, rec: if s.rec { s.cte } else { -1 }, srf: "", ordin: false,
