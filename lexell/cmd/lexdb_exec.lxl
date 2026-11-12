@@ -1996,34 +1996,7 @@ pub fn eval(x: &Expr, env: &Env): Result[Val, DbErr] {
         }
         Expr.Unary(op, a) {
             let v = try eval(&a, env)
-            if op == "~" {
-                match v {
-                    Val.Null { return Ok(Val.Null) }
-                    Val.Int(n) { return Ok(Val.Int(~n)) }
-                    else { return Err(e("42883", "operator does not exist: ~ " + kindName(&oidType(kindOid(&v))))) }
-                }
-            }
-            if op == "-" {
-                match v {
-                    Val.Null { return Ok(Val.Null) }
-                    Val.Int(n) {
-                        match (0).checkedSub(n) {
-                            Some(m) { return Ok(Val.Int(m)) }
-                            None { return Err(e("22003", "bigint out of range")) }
-                        }
-                    }
-                    Val.Num(d) { return Ok(Val.Num(d.neg())) }
-                    Val.Ival(iv) { return Ok(Val.Ival(lexdb_time.ivalNeg(&iv))) }
-                    Val.Float(fx) { return Ok(Val.Float(-fx)) }
-                    Val.Real(fx) { return Ok(Val.Real(-fx)) }
-                    else { return arith(&"-", &Val.Int(0), &v) }
-                }
-            }
-            if isNull(&v) { return Ok(Val.Null) }
-            match truth(&v) {
-                Some(b) { return Ok(Val.Bool(!b)) }
-                None { return Err(e("42804", "argument of NOT must be type boolean")) }
-            }
+            return unaryVal(&op, v)
         }
         Expr.Bin(op, a, b) {
             if op == "and" || op == "or" {
@@ -2042,50 +2015,14 @@ pub fn eval(x: &Expr, env: &Env): Result[Val, DbErr] {
             }
             let l = try eval(&a, env)
             let r = try eval(&b, env)
-            if op == "t+" {
-                // T-SQL's + (design/lexdb-tds.md S3): NULL with a NULL; two
-                // strings joined; a string with a number read as that number
-                if isNull(&l) || isNull(&r) { return Ok(Val.Null) }
-                let lt = kindOf(&l) == lexdb_sql.K_TEXT
-                let rt = kindOf(&r) == lexdb_sql.K_TEXT
-                if lt && rt { return Ok(Val.Text(text(&l) + text(&r))) }
-                if lt { return arith(&"+", &(try coerce(l, &oidType(kindOid(&r)))), &r) }
-                if rt { return arith(&"+", &l, &(try coerce(r, &oidType(kindOid(&l))))) }
-                return arith(&"+", &l, &r)
-            }
-            if op == "||" {
+            if op == "||" && (looksArray(&l) || looksArray(&r)) {
                 // arrays, in an expression resolve has not seen (9.92)
-                if (looksArray(&l) || looksArray(&r)) {
-                    let noCols: []lexdb_sql.ColDef = []
-                    let noTypes: []int = []
-                    let f = arrayConcat(&a, &b, &noCols, &noTypes)
-                    if len(f) > 0 { return call(&f, &[l, r]) }
-                }
-                if isNull(&l) || isNull(&r) { return Ok(Val.Null) }
-                if kindOf(&l) == lexdb_sql.K_BYTEA || kindOf(&r) == lexdb_sql.K_BYTEA {
-                    let ty = oidType(lexdb_sql.OID_BYTEA)
-                    let lb = try coerce(l, &ty)
-                    let rb = try coerce(r, &ty)
-                    match lb { Val.Bytes(p) { match rb { Val.Bytes(q) { return Ok(Val.Bytes(p + q)) } else {} } } else {} }
-                }
-                if isTstz(&l) || isTstz(&r) { return Ok(Val.Text(textZ(&l, &envZone(env)) + textZ(&r, &envZone(env)))) }
-                return Ok(Val.Text(text(&l) + text(&r)))
+                let noCols: []lexdb_sql.ColDef = []
+                let noTypes: []int = []
+                let f = arrayConcat(&a, &b, &noCols, &noTypes)
+                if len(f) > 0 { return call(&f, &[l, r]) }
             }
-            if op == "=" || op == "<>" || op == "<" || op == "<=" || op == ">" || op == ">=" {
-                if isNull(&l) || isNull(&r) { return Ok(Val.Null) }
-                let c = if isTimeKind(kindOf(&l)) || isTimeKind(kindOf(&r)) { try compareTime(&l, &r, &envZone(env)) } else { try compare(&l, &r) }
-                let t = match op {
-                    "=" { c == 0 }
-                    "<>" { c != 0 }
-                    "<" { c < 0 }
-                    "<=" { c <= 0 }
-                    ">" { c > 0 }
-                    else { c >= 0 }
-                }
-                return Ok(Val.Bool(t))
-            }
-            if isTimeKind(kindOf(&l)) || isTimeKind(kindOf(&r)) { return arithZ(&op, &l, &r, &envZone(env)) }
-            return arith(&op, &l, &r)
+            return binVal(&op, l, r, &env.seq)
         }
         Expr.IsNull(a, neg) {
             let v = try eval(&a, env)
@@ -2093,10 +2030,7 @@ pub fn eval(x: &Expr, env: &Env): Result[Val, DbErr] {
         }
         Expr.Cast(a, t) {
             let v = try eval(&a, env)
-            if t.kind == lexdb_sql.K_REG { return regCast(&v, t.oid, &env.seq) }
-            if t.oid == lexdb_sql.OID_BPCHAR && !isNull(&v) && kindOf(&v) == lexdb_sql.K_TEXT { return bpcharOf(text(&v), t.len, true) }
-            if isTimeKind(t.kind) || t.kind == lexdb_sql.K_ARRAY || isTstz(&v) { return coerceZ(v, &t, &envZone(env)) }
-            return coerce(v, &t)
+            return castVal(v, &t, &env.seq)
         }
         Expr.Call(name, args, star) {
             if isSubCall(&name) {
@@ -2214,6 +2148,341 @@ pub fn eval(x: &Expr, env: &Env): Result[Val, DbErr] {
     }
 }
 
+// op on v: eval's Expr.Unary, shared with compiled expressions (cEval).
+fn unaryVal(op: &str, v: Val): Result[Val, DbErr] {
+    if op == "~" {
+        match v {
+            Val.Null { return Ok(Val.Null) }
+            Val.Int(n) { return Ok(Val.Int(~n)) }
+            else { return Err(e("42883", "operator does not exist: ~ " + kindName(&oidType(kindOid(&v))))) }
+        }
+    }
+    if op == "-" {
+        match v {
+            Val.Null { return Ok(Val.Null) }
+            Val.Int(n) {
+                match (0).checkedSub(n) {
+                    Some(m) { return Ok(Val.Int(m)) }
+                    None { return Err(e("22003", "bigint out of range")) }
+                }
+            }
+            Val.Num(d) { return Ok(Val.Num(d.neg())) }
+            Val.Ival(iv) { return Ok(Val.Ival(lexdb_time.ivalNeg(&iv))) }
+            Val.Float(fx) { return Ok(Val.Float(-fx)) }
+            Val.Real(fx) { return Ok(Val.Real(-fx)) }
+            else { return arith(&"-", &Val.Int(0), &v) }
+        }
+    }
+    if isNull(&v) { return Ok(Val.Null) }
+    match truth(&v) {
+        Some(b) { return Ok(Val.Bool(!b)) }
+        None { return Err(e("42804", "argument of NOT must be type boolean")) }
+    }
+}
+
+// The session's zone of an evaluation's seq (envZone).
+fn seqZone(seq: &Option[SeqEnv]): lexdb_time.Zone {
+    match seq {
+        Some(se) { return se.zone }
+        None { return lexdb_time.utc() }
+    }
+}
+
+// l op r, op not AND or OR, nor || of arrays (eval's Expr.Bin after its
+// operands); seq: the evaluation's (its zone: 9.95). Shared with compiled
+// expressions (cEval).
+fn binVal(op: &str, l: Val, r: Val, seq: &Option[SeqEnv]): Result[Val, DbErr] {
+    if op == "t+" {
+        // T-SQL's + (design/lexdb-tds.md S3): NULL with a NULL; two
+        // strings joined; a string with a number read as that number
+        if isNull(&l) || isNull(&r) { return Ok(Val.Null) }
+        let lt = kindOf(&l) == lexdb_sql.K_TEXT
+        let rt = kindOf(&r) == lexdb_sql.K_TEXT
+        if lt && rt { return Ok(Val.Text(text(&l) + text(&r))) }
+        if lt { return arith(&"+", &(try coerce(l, &oidType(kindOid(&r)))), &r) }
+        if rt { return arith(&"+", &l, &(try coerce(r, &oidType(kindOid(&l))))) }
+        return arith(&"+", &l, &r)
+    }
+    if op == "||" {
+        if isNull(&l) || isNull(&r) { return Ok(Val.Null) }
+        if kindOf(&l) == lexdb_sql.K_BYTEA || kindOf(&r) == lexdb_sql.K_BYTEA {
+            let ty = oidType(lexdb_sql.OID_BYTEA)
+            let lb = try coerce(l, &ty)
+            let rb = try coerce(r, &ty)
+            match lb { Val.Bytes(p) { match rb { Val.Bytes(q) { return Ok(Val.Bytes(p + q)) } else {} } } else {} }
+        }
+        if isTstz(&l) || isTstz(&r) { return Ok(Val.Text(textZ(&l, &seqZone(seq)) + textZ(&r, &seqZone(seq)))) }
+        return Ok(Val.Text(text(&l) + text(&r)))
+    }
+    if op == "=" || op == "<>" || op == "<" || op == "<=" || op == ">" || op == ">=" {
+        if isNull(&l) || isNull(&r) { return Ok(Val.Null) }
+        let c = if isTimeKind(kindOf(&l)) || isTimeKind(kindOf(&r)) { try compareTime(&l, &r, &seqZone(seq)) } else { try compare(&l, &r) }
+        let t = match op {
+            "=" { c == 0 }
+            "<>" { c != 0 }
+            "<" { c < 0 }
+            "<=" { c <= 0 }
+            ">" { c > 0 }
+            else { c >= 0 }
+        }
+        return Ok(Val.Bool(t))
+    }
+    if isTimeKind(kindOf(&l)) || isTimeKind(kindOf(&r)) { return arithZ(op, &l, &r, &seqZone(seq)) }
+    return arith(op, &l, &r)
+}
+
+// v cast to t (eval's Expr.Cast after its operand); seq: the evaluation's.
+fn castVal(v: Val, t: &lexdb_sql.TypeName, seq: &Option[SeqEnv]): Result[Val, DbErr] {
+    if t.kind == lexdb_sql.K_REG { return regCast(&v, t.oid, seq) }
+    if t.oid == lexdb_sql.OID_BPCHAR && !isNull(&v) && kindOf(&v) == lexdb_sql.K_TEXT { return bpcharOf(text(&v), t.len, true) }
+    if isTimeKind(t.kind) || t.kind == lexdb_sql.K_ARRAY || isTstz(&v) { return coerceZ(v, t, &seqZone(seq)) }
+    return coerce(v, t)
+}
+
+// ---- Compiled expressions (design/lexdb.md 9.108)
+//
+// An expression compiled once for a statement's run: its columns by their
+// places in the row (not found by their names per row, as eval finds
+// them), its parameters as their values, each function bound once (FnB:
+// which of callAt's ways gives it, not eval's checks of its name on every
+// call). cEval gives exactly what eval gives: it runs eval's own
+// operations (unaryVal, binVal, castVal, callAt and its parts). What eval
+// alone evaluates (a subquery, an aggregate, a window call, a sequence,
+// session, lock or catalog function, a reg cast, T-SQL's typed division
+// and AVG) does not compile: eval runs it.
+
+const FN_GEN = 0        // callAt by the name (after T-SQL's, tsql)
+const FN_ONE = 1        // one argument: call1's (id)
+const FN_COALESCE = 2
+const FN_SUBSTR = 3     // substr of 2 or 3 arguments
+const FN_CONCAT = 4
+
+// A function call bound once: the way callAt gives it, found from its name
+// and number of arguments when compiled.
+type FnB = record {
+    name: str
+    way: int
+    id: int                 // FN_ONE: call1's
+    tsql: bool              // a T-SQL function's name: lexdb_tsqlfn.call first, as eval
+}
+
+type CX = closed {
+    Lit(Val)
+    Col(int)                    // the row's value at this place
+    Agg(int)                    // an aggregate's or window's value (#agg's slot)
+    Unary(str, CX)
+    And(CX, CX)
+    Or(CX, CX)
+    Bin(str, CX, CX)            // binVal
+    Cat(CX, CX, str)            // ||, with its function for arrays (arrayConcat; "" none)
+    IsNull(CX, bool)
+    Cast(CX, lexdb_sql.TypeName)
+    Case([]CX, bool)            // CASE's conditions and values in turn; true: an ELSE last
+    Try(CX)                     // T-SQL's TRY_CAST: NULL for an error
+    Call(FnB, []CX)
+}
+
+// What a compiled expression is evaluated in: the session (seq, as Env
+// has it), and the transaction's start and time zone eval gives callAt.
+type CEnv = record {
+    seq: Option[SeqEnv]
+    now: int
+    zone: lexdb_time.Zone
+}
+
+fn cenvOf(seq: Option[SeqEnv]): CEnv {
+    var now = 0
+    var z = lexdb_time.utc()
+    match seq {
+        Some(se) {
+            now = lexdb_time.fromUnixUs(se.now)
+            z = se.zone
+        }
+        None {}
+    }
+    return CEnv{seq: seq, now: now, zone: z}
+}
+
+// name's call of n arguments, bound: callAt's way for it, when none of
+// callAt's earlier ways (callMisc, callFn, callTime, ...) can take it.
+fn fnBind(name: &str, n: int): FnB {
+    var way = FN_GEN
+    var id = 0
+    let tsql = lexdb_tsqlfn.isTsqlFn(name)
+    if !tsql {
+        // (callFn takes sqrt, cbrt, exp, ln and log10 first)
+        if n == 1 && name != "sqrt" && name != "cbrt" && name != "exp" && name != "ln" && name != "log10" {
+            id = fn1Of(name)
+            if id > 0 { way = FN_ONE }
+        }
+        if name == "coalesce" { way = FN_COALESCE }
+        if name == "substr" && (n == 2 || n == 3) { way = FN_SUBSTR }
+        if name == "concat" { way = FN_CONCAT }
+    }
+    return FnB{name: name.toStr(), way: way, id: id, tsql: tsql}
+}
+
+// x compiled; None: eval evaluates it. cols: the row's columns; params:
+// the statement's. direct: the row is of cols (Col(i): its place i); else
+// a row of the columns slots lists (Col(s): slots[s] of cols, a column
+// added to slots when first used). aggs: #agg's slots are given.
+fn cxOf(x: &Expr, cols: &[]lexdb_sql.ColDef, params: &[]Val, direct: bool, aggs: bool, slots: mut &[]int): Option[CX] {
+    match x {
+        Expr.Lit(v) { return Some(CX.Lit(v)) }
+        Expr.Param(n) {
+            if n < 1 || n > len(params) { return None }
+            return Some(CX.Lit(params[n - 1]))
+        }
+        Expr.Col(name) {
+            let i = colIndex(cols, &name)
+            if i < 0 { return None }
+            if direct { return Some(CX.Col(i)) }
+            for s in 0..len(slots) { if slots[s] == i { return Some(CX.Col(s)) } }
+            append(slots, i)
+            return Some(CX.Col(len(slots) - 1))
+        }
+        Expr.Unary(op, a) {
+            let ca = cxOf(&a, cols, params, direct, aggs, slots)
+            if ca.isNone() { return None }
+            return Some(CX.Unary(op, ca.unwrap()))
+        }
+        Expr.Bin(op, a, b) {
+            let ca = cxOf(&a, cols, params, direct, aggs, slots)
+            if ca.isNone() { return None }
+            let cb = cxOf(&b, cols, params, direct, aggs, slots)
+            if cb.isNone() { return None }
+            if op == "and" { return Some(CX.And(ca.unwrap(), cb.unwrap())) }
+            if op == "or" { return Some(CX.Or(ca.unwrap(), cb.unwrap())) }
+            if op == "||" {
+                let noCols: []lexdb_sql.ColDef = []
+                let noTypes: []int = []
+                return Some(CX.Cat(ca.unwrap(), cb.unwrap(), arrayConcat(&a, &b, &noCols, &noTypes)))
+            }
+            return Some(CX.Bin(op, ca.unwrap(), cb.unwrap()))
+        }
+        Expr.IsNull(a, neg) {
+            let ca = cxOf(&a, cols, params, direct, aggs, slots)
+            if ca.isNone() { return None }
+            return Some(CX.IsNull(ca.unwrap(), neg))
+        }
+        Expr.Cast(a, t) {
+            if t.kind == lexdb_sql.K_REG { return None }
+            let ca = cxOf(&a, cols, params, direct, aggs, slots)
+            if ca.isNone() { return None }
+            return Some(CX.Cast(ca.unwrap(), t))
+        }
+        Expr.Call(name, args, star) {
+            if isSubCall(&name) { return None }
+            if name == "#agg" {
+                if !aggs || len(args) != 1 { return None }
+                let i = litInt(&args[0])
+                if i < 0 { return None }
+                return Some(CX.Agg(i))
+            }
+            if isAgg(&name) || name == "#win" || name == "#wmark" || name == "row" || isWinFn(&name) { return None }
+            if name == "#tdiv" || name == "#tavg" || isSeqFn(&name) || isSessFn(&name) || isAdvFn(&name) ||
+               lexdb_sql.isCatFn(&name) || name == "current_schema" { return None }
+            var cs: []CX = []
+            for a in args {
+                let c = cxOf(&a, cols, params, direct, aggs, slots)
+                if c.isNone() { return None }
+                append(mut &cs, c.unwrap())
+            }
+            if name == "case" || name == "case else" { return Some(CX.Case(cs, name == "case else")) }
+            if name == "#try" && len(cs) == 1 { return Some(CX.Try(pop(mut &cs))) }
+            return Some(CX.Call(fnBind(&name, len(cs)), cs))
+        }
+    }
+}
+
+// x's value for row (aggs: #agg's slots), as eval gives it.
+fn cEval(x: &CX, row: &[]Val, aggs: &[]Val, ce: &CEnv): Result[Val, DbErr] {
+    match x {
+        CX.Lit(v) { return Ok(v) }
+        CX.Col(i) {
+            if len(row) == 0 { return Ok(Val.Null) }
+            return Ok(row[i])
+        }
+        CX.Agg(i) { return Ok(aggs[i]) }
+        CX.Unary(op, a) { return unaryVal(&op, try cEval(&a, row, aggs, ce)) }
+        CX.And(a, b) {
+            let l = truth(&(try cEval(&a, row, aggs, ce)))
+            if l == Some(false) { return Ok(Val.Bool(false)) }
+            let r = truth(&(try cEval(&b, row, aggs, ce)))
+            if r == Some(false) { return Ok(Val.Bool(false)) }
+            if l.isNone() || r.isNone() { return Ok(Val.Null) }
+            return Ok(Val.Bool(true))
+        }
+        CX.Or(a, b) {
+            let l = truth(&(try cEval(&a, row, aggs, ce)))
+            if l == Some(true) { return Ok(Val.Bool(true)) }
+            let r = truth(&(try cEval(&b, row, aggs, ce)))
+            if r == Some(true) { return Ok(Val.Bool(true)) }
+            if l.isNone() || r.isNone() { return Ok(Val.Null) }
+            return Ok(Val.Bool(false))
+        }
+        CX.Bin(op, a, b) {
+            let l = try cEval(&a, row, aggs, ce)
+            let r = try cEval(&b, row, aggs, ce)
+            return binVal(&op, l, r, &ce.seq)
+        }
+        CX.Cat(a, b, f) {
+            let l = try cEval(&a, row, aggs, ce)
+            let r = try cEval(&b, row, aggs, ce)
+            if len(f) > 0 && (looksArray(&l) || looksArray(&r)) { return call(&f, &[l, r]) }
+            return binVal(&"||", l, r, &ce.seq)
+        }
+        CX.IsNull(a, neg) {
+            let v = try cEval(&a, row, aggs, ce)
+            return Ok(Val.Bool(isNull(&v) != neg))
+        }
+        CX.Cast(a, t) { return castVal(try cEval(&a, row, aggs, ce), &t, &ce.seq) }
+        CX.Case(cs, hasElse) {
+            // only the branch taken is evaluated
+            let pairs = if hasElse { (len(cs) - 1) / 2 } else { len(cs) / 2 }
+            for k in 0..pairs { if truth(&(try cEval(&cs[2 * k], row, aggs, ce))) == Some(true) { return cEval(&cs[2 * k + 1], row, aggs, ce) } }
+            if hasElse { return cEval(&cs[len(cs) - 1], row, aggs, ce) }
+            return Ok(Val.Null)
+        }
+        CX.Try(a) {
+            match cEval(&a, row, aggs, ce) {
+                Ok(v) { return Ok(v) }
+                Err(_) { return Ok(Val.Null) }
+            }
+        }
+        CX.Call(fb, cs) {
+            var vs: []Val = withCapacity(len(cs))
+            for c in cs { append(mut &vs, try cEval(&c, row, aggs, ce)) }
+            return callB(&fb, &vs, ce)
+        }
+    }
+}
+
+// A bound call's value for its arguments vs, as eval's call gives it.
+fn callB(fb: &FnB, vs: &[]Val, ce: &CEnv): Result[Val, DbErr] {
+    if fb.way == FN_ONE {
+        if isNull(&vs[0]) { return Ok(Val.Null) }
+        match try call1(fb.id, &fb.name, &vs[0]) {
+            Some(r) { return Ok(r) }
+            None {}
+        }
+    } else if fb.way == FN_COALESCE {
+        return Ok(coalesceOf(vs))
+    } else if fb.way == FN_SUBSTR {
+        for v in vs { if isNull(&v) { return Ok(Val.Null) } }
+        return substrOf(text(&vs[0]), vs, &fb.name)
+    } else if fb.way == FN_CONCAT {
+        return Ok(concatOf(vs, &ce.zone))
+    }
+    if fb.tsql {
+        match try lexdb_tsqlfn.call(&fb.name, vs, &ce.zone) {
+            Some(v) { return Ok(v) }
+            None {}
+        }
+    }
+    return callAt(&fb.name, vs, ce.now, &ce.zone)
+}
+
 fn intArg(v: Val, fname: &str): Result[int, DbErr] {
     match v {
         Val.Int(n) { return Ok(n) }
@@ -2263,28 +2532,26 @@ fn bytesAt(s: &str, at: int, p: &str): bool {
 // Whether s matches the pattern of these pieces (likeSplit): the first at
 // its start, the last at its end, the others in order between, each at the
 // first place it is found.
-fn likePieces(s: &str, ps: &[]str): bool {
+fn likePieces(s: &str, ps: &[]str): bool { return likeRange(s, 0, len(s), ps) }
+
+// likePieces of s[lo..hi] (9.108: a text in a row's bytes, not copied out).
+// A piece between is found by the runtime's search from where the last
+// ended: its first place in s, which is in s[lo..hi] if any is.
+fn likeRange(s: &str, lo: int, hi: int, ps: &[]str): bool {
     let n = len(ps)
-    if n == 1 { return len(s) == len(ps[0]) && bytesAt(s, 0, &ps[0]) }
+    if n == 1 { return hi - lo == len(ps[0]) && bytesAt(s, lo, &ps[0]) }
     let first = &ps[0]
     let last = &ps[n - 1]
-    if len(s) < len(first) + len(last) { return false }
-    if !bytesAt(s, 0, first) || !bytesAt(s, len(s) - len(last), last) { return false }
-    var at = len(first)
-    let end = len(s) - len(last)
+    if hi - lo < len(first) + len(last) { return false }
+    if !bytesAt(s, lo, first) || !bytesAt(s, hi - len(last), last) { return false }
+    var at = lo + len(first)
+    let end = hi - len(last)
     for k in 1..n - 1 {
         let p = &ps[k]
         if len(p) == 0 { continue }
-        var found = -1
-        var i = at
-        while i + len(p) <= end {
-            if s[i] == p[0] && bytesAt(s, i, p) {
-                found = i
-                break
-            }
-            i += 1
-        }
-        if found < 0 { return false }
+        if at + len(p) > end { return false }
+        let found = strFind(s, at, p)
+        if found < 0 || found + len(p) > end { return false }
         at = found + len(p)
     }
     return true
@@ -2362,6 +2629,27 @@ fn substr(s: str, from: int, count: int, hasCount: bool): Result[str, DbErr] {
     var out: []int = []
     for i in lo - 1..hi - 1 { append(mut &out, rs[i]) }
     return Ok(strings.fromRunes(&out))
+}
+
+// callAt's substr(a, from [, count]) of vs (none NULL), a vs[0]'s text.
+fn substrOf(a: str, vs: &[]Val, name: &str): Result[Val, DbErr] {
+    let n = len(vs)
+    let from = try intArg(vs[1], name)
+    let count = if n == 3 { try intArg(vs[2], name) } else { 0 }
+    return Ok(Val.Text(try substr(a, from, count, n == 3)))
+}
+
+// callAt's concat.
+fn concatOf(vs: &[]Val, z: &lexdb_time.Zone): Val {
+    var out = ""
+    for v in vs { if !isNull(&v) { out = out + textZ(&v, z) } }
+    return Val.Text(out)
+}
+
+// callAt's coalesce.
+fn coalesceOf(vs: &[]Val): Val {
+    for v in vs { if !isNull(&v) { return v } }
+    return Val.Null
 }
 
 fn call(name: &str, vs: &[]Val): Result[Val, DbErr] { return callAt(name, vs, 0, &lexdb_time.utc()) }
@@ -2456,11 +2744,7 @@ fn callAt(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, Db
         }
         return Ok(best)
     }
-    if name == "concat" {
-        var out = ""
-        for v in vs { if !isNull(&v) { out = out + textZ(&v, z) } }
-        return Ok(Val.Text(out))
-    }
+    if name == "concat" { return Ok(concatOf(vs, z)) }
     let strFn = name == "substr" || name == "substring" || name == "strpos" || name == "replace" || name == "left" ||
                 name == "right" || name == "position"
     if n >= 2 && strFn {
@@ -2486,11 +2770,7 @@ fn callAt(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, Db
             }
             return Ok(Val.Text(a[m[0]..m[1]].toStr()))
         }
-        if (name == "substr" || name == "substring") && n <= 3 {
-            let from = try intArg(vs[1], name)
-            let count = if n == 3 { try intArg(vs[2], name) } else { 0 }
-            return Ok(Val.Text(try substr(a, from, count, n == 3)))
-        }
+        if (name == "substr" || name == "substring") && n <= 3 { return substrOf(a, vs, name) }
         if (name == "strpos" || name == "position") && n == 2 {
             let i = strings.indexOf(a, text(&vs[1]), 0)
             return Ok(Val.Int(if i < 0 { 0 } else { strings.runeCount(&a[0..i]) + 1 }))
@@ -2510,61 +2790,17 @@ fn callAt(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, Db
             return Ok(Val.Text(try substr(a, total - take + 1, take, true)))
         }
     }
-    if name == "coalesce" {
-        for v in vs { if !isNull(&v) { return Ok(v) } }
-        return Ok(Val.Null)
-    }
+    if name == "coalesce" { return Ok(coalesceOf(vs)) }
     if name == "version" && n == 0 { return Ok(Val.Text("PostgreSQL 16.0 (lexdb 0.1)")) }
     if name == "current_database" && n == 0 { return Ok(Val.Text("lexdb")) }
     if n == 1 {
-        let v = vs[0]
-        if isNull(&v) { return Ok(Val.Null) }
-        match name {
-            "lower" { return Ok(Val.Text(strings.toLowerAscii(text(&v)))) }
-            "trim", "btrim" { return Ok(Val.Text(strings.trim(text(&v)))) }
-            "ltrim" { return Ok(Val.Text(strings.trimLeft(text(&v)))) }
-            "rtrim" { return Ok(Val.Text(strings.trimRight(text(&v)))) }
-            "upper" { return Ok(Val.Text(strings.toUpperAscii(text(&v)))) }
-            "length", "char_length" {
-                match v {
-                    Val.Bytes(x) { return Ok(Val.Int(len(x))) }
-                    else { return Ok(Val.Int(strings.runeCount(&text(&v)))) }
-                }
+        if isNull(&vs[0]) { return Ok(Val.Null) }
+        let id = fn1Of(name)
+        if id > 0 {
+            match try call1(id, name, &vs[0]) {
+                Some(r) { return Ok(r) }
+                None {}
             }
-            "octet_length" {
-                match v {
-                    Val.Bytes(x) { return Ok(Val.Int(len(x))) }
-                    else { return Ok(Val.Int(len(text(&v)))) }
-                }
-            }
-            "abs" {
-                match v {
-                    Val.Int(x) { return Ok(Val.Int(if x < 0 { try arithInt(0, x) } else { x })) }
-                    Val.Num(d) { return Ok(Val.Num(d.abs())) }
-                    Val.Float(x) { return Ok(Val.Float(x.abs())) }
-                    Val.Real(x) { return Ok(Val.Real(x.abs())) }
-                    else {}
-                }
-            }
-            "floor", "ceil", "ceiling", "trunc", "sqrt", "cbrt", "exp", "ln", "log10", "sign" {
-                match try callFloat(&name, &v) {
-                    Some(r) { return Ok(r) }
-                    None {}
-                }
-            }
-            "round" {
-                if isFloat(&v) { return Ok(Val.Float(asFloat(&v).unwrap().roundEven())) }
-                match asNum(&v) {
-                    Some(d) {
-                        match d.roundAway(0) {
-                            Ok(r) { return Ok(Val.Num(r)) }
-                            Err(_) { return Err(decErr()) }
-                        }
-                    }
-                    None {}
-                }
-            }
-            else {}
         }
     }
     if n == 2 && (name == "power" || name == "pow") { return powOp(&vs[0], &vs[1]) }
@@ -2585,6 +2821,81 @@ fn callAt(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, Db
         }
     }
     return Err(e("42883", "function " + name + " with " + n.toStr() + " arguments does not exist"))
+}
+
+// The functions of one argument callAt gives itself, after every other
+// it knows (none of these names is taken before): an id, found once by a
+// compiled expression (FnB), else per call. 0: none of them.
+const F1_LOWER = 1
+const F1_UPPER = 2
+const F1_TRIM = 3
+const F1_LTRIM = 4
+const F1_RTRIM = 5
+const F1_LENGTH = 6
+const F1_OCTETS = 7
+const F1_ABS = 8
+const F1_FLOAT = 9          // floor, ceil, ceiling, trunc, sqrt, cbrt, exp, ln, log10, sign (callFloat)
+const F1_ROUND = 10
+
+fn fn1Of(name: &str): int {
+    match name {
+        "lower" { return F1_LOWER }
+        "upper" { return F1_UPPER }
+        "trim", "btrim" { return F1_TRIM }
+        "ltrim" { return F1_LTRIM }
+        "rtrim" { return F1_RTRIM }
+        "length", "char_length" { return F1_LENGTH }
+        "octet_length" { return F1_OCTETS }
+        "abs" { return F1_ABS }
+        "floor", "ceil", "ceiling", "trunc", "sqrt", "cbrt", "exp", "ln", "log10", "sign" { return F1_FLOAT }
+        "round" { return F1_ROUND }
+        else { return 0 }
+    }
+}
+
+// Function id (fn1Of: name's) of v, not NULL; None: not one it gives for
+// v (callAt goes on to its error).
+fn call1(id: int, name: &str, v: &Val): Result[Option[Val], DbErr] {
+    if id == F1_LOWER { return Ok(Some(Val.Text(strings.toLowerAscii(text(v))))) }
+    if id == F1_UPPER { return Ok(Some(Val.Text(strings.toUpperAscii(text(v))))) }
+    if id == F1_TRIM { return Ok(Some(Val.Text(strings.trim(text(v))))) }
+    if id == F1_LTRIM { return Ok(Some(Val.Text(strings.trimLeft(text(v))))) }
+    if id == F1_RTRIM { return Ok(Some(Val.Text(strings.trimRight(text(v))))) }
+    if id == F1_LENGTH {
+        match v {
+            Val.Bytes(x) { return Ok(Some(Val.Int(len(x)))) }
+            else { return Ok(Some(Val.Int(strings.runeCount(&text(v))))) }
+        }
+    }
+    if id == F1_OCTETS {
+        match v {
+            Val.Bytes(x) { return Ok(Some(Val.Int(len(x)))) }
+            else { return Ok(Some(Val.Int(len(text(v))))) }
+        }
+    }
+    if id == F1_ABS {
+        match v {
+            Val.Int(x) { return Ok(Some(Val.Int(if x < 0 { try arithInt(0, x) } else { x }))) }
+            Val.Num(d) { return Ok(Some(Val.Num(d.abs()))) }
+            Val.Float(x) { return Ok(Some(Val.Float(x.abs()))) }
+            Val.Real(x) { return Ok(Some(Val.Real(x.abs()))) }
+            else { return Ok(None) }
+        }
+    }
+    if id == F1_FLOAT { return callFloat(name, v) }
+    if id == F1_ROUND {
+        if isFloat(v) { return Ok(Some(Val.Float(asFloat(v).unwrap().roundEven()))) }
+        match asNum(v) {
+            Some(d) {
+                match d.roundAway(0) {
+                    Ok(r) { return Ok(Some(Val.Num(r))) }
+                    Err(_) { return Err(decErr()) }
+                }
+            }
+            None { return Ok(None) }
+        }
+    }
+    return Ok(None)
 }
 
 fn arithInt(a: int, b: int): Result[int, DbErr] {
@@ -7995,10 +8306,10 @@ fn tryRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Mats
     let lv = &q.levels[k]
     for i in 0..len(r) { row[lv.first + i] = r[i] }
     rs.cnt[k].read += 1
-    if !(try allTrueX(st, txn, q, m, &lv.cond, row, params, rs)) { return Ok(0) }
+    if !(try allTrueC(st, txn, q, m, &lv.cond, &m.cc[k], row, params, rs)) { return Ok(0) }
     rs.cnt[k].joined += 1
     if ri >= 0 && len(rs.seen[k]) > 0 { rs.seen[k][ri] = true }
-    if !(try allTrueX(st, txn, q, m, &lv.post, row, params, rs)) { return Ok(1) }
+    if !(try allTrueC(st, txn, q, m, &lv.post, &m.cp[k], row, params, rs)) { return Ok(1) }
     if !(try runLevel(st, txn, q, m, k + 1, row, params, emit, rs)) { return Ok(-1) }
     return Ok(1)
 }
@@ -9812,6 +10123,47 @@ fn evalX(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, x: &Expr,
     return eval(x, &env2)
 }
 
+// The conditions xs of q compiled (9.108), when on; None those eval
+// evaluates (a correlated subquery's among them).
+fn cxsOf(q: &Query, xs: &[]Expr, params: &[]Val, on: bool): []Option[CX] {
+    var out: []Option[CX] = []
+    for x in xs {
+        var sl: []int = []
+        append(mut &out, if on && !(q.corr && hasCorr(&x)) { cxOf(&x, &q.cols, params, true, false, mut &sl) } else { None })
+    }
+    return out
+}
+
+// allTrueX, the conditions compiled in ccs (cxsOf) run by cEval.
+fn allTrueC(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Mats, cs: &[]Expr, ccs: &[]Option[CX],
+            row: &[]Val, params: &[]Val, rs: mut &Run): Result[bool, DbErr] {
+    if len(cs) == 0 { return Ok(true) }
+    if len(ccs) != len(cs) { return allTrueX(st, txn, q, m, cs, row, params, rs) }
+    let noAggs: []Val = []
+    var all = true
+    for c in ccs { if c.isNone() { all = false } }
+    if all {
+        for i in 0..len(cs) {
+            match ccs[i] {
+                Some(cx) { if truth(&(try cEval(&cx, row, &noAggs, &m.ce))) != Some(true) { return Ok(false) } }
+                None {}
+            }
+        }
+        return Ok(true)
+    }
+    // in order, as allTrueX (a later condition's error not given when an
+    // earlier one fails)
+    let sqe = seqEnv(st, txn)
+    let env = Env{cols: &q.cols, row: row, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: sqe}
+    for i in 0..len(cs) {
+        match ccs[i] {
+            Some(cx) { if truth(&(try cEval(&cx, row, &noAggs, &m.ce))) != Some(true) { return Ok(false) } }
+            None { if truth(&(try evalX(st, txn, q, &cs[i], &env, rs))) != Some(true) { return Ok(false) } }
+        }
+    }
+    return Ok(true)
+}
+
 fn allTrueX(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Mats, cs: &[]Expr, row: &[]Val,
             params: &[]Val, rs: mut &Run): Result[bool, DbErr] {
     let sqe = seqEnv(st, txn)
@@ -9830,17 +10182,25 @@ type Mats = record {
     keys: []Map[str, int]       // hash key -> bucket
     buckets: [][][]int          // rows of mat
     subs: []SubRes
+    // per level, its conditions and the WHERE conjuncts after it compiled
+    // (9.108: columns by place, functions bound once), with batches on;
+    // None: evaluated by eval
+    cc: [][]Option[CX]
+    cp: [][]Option[CX]
+    ce: CEnv
 }
 
 // Before a query runs: its subqueries without refs, then its hash tables.
 fn prepare(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, params: &[]Val,
            rs: mut &Run): Result[Mats, DbErr] {
-    var m = Mats{vrows: [], mat: [], keys: [], buckets: [], subs: []}
+    var m = Mats{vrows: [], mat: [], keys: [], buckets: [], subs: [], cc: [], cp: [], ce: cenvOf(seqEnv(st, txn))}
     for k in 0..len(q.levels) {
         append(mut &m.vrows, [])
         append(mut &m.mat, [])
         append(mut &m.keys, newMap())
         append(mut &m.buckets, [])
+        append(mut &m.cc, cxsOf(q, &q.levels[k].cond, params, rs.batch))
+        append(mut &m.cp, cxsOf(q, &q.levels[k].post, params, rs.batch))
     }
     for i in 0..len(q.subs) {
         let sp = &q.subs[i]
@@ -13207,23 +13567,13 @@ fn eachRowB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params
     let q = &sel.q
     var n = 0
     var vals: []Val = []                // one row's values, the array used again for each (9.99)
-    // an output that is a column: its place in the row, found once, not by
-    // its name per row as eval does; -1 others (9.100)
-    var at: []int = []
-    var plain = true                    // every output a column: no Env made per row
-    for x in sel.exprs {
-        match x {
-            Expr.Col(name) { append(mut &at, colIndex(&q.cols, &name)) }
-            else { append(mut &at, -1) }
-        }
-        if at[len(at) - 1] < 0 { plain = false }
-    }
+    let oc = outC(sel, params, rs.batch, seqEnv(st, txn))
     if batched {
         let op = try outPlan(st, txn, sel, &m, params, mut &rs, false)
-        if op.isSome() { return eachOut(st, txn, sel, &m, params, &op.unwrap(), &at, plain, each, eachB, mut &rs) }
+        if op.isSome() { return eachOut(st, txn, sel, &m, params, &op.unwrap(), &oc, each, eachB, mut &rs) }
     }
     try runQuery(st, txn, q, &m, params, fn(tx: mut &lexdb_store.Txn, r: &[]Val): Result[bool, DbErr] {
-        try outRow(sel, &m, params, sqe, &at, plain, r, mut &vals)
+        try outRow(sel, &m, params, sqe, &oc, r, mut &vals)
         if !(try each(tx, &vals)) { return Ok(false) }
         n += 1
         return Ok(sel.limit < 0 || n < sel.limit)
@@ -13231,21 +13581,74 @@ fn eachRowB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params
     return Ok(n)
 }
 
+// A streamed SELECT's outputs as the row path makes them (outRow): per
+// output its column's place, found once, not by its name per row as eval
+// finds it (9.100), -1 others; with batches on, the others compiled
+// (9.108: their columns by place, functions bound once; batches off keeps
+// eval, the reference). plain: every output a column, no Env per row;
+// none: no output needs eval.
+type OutC = record {
+    at: []int
+    cxs: []Option[CX]
+    plain: bool
+    none: bool
+    ce: CEnv
+}
+
+fn outC(sel: &Sel, params: &[]Val, compiled: bool, seq: Option[SeqEnv]): OutC {
+    let q = &sel.q
+    var oc = OutC{at: [], cxs: [], plain: true, none: true, ce: cenvOf(seq)}
+    for x in sel.exprs {
+        var c = -1
+        match x {
+            Expr.Col(name) { c = colIndex(&q.cols, &name) }
+            else {}
+        }
+        append(mut &oc.at, c)
+        var cx: Option[CX] = None
+        if c < 0 {
+            oc.plain = false
+            if compiled && !(q.corr && hasCorr(&x)) {
+                var sl: []int = []
+                cx = cxOf(&x, &q.cols, params, true, false, mut &sl)
+            }
+            if cx.isNone() { oc.none = false }
+        }
+        append(mut &oc.cxs, cx)
+    }
+    return oc
+}
+
 // A SELECT's output row for the query's row r (eachRow), into vals: its
-// outputs that are columns (at, plain) copied, the others evaluated.
-fn outRow(sel: &Sel, m: &Mats, params: &[]Val, sqe: Option[SeqEnv], at: &[]int, plain: bool, r: &[]Val,
+// outputs that are columns copied, the others evaluated (oc).
+fn outRow(sel: &Sel, m: &Mats, params: &[]Val, sqe: Option[SeqEnv], oc: &OutC, r: &[]Val,
           vals: mut &[]Val): Result[Unit, DbErr] {
     let q = &sel.q
     while len(vals) > 0 { let x = pop(vals) }
-    if plain && len(r) == len(q.cols) {
-        for c in at { append(vals, r[c]) }
+    if len(r) != len(q.cols) || !oc.none {
+        let noAggs: []Val = []
+        let env = Env{cols: &q.cols, row: r, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: sqe}
+        for i in 0..len(sel.exprs) {
+            let c = oc.at[i]
+            if c >= 0 && c < len(r) { append(vals, r[c]) } else { append(vals, try eval(&sel.exprs[i], &env)) }
+        }
+        return Ok(Unit{})
+    }
+    if oc.plain {
+        for c in oc.at { append(vals, r[c]) }
         return Ok(Unit{})
     }
     let noAggs: []Val = []
-    let env = Env{cols: &q.cols, row: r, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: sqe}
     for i in 0..len(sel.exprs) {
-        let c = at[i]
-        if c >= 0 && c < len(r) { append(vals, r[c]) } else { append(vals, try eval(&sel.exprs[i], &env)) }
+        let c = oc.at[i]
+        if c >= 0 {
+            append(vals, r[c])
+            continue
+        }
+        match oc.cxs[i] {
+            Some(cx) { append(vals, try cEval(&cx, r, &noAggs, &oc.ce)) }
+            None {}
+        }
     }
     return Ok(Unit{})
 }
@@ -14872,6 +15275,31 @@ fn skIntOf(v: &Val, n: mut &int): int {
 // A key over vs (taken): integers if every value not NULL is integer-like
 // of one kind, texts if every one is a text, else the values, if of one
 // kind. False: of mixed kinds.
+// skOfVals of values borrowed (a window's, which the old way may read
+// after: 9.108), copied only into a key of values.
+fn skOfValsRef(vs: &[]Val, desc: bool, nf: bool, key: mut &SKey): bool {
+    let n = len(vs)
+    var kind = -1
+    for i in 0..n {
+        if isNull(&vs[i]) { continue }
+        let k = kindOf(&vs[i])
+        if kind < 0 { kind = k } else if k != kind { return false }
+    }
+    if kind == lexdb_sql.K_TEXT || !(kind < 0 || kind == lexdb_sql.K_INT || kind == lexdb_sql.K_BOOL || kind == lexdb_sql.K_DATE ||
+       kind == lexdb_sql.K_TIME || kind == lexdb_sql.K_TS || kind == lexdb_sql.K_TSTZ) { return skOfVals(copyRow(vs), desc, nf, key) }
+    var x = 0
+    var k = newSKey(SK_INT, desc, nf)
+    k.ints = withCapacity(n)
+    k.nul = withCapacity(n)
+    for i in 0..n {
+        let got = skIntOf(&vs[i], mut &x)
+        append(mut &k.ints, if got == 0 { 0 } else { x })
+        append(mut &k.nul, got == 0)
+    }
+    key = k
+    return true
+}
+
 fn skOfVals(vs: []Val, desc: bool, nf: bool, key: mut &SKey): bool {
     var all = vs
     let n = len(all)
@@ -15359,12 +15787,17 @@ fn execSelTo(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, param
         }
     } else if late {
         var raws: [][]Val = []
+        // a window's rows straight from the batches of its one table (9.108)
+        var fromBatches = false
+        if windowed && len(sel.feedback) == 0 { fromBatches = try winBatch(st, txn, q, &m, params, rs, mut &raws, mut &held, room, rs0max) }
+        if !fromBatches {
         try runQuery(st, txn, q, &m, params, fn(tx: mut &lexdb_store.Txn, r: &[]Val): Result[bool, DbErr] {
             held += rowBytes(r)
             if room >= 0 && held > room { return Err(memErr(rs0max)) }
             append(mut &raws, copyRow(r))
             return Ok(!early || len(raws) < stopAt)
         }, rs)
+        }
         if windowed {
             for i in 0..len(raws) { append(mut &bases, WinRow{row: replace(mut &raws[i], []), aggs: []}) }
         }
@@ -15399,11 +15832,17 @@ fn execSelTo(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, param
             }
             raws = []
         }
+        let oc = outC(sel, params, rs.batch, seqEnv(st, txn))
         for r in raws {
             if windowed { break }
             let env = Env{cols: &q.cols, row: &r, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: sqe}
             var vals: []Val = []
-            for x in sel.exprs { append(mut &vals, try evalX(st, txn, q, &x, &env, rs)) }
+            for xi in 0..len(sel.exprs) {
+                match oc.cxs[xi] {
+                    Some(cx) { append(mut &vals, try cEval(&cx, &r, &noAggs, &oc.ce)) }
+                    None { append(mut &vals, try evalX(st, txn, q, &sel.exprs[xi], &env, rs)) }
+                }
+            }
             if sel.distinct {
                 let k = valsKeyIn(&vals, &sel.outKinds)
                 if seen.get(&k).isSome() { continue }
@@ -15425,10 +15864,21 @@ fn execSelTo(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, param
         let topK = if sorting && limit >= 0 && !sel.distinct && sel.donKey == 0 && !sel.withTies { limit + max(offset, 0) } else { -1 }
         var bar: []Val = []                 // the last kept row's sort values, once cut
         var barSet = false
+        let oc = outC(sel, params, rs.batch, seqEnv(st, txn))
         try runQuery(st, txn, q, &m, params, fn(tx: mut &lexdb_store.Txn, r: &[]Val): Result[bool, DbErr] {
             let env = Env{cols: &q.cols, row: r, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: sqe}
             var vals: []Val = []
-            for x in sel.exprs { append(mut &vals, try eval(&x, &env)) }
+            for xi in 0..len(sel.exprs) {
+                let c = oc.at[xi]
+                if c >= 0 && c < len(r) {
+                    append(mut &vals, r[c])
+                    continue
+                }
+                match oc.cxs[xi] {
+                    Some(cx) { append(mut &vals, try cEval(&cx, r, &noAggs, &oc.ce)) }
+                    None { append(mut &vals, try eval(&sel.exprs[xi], &env)) }
+                }
+            }
             if sel.distinct {
                 let k = valsKeyIn(&vals, &sel.outKinds)
                 if seen.get(&k).isSome() { return Ok(true) }
@@ -15455,14 +15905,19 @@ fn execSelTo(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, param
     }
     if windowed {
         var wv = try winValues(st, txn, sel, &bases, &m, params, rs)
-        // an output that is a column read at its place, found once (9.105)
+        // an output that is a column read at its place, found once (9.105);
+        // with batches on, the others compiled (9.108)
         var at: []int = []
+        var cxs: []Option[CX] = []
         for x in sel.exprs {
             match x {
                 Expr.Col(name) { append(mut &at, colIndex(&q.cols, &name)) }
                 else { append(mut &at, -1) }
             }
+            var sl: []int = []
+            append(mut &cxs, if rs.batch && !(q.corr && hasCorr(&x)) { cxOf(&x, &q.cols, params, true, true, mut &sl) } else { None })
         }
+        let ce = cenvOf(seqEnv(st, txn))
         for bi in 0..len(bases) {
             // the slots: the row's aggregates, then its window values
             var aggs = if len(bases[bi].aggs) == 0 { replace(mut &wv[bi], []) } else { copyRow(&bases[bi].aggs) }
@@ -15472,7 +15927,12 @@ fn execSelTo(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, param
             for xi in 0..len(sel.exprs) {
                 let c = at[xi]
                 if c >= 0 && c < len(bases[bi].row) { append(mut &vals, bases[bi].row[c]) }
-                else { append(mut &vals, try evalX(st, txn, q, &sel.exprs[xi], &env, rs)) }
+                else {
+                    match cxs[xi] {
+                        Some(cx) { append(mut &vals, try cEval(&cx, &bases[bi].row, &aggs, &ce)) }
+                        None { append(mut &vals, try evalX(st, txn, q, &sel.exprs[xi], &env, rs)) }
+                    }
+                }
             }
             if sel.distinct {
                 let k = valsKeyIn(&vals, &sel.outKinds)
@@ -15528,6 +15988,76 @@ fn execSelTo(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, param
     }
     res.tag = "SELECT " + len(res.rows).toStr()
     return Ok(res)
+}
+
+// A windowed SELECT's rows (execSel's late rows) from the batches of its
+// one table (9.108): each kept row's columns used put at their places, not
+// made by the row path and copied; counted and held as the row path's.
+// false: not a query whose table batches scan (nothing done). A batch the
+// batches cannot read goes to the row path, from its start, with the rest
+// of its scan (as batchLevel).
+fn winBatch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Mats, params: &[]Val, rs: mut &Run,
+            raws: mut &[][]Val, held: mut &int, room: int, rs0max: int): Result[bool, DbErr] {
+    if !rs.batch || len(q.levels) != 1 { return Ok(false) }
+    let got0 = try bLevelPlan(st, txn, q, m, params, rs)
+    if got0.isNone() { return Ok(false) }
+    let lp = got0.unwrap()
+    let lv = &q.levels[0]
+    if len(lv.post) > 0 || !lp.all || !lp.ranges { return Ok(false) }
+    let t = &lv.t
+    let bp = &lp.bp
+    let nq = len(q.cols)
+    rs.cnt[0].starts += 1
+    for sc in lp.scans {
+        var cur = newCursor()
+        var rowPath = false
+        while !cur.done {
+            let saved = Cursor{at: cur.at, started: cur.started, done: cur.done}
+            let got = try fillPick(st, txn, t, &sc, lp.part, mut &cur, bp, &lp.rd, &lp.lazy, &lp.conds, &noBar())
+            if got.isNone() {
+                cur = saved
+                rowPath = true
+                break
+            }
+            var pk = got.unwrap()
+            let b = replace(mut &pk.b, noRows())
+            let nr = b.n
+            if nr == 0 { continue }
+            rs.cnt[0].batches += 1
+            let nt = len(bp.kinds)
+            for j in pk.idx {
+                // (rowBytes' count)
+                var n = 32 + 24 * nq
+                var r: []Val = array(nq, Val.Null)
+                for i in 0..nt {
+                    if !bp.needCol[i] || b.cols[i].nul[j] { continue }
+                    let v = bValAt(&b, i, bp.kinds[i], j)
+                    n += valExtra(&v)
+                    r[lv.first + i] = v
+                }
+                held += n
+                if room >= 0 && held > room { return Err(memErr(rs0max)) }
+                append(raws, r)
+            }
+            rs.cnt[0].read += nr
+            rs.cnt[0].joined += len(pk.idx)
+            try rs.tickN(nr)
+        }
+        while rowPath && !cur.done {
+            var batch: [][]Val = []
+            try fetch(st, txn, t, &lv.path, &sc, &lv.need, mut &cur, mut &batch)
+            var row: []Val = array(nq, Val.Null)
+            for r in batch {
+                let got2 = try tryRow(st, txn, q, m, 0, &r, -1, mut &row, params, fn(tx: mut &lexdb_store.Txn, x: &[]Val): Result[bool, DbErr] {
+                    held += rowBytes(x)
+                    if room >= 0 && held > room { return Err(memErr(rs0max)) }
+                    append(raws, copyRow(x))
+                    return Ok(true)
+                }, rs)
+            }
+        }
+    }
+    return Ok(true)
 }
 
 // ---- describing a statement before it runs (the extended protocol)
@@ -19494,8 +20024,6 @@ fn winValues(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, rows:
                 else { append(mut &vcols[i], try evalX(st, txn, q, &xs[i], &env, rs)) }
             }
         }
-        var ocols: [][]Val = []
-        for k in 0..nob { append(mut &ocols, copyRow(&vcols[np + k])) }
         // the rows in partition order, then the window's (peers keep the
         // rows' order); where a partition and a peer group start
         var idx: []int = []
@@ -19504,23 +20032,24 @@ fn winValues(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, rows:
         var typed = rs.batch
         var keys: []SKey = []
         if typed {
-            // (the values copied, not moved: if a key turns out to be of
-            // mixed kinds, the old way below reads them)
+            // (the values borrowed, copied only into a key of values: if a
+            // key turns out to be of mixed kinds, the old way below reads them)
             for i in 0..len(xs) {
-                let vs = copyRow(&vcols[i])
                 let part = i < np
                 let desc = if part { false } else { w.desc[i - np] }
                 let nf = if part { false } else { w.nullsFirst[i - np] }
                 var key = newSKey(SK_VAL, desc, nf)
                 if part {
-                    if !skOfVals(copyRow(&vs), false, false, mut &key) || key.kind == SK_VAL { key = skEnc(&vs) }
-                } else if !skOfVals(vs, desc, nf, mut &key) {
+                    if !skOfValsRef(&vcols[i], false, false, mut &key) || key.kind == SK_VAL { key = skEnc(&vcols[i]) }
+                } else if !skOfValsRef(&vcols[i], desc, nf, mut &key) {
                     typed = false
                     break
                 }
                 append(mut &keys, key)
             }
         }
+        var ocols: [][]Val = []
+        for k in 0..nob { append(mut &ocols, replace(mut &vcols[np + k], [])) }
         if typed {
             idx = skSort(mut &keys, n)
             for p in 1..n {
@@ -19920,6 +20449,20 @@ type BNode = closed {
     // two columns compared, one at least of values (bColPair): op, the
     // columns, their kinds (BK_*)
     VCmp(int, int, int, int, int)
+    // a compiled expression (9.108): a condition, true where its value is
+    // true (eval's truth), as the row path checks one; or an output's or a
+    // key's values (OutPlan's src -2: bGenVals)
+    Gen(BGen)
+}
+
+// A compiled expression over a batch (9.108): per row, the columns it
+// reads put in a row of its own (its places), then cEval, in the
+// statement's session (ce).
+type BGen = record {
+    cx: CX
+    cols: []int             // per place of its row: the batch's column
+    kinds: []int            // ... and its kind (BK_*)
+    ce: CEnv
 }
 
 type LikePat = record {
@@ -20373,7 +20916,74 @@ fn bEval(n: &BNode, b: &Batch, idx: &[]int): Result[BVec, DbErr] {
             }
             return Ok(a)
         }
+        BNode.Gen(g) {
+            // a condition: 1 where it holds (its value true), as the row path checks it
+            let vs = try bGenVals(&g, b, idx)
+            var out = bvec(m)
+            for j in 0..m { if truth(&vs[j]) == Some(true) { out.v[j] = 1 } }
+            return Ok(out)
+        }
     }
+}
+
+// g's values for the rows idx of b.
+fn bGenVals(g: &BGen, b: &Batch, idx: &[]int): Result[[]Val, DbErr] {
+    let m = len(idx)
+    let ns = len(g.cols)
+    var row: []Val = array(ns, Val.Null)
+    let none: []Val = []
+    var out: []Val = withCapacity(m)
+    for j in 0..m {
+        let r = idx[j]
+        for p in 0..ns {
+            let c = g.cols[p]
+            row[p] = if b.cols[c].nul[r] { Val.Null } else { bValAt(b, c, g.kinds[p], r) }
+        }
+        append(mut &out, try cEval(&g.cx, &row, &none, &g.ce))
+    }
+    return Ok(out)
+}
+
+// x compiled to run over a batch (BGen): the query's column i is the
+// batch's i - base, kinds per column of the query (BK_NONE: not in the
+// batch), need per column of the batch (decoded). None: x reads a column
+// the batch does not hold, or only eval evaluates it.
+fn bGenOf(x: &Expr, q: &Query, kinds: &[]int, base: int, need: &[]bool, params: &[]Val, seq: Option[SeqEnv]): Option[BGen] {
+    var slots: []int = []
+    let c = cxOf(x, &q.cols, params, false, false, mut &slots)
+    if c.isNone() { return None }
+    var cols: []int = []
+    var ks: []int = []
+    for i in slots {
+        if i >= len(kinds) || kinds[i] == BK_NONE || i - base < 0 || i - base >= len(need) || !need[i - base] { return None }
+        append(mut &cols, i - base)
+        append(mut &ks, kinds[i])
+    }
+    return Some(BGen{cx: c.unwrap(), cols: cols, kinds: ks, ce: cenvOf(seq)})
+}
+
+// vals, of b's rows idx, added to b as a column of values (BK_VAL): its place.
+fn bAddVals(b: mut &Batch, idx: &[]int, vals: []Val): int {
+    let c = len(b.cols)
+    var col = BVec{v: [], nul: array(b.n, true)}
+    var vs = vals
+    if len(idx) == b.n {
+        // every row of b (idx is 0, 1, ...): the values are the column
+        for j in 0..b.n { if !isNull(&vs[j]) { col.nul[j] = false } }
+    } else {
+        var all: []Val = array(b.n, Val.Null)
+        for j in 0..len(idx) {
+            let r = idx[j]
+            if !isNull(&vs[j]) {
+                col.nul[r] = false
+                all[r] = replace(mut &vs[j], Val.Null)
+            }
+        }
+        vs = all
+    }
+    append(mut &b.cols, col)
+    append(mut &b.vals, vs)
+    return c
 }
 
 fn cmpConst(op: int, a: mut &BVec, k: int) {
@@ -20813,6 +21423,424 @@ fn fillBatch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, sc: &
     return Ok(Some(b))
 }
 
+// ---- Decoding in two steps (9.108)
+//
+// A batch of the first level is decoded as PostgreSQL decodes a row for
+// its quals (lexdb-engines.md, item 4): the places its conditions read
+// first, for every row of a run in one layout; the conditions run over
+// the run; the other places are decoded for the rows they keep only. A
+// top-N's first key, an integer column, is read first too (Bar): a row
+// it sorts after the heap's last kept is dropped before its outputs are
+// decoded. Rows not in the fixed layout (tagged, stored apart, read
+// merged with the transaction's writes) are decoded whole, as before.
+
+type Lazy = record {
+    on: bool
+    first: []int            // the places read first, in order
+    rest: []int             // the other places used
+    // conditions run on the rows' bytes, before anything is decoded: a
+    // simple LIKE (literal text and %) on a text column no other
+    // condition reads; per one, its condition and its column's place
+    raw: []int
+    rawPl: []int
+    skip: []bool            // per condition: one of raw
+}
+
+// A top-N's bar (sortBatches): a row whose first key (an integer column,
+// col of the batch) sorts after the heap's last row's (v, nul) cannot
+// enter the heap.
+type Bar = record {
+    on: bool
+    col: int
+    v: int
+    nul: bool
+    desc: bool
+    nf: bool
+}
+
+fn noBar(): Bar { return Bar{on: false, col: -1, v: 0, nul: false, desc: false, nf: false} }
+
+fn noRows(): Batch { return Batch{cols: [], vals: [], n: 0} }
+
+// A batch decoded and its rows chosen: the rows the conditions chose and
+// the bar did not drop (their columns all decoded), in order; kept: the
+// rows the conditions chose.
+type Picked = record {
+    b: Batch
+    idx: []int
+    kept: int
+}
+
+// The two steps for a batch plan with these conditions: a simple LIKE on
+// a column no other condition reads on the rows' bytes; then the places
+// of the columns the others read (and extra's, a bar's: -1 none); then
+// the rest. Off when nothing is read first, or nothing after.
+fn lazyOf(bp: &BPlan, t: &Table, conds: &[]BNode, extra: int): Lazy {
+    let nc = len(bp.kinds)
+    var used: []bool = array(nc, false)
+    var likeOn: []int = array(len(conds), -1)
+    for ci in 0..len(conds) {
+        match conds[ci] {
+            BNode.Like(c, lp) { if lp.simple { likeOn[ci] = c } }
+            else {}
+        }
+        if likeOn[ci] < 0 { bColsOf(&conds[ci], mut &used) }
+    }
+    var raw: []int = []
+    var rawPl: []int = []
+    var skip: []bool = array(len(conds), false)
+    for ci in 0..len(conds) {
+        let c = likeOn[ci]
+        if c < 0 { continue }
+        if used[c] { continue }
+        append(mut &raw, ci)
+        append(mut &rawPl, if len(t.slots) == 0 { c } else { t.slots[c] })
+        skip[ci] = true
+    }
+    // (a column two raw conditions read: both raw)
+    for ci in 0..len(conds) { if likeOn[ci] >= 0 && !skip[ci] { used[likeOn[ci]] = true } }
+    if extra >= 0 { used[extra] = true }
+    var first: []int = []
+    var rest: []int = []
+    for pl in bp.usedP {
+        let c = bp.placeCol[pl]
+        if used[c] { append(mut &first, pl) } else { append(mut &rest, pl) }
+    }
+    return Lazy{on: (len(first) > 0 || len(raw) > 0) && len(rest) > 0, first: first, rest: rest, raw: raw, rawPl: rawPl, skip: skip}
+}
+
+// idx0 narrowed to the rows of b every one of conds (not marked in skip)
+// holds for, in order; None: one gives an error on one of them.
+fn bNarrow(conds: &[]BNode, skip: &[]bool, b: &Batch, idx0: []int): Option[[]int] {
+    var idx = idx0
+    for ci in 0..len(conds) {
+        if len(idx) == 0 { break }
+        if ci < len(skip) && skip[ci] { continue }
+        match bTrue(&conds[ci], b, &idx) {
+            Ok(pos) {
+                var next: []int = withCapacity(len(pos))
+                for j in pos { append(mut &next, idx[j]) }
+                idx = next
+            }
+            Err(_) { return None }
+        }
+    }
+    return Some(idx)
+}
+
+// Rows rs of a run (their bytes rows[r - r0], of layout lay) a simple LIKE
+// on place pl holds for, read in place: as Like over the decoded text.
+fn likeRaw(rows: &[]&str, rs: &[]int, r0: int, pl: int, lay: &FixedLay, ps: &[]str): Result[[]int, DbErr] {
+    let at = lay.bm + pl / 8
+    let bit = pl % 8
+    let o = lay.off[pl]
+    let pv = lay.prev[pl]
+    let v0 = lay.v0
+    var out: []int = []
+    for r in rs {
+        let s = rows[r - r0]
+        if (int(s[at]) >> bit) & 1 == 1 { continue }
+        let e = binary.readU16LEStr(s, o)
+        let st = if pv < 0 { 0 } else { binary.readU16LEStr(s, pv) }
+        if st > e || v0 + e > len(s) { return Err(lexdb_base.corrupt("a row's variable part")) }
+        if likeRange(s, v0 + st, v0 + e, ps) { append(mut &out, r) }
+    }
+    return Ok(out)
+}
+
+// Whether integer key x (nul) sorts after the bar's (bar.v, bar.nul), as
+// skCmp orders an integer key.
+fn barAfter(bar: &Bar, x: int, nul: bool): bool {
+    if nul || bar.nul {
+        if nul && bar.nul { return false }
+        if nul { return !bar.nf }
+        return bar.nf
+    }
+    if x == bar.v { return false }
+    return (x > bar.v) != bar.desc
+}
+
+// Decodes places ps of a run's rows (their bytes in rows, of layout lay)
+// at offsets qs into b's rows r0 + q, a column at a time, as bRunInto
+// does; false: a value of a kind its column's batch does not hold.
+fn bRunCols(rows: &[]&str, qs: &[]int, r0: int, ps: &[]int, b: mut &Batch, bp: &BPlan, lay: &FixedLay): Result[bool, DbErr] {
+    let np = len(lay.kinds)
+    for pl in ps {
+        let c = bp.placeCol[pl]
+        let k = bp.kinds[c]
+        if pl >= np {
+            let mv = if pl < len(bp.missing) { bp.missing[pl] } else { Val.Null }
+            for q in qs { if !bPut(b, c, r0 + q, mv, k) { return Ok(false) } }
+            continue
+        }
+        let pk = lay.kinds[pl]
+        if pk == PK_NONE {
+            for q in qs { b.cols[c].nul[r0 + q] = true }
+            continue
+        }
+        let at = lay.bm + pl / 8
+        let bit = pl % 8
+        let o = lay.off[pl]
+        if k == BK_INT && pk == PK_INT4 {
+            var col = replace(mut &b.cols[c], bvec(0))
+            for q in qs {
+                let s = rows[q]
+                if (int(s[at]) >> bit) & 1 == 1 {
+                    col.nul[r0 + q] = true
+                } else {
+                    let u = int(s[o]) | (int(s[o + 1]) << 8) | (int(s[o + 2]) << 16) | (int(s[o + 3]) << 24)
+                    col.v[r0 + q] = if u >= 0x80000000 { u - 0x100000000 } else { u }
+                }
+            }
+            b.cols[c] = col
+        } else if k == BK_INT && pk == PK_INT {
+            var col = replace(mut &b.cols[c], bvec(0))
+            for q in qs {
+                let s = rows[q]
+                if (int(s[at]) >> bit) & 1 == 1 {
+                    col.nul[r0 + q] = true
+                } else {
+                    col.v[r0 + q] = int(s[o]) | (int(s[o + 1]) << 8) | (int(s[o + 2]) << 16) | (int(s[o + 3]) << 24) |
+                                    (int(s[o + 4]) << 32) | (int(s[o + 5]) << 40) | (int(s[o + 6]) << 48) | (int(s[o + 7]) << 56)
+                }
+            }
+            b.cols[c] = col
+        } else if k == BK_INT && pk == PK_INT2 {
+            var col = replace(mut &b.cols[c], bvec(0))
+            for q in qs {
+                let s = rows[q]
+                if (int(s[at]) >> bit) & 1 == 1 {
+                    col.nul[r0 + q] = true
+                } else {
+                    let u = int(s[o]) | (int(s[o + 1]) << 8)
+                    col.v[r0 + q] = if u >= 0x8000 { u - 0x10000 } else { u }
+                }
+            }
+            b.cols[c] = col
+        } else if k == BK_BOOL && pk == PK_BOOL {
+            var col = replace(mut &b.cols[c], bvec(0))
+            for q in qs {
+                let s = rows[q]
+                if (int(s[at]) >> bit) & 1 == 1 { col.nul[r0 + q] = true } else { col.v[r0 + q] = if s[o] == 1 { 1 } else { 0 } }
+            }
+            b.cols[c] = col
+        } else if k == BK_VAL {
+            for q in qs {
+                let s = rows[q]
+                if (int(s[at]) >> bit) & 1 == 1 { b.cols[c].nul[r0 + q] = true } else { b.vals[c][r0 + q] = try fixedVal(s, pl, pk, lay) }
+            }
+        } else {
+            return Ok(false)
+        }
+    }
+    return Ok(true)
+}
+
+// bRunInto in two steps (Lazy): the rows vs[from..to) in the fixed layout
+// of vs[from] decoded at lz.first into rows b.n on, the conditions and the
+// bar run over them, their other places decoded for the rows kept, which
+// are added to idx (kept: the conditions' count added to). The rows
+// decoded; 0, -1 as bRunInto; -2 a condition's error on one of them.
+fn bRunLazy(leaf: &lexdb_page.Node, from: int, to: int, b: mut &Batch, bp: &BPlan, t: &Table, lz: &Lazy, conds: &[]BNode,
+            bar: &Bar, idx: mut &[]int, kept: mut &int): Result[int, DbErr] {
+    let s0 = leaf.valView(from)
+    if len(s0) < 3 || s0[0] != FIXED { return Ok(0) }
+    let id = try layOf(s0, &t.lays)
+    let lay = &t.lays[id]
+    let id0 = s0[1]
+    let id1 = s0[2]
+    let v0 = lay.v0
+    var rows: []&str = withCapacity(to - from)
+    append(mut &rows, s0)
+    var end = from + 1
+    while end < to {
+        let s = leaf.valView(end)
+        if len(s) < v0 || s[0] != FIXED || s[1] != id0 || s[2] != id1 { break }
+        append(mut &rows, s)
+        end += 1
+    }
+    let n = end - from
+    let r0 = b.n
+    let np = len(lay.kinds)
+    var rs: []int = withCapacity(n)
+    for q in 0..n { append(mut &rs, r0 + q) }
+    // the simple LIKEs on the rows' bytes
+    for x in 0..len(lz.raw) {
+        if len(rs) == 0 { break }
+        let ci = lz.raw[x]
+        let pl = lz.rawPl[x]
+        if pl < np && lay.kinds[pl] == PK_TEXT {
+            match conds[ci] {
+                BNode.Like(_, lp) { rs = try likeRaw(&rows, &rs, r0, pl, lay, &lp.pieces) }
+                else {}
+            }
+            continue
+        }
+        // (a layout whose place is not a text: decoded, then the condition)
+        var qs1: []int = withCapacity(len(rs))
+        for r in rs { append(mut &qs1, r - r0) }
+        if !(try bRunCols(&rows, &qs1, r0, &[pl], b, bp, lay)) { return Ok(-1) }
+        var only: []bool = array(len(conds), true)
+        only[ci] = false
+        let got1 = bNarrow(conds, &only, b, rs)
+        if got1.isNone() { return Ok(-2) }
+        rs = got1.unwrap()
+    }
+    var qs0: []int = withCapacity(len(rs))
+    for r in rs { append(mut &qs0, r - r0) }
+    if !(try bRunCols(&rows, &qs0, r0, &lz.first, b, bp, lay)) { return Ok(-1) }
+    let got = bNarrow(conds, &lz.skip, b, rs)
+    if got.isNone() { return Ok(-2) }
+    var ch = got.unwrap()
+    kept += len(ch)
+    if bar.on && len(ch) > 0 {
+        var ok: []int = withCapacity(len(ch))
+        let kc = &b.cols[bar.col]
+        for r in ch { if !barAfter(bar, kc.v[r], kc.nul[r]) { append(mut &ok, r) } }
+        ch = ok
+    }
+    var qs: []int = withCapacity(len(ch))
+    for r in ch { append(mut &qs, r - r0) }
+    if !(try bRunCols(&rows, &qs, r0, &lz.rest, b, bp, lay)) { return Ok(-1) }
+    for r in ch { append(idx, r) }
+    return Ok(n)
+}
+
+// The next batch of a level, decoded in two steps when lz is on and the
+// level is a scan of its table (else as fillLevel reads it, whole), its
+// rows chosen by conds (and the bar). None: a
+// value of a kind its column's batch does not hold, or a condition's
+// error on one of its rows (the caller reads the batch by the row path).
+fn fillPick(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, sc: &Scan, part: bool, cur: mut &Cursor,
+            bp: &BPlan, rd: &IxRead, lz: &Lazy, conds: &[]BNode, bar: &Bar): Result[Option[Picked], DbErr] {
+    // (an index's read, 9.107, whole: an index-only entry's columns come
+    // from its key all at once; its rows, fetched by their keys, as fillLevel reads them)
+    if !lz.on || sc.empty || sc.point || (rd.ix >= 0 && !sc.whole) {
+        let got = try fillLevel(st, txn, t, rd, sc, part, cur, bp)
+        if got.isNone() { return Ok(None) }
+        let b = got.unwrap()
+        let ch = bChoose(conds, &b)
+        if ch.isNone() { return Ok(None) }
+        let idx = ch.unwrap()
+        return Ok(Some(Picked{kept: len(idx), idx: idx, b: b}))
+    }
+    var b = newBatch(bp, BROWS)
+    var idx: []int = []
+    var pend: []int = []                // rows decoded whole: chosen at the end
+    var kept = 0
+    while b.n < BROWS && !cur.done {
+        let from = if cur.started { cur.at } else { sc.lo }
+        cur.started = true
+        var stopKey = ""
+        var stop = 0                // 1 the batch is full, 2 a value stored apart
+        var bail = false
+        var bad: []DbErr = []
+        let inPlace = try st.scanLeaves(txn, t.tree, from, sc.hi, fn(leaf: &lexdb_page.Node, i: int, j: int): bool {
+            var k = i
+            while k < j {
+                if b.n == BROWS {
+                    stop = 1
+                    stopKey = leaf.key(k)
+                    return false
+                }
+                match bRunLazy(leaf, k, min(j, k + BROWS - b.n), mut &b, bp, t, lz, conds, bar, mut &idx, mut &kept) {
+                    Ok(got) {
+                        if got < 0 {
+                            bail = true
+                            return false
+                        }
+                        if got > 0 {
+                            b.n += got
+                            k += got
+                            continue
+                        }
+                    }
+                    Err(x) {
+                        append(mut &bad, x)
+                        return false
+                    }
+                }
+                match bRowInto(leaf.valView(k), b.n, mut &b, bp, t) {
+                    Ok(code) {
+                        if code == 1 {
+                            bail = true
+                            return false
+                        }
+                        if code == 2 {
+                            stop = 2
+                            stopKey = leaf.key(k)
+                            return false
+                        }
+                    }
+                    Err(x) {
+                        append(mut &bad, x)
+                        return false
+                    }
+                }
+                append(mut &pend, b.n)
+                b.n += 1
+                k += 1
+            }
+            return true
+        })
+        if len(bad) > 0 { return Err(bad[0]) }
+        if bail { return Ok(None) }
+        if !inPlace {
+            // the transaction's own writes in the range: copied and merged
+            cur.at = from
+            if b.n > 0 { break }
+            let raw = try fetchRaw(st, txn, t, sc, part, cur)
+            let got = try bDecode(st, txn, t, &raw, bp)
+            if got.isNone() { return Ok(None) }
+            let b2 = got.unwrap()
+            let ch = bChoose(conds, &b2)
+            if ch.isNone() { return Ok(None) }
+            let idx2 = ch.unwrap()
+            return Ok(Some(Picked{kept: len(idx2), idx: idx2, b: b2}))
+        }
+        if stop == 1 {
+            cur.at = stopKey
+            break
+        }
+        if stop == 2 {
+            let got = if part { try st.getPart(txn, t.tree, stopKey) } else { try st.get(txn, t.tree, stopKey) }
+            match got {
+                Some(v) {
+                    if !(try bRowOf(st, txn, t, &stopKey, &v, b.n, mut &b, bp)) { return Ok(None) }
+                    append(mut &pend, b.n)
+                    b.n += 1
+                }
+                None {}
+            }
+            cur.at = after(&stopKey)
+            continue
+        }
+        cur.done = true
+    }
+    if len(pend) > 0 {
+        // the rows decoded whole: chosen now, then in order among the others
+        let none: []bool = []
+        let got = bNarrow(conds, &none, &b, pend)
+        if got.isNone() { return Ok(None) }
+        let pk = got.unwrap()
+        kept += len(pk)
+        var merged: []int = withCapacity(len(idx) + len(pk))
+        var x = 0
+        var y = 0
+        while x < len(idx) || y < len(pk) {
+            if y >= len(pk) || (x < len(idx) && idx[x] < pk[y]) {
+                append(mut &merged, idx[x])
+                x += 1
+            } else {
+                append(mut &merged, pk[y])
+                y += 1
+            }
+        }
+        idx = merged
+    }
+    return Ok(Some(Picked{kept: kept, idx: idx, b: b}))
+}
+
 // Row r of a batch as the row path gives it: its columns used, NULL for
 // the others.
 fn bRow(b: &Batch, r: int, kinds: &[]int, needCol: &[]bool): []Val {
@@ -20869,6 +21897,7 @@ fn bColsOf(n: &BNode, used: mut &[]bool) {
             used[a] = true
             used[b] = true
         }
+        BNode.Gen(g) { for c in g.cols { used[c] = true } }
     }
 }
 
@@ -20978,6 +22007,7 @@ type LPlan = record {
     qkinds: []int
     ranges: bool
     rd: IxRead              // through an index (9.107): how (fillLevel)
+    lazy: Lazy              // the conditions' columns decoded first (9.108)
 }
 
 // q's first level's plan for batches; None: not a level they scan. An
@@ -21013,18 +22043,26 @@ fn bLevelPlan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &
     // checks every condition on the rows they keep, and a batch on one of
     // whose rows one gives an error goes to the row path, which tries them
     // in order (an error the row path would not reach is not given).
+    var needCol: []bool = []
+    for i in 0..len(t.cols) { append(mut &needCol, len(lv.need) == 0 || lv.need[i]) }
     var conds: []BNode = []
     for x in lv.cond {
         let c = bCompile(&x, q, &qkinds, &env, lv.first)
-        if c.isNone() { continue }
-        let cc = c.unwrap()
-        if !boolLike(cc.typ) { continue }
-        append(mut &conds, takeN(cc))
+        if c.isSome() {
+            let cc = c.unwrap()
+            if boolLike(cc.typ) {
+                append(mut &conds, takeN(cc))
+                continue
+            }
+        }
+        // else compiled (9.108): a condition of any type, per row
+        match bGenOf(&x, q, &qkinds, lv.first, &needCol, params, seqEnv(st, txn)) {
+            Some(g) { append(mut &conds, BNode.Gen(g)) }
+            None {}
+        }
     }
     let all = len(conds) == len(lv.cond)
     var scans = try pathScans(t, p, &env)
-    var needCol: []bool = []
-    for i in 0..len(t.cols) { append(mut &needCol, len(lv.need) == 0 || lv.need[i]) }
     var rd = noIxRead()
     if p.index >= 0 {
         rd.ix = p.index
@@ -21062,7 +22100,8 @@ fn bLevelPlan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &
     // key lookups: a row each, not worth a batch
     var ranges = false
     for sc in scans { if !sc.point && !sc.empty { ranges = true } }
-    return Ok(Some(LPlan{conds: conds, all: all, scans: scans, bp: bp, part: part, qkinds: qkinds, ranges: ranges, rd: rd}))
+    let lazy = lazyOf(&bp, t, &conds, -1)
+    return Ok(Some(LPlan{conds: conds, all: all, scans: scans, bp: bp, part: part, qkinds: qkinds, ranges: ranges, rd: rd, lazy: lazy}))
 }
 
 // The rows of b every one of conds holds for (true, not NULL), in order;
@@ -21070,18 +22109,8 @@ fn bLevelPlan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &
 fn bChoose(conds: &[]BNode, b: &Batch): Option[[]int] {
     var idx: []int = withCapacity(b.n)
     for r in 0..b.n { append(mut &idx, r) }
-    for ci in 0..len(conds) {
-        if len(idx) == 0 { break }
-        match bTrue(&conds[ci], b, &idx) {
-            Ok(pos) {
-                var next: []int = withCapacity(len(pos))
-                for j in pos { append(mut &next, idx[j]) }
-                idx = next
-            }
-            Err(_) { return None }
-        }
-    }
-    return Some(idx)
+    let none: []bool = []
+    return bNarrow(conds, &none, b, idx)
 }
 
 // ---- Joins over batches (9.102)
@@ -22195,25 +23224,21 @@ fn batchLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &
         var rowPath = false
         while !cur.done {
             let saved = Cursor{at: cur.at, started: cur.started, done: cur.done}
-            let got = try fillLevel(st, txn, t, &lp.rd, &sc, lp.part, mut &cur, bp)
+            // (decoded in two steps: 9.108)
+            let got = try fillPick(st, txn, t, &sc, lp.part, mut &cur, bp, &lp.rd, &lp.lazy, &lp.conds, &noBar())
             if got.isNone() {
+                // a value a batch cannot hold, or an error on some row of
+                // the batch: the row path reads it, and gives the error
+                // only if it gets to that row (a LIMIT may stop it first)
                 cur = saved
                 rowPath = true
                 break
             }
-            let b = got.unwrap()
+            var pk = got.unwrap()
+            let b = replace(mut &pk.b, noRows())
+            let idx = replace(mut &pk.idx, [])
             let nr = b.n
             if nr == 0 { continue }
-            let chosen = bChoose(&lp.conds, &b)
-            if chosen.isNone() {
-                // an error on some row of the batch: the row path reads it,
-                // and gives the error only if it gets to that row (a LIMIT
-                // may stop it first)
-                cur = saved
-                rowPath = true
-                break
-            }
-            let idx = chosen.unwrap()
             if joined {
                 let got3 = try bJoinAll(st, txn, q, m, &jpl, &b, &idx, &zone, rs)
                 if got3.isNone() {
@@ -22309,6 +23334,70 @@ type OutPlan = record {
     ksrc: []int
 }
 
+// An output or ORDER BY key over a batch (outPlan): its node, its kind
+// (BK_*) and source as OutPlan has them.
+type ONode = record {
+    n: BNode
+    kind: int
+    src: int
+}
+
+fn takeON(c: ONode): BNode {
+    var x = c
+    return replace(mut &x.n, BNode.Const(0, false))
+}
+
+// x as an output or key over the batch: a column of it (src its column), an
+// integer or boolean expression (src -1), or a compiled expression of any
+// type (9.108: src -2, its values BK_VAL). kinds: per column of the query
+// (base: the batch's first), need: per column of the batch, decoded. None:
+// not one the batches evaluate.
+fn outNode(x: &Expr, q: &Query, kinds: &[]int, base: int, need: &[]bool, env: &Env, params: &[]Val, seq: Option[SeqEnv]): Option[ONode] {
+    let c = bCompile(x, q, kinds, env, base)
+    if c.isSome() {
+        let cc = c.unwrap()
+        var col = -1
+        match cc.n {
+            BNode.Col(i) { col = i }
+            else {}
+        }
+        if col >= 0 {
+            if col >= len(need) || !need[col] { return None }
+            return Some(ONode{n: BNode.Col(col), kind: kinds[col + base], src: col})
+        }
+        if cc.typ != BT_OTHER { return Some(ONode{kind: if cc.typ == BT_BOOL { BK_BOOL } else { BK_INT }, src: -1, n: takeN(cc)}) }
+    }
+    match bGenOf(x, q, kinds, base, need, params, seq) {
+        Some(g) { return Some(ONode{n: BNode.Gen(g), kind: BK_VAL, src: -2}) }
+        None { return None }
+    }
+}
+
+// An output's or key's values (node, src as OutPlan has them) for b's rows
+// idx: an integer or boolean expression's into ex (src -1); a compiled
+// one's (-2) added to b as a column of values, its place in srcs (as a
+// column's own: src >= 0). Err: an expression's error on one of the rows.
+fn bOutVal(n: &BNode, src: int, b: mut &Batch, idx: &[]int, ex: mut &[]BVec, srcs: mut &[]int): Result[Unit, DbErr] {
+    if src >= 0 {
+        append(ex, bvec(0))
+        append(srcs, src)
+        return Ok(Unit{})
+    }
+    if src == -1 {
+        append(ex, try bEval(n, b, idx))
+        append(srcs, -1)
+        return Ok(Unit{})
+    }
+    var vs: []Val = []
+    match n {
+        BNode.Gen(g) { vs = try bGenVals(&g, b, idx) }
+        else { return Err(e("XX000", "an output's node")) }
+    }
+    append(srcs, bAddVals(b, idx, vs))
+    append(ex, bvec(0))
+    return Ok(Unit{})
+}
+
 // sel's OutPlan; None: its rows are made by the row path (runQuery).
 fn outPlan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: &Mats, params: &[]Val, rs: mut &Run, keyed: bool): Result[Option[OutPlan], DbErr] {
     let q = &sel.q
@@ -22330,33 +23419,18 @@ fn outPlan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: &Mat
     let noAggs: []Val = []
     let nullRow: []Val = array(len(q.cols), Val.Null)
     let env = Env{cols: &q.cols, row: &nullRow, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: seqEnv(st, txn)}
+    let qk = if joined { &jp.kinds } else { &lp.qkinds }
+    let need = if joined { &jp.need } else { &lp.bp.needCol }
     var nodes: []BNode = []
     var kinds: []int = []
     var src: []int = []
     for xi in 0..len(sel.exprs) {
-        let c = if joined { bCompile(&sel.exprs[xi], q, &jp.kinds, &env, 0) } else { bCompile(&sel.exprs[xi], q, &lp.qkinds, &env, base) }
+        let c = outNode(&sel.exprs[xi], q, qk, base, need, &env, params, seqEnv(st, txn))
         if c.isNone() { return Ok(None) }
-        let cc = c.unwrap()
-        var col = -1
-        match cc.n {
-            BNode.Col(i) { col = i }
-            else {}
-        }
-        if col >= 0 {
-            if joined {
-                if !jp.need[col] { return Ok(None) }
-                append(mut &kinds, jp.kinds[col])
-            } else {
-                if !lp.bp.needCol[col] { return Ok(None) }
-                append(mut &kinds, lp.bp.kinds[col])
-            }
-            append(mut &src, col)
-        } else {
-            if cc.typ == BT_OTHER { return Ok(None) }
-            append(mut &src, -1)
-            append(mut &kinds, if cc.typ == BT_BOOL { BK_BOOL } else { BK_INT })
-        }
-        append(mut &nodes, takeN(cc))
+        let on = c.unwrap()
+        append(mut &kinds, on.kind)
+        append(mut &src, on.src)
+        append(mut &nodes, takeON(on))
     }
     var kout: []int = []
     var knodes: []BNode = []
@@ -22373,29 +23447,12 @@ fn outPlan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: &Mat
                 append(mut &ksrc, -1)
                 continue
             }
-            let c = if joined { bCompile(&sel.order[oi], q, &jp.kinds, &env, 0) } else { bCompile(&sel.order[oi], q, &lp.qkinds, &env, base) }
+            let c = outNode(&sel.order[oi], q, qk, base, need, &env, params, seqEnv(st, txn))
             if c.isNone() { return Ok(None) }
-            let cc = c.unwrap()
-            var col = -1
-            match cc.n {
-                BNode.Col(i) { col = i }
-                else {}
-            }
-            if col >= 0 {
-                if joined {
-                    if !jp.need[col] { return Ok(None) }
-                    append(mut &kkinds, jp.kinds[col])
-                } else {
-                    if !lp.bp.needCol[col] { return Ok(None) }
-                    append(mut &kkinds, lp.bp.kinds[col])
-                }
-                append(mut &ksrc, col)
-            } else {
-                if cc.typ == BT_OTHER { return Ok(None) }
-                append(mut &ksrc, -1)
-                append(mut &kkinds, if cc.typ == BT_BOOL { BK_BOOL } else { BK_INT })
-            }
-            append(mut &knodes, takeN(cc))
+            let on = c.unwrap()
+            append(mut &kkinds, on.kind)
+            append(mut &ksrc, on.src)
+            append(mut &knodes, takeON(on))
         }
     }
     if joined {
@@ -22476,8 +23533,8 @@ fn cellVal(kind: int, nul: bool, iv: int, vv: &Val): Val {
 
 // Row r's ORDER BY keys into slot s; false: a key of values of another
 // kind than the earlier rows' (not sorted here). Its bytes.
-fn ssKeys(set: mut &SortSet, s: int, sel: &Sel, op: &OutPlan, b: &Batch, ex: &[]BVec, kex: &[]BVec, r: int, j: int,
-          bytes: mut &int): bool {
+fn ssKeys(set: mut &SortSet, s: int, sel: &Sel, op: &OutPlan, srcs: &[]int, ksrcs: &[]int, b: &Batch, ex: &[]BVec, kex: &[]BVec,
+          r: int, j: int, bytes: mut &int): bool {
     var n = 32
     for k in 0..len(set.keys) {
         n += 24
@@ -22485,7 +23542,7 @@ fn ssKeys(set: mut &SortSet, s: int, sel: &Sel, op: &OutPlan, b: &Batch, ex: &[]
         let kind = if o >= 0 { op.kinds[o] } else { op.kkinds[k] }
         var iv = 0
         var vv = Val.Null
-        let nul = if o >= 0 { bCell(kind, op.src[o], b, &ex[o], r, j, mut &iv, mut &vv) } else { bCell(kind, op.ksrc[k], b, &kex[k], r, j, mut &iv, mut &vv) }
+        let nul = if o >= 0 { bCell(kind, srcs[o], b, &ex[o], r, j, mut &iv, mut &vv) } else { bCell(kind, ksrcs[k], b, &kex[k], r, j, mut &iv, mut &vv) }
         if kind == BK_VAL {
             let v = if nul { Val.Null } else { ordVal(sel, k, vv) }
             if !nul {
@@ -22504,14 +23561,14 @@ fn ssKeys(set: mut &SortSet, s: int, sel: &Sel, op: &OutPlan, b: &Batch, ex: &[]
 }
 
 // Row r's outputs into slot s. Their bytes.
-fn ssOuts(set: mut &SortSet, s: int, op: &OutPlan, b: &Batch, ex: &[]BVec, r: int, j: int): int {
+fn ssOuts(set: mut &SortSet, s: int, op: &OutPlan, srcs: &[]int, b: &Batch, ex: &[]BVec, r: int, j: int): int {
     var n = 32
     for o in 0..len(op.kinds) {
         n += 24
         let kind = op.kinds[o]
         var iv = 0
         var vv = Val.Null
-        let nul = bCell(kind, op.src[o], b, &ex[o], r, j, mut &iv, mut &vv)
+        let nul = bCell(kind, srcs[o], b, &ex[o], r, j, mut &iv, mut &vv)
         putF(mut &set.outs[o].nul, s, nul)
         if kind == BK_VAL {
             if !nul { n += valExtra(&vv) }
@@ -22620,26 +23677,36 @@ fn sortBatches(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
     let room = rs.room()
     let rs0max = rs.maxHeld
     var stopped = false
+    // top-N whose first key is an integer column of the first table: that
+    // column decoded first, with the conditions', and a row it puts after
+    // the heap's last dropped before its outputs are decoded (9.108)
+    var barCol = -1
+    if topK > 0 && !op.joined && nk > 0 && op.kkinds[0] != BK_VAL {
+        barCol = if op.kout[0] >= 0 { op.src[op.kout[0]] } else { op.ksrc[0] }
+    }
+    let lz = lazyOf(bp, t, &lp.conds, barCol)
     rs.cnt[0].starts += 1
     for sc in lp.scans {
         if stopped { break }
         var cur = newCursor()
         while !cur.done {
-            let got1 = try fillLevel(st, txn, t, &lp.rd, &sc, lp.part, mut &cur, bp)
+            var bar = noBar()
+            if barCol >= 0 && len(heap) == topK && set.keys[0].kind == SK_INT {
+                let root = heap[0]
+                bar = Bar{on: true, col: barCol, v: set.keys[0].ints[root], nul: set.keys[0].nul[root], desc: set.keys[0].desc,
+                          nf: set.keys[0].nf}
+            }
+            let got1 = try fillPick(st, txn, t, &sc, lp.part, mut &cur, bp, &lp.rd, &lz, &lp.conds, &bar)
             if got1.isNone() {
                 rs.cnt = cnt0
                 return Ok(false)
             }
-            var b = got1.unwrap()
+            var pk = got1.unwrap()
+            var b = replace(mut &pk.b, noRows())
+            var idx = replace(mut &pk.idx, [])
             let nr = b.n
             if nr == 0 { continue }
-            let chosen = bChoose(&lp.conds, &b)
-            if chosen.isNone() {
-                rs.cnt = cnt0
-                return Ok(false)
-            }
-            var idx = chosen.unwrap()
-            let nChosen = len(idx)
+            let nChosen = pk.kept
             if op.joined {
                 let got3 = try bJoinAll(st, txn, q, m, &op.jp, &b, &idx, &zone, rs)
                 if got3.isNone() {
@@ -22653,26 +23720,25 @@ fn sortBatches(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
             }
             var ex: []BVec = []
             var kex: []BVec = []
+            var srcs: []int = []
+            var ksrcs: []int = []
             var failed = false
             for o in 0..no {
-                if op.src[o] >= 0 {
-                    append(mut &ex, bvec(0))
-                    continue
-                }
-                match bEval(&op.nodes[o], &b, &idx) {
-                    Ok(v) { append(mut &ex, v) }
+                match bOutVal(&op.nodes[o], op.src[o], mut &b, &idx, mut &ex, mut &srcs) {
+                    Ok(_) {}
                     Err(_) { failed = true }
                 }
                 if failed { break }
             }
             for k in 0..nk {
                 if failed { break }
-                if op.kout[k] >= 0 || op.ksrc[k] >= 0 {
+                if op.kout[k] >= 0 {
                     append(mut &kex, bvec(0))
+                    append(mut &ksrcs, -1)
                     continue
                 }
-                match bEval(&op.knodes[k], &b, &idx) {
-                    Ok(v) { append(mut &kex, v) }
+                match bOutVal(&op.knodes[k], op.ksrc[k], mut &b, &idx, mut &kex, mut &ksrcs) {
+                    Ok(_) {}
                     Err(_) { failed = true }
                 }
             }
@@ -22681,7 +23747,7 @@ fn sortBatches(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
                 return Ok(false)
             }
             rs.cnt[0].batches += 1
-            var went = len(idx)
+            var went = nChosen                  // (the rows a bar dropped included)
             for j in 0..len(idx) {
                 let r = idx[j]
                 seq += 1
@@ -22689,7 +23755,7 @@ fn sortBatches(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
                     var iv = 0
                     var vv = Val.Null
                     if dmode == 1 {
-                        if bCell(op.kinds[0], op.src[0], &b, &ex[0], r, j, mut &iv, mut &vv) {
+                        if bCell(op.kinds[0], srcs[0], &b, &ex[0], r, j, mut &iv, mut &vv) {
                             if dNull { continue }
                             dNull = true
                         } else {
@@ -22697,7 +23763,7 @@ fn sortBatches(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
                             dInts.put(iv, 1)
                         }
                     } else if dmode == 2 {
-                        if bCell(op.kinds[0], op.src[0], &b, &ex[0], r, j, mut &iv, mut &vv) {
+                        if bCell(op.kinds[0], srcs[0], &b, &ex[0], r, j, mut &iv, mut &vv) {
                             if dNull { continue }
                             dNull = true
                         } else {
@@ -22720,7 +23786,7 @@ fn sortBatches(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
                     } else {
                         var kb = newStrBuf()
                         for o in 0..no {
-                            let nul = bCell(op.kinds[o], op.src[o], &b, &ex[o], r, j, mut &iv, mut &vv)
+                            let nul = bCell(op.kinds[o], srcs[o], &b, &ex[o], r, j, mut &iv, mut &vv)
                             let v = cellVal(op.kinds[o], nul, iv, &vv)
                             encIdxPart(mut &kb, &(if o < len(sel.outKinds) { collVal(sel.outKinds[o], &v) } else { v }))
                         }
@@ -22734,11 +23800,11 @@ fn sortBatches(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
                     if topK == 0 { continue }
                     if len(heap) < topK {
                         let s = set.n
-                        if !ssKeys(mut &set, s, sel, &op, &b, &ex, &kex, r, j, mut &kb2) {
+                        if !ssKeys(mut &set, s, sel, &op, &srcs, &ksrcs, &b, &ex, &kex, r, j, mut &kb2) {
                             rs.cnt = cnt0
                             return Ok(false)
                         }
-                        let ob = ssOuts(mut &set, s, &op, &b, &ex, r, j)
+                        let ob = ssOuts(mut &set, s, &op, &srcs, &b, &ex, r, j)
                         putI(mut &set.seq, s, seq)
                         putI(mut &set.bytes, s, kb2 + ob)
                         set.n += 1
@@ -22750,14 +23816,14 @@ fn sortBatches(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
                             scr = set.n
                             set.n += 1
                         }
-                        if !ssKeys(mut &set, scr, sel, &op, &b, &ex, &kex, r, j, mut &kb2) {
+                        if !ssKeys(mut &set, scr, sel, &op, &srcs, &ksrcs, &b, &ex, &kex, r, j, mut &kb2) {
                             rs.cnt = cnt0
                             return Ok(false)
                         }
                         putI(mut &set.seq, scr, seq)
                         // the last kept beats it (or ties: it came first)
                         if hCmp(&set, scr, heap[0]) >= 0 { continue }
-                        let ob = ssOuts(mut &set, scr, &op, &b, &ex, r, j)
+                        let ob = ssOuts(mut &set, scr, &op, &srcs, &b, &ex, r, j)
                         putI(mut &set.bytes, scr, kb2 + ob)
                         held += kb2 + ob - set.bytes[heap[0]]
                         let gone = heap[0]
@@ -22767,11 +23833,11 @@ fn sortBatches(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
                     }
                 } else {
                     let s = set.n
-                    if !ssKeys(mut &set, s, sel, &op, &b, &ex, &kex, r, j, mut &kb2) {
+                    if !ssKeys(mut &set, s, sel, &op, &srcs, &ksrcs, &b, &ex, &kex, r, j, mut &kb2) {
                         rs.cnt = cnt0
                         return Ok(false)
                     }
-                    let ob = ssOuts(mut &set, s, &op, &b, &ex, r, j)
+                    let ob = ssOuts(mut &set, s, &op, &srcs, &b, &ex, r, j)
                     putI(mut &set.seq, s, seq)
                     putI(mut &set.bytes, s, kb2 + ob)
                     set.n += 1
@@ -22790,9 +23856,9 @@ fn sortBatches(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
                 rs.cnt[0].joined += nChosen
                 try rs.tickN(nr)
             } else {
-                rs.cnt[0].read += nr - len(idx) + went
+                rs.cnt[0].read += nr - nChosen + went
                 rs.cnt[0].joined += went
-                try rs.tickN(nr - len(idx) + went)
+                try rs.tickN(nr - nChosen + went)
             }
             if stopped { break }
         }
@@ -22867,7 +23933,7 @@ fn sortBatches(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
 // that scan from the batch's start, its rows to each (it gives the error
 // only if it gets to that row). The number of rows given.
 fn eachOut(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: &Mats, params: &[]Val, op: &OutPlan,
-           at: &[]int, plain: bool, each: &fn(mut &lexdb_store.Txn, &[]Val): Result[bool, DbErr],
+           oc: &OutC, each: &fn(mut &lexdb_store.Txn, &[]Val): Result[bool, DbErr],
            eachB: &fn(mut &lexdb_store.Txn, &OutBatch): Result[bool, DbErr], rs: mut &Run): Result[int, DbErr] {
     let q = &sel.q
     let lv = &q.levels[0]
@@ -22886,22 +23952,17 @@ fn eachOut(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: &Mat
         var rowPath = false
         while !cur.done {
             let saved = Cursor{at: cur.at, started: cur.started, done: cur.done}
-            let got = try fillLevel(st, txn, t, &lp.rd, &sc, lp.part, mut &cur, bp)
+            let got = try fillPick(st, txn, t, &sc, lp.part, mut &cur, bp, &lp.rd, &lp.lazy, &lp.conds, &noBar())
             if got.isNone() {
                 cur = saved
                 rowPath = true
                 break
             }
-            var b = got.unwrap()
+            var pk = got.unwrap()
+            var b = replace(mut &pk.b, noRows())
+            var idx = replace(mut &pk.idx, [])
             let nr = b.n
             if nr == 0 { continue }
-            let chosen = bChoose(&lp.conds, &b)
-            if chosen.isNone() {
-                cur = saved
-                rowPath = true
-                break
-            }
-            var idx = chosen.unwrap()
             let nRead = nr
             let nChosen = len(idx)
             if op.joined {
@@ -22919,14 +23980,11 @@ fn eachOut(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: &Mat
             }
             // the expressions' values, before any row of the batch is given
             var ex: []BVec = []
+            var srcs: []int = []
             var failed = false
             for o in 0..no {
-                if op.src[o] >= 0 {
-                    append(mut &ex, bvec(0))
-                    continue
-                }
-                match bEval(&op.nodes[o], &b, &idx) {
-                    Ok(v) { append(mut &ex, v) }
+                match bOutVal(&op.nodes[o], op.src[o], mut &b, &idx, mut &ex, mut &srcs) {
+                    Ok(_) {}
                     Err(_) {
                         failed = true
                         break
@@ -22952,7 +24010,7 @@ fn eachOut(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: &Mat
                 try rs.tickN(nr - len(idx) + take)
             }
             if take > 0 {
-                let ob = OutBatch{n: take, kinds: copyInts(&op.kinds), src: copyInts(&op.src), idx: move(idx),
+                let ob = OutBatch{n: take, kinds: copyInts(&op.kinds), src: srcs, idx: move(idx),
                                   cols: replace(mut &b.cols, []), vals: replace(mut &b.vals, []), ex: ex}
                 n += take
                 if !(try eachB(txn, &ob)) { return Ok(n) }
@@ -22965,7 +24023,7 @@ fn eachOut(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: &Mat
             for r in batch {
                 var stop = false
                 let got2 = try tryRow(st, txn, q, m, 0, &r, -1, mut &row, params, fn(tx: mut &lexdb_store.Txn, x: &[]Val): Result[bool, DbErr] {
-                    try outRow(sel, m, params, sqe, at, plain, x, mut &vals)
+                    try outRow(sel, m, params, sqe, oc, x, mut &vals)
                     if !(try each(tx, &vals)) {
                         stop = true
                         return Ok(false)

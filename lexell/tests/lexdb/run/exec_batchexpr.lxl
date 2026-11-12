@@ -1,0 +1,445 @@
+// lexdb_exec: expressions of every type over batches, a first table's
+// batches decoded in two steps, window rows from batches, and the row
+// path's compiled expressions (design/lexdb.md 9.108), against the row
+// path's eval. Random queries over a table of 2,600 rows (two batches and
+// part of a third) of every kind of row (the fixed layout; tagged rows,
+// which a date or timestamptz makes; long texts kept in the leaf and kept
+// apart; a dropped column and an added one with its default), joined at
+// times to one of 300, run three ways as exec_batchsort runs them: SET
+// lexdb_batch = off (eval, the reference), on with the rows held, and on
+// with the rows given to a sink (an OutBatch when the batches made them).
+// The three must agree, errors included.
+// - Expressions over numerics (scales, overflow, division by zero),
+//   texts, varchars, timestamptz in a session zone not UTC (Asia/Kolkata,
+//   then America/New_York), dates, booleans and NULLs: casts, ||, upper,
+//   lower, substr, length, coalesce, abs, round, concat, nullif, CASE,
+//   to_char, date_trunc, intervals, and errors (a text not a number, a
+//   numeric too wide for its type).
+// - Conditions of those types, and selective LIKEs (simple, run on the
+//   rows' bytes, and with _ or ILIKE), alone and with others.
+// - Top-N with wide outputs (its first key an integer: the bar), ORDER BY
+//   and DISTINCT of expressions, LIMIT and OFFSET.
+// - Joins with expressions over both tables.
+// - Window functions over rows the batches give.
+// - The row path's compiled outputs and conditions (a scalar subquery in
+//   the WHERE keeps the query there).
+// - Again in a transaction with its own writes not committed.
+// - Fixed queries: the benchmark's shapes; a LIMIT reached before an
+//   error gives rows, a sort that reaches it the error; the counts of a
+//   two-step filter and a top-N as the row path's.
+// expect: committed: 600 queries, 600 the same three ways
+// expect: in a transaction: 152 queries, 152 the same three ways, its writes: INSERT 0 40, UPDATE 264, DELETE 176
+// expect: fixed: 16 queries, 16 the same three ways
+// expect: given as an OutBatch: 266 of 600, errors: 126
+// expect: counts: same: true true true true
+// expect: limit before an error: same: true
+// expect: parameters: 4 of 4 the same
+import "strings"
+import "../../../cmd/lexdb_base"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_sql"
+import "../../../cmd/lexdb_exec"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            var out: []str = []
+            for r in rs {
+                if !r.hasRows { append(mut &out, r.tag) }
+                for row in r.rows {
+                    var vs: []str = []
+                    for v in row { append(mut &vs, lexdb_exec.text(&v)) }
+                    append(mut &out, strings.join(&vs, "|"))
+                }
+            }
+            return strings.join(&out, " ")
+        }
+        Err(e) { return "ERROR " + e.state + " " + e.msg }
+    }
+}
+
+// sql's rows through runRows' sink, as q gives them; batched: whether
+// they came as an OutBatch.
+fn viaSink(s: mut &lexdb_exec.Session, sql: &str, batched: mut &bool): str {
+    let none: []lexdb_sql.Val = []
+    return viaSinkP(s, sql, &none, batched)
+}
+
+// viaSink with parameters.
+fn viaSinkP(s: mut &lexdb_exec.Session, sql: &str, params: &[]lexdb_sql.Val, batched: mut &bool): str {
+    let stmts = match lexdb_sql.parse(sql) {
+        Ok(x) { x }
+        Err(e) { return "ERROR " + e.state + " " + e.msg }
+    }
+    var pc = lexdb_exec.newPlanCache()
+    let nt: []int = []
+    var lines: []str = []
+    var nb = 0
+    var starts = 0
+    let r = s.runRows(&stmts[0], params, &nt, mut &pc, fn(cols: &[]lexdb_exec.OutCol, row: &[]lexdb_sql.Val, ob: &lexdb_exec.OutBatch, start: bool): bool {
+        if start {
+            starts += 1
+            return true
+        }
+        if ob.n > 0 {
+            nb += 1
+            for j in 0..ob.n {
+                var vs: []str = []
+                for o in 0..len(ob.kinds) {
+                    let c = ob.src[o]
+                    let k = ob.kinds[o]
+                    var v = lexdb_sql.Val.Null
+                    if c < 0 {
+                        if !ob.ex[o].nul[j] { v = if k == lexdb_exec.BK_BOOL { lexdb_sql.Val.Bool(ob.ex[o].v[j] == 1) } else { lexdb_sql.Val.Int(ob.ex[o].v[j]) } }
+                    } else {
+                        let at = ob.idx[j]
+                        if !ob.cols[c].nul[at] {
+                            v = if k == lexdb_exec.BK_INT { lexdb_sql.Val.Int(ob.cols[c].v[at]) } else if k == lexdb_exec.BK_BOOL { lexdb_sql.Val.Bool(ob.cols[c].v[at] == 1) } else { ob.vals[c][at] }
+                        }
+                    }
+                    append(mut &vs, lexdb_exec.text(&v))
+                }
+                append(mut &lines, strings.join(&vs, "|"))
+            }
+            return true
+        }
+        var vs: []str = []
+        for v in row { append(mut &vs, lexdb_exec.text(&v)) }
+        append(mut &lines, strings.join(&vs, "|"))
+        return true
+    })
+    batched = nb > 0
+    if starts > 1 { append(mut &lines, "STARTED " + starts.toStr() + " TIMES") }
+    match r {
+        Ok(res) {
+            for row in res.rows {
+                var vs: []str = []
+                for v in row { append(mut &vs, lexdb_exec.text(&v)) }
+                append(mut &lines, strings.join(&vs, "|"))
+            }
+            return strings.join(&lines, " ")
+        }
+        Err(e) { return "ERROR " + e.state + " " + e.msg }
+    }
+}
+
+fn pick(r: mut &lexdb_base.Rng, xs: &[]str): str { return xs[r.below(len(xs))] }
+
+fn two(n: int): str { return if n < 10 { "0" + n.toStr() } else { n.toStr() } }
+
+fn maybe(r: mut &lexdb_base.Rng, v: str): str { return if r.below(10) == 0 { "null" } else { v } }
+
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: 1024 * 1024, segBytes: 4 * 1024 * 1024, ckptBytes: 2 * 1024 * 1024, snapNodes: 100000, bufferedPages: false}
+}
+
+fn bigText(n: int): str {
+    var b = newStrBuf()
+    for i in 0..n { b.add(if i % 10 == 9 { " " } else { "x" }) }
+    return b.toStr()
+}
+
+fn texts(): []str { return ["'abc'", "'ABC'", "'a'", "''", "'été'", "'Ünï'", "'item 7'", "'item 77 x'", "'12'", "'3x'", "'  pad '", "'z%z'", "'a_b'", "'b'"] }
+
+// A row of e; after: its columns after the ALTERs (x0 dropped, k and w added).
+fn eRow(r: mut &lexdb_base.Rng, id: int, after: bool): str {
+    let big = r.below(50)
+    var note = "'item " + r.below(120).toStr() + " " + pick(r, &["red", "blue", "x7", ""]) + "'"
+    if big == 0 { note = "'item " + bigText(300) + "'" } else if big == 1 { note = "'" + bigText(2000) + " 7'" }
+    let nn = r.below(6000) - 1000
+    let ns = if nn < 0 { "-" + (-nn / 100).toStr() + "." + two(-nn % 100) } else { (nn / 100).toStr() + "." + two(nn % 100) }
+    let d = if r.below(2) == 0 { "null" } else { "'2024-01-" + two(1 + r.below(28)) + "'" }
+    let ts = if r.below(2) == 0 { "null" } else {
+        "'2024-03-" + two(1 + r.below(28)) + " " + two(r.below(24)) + ":" + two(r.below(60)) + ":00" + pick(r, &["+00", "+05:30", "-04", ""]) + "'"
+    }
+    let vs: []str = [id.toStr(), maybe(r, (r.below(230) - 10).toStr()),
+                     maybe(r, if r.below(15) == 0 { "9000000000000000000" } else { ((r.below(11) - 5) * 1000000007).toStr() }),
+                     maybe(r, r.below(5).toStr()), if after { "-1" } else { "0" }, maybe(r, pick(r, &["true", "false"])), maybe(r, pick(r, &texts())),
+                     maybe(r, "'v" + r.below(40).toStr() + pick(r, &["", " ", "  "]) + "'"), maybe(r, ns),
+                     maybe(r, pick(r, &["1.5", "0.333", "123456789.123456", "-7", "100000000000000000000", "2.50", "0"])), d, ts, maybe(r, note)]
+    if after {
+        // (x0 is gone: the -1 its place took is the added k's, then w's)
+        var out: []str = []
+        for x in 0..len(vs) { if x != 4 { append(mut &out, vs[x]) } }
+        append(mut &out, maybe(r, r.below(9).toStr()))
+        append(mut &out, maybe(r, "'w" + r.below(13).toStr() + "'"))
+        return "(" + strings.join(&out, ", ") + ")"
+    }
+    return "(" + strings.join(&vs, ", ") + ")"
+}
+
+fn text_x(): []str { return ["upper(e.t)", "lower(e.v)", "e.t || e.v", "e.t || e.i", "e.i || '-' || e.t", "substr(e.t, 2)", "substr(e.t, e.i % 4, 3)",
+                       "substr(e.v, 1, 2)", "coalesce(e.t, e.v, 'none')", "concat(e.t, '-', e.i, e.b)", "trim(e.v)", "e.i::text", "e.n::text",
+                       "e.ts::text", "e.d::text", "cast(e.t as varchar(3))", "e.b::text", "case when e.i > 50 then e.t else e.v end", "e.ts || ''",
+                       "'at ' || e.ts", "to_char(e.ts, 'YYYY-MM-DD HH24:MI')", "replace(e.t, 'a', 'xy')", "lpad(e.v, 6, '*')", "e.t || e.n",
+                       "upper(e.t) || lower(e.t)", "initcap(e.t)", "e.note", "e.w || e.k", "upper(e.w)", "concat(e.ts, '/', e.d)",
+                       "substr(e.note, 1, 9)", "e.t", "e.v"] }
+fn int_x(): []str { return ["length(e.t)", "length(e.note)", "char_length(e.v)", "octet_length(e.t)", "abs(e.i - 100)", "e.i + e.j",
+                      "e.j * 1000000000", "e.i / (e.s - 2)", "e.i % (e.s + 0)", "-e.j", "coalesce(e.i, e.s, -1)", "nullif(e.i, 3)",
+                      "greatest(e.i, e.s)", "least(e.i, 5)", "e.t::int", "e.n::int", "strpos(e.t, 'b')", "e.k", "e.k + e.i", "e.i", "e.j",
+                      "e.s * e.i", "abs(e.j)"] }
+fn num_x(): []str { return ["e.n * 2", "e.n + e.i", "e.n / (e.i - 3)", "round(e.n, 1)", "round(coalesce(e.n, e.m, 0), 1)", "round(e.n)", "abs(e.n - 50)", "e.m * e.m",
+                      "e.m * 100000000000000000000 * 1000000000000000000", "(e.n * 100000000)::numeric(10,2)", "e.n::numeric(6,3)", "e.m / 3",
+                      "e.n % 7", "-e.n", "e.n * e.j", "floor(e.n)", "ceil(e.m)", "trunc(e.n)", "e.n::float8 / 3", "e.n", "e.m",
+                      "coalesce(e.n, e.m)", "case when e.b then e.n end", "e.n * 2 - e.m", "sqrt(abs(e.n))", "exp(e.s)", "ln(abs(e.n) + 1)", "log10(abs(e.m) + 1)"] }
+fn time_x(): []str { return ["e.d + 1", "e.d - e.s", "e.ts + interval '1 hour'", "date_trunc('day', e.ts)", "e.ts::date", "e.d::timestamptz",
+                       "e.ts - interval '1 day'", "date_trunc('month', e.d)", "e.ts at time zone 'UTC'", "e.ts", "e.d"] }
+fn bool_x(): []str { return ["e.b", "not e.b", "e.i > 3", "e.t like 'a%'", "e.t like '%b%'", "e.note like '%item 7%'", "e.note like 'item 1%'",
+                       "e.note not like '%7'", "e.v ilike 'V1%'", "e.t like 'a_b'", "e.t = 'abc'", "e.ts > '2024-03-10 10:00'",
+                       "e.d < '2024-01-15'", "e.n between 10 and 20", "upper(e.t) = 'ABC'", "e.n * 2 > 30", "coalesce(e.b, false)",
+                       "e.t is null", "e.i > 3 or e.b", "length(e.t) > 2", "e.t || 'x' like '%cx'", "e.ts::text like '2024-03-1%'",
+                       "e.i / (e.s - 2) > 1", "e.t::int > 5", "e.m > 1000", "e.note like '%x7'", "e.w like 'd%'", "e.k = 7",
+                       "e.note like '%item 77%' and e.i > 50", "e.v like 'v1%'", "e.n > e.m", "e.ts::date = e.d", "e.t like '%'", "e.note like '%'"] }
+
+fn anyX(r: mut &lexdb_base.Rng): str {
+    let c = r.below(5)
+    if c == 0 { return pick(r, &text_x()) }
+    if c == 1 { return pick(r, &int_x()) }
+    if c == 2 { return pick(r, &num_x()) }
+    if c == 3 { return pick(r, &time_x()) }
+    return pick(r, &bool_x())
+}
+
+fn wh(r: mut &lexdb_base.Rng, safe: bool): str {
+    if r.below(5) == 0 { return "" }
+    var c = pick(r, &bool_x())
+    if safe && (c == "e.i / (e.s - 2) > 1" || c == "e.t::int > 5") { c = "e.i > 100" }
+    var w = " where " + c
+    if r.below(3) == 0 {
+        var c2 = pick(r, &bool_x())
+        if safe && (c2 == "e.i / (e.s - 2) > 1" || c2 == "e.t::int > 5") { c2 = "e.b" }
+        w = w + " and " + c2
+    }
+    return w
+}
+
+fn dir(r: mut &lexdb_base.Rng): str { return pick(r, &["", "", " desc", " nulls first", " desc nulls last"]) }
+
+fn safeX(r: mut &lexdb_base.Rng, safe: bool, xs: &[]str): str {
+    let x = pick(r, xs)
+    if !safe { return x }
+    if strings.contains(x, "/ (e.") || strings.contains(x, "% (e.") || strings.contains(x, "e.t::int") || strings.contains(x, "::numeric(") ||
+       strings.contains(x, "1000000000") || x == "round(e.n, 1)" || strings.contains(x, "varchar(3)") { return "e.id" }
+    return x
+}
+
+fn query(r: mut &lexdb_base.Rng, safe: bool): str {
+    let shape = r.below(10)
+    var items: []str = []
+    if shape <= 2 {
+        // plain rows of expressions
+        for i in 0..(1 + r.below(5)) { append(mut &items, if safe { safeX(r, true, &text_x()) } else { anyX(r) }) }
+        var sql = "select e.id, " + strings.join(&items, ", ") + " from e" + wh(r, safe)
+        if r.below(3) == 0 { sql = sql + " limit " + pick(r, &["1", "5", "700", "2000"]) }
+        return sql
+    }
+    if shape <= 4 {
+        // top-N, wide outputs
+        append(mut &items, "e.id")
+        for i in 0..(2 + r.below(6)) { append(mut &items, if safe { safeX(r, true, &num_x()) } else { anyX(r) }) }
+        append(mut &items, "e.note")
+        let k1 = pick(r, &["e.i", "e.j", "e.s", "e.b", "e.k", "e.id", "length(e.t)", "e.t", "e.n", "e.ts", "upper(e.v)", "e.n * 2"]) + dir(r)
+        let k2 = pick(r, &["e.id", "e.t", "e.n", "2"]) + dir(r)
+        return "select " + strings.join(&items, ", ") + " from e" + wh(r, safe) + " order by " + k1 + ", " + k2 + " limit " +
+               pick(r, &["1", "3", "10", "200"]) + pick(r, &["", "", " offset 4"])
+    }
+    if shape == 5 {
+        // ORDER BY or DISTINCT of expressions
+        for i in 0..(1 + r.below(3)) { append(mut &items, if safe { safeX(r, true, &text_x()) } else { anyX(r) }) }
+        if r.below(2) == 0 {
+            return "select distinct " + strings.join(&items, ", ") + " from e" + wh(r, safe) + pick(r, &["", " order by 1", " limit 9"])
+        }
+        return "select e.id, " + strings.join(&items, ", ") + " from e" + wh(r, safe) + " order by 2" + dir(r) + ", 1" + pick(r, &["", " limit 40", " offset 2590"])
+    }
+    if shape == 6 {
+        // a join
+        for i in 0..(1 + r.below(3)) { append(mut &items, if safe { safeX(r, true, &text_x()) } else { anyX(r) }) }
+        append(mut &items, pick(r, &["g.t || e.t", "upper(g.t)", "g.n * e.i", "g.n + e.n", "coalesce(g.t, e.v)", "g.b"]))
+        return "select e.id, " + strings.join(&items, ", ") + " from e " + pick(r, &["join", "left join"]) + " g on g.id = e.i" + wh(r, safe) +
+               pick(r, &["", " order by 1 limit 30"])
+    }
+    if shape == 7 {
+        // the row path: a scalar subquery in the WHERE
+        for i in 0..(1 + r.below(4)) { append(mut &items, if safe { safeX(r, true, &text_x()) } else { anyX(r) }) }
+        var w = " where e.i <> (select max(id) from g where g.id < 200)"
+        if r.below(2) == 0 { w = w + " and " + (if safe { "e.n > 0" } else { pick(r, &bool_x()) }) }
+        return "select e.id, " + strings.join(&items, ", ") + " from e" + w + pick(r, &["", " order by 1 desc limit 20"])
+    }
+    // window functions
+    let fns = ["row_number()", "rank()", "lag(e.t)", "sum(e.i)", "count(*)", "first_value(e.n)", "max(e.ts)", "avg(e.n)"]
+    let parts = ["", "e.s", "e.b", "e.t", "e.i / 40", "e.d", "upper(e.v)"]
+    let ords = ["", "e.i", "e.n desc", "e.t nulls first", "e.ts", "e.id", "e.i desc", "e.ts desc nulls last"]
+    let p = pick(r, &parts)
+    let o = pick(r, &ords)
+    var spec = ""
+    if p != "" { spec = "partition by " + p }
+    if o != "" { spec = spec + (if spec == "" { "" } else { " " }) + "order by " + o }
+    let x = if safe { safeX(r, true, &text_x()) } else { anyX(r) }
+    var sql = "select e.id, " + pick(r, &fns) + " over (" + spec + "), " + x + " from e" + wh(r, safe)
+    if r.below(3) == 0 { sql = sql + " order by 2, 1 limit 25" }
+    return sql
+}
+
+// The three ways; same: whether they agree.
+fn three(s: mut &lexdb_exec.Session, sql: &str, batched: mut &bool, failed: mut &bool): bool {
+    let a = q(s, &"set lexdb_batch = off")
+    let off = q(s, sql)
+    let b = q(s, &"set lexdb_batch = on")
+    let on = q(s, sql)
+    var ob = false
+    let sunk = viaSink(s, sql, mut &ob)
+    batched = ob
+    failed = strings.startsWith(off, "ERROR")
+    if off == on && on == sunk { return true }
+    println("DIFFERENT: " + sql)
+    println("  rows:    " + off)
+    println("  batches: " + on)
+    println("  sink:    " + sunk)
+    return false
+}
+
+fn load(s: mut &lexdb_exec.Session, r: mut &lexdb_base.Rng) {
+    let c1 = q(s, &"create table e (id int primary key, i int, j bigint, s smallint, x0 int, b boolean, t text, v varchar(12), n numeric(10,2), m numeric, d date, ts timestamptz, note text)")
+    var id = 1
+    for chunk in 0..26 {
+        var rows: []str = []
+        for i in 0..100 {
+            append(mut &rows, eRow(r, id, chunk > 20))
+            id += 1
+        }
+        let ins = q(s, &("insert into e values " + strings.join(&rows, ", ")))
+        if ins != "INSERT 0 100" { println("insert: " + ins) }
+        if chunk == 20 {
+            // a dropped column, and two added with defaults: the rows before them miss them
+            let c2 = q(s, &"alter table e drop column x0")
+            let c3 = q(s, &"alter table e add column k int default 7")
+            let c4 = q(s, &"alter table e add column w text default 'dflt'")
+        }
+    }
+    let c5 = q(s, &"update e set k = id % 9, w = 'w' || (id % 13) where id > 2100 and id % 3 = 0")
+    let c6 = q(s, &"create table g (id int primary key, t text, n numeric(10,2), b boolean)")
+    var rows: []str = []
+    for k in 1..301 {
+        append(mut &rows, "(" + k.toStr() + ", " + maybe(r, pick(r, &texts())) + ", " + maybe(r, r.below(500).toStr() + ".25") + ", " +
+               maybe(r, pick(r, &["true", "false"])) + ")")
+    }
+    let ins = q(s, &("insert into g values " + strings.join(&rows, ", ")))
+}
+
+// An EXPLAIN ANALYZE's lines without the batches and the result's time.
+fn plan(x: &str): str {
+    let parts = strings.split(x, &"result:")
+    var t = "" + parts[0]
+    for n in ["1", "2", "3"] { t = strings.replaceAll(t, ", batches " + n, "") }
+    return t
+}
+
+fn sameCounts(s: mut &lexdb_exec.Session, sql: &str): bool {
+    let a = q(s, &"set lexdb_batch = off")
+    let off = q(s, &("explain analyze " + sql))
+    let b = q(s, &"set lexdb_batch = on")
+    let on = q(s, &("explain analyze " + sql))
+    if plan(&on) == plan(&off) { return true }
+    println("COUNTS: " + sql)
+    println("  rows:    " + off)
+    println("  batches: " + on)
+    return false
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(61), opts(), fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        var r = lexdb_base.rng(61)
+        let z1 = q(mut &s, &"set timezone = 'Asia/Kolkata'")
+        load(mut &s, mut &r)
+        var same = 0
+        var batched = 0
+        var errors = 0
+        for i in 0..600 {
+            if i == 300 { let z2 = q(mut &s, &"set timezone = 'America/New_York'") }
+            let sql = query(mut &r, false)
+            var ob = false
+            var bad = false
+            if three(mut &s, &sql, mut &ob, mut &bad) { same += 1 }
+            if ob { batched += 1 }
+            if bad { errors += 1 }
+        }
+        println("committed: 600 queries, " + same.toStr() + " the same three ways")
+        // in a transaction with its own writes (read merged with them, not in place)
+        let b1 = q(mut &s, &"begin")
+        let w1 = q(mut &s, &"insert into e select id + 5000, i, j, s, b, t, v, n, m, d, ts, note, k, w from e where id <= 40")
+        let w2 = q(mut &s, &"update e set t = 'item 77', n = n + 1 where id % 10 = 3")
+        let w3 = q(mut &s, &"delete from e where id % 15 = 4")
+        var same2 = 0
+        for i in 0..150 {
+            let sql = query(mut &r, true)
+            var ob = false
+            var bad = false
+            if three(mut &s, &sql, mut &ob, mut &bad) { same2 += 1 }
+        }
+        // now() and its kin in the transaction: its start, every way
+        for sql in ["select e.id, now(), current_timestamp, e.ts < now() from e where e.i > 100 limit 3",
+                    "select e.id, now()::text, e.d < current_date from e where e.i > 100 order by e.j desc, e.id limit 3"] {
+            var ob = false
+            var bad = false
+            if three(mut &s, &sql, mut &ob, mut &bad) { same2 += 1 }
+        }
+        let b2 = q(mut &s, &"rollback")
+        println("in a transaction: 152 queries, " + same2.toStr() + " the same three ways, its writes: " + w1 + ", " + w2 + ", " + w3)
+        let fixed = ["select e.id, e.i + e.j, e.n * 2, upper(e.t) from e", "select e.id, e.j, e.t from e where e.i = 5",
+                     "select e.id, e.t from e where e.note like '%item 77%'", "select e.id, e.j, e.t from e order by e.i desc limit 10",
+                     "select e.id, row_number() over (partition by e.s order by e.i) from e where e.i < 20",
+                     "select * from e where e.i > 200", "select e.id, e.t from e where e.note like '%item 7%' and e.i > 30 limit 3",
+                     "select e.id, e.note from e where e.note like '%x x%'", "select e.id, e.note, e.w, e.k from e where e.k = 7 order by e.id desc limit 5",
+                     "select e.id, e.note from e order by e.i nulls first, e.id limit 7", "select e.id, e.t from e order by e.s desc nulls last, e.id limit 12 offset 3",
+                     "select e.id, e.ts || ' ' || e.d, e.ts::text from e where e.ts is not null order by e.ts limit 5",
+                     "select e.id, upper(e.note) from e where length(e.note) > 1000",
+                     "select e.id, e.n * e.m from e where e.m is not null and e.n is not null order by 2 desc nulls last, 1 limit 4",
+                     "select e.id, e.t || e.v from e where e.t || e.v like '%a%' order by 1 limit 6",
+                     "select count(*), sum(e.i) from e join g on g.id = e.i where upper(g.t) = 'ABC'"]
+        var same3 = 0
+        for sql in fixed {
+            var ob = false
+            var bad = false
+            if three(mut &s, &sql, mut &ob, mut &bad) { same3 += 1 }
+        }
+        println("fixed: " + len(fixed).toStr() + " queries, " + same3.toStr() + " the same three ways")
+        println("given as an OutBatch: " + batched.toStr() + " of 600, errors: " + errors.toStr())
+        // the counts: a filter decoded in two steps, its LIKE on the bytes; a top-N with its bar; a window's rows
+        let c1 = sameCounts(mut &s, &"select e.id, e.t from e where e.note like '%item 7%' and e.i > 30")
+        let c2 = sameCounts(mut &s, &"select e.id, e.note, upper(e.t) from e where e.b order by e.i desc limit 3 offset 2")
+        let c3 = sameCounts(mut &s, &"select e.id, rank() over (order by e.n) from e where e.i < 40")
+        let c4 = sameCounts(mut &s, &"select e.id, upper(e.t) from e where e.i <> (select max(id) from g) and e.n > 3")
+        println("counts: same: " + c1.toStr() + " " + c2.toStr() + " " + c3.toStr() + " " + c4.toStr())
+        // a LIMIT reached before the row whose output or condition fails (e.t::int at id 2000)
+        let u = q(mut &s, &"update e set t = 'nan' where id = 2000")
+        let u2 = q(mut &s, &"update e set t = '5' where id < 2000")
+        var ob = false
+        var bad = false
+        let ok = three(mut &s, &"select e.id, e.t::int + 1 from e limit 3", mut &ob, mut &bad) &&
+                 three(mut &s, &"select e.id from e where e.t::int > 1 limit 3", mut &ob, mut &bad) &&
+                 three(mut &s, &"select e.id, e.t::int from e order by e.i limit 2", mut &ob, mut &bad) &&
+                 three(mut &s, &"select e.id, upper(e.note) from e where e.t::int > 1 order by e.j desc limit 2", mut &ob, mut &bad)
+        println("limit before an error: same: " + ok.toStr())
+        // parameters, folded into the compiled expressions as their values
+        let ps: []lexdb_sql.Val = [lexdb_sql.Val.Text("-x"), lexdb_sql.Val.Int(3), lexdb_sql.Val.Int(40), lexdb_sql.Val.Text("%a%")]
+        let pq = ["select e.id, upper(e.t) || $1, e.n * $2 from e where e.i > $3 and e.t like $4 order by e.id limit 50",
+                  "select e.id, e.n * $2, e.t || $1 from e where e.i > $3 and upper(e.t) || $1 like $4",
+                  "select e.id, e.n * $2 from e where e.i > $3 order by e.i desc, e.id limit 5",
+                  "select e.id, $1 || e.t from e where e.i <> (select max(id) from g) and e.n > $2"]
+        var psame = 0
+        for sql in pq {
+            let a = q(mut &s, &"set lexdb_batch = off")
+            var ob1 = false
+            let off = viaSinkP(mut &s, &sql, &ps, mut &ob1)
+            let b = q(mut &s, &"set lexdb_batch = on")
+            var ob2 = false
+            let on = viaSinkP(mut &s, &sql, &ps, mut &ob2)
+            if off == on && !strings.startsWith(off, "ERROR") { psame += 1 } else { println("PARAMS: " + sql + "\n  " + off + "\n  " + on) }
+        }
+        println("parameters: " + psame.toStr() + " of " + len(pq).toStr() + " the same")
+        return 0
+    }).unwrap()
+}
