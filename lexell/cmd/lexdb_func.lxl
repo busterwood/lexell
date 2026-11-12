@@ -1,0 +1,1983 @@
+// lexdb_func: built-in functions that need no table or session (9.92):
+// numeric's math functions at PostgreSQL's result scales, the string
+// functions, the regular expression functions over lib/regex, format() and
+// md5. lexdb_exec turns values to and from these.
+
+import "strings"
+import "regex"
+import "crypto"
+import "math"
+import "time"
+import "./lexdb_time"
+import "./lexdb_base"
+import "./lexdb_sql"
+
+type DbErr = lexdb_base.DbErr
+
+fn e(state: str, msg: str): DbErr { return lexdb_base.err(state, msg) }
+
+// ---- numeric's sqrt, exp, ln, log and power
+//
+// PostgreSQL computes these exactly to a result scale it chooses (at least
+// 16 significant digits, and no fewer decimals than an argument has). Here
+// they are computed in Hp, a decimal floating point of 19 significant
+// digits, then rounded to that scale: right where the result shows at most
+// about 18 significant digits, as it does unless an argument has many
+// decimals or the result is very large.
+
+const P18: u128 = 1000000000000000000
+const P19: u128 = 10000000000000000000
+
+// ±m * 10^e, m in [10^18, 10^19) (or 0).
+type Hp = value record { neg: bool; m: u128; e: int }
+
+fn hpZero(): Hp { return Hp{neg: false, m: 0, e: 0} }
+
+fn pow10u(k: int): u128 {
+    var r: u128 = 1
+    for i in 0..k { r = r * 10 }
+    return r
+}
+
+fn digitsU(x: u128): int {
+    var n = 0
+    var v = x
+    while v > 0 {
+        v = v / 10
+        n += 1
+    }
+    return n
+}
+
+// m made 19 digits, rounded half up.
+fn hpNorm(neg: bool, m: u128, e: int): Hp {
+    if m == 0 { return hpZero() }
+    let d = digitsU(m)
+    if d > 19 {
+        let k = d - 19
+        let p = pow10u(k)
+        var q = m / p
+        let r = m % p
+        var ex = e + k
+        if r >= p - r { q = q + 1 }
+        if q == P19 {
+            q = P18
+            ex += 1
+        }
+        return Hp{neg: neg, m: q, e: ex}
+    }
+    return Hp{neg: neg, m: m * pow10u(19 - d), e: e - (19 - d)}
+}
+
+fn hpInt(n: int): Hp {
+    if n < 0 { return hpNorm(true, u128(-n), 0) }
+    return hpNorm(false, u128(n), 0)
+}
+
+fn hpOfDec(d: &Decimal): Hp { return hpNorm(d.isNeg(), d.coefficient(), d.exponent()) }
+
+fn hpNeg(a: Hp): Hp { return Hp{neg: a.m != 0 && !a.neg, m: a.m, e: a.e} }
+
+fn hpMul(a: Hp, b: Hp): Hp {
+    if a.m == 0 || b.m == 0 { return hpZero() }
+    return hpNorm(a.neg != b.neg, a.m * b.m, a.e + b.e)
+}
+
+fn hpDiv(a: Hp, b: Hp): Hp {
+    if a.m == 0 { return hpZero() }
+    let n = a.m * P19
+    var q = n / b.m
+    let r = n % b.m
+    if r >= b.m - r { q = q + 1 }
+    return hpNorm(a.neg != b.neg, q, a.e - b.e - 19)
+}
+
+fn hpAdd(x: Hp, y: Hp): Hp {
+    if x.m == 0 { return y }
+    if y.m == 0 { return x }
+    var a = x
+    var b = y
+    if b.e > a.e {
+        a = y
+        b = x
+    }
+    let d = a.e - b.e
+    if d > 40 { return a }
+    let sh = if d < 19 { d } else { 19 }
+    let am = a.m * pow10u(sh)
+    var bm = b.m
+    let rest = d - sh
+    if rest > 0 {
+        let p = pow10u(rest)
+        let r = bm % p
+        bm = bm / p
+        if r >= p - r { bm = bm + 1 }
+    }
+    let ex = a.e - sh
+    if a.neg == b.neg { return hpNorm(a.neg, am + bm, ex) }
+    if am >= bm { return hpNorm(a.neg, am - bm, ex) }
+    return hpNorm(b.neg, bm - am, ex)
+}
+
+fn hpSub(a: Hp, b: Hp): Hp { return hpAdd(a, hpNeg(b)) }
+
+fn hpCmp(a: Hp, b: Hp): int {
+    let d = hpSub(a, b)
+    if d.m == 0 { return 0 }
+    return if d.neg { -1 } else { 1 }
+}
+
+fn pow10f(k: int): float { return 10.0f.pow(float(k)) }
+
+// As a float (to estimate with).
+fn hpFloat(a: Hp): float {
+    if a.m == 0 { return 0.0f }
+    let x = float(int(a.m / 10)) * pow10f(a.e + 1)
+    return if a.neg { -x } else { x }
+}
+
+// A float as an Hp (to start an iteration from).
+fn hpOfFloat(x: float): Hp {
+    if x == 0.0f || !x.isFinite() { return hpZero() }
+    let ax = x.abs()
+    let w = int(ax.log10().floor())
+    let m = ax * pow10f(16 - w)
+    return hpNorm(x < 0.0f, u128(int(m)), w - 16)
+}
+
+// 10^k as an Hp.
+fn hpPow10(k: int): Hp { return Hp{neg: false, m: P18, e: k - 18} }
+
+const LN10_M: u128 = 2302585092994045684      // ln 10 = 2.302585092994045684017991...
+const LN2_M: u128 = 6931471805599453094       // ln 2 = 0.6931471805599453094172321...
+
+fn hpLn10(): Hp { return Hp{neg: false, m: LN10_M, e: -18} }
+fn hpLn2(): Hp { return Hp{neg: false, m: LN2_M, e: -19} }
+
+// ln(x) for x in [0.5, 2): 2 atanh((x - 1) / (x + 1)).
+fn hpLnNear1(x: Hp): Hp {
+    let one = hpInt(1)
+    let z = hpDiv(hpSub(x, one), hpAdd(x, one))
+    if z.m == 0 { return hpZero() }
+    let z2 = hpMul(z, z)
+    var term = z
+    var sum = z
+    var k = 3
+    while k < 200 {
+        term = hpMul(term, z2)
+        let t = hpDiv(term, hpInt(k))
+        if t.m == 0 || t.e < sum.e - 21 { break }
+        sum = hpAdd(sum, t)
+        k += 2
+    }
+    return hpMul(sum, hpInt(2))
+}
+
+// ln(x), x > 0.
+fn hpLn(x: Hp): Hp {
+    let half = Hp{neg: false, m: P18 * 5, e: -19}
+    if hpCmp(x, half) >= 0 && hpCmp(x, hpInt(2)) < 0 { return hpLnNear1(x) }
+    // x = f * 10^k, f in [1, 10); f / 2^j in [1, 2)
+    let k = x.e + 18
+    var f = Hp{neg: false, m: x.m, e: -18}
+    var j = 0
+    while hpCmp(f, hpInt(2)) >= 0 {
+        f = hpDiv(f, hpInt(2))
+        j += 1
+    }
+    var r = hpLnNear1(f)
+    if j > 0 { r = hpAdd(r, hpMul(hpInt(j), hpLn2())) }
+    if k != 0 { r = hpAdd(r, hpMul(hpInt(k), hpLn10())) }
+    return r
+}
+
+// e^y, |y| below about 10^5 (the caller has checked).
+fn hpExp(y: Hp): Hp {
+    let k = int((hpFloat(y) / 2.302585092994046f).floor())
+    let r = hpSub(y, hpMul(hpInt(k), hpLn10()))
+    let one = hpInt(1)
+    var sum = one
+    var term = one
+    var n = 1
+    while n < 100 {
+        term = hpDiv(hpMul(term, r), hpInt(n))
+        if term.m == 0 || term.e < sum.e - 21 { break }
+        sum = hpAdd(sum, term)
+        n += 1
+    }
+    if sum.m == 0 { return sum }
+    return Hp{neg: sum.neg, m: sum.m, e: sum.e + k}
+}
+
+// sqrt(x), x > 0.
+fn hpSqrt(x: Hp): Hp {
+    // x = f * 10^(2q), f in [1, 100)
+    var w = x.e + 18
+    var q = if w >= 0 { w / 2 } else { -((-w + 1) / 2) }
+    let f = Hp{neg: false, m: x.m, e: x.e - 2 * q}
+    var s0 = hpOfFloat(hpFloat(f).sqrt())
+    var s = Hp{neg: false, m: s0.m, e: s0.e + q}
+    let two = hpInt(2)
+    for i in 0..3 { s = hpDiv(hpAdd(s, hpDiv(x, s)), two) }
+    return s
+}
+
+// An Hp rounded to scale decimals (half away from zero), as a numeric.
+fn hpDec(h: Hp, scale: int): Result[Decimal, DbErr] {
+    if h.m == 0 { return decRound(Decimal.zero(), scale) }
+    let s = (if h.neg { "-" } else { "" }) + h.m.toStr() + "e" + h.e.toStr()
+    match Decimal.parse(s) {
+        Ok(d) { return decRound(d, scale) }
+        Err(_) { return Err(numOverflow()) }
+    }
+}
+
+fn decRound(d: Decimal, scale: int): Result[Decimal, DbErr] {
+    match d.roundAway(scale) {
+        Ok(r) { return Ok(r) }
+        Err(_) { return Err(numOverflow()) }
+    }
+}
+
+fn numOverflow(): DbErr { return e("22003", "value overflows numeric format") }
+
+// The decimal weight of a nonzero numeric's first digit (floor(log10 |d|)).
+fn dweight(d: &Decimal): int { return digitsU(d.coefficient()) - 1 + d.exponent() }
+
+// PostgreSQL's base-10000 view of a nonzero numeric: the weight of its first
+// digit group, that group, and the next (0 if none) with whether there is one.
+type Groups = value record { weight: int; g0: int; g1: int; more: bool }
+
+fn floorDiv(a: int, b: int): int {
+    let q = a / b
+    return if (a % b != 0) && ((a < 0) != (b < 0)) { q - 1 } else { q }
+}
+
+fn groupsOf(d: &Decimal): Groups {
+    let ds = d.coefficient().toStr()
+    let top = len(ds) - 1 + d.exponent()        // the power of ten of ds[0]
+    let w = floorDiv(top, 4)
+    var g0 = 0
+    var g1 = 0
+    for k in 0..8 {
+        let p = w * 4 + 3 - k                   // a digit's power of ten
+        let i = top - p
+        let dig = if i >= 0 && i < len(ds) { int(ds[i] - '0') } else { 0 }
+        if k < 4 { g0 = g0 * 10 + dig } else { g1 = g1 * 10 + dig }
+    }
+    return Groups{weight: w, g0: g0, g1: g1, more: d.exponent() < w * 4}
+}
+
+// PostgreSQL's estimate_ln_dweight: the decimal weight of ln(d), d > 0.
+fn lnDweight(d: &Decimal): int {
+    let x = d.toFloat()
+    if x >= 0.9f && x <= 1.1f {
+        let y = d.sub(Decimal.fromInt(1))
+        if y.isZero() { return 0 }
+        let g = groupsOf(&y.abs())
+        return g.weight * 4 + int(float(g.g0).log10())
+    }
+    let g = groupsOf(d)
+    var digits = g.g0
+    var dw = g.weight * 4
+    if g.more {
+        digits = digits * 10000 + g.g1
+        dw -= 4
+    }
+    let lnv = float(digits).ln() + float(dw) * 2.302585092994046f
+    return int(lnv.abs().log10())
+}
+
+fn clampScale(r: int): int { return if r < 0 { 0 } else if r > 1000 { 1000 } else { r } }
+
+pub fn numSqrt(d: &Decimal): Result[Decimal, DbErr] {
+    if d.isNeg() { return Err(e("2201F", "cannot take square root of a negative number")) }
+    let w = if d.isZero() { 0 } else { groupsOf(d).weight }
+    let sweight = (w + 1) * 4 / 2 - 1
+    let rscale = clampScale(max(16 - sweight, d.scale()))
+    if d.isZero() { return decRound(Decimal.zero(), rscale) }
+    return hpDec(hpSqrt(hpOfDec(d)), rscale)
+}
+
+pub fn numExp(d: &Decimal): Result[Decimal, DbErr] {
+    let x = d.toFloat()
+    if x > 87000.0f { return Err(numOverflow()) }
+    var v = x * 0.434294481903252f
+    if v < -2000.0f { v = -2000.0f }
+    if v > 2000.0f { v = 2000.0f }
+    let rscale = clampScale(max(16 - int(v), d.scale()))
+    if x < -87000.0f { return decRound(Decimal.zero(), rscale) }
+    return hpDec(hpExp(hpOfDec(d)), rscale)
+}
+
+fn lnCheck(d: &Decimal): Result[Unit, DbErr] {
+    if d.isZero() { return Err(e("2201E", "cannot take logarithm of zero")) }
+    if d.isNeg() { return Err(e("2201E", "cannot take logarithm of a negative number")) }
+    return Ok(Unit{})
+}
+
+pub fn numLn(d: &Decimal): Result[Decimal, DbErr] {
+    try lnCheck(d)
+    let rscale = clampScale(max(16 - lnDweight(d), d.scale()))
+    return hpDec(hpLn(hpOfDec(d)), rscale)
+}
+
+// log(base, x) over numeric.
+pub fn numLog(b: &Decimal, x: &Decimal): Result[Decimal, DbErr] {
+    try lnCheck(b)
+    try lnCheck(x)
+    let rd = lnDweight(x) - lnDweight(b)
+    let rscale = clampScale(max(max(16 - rd, b.scale()), x.scale()))
+    let lb = hpLn(hpOfDec(b))
+    if lb.m == 0 { return Err(e("22012", "division by zero")) }
+    return hpDec(hpDiv(hpLn(hpOfDec(x)), lb), rscale)
+}
+
+// Whether a numeric is a whole number in int's range: its value.
+fn wholeInt(d: &Decimal): Option[int] {
+    match d.trunc(0) {
+        Ok(t) {
+            if t.cmp(d) != 0 { return None }
+            match t.toInt(Rounding.TOWARD_ZERO) {
+                Ok(n) { return Some(n) }
+                Err(_) { return None }
+            }
+        }
+        Err(_) { return None }
+    }
+}
+
+// x ^ y over numeric (PostgreSQL's numeric_power and power_var).
+pub fn numPower(x: &Decimal, y: &Decimal): Result[Decimal, DbErr] {
+    if x.isZero() && y.isNeg() { return Err(e("2201F", "zero raised to a negative power is undefined")) }
+    match wholeInt(y) {
+        Some(n) {
+            if n >= -2147483648 && n <= 2147483647 { return numPowerInt(x, n, y.scale()) }
+        }
+        None {}
+    }
+    if x.isZero() { return decRound(Decimal.zero(), 16) }
+    if x.isNeg() { return Err(e("2201F", "a negative number raised to a non-integer power yields a complex result")) }
+    let lnx = hpLn(hpOfDec(x))
+    let t = hpMul(lnx, hpOfDec(y))
+    let val = hpFloat(t)
+    if val.abs() > 6000.0f * 3.01f {
+        if val > 0.0f { return Err(numOverflow()) }
+        return decRound(Decimal.zero(), 1000)
+    }
+    let rscale = clampScale(max(max(16 - int(val * 0.434294481903252f), x.scale()), y.scale()))
+    if val > 87000.0f { return Err(numOverflow()) }
+    return hpDec(hpExp(t), rscale)
+}
+
+fn numPowerInt(x: &Decimal, n: int, ydscale: int): Result[Decimal, DbErr] {
+    var f = 0.0f
+    if !x.isZero() { f = float(n) * x.abs().toFloat().log10() }
+    if f > 131072.0f * 4.0f { return Err(numOverflow()) }
+    if f + 1.0f < -1000.0f { return decRound(Decimal.zero(), 1000) }
+    let rscale = clampScale(max(max(16 - int(f), x.scale()), ydscale))
+    if n == 0 { return decRound(Decimal.fromInt(1), rscale) }
+    let an = if n < 0 { -n } else { n }
+    // exactly, while it fits; else in Hp
+    var exact = true
+    var acc = Decimal.fromInt(1)
+    var b = x.neg().neg()
+    var k = an
+    while k > 0 && exact {
+        if k % 2 == 1 {
+            match acc.mulExact(b) {
+                Ok(v) { acc = v }
+                Err(_) { exact = false }
+            }
+        }
+        k = k / 2
+        if k > 0 && exact {
+            match b.mulExact(b) {
+                Ok(v) { b = v }
+                Err(_) { exact = false }
+            }
+        }
+    }
+    if exact {
+        if n > 0 { return decRound(acc, rscale) }
+        match Decimal.fromInt(1).div(acc, rscale, Rounding.HALF_AWAY) {
+            Ok(r) { return Ok(r) }
+            Err(_) { return Err(numOverflow()) }
+        }
+    }
+    // e^(n ln |x|): repeated squaring would lose a digit a step
+    var r = hpExp(hpMul(hpInt(n), hpLn(hpOfDec(&x.abs()))))
+    if x.isNeg() && an % 2 == 1 { r = hpNeg(r) }
+    return hpDec(r, rscale)
+}
+
+// ---- strings
+
+// lpad and rpad: s filled on the left (or right) with fill to n characters,
+// or cut to n.
+pub fn pad(s: &str, n: int, fill: &str, left: bool): Result[str, DbErr] {
+    if n <= 0 { return Ok("") }
+    if n > 268435455 { return Err(e("54000", "requested length too large")) }
+    let rs = strings.runes(s.toStr())
+    if len(rs) >= n { return Ok(strings.fromRunes(&rs[0..n])) }
+    let fs = strings.runes(fill.toStr())
+    if len(fs) == 0 { return Ok(s.toStr()) }
+    var b = newStrBuf()
+    if !left { b.add(s.toStr()) }
+    for i in 0..n - len(rs) { strings.addRune(mut &b, fs[i % len(fs)]) }
+    if left { b.add(s.toStr()) }
+    return Ok(b.toStr())
+}
+
+pub fn splitPart(s: &str, delim: &str, n: int): Result[str, DbErr] {
+    if n == 0 { return Err(e("22023", "field position must not be zero")) }
+    var parts: []str = []
+    if len(delim) == 0 {
+        if len(s) > 0 { append(mut &parts, s.toStr()) }
+    } else if len(s) > 0 {
+        for p in strings.split(s, delim) { append(mut &parts, p.toStr()) }
+    }
+    if len(parts) == 0 { return Ok("") }
+    let i = if n > 0 { n - 1 } else { len(parts) + n }
+    if i < 0 || i >= len(parts) { return Ok("") }
+    return Ok(parts[i])
+}
+
+// initcap: each run of letters and digits with its first letter upper case,
+// the rest lower case (ASCII, as lower and upper are here).
+pub fn initcap(s: &str): str {
+    var b = newStrBuf()
+    var inWord = false
+    for i in 0..len(s) {
+        let c = s[i]
+        let alnum = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c >= 128
+        if alnum && !inWord && c >= 'a' && c <= 'z' { b.addByte(c - 32) }
+        else if alnum && inWord && c >= 'A' && c <= 'Z' { b.addByte(c + 32) }
+        else { b.addByte(c) }
+        inWord = alnum
+    }
+    return b.toStr()
+}
+
+pub fn reverse(s: &str): str {
+    let rs = strings.runes(s.toStr())
+    var out: []int = []
+    var i = len(rs) - 1
+    while i >= 0 {
+        append(mut &out, rs[i])
+        i -= 1
+    }
+    return strings.fromRunes(&out)
+}
+
+pub fn translate(s: &str, from: &str, to: &str): str {
+    let fr = strings.runes(from.toStr())
+    let tr = strings.runes(to.toStr())
+    var b = newStrBuf()
+    for r in strings.runes(s.toStr()) {
+        var at = -1
+        for k in 0..len(fr) {
+            if fr[k] == r {
+                at = k
+                break
+            }
+        }
+        if at < 0 { strings.addRune(mut &b, r) } else if at < len(tr) { strings.addRune(mut &b, tr[at]) }
+    }
+    return b.toStr()
+}
+
+// quote_literal: in quotes, quotes doubled; with a backslash, E'...' and
+// backslashes doubled.
+pub fn quoteLiteral(s: &str): str {
+    var b = newStrBuf()
+    if strings.contains(s, "\\") { b.addByte('E') }
+    b.addByte('\'')
+    for i in 0..len(s) {
+        if s[i] == '\'' || s[i] == '\\' { b.addByte(s[i]) }
+        b.addByte(s[i])
+    }
+    b.addByte('\'')
+    return b.toStr()
+}
+
+// quote_ident.
+pub fn quoteIdent(n: &str): str {
+    var plain = len(n) > 0 && ((n[0] >= 'a' && n[0] <= 'z') || n[0] == '_')
+    for i in 0..len(n) {
+        let c = n[i]
+        if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_') { plain = false }
+    }
+    if plain && lexdb_sql.isReservedWord(n) { plain = false }
+    return if plain { n.toStr() } else { "\"" + strings.replaceAll(n, "\"", "\"\"") + "\"" }
+}
+
+// to_hex: bits the integer's type has (32 or 64), as two's complement.
+pub fn toHex(n: int, bits: int): str {
+    if n >= 0 { return strings.hex(n) }
+    if bits == 32 { return strings.hex(n & 0xFFFFFFFF) }
+    return strings.hex64(u64(n &  0x7FFFFFFFFFFFFFFF) | (u64(1) << 63))
+}
+
+pub fn chr(n: int): Result[str, DbErr] {
+    if n < 0 { return Err(e("22023", "character number must be positive")) }
+    if n == 0 { return Err(e("54000", "null character not permitted")) }
+    if n > 0x10FFFF { return Err(e("54000", "requested character too large for encoding: " + n.toStr())) }
+    if n >= 0xD800 && n <= 0xDFFF { return Err(e("54000", "requested character not valid for encoding: " + n.toStr())) }
+    return Ok(strings.fromRune(n))
+}
+
+pub fn ascii(s: &str): int {
+    if len(s) == 0 { return 0 }
+    return strings.runes(s.toStr())[0]
+}
+
+pub fn md5Hex(data: &str): Result[str, DbErr] {
+    match crypto.md5(data.toStr()) {
+        Ok(d) {
+            let digits = "0123456789abcdef"
+            var b = newStrBuf()
+            for i in 0..len(d) {
+                b.addByte(digits[int(d[i]) >> 4])
+                b.addByte(digits[int(d[i]) & 15])
+            }
+            return Ok(b.toStr())
+        }
+        Err(x) { return Err(e("XX000", x.toStr())) }
+    }
+}
+
+// overlay(s placing r from n [for m]).
+pub fn overlay(s: &str, r: &str, from: int, count: int, hasCount: bool): Result[str, DbErr] {
+    let rs = strings.runes(s.toStr())
+    let m = if hasCount { count } else { strings.runeCount(r.toStr()) }
+    if from < 1 || m < 0 { return Err(e("22011", "negative substring length not allowed")) }
+    let a = if from - 1 < len(rs) { from - 1 } else { len(rs) }
+    let bEnd = from - 1 + m
+    let b = if bEnd < len(rs) { bEnd } else { len(rs) }
+    return Ok(strings.fromRunes(&rs[0..a]) + r.toStr() + strings.fromRunes(&rs[b..len(rs)]))
+}
+
+// format(fmt, args...): %s, %I, %L, %%, with positions (%2$s) and widths
+// (%10s, %-10s, %*s, %*2$s). args: each argument's text, None for NULL.
+pub fn format(f: &str, args: &[]Option[str]): Result[str, DbErr] {
+    var b = newStrBuf()
+    var next = 0
+    var i = 0
+    let n = len(f)
+    while i < n {
+        let c = f[i]
+        if c != '%' {
+            b.addByte(c)
+            i += 1
+            continue
+        }
+        i += 1
+        if i >= n { return Err(e("22023", "unterminated format() type specifier")) }
+        if f[i] == '%' {
+            b.addByte('%')
+            i += 1
+            continue
+        }
+        // [argpos$][flags][width][type]
+        var argPos = -1
+        var j = i
+        var num = 0
+        var got = false
+        while j < n && f[j] >= '0' && f[j] <= '9' {
+            if num > 100000000 { return Err(e("22003", "number is out of range")) }
+            num = num * 10 + int(f[j] - '0')
+            got = true
+            j += 1
+        }
+        if got && j < n && f[j] == '$' {
+            if num == 0 { return Err(e("22023", "format specifies argument 0, but arguments are numbered from 1")) }
+            argPos = num
+            i = j + 1
+        }
+        var left = false
+        while i < n && f[i] == '-' {
+            left = true
+            i += 1
+        }
+        var width = -1
+        if i < n && f[i] == '*' {
+            // the width from an argument: the next, or one named by n$
+            i += 1
+            var wPos = -1
+            var k = i
+            var wn = 0
+            var wgot = false
+            while k < n && f[k] >= '0' && f[k] <= '9' {
+                if wn > 100000000 { return Err(e("22003", "number is out of range")) }
+                wn = wn * 10 + int(f[k] - '0')
+                wgot = true
+                k += 1
+            }
+            if wgot {
+                if k >= n || f[k] != '$' { return Err(e("22023", "unterminated format() type specifier")) }
+                if wn == 0 { return Err(e("22023", "format specifies argument 0, but arguments are numbered from 1")) }
+                wPos = wn
+                i = k + 1
+            }
+            let wi = if wPos > 0 { wPos - 1 } else { next }
+            if wi >= len(args) { return Err(e("22023", "too few arguments for format()")) }
+            next = wi + 1
+            match args[wi] {
+                Some(t) {
+                    match strings.parseIntOpt(t) {
+                        Some(w) {
+                            if w < 0 {
+                                left = true
+                                width = -w
+                            } else {
+                                width = w
+                            }
+                        }
+                        None { return Err(e("22P02", "invalid input syntax for type integer: \"" + t + "\"")) }
+                    }
+                }
+                None { width = 0 }
+            }
+        } else {
+            var wn = 0
+            var wgot = false
+            while i < n && f[i] >= '0' && f[i] <= '9' {
+                if wn > 100000000 { return Err(e("22003", "number is out of range")) }
+                wn = wn * 10 + int(f[i] - '0')
+                wgot = true
+                i += 1
+            }
+            if wgot { width = wn }
+        }
+        if i >= n { return Err(e("22023", "unterminated format() type specifier")) }
+        let t = f[i]
+        i += 1
+        if t != 's' && t != 'I' && t != 'L' {
+            return Err(e("22023", "unrecognized format() type specifier \"" + f[i - 1..i] + "\""))
+        }
+        let ai = if argPos > 0 { argPos - 1 } else { next }
+        if ai >= len(args) { return Err(e("22023", "too few arguments for format()")) }
+        next = ai + 1
+        var out = ""
+        match args[ai] {
+            Some(v) {
+                if t == 's' { out = v } else if t == 'I' { out = quoteIdent(&v) } else { out = quoteLiteral(&v) }
+            }
+            None {
+                if t == 'I' { return Err(e("22004", "null values cannot be formatted as an SQL identifier")) }
+                if t == 'L' { out = "NULL" }
+            }
+        }
+        let k = strings.runeCount(out)
+        if width > k {
+            if left {
+                b.add(out)
+                for x in 0..width - k { b.addByte(' ') }
+            } else {
+                for x in 0..width - k { b.addByte(' ') }
+                b.add(out)
+            }
+        } else {
+            b.add(out)
+        }
+    }
+    return Ok(b.toStr())
+}
+
+// string_to_array(s, delim [, null]): delim None splits into characters;
+// "" keeps s whole. Each element None for NULL.
+pub fn stringToArray(s: &str, delim: Option[str], nullStr: Option[str]): []Option[str] {
+    var parts: []str = []
+    if len(s) > 0 {
+        match delim {
+            None { for r in strings.runes(s.toStr()) { append(mut &parts, strings.fromRune(r)) } }
+            Some(d) {
+                if len(d) == 0 { append(mut &parts, s.toStr()) } else {
+                    for p in strings.split(s, &d) { append(mut &parts, p.toStr()) }
+                }
+            }
+        }
+    }
+    var out: []Option[str] = []
+    for p in parts {
+        var isNull = false
+        match nullStr {
+            Some(ns) { isNull = ns == p }
+            None {}
+        }
+        append(mut &out, if isNull { None } else { Some(p) })
+    }
+    return out
+}
+
+// ---- regular expressions (PostgreSQL's flags over lib/regex's RE2 syntax)
+
+pub type ReFlags = value record {
+    pub glob: bool
+    pub icase: bool
+    pub newline: bool       // n, m: . and [^ do not match a newline; ^ and $ match at lines
+    pub quote: bool         // q: the pattern is literal text
+    pub expanded: bool      // x: white space and # comments in the pattern ignored
+    pub nlAnchor: bool      // w: ^ and $ at lines, . matching a newline
+    pub nlStop: bool        // p: . not matching a newline, ^ and $ at the ends
+}
+
+pub fn reFlags(f: &str): Result[ReFlags, DbErr] {
+    var r = ReFlags{glob: false, icase: false, newline: false, quote: false, expanded: false, nlAnchor: false, nlStop: false}
+    for i in 0..len(f) {
+        let c = f[i]
+        if c == 'g' { r.glob = true }
+        else if c == 'i' { r.icase = true }
+        else if c == 'c' { r.icase = false }
+        else if c == 'n' || c == 'm' { r.newline = true; r.nlAnchor = false; r.nlStop = false }
+        else if c == 's' { r.newline = false; r.nlAnchor = false; r.nlStop = false }
+        else if c == 'p' { r.newline = false; r.nlStop = true; r.nlAnchor = false }
+        else if c == 'w' { r.newline = false; r.nlAnchor = true; r.nlStop = false }
+        else if c == 'q' { r.quote = true }
+        else if c == 'x' { r.expanded = true }
+        else if c == 't' { r.expanded = false }
+        else if c == 'e' || c == 'b' {}
+        else { return Err(e("22023", "invalid regular expression option: \"" + f[i..i + 1] + "\"")) }
+    }
+    return Ok(r)
+}
+
+// PostgreSQL's ARE escapes RE2 spells otherwise: \y \m \M (word
+// boundaries) as \b, \Y as \B, \Z as \z; in x mode, white space and #
+// comments dropped outside brackets.
+fn arePattern(p: &str, expanded: bool): str {
+    var b = newStrBuf()
+    var i = 0
+    var inBr = false
+    let n = len(p)
+    while i < n {
+        let c = p[i]
+        if c == '\\' && i + 1 < n {
+            let d = p[i + 1]
+            if !inBr && (d == 'y' || d == 'm' || d == 'M') { b.add("\\b") }
+            else if !inBr && d == 'Y' { b.add("\\B") }
+            else if !inBr && d == 'Z' { b.add("\\z") }
+            else {
+                b.addByte(c)
+                b.addByte(d)
+            }
+            i += 2
+            continue
+        }
+        if inBr {
+            if c == ']' { inBr = false }
+            b.addByte(c)
+            i += 1
+            continue
+        }
+        if c == '[' {
+            inBr = true
+            b.addByte(c)
+            i += 1
+            // a ] first in a bracket is itself, as is one after ^
+            if i < n && p[i] == '^' {
+                b.addByte('^')
+                i += 1
+            }
+            if i < n && p[i] == ']' {
+                b.addByte(']')
+                i += 1
+            }
+            continue
+        }
+        if expanded && (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+            i += 1
+            continue
+        }
+        if expanded && c == '#' {
+            while i < n && p[i] != '\n' { i += 1 }
+            continue
+        }
+        b.addByte(c)
+        i += 1
+    }
+    return b.toStr()
+}
+
+// Whether a pattern has a non-greedy quantifier: PostgreSQL's ARE then
+// prefers the shortest match, as Perl's rules do; else the longest.
+fn nonGreedy(p: &str): bool {
+    for i in 1..len(p) {
+        if p[i] == '?' && (p[i - 1] == '*' || p[i - 1] == '+' || p[i - 1] == '?' || p[i - 1] == '}') {
+            if i < 2 || p[i - 2] != '\\' { return true }
+        }
+    }
+    return false
+}
+
+pub fn reCompile(pat: &str, fl: &ReFlags): Result[regex.Regex, DbErr] { return reCompileFor(pat, fl, true) }
+
+// For a yes or no (~, regexp_like): which match does not matter.
+pub fn reCompileTest(pat: &str, fl: &ReFlags): Result[regex.Regex, DbErr] { return reCompileFor(pat, fl, false) }
+
+fn reCompileFor(pat: &str, fl: &ReFlags, which: bool): Result[regex.Regex, DbErr] {
+    var body = if fl.quote { regex.quote(pat.toStr()) } else { arePattern(pat, fl.expanded) }
+    var opts = ""
+    if fl.icase { opts = opts + "i" }
+    if fl.newline { opts = opts + "m" } else if fl.nlAnchor { opts = opts + "ms" } else if !fl.nlStop { opts = opts + "s" }
+    let full = (if len(opts) > 0 { "(?" + opts + ")" } else { "" }) + body
+    let r = if !which || (!fl.quote && nonGreedy(&body)) { regex.compile(full) } else { regex.compileLongest(full) }
+    match move(r) {
+        Ok(re) { return Ok(re) }
+        Err(x) { return Err(e("2201B", "invalid regular expression: " + x.toStr())) }
+    }
+}
+
+// The byte offset of character k (from 0) of s; len(s) past its end.
+fn byteAt(s: &str, k: int): int {
+    var i = 0
+    var c = 0
+    while i < len(s) && c < k {
+        i += strings.decodeAt(s.toStr(), i).size
+        c += 1
+    }
+    return i
+}
+
+fn charsBefore(s: &str, b: int): int { return strings.runeCount(s[0..b].toStr()) }
+
+// The matches of re in s from character start (from 0), as PostgreSQL's
+// setup_regexp_matches finds them: each its group slots (bytes), at most one
+// unless all; after an empty match the search moves one character on. With
+// split, empty matches at either end or just after the last match are
+// skipped.
+pub fn reMatches(re: &regex.Regex, s: &str, start: int, all: bool, split: bool): [][]int {
+    var out: [][]int = []
+    var pos = byteAt(s, start)
+    var prevEnd = 0
+    while pos <= len(s) {
+        let m = re.submatchIndexAt(s.toStr(), pos)
+        if len(m) == 0 { break }
+        let m0 = m[0]
+        let m1 = m[1]
+        if !split || (m0 < len(s) && m1 > prevEnd) {
+            append(mut &out, m)
+            if !all { break }
+        }
+        prevEnd = m1
+        pos = m1
+        if m0 == m1 {
+            if pos >= len(s) { break }
+            pos += strings.decodeAt(s.toStr(), pos).size
+        }
+    }
+    return out
+}
+
+// A match's groups as PostgreSQL gives them (regexp_match): the groups, or
+// the whole match when there are none; None for a group not taking part.
+pub fn reGroups(s: &str, m: &[]int): []Option[str] {
+    var out: []Option[str] = []
+    let ng = len(m) / 2 - 1
+    if ng == 0 {
+        append(mut &out, Some(s[m[0]..m[1]].toStr()))
+        return out
+    }
+    for g in 1..ng + 1 {
+        if m[2 * g] < 0 { append(mut &out, None) } else { append(mut &out, Some(s[m[2 * g]..m[2 * g + 1]].toStr())) }
+    }
+    return out
+}
+
+// The replacement for one match: \1 to \9 its groups, \& the match, \\ a
+// backslash; a backslash before anything else stays.
+fn replText(s: &str, m: &[]int, repl: &str, b: mut &StrBuf) {
+    var i = 0
+    let n = len(repl)
+    while i < n {
+        let c = repl[i]
+        if c == '\\' && i + 1 < n {
+            let d = repl[i + 1]
+            if d >= '1' && d <= '9' {
+                let g = int(d - '0')
+                if 2 * g + 1 < len(m) && m[2 * g] >= 0 { b.add(s[m[2 * g]..m[2 * g + 1]].toStr()) }
+                i += 2
+                continue
+            }
+            if d == '&' {
+                b.add(s[m[0]..m[1]].toStr())
+                i += 2
+                continue
+            }
+            if d == '\\' {
+                b.addByte('\\')
+                i += 2
+                continue
+            }
+        }
+        b.addByte(c)
+        i += 1
+    }
+}
+
+// regexp_replace: from character start (from 0); the nth match only (0: all
+// when all, else the first).
+pub fn reReplace(re: &regex.Regex, s: &str, repl: &str, start: int, nth: int, all: bool): str {
+    let ms = reMatches(re, s, start, all || nth > 0, false)
+    var b = newStrBuf()
+    var at = 0
+    for k in 0..len(ms) {
+        if nth > 0 && k + 1 != nth { continue }
+        let m = &ms[k]
+        b.add(s[at..m[0]].toStr())
+        replText(s, m, repl, mut &b)
+        at = m[1]
+    }
+    b.add(s[at..len(s)].toStr())
+    return b.toStr()
+}
+
+// regexp_split_to_table and _to_array: the pieces between the matches.
+pub fn reSplit(re: &regex.Regex, s: &str): []str {
+    var out: []str = []
+    var at = 0
+    for m in reMatches(re, s, 0, true, true) {
+        append(mut &out, s[at..m[0]].toStr())
+        at = m[1]
+    }
+    append(mut &out, s[at..len(s)].toStr())
+    return out
+}
+
+// Character positions (from 1) for regexp_instr.
+pub fn charPos(s: &str, b: int): int { return charsBefore(s, b) + 1 }
+
+// ---- to_char, to_number, to_date and to_timestamp (PostgreSQL's
+// formatting.c, in the C locale)
+
+// A date or time's fields for to_char. year as the calendar's (0 is 1 BC);
+// for an interval its fields as they are.
+pub type Tm = value record {
+    pub year: int
+    pub mon: int
+    pub mday: int
+    pub hour: int
+    pub min: int
+    pub sec: int
+    pub us: int
+    pub days: int           // since 2000-01-01
+    pub interval: bool
+    pub tz: bool            // a timestamptz: TZ is UTC
+}
+
+fn fdiv(a: int, b: int): int { return floorDiv(a, b) }
+fn fmod(a: int, b: int): int { return a - floorDiv(a, b) * b }
+
+// A timestamp's (local microseconds since 2000) fields; a date's at midnight.
+pub fn tmOfTs(local: int, tz: bool): Tm {
+    let days = fdiv(local, lexdb_time.DAY_US)
+    let tod = fmod(local, lexdb_time.DAY_US)
+    let d = lexdb_time.dateOf(days)
+    let s = tod / 1000000
+    return Tm{year: d.year, mon: d.month, mday: d.day, hour: s / 3600, min: s / 60 % 60, sec: s % 60, us: tod % 1000000,
+              days: days, interval: false, tz: tz}
+}
+
+pub fn tmOfIval(v: &lexdb_time.Ival): Tm {
+    let s = v.us / 1000000
+    return Tm{year: v.months / 12, mon: v.months % 12, mday: v.days, hour: s / 3600, min: s / 60 % 60, sec: s % 60,
+              us: v.us % 1000000, days: 0, interval: true, tz: false}
+}
+
+const MONTHS: []str = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October",
+                       "November", "December"]
+const DAYS: []str = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+const RM_UP: []str = ["I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X", "XI", "XII"]
+
+// The date and time patterns, in PostgreSQL's order: the first that
+// matches at a place is taken (so the longer before the shorter).
+const DCH: []str = ["A.D.", "A.M.", "AD", "AM", "B.C.", "BC", "CC", "DAY", "DDD", "DD", "DY", "Day", "Dy", "D", "FF1", "FF2",
+                    "FF3", "FF4", "FF5", "FF6", "FX", "HH24", "HH12", "HH", "IDDD", "ID", "IW", "IYYY", "IYY", "IY", "I", "J",
+                    "MI", "MM", "MONTH", "MON", "MS", "Month", "Mon", "OF", "P.M.", "PM", "Q", "RM", "SSSSS", "SSSS", "SS",
+                    "TZH", "TZM", "TZ", "US", "WW", "W", "Y,YYY", "YYYY", "YYY", "YY", "Y", "a.d.", "a.m.", "ad", "am",
+                    "b.c.", "bc", "cc", "day", "ddd", "dd", "dy", "d", "ff1", "ff2", "ff3", "ff4", "ff5", "ff6", "fx",
+                    "hh24", "hh12", "hh", "iddd", "id", "iw", "iyyy", "iyy", "iy", "i", "j", "mi", "mm", "month", "mon",
+                    "ms", "of", "p.m.", "pm", "q", "rm", "sssss", "ssss", "ss", "tzh", "tzm", "tz", "us", "ww", "w",
+                    "y,yyy", "yyyy", "yyy", "yy", "y"]
+
+// The patterns whose case is their output's: the rest are one pattern in
+// either case.
+fn dchCanon(k: &str): str {
+    match k {
+        "DAY", "Day", "day", "DY", "Dy", "dy", "MONTH", "Month", "month", "MON", "Mon", "mon", "A.D.", "a.d.", "AD", "ad",
+        "A.M.", "a.m.", "AM", "am", "B.C.", "b.c.", "BC", "bc", "P.M.", "p.m.", "PM", "pm", "RM", "rm", "TZ", "tz" { return k.toStr() }
+        else { return strings.toUpperAscii(k.toStr()) }
+    }
+}
+
+// A format's pieces: a pattern (with FM and TH) or literal text.
+type FmtNode = value record {
+    key: str                // "" for literal text
+    lit: str
+    fm: bool
+    th: int                 // 0 none, 1 TH, 2 th
+}
+
+fn startsAt(f: &str, i: int, k: &str): bool {
+    if i + len(k) > len(f) { return false }
+    for j in 0..len(k) { if f[i + j] != k[j] { return false } }
+    return true
+}
+
+fn parseDch(f: &str, keys: &[str], num: bool): []FmtNode {
+    var out: []FmtNode = []
+    var i = 0
+    let n = len(f)
+    while i < n {
+        var fm = false
+        // prefixes: FM, and FX and TM (read, not used)
+        while true {
+            if startsAt(f, i, &"FM") || startsAt(f, i, &"fm") {
+                fm = true
+                i += 2
+            } else if !num && (startsAt(f, i, &"TM") || startsAt(f, i, &"tm") || startsAt(f, i, &"FX") || startsAt(f, i, &"fx")) {
+                i += 2
+            } else {
+                break
+            }
+        }
+        if i >= n { break }
+        var key = ""
+        for k in keys {
+            if startsAt(f, i, &k) {
+                key = k
+                break
+            }
+        }
+        if len(key) > 0 {
+            i += len(key)
+            var th = 0
+            if !num {
+                if startsAt(f, i, &"TH") {
+                    th = 1
+                    i += 2
+                } else if startsAt(f, i, &"th") {
+                    th = 2
+                    i += 2
+                } else if startsAt(f, i, &"SP") || startsAt(f, i, &"sp") {
+                    i += 2
+                }
+            }
+            append(mut &out, FmtNode{key: if num { key } else { dchCanon(&key) }, lit: "", fm: fm, th: th})
+            continue
+        }
+        if f[i] == '"' {
+            // quoted text, \ escaping within
+            var b = newStrBuf()
+            i += 1
+            while i < n && f[i] != '"' {
+                if f[i] == '\\' && i + 1 < n { i += 1 }
+                b.addByte(f[i])
+                i += 1
+            }
+            i += 1
+            append(mut &out, FmtNode{key: "", lit: b.toStr(), fm: false, th: 0})
+            continue
+        }
+        if f[i] == '\\' && i + 1 < n && f[i + 1] == '"' {
+            append(mut &out, FmtNode{key: "", lit: "\"", fm: false, th: 0})
+            i += 2
+            continue
+        }
+        let sz = strings.decodeAt(f.toStr(), i).size
+        append(mut &out, FmtNode{key: "", lit: f[i..i + sz].toStr(), fm: false, th: 0})
+        i += sz
+    }
+    return out
+}
+
+// 1ST 2ND 3RD 4TH 11TH: the suffix for a number's text.
+fn ordSuffix(num: &str, upper: bool): str {
+    if len(num) == 0 { return "" }
+    var last = num[len(num) - 1]
+    if len(num) > 1 && num[len(num) - 2] == '1' { last = '0' }
+    let s = if last == '1' { "st" } else if last == '2' { "nd" } else if last == '3' { "rd" } else { "th" }
+    return if upper { strings.toUpperAscii(s) } else { s }
+}
+
+fn zpad(n: int, w: int, fm: bool): str {
+    if fm || w <= 0 { return n.toStr() }
+    if n < 0 { return "-" + strings.padLeft((-n).toStr(), w - 1, '0') }
+    return strings.padLeft(n.toStr(), w, '0')
+}
+
+fn rpadTo(s: &str, w: int, fm: bool): str {
+    if fm { return s.toStr() }
+    return strings.padRight(s.toStr(), w, ' ')
+}
+
+fn daysOfYmd(y: int, m: int, d: int): int { return lexdb_time.daysOf(time.Date{year: y, month: m, day: d}) }
+
+// to_char of a date, time, timestamp or interval.
+pub fn toCharTm(t: &Tm, f: &str): str {
+    var b = newStrBuf()
+    let wday = fmod(t.days + 6, 7)                   // 2000-01-01 was a Saturday; Sunday 0
+    let yday = t.days - daysOfYmd(t.year, 1, 1) + 1
+    let isodow = if wday == 0 { 7 } else { wday }
+    let thu = t.days + 4 - isodow
+    let isoYear = lexdb_time.dateOf(thu).year
+    let isoWeek = (thu - daysOfYmd(isoYear, 1, 1)) / 7 + 1
+    let adj = if t.interval { t.year } else if t.year <= 0 { 1 - t.year } else { t.year }
+    let isoAdj = if t.interval { isoYear } else if isoYear <= 0 { 1 - isoYear } else { isoYear }
+    for nd in parseDch(f, DCH, false) {
+        if len(nd.key) == 0 {
+            b.add(nd.lit)
+            continue
+        }
+        let fm = nd.fm
+        var s = ""
+        var numeric = true
+        match nd.key {
+            "A.D.", "B.C." { s = if t.year <= 0 { "B.C." } else { "A.D." }; numeric = false }
+            "a.d.", "b.c." { s = if t.year <= 0 { "b.c." } else { "a.d." }; numeric = false }
+            "AD", "BC" { s = if t.year <= 0 { "BC" } else { "AD" }; numeric = false }
+            "ad", "bc" { s = if t.year <= 0 { "bc" } else { "ad" }; numeric = false }
+            "A.M.", "P.M." { s = if t.hour % 24 >= 12 { "P.M." } else { "A.M." }; numeric = false }
+            "a.m.", "p.m." { s = if t.hour % 24 >= 12 { "p.m." } else { "a.m." }; numeric = false }
+            "AM", "PM" { s = if t.hour % 24 >= 12 { "PM" } else { "AM" }; numeric = false }
+            "am", "pm" { s = if t.hour % 24 >= 12 { "pm" } else { "am" }; numeric = false }
+            "HH", "HH12" { s = zpad(if t.hour % 12 == 0 { 12 } else { t.hour % 12 }, 2, fm) }
+            "HH24" { s = zpad(t.hour, 2, fm) }
+            "MI" { s = zpad(t.min, 2, fm) }
+            "SS" { s = zpad(t.sec, 2, fm) }
+            "MS" { s = zpad(t.us / 1000, 3, fm) }
+            "US" { s = zpad(t.us, 6, fm) }
+            "FF1", "FF2", "FF3", "FF4", "FF5", "FF6" {
+                let k = int(nd.key[2] - '0')
+                var d = t.us
+                for x in 0..6 - k { d = d / 10 }
+                s = zpad(d, k, fm)
+            }
+            "SSSS", "SSSSS" { s = (t.hour * 3600 + t.min * 60 + t.sec).toStr() }
+            "TZ", "tz" {
+                numeric = false
+                if t.tz { s = if nd.key == "TZ" { "UTC" } else { "utc" } }
+            }
+            "TZH" { s = "+00"; numeric = false }
+            "TZM" { s = "00" }
+            "OF" { s = if fm { "+0" } else { "+00" }; numeric = false }
+            "Y,YYY" { s = (adj / 1000).toStr() + "," + strings.padLeft((adj % 1000).toStr(), 3, '0') }
+            "YYYY" { s = zpad(adj, 4, fm) }
+            "YYY" { s = zpad(adj % 1000, 3, fm) }
+            "YY" { s = zpad(adj % 100, 2, fm) }
+            "Y" { s = zpad(adj % 10, 1, fm) }
+            "IYYY" { s = zpad(isoAdj, 4, fm) }
+            "IYY" { s = zpad(isoAdj % 1000, 3, fm) }
+            "IY" { s = zpad(isoAdj % 100, 2, fm) }
+            "I" { s = zpad(isoAdj % 10, 1, fm) }
+            "CC" {
+                let c = if t.interval { t.year / 100 } else if t.year > 0 { (t.year - 1) / 100 + 1 } else { t.year / 100 - 1 }
+                s = if c <= 99 && c >= -99 { zpad(c, if c >= 0 { 2 } else { 3 }, fm) } else { c.toStr() }
+            }
+            "MONTH", "Month", "month", "MON", "Mon", "mon", "RM", "rm" {
+                numeric = false
+                if t.mon >= 1 && t.mon <= 12 {
+                    let full = MONTHS[t.mon - 1]
+                    if nd.key == "MONTH" { s = rpadTo(&strings.toUpperAscii(full), 9, fm) }
+                    else if nd.key == "Month" { s = rpadTo(&full, 9, fm) }
+                    else if nd.key == "month" { s = rpadTo(&strings.toLowerAscii(full), 9, fm) }
+                    else if nd.key == "MON" { s = strings.toUpperAscii(full[0..3].toStr()) }
+                    else if nd.key == "Mon" { s = full[0..3].toStr() }
+                    else if nd.key == "mon" { s = strings.toLowerAscii(full[0..3].toStr()) }
+                    else if nd.key == "RM" { s = rpadTo(&RM_UP[t.mon - 1], 4, fm) }
+                    else { s = rpadTo(&strings.toLowerAscii(RM_UP[t.mon - 1]), 4, fm) }
+                }
+            }
+            "DAY", "Day", "day", "DY", "Dy", "dy" {
+                numeric = false
+                let full = DAYS[wday]
+                if nd.key == "DAY" { s = rpadTo(&strings.toUpperAscii(full), 9, fm) }
+                else if nd.key == "Day" { s = rpadTo(&full, 9, fm) }
+                else if nd.key == "day" { s = rpadTo(&strings.toLowerAscii(full), 9, fm) }
+                else if nd.key == "DY" { s = strings.toUpperAscii(full[0..3].toStr()) }
+                else if nd.key == "Dy" { s = full[0..3].toStr() }
+                else { s = strings.toLowerAscii(full[0..3].toStr()) }
+            }
+            "MM" { s = zpad(t.mon, 2, fm) }
+            "DDD" { s = zpad(yday, 3, fm) }
+            "IDDD" { s = zpad((isoWeek - 1) * 7 + isodow, 3, fm) }
+            "DD" { s = zpad(t.mday, 2, fm) }
+            "D" { s = (wday + 1).toStr() }
+            "ID" { s = isodow.toStr() }
+            "WW" { s = zpad((yday - 1) / 7 + 1, 2, fm) }
+            "IW" { s = zpad(isoWeek, 2, fm) }
+            "W" { s = ((t.mday - 1) / 7 + 1).toStr() }
+            "Q" {
+                if t.mon >= 1 { s = ((t.mon - 1) / 3 + 1).toStr() } else { numeric = false }
+            }
+            "J" { s = (t.days + 2451545).toStr() }
+            else { numeric = false }
+        }
+        b.add(s)
+        if nd.th > 0 && numeric && len(s) > 0 { b.add(ordSuffix(&s, nd.th == 1)) }
+    }
+    return b.toStr()
+}
+
+// ---- to_char of a number
+
+const NUMK: []str = [",", ".", "0", "9", "B", "C", "D", "E", "FM", "G", "L", "MI", "PL", "PR", "RN", "SG", "SP", "S", "TH", "V",
+                     "b", "c", "d", "e", "fm", "g", "l", "mi", "pl", "pr", "rn", "sg", "sp", "s", "th", "v"]
+
+// A number format, read (PostgreSQL's NUMDesc).
+type NumDesc = record {
+    pre: int
+    post: int
+    decimal: bool
+    zero: bool
+    zeroStart: int
+    zeroEnd: int
+    fill: bool
+    lsign: int              // 0 none, 1 before, 2 after
+    preLsign: int
+    bracket: bool
+    minus: bool
+    plus: bool
+    roman: bool
+    multi: int
+    hasMulti: bool
+    eeee: bool
+    nodes: []FmtNode
+}
+
+fn fmtErr(msg: &str): DbErr { return e("42601", msg.toStr()) }
+
+fn numDesc(f: &str): Result[NumDesc, DbErr] {
+    var d = NumDesc{pre: 0, post: 0, decimal: false, zero: false, zeroStart: 0, zeroEnd: 0, fill: false, lsign: 0, preLsign: 0,
+                    bracket: false, minus: false, plus: false, roman: false, multi: 0, hasMulti: false, eeee: false, nodes: []}
+    // EEEE is read as one pattern
+    var nodes: []FmtNode = []
+    var i = 0
+    while i < len(f) {
+        if startsAt(f, i, &"EEEE") || startsAt(f, i, &"eeee") {
+            append(mut &nodes, FmtNode{key: "EEEE", lit: "", fm: false, th: 0})
+            i += 4
+            continue
+        }
+        var j = i
+        while j < len(f) && !startsAt(f, j, &"EEEE") && !startsAt(f, j, &"eeee") { j += 1 }
+        for nd in parseDch(&f[i..j], NUMK, true) { append(mut &nodes, nd) }
+        i = j
+    }
+    for nd in nodes {
+        if nd.fm { d.fill = true }
+        let k = strings.toUpperAscii(nd.key)
+        if len(k) > 0 && d.eeee && k != "FM" { return Err(fmtErr(&"\"EEEE\" must be the last pattern used")) }
+        match k {
+            "9" {
+                if d.bracket { return Err(fmtErr(&"\"9\" must be ahead of \"PR\"")) }
+                if d.hasMulti { d.multi += 1 } else if d.decimal { d.post += 1 } else { d.pre += 1 }
+            }
+            "0" {
+                if d.bracket { return Err(fmtErr(&"\"0\" must be ahead of \"PR\"")) }
+                if !d.zero && !d.decimal {
+                    d.zero = true
+                    d.zeroStart = d.pre + 1
+                }
+                if !d.decimal { d.pre += 1 } else { d.post += 1 }
+                d.zeroEnd = d.pre + d.post
+            }
+            ".", "D" {
+                if d.decimal { return Err(fmtErr(&"multiple decimal points")) }
+                if d.hasMulti { return Err(fmtErr(&"cannot use \"V\" and decimal point together")) }
+                d.decimal = true
+            }
+            "FM" { d.fill = true }
+            "S" {
+                if d.lsign != 0 { return Err(fmtErr(&"cannot use \"S\" twice")) }
+                if d.plus || d.minus || d.bracket { return Err(fmtErr(&"cannot use \"S\" and \"PL\"/\"MI\"/\"SG\"/\"PR\" together")) }
+                if !d.decimal {
+                    d.lsign = 1
+                    d.preLsign = d.pre
+                } else {
+                    d.lsign = 2
+                }
+            }
+            "MI" {
+                if d.lsign != 0 { return Err(fmtErr(&"cannot use \"S\" and \"MI\" together")) }
+                d.minus = true
+            }
+            "PL" {
+                if d.lsign != 0 { return Err(fmtErr(&"cannot use \"S\" and \"PL\" together")) }
+                d.plus = true
+            }
+            "SG" {
+                if d.lsign != 0 { return Err(fmtErr(&"cannot use \"S\" and \"SG\" together")) }
+                d.minus = true
+                d.plus = true
+            }
+            "PR" {
+                if d.lsign != 0 || d.plus || d.minus { return Err(fmtErr(&"cannot use \"PR\" and \"S\"/\"PL\"/\"MI\"/\"SG\" together")) }
+                d.bracket = true
+            }
+            "RN" { d.roman = true }
+            "V" {
+                if d.decimal { return Err(fmtErr(&"cannot use \"V\" and decimal point together")) }
+                d.hasMulti = true
+            }
+            "EEEE" {
+                if d.eeee { return Err(fmtErr(&"cannot use \"EEEE\" twice")) }
+                if d.bracket || d.minus || d.plus || d.roman || d.hasMulti || d.lsign != 0 {
+                    return Err(fmtErr(&"\"EEEE\" is incompatible with other formats"))
+                }
+                d.eeee = true
+            }
+            else {}
+        }
+    }
+    d.nodes = nodes
+    return Ok(d)
+}
+
+fn roman(n: int): str {
+    let vals = [1000, 900, 500, 400, 100, 90, 50, 40, 10, 9, 5, 4, 1]
+    let syms = ["M", "CM", "D", "CD", "C", "XC", "L", "XL", "X", "IX", "V", "IV", "I"]
+    var b = newStrBuf()
+    var x = n
+    for i in 0..len(vals) {
+        while x >= vals[i] {
+            b.add(syms[i])
+            x -= vals[i]
+        }
+    }
+    return b.toStr()
+}
+
+// A number to format: its digits as numeric_out writes them (rounded to
+// the format's decimals), and its sign. ints: a whole number.
+pub type NumIn = value record {
+    pub text: str           // "12.50", "-3"; "NaN"
+    pub isFloat: bool
+    pub isReal: bool
+    pub fl: float
+}
+
+// to_char of a number (PostgreSQL's numeric_to_char, int8_to_char and
+// float8_to_char).
+pub fn toCharNum(v: &NumIn, f: &str): Result[str, DbErr] {
+    var d = try numDesc(f)
+    if d.roman {
+        // Roman numerals, of the value rounded to a whole number
+        var n = 0
+        if v.isFloat { n = int(v.fl.roundEven()) } else {
+            match Decimal.parse(v.text) {
+                Ok(x) { n = x.toInt(Rounding.HALF_AWAY).unwrapOr(0) }
+                Err(_) {}
+            }
+        }
+        let r = if n < 1 || n > 3999 { strings.repeat("#", 15) } else { roman(n) }
+        var b = newStrBuf()
+        for nd in d.nodes {
+            let k = nd.key
+            if k == "RN" { b.add(if d.fill { r } else { strings.padLeft(r, 15, ' ') }) }
+            else if k == "rn" { b.add(strings.toLowerAscii(if d.fill { r } else { strings.padLeft(r, 15, ' ') })) }
+            else if len(k) == 0 { b.add(nd.lit) }
+        }
+        return Ok(b.toStr())
+    }
+    var x = Decimal.zero()
+    var isNan = false
+    if v.isFloat {
+        if !v.fl.isFinite() { isNan = true }
+    } else {
+        match Decimal.parse(v.text) {
+            Ok(y) { x = y }
+            Err(_) { isNan = true }
+        }
+    }
+    if d.eeee {
+        var out = ""
+        if isNan {
+            out = " " + strings.repeat("#", d.pre + d.post + 5)
+            out = out[0..d.pre + 1].toStr() + "." + out[d.pre + 2..len(out)].toStr()
+        } else {
+            let sci = if v.isFloat { sciFloat(v.fl, d.post) } else { sciNum(&x, d.post) }
+            out = if sci[0] == '-' { sci } else { " " + sci }
+        }
+        return Ok(out)
+    }
+    var sign = '+'
+    var numstr = ""
+    var post = d.post
+    if v.isFloat {
+        var val = v.fl
+        if d.hasMulti {
+            val = val * 10.0f.pow(float(d.multi))
+            d.pre += d.multi
+        }
+        let maxDig = if v.isReal { 6 } else { 15 }
+        let preLen = len(floatFixed(val.abs(), 0))
+        if preLen >= maxDig { post = 0 } else if preLen + post > maxDig { post = maxDig - preLen }
+        let s = floatFixed(val, post)
+        if s[0] == '-' {
+            sign = '-'
+            numstr = s[1..len(s)].toStr()
+        } else {
+            numstr = s
+        }
+    } else {
+        if d.hasMulti {
+            x = x.mul(Decimal.parse("1" + strings.repeat("0", d.multi)).unwrap())
+            d.pre += d.multi
+        }
+        let r = try decRound(x, post)
+        let s = r.toStr()
+        if s[0] == '-' {
+            sign = '-'
+            numstr = s[1..len(s)].toStr()
+        } else {
+            numstr = s
+        }
+    }
+    let dot = strings.indexOf(&numstr, ".", 0)
+    let preLen = if dot >= 0 { dot } else { len(numstr) }
+    var outPre = 0
+    if preLen < d.pre {
+        outPre = d.pre - preLen
+    } else if preLen > d.pre {
+        numstr = strings.repeat("#", d.pre) + "." + strings.repeat("#", post)
+    }
+    d.post = post
+    return Ok(numProcess(mut &d, &numstr, sign, outPre))
+}
+
+// The digits of a float to p decimals, as C's printf("%.*f") rounds the
+// float's exact value (half to even only on an exact tie).
+pub fn floatFixed(x: float, p: int): str {
+    let s = math.fixed(x, p + 1)          // one more digit, from the shortest form
+    // the shortest form's digits past p
+    let sh = x.abs().toStr()
+    var digs = math.fixed(x.abs(), 30)
+    // a tie in the shortest form: its digits stop at p + 1 with a 5
+    let dot = strings.indexOf(&digs, ".", 0)
+    var last = len(digs) - 1
+    while last > dot && digs[last] == '0' { last -= 1 }
+    let decs = last - dot
+    if decs == p + 1 && digs[last] == '5' {
+        let c = cmpExact(x.abs(), &digs[0..last + 1].toStr())
+        if c != 0 {
+            // not a tie: away from the shortest form's 5, as the exact value lies
+            let trunc = digs[0..last].toStr()
+            var r = if c > 0 { incDecimal(&trunc) } else { trunc }
+            if r[len(r) - 1] == '.' { r = r[0..len(r) - 1].toStr() }
+            if x < 0.0f && !allZeroDigits(&r) { r = "-" + r }
+            return r
+        }
+    }
+    return math.fixed(x, p)
+}
+
+fn allZeroDigits(s: &str): bool {
+    for i in 0..len(s) { if s[i] != '0' && s[i] != '.' { return false } }
+    return true
+}
+
+// "12.34" + one in the last place.
+fn incDecimal(s: &str): str {
+    var bs = strToBytes(s.toStr())
+    var k = len(bs) - 1
+    while k >= 0 {
+        if bs[k] == '.' {
+            k -= 1
+            continue
+        }
+        if bs[k] == '9' {
+            bs[k] = '0'
+            k -= 1
+        } else {
+            bs[k] += 1
+            return strFromBytes(&bs)
+        }
+    }
+    return "1" + strFromBytes(&bs)
+}
+
+// The sign of x - d, d a decimal text ("12.345"), x > 0 finite; 0 when it
+// cannot be told in 128 bits (then taken as a tie).
+fn cmpExact(x: float, d: &str): int {
+    let bits = math.bitsOf(x)
+    let be = (bits >> 52) & 0x7ff
+    if be == 0 { return 0 }
+    let m = u128((bits & 0xfffffffffffff) | (1 << 52))
+    let e2 = be - 1075
+    let dot = strings.indexOf(d, ".", 0)
+    let k = if dot < 0 { 0 } else { len(d) - dot - 1 }
+    let digits = if dot < 0 { d.toStr() } else { d[0..dot].toStr() + d[dot + 1..len(d)].toStr() }
+    if len(digits) > 30 || k > 40 { return 0 }
+    var dv: u128 = 0
+    for i in 0..len(digits) { dv = dv * 10 + u128(int(digits[i] - '0')) }
+    // x = m 2^e2, d = dv 10^-k: compare m 5^k 2^(e2+k) with dv
+    var left = m
+    for i in 0..k {
+        if left > P19 * P18 { return 0 }
+        left = left * 5
+    }
+    var right = dv
+    let sh = e2 + k
+    if sh >= 0 {
+        if sh > 60 { return 1 }
+        for i in 0..sh {
+            if left > P19 * P18 { return 1 }
+            left = left * 2
+        }
+    } else {
+        for i in 0..(-sh) {
+            if right > P19 * P18 { return 0 }
+            right = right * 2
+        }
+    }
+    return if left > right { 1 } else if left < right { -1 } else { 0 }
+}
+
+// d.ddde+XX, post digits after the point (numeric_out_sci).
+fn sciNum(x: &Decimal, post: int): str {
+    if x.isZero() { return "0" + (if post > 0 { "." + strings.repeat("0", post) } else { "" }) + "e+00" }
+    var ex = dweight(x)
+    // x / 10^ex rounded to post decimals; it may round up to 10
+    let h = hpOfDec(x)
+    var m = Hp{neg: false, m: h.m, e: h.e - ex}
+    var r = hpDec(m, post).unwrapOr(Decimal.zero())
+    if r.cmp(&Decimal.fromInt(10)) >= 0 {
+        ex += 1
+        m = Hp{neg: false, m: h.m, e: h.e - ex}
+        r = hpDec(m, post).unwrapOr(Decimal.zero())
+    }
+    let es = if ex < 0 { "-" + strings.padLeft((-ex).toStr(), 2, '0') } else { "+" + strings.padLeft(ex.toStr(), 2, '0') }
+    return (if x.isNeg() { "-" } else { "" }) + r.toStr() + "e" + es
+}
+
+fn sciFloat(x: float, post: int): str {
+    match math.toDecimal(x) {
+        Some(d) { return sciNum(&d, post) }
+        None { return "0e+00" }
+    }
+}
+
+// PostgreSQL's NUM_processor, writing: numstr the digits ("12.50", "#.##"),
+// sign '+' or '-', outPre the digit places before the number's.
+fn numProcess(d: mut &NumDesc, numstr: &str, sign: byte, outPre: int): str {
+    var out = newStrBuf()
+    var signWrote = false
+    if d.plus || d.minus {
+        signWrote = !(d.plus && !d.minus)
+    } else {
+        if sign != '-' && d.fill { d.bracket = false }
+        signWrote = sign == '+' && d.fill && d.lsign == 0
+        if d.lsign == 1 && d.pre == d.preLsign { d.lsign = 2 }
+    }
+    var numCount = d.post + d.pre - 1
+    var lastRel = -1                     // an index into numstr; -1 none
+    if d.fill && d.decimal {
+        let dp = strings.indexOf(numstr, ".", 0)
+        if dp >= 0 {
+            lastRel = dp
+            for i in dp + 1..len(numstr) { if numstr[i] != '0' { lastRel = i } }
+            if d.zeroEnd > outPre {
+                var lz = len(numstr) - 1
+                if d.zeroEnd - outPre < lz { lz = d.zeroEnd - outPre }
+                if lastRel < lz { lastRel = lz }
+            }
+        }
+    }
+    if !signWrote && outPre == 0 { numCount += 1 }
+    let zeroStart = if d.zeroStart > 0 { d.zeroStart - 1 } else { 0 }
+    var numCurr = 0
+    var numIn = false
+    var np = 0                           // the place in numstr
+    let n = len(numstr)
+    for nd in d.nodes {
+        let k = strings.toUpperAscii(nd.key)
+        if len(nd.key) == 0 {
+            out.add(nd.lit)
+            continue
+        }
+        if k == "9" || k == "0" || k == "." || k == "D" {
+            let predecSpace = !d.zero && np == 0 && n > 0 && numstr[0] == '0' && d.post != 0
+            // the sign, before the first digit written
+            if !signWrote && (numCurr >= outPre || (d.zero && zeroStart == numCurr)) &&
+               (!predecSpace || (lastRel >= 0 && numstr[lastRel] == '.')) {
+                if d.lsign != 0 {
+                    if d.lsign == 1 {
+                        out.addByte(if sign == '-' { '-' } else { '+' })
+                        signWrote = true
+                    }
+                } else if d.bracket {
+                    out.addByte(if sign == '+' { ' ' } else { '<' })
+                    signWrote = true
+                } else if sign == '+' {
+                    if !d.fill { out.addByte(' ') }
+                    signWrote = true
+                } else {
+                    out.addByte('-')
+                    signWrote = true
+                }
+            }
+            if numCurr < outPre && (zeroStart > numCurr || !d.zero) {
+                if !d.fill { out.addByte(' ') }
+            } else if d.zero && numCurr < outPre && zeroStart <= numCurr {
+                out.addByte('0')
+                numIn = true
+            } else {
+                if np < n && numstr[np] == '.' {
+                    if lastRel < 0 || numstr[lastRel] != '.' { out.addByte('.') }
+                    else if d.fill { out.addByte('.') }
+                } else {
+                    if lastRel >= 0 && np > lastRel && k != "0" {
+                    } else if predecSpace {
+                        if !d.fill { out.addByte(' ') }
+                        else if lastRel >= 0 && numstr[lastRel] == '.' { out.addByte('0') }
+                    } else if np < n {
+                        out.addByte(numstr[np])
+                        numIn = true
+                    }
+                }
+                if np < n { np += 1 }
+            }
+            var end = numCount + (if outPre > 0 { 1 } else { 0 }) + (if d.decimal { 1 } else { 0 })
+            if lastRel >= 0 && lastRel == np { end = numCurr }
+            if numCurr + 1 == end {
+                if signWrote && d.bracket { out.addByte(if sign == '+' { ' ' } else { '>' }) }
+                else if d.lsign == 2 { out.addByte(if sign == '-' { '-' } else { '+' }) }
+            }
+            numCurr += 1
+            continue
+        }
+        if k == "," || k == "G" {
+            if !numIn {
+                if !d.fill { out.addByte(' ') }
+            } else {
+                out.addByte(',')
+            }
+            continue
+        }
+        if k == "L" {
+            out.addByte(' ')                // the C locale's currency symbol
+            continue
+        }
+        if k == "TH" {
+            if (n > 0 && numstr[0] == '#') || sign == '-' || d.decimal { continue }
+            out.add(ordSuffix(numstr, nd.key == "TH"))
+            continue
+        }
+        if k == "MI" {
+            if sign == '-' { out.addByte('-') } else if !d.fill { out.addByte(' ') }
+            continue
+        }
+        if k == "PL" {
+            if sign == '+' { out.addByte('+') } else if !d.fill { out.addByte(' ') }
+            continue
+        }
+        if k == "SG" {
+            out.addByte(sign)
+            continue
+        }
+    }
+    return out.toStr()
+}
+
+// ---- to_number
+
+// to_number(text, format): the digits, sign and point read where the
+// format has them.
+pub fn toNumber(s: &str, f: &str): Result[Decimal, DbErr] {
+    let d = try numDesc(f)
+    var digits = newStrBuf()
+    var neg = false
+    var seenDot = false
+    var post = 0
+    var i = 0
+    let n = len(s)
+    for nd in d.nodes {
+        let k = strings.toUpperAscii(nd.key)
+        if len(nd.key) == 0 {
+            if i < n { i += strings.decodeAt(s.toStr(), i).size }
+            continue
+        }
+        if k == "9" || k == "0" {
+            // a digit place: skip blanks and a sign before the first digit
+            while i < n && (s[i] == ' ' || ((s[i] == '-' || s[i] == '+' || s[i] == '<') && len(digits.toStr()) == 0 && !seenDot)) {
+                if s[i] == '-' || s[i] == '<' { neg = true }
+                i += 1
+            }
+            if i < n && s[i] >= '0' && s[i] <= '9' {
+                digits.addByte(s[i])
+                if seenDot { post += 1 }
+                i += 1
+            }
+            continue
+        }
+        if k == "." || k == "D" {
+            while i < n && (s[i] == ' ' || s[i] == '-' || s[i] == '+') {
+                if s[i] == '-' { neg = true }
+                i += 1
+            }
+            if i < n && s[i] == '.' {
+                i += 1
+            }
+            seenDot = true
+            continue
+        }
+        if k == "," || k == "G" {
+            if i < n && s[i] == ',' { i += 1 }
+            continue
+        }
+        if k == "S" || k == "MI" || k == "PL" || k == "SG" || k == "PR" {
+            while i < n && s[i] == ' ' { i += 1 }
+            if i < n && (s[i] == '-' || s[i] == '+' || s[i] == '<' || s[i] == '>') {
+                if s[i] == '-' || s[i] == '<' { neg = true }
+                i += 1
+            }
+            continue
+        }
+        if k == "L" {
+            // a currency symbol: whatever is there before the number
+            while i < n && !(s[i] >= '0' && s[i] <= '9') && s[i] != '.' && s[i] != ',' && s[i] != '-' && s[i] != '+' { i += 1 }
+            continue
+        }
+    }
+    let ds = digits.toStr()
+    if len(ds) == 0 { return Err(e("22P02", "invalid input syntax for type numeric: \" \"")) }
+    let txt = (if neg { "-" } else { "" }) + ds[0..len(ds) - post].toStr() + (if len(ds) - post == 0 { "0" } else { "" }) +
+              (if post > 0 { "." + ds[len(ds) - post..len(ds)].toStr() } else { "" })
+    match Decimal.parse(txt) {
+        Ok(x) {
+            if d.hasMulti { return decRound(x.div(Decimal.parse("1" + strings.repeat("0", d.multi)).unwrap(), post + d.multi, Rounding.HALF_AWAY).unwrapOr(x), post + d.multi) }
+            return Ok(x)
+        }
+        Err(_) { return Err(e("22P02", "invalid input syntax for type numeric")) }
+    }
+}
+
+// ---- to_date and to_timestamp
+
+// The fields to_date and to_timestamp read.
+pub type Parsed = value record {
+    pub year: int           // the calendar's: 0 is 1 BC; MIN_YEAR none
+    pub mon: int
+    pub mday: int
+    pub hour: int
+    pub min: int
+    pub sec: int
+    pub us: int
+    pub pm: int             // 0 none, 1 AM, 2 PM
+    pub yday: int           // DDD, 0 none
+    pub julian: int         // J, -1 none
+    pub bc: bool
+    pub tzoff: int          // seconds east, from TZH and TZM
+}
+
+fn bad(f: &str): DbErr { return e("22007", f.toStr()) }
+
+fn skipSpaces(s: &str, i: mut &int) { while i < len(s) && s[i] == ' ' { i += 1 } }
+
+// Up to max digits (max 0: as many as there are), with a sign if signed.
+fn readNum(s: &str, i: mut &int, max: int, signed: bool, what: &str): Result[int, DbErr] {
+    skipSpaces(s, i)
+    var neg = false
+    if signed && i < len(s) && (s[i] == '-' || s[i] == '+') {
+        neg = s[i] == '-'
+        i += 1
+    }
+    let start: int = i + 0
+    var v = 0
+    while i < len(s) && s[i] >= '0' && s[i] <= '9' && (max == 0 || i - start < max) {
+        if v > 100000000000 { return Err(e("22008", "value for \"" + what + "\" in source string is out of range")) }
+        v = v * 10 + int(s[i] - '0')
+        i += 1
+    }
+    if i == start {
+        return Err(e("22007", "invalid value \"" + (if start < len(s) { s[start..len(s)].toStr() } else { "" }) + "\" for \"" + what + "\""))
+    }
+    return Ok(if neg { -v } else { v })
+}
+
+fn readName(s: &str, i: mut &int, names: &[str], short: bool, what: &str): Result[int, DbErr] {
+    skipSpaces(s, i)
+    for k in 0..len(names) {
+        let nm = if short { names[k][0..3].toStr() } else { names[k] }
+        if i + len(nm) <= len(s) && strings.toLowerAscii(s[i..i + len(nm)].toStr()) == strings.toLowerAscii(nm) {
+            i += len(nm)
+            return Ok(k)
+        }
+    }
+    return Err(e("22007", "invalid value \"" + (if i < len(s) { s[i..len(s)].toStr() } else { "" }) + "\" for \"" + what + "\""))
+}
+
+fn isDigitAt(s: &str, i: int): bool { return i < len(s) && s[i] >= '0' && s[i] <= '9' }
+
+// Reads s by format f (PostgreSQL's DCH_from_char, not in FX mode: a
+// separator in the format matches any one in the text, spaces are skipped).
+pub fn parseDate(s: &str, f: &str): Result[Parsed, DbErr] {
+    var p = Parsed{year: -2147483648, mon: 0, mday: 0, hour: 0, min: 0, sec: 0, us: 0, pm: 0, yday: 0, julian: -1, bc: false, tzoff: 0}
+    let nodes = parseDch(f, DCH, false)
+    var i = 0
+    for k in 0..len(nodes) {
+        let nd = &nodes[k]
+        // a field followed straight by another reads its width only
+        let tight = k + 1 < len(nodes) && len(nodes[k + 1].key) > 0
+        if len(nd.key) == 0 {
+            // literal text: a space skips spaces; anything else one character
+            if nd.lit == " " {
+                skipSpaces(s, mut &i)
+            } else if i < len(s) && !isDigitAt(s, i) {
+                i += strings.decodeAt(s.toStr(), i).size
+            }
+            continue
+        }
+        match nd.key {
+            "YYYY", "IYYY" { p.year = try readNum(s, mut &i, if tight { 4 } else { 0 }, false, &nd.key) }
+            "Y,YYY" {
+                let a = try readNum(s, mut &i, 0, false, &nd.key)
+                if i < len(s) && s[i] == ',' { i += 1 }
+                let b = try readNum(s, mut &i, 3, false, &nd.key)
+                p.year = a * 1000 + b
+            }
+            "YYY", "IYY" {
+                let y = try readNum(s, mut &i, 3, false, &nd.key)
+                p.year = if y < 100 { y + 2000 } else { y + 1000 }
+            }
+            "YY", "IY" {
+                let y = try readNum(s, mut &i, 2, false, &nd.key)
+                p.year = if y < 70 { y + 2000 } else { y + 1900 }
+            }
+            "Y", "I" { p.year = 2000 + try readNum(s, mut &i, 1, false, &nd.key) }
+            "MM" { p.mon = try readNum(s, mut &i, 2, false, &nd.key) }
+            "DD" { p.mday = try readNum(s, mut &i, 2, false, &nd.key) }
+            "DDD", "IDDD" { p.yday = try readNum(s, mut &i, 3, false, &nd.key) }
+            "D", "ID" { let x = try readNum(s, mut &i, 1, false, &nd.key) }
+            "W", "Q" { let x = try readNum(s, mut &i, 1, false, &nd.key) }
+            "WW", "IW" { let x = try readNum(s, mut &i, 2, false, &nd.key) }
+            "CC" { let x = try readNum(s, mut &i, 2, false, &nd.key) }
+            "J" { p.julian = try readNum(s, mut &i, 0, false, &nd.key) }
+            "HH", "HH12", "HH24" {
+                p.hour = try readNum(s, mut &i, 2, false, &nd.key)
+                if nd.key != "HH24" && (p.hour < 1 || p.hour > 12) {
+                    return Err(e("22007", "hour \"" + p.hour.toStr() + "\" is invalid for the 12-hour clock"))
+                }
+                if nd.key != "HH24" && p.pm == 0 { p.pm = 1 }
+            }
+            "MI" { p.min = try readNum(s, mut &i, 2, false, &nd.key) }
+            "SS" { p.sec = try readNum(s, mut &i, 2, false, &nd.key) }
+            "SSSS", "SSSSS" {
+                let x = try readNum(s, mut &i, 0, false, &nd.key)
+                p.hour = x / 3600
+                p.min = x / 60 % 60
+                p.sec = x % 60
+            }
+            "MS" {
+                let st = i
+                let x = try readNum(s, mut &i, 3, false, &nd.key)
+                var w = i - st
+                var v = x
+                while w < 3 {
+                    v = v * 10
+                    w += 1
+                }
+                p.us = v * 1000
+            }
+            "US", "FF1", "FF2", "FF3", "FF4", "FF5", "FF6" {
+                skipSpaces(s, mut &i)
+                let st = i
+                let x = try readNum(s, mut &i, 6, false, &nd.key)
+                var w = i - st
+                var v = x
+                while w < 6 {
+                    v = v * 10
+                    w += 1
+                }
+                p.us = v
+            }
+            "AM", "PM", "am", "pm", "A.M.", "P.M.", "a.m.", "p.m." {
+                skipSpaces(s, mut &i)
+                let rest = strings.toLowerAscii(s[i..len(s)].toStr())
+                let dotted = strings.contains(&nd.key, ".")
+                if strings.startsWith(&rest, if dotted { "a.m." } else { "am" }) { p.pm = 1 }
+                else if strings.startsWith(&rest, if dotted { "p.m." } else { "pm" }) { p.pm = 2 }
+                else { return Err(e("22007", "invalid value \"" + s[i..len(s)].toStr() + "\" for \"" + nd.key + "\"")) }
+                i += if dotted { 4 } else { 2 }
+            }
+            "AD", "BC", "ad", "bc", "A.D.", "B.C.", "a.d.", "b.c." {
+                skipSpaces(s, mut &i)
+                let rest = strings.toLowerAscii(s[i..len(s)].toStr())
+                let dotted = strings.contains(&nd.key, ".")
+                if strings.startsWith(&rest, if dotted { "b.c." } else { "bc" }) { p.bc = true }
+                else if !strings.startsWith(&rest, if dotted { "a.d." } else { "ad" }) {
+                    return Err(e("22007", "invalid value \"" + s[i..len(s)].toStr() + "\" for \"" + nd.key + "\""))
+                }
+                i += if dotted { 4 } else { 2 }
+            }
+            "MONTH", "Month", "month" { p.mon = 1 + try readName(s, mut &i, MONTHS, false, &nd.key) }
+            "MON", "Mon", "mon" { p.mon = 1 + try readName(s, mut &i, MONTHS, true, &nd.key) }
+            "RM", "rm" {
+                skipSpaces(s, mut &i)
+                var got = 0
+                var k2 = 11
+                while k2 >= 0 {
+                    let r = RM_UP[k2]
+                    if i + len(r) <= len(s) && strings.toUpperAscii(s[i..i + len(r)].toStr()) == r && got == 0 {
+                        got = k2 + 1
+                        i += len(r)
+                    }
+                    k2 -= 1
+                }
+                if got == 0 { return Err(e("22007", "invalid value for \"RM\"")) }
+                p.mon = got
+            }
+            "DAY", "Day", "day" { let x = try readName(s, mut &i, DAYS, false, &nd.key) }
+            "DY", "Dy", "dy" { let x = try readName(s, mut &i, DAYS, true, &nd.key) }
+            "TZH" {
+                skipSpaces(s, mut &i)
+                let neg = i < len(s) && s[i] == '-'
+                let h = try readNum(s, mut &i, 2, true, &nd.key)
+                p.tzoff = h * 3600
+                if neg && h == 0 { p.tzoff = -1 }
+            }
+            "TZM" {
+                let m = try readNum(s, mut &i, 2, false, &nd.key)
+                p.tzoff = if p.tzoff < 0 { p.tzoff - m * 60 + (if p.tzoff == -1 { 1 } else { 0 }) } else { p.tzoff + m * 60 }
+            }
+            "TZ", "tz", "OF" { return Err(e("0A000", "formatting field \"" + nd.key + "\" is only supported in to_char")) }
+            else {}
+        }
+    }
+    // the rest of the text: only spaces may be left
+    skipSpaces(s, mut &i)
+    if i < len(s) && len(nodes) > 0 {
+        // PostgreSQL ignores what is left after the format ends
+    }
+    return Ok(p)
+}
+
+// The date a parse names (days since 2000).
+pub fn parsedDate(p: &Parsed): Result[int, DbErr] {
+    if p.julian >= 0 { return Ok(p.julian - 2451545) }
+    var y = if p.year == -2147483648 { 0 } else { p.year }        // none: 1 BC, as PostgreSQL
+    if p.bc { y = 1 - y }
+    if p.yday > 0 && p.mon == 0 && p.mday == 0 {
+        let d0 = daysOfYmd(y, 1, 1)
+        let leap = time.isLeapYear(y)
+        if p.yday > (if leap { 366 } else { 365 }) { return Err(e("22008", "date/time field value out of range")) }
+        return Ok(d0 + p.yday - 1)
+    }
+    let m = if p.mon == 0 { 1 } else { p.mon }
+    let d = if p.mday == 0 { 1 } else { p.mday }
+    if m < 1 || m > 12 || d < 1 || d > time.daysInMonth(y, m) {
+        return Err(e("22008", "date/time field value out of range: \"" + y.toStr() + "-" + m.toStr() + "-" + d.toStr() + "\""))
+    }
+    return Ok(daysOfYmd(y, m, d))
+}
+
+// The time of day a parse names, in microseconds.
+pub fn parsedTime(p: &Parsed): Result[int, DbErr] {
+    var h = p.hour
+    if p.pm == 2 && h < 12 { h += 12 }
+    if p.pm == 1 && h == 12 { h = 0 }
+    if h > 24 || p.min > 59 || p.sec > 60 { return Err(e("22008", "date/time field value out of range")) }
+    return Ok(((h * 60 + p.min) * 60 + p.sec) * 1000000 + p.us)
+}
