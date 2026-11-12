@@ -1724,19 +1724,27 @@ set's earlier extension through a map instead of a scan.
 
 | Tables | Chain | Star | Rules mode |
 |---|---|---|---|
-| 12 | 133 | 401 | 51 |
-| 16 | 198 | 877 | 69 |
-| 24 | 365 | 2,904 | about 105 |
+| 12 | 131 | 326 | 51 |
+| 16 | 177 | 686 | 69 |
+| 24 | 310 | 2,238 | about 105 |
+
+(after the profile below; first measured 133, 401; 198, 877; 365, 2,904)
 
 Up to 12 tables this is faster than section 29 (chain 194, star 512),
 because the 2^n rows are no longer computed. The 24-table star is the
 costly shape. Its spokes all join the centre's key, so implied equalities
 link every pair (276 derived), and each of about 5,760 extensions costs a
-lookup estimate and a set's rows. A profile (`perf`, C build) showed no
-single hot spot left: the cost search is about a sixth of the run, set rows
-a tenth, and the rest is spread over allocation and name lookups. Two tries
-that changed little: checking implied equalities against a set of texts
-(3.2 to 3.0 ms), and copying only the kept orders (3.0 to 2.9 ms).
+lookup estimate and a set's rows. Two tries changed little: checking implied
+equalities against a set of texts (3.2 to 3.0 ms), and copying only the
+kept orders (3.0 to 2.9 ms). A profile of the native build (perf, with
+`LXL_NATIVE_MAP` giving the function names, design/native.md section 4)
+then found the cost: `levelOf` searched the query's columns by string
+compare (9% of the run), and each table's range estimate scanned every
+conjunct of the query (7%). The query now keeps its columns by name
+(`Query.colAt`, built for joins), and each table's estimates see only its
+own conditions: the 24-table star went from 2.9 to 2.2 ms, the 12-table
+star from 401 to 326 us. What is left is spread out: SQL parsing 16% of
+the run, set rows 12% (mostly the map's hashing), and lookup estimates 5%.
 
 **Plans.** The 24-table chain and star choose the expected orders: the
 filtered table by its index, then each table by lookup. The star hashes a
@@ -1746,7 +1754,7 @@ equalities repeat it. That is correct but wasteful, and not fixed.
 `exec_joincost`'s chain is now 20 tables, past the old bound, and its count
 matches the rules mode's.
 
-**Open (the user's call).** About 2.9 ms to plan a 24-table star, paid once
+**Open (the user's call).** About 2.2 ms to plan a 24-table star, paid once
 per prepared statement. If too much: a narrower N past 16 tables, or not
 deriving equalities between spokes that only meet at the centre.
 

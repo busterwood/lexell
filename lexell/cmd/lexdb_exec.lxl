@@ -4499,6 +4499,7 @@ pub type Query = record {
     corr: bool                  // a subquery of it is correlated
     refs: []Expr                // a subquery: the outer values it uses (in the outer query's terms)
     implied: bool               // its implied equalities were added (optimizer 27): a constant's equality is taken first
+    colAt: Map[str, int]        // cols by name, once its tables are read (levelOf's; a name missing: colIndex)
 }
 
 fn dotAt(s: &str): int {
@@ -4687,7 +4688,8 @@ fn (q: &Query) keyBefore(x: &Expr, k: int): bool { return q.maxLevel(x) < k }
 // The level whose columns hold name's (-1 none). Levels hold their columns
 // where FROM put them, whatever order they run in (join order, optimizer 25).
 fn (q: &Query) levelOf(name: &str): int {
-    let i = colIndex(&q.cols, name)
+    var i = q.colAt.getOr(name, -1)
+    if i < 0 { i = colIndex(&q.cols, name) }
     if i < 0 { return -1 }
     for j in 0..len(q.levels) {
         let f = q.levels[j].first
@@ -5708,11 +5710,20 @@ fn (q: &Query) costOrder(ms: &[][]Expr, lookups: bool, cap: float, perm: mut &[]
     var base: []Way = []                // each level by its constants alone
     for k in 0..nl {
         append(mut &cands, q.wayCands(k, &cs))
+        // its own conditions (no other table's columns)
+        var own: []Expr = []
+        var ownMasks: []int = []
+        for i in 0..len(cs) {
+            if masks[i] == (1 << k) {
+                append(mut &own, clone(&cs[i]))
+                append(mut &ownMasks, masks[i])
+            }
+        }
         // read by its constants; its rows: the table's, times the share its
         // own conditions keep (optimizer 29)
-        let w = q.wayInto(k, &cands[k], 0, false, &cs)
+        let w = q.wayInto(k, &cands[k], 0, false, &own)
         let t = float(q.levels[k].est.rows)
-        append(mut &base, Way{rows: fmax(t * q.localShare(k, &cs, &masks), 1.0f), cost: w.cost, outer: false})
+        append(mut &base, Way{rows: fmax(t * q.localShare(k, &own, &ownMasks), 1.0f), cost: w.cost, outer: false})
     }
     // the levels each level shares a conjunct with
     var adj: []int = array(nl, 0)
@@ -6400,7 +6411,7 @@ fn newLevel(t: Table, alias: str, join: int, first: int): Level {
 // (a SELECT's; UPDATE ... FROM and DELETE ... USING keep their target first).
 fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_sql.FromItem,
               where: &Option[Expr], params: &[]Val, subs: &[]lexdb_sql.Stmt, sc: mut &Scope, order: bool): Result[Query, DbErr] {
-    var q = Query{levels: [], cols: [], top: [], subs: [], base: sc.base, corr: false, refs: [], implied: false}
+    var q = Query{levels: [], cols: [], top: [], subs: [], base: sc.base, corr: false, refs: [], implied: false, colAt: newMap()}
     // this query's (its subqueries set their own)
     let early = sc.early
     sc.early = false
@@ -6607,6 +6618,8 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
         append(mut &q.subs, vp)
     }
     let nl = len(q.levels)
+    // the columns by name, for levelOf (the planner asks it often: optimizer 30)
+    if nl >= 2 { for i in 0..len(q.cols) { if !q.colAt.has(&q.cols[i].name) { q.colAt.put(q.cols[i].name.toStr(), i) } } }
     // A RIGHT or FULL JOIN can make the columns before it NULL: no WHERE
     // conjunct goes below the last one.
     var lastRight = -1
@@ -12105,7 +12118,7 @@ fn planSet(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
     let split = len(l.q.refs)
     let limit = try evalInt(&s.limit, params, "LIMIT", mut &sc.looks)
     let offset = try evalInt(&s.offset, params, "OFFSET", mut &sc.looks)
-    let q = Query{levels: [], cols: [], top: [], subs: [], base: sc.base, corr: false, refs: refs, implied: false}
+    let q = Query{levels: [], cols: [], top: [], subs: [], base: sc.base, corr: false, refs: refs, implied: false, colAt: newMap()}
     return Ok(Sel{q: q, exprs: [], outs: outs, groupBy: [], order: order, aggQ: false, sort: len(order) > 0, first: -1,
                   limit: limit, offset: offset, having: None, specs: [], distinct: false, desc: desc, nullsFirst: nullsFirst, parts: [l, r],
                   setop: s.setop, setAll: s.setAll, split: split, rec: if s.rec { s.cte } else { -1 }, srf: "", ordin: false,
