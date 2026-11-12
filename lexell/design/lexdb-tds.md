@@ -434,11 +434,51 @@ resolve the collation conflict between ... in the equal to operation").
   GROUP BY, DISTINCT, min, max, count(DISTINCT), UNION, INTERSECT, ORDER BY
   ties: the same answers. Over psql a TDS table is case-insensitive and a
   psql one exact; `'a' = 'A'` is false there.
-- **Not yet:** window PARTITION BY and a window's ORDER BY (exact); a join
-  on collated columns runs as a nested loop with the condition, not a hash
-  join; `IN (subquery)` and `= ANY (array)` compare exactly; a correlated
-  subquery's outer column has the session's default, not its own; NULLIF
-  and the string functions compare exactly; a key violation's message shows
-  the folded key (`(ann@x.org)`) where SQL Server shows the value. SQL
-  Server's order (accents, punctuation, `ß`) is the second part.
+- **Closed since:** window PARTITION BY and a window's ORDER BY go by keys;
+  a join on collated columns is a hash join on the key (`Level.hashKinds`;
+  or a key lookup when the other side is the key's column); `IN
+  (subquery)` keys its set under the comparison's collation (resolve
+  decides it, `Frame.subKinds`, endScope gives it to the `SubPlan`; the
+  hashed form too); a correlated subquery's outer column keeps its
+  collation (`#coll(param, name)`, implicit); NULLIF compares keys; a key
+  violation's message gives the value as written. Still exact: `= ANY
+  (array)` (T-SQL has no arrays) and the string functions (S3's).
+
+### L2's second part, SQL Server's order (2026-11-12)
+
+`ciKey` is SQL Server's order for SQL_Latin1_General_CP1_CI_AS on nvarchar
+(its Windows sort), from a table generated from the oracle:
+`tools/gen_sqlserver_collation.py` writes `cmd/lexdb_sqlcoll.lxl` and the
+test `tests/lexdb/run/exec_sqlcoll.lxl` (1500 random strings over Latin,
+Greek, Cyrillic, punctuation, dashes, quotes, ligatures and combining marks,
+in the oracle's order with its ties).
+
+- **What the oracle showed:** four kinds of character. Letters (and space,
+  punctuation, symbols, digits, which sort before the letters: space <
+  NBSP < `.` < `_` < digits) with a primary weight and, within it, a
+  secondary one (accents, but also `ª`, `ɐ`, circled letters: SQL Server's
+  own order of the variants of a letter, read from it as each one's rank).
+  Hyphen-like marks (`-`, `'`, soft hyphen, the dashes, Arabic vowel
+  marks): ignored by the letters, they break ties after the accents, by how
+  many letters come before them and then by their own order (`coop` <
+  `-coop` < `co'op` < `co-op` < `cOOp-` < `coöp`). Combining marks: an
+  accent on the letter before. And characters SQL Server's table does not
+  know (most of Latin Extended-B, much else): ignored, equal to nothing.
+  Expansions: `æ` = `ae`, `ß` = `ss`, `þ` = `th`, `œ`, `ĳ`, `ǆ` and the like.
+  Each character is ranked as c + 'a': a lone space is a trailing one.
+- **The key:** the primary weights (3 bytes each; a code point beyond the
+  BMP after all of them), 0 0 0, the secondary ones (2 bytes each), then
+  the hyphen-like marks (position, weight). A combining mark after a letter
+  composes with it where Unicode has the letter (`e` + U+0301 is `é`);
+  trailing spaces are dropped after ignored characters (`'Éå ẞ'` =
+  `'Éå'`). Checked: no difference from the oracle in 1500 + 4000 + 6000
+  random strings (equality and order). Left: a combining mark with no letter
+  before it to compose with (at the start, after punctuation) is placed
+  after its letter's variants, near but not where SQL Server puts it.
+- **Format:** the key of a case-insensitive column's index changed with it.
+  An index on such a column made with the first part's build (the commit
+  before) holds the old keys: drop and make it again (there is no release
+  with the first part).
+- LIKE under the collation folds case only (`#cifold`); SQL Server's
+  character matching under its weights (`'æ' LIKE 'ae'`) is not done.
 
