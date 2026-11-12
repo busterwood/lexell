@@ -941,6 +941,24 @@ fn (p: mut &P) name(): Result[str, lexdb_base.DbErr] {
 // A table's (or an index's) name: name or schema.name (qual).
 fn (p: mut &P) qname(): Result[str, lexdb_base.DbErr] {
     let first = try p.name()
+    if p.tsql {
+        // T-SQL: [db.][schema.]name, db..name; dbo is public (design/lexdb-tds.md L3)
+        var parts: []str = [first]
+        var spell = p.spelled
+        while p.acceptKw(".") {
+            if p.isKw(".") {
+                append(mut &parts, "")
+                continue
+            }
+            append(mut &parts, try p.name())
+            spell = p.spelled
+        }
+        p.spelled = spell
+        let n = len(parts)
+        let sc = if n >= 2 { parts[n - 2] } else { "" }
+        if n == 1 || sc == "" || sc == "dbo" { return Ok(parts[n - 1]) }
+        return Ok(qual(&sc, &parts[n - 1]))
+    }
     if p.acceptKw(".") { return Ok(qual(&first, &(try p.name()))) }
     return Ok(first)
 }
@@ -2035,6 +2053,82 @@ fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
     return Err(near(&t))
 }
 
+// T-SQL's UPDATE and DELETE (design/lexdb-tds.md S3): a target named in
+// FROM (UPDATE p SET ... FROM Posts AS p JOIN ...; UPDATE Posts ... FROM
+// Posts JOIN ...) is that FROM item, taken out of the list, its join's
+// condition the WHERE's; OUTPUT's items are RETURNING's, INSERTED.c the
+// row's c and DELETED.c (an UPDATE's) the old row's (#old).
+fn tsqlDml(s: mut &Stmt, out: []SelItem): Result[Unit, lexdb_base.DbErr] {
+    var at = -1
+    for i in 0..len(s.from) {
+        if s.from[i].sub < 0 && (s.from[i].alias == s.table || (s.from[i].table == s.table && s.from[i].alias == baseName(&s.from[i].table))) { at = i }
+    }
+    if at >= 0 {
+        var all = replace(mut &s.from, [])
+        var keep: []FromItem = []
+        for k in 0..len(all) {
+            var f = replace(mut &all[k], FromItem{table: "", alias: "", join: 0, on: None, sub: -1, cols: [], work: -1, lateral: false, using: [], natural: false, comma: false})
+            if k == at {
+                s.table = f.table
+                if f.alias != baseName(&f.table) { s.alias = f.alias }
+                match replace(mut &f.on, None) {
+                    Some(c) {
+                        s.where = match replace(mut &s.where, None) {
+                            Some(w) { Some(Expr.Bin("and", c, w)) }
+                            None { Some(c) }
+                        }
+                    }
+                    None {}
+                }
+            } else { append(mut &keep, f) }
+        }
+        if len(keep) > 0 && keep[0].join == J_FIRST { keep[0].join = J_CROSS }
+        s.from = keep
+    }
+    if len(out) == 0 { return Ok(Unit{}) }
+    let q = if len(s.alias) > 0 { s.alias.toStr() } else { baseName(&s.table) }
+    var items = out
+    for i in 0..len(items) {
+        if items[i].star {
+            if items[i].qual == "inserted" || items[i].qual == "deleted" { items[i].qual = q }
+            continue
+        }
+        match replace(mut &items[i].expr, None) {
+            Some(x) { items[i].expr = Some(outputRefs(&x, &q, s.kind == S_UPDATE)) }
+            None {}
+        }
+    }
+    s.items = items
+    return Ok(Unit{})
+}
+
+fn outputRefs(x: &Expr, q: &str, upd: bool): Expr {
+    match x {
+        Expr.Col(n) {
+            let d = strings.indexOf(&n, ".", 0)
+            if d < 0 { return Expr.Col(n.toStr()) }
+            let t = n[0..d].toStr()
+            let c = n[d + 1..len(n)].toStr()
+            if t == "inserted" { return Expr.Col(q + "." + c) }
+            if t == "deleted" {
+                if upd { return Expr.Call("#old", [Expr.Col(q + "." + c)], false) }
+                return Expr.Col(q + "." + c)
+            }
+            return Expr.Col(n.toStr())
+        }
+        Expr.Unary(op, a) { return Expr.Unary(op.toStr(), outputRefs(&a, q, upd)) }
+        Expr.Bin(op, a, b) { return Expr.Bin(op.toStr(), outputRefs(&a, q, upd), outputRefs(&b, q, upd)) }
+        Expr.Cast(a, t) { return Expr.Cast(outputRefs(&a, q, upd), t) }
+        Expr.IsNull(a, n) { return Expr.IsNull(outputRefs(&a, q, upd), n) }
+        Expr.Call(f, args, star) {
+            var out: []Expr = []
+            for a in args { append(mut &out, outputRefs(&a, q, upd)) }
+            return Expr.Call(f.toStr(), out, star)
+        }
+        else { return cloneE(x) }
+    }
+}
+
 // T-SQL's CAST and CONVERT (design/lexdb-tds.md S3): to a string of n
 // characters a longer value is cut (SQL Server's), a date or time with a
 // style written so (lexdb_tsqlfn's #datestyle).
@@ -2089,6 +2183,11 @@ fn (p: mut &P) tsqlCall(name: &str, args: []Expr, star: bool): Result[Expr, lexd
     let n = len(args)
     var a = args
     let float8 = TypeName{kind: K_FLOAT, oid: OID_FLOAT8, prec: 0, scale: 0, len: 0}
+    if strings.startsWith(name, "count_big") { return Ok(Expr.Call("count" + name[9..len(name)], a, star)) }
+    if name == "scope_identity" && n == 0 {
+        // the batch's @@IDENTITY (refreshed before each statement): a value WHERE can read
+        return p.variable(&Tok{kind: T_VAR, text: "@@identity", at: 0, spell: ""})
+    }
     match name.toStr() {
         "len" { return Ok(Expr.Call("#len", a, false)) }
         "datalength" { return Ok(Expr.Call("#datalength", a, false)) }
@@ -2842,6 +2941,12 @@ fn (p: mut &P) insert(): Result[Stmt, lexdb_base.DbErr] {
         while p.acceptKw(",") { append(mut &s.names, try p.name()) }
         try p.expectKw(")")
     }
+    if p.tsql && p.acceptKw("output") {
+        // T-SQL: OUTPUT INSERTED.col, ...: RETURNING
+        var out: []SelItem = []
+        try p.itemList(mut &out)
+        try tsqlDml(mut &s, out)
+    }
     if p.acceptKw("overriding") {
         if p.acceptKw("system") { s.overriding = OVR_SYSTEM } else {
             try p.expectKw("user")
@@ -2933,7 +3038,8 @@ fn (p: mut &P) setList(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
             }
             try p.expectKw(")")
         } else {
-            let c = try p.name()
+            var c = try p.name()
+            if p.tsql && p.acceptKw(".") { c = try p.name() }      // T-SQL: SET t.col = (the target's)
             try p.expectKw("=")
             append(mut &s.sets, SetItem{col: c, expr: try p.valueOrDefault()})
         }
@@ -3635,6 +3741,15 @@ fn (p: mut &P) fromList(from: mut &[]FromItem, join: int): Result[Unit, lexdb_ba
             var f = try p.fromItem(J_CROSS)
             f.comma = true
             append(from, f)
+        } else if p.tsql && (p.isKw("cross") || p.isKw("outer")) && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "apply" {
+            // T-SQL: CROSS APPLY x, OUTER APPLY x: a LATERAL join (inner, left)
+            let outer = p.acceptKw("outer")
+            if !outer { let c = p.acceptKw("cross") }
+            p.pos += 1
+            var f = try p.fromItem(if outer { J_LEFT } else { J_CROSS })
+            f.lateral = true
+            if outer { f.on = Some(Expr.Lit(Val.Bool(true))) }
+            append(from, f)
         } else if p.acceptKw("cross") {
             try p.expectKw("join")
             append(from, try p.fromItem(J_CROSS))
@@ -3716,6 +3831,7 @@ fn (p: mut &P) fromItem(join: int): Result[FromItem, lexdb_base.DbErr] {
     var alias = baseName(&table)
     var cols: []str = []
     try p.aliasOf(mut &alias, mut &cols)
+    try p.tableHints()
     // a CTE in scope (the innermost of the name) before a table; a
     // qualified name is always a table
     var ci = -1
@@ -3790,6 +3906,26 @@ fn (p: mut &P) fromFunction(join: int): Result[FromItem, lexdb_base.DbErr] {
     return Ok(FromItem{table: name, alias: alias, join: join, on: None, sub: i, cols: cols, work: -1, lateral: true, using: [], natural: false, comma: false})
 }
 
+// T-SQL's table hints, WITH (NOLOCK, ...) or (NOLOCK): read, not used
+// (lexdb's reads are snapshots; its writes lock rows).
+fn (p: mut &P) tableHints(): Result[Unit, lexdb_base.DbErr] {
+    if !p.tsql { return Ok(Unit{}) }
+    let w = p.isKw("with") && p.peekAt(1).kind == T_OP && p.peekAt(1).text == "("
+    let bare = p.isKw("(") && p.peekAt(1).kind == T_IDENT && (p.peekAt(1).text == "nolock" || p.peekAt(1).text == "readuncommitted" ||
+               p.peekAt(1).text == "holdlock" || p.peekAt(1).text == "updlock" || p.peekAt(1).text == "rowlock" || p.peekAt(1).text == "tablock")
+    if !w && !bare { return Ok(Unit{}) }
+    if w { p.pos += 1 }
+    try p.expectKw("(")
+    var depth = 1
+    while depth > 0 {
+        let t = p.next()
+        if t.kind == T_EOF { return Err(near(&t)) }
+        if t.kind == T_OP && t.text == "(" { depth += 1 }
+        if t.kind == T_OP && t.text == ")" { depth -= 1 }
+    }
+    return Ok(Unit{})
+}
+
 fn (p: mut &P) aliasOf(alias: mut &str, cols: mut &[]str): Result[Unit, lexdb_base.DbErr] {
     var got = false
     if p.acceptKw("as") {
@@ -3797,7 +3933,9 @@ fn (p: mut &P) aliasOf(alias: mut &str, cols: mut &[]str): Result[Unit, lexdb_ba
         got = true
     } else {
         let t = p.peek()
-        if t.kind == T_QIDENT || (t.kind == T_IDENT && !isReserved(&t.text)) {
+        // (T-SQL: OUTPUT and OPTION after a table are clauses)
+        let tw = p.tsql && t.kind == T_IDENT && (t.text == "output" || t.text == "option")
+        if !tw && (t.kind == T_QIDENT || (t.kind == T_IDENT && !isReserved(&t.text))) {
             let old = replace(alias, t.text)
             p.pos += 1
             got = true
@@ -3900,22 +4038,28 @@ fn (p: mut &P) update(): Result[Stmt, lexdb_base.DbErr] {
     try p.dmlTarget(mut &s)
     try p.expectKw("set")
     try p.setList(mut &s)
+    var out: []SelItem = []
+    if p.tsql && p.acceptKw("output") { try p.itemList(mut &out) }
     if p.acceptKw("from") { try p.fromList(mut &s.from, J_CROSS) }
     if p.acceptKw("where") { s.where = Some(try p.expr()) }
     try p.returning(mut &s)
+    if p.tsql { try tsqlDml(mut &s, out) }
     return Ok(s)
 }
 
 // DELETE FROM [ONLY] t [[AS] alias] [USING list] [WHERE ...] [RETURNING ...]
 fn (p: mut &P) delete(): Result[Stmt, lexdb_base.DbErr] {
     var s = newStmt(S_DELETE)
-    // T-SQL: DELETE [TOP (n)] [FROM] t
+    // T-SQL: DELETE [TOP (n)] [FROM] t [OUTPUT ...] [FROM list] [WHERE ...]
     if p.tsql && p.acceptKw("top") { try p.top(mut &s, false) }
     if !p.tsql || p.isKw("from") { try p.expectKw("from") }
     try p.dmlTarget(mut &s)
-    if p.acceptKw("using") { try p.fromList(mut &s.from, J_CROSS) }
+    var out: []SelItem = []
+    if p.tsql && p.acceptKw("output") { try p.itemList(mut &out) }
+    if p.acceptKw("using") || (p.tsql && p.acceptKw("from")) { try p.fromList(mut &s.from, J_CROSS) }
     if p.acceptKw("where") { s.where = Some(try p.expr()) }
     try p.returning(mut &s)
+    if p.tsql { try tsqlDml(mut &s, out) }
     return Ok(s)
 }
 
@@ -3927,6 +4071,7 @@ fn (p: mut &P) dmlTarget(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
     let star = p.acceptKw("*")
     var cols: []str = []
     try p.aliasOf(mut &s.alias, mut &cols)
+    try p.tableHints()
     if len(cols) > 0 { return Err(lexdb_base.err("42601", "syntax error at or near \"(\"")) }
     return Ok(Unit{})
 }

@@ -5227,6 +5227,21 @@ fn resolve(x: &Expr, cols: &[]lexdb_sql.ColDef, n: int, sc: mut &Scope): Result[
             if nm == "in" || nm == "like" || nm == "ilike" || nm == "#tlike" || nm == "distinct from" || nm == "charindex" || nm == "patindex" {
                 out = try collateCall(&nm, out, cols, sc)
             }
+            if nm == "coalesce" && len(out) > 1 {
+                // its arguments of no type of their own ('1900-01-01' after a
+                // timestamp) take the result's, as PostgreSQL's and SQL Server's
+                let pt = ptypesOf(sc)
+                let o = exprOid(&Expr.Call(nm.toStr(), cloneAll(&out), star), cols, &pt)
+                if o != 0 && o != 705 && !isTextOid(o) {
+                    var cast: []Expr = []
+                    for ca in out {
+                        let xo = exprOid(&ca, cols, &pt)
+                        let lit = match ca { Expr.Lit(v) { kindOf(&v) == lexdb_sql.K_TEXT } else { false } }
+                        append(mut &cast, if lit || xo == 705 { Expr.Cast(clone(&ca), oidType(o)) } else { clone(&ca) })
+                    }
+                    out = cast
+                }
+            }
             if nm == "avg" && !star && len(out) == 1 && len(sc.coll) > 0 {
                 // T-SQL's AVG: of integers an integer, of decimal(p, s) scale max(s, 6)
                 let ps = numPS(&out[0], cols, sc)
@@ -11393,13 +11408,48 @@ fn retOf(s: &lexdb_sql.Stmt, q: &Query, sc: mut &Scope): Result[Ret, DbErr] {
 
 fn retAdd(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Mats, params: &[]Val, r: mut &Ret,
           row: &[]Val, rs: mut &Run): Result[Unit, DbErr] {
+    let none: []Val = []
+    return retAddOld(st, txn, q, m, params, r, row, &none, rs)
+}
+
+// retAdd with the row before an UPDATE: T-SQL's OUTPUT DELETED.c (#old(c)).
+fn retAddOld(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Mats, params: &[]Val, r: mut &Ret,
+             row: &[]Val, old: &[]Val, rs: mut &Run): Result[Unit, DbErr] {
     if !r.on { return Ok(Unit{}) }
     let noAggs: []Val = []
     let env = Env{cols: &q.cols, row: row, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: seqEnv(st, txn)}
     var out: []Val = []
-    for x in r.exprs { append(mut &out, try evalX(st, txn, q, &x, &env, rs)) }
+    for x0 in r.exprs {
+        let x = if len(old) > 0 { oldRefs(&x0, &q.cols, old) } else { clone(&x0) }
+        append(mut &out, try evalX(st, txn, q, &x, &env, rs))
+    }
     append(mut &r.rows, out)
     return Ok(Unit{})
+}
+
+// #old(c): the old row's c, as a value.
+fn oldRefs(x: &Expr, cols: &[]lexdb_sql.ColDef, old: &[]Val): Expr {
+    match x {
+        Expr.Call(f, args, star) {
+            if f == "#old" && len(args) == 1 {
+                match args[0] {
+                    Expr.Col(n) {
+                        let i = colIndex(cols, &n)
+                        if i >= 0 && i < len(old) { return Expr.Lit(old[i]) }
+                    }
+                    else {}
+                }
+            }
+            var out: []Expr = []
+            for a in args { append(mut &out, oldRefs(&a, cols, old)) }
+            return Expr.Call(f, out, star)
+        }
+        Expr.Unary(op, a) { return Expr.Unary(op, oldRefs(&a, cols, old)) }
+        Expr.Bin(op, a, b) { return Expr.Bin(op, oldRefs(&a, cols, old), oldRefs(&b, cols, old)) }
+        Expr.Cast(a, t) { return Expr.Cast(oldRefs(&a, cols, old), t) }
+        Expr.IsNull(a, n) { return Expr.IsNull(oldRefs(&a, cols, old), n) }
+        else { return clone(x) }
+    }
 }
 
 fn retRes(r: Ret, tag: str): Res {
@@ -11731,7 +11781,7 @@ fn update(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
         let old = rowPrefix(&joined, nt)
         let row = rowPrefix(&all, nt)
         try updRow(st, txn, t, &old, &row, &fw, mut &later)
-        try retAdd(st, txn, &q, &m, params, mut &ret, &all, mut &rs)
+        try retAddOld(st, txn, &q, &m, params, mut &ret, &all, &joined, mut &rs)
     }
     try fkFinish(st, txn, &fw, mut &later)
     return Ok(retRes(ret, "UPDATE " + len(found).toStr()))

@@ -526,9 +526,23 @@ oracle's answers all.
   column's TDS type is sent as its own type where the column's values
   share one (ISNULL(NULL, 5) an int), else as text: before, an int could
   be written into an nvarchar column, breaking the stream.
+- **What applications send** (`mssql_app_queries.txt`, `run/tds_app.lxl`,
+  35 batches, all the oracle's answers): EF Core's tables (`IDENTITY`,
+  `CONSTRAINT [PK_x] PRIMARY KEY`, `nvarchar(max)`, cascading foreign
+  keys), `OUTPUT INSERTED.c` on INSERT, UPDATE and DELETE (RETURNING; an
+  UPDATE's `DELETED.c` the row before: `#old`, filled per row), `OUTPUT 1`,
+  CROSS APPLY and OUTER APPLY (LATERAL joins), paging by variables, EXISTS
+  as bit, ROW_NUMBER, LIKE ... ESCAPE, `UPDATE p SET p.c = ... FROM Posts
+  AS p JOIN ...` and `DELETE p FROM ...` (the target found in FROM, taken
+  out, its join's condition the WHERE's: `tsqlDml`), table hints (`WITH
+  (NOLOCK)`, read and not used), `dbo.` and `db.dbo.` (public),
+  COUNT_BIG, SCOPE_IDENTITY() in a WHERE (the frame's @@IDENTITY). A
+  DECLARE of several variables counts one row. COALESCE's untyped
+  arguments take its type ('1900-01-01' after a datetime2 column), over
+  PostgreSQL too.
 - **Not yet:** DATALENGTH of a varchar literal (lexdb has one string type:
   every string counts as nvarchar); FORMAT; CONVERT's number styles and a
   string's date styles (`CONVERT(date, '05/03/2024', 103)`); decimal
   precision past division and AVG (multiplication's and addition's scales
-  are the values'); UPDATE ... FROM with the target in FROM.
+  are the values'); OUTPUT ... INTO; MERGE (S5).
 
