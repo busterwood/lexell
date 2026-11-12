@@ -8799,3 +8799,68 @@ PostgreSQL's 130.
 - **Sort, top-N and DISTINCT** over batches.
 
 The suite passes (109).
+
+### 9.103 Key lookups per row over batches; the planner's hash costs measured again
+
+The user's go-ahead after 9.102's measurements. Two parts:
+- **The planner** (lexdb-optimizer.md 41):
+  - hash joins' build and probe were measured apart (`calib_batch.lxl`),
+    and the constants set again: `HASH_PROBE` 22 to 2, `HASH_BUILD` 22 to
+    8;
+  - a query with outer joins now costs each table's hash against its
+    lookups (`Query.outerReadOnce`), so a LEFT JOIN to a small table is
+    hashed.
+- **Lookups that stay lookups** run over batches (`bLookup`).
+
+**A lookup over batches.** A table after the first, looked up per row by
+its whole primary key (`lookupPath`), is a join level of 9.102, INNER or
+LEFT:
+- **Not when:** an index's key, a range, an IN list, or a correlated
+  value. Not either when reading may stop early: a LIMIT or EXISTS
+  (optimizer 19's `stops`). A batch's 1,024 lookups would be made for
+  rows never wanted; `exec_joinreview`'s `LIMIT 1` showed it.
+- **Per batch, per row:**
+  1. its key is made as the row path makes it (`pathScan`: `keyVal`, then
+     `encPart`), from the key's values over the batch;
+  2. its row is read as `fetch` reads it (`get`, or `getPart` when only
+     some columns are used), so it is noted as read the same way;
+  3. the row is decoded into columns (`bRowInto`, `bRowOf` for a value
+     stored apart), its columns used only.
+- **Then** the candidates go through the same tail as a hash's
+  (`bJoinTail`): the join's conditions, a LEFT JOIN's NULL rows, its WHERE
+  conjuncts.
+- **Counts** are the row path's: lookups (one per batch row reaching it),
+  rows read, joined, NULL rows.
+
+**Measured** (as 9.102, CPU ms, 1M rows; PostgreSQL 18 on one core in
+brackets):
+- `w JOIN t ON t.id = w.b`, 1M lookups, count and sum: 1,580 to **585**
+  (70). Still lookups: the cap counts every column of `t` (optimizer 41).
+  What is left is the store's descent per key: `memcmp`, `Node.lower`,
+  `childIndex` and the snapshot's descent, about 40%.
+- `w LEFT JOIN d ON d.k = w.a WHERE w.id < 200000`: 303 to **32** (40), by
+  the planner's change (`d` hashed).
+- The other joins of 9.102's table are unchanged.
+
+**Tests:**
+- `exec_batchjoin`: a LEFT JOIN looked up by a primary key has the row
+  path's counts. Its batched count is now 206 of 300 (the first scan in
+  batches, with a hash join after it).
+- `exec_batch`: its join is now batched (4 of 5).
+- `exec_joincost`, `exec_joinreview`: the planner's plans as
+  optimizer 41 explains.
+- **Differential runs, outside the suite:** 1,600 random queries, joins
+  and scans, the same output on and off (one seed in America/New_York).
+
+The suite passes (109).
+
+**Next, where the time is now:**
+- **The store's descent per key** for lookups: sorted keys per batch, a
+  leaf used again for the next key (clustered keys gain; random keys
+  barely).
+- **The cap's row size** counting the columns used, so that a big table's
+  hash is taken where a lookup is dearer.
+- **Sort** (the sorted join is 3.7 times PostgreSQL's time), wide rows,
+  and selective filters (late materialisation).
+- A lookup per row is about 20% slower with batches on than off, before
+  9.101 too: not yet explained.
