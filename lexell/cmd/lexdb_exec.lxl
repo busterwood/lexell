@@ -3476,12 +3476,12 @@ fn nextVersion(v: &str): str {
     return (n + 1).toStr() + "." + VERSION_BUMPS.toStr() + "." + time.monotonicNs().toStr()
 }
 
-// ---- statistics (optimizer 20): ANALYZE's row per table, keyed 5 then the table's
-// catalog key (between the sequences' 4 and the tables), its text
-// "tree;rows" then ";indextree:entries:d1,d2,..." per index. The table's tree
-// is in it, so an older table of the same name's statistics are not used.
-
-fn statKey(name: &str): str { return "\x05" + name }
+// ---- statistics (optimizer 20): ANALYZE's row per table, keyed "\x02stat\x00"
+// then the table's catalog key (with the other \x02 rows; it was \x05, the
+// roles' prefix since 9.81: optimizer 40), its text "tree;rows" then
+// ";indextree:entries:d1,d2,..." per index. The table's tree is in it, so
+// an older table of the same name's statistics are not used.
+fn statKey(name: &str): str { return "\x02stat\x00" + name }
 
 // A key's bytes as hex, and back (the statistics' text row).
 fn toHex(s: &str): str {
@@ -3625,7 +3625,8 @@ fn analyzeStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
     } else {
         var keys: []str = []
         var raw: []str = []
-        try st.scan(txn, CATALOG, "\x06", "", fn(en: &lexdb_store.Entry): bool {
+        // (not other sessions' temporary tables, as PostgreSQL: optimizer 40)
+        try catScan(st, txn, &"\x06", &"", &"", fn(en: &lexdb_store.Entry): bool {
             append(mut &keys, en.key)
             append(mut &raw, en.val)
             return true
@@ -3648,8 +3649,16 @@ fn analyzeStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
     }
     st.endSnapshot(&snap)
     if len(failed) > 0 { return Err(failed[0]) }
-    let v = try statVersion(st, txn)
-    try txn.put(CATALOG, STAT_VERSION, nextVersion(&v))
+    // a temporary table's statistics are its session's alone: its kept
+    // plans are made again (tmpBump), no other session's (optimizer 40)
+    var perm = false
+    var temp = false
+    for t in tabs { if tempRel(&t.name) { temp = true } else { perm = true } }
+    if temp { tmpBump(st, txn) }
+    if perm || len(tabs) == 0 {
+        let v = try statVersion(st, txn)
+        try txn.put(CATALOG, STAT_VERSION, nextVersion(&v))
+    }
     return Ok(checked)
 }
 
@@ -6500,7 +6509,7 @@ fn (q: &Query) orderedLevel(items: &[]lexdb_sql.OrderItem, out: mut &[]int): int
 // A table of nothing (a level's place while levels are moved).
 fn noTable(): Table {
     return Table{name: "", tree: -1, cols: [], pk: [], indexes: [], slots: [], width: 0, checks: [], fks: [], refBy: [], layouts: [], lays: [],
-                 view: "", deps: []}
+                 view: "", deps: [], onCommit: 0}
 }
 
 // Whether a table is pinned to one row by its key's equalities with

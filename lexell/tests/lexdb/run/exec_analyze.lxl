@@ -2,7 +2,9 @@
 // table's rows and, per index, the distinct values of each leading prefix.
 // The planner takes the path with the fewer expected rows (here, a tie the
 // rules leave between indexes; exec_estimates has the rest, optimizer 24). SET
-// lexdb_planner = rules turns them off. Checked by hand.
+// lexdb_planner = rules turns them off. Temporary tables' statistics are
+// their session's (optimizer 40); a role named as a table keeps its row.
+// Checked by hand.
 // expect: -- ev: 1000 rows; kind 1 for 990 of them, uid 100 values
 // expect: create table ev (id int primary key, kind int, uid int) -> CREATE TABLE
 // expect: insert into ev select g, case when g <= 990 then 1 else 2 end, g % 100 from generate_series(1, 1000) g -> INSERT 0 1000
@@ -66,6 +68,30 @@
 // expect: -- SHOW ALL lists the lexdb settings (it panicked on lexdb_batch before)
 // expect: show lexdb_batch -> [lexdb_batch] on
 // expect: show all -> [name,setting] max_recursion|1000; statement_timeout|0; max_statement_mem|262144kB; search_path|public; lexdb_batch|on; lexdb_planner|cost
+// expect: -- temporary tables (optimizer 40): another session's are not analyzed; one's own are, and
+// expect: -- neither that nor dropping it conflicts with another session's block that read the catalog
+// expect: create temp table tt (id int primary key, k int, j int) -> CREATE TABLE
+// expect: insert into tt select g, g % 50, g % 7 from generate_series(1, 700) g -> INSERT 0 700
+// expect: create index tt_k on tt (k) -> CREATE INDEX
+// expect: create index tt_j on tt (j) -> CREATE INDEX
+// expect: analyze -> ANALYZE
+// expect: explain select id from tt where k = 3 and j = 4 -> [QUERY PLAN] scan tt: index tt_k lookup
+// expect: begin -> BEGIN
+// expect: select count(*) from pg_class where relname = 't' -> [count] 1
+// expect: update t set a = a where id = 1 -> UPDATE 1
+// expect: analyze tt -> ANALYZE
+// expect: analyze -> ANALYZE
+// expect: explain select id from tt where k = 3 and j = 4 -> [QUERY PLAN] scan tt: index tt_k lookup (estimated 14 rows)
+// expect: drop table tt -> DROP TABLE
+// expect: commit -> COMMIT
+// expect: -- a role named as a table: ANALYZE and DROP TABLE leave it (statistics were under the roles' prefix)
+// expect: create role t login password 'pw' -> CREATE ROLE
+// expect: select count(*) from pg_roles -> [count] 2
+// expect: analyze -> ANALYZE
+// expect: select rolname, rolcanlogin from pg_roles where rolname = 't' -> [rolname,rolcanlogin] t|t
+// expect: select count(*) from pg_roles -> [count] 2
+// expect: drop table t -> DROP TABLE
+// expect: select rolname, rolcanlogin from pg_roles where rolname = 't' -> [rolname,rolcanlogin] t|t
 import "../../../cmd/lexdb_store"
 import "../../../cmd/lexdb_disk"
 import "../../../cmd/lexdb_exec"
@@ -172,6 +198,31 @@ fn body(st: lexdb_store.Store): int {
     println("-- SHOW ALL lists the lexdb settings (it panicked on lexdb_batch before)")
     show(mut &s, "show lexdb_batch")
     show(mut &s, "show all")
+    println("-- temporary tables (optimizer 40): another session's are not analyzed; one's own are, and")
+    println("-- neither that nor dropping it conflicts with another session's block that read the catalog")
+    var s2 = lexdb_exec.newSession(st)
+    show(mut &s2, "create temp table tt (id int primary key, k int, j int)")
+    show(mut &s2, "insert into tt select g, g % 50, g % 7 from generate_series(1, 700) g")
+    show(mut &s2, "create index tt_k on tt (k)")
+    show(mut &s2, "create index tt_j on tt (j)")
+    show(mut &s, "analyze")
+    show(mut &s2, "explain select id from tt where k = 3 and j = 4")
+    show(mut &s, "begin")
+    show(mut &s, "select count(*) from pg_class where relname = 't'")
+    show(mut &s, "update t set a = a where id = 1")
+    show(mut &s2, "analyze tt")
+    show(mut &s2, "analyze")
+    show(mut &s2, "explain select id from tt where k = 3 and j = 4")
+    show(mut &s2, "drop table tt")
+    show(mut &s, "commit")
+    println("-- a role named as a table: ANALYZE and DROP TABLE leave it (statistics were under the roles' prefix)")
+    show(mut &s, "create role t login password 'pw'")
+    show(mut &s, "select count(*) from pg_roles")
+    show(mut &s, "analyze")
+    show(mut &s, "select rolname, rolcanlogin from pg_roles where rolname = 't'")
+    show(mut &s, "select count(*) from pg_roles")
+    show(mut &s, "drop table t")
+    show(mut &s, "select rolname, rolcanlogin from pg_roles where rolname = 't'")
     return 0
 }
 

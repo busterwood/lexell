@@ -32,7 +32,7 @@ section and the decision list below win.
   per-parameter plans, and a fallback to rule-based planning through a SET
   command.** Section 18 has the consequences.
 
-**Built so far (on `exp/optimizer`, rebased onto `lexdb` 9.94 on 2026-11-12):**
+**Built so far (on `exp/optimizer`, rebased onto `lexdb` 9.97 on 2026-11-12):**
 the index-to-scan switch (section 19); ANALYZE, the tie-break and `SET
 lexdb_planner` (20); the review fixes (21); plans kept per parameter
 outcome (22); per-value estimates (23); estimates deciding beyond ties and
@@ -45,7 +45,9 @@ the fast path for pinned joins (35); the read costs measured and
 calibrated (36); ANALYZE's samples, the rest of SQLite's stat4 (37); the
 switch's threshold from the measured costs in the cost mode (38); and the
 third review's fixes, with ANALYZE's distinct counts of the other columns
-(39, uncommitted). Code comments cite these sections as "optimizer N".
+(39); and the rebase onto lexdb 9.96 and 9.97, with temporary tables'
+statistics and the statistics' key moved off the roles' (40). Code
+comments cite these sections as "optimizer N".
 
 ## 1. Summary
 
@@ -2296,6 +2298,60 @@ let through the fast path's check.
 against rules: 864 queries (`gen4`, seeds 101 to 104) with and without
 ANALYZE, 1,579 (`gen5`, seeds 1 to 4), and gen5 seed 1 in a block that has
 written (389). 0 differences.
+
+## 40. On lexdb 9.96 and 9.97: temporary tables, the statistics' key (2026-11-12)
+
+The branch was rebased onto `lexdb` 9.97: temporary tables (9.96) and
+psql's `\d+` (9.97). Three commits needed resolving (19 and 20, 21, 29),
+all where 9.96 put a session's settings into `resetAll` and a
+transaction's set-up into `setUp`. The planner's two fields went there
+too: `Session.resetAll` sets `rules` off and the block's `memMax`, and
+`Session.setUp` gives a transaction `rules` and `memMax`. `noTable` gained
+9.96's `Table.onCommit`.
+
+**The statistics' key was the roles'.** Statistics were kept under the
+byte `\x05` and the table's catalog key (section 20). Since 9.81 lexdb's
+roles have been kept under `\x05` and the role's name (`roleKey`). The
+earlier rebases missed this; no test had a role and statistics together.
+The consequences:
+- every table's statistics read as a role (`rolesIn` scans `\x05`): the
+  roles' count in `pg_roles` grew by the analyzed tables;
+- a role named like a table lost its login (and its verifier) at ANALYZE;
+- DROP TABLE deleted the role of its name.
+
+The key is now `"\x02stat\x00"` and the table's key, with lexdb's other
+`\x02` rows (ACLs, enums, the statistics' version `"\x02stats"`, which it
+does not clash with). Statistics written under `\x05` by the branch before
+are not read and not moved: the branch has not been released. `exec_analyze`
+has a role named as a table through ANALYZE and DROP TABLE; with the old
+key it fails each way above.
+
+**Temporary tables.** lexdb 9.96 keeps a temporary object's catalog rows
+under keys that `lexdb_base.tempCatKey` recognizes. Other sessions read
+them quietly or not at all, so temporary DDL never conflicts with another
+session. The statistics' rows were not among those keys. 9.96's own test
+(`exec_tempsessions`) failed: a session dropping a temporary table deleted
+its statistics' key inside the roles' range, which another session's
+UPDATE had read (its privileges). So that session's block failed (40001).
+Now:
+- `tempCatKey` recognizes `"\x02stat\x00pg_temp_N\x1f..."`: a temporary
+  table's statistics are its session's;
+- ANALYZE without names lists the tables through `catScan`, as lexdb's
+  other catalog scans do, so another session's temporary tables are not
+  analyzed (PostgreSQL's ANALYZE skips them too);
+- ANALYZE of temporary tables bumps only its session's version (`tmpBump`,
+  so its own kept plans are made again), not the statistics' version that
+  every session's prepared statements depend on;
+- dropping the session's temporary tables (at its end, DISCARD, a restart)
+  deletes their statistics through `dropOne`, as before.
+`exec_analyze` has another session's block (a catalog read, an update)
+across a temporary table's ANALYZE, an ANALYZE of all tables, and its DROP:
+it commits. The temporary table's statistics are used (EXPLAIN shows the
+estimate).
+
+**Checked:** the suite, 100 of 100 (with 9.96's and 9.97's tests); the
+differential sets `gen5` seed 3 and `gen4` seed 103 with ANALYZE, 624
+queries, 0 differences.
 
 ## Sources
 
