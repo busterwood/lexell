@@ -1,0 +1,99 @@
+// lexdb_wire: a SELECT's rows sent as they are made (Session.runRows), so
+// a large result is never held whole. With max_statement_mem at 256 kB,
+// which a held result of these sizes is over (53200):
+// - the simple protocol (exec) and the extended one (query) send 50000
+//   rows, every one, in order;
+// - a query whose rows must all be made first (ORDER BY) is still held,
+//   and so over the limit;
+// - an error part way (a division by zero at row 30000): the client gets
+//   the error, after rows went out, and the connection goes on;
+// - a prepared statement described, then run: its rows streamed;
+// - the session's settings and a transaction block around streamed rows.
+// expect: simple: ok
+// expect: extended: 50000 rows, first 1|ABC1, last 50000|ABC50000, in order t
+// expect: sorted, held: 53200
+// expect: error part way: 22012
+// expect: after it: 1
+// expect: prepared: 3 rows, 5|ABC5
+// expect: in a block: 20000, committed
+import "task"
+import "net"
+import "postgres"
+import "sqldialect"
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_wire"
+
+type V = sqldialect.Value
+
+fn state(e: &postgres.Error): str {
+    let t = e.toStr()
+    for code in ["53200", "22012", "42601"] { if strings.contains(t, code) { return code } }
+    return t
+}
+
+fn client(addr: str): Result[Unit, postgres.Error] {
+    let port = addr[10..len(addr)]
+    let dsn = "host=127.0.0.1 port=" + port + " user=test dbname=test sslmode=disable"
+    var c = try postgres.connect(dsn)
+    try c.exec("set max_statement_mem = '256kB'")
+
+    match c.exec("select g, 'ABC' || g from generate_series(1, 50000) g") {
+        Ok(_) { println("simple: ok") }
+        Err(e) { println("simple: " + state(&e)) }
+    }
+
+    let r = try c.query("select g, 'ABC' || g from generate_series(1, $1::int) g", &[V.Int(50000)])
+    var ordered = true
+    for i in 0..r.rowCount() { if r.int(i, 0).unwrapOr(-1) != i + 1 { ordered = false } }
+    let n = r.rowCount()
+    println("extended: " + n.toStr() + " rows, first " + r.text(0, 0).unwrapOr("?") + "|" + r.text(0, 1).unwrapOr("?") +
+            ", last " + r.text(n - 1, 0).unwrapOr("?") + "|" + r.text(n - 1, 1).unwrapOr("?") + ", in order " + (if ordered { "t" } else { "f" }))
+
+    match c.query("select g, 'ABC' || g from generate_series(1, 50000) g order by g desc", &[]) {
+        Ok(x) { println("sorted, held: " + x.rowCount().toStr() + " rows") }
+        Err(e) { println("sorted, held: " + state(&e)) }
+    }
+
+    match c.query("select 10 / (g - 30000) from generate_series(1, 50000) g", &[]) {
+        Ok(x) { println("error part way: " + x.rowCount().toStr() + " rows") }
+        Err(e) { println("error part way: " + state(&e)) }
+    }
+    let one = try c.query("select 1", &[])
+    println("after it: " + one.text(0, 0).unwrapOr("?"))
+
+    try c.exec("reset max_statement_mem")
+    try c.exec("create table t (id int primary key, code text)")
+    try c.exec("insert into t select g, 'ABC' || g from generate_series(1, 20000) g")
+    let p = try c.prepare("select id, code from t where id > $1 and id <= $2")
+    let pr = try c.queryPrepared(&p, &[V.Int(4), V.Int(7)])
+    println("prepared: " + pr.rowCount().toStr() + " rows, " + pr.text(0, 0).unwrapOr("?") + "|" + pr.text(0, 1).unwrapOr("?"))
+    try c.closePrepared(p)
+
+    try c.exec("begin")
+    let b = try c.query("select id from t", &[])
+    try c.exec("commit")
+    println("in a block: " + b.rowCount().toStr() + ", committed")
+    return Ok(Unit{})
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        let f = s.start(lexdb_wire.acceptLoop, lexdb_wire.AcceptArg{ln: ln, st: st})
+        match client(addr) {
+            Ok(_) {}
+            Err(e) { println("client: " + e.toStr()) }
+        }
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(17), lexdb_store.Options{cacheBytes: 128 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000, bufferedPages: false}, body).unwrap()
+}

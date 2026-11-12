@@ -7863,7 +7863,7 @@ fn materialize(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: 
 // Places a candidate row of level k in the joined row and goes on to the
 // next level if it joins: -1 stop, 0 it does not join, 1 it joined.
 fn tryRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Mats, k: int, r: &[]Val, ri: int,
-          row: mut &[]Val, params: &[]Val, emit: &fn(&[]Val): Result[bool, DbErr], rs: mut &Run): Result[int, DbErr] {
+          row: mut &[]Val, params: &[]Val, emit: &fn(mut &lexdb_store.Txn, &[]Val): Result[bool, DbErr], rs: mut &Run): Result[int, DbErr] {
     try rs.tick()
     let lv = &q.levels[k]
     for i in 0..len(r) { row[lv.first + i] = r[i] }
@@ -7970,9 +7970,9 @@ fn indexOrScan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, p: 
 // Joins the rows of level k on to the joined row (levels before k filled),
 // calling emit for each complete row; false: emit asked to stop.
 fn runLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Mats, k: int, row: mut &[]Val,
-            params: &[]Val, emit: &fn(&[]Val): Result[bool, DbErr], rs: mut &Run): Result[bool, DbErr] {
+            params: &[]Val, emit: &fn(mut &lexdb_store.Txn, &[]Val): Result[bool, DbErr], rs: mut &Run): Result[bool, DbErr] {
     let sqe = seqEnv(st, txn)
-    if k == len(q.levels) { return emit(row) }
+    if k == len(q.levels) { return emit(txn, row) }
     let lv = &q.levels[k]
     var matched = false
     rs.cnt[k].starts += 1
@@ -8055,6 +8055,34 @@ fn runLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Ma
             if got > 0 { matched = true }
         }
         if at >= 0 { rs.memoRes[i][at].data = rows }
+    } else if lv.virt() && lv.src >= 0 && m.subs[lv.src].series {
+        // generate_series, made as it is read (lazySeries); as execSrf's
+        let sr = &m.subs[lv.src]
+        if len(sr.vals) == 3 {
+            let ty = oidType(sr.sOid)
+            let dir = try compare(&sr.vals[2], &(try coerce(Val.Int(0), &ty)))
+            var v = sr.vals[0]
+            var n = 0
+            while true {
+                let c = try compare(&v, &sr.vals[1])
+                if (dir > 0 && c > 0) || (dir < 0 && c < 0) { break }
+                n += 1
+                var r: []Val = [v]
+                if sr.sOrdin { append(mut &r, Val.Int(n)) }
+                let got = try tryRow(st, txn, q, m, k, &r, -1, row, params, emit, rs)
+                if got < 0 { return Ok(false) }
+                if got > 0 { matched = true }
+                // the next value; past the type's range: the end
+                match arithZ(&"+", &v, &sr.vals[2], &txn.zone) {
+                    Ok(x) { v = x }
+                    Err(_) { break }
+                }
+                match coerce(v, &ty) {
+                    Ok(x) { v = x }
+                    Err(_) { break }
+                }
+            }
+        }
     } else if lv.virt() {
         for r in m.vrows[k] {
             let got = try tryRow(st, txn, q, m, k, &r, -1, row, params, emit, rs)
@@ -8145,10 +8173,10 @@ fn runLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Ma
 
 // Calls emit on each row of the query (materialize first).
 fn runQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Mats, params: &[]Val,
-            emit: &fn(&[]Val): Result[bool, DbErr], rs: mut &Run): Result[Unit, DbErr] {
+            emit: &fn(mut &lexdb_store.Txn, &[]Val): Result[bool, DbErr], rs: mut &Run): Result[Unit, DbErr] {
     if len(q.levels) == 0 {
         let none: []Val = []
-        if try allTrueX(st, txn, q, m, &q.top, &none, params, rs) { let more = try emit(&none) }
+        if try allTrueX(st, txn, q, m, &q.top, &none, params, rs) { let more = try emit(txn, &none) }
         return Ok(Unit{})
     }
     var row: []Val = array(len(q.cols), Val.Null)
@@ -8204,11 +8232,55 @@ type SubRes = record {
     hasNull: bool
     groups: Map[str, int]       // hashed: key -> 1 rows, 3 rows and a NULL value (IN)
     data: [][]Val               // in FROM: its rows
-    vals: []Val                 // IN: its distinct values not NULL, IN_LOOKUP_MAX + 1 at most (Path.inSub)
+    vals: []Val                 // IN: its distinct values not NULL, IN_LOOKUP_MAX + 1 at most (Path.inSub); a series: start, stop, step ([] none)
+    // In FROM, an integer generate_series the first level reads: its rows
+    // made as they are read (runLevel), not held (lazySeries). Its type
+    // and WITH ORDINALITY.
+    series: bool
+    sOid: int
+    sOrdin: bool
 }
 
 fn emptyRes(): SubRes {
-    return SubRes{val: Val.Null, rows: 0, set: newMap(), numeric: false, hasNull: false, groups: newMap(), data: [], vals: []}
+    return SubRes{val: Val.Null, rows: 0, set: newMap(), numeric: false, hasNull: false, groups: newMap(), data: [], vals: [],
+                  series: false, sOid: 0, sOrdin: false}
+}
+
+// Whether subquery i of q, in FROM, is an integer generate_series read by
+// q's first level only, as a series made as it is read: nothing reads it
+// again (a hash join's or a second scan's rows are held), and its values
+// do not depend on the row.
+fn lazySeries(q: &Query, i: int): bool {
+    let sp = &q.subs[i]
+    if sp.use != lexdb_sql.SUB_FROM || sp.sel.srf != "generate_series" || sp.cte >= 0 || len(sp.sel.q.refs) > 0 || len(sp.sel.outs) == 0 { return false }
+    if oidType(sp.sel.outs[0].oid).kind != lexdb_sql.K_INT { return false }
+    if len(q.levels) == 0 || q.levels[0].src != i || q.levels[0].lateral { return false }
+    for k in 1..len(q.levels) { if q.levels[k].src == i { return false } }
+    return true
+}
+
+// A lazy series' arguments (lazySeries), as execSrf takes them: start,
+// stop and step in the series' type; none (no rows) if one is NULL.
+fn seriesRes(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sp: &SubPlan, params: &[]Val, rs: mut &Run): Result[SubRes, DbErr] {
+    let sel = &sp.sel
+    let sqe = seqEnv(st, txn)
+    let m = try prepare(st, txn, &sel.q, params, rs)
+    let noRow: []Val = []
+    let env = Env{cols: &sel.q.cols, row: &noRow, aggs: &noRow, params: params, subs: &m.subs, cur: &noRow, seq: sqe}
+    var args: []Val = []
+    for x in sel.exprs { append(mut &args, try evalX(st, txn, &sel.q, &x, &env, rs)) }
+    var out = emptyRes()
+    out.series = true
+    out.sOid = sel.outs[0].oid
+    out.sOrdin = sel.ordin
+    for a in args { if isNull(&a) { return Ok(out) } }
+    let ty = oidType(out.sOid)
+    let start = try coerceZ(args[0], &ty, &txn.zone)
+    let stop = try coerceZ(args[1], &ty, &txn.zone)
+    let step = if len(args) > 2 { try coerceZ(args[2], &ty, &txn.zone) } else { try coerce(Val.Int(1), &ty) }
+    if try compare(&step, &(try coerce(Val.Int(0), &ty))) == 0 { return Err(e("22023", "step size cannot equal zero")) }
+    out.vals = [start, stop, step]
+    return Ok(out)
 }
 
 // The queries being planned, outermost first.
@@ -9267,7 +9339,9 @@ fn prepare(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, params:
         }
         var ps: []Val = []
         for j in 0..q.base { append(mut &ps, params[j]) }
-        if sp.use == lexdb_sql.SUB_FROM {
+        if lazySeries(q, i) {
+            append(mut &m.subs, try seriesRes(st, txn, sp, &ps, rs))
+        } else if sp.use == lexdb_sql.SUB_FROM {
             append(mut &m.subs, try runFrom(st, txn, sp, &ps, rs, i))
         } else if sp.hashed {
             append(mut &m.subs, try runHashed(st, txn, sp, &ps, rs, i))
@@ -10537,7 +10611,7 @@ fn retype(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, chan
     let room = rs.room()
     let max = rs.maxHeld
     var held = 0
-    try runQuery(st, txn, &q, &m, &noParams, fn(r: &[]Val): Result[bool, DbErr] {
+    try runQuery(st, txn, &q, &m, &noParams, fn(tx: mut &lexdb_store.Txn, r: &[]Val): Result[bool, DbErr] {
         held += 2 * rowBytes(r)             // the row found, and its new one
         if room >= 0 && held > room { return Err(memErr(max)) }
         append(mut &found, copyRow(r))
@@ -11335,35 +11409,29 @@ fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     var count = 0
     let parents = up.mode == lexdb_sql.CONFLICT_UPDATE        // an update may change a key other rows refer to
     if len(s.inner) > 0 {
-        // INSERT ... SELECT: the query runs to its end first, so it never
-        // reads the rows it inserts
+        // INSERT ... SELECT: the query's rows inserted as it gives them
+        // (eachRow), so they are not all held first. A query that reads the
+        // table it inserts into runs to its end first, so it never reads the
+        // rows it inserts.
         let noTypes: []int = []
-        var pc = oneShot()
-        let res = try select(st, txn, &s.inner[0], params, &noTypes, lim, mut &pc)
+        var ssc = newScopeIn(st, txn, params, &noTypes)
+        let sel = try planSelect(st, txn, &s.inner[0], params, mut &ssc)
         let defs = try defaultsOf(st, txn, &t)
         let fw = try fkTables(st, txn, &t, true, parents)
         var later: []FkLater = []
         let noAggs: []Val = []
         let env = Env{cols: &q.cols, row: &noAggs, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: sqe}
-        for r in res.rows {
-            var vs: []Val = []
-            for k in 0..len(r) {
-                if k < len(targets) && try idDefault(&t, targets[k], false, ovr) {
-                    append(mut &vs, try defAt(st, txn, &defs, &t, targets[k]))
-                } else if k < len(res.cols) && k < len(targets) && res.cols[k].oid == lexdb_sql.OID_BPCHAR && kindOf(&r[k]) == lexdb_sql.K_TEXT &&
-                          t.cols[targets[k]].typ.kind == lexdb_sql.K_TEXT && t.cols[targets[k]].typ.oid != lexdb_sql.OID_BPCHAR {
-                    append(mut &vs, Val.Text(bpTrim(&text(&r[k]))))     // a char into a text: without its blanks (9.94)
-                } else {
-                    append(mut &vs, r[k])
-                }
+        if try stmtReads(st, txn, &s.inner[0], &t.name) {
+            var res = try runSel(st, txn, &sel, params, lim)
+            for i in 0..len(res.rows) {
+                let r = replace(mut &res.rows[i], [])
+                count += try insertSelRow(st, txn, &t, &targets, &sel.outs, &r, &defs, ovr, &fw, mut &later, mut &up, &env, ret.on, mut &kept)
             }
-            match try insertOne(st, txn, &t, &targets, &vs, &defs, &fw, mut &later, mut &up, &env) {
-                Some(row) {
-                    if ret.on { append(mut &kept, row) }
-                    count += 1
-                }
-                None {}
-            }
+        } else {
+            try eachRow(st, txn, &sel, params, lim, fn(tx: mut &lexdb_store.Txn, r: &[]Val): Result[bool, DbErr] {
+                count += try insertSelRow(st, tx, &t, &targets, &sel.outs, r, &defs, ovr, &fw, mut &later, mut &up, &env, ret.on, mut &kept)
+                return Ok(true)
+            })
         }
         try fkFinish(st, txn, &fw, mut &later)
     } else {
@@ -11381,6 +11449,59 @@ fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
         if (d.inc > 0 && v >= next) || (d.inc < 0 && v <= next) { try setVal(st, &d, v, true) }
     }
     return Ok(retRes(ret, "INSERT 0 " + count.toStr()))
+}
+
+// One row of an INSERT ... SELECT's query inserted: 1, or 0 (ON CONFLICT
+// DO NOTHING). cols: the query's columns.
+fn insertSelRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, targets: &[]int, cols: &[]OutCol, r: &[]Val,
+                defs: &Defs, ovr: int, fw: &[]Table, later: mut &[]FkLater, up: mut &Upsert, env: &Env,
+                keep: bool, kept: mut &[][]Val): Result[int, DbErr] {
+    var vs: []Val = []
+    for k in 0..len(r) {
+        if k < len(targets) && try idDefault(t, targets[k], false, ovr) {
+            append(mut &vs, try defAt(st, txn, defs, t, targets[k]))
+        } else if k < len(cols) && k < len(targets) && cols[k].oid == lexdb_sql.OID_BPCHAR && kindOf(&r[k]) == lexdb_sql.K_TEXT &&
+                  t.cols[targets[k]].typ.kind == lexdb_sql.K_TEXT && t.cols[targets[k]].typ.oid != lexdb_sql.OID_BPCHAR {
+            append(mut &vs, Val.Text(bpTrim(&text(&r[k]))))     // a char into a text: without its blanks (9.94)
+        } else {
+            append(mut &vs, r[k])
+        }
+    }
+    match try insertOne(st, txn, t, targets, &vs, defs, fw, later, up, env) {
+        Some(row) {
+            if keep { append(kept, row) }
+            return Ok(1)
+        }
+        None { return Ok(0) }
+    }
+}
+
+// Whether a query reads relation key (a table's catalog key): in FROM, in
+// a view it reads (any view not known to leave it out counts), or in its
+// subqueries and set operations' branches.
+fn stmtReads(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, key: &str): Result[bool, DbErr] {
+    for f in s.from {
+        if f.sub >= 0 || f.work >= 0 || len(f.table) == 0 { continue }       // (subqueries: below)
+        match try findTable(st, txn, &f.table) {
+            Some(t) {
+                if t.name == key { return Ok(true) }
+                if len(t.view) > 0 {
+                    for d in t.deps {
+                        if d == key { return Ok(true) }
+                        // a view over a view: read through, the same way
+                        match try byKeyOpt(st, txn, &d) {
+                            Some(dt) { if len(dt.view) > 0 { return Ok(true) } }
+                            None {}
+                        }
+                    }
+                }
+            }
+            None {}
+        }
+    }
+    for b in s.subs { if try stmtReads(st, txn, &b, key) { return Ok(true) } }
+    for b in s.inner { if try stmtReads(st, txn, &b, key) { return Ok(true) } }
+    return Ok(false)
 }
 
 // The value a sequence's nextval would give now (not taking it).
@@ -11752,7 +11873,7 @@ fn update(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     for k in targets { for p in t.pk { if p == k { lmode = lexdb_sql.LOCK_UPDATE } } }
     let reads0 = txn.readCount()
     while true {
-        try runQuery(st, txn, &q, &m, params, fn(r: &[]Val): Result[bool, DbErr] {
+        try runQuery(st, txn, &q, &m, params, fn(tx: mut &lexdb_store.Txn, r: &[]Val): Result[bool, DbErr] {
             held += 2 * rowBytes(r)             // the row found, and its write
             if room >= 0 && held > room { return Err(memErr(max)) }
             append(mut &found, copyRow(r))
@@ -11817,7 +11938,7 @@ fn delete(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     var held = 0
     let reads0 = txn.readCount()
     while true {
-        try runQuery(st, txn, &q, &m, params, fn(r: &[]Val): Result[bool, DbErr] {
+        try runQuery(st, txn, &q, &m, params, fn(tx: mut &lexdb_store.Txn, r: &[]Val): Result[bool, DbErr] {
             held += 2 * rowBytes(r)             // the row found, and its write
             if room >= 0 && held > room { return Err(memErr(max)) }
             append(mut &found, copyRow(r))
@@ -12332,7 +12453,7 @@ fn orderValue(o: &Expr, outs: &[]OutCol, vals: &[]Val, env: &Env): Result[Val, D
 }
 
 fn select(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int,
-          lim: Limits, pc: mut &PlanCache): Result[Res, DbErr] {
+          lim: Limits, pc: mut &PlanCache, sink: &fn(&[]OutCol, &[]Val, bool): bool): Result[Res, DbErr] {
     // A prepared statement's plans, kept while the schema the transaction
     // sees is the same (and the statistics and the planner's mode): one per
     // outcome of the looks at its parameters' values (optimizer 22), the first whose
@@ -12361,17 +12482,45 @@ fn select(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
         pc.ver = ver
     }
     for i in 0..len(pc.sels) {
-        if looksHold(&pc.looks[i], params) { return runSel(st, txn, &pc.sels[i], params, lim) }
+        if looksHold(&pc.looks[i], params) { return runSelTo(st, txn, &pc.sels[i], params, lim, sink) }
     }
     var sc = newScopeIn(st, txn, params, ptypes)
     let sel = try planSelect(st, txn, s, params, mut &sc)
     let looks = replace(mut &sc.looks, [])
-    if !pc.keep || len(pc.sels) >= PLAN_VARIANTS { return runSel(st, txn, &sel, params, lim) }
+    if !pc.keep || len(pc.sels) >= PLAN_VARIANTS { return runSelTo(st, txn, &sel, params, lim, sink) }
     append(mut &pc.sels, sel)
     append(mut &pc.looks, looks)
     pc.plans += 1
-    return runSel(st, txn, &pc.sels[len(pc.sels) - 1], params, lim)
+    return runSelTo(st, txn, &pc.sels[len(pc.sels) - 1], params, lim, sink)
 }
+
+// runSel, or its rows given to sink as they are made (a client's: the
+// wire sends them as they come, so they are not all held). sink(cols, [],
+// true) asks first: false, the caller wants them held, as do queries whose
+// rows need anything after the scan (streams). sink false for a row: the
+// client is gone (08006).
+fn runSelTo(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params: &[]Val, lim: Limits,
+            sink: &fn(&[]OutCol, &[]Val, bool): bool): Result[Res, DbErr] {
+    let noRow: []Val = []
+    if !streams(sel) || !sink(&sel.outs, &noRow, true) { return runSel(st, txn, sel, params, lim) }
+    var n = 0
+    var lost = false
+    try eachRow(st, txn, sel, params, lim, fn(tx: mut &lexdb_store.Txn, r: &[]Val): Result[bool, DbErr] {
+        n += 1
+        if !sink(&sel.outs, r, false) {
+            lost = true
+            return Ok(false)
+        }
+        return Ok(true)
+    })
+    if lost { return Err(e("08006", "the connection was lost while rows were sent")) }
+    var outs: []OutCol = []
+    for oc in sel.outs { append(mut &outs, oc) }
+    return Ok(Res{cols: outs, rows: [], tag: "SELECT " + n.toStr(), hasRows: true, copy: COPY_NONE})
+}
+
+// No sink: rows held (runSelTo).
+fn noSink(c: &[]OutCol, r: &[]Val, start: bool): bool { return false }
 
 // The plans a prepared statement keeps at most (optimizer 22): past them, a run with
 // parameters none of them fits is planned and not kept.
@@ -12438,14 +12587,14 @@ fn runLocking(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, para
 // DISTINCT, window, set operation or OFFSET) gives them as they are read,
 // so they are not kept; any other runs whole first (execSel).
 fn eachRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params: &[]Val, lim: Limits,
-           each: &fn(&[]Val): Result[bool, DbErr]): Result[Unit, DbErr] {
+           each: &fn(mut &lexdb_store.Txn, &[]Val): Result[bool, DbErr]): Result[Unit, DbErr] {
     var rs = newRun(&sel.q)
     rs.limit(&lim)
     if !streams(sel) {
         var res = try runSel(st, txn, sel, params, lim)
         for i in 0..len(res.rows) {
             let r = replace(mut &res.rows[i], [])
-            if !(try each(&r)) { break }
+            if !(try each(txn, &r)) { break }
         }
         return Ok(Unit{})
     }
@@ -12455,11 +12604,11 @@ fn eachRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
     let q = &sel.q
     let noAggs: []Val = []
     var n = 0
-    try runQuery(st, txn, q, &m, params, fn(r: &[]Val): Result[bool, DbErr] {
+    try runQuery(st, txn, q, &m, params, fn(tx: mut &lexdb_store.Txn, r: &[]Val): Result[bool, DbErr] {
         let env = Env{cols: &q.cols, row: r, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: sqe}
         var vals: []Val = []
         for x in sel.exprs { append(mut &vals, try eval(&x, &env)) }
-        if !(try each(&vals)) { return Ok(false) }
+        if !(try each(tx, &vals)) { return Ok(false) }
         n += 1
         return Ok(sel.limit < 0 || n < sel.limit)
     }, mut &rs)
@@ -13980,7 +14129,7 @@ fn execSel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
         var batched = false
         if !later { batched = try batchGroups(st, txn, sel, &m, params, rs, mut &gs, mut &held, room, rs0max) }
         if !batched {
-        try runQuery(st, txn, q, &m, params, fn(r: &[]Val): Result[bool, DbErr] {
+        try runQuery(st, txn, q, &m, params, fn(tx: mut &lexdb_store.Txn, r: &[]Val): Result[bool, DbErr] {
             if sel.first >= 0 && isNull(&r[sel.first]) { return Ok(true) }
             if later {
                 held += rowBytes(r)
@@ -14070,7 +14219,7 @@ fn execSel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
         }
     } else if late {
         var raws: [][]Val = []
-        try runQuery(st, txn, q, &m, params, fn(r: &[]Val): Result[bool, DbErr] {
+        try runQuery(st, txn, q, &m, params, fn(tx: mut &lexdb_store.Txn, r: &[]Val): Result[bool, DbErr] {
             held += rowBytes(r)
             if room >= 0 && held > room { return Err(memErr(rs0max)) }
             append(mut &raws, copyRow(r))
@@ -14131,7 +14280,7 @@ fn execSel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
         let topK = if sorting && limit >= 0 && !sel.distinct && sel.donKey == 0 && !sel.withTies { limit + max(offset, 0) } else { -1 }
         var bar: []Val = []                 // the last kept row's sort values, once cut
         var barSet = false
-        try runQuery(st, txn, q, &m, params, fn(r: &[]Val): Result[bool, DbErr] {
+        try runQuery(st, txn, q, &m, params, fn(tx: mut &lexdb_store.Txn, r: &[]Val): Result[bool, DbErr] {
             let env = Env{cols: &q.cols, row: r, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: sqe}
             var vals: []Val = []
             for x in sel.exprs { append(mut &vals, try eval(&x, &env)) }
@@ -14987,7 +15136,8 @@ pub fn (s: &Session) status(): byte {
 }
 
 fn execIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int,
-          lim: Limits, pc: mut &PlanCache, input: &CopyInput, out: &fn(int, &[]byte): bool, pull: &fn(): CopyPart): Result[Res, DbErr] {
+          lim: Limits, pc: mut &PlanCache, input: &CopyInput, out: &fn(int, &[]byte): bool, pull: &fn(): CopyPart,
+          sink: &fn(&[]OutCol, &[]Val, bool): bool): Result[Res, DbErr] {
     try bindSeqs(st, txn, &s.seqNames)
     // with subqueries, the outer values they use are numbered after all the
     // statement's parameters: those not sent are NULL
@@ -14997,9 +15147,9 @@ fn execIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
         var ps: []Val = []
         for v in params { append(mut &ps, v) }
         while len(ps) < want { append(mut &ps, Val.Null) }
-        return execStmt(st, txn, s, &ps, ptypes, lim, pc, input, out, pull)
+        return execStmt(st, txn, s, &ps, ptypes, lim, pc, input, out, pull, sink)
     }
-    return execStmt(st, txn, s, params, ptypes, lim, pc, input, out, pull)
+    return execStmt(st, txn, s, params, ptypes, lim, pc, input, out, pull, sink)
 }
 
 fn hasSubs(s: &lexdb_sql.Stmt): bool {
@@ -15009,7 +15159,8 @@ fn hasSubs(s: &lexdb_sql.Stmt): bool {
 }
 
 fn execStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int,
-            lim: Limits, pc: mut &PlanCache, input: &CopyInput, out: &fn(int, &[]byte): bool, pull: &fn(): CopyPart): Result[Res, DbErr] {
+            lim: Limits, pc: mut &PlanCache, input: &CopyInput, out: &fn(int, &[]byte): bool, pull: &fn(): CopyPart,
+            sink: &fn(&[]OutCol, &[]Val, bool): bool): Result[Res, DbErr] {
     if st.isReplica() {
         match writesOn(s) {
             Some(what) { return Err(lexdb_store.readOnly(&what)) }
@@ -15027,7 +15178,7 @@ fn execStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
         }
         lexdb_sql.S_DROP { return dropTable(st, txn, s) }
         lexdb_sql.S_INSERT { return insert(st, txn, s, params, lim) }
-        lexdb_sql.S_SELECT { return select(st, txn, s, params, ptypes, lim, pc) }
+        lexdb_sql.S_SELECT { return select(st, txn, s, params, ptypes, lim, pc, sink) }
         lexdb_sql.S_UPDATE { return update(st, txn, s, params, lim) }
         lexdb_sql.S_DELETE { return delete(st, txn, s, params, lim) }
         lexdb_sql.S_CREATE_INDEX { return createIndex(st, txn, s) }
@@ -15111,8 +15262,21 @@ pub fn (s: mut &Session) run(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
 
 // run, keeping a SELECT's plan in pc for the next run of the same statement.
 pub fn (s: mut &Session) runCached(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int, pc: mut &PlanCache): Result[Res, DbErr] {
-    let r = s.runIn(stmt, params, ptypes, pc, &noInput(), noOut, noPull)
+    let r = s.runIn(stmt, params, ptypes, pc, &noInput(), noOut, noPull, noSink)
     if len(s.txn) == 0 { advRelease(&s.st, s.id, false) }      // its transaction over: its advisory locks (9.86)
+    return r
+}
+
+// runCached with a SELECT's rows given to sink as they are made, so they
+// are not all held (runSelTo): sink(cols, [], true) first, then each row;
+// the result then has the columns and tag, no rows. Rows that need
+// anything after the scan (a sort, grouping ...) are held and in the
+// result, sink not asked. sink giving false for a row (the client gone)
+// ends the statement (08006).
+pub fn (s: mut &Session) runRows(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int, pc: mut &PlanCache,
+                                 sink: &fn(&[]OutCol, &[]Val, bool): bool): Result[Res, DbErr] {
+    let r = s.runIn(stmt, params, ptypes, pc, &noInput(), noOut, noPull, sink)
+    if len(s.txn) == 0 { advRelease(&s.st, s.id, false) }
     return r
 }
 
@@ -15123,7 +15287,7 @@ pub fn (s: mut &Session) runCached(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes
 // COPY_NONE with its tag only.
 pub fn (s: mut &Session) runOut(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int, pc: mut &PlanCache,
                                 out: &fn(int, &[]byte): bool): Result[Res, DbErr] {
-    let r = s.runIn(stmt, params, ptypes, pc, &CopyInput{have: false, data: "", fail: "", proto: false, stream: true, pull: false}, out, noPull)
+    let r = s.runIn(stmt, params, ptypes, pc, &CopyInput{have: false, data: "", fail: "", proto: false, stream: true, pull: false}, out, noPull, noSink)
     if len(s.txn) == 0 { advRelease(&s.st, s.id, false) }
     return r
 }
@@ -15136,7 +15300,7 @@ pub fn (s: mut &Session) copyIn(stmt: &lexdb_sql.Stmt, input: CopyInput): Result
     var pc = oneShot()
     let none: []Val = []
     let nt: []int = []
-    return s.runIn(stmt, &none, &nt, mut &pc, &input, noOut, noPull)
+    return s.runIn(stmt, &none, &nt, mut &pc, &input, noOut, noPull, noSink)
 }
 
 // copyIn with the data as it arrives (9.87): pull gives its parts, the
@@ -15146,23 +15310,25 @@ pub fn (s: mut &Session) copyInFrom(stmt: &lexdb_sql.Stmt, pull: &fn(): CopyPart
     var pc = oneShot()
     let none: []Val = []
     let nt: []int = []
-    return s.runIn(stmt, &none, &nt, mut &pc, &CopyInput{have: true, data: "", fail: "", proto: false, stream: false, pull: true}, noOut, pull)
+    return s.runIn(stmt, &none, &nt, mut &pc, &CopyInput{have: true, data: "", fail: "", proto: false, stream: false, pull: true}, noOut, pull, noSink)
 }
 
 fn (s: mut &Session) runIn(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int, pc: mut &PlanCache,
-                           input: &CopyInput, out: &fn(int, &[]byte): bool, pull: &fn(): CopyPart): Result[Res, DbErr] {
+                           input: &CopyInput, out: &fn(int, &[]byte): bool, pull: &fn(): CopyPart,
+                           sink: &fn(&[]OutCol, &[]Val, bool): bool): Result[Res, DbErr] {
     // current_setting and set_config read and change the session's settings (9.92)
     var marked = false
     for n in stmt.seqNames { if n == lexdb_sql.SET_MARK { marked = true } }
-    if !marked { return s.runStmt(stmt, params, ptypes, pc, input, out, pull) }
+    if !marked { return s.runStmt(stmt, params, ptypes, pc, input, out, pull, sink) }
     s.publishSettings()
-    let r = s.runStmt(stmt, params, ptypes, pc, input, out, pull)
+    let r = s.runStmt(stmt, params, ptypes, pc, input, out, pull, sink)
     if r.isOk() { try s.takeSetConfigs() } else { s.st.memoPut(&setCfgKey(s.id), &"") }
     return r
 }
 
 fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int, pc: mut &PlanCache,
-                             input: &CopyInput, out: &fn(int, &[]byte): bool, pull: &fn(): CopyPart): Result[Res, DbErr] {
+                             input: &CopyInput, out: &fn(int, &[]byte): bool, pull: &fn(): CopyPart,
+                             sink: &fn(&[]OutCol, &[]Val, bool): bool): Result[Res, DbErr] {
     // a block's first statement may be a WAITFOR: any other but a
     // savepoint's (and BEGIN's, which does nothing in a block) ends that
     if !stmt.waitFor && stmt.kind != lexdb_sql.S_SAVEPOINT && stmt.kind != lexdb_sql.S_RELEASE &&
@@ -15418,7 +15584,7 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
         s.txn[0].live = stmt.kind == lexdb_sql.S_UPDATE || stmt.kind == lexdb_sql.S_DELETE || stmt.kind == lexdb_sql.S_INSERT ||
                         (stmt.kind == lexdb_sql.S_COPY && stmt.copy.from) || (stmt.kind == lexdb_sql.S_SELECT && stmt.lockMode > 0)
         if s.readOnly { s.txn[0].live = false }       // (a temporary table's writes: its snapshot is the session's own, 9.96)
-        let r = execIn(&st, mut &s.txn[0], stmt, params, ptypes, s.limits(), pc, input, out, pull)
+        let r = execIn(&st, mut &s.txn[0], stmt, params, ptypes, s.limits(), pc, input, out, pull, sink)
         s.txn[0].live = false
         if len(s.tmp) == 0 && len(s.txn[0].tmp) > 0 { s.tmp = s.txn[0].tmp }
         if r.isErr() {
@@ -15445,7 +15611,13 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
         let snap = (stmt.kind == lexdb_sql.S_SELECT && stmt.lockMode == 0) || explained || (stmt.kind == lexdb_sql.S_COPY && !stmt.copy.from)
         var t = if snap { try s.st.beginSnapshot() } else { lexdb_store.begin() }
         s.setUp(mut &t)
-        match execIn(&s.st, mut &t, stmt, params, ptypes, lim, pc, input, out, pull) {
+        var sent = false
+        let ran = execIn(&s.st, mut &t, stmt, params, ptypes, lim, pc, input, out, pull, fn(c: &[]OutCol, r: &[]Val, start: bool): bool {
+            let ok = sink(c, r, start)
+            if ok { sent = true }
+            return ok
+        })
+        match move(ran) {
             Ok(r) {
                 s.adopt(&t)
                 // its temporary tables' ON COMMIT (9.96)
@@ -15480,8 +15652,8 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
                 s.tmpUndo(&t)
                 s.st.abort(t)
                 tries += 1
-                // (a COPY TO sent as it ran is not run again)
-                if !(snap && x.state == "72000") || tries >= 10 || input.stream { return Err(x) }
+                // (a COPY TO sent as it ran is not run again, nor a SELECT whose rows went out)
+                if !(snap && x.state == "72000") || tries >= 10 || input.stream || sent { return Err(x) }
             }
         }
     }
@@ -15666,7 +15838,7 @@ fn (s: mut &Session) waitForRun(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &
             // its reads noted, but not past the last key each read reached
             // (Txn.openEnd): rows producers add after them do not fail the commit
             s.txn[0].openEnd = true
-            let r = execIn(&s.st, mut &s.txn[0], stmt, params, ptypes, lim, pc, &noInput(), noOut, noPull)
+            let r = execIn(&s.st, mut &s.txn[0], stmt, params, ptypes, lim, pc, &noInput(), noOut, noPull, noSink)
             s.txn[0].openEnd = false
             let res = try r
             if len(res.rows) > 0 || last { return Ok(res) }
@@ -15677,7 +15849,7 @@ fn (s: mut &Session) waitForRun(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &
             var r = waitShape(&s.st, mut &t, stmt)
             var out = tagOnly("")
             if r.isOk() {
-                match execIn(&s.st, mut &t, stmt, params, ptypes, lim, pc, &noInput(), noOut, noPull) {
+                match execIn(&s.st, mut &t, stmt, params, ptypes, lim, pc, &noInput(), noOut, noPull, noSink) {
                     Ok(x) { out = x }
                     Err(x) { r = Err(x) }
                 }
@@ -17694,7 +17866,7 @@ fn csvRecord(data: &str, o: &lexdb_sql.CopyOpts, at: int, line: mut &int, notNul
 // COPY ... TO STDOUT: its query's rows, a line each (the header first).
 fn copyOut(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int,
            lim: Limits, pc: mut &PlanCache): Result[Res, DbErr] {
-    var res = try select(st, txn, &s.inner[0], params, ptypes, lim, pc)
+    var res = try select(st, txn, &s.inner[0], params, ptypes, lim, pc, noSink)
     var names: []str = []
     for c in res.cols { append(mut &names, c.name) }
     var fq = try forced(&s.copy.forceQuote, &names, &"FORCE_QUOTE")
@@ -17734,7 +17906,7 @@ fn copyStream(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
     }
     var count = 0
     let zone = txn.zone
-    try eachRow(st, txn, &sel, params, lim, fn(r: &[]Val): Result[bool, DbErr] {
+    try eachRow(st, txn, &sel, params, lim, fn(tx: mut &lexdb_store.Txn, r: &[]Val): Result[bool, DbErr] {
         let at = copyMsgStart(mut &b)
         copyLine(r, &s.copy, &fq, &sel.outs, &zone, mut &b)
         copyMsgEnd(mut &b, at)
@@ -19496,7 +19668,7 @@ fn bAccum(sp: &BSpec, b: &Batch, rows: &[]int, gids: &[]int, one: bool, cn: mut 
 // path reads the rest of that scan from the batch's start (and gives the
 // error only if it gets to that row).
 fn batchLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Mats, row: mut &[]Val,
-              params: &[]Val, emit: &fn(&[]Val): Result[bool, DbErr], rs: mut &Run, matched: mut &bool): Result[int, DbErr] {
+              params: &[]Val, emit: &fn(mut &lexdb_store.Txn, &[]Val): Result[bool, DbErr], rs: mut &Run, matched: mut &bool): Result[int, DbErr] {
     if !rs.batch || len(q.levels) == 0 { return Ok(-1) }
     let lv = &q.levels[0]
     if !lv.perRow || lv.lateral || lv.virt() || (q.corr && pathCorr(&lv.path)) { return Ok(-1) }

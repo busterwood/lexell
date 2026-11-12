@@ -21,6 +21,7 @@ import "./lexdb_store"
 import "./lexdb_sql"
 import "./lexdb_exec"
 import "./lexdb_float"
+import "./lexdb_time"
 import "./lexdb_auth"
 import "tls"
 
@@ -61,6 +62,7 @@ type Wire = record {
     st: lexdb_store.Store
     skipping: bool
     tzShown: str                // the TimeZone the client was last told (ParameterStatus, 9.95)
+    streamed: bool              // the last runStreamed sent its rows as they came (its RowDescription too, if asked)
 }
 
 // The prepared statements and portals of a connection.
@@ -347,32 +349,63 @@ fn (w: mut &Wire) rowDesc(cols: &[]lexdb_exec.OutCol) {
 // a timestamptz's in the session's zone: 9.95).
 fn (w: mut &Wire) dataRows(rows: &[][]Val, cols: &[]lexdb_exec.OutCol) {
     let zone = w.sess.zone()
+    for r in rows { w.dataRow(r, cols, &zone) }
+}
+
+fn (w: mut &Wire) dataRow(r: &[]Val, cols: &[]lexdb_exec.OutCol, zone: &lexdb_time.Zone) {
     var ts: []str = []
-    for r in rows {
-        replace(mut &ts, [])
-        var size = 4 + 2
-        for v in r {
-            if lexdb_exec.isNull(&v) {
-                append(mut &ts, "")
-                size += 4
-            } else {
-                let t = lexdb_exec.textOut(&v, if len(ts) < len(cols) { cols[len(ts)].oid } else { 0 }, &zone)
-                size += 4 + len(t)
-                append(mut &ts, t)
-            }
-        }
-        w.out.addByte('D')
-        binary.addU32BE(mut &w.out, size)
-        binary.addU16BE(mut &w.out, len(r))
-        for k in 0..len(r) {
-            if lexdb_exec.isNull(&r[k]) {
-                binary.addU32BE(mut &w.out, 0xFFFFFFFF)
-            } else {
-                binary.addU32BE(mut &w.out, len(ts[k]))
-                w.out.add(ts[k])
-            }
+    var size = 4 + 2
+    for v in r {
+        if lexdb_exec.isNull(&v) {
+            append(mut &ts, "")
+            size += 4
+        } else {
+            let t = lexdb_exec.textOut(&v, if len(ts) < len(cols) { cols[len(ts)].oid } else { 0 }, zone)
+            size += 4 + len(t)
+            append(mut &ts, t)
         }
     }
+    w.out.addByte('D')
+    binary.addU32BE(mut &w.out, size)
+    binary.addU16BE(mut &w.out, len(r))
+    for k in 0..len(r) {
+        if lexdb_exec.isNull(&r[k]) {
+            binary.addU32BE(mut &w.out, 0xFFFFFFFF)
+        } else {
+            binary.addU32BE(mut &w.out, len(ts[k]))
+            w.out.add(ts[k])
+        }
+    }
+}
+
+// A statement run with a SELECT's rows sent as they are made
+// (Session.runRows), the output flushed each 64 kB, so a large result is
+// never held whole: in the session, nor here. desc: send RowDescription
+// first (the simple protocol; the extended one's comes from Describe).
+// check: the columns Describe gave, which a streamed result must match
+// (else its rows are held, and executeMsg refuses them). The session is out
+// of w while it runs, so that the closure can use w's connection.
+fn (w: mut &Wire) runStreamed(s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int, pc: mut &lexdb_exec.PlanCache,
+                              desc: bool, check: &Option[[]lexdb_exec.OutCol]): Result[lexdb_exec.Res, lexdb_base.DbErr] {
+    let zone = w.sess.zone()
+    w.streamed = false
+    var sess = replace(mut &w.sess, lexdb_exec.parkedSession(w.st))
+    let r = sess.runRows(s, params, ptypes, pc, fn(cols: &[]lexdb_exec.OutCol, row: &[]Val, start: bool): bool {
+        if start {
+            match check {
+                Some(want) { if !sameCols(cols, want) { return false } }
+                None {}
+            }
+            if desc { w.rowDesc(cols) }
+            w.streamed = true
+            return true
+        }
+        w.dataRow(row, cols, &zone)
+        if w.out.size() > 65536 { return w.flush().isOk() }
+        return true
+    })
+    let parked = replace(mut &w.sess, sess)
+    return r
 }
 
 fn (w: mut &Wire) complete(tag: &str) {
@@ -492,7 +525,10 @@ fn (w: mut &Wire) query(sql: &str): Result[Unit, io.IoError] {
             } else {
                 for s in stmts {
                     var pc1 = lexdb_exec.oneShot()
-                    var r = if isCopyTo(&s) { w.copyTo(&s, &none, &nt, mut &pc1) } else { w.sess.run(&s, &none, &nt) }
+                    let noCheck: Option[[]lexdb_exec.OutCol] = None
+                    var r = if isCopyTo(&s) { w.copyTo(&s, &none, &nt, mut &pc1) }
+                            else if s.kind == lexdb_sql.S_SELECT { w.runStreamed(&s, &none, &nt, mut &pc1, true, &noCheck) }
+                            else { w.sess.run(&s, &none, &nt) }
                     var cols: []lexdb_exec.OutCol = []
                     var copyIn = false
                     match r {
@@ -508,7 +544,7 @@ fn (w: mut &Wire) query(sql: &str): Result[Unit, io.IoError] {
                     match r {
                         Ok(res) {
                             if res.copy == lexdb_exec.COPY_OUT { w.copyOut(&res) }
-                            if res.hasRows {
+                            if res.hasRows && !(s.kind == lexdb_sql.S_SELECT && w.streamed) {
                                 w.rowDesc(&res.cols)
                                 w.dataRows(&res.rows, &res.cols)
                             }
@@ -740,6 +776,15 @@ fn (w: mut &Wire) runPortal(ps: &Ps, portal: &str, name: &str, plan: mut &lexdb_
     let po = ps.portals.at(portal)
     let p = ps.stmts.at(name)
     if isCopyTo(&p.stmts[0]) { return w.copyTo(&p.stmts[0], &po.params, &p.ptypes, plan) }
+    if p.stmts[0].kind == lexdb_sql.S_SELECT {
+        var check: Option[[]lexdb_exec.OutCol] = None
+        if p.colsAt >= 0 {
+            var cs: []lexdb_exec.OutCol = []
+            for c in p.cols { append(mut &cs, c) }
+            check = Some(cs)
+        }
+        return w.runStreamed(&p.stmts[0], &po.params, &p.ptypes, plan, false, &check)
+    }
     return w.sess.runCached(&p.stmts[0], &po.params, &p.ptypes, plan)
 }
 
@@ -1002,7 +1047,7 @@ pub fn serve(a: ConnArg): int {
     let ConnArg{conn: c, st: st, id: _, ctx: ctx} = move(a)
     let nd = c.setNoDelay(true)
     var w = Wire{c: c, eng: [], raw: [], bind: "", inBuf: array(65536, byte(0)), inPos: 0, inEnd: 0, out: newStrBuf(), sess: lexdb_exec.newSession(st), st: st,
-                 skipping: false, tzShown: ""}
+                 skipping: false, tzShown: "", streamed: false}
     var ps = Ps{stmts: newMap(), portals: newMap()}
     if startup(mut &w, &ctx).unwrapOr(false) {
         while true {

@@ -201,7 +201,11 @@ In three tiers, by how soon a real application meets the gap.
   - no error position is sent, so psql shows no `LINE` and caret.
 - **Memory:**
   - a query that sorts, groups or uses a window is made whole before it
-    is sent (9.84; plain queries and COPY stream);
+    is sent, at about 890 bytes a row; plain queries, INSERT ... SELECT and
+    integer series stream (9.99), as does COPY TO (9.84). T-SQL results
+    over TDS are held whole;
+  - the runtime's allocator never gives memory back to the system, so RSS
+    stays at its highest (9.99);
   - a transaction's writes stay in memory until its commit, about 176
     bytes a row (9.84);
   - a large `CREATE TABLE AS` holds its result while it inserts (9.88).

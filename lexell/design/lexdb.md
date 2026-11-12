@@ -8345,3 +8345,110 @@ can be run again.
 - T-SQL's `WAITFOR (SELECT TOP 2 ...), TIMEOUT 1000`.
 
 Over psql, a waiter returned within 5 ms of the insert that woke it.
+
+### 9.99 Rows streamed: SELECT to the client, INSERT ... SELECT, generate_series
+
+The user's report: a table of two columns (an integer, and `'ABC' ||` it),
+1M rows by `INSERT ... SELECT ... FROM generate_series`. 31 MB on disk, but
+the server's RSS went to 665 MB, and `LEXDB_CACHE_MB=128` did not help.
+After a restart, a query of the table took it past 600 MB again.
+
+**What it was.** Measured at 200k rows (a fifth, on fresh servers):
+
+| | peak before | peak after |
+|---|---|---|
+| `count(*)` of `generate_series` | 29 MB | 9 MB |
+| a SELECT of 200k rows to psql | 162 MB | 9 MB |
+| `INSERT ... SELECT generate_series` | 213 MB | 74 MB |
+| COPY FROM of the same rows (unchanged) | 73 MB | 72 MB |
+| `SELECT *` of the table after | +140 MB | +0 |
+
+- **Not the cache:** it held 7 to 25 MB, so `LEXDB_CACHE_MB` could not
+  help. It bounds the page cache only. Its default is a quarter of the
+  machine's memory.
+- **A SELECT's whole result was made before it was sent:** about 750 bytes
+  a held row, for two small values. Only COPY TO streamed (9.84).
+- **INSERT ... SELECT ran its query to the end first:** the same held rows,
+  then the transaction's writes (about 176 bytes a row, 9.84) on top.
+- **`generate_series` in FROM made all its rows first** (`execSrf` into
+  `Mats.vrows`), and `streams` refused a query with a function in FROM.
+- **The runtime gives no memory back.** lexdb's native `malloc`
+  (`compiler/native/rt.c`) reuses its small blocks but never unmaps them.
+  So RSS stays at the highest it has been: after the first 200k-row insert
+  (216 MB), two more grew it by 14 and 9 MB. The restart's 600 MB was a
+  query of the whole table: a restart with `count(*)` alone took 17 MB.
+
+**SELECT's rows to the client as they are made** (`Session.runRows`,
+`runSelTo`):
+- A row sink is a parameter from `runIn` down to `select`, as COPY TO's
+  `out` is: `sink(cols, row, start)`.
+  - It is asked first (`start`); false means the caller wants the rows held
+    (the T-SQL runner, WAITFOR, the tests' `run`).
+  - A query whose rows need anything after the scan (a sort, grouping,
+    DISTINCT, a window, OFFSET, a locking clause: `streams`) is held as
+    before and returned whole.
+  - Otherwise `eachRow` gives each row to the sink, and the result has
+    only the columns and the tag.
+- The wire (`Wire.runStreamed`) sends RowDescription at the start in the
+  simple protocol, then DataRows, flushing every 64 kB.
+  - In the extended protocol, Describe's columns are checked at the start;
+    if they differ, the rows are held and Execute refuses them, as before.
+  - Execute's row limit was already ignored (all rows sent), so nothing
+    changes for clients that set one.
+  - The session is moved out of the Wire while it runs, as for COPY TO.
+- **An error after rows went out** is an ErrorResponse after them, as in
+  PostgreSQL.
+- An autocommit SELECT whose snapshot is cancelled (72000) is not run again
+  once rows were sent. A sink giving false (the client gone) ends the
+  statement (08006).
+
+**INSERT ... SELECT inserts each row as the query gives it** (`eachRow`
+into `insertSelRow`).
+- The row callbacks (`emit` in `runQuery`, `eachRow`'s) now receive the
+  transaction, so the insert can write through it while the query reads.
+  The query's scan is between batches when a row is given (rows are fetched
+  in batches), so the transaction is free then.
+- A query that reads the table it inserts into (in FROM, a view over it, a
+  subquery or a set operation's branch: `stmtReads`) runs to its end first,
+  as before, so it never reads its own rows.
+
+**An integer `generate_series` that a query reads first is made as it is
+read** (`lazySeries`, `seriesRes`, `runLevel`).
+- Its arguments are taken in `prepare`, and the level loop makes the
+  values, stepping and stopping as `execSrf` does.
+- Not for:
+  - other types (numeric, timestamps);
+  - a series read by a later level (a hash join holds its rows);
+  - a CTE;
+  - one whose arguments depend on the row (LATERAL).
+
+**Left as it was:**
+- **Held rows are costly:** a sorted query of one integer column still
+  holds about 890 bytes a row (178 MB for 200k rows). Each row is two
+  arrays (its values and its sort key) in a growing list, plus the sort's
+  index arrays. The allocator's size classes do not share freed memory.
+  Not changed here.
+- **T-SQL over TDS:** results are still held. The reply is one message, and
+  the batch's events are gathered before any is sent. Streaming there needs
+  the TDS layer to send a reply in parts, and a sink through the T-SQL
+  runner.
+- **A transaction's writes:** about 176 bytes a row until its commit (9.84).
+- **The runtime keeping freed memory:** below.
+
+**Tests:**
+- `wire_stream` (new), with `max_statement_mem` at 256 kB, which a held
+  result of these sizes is over:
+  - 50000 rows by the simple and the extended protocols, all in order;
+  - a sorted query still held, so over the limit (53200);
+  - a division by zero at row 30000: the error after rows went out, then
+    the connection goes on;
+  - a prepared statement described then run;
+  - rows streamed in a block.
+- `exec_srf`:
+  - `count(*)` of a 1M-row integer series under the 256 kB limit now
+    completes; a numeric series is held and refused;
+  - an `INSERT ... SELECT` of 100,000 rows under the limit completes;
+  - one reading its own table is held and refused, and a small one of its
+    own table works.
+
+The suite passes (107).
