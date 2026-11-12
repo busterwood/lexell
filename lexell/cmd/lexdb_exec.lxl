@@ -5010,6 +5010,10 @@ fn (q: &Query) implied(cs: &[]Expr): []Expr {
 // (optimizer 25) stands.
 
 const JOIN_SEARCH_MAX: int = 12
+// Exact search to this many tables; past it SQLite's N-best search, keeping
+// the JOIN_BEST cheapest partial orders at each step (optimizer 28).
+const JOIN_EXACT_MAX: int = 8
+const JOIN_BEST: int = 10
 const HASH_PROBE: float = 0.1f
 const HASH_BUILD: float = 0.2f
 const ROW_COST: float = 0.1f
@@ -5143,6 +5147,50 @@ fn (q: &Query) distinctOf(name: &str, k: int): float {
     return fmax(t / 10.0f, 1.0f)
 }
 
+// The cost of joining level k to the set mask (rin its rows; rnext the rows
+// of the set with k): its constant way read once and hashed, then a probe
+// per row; or a lookup per row, whichever is cheaper (once: the first).
+fn (q: &Query) joinStep(k: int, cands: &[]WayCand, base: &Way, mask: int, rin: float, rnext: float, hashed: mut &bool): float {
+    let out = rnext * ROW_COST
+    var add = base.cost + base.rows * HASH_BUILD + rin * HASH_PROBE + out
+    hashed = true
+    let w = q.wayInto(k, cands, mask, true)
+    if w.rows >= 0.0f && rin * w.cost + out < add {
+        add = rin * w.cost + out
+        hashed = false
+    }
+    return add
+}
+
+// Keeps the JOIN_BEST cheapest of the partial orders, cheapest first (a tie:
+// the earlier).
+fn bestOf(pm: mut &[]int, pc: mut &[]float, po: mut &[][]int, pf: mut &[][]bool) {
+    var taken: []bool = array(len(pm), false)
+    var m: []int = []
+    var c: []float = []
+    var o: [][]int = []
+    var f: [][]bool = []
+    while len(m) < JOIN_BEST && len(m) < len(pm) {
+        var b = -1
+        for i in 0..len(pm) { if !taken[i] && (b < 0 || pc[i] < pc[b]) { b = i } }
+        taken[b] = true
+        append(mut &m, pm[b])
+        append(mut &c, pc[b])
+        append(mut &o, replace(mut &po[b], []))
+        append(mut &f, replace(mut &pf[b], []))
+    }
+    pm = m
+    pc = c
+    po = o
+    pf = f
+}
+
+fn copyBools(xs: &[]bool): []bool {
+    var out: []bool = []
+    for x in xs { append(mut &out, x) }
+    return out
+}
+
 // The cheapest order by cost: perm (old indexes, [] when it is FROM's) and
 // per new place whether it is read once. false: it does not apply (a table
 // without statistics, an outer join, LATERAL, too many tables).
@@ -5222,47 +5270,103 @@ fn (q: &Query) costOrder(ms: &[][]Expr, perm: mut &[]int, ro: mut &[]bool): bool
             last[mask] = low
         }
     }
-    for mask in 1..full + 1 {
-        if cost[mask] < 0.0f { continue }
-        let rin = rows[mask]
-        let linked = (nbr[mask] & ~mask) != 0
-        for k in 0..nl {
-            if (mask & (1 << k)) != 0 { continue }
-            if linked && (adj[k] & mask) == 0 { continue }       // a cross product while a join is left
-            let next = mask | (1 << k)
-            let out = rows[next] * ROW_COST
-            // once: its constant way and its rows hashed, then a probe per
-            // row; or a lookup per row
-            var add = base[k].cost + base[k].rows * HASH_BUILD + rin * HASH_PROBE + out
-            var o = true
-            let w = q.wayInto(k, &cands[k], mask, true)
-            if w.rows >= 0.0f && rin * w.cost + out < add {
-                add = rin * w.cost + out
-                o = false
-            }
-            let total = cost[mask] + add
-            if cost[next] < 0.0f || total < cost[next] {
-                cost[next] = total
-                last[next] = k
-                lastOnce[next] = o
+    var order: []int = []
+    var flags: []bool = []
+    if nl <= JOIN_EXACT_MAX {
+        for mask in 1..full + 1 {
+            if cost[mask] < 0.0f { continue }
+            let rin = rows[mask]
+            let linked = (nbr[mask] & ~mask) != 0
+            for k in 0..nl {
+                if (mask & (1 << k)) != 0 { continue }
+                if linked && (adj[k] & mask) == 0 { continue }       // a cross product while a join is left
+                let next = mask | (1 << k)
+                var o = false
+                let total = cost[mask] + q.joinStep(k, &cands[k], &base[k], mask, rin, rows[next], mut &o)
+                if cost[next] < 0.0f || total < cost[next] {
+                    cost[next] = total
+                    last[next] = k
+                    lastOnce[next] = o
+                }
             }
         }
-    }
-    var rev: []int = []
-    var revOnce: []bool = []
-    var m = full
-    while m != 0 {
-        let k = last[m]
-        append(mut &rev, k)
-        append(mut &revOnce, lastOnce[m] && (m & ~(1 << k)) != 0)
-        m = m & ~(1 << k)
+        var rev: []int = []
+        var revOnce: []bool = []
+        var m = full
+        while m != 0 {
+            let k = last[m]
+            append(mut &rev, k)
+            append(mut &revOnce, lastOnce[m] && (m & ~(1 << k)) != 0)
+            m = m & ~(1 << k)
+        }
+        for i in 0..nl {
+            append(mut &order, rev[nl - 1 - i])
+            append(mut &flags, revOnce[nl - 1 - i])
+        }
+    } else {
+        // SQLite's N-best search: at each step the JOIN_BEST cheapest
+        // partial orders are kept (one per set of tables), each extended by
+        // every table it may take next
+        var pm: []int = []
+        var pc: []float = []
+        var po: [][]int = []
+        var pf: [][]bool = []
+        for k in 0..nl {
+            append(mut &pm, 1 << k)
+            append(mut &pc, base[k].cost)
+            append(mut &po, [k])
+            append(mut &pf, [false])
+        }
+        bestOf(mut &pm, mut &pc, mut &po, mut &pf)
+        for step in 1..nl {
+            var nm: []int = []
+            var nc: []float = []
+            var no: [][]int = []
+            var nf: [][]bool = []
+            for p in 0..len(pm) {
+                let mask = pm[p]
+                let rin = rows[mask]
+                let linked = (nbr[mask] & ~mask) != 0
+                for k in 0..nl {
+                    if (mask & (1 << k)) != 0 { continue }
+                    if linked && (adj[k] & mask) == 0 { continue }
+                    let next = mask | (1 << k)
+                    var o = false
+                    let total = pc[p] + q.joinStep(k, &cands[k], &base[k], mask, rin, rows[next], mut &o)
+                    var at = -1
+                    for j in 0..len(nm) { if nm[j] == next { at = j } }
+                    if at >= 0 && nc[at] <= total { continue }
+                    var ord = copyInts(&po[p])
+                    append(mut &ord, k)
+                    var fl = copyBools(&pf[p])
+                    append(mut &fl, o)
+                    if at < 0 {
+                        append(mut &nm, next)
+                        append(mut &nc, total)
+                        append(mut &no, ord)
+                        append(mut &nf, fl)
+                    } else {
+                        nc[at] = total
+                        no[at] = ord
+                        nf[at] = fl
+                    }
+                }
+            }
+            bestOf(mut &nm, mut &nc, mut &no, mut &nf)
+            pm = nm
+            pc = nc
+            po = no
+            pf = nf
+        }
+        // the cheapest (the first: bestOf orders them)
+        order = replace(mut &po[0], [])
+        flags = replace(mut &pf[0], [])
     }
     var ident = true
     for i in 0..nl {
-        let k = rev[nl - 1 - i]
-        append(perm, k)
-        append(ro, revOnce[nl - 1 - i])
-        if k != i { ident = false }
+        append(perm, order[i])
+        append(ro, flags[i])
+        if order[i] != i { ident = false }
     }
     if ident { perm = [] }
     return true

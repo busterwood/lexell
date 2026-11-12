@@ -39,8 +39,9 @@ kept per parameter outcome (section 22), per-value estimates with
 per-parameter plans (section 23), estimates deciding beyond ties with
 primary-key statistics (section 24), the constraint-bound join order
 (section 25), the cost-based join order with its planning-time measurement
-(section 26), and implied equalities (section 27, uncommitted). Code
-comments cite these sections as "optimizer N".
+(section 26), implied equalities (section 27), and SQLite's N-best search
+past 8 tables (section 28, uncommitted). Code comments cite these sections
+as "optimizer N".
 
 ## 1. Summary
 
@@ -1593,10 +1594,48 @@ records in the loop over every set and tripled the chain's time (147 to
 450 us); flat arrays fixed it. A `for ... in` over records was measured and
 does not copy.
 
-**Open (the user's call).** The 12-table bound with about 1.6 ms for a
-12-table star, paid once per prepared statement and on every simple-query
-run. A bound of 10, or SQLite's N-best search for dense joins above 8
-tables, would cut it.
+**Open (the user's call), answered.** About 1.6 ms for a 12-table star.
+The user chose SQLite's N-best search (section 28).
+
+## 28. SQLite's N-best search past 8 tables (2026-11-12)
+
+The user's choice after section 27's star measurement.
+
+**What.** Up to `JOIN_EXACT_MAX` (8) tables, the search stays exact (section
+26). Past that, up to `JOIN_SEARCH_MAX` (12), it is SQLite's: the orders
+are built one table at a time, and at each step only the `JOIN_BEST` (10)
+cheapest partial orders are kept, one per set of tables (the cheaper of two
+orders of the same tables). Each is extended by every table it may take
+next. The costs, row estimates, pruning and lookup-or-hash choice are the
+exact search's (`joinStep`, shared), so the two can differ only where the N-best
+search drops an order that would have become the cheapest. SQLite keeps 10
+for three tables or more; the same here.
+
+**Measured** (`plan_time.lxl`, load about 1, microseconds per EXPLAIN; the
+exact column is the same build with `JOIN_EXACT_MAX` at 12):
+
+| Query | Exact | N-best |
+|---|---|---|
+| 12 tables, chain | 167 | 173 |
+| 12 tables, star | 1,725 | 441 |
+
+The plans chosen are the same for both queries (compared line by line).
+The chain gains nothing: the pruning had already cut it to 78 sets, and the
+rest of its time is the setup, the rows of every set (an array of 2^n,
+which also keeps the bound at 12 for now). Up to 8 tables nothing changed:
+63 us at 8.
+
+**Test.** `exec_joincost` has a 10-table chain written from the far end, its
+filtered table last in FROM, so the N-best search runs in the suite. The plan
+starts from the filtered table's index (an estimated 10 rows) and looks up
+each next table; the count equals the rules mode's.
+
+**Not done.** Raising the 12-table bound: the N-best search itself would
+allow it (SQLite plans 64), but the rows of every set are computed up front
+(2^n). They would have to be computed as needed first. Also: the filter in
+the first version of the test was on an unindexed column, and the model
+ignored it (all ten tables estimated alike, FROM order kept). That is the
+known gap of section 26: filters on unindexed columns.
 
 ## Sources
 
