@@ -367,6 +367,7 @@ fn noCopyOpts(): CopyOpts {
 pub const OVR_NONE = 0
 pub const OVR_SYSTEM = 1        // OVERRIDING SYSTEM VALUE: an ALWAYS identity column takes the value given
 pub const OVR_USER = 2          // OVERRIDING USER VALUE: identity columns take their defaults
+pub const OVR_TSQL = 3          // T-SQL's SET IDENTITY_INSERT t ON: as OVR_SYSTEM, and a value past the identity's moves it there
 
 // ALTER TABLE's actions (Alter.kind).
 pub const A_ADD = 1             // ADD COLUMN
@@ -477,12 +478,20 @@ pub type Stmt = record {
     pub into: str               // SELECT ... INTO t: t (9.88); made a CREATE TABLE ... AS
     pub exprs: []Expr           // CREATE INDEX: per column, its expression (9.89; a Lit NULL for a column, whose name is in names)
     pub assign: []str           // T-SQL SELECT @v = expr, ...: each item's variable ("" none); [] no assignment (design/lexdb-tds.md)
+    pub topMode: int            // T-SQL TOP n (in limit): TOP_PERCENT, TOP_TIES (bits); 0 plain (design/lexdb-tds.md S3)
     // The spelling of the name the statement makes (CREATE TABLE, VIEW, ...
     // AS, SELECT INTO; L6), "" as table's; and of names', parallel to them
     // where they name columns it makes (CREATE VIEW, CREATE TABLE ... AS)
     pub spell: str
     pub spells: []str
 }
+
+// A result column with no name (T-SQL's 1 + 1, count(*)): its OutCol's
+// spell; lexdb_tds sends no name.
+pub const ANON: str = "\x01"
+
+pub const TOP_PERCENT = 1
+pub const TOP_TIES = 2
 
 pub const CONFLICT_NONE = 0
 pub const CONFLICT_NOTHING = 1
@@ -549,7 +558,7 @@ pub fn newStmt(kind: int): Stmt {
                 group: [], order: [], limit: None, offset: None, sets: [], params: 0, from: [], index: "",
                 unique: false, inner: [], distinct: false, having: None, subs: [], use: 0, setop: 0, setAll: false,
                 cte: -1, rec: false, cascade: false, src: "", srf: "", ordin: false, alters: [], cons: [], seqNames: [], seq: noSeqOpts(), idOpts: [], overriding: OVR_NONE,
-                copy: noCopyOpts(), wins: [], windows: [], conflict: CONFLICT_NONE, conflictCols: [], conflictCon: "", alias: "", conc: false, lockMode: 0, lockOf: [], lockWait: 0, noData: false, into: "", exprs: [], assign: [], spell: "", spells: []}
+                copy: noCopyOpts(), wins: [], windows: [], conflict: CONFLICT_NONE, conflictCols: [], conflictCon: "", alias: "", conc: false, lockMode: 0, lockOf: [], lockWait: 0, noData: false, into: "", exprs: [], assign: [], topMode: 0, spell: "", spells: []}
 }
 
 // ---- the lexer
@@ -1124,7 +1133,8 @@ fn (p: mut &P) cmpExpr(): Result[Expr, lexdb_base.DbErr] {
         neg = true
     }
     if p.isKw("like") || p.isKw("ilike") {
-        let kw = p.next().text
+        var kw = p.next().text
+        if p.tsql && kw == "like" { kw = "#tlike" }        // T-SQL's [sets] (lexdb_tsqlfn)
         var args: []Expr = [e]
         append(mut &args, try p.catExpr())
         if p.acceptKw("escape") { append(mut &args, try p.catExpr()) }
@@ -1190,7 +1200,8 @@ fn (p: mut &P) addExpr(): Result[Expr, lexdb_base.DbErr] {
     while p.isKw("+") || p.isKw("-") {
         let op = p.next().text
         let r = try p.mulExpr()
-        e = Expr.Bin(op, e, r)
+        // T-SQL's +: strings joined too (lexdb_exec: "t+")
+        e = Expr.Bin(if p.tsql && op == "+" { "t+" } else { op }, e, r)
     }
     return Ok(e)
 }
@@ -1498,10 +1509,12 @@ fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
                 try p.expectKw("as")
                 let ty = try p.typeName()
                 try p.expectKw(")")
+                if p.tsql { return Ok(tsqlCast(e, ty, None)) }
                 return Ok(Expr.Cast(e, ty))
             }
             // the date and time keywords that are not called (9.76)
             "current_date", "current_timestamp", "localtimestamp", "current_time", "localtime" {
+                if p.tsql && t.text == "current_timestamp" { return Ok(Expr.Call("localtimestamp", [], false)) }     // GETDATE()
                 if p.acceptKw("(") {
                     let n = try p.intLit()        // a precision: rounded to it
                     try p.expectKw(")")
@@ -1542,6 +1555,25 @@ fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
         let fn2 = (t.text == "left" || t.text == "right") && p.isKw("(")
         if isReserved(&t.text) && !fn2 { return Err(near(&t)) }
     }
+    if p.tsql && t.kind == T_IDENT && p.isKw("(") && (t.text == "convert" || t.text == "try_convert" || t.text == "try_cast") {
+        p.pos += 1
+        var x = Expr.Lit(Val.Null)
+        var ty = TypeName{kind: 0, oid: 0, prec: 0, scale: 0, len: 0}
+        var style: Option[Expr] = None
+        if t.text == "try_cast" {
+            x = try p.expr()
+            try p.expectKw("as")
+            ty = try p.typeName()
+        } else {
+            ty = try p.typeName()
+            try p.expectKw(",")
+            x = try p.expr()
+            if p.acceptKw(",") { style = Some(try p.expr()) }
+        }
+        try p.expectKw(")")
+        let c = tsqlCast(x, ty, style)
+        return Ok(if t.text == "convert" { c } else { Expr.Call("#try", [c], false) })
+    }
     if t.kind == T_IDENT || t.kind == T_QIDENT {
         if p.isKw("(") && t.kind == T_IDENT {
             p.pos += 1
@@ -1580,6 +1612,26 @@ fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
                 }
             }
             try p.expectKw(")")
+            if p.tsql && p.isKw("within") {
+                // STRING_AGG(x, sep) WITHIN GROUP (ORDER BY k [ASC | DESC], ...):
+                // the keys after the arguments, as agg(... ORDER BY ...); SQL
+                // Server's NULLs first going up, last going down
+                p.pos += 1
+                try p.expectKw("group")
+                try p.expectKw("(")
+                try p.expectKw("order")
+                try p.expectKw("by")
+                var dirs = ""
+                while true {
+                    append(mut &args, try p.expr())
+                    var desc = false
+                    if p.acceptKw("desc") { desc = true } else { let asc = p.acceptKw("asc") }
+                    dirs = dirs + (if desc { "D" } else { "A" })
+                    if !p.acceptKw(",") { break }
+                }
+                try p.expectKw(")")
+                fname = fname + " order:" + dirs
+            }
             if p.acceptKw("filter") {
                 // agg(...) FILTER (WHERE cond): the condition is the last argument
                 try p.expectKw("(")
@@ -1595,6 +1647,7 @@ fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
                     None {}
                 }
             }
+            if p.tsql && !p.isKw("over") { return p.tsqlCall(&fname, args, star) }
             if p.acceptKw("over") {
                 // a window call (9.46): kept in the query, named here by number
                 var d = try p.over()
@@ -1620,6 +1673,118 @@ fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
         return Ok(Expr.Col(name))
     }
     return Err(near(&t))
+}
+
+// T-SQL's CAST and CONVERT (design/lexdb-tds.md S3): to a string of n
+// characters a longer value is cut (SQL Server's), a date or time with a
+// style written so (lexdb_tsqlfn's #datestyle).
+fn tsqlCast(x: Expr, ty: TypeName, style: Option[Expr]): Expr {
+    var v = x
+    var sty = style
+    if ty.kind == K_INT { v = Expr.Call("#tint", [v], false) }
+    if ty.kind == K_TEXT {
+        match replace(mut &sty, None) {
+            Some(st) { v = Expr.Call("#datestyle", [v, st], false) }
+            None {}
+        }
+        if ty.len > 0 {
+            let text = TypeName{kind: K_TEXT, oid: OID_TEXT, prec: 0, scale: 0, len: 0}
+            v = Expr.Call("left", [Expr.Cast(v, text), Expr.Lit(Val.Int(ty.len))], false)
+        }
+    }
+    return Expr.Cast(v, ty)
+}
+
+// A date part's name as T-SQL's date functions take it (day, dd, d), canonical.
+fn datePart(x: &Expr): Option[Expr] {
+    var w = ""
+    match x {
+        Expr.Col(n) { w = n }
+        Expr.Lit(v) { match v { Val.Text(s) { w = strings.toLowerAscii(s) } else {} } }
+        else {}
+    }
+    let c = match w {
+        "year", "yy", "yyyy" { "year" }
+        "quarter", "qq", "q" { "quarter" }
+        "month", "mm", "m" { "month" }
+        "dayofyear", "dy", "y" { "dayofyear" }
+        "day", "dd", "d" { "day" }
+        "week", "wk", "ww" { "week" }
+        "weekday", "dw", "w" { "weekday" }
+        "hour", "hh" { "hour" }
+        "minute", "mi", "n" { "minute" }
+        "second", "ss", "s" { "second" }
+        "millisecond", "ms" { "millisecond" }
+        "microsecond", "mcs" { "microsecond" }
+        "nanosecond", "ns" { "nanosecond" }
+        else { "" }
+    }
+    if len(c) == 0 { return None }
+    return Some(Expr.Lit(Val.Text(c)))
+}
+
+// T-SQL's functions on lexdb's (or lexdb_tsqlfn's, named #...) where they
+// differ (design/lexdb-tds.md S3); any other call as it is.
+fn (p: mut &P) tsqlCall(name: &str, args: []Expr, star: bool): Result[Expr, lexdb_base.DbErr] {
+    let n = len(args)
+    var a = args
+    let float8 = TypeName{kind: K_FLOAT, oid: OID_FLOAT8, prec: 0, scale: 0, len: 0}
+    match name.toStr() {
+        "len" { return Ok(Expr.Call("#len", a, false)) }
+        "datalength" { return Ok(Expr.Call("#datalength", a, false)) }
+        "replicate" { return Ok(Expr.Call("repeat", a, false)) }
+        "space" { if n == 1 { return Ok(Expr.Call("repeat", [Expr.Lit(Val.Text(" ")), replace(mut &a[0], Expr.Lit(Val.Null))], false)) } }
+        "stuff" { return Ok(Expr.Call("#stuff", a, false)) }
+        "isnull" { return Ok(Expr.Call("coalesce", a, false)) }
+        "iif" { if n == 3 { return Ok(Expr.Call("case else", a, false)) } }
+        "choose" {
+            if n >= 2 {
+                var xs: []Expr = []
+                for i in 1..n {
+                    append(mut &xs, Expr.Bin("=", cloneE(&a[0]), Expr.Lit(Val.Int(i))))
+                    append(mut &xs, replace(mut &a[i], Expr.Lit(Val.Null)))
+                }
+                return Ok(Expr.Call("case", xs, false))
+            }
+        }
+        "getdate", "sysdatetime", "sysdatetimeoffset" { return Ok(Expr.Call("localtimestamp", [], false)) }
+        "getutcdate", "sysutcdatetime" { return Ok(Expr.Call("#utcnow", [], false)) }
+        "dateadd", "datediff", "datepart", "datename", "datediff_big" {
+            if n >= 2 {
+                match datePart(&a[0]) {
+                    Some(dp) { a[0] = dp }
+                    None { return Err(lexdb_base.err("TS155", "'" + exprText(&a[0]) + "' is not a recognized " + name + " option.")) }
+                }
+                let f = if name == "datediff_big" { "#datediff" } else { "#" + name }
+                return Ok(Expr.Call(f, a, false))
+            }
+        }
+        "year", "month", "day" { if n == 1 { return Ok(Expr.Call("#datepart", [Expr.Lit(Val.Text(name.toStr())), replace(mut &a[0], Expr.Lit(Val.Null))], false)) } }
+        "eomonth" { return Ok(Expr.Call("#eomonth", a, false)) }
+        "datefromparts" { return Ok(Expr.Call("make_date", a, false)) }
+        "round" { return Ok(Expr.Call("#round", a, false)) }
+        "power" { return Ok(Expr.Call("#power", a, false)) }
+        "ceiling" { return Ok(Expr.Call("ceil", a, false)) }
+        "sqrt", "exp", "log10", "square" {
+            if n == 1 {
+                let x = Expr.Cast(replace(mut &a[0], Expr.Lit(Val.Null)), float8)
+                if name == "square" { return Ok(Expr.Bin("*", cloneE(&x), x)) }
+                return Ok(Expr.Call(name.toStr(), [x], false))
+            }
+        }
+        "log" { if n == 1 { return Ok(Expr.Call("ln", [Expr.Cast(replace(mut &a[0], Expr.Lit(Val.Null)), float8)], false)) } }
+        "newid" { return Ok(Expr.Call("gen_random_uuid", [], false)) }
+        "db_name" { return Ok(Expr.Call("current_database", [], false)) }
+        "schema_name" { if n == 0 { return Ok(Expr.Lit(Val.Text("dbo"))) } }
+        "user_name", "suser_sname", "suser_name", "original_login" {
+            if n == 0 {
+                append(mut &p.seqs, CAT_MARK)
+                return Ok(Expr.Call("current_user", [], false))
+            }
+        }
+        else {}
+    }
+    return Ok(Expr.Call(name.toStr(), a, star))
 }
 
 // ---- statements
@@ -1669,6 +1834,8 @@ fn (p: mut &P) createTable(): Result[Stmt, lexdb_base.DbErr] {
                     c.def = Some(try p.defaultExpr())
                 } else if p.acceptKw("generated") {
                     try p.identity(mut &c, mut &s)
+                } else if p.tsql && p.acceptKw("identity") {
+                    try p.tsqlIdentity(mut &c, mut &s)
                 } else if p.acceptKw("unique") {
                     try p.uniqueTail()
                     var u = newConstraint(C_UNIQUE, cn)
@@ -1946,6 +2113,25 @@ fn (p: mut &P) collName(): Result[str, lexdb_base.DbErr] {
 }
 
 // After GENERATED: {ALWAYS | BY DEFAULT} AS IDENTITY [(options)].
+// T-SQL's IDENTITY [(seed, increment)], after IDENTITY: an identity column
+// a value given to is refused (unless SET IDENTITY_INSERT is ON for the
+// table: design/lexdb-tds.md S3).
+fn (p: mut &P) tsqlIdentity(c: mut &ColDef, s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
+    c.identity = ID_ALWAYS
+    c.notNull = true
+    var o = noSeqOpts()
+    if p.acceptKw("(") {
+        o.start = try p.signedInt()
+        o.hasStart = true
+        try p.expectKw(",")
+        o.inc = try p.signedInt()
+        o.hasInc = true
+        try p.expectKw(")")
+    }
+    append(mut &s.idOpts, IdOpts{col: c.name, opts: o})
+    return Ok(Unit{})
+}
+
 fn (p: mut &P) identity(c: mut &ColDef, s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
     if p.acceptKw("always") {
         c.identity = ID_ALWAYS
@@ -2145,6 +2331,8 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
                 } else if p.acceptKw("null") {
                 } else if p.acceptKw("generated") {
                     try p.identity(mut &a.col, mut &s)
+                } else if p.tsql && p.acceptKw("identity") {
+                    try p.tsqlIdentity(mut &a.col, mut &s)
                 } else if p.isKw("primary") {
                     return Err(lexdb_base.err("0A000", "lexdb: a table's primary key cannot be changed"))
                 } else if p.acceptKw("default") {
@@ -2691,13 +2879,27 @@ fn (p: mut &P) itemListAssign(items: mut &[]SelItem, assign: mut &[]str): Result
             while len(assign) < len(items) { append(assign, "") }
             append(assign, q.text)
             append(items, SelItem{star: false, qual: "", expr: Some(e), alias: q.text, spell: ""})
+        } else if p.tsql && (q.kind == T_QIDENT || q.kind == T_STR || (q.kind == T_IDENT && !isReserved(&q.text))) &&
+                  p.peekAt(1).kind == T_OP && p.peekAt(1).text == "=" {
+            // T-SQL: SELECT alias = expr
+            p.pos += 2
+            let e = try p.expr()
+            let al = if q.kind == T_STR { strings.toLowerAscii(q.text) } else { q.text }
+            let sp = if q.kind == T_STR { q.text } else { q.spell }
+            append(items, SelItem{star: false, qual: "", expr: Some(e), alias: al, spell: sp})
         } else {
             let e = try p.expr()
             // the column's name as written (L6): a bare column's, or the alias's
             var spell = ""
             if isColExpr(&e) && p.pos > 0 { spell = p.toks[p.pos - 1].spell }
             var alias = ""
-            if p.acceptKw("as") {
+            if p.tsql && (p.peek().kind == T_STR || (p.isKw("as") && p.peekAt(1).kind == T_STR)) {
+                // T-SQL: expr [AS] 'alias'
+                let a0 = p.acceptKw("as")
+                let t = p.next()
+                alias = strings.toLowerAscii(t.text)
+                spell = t.text
+            } else if p.acceptKw("as") {
                 alias = try p.name()
                 spell = p.spelled
             } else {
@@ -2708,6 +2910,8 @@ fn (p: mut &P) itemListAssign(items: mut &[]SelItem, assign: mut &[]str): Result
                     p.pos += 1
                 }
             }
+            // T-SQL: a column that is neither a table's nor named has no name
+            if p.tsql && len(alias) == 0 && !isColExpr(&e) { spell = ANON }
             append(items, SelItem{star: false, qual: "", expr: Some(e), alias: alias, spell: spell})
         }
         if !p.acceptKw(",") { break }
@@ -2730,6 +2934,7 @@ fn (p: mut &P) selectCore(): Result[Stmt, lexdb_base.DbErr] {
     } else {
         let all = p.acceptKw("all")
     }
+    if p.tsql && p.acceptKw("top") { try p.top(mut &s, true) }
     try p.itemListAssign(mut &s.items, mut &s.assign)
     if len(s.assign) > 0 {
         while len(s.assign) < len(s.items) { append(mut &s.assign, "") }
@@ -2817,6 +3022,26 @@ fn (p: mut &P) lockClause(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
     return Ok(Unit{})
 }
 
+// T-SQL's TOP, after TOP: n or (expr), then (in a SELECT) PERCENT and
+// WITH TIES; its count in limit.
+fn (p: mut &P) top(s: mut &Stmt, sel: bool): Result[Unit, lexdb_base.DbErr] {
+    if p.acceptKw("(") {
+        s.limit = Some(try p.expr())
+        try p.expectKw(")")
+    } else {
+        let t = p.next()
+        if t.kind != T_NUM { return Err(near(&t)) }
+        p.pos -= 1
+        s.limit = Some(try p.primary())
+    }
+    if sel && p.acceptKw("percent") { s.topMode = s.topMode | TOP_PERCENT }
+    if sel && p.isKw("with") && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "ties" {
+        p.pos += 2
+        s.topMode = s.topMode | TOP_TIES
+    }
+    return Ok(Unit{})
+}
+
 fn (p: mut &P) orderLimit(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
     if p.acceptKw("order") {
         try p.expectKw("by")
@@ -2824,7 +3049,7 @@ fn (p: mut &P) orderLimit(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
             let e = try p.expr()
             var desc = false
             if p.acceptKw("desc") { desc = true } else { let a = p.acceptKw("asc") }
-            var nf = desc
+            var nf = if p.tsql { !desc } else { desc }      // SQL Server's NULLs are the least
             if p.acceptKw("nulls") {
                 if p.acceptKw("first") { nf = true } else {
                     try p.expectKw("last")
@@ -2835,9 +3060,15 @@ fn (p: mut &P) orderLimit(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
             if !p.acceptKw(",") { break }
         }
     }
-    while p.isKw("limit") || p.isKw("offset") || p.isKw("for") {
+    while p.isKw("limit") || p.isKw("offset") || p.isKw("for") || p.isKw("fetch") {
         if p.acceptKw("for") {
             try p.lockClause(s)
+        } else if p.acceptKw("fetch") {
+            // FETCH {FIRST | NEXT} [n] {ROW | ROWS} ONLY: a limit (SQL's, T-SQL's)
+            if !p.acceptKw("first") { try p.expectKw("next") }
+            if p.isKw("row") || p.isKw("rows") { s.limit = Some(Expr.Lit(Val.Int(1))) } else { s.limit = Some(try p.expr()) }
+            if !p.acceptKw("row") { try p.expectKw("rows") }
+            try p.expectKw("only")
         } else if p.acceptKw("limit") {
             if p.acceptKw("all") { s.limit = None } else { s.limit = Some(try p.expr()) }
         } else {
@@ -3099,6 +3330,7 @@ fn (p: mut &P) indexCol(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
 // (FROM and the alias: 9.91). The alias in alias, FROM's items in from.
 fn (p: mut &P) update(): Result[Stmt, lexdb_base.DbErr] {
     var s = newStmt(S_UPDATE)
+    if p.tsql && p.acceptKw("top") { try p.top(mut &s, false) }      // T-SQL: UPDATE TOP (n)
     try p.dmlTarget(mut &s)
     try p.expectKw("set")
     try p.setList(mut &s)
@@ -3110,8 +3342,10 @@ fn (p: mut &P) update(): Result[Stmt, lexdb_base.DbErr] {
 
 // DELETE FROM [ONLY] t [[AS] alias] [USING list] [WHERE ...] [RETURNING ...]
 fn (p: mut &P) delete(): Result[Stmt, lexdb_base.DbErr] {
-    try p.expectKw("from")
     var s = newStmt(S_DELETE)
+    // T-SQL: DELETE [TOP (n)] [FROM] t
+    if p.tsql && p.acceptKw("top") { try p.top(mut &s, false) }
+    if !p.tsql || p.isKw("from") { try p.expectKw("from") }
     try p.dmlTarget(mut &s)
     if p.acceptKw("using") { try p.fromList(mut &s.from, J_CROSS) }
     if p.acceptKw("where") { s.where = Some(try p.expr()) }
@@ -3368,7 +3602,7 @@ fn (p: mut &P) winSpec(): Result[WinDef, lexdb_base.DbErr] {
             let x = try p.expr()
             var desc = false
             if p.acceptKw("desc") { desc = true } else { let a = p.acceptKw("asc") }
-            var nf = desc                   // NULLs come first going down, last going up
+            var nf = if p.tsql { !desc } else { desc }      // NULLs first going down, last going up (SQL Server: the other way)
             if p.acceptKw("nulls") {
                 if p.acceptKw("first") { nf = true } else {
                     try p.expectKw("last")
@@ -4121,7 +4355,7 @@ fn (p: mut &P) tsqlType(w: &str): Result[Option[TypeName], lexdb_base.DbErr] {
             return Ok(Some(TypeName{kind: K_TEXT, oid: OID_TEXT, prec: 0, scale: 0, len: 0}))
         }
         "ntext", "xml" { return Ok(Some(TypeName{kind: K_TEXT, oid: OID_TEXT, prec: 0, scale: 0, len: 0})) }
-        "bit" { return Ok(Some(TypeName{kind: K_BOOL, oid: OID_BOOL, prec: 0, scale: 0, len: 0})) }
+        "bit" { return Ok(Some(TypeName{kind: K_BOOL, oid: OID_BOOL, prec: 0, scale: 0, len: 1})) }     // len 1: takes numbers
         "tinyint" { return Ok(Some(TypeName{kind: K_INT, oid: OID_INT2, prec: 0, scale: 0, len: 0})) }
         "money" { return Ok(Some(TypeName{kind: K_NUM, oid: OID_NUMERIC, prec: 19, scale: 4, len: 0})) }
         "smallmoney" { return Ok(Some(TypeName{kind: K_NUM, oid: OID_NUMERIC, prec: 10, scale: 4, len: 0})) }
@@ -4140,7 +4374,7 @@ fn (p: mut &P) tsqlType(w: &str): Result[Option[TypeName], lexdb_base.DbErr] {
                 try p.expectKw(")")
             }
             t.prec = 1
-            t.scale = min(n, 6)              // lexdb keeps microseconds
+            t.scale = n                     // (lexdb keeps microseconds: 7 rounds as 6; TDS sends the 7)
             return Ok(Some(t))
         }
         else { return Ok(None) }

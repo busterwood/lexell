@@ -482,3 +482,53 @@ in the oracle's order with its ties).
 - LIKE under the collation folds case only (`#cifold`); SQL Server's
   character matching under its weights (`'æ' LIKE 'ae'`) is not done.
 
+## 11. Stage S3, as built so far (2026-11-12)
+
+Checked by `tests/lexdb/gen_mssql.py`: a file of T-SQL batches
+(`mssql_tsql_queries.txt`, one a line) run on the oracle through
+lib/sqlserver by the test program itself (LEXDB_MSSQL set: the expect
+lines), then through lexdb's TDS endpoint in the same process with the
+same client (`run/tds_tsql.lxl`). A result: each statement's column names
+and rows, or row count, or the batch's error number. 57 batches, the
+oracle's answers all.
+
+- **IDENTITY(seed, increment)** columns (an ALWAYS identity: a value given
+  is 544), `SCOPE_IDENTITY()` and `@@IDENTITY` (the session's last identity
+  value, NULL before one), `SET IDENTITY_INSERT t ON` (a session memo the
+  INSERT reads: lexdb_sql.OVR_TSQL; a value past the identity moves it, as
+  SQL Server).
+- **TOP** n, (expr), PERCENT, WITH TIES (`Stmt.topMode`; PERCENT and TIES
+  applied to the sorted rows); UPDATE TOP (n), DELETE TOP (n), DELETE
+  without FROM; `OFFSET n ROWS FETCH {FIRST | NEXT} m {ROW | ROWS} ONLY`
+  (SQL's, so PostgreSQL's too).
+- **Expressions:** `+` joins strings (`t+`: NULL with a NULL, a string with a
+  number read as the number); `alias = expr`, `AS 'alias'`; a column neither
+  a table's nor named has no name (`lexdb_sql.ANON`); NULLs are the least
+  in ORDER BY (first going up); LIKE's `[sets]` (`#tlike`); bit takes and
+  compares with numbers (`TypeName.len` 1); CAST and CONVERT cut a string
+  to its length and an integer's fraction (3.9 is 3), CONVERT's date
+  styles (0-12, 20-24, 100-112, 120, 121, 126, 127), TRY_CAST and
+  TRY_CONVERT (`#try`: NULL where the conversion fails).
+- **Functions:** LEN, DATALENGTH, CHARINDEX, PATINDEX, REPLACE (case-
+  insensitive under the collation), REPLICATE, REVERSE, STUFF, SPACE,
+  CONCAT, CONCAT_WS, ISNULL, IIF, CHOOSE, ROUND (its argument's type and
+  scale), POWER, CEILING, SQRT and the float ones, GETDATE, SYSDATETIME,
+  GETUTCDATE, CURRENT_TIMESTAMP, DATEADD, DATEDIFF (boundaries crossed),
+  DATEPART, DATENAME, YEAR, MONTH, DAY, EOMONTH, DATEFROMPARTS, NEWID,
+  DB_NAME, SCHEMA_NAME, USER_NAME, STRING_AGG ... WITHIN GROUP. Those of
+  lexdb's own are mapped onto them in the parser (`tsqlCall`); the rest are
+  `cmd/lexdb_tsqlfn.lxl`.
+- **Types as clients see them:** datetime2, time and datetimeoffset sent
+  at their scale (7 unless the type says: datetime's 3), `OutCol.scale`;
+  decimal division and AVG at SQL Server's scales (`#tdiv`: max(6, s1 + p2
+  + 1), an integer literal's precision its digits; `#tavg`: of integers an
+  integer, of decimal(p, s) scale max(s, 6)). A value that does not fit its
+  column's TDS type is sent as its own type where the column's values
+  share one (ISNULL(NULL, 5) an int), else as text: before, an int could
+  be written into an nvarchar column, breaking the stream.
+- **Not yet:** DATALENGTH of a varchar literal (lexdb has one string type:
+  every string counts as nvarchar); FORMAT; CONVERT's number styles and a
+  string's date styles (`CONVERT(date, '05/03/2024', 103)`); decimal
+  precision past division and AVG (multiplication's and addition's scales
+  are the values'); UPDATE ... FROM with the target in FROM.
+
