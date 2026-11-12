@@ -4,7 +4,7 @@
 // joined at times to one of 200, run three ways: SET lexdb_batch = off
 // (the row path, and the old comparator), on with the rows held
 // (Session.exec), and on with the rows given to a sink (Session.runRows:
-// one OutBatch when the batches made them). The three must agree, errors
+// an OutBatch when the batches made them). The three must agree, errors
 // included.
 // - ORDER BY of one to four keys: integers, bigints, booleans, texts (one
 //   under a case-insensitive collation), numerics, dates, varchars,
@@ -16,15 +16,18 @@
 //   partitions of each type, in each order.
 // - Errors: a division by zero in an output, a key or a condition, an
 //   ORDER BY position not in the list.
+// - Fixed queries: DISTINCT and ORDER BY of one column under its
+//   collation, and of other single columns; a sort of about 30,000 joined
+//   rows (the sink asked to start once).
 // - Again in a transaction with its own writes not committed.
 // - How many gave their rows as an OutBatch; the counts of a sort and a
 //   top-N as the row path's, and of a DISTINCT its LIMIT stops part way
 //   through a batch as batchLevel's; a LIMIT reached before an error gives
 //   rows, not the error, and a sort that reaches it the error.
 // expect: committed: 400 queries, 400 the same three ways
-// expect: fixed: 10 queries, 10 the same three ways
+// expect: fixed: 11 queries, 11 the same three ways
 // expect: in a transaction: 120 queries, 120 the same three ways, its writes: INSERT 0 40, UPDATE 264, DELETE 176
-// expect: given as one OutBatch: 198 of 400
+// expect: given as an OutBatch: 198 of 400
 // expect: counts: same: true true true
 // expect: limit before an error: same: true, rows: 2|1 2|0
 // expect: windows over typed keys: 82 queries
@@ -65,8 +68,12 @@ fn viaSink(s: mut &lexdb_exec.Session, sql: &str, batched: mut &bool): str {
     let nt: []int = []
     var lines: []str = []
     var nb = 0
+    var starts = 0
     let r = s.runRows(&stmts[0], &none, &nt, mut &pc, fn(cols: &[]lexdb_exec.OutCol, row: &[]lexdb_sql.Val, ob: &lexdb_exec.OutBatch, start: bool): bool {
-        if start { return true }
+        if start {
+            starts += 1
+            return true
+        }
         if ob.n > 0 {
             nb += 1
             for j in 0..ob.n {
@@ -95,6 +102,8 @@ fn viaSink(s: mut &lexdb_exec.Session, sql: &str, batched: mut &bool): str {
         return true
     })
     batched = nb > 0
+    // asked to start once at most (a RowDescription each time)
+    if starts > 1 { append(mut &lines, "STARTED " + starts.toStr() + " TIMES") }
     match r {
         Ok(res) {
             for row in res.rows {
@@ -308,7 +317,8 @@ fn main() {
         let fixed = ["select distinct f.tc from f", "select distinct f.tc from f order by 1 desc", "select distinct f.tc, f.z from f order by 2, 1",
                      "select distinct f.tc from f where f.x > 50 limit 3 offset 1", "select distinct f.tx from f where f.z = 1 limit 7 offset 2",
                      "select distinct f.z from f", "select distinct f.bo from f order by 1 nulls first", "select distinct f.w from f order by 1",
-                     "select f.id, f.tc from f order by f.tc, f.id desc limit 15", "select f.id from f order by f.tc desc, f.w, f.id"]
+                     "select f.id, f.tc from f order by f.tc, f.id desc limit 15", "select f.id from f order by f.tc desc, f.w, f.id",
+                     "select f.id, g.id, g.tx from f join f g on g.z = f.z where f.id < 60 order by g.tx desc, 2, 1"]
         var same3 = 0
         for sql in fixed {
             var ob = false
@@ -329,7 +339,7 @@ fn main() {
         }
         let b2 = q(mut &s, &"rollback")
         println("in a transaction: 120 queries, " + same2.toStr() + " the same three ways, its writes: " + w1 + ", " + w2 + ", " + w3)
-        println("given as one OutBatch: " + batched.toStr() + " of 400")
+        println("given as an OutBatch: " + batched.toStr() + " of 400")
         // the counts: as the row path's (a DISTINCT stopped by its LIMIT part way through a batch)
         let c1 = sameCounts(mut &s, &"select f.id, f.tx from f where f.x > 20 order by f.tx desc, f.y")
         let c2 = sameCounts(mut &s, &"select f.id from f join d on d.k = f.x order by f.y desc limit 3 offset 2")

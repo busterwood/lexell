@@ -9043,6 +9043,250 @@ The suite passes (110).
 - **Correlations other than equalities** (`d.v > w.x`).
 - **A conjunct in an outer join's ON.**
 
+### 9.105 Sorting by typed keys; ORDER BY, top-N and DISTINCT over batches
+
+Item 2 of lexdb-engines.md. Profiles at 9f5f4cb7 (server CPU, the 1M-row
+`w` of 9.102):
+- **`select id, b from w order by b`, 4,042 ms:** `ordCmp` and `sortCmp`
+  53%, `collections.sortBy` 7%. Each comparison walked the keys and
+  compared two values by their kinds.
+- **Top-N and DISTINCT, about 400 and 340 ms:** about 31% in
+  `batchLevel`'s direct emit, a row of values per scanned row, then
+  `execSel`'s closure evaluating the outputs by name (`colIndex`, `eval`).
+- **The window query, 946 ms:** a column found by its name per row, a
+  sort by a closure over value arrays, values pushed one by one.
+- **The sorted join, 506 ms:** 66% in `ordCmp`, mostly `memcmp` of the
+  label texts.
+
+**A sort by typed keys** (`SKey`, `skSort`).
+- **The keys:** ORDER BY's (or a window's) values are taken into a column
+  per key, by type:
+  - integers, and the values compared as integers (booleans, dates, times,
+    timestamps), as ints with NULL flags;
+  - texts as strs with NULL flags;
+  - any other values (numerics, floats, intervals) as they are, if all of
+    one kind.
+- **Texts with few distinct values** (at most 1,024 and an eighth of the
+  rows) become their ranks in byte order: integer keys.
+- **Integer keys are packed:** the leading integer keys that fit together
+  in 62 bits become one unsigned integer per row. Each key's place is its
+  value less the column's least (DESC: the greatest less it), and NULL has
+  a place of its own at the end it sorts to.
+- **A permutation of the rows is sorted,** not the rows:
+  - by the packed keys, with a radix sort of 11 bits or fewer a pass
+    (stable; a pass whose digit is the same for every row is skipped);
+  - then, for the rows equal in those keys (or all rows, when none packs),
+    by the other keys: a stable merge sort, insertion sort in runs of 16,
+    a merge skipped when its halves are in order already. Its comparator
+    `skCmp` is `ordCmp` per type.
+- **Rows in order already** cost one pass: the packed keys are checked
+  first, and every merge is skipped.
+
+**Its semantics are the old sort's:**
+- **Ties keep the rows' order.** `collections.sortBy` was stable, and
+  top-N (9.52) and the window's peers rely on it.
+- **NULLs** go where `ordCmp` puts them: NULLS FIRST or LAST as given,
+  else last ascending and first descending.
+- **Collations:** the keys are the values `ordVal` gives (`ciKey`, `padKey`
+  under the L2 collation kinds), compared as bytes, as before.
+- **Mixed kinds:** a key whose values are of more than one kind is not
+  sorted this way (`compare` may not be a total order over them). The
+  old comparator sorts the rows instead, so the result is the old one.
+- **The reference kept:** with `SET lexdb_batch = off`, `execSel` and
+  `winValues` sort as before (`sortBy`, `ordCmp`, `winCmp`).
+
+**ORDER BY, top-N and DISTINCT over batches** (`sortBatches`).
+- **When:** a SELECT that sorts or is DISTINCT, with no grouping, window,
+  set operation, correlated output, DISTINCT ON, WITH TIES, TOP, locking
+  or set-returning function, whose rows a scan in batches makes
+  (`outPlan`, 9.101), joins (9.102) included. Its ORDER BY keys must
+  compile too (`outPlan`'s new keyed form): an output named by position or
+  alias, a column of any type, or an integer or boolean expression. The
+  join's columns gathered include the keys'.
+- **How:** each batch's chosen rows' outputs and keys go into columns
+  (`SortSet`): integers as ints, other values as values. No row is made
+  for a row the query does not give.
+  - **DISTINCT:** a row is kept if its outputs were not seen: one integer
+    output by its integer, one text output by its text (under its
+    collation's key), else by `valsKeyIn`'s key, as `execSel` does. With a
+    LIMIT and no ORDER BY, the scan stops at the rows wanted, as before.
+  - **Top-N** (ORDER BY with LIMIT): a bounded heap of LIMIT + OFFSET
+    rows, its root the last of them in the order (by the keys, then the
+    scan's). A row is tried in a spare slot: its keys are written, then
+    compared with the root once. If the root beats it (or ties: the root
+    came first), it is dropped and its outputs are never taken. Else its
+    outputs are written and it replaces the root.
+  - **The rest:** the rows kept are sorted by `skSort`, the heap's in the
+    scan's order first, then cut by OFFSET and LIMIT.
+- **To the client:** the rows go to the wire as one OutBatch (9.101) whose
+  `idx` is the sorted permutation: no row of values is made at all.
+  - `runSelTo` now offers a sorted or DISTINCT SELECT (`sortSinks`) to its
+    sink, through `execSelTo`.
+  - The sink is asked, once, only when the rows are ready. So an error
+    still comes before any RowDescription, as for a held result.
+  - A sink that does not want them (Describe's columns differ), and every
+    other caller of `execSel` (subqueries, EXPLAIN ANALYZE,
+    `Session.exec`), gets them as rows in the Res.
+- **Anything the batches cannot do** gives way before a row is given, and
+  the counts are put back. `execSel`'s row path then runs the query from
+  its start, as before, and gives its error if it reaches it. That covers
+  a value a batch cannot hold, an error on a row (a division by zero in an
+  output, a key or a condition), an ORDER BY position not in the list, and
+  keys of mixed kinds.
+- **Counts:** EXPLAIN ANALYZE's are `batchLevel`'s: rows read and kept
+  per batch, and where a DISTINCT's LIMIT stops part way through a batch.
+- **Memory:** `max_statement_mem` counts the rows kept as `execSel` counts
+  them (`rowBytes` of the outputs and the keys). Top-N holds LIMIT +
+  OFFSET rows, not 9.52's buffer of twice that, so `exec_limits`' LIMIT 5
+  and LIMIT 15000 give what they gave.
+
+**Window functions** (`winValues`).
+- **Values by place:** a partition or order expression that is a column
+  is read at its place, found once, not by its name per row. Their values
+  go into a column per expression.
+- **The typed sort:** windows of one partitioning and order share one
+  sort.
+  - The partition keys come first. An integer-like or a text column is
+    its own key; any other, its encoded key (`encIdxPart`), which tells
+    partitions apart exactly as the old string did.
+  - Then the window's ORDER BY keys, as above.
+  - Then the rows' order.
+- **Partitions and peer groups** are found on the sorted keys once, as
+  breaks in the sorted order. `winPartition` takes those breaks, and the
+  order values' first column for RANGE frames.
+- **The select list** after the windows reads its column outputs by place
+  too.
+
+**Also:**
+- `execSel` moves each row into its result instead of copying it value by
+  value.
+- **Not done:**
+  - **ORDER BY through an index's order without a LIMIT** (item 5 of the
+    brief). The typed sort took `order by b` to 245 ms of CPU, under
+    PostgreSQL's index scan (400), so the planner's costs were left alone.
+    `costOrder` (optimizer 32) still prices a sort at rows x ROW_COST x
+    log2 rows, which now overstates it.
+  - **A window's rows** are still gathered by the row path (`late`): a
+    row of every column per scanned row, copied. That is most of what is
+    left of the window query (the values' copies about 28% of it).
+  - **Top-N still decodes every output column of every row.** The heap
+    skips taking a dropped row's outputs, but not decoding them; that
+    needs decoding per condition (engines item 4).
+
+**Measured.** Server CPU in ms, median of three, on the 1M-row tables
+(PostgreSQL 18 on one core and SQLite from lexdb-engines.md):
+
+| query | rows | before (9f5f4cb7) | now | PostgreSQL, one core | SQLite |
+|---|---|---|---|---|---|
+| `select id, b from w order by b` | 1M | 4,005 | **224** | 400 (index w_b, no sort) | 152 (index) |
+| `select id, b, name from w order by c desc limit 10` | 10 | 395 | **89** | 90 | 42 |
+| `w join d ... where d.grp = 3 order by d.label, w.id` | 103k | 498 | **82** | 100 | 1,166 |
+| `select distinct city from w` | 20 | 330 | **98** | 100 | 62 |
+| `row_number() over (partition by a order by c) ... where a < 20` | 206k | 939 | **300** | 130 | 180 |
+
+Two rounds each of the old and the new build, alternating, three runs a
+query (the medians of the two rounds averaged; they were within 5% of
+each other). Other agents were compiling on the machine, so single runs
+were noisy (the window query from 304 to 369 in one series), but the
+rounds agreed.
+
+What is left:
+- **The full sort, 224 ms:** the sort itself is about 6% (`radixPerm`,
+  two passes, and `skPack`). The wire's `dataBatch` is about 47%: it
+  reads the columns in the sorted order, so a cache miss or two a row.
+  Then the scan's decoding (10%) and the gathering (`ssKeys`, `ssOuts`,
+  `bCell`: 20%).
+  - **Sending in pieces** was tried, against one OutBatch's 221 ms of CPU
+    and 308 ms wall, five runs each, three rounds interleaved:
+    - pieces of 4,096 rows, each piece's columns gathered in the sorted
+      order: 240 CPU and 295 wall;
+    - the same with 65,536 rows: 259 and 314;
+    - one OutBatch whose places change per piece: 262 and 317.
+
+    One OutBatch was kept. Its buffer holds the whole result's DataRows
+    (about 20 MB here), still less than the rows of values `Res` held
+    before.
+- **Top-N:** about half is decoding (`bRunInto`, `fixedVal`); `name` is
+  decoded for every row.
+- **The window query:** the row path's rows (above), then the windows' own
+  work.
+
+Results checked:
+- the five queries' outputs are the same as 9f5f4cb7's (by checksum),
+  batches on and off;
+- the rest of lexdb-engines.md's queries (`qL.txt`) are unchanged in
+  time, within noise.
+
+**Checked against PostgreSQL 18.** 48 queries over a 5,000-row table and a
+300-row one, texts under COLLATE "C" in PostgreSQL (lexdb's byte order),
+ties broken by id. They cover:
+- ORDER BY of each type, ASC and DESC, NULLS FIRST and LAST, several
+  keys, expressions, positions and aliases;
+- LIMIT and OFFSET;
+- joins, sorted;
+- DISTINCT;
+- 13 window queries: ranking, lag and lead, first and last values,
+  ntile, sums over ROWS, RANGE and GROUPS frames, partitions of each
+  type.
+
+PostgreSQL, lexdb with batches on and with batches off gave the same
+output for all 48.
+
+**Tests:**
+- **`exec_batchsort`,** new: random queries over a 2,600-row table
+  (three batches) joined at times to one of 200, run three ways:
+  - batches off: the row path and the old comparator;
+  - batches on, the rows held (`Session.exec`);
+  - batches on, the rows given to `Session.runRows`' sink, as one
+    OutBatch when the batches made them.
+
+  The three must agree, errors included. The queries:
+  - 400 committed and 120 in a transaction with its own writes;
+  - ORDER BY of one to four keys of every type, a text under a
+    case-insensitive collation, expressions, positions, aliases, ASC and
+    DESC, NULLS FIRST and LAST, many ties;
+  - LIMIT and OFFSET, DISTINCT (alone, sorted, limited), window functions
+    of every kind and frame;
+  - divisions by zero in outputs, keys and conditions, and an ORDER BY
+    position not in the list;
+  - 10 fixed queries: DISTINCT and ORDER BY of one collated column, and
+    other single columns.
+
+  Also:
+  - 198 of the 400 gave their rows as an OutBatch;
+  - a sort's and a top-N's EXPLAIN ANALYZE counts are the row path's;
+  - a DISTINCT's LIMIT stopping part way through a batch counts as
+    `batchLevel` did;
+  - a LIMIT reached before an error gives rows, and a sort that reaches
+    the error gives it.
+- **Planted bugs:** 20 were planted. 16 were caught at once, and a 17th
+  once the test gained its fixed queries.
+  - **Caught:**
+    - NULLS FIRST ignored, in the comparator and in the packing;
+    - DESC ignored in the packing, and in the comparator;
+    - the radix sort's last pass skipped;
+    - the merge and the insertion sort unstable;
+    - text ranks reversed;
+    - the heap's ties broken by the later row;
+    - the heap's sift reversed;
+    - OFFSET ignored;
+    - the key's collation ignored;
+    - a window's peers taken from the partition keys;
+    - a DISTINCT's LIMIT one row late;
+    - its early stop counting the whole batch;
+    - an expression's NULLs ignored.
+  - **Caught after a fix to the test:** a single DISTINCT text under its
+    collation, compared as raw text. The random queries had not made that
+    shape; the fixed queries do.
+  - **Not caught, as they change nothing:**
+    - the heap admitting ties: its comparison includes the scan's order,
+      so it never ties;
+    - a partition's start not marked as a peer group's: `winPartition`
+      starts a group at each partition anyway;
+    - texts never ranked: the merge sort compares them.
+
+The suite passes (110). No existing expectation changed.
+
 ### 9.106 IS TRUE and IS FALSE never give NULL; IS after IN, LIKE, BETWEEN
 
 Found reviewing 9.104 against PostgreSQL:

@@ -13008,13 +13008,18 @@ fn runSelTo(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params
     let noB = noBatch()
     if !streams(sel) {
         // sorted or DISTINCT (9.105): the rows sortBatches makes go to the
-        // sink as one OutBatch, if it wants them so (asked only then);
+        // sink as one OutBatch, if it wants them so (asked only then, and
+        // once);
         // else they are held, as runSel holds them
         if !sortSinks(sel) { return runSel(st, txn, sel, params, lim) }
         var rs = newRun(&sel.q)
         rs.limit(&lim)
+        var asked = false
         return execSelTo(st, txn, sel, params, -1, mut &rs, true, fn(tx: mut &lexdb_store.Txn, ob: &OutBatch): Result[bool, DbErr] {
-            if !sink(&sel.outs, &noRow, &noB, true) { return Ok(false) }
+            if !asked {
+                asked = true
+                if !sink(&sel.outs, &noRow, &noB, true) { return Ok(false) }
+            }
             if !sink(&sel.outs, &noRow, ob, false) { return Err(lostRows()) }
             return Ok(true)
         })
@@ -15380,9 +15385,7 @@ fn execSelTo(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, param
             if cut >= 0 && len(res.rows) >= cut {
                 if !ties || lastAt < 0 || ordCmp(sel, &outRows[k].ord, &outRows[lastAt].ord) != 0 { break }
             }
-            var vs: []Val = []
-            for v in outRows[k].vals { append(mut &vs, v) }
-            append(mut &res.rows, vs)
+            append(mut &res.rows, replace(mut &outRows[k].vals, []))      // (moved: only ord is read after)
             lastAt = k
         }
         i += 1
@@ -21897,8 +21900,8 @@ fn sortSinks(sel: &Sel): bool {
 
 // Runs sel (sorting, or DISTINCT) over batches into res; false: not a
 // query the batches run, or one they gave up (nothing done, the counts as
-// they were). toSink: the rows go to eachB as one OutBatch, which gives
-// false if it wants them in res.rows.
+// they were). toSink: the rows go to eachB as one OutBatch, which it may
+// refuse (false): it wants them in res.rows.
 fn sortBatches(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: &Mats, params: &[]Val, limit: int,
                offset: int, sorting: bool, rs: mut &Run, toSink: bool,
                eachB: &fn(mut &lexdb_store.Txn, &OutBatch): Result[bool, DbErr], res: mut &Res): Result[bool, DbErr] {
@@ -22030,9 +22033,9 @@ fn sortBatches(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
                         } else {
                             var tk = ""
                             var isText = false
-                            match collVal(dkind0, &vv) {
+                            match vv {
                                 Val.Text(x) {
-                                    tk = x
+                                    tk = if dkind0 == lexdb_sql.COLL_EXACT { x } else if dkind0 == lexdb_sql.COLL_CI { ciKey(&x) } else { padKey(&x) }
                                     isText = true
                                 }
                                 else {}
@@ -22157,6 +22160,8 @@ fn sortBatches(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
     for oc in sel.outs { append(mut &outs, oc) }
     res = Res{cols: outs, rows: [], tag: "SELECT " + (to - from).toStr(), hasRows: true, copy: COPY_NONE}
     if toSink && to > from {
+        // one OutBatch, its places the sorted rows': less work than pieces
+        // (gathered in order, or each its places), measured (9.105)
         var oidx: []int = withCapacity(to - from)
         for i in from..to { append(mut &oidx, perm[i]) }
         var srcs: []int = []
