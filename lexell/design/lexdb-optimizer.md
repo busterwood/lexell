@@ -34,9 +34,10 @@ section and the decision list below win.
 
 **Built so far (uncommitted on `exp/optimizer`):** the index-to-scan switch
 (section 19) and stage A, ANALYZE with the tie-break and `SET lexdb_planner`
-(section 20), the review fixes (section 21), and plans kept per parameter
-outcome (section 22). Next, in order: `stat4`-style samples as a new look, then
-estimates deciding beyond ties, then join ordering (constraint-bound first).
+(section 20), the review fixes (section 21), plans kept per parameter
+outcome (section 22), and per-value estimates with per-parameter plans
+(section 23). Next, in order: estimates deciding beyond ties, then join
+ordering (constraint-bound first).
 
 ## 1. Summary
 
@@ -1287,6 +1288,44 @@ for the version another session commits next).
 **Not done.** EXPLAIN of a prepared statement does not name the plan it would
 take; the cap does not replace old plans (past four, new outcomes are planned
 every run).
+
+## 23. Per-value estimates and per-parameter plans (2026-11-11)
+
+The user chose `stat4`-style statistics for per-value estimates (section 18).
+What was built is the part of SQLite's `stat4` that equalities need: for each
+index's leading column, its most common values with exact counts. SQLite's
+`stat4` keeps samples spread over the whole key range with their counts below
+and equal, which also serves ranges; that is not built.
+
+**ANALYZE** counts the leading column's values (the counting already kept the
+distinct values; it now keeps how many of each) and stores up to
+`COMMON_MAX` (16) values above the average, largest first, as hex of their
+encoded index parts with their counts. Values past the distinct-value cap
+(100,000) are not counted.
+
+**Estimates.** For an equality on an index's leading column whose value is
+known at planning (a literal or a parameter), the estimate is its count when it
+is a common value, else the average of the other values (`rowsOf`). Two or more
+equalities use the distinct counts of the prefix as before. EXPLAIN shows the
+estimate for the value given.
+
+**Per-parameter plans.** When candidates tie on the rules' score and a
+parameter's value set one of the estimates that decided between them, the
+estimate becomes a look (kind 2): its scale (about a power of two) is the
+outcome, and the look keeps a copy of that index's common values so a later
+run can recompute it without the catalog. The plan cache of section 22 then
+keeps a plan per outcome. Looks are recorded only for the candidates that tied,
+so a statement whose plan does not depend on the value keeps one plan.
+
+**Example (tested).** `kind = $1 and uid = $2` on `ev`-like data: kind 1 holds
+99% of the rows. With kind 1 the plan reads `uid`'s index (about 10 rows
+against 990); with kind 2 the two estimates are equal (10) and the rules' order
+picks `kind`'s index. A second kind-1 run with another uid takes the first plan
+again: two plans for three runs.
+
+**Not built.** Range estimates and even samples (the rest of `stat4`);
+estimates deciding beyond ties; join ordering; the database-wide planner
+setting; EXPLAIN naming which kept plan a prepared statement would take.
 
 ## Sources
 
