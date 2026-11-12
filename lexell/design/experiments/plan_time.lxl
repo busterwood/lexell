@@ -1,0 +1,90 @@
+// Planning time (lexdb-optimizer.md section 26): EXPLAIN (plans, runs
+// nothing) of a point select, a 4-table join and a 12-table join, each table
+// with ANALYZE's statistics, in the cost mode and the rules mode. Each
+// EXPLAIN is run N times; the time per EXPLAIN in microseconds. EXPLAIN plans
+// from scratch each time (no plan cache), catalog and statistics reads
+// included.
+//   lexell/compiler/out/lxlc lexell/design/experiments/plan_time.lxl -o /tmp/pt && /tmp/pt
+import "../../cmd/lexdb_store"
+import "../../cmd/lexdb_disk"
+import "../../cmd/lexdb_exec"
+import "strings"
+import "time"
+
+const N: int = 2000
+
+fn exec(s: mut &lexdb_exec.Session, sql: &str) {
+    match s.exec(sql) {
+        Ok(_) {}
+        Err(e) { println(sql + " -> " + e.state + " " + e.msg) }
+    }
+}
+
+// A chain of n tables t1 .. tn, each joined to the one before by its own
+// column p (an index on it), the first pinned to nothing.
+fn chain(n: int): str {
+    var b = "select count(*) from t1"
+    for i in 2..n + 1 {
+        b = b + " join t" + i.toStr() + " on t" + i.toStr() + ".p = t" + (i - 1).toStr() + ".id"
+    }
+    return b + " where t1.k = 3"
+}
+
+// A star: t1 joined to each of t2 .. tn (the worst shape for the search:
+// every set holding t1 is connected).
+fn star(n: int): str {
+    var b = "select count(*) from t1"
+    for i in 2..n + 1 { b = b + " join t" + i.toStr() + " on t" + i.toStr() + ".p = t1.id" }
+    return b + " where t1.k = 3"
+}
+
+fn timeIt(s: mut &lexdb_exec.Session, label: &str, sql: &str) {
+    let q = "explain " + sql
+    exec(s, &q)                         // warm
+    // runs for half a second at least
+    let t0 = time.monotonicNs()
+    var n = 0
+    while n < N && (n < 10 || time.monotonicNs() - t0 < 500000000) {
+        exec(s, &q)
+        n += 1
+    }
+    let ns = (time.monotonicNs() - t0) / n
+    println(label + ": " + (ns / 1000).toStr() + " us per EXPLAIN (" + n.toStr() + " runs)")
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    var s = lexdb_exec.newSession(st)
+    for i in 1..13 {
+        let t = "t" + i.toStr()
+        exec(mut &s, &("create table " + t + " (id int primary key, p int, k int)"))
+        exec(mut &s, &("insert into " + t + " select g, g % 500 + 1, g % 50 from generate_series(1, 1000) g"))
+        exec(mut &s, &("create index " + t + "_p on " + t + " (p)"))
+        exec(mut &s, &("create index " + t + "_k on " + t + " (k)"))
+    }
+    exec(mut &s, &"analyze")
+    for mode in ["cost", "rules"] {
+        exec(mut &s, &("set lexdb_planner = " + mode))
+        timeIt(mut &s, &(mode + ", point select"), &"select * from t1 where id = 5")
+        timeIt(mut &s, &(mode + ", 2 tables"), &chain(2))
+        timeIt(mut &s, &(mode + ", 4 tables"), &chain(4))
+        timeIt(mut &s, &(mode + ", 8 tables"), &chain(8))
+        timeIt(mut &s, &(mode + ", 12 tables"), &chain(12))
+        timeIt(mut &s, &(mode + ", 12 tables, star"), &star(12))
+    }
+    exec(mut &s, &"reset lexdb_planner")
+    match s.exec(&("explain " + chain(4))) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            var lines: []str = []
+            for row in r.rows { append(mut &lines, lexdb_exec.text(&row[0])) }
+            println("plan, 4 tables: " + strings.join(&lines, "; "))
+        }
+        Err(e) { println(e.msg) }
+    }
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(5), lexdb_store.Options{cacheBytes: 128 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000, bufferedPages: false}, body).unwrap()
+}

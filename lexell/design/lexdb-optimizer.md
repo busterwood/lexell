@@ -37,10 +37,10 @@ index-to-scan switch (section 19) and stage A, ANALYZE with the tie-break
 and `SET lexdb_planner` (section 20), the review fixes (section 21), plans
 kept per parameter outcome (section 22), per-value estimates with
 per-parameter plans (section 23), estimates deciding beyond ties with
-primary-key statistics (section 24), and the constraint-bound join order
-(section 25, uncommitted). Next: the cost-based join order, which needs the
-planning-time measurement first (section 5.3). Code comments cite these
-sections as "optimizer N".
+primary-key statistics (section 24), the constraint-bound join order
+(section 25), and the cost-based join order with its planning-time
+measurement (section 26, uncommitted). Code comments cite these sections as
+"optimizer N".
 
 ## 1. Summary
 
@@ -1454,6 +1454,90 @@ and io_uring. They now cite this document's sections ("optimizer 19" to
 between a lookup per outer row and a hash join; UPDATE ... FROM's join (its
 target is scanned in full even when the FROM table is pinned); outer-join
 reordering.
+
+## 26. Join order, step 2: by cost (2026-11-12)
+
+Section 5.3's second step. The user's go-ahead (2026-11-12) covered the
+planning-time measurement it required.
+
+**When it applies** (`Query.costOrder`). A SELECT's inner join of 2 to
+`JOIN_SEARCH_MAX` (12) tables, every one a stored table with ANALYZE's
+statistics, and no outer join or LATERAL. A table in a join now loads its
+statistics even with fewer than two indexes (`loadEst`'s `join` argument).
+Otherwise section 25's order stands, so a database without ANALYZE plans as
+before. `SET lexdb_planner = rules` keeps FROM's order.
+
+**The search.** Exact dynamic programming over left-deep orders: for each set
+of tables, the cheapest way to have joined them. A set is extended only by a
+table that some conjunct links to it, unless no table outside it is linked;
+this is the usual "no cross product while a join is left" pruning. At each
+step the table is either looked up per row of the set (a key or an index
+whose leading columns the set's values bind) or read once and hashed,
+whichever costs less. A table chosen to be read once is marked
+(`Level.readOnce`), and `choosePath` then takes no path that uses the tables
+before it. Ties keep the first order found, which makes the result
+deterministic.
+
+**The model**, in reads, as in section 24:
+- a lookup: a descent (1), then its rows, 1 each by the primary key or 2 by
+  an index;
+- read once: the table's cheapest way by its constants (a full scan at
+  worst), each row put in the hash `HASH_BUILD` (0.2), each outer row's
+  probe `HASH_PROBE` (0.1). The build costing more than the probe makes the
+  smaller side the hashed one; without it, the first version hashed a
+  20,000-row table to probe it 100 times;
+- each row the join gives `ROW_COST` (0.1);
+- rows of a set: its tables' rows by their constants, times, for each
+  equality between two of its tables' columns, 1 / the larger distinct count
+  of the two. Distinct counts come from a one-column primary key or unique
+  index (the table's rows), an index's leading column (ANALYZE's count), or
+  else about 10 rows per value (SQLite's default). This answers section
+  5.3's open question on a default selectivity;
+- parameters are unknown values, so the order never depends on a
+  parameter, and a prepared join keeps one plan (tested). Literals are
+  estimated by value.
+
+**Examples (tested, `exec_joincost`).** `big` has 20,000 rows, 200 per
+`small` row; `small` has 100 rows, one labelled `x`.
+- `big JOIN small ON b.sid = s.id WHERE s.label = 'x'`. Without statistics,
+  or with the rules: `big` is scanned and `small` looked up 20,000 times.
+  Now: `small` by its label index (1 row read), then `big` through `big_sid`
+  (200 rows).
+- The same join without the filter: `big` scanned, `small` hashed (100
+  rows), not looked up per row.
+- Three tables, `mid` without an index on `sid`: `mid` scanned, `small`
+  hashed from its label index, `big` looked up per row by index.
+- A table without statistics in the join: section 25's order.
+
+**Planning time** (`design/experiments/plan_time.lxl`, 2026-11-12, an idle
+machine). EXPLAIN plans from scratch each time, catalog and statistics reads
+included. Each table has 1,000 rows and two indexes, and the joins are chains
+`tN.p = tN-1.id` plus a star `tN.p = t1.id`. Microseconds per EXPLAIN:
+
+| Query | Cost mode | Rules mode |
+|---|---|---|
+| point select | 6 | 6 |
+| 2 tables | 14 | 11 |
+| 4 tables | 25 | 18 |
+| 8 tables | 52 | 34 |
+| 12 tables, chain | 147 | 50 |
+| 12 tables, star | 636 | 49 |
+
+Before the cross-product pruning, the 12-table chain took 1,031 us (all 4,096
+sets). Point selects pay nothing. The star is the worst realistic shape,
+since every set holding its centre is connected (2,048 sets). Prepared
+statements pay it once, through the plan cache; the simple query protocol
+pays it each time. The 12-table bound stands unless the user lowers it.
+
+**Not done.**
+- Equalities implied by others (a = b and b = c gives a = c) are not
+  derived, so a table linked only through another is not reached directly.
+- Range estimates and filters on unindexed columns are not counted: a
+  table's rows by its constants count only its key and index equalities.
+- The executor may still take another path than the one costed. The model
+  plans a lookup, then `choosePath`'s rules or estimates pick the level's
+  path; `readOnce` is enforced, a lookup is not.
+- Bushy plans, outer-join reordering, and the run-time check of section 5.5.
 
 ## Sources
 

@@ -3533,11 +3533,12 @@ fn moveStats(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, old: &str, new: 
 
 // A table's statistics as the transaction sees them (none with SET
 // lexdb_planner = rules).
-fn loadEst(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table): Result[Est, DbErr] {
+// join: a table of a SELECT's join, whose order its rows decide (optimizer 26).
+fn loadEst(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, join: bool): Result[Est, DbErr] {
     // the statistics choose between candidates: two indexes, or an index and
-    // a primary key of several columns (optimizer 24)
+    // a primary key of several columns (optimizer 24); or a join's order
     let cands = len(t.indexes) + (if len(t.pk) >= 2 { 1 } else { 0 })
-    if txn.rules || t.tree < 0 || cands < 2 { return Ok(noEst()) }
+    if txn.rules || t.tree < 0 || (cands < 2 && !join) { return Ok(noEst()) }
     let got = try st.getUnnoted(txn, CATALOG, statKey(&t.name))
     if got.isNone() { return Ok(noEst()) }
     let v = got.unwrap()
@@ -4240,6 +4241,7 @@ pub type Level = record {
     stops: bool             // the first table's reading may stop early (a LIMIT, EXISTS): no switch to a scan (optimizer 19)
     estRows: int            // its path's expected rows (EXPLAIN); -1 unknown (optimizer 23)
     estMax: bool            // estRows only bounds them: at most (optimizer 24)
+    readOnce: bool          // the join order read it once (a hash join), not per row of the tables before (optimizer 26)
 }
 
 // A level of rows held by the run (a subquery's, a working table), not a table's.
@@ -5031,6 +5033,281 @@ fn keyCols(t: &Table, index: int): []int {
 // so does SET lexdb_planner = rules. The tables keep their columns' places
 // in the joined row (Level.first): only the order they run in changes.
 
+// ---- join order, step 2 (optimizer 26): by cost, with ANALYZE's statistics.
+// When every table of a SELECT's inner join has statistics and there are at
+// most JOIN_SEARCH_MAX, the order is the cheapest of all left-deep orders,
+// found exactly by dynamic programming over the sets of tables placed, and
+// each table after the first is read either by a lookup per row of the
+// tables before it or once (a hash join), whichever costs less. Costs are
+// reads (optimizer 24): a lookup's descent one, a row by the primary key
+// one, by an index two; a row put in a hash HASH_BUILD, a probe of it
+// HASH_PROBE (so the smaller side is hashed); each row a join gives ROW_COST. A table's rows by its constant conditions come from its
+// statistics (a literal by its value; a parameter as an unknown value, so
+// that the order does not depend on parameters); an equality between two
+// tables' columns keeps 1 / the larger distinct count of the two (a one-column
+// primary key or unique index: the table's rows; an index's leading column:
+// ANALYZE's count; else about 10 rows a value, SQLite's default). A set is
+// extended only by a table a conjunct links to it, unless none is (no cross
+// product while a join is left: a chain of n tables visits n(n+1)/2 sets, not
+// 2^n). Without statistics for every table, the order bound by keys
+// (optimizer 25) stands.
+
+const JOIN_SEARCH_MAX: int = 12
+const HASH_PROBE: float = 0.1f
+const HASH_BUILD: float = 0.2f
+const ROW_COST: float = 0.1f
+
+// A key column's values among the conjuncts: per value, the levels it uses
+// (a bit each; 0 constants and parameters) and its key when it is a literal
+// ("" else).
+type BindCol = record { deps: []int; keys: []str }
+
+// A way into a level: its primary key (index -1) or an unfiltered index.
+type WayCand = record { index: int; tree: int; unique: bool; cols: []BindCol }
+
+// Its expected rows and reads each time it is taken; outer: it uses values of
+// the levels placed. rows -1: none.
+type Way = record { rows: float; cost: float; outer: bool }
+
+fn fmax(a: float, b: float): float { return if a > b { a } else { b } }
+
+fn (q: &Query) levelMask(x: &Expr): int {
+    var ns: []str = []
+    colNames(x, mut &ns)
+    var m = 0
+    for n in ns {
+        let l = q.levelOf(&n)
+        if l < 0 { return -1 }
+        m = m | (1 << l)
+    }
+    return m
+}
+
+// The ways into level k, their key columns' values among cs.
+fn (q: &Query) wayCands(k: int, cs: &[]Expr): []WayCand {
+    let lv = &q.levels[k]
+    var out: []WayCand = []
+    let noParams: []Val = []
+    for c0 in 0..len(lv.t.indexes) + 1 {
+        let c = c0 - 1
+        if c >= 0 && lv.t.indexes[c].pred.isSome() { continue }
+        let cols = keyCols(&lv.t, c)
+        var bcs: []BindCol = []
+        for pos in 0..len(cols) {
+            var b = BindCol{deps: [], keys: []}
+            if cols[pos] >= 0 {
+                let name = lv.alias + "." + lv.t.cols[cols[pos]].name
+                for x in cs {
+                    match x {
+                        Expr.Bin(op, l, r) {
+                            if op == "=" {
+                                for side in 0..2 {
+                                    let me = if side == 0 { &l } else { &r }
+                                    let other = if side == 0 { &r } else { &l }
+                                    match me {
+                                        Expr.Col(n) {
+                                            if n == name && !hasCorr(other) {
+                                                let m = q.levelMask(other)
+                                                if m >= 0 && (m & (1 << k)) == 0 {
+                                                    append(mut &b.deps, m)
+                                                    append(mut &b.keys, if m == 0 { constKey(other, &keyType(&lv.t, c, pos), &noParams) } else { "" })
+                                                }
+                                            }
+                                        }
+                                        else {}
+                                    }
+                                }
+                            }
+                        }
+                        else {}
+                    }
+                }
+            }
+            append(mut &bcs, b)
+        }
+        append(mut &out, WayCand{index: c, tree: if c < 0 { lv.t.tree } else { lv.t.indexes[c].tree },
+                                 unique: c < 0 || lv.t.indexes[c].unique, cols: bcs})
+    }
+    return out
+}
+
+// The cheapest way into level k with the levels of mask placed: outer, one
+// using their values (a lookup per row; rows -1 when there is none); else
+// one by constants only, a full scan at worst.
+fn (q: &Query) wayInto(k: int, cands: &[]WayCand, mask: int, outer: bool): Way {
+    let lv = &q.levels[k]
+    let t = float(lv.est.rows)
+    var best = if outer { Way{rows: -1.0f, cost: 0.0f, outer: true} } else { Way{rows: t, cost: t, outer: false} }
+    for wc in cands {
+        var n = 0
+        var uses = false
+        var key = ""
+        for b in wc.cols {
+            var found = -1
+            for i in 0..len(b.deps) {
+                let d = b.deps[i]
+                let ok = if outer { (d & ~mask) == 0 } else { d == 0 }
+                if found < 0 && ok { found = i }
+            }
+            if found < 0 { break }
+            if b.deps[found] != 0 { uses = true }
+            if n == 0 { key = b.keys[found] }
+            n += 1
+        }
+        if n == 0 || (outer && !uses) { continue }
+        var m = 1.0f
+        if n < len(wc.cols) || !wc.unique {
+            let r = lv.est.rowsFor(wc.tree, n, &key)
+            m = if r >= 0 { float(r) } else { fmax(t / 10.0f, 1.0f) }
+        }
+        let cost = 1.0f + m * (if wc.index < 0 { 1.0f } else { 2.0f })
+        if best.rows < 0.0f || cost < best.cost { best = Way{rows: m, cost: cost, outer: outer} }
+    }
+    return best
+}
+
+// A column's distinct values (level k's), for an equality's share.
+fn (q: &Query) distinctOf(name: &str, k: int): float {
+    let lv = &q.levels[k]
+    let i = colIndex(&q.cols, name) - lv.first
+    let t = fmax(float(lv.est.rows), 1.0f)
+    if len(lv.t.pk) == 1 && lv.t.pk[0] == i { return t }
+    for x in 0..len(lv.t.indexes) + 1 {
+        let c = x - 1
+        if c >= 0 && lv.t.indexes[c].pred.isSome() { continue }
+        let cols = keyCols(&lv.t, c)
+        if len(cols) == 0 || cols[0] != i { continue }
+        if len(cols) == 1 && (c < 0 || lv.t.indexes[c].unique) { return t }
+        let tree = if c < 0 { lv.t.tree } else { lv.t.indexes[c].tree }
+        for j in 0..len(lv.est.trees) { if lv.est.trees[j] == tree && lv.est.cm[j].d > 0 { return float(lv.est.cm[j].d) } }
+    }
+    return fmax(t / 10.0f, 1.0f)
+}
+
+// The cheapest order by cost: perm (old indexes, [] when it is FROM's) and
+// per new place whether it is read once. false: it does not apply (a table
+// without statistics, an outer join, LATERAL, too many tables).
+fn (q: &Query) costOrder(ms: &[][]Expr, perm: mut &[]int, ro: mut &[]bool): bool {
+    let nl = len(q.levels)
+    if nl < 2 || nl > JOIN_SEARCH_MAX { return false }
+    for lv in q.levels {
+        if isOuter(lv.join) || lv.lateral || lv.virt() || lv.est.rows < 0 { return false }
+    }
+    var cs: []Expr = []
+    for m in ms { for c in m { append(mut &cs, clone(&c)) } }
+    var cands: [][]WayCand = []
+    var base: []Way = []                // each level by its constants alone
+    for k in 0..nl {
+        append(mut &cands, q.wayCands(k, &cs))
+        append(mut &base, q.wayInto(k, &cands[k], 0, false))
+    }
+    // the levels each level shares a conjunct with
+    var adj: []int = array(nl, 0)
+    for x in cs {
+        let m = q.levelMask(&x)
+        if m > 0 { for k in 0..nl { if (m & (1 << k)) != 0 { adj[k] = adj[k] | (m & ~(1 << k)) } } }
+    }
+    // the equalities between two levels' columns: their share of the rows
+    var la: []int = []
+    var lb: []int = []
+    var lsel: []float = []
+    for x in cs {
+        match x {
+            Expr.Bin(op, l, r) {
+                if op == "=" {
+                    match l {
+                        Expr.Col(a) {
+                            match r {
+                                Expr.Col(b) {
+                                    let i = q.levelOf(&a)
+                                    let j = q.levelOf(&b)
+                                    if i >= 0 && j >= 0 && i != j {
+                                        append(mut &la, i)
+                                        append(mut &lb, j)
+                                        append(mut &lsel, 1.0f / fmax(q.distinctOf(&a, i), q.distinctOf(&b, j)))
+                                    }
+                                }
+                                else {}
+                            }
+                        }
+                        else {}
+                    }
+                }
+            }
+            else {}
+        }
+    }
+    let full = (1 << nl) - 1
+    var rows: []float = array(full + 1, 0.0f)
+    var cost: []float = array(full + 1, -1.0f)
+    var last: []int = array(full + 1, -1)
+    var lastOnce: []bool = array(full + 1, false)
+    var nbr: []int = array(full + 1, 0)         // the levels linked to a set's
+    for mask in 1..full + 1 {
+        // the rows of the set: its tables' by their constants, times the
+        // equalities' shares among them (at least one)
+        var low = 0
+        while (mask & (1 << low)) == 0 { low += 1 }
+        let rest = mask & ~(1 << low)
+        var r = base[low].rows * (if rest == 0 { 1.0f } else { rows[rest] })
+        for i in 0..len(la) {
+            let a = la[i]
+            let b = lb[i]
+            if (a == low && (rest & (1 << b)) != 0) || (b == low && (rest & (1 << a)) != 0) { r = r * lsel[i] }
+        }
+        rows[mask] = fmax(r, 1.0f)
+        nbr[mask] = nbr[rest] | adj[low]
+        if rest == 0 {
+            cost[mask] = base[low].cost
+            last[mask] = low
+        }
+    }
+    for mask in 1..full + 1 {
+        if cost[mask] < 0.0f { continue }
+        let rin = rows[mask]
+        let linked = (nbr[mask] & ~mask) != 0
+        for k in 0..nl {
+            if (mask & (1 << k)) != 0 { continue }
+            if linked && (adj[k] & mask) == 0 { continue }       // a cross product while a join is left
+            let next = mask | (1 << k)
+            let out = rows[next] * ROW_COST
+            // once: its constant way and its rows hashed, then a probe per
+            // row; or a lookup per row
+            var add = base[k].cost + base[k].rows * HASH_BUILD + rin * HASH_PROBE + out
+            var o = true
+            let w = q.wayInto(k, &cands[k], mask, true)
+            if w.rows >= 0.0f && rin * w.cost + out < add {
+                add = rin * w.cost + out
+                o = false
+            }
+            let total = cost[mask] + add
+            if cost[next] < 0.0f || total < cost[next] {
+                cost[next] = total
+                last[next] = k
+                lastOnce[next] = o
+            }
+        }
+    }
+    var rev: []int = []
+    var revOnce: []bool = []
+    var m = full
+    while m != 0 {
+        let k = last[m]
+        append(mut &rev, k)
+        append(mut &revOnce, lastOnce[m] && (m & ~(1 << k)) != 0)
+        m = m & ~(1 << k)
+    }
+    var ident = true
+    for i in 0..nl {
+        let k = rev[nl - 1 - i]
+        append(perm, k)
+        append(ro, revOnce[nl - 1 - i])
+        if k != i { ident = false }
+    }
+    if ident { perm = [] }
+    return true
+}
+
 // A table of nothing (a level's place while levels are moved).
 fn noTable(): Table {
     return Table{name: "", tree: -1, cols: [], pk: [], indexes: [], slots: [], width: 0, checks: [], fks: [], refBy: [], layouts: [], lays: [],
@@ -5192,6 +5469,7 @@ fn choosePath(q: &Query, k: int, cs: &[]Expr, params: &[]Val, lk: mut &[]Look): 
         }
         if score == 0 { continue }
         let p = Path{index: c, eqs: eqs, rng: rng, desc: false, noNulls: false, ins: ins, inSub: inSub, inArr: inArr}
+        if lv.readOnce && q.pathOuter(&p) { continue }          // read once (optimizer 26)
         let f = pathFig(lv, &p, params)
         // the first equality's value set the figure: a look (optimizer 23)
         var lo = Look{kind: -1, c: Expr.Lit(Val.Null), p: Expr.Lit(Val.Null), out: 0, typ: noType(), cm: noCommon()}
@@ -5506,7 +5784,7 @@ fn allTrue(cs: &[]Expr, cols: &[]lexdb_sql.ColDef, row: &[]Val, params: &[]Val):
 fn newLevel(t: Table, alias: str, join: int, first: int): Level {
     return Level{t: t, alias: alias, join: join, first: first, path: Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: []}, cond: [],
                  post: [], local: [], perRow: true, hashCols: [], hashVals: [], src: -1, work: -1, lateral: false, need: [],
-                 lock: 0, lockWait: 0, keeps: false, est: noEst(), stops: false, estRows: -1, estMax: false}
+                 lock: 0, lockWait: 0, keeps: false, est: noEst(), stops: false, estRows: -1, estMax: false, readOnce: false}
 }
 
 // Plans a query over the tables of FROM (4.8): the tables are joined in the
@@ -5623,7 +5901,7 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
         lv.src = if viewSrc >= 0 { viewSrc } else { f.sub }
         lv.work = f.work
         lv.lateral = lateral
-        if f.sub < 0 && f.work < 0 { lv.est = try loadEst(st, txn, &lv.t) }
+        if f.sub < 0 && f.work < 0 { lv.est = try loadEst(st, txn, &lv.t, order && len(from) >= 2) }
         append(mut &q.levels, lv)
         if len(subs) > 0 {
             // only its subqueries look here
@@ -5767,9 +6045,12 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
         None {}
     }
     if order && nl >= 2 && !txn.rules {
-        // the join order (optimizer 25): the conjuncts go again to the latest table
+        // the join order: by cost with statistics (optimizer 26), else bound
+        // by keys (optimizer 25); the conjuncts go again to the latest table
         // they use, in the new order
-        let perm = q.joinOrder(&ms)
+        var ro: []bool = []
+        var perm: []int = []
+        if !q.costOrder(&ms, mut &perm, mut &ro) { perm = q.joinOrder(&ms) }
         if len(perm) == nl {
             var pool: []Expr = []
             for k in 0..nl {
@@ -5787,6 +6068,7 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
                 append(mut &ms[k], c)
             }
         }
+        for i in 0..len(ro) { q.levels[i].readOnce = ro[i] }
     }
     if q.corr {
         // a correlated subquery runs per row: its conjuncts go last

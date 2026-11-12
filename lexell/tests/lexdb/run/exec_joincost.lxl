@@ -1,0 +1,120 @@
+// lexdb_exec: the join order by cost (optimizer 26). When every table of a
+// SELECT's inner join has ANALYZE's statistics, the cheapest left-deep order
+// is found exactly, and each table after the first is looked up per row or
+// read once and hashed, whichever costs less in reads. Without statistics
+// for every table, the order bound by keys (optimizer 25) stands; SET
+// lexdb_planner = rules keeps FROM's. The results are the rules'. Checked
+// by hand.
+// expect: -- small: 100 rows, one labelled x; big: 20,000 rows, 200 per small row; mid: 2,000 rows, no index on sid
+// expect: create table small (id int primary key, label text) -> CREATE TABLE
+// expect: insert into small select g, case when g = 7 then 'x' else 'l' || (g % 10) end from generate_series(1, 100) g -> INSERT 0 100
+// expect: create index small_label on small (label) -> CREATE INDEX
+// expect: create table big (id int primary key, sid int, v int) -> CREATE TABLE
+// expect: insert into big select g, g % 100 + 1, g % 7 from generate_series(1, 20000) g -> INSERT 0 20000
+// expect: create index big_sid on big (sid) -> CREATE INDEX
+// expect: create table mid (id int primary key, sid int) -> CREATE TABLE
+// expect: insert into mid select g, g % 100 + 1 from generate_series(1, 2000) g -> INSERT 0 2000
+// expect: -- before ANALYZE: nothing pinned (label is not unique), FROM order
+// expect: explain select count(*) from big b join small s on b.sid = s.id where s.label = 'x' -> [QUERY PLAN] scan big b: full scan; join small s: primary key lookup per row; aggregate
+// expect: analyze -> ANALYZE
+// expect: -- after: the one small row by its label, then its big rows by index
+// expect: explain select count(*) from big b join small s on b.sid = s.id where s.label = 'x' -> [QUERY PLAN] scan small s: index small_label lookup (estimated 5 rows); join big b: index big_sid lookup (estimated 200 rows) per row; aggregate
+// expect: select count(*) from big b join small s on b.sid = s.id where s.label = 'x' -> [count] 200
+// expect: explain analyze select count(*) from big b join small s on b.sid = s.id where s.label = 'x' -> scan small s: index small_label lookup (estimated 5 rows) (rows read 1, kept 1); join big b: index big_sid lookup (estimated 200 rows) per row (lookups 1, rows read 200, joined 200); aggregate
+// expect: -- no filter: big read once, small hashed (100 rows) rather than looked up 20,000 times
+// expect: explain select count(*), sum(b.v) from big b join small s on b.sid = s.id -> [QUERY PLAN] scan big b: full scan; join small s: hash on (id) over full scan; aggregate
+// expect: select count(*), sum(b.v) from big b join small s on b.sid = s.id -> [count,sum] 20000|59998
+// expect: -- three tables: mid has no index on sid, so it is hashed after the small row
+// expect: explain select count(*) from mid m join big b on b.sid = m.sid join small s on s.id = m.sid where s.label = 'x' -> [QUERY PLAN] scan mid m: full scan; join small s: hash on (id) over index small_label lookup (estimated 5 rows); join big b: index big_sid lookup (estimated 200 rows) per row; aggregate
+// expect: select count(*) from mid m join big b on b.sid = m.sid join small s on s.id = m.sid where s.label = 'x' -> [count] 4000
+// expect: -- the rules: FROM order, the same results
+// expect: set lexdb_planner = rules -> SET
+// expect: explain select count(*) from big b join small s on b.sid = s.id where s.label = 'x' -> [QUERY PLAN] scan big b: full scan; join small s: primary key lookup per row; aggregate
+// expect: select count(*) from mid m join big b on b.sid = m.sid join small s on s.id = m.sid where s.label = 'x' -> [count] 4000
+// expect: select count(*), sum(b.v) from big b join small s on b.sid = s.id -> [count,sum] 20000|59998
+// expect: reset lexdb_planner -> RESET
+// expect: -- a table without statistics: the order bound by keys (here FROM order)
+// expect: create table other (id int primary key, sid int) -> CREATE TABLE
+// expect: insert into other select g, g % 100 + 1 from generate_series(1, 50) g -> INSERT 0 50
+// expect: explain select count(*) from other o join small s on s.id = o.sid where s.label = 'x' -> [QUERY PLAN] scan other o: full scan; join small s: primary key lookup per row; aggregate
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "strings"
+
+fn show(s: mut &lexdb_exec.Session, sql: str) {
+    match s.exec(&sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if !r.hasRows {
+                println(sql + " -> " + r.tag)
+                return
+            }
+            var lines: []str = []
+            for row in r.rows {
+                var cells: []str = []
+                for v in row { append(mut &cells, if lexdb_exec.isNull(&v) { "NULL" } else { lexdb_exec.text(&v) }) }
+                append(mut &lines, strings.join(&cells, "|"))
+            }
+            var names: []str = []
+            for c in r.cols { append(mut &names, c.name) }
+            println(sql + " -> [" + strings.join(&names, ",") + "]" + (if len(lines) > 0 { " " } else { "" }) + strings.join(&lines, "; "))
+        }
+        Err(e) { println(sql + " -> " + e.state + " " + e.msg) }
+    }
+}
+
+// EXPLAIN ANALYZE without its last line (the time).
+fn analyze(s: mut &lexdb_exec.Session, sql: str) {
+    match s.exec(&sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            var lines: []str = []
+            for i in 0..len(r.rows) - 1 { append(mut &lines, lexdb_exec.text(&r.rows[i][0])) }
+            println(sql + " -> " + strings.join(&lines, "; "))
+        }
+        Err(e) { println(sql + " -> " + e.state + " " + e.msg) }
+    }
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    var s = lexdb_exec.newSession(st)
+    println("-- small: 100 rows, one labelled x; big: 20,000 rows, 200 per small row; mid: 2,000 rows, no index on sid")
+    show(mut &s, "create table small (id int primary key, label text)")
+    show(mut &s, "insert into small select g, case when g = 7 then 'x' else 'l' || (g % 10) end from generate_series(1, 100) g")
+    show(mut &s, "create index small_label on small (label)")
+    show(mut &s, "create table big (id int primary key, sid int, v int)")
+    show(mut &s, "insert into big select g, g % 100 + 1, g % 7 from generate_series(1, 20000) g")
+    show(mut &s, "create index big_sid on big (sid)")
+    show(mut &s, "create table mid (id int primary key, sid int)")
+    show(mut &s, "insert into mid select g, g % 100 + 1 from generate_series(1, 2000) g")
+    println("-- before ANALYZE: nothing pinned (label is not unique), FROM order")
+    show(mut &s, "explain select count(*) from big b join small s on b.sid = s.id where s.label = 'x'")
+    show(mut &s, "analyze")
+    println("-- after: the one small row by its label, then its big rows by index")
+    show(mut &s, "explain select count(*) from big b join small s on b.sid = s.id where s.label = 'x'")
+    show(mut &s, "select count(*) from big b join small s on b.sid = s.id where s.label = 'x'")
+    analyze(mut &s, "explain analyze select count(*) from big b join small s on b.sid = s.id where s.label = 'x'")
+    println("-- no filter: big read once, small hashed (100 rows) rather than looked up 20,000 times")
+    show(mut &s, "explain select count(*), sum(b.v) from big b join small s on b.sid = s.id")
+    show(mut &s, "select count(*), sum(b.v) from big b join small s on b.sid = s.id")
+    println("-- three tables: mid has no index on sid, so it is hashed after the small row")
+    show(mut &s, "explain select count(*) from mid m join big b on b.sid = m.sid join small s on s.id = m.sid where s.label = 'x'")
+    show(mut &s, "select count(*) from mid m join big b on b.sid = m.sid join small s on s.id = m.sid where s.label = 'x'")
+    println("-- the rules: FROM order, the same results")
+    show(mut &s, "set lexdb_planner = rules")
+    show(mut &s, "explain select count(*) from big b join small s on b.sid = s.id where s.label = 'x'")
+    show(mut &s, "select count(*) from mid m join big b on b.sid = m.sid join small s on s.id = m.sid where s.label = 'x'")
+    show(mut &s, "select count(*), sum(b.v) from big b join small s on b.sid = s.id")
+    show(mut &s, "reset lexdb_planner")
+    println("-- a table without statistics: the order bound by keys (here FROM order)")
+    show(mut &s, "create table other (id int primary key, sid int)")
+    show(mut &s, "insert into other select g, g % 100 + 1 from generate_series(1, 50) g")
+    show(mut &s, "explain select count(*) from other o join small s on s.id = o.sid where s.label = 'x'")
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(5), lexdb_store.Options{cacheBytes: 128 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000, bufferedPages: false}, body).unwrap()
+}
