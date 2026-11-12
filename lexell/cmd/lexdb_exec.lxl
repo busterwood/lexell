@@ -12911,6 +12911,27 @@ fn outText(o: &Expr, exprs: &[]Expr, outs: &[]OutCol, cols: &[]lexdb_sql.ColDef)
     return lexdb_sql.exprText(o)
 }
 
+// The output an ORDER BY item names (orderValue's): by position or by its
+// alias; -1 none (an expression over the row); -2 a position not in the
+// list (orderValue's error).
+fn orderOut(o: &Expr, q: &Query, outs: &[]OutCol, n: int): int {
+    match o {
+        Expr.Lit(v) {
+            match v {
+                Val.Int(i) { return if i < 1 || i > n { -2 } else { i - 1 } }
+                else {}
+            }
+        }
+        Expr.Col(name) {
+            if colIndex(&q.cols, &name) < 0 {
+                for i in 0..len(outs) { if outs[i].name == name { return i } }
+            }
+        }
+        else {}
+    }
+    return -1
+}
+
 // An ORDER BY item may name an output column by position or by its alias.
 fn orderValue(o: &Expr, outs: &[]OutCol, vals: &[]Val, env: &Env): Result[Val, DbErr] {
     match o {
@@ -12985,7 +13006,20 @@ fn runSelTo(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params
             sink: &fn(&[]OutCol, &[]Val, &OutBatch, bool): bool): Result[Res, DbErr] {
     let noRow: []Val = []
     let noB = noBatch()
-    if !streams(sel) || !sink(&sel.outs, &noRow, &noB, true) { return runSel(st, txn, sel, params, lim) }
+    if !streams(sel) {
+        // sorted or DISTINCT (9.105): the rows sortBatches makes go to the
+        // sink as one OutBatch, if it wants them so (asked only then);
+        // else they are held, as runSel holds them
+        if !sortSinks(sel) { return runSel(st, txn, sel, params, lim) }
+        var rs = newRun(&sel.q)
+        rs.limit(&lim)
+        return execSelTo(st, txn, sel, params, -1, mut &rs, true, fn(tx: mut &lexdb_store.Txn, ob: &OutBatch): Result[bool, DbErr] {
+            if !sink(&sel.outs, &noRow, &noB, true) { return Ok(false) }
+            if !sink(&sel.outs, &noRow, ob, false) { return Err(lostRows()) }
+            return Ok(true)
+        })
+    }
+    if !sink(&sel.outs, &noRow, &noB, true) { return runSel(st, txn, sel, params, lim) }
     let n = try eachRowB(st, txn, sel, params, lim, true, fn(tx: mut &lexdb_store.Txn, r: &[]Val): Result[bool, DbErr] {
         if !sink(&sel.outs, r, &noB, false) { return Err(lostRows()) }
         return Ok(true)
@@ -13113,7 +13147,7 @@ fn eachRowB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params
         if at[len(at) - 1] < 0 { plain = false }
     }
     if batched {
-        let op = try outPlan(st, txn, sel, &m, params, &rs)
+        let op = try outPlan(st, txn, sel, &m, params, &rs, false)
         if op.isSome() { return eachOut(st, txn, sel, &m, params, &op.unwrap(), &at, plain, each, eachB, mut &rs) }
     }
     try runQuery(st, txn, q, &m, params, fn(tx: mut &lexdb_store.Txn, r: &[]Val): Result[bool, DbErr] {
@@ -14592,16 +14626,451 @@ fn ordCmp(sel: &Sel, a: &[]Val, b: &[]Val): int {
 // Top-N (9.52): rows sorted and cut to the first k, in the order the full
 // sort gives (sortBy is stable, and the rows kept came before those added
 // after them). The last one's sort values, for the rows to come.
-fn keepFirst(sel: &Sel, rows: mut &[]OutRow, k: int): []Val {
-    collections.sortBy(rows, fn(a: &OutRow, b: &OutRow): int { return ordCmp(sel, &a.ord, &b.ord) })
+fn keepFirst(sel: &Sel, rows: mut &[]OutRow, k: int, typed: bool): []Val {
+    sortOutRows(sel, rows, typed)
     while len(rows) > k { let gone = pop(rows) }
     return copyRow(&rows[len(rows) - 1].ord)
+}
+
+// The rows in ORDER BY's order (ordCmp's, ties in their order): typed, by
+// their sort values as typed keys (9.105); else, or when a key's values
+// are of mixed kinds, by collections.sortBy with ordCmp. lexdb_batch off
+// sorts the old way, so the two can be compared.
+fn sortOutRows(sel: &Sel, rows: mut &[]OutRow, typed: bool) {
+    let n = len(rows)
+    if typed && n > 1 {
+        var keys: []SKey = []
+        var ok = true
+        for k in 0..len(sel.desc) {
+            var vs: []Val = withCapacity(n)
+            for i in 0..n { append(mut &vs, rows[i].ord[k]) }
+            var key = newSKey(SK_VAL, sel.desc[k], sel.nullsFirst[k])
+            if !skOfVals(vs, sel.desc[k], sel.nullsFirst[k], mut &key) {
+                ok = false
+                break
+            }
+            append(mut &keys, key)
+        }
+        if ok {
+            let perm = skSort(mut &keys, n)
+            var out: []OutRow = withCapacity(n)
+            for p in perm { append(mut &out, replace(mut &rows[p], OutRow{vals: [], ord: []})) }
+            rows = out
+            return
+        }
+    }
+    collections.sortBy(rows, fn(a: &OutRow, b: &OutRow): int { return ordCmp(sel, &a.ord, &b.ord) })
+}
+
+// ---- Sorting by typed keys (9.105)
+//
+// ORDER BY's keys, and a window's, are taken once per row into a column
+// per key, by type (SKey): integers (and integer-like values: booleans,
+// dates, times, timestamps) as ints with NULL flags, texts as strs, any
+// other value as it is. A permutation of the rows is sorted, not the rows:
+// - the leading integer keys that fit together in 62 bits are packed into
+//   one unsigned integer per row, and sorted by a radix sort (stable);
+// - a text key with few distinct values becomes its values' ranks first,
+//   so it is an integer key too;
+// - rows equal in the packed keys (or all rows, when none packs) are then
+//   sorted by the other keys with a stable merge sort, whose comparator
+//   (skCmp) is ordCmp's per type.
+// Ties keep the rows' order, as collections.sortBy does. A column of
+// values of mixed kinds is not sorted here (skOfVals gives false): compare
+// may not be a total order over them, and the old sort runs instead.
+
+const SK_INT = 0        // a key's values: integers and NULL flags ...
+const SK_TEXT = 1       // ... texts and NULL flags ...
+const SK_VAL = 2        // ... or values of one kind (ordCmp's comparison)
+
+type SKey = record {
+    kind: int
+    ints: []int
+    nul: []bool
+    strs: []str
+    vals: []Val
+    desc: bool
+    nf: bool                // NULLs first
+}
+
+fn newSKey(kind: int, desc: bool, nf: bool): SKey {
+    return SKey{kind: kind, ints: [], nul: [], strs: [], vals: [], desc: desc, nf: nf}
+}
+
+// An integer-like value's kind and integer (kind 0: not one).
+fn skIntOf(v: &Val, n: mut &int): int {
+    match v {
+        Val.Int(x) {
+            n = x
+            return lexdb_sql.K_INT
+        }
+        Val.Bool(x) {
+            n = if x { 1 } else { 0 }
+            return lexdb_sql.K_BOOL
+        }
+        Val.Date(x) {
+            n = x
+            return lexdb_sql.K_DATE
+        }
+        Val.Time(x) {
+            n = x
+            return lexdb_sql.K_TIME
+        }
+        Val.Ts(x) {
+            n = x
+            return lexdb_sql.K_TS
+        }
+        Val.Tstz(x) {
+            n = x
+            return lexdb_sql.K_TSTZ
+        }
+        else { return 0 }
+    }
+}
+
+// A key over vs (taken): integers if every value not NULL is integer-like
+// of one kind, texts if every one is a text, else the values, if of one
+// kind. False: of mixed kinds.
+fn skOfVals(vs: []Val, desc: bool, nf: bool, key: mut &SKey): bool {
+    var all = vs
+    let n = len(all)
+    var kind = -1
+    for i in 0..n {
+        if isNull(&all[i]) { continue }
+        let k = kindOf(&all[i])
+        if kind < 0 { kind = k } else if k != kind { return false }
+    }
+    var x = 0
+    if kind < 0 || kind == lexdb_sql.K_INT || kind == lexdb_sql.K_BOOL || kind == lexdb_sql.K_DATE ||
+       kind == lexdb_sql.K_TIME || kind == lexdb_sql.K_TS || kind == lexdb_sql.K_TSTZ {
+        var k = newSKey(SK_INT, desc, nf)
+        k.ints = withCapacity(n)
+        k.nul = withCapacity(n)
+        for i in 0..n {
+            let got = skIntOf(&all[i], mut &x)
+            append(mut &k.ints, if got == 0 { 0 } else { x })
+            append(mut &k.nul, got == 0)
+        }
+        key = k
+        return true
+    }
+    if kind == lexdb_sql.K_TEXT {
+        var k = newSKey(SK_TEXT, desc, nf)
+        k.strs = withCapacity(n)
+        k.nul = withCapacity(n)
+        for i in 0..n {
+            match all[i] {
+                Val.Text(s) {
+                    append(mut &k.strs, s)
+                    append(mut &k.nul, false)
+                }
+                else {
+                    append(mut &k.strs, "")
+                    append(mut &k.nul, true)
+                }
+            }
+        }
+        key = k
+        return true
+    }
+    var k = newSKey(SK_VAL, desc, nf)
+    k.vals = all
+    key = k
+    return true
+}
+
+// A text key with few distinct values (at most 1,024 and an eighth of
+// the rows) becomes their ranks in the texts' byte order: an integer key.
+fn skRank(key: mut &SKey) {
+    if key.kind != SK_TEXT { return }
+    let n = len(key.strs)
+    let most = 1024 + n / 8
+    var ids: Map[str, int] = newMap()
+    var dist: []str = []
+    var code: []int = withCapacity(n)
+    for i in 0..n {
+        if key.nul[i] {
+            append(mut &code, 0)
+            continue
+        }
+        match ids.get(&key.strs[i]) {
+            Some(c) { append(mut &code, c) }
+            None {
+                if len(dist) >= most { return }
+                ids.put(key.strs[i], len(dist))
+                append(mut &code, len(dist))
+                append(mut &dist, key.strs[i])
+            }
+        }
+    }
+    var ord: []int = []
+    for i in 0..len(dist) { append(mut &ord, i) }
+    collections.sortBy(mut &ord, fn(a: &int, b: &int): int { return dist[a].cmp(&dist[b]) })
+    var rank: []int = array(len(dist), 0)
+    for r in 0..len(ord) { rank[ord[r]] = r }
+    for i in 0..n { code[i] = if key.nul[i] { 0 } else { rank[code[i]] } }
+    key.ints = code
+    key.strs = []
+    key.kind = SK_INT
+}
+
+// How rows a and b compare by keys[from..to] (ordCmp's order): negative,
+// a first.
+fn skCmp(keys: &[]SKey, from: int, to: int, a: int, b: int): int {
+    for k in from..to {
+        let key = &keys[k]
+        var c = 0
+        if key.kind == SK_VAL {
+            let na = isNull(&key.vals[a])
+            let nb = isNull(&key.vals[b])
+            if na || nb {
+                if na && nb { continue }
+                if na { return if key.nf { -1 } else { 1 } }
+                return if key.nf { 1 } else { -1 }
+            }
+            c = sortCmp(&key.vals[a], &key.vals[b])
+        } else {
+            let na = key.nul[a]
+            let nb = key.nul[b]
+            if na || nb {
+                if na && nb { continue }
+                if na { return if key.nf { -1 } else { 1 } }
+                return if key.nf { 1 } else { -1 }
+            }
+            if key.kind == SK_INT {
+                let x = key.ints[a]
+                let y = key.ints[b]
+                c = if x < y { -1 } else if x > y { 1 } else { 0 }
+            } else {
+                c = key.strs[a].cmp(&key.strs[b])
+            }
+        }
+        if c != 0 { return if key.desc { -c } else { c } }
+    }
+    return 0
+}
+
+// The bits a value of 0 to m needs.
+fn bitsFor(m: int): int {
+    var b = 0
+    while b < 63 && (m >> b) > 0 { b += 1 }
+    return b
+}
+
+// The leading integer keys that fit in 62 bits, packed into one unsigned
+// integer per row (into out), in the keys' order: per key, NULL at its
+// end, DESC reversed. The number of keys packed, and their bits (in bits).
+fn skPack(keys: &[]SKey, n: int, out: mut &[]int, bits: mut &int): int {
+    var taken = 0
+    var total = 0
+    var los: []int = []
+    var his: []int = []
+    var nuls: []bool = []
+    var widths: []int = []
+    for k in 0..len(keys) {
+        let key = &keys[k]
+        if key.kind != SK_INT { break }
+        var lo = 0
+        var hi = 0
+        var any = false
+        var anyNul = false
+        for i in 0..n {
+            if key.nul[i] {
+                anyNul = true
+                continue
+            }
+            let v = key.ints[i]
+            if !any {
+                lo = v
+                hi = v
+                any = true
+            } else if v < lo { lo = v } else if v > hi { hi = v }
+        }
+        // hi - lo + 1, and a place for NULL, must fit
+        if lo < 0 && hi > 4611686018427387903 + lo { break }
+        let span = hi - lo
+        if span > 4611686018427387903 { break }
+        let top = span + (if anyNul { 1 } else { 0 })
+        let w = bitsFor(top)
+        if total + w > 62 { break }
+        total += w
+        append(mut &los, lo)
+        append(mut &his, hi)
+        append(mut &nuls, anyNul)
+        append(mut &widths, w)
+        taken += 1
+    }
+    bits = total
+    if taken == 0 { return 0 }
+    out = array(n, 0)
+    for k in 0..taken {
+        let key = &keys[k]
+        let w = widths[k]
+        if w == 0 { continue }
+        let lo = los[k]
+        let hi = his[k]
+        let span = hi - lo
+        let shiftNul = nuls[k] && key.nf
+        for i in 0..n {
+            var c = 0
+            if key.nul[i] {
+                c = if key.nf { 0 } else { span + 1 }
+            } else {
+                c = if key.desc { hi - key.ints[i] } else { key.ints[i] - lo }
+                if shiftNul { c += 1 }
+            }
+            out[i] = (out[i] << w) | c
+        }
+    }
+    return taken
+}
+
+// The permutation sorting the rows by their packed keys (stable): a radix
+// sort, 11 bits or fewer a pass; none when they are in order already.
+fn radixPerm(keys0: &[]int, bits: int): []int {
+    let n = len(keys0)
+    var idx: []int = withCapacity(n)
+    for i in 0..n { append(mut &idx, i) }
+    var sorted = true
+    for i in 1..n {
+        if keys0[i] < keys0[i - 1] {
+            sorted = false
+            break
+        }
+    }
+    if sorted || bits == 0 { return idx }
+    let passes = (bits + 10) / 11
+    let digit = (bits + passes - 1) / passes
+    let mask = (1 << digit) - 1
+    var ka: []int = withCapacity(n)
+    for x in keys0 { append(mut &ka, x) }
+    var kb: []int = array(n, 0)
+    var ib: []int = array(n, 0)
+    var cnt: []int = array((1 << digit) + 1, 0)
+    var shift = 0
+    for p in 0..passes {
+        for d in 0..len(cnt) { cnt[d] = 0 }
+        for i in 0..n { cnt[((ka[i] >> shift) & mask) + 1] += 1 }
+        var one = false
+        for d in 1..len(cnt) { if cnt[d] == n { one = true } }
+        if !one {
+            for d in 1..len(cnt) { cnt[d] += cnt[d - 1] }
+            for i in 0..n {
+                let d = (ka[i] >> shift) & mask
+                let at = cnt[d]
+                cnt[d] = at + 1
+                kb[at] = ka[i]
+                ib[at] = idx[i]
+            }
+            ka = replace(mut &kb, ka)
+            idx = replace(mut &ib, idx)
+        }
+        shift += digit
+    }
+    return idx
+}
+
+// Sorts idx[lo..hi] stably by keys[from..to] (skCmp): insertion sort in
+// runs of 16, then merges; a merge whose halves are in order already is
+// skipped, so rows in order cost n - 1 comparisons.
+fn skMerge(keys: &[]SKey, from: int, to: int, idx: mut &[]int, lo: int, hi: int, tmp: mut &[]int) {
+    let n = hi - lo
+    if n < 2 { return }
+    var s = lo
+    while s < hi {
+        let e = min(s + 16, hi)
+        for i in s + 1..e {
+            let x = idx[i]
+            var j = i
+            while j > s && skCmp(keys, from, to, idx[j - 1], x) > 0 {
+                idx[j] = idx[j - 1]
+                j -= 1
+            }
+            idx[j] = x
+        }
+        s = e
+    }
+    var width = 16
+    while width < n {
+        var a = lo
+        while a < hi - width {
+            let mid = a + width
+            let b = min(a + 2 * width, hi)
+            if skCmp(keys, from, to, idx[mid - 1], idx[mid]) > 0 {
+                var i = a
+                var j = mid
+                for k in a..b {
+                    if j >= b || (i < mid && skCmp(keys, from, to, idx[i], idx[j]) <= 0) {
+                        tmp[k] = idx[i]
+                        i += 1
+                    } else {
+                        tmp[k] = idx[j]
+                        j += 1
+                    }
+                }
+                for k in a..b { idx[k] = tmp[k] }
+            }
+            a += 2 * width
+        }
+        width *= 2
+    }
+}
+
+// A partition key of values of any kind: their encoded keys (encIdxPart),
+// which tell partitions apart as winValues always has.
+fn skEnc(vs: &[]Val): SKey {
+    var k = newSKey(SK_TEXT, false, false)
+    for v in vs {
+        var kb = newStrBuf()
+        encIdxPart(mut &kb, &v)
+        append(mut &k.strs, kb.toStr())
+        append(mut &k.nul, false)
+    }
+    return k
+}
+
+// The permutation that sorts n rows by keys (stable). The keys' texts may
+// be ranked (skRank).
+fn skSort(keys: mut &[]SKey, n: int): []int {
+    for k in 0..len(keys) { skRank(mut &keys[k]) }
+    var packed: []int = []
+    var bits = 0
+    let taken = skPack(keys, n, mut &packed, mut &bits)
+    var idx: []int = []
+    if taken == 0 {
+        for i in 0..n { append(mut &idx, i) }
+    } else {
+        idx = radixPerm(&packed, bits)
+    }
+    let nk = len(keys)
+    if taken == nk { return idx }
+    var tmp: []int = array(n, 0)
+    if taken == 0 {
+        skMerge(keys, 0, nk, mut &idx, 0, n, mut &tmp)
+        return idx
+    }
+    // the rows equal in the packed keys, by the others
+    var lo = 0
+    while lo < n {
+        var hi = lo + 1
+        while hi < n && packed[idx[hi]] == packed[idx[lo]] { hi += 1 }
+        if hi - lo > 1 { skMerge(keys, taken, nk, mut &idx, lo, hi, mut &tmp) }
+        lo = hi
+    }
+    return idx
 }
 
 // Runs a planned SELECT. cap >= 0: at most that many rows are wanted (a
 // subquery: EXISTS 1, in any order; a scalar 2).
 fn execSel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params: &[]Val, cap: int,
            rs: mut &Run): Result[Res, DbErr] {
+    return execSelTo(st, txn, sel, params, cap, rs, false, noEachB)
+}
+
+// execSel; toSink: a query sortBatches runs gives its rows to eachB as one
+// OutBatch (runSelTo), unless eachB gives false (then they are in the Res).
+fn execSelTo(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params: &[]Val, cap: int,
+             rs: mut &Run, toSink: bool, eachB: &fn(mut &lexdb_store.Txn, &OutBatch): Result[bool, DbErr]): Result[Res, DbErr] {
     let sqe = seqEnv(st, txn)
     if len(sel.srf) > 0 { return execSrf(st, txn, sel, params, cap, rs) }
     let m = try prepare(st, txn, &sel.q, params, rs)
@@ -14623,6 +15092,7 @@ fn execSel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
     var outRows: []OutRow = []
     // the rows kept here, counted in the row callbacks (they cannot reach rs)
     let room = rs.room()
+    let typedSort = rs.batch            // sorts by typed keys (9.105); off: the old comparator
     var held = 0
     if sel.setop != 0 {
         var rows = try runSet(st, txn, sel, params, rs)
@@ -14804,6 +15274,11 @@ fn execSel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
             append(mut &outRows, OutRow{vals: vals, ord: ord})
         }
     } else {
+        // sorted or DISTINCT over batches (9.105): done whole there, or not at all
+        if sorting || sel.distinct {
+            var bres = Res{cols: [], rows: [], tag: "", hasRows: true, copy: COPY_NONE}
+            if try sortBatches(st, txn, sel, &m, params, limit, offset, sorting, rs, toSink, eachB, mut &bres) { return Ok(bres) }
+        }
         // ORDER BY with LIMIT: only the first limit + offset rows are kept
         // (top-N); a row that sorts after the last of them is dropped
         let topK = if sorting && limit >= 0 && !sel.distinct && sel.donKey == 0 && !sel.withTies { limit + max(offset, 0) } else { -1 }
@@ -14829,7 +15304,7 @@ fn execSel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
             if room >= 0 && held > room { return Err(memErr(rs0max)) }
             append(mut &outRows, OutRow{vals: vals, ord: ord})
             if topK > 0 && len(outRows) >= 2 * topK + 16 {
-                bar = keepFirst(sel, mut &outRows, topK)
+                bar = keepFirst(sel, mut &outRows, topK, typedSort)
                 barSet = true
                 held = 0
                 for o in outRows { held += rowBytes(&o.vals) + rowBytes(&o.ord) }
@@ -14839,13 +15314,25 @@ fn execSel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
     }
     if windowed {
         var wv = try winValues(st, txn, sel, &bases, &m, params, rs)
+        // an output that is a column read at its place, found once (9.105)
+        var at: []int = []
+        for x in sel.exprs {
+            match x {
+                Expr.Col(name) { append(mut &at, colIndex(&q.cols, &name)) }
+                else { append(mut &at, -1) }
+            }
+        }
         for bi in 0..len(bases) {
             // the slots: the row's aggregates, then its window values
             var aggs = if len(bases[bi].aggs) == 0 { replace(mut &wv[bi], []) } else { copyRow(&bases[bi].aggs) }
             if len(bases[bi].aggs) > 0 { for v in wv[bi] { append(mut &aggs, v) } }
             let env = Env{cols: &q.cols, row: &bases[bi].row, aggs: &aggs, params: params, subs: &m.subs, cur: &noAggs, seq: sqe}
             var vals: []Val = []
-            for x in sel.exprs { append(mut &vals, try evalX(st, txn, q, &x, &env, rs)) }
+            for xi in 0..len(sel.exprs) {
+                let c = at[xi]
+                if c >= 0 && c < len(bases[bi].row) { append(mut &vals, bases[bi].row[c]) }
+                else { append(mut &vals, try evalX(st, txn, q, &sel.exprs[xi], &env, rs)) }
+            }
             if sel.distinct {
                 let k = valsKeyIn(&vals, &sel.outKinds)
                 if seen.get(&k).isSome() { continue }
@@ -14860,7 +15347,7 @@ fn execSel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
     try rs.hold(held)
     if hasSrfCall(&sel.exprs) { try expandSrfs(mut &outRows, &sel.outs) }
     // (rows assigned in their order are in it already)
-    if sorting && len(sel.feedback) == 0 { collections.sortBy(mut &outRows, fn(a: &OutRow, b: &OutRow): int { return ordCmp(sel, &a.ord, &b.ord) }) }
+    if sorting && len(sel.feedback) == 0 { sortOutRows(sel, mut &outRows, rs.batch) }
     if sorting && sel.donKey > 0 {
         // DISTINCT ON (9.94): the first row of each run of equal keys
         var kept: []OutRow = []
@@ -18835,38 +19322,107 @@ fn winValues(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, rows:
     for wi in 0..len(sel.wins) {
         if done[wi] { continue }
         let w = &sel.wins[wi]
-        // each row's partition and order
-        var keys: []str = []
-        var ords: [][]Val = []
+        let np = len(w.part)
+        let nob = len(w.order)
+        // each row's partition and order values, a column per expression;
+        // an expression that is a column read at its place, found once, not
+        // by its name per row (9.105)
+        var xs: []Expr = []
+        for x in w.part { append(mut &xs, clone(&x)) }
+        for x in w.order { append(mut &xs, clone(&x)) }
+        var at: []int = []
+        var plain = true
+        for x in xs {
+            var c = -1
+            match x {
+                Expr.Col(name) { c = colIndex(&q.cols, &name) }
+                else {}
+            }
+            append(mut &at, c)
+            if c < 0 { plain = false }
+        }
+        var vcols: [][]Val = []
+        for i in 0..len(xs) { append(mut &vcols, withCapacity(n)) }
         for b in 0..n {
-            let env = Env{cols: &q.cols, row: &rows[b].row, aggs: &rows[b].aggs, params: params, subs: &m.subs, cur: &noAggs, seq: sqe}
-            if len(w.part) == 0 {
-                append(mut &keys, "")
-            } else {
-                var kb = newStrBuf()
-                for x in w.part { encIdxPart(mut &kb, &(try evalX(st, txn, q, &x, &env, rs))) }
-                append(mut &keys, kb.toStr())
+            let r = &rows[b].row
+            if plain {
+                for i in 0..len(xs) { append(mut &vcols[i], if at[i] < len(r) { r[at[i]] } else { Val.Null }) }
+                continue
             }
-            var ov: []Val = []
-            for x in w.order { append(mut &ov, try evalX(st, txn, q, &x, &env, rs)) }
-            append(mut &ords, ov)
+            let env = Env{cols: &q.cols, row: r, aggs: &rows[b].aggs, params: params, subs: &m.subs, cur: &noAggs, seq: sqe}
+            for i in 0..len(xs) {
+                if at[i] >= 0 && at[i] < len(r) { append(mut &vcols[i], r[at[i]]) }
+                else { append(mut &vcols[i], try evalX(st, txn, q, &xs[i], &env, rs)) }
+            }
         }
+        var ocols: [][]Val = []
+        for k in 0..nob { append(mut &ocols, copyRow(&vcols[np + k])) }
+        // the rows in partition order, then the window's (peers keep the
+        // rows' order); where a partition and a peer group start
         var idx: []int = []
-        for b in 0..n { append(mut &idx, b) }
-        // rows often come in the window's order already (ORDER BY the key the scan follows)
-        var sorted = true
-        for b in 1..n {
-            if keys[b - 1] != keys[b] || winCmp(&ords[b - 1], &ords[b], w) > 0 {
-                sorted = false
-                break
+        var partBreak: []bool = array(n, false)
+        var peerBreak: []bool = array(n, false)
+        var typed = rs.batch
+        var keys: []SKey = []
+        if typed {
+            for i in 0..len(xs) {
+                let vs = replace(mut &vcols[i], [])
+                let part = i < np
+                let desc = if part { false } else { w.desc[i - np] }
+                let nf = if part { false } else { w.nullsFirst[i - np] }
+                var key = newSKey(SK_VAL, desc, nf)
+                if part {
+                    if !skOfVals(copyRow(&vs), false, false, mut &key) || key.kind == SK_VAL { key = skEnc(&vs) }
+                } else if !skOfVals(vs, desc, nf, mut &key) {
+                    typed = false
+                    break
+                }
+                append(mut &keys, key)
             }
         }
-        if !sorted { collections.sortBy(mut &idx, fn(a: &int, b: &int): int {
-            if keys[a] != keys[b] { return if keys[a] < keys[b] { -1 } else { 1 } }
-            let c = winCmp(&ords[a], &ords[b], w)
-            if c != 0 { return c }
-            return a - b                        // peers keep the rows' order
-        }) }
+        if typed {
+            idx = skSort(mut &keys, n)
+            for p in 1..n {
+                if skCmp(&keys, 0, np, idx[p - 1], idx[p]) != 0 {
+                    partBreak[p] = true
+                    peerBreak[p] = true
+                } else if skCmp(&keys, np, np + nob, idx[p - 1], idx[p]) != 0 { peerBreak[p] = true }
+            }
+        } else {
+            // the old way (lexdb_batch off): the partition's encoded key, and
+            // the order's values compared by winCmp
+            var pkeys: []str = []
+            var ords: [][]Val = []
+            for b in 0..n {
+                var kb = newStrBuf()
+                for i in 0..np { encIdxPart(mut &kb, &vcols[i][b]) }
+                append(mut &pkeys, kb.toStr())
+                var ov: []Val = []
+                for k in 0..nob { append(mut &ov, ocols[k][b]) }
+                append(mut &ords, ov)
+            }
+            for b in 0..n { append(mut &idx, b) }
+            // rows often come in the window's order already (ORDER BY the key the scan follows)
+            var sorted = true
+            for b in 1..n {
+                if pkeys[b - 1] != pkeys[b] || winCmp(&ords[b - 1], &ords[b], w) > 0 {
+                    sorted = false
+                    break
+                }
+            }
+            if !sorted { collections.sortBy(mut &idx, fn(a: &int, b: &int): int {
+                if pkeys[a] != pkeys[b] { return if pkeys[a] < pkeys[b] { -1 } else { 1 } }
+                let c = winCmp(&ords[a], &ords[b], w)
+                if c != 0 { return c }
+                return a - b                        // peers keep the rows' order
+            }) }
+            for p in 1..n {
+                if pkeys[idx[p - 1]] != pkeys[idx[p]] {
+                    partBreak[p] = true
+                    peerBreak[p] = true
+                } else if winCmp(&ords[idx[p - 1]], &ords[idx[p]], w) != 0 { peerBreak[p] = true }
+            }
+        }
         for wj in wi..len(sel.wins) {
             if done[wj] || specs[wj] != specs[wi] { continue }
             done[wj] = true
@@ -18876,8 +19432,8 @@ fn winValues(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, rows:
             var lo = 0
             while lo < n {
                 var hi = lo + 1
-                while hi < n && keys[idx[hi]] == keys[idx[lo]] { hi += 1 }
-                try winPartition(st, txn, sel, wj, rows, &idx, lo, hi, &ords, &so, &eo, m, params, rs, mut &out)
+                while hi < n && !partBreak[hi] { hi += 1 }
+                try winPartition(st, txn, sel, wj, rows, &idx, lo, hi, &peerBreak, &ocols, &so, &eo, m, params, rs, mut &out)
                 lo = hi
             }
         }
@@ -18989,7 +19545,7 @@ fn excluded(w: &WinPlan, p: int, k: int, grp: &[]int): bool {
 // One partition's values of window call wi: its rows rows[idx[lo..hi]],
 // in its order.
 fn winPartition(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, wi: int, rows: &[]WinRow, idx: &[]int, lo: int,
-                hi: int, ords: &[][]Val, so: &Val, eo: &Val, m: &Mats, params: &[]Val, rs: mut &Run,
+                hi: int, peerBreak: &[]bool, ocols: &[][]Val, so: &Val, eo: &Val, m: &Mats, params: &[]Val, rs: mut &Run,
                 out: mut &[][]Val): Result[Unit, DbErr] {
     let sqe = seqEnv(st, txn)
     let q = &sel.q
@@ -19001,7 +19557,7 @@ fn winPartition(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, wi
     var gStart: []int = []
     var gEnd: []int = []
     for k in 0..n {
-        if k == 0 || winCmp(&ords[idx[lo + k - 1]], &ords[idx[lo + k]], w) != 0 {
+        if k == 0 || peerBreak[lo + k] {
             if k > 0 { append(mut &gEnd, k) }
             append(mut &gStart, k)
         }
@@ -19009,7 +19565,7 @@ fn winPartition(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, wi
     }
     append(mut &gEnd, n)
     var keyAt: []Val = []
-    if w.mode == lexdb_sql.FR_RANGE && len(w.order) == 1 { for k in 0..n { append(mut &keyAt, ords[idx[lo + k]][0]) } }
+    if w.mode == lexdb_sql.FR_RANGE && len(w.order) == 1 { for k in 0..n { append(mut &keyAt, ocols[0][idx[lo + k]]) } }
     let f = w.fname
     if f == "row_number" || f == "rank" || f == "dense_rank" || f == "percent_rank" || f == "cume_dist" {
         for k in 0..n {
@@ -21071,10 +21627,17 @@ type OutPlan = record {
     nodes: []BNode
     kinds: []int
     src: []int
+    // ORDER BY's keys (keyed, sortBatches, 9.105): per key, the output it
+    // is (kout >= 0: by position or by its name), else its node, kind and
+    // batch column as for an output
+    kout: []int
+    knodes: []BNode
+    kkinds: []int
+    ksrc: []int
 }
 
 // sel's OutPlan; None: its rows are made by the row path (runQuery).
-fn outPlan(st: &lexdb_store.Store, txn: &lexdb_store.Txn, sel: &Sel, m: &Mats, params: &[]Val, rs: &Run): Result[Option[OutPlan], DbErr] {
+fn outPlan(st: &lexdb_store.Store, txn: &lexdb_store.Txn, sel: &Sel, m: &Mats, params: &[]Val, rs: &Run, keyed: bool): Result[Option[OutPlan], DbErr] {
     let q = &sel.q
     if !rs.batch || len(q.levels) == 0 || len(sel.exprs) == 0 || len(sel.exprs) != len(sel.outs) { return Ok(None) }
     if len(q.levels[0].post) > 0 { return Ok(None) }
@@ -21122,13 +21685,502 @@ fn outPlan(st: &lexdb_store.Store, txn: &lexdb_store.Txn, sel: &Sel, m: &Mats, p
         }
         append(mut &nodes, takeN(cc))
     }
+    var kout: []int = []
+    var knodes: []BNode = []
+    var kkinds: []int = []
+    var ksrc: []int = []
+    if keyed {
+        for oi in 0..len(sel.order) {
+            let o = orderOut(&sel.order[oi], q, &sel.outs, len(sel.exprs))
+            if o == -2 { return Ok(None) }      // a position not in the list: the row path's error
+            append(mut &kout, o)
+            if o >= 0 {
+                append(mut &knodes, BNode.Const(0, true))
+                append(mut &kkinds, kinds[o])
+                append(mut &ksrc, -1)
+                continue
+            }
+            let c = if joined { bCompile(&sel.order[oi], q, &jp.kinds, &env, 0) } else { bCompile(&sel.order[oi], q, &lp.qkinds, &env, base) }
+            if c.isNone() { return Ok(None) }
+            let cc = c.unwrap()
+            var col = -1
+            match cc.n {
+                BNode.Col(i) { col = i }
+                else {}
+            }
+            if col >= 0 {
+                if joined {
+                    if !jp.need[col] { return Ok(None) }
+                    append(mut &kkinds, jp.kinds[col])
+                } else {
+                    if !lp.bp.needCol[col] { return Ok(None) }
+                    append(mut &kkinds, lp.bp.kinds[col])
+                }
+                append(mut &ksrc, col)
+            } else {
+                if cc.typ == BT_OTHER { return Ok(None) }
+                append(mut &ksrc, -1)
+                append(mut &kkinds, if cc.typ == BT_BOOL { BK_BOOL } else { BK_INT })
+            }
+            append(mut &knodes, takeN(cc))
+        }
+    }
     if joined {
-        // the joins gather only the columns the outputs use
+        // the joins gather only the columns the outputs (and keys) use
         var used: []bool = array(len(q.cols), false)
         for ni in 0..len(nodes) { bColsOf(&nodes[ni], mut &used) }
+        for ni in 0..len(knodes) { bColsOf(&knodes[ni], mut &used) }
         jpFinish(mut &jp, q, &used)
     }
-    return Ok(Some(OutPlan{lp: lp, jp: jp, joined: joined, nodes: nodes, kinds: kinds, src: src}))
+    return Ok(Some(OutPlan{lp: lp, jp: jp, joined: joined, nodes: nodes, kinds: kinds, src: src,
+                           kout: kout, knodes: knodes, kkinds: kkinds, ksrc: ksrc}))
+}
+
+// ---- ORDER BY, top-N and DISTINCT over batches (9.105)
+//
+// A SELECT that sorts or is DISTINCT, with no grouping, window, set
+// operation or correlated output, whose rows a scan in batches makes,
+// outputs and ORDER BY keys all (outPlan, keyed), is run here, not by
+// runQuery and execSel's row closure:
+// - each batch's chosen rows' outputs and keys go into columns (SortSet),
+//   integers as integers: no row and no value made per row;
+// - DISTINCT keeps a row whose outputs were not seen (hashed as execSel's
+//   valsKeyIn, or by the integer or text itself when there is one output);
+// - ORDER BY with LIMIT keeps the first LIMIT + OFFSET in a bounded heap,
+//   its root the last of them: a row it beats costs its keys' copy and
+//   one comparison, and its outputs are not taken;
+// - the rows kept are sorted by their typed keys (skSort; ties in the scan's
+//   order), then cut by OFFSET and LIMIT, and given as one OutBatch (the
+//   wire writes it from the columns) or made into rows.
+// Anything the batches cannot do (a value a batch cannot hold, an error on
+// a row, keys of mixed kinds) gives false before a row is given, the
+// counts put back: execSel's row path runs the query from its start, as it
+// did before, and gives its error if it reaches it.
+
+type SortSet = record {
+    outs: []BVec            // per output: its integers (BK_INT, BK_BOOL) and NULL flags (all)
+    ovals: [][]Val          // per output of kind BK_VAL: its values
+    keys: []SKey            // per ORDER BY key: SK_INT, or SK_VAL (values under its collation)
+    vk: []int               // per key of values: their kind (kindOf), 0 none yet
+    seq: []int              // per row kept: its place in the scan
+    bytes: []int            // ... and its rowBytes count (outputs and keys)
+    n: int
+}
+
+fn putI(xs: mut &[]int, s: int, v: int) { if s < len(xs) { xs[s] = v } else { append(xs, v) } }
+fn putF(xs: mut &[]bool, s: int, v: bool) { if s < len(xs) { xs[s] = v } else { append(xs, v) } }
+fn putV(xs: mut &[]Val, s: int, v: Val) { if s < len(xs) { xs[s] = v } else { append(xs, v) } }
+
+// rowBytes' count for a value past its 24 bytes.
+fn valExtra(v: &Val): int {
+    match v {
+        Val.Text(t) { return len(t) }
+        Val.Num(_) { return 32 }
+        Val.Ival(_) { return 24 }
+        else { return 0 }
+    }
+}
+
+// A cell of a batch row (r, at j among the rows chosen): from batch column
+// src, or from ex (an expression's values). Its integer (BK_INT, BK_BOOL)
+// in iv, its value (BK_VAL) in vv; true: NULL.
+fn bCell(kind: int, src: int, b: &Batch, ex: &BVec, r: int, j: int, iv: mut &int, vv: mut &Val): bool {
+    if src < 0 {
+        iv = ex.v[j]
+        return ex.nul[j]
+    }
+    if b.cols[src].nul[r] { return true }
+    if kind == BK_VAL { vv = b.vals[src][r] } else { iv = b.cols[src].v[r] }
+    return false
+}
+
+fn cellVal(kind: int, nul: bool, iv: int, vv: &Val): Val {
+    if nul { return Val.Null }
+    if kind == BK_INT { return Val.Int(iv) }
+    if kind == BK_BOOL { return Val.Bool(iv == 1) }
+    return vv
+}
+
+// Row r's ORDER BY keys into slot s; false: a key of values of another
+// kind than the earlier rows' (not sorted here). Its bytes.
+fn ssKeys(set: mut &SortSet, s: int, sel: &Sel, op: &OutPlan, b: &Batch, ex: &[]BVec, kex: &[]BVec, r: int, j: int,
+          bytes: mut &int): bool {
+    var n = 32
+    for k in 0..len(set.keys) {
+        n += 24
+        let o = op.kout[k]
+        let kind = if o >= 0 { op.kinds[o] } else { op.kkinds[k] }
+        var iv = 0
+        var vv = Val.Null
+        let nul = if o >= 0 { bCell(kind, op.src[o], b, &ex[o], r, j, mut &iv, mut &vv) } else { bCell(kind, op.ksrc[k], b, &kex[k], r, j, mut &iv, mut &vv) }
+        if kind == BK_VAL {
+            let v = if nul { Val.Null } else { ordVal(sel, k, vv) }
+            if !nul {
+                let vk = kindOf(&v)
+                if set.vk[k] == 0 { set.vk[k] = vk } else if set.vk[k] != vk { return false }
+                n += valExtra(&v)
+            }
+            putV(mut &set.keys[k].vals, s, v)
+        } else {
+            putI(mut &set.keys[k].ints, s, iv)
+            putF(mut &set.keys[k].nul, s, nul)
+        }
+    }
+    bytes = n
+    return true
+}
+
+// Row r's outputs into slot s. Their bytes.
+fn ssOuts(set: mut &SortSet, s: int, op: &OutPlan, b: &Batch, ex: &[]BVec, r: int, j: int): int {
+    var n = 32
+    for o in 0..len(op.kinds) {
+        n += 24
+        let kind = op.kinds[o]
+        var iv = 0
+        var vv = Val.Null
+        let nul = bCell(kind, op.src[o], b, &ex[o], r, j, mut &iv, mut &vv)
+        putF(mut &set.outs[o].nul, s, nul)
+        if kind == BK_VAL {
+            if !nul { n += valExtra(&vv) }
+            putV(mut &set.ovals[o], s, vv)
+        } else {
+            putI(mut &set.outs[o].v, s, iv)
+        }
+    }
+    return n
+}
+
+// The heap's order: by the keys, then the scan's (a later row tied with an
+// earlier one sorts after it).
+fn hCmp(set: &SortSet, a: int, b: int): int {
+    let c = skCmp(&set.keys, 0, len(set.keys), a, b)
+    if c != 0 { return c }
+    return set.seq[a] - set.seq[b]
+}
+
+// The heap (its root the last row in the order) after heap[i] rose.
+fn hUp(set: &SortSet, heap: mut &[]int, i: int) {
+    var c = i
+    while c > 0 {
+        let p = (c - 1) / 2
+        if hCmp(set, heap[c], heap[p]) <= 0 { break }
+        let x = heap[c]
+        heap[c] = heap[p]
+        heap[p] = x
+        c = p
+    }
+}
+
+// ... after heap[i] fell.
+fn hDown(set: &SortSet, heap: mut &[]int, i: int) {
+    let n = len(heap)
+    var c = i
+    while true {
+        let l = 2 * c + 1
+        if l >= n { break }
+        var big = l
+        if l + 1 < n && hCmp(set, heap[l + 1], heap[l]) > 0 { big = l + 1 }
+        if hCmp(set, heap[big], heap[c]) <= 0 { break }
+        let x = heap[c]
+        heap[c] = heap[big]
+        heap[big] = x
+        c = big
+    }
+}
+
+// Whether sel may give its sorted (or DISTINCT) rows as an OutBatch
+// (sortBatches through runSelTo's sink): a query execSel's last branch runs.
+fn sortSinks(sel: &Sel): bool {
+    return sel.setop == 0 && len(sel.srf) == 0 && !sel.aggQ && len(sel.wins) == 0 && len(sel.locks) == 0 &&
+           len(sel.feedback) == 0 && (sel.sort || sel.distinct)
+}
+
+// Runs sel (sorting, or DISTINCT) over batches into res; false: not a
+// query the batches run, or one they gave up (nothing done, the counts as
+// they were). toSink: the rows go to eachB as one OutBatch, which gives
+// false if it wants them in res.rows.
+fn sortBatches(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: &Mats, params: &[]Val, limit: int,
+               offset: int, sorting: bool, rs: mut &Run, toSink: bool,
+               eachB: &fn(mut &lexdb_store.Txn, &OutBatch): Result[bool, DbErr], res: mut &Res): Result[bool, DbErr] {
+    let q = &sel.q
+    if !rs.batch || sel.setop != 0 || sel.aggQ || len(sel.wins) > 0 || len(sel.feedback) > 0 || sel.donKey > 0 ||
+       sel.withTies || sel.topMode != 0 || len(sel.locks) > 0 || len(q.levels) == 0 || hasSrfCall(&sel.exprs) { return Ok(false) }
+    if !sorting && !sel.distinct { return Ok(false) }
+    let got = try outPlan(st, txn, sel, m, params, rs, sorting)
+    if got.isNone() { return Ok(false) }
+    let op = got.unwrap()
+    let lp = &op.lp
+    let bp = &lp.bp
+    let lv = &q.levels[0]
+    let t = &lv.t
+    let zone = txn.zone
+    let no = len(op.nodes)
+    let nk = if sorting { len(op.knodes) } else { 0 }
+    // ORDER BY with LIMIT: the first limit + offset rows (top-N)
+    let topK = if sorting && limit >= 0 && !sel.distinct { limit + max(offset, 0) } else { -1 }
+    // DISTINCT with LIMIT and no ORDER BY: the scan stops at the rows wanted
+    let early = !sorting && limit >= 0
+    let stopAt = if offset > 0 { limit + offset } else { limit }
+    var cnt0: []Counts = []
+    for c in rs.cnt { append(mut &cnt0, c) }
+    var set = SortSet{outs: [], ovals: [], keys: [], vk: array(nk, 0), seq: [], bytes: [], n: 0}
+    for o in 0..no {
+        append(mut &set.outs, bvec(0))
+        append(mut &set.ovals, [])
+    }
+    for k in 0..nk {
+        let kind = if op.kout[k] >= 0 { op.kinds[op.kout[k]] } else { op.kkinds[k] }
+        append(mut &set.keys, newSKey(if kind == BK_VAL { SK_VAL } else { SK_INT }, sel.desc[k], sel.nullsFirst[k]))
+    }
+    // DISTINCT: one integer output by its integer, one text output by its
+    // text (its collation's key), else valsKeyIn's key
+    var dmode = 0
+    if sel.distinct { dmode = if no == 1 && op.kinds[0] != BK_VAL { 1 } else if no == 1 { 2 } else { 3 } }
+    let dkind0 = if len(sel.outKinds) > 0 { sel.outKinds[0] } else { lexdb_sql.COLL_EXACT }
+    var dInts: Map[int, int] = newMap()
+    var dKeys: Map[str, int] = newMap()
+    var dNull = false
+    var heap: []int = []
+    var scr = -1                        // top-N: the slot a row is tried in
+    var held = 0
+    var seq = 0
+    let room = rs.room()
+    let rs0max = rs.maxHeld
+    var stopped = false
+    rs.cnt[0].starts += 1
+    for sc in lp.scans {
+        if stopped { break }
+        var cur = newCursor()
+        while !cur.done {
+            let got1 = try fillBatch(st, txn, t, &sc, lp.part, mut &cur, bp)
+            if got1.isNone() {
+                rs.cnt = cnt0
+                return Ok(false)
+            }
+            var b = got1.unwrap()
+            let nr = b.n
+            if nr == 0 { continue }
+            let chosen = bChoose(&lp.conds, &b)
+            if chosen.isNone() {
+                rs.cnt = cnt0
+                return Ok(false)
+            }
+            var idx = chosen.unwrap()
+            let nChosen = len(idx)
+            if op.joined {
+                let got3 = try bJoinAll(st, txn, q, m, &op.jp, &b, &idx, &zone, rs)
+                if got3.isNone() {
+                    rs.cnt = cnt0
+                    return Ok(false)
+                }
+                b = got3.unwrap()
+                var all: []int = withCapacity(b.n)
+                for r in 0..b.n { append(mut &all, r) }
+                idx = all
+            }
+            var ex: []BVec = []
+            var kex: []BVec = []
+            var failed = false
+            for o in 0..no {
+                if op.src[o] >= 0 {
+                    append(mut &ex, bvec(0))
+                    continue
+                }
+                match bEval(&op.nodes[o], &b, &idx) {
+                    Ok(v) { append(mut &ex, v) }
+                    Err(_) { failed = true }
+                }
+                if failed { break }
+            }
+            for k in 0..nk {
+                if failed { break }
+                if op.kout[k] >= 0 || op.ksrc[k] >= 0 {
+                    append(mut &kex, bvec(0))
+                    continue
+                }
+                match bEval(&op.knodes[k], &b, &idx) {
+                    Ok(v) { append(mut &kex, v) }
+                    Err(_) { failed = true }
+                }
+            }
+            if failed {
+                rs.cnt = cnt0
+                return Ok(false)
+            }
+            rs.cnt[0].batches += 1
+            var went = len(idx)
+            for j in 0..len(idx) {
+                let r = idx[j]
+                seq += 1
+                if dmode > 0 {
+                    var iv = 0
+                    var vv = Val.Null
+                    if dmode == 1 {
+                        if bCell(op.kinds[0], op.src[0], &b, &ex[0], r, j, mut &iv, mut &vv) {
+                            if dNull { continue }
+                            dNull = true
+                        } else {
+                            if dInts.get(&iv).isSome() { continue }
+                            dInts.put(iv, 1)
+                        }
+                    } else if dmode == 2 {
+                        if bCell(op.kinds[0], op.src[0], &b, &ex[0], r, j, mut &iv, mut &vv) {
+                            if dNull { continue }
+                            dNull = true
+                        } else {
+                            var tk = ""
+                            var isText = false
+                            match collVal(dkind0, &vv) {
+                                Val.Text(x) {
+                                    tk = x
+                                    isText = true
+                                }
+                                else {}
+                            }
+                            if !isText {
+                                rs.cnt = cnt0
+                                return Ok(false)
+                            }
+                            if dKeys.get(&tk).isSome() { continue }
+                            dKeys.put(tk, 1)
+                        }
+                    } else {
+                        var kb = newStrBuf()
+                        for o in 0..no {
+                            let nul = bCell(op.kinds[o], op.src[o], &b, &ex[o], r, j, mut &iv, mut &vv)
+                            let v = cellVal(op.kinds[o], nul, iv, &vv)
+                            encIdxPart(mut &kb, &(if o < len(sel.outKinds) { collVal(sel.outKinds[o], &v) } else { v }))
+                        }
+                        let dk = kb.toStr()
+                        if dKeys.get(&dk).isSome() { continue }
+                        dKeys.put(dk, 1)
+                    }
+                }
+                var kb2 = 0
+                if topK >= 0 {
+                    if topK == 0 { continue }
+                    if len(heap) < topK {
+                        let s = set.n
+                        if !ssKeys(mut &set, s, sel, &op, &b, &ex, &kex, r, j, mut &kb2) {
+                            rs.cnt = cnt0
+                            return Ok(false)
+                        }
+                        let ob = ssOuts(mut &set, s, &op, &b, &ex, r, j)
+                        putI(mut &set.seq, s, seq)
+                        putI(mut &set.bytes, s, kb2 + ob)
+                        set.n += 1
+                        held += kb2 + ob
+                        append(mut &heap, s)
+                        hUp(&set, mut &heap, len(heap) - 1)
+                    } else {
+                        if scr < 0 {
+                            scr = set.n
+                            set.n += 1
+                        }
+                        if !ssKeys(mut &set, scr, sel, &op, &b, &ex, &kex, r, j, mut &kb2) {
+                            rs.cnt = cnt0
+                            return Ok(false)
+                        }
+                        putI(mut &set.seq, scr, seq)
+                        // the last kept beats it (or ties: it came first)
+                        if hCmp(&set, scr, heap[0]) >= 0 { continue }
+                        let ob = ssOuts(mut &set, scr, &op, &b, &ex, r, j)
+                        putI(mut &set.bytes, scr, kb2 + ob)
+                        held += kb2 + ob - set.bytes[heap[0]]
+                        let gone = heap[0]
+                        heap[0] = scr
+                        scr = gone
+                        hDown(&set, mut &heap, 0)
+                    }
+                } else {
+                    let s = set.n
+                    if !ssKeys(mut &set, s, sel, &op, &b, &ex, &kex, r, j, mut &kb2) {
+                        rs.cnt = cnt0
+                        return Ok(false)
+                    }
+                    let ob = ssOuts(mut &set, s, &op, &b, &ex, r, j)
+                    putI(mut &set.seq, s, seq)
+                    putI(mut &set.bytes, s, kb2 + ob)
+                    set.n += 1
+                    held += kb2 + ob
+                }
+                if room >= 0 && held > room { return Err(memErr(rs0max)) }
+                if early && set.n >= stopAt {
+                    went = j + 1
+                    stopped = true
+                    break
+                }
+            }
+            // counted as the row path counts them (batchLevel)
+            if op.joined {
+                rs.cnt[0].read += nr
+                rs.cnt[0].joined += nChosen
+                try rs.tickN(nr)
+            } else {
+                rs.cnt[0].read += nr - len(idx) + went
+                rs.cnt[0].joined += went
+                try rs.tickN(nr - len(idx) + went)
+            }
+            if stopped { break }
+        }
+    }
+    // the order
+    var perm: []int = []
+    if topK >= 0 {
+        // the heap's rows in the scan's order, then sorted by their keys (stable)
+        var hs: []int = []
+        for x in heap { append(mut &hs, x) }
+        collections.sortBy(mut &hs, fn(a: &int, b: &int): int { return set.seq[a] - set.seq[b] })
+        var tmp: []int = array(len(hs), 0)
+        skMerge(&set.keys, 0, nk, mut &hs, 0, len(hs), mut &tmp)
+        perm = hs
+    } else if sorting {
+        for k in 0..nk {
+            if set.keys[k].kind != SK_VAL { continue }
+            let vs = replace(mut &set.keys[k].vals, [])
+            var key = newSKey(SK_VAL, sel.desc[k], sel.nullsFirst[k])
+            if !skOfVals(vs, sel.desc[k], sel.nullsFirst[k], mut &key) {
+                rs.cnt = cnt0
+                return Ok(false)
+            }
+            set.keys[k] = key
+        }
+        perm = skSort(mut &set.keys, set.n)
+    } else {
+        for i in 0..set.n { append(mut &perm, i) }
+    }
+    try rs.hold(held)
+    let from = min(if offset > 0 { offset } else { 0 }, len(perm))
+    var to = len(perm)
+    if limit >= 0 && from + limit < to { to = from + limit }
+    var outs: []OutCol = []
+    for oc in sel.outs { append(mut &outs, oc) }
+    res = Res{cols: outs, rows: [], tag: "SELECT " + (to - from).toStr(), hasRows: true, copy: COPY_NONE}
+    if toSink && to > from {
+        var oidx: []int = withCapacity(to - from)
+        for i in from..to { append(mut &oidx, perm[i]) }
+        var srcs: []int = []
+        for o in 0..no { append(mut &srcs, o) }
+        var ob = OutBatch{n: to - from, kinds: copyInts(&op.kinds), src: srcs, idx: oidx, cols: replace(mut &set.outs, []),
+                          vals: replace(mut &set.ovals, []), ex: []}
+        if try eachB(txn, &ob) { return Ok(true) }
+        // not wanted so: the rows in res
+        set.outs = replace(mut &ob.cols, [])
+        set.ovals = replace(mut &ob.vals, [])
+    }
+    for i in from..to {
+        let s = perm[i]
+        var row: []Val = withCapacity(no)
+        for o in 0..no {
+            let kind = op.kinds[o]
+            if set.outs[o].nul[s] { append(mut &row, Val.Null) }
+            else if kind == BK_VAL { append(mut &row, set.ovals[o][s]) }
+            else if kind == BK_BOOL { append(mut &row, Val.Bool(set.outs[o].v[s] == 1)) }
+            else { append(mut &row, Val.Int(set.outs[o].v[s])) }
+        }
+        append(mut &res.rows, row)
+    }
+    return Ok(true)
 }
 
 // eachRowB's rows made in batches (outPlan), as runQuery's first level
