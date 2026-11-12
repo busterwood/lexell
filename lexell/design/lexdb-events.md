@@ -1,7 +1,7 @@
 # LexDB: transactional event streams with a waiting SELECT
 
 Status: design proposal, 2026-11-12. Not implemented. Revised the same day
-after a review against the code (section 12 lists what the review
+after a review against the code (section 13 lists what the review
 changed). Syntax and sequence allocation are provisional.
 
 ## 1. Idea
@@ -22,12 +22,13 @@ CREATE TABLE events (
 );
 
 BEGIN;
-SELECT seq, subject, payload
-FROM events
-WHERE seq > $1
-ORDER BY seq
-LIMIT 100
-WAIT 30000;
+WAITFOR (
+    SELECT seq, subject, payload
+    FROM events
+    WHERE seq > $1
+    ORDER BY seq
+    LIMIT 100
+), TIMEOUT 30000;
 
 -- Process the returned events, then advance the consumer cursor,
 -- only from the position this batch was read after (section 6).
@@ -37,13 +38,13 @@ WHERE consumer_id = $3 AND last_seen = $1;
 COMMIT;
 ```
 
-`WAIT 30000` waits up to 30 seconds. `$1` is the last successfully processed sequence. Return immediately when matching rows exist; otherwise wait, re-evaluate, and return a nonempty batch or an empty result at timeout. Each independent consumer has its own durable offset, stored as ordinary SQL data. No server-side consumer groups or individual acknowledgments are required initially (section 7 shows how groups are built from what LexDB has).
+`TIMEOUT 30000` waits up to 30 seconds. `$1` is the last successfully processed sequence. Return immediately when matching rows exist; otherwise wait, re-evaluate, and return a nonempty batch or an empty result at timeout. Each independent consumer has its own durable offset, stored as ordinary SQL data. No server-side consumer groups or individual acknowledgments are required initially (section 7 shows how groups are built from what LexDB has).
 
-**Spelling: `SELECT ... WAIT ms`, not `RECEIVE`.**
-- It reuses the whole S_SELECT path: Describe, the plan cache and the row description.
-- `wait` is not a keyword today; only `nowait` is.
-- `RECEIVE` would be a new statement kind duplicating all that. T-SQL's `WAITFOR (RECEIVE ...), TIMEOUT` can map onto `WAIT` later, for the TDS front end (`lexdb-tds.md`).
-- `WAIT $n` is allowed, as LIMIT allows a parameter.
+**Spelling: `WAITFOR (SELECT ...), TIMEOUT ms`**, from SQL Server Service Broker's `WAITFOR (RECEIVE ...), TIMEOUT ms`, the closest precedent (section 12):
+- The same form serves both front ends. Under TDS a suffix clause would be confusing: T-SQL needs no separator between statements, and `WAITFOR` already begins a statement there (`WAITFOR DELAY`, `WAITFOR TIME`; not done yet, `lexdb-tds.md`).
+- The parser turns it into an ordinary S_SELECT with a `waitMs` field. It still reuses the whole SELECT path: Describe, the plan cache and the row description. Only a SELECT may be inside; `RECEIVE`, which consumes rows as it reads them, is not needed, because the offset is ordinary data (section 6).
+- `waitfor` is not a keyword in PostgreSQL's grammar or in lexdb's today.
+- Without `TIMEOUT`, the wait runs to the cap (section 8). `TIMEOUT $n` is allowed, as LIMIT allows a parameter.
 
 Initially support only an easily recognisable indexed query: one table, `seq > parameter`, `ORDER BY seq ASC`, bounded `LIMIT`. Arbitrary predicates, joins and general waiting SELECTs create a much larger query-dependency problem and are not needed to test the design. Correctness does not depend on the shape: every wake re-runs the whole query (section 5). The restriction keeps the re-run cheap. Section 7's partitioned groups widen it to an equality prefix, `part = $p AND seq > $1`, on an index over `(part, seq)`.
 
@@ -155,7 +156,7 @@ All three patterns below use what LexDB has today: session advisory locks (`lexd
 - Each member takes `pg_advisory_lock(<group's key>)` before its waiting SELECT.
 - Standbys park on the lock, so only the holder waits for events: only one connection of the group is woken.
 - A session's advisory locks go when it closes, so a standby takes over when the active member disconnects.
-- LexDB notices a dead client only when its wait ends (section 8), so failover can take up to the WAIT cap.
+- LexDB notices a dead client only when its wait ends (section 8), so failover can take up to the wait's cap.
 
 **2. Members in parallel, ordered per key (partitions).**
 - Events carry a `part` column, a hash of their key modulo N.
@@ -165,11 +166,11 @@ All three patterns below use what LexDB has today: session advisory locks (`lexd
 
 **3. A work queue: any free worker takes any message, with no ordering.**
 - Per-message claims with `SELECT ... FOR UPDATE SKIP LOCKED`, or a claimed/done state column.
-- WAIT is used only when nothing is claimable.
+- `WAITFOR` is used only when nothing is claimable.
 - This is not an ordered stream. It suits jobs, not event processing.
 
 **Later, if measured: a keyed wake-one.**
-- Spelling: `WAIT 30000 GROUP 'billing'` or similar. Waiters with the same key form a queue, and a flush wakes the first of each queue rather than every waiter.
+- Spelling: `WAITFOR (SELECT ...), TIMEOUT 30000, GROUP 'billing'` or similar. Waiters with the same key form a queue, and a flush wakes the first of each queue rather than every waiter.
 - A wake is still only a hint. Waking just one waiter needs a **pass-on rule**, or work stalls. The woken waiter wakes the next in its queue when it:
   - returns a full batch (LIMIT reached: there may be more);
   - finds nothing;
@@ -188,16 +189,16 @@ All three patterns below use what LexDB has today: session advisory locks (`lexd
 - `statement_timeout` is checked only in `Run.tick`, and does not end lock waits today (9.86, "Not done").
 
 So the first version:
-- caps WAIT, at 60 s say, and lets the cap bound cleanup;
-- waits for the smaller of WAIT and the remaining `statement_timeout`, and raises 57014 if the latter ends first;
-- documents that client command timeouts must exceed WAIT. Npgsql and SqlClient default to 30 s, exactly the example's value.
+- caps the wait, at 60 s say, and lets the cap bound cleanup;
+- waits for the smaller of `TIMEOUT` and the remaining `statement_timeout`, and raises 57014 if the latter ends first;
+- documents that client command timeouts must exceed `TIMEOUT`. Npgsql and SqlClient default to 30 s, exactly the example's value.
 
 Real cancellation needs the connection loop to wait on "socket or wake": a separate project, shared with `LISTEN`/`NOTIFY`.
 
 **Refused with 0A000:**
-- **WAIT with a locking clause** (FOR UPDATE and the rest), which reads live data rather than a snapshot. It would break section 5's durability argument.
-- **WAIT on a replica.** Nothing flushes locally on a replica; the follower advances in its poll, and writes fail at commit. A wake from the follower's poll can come later, for autocommit consumers only.
-- **WAIT on a temporary table.** It is session-private (`lexdb.md` 9.96), so no other session can ever add to it.
+- **`WAITFOR` around a locking clause** (FOR UPDATE and the rest), which reads live data rather than a snapshot. It would break section 5's durability argument.
+- **`WAITFOR` on a replica.** Nothing flushes locally on a replica; the follower advances in its poll, and writes fail at commit. A wake from the follower's poll can come later, for autocommit consumers only.
+- **`WAITFOR` on a temporary table.** It is session-private (`lexdb.md` 9.96), so no other session can ever add to it.
 
 **The rest:**
 - **Describe** only plans, so it never waits.
@@ -228,7 +229,7 @@ A timeout on the wire is simply zero rows and `SELECT 0`; it needs no new messag
 Start with one stream/table, a constrained indexed SELECT, timeout, generation-based notification and offsets held in SQL tables. Avoid a new messaging protocol, consumer group subsystem or partitioning requirement. No subject filtering in version one: with a filter, the cursor cannot advance past rows that do not match, so each wake rescans them.
 
 **What it touches:**
-- **`lexdb_sql.lxl`:** a `waitMs` field beside `lockWait`, parsed after LIMIT and the locking clause.
+- **`lexdb_sql.lxl`:** `WAITFOR (SELECT ...) [, TIMEOUT n]` as a statement, in the PostgreSQL and T-SQL dialects, giving an S_SELECT with a `waitMs` field (beside `lockWait`).
 - **`lexdb_store.lxl`:**
   - `waitDurable(afterSeq, ms)`, modelled on `waitChange` and woken in the log writer's post-flush section;
   - an accessor for `Txn.snapSeq`.
@@ -251,16 +252,59 @@ Start with one stream/table, a constrained indexed SELECT, timeout, generation-b
 - **ordering and durability:** concurrent writers never exposing out-of-order event sequences; recovery/durability;
 - **retention:** explicit retention-expired behaviour.
 
-## 12. Review, 2026-11-12
+## 12. Precedents
+
+From memory, 2026-11-12; check the details before relying on them. None of these is a waiting SELECT on an ordinary table, but each has a piece of the design.
+
+**Blocking receive inside a transaction: the closest.**
+- **SQL Server Service Broker** (since 2005):
+  - `WAITFOR (RECEIVE TOP (n) ... FROM queue), TIMEOUT ms` is a blocking read inside a transaction, beside business writes, and a rollback puts the message back. It is where this design's spelling comes from (section 2).
+  - Its conversation-group locks give one reader per group: section 7's wake-one.
+  - It differs in two ways: queues are special objects, not tables, and a message is consumed once, not re-read from an offset.
+- **Oracle Advanced Queuing, now Transactional Event Queues:**
+  - `DBMS_AQ.DEQUEUE` takes a wait time and runs in the caller's transaction. Events published in the same commit as business changes are its main selling point.
+  - Since 21c it has a Kafka-compatible client API over the same queues: the nearest to "Kafka's semantics, transactional, in the database".
+
+**Streaming SQL statements, with no transaction around consumption:**
+- **CockroachDB's core changefeeds** (`EXPERIMENTAL CHANGEFEED FOR t`): a SQL statement that never ends, streaming changes as rows.
+- **Materialize's `SUBSCRIBE`** (formerly `TAIL`) and **ksqlDB's** `EMIT CHANGES` push queries: long-running queries that send results as they change.
+
+These push; they do not return a batch and wait. The client keeps its position, and no transaction ties it to processing.
+
+**PostgreSQL:**
+- **`LISTEN`/`NOTIFY`:** delivered at commit, but not durable and not replayable. It is section 5's wake hint without the log.
+- **Queues with `SKIP LOCKED`,** and extensions such as pgmq: work queues, polled (section 7's third pattern).
+- **Logical replication slots:** a durable, ordered change stream with a position kept per consumer, read over the replication protocol rather than by SELECT.
+
+**Sequence numbers that follow commit order (section 4)** are a known trap, with known answers:
+- **Kafka**, with transactions: a `read_committed` consumer never reads past the "last stable offset", the first transaction still open. It is section 4's guarantee.
+- **FoundationDB:**
+  - versionstamps fill a key's sequence in from the commit version: section 4's commit-time alternative;
+  - watches are a wake hint that must be rechecked, as in section 5.
+- **SQL Server's `rowversion`** is assigned at write time and has exactly the gap problem. `MIN_ACTIVE_ROWVERSION()` exists so readers can stop below writes not yet committed.
+- **PostgreSQL outbox and event-store libraries** filter by transaction ids and snapshots, or serialize their writers (Message DB with an advisory lock).
+
+**Not SQL, the same shape:**
+- **Redis Streams' `XREADGROUP ... BLOCK`:** a blocking read, with consumer groups and a pending-entries list per group.
+- **NATS JetStream's pull consumers:** the blocking receive section 1 names.
+
+**What is new here is the combination:**
+- the stream is an ordinary table;
+- the subscription is an ordinary indexed SELECT that can wait, not a queue object or a protocol;
+- the consumer's offset is ordinary data, committed in the same serializable transaction as the processing.
+
+Service Broker and Oracle AQ have the transaction but special queues. Changefeeds, `SUBSCRIBE` and replication slots re-read the log, outside any transaction.
+
+## 13. Review, 2026-11-12
 
 The proposal was reviewed against the code the day it was written. What changed:
 - **Section 3:** BEGIN takes its snapshot at once today, so the waiting SELECT swaps it. It also needs a first-statement flag, and reads quietly so that a caught-up consumer does not fail with 40001.
 - **Section 4:** the counter row queues producers, one per flush; they do not retry.
 - **Section 5:** the generation is `durableSeq`, woken after the flush, with an atomic check-and-register.
 - **Section 6:** the offset update must be a compare-and-set. Otherwise two competing workers can both commit.
-- **Sections 7 to 9 are new:** consumer groups, the first version's limits and refusals, and `LISTEN`/`NOTIFY`.
+- **Sections 7 to 9 and 12 are new:** consumer groups, the first version's limits and refusals, `LISTEN`/`NOTIFY`, and the precedents.
 - **The open questions are settled:**
-  - `SELECT ... WAIT ms`;
+  - `WAITFOR (SELECT ...), TIMEOUT ms`, after Service Broker (changed from `SELECT ... WAIT ms` once the precedents were listed);
   - a counter row first;
   - an ordinary table;
   - a timeout as zero rows, and retention as a `floor` column;
