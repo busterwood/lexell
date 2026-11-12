@@ -1,0 +1,554 @@
+// lexdb_tsqlfn: T-SQL's functions that lexdb's own do not cover
+// (design/lexdb-tds.md S3). The parser (lexdb_sql in T-SQL mode) maps
+// T-SQL's calls onto lexdb's where they agree (ISNULL is coalesce,
+// REPLICATE repeat, ...) and onto these where they do not; lexdb_exec calls
+// call() for any name here.
+//
+// Dates as SQL Server takes them: a text is read as a datetime; DATEDIFF
+// counts the boundaries crossed (DATEDIFF(year, '2023-12-31',
+// '2024-01-01') is 1); weeks start on Sunday (SET DATEFIRST 7, us_english's
+// default); DATEPART(weekday) is 1 on Sunday.
+
+import "strings"
+import "unicode"
+import "./lexdb_base"
+import "./lexdb_sql"
+import "./lexdb_time"
+
+type Val = lexdb_sql.Val
+type DbErr = lexdb_base.DbErr
+
+fn e(state: str, msg: str): DbErr { return lexdb_base.err(state, msg) }
+
+// The names call() takes.
+pub fn isTsqlFn(name: &str): bool {
+    match name {
+        "#len", "#datalength", "charindex", "patindex", "#replaceci", "#stuff", "#round", "#power", "#dateadd", "#datediff",
+        "#datepart", "#datename", "#eomonth", "#datestyle", "#tlike", "#utcnow", "#reverse", "#concat_ws", "#tint" { return true }
+        else { return false }
+    }
+}
+
+fn isNull(v: &Val): bool {
+    match v {
+        Val.Null { return true }
+        else { return false }
+    }
+}
+
+// A value as T-SQL converts it to a string.
+fn sv(v: &Val): str {
+    match v {
+        Val.Text(s) { return s }
+        Val.Int(n) { return n.toStr() }
+        Val.Num(d) { return d.toStr() }
+        Val.Bool(b) { return if b { "1" } else { "0" } }
+        Val.Float(x) { return x.toStr() }
+        Val.Date(d) { return lexdb_time.fmtDate(d) }
+        Val.Ts(u) { return lexdb_time.fmtTs(u) }
+        Val.Uuid(u) { return strings.toUpperAscii(u) }
+        else { return "" }
+    }
+}
+
+fn intOf(v: &Val, what: &str): Result[int, DbErr] {
+    match v {
+        Val.Int(n) { return Ok(n) }
+        Val.Num(d) {
+            match d.toInt(Rounding.TOWARD_ZERO) {
+                Ok(n) { return Ok(n) }
+                Err(_) { return Err(e("22003", what + ": out of range")) }
+            }
+        }
+        Val.Bool(b) { return Ok(if b { 1 } else { 0 }) }
+        Val.Text(s) {
+            match strings.parseIntOpt(strings.trim(s)) {
+                Some(n) { return Ok(n) }
+                None { return Err(e("TS245", "Conversion failed when converting the varchar value '" + s + "' to data type int.")) }
+            }
+        }
+        else { return Err(e("TS8116", "Argument data type is invalid for argument of " + what + " function.")) }
+    }
+}
+
+fn runes(s: &str): []int {
+    var out: []int = []
+    var i = 0
+    while i < len(s) {
+        let d = strings.decodeAt(s, i)
+        append(mut &out, d.rune)
+        i += d.size
+    }
+    return out
+}
+
+fn fromRunes(rs: &[]int, a: int, b: int): str {
+    var sb = newStrBuf()
+    for i in a..b { strings.addRune(mut &sb, rs[i]) }
+    return sb.toStr()
+}
+
+pub fn call(name: &str, vs: &[]Val, z: &lexdb_time.Zone): Result[Option[Val], DbErr] {
+    let n = len(vs)
+    if name == "#utcnow" { return Ok(Some(Val.Ts(lexdb_time.nowTstz()))) }
+    if name == "#concat_ws" {
+        // CONCAT_WS(sep, x, ...): the values not NULL, sep between
+        if n == 0 || isNull(&vs[0]) { return Ok(Some(Val.Null)) }
+        var parts: []str = []
+        for i in 1..n { if !isNull(&vs[i]) { append(mut &parts, sv(&vs[i])) } }
+        return Ok(Some(Val.Text(strings.join(&parts, sv(&vs[0])))))
+    }
+    for v in vs { if isNull(&v) { return Ok(Some(Val.Null)) } }
+    match name {
+        "#len" {
+            // its characters, trailing spaces not counted
+            var s = sv(&vs[0])
+            var end = len(s)
+            while end > 0 && s[end - 1] == ' ' { end -= 1 }
+            return Ok(Some(Val.Int(strings.runeCount(&s[0..end]))))
+        }
+        "#datalength" {
+            match vs[0] {
+                Val.Text(s) {
+                    // nvarchar's: two bytes a UTF-16 unit
+                    var units = 0
+                    for r in runes(&s) { units += if r > 0xFFFF { 2 } else { 1 } }
+                    return Ok(Some(Val.Int(2 * units)))
+                }
+                Val.Bytes(b) { return Ok(Some(Val.Int(len(b)))) }
+                Val.Int(_) { return Ok(Some(Val.Int(4))) }
+                Val.Bool(_) { return Ok(Some(Val.Int(1))) }
+                Val.Date(_) { return Ok(Some(Val.Int(3))) }
+                Val.Ts(_) { return Ok(Some(Val.Int(8))) }
+                Val.Float(_) { return Ok(Some(Val.Int(8))) }
+                Val.Uuid(_) { return Ok(Some(Val.Int(16))) }
+                else { return Ok(Some(Val.Int(len(sv(&vs[0]))))) }
+            }
+        }
+        "charindex" {
+            // CHARINDEX(find, s [, start]): where find is in s from start, 1 on; 0 none
+            let f = runes(&sv(&vs[0]))
+            let s = runes(&sv(&vs[1]))
+            var from = if n > 2 { try intOf(&vs[2], &"charindex") } else { 1 }
+            if from < 1 { from = 1 }
+            if len(f) == 0 { return Ok(Some(Val.Int(0))) }
+            var i = from - 1
+            while i + len(f) <= len(s) {
+                var ok = true
+                for k in 0..len(f) { if s[i + k] != f[k] { ok = false } }
+                if ok { return Ok(Some(Val.Int(i + 1))) }
+                i += 1
+            }
+            return Ok(Some(Val.Int(0)))
+        }
+        "patindex" {
+            // PATINDEX(pattern, s): where pattern (LIKE's, with % around
+            // what is looked for) first matches; 0 none
+            let p = runes(&sv(&vs[0]))
+            let s = runes(&sv(&vs[1]))
+            let lead = len(p) > 0 && p[0] == int('%')
+            var rest: []int = []
+            for k in (if lead { 1 } else { 0 })..len(p) { append(mut &rest, p[k]) }
+            let last = if lead { len(s) } else { 0 }
+            for i in 0..last + 1 {
+                if i > len(s) { break }
+                var sub: []int = []
+                for k in i..len(s) { append(mut &sub, s[k]) }
+                if likeAt(&sub, 0, &rest, 0, -1) { return Ok(Some(Val.Int(i + 1))) }
+                if !lead { break }
+            }
+            return Ok(Some(Val.Int(0)))
+        }
+        "#tlike" {
+            // T-SQL's LIKE: %, _, [abc], [a-c], [^abc]; ESCAPE c
+            var esc = -1
+            if n > 2 {
+                let er = runes(&sv(&vs[2]))
+                if len(er) == 1 { esc = er[0] }
+            }
+            return Ok(Some(Val.Bool(likeAt(&runes(&sv(&vs[0])), 0, &runes(&sv(&vs[1])), 0, esc))))
+        }
+        "#replaceci" {
+            // REPLACE under a case-insensitive collation: find matched as it folds
+            let s = runes(&sv(&vs[0]))
+            let f = runes(&sv(&vs[1]))
+            let r = sv(&vs[2])
+            if len(f) == 0 { return Ok(Some(Val.Text(sv(&vs[0])))) }
+            var fs: []int = []
+            for x in s { append(mut &fs, fold(x)) }
+            var ff: []int = []
+            for x in f { append(mut &ff, fold(x)) }
+            var sb = newStrBuf()
+            var i = 0
+            while i < len(s) {
+                var ok = i + len(ff) <= len(fs)
+                if ok { for k in 0..len(ff) { if fs[i + k] != ff[k] { ok = false } } }
+                if ok {
+                    sb.add(r)
+                    i += len(ff)
+                } else {
+                    strings.addRune(mut &sb, s[i])
+                    i += 1
+                }
+            }
+            return Ok(Some(Val.Text(sb.toStr())))
+        }
+        "#stuff" {
+            // STUFF(s, start, length, new): length characters from start replaced
+            let s = runes(&sv(&vs[0]))
+            let st = try intOf(&vs[1], &"stuff")
+            let ln = try intOf(&vs[2], &"stuff")
+            if st < 1 || st > len(s) || ln < 0 { return Ok(Some(Val.Null)) }
+            let end = min(len(s), st - 1 + ln)
+            return Ok(Some(Val.Text(fromRunes(&s, 0, st - 1) + sv(&vs[3]) + fromRunes(&s, end, len(s)))))
+        }
+        "#round" {
+            // ROUND(x, n): x's type kept (a decimal its scale: 2.567 to 2 is 2.570)
+            let k = try intOf(&vs[1], &"round")
+            let trunc = n > 2 && try intOf(&vs[2], &"round") != 0
+            match vs[0] {
+                Val.Num(d) {
+                    let mode = if trunc { Rounding.TOWARD_ZERO } else { Rounding.HALF_AWAY }
+                    let sc = d.scale()
+                    if k >= sc { return Ok(Some(Val.Num(d))) }
+                    var q = try quant(&d, k, mode)
+                    return Ok(Some(Val.Num(try quant(&q, sc, mode))))
+                }
+                Val.Int(x) {
+                    if k >= 0 { return Ok(Some(Val.Int(x))) }
+                    var p = 1
+                    for i in 0..(0 - k) { p = p * 10 }
+                    let r = if trunc { (x / p) * p } else if x >= 0 { ((x + p / 2) / p) * p } else { 0 - (((0 - x) + p / 2) / p) * p }
+                    return Ok(Some(Val.Int(r)))
+                }
+                Val.Float(x) {
+                    let p = (10.0f).pow(float(k))
+                    return Ok(Some(Val.Float(if trunc { (x * p).trunc() / p } else { (x * p).round() / p })))
+                }
+                else { return Err(e("TS8116", "Argument data type is invalid for argument 1 of round function.")) }
+            }
+        }
+        "#power" {
+            // POWER(x, y): of x's type
+            let y = toFloat(&vs[1])
+            match vs[0] {
+                Val.Int(x) { return Ok(Some(Val.Int(int(float(x).pow(y).trunc())))) }
+                Val.Num(d) {
+                    let r = toFloat(&vs[0]).pow(y)
+                    match Decimal.parse(r.toStr()) {
+                        Ok(x) { return Ok(Some(Val.Num(try quant(&x, d.scale(), Rounding.HALF_AWAY)))) }
+                        Err(_) { return Ok(Some(Val.Float(r))) }
+                    }
+                }
+                else { return Ok(Some(Val.Float(toFloat(&vs[0]).pow(y)))) }
+            }
+        }
+        "#dateadd" { return Ok(Some(try dateadd(&sv(&vs[0]), try intOf(&vs[1], &"dateadd"), &vs[2], z))) }
+        "#datediff" { return Ok(Some(Val.Int(try datediff(&sv(&vs[0]), &vs[1], &vs[2], z)))) }
+        "#datepart" { return Ok(Some(Val.Int(try datepart(&sv(&vs[0]), &vs[1], z)))) }
+        "#datename" {
+            let part = sv(&vs[0])
+            if part == "month" { return Ok(Some(Val.Text(MONTHS[try datepart(&part, &vs[1], z) - 1].toStr()))) }
+            if part == "weekday" { return Ok(Some(Val.Text(DAYS[try datepart(&part, &vs[1], z) - 1].toStr()))) }
+            return Ok(Some(Val.Text((try datepart(&part, &vs[1], z)).toStr())))
+        }
+        "#eomonth" {
+            // EOMONTH(d [, months]): the last day of d's month (months on)
+            let us = try asTs(&vs[0], z)
+            let add = if n > 1 { try intOf(&vs[1], &"eomonth") } else { 0 }
+            let first = lexdb_time.dateToTs(lexdb_time.tsToDate(us)) - (try datepart(&"day", &Val.Ts(us), z) - 1) * lexdb_time.DAY_US
+            let next = try lexdb_time.tsPlus(first, &lexdb_time.Ival{months: add + 1, days: 0, us: 0})
+            return Ok(Some(Val.Date(lexdb_time.tsToDate(next) - 1)))
+        }
+        "#reverse" {
+            let r = runes(&sv(&vs[0]))
+            var sb = newStrBuf()
+            var i = len(r)
+            while i > 0 {
+                i -= 1
+                strings.addRune(mut &sb, r[i])
+            }
+            return Ok(Some(Val.Text(sb.toStr())))
+        }
+        "#tint" {
+            // CAST to an integer type: a fraction cut, not rounded (3.9 is 3)
+            match vs[0] {
+                Val.Num(d) { return Ok(Some(Val.Num(try quant(&d, 0, Rounding.TOWARD_ZERO)))) }
+                Val.Float(x) { return Ok(Some(Val.Float(x.trunc()))) }
+                else { return Ok(Some(vs[0])) }
+            }
+        }
+        "#datestyle" {
+            match try datestyle(&vs[0], try intOf(&vs[1], &"convert"), z) {
+                Some(x) { return Ok(Some(x)) }
+                None { return Ok(Some(vs[0])) }
+            }
+        }
+        else { return Ok(None) }
+    }
+}
+
+fn quant(d: &Decimal, scale: int, mode: Rounding): Result[Decimal, DbErr] {
+    match d.quantize(scale, mode) {
+        Ok(q) { return Ok(q) }
+        Err(_) { return Err(e("TS8115", "Arithmetic overflow error converting expression to data type numeric.")) }
+    }
+}
+
+fn toFloat(v: &Val): float {
+    match v {
+        Val.Int(n) { return float(n) }
+        Val.Float(x) { return x }
+        Val.Num(d) { return d.toFloat() }
+        else { return 0.0f }
+    }
+}
+
+// The lower case of the upper case: as the case-insensitive collation folds.
+fn fold(r: int): int {
+    if r < 128 { return if r >= int('A') && r <= int('Z') { r + 32 } else { r } }
+    return unicode.lower(unicode.upper(r))
+}
+
+// ---- LIKE, T-SQL's
+
+// Whether s from i matches p from j: % any run, _ one character, [set]
+// one of it ([^set] none of it, a-z a range), esc the next character as it is.
+fn likeAt(s: &[]int, i0: int, p: &[]int, j0: int, esc: int): bool {
+    var i = i0
+    var j = j0
+    while j < len(p) {
+        let c = p[j]
+        if c == esc && esc >= 0 && j + 1 < len(p) {
+            if i >= len(s) || s[i] != p[j + 1] { return false }
+            i += 1
+            j += 2
+            continue
+        }
+        if c == int('%') {
+            while j < len(p) && p[j] == int('%') { j += 1 }
+            if j == len(p) { return true }
+            for k in i..len(s) + 1 { if likeAt(s, k, p, j, esc) { return true } }
+            return false
+        }
+        if i >= len(s) { return false }
+        if c == int('_') {
+            i += 1
+            j += 1
+            continue
+        }
+        if c == int('[') {
+            // a set, to its ]; a [ with none is itself
+            var k = j + 1
+            var neg = false
+            if k < len(p) && p[k] == int('^') {
+                neg = true
+                k += 1
+            }
+            var close = -1
+            var m = k
+            while m < len(p) {
+                if p[m] == int(']') && m > k {
+                    close = m
+                    break
+                }
+                m += 1
+            }
+            if close > 0 {
+                var hit = false
+                var q = k
+                while q < close {
+                    if q + 2 < close && p[q + 1] == int('-') {
+                        if s[i] >= p[q] && s[i] <= p[q + 2] { hit = true }
+                        q += 3
+                    } else {
+                        if s[i] == p[q] { hit = true }
+                        q += 1
+                    }
+                }
+                if hit == neg { return false }
+                i += 1
+                j = close + 1
+                continue
+            }
+        }
+        if s[i] != c { return false }
+        i += 1
+        j += 1
+    }
+    return i == len(s)
+}
+
+// ---- dates
+
+const MONTHS: []str = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]
+const DAYS: []str = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+
+// A value as a datetime: microseconds since 2000, local.
+fn asTs(v: &Val, z: &lexdb_time.Zone): Result[int, DbErr] {
+    match v {
+        Val.Date(d) { return Ok(lexdb_time.dateToTs(d)) }
+        Val.Ts(u) { return Ok(u) }
+        Val.Tstz(u) { return Ok(lexdb_time.tstzToTs(u, z)) }
+        Val.Time(u) { return Ok(u - 36524 * lexdb_time.DAY_US) }     // 1900-01-01, as SQL Server's time cast to datetime
+        Val.Text(s) {
+            match lexdb_time.parseTs(&strings.trim(s), z) {
+                Ok(u) { return Ok(u) }
+                Err(_) { return Err(e("TS241", "Conversion failed when converting date and/or time from character string.")) }
+            }
+        }
+        else { return Err(e("TS8116", "Argument data type is invalid for a date function.")) }
+    }
+}
+
+fn ymd(us: int): []int {
+    let l = lexdb_time.localOf(us)
+    return [l.date.year, l.date.month, l.date.day]
+}
+
+fn floorDiv(a: int, b: int): int {
+    let q = a / b
+    return if (a % b != 0) && ((a < 0) != (b < 0)) { q - 1 } else { q }
+}
+
+// Days since 2000-01-01 of a datetime, and its week number counted from
+// Sundays (2000-01-01 was a Saturday).
+fn dayNo(us: int): int { return floorDiv(us, lexdb_time.DAY_US) }
+fn weekNo(us: int): int { return floorDiv(dayNo(us) + 6, 7) }
+
+fn dateadd(part: &str, n: int, v: &Val, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    let us = try asTs(v, z)
+    var iv = lexdb_time.Ival{months: 0, days: 0, us: 0}
+    match part.toStr() {
+        "year" { iv.months = 12 * n }
+        "quarter" { iv.months = 3 * n }
+        "month" { iv.months = n }
+        "dayofyear", "day", "weekday" { iv.days = n }
+        "week" { iv.days = 7 * n }
+        "hour" { iv.us = n * 3600000000 }
+        "minute" { iv.us = n * 60000000 }
+        "second" { iv.us = n * 1000000 }
+        "millisecond" { iv.us = n * 1000 }
+        "microsecond" { iv.us = n }
+        "nanosecond" { iv.us = n / 1000 }
+        else { return Err(e("TS155", "'" + part + "' is not a recognized dateadd option.")) }
+    }
+    let r = try lexdb_time.tsPlus(us, &iv)
+    match v {
+        Val.Date(_) {
+            if iv.us != 0 { return Err(e("TS9810", "The datepart " + part + " is not supported by date function dateadd for data type date.")) }
+            return Ok(Val.Date(lexdb_time.tsToDate(r)))
+        }
+        Val.Tstz(_) { return Ok(Val.Tstz(lexdb_time.tsToTstz(r, z))) }
+        else { return Ok(Val.Ts(r)) }
+    }
+}
+
+fn datediff(part: &str, a: &Val, b: &Val, z: &lexdb_time.Zone): Result[int, DbErr] {
+    let x = try asTs(a, z)
+    let y = try asTs(b, z)
+    let p = ymd(x)
+    let q = ymd(y)
+    match part.toStr() {
+        "year" { return Ok(q[0] - p[0]) }
+        "quarter" { return Ok((q[0] * 4 + (q[1] - 1) / 3) - (p[0] * 4 + (p[1] - 1) / 3)) }
+        "month" { return Ok((q[0] * 12 + q[1]) - (p[0] * 12 + p[1])) }
+        "dayofyear", "day", "weekday" { return Ok(dayNo(y) - dayNo(x)) }
+        "week" { return Ok(weekNo(y) - weekNo(x)) }
+        "hour" { return Ok(floorDiv(y, 3600000000) - floorDiv(x, 3600000000)) }
+        "minute" { return Ok(floorDiv(y, 60000000) - floorDiv(x, 60000000)) }
+        "second" { return Ok(floorDiv(y, 1000000) - floorDiv(x, 1000000)) }
+        "millisecond" { return Ok(floorDiv(y, 1000) - floorDiv(x, 1000)) }
+        "microsecond" { return Ok(y - x) }
+        "nanosecond" { return Ok((y - x) * 1000) }
+        else { return Err(e("TS155", "'" + part + "' is not a recognized datediff option.")) }
+    }
+}
+
+fn datepart(part: &str, v: &Val, z: &lexdb_time.Zone): Result[int, DbErr] {
+    let us = try asTs(v, z)
+    let d = ymd(us)
+    let tod = us - dayNo(us) * lexdb_time.DAY_US
+    match part.toStr() {
+        "year" { return Ok(d[0]) }
+        "quarter" { return Ok((d[1] - 1) / 3 + 1) }
+        "month" { return Ok(d[1]) }
+        "day" { return Ok(d[2]) }
+        "dayofyear" {
+            let jan1 = try lexdb_time.makeDate(d[0], 1, 1)
+            return Ok(dayNo(us) - jan1 + 1)
+        }
+        "weekday" { return Ok(floorMod(dayNo(us) + 6, 7) + 1) }
+        "week" {
+            let jan1 = lexdb_time.dateToTs(try lexdb_time.makeDate(d[0], 1, 1))
+            return Ok(weekNo(us) - weekNo(jan1) + 1)
+        }
+        "hour" { return Ok(tod / 3600000000) }
+        "minute" { return Ok((tod / 60000000) % 60) }
+        "second" { return Ok((tod / 1000000) % 60) }
+        "millisecond" { return Ok((tod / 1000) % 1000) }
+        "microsecond" { return Ok(tod % 1000000) }
+        "nanosecond" { return Ok((tod % 1000000) * 1000) }
+        else { return Err(e("TS155", "'" + part + "' is not a recognized datepart option.")) }
+    }
+}
+
+fn floorMod(a: int, b: int): int { return a - floorDiv(a, b) * b }
+
+fn two(n: int): str { return strings.padLeft(n.toStr(), 2, '0') }
+fn four(n: int): str { return strings.padLeft(n.toStr(), 4, '0') }
+
+const MON3: []str = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+// CONVERT(text type, d, style): a date or time as the style writes it; any
+// other value as it is (the cast after it makes it text).
+fn datestyle(v: &Val, style: int, z: &lexdb_time.Zone): Result[Option[Val], DbErr] {
+    var us = 0
+    match v {
+        Val.Date(dd) { us = lexdb_time.dateToTs(dd) }
+        Val.Ts(u) { us = u }
+        Val.Tstz(u) { us = lexdb_time.tstzToTs(u, z) }
+        Val.Time(u) { us = u }
+        else { return Ok(None) }
+    }
+    let d = ymd(us)
+    let tod = us - dayNo(us) * lexdb_time.DAY_US
+    let hh = tod / 3600000000
+    let mi = (tod / 60000000) % 60
+    let ss = (tod / 1000000) % 60
+    let ms = (tod / 1000) % 1000
+    let y4 = four(d[0])
+    let y2 = two(d[0] % 100)
+    let mm = two(d[1])
+    let dd = two(d[2])
+    let hms = two(hh) + ":" + two(mi) + ":" + two(ss)
+    let y = if style >= 100 || style == 20 || style == 21 || style == 23 || style == 126 || style == 127 { y4 } else { y2 }
+    match style {
+        1, 101 { return Ok(Some(Val.Text(mm + "/" + dd + "/" + y))) }
+        2, 102 { return Ok(Some(Val.Text(y + "." + mm + "." + dd))) }
+        3, 103 { return Ok(Some(Val.Text(dd + "/" + mm + "/" + y))) }
+        4, 104 { return Ok(Some(Val.Text(dd + "." + mm + "." + y))) }
+        5, 105 { return Ok(Some(Val.Text(dd + "-" + mm + "-" + y))) }
+        6, 106 { return Ok(Some(Val.Text(dd + " " + MON3[d[1] - 1] + " " + y))) }
+        7, 107 { return Ok(Some(Val.Text(MON3[d[1] - 1] + " " + dd + ", " + y))) }
+        8, 108, 24 { return Ok(Some(Val.Text(hms))) }
+        10, 110 { return Ok(Some(Val.Text(mm + "-" + dd + "-" + y))) }
+        11, 111 { return Ok(Some(Val.Text(y + "/" + mm + "/" + dd))) }
+        12, 112 { return Ok(Some(Val.Text(y + mm + dd))) }
+        23 { return Ok(Some(Val.Text(y4 + "-" + mm + "-" + dd))) }
+        20, 120 { return Ok(Some(Val.Text(y4 + "-" + mm + "-" + dd + " " + hms))) }
+        21, 121 { return Ok(Some(Val.Text(y4 + "-" + mm + "-" + dd + " " + hms + "." + strings.padLeft(ms.toStr(), 3, '0')))) }
+        126, 127 {
+            var out = y4 + "-" + mm + "-" + dd + "T" + hms
+            if ms != 0 { out = out + "." + strings.padLeft(ms.toStr(), 3, '0') }
+            if style == 127 { out = out + "Z" }
+            return Ok(Some(Val.Text(out)))
+        }
+        0, 100 {
+            let h12 = if hh % 12 == 0 { 12 } else { hh % 12 }
+            return Ok(Some(Val.Text(MON3[d[1] - 1] + " " + strings.padLeft(d[2].toStr(), 2, ' ') + " " + y4 + " " +
+                               strings.padLeft(h12.toStr(), 2, ' ') + ":" + two(mi) + (if hh < 12 { "AM" } else { "PM" }))))
+        }
+        else { return Err(e("TS281", style.toStr() + " is not a valid style number when converting from datetime to a character string.")) }
+    }
+}

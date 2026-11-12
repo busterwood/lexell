@@ -28,12 +28,15 @@ import "./lexdb_float"
 import "./lexdb_pgcat"
 import "./lexdb_auth"
 import "regex"
+import "unicode"
 import "math"
 import "base64"
 import "./lexdb_page"
 import "./lexdb_store"
 import "./lexdb_sql"
 import "./lexdb_func"
+import "./lexdb_sqlcoll"
+import "./lexdb_tsqlfn"
 
 pub const CATALOG = 1
 
@@ -82,6 +85,10 @@ pub type Table = record {
     // A temporary table's ON COMMIT (lexdb_sql.ONC_*, 9.96): kept for
     // DELETE ROWS and DROP
     pub onCommit: int
+    // Its name as written, where that differs from its catalog key's base
+    // name (design/lexdb-tds.md L6: names are matched folded, shown as
+    // written); "" else. Its columns' are their ColDef.spell.
+    pub spell: str
 }
 
 // A foreign key: cols of its table hold a key of table ref, refCols (a
@@ -99,14 +106,24 @@ pub type ForeignKey = record {
 
 fn emptyTable(name: str): Table {
     return Table{name: name, tree: 0, cols: [], pk: [], indexes: [], slots: [], width: 0, checks: [], fks: [], refBy: [], layouts: [], lays: [],
-                 view: "", deps: [], onCommit: 0}
+                 view: "", deps: [], onCommit: 0, spell: ""}
 }
 
 // A CHECK constraint: a row may not make expr false (column names bare).
 pub type Check = record { pub name: str; pub expr: Expr }
 
 // A result column: its name and type OID.
-pub type OutCol = value record { pub name: str; pub oid: int }
+// spell: its name as written where that differs (L6), "" else; a client is
+// shown label(), lexdb matches name.
+// coll: a text column's collation (L2), "" exact.
+// scale: a time type's fractional seconds where its type says (datetime's
+// 3), -1 else (design/lexdb-tds.md S3: TDS sends datetime2(scale)).
+pub type OutCol = value record { pub name: str; pub oid: int; pub spell: str; pub coll: str; pub scale: int }
+
+pub fn (o: &OutCol) label(): str {
+    if o.spell == lexdb_sql.ANON { return "" }         // T-SQL's unnamed column
+    return if len(o.spell) > 0 { o.spell } else { o.name }
+}
 
 pub type Res = record {
     pub cols: []OutCol
@@ -306,6 +323,9 @@ pub fn coerce(v: Val, t: &lexdb_sql.TypeName): Result[Val, DbErr] {
     } else if t.kind == lexdb_sql.K_BOOL {
         match v {
             Val.Bool(b) { return Ok(Val.Bool(b)) }
+            // T-SQL's bit (len 1): a number, 0 false, else true
+            Val.Int(n) { if t.len == 1 { return Ok(Val.Bool(n != 0)) } }
+            Val.Num(d) { if t.len == 1 { return Ok(Val.Bool(!d.isZero())) } }
             Val.Text(s) {
                 match parseBool(&s) {
                     Some(b) { return Ok(Val.Bool(b)) }
@@ -1388,7 +1408,7 @@ fn quantified(name: &str, x: &Val, arr: &Val): Result[Val, DbErr] {
 }
 
 // A value's type OID by its kind (for messages).
-fn kindOid(v: &Val): int {
+pub fn kindOid(v: &Val): int {
     match v {
         Val.Int(_) { return lexdb_sql.OID_INT8 }
         Val.Bool(_) { return lexdb_sql.OID_BOOL }
@@ -1412,14 +1432,14 @@ fn srfCols(name: &str, ordin: bool, args: &[]OutCol): Result[[]OutCol, DbErr] {
     var out: []OutCol = []
     if name == "pg_available_extensions" {
         // lexdb has no extensions: no rows
-        append(mut &out, OutCol{name: "name", oid: lexdb_sql.OID_NAME})
-        append(mut &out, OutCol{name: "default_version", oid: lexdb_sql.OID_TEXT})
-        append(mut &out, OutCol{name: "comment", oid: lexdb_sql.OID_TEXT})
+        append(mut &out, OutCol{name: "name", oid: lexdb_sql.OID_NAME, spell: "", coll: "", scale: -1})
+        append(mut &out, OutCol{name: "default_version", oid: lexdb_sql.OID_TEXT, spell: "", coll: "", scale: -1})
+        append(mut &out, OutCol{name: "comment", oid: lexdb_sql.OID_TEXT, spell: "", coll: "", scale: -1})
         return Ok(out)
     }
     if name == "pg_partition_ancestors" {
-        append(mut &out, OutCol{name: "relid", oid: lexdb_sql.OID_REGCLASS})
-        if ordin { append(mut &out, OutCol{name: "ordinality", oid: lexdb_sql.OID_INT8}) }
+        append(mut &out, OutCol{name: "relid", oid: lexdb_sql.OID_REGCLASS, spell: "", coll: "", scale: -1})
+        if ordin { append(mut &out, OutCol{name: "ordinality", oid: lexdb_sql.OID_INT8, spell: "", coll: "", scale: -1}) }
         return Ok(out)
     }
     if strings.startsWith(name, "#values:") {
@@ -1433,19 +1453,19 @@ fn srfCols(name: &str, ordin: bool, args: &[]OutCol): Result[[]OutCol, DbErr] {
                 if oid != lexdb_sql.OID_TEXT { break }
                 r += k
             }
-            append(mut &out, OutCol{name: "column" + (c + 1).toStr(), oid: oid})
+            append(mut &out, OutCol{name: "column" + (c + 1).toStr(), oid: oid, spell: "", coll: "", scale: -1})
         }
         return Ok(out)
     }
     if strings.startsWith(name, "#") {
         // a catalog relation (9.80)
-        for c in lexdb_pgcat.relCols(&name[1..len(name)]) { append(mut &out, OutCol{name: c.name, oid: c.oid}) }
+        for c in lexdb_pgcat.relCols(&name[1..len(name)]) { append(mut &out, OutCol{name: c.name, oid: c.oid, spell: "", coll: "", scale: -1}) }
         return Ok(out)
     }
     if name == "regexp_matches" || name == "regexp_split_to_table" || name == "string_to_table" {
         // (9.92) their values made by the call, as in a select list
-        append(mut &out, OutCol{name: name, oid: if name == "regexp_matches" { lexdb_sql.arrayOid(lexdb_sql.OID_TEXT) } else { lexdb_sql.OID_TEXT }})
-        if ordin { append(mut &out, OutCol{name: "ordinality", oid: lexdb_sql.OID_INT8}) }
+        append(mut &out, OutCol{name: name, oid: if name == "regexp_matches" { lexdb_sql.arrayOid(lexdb_sql.OID_TEXT) } else { lexdb_sql.OID_TEXT }, spell: "", coll: "", scale: -1})
+        if ordin { append(mut &out, OutCol{name: "ordinality", oid: lexdb_sql.OID_INT8, spell: "", coll: "", scale: -1}) }
         return Ok(out)
     }
     if name == "generate_series" {
@@ -1460,7 +1480,7 @@ fn srfCols(name: &str, ordin: bool, args: &[]OutCol): Result[[]OutCol, DbErr] {
         }
         if tsOid != 0 {
             if len(args) != 3 { return Err(e("42883", "function generate_series(" + lexdb_sql.typeText(&oidType(tsOid)) + ", ...) needs an interval step")) }
-            append(mut &out, OutCol{name: "generate_series", oid: tsOid})
+            append(mut &out, OutCol{name: "generate_series", oid: tsOid, spell: "", coll: "", scale: -1})
             return Ok(out)
         }
         var oid = lexdb_sql.OID_INT4
@@ -1474,7 +1494,7 @@ fn srfCols(name: &str, ordin: bool, args: &[]OutCol): Result[[]OutCol, DbErr] {
                 return Err(e("42883", "function generate_series needs numbers"))
             }
         }
-        append(mut &out, OutCol{name: "generate_series", oid: oid})
+        append(mut &out, OutCol{name: "generate_series", oid: oid, spell: "", coll: "", scale: -1})
     } else {
         if len(args) == 0 { return Err(e("42883", "function unnest() does not exist")) }
         for k in 0..len(args) {
@@ -1482,10 +1502,10 @@ fn srfCols(name: &str, ordin: bool, args: &[]OutCol): Result[[]OutCol, DbErr] {
             if el == 0 {
                 return Err(e("42804", "function unnest: argument " + (k + 1).toStr() + " is not an array (cast it: $1::int[], '{1,2}'::text[])"))
             }
-            append(mut &out, OutCol{name: "unnest", oid: el})
+            append(mut &out, OutCol{name: "unnest", oid: el, spell: "", coll: "", scale: -1})
         }
     }
-    if ordin { append(mut &out, OutCol{name: "ordinality", oid: lexdb_sql.OID_INT8}) }
+    if ordin { append(mut &out, OutCol{name: "ordinality", oid: lexdb_sql.OID_INT8, spell: "", coll: "", scale: -1}) }
     return Ok(out)
 }
 
@@ -2022,6 +2042,17 @@ pub fn eval(x: &Expr, env: &Env): Result[Val, DbErr] {
             }
             let l = try eval(&a, env)
             let r = try eval(&b, env)
+            if op == "t+" {
+                // T-SQL's + (design/lexdb-tds.md S3): NULL with a NULL; two
+                // strings joined; a string with a number read as that number
+                if isNull(&l) || isNull(&r) { return Ok(Val.Null) }
+                let lt = kindOf(&l) == lexdb_sql.K_TEXT
+                let rt = kindOf(&r) == lexdb_sql.K_TEXT
+                if lt && rt { return Ok(Val.Text(text(&l) + text(&r))) }
+                if lt { return arith(&"+", &(try coerce(l, &oidType(kindOid(&r)))), &r) }
+                if rt { return arith(&"+", &l, &(try coerce(r, &oidType(kindOid(&l))))) }
+                return arith(&"+", &l, &r)
+            }
             if op == "||" {
                 // arrays, in an expression resolve has not seen (9.92)
                 if (looksArray(&l) || looksArray(&r)) {
@@ -2100,8 +2131,65 @@ pub fn eval(x: &Expr, env: &Env): Result[Val, DbErr] {
                 if name == "case else" { return eval(&args[len(args) - 1], env) }
                 return Ok(Val.Null)
             }
+            if name == "#try" && len(args) == 1 {
+                // T-SQL's TRY_CAST and TRY_CONVERT: NULL for a value that does not convert
+                match eval(&args[0], env) {
+                    Ok(v) { return Ok(v) }
+                    Err(_) { return Ok(Val.Null) }
+                }
+            }
             var vs: []Val = []
             for a in args { append(mut &vs, try eval(&a, env)) }
+            if name == "#tdiv" && len(vs) == 3 {
+                // T-SQL's decimal division at the scale its types give
+                if isNull(&vs[0]) || isNull(&vs[1]) { return Ok(Val.Null) }
+                let a = try coerce(vs[0], &oidType(lexdb_sql.OID_NUMERIC))
+                let b = try coerce(vs[1], &oidType(lexdb_sql.OID_NUMERIC))
+                match a {
+                    Val.Num(da) {
+                        match b {
+                            Val.Num(db) {
+                                if db.isZero() { return Err(e("22012", "division by zero")) }
+                                match da.div(db, intOf(&vs[2]).unwrapOr(6), Rounding.HALF_AWAY) {
+                                    Ok(q) { return Ok(Val.Num(q)) }
+                                    Err(_) { return Err(e("22003", "numeric field overflow")) }
+                                }
+                            }
+                            else {}
+                        }
+                    }
+                    else {}
+                }
+                return arith(&"/", &vs[0], &vs[1])
+            }
+            if name == "#tavg" && len(vs) == 2 {
+                // T-SQL's AVG: an integer's cut to an integer, a decimal's to its scale
+                let m = intOf(&vs[1]).unwrapOr(-2)
+                match vs[0] {
+                    Val.Num(d) {
+                        if m == -1 {
+                            match d.toInt(Rounding.TOWARD_ZERO) {
+                                Ok(n) { return Ok(Val.Int(n)) }
+                                Err(_) {}
+                            }
+                        }
+                        if m >= 0 {
+                            match d.quantize(m, Rounding.HALF_AWAY) {
+                                Ok(q) { return Ok(Val.Num(q)) }
+                                Err(_) {}
+                            }
+                        }
+                    }
+                    else {}
+                }
+                return Ok(vs[0])
+            }
+            if lexdb_tsqlfn.isTsqlFn(&name) {
+                match try lexdb_tsqlfn.call(&name, &vs, &envZone(env)) {
+                    Some(v) { return Ok(v) }
+                    None {}
+                }
+            }
             if isSeqFn(&name) { return seqCall(&name, &vs, env) }
             if isSessFn(&name) { return sessCall(&name, &vs, env) }
             if isAdvFn(&name) { return advCall(&name, &vs, env) }
@@ -2582,11 +2670,49 @@ fn encIdxPart(b: mut &StrBuf, v: &Val) {
     encKeyPart(b, v)
 }
 
+// A column, bare or under a collation's key (#ci(col), #pad(col)): its
+// name and the kind; name "" when x is neither.
+type KeyedCol = value record { name: str; kind: int }
+
+fn keyedCol(x: &Expr): KeyedCol {
+    match x {
+        Expr.Col(n) { return KeyedCol{name: n, kind: lexdb_sql.COLL_EXACT} }
+        Expr.Call(f, args, _) {
+            if (f == "#ci" || f == "#pad") && len(args) == 1 {
+                match args[0] {
+                    Expr.Col(n) { return KeyedCol{name: n, kind: if f == "#ci" { lexdb_sql.COLL_CI } else { lexdb_sql.COLL_PAD }} }
+                    else {}
+                }
+            }
+        }
+        else {}
+    }
+    return KeyedCol{name: "", kind: lexdb_sql.COLL_EXACT}
+}
+
 // The key of a row: its primary key's values, in byte order = SQL order.
 fn keyOf(t: &Table, row: &[]Val): str {
     var b = newStrBuf()
-    for i in t.pk { encKeyPart(mut &b, &row[i]) }
+    for i in t.pk { encKeyPart(mut &b, &collKeyVal(&t.cols[i], &row[i])) }
     return b.toStr()
+}
+
+// The collation kind of a column (L2): lexdb_sql.COLL_*, a text column's.
+fn colCollKind(c: &lexdb_sql.ColDef): int {
+    if c.typ.kind != lexdb_sql.K_TEXT || len(c.coll) == 0 { return lexdb_sql.COLL_EXACT }
+    return lexdb_sql.collKind(&c.coll)
+}
+
+// A column's value as its keys hold it (L2): under a case-insensitive
+// collation its ciKey, under SQL Server's others its trailing spaces
+// dropped; else itself. The row holds the value.
+fn collKeyVal(c: &lexdb_sql.ColDef, v: &Val): Val {
+    let k = colCollKind(c)
+    if k == lexdb_sql.COLL_EXACT { return v }
+    match v {
+        Val.Text(s) { return Val.Text(if k == lexdb_sql.COLL_CI { ciKey(&s) } else { padKey(&s) }) }
+        else { return v }
+    }
 }
 
 // The smallest string after every string that starts with s ("" when there
@@ -3120,8 +3246,10 @@ fn encTable(t: &Table): str {
     binary.addU32LE(mut &b, t.tree)
     binary.addU32LE(mut &b, len(t.cols))
     for c in t.cols {
-        binary.addU32LE(mut &b, len(c.name))
-        b.add(c.name)
+        // as written (L6): decTable folds it for the name
+        let cn = colShown(&c)
+        binary.addU32LE(mut &b, len(cn))
+        b.add(cn)
         binary.addU32LE(mut &b, c.typ.kind)
         binary.addU32LE(mut &b, c.typ.oid)
         binary.addU32LE(mut &b, c.typ.prec)
@@ -3173,7 +3301,8 @@ fn encTable(t: &Table): str {
     if defs || checks {
         for c in t.cols {
             let missing = !isNull(&c.missing)
-            b.addByte((if c.def.isSome() { 1 } else { 0 }) + (if missing { 2 } else { 0 }) + (if len(c.seq) > 0 { 4 } else { 0 }))
+            b.addByte((if c.def.isSome() { 1 } else { 0 }) + (if missing { 2 } else { 0 }) + (if len(c.seq) > 0 { 4 } else { 0 }) +
+                      (if len(c.coll) > 0 { 8 } else { 0 }))
             match c.def {
                 Some(x) {
                     let text = lexdb_sql.exprText(&x)
@@ -3191,6 +3320,7 @@ fn encTable(t: &Table): str {
                 b.addByte(byte(c.identity))
                 addStr(mut &b, &c.seq)
             }
+            if len(c.coll) > 0 { addStr(mut &b, &c.coll) }      // its collation (L2)
         }
     }
     // then the checks
@@ -3226,9 +3356,30 @@ fn encTable(t: &Table): str {
     binary.addU32LE(mut &b, n + (if add { 1 } else { 0 }))
     for l in t.layouts { addKinds(mut &b, &l) }
     if add { addKinds(mut &b, &cur) }
-    // then a temporary table's ON COMMIT, when it is DELETE ROWS or DROP (9.96)
-    if t.onCommit > lexdb_sql.ONC_PRESERVE { b.addByte(byte(t.onCommit)) }
+    // then a temporary table's ON COMMIT, when it is DELETE ROWS or DROP
+    // (9.96), or when a spelling follows
+    if t.onCommit > lexdb_sql.ONC_PRESERVE || len(t.spell) > 0 { b.addByte(byte(t.onCommit)) }
+    // then its name as written, if that is not its key's (L6)
+    if len(t.spell) > 0 { addStr(mut &b, &t.spell) }
     return b.toStr()
+}
+
+// A column's name as written (L6).
+pub fn colShown(c: &lexdb_sql.ColDef): str { return if len(c.spell) > 0 { c.spell } else { c.name } }
+
+// A name as stored (its spelling, L6) made a column: its name folded, its
+// spelling kept if that differs.
+fn spelledCol(stored: &str, ty: lexdb_sql.TypeName, notNull: bool): lexdb_sql.ColDef {
+    let f = strings.toLowerAscii(stored)
+    var c = lexdb_sql.colDef(f, ty, notNull)
+    if f != stored { c.spell = stored.toStr() }
+    return c
+}
+
+fn foldAll(xs: []str): []str {
+    var out: []str = []
+    for x in xs { append(mut &out, strings.toLowerAscii(&x)) }
+    return out
 }
 
 fn addKinds(b: mut &StrBuf, ks: &[]byte) {
@@ -3301,7 +3452,7 @@ fn decTable(name: str, s: &str): Result[Table, DbErr] {
                                     prec: binary.readU32LEStr(s, at + 8), scale: binary.readU32LEStr(s, at + 12),
                                     len: binary.readU32LEStr(s, at + 16)}
         at += 20
-        append(mut &t.cols, lexdb_sql.colDef(cn, ty, s[at] == 1))
+        append(mut &t.cols, spelledCol(&cn, ty, s[at] == 1))
         at += 1
     }
     let k = binary.readU32LEStr(s, at)
@@ -3388,6 +3539,10 @@ fn decTable(name: str, s: &str): Result[Table, DbErr] {
                 t.cols[i].seq = strAt(s, at + 1)
                 at += 5 + len(t.cols[i].seq)
             }
+            if flags & 8 != 0 {
+                t.cols[i].coll = strAt(s, at)
+                at += 4 + len(t.cols[i].coll)
+            }
         }
     }
     if at + 4 <= len(s) {
@@ -3418,7 +3573,7 @@ fn decTable(name: str, s: &str): Result[Table, DbErr] {
             let frefCols = strsAt(s, at)
             at += strsLen(&frefCols)
             let ub = int(s[at + 1])
-            append(mut &t.fks, ForeignKey{name: fname, cols: fcols, ref: fref, refCols: frefCols, onDelete: int(s[at]), onUpdate: ub & 15,
+            append(mut &t.fks, ForeignKey{name: fname, cols: foldAll(fcols), ref: fref, refCols: foldAll(frefCols), onDelete: int(s[at]), onUpdate: ub & 15,
                                           deferrable: ub & 16 != 0, deferred: ub & 32 != 0})
             at += 2
         }
@@ -3439,7 +3594,14 @@ fn decTable(name: str, s: &str): Result[Table, DbErr] {
             append(mut &t.layouts, ks)
         }
     }
-    if at < len(s) { t.onCommit = int(s[at]) }
+    if at < len(s) {
+        t.onCommit = int(s[at])
+        at += 1
+    }
+    if at + 4 <= len(s) {
+        t.spell = strAt(s, at)
+        at += 4 + len(t.spell)
+    }
     return Ok(t)
 }
 
@@ -4125,12 +4287,23 @@ fn createSchema(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[str, 
     return Ok("")
 }
 
+// ---- T-SQL's temporary tables (design/lexdb-tds.md S4): #name (and a
+// table variable, #@name) is a session's own, a temporary table (9.96) of
+// that name in its temporary schema.
+
+fn isTempName(n: &str): bool { return len(n) > 1 && n[0] == '#' && n[1] != '#' }
+
+fn tempSchema(sess: int): str { return tmpName(sess) }
+
+fn tempKey(sess: int, n: &str): str { return lexdb_sql.qual(&tempSchema(sess), n) }
+
 // The catalog key of a table (idx false) or an index named n: n if it is
 // qualified or the path is public's; else the first schema on the path
 // holding it, or none: the schema new names would go in (it is not there).
 // pg_temp is the session's temporary schema; another session's is refused
 // (9.96).
 fn catKey(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, n: &str, idx: bool): Result[str, DbErr] {
+    if isTempName(n) { return Ok(tempKey(txn.sess, n)) }
     let q = lexdb_sql.isQual(n)
     if q && n[0] == 'p' { return tmpQual(st, txn, n) }
     if len(txn.path) == 0 || q { return Ok(n) }
@@ -4236,7 +4409,7 @@ fn bumpFor(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, k: &str): Result[U
 // pg_temp): in its schema, or the first on the path; a temporary one's in
 // the session's temporary schema, made if need be. Errors as PostgreSQL's.
 fn createKey(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, n: &str, temp: bool): Result[str, DbErr] {
-    var tmp = temp
+    var tmp = temp || isTempName(n)       // T-SQL's #name (S4)
     if lexdb_sql.isQual(n) {
         let sn = lexdb_sql.schemaOf(n)
         if sn == "pg_temp" || sn == tmpName(txn.sess) {
@@ -4678,6 +4851,7 @@ pub type Level = record {
     perRow: bool
     hashCols: []int         // hash: its columns ...
     hashVals: []Expr        // ... equal to these values from earlier tables
+    hashKinds: []int        // ... per column, the collation its key is under (L2: #ci(col) = x)
     src: int                // a subquery in FROM (or a CTE): its number, its rows read from the run; -1 a table
     work: int               // a recursive CTE's working table: the CTE's number; -1
     lateral: bool           // a subquery in FROM using outer values (LATERAL): run per row
@@ -4984,7 +5158,37 @@ fn resolve(x: &Expr, cols: &[]lexdb_sql.ColDef, n: int, sc: mut &Scope): Result[
                 let rt = if isBp(&r, cols) { trimmed(r) } else { r }
                 return Ok(Expr.Bin(op, lt, rt))
             }
-            if isCmp(&op) { return Ok(bpCmp(&op, l, r, cols)) }
+            if op == "/" && len(sc.coll) > 0 {
+                // T-SQL's decimal division: its scale SQL Server's (design/lexdb-tds.md S3)
+                let pa = numPS(&l, cols, sc)
+                let pb = numPS(&r, cols, sc)
+                if pa.p > 0 && pb.p > 0 && (pa.s > 0 || pb.s > 0 || pa.dec || pb.dec) {
+                    let ip = pa.p - pa.s + pb.s
+                    var scale = max(6, pa.s + pb.p + 1)
+                    if ip + scale > 38 { scale = max(min(scale, 38 - ip), 6) }
+                    return Ok(Expr.Call("#tdiv", [l, r, Expr.Lit(Val.Int(scale))], false))
+                }
+            }
+            if isCmp(&op) {
+                var lx = l
+                var rx = r
+                if len(sc.coll) > 0 {
+                    // T-SQL has no booleans: a bit compared with a number (active = 1)
+                    let pt = ptypesOf(sc)
+                    let lo = exprOid(&lx, cols, &pt)
+                    let ro = exprOid(&rx, cols, &pt)
+                    let bit = lexdb_sql.TypeName{kind: lexdb_sql.K_BOOL, oid: lexdb_sql.OID_BOOL, prec: 0, scale: 0, len: 1}
+                    if lo == lexdb_sql.OID_BOOL && isIntOid(ro) {
+                        rx = Expr.Cast(replace(mut &rx, Expr.Lit(Val.Null)), bit)
+                    } else if ro == lexdb_sql.OID_BOOL && isIntOid(lo) {
+                        lx = Expr.Cast(replace(mut &lx, Expr.Lit(Val.Null)), bit)
+                    }
+                }
+                // under a collation's keys (L2), else as PostgreSQL compares a char
+                let k = try cmpKind(&op, &lx, &rx, cols, sc)
+                if k == lexdb_sql.COLL_EXACT { return Ok(bpCmp(&op, lx, rx, cols)) }
+                return Ok(Expr.Bin(op, collKeyOf(k, lx), collKeyOf(k, rx)))
+            }
             return Ok(Expr.Bin(op, l, r))
         }
         Expr.IsNull(a, neg) { return Ok(Expr.IsNull(try resolve(&a, cols, n, sc), neg)) }
@@ -5000,7 +5204,18 @@ fn resolve(x: &Expr, cols: &[]lexdb_sql.ColDef, n: int, sc: mut &Scope): Result[
                 // a subquery: its number, type and name, (IN: the value), then the outer values it needs
                 let i = litInt(&args[0])
                 var xs: []Expr = []
-                if nm == "#in" { append(mut &xs, try resolve(&args[1], cols, n, sc)) }
+                if nm == "#in" {
+                    // x IN (subquery) under its collation (L2): x's and the
+                    // subquery's column's; the set is keyed so (endScope)
+                    let v = try resolve(&args[1], cols, n, sc)
+                    let top = len(sc.frames) - 1
+                    let sn = sc.frames[top].subColls[i]
+                    let c2 = if len(sn) > 0 { Coll{name: sn, level: COLL_IMPLICIT} } else { Coll{name: sc.coll, level: COLL_DEFAULT} }
+                    let c = try cmpColl(exprColl(&v, cols, sc), c2, &"=")
+                    let k = if c.level == COLL_NONE || !(isTextExpr(&v, cols, sc) || isTextOid(sc.frames[top].subOids[i])) { lexdb_sql.COLL_EXACT } else { lexdb_sql.collKind(&c.name) }
+                    sc.frames[top].subKinds[i] = k
+                    append(mut &xs, collKeyOf(k, v))
+                }
                 let f = &sc.frames[len(sc.frames) - 1]
                 append(mut &out, Expr.Lit(Val.Int(i)))
                 append(mut &out, Expr.Lit(Val.Int(f.subOids[i])))
@@ -5019,6 +5234,46 @@ fn resolve(x: &Expr, cols: &[]lexdb_sql.ColDef, n: int, sc: mut &Scope): Result[
                 var os: []str = []
                 for ox in out { append(mut &os, exprOid(&ox, cols, &[]).toStr()) }
                 append(mut &out, Expr.Lit(Val.Text(HINT + strings.join(&os, ","))))
+            }
+            if nm == "in" || nm == "like" || nm == "ilike" || nm == "#tlike" || nm == "distinct from" || nm == "charindex" || nm == "patindex" {
+                out = try collateCall(&nm, out, cols, sc)
+            }
+            if nm == "coalesce" && len(out) > 1 {
+                // its arguments of no type of their own ('1900-01-01' after a
+                // timestamp) take the result's, as PostgreSQL's and SQL Server's
+                let pt = ptypesOf(sc)
+                let o = exprOid(&Expr.Call(nm.toStr(), cloneAll(&out), star), cols, &pt)
+                if o != 0 && o != 705 && !isTextOid(o) {
+                    var cast: []Expr = []
+                    for ca in out {
+                        let xo = exprOid(&ca, cols, &pt)
+                        let lit = match ca { Expr.Lit(v) { kindOf(&v) == lexdb_sql.K_TEXT } else { false } }
+                        append(mut &cast, if lit || xo == 705 { Expr.Cast(clone(&ca), oidType(o)) } else { clone(&ca) })
+                    }
+                    out = cast
+                }
+            }
+            if nm == "avg" && !star && len(out) == 1 && len(sc.coll) > 0 {
+                // T-SQL's AVG: of integers an integer, of decimal(p, s) scale max(s, 6)
+                let ps = numPS(&out[0], cols, sc)
+                let pt = ptypesOf(sc)
+                let o = exprOid(&out[0], cols, &pt)
+                let mode = if isIntOid(o) { -1 } else if ps.p > 0 && ps.dec { max(ps.s, 6) } else { -2 }
+                if mode != -2 { return Ok(Expr.Call("#tavg", [Expr.Call(nm, out, star), Expr.Lit(Val.Int(mode))], false)) }
+            }
+            if nm == "replace" && len(out) == 3 {
+                // REPLACE under a case-insensitive collation matches as it folds
+                let c = try cmpColl(exprColl(&out[0], cols, sc), exprColl(&out[1], cols, sc), &"replace")
+                if c.level != COLL_NONE && lexdb_sql.collKind(&c.name) == lexdb_sql.COLL_CI { return Ok(Expr.Call("#replaceci", out, star)) }
+            }
+            if nm == "nullif" && len(out) == 2 && !star {
+                // NULLIF(a, b) under a collation's keys (L2): CASE WHEN a = b THEN NULL ELSE a END
+                let k = try cmpKind(&"=", &out[0], &out[1], cols, sc)
+                if k != lexdb_sql.COLL_EXACT {
+                    let a0 = clone(&out[0])
+                    let eq = Expr.Bin("=", collKeyOf(k, clone(&out[0])), collKeyOf(k, clone(&out[1])))
+                    return Ok(Expr.Call("case else", [eq, Expr.Lit(Val.Null), a0], false))
+                }
             }
             if nm == "pg_typeof" && len(out) == 1 && !star {
                 // its argument's type, known now: a text (PostgreSQL's regtype, shown by name)
@@ -6509,7 +6764,7 @@ fn (q: &Query) orderedLevel(items: &[]lexdb_sql.OrderItem, out: mut &[]int): int
 // A table of nothing (a level's place while levels are moved).
 fn noTable(): Table {
     return Table{name: "", tree: -1, cols: [], pk: [], indexes: [], slots: [], width: 0, checks: [], fks: [], refBy: [], layouts: [], lays: [],
-                 view: "", deps: [], onCommit: 0}
+                 view: "", deps: [], onCommit: 0, spell: ""}
 }
 
 // Whether a table is pinned to one row by its key's equalities with
@@ -6675,9 +6930,13 @@ fn choosePath(q: &Query, k: int, cs: &[]Expr, params: &[]Val, lk: mut &[]Look): 
         var fdiff = false
         for pos in 0..len(cols) {
             let ci = cols[pos]
-            if ci < 0 {
-                // an expression's (9.89): the conditions on the same expression
-                let target = qualified(&lv.t.indexes[c].exprs[pos], &lv.alias)
+            let ck = if ci >= 0 { colCollKind(&lv.t.cols[ci]) } else { lexdb_sql.COLL_EXACT }
+            if ci < 0 || ck != lexdb_sql.COLL_EXACT {
+                // an expression's (9.89): the conditions on the same
+                // expression; a column under a collation's keys (L2): the
+                // conditions on its key, #ci(col) or #pad(col)
+                let target = if ci < 0 { qualified(&lv.t.indexes[c].exprs[pos], &lv.alias) }
+                             else { collKeyOf(ck, Expr.Col(lv.alias + "." + lv.t.cols[ci].name)) }
                 var xb = q.onceBounds(exprBounds(cs, &target, k, q), lv.readOnce)
                 var xeq = -1
                 for i in 0..len(xb) { if xb[i].op == "=" && xeq < 0 { xeq = i } }
@@ -7094,7 +7353,7 @@ fn allTrue(cs: &[]Expr, cols: &[]lexdb_sql.ColDef, row: &[]Val, params: &[]Val):
 
 fn newLevel(t: Table, alias: str, join: int, first: int): Level {
     return Level{t: t, alias: alias, join: join, first: first, path: Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: []}, cond: [],
-                 post: [], local: [], perRow: true, hashCols: [], hashVals: [], src: -1, work: -1, lateral: false, need: [],
+                 post: [], local: [], perRow: true, hashCols: [], hashVals: [], hashKinds: [], src: -1, work: -1, lateral: false, need: [],
                  lock: 0, lockWait: 0, keeps: false, est: noEst(), stops: false, estRows: -1, estMax: false, readOnce: false}
 }
 
@@ -7118,7 +7377,7 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
     for i in 0..len(subs) { append(mut &planned, []) }
     // its scope comes first, its columns added as its tables are read: a
     // LATERAL subquery sees the tables before it, another none of them
-    append(mut &sc.frames, Frame{cols: [], refs: [], refOids: [], subRefs: [], subOids: [], subNames: [], hidden: false})
+    append(mut &sc.frames, Frame{cols: [], refs: [], refOids: [], subRefs: [], subOids: [], subNames: [], subColls: [], subKinds: [], hidden: false})
     let me = len(sc.frames) - 1
     var views: []SubPlan = []              // the views read, planned (9.82)
     var usingOn: []Option[Expr] = []       // per FROM item, the ON its USING or NATURAL makes (9.93)
@@ -7131,7 +7390,7 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
         }
         var viewSrc = -1
         var t = Table{name: f.alias, tree: -1, cols: [], pk: [], indexes: [], slots: [], width: 0, checks: [], fks: [], refBy: [], layouts: [], lays: [],
-                      view: "", deps: [], onCommit: 0}
+                      view: "", deps: [], onCommit: 0, spell: ""}
         var lateral = false
         if f.sub >= 0 {
             sc.frames[me].hidden = !f.lateral
@@ -7149,7 +7408,10 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
             }
             for i in 0..len(sp.sel.outs) {
                 let name = if i < len(f.cols) { f.cols[i] } else { sp.sel.outs[i].name }
-                append(mut &t.cols, lexdb_sql.colDef(name, oidType(sp.sel.outs[i].oid), false))
+                var col = lexdb_sql.colDef(name, oidType(sp.sel.outs[i].oid), false)
+                if i >= len(f.cols) { col.spell = sp.sel.outs[i].spell }
+                col.coll = sp.sel.outs[i].coll
+                append(mut &t.cols, col)
             }
             append(mut &planned[f.sub], sp)
         } else if f.work >= 0 {
@@ -7164,7 +7426,10 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
             }
             for i in 0..len(sc.works[w].cols) {
                 let name = if i < len(f.cols) { f.cols[i] } else { sc.works[w].cols[i].name }
-                append(mut &t.cols, lexdb_sql.colDef(name, sc.works[w].cols[i].typ, false))
+                var col = lexdb_sql.colDef(name, sc.works[w].cols[i].typ, false)
+                if i >= len(f.cols) { col.spell = sc.works[w].cols[i].spell }
+                col.coll = sc.works[w].cols[i].coll
+                append(mut &t.cols, col)
             }
         } else {
             let found = try findTable(st, txn, &f.table)
@@ -7189,10 +7454,13 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
                                  len(f.cols).toStr() + " columns specified"))
                 }
                 var vt = Table{name: f.alias, tree: -1, cols: [], pk: [], indexes: [], slots: [], width: 0, checks: [], fks: [], refBy: [], layouts: [], lays: [],
-                               view: "", deps: [], onCommit: 0}
+                               view: "", deps: [], onCommit: 0, spell: ""}
                 for i in 0..len(sp.sel.outs) {
                     let name = if i < len(f.cols) { f.cols[i] } else if i < len(t.cols) { t.cols[i].name } else { sp.sel.outs[i].name }
-                    append(mut &vt.cols, lexdb_sql.colDef(name, oidType(sp.sel.outs[i].oid), false))
+                    var col = lexdb_sql.colDef(name, oidType(sp.sel.outs[i].oid), false)
+                    col.spell = if i < len(f.cols) { "" } else if i < len(t.cols) { t.cols[i].spell } else { sp.sel.outs[i].spell }
+                    col.coll = sp.sel.outs[i].coll
+                    append(mut &vt.cols, col)
                 }
                 viewSrc = len(subs) + len(views)
                 append(mut &views, sp)
@@ -7203,7 +7471,10 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
                     return Err(e("42P10", "table \"" + f.alias + "\" has " + len(t.cols).toStr() + " columns available but " +
                                  len(f.cols).toStr() + " columns specified"))
                 }
-                for i in 0..len(f.cols) { t.cols[i].name = f.cols[i] }
+                for i in 0..len(f.cols) {
+                    t.cols[i].name = f.cols[i]
+                    t.cols[i].spell = ""
+                }
             }
         }
         let first = len(q.cols)
@@ -7212,7 +7483,10 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
             // unnest(a, b)): each its own column, the name ambiguous
             var name = t.cols[k].name
             for j in 0..k { if t.cols[j].name == name { name = name + DUPSEP + k.toStr() } }
-            append(mut &q.cols, lexdb_sql.colDef(f.alias + "." + name, t.cols[k].typ, t.cols[k].notNull))
+            var qc = lexdb_sql.colDef(f.alias + "." + name, t.cols[k].typ, t.cols[k].notNull)
+            qc.spell = t.cols[k].spell
+            qc.coll = t.cols[k].coll
+            append(mut &q.cols, qc)
         }
         var lv = newLevel(t, f.alias, f.join, first)
         lv.src = if viewSrc >= 0 { viewSrc } else { f.sub }
@@ -7224,7 +7498,10 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
         if len(subs) > 0 {
             // only its subqueries look here
             for i in first..len(q.cols) {
-                append(mut &sc.frames[me].cols, lexdb_sql.colDef(q.cols[i].name, q.cols[i].typ, q.cols[i].notNull))
+                var fc = lexdb_sql.colDef(q.cols[i].name, q.cols[i].typ, q.cols[i].notNull)
+                fc.spell = q.cols[i].spell
+                fc.coll = q.cols[i].coll
+                append(mut &sc.frames[me].cols, fc)
             }
         }
         // JOIN ... USING and NATURAL JOIN (9.93): an ON made of the names'
@@ -7301,6 +7578,8 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
         append(mut &sc.frames[top].subRefs, cloneAll(&sp.sel.q.refs))
         append(mut &sc.frames[top].subOids, sp.oid)
         append(mut &sc.frames[top].subNames, sp.name)
+        append(mut &sc.frames[top].subColls, if len(sp.sel.outs) > 0 && isTextOid(sp.sel.outs[0].oid) { sp.sel.outs[0].coll } else { "" })
+        append(mut &sc.frames[top].subKinds, lexdb_sql.COLL_EXACT)
         if len(sp.sel.q.refs) > 0 { q.corr = true }
         append(mut &q.subs, sp)
     }
@@ -7313,6 +7592,8 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
         append(mut &sc.frames[top].subRefs, [])
         append(mut &sc.frames[top].subOids, vp.oid)
         append(mut &sc.frames[top].subNames, vp.name)
+        append(mut &sc.frames[top].subColls, "")
+        append(mut &sc.frames[top].subKinds, lexdb_sql.COLL_EXACT)
         append(mut &q.subs, vp)
     }
     let nl = len(q.levels)
@@ -7466,6 +7747,7 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
         var local: []Expr = []
         var hcols: []int = []
         var hvals: []Expr = []
+        var hkinds: []int = []
         if !perRow {
             for c in m {
                 if q.minLevel(&c) >= k {
@@ -7475,27 +7757,17 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
                 match c {
                     Expr.Bin(op, a, b) {
                         if op == "=" {
-                            var got = false
-                            match a {
-                                Expr.Col(n) {
-                                    if q.levelOf(&n) == k && q.valBefore(&b, k) {
-                                        append(mut &hcols, colIndex(&q.cols, &n) - q.levels[k].first)
-                                        append(mut &hvals, clone(&b))
-                                        got = true
-                                    }
-                                }
-                                else {}
-                            }
-                            if !got {
-                                match b {
-                                    Expr.Col(n) {
-                                        if q.levelOf(&n) == k && q.valBefore(&a, k) {
-                                            append(mut &hcols, colIndex(&q.cols, &n) - q.levels[k].first)
-                                            append(mut &hvals, clone(&a))
-                                        }
-                                    }
-                                    else {}
-                                }
+                            // col = x, or a collation's #ci(col) = #ci(x) (L2): hashed on the key
+                            let ka = keyedCol(&a)
+                            let kb = keyedCol(&b)
+                            if len(ka.name) > 0 && q.levelOf(&ka.name) == k && q.valBefore(&b, k) {
+                                append(mut &hcols, colIndex(&q.cols, &ka.name) - q.levels[k].first)
+                                append(mut &hvals, clone(&b))
+                                append(mut &hkinds, ka.kind)
+                            } else if len(kb.name) > 0 && q.levelOf(&kb.name) == k && q.valBefore(&a, k) {
+                                append(mut &hcols, colIndex(&q.cols, &kb.name) - q.levels[k].first)
+                                append(mut &hvals, clone(&a))
+                                append(mut &hkinds, kb.kind)
                             }
                         }
                     }
@@ -7513,6 +7785,7 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
         q.levels[k].local = local
         q.levels[k].hashCols = hcols
         q.levels[k].hashVals = hvals
+        q.levels[k].hashKinds = hkinds
     }
     return Ok(q)
 }
@@ -7550,9 +7823,11 @@ fn materialize(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: 
                 if !(try allTrueX(st, txn, q, m, &lv.local, &full, params, rs)) { continue }
                 var kb = newStrBuf()
                 var nul = false
-                for c in lv.hashCols {
+                for j in 0..len(lv.hashCols) {
+                    let c = lv.hashCols[j]
                     if isNull(&r[c]) { nul = true }
-                    if lv.virt() { keyPart(mut &kb, &r[c]) } else { encIdxPart(mut &kb, &r[c]) }
+                    let hv = if j < len(lv.hashKinds) { collVal(lv.hashKinds[j], &r[c]) } else { r[c] }
+                    if lv.virt() { keyPart(mut &kb, &hv) } else { encIdxPart(mut &kb, &hv) }
                 }
                 if nul {
                     // NULL equals nothing; a RIGHT or FULL JOIN still keeps the row
@@ -7917,6 +8192,7 @@ type SubPlan = record {
     keyOuter: []Expr            // per key column: what it equals, of outer values only (refs as parameters)
     keyText: []str              // EXPLAIN: "inner = outer"
     cte: int                    // a CTE's use: the CTE's number (its rows shared); -1
+    kind: int                   // IN: the collation kind its values are compared under (L2)
 }
 
 // A subquery's result: a scalar's value, how many rows, IN's values.
@@ -7943,6 +8219,8 @@ type Frame = record {
     subRefs: [][]Expr           // per subquery of it: the subquery's refs, in its terms
     subOids: []int
     subNames: []str
+    subColls: []str             // per subquery of it: its column's collation (L2)
+    subKinds: []int             // ... IN's: the kind its values are compared under, as resolve finds it
     hidden: bool                // its columns are not in scope (a FROM subquery that is not LATERAL)
 }
 
@@ -7968,6 +8246,7 @@ pub type Scope = record {
     // and stop early (optimizer 32). Set by planSelect, taken by buildQuery.
     ordBy: []lexdb_sql.OrderItem
     ordLim: int
+    coll: str                   // the session's default collation (L2): a literal's, a parameter's; "" exact
 }
 
 type Work = record { id: int; cols: []lexdb_sql.ColDef }
@@ -7990,7 +8269,271 @@ fn scCheck(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: mut &Scope, ke
 fn newScope(params: &[]Val, ptypes: &[]int): Scope {
     var pt: []int = []
     for i in 0..len(params) { append(mut &pt, if i < len(ptypes) { ptypes[i] } else { 0 }) }
-    return Scope{frames: [], base: len(params), ptypes: pt, works: [], asRole: [], whos: [], target: "", looks: [], early: false, ordBy: [], ordLim: -1}
+    return Scope{frames: [], base: len(params), ptypes: pt, works: [], asRole: [], whos: [], target: "", looks: [], early: false, ordBy: [], ordLim: -1, coll: ""}
+}
+
+// newScope for a statement of txn's session: its default collation (L2).
+fn newScopeIn(st: &lexdb_store.Store, txn: &lexdb_store.Txn, params: &[]Val, ptypes: &[]int): Scope {
+    var sc = newScope(params, ptypes)
+    sc.coll = sessColl(st, txn.sess)
+    return sc
+}
+
+fn collKey(sess: int): str { return "\x00coll\x00" + sess.toStr() }
+
+// A session's default collation (L2): "" exact, PostgreSQL's; a TDS
+// session's SQL Server's (lexdb_tds sets it).
+fn sessColl(st: &lexdb_store.Store, sess: int): str { return st.memoGet(&collKey(sess)).unwrapOr("") }
+
+fn identKey(sess: int): str { return "\x00idins\x00" + sess.toStr() }
+
+// The table SET IDENTITY_INSERT is ON for in a session (its name, folded),
+// "" none.
+fn identityInsertOf(st: &lexdb_store.Store, sess: int): str { return st.memoGet(&identKey(sess)).unwrapOr("") }
+
+pub fn (s: &Session) setIdentityInsert(table: &str) {
+    if len(table) == 0 { s.st.memoDel(&identKey(s.id)) } else { s.st.memoPut(&identKey(s.id), table) }
+}
+
+// The session's last identity (or sequence) value: @@IDENTITY.
+pub fn (s: &Session) lastIdentity(): Option[int] {
+    match s.st.memoGet(&lastKey(s.id)) {
+        Some(v) { return Some(num(&v)) }
+        None { return None }
+    }
+}
+
+pub fn (s: &Session) setCollation(name: &str) {
+    if len(name) == 0 { s.st.memoDel(&collKey(s.id)) } else { s.st.memoPut(&collKey(s.id), name) }
+}
+
+// A numeric expression's precision and scale as SQL Server types it (an
+// integer literal its digits, an int column 10, decimal(p, s) its p and s);
+// p 0: not known. dec: a decimal.
+type PS = value record { p: int; s: int; dec: bool }
+
+fn digitsOf(n: int): int {
+    var d = 1
+    var x = if n < 0 { 0 - n } else { n }
+    while x >= 10 {
+        x = x / 10
+        d += 1
+    }
+    return d
+}
+
+fn numPS(x: &Expr, cols: &[]lexdb_sql.ColDef, sc: &Scope): PS {
+    let none = PS{p: 0, s: 0, dec: false}
+    match x {
+        Expr.Lit(v) {
+            match v {
+                Val.Int(n) { return PS{p: digitsOf(n), s: 0, dec: false} }
+                Val.Num(d) {
+                    let sc0 = max(d.scale(), 0)
+                    let c = d.coefficient()
+                    var digits = 1
+                    var m = if c < 0 { 0 - c } else { c }
+                    while m >= 10 {
+                        m = m / 10
+                        digits += 1
+                    }
+                    return PS{p: max(digits, sc0), s: sc0, dec: true}
+                }
+                else { return none }
+            }
+        }
+        Expr.Col(n) {
+            for c in cols { if c.name == n { return typPS(&c.typ) } }
+            return none
+        }
+        Expr.Cast(_, t) { return typPS(&t) }
+        Expr.Unary(op, a) { return if op == "-" { numPS(&a, cols, sc) } else { none } }
+        Expr.Param(k) {
+            let pt = ptypesOf(sc)
+            let o = if k >= 1 && k <= len(pt) { pt[k - 1] } else { 0 }
+            return typPS(&oidType(o))
+        }
+        else { return none }
+    }
+}
+
+fn typPS(t: &lexdb_sql.TypeName): PS {
+    if t.oid == lexdb_sql.OID_INT4 { return PS{p: 10, s: 0, dec: false} }
+    if t.oid == lexdb_sql.OID_INT8 { return PS{p: 19, s: 0, dec: false} }
+    if t.oid == lexdb_sql.OID_INT2 { return PS{p: 5, s: 0, dec: false} }
+    if t.kind == lexdb_sql.K_NUM && t.prec > 0 { return PS{p: t.prec, s: t.scale, dec: true} }
+    return PS{p: 0, s: 0, dec: false}
+}
+
+// A time type's fractional seconds where it says them (prec 1), else -1.
+fn typScale(t: &lexdb_sql.TypeName): int { return if isTimeKind(t.kind) && t.prec == 1 { t.scale } else { -1 } }
+
+// An expression's, where a cast or a column says them.
+fn exprScale(x: &Expr, cols: &[]lexdb_sql.ColDef): int {
+    match x {
+        Expr.Cast(_, t) { return typScale(&t) }
+        Expr.Col(n) {
+            for c in cols { if c.name == n { return typScale(&c.typ) } }
+            return -1
+        }
+        else { return -1 }
+    }
+}
+
+// An expression's collation (L2): its name ("" exact) and its strength,
+// SQL Server's precedence: COLLATE (explicit) over a column's (implicit)
+// over a literal's, a variable's or a parameter's (the session's default);
+// COLL_NONE: not text.
+type Coll = value record { name: str; level: int }
+
+const COLL_NONE = 0
+const COLL_DEFAULT = 1
+const COLL_IMPLICIT = 2
+const COLL_EXPLICIT = 3
+
+fn isIntOid(o: int): bool { return o == lexdb_sql.OID_INT2 || o == lexdb_sql.OID_INT4 || o == lexdb_sql.OID_INT8 }
+
+fn isTextOid(o: int): bool {
+    return o == lexdb_sql.OID_TEXT || o == lexdb_sql.OID_VARCHAR || o == lexdb_sql.OID_NAME || o == lexdb_sql.OID_CHAR || o == 705
+}
+
+fn noColl(): Coll { return Coll{name: "", level: COLL_NONE} }
+
+fn exprColl(x: &Expr, cols: &[]lexdb_sql.ColDef, sc: &Scope): Coll {
+    match x {
+        Expr.Col(n) {
+            for c in cols {
+                if c.name == n { return if c.typ.kind == lexdb_sql.K_TEXT { Coll{name: c.coll, level: COLL_IMPLICIT} } else { noColl() } }
+            }
+            return noColl()
+        }
+        Expr.Lit(v) {
+            match v {
+                Val.Text(_) { return Coll{name: sc.coll, level: COLL_DEFAULT} }
+                else { return noColl() }
+            }
+        }
+        Expr.Param(k) {
+            let pt = ptypesOf(sc)
+            let o = if k >= 1 && k <= len(pt) { pt[k - 1] } else { 0 }
+            return if isTextOid(o) || o == 0 { Coll{name: sc.coll, level: COLL_DEFAULT} } else { noColl() }
+        }
+        Expr.Cast(a, t) {
+            if t.kind != lexdb_sql.K_TEXT { return noColl() }
+            let c = exprColl(&a, cols, sc)
+            return if c.level >= COLL_IMPLICIT { c } else { Coll{name: sc.coll, level: COLL_DEFAULT} }
+        }
+        Expr.Bin(op, a, b) {
+            if op != "||" && op != "+" { return noColl() }
+            return strongerColl(exprColl(&a, cols, sc), exprColl(&b, cols, sc))
+        }
+        Expr.Call(n, args, _) {
+            if (n == "#collate" || n == "#coll") && len(args) == 2 {
+                match args[1] {
+                    Expr.Lit(v) { return Coll{name: text(&v), level: if n == "#coll" { COLL_IMPLICIT } else { COLL_EXPLICIT }} }
+                    else {}
+                }
+            }
+            let pt = ptypesOf(sc)
+            if !isTextOid(exprOid(x, cols, &pt)) { return noColl() }
+            var c = Coll{name: sc.coll, level: COLL_DEFAULT}
+            for a in args { c = strongerColl(c, exprColl(&a, cols, sc)) }
+            return c
+        }
+        else { return noColl() }
+    }
+}
+
+fn strongerColl(a: Coll, b: Coll): Coll { return if b.level > a.level { b } else { a } }
+
+fn collOpName(op: &str): str {
+    return match op {
+        "=" { "equal to" }
+        "<>" { "not equal to" }
+        "<" { "less than" }
+        "<=" { "less than or equal to" }
+        ">" { "greater than" }
+        ">=" { "greater than or equal to" }
+        else { op.toStr() }
+    }
+}
+
+// The collation a comparison of a and b is made under: the stronger; two
+// of one strength that compare differently are a conflict (SQL Server's
+// 468).
+fn cmpColl(a: Coll, b: Coll, op: &str): Result[Coll, DbErr] {
+    if a.level == b.level && a.level >= COLL_IMPLICIT && lexdb_sql.collKind(&a.name) != lexdb_sql.collKind(&b.name) {
+        // (SQL Server names the right one first)
+        return Err(e("42P21", "Cannot resolve the collation conflict between \"" + collShown(&b.name) + "\" and \"" +
+                     collShown(&a.name) + "\" in the " + collOpName(op) + " operation."))
+    }
+    return Ok(strongerColl(a, b))
+}
+
+fn collShown(n: &str): str { return if len(n) > 0 { n.toStr() } else { "default" } }
+
+// x's key under a collation of kind k (lexdb_sql.COLL_*): #ci(x) folded,
+// #pad(x) its trailing spaces dropped; x itself under an exact one.
+fn collKeyOf(k: int, x: Expr): Expr {
+    if k == lexdb_sql.COLL_CI { return Expr.Call("#ci", [x], false) }
+    if k == lexdb_sql.COLL_PAD { return Expr.Call("#pad", [x], false) }
+    return x
+}
+
+// Whether an expression is text or of a type not known (a parameter, NULL).
+fn textOrUnknown(x: &Expr, cols: &[]lexdb_sql.ColDef, sc: &Scope): bool {
+    let pt = ptypesOf(sc)
+    let o = exprOid(x, cols, &pt)
+    return o == 0 || isTextOid(o)
+}
+
+// Whether an expression is text (its type known as one).
+fn isTextExpr(x: &Expr, cols: &[]lexdb_sql.ColDef, sc: &Scope): bool {
+    let pt = ptypesOf(sc)
+    return isTextOid(exprOid(x, cols, &pt))
+}
+
+// The collation a comparison of l and r is made under (L2), as the kind of
+// its keys (lexdb_sql.COLL_*): COLL_EXACT when they are compared as they
+// are.
+fn cmpKind(op: &str, l: &Expr, r: &Expr, cols: &[]lexdb_sql.ColDef, sc: &Scope): Result[int, DbErr] {
+    let c = try cmpColl(exprColl(l, cols, sc), exprColl(r, cols, sc), op)
+    let k = lexdb_sql.collKind(&c.name)
+    if c.level == COLL_NONE || k == lexdb_sql.COLL_EXACT { return Ok(lexdb_sql.COLL_EXACT) }
+    // keys when both sides are text (or one is, the other's type unknown):
+    // a date compared with '2024-01-01' compares dates
+    if !(isTextExpr(l, cols, sc) || isTextExpr(r, cols, sc)) || !textOrUnknown(l, cols, sc) || !textOrUnknown(r, cols, sc) {
+        return Ok(lexdb_sql.COLL_EXACT)
+    }
+    return Ok(k)
+}
+
+// x [NOT] IN (a, b, ...), x LIKE p, x IS DISTINCT FROM y, resolved, under
+// their collation (L2): IN and IS DISTINCT FROM compare keys; LIKE folds
+// case (its spaces kept).
+fn collateCall(nm: &str, args: []Expr, cols: &[]lexdb_sql.ColDef, sc: &Scope): Result[[]Expr, DbErr] {
+    let foldOnly = nm == "like" || nm == "ilike" || nm == "#tlike" || nm == "charindex" || nm == "patindex"
+    let n = if foldOnly { 2 } else { len(args) }
+    if n < 2 { return Ok(args) }
+    var c = exprColl(&args[0], cols, sc)
+    var text = isTextExpr(&args[0], cols, sc)
+    var mixed = !textOrUnknown(&args[0], cols, sc)
+    for i in 1..n {
+        c = try cmpColl(c, exprColl(&args[i], cols, sc), &(if nm == "in" { "=" } else { nm }))
+        if isTextExpr(&args[i], cols, sc) { text = true }
+        if !textOrUnknown(&args[i], cols, sc) { mixed = true }
+    }
+    if mixed { return Ok(args) }
+    let k = lexdb_sql.collKind(&c.name)
+    if c.level == COLL_NONE || k == lexdb_sql.COLL_EXACT || !text { return Ok(args) }
+    let like = foldOnly
+    if like && k != lexdb_sql.COLL_CI { return Ok(args) }        // LIKE keeps spaces
+    var out: []Expr = []
+    for i in 0..len(args) {
+        let a = clone(&args[i])
+        if i < n { append(mut &out, if like { Expr.Call("#cifold", [a], false) } else { collKeyOf(k, a) }) } else { append(mut &out, a) }
+    }
+    return Ok(out)
 }
 
 // The parameter types of the query being planned: the statement's, then
@@ -8008,6 +8551,7 @@ fn outerRef(sc: mut &Scope, name: &str): Result[Option[Expr], DbErr] {
     var f = top - 1
     var found = ""
     var oid = 0
+    var coll = ""
     while f >= 0 && found == "" {
         if sc.frames[f].hidden {
             f -= 1
@@ -8015,7 +8559,9 @@ fn outerRef(sc: mut &Scope, name: &str): Result[Option[Expr], DbErr] {
         }
         match resolveName(&sc.frames[f].cols, len(sc.frames[f].cols), name) {
             Ok(n) {
-                oid = sc.frames[f].cols[colIndex(&sc.frames[f].cols, &n)].typ.oid
+                let fc = &sc.frames[f].cols[colIndex(&sc.frames[f].cols, &n)]
+                oid = fc.typ.oid
+                if fc.typ.kind == lexdb_sql.K_TEXT { coll = fc.coll }
                 found = n
             }
             Err(x) {
@@ -8038,6 +8584,8 @@ fn outerRef(sc: mut &Scope, name: &str): Result[Option[Expr], DbErr] {
         }
         x = Expr.Param(sc.base + at + 1)
     }
+    // a collated column keeps its collation (L2): #coll(x, name), implicit
+    if len(coll) > 0 { x = Expr.Call("#coll", [x, Expr.Lit(Val.Text(coll))], false) }
     return Ok(Some(x))
 }
 
@@ -8046,6 +8594,7 @@ fn outerRef(sc: mut &Scope, name: &str): Result[Option[Expr], DbErr] {
 fn endScope(sc: mut &Scope, q: mut &Query) {
     var f = pop(mut &sc.frames)
     q.refs = replace(mut &f.refs, [])
+    for i in 0..len(f.subKinds) { if i < len(q.subs) { q.subs[i].kind = f.subKinds[i] } }
 }
 
 fn planSub(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val,
@@ -8064,7 +8613,7 @@ fn planSub(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
     let oid = if s.use == lexdb_sql.SUB_EXISTS || len(sel.outs) == 0 { lexdb_sql.OID_BOOL } else { sel.outs[0].oid }
     let name = if s.use == lexdb_sql.SUB_EXISTS { "exists" } else if s.use == lexdb_sql.SUB_SCALAR { sel.outs[0].name } else { "?column?" }
     // (in FROM: its columns are its outs)
-    var sp = SubPlan{use: s.use, sel: sel, oid: oid, name: name, hashed: false, keyOuter: [], keyText: [], cte: s.cte}
+    var sp = SubPlan{use: s.use, sel: sel, oid: oid, name: name, hashed: false, keyOuter: [], keyText: [], cte: s.cte, kind: lexdb_sql.COLL_EXACT}
     if len(sp.sel.q.refs) > 0 && s.use != lexdb_sql.SUB_FROM { hashSub(mut &sp, sc.base) }
     return Ok(sp)
 }
@@ -8315,7 +8864,7 @@ fn runHashed(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sp: &SubPlan, pa
             } else {
                 var mk = newStrBuf()
                 mk.add(g)
-                keyPart(mut &mk, &inVal(sp, r[nk]))
+                keyPart(mut &mk, &collVal(sp.kind, &inVal(sp, r[nk])))
                 out.set.put(mk.toStr(), 1)
             }
         }
@@ -8588,7 +9137,7 @@ fn runSub(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sp: &SubPlan, param
                 out.hasNull = true
                 continue
             }
-            let v = inVal(sp, r[0])
+            let v = collVal(sp.kind, &inVal(sp, r[0]))
             match setKey(&v, out.numeric) {
                 Some(k) {
                     if out.set.get(&k).isNone() && len(out.vals) <= IN_LOOKUP_MAX { append(mut &out.vals, v) }
@@ -8933,7 +9482,7 @@ fn idxName(name: &str): str {
 // (9.89), of the expression's type.
 fn idxVal(t: &Table, ix: &Index, k: int, row: &[]Val): Result[Val, DbErr] {
     let c = ix.cols[k]
-    if c >= 0 { return Ok(row[c]) }
+    if c >= 0 { return Ok(collKeyVal(&t.cols[c], &row[c])) }
     let none: []Val = []
     let noSubs: []SubRes = []
     let env = Env{cols: &t.cols, row: row, aggs: &none, params: &none, subs: &noSubs, cur: &none, seq: None}
@@ -9014,7 +9563,8 @@ fn checkUnique(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, ix:
             let none: Option[lexdb_sql.TypeName] = None
             append(mut &names, pgExprText(&ix.exprs[k], &none))
         }
-        append(mut &vals, text(&(try idxVal(t, ix, k, row))))
+        // the value as written, not its key (L2)
+        append(mut &vals, text(&(if c >= 0 { row[c] } else { try idxVal(t, ix, k, row) })))
     }
     return Err(e("23505", "duplicate key value violates unique constraint \"" + lexdb_sql.baseName(&ix.name) + "\": Key (" +
                  strings.join(&names, ", ") + ")=(" + strings.join(&vals, ", ") + ") already exists."))
@@ -9075,10 +9625,13 @@ fn createTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
     }
     try needCreate(st, txn, &key)
     var t = emptyTable(key)
+    t.spell = s.spell
     for c in s.cols {
         if colIndex(&t.cols, &c.name) >= 0 { return Err(e("42701", "column \"" + c.name + "\" specified more than once")) }
         var col = lexdb_sql.colDef(c.name, c.typ, c.notNull)
         col.identity = c.identity
+        col.spell = c.spell
+        col.coll = c.coll
         match c.def {
             Some(x) {
                 let v = try defaultValue(&x, &col, None)
@@ -9346,19 +9899,26 @@ fn createTableAs(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sq
         let k = try createKey(st, txn, &s.table, s.temp)
         if (try relExists(st, txn, &k)) { return Ok(tagOnly("CREATE TABLE AS")) }
     }
-    var sc = newScope(params, ptypes)
+    var sc = newScopeIn(st, txn, params, ptypes)
     let sel = try planSelect(st, txn, &s.inner[0], params, mut &sc)
     if len(s.names) > len(sel.outs) { return Err(e("42601", "too many column names were specified")) }
     var mk = lexdb_sql.newStmt(lexdb_sql.S_CREATE)
     mk.table = s.table
     mk.temp = s.temp
     mk.onCommit = s.onCommit
+    mk.spell = s.spell
     for i in 0..len(sel.outs) {
         let n = if i < len(s.names) { s.names[i] } else { sel.outs[i].name }
+        if i >= len(s.names) && sel.outs[i].spell == lexdb_sql.ANON {
+            return Err(e("TS1038", "An object or column name is missing or empty. For SELECT INTO statements, verify each column has a name."))
+        }
         for c in mk.cols { if c.name == n { return Err(e("42701", "column \"" + n + "\" specified more than once")) } }
         let o = sel.outs[i].oid
         let ty = if o == 0 || o == 705 { oidType(lexdb_sql.OID_TEXT) } else { oidType(o) }
-        append(mut &mk.cols, lexdb_sql.colDef(n, ty, false))
+        var col = lexdb_sql.colDef(n, ty, false)
+        col.spell = if i < len(s.names) { if i < len(s.spells) { s.spells[i] } else { "" } } else { sel.outs[i].spell }
+        if ty.kind == lexdb_sql.K_TEXT { col.coll = sel.outs[i].coll }     // the query's column's collation (L2)
+        append(mut &mk.cols, col)
     }
     let made = try createTable(st, txn, &mk)
     if s.noData { return Ok(tagOnly("CREATE TABLE AS")) }
@@ -9954,7 +10514,7 @@ fn retype(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, chan
     let sqe = seqEnv(st, txn)
     // the rows, read as the table stands (the statement's other actions done)
     try txn.put(CATALOG, t.name, encTable(t))
-    var sc = newScope(&[], &[])
+    var sc = newScopeIn(st, txn, &[], &[])
     let noWhere: Option[Expr] = None
     let noParams: []Val = []
     let noSubs: []lexdb_sql.Stmt = []
@@ -10128,6 +10688,8 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             // the rows there read the default as it is now (no row is written)
             var col = lexdb_sql.colDef(a.col.name, a.col.typ, a.col.notNull)
             col.identity = a.col.identity
+            col.spell = a.col.spell
+            col.coll = a.col.coll
             var perRow = a.col.identity != lexdb_sql.ID_NONE
             match a.col.def {
                 Some(x) {
@@ -10162,6 +10724,7 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             try dropColumn(txn, mut &t, i)
         } else if a.kind == lexdb_sql.A_RENAME {
             let key = lexdb_sql.qual(&lexdb_sql.schemaOf(&t.name), &a.name)
+            t.spell = a.col.spell
             if key == t.name { continue }
             if try relExists(st, txn, &key) {
                 return Err(e("42P07", "relation \"" + a.name + "\" already exists"))
@@ -10178,6 +10741,7 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             let i = colIndex(&t.cols, &a.name)
             if i < 0 { return Err(e("42703", "column \"" + a.name + "\" does not exist")) }
             if a.kind == lexdb_sql.A_RENAME_COL {
+                t.cols[i].spell = a.col.spell
                 if a.to == a.name { continue }
                 if colIndex(&t.cols, &a.to) >= 0 {
                     return Err(e("42701", "column \"" + a.to + "\" of relation \"" + rel + "\" already exists"))
@@ -10732,6 +11296,8 @@ fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     try dmlCheck(st, txn, s, &"a")
     let sqe = seqEnv(st, txn)
     let t = try needTable(st, txn, &s.table)
+    // T-SQL's SET IDENTITY_INSERT t ON (design/lexdb-tds.md S3)
+    let ovr = if s.overriding == lexdb_sql.OVR_NONE && identityInsertOf(st, txn.sess) == lexdb_sql.baseName(&t.name) { lexdb_sql.OVR_TSQL } else { s.overriding }
     var targets: []int = []
     if len(s.names) == 0 {
         for i in 0..len(t.cols) { if t.cols[i].name != ROWID { append(mut &targets, i) } }
@@ -10743,7 +11309,7 @@ fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
         }
     }
     // its subqueries are run first; with RETURNING, over the table's columns
-    var sc = newScope(params, &[])
+    var sc = newScopeIn(st, txn, params, &[])
     let noFrom: []lexdb_sql.FromItem = []
     let noWhere: Option[Expr] = None
     let from = if len(s.items) > 0 { oneTable(&s.table) } else { noFrom }
@@ -10759,6 +11325,7 @@ fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     }
     var ret = try retOf(s, &q, mut &sc)
     var up = try upsertOf(s, &t, mut &sc)
+    up.idBump = ovr == lexdb_sql.OVR_TSQL
     endScope(mut &sc, mut &q)
     var rs = newRun(&q)
     rs.limit(&lim)
@@ -10781,7 +11348,7 @@ fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
         for r in res.rows {
             var vs: []Val = []
             for k in 0..len(r) {
-                if k < len(targets) && try idDefault(&t, targets[k], false, s.overriding) {
+                if k < len(targets) && try idDefault(&t, targets[k], false, ovr) {
                     append(mut &vs, try defAt(st, txn, &defs, &t, targets[k]))
                 } else if k < len(res.cols) && k < len(targets) && res.cols[k].oid == lexdb_sql.OID_BPCHAR && kindOf(&r[k]) == lexdb_sql.K_TEXT &&
                           t.cols[targets[k]].typ.kind == lexdb_sql.K_TEXT && t.cols[targets[k]].typ.oid != lexdb_sql.OID_BPCHAR {
@@ -10802,11 +11369,31 @@ fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     } else {
         let noAggs: []Val = []
         let env = Env{cols: &q.cols, row: &noAggs, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: sqe}
-        count = if resolved { try insertRows(st, txn, &t, &targets, &rows, &env, s.overriding, ret.on, mut &kept, mut &up) }
-                else { try insertRows(st, txn, &t, &targets, &s.rows, &env, s.overriding, ret.on, mut &kept, mut &up) }
+        count = if resolved { try insertRows(st, txn, &t, &targets, &rows, &env, ovr, ret.on, mut &kept, mut &up) }
+                else { try insertRows(st, txn, &t, &targets, &s.rows, &env, ovr, ret.on, mut &kept, mut &up) }
     }
     for row in kept { try retAdd(st, txn, &q, &m, params, mut &ret, &row, mut &rs) }
+    // IDENTITY_INSERT: an identity given a value past its own goes on from there
+    for j in 0..len(up.idCols) {
+        let d = try needSeq(st, txn, &t.cols[up.idCols[j]].seq)
+        let v = up.idMax[j]
+        let next = try seqPeek(st, txn, &d)
+        if (d.inc > 0 && v >= next) || (d.inc < 0 && v <= next) { try setVal(st, &d, v, true) }
+    }
     return Ok(retRes(ret, "INSERT 0 " + count.toStr()))
+}
+
+// The value a sequence's nextval would give now (not taking it).
+fn seqPeek(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, d: &Seq): Result[int, DbErr] {
+    match st.memoGet(&memoNext(d)) {
+        Some(nv) { return Ok(if nv == "e" { if d.inc > 0 { d.max } else { d.min } } else { num(&nv) }) }
+        None {}
+    }
+    let tree = try seqTree(st, txn)
+    match try st.get(txn, tree, d.id) {
+        Some(v) { return Ok(num(&v) + d.inc) }
+        None { return Ok(d.start) }
+    }
 }
 
 // ---- RETURNING (9.44): rows of values per row written, over the table's
@@ -10832,13 +11419,48 @@ fn retOf(s: &lexdb_sql.Stmt, q: &Query, sc: mut &Scope): Result[Ret, DbErr] {
 
 fn retAdd(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Mats, params: &[]Val, r: mut &Ret,
           row: &[]Val, rs: mut &Run): Result[Unit, DbErr] {
+    let none: []Val = []
+    return retAddOld(st, txn, q, m, params, r, row, &none, rs)
+}
+
+// retAdd with the row before an UPDATE: T-SQL's OUTPUT DELETED.c (#old(c)).
+fn retAddOld(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Mats, params: &[]Val, r: mut &Ret,
+             row: &[]Val, old: &[]Val, rs: mut &Run): Result[Unit, DbErr] {
     if !r.on { return Ok(Unit{}) }
     let noAggs: []Val = []
     let env = Env{cols: &q.cols, row: row, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: seqEnv(st, txn)}
     var out: []Val = []
-    for x in r.exprs { append(mut &out, try evalX(st, txn, q, &x, &env, rs)) }
+    for x0 in r.exprs {
+        let x = if len(old) > 0 { oldRefs(&x0, &q.cols, old) } else { clone(&x0) }
+        append(mut &out, try evalX(st, txn, q, &x, &env, rs))
+    }
     append(mut &r.rows, out)
     return Ok(Unit{})
+}
+
+// #old(c): the old row's c, as a value.
+fn oldRefs(x: &Expr, cols: &[]lexdb_sql.ColDef, old: &[]Val): Expr {
+    match x {
+        Expr.Call(f, args, star) {
+            if f == "#old" && len(args) == 1 {
+                match args[0] {
+                    Expr.Col(n) {
+                        let i = colIndex(cols, &n)
+                        if i >= 0 && i < len(old) { return Expr.Lit(old[i]) }
+                    }
+                    else {}
+                }
+            }
+            var out: []Expr = []
+            for a in args { append(mut &out, oldRefs(&a, cols, old)) }
+            return Expr.Call(f, out, star)
+        }
+        Expr.Unary(op, a) { return Expr.Unary(op, oldRefs(&a, cols, old)) }
+        Expr.Bin(op, a, b) { return Expr.Bin(op, oldRefs(&a, cols, old), oldRefs(&b, cols, old)) }
+        Expr.Cast(a, t) { return Expr.Cast(oldRefs(&a, cols, old), t) }
+        Expr.IsNull(a, n) { return Expr.IsNull(oldRefs(&a, cols, old), n) }
+        else { return clone(x) }
+    }
 }
 
 fn retRes(r: Ret, tag: str): Res {
@@ -10854,7 +11476,7 @@ fn idDefault(t: &Table, i: int, isDef: bool, ovr: int): Result[bool, DbErr] {
     let id = t.cols[i].identity
     if isDef || (id != lexdb_sql.ID_ALWAYS && id != lexdb_sql.ID_BY_DEFAULT) { return Ok(false) }
     if ovr == lexdb_sql.OVR_USER { return Ok(true) }
-    if id == lexdb_sql.ID_ALWAYS && ovr != lexdb_sql.OVR_SYSTEM {
+    if id == lexdb_sql.ID_ALWAYS && ovr != lexdb_sql.OVR_SYSTEM && ovr != lexdb_sql.OVR_TSQL {
         return Err(e("428C9", "cannot insert a non-DEFAULT value into column \"" + t.cols[i].name + "\": it is GENERATED ALWAYS AS IDENTITY (OVERRIDING SYSTEM VALUE inserts it)"))
     }
     return Ok(false)
@@ -10906,6 +11528,22 @@ fn insertOne(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, targe
     }
     // the others their defaults (a sequence's taken only for these)
     for i in 0..len(t.cols) { if !given[i] { row[i] = try defAt(st, txn, defs, t, i) } }
+    if up.idBump {
+        for i in 0..len(t.cols) {
+            if !given[i] || len(t.cols[i].seq) == 0 { continue }
+            match row[i] {
+                Val.Int(v) {
+                    var at = -1
+                    for j in 0..len(up.idCols) { if up.idCols[j] == i { at = j } }
+                    if at < 0 {
+                        append(mut &up.idCols, i)
+                        append(mut &up.idMax, v)
+                    } else if v > up.idMax[at] { up.idMax[at] = v }
+                }
+                else {}
+            }
+        }
+    }
     try checkRow(t, &row)
     try checkChecks(t, &row)
     if up.mode != lexdb_sql.CONFLICT_NONE {
@@ -10930,10 +11568,16 @@ type Upsert = record {
     cond: Option[Expr]          // DO UPDATE's WHERE, over cols
     cols: []lexdb_sql.ColDef    // the table's columns (alias.column), then EXCLUDED's (excluded.column)
     touched: Map[str, int]      // the rows the statement inserted or updated, by primary key
+    // IDENTITY_INSERT (lexdb_sql.OVR_TSQL): per identity column given a
+    // value, the largest (idCols[i] the column)
+    idBump: bool
+    idCols: []int
+    idMax: []int
 }
 
 fn noUpsert(): Upsert {
-    return Upsert{mode: lexdb_sql.CONFLICT_NONE, arb: [], targets: [], sets: [], cond: None, cols: [], touched: newMap()}
+    return Upsert{mode: lexdb_sql.CONFLICT_NONE, arb: [], targets: [], sets: [], cond: None, cols: [], touched: newMap(), idBump: false,
+                  idCols: [], idMax: []}
 }
 
 fn sameCols(a: &[]int, b: &[]int): bool {
@@ -11079,7 +11723,7 @@ fn update(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     try notView(st, txn, &s.table, &"update")
     try dmlCheck(st, txn, s, &"w")
     let sqe = seqEnv(st, txn)
-    var sc = newScope(params, &[])
+    var sc = newScopeIn(st, txn, params, &[])
     sc.target = try catKey(st, txn, &s.table, false)
     var q = try buildQuery(st, txn, &(try dmlFrom(s)), &s.where, params, &s.subs, mut &sc, false)
     var targets: []int = []
@@ -11115,6 +11759,8 @@ fn update(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
             return Ok(true)
         }, mut &rs)
         found = onceEach(t, found, len(s.from) > 0)
+        var nolk: []Look = []
+        found = firstN(found, try evalInt(&s.limit, params, "TOP", mut &nolk))     // T-SQL's UPDATE TOP (n), DELETE TOP (n)
         if !(try lockFound(st, txn, t, &found, lmode)) { break }
         // a lock waited for: the rows found again, holding the locks
         found = []
@@ -11146,7 +11792,7 @@ fn update(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
         let old = rowPrefix(&joined, nt)
         let row = rowPrefix(&all, nt)
         try updRow(st, txn, t, &old, &row, &fw, mut &later)
-        try retAdd(st, txn, &q, &m, params, mut &ret, &all, mut &rs)
+        try retAddOld(st, txn, &q, &m, params, mut &ret, &all, &joined, mut &rs)
     }
     try fkFinish(st, txn, &fw, mut &later)
     return Ok(retRes(ret, "UPDATE " + len(found).toStr()))
@@ -11155,7 +11801,7 @@ fn update(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
 fn delete(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, lim: Limits): Result[Res, DbErr] {
     try notView(st, txn, &s.table, &"delete from")
     try dmlCheck(st, txn, s, &"d")
-    var sc = newScope(params, &[])
+    var sc = newScopeIn(st, txn, params, &[])
     sc.target = try catKey(st, txn, &s.table, false)
     var q = try buildQuery(st, txn, &(try dmlFrom(s)), &s.where, params, &s.subs, mut &sc, false)
     var ret = try retOf(s, &q, mut &sc)
@@ -11178,6 +11824,8 @@ fn delete(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
             return Ok(true)
         }, mut &rs)
         found = onceEach(t, found, len(s.from) > 0)
+        var nolk: []Look = []
+        found = firstN(found, try evalInt(&s.limit, params, "TOP", mut &nolk))     // T-SQL's UPDATE TOP (n), DELETE TOP (n)
         if !(try lockFound(st, txn, t, &found, lexdb_sql.LOCK_UPDATE)) { break }
         found = []
         held = 0
@@ -11200,7 +11848,7 @@ fn delete(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
 fn explain(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, x: &lexdb_sql.Stmt, params: &[]Val, lim: Limits,
            ptypes: &[]int): Result[Res, DbErr] {
     let s = &x.inner[0]
-    var res = Res{cols: [OutCol{name: "QUERY PLAN", oid: lexdb_sql.OID_TEXT}], rows: [], tag: "EXPLAIN", hasRows: true, copy: COPY_NONE}
+    var res = Res{cols: [OutCol{name: "QUERY PLAN", oid: lexdb_sql.OID_TEXT, spell: "", coll: "", scale: -1}], rows: [], tag: "EXPLAIN", hasRows: true, copy: COPY_NONE}
     var lines: []str = []
     let none: []Counts = []
     if x.ifFlag {
@@ -11211,12 +11859,12 @@ fn explain(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, x: &lexdb_sql.Stmt
         append(mut &lines, "result: " + len(r.rows).toStr() + " rows in " + (us / 1000).toStr() + "." +
                strings.padLeft((us % 1000).toStr(), 3, '0') + " ms")
     } else if s.kind == lexdb_sql.S_SELECT {
-        var sc = newScope(params, ptypes)
+        var sc = newScopeIn(st, txn, params, ptypes)
         let sel = try planSelect(st, txn, s, params, mut &sc)
         let noStats: []SubStat = []
         lines = selLines(&sel, &none, &noStats)
     } else {
-        var sc = newScope(params, ptypes)
+        var sc = newScopeIn(st, txn, params, ptypes)
         var q = try buildQuery(st, txn, &(try dmlFrom(s)), &s.where, params, &s.subs, mut &sc, false)
         endScope(mut &sc, mut &q)
         lines = explainLines(&q, &none)
@@ -11296,6 +11944,17 @@ pub fn exprOid(x: &Expr, cols: &[]lexdb_sql.ColDef, ptypes: &[]int): int {
                 return if l == lexdb_sql.OID_BYTEA || r == lexdb_sql.OID_BYTEA { lexdb_sql.OID_BYTEA } else { lexdb_sql.OID_TEXT }
             }
             if op == "^" { return numOrFloat(exprOid(&a, cols, ptypes), exprOid(&b, cols, ptypes)) }
+            if op == "t+" {
+                // T-SQL's +: text when both are, else the other's type
+                let l = exprOid(&a, cols, ptypes)
+                let r = exprOid(&b, cols, ptypes)
+                let lt = isTextOid(l) || l == 0
+                let rt = isTextOid(r) || r == 0
+                if lt && rt { return lexdb_sql.OID_TEXT }
+                if lt { return r }
+                if rt { return l }
+                return exprOid(&Expr.Bin("+", clone(&a), clone(&b)), cols, ptypes)
+            }
             if op == "+" || op == "-" || op == "*" || op == "/" || op == "%" || op == "&" || op == "|" || op == "#" || op == "<<" || op == ">>" {
                 let l = exprOid(&a, cols, ptypes)
                 let r = exprOid(&b, cols, ptypes)
@@ -11449,7 +12108,16 @@ pub fn exprOid(x: &Expr, cols: &[]lexdb_sql.ColDef, ptypes: &[]int): int {
                     let el = lexdb_sql.elemOid(a)
                     return if el > 0 { el } else { lexdb_sql.OID_TEXT }
                 }
-                "min", "max", "abs", "coalesce" {
+                "coalesce" {
+                    // the first argument's whose type is known (COALESCE(NULL, 5) is an integer)
+                    for a in args {
+                        match a { Expr.Lit(v) { if isNull(&v) { continue } } else {} }
+                        let o = exprOid(&a, cols, ptypes)
+                        if o != 0 && o != 705 { return o }
+                    }
+                    return lexdb_sql.OID_TEXT
+                }
+                "min", "max", "abs" {
                     return if len(args) > 0 { exprOid(&args[0], cols, ptypes) } else { lexdb_sql.OID_TEXT }
                 }
                 "length", "char_length", "octet_length" { return lexdb_sql.OID_INT4 }
@@ -11476,6 +12144,23 @@ pub fn exprOid(x: &Expr, cols: &[]lexdb_sql.ColDef, ptypes: &[]int): int {
                     return if a == lexdb_sql.OID_TS || a == lexdb_sql.OID_IVAL { a } else { lexdb_sql.OID_TSTZ }
                 }
                 "nextval", "currval", "setval", "lastval" { return lexdb_sql.OID_INT8 }
+                "scope_identity" { return lexdb_sql.OID_NUMERIC }
+                // T-SQL's (lexdb_tsqlfn)
+                "#len", "#datalength", "charindex", "patindex", "#datediff", "#datepart" { return lexdb_sql.OID_INT4 }
+                "#replaceci", "#stuff", "#datename", "#datestyle", "#reverse", "#concat_ws" { return lexdb_sql.OID_TEXT }
+                "#tlike" { return lexdb_sql.OID_BOOL }
+                "#utcnow" { return lexdb_sql.OID_TS }
+                "#eomonth" { return lexdb_sql.OID_DATE }
+                "#tdiv" { return lexdb_sql.OID_NUMERIC }
+                "#tavg" {
+                    let m = if len(args) > 1 { litInt(&args[1]) } else { 0 }
+                    return if m == -1 { lexdb_sql.OID_INT8 } else { lexdb_sql.OID_NUMERIC }
+                }
+                "#round", "#power", "#try", "#tint" { return if len(args) > 0 { exprOid(&args[0], cols, ptypes) } else { lexdb_sql.OID_NUMERIC } }
+                "#dateadd" {
+                    let o = if len(args) > 2 { exprOid(&args[2], cols, ptypes) } else { 0 }
+                    return if o == lexdb_sql.OID_DATE || o == lexdb_sql.OID_TS || o == lexdb_sql.OID_TSTZ { o } else { lexdb_sql.OID_TS }
+                }
                 "round" {
                     let a = if len(args) > 0 { exprOid(&args[0], cols, ptypes) } else { lexdb_sql.OID_NUMERIC }
                     return if isFloatOid(a) && len(args) == 1 { lexdb_sql.OID_FLOAT8 } else { lexdb_sql.OID_NUMERIC }
@@ -11508,7 +12193,7 @@ fn itemCols(items: &[]lexdb_sql.SelItem, from: bool, cols: &[]lexdb_sql.ColDef, 
                     for c in cols {
                         if c.pos != p || hiddenName(&c.name) { continue }
                         any = true
-                        append(mut &out, OutCol{name: colPart(&c.name), oid: c.typ.oid})
+                        append(mut &out, OutCol{name: colPart(&c.name), oid: c.typ.oid, spell: "", coll: "", scale: -1})
                         append(exprs, colExpr(cols, &c.name))
                     }
                 }
@@ -11519,7 +12204,7 @@ fn itemCols(items: &[]lexdb_sql.SelItem, from: bool, cols: &[]lexdb_sql.ColDef, 
                 if it.qual != "" && c.name[0..dotAt(&c.name)] != it.qual { continue }
                 any = true
                 if hiddenName(&c.name) { continue }
-                append(mut &out, OutCol{name: colPart(&c.name), oid: c.typ.oid})
+                append(mut &out, OutCol{name: colPart(&c.name), oid: c.typ.oid, spell: c.spell, coll: c.coll, scale: typScale(&c.typ)})
                 append(exprs, Expr.Col(c.name))
             }
             if !any { return Err(e("42P01", "missing FROM-clause entry for table \"" + it.qual + "\"")) }
@@ -11530,7 +12215,7 @@ fn itemCols(items: &[]lexdb_sql.SelItem, from: bool, cols: &[]lexdb_sql.ColDef, 
                 let r = try resolve(&x, cols, len(cols), sc)
                 let name = if it.alias != "" { it.alias } else { exprName(&r) }
                 let pt = ptypesOf(sc)
-                append(mut &out, OutCol{name: name, oid: exprOid(&r, cols, &pt)})
+                append(mut &out, OutCol{name: name, oid: exprOid(&r, cols, &pt), spell: it.spell, coll: exprColl(&r, cols, sc).name, scale: exprScale(&r, cols)})
                 append(exprs, r)
             }
             None {}
@@ -11569,6 +12254,14 @@ fn sortCmp(a: &Val, b: &Val): int {
         Ok(c) { return c }
         Err(_) { return kindOf(a) - kindOf(b) }
     }
+}
+
+fn firstN(rows: [][]Val, n: int): [][]Val {
+    if n < 0 || len(rows) <= n { return rows }
+    var all = rows
+    var out: [][]Val = []
+    for i in 0..n { append(mut &out, replace(mut &all[i], [])) }
+    return out
 }
 
 fn evalInt(x: &Option[Expr], params: &[]Val, what: str, lk: mut &[]Look): Result[int, DbErr] {
@@ -11670,7 +12363,7 @@ fn select(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     for i in 0..len(pc.sels) {
         if looksHold(&pc.looks[i], params) { return runSel(st, txn, &pc.sels[i], params, lim) }
     }
-    var sc = newScope(params, ptypes)
+    var sc = newScopeIn(st, txn, params, ptypes)
     let sel = try planSelect(st, txn, s, params, mut &sc)
     let looks = replace(mut &sc.looks, [])
     if !pc.keep || len(pc.sels) >= PLAN_VARIANTS { return runSel(st, txn, &sel, params, lim) }
@@ -11715,7 +12408,8 @@ fn runLocking(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, para
             var skip = false
             for lk in sel.locks {
                 var b = newStrBuf()
-                for j in 0..lk.n { encKeyPart(mut &b, &res.rows[i][lk.at + j]) }
+                let lt = &sel.q.levels[lk.level].t
+                for j in 0..lk.n { encKeyPart(mut &b, &collKeyVal(&lt.cols[lt.pk[j]], &res.rows[i][lk.at + j])) }
                 let got = try lockOf(st, txn, &sel.q.levels[lk.level].t, &b.toStr(), lk.mode, lk.wait, true)
                 if got == lexdb_store.LOCK_SKIPPED { skip = true }
                 if got == lexdb_store.LOCKED_AFTER_WAIT { waited = true }
@@ -11801,6 +12495,7 @@ type AggSpec = record {
     order: []Expr           // ORDER BY in the call (string_agg's result depends on it; the others' not)
     dirs: str               // per key: a, A (NULLs first), d, D (NULLs last), as the parser gives them
     text: str               // to share one accumulator between equal calls
+    kind: int               // its argument's collation kind (L2): min, max and DISTINCT compare its keys
 }
 
 type Acc = record {
@@ -11861,7 +12556,7 @@ fn collectAggs(x: &Expr, specs: mut &[]AggSpec): Result[Expr, DbErr] {
             let text = lexdb_sql.exprText(x)
             for i in 0..len(specs) { if specs[i].text == text { return Ok(slotRef(i)) } }
             append(specs, AggSpec{fname: base, args: aargs, star: star, distinct: strings.contains(name, " distinct"),
-                                  filter: filter, order: order, dirs: dirs, text: text})
+                                  filter: filter, order: order, dirs: dirs, text: text, kind: lexdb_sql.COLL_EXACT})
             return Ok(slotRef(len(specs) - 1))
         }
         Expr.Unary(op, a) { return Ok(Expr.Unary(op, try collectAggs(&a, specs))) }
@@ -11926,7 +12621,10 @@ fn addToGroup(sel: &Sel, gs: mut &Groups, r: &[]Val, env: &Env, held: mut &int, 
     var g = 0
     if len(sel.groupBy) > 0 {
         var kb = newStrBuf()
-        for x in sel.groupBy { encIdxPart(mut &kb, &(try eval(&x, env))) }
+        for gi in 0..len(sel.groupBy) {
+            let v = try eval(&sel.groupBy[gi], env)
+            encIdxPart(mut &kb, &(if gi < len(sel.groupKinds) { collVal(sel.groupKinds[gi], &v) } else { v }))
+        }
         let k = kb.toStr()
         match gs.index.get(&k) {
             Some(i) { g = i }
@@ -11976,7 +12674,7 @@ fn accumulate(sp: &AggSpec, acc: mut &Acc, env: &Env): Result[Unit, DbErr] {
     if isNull(&v) && sp.fname != "array_agg" { return Ok(Unit{}) }      // array_agg keeps NULLs, as elements
     if sp.distinct {
         var kb = newStrBuf()
-        encIdxPart(mut &kb, &v)
+        encIdxPart(mut &kb, &collVal(sp.kind, &v))
         let k = kb.toStr()
         if acc.seen.get(&k).isSome() { return Ok(Unit{}) }
         acc.seen.put(k, 1)
@@ -11991,9 +12689,14 @@ fn accumulate(sp: &AggSpec, acc: mut &Acc, env: &Env): Result[Unit, DbErr] {
     } else if f == "min" {
         // of equal values the last, as PostgreSQL's numeric_smaller gives
         // (0.5 and 0.500: 0.500 if it comes after)
-        if isNull(&acc.val) || (try compare(&v, &acc.val)) <= 0 { acc.val = v }
+        if sp.kind != lexdb_sql.COLL_EXACT {
+            // under a collation's keys: of equal ones the first (L2, as SQL Server)
+            if isNull(&acc.val) || (try compare(&collVal(sp.kind, &v), &collVal(sp.kind, &acc.val))) < 0 { acc.val = v }
+        } else if isNull(&acc.val) || (try compare(&v, &acc.val)) <= 0 { acc.val = v }
     } else if f == "max" {
-        if isNull(&acc.val) || (try compare(&v, &acc.val)) >= 0 { acc.val = v }
+        if sp.kind != lexdb_sql.COLL_EXACT {
+            if isNull(&acc.val) || (try compare(&collVal(sp.kind, &v), &collVal(sp.kind, &acc.val))) > 0 { acc.val = v }
+        } else if isNull(&acc.val) || (try compare(&v, &acc.val)) >= 0 { acc.val = v }
     } else if f == "bool_and" || f == "every" || f == "bool_or" {
         let b = match truth(&v) {
             Some(x) { x }
@@ -12224,6 +12927,19 @@ type Sel = record {
     gx: [][]Expr            // ... per set, exprs, order and having as that set sees them
     gord: [][]Expr
     gh: []Option[Expr]
+    // collations (L2): per GROUP BY key, ORDER BY item and output column,
+    // the kind it is grouped, sorted and made distinct by (lexdb_sql.COLL_*)
+    groupKinds: []int
+    ordKinds: []int
+    outKinds: []int
+    // T-SQL's TOP n PERCENT and WITH TIES (lexdb_sql.TOP_*): limit is -1,
+    // topN the n, applied to the rows sorted
+    topMode: int
+    topN: int
+    // T-SQL's SELECT @v = f(@v, ...) (design/lexdb-tds.md S4): per output
+    // column the parameter it assigns (0 none), when one reads another's:
+    // the rows evaluated in their order, each seeing the last's values
+    feedback: []int
 }
 
 fn copySets(xs: &[][]int): [][]int {
@@ -12514,15 +13230,26 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
     var exprs: []Expr = []
     let outs = try selectCols(s, &q.cols, sc, mut &exprs)
     var groupBy: []Expr = []
+    var groupKinds: []int = []
     for g in s.group {
         let r = try resolveGroup(&g, &q.cols, &outs, &exprs, sc)
         if hasAgg(&r) { return Err(e("42803", "aggregate functions are not allowed in GROUP BY")) }
+        append(mut &groupKinds, exprKind(&r, &q.cols, sc))
         append(mut &groupBy, r)
     }
     var order: []Expr = []
+    var ordKinds: []int = []
     for o in s.order {
         // an enum's order is its labels' (9.90)
         let r = try resolveOrder(&o.expr, &q.cols, &outs, sc)
+        // its collation's (L2): an output column's, or the expression's
+        var ok = outRefKind(&r, &outs)
+        match r {
+            Expr.Col(n) { if colIndex(&q.cols, &n) >= 0 { ok = exprKind(&r, &q.cols, sc) } }
+            Expr.Lit(_) {}
+            else { ok = exprKind(&r, &q.cols, sc) }
+        }
+        append(mut &ordKinds, ok)
         match try enumOf(st, txn, &r, &q.cols) {
             Some(en) { append(mut &order, enumPos(&r, &en)) }
             None { append(mut &order, r) }
@@ -12594,9 +13321,14 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             let d = try mergeWin(&w, &s.windows, 0)
             var r = lexdb_sql.WinDef{call: try resolve(&d.call, &q.cols, len(q.cols), sc), ref: "", bare: false, part: [], order: [],
                                      frame: cloneFrame(&d.frame)}
-            for x in d.part { append(mut &r.part, try resolve(&x, &q.cols, len(q.cols), sc)) }
+            // partitions and the window's order under their collations (L2): by keys
+            for x in d.part {
+                let rx = try resolve(&x, &q.cols, len(q.cols), sc)
+                append(mut &r.part, collKeyOf(exprKind(&rx, &q.cols, sc), rx))
+            }
             for o in d.order {
-                append(mut &r.order, lexdb_sql.WinOrder{expr: try resolve(&o.expr, &q.cols, len(q.cols), sc), desc: o.desc, nullsFirst: o.nullsFirst})
+                let ro = try resolve(&o.expr, &q.cols, len(q.cols), sc)
+                append(mut &r.order, lexdb_sql.WinOrder{expr: collKeyOf(exprKind(&ro, &q.cols, sc), ro), desc: o.desc, nullsFirst: o.nullsFirst})
             }
             var inDef = false
             for x in r.part { if hasWin(&x) { inDef = true } }
@@ -12633,7 +13365,10 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             if !ok { return Err(e("42P10", "for SELECT DISTINCT, ORDER BY expressions must appear in select list")) }
         }
     }
-    let limit = try evalInt(&s.limit, params, "LIMIT", mut &sc.looks)
+    // T-SQL's TOP n PERCENT and WITH TIES: no limit while running, the n kept for the end
+    let n0 = try evalInt(&s.limit, params, if s.topMode != 0 { "TOP" } else { "LIMIT" }, mut &sc.looks)
+    let topN = if s.topMode != 0 { n0 } else { -1 }
+    let limit = if s.topMode != 0 { -1 } else { n0 }
     let offset = try evalInt(&s.offset, params, "OFFSET", mut &sc.looks)
     var sort = len(order) > 0
     var first = -1
@@ -12714,6 +13449,8 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         var rx: []Expr = []
         for x in exprs { append(mut &rx, try collectAggs(&x, mut &specs)) }
         exprs = rx
+        // min, max and DISTINCT compare under their argument's collation (L2)
+        for i in 0..len(specs) { if len(specs[i].args) > 0 { specs[i].kind = exprKind(&specs[i].args[0], &q.cols, sc) } }
         var ro: []Expr = []
         for x in order { append(mut &ro, try collectAggs(&x, mut &specs)) }
         order = ro
@@ -12846,7 +13583,9 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
     return Ok(Sel{q: q, exprs: exprs, outs: outs, groupBy: groupBy, order: order, aggQ: aggQ, sort: sort,
                   first: first, limit: limit, offset: offset, having: having, specs: specs, distinct: s.distinct, desc: desc, nullsFirst: nullsFirst,
                   parts: [], setop: 0, setAll: false, split: 0, rec: -1, srf: s.srf, ordin: s.ordin, wins: wins, nAggs: nAggs,
-                  locks: locks, nOut: nOut, donKey: donKey, withTies: s.withTies, gsets: copySets(&s.gsets), gx: gx, gord: gord, gh: gh})
+                  locks: locks, nOut: nOut, donKey: donKey, withTies: s.withTies, gsets: copySets(&s.gsets), gx: gx, gord: gord, gh: gh,
+                  groupKinds: groupKinds, ordKinds: ordKinds, outKinds: outKindsOf(&outs),
+                  topMode: s.topMode, topN: topN, feedback: if aggQ || s.distinct || len(wins) > 0 { [] } else { feedbackOf(s, &exprs) }})
 }
 
 // UNION, INTERSECT, EXCEPT: its two queries, planned on their own; the
@@ -12859,7 +13598,12 @@ fn planSet(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
     let l = try planSelect(st, txn, &s.inner[0], params, sc)
     if s.rec {
         var cols: []lexdb_sql.ColDef = []
-        for o in l.outs { append(mut &cols, lexdb_sql.colDef(o.name, oidType(o.oid), false)) }
+        for o in l.outs {
+            var c = lexdb_sql.colDef(o.name, oidType(o.oid), false)
+            c.spell = o.spell
+            c.coll = o.coll
+            append(mut &cols, c)
+        }
         append(mut &sc.works, Work{id: s.cte, cols: cols})
     }
     let rr = planSelect(st, txn, &s.inner[1], params, sc)
@@ -12869,8 +13613,11 @@ fn planSet(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
     if len(l.outs) != len(r.outs) { return Err(e("42601", "each " + what + " query must have the same number of columns")) }
     var outs: []OutCol = []
     for o in l.outs { append(mut &outs, o) }
+    for i in 0..len(outs) { if len(outs[i].coll) == 0 { outs[i].coll = r.outs[i].coll } }
     var order: []Expr = []
+    var ordKinds: []int = []
     for o in s.order {
+        append(mut &ordKinds, outRefKind(&o.expr, &outs))
         var ok = false
         match o.expr {
             Expr.Lit(v) { match v { Val.Int(n) { ok = n >= 1 && n <= len(outs) } else {} } }
@@ -12895,7 +13642,9 @@ fn planSet(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
     return Ok(Sel{q: q, exprs: [], outs: outs, groupBy: [], order: order, aggQ: false, sort: len(order) > 0, first: -1,
                   limit: limit, offset: offset, having: None, specs: [], distinct: false, desc: desc, nullsFirst: nullsFirst, parts: [l, r],
                   setop: s.setop, setAll: s.setAll, split: split, rec: if s.rec { s.cte } else { -1 }, srf: "", ordin: false,
-                  wins: [], nAggs: 0, locks: [], nOut: len(outs), donKey: 0, withTies: s.withTies, gsets: [], gx: [], gord: [], gh: []})
+                  wins: [], nAggs: 0, locks: [], nOut: len(outs), donKey: 0, withTies: s.withTies, gsets: [], gx: [], gord: [], gh: [],
+                  groupKinds: [], ordKinds: ordKinds, outKinds: outKindsOf(&outs),
+                  topMode: 0, topN: -1, feedback: []})
 }
 
 // A row's key for UNION and the like (NULLs alike; 2 = 2.0).
@@ -12905,11 +13654,88 @@ fn rowKey(vs: &[]Val): str {
     return kb.toStr()
 }
 
-fn distinctRows(rows: [][]Val, seen: mut &Map[str, int]): [][]Val {
+// A value as a collation of kind k compares it (L2): a text's key.
+fn collVal(k: int, v: &Val): Val {
+    if k == lexdb_sql.COLL_EXACT { return v }
+    match v {
+        Val.Text(s) { return Val.Text(if k == lexdb_sql.COLL_CI { ciKey(&s) } else { padKey(&s) }) }
+        else { return v }
+    }
+}
+
+// A SELECT @v = ... whose expressions read what it assigns: its
+// parameters, per output column; [] none.
+fn feedbackOf(s: &lexdb_sql.Stmt, exprs: &[]Expr): []int {
+    if len(s.assignAt) == 0 { return [] }
+    var reads = false
+    for x in exprs { for k in s.assignAt { if k > 0 && usesParam(&x, k) { reads = true } } }
+    if !reads { return [] }
+    var out: []int = []
+    for k in s.assignAt { append(mut &out, k) }
+    return out
+}
+
+fn usesParam(x: &Expr, k: int): bool {
+    match x {
+        Expr.Param(n) { return n == k }
+        Expr.Unary(_, a) { return usesParam(&a, k) }
+        Expr.Bin(_, a, b) { return usesParam(&a, k) || usesParam(&b, k) }
+        Expr.IsNull(a, _) { return usesParam(&a, k) }
+        Expr.Cast(a, _) { return usesParam(&a, k) }
+        Expr.Call(_, args, _) {
+            for a in args { if usesParam(&a, k) { return true } }
+            return false
+        }
+        else { return false }
+    }
+}
+
+// An ORDER BY value under its item's collation.
+fn ordVal(sel: &Sel, i: int, v: Val): Val { return if i < len(sel.ordKinds) { collVal(sel.ordKinds[i], &v) } else { v } }
+
+fn valsKeyIn(vs: &[]Val, kinds: &[]int): str {
+    var kb = newStrBuf()
+    for i in 0..len(vs) { encIdxPart(mut &kb, &(if i < len(kinds) { collVal(kinds[i], &vs[i]) } else { vs[i] })) }
+    return kb.toStr()
+}
+
+// The collation kinds of a query's output columns.
+fn outKindsOf(outs: &[]OutCol): []int {
+    var out: []int = []
+    for o in outs { append(mut &out, if isTextOid(o.oid) { lexdb_sql.collKind(&o.coll) } else { lexdb_sql.COLL_EXACT }) }
+    return out
+}
+
+// An expression's collation kind, a text one's (COLL_EXACT else).
+fn exprKind(x: &Expr, cols: &[]lexdb_sql.ColDef, sc: &Scope): int {
+    let c = exprColl(x, cols, sc)
+    if c.level == COLL_NONE || !isTextExpr(x, cols, sc) { return lexdb_sql.COLL_EXACT }
+    return lexdb_sql.collKind(&c.name)
+}
+
+// ORDER BY's item as an output column (a number, a name): its kind.
+fn outRefKind(x: &Expr, outs: &[]OutCol): int {
+    let ks = outKindsOf(outs)
+    match x {
+        Expr.Lit(v) { match v { Val.Int(n) { if n >= 1 && n <= len(ks) { return ks[n - 1] } } else {} } }
+        Expr.Col(n) { for i in 0..len(outs) { if outs[i].name == n { return ks[i] } } }
+        else {}
+    }
+    return lexdb_sql.COLL_EXACT
+}
+
+// rowKey with its columns' collations (L2).
+fn rowKeyIn(vs: &[]Val, kinds: &[]int): str {
+    var kb = newStrBuf()
+    for i in 0..len(vs) { keyPart(mut &kb, &(if i < len(kinds) { collVal(kinds[i], &vs[i]) } else { vs[i] })) }
+    return kb.toStr()
+}
+
+fn distinctRows(rows: [][]Val, seen: mut &Map[str, int], kinds: &[]int): [][]Val {
     var all = rows
     var out: [][]Val = []
     for i in 0..len(all) {
-        let k = rowKey(&all[i])
+        let k = rowKeyIn(&all[i], kinds)
         if seen.get(&k).isSome() { continue }
         seen.put(k, 1)
         append(mut &out, replace(mut &all[i], []))
@@ -12917,7 +13743,7 @@ fn distinctRows(rows: [][]Val, seen: mut &Map[str, int]): [][]Val {
     return out
 }
 
-fn combine(op: int, all: bool, l: [][]Val, r: [][]Val): [][]Val {
+fn combine(op: int, all: bool, l: [][]Val, r: [][]Val, kinds: &[]int): [][]Val {
     var la = l
     var ra = r
     if op == lexdb_sql.SET_UNION {
@@ -12926,22 +13752,22 @@ fn combine(op: int, all: bool, l: [][]Val, r: [][]Val): [][]Val {
             return la
         }
         var seen: Map[str, int] = newMap()
-        var out = distinctRows(la, mut &seen)
-        let more = distinctRows(ra, mut &seen)
+        var out = distinctRows(la, mut &seen, kinds)
+        let more = distinctRows(ra, mut &seen, kinds)
         var mo = more
         for i in 0..len(mo) { append(mut &out, replace(mut &mo[i], [])) }
         return out
     }
     var cnt: Map[str, int] = newMap()
     for row in ra {
-        let k = rowKey(&row)
+        let k = rowKeyIn(&row, kinds)
         let n = cnt.get(&k).unwrapOr(0)
         cnt.put(k, n + 1)
     }
     var out: [][]Val = []
     var done: Map[str, int] = newMap()
     for i in 0..len(la) {
-        let k = rowKey(&la[i])
+        let k = rowKeyIn(&la[i], kinds)
         let n = cnt.get(&k).unwrapOr(0)
         if op == lexdb_sql.SET_INTERSECT {
             if n > 0 {
@@ -12976,7 +13802,7 @@ fn runSet(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params: 
     try rs.hold(rowsBytes(&lres.rows))
     var rres = try runChild(st, txn, &sel.parts[1], &rp, -1, rs, 1)
     try rs.hold(rowsBytes(&rres.rows))
-    return Ok(combine(sel.setop, sel.setAll, replace(mut &lres.rows, []), replace(mut &rres.rows, [])))
+    return Ok(combine(sel.setop, sel.setAll, replace(mut &lres.rows, []), replace(mut &rres.rows, []), &sel.outKinds))
 }
 
 // A recursive CTE: the first query's rows, then rounds of the second over
@@ -12988,7 +13814,7 @@ fn runRecursive(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, lp
     var seen: Map[str, int] = newMap()
     var lres = try runChild(st, txn, &sel.parts[0], lp, -1, rs, 0)
     var work = replace(mut &lres.rows, [])
-    if !sel.setAll { work = distinctRows(work, mut &seen) }
+    if !sel.setAll { work = distinctRows(work, mut &seen, &sel.outKinds) }
     var out: [][]Val = []
     // max_recursion: rounds that add rows (the last round, adding none, is free)
     var rounds = 0
@@ -12999,7 +13825,7 @@ fn runRecursive(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, lp
         cachePut(mut &rs.cache, key, work)
         var rres = try runChild(st, txn, &sel.parts[1], rp, -1, rs, 1)
         work = replace(mut &rres.rows, [])
-        if !sel.setAll { work = distinctRows(work, mut &seen) }
+        if !sel.setAll { work = distinctRows(work, mut &seen, &sel.outKinds) }
         rounds += 1
         if rs.maxRounds > 0 && rounds > rs.maxRounds && len(work) > 0 {
             return Err(e("54001", "recursive query still adding rows after " + rs.maxRounds.toStr() +
@@ -13051,7 +13877,7 @@ fn setLines(sel: &Sel, stats: &[]SubStat): []str {
 // table, with what it did). The counts are kept for every query: an add each.
 fn selectWith(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int,
               lim: Limits, analyze: bool, plan: mut &[]str): Result[Res, DbErr] {
-    var sc = newScope(params, ptypes)
+    var sc = newScopeIn(st, txn, params, ptypes)
     let sel = try planSelect(st, txn, s, params, mut &sc)
     var rs = newRun(&sel.q)
     rs.limit(&lim)
@@ -13114,6 +13940,7 @@ fn execSel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
     // with window calls the rows are kept first, then their values made (9.46)
     let windowed = len(sel.wins) > 0
     if windowed && !sel.aggQ { late = true }
+    if len(sel.feedback) > 0 { late = true }
     var bases: []WinRow = []
     var outRows: []OutRow = []
     // the rows kept here, counted in the row callbacks (they cannot reach rs)
@@ -13128,7 +13955,7 @@ fn execSel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
             if sorting {
                 let none: []Val = []
                 let env = Env{cols: &noCols, row: &vals, aggs: &none, params: params, subs: &m.subs, cur: &none, seq: sqe}
-                for o in sel.order { append(mut &ord, try orderValue(&o, &sel.outs, &vals, &env)) }
+                for oi in 0..len(sel.order) { append(mut &ord, ordVal(sel, oi, try orderValue(&sel.order[oi], &sel.outs, &vals, &env))) }
             }
             held += rowBytes(&ord)
             append(mut &outRows, OutRow{vals: vals, ord: ord})
@@ -13232,12 +14059,12 @@ fn execSel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
             var out: []Val = []
             for x in sel.exprs { append(mut &out, try evalX(st, txn, q, &x, &env, rs)) }
             if sel.distinct {
-                let k = valsKey(&out)
+                let k = valsKeyIn(&out, &sel.outKinds)
                 if seen.get(&k).isSome() { continue }
                 seen.put(k, 1)
             }
             var ord: []Val = []
-            if sorting { for o in sel.order { append(mut &ord, try orderX(st, txn, q, &o, &sel.outs, &out, &env, rs)) } }
+            if sorting { for oi in 0..len(sel.order) { append(mut &ord, ordVal(sel, oi, try orderX(st, txn, q, &sel.order[oi], &sel.outs, &out, &env, rs))) } }
             held += rowBytes(&out) + rowBytes(&ord)
             append(mut &outRows, OutRow{vals: out, ord: ord})
         }
@@ -13252,18 +14079,49 @@ fn execSel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
         if windowed {
             for i in 0..len(raws) { append(mut &bases, WinRow{row: replace(mut &raws[i], []), aggs: []}) }
         }
+        if len(sel.feedback) > 0 {
+            // SELECT @v = f(@v, ...): the rows in their order, each one's
+            // values the parameters of the next
+            var keyed: []OutRow = []
+            for i in 0..len(raws) {
+                let r = replace(mut &raws[i], [])
+                var ord: []Val = []
+                if sorting {
+                    let env = Env{cols: &q.cols, row: &r, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: sqe}
+                    let noVals: []Val = []
+                    for oi in 0..len(sel.order) { append(mut &ord, ordVal(sel, oi, try orderX(st, txn, q, &sel.order[oi], &sel.outs, &noVals, &env, rs))) }
+                }
+                append(mut &keyed, OutRow{vals: r, ord: ord})
+            }
+            if sorting { collections.sortBy(mut &keyed, fn(a: &OutRow, b: &OutRow): int { return ordCmp(sel, &a.ord, &b.ord) }) }
+            var pv = copyRow(params)
+            for kr in keyed {
+                var vals: []Val = []
+                {
+                    let env = Env{cols: &q.cols, row: &kr.vals, aggs: &noAggs, params: &pv, subs: &m.subs, cur: &noAggs, seq: sqe}
+                    for x in sel.exprs { append(mut &vals, try evalX(st, txn, q, &x, &env, rs)) }
+                }
+                for i in 0..len(sel.feedback) {
+                    let k = sel.feedback[i]
+                    if k > 0 && k <= len(pv) && i < len(vals) { pv[k - 1] = vals[i] }
+                }
+                held += rowBytes(&vals)
+                append(mut &outRows, OutRow{vals: vals, ord: []})
+            }
+            raws = []
+        }
         for r in raws {
             if windowed { break }
             let env = Env{cols: &q.cols, row: &r, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: sqe}
             var vals: []Val = []
             for x in sel.exprs { append(mut &vals, try evalX(st, txn, q, &x, &env, rs)) }
             if sel.distinct {
-                let k = valsKey(&vals)
+                let k = valsKeyIn(&vals, &sel.outKinds)
                 if seen.get(&k).isSome() { continue }
                 seen.put(k, 1)
             }
             var ord: []Val = []
-            if sorting { for o in sel.order { append(mut &ord, try orderX(st, txn, q, &o, &sel.outs, &vals, &env, rs)) } }
+            if sorting { for oi in 0..len(sel.order) { append(mut &ord, ordVal(sel, oi, try orderX(st, txn, q, &sel.order[oi], &sel.outs, &vals, &env, rs))) } }
             held += rowBytes(&vals) + rowBytes(&ord)
             append(mut &outRows, OutRow{vals: vals, ord: ord})
         }
@@ -13278,12 +14136,12 @@ fn execSel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
             var vals: []Val = []
             for x in sel.exprs { append(mut &vals, try eval(&x, &env)) }
             if sel.distinct {
-                let k = valsKey(&vals)
+                let k = valsKeyIn(&vals, &sel.outKinds)
                 if seen.get(&k).isSome() { return Ok(true) }
                 seen.put(k, 1)
             }
             var ord: []Val = []
-            if sorting { for o in sel.order { append(mut &ord, try orderValue(&o, &sel.outs, &vals, &env)) } }
+            if sorting { for oi in 0..len(sel.order) { append(mut &ord, ordVal(sel, oi, try orderValue(&sel.order[oi], &sel.outs, &vals, &env))) } }
             if topK >= 0 {
                 if topK == 0 { return Ok(true) }
                 // after the last kept, or tied with it: the full sort puts it after
@@ -13311,19 +14169,20 @@ fn execSel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
             var vals: []Val = []
             for x in sel.exprs { append(mut &vals, try evalX(st, txn, q, &x, &env, rs)) }
             if sel.distinct {
-                let k = valsKey(&vals)
+                let k = valsKeyIn(&vals, &sel.outKinds)
                 if seen.get(&k).isSome() { continue }
                 seen.put(k, 1)
             }
             var ord: []Val = []
-            if sorting { for o in sel.order { append(mut &ord, try orderX(st, txn, q, &o, &sel.outs, &vals, &env, rs)) } }
+            if sorting { for oi in 0..len(sel.order) { append(mut &ord, ordVal(sel, oi, try orderX(st, txn, q, &sel.order[oi], &sel.outs, &vals, &env, rs))) } }
             held += rowBytes(&vals) + rowBytes(&ord)
             append(mut &outRows, OutRow{vals: vals, ord: ord})
         }
     }
     try rs.hold(held)
     if hasSrfCall(&sel.exprs) { try expandSrfs(mut &outRows, &sel.outs) }
-    if sorting { collections.sortBy(mut &outRows, fn(a: &OutRow, b: &OutRow): int { return ordCmp(sel, &a.ord, &b.ord) }) }
+    // (rows assigned in their order are in it already)
+    if sorting && len(sel.feedback) == 0 { collections.sortBy(mut &outRows, fn(a: &OutRow, b: &OutRow): int { return ordCmp(sel, &a.ord, &b.ord) }) }
     if sorting && sel.donKey > 0 {
         // DISTINCT ON (9.94): the first row of each run of equal keys
         var kept: []OutRow = []
@@ -13341,18 +14200,25 @@ fn execSel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
     var outs: []OutCol = []
     for oc in sel.outs { append(mut &outs, oc) }
     var res = Res{cols: outs, rows: [], tag: "", hasRows: true, copy: COPY_NONE}
+    // TOP n PERCENT: n percent of the rows, rounded up; WITH TIES: then the
+    // rows that sort as the last one does
+    var cut = limit
+    if sel.topMode & lexdb_sql.TOP_PERCENT != 0 {
+        if sel.topN < 0 || sel.topN > 100 { return Err(e("TS1031", "Percent values must be between 0 and 100.")) }
+        cut = (len(outRows) * sel.topN + 99) / 100
+    } else if sel.topMode != 0 { cut = sel.topN }
+    let ties = sel.topMode & lexdb_sql.TOP_TIES != 0 || (sel.withTies && sorting)
     var i = 0
-    var lastOrd = -1                    // WITH TIES: the last row given
-    for ri in 0..len(outRows) {
-        let r = &outRows[ri]
+    var lastAt = -1
+    for k in 0..len(outRows) {
         if i >= offset || offset < 0 {
-            if limit >= 0 && len(res.rows) >= limit {
-                if !(sel.withTies && sorting && lastOrd >= 0 && ordCmp(sel, &r.ord, &outRows[lastOrd].ord) == 0) { break }
+            if cut >= 0 && len(res.rows) >= cut {
+                if !ties || lastAt < 0 || ordCmp(sel, &outRows[k].ord, &outRows[lastAt].ord) != 0 { break }
             }
             var vs: []Val = []
-            for v in r.vals { append(mut &vs, v) }
+            for v in outRows[k].vals { append(mut &vs, v) }
             append(mut &res.rows, vs)
-            lastOrd = ri
+            lastAt = k
         }
         i += 1
     }
@@ -13458,7 +14324,7 @@ fn guessParams(st: &lexdb_store.Store, s: &lexdb_sql.Stmt, out: mut &[]int, path
     if s.kind != lexdb_sql.S_SELECT && s.kind != lexdb_sql.S_UPDATE && s.kind != lexdb_sql.S_DELETE { return }
     let np: []Val = array(len(out), Val.Null)
     let noTypes: []int = []
-    var sc = newScope(&np, &noTypes)
+    var sc = newScopeIn(st, &txn, &np, &noTypes)
     let built = if s.kind == lexdb_sql.S_SELECT { buildQuery(st, mut &txn, &s.from, &s.where, &np, &s.subs, mut &sc, false) } else {
         match dmlFrom(s) {
             Ok(from) { buildQuery(st, mut &txn, &from, &s.where, &np, &s.subs, mut &sc, false) }
@@ -13526,7 +14392,7 @@ pub fn returnsRows(s: &lexdb_sql.Stmt): bool {
 // The columns a statement returns (none unless it is a SELECT, EXPLAIN,
 // SHOW, or has RETURNING).
 fn describe(st: &lexdb_store.Store, s: &lexdb_sql.Stmt, ptypes: &[]int, path: &[]str): Result[[]OutCol, DbErr] {
-    if s.kind == lexdb_sql.S_EXPLAIN { return Ok([OutCol{name: "QUERY PLAN", oid: lexdb_sql.OID_TEXT}]) }
+    if s.kind == lexdb_sql.S_EXPLAIN { return Ok([OutCol{name: "QUERY PLAN", oid: lexdb_sql.OID_TEXT, spell: "", coll: "", scale: -1}]) }
     if s.kind == lexdb_sql.S_SHOW { return Ok(showCols(&s.table)) }
     let dml = s.kind == lexdb_sql.S_INSERT || s.kind == lexdb_sql.S_UPDATE || s.kind == lexdb_sql.S_DELETE
     if s.kind != lexdb_sql.S_SELECT && !(dml && len(s.items) > 0) { return Ok([]) }
@@ -13536,7 +14402,7 @@ fn describe(st: &lexdb_store.Store, s: &lexdb_sql.Stmt, ptypes: &[]int, path: &[
     if dml {
         let none: Option[Expr] = None
         let np: []Val = array(if s.params > len(ptypes) { s.params } else { len(ptypes) }, Val.Null)
-        var sc = newScope(&np, ptypes)
+        var sc = newScopeIn(st, &txn, &np, ptypes)
         let from = if s.kind == lexdb_sql.S_INSERT { oneTable(&s.table) } else { try dmlFrom(s) }
         let q = try buildQuery(st, mut &txn, &from, &none, &np, &s.subs, mut &sc, false)
         var exprs: []Expr = []
@@ -13544,7 +14410,7 @@ fn describe(st: &lexdb_store.Store, s: &lexdb_sql.Stmt, ptypes: &[]int, path: &[
     }
     if s.setop != 0 {
         let np: []Val = array(if s.params > len(ptypes) { s.params } else { len(ptypes) }, Val.Null)
-        var sc = newScope(&np, ptypes)
+        var sc = newScopeIn(st, &txn, &np, ptypes)
         let sel = try planSelect(st, mut &txn, s, &np, mut &sc)
         var outs: []OutCol = []
         for o in sel.outs { append(mut &outs, o) }
@@ -13552,7 +14418,7 @@ fn describe(st: &lexdb_store.Store, s: &lexdb_sql.Stmt, ptypes: &[]int, path: &[
     }
     let none: Option[Expr] = None
     let np: []Val = array(if s.params > len(ptypes) { s.params } else { len(ptypes) }, Val.Null)
-    var sc = newScope(&np, ptypes)
+    var sc = newScopeIn(st, &txn, &np, ptypes)
     let q = try buildQuery(st, mut &txn, &s.from, &none, &np, &s.subs, mut &sc, false)
     var exprs: []Expr = []
     return selectCols(s, &q.cols, mut &sc, mut &exprs)
@@ -13677,9 +14543,9 @@ fn (s: mut &Session) setPath(names: &[]str) {
 
 // SHOW's columns: the setting's name, or SHOW ALL's name and setting.
 fn showCols(name: &str): []OutCol {
-    if name == "all" { return [OutCol{name: "name", oid: lexdb_sql.OID_TEXT}, OutCol{name: "setting", oid: lexdb_sql.OID_TEXT}] }
-    if name == "timezone" { return [OutCol{name: "TimeZone", oid: lexdb_sql.OID_TEXT}] }
-    return [OutCol{name: name, oid: lexdb_sql.OID_TEXT}]
+    if name == "all" { return [OutCol{name: "name", oid: lexdb_sql.OID_TEXT, spell: "", coll: "", scale: -1}, OutCol{name: "setting", oid: lexdb_sql.OID_TEXT, spell: "", coll: "", scale: -1}] }
+    if name == "timezone" { return [OutCol{name: "TimeZone", oid: lexdb_sql.OID_TEXT, spell: "", coll: "", scale: -1}] }
+    return [OutCol{name: name, oid: lexdb_sql.OID_TEXT, spell: "", coll: "", scale: -1}]
 }
 
 fn (s: &Session) setting(name: &str): Option[str] {
@@ -13957,6 +14823,8 @@ pub fn (s: mut &Session) close() {
     // its temporary objects (9.96); should this fail, the next start drops them
     if len(s.tmp) > 0 { let r = s.dropTemps() }
     advRelease(&s.st, s.id, true)
+    s.st.memoDel(&collKey(s.id))
+    s.st.memoDel(&identKey(s.id))
 }
 
 // Its temporary objects dropped, in a transaction of their own (tried
@@ -14754,7 +15622,7 @@ fn refRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, c: &Table, cols: &
     var sc = Scan{empty: false, point: false, lo: "", hi: "", whole: false}
     if prefixSame(&c.pk, n, cols) {
         var b = newStrBuf()
-        for j in 0..n { encKeyPart(mut &b, &crow[c.pk[j]]) }
+        for j in 0..n { encKeyPart(mut &b, &collKeyVal(&c.cols[c.pk[j]], &crow[c.pk[j]])) }
         let pre = b.toStr()
         sc.lo = pre
         sc.hi = succ(&pre)
@@ -14762,7 +15630,7 @@ fn refRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, c: &Table, cols: &
         for k in 0..len(c.indexes) {
             if path.index < 0 && c.indexes[k].pred.isNone() && prefixSame(&c.indexes[k].cols, n, cols) {
                 var b = newStrBuf()
-                for j in 0..n { encIdxPart(mut &b, &crow[c.indexes[k].cols[j]]) }
+                for j in 0..n { encIdxPart(mut &b, &collKeyVal(&c.cols[c.indexes[k].cols[j]], &crow[c.indexes[k].cols[j]])) }
                 let pre = b.toStr()
                 path.index = k
                 sc.lo = pre
@@ -15808,7 +16676,7 @@ fn boundSeq(q: &SeqEnv, name: &str, f: &str): Result[Seq, DbErr] {
     return Err(e("0A000", "lexdb: " + f + " takes its sequence's name as a literal ('name')"))
 }
 
-fn isSeqFn(name: &str): bool { return name == "nextval" || name == "currval" || name == "setval" || name == "lastval" }
+fn isSeqFn(name: &str): bool { return name == "nextval" || name == "currval" || name == "setval" || name == "lastval" || name == "scope_identity" }
 
 // ---- advisory locks (9.86)
 //
@@ -15908,6 +16776,14 @@ fn seqCall(name: &str, vs: &[]Val, env: &Env): Result[Val, DbErr] {
     match env.seq {
         None { return Err(e("0A000", "lexdb: " + name + " is not allowed here")) }
         Some(q) {
+            if name == "scope_identity" {
+                // T-SQL's SCOPE_IDENTITY(): the session's last identity (or
+                // sequence) value, NULL before one (design/lexdb-tds.md S3)
+                match q.st.memoGet(&lastKey(q.sess)) {
+                    Some(v) { return Ok(Val.Num(Decimal.fromInt(num(&v)))) }
+                    None { return Ok(Val.Null) }
+                }
+            }
             if name == "lastval" {
                 if len(vs) != 0 { return Err(e("42883", "function lastval takes no arguments")) }
                 match q.st.memoGet(&lastKey(q.sess)) {
@@ -16280,7 +17156,7 @@ fn copyStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
     }
     var cols: []OutCol = []
     for i in targets {
-        append(mut &cols, OutCol{name: t.cols[i].name, oid: t.cols[i].typ.oid})
+        append(mut &cols, OutCol{name: t.cols[i].name, oid: t.cols[i].typ.oid, spell: t.cols[i].spell, coll: t.cols[i].coll, scale: -1})
         append(mut &names, t.cols[i].name)
     }
     if !input.have { return Ok(Res{cols: cols, rows: [], tag: "", hasRows: false, copy: COPY_IN}) }
@@ -16596,7 +17472,7 @@ fn copyOut(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
 // each, given to out in parts of about 64 kB; the rows are not kept.
 fn copyStream(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int,
               lim: Limits, out: &fn(int, &[]byte): bool): Result[Res, DbErr] {
-    var sc = newScope(params, ptypes)
+    var sc = newScopeIn(st, txn, params, ptypes)
     let sel = try planSelect(st, txn, &s.inner[0], params, mut &sc)
     let n = len(sel.outs)
     var names: []str = []
@@ -16876,7 +17752,7 @@ fn mergeWin(d: &lexdb_sql.WinDef, named: &[]lexdb_sql.NamedWin, depth: int): Res
 }
 
 fn noSpec(): AggSpec {
-    return AggSpec{fname: "", args: [], star: false, distinct: false, filter: None, order: [], dirs: "", text: ""}
+    return AggSpec{fname: "", args: [], star: false, distinct: false, filter: None, order: [], dirs: "", text: "", kind: lexdb_sql.COLL_EXACT}
 }
 
 fn modeName(m: int): str {
@@ -18514,6 +19390,9 @@ fn batchGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
         if !boolLike(cc.typ) { return Ok(false) }
         append(mut &conds, takeN(cc))
     }
+    // keys and aggregates under a collation's keys (L2): the row path's
+    for k in sel.groupKinds { if k != lexdb_sql.COLL_EXACT { return Ok(false) } }
+    for sp in sel.specs { if sp.kind != lexdb_sql.COLL_EXACT { return Ok(false) } }
     var keys: []BComp = []
     for x in sel.groupBy {
         let c = bCompile(&x, q, &kinds, &env)
@@ -19156,10 +20035,11 @@ fn shownIn(path: &[]str, schema: &str, name: &str): str {
     return quoteIfNeeded(schema) + "." + quoteIfNeeded(name)
 }
 
-// shownIn, a name a temporary relation hides (tnames, 9.96) qualified.
-fn shownBy(path: &[]str, tnames: &[]str, schema: &str, name: &str): str {
-    if len(tnames) > 0 && !lexdb_base.isTempSchema(schema) && hasStr(tnames, name) { return quoteIfNeeded(schema) + "." + quoteIfNeeded(name) }
-    return shownIn(path, schema, name)
+// shownIn, a name a temporary relation hides (tnames, 9.96) qualified;
+// spelt, the name as written (L6).
+fn shownBy(path: &[]str, tnames: &[]str, schema: &str, name: &str, spelt: &str): str {
+    if len(tnames) > 0 && !lexdb_base.isTempSchema(schema) && hasStr(tnames, name) { return quoteIfNeeded(schema) + "." + quoteIfNeeded(spelt) }
+    return shownIn(path, schema, spelt)
 }
 
 fn colNum(t: &Table, name: &str): int {
@@ -19196,7 +20076,7 @@ fn colOpts(t: &Table, ix: &CatIdx): str {
             p = if call { x } else { "(" + x + ")" }
         } else {
             if n < 1 || n > len(t.cols) { continue }
-            p = quoteIfNeeded(&t.cols[n - 1].name)
+            p = quoteIfNeeded(&colShown(&t.cols[n - 1]))
         }
         if k < len(ix.opts) && len(ix.opts[k]) > 0 { p = p + " " + ix.opts[k] }
         append(mut &parts, p)
@@ -19218,7 +20098,7 @@ fn indOptions(ix: &CatIdx): Val {
 
 fn colList(t: &Table, nums: &[]int): str {
     var parts: []str = []
-    for n in nums { if n >= 1 && n <= len(t.cols) { append(mut &parts, quoteIfNeeded(&t.cols[n - 1].name)) } }
+    for n in nums { if n >= 1 && n <= len(t.cols) { append(mut &parts, quoteIfNeeded(&colShown(&t.cols[n - 1]))) } }
     return strings.join(&parts, ", ")
 }
 
@@ -19365,9 +20245,10 @@ fn catSnap(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[CatSnap, D
         let t = try decTable(&keys[i], &raw[i])
         let schema = lexdb_sql.schemaOf(&keys[i])
         let name = lexdb_sql.baseName(&keys[i])
+        let spelt = if len(t.spell) > 0 { t.spell } else { name }      // as written (L6)
         if len(t.view) > 0 {
             append(mut &snap.views, CatTab{key: keys[i], t: t, oid: catOid(&"r", &keys[i]), schema: schema, name: name,
-                                           shown: shownBy(&txn.path, &tnames, &schema, &name), idxs: []})
+                                           shown: shownBy(&txn.path, &tnames, &schema, &name, &spelt), idxs: []})
             continue
         }
         var idxs: []CatIdx = []
@@ -19391,7 +20272,7 @@ fn catSnap(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[CatSnap, D
                                      primary: false, con: ix.con, pred: cloneOptE(&ix.pred), opts: copyStrs(&ix.opts), exprs: xs})
         }
         append(mut &snap.tabs, CatTab{key: keys[i], t: t, oid: catOid(&"r", &keys[i]), schema: schema, name: name,
-                                      shown: shownBy(&txn.path, &tnames, &schema, &name), idxs: idxs})
+                                      shown: shownBy(&txn.path, &tnames, &schema, &name, &spelt), idxs: idxs})
     }
     // the constraints, now that every table's OID is known
     var cons: []CatCon = []
@@ -19598,7 +20479,7 @@ fn relOidOf(se: &SeqEnv, s: &str): int {
         else if c == '.' && !q {
             append(mut &parts, cur.toStr())
             cur = newStrBuf()
-        } else { cur.addByte(if !q && c >= 'A' && c <= 'Z' { c + 32 } else { c }) }
+        } else { cur.addByte(if c >= 'A' && c <= 'Z' { c + 32 } else { c }) }     // quoted or not: names match folded (L6)
     }
     append(mut &parts, cur.toStr())
     if len(parts) == 2 { sc = parts[0] }
@@ -19856,6 +20737,160 @@ fn jsonText(v: &Val): str {
             b.addByte('"')
             return b.toStr()
         }
+    }
+}
+
+// ---- collations (design/lexdb-tds.md L2)
+
+// The key of a text under SQL Server's default collation (L2): equal for
+// texts it holds equal, in its order, byte by byte. From lexdb_sqlcoll's
+// table (generated from SQL Server): a combining mark after a letter
+// composed with it where there is one letter for both; trailing spaces and
+// ignored characters dropped; then each letter's primary weight (3 bytes;
+// an expansion, as ae for ae's ligature, two), 0 0 0, each letter's
+// secondary weight (its accent: 2 bytes; a combining mark left over adds
+// to its letter's), and each hyphen-like mark: how many letters before it
+// (2 bytes), its weight. Case is in none of them.
+pub fn ciKey(s: &str): str {
+    var cps: []int = []
+    var i = 0
+    while i < len(s) {
+        let d = strings.decodeAt(s, i)
+        i += d.size
+        let r = d.rune
+        let n = len(cps)
+        if n > 0 && collClass(collAt(r)) == 2 {
+            let c = collCompose(cps[n - 1], r)
+            if c >= 0 && collClass(collAt(c)) == 1 {
+                cps[n - 1] = c
+                continue
+            }
+        }
+        append(mut &cps, r)
+    }
+    while len(cps) > 0 && (cps[len(cps) - 1] == 32 || collClass(collAt(cps[len(cps) - 1])) == 0) { let x = pop(mut &cps) }
+    var prim = newStrBuf()
+    var sec: []int = []
+    var spec = newStrBuf()
+    for cp in cps {
+        let v = collAt(cp)
+        let k = collClass(v)
+        if k == 0 { continue }
+        if k == 2 {
+            if len(sec) > 0 { sec[len(sec) - 1] += 1000 + (v & 0xFFFFFF) }
+            continue
+        }
+        if k == 3 {
+            binary.addU16BE(mut &spec, len(sec))
+            spec.addByte(byte(v & 0xFF))
+            continue
+        }
+        let e = collExpansion(cp)
+        if e >= 0 {
+            let at = int(lexdb_sqlcoll.EXP_AT[e])
+            for j in 0..int(lexdb_sqlcoll.EXP_N[e]) {
+                let el = int(lexdb_sqlcoll.EXP_EL[at + j])
+                addU24(mut &prim, el >> 8)
+                append(mut &sec, el & 0xFF)
+            }
+        } else if v < 0 {
+            addU24(mut &prim, (1 << 20) + cp)       // not in the table: after all of it
+            append(mut &sec, 0)
+        } else {
+            addU24(mut &prim, (v >> 8) & 0xFFFF)
+            append(mut &sec, v & 0xFF)
+        }
+    }
+    addU24(mut &prim, 0)
+    for x in sec { binary.addU16BE(mut &prim, x + 1) }
+    prim.add(spec.toStr())
+    return prim.toStr()
+}
+
+fn addU24(b: mut &StrBuf, x: int) {
+    b.addByte(byte((x >> 16) & 0xFF))
+    b.addByte(byte((x >> 8) & 0xFF))
+    b.addByte(byte(x & 0xFF))
+}
+
+// A code point's value in lexdb_sqlcoll's table (kind << 24 | data), -1
+// if it is in none of its runs.
+fn collAt(cp: int): int {
+    if cp >= 0 && cp < 128 { return int(lexdb_sqlcoll.ASCII[cp]) }
+    var lo = 0
+    var hi = len(lexdb_sqlcoll.RUN_START)
+    while lo < hi {
+        let m = (lo + hi) / 2
+        if int(lexdb_sqlcoll.RUN_START[m]) <= cp { lo = m + 1 } else { hi = m }
+    }
+    let i = lo - 1
+    if i < 0 { return -1 }
+    let st = int(lexdb_sqlcoll.RUN_START[i])
+    if cp >= st + int(lexdb_sqlcoll.RUN_LEN[i]) { return -1 }
+    return int(lexdb_sqlcoll.RUN_VAL[i]) + (cp - st) * int(lexdb_sqlcoll.RUN_STEP[i])
+}
+
+// Its kind: 0 ignored, 1 a letter (one not in the table too), 2 a
+// combining mark, 3 hyphen-like.
+fn collClass(v: int): int { return if v < 0 { 1 } else { v >> 24 } }
+
+// The letter a letter and a combining mark make, -1 none.
+fn collCompose(base: int, mark: int): int {
+    var lo = 0
+    var hi = len(lexdb_sqlcoll.COMP_BASE)
+    while lo < hi {
+        let m = (lo + hi) / 2
+        let b = int(lexdb_sqlcoll.COMP_BASE[m])
+        let k = int(lexdb_sqlcoll.COMP_MARK[m])
+        if b < base || (b == base && k < mark) { lo = m + 1 } else { hi = m }
+    }
+    if lo < len(lexdb_sqlcoll.COMP_BASE) && int(lexdb_sqlcoll.COMP_BASE[lo]) == base && int(lexdb_sqlcoll.COMP_MARK[lo]) == mark {
+        return int(lexdb_sqlcoll.COMP_TO[lo])
+    }
+    return -1
+}
+
+// An expansion's number, -1 if cp is none.
+fn collExpansion(cp: int): int {
+    var lo = 0
+    var hi = len(lexdb_sqlcoll.EXP_CP)
+    while lo < hi {
+        let m = (lo + hi) / 2
+        if int(lexdb_sqlcoll.EXP_CP[m]) < cp { lo = m + 1 } else { hi = m }
+    }
+    if lo < len(lexdb_sqlcoll.EXP_CP) && int(lexdb_sqlcoll.EXP_CP[lo]) == cp { return lo }
+    return -1
+}
+
+// A text's key under SQL Server's case-sensitive collations: its trailing
+// spaces dropped.
+pub fn padKey(s: &str): str {
+    var end = len(s)
+    while end > 0 && s[end - 1] == ' ' { end -= 1 }
+    return s[0..end].toStr()
+}
+
+// A text with its case folded as ciKey folds it, its spaces kept.
+fn ciFold(s: &str): str {
+    var ascii = true
+    for i in 0..len(s) { if s[i] >= 128 { ascii = false } }
+    if ascii { return strings.toLowerAscii(s) }
+    var b = newStrBuf()
+    var i = 0
+    while i < len(s) {
+        let d = strings.decodeAt(s, i)
+        strings.addRune(mut &b, unicode.lower(unicode.upper(d.rune)))
+        i += d.size
+    }
+    return b.toStr()
+}
+
+// A value's key under a case-insensitive collation: a text's ciKey; any
+// other value as it is.
+fn ciVal(v: &Val): Val {
+    match v {
+        Val.Text(s) { return Val.Text(ciKey(&s)) }
+        else { return v }
     }
 }
 
@@ -20767,6 +21802,22 @@ fn sessCall(name: &str, vs: &[]Val, env: &Env): Result[Val, DbErr] {
 
 fn callMisc(name: &str, vs: &[]Val): Result[Option[Val], DbErr] {
     let n = len(vs)
+    // x COLLATE name: x (its collation used when planned); #ci(x): its key
+    if (name == "#collate" || name == "#coll") && n == 2 { return Ok(Some(vs[0])) }
+    if name == "#ci" && n == 1 { return Ok(Some(ciVal(&vs[0]))) }
+    if name == "#pad" && n == 1 {
+        match vs[0] {
+            Val.Text(t) { return Ok(Some(Val.Text(padKey(&t)))) }
+            else { return Ok(Some(vs[0])) }
+        }
+    }
+    if name == "#cifold" && n == 1 {
+        // LIKE's operands under a case-insensitive collation: case folded, spaces kept
+        match vs[0] {
+            Val.Text(t) { return Ok(Some(Val.Text(ciFold(&t)))) }
+            else { return Ok(Some(vs[0])) }
+        }
+    }
     if name == "~" || name == "!~" || name == "~*" || name == "!~*" {
         if n != 2 { return Ok(None) }
         if isNull(&vs[0]) || isNull(&vs[1]) { return Ok(Some(Val.Null)) }
@@ -20915,6 +21966,20 @@ fn callMisc(name: &str, vs: &[]Val): Result[Option[Val], DbErr] {
 // The functions that read the bound catalog: None if name is none of them.
 fn callCat(name: &str, vs: &[]Val, se: &SeqEnv): Result[Option[Val], DbErr] {
     let n = len(vs)
+    if name == "#object_id" {
+        // T-SQL's OBJECT_ID(name): a relation's id, NULL if there is none
+        // ([brackets], dbo., a database's name and #temporary names read)
+        if n < 1 || isNull(&vs[0]) { return Ok(Some(Val.Null)) }
+        let full = strings.replaceAll(strings.replaceAll(text(&vs[0]), "[", ""), "]", "")
+        let parts = strings.split(&full, ".")
+        let nm = parts[len(parts) - 1].toStr()
+        let sc = if len(parts) >= 2 { strings.toLowerAscii(parts[len(parts) - 2]) } else { "" }
+        var look = "\"" + strings.replaceAll(strings.toLowerAscii(&nm), "\"", "\"\"") + "\""
+        if isTempName(&strings.toLowerAscii(&nm)) { look = "\"" + tempSchema(se.sess) + "\"." + look }
+        else if sc != "" && sc != "dbo" { look = "\"" + sc + "\"." + look }
+        let o = relOidOf(se, &look)
+        return Ok(Some(if o == 0 { Val.Null } else { Val.Int(o) }))
+    }
     if name == "current_user" { return Ok(Some(Val.Text(catUser(se)))) }
     if name == "session_user" {
         for l in catLines(se, &"U") { return Ok(Some(Val.Text(l[0]))) }
@@ -21130,7 +22195,7 @@ fn catRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &str): Result
                 let hasIdx = len(ct.idxs) > 0
                 let trig = len(ct.t.fks) > 0 || len(ct.t.refBy) > 0
                 let ta = aclOf(&snap, &relObj(&ct.key))
-                append(mut &rows, [iv(ct.oid), tv(&ct.name), iv(nspOid(&ct.schema)), iv(0), iv(0), iv(roleOid(&ownerName(&snap, &ta), &roles)), iv(2), iv(ct.oid), iv(0),
+                append(mut &rows, [iv(ct.oid), tv(&(if len(ct.t.spell) > 0 { ct.t.spell } else { ct.name })), iv(nspOid(&ct.schema)), iv(0), iv(0), iv(roleOid(&ownerName(&snap, &ta), &roles)), iv(2), iv(ct.oid), iv(0),
                                    iv(0), Val.Real(-1.0f), iv(0), iv(0), bv(hasIdx), bv(false), tv(&persistOf(&ct.schema)), tv(&"r"), iv(len(ct.t.cols) - (if rowidKeyed(&ct.t) { 1 } else { 0 })),
                                    iv(len(ct.t.checks)), bv(false), bv(trig), bv(false), bv(false), bv(false), bv(true), tv(&"d"),
                                    bv(false), iv(0), iv(0), iv(0), aclText(&snap, &ta, &"arwdDxt"), Val.Null, Val.Null])
@@ -21143,7 +22208,7 @@ fn catRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &str): Result
             }
             for v in snap.views {
                 let va = aclOf(&snap, &relObj(&v.key))
-                append(mut &rows, [iv(v.oid), tv(&v.name), iv(nspOid(&v.schema)), iv(0), iv(0), iv(roleOid(&ownerName(&snap, &va), &roles)), iv(0), iv(0), iv(0),
+                append(mut &rows, [iv(v.oid), tv(&(if len(v.t.spell) > 0 { v.t.spell } else { v.name })), iv(nspOid(&v.schema)), iv(0), iv(0), iv(roleOid(&ownerName(&snap, &va), &roles)), iv(0), iv(0), iv(0),
                                    iv(0), Val.Real(-1.0f), iv(0), iv(0), bv(false), bv(false), tv(&persistOf(&v.schema)), tv(&"v"), iv(len(v.t.cols)),
                                    iv(0), bv(true), bv(false), bv(false), bv(false), bv(false), bv(true), tv(&"n"),
                                    bv(false), iv(0), iv(0), iv(0), aclText(&snap, &va, &"arwdDxt"), Val.Null, Val.Null])
@@ -21176,21 +22241,21 @@ fn catRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &str): Result
                     if c.name == ROWID { continue }
                     var nn = c.notNull
                     for p in ct.t.pk { if p == i { nn = true } }
-                    append(mut &rows, attRow(ct.oid, &c.name, c.typ.oid, typmodOf(&c.typ), i + 1, nn, defaultText(&snap, c).isSome(), identOf(c)))
+                    append(mut &rows, attRow(ct.oid, &colShown(c), c.typ.oid, typmodOf(&c.typ), i + 1, nn, defaultText(&snap, c).isSome(), identOf(c)))
                 }
                 for ix in ct.idxs {
                     for k in 0..len(ix.cols) {
                         let cn = ix.cols[k]
                         if cn < 1 || cn > len(ct.t.cols) { continue }
                         let c = &ct.t.cols[cn - 1]
-                        append(mut &rows, attRow(ix.oid, &c.name, c.typ.oid, typmodOf(&c.typ), k + 1, false, false, ""))
+                        append(mut &rows, attRow(ix.oid, &colShown(c), c.typ.oid, typmodOf(&c.typ), k + 1, false, false, ""))
                     }
                 }
             }
             for v in snap.views {
                 for i in 0..len(v.t.cols) {
                     let c = &v.t.cols[i]
-                    append(mut &rows, attRow(v.oid, &c.name, c.typ.oid, typmodOf(&c.typ), i + 1, false, false, ""))
+                    append(mut &rows, attRow(v.oid, &colShown(c), c.typ.oid, typmodOf(&c.typ), i + 1, false, false, ""))
                 }
             }
             for r in lexdb_pgcat.relNames() {
@@ -21318,13 +22383,13 @@ fn catRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &str): Result
         }
         "pg_tables" {
             for ct in snap.tabs {
-                append(mut &rows, [tv(&ct.schema), tv(&ct.name), tv(&ownerName(&snap, &aclOf(&snap, &relObj(&ct.key)))), Val.Null, bv(len(ct.idxs) > 0), bv(false),
+                append(mut &rows, [tv(&ct.schema), tv(&(if len(ct.t.spell) > 0 { ct.t.spell } else { ct.name })), tv(&ownerName(&snap, &aclOf(&snap, &relObj(&ct.key)))), Val.Null, bv(len(ct.idxs) > 0), bv(false),
                                    bv(len(ct.t.fks) > 0 || len(ct.t.refBy) > 0), bv(false)])
             }
         }
         "pg_indexes" {
             for ct in snap.tabs {
-                for ix in ct.idxs { append(mut &rows, [tv(&ct.schema), tv(&ct.name), tv(&ix.name), Val.Null, tv(&idxDef(&ct, &ix))]) }
+                for ix in ct.idxs { append(mut &rows, [tv(&ct.schema), tv(&(if len(ct.t.spell) > 0 { ct.t.spell } else { ct.name })), tv(&ix.name), Val.Null, tv(&idxDef(&ct, &ix))]) }
             }
         }
         "pg_sequences" {
@@ -21342,11 +22407,11 @@ fn catRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &str): Result
         }
         "information_schema.tables" {
             for ct in snap.tabs {
-                append(mut &rows, [tv(&db), tv(&ct.schema), tv(&ct.name), tv(&if persistOf(&ct.schema) == "t" { "LOCAL TEMPORARY" } else { "BASE TABLE" }), Val.Null, Val.Null, Val.Null, Val.Null, Val.Null,
+                append(mut &rows, [tv(&db), tv(&ct.schema), tv(&(if len(ct.t.spell) > 0 { ct.t.spell } else { ct.name })), tv(&if persistOf(&ct.schema) == "t" { "LOCAL TEMPORARY" } else { "BASE TABLE" }), Val.Null, Val.Null, Val.Null, Val.Null, Val.Null,
                                    tv(&"YES"), tv(&"NO"), Val.Null])
             }
             for v in snap.views {
-                append(mut &rows, [tv(&db), tv(&v.schema), tv(&v.name), tv(&"VIEW"), Val.Null, Val.Null, Val.Null, Val.Null, Val.Null,
+                append(mut &rows, [tv(&db), tv(&v.schema), tv(&(if len(v.t.spell) > 0 { v.t.spell } else { v.name })), tv(&"VIEW"), Val.Null, Val.Null, Val.Null, Val.Null, Val.Null,
                                    tv(&"NO"), tv(&"NO"), Val.Null])
             }
         }
@@ -21374,7 +22439,7 @@ fn catRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &str): Result
                         for k in 0..len(g.privs) {
                             let pn = privName(&g.privs[k..k + 1])
                             if len(pn) == 0 { continue }
-                            append(mut &rows, [tv(&o), tv(&(if len(g.to) > 0 { g.to } else { "PUBLIC" })), tv(&db), tv(&ct.schema), tv(&ct.name), tv(&pn),
+                            append(mut &rows, [tv(&o), tv(&(if len(g.to) > 0 { g.to } else { "PUBLIC" })), tv(&db), tv(&ct.schema), tv(&(if len(ct.t.spell) > 0 { ct.t.spell } else { ct.name })), tv(&pn),
                                                tv(&(if g.to == o { "YES" } else { "NO" })), tv(&(if pn == "SELECT" { "YES" } else { "NO" }))])
                         }
                     }
@@ -21383,12 +22448,12 @@ fn catRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &str): Result
         }
         "information_schema.views" {
             for v in snap.views {
-                append(mut &rows, [tv(&db), tv(&v.schema), tv(&v.name), tv(&(v.t.view + ";")), tv(&"NONE"), tv(&"NO"), tv(&"NO"),
+                append(mut &rows, [tv(&db), tv(&v.schema), tv(&(if len(v.t.spell) > 0 { v.t.spell } else { v.name })), tv(&(v.t.view + ";")), tv(&"NONE"), tv(&"NO"), tv(&"NO"),
                                    tv(&"NO"), tv(&"NO"), tv(&"NO")])
             }
         }
         "pg_views" {
-            for v in snap.views { append(mut &rows, [tv(&v.schema), tv(&v.name), tv(&ownerName(&snap, &aclOf(&snap, &relObj(&v.key)))), tv(&(v.t.view + ";"))]) }
+            for v in snap.views { append(mut &rows, [tv(&v.schema), tv(&(if len(v.t.spell) > 0 { v.t.spell } else { v.name })), tv(&ownerName(&snap, &aclOf(&snap, &relObj(&v.key)))), tv(&(v.t.view + ";"))]) }
         }
         "information_schema.columns" {
             for which in 0..2 {
@@ -21435,7 +22500,7 @@ fn catRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &str): Result
                         Some(d) { tv(&d) }
                         None { Val.Null }
                     }
-                    append(mut &rows, [tv(&db), tv(&ct.schema), tv(&ct.name), tv(&c.name), iv(i + 1), dflt, tv(&if nn { "NO" } else { "YES" }),
+                    append(mut &rows, [tv(&db), tv(&ct.schema), tv(&(if len(ct.t.spell) > 0 { ct.t.spell } else { ct.name })), tv(&colShown(c)), iv(i + 1), dflt, tv(&if nn { "NO" } else { "YES" }),
                                        tv(&dataType), maxLen, octLen, prec, radix, scale, dtp, Val.Null, Val.Null,
                                        Val.Null, Val.Null, Val.Null, Val.Null, Val.Null, Val.Null, Val.Null, Val.Null, Val.Null,
                                        tv(&db), tv(&udtSchema), tv(&udt), Val.Null, Val.Null, Val.Null, Val.Null, tv(&(i + 1).toStr()),
@@ -21691,14 +22756,14 @@ fn roleStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
 
 const VIEW_MARK: str = "\xff\xff\xff\xffview"
 
-fn encView(cols: &[]lexdb_sql.ColDef, text: &str, deps: &[]str): str {
+fn encView(cols: &[]lexdb_sql.ColDef, text: &str, deps: &[]str, spell: &str): str {
     var b = newStrBuf()
     b.add(VIEW_MARK)
     var names: []str = []
     var oids: []str = []
     var mods: []str = []
     for c in cols {
-        append(mut &names, c.name)
+        append(mut &names, colShown(&c))
         append(mut &oids, c.typ.oid.toStr())
         append(mut &mods, typmodOf(&c.typ).toStr())
     }
@@ -21707,6 +22772,8 @@ fn encView(cols: &[]lexdb_sql.ColDef, text: &str, deps: &[]str): str {
     addStrs(mut &b, &mods)
     addStrs(mut &b, &[text.toStr()])
     addStrs(mut &b, deps)
+    // then its name as written, if that is not its key's (L6)
+    if len(spell) > 0 { addStr(mut &b, spell) }
     return b.toStr()
 }
 
@@ -21738,12 +22805,14 @@ fn decView(name: str, s: &str): Table {
     let text = strsAt(s, at)
     at += strsLen(&text)
     t.deps = strsAt(s, at)
+    at += strsLen(&t.deps)
+    if at + 4 <= len(s) { t.spell = strAt(s, at) }
     t.tree = -1
     t.view = if len(text) > 0 { text[0] } else { "select" }
     for i in 0..len(names) {
         let o = strings.parseIntOpt(oids[i]).unwrapOr(lexdb_sql.OID_TEXT)
         let m = if i < len(mods) { strings.parseIntOpt(mods[i]).unwrapOr(-1) } else { -1 }
-        append(mut &t.cols, lexdb_sql.colDef(names[i], typeOfMod(o, m), false))
+        append(mut &t.cols, spelledCol(&names[i], typeOfMod(o, m), false))
     }
     return t
 }
@@ -21875,16 +22944,18 @@ fn createView(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
     let base = lexdb_sql.baseName(&key)
     var old = try viewOld(st, txn, &key, s)
     // the query planned: its columns, and the relations it reads
-    var q = try viewQuery(&decView(key, &encView(&[], &s.index, &[])))
+    var q = try viewQuery(&decView(key, &encView(&[], &s.index, &[], &"")))
     q.use = lexdb_sql.SUB_SCALAR - lexdb_sql.SUB_SCALAR     // a statement of its own
-    var sc = newScope(&[], &[])
+    var sc = newScopeIn(st, txn, &[], &[])
     let sel = try planSelect(st, txn, &q, &[], mut &sc)
     if len(s.names) > len(sel.outs) { return Err(e("42601", "CREATE VIEW specifies more column names than columns")) }
     var cols: []lexdb_sql.ColDef = []
     for i in 0..len(sel.outs) {
         let n = if i < len(s.names) { s.names[i] } else { sel.outs[i].name }
         for c in cols { if c.name == n { return Err(e("42701", "column \"" + n + "\" specified more than once")) } }
-        append(mut &cols, lexdb_sql.colDef(n, oidType(sel.outs[i].oid), false))
+        var col = lexdb_sql.colDef(n, oidType(sel.outs[i].oid), false)
+        col.spell = if i < len(s.names) { if i < len(s.spells) { s.spells[i] } else { "" } } else { sel.outs[i].spell }
+        append(mut &cols, col)
     }
     // a column's typmod, where the query's column is a table's
     var deps: []str = []
@@ -21918,7 +22989,7 @@ fn createView(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         }
         None {}
     }
-    try txn.put(CATALOG, key, encView(&cols, &s.index, &deps))
+    try txn.put(CATALOG, key, encView(&cols, &s.index, &deps, &s.spell))
     if old.isNone() { try ownNew(st, txn, &relObj(&key)) }
     try bumpFor(st, txn, &key)
     return Ok(tagOnly("CREATE VIEW"))
@@ -22174,8 +23245,9 @@ fn needOwner(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, w: &Who, obj: &s
 
 // CREATE in a schema.
 fn needCreate(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, key: &str): Result[Unit, DbErr] {
-    let w = try whoNow(st, txn)
     let sc = lexdb_sql.schemaOf(key)
+    if sc == tempSchema(txn.sess) { return Ok(Unit{}) }        // a session's temporary tables
+    let w = try whoNow(st, txn)
     if !(try may(st, txn, &w, &nspObj(&sc), &"C")) { return Err(denied(&"schema", &sc)) }
     return Ok(Unit{})
 }

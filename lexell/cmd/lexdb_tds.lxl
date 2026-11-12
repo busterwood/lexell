@@ -1,0 +1,1271 @@
+// lexdb: Microsoft SQL Server's protocol, TDS 7.4, server side
+// (design/lexdb-tds.md). One task per connection, as lexdb_wire's.
+//
+// PRELOGIN: the client's options read, encryption agreed (TLS needs
+// --tls-cert: a client that asks for encryption is refused without it, as
+// SQL Server with no certificate would refuse it; with a certificate,
+// Encrypt=no gives TLS for the login only, and --require-tls turns that into
+// TLS for everything). The TLS handshake is carried in PRELOGIN packets,
+// TLS 1.2 at most as SQL Server's is, then TLS records go straight on the
+// socket. LOGIN7: SQL authentication against the role's password (its
+// SCRAM verifier) under --auth scram-sha-256, any password under trust;
+// integrated (SSPI) logins are refused. The database asked for must be
+// lexdb's own ("lexdb"; "master" and none are taken as it).
+//
+// Then requests. SQLBatch: T-SQL, run by lexdb_tsql (its variables,
+// transactions and errors as SQL Server has them). RPC: sp_executesql,
+// sp_prepare, sp_execute, sp_prepexec and sp_unprepare, by id or by name,
+// several in one request; the parameters declared in @params are the
+// batch's variables, OUTPUT ones come back as RETURNVALUE, then
+// RETURNSTATUS and DONEPROC. Transaction Manager requests: begin, commit,
+// rollback (each optionally beginning the next) and save, run as the
+// T-SQL statements; a transaction's start and end are ENVCHANGE 8, 9 and 10
+// with its 8-byte descriptor, however it began or ended. RESETCONNECTION
+// (the request's first packet's status) gives a fresh session as after the
+// login: an open transaction rolled back, the SET options and prepared
+// statements gone; ENVCHANGE 18. ATTENTION is acknowledged once the request
+// it interrupts has answered.
+//
+// Results: COLMETADATA, ROW and DONE tokens. A column's TDS type comes from
+// its lexdb type: int2/int4/int8 as smallint/int/bigint, bool as bit,
+// float8 and float4 as float and real, numeric as decimal(38, s) with s the
+// largest scale among its values, text as nvarchar(4000) (nvarchar(max)
+// when a value is longer), bytea as varbinary(8000) or (max), uuid as
+// uniqueidentifier, date, time(6), timestamp as datetime2(6), timestamptz
+// as datetimeoffset(6) at +00:00, and anything else (intervals, arrays,
+// json, ...) as nvarchar holding the text lexdb gives it over PostgreSQL's
+// protocol. An error is an ERROR token with SQL Server's number for the
+// same failure where there is one (lexdb_tsql.sqlNumber), else 50000, and
+// SQL Server's severity for it.
+import "net"
+import "task"
+import "tls"
+import "io"
+import "strings"
+import "binary"
+import "tds"
+import "./lexdb_base"
+import "./lexdb_store"
+import "./lexdb_sql"
+import "./lexdb_exec"
+import "./lexdb_auth"
+import "./lexdb_wire"
+import "./lexdb_tsql"
+import "./lexdb_tsqlparse"
+import "./lexdb_time"
+
+type Val = lexdb_sql.Val
+type DbErr = lexdb_base.DbErr
+
+const SERVER_NAME = "lexdb"
+const DB_NAME = "lexdb"
+const PROG_NAME = "Microsoft SQL Server\x00\x00"    // as SQL Server sends it: drivers look at it
+const VERSION_MAJOR = 16                             // SQL Server 2022
+const VERSION_MINOR = 0
+const VERSION_BUILD = 4315
+const MAX_PACKET_SIZE = 16384                        // SQL Server caps the client's ask at this
+const MAX_REQUEST = 67108864                         // 64 MiB: the largest request read
+
+// SQL_Latin1_General_CP1_CI_AS, SQL Server's default: what text columns and
+// the login's ENVCHANGE carry (comparison in lexdb is still exact: L2)
+const COLLATION = "\x09\x04\xd0\x00\x34"
+
+const CMD_EXECUTE = 0xE0           // DONEPROC's CurCmd
+
+// ---- the reply's tokens: built in a byte array, sent as one message
+
+type Out = record {
+    b: []byte
+    lastDone: int               // where the last DONE (or DONEPROC) token's status is, -1 none
+}
+
+fn newOut(): Out { return Out{b: [], lastDone: -1} }
+
+fn (o: mut &Out) u8(v: int) { append(mut &o.b, byte(v & 0xff)) }
+fn (o: mut &Out) u16(v: int) { binary.appendU16LE(mut &o.b, v) }
+fn (o: mut &Out) u32(v: int) { binary.appendU32LE(mut &o.b, v) }
+fn (o: mut &Out) u64(v: int) { binary.appendU64LE(mut &o.b, v) }
+fn (o: mut &Out) raw(s: &str) { appendStr(mut &o.b, s.toStr()) }
+
+// UTF-16LE of s, at most max units (s is UTF-8: lexdb's text always is)
+fn units(s: &str, max: int): []byte {
+    var u = tds.toUtf16(s.toStr()).unwrapOr([])
+    truncate(mut &u, 2 * max)
+    return u
+}
+
+// b cut to its first n bytes (if it is longer).
+fn truncate(b: mut &[]byte, n: int) {
+    while len(b) > n { let x = pop(b) }
+}
+
+// B_VARCHAR: a length byte (UTF-16 units), then UTF-16LE
+fn (o: mut &Out) bvarchar(s: &str) {
+    let u = units(s, 255)
+    o.u8(len(u) / 2)
+    for x in u { append(mut &o.b, x) }
+}
+
+// US_VARCHAR: a 2-byte length (UTF-16 units), then UTF-16LE
+fn (o: mut &Out) usvarchar(s: &str) {
+    let u = units(s, 65535)
+    o.u16(len(u) / 2)
+    for x in u { append(mut &o.b, x) }
+}
+
+// A token with a 2-byte length before its body, the body made by the caller
+// after start and closed by end.
+fn (o: mut &Out) start(token: int): int {
+    o.u8(token)
+    o.u16(0)
+    return len(o.b)
+}
+
+fn (o: mut &Out) end(at: int) { binary.setU16LE(mut &o.b, at - 2, len(o.b) - at) }
+
+fn (o: mut &Out) done(status: int, cmd: int, count: int) { o.doneTok(tds.TK_DONE, status, cmd, count) }
+
+// DONE, DONEINPROC or DONEPROC.
+fn (o: mut &Out) doneTok(token: int, status: int, cmd: int, count: int) {
+    o.u8(token)
+    if token != tds.TK_DONEINPROC { o.lastDone = len(o.b) }
+    o.u16(status)
+    o.u16(cmd)
+    o.u64(count)
+}
+
+// An ERROR or INFO token.
+fn (o: mut &Out) message(token: int, number: int, state: int, class: int, text: &str) {
+    let at = o.start(token)
+    o.u32(number)
+    o.u8(state)
+    o.u8(class)
+    o.usvarchar(text)
+    o.bvarchar(&SERVER_NAME)
+    o.bvarchar(&"")                 // the procedure
+    o.u32(1)                        // the line
+    o.end(at)
+}
+
+fn (o: mut &Out) error(e: &DbErr) {
+    let n = lexdb_tsql.sqlNumber(&e.state)
+    o.message(tds.TK_ERROR, n, 1, lexdb_tsql.sqlClass(n), &e.msg)
+}
+
+// ENVCHANGE with byte values (B_VARBYTE): the transaction's (8, 9, 10), RESETCONNECTION's (18).
+fn (o: mut &Out) envchangeBytes(kind: int, newValue: &str, oldValue: &str) {
+    let at = o.start(tds.TK_ENVCHANGE)
+    o.u8(kind)
+    o.u8(len(newValue))
+    o.raw(newValue)
+    o.u8(len(oldValue))
+    o.raw(oldValue)
+    o.end(at)
+}
+
+fn (o: mut &Out) envchange(kind: int, newValue: &str, oldValue: &str) {
+    let at = o.start(tds.TK_ENVCHANGE)
+    o.u8(kind)
+    o.bvarchar(newValue)
+    o.bvarchar(oldValue)
+    o.end(at)
+}
+
+// The message: the last DONE without DONE_MORE.
+fn (o: mut &Out) take(): str {
+    if o.lastDone >= 0 {
+        let st = binary.readU16LE(&o.b, o.lastDone) & ~tds.DONE_MORE
+        binary.setU16LE(mut &o.b, o.lastDone, st)
+    }
+    let s = strFromBytes(&o.b)
+    o.b = []
+    o.lastDone = -1
+    return s
+}
+
+// ---- result columns: their TDS types, chosen from the lexdb type and the values
+
+const C_TEXT = 0        // nvarchar, from lexdb_exec.text
+const C_INT = 1         // INTN of n bytes
+const C_BIT = 2
+const C_FLT8 = 3
+const C_FLT4 = 4
+const C_DEC = 5         // DECIMALN(38, scale)
+const C_BIN = 6         // varbinary
+const C_GUID = 7
+const C_DATE = 8
+const C_TIME = 9
+const C_DT2 = 10
+const C_DTO = 11
+
+type ColT = value record {
+    kind: int
+    n: int          // C_INT: bytes; C_DEC: the scale
+    max: bool       // C_TEXT, C_BIN: (max)
+}
+
+fn kindOf(oid: int): ColT {
+    let k = ColT{kind: C_TEXT, n: 0, max: false}
+    if oid == lexdb_sql.OID_INT2 { return ColT{kind: C_INT, n: 2, max: false} }
+    if oid == lexdb_sql.OID_INT4 { return ColT{kind: C_INT, n: 4, max: false} }
+    if oid == lexdb_sql.OID_INT8 { return ColT{kind: C_INT, n: 8, max: false} }
+    if oid == lexdb_sql.OID_BOOL { return ColT{kind: C_BIT, n: 0, max: false} }
+    if oid == lexdb_sql.OID_FLOAT8 { return ColT{kind: C_FLT8, n: 0, max: false} }
+    if oid == lexdb_sql.OID_FLOAT4 { return ColT{kind: C_FLT4, n: 0, max: false} }
+    if oid == lexdb_sql.OID_NUMERIC { return ColT{kind: C_DEC, n: 0, max: false} }
+    if oid == lexdb_sql.OID_BYTEA { return ColT{kind: C_BIN, n: 0, max: false} }
+    if oid == lexdb_sql.OID_UUID { return ColT{kind: C_GUID, n: 0, max: false} }
+    if oid == lexdb_sql.OID_DATE { return ColT{kind: C_DATE, n: 0, max: false} }
+    // the time types: n their scale, SQL Server's default 7
+    if oid == lexdb_sql.OID_TIME { return ColT{kind: C_TIME, n: 7, max: false} }
+    if oid == lexdb_sql.OID_TS { return ColT{kind: C_DT2, n: 7, max: false} }
+    if oid == lexdb_sql.OID_TSTZ { return ColT{kind: C_DTO, n: 7, max: false} }
+    return k
+}
+
+// Whether v can be sent as kind (NULL always can).
+fn fits(kind: int, v: &Val): bool {
+    match v {
+        Val.Null { return true }
+        Val.Int(_) { return kind == C_INT }
+        Val.Bool(_) { return kind == C_BIT }
+        Val.Float(_) { return kind == C_FLT8 }
+        Val.Real(_) { return kind == C_FLT4 }
+        Val.Num(_) { return kind == C_DEC }
+        Val.Bytes(_) { return kind == C_BIN }
+        Val.Uuid(_) { return kind == C_GUID }
+        Val.Date(_) { return kind == C_DATE }
+        Val.Time(_) { return kind == C_TIME }
+        Val.Ts(_) { return kind == C_DT2 }
+        Val.Tstz(_) { return kind == C_DTO }
+        else { return kind == C_TEXT }
+    }
+}
+
+// UTF-16 units of UTF-8 text: one per character, two for one past U+FFFF.
+fn units16(s: &str): int {
+    var n = 0
+    for i in 0..len(s) {
+        let b = s[i]
+        if (b & 0xC0) != 0x80 { n += if b >= 0xF0 { 2 } else { 1 } }
+    }
+    return n
+}
+
+// The columns' types for these rows: the lexdb type's, unless a value does
+// not fit it (then text); the largest decimal scale; (max) where a value is
+// longer than nvarchar(4000) or varbinary(8000) holds.
+fn colTypes(cols: &[]lexdb_exec.OutCol, rows: &[][]Val): []ColT {
+    var ts: []ColT = []
+    for i in 0..len(cols) {
+        var t = kindOf(cols[i].oid)
+        var bad = false
+        for r in rows { if i < len(r) && !fits(t.kind, &r[i]) { bad = true } }
+        if bad {
+            // the values' own type where they all have one (ISNULL(NULL, 5)), else text
+            t = ColT{kind: C_TEXT, n: 0, max: false}
+            var own = -1
+            var same = true
+            for r in rows {
+                if i >= len(r) || lexdb_exec.isNull(&r[i]) { continue }
+                let o = lexdb_exec.kindOid(&r[i])
+                if own < 0 { own = o } else if o != own { same = false }
+            }
+            if same && own > 0 {
+                let k = kindOf(if own == lexdb_sql.OID_INT4 || own == lexdb_sql.OID_INT2 { lexdb_sql.OID_INT8 } else { own })
+                var all = true
+                for r in rows { if i < len(r) && !fits(k.kind, &r[i]) { all = false } }
+                if all { t = k }
+            }
+        }
+        for r in rows {
+            if i >= len(r) { continue }
+            match r[i] {
+                Val.Null {}
+                Val.Num(d) {
+                    let sc = max(d.scale(), -d.exponent())
+                    if t.kind == C_DEC && sc > t.n { t.n = min(sc, 38) }
+                }
+                Val.Bytes(b) { if t.kind == C_BIN && len(b) > 8000 { t.max = true } }
+                else {
+                    if t.kind == C_TEXT && !t.max && units16(&lexdb_exec.text(&r[i])) > 4000 { t.max = true }
+                }
+            }
+        }
+        if (t.kind == C_TIME || t.kind == C_DT2 || t.kind == C_DTO) && cols[i].scale >= 0 { t.n = min(cols[i].scale, 7) }
+        append(mut &ts, t)
+    }
+    return ts
+}
+
+fn (o: mut &Out) colmetadata(cols: &[]lexdb_exec.OutCol, ts: &[]ColT) {
+    o.u8(tds.TK_COLMETADATA)
+    o.u16(len(cols))
+    for i in 0..len(cols) {
+        o.u32(0)                    // UserType
+        o.u16(0x0001)               // Flags: nullable
+        o.typeInfo(&ts[i])
+        let name = cols[i].label()
+        o.bvarchar(&(if name == "?column?" { "" } else { name }))
+    }
+}
+
+// TYPE_INFO for a column's or an output parameter's type.
+fn (o: mut &Out) typeInfo(t: &ColT) {
+        if t.kind == C_INT {
+            o.u8(tds.T_INTN)
+            o.u8(t.n)
+        } else if t.kind == C_BIT {
+            o.u8(tds.T_BITN)
+            o.u8(1)
+        } else if t.kind == C_FLT8 || t.kind == C_FLT4 {
+            o.u8(tds.T_FLTN)
+            o.u8(if t.kind == C_FLT8 { 8 } else { 4 })
+        } else if t.kind == C_DEC {
+            o.u8(tds.T_DECIMALN)
+            o.u8(17)
+            o.u8(38)
+            o.u8(t.n)
+        } else if t.kind == C_BIN {
+            o.u8(tds.T_BIGVARBIN)
+            o.u16(if t.max { 0xFFFF } else { 8000 })
+        } else if t.kind == C_GUID {
+            o.u8(tds.T_GUID)
+            o.u8(16)
+        } else if t.kind == C_DATE {
+            o.u8(tds.T_DATEN)
+        } else if t.kind == C_TIME || t.kind == C_DT2 || t.kind == C_DTO {
+            o.u8(if t.kind == C_TIME { tds.T_TIMEN } else if t.kind == C_DT2 { tds.T_DATETIME2N } else { tds.T_DATETIMEOFFSETN })
+            o.u8(t.n)
+        } else {
+            o.u8(tds.T_NVARCHAR)
+            o.u16(if t.max { 0xFFFF } else { 8000 })
+            o.raw(&COLLATION)
+        }
+}
+
+fn rangeErr(what: &str): DbErr { return lexdb_base.err("22003", what.toStr()) }
+
+// PLP: the total length, one chunk, the terminator.
+fn (o: mut &Out) plp(b: &[]byte) {
+    o.u64(len(b))
+    if len(b) > 0 {
+        o.u32(len(b))
+        for x in b { append(mut &o.b, x) }
+    }
+    o.u32(0)
+}
+
+const DAYS_0001_TO_2000 = 730119        // from 0001-01-01 to 2000-01-01
+const DAY_US = 86400000000
+
+fn floorDiv(a: int, b: int): int {
+    let q = a / b
+    return if (a % b != 0) && ((a < 0) != (b < 0)) { q - 1 } else { q }
+}
+
+// time(6): microseconds since midnight in 5 bytes; date: days since
+// 0001-01-01 in 3 (0001 to 9999, as SQL Server's)
+fn (o: mut &Out) time5(us: int) {
+    for k in 0..5 { o.u8(us >> (8 * k)) }
+}
+
+// A time of day at scale n (its units 10^-n seconds), in timeLen(n) bytes.
+fn timeLen(n: int): int { return if n <= 2 { 3 } else if n <= 4 { 4 } else { 5 } }
+
+fn (o: mut &Out) timeN(us: int, n: int) {
+    var v = us
+    if n == 7 { v = us * 10 } else {
+        var d = 1
+        for k in 0..6 - n { d = d * 10 }
+        v = (us + d / 2) / d
+    }
+    for k in 0..timeLen(n) { o.u8(v >> (8 * k)) }
+}
+
+fn (o: mut &Out) date3(days2000: int): Result[Unit, DbErr] {
+    let d = days2000 + DAYS_0001_TO_2000
+    if d < 0 || d > 3652058 { return Err(rangeErr(&"a date outside 0001-01-01 to 9999-12-31, which SQL Server's date types cannot hold")) }
+    for k in 0..3 { o.u8(d >> (8 * k)) }
+    return Ok(Unit{})
+}
+
+fn hexVal(c: byte): int {
+    if c >= '0' && c <= '9' { return int(c - '0') }
+    if c >= 'a' && c <= 'f' { return int(c - 'a') + 10 }
+    if c >= 'A' && c <= 'F' { return int(c - 'A') + 10 }
+    return 0
+}
+
+// The single-precision bits of x, a double holding a float4's value exactly.
+fn bits32(x: float): int {
+    let b = tds.bitsOfFloat(x)
+    let sign = (b >> 63) & 1
+    let e = (b >> 52) & 0x7FF
+    let m = b & 0xFFFFFFFFFFFFF
+    if e == 0 { return sign << 31 }                         // zero (a float4 has no double subnormals)
+    let e32 = e - 1023 + 127
+    if e32 >= 1 { return (sign << 31) | (e32 << 23) | (m >> 29) }
+    // a float4 subnormal: the significand with its leading 1, shifted
+    let full = (1 << 52) | m
+    return (sign << 31) | (full >> (29 + 1 - e32))
+}
+
+fn (o: mut &Out) value(t: &ColT, v: &Val): Result[Unit, DbErr] {
+    if lexdb_exec.isNull(v) {
+        if (t.kind == C_TEXT || t.kind == C_BIN) && t.max {
+            for k in 0..8 { o.u8(0xFF) }
+        } else if t.kind == C_TEXT || t.kind == C_BIN {
+            o.u16(0xFFFF)
+        } else {
+            o.u8(0)
+        }
+        return Ok(Unit{})
+    }
+    // a value that does not fit its column (whose type is text then): its text
+    let vv: Val = if fits(t.kind, v) { v } else { Val.Text(lexdb_exec.text(v)) }
+    match vv {
+        Val.Int(n) {
+            if t.n == 2 && (n < -32768 || n > 32767) { return Err(rangeErr(&"Arithmetic overflow error converting expression to data type smallint.")) }
+            if t.n == 4 && (n < -2147483648 || n > 2147483647) { return Err(rangeErr(&"Arithmetic overflow error converting expression to data type int.")) }
+            o.u8(t.n)
+            for k in 0..t.n { o.u8(n >> (8 * k)) }
+        }
+        Val.Bool(x) {
+            o.u8(1)
+            o.u8(if x { 1 } else { 0 })
+        }
+        Val.Float(x) {
+            if !x.isFinite() { return Err(rangeErr(&"SQL Server's float has no NaN or Infinity")) }
+            o.u8(8)
+            o.u64(tds.bitsOfFloat(x))
+        }
+        Val.Real(x) {
+            if !x.isFinite() { return Err(rangeErr(&"SQL Server's real has no NaN or Infinity")) }
+            o.u8(4)
+            o.u32(bits32(x))
+        }
+        Val.Num(d) {
+            // the magnitude at the column's scale, in 16 bytes
+            // (coefficient × 10^exponent: times 10^(exponent + scale))
+            var m = d.coefficient()
+            let up = d.exponent() + t.n
+            var big: u128 = 1
+            for _ in 0..38 { big = big * 10 }
+            if up < 0 { return Err(rangeErr(&("Arithmetic overflow error converting numeric to data type numeric: " + d.toStr()))) }
+            for _ in 0..up {
+                if m >= big { break }
+                m = m * 10
+            }
+            if m >= big { return Err(rangeErr(&("Arithmetic overflow error converting numeric to data type numeric: " + d.toStr()))) }
+            o.u8(17)
+            o.u8(if d.isNeg() { 0 } else { 1 })
+            for k in 0..16 { o.u8(int((m >> (8 * k)) & 0xff)) }
+        }
+        Val.Bytes(b) {
+            if t.max {
+                o.plp(&strToBytes(b))
+            } else {
+                o.u16(len(b))
+                o.raw(&b)
+            }
+        }
+        Val.Uuid(u) {
+            // the canonical text's bytes, the first three groups little-endian
+            let h = strings.replaceAll(u, "-", "")
+            var g: []int = []
+            for k in 0..16 { append(mut &g, hexVal(h[2 * k]) * 16 + hexVal(h[2 * k + 1])) }
+            o.u8(16)
+            for k in [3, 2, 1, 0, 5, 4, 7, 6, 8, 9, 10, 11, 12, 13, 14, 15] { o.u8(g[k]) }
+        }
+        Val.Date(d) {
+            o.u8(3)
+            try o.date3(d)
+        }
+        Val.Time(us) {
+            o.u8(timeLen(t.n))
+            o.timeN(us, t.n)
+        }
+        Val.Ts(us) {
+            let days = floorDiv(us, DAY_US)
+            o.u8(timeLen(t.n) + 3)
+            o.timeN(us - days * DAY_US, t.n)
+            try o.date3(days)
+        }
+        Val.Tstz(us) {
+            let days = floorDiv(us, DAY_US)
+            o.u8(timeLen(t.n) + 5)
+            o.timeN(us - days * DAY_US, t.n)
+            try o.date3(days)
+            o.u16(0)                // the offset: +00:00
+        }
+        else {
+            let u = units(&lexdb_exec.text(v), 1073741823)
+            if t.max {
+                o.plp(&u)
+            } else {
+                o.u16(len(u))
+                for x in u { append(mut &o.b, x) }
+            }
+        }
+    }
+    return Ok(Unit{})
+}
+
+// A result set: COLMETADATA and its ROWs. Err, with nothing written, when a
+// value has no SQL Server form (a date before year 1, NaN, ...).
+fn (o: mut &Out) rowSet(cols: &[]lexdb_exec.OutCol, rows: &[][]Val): Result[Unit, DbErr] {
+    let ts = colTypes(cols, rows)
+    let mark = len(o.b)
+    o.colmetadata(cols, &ts)
+    for r in rows {
+        o.u8(tds.TK_ROW)
+        for i in 0..len(ts) {
+            let v = if i < len(r) { r[i] } else { Val.Null }
+            match o.value(&ts[i], &v) {
+                Ok(_) {}
+                Err(e) {
+                    truncate(mut &o.b, mark)
+                    return Err(e)
+                }
+            }
+        }
+    }
+    return Ok(Unit{})
+}
+
+// ---- a connection
+
+// A prepared statement (sp_prepare, sp_prepexec): its parameters' declarations and its text.
+type Prep = record { decls: str; sql: str; live: bool }
+
+type Conn = record {
+    t: tds.Transport
+    sess: lexdb_exec.Session
+    st: lexdb_store.Store
+    o: Out
+    ts: lexdb_tsql.State
+    user: str
+    txn: int                    // the transaction descriptor's number, 0 none
+    preps: []Prep               // by handle - 1
+}
+
+fn (c: mut &Conn) send(): Result[Unit, tds.Error] {
+    let msg = c.o.take()
+    return c.t.send(tds.PT_REPLY, msg)
+}
+
+fn descriptor(n: int): str {
+    var b: []byte = []
+    binary.appendU64LE(mut &b, n)
+    return strFromBytes(&b)
+}
+
+fn (c: mut &Conn) tran(kind: int) {
+    if kind == 8 {
+        c.txn += 1
+        c.o.envchangeBytes(8, &descriptor(c.txn), &"")
+    } else {
+        c.o.envchangeBytes(kind, &"", &descriptor(c.txn))
+    }
+}
+
+// A batch's events as tokens: DONE (DONEINPROC inside an RPC) for each
+// statement, a transaction's ENVCHANGE before the DONE of the statement
+// that began or ended it. Whether there was an error.
+fn (c: mut &Conn) emit(ev: &[]lexdb_tsql.Event, inProc: bool): bool {
+    var failed = false
+    var rowsFailed = false
+    var i = 0
+    while i < len(ev) {
+        let e = &ev[i]
+        i += 1
+        if e.kind == lexdb_tsql.EV_ROWS {
+            match c.o.rowSet(&e.cols, &e.rows) {
+                Ok(_) {}
+                Err(x) {
+                    c.o.error(&x)
+                    rowsFailed = true
+                    failed = true
+                }
+            }
+        } else if e.kind == lexdb_tsql.EV_ERROR {
+            if e.number > 0 { c.o.message(tds.TK_ERROR, e.number, e.state, e.sev, &e.err.msg) } else { c.o.error(&e.err) }
+            failed = true
+        } else if e.kind == lexdb_tsql.EV_INFO {
+            c.o.message(tds.TK_INFO, e.number, e.state, e.sev, &e.err.msg)
+        } else if e.kind == lexdb_tsql.EV_TRAN {
+            c.tran(e.tran)
+        } else if e.kind == lexdb_tsql.EV_DONE {
+            while i < len(ev) && ev[i].kind == lexdb_tsql.EV_TRAN {
+                c.tran(ev[i].tran)
+                i += 1
+            }
+            let err = e.error || rowsFailed
+            let counted = e.count >= 0 && !rowsFailed
+            c.o.doneTok(if inProc { tds.TK_DONEINPROC } else { tds.TK_DONE },
+                        tds.DONE_MORE | (if counted { tds.DONE_COUNT } else { 0 }) | (if err { tds.DONE_ERROR } else { 0 }),
+                        e.cmd, if counted { e.count } else { 0 })
+            rowsFailed = false
+        }
+    }
+    return failed
+}
+
+// The text of a SQLBatch: after ALL_HEADERS, UTF-16LE.
+fn batchText(d: &str): Result[str, DbErr] {
+    let h = match tds.allHeadersOf(d) {
+        Ok(x) { x }
+        Err(e) { return Err(lexdb_base.err("08P01", e.msg)) }
+    }
+    match tds.fromUtf16(d[h.end..len(d)].toStr()) {
+        Ok(s) { return Ok(s) }
+        Err(m) { return Err(lexdb_base.err("08P01", m)) }
+    }
+}
+
+fn (c: mut &Conn) batch(sql: &str) {
+    var f = lexdb_tsql.newFrame()
+    var ev: []lexdb_tsql.Event = []
+    lexdb_tsql.run(mut &c.sess, mut &c.ts, sql, mut &f, mut &ev)
+    let failed = c.emit(&ev, false)
+    if c.o.lastDone < 0 { c.o.done(0, 0, 0) }
+}
+
+// ---- RPC
+
+fn protoErr(msg: str): DbErr { return lexdb_base.err("08P01", msg) }
+
+fn tsErr(n: int, msg: str): DbErr { return lexdb_base.err("TS" + n.toStr(), msg) }
+
+// A parameter's value as lexdb's.
+fn valOf(p: &tds.RpcParam): Result[Val, DbErr] {
+    let t = p.column.tdsType
+    match p.value {
+        tds.Cell.Null { return Ok(Val.Null) }
+        tds.Cell.Int(n) { return Ok(if t == tds.T_BIT || t == tds.T_BITN { Val.Bool(n != 0) } else { Val.Int(n) }) }
+        tds.Cell.Float(x) { return Ok(if t == tds.T_FLT4 || (t == tds.T_FLTN && p.column.size == 4) { Val.Real(x) } else { Val.Float(x) }) }
+        tds.Cell.Text(s) { return Ok(Val.Text(s)) }
+        tds.Cell.Bytes(b) { return Ok(Val.Bytes(b)) }
+        tds.Cell.Dec(d) { return Ok(Val.Num(d)) }
+        tds.Cell.Date(d) { return Ok(Val.Date(lexdb_time.daysOf(d))) }
+        tds.Cell.Time(x) { return Ok(Val.Time(x.nanos / 1000)) }
+        tds.Cell.DateTime(l) {
+            match lexdb_time.tsOf(l) {
+                Some(us) { return Ok(Val.Ts(us)) }
+                None { return Err(lexdb_base.err("22008", "a datetime parameter out of range")) }
+            }
+        }
+        tds.Cell.Offset(o) {
+            match lexdb_time.tsOf(o.local) {
+                Some(us) { return Ok(Val.Tstz(us - o.offset * 60000000)) }
+                None { return Err(lexdb_base.err("22008", "a datetimeoffset parameter out of range")) }
+            }
+        }
+        tds.Cell.Guid(g) { return Ok(Val.Uuid(strings.toLowerAscii(g))) }
+        tds.Cell.Failed(why) { return Err(lexdb_base.err("0A000", "parameter " + p.name + ": " + why)) }
+    }
+}
+
+// A text parameter's value (sp_executesql's @stmt and @params).
+fn textOf(p: &tds.RpcParam): Result[str, DbErr] {
+    match p.value {
+        tds.Cell.Text(s) { return Ok(s) }
+        tds.Cell.Null { return Ok("") }
+        else { return Err(tsErr(214, "Procedure expects parameter '" + p.name + "' of type 'ntext/nchar/nvarchar'.")) }
+    }
+}
+
+fn intOf(p: &tds.RpcParam): int {
+    match p.value {
+        tds.Cell.Int(n) { return n }
+        else { return 0 }
+    }
+}
+
+// RETURNVALUE: an output parameter's value.
+fn (o: mut &Out) returnValue(ordinal: int, name: &str, t: &lexdb_sql.TypeName, v: &Val) {
+    let cols = [lexdb_exec.OutCol{name: name.toStr(), oid: t.oid, spell: "", coll: "", scale: -1}]
+    let rows = [[v]]
+    let ts = colTypes(&cols, &rows)
+    let mark = len(o.b)
+    o.u8(tds.TK_RETURNVALUE)
+    o.u16(ordinal)
+    o.bvarchar(name)
+    o.u8(1)                         // an output parameter
+    o.u32(0)                        // UserType
+    o.u16(0x0001)                   // Flags: nullable
+    o.typeInfo(&ts[0])
+    match o.value(&ts[0], v) {
+        Ok(_) {}
+        Err(e) {
+            truncate(mut &o.b, mark)
+            o.error(&e)
+        }
+    }
+}
+
+fn (o: mut &Out) returnStatus(n: int) {
+    o.u8(tds.TK_RETURNSTATUS)
+    o.u32(n)
+}
+
+// Runs sql with the declared parameters bound to the call's values (from
+// position first on: sp_executesql's after @stmt and @params, sp_execute's
+// after the handle), then answers: the batch's tokens, RETURNSTATUS, the
+// output parameters, DONEPROC. handle > 0: sp_prepexec's handle, returned
+// first.
+fn (c: mut &Conn) execute(sql: &str, decls: &str, call: &tds.RpcCall, first: int, handle: int, more: bool) {
+    var f = lexdb_tsql.newFrame()
+    var outs: []int = []                        // the frame's indexes of the output parameters
+    var outNames: []str = []
+    var bad: Option[DbErr] = None
+    let noDecls: []lexdb_tsqlparse.ParamDecl = []
+    let ds: Result[[]lexdb_tsqlparse.ParamDecl, DbErr] = if len(strings.trim(decls)) == 0 { Ok(noDecls) } else { lexdb_tsqlparse.parseParamDecls(decls) }
+    if ds.isErr() {
+        bad = Some(ds.unwrapErr())
+    } else {
+        let list = ds.unwrap()
+        var given: []bool = []
+        for d in list {
+            let k = f.add(&d.name, d.typ, Val.Null)
+            append(mut &given, false)
+            if d.output {
+                append(mut &outs, k)
+                append(mut &outNames, d.name)
+            }
+        }
+        let base = len(f.names) - len(list)
+        var pos = 0
+        for i in first..len(call.params) {
+            let p = &call.params[i]
+            var k = -1
+            if len(p.name) > 0 {
+                let low = strings.toLowerAscii(p.name)
+                for j in 0..len(list) { if list[j].name == low { k = j } }
+            } else {
+                k = pos
+            }
+            pos += 1
+            if k < 0 || k >= len(list) {
+                bad = Some(tsErr(8145, "" + p.name + " is not a parameter for procedure sp_executesql."))
+                break
+            }
+            match valOf(&p) {
+                Ok(v) {
+                    match lexdb_exec.coerce(v, &list[k].typ) {
+                        Ok(x) { f.vals[base + k] = x }
+                        Err(e) { bad = Some(e) }
+                    }
+                }
+                Err(e) { bad = Some(e) }
+            }
+            given[k] = true
+        }
+        if bad.isNone() {
+            for j in 0..len(list) {
+                if !given[j] && !list[j].output {
+                    bad = Some(tsErr(8178, "The parameterized query '(" + decls + ")" + sql + "' expects the parameter '" + list[j].name +
+                                           "', which was not supplied."))
+                    break
+                }
+            }
+        }
+    }
+    var status = 0
+    match bad {
+        Some(e) {
+            c.o.error(&e)
+            status = lexdb_tsql.sqlNumber(&e.state)
+        }
+        None {
+            var ev: []lexdb_tsql.Event = []
+            lexdb_tsql.run(mut &c.sess, mut &c.ts, sql, mut &f, mut &ev)
+            let failed = c.emit(&ev, true)
+            if failed { status = c.ts.error }
+        }
+    }
+    c.o.returnStatus(status)
+    var ordinal = 0
+    if handle > 0 {
+        c.o.returnValue(0, &call.params[0].name, &lexdb_sql.TypeName{kind: lexdb_sql.K_INT, oid: lexdb_sql.OID_INT4, prec: 0, scale: 0, len: 0}, &Val.Int(handle))
+        ordinal = 1
+    }
+    for i in 0..len(outs) {
+        c.o.returnValue(ordinal + i, &outNames[i], &f.types[outs[i]], &f.vals[outs[i]])
+    }
+    c.o.doneTok(tds.TK_DONEPROC, (if more { tds.DONE_MORE } else { 0 }) | (if status != 0 { tds.DONE_ERROR } else { 0 }), CMD_EXECUTE, 0)
+}
+
+// A procedure's id from its name: sp_executesql and the prepared-statement ones; 0 for another.
+fn procIdOf(name: &str): int {
+    var n = strings.toLowerAscii(name)
+    for pre in ["master.dbo.", "master..", "sys.", "dbo."] {
+        if strings.startsWith(n, pre) { n = n[len(pre)..len(n)].toStr() }
+    }
+    match n {
+        "sp_executesql" { return tds.PROC_EXECUTESQL }
+        "sp_prepare" { return tds.PROC_PREPARE }
+        "sp_execute" { return tds.PROC_EXECUTE }
+        "sp_prepexec" { return tds.PROC_PREPEXEC }
+        "sp_unprepare" { return tds.PROC_UNPREPARE }
+        else { return 0 }
+    }
+}
+
+fn (c: mut &Conn) procError(e: &DbErr, more: bool) {
+    c.o.error(e)
+    c.o.returnStatus(lexdb_tsql.sqlNumber(&e.state))
+    c.o.doneTok(tds.TK_DONEPROC, (if more { tds.DONE_MORE } else { 0 }) | tds.DONE_ERROR, CMD_EXECUTE, 0)
+}
+
+fn (c: mut &Conn) rpc(d: str) {
+    let parsed = tds.parseRpc(d)
+    if parsed.isErr() {
+        c.o.error(&protoErr(parsed.unwrapErr().msg))
+        c.o.done(tds.DONE_ERROR, 0, 0)
+        return
+    }
+    let calls = parsed.unwrap()
+    for ci in 0..len(calls) {
+        let call = &calls[ci]
+        let more = ci + 1 < len(calls)
+        let id = if call.procId > 0 { call.procId } else { procIdOf(&call.procName) }
+        let n = len(call.params)
+        if id == tds.PROC_EXECUTESQL {
+            if n < 1 {
+                c.procError(&tsErr(201, "Procedure or function 'sp_executesql' expects parameter '@statement', which was not supplied."), more)
+                continue
+            }
+            match textOf(&call.params[0]) {
+                Ok(sql) {
+                    let decls = if n >= 2 { textOf(&call.params[1]).unwrapOr("") } else { "" }
+                    c.execute(&sql, &decls, &call, 2, 0, more)
+                }
+                Err(e) { c.procError(&e, more) }
+            }
+        } else if id == tds.PROC_PREPARE || id == tds.PROC_PREPEXEC {
+            // @handle OUTPUT, @params, @stmt[, values ...]
+            if n < 3 {
+                c.procError(&tsErr(201, "Procedure or function expects parameter '@stmt', which was not supplied."), more)
+                continue
+            }
+            let decls = textOf(&call.params[1]).unwrapOr("")
+            match textOf(&call.params[2]) {
+                Ok(sql) {
+                    append(mut &c.preps, Prep{decls: decls, sql: sql, live: true})
+                    let h = len(c.preps)
+                    if id == tds.PROC_PREPEXEC {
+                        c.execute(&sql, &decls, &call, 3, h, more)
+                    } else {
+                        c.o.returnStatus(0)
+                        c.o.returnValue(0, &call.params[0].name, &lexdb_sql.TypeName{kind: lexdb_sql.K_INT, oid: lexdb_sql.OID_INT4, prec: 0, scale: 0, len: 0}, &Val.Int(h))
+                        c.o.doneTok(tds.TK_DONEPROC, if more { tds.DONE_MORE } else { 0 }, CMD_EXECUTE, 0)
+                    }
+                }
+                Err(e) { c.procError(&e, more) }
+            }
+        } else if id == tds.PROC_EXECUTE || id == tds.PROC_UNPREPARE {
+            let h = if n > 0 { intOf(&call.params[0]) } else { 0 }
+            if h < 1 || h > len(c.preps) || !c.preps[h - 1].live {
+                c.procError(&tsErr(8179, "Could not find prepared statement with handle " + h.toStr() + "."), more)
+                continue
+            }
+            if id == tds.PROC_UNPREPARE {
+                c.preps[h - 1].live = false
+                c.o.returnStatus(0)
+                c.o.doneTok(tds.TK_DONEPROC, if more { tds.DONE_MORE } else { 0 }, CMD_EXECUTE, 0)
+            } else {
+                let sql = c.preps[h - 1].sql
+                let decls = c.preps[h - 1].decls
+                c.execute(&sql, &decls, &call, 1, 0, more)
+            }
+        } else {
+            let name = if len(call.procName) > 0 { call.procName } else { "procedure " + call.procId.toStr() }
+            c.procError(&tsErr(2812, "Could not find stored procedure '" + name + "'."), more)
+        }
+    }
+}
+
+// ---- Transaction Manager requests: begin, commit, rollback, save
+
+fn (c: mut &Conn) transMgr(d: &str) {
+    let hr = tds.allHeadersOf(d)
+    if hr.isErr() {
+        c.o.error(&protoErr(hr.unwrapErr().msg))
+        c.o.done(tds.DONE_ERROR, 0, 0)
+        return
+    }
+    let h = hr.unwrap()
+    if h.end + 2 > len(d) {
+        c.o.error(&protoErr("a Transaction Manager request without its type"))
+        c.o.done(tds.DONE_ERROR, 0, 0)
+        return
+    }
+    let kind = binary.readU16LEStr(d, h.end)
+    // the name (B_VARCHAR) after the request type (and BEGIN's isolation level)
+    let at = h.end + 2 + (if kind == tds.TM_BEGIN_XACT { 1 } else { 0 })
+    var name = ""
+    if at < len(d) {
+        let n = int(d[at])
+        if at + 1 + 2 * n <= len(d) { name = tds.fromUtf16(d[at + 1..at + 1 + 2 * n].toStr()).unwrapOr("") }
+    }
+    let after = at + 1 + 2 * len(name)
+    let beginAfter = (kind == tds.TM_COMMIT_XACT || kind == tds.TM_ROLLBACK_XACT) && after < len(d) && d[after] != 0
+    var sql = ""
+    if kind == tds.TM_BEGIN_XACT { sql = "BEGIN TRANSACTION" }
+    else if kind == tds.TM_COMMIT_XACT { sql = "COMMIT TRANSACTION" }
+    else if kind == tds.TM_ROLLBACK_XACT { sql = "ROLLBACK TRANSACTION" }
+    else if kind == 9 { sql = "SAVE TRANSACTION [" + strings.replaceAll(name, "]", "]]") + "]" }
+    else {
+        c.o.error(&lexdb_base.err("0A000", "Transaction Manager request " + kind.toStr() + " (distributed transactions) is not supported"))
+        c.o.done(tds.DONE_ERROR, 0, 0)
+        return
+    }
+    if beginAfter { sql = sql + "; BEGIN TRANSACTION" }
+    c.batch(&sql)
+}
+
+// ---- requests
+
+// RESETCONNECTION: the session as it was after the login (an open
+// transaction rolled back), then ENVCHANGE 18.
+fn (c: mut &Conn) reset() {
+    if c.sess.status() != 'I' {
+        match lexdb_sql.parse(&"ROLLBACK") {
+            Ok(stmts) {
+                let none: []Val = []
+                let nt: []int = []
+                let r = c.sess.run(&stmts[0], &none, &nt)
+            }
+            Err(_) {}
+        }
+    }
+    lexdb_tsql.dropTemps(mut &c.sess, mut &c.ts)
+    c.sess.close()
+    c.sess = lexdb_exec.newSession(c.st)
+    c.sess.setCollation(&lexdb_sql.TSQL_COLLATION)
+    c.sess.setUser(&c.user)
+    c.ts = lexdb_tsql.newState(c.ts.spid)
+    c.preps = []
+    c.o.envchangeBytes(18, &"", &"")
+}
+
+// Requests until the client goes: Ok(()) at its end, Err on the wire.
+fn (c: mut &Conn) requests(): Result[Unit, tds.Error] {
+    while true {
+        let m = try c.t.receive(MAX_REQUEST)
+        if (m.status & tds.STATUS_RESET) != 0 { c.reset() }
+        if m.ptype == tds.PT_SQLBATCH {
+            match batchText(&m.data) {
+                Ok(sql) { c.batch(&sql) }
+                Err(e) {
+                    c.o.error(&e)
+                    c.o.done(tds.DONE_ERROR, 0, 0)
+                }
+            }
+        } else if m.ptype == tds.PT_ATTENTION {
+            c.o.done(tds.DONE_ATTN, 0, 0)
+        } else if m.ptype == tds.PT_RPC {
+            c.rpc(m.data)
+        } else if m.ptype == 14 {
+            c.transMgr(&m.data)
+        } else {
+            c.o.error(&lexdb_base.err("08P01", "requests of packet type " + m.ptype.toStr() + " are not supported"))
+            c.o.done(tds.DONE_ERROR, 0, 0)
+        }
+        try c.send()
+    }
+    return Ok(Unit{})
+}
+
+// ---- PRELOGIN and LOGIN7
+
+// The server's PRELOGIN answer: VERSION, ENCRYPTION, INSTOPT (matched),
+// THREADID (none), MARS off.
+fn preloginAnswer(encrypt: int): str {
+    var b: []byte = []
+    let lens = [6, 1, 1, 0, 1]
+    var at = 26
+    for i in 0..5 {
+        append(mut &b, byte(i))
+        binary.appendU16BE(mut &b, at)
+        binary.appendU16BE(mut &b, lens[i])
+        at += lens[i]
+    }
+    append(mut &b, byte(0xFF))
+    append(mut &b, byte(VERSION_MAJOR))
+    append(mut &b, byte(VERSION_MINOR))
+    binary.appendU16BE(mut &b, VERSION_BUILD)
+    binary.appendU16BE(mut &b, 0)
+    append(mut &b, byte(encrypt))
+    append(mut &b, byte(0))
+    append(mut &b, byte(0))
+    return strFromBytes(&b)
+}
+
+// What LOGIN7 says.
+type Login = record {
+    user: str
+    password: str
+    app: str
+    database: str
+    packetSize: int
+    integrated: bool
+}
+
+// A text field of LOGIN7: its offset and length (UTF-16 units) at at.
+fn loginField(d: &str, at: int): Result[str, DbErr] {
+    let off = binary.readU16LEStr(d, at)
+    let n = binary.readU16LEStr(d, at + 2)
+    if off + 2 * n > len(d) { return Err(lexdb_base.err("08P01", "LOGIN7: a field out of bounds")) }
+    match tds.fromUtf16(d[off..off + 2 * n].toStr()) {
+        Ok(s) { return Ok(s) }
+        Err(m) { return Err(lexdb_base.err("08P01", "LOGIN7: " + m)) }
+    }
+}
+
+fn parseLogin(d: &str): Result[Login, DbErr] {
+    if len(d) < 94 { return Err(lexdb_base.err("08P01", "LOGIN7 is shorter than its fixed part")) }
+    let integrated = (int(d[25]) & 0x80) != 0          // OptionFlags2's fIntSecurity
+    // the password: each byte XORed with 0xA5, then its halves swapped
+    let off = binary.readU16LEStr(d, 44)
+    let n = binary.readU16LEStr(d, 46)
+    if off + 2 * n > len(d) { return Err(lexdb_base.err("08P01", "LOGIN7: the password is out of bounds")) }
+    var pw = array(2 * n, byte(0))
+    for i in 0..2 * n {
+        let x = int(d[off + i]) ^ 0xA5
+        pw[i] = byte(((x << 4) & 0xF0) | (x >> 4))
+    }
+    let password = match tds.fromUtf16(strFromBytes(&pw)) {
+        Ok(s) { s }
+        Err(m) { return Err(lexdb_base.err("08P01", "LOGIN7: the password: " + m)) }
+    }
+    return Ok(Login{user: try loginField(d, 40), password: password, app: try loginField(d, 48),
+                    database: try loginField(d, 68), packetSize: binary.readU32LEStr(d, 8), integrated: integrated})
+}
+
+// Whether the login may in: its role's password under scram-sha-256, any
+// under trust. The message is SQL Server's, which names no reason.
+fn (c: mut &Conn) authorized(l: &Login, encrypted: bool): Result[Unit, str] {
+    let fail = "Login failed for user '" + l.user + "'."
+    if l.integrated { return Err("Login failed. The login is from an untrusted domain and cannot be used with Integrated authentication.") }
+    let conf = lexdb_wire.confOf(&c.st)
+    if conf.requireTls && !encrypted { return Err(fail) }
+    if conf.tcp != "scram-sha-256" { return Ok(Unit{}) }
+    let rs = match lexdb_exec.roles(&c.st) {
+        Ok(x) { x }
+        Err(_) { return Err(fail) }
+    }
+    for r in rs {
+        if r.name == l.user {
+            if !r.login { return Err(fail) }
+            match lexdb_auth.parseVerifier(&r.verifier) {
+                Some(v) {
+                    if lexdb_auth.checkPassword(&v, &l.password).unwrapOr(false) { return Ok(Unit{}) }
+                }
+                None {}
+            }
+            return Err(fail)
+        }
+    }
+    return Err(fail)
+}
+
+// The login's answer: the database, collation and language, LOGINACK, the
+// packet size, then DONE.
+fn (c: mut &Conn) welcome(packetSize: int) {
+    c.o.envchange(tds.ENV_DATABASE, &DB_NAME, &"master")
+    c.o.message(tds.TK_INFO, 5701, 2, 0, &("Changed database context to '" + DB_NAME + "'."))
+    // ENVCHANGE 7: the collation's 5 bytes, then none for the old value
+    let at = c.o.start(tds.TK_ENVCHANGE)
+    c.o.u8(tds.ENV_COLLATION)
+    c.o.u8(5)
+    c.o.raw(&COLLATION)
+    c.o.u8(0)
+    c.o.end(at)
+    c.o.envchange(tds.ENV_LANGUAGE, &"us_english", &"")
+    c.o.message(tds.TK_INFO, 5703, 1, 0, &"Changed language setting to us_english.")
+    let la = c.o.start(tds.TK_LOGINACK)
+    c.o.u8(1)                                  // the interface: SQL
+    binary.appendU32BE(mut &c.o.b, tds.TDS74)
+    c.o.bvarchar(&PROG_NAME)
+    c.o.u8(VERSION_MAJOR)
+    c.o.u8(VERSION_MINOR)
+    c.o.u8(VERSION_BUILD >> 8)
+    c.o.u8(VERSION_BUILD & 0xff)
+    c.o.end(la)
+    c.o.envchange(tds.ENV_PACKETSIZE, &packetSize.toStr(), &packetSize.toStr())
+    c.o.done(0, 0, 0)
+}
+
+// The TLS handshake carried in PRELOGIN packets, then TLS on the socket.
+// Ok(false) when it failed or the client went.
+fn handshake(t: mut &tds.Transport, ctx: &tls.Context): Result[bool, tds.Error] {
+    var e = match ctx.engine("") {
+        Ok(x) { x }
+        Err(_) { return Ok(false) }
+    }
+    while true {
+        let m = try t.receive(1048576)
+        if m.ptype != tds.PT_PRELOGIN { return Ok(false) }
+        e.feed(&strToBytes(m.data))
+        let r = e.handshake()
+        let out = e.takeOutput()
+        if len(out) > 0 { try t.send(tds.PT_PRELOGIN, strFromBytes(&out)) }
+        match r {
+            Ok(done) { if done { break } }
+            Err(_) { return Ok(false) }
+        }
+    }
+    try t.startTls(e)
+    return Ok(true)
+}
+
+// PRELOGIN, TLS and LOGIN7; Ok(true) once logged in, Ok(false) when the
+// client was refused or went.
+fn (c: mut &Conn) login(ctx: &[]tls.Context): Result[bool, tds.Error] {
+    let m = try c.t.receive(65536)
+    if m.ptype != tds.PT_PRELOGIN { return Ok(false) }
+    let pre = match tds.parsePrelogin(m.data) {
+        Ok(x) { x }
+        Err(_) { return Ok(false) }
+    }
+    let conf = lexdb_wire.confOf(&c.st)
+    let asked = pre.encryption & 0x7F
+    // ON and REQ: TLS for everything; OFF: TLS for the login only (all of it
+    // when --require-tls); NOT_SUP: none (refused under --require-tls)
+    var answer = tds.ENCRYPT_NOT_SUP
+    if len(ctx) > 0 {
+        if asked == tds.ENCRYPT_ON || asked == tds.ENCRYPT_REQ {
+            answer = tds.ENCRYPT_ON
+        } else if asked == tds.ENCRYPT_OFF {
+            answer = if conf.requireTls { tds.ENCRYPT_REQ } else { tds.ENCRYPT_OFF }
+        } else {
+            answer = if conf.requireTls { tds.ENCRYPT_REQ } else { tds.ENCRYPT_NOT_SUP }
+        }
+    }
+    try c.t.send(tds.PT_REPLY, preloginAnswer(answer))
+    if answer == tds.ENCRYPT_NOT_SUP && asked != tds.ENCRYPT_NOT_SUP && asked != tds.ENCRYPT_OFF { return Ok(false) }
+    if answer == tds.ENCRYPT_REQ && asked == tds.ENCRYPT_NOT_SUP { return Ok(false) }
+    let tlsUsed = answer != tds.ENCRYPT_NOT_SUP
+    if tlsUsed {
+        if !(try handshake(mut &c.t, &ctx[0])) { return Ok(false) }
+    }
+    let lm = try c.t.receive(65536)
+    if lm.ptype != tds.PT_LOGIN7 { return Ok(false) }
+    let loginOnly = answer == tds.ENCRYPT_OFF
+    if loginOnly { try c.t.stopTls() }
+    let parsed = parseLogin(&lm.data)
+    if parsed.isErr() {
+        c.o.message(tds.TK_ERROR, 18456, 1, 14, &parsed.unwrapErr().msg)
+        c.o.done(tds.DONE_ERROR, 0, 0)
+        try c.send()
+        return Ok(false)
+    }
+    let l = parsed.unwrap()
+    match c.authorized(&l, tlsUsed && !loginOnly) {
+        Ok(_) {}
+        Err(msg) {
+            c.o.message(tds.TK_ERROR, 18456, 1, 14, &msg)
+            c.o.done(tds.DONE_ERROR, 0, 0)
+            try c.send()
+            return Ok(false)
+        }
+    }
+    let db = strings.toLowerAscii(l.database)
+    if len(db) > 0 && db != DB_NAME && db != "master" {
+        c.o.message(tds.TK_ERROR, 4060, 1, 11, &("Cannot open database \"" + l.database + "\" requested by the login. The login failed."))
+        c.o.done(tds.DONE_ERROR, 0, 0)
+        try c.send()
+        return Ok(false)
+    }
+    c.sess.setUser(&l.user)
+    c.user = l.user
+    let ps = if l.packetSize == 0 { tds.DEFAULT_PACKET } else { min(max(l.packetSize, tds.MIN_PACKET), MAX_PACKET_SIZE) }
+    c.welcome(ps)
+    try c.send()
+    c.t.packetSize = ps
+    return Ok(true)
+}
+
+pub type ConnArg = record { pub conn: net.Conn; pub st: lexdb_store.Store; pub id: int; ctx: []tls.Context }
+
+// Serves one client until it goes away.
+pub fn serve(a: ConnArg): int {
+    let ConnArg{conn: sock, st: st, id: id, ctx: ctx} = move(a)
+    let nd = sock.setNoDelay(true)
+    var c = Conn{t: tds.transport(sock), sess: lexdb_exec.newSession(st), st: st, o: newOut(), ts: lexdb_tsql.newState(id),
+                 user: "", txn: 0, preps: []}
+    // SQL Server's default collation, a literal's and a variable's (L2)
+    c.sess.setCollation(&lexdb_sql.TSQL_COLLATION)
+    if c.login(&ctx).unwrapOr(false) {
+        let r = c.requests()
+    }
+    lexdb_tsql.dropTemps(mut &c.sess, mut &c.ts)
+    c.sess.close()
+    return 0
+}
+
+// ---- listening
+
+pub type ListenArg = record { pub lns: []net.Listener; pub st: lexdb_store.Store }
+
+pub type AcceptArg = record { pub ln: net.Listener; pub st: lexdb_store.Store }
+
+// Serves each TDS listener in an accept loop of its own, until the task
+// running it is cancelled.
+pub fn acceptAll(a: ListenArg): int {
+    var ListenArg{lns: lns, st: st} = move(a)
+    task.scope(fn(s: mut &task.Scope) {
+        while len(lns) > 0 {
+            let ln = pop(mut &lns)
+            s.spawn(acceptLoop, AcceptArg{ln: ln, st: st})
+        }
+    })
+    return 0
+}
+
+// The TLS context for TDS: the server's certificate, TLS 1.2 at most (the
+// handshake inside PRELOGIN is TLS 1.2's, as SQL Server's is).
+fn tlsContext(conf: &lexdb_wire.AuthConf): Result[tls.Context, tls.Error] {
+    var o = tls.defaults()
+    o.certFile = conf.cert
+    o.keyFile = if len(conf.key) > 0 { conf.key } else { conf.cert }
+    o.maxVersion = tls.Version.Tls12
+    return tls.server(o)
+}
+
+// Accepts TDS connections and serves each in a task of its own, until the
+// task running it is cancelled.
+pub fn acceptLoop(a: AcceptArg): int {
+    let AcceptArg{ln: ln, st: st} = move(a)
+    var id = 0
+    var ctxs: []tls.Context = []
+    let conf = lexdb_wire.confOf(&st)
+    if len(conf.cert) > 0 {
+        match tlsContext(&conf) {
+            Ok(x) { append(mut &ctxs, x) }
+            Err(x) { eprintln("lexdb: tds: tls: " + x.toStr()) }
+        }
+    }
+    task.scope(fn(s: mut &task.Scope) {
+        while true {
+            match ln.accept() {
+                Ok(c) {
+                    id += 1
+                    var mine: []tls.Context = []
+                    if len(ctxs) > 0 { append(mut &mine, ctxs[0].share()) }
+                    s.spawn(serve, ConnArg{conn: c, st: st, id: id, ctx: mine})
+                }
+                Err(e) {
+                    if e.isCancelled() || e.isTimeout() { return }
+                    eprintln("lexdb: tds: accept: " + e.toStr())
+                    let r = task.sleep(100)
+                    if r.isErr() { return }
+                }
+            }
+        }
+    })
+    return 0
+}

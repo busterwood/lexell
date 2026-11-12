@@ -1,0 +1,367 @@
+// lexdb_tsqlparse: a T-SQL batch's own statements (design/lexdb-tds.md).
+//
+// DECLARE, SET @v = ..., SET options, and transaction control (BEGIN TRAN,
+// COMMIT, ROLLBACK, SAVE TRAN) are read here; every other statement, and
+// every expression and type name in these, is lexdb's grammar, read by
+// lexdb_sql in T-SQL mode (@variables, [names], N'...', SQL Server's type
+// names) through its Parser. The control of flow S4 adds (IF, WHILE,
+// TRY ... CATCH, procedures) belongs here too.
+//
+// A batch is parsed whole before any of it runs, as SQL Server compiles
+// one: a syntax error anywhere runs none of it. lexdb_tsql runs what this
+// gives.
+
+import "strings"
+import "./lexdb_base"
+import "./lexdb_sql"
+
+type DbErr = lexdb_base.DbErr
+type TypeName = lexdb_sql.TypeName
+type Stmt = lexdb_sql.Stmt
+type Expr = lexdb_sql.Expr
+type Parser = lexdb_sql.Parser
+
+pub const TS_SQL = 1        // a statement of lexdb's parser: stmt[0]
+pub const TS_DECLARE = 2    // DECLARE: names and types; stmt: the initialisers, as SELECT @v = expr
+pub const TS_SETOPT = 3     // SET options value: names (lower case) and value
+pub const TS_BEGIN = 4      // BEGIN TRAN[SACTION] [name]
+pub const TS_COMMIT = 5     // COMMIT [TRAN[SACTION] | WORK] [name]
+pub const TS_ROLLBACK = 6   // ROLLBACK [TRAN[SACTION] | WORK] [name]: names[0] the name, if any
+pub const TS_SAVE = 7       // SAVE TRAN[SACTION] name: names[0]
+// control of flow (S4)
+pub const TS_IF = 8         // IF: stmt[0] the condition (SELECT 1 or 0); body, else els
+pub const TS_WHILE = 9      // WHILE: stmt[0] the condition; body
+pub const TS_BLOCK = 10     // BEGIN ... END: body
+pub const TS_TRY = 11       // BEGIN TRY body END TRY BEGIN CATCH els END CATCH
+pub const TS_BREAK = 12
+pub const TS_CONTINUE = 13
+pub const TS_RETURN = 14
+pub const TS_PRINT = 15     // stmt[0]: SELECT the message
+pub const TS_RAISERROR = 16 // stmt[0]: SELECT message, severity, state, arguments ...
+pub const TS_THROW = 17     // stmt[0]: SELECT number, message, state; none: the error being handled again
+pub const TS_TABLEVAR = 18  // DECLARE @t TABLE (...): names[0] @t; stmt[0] its CREATE TABLE (of #@t)
+
+pub type TStmt = record {
+    pub kind: int
+    pub stmt: []Stmt
+    pub names: []str
+    pub types: []TypeName
+    pub value: str          // TS_SETOPT: the value
+    pub body: []TStmt       // TS_IF, TS_WHILE, TS_BLOCK, TS_TRY: the statements run
+    pub els: []TStmt        // TS_IF's ELSE, TS_TRY's CATCH
+}
+
+// A parsed batch: its statements, and its variables (those given, then
+// those it declares, in order) with the declared ones' types.
+pub type TBatch = record {
+    pub stmts: []TStmt
+    pub vars: []str
+    pub types: []TypeName
+}
+
+// The SET options T-SQL has (and lexdb_dialect, lexdb's own).
+const SET_OPTIONS: []str = ["quoted_identifier", "ansi_nulls", "ansi_padding", "ansi_warnings", "arithabort",
+    "arithignore", "concat_null_yields_null", "numeric_roundabort", "ansi_null_dflt_on", "ansi_null_dflt_off",
+    "cursor_close_on_commit", "implicit_transactions", "textsize", "nocount", "xact_abort", "lock_timeout",
+    "deadlock_priority", "language", "dateformat", "datefirst", "rowcount", "no_browsetable", "fmtonly",
+    "query_governor_cost_limit", "ansi_defaults", "forceplan", "statistics", "showplan_text", "showplan_all",
+    "showplan_xml", "parseonly", "noexec", "context_info", "lexdb_dialect"]
+
+fn isSetOption(w: &str): bool {
+    for o in SET_OPTIONS { if o == w { return true } }
+    return false
+}
+
+fn tstmt(kind: int): TStmt { return TStmt{kind: kind, stmt: [], names: [], types: [], value: "", body: [], els: []} }
+
+// Statements to the END that closes their block (not read).
+fn block(q: mut &Parser, types: mut &[]TypeName): Result[[]TStmt, DbErr] {
+    var out: []TStmt = []
+    while true {
+        while q.acceptKw(";") {}
+        if q.isKw("end") { break }
+        if q.peek().kind == lexdb_sql.T_EOF { return Err(lexdb_base.err("42601", "syntax error at end of input")) }
+        append(mut &out, try tsqlStmt(q, types))
+    }
+    return Ok(out)
+}
+
+// One statement where IF, ELSE and WHILE take one.
+fn single(q: mut &Parser, types: mut &[]TypeName): Result[TStmt, DbErr] {
+    while q.acceptKw(";") {}
+    return tsqlStmt(q, types)
+}
+
+// Whether the next token ends a statement with nothing after it (THROW, RETURN).
+fn atEnd(q: &Parser): bool {
+    let t = q.peek()
+    return t.kind == lexdb_sql.T_EOF || (t.kind == lexdb_sql.T_OP && t.text == ";") || (t.kind == lexdb_sql.T_IDENT && (t.text == "end" || t.text == "else"))
+}
+
+// An optional transaction or savepoint name after BEGIN TRAN, COMMIT, ROLLBACK.
+fn tranName(q: mut &Parser, names: mut &[]str) {
+    let t = q.peek()
+    if t.kind == lexdb_sql.T_IDENT && !lexdb_sql.isReservedWord(&t.text) || t.kind == lexdb_sql.T_QIDENT || t.kind == lexdb_sql.T_VAR {
+        q.skip(1)
+        append(names, t.text)
+    }
+}
+
+// DECLARE @v [AS] type [= expr], ..., after DECLARE.
+fn declare(q: mut &Parser, types: mut &[]TypeName): Result[TStmt, DbErr] {
+    var ts = tstmt(TS_DECLARE)
+    while true {
+        let t = q.peek()
+        if t.kind != lexdb_sql.T_VAR || strings.startsWith(t.text, "@@") { return Err(q.unexpected()) }
+        q.skip(1)
+        let a = q.acceptKw("as")
+        if q.isKw("table") || q.isKw("cursor") { return Err(lexdb_base.err("0A000", "DECLARE of a table or cursor variable is not supported yet")) }
+        let ty = try q.typeName()
+        q.fresh()
+        var init: Option[Expr] = None
+        if q.acceptKw("=") { init = Some(try q.expr()) }
+        if q.hasVar(&t.text) {
+            return Err(lexdb_base.err("TS134", "The variable name '" + t.text + "' has already been declared. Variable names must be unique within a query batch or stored procedure."))
+        }
+        q.declare(&t.text)
+        append(types, ty)
+        append(mut &ts.names, t.text)
+        append(mut &ts.types, ty)
+        match replace(mut &init, None) {
+            Some(e) { append(mut &ts.stmt, q.assign(&t.text, e)) }
+            None {}
+        }
+        if !q.acceptKw(",") { break }
+    }
+    return Ok(ts)
+}
+
+// SET option[, option ...] value, after SET; TRANSACTION ISOLATION LEVEL ... too.
+fn setOption(q: mut &Parser): Result[TStmt, DbErr] {
+    var ts = tstmt(TS_SETOPT)
+    if q.acceptKw("transaction") {
+        try q.expectKw("isolation")
+        try q.expectKw("level")
+        append(mut &ts.names, "transaction isolation level")
+        var v = q.next().text
+        if v == "read" || v == "repeatable" { v = v + " " + q.next().text }
+        ts.value = v
+        return Ok(ts)
+    }
+    while true {
+        let t = q.next()
+        append(mut &ts.names, t.text)
+        if !q.acceptKw(",") { break }
+    }
+    let v = q.next()
+    if v.kind == lexdb_sql.T_EOF { return Err(lexdb_base.err("42601", "syntax error at end of input")) }
+    ts.value = if v.kind == lexdb_sql.T_IDENT { v.text } else { strings.toLowerAscii(v.text) }
+    if v.kind == lexdb_sql.T_OP && v.text == "-" { ts.value = "-" + q.next().text }
+    return Ok(ts)
+}
+
+// One of the batch's statements, at a statement's start.
+fn tsqlStmt(q: mut &Parser, types: mut &[]TypeName): Result[TStmt, DbErr] {
+    q.fresh()
+    let t = q.peek()
+    if t.kind == lexdb_sql.T_IDENT {
+        let w1 = q.peekAt(1)
+        if t.text == "declare" && w1.kind == lexdb_sql.T_VAR && q.peekAt(2).kind == lexdb_sql.T_IDENT && q.peekAt(2).text == "table" {
+            // DECLARE @t TABLE (...): a table for the batch, #@t
+            q.skip(3)
+            var ts = tstmt(TS_TABLEVAR)
+            append(mut &ts.names, w1.text)
+            append(mut &ts.stmt, try q.tableDef(&("#" + w1.text)))
+            return Ok(ts)
+        }
+        if t.text == "declare" {
+            q.skip(1)
+            return declare(q, types)
+        }
+        if t.text == "set" && w1.kind == lexdb_sql.T_VAR {
+            q.skip(2)
+            let target = try q.variable(&w1)
+            // SET @v = e, and SET @v += e and the like
+            var op = ""
+            let o = q.peek()
+            if o.kind == lexdb_sql.T_OP && (o.text == "+" || o.text == "-" || o.text == "*" || o.text == "/" || o.text == "%") &&
+               q.peekAt(1).kind == lexdb_sql.T_OP && q.peekAt(1).text == "=" {
+                q.skip(1)
+                op = if o.text == "+" { "t+" } else { o.text }
+            }
+            try q.expectKw("=")
+            var e = try q.expr()
+            if len(op) > 0 { e = Expr.Bin(op, target, e) }
+            var ts = tstmt(TS_SQL)
+            append(mut &ts.stmt, q.assign(&w1.text, e))
+            return Ok(ts)
+        }
+        if t.text == "if" {
+            q.skip(1)
+            var ts = tstmt(TS_IF)
+            append(mut &ts.stmt, try q.condition())
+            append(mut &ts.body, try single(q, types))
+            if q.isKw(";") && q.peekAt(1).kind == lexdb_sql.T_IDENT && q.peekAt(1).text == "else" { q.skip(1) }
+            if q.acceptKw("else") { append(mut &ts.els, try single(q, types)) }
+            return Ok(ts)
+        }
+        if t.text == "while" {
+            q.skip(1)
+            var ts = tstmt(TS_WHILE)
+            append(mut &ts.stmt, try q.condition())
+            append(mut &ts.body, try single(q, types))
+            return Ok(ts)
+        }
+        if t.text == "break" || t.text == "continue" {
+            q.skip(1)
+            return Ok(tstmt(if t.text == "break" { TS_BREAK } else { TS_CONTINUE }))
+        }
+        if t.text == "return" {
+            q.skip(1)
+            if !atEnd(q) && (q.peek().kind == lexdb_sql.T_NUM || q.peek().kind == lexdb_sql.T_VAR || q.isKw("(") || q.isKw("-")) {
+                q.fresh()
+                let x = try q.expr()
+            }
+            return Ok(tstmt(TS_RETURN))
+        }
+        if t.text == "print" {
+            q.skip(1)
+            q.fresh()
+            let e = try q.expr()
+            var ts = tstmt(TS_PRINT)
+            append(mut &ts.stmt, q.values([e]))
+            return Ok(ts)
+        }
+        if t.text == "raiserror" {
+            // RAISERROR (message, severity, state [, argument ...]) [WITH option, ...]
+            q.skip(1)
+            try q.expectKw("(")
+            q.fresh()
+            var args: []Expr = [try q.expr()]
+            while q.acceptKw(",") { append(mut &args, try q.expr()) }
+            try q.expectKw(")")
+            if q.acceptKw("with") {
+                let o = q.next()
+                while q.acceptKw(",") { let o2 = q.next() }
+            }
+            if len(args) < 3 { return Err(lexdb_base.err("42601", "RAISERROR takes a message, a severity and a state")) }
+            var ts = tstmt(TS_RAISERROR)
+            append(mut &ts.stmt, q.values(args))
+            return Ok(ts)
+        }
+        if t.text == "throw" {
+            // THROW number, message, state; THROW alone in a CATCH block
+            q.skip(1)
+            var ts = tstmt(TS_THROW)
+            if !atEnd(q) {
+                q.fresh()
+                var args: []Expr = [try q.expr()]
+                try q.expectKw(",")
+                append(mut &args, try q.expr())
+                try q.expectKw(",")
+                append(mut &args, try q.expr())
+                append(mut &ts.stmt, q.values(args))
+            }
+            return Ok(ts)
+        }
+        if t.text == "set" && w1.kind == lexdb_sql.T_IDENT && w1.text == "identity_insert" {
+            // SET IDENTITY_INSERT [schema.]table ON | OFF: names the option and the table
+            q.skip(2)
+            var ts = tstmt(TS_SETOPT)
+            append(mut &ts.names, "identity_insert")
+            var n = q.next()
+            while q.acceptKw(".") { n = q.next() }
+            if n.kind != lexdb_sql.T_IDENT && n.kind != lexdb_sql.T_QIDENT { return Err(q.unexpected()) }
+            append(mut &ts.names, n.text)
+            let v = q.next()
+            if v.text != "on" && v.text != "off" { return Err(q.unexpected()) }
+            ts.value = v.text
+            return Ok(ts)
+        }
+        if t.text == "set" && w1.kind == lexdb_sql.T_IDENT && (isSetOption(&w1.text) || w1.text == "transaction") {
+            q.skip(1)
+            return setOption(q)
+        }
+        if t.text == "begin" {
+            if w1.kind == lexdb_sql.T_IDENT && (w1.text == "tran" || w1.text == "transaction") {
+                q.skip(2)
+                var ts = tstmt(TS_BEGIN)
+                tranName(q, mut &ts.names)
+                return Ok(ts)
+            }
+            if w1.kind == lexdb_sql.T_IDENT && w1.text == "try" {
+                q.skip(2)
+                var ts = tstmt(TS_TRY)
+                ts.body = try block(q, types)
+                try q.expectKw("end")
+                try q.expectKw("try")
+                while q.acceptKw(";") {}
+                try q.expectKw("begin")
+                try q.expectKw("catch")
+                ts.els = try block(q, types)
+                try q.expectKw("end")
+                try q.expectKw("catch")
+                return Ok(ts)
+            }
+            q.skip(1)
+            var ts = tstmt(TS_BLOCK)
+            ts.body = try block(q, types)
+            try q.expectKw("end")
+            return Ok(ts)
+        }
+        if t.text == "commit" || t.text == "rollback" {
+            q.skip(1)
+            var ts = tstmt(if t.text == "commit" { TS_COMMIT } else { TS_ROLLBACK })
+            let kw = q.acceptKw("tran") || q.acceptKw("transaction") || q.acceptKw("work")
+            tranName(q, mut &ts.names)
+            return Ok(ts)
+        }
+        if t.text == "save" {
+            q.skip(1)
+            if !q.acceptKw("tran") { try q.expectKw("transaction") }
+            var ts = tstmt(TS_SAVE)
+            tranName(q, mut &ts.names)
+            if len(ts.names) == 0 { return Err(q.unexpected()) }
+            return Ok(ts)
+        }
+    }
+    var ts = tstmt(TS_SQL)
+    append(mut &ts.stmt, try q.statement())
+    return Ok(ts)
+}
+
+// A batch of T-SQL. vars: the variables it starts with ($1, $2, ... in that order).
+pub fn parseBatch(sql: &str, d: lexdb_sql.Dialect, vars: &[]str): Result[TBatch, DbErr] {
+    var q = try lexdb_sql.tsqlParser(sql, d, vars)
+    var out: []TStmt = []
+    var types: []TypeName = []
+    while true {
+        while q.acceptKw(";") {}
+        if q.peek().kind == lexdb_sql.T_EOF { break }
+        append(mut &out, try tsqlStmt(mut &q, mut &types))
+    }
+    return Ok(TBatch{stmts: out, vars: q.takeVars(), types: types})
+}
+
+// A parameter of sp_executesql's or sp_prepare's @params: "@p1 int, @p2
+// nvarchar(50) OUTPUT".
+pub type ParamDecl = record { pub name: str; pub typ: TypeName; pub output: bool }
+
+pub fn parseParamDecls(text: &str): Result[[]ParamDecl, DbErr] {
+    let none: []str = []
+    var q = try lexdb_sql.tsqlParser(text, lexdb_sql.Dialect{tsql: true, quotedIdent: true}, &none)
+    var out: []ParamDecl = []
+    while q.peek().kind != lexdb_sql.T_EOF {
+        let t = q.next()
+        if t.kind != lexdb_sql.T_VAR { return Err(lexdb_base.err("42601", "syntax error at or near \"" + t.text + "\"")) }
+        let a = q.acceptKw("as")
+        let ty = try q.typeName()
+        if q.acceptKw("=") { let dflt = try q.expr() }
+        let output = q.acceptKw("output") || q.acceptKw("out")
+        let ro = q.acceptKw("readonly")
+        append(mut &out, ParamDecl{name: t.text, typ: ty, output: output})
+        if !q.acceptKw(",") { break }
+    }
+    if q.peek().kind != lexdb_sql.T_EOF { return Err(q.unexpected()) }
+    return Ok(out)
+}

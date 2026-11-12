@@ -1618,6 +1618,92 @@ pub fn tmRequest(kind: int, txn: str): str {
     return strFromBytes(&b)
 }
 
+// ---------------------------------------------------------------- requests, as a server reads them
+
+// The transaction descriptor in a request's ALL_HEADERS (zeros when none),
+// and where the request's own data starts. E_PROTOCOL when malformed.
+pub type Headers = value record { pub txn: str; pub end: int }
+
+pub fn allHeadersOf(d: &str): Result[Headers, Error] {
+    if len(d) < 4 { return Err(proto("a request without ALL_HEADERS")) }
+    var c = cursor(d.toStr())
+    let total = try c.u32("ALL_HEADERS")
+    if total < 4 || total > len(d) { return Err(proto("ALL_HEADERS out of bounds")) }
+    var txn = noTransaction()
+    while c.pos < total {
+        let at = c.pos
+        let n = try c.u32("a header")
+        if n < 6 || at + n > total { return Err(proto("a header out of bounds")) }
+        let kind = try c.u16("a header")
+        if kind == 2 && n >= 14 { txn = try c.take(8, "the transaction descriptor") }
+        c.pos = at + n
+    }
+    return Ok(Headers{txn: txn, end: total})
+}
+
+// A parameter of an RPC as a server reads it (MS-TDS 2.2.6.6): its name ("":
+// positional), whether it is OUTPUT (fByRefValue) or its default
+// (fDefaultValue), its type and its value.
+pub type RpcParam = record {
+    pub name: str
+    pub output: bool
+    pub byDefault: bool
+    pub column: Column
+    pub value: Cell
+}
+
+// One procedure call of an RPC request: a well-known procedure by its id
+// (PROC_EXECUTESQL and the rest; procName "") or a procedure by its name
+// (procId 0), its option flags, its parameters.
+pub type RpcCall = record {
+    pub procId: int
+    pub procName: str
+    pub options: int
+    pub params: []RpcParam
+}
+
+pub const PROC_PREPARE = 11
+pub const PROC_EXECUTE = 12
+pub const PROC_PREPEXEC = 13
+pub const PROC_PREPEXECRPC = 14
+pub const PROC_UNPREPARE = 15
+
+// An RPC request's calls (several in one request, each after a batch
+// separator). E_PROTOCOL for anything malformed; a table-valued parameter
+// or another type this decoder does not know is E_PROTOCOL too.
+pub fn parseRpc(d: str): Result[[]RpcCall, Error] {
+    let h = try allHeadersOf(&d)
+    var c = cursor(d)
+    c.pos = h.end
+    var calls: []RpcCall = []
+    while c.left() > 0 {
+        var call = RpcCall{procId: 0, procName: "", options: 0, params: []}
+        let n = try c.u16("the procedure")
+        if n == 0xFFFF {
+            call.procId = try c.u16("the procedure's id")
+        } else {
+            call.procName = try text16(try c.take(2 * n, "the procedure's name"), "the procedure's name")
+        }
+        call.options = try c.u16("the option flags")
+        while c.left() > 0 {
+            let b = int(strByte(c.s, c.pos))
+            if b == 0xFF || b == 0xFE || b == 0x80 {
+                c.pos += 1                                  // the next call
+                break
+            }
+            let name = try c.bvarchar("a parameter's name")
+            let status = try c.u8("a parameter's status")
+            var col = column(try c.u8("a parameter's type"))
+            col.name = name
+            try typeInfo(mut &c, mut &col)
+            let v = try readValue(mut &c, &col)
+            append(mut &call.params, RpcParam{name: name, output: (status & 1) != 0, byDefault: (status & 2) != 0, column: col, value: v})
+        }
+        append(mut &calls, call)
+    }
+    return Ok(calls)
+}
+
 // ---------------------------------------------------------------- reading
 
 // A position in a byte string, with an end.
@@ -2729,7 +2815,7 @@ fn fillInbox(s: mut &Stream, ib: mut &Inbox, dl: int, w: Where): Result[Unit, Er
 }
 
 // A message read: its packets' type and their payloads joined.
-pub type Received = value record { pub ptype: int; pub data: str }
+pub type Received = value record { pub ptype: int; pub data: str; pub status: int }
 
 // A connection's packets: written a message at a time, read a message at a
 // time (every packet up to the one with EOM).
@@ -2744,11 +2830,12 @@ pub type Transport = record {
     pub packetSize: int
     msg: []byte              // the payloads of the message being received
     msgType: int             // its packets' type, -1 before its first
+    msgStatus: int           // its first packet's status (a server reads RESETCONNECTION there)
 }
 
 pub fn transport(sock: net.Conn): Transport {
     return Transport{s: Stream.Plain(sock), inbox: Inbox{buf: array(65536, byte(0)), pos: 0, end: 0},
-                     packetSize: DEFAULT_PACKET, msg: [], msgType: -1}
+                     packetSize: DEFAULT_PACKET, msg: [], msgType: -1, msgStatus: 0}
 }
 
 // Sends one message as packets of the current packet size.
@@ -2786,6 +2873,7 @@ pub fn (t: mut &Transport) receive(limit: int, w: Where): Result[Received, Error
         let p = try t.nextPacket(-1, w)
         if t.msgType < 0 {
             t.msgType = p.ptype
+            t.msgStatus = p.status
         } else if p.ptype != t.msgType {
             return Err(proto("a packet of type " + p.ptype.toStr() + " inside a message of type " + t.msgType.toStr()))
         }
@@ -2795,7 +2883,7 @@ pub fn (t: mut &Transport) receive(limit: int, w: Where): Result[Received, Error
         appendStr(mut &t.msg, p.data)
         if p.eom { break }
     }
-    let r = Received{ptype: t.msgType, data: strFromBytes(&t.msg)}
+    let r = Received{ptype: t.msgType, data: strFromBytes(&t.msg), status: t.msgStatus}
     t.msg = []
     t.msgType = -1
     return Ok(r)
@@ -2804,14 +2892,14 @@ pub fn (t: mut &Transport) receive(limit: int, w: Where): Result[Received, Error
 // The part of a message that receive had read when it was ended, and its
 // packets' type (-1: none); the transport no longer holds it.
 fn (t: mut &Transport) takePartial(): Received {
-    let r = Received{ptype: t.msgType, data: strFromBytes(&t.msg)}
+    let r = Received{ptype: t.msgType, data: strFromBytes(&t.msg), status: t.msgStatus}
     t.msg = []
     t.msgType = -1
     return r
 }
 
 // One packet of a message.
-pub type Packet = value record { pub ptype: int; pub eom: bool; pub data: str }
+pub type Packet = value record { pub ptype: int; pub eom: bool; pub data: str; pub status: int }
 
 // Reads one packet (a stream reads its reply a packet at a time).
 pub fn (t: mut &Transport) receivePacket(w: Where): Result[Packet, Error] { return t.nextPacket(-1, w) }
@@ -2826,7 +2914,8 @@ fn (t: mut &Transport) nextPacket(dl: int, w: Where): Result[Packet, Error] {
             let h = try parseHeader(&t.inbox.buf[at..at + HEADER])
             if have >= h.length {
                 t.inbox.pos = at + h.length
-                return Ok(Packet{ptype: h.ptype, eom: (h.status & STATUS_EOM) != 0, data: strFromBytes(&t.inbox.buf[at + HEADER..at + h.length])})
+                return Ok(Packet{ptype: h.ptype, eom: (h.status & STATUS_EOM) != 0, data: strFromBytes(&t.inbox.buf[at + HEADER..at + h.length]),
+                              status: h.status})
             }
         }
         try fillInbox(mut &t.s, mut &t.inbox, dl, w)
@@ -2837,7 +2926,7 @@ fn (t: mut &Transport) nextPacket(dl: int, w: Where): Result[Packet, Error] {
 fn (t: &Transport) buffered(): bool { return t.inbox.pos < t.inbox.end }
 
 // Puts TLS over the socket, with an engine whose handshake is done.
-fn (t: mut &Transport) startTls(e: tls.Engine): Result[Unit, Error] {
+pub fn (t: mut &Transport) startTls(e: tls.Engine): Result[Unit, Error] {
     if t.buffered() { return Err(proto("bytes after the TLS handshake")) }
     match replace(mut &t.s, Stream.Gone) {
         Stream.Plain(c) {
@@ -2850,7 +2939,7 @@ fn (t: mut &Transport) startTls(e: tls.Engine): Result[Unit, Error] {
 
 // Ends TLS without close_notify (encryption for the login only); bytes
 // that arrived after the last record are read next, as plain bytes.
-fn (t: mut &Transport) stopTls(): Result[Unit, Error] {
+pub fn (t: mut &Transport) stopTls(): Result[Unit, Error] {
     match replace(mut &t.s, Stream.Gone) {
         Stream.Tls(c) {
             let tls.Detached{sock: sock, rest: rest} = c.detach()
