@@ -2447,6 +2447,61 @@ batches on than off (1,610 against 1,340 ns). That was so before 9.101 too
 (c66474b0: 1,645 against 1,315), so it is not 9.102's. It is left for a
 profile.
 
+## 42. Semi-joins: a correlated subquery hashed or looked up, by cost (2026-11-12)
+
+lexdb 9.104 turns WHERE's `x IN (subquery)` and `EXISTS (subquery)` into
+semi-join levels: the subquery's rows hashed once, each outer row probing
+them. The question for the planner is a correlated subquery whose outer
+value is a key of one of its tables. The benchmark's
+`exists (select 1 from d where d.k = w.a and d.grp = 3)` is an example:
+d's primary key, looked up per outer row (memoised by the value).
+
+**Two plans.**
+- **The usual plan:** the subquery is planned as before (a lookup per
+  outer row).
+- **A second plan:** the subquery is planned again with its outer values
+  refused as keys. `Scope.noRefKeys` is taken by its `buildQuery` as
+  `Query.noRefKeys`, and `keyBefore` and `valBefore` reject an expression
+  using its refs. The equalities stay conditions, and 9.9's `hashSub`
+  takes them out as the hash's keys.
+- **Only for semi-join candidates:** a WHERE conjunct of a SELECT, the
+  subquery correlated, not hashed by 9.9 as planned.
+- **Not planned again:**
+  - in the rules mode;
+  - where the query may stop early;
+  - in a transaction whose reads are noted;
+  - when the second plan differs in its outer values, has a subquery of
+    its own, or a function whose value changes.
+
+**The choice** (`semiCheaper`, optimizer 41's constants):
+
+    hash:   inner × (COST_SCAN_INNER + HASH_BUILD) + outer × HASH_PROBE
+    lookup: outer × (COST_DESCENT + COST_KEY_ROW)
+
+- **inner:** the rows the second plan's tables read.
+- **outer:** the rows the outer query's first table reads by its path.
+  - One for a unique key's point.
+  - Else ANALYZE's figure (`pathFig`), with the statistics loaded for the
+    estimate when the level has none (a query of one table loads none,
+    optimizer 24).
+  - In a join this is a lower bound of the rows reaching the semi-join,
+    so the choice leans to the lookups, the plan as it was.
+- **Unknown on either side** (no ANALYZE): the lookups stay, as before.
+- The memo of the per-row plan (one run per distinct outer value) is not
+  counted. The per-row path's cost is mostly its per-row machinery, which
+  the batched probe does not have.
+
+**Examples:**
+- The benchmark: 1M outer rows, 1,000 inner. The hash costs 20,000 + 2M
+  units, the lookups 57M. Hashed: 602 ms to 38 ms of CPU.
+- `exec_semijoin`'s `f.id = 7 and exists (... d.k = f.x)`: one outer row
+  (the primary key's point). One lookup, 57 units, against d's 200 rows
+  hashed (4,002). It stays per row.
+
+**Planning time.** The second plan doubles the planning of such a
+subquery. It is only done for the candidates above, and a prepared
+statement pays it once. Point selects have no subquery and pay nothing.
+
 ## Sources
 
 - SQLite, Query Planner Next Generation: https://sqlite.org/queryplanner-ng.html

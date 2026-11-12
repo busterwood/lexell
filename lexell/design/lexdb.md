@@ -8864,3 +8864,181 @@ The suite passes (109).
   and selective filters (late materialisation).
 - A lookup per row is about 20% slower with batches on than off, before
   9.101 too: not yet explained.
+
+### 9.104 IN and EXISTS as semi-joins
+
+Item 1 of [lexdb-engines.md](lexdb-engines.md). PostgreSQL pulls
+`a IN (select k from d where grp = 3)` and a correlated
+`EXISTS (select 1 from d where d.k = w.a and d.grp = 3)` up into a hash
+semi join (`convert_ANY_sublink_to_join`, `convert_EXISTS_sublink_to_join`):
+50 ms each on the 1M-row `w`. lexdb ran the IN through a hashed set on the
+row path (470 ms), and the EXISTS per row, memoised, by d's primary key
+(602 ms). Neither reached 9.102's batched joins.
+
+**What becomes a semi-join** (`semiJoins`, at the end of `buildQuery`):
+- a conjunct of a SELECT's WHERE, at its top level, that is `x IN
+  (subquery)` (or `x = ANY (subquery)`) or `EXISTS (subquery)`;
+- found in the conditions of a table that is not the nullable side of an
+  outer join;
+- of one of these forms:
+  - **IN, uncorrelated:** hashed on its value; x is the probe. Any
+    subquery: it runs once, as before, so a LIMIT, an aggregate, a set
+    operation or a volatile function in it means what it meant.
+  - **Correlated, hashed by 9.9** (its outer values only in its WHERE's
+    equalities `inner = outer`; no LIMIT, aggregate, grouping or set
+    operation): hashed on the inner sides, then IN's value. The outer
+    sides, in the outer query's terms, are the probe.
+  - **Correlated, that 9.9 could not hash because an outer value was a
+    lookup's key** (the benchmark's EXISTS on `d.k`): see the planner,
+    below.
+
+**Not:**
+- NOT IN and NOT EXISTS (NOT IN's NULLs; left where they were);
+- a conjunct under OR, in the select list, in ON, HAVING;
+- a subquery a path reads its IN values from (`Path.inSub`: `id IN
+  (...)` on a key stays a lookup per value);
+- UPDATE and DELETE (their target's level is kept as it is).
+- **Types:** a key whose two types a hash would compare otherwise than
+  `=` and IN do (`semiTypes`) stays as it was. Allowed:
+  - integers and numerics by value;
+  - text and varchar by their text;
+  - boolean, date, timestamp, timestamptz and uuid each with itself.
+
+  Not floats (-0 and 0), intervals ('1 day' and '24 hours'), char(n) (its
+  blanks), nor text against an integer (IN parses the text).
+
+**The level.**
+- **Place:** a level placed right after the one the conjunct was checked
+  at, so a join after it sees only the rows kept.
+- **Rows:** its rows are the subquery's, run once before the query
+  (`runSemi`, in `prepare`), and hashed by `materialize` with the keys as
+  9.9's: `keyPart`, numbers by value. IN's value is under its collation
+  kind (L2, resolve's `subKinds`), as `runSub` keys its set.
+- **No names:** its columns are named `\0sjN.\0rowidJ`, hidden: not in
+  `*`, no name a query can use (`d.k` is still "missing FROM-clause
+  entry").
+- **The conjunct is taken out of its level's conditions,** and out of
+  its hash's filters when that table is read once (`local`). The first
+  build missed `local`: `exec_insub`'s join case gave 0 rows for 300.
+- **At most once:**
+  - **The row path** (`runLevel`) stops at a row's first match.
+  - **The batches** (`bProbe`) take a bucket's first row only. The level
+    has no conditions, so the first match always joins and the counts
+    are the row path's.
+  - **Keys:** one integer key or one text key gets its own map, as for a
+    table. The rows are keyed by value, so an integer's key is its
+    value's.
+- **`batchGroups`** now takes a query whose subqueries are all
+  semi-joins' (it took none).
+- **NULLs:** a NULL x or outer key probes nothing; a NULL inner key or
+  value is not in the hash. In a WHERE conjunct, NULL and false both drop
+  the row.
+
+**The planner** (lexdb-optimizer.md 42). A correlated EXISTS or IN that
+9.9 could not hash, because an outer value was a lookup's key, is
+planned a second time:
+- **How:** without outer values as keys (`Scope.noRefKeys`, taken by the
+  subquery's `buildQuery`: `keyBefore` and `valBefore` refuse them).
+  9.9's `hashSub` then takes the equalities out as keys.
+- **The choice:** the hashed plan is taken when reading the subquery once
+  and probing costs less than a lookup per outer row, by optimizer 41's
+  constants and ANALYZE's statistics. Without statistics the plan stays
+  per row, as before.
+- **Not planned again:**
+  - where reading may stop early (a LIMIT);
+  - in a transaction whose reads are noted (a whole table's read would
+    conflict with every write to it);
+  - when the subquery has a subquery of its own, or a function whose
+    value changes (`immutable`): once and per row would differ.
+
+**EXPLAIN:**
+
+```
+scan w: full scan (rows read 1000000, kept 1000000, batches 977)
+semi join d: hash on (k) over rows of subquery 1 (table rows 100 of 100 read, probes 1000000, rows read 103093, joined 103093)
+aggregate
+subquery 1 (exists): semi join on d.k = w.a, run once (runs 1)
+  scan d: full scan (rows read 1000, kept 100, batches 1)
+```
+
+With batches off, the same lines but for "batches N".
+
+**Errors.** The subquery runs whole, once:
+- **IN uncorrelated and 9.9's hashed ones:** the same as before.
+- **Planned again:** any error the per-row runs would raise is raised,
+  and also one on a row of the subquery no outer row asked for (as in
+  PostgreSQL's hash semi join).
+- **Order:** the semi-join comes after its level's other conditions, so
+  an error in one of them (`10 / (id - 900)`) may now come where IN
+  rejected the row first. SQL leaves the order open, and PostgreSQL also
+  applies the semi-join after the scan's filter.
+- **EXISTS's select list** is no longer evaluated (`select 1/0`), as in
+  PostgreSQL and 9.9.
+
+**Measured** (the user's benchmark, 1M-row `w`, `$S/vec/bench.py`,
+server CPU ms, median of three; PostgreSQL 18 on one core; load about
+1.5 to 1.9, runs within 1 to 2 ms of each other):
+
+| query | before (9f5f4cb7) | now | PostgreSQL |
+|---|---|---|---|
+| `count(*) where a in (select k from d where grp = 3)` | 470 | **38** | 50 |
+| `count(*) where exists (select 1 from d where d.k = w.a and d.grp = 3)` | 602 | **38** | 50 |
+| the IN, 103k rows out | 520 | **57** | 60 |
+| `count(*) where city in (select city from cr where big)` | 499 | **101** | 80 |
+| the same as EXISTS | 734 | **100** | 80 |
+| `w join d ... where exists (select 1 from d d2 where d2.k = w.b and d2.grp = 3)` | 2,350 | **52** | 20 |
+| `id in (select k ...)`: a lookup per value, unchanged | 0 | 0 | 10 |
+| `id = 5 and exists (... d.k = w.a)`: one row, stays per row | 0 | 0 | 0 |
+
+- **The text key:** it costs what 9.102's text hash join costs (the
+  plain join on `cr.city` takes 100 ms too).
+- **The join:** PostgreSQL makes d2's 100 keys distinct and reads `w`
+  through `w_b`. lexdb places the semi-join after `w`'s scan; it does
+  not drive the join from it.
+
+**Tests:**
+- **`exec_semijoin`** (new), over 1,800, 200 and 30 rows with NULLs and
+  repeated values:
+  - **300 random queries against a reference:** the same query with its
+    conjunct written `(c) = true`, which is no semi-join. The same rows
+    in all 300. 300 ran a semi-join, 162 of them over batches.
+  - **300 more with batches off and on,** errors included (division by
+    zero inside and outside the subquery): all the same.
+  - **60 in a transaction** with its own writes: all the same.
+  - **What the queries cover:**
+    - IN on an integer, text, numeric, date, varchar, an expression, a
+      two-table subquery, DISTINCT with ORDER BY and LIMIT;
+    - IN and EXISTS correlated on one key and on two, on the subquery's
+      primary key (planned again);
+    - NOT IN, NOT EXISTS and OR beside them;
+    - rows out, sorted, grouped, a join, a LIMIT.
+  - **EXPLAIN ANALYZE's counts** are the same on and off for an IN whose
+    values repeat and an EXISTS whose rows do.
+  - **Plans:** a semi-join for IN, EXISTS by a primary key, two keys,
+    before a join; per row for NOT IN, OR, the select list and one
+    pinned row.
+  - **Mixed types:** eight queries with mixed types against the
+    reference; a float stays per row.
+  - **Hidden columns:** `*` and `d.v` do not see the level.
+- **Mutations caught:**
+  - the row path not stopping at the first match: 56 of 300 differ from
+    the reference, 70 on and off, both counts;
+  - the batches taking every match: 74, and both counts;
+  - `semiTypes` taking any types: the float case.
+- **`exec_sub`:** three EXPLAIN lines of 9.9's hashed EXISTS now show the
+  semi-join. Their results are unchanged.
+- **Against PostgreSQL 18:** 46 queries over tables of 2,000, 150 and 30
+  rows, with NULLs and repeats in every column. All give the same output
+  in both, with batches on and off, the two division-by-zero errors
+  included. 41 ran as semi-joins (not: NOT IN twice, NOT EXISTS, OR, one
+  pinned row).
+
+The suite passes (110).
+
+**Not done:**
+- **NOT EXISTS and NOT IN as anti-joins.** NOT EXISTS is the easy one;
+  NOT IN needs the NULL-aware form.
+- **Driving the join from the semi-join's keys** (PostgreSQL's unique-ified
+  inner side, then an index).
+- **Correlations other than equalities** (`d.v > w.x`).
+- **A conjunct in an outer join's ON.**
