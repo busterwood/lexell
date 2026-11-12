@@ -9042,3 +9042,22 @@ The suite passes (110).
   inner side, then an index).
 - **Correlations other than equalities** (`d.v > w.x`).
 - **A conjunct in an outer join's ON.**
+
+### 9.106 IS TRUE and IS FALSE never give NULL; IS after IN, LIKE, BETWEEN
+
+Found reviewing 9.104 against PostgreSQL:
+- **`NULL IS NOT FALSE` gave NULL** in lexdb; PostgreSQL gives true. The
+  parser wrote `x IS TRUE` as `x = true` (and `IS FALSE` as `x = false`),
+  which is NULL for a NULL x. Now `x IS TRUE` is
+  `NOT (x IS DISTINCT FROM true)`, and `IS NOT TRUE` is
+  `x IS DISTINCT FROM true` (the same for FALSE), so neither is ever NULL.
+  `IS [NOT] UNKNOWN` is added, as `IS [NOT] NULL`.
+- **`x IN (...) IS NOT FALSE` was a syntax error.** `IS` was parsed only
+  where no comparison, IN, LIKE or BETWEEN had been. It now binds more
+  loosely than those, as PostgreSQL's grammar has it: `x = y IS TRUE` is
+  `(x = y) IS TRUE`. `cmpExpr` parses the comparison (`cmpExpr0`), then
+  any number of `IS` tests (`isTail`).
+
+Tests: `exec_ops` has six queries, checked against PostgreSQL 18: the four
+NULL cases, UNKNOWN, and IS after a comparison, IN, LIKE and BETWEEN. The
+suite passes (110).

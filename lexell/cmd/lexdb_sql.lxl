@@ -1174,7 +1174,16 @@ fn (p: mut &P) notExpr(): Result[Expr, lexdb_base.DbErr] {
     return p.cmpExpr()
 }
 
+// A comparison, IN, LIKE or BETWEEN, then any IS tests of it: IS binds
+// more loosely than those, as PostgreSQL's grammar has it (x = y IS TRUE is
+// (x = y) IS TRUE; x IN (...) IS NOT FALSE too).
 fn (p: mut &P) cmpExpr(): Result[Expr, lexdb_base.DbErr] {
+    var e = try p.cmpExpr0()
+    while p.isKw("is") { e = try p.isTail(e) }
+    return Ok(e)
+}
+
+fn (p: mut &P) cmpExpr0(): Result[Expr, lexdb_base.DbErr] {
     var e = try p.catExpr()
     let t = p.peek()
     if t.kind == T_OP && (t.text == "=" || t.text == "<>" || t.text == "!=" || t.text == "<" || t.text == "<=" ||
@@ -1314,6 +1323,13 @@ fn (p: mut &P) cmpExpr(): Result[Expr, lexdb_base.DbErr] {
         return Ok(negate(neg, x))
     }
     if neg { return Err(near(&p.peek())) }
+    return Ok(e)
+}
+
+// e IS [NOT] NULL, TRUE, FALSE, UNKNOWN, DISTINCT FROM x. IS TRUE and IS
+// FALSE are never NULL: e IS TRUE is e IS NOT DISTINCT FROM true (a NULL
+// e is not true: false); IS NOT TRUE its opposite (a NULL e: true).
+fn (p: mut &P) isTail(e: Expr): Result[Expr, lexdb_base.DbErr] {
     if p.acceptKw("is") {
         let isNot = p.acceptKw("not")
         if p.acceptKw("distinct") {
@@ -1341,13 +1357,14 @@ fn (p: mut &P) cmpExpr(): Result[Expr, lexdb_base.DbErr] {
             }
             return Ok(Expr.IsNull(e, isNot))
         }
-        if p.acceptKw("true") {
-            let x = Expr.Bin("=", e, Expr.Lit(Val.Bool(true)))
-            return Ok(if isNot { Expr.Unary("not", x) } else { x })
+        if p.acceptKw("true") || p.acceptKw("false") {
+            let b = p.toks[p.pos - 1].text == "true"
+            let d = Expr.Call("distinct from", [e, Expr.Lit(Val.Bool(b))], false)
+            return Ok(if isNot { d } else { Expr.Unary("not", d) })
         }
-        if p.acceptKw("false") {
-            let x = Expr.Bin("=", e, Expr.Lit(Val.Bool(false)))
-            return Ok(if isNot { Expr.Unary("not", x) } else { x })
+        if p.peek().kind == T_IDENT && p.peek().text == "unknown" {
+            p.pos += 1
+            return Ok(Expr.IsNull(e, isNot))
         }
         return Err(near(&p.peek()))
     }
