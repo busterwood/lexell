@@ -15,6 +15,8 @@
 // - after ANALYZE, kind = $1 and uid = $2 plans per value of kind (9.56):
 //   kind 1 is 99% of the rows (its common value), kind 2 1% (no row of it has
 //   uid 5); a value of the same scale takes its plan again;
+// - the same for a primary key prefix against an index (9.57): tenant 1 (95%
+//   of the rows) reads the index, tenant 1950 (one row) the key;
 // - A in a block begun before B drops and remakes a table keeps the plan
 //   its snapshot's schema matches and sees the old rows; after COMMIT it
 //   plans again and sees the new table;
@@ -29,6 +31,7 @@
 // expect: partial index again: 4, plans 2
 // expect: rolled-back version: 10 10, plans 3
 // expect: per value: 10 0 10, plans 2
+// expect: primary key prefix: 38 1 38, plans 2
 // expect: block before the drop: 3 3, plans 1
 // expect: after commit: 0, plans 2
 // expect: run once: plans 0
@@ -145,6 +148,19 @@ fn main() {
         let e25 = run(mut &a, &qe, &[Val.Int(2), Val.Int(5)], mut &pce)
         let e17 = run(mut &a, &qe, &[Val.Int(1), Val.Int(7)], mut &pce)
         println("per value: " + e15 + " " + e25 + " " + e17 + ", plans " + pce.plans.toStr())
+
+        // a primary key prefix against an index (9.57): tenant 1 is 95% of the
+        // rows, so its plan reads mt_kind; tenant 1950 has one row, the key
+        one(mut &b, &"create table mt (tenant int, id int, kind int, primary key (tenant, id))")
+        one(mut &b, &"insert into mt select case when g <= 1900 then 1 else g end, g, g % 50 from generate_series(1, 2000) g")
+        one(mut &b, &"create index mt_kind on mt (kind)")
+        one(mut &b, &"analyze mt")
+        let qm = stmt(&"select count(*) from mt where tenant = $1 and kind = $2")
+        var pcm = lexdb_exec.newPlanCache()
+        let m10 = run(mut &a, &qm, &[Val.Int(1), Val.Int(0)], mut &pcm)
+        let m19 = run(mut &a, &qm, &[Val.Int(1950), Val.Int(0)], mut &pcm)
+        let m13 = run(mut &a, &qm, &[Val.Int(1), Val.Int(3)], mut &pcm)
+        println("primary key prefix: " + m10 + " " + m19 + " " + m13 + ", plans " + pcm.plans.toStr())
 
         one(mut &b, &"create table u (x int primary key)")
         one(mut &b, &"insert into u values (1), (2), (3)")
