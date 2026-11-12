@@ -1409,6 +1409,13 @@ fn kindOid(v: &Val): int {
 // A function in FROM: its columns, from its arguments' types.
 fn srfCols(name: &str, ordin: bool, args: &[]OutCol): Result[[]OutCol, DbErr] {
     var out: []OutCol = []
+    if name == "pg_available_extensions" {
+        // lexdb has no extensions: no rows
+        append(mut &out, OutCol{name: "name", oid: lexdb_sql.OID_NAME})
+        append(mut &out, OutCol{name: "default_version", oid: lexdb_sql.OID_TEXT})
+        append(mut &out, OutCol{name: "comment", oid: lexdb_sql.OID_TEXT})
+        return Ok(out)
+    }
     if name == "pg_partition_ancestors" {
         append(mut &out, OutCol{name: "relid", oid: lexdb_sql.OID_REGCLASS})
         if ordin { append(mut &out, OutCol{name: "ordinality", oid: lexdb_sql.OID_INT8}) }
@@ -1493,7 +1500,9 @@ fn execSrf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
     var rows: [][]Val = []
     let room = rs.room()
     var bytes = 0
-    if sel.srf == "pg_partition_ancestors" {
+    if sel.srf == "pg_available_extensions" {
+        // none
+    } else if sel.srf == "pg_partition_ancestors" {
         // no partitions in lexdb: a relation is its only ancestor
         if len(args) == 1 && !isNull(&args[0]) {
             let o = oidArg(&args[0]).unwrapOr(0)
@@ -8909,7 +8918,7 @@ pub fn exprOid(x: &Expr, cols: &[]lexdb_sql.ColDef, ptypes: &[]int): int {
                 "format_type", "pg_get_expr", "pg_get_constraintdef", "pg_get_indexdef", "pg_get_serial_sequence", "quote_ident",
                 "array_to_string", "obj_description", "col_description", "shobj_description", "pg_get_viewdef", "json_build_object",
                 "jsonb_build_object", "pg_get_userbyid", "repeat", "pg_get_triggerdef", "pg_get_ruledef", "pg_get_statisticsobjdef_columns",
-                "pg_get_function_result", "pg_get_function_arguments" {
+                "pg_get_function_result", "pg_get_function_arguments", "pg_size_pretty" {
                     return lexdb_sql.OID_TEXT
                 }
                 "current_user", "session_user", "current_schema", "pg_encoding_to_char" { return lexdb_sql.OID_NAME }
@@ -8920,7 +8929,7 @@ pub fn exprOid(x: &Expr, cols: &[]lexdb_sql.ColDef, ptypes: &[]int): int {
                     return lexdb_sql.OID_BOOL
                 }
                 "array_length", "array_upper", "array_lower", "cardinality", "generate_subscripts" { return lexdb_sql.OID_INT4 }
-                "pg_relation_size", "pg_total_relation_size", "pg_table_size", "pg_indexes_size" { return lexdb_sql.OID_INT8 }
+                "pg_relation_size", "pg_total_relation_size", "pg_table_size", "pg_indexes_size", "pg_database_size" { return lexdb_sql.OID_INT8 }
                 "to_regclass", "pg_partition_ancestors" { return lexdb_sql.OID_REGCLASS }
                 "to_regtype" { return lexdb_sql.OID_REGTYPE }
                 "to_regnamespace" { return lexdb_sql.OID_REGNAMESPACE }
@@ -16907,6 +16916,14 @@ fn bindCatalog(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[Unit, 
     if len(txn.tmp) > 0 { b.add("T\t" + txn.tmp + "\n") }       // the session's temporary schema (9.96)
     for ct in snap.tabs {
         b.add("r\t" + ct.oid.toStr() + "\t" + ct.shown + "\t" + ct.schema + "\t" + ct.name + "\n")
+        // the trees, for the size functions: the table's, then its indexes'
+        var trees: []str = [ct.t.tree.toStr()]
+        for x in ct.t.indexes { append(mut &trees, x.tree.toStr()) }
+        b.add("z\t" + ct.oid.toStr() + "\tt\t" + strings.join(&trees, ",") + "\n")
+        for ix in ct.idxs {
+            // a primary key is the table's own tree in lexdb: no pages of its own
+            for x in ct.t.indexes { if lexdb_sql.baseName(&x.name) == ix.name { b.add("z\t" + ix.oid.toStr() + "\ti\t" + x.tree.toStr() + "\n") } }
+        }
         for ix in ct.idxs {
             b.add("r\t" + ix.oid.toStr() + "\t" + shownIn(&snap.path, &ct.schema, &ix.name) + "\t" + ct.schema + "\t" + ix.name + "\n")
             var cols: []str = []
@@ -16932,6 +16949,7 @@ fn bindCatalog(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[Unit, 
     for d in snap.seqs {
         let sc = lexdb_sql.schemaOf(&d.key)
         let nm = lexdb_sql.baseName(&d.key)
+        b.add("z\t" + seqOid(&d).toStr() + "\tS\t\n")
         b.add("r\t" + seqOid(&d).toStr() + "\t" + shownIn(&snap.path, &sc, &nm) + "\t" + sc + "\t" + nm + "\n")
     }
     for r in lexdb_pgcat.relNames() {
@@ -16997,6 +17015,49 @@ fn relOidOf(se: &SeqEnv, s: &str): int {
         return strings.parseIntOpt(l[0]).unwrapOr(0)
     }
     return 0
+}
+
+// The size functions (9.97) of relation oid in bytes: a table's tree (its
+// rows, with its primary key) and its indexes' trees, counted by
+// lexdb_store.treePages; a sequence one PostgreSQL page; a view or catalog
+// relation 0; NULL for no relation.
+fn relSize(se: &SeqEnv, name: &str, oid: int): Result[Val, DbErr] {
+    let k = oid.toStr()
+    for l in catLines(se, &"z") {
+        if l[0] != k { continue }
+        if l[1] == "S" { return Ok(Val.Int(if name == "pg_indexes_size" { 0 } else { 8192 })) }
+        let trees = strings.split(&l[2], ",")
+        var pages = 0
+        for i in 0..len(trees) {
+            let tr = strings.parseIntOpt(trees[i]).unwrapOr(-1)
+            if tr < 0 { continue }
+            let mine = i == 0
+            let take = if l[1] == "i" { name != "pg_indexes_size" } else if name == "pg_indexes_size" { !mine } else if name == "pg_total_relation_size" { true } else { mine }
+            if take { pages += try se.st.treePages(tr) }
+        }
+        return Ok(Val.Int(pages * lexdb_page.PAGE))
+    }
+    if relShown(se, oid).isSome() { return Ok(Val.Int(0)) }
+    return Ok(Val.Null)
+}
+
+// PostgreSQL's pg_size_pretty: bytes below 10 kB, then kB, MB, GB, TB and PB,
+// each kept below 20480 of itself, rounded half away from zero.
+fn sizePretty(v: int): str {
+    let names = ["bytes", "kB", "MB", "GB", "TB", "PB"]
+    var size = v
+    for i in 0..len(names) {
+        let lim = if i == 0 { 10 * 1024 } else { 20 * 1024 - 1 }
+        let abs = if size < 0 { -size } else { size }
+        if i == len(names) - 1 || abs < lim {
+            if i > 0 { size = (size + (if size < 0 { -1 } else { 1 })) / 2 }
+            return size.toStr() + " " + names[i]
+        }
+        // to the next unit: 10 bits, one fewer into a rounded one, one more out of one
+        let bits = 10 - 1 + (if i > 0 { 1 } else { 0 })
+        size = size / (1 << bits)
+    }
+    return size.toStr()
 }
 
 fn relShown(se: &SeqEnv, oid: int): Option[str] {
@@ -18207,6 +18268,23 @@ fn callMisc(name: &str, vs: &[]Val): Result[Option[Val], DbErr] {
         if n == 2 && oidArg(&vs[1]).unwrapOr(0) != 1 { return Ok(Some(Val.Null)) }
         return Ok(Some(Val.Int(if name == "array_lower" { 1 } else { k })))
     }
+    if name == "pg_size_pretty" && n == 1 {
+        match vs[0] {
+            Val.Null { return Ok(Some(Val.Null)) }
+            Val.Int(x) { return Ok(Some(Val.Text(sizePretty(x)))) }
+            else {
+                match coerce(vs[0], &lexdb_sql.TypeName{kind: lexdb_sql.K_INT, oid: lexdb_sql.OID_INT8, prec: 0, scale: 0, len: 0}) {
+                    Ok(iv) {
+                        match iv {
+                            Val.Int(x) { return Ok(Some(Val.Text(sizePretty(x)))) }
+                            else { return Ok(Some(Val.Null)) }
+                        }
+                    }
+                    Err(x) { return Err(x) }
+                }
+            }
+        }
+    }
     if name == "pg_encoding_to_char" && n == 1 { return Ok(Some(Val.Text(if oidArg(&vs[0]) == Some(6) { "UTF8" } else { "SQL_ASCII" }))) }
     if (name == "json_build_object" || name == "jsonb_build_object") {
         if n % 2 != 0 { return Err(e("22023", "argument list must have even number of elements")) }
@@ -18268,8 +18346,33 @@ fn callCat(name: &str, vs: &[]Val, se: &SeqEnv): Result[Option[Val], DbErr] {
         let m = if isNull(&vs[1]) { -1 } else { oidArg(&vs[1]).unwrapOr(-1) }
         return Ok(Some(Val.Text(lexdb_pgcat.formatType(fo, m))))
     }
-    if (name == "pg_relation_size" || name == "pg_total_relation_size" || name == "pg_table_size" || name == "pg_indexes_size") {
-        return Ok(Some(Val.Int(0)))
+    if (name == "pg_relation_size" || name == "pg_total_relation_size" || name == "pg_table_size" || name == "pg_indexes_size") && n >= 1 {
+        if isNull(&vs[0]) { return Ok(Some(Val.Null)) }
+        if name == "pg_relation_size" && n == 2 && text(&vs[1]) != "main" { return Ok(Some(Val.Int(0))) }
+        // a name as text is read as a regclass, as PostgreSQL types the argument
+        var oid = oidArg(&vs[0]).unwrapOr(0)
+        match vs[0] {
+            Val.Text(t) {
+                oid = relOidOf(se, &t)
+                if oid == 0 { return Err(e("42P01", "relation \"" + t + "\" does not exist")) }
+            }
+            else {}
+        }
+        return Ok(Some(try relSize(se, name, oid)))
+    }
+    if name == "pg_database_size" && n == 1 {
+        if isNull(&vs[0]) { return Ok(Some(Val.Null)) }
+        let db = "lexdb"
+        let named = match vs[0] {
+            Val.Text(t) { t == db }
+            else { oidArg(&vs[0]) == Some(16384) }
+        }
+        if !named { return Err(e("3D000", "database \"" + text(&vs[0]) + "\" does not exist")) }
+        // every tree's pages, as the size functions count them (the data
+        // file may hold freed pages, and rows still only in the log)
+        var pages = 0
+        for tr in se.st.trees() { if tr < lexdb_store.OVF { pages += try se.st.treePages(tr) } }
+        return Ok(Some(Val.Int(pages * lexdb_page.PAGE)))
     }
     if n >= 1 && isNull(&vs[0]) { return Ok(Some(Val.Null)) }
     if name == "pg_table_is_visible" && n == 1 {
@@ -18586,6 +18689,12 @@ fn catRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &str): Result
         "pg_database" {
             append(mut &rows, [iv(16384), tv(&db), iv(OID_OWNER), iv(6), tv(&"c"), bv(false), bv(true), iv(-1), iv(0), iv(1), iv(1663),
                                tv(&"C"), tv(&"C"), Val.Null, Val.Null, Val.Null, Val.Null, Val.Null])
+        }
+        "pg_language" {
+            // the languages PostgreSQL has before CREATE EXTENSION (lexdb runs none of them)
+            append(mut &rows, [iv(12), tv(&"internal"), iv(OID_OWNER), bv(false), bv(false), iv(0), iv(0), tv(&"fmgr_internal_validator"), Val.Null])
+            append(mut &rows, [iv(13), tv(&"c"), iv(OID_OWNER), bv(false), bv(false), iv(0), iv(0), tv(&"fmgr_c_validator"), Val.Null])
+            append(mut &rows, [iv(14), tv(&"sql"), iv(OID_OWNER), bv(false), bv(true), iv(0), iv(0), tv(&"fmgr_sql_validator"), Val.Null])
         }
         "pg_tablespace" {
             append(mut &rows, [iv(1663), tv(&"pg_default"), iv(OID_OWNER), Val.Null, Val.Null])

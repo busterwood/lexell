@@ -1450,6 +1450,69 @@ fn (st: &Store) getIn(t: mut &Txn, tree: int, key: str, mode: int): Result[Optio
     return Ok(None)
 }
 
+// The pages of tree and of its companion (large values), as the latest
+// commit has them: for pg_relation_size and the like. The interior nodes
+// are read (loaded if they are not in the cache); the leaves under the
+// lowest interior level are counted from their parents, not loaded. The
+// height is the leftmost path's. A replica: 0.
+pub fn (st: &Store) treePages(tree: int): Result[int, lexdb_base.DbErr] {
+    if st.fo.isSome() { return Ok(0) }
+    var total = 0
+    for tr in [tree, tree + OVF] {
+        while true {
+            var need = -1
+            var count = 0
+            var bad: []lexdb_base.DbErr = []
+            st.sh.with(fn(db: mut &Db) {
+                if len(db.failed) > 0 {
+                    append(mut &bad, db.failed[0])
+                    return
+                }
+                let r = match db.trees.get(&tr) { Some(x) { x } None { -1 } }
+                if r < 0 { return }
+                var h = 0
+                var s = r
+                while true {
+                    if !db.meta[s].loaded {
+                        need = s
+                        return
+                    }
+                    if db.pool[db.meta[s].frame].leaf { break }
+                    s = db.pool[db.meta[s].frame].kids[0]
+                    h += 1
+                }
+                if h == 0 {
+                    count = 1
+                    return
+                }
+                var level: []int = [r]
+                var depth = 0
+                while depth < h {
+                    var next: []int = []
+                    for x in level {
+                        if !db.meta[x].loaded {
+                            need = x
+                            return
+                        }
+                        count += 1
+                        let nk = len(db.pool[db.meta[x].frame].kids)
+                        if depth == h - 1 { count += nk } else { for k in db.pool[db.meta[x].frame].kids { append(mut &next, k) } }
+                    }
+                    level = next
+                    depth += 1
+                }
+            })
+            if len(bad) > 0 { return Err(bad[0]) }
+            if need < 0 {
+                total += count
+                break
+            }
+            try st.load(need)
+        }
+    }
+    return Ok(total)
+}
+
 // getIn for a snapshot's reads: the key's leaf as the snapshot sees it,
 // one descent (9.53; a one-key scan, as before, cost a point lookup 15%).
 fn (st: &Store) snapGet(t: mut &Txn, tree: int, key: str, mode: int): Result[Option[str], lexdb_base.DbErr] {

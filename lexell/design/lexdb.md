@@ -8128,3 +8128,65 @@ sequences and grants with them), then its other sequences.
 - unlogged storage for temporary (or UNLOGGED) tables;
 - `CREATE TEMP TABLE ... (LIKE t)`, `WITH (...)`, `TABLESPACE`;
 - temporary types and functions.
+
+### 9.97 psql's \d+: sizes, pg_language, pg_available_extensions
+
+The user's report: `\d+` failed. psql's listings with `+` (`\d+`, `\dt+`,
+`\di+`, `\dv+`, `\ds+`, `\l+`) call `pg_size_pretty` on the size
+functions. `\df+` reads `pg_language`, and `\dx` reads
+`pg_available_extensions()` in FROM. `\d+ t` on one relation already worked.
+
+**Real sizes, not zeros.** The size functions answered 0 (9.80), so `\dt+`
+would have said "0 bytes" for every table.
+- `lexdb_store.treePages(tree)` counts the pages of a tree and of its
+  companion (large values), as the latest commit has them.
+  - It reads the interior nodes only, loading those not in the cache. The
+    leaves under the lowest interior level are counted from their parents.
+  - The height is the leftmost path's, since a B+tree's leaves are all at
+    one depth. On a replica it gives 0.
+- The bound catalog (9.80) has a line per table, index and sequence with
+  its trees (`z`), so the functions find them by OID.
+  - `pg_relation_size(rel [, fork])`: the relation's own tree. Another
+    fork is 0.
+  - `pg_table_size`: the table's tree, its rows and their large values.
+  - `pg_indexes_size`: its indexes' trees.
+  - `pg_total_relation_size`: both.
+- Bytes are pages × 4096, lexdb's page size.
+- **Other relations:**
+  - a sequence is 8192, PostgreSQL's one page;
+  - a view or catalog relation is 0;
+  - an OID that is no relation is NULL;
+  - a name given as text is read as a regclass (42P01 if none).
+- **A primary key's index (`t_pkey`) is 0 bytes:** in lexdb it is the
+  table's tree itself, counted in the table's size.
+- **`pg_database_size(name | oid)`** is every tree's pages (`Store.trees`).
+  The data file's length would count freed pages, and miss rows still only
+  in the log. Another database name is 3D000.
+- **`pg_size_pretty(bigint | numeric)`** is PostgreSQL's (dbsize.c):
+  - bytes below 10240;
+  - then kB, MB, GB, TB and PB, each used below 20480 of itself;
+  - halves rounded away from zero, negatives the same.
+  - A numeric is taken as a bigint. PostgreSQL's numeric form reaches past
+    8192 PB, and its untyped integer call is ambiguous (42725), which lexdb
+    takes as bigint.
+- **`pg_language`** has PostgreSQL's three built-in languages (internal, c,
+  sql). lexdb runs none of them, and `pg_proc` has no rows.
+- **`pg_available_extensions()`** in FROM gives no rows.
+
+**Checked:** `\d+ \dt+ \di+ \dv+ \ds+ \l+ \df+ \dx \dx+ \dn+` and `\d+ t` all
+run. A table of 50,000 rows of 100 bytes showed 6096 kB, and its text
+index 11 MB.
+
+**Tests:** `exec_psqlplus`, 18 statements generated from PostgreSQL 18 by
+`gen_pg.py psqlplus`, all the same. They cover:
+- `pg_size_pretty` at each unit's edges, negatives and the bigint ends;
+- the size functions' signs, NULLs and zeros (a view, an `init` fork, no
+  relation);
+- a sequence's 8192;
+- the errors;
+- `pg_database_size`;
+- `pg_language`;
+- `pg_available_extensions` in a join.
+
+Sizes themselves differ from PostgreSQL's (4 kB pages, B+trees), so the
+test compares them only with zero and with each other.
