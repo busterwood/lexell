@@ -5906,16 +5906,19 @@ const JOIN_BEST: int = 10
 // memory), in units of a row of a scan in batches (25 ns): a scan read row
 // by row (a hashed table's) 12 (307 ns); a primary key range's row, first
 // table, 1.7 (42 ns); a descent of a tree 12; a row fetched by its key (a
-// lookup's, an index entry's) 45 (about 1,100 ns); a hash's row built 22 and
-// a probe 22 (a 200,000-row hash join: 1,404 ns a row with its read, the
-// same as its lookups, 1,425 ns); a joined row 2.
+// lookup's, an index entry's) 45 (about 1,100 ns); a joined row 2. A hash's
+// row built 8 and a probe 2 (optimizer 41, calib_batch.lxl: joins over
+// batches, lexdb.md 9.102, probe a batch at a time: 13 to 21 ns an outer
+// row on an integer key, 79 on a text key; a row read once and hashed 554
+// ns, its read's 12 and 8). They were 22 and 22 when each probe went
+// through the row path (about 450 ns).
 const COST_SCAN: float = 1.0f
 const COST_SCAN_INNER: float = 12.0f
 const COST_PK_RANGE: float = 1.7f
 const COST_DESCENT: float = 12.0f
 const COST_KEY_ROW: float = 45.0f
-const HASH_PROBE: float = 22.0f
-const HASH_BUILD: float = 22.0f
+const HASH_PROBE: float = 2.0f
+const HASH_BUILD: float = 8.0f
 const ROW_COST: float = 2.0f
 
 // A key column's values among the conjuncts: per value, the levels it uses
@@ -6528,6 +6531,53 @@ fn copyBools(xs: &[]bool): []bool {
     var out: []bool = []
     for x in xs { append(mut &out, x) }
     return out
+}
+
+// A query with outer joins, its tables in FROM's order (optimizer 41):
+// per table after the first, whether it is read once and hashed (true)
+// or looked up per row of the tables before it, whichever costs less, as
+// joinStep weighs them: the rows reaching it are the first table's by its
+// own conditions, then times each table's rows a lookup gives (a LEFT
+// JOIN keeps a row that joins none). false: it does not apply (a RIGHT or
+// FULL JOIN, LATERAL, a table without statistics). early: a lookup stays a
+// lookup (reading may stop early); cap: a hash's bytes at most.
+fn (q: &Query) outerReadOnce(ms: &[][]Expr, early: bool, cap: float, ro: mut &[]bool): bool {
+    let nl = len(q.levels)
+    for lv in q.levels {
+        if keepsRight(lv.join) || lv.lateral || (lv.est.rows < 0 && !lv.virt()) { return false }
+    }
+    var out: []bool = array(nl, false)
+    var rin = 1.0f
+    for k in 0..nl {
+        let lv = &q.levels[k]
+        if lv.virt() { continue }
+        let cs = &ms[k]
+        var own: []Expr = []
+        var ownMasks: []int = []
+        for c in cs {
+            let mk = q.levelMask(&c)
+            if mk == (1 << k) {
+                append(mut &own, clone(&c))
+                append(mut &ownMasks, mk)
+            }
+        }
+        let cands = q.wayCands(k, cs)
+        var g = false
+        let rows = fmax(float(lv.est.rows) * q.localShare(k, &own, &ownMasks, mut &g), 1.0f)
+        if k == 0 {
+            rin = rows
+            continue
+        }
+        let w = q.wayInto(k, &cands, (1 << k) - 1, true, &own)
+        if w.rows < 0.0f { continue }               // no lookup: hashed in any case
+        let base = q.wayInto(k, &cands, 0, false, &own)
+        let hash = base.inner + rows * HASH_BUILD + rin * HASH_PROBE
+        let big = rows * float(estRowBytes(&lv.t)) > cap
+        if !early && !big && hash < rin * w.cost { out[k] = true }
+        rin = if keepsLeft(lv.join) { rin * fmax(w.rows, 1.0f) } else { rin * w.rows }
+    }
+    ro = out
+    return true
 }
 
 // The cheapest order by cost: perm (old indexes, [] when it is FROM's) and
@@ -7703,6 +7753,11 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
             if !ident { perm = po }
         } else if txn.noting() || !q.costOrder(&ms, early, cap, ordT, &ordCols, float(ordLim), mut &perm, mut &ro) {
             perm = q.joinOrder(&ms)
+            // outer joins, in FROM's order: each table hashed or looked up
+            // by cost (optimizer 41)
+            if !txn.noting() && len(perm) == 0 && !q.innerOnly() {
+                if !q.outerReadOnce(&ms, early, cap, mut &ro) { ro = [] }
+            }
         }
         if len(perm) == nl {
             var pool: []Expr = []

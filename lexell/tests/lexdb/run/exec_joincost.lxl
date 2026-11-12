@@ -5,7 +5,8 @@
 // read once and hashed, whichever costs less in reads. Without statistics
 // for every table, the order bound by keys (optimizer 25) stands; SET
 // lexdb_planner = rules keeps FROM's. The results are the rules'. Checked
-// by hand.
+// by hand. With a LEFT JOIN (optimizer 41) FROM's order stands, and each
+// table after the first is hashed or looked up by the same costs.
 // expect: -- small: 100 rows, one labelled x; big: 20,000 rows, 200 per small row; mid: 2,000 rows, no index on sid
 // expect: create table small (id int primary key, label text) -> CREATE TABLE
 // expect: insert into small select g, case when g = 7 then 'x' else 'l' || (g % 10) end from generate_series(1, 100) g -> INSERT 0 100
@@ -37,7 +38,8 @@
 // expect: -- ORDER BY ... LIMIT (optimizer 32): big read in its order and stopped, when the LIMIT's share of the rows makes that cheaper than a sort
 // expect: explain analyze select b.id from big b join small s on s.id = b.sid where s.label = 'l3' order by b.id limit 5 -> scan big b: full scan (rows read 42, kept 42); join small s: primary key lookup per row (lookups 42, rows read 42, joined 5); order: the scan's; limit: stops the scan
 // expect: explain analyze select b.id from big b join small s on s.id = b.sid where s.label = 'l3' order by b.id desc limit 5 -> scan big b: full scan backward (rows read 49, kept 49); join small s: primary key lookup per row (lookups 49, rows read 49, joined 5); order: the scan's; limit: stops the scan
-// expect: explain analyze select b.id from big b join small s on s.id = b.sid where s.label = 'l3' order by b.id limit 1000 -> scan small s: index small_label lookup (estimated 10 rows) (rows read 10, kept 10); join big b: index big_sid lookup (estimated 200 rows) per row (lookups 10, rows read 2000, joined 2000); order: sort
+// expect: explain analyze select b.id from big b join small s on s.id = b.sid where s.label = 'l3' order by b.id limit 1000 -> scan big b: full scan (rows read 10240, kept 10240, batches 10); join small s: hash on (id) over index small_label lookup (estimated 10 rows) (table rows 10 of 10 read, probes 10240, rows read 1024, joined 1024); order: the scan's; limit: stops the scan
+// expect: explain analyze select b.id from big b join small s on s.id = b.sid where s.label = 'x' order by b.id limit 150 -> scan small s: index small_label lookup (estimated 5 rows) (rows read 1, kept 1); join big b: index big_sid lookup (estimated 200 rows) per row (lookups 1, rows read 200, joined 200); order: sort
 // expect: select b.id from big b join small s on s.id = b.sid where s.label = 'l3' order by b.id limit 5 -> [id] 2; 12; 22; 32; 42
 // expect: select b.id from big b join small s on s.id = b.sid where s.label = 'l3' order by b.id desc limit 5 -> [id] 19992; 19982; 19972; 19962; 19952
 // expect: -- a table without statistics: the order bound by keys (here FROM order)
@@ -111,6 +113,15 @@
 // expect: select count(*) from c20 join c19 on c20.p = c19.id join c18 on c19.p = c18.id join c17 on c18.p = c17.id join c16 on c17.p = c16.id join c15 on c16.p = c15.id join c14 on c15.p = c14.id join c13 on c14.p = c13.id join c12 on c13.p = c12.id join c11 on c12.p = c11.id join c10 on c11.p = c10.id join c9 on c10.p = c9.id join c8 on c9.p = c8.id join c7 on c8.p = c7.id join c6 on c7.p = c6.id join c5 on c6.p = c5.id join c4 on c5.p = c4.id join c3 on c4.p = c3.id join c2 on c3.p = c2.id join c1 on c2.p = c1.id where c1.k = 3 -> [count] 10
 // expect: set lexdb_planner = rules -> SET
 // expect: select count(*) from c20 join c19 on c20.p = c19.id join c18 on c19.p = c18.id join c17 on c18.p = c17.id join c16 on c17.p = c16.id join c15 on c16.p = c15.id join c14 on c15.p = c14.id join c13 on c14.p = c13.id join c12 on c13.p = c12.id join c11 on c12.p = c11.id join c10 on c11.p = c10.id join c9 on c10.p = c9.id join c8 on c9.p = c8.id join c7 on c8.p = c7.id join c6 on c7.p = c6.id join c5 on c6.p = c5.id join c4 on c5.p = c4.id join c3 on c4.p = c3.id join c2 on c3.p = c2.id join c1 on c2.p = c1.id where c1.k = 3 -> [count] 10
+// expect: reset lexdb_planner -> RESET
+// expect: -- LEFT JOIN (optimizer 41): FROM's order kept, each table hashed or looked up per row by cost; the results the rules'
+// expect: explain analyze select count(*), count(s.label) from big b left join small s on s.id = b.sid -> scan big b: full scan (rows read 20000, kept 20000, batches 20); left join small s: hash on (id) over full scan (table rows 100 of 100 read, probes 20000, rows read 20000, joined 20000, null rows 0); aggregate
+// expect: select count(*), count(s.label) from big b left join small s on s.id = b.sid -> [count,count] 20000|20000
+// expect: explain analyze select s.id, b.v from small s left join big b on b.id = s.id * 1000 where s.id < 3 -> scan small s: primary key range (estimated 2 rows) (rows read 3, kept 2, batches 1); left join big b: primary key lookup per row (lookups 2, rows read 2, joined 2, null rows 0)
+// expect: select s.id, b.v from small s left join big b on b.id = s.id * 1000 where s.id < 3 -> [id,v] 1|6; 2|5
+// expect: set lexdb_planner = rules -> SET
+// expect: select count(*), count(s.label) from big b left join small s on s.id = b.sid -> [count,count] 20000|20000
+// expect: select s.id, b.v from small s left join big b on b.id = s.id * 1000 where s.id < 3 -> [id,v] 1|6; 2|5
 // expect: reset lexdb_planner -> RESET
 import "../../../cmd/lexdb_store"
 import "../../../cmd/lexdb_disk"
@@ -187,6 +198,8 @@ fn body(st: lexdb_store.Store): int {
     analyze(mut &s, "explain analyze select b.id from big b join small s on s.id = b.sid where s.label = 'l3' order by b.id limit 5")
     analyze(mut &s, "explain analyze select b.id from big b join small s on s.id = b.sid where s.label = 'l3' order by b.id desc limit 5")
     analyze(mut &s, "explain analyze select b.id from big b join small s on s.id = b.sid where s.label = 'l3' order by b.id limit 1000")
+    // one small row of 100 ('x'): its 200 rows looked up and sorted, not big read in order
+    analyze(mut &s, "explain analyze select b.id from big b join small s on s.id = b.sid where s.label = 'x' order by b.id limit 150")
     show(mut &s, "select b.id from big b join small s on s.id = b.sid where s.label = 'l3' order by b.id limit 5")
     show(mut &s, "select b.id from big b join small s on s.id = b.sid where s.label = 'l3' order by b.id desc limit 5")
     println("-- a table without statistics: the order bound by keys (here FROM order)")
@@ -214,6 +227,17 @@ fn body(st: lexdb_store.Store): int {
     show(mut &s, q)
     show(mut &s, "set lexdb_planner = rules")
     show(mut &s, q)
+    show(mut &s, "reset lexdb_planner")
+    println("-- LEFT JOIN (optimizer 41): FROM's order kept, each table hashed or looked up per row by cost; the results the rules'")
+    // big's 20,000 rows: small (100 rows) hashed once, not 20,000 lookups
+    analyze(mut &s, "explain analyze select count(*), count(s.label) from big b left join small s on s.id = b.sid")
+    show(mut &s, "select count(*), count(s.label) from big b left join small s on s.id = b.sid")
+    // small's 2 rows: big looked up by its key twice, not read whole
+    analyze(mut &s, "explain analyze select s.id, b.v from small s left join big b on b.id = s.id * 1000 where s.id < 3")
+    show(mut &s, "select s.id, b.v from small s left join big b on b.id = s.id * 1000 where s.id < 3")
+    show(mut &s, "set lexdb_planner = rules")
+    show(mut &s, "select count(*), count(s.label) from big b left join small s on s.id = b.sid")
+    show(mut &s, "select s.id, b.v from small s left join big b on b.id = s.id * 1000 where s.id < 3")
     show(mut &s, "reset lexdb_planner")
     return 0
 }

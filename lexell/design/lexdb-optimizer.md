@@ -2353,6 +2353,100 @@ estimate).
 differential sets `gen5` seed 3 and `gen4` seed 103 with ANALYZE, 624
 queries, 0 differences.
 
+## 41. Hash joins over batches: their costs measured again; LEFT JOIN by cost (2026-11-12)
+
+lexdb 9.102 runs hash joins a batch at a time. A probe went from about
+450 ns (the row path) to between 13 and 79 ns. The planner's costs, from
+section 36, still priced it at 22 units, the same as building a row. So it
+kept choosing lookups per row (57 units: a descent and a row by key) where a
+hash was now far cheaper. And a LEFT JOIN was never costed: section 26's
+search takes inner joins only, so a LEFT JOIN took a lookup whenever its key
+allowed one. On the user's benchmark (1M rows),
+`w LEFT JOIN d ON d.k = w.a` with `d` at 1,000 rows took 303 ms of CPU by
+200,000 lookups, against PostgreSQL's 40.
+
+**Measured** (`design/experiments/calib_batch.lxl`, in memory, median of
+5, ns a row, batches on / off):
+
+| | on | off |
+|---|---|---|
+| a scan's row (the unit) | 28 | 363 |
+| a probe, integer key, the row joined | 18 to 21 | 434 to 461 |
+| a probe, text key, the row joined | 79 | 521 |
+| a probe, integer key, no row joined | 12 to 13 | 158 to 160 |
+| a row read once and hashed (200,000) | 553 to 564 | 461 to 465 |
+| a lookup by primary key, per outer row | 1,610 to 1,667 | 1,300 to 1,373 |
+
+Section 36's single "hash" figure was the build and the probe together.
+Here they are apart: the build is forced onto the 200,000-row table by a
+LEFT JOIN, which keeps FROM's order.
+
+**The constants** (units of a batched scan's row):
+- **`HASH_PROBE` 22 to 2.** An integer key's probe is under 1 unit and a
+  text key's about 3; 2 is between them, leaning to text. A probe the row
+  path makes (a join the batches cannot run, 9.102) is about 16 units:
+  still well under a lookup's 57, so the choice it makes is right there
+  too.
+- **`HASH_BUILD` 22 to 8.** A row read once and hashed is about 20 units:
+  `COST_SCAN_INNER`'s 12 for the read, 8 for the rest. Batches on, the
+  build is a little dearer than off: 9.102 converts the hashed rows to
+  columns once.
+- **Unchanged:** `COST_DESCENT`, `COST_KEY_ROW` (the lookup measured
+  1,610 ns against 57 units' 1,600) and `ROW_COST`.
+- **The plan's key does not depend on SET `lexdb_batch`.** The planner
+  assumes batches, the default, so that batches on and off run the same
+  plan (the differential tests compare them).
+
+**LEFT JOIN by cost** (`Query.outerReadOnce`). A query with an outer join
+keeps FROM's order. Each table after the first is read once and hashed,
+or looked up per row, whichever `joinStep`'s weighing makes cheaper:
+- **The rows reaching a table:** the first table's rows by its own
+  conditions (`localShare`), then times each table's lookup's rows. A LEFT
+  JOIN keeps a row that joins none, so at least 1.
+- **The alternatives:** the table's constant way read once, each row built
+  and each reaching row probed, against a lookup per reaching row.
+- **Not applied** with a RIGHT or FULL join, LATERAL, or a table without
+  statistics (the rules' choice stands); not when reading may stop early
+  (a lookup stays); not when a hash would pass the cap (optimizer 26
+  review); not in a transaction whose reads are noted (as for section 26).
+
+**Results** (the user's benchmark, CPU ms, 1M rows):
+- `w LEFT JOIN d ON d.k = w.a WHERE w.id < 200000`: 303 to **32**
+  (PostgreSQL 18 on one core: 40). `d` is now hashed.
+- Inner joins chose hashes already where these do; their times are lexdb
+  9.102's.
+- `w JOIN t ON t.id = w.b` (1M rows each) is still 1M lookups (1,580 ms;
+  PostgreSQL 70, by a merge join). A hash of `t` would cost less now, but
+  the cap check counts every column of `t` (112 bytes a row: 112 MB, over
+  64 MB), not just the one the query uses. The columns a query uses
+  (`narrow`, lexdb 9.31) are known only after planning.
+
+**Plans changed in the suite:**
+- **`exec_joincost`:**
+  - `... order by b.id limit 1000`, with `s.label = 'l3'` keeping 10
+    small rows: `big` is now read in key order, each row probing a hash of
+    those 10 small rows, stopping at the LIMIT (10,240 rows read in
+    batches). Before, 2,000 rows were looked up through `big_sid` and
+    sorted. The new plan is the cheaper one: 2,000 rows by an index cost
+    90,000 units, the ordered scan about 30,000.
+  - Added `s.label = 'x'` (one small row, 200 big rows) with LIMIT 150,
+    where the lookups and the sort still win. That keeps the case section
+    32 tests.
+  - Two LEFT JOINs: `big LEFT JOIN small` hashes small (20,000 probes, not
+    lookups); `small LEFT JOIN big` with `s.id < 3` looks big up twice.
+    The results are the rules planner's.
+- **`exec_joinreview`:** `big b JOIN small s ... WHERE b.id < 5 AND
+  s.label = 'l3'` now starts from small: 10 rows by its index, each
+  probing a hash of big's 4-row key range. That prices at 212 units
+  against 247 for 4 lookups; both take microseconds. The test's point,
+  that the range's estimate counts, stands: the hash is over the
+  4-row range.
+
+**Seen, not explained:** a lookup per outer row is about 20% slower with
+batches on than off (1,610 against 1,340 ns). That was so before 9.101 too
+(c66474b0: 1,645 against 1,315), so it is not 9.102's. It is left for a
+profile.
+
 ## Sources
 
 - SQLite, Query Planner Next Generation: https://sqlite.org/queryplanner-ng.html
