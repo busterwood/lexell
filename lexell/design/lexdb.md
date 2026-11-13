@@ -10992,3 +10992,24 @@ fails every query. This one reads every value as written:
 - fuzz, columns on and off, batches on and off, and 9.114's ALTER and
   VACUUM fuzz: the same;
 - ordinary tables' queries (the column-leaf list): times unchanged.
+
+### 9.116 A sequence counting down to a positive least value stopped the server
+
+`nextval` takes a block of values at a time (9.88). How many fit before
+the sequence's bound was computed under a guard against overflow:
+- `max - n`, counting up;
+- `n - min`, counting down.
+
+The guards' own sums overflowed instead: `min + 2^63-1` with a positive
+`min` (`increment by -5 minvalue 80`), and `max - (2^63-1)` with a
+negative `max`. Lexell stops the process on an integer overflow, so the
+server stopped (`integer overflow at lexdb_exec.lxl`) at the first
+`nextval`. The guards now test the signs first: the distance can only
+overflow when `n` and the bound are of opposite signs. `exec_seq` has
+both cases.
+
+Found by a probe of sequences against PostgreSQL 18; its other findings
+are in lexdb-gaps.md 2.2.
+
+**Not fixed:** any integer overflow in the executor stops the whole
+server, and every session with it, not the statement.

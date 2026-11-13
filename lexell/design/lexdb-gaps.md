@@ -137,6 +137,26 @@ In three tiers, by how soon a real application meets the gap.
 
 ### 2.2 Tier 2: common, each with a workaround
 
+- **Sequences and identity columns** (probed against PostgreSQL 18,
+  2026-11-13).
+  - **What matches:** nextval, currval, lastval and setval; the options,
+    cycling, the types' bounds and RESTART; serial; identity ALWAYS and BY
+    DEFAULT with options; OVERRIDING; `pg_get_serial_sequence`; nextval
+    not rolled back; OWNED BY and its drop; `pg_sequences`,
+    `pg_sequence` and `information_schema.sequences`; TRUNCATE RESTART
+    IDENTITY.
+  - **What is missing:**
+    - `ALTER TABLE ... ALTER COLUMN` identity forms (`ADD GENERATED ...
+      AS IDENTITY`, `SET GENERATED`, `RESTART`, `DROP IDENTITY`), which
+      migration tools use;
+    - `ADD COLUMN ... serial` (or identity) on a table with rows (0A000);
+    - reading a sequence as a relation (`SELECT last_value, is_called
+      FROM s`);
+    - `ALTER SEQUENCE` RENAME, OWNER and SET SCHEMA;
+    - `DROP SEQUENCE a, b`;
+    - nextval of a quoted, schema-qualified name (`'app."Mixed"'`).
+  - **Differences:** the GENERATED ALWAYS error's text (its SQLSTATE,
+    428C9, matches).
 - **Tables:**
   - `ADD PRIMARY KEY` on a table made without one (a table's key cannot
     change, 9.88);
