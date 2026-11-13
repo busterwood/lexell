@@ -10169,3 +10169,171 @@ the leaves it changes and shifting their entries.
   32 pages.
 - A commit's sorted writes to one leaf could be applied together (one
   shift of its entries, not one each).
+
+### 9.111 UPDATE's search: a batch used again, tagged rows in two steps; automatic statistics
+
+The brief: `update w set a = a + 1 where id % 1000 < 10` (10,000 of the 1M
+rows) took 257 ms against PostgreSQL's 66, 74% of it the scan decoding
+every column of every row (`bRunInto`); UPDATE should choose its rows by the
+WHERE's columns and read whole rows only for the rows it changes. And
+automatic statistics (lexdb-optimizer.md section 44, built in the same
+branch).
+
+**What the UPDATE was doing at 61d57286.** The 257 ms and its profile were
+taken before 9.108 was merged. Since 9.108 an UPDATE's search over the
+first table's batches (`batchLevel`, `fillPick`) already decodes in two
+steps: the conditions' columns for every row, the others for the rows
+kept. At 61d57286 the statement took 119 ms, and the profile (perf, call
+chains) showed:
+- `newBatch` 27% inclusive, `dup` 17% under it, drops 5%: each fill made a
+  batch of every column the level reads, BROWS (1,024) slots each, the
+  four value columns' slots each a `Val.Null` made (dup) and dropped. A
+  fill that keeps 10 rows of 1,024 paid for all of them.
+- the condition (`bNarrow`, `bEval`, `checkedRem`) 10%; the decoding of the
+  conditions' column (`bRunCols`) 5%;
+- the writes: `updRow` 6%, `copyRow` 6%, `rowPrefix` 3%, the commit 6%.
+- A table with a date or a timestamp (tagged rows, 9.76) was not decoded in
+  two steps at all: its rows went to `bRowInto` whole (9.108: "tagged rows
+  gain nothing from two steps"). The same UPDATE on `us_wt`, `w` with a
+  timestamp column added: 326 ms; `select id ...` with its WHERE 80 ms.
+
+**What changed:**
+- **A lazy fill's batch is used again** (`bReuse`, `fillPickIn`). The
+  caller gives back the batch it is done with (`spare`); the next fill
+  keeps its value columns as they are and makes new integer and NULL
+  columns (cheap: `array` of ints and bools, no per-slot dup). Every slot
+  a fill decodes is written, a NULL too (`bNull`: NULL flag and value), so
+  no value of the last use is read: readers read only the rows in `idx`,
+  all decoded. A batch is used again only when it is of the plan (as many
+  columns, BROWS value slots where needed); `batchLevel` (UPDATE, DELETE,
+  the row path's SELECTs) and `eachOut` (a streamed SELECT: its
+  OutBatch's columns taken back after `eachB`, the outputs' added columns
+  dropped; not a joined batch) give theirs back. fillLevel's whole fills
+  and the other callers make new ones, as before.
+- **Tagged rows in two steps** (`bTagLazy`, `Lazy.bf`, `Lazy.br`,
+  `placesOnly`). A run of tagged rows in a leaf is decoded at the places
+  of the conditions (and of the LIKEs run on the bytes for fixed rows,
+  which a tagged row cannot), the conditions and the top-N's bar run over
+  the run, and the other places are decoded for the rows kept, while the
+  leaf is in hand. `bRowInto` reads a tagged row up to the plan's last
+  place, so a plan of the first places stops early. Rows with long texts
+  in the leaf, rows stored apart and reads merged with the transaction's
+  writes are decoded whole, as before. A kind its column's batch cannot
+  hold, or a condition's error, gives the batch to the row path from its
+  start, as for fixed rows.
+- **UPDATE without FROM writes the rows it found** (`updRow` given the
+  found row and the new one), not copies of their first columns
+  (`rowPrefix`, twice a row).
+
+**Why not narrow the search as DELETE does (`delNarrow`, 9.109)?** An
+UPDATE writes every row back whole, so a search reading only the WHERE's
+columns would have to read each found row again by its key: a descent and a
+whole decode a row, where the two steps decode the kept rows' other columns
+in place for almost nothing. The two steps already are "the WHERE's columns,
+then whole rows for the rows changed", in batches. What they still do not
+cover, and the UPDATE reads whole there as before: the row path (batches
+off, or a WHERE none of whose conditions compile, such as `k <> (select
+...)` alone), an index's rows (9.107: fetched by key, decoded whole), rows
+with long texts or stored apart, and a range merged with the
+transaction's own writes.
+
+**Behaviour kept.** Nothing after the search changed: RETURNING
+(`retAddOld`), foreign keys (`childSide`, `parentSide`, the cascade),
+indexes' old and new entries (`changeIndexes`), UPDATE ... FROM
+(`onceEach`), the row locks (`lockFound`: FOR UPDATE when a key changes,
+else FOR NO KEY UPDATE, 9.86), and the reads noted (`scanLeaves` notes a
+leaf's range as before; the two steps change only what is decoded of it).
+lexdb has no triggers.
+
+**Measured** (wall ms, `\timing` of each statement, median of 5 runs, the
+median of three rounds, each round base, this branch with the automatic
+statistics off, then on; one data directory, a copy of `bd_ob` with `us_wt`
+added; every timing under the agents' shared lock, load 1.3 to 5 from
+other agents' builds and tests). PostgreSQL 18 on fresh copies (`us_w`,
+`us_wt`, vacuumed and analyzed), its first round of three (it slows as its
+tables bloat: `upd10k` 75, 118, 146 in its three rounds):
+
+| statement | before | after | after, statistics on | PostgreSQL |
+|---|---:|---:|---:|---:|
+| `update w set a = a + 1 where id % 1000 < 10` (10k rows) | 119 | **79** | 80 | 75 |
+| `... set c = c + 1 where a = 40` (10k) | 127 | **91** | 89 | 107 |
+| `... where id % 1000 < 100` (100k) | 403 | **332** | 618 | 366 to 621 |
+| `update w set c = c + 1` (1M) | 3,319 | **2,887** | 2,909 | 3,999 |
+| `... where id between 200000 and 299999` (100k by key) | 335 | **284** | 292 | 462 |
+| `... where id between 500000 and 500999` (1k by key) | 3.9, 4.6 | **3.2, 3.4** | 3.2, 3.3 | 6.9 |
+| `... where id = 123457` (one row by key) | 1.0, 1.2 | **0.8, 0.8** | 0.7, 0.8 | 1.3 |
+| `... where b = 4242` (one row by index) | 1.0, 1.2 | **0.8, 0.8** | 0.8, 0.8 | 1.6 |
+| tagged (`us_wt`), `where id % 1000 < 10` | 326 | **114** | 117 | 58 |
+| tagged, `where id % 1000 < 100` | 621 | **379** | 587 | 250 |
+
+- The last three rows of the first part are medians of 21 runs in two
+  rounds each (the 5-run figures were noisy: checkpoints).
+- **"statistics on":** the 100k-row UPDATEs at 618 and 587 ran beside an
+  automatic analysis of the table (1.3 s, taking turns) that the earlier
+  statements had made due (lexdb-optimizer.md 44); in the rounds without
+  one they took 323 and 465.
+- **What is left of `upd10k`** (perf, this branch): the scan 57% (the
+  condition `id % 1000 < 10` over a million rows 15%, decoding `id` 10%,
+  the leaves' walk), the new integer and NULL columns per fill (`bReuse`)
+  6%, the writes 20% (`updRow`, `encRowOf`, `copyRow`), the commit 7%. PostgreSQL's 75 is its whole statement.
+- **Tagged rows** still cost more than fixed ones (the conditions' column
+  is found by walking the tags): `select id from us_wt where id % 1000 <
+  10 and c = -5` 79 ms, `w`'s 41.
+
+**SELECTs** gain the same (server CPU ms, `vec/bench.py`, two rounds of
+base then this branch, under the lock): `filt1pct` 47, 45 to **38, 39**;
+`filt10pct` 56, 55 to **47, 48**; `filt_like` 67, 66 to **49, 49**;
+`idx_range100k` (switched to a scan) 73, 77 to **66, 63**. The other 26
+queries of `queries.txt` are within noise (`scan3` 133, 132 / 137, 134;
+`sort_all` 78, 80 / 83, 78). Earlier, not under the lock: `select * from
+w where id % 1000 < 10 and c = -5` 94 to 55; on `us_wt`, 255 to 86.
+
+**Checked against PostgreSQL 18** (`pgcmp/`): 12 UPDATEs on a 20,000-row
+copy of `w` with NULLs in three columns, an expression index, a timestamptz
+in Asia/Kolkata and a foreign key ON UPDATE CASCADE from another table:
+filters, RETURNING, UPDATE ... FROM, the key changed, timestamptz
+arithmetic in the zone, a division by zero and an integer out of range part
+way. The same rows (RETURNING's sorted), the same two errors, the same
+table after (sums of every column) and the same child rows.
+
+**Tests.**
+- **`exec_updrand`** (new): the same 420 random UPDATEs run twice, each on
+  a store of its own from one seed, with batches off (the reference) and
+  on; every result (tag, RETURNING rows sorted, error), the tables after
+  every 25, and the indexes' agreement with the table compared:
+  - `u`: 1,500 rows (a batch and part of another, so batches are used
+    again), fixed and tagged rows, long texts in the leaf and apart, NULLs
+    in every column but the key; indexes on `k`, `lower(t)`, `j` where `b`,
+    unique on `v`; a foreign key to `p` and one from `c`, both ON UPDATE
+    CASCADE; the session in Asia/Kolkata;
+  - shapes: filters of every type (LIKE on the bytes among them),
+    RETURNING, UPDATE ... FROM (a row joined twice), the key changed (`c`
+    follows), a key range, one row by key, by an index, the row path (a
+    scalar subquery), errors part way (division by zero in a SET and in
+    the WHERE, smallint and numeric out of range, a text not a number, a
+    unique and a foreign key broken);
+  - 20 blocks with their own earlier writes (INSERT, then UPDATEs over
+    them and the table), committed or rolled back, one aborted by an error;
+  - two sessions: an UPDATE's row locks (FOR NO KEY UPDATE lets FOR KEY
+    SHARE in and keeps FOR UPDATE out; FOR UPDATE when it changes the key;
+    SKIP LOCKED skips its rows), write skew (the second COMMIT 40001), a
+    block whose UPDATE scanned the table fails (40001) when another commits
+    a row into its predicate first, and one that read a key range commits.
+
+  All 420 the same; 325 updated rows (57,933 in all), 33 errors.
+- **Planted bugs:** a reused batch's NULL columns kept (171 of 420 the same),
+  a tagged row's other places not decoded for the rows kept (119), the raw
+  LIKEs' places missing from a tagged row's first step (377): all caught.
+  Not caught: a NULL slot's value not cleared in a reused batch (`bNull`'s
+  second line): every reader checks the NULL flag first, so the clearing is
+  for safety, not needed today.
+- `exec_batchexpr` (SELECTs over tagged rows, three ways) and the rest of
+  the suite pass unchanged (118 with the two new tests).
+
+**Not done, and next:**
+- The row path's UPDATE (batches off, a WHERE that does not compile) and
+  an index's rows still decode whole.
+- The integer and NULL columns are still made per fill (6% of `upd10k`): reusing them needs every writer of a batch to write a slot's
+  NULL flag both ways.
+- The condition itself (`id % 1000 < 10`: `checkedRem` per row) and
+  `bNarrow`'s vectors per node.

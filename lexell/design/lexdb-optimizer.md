@@ -2718,7 +2718,46 @@ same); turns; the task itself analyzing within its naps; a replica that
 refuses the write, counts nothing, does nothing at a look, and plans with
 the master's statistics once it has them.
 
-MEASURED
+**Measured** (wall ms; `w` and `d` loaded into an empty data directory with
+`w_b`, then the join of the introduction timed; three rounds each, a
+fresh directory each time; every timing under the agents' shared lock,
+other agents' builds running beside):
+
+| | statistics off | on |
+|---|---:|---:|
+| COPY of 1M rows, one transaction | 5,888 / 5,538 / 5,498 | 5,513 / 5,891 / 5,509 |
+| 100 COPYs of 10,000 rows | 9,350 / 11,204 / 9,351 | 9,382 / 9,320 / 9,255 |
+| the join, first run after the load | 383 / 378 / 381 | 380 / 384 / 379 |
+| statistics there (after the load's last commit) | never | 1.4 to 1.6 s |
+| the join then (median of 5) | 124 / 138 / 124 | 53 / 53 / 53 |
+| the analysis of `w` (`total_autoanalyze_time`) | | 1,281 to 1,338 |
+
+- **The load costs nothing measurable:** the counting is a few integer
+  operations a row, and the analysis comes after the load. The two rounds
+  of 100 COPYs at 9,320 and 9,255 had one analysis of `w` part way, at
+  about 960,000 rows: a pause between two COPYs passed 300 ms (the
+  statistics then hold 96% of the rows, and the 40,000 after them stay
+  under the threshold). The first version, without the wait for writes
+  to pause, analyzed at about 170,000 rows in those loads (2.1 s beside
+  the load) and kept those statistics for 19 s.
+- **The join:** 124 ms looking `d` up per row of `w` without statistics,
+  53 with them (a hash of `d` over batches); PostgreSQL 18 40 (wall, its
+  tables analyzed, parallel workers on). The first run after a one-transaction COPY takes about
+  380 ms with or without statistics: the first read of pages the load
+  wrote, not the plan (437 ms in the brief was such a first run).
+- **Beside the sessions** (`lat4.sh`: 40,000 point selects on one
+  connection, quiet, then from an UPDATE of 200,000 rows of `w` until its
+  automatic analysis was done): quiet p50 0.025 ms, p99 0.035, max 0.19;
+  during the analysis (1.5 s) p50 0.026, p99 0.23, max 24. Before the
+  samples' sort took turns the max was 146 (the sort of `w_b`'s 100,000
+  keys alone took 42 ms; `sortTakingTurns` sorts runs of 4,096 and merges
+  them, yielding between). The 24 ms left is the rest of an analysis' end
+  (the statistics row, the snapshot let go) and was not followed further.
+- **UPDATE timings beside it** (lexdb.md 9.111): with the task on, an
+  UPDATE of 100,000 rows ran in 618 ms in two rounds of three against 332
+  with it off: the analysis of `w` its earlier UPDATEs had made due ran
+  beside it, taking turns. That is the price of the analysis, paid in
+  the background; the other statements' times were the same on and off.
 
 **Not done.**
 - Sampling: an analysis reads the whole table, as ANALYZE does (PostgreSQL
