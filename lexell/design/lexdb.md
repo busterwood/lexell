@@ -10337,6 +10337,7 @@ table after (sums of every column) and the same child rows.
   NULL flag both ways.
 - The condition itself (`id % 1000 < 10`: `checkedRem` per row) and
   `bNarrow`'s vectors per node.
+
 ### 9.112 Column leaves
 
 The user decided to build column leaves for table trees as
