@@ -9579,3 +9579,183 @@ The suite passes (113).
   added.
 - **A range's rows read in key order across batches** (a true bitmap
   heap scan): it would change the rows' order.
+
+### 9.109 Data changes without quadratic costs; front-coded leaves
+
+Item 6 of [lexdb-engines.md](lexdb-engines.md) (DELETE with an index, 2 to
+12 s for 10,000 rows) and recommendation 2 of
+[lexdb-pages.md](lexdb-pages.md) (index leaves 4.5 times PostgreSQL's).
+
+**What the DML was doing** (perf with the native symbol map; `perf` here
+allows user-space call chains only, `--call-graph=fp --user-callchains`):
+- **The DELETE with an index: 84% in `commitLive`'s check of its writes.**
+  Before a commit applies, every write's leaf must be in memory
+  (`writeNeeds`). `commitLive` went through the writes, stopped at the first
+  missing leaf, loaded that one page and started again from the first
+  write. 20,000 writes (rows and `w_b` entries) whose index leaves had left
+  the cache made thousands of passes of thousands of descents each. How many
+  depended on what the cache held, hence 2 to 12 s across runs; with every
+  page cached the same DELETE took 350 ms.
+- **INSERT ... SELECT: `Txn.ownRange`**, the transaction's own writes in a
+  scan's range, went over every write the transaction had made, per call;
+  the source scan calls it per batch (`scanLeaves`) while the INSERT's
+  writes grow: quadratic in the rows. A CREATE UNIQUE INDEX checked each row
+  with a scan of the new index, the same way.
+- **DELETE decoded every column of every row it scanned** (UPDATE and DELETE
+  read rows whole), then copied each row found twice.
+- **Each write descended from the root twice** (`writeNeeds`, then
+  `applyPut`/`applyDel`), and a leaf's arrays shifted an element at a time
+  through `rt_swap`.
+
+**What changed:**
+- **A commit loads what it misses together.** Each pass over the writes
+  gathers every missing slot (`commitLive`), `loadMany` reads them 32 at a
+  time and installs them, and the cache is swept once after
+  (`installOnly`, then `maybeEvict`): the pages just loaded and the nodes
+  the pass's descents marked survive that sweep, so a commit never evicts
+  its own leaves (sweeping per install did, and looped). A pass per tree
+  level that misses, then one that finds nothing and applies.
+- **`ownRange` searches.** Per tree written, the transaction keeps its keys
+  sorted (`Txn.sortedKeys`): the keys added since the last call are sorted
+  and merged in, then a binary search finds the range. `undoTo` drops them
+  with the maps.
+- **The last leaf again** (`Db.lastLeaf`): `descend` keeps the path to the
+  last leaf it reached and the separators around it, and a key between
+  them gets that path without a search. `Db.shape` counts changes to what
+  a path may hold (a node set, loaded or dropped, a separator added or
+  removed, a root set); the cache is used only while it is unchanged.
+  Writes in key order (loads, ranges deleted) mostly skip the descent.
+- **DELETE reads the columns it uses** (`delNarrow`, as `narrow` for
+  SELECT): WHERE's and RETURNING's, the primary key's, and each index's
+  columns, expressions and predicate. Rows of a table others reference,
+  DELETE ... USING and a whole-row reference are read whole.
+- **A leaf's keys and values shift by `replace`** (`insertStr`,
+  `removeStr`): 3.2 times faster than `collections.insert`/`removeAt` in a
+  microbenchmark, which matters with the leaves below (about 700 entries
+  in an index's).
+- **UPDATE is unchanged.** 74% of `update w set c = c + 1 where a = 40` is
+  the scan decoding all nine columns of the million rows (`bRunInto`,
+  `fixedVal`, `Decimal.fromBin`), 8% the commit. Decoding the filter's
+  columns first (lexdb-engines.md item 4) is the batch decoder's work, not
+  done here.
+
+**Front-coded leaves.** A new leaf page type, `T_FLEAF` (6):
+- Each key is front coded against the key before it on the page (the first
+  against ""). The header has two forms, told by its first byte: below
+  0x80, that byte is the shared length (0 to 127), then a varint of the
+  tail's length and one of twice the value's length plus a suffix bit;
+  from 0x80, a u32 holding shared (9 bits), tail (10), suffix (1) and the
+  value's length (11). The encoder takes the smaller.
+- **The suffix bit:** the value is the key's last bytes and is not stored.
+  A secondary index's entry is its columns then the primary key, its value
+  the primary key (`idxEntry`), so the primary key is stored once. The
+  entry is unchanged above the page: `Node.val`, `get` and the scans give
+  the primary key as before, a slice of the key. `fetch`, `indexOrScan`,
+  `checkUnique`, `conflictOf` and `batch/indexonly`'s `fillIdxRows` read it
+  so and need no change; an index-only read decodes the key, as before.
+- **Every leaf is written so from now on**, tables' too (`leafPage`);
+  `T_LEAF` pages (2) are read as before. An entry never takes more bytes in
+  `T_FLEAF` than in `T_LEAF` (the u32 form is at most T_LEAF's 4 bytes, and
+  holds any key and value a leaf can), so an old leaf always fits, and a
+  directory changes page by page as its leaves are written. An older lexdb
+  reports a T_FLEAF page as corrupt; the meta pages keep their magic, as a
+  new one would make an older lexdb take the directory for empty.
+- **Sizes.** `Node.size` is a leaf's bytes in T_FLEAF, counted exactly:
+  `frontEntry` per entry, after the key before it. `applyPut` adds the new
+  entry's and the next one's change, `applyDel` takes them off, `split`
+  counts both halves (the right one's first key whole), a T_LEAF page read
+  is counted when decoded. A key put between two only lengthens the next
+  one's shared prefix, and a delete never grows the leaf, so the split's
+  argument for MAX_ENTRY holds as before. Should a size ever be wrong,
+  `leafPage` writes the leaf whole if it fits so.
+- **In memory** a leaf read from a T_FLEAF page is made whole once
+  (`frontLeaf`): the lazy body holds each key whole and a suffix value as a
+  slice of its key, `ents` packing 20-bit starts and 12/11-bit lengths (a
+  page's keys made whole can pass 64 KiB). Scans, `valView` and `lower` are
+  unchanged; the cache counts the body's bytes (`nodeCost`).
+- **The checkpoint** keeps the leaf's body as before and front codes it as
+  the page is written (`bodyPage`). The log, the WAL's records, meta, list
+  and internal pages, checksums and the replicas' follower are unchanged
+  (the follower decodes pages with `decodeNode`).
+- **CREATE INDEX sorts its entries** (`addIndex`), as PostgreSQL's and
+  SQLite's builds do, so each goes past the tree's last and the leaves are
+  left full; a unique index's duplicates are then neighbours.
+
+**Measured** (wall ms, median of three, each run on other rows; `dml2.py`:
+the data of 9.102, every page of `w` and `w_b` read first; PostgreSQL 18 on
+a copy of `w` as `st_w`). Other agents' benchmarks ran on the machine, load
+1 to 3; numbers within about 10% are noise:
+
+| statement | before | after | PostgreSQL |
+|---|---:|---:|---:|
+| INSERT ... SELECT, 103k rows | 738 | **486** | 202 |
+| INSERT ... SELECT with expressions, 103k rows | 1,220 | **570** | 185 |
+| UPDATE of 10k rows | 257 | 264 | 66 |
+| UPDATE of 103k rows | 571 | 576 | 596 |
+| UPDATE of a 100k-key range | 320 | 305 | 242 |
+| DELETE of 10k rows, `w_b` | 347 | **164** | 52 |
+| DELETE from `w2`, no index (about 190k rows) | 564 | **349** | 99 |
+
+The same statements with the cache cold (`dml.py`, a server started for
+each of two rounds): the DELETE of 10k rows with an index 4,755 and 4,650
+(2,097 to 12,799 across runs) before, **370 and 233** (153 to 851) after;
+INSERT ... SELECT 855 and 815 before, 512 and 518 after.
+
+**Index size** (`pg_relation_size`, a copy of `vec/ldata`):
+- `w_b`: **42.3 MB to 6.4 MB** when built again by CREATE INDEX (sorted, its
+  leaves full; 1M entries at 6.4 bytes); 8.8 MB when filled in the table's
+  order (an index on an empty table, then INSERT of the million rows:
+  leaves 70% full). PostgreSQL's is 9.3 MB. The estimate was 14 MB.
+- `w` filled the same way: 95.6 MB to 88.1 MB (8-byte keys share most of
+  their bytes).
+- CREATE INDEX `w_b`: 13,955 ms to 3,109. INSERT of the million rows into
+  an indexed empty table: 32,167 ms to 8,095 (`ownRange`).
+
+**Index scans** (server CPU ms, median of 5, `bench.py`; before / this build
+on the old data / this build, `w_b` built again):
+`idx_range100k` 169 / 168 / 170, `idx_range1k` 2 / 2 / 2, `idx_range_agg`
+156 / 157 / 159; a second round 168 / 181 and 180 / 173 (noise). The first
+`idx_range_agg` after a start: 1,673 and 1,668 ms before, 1,700 and 1,707
+after: almost all of it is the 100,000 rows fetched by key, not the index.
+
+**Random inserts into an index**, the cost of bigger leaves (`w3` with an
+index on `b`: 300k rows, 100k more, then 30% deleted): 1,476 / 839 / 746 ms
+without front coding, 2,342 / 1,184 / 1,081 with it and leaves shifted by
+`collections.insert`, **1,546 / 817 / 696** with `insertStr`.
+
+**Tests:**
+- `page_codec`: the leaf of three entries is 21 bytes, not 24; an index's
+  300 entries 1,486 bytes, not 8,700, its values the keys' ends; keys
+  sharing 280 bytes (the u32 header); a T_LEAF page read, its size counted
+  front coded; each form through `nodeBody`, `bodyPage` and `repack`; 3,000
+  random entries never larger than whole.
+- `store_oldpages` (new): a data directory the store wrote at 78731801
+  (`fixture.lxl`, its pages in base64; `gen.lxl.txt` made it), with a
+  commit in its log only. Opened, replayed over its T_LEAF leaves, read
+  forward, backward and by key, and by a follower; written and
+  checkpointed: six leaves T_FLEAF, one still T_LEAF, the index's bytes
+  8,700 to 1,621; opened again, and the follower again.
+- `exec_dmlscale` (new): 30,000 rows with three indexes (a column, an
+  expression, a filtered one) under a 512 KB cache, each step checked by
+  counts through every index against counts by scan: DELETE, DELETE ...
+  RETURNING, a block's INSERT ... SELECT read back through its own index
+  and updated and deleted in it, serializable 40001 when another session
+  commits into a range the block read and COMMIT when outside it, a
+  cascade. Its output is the same at 78731801.
+- **Changed expectations**, for smaller trees: `store_drop`'s page counts
+  (785 to 747 pages, 15 to 14 internal); `store_snapshot`'s budget of old
+  versions 3 to 1 (its 1,200 accounts now take 3 leaves, not 4, so 3 were
+  never over it); `store_evict`'s keys start with their number (97 shared
+  zeros put 680 keys in a leaf and the tree in two levels).
+- The suite passes (113); the crash test, 20 rounds direct and 20
+  buffered; the replica test.
+
+**Not done, and next:**
+- UPDATE's and the scans' decoding of every column (above).
+- The commit still descends each write twice; sorting a commit's writes by
+  key would let `lastLeaf` serve random ones too.
+- A lazy leaf from a T_FLEAF page is made whole when read: about 3 times
+  the page for an index's. Searching the page as it is needs restart points.
+- Internal pages are not front coded.
+- The native backend cannot compile a `match` on a `Result[[]byte, DbErr]`
+  popped from an array ("opt: no outer field"); `loadMany` uses `isErr`.
