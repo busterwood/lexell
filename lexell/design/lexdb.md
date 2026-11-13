@@ -11398,3 +11398,85 @@ old code on both backends.
    PostgreSQL's COPY uses one thread, so this is where lexdb could pass it.
 3. A large load's memory bounded by default, without `batch_rows`'s cost.
 4. TDS bulk load (`INSERT BULK`, BulkLoadBCP), on the same path.
+
+### 9.119 COPY's rows made cheaper
+
+After 9.118, at the user's go-ahead: each row's own work in COPY, profiled
+with call graphs (`perf --user-callchains` against the native symbol map)
+on the wide load of 9.118. Each change below is general: INSERT, the wire's
+parameters and casts take the same paths.
+
+**Text read at once.**
+- `textRecord` finds the next delimiter, newline, carriage return or
+  backslash with `strings.indexOfAny`, 16 bytes at a time, instead of
+  testing each byte (10% of the load before, 3% after). The four bytes are
+  made once per COPY (`CopyRd.stops`).
+- **Dates and timestamps** in the ISO form a dump writes,
+  `YYYY-MM-DD[ T]HH:MM:SS[.ffffff][Z|+-HH[[:]MM[:SS]]]`, are read by
+  `lexdb_time.fastTs`. It needs a 4-digit year and every part in its plain
+  range (no 24:00, no leap second, at most 6 fraction digits); anything
+  else goes to the general parse, as before, errors included. Before,
+  every value was trimmed and lowered to look for words like `today`, its
+  era and zone looked for with copies, then parsed: 11% of the load, now 3%.
+  Checked against the general parse on 105,000 texts (random parts in and
+  out of range, every separator, fraction length and zone form, eras,
+  words), with UTC and America/New_York: the same values and the same
+  errors.
+- **uuids** in their canonical form (36 characters, lower case) are taken
+  as they are, checked through a 256-byte table (`HEX_LOW`), instead of
+  rebuilt through a buffer and five concatenations; `uuidBytes` uses
+  `HEX_ANY` and one array.
+- **Doubles**: `lexdb_float.parse` reads a plain number (a digit, sign or
+  point first, a digit or point last) without trimming and lowering it,
+  and makes its error message only on an error (before, every value built
+  it, used or not).
+- `intDigits` (a numeric's digits before its point, for `numeric(p,s)`)
+  counts the coefficient's digits and adds the exponent; before, it made
+  the number's text and searched it.
+
+**Rows encoded at once.** `encFixed` no longer makes the table's place
+kinds per row to compare with its layout (`kindsFit` compares in place),
+and writes the row into one array sized first, with no side arrays of
+words, bits and parts.
+
+**Hidden keys.** A table without a primary key (9.88) is keyed by its
+hidden column's sequence.
+- Its rows are not looked for before they are put: no SQL can name the
+  column, so a key is never given, only taken from the sequence. The read
+  cost a descent per row, and a read set the commit validated (7% of the
+  keyless load).
+- The statement takes the sequence's values in runs (`nextRun`): up to
+  `want` at once from the block written, a block at least that large when
+  one is needed. `Upsert` holds the run (`ridNext`, `ridLeft`), and the
+  size doubles from 1 to 1024 (`ROWID_RUN`), so a one-row INSERT still
+  takes one value. Before, every row took six memo operations and a lock
+  (15% of the keyless load). Values reserved and not used are skipped, as
+  PostgreSQL's cached sequence values are.
+- The hidden key's values no longer set `currval` and `lastval`, which
+  PostgreSQL, having no such key, never sets.
+
+**Measured** (1M rows, `\copy`, median of 3, as 9.118):
+
+| | 9.118 before | 9.118 after | 9.119 | PostgreSQL 18 |
+|---|---:|---:|---:|---:|
+| narrow | 1.23 s | 1.24 s | 1.21 s | 0.55 s |
+| wide | 5.15 s | 4.56 s | 3.15 s | 1.96 s |
+| wide, 2 indexes | 9.49 s | 8.77 s | 7.43 s | 4.49 s |
+| wide, no key | 6.63 s | 5.88 s | 3.42 s | 1.40 s |
+| narrow, 10M rows | 14.3 s | | 12.8 s | 5.93 s |
+
+The wide load is now as fast as SQL Server's bcp (3.19 s). What is left is
+spread thin: the store's put and the commit (14%), the key's read (8%),
+reference counts and allocation (about 10%), `insertOne` itself (7%). The
+narrow load is mostly the store's: the commit's puts (28%) and the key's
+read (14%).
+
+**Next, not built:** parsing and encoding on several threads, which the
+user wants to discuss first (a narrow parallel primitive in the language
+with its own heap per worker, or worker processes for COPY alone); a
+large load's memory bounded by default; SQL Server bulk load over TDS (in
+progress, design lexdb-tds).
+
+**Tests:** the suite passes (132), and with `LEXDB_COLCHECK=1`; the crash
+test (with and without io_uring) and the replica test pass. The crash test
+showed an older intermittent failure, on main too (9.120).
