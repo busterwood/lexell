@@ -1,0 +1,95 @@
+// lexdb_store on a real directory: the data file's space reserved ahead of
+// a checkpoint's pages (design/lexdb.md 9.110). After each checkpoint the
+// file holds every page (its size at least the pages' bytes), in whole
+// MiB, at least 4 MiB, and never more than an eighth of itself (or 4 MiB)
+// past what its pages need; it grows in a few steps, not page by page.
+// Pages past the meta page's count are not read: the store opens again,
+// replays, and its pages pass the audit.
+// expect: loaded 20000 rows, every checkpoint's file ok
+// expect: grew in at most 12 steps
+// expect: reopened 20000 rows, file ok
+// expect: audit ok
+import "os"
+import "fs"
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_base"
+
+const MIB = 1024 * 1024
+
+fn key(i: int): str { return "k" + strings.padLeft(i.toStr(), 6, '0') }
+
+fn fileSize(d: &lexdb_disk.Fs): int {
+    let f = d.open(lexdb_store.DATA, false).unwrap()
+    let n = f.size().unwrap()
+    f.close()
+    return n
+}
+
+// "" when the file is as reserving leaves it after a checkpoint.
+fn fileOk(size: int, pages: int): str {
+    let need = pages * 4096
+    if size < need { return "file " + size.toStr() + " under its pages' " + need.toStr() }
+    if size % MIB != 0 { return "file " + size.toStr() + " not whole MiB" }
+    if size < 4 * MIB { return "file " + size.toStr() + " under 4 MiB" }
+    let most = need + max(need / 8, 4 * MIB) + MIB
+    if size > most { return "file " + size.toStr() + " over " + most.toStr() + " for " + need.toStr() }
+    return ""
+}
+
+fn count(st: &lexdb_store.Store, tree: int): int {
+    var t = lexdb_store.begin()
+    var n = 0
+    st.scan(mut &t, tree, "", "", fn(e: &lexdb_store.Entry): bool {
+        n += 1
+        return true
+    }).unwrap()
+    return n
+}
+
+fn main() {
+    let dir = fs.join(os.tempDir(), "lexdb_reserve_" + os.pid().toStr())
+    let made = fs.mkdirAll(dir)
+    let d = lexdb_disk.real(dir)
+    var tree = 0
+    let val = strings.repeat("v", 300)
+    lexdb_store.run(d, lexdb_store.defaults(), fn(st: lexdb_store.Store): int {
+        var t = lexdb_store.begin()
+        tree = st.createTree(mut &t)
+        st.commit(t).unwrap()
+        var bad = ""
+        var sizes: []int = []
+        for b in 0..40 {
+            var w = lexdb_store.begin()
+            for i in b * 500..(b + 1) * 500 { w.put(tree, key(i), val.toStr()).unwrap() }
+            st.commit(w).unwrap()
+            st.checkpoint().unwrap()
+            let size = fileSize(&d)
+            let m = fileOk(size, st.stats().pages)
+            if m != "" && bad == "" { bad = "after batch " + b.toStr() + ": " + m }
+            if len(sizes) == 0 || sizes[len(sizes) - 1] != size { append(mut &sizes, size) }
+        }
+        println("loaded " + count(&st, tree).toStr() + " rows, every checkpoint's file " + (if bad == "" { "ok" } else { bad }))
+        println(if len(sizes) <= 12 { "grew in at most 12 steps" } else { "grew in " + len(sizes).toStr() + " steps" })
+        // a commit left to the log alone: replayed at the next open
+        var w = lexdb_store.begin()
+        w.put(tree, key(0), "last").unwrap()
+        st.commit(w).unwrap()
+        return 0
+    }).unwrap()
+    let tr = tree
+    lexdb_store.run(d, lexdb_store.defaults(), fn(st: lexdb_store.Store): int {
+        var t = lexdb_store.begin()
+        let first = st.get(mut &t, tr, key(0)).unwrap().unwrapOr("")
+        let m = fileOk(fileSize(&d), st.stats().pages)
+        println("reopened " + count(&st, tr).toStr() + " rows" + (if first != "last" { ", the logged commit lost" } else { "" }) +
+                ", file " + (if m == "" { "ok" } else { m }))
+        return 0
+    }).unwrap()
+    match lexdb_store.audit(d) {
+        Ok(_) { println("audit ok") }
+        Err(e) { println("audit: " + e.toStr()) }
+    }
+    let gone = fs.removeAll(dir)
+}

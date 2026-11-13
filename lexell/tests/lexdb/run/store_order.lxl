@@ -1,0 +1,163 @@
+// lexdb_store: large commits applied in key order (design/lexdb.md 9.110).
+// A commit of 32 writes or more is checked and applied by (tree, key)
+// within each run of puts and deletes, stably, with creates and drops where
+// they are; the log keeps the writes as made. Against a model, with a small
+// cache (leaves loaded by the commit, evictions) and small leaves' worth of
+// keys (splits, emptied leaves leaving their parents):
+// - commits of random puts and deletes over two trees, interleaved, with a
+//   key written several times in one commit (the last write wins);
+// - one commit that creates a tree, writes it, drops another and writes
+//   the first again after the drop (the creates and drops stay where they
+//   are, each side's run sorted apart: tree ids are never reused, so this
+//   is the safe side rather than a case that differs);
+// - the state after a simulated crash (replayed from the log in the order
+//   made) and after a checkpoint and a reopen, both against the model.
+// expect: random: 30 commits ok
+// expect: barriers: ok, dropped tree gone
+// expect: after a crash: ok
+// expect: after a checkpoint: ok
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_base"
+
+fn key(i: int): str { return "key" + strings.padLeft(i.toStr(), 5, '0') }
+
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: 64 * 1024, segBytes: 64 * 4096, ckptBytes: 32 * 4096, snapNodes: 1000, bufferedPages: false}
+}
+
+// The tree against its model; "" when they agree.
+fn check(st: &lexdb_store.Store, tree: int, model: &Map[str, str]): str {
+    var t = lexdb_store.begin()
+    var n = 0
+    var bad = ""
+    var last = ""
+    let r = st.scan(mut &t, tree, "", "", fn(e: &lexdb_store.Entry): bool {
+        n += 1
+        if n > 1 && e.key <= last && bad == "" { bad = "out of order at " + e.key }
+        last = e.key
+        match model.get(&e.key) {
+            Some(v) { if v != e.val && bad == "" { bad = "value of " + e.key + ": " + e.val + " want " + v } }
+            None { if bad == "" { bad = "extra key " + e.key } }
+        }
+        return true
+    })
+    if r.isErr() { return "scan: " + r.unwrapErr().toStr() }
+    if bad != "" { return bad }
+    if n != model.size() { return "count " + n.toStr() + " want " + model.size().toStr() }
+    // and each key by itself (a descent from the root, and the finger's)
+    for i in 0..model.size() {
+        let k: str = model.keyAt(i)
+        let want: str = model.valAt(i)
+        let got = st.get(mut &t, tree, k.toStr())
+        if got.isErr() { return "get: " + got.unwrapErr().toStr() }
+        match got.unwrap() {
+            Some(v) { if v != want { return "get " + k } }
+            None { return "get " + k + ": missing" }
+        }
+    }
+    return ""
+}
+
+fn both(st: &lexdb_store.Store, a: int, ma: &Map[str, str], b: int, mb: &Map[str, str]): str {
+    let x = check(st, a, ma)
+    if x != "" { return "tree a: " + x }
+    let y = check(st, b, mb)
+    if y != "" { return "tree b: " + y }
+    return ""
+}
+
+fn main() {
+    let fs = lexdb_disk.sim(11)
+    var rng = lexdb_base.rng(5)
+    var ma: Map[str, str] = newMap()
+    var mb: Map[str, str] = newMap()
+    var ta = 0
+    var tb = 0
+    var crashFs: []lexdb_disk.Fs = []
+    lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int {
+        var t = lexdb_store.begin()
+        ta = st.createTree(mut &t)
+        tb = st.createTree(mut &t)
+        for i in 0..3000 {
+            t.put(ta, key(i * 2), "a" + i.toStr()).unwrap()
+            ma.put(key(i * 2), "a" + i.toStr())
+            if i % 3 == 0 {
+                t.put(tb, key(i), "b" + i.toStr()).unwrap()
+                mb.put(key(i), "b" + i.toStr())
+            }
+        }
+        st.commit(t).unwrap()
+        var bad = ""
+        for c in 0..30 {
+            var w = lexdb_store.begin()
+            let n = 32 + rng.below(400)
+            for j in 0..n {
+                let k = key(rng.below(6500))
+                let which = rng.below(2)
+                let op = rng.below(3)
+                let v = "c" + c.toStr() + "." + j.toStr()
+                let tr = if which == 0 { ta } else { tb }
+                if op == 0 {
+                    w.del(tr, k.toStr())
+                    if which == 0 { let gone = ma.remove(&k) } else { let gone = mb.remove(&k) }
+                } else {
+                    w.put(tr, k.toStr(), v.toStr()).unwrap()
+                    if which == 0 { ma.put(k, v) } else { mb.put(k, v) }
+                }
+            }
+            // a key written several times: the last wins
+            let k = key(rng.below(6500))
+            w.put(ta, k.toStr(), "first").unwrap()
+            w.del(ta, k.toStr())
+            w.put(ta, k.toStr(), "last").unwrap()
+            ma.put(k, "last")
+            st.commit(w).unwrap()
+            if bad == "" { bad = both(&st, ta, &ma, tb, &mb) }
+        }
+        println("random: 30 commits " + (if bad == "" { "ok" } else { bad }))
+
+        // a create, writes to it, a drop, then writes to a again: the
+        // runs either side of the create and of the drop are sorted apart
+        var w = lexdb_store.begin()
+        for i in 0..40 {
+            w.put(ta, key(6000 - i * 7), "before").unwrap()
+            ma.put(key(6000 - i * 7), "before")
+        }
+        let tc = st.createTree(mut &w)
+        var mc: Map[str, str] = newMap()
+        for i in 0..40 {
+            w.put(tc, key(40 - i), "c").unwrap()
+            mc.put(key(40 - i), "c")
+        }
+        w.dropTree(tb)
+        for i in 0..40 {
+            w.put(ta, key(6000 - i * 7), "after").unwrap()
+            ma.put(key(6000 - i * 7), "after")
+        }
+        st.commit(w).unwrap()
+        var gone = true
+        for id in st.trees() { if id == tb { gone = false } }
+        let m1 = check(&st, ta, &ma)
+        let m2 = check(&st, tc, &mc)
+        println("barriers: " + (if m1 == "" && m2 == "" { "ok" } else { m1 + m2 }) + (if gone { ", dropped tree gone" } else { ", dropped tree still there" }))
+        tb = tc
+        mb = mc
+        append(mut &crashFs, fs.crash(77))
+        return 0
+    }).unwrap()
+    // the crash: the meta page as last checkpointed, the rest replayed from
+    // the log, in the order the writes were made
+    lexdb_store.run(crashFs[0], opts(), fn(st: lexdb_store.Store): int {
+        let m = both(&st, ta, &ma, tb, &mb)
+        println("after a crash: " + (if m == "" { "ok" } else { m }))
+        st.checkpoint().unwrap()
+        return 0
+    }).unwrap()
+    lexdb_store.run(crashFs[0], opts(), fn(st: lexdb_store.Store): int {
+        let m = both(&st, ta, &ma, tb, &mb)
+        println("after a checkpoint: " + (if m == "" { "ok" } else { m }))
+        return 0
+    }).unwrap()
+}
