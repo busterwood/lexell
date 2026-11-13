@@ -362,7 +362,23 @@ noise (to 1.12 ×), and 6 more than 1.3 × behind.
 - **Windows (1.65 ×).**
 - **`w join t` (1.5 ×):** 1M lookups into t's key.
 
-PostgreSQL in parallel is still about twice as fast in wall time on whole
-scans (section 3E).
+**Against PostgreSQL in parallel, at most 4 processes** (the leader and 3
+workers: `max_parallel_workers_per_gather=3`, `max_parallel_workers=3`).
+The user's rule from 2026-11-13: lexdb's shape is a main process and 3
+replicas, so PostgreSQL is not given all 8 cores. Earlier "PG parallel"
+figures are superseded. Wall ms, median of three, 34 queries:
+- **lexdb (one thread) over PostgreSQL at 4 processes:** geometric mean
+  **1.28**. Over PostgreSQL on one core in wall time it is 0.79.
+- **PostgreSQL's plans stay serial** for returning 1M rows, the sort, key
+  ranges, LEFT JOIN and point lookups. There lexdb is level or ahead:
+  the sort 0.29, `where a < 10` 0.75, `count` 0.72.
+- **PostgreSQL runs 2.5 to 5 × faster** where its aggregates and hash
+  joins split across workers: two-column DISTINCT 4.8 ×, GROUP BY text
+  4.1 ×, `w join t` 3.5 ×, a text-keyed join count 3.2 ×, windows 2.6 ×,
+  DISTINCT 2.5 ×, min/max of a text 2.4 ×.
+
+Closing those last needs lexdb to run one query on several cores (scans
+and partial aggregates split by key range), not only a faster single
+thread.
 
 The tables in `~/Work/lexdb-bench/saved/results/2026-11-13-refresh/`.
