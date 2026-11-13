@@ -1,0 +1,382 @@
+// lexdb_exec: UPDATE's search over batches (design/lexdb.md 9.111: a lazy
+// fill's batch used again, tagged rows decoded in two steps), against the
+// row path. The same random statements run twice, each time on a store of
+// its own made from the same seed: with SET lexdb_batch = off (the row
+// path's eval and whole rows: the reference) and on. Every statement's
+// result (its tag, its RETURNING rows sorted, or its error), the table
+// after every 25 of them, and the indexes' agreement with it must be the
+// same both ways.
+// - u has 1,500 rows (a batch and part of another): fixed rows, tagged
+//   ones (a timestamptz or a date not NULL), long texts in the leaf and
+//   apart, NULLs in every column but the key; an index on k, one on
+//   lower(t), a filtered one on j, a unique one on v; a foreign key to p
+//   (ON UPDATE CASCADE) and one from c (ON UPDATE CASCADE).
+// - The session's zone is Asia/Kolkata: timestamptz conditions and SETs.
+// - Shapes: a filter of any type; RETURNING; UPDATE ... FROM (a row
+//   joined twice updated once); the primary key changed (c follows); a
+//   range and a row by key; by an index; the row path (a scalar subquery);
+//   errors part way: division by zero in a SET and in the WHERE, a
+//   numeric too wide, a unique and a foreign key broken.
+// - Blocks with their own earlier writes (INSERT, then UPDATEs over them),
+//   committed or rolled back, an error in one aborting it.
+// - Two sessions: the row locks an UPDATE takes (FOR NO KEY UPDATE, FOR
+//   UPDATE when it changes the key: 9.86); write skew (40001); a block
+//   whose UPDATE scanned the table fails when another commits a row there
+//   first, and one that read a key range commits.
+// expect: rows updated: 57933 by 325 statements; errors by state: 22003 7, 22012 8, 22P02 12, 23503 1, 23505 4, 25P02 1
+// expect: statements: 420, the same both ways: 420
+// expect: tables compared: 16, the same: 16; indexes consistent: true true
+// expect: errors: 33; RETURNING rows: 11495; blocks: 20
+// expect: two sessions the same both ways: true
+// expect: locks: no key update (UPDATE 1): for key share SELECT 1 10; for update ERROR 55P03 could not obtain lock on row in relation "u"; key update (UPDATE 1): for key share ERROR 55P03 could not obtain lock on row in relation "u"; skip locked: 0 of 16 rows; after rollback SELECT 1 11
+// expect: write skew: COMMIT then ERROR 40001 could not serialize access due to concurrent update (UPDATE 1, UPDATE 1)
+// expect: scanned: UPDATE 1, other UPDATE 1, commit ERROR 40001 could not serialize access due to concurrent update; key range: UPDATE 6, other UPDATE 1, commit COMMIT
+// timeout: 120
+import "strings"
+import "collections"
+import "../../../cmd/lexdb_base"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+
+// A statement's result: its tags, its rows sorted (RETURNING gives them in
+// the order found), or its error.
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    var n = 0
+    return qn(s, sql, mut &n)
+}
+
+// q, n its rows.
+fn qn(s: mut &lexdb_exec.Session, sql: &str, n: mut &int): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            var out: []str = []
+            for r in rs {
+                var lines: []str = []
+                for row in r.rows {
+                    var vs: []str = []
+                    for v in row { append(mut &vs, lexdb_exec.text(&v)) }
+                    append(mut &lines, strings.join(&vs, "|"))
+                }
+                n += len(lines)
+                collections.sort(mut &lines)
+                append(mut &out, r.tag)
+                for l in lines { append(mut &out, l) }
+            }
+            return strings.join(&out, " ")
+        }
+        Err(e) { return "ERROR " + e.state + " " + e.msg }
+    }
+}
+
+fn pick(r: mut &lexdb_base.Rng, xs: &[]str): str { return xs[r.below(len(xs))] }
+
+fn two(n: int): str { return if n < 10 { "0" + n.toStr() } else { n.toStr() } }
+
+fn maybe(r: mut &lexdb_base.Rng, v: str): str { return if r.below(8) == 0 { "null" } else { v } }
+
+fn bigText(n: int): str {
+    var b = newStrBuf()
+    for i in 0..n { b.add(if i % 10 == 9 { " " } else { "y" }) }
+    return b.toStr()
+}
+
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: 1024 * 1024, segBytes: 4 * 1024 * 1024, ckptBytes: 2 * 1024 * 1024, snapNodes: 100000, bufferedPages: false}
+}
+
+fn texts(): []str { return ["'abc'", "'ABC'", "'a'", "''", "'été'", "'item 7'", "'12'", "'3x'", "'b'", "'Bob'", "'z%z'"] }
+
+fn uRow(r: mut &lexdb_base.Rng, id: int): str {
+    let big = r.below(60)
+    var note = "'item " + r.below(120).toStr() + "'"
+    if big == 0 { note = "'item " + bigText(300) + "'" } else if big == 1 { note = "'" + bigText(3000) + " 7'" }
+    let nn = r.below(9000) - 1000
+    let ns = if nn < 0 { "-" + (-nn / 100).toStr() + "." + two(-nn % 100) } else { (nn / 100).toStr() + "." + two(nn % 100) }
+    let d = if r.below(2) == 0 { "null" } else { "'2024-01-" + two(1 + r.below(28)) + "'" }
+    let ts = if r.below(2) == 0 { "null" } else {
+        "'2024-03-" + two(1 + r.below(28)) + " " + two(r.below(24)) + ":" + two(r.below(60)) + ":00" + pick(r, &["+00", "+05:30", "-04", ""]) + "'"
+    }
+    let vs: []str = [id.toStr(), maybe(r, r.below(100).toStr()), maybe(r, ((r.below(21) - 10) * 1000003).toStr()), maybe(r, r.below(6).toStr()),
+                     maybe(r, pick(r, &["true", "false"])), maybe(r, pick(r, &texts())), maybe(r, "'v" + id.toStr() + "'"), maybe(r, ns), ts, d,
+                     maybe(r, (1 + r.below(40)).toStr()), maybe(r, note)]
+    return "(" + strings.join(&vs, ", ") + ")"
+}
+
+fn setup(s: mut &lexdb_exec.Session, r: mut &lexdb_base.Rng, out: mut &[]str) {
+    append(out, q(s, &"create table p (id int primary key, name text)"))
+    append(out, q(s, &"insert into p select g, 'p' || g from generate_series(1, 40) g"))
+    append(out, q(s, &("create table u (id int primary key, k int, j bigint, s smallint, b boolean, t text, v varchar(12), n numeric(10,2), " +
+                       "ts timestamptz, d date, pid int references p (id) on update cascade, note text)")))
+    append(out, q(s, &"create index u_k on u (k)"))
+    append(out, q(s, &"create index u_lt on u (lower(t))"))
+    append(out, q(s, &"create index u_jb on u (j) where b"))
+    append(out, q(s, &"create unique index u_v on u (v)"))
+    var id = 1
+    for chunk in 0..15 {
+        var rows: []str = []
+        for i in 0..100 {
+            append(mut &rows, uRow(r, id))
+            id += 1
+        }
+        append(out, q(s, &("insert into u values " + strings.join(&rows, ", "))))
+    }
+    append(out, q(s, &"create table c (id int primary key, uid int references u (id) on update cascade, x int)"))
+    append(out, q(s, &"insert into c select g, g * 7, g from generate_series(1, 200) g"))
+    append(out, q(s, &"create table g (id int primary key, t text, n numeric(10,2))"))
+    append(out, q(s, &"insert into g select x, case when x % 5 = 0 then null else 'g' || x end, x * 1.5 from generate_series(1, 60) x"))
+}
+
+fn conds(): []str {
+    return ["k = 5", "k < 10", "k is null", "k between 20 and 30", "id % 7 = 3", "id % 50 < 2", "b", "not b", "b is null",
+            "t like 'a%'", "lower(t) = 'abc'", "t is null", "v like 'v1%'", "n > 30", "n is null", "ts > '2024-03-10 10:00'",
+            "ts::date = d", "d < '2024-01-15'", "ts is null", "note like '%item 7%'", "j > 0", "s = 2", "pid = 3",
+            "coalesce(k, -1) < 0", "upper(t) || v like '%B%'", "length(note) > 1000", "k + s > 90", "ts at time zone 'UTC' < '2024-03-05'",
+            "date_trunc('day', ts) = '2024-03-07'", "n * 2 > k", "t = 'item 7' or k = 77", "j is not null and s is null"]
+}
+
+fn sets(): []str {
+    return ["k = k + 1", "k = null", "j = j * 2", "s = s + 1", "b = not b", "t = upper(t)", "t = t || 'x'", "n = n * 2", "n = n + 0.01",
+            "ts = ts + interval '1 hour'", "d = d + 1", "note = 'item ' || k", "note = note || '!'", "pid = (id % 40) + 1", "pid = null",
+            "t = coalesce(t, 'none')", "ts = date_trunc('day', ts)", "b = k > 50", "k = s * 10, s = null", "v = null", "n = null, t = 'n'",
+            "j = j + k", "d = ts::date"]
+}
+
+fn errSets(): []str { return ["n = n / (k - 3)", "s = 40000", "n = n * 100000000", "v = 'dup'", "pid = 9999", "k = t::int"] }
+
+fn wh(r: mut &lexdb_base.Rng): str {
+    var w = pick(r, &conds())
+    if r.below(3) == 0 { w = w + " and " + pick(r, &conds()) }
+    return w
+}
+
+fn setList(r: mut &lexdb_base.Rng): str {
+    var xs: []str = [pick(r, &sets())]
+    if r.below(3) == 0 { append(mut &xs, pick(r, &["t = lower(t)", "n = n - 1", "b = true", "note = substr(note, 1, 5)"])) }
+    return strings.join(&xs, ", ")
+}
+
+fn rets(): []str { return [" returning id, k, t", " returning *", " returning id, n * 2, ts::text, upper(note)", " returning id, v"] }
+
+// A random UPDATE.
+fn stmt(r: mut &lexdb_base.Rng): str {
+    let shape = r.below(14)
+    if shape <= 3 { return "update u set " + setList(r) + " where " + wh(r) }
+    if shape == 4 { return "update u set " + setList(r) + " where " + wh(r) + pick(r, &rets()) }
+    if shape == 5 {
+        return pick(r, &["update u set n = g.n, t = g.t from g where g.id = u.k and ", "update u set k = u.k + g.id from g where g.id = u.s + 1 and ",
+                         "update u set note = g.t || u.id from g where g.id between u.s and u.s + 2 and "]) +
+               pick(r, &["g.t is not null", "u.k < 30", "g.n > 20", "u.ts is not null", "u.b"]) + pick(r, &["", " returning u.id, g.id, u.k"])
+    }
+    if shape == 6 {
+        // the key changed: c's rows follow (a clash: 23505)
+        return "update u set id = id + " + pick(r, &["5000", "10000", "1"]) + " where " + pick(r, &["id % 97 = 3", "k = 13", "id between 600 and 610"]) +
+               pick(r, &["", " returning id, k"])
+    }
+    if shape == 7 {
+        let a = r.below(1400)
+        return "update u set " + setList(r) + " where id between " + a.toStr() + " and " + (a + r.below(300)).toStr()
+    }
+    if shape == 8 { return "update u set " + setList(r) + " where id = " + (1 + r.below(1500)).toStr() + pick(r, &["", " returning *"]) }
+    if shape == 9 { return "update u set " + setList(r) + " where k = " + r.below(100).toStr() + pick(r, &["", " and t is not null"]) }
+    if shape == 10 { return "update u set " + setList(r) + " where k <> (select max(id) from g where id < 50) and " + wh(r) }
+    if shape == 11 { return "update u set " + pick(r, &errSets()) + " where " + wh(r) }
+    if shape == 12 { return "update u set " + setList(r) + " where " + pick(r, &["10 / (s - 2) > 1", "t::int > 3", "n / (k - 3) > 0"]) }
+    return "update u set " + setList(r) + " where " + wh(r) + " and id % 3 = " + r.below(3).toStr() + pick(r, &rets())
+}
+
+// Whether u's indexes agree with its rows (counts by each against a scan).
+fn consistent(s: mut &lexdb_exec.Session): bool {
+    var ok = q(s, &"select count(*), sum(id) from u where k >= 0") == q(s, &"select count(*), sum(id) from u where k + 0 >= 0")
+    for v in [3, 13, 50, 77] {
+        ok = ok && q(s, &("select count(*), sum(id) from u where k = " + v.toStr())) == q(s, &("select count(*), sum(id) from u where k + 0 = " + v.toStr()))
+    }
+    for t in ["abc", "item 7", "b", "n"] {
+        ok = ok && q(s, &("select count(*), sum(id) from u where lower(t) = '" + t + "'")) == q(s, &("select count(*), sum(id) from u where lower(t) || '' = '" + t + "'"))
+    }
+    ok = ok && q(s, &"select count(*), sum(id) from u where b and j > 0") == q(s, &"select count(*), sum(id) from u where b and j + 0 > 0")
+    ok = ok && q(s, &"select count(*), count(v) from u where v >= ''") == q(s, &"select count(v), count(v) from u")
+    ok = ok && q(s, &"select count(*) from c where uid not in (select id from u)") == "SELECT 1 0"
+    return ok
+}
+
+// The random part; out its transcript.
+fn random(s: mut &lexdb_exec.Session, r: mut &lexdb_base.Rng, out: mut &[]str, tables: mut &int, cons: mut &bool, errs: mut &int,
+          rets: mut &int, blocks: mut &int) {
+    var n = 0
+    while n < 420 {
+        if r.below(18) == 0 {
+            // a block: its own rows inserted, then updated, with the table's
+            blocks += 1
+            append(out, q(s, &"begin"))
+            let base = 100000 + n * 10
+            var rows: []str = []
+            for i in 0..(1 + r.below(8)) { append(mut &rows, uRow(r, base + i)) }
+            append(out, q(s, &("insert into u values " + strings.join(&rows, ", "))))
+            for i in 0..(1 + r.below(3)) {
+                let sql = if r.below(2) == 0 { "update u set " + setList(r) + " where id >= " + base.toStr() } else { stmt(r) }
+                let got = q(s, &sql)
+                append(out, sql + " -> " + got)
+                if strings.startsWith(got, "ERROR") { errs += 1 }
+                n += 1
+            }
+            append(out, q(s, &"select count(*), sum(k), sum(n) from u where id >= 100000"))
+            append(out, q(s, &(if r.below(3) == 0 { "rollback" } else { "commit" })))
+            continue
+        }
+        let sql = stmt(r)
+        var nr = 0
+        let got = qn(s, &sql, mut &nr)
+        append(out, sql + " -> " + got)
+        if strings.startsWith(got, "ERROR") { errs += 1 }
+        rets += nr
+        n += 1
+        if n % 25 == 0 {
+            append(out, "TABLE " + q(s, &"select * from u order by id") + " / " + q(s, &"select * from c order by id"))
+            tables += 1
+            cons = cons && consistent(s)
+        }
+    }
+}
+
+// Two sessions: the row locks an UPDATE takes, write skew, its scan's reads.
+fn twoSessions(a: mut &lexdb_exec.Session, b: mut &lexdb_exec.Session, out: mut &[]str) {
+    let x0 = q(a, &"update u set k = 11 where id = 10")
+    let a1 = q(a, &"begin")
+    let a2 = q(a, &"update u set k = k + 1 where id = 10")
+    let ks = q(b, &"select id from u where id = 10 for key share nowait")
+    let up = q(b, &"select id from u where id = 10 for update nowait")
+    let a3 = q(a, &"update u set id = 9000 where id = 11")
+    let ks2 = q(b, &"select id from u where id = 11 for key share nowait")
+    let a4 = q(a, &"rollback")
+    let a5 = q(a, &"begin")
+    let a6 = q(a, &"update u set k = k where id % 100 = 1")
+    var skn = 0
+    let sk = qn(b, &"select id from u where id % 100 = 1 for update skip locked", mut &skn)
+    var all = 0
+    let al = qn(b, &"select id from u where id % 100 = 1", mut &all)
+    let a7 = q(a, &"rollback")
+    let k12 = q(a, &"select k from u where id = 10")
+    append(out, "locks: no key update (" + a2 + "): for key share " + ks + "; for update " + up + "; key update (" + a3 + "): for key share " + ks2 +
+           "; skip locked: " + skn.toStr() + " of " + all.toStr() + " rows; after rollback " + k12)
+    // write skew: each block updates its row if both rows are on
+    let w0 = q(a, &"update u set k = 1 where id in (20, 21)")
+    let w1 = q(a, &"begin")
+    let w2 = q(b, &"begin")
+    let w3 = q(a, &"update u set k = 0 where id = 20 and (select count(*) from u where id in (20, 21) and k = 1) = 2")
+    let w4 = q(b, &"update u set k = 0 where id = 21 and (select count(*) from u where id in (20, 21) and k = 1) = 2")
+    let ca = q(a, &"commit")
+    let cb = q(b, &"commit")
+    append(out, "write skew: " + ca + " then " + cb + " (" + w3 + ", " + w4 + ")")
+    // a block's UPDATE that scanned the table: another's commit there first
+    let s0 = q(a, &"update u set s = 4, k = case when id = 33 then 49 else 50 end where id in (33, 34)")
+    let s1 = q(a, &"begin")
+    let s2 = q(a, &"update u set n = 0 where s = 4 and k = 50")
+    let s3 = q(b, &"update u set k = 50 where id = 33")
+    let s4 = q(a, &"commit")
+    let r1 = q(a, &"begin")
+    let r2 = q(a, &"update u set n = 0 where id between 40 and 45")
+    let r3 = q(b, &"update u set k = k + 1 where id = 300")
+    let r4 = q(a, &"commit")
+    append(out, "scanned: " + s2 + ", other " + s3 + ", commit " + s4 + "; key range: " + r2 + ", other " + r3 +
+           ", commit " + r4)
+    append(out, q(a, &"select * from u where id in (10, 11, 20, 21, 33, 40, 45, 300) order by id"))
+}
+
+fn runAll(seed: int, batch: bool, out: mut &[]str, tables: mut &int, cons: mut &bool, errs: mut &int, rets: mut &int, blocks: mut &int) {
+    lexdb_store.run(lexdb_disk.sim(seed), opts(), fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        var s2 = lexdb_exec.newSession(st)
+        var r = lexdb_base.rng(seed)
+        let z = q(mut &s, &"set timezone = 'Asia/Kolkata'")
+        let z2 = q(mut &s2, &"set timezone = 'Asia/Kolkata'")
+        let m = if batch { "on" } else { "off" }
+        let b1 = q(mut &s, &("set lexdb_batch = " + m))
+        let b2 = q(mut &s2, &("set lexdb_batch = " + m))
+        setup(mut &s, mut &r, out)
+        random(mut &s, mut &r, out, tables, cons, errs, rets, blocks)
+        append(out, "TWO")
+        twoSessions(mut &s, mut &s2, out)
+        s.close()
+        s2.close()
+        return 0
+    }).unwrap()
+}
+
+fn main() {
+    var off: []str = []
+    var on: []str = []
+    var t1 = 0
+    var t2 = 0
+    var c1 = true
+    var c2 = true
+    var e1 = 0
+    var e2 = 0
+    var r1 = 0
+    var r2 = 0
+    var k1 = 0
+    var k2 = 0
+    runAll(83, false, mut &off, mut &t1, mut &c1, mut &e1, mut &r1, mut &k1)
+    runAll(83, true, mut &on, mut &t2, mut &c2, mut &e2, mut &r2, mut &k2)
+    var stmts = 0
+    var same = 0
+    var tabs = 0
+    var tabsSame = 0
+    var two = false
+    var twoSame = true
+    for i in 0..len(off) {
+        let a = &off[i]
+        let b = if i < len(on) { on[i] } else { "" }
+        if a == "TWO" { two = true }
+        if two {
+            if a != b {
+                twoSame = false
+                println("TWO DIFFERS:\n  off: " + a + "\n  on:  " + b)
+            }
+            continue
+        }
+        let isStmt = strings.startsWith(a, "update ")
+        let isTab = strings.startsWith(a, "TABLE ")
+        if isStmt { stmts += 1 }
+        if isTab { tabs += 1 }
+        if a == b {
+            if isStmt { same += 1 }
+            if isTab { tabsSame += 1 }
+        } else {
+            println("DIFFERS:\n  off: " + a + "\n  on:  " + b)
+        }
+    }
+    if len(on) != len(off) { println("transcripts differ in length: " + len(off).toStr() + " " + len(on).toStr()) }
+    // what the statements did: their errors by state, rows updated
+    var states: Map[str, int] = newMap()
+    var changed = 0
+    var updated = 0
+    for l in off {
+        if !strings.startsWith(l, "update ") { continue }
+        let at = strings.indexOf(l, " -> ", 0)
+        let res = l[at + 4..len(l)].toStr()
+        if strings.startsWith(&res, "ERROR ") {
+            let st = res[6..11].toStr()
+            states.put(st, states.getOr(&st, 0) + 1)
+        } else if strings.startsWith(&res, "UPDATE ") {
+            let f = strings.split(&res, " ")
+            let k = strings.parseIntOpt(f[1].toStr()).unwrapOr(0)
+            if k > 0 { changed += 1 }
+            updated += k
+        }
+    }
+    var sts: []str = []
+    for x in 0..states.size() { append(mut &sts, states.keyAt(x).toStr() + " " + states.getOr(states.keyAt(x), 0).toStr()) }
+    collections.sort(mut &sts)
+    println("rows updated: " + updated.toStr() + " by " + changed.toStr() + " statements; errors by state: " + strings.join(&sts, ", "))
+    println("statements: " + stmts.toStr() + ", the same both ways: " + same.toStr())
+    println("tables compared: " + tabs.toStr() + ", the same: " + tabsSame.toStr() + "; indexes consistent: " + c1.toStr() + " " + c2.toStr())
+    println("errors: " + e1.toStr() + "; RETURNING rows: " + r1.toStr() + "; blocks: " + k1.toStr())
+    println("two sessions the same both ways: " + twoSame.toStr())
+    var two2 = false
+    for l in on {
+        if l == "TWO" { two2 = true }
+        if two2 && (strings.startsWith(l, "locks:") || strings.startsWith(l, "write skew:") || strings.startsWith(l, "scanned:")) { println(l) }
+    }
+}

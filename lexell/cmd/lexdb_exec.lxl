@@ -21537,6 +21537,11 @@ type Lazy = record {
     raw: []int
     rawPl: []int
     skip: []bool            // per condition: one of raw
+    // A tagged row's (9.76: a row with a date or a timestamp mostly is)
+    // two steps (bTagLazy): first the places of first and raw (bf's
+    // placeCol, stopAt), then those of rest for the rows kept (br's)
+    bf: BPlan
+    br: BPlan
 }
 
 // A top-N's bar (sortBatches): a row whose first key (an integer column,
@@ -21599,7 +21604,79 @@ fn lazyOf(bp: &BPlan, t: &Table, conds: &[]BNode, extra: int): Lazy {
         let c = bp.placeCol[pl]
         if used[c] { append(mut &first, pl) } else { append(mut &rest, pl) }
     }
-    return Lazy{on: (len(first) > 0 || len(raw) > 0) && len(rest) > 0, first: first, rest: rest, raw: raw, rawPl: rawPl, skip: skip}
+    var bf = placesOnly(bp, &first)
+    for pl in rawPl { bf.placeCol[pl] = bp.placeCol[pl] }
+    bf.stopAt = 0
+    for pl in 0..len(bf.placeCol) { if bf.placeCol[pl] >= 0 { bf.stopAt = pl + 1 } }
+    let br = placesOnly(bp, &rest)
+    return Lazy{on: (len(first) > 0 || len(raw) > 0) && len(rest) > 0, first: first, rest: rest, raw: raw, rawPl: rawPl, skip: skip,
+                bf: bf, br: br}
+}
+
+// bp reading places ps only, as a tagged row is read (bRowInto): its
+// placeCol those places' (-1 the others), stopAt the last one's end.
+fn placesOnly(bp: &BPlan, ps: &[]int): BPlan {
+    var pc: []int = array(len(bp.placeCol), -1)
+    var stop = 0
+    for pl in ps {
+        pc[pl] = bp.placeCol[pl]
+        if pl + 1 > stop { stop = pl + 1 }
+    }
+    var need: []bool = []
+    for x in bp.needCol { append(mut &need, x) }
+    var np: []bool = []
+    for x in bp.needP { append(mut &np, x) }
+    return BPlan{kinds: copyInts(&bp.kinds), needCol: need, placeCol: pc, usedP: copyInts(ps), stopAt: stop,
+                 missing: copyRow(&bp.missing), needP: np, width: bp.width}
+}
+
+// Whether stored row s is a tagged one (bRowInto's last way): not in the
+// fixed layout, not stored apart, not one with long texts kept whole.
+fn plainTagged(s: &str): bool {
+    if len(s) > 0 && (s[0] == FIXED || s[0] == 6 || s[0] == 0xFF) { return false }
+    return lexdb_store.partOf(s).isNone()
+}
+
+// bRunLazy for a run of tagged rows from vs[from] up to vs[to]: each decoded
+// into b's rows b.n on at the places of the conditions (lz.bf), the
+// conditions and the bar run over the run, the rest decoded for the rows
+// kept (lz.br), which are added to idx (kept: the conditions' count added
+// to). Before, every place a tagged row's level used was decoded for every
+// row (an UPDATE of 1% of a million rows with a timestamp: 296 ms, 80 of
+// them choosing the rows). The rows decoded (0: vs[from] is not a tagged
+// row); -1 a value of a kind its column's batch does not hold; -2 a
+// condition's error on one of them.
+fn bTagLazy(leaf: &lexdb_page.Node, from: int, to: int, b: mut &Batch, bp: &BPlan, t: &Table, lz: &Lazy, conds: &[]BNode,
+            bar: &Bar, idx: mut &[]int, kept: mut &int): Result[int, DbErr] {
+    let r0 = b.n
+    var end = from
+    while end < to {
+        let s = leaf.valView(end)
+        if !plainTagged(s) { break }
+        if try bRowInto(s, r0 + end - from, b, &lz.bf, t) != 0 { return Ok(-1) }
+        end += 1
+    }
+    let n = end - from
+    if n == 0 { return Ok(0) }
+    var rs: []int = withCapacity(n)
+    for q in 0..n { append(mut &rs, r0 + q) }
+    // (raw LIKEs too: their places were decoded)
+    let none: []bool = []
+    let got = bNarrow(conds, &none, b, rs)
+    if got.isNone() { return Ok(-2) }
+    var ch = got.unwrap()
+    kept += len(ch)
+    if bar.on && len(ch) > 0 {
+        var ok: []int = withCapacity(len(ch))
+        let kc = &b.cols[bar.col]
+        for r in ch { if !barAfter(bar, kc.v[r], kc.nul[r]) { append(mut &ok, r) } }
+        ch = ok
+    }
+    for r in ch {
+        if try bRowInto(leaf.valView(from + r - r0), r, b, &lz.br, t) != 0 { return Ok(-1) }
+        append(idx, r)
+    }
+    return Ok(n)
 }
 
 // idx0 narrowed to the rows of b every one of conds (not marked in skip)
@@ -21850,6 +21927,23 @@ fn fillPickIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, sc: 
                     return false
                 }
                 match bRunLazy(leaf, k, min(j, k + BROWS - b.n), mut &b, bp, t, lz, conds, bar, mut &idx, mut &kept) {
+                    Ok(got) {
+                        if got < 0 {
+                            bail = true
+                            return false
+                        }
+                        if got > 0 {
+                            b.n += got
+                            k += got
+                            continue
+                        }
+                    }
+                    Err(x) {
+                        append(mut &bad, x)
+                        return false
+                    }
+                }
+                match bTagLazy(leaf, k, min(j, k + BROWS - b.n), mut &b, bp, t, lz, conds, bar, mut &idx, mut &kept) {
                     Ok(got) {
                         if got < 0 {
                             bail = true
