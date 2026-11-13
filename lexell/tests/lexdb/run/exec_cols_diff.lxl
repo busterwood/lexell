@@ -1,0 +1,207 @@
+// lexdb_exec: random queries over tables written with column leaves
+// against the same tables with column leaves off (design/lexdb.md 9.112).
+// Store A writes column leaves, store B rows only
+// (lexdb_store.setColumns); both get the same random tables (each column
+// a random type, its NULLs and values drawn to hit each codec), the same
+// random changes (inserts, updates of ranges and of single rows, deletes,
+// an added column) with checkpoints between, and the same random queries
+// (filters, LIKE, ranges, IS NULL, groups, orders, limits, point reads,
+// aggregates), batches on and off. Every result must be the same; A must
+// have written column leaves.
+// expect: rounds 10, statements the same true, queries 4000 the same 4000, A column leaves true, B column leaves 0; errors under 2% true
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_base"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            var out: []str = []
+            for r in rs {
+                if !r.hasRows { append(mut &out, r.tag) }
+                for row in r.rows {
+                    var vs: []str = []
+                    for v in row { append(mut &vs, lexdb_exec.text(&v)) }
+                    append(mut &out, strings.join(&vs, "|"))
+                }
+            }
+            return strings.join(&out, " ")
+        }
+        Err(e) { return "ERROR " + e.state + " " + e.msg }
+    }
+}
+
+// A column: its name, type (0 int, 1 smallint, 2 bigint, 3 boolean, 4
+// numeric(10,2), 5 numeric, 6 text of few values, 7 text), NULL share in
+// tenths, and value style.
+type Col = value record { name: str; typ: int; nulls: int; style: int }
+
+fn typeName(t: int): str {
+    return ["int", "smallint", "bigint", "boolean", "numeric(10,2)", "numeric", "text", "text"][t]
+}
+
+// A value of column c for row g, as SQL.
+fn lit(r: mut &lexdb_base.Rng, c: &Col, g: int): str {
+    if r.below(10) < c.nulls { return "null" }
+    let t = c.typ
+    if t == 0 { return if c.style == 0 { (g % 100).toStr() } else { (r.below(2000000) - 1000000).toStr() } }
+    if t == 1 { return (r.below(65536) - 32768).toStr() }
+    if t == 2 {
+        if c.style == 0 { return (g * 1000 + r.below(1000)).toStr() }
+        if c.style == 1 { return ["9223372036854775807", "-9223372036854775807", "0", "1", "-1"][r.below(5)] }
+        return (r.below(1000000000) * 1000000 + r.below(1000000)).toStr()
+    }
+    if t == 3 { return if r.below(2) == 0 { "true" } else { "false" } }
+    if t == 4 { return ((r.below(2000000) - 1000000)).toStr() + "/100.0" }
+    if t == 5 {
+        if c.style == 0 { return (r.below(100000)).toStr() + ".5" }
+        return ["1.5", "2.25", "-0.001", "1e20", "123456789012345678901234567", "0", "7", "3.14159", "0.10", "100"][r.below(10)]
+    }
+    if t == 6 { return "'" + ["Paris", "Rome", "Oslo", "", "Lima", "Tokyo"][r.below(6)] + "'" }
+    let l = r.below(30)
+    var b = newStrBuf()
+    for i in 0..l { b.addByte(byte(97 + r.below(if c.style == 0 { 3 } else { 26 }))) }
+    return "'" + b.toStr() + "'"
+}
+
+fn insert(r: mut &lexdb_base.Rng, cols: &[]Col, from: int, to: int): str {
+    var rows: []str = []
+    for g in from..to {
+        var vs: []str = [g.toStr()]
+        for c in cols { append(mut &vs, lit(r, &c, g)) }
+        append(mut &rows, "(" + strings.join(&vs, ", ") + ")")
+    }
+    var names: []str = ["id"]
+    for c in cols { append(mut &names, c.name) }
+    return "insert into x (" + strings.join(&names, ", ") + ") values " + strings.join(&rows, ", ")
+}
+
+// A condition on column c.
+fn cond(r: mut &lexdb_base.Rng, c: &Col): str {
+    let t = c.typ
+    let k = r.below(4)
+    if k == 0 { return c.name + (if r.below(2) == 0 { " is null" } else { " is not null" }) }
+    if t == 3 { return if k == 1 { c.name } else { "not " + c.name } }
+    if t == 6 || t == 7 {
+        if k == 1 { return c.name + " like '%" + ["a", "o", "ri", "b"][r.below(4)] + "%'" }
+        if k == 2 { return c.name + " = '" + ["Paris", "Oslo", "abc", ""][r.below(4)] + "'" }
+        return c.name + " < 'm'"
+    }
+    let v = lit(r, c, r.below(400))
+    let v2 = if v == "null" { "0" } else { v }
+    if k == 1 { return c.name + [" < ", " >= ", " = ", " <> "][r.below(4)] + v2 }
+    return c.name + " between " + v2 + " and " + v2 + " + " + r.below(1000000).toStr()
+}
+
+fn query(r: mut &lexdb_base.Rng, cols: &[]Col): str {
+    let c = cols[r.below(len(cols))]
+    let d = cols[r.below(len(cols))]
+    let w = if r.below(4) == 0 { "" } else if r.below(3) == 0 { " where " + cond(r, &c) + " and " + cond(r, &d) } else { " where " + cond(r, &c) }
+    let k = r.below(8)
+    let num = c.typ != 3 && c.typ != 6 && c.typ != 7
+    if k == 0 { return "select count(*), count(" + c.name + "), count(" + d.name + ") from x" + w }
+    if k == 1 && num { return "select sum(" + c.name + "), min(" + c.name + "), max(" + c.name + ") from x" + w }
+    if k == 2 { return "select " + d.name + ", count(*) from x" + w + " group by " + d.name + " order by 1 limit 20" }
+    if k == 3 { return "select id, " + c.name + ", " + d.name + " from x" + w + " order by id limit 15" }
+    if k == 4 { return "select * from x where id = " + r.below(450).toStr() }
+    if k == 5 { return "select id from x" + w + " order by " + c.name + ", id desc limit 10" }
+    if k == 6 { return "select count(distinct " + c.name + ") from x" + w }
+    return "select max(id), min(" + d.name + "), count(*) from x" + w
+}
+
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: 256 * 1024, segBytes: 4 * 1024 * 1024, ckptBytes: 1024 * 1024, snapNodes: 100000, bufferedPages: false}
+}
+
+fn main() {
+    var r = lexdb_base.rng(7)
+    var same = 0
+    var total = 0
+    var stmtsSame = true
+    var colsA = 0
+    var colsB = 0
+    var errs = 0
+    let rounds = 10
+    for round in 0..rounds {
+        let res = lexdb_store.run(lexdb_disk.sim(100 + round), opts(), fn(sa: lexdb_store.Store): int {
+            let res2 = lexdb_store.run(lexdb_disk.sim(200 + round), opts(), fn(sb: lexdb_store.Store): int {
+                sb.setColumns(false)
+                lexdb_exec.bootstrap(&sa).unwrap()
+                lexdb_exec.bootstrap(&sb).unwrap()
+                var a = lexdb_exec.newSession(sa)
+                var b = lexdb_exec.newSession(sb)
+                var cols: []Col = []
+                let nc = 2 + r.below(7)
+                for i in 0..nc { append(mut &cols, Col{name: "c" + i.toStr(), typ: r.below(8), nulls: [0, 0, 1, 3, 10][r.below(5)], style: r.below(3)}) }
+                var ddl: []str = ["id int primary key"]
+                for c in cols { append(mut &ddl, c.name + " " + typeName(c.typ)) }
+                var stmts: []str = ["create table x (" + strings.join(&ddl, ", ") + ")"]
+                for k in 0..8 { append(mut &stmts, insert(mut &r, &cols, k * 50, k * 50 + 50)) }
+                for st in stmts {
+                    if q(mut &a, &st) != q(mut &b, &st) { stmtsSame = false }
+                }
+                for step in 0..5 {
+                    sa.checkpointAll().unwrap()
+                    sb.checkpointAll().unwrap()
+                    for i in 0..40 {
+                        let x = query(mut &r, &cols)
+                        for mode in ["on", "off"] {
+                            let s1 = q(mut &a, &("set lexdb_batch = " + mode))
+                            let s2 = q(mut &b, &("set lexdb_batch = " + mode))
+                            total += 1
+                            let ra = q(mut &a, &x)
+                            let rb = q(mut &b, &x)
+                            if strings.startsWith(&ra, "ERROR") { errs += 1 }
+                            if ra == rb { same += 1 } else {
+                                println("DIFFERENT (" + mode + "): " + x)
+                                println("  A: " + ra)
+                                println("  B: " + rb)
+                            }
+                        }
+                    }
+                    // changes
+                    let c = cols[r.below(len(cols))]
+                    var ch: []str = []
+                    let lo = r.below(400)
+                    append(mut &ch, "update x set " + c.name + " = " + lit(mut &r, &c, lo) + " where id between " + lo.toStr() + " and " + (lo + r.below(80)).toStr())
+                    append(mut &ch, "update x set " + c.name + " = " + lit(mut &r, &c, lo) + " where id = " + r.below(400).toStr())
+                    append(mut &ch, "delete from x where id % " + (7 + r.below(20)).toStr() + " = " + r.below(7).toStr())
+                    append(mut &ch, insert(mut &r, &cols, 400 + step * 10, 410 + step * 10))
+                    if step == 2 {
+                        let nc2 = Col{name: "e" + step.toStr(), typ: r.below(8), nulls: 2, style: 0}
+                        append(mut &ch, "alter table x add column " + nc2.name + " " + typeName(nc2.typ))
+                        append(mut &cols, nc2)
+                        append(mut &ch, "update x set " + nc2.name + " = " + lit(mut &r, &nc2, 1) + " where id < 300")
+                    }
+                    if step == 3 {
+                        append(mut &ch, "begin")
+                        append(mut &ch, "update x set " + c.name + " = null where id < 100")
+                        append(mut &ch, "delete from x where id between 200 and 220")
+                        append(mut &ch, query(mut &r, &cols))
+                        append(mut &ch, query(mut &r, &cols))
+                        append(mut &ch, "select count(*), sum(id) from x")
+                        append(mut &ch, if r.below(2) == 0 { "commit" } else { "rollback" })
+                    }
+                    for st in ch {
+                        let ra = q(mut &a, &st)
+                        let rb = q(mut &b, &st)
+                        if ra != rb {
+                            stmtsSame = false
+                            println("DIFFERENT: " + st)
+                            println("  A: " + ra)
+                            println("  B: " + rb)
+                        }
+                    }
+                }
+                colsA += sa.colCounts()[0]
+                colsB += sb.colCounts()[0]
+                return 0
+            })
+            return 0
+        })
+    }
+    println("rounds " + rounds.toStr() + ", statements the same " + stmtsSame.toStr() + ", queries " + total.toStr() + " the same " + same.toStr() +
+            ", A column leaves " + (colsA > 0).toStr() + ", B column leaves " + colsB.toStr() + "; errors under 2% " + (errs * 50 < total).toStr())
+}
