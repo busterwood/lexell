@@ -12456,6 +12456,7 @@ fn delete(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     var q = try buildQuery(st, txn, &(try dmlFrom(s)), &s.where, params, &s.subs, mut &sc, false)
     var ret = try retOf(s, &q, mut &sc)
     endScope(mut &sc, mut &q)
+    delNarrow(mut &q, s)
     let t = &q.levels[0].t
     var found: [][]Val = []
     var rs = newRun(&q)
@@ -12489,7 +12490,8 @@ fn delete(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     let nt = len(t.cols)
     for joined in found {
         try retAdd(st, txn, &q, &m, params, mut &ret, &joined, mut &rs)
-        try delRow(st, txn, t, &rowPrefix(&joined, nt), &fw, mut &later)
+        if len(joined) == nt { try delRow(st, txn, t, &joined, &fw, mut &later) }
+        else { try delRow(st, txn, t, &rowPrefix(&joined, nt), &fw, mut &later) }
     }
     try fkFinish(st, txn, &fw, mut &later)
     return Ok(retRes(ret, "DELETE " + len(found).toStr()))
@@ -13944,6 +13946,32 @@ fn narrow(q: mut &Query, s: &lexdb_sql.Stmt) {
         for c in q.levels[k].t.cols { append(mut &need, names.has(&c.name)) }
         q.levels[k].need = need
     }
+}
+
+// DELETE reads of its table's rows only the columns it uses, as narrow does
+// for SELECT: those its WHERE and RETURNING name, the primary key's, and
+// each index's (its columns, expressions and predicate: delRow deletes the
+// entries by value). The rows of a table that foreign keys reference, of a
+// DELETE ... USING, or named whole, are read whole. A DELETE of 10,000 of
+// w's million rows decoded all nine columns of every row to delete by key
+// (design/lexdb.md 9.109).
+fn delNarrow(q: mut &Query, s: &lexdb_sql.Stmt) {
+    if len(q.levels) != 1 || len(s.from) > 0 || q.levels[0].virt() || len(q.levels[0].t.refBy) > 0 { return }
+    var names: Map[str, int] = newMap()
+    var star = false
+    stmtNames(s, mut &names, mut &star)
+    if star || names.has(&q.levels[0].alias) || names.has(&lexdb_sql.baseName(&q.levels[0].t.name)) { return }
+    var xs: []str = []
+    for p in q.levels[0].t.pk { append(mut &xs, q.levels[0].t.cols[p].name) }
+    for ix in q.levels[0].t.indexes {
+        for c in ix.cols { if c >= 0 { append(mut &xs, q.levels[0].t.cols[c].name) } }
+        for x in ix.exprs { colNames(&x, mut &xs) }
+        match ix.pred { Some(x) { colNames(&x, mut &xs) } None {} }
+    }
+    for x in xs { names.put(colPart(&x), 1) }
+    var need: []bool = []
+    for c in q.levels[0].t.cols { append(mut &need, names.has(&c.name)) }
+    q.levels[0].need = need
 }
 
 // ---- row locks (9.86)

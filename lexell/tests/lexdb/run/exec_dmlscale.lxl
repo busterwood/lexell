@@ -1,0 +1,129 @@
+// lexdb_exec: data changes at scale on indexed tables, with a cache so
+// small that commits load the leaves they change (design/lexdb.md 9.109:
+// a commit gathers the leaves its writes miss and reads them together; a
+// DELETE reads only the columns it uses; a transaction's own writes are
+// found by binary search). w has 30,000 rows, an index on b, one on an
+// expression and a filtered one. After each step every index agrees with
+// the table: counts by each index equal counts by a scan (an expression
+// the index cannot serve).
+// - DELETE of 300 rows; DELETE ... RETURNING.
+// - A transaction block that loads 5,400 rows into w2 (indexed) with
+//   INSERT ... SELECT, reads them back through its index, updates and
+//   deletes some, and commits: another session then sees what the block
+//   saw.
+// - Serializable as before: a block that read a range of w_b and deleted
+//   rows fails (40001) when another commits a row into that range first,
+//   and commits when the other's row is outside it.
+// - A DELETE on a table whose rows others reference (read whole): its
+//   cascade.
+// expect: loaded 30000; consistent true
+// expect: delete: DELETE 300; consistent true
+// expect: returning: 300 rows, row 8 n8; consistent true
+// expect: block: own rows 2700 sum 3363750 = 2700 sum 3363750; updated UPDATE 2400; after delete 3900 by index 3900; commit COMMIT
+// expect: other session: 3900 by index 3900; consistent true
+// expect: conflict: in block 0 left; INSERT 0 1 then 40001; consistent true
+// expect: no conflict: INSERT 0 1 then COMMIT; consistent true
+// expect: cascade: DELETE 99, children left 3
+// timeout: 60
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+
+fn one(s: mut &lexdb_exec.Session, sql: str): str {
+    match s.exec(&sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if r.hasRows && len(r.rows) > 0 {
+                var out = ""
+                for v in r.rows[0] { out = out + (if out == "" { "" } else { " " }) + lexdb_exec.text(&v) }
+                return out
+            }
+            return r.tag
+        }
+        Err(e) { return e.state + " " + e.msg }
+    }
+}
+
+fn rows(s: mut &lexdb_exec.Session, sql: str): int {
+    match s.exec(&sql) {
+        Ok(rs) { return len(rs[len(rs) - 1].rows) }
+        Err(e) { return -1 }
+    }
+}
+
+// Whether w's indexes agree with its rows, for a few values each.
+fn consistent(s: mut &lexdb_exec.Session): bool {
+    var ok = one(s, "select count(*) from w where b >= 0") == one(s, "select count(*) from w")
+    for v in [17, 150, 2499, 4321] {
+        ok = ok && one(s, "select count(*), sum(id) from w where b = " + v.toStr()) == one(s, "select count(*), sum(id) from w where b + 0 = " + v.toStr())
+    }
+    for v in [3, 77, 999] {
+        ok = ok && one(s, "select count(*), sum(id) from w where lower(name) = 'n" + v.toStr() + "'") ==
+                   one(s, "select count(*), sum(id) from w where lower(name) || '' = 'n" + v.toStr() + "'")
+    }
+    ok = ok && one(s, "select count(*), sum(id) from w where c > 950") == one(s, "select count(*), sum(id) from w where c + 0 > 950")
+    return ok
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    var a = lexdb_exec.newSession(st)
+    var b = lexdb_exec.newSession(st)
+    let c1 = one(mut &a, "create table w (id int primary key, a int, b int, name text, c int)")
+    let c2 = one(mut &a, "create index w_b on w (b)")
+    let c3 = one(mut &a, "create index w_lname on w (lower(name))")
+    let c4 = one(mut &a, "create index w_c on w (c) where c > 900")
+    let c5 = one(mut &a, "insert into w select g, g % 100, (g * 7919) % 5000, 'N' || (g % 1000), g % 1000 from generate_series(1, 30000) g")
+    println("loaded " + one(mut &a, "select count(*) from w") + "; consistent " + consistent(mut &a).toStr())
+
+    println("delete: " + one(mut &a, "delete from w where a = 7") + "; consistent " + consistent(mut &a).toStr())
+    let n = rows(mut &a, "delete from w where a = 8 returning id, lower(name)")
+    println("returning: " + n.toStr() + " rows, row 8 " + (if one(mut &a, "select count(*) from w where id = 8") == "0" { "n8" } else { "there" }) +
+            "; consistent " + consistent(mut &a).toStr())
+
+    // a block: INSERT ... SELECT, then its own rows read through w2's index
+    let c6 = one(mut &a, "create table w2 (id int primary key, a int, b int, name text, c int)")
+    let c7 = one(mut &a, "create index w2_b on w2 (b)")
+    let b0 = one(mut &a, "begin")
+    let i0 = one(mut &a, "insert into w2 select * from w where a < 20")
+    let own = one(mut &a, "select count(*), sum(b) from w2 where b < 2500")
+    let src = one(mut &a, "select count(*), sum(b) from w where a < 20 and b < 2500")
+    let up = one(mut &a, "update w2 set b = b + 1 where a < 10")
+    let dl = one(mut &a, "delete from w2 where a < 5")
+    let cnt = one(mut &a, "select count(*) from w2")
+    let byIx = one(mut &a, "select count(*) from w2 where b >= 0")
+    println("block: own rows " + strings.replaceAll(own, " ", " sum ") + " = " + strings.replaceAll(src, " ", " sum ") + "; updated " + up +
+            "; after delete " + cnt + " by index " + byIx + "; commit " + one(mut &a, "commit"))
+    println("other session: " + one(mut &b, "select count(*) from w2") + " by index " + one(mut &b, "select count(*) from w2 where b >= 0") +
+            "; consistent " + consistent(mut &b).toStr())
+
+    // serializable: a range of w_b read, rows deleted by key range; another
+    // session's row into that range first
+    let x1 = one(mut &a, "begin")
+    let x2 = one(mut &a, "select sum(c) from w where b between 100 and 200")
+    let x3 = one(mut &a, "delete from w where id between 1000 and 1300")
+    let left = one(mut &a, "select count(*) from w where id between 1000 and 1300")
+    let x4 = one(mut &b, "insert into w values (99999, 1, 150, 'x', 1)")
+    println("conflict: in block " + left + " left; " + x4 + " then " + strings.split(&one(mut &a, "commit"), " ")[0] +
+            "; consistent " + consistent(mut &b).toStr())
+    let y1 = one(mut &a, "begin")
+    let y2 = one(mut &a, "select sum(c) from w where b between 100 and 200")
+    let y3 = one(mut &a, "delete from w where id between 1000 and 1300")
+    let y4 = one(mut &b, "insert into w values (99998, 1, 4000, 'y', 1)")
+    println("no conflict: " + y4 + " then " + one(mut &a, "commit") + "; consistent " + consistent(mut &b).toStr())
+
+    // rows others reference: read whole, the cascade done
+    let p1 = one(mut &a, "create table p (id int primary key, v int)")
+    let p2 = one(mut &a, "create table ch (id int primary key, pid int references p (id) on delete cascade)")
+    let p3 = one(mut &a, "insert into p select g, g from generate_series(1, 200) g")
+    let p4 = one(mut &a, "insert into ch select g, g from generate_series(97, 102) g")
+    println("cascade: " + one(mut &a, "delete from p where v < 100") + ", children left " + one(mut &a, "select count(*) from ch"))
+    a.close()
+    b.close()
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(19), lexdb_store.Options{cacheBytes: 512 * 1024, segBytes: 1024 * 1024, ckptBytes: 512 * 1024, snapNodes: 100000, bufferedPages: false}, body).unwrap()
+}

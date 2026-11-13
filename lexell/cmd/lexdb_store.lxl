@@ -69,6 +69,10 @@ type SlotMeta = value record {
     frame: int          // loaded: its node, pool[frame]; -1 when not (a slot not in memory holds no node)
 }
 
+// A descent's leaf, with the separators around it: keys in [lo, hi) (no lo:
+// from the start; no hi: to the end) reach it by path, as of Db.shape.
+type LastLeaf = record { tree: int; shape: int; path: []int; lo: str; hasLo: bool; hi: str; hasHi: bool }
+
 // An old version of a node, kept while a snapshot can see it: the commits
 // [since, until) saw it.
 type Hist = record { since: int; until: int; node: lexdb_page.Node }
@@ -111,6 +115,13 @@ pub type Db = record {
     wlogFloor: int              // reads before this commit can no longer be checked
     hand: int
     trees: Map[int, int]        // tree id -> root slot
+    // The last descent to a leaf (descend), and the keys that lead there:
+    // a descent of a key between its fences gives its path without
+    // searching, while shape is what it was. shape changes with every
+    // change to what a path may hold: a node replaced, loaded or dropped,
+    // a separator added or removed, a root set (9.109).
+    lastLeaf: LastLeaf
+    shape: int
     nextTree: int
     npages: int
     free: []int                 // pages free now: runs, (first, count) pairs, highest first (9.33)
@@ -218,6 +229,11 @@ pub type Txn = record {
     // the write's own key string (shared, not copied), one map per tree.
     idxTrees: []int
     idx: []Map[str, int]
+    // Per tree written, the keys of idx[k] sorted, as of its first
+    // sortedN[k] keys (a map's keys stay in the order added): ownRange
+    // sorts only the keys added since, and merges them in.
+    sortedKeys: [][]str
+    sortedN: []int
     created: []int
     snap: int                   // its reads' snapshot's id, -1 for none (reads of the live tree)
     snapSeq: int
@@ -265,7 +281,7 @@ pub type Txn = record {
 }
 
 pub fn begin(): Txn {
-    return Txn{reads: [], writes: [], idxTrees: [], idx: [], created: [], snap: -1, snapSeq: 0, snapTrees: newMap(), track: false, live: false, path: [], sess: 0, rules: false, memMax: 0,
+    return Txn{reads: [], writes: [], idxTrees: [], idx: [], sortedKeys: [], sortedN: [], created: [], snap: -1, snapSeq: 0, snapTrees: newMap(), track: false, live: false, path: [], sess: 0, rules: false, memMax: 0,
                raTree: -1, ra: AHEAD_MIN, fsnap: [], now: time.now().unixMicros(), zone: lexdb_time.utc(),
                pending: [], consAll: 0, consNames: [], consDeferred: [], lockId: 0, held: [], quiet: false, openEnd: false,
                tmp: "", tmpDdl: false, onCommit: []}
@@ -346,6 +362,8 @@ fn (t: mut &Txn) noteWrite(tree: int, key: str, i: int) {
     m.put(key, i)
     append(mut &t.idxTrees, tree)
     append(mut &t.idx, m)
+    append(mut &t.sortedKeys, [])
+    append(mut &t.sortedN, 0)
 }
 
 pub fn (t: mut &Txn) put(tree: int, key: str, val: str): Result[Unit, lexdb_base.DbErr] { return t.putRow(tree, key, val, 0) }
@@ -379,6 +397,8 @@ pub fn (t: mut &Txn) undoTo(n: int) {
     while len(t.writes) > n { let w = pop(mut &t.writes) }
     t.idxTrees = []
     t.idx = []
+    t.sortedKeys = []
+    t.sortedN = []
     for i in 0..len(t.writes) { t.noteWrite(t.writes[i].tree, t.writes[i].key, i) }
 }
 
@@ -415,6 +435,7 @@ fn (db: mut &Db) allocSlot(): int {
 
 // Gives slot s node n, in a frame of the pool (its own, or a new one).
 fn (db: mut &Db) setNode(s: int, n: lexdb_page.Node) {
+    db.shape += 1
     let f = db.meta[s].frame
     if f >= 0 {
         db.pool[f] = n
@@ -430,6 +451,7 @@ fn (db: mut &Db) setNode(s: int, n: lexdb_page.Node) {
 fn (db: mut &Db) freeNode(s: int) {
     let f = db.meta[s].frame
     if f < 0 { return }
+    db.shape += 1
     db.meta[s].frame = -1
     let last = len(db.pool) - 1
     let n = pop(mut &db.pool)
@@ -669,6 +691,14 @@ fn (db: &Db) loadReq(s: int): LoadReq {
 
 // Installs a page read for a slot, unless the slot changed meanwhile.
 fn (db: mut &Db) install(r: LoadReq, b: &[]byte): Result[Unit, lexdb_base.DbErr] {
+    try db.installOnly(r, b)
+    db.maybeEvict()
+    return Ok(Unit{})
+}
+
+// install, evicting nothing: loadMany evicts once after its pages (each
+// install's sweep would clear the reference bits the ones before it set).
+fn (db: mut &Db) installOnly(r: LoadReq, b: &[]byte): Result[Unit, lexdb_base.DbErr] {
     let s = r.slot
     if !db.meta[s].used || db.meta[s].gen != r.gen || db.meta[s].loaded || db.meta[s].disk != r.page {
         return Ok(Unit{})
@@ -689,7 +719,6 @@ fn (db: mut &Db) install(r: LoadReq, b: &[]byte): Result[Unit, lexdb_base.DbErr]
     db.loadedCount += 1
     db.recost(s)
     db.loads += 1
-    db.maybeEvict()
     return Ok(Unit{})
 }
 
@@ -780,6 +809,81 @@ fn (st: &Store) loadAhead(need: int, run: &[]LoadReq): Result[Unit, lexdb_base.D
     return res
 }
 
+// How many pages loadMany reads at a time.
+const READS_IN_FLIGHT = 32
+
+type PageRead = record { f: lexdb_disk.File; page: int }
+
+fn readOne(r: PageRead): Result[[]byte, lexdb_base.DbErr] {
+    var b = array(PAGE, byte(0))
+    try r.f.read(r.page * PAGE, mut &b[0..PAGE], PAGE)
+    return Ok(b)
+}
+
+// Loads the slots not in memory among slots, their pages read
+// READS_IN_FLIGHT at a time (a commit's leaves are scattered: one read
+// each, not a run). The cache is swept once, after all are in: they are
+// marked referenced, and so are the nodes the caller's descents just
+// passed, so a commit's nodes are not evicted by its own loads (the cache
+// holds more than its size meanwhile, as before).
+fn (st: &Store) loadMany(slots: &[]int): Result[Unit, lexdb_base.DbErr] {
+    if len(slots) == 1 { return st.load(slots[0]) }
+    var reqs: []LoadReq = []
+    var f = lexdb_disk.File.Real(-1, false)
+    var bad = false
+    st.sh.with(fn(db: mut &Db) {
+        f = db.data
+        for s in slots {
+            if !db.meta[s].used || db.meta[s].loaded { continue }
+            if db.meta[s].disk < 0 {
+                bad = true
+                return
+            }
+            append(mut &reqs, db.loadReq(s))
+        }
+    })
+    if bad { return Err(lexdb_base.err(lexdb_base.S_INTERNAL, "load: a slot without a page")) }
+    var at = 0
+    while at < len(reqs) {
+        let end = min(at + READS_IN_FLIGHT, len(reqs))
+        var batch: []PageRead = []
+        for j in at..end { append(mut &batch, PageRead{f: f, page: reqs[j].page}) }
+        var got: []Result[[]byte, lexdb_base.DbErr] = []
+        var res: Result[Unit, lexdb_base.DbErr] = Ok(Unit{})
+        task.scope(fn(sc: mut &task.Scope) {
+            var fs: []task.Future[Result[[]byte, lexdb_base.DbErr]] = []
+            while len(batch) > 0 { append(mut &fs, sc.start(readOne, pop(mut &batch))) }
+            match task.all(fs) {
+                Ok(rs) { got = rs }
+                Err(_) { res = Err(lexdb_base.err(lexdb_base.S_INTERNAL, "load: a page read was cancelled")) }
+            }
+        })
+        try res
+        // (started from the batch's end: got is in reverse order)
+        var pages: [][]byte = []
+        while len(got) > 0 {
+            let x = pop(mut &got)
+            if x.isErr() { return Err(x.unwrapErr()) }
+            append(mut &pages, x.unwrap())
+        }
+        st.sh.with(fn(db: mut &Db) {
+            for j in 0..len(pages) {
+                match db.installOnly(reqs[at + j], &pages[j]) {
+                    Ok(_) {}
+                    Err(x) {
+                        res = Err(x)
+                        return
+                    }
+                }
+            }
+        })
+        try res
+        at = end
+    }
+    st.sh.with(fn(db: mut &Db) { db.maybeEvict() })
+    return Ok(Unit{})
+}
+
 // ---- descending
 
 // The number of keys <= k: the child to follow.
@@ -815,9 +919,18 @@ type Descent = record {
 }
 
 fn (db: mut &Db) descend(tree: int, k: &str): Descent {
+    // the last descent's leaf, when k is between its fences: a commit's
+    // writes in key order (a load, a range deleted) mostly go to the leaf
+    // the one before went to
+    if db.lastLeaf.shape == db.shape && db.lastLeaf.tree == tree && (!db.lastLeaf.hasLo || k >= db.lastLeaf.lo) &&
+       (!db.lastLeaf.hasHi || k < db.lastLeaf.hi) {
+        return Descent{path: collections.copyOf(&db.lastLeaf.path), need: -1, upper: db.lastLeaf.hi, hasUpper: db.lastLeaf.hasHi}
+    }
     var d = Descent{path: [], need: -1, upper: "", hasUpper: false}
     var s = match db.trees.get(&tree) { Some(r) { r } None { -1 } }
     if s < 0 { return d }
+    var lo = ""
+    var hasLo = false
     while true {
         if !db.meta[s].loaded {
             d.need = s
@@ -825,11 +938,18 @@ fn (db: mut &Db) descend(tree: int, k: &str): Descent {
         }
         db.meta[s].ref = true
         append(mut &d.path, s)
-        if db.pool[db.meta[s].frame].leaf { return d }
+        if db.pool[db.meta[s].frame].leaf {
+            db.lastLeaf = LastLeaf{tree: tree, shape: db.shape, path: collections.copyOf(&d.path), lo: lo, hasLo: hasLo, hi: d.upper, hasHi: d.hasUpper}
+            return d
+        }
         let i = childIndex(&db.pool[db.meta[s].frame].keys, k)
         if i < db.pool[db.meta[s].frame].count() {
             d.upper = db.pool[db.meta[s].frame].key(i)
             d.hasUpper = true
+        }
+        if i > 0 {
+            lo = db.pool[db.meta[s].frame].key(i - 1)
+            hasLo = true
         }
         s = db.pool[db.meta[s].frame].kids[i]
     }
@@ -837,6 +957,26 @@ fn (db: mut &Db) descend(tree: int, k: &str): Descent {
 }
 
 // ---- changing a tree (inside with; every node on the path is in memory)
+
+// collections.insert and removeAt for a node's keys and values, each
+// element moved by replace rather than swap: about 3 times faster
+// (design/lexdb.md 9.109).
+fn insertStr(xs: mut &[]str, i: int, x: str) {
+    append(xs, "")
+    var j = len(xs) - 1
+    while j > i {
+        xs[j] = replace(mut &xs[j - 1], "")
+        j -= 1
+    }
+    xs[i] = x
+}
+
+fn removeStr(xs: mut &[]str, i: int): str {
+    let out = replace(mut &xs[i], "")
+    for j in i..len(xs) - 1 { xs[j] = replace(mut &xs[j + 1], "") }
+    let last = pop(xs)
+    return out
+}
 
 fn nodeSize(n: &lexdb_page.Node): int {
     var size = 0
@@ -856,6 +996,7 @@ fn nodeSize(n: &lexdb_page.Node): int {
 // chunks fills stay full, where halving would leave them half full wherever
 // in the tree the run goes (9.30).
 fn (db: mut &Db) split(s: int, atEnd: bool, at: int): Descent {
+    db.shape += 1
     db.willChange(s)
     db.pool[db.meta[s].frame].loosen()
     let leaf = db.pool[db.meta[s].frame].leaf
@@ -947,7 +1088,8 @@ fn (db: mut &Db) fixOverflow(tree: int, path: &[]int, from: int, atEnd: bool, in
         db.willChange(p)
         var at = 0
         while db.pool[db.meta[p].frame].kids[at] != s { at += 1 }
-        collections.insert(mut &db.pool[db.meta[p].frame].keys, at, sp.upper)
+        db.shape += 1
+        insertStr(mut &db.pool[db.meta[p].frame].keys, at, sp.upper)
         collections.insert(mut &db.pool[db.meta[p].frame].kids, at + 1, r)
         end = end && at + 2 == len(db.pool[db.meta[p].frame].kids)     // the new child is the parent's last
         db.pool[db.meta[p].frame].size += lexdb_page.kidEntry(&sp.upper)
@@ -975,8 +1117,8 @@ fn (db: mut &Db) applyPut(tree: int, key: &str, val: &str) {
         db.pool[db.meta[leaf].frame].size += len(val) - len(db.pool[db.meta[leaf].frame].val(i))
         db.pool[db.meta[leaf].frame].vals[i] = val
     } else {
-        collections.insert(mut &db.pool[db.meta[leaf].frame].keys, i, key)
-        collections.insert(mut &db.pool[db.meta[leaf].frame].vals, i, val)
+        insertStr(mut &db.pool[db.meta[leaf].frame].keys, i, key)
+        insertStr(mut &db.pool[db.meta[leaf].frame].vals, i, val)
         db.pool[db.meta[leaf].frame].size += lexdb_page.leafEntry(key, val)
     }
     db.meta[leaf].version += 1
@@ -995,8 +1137,8 @@ fn (db: mut &Db) applyDel(tree: int, key: &str) {
     db.willChange(leaf)
     db.pool[db.meta[leaf].frame].loosen()
     db.pool[db.meta[leaf].frame].size -= lexdb_page.leafEntry(&db.pool[db.meta[leaf].frame].key(i), &db.pool[db.meta[leaf].frame].val(i))
-    let k = collections.removeAt(mut &db.pool[db.meta[leaf].frame].keys, i)
-    let v = collections.removeAt(mut &db.pool[db.meta[leaf].frame].vals, i)
+    let k = removeStr(mut &db.pool[db.meta[leaf].frame].keys, i)
+    let v = removeStr(mut &db.pool[db.meta[leaf].frame].vals, i)
     db.meta[leaf].version += 1
     db.pool[db.meta[leaf].frame].packed = false
     db.recost(leaf)
@@ -1017,10 +1159,11 @@ fn (db: mut &Db) applyDel(tree: int, key: &str) {
         if at > 0 && !db.edgeLoaded(db.pool[db.meta[p].frame].kids[at - 1], true) { break }
         if at == 0 && nk > 1 && !db.edgeLoaded(db.pool[db.meta[p].frame].kids[1], false) { break }
         db.willChange(p)
+        db.shape += 1
         let gone = collections.removeAt(mut &db.pool[db.meta[p].frame].kids, at)
         if db.pool[db.meta[p].frame].count() > 0 {
             let ki = if at == 0 { 0 } else { at - 1 }
-            let sk = collections.removeAt(mut &db.pool[db.meta[p].frame].keys, ki)
+            let sk = removeStr(mut &db.pool[db.meta[p].frame].keys, ki)
         }
         db.pool[db.meta[p].frame].size = nodeSize(&db.pool[db.meta[p].frame])
         db.meta[p].version += 1
@@ -1065,6 +1208,7 @@ fn (db: &Db) edgeLoaded(s: int, right: bool): bool {
 
 // Sets (slot >= 0) or removes a tree's root, noting the change for snapshots.
 fn (db: mut &Db) setRoot(tree: int, slot: int) {
+    db.shape += 1
     let prev = match db.trees.get(&tree) { Some(x) { x } None { -1 } }
     if db.seq > db.durableSeq || db.maxSnap() >= 0 { append(mut &db.rootHist, RootChange{seq: db.seq, tree: tree, prev: prev}) }
     if slot >= 0 { db.trees.put(tree, slot) } else { let gone = db.trees.remove(&tree) }
@@ -1813,20 +1957,46 @@ fn (st: &Store) snapGet(t: mut &Txn, tree: int, key: str, mode: int): Result[Opt
 pub type Entry = value record { pub key: str; pub val: str }
 
 // The transaction's own writes to tree with keys in [from, to) (to "" for no
-// end), sorted, the last write of each key.
-fn (t: &Txn) ownRange(tree: int, from: &str, to: &str): []TxWrite {
+// end), sorted, the last write of each key. The tree's keys are kept
+// sorted (sortedKeys), so a scan's call costs the keys in its range and a
+// binary search, not a pass over every write the transaction made: an
+// INSERT ... SELECT's source scan called this per batch while its writes
+// grew, quadratic in the rows (design/lexdb.md 9.109).
+fn (t: mut &Txn) ownRange(tree: int, from: &str, to: &str): []TxWrite {
     var out: []TxWrite = []
-    for i in 0..len(t.writes) {
-        let w = t.writes[i]
-        if w.tree != tree || (w.op != OP_PUT && w.op != OP_DEL) { continue }
-        if w.key < from || (len(to) > 0 && w.key >= to) { continue }
-        match t.lastWrite(tree, &w.key) {
-            Some(last) { if last != i { continue } }
+    var k = 0
+    while k < len(t.idxTrees) && t.idxTrees[k] != tree { k += 1 }
+    if k == len(t.idxTrees) { return out }
+    let n = t.idx[k].size()
+    if t.sortedN[k] < n {
+        var added: []str = []
+        for i in t.sortedN[k]..n { append(mut &added, t.idx[k].keyAt(i)) }
+        collections.sortBy(mut &added, fn(a: &str, b: &str): int { return a.cmp(b) })
+        let old = replace(mut &t.sortedKeys[k], [])
+        var merged: []str = withCapacity(len(old) + len(added))
+        var a = 0
+        var b = 0
+        while a < len(old) || b < len(added) {
+            if b == len(added) || (a < len(old) && old[a] < added[b]) {
+                append(mut &merged, old[a])
+                a += 1
+            } else {
+                append(mut &merged, added[b])
+                b += 1
+            }
+        }
+        t.sortedKeys[k] = merged
+        t.sortedN[k] = n
+    }
+    var j = collections.lowerBound(&t.sortedKeys[k], from)
+    while j < len(t.sortedKeys[k]) {
+        if len(to) > 0 && t.sortedKeys[k][j] >= to { break }
+        match t.idx[k].get(&t.sortedKeys[k][j]) {
+            Some(i) { append(mut &out, t.writes[i]) }
             None {}
         }
-        append(mut &out, w)
+        j += 1
     }
-    collections.sortBy(mut &out, fn(a: &TxWrite, b: &TxWrite): int { return a.key.cmp(&b.key) })
     return out
 }
 
@@ -2355,7 +2525,7 @@ fn (st: &Store) commitLive(t: Txn, durable: bool): Result[Unit, lexdb_base.DbErr
     var wait: []task.Future[Result[Unit, lexdb_base.DbErr]] = []
     var wake: []task.Promise[Unit] = []
     while true {
-        var need = -1
+        var needs: []int = []
         var bad: []lexdb_base.DbErr = []
         var held: []task.Future[Unit] = []
         st.sh.with(fn(db: mut &Db) {
@@ -2380,13 +2550,23 @@ fn (st: &Store) commitLive(t: Txn, durable: bool): Result[Unit, lexdb_base.DbErr
                     while len(db.ckptWake) > 0 { append(mut &wake, pop(mut &db.ckptWake)) }
                 }
             }
+            // Every write's nodes in memory: a pass over the writes gathers
+            // the slots missing, which are read together (loadMany), and
+            // the commit applies after a pass that finds none; a pass per
+            // level of the trees the writes miss. Loading one slot and
+            // starting the pass again, as before, made a commit quadratic
+            // in its writes when they missed the cache (design/lexdb.md
+            // 9.109). Each pass's descents mark the nodes they pass, so
+            // loadMany's sweep keeps them.
+            var seen: Map[int, int] = newMap()
             for w in t.writes {
                 let n = db.writeNeeds(&w)
-                if n >= 0 {
-                    need = n
-                    return
+                if n >= 0 && !seen.has(&n) {
+                    seen.put(n, 1)
+                    append(mut &needs, n)
                 }
             }
+            if len(needs) > 0 { return }
             if !db.validate(&t) {
                 db.conflicts += 1
                 append(mut &bad, lexdb_base.conflict())
@@ -2422,8 +2602,8 @@ fn (st: &Store) commitLive(t: Txn, durable: bool): Result[Unit, lexdb_base.DbErr
             }
             continue
         }
-        if need >= 0 {
-            try st.load(need)
+        if len(needs) > 0 {
+            try st.loadMany(&needs)
             continue
         }
         break
@@ -3471,7 +3651,7 @@ pub fn checkpointer(st: Store): int {
 
 fn newDb(fs: lexdb_disk.Fs, data: lexdb_disk.File, opts: Options, m: &lexdb_page.Meta): Db {
     return Db{opts: opts, fs: fs, data: data, watched: -1, watchedWrites: 0, pool: [], owner: [], meta: [], freeSlots: [], loadedCount: 0, cacheUsed: 0, wlog: [], wlogFloor: 0, hand: 0,
-              trees: newMap(), nextTree: m.nextTree, npages: m.npages, free: [], freeAfterNext: [],
+              trees: newMap(), lastLeaf: LastLeaf{tree: -1, shape: -1, path: [], lo: "", hasLo: false, hi: "", hasHi: false}, shape: 0, nextTree: m.nextTree, npages: m.npages, free: [], freeAfterNext: [],
               pendingFree: [], dropped: [], dropReads: DROP_READS, memo: newMap(), listPages: [], ckpt: m.ckpt, durableCkpt: m.ckpt, ckptRunning: false,
               batch: [], batchCount: 0, batchNo: m.replayBatch, appliedBatch: m.replayBatch - 1,
               durableBatch: m.replayBatch - 1, waiters: [], locks: newMap(), lockWaits: [], waitFor: newMap(), nextLock: 0, writerWake: [], ckptWake: [], ckptDone: [], seg: m.replaySeg,
