@@ -353,8 +353,9 @@ noise (to 1.12 ×), and 6 more than 1.3 × behind.
 
 **Where lexdb is still behind PostgreSQL on one core:**
 - **`select *` (1.7 ×) and `expr_mix` (1.3 ×):** they return 1M rows of
-  every column. lexdb's time there is in building each row's text for the
-  wire, not in reading pages (column leaves cut it from 531 to 453 only).
+  every column. column leaves cut it only from 531 to 453, so most of the
+  time is likely past reading pages, in making each row's values and text
+  for the wire. Not yet profiled.
 - **Two-column DISTINCT (1.7 ×), `group by city, avg(numeric)` (1.4 ×)
   and the text-keyed hash join (1.1 ×):** these hash text keys, and the
   avg sums numerics.
