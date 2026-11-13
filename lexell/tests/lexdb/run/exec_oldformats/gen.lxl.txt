@@ -1,0 +1,42 @@
+// Makes the fixture of exec_oldformats (design/lexdb.md 9.112): a data
+// directory as lexdb wrote it before column leaves, through SQL: a table
+// of every place kind in two layouts (a column added), with NULLs, a long
+// text (a tagged row) and a value stored apart, an index; checkpointed;
+// then a commit in the log only (the process exits without closing).
+import "os"
+import "strings"
+import "../cmd/lexdb_store"
+import "../cmd/lexdb_disk"
+import "../cmd/lexdb_exec"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str) {
+    match s.exec(sql) {
+        Ok(_) {}
+        Err(e) { println("ERROR " + e.msg + ": " + sql) }
+    }
+}
+
+fn main() {
+    let dir = os.arguments()[0]
+    let opts = lexdb_store.Options{cacheBytes: 4 * 1024 * 1024, segBytes: 64 * 1024, ckptBytes: 16 * 1024 * 1024, snapNodes: 100000, bufferedPages: false}
+    let r = lexdb_store.run(lexdb_disk.real(dir), opts, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        q(mut &s, &"create table m (id int primary key, a int, b smallint, c bigint, f boolean, n numeric(10,2), t text, city text, big text)")
+        q(mut &s, &("insert into m (id, a, b, c, f, n, t, city, big) select g, g % 100, case when g % 9 = 0 then null else (g % 600) - 300 end, " +
+                    "(g * 7919) % 1000003, case when g % 5 = 0 then null else g % 2 = 0 end, case when g % 11 = 0 then null else (g % 1000) / 10.0 end, " +
+                    "case when g % 13 = 0 then null else 't' || (g % 97) end, (array['Paris','Rome','Oslo','Lima'])[g % 4 + 1], " +
+                    "case when g between 100 and 105 then repeat('long ', 60) || g when g % 3 = 0 then 'b' || g else null end from generate_series(1, 300) g"))
+        q(mut &s, &"update m set big = repeat('x', 3000) where id = 102")
+        q(mut &s, &"create index m_a on m (a)")
+        q(mut &s, &"alter table m add column e int default 7")
+        q(mut &s, &"insert into m (id, a, c, f, n, t, city, e) select g, g % 50, g, true, 1.25, 'new', 'Oslo', g % 4 from generate_series(301, 360) g")
+        st.checkpointAll().unwrap()
+        // in the log only
+        q(mut &s, &"update m set c = -c, city = 'Bern' where id between 40 and 70")
+        q(mut &s, &"delete from m where id % 17 = 0")
+        q(mut &s, &"insert into m (id, a, c, e) values (5000, 1, 2, 3)")
+        println("durable batch " + st.durableBatch().toStr())
+        exit(0)
+    })
+}

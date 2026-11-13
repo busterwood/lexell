@@ -1,0 +1,263 @@
+// lexdb: data directories written before column leaves (design/lexdb.md
+// 9.112) open and read, through SQL: one as lexdb wrote it at 78731801 (row
+// leaves, T_LEAF: fixture78) and one at 61d57286 (front-coded leaves,
+// T_FLEAF: fixture61), each a table of every place kind in two layouts,
+// with NULLs, a long text (a tagged row), a value stored apart and an
+// index, checkpointed, and a last commit in the log only (gen.lxl.txt made
+// both).
+// - Opened (the log replayed over the old leaves), four queries give what
+//   the lexdb that wrote it gives (the expected lines below are its
+//   output), and a follower (a replica's reader) reads every tree as the
+//   store does.
+// - Then two copies get the same writes (rows changed, a column added,
+//   most rows written again in its layout), one writing column leaves and
+//   one rows only, and are checkpointed: the first then has column leaves
+//   beside the old leaves (a leaf holding rows of two layouts stays rows);
+//   the queries agree, and agree again, with the follower's reads, after
+//   reopening.
+// expect: 78 opened: leaves T_LEAF true T_FLEAF false T_CLEAF false; queries as at 78731801 true; follower ok true
+// expect: 78 written: leaves T_LEAF true T_FLEAF true T_CLEAF true; same as rows only true
+// expect: 78 reopened: same true; follower ok true
+// expect: 61 opened: leaves T_LEAF false T_FLEAF true T_CLEAF false; queries as at 61d57286 true; follower ok true
+// expect: 61 written: leaves T_LEAF false T_FLEAF true T_CLEAF true; same as rows only true
+// expect: 61 reopened: same true; follower ok true
+import "os"
+import "fs"
+import "io"
+import "base64"
+import "binary"
+import "strings"
+import "../../../../cmd/lexdb_store"
+import "../../../../cmd/lexdb_disk"
+import "../../../../cmd/lexdb_page"
+import "../../../../cmd/lexdb_exec"
+import "./fixture78"
+import "./fixture61"
+
+// What the lexdb that wrote them gives for queries() (the same for both).
+fn expected(): []str {
+    return ["340|15254|-37647|102844342|282|3927.80|317|339|1856|2068",
+            "Bern|29 Lima|65 Oslo|119 Paris|64 Rome|62 |1",
+            "1|1|-299|7919|f|0.10|t1|Rome||7 40|40|-260|-316760||4.00|t40|Bern||7 99|99||783981|f||t2|Lima|3|7 100|0|-200|791900||10.00|t3|Paris|303|7 300|0|0|375694||30.00|t9|Paris|4|7 301|1||301|t|1.25|new|Oslo||1 360|10||360|t|1.25|new|Oslo||0 5000|1||2||||||3",
+            "4|628"]
+}
+
+fn queries(): []str {
+    return ["select count(*), sum(a), sum(b), sum(c), count(f), sum(n), count(t), count(city), sum(length(big)), sum(e) from m",
+            "select city, count(*) from m group by city order by 1",
+            "select id, a, b, c, f, n, t, city, length(big), e from m where id in (1, 34, 40, 99, 100, 102, 300, 301, 360, 5000) order by id",
+            "select count(*), sum(id) from m where a = 7"]
+}
+
+fn more(): []str {
+    return ["select count(*), sum(a), sum(b), sum(c), count(f), sum(n), count(t), count(city), sum(length(big)), sum(e), count(g) from m",
+            "select * from m where id in (1, 2, 34, 40, 99, 100, 101, 102, 103, 300, 301, 302, 360, 5000) order by id",
+            "select city, count(*), sum(n), max(t) from m group by city order by 1",
+            "select count(*), sum(id) from m where a = 8",
+            "select id, g from m where g like '%7' order by id",
+            "select count(*) from m where c between 0 and 500000 and f"]
+}
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            var out: []str = []
+            for r in rs {
+                if !r.hasRows { append(mut &out, r.tag) }
+                for row in r.rows {
+                    var vs: []str = []
+                    for v in row { append(mut &vs, lexdb_exec.text(&v)) }
+                    append(mut &out, strings.join(&vs, "|"))
+                }
+            }
+            return strings.join(&out, " ")
+        }
+        Err(e) { return "ERROR " + e.state + " " + e.msg }
+    }
+}
+
+fn runAll(s: mut &lexdb_exec.Session, qs: &[]str): []str {
+    var out: []str = []
+    for x in qs { append(mut &out, q(s, &x)) }
+    return out
+}
+
+fn sameList(a: &[]str, b: &[]str): bool {
+    if len(a) != len(b) { return false }
+    for i in 0..len(a) {
+        if a[i] != b[i] {
+            println("  differs: " + a[i] + " / " + b[i])
+            return false
+        }
+    }
+    return true
+}
+
+fn put(dir: &str, name: &str, size: int, at: &[]int, b64: &[]str) {
+    var b = array(size, byte(0))
+    for i in 0..len(at) {
+        let bytes = base64.decodeStrict(b64[i]).unwrap()
+        for j in 0..len(bytes) { b[at[i] + j] = bytes[j] }
+    }
+    io.write(fs.join(dir.toStr(), name.toStr()), strFromBytes(&b)).unwrap()
+}
+
+fn materialize(which: int, dir: &str) {
+    let made = fs.mkdirAll(dir.toStr())
+    if which == 78 {
+        for f in fixture78.files() {
+            var at: []int = []
+            var bs: []str = []
+            for p in f.parts {
+                append(mut &at, p.at)
+                append(mut &bs, p.b64)
+            }
+            put(dir, &f.name, f.size, &at, &bs)
+        }
+    } else {
+        for f in fixture61.files() {
+            var at: []int = []
+            var bs: []str = []
+            for p in f.parts {
+                append(mut &at, p.at)
+                append(mut &bs, p.b64)
+            }
+            put(dir, &f.name, f.size, &at, &bs)
+        }
+    }
+}
+
+// The last checkpoint's leaves, by page type: read from the page file down
+// from its roots.
+fn census(dir: &str): []int {
+    let b = io.read(fs.join(dir.toStr(), lexdb_store.DATA)).unwrap()
+    var best = -1
+    var roots = 0
+    for p in 0..2 {
+        let pg = strToBytes(b[p * 4096..p * 4096 + 4096].toStr())
+        match lexdb_page.decodeMeta(&pg, p) {
+            Some(m) {
+                if m.ckpt > best {
+                    best = m.ckpt
+                    roots = m.roots
+                }
+            }
+            None {}
+        }
+    }
+    var c: []int = array(8, 0)
+    var pairs: []int = []
+    var p = roots
+    while p != 0 {
+        let n = binary.readU32LEStr(&b, p * 4096 + 24)
+        for i in 0..n { append(mut &pairs, int(binary.readU64LEStr(&b, p * 4096 + 28 + i * 8))) }
+        p = int(binary.readU64LEStr(&b, p * 4096 + 16))
+    }
+    var i = 0
+    while i + 1 < len(pairs) {
+        var stack = [pairs[i + 1]]
+        while len(stack) > 0 {
+            let x = pop(mut &stack)
+            let pg = strToBytes(b[x * 4096..x * 4096 + 4096].toStr())
+            lexdb_page.check(&pg, x, lexdb_page.T_LEAF).unwrap()
+            let typ = int(pg[12])
+            if typ == lexdb_page.T_INTERNAL {
+                for k in lexdb_page.decodeNode(&pg).kids { append(mut &stack, k) }
+                continue
+            }
+            c[typ] += 1
+        }
+        i += 2
+    }
+    return c
+}
+
+fn censusText(c: &[]int): str {
+    return "leaves T_LEAF " + (c[lexdb_page.T_LEAF] > 0).toStr() + " T_FLEAF " + (c[lexdb_page.T_FLEAF] > 0).toStr() + " T_CLEAF " + (c[lexdb_page.T_CLEAF] > 0).toStr()
+}
+
+// Whether a follower on dir reads every tree as the store does.
+fn followerOk(st: &lexdb_store.Store, dir: &str): bool {
+    let fo = lexdb_store.openFollower(lexdb_store.Link.LocalId(st.handle(), 1), lexdb_disk.real(dir.toStr()), 1024 * 1024).unwrap()
+    fo.poll(st.durableBatch()).unwrap()
+    var ok = fo.ready()
+    if ok {
+        let s = fo.begin().unwrap()
+        for tree in st.trees() {
+            var want: []str = []
+            var t = lexdb_store.begin()
+            st.scan(mut &t, tree, "", "", fn(e: &lexdb_store.Entry): bool {
+                append(mut &want, e.key + "=" + e.val)
+                return true
+            }).unwrap()
+            st.abort(t)
+            var n = 0
+            fo.scan(&s, tree, &"", &"", fn(e: &lexdb_store.Entry): bool {
+                if n >= len(want) || want[n] != e.key + "=" + e.val { ok = false }
+                n += 1
+                return true
+            }).unwrap()
+            if n != len(want) { ok = false }
+        }
+        fo.end(&s)
+    }
+    fo.close()
+    return ok
+}
+
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: 256 * 1024, segBytes: 64 * 1024, ckptBytes: 16 * 1024 * 1024, snapNodes: 100000, bufferedPages: false}
+}
+
+fn one(which: int) {
+    let base = fs.join(os.tempDir(), "lexdb_oldformats_" + os.pid().toStr() + "_" + which.toStr())
+    let da = fs.join(base, "a")
+    let db = fs.join(base, "b")
+    materialize(which, &da)
+    materialize(which, &db)
+    let before = census(&da)
+    let w = which.toStr()
+    let r = lexdb_store.run(lexdb_disk.real(da.toStr()), opts(), fn(sa: lexdb_store.Store): int {
+        let r2 = lexdb_store.run(lexdb_disk.real(db.toStr()), opts(), fn(sb: lexdb_store.Store): int {
+            sb.setColumns(false)
+            lexdb_exec.bootstrap(&sa).unwrap()
+            lexdb_exec.bootstrap(&sb).unwrap()
+            var a = lexdb_exec.newSession(sa)
+            var b = lexdb_exec.newSession(sb)
+            let got = runAll(mut &a, &queries())
+            println(w + " opened: " + censusText(&before) + "; queries as at " + (if which == 78 { "78731801" } else { "61d57286" }) + " " +
+                    sameList(&got, &expected()).toStr() + "; follower ok " + followerOk(&sa, &da).toStr())
+            for x in ["update m set a = a + 1 where id % 2 = 0 and id < 250", "alter table m add column g text",
+                      "update m set g = 'g' || id where id % 3 = 0 or id < 200", "insert into m (id, a, c, g) select g, g % 9, g, 'n' || g from generate_series(400, 460) g"] {
+                let ra = q(mut &a, &x)
+                let rb = q(mut &b, &x)
+            }
+            sa.checkpointAll().unwrap()
+            sb.checkpointAll().unwrap()
+            let ga = runAll(mut &a, &more())
+            let gb = runAll(mut &b, &more())
+            println(w + " written: " + censusText(&census(&da)) + "; same as rows only " + sameList(&ga, &gb).toStr())
+            return 0
+        })
+        return 0
+    })
+    let r3 = lexdb_store.run(lexdb_disk.real(da.toStr()), opts(), fn(sa: lexdb_store.Store): int {
+        let r4 = lexdb_store.run(lexdb_disk.real(db.toStr()), opts(), fn(sb: lexdb_store.Store): int {
+            lexdb_exec.bootstrap(&sa).unwrap()
+            lexdb_exec.bootstrap(&sb).unwrap()
+            var a = lexdb_exec.newSession(sa)
+            var b = lexdb_exec.newSession(sb)
+            let ga = runAll(mut &a, &more())
+            let gb = runAll(mut &b, &more())
+            println(w + " reopened: same " + sameList(&ga, &gb).toStr() + "; follower ok " + followerOk(&sa, &da).toStr())
+            return 0
+        })
+        return 0
+    })
+    let gone = fs.removeAll(base)
+}
+
+fn main() {
+    one(78)
+    one(61)
+}
