@@ -294,3 +294,74 @@ Everything else is level or ahead. PostgreSQL in parallel is still about twice a
 **Row format.** The page studies' column leaves address the first of these (decoding whole rows); see lexdb-pages.md and its sequel.
 
 **Data changes** (9.109, wall ms): DELETE of 10k rows with an index fell from 2 to 12 s to 0.16 to 0.37 (PostgreSQL 0.05). INSERT … SELECT of 103k rows fell from 738 to 486 (PostgreSQL 202). UPDATE is unchanged (257 against 66); its scan decodes whole rows.
+
+## 6. Results after column leaves (2026-11-13, later)
+
+Section 5's "now" (fd437e6b) came before:
+- 9.110: commits, fragmentation;
+- 9.111: UPDATE's search, automatic statistics;
+- 9.112: column leaves;
+- 9.113: dates, times and floats in column leaves.
+
+Section 5's data directory was also in the old row format (T_LEAF), so it
+measured none of the page work. Refreshed:
+- **lexdb:** 95d0678c, its tables loaded fresh from the same TSVs (w, d,
+  t, cr; w_b), analysed and checkpointed. The result is 85 MB, against 162
+  MB for the old directory: 18,982 column leaves and 1,563 row leaves
+  (keys and inner nodes).
+- **PostgreSQL 18:** the same saved directory, one core
+  (`max_parallel_workers_per_gather=0`), re-measured in the same hour.
+
+Server CPU ms, median of three runs, and of the lists a query is in (it is
+in up to four). Run under the shared bench lock, the machine otherwise
+nearly idle (load 0.4). PostgreSQL's CPU is counted in 10 ms ticks, so its
+small numbers are coarse. Every query gave the same row count on both.
+
+| query | 9.109 (section 5) | now | PG 1 core | now / PG |
+|---|---:|---:|---:|---:|
+| `order by b` (1M rows) | 82 | **74** | 400 | 0.18 |
+| `count(*)` | 20 | **9** | 30 | 0.30 |
+| `order by c desc limit 10` | 49 | **28** | 90 | 0.31 |
+| `group by a` | 51 | **37** | 100 | 0.37 |
+| `in (subquery)` | 39 | **25** | 50 | 0.50 |
+| `exists (...)` | 49 | **25** | 50 | 0.50 |
+| `where a = 5` (10k rows) | 50 | **21** | 40 | 0.53 |
+| `note like '%item 77%'` | 67 | **46** | 80 | 0.57 |
+| LEFT JOIN, rows (200k) | 36 | **29** | 50 | 0.58 |
+| hash join, rows (103k) | 53 | **37** | 60 | 0.62 |
+| join, then sorted (103k) | 93 | **68** | 110 | 0.62 |
+| `where a < 10` (103k rows) | 60 | **32** | 50 | 0.64 |
+| key range, 100k rows | 17 | **13** | 20 | 0.65 |
+| `id, a + b, c % 1000` | 124 | **96** | 135 | 0.71 |
+| `distinct city` | 105 | **85** | 100 | 0.85 |
+| `select id, b, name` | 135 | **82** | 80 | 1.02 |
+| index range, aggregate | 52 | **31** | 30 | 1.03 |
+| 20k point lookups | 586 | **602** | 570 | 1.06 |
+| hash join, text key, count | 119 | **98** | 90 | 1.09 |
+| hash join, text key, rows | 121 | **100** | 90 | 1.11 |
+| index range, 100k rows | 77 | **45** | 40 | 1.12 |
+| `a + b, price * 2, upper(city)` | 454 | **400** | 300 | 1.33 |
+| `group by city, avg(price)` | 195 | **169** | 120 | 1.41 |
+| `w join t` (1M × 1M), aggregate | 106 | **110** | 75 | 1.47 |
+| `row_number() over (...)` | 247 | **214** | 130 | 1.65 |
+| `select *` | 531 | **453** | 265 | 1.71 |
+| `distinct city, a` (1,940 rows) | | **190** | 110 | 1.73 |
+
+Over all 34 queries of the four lists, the geometric mean of lexdb's time
+over PostgreSQL's is **0.72**. That is 22 queries ahead or level within
+noise (to 1.12 ×), and 6 more than 1.3 × behind.
+
+**Where lexdb is still behind PostgreSQL on one core:**
+- **`select *` (1.7 ×) and `expr_mix` (1.3 ×):** they return 1M rows of
+  every column. lexdb's time there is in building each row's text for the
+  wire, not in reading pages (column leaves cut it from 531 to 453 only).
+- **Two-column DISTINCT (1.7 ×), `group by city, avg(numeric)` (1.4 ×)
+  and the text-keyed hash join (1.1 ×):** these hash text keys, and the
+  avg sums numerics.
+- **Windows (1.65 ×).**
+- **`w join t` (1.5 ×):** 1M lookups into t's key.
+
+PostgreSQL in parallel is still about twice as fast in wall time on whole
+scans (section 3E).
+
+The tables in `~/Work/lexdb-bench/saved/results/2026-11-13-refresh/`.
