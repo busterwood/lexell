@@ -9377,9 +9377,8 @@ the covering index `w_b` and looks `t` up by rowid in key order (29 ms).
 
 **An index's range with its rows, in batches** (`fillIdxRows`).
 - **The keys:** a batch of entries, then their primary keys (the entries'
-  values, as `fetch` reads them), sorted (`sortKeysPerm`: by their first
-  8 bytes as an integer with `radixPerm` when they span less than 2^62,
-  an integer key's case; else by comparison).
+  values, as `fetch` reads them), sorted (`sortKeysPerm`: keys of 8
+  bytes, an integer key's, by `radixPerm`; others by comparison).
 - **The rows** are read by `getMany`, and each is put at its entry's
   place: the batch keeps the index's order, so the rows come out as the
   row path gives them. That is a bitmap heap scan's reading without its
