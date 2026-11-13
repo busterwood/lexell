@@ -33,6 +33,8 @@ import "binary"
 import "./lexdb_base"
 import "./lexdb_disk"
 
+extern "c" fn memcpy(dst: mut &[byte], src: &[byte], n: int): ptr
+
 pub const PAGE = 4096
 pub const T_META = 1
 pub const T_LEAF = 2
@@ -70,7 +72,7 @@ pub type Node = record {
     pub keys: []str
     pub vals: []str
     pub kids: []int
-    pub size: int        // the bytes its entries take on a page
+    pub size: int        // the bytes its entries take on a page; -1: a lazy leaf from a T_LEAF page, counted when loosened
     pub packed: bool     // its keys and values are slices of one string (read or written as a page since it changed)
     pub lazy: bool       // a leaf whose entries are body's, at ents (keys and vals empty)
     pub body: str
@@ -166,6 +168,7 @@ pub fn (n: mut &Node) loosen() {
     n.packed = true
     n.body = ""
     n.ents = []
+    if n.size < 0 { n.size = leafSize(n) }
 }
 
 // A leaf's body in memory: its entries whole, each a u16 key length, a u16
@@ -361,17 +364,17 @@ fn frontLeaf(b: &[]byte, cnt: int): Node {
         binary.setU16LE(mut &out, o + 2, h.vl | (if h.suffix { SUFFIX } else { 0 }))
         let ks = o + 4
         for j in 0..h.shared { out[ks + j] = out[prev + j] }
-        for j in 0..h.tail { out[ks + h.shared + j] = b[h.at + j] }
+        // the tail, and the value after it, are together on the page and in out
+        let n = h.tail + (if h.suffix { 0 } else { h.vl })
+        if n > 0 { let c = memcpy(mut &out[ks + h.shared..ks + h.shared + n], &b[h.at..h.at + n], n) }
         if h.suffix {
             ents[i] = ent(ks, kl, ks + kl - h.vl, h.vl)
             o = ks + kl
-            at = h.at + h.tail
         } else {
-            for j in 0..h.vl { out[ks + kl + j] = b[h.at + h.tail + j] }
             ents[i] = ent(ks, kl, ks + kl, h.vl)
             o = ks + kl + h.vl
-            at = h.at + h.tail + h.vl
         }
+        at = h.at + n
         prev = ks
     }
     return Node{leaf: true, keys: [], vals: [], kids: [], size: size, packed: true, lazy: true, body: strFromBytes(&out), ents: ents}
@@ -471,9 +474,11 @@ pub fn decodeNode(b: &[]byte): Node {
         end += if leaf { 4 + binary.readU16LE(b, end) + binary.readU16LE(b, end + 2) } else { 2 + binary.readU16LE(b, end) + 8 }
     }
     if leaf {
-        // a page from before 9.109: its body is a lazy leaf's as it is
+        // a page from before 9.109: its body is a lazy leaf's as it is. Its
+        // size front coded is counted when it is loosened to change: on a
+        // read, counting it cost as much as the read's decoding (9.110)
         var l = lazyLeaf(getStr(b, 18, end - 18), n)
-        l.size = leafSize(&l)
+        l.size = -1
         return l
     }
     var node = Node{leaf: false, keys: array(n, ""), vals: [], kids: array(n + 1, 0), size: end - 18, packed: true, lazy: false, body: "", ents: []}
