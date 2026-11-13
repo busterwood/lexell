@@ -13,6 +13,7 @@ import "./lexdb_base"
 import "./lexdb_time"
 import "./lexdb_float"
 import "./lexdb_pgcat"
+import "./lexdb_syscat"
 
 // Column kinds.
 pub const K_INT = 1
@@ -134,7 +135,12 @@ const CAT_FNS: []str = ["#object_id", "pg_get_userbyid", "pg_table_is_visible", 
                         "has_sequence_privilege", "has_any_column_privilege",
                         "pg_get_viewdef", "pg_relation_size", "pg_total_relation_size", "pg_table_size", "pg_indexes_size",
                         "pg_database_size",
-                        "format_type"]
+                        "format_type",
+                        // T-SQL's (design/lexdb-tds.md, section 13)
+                        "#object_name", "#object_schema_name", "#schema_name", "#schema_id", "#objectproperty", "#objectpropertyex",
+                        "#columnproperty", "#indexproperty", "#type_name", "#type_id", "#suser_sname", "#suser_sid", "#sid_binary",
+                        "#is_srvrolemember", "#is_member", "#has_perms_by_name", "#db_id", "#db_name", "#has_dbaccess",
+                        "#serverproperty", "#fulltextserviceproperty"]
 
 pub fn isCatFn(n: &str): bool {
     for f in CAT_FNS { if f == n { return true } }
@@ -808,6 +814,13 @@ fn lexIn(s: &str, dialect: Dialect): Result[[]Tok, lexdb_base.DbErr] {
             append(mut &out, nameTok(T_QIDENT, b.toStr(), start))
             continue
         }
+        if dialect.tsql && c == '0' && i + 1 < n && (s[i + 1] == 'x' || s[i + 1] == 'X') {
+            // T-SQL's binary literal, 0x01ff (design/lexdb-tds.md, section 13)
+            i += 2
+            while i < n && isHexDigit(s[i]) { i += 1 }
+            append(mut &out, Tok{kind: T_NUM, text: strings.toLowerAscii(s[start..i]), at: start, spell: ""})
+            continue
+        }
         if isDigit(c) || (c == '.' && i + 1 < n && isDigit(s[i + 1])) {
             while i < n && (isDigit(s[i]) || s[i] == '.') { i += 1 }
             if i < n && (s[i] == 'e' || s[i] == 'E') {
@@ -941,6 +954,21 @@ fn isReserved(w: &str): bool {
     }
 }
 
+// T-SQL: a word that starts a batch's next statement, not an alias
+// (SELECT ... FROM t IF @x = 1 ...: statements need no ;).
+pub fn isTsqlStart(w: &str): bool { return tsqlStarts(w) || w == "select" || w == "insert" || w == "update" || w == "delete" || w == "set" ||
+                                           w == "create" || w == "with" }
+
+fn tsqlStarts(w: &str): bool {
+    match w {
+        "if", "else", "begin", "while", "declare", "exec", "execute", "print", "return", "use", "raiserror", "throw", "commit",
+        "rollback", "save", "break", "continue", "drop", "alter", "truncate", "merge", "go", "waitfor", "goto", "grant",
+        "revoke", "deny", "open", "close", "fetch", "deallocate", "bulk", "dbcc", "checkpoint", "kill", "reconfigure",
+        "shutdown", "readtext", "writetext", "updatetext", "setuser", "backup", "restore" { return true }
+        else { return false }
+    }
+}
+
 fn (p: mut &P) name(): Result[str, lexdb_base.DbErr] {
     let t = p.peek()
     if t.kind == T_QIDENT || (t.kind == T_IDENT && !isReserved(&t.text)) {
@@ -974,6 +1002,8 @@ fn (p: mut &P) qname(): Result[str, lexdb_base.DbErr] {
         }
         p.spelled = spell
         let n = len(parts)
+        // msdb's objects lexdb_syscat has (msdb.dbo.x: msdb.x)
+        if n >= 3 && parts[n - 3] == "msdb" && lexdb_syscat.isMsdb(&parts[n - 1]) { return Ok(qual(&"msdb", &parts[n - 1])) }
         let sc = if n >= 2 { parts[n - 2] } else { "" }
         if n == 1 || sc == "" || sc == "dbo" { return Ok(parts[n - 1]) }
         return Ok(qual(&sc, &parts[n - 1]))
@@ -1028,7 +1058,8 @@ fn (p: mut &P) typeName(): Result[TypeName, lexdb_base.DbErr] {
         "bigint", "int8" { t = TypeName{kind: K_INT, oid: OID_INT8, prec: 0, scale: 0, len: 0} }
         "smallint", "int2" { t = TypeName{kind: K_INT, oid: OID_INT2, prec: 0, scale: 0, len: 0} }
         "boolean", "bool" { t = TypeName{kind: K_BOOL, oid: OID_BOOL, prec: 0, scale: 0, len: 0} }
-        "numeric", "decimal" { t = TypeName{kind: K_NUM, oid: OID_NUMERIC, prec: 0, scale: 0, len: 0} }
+        // T-SQL's numeric, apart from decimal, in len (lexdb_tds sends it as numeric)
+        "numeric", "decimal" { t = TypeName{kind: K_NUM, oid: OID_NUMERIC, prec: 0, scale: 0, len: if p.tsql && w == "numeric" { lexdb_syscat.TS_NUMERIC } else { 0 }} }
         "text" { t = TypeName{kind: K_TEXT, oid: OID_TEXT, prec: 0, scale: 0, len: 0} }
         "varchar" { t = TypeName{kind: K_TEXT, oid: OID_VARCHAR, prec: 0, scale: 0, len: 0} }
         "date" { t = timeType(OID_DATE) }
@@ -1380,18 +1411,42 @@ fn (p: mut &P) catExpr(): Result[Expr, lexdb_base.DbErr] {
         let op = p.next().text
         let r = try p.addExpr()
         // the array operators (9.92) are calls
-        e = if op == "@>" || op == "<@" || op == "&&" { Expr.Call(op, [e, r], false) } else { Expr.Bin(op, e, r) }
+        if p.tsql && (op == "&" || op == "|") {
+            e = Expr.Bin(op, bitInt(e), bitInt(r))
+        } else {
+            e = if op == "@>" || op == "<@" || op == "&&" { Expr.Call(op, [e, r], false) } else { Expr.Bin(op, e, r) }
+        }
     }
     return Ok(e)
 }
+
+// T-SQL: a bit in arithmetic is a number. A column's or a variable's value
+// may be one: read through #bitint (lexdb_tsqlfn), which makes a bit 0 or
+// 1 and leaves the rest.
+fn bitInt(x: Expr): Expr {
+    match x {
+        Expr.Col(_) { return Expr.Call("#bitint", [x], false) }
+        Expr.Param(_) { return Expr.Call("#bitint", [x], false) }
+        else { return x }
+    }
+}
+
+fn hexDigit(c: byte): int {
+    if c >= '0' && c <= '9' { return int(c - '0') }
+    if c >= 'a' && c <= 'f' { return int(c - 'a') + 10 }
+    if c >= 'A' && c <= 'F' { return int(c - 'A') + 10 }
+    return 0
+}
+
+fn isHexDigit(c: byte): bool { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F') }
 
 fn (p: mut &P) addExpr(): Result[Expr, lexdb_base.DbErr] {
     var e = try p.mulExpr()
     while p.isKw("+") || p.isKw("-") {
         let op = p.next().text
         let r = try p.mulExpr()
-        // T-SQL's +: strings joined too (lexdb_exec: "t+")
-        e = Expr.Bin(if p.tsql && op == "+" { "t+" } else { op }, e, r)
+        // T-SQL's +: strings joined too (lexdb_exec: "t+"); a bit a number
+        e = if p.tsql { Expr.Bin(if op == "+" { "t+" } else { op }, bitInt(e), bitInt(r)) } else { Expr.Bin(op, e, r) }
     }
     return Ok(e)
 }
@@ -1401,7 +1456,7 @@ fn (p: mut &P) mulExpr(): Result[Expr, lexdb_base.DbErr] {
     while p.isKw("*") || p.isKw("/") || p.isKw("%") {
         let op = p.next().text
         let r = try p.powExpr()
-        e = Expr.Bin(op, e, r)
+        e = if p.tsql { Expr.Bin(op, bitInt(e), bitInt(r)) } else { Expr.Bin(op, e, r) }
     }
     return Ok(e)
 }
@@ -1443,6 +1498,8 @@ fn (p: mut &P) unary(): Result[Expr, lexdb_base.DbErr] {
     }
     if p.acceptKw("~") {
         let e = try p.unary()
+        // T-SQL's ~ takes a bit too (lexdb_tsqlfn)
+        if p.tsql { return Ok(Expr.Call("#bitnot", [e], false)) }
         return Ok(Expr.Unary("~", e))
     }
     if p.acceptKw("+") { return p.unary() }
@@ -1782,6 +1839,19 @@ fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
        p.peekAt(2).kind == T_IDENT && p.peekAt(3).kind == T_OP && p.peekAt(3).text == "(" {
         p.pos += 2
     }
+    // T-SQL: db.schema.f(...), schema.f(...): f (design/lexdb-tds.md, section 13)
+    if p.tsql && (p.peek().kind == T_IDENT || p.peek().kind == T_QIDENT) && p.peekAt(1).kind == T_OP && p.peekAt(1).text == "." {
+        var k = 0
+        while (p.peekAt(k).kind == T_IDENT || p.peekAt(k).kind == T_QIDENT) && p.peekAt(k + 1).kind == T_OP && p.peekAt(k + 1).text == "." { k += 2 }
+        if k >= 2 && p.peekAt(k).kind == T_IDENT && p.peekAt(k + 1).kind == T_OP && p.peekAt(k + 1).text == "(" {
+            // msdb's policy check: SQL Server's answer
+            if p.peekAt(k).text == "fn_syspolicy_is_automation_enabled" && p.peekAt(k + 2).kind == T_OP && p.peekAt(k + 2).text == ")" {
+                p.pos += k + 3
+                return Ok(Expr.Lit(Val.Int(1)))
+            }
+            if k == 4 || (k == 2 && p.peekAt(0).text == "dbo") { p.pos += k }
+        }
+    }
     let t = p.next()
     if t.kind == T_IDENT && t.text == "case" { return p.caseExpr() }
     if t.kind == T_IDENT && t.text == "substring" && p.isKw("(") && p.sqlForm() {
@@ -1877,6 +1947,27 @@ fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
     if t.kind == T_IDENT && t.text == "exists" && p.isKw("(") {
         p.pos += 1
         return Ok(subRef("#exists", try p.subquery(SUB_EXISTS)))
+    }
+    if t.kind == T_NUM && strings.startsWith(&t.text, "0x") {
+        // T-SQL's 0x literal: up to 8 digits an int (as SQL Server converts
+        // one in arithmetic: 0x200 | x), longer the bytes
+        let h = t.text[2..len(t.text)]
+        if len(h) > 0 && len(h) <= 8 {
+            var v = 0
+            for i in 0..len(h) { v = v * 16 + hexDigit(h[i]) }
+            return Ok(Expr.Lit(Val.Int(v)))
+        }
+        var b = newStrBuf()
+        var i = 0
+        if len(h) % 2 == 1 {
+            b.addByte(byte(hexDigit(h[0])))
+            i = 1
+        }
+        while i + 1 < len(h) {
+            b.addByte(byte(hexDigit(h[i]) * 16 + hexDigit(h[i + 1])))
+            i += 2
+        }
+        return Ok(Expr.Lit(Val.Bytes(b.toStr())))
     }
     if t.kind == T_NUM {
         if !strings.contains(&t.text, ".") && !strings.contains(&t.text, "e") && !strings.contains(&t.text, "E") {
@@ -2229,6 +2320,11 @@ fn (p: mut &P) tsqlCall(name: &str, args: []Expr, star: bool): Result[Expr, lexd
         append(mut &p.seqs, CAT_MARK)
         return Ok(Expr.Call("#object_id", [replace(mut &a[0], Expr.Lit(Val.Null))], false))
     }
+    // SQL Server's catalog functions (design/lexdb-tds.md, section 13)
+    match try p.tsqlCatCall(name, mut &a) {
+        Some(x) { return Ok(x) }
+        None {}
+    }
     if name == "scope_identity" && n == 0 {
         // the batch's @@IDENTITY (refreshed before each statement): a value WHERE can read
         return p.variable(&Tok{kind: T_VAR, text: "@@identity", at: 0, spell: ""})
@@ -2292,6 +2388,122 @@ fn (p: mut &P) tsqlCall(name: &str, args: []Expr, star: bool): Result[Expr, lexd
         else {}
     }
     return Ok(Expr.Call(name.toStr(), a, star))
+}
+
+// A property function's value, as SQL Server's sql_variant (lexdb_tds
+// sends it so: lexdb_syscat.TS_VARIANT in prec).
+fn variant(x: Expr): Expr {
+    // the type it is: 1 an integer, 2 text (and NULL), 0 neither
+    var k = 0
+    match x {
+        Expr.Lit(v) {
+            match v {
+                Val.Int(_) { k = 1 }
+                Val.Text(_) { k = 2 }
+                Val.Null { k = 2 }
+                else {}
+            }
+        }
+        Expr.Cast(_, t) { if t.kind == K_INT { k = 1 } }
+        else {}
+    }
+    if k == 1 { return Expr.Cast(x, TypeName{kind: K_INT, oid: OID_INT4, prec: lexdb_syscat.TS_VARIANT, scale: 0, len: 0}) }
+    if k == 2 { return Expr.Cast(x, TypeName{kind: K_TEXT, oid: OID_TEXT, prec: lexdb_syscat.TS_VARIANT, scale: 0, len: 0}) }
+    return x
+}
+
+// A property's value as SQL Server's type gives it (lexdb_syscat.prop).
+fn propExpr(pr: &lexdb_syscat.Prop): Expr {
+    if !pr.found || pr.val == "\x00" { return Expr.Lit(Val.Null) }
+    let n = strings.parseIntOpt(pr.val).unwrapOr(0)
+    match pr.typ.toStr() {
+        "int" { return Expr.Lit(Val.Int(n)) }
+        "tinyint" { return Expr.Cast(Expr.Lit(Val.Int(n)), TypeName{kind: K_INT, oid: OID_INT2, prec: lexdb_syscat.TS_TINYINT, scale: 0, len: 0}) }
+        "smallint" { return Expr.Cast(Expr.Lit(Val.Int(n)), TypeName{kind: K_INT, oid: OID_INT2, prec: 0, scale: 0, len: 0}) }
+        "bigint" { return Expr.Cast(Expr.Lit(Val.Int(n)), TypeName{kind: K_INT, oid: OID_INT8, prec: 0, scale: 0, len: 0}) }
+        "datetime" {
+            var t = timeType(OID_TS)
+            t.prec = lexdb_syscat.TS_DATETIME
+            t.scale = 3
+            return Expr.Cast(Expr.Lit(Val.Text(pr.val)), t)
+        }
+        else { return Expr.Lit(Val.Text(pr.val)) }
+    }
+}
+
+// SQL Server's catalog and property functions: a constant's value (a
+// server's or a session's property named by a literal), or the executor's
+// function (lexdb_exec.callCat: "#object_name", ...); None for another.
+fn (p: mut &P) tsqlCatCall(name: &str, a: mut &[]Expr): Result[Option[Expr], lexdb_base.DbErr] {
+    let n = len(a)
+    let none: Option[Expr] = None
+    if (name == "serverproperty" || name == "fulltextserviceproperty") && n == 1 {
+        match litText(&a[0]) {
+            Some(t) { return Ok(Some(variant(propExpr(&lexdb_syscat.prop(if name == "serverproperty" { "server" } else { "fulltext" }, &t))))) }
+            None {}
+        }
+        return Ok(Some(Expr.Call("#" + name, replace(a, []), false)))
+    }
+    if name == "sessionproperty" && n == 1 {
+        // the SET options drivers send: on (NUMERIC_ROUNDABORT off)
+        match litText(&a[0]) {
+            Some(t) {
+                let o = strings.toLowerAscii(&t)
+                if o == "numeric_roundabort" { return Ok(Some(variant(Expr.Lit(Val.Int(0))))) }
+                if o == "ansi_nulls" || o == "ansi_padding" || o == "ansi_warnings" || o == "arithabort" || o == "concat_null_yields_null" ||
+                   o == "quoted_identifier" {
+                    return Ok(Some(variant(Expr.Lit(Val.Int(1)))))
+                }
+                return Ok(Some(variant(Expr.Lit(Val.Null))))
+            }
+            None { return Ok(Some(variant(Expr.Lit(Val.Null)))) }
+        }
+    }
+    if name == "connectionproperty" && n == 1 {
+        match litText(&a[0]) {
+            Some(t) {
+                let o = strings.toLowerAscii(&t)
+                if o == "net_transport" { return Ok(Some(variant(Expr.Lit(Val.Text("TCP"))))) }
+                if o == "protocol_type" { return Ok(Some(variant(Expr.Lit(Val.Text("TSQL"))))) }
+                if o == "auth_scheme" { return Ok(Some(variant(Expr.Lit(Val.Text("SQL"))))) }
+                return Ok(Some(variant(Expr.Lit(Val.Null))))
+            }
+            None { return Ok(Some(Expr.Lit(Val.Null))) }
+        }
+    }
+    if name == "context_info" && n == 0 { return Ok(Some(Expr.Cast(Expr.Lit(Val.Null), TypeName{kind: K_BYTEA, oid: OID_BYTEA, prec: 0, scale: 0, len: 0}))) }
+    if name == "databasepropertyex" && n == 2 {
+        // the property of a database there is (lexdb's, or SQL Server's system ones)
+        match litText(&a[1]) {
+            Some(t) {
+                let v = variant(propExpr(&lexdb_syscat.prop("database", &t)))
+                let db = replace(mut &a[0], Expr.Lit(Val.Null))
+                return Ok(Some(Expr.Call("case else", [Expr.IsNull(Expr.Call("#db_id", [db], false), false), Expr.Lit(Val.Null), v], false)))
+            }
+            None { return Ok(Some(Expr.Lit(Val.Null))) }
+        }
+    }
+    if name == "db_id" && n == 0 { return Ok(Some(Expr.Lit(Val.Int(5)))) }
+    if (name == "db_id" || name == "db_name" || name == "has_dbaccess") && n >= 1 { return Ok(Some(Expr.Call("#" + name, replace(a, []), false))) }
+    match name.toStr() {
+        "schema_name", "schema_id", "object_name", "object_schema_name", "objectproperty", "objectpropertyex", "columnproperty",
+        "indexproperty", "type_name", "type_id", "suser_sid", "sid_binary", "is_srvrolemember", "is_member", "has_perms_by_name" {
+            if n == 0 && (name == "schema_name" || name == "schema_id" || name == "suser_sid" || name == "is_member" || name == "is_srvrolemember") {
+                if name == "schema_name" { return Ok(none) }
+                if name == "schema_id" { return Ok(Some(Expr.Lit(Val.Int(1)))) }
+            }
+            append(mut &p.seqs, CAT_MARK)
+            return Ok(Some(Expr.Call("#" + name, replace(a, []), false)))
+        }
+        "suser_sname", "suser_name" {
+            if n >= 1 {
+                append(mut &p.seqs, CAT_MARK)
+                return Ok(Some(Expr.Call("#suser_sname", replace(a, []), false)))
+            }
+        }
+        else {}
+    }
+    return Ok(none)
 }
 
 // ---- statements
@@ -2982,7 +3194,8 @@ fn (p: &P) selectNext(): bool {
 }
 
 fn (p: mut &P) insert(): Result[Stmt, lexdb_base.DbErr] {
-    try p.expectKw("into")
+    // T-SQL: INTO may be left out
+    if !(p.tsql && !p.isKw("into")) { try p.expectKw("into") }
     var s = newStmt(S_INSERT)
     s.table = try p.rname()
     if p.acceptKw("as") { s.alias = try p.name() }
@@ -3275,6 +3488,8 @@ fn (p: mut &P) createView(orReplace: bool): Result[Stmt, lexdb_base.DbErr] {
     let end = p.peek().at
     if p.isKw("with") { return Err(lexdb_base.err("0A000", "lexdb: WITH CHECK OPTION is not supported")) }
     v.index = strings.trim(&p.src[start..end]).toStr()
+    // made over TDS: T-SQL, tagged so (parseView)
+    if p.tsql { v.index = TSQL_VIEW + v.index }
     // the query's subqueries were parsed into the statement's: dropped (the
     // text is parsed again where the view is used)
     p.subs = []
@@ -3442,7 +3657,7 @@ fn (p: mut &P) itemListAssign(items: mut &[]SelItem, assign: mut &[]str): Result
                 spell = p.spelled
             } else {
                 let t = p.peek()
-                if t.kind == T_QIDENT || (t.kind == T_IDENT && !isReserved(&t.text)) {
+                if t.kind == T_QIDENT || (t.kind == T_IDENT && !isReserved(&t.text) && !(p.tsql && tsqlStarts(&t.text))) {
                     alias = t.text
                     spell = t.spell
                     p.pos += 1
@@ -3893,7 +4108,9 @@ fn (p: mut &P) fromItem(join: int): Result[FromItem, lexdb_base.DbErr] {
     // qualified name is always a table
     var ci = -1
     for i in 0..len(p.ctes) { if p.ctes[i].name == table { ci = i } }
-    let rel = if ci >= 0 { "" } else { lexdb_pgcat.relOf(&(if isQual(&table) { schemaOf(&table) } else { "" }), &baseName(&table)) }
+    var rel = if ci >= 0 { "" } else { lexdb_pgcat.relOf(&(if isQual(&table) { schemaOf(&table) } else { "" }), &baseName(&table)) }
+    // T-SQL: SQL Server's catalog views, sys.x (design/lexdb-tds.md, section 13)
+    if p.tsql && ci < 0 && len(rel) == 0 && isQual(&table) { rel = lexdb_syscat.relOf(&schemaOf(&table), &baseName(&table)) }
     if len(rel) > 0 {
         // a pg_catalog or information_schema relation (9.80): a function
         // in FROM whose rows the executor makes from its catalog
@@ -3991,7 +4208,7 @@ fn (p: mut &P) aliasOf(alias: mut &str, cols: mut &[]str): Result[Unit, lexdb_ba
     } else {
         let t = p.peek()
         // (T-SQL: OUTPUT and OPTION after a table are clauses)
-        let tw = p.tsql && t.kind == T_IDENT && (t.text == "output" || t.text == "option")
+        let tw = p.tsql && t.kind == T_IDENT && (t.text == "output" || t.text == "option" || tsqlStarts(&t.text))
         if !tw && (t.kind == T_QIDENT || (t.kind == T_IDENT && !isReserved(&t.text))) {
             let old = replace(alias, t.text)
             p.pos += 1
@@ -4027,6 +4244,14 @@ fn (p: mut &P) createIndex(unique: bool): Result[Stmt, lexdb_base.DbErr] {
     try p.indexCol(mut &s)
     while p.acceptKw(",") { try p.indexCol(mut &s) }
     try p.expectKw(")")
+    if p.tsql && p.acceptKw("include") {
+        // T-SQL's INCLUDE (columns): read, not kept (lexdb's index holds its
+        // key; the row is the table's)
+        try p.expectKw("(")
+        let first = try p.name()
+        while p.acceptKw(",") { let more = try p.name() }
+        try p.expectKw(")")
+    }
     if p.acceptKw("where") { s.where = Some(try p.expr()) }      // a filtered index
     return Ok(s)
 }
@@ -5152,6 +5377,23 @@ fn (p: mut &P) skipToEnd() {
 
 // Parses SQL text into its statements (separated by ;). params is the
 // highest $n in each.
+// A view's query made in T-SQL (design/lexdb-tds.md, section 13): its
+// text is kept so tagged, and parsed again as T-SQL.
+pub const TSQL_VIEW: str = "\x00tsql\x00"
+
+// A view's query, from its text as kept (TSQL_VIEW: T-SQL).
+pub fn parseView(text: &str): Result[[]Stmt, lexdb_base.DbErr] {
+    if !strings.startsWith(text, TSQL_VIEW) { return parse(text) }
+    var q = try tsqlParser(&text[len(TSQL_VIEW)..len(text)], Dialect{tsql: true, quotedIdent: true}, &[])
+    let st = try q.statement()
+    return Ok([st])
+}
+
+// A view's text as shown: without its tag.
+pub fn viewShown(text: &str): str {
+    return if strings.startsWith(text, TSQL_VIEW) { text[len(TSQL_VIEW)..len(text)].toStr() } else { text.toStr() }
+}
+
 pub fn parse(sql: &str): Result[[]Stmt, lexdb_base.DbErr] {
     let toks = try lex(sql)
     var p = P{toks: toks, pos: 0, params: 0, subs: [], ctes: [], nextCte: 0, inCte: [], depth: 0, seqs: [], wins: [], src: sql.toStr(), tsql: false, vars: [], spelled: ""}
@@ -5212,7 +5454,7 @@ pub fn typeText(t: &TypeName): str {
         if t.len > 0 { return "character(" + t.len.toStr() + ")" }
         return "bpchar"
     }
-    let p = if t.prec == 1 { "(" + t.scale.toStr() + ")" } else { "" }
+    let p = if t.prec >= 1 { "(" + t.scale.toStr() + ")" } else { "" }
     if t.oid == OID_DATE { return "date" }
     if t.oid == OID_UUID { return "uuid" }
     if t.oid == OID_FLOAT4 { return "real" }
@@ -5345,7 +5587,22 @@ pub fn exprText(x: &Expr): str {
 
 // One expression and nothing after it.
 pub fn parseExpr(sql: &str): Result[Expr, lexdb_base.DbErr] {
-    let toks = try lex(sql)
+    let raw = try lex(sql)
+    // the executor's own functions (#utcnow(), #len(x): T-SQL's, as exprText
+    // writes them) are names here, as the text was made by exprText
+    var toks: []Tok = []
+    var i = 0
+    while i < len(raw) {
+        let t = raw[i]
+        if t.kind == T_OP && t.text == "#" && i + 2 < len(raw) && raw[i + 1].kind == T_IDENT && raw[i + 1].at == t.at + 1 &&
+           raw[i + 2].kind == T_OP && raw[i + 2].text == "(" {
+            append(mut &toks, Tok{kind: T_IDENT, text: "#" + raw[i + 1].text, at: t.at, spell: ""})
+            i += 2
+            continue
+        }
+        append(mut &toks, t)
+        i += 1
+    }
     var p = P{toks: toks, pos: 0, params: 0, subs: [], ctes: [], nextCte: 0, inCte: [], depth: 0, seqs: [], wins: [], src: sql.toStr(), tsql: false, vars: [], spelled: ""}
     let x = try p.expr()
     let t = p.peek()
@@ -5366,7 +5623,12 @@ fn (p: mut &P) variable(t: &Tok): Result[Expr, lexdb_base.DbErr] {
             return Ok(Expr.Param(k + 1))
         }
     }
-    if strings.startsWith(t.text, "@@") { return Err(lexdb_base.err("TS195", "'" + t.text + "' is not a recognized built-in function name.")) }
+    if strings.startsWith(t.text, "@@") {
+        // SQL Server's constant ones (@@MICROSOFTVERSION, @@MAX_PRECISION, ...: lexdb_syscat)
+        let pr = lexdb_syscat.prop(&"global", &t.text)
+        if pr.found { return Ok(propExpr(&pr)) }
+        return Err(lexdb_base.err("TS195", "'" + t.text + "' is not a recognized built-in function name."))
+    }
     return Err(lexdb_base.err("TS137", "Must declare the scalar variable \"" + t.text + "\"."))
 }
 
@@ -5380,6 +5642,17 @@ fn (p: mut &P) tsqlLen(): Result[int, lexdb_base.DbErr] {
     return Ok(n)
 }
 
+// The SQL Server type (its system_type_id, lexdb_syscat.TS_*) a type made
+// from a T-SQL type name keeps where lexdb's own does not say it: in prec,
+// which a text, integer or binary type does not use (varchar, char, nchar,
+// tinyint, varbinary, ...), and which a time type's says its scale is
+// given in (1; datetime, smalldatetime). 0 none.
+pub fn tsqlCode(t: &TypeName): int {
+    if t.kind == K_TEXT || t.kind == K_INT || t.kind == K_BYTEA { return if t.prec >= 34 { t.prec } else { 0 } }
+    if timeKind(t.oid) > 0 && (t.prec == lexdb_syscat.TS_DATETIME || t.prec == lexdb_syscat.TS_SMALLDATETIME) { return t.prec }
+    return 0
+}
+
 // SQL Server's type names as lexdb's types; None for a name both share or
 // lexdb's own. Lengths are kept for varchar; (max) is text.
 fn (p: mut &P) tsqlType(w: &str): Result[Option[TypeName], lexdb_base.DbErr] {
@@ -5387,18 +5660,23 @@ fn (p: mut &P) tsqlType(w: &str): Result[Option[TypeName], lexdb_base.DbErr] {
         "nvarchar", "varchar", "nchar", "char", "sysname" {
             var n = try p.tsqlLen()
             if w == "sysname" { n = 128 }
-            if n > 0 { return Ok(Some(TypeName{kind: K_TEXT, oid: OID_VARCHAR, prec: 0, scale: 0, len: n})) }
-            return Ok(Some(TypeName{kind: K_TEXT, oid: OID_TEXT, prec: 0, scale: 0, len: 0}))
+            // SQL Server's type, where it is not nvarchar's, in prec (tsqlCode)
+            let code = if w == "varchar" { lexdb_syscat.TS_VARCHAR } else if w == "char" { lexdb_syscat.TS_CHAR } else if w == "nchar" { lexdb_syscat.TS_NCHAR } else { 0 }
+            if n > 0 { return Ok(Some(TypeName{kind: K_TEXT, oid: OID_VARCHAR, prec: code, scale: 0, len: n})) }
+            return Ok(Some(TypeName{kind: K_TEXT, oid: OID_TEXT, prec: code, scale: 0, len: 0}))
         }
-        "ntext", "xml" { return Ok(Some(TypeName{kind: K_TEXT, oid: OID_TEXT, prec: 0, scale: 0, len: 0})) }
+        "ntext", "xml" {
+            return Ok(Some(TypeName{kind: K_TEXT, oid: OID_TEXT, prec: if w == "xml" { lexdb_syscat.TS_XML } else { lexdb_syscat.TS_NTEXT }, scale: 0, len: 0}))
+        }
         "bit" { return Ok(Some(TypeName{kind: K_BOOL, oid: OID_BOOL, prec: 0, scale: 0, len: 1})) }     // len 1: takes numbers
-        "tinyint" { return Ok(Some(TypeName{kind: K_INT, oid: OID_INT2, prec: 0, scale: 0, len: 0})) }
+        "tinyint" { return Ok(Some(TypeName{kind: K_INT, oid: OID_INT2, prec: lexdb_syscat.TS_TINYINT, scale: 0, len: 0})) }
         "money" { return Ok(Some(TypeName{kind: K_NUM, oid: OID_NUMERIC, prec: 19, scale: 4, len: 0})) }
         "smallmoney" { return Ok(Some(TypeName{kind: K_NUM, oid: OID_NUMERIC, prec: 10, scale: 4, len: 0})) }
         "uniqueidentifier" { return Ok(Some(TypeName{kind: K_UUID, oid: OID_UUID, prec: 0, scale: 0, len: 0})) }
         "varbinary", "binary", "image", "rowversion", "timestamp" {
             let n = try p.tsqlLen()
-            return Ok(Some(TypeName{kind: K_BYTEA, oid: OID_BYTEA, prec: 0, scale: 0, len: 0}))
+            let code = if w == "varbinary" { lexdb_syscat.TS_VARBINARY } else if w == "binary" { lexdb_syscat.TS_BINARY } else if w == "image" { lexdb_syscat.TS_IMAGE } else { lexdb_syscat.TS_TIMESTAMP }
+            return Ok(Some(TypeName{kind: K_BYTEA, oid: OID_BYTEA, prec: code, scale: 0, len: if n > 0 { n } else { 0 }}))
         }
         "datetime", "smalldatetime", "datetime2", "datetimeoffset", "time" {
             let oid = if w == "datetimeoffset" { OID_TSTZ } else if w == "time" { OID_TIME } else { OID_TS }
@@ -5409,7 +5687,8 @@ fn (p: mut &P) tsqlType(w: &str): Result[Option[TypeName], lexdb_base.DbErr] {
                 if n < 0 || n > 7 { return Err(lexdb_base.err("TS1002", "Line 1: Specified scale " + n.toStr() + " is invalid.")) }
                 try p.expectKw(")")
             }
-            t.prec = 1
+            // prec: 1 (the scale given), or SQL Server's datetime or smalldatetime (tsqlCode)
+            t.prec = if w == "datetime" { lexdb_syscat.TS_DATETIME } else if w == "smalldatetime" { lexdb_syscat.TS_SMALLDATETIME } else { 1 }
             t.scale = n                     // (lexdb keeps microseconds: 7 rounds as 6; TDS sends the 7)
             return Ok(Some(t))
         }

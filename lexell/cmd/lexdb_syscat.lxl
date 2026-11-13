@@ -1,0 +1,343 @@
+// lexdb_syscat: SQL Server's catalog views (sys.tables, sys.all_columns,
+// ...) for T-SQL sessions (design/lexdb-tds.md, section 13). Their shapes,
+// and the rows lexdb takes from SQL Server as they are (sys.types, the
+// system databases, the fixed principals, ...), are SQL Server 2022's,
+// recorded by tools/gen_sqlserver_syscat.py in lexdb_sysdata; the rows
+// that describe lexdb's own tables lexdb_exec makes from its catalog
+// (sysRows), each from a template row of SQL Server's for such an object.
+//
+// A view is a catalog relation as pg_catalog's are (lexdb_pgcat): the
+// parser, in T-SQL mode, makes sys.x (master.sys.x, db.sys.x) the function
+// "#sys.x" in FROM. PostgreSQL sessions never see them.
+//
+// Types: a column's SQL Server type is kept beside the lexdb type it is
+// computed as (lexOid): its system_type_id and length (tdsCode) ride in
+// OutCol.scale, so that lexdb_tds sends tinyint, char(2), varchar and
+// datetime as SQL Server would.
+
+import "strings"
+import "io"
+import "./lexdb_sysdata"
+
+// A view's column: as sys.all_columns describes it.
+pub type SysCol = record {
+    pub name: str
+    pub typ: str            // its type's name: int, sysname, nvarchar, char, ...
+    pub maxLen: int         // max_length (bytes; -1 for max)
+    pub prec: int
+    pub scale: int
+    pub nullable: bool
+    pub coll: str           // collation_name, "" none
+}
+
+// SQL Server's system_type_id of the types lexdb gives as they are.
+pub const TS_IMAGE = 34
+pub const TS_TEXT = 35
+pub const TS_GUID = 36
+pub const TS_DATE = 40
+pub const TS_TIME = 41
+pub const TS_DATETIME2 = 42
+pub const TS_DTO = 43
+pub const TS_TINYINT = 48
+pub const TS_SMALLINT = 52
+pub const TS_INT = 56
+pub const TS_SMALLDATETIME = 58
+pub const TS_REAL = 59
+pub const TS_MONEY = 60
+pub const TS_DATETIME = 61
+pub const TS_FLOAT = 62
+pub const TS_VARIANT = 98
+pub const TS_NTEXT = 99
+pub const TS_BIT = 104
+pub const TS_DECIMAL = 106
+pub const TS_NUMERIC = 108
+pub const TS_SMALLMONEY = 122
+pub const TS_BIGINT = 127
+pub const TS_VARBINARY = 165
+pub const TS_VARCHAR = 167
+pub const TS_BINARY = 173
+pub const TS_CHAR = 175
+pub const TS_TIMESTAMP = 189
+pub const TS_NVARCHAR = 231
+pub const TS_NCHAR = 239
+pub const TS_XML = 241
+pub const TS_SYSNAME = 256      // its user_type_id (its system_type_id is nvarchar's)
+
+// lexdb's OIDs (as lexdb_sql's; this module is below it)
+const O_BOOL = 16
+const O_BYTEA = 17
+const O_INT8 = 20
+const O_INT2 = 21
+const O_INT4 = 23
+const O_TEXT = 25
+const O_FLOAT4 = 700
+const O_FLOAT8 = 701
+const O_DATE = 1082
+const O_TIME = 1083
+const O_TS = 1114
+const O_TSTZ = 1184
+const O_NUMERIC = 1700
+const O_UUID = 2950
+
+fn specOf(view: &str): str {
+    if strings.startsWith(view, "msdb.") {
+        for m in MSDB { if strings.startsWith(&m, view[5..len(view)] + "\t") { return m.toStr() } }
+        return ""
+    }
+    for v in lexdb_sysdata.VIEWS {
+        let t = strings.indexOf(&v, "\t", 0)
+        if v[0..t] == view { return v.toStr() }
+    }
+    return ""
+}
+
+// Whether view (tables, all_columns, ...) is one of sys's.
+pub fn isView(view: &str): bool { return len(specOf(view)) > 0 }
+
+// Every view's name.
+pub fn viewNames(): []str {
+    var out: []str = []
+    for v in lexdb_sysdata.VIEWS { append(mut &out, v[0..strings.indexOf(&v, "\t", 0)].toStr()) }
+    return out
+}
+
+// The catalog relation a T-SQL FROM item names: "sys.tables" for sys.tables
+// (any database's: master.sys.tables is lexdb's own); "" if none.
+pub fn relOf(schema: &str, name: &str): str {
+    if schema == "sys" && isView(name) { return "sys." + name }
+    if schema == "msdb" && isMsdb(name) { return "sys.msdb." + name }
+    return ""
+}
+
+// msdb's tables SMO reads, as SQL Server 2022 has them (empty here).
+const MSDB: []str = [
+    "syspolicy_system_health_state\t0\thealth_state_id:bigint:8:19:0:0:\tpolicy_id:int:4:10:0:0:\tlast_run_date:datetime:8:23:3:0:\t" +
+        "target_query_expression_with_id:nvarchar:800:0:0:0:SQL_Latin1_General_CP1_CI_AS\ttarget_query_expression:nvarchar:-1:0:0:0:SQL_Latin1_General_CP1_CI_AS\t" +
+        "result:bit:1:1:0:0:",
+]
+
+pub fn isMsdb(name: &str): bool {
+    for m in MSDB { if strings.startsWith(&m, name + "\t") { return true } }
+    return false
+}
+
+// A view's object_id (SQL Server's: negative), 0 if it is none.
+pub fn viewId(view: &str): int {
+    let s = specOf(view)
+    if len(s) == 0 { return 0 }
+    let f = strings.split(&s, "\t")
+    return strings.parseIntOpt(f[1]).unwrapOr(0)
+}
+
+// The view whose object_id is id, "" if none.
+pub fn viewOf(id: int): str {
+    for v in lexdb_sysdata.VIEWS {
+        let f = strings.split(&v, "\t")
+        if strings.parseIntOpt(f[1]).unwrapOr(0) == id { return f[0].toStr() }
+    }
+    return ""
+}
+
+pub fn cols(view: &str): []SysCol {
+    var out: []SysCol = []
+    let s = specOf(view)
+    if len(s) == 0 { return out }
+    let f = strings.split(&s, "\t")
+    for i in 2..len(f) {
+        let p = strings.split(&f[i], ":")
+        append(mut &out, SysCol{name: p[0].toStr(), typ: p[1].toStr(), maxLen: strings.parseIntOpt(p[2]).unwrapOr(0),
+                                prec: strings.parseIntOpt(p[3]).unwrapOr(0), scale: strings.parseIntOpt(p[4]).unwrapOr(0),
+                                nullable: p[5] == "1", coll: p[6].toStr()})
+    }
+    return out
+}
+
+// A view's rows SQL Server has: kind "full" (every one it has) or
+// "template" (one, for lexdb_exec to fill in); values as text, NULL "\x00".
+pub fn rows(view: &str, kind: &str): [][]str {
+    var out: [][]str = []
+    let head = view + "\t" + kind + "\t"
+    for r in lexdb_sysdata.ROWS {
+        if !strings.startsWith(&r, &head) { continue }
+        let body = r[len(head)..len(r)]
+        if len(body) == 0 { return out }
+        for row in strings.split(&body, "\x1e") {
+            var vs: []str = []
+            for v in strings.split(&row, "\x1f") { append(mut &vs, v.toStr()) }
+            append(mut &out, vs)
+        }
+    }
+    return out
+}
+
+// The lexdb type a SQL Server type is computed as.
+pub fn lexOid(typ: &str): int {
+    match typ.toStr() {
+        "tinyint", "smallint" { return O_INT2 }
+        "int" { return O_INT4 }
+        "bigint" { return O_INT8 }
+        "bit" { return O_BOOL }
+        "decimal", "numeric", "money", "smallmoney" { return O_NUMERIC }
+        "float" { return O_FLOAT8 }
+        "real" { return O_FLOAT4 }
+        "datetime", "smalldatetime", "datetime2" { return O_TS }
+        "datetimeoffset" { return O_TSTZ }
+        "date" { return O_DATE }
+        "time" { return O_TIME }
+        "uniqueidentifier" { return O_UUID }
+        "varbinary", "binary", "image", "timestamp" { return O_BYTEA }
+        else { return O_TEXT }
+    }
+}
+
+// A type's system_type_id by its name (sysname: nvarchar's); 0 if unknown.
+pub fn typeId(typ: &str): int {
+    match typ.toStr() {
+        "image" { return TS_IMAGE }
+        "text" { return TS_TEXT }
+        "uniqueidentifier" { return TS_GUID }
+        "date" { return TS_DATE }
+        "time" { return TS_TIME }
+        "datetime2" { return TS_DATETIME2 }
+        "datetimeoffset" { return TS_DTO }
+        "tinyint" { return TS_TINYINT }
+        "smallint" { return TS_SMALLINT }
+        "int" { return TS_INT }
+        "smalldatetime" { return TS_SMALLDATETIME }
+        "real" { return TS_REAL }
+        "money" { return TS_MONEY }
+        "datetime" { return TS_DATETIME }
+        "float" { return TS_FLOAT }
+        "sql_variant" { return TS_VARIANT }
+        "ntext" { return TS_NTEXT }
+        "bit" { return TS_BIT }
+        "decimal" { return TS_DECIMAL }
+        "numeric" { return TS_NUMERIC }
+        "smallmoney" { return TS_SMALLMONEY }
+        "bigint" { return TS_BIGINT }
+        "varbinary" { return TS_VARBINARY }
+        "varchar" { return TS_VARCHAR }
+        "binary" { return TS_BINARY }
+        "char" { return TS_CHAR }
+        "timestamp" { return TS_TIMESTAMP }
+        "nvarchar", "sysname" { return TS_NVARCHAR }
+        "nchar" { return TS_NCHAR }
+        "xml" { return TS_XML }
+        else { return 0 }
+    }
+}
+
+// What a result column of SQL Server type code (system_type_id) and
+// length n (characters or bytes; 0 for max) carries in OutCol.scale for
+// lexdb_tds: code + n * 1024. Codes start at 34, above a time type's
+// scale (0 to 7), which OutCol.scale otherwise holds.
+pub fn hint(code: int, n: int): int { return code + n * 1024 }
+
+// The parts of a hint: its code and its length.
+pub fn hintCode(h: int): int { return if h >= 34 { h % 1024 } else { 0 } }
+pub fn hintLen(h: int): int { return if h >= 34 { h / 1024 } else { 0 } }
+
+// The hint of a view's column, -1 for none (the lexdb type's own TDS type
+// is SQL Server's: int, bigint, smallint, bit, nvarchar, ...), or a time
+// type's scale.
+pub fn colHint(c: &SysCol): int {
+    let code = typeId(&c.typ)
+    if code == TS_TINYINT || code == TS_DATETIME || code == TS_SMALLDATETIME { return hint(code, 0) }
+    if code == TS_CHAR || code == TS_VARCHAR || code == TS_BINARY || code == TS_VARBINARY {
+        return hint(code, if c.maxLen > 0 { c.maxLen } else { 0 })
+    }
+    if code == TS_NCHAR { return hint(code, if c.maxLen > 0 { c.maxLen / 2 } else { 0 }) }
+    if code == TS_DATETIME2 || code == TS_TIME || code == TS_DTO { return c.scale }
+    if code == TS_VARIANT { return hint(code, 0) }
+    return -1
+}
+
+// ---- SERVERPROPERTY, DATABASEPROPERTYEX, FULLTEXTSERVICEPROPERTY and the
+// constant @@ values, as SQL Server 2022 gives them (lexdb_sysdata.PROPS):
+// the machine's and the server's name are this host's.
+
+pub type Prop = record {
+    pub found: bool
+    pub typ: str            // SQL Server's type of the value: int, nvarchar, tinyint, datetime, ...
+    pub val: str            // "\x00" NULL
+}
+
+// This machine's name.
+pub fn hostName(): str {
+    for f in ["/proc/sys/kernel/hostname", "/etc/hostname"] {
+        match io.read(f.toStr()) {
+            Ok(s) {
+                let h = strings.trim(&s)
+                if len(h) > 0 { return h.toStr() }
+            }
+            Err(_) {}
+        }
+    }
+    return "lexdb"
+}
+
+// A property's value: kind "server", "database", "fulltext" or "global"
+// (@@name, lower case); the name as written (case is ignored).
+pub fn prop(kind: &str, name: &str): Prop {
+    let want = strings.toLowerAscii(strings.trim(name))
+    if kind == "server" && (want == "machinename" || want == "servername" || want == "computernamephysicalnetbios") {
+        return Prop{found: true, typ: "nvarchar", val: hostName()}
+    }
+    let head = kind + "\t"
+    for p in lexdb_sysdata.PROPS {
+        if !strings.startsWith(&p, &head) { continue }
+        let f = strings.split(&p, "\t")
+        if strings.toLowerAscii(&f[1]) == want { return Prop{found: true, typ: f[2].toStr(), val: f[3].toStr()} }
+    }
+    return Prop{found: false, typ: "", val: "\x00"}
+}
+
+// SQL Server's databases: master 1, tempdb 2, model 3, msdb 4; lexdb's own
+// is 5 (name: its name).
+pub fn dbId(n: &str, own: &str): int {
+    let l = strings.toLowerAscii(strings.trim(n))
+    if l == strings.toLowerAscii(own) { return 5 }
+    match l {
+        "master" { return 1 }
+        "tempdb" { return 2 }
+        "model" { return 3 }
+        "msdb" { return 4 }
+        else { return 0 }
+    }
+}
+
+pub fn dbName(id: int, own: &str): str {
+    match id {
+        1 { return "master" }
+        2 { return "tempdb" }
+        3 { return "model" }
+        4 { return "msdb" }
+        5 { return own.toStr() }
+        else { return "" }
+    }
+}
+
+// A type's name by its user_type_id (sys.types), "" if none; and back.
+pub fn typeName(id: int): str {
+    for r in rows(&"types", &"full") { if strings.parseIntOpt(r[2]).unwrapOr(-1) == id { return r[0] } }
+    return ""
+}
+
+pub fn typeIdOf(n: &str): int {
+    let l = strings.toLowerAscii(strings.trim(n))
+    for r in rows(&"types", &"full") { if strings.toLowerAscii(&r[0]) == l { return strings.parseIntOpt(r[2]).unwrapOr(0) } }
+    return 0
+}
+
+// A fixed schema's name by its id (dbo, guest, INFORMATION_SCHEMA, sys, the
+// db_ roles'), "" if none; and back (0 if none).
+pub fn schemaName(id: int): str {
+    for r in rows(&"schemas", &"full") { if strings.parseIntOpt(r[1]).unwrapOr(-1) == id { return r[0] } }
+    return ""
+}
+
+pub fn schemaIdOf(n: &str): int {
+    let l = strings.toLowerAscii(strings.trim(n))
+    for r in rows(&"schemas", &"full") { if strings.toLowerAscii(&r[0]) == l { return strings.parseIntOpt(r[1]).unwrapOr(0) } }
+    return 0
+}

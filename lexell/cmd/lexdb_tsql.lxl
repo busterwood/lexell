@@ -28,6 +28,7 @@ import "./lexdb_base"
 import "./lexdb_sql"
 import "./lexdb_tsqlparse"
 import "./lexdb_exec"
+import "./lexdb_syscat"
 
 type Val = lexdb_sql.Val
 type DbErr = lexdb_base.DbErr
@@ -42,6 +43,7 @@ pub const EV_DONE = 2       // a statement's end: count (-1: none to report), cm
 pub const EV_ERROR = 3      // err
 pub const EV_TRAN = 4       // tran: the transaction began (8), committed (9) or was rolled back (10)
 pub const EV_INFO = 5       // a message (PRINT, RAISERROR under severity 11): err's text, number, sev and state
+pub const EV_DB = 6         // USE: the session's database is err.msg (ENVCHANGE, and INFO 5701)
 
 pub type Event = record {
     pub kind: int
@@ -778,6 +780,16 @@ fn (st: mut &State) one(sess: mut &lexdb_exec.Session, t: &lexdb_tsqlparse.TStmt
         if st.xactAbort && sess.status() != 'I' { let rb = simple(sess, &"ROLLBACK") }
         return F_END
     }
+    if k == lexdb_tsqlparse.TS_USE || k == lexdb_tsqlparse.TS_EXECSTR || k == lexdb_tsqlparse.TS_EXEC || k == lexdb_tsqlparse.TS_INSERTEXEC {
+        let before = sess.status()
+        let r = st.call(sess, t, f, ev)
+        st.after(sess, before, ev)
+        if st.jump {
+            st.jump = false
+            return F_ERROR
+        }
+        return r
+    }
     if k == lexdb_tsqlparse.TS_TABLEVAR {
         let go = st.sqlStmt(sess, &t.stmt[0], f, ev, true)
         if go && !st.jump { append(mut &st.tableVars, "#" + t.names[0]) }
@@ -798,6 +810,199 @@ fn (st: mut &State) one(sess: mut &lexdb_exec.Session, t: &lexdb_tsqlparse.TStmt
         return F_ERROR
     }
     return if go { F_NEXT } else { F_END }
+}
+
+// ---- USE and EXEC (design/lexdb-tds.md, section 13)
+
+// USE, EXEC (string), EXEC procedure, INSERT ... EXEC, and how they ended.
+fn (st: mut &State) call(sess: mut &lexdb_exec.Session, t: &lexdb_tsqlparse.TStmt, f: mut &Frame, ev: mut &[]Event): int {
+    let k = t.kind
+    if k == lexdb_tsqlparse.TS_USE {
+        // lexdb's database (and master, taken as it, as at login); SQL
+        // Server's other system databases are listed, not opened
+        let n = t.names[0]
+        let id = lexdb_syscat.dbId(&n, &lexdb_exec.SYS_DB_NAME)
+        if id == lexdb_exec.SYS_DB_ID || id == 1 {
+            var x = ev0(EV_DB)
+            x.err = lexdb_base.err("", lexdb_exec.SYS_DB_NAME)
+            append(ev, x)
+            doneEv(ev, -1, 0, false)
+            return F_NEXT
+        }
+        if id > 0 {
+            st.fail(ev, Caught{number: 916, message: "The server principal \"" + sess.user() + "\" is not able to access the database \"" + n +
+                                                     "\" under the current security context.", severity: 14, state: 1}, 0)
+        } else {
+            st.fail(ev, Caught{number: 911, message: "Database '" + n + "' does not exist. Make sure that the name is entered correctly.", severity: 16,
+                               state: 1}, 0)
+        }
+        return F_NEXT
+    }
+    if k == lexdb_tsqlparse.TS_INSERTEXEC {
+        // the procedure's rows, inserted
+        var inner: []Event = []
+        let r = st.call(sess, &t.body[0], f, mut &inner)
+        var rows: []str = []
+        for i in 0..len(inner) {
+            if inner[i].kind == EV_ROWS {
+                for row in inner[i].rows {
+                    var vs: []str = []
+                    for v in row { append(mut &vs, litOf(&v)) }
+                    append(mut &rows, "(" + strings.join(&vs, ", ") + ")")
+                }
+            } else if inner[i].kind == EV_ERROR || inner[i].kind == EV_INFO {
+                append(ev, replace(mut &inner[i], ev0(EV_DONE)))
+            }
+        }
+        if len(rows) == 0 {
+            doneEv(ev, if st.nocount { -1 } else { 0 }, CMD_INSERT, false)
+            return r
+        }
+        var cols: []str = []
+        for i in 1..len(t.names) { append(mut &cols, "[" + t.names[i] + "]") }
+        let tn = t.names[0]
+        let target = if strings.startsWith(&tn, "#") { tn.toStr() } else { "[" + tn + "]" }
+        let sql = "INSERT INTO " + target + (if len(cols) > 0 { " (" + strings.join(&cols, ", ") + ")" } else { "" }) + " VALUES " + strings.join(&rows, ", ")
+        var fr = newFrame()
+        return st.nested(sess, &sql, mut &fr, ev)
+    }
+    // the arguments' values
+    var vals: []Val = []
+    if len(t.stmt) > 0 && len(t.stmt[0].items) > 0 {
+        let oids = f.oids()
+        match sess.run(&t.stmt[0], &f.vals, &oids) {
+            Ok(r0) {
+                var r = r0
+                if len(r.rows) > 0 { vals = replace(mut &r.rows[0], []) }
+            }
+            Err(e) {
+                st.failErr(ev, &e, 0)
+                return if endsBatch(&e) && st.tryDepth == 0 { F_END } else { F_NEXT }
+            }
+        }
+    }
+    if k == lexdb_tsqlparse.TS_EXECSTR {
+        // dynamic SQL: a batch of its own, without the caller's variables
+        let sql = if len(vals) > 0 && !lexdb_exec.isNull(&vals[0]) { lexdb_exec.text(&vals[0]) } else { "" }
+        var fr = newFrame()
+        return st.nested(sess, &sql, mut &fr, ev)
+    }
+    let proc = t.names[0]
+    let outs = strings.split(&t.value, "\x1f")
+    if proc == "sp_executesql" {
+        if len(vals) == 0 || lexdb_exec.isNull(&vals[0]) {
+            st.fail(ev, Caught{number: 201, message: "Procedure or function 'sp_executesql' expects parameter '@statement', which was not supplied.",
+                               severity: 16, state: 4}, 0)
+            return F_NEXT
+        }
+        var decls: []lexdb_tsqlparse.ParamDecl = []
+        if len(vals) > 1 && !lexdb_exec.isNull(&vals[1]) {
+            match lexdb_tsqlparse.parseParamDecls(&lexdb_exec.text(&vals[1])) {
+                Ok(ds) { decls = ds }
+                Err(e) {
+                    st.failErr(ev, &e, 0)
+                    return F_NEXT
+                }
+            }
+        }
+        var fr = newFrame()
+        st.refresh(sess, mut &fr)
+        for i in 0..len(decls) {
+            var v = Val.Null
+            for j in 2..len(vals) {
+                let pn = if 1 + j < len(t.names) { t.names[1 + j] } else { "" }
+                if pn == decls[i].name || (pn == "" && j - 2 == i) { v = vals[j] }
+            }
+            match lexdb_exec.coerce(v, &decls[i].typ) {
+                Ok(cv) { let x = fr.add(&decls[i].name, decls[i].typ, cv) }
+                Err(e) {
+                    st.failErr(ev, &e, 0)
+                    return F_NEXT
+                }
+            }
+        }
+        let r = st.nested(sess, &lexdb_exec.text(&vals[0]), mut &fr, ev)
+        // OUTPUT parameters back to the caller's variables
+        for j in 2..len(vals) {
+            if j >= len(outs) || len(outs[j]) == 0 { continue }
+            let pn = if 1 + j < len(t.names) && len(t.names[1 + j]) > 0 { t.names[1 + j] } else if j - 2 < len(decls) { decls[j - 2].name } else { "" }
+            let kf = fr.find(&pn)
+            let ko = f.find(&outs[j])
+            if kf < 0 || ko < 0 { continue }
+            match lexdb_exec.coerce(fr.vals[kf], &f.types[ko]) {
+                Ok(cv) { f.vals[ko] = cv }
+                Err(_) {}
+            }
+        }
+        return r
+    }
+    if proc == "xp_instance_regread" || proc == "xp_regread" {
+        // lexdb has no registry: an OUTPUT argument is NULL
+        for j in 0..len(outs) {
+            if len(outs[j]) == 0 { continue }
+            let ko = f.find(&outs[j])
+            if ko >= 0 { f.vals[ko] = Val.Null }
+        }
+        doneEv(ev, -1, 0, false)
+        return F_NEXT
+    }
+    if proc == "xp_msver" {
+        var x = ev0(EV_ROWS)
+        x.cols = [outCol(&"Index", lexdb_sql.OID_INT4), outCol(&"Name", lexdb_sql.OID_TEXT), outCol(&"Internal_Value", lexdb_sql.OID_INT4),
+                  outCol(&"Character_Value", lexdb_sql.OID_TEXT)]
+        for i in 0..len(MSVER) {
+            let p = strings.split(&MSVER[i], "|")
+            append(mut &x.rows, [Val.Int(i + 1), Val.Text(p[0].toStr()), if len(p[1]) == 0 { Val.Null } else { Val.Int(strings.parseIntOpt(p[1]).unwrapOr(0)) },
+                                 if len(p[2]) == 0 { Val.Null } else { Val.Text(p[2].toStr()) }])
+        }
+        let n = len(x.rows)
+        append(ev, x)
+        doneEv(ev, if st.nocount { -1 } else { n }, CMD_SELECT, false)
+        return F_NEXT
+    }
+    st.fail(ev, Caught{number: 2812, message: "Could not find stored procedure '" + proc + "'.", severity: 16, state: 62}, 0)
+    return if st.tryDepth > 0 { F_NEXT } else { F_END }
+}
+
+// xp_msver's rows, as SQL Server 2022's: name|internal value|character value.
+const MSVER: []str = ["ProductName||Microsoft SQL Server", "ProductVersion|1048576|16.0.4315.2", "Language||English", "Platform||NT x64",
+                      "Comments||SQL", "CompanyName||Microsoft Corporation", "FileDescription||SQL Server Windows NT - 64 Bit",
+                      "FileVersion||2022.0160.4315.02 ((sql2022_rtm_qfe-cu27-gdr2).261021-1910)", "InternalName||SQLSERVR",
+                      "LegalCopyright||Microsoft. All rights reserved.",
+                      "LegalTrademarks||Microsoft SQL Server is a registered trademark of Microsoft Corporation.",
+                      "OriginalFilename||SQLSERVR.EXE", "PrivateBuild||", "SpecialBuild|282787842|", "WindowsVersion|282787842|6.2 (9200)",
+                      "ProcessorCount|16|16", "ProcessorActiveMask||            ffff", "ProcessorType|8664|",
+                      "PhysicalMemory|38361|38361 (40224423936)", "Product ID||"]
+
+fn outCol(name: &str, oid: int): lexdb_exec.OutCol {
+    return lexdb_exec.OutCol{name: strings.toLowerAscii(name), oid: oid, spell: name.toStr(), coll: "", scale: -1}
+}
+
+// A value as a T-SQL literal.
+fn litOf(v: &Val): str {
+    if lexdb_exec.isNull(v) { return "NULL" }
+    match v {
+        Val.Int(n) { return n.toStr() }
+        Val.Num(d) { return d.toStr() }
+        Val.Bool(b) { return if b { "1" } else { "0" } }
+        else { return "N'" + strings.replaceAll(&lexdb_exec.text(v), "'", "''") + "'" }
+    }
+}
+
+// A batch run inside this one (EXEC (string), sp_executesql), with its own
+// variables fr; its errors end it, not the batch that ran it.
+fn (st: mut &State) nested(sess: mut &lexdb_exec.Session, sql: &str, fr: mut &Frame, ev: mut &[]Event): int {
+    let parsed = lexdb_tsqlparse.parseBatch(sql, lexdb_sql.Dialect{tsql: true, quotedIdent: st.quotedIdent}, &fr.names)
+    if parsed.isErr() {
+        let e = parsed.unwrapErr()
+        st.failErr(ev, &e, 0)
+        return F_NEXT
+    }
+    let b = parsed.unwrap()
+    let given = len(fr.names)
+    for k in given..len(b.vars) { let i = fr.add(&b.vars[k], b.types[k - given], Val.Null) }
+    let r = st.block(sess, &b.stmts, fr, ev)
+    return if r == F_ERROR { F_ERROR } else { F_NEXT }
 }
 
 // After an error in a condition or an argument: to the CATCH block, else on.

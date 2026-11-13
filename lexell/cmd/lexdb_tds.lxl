@@ -47,6 +47,8 @@ import "tds"
 import "./lexdb_base"
 import "./lexdb_store"
 import "./lexdb_sql"
+import "./lexdb_syscat"
+import "codepage"
 import "./lexdb_exec"
 import "./lexdb_auth"
 import "./lexdb_wire"
@@ -197,6 +199,14 @@ const C_DATE = 8
 const C_TIME = 9
 const C_DT2 = 10
 const C_DTO = 11
+// SQL Server's own types, where a T-SQL type name or a sys view's column
+// says one (OutCol.scale's hint: lexdb_syscat; design/lexdb-tds.md,
+// section 13): tinyint is C_INT of 1 byte
+const C_VARCHAR = 12    // varchar(n) (n 0: max), in the collation's code page (1252)
+const C_CHAR = 13       // char(n)
+const C_NCHAR = 14      // nchar(n)
+const C_DATETIME = 15   // datetime (n 8) or smalldatetime (n 4)
+const C_VARIANT = 16    // sql_variant
 
 type ColT = value record {
     kind: int
@@ -206,6 +216,8 @@ type ColT = value record {
 
 fn kindOf(oid: int): ColT {
     let k = ColT{kind: C_TEXT, n: 0, max: false}
+    // a bare NULL (an untyped literal): SQL Server's int (a string's values make it text)
+    if oid == lexdb_sql.OID_UNKNOWN { return ColT{kind: C_INT, n: 4, max: false} }
     if oid == lexdb_sql.OID_INT2 { return ColT{kind: C_INT, n: 2, max: false} }
     if oid == lexdb_sql.OID_INT4 { return ColT{kind: C_INT, n: 4, max: false} }
     if oid == lexdb_sql.OID_INT8 { return ColT{kind: C_INT, n: 8, max: false} }
@@ -227,7 +239,8 @@ fn kindOf(oid: int): ColT {
 fn fits(kind: int, v: &Val): bool {
     match v {
         Val.Null { return true }
-        Val.Int(_) { return kind == C_INT }
+        // (an integer 0 or 1 in a bit column: ISNULL(bit, 0) is a bit in T-SQL)
+        Val.Int(n) { return kind == C_INT || (kind == C_BIT && (n == 0 || n == 1)) }
         Val.Bool(_) { return kind == C_BIT }
         Val.Float(_) { return kind == C_FLT8 }
         Val.Real(_) { return kind == C_FLT4 }
@@ -292,10 +305,58 @@ fn colTypes(cols: &[]lexdb_exec.OutCol, rows: &[][]Val): []ColT {
                 }
             }
         }
-        if (t.kind == C_TIME || t.kind == C_DT2 || t.kind == C_DTO) && cols[i].scale >= 0 { t.n = min(cols[i].scale, 7) }
-        append(mut &ts, t)
+        if (t.kind == C_TIME || t.kind == C_DT2 || t.kind == C_DTO) && cols[i].scale >= 0 && cols[i].scale < 34 { t.n = min(cols[i].scale, 7) }
+        append(mut &ts, hinted(t, cols[i].scale, rows, i))
+        
     }
     return ts
+}
+
+// A column's type as SQL Server's type its hint names (lexdb_syscat.hint),
+// where its values fit that; else t.
+fn hinted(t: ColT, h: int, rows: &[][]Val, i: int): ColT {
+    let code = lexdb_syscat.hintCode(h)
+    let n = lexdb_syscat.hintLen(h)
+    if code == 0 { return t }
+    if code == lexdb_syscat.TS_VARIANT { return ColT{kind: C_VARIANT, n: 0, max: false} }
+    // numeric: decimal's, named so (max marks it)
+    if code == lexdb_syscat.TS_NUMERIC && t.kind == C_DEC { return ColT{kind: C_DEC, n: t.n, max: true} }
+    if code == lexdb_syscat.TS_INT && t.kind == C_TEXT {
+        // a bare NULL
+        for r in rows { if !lexdb_exec.isNull(&r[i]) { return t } }
+        return ColT{kind: C_INT, n: 4, max: false}
+    }
+    if code == lexdb_syscat.TS_TINYINT && t.kind == C_INT {
+        for r in rows {
+            match r[i] {
+                Val.Int(x) { if x < 0 || x > 255 { return t } }
+                else {}
+            }
+        }
+        return ColT{kind: C_INT, n: 1, max: false}
+    }
+    if (code == lexdb_syscat.TS_DATETIME || code == lexdb_syscat.TS_SMALLDATETIME) && t.kind == C_DT2 {
+        return ColT{kind: C_DATETIME, n: if code == lexdb_syscat.TS_DATETIME { 8 } else { 4 }, max: false}
+    }
+    if (code == lexdb_syscat.TS_VARCHAR || code == lexdb_syscat.TS_CHAR || code == lexdb_syscat.TS_NCHAR) && t.kind == C_TEXT && !t.max {
+        // every value in the code page and within the length (8000 bytes, or n)
+        let lim = if n > 0 { n } else if code == lexdb_syscat.TS_VARCHAR { 1073741823 } else { 1 }
+        for r in rows {
+            if lexdb_exec.isNull(&r[i]) { continue }
+            let x = lexdb_exec.text(&r[i])
+            if code == lexdb_syscat.TS_NCHAR {
+                if units16(&x) > lim { return t }
+            } else {
+                match codepage.encode(codepage.WINDOWS_1252, &x) {
+                    Ok(b) { if len(b) > lim { return t } }
+                    Err(_) { return t }
+                }
+            }
+        }
+        let kind = if code == lexdb_syscat.TS_VARCHAR { C_VARCHAR } else if code == lexdb_syscat.TS_CHAR { C_CHAR } else { C_NCHAR }
+        return ColT{kind: kind, n: if code == lexdb_syscat.TS_VARCHAR && n > 8000 { 0 } else { n }, max: code == lexdb_syscat.TS_VARCHAR && (n == 0 || n > 8000)}
+    }
+    return t
 }
 
 fn (o: mut &Out) colmetadata(cols: &[]lexdb_exec.OutCol, ts: &[]ColT) {
@@ -322,7 +383,7 @@ fn (o: mut &Out) typeInfo(t: &ColT) {
             o.u8(tds.T_FLTN)
             o.u8(if t.kind == C_FLT8 { 8 } else { 4 })
         } else if t.kind == C_DEC {
-            o.u8(tds.T_DECIMALN)
+            o.u8(if t.max { tds.T_NUMERICN } else { tds.T_DECIMALN })
             o.u8(17)
             o.u8(38)
             o.u8(t.n)
@@ -332,6 +393,16 @@ fn (o: mut &Out) typeInfo(t: &ColT) {
         } else if t.kind == C_GUID {
             o.u8(tds.T_GUID)
             o.u8(16)
+        } else if t.kind == C_VARCHAR || t.kind == C_CHAR || t.kind == C_NCHAR {
+            o.u8(if t.kind == C_VARCHAR { tds.T_BIGVARCHR } else if t.kind == C_CHAR { tds.T_BIGCHAR } else { tds.T_NCHAR })
+            o.u16(if t.max { 0xFFFF } else if t.kind == C_NCHAR { 2 * t.n } else { t.n })
+            o.raw(&COLLATION)
+        } else if t.kind == C_DATETIME {
+            o.u8(tds.T_DATETIMN)
+            o.u8(t.n)
+        } else if t.kind == C_VARIANT {
+            o.u8(tds.T_SSVARIANT)
+            o.u32(8016)
         } else if t.kind == C_DATE {
             o.u8(tds.T_DATEN)
         } else if t.kind == C_TIME || t.kind == C_DT2 || t.kind == C_DTO {
@@ -411,7 +482,116 @@ fn bits32(x: float): int {
     return (sign << 31) | (full >> (29 + 1 - e32))
 }
 
+// datetime's parts: days since 1900-01-01, and the time of day in 1/300 s
+// (smalldatetime: days, minutes).
+const DAYS_1900_TO_2000 = 36524
+
+fn (o: mut &Out) datetime(us: int, n: int): Result[Unit, DbErr] {
+    var days = floorDiv(us, DAY_US) + DAYS_1900_TO_2000
+    let tod = us - floorDiv(us, DAY_US) * DAY_US
+    if n == 4 {
+        var mins = (tod + 30000000) / 60000000
+        if mins >= 1440 {
+            mins = 0
+            days += 1
+        }
+        if days < 0 || days > 65535 { return Err(rangeErr(&"The conversion of a datetime2 data type to a smalldatetime data type resulted in an out-of-range value.")) }
+        o.u16(days)
+        o.u16(mins)
+        return Ok(Unit{})
+    }
+    var ticks = (tod * 3 + 5000) / 10000
+    if ticks >= 25920000 {
+        ticks = 0
+        days += 1
+    }
+    if days < -53690 { return Err(rangeErr(&"The conversion of a datetime2 data type to a datetime data type resulted in an out-of-range value.")) }
+    o.u32(days & 0xFFFFFFFF)
+    o.u32(ticks)
+    return Ok(Unit{})
+}
+
+// SQL Server's own types (hinted): varchar, char, nchar, datetime, sql_variant.
+fn (o: mut &Out) hintedValue(t: &ColT, v: &Val): Result[Unit, DbErr] {
+    let k = t.kind
+    if k == C_VARIANT {
+        if lexdb_exec.isNull(v) {
+            o.u32(0)
+            return Ok(Unit{})
+        }
+        match v {
+            Val.Int(x) {
+                if x >= -2147483648 && x <= 2147483647 {
+                    o.u32(6)
+                    o.u8(tds.T_INT4)
+                    o.u8(0)
+                    o.u32(x & 0xFFFFFFFF)
+                } else {
+                    o.u32(10)
+                    o.u8(tds.T_INT8)
+                    o.u8(0)
+                    o.u64(x)
+                }
+            }
+            Val.Bool(b) {
+                o.u32(3)
+                o.u8(tds.T_BIT)
+                o.u8(0)
+                o.u8(if b { 1 } else { 0 })
+            }
+            Val.Ts(us) {
+                o.u32(10)
+                o.u8(tds.T_DATETIME)
+                o.u8(0)
+                try o.datetime(us, 8)
+            }
+            else {
+                let u = units(&lexdb_exec.text(v), 4000)
+                o.u32(2 + 7 + len(u))
+                o.u8(tds.T_NVARCHAR)
+                o.u8(7)
+                o.raw(&COLLATION)
+                o.u16(8000)
+                for x in u { append(mut &o.b, x) }
+            }
+        }
+        return Ok(Unit{})
+    }
+    if lexdb_exec.isNull(v) {
+        if t.max { for _ in 0..8 { o.u8(0xFF) } } else if k == C_DATETIME { o.u8(0) } else { o.u16(0xFFFF) }
+        return Ok(Unit{})
+    }
+    if k == C_DATETIME {
+        match v {
+            Val.Ts(us) {
+                o.u8(t.n)
+                try o.datetime(us, t.n)
+            }
+            else { return Err(rangeErr(&"not a datetime")) }
+        }
+        return Ok(Unit{})
+    }
+    var x = lexdb_exec.text(v)
+    if k == C_NCHAR {
+        while units16(&x) < t.n { x = x + " " }
+        let u = units(&x, t.n)
+        o.u16(len(u))
+        for b in u { append(mut &o.b, b) }
+        return Ok(Unit{})
+    }
+    var b = codepage.encode(codepage.WINDOWS_1252, &x).unwrapOr("")
+    if k == C_CHAR { while len(b) < t.n { b = b + " " } }
+    if t.max {
+        o.plp(&strToBytes(b))
+    } else {
+        o.u16(len(b))
+        o.raw(&b)
+    }
+    return Ok(Unit{})
+}
+
 fn (o: mut &Out) value(t: &ColT, v: &Val): Result[Unit, DbErr] {
+    if t.kind >= C_VARCHAR { return o.hintedValue(t, v) }
     if lexdb_exec.isNull(v) {
         if (t.kind == C_TEXT || t.kind == C_BIN) && t.max {
             for k in 0..8 { o.u8(0xFF) }
@@ -424,6 +604,16 @@ fn (o: mut &Out) value(t: &ColT, v: &Val): Result[Unit, DbErr] {
     }
     // a value that does not fit its column (whose type is text then): its text
     let vv: Val = if fits(t.kind, v) { v } else { Val.Text(lexdb_exec.text(v)) }
+    if t.kind == C_BIT {
+        match vv {
+            Val.Int(b) {
+                o.u8(1)
+                o.u8(b)
+                return Ok(Unit{})
+            }
+            else {}
+        }
+    }
     match vv {
         Val.Int(n) {
             if t.n == 2 && (n < -32768 || n > 32767) { return Err(rangeErr(&"Arithmetic overflow error converting expression to data type smallint.")) }
@@ -596,6 +786,10 @@ fn (c: mut &Conn) emit(ev: &[]lexdb_tsql.Event, inProc: bool): bool {
             c.o.message(tds.TK_INFO, e.number, e.state, e.sev, &e.err.msg)
         } else if e.kind == lexdb_tsql.EV_TRAN {
             c.tran(e.tran)
+        } else if e.kind == lexdb_tsql.EV_DB {
+            // USE (design/lexdb-tds.md, section 13)
+            c.o.envchange(tds.ENV_DATABASE, &e.err.msg, &DB_NAME)
+            c.o.message(tds.TK_INFO, 5701, 1, 0, &("Changed database context to '" + e.err.msg + "'."))
         } else if e.kind == lexdb_tsql.EV_DONE {
             while i < len(ev) && ev[i].kind == lexdb_tsql.EV_TRAN {
                 c.tran(ev[i].tran)

@@ -40,6 +40,13 @@ pub const TS_PRINT = 15     // stmt[0]: SELECT the message
 pub const TS_RAISERROR = 16 // stmt[0]: SELECT message, severity, state, arguments ...
 pub const TS_THROW = 17     // stmt[0]: SELECT number, message, state; none: the error being handled again
 pub const TS_TABLEVAR = 18  // DECLARE @t TABLE (...): names[0] @t; stmt[0] its CREATE TABLE (of #@t)
+// (design/lexdb-tds.md, section 13)
+pub const TS_USE = 19       // USE database: names[0]
+pub const TS_EXECSTR = 20   // EXEC (string): stmt[0] SELECT the string
+pub const TS_EXEC = 21      // EXEC [@r =] procedure args: names[0] the procedure (its last part); stmt[0] SELECT the
+                            // arguments; names[1 + i] argument i's parameter name ("" positional); value: per
+                            // argument, the variable an OUTPUT one sets ("" none), \x1f between them
+pub const TS_INSERTEXEC = 22 // INSERT [INTO] t [(columns)] EXEC ...: names[0] the table, names[1..] its columns; body[0] the EXEC
 
 pub type TStmt = record {
     pub kind: int
@@ -160,12 +167,129 @@ fn setOption(q: mut &Parser): Result[TStmt, DbErr] {
     return Ok(ts)
 }
 
+// A name of up to four parts ([server.][db.][schema.]name): its parts.
+fn multiName(q: mut &Parser): Result[[]str, DbErr] {
+    var parts: []str = []
+    while true {
+        let t = q.peek()
+        if t.kind == lexdb_sql.T_IDENT || t.kind == lexdb_sql.T_QIDENT {
+            q.skip(1)
+            append(mut &parts, if len(t.spell) > 0 { t.spell } else { t.text })
+        } else if q.isKw(".") {
+            append(mut &parts, "")
+        } else {
+            return Err(q.unexpected())
+        }
+        if !q.acceptKw(".") { break }
+    }
+    return Ok(parts)
+}
+
+// EXEC|EXECUTE, after it: (string), or [@r =] procedure [arguments].
+fn execStmt(q: mut &Parser): Result[TStmt, DbErr] {
+    q.fresh()
+    if q.acceptKw("(") {
+        var e = try q.expr()
+        try q.expectKw(")")
+        var ts = tstmt(TS_EXECSTR)
+        append(mut &ts.stmt, q.values([e]))
+        return Ok(ts)
+    }
+    var ts = tstmt(TS_EXEC)
+    let r = q.peek()
+    if r.kind == lexdb_sql.T_VAR && q.peekAt(1).kind == lexdb_sql.T_OP && q.peekAt(1).text == "=" { q.skip(2) }
+    let parts = try multiName(q)
+    append(mut &ts.names, strings.toLowerAscii(&parts[len(parts) - 1]))
+    var args: []Expr = []
+    var outs: []str = []
+    while !atEnd(q) && !(q.peek().kind == lexdb_sql.T_IDENT && lexdb_sql.isTsqlStart(&q.peek().text)) {
+        let t = q.peek()
+        var pname = ""
+        if t.kind == lexdb_sql.T_VAR && q.peekAt(1).kind == lexdb_sql.T_OP && q.peekAt(1).text == "=" {
+            pname = t.text
+            q.skip(2)
+        }
+        var out = ""
+        let v = q.peek()
+        if q.acceptKw("default") {
+            append(mut &args, Expr.Lit(lexdb_sql.Val.Null))
+        } else {
+            append(mut &args, try q.expr())
+            if q.acceptKw("output") || q.acceptKw("out") {
+                if v.kind != lexdb_sql.T_VAR { return Err(q.unexpected()) }
+                out = v.text
+            }
+        }
+        append(mut &ts.names, pname)
+        append(mut &outs, out)
+        if !q.acceptKw(",") { break }
+    }
+    ts.value = strings.join(&outs, "\x1f")
+    append(mut &ts.stmt, q.values(args))
+    return Ok(ts)
+}
+
+// Whether INSERT [INTO] name [(columns)] EXEC follows.
+fn insertExec(q: &Parser): bool {
+    var k = 1
+    if q.peekAt(k).kind == lexdb_sql.T_IDENT && q.peekAt(k).text == "into" { k += 1 }
+    while true {
+        let t = q.peekAt(k)
+        if !(t.kind == lexdb_sql.T_IDENT || t.kind == lexdb_sql.T_QIDENT) { return false }
+        k += 1
+        let d = q.peekAt(k)
+        if !(d.kind == lexdb_sql.T_OP && d.text == ".") { break }
+        k += 1
+    }
+    if q.peekAt(k).kind == lexdb_sql.T_OP && q.peekAt(k).text == "(" {
+        while true {
+            k += 1
+            let t = q.peekAt(k)
+            if t.kind == lexdb_sql.T_EOF { return false }
+            if t.kind == lexdb_sql.T_OP && t.text == ")" { break }
+        }
+        k += 1
+    }
+    let w = q.peekAt(k)
+    return w.kind == lexdb_sql.T_IDENT && (w.text == "exec" || w.text == "execute")
+}
+
 // One of the batch's statements, at a statement's start.
 fn tsqlStmt(q: mut &Parser, types: mut &[]TypeName): Result[TStmt, DbErr] {
     q.fresh()
     let t = q.peek()
     if t.kind == lexdb_sql.T_IDENT {
         let w1 = q.peekAt(1)
+        if t.text == "use" {
+            q.skip(1)
+            let n = q.next()
+            if n.kind != lexdb_sql.T_IDENT && n.kind != lexdb_sql.T_QIDENT { return Err(q.unexpected()) }
+            var ts = tstmt(TS_USE)
+            append(mut &ts.names, if len(n.spell) > 0 { n.spell } else { n.text })
+            return Ok(ts)
+        }
+        if t.text == "exec" || t.text == "execute" {
+            q.skip(1)
+            return execStmt(q)
+        }
+        if t.text == "insert" && insertExec(q) {
+            q.skip(1)
+            let into = q.acceptKw("into")
+            var ts = tstmt(TS_INSERTEXEC)
+            let parts = try multiName(q)
+            append(mut &ts.names, parts[len(parts) - 1])
+            if q.acceptKw("(") {
+                while true {
+                    let c = q.next()
+                    append(mut &ts.names, c.text)
+                    if !q.acceptKw(",") { break }
+                }
+                try q.expectKw(")")
+            }
+            q.skip(1)
+            append(mut &ts.body, try execStmt(q))
+            return Ok(ts)
+        }
         if t.text == "declare" && w1.kind == lexdb_sql.T_VAR && q.peekAt(2).kind == lexdb_sql.T_IDENT && q.peekAt(2).text == "table" {
             // DECLARE @t TABLE (...): a table for the batch, #@t
             q.skip(3)
