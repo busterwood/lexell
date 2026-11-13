@@ -10337,3 +10337,251 @@ table after (sums of every column) and the same child rows.
   NULL flag both ways.
 - The condition itself (`id % 1000 < 10`: `checkedRem` per row) and
   `bNarrow`'s vectors per node.
+### 9.112 Column leaves
+
+The user decided to build column leaves for table trees as
+[lexdb-columns-study.md](lexdb-columns-study.md) section 7 measured them
+(after [lexdb-pages.md](lexdb-pages.md)): a table's leaf stored a column at
+a time on today's 4 KiB pages, lightly encoded and bit-packed, held as rows
+while it changes and encoded when a checkpoint writes it (WiredTiger's
+split between the in-memory and the on-disk page).
+
+**The format.** A new leaf page type, `T_CLEAF` (7), in `lexdb_page`; the
+columns' codec is `lexdb_cols`.
+- Page: `[16..18)` n, the rows; `[18..20)` K, the keys' bytes; `[20..22)`
+  L, the columns' bytes; `[22..22 + K)` the keys, each front coded against
+  the key before (a varint of the bytes shared, a varint of the tail's
+  length, the tail); then L bytes of columns. The rest of the page is zero.
+- The columns: a version byte (1), the rows' layout number (u16, the
+  number in the rows' own bytes, 9.50), np the places (u8), np kind bytes
+  (lexdb_exec's `PK_*`), then a block per place in order. A block is a
+  codec byte, with `0x80` when a NULL bitmap follows (a bit per row, 1
+  NULL, (n + 7) / 8 bytes; left out when no row of the leaf is NULL there),
+  then the codec's data:
+
+| Codec | For | Data |
+|---|---|---|
+| 0 none | a dropped place | nothing (the bitmap keeps its rows' NULL bits as written) |
+| 1 FOR | integers | zigzag varint of the least value (base), u8 width w (0..56), uvarint greatest less base, then each value less base in w bits, bit-packed least significant bit first; a NULL row 0 |
+| 2 raw | integers too wide for 56 bits | zigzag varints of the least and greatest, then each value at its kind's width, little-endian |
+| 3 bool | booleans | a bit per row (a NULL row 0) |
+| 4 text | texts | a u16 end per row (of the column's bytes), then the bytes |
+| 5 dict | texts of few values | u8 entries less 1, a u16 end per entry, the entries' bytes, u8 code width, each row's entry in that many bits |
+| 6 units | numerics of one display scale | u8 scale, then as FOR the value times 10^scale |
+| 7 bin | other numerics | as text, each value's `Decimal.toBin` bytes |
+
+- **The encoder** (`encodeRows`) takes a leaf only when every row is in
+  the fixed form (byte 8) of one layout the tree's spec has, and parses in
+  it to the byte: its length its parts', a NULL place's fixed bytes zero and
+  a NULL text's end its predecessor's, booleans 0 or 1, ends in order, the
+  bitmap's spare bits clear. Then every value is kept exactly: integers at
+  their bits, texts and other numerics as their bytes, a numeric as units
+  only when the bytes rebuilt from the units are its bytes (checked per
+  value). So the rows rebuilt from the columns are the rows given, byte for
+  byte: `lexdb_cols.rowOf` (one row, without decoding the leaf) and
+  `allRows` (a column at a time, the rows appended). `LEXDB_COLCHECK=1`
+  decodes every leaf encoded and compares (the tests and crash runs use it).
+- A text is a dictionary when that is smaller than ends and bytes: its
+  distinct values in order of first use, given up at 256, or once 24 or
+  more are three quarters of the rows seen (the study's rule).
+- **Self-describing:** the page holds its layout's kinds, so a follower,
+  recovery and every reader decode it without the table. A reader that
+  reads columns as values (the batches) first checks the leaf's kinds
+  against its table's layout of that number (`cLayoutOk`); a mismatch reads
+  the rows rebuilt.
+
+**In memory.** A leaf read from a `T_CLEAF` page, or written as one by a
+checkpoint, is a column leaf (`Node.isCols`): its body holds its keys whole
+(as a lazy leaf's, with empty values) and then its columns (`cols`), with
+the columns' directory parsed once (`cdir`: per place its codec, NULL
+bitmap, data, base, width, greatest, scale, entries). In a checkpoint's
+`PageOut` its body starts `\xff\xff` (no row body can: a key is at most
+`MAX_KEY` bytes), and `bodyPage` makes the page from it.
+- `Node.val(i)` rebuilds row i (`rowOf`): a point read, `get`, `getMany`,
+  the row path's scans, a snapshot's, a follower's, all see the row's bytes.
+- `valView` is not for a column leaf (it panics); the batch decoders check
+  `isCols` first.
+- `loosen` (before a change) rebuilds every row (`allRows`) as one string,
+  the keys and values slices of it, and counts the leaf's size in T_FLEAF.
+- `nodeCost` counts the body and the directory.
+
+**The store and the executor.** The store learns each table tree's
+layouts from the executor (`Store.setColSpec`, called by `findTable` with
+`Table.layouts`); trees without (indexes, the catalog, companion trees)
+keep row leaves. What a column leaf holds does not depend on the spec being
+right: given wrong kinds the encoder either refuses the rows or keeps them
+byte for byte. `LEXDB_COLUMNS=0` (or `Store.setColumns(false)`) writes row
+leaves only; column leaves already on disk are still read.
+
+**The fallback.** A leaf is written as rows (T_FLEAF, as before) when:
+- a row is not in the fixed form: tagged (a long text, `encLong`; over 255
+  places; a date or time value), or a value stored apart (a stub);
+- its rows are of two layouts (after ALTER TABLE, until its rows are
+  written again); one layout per leaf, no layout chosen per row;
+- its columns and keys do not fit the page.
+
+**Rows per leaf (refill).** A column leaf of w holds 67 rows, against 43
+rows a page as rows, so a table's changed leaf holds more rows than a page
+of rows:
+- **At commit** a leaf of a tree with a spec splits when its rows pass what
+  a column leaf of them is estimated to hold (`leafRoom`): `PAGE - 22` over
+  the tree's ratio of column bytes to row bytes, less 3%, at most four pages
+  of rows (`CAP_LEAF`). The ratio is sampled by encoding the leaf about to
+  split, at first and every 64th split (when it is about as full as a column
+  leaf: a smaller leaf counts its dictionaries and headers more), and
+  updated by the checkpoint's encodings of leaves over a page of rows.
+- **At checkpoint**, before the roots are taken, `refit` goes down every
+  changed node of each tree with a spec: a changed leaf over a page of rows
+  becomes a column leaf if it fits one; else it is cut (`cutLeaf`) into
+  column leaves that do (as many rows as estimated, then 10% fewer until
+  they fit), or into pages of rows when its rows do not encode. A cut is a
+  split (`hang`, factored out of `fixOverflow`, puts the new leaf in its
+  parent, and parents that overflow split in turn); snapshots keep the
+  leaf's version from before (`willChange`).
+- No merges, as before (an empty leaf leaves its parent).
+
+**Leaf skipping.** A column leaf keeps each integer place's least and
+greatest (FOR's base and range; raw's two varints). A level's conditions,
+and the batch aggregates' WHERE, that compare an integer column with a
+constant (either side), and ANDs of them, become ranges per place in the
+batch plan (`BPlan.ranges`, `cRanges`); `fillBatch` and `fillPick` skip a
+column leaf whose range of such a place misses one, or whose rows there are
+all NULL (`cExcluded`). Parents keep no summaries. Numerics' units are not
+used for skipping yet.
+
+**Reads.** The batch scan's run decoders hand a column leaf to its own:
+`bRunInto` to `cRunInto` and `bRunLazy` to `cRunLazy`, which decode a
+column at a time from the columns, only the places used, in the two steps
+of 9.108 (the conditions' places for every row, the rest for the rows
+kept). An integer run is unpacked in one pass, a dictionary's entries are
+made once per leaf and its codes looked up, a text is a slice of the leaf,
+a simple LIKE runs on each text in place (a dictionary's entries matched
+once). A transaction's own writes in a scan's range go through the row
+path, as before (`scanLeaves` gives way).
+
+**Compatibility.** T_LEAF (before 9.109) and T_FLEAF pages are read as
+before and written again, as column leaves or as T_FLEAF, when they change;
+a data directory changes leaf by leaf. An older lexdb reports a T_CLEAF
+page as corrupt (its check of the type). The log, meta, list and internal
+pages are unchanged.
+
+**Measured** (wall ms, the median of 3 runs of each query in `bench.py`,
+two passes, each on a data directory this build loaded fresh by COPY with
+column leaves on and off, `w_b` built, ANALYZE run; the same binary,
+`LEXDB_COLUMNS=0` for off; other agents' benchmarks held off by a lock; two
+off passes agreed within 4% on the geometric mean and 1% on `qL.txt`):
+
+| Query | Off | Column leaves | Ratio |
+|---|---:|---:|---:|
+| `count` | 25.0 | 12.5 | 0.50 |
+| `filt1pct` | 54.0 | 31.0 | 0.57 |
+| `idx_range_agg` (a scan with statistics) | 55.5 | 36.0 | 0.65 |
+| `sort_lim` | 49.0 | 32.5 | 0.66 |
+| `sub_in`, `sub_exists` | 42.5, 42.5 | 28.5, 28.0 | 0.66, 0.67 |
+| `filt_agg` | 34.5 | 23.0 | 0.67 |
+| `filt10pct` | 73.5 | 51.5 | 0.70 |
+| `expr_agg` | 69.5 | 50.0 | 0.72 |
+| `join_hash_agg`, `join_hash_rows` | 58.0, 64.5 | 42.0, 47.5 | 0.72, 0.74 |
+| `grp_int` | 56.5 | 41.0 | 0.73 |
+| `idx_range100k` (a scan) | 87.5 | 66.0 | 0.75 |
+| `minmax_text`, `distinct`, `sub_corr_sel`, `pk_range100k` | | | 0.86 to 0.87 |
+| `expr_int`, `grp_text`, `scan2`, `scan3` | | | 0.87 to 0.90 |
+| `window`, `distinct2`, `scan9` (`select *`), `expr_mix`, `filt_like`, `sort_all` | | | 0.91 to 0.96 |
+| `pk_point20k` | 616.5 | 632.0 | 1.03 |
+| `join_lookup_agg` (lookups into t's column leaves) | 106.0 | 113.0 | 1.07 |
+| `idx_range1k` | 5 | 6 | (noise) |
+
+- **Lists:** `queries.txt` geometric mean 0.807 (passes 0.789 and 0.827),
+  total 4,696 to 4,219 ms; `qL.txt` 0.827, 2,708 to 2,454 ms. The study
+  expected 0.86 and 0.865.
+- **Size:** `w` 88.1 MB to 61.4 MB (30% smaller; the study's 40% was from
+  93.7 MB, before 9.109's front coding, and stored the key as a column):
+  14,934 leaves of 67 rows, 96% full; 55.2 bytes a row of columns (the
+  study's 55.7) and 3.1 of front-coded keys. The data file 117.8 to 84.6 MB.
+- **Cold `count(*)`** (a server started for each of 5 runs, the file
+  evicted, O_DIRECT): 351 ms to 210 (40% faster); `count(*), sum(c) where b
+  < 10000` 393 to 238.
+- **Writes**, server CPU µs per statement (20,000 statements in one
+  transaction, a fresh copy each of 3 runs; "with checkpoint" counts the
+  server's whole life less an idle one, so its shutdown checkpoint is in):
+
+| Statement | Off | Columns | Off, with checkpoint | Columns, with checkpoint | Shutdown checkpoint, ms |
+|---|---:|---:|---:|---:|---:|
+| SELECT by key | 27.3 | 29.1 | 27.4 | 29.1 | |
+| UPDATE one column, random keys | 31.3 | 41.8 | 40.7 | 58.5 | 209 to 355 |
+| DELETE, random keys | 37.7 | 47.8 | 56.2 | 72.1 | 384 to 505 |
+| INSERT, ascending keys | 27.2 | 27.0 | 29.4 | 29.4 | 61 to 64 |
+
+  - A random update costs 10.5 µs more while it runs (its leaf rebuilt as
+    rows) and 17.8 µs more counting the checkpoint (the leaf encoded), on a
+    statement of 41 µs: the study expected about 14. Per changed leaf the
+    checkpoint takes about 32 µs (11,000 leaves in 355 ms, writes
+    included) against 16 µs for a row leaf. Inserts in key order are
+    unchanged.
+  - Autocommit (10,000 statements, a log flush each, 3 runs): an update 229
+    to 260 µs of CPU and 7,591 to 8,412 ms wall in one run, 239 to 251 µs
+    and 7,756 to 7,805 ms in a second with the order reversed: noisy, about
+    5% more CPU. A delete 261 to 287 µs; an ascending insert 217 to 219.
+  - Before the tuning (rows rebuilt a place at a time, bytes copied one at
+    a time) the update was 49.1 µs and 70.1 with its checkpoint.
+- **PostgreSQL 18:** `w` loaded as `cl_w` into both, the same updates,
+  deletes and inserts on both (lexdb's with column leaves), 14 queries
+  (aggregates, groups, LIKE, ranges, NULLs, rows by key): all the same, one
+  only under `COLLATE "C"` (`max(note)`: PostgreSQL's database collation
+  orders spaces differently, unrelated).
+
+**Tests:**
+- `cols_codec` (new): 880 random leaves of every place kind (integers at
+  their limits, booleans, numerics of one scale and of many, texts of few
+  values and of many, a dropped place), every NULL pattern, at the bitmap's
+  edges (1, 7, 8, 9, 63, 64, 65 rows and more): rebuilt whole and row by
+  row byte for byte, each value read in place and in runs from several
+  starts, ranges right; every codec used; the refusals (two layouts, a
+  tagged row, a stub, a NULL place with bytes, a boolean of 2, a long row, a
+  spare bit, an unknown layout); units against `toBin`.
+- `exec_cols` (new): a store with column leaves against one without, the
+  same statements, every result compared batches on and off: column leaves
+  and the fallback both; ADD and DROP COLUMN and a widening retype with
+  column leaves on disk; a transaction's own writes over them, rolled back
+  and committed; write skew (40001 on both); reopened.
+- `exec_cols_diff` (new): 10 rounds of random tables (each column of a
+  random type and NULL share), random changes (ranges, single rows,
+  deletes, an added column, a transaction), checkpoints between, 4,000
+  random queries (filters with the constant on either side, LIKE, IS NULL,
+  groups, orders, limits, point reads, aggregates) against column leaves
+  off: all the same, leaves skipped by their ranges.
+- `exec_colsfill` (new): loads in key and random order (A's table under 80%
+  of B's pages), leaves of two layouts and long texts cut into pages of
+  rows, a root leaf cut and then a crash (A reopened from its last
+  checkpoint and log), a snapshot across the cuts, 40001.
+- `exec_oldformats` (new, 9.109's approach): data directories written by
+  SQL at 78731801 (T_LEAF) and 61d57286 (T_FLEAF), checkpointed with a
+  commit in the log only: opened, four queries give what those builds
+  give, a follower reads every tree as the store; written (column leaves
+  appear beside the old leaves), the same as a copy without column leaves,
+  reopened, the follower again.
+- **Planted bugs**, each caught: a value off by one in the batch decoder;
+  booleans inverted in the rebuilt rows; a dictionary's LIKE inverted; an
+  integer read wrong at one row; refit after the roots are taken (caught
+  only after the crash was added to `exec_colsfill`); a range's bound off
+  by one; a constant on the left not turned round.
+- **Changed expectations,** both from leaf skipping: `exec_switch`'s scan
+  after a switch reads 1,386 rows, not 20,000 (x follows the key);
+  `exec_hashagg`'s per-row subquery reads 326,750 rows of o, not 499,500.
+- The suite passes (122), with `LEXDB_COLCHECK=1` and without; the crash
+  test, 20 rounds direct and 20 with `LXL_URING=1`; the replica test.
+
+**Not done, and next:**
+- A leaf of two layouts is written as rows, so after an ALTER TABLE a
+  table's leaves stay rows until their rows are written again. A layout
+  per run of rows, or rows rewritten to the new layout at checkpoint, would
+  fix it.
+- A changed column leaf rebuilds all its rows (about 8 µs for 67), and the
+  checkpoint encodes it whole (about 16 µs): the write cost above.
+- The encode runs inside the checkpoint's hold of the store (as the row
+  leaves' bodies did), so a large checkpoint holds commits for longer.
+- Skipping uses integer places only, in the leaf (parents keep no
+  summaries); numerics' units and text dictionaries are not used for it.
+- Keys are front coded (3.1 bytes a row of w); the study stored an integer
+  key as a column (about 1).
+- No FSST, no byte-aligned variants, no larger pages (as decided).
