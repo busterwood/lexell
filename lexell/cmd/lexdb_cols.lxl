@@ -49,6 +49,16 @@ pub const K_NUM: byte = 3
 pub const K_TEXT: byte = 4
 pub const K_INT4: byte = 5
 pub const K_INT2: byte = 6
+// 9.113: words a date (4 bytes), a time, a timestamp, a timestamptz (8), a
+// double's bits (8), a real's (4); variable a uuid's 16 bytes, a bytea
+pub const K_DATE: byte = 7
+pub const K_TIME: byte = 8
+pub const K_TS: byte = 9
+pub const K_TSTZ: byte = 10
+pub const K_F8: byte = 11
+pub const K_F4: byte = 12
+pub const K_UUID: byte = 13
+pub const K_BYTEA: byte = 14
 
 pub const C_NONE = 0
 pub const C_FOR = 1
@@ -107,15 +117,28 @@ pub fn sameSpec(a: &Spec, b: &[][]byte): bool {
 }
 
 fn fixedSize(k: byte): int {
-    if k == K_INT { return 8 }
-    if k == K_INT4 { return 4 }
-    if k == K_INT2 || k == K_NUM || k == K_TEXT { return 2 }
+    if k == K_INT || k == K_TIME || k == K_TS || k == K_TSTZ || k == K_F8 { return 8 }
+    if k == K_INT4 || k == K_DATE || k == K_F4 { return 4 }
+    if k == K_INT2 || isVar(k) { return 2 }
     if k == K_BOOL { return 1 }
     return 0
 }
 
-fn isInt(k: byte): bool { return k == K_INT || k == K_INT4 || k == K_INT2 }
-fn isVar(k: byte): bool { return k == K_NUM || k == K_TEXT }
+// A place holding a word (an integer, a date or time, a float's bits): an
+// integer column of the codec (C_FOR, C_RAW), at its width.
+fn isInt(k: byte): bool { return k == K_INT || k == K_INT4 || k == K_INT2 || (k >= K_DATE && k <= K_F4) }
+fn isVar(k: byte): bool { return k == K_NUM || k == K_TEXT || k == K_UUID || k == K_BYTEA }
+
+// Writes word v at out[o..] at kind k's width (LE).
+fn setWord(out: mut &[]byte, o: int, k: byte, v: int) {
+    let w = fixedSize(k)
+    if w == 8 { binary.setU64LE(out, o, v) } else if w == 4 { binary.setU32LE(out, o, v & 0xffffffff) } else { binary.setU16LE(out, o, v & 0xffff) }
+}
+
+fn appendWord(out: mut &[]byte, k: byte, v: int) {
+    let w = fixedSize(k)
+    if w == 8 { binary.appendU64LE(out, v) } else if w == 4 { binary.appendU32LE(out, v & 0xffffffff) } else { binary.appendU16LE(out, v & 0xffff) }
+}
 
 // Where a layout's places are in a row (lexdb_exec layOfKinds): per place
 // its offset, and a variable one's previous end's offset (-1: the first).
@@ -244,8 +267,9 @@ fn bitAt(s: &str, at: int, i: int): bool { return (int(s[at + (i >> 3)]) >> (i &
 
 // The integer of kind k at s[at..] (a row's fixed place).
 fn readIntK(s: &str, at: int, k: byte): int {
-    if k == K_INT { return binary.readI64LEStr(s, at) }
-    if k == K_INT4 { return binary.readI32LEStr(s, at) }
+    let w = fixedSize(k)
+    if w == 8 { return binary.readI64LEStr(s, at) }
+    if w == 4 { return binary.readI32LEStr(s, at) }
     return binary.readI16LEStr(s, at)
 }
 
@@ -459,10 +483,11 @@ pub fn encodeRows(rows: &[]&str, spec: &Spec): Option[str] {
                 }
                 let x = rows[r]
                 var v = 0
-                if k == K_INT {
+                let wb = fixedSize(k)
+                if wb == 8 {
                     v = int(x[o]) | (int(x[o + 1]) << 8) | (int(x[o + 2]) << 16) | (int(x[o + 3]) << 24) |
                         (int(x[o + 4]) << 32) | (int(x[o + 5]) << 40) | (int(x[o + 6]) << 48) | (int(x[o + 7]) << 56)
-                } else if k == K_INT4 {
+                } else if wb == 4 {
                     let u = int(x[o]) | (int(x[o + 1]) << 8) | (int(x[o + 2]) << 16) | (int(x[o + 3]) << 24)
                     v = if u >= 0x80000000 { u - 0x100000000 } else { u }
                 } else {
@@ -513,7 +538,7 @@ pub fn encodeRows(rows: &[]&str, spec: &Spec): Option[str] {
                     let s = rows[r]
                     for i in st[r]..en[r] { append(mut &out, s[i]) }
                 }
-                c = if k == K_TEXT { C_TEXT } else { C_BIN }
+                c = if k == K_NUM { C_BIN } else { C_TEXT }
             }
         }
         out[cpos] = byte(c | (if anyNull { C_NULLS } else { 0 }))
@@ -727,7 +752,7 @@ pub fn parse(s: &str, n: int): Option[[]int] {
             dir[x + F_DATA] = at
             at += nb
         } else if c == C_TEXT || c == C_BIN {
-            if (c == C_TEXT && k != K_TEXT) || (c == C_BIN && k != K_NUM) { return None }
+            if (c == C_TEXT && (k == K_NUM || !isVar(k))) || (c == C_BIN && k != K_NUM) { return None }
             if at + 2 * n > len(s) || n == 0 { return None }
             dir[x + F_DATA] = at
             let total = u16At(s, at + 2 * n - 2)
@@ -950,7 +975,7 @@ fn putRow(s: &str, dir: &[]int, i: int, out: mut &[]byte, at: int) {
         if k == K_NONE { continue }
         if isInt(k) {
             let v = if nul { 0 } else { intAt(s, dir, p, i) }
-            if k == K_INT { binary.setU64LE(out, o, v) } else if k == K_INT4 { binary.setU32LE(out, o, v & 0xffffffff) } else { binary.setU16LE(out, o, v & 0xffff) }
+            setWord(out, o, k, v)
             o += fixedSize(k)
         } else if k == K_BOOL {
             out[o] = if !nul && boolAt(s, dir, p, i) { byte(1) } else { byte(0) }
@@ -1065,7 +1090,7 @@ pub fn allRows(s: &str, dir: &[]int, ends: mut &[]int): str {
             let nul = len(nuls[p]) > 0 && nuls[p][r]
             if isInt(k) {
                 let v = if nul { 0 } else { vals[p][r] }
-                if k == K_INT { binary.appendU64LE(mut &out, v) } else if k == K_INT4 { binary.appendU32LE(mut &out, v & 0xffffffff) } else { binary.appendU16LE(mut &out, v & 0xffff) }
+                appendWord(mut &out, k, v)
             } else if k == K_BOOL {
                 append(mut &out, if !nul && vals[p][r] == 1 { byte(1) } else { byte(0) })
             } else {

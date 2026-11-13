@@ -1,0 +1,121 @@
+// lexdb_exec: dates, times, timestamps, timestamptz, doubles, reals, uuids
+// and byteas in the fixed row layout (design/lexdb.md 9.113), and so in
+// column leaves (9.112).
+// - A new table of every such type: its rows, NULLs or not, are all in
+//   the fixed layout; every value reads back as written, through a
+//   checkpoint (column leaves) and the row path alike (batches off).
+// - A table made before 9.113 (setLegacyKinds: its layout's places of
+//   these types text places) keeps writing in that layout: a row with a
+//   NULL date fixed, one with a date tagged, as then. All read back the
+//   same. After ALTER TABLE (its catalog row written again) its new layout
+//   has the new kinds, and a row with a date is fixed.
+// - Date and time ranges skip column leaves whose least and greatest are
+//   outside them (9.113), giving the row path's rows.
+// - Values at the edges: a date far in the past and the future, a
+//   timestamp's least and greatest, -0.0, NaN and infinities, a real.
+// expect: new table: 2000 rows, by layout: 0:2000 of 1 layouts
+// expect: new table, values: same as written true
+// expect: after a checkpoint: column leaves true, same as written true, batches off same true
+// expect: ranges: 241|300|540 / 23|2750 / 1439 / 5|2024-01-05 / 75; leaves skipped true, same as the row path true
+// expect: old table: by layout: 0:2 tagged:3 of 1 layouts
+// expect: old table, values: 1|2024-05-01|1.5 2|| 3|2024-05-03| 4|| 5|2024-05-05|
+// expect: altered: by layout: 0:2 1:2 tagged:3 of 2 layouts
+// expect: altered, values: 1|2024-05-01|1.5| 2||| 3|2024-05-03|| 4||| 5|2024-05-05|| 6|2024-05-06|6.5|x 7|||y
+// expect: edges: 4713-01-01 BC|294276-12-31|-infinity|infinity|-0|NaN|Infinity|-Infinity|3.4028235e+38
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            var out: []str = []
+            for r in rs {
+                if !r.hasRows { append(mut &out, r.tag) }
+                for row in r.rows {
+                    var vs: []str = []
+                    for v in row { append(mut &vs, lexdb_exec.text(&v)) }
+                    append(mut &out, strings.join(&vs, "|"))
+                }
+            }
+            return strings.join(&out, " ")
+        }
+        Err(e) { return "ERROR " + e.state + " " + e.msg }
+    }
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(113), lexdb_store.Options{cacheBytes: 4 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 1024 * 1024, snapNodes: 50000, bufferedPages: false}, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        let c1 = q(mut &s, &("create table ty (id int primary key, d date, tm time, ts timestamp, tz timestamptz, f8 float8, f4 real, " +
+                             "u uuid, bt bytea, n numeric(10,2), x text)"))
+        let i1 = q(mut &s, &("insert into ty select g, case when g % 9 = 0 then null else date '2024-01-01' + g % 400 end, " +
+                             "case when g % 8 = 0 then null else time '00:00' + g * interval '7 seconds' end, " +
+                             "timestamp '2024-01-01' + g * interval '1 minute', " +
+                             "case when g % 7 = 0 then null else timestamptz '2024-03-10 01:00:00+00' + g * interval '13 minutes' end, " +
+                             "case when g % 6 = 0 then null else g / 7.0 - 100 end, (g % 1000) / 3.0, " +
+                             "case when g % 5 = 0 then null else ('a0eebc99-9c0b-4ef8-bb6d-' || lpad(to_hex(g), 12, '0'))::uuid end, " +
+                             "case when g % 4 = 0 then null else decode(lpad(to_hex(g * 31), 8, '0'), 'hex') end, g * 0.25, 's' || g " +
+                             "from generate_series(1, 2000) g"))
+        println("new table: 2000 rows, by layout: " + lexdb_exec.rowLayouts(&st, &"ty"))
+        let all = "select id, d, tm, ts, tz, f8, f4, u, bt, n, x from ty order by id"
+        let before = q(mut &s, &all)
+        // the same values, made again as they were inserted, compared
+        let want = q(mut &s, &("select g, case when g % 9 = 0 then null else date '2024-01-01' + g % 400 end, " +
+                               "case when g % 8 = 0 then null else time '00:00' + g * interval '7 seconds' end, " +
+                               "timestamp '2024-01-01' + g * interval '1 minute', " +
+                               "case when g % 7 = 0 then null else timestamptz '2024-03-10 01:00:00+00' + g * interval '13 minutes' end, " +
+                               "case when g % 6 = 0 then null else (g / 7.0 - 100)::float8 end, ((g % 1000) / 3.0)::real, " +
+                               "case when g % 5 = 0 then null else ('a0eebc99-9c0b-4ef8-bb6d-' || lpad(to_hex(g), 12, '0'))::uuid end, " +
+                               "case when g % 4 = 0 then null else decode(lpad(to_hex(g * 31), 8, '0'), 'hex') end, (g * 0.25)::numeric(10,2), 's' || g " +
+                               "from generate_series(1, 2000) g order by 1"))
+        println("new table, values: same as written " + (before == want).toStr())
+        st.checkpointAll().unwrap()
+        let after = q(mut &s, &all)
+        let cols = st.colCounts()[0]
+        let off = q(mut &s, &"set lexdb_batch = off")
+        let rowPath = q(mut &s, &all)
+        let on = q(mut &s, &"set lexdb_batch = on")
+        println("after a checkpoint: column leaves " + (cols > 0).toStr() + ", same as written " + (after == want).toStr() +
+                ", batches off same " + (rowPath == want).toStr())
+
+        // leaves skipped by a date or time range (9.113): the rows the same
+        // with column leaves' skipping as without (batches off: no skipping)
+        let ranges = ["select count(*), min(id), max(id) from ty where ts between '2024-01-01 05:00' and '2024-01-01 09:00'",
+                      "select count(*), sum(id) from ty where tz >= '2024-03-11 00:00:00+00' and tz < '2024-03-11 06:00:00+00'",
+                      "select count(*) from ty where '2024-01-02 00:00' > ts",
+                      "select count(*), min(d) from ty where d = '2024-01-05'",
+                      "select count(*) from ty where tm < '00:10:00'"]
+        var sameR = true
+        let k0 = lexdb_exec.colLeavesSkipped()
+        var got: []str = []
+        for r in ranges { append(mut &got, q(mut &s, &r)) }
+        let skipped = lexdb_exec.colLeavesSkipped() - k0
+        let off2 = q(mut &s, &"set lexdb_batch = off")
+        for i in 0..len(ranges) { if q(mut &s, &ranges[i]) != got[i] { sameR = false } }
+        let on2 = q(mut &s, &"set lexdb_batch = on")
+        println("ranges: " + strings.join(&got, " / ") + "; leaves skipped " + (skipped > 0).toStr() + ", same as the row path " + sameR.toStr())
+
+        // a table made before 9.113: its layout's date and float places text places
+        lexdb_exec.setLegacyKinds(true)
+        let c2 = q(mut &s, &"create table old (id int primary key, d date, f float8)")
+        lexdb_exec.setLegacyKinds(false)
+        let i2 = q(mut &s, &"insert into old values (1, '2024-05-01', 1.5), (2, null, null), (3, '2024-05-03', null), (4, null, null), (5, '2024-05-05', null)")
+        println("old table: by layout: " + lexdb_exec.rowLayouts(&st, &"old"))
+        println("old table, values: " + q(mut &s, &"select id, d, f from old order by id"))
+        let a2 = q(mut &s, &"alter table old add column t text")
+        let i3 = q(mut &s, &"insert into old values (6, '2024-05-06', 6.5, 'x'), (7, null, null, 'y')")
+        println("altered: by layout: " + lexdb_exec.rowLayouts(&st, &"old"))
+        println("altered, values: " + q(mut &s, &"select id, d, f, t from old order by id"))
+
+        // the edges of the types
+        let c3 = q(mut &s, &"create table edge (id int primary key, d1 date, d2 date, t1 timestamp, t2 timestamptz, z float8, nan float8, pi float8, ni float8, r real)")
+        let i4 = q(mut &s, &("insert into edge values (1, '4713-01-01 BC', '294276-12-31', '-infinity', 'infinity', '-0', 'NaN', " +
+                             "'Infinity', '-Infinity', '3.4028235e38')"))
+        st.checkpointAll().unwrap()
+        println("edges: " + q(mut &s, &"select d1, d2, t1, t2, z, nan, pi, ni, r from edge"))
+        return 0
+    }).unwrap()
+}

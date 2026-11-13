@@ -21623,9 +21623,10 @@ type BPlan = record {
     missing: []Val          // by place
     needP: []bool           // by place, for decRowNeed and rowOf
     width: int
-    // the ranges an integer place's values must be in for a row to be
-    // kept, (place, least, greatest) each: a column leaf whose values of
-    // one are all outside it is skipped (cRanges, 9.112)
+    // the ranges a place's words must be in for a row to be kept, (place,
+    // the kind they are of: 0 an integer's, else a date or time PK_*;
+    // least, greatest) each: a column leaf whose words of one are all
+    // outside it is skipped (cRanges, 9.112; dates and times 9.113)
     ranges: []int
 }
 
@@ -22425,8 +22426,9 @@ fn cCols(leaf: &lexdb_page.Node, from: int, qs: &[]int, all: bool, r0: int, ps: 
             // used again (bReuse, 9.111)
             if nulls { for q in qs { if b.cols[c].nul[r0 + q] { vals[r0 + q] = Val.Null } } }
             let codec = lexdb_cols.codecOf(dir, pl)
-            if isIntKind(pk) {
-                for q in qs { if !b.cols[c].nul[r0 + q] { vals[r0 + q] = Val.Int(lexdb_cols.intAt(s, dir, pl, from + q)) } }
+            if isWordKind(pk) {
+                // an integer, a date or time, a float's bits (9.113)
+                for q in qs { if !b.cols[c].nul[r0 + q] { vals[r0 + q] = wordVal(pk, lexdb_cols.intAt(s, dir, pl, from + q)) } }
             } else if pk == PK_BOOL {
                 for q in qs { if !b.cols[c].nul[r0 + q] { vals[r0 + q] = Val.Bool(lexdb_cols.boolAt(s, dir, pl, from + q)) } }
             } else if codec == lexdb_cols.C_DICT {
@@ -22461,11 +22463,12 @@ fn cCols(leaf: &lexdb_page.Node, from: int, qs: &[]int, all: bool, r0: int, ps: 
                     if pk == PK_TEXT {
                         vals[r0 + q] = Val.Text(leaf.cols[a..e])
                     } else {
-                        match Decimal.fromBin(s, a, e - a) {
-                            Ok(d) { vals[r0 + q] = Val.Num(d) }
-                            Err(_) {
+                        // a numeric, a uuid, a bytea (9.113)
+                        match varVal(pk, s, a, e) {
+                            Ok(v) { vals[r0 + q] = v }
+                            Err(bad) {
                                 b.vals[c] = vals
-                                return Err(lexdb_base.corrupt("a numeric value in a column leaf"))
+                                return Err(bad)
                             }
                         }
                     }
@@ -22479,9 +22482,10 @@ fn cCols(leaf: &lexdb_page.Node, from: int, qs: &[]int, all: bool, r0: int, ps: 
     return Ok(true)
 }
 
-// The ranges conds (each must hold for a row to be kept) put on integer
-// places: (place, least, greatest) per condition of a column of integers
-// (kinds: BK_INT) compared with an integer constant, or an AND of them.
+// The ranges conds (each must hold for a row to be kept) put on places
+// (BPlan.ranges): per condition of a column of integers (kinds: BK_INT)
+// compared with an integer constant, or of a date or time column with a
+// value of its own type (9.113), or an AND of them.
 fn cRanges(conds: &[]BNode, kinds: &[]int, t: &Table): []int {
     var out: []int = []
     for c in conds { cRangesOf(&c, kinds, t, mut &out) }
@@ -22521,30 +22525,63 @@ fn cRangesOf(n: &BNode, kinds: &[]int, t: &Table, out: mut &[]int) {
                 else {}
             }
             if col < 0 || col >= len(kinds) || kinds[col] != BK_INT || o == 1 { return }
-            let MIN = -9223372036854775807 - 1
-            let MAX = 9223372036854775807
-            var lo = MIN
-            var hi = MAX
-            if o == 0 {
-                lo = v
-                hi = v
-            } else if o == 2 {
-                if v == MIN { lo = 1; hi = 0 } else { hi = v - 1 }
-            } else if o == 3 { hi = v }
-            else if o == 4 {
-                if v == MAX { lo = 1; hi = 0 } else { lo = v + 1 }
-            } else if o == 5 { lo = v }
-            append(out, if len(t.slots) == 0 { col } else { t.slots[col] })
-            append(out, lo)
-            append(out, hi)
+            cRangeAdd(o, v, col, 0, t, out)
+        }
+        BNode.ValCmp(op, c, k, left) {
+            // a date or time column compared with a value of its own kind
+            // (9.113): as the words its places hold (compare orders them so)
+            if op == 1 || c >= len(t.cols) { return }
+            let pk = timeKindOf(t.cols[c].typ.oid)
+            if pk == PK_NONE { return }
+            var v = 0
+            match k {
+                Val.Date(x) { if pk == PK_DATE { v = x } else { return } }
+                Val.Time(x) { if pk == PK_TIME { v = x } else { return } }
+                Val.Ts(x) { if pk == PK_TS { v = x } else { return } }
+                Val.Tstz(x) { if pk == PK_TSTZ { v = x } else { return } }
+                else { return }
+            }
+            let o = if !left { op } else if op == 2 { 4 } else if op == 3 { 5 } else if op == 4 { 2 } else if op == 5 { 3 } else { op }
+            cRangeAdd(o, v, c, int(pk), t, out)
         }
         else {}
     }
 }
 
-// Whether column leaf leaf holds no row bp.ranges keep: an integer place
-// whose least and greatest in the leaf are outside its range (or whose
-// rows are all NULL).
+// A date or time type's place kind (9.113); PK_NONE another type.
+fn timeKindOf(oid: int): byte {
+    if oid == lexdb_sql.OID_DATE { return PK_DATE }
+    if oid == lexdb_sql.OID_TIME { return PK_TIME }
+    if oid == lexdb_sql.OID_TS { return PK_TS }
+    if oid == lexdb_sql.OID_TSTZ { return PK_TSTZ }
+    return PK_NONE
+}
+
+// Adds to out the range "column col (the table's) op v" keeps: (place, the
+// place kind it holds for: 0 any integer's, least, greatest).
+fn cRangeAdd(o: int, v: int, col: int, kind: int, t: &Table, out: mut &[]int) {
+    let MIN = -9223372036854775807 - 1
+    let MAX = 9223372036854775807
+    var lo = MIN
+    var hi = MAX
+    if o == 0 {
+        lo = v
+        hi = v
+    } else if o == 2 {
+        if v == MIN { lo = 1; hi = 0 } else { hi = v - 1 }
+    } else if o == 3 { hi = v }
+    else if o == 4 {
+        if v == MAX { lo = 1; hi = 0 } else { lo = v + 1 }
+    } else if o == 5 { lo = v }
+    append(out, if len(t.slots) == 0 { col } else { t.slots[col] })
+    append(out, kind)
+    append(out, lo)
+    append(out, hi)
+}
+
+// Whether column leaf leaf holds no row bp.ranges keep: a place of the
+// range's kind whose least and greatest in the leaf are outside its range
+// (or whose rows are all NULL).
 var C_SKIPPED: int = 0
 
 // Column leaves batch scans skipped (cExcluded), for the tests.
@@ -22555,12 +22592,18 @@ fn cExcluded(leaf: &lexdb_page.Node, bp: &BPlan, t: &Table): bool {
     let dir = &leaf.cdir
     let np = lexdb_cols.places(dir)
     var x = 0
-    while x + 2 < len(bp.ranges) {
+    while x + 3 < len(bp.ranges) {
         let pl = bp.ranges[x]
-        let lo = bp.ranges[x + 1]
-        let hi = bp.ranges[x + 2]
-        x += 3
-        if pl >= np || !isIntKind(lexdb_cols.kindOf(&leaf.cols, pl)) { continue }
+        let want = bp.ranges[x + 1]
+        let lo = bp.ranges[x + 2]
+        let hi = bp.ranges[x + 3]
+        x += 4
+        if pl >= np { continue }
+        // the place's words must be what the range is of: any integer's, or
+        // the one date or time kind (a column retyped keeps older leaves of
+        // its old kind)
+        let pk = lexdb_cols.kindOf(&leaf.cols, pl)
+        if !(if want == 0 { isIntKind(pk) } else { int(pk) == want }) { continue }
         if lo > hi || !lexdb_cols.hasRange(dir, pl) || lexdb_cols.least(dir, pl) > hi || lexdb_cols.greatest(dir, pl) < lo {
             C_SKIPPED += 1
             return true
@@ -25486,6 +25529,14 @@ fn batchGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
 // it. A row this cannot hold is in the tagged form (encRow): one with a
 // long text (LONG, encLong), over 255 places, a value not of its place's
 // kind, or written with LEXDB_ROWFMT=tagged.
+//
+// Since 9.113 a date, a time, a timestamp and a timestamptz are words in
+// the fixed part too (4 bytes the date's days; 8 the others' microseconds),
+// as are a double's and a real's bits (8, 4); a uuid (its 16 bytes) and a
+// bytea are variable-length values, as texts are. Before, their places
+// were text places (PK_TEXT) and a row with such a value was in the tagged
+// form; a table keeps such a layout as its current one until its catalog
+// row is written again (encFixed: compatible).
 
 const FIXED: byte = 8
 const PK_NONE: byte = 0     // a dropped column's place
@@ -25495,6 +25546,14 @@ const PK_NUM: byte = 3
 const PK_TEXT: byte = 4
 const PK_INT4: byte = 5
 const PK_INT2: byte = 6
+const PK_DATE: byte = 7     // 4 bytes: days (9.113)
+const PK_TIME: byte = 8     // 8 bytes: microseconds
+const PK_TS: byte = 9
+const PK_TSTZ: byte = 10
+const PK_F8: byte = 11      // 8 bytes: a double's bits
+const PK_F4: byte = 12      // 4 bytes: a real's bits
+const PK_UUID: byte = 13    // variable: its 16 bytes
+const PK_BYTEA: byte = 14   // variable: its bytes
 
 var fixedRows: bool = true
 
@@ -25551,6 +25610,12 @@ pub fn rowLayouts(st: &lexdb_store.Store, name: &str): str {
     return strings.join(&out, " ") + " of " + nl.toStr() + " layouts"
 }
 
+// Places of 9.113's kinds as text places, as before 9.113 (a test's look
+// at a table whose layout was stored then: olderKinds).
+var legacyKinds: bool = false
+
+pub fn setLegacyKinds(on: bool) { legacyKinds = on }
+
 // Each place's kind, from its column's type.
 fn placeKinds(t: &Table): []byte {
     var out: []byte = array(rowWidth(t), PK_NONE)
@@ -25562,20 +25627,100 @@ fn placeKinds(t: &Table): []byte {
         else if o == lexdb_sql.OID_INT2 { k = PK_INT2 }
         else if o == lexdb_sql.OID_BOOL { k = PK_BOOL }
         else if o == lexdb_sql.OID_NUMERIC { k = PK_NUM }
+        else if o == lexdb_sql.OID_DATE { k = PK_DATE }
+        else if o == lexdb_sql.OID_TIME { k = PK_TIME }
+        else if o == lexdb_sql.OID_TS { k = PK_TS }
+        else if o == lexdb_sql.OID_TSTZ { k = PK_TSTZ }
+        else if o == lexdb_sql.OID_FLOAT8 { k = PK_F8 }
+        else if o == lexdb_sql.OID_FLOAT4 { k = PK_F4 }
+        else if o == lexdb_sql.OID_UUID { k = PK_UUID }
+        else if o == lexdb_sql.OID_BYTEA { k = PK_BYTEA }
+        if legacyKinds && k >= PK_DATE { k = PK_TEXT }
         out[if len(t.slots) == 0 { i } else { t.slots[i] }] = k
     }
     return out
 }
 
 fn fixedSize(k: byte): int {
-    if k == PK_INT { return 8 }
-    if k == PK_INT4 { return 4 }
-    if k == PK_INT2 || k == PK_NUM || k == PK_TEXT { return 2 }
+    if k == PK_INT || k == PK_TIME || k == PK_TS || k == PK_TSTZ || k == PK_F8 { return 8 }
+    if k == PK_INT4 || k == PK_DATE || k == PK_F4 { return 4 }
+    if k == PK_INT2 || isVarKind(k) { return 2 }
     if k == PK_BOOL { return 1 }
     return 0
 }
 
 fn isIntKind(k: byte): bool { return k == PK_INT || k == PK_INT4 || k == PK_INT2 }
+
+// A place holding a word: an integer, or (9.113) a date, a time, a
+// timestamp, a timestamptz, a double's or a real's bits.
+fn isWordKind(k: byte): bool { return isIntKind(k) || (k >= PK_DATE && k <= PK_F4) }
+
+// A place holding a variable-length value: its end in the fixed part.
+fn isVarKind(k: byte): bool { return k == PK_NUM || k == PK_TEXT || k == PK_UUID || k == PK_BYTEA }
+
+// The word of v for a place of word kind k; None: v is not of k's kind, or
+// does not fit its width.
+fn wordOf(v: &Val, k: byte): Option[int] {
+    match v {
+        Val.Int(x) { if isIntKind(k) && intFits(k, x) { return Some(x) } }
+        Val.Date(x) { if k == PK_DATE && x >= -2147483648 && x <= 2147483647 { return Some(x) } }
+        Val.Time(x) { if k == PK_TIME { return Some(x) } }
+        Val.Ts(x) { if k == PK_TS { return Some(x) } }
+        Val.Tstz(x) { if k == PK_TSTZ { return Some(x) } }
+        Val.Float(x) { if k == PK_F8 { return Some(math.bitsOf(x)) } }
+        Val.Real(x) { if k == PK_F4 { return Some(math.bitsOf32Int(x)) } }
+        else {}
+    }
+    return None
+}
+
+// The value of word w at a place of word kind k.
+fn wordVal(k: byte, w: int): Val {
+    if k == PK_DATE { return Val.Date(w) }
+    if k == PK_TIME { return Val.Time(w) }
+    if k == PK_TS { return Val.Ts(w) }
+    if k == PK_TSTZ { return Val.Tstz(w) }
+    if k == PK_F8 { return Val.Float(math.fromBits(w)) }
+    if k == PK_F4 { return Val.Real(math.fromBits32Int(w & 0xFFFFFFFF)) }
+    return Val.Int(w)
+}
+
+// The bytes v takes in the variable part at a place of variable kind k;
+// None: v is not of k's kind.
+fn varBytes(v: &Val, k: byte): Option[str] {
+    match v {
+        Val.Text(x) { if k == PK_TEXT { return Some(x) } }
+        Val.Num(d) { if k == PK_NUM { return Some(d.toBin()) } }
+        Val.Uuid(u) { if k == PK_UUID { return Some(uuidBytes(&u)) } }
+        Val.Bytes(x) { if k == PK_BYTEA { return Some(x) } }
+        else {}
+    }
+    return None
+}
+
+// The value of a variable place of kind k: s[a..b].
+fn varVal(k: byte, s: &str, a: int, b: int): Result[Val, DbErr] {
+    if k == PK_TEXT { return Ok(Val.Text(s[a..b])) }
+    if k == PK_BYTEA { return Ok(Val.Bytes(s[a..b])) }
+    if k == PK_UUID {
+        if b - a != 16 { return Err(lexdb_base.corrupt("a uuid value in a row")) }
+        return Ok(Val.Uuid(uuidText(&s[a..b])))
+    }
+    match Decimal.fromBin(s, a, b - a) {
+        Ok(d) { return Ok(Val.Num(d)) }
+        Err(_) { return Err(lexdb_base.corrupt("a numeric value in a row")) }
+    }
+}
+
+// Whether a table's stored current layout (old) is the layout the table
+// would have now (cur) but for places of a kind 9.113 added, which old
+// has as text places: rows are then written in old, as they were before
+// (a value of the new kinds then makes its row tagged).
+fn olderKinds(old: &[]byte, cur: &[]byte): bool {
+    if len(old) != len(cur) { return false }
+    for i in 0..len(old) { if old[i] != cur[i] && !(old[i] == PK_TEXT && cur[i] >= PK_DATE) { return false } }
+    return true
+}
 
 // Whether integer v fits a place of kind k.
 fn intFits(k: byte, v: int): bool {
@@ -25585,10 +25730,11 @@ fn intFits(k: byte, v: int): bool {
     return false
 }
 
-// The integer of kind k at s[at..].
+// The word of kind k at s[at..] (by its width; signed).
 fn readIntK(s: &str, at: int, k: byte): int {
-    if k == PK_INT { return binary.readI64LEStr(s, at) }
-    if k == PK_INT4 { return binary.readI32LEStr(s, at) }
+    let w = fixedSize(k)
+    if w == 8 { return binary.readI64LEStr(s, at) }
+    if w == 4 { return binary.readI32LEStr(s, at) }
     return binary.readI16LEStr(s, at)
 }
 
@@ -25602,26 +25748,36 @@ fn encFixed(t: &Table, places: &[]Val): Option[str] {
     let kinds = &t.layouts[nl - 1]
     let n = len(kinds)
     if n > 255 || len(places) != n { return None }
-    // the table as it stands must have this layout as its current one
+    // the table as it stands must have this layout as its current one (or
+    // one stored before 9.113's kinds: olderKinds)
     let cur = placeKinds(t)
-    if !sameKinds(kinds, &cur) { return None }
+    if !sameKinds(kinds, &cur) && !olderKinds(kinds, &cur) { return None }
     var bits: []byte = array((n + 7) / 8, byte(0))
     var vars: []str = []
+    var words: []int = array(n, 0)
     for p in 0..n {
         let k = kinds[p]
         match places[p] {
             Val.Null { bits[p / 8] = bits[p / 8] | byte(1 << (p % 8)) }
-            Val.Int(v) { if !intFits(k, v) { return None } }
             Val.Bool(_) { if k != PK_BOOL { return None } }
-            Val.Num(d) {
-                if k != PK_NUM { return None }
-                append(mut &vars, d.toBin())
+            else {
+                if isWordKind(k) {
+                    match wordOf(&places[p], k) {
+                        Some(w) { words[p] = w }
+                        None { return None }
+                    }
+                } else if isVarKind(k) {
+                    match varBytes(&places[p], k) {
+                        Some(x) {
+                            if len(x) >= LONG { return None }
+                            append(mut &vars, x)
+                        }
+                        None { return None }
+                    }
+                } else {
+                    return None             // a value its place does not hold: the tagged form
+                }
             }
-            Val.Text(x) {
-                if k != PK_TEXT || len(x) >= LONG { return None }
-                append(mut &vars, x)
-            }
-            else { return None }        // the date and time kinds: the tagged form (9.76)
         }
     }
     var b = newStrBuf()
@@ -25632,14 +25788,15 @@ fn encFixed(t: &Table, places: &[]Val): Option[str] {
     var vi = 0
     for p in 0..n {
         let k = kinds[p]
-        if isIntKind(k) {
-            let v = match places[p] { Val.Int(v) { v } else { 0 } }
-            if k == PK_INT { binary.addU64LE(mut &b, v) }
-            else if k == PK_INT4 { binary.addU32LE(mut &b, v & 0xFFFFFFFF) }
+        if isWordKind(k) {
+            let v = words[p]
+            let w = fixedSize(k)
+            if w == 8 { binary.addU64LE(mut &b, v) }
+            else if w == 4 { binary.addU32LE(mut &b, v & 0xFFFFFFFF) }
             else { binary.addU16LE(mut &b, v & 0xFFFF) }
         } else if k == PK_BOOL {
             b.addByte(match places[p] { Val.Bool(x) { if x { 1 } else { 0 } } else { 0 } })
-        } else if k == PK_NUM || k == PK_TEXT {
+        } else if isVarKind(k) {
             if !isNull(&places[p]) {
                 end += len(vars[vi])
                 vi += 1
@@ -25664,16 +25821,12 @@ fn layOf(s: &str, lays: &[]FixedLay): Result[int, DbErr] {
 // The value of kind k at place p of row s in layout lay (not NULL).
 fn fixedVal(s: &str, p: int, k: byte, lay: &FixedLay): Result[Val, DbErr] {
     let at = lay.off[p]
-    if isIntKind(k) { return Ok(Val.Int(readIntK(s, at, k))) }
+    if isWordKind(k) { return Ok(wordVal(k, readIntK(s, at, k))) }
     if k == PK_BOOL { return Ok(Val.Bool(s[at] == 1)) }
     let end = binary.readU16LEStr(s, at)
     let start = if lay.prev[p] < 0 { 0 } else { binary.readU16LEStr(s, lay.prev[p]) }
     if start > end || lay.v0 + end > len(s) { return Err(lexdb_base.corrupt("a row's variable part")) }
-    if k == PK_TEXT { return Ok(Val.Text(s[lay.v0 + start..lay.v0 + end])) }
-    match Decimal.fromBin(s, lay.v0 + start, end - start) {
-        Ok(d) { return Ok(Val.Num(d)) }
-        Err(_) { return Err(lexdb_base.corrupt("a numeric value in a row")) }
-    }
+    return varVal(k, s, lay.v0 + start, lay.v0 + end)
 }
 
 // decRowNeed for a row in the fixed layout.
@@ -25719,7 +25872,7 @@ fn layOfKinds(kinds: &[]byte): FixedLay {
     for p in 0..np {
         off[p] = at
         let k = kinds[p]
-        if k == PK_NUM || k == PK_TEXT {
+        if isVarKind(k) {
             prev[p] = lastVar
             lastVar = at
         }

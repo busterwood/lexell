@@ -10586,3 +10586,103 @@ off passes agreed within 4% on the geometric mean and 1% on `qL.txt`):
 - Keys are front coded (3.1 bytes a row of w); the study stored an integer
   key as a column (about 1).
 - No FSST, no byte-aligned variants, no larger pages (as decided).
+
+### 9.113 Dates, times, floats, uuids and byteas in the fixed layout; leaves skipped by time ranges
+
+9.112's column leaves take only rows in the fixed layout (9.50). Reviewing
+it showed that any row with a value of date, time, timestamp, timestamptz,
+double precision, real, uuid or bytea was in the tagged form, and so was
+its whole leaf, since 9.76 said "the fixed layout does not take them yet".
+A table with a `created_at`, as most have, therefore got no column leaves
+at all. Long texts (over `LONG`) still make a row tagged, leaf by leaf.
+
+**The kinds** (`PK_*`, the same bytes in `lexdb_cols`' `K_*`):
+
+| Kind | Byte | In the fixed part | Its value |
+|---|---|---|---|
+| `PK_DATE` | 7 | 4-byte word | days (`Val.Date`; outside int32: the tagged form) |
+| `PK_TIME` | 8 | 8-byte word | microseconds (`Val.Time`) |
+| `PK_TS` | 9 | 8-byte word | microseconds (`Val.Ts`) |
+| `PK_TSTZ` | 10 | 8-byte word | microseconds since the epoch, UTC (`Val.Tstz`) |
+| `PK_F8` | 11 | 8-byte word | the double's bits (`math.bitsOf`) |
+| `PK_F4` | 12 | 4-byte word | the real's bits |
+| `PK_UUID` | 13 | variable (its end) | its 16 bytes |
+| `PK_BYTEA` | 14 | variable (its end) | its bytes |
+
+- **The helpers:**
+  - `wordOf` (a value to its word, None if not of the place's kind) and
+    `wordVal`;
+  - `varBytes` and `varVal`;
+  - `isWordKind` and `isVarKind`, with `readIntK` reading by width.
+
+  `encFixed`, `fixedVal` and `layOfKinds` use them, so every reader of a
+  fixed row (the batches, the row path, `decFixed`) sees the new kinds.
+- **In column leaves** the words are integers to the codec (`C_FOR`
+  bit-packed, or `C_RAW`), with their least and greatest. Uuids and byteas
+  take the codec's text form (`C_TEXT`), never a dictionary. `cCols` gives
+  each word back as its value (`wordVal`) and each uuid or bytea by
+  `varVal`.
+- **Tables made before 9.113:**
+  - **Before their catalog row is written again.** Their stored current
+    layout has text places where `placeKinds` now gives the new kinds.
+    `encFixed` keeps writing in it (`olderKinds`: places equal, or the
+    stored one text and the current one of 9.113's kinds). So a row with
+    a NULL date is fixed and one with a date tagged, exactly as before.
+  - **After their next CREATE or ALTER** (its catalog row written,
+    `encTable` adding the current layout), new rows take the new kinds.
+  - **Rows already written** keep their form; all forms are read.
+  - Tested with a switch that makes `placeKinds` give the old kinds
+    (`setLegacyKinds`).
+
+**Leaves skipped by time ranges.** 9.112 skipped column leaves only by
+integer columns' least and greatest. A condition comparing a date, time,
+timestamp or timestamptz column with a value of its own type
+(`BNode.ValCmp`, whose constant `bValCmpOf` has already made the column's
+type in the session's zone) now gives a range too (`cRangesOf`,
+`cRangeAdd`). Values of one such type compare as their words do.
+- **A range records the kind it is of:** 0 for any integer kind, else the
+  date or time kind. A leaf's place must be of that kind for the range to
+  apply, so a column retyped (a date made a timestamp) does not compare
+  its older leaves' days with microseconds.
+- **Floats are not ranged:** their bits are not in their order.
+- `BPlan.ranges` is now (place, kind, least, greatest) per range.
+
+**Measured.** An events table, 1M rows: id bigint, `at` timestamptz
+following the key (31 s apart), kind, user_id, amount numeric, ok
+boolean, note text. Loaded and analysed by each build; server CPU ms,
+median of 3, under the shared lock:
+
+| | 9.112 (tagged rows) | 9.113 |
+|---|---:|---:|
+| data file | 65 MB | **24 MB** |
+| leaves | 16,336 rows | 5,882 columns |
+| `count(*)` | 35 | **26** |
+| one day, `count`, `sum(amount)` | 174 | **8** |
+| one week, by kind | 112 | **11** |
+| six hours of rows (697) | 91 | **3** |
+| `where user_id = 4242` | 59 | **13** |
+| by kind, whole table | 190 | **117** |
+| the load (wall) | 5.3 s | 6.2 s |
+
+**Checked:**
+- **Values:** a table of every new type with NULLs, 20,000 rows. Its
+  output was the same:
+  - with column leaves on and off;
+  - as 9.112's build (tagged rows) gives;
+  - as PostgreSQL 18 gives, 47 lines in America/New_York.
+- **Edges:** a date of 4713 BC and one of 294276, timestamps at ±infinity,
+  -0, NaN and ±Infinity doubles, a real at its greatest. All read back as
+  written through a checkpoint (`exec_rowkinds`).
+- **The fuzz tables, unchanged** (dates, timestamptz, doubles, long
+  varchars): now in column leaves. 2,200 queries were the same with
+  column leaves on and off, plus 700 with batches on and off.
+
+**Tests:** new `exec_rowkinds`:
+- a new table's rows all fixed;
+- values as written, after a checkpoint (column leaves), with batches off;
+- five date and time ranges skipping leaves, with the row path's rows;
+- a pre-9.113 table writing as before, then after ALTER in its new layout;
+- the edges.
+
+The suite passes (126), also with `LEXDB_COLCHECK=1`. Crash runs, 6 rounds
+in each I/O mode, pass.
