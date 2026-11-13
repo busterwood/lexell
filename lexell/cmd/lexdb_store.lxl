@@ -69,9 +69,10 @@ type SlotMeta = value record {
     frame: int          // loaded: its node, pool[frame]; -1 when not (a slot not in memory holds no node)
 }
 
-// A descent's leaf, with the separators around it: keys in [lo, hi) (no lo:
-// from the start; no hi: to the end) reach it by path, as of Db.shape.
-type LastLeaf = record { tree: int; shape: int; path: []int; lo: str; hasLo: bool; hi: str; hasHi: bool }
+// A descent's path, with the separators around each node on it: keys in
+// [lo[j], hi[j]) (no lo: from the start; no hi: to the end) reach path[j]
+// by path[0..j], as of Db.shape. The leaf is the last.
+type LastLeaf = record { tree: int; shape: int; path: []int; lo: []str; hasLo: []bool; hi: []str; hasHi: []bool }
 
 // An old version of a node, kept while a snapshot can see it: the commits
 // [since, until) saw it.
@@ -124,6 +125,8 @@ pub type Db = record {
     shape: int
     nextTree: int
     npages: int
+    fileEnd: int                // the data file's bytes, written or reserved (reserveAhead)
+    reserving: bool             // false once reserving space has failed: the file then grows by its writes
     free: []int                 // pages free now: runs, (first, count) pairs, highest first (9.33)
     freeAfterNext: []int        // pages the next checkpoint frees
     pendingFree: []int          // runs the checkpoint in flight frees when durable
@@ -181,7 +184,9 @@ pub type Db = record {
     pub aheadPages: int
     pub evictions: int
     pub flushes: int
+    pub logBytes: int           // bytes the log writer wrote (frames, padding included)
     pub checkpoints: int
+    pub pagesWritten: int       // pages checkpoints wrote (meta pages included)
     pub held: int               // commits held for a checkpoint (the cache over twice its budget)
     pub wholes: int             // large values read whole: their chunks read (9.31)
 }
@@ -919,18 +924,46 @@ type Descent = record {
 }
 
 fn (db: mut &Db) descend(tree: int, k: &str): Descent {
-    // the last descent's leaf, when k is between its fences: a commit's
-    // writes in key order (a load, a range deleted) mostly go to the leaf
-    // the one before went to
-    if db.lastLeaf.shape == db.shape && db.lastLeaf.tree == tree && (!db.lastLeaf.hasLo || k >= db.lastLeaf.lo) &&
-       (!db.lastLeaf.hasHi || k < db.lastLeaf.hi) {
-        return Descent{path: collections.copyOf(&db.lastLeaf.path), need: -1, upper: db.lastLeaf.hi, hasUpper: db.lastLeaf.hasHi}
-    }
+    // From the last descent's path, at the deepest node whose separators
+    // hold k (a finger): a commit's writes in key order (a load, a range
+    // deleted, and every large commit's since 9.110: commitOrder) mostly
+    // go to the leaf the one before went to, or to one near it.
     var d = Descent{path: [], need: -1, upper: "", hasUpper: false}
-    var s = match db.trees.get(&tree) { Some(r) { r } None { -1 } }
-    if s < 0 { return d }
+    var s = -1
     var lo = ""
     var hasLo = false
+    var los: []str = []
+    var hasLos: []bool = []
+    var his: []str = []
+    var hasHis: []bool = []
+    if db.lastLeaf.shape == db.shape && db.lastLeaf.tree == tree && len(db.lastLeaf.path) > 0 {
+        var j = len(db.lastLeaf.path) - 1
+        while j > 0 && !((!db.lastLeaf.hasLo[j] || k >= db.lastLeaf.lo[j]) && (!db.lastLeaf.hasHi[j] || k < db.lastLeaf.hi[j])) { j -= 1 }
+        if j == len(db.lastLeaf.path) - 1 {
+            for x in 0..len(db.lastLeaf.path) {
+                let sl = db.lastLeaf.path[x]
+                db.meta[sl].ref = true
+            }
+            return Descent{path: collections.copyOf(&db.lastLeaf.path), need: -1, upper: db.lastLeaf.hi[j], hasUpper: db.lastLeaf.hasHi[j]}
+        }
+        for x in 0..j {
+            let sl = db.lastLeaf.path[x]
+            db.meta[sl].ref = true
+            append(mut &d.path, sl)
+            append(mut &los, db.lastLeaf.lo[x])
+            append(mut &hasLos, db.lastLeaf.hasLo[x])
+            append(mut &his, db.lastLeaf.hi[x])
+            append(mut &hasHis, db.lastLeaf.hasHi[x])
+        }
+        s = db.lastLeaf.path[j]
+        lo = db.lastLeaf.lo[j]
+        hasLo = db.lastLeaf.hasLo[j]
+        d.upper = db.lastLeaf.hi[j]
+        d.hasUpper = db.lastLeaf.hasHi[j]
+    } else {
+        s = match db.trees.get(&tree) { Some(r) { r } None { -1 } }
+        if s < 0 { return d }
+    }
     while true {
         if !db.meta[s].loaded {
             d.need = s
@@ -938,8 +971,12 @@ fn (db: mut &Db) descend(tree: int, k: &str): Descent {
         }
         db.meta[s].ref = true
         append(mut &d.path, s)
+        append(mut &los, lo)
+        append(mut &hasLos, hasLo)
+        append(mut &his, d.upper)
+        append(mut &hasHis, d.hasUpper)
         if db.pool[db.meta[s].frame].leaf {
-            db.lastLeaf = LastLeaf{tree: tree, shape: db.shape, path: collections.copyOf(&d.path), lo: lo, hasLo: hasLo, hi: d.upper, hasHi: d.hasUpper}
+            db.lastLeaf = LastLeaf{tree: tree, shape: db.shape, path: collections.copyOf(&d.path), lo: los, hasLo: hasLos, hi: his, hasHi: hasHis}
             return d
         }
         let i = childIndex(&db.pool[db.meta[s].frame].keys, k)
@@ -2544,9 +2581,45 @@ pub fn (st: &Store) commitAhead(t0: Txn): Result[Unit, lexdb_base.DbErr] {
     return r
 }
 
+// The order a commit checks and applies its writes in (9.110): by tree and
+// key within each run of puts and deletes, stably (a key's writes keep
+// their order, so the last still wins), with creates and drops where they
+// are. Each descent then starts where the one before ended (descend's
+// finger), and the writes to one leaf come together. The final state is
+// the same in any order (each key's last write; the trees' shapes may
+// differ). The log keeps the writes as made. A commit of fewer than
+// ORDER_MIN writes keeps their order: sorting would cost more than it saves.
+const ORDER_MIN = 32
+
+fn commitOrder(ws: &[]TxWrite): []int {
+    var ix: []int = withCapacity(len(ws))
+    for i in 0..len(ws) { append(mut &ix, i) }
+    if len(ws) < ORDER_MIN { return ix }
+    var a = 0
+    while a < len(ws) {
+        if ws[a].op != OP_PUT && ws[a].op != OP_DEL {
+            a += 1
+            continue
+        }
+        var b = a
+        while b < len(ws) && (ws[b].op == OP_PUT || ws[b].op == OP_DEL) { b += 1 }
+        if b - a > 1 {
+            var run = collections.copyRange(&ix, a, b)
+            collections.sortBy(mut &run, fn(x, y) {
+                if ws[x].tree != ws[y].tree { return if ws[x].tree < ws[y].tree { -1 } else { 1 } }
+                return if ws[x].key < ws[y].key { -1 } else if ws[y].key < ws[x].key { 1 } else { 0 }
+            })
+            for j in 0..len(run) { ix[a + j] = run[j] }
+        }
+        a = b
+    }
+    return ix
+}
+
 fn (st: &Store) commitLive(t: Txn, durable: bool): Result[Unit, lexdb_base.DbErr] {
     var wait: []task.Future[Result[Unit, lexdb_base.DbErr]] = []
     var wake: []task.Promise[Unit] = []
+    let order = commitOrder(&t.writes)
     while true {
         var needs: []int = []
         var bad: []lexdb_base.DbErr = []
@@ -2582,8 +2655,8 @@ fn (st: &Store) commitLive(t: Txn, durable: bool): Result[Unit, lexdb_base.DbErr
             // 9.109). Each pass's descents mark the nodes they pass, so
             // loadMany's sweep keeps them.
             var seen: Map[int, int] = newMap()
-            for w in t.writes {
-                let n = db.writeNeeds(&w)
+            for i in order {
+                let n = db.writeNeeds(&t.writes[i])
                 if n >= 0 && !seen.has(&n) {
                     seen.put(n, 1)
                     append(mut &needs, n)
@@ -2600,8 +2673,8 @@ fn (st: &Store) commitLive(t: Txn, durable: bool): Result[Unit, lexdb_base.DbErr
                 db.seq += 1
                 db.logWrites(&t)
                 db.reserveBatch(&t)
+                for i in order { db.applyWrite(&t.writes[i]) }
                 for w in t.writes {
-                    db.applyWrite(&w)
                     addRecord(mut &db.batch, &w)
                     db.batchCount += 1
                 }
@@ -3180,6 +3253,7 @@ pub fn writer(st: Store): int {
             db.seg = segNo
             db.segOff = segOff
             db.flushes += 1
+            db.logBytes += len(fr)
             db.logSinceCkpt += len(fr)
             var keep: []Waiter = []
             while len(db.waiters) > 0 {
@@ -3373,6 +3447,33 @@ fn (db: mut &Db) encodeSlot(s: int, n: int, out: mut &[]PageOut): int {
 // A checkpoint of everything applied so far, waiting first for one that
 // is running (checkpoint returns at once then): at shutdown, so the next
 // start replays nothing.
+// ---- the data file's space (9.110)
+//
+// A checkpoint's new pages go past the file's end, in runs written several
+// at once (9.63). Written so, each write allocates its own extent, and on
+// btrfs (copy-on-write off, 9.61) the runs of one checkpoint land wherever
+// the allocator had room as they came: a 1M-row load left 452 extents of
+// 64 pages, and read at two thirds of a copy's speed. Space reserved ahead
+// in large steps (fallocate) is laid out in a few large extents, which the
+// writes then fill in place.
+
+const RESERVE_MIN = 4 * 1024 * 1024        // the least a reservation adds
+const RESERVE_MAX = 256 * 1024 * 1024      // the most beyond what is needed
+const RESERVE_ALIGN = 1024 * 1024
+
+// The range [from, to) of the data file to reserve before this
+// checkpoint's pages are written, or nothing when its pages fit: the pages
+// needed, and an eighth of the file more (at least RESERVE_MIN, at most
+// RESERVE_MAX), so the file grows in about log(size) steps and at most an
+// eighth of it is reserved and unused.
+fn (db: &Db) reserveAhead(): []int {
+    let need = db.npages * PAGE
+    if !db.reserving || need <= db.fileEnd { return [] }
+    let step = min(max(db.fileEnd / 8, RESERVE_MIN), RESERVE_MAX)
+    let to = (max(need, db.fileEnd + step) + RESERVE_ALIGN - 1) / RESERVE_ALIGN * RESERVE_ALIGN
+    return [db.fileEnd, to]
+}
+
 pub fn (st: &Store) checkpointAll(): Result[Unit, lexdb_base.DbErr] {
     if st.fo.isSome() { return Ok(Unit{}) }        // a replica writes nothing
     while true {
@@ -3403,6 +3504,8 @@ pub fn (st: &Store) checkpoint(): Result[Unit, lexdb_base.DbErr] {
     var fs = lexdb_disk.Fs.Real("")
     var todo: []int = []
     var most = 0
+    var reserve: []int = []
+    var ckPages = 0
     st.sh.with(fn(db: mut &Db) {
         if len(db.failed) > 0 {
             append(mut &bad, db.failed[0])
@@ -3509,10 +3612,18 @@ pub fn (st: &Store) checkpoint(): Result[Unit, lexdb_base.DbErr] {
                                 nextTree: db.nextTree, dropped: if len(dropPages) > 0 { dropPages[0] } else { 0 },
                                 covers: target}
         metaPage = lexdb_page.encodeMeta(&m, n % 2)
+        reserve = db.reserveAhead()
+        ckPages = db.npages
         for s in 1..db.seg { if db.holdSeg < 0 || s < db.holdSeg { append(mut &oldSegs, s) } }
     })
     if len(bad) > 0 { return Err(bad[0]) }
     if busy { return Ok(Unit{}) }
+    if len(reserve) == 2 {
+        let ok = f.reserve(reserve[0], reserve[1] - reserve[0]).isOk()
+        st.sh.with(fn(db: mut &Db) {
+            if ok { db.fileEnd = max(db.fileEnd, reserve[1]) } else { db.reserving = false }
+        })
+    }
     let r = st.finishCheckpoint(&f, &out, &metaPage, n, target)
     var done: []task.Promise[Unit] = []
     match r {
@@ -3533,6 +3644,7 @@ pub fn (st: &Store) checkpoint(): Result[Unit, lexdb_base.DbErr] {
             db.free = mergeRuns(&db.free, &pf)
         }
         db.listPages = replace(mut &newLists, [])
+        db.fileEnd = max(db.fileEnd, ckPages * PAGE)
         db.ckptRunning = false
         db.logSinceCkpt = 0
         db.checkpoints += 1
@@ -3567,7 +3679,7 @@ const RUNS_IN_FLIGHT = 16       // runs written at once (32 and 64 measured no f
 // (4 MiB, and as much again in the writes' aligned buffers). A page listed
 // twice is written once, as the later of its entries (as the writes in
 // order left it).
-fn writeCheckpointPages(f: &lexdb_disk.File, out: &[]PageOut): Result[Unit, lexdb_base.DbErr] {
+fn writeCheckpointPages(f: &lexdb_disk.File, out: &[]PageOut, written: mut &int): Result[Unit, lexdb_base.DbErr] {
     var ix: []int = []
     for i in 0..len(out) { append(mut &ix, i) }
     collections.sortBy(mut &ix, fn(a, b) {
@@ -3580,6 +3692,7 @@ fn writeCheckpointPages(f: &lexdb_disk.File, out: &[]PageOut): Result[Unit, lexd
         if i + 1 < len(ix) && out[ix[i + 1]].no == out[ix[i]].no { continue }
         append(mut &keep, ix[i])
     }
+    written = len(keep)
     var starts: []int = []
     for i in 0..len(keep) {
         let k = len(starts)
@@ -3616,7 +3729,8 @@ fn writeCheckpointPages(f: &lexdb_disk.File, out: &[]PageOut): Result[Unit, lexd
 }
 
 fn (st: &Store) finishCheckpoint(f: &lexdb_disk.File, out: &[]PageOut, metaPage: &[]byte, n: int, target: int): Result[Unit, lexdb_base.DbErr] {
-    try writeCheckpointPages(f, out)
+    var written = 0
+    try writeCheckpointPages(f, out, mut &written)
     // The log must hold every commit this checkpoint includes before its
     // meta page may name it (otherwise recovery could mix a commit's rows).
     var wait: []task.Future[Result[Unit, lexdb_base.DbErr]] = []
@@ -3639,6 +3753,7 @@ fn (st: &Store) finishCheckpoint(f: &lexdb_disk.File, out: &[]PageOut, metaPage:
     try f.flush()
     try f.write((n % 2) * PAGE, metaPage)
     try f.flush()
+    st.sh.with(fn(db: mut &Db) { db.pagesWritten += written + 1 })
     return Ok(Unit{})
 }
 
@@ -3674,13 +3789,13 @@ pub fn checkpointer(st: Store): int {
 
 fn newDb(fs: lexdb_disk.Fs, data: lexdb_disk.File, opts: Options, m: &lexdb_page.Meta): Db {
     return Db{opts: opts, fs: fs, data: data, watched: -1, watchedWrites: 0, pool: [], owner: [], meta: [], freeSlots: [], loadedCount: 0, cacheUsed: 0, wlog: [], wlogFloor: 0, hand: 0,
-              trees: newMap(), lastLeaf: LastLeaf{tree: -1, shape: -1, path: [], lo: "", hasLo: false, hi: "", hasHi: false}, shape: 0, nextTree: m.nextTree, npages: m.npages, free: [], freeAfterNext: [],
+              trees: newMap(), lastLeaf: LastLeaf{tree: -1, shape: -1, path: [], lo: [], hasLo: [], hi: [], hasHi: []}, shape: 0, nextTree: m.nextTree, npages: m.npages, fileEnd: 0, reserving: true, free: [], freeAfterNext: [],
               pendingFree: [], dropped: [], dropReads: DROP_READS, memo: newMap(), listPages: [], ckpt: m.ckpt, durableCkpt: m.ckpt, ckptRunning: false,
               batch: [], batchCount: 0, batchNo: m.replayBatch, appliedBatch: m.replayBatch - 1,
               durableBatch: m.replayBatch - 1, waiters: [], locks: newMap(), lockWaits: [], waitFor: newMap(), nextLock: 0, writerWake: [], ckptWake: [], ckptDone: [], seg: m.replaySeg,
               segOff: m.replayOff, logSinceCkpt: 0, failed: [], closing: false, seq: 0, snaps: [], nextSnap: 0,
               hist: [], histCount: 0, histSlots: [], deferred: [], rootHist: [], durableSeq: 0, holds: newMap(), holdCkpt: -1, holdSeg: -1, heldFree: [], changeWake: [], durWaits: [], nextDurWait: 0, ckptCovers: m.covers, snapshots: 0, tooOld: 0, commits: 0,
-              conflicts: 0, loads: 0, aheadReads: 0, aheadPages: 0, evictions: 0, flushes: 0, checkpoints: 0, held: 0, wholes: 0}
+              conflicts: 0, loads: 0, aheadReads: 0, aheadPages: 0, evictions: 0, flushes: 0, logBytes: 0, checkpoints: 0, pagesWritten: 0, held: 0, wholes: 0}
 }
 
 // Opens the store in fs (creating it when it is new) and recovers: the last
@@ -3713,6 +3828,7 @@ pub fn open(fs: lexdb_disk.Fs, opts: Options): Result[Store, lexdb_base.DbErr] {
     let runs = try lexdb_page.readList(&data, m.runs, mut &lists)
     let dropped = try lexdb_page.readList(&data, m.dropped, mut &lists)
     var db = newDb(fs, data, opts, &m)
+    db.fileEnd = size
     db.free = mergeRuns(&runsOf(&free), &runs)
     var d = 0
     while d + 1 < len(dropped) {
@@ -3935,7 +4051,9 @@ pub type Stats = value record {
     pub aheadPages: int
     pub evictions: int
     pub flushes: int
+    pub logBytes: int
     pub checkpoints: int
+    pub pagesWritten: int
     pub loaded: int
     pub cacheUsed: int          // about the bytes the loaded nodes take
     pub held: int
@@ -4129,12 +4247,12 @@ pub fn (st: &Store) holdNowFor(id: int): int {
 }
 
 pub fn (st: &Store) stats(): Stats {
-    var s = Stats{commits: 0, conflicts: 0, loads: 0, aheadReads: 0, aheadPages: 0, evictions: 0, flushes: 0, checkpoints: 0, loaded: 0,
+    var s = Stats{commits: 0, conflicts: 0, loads: 0, aheadReads: 0, aheadPages: 0, evictions: 0, flushes: 0, logBytes: 0, checkpoints: 0, pagesWritten: 0, loaded: 0,
                   cacheUsed: 0, held: 0, pages: 0, free: 0, freeRuns: 0, dropped: 0, wholes: 0}
     st.sh.with(fn(db: mut &Db) {
         s = Stats{commits: db.commits, conflicts: db.conflicts, loads: db.loads, aheadReads: db.aheadReads,
                   aheadPages: db.aheadPages, evictions: db.evictions,
-                  flushes: db.flushes, checkpoints: db.checkpoints, loaded: db.loadedCount,
+                  flushes: db.flushes, logBytes: db.logBytes, checkpoints: db.checkpoints, pagesWritten: db.pagesWritten, loaded: db.loadedCount,
                   cacheUsed: db.cacheUsed, held: db.held, pages: db.npages,
                   free: runPages(&db.free), freeRuns: len(db.free) / 2, dropped: len(db.dropped) / 2, wholes: db.wholes}
     })
