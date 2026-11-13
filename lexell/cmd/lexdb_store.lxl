@@ -198,6 +198,12 @@ pub type Db = record {
     pub colLeaves: int
     pub rowLeaves: int
     colsOff: bool               // no column leaves written (setColumns)
+    // per spec: a column leaf's page bytes per 1000 of its rows' T_FLEAF
+    // bytes, as last sampled (0 not yet, -1 its rows did not encode), and
+    // the leaves split since (leafRoom)
+    specRatio: []int
+    specSplits: []int
+    pub refitCuts: int          // leaves a checkpoint cut to fit their pages (refit)
 }
 
 // A handle to an open store; copies reach the same store. A replica's
@@ -1141,39 +1147,240 @@ fn (db: mut &Db) split(s: int, atEnd: bool, at: int): Descent {
 }
 
 // After path[j] grew past a page, split it and the parents that overflow
-// in turn; a split root gets a new root above it.
+// in turn; a split root gets a new root above it. A table's leaf may hold
+// more rows than a page of rows, as many as a column leaf holds (leafRoom).
 fn (db: mut &Db) fixOverflow(tree: int, path: &[]int, from: int, atEnd: bool, ins: int) {
     var j = from
     var end = atEnd
     while j >= 0 {
         let s = path[j]
-        if db.pool[db.meta[s].frame].size <= lexdb_page.NODE_ROOM { return }
+        let room = if db.pool[db.meta[s].frame].leaf { db.leafRoom(tree, s) } else { lexdb_page.NODE_ROOM }
+        if db.pool[db.meta[s].frame].size <= room { return }
         let sp = db.split(s, end, if j == len(path) - 1 { ins } else { -1 })
-        let r = sp.path[0]
-        if j == 0 {
-            let root = lexdb_page.Node{leaf: false, keys: [sp.upper], vals: [], kids: [s, r], size: 0, packed: false, lazy: false, body: "", ents: [], cols: "", cdir: []}
-            var rn = root
-            rn.size = nodeSize(&rn)
-            let ns = db.newNode(rn)
-            db.meta[s].root = false
-            db.meta[ns].root = true
-            db.recost(s)
-            db.setRoot(tree, ns)
-            return
-        }
-        let p = path[j - 1]
-        db.willChange(p)
-        var at = 0
-        while db.pool[db.meta[p].frame].kids[at] != s { at += 1 }
-        db.shape += 1
-        insertStr(mut &db.pool[db.meta[p].frame].keys, at, sp.upper)
-        collections.insert(mut &db.pool[db.meta[p].frame].kids, at + 1, r)
-        end = end && at + 2 == len(db.pool[db.meta[p].frame].kids)     // the new child is the parent's last
-        db.pool[db.meta[p].frame].size += lexdb_page.kidEntry(&sp.upper)
-        db.meta[p].version += 1
-        db.pool[db.meta[p].frame].packed = false
-        db.recost(p)
+        if room > lexdb_page.NODE_ROOM { db.noteSplit(tree) }
+        end = db.hang(tree, path, j, &sp, end)
+        if j == 0 { return }
         j -= 1
+    }
+}
+
+// Hangs the right node of path[j]'s split (sp: its slot and separator)
+// beside it, in its parent, or under a new root when path[j] is the root.
+// Whether the new node is its parent's last, with atEnd (fixOverflow's end).
+fn (db: mut &Db) hang(tree: int, path: &[]int, j: int, sp: &Descent, atEnd: bool): bool {
+    let s = path[j]
+    let r = sp.path[0]
+    if j == 0 {
+        let root = lexdb_page.Node{leaf: false, keys: [sp.upper], vals: [], kids: [s, r], size: 0, packed: false, lazy: false, body: "", ents: [], cols: "", cdir: []}
+        var rn = root
+        rn.size = nodeSize(&rn)
+        let ns = db.newNode(rn)
+        db.meta[s].root = false
+        db.meta[ns].root = true
+        db.recost(s)
+        db.setRoot(tree, ns)
+        return atEnd
+    }
+    let p = path[j - 1]
+    db.willChange(p)
+    var at = 0
+    while db.pool[db.meta[p].frame].kids[at] != s { at += 1 }
+    db.shape += 1
+    insertStr(mut &db.pool[db.meta[p].frame].keys, at, sp.upper)
+    collections.insert(mut &db.pool[db.meta[p].frame].kids, at + 1, r)
+    let end = atEnd && at + 2 == len(db.pool[db.meta[p].frame].kids)     // the new child is the parent's last
+    db.pool[db.meta[p].frame].size += lexdb_page.kidEntry(&sp.upper)
+    db.meta[p].version += 1
+    db.pool[db.meta[p].frame].packed = false
+    db.recost(p)
+    return end
+}
+
+// ---- table leaves of a column leaf's rows (9.112)
+//
+// A column leaf holds more rows than a page of rows (about 73 of w's
+// against 43). So a changed leaf of a table tree with layouts is split
+// when its rows pass what a column leaf of them is estimated to hold: a
+// page's bytes over the tree's ratio of column bytes to row bytes, as last
+// sampled (an encoding of the leaf being split, at first and every 64th
+// split after), less 4%. A checkpoint then makes sure (refit): a changed
+// leaf over a page of rows is written as a column leaf if it fits one, and
+// is cut into leaves that do if not (or into leaves of a page of rows
+// each, when its rows do not encode).
+
+const CAP_LEAF = 4 * lexdb_page.NODE_ROOM      // the most row bytes a leaf holds in memory
+const COL_ROOM = lexdb_page.PAGE - 22          // a column leaf's keys and columns at most
+
+// The bytes leaf s of tree may take before it splits.
+fn (db: mut &Db) leafRoom(tree: int, s: int): int {
+    let size = db.pool[db.meta[s].frame].size
+    if size <= lexdb_page.NODE_ROOM || !lexdb_cols.on() || db.colsOff { return lexdb_page.NODE_ROOM }
+    let i = match db.colSpecs.get(&tree) {
+        Some(x) { x }
+        None { return lexdb_page.NODE_ROOM }
+    }
+    // sampled at first, and when a leaf is about to split (it is about
+    // as full as a column leaf then: a ratio taken from a leaf of fewer
+    // rows counts its dictionaries and headers more)
+    if db.specRatio[i] == 0 || (db.specSplits[i] >= 64 && size > roomOf(db.specRatio[i])) {
+        db.specSplits[i] = 0
+        let f = db.meta[s].frame
+        let e = lexdb_page.colSize(&db.pool[f], 0, db.pool[f].count(), &db.specs[i])
+        db.noteRatio(i, e, size)
+        if e >= 0 && e <= lexdb_page.PAGE && size <= CAP_LEAF { return size }        // fits as it is
+    }
+    return roomOf(db.specRatio[i])
+}
+
+// The row bytes a column leaf holds at ratio r (noteRatio's), less 3%.
+fn roomOf(r: int): int {
+    if r <= 0 { return lexdb_page.NODE_ROOM }
+    let room = COL_ROOM * 1000 / r * 97 / 100
+    return if room < lexdb_page.NODE_ROOM { lexdb_page.NODE_ROOM } else if room > CAP_LEAF { CAP_LEAF } else { room }
+}
+
+// A sample of spec i's leaves: e page bytes as a column leaf (-1: its rows
+// did not encode) for size bytes of rows.
+fn (db: mut &Db) noteRatio(i: int, e: int, size: int) {
+    if e < 0 {
+        if db.specRatio[i] == 0 { db.specRatio[i] = -1 }
+        return
+    }
+    let r = e * 1000 / size + 1
+    db.specRatio[i] = if db.specRatio[i] <= 0 { r } else { (db.specRatio[i] * 3 + r) / 4 }
+}
+
+fn (db: mut &Db) noteSplit(tree: int) {
+    match db.colSpecs.get(&tree) {
+        Some(i) { db.specSplits[i] += 1 }
+        None {}
+    }
+}
+
+// Splits leaf path[last] of tree before its entry m (0 < m < count): the
+// entries from m go to a new leaf beside it; parents that overflow split
+// in turn.
+fn (db: mut &Db) cutLeaf(tree: int, path: &[]int, m: int) {
+    let j = len(path) - 1
+    let s = path[j]
+    db.shape += 1
+    db.willChange(s)
+    db.pool[db.meta[s].frame].loosen()
+    let n = db.pool[db.meta[s].frame].count()
+    var right = lexdb_page.newNode(true)
+    for i in m..n {
+        append(mut &right.keys, db.pool[db.meta[s].frame].keys[i])
+        append(mut &right.vals, db.pool[db.meta[s].frame].vals[i])
+    }
+    for i in m..n {
+        let k = pop(mut &db.pool[db.meta[s].frame].keys)
+        let v = pop(mut &db.pool[db.meta[s].frame].vals)
+    }
+    let sep = lexdb_base.own(&right.keys[0])
+    db.pool[db.meta[s].frame].size = nodeSize(&db.pool[db.meta[s].frame])
+    right.size = nodeSize(&right)
+    db.meta[s].version += 1
+    db.pool[db.meta[s].frame].packed = false
+    db.recost(s)
+    let r = db.newNode(right)
+    let sp = Descent{path: [r], need: -1, upper: sep, hasUpper: true}
+    let end = db.hang(tree, path, j, &sp, false)
+    if j > 0 { db.fixOverflow(tree, path, j - 1, false, -1) }
+}
+
+// Before a checkpoint writes the trees: every changed leaf of a table tree
+// over a page of rows becomes a column leaf that fits a page, or is cut
+// into leaves that do (refitLeaf).
+fn (db: mut &Db) refit() {
+    for x in 0..db.colSpecs.size() {
+        let tree: int = db.colSpecs.keyAt(x)
+        let i: int = db.colSpecs.valAt(x)
+        let root = match db.trees.get(&tree) {
+            Some(r) { r }
+            None { -1 }
+        }
+        if root < 0 || !db.meta[root].dirty { continue }
+        // the first keys of the leaves to fit: changed nodes only (a
+        // changed node's parents are changed, and in memory)
+        var firsts: []str = []
+        var stack = [root]
+        while len(stack) > 0 {
+            let s = pop(mut &stack)
+            if !db.meta[s].dirty || !db.meta[s].loaded { continue }
+            let f = db.meta[s].frame
+            if db.pool[f].leaf {
+                if db.pool[f].size > lexdb_page.NODE_ROOM && !db.pool[f].isCols() && db.pool[f].count() > 0 { append(mut &firsts, db.pool[f].key(0)) }
+                continue
+            }
+            for k in db.pool[f].kids { append(mut &stack, k) }
+        }
+        for k in firsts { db.refitLeaf(tree, i, &k) }
+    }
+}
+
+fn (db: mut &Db) refitLeaf(tree: int, i: int, first: &str) {
+    var k = first.toStr()
+    let cols = lexdb_cols.on() && !db.colsOff
+    var guard = 0
+    while guard < 10000 {
+        guard += 1
+        let d = db.descend(tree, &k)
+        if d.need >= 0 || len(d.path) == 0 { return }
+        let s = d.path[len(d.path) - 1]
+        let f = db.meta[s].frame
+        if db.pool[f].isCols() { return }
+        let n = db.pool[f].count()
+        if cols {
+            match lexdb_page.colBody(&db.pool[f], &db.specs[i]) {
+                Some(b) {
+                    lexdb_page.repack(mut &db.pool[f], &b)
+                    db.recost(s)
+                    return
+                }
+                None {}
+            }
+        }
+        if db.pool[f].size <= lexdb_page.NODE_ROOM { return }
+        let e = if cols { lexdb_page.colSize(&db.pool[f], 0, n, &db.specs[i]) } else { -1 }
+        var m = 0
+        var body = ""
+        if e > 0 {
+            // as many rows as fit a column leaf: estimated, then fewer until they do
+            m = n * COL_ROOM / e
+            if m >= n { m = n - 1 }
+            if m < 1 { m = 1 }
+            while true {
+                match lexdb_page.colBodyRange(&db.pool[f], 0, m, &db.specs[i]) {
+                    Some(b) {
+                        body = b
+                        break
+                    }
+                    None {}
+                }
+                if m == 1 { break }
+                m = m * 9 / 10
+                if m < 1 { m = 1 }
+            }
+        }
+        if len(body) == 0 {
+            // a page of rows
+            let sizes = lexdb_page.leafSizes(&db.pool[f])
+            var acc = 0
+            m = 0
+            while m < n - 1 && (m == 0 || acc + sizes[m] <= lexdb_page.NODE_ROOM) {
+                acc += sizes[m]
+                m += 1
+            }
+        }
+        if m <= 0 || m >= n { return }
+        let next = lexdb_base.own(&db.pool[f].key(m))
+        db.refitCuts += 1
+        db.cutLeaf(tree, &d.path, m)
+        if len(body) > 0 {
+            lexdb_page.repack(mut &db.pool[db.meta[s].frame], &body)
+            db.recost(s)
+        }
+        k = next
     }
 }
 
@@ -3533,6 +3740,9 @@ fn (db: mut &Db) leafBody(s: int, pages: &[]int, tree: int): str {
                 match lexdb_page.colBody(&db.pool[f], &db.specs[i]) {
                     Some(b) {
                         db.colLeaves += 1
+                        // a full leaf's ratio (leafRoom)
+                        let size = db.pool[f].size
+                        if size > lexdb_page.NODE_ROOM && !db.pool[f].isCols() { db.noteRatio(i, lexdb_page.colPageBytes(&b, db.pool[f].count()), size) }
                         return b
                     }
                     None { db.rowLeaves += 1 }
@@ -3562,6 +3772,8 @@ pub fn (st: &Store) setColSpec(tree: int, layouts: &[][]byte) {
             None {
                 db.colSpecs.put(tree, len(db.specs))
                 append(mut &db.specs, lexdb_cols.Spec{layouts: copyLayouts(layouts)})
+                append(mut &db.specRatio, 0)
+                append(mut &db.specSplits, 0)
             }
         }
     })
@@ -3583,10 +3795,10 @@ fn copyLayouts(ls: &[][]byte): [][]byte {
 pub fn (st: &Store) setColumns(on: bool) { st.sh.with(fn(db: mut &Db) { db.colsOff = !on }) }
 
 // Leaves checkpoints wrote as column leaves, and as rows (of trees with
-// layouts: their rows did not all encode): 9.112.
+// layouts: their rows did not all encode), and cut to fit (refit): 9.112.
 pub fn (st: &Store) colCounts(): []int {
     var out: []int = []
-    st.sh.with(fn(db: mut &Db) { out = [db.colLeaves, db.rowLeaves] })
+    st.sh.with(fn(db: mut &Db) { out = [db.colLeaves, db.rowLeaves, db.refitCuts] })
     return out
 }
 
@@ -3690,6 +3902,7 @@ pub fn (st: &Store) checkpoint(): Result[Unit, lexdb_base.DbErr] {
         n = db.ckpt
         f = db.data
         fs = db.fs
+        db.refit()      // (it may split leaves, and roots: before the roots are taken)
         var roots: []int = []
         var ids: []int = []
         var rs: []int = []
@@ -3942,7 +4155,8 @@ fn newDb(fs: lexdb_disk.Fs, data: lexdb_disk.File, opts: Options, m: &lexdb_page
               segOff: m.replayOff, logSinceCkpt: 0, failed: [], closing: false, seq: 0, snaps: [], nextSnap: 0,
               hist: [], histCount: 0, histSlots: [], deferred: [], rootHist: [], durableSeq: 0, holds: newMap(), holdCkpt: -1, holdSeg: -1, heldFree: [], changeWake: [], durWaits: [], nextDurWait: 0, ckptCovers: m.covers, snapshots: 0, tooOld: 0, commits: 0,
               conflicts: 0, loads: 0, aheadReads: 0, aheadPages: 0, evictions: 0, flushes: 0, logBytes: 0, checkpoints: 0, pagesWritten: 0, held: 0, wholes: 0,
-              colSpecs: newMap(), specs: [], colLeaves: 0, rowLeaves: 0, colsOff: false}
+              colSpecs: newMap(), specs: [], colLeaves: 0, rowLeaves: 0, colsOff: false,
+              specRatio: [], specSplits: [], refitCuts: 0}
 }
 
 // Opens the store in fs (creating it when it is new) and recovers: the last

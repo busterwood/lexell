@@ -1,0 +1,230 @@
+// lexdb: table leaves filled to a column leaf's page (design/lexdb.md
+// 9.112). A table's changed leaf holds more rows than a page of rows, as
+// many as a column leaf of them is estimated to hold, and a checkpoint
+// makes them fit (lexdb_store refit): a leaf written as a column leaf, or
+// cut into leaves that are. Store A writes column leaves, B rows only;
+// every statement and query must give the same on both.
+// - Rows loaded in key order: A's table takes under 80% of B's pages.
+// - Rows inserted in random order, between checkpoints.
+// - A column added, then rows of the new layout inserted among the old
+//   ones and long texts (tagged rows): leaves that grew past a page of rows
+//   and do not encode are cut into pages of rows by the checkpoint.
+// - A transaction block's snapshot, taken before leaves are cut, reads what
+//   it read before; a block that read a range another commits into after
+//   the cut fails (40001).
+// - A table of one leaf past a page of rows, then rows of a second layout
+//   in it: the checkpoint cuts the leaf, the tree's root, into two under a
+//   new root.
+// - Reopened (A after a crash: from its last checkpoint and its log): the
+//   same.
+// expect: loaded: A's pages under 80% of B's true; queries 10 of 10 the same
+// expect: random inserts: queries 10 of 10 the same
+// expect: mixed: A cut leaves true; queries 10 of 10 the same
+// expect: one leaf: A rows 205 B rows 205, A cut leaves true
+// expect: snapshot: same as before true; A and B the same true; conflict 40001 40001
+// expect: reopened: queries 10 of 10 the same; one leaf same true
+// expect: different 0
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_base"
+
+var DIFF: int = 0
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            var out: []str = []
+            for r in rs {
+                if !r.hasRows { append(mut &out, r.tag) }
+                for row in r.rows {
+                    var vs: []str = []
+                    for v in row { append(mut &vs, lexdb_exec.text(&v)) }
+                    append(mut &out, strings.join(&vs, "|"))
+                }
+            }
+            return strings.join(&out, " ")
+        }
+        Err(e) { return "ERROR " + e.state + " " + e.msg }
+    }
+}
+
+fn both(a: mut &lexdb_exec.Session, b: mut &lexdb_exec.Session, sql: &str): str {
+    let x = q(a, sql)
+    let y = q(b, sql)
+    if x != y {
+        DIFF += 1
+        println("DIFFERENT: " + sql)
+        println("  A: " + x)
+        println("  B: " + y)
+    }
+    return x
+}
+
+fn queries(): []str {
+    return ["select count(*), sum(id), sum(a), sum(c), count(t), count(n), sum(n) from m",
+            "select city, count(*), min(id), max(id) from m group by city order by 1",
+            "select id, a, c, t, city, n from m where id % 997 = 1 order by id",
+            "select count(*) from m where a between 10 and 20 and city like '%o%'",
+            "select * from m where id = 4321",
+            "select * from m where id = 1",
+            "select id from m order by c desc, id limit 7",
+            "select count(*), max(length(t)) from m where t like 'long%'",
+            "select a, count(*) from m where id > 20000 group by a order by 2 desc, 1 limit 5",
+            "select count(*), sum(id) from m where id between 2500 and 7500"]
+}
+
+fn compare(a: mut &lexdb_exec.Session, b: mut &lexdb_exec.Session): int {
+    var same = 0
+    for x in queries() {
+        var ok = true
+        for mode in ["on", "off"] {
+            let s1 = q(a, &("set lexdb_batch = " + mode))
+            let s2 = q(b, &("set lexdb_batch = " + mode))
+            let ra = q(a, &x)
+            let rb = q(b, &x)
+            if ra != rb || strings.startsWith(&ra, "ERROR") {
+                ok = false
+                DIFF += 1
+                println("DIFFERENT (" + mode + "): " + x)
+                println("  A: " + ra)
+                println("  B: " + rb)
+            }
+        }
+        if ok { same += 1 }
+    }
+    let s3 = q(a, &"set lexdb_batch = on")
+    let s4 = q(b, &"set lexdb_batch = on")
+    return same
+}
+
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: 2 * 1024 * 1024, segBytes: 4 * 1024 * 1024, ckptBytes: 1024 * 1024, snapNodes: 100000, bufferedPages: false}
+}
+
+fn rowsSql(ids: &[]int): str {
+    var out: []str = []
+    for g in ids {
+        append(mut &out, "(" + g.toStr() + ", " + (g % 100).toStr() + ", " + ((g * 7919) % 1000003).toStr() + ", 't" + (g % 300).toStr() + "', '" +
+               ["Paris", "Rome", "Oslo", "Lima"][g % 4] + "', " + (if g % 7 == 0 { "null" } else { (g % 1000).toStr() + ".25" }) + ")")
+    }
+    return "insert into m (id, a, c, t, city, n) values " + strings.join(&out, ", ")
+}
+
+fn pages(s: mut &lexdb_exec.Session): int { return strings.parseInt(q(s, &"select pg_relation_size('m')")).unwrapOr(0) / 4096 }
+
+fn body(sa: lexdb_store.Store, sb: lexdb_store.Store) {
+    lexdb_exec.bootstrap(&sa).unwrap()
+    lexdb_exec.bootstrap(&sb).unwrap()
+    sb.setColumns(false)
+    var a = lexdb_exec.newSession(sa)
+    var b = lexdb_exec.newSession(sb)
+    let c1 = both(mut &a, mut &b, &"create table m (id int primary key, a int, c bigint, t text, city text, n numeric(10,2))")
+    // in key order
+    for k in 0..10 {
+        var ids: []int = []
+        for g in k * 1000 + 1..k * 1000 + 1001 { append(mut &ids, g) }
+        let r = both(mut &a, mut &b, &rowsSql(&ids))
+    }
+    sa.checkpointAll().unwrap()
+    sb.checkpointAll().unwrap()
+    let pa = pages(mut &a)
+    let pb = pages(mut &b)
+    println("loaded: A's pages under 80% of B's " + (pa * 5 < pb * 4).toStr() + "; queries " + compare(mut &a, mut &b).toStr() + " of 10 the same")
+
+    // in random order, between checkpoints
+    var r = lexdb_base.rng(5)
+    var ids: []int = []
+    for g in 20001..26001 { append(mut &ids, g) }
+    for i in 0..len(ids) {
+        let j = i + r.below(len(ids) - i)
+        let x = ids[i]
+        ids[i] = ids[j]
+        ids[j] = x
+    }
+    for k in 0..12 {
+        var part: []int = []
+        for x in ids[k * 500..k * 500 + 500] { append(mut &part, x) }
+        let r1 = both(mut &a, mut &b, &rowsSql(&part))
+        if k % 4 == 3 {
+            sa.checkpointAll().unwrap()
+            sb.checkpointAll().unwrap()
+        }
+    }
+    println("random inserts: queries " + compare(mut &a, mut &b).toStr() + " of 10 the same")
+
+    // a snapshot from before the cuts
+    var x = lexdb_exec.newSession(sa)
+    var y = lexdb_exec.newSession(sb)
+    let x1 = q(mut &x, &"begin")
+    let y1 = q(mut &y, &"begin")
+    let before = q(mut &x, &"select count(*), sum(c), sum(n) from m where id between 20000 and 27000")
+    let yb = q(mut &y, &"select count(*), sum(c), sum(n) from m where id between 20000 and 27000")
+
+    // leaves of two layouts and long texts, past a page of rows
+    let c2 = both(mut &a, mut &b, &"alter table m add column e int")
+    var ids2: []int = []
+    for g in 0..3000 { append(mut &ids2, 20001 + g * 2 + 1) }
+    let i2 = both(mut &a, mut &b, &(strings.replaceAll(rowsSql(&ids2), "insert into m (id, a, c, t, city, n)", "insert into m (id, a, c, t, city, n)") + " on conflict (id) do nothing"))
+    let u2 = both(mut &a, mut &b, &"update m set e = id % 5 where id % 3 = 0 and id > 20000")
+    let u3 = both(mut &a, mut &b, &"update m set t = 'long ' || repeat('x', 300) || id where id % 50 = 0 and id > 20000")
+    let cutsBefore = sa.colCounts()[2]
+    sa.checkpointAll().unwrap()
+    sb.checkpointAll().unwrap()
+    println("mixed: A cut leaves " + (sa.colCounts()[2] > cutsBefore).toStr() + "; queries " + compare(mut &a, mut &b).toStr() + " of 10 the same")
+
+    let after = q(mut &x, &"select count(*), sum(c), sum(n) from m where id between 20000 and 27000")
+    let ya = q(mut &y, &"select count(*), sum(c), sum(n) from m where id between 20000 and 27000")
+    // another commits into the range the blocks read
+    let w1 = q(mut &x, &"update m set c = 0 where id = 3")
+    let w2 = q(mut &y, &"update m set c = 0 where id = 3")
+    let o1 = q(mut &a, &"insert into m (id, a, c) values (20000, 1, 1)")
+    let o2 = q(mut &b, &"insert into m (id, a, c) values (20000, 1, 1)")
+    let ka = q(mut &x, &"commit")
+    let kb = q(mut &y, &"commit")
+    let ca = strings.split(&ka, " ")
+    let cb = strings.split(&kb, " ")
+    // a root leaf cut
+    let s1 = both(mut &a, mut &b, &"create table s (id int primary key, a int, t text)")
+    let s2 = both(mut &a, mut &b, &"insert into s select g, g * 3, 'the same text ' || (g % 3) from generate_series(1, 200) g")
+    sa.checkpointAll().unwrap()
+    sb.checkpointAll().unwrap()
+    let s3 = both(mut &a, mut &b, &"alter table s add column e int")
+    let s4 = both(mut &a, mut &b, &"insert into s select g, g * 3, 'text ' || g, g from generate_series(201, 205) g")
+    let cuts0 = sa.colCounts()[2]
+    sa.checkpointAll().unwrap()
+    sb.checkpointAll().unwrap()
+    println("one leaf: A rows " + q(mut &a, &"select count(*) from s") + " B rows " + q(mut &b, &"select count(*) from s") + ", A cut leaves " + (sa.colCounts()[2] > cuts0).toStr())
+    println("snapshot: same as before " + (before == after).toStr() + "; A and B the same " + (before == yb && after == ya).toStr() +
+            "; conflict " + (if len(ca) > 1 { ca[1] } else { ca[0] }) + " " + (if len(cb) > 1 { cb[1] } else { cb[0] }))
+}
+
+fn main() {
+    let fa = lexdb_disk.sim(21)
+    let fb = lexdb_disk.sim(22)
+    var crashed = fa
+    let r = lexdb_store.run(fa, opts(), fn(sa: lexdb_store.Store): int {
+        let r2 = lexdb_store.run(fb, opts(), fn(sb: lexdb_store.Store): int {
+            body(sa, sb)
+            return 0
+        })
+        // A's disk as it is: its last checkpoint's pages and its log
+        crashed = fa.crash(3)
+        return 0
+    })
+    let r3 = lexdb_store.run(crashed, opts(), fn(sa: lexdb_store.Store): int {
+        let r4 = lexdb_store.run(fb, opts(), fn(sb: lexdb_store.Store): int {
+            lexdb_exec.bootstrap(&sa).unwrap()
+            lexdb_exec.bootstrap(&sb).unwrap()
+            var a = lexdb_exec.newSession(sa)
+            var b = lexdb_exec.newSession(sb)
+            let qa = q(mut &a, &"select * from s order by id")
+            let qb = q(mut &b, &"select * from s order by id")
+            println("reopened: queries " + compare(mut &a, mut &b).toStr() + " of 10 the same; one leaf same " + (qa == qb && len(qa) > 1000).toStr())
+            return 0
+        })
+        return 0
+    })
+    println("different " + DIFF.toStr())
+}
