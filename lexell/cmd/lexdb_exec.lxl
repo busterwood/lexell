@@ -11575,10 +11575,19 @@ fn createIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
 
 // Fills index ix from table t's rows (a unique one checked) and adds it to
 // t, its catalog row naming t (t's own row is the caller's to write).
+// The entries are written in key order (sorted here, as PostgreSQL's and
+// SQLite's index builds sort): each then goes past the tree's last, so its
+// leaves are left full (lexdb_store applyPut), where the table's order put
+// them anywhere and left them about 70% full (design/lexdb.md 9.109). A
+// unique index's duplicates are then neighbours: two entries with the same
+// columns, none NULL (the tree is new, so they are all there is to check).
 fn addIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, ix: Index): Result[Unit, DbErr] {
     let path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: []}
     let sc = Scan{empty: false, point: false, lo: "", hi: "", whole: false}
     var cur = newCursor()
+    var ents: []str = []
+    var pks: []str = []
+    var pres: []int = []                // a unique index's: the length of each entry's columns, -1 one NULL
     while !cur.done {
         var batch: [][]Val = []
         let all: []bool = []
@@ -11586,15 +11595,24 @@ fn addIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, ix
         for r in batch {
             if !(try inIndex(t, &ix, &r)) { continue }
             let pk = keyOf(t, &r)
-            match checkUnique(st, txn, t, &ix, &r, &pk) {
-                Ok(_) {}
-                Err(x) {
-                    if x.state != "23505" { return Err(x) }
-                    return Err(e("23505", "could not create unique index \"" + lexdb_sql.baseName(&ix.name) + "\": a value is duplicated"))
-                }
-            }
-            try txn.put(ix.tree, try idxEntry(t, &ix, &r, &pk), pk)
+            let en = try idxEntry(t, &ix, &r, &pk)
+            if ix.unique { append(mut &pres, if try hasNull(t, &ix, &r) { -1 } else { len(en) - len(pk) }) }
+            append(mut &ents, en)
+            append(mut &pks, pk)
         }
+    }
+    var order: []int = array(len(ents), 0)
+    for i in 0..len(ents) { order[i] = i }
+    collections.sortBy(mut &order, fn(a: &int, b: &int): int { return ents[a].cmp(&ents[b]) })
+    for j in 0..len(order) {
+        let i = order[j]
+        if ix.unique && j > 0 {
+            let h = order[j - 1]
+            if pres[i] >= 0 && pres[h] == pres[i] && ents[i][0..pres[i]] == ents[h][0..pres[h]] {
+                return Err(e("23505", "could not create unique index \"" + lexdb_sql.baseName(&ix.name) + "\": a value is duplicated"))
+            }
+        }
+        try txn.put(ix.tree, ents[i], pks[i])
     }
     try txn.put(CATALOG, idxName(&ix.name), t.name)
     append(mut &t.indexes, ix)

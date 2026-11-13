@@ -4,8 +4,25 @@
 // [12] its type, [13..16) zero. A page read from the wrong place, or torn,
 // fails the check.
 //
-// Leaf (type 2): [16..18) n; then n entries: u16 key length, u16 value
-// length, key, value.
+// Leaf (type 2, T_LEAF; written before design/lexdb.md 9.109, still read):
+// [16..18) n; then n entries: u16 key length, u16 value length, key, value.
+// Leaf (type 6, T_FLEAF, 9.109; every leaf written since): [16..18) n; then
+// n entries, each key front coded against the key before it on the page
+// (the first against ""):
+//   - a header, of one of two forms, told by its first byte:
+//     - below 0x80: that byte is how many bytes the key shares with the key
+//       before (0 to 127); then a varint (LEB128) of the bytes left (the
+//       tail); then a varint of twice the value's length, plus 1 when the
+//       value is the key's last bytes (suffix);
+//     - 0x80 and up: a u32 LE: 0x80 | shared's low 7 bits | its high 2 bits
+//       << 8 | tail << 10 | suffix << 20 | the value's length << 21;
+//   - the tail;
+//   - the value, unless it is the key's last bytes. A secondary index's
+//     entry is its columns then the primary key, its value the primary key
+//     (lexdb_exec idxEntry), so the primary key is stored once.
+// Each entry takes at most its bytes in T_LEAF (frontEntry), so a T_LEAF
+// page always fits again as T_FLEAF, and a leaf's size (Node.size) is its
+// bytes in T_FLEAF.
 // Internal (type 3): [16..18) n keys; [18..26) child 0; then n entries: u16
 // key length, key, u64 child. Child i+1 holds the keys >= key i.
 // Meta (type 1, pages 0 and 1): see Meta.
@@ -21,6 +38,10 @@ pub const T_META = 1
 pub const T_LEAF = 2
 pub const T_INTERNAL = 3
 pub const T_LIST = 5
+pub const T_FLEAF = 6
+
+// Whether page type t is a leaf's (either form).
+pub fn isLeafType(t: int): bool { return t == T_LEAF || t == T_FLEAF }
 
 const HDR = 16
 // The bytes a node's entries may use: the page less the header and count
@@ -63,12 +84,17 @@ pub fn newLeaf(): Node { return newNode(true) }
 // Its entries (a leaf's) or keys (an internal node's).
 pub fn (n: &Node) count(): int { return if n.lazy { len(n.ents) } else { len(n.keys) } }
 
-// A lazy leaf's entry i: where its key and value are in body, 16 bits each
-// (a page is 4 KiB): key start, key length, value start, value length.
-fn kStart(e: int): int { return e & 0xffff }
-fn kEnd(e: int): int { return (e & 0xffff) + ((e >> 16) & 0xffff) }
-fn vStart(e: int): int { return (e >> 32) & 0xffff }
-fn vEnd(e: int): int { return ((e >> 32) & 0xffff) + ((e >> 48) & 0xffff) }
+// A lazy leaf's entry i: where its key and value are in body: key start
+// (20 bits), key length (12), value start (20), value length (11). A body
+// is its page's entries made whole: front coding lets a page's keys take
+// far more than 4 KiB (at most about 1,360 keys of 530 bytes), and keys
+// and values are at most MAX_KEY and MAX_ENTRY bytes. A value that is its
+// key's last bytes is a slice of the key.
+fn kStart(e: int): int { return e & 0xfffff }
+fn kEnd(e: int): int { return (e & 0xfffff) + ((e >> 20) & 0xfff) }
+fn vStart(e: int): int { return (e >> 32) & 0xfffff }
+fn vEnd(e: int): int { return ((e >> 32) & 0xfffff) + ((e >> 52) & 0x7ff) }
+fn ent(ks: int, kl: int, vs: int, vl: int): int { return ks | (kl << 20) | (vs << 32) | (vl << 52) }
 
 // Key i.
 pub fn (n: &Node) key(i: int): str {
@@ -142,21 +168,244 @@ pub fn (n: mut &Node) loosen() {
     n.ents = []
 }
 
-// A lazy leaf over body, a leaf page's entries from byte 18 (cnt of them).
+// A leaf's body in memory: its entries whole, each a u16 key length, a u16
+// value length, the key and the value; the value length | SUFFIX when the
+// value is the key's last bytes, then not there again. A T_LEAF page's
+// entries are such a body (none a suffix).
+const SUFFIX = 0x8000
+
+// A lazy leaf over body (cnt entries); its size is the caller's to set.
 fn lazyLeaf(body: str, cnt: int): Node {
     var ents: []int = array(cnt, 0)
     var at = 0
     for i in 0..cnt {
         let kl = binary.readU16LEStr(&body, at)
-        let vl = binary.readU16LEStr(&body, at + 2)
-        ents[i] = (at + 4) | (kl << 16) | ((at + 4 + kl) << 32) | (vl << 48)
-        at += 4 + kl + vl
+        let vw = binary.readU16LEStr(&body, at + 2)
+        let vl = vw & 0x7fff
+        if vw & SUFFIX != 0 {
+            ents[i] = ent(at + 4, kl, at + 4 + kl - vl, vl)
+            at += 4 + kl
+        } else {
+            ents[i] = ent(at + 4, kl, at + 4 + kl, vl)
+            at += 4 + kl + vl
+        }
     }
-    return Node{leaf: true, keys: [], vals: [], kids: [], size: at, packed: true, lazy: true, body: body, ents: ents}
+    return Node{leaf: true, keys: [], vals: [], kids: [], size: 0, packed: true, lazy: true, body: body, ents: ents}
 }
 
+// The bytes of an entry in T_LEAF: what bounds an entry (MAX_ENTRY), and
+// what it takes at most in T_FLEAF.
 pub fn leafEntry(k: &str, v: &str): int { return 4 + len(k) + len(v) }
 pub fn kidEntry(k: &str): int { return 2 + len(k) + 8 }
+
+// ---- front coding (T_FLEAF)
+
+fn commonLen(a: &str, b: &str): int {
+    let m = if len(a) < len(b) { len(a) } else { len(b) }
+    var n = 0
+    while n < m && a[n] == b[n] { n += 1 }
+    return n
+}
+
+// Whether value v is key k's last bytes (an index entry's primary key).
+fn isSuffix(k: &str, v: &str): bool {
+    let kl = len(k)
+    let vl = len(v)
+    if vl == 0 || vl > kl { return false }
+    for i in 0..vl { if k[kl - vl + i] != v[i] { return false } }
+    return true
+}
+
+fn varLen(x: int): int { return if x < 0x80 { 1 } else if x < 0x4000 { 2 } else { 3 } }
+
+fn putVar(b: mut &[]byte, at: int, x: int): int {
+    var v = x
+    var p = at
+    while v >= 0x80 {
+        b[p] = byte((v & 0x7f) | 0x80)
+        v = v >> 7
+        p += 1
+    }
+    b[p] = byte(v)
+    return p + 1
+}
+
+// An entry's header on a T_FLEAF page: its bytes, the key's bytes shared
+// with the key before, whether the value is the key's last bytes, and the
+// u32 form (fixed) or the varint one. The smaller of the two; the fixed
+// form, never over T_LEAF's 4 bytes, holds any key and value a leaf can
+// (a tail up to 1,023 bytes, a value up to 2,047).
+type Front = value record { hdr: int; shared: int; suffix: bool; fixed: bool }
+
+fn frontOf(prev: &str, k: &str, v: &str): Front {
+    let c = commonLen(prev, k)
+    let kl = len(k)
+    let vl = len(v)
+    let suf = isSuffix(k, v)
+    let s1 = if c < 127 { c } else { 127 }
+    let hv = 1 + varLen(kl - s1) + varLen(2 * vl + (if suf { 1 } else { 0 }))
+    let s2 = if c < 511 { c } else { 511 }
+    if kl - s2 <= 1023 && vl <= 2047 && 4 + kl - s2 < hv + kl - s1 {
+        return Front{hdr: 4, shared: s2, suffix: suf, fixed: true}
+    }
+    return Front{hdr: hv, shared: s1, suffix: suf, fixed: false}
+}
+
+// The bytes entry (k, v) takes on a T_FLEAF page after the key prev ("" for
+// a page's first): at most leafEntry(k, v).
+pub fn frontEntry(prev: &str, k: &str, v: &str): int {
+    let f = frontOf(prev, k, v)
+    return f.hdr + len(k) - f.shared + (if f.suffix { 0 } else { len(v) })
+}
+
+// The bytes a leaf's entries take on a T_FLEAF page: its size.
+pub fn leafSize(n: &Node): int {
+    var size = 0
+    for i in 0..n.count() {
+        if i == 0 { size += frontEntry(&"", &n.key(0), &n.val(0)) }
+        else { size += frontEntry(&n.key(i - 1), &n.key(i), &n.val(i)) }
+    }
+    return size
+}
+
+// The bytes of each of a leaf's entries on a T_FLEAF page (frontEntry after
+// the key before).
+pub fn leafSizes(n: &Node): []int {
+    var out: []int = array(n.count(), 0)
+    for i in 0..n.count() {
+        out[i] = if i == 0 { frontEntry(&"", &n.key(0), &n.val(0)) } else { frontEntry(&n.key(i - 1), &n.key(i), &n.val(i)) }
+    }
+    return out
+}
+
+// Writes entry (k, v) after key prev at b[at..], if it ends by end; the
+// bytes it takes (written or not).
+fn putFront(b: mut &[]byte, at: int, end: int, prev: &str, k: &str, v: &str): int {
+    let f = frontOf(prev, k, v)
+    let tail = len(k) - f.shared
+    let vl = len(v)
+    let size = f.hdr + tail + (if f.suffix { 0 } else { vl })
+    if at + size > end { return size }
+    let sb = if f.suffix { 1 } else { 0 }
+    var p = at
+    if f.fixed {
+        binary.setU32LE(b, p, 0x80 | (f.shared & 0x7f) | ((f.shared >> 7) << 8) | (tail << 10) | (sb << 20) | (vl << 21))
+        p += 4
+    } else {
+        b[p] = byte(f.shared)
+        p = putVar(b, p + 1, tail)
+        p = putVar(b, p, 2 * vl + sb)
+    }
+    for i in 0..tail { b[p + i] = k[f.shared + i] }
+    p += tail
+    if !f.suffix {
+        for i in 0..vl { b[p + i] = v[i] }
+        p += vl
+    }
+    return p - at
+}
+
+// A T_FLEAF page's entries, header by header: shared, tail and value
+// lengths, suffix, and where the tail starts.
+type FrontHdr = value record { shared: int; tail: int; vl: int; suffix: bool; at: int }
+
+fn readFront(b: &[]byte, at: int): FrontHdr {
+    let h0 = int(b[at])
+    if h0 < 0x80 {
+        var p = at + 1
+        var tail = 0
+        var sh = 0
+        while true {
+            let x = int(b[p])
+            tail = tail | ((x & 0x7f) << sh)
+            p += 1
+            sh += 7
+            if x < 0x80 { break }
+        }
+        var w = 0
+        sh = 0
+        while true {
+            let x = int(b[p])
+            w = w | ((x & 0x7f) << sh)
+            p += 1
+            sh += 7
+            if x < 0x80 { break }
+        }
+        return FrontHdr{shared: h0, tail: tail, vl: w >> 1, suffix: w & 1 != 0, at: p}
+    }
+    let x = binary.readU32LE(b, at)
+    return FrontHdr{shared: (x & 0x7f) | (((x >> 8) & 3) << 7), tail: (x >> 10) & 0x3ff, vl: (x >> 21) & 0x7ff,
+                    suffix: (x >> 20) & 1 != 0, at: at + 4}
+}
+
+// A lazy leaf from a T_FLEAF page b (cnt entries): its keys made whole,
+// into a body as lazyLeaf reads; its size, the page's bytes for them.
+fn frontLeaf(b: &[]byte, cnt: int): Node {
+    var total = 0
+    var at = 18
+    for i in 0..cnt {
+        let h = readFront(b, at)
+        total += 4 + h.shared + h.tail + (if h.suffix { 0 } else { h.vl })
+        at = h.at + h.tail + (if h.suffix { 0 } else { h.vl })
+    }
+    let size = at - 18
+    var out: []byte = array(total, byte(0))
+    var ents: []int = array(cnt, 0)
+    var o = 0
+    var prev = 0                        // where the key before starts in out
+    at = 18
+    for i in 0..cnt {
+        let h = readFront(b, at)
+        let kl = h.shared + h.tail
+        binary.setU16LE(mut &out, o, kl)
+        binary.setU16LE(mut &out, o + 2, h.vl | (if h.suffix { SUFFIX } else { 0 }))
+        let ks = o + 4
+        for j in 0..h.shared { out[ks + j] = out[prev + j] }
+        for j in 0..h.tail { out[ks + h.shared + j] = b[h.at + j] }
+        if h.suffix {
+            ents[i] = ent(ks, kl, ks + kl - h.vl, h.vl)
+            o = ks + kl
+            at = h.at + h.tail
+        } else {
+            for j in 0..h.vl { out[ks + kl + j] = b[h.at + h.tail + j] }
+            ents[i] = ent(ks, kl, ks + kl, h.vl)
+            o = ks + kl + h.vl
+            at = h.at + h.tail + h.vl
+        }
+        prev = ks
+    }
+    return Node{leaf: true, keys: [], vals: [], kids: [], size: size, packed: true, lazy: true, body: strFromBytes(&out), ents: ents}
+}
+
+// Leaf n's page, numbered pageNo: front coded (T_FLEAF); or, should its
+// entries not fit so (its size miscounted: they always do), whole (T_LEAF)
+// if they fit that way. A leaf that fits neither way traps.
+fn leafPage(n: &Node, pageNo: int): []byte {
+    var b = array(PAGE, byte(0))
+    binary.setU16LE(mut &b, 16, n.count())
+    var at = 18
+    for i in 0..n.count() {
+        if at > PAGE { break }
+        if i == 0 { at += putFront(mut &b, at, PAGE, &"", &n.key(0), &n.val(0)) }
+        else { at += putFront(mut &b, at, PAGE, &n.key(i - 1), &n.key(i), &n.val(i)) }
+    }
+    if at <= PAGE {
+        seal(mut &b, pageNo, T_FLEAF)
+        return b
+    }
+    var w = array(PAGE, byte(0))
+    binary.setU16LE(mut &w, 16, n.count())
+    at = 18
+    for i in 0..n.count() {
+        binary.setU16LE(mut &w, at, len(n.key(i)))
+        binary.setU16LE(mut &w, at + 2, len(n.val(i)))
+        putStr(mut &w, at + 4, &n.key(i))
+        putStr(mut &w, at + 4 + len(n.key(i)), &n.val(i))
+        at += leafEntry(&n.key(i), &n.val(i))
+    }
+    seal(mut &w, pageNo, T_LEAF)
+    return w
+}
 
 // ---- header and check
 
@@ -176,7 +425,7 @@ pub fn check(b: &[]byte, pageNo: int, typ: int): Result[Unit, lexdb_base.DbErr] 
     if int(binary.readU64LE(b, 4)) != pageNo {
         return Err(lexdb_base.corrupt("page " + pageNo.toStr() + ": holds page " + int(binary.readU64LE(b, 4)).toStr()))
     }
-    if int(b[12]) != typ && !(typ == T_LEAF && int(b[12]) == T_INTERNAL) {
+    if int(b[12]) != typ && !(typ == T_LEAF && (int(b[12]) == T_INTERNAL || int(b[12]) == T_FLEAF)) {
         return Err(lexdb_base.corrupt("page " + pageNo.toStr() + ": type " + int(b[12]).toStr()))
     }
     return Ok(Unit{})
@@ -195,29 +444,18 @@ fn getStr(b: &[]byte, at: int, n: int): str {
 // The page of a node whose kids have been given page numbers (pages[i] for
 // kid i).
 pub fn encodeNode(n: &Node, pages: &[]int, pageNo: int): []byte {
+    if n.leaf { return leafPage(n, pageNo) }
     var b = array(PAGE, byte(0))
-    binary.setU16LE(mut &b, 16, len(n.keys))
-    if n.leaf {
-        var at = 18
-        for i in 0..len(n.keys) {
-            binary.setU16LE(mut &b, at, len(n.keys[i]))
-            binary.setU16LE(mut &b, at + 2, len(n.vals[i]))
-            putStr(mut &b, at + 4, &n.keys[i])
-            putStr(mut &b, at + 4 + len(n.keys[i]), &n.vals[i])
-            at += leafEntry(&n.keys[i], &n.vals[i])
-        }
-        seal(mut &b, pageNo, T_LEAF)
-    } else {
-        binary.setU64LE(mut &b, 18, pages[0])
-        var at = 26
-        for i in 0..len(n.keys) {
-            binary.setU16LE(mut &b, at, len(n.keys[i]))
-            putStr(mut &b, at + 2, &n.keys[i])
-            binary.setU64LE(mut &b, at + 2 + len(n.keys[i]), pages[i + 1])
-            at += kidEntry(&n.keys[i])
-        }
-        seal(mut &b, pageNo, T_INTERNAL)
+    binary.setU16LE(mut &b, 16, n.count())
+    binary.setU64LE(mut &b, 18, pages[0])
+    var at = 26
+    for i in 0..len(n.keys) {
+        binary.setU16LE(mut &b, at, len(n.keys[i]))
+        putStr(mut &b, at + 2, &n.keys[i])
+        binary.setU64LE(mut &b, at + 2 + len(n.keys[i]), pages[i + 1])
+        at += kidEntry(&n.keys[i])
     }
+    seal(mut &b, pageNo, T_INTERNAL)
     return b
 }
 
@@ -226,31 +464,60 @@ pub fn encodeNode(n: &Node, pages: &[]int, pageNo: int): []byte {
 // allocation, not one per key and per value: design/lexdb.md 9.13).
 pub fn decodeNode(b: &[]byte): Node {
     let n = binary.readU16LE(b, 16)
+    if int(b[12]) == T_FLEAF { return frontLeaf(b, n) }
     let leaf = int(b[12]) == T_LEAF
     var end = if leaf { 18 } else { 26 }
     for i in 0..n {
         end += if leaf { 4 + binary.readU16LE(b, end) + binary.readU16LE(b, end + 2) } else { 2 + binary.readU16LE(b, end) + 8 }
     }
-    if leaf { return lazyLeaf(getStr(b, 18, end - 18), n) }
+    if leaf {
+        // a page from before 9.109: its body is a lazy leaf's as it is
+        var l = lazyLeaf(getStr(b, 18, end - 18), n)
+        l.size = leafSize(&l)
+        return l
+    }
     var node = Node{leaf: false, keys: array(n, ""), vals: [], kids: array(n + 1, 0), size: end - 18, packed: true, lazy: false, body: "", ents: []}
     unpack(mut &node, &getStr(b, 18, end - 18), true)
     return node
 }
 
-// The bytes of n's page after its header and count: its entries (with an
-// internal node's kids' pages, pages[i] for kid i).
+// What a checkpoint keeps of node n to write its page (bodyPage) and to
+// make it lazy (repack): a leaf's body as a lazy leaf holds it, its keys
+// whole (the page is front coded as it is written); an internal node's
+// page from byte 18 (with its kids' pages, pages[i] for kid i).
 pub fn nodeBody(n: &Node, pages: &[]int): str {
     if n.lazy { return n.body }
+    if n.leaf {
+        var total = 0
+        for i in 0..len(n.keys) { total += 4 + len(n.keys[i]) + (if isSuffix(&n.keys[i], &n.vals[i]) { 0 } else { len(n.vals[i]) }) }
+        var b = array(total, byte(0))
+        var at = 0
+        for i in 0..len(n.keys) {
+            let suf = isSuffix(&n.keys[i], &n.vals[i])
+            binary.setU16LE(mut &b, at, len(n.keys[i]))
+            binary.setU16LE(mut &b, at + 2, len(n.vals[i]) | (if suf { SUFFIX } else { 0 }))
+            putStr(mut &b, at + 4, &n.keys[i])
+            at += 4 + len(n.keys[i])
+            if !suf {
+                putStr(mut &b, at, &n.vals[i])
+                at += len(n.vals[i])
+            }
+        }
+        return strFromBytes(&b)
+    }
     let b = encodeNode(n, pages, 0)
     return getStr(&b, 18, n.size)
 }
 
-// Page pageNo holding a node's body (nodeBody) and count.
+// Page pageNo holding a node's body (nodeBody) and count: a leaf's front
+// coded (T_FLEAF), or, should its entries not fit so (a size miscounted),
+// whole (T_LEAF) when they fit that way.
 pub fn bodyPage(leaf: bool, n: int, body: &str, pageNo: int): []byte {
+    if leaf { return leafPage(&lazyLeaf(body.toStr(), n), pageNo) }
     var b = array(PAGE, byte(0))
     binary.setU16LE(mut &b, 16, n)
     putStr(mut &b, 18, body)
-    seal(mut &b, pageNo, if leaf { T_LEAF } else { T_INTERNAL })
+    seal(mut &b, pageNo, T_INTERNAL)
     return b
 }
 
@@ -263,10 +530,9 @@ pub fn repack(n: mut &Node, body: &str) {
         let cnt = n.count()
         n.keys = []
         n.vals = []
-        var l = lazyLeaf(body, cnt)
+        var l = lazyLeaf(body.toStr(), cnt)
         n.ents = replace(mut &l.ents, [])
         n.body = l.body
-        n.size = l.size
         n.lazy = true
         n.packed = true
         return
@@ -320,7 +586,7 @@ fn unpack(n: mut &Node, body: &str, kids: bool) {
 // keeps for it, loaded or not: its SlotMeta and history list, about 120
 // bytes (measured, 9.17; a slot not in memory holds no node).
 pub fn nodeCost(n: &Node): int {
-    if n.lazy { return 160 + n.size + 8 * len(n.ents) }
+    if n.lazy { return 160 + len(n.body) + 8 * len(n.ents) }
     let keys = n.size + (if n.packed { 64 } else { 144 }) * len(n.keys)
     return 160 + keys + 120 * len(n.kids)
 }

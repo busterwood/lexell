@@ -959,8 +959,9 @@ fn (db: mut &Db) descend(tree: int, k: &str): Descent {
 // ---- changing a tree (inside with; every node on the path is in memory)
 
 // collections.insert and removeAt for a node's keys and values, each
-// element moved by replace rather than swap: about 3 times faster
-// (design/lexdb.md 9.109).
+// element moved by replace rather than swap: about 3 times faster, which
+// matters as front-coded leaves hold several times the entries (an index's
+// leaf about 700: design/lexdb.md 9.109).
 fn insertStr(xs: mut &[]str, i: int, x: str) {
     append(xs, "")
     var j = len(xs) - 1
@@ -981,7 +982,7 @@ fn removeStr(xs: mut &[]str, i: int): str {
 fn nodeSize(n: &lexdb_page.Node): int {
     var size = 0
     if n.leaf {
-        for i in 0..n.count() { size += lexdb_page.leafEntry(&n.key(i), &n.val(i)) }
+        size = lexdb_page.leafSize(n)       // front coded (lexdb_page T_FLEAF, 9.109)
     } else {
         size = 8
         for k in n.keys { size += lexdb_page.kidEntry(&k) }
@@ -1005,25 +1006,31 @@ fn (db: mut &Db) split(s: int, atEnd: bool, at: int): Descent {
     var right = lexdb_page.newNode(leaf)
     var sep = ""
     if leaf {
+        // Entry sizes front coded (lexdb_page T_FLEAF): each after the key
+        // before it; the right node's first entry, after none, takes its
+        // key whole (first), at most its bytes in T_LEAF. A half of the
+        // entries is then at most about half the node and one entry, so
+        // both fit, as before (MAX_ENTRY).
+        let sizes = lexdb_page.leafSizes(&db.pool[db.meta[s].frame])
         var acc = 0
         var m = 0
         while m < n - 1 {
-            let e = lexdb_page.leafEntry(&db.pool[db.meta[s].frame].key(m), &db.pool[db.meta[s].frame].val(m))
+            let e = sizes[m]
             if m > 0 && acc + e > total / 2 { break }
             acc += e
             m += 1
         }
         if atEnd && n >= 2 { m = n - 1 }        // the left stays full: only the new entry goes right
         if at >= 0 {
-            var sizes: []int = []
-            for i in 0..n { append(mut &sizes, lexdb_page.leafEntry(&db.pool[db.meta[s].frame].keys[i], &db.pool[db.meta[s].frame].vals[i])) }
             var left = 0
             for i in 0..at + 1 { left += sizes[i] }
-            if at + 1 < n && left <= lexdb_page.NODE_ROOM && total - left <= lexdb_page.NODE_ROOM {
+            let rightAt = if at + 1 < n { total - left - sizes[at + 1] + lexdb_page.frontEntry(&"", &db.pool[db.meta[s].frame].keys[at + 1], &db.pool[db.meta[s].frame].vals[at + 1]) } else { 0 }
+            if at + 1 < n && left <= lexdb_page.NODE_ROOM && rightAt <= lexdb_page.NODE_ROOM {
                 m = at + 1
             } else {
                 left -= sizes[at]
-                if at > 0 && left <= lexdb_page.NODE_ROOM && total - left <= lexdb_page.NODE_ROOM { m = at }
+                let right2 = total - left - sizes[at] + lexdb_page.frontEntry(&"", &db.pool[db.meta[s].frame].keys[at], &db.pool[db.meta[s].frame].vals[at])
+                if at > 0 && left <= lexdb_page.NODE_ROOM && right2 <= lexdb_page.NODE_ROOM { m = at }
             }
         }
         for i in m..n {
@@ -1112,14 +1119,23 @@ fn (db: mut &Db) applyPut(tree: int, key: &str, val: &str) {
     // ascending load. Its splits leave the left node full, not half (as
     // PostgreSQL's rightmost split and SQLite's quick balance do): a table
     // loaded in key order then takes half the pages.
-    let atEnd = !d.hasUpper && i == db.pool[db.meta[leaf].frame].count()
-    if i < db.pool[db.meta[leaf].frame].count() && db.pool[db.meta[leaf].frame].key(i) == key {
-        db.pool[db.meta[leaf].frame].size += len(val) - len(db.pool[db.meta[leaf].frame].val(i))
+    let cnt = db.pool[db.meta[leaf].frame].count()
+    let atEnd = !d.hasUpper && i == cnt
+    // the size front coded: the entry's bytes after the key before it, and
+    // the next entry's after it rather than after that one (lexdb_page T_FLEAF)
+    let prev = if i > 0 { db.pool[db.meta[leaf].frame].keys[i - 1] } else { "" }
+    if i < cnt && db.pool[db.meta[leaf].frame].key(i) == key {
+        db.pool[db.meta[leaf].frame].size += lexdb_page.frontEntry(&prev, key, val) - lexdb_page.frontEntry(&prev, key, &db.pool[db.meta[leaf].frame].vals[i])
         db.pool[db.meta[leaf].frame].vals[i] = val
     } else {
+        var grow = lexdb_page.frontEntry(&prev, key, val)
+        if i < cnt {
+            grow += lexdb_page.frontEntry(key, &db.pool[db.meta[leaf].frame].keys[i], &db.pool[db.meta[leaf].frame].vals[i]) -
+                    lexdb_page.frontEntry(&prev, &db.pool[db.meta[leaf].frame].keys[i], &db.pool[db.meta[leaf].frame].vals[i])
+        }
         insertStr(mut &db.pool[db.meta[leaf].frame].keys, i, key)
         insertStr(mut &db.pool[db.meta[leaf].frame].vals, i, val)
-        db.pool[db.meta[leaf].frame].size += lexdb_page.leafEntry(key, val)
+        db.pool[db.meta[leaf].frame].size += grow
     }
     db.meta[leaf].version += 1
     db.pool[db.meta[leaf].frame].packed = false
@@ -1136,7 +1152,14 @@ fn (db: mut &Db) applyDel(tree: int, key: &str) {
     for s in d.path { db.markDirty(s) }
     db.willChange(leaf)
     db.pool[db.meta[leaf].frame].loosen()
-    db.pool[db.meta[leaf].frame].size -= lexdb_page.leafEntry(&db.pool[db.meta[leaf].frame].key(i), &db.pool[db.meta[leaf].frame].val(i))
+    // the size front coded (as applyPut's): the next entry then follows the key before this one
+    let prev = if i > 0 { db.pool[db.meta[leaf].frame].keys[i - 1] } else { "" }
+    var shrink = lexdb_page.frontEntry(&prev, &db.pool[db.meta[leaf].frame].keys[i], &db.pool[db.meta[leaf].frame].vals[i])
+    if i + 1 < db.pool[db.meta[leaf].frame].count() {
+        shrink += lexdb_page.frontEntry(&db.pool[db.meta[leaf].frame].keys[i], &db.pool[db.meta[leaf].frame].keys[i + 1], &db.pool[db.meta[leaf].frame].vals[i + 1]) -
+                  lexdb_page.frontEntry(&prev, &db.pool[db.meta[leaf].frame].keys[i + 1], &db.pool[db.meta[leaf].frame].vals[i + 1])
+    }
+    db.pool[db.meta[leaf].frame].size -= shrink
     let k = removeStr(mut &db.pool[db.meta[leaf].frame].keys, i)
     let v = removeStr(mut &db.pool[db.meta[leaf].frame].vals, i)
     db.meta[leaf].version += 1
@@ -3285,7 +3308,7 @@ fn heightAt(f: &lexdb_disk.File, p: int, b: mut &[]byte, reads: mut &int): Resul
         try f.read(at * PAGE, mut &b[0..PAGE], PAGE)
         try lexdb_page.check(b, at, lexdb_page.T_LEAF)
         reads += 1
-        if int(b[12]) == lexdb_page.T_LEAF { return Ok(h) }
+        if lexdb_page.isLeafType(int(b[12])) { return Ok(h) }
         if h > 64 { return Err(lexdb_base.corrupt("page " + p.toStr() + ": its subtree is over 64 deep")) }
         at = lexdb_page.decodeNode(b).kids[0]
         h += 1

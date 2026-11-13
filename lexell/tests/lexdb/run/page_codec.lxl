@@ -1,20 +1,78 @@
 // lexdb_page: nodes, meta and list pages round-trip; a flipped byte or the
 // wrong page number fails the check.
-// expect: leaf 3 a=1 bb=22 ccc=333 size 24
+// Leaves are front coded (T_FLEAF, design/lexdb.md 9.109): the three
+// entries take 21 bytes, 24 whole. Index-like entries (columns then the
+// key, the key as value) round-trip with the value stored once; long keys
+// sharing over 127 bytes take the u32 header; a page of the old format
+// (T_LEAF) reads, its size counted front coded; a leaf of every form goes
+// through a checkpoint's body (nodeBody, bodyPage, repack) unchanged; and
+// no entry takes more bytes front coded than whole.
+// expect: leaf 3 a=1 bb=22 ccc=333 size 21
 // expect: lazy true lower 0 1 1 3 3; loosened 3 a=1 ccc=333 lazy false
 // expect: internal 2 kids 7 8 9 keys m t
 // expect: meta 5 120 9 6 10
 // expect: bad crc true wrong page true
 // expect: list 1000 2 999
+// expect: index 300 ok true type 6 size 1486 whole 8700 suffix true
+// expect: long 20 ok true size 534 whole 5910
+// expect: old type 2 ok true lazy true size 598 counted true whole 3480
+// expect: body index true long true old true
+// expect: never larger true
+import "strings"
+import "binary"
 import "../../../cmd/lexdb_page"
 import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_base"
+
+// An index entry's key for value v and primary key k: 1, v as 8 bytes, k
+// as 8 bytes (lexdb_exec's encIdxPart and encKeyPart); its value is k's.
+fn ikey(v: int, k: int): str { return "\x01" + be8(v) + be8(k) }
+fn be8(x: int): str {
+    var b = newStrBuf()
+    binary.addU64BE(mut &b, x)
+    return b.toStr()
+}
+
+// Whether node d holds keys ks and values vs.
+fn same(d: &lexdb_page.Node, ks: &[]str, vs: &[]str): bool {
+    if d.count() != len(ks) { return false }
+    for i in 0..len(ks) { if d.key(i) != ks[i] || d.val(i) != vs[i] { return false } }
+    return true
+}
+
+// A leaf of keys ks and values vs, its size counted.
+fn leafOf(ks: &[]str, vs: &[]str): lexdb_page.Node {
+    var n = lexdb_page.newLeaf()
+    for i in 0..len(ks) {
+        append(mut &n.keys, ks[i])
+        append(mut &n.vals, vs[i])
+    }
+    n.size = lexdb_page.leafSize(&n)
+    return n
+}
+
+// Through a checkpoint's steps: nodeBody, the page written (bodyPage),
+// read back; and the node made lazy (repack).
+fn throughBody(n: &lexdb_page.Node, ks: &[]str, vs: &[]str): bool {
+    let none: []int = []
+    let body = lexdb_page.nodeBody(n, &none)
+    let pg = lexdb_page.bodyPage(true, n.count(), &body, 30)
+    if lexdb_page.check(&pg, 30, lexdb_page.T_LEAF).isErr() { return false }
+    var r = lexdb_page.newLeaf()
+    for i in 0..n.count() {
+        append(mut &r.keys, n.key(i))
+        append(mut &r.vals, n.val(i))
+    }
+    lexdb_page.repack(mut &r, &body)
+    return same(&lexdb_page.decodeNode(&pg), ks, vs) && same(&r, ks, vs) && r.lazy
+}
 
 fn main() {
     var n = lexdb_page.newLeaf()
     append(mut &n.keys, "a"); append(mut &n.vals, "1")
     append(mut &n.keys, "bb"); append(mut &n.vals, "22")
     append(mut &n.keys, "ccc"); append(mut &n.vals, "333")
-    n.size = 21
+    n.size = lexdb_page.leafSize(&n)
     let none: []int = []
     var b = lexdb_page.encodeNode(&n, &none, 12)
     lexdb_page.check(&b, 12, lexdb_page.T_LEAF).unwrap()
@@ -50,4 +108,80 @@ fn main() {
     var used: []int = []
     let got = lexdb_page.readList(&f, 5, mut &used).unwrap()
     println("list " + len(got).toStr() + " " + len(used).toStr() + " " + got[999].toStr())
+
+    // an index's leaf: 300 entries, about 10 a value
+    var iks: []str = []
+    var ivs: []str = []
+    var whole = 0
+    for j in 0..300 {
+        append(mut &iks, ikey(1000 + j / 10, 500000 + j * 37))
+        append(mut &ivs, be8(500000 + j * 37))
+        whole += lexdb_page.leafEntry(&iks[j], &ivs[j])
+    }
+    let ix = leafOf(&iks, &ivs)
+    let ib2 = lexdb_page.encodeNode(&ix, &none, 20)
+    lexdb_page.check(&ib2, 20, lexdb_page.T_LEAF).unwrap()
+    let id = lexdb_page.decodeNode(&ib2)
+    let suffix = id.val(7) == iks[7][9..17]
+    println("index " + id.count().toStr() + " ok " + same(&id, &iks, &ivs).toStr() + " type " + int(ib2[12]).toStr() +
+            " size " + id.size.toStr() + " whole " + whole.toStr() + " suffix " + suffix.toStr())
+
+    // long keys sharing 280 bytes: the u32 header
+    var lks: []str = []
+    var lvs: []str = []
+    var lwhole = 0
+    for j in 0..20 {
+        append(mut &lks, strings.repeat("p", 280) + strings.padLeft(j.toStr(), 4, '0'))
+        append(mut &lvs, "value " + j.toStr())
+        lwhole += lexdb_page.leafEntry(&lks[j], &lvs[j])
+    }
+    let ln = leafOf(&lks, &lvs)
+    let lb = lexdb_page.encodeNode(&ln, &none, 21)
+    let ld = lexdb_page.decodeNode(&lb)
+    println("long " + ld.count().toStr() + " ok " + same(&ld, &lks, &lvs).toStr() + " size " + ld.size.toStr() + " whole " + lwhole.toStr())
+
+    // a page of the format before 9.109: entries whole, type 2 (the first
+    // 120 of the index's)
+    var oks: []str = []
+    var ovs: []str = []
+    for j in 0..120 {
+        append(mut &oks, iks[j])
+        append(mut &ovs, ivs[j])
+    }
+    var ob = array(4096, byte(0))
+    binary.setU16LE(mut &ob, 16, 120)
+    var at = 18
+    for j in 0..120 {
+        binary.setU16LE(mut &ob, at, len(oks[j]))
+        binary.setU16LE(mut &ob, at + 2, len(ovs[j]))
+        for q in 0..len(oks[j]) { ob[at + 4 + q] = oks[j][q] }
+        for q in 0..len(ovs[j]) { ob[at + 4 + len(oks[j]) + q] = ovs[j][q] }
+        at += lexdb_page.leafEntry(&oks[j], &ovs[j])
+    }
+    ob[12] = byte(lexdb_page.T_LEAF)
+    binary.setU64LE(mut &ob, 4, 22)
+    binary.setU32LE(mut &ob, 0, int(lexdb_base.crc32c(&ob, 4, 4096)))
+    lexdb_page.check(&ob, 22, lexdb_page.T_LEAF).unwrap()
+    let od = lexdb_page.decodeNode(&ob)
+    println("old type " + int(ob[12]).toStr() + " ok " + same(&od, &oks, &ovs).toStr() + " lazy " + od.lazy.toStr() + " size " +
+            od.size.toStr() + " counted " + (od.size == lexdb_page.leafSize(&leafOf(&oks, &ovs))).toStr() + " whole " + (at - 18).toStr())
+
+    println("body index " + throughBody(&ix, &iks, &ivs).toStr() + " long " + throughBody(&ln, &lks, &lvs).toStr() + " old " +
+            throughBody(&od, &oks, &ovs).toStr())
+
+    // front coded never over whole, whatever the keys and values
+    var r = lexdb_base.rng(3)
+    var ok = true
+    var prev = ""
+    for j in 0..3000 {
+        let kl = r.below(520)
+        let sh = if len(prev) > 0 { r.below(min(kl, len(prev)) + 1) } else { 0 }
+        var k = prev[0..sh]
+        while len(k) < kl { k = k + strings.repeat("q", 1) }
+        let vl = r.below(1300)
+        let v = if r.below(3) == 0 && vl <= kl { k[kl - vl..kl] } else { strings.repeat("v", vl) }
+        if lexdb_page.frontEntry(&prev, &k, &v) > lexdb_page.leafEntry(&k, &v) { ok = false }
+        prev = k
+    }
+    println("never larger " + ok.toStr())
 }

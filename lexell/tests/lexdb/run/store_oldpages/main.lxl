@@ -1,0 +1,198 @@
+// lexdb_store: a data directory from before front-coded leaves (design/
+// lexdb.md 9.109), as the store at 78731801 wrote it (fixture.lxl; made by
+// gen.lxl.txt): three trees in T_LEAF pages (a table's rows with a large
+// value in chunks, an index's entries whose value is the key's end, text
+// keys), and a last commit in the log only.
+// - Opened: the log is replayed over the old leaves, and every tree reads as
+//   the model (scan, backward, by key), the large value whole.
+// - A follower (a replica's reader) on the same files reads the same.
+// - Every index entry written again and a row of the table, then a
+//   checkpoint: the leaves written are T_FLEAF, one not written is still
+//   T_LEAF, all read right, and the index's leaves hold a fifth of the
+//   bytes (an entry about 6 bytes, not 29: its key front coded, its value the
+//   key's end; the leaves stay, half empty, as lexdb does not merge them).
+// - Opened again: the same, and the follower again.
+// expect: opened: before pages T_LEAF 7 T_FLEAF 0; model ok true
+// expect: follower: ok true
+// expect: written: pages T_LEAF 1 T_FLEAF 6; model ok true; index leaves 4, bytes 8700 then 1621
+// expect: reopened: model ok true; follower ok true
+import "os"
+import "fs"
+import "io"
+import "base64"
+import "binary"
+import "strings"
+import "../../../../cmd/lexdb_store"
+import "../../../../cmd/lexdb_disk"
+import "../../../../cmd/lexdb_page"
+import "./fixture"
+
+// The fixture's data (gen.lxl.txt's).
+fn be8(x: int): str {
+    var b = newStrBuf()
+    binary.addU64BE(mut &b, x)
+    return b.toStr()
+}
+fn tkey(i: int): str { return be8(i * 3) }
+fn tval(i: int): str { return "row " + i.toStr() + " " + strings.repeat("r", 10 + i % 21) }
+fn ikey(i: int): str { return "\x01" + be8(i % 37) + tkey(i) }
+fn ckey(i: int): str { return "code-" + i.toStr() }
+
+const A = 1
+const B = 2
+const C = 3
+
+type Model = record { a: Map[str, str]; b: Map[str, str]; c: Map[str, str] }
+
+fn model(): Model {
+    var m = Model{a: newMap(), b: newMap(), c: newMap()}
+    for i in 0..60 { m.a.put(tkey(i), tval(i)) }
+    m.a.put(tkey(1000), strings.repeat("big", 1200))
+    for i in 0..300 { m.b.put(ikey(i), tkey(i)) }
+    for i in 0..60 { m.c.put(ckey(i), "v" + i.toStr()) }
+    // the commit in the log
+    for i in 0..10 { m.a.put(tkey(60 + i), tval(60 + i)) }
+    for i in 0..10 { let gone = m.b.remove(&ikey(i * 7)) }
+    m.c.put(ckey(5), "changed")
+    return m
+}
+
+// Whether tree reads as want: forward, backward, and every key by get.
+fn same(st: &lexdb_store.Store, tree: int, want: &Map[str, str]): bool {
+    var t = lexdb_store.begin()
+    var keys: []str = []
+    var ok = true
+    st.scan(mut &t, tree, "", "", fn(e: &lexdb_store.Entry): bool {
+        if want.get(&e.key) != Some(e.val.toStr()) { ok = false }
+        append(mut &keys, e.key.toStr())
+        return true
+    }).unwrap()
+    if len(keys) != want.size() { return false }
+    for i in 1..len(keys) { if keys[i - 1] >= keys[i] { ok = false } }
+    var n = len(keys)
+    st.scanBack(mut &t, tree, "", "", fn(e: &lexdb_store.Entry): bool {
+        n -= 1
+        if n < 0 || e.key != keys[n] { ok = false }
+        return true
+    }).unwrap()
+    for k in keys { if st.get(mut &t, tree, k).unwrap() != want.get(&k) { ok = false } }
+    return ok && n == 0
+}
+
+fn sameAll(st: &lexdb_store.Store, m: &Model): bool { return same(st, A, &m.a) && same(st, B, &m.b) && same(st, C, &m.c) }
+
+fn sameFollower(fo: &lexdb_store.Follower, s: &lexdb_store.FSnap, tree: int, want: &Map[str, str]): bool {
+    var n = 0
+    var ok = true
+    fo.scan(s, tree, &"", &"", fn(e: &lexdb_store.Entry): bool {
+        if want.get(&e.key) != Some(e.val.toStr()) { ok = false }
+        n += 1
+        return true
+    }).unwrap()
+    return ok && n == want.size()
+}
+
+fn followerOk(st: &lexdb_store.Store, dir: &str, m: &Model): bool {
+    let fo = lexdb_store.openFollower(lexdb_store.Link.LocalId(st.handle(), 1), lexdb_disk.real(dir.toStr()), 1024 * 1024).unwrap()
+    fo.poll(st.durableBatch()).unwrap()
+    var ok = fo.ready()
+    if ok {
+        let s = fo.begin().unwrap()
+        ok = sameFollower(&fo, &s, A, &m.a) && sameFollower(&fo, &s, B, &m.b) && sameFollower(&fo, &s, C, &m.c)
+        fo.end(&s)
+    }
+    fo.close()
+    return ok
+}
+
+// The leaf pages of the last checkpoint's trees, by type (T_LEAF, T_FLEAF),
+// and tree's own: read from the page file down from the roots.
+type Census = record { plain: int; front: int; ofTree: int; bytes: int }
+
+fn census(dir: &str, tree: int): Census {
+    let b = io.read(fs.join(dir.toStr(), lexdb_store.DATA)).unwrap()
+    var best = -1
+    var roots = 0
+    for p in 0..2 {
+        let pg = strToBytes(b[p * 4096..p * 4096 + 4096].toStr())
+        match lexdb_page.decodeMeta(&pg, p) {
+            Some(m) { if m.ckpt > best { best = m.ckpt; roots = m.roots } }
+            None {}
+        }
+    }
+    var c = Census{plain: 0, front: 0, ofTree: 0, bytes: 0}
+    var pairs: []int = []
+    var p = roots
+    while p != 0 {
+        let n = binary.readU32LEStr(&b, p * 4096 + 24)
+        for i in 0..n { append(mut &pairs, int(binary.readU64LEStr(&b, p * 4096 + 28 + i * 8))) }
+        p = int(binary.readU64LEStr(&b, p * 4096 + 16))
+    }
+    var i = 0
+    while i + 1 < len(pairs) {
+        var stack = [pairs[i + 1]]
+        while len(stack) > 0 {
+            let q = pop(mut &stack)
+            let pg = strToBytes(b[q * 4096..q * 4096 + 4096].toStr())
+            lexdb_page.check(&pg, q, lexdb_page.T_LEAF).unwrap()
+            let typ = int(pg[12])
+            if typ == lexdb_page.T_INTERNAL {
+                for k in lexdb_page.decodeNode(&pg).kids { append(mut &stack, k) }
+                continue
+            }
+            if typ == lexdb_page.T_LEAF { c.plain += 1 } else { c.front += 1 }
+            if pairs[i] == tree {
+                c.ofTree += 1
+                // its entries' bytes on the page
+                let n = lexdb_page.decodeNode(&pg)
+                if typ == lexdb_page.T_FLEAF { c.bytes += n.size } else {
+                    for e in 0..n.count() { c.bytes += lexdb_page.leafEntry(&n.key(e), &n.val(e)) }
+                }
+            }
+        }
+        i += 2
+    }
+    return c
+}
+
+fn main() {
+    let dir = fs.join(os.tempDir(), "lexdb_oldpages_" + os.pid().toStr())
+    let made = fs.mkdirAll(dir)
+    for f in fixture.files() {
+        var b = array(f.size, byte(0))
+        for part in f.parts {
+            let bytes = base64.decodeStrict(part.b64).unwrap()
+            for j in 0..len(bytes) { b[part.at + j] = bytes[j] }
+        }
+        io.write(fs.join(dir, f.name), strFromBytes(&b)).unwrap()
+    }
+    let before = census(&dir, B)
+    let opts = lexdb_store.Options{cacheBytes: 4 * 1024 * 1024, segBytes: 32 * 1024, ckptBytes: 16 * 1024 * 1024, snapNodes: 100000, bufferedPages: false}
+    var m = model()
+    lexdb_store.run(lexdb_disk.real(dir.toStr()), opts, fn(st: lexdb_store.Store): int {
+        println("opened: before pages T_LEAF " + before.plain.toStr() + " T_FLEAF " + before.front.toStr() + "; model ok " +
+                sameAll(&st, &m).toStr())
+        println("follower: ok " + followerOk(&st, &dir, &m).toStr())
+        // every index entry written again (its leaves rewritten, front
+        // coded), and one row of the table's first leaf
+        var w = lexdb_store.begin()
+        for i in 0..300 {
+            if i % 7 == 0 && i < 70 { continue }
+            w.put(B, ikey(i), tkey(i)).unwrap()
+        }
+        w.put(A, tkey(0), "first row changed").unwrap()
+        m.a.put(tkey(0), "first row changed")
+        st.commit(w).unwrap()
+        st.checkpointAll().unwrap()
+        let after = census(&dir, B)
+        println("written: pages T_LEAF " + after.plain.toStr() + " T_FLEAF " + after.front.toStr() + "; model ok " +
+                sameAll(&st, &m).toStr() + "; index leaves " + after.ofTree.toStr() + ", bytes " + before.bytes.toStr() + " then " +
+                after.bytes.toStr())
+        return 0
+    }).unwrap()
+    lexdb_store.run(lexdb_disk.real(dir.toStr()), opts, fn(st: lexdb_store.Store): int {
+        println("reopened: model ok " + sameAll(&st, &m).toStr() + "; follower ok " + followerOk(&st, &dir, &m).toStr())
+        return 0
+    }).unwrap()
+    let gone = fs.removeAll(dir)
+}

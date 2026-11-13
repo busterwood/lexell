@@ -1,0 +1,50 @@
+// Makes the store-level fixture of design/lexdb.md 9.109 with the store as it
+// was before front-coded leaves (78731801): trees in pages written whole
+// (T_LEAF), and commits after the checkpoint in the log only.
+import "os"
+import "binary"
+import "strings"
+import "../cmd/lexdb_store"
+import "../cmd/lexdb_disk"
+
+fn be8(x: int): str {
+    var b = newStrBuf()
+    binary.addU64BE(mut &b, x)
+    return b.toStr()
+}
+// tree 1, a table's: 8-byte keys, rows of 20 to 40 bytes
+fn tkey(i: int): str { return be8(i * 3) }
+fn tval(i: int): str { return "row " + i.toStr() + " " + strings.repeat("r", 10 + i % 21) }
+// tree 2, an index's: 1, a column's 8 bytes, the key's 8; the value the key's
+fn ikey(i: int): str { return "\x01" + be8(i % 37) + tkey(i) }
+// tree 3: text keys
+fn ckey(i: int): str { return "code-" + i.toStr() }
+
+fn main() {
+    let dir = os.arguments()[0]
+    let opts = lexdb_store.Options{cacheBytes: 4 * 1024 * 1024, segBytes: 32 * 1024, ckptBytes: 16 * 1024 * 1024, snapNodes: 100000, bufferedPages: false}
+    let r = lexdb_store.run(lexdb_disk.real(dir), opts, fn(st: lexdb_store.Store): int {
+        var t = lexdb_store.begin()
+        let a = st.createTree(mut &t)
+        let b = st.createTree(mut &t)
+        let c = st.createTree(mut &t)
+        st.commit(t).unwrap()
+        var w = lexdb_store.begin()
+        for i in 0..60 { w.put(a, tkey(i), tval(i)).unwrap() }
+        w.put(a, tkey(1000), strings.repeat("big", 1200)).unwrap()
+        for i in 0..300 { w.put(b, ikey(i), tkey(i)).unwrap() }
+        for i in 0..60 { w.put(c, ckey(i), "v" + i.toStr()).unwrap() }
+        st.commit(w).unwrap()
+        st.checkpointAll().unwrap()
+        // in the log only
+        var l = lexdb_store.begin()
+        for i in 0..10 { l.put(a, tkey(60 + i), tval(60 + i)).unwrap() }
+        for i in 0..10 { l.del(b, ikey(i * 7)) }
+        l.put(c, ckey(5), "changed").unwrap()
+        st.commit(l).unwrap()
+        println("trees " + a.toStr() + " " + b.toStr() + " " + c.toStr() + " durable batch " + st.durableBatch().toStr())
+        // gone without closing (the close would checkpoint): the last
+        // commit is in the log only, as after a crash
+        exit(0)
+    })
+}
