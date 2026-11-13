@@ -1,0 +1,287 @@
+// lexdb_exec: automatic statistics (optimizer 44). A table whose rows
+// changed since its last analysis pass 50 + 10% of its rows then (as
+// PostgreSQL's autovacuum_analyze_threshold and _scale_factor) is analyzed
+// by a look of the automatic statistics (autoAnalyzeStep; lexdb's master
+// runs one a second in a task of its own, autoAnalyzer, while commits have
+// counted changes).
+// - The threshold: a table never analyzed after 51 changes, not 50; one of
+//   51 rows after 56; 1,000 rows after 151.
+// - What is counted: rows inserted, updated and deleted by statements and
+//   blocks that commit (a cascade too), per kind, in pg_stat_user_tables;
+//   not a rolled back block, a failed statement, a temporary table, a
+//   session with SET lexdb_autoanalyze = off, nor anything while the
+//   process's switch is off (setAutoAnalyze: LEXDB_AUTOANALYZE=off).
+//   ROLLBACK TO a savepoint keeps its rows counted (a statistics' count:
+//   too many at worst, as the changes it undid).
+// - ANALYZE starts the count again (not in a block, which may roll back).
+// - Plans change as statistics come: the tie of optimizer 20 (ev_kind by
+//   the rules, ev_uid with estimates); a join ordered by cost once both
+//   tables have statistics (optimizer 26). Results are the same.
+// - The analysis takes turns: point selects in another task go on while
+//   it reads 30,000 rows (the longest wait between two of them a small part
+//   of the analysis' time).
+// - The task itself analyzes after a commit, within its naps.
+// - A replica counts nothing and never analyzes (its look does nothing);
+//   the master's statistics reach it with the rest.
+// expect: 49 rows: 49|0|0|49|49|0|0, look 0; 50: look 0; 51: look 1, 51|0|0|51|0|0|1
+// expect: before: scan ev: index ev_kind lookup
+// expect: after the look: scan ev: index ev_uid lookup (estimated 1 rows)
+// expect: 1,000 rows: look 1; scan ev: index ev_uid lookup (estimated 10 rows); 1000|0|0|1000|0|0|2
+// expect: 150 updated: look 0; one more: look 1; 1000|151|0|1000|0|0|3
+// expect: not counted: session off 0, show off, rollback 0, failed 22012 0, process off 0 look 0, temp 0; reset on
+// expect: counted: block 1015|161|5|1010|30|0|3, savepoint 1016|161|5|1011|31, cascade child 0|7|7
+// expect: analyze: 0|1 in a block 26|0 then 0|1
+// expect: join before: scan big b: full scan / join small s: primary key lookup per row / aggregate
+// expect: join after: scan small s: index small_label lookup, index only (estimated 1 rows) / join big b: index big_sid lookup (estimated 200 rows) per row / aggregate
+// expect: join result the same: true
+// expect: turns: analyzed 1, selects during it true, longest wait short true
+// expect: the task: analyzed true
+// expect: replica: update 25006, counts none, look 0; master's statistics there: scan ev: index ev_uid lookup (estimated 11 rows)
+// timeout: 60
+import "strings"
+import "task"
+import "time"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+
+// every row of the last result, or its tag, or the error's state
+fn all(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if !r.hasRows { return r.tag }
+            var rows: []str = []
+            for row in r.rows {
+                var cells: []str = []
+                for v in row { append(mut &cells, lexdb_exec.text(&v)) }
+                append(mut &rows, strings.join(&cells, "|"))
+            }
+            return strings.join(&rows, " / ")
+        }
+        Err(e) { return e.state }
+    }
+}
+
+// ins|upd|del|live|mod|analyze_count|autoanalyze_count
+fn stat(s: mut &lexdb_exec.Session, rel: &str): str {
+    return all(s, &("select n_tup_ins, n_tup_upd, n_tup_del, n_live_tup, n_mod_since_analyze, analyze_count, autoanalyze_count " +
+                    "from pg_stat_user_tables where relname = '" + rel + "'"))
+}
+
+// A look; again while one waits for its table's last analysis (AUTO_COOL:
+// it leaves the look due)
+fn look(st: &lexdb_store.Store): str {
+    var tries = 0
+    while true {
+        match lexdb_exec.autoAnalyzeStep(st) {
+            Ok(n) {
+                if n > 0 || st.memoGet(&"\x00acdue").isNone() || tries > 200 { return n.toStr() }
+            }
+            Err(e) { return e.state + " " + e.msg }
+        }
+        let z = task.sleep(5)
+        tries += 1
+    }
+    return ""
+}
+
+fn poll(rep: &lexdb_store.Store, st: &lexdb_store.Store) {
+    let n = rep.follower().unwrap().poll(st.durableBatch()).unwrap()
+}
+
+type Arg = record { st: lexdb_store.Store; which: int }
+
+// which 0: a look (big's changes over its threshold), its time in the
+// memo; 1: point selects until it is done, the longest wait between two
+fn turns(a: Arg): int {
+    if a.which == 0 {
+        while a.st.memoGet(&"test.started").isNone() { let y = task.yield() }
+        let t0 = time.monotonicNs()
+        let n = look(&a.st)
+        a.st.memoPut(&"test.look", &n)
+        a.st.memoPut(&"test.ns", &(time.monotonicNs() - t0).toStr())
+        a.st.memoPut(&"test.done", &"1")
+        return 0
+    }
+    var s = lexdb_exec.newSession(a.st)
+    let warm = all(mut &s, &"select v from big where id = 1")
+    a.st.memoPut(&"test.started", &"1")
+    let y0 = task.yield()
+    var n = 0
+    var last = time.monotonicNs()
+    var gap = 0
+    while a.st.memoGet(&"test.done").isNone() {
+        let r = all(mut &s, &("select v from big where id = " + (1 + (n * 37) % 30000).toStr()))
+        let now = time.monotonicNs()
+        if now - last > gap { gap = now - last }
+        last = now
+        n += 1
+        // (a select takes no turn of its own: the look runs at the yield)
+        let y = task.yield()
+    }
+    a.st.memoPut(&"test.selects", &n.toStr())
+    a.st.memoPut(&"test.gap", &gap.toStr())
+    s.close()
+    return 0
+}
+
+fn memoInt(st: &lexdb_store.Store, k: &str): int { return strings.parseIntOpt(st.memoGet(k).unwrapOr("0")).unwrapOr(0) }
+
+fn main() {
+    lexdb_exec.setAutoAnalyze(true)             // whatever LEXDB_AUTOANALYZE says
+    let fs = lexdb_disk.sim(44)
+    let opts = lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 4 * 1024 * 1024, ckptBytes: 2 * 1024 * 1024, snapNodes: 100000,
+                                   bufferedPages: false}
+    lexdb_store.run(fs, opts, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var m = lexdb_exec.newSession(st)
+        let c1 = all(mut &m, &"create table ev (id int primary key, kind int, uid int)")
+        let c2 = all(mut &m, &"create index ev_kind on ev (kind)")
+        let c3 = all(mut &m, &"create index ev_uid on ev (uid)")
+        let q = "select id from ev where kind = 1 and uid = 5"
+        // the threshold of a table never analyzed: 50
+        let i1 = all(mut &m, &"insert into ev select g, 1, g % 100 from generate_series(1, 49) g")
+        let s49 = stat(mut &m, &"ev")
+        let l49 = look(&st)
+        let i2 = all(mut &m, &"insert into ev values (50, 1, 50)")
+        let l50 = look(&st)
+        let before = all(mut &m, &("explain " + q))
+        let i3 = all(mut &m, &"insert into ev values (51, 1, 51)")
+        let l51 = look(&st)
+        println("49 rows: " + s49 + ", look " + l49 + "; 50: look " + l50 + "; 51: look " + l51 + ", " + stat(mut &m, &"ev"))
+        println("before: " + before)
+        println("after the look: " + all(mut &m, &("explain " + q)))
+        // 51 rows: 55; then 1,000 rows: kind 1 for 990, uid 100 values
+        let i4 = all(mut &m, &"insert into ev select g, case when g <= 990 then 1 else 2 end, g % 100 from generate_series(52, 1000) g")
+        let l1k = look(&st)
+        println("1,000 rows: look " + l1k + "; " + all(mut &m, &("explain " + q)) + "; " + stat(mut &m, &"ev"))
+        // 1,000 rows: 150
+        let u1 = all(mut &m, &"update ev set uid = uid where id <= 150")
+        let l150 = look(&st)
+        let u2 = all(mut &m, &"update ev set uid = uid where id = 151")
+        let l151 = look(&st)
+        println("150 updated: look " + l150 + "; one more: look " + l151 + "; " + stat(mut &m, &"ev"))
+
+        // not counted
+        let o1 = all(mut &m, &"set lexdb_autoanalyze = off")
+        let o2 = all(mut &m, &"update ev set uid = uid where id <= 500")
+        let offN = all(mut &m, &"select n_mod_since_analyze from pg_stat_user_tables where relname = 'ev'")
+        let shown = all(mut &m, &"show lexdb_autoanalyze")
+        let o3 = all(mut &m, &"reset lexdb_autoanalyze")
+        let b1 = all(mut &m, &"begin")
+        let b2 = all(mut &m, &"update ev set uid = uid where id <= 500")
+        let b3 = all(mut &m, &"rollback")
+        let rbN = all(mut &m, &"select n_mod_since_analyze from pg_stat_user_tables where relname = 'ev'")
+        let f1 = all(mut &m, &"update ev set uid = 10 / (kind - 2) where id >= 900")
+        let failN = all(mut &m, &"select n_mod_since_analyze from pg_stat_user_tables where relname = 'ev'")
+        lexdb_exec.setAutoAnalyze(false)
+        let p1 = all(mut &m, &"update ev set uid = uid where id <= 500")
+        let pl = look(&st)
+        lexdb_exec.setAutoAnalyze(true)
+        let procN = all(mut &m, &"select n_mod_since_analyze from pg_stat_user_tables where relname = 'ev'")
+        let t1 = all(mut &m, &"create temp table tt (id int primary key)")
+        let t2 = all(mut &m, &"insert into tt select g from generate_series(1, 300) g")
+        let tempN = all(mut &m, &"select n_mod_since_analyze from pg_stat_user_tables where relname = 'tt'")
+        println("not counted: session off " + offN + ", show " + shown + ", rollback " + rbN + ", failed " + f1 + " " + failN + ", process off " +
+                procN + " look " + pl + ", temp " + tempN + "; reset " + all(mut &m, &"show lexdb_autoanalyze"))
+
+        // counted: a block's, per kind; ROLLBACK TO's; a cascade's
+        let k1 = all(mut &m, &"begin")
+        let k2 = all(mut &m, &"insert into ev select g, 3, g % 100 from generate_series(1001, 1015) g")
+        let k3 = all(mut &m, &"update ev set kind = 4 where id > 1005")
+        let k4 = all(mut &m, &"delete from ev where id > 1010")
+        let k5 = all(mut &m, &"commit")
+        let blk = stat(mut &m, &"ev")
+        let v1 = all(mut &m, &"begin")
+        let v2 = all(mut &m, &"savepoint a")
+        let v3 = all(mut &m, &"insert into ev values (1100, 5, 5)")
+        let v4 = all(mut &m, &"rollback to savepoint a")
+        let v5 = all(mut &m, &"commit")
+        let sp = all(mut &m, &"select n_tup_ins, n_tup_upd, n_tup_del, n_live_tup, n_mod_since_analyze from pg_stat_user_tables where relname = 'ev'")
+        let p2 = all(mut &m, &"create table par (id int primary key)")
+        let p3 = all(mut &m, &"create table chi (id int primary key, pid int references par (id) on delete cascade)")
+        let p4 = all(mut &m, &"insert into par select g from generate_series(1, 10) g")
+        let p5 = all(mut &m, &"insert into chi select g, g % 10 + 1 from generate_series(1, 70) g")
+        let p6 = all(mut &m, &"delete from par where id = 3")
+        let ch = all(mut &m, &"select n_tup_upd, n_tup_del, n_mod_since_analyze - 70 from pg_stat_user_tables where relname = 'chi'")
+        println("counted: block " + blk + ", savepoint " + sp + ", cascade child " + ch)
+
+        // ANALYZE starts the count again; in a block it does not
+        let a1 = all(mut &m, &"analyze ev")
+        let an = all(mut &m, &"select n_mod_since_analyze, analyze_count from pg_stat_user_tables where relname = 'ev'")
+        let a2 = all(mut &m, &"update ev set uid = uid where id <= 26")
+        let a3 = all(mut &m, &"begin")
+        let a4 = all(mut &m, &"analyze ev")
+        let a5 = all(mut &m, &"commit")
+        let an2 = all(mut &m, &"select n_mod_since_analyze, analyze_count - 1 from pg_stat_user_tables where relname = 'ev'")
+        let a6 = all(mut &m, &"analyze")
+        let an3 = all(mut &m, &"select n_mod_since_analyze, analyze_count - 1 from pg_stat_user_tables where relname = 'ev'")
+        println("analyze: " + an + " in a block " + an2 + " then " + an3)
+
+        // a join ordered by cost once both tables have statistics (optimizer 26)
+        let j1 = all(mut &m, &"create table small (id int primary key, label text)")
+        let j2 = all(mut &m, &"create index small_label on small (label)")
+        let j3 = all(mut &m, &"create table big (id int primary key, sid int, v int)")
+        let j4 = all(mut &m, &"create index big_sid on big (sid)")
+        let j5 = all(mut &m, &"insert into small select g, case when g = 7 then 'x' else 'l' || g end from generate_series(1, 100) g")
+        let j6 = all(mut &m, &"insert into big select g, g % 100 + 1, g from generate_series(1, 20000) g")
+        let jq = "select count(*), sum(b.v) from big b join small s on b.sid = s.id where s.label = 'x'"
+        let jb = all(mut &m, &("explain " + jq))
+        let r1 = all(mut &m, &jq)
+        let jl = look(&st)
+        println("join before: " + jb)
+        println("join after: " + all(mut &m, &("explain " + jq)))
+        println("join result the same: " + (all(mut &m, &jq) == r1 && jl == "2").toStr())
+
+        // turns: 30,000 rows analyzed beside point selects
+        let g1 = all(mut &m, &"insert into big select g, g % 100 + 1, g from generate_series(20001, 30000) g")
+        let g2 = all(mut &m, &"update big set v = v + 1 where id <= 20000")
+        task.scope(fn(sc: mut &task.Scope) {
+            sc.spawn(turns, Arg{st: st, which: 1})
+            sc.spawn(turns, Arg{st: st, which: 0})
+        })
+        let ns = memoInt(&st, &"test.ns")
+        let gap = memoInt(&st, &"test.gap")
+        println("turns: analyzed " + st.memoGet(&"test.look").unwrapOr("?") + ", selects during it " + (memoInt(&st, &"test.selects") > 5).toStr() +
+                ", longest wait short " + (gap * 4 < ns).toStr())
+        if gap * 4 >= ns { println("  (analysis " + ns.toStr() + " ns, longest wait " + gap.toStr() + " ns)") }
+
+        // the task: a commit's changes analyzed within its naps
+        let x1 = all(mut &m, &"create table tk (id int primary key, a int)")
+        let x2 = all(mut &m, &"insert into tk select g, g from generate_series(1, 100) g")
+        var seen = false
+        task.scope(fn(sc: mut &task.Scope) {
+            let f = sc.start(lexdb_exec.autoAnalyzer, st)
+            var tries = 0
+            while tries < 60 && !seen {
+                let z = task.sleep(100)
+                seen = all(mut &m, &"select autoanalyze_count from pg_stat_user_tables where relname = 'tk'") == "1"
+                tries += 1
+            }
+            { let stop = f }
+        })
+        println("the task: analyzed " + seen.toStr())
+
+        // a replica: refuses writes, counts nothing, never analyzes; the
+        // master's statistics reach it
+        st.checkpoint().unwrap()
+        let rep = lexdb_store.openReplica(fs, opts, lexdb_store.Link.Local(st)).unwrap()
+        poll(&rep, &st)
+        lexdb_exec.bootstrap(&rep).unwrap()
+        var r = lexdb_exec.newSession(rep)
+        let ru = all(mut &r, &"update ev set uid = uid where id <= 300")
+        let rc = all(mut &r, &"select n_mod_since_analyze from pg_stat_user_tables where relname = 'ev'")
+        let rl = look(&rep)
+        let mu = all(mut &m, &"update ev set kind = 2 where id <= 300")
+        let ml = look(&st)
+        poll(&rep, &st)
+        println("replica: update " + ru + ", counts " + (if rc == "0" { "none" } else { rc }) + ", look " + rl + "; master's statistics there: " +
+                all(mut &r, &("explain " + q)))
+        if ml != "1" { println("  master's look: " + ml) }
+        r.close()
+        rep.close()
+        m.close()
+        return 0
+    }).unwrap()
+}

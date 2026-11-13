@@ -4111,9 +4111,16 @@ fn analyzeStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
     }
     var snap = try st.beginSnapshot()
     var failed: []DbErr = []
+    var counted: []int = []             // per table: its rows, its time
+    var c0s: [][]int = []               // its counts when it began
     for t in tabs {
+        append(mut &c0s, acCounts(st, t.tree))
+        let t0 = time.monotonicNs()
         match analyzeTable(st, txn, mut &snap, &t, &lim) {
-            Ok(_) {}
+            Ok(n) {
+                append(mut &counted, n)
+                append(mut &counted, time.monotonicNs() - t0)
+            }
             Err(x) {
                 append(mut &failed, x)
                 break
@@ -4122,6 +4129,11 @@ fn analyzeStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
     }
     st.endSnapshot(&snap)
     if len(failed) > 0 { return Err(failed[0]) }
+    // the automatic statistics' counts start again (optimizer 44); not in a
+    // block, which may roll back (the automatic one may then come early)
+    if !txn.inBlock() {
+        for i in 0..len(tabs) { acDone(st, &tabs[i], counted[2 * i], &c0s[i], false, counted[2 * i + 1]) }
+    }
     // a temporary table's statistics are its session's alone: its kept
     // plans are made again (tmpBump), no other session's (optimizer 40)
     var perm = false
@@ -4396,9 +4408,15 @@ fn keepCommon(keys: mut &[]str, cnts: mut &[]int, key: &str, c: int) {
     }
 }
 
+// Table t's statistics counted from its rows on snap, written in txn; its
+// rows. It takes turns (9.15) as a statement does: after TURN_NS of
+// reading, the other sessions run (an ANALYZE of a million rows held every
+// session for over a second; the automatic one runs beside them: optimizer
+// 44).
 fn analyzeTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, snap: mut &lexdb_store.Txn, t: &Table,
-                lim: &Limits): Result[Unit, DbErr] {
+                lim: &Limits): Result[int, DbErr] {
     var rows = 0
+    var turnEnd = time.monotonicNs() + TURN_NS
     var entries: []int = []
     var seen: [][]Map[str, int] = []
     // the leading column's least and greatest values as numbers, when they
@@ -4450,7 +4468,15 @@ fn analyzeTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, snap: mut &le
     var pkCnts: []int = []
     var cur = newCursor()
     while !cur.done {
-        if lim.deadline != 0 && time.monotonicNs() > lim.deadline { return Err(e("57014", "canceling statement due to statement timeout")) }
+        let now = time.monotonicNs()
+        if lim.deadline != 0 && now > lim.deadline { return Err(e("57014", "canceling statement due to statement timeout")) }
+        if now > turnEnd {
+            match task.yield() {
+                Ok(_) {}
+                Err(_) { return Err(e("57014", "canceling statement: its session has ended")) }
+            }
+            turnEnd = time.monotonicNs() + TURN_NS
+        }
         var batch: [][]Val = []
         try fetch(st, snap, t, &path, &sc, &all, mut &cur, mut &batch)
         for r in batch {
@@ -4569,7 +4595,334 @@ fn analyzeTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, snap: mut &le
         out.add(";d:" + strings.join(&parts, ","))
     }
     try txn.put(CATALOG, statKey(&t.name), out.toStr())
-    return Ok(Unit{})
+    return Ok(rows)
+}
+
+// ---- automatic statistics (optimizer 44), as PostgreSQL's autovacuum
+// analyzes: a table whose rows changed since its last ANALYZE pass
+// AUTO_THRESHOLD + AUTO_SCALE_PCT% of its rows then (autovacuum_analyze_
+// threshold 50, autovacuum_analyze_scale_factor 0.1) is analyzed again, by
+// a task of its own (autoAnalyzer) that takes turns with the sessions.
+// - Counted: each row an INSERT, UPDATE or DELETE writes (COPY, a
+//   cascade, ON CONFLICT's too: storeRow, updRow, delRow), per session
+//   while its transaction runs; added to the table's count when it
+//   commits, dropped when it does not (as PostgreSQL's changed tuples).
+//   Temporary tables are not counted, as autovacuum does not see them.
+// - Kept in the store's memo, not the catalog: counts and times are lost
+//   at a restart (PostgreSQL's after a crash). The rows at the last
+//   analysis are then read from the statistics' row.
+// - Off: LEXDB_AUTOANALYZE=off for the process (nothing counted, no task);
+//   SET lexdb_autoanalyze = off for a session (its changes not counted).
+//   A replica never analyzes: its statistics are the master's.
+// Statistics change plans only, never results.
+
+const AUTO_THRESHOLD: int = 50
+const AUTO_SCALE_PCT: int = 10
+const AUTO_NAP_MS: int = 1000              // between looks (autovacuum_naptime is 60 s)
+const AUTO_COOL: int = 9                   // after an analysis of d ms, the table waits AUTO_COOL x d: at most a tenth of the time
+
+// The rows counted for one session and table, before they go to the memo
+// (chgFlush): a row's count is a few integer operations. Globals must be of
+// copy types (and the SQL runs on one thread).
+var CHG_SESS: int = -1
+var CHG_TREE: int = -1
+var CHG_I: int = 0
+var CHG_U: int = 0
+var CHG_D: int = 0
+var AUTO_STATE: int = 0                    // 0 not yet read, 1 on, 2 off
+
+// Automatic statistics on or off for the process (lexdb's LEXDB_AUTOANALYZE).
+pub fn setAutoAnalyze(on: bool) { AUTO_STATE = if on { 1 } else { 2 } }
+
+pub fn autoAnalyzeOn(): bool {
+    if AUTO_STATE == 0 {
+        AUTO_STATE = 1
+        match os.env("LEXDB_AUTOANALYZE") {
+            Some(v) {
+                let x = strings.toLowerAscii(v)
+                if x == "off" || x == "0" || x == "false" || x == "no" { AUTO_STATE = 2 }
+            }
+            None {}
+        }
+    }
+    return AUTO_STATE == 1
+}
+
+const AC_DUE: str = "\x00acdue"
+fn acPendKey(sess: int): str { return "\x00acp\x00" + sess.toStr() }
+fn acKey(tree: int): str { return "\x00ac\x00" + tree.toStr() }
+fn acStateKey(tree: int): str { return "\x00acs\x00" + tree.toStr() }
+
+// Space-separated integers, n of them (0 those missing).
+fn intsOf(v: &str, n: int): []int {
+    var out: []int = array(n, 0)
+    let f = strings.split(v, " ")
+    for i in 0..min(n, len(f)) { out[i] = strings.parseIntOpt(f[i].toStr()).unwrapOr(0) }
+    return out
+}
+
+fn intsText(xs: &[]int): str {
+    var parts: []str = []
+    for x in xs { append(mut &parts, x.toStr()) }
+    return strings.join(&parts, " ")
+}
+
+// A row of table t written by txn: kind 0 inserted, 1 updated, 2 deleted.
+fn noteChg(st: &lexdb_store.Store, txn: &lexdb_store.Txn, t: &Table, kind: int) {
+    if AUTO_STATE == 2 { return }
+    if txn.sess != CHG_SESS || t.tree != CHG_TREE {
+        if !autoAnalyzeOn() || tempRel(&t.name) || txn.sess <= 0 { return }
+        chgFlush(st)
+        CHG_SESS = txn.sess
+        CHG_TREE = t.tree
+    }
+    if kind == 0 { CHG_I += 1 } else if kind == 1 { CHG_U += 1 } else { CHG_D += 1 }
+}
+
+// A table's counts (acKey): its rows changed since its last analysis;
+// inserted, updated, deleted since the store opened; inserted less deleted
+// since its last analysis.
+fn acCounts(st: &lexdb_store.Store, tree: int): []int { return intsOf(&st.memoGet(&acKey(tree)).unwrapOr(""), 5) }
+
+// The rows counted so far into their session's pending counts:
+// "tree ins upd del" per table, ";" between.
+fn chgFlush(st: &lexdb_store.Store) {
+    if CHG_SESS < 0 { return }
+    let k = acPendKey(CHG_SESS)
+    let add: []int = [CHG_TREE, CHG_I, CHG_U, CHG_D]
+    var parts: []str = []
+    var found = false
+    match st.memoGet(&k) {
+        Some(v) {
+            for p in strings.split(&v, ";") {
+                var xs = intsOf(&p.toStr(), 4)
+                if xs[0] == CHG_TREE {
+                    for i in 1..4 { xs[i] += add[i] }
+                    found = true
+                }
+                append(mut &parts, intsText(&xs))
+            }
+        }
+        None {}
+    }
+    if !found { append(mut &parts, intsText(&add)) }
+    st.memoPut(&k, &strings.join(&parts, ";"))
+    CHG_SESS = -1
+    CHG_TREE = -1
+    CHG_I = 0
+    CHG_U = 0
+    CHG_D = 0
+}
+
+// A session's transaction ended: its counts added to its tables' (keep:
+// it committed, and the session counts its changes), or dropped.
+fn chgEnd(st: &lexdb_store.Store, sess: int, keep: bool) {
+    if AUTO_STATE == 2 { return }
+    if CHG_SESS == sess { chgFlush(st) }
+    let k = acPendKey(sess)
+    let got = st.memoGet(&k)
+    if got.isNone() { return }
+    st.memoDel(&k)
+    if !keep { return }
+    for p in strings.split(&got.unwrap(), ";") {
+        let xs = intsOf(&p.toStr(), 4)
+        // the table's: changed since its last analysis, then inserted, updated, deleted
+        var c = intsOf(&st.memoGet(&acKey(xs[0])).unwrapOr(""), 5)
+        c[0] += xs[1] + xs[2] + xs[3]
+        for i in 1..4 { c[i] += xs[i] }
+        c[4] += xs[1] - xs[3]
+        st.memoPut(&acKey(xs[0]), &intsText(&c))
+    }
+    st.memoPut(&AC_DUE, &"1")
+}
+
+// A table's analysis state: the rows at its last analysis (-1 not known),
+// when (lexdb_time.nowTstz(); 0 never) by ANALYZE and automatically, how
+// many of each, the time it took (ns, the automatic ones' in all), and
+// until when (monotonic ns) it waits before the next automatic one.
+type AcState = record { base: int; last: int; lastAuto: int; n: int; nAuto: int; ns: int; nsAuto: int; cool: int }
+
+fn acState(st: &lexdb_store.Store, tree: int): AcState {
+    match st.memoGet(&acStateKey(tree)) {
+        Some(v) {
+            let xs = intsOf(&v, 8)
+            return AcState{base: xs[0], last: xs[1], lastAuto: xs[2], n: xs[3], nAuto: xs[4], ns: xs[5], nsAuto: xs[6], cool: xs[7]}
+        }
+        None { return AcState{base: -1, last: 0, lastAuto: 0, n: 0, nAuto: 0, ns: 0, nsAuto: 0, cool: 0} }
+    }
+}
+
+fn acPut(st: &lexdb_store.Store, tree: int, a: &AcState) {
+    st.memoPut(&acStateKey(tree), &intsText(&[a.base, a.last, a.lastAuto, a.n, a.nAuto, a.ns, a.nsAuto, a.cool]))
+}
+
+// Table t analyzed (auto: by the task), its rows counted; c0 its counts
+// when the analysis began (acKey's: changes since then stay counted); ns
+// its time.
+fn acDone(st: &lexdb_store.Store, t: &Table, rows: int, c0: &[]int, auto: bool, ns: int) {
+    var c = intsOf(&st.memoGet(&acKey(t.tree)).unwrapOr(""), 5)
+    c[0] = max(0, c[0] - c0[0])
+    c[4] = c[4] - c0[4]
+    st.memoPut(&acKey(t.tree), &intsText(&c))
+    var a = acState(st, t.tree)
+    a.base = rows
+    if auto {
+        a.lastAuto = lexdb_time.nowTstz()
+        a.nAuto += 1
+        a.nsAuto += ns
+    } else {
+        a.last = lexdb_time.nowTstz()
+        a.n += 1
+        a.ns += ns
+    }
+    acPut(st, t.tree, &a)
+}
+
+// The rows table t had at its last ANALYZE, from its statistics' row (0
+// none: PostgreSQL's reltuples of a table never analyzed counts as 0).
+fn statRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table): Result[int, DbErr] {
+    match try st.getUnnoted(txn, CATALOG, statKey(&t.name)) {
+        Some(v) {
+            let parts = strings.split(&v, ";")
+            if len(parts) >= 2 && strings.parseIntOpt(parts[0].toStr()).unwrapOr(-1) == t.tree {
+                return Ok(max(0, strings.parseIntOpt(parts[1].toStr()).unwrapOr(0)))
+            }
+        }
+        None {}
+    }
+    return Ok(0)
+}
+
+// One look of the automatic statistics: each table whose changes passed
+// its threshold analyzed, in a transaction of its own; the number analyzed.
+// A table analyzed lately waits (AUTO_COOL); one whose analysis failed (a
+// conflict, a snapshot gone too old beside heavy writes) is tried at a
+// later look. Nothing on a replica.
+pub fn autoAnalyzeStep(st: &lexdb_store.Store): Result[int, DbErr] {
+    if st.isReplica() || !autoAnalyzeOn() { return Ok(0) }
+    st.memoDel(&AC_DUE)
+    var keys: []str = []
+    var raw: []str = []
+    var lt = lexdb_store.begin()
+    // (other sessions' temporary tables are not listed: catScan)
+    let listed = catScan(st, mut &lt, &"\x06", &"", &"", fn(en: &lexdb_store.Entry): bool {
+        append(mut &keys, en.key)
+        append(mut &raw, en.val)
+        return true
+    })
+    st.abort(lt)
+    try listed
+    var done = 0
+    for i in 0..len(keys) {
+        let t = try decTable(&keys[i], &raw[i])
+        if len(t.view) > 0 || tempRel(&t.name) || t.tree < 0 { continue }
+        let c0 = acCounts(st, t.tree)
+        let mod = c0[0]
+        if mod <= 0 { continue }
+        var a = acState(st, t.tree)
+        if a.base < 0 {
+            var rt = lexdb_store.begin()
+            let got = statRows(st, mut &rt, &t)
+            st.abort(rt)
+            a.base = try got
+            acPut(st, t.tree, &a)
+        }
+        if mod <= AUTO_THRESHOLD + a.base * AUTO_SCALE_PCT / 100 { continue }
+        if time.monotonicNs() < a.cool {
+            st.memoPut(&AC_DUE, &"1")
+            continue
+        }
+        let t0 = time.monotonicNs()
+        let r = autoOne(st, &keys[i], &raw[i], &t, mod)
+        let t1 = time.monotonicNs()
+        var b = acState(st, t.tree)
+        b.cool = t1 + AUTO_COOL * (t1 - t0)
+        acPut(st, t.tree, &b)
+        match r {
+            Ok(rows) {
+                if rows >= 0 {
+                    acDone(st, &t, rows, &c0, true, t1 - t0)
+                    done += 1
+                }
+            }
+            Err(x) {
+                // tried again at a later look; a cancelled task ends
+                st.memoPut(&AC_DUE, &"1")
+                if x.state == "57014" { return Err(x) }
+            }
+        }
+    }
+    return Ok(done)
+}
+
+// Table t (catalog key key, row raw when listed) analyzed and committed:
+// its rows; -1 it changed or went since it was listed.
+fn autoOne(st: &lexdb_store.Store, key: &str, raw: &str, t: &Table, mod: int): Result[int, DbErr] {
+    var tx = lexdb_store.begin()
+    // its catalog row read (noted): a DROP or ALTER meanwhile fails the commit
+    match st.get(mut &tx, CATALOG, key.toStr()) {
+        Ok(got) {
+            if got.isNone() || got.unwrap() != raw {
+                st.abort(tx)
+                return Ok(-1)
+            }
+        }
+        Err(x) {
+            st.abort(tx)
+            return Err(x)
+        }
+    }
+    match st.beginSnapshot() {
+        Ok(snap0) {
+            var snap = snap0
+            let r = analyzeTable(st, mut &tx, mut &snap, t, &noLimits())
+            st.endSnapshot(&snap)
+            match r {
+                Ok(rows) {
+                    match statVersion(st, mut &tx) {
+                        Ok(v) {
+                            match tx.put(CATALOG, STAT_VERSION, nextVersion(&v)) {
+                                Ok(_) {}
+                                Err(x) {
+                                    st.abort(tx)
+                                    return Err(x)
+                                }
+                            }
+                        }
+                        Err(x) {
+                            st.abort(tx)
+                            return Err(x)
+                        }
+                    }
+                    try st.commit(tx)
+                    return Ok(rows)
+                }
+                Err(x) {
+                    st.abort(tx)
+                    return Err(x)
+                }
+            }
+        }
+        Err(x) {
+            st.abort(tx)
+            return Err(x)
+        }
+    }
+}
+
+// The task: a look every AUTO_NAP_MS when a commit counted changes, until
+// it is cancelled (lexdb's master starts it; a replica does not).
+pub fn autoAnalyzer(st: lexdb_store.Store): int {
+    if st.isReplica() || !autoAnalyzeOn() { return 0 }
+    while true {
+        if task.sleep(AUTO_NAP_MS).isErr() { return 0 }
+        if st.memoGet(&AC_DUE).isNone() { continue }
+        match autoAnalyzeStep(&st) {
+            Ok(_) {}
+            Err(x) { if x.state == "57014" { return 0 } }
+        }
+    }
+    return 0
 }
 
 // ---- schemas (9.20): a table's catalog key is its name qualified by its
@@ -5234,9 +5587,10 @@ pub type Limits = value record {
     pub deadline: int           // time.monotonicNs() to stop at; 0 none
     pub batch: bool             // SET lexdb_batch: aggregates over batches of rows (9.47)
     pub rules: bool             // SET lexdb_planner = rules: kept with the others for a block's ROLLBACK (optimizer 20)
+    pub auto: bool              // SET lexdb_autoanalyze: the session's changes counted for the automatic statistics (optimizer 44)
 }
 
-pub fn noLimits(): Limits { return Limits{rounds: 0, mem: 0, deadline: 0, batch: true, rules: false} }
+pub fn noLimits(): Limits { return Limits{rounds: 0, mem: 0, deadline: 0, batch: true, rules: false, auto: true} }
 
 fn (rs: mut &Run) limit(l: &Limits) {
     rs.maxRounds = l.rounds
@@ -12739,6 +13093,7 @@ fn storeRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, row: [
     if (try st.get(txn, t.tree, key)).isSome() { return Err(dupKey(t, &row)) }
     let enc = encRowOf(t, &row)
     try txn.putRow(t.tree, key, enc, rowHead(&enc))
+    noteChg(st, txn, t, 0)
     try addIndexes(st, txn, t, &row, &key)
     if len(t.fks) > 0 {
         let none: []Val = []
@@ -16283,6 +16638,7 @@ pub type Session = record {
     id: int                     // its number while the store is open (its sequences' currval: 9.43)
     batch: bool                 // SET lexdb_batch (9.47)
     rules: bool                 // SET lexdb_planner = rules: no statistics in planning (optimizer 20)
+    auto: bool                  // SET lexdb_autoanalyze: its committed changes counted for the automatic statistics (optimizer 44)
     saves: []SavePt             // the open block's savepoints, oldest first (9.80)
     savedRoles: []str           // in a transaction block: SET ROLE's and SET SESSION AUTHORIZATION's at its BEGIN (9.83)
     custom: []str               // the settings with a dot in their names (SET my.x, set_config): "name\x00value" (9.92)
@@ -16414,6 +16770,7 @@ fn (s: &Session) setting(name: &str): Option[str] {
         "bytea_output" { return Some("hex") }
         "lexdb_planner" { return Some(if s.rules { "rules" } else { "cost" }) }
         "lexdb_batch" { return Some(if s.batch { "on" } else { "off" }) }
+        "lexdb_autoanalyze" { return Some(if s.auto { "on" } else { "off" }) }
         else {}
     }
     let k = strings.toLowerAscii(name)
@@ -16430,7 +16787,7 @@ const SHOWN: []str = ["search_path", "max_recursion", "statement_timeout", "max_
                       "transaction_read_only", "default_transaction_read_only", "in_hot_standby", "server_version",
                       "server_version_num", "server_encoding", "client_encoding", "datestyle", "timezone", "log_timezone",
                       "intervalstyle", "lc_collate", "lc_ctype", "lc_messages", "lc_monetary", "lc_numeric", "lc_time",
-                      "max_identifier_length", "application_name", "bytea_output", "lexdb_batch", "lexdb_planner"]
+                      "max_identifier_length", "application_name", "bytea_output", "lexdb_batch", "lexdb_planner", "lexdb_autoanalyze"]
 
 // The session's settings for current_setting and set_config (9.92), in the
 // memo while a statement calling them runs: a line each, name TAB value.
@@ -16515,6 +16872,13 @@ fn (s: mut &Session) applySetting(name: &str, value: &str, local: bool): Result[
         }
         return Ok(Unit{})
     }
+    if k == "lexdb_autoanalyze" {
+        match parseBool(&strings.toLowerAscii(strings.trim(value.toStr()))) {
+            Some(y) { s.auto = y }
+            None { return Err(e("22023", "parameter \"lexdb_autoanalyze\" requires a Boolean value")) }
+        }
+        return Ok(Unit{})
+    }
     if k == "max_recursion" || k == "statement_timeout" || k == "max_statement_mem" {
         let v = try settingValue(&k, &Val.Text(value.toStr()))
         if k == "max_recursion" { s.maxRecursion = v }
@@ -16566,7 +16930,7 @@ fn (s: &Session) show(name: &str): Result[Res, DbErr] {
 // lexdb_wire): no id of its own, never run.
 pub fn parkedSession(st: lexdb_store.Store): Session {
     return Session{st: st, txn: [], failed: false, maxRecursion: MAX_RECURSION, timeoutMs: 0, maxMem: MAX_STATEMENT_MEM,
-                   saved: [], readOnly: false, path: [], pathAt: 0, savedPath: [], id: 0, batch: true, rules: false, saves: [], savedRoles: [],
+                   saved: [], readOnly: false, path: [], pathAt: 0, savedPath: [], id: 0, batch: true, rules: false, auto: true, saves: [], savedRoles: [],
                    custom: [], savedCustom: [], localUndo: [], zone: lexdb_time.utc(), savedZone: [], tmp: "", onCommit: [], fresh: false}
 }
 
@@ -16580,7 +16944,7 @@ pub fn newSession(st: lexdb_store.Store): Session {
     let id = num(&st.memoGet(&"sessions").unwrapOr("0")) + 1
     st.memoPut(&"sessions", &id.toStr())
     return Session{st: st, txn: [], failed: false, maxRecursion: MAX_RECURSION, timeoutMs: 0, maxMem: MAX_STATEMENT_MEM,
-                   saved: [], readOnly: false, path: [], pathAt: 0, savedPath: [], id: id, batch: true, rules: false, saves: [], savedRoles: [],
+                   saved: [], readOnly: false, path: [], pathAt: 0, savedPath: [], id: id, batch: true, rules: false, auto: true, saves: [], savedRoles: [],
                    custom: [], savedCustom: [], localUndo: [], zone: lexdb_time.utc(), savedZone: [], tmp: "", onCommit: [], fresh: false}
 }
 
@@ -16611,12 +16975,13 @@ fn (s: mut &Session) restore() {
     s.timeoutMs = l.deadline                // saved there: the timeout in ms
     s.batch = l.batch
     s.rules = l.rules
+    s.auto = l.auto
 }
 
 // The limits for a statement starting now.
 fn (s: &Session) limits(): Limits {
     let dl = if s.timeoutMs > 0 { time.monotonicNs() + s.timeoutMs * 1000000 } else { 0 }
-    return Limits{rounds: s.maxRecursion, mem: s.maxMem, deadline: dl, batch: s.batch, rules: s.rules}
+    return Limits{rounds: s.maxRecursion, mem: s.maxMem, deadline: dl, batch: s.batch, rules: s.rules, auto: s.auto}
 }
 
 // A setting's value: a number (statement_timeout in ms, max_statement_mem
@@ -16662,6 +17027,7 @@ pub fn (s: mut &Session) close() {
         s.tmpUndo(&t)
         s.st.abort(t)
     }
+    chgEnd(&s.st, s.id, false)
     s.failed = false
     // its temporary objects (9.96); should this fail, the next start drops them
     if len(s.tmp) > 0 { let r = s.dropTemps() }
@@ -16753,6 +17119,7 @@ fn (s: mut &Session) resetAll() {
     s.batch = true
     s.rules = false
     if len(s.txn) > 0 { s.txn[0].rules = false }
+    s.auto = true
 }
 
 // Whether a statement a READ ONLY block refuses writes only temporary
@@ -17097,6 +17464,24 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
                     None {}
                 }
                 s.batch = on
+            } else if stmt.table == "lexdb_autoanalyze" {
+                var on = true                       // DEFAULT, RESET
+                match stmt.limit {
+                    Some(x) {
+                        let noCols: []lexdb_sql.ColDef = []
+                        let none: []Val = []
+                        let noSubs: []SubRes = []
+                        let env = Env{cols: &noCols, row: &none, aggs: &none, params: params, subs: &noSubs, cur: &none, seq: None}
+                        let v = try eval(&x, &env)
+                        let b = match v { Val.Text(t) { parseBool(&t) } Val.Bool(y) { Some(y) } else { None } }
+                        match b {
+                            Some(y) { on = y }
+                            None { return Err(e("22023", "parameter \"lexdb_autoanalyze\" requires a Boolean value")) }
+                        }
+                    }
+                    None {}
+                }
+                s.auto = on
             } else if stmt.table != "" {
                 var v = -1                          // DEFAULT, RESET
                 match stmt.limit {
@@ -17120,6 +17505,7 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
         }
         lexdb_sql.S_BEGIN {
             if len(s.txn) == 0 {
+                chgEnd(&s.st, s.id, false)          // (counts an earlier failed statement left: optimizer 44)
                 if stmt.ifFlag {
                     append(mut &s.txn, try s.st.beginSnapshot())     // READ ONLY: a snapshot (4.5)
                 } else {
@@ -17129,7 +17515,7 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
                 s.failed = false
                 s.fresh = true
                 s.saves = []
-                s.saved = [Limits{rounds: s.maxRecursion, mem: s.maxMem, deadline: s.timeoutMs, batch: s.batch, rules: s.rules}]
+                s.saved = [Limits{rounds: s.maxRecursion, mem: s.maxMem, deadline: s.timeoutMs, batch: s.batch, rules: s.rules, auto: s.auto}]
                 var p: []str = []
                 for n in s.path { append(mut &p, n) }
                 s.savedPath = [p]
@@ -17191,6 +17577,7 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
                 s.tmpUndo(&t)
                 s.st.abort(t)
                 s.restore()
+                chgEnd(&s.st, s.id, false)
                 return Ok(tagOnly("ROLLBACK"))
             }
             s.saved = []
@@ -17201,8 +17588,12 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
             s.savedZone = []
             let ddl = t.tmpDdl
             match s.st.commit(t) {
-                Ok(_) { s.onCommit = kept }
+                Ok(_) {
+                    s.onCommit = kept
+                    chgEnd(&s.st, s.id, s.auto)
+                }
                 Err(x) {
+                    chgEnd(&s.st, s.id, false)
                     if ddl { tmpChanged(&s.st, s.id) }
                     return Err(x)
                 }
@@ -17215,6 +17606,7 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
                 s.tmpUndo(&t)
                 s.st.abort(t)
             }
+            chgEnd(&s.st, s.id, false)
             s.failed = false
             s.saves = []
             s.restore()
@@ -17301,6 +17693,7 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
         let snap = (stmt.kind == lexdb_sql.S_SELECT && stmt.lockMode == 0) || explained || (stmt.kind == lexdb_sql.S_COPY && !stmt.copy.from)
         var t = if snap { try s.st.beginSnapshot() } else { lexdb_store.begin() }
         s.setUp(mut &t)
+        chgEnd(&s.st, s.id, false)          // (a try before that failed: its counts go, optimizer 44)
         var sent = false
         let ran = execIn(&s.st, mut &t, stmt, params, ptypes, lim, pc, input, out, pull, fn(c: &[]OutCol, r: &[]Val, ob: &OutBatch, start: bool): bool {
             let ok = sink(c, r, ob, start)
@@ -17326,6 +17719,7 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
                 match s.st.commit(t) {
                     Ok(_) {
                         s.onCommit = kept
+                        chgEnd(&s.st, s.id, s.auto)
                         return Ok(r)
                     }
                     Err(x) {
@@ -17859,6 +18253,7 @@ fn updRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, old: &[]
     }
     let enc = encRowOf(t, row)
     try txn.putRow(t.tree, key, enc, rowHead(&enc))
+    noteChg(st, txn, t, 1)
     try changeIndexes(st, txn, t, old, &oldKey, row, &key)
     if len(t.fks) > 0 { try childSide(st, txn, t, fw, row, old, later) }
     if len(t.refBy) > 0 { try parentSide(st, txn, t, fw, old, row, true, later) }
@@ -17870,6 +18265,7 @@ fn delRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, row: &[]
           later: mut &[]FkLater): Result[Unit, DbErr] {
     let key = keyOf(t, row)
     txn.del(t.tree, key)
+    noteChg(st, txn, t, 2)
     for ix in t.indexes { if try inIndex(t, &ix, row) { txn.del(ix.tree, try idxEntry(t, &ix, row, &key)) } }
     if len(t.refBy) > 0 {
         let none: []Val = []
@@ -27245,7 +27641,7 @@ fn catRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &str): Result
                 let sc = if dot < 0 { "pg_catalog" } else { r[0..dot] }
                 let nm = if dot < 0 { r } else { r[dot + 1..len(r)] }
                 let o = if dot < 0 { sysRelOid(&r) } else { catOid(&"r", &(sc + "\x1f" + nm)) }
-                let view = dot >= 0 || strings.startsWith(&r, "pg_tables") || r == "pg_indexes" || r == "pg_views" ||
+                let view = dot >= 0 || strings.startsWith(&r, "pg_tables") || r == "pg_indexes" || r == "pg_views" || r == "pg_stat_user_tables" ||
                            r == "pg_matviews" || r == "pg_sequences" || r == "pg_settings" || r == "pg_roles" || r == "pg_user"
                 append(mut &rows, [iv(o), tv(&nm), iv(nspOid(&sc)), iv(0), iv(0), iv(OID_OWNER), iv(if view { 0 } else { 2 }), iv(o),
                                    iv(0), iv(0), Val.Real(-1.0f), iv(0), iv(0), bv(false), bv(false), tv(&"p"), tv(&if view { "v" } else { "r" }),
@@ -27398,6 +27794,19 @@ fn catRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &str): Result
                 } else if r.login {
                     append(mut &rows, [tv(&r.name), iv(o), bv(r.superuser), bv(r.superuser), bv(false), bv(r.superuser), pw, Val.Null, Val.Null])
                 }
+            }
+        }
+        "pg_stat_user_tables" {
+            // what the automatic statistics keep (optimizer 44), since the store opened
+            for ct in snap.tabs {
+                let c = intsOf(&st.memoGet(&acKey(ct.t.tree)).unwrapOr(""), 5)
+                let a = acState(st, ct.t.tree)
+                let base = if a.base >= 0 { a.base } else { try statRows(st, txn, &ct.t) }
+                let tz = fn(us: int): Val { return if us == 0 { Val.Null } else { Val.Tstz(us) } }
+                append(mut &rows, [iv(ct.oid), tv(&ct.schema), tv(&(if len(ct.t.spell) > 0 { ct.t.spell } else { ct.name })), iv(0), Val.Null, iv(0),
+                                   iv(0), Val.Null, iv(0), iv(c[1]), iv(c[2]), iv(c[3]), iv(0), iv(0), iv(max(0, base + c[4])), iv(0), iv(c[0]),
+                                   iv(0), Val.Null, Val.Null, tz(a.last), tz(a.lastAuto), iv(0), iv(0), iv(a.n), iv(a.nAuto), Val.Float(0.0f),
+                                   Val.Float(0.0f), Val.Float(float(a.ns) / 1000000.0f), Val.Float(float(a.nsAuto) / 1000000.0f)])
             }
         }
         "pg_tables" {
