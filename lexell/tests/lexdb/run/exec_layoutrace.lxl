@@ -1,0 +1,110 @@
+// lexdb_exec: a statement reading the live tree while another session
+// changes its table's layout (design/lexdb.md 9.120). A long DELETE (or
+// UPDATE) outside a block reads the table's catalog row when it begins,
+// then its rows as it goes; it takes turns with other sessions (9.15), and
+// meanwhile one adds a column and inserts a row in the new layout. The
+// long statement then meets a row whose layout its table does not have.
+// That once failed as corruption (XX001, "a row's layout number"); what it
+// read has changed, so it is a conflict, as its commit would be, and outside
+// a block the statement is run again, on the new catalog. In a block it
+// fails with 40001.
+// expect: delete: DELETE 1; the other session: ALTER TABLE, INSERT 0 1; order: other, long
+// expect: update: UPDATE 1; the other session: ALTER TABLE, INSERT 0 1; order: other, long
+// expect: row 6: 6|7|row 6|8|9
+// expect: the new rows: 100000|1|new|8|9, 100001|1|new|8|10
+// expect: in a block: delete 40001, commit ROLLBACK; the other session: ALTER TABLE, INSERT 0 1
+// expect: rows: 60002; by layout: 0:59998 1:1 2:2 3:1 of 4 layouts
+import "strings"
+import "task"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+
+type Arg = record { st: lexdb_store.Store; which: int; round: int }
+
+fn one(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if len(r.rows) == 0 { return r.tag }
+            var outs: []str = []
+            for row in r.rows {
+                var cells: []str = []
+                for v in row { append(mut &cells, lexdb_exec.text(&v)) }
+                append(mut &outs, strings.join(&cells, "|"))
+            }
+            return strings.join(&outs, ", ")
+        }
+        Err(e) { return e.state }
+    }
+}
+
+fn mark(s: mut &lexdb_exec.Session, round: int, who: &str, what: &str) {
+    let m = one(s, &("insert into log values (" + round.toStr() + ", (select count(*) from log where round = " + round.toStr() + "), '" +
+                     who + "', '" + what + "')"))
+}
+
+// which 0: the long statement (round 0 a DELETE, 1 an UPDATE, 2 a DELETE
+// in a block); 1: the other session's ALTER and insert
+fn race(a: Arg): int {
+    var s = lexdb_exec.newSession(a.st)
+    if a.which == 0 {
+        var got = ""
+        if a.round == 0 { got = one(mut &s, &"delete from t where id = 5") }
+        if a.round == 1 { got = one(mut &s, &"update t set a = a + 1 where id = 6") }
+        if a.round == 2 {
+            let b = one(mut &s, &"begin")
+            let d = one(mut &s, &"delete from t where id = 7")
+            got = "delete " + d + ", commit " + one(mut &s, &"commit")
+        }
+        mark(mut &s, a.round, &"long", &got)
+    } else {
+        let col = if a.round == 0 { "x int default 8" } else if a.round == 1 { "y int default 9" } else { "z int default 3" }
+        let alt = one(mut &s, &("alter table t add column " + col))
+        let ins = if a.round == 0 {
+            one(mut &s, &"insert into t values (100000, 1, 'new')")
+        } else if a.round == 1 {
+            one(mut &s, &"insert into t values (100001, 1, 'new', 8, 10)")
+        } else {
+            one(mut &s, &"insert into t values (100002, 1, 'new', 8, 10, 4)")
+        }
+        mark(mut &s, a.round, &"other", &(alt + ", " + ins))
+    }
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(5), lexdb_store.Options{cacheBytes: 128 * 1024 * 1024, segBytes: 4 * 1024 * 1024, ckptBytes: 64 * 1024 * 1024, snapNodes: 100000, bufferedPages: false}, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        // no primary key: a DELETE or UPDATE by id reads every row
+        let c1 = one(mut &s, &"create table t (id int, a int, b text)")
+        let c2 = one(mut &s, &"create table log (round int, n int, who text, what text)")
+        var i = 0
+        while i < 60000 {
+            var vals: []str = []
+            for j in i..i + 1000 { append(mut &vals, "(" + j.toStr() + ", " + (j % 100).toStr() + ", 'row " + j.toStr() + "')") }
+            let r = one(mut &s, &("insert into t values " + strings.join(&vals, ", ")))
+            i += 1000
+        }
+        let warm = one(mut &s, &"select count(*) from t")
+        for round in 0..3 {
+            task.scope(fn(sc: mut &task.Scope) {
+                sc.spawn(race, Arg{st: st, which: 0, round: round})
+                sc.spawn(race, Arg{st: st, which: 1, round: round})
+            })
+            let longGot = one(mut &s, &("select what from log where round = " + round.toStr() + " and who = 'long'"))
+            let other = one(mut &s, &("select what from log where round = " + round.toStr() + " and who = 'other'"))
+            let order = one(mut &s, &("select string_agg(who, ', ' order by n) from log where round = " + round.toStr()))
+            if round == 0 { println("delete: " + longGot + "; the other session: " + other + "; order: " + order) }
+            if round == 1 { println("update: " + longGot + "; the other session: " + other + "; order: " + order) }
+            if round == 2 { println("in a block: " + longGot + "; the other session: " + other) }
+            if round == 1 {
+                println("row 6: " + one(mut &s, &"select id, a, b, x, y from t where id = 6"))
+                println("the new rows: " + one(mut &s, &"select id, a, b, x, y from t where id >= 100000 and id < 100002 order by id"))
+            }
+        }
+        println("rows: " + one(mut &s, &"select count(*) from t") + "; by layout: " + lexdb_exec.rowLayouts(&st, &"t"))
+        return 0
+    }).unwrap()
+}

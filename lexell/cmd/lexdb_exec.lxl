@@ -18332,13 +18332,27 @@ fn execIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     // statement's parameters: those not sent are NULL
     let subs = hasSubs(s)
     let want = if s.params > len(ptypes) { s.params } else { len(ptypes) }
+    var r: Result[Res, DbErr] = Err(e("XX000", "unreachable"))
     if subs && len(params) < want {
         var ps: []Val = []
         for v in params { append(mut &ps, v) }
         while len(ps) < want { append(mut &ps, Val.Null) }
-        return execStmt(st, txn, s, &ps, ptypes, lim, pc, input, out, pull, sink)
+        r = execStmt(st, txn, s, &ps, ptypes, lim, pc, input, out, pull, sink)
+    } else {
+        r = execStmt(st, txn, s, params, ptypes, lim, pc, input, out, pull, sink)
     }
-    return execStmt(st, txn, s, params, ptypes, lim, pc, input, out, pull, sink)
+    match move(r) {
+        Ok(res) { return Ok(res) }
+        Err(x) {
+            // Rows that do not read in the table as the statement found it
+            // (a row's layout number past its table's): a statement reading
+            // the live tree read the catalog, then rows another session wrote
+            // after changing it (9.120). What it read has changed, so it is a
+            // conflict, as its commit would be: outside a block it runs again.
+            if x.state == lexdb_base.S_CORRUPT && st.liveStale(txn) { return Err(lexdb_base.conflict()) }
+            return Err(x)
+        }
+    }
 }
 
 fn hasSubs(s: &lexdb_sql.Stmt): bool {
@@ -18873,8 +18887,12 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
                 s.tmpUndo(&t)
                 s.st.abort(t)
                 tries += 1
-                // (a COPY TO sent as it ran is not run again, nor a SELECT whose rows went out)
-                if !(snap && x.state == "72000") || tries >= 10 || input.stream || sent { return Err(x) }
+                // (a COPY TO sent as it ran is not run again, nor a SELECT whose rows went out).
+                // A conflict found as it ran (it read the live tree: execIn's
+                // stale reads, 9.120) is run again, as one its commit finds is
+                let again = (snap && x.state == "72000") ||
+                            (!snap && x.state == lexdb_base.S_CONFLICT && !input.pull && !(stmt.kind == lexdb_sql.S_COPY && stmt.copy.batchRows > 0))
+                if !again || tries >= 10 || input.stream || sent { return Err(x) }
             }
         }
     }

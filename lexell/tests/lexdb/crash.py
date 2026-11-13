@@ -6,8 +6,8 @@ killed while 12 connections load it, then restarted and checked.
 
 Each round starts the server (recovering from the last kill), runs
 crash/client.lxl's load (transfers in blocks, prepared inserts that split
-the tree, deletes; columns added to and dropped from the log table, and
-VACUUMs of it, 9.114; its primary key dropped and added again, 9.117), and after 0.3 to 3 s kills the server with SIGKILL;
+the tree, deletes, some by a scan of the whole table, 9.120; columns
+added to and dropped from the log table, and VACUUMs of it, 9.114; its primary key dropped and added again, 9.117), and after 0.3 to 3 s kills the server with SIGKILL;
 every fifth round it stops it with SIGTERM instead, and it must exit 0.
 Every fourth round the restarted server is killed again during its
 recovery. Then the server starts once more and the client checks the

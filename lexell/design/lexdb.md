@@ -10905,7 +10905,7 @@ layout number"). Fixed in 9.115.
 - A reader holding a table's catalog from before an ALTER (not a snapshot:
   an UPDATE's scan, say) that meets a row converted to the new layout fails
   with "a row's layout number", as it already did for rows other sessions
-  wrote in it.
+  wrote in it. (Fixed in 9.120: a conflict, and run again.)
 - Old column leaves of a table's earlier layout are left as they are.
 
 ### 9.115 Tagged rows whose first value is a time
@@ -11480,3 +11480,79 @@ progress, design lexdb-tds).
 **Tests:** the suite passes (132), and with `LEXDB_COLCHECK=1`; the crash
 test (with and without io_uring) and the replica test pass. The crash test
 showed an older intermittent failure, on main too (9.120).
+
+### 9.120 A statement on the live tree meets a layout newer than its table's
+
+The crash test failed about one run in five of `--rounds 4`, always in an
+even round: during the load, several workers' `delete from log where id =
+X` failed with XX001, "a row's layout number". After a restart the rows read
+back whole.
+
+**The cause.**
+- **Two moments.** A statement outside a block that writes (UPDATE, DELETE,
+  INSERT, a locking SELECT), and a block's UPDATE, DELETE and INSERT, read
+  the live tree, not a snapshot (9.16). They read the table's catalog row
+  when they are planned, and its rows as they run.
+- **Turns.** A long statement lets other sessions run every 0.1 ms (9.15).
+  One of them may meanwhile commit an ALTER TABLE that adds or drops a
+  column, which makes a new layout (9.50). Rows then appear in that layout:
+  the session's own inserts, other sessions' inserts, and leaves a
+  checkpoint converts (9.114). The long statement's table lacks the layout,
+  and `layOf` fails. 9.114 listed this under "not done".
+- **Why the crash test's deletes were long.** Round 1 drops log's primary
+  key and round 3 adds it back (9.117). If round 3 is killed before worker
+  0 gets that far, the next even round deletes by id on a table with no
+  key. Each delete is then a scan of the whole table, about 50 ms.
+  - Worker 0's ALTER (operation 300) comes while nearly every other worker
+    is inside such a scan, so 8 to 10 of them fail together, once each.
+  - In a kept failing run, log had no primary key in the failed round 4.
+  - A trace showed the deletes beginning 2 to 11 ms before the ALTER's
+    commit. They failed 50 ms later on rows of layout 2, with a table of
+    two layouts (0 and 1), before any leaf had been converted.
+
+**Nothing was lost.** The statement's read of the catalog row is noted
+(9.16). The ALTER changed that row, so the statement's commit would fail
+with 40001, and outside a block it would run again. The error simply came
+first.
+
+**The fix.**
+- **A conflict, not corruption** (`execIn`). Suppose a statement fails with
+  XX001, its transaction reads the live tree, and what it has read has
+  changed since. `Store.liveStale` checks that last part with `validate`,
+  as a commit does. The error is then a conflict (40001), as the commit
+  would be. Corruption in a statement whose reads are still current is
+  reported as before.
+- **Run again outside a block** (`runStmt`). A conflict found while the
+  statement runs is now retried, like one its commit finds: up to 10 tries.
+  It is not retried for a COPY whose data was read as it came or that
+  committed batches, nor for a statement whose rows already went out.
+  `unstore` already failed this way when a large value's chunks changed
+  under a live read; it is now run again too.
+- **In a block** the statement fails with 40001, as the block's commit
+  would.
+- **The table is not read again mid-statement.** Once its catalog has
+  changed, the statement must not commit, whatever it read.
+
+**Tests.** New `exec_layoutrace` uses a table of 60,000 rows with no key.
+Outside a block, it runs a DELETE by id and then an UPDATE, each while
+another session adds a column and inserts a row in the new layout. Then it
+runs a DELETE in a block the same way.
+- **Before the fix:** XX001, all three.
+- **Now:** the DELETE and the UPDATE run again (DELETE 1, UPDATE 1). The
+  updated row has the new columns' defaults, in the latest layout. The
+  block's DELETE fails with 40001.
+- **Planted:** without the conversion, XX001; without the retry, 40001
+  outside the block.
+
+**Crash test.** On this machine the failure had become rare: 25 runs of
+`--rounds 4` on the code before the fix all passed. So the client now makes
+the race likely. Workers other than 0 delete every other row by `id + 0 =
+X`, which no index serves, so the delete scans the whole table on the live
+tree while worker 0's ALTERs land.
+- **Before the fix,** with that client: 7 of 8 runs of `--rounds 4`
+  failed, in rounds 2, 3 and 4. Round 3's DROP COLUMN makes a layout
+  too.
+- **With the fix:** 25 runs and 12 with `LXL_URING=1` all pass, as do 12
+  rounds with and without `LEXDB_COLCHECK=1`. The replica test passes.
+
+The suite passes (133), also with `LEXDB_COLCHECK=1`.
