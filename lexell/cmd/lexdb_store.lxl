@@ -814,20 +814,24 @@ fn (st: &Store) loadAhead(need: int, run: &[]LoadReq): Result[Unit, lexdb_base.D
     return res
 }
 
-// How many pages loadMany reads at a time.
+// How many reads loadMany has in flight at a time.
 const READS_IN_FLIGHT = 32
 
-type PageRead = record { f: lexdb_disk.File; page: int }
+type PageRead = record { f: lexdb_disk.File; page: int; n: int }
 
-fn readOne(r: PageRead): Result[[]byte, lexdb_base.DbErr] {
-    var b = array(PAGE, byte(0))
-    try r.f.read(r.page * PAGE, mut &b[0..PAGE], PAGE)
-    return Ok(b)
+fn readOne(r: PageRead): Result[[][]byte, lexdb_base.DbErr] {
+    var bufs: [][]byte = []
+    for j in 0..r.n { append(mut &bufs, array(PAGE, byte(0))) }
+    if r.n == 1 { try r.f.read(r.page * PAGE, mut &bufs[0][0..PAGE], PAGE) } else { try r.f.readPages(r.page * PAGE, mut &bufs) }
+    return Ok(bufs)
 }
 
-// Loads the slots not in memory among slots, their pages read
-// READS_IN_FLIGHT at a time (a commit's leaves are scattered: one read
-// each, not a run). The cache is swept once, after all are in: they are
+// Loads the slots not in memory among slots, READS_IN_FLIGHT reads at a
+// time. Their pages are read in order, and pages next to each other in
+// one read (at most AHEAD_MAX): a commit's leaves are scattered when its
+// writes are, but a large commit's (its writes in key order: commitOrder)
+// are mostly a tree's leaves in a row, which checkpoints write in key
+// order (9.110). The cache is swept once, after all are in: they are
 // marked referenced, and so are the nodes the caller's descents just
 // passed, so a commit's nodes are not evicted by its own loads (the cache
 // holds more than its size meanwhile, as before).
@@ -848,15 +852,32 @@ fn (st: &Store) loadMany(slots: &[]int): Result[Unit, lexdb_base.DbErr] {
         }
     })
     if bad { return Err(lexdb_base.err(lexdb_base.S_INTERNAL, "load: a slot without a page")) }
-    var at = 0
-    while at < len(reqs) {
-        let end = min(at + READS_IN_FLIGHT, len(reqs))
+    collections.sortBy(mut &reqs, fn(a, b) { return a.page.cmp(&b.page) })
+    // the reads: (first request, pages) pairs of requests for pages in a row
+    var runs: []int = []
+    var i = 0
+    while i < len(reqs) {
+        var j = i + 1
+        while j < len(reqs) && j - i < AHEAD_MAX && reqs[j].page == reqs[j - 1].page + 1 { j += 1 }
+        append(mut &runs, i)
+        append(mut &runs, j - i)
+        i = j
+    }
+    var r = 0
+    while r < len(runs) {
+        let rend = min(r + 2 * READS_IN_FLIGHT, len(runs))
+        let at = runs[r]
+        let end = runs[rend - 2] + runs[rend - 1]
         var batch: []PageRead = []
-        for j in at..end { append(mut &batch, PageRead{f: f, page: reqs[j].page}) }
-        var got: []Result[[]byte, lexdb_base.DbErr] = []
+        var q = r
+        while q < rend {
+            append(mut &batch, PageRead{f: f, page: reqs[runs[q]].page, n: runs[q + 1]})
+            q += 2
+        }
+        var got: []Result[[][]byte, lexdb_base.DbErr] = []
         var res: Result[Unit, lexdb_base.DbErr] = Ok(Unit{})
         task.scope(fn(sc: mut &task.Scope) {
-            var fs: []task.Future[Result[[]byte, lexdb_base.DbErr]] = []
+            var fs: []task.Future[Result[[][]byte, lexdb_base.DbErr]] = []
             while len(batch) > 0 { append(mut &fs, sc.start(readOne, pop(mut &batch))) }
             match task.all(fs) {
                 Ok(rs) { got = rs }
@@ -867,9 +888,10 @@ fn (st: &Store) loadMany(slots: &[]int): Result[Unit, lexdb_base.DbErr] {
         // (started from the batch's end: got is in reverse order)
         var pages: [][]byte = []
         while len(got) > 0 {
-            let x = pop(mut &got)
-            if x.isErr() { return Err(x.unwrapErr()) }
-            append(mut &pages, x.unwrap())
+            let g = pop(mut &got)
+            if g.isErr() { return Err(g.unwrapErr()) }
+            var bufs = g.unwrap()
+            for k in 0..len(bufs) { append(mut &pages, replace(mut &bufs[k], [])) }
         }
         st.sh.with(fn(db: mut &Db) {
             for j in 0..len(pages) {
@@ -883,7 +905,7 @@ fn (st: &Store) loadMany(slots: &[]int): Result[Unit, lexdb_base.DbErr] {
             }
         })
         try res
-        at = end
+        r = rend
     }
     st.sh.with(fn(db: mut &Db) { db.maybeEvict() })
     return Ok(Unit{})
