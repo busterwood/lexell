@@ -32,6 +32,7 @@ import "unicode"
 import "math"
 import "base64"
 import "./lexdb_page"
+import "./lexdb_cols"
 import "./lexdb_store"
 import "./lexdb_sql"
 import "./lexdb_func"
@@ -5205,7 +5206,12 @@ fn catScan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, lo: &str, hi: &str
 fn findTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, name: &str): Result[Option[Table], DbErr] {
     let k = try catKey(st, txn, name, false)
     match try st.get(txn, CATALOG, k) {
-        Some(s) { return Ok(Some(try decTable(&k, &s))) }
+        Some(s) {
+            let t = try decTable(&k, &s)
+            // its layouts, for the store's column leaves (9.112)
+            if t.tree > 0 && len(t.layouts) > 0 && len(t.view) == 0 { st.setColSpec(t.tree, &t.layouts) }
+            return Ok(Some(t))
+        }
         None { return Ok(None) }
     }
 }
@@ -21770,6 +21776,7 @@ fn bRowInto(s: &str, r: int, b: mut &Batch, bp: &BPlan, t: &Table): Result[int, 
 // fixed layout (bRowInto reads it), -1 a value of a kind its column's
 // batch does not hold (as bRowInto's 1).
 fn bRunInto(leaf: &lexdb_page.Node, from: int, to: int, b: mut &Batch, bp: &BPlan, t: &Table): Result[int, DbErr] {
+    if leaf.isCols() { return cRunInto(leaf, from, to, b, bp, t) }
     let s0 = leaf.valView(from)
     if len(s0) < 3 || s0[0] != FIXED { return Ok(0) }
     let id = try layOf(s0, &t.lays)
@@ -22286,6 +22293,7 @@ fn bRunCols(rows: &[]&str, qs: &[]int, r0: int, ps: &[]int, b: mut &Batch, bp: &
 // decoded; 0, -1 as bRunInto; -2 a condition's error on one of them.
 fn bRunLazy(leaf: &lexdb_page.Node, from: int, to: int, b: mut &Batch, bp: &BPlan, t: &Table, lz: &Lazy, conds: &[]BNode,
             bar: &Bar, idx: mut &[]int, kept: mut &int): Result[int, DbErr] {
+    if leaf.isCols() { return cRunLazy(leaf, from, to, b, bp, t, lz, conds, bar, idx, kept) }
     let s0 = leaf.valView(from)
     if len(s0) < 3 || s0[0] != FIXED { return Ok(0) }
     let id = try layOf(s0, &t.lays)
@@ -22347,6 +22355,236 @@ fn bRunLazy(leaf: &lexdb_page.Node, from: int, to: int, b: mut &Batch, bp: &BPla
     if !(try bRunCols(&rows, &qs, r0, &lz.rest, b, bp, lay)) { return Ok(-1) }
     for r in ch { append(idx, r) }
     return Ok(n)
+}
+
+// ---- Column leaves (9.112)
+//
+// A table leaf a checkpoint wrote as columns (lexdb_page T_CLEAF,
+// lexdb_cols) is decoded into a batch a column at a time from its
+// columns, only the places used: an integer unpacked from its frame of
+// reference, a text a slice of the leaf, a dictionary's entries made once.
+// Two steps as for rows (9.108): the places the conditions read, then the
+// others for the rows kept. A leaf whose layout's kinds are not its
+// table's (lexdb_store.setColSpec was given others) is read row by row,
+// its rows rebuilt.
+
+// Whether column leaf leaf's rows are in a layout of t with the same kinds.
+fn cLayoutOk(leaf: &lexdb_page.Node, t: &Table): bool {
+    let lid = lexdb_cols.layoutOf(&leaf.cdir)
+    return lid < len(t.lays) && lexdb_cols.kindsAre(&leaf.cols, &leaf.cdir, &t.lays[lid].kinds)
+}
+
+// Places ps of column leaf rows from + qs[x] into b's rows r0 + qs[x]
+// (all: qs is 0, 1, 2 ... in order, read as a run); false: a value of a
+// kind its column's batch does not hold.
+fn cCols(leaf: &lexdb_page.Node, from: int, qs: &[]int, all: bool, r0: int, ps: &[]int, b: mut &Batch, bp: &BPlan): Result[bool, DbErr] {
+    let s = &leaf.cols
+    let dir = &leaf.cdir
+    let np = lexdb_cols.places(dir)
+    let n = len(qs)
+    if n == 0 { return Ok(true) }
+    for pl in ps {
+        let c = bp.placeCol[pl]
+        let k = bp.kinds[c]
+        if pl >= np {
+            let mv = if pl < len(bp.missing) { bp.missing[pl] } else { Val.Null }
+            for q in qs { if !bPut(b, c, r0 + q, mv, k) { return Ok(false) } }
+            continue
+        }
+        let pk = lexdb_cols.kindOf(s, pl)
+        if pk == PK_NONE {
+            for q in qs { b.cols[c].nul[r0 + q] = true }
+            continue
+        }
+        let nulls = lexdb_cols.hasNulls(dir, pl)
+        if nulls {
+            if all { lexdb_cols.nullsInto(s, dir, pl, from, n, mut &b.cols[c].nul, r0) } else {
+                for q in qs { if lexdb_cols.isNull(s, dir, pl, from + q) { b.cols[c].nul[r0 + q] = true } }
+            }
+        }
+        if k == BK_INT && isIntKind(pk) {
+            var col = replace(mut &b.cols[c], bvec(0))
+            if all { lexdb_cols.intsInto(s, dir, pl, from, n, mut &col.v, r0) } else {
+                for q in qs { col.v[r0 + q] = lexdb_cols.intAt(s, dir, pl, from + q) }
+            }
+            b.cols[c] = col
+        } else if k == BK_BOOL && pk == PK_BOOL {
+            var col = replace(mut &b.cols[c], bvec(0))
+            if all { lexdb_cols.boolsInto(s, dir, pl, from, n, mut &col.v, r0) } else {
+                for q in qs { col.v[r0 + q] = if lexdb_cols.boolAt(s, dir, pl, from + q) { 1 } else { 0 } }
+            }
+            b.cols[c] = col
+        } else if k == BK_VAL {
+            var vals = replace(mut &b.vals[c], [])
+            let codec = lexdb_cols.codecOf(dir, pl)
+            if isIntKind(pk) {
+                for q in qs { if !b.cols[c].nul[r0 + q] { vals[r0 + q] = Val.Int(lexdb_cols.intAt(s, dir, pl, from + q)) } }
+            } else if pk == PK_BOOL {
+                for q in qs { if !b.cols[c].nul[r0 + q] { vals[r0 + q] = Val.Bool(lexdb_cols.boolAt(s, dir, pl, from + q)) } }
+            } else if codec == lexdb_cols.C_DICT {
+                // each entry made once
+                let nd = lexdb_cols.dictSize(dir, pl)
+                var dv: []Val = withCapacity(nd)
+                for j in 0..nd {
+                    let sp = lexdb_cols.entryAt(s, dir, pl, j)
+                    append(mut &dv, Val.Text(leaf.cols[lexdb_cols.spanStart(sp)..lexdb_cols.spanEnd(sp)]))
+                }
+                var codes: []int = array(n, 0)
+                if all { lexdb_cols.codesInto(s, dir, pl, from, n, mut &codes, 0) } else {
+                    for x in 0..n { codes[x] = lexdb_cols.codeAt(s, dir, pl, from + qs[x]) }
+                }
+                for x in 0..n {
+                    let q = qs[x]
+                    if !b.cols[c].nul[r0 + q] { vals[r0 + q] = dv[codes[x]] }
+                }
+            } else if codec == lexdb_cols.C_UNITS {
+                let ds = lexdb_cols.scaleOf(dir, pl)
+                for q in qs { if !b.cols[c].nul[r0 + q] { vals[r0 + q] = Val.Num(Decimal.fromUnits(lexdb_cols.intAt(s, dir, pl, from + q), ds)) } }
+            } else {
+                var sp: []int = array(n, 0)
+                if all { lexdb_cols.varsInto(s, dir, pl, from, n, mut &sp, 0) } else {
+                    for x in 0..n { sp[x] = lexdb_cols.varAt(s, dir, pl, from + qs[x]) }
+                }
+                for x in 0..n {
+                    let q = qs[x]
+                    if b.cols[c].nul[r0 + q] { continue }
+                    let a = lexdb_cols.spanStart(sp[x])
+                    let e = lexdb_cols.spanEnd(sp[x])
+                    if pk == PK_TEXT {
+                        vals[r0 + q] = Val.Text(leaf.cols[a..e])
+                    } else {
+                        match Decimal.fromBin(s, a, e - a) {
+                            Ok(d) { vals[r0 + q] = Val.Num(d) }
+                            Err(_) {
+                                b.vals[c] = vals
+                                return Err(lexdb_base.corrupt("a numeric value in a column leaf"))
+                            }
+                        }
+                    }
+                }
+            }
+            b.vals[c] = vals
+        } else {
+            return Ok(false)
+        }
+    }
+    return Ok(true)
+}
+
+// Column leaf rows from..to (rebuilt) into rows b.n on of b, a row at a
+// time: a leaf whose layout's kinds are not its table's. -1 as bRunInto.
+fn cRowsInto(leaf: &lexdb_page.Node, from: int, to: int, b: mut &Batch, bp: &BPlan, t: &Table): Result[int, DbErr] {
+    for k in from..to {
+        let row = leaf.val(k)
+        let code = try bRowInto(&row, b.n + k - from, b, bp, t)
+        if code != 0 { return Ok(-1) }
+    }
+    return Ok(to - from)
+}
+
+// bRunInto for a column leaf: rows from..to into rows b.n on of b. The
+// rows decoded (to - from), -1 as bRunInto.
+fn cRunInto(leaf: &lexdb_page.Node, from: int, to: int, b: mut &Batch, bp: &BPlan, t: &Table): Result[int, DbErr] {
+    if !cLayoutOk(leaf, t) { return cRowsInto(leaf, from, to, b, bp, t) }
+    let n = to - from
+    var qs: []int = withCapacity(n)
+    for q in 0..n { append(mut &qs, q) }
+    if !(try cCols(leaf, from, &qs, true, b.n, &bp.usedP, b, bp)) { return Ok(-1) }
+    return Ok(n)
+}
+
+// bRunLazy for a column leaf: rows from..to, the places the conditions
+// read first, the conditions, then the other places for the rows kept
+// (added to idx). A simple LIKE on a dictionary's text is matched once per
+// entry. The rows decoded (to - from), -1 and -2 as bRunLazy.
+fn cRunLazy(leaf: &lexdb_page.Node, from: int, to: int, b: mut &Batch, bp: &BPlan, t: &Table, lz: &Lazy, conds: &[]BNode,
+            bar: &Bar, idx: mut &[]int, kept: mut &int): Result[int, DbErr] {
+    let n = to - from
+    let r0 = b.n
+    var rs: []int = withCapacity(n)
+    for q in 0..n { append(mut &rs, r0 + q) }
+    if !cLayoutOk(leaf, t) {
+        // row by row, the conditions over them all
+        if (try cRowsInto(leaf, from, to, b, bp, t)) < 0 { return Ok(-1) }
+        let none: []bool = []
+        let got0 = bNarrow(conds, &none, b, rs)
+        if got0.isNone() { return Ok(-2) }
+        let ch0 = got0.unwrap()
+        kept += len(ch0)
+        for r in ch0 { append(idx, r) }
+        return Ok(n)
+    }
+    let s = &leaf.cols
+    let dir = &leaf.cdir
+    let np = lexdb_cols.places(dir)
+    // the simple LIKEs on the leaf's bytes
+    for x in 0..len(lz.raw) {
+        if len(rs) == 0 { break }
+        let ci = lz.raw[x]
+        let pl = lz.rawPl[x]
+        if pl < np && lexdb_cols.kindOf(s, pl) == PK_TEXT {
+            match conds[ci] {
+                BNode.Like(_, lp) { rs = cLikeRaw(leaf, from, &rs, r0, pl, &lp.pieces) }
+                else {}
+            }
+            continue
+        }
+        var qs1: []int = withCapacity(len(rs))
+        for r in rs { append(mut &qs1, r - r0) }
+        if !(try cCols(leaf, from, &qs1, false, r0, &[pl], b, bp)) { return Ok(-1) }
+        var only: []bool = array(len(conds), true)
+        only[ci] = false
+        let got1 = bNarrow(conds, &only, b, rs)
+        if got1.isNone() { return Ok(-2) }
+        rs = got1.unwrap()
+    }
+    var qs0: []int = withCapacity(len(rs))
+    for r in rs { append(mut &qs0, r - r0) }
+    if !(try cCols(leaf, from, &qs0, len(rs) == n, r0, &lz.first, b, bp)) { return Ok(-1) }
+    let got = bNarrow(conds, &lz.skip, b, rs)
+    if got.isNone() { return Ok(-2) }
+    var ch = got.unwrap()
+    kept += len(ch)
+    if bar.on && len(ch) > 0 {
+        var ok: []int = withCapacity(len(ch))
+        let kc = &b.cols[bar.col]
+        for r in ch { if !barAfter(bar, kc.v[r], kc.nul[r]) { append(mut &ok, r) } }
+        ch = ok
+    }
+    var qs: []int = withCapacity(len(ch))
+    for r in ch { append(mut &qs, r - r0) }
+    if !(try cCols(leaf, from, &qs, len(ch) == n, r0, &lz.rest, b, bp)) { return Ok(-1) }
+    for r in ch { append(idx, r) }
+    return Ok(n)
+}
+
+// Rows rs (batch rows, from row r0 = leaf row from) whose text at place pl
+// a simple LIKE of pieces ps holds for; a dictionary's entries matched once.
+fn cLikeRaw(leaf: &lexdb_page.Node, from: int, rs: &[]int, r0: int, pl: int, ps: &[]str): []int {
+    let s = &leaf.cols
+    let dir = &leaf.cdir
+    var out: []int = []
+    if lexdb_cols.codecOf(dir, pl) == lexdb_cols.C_DICT {
+        let nd = lexdb_cols.dictSize(dir, pl)
+        var hit: []bool = array(nd, false)
+        for j in 0..nd {
+            let sp = lexdb_cols.entryAt(s, dir, pl, j)
+            hit[j] = likeRange(s, lexdb_cols.spanStart(sp), lexdb_cols.spanEnd(sp), ps)
+        }
+        for r in rs {
+            let i = from + r - r0
+            if lexdb_cols.isNull(s, dir, pl, i) { continue }
+            if hit[lexdb_cols.codeAt(s, dir, pl, i)] { append(mut &out, r) }
+        }
+        return out
+    }
+    for r in rs {
+        let i = from + r - r0
+        if lexdb_cols.isNull(s, dir, pl, i) { continue }
+        let sp = lexdb_cols.varAt(s, dir, pl, i)
+        if likeRange(s, lexdb_cols.spanStart(sp), lexdb_cols.spanEnd(sp), ps) { append(mut &out, r) }
+    }
+    return out
 }
 
 // The next batch of a level, decoded in two steps when lz is on and the

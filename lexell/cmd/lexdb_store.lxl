@@ -24,6 +24,7 @@ import "time"
 import "./lexdb_base"
 import "./lexdb_disk"
 import "./lexdb_page"
+import "./lexdb_cols"
 import "./lexdb_time"
 
 pub const DATA = "data.lxdb"
@@ -189,6 +190,14 @@ pub type Db = record {
     pub pagesWritten: int       // pages checkpoints wrote (meta pages included)
     pub held: int               // commits held for a checkpoint (the cache over twice its budget)
     pub wholes: int             // large values read whole: their chunks read (9.31)
+    // Column leaves (9.112): per table tree, its layouts as the executor
+    // gave them (setColSpec), specs[colSpecs[tree]]; leaves checkpoints
+    // wrote as columns and as rows (of trees with layouts)
+    colSpecs: Map[int, int]
+    specs: []lexdb_cols.Spec
+    pub colLeaves: int
+    pub rowLeaves: int
+    colsOff: bool               // no column leaves written (setColumns)
 }
 
 // A handle to an open store; copies reach the same store. A replica's
@@ -574,6 +583,8 @@ fn copyNode(n: &lexdb_page.Node): lexdb_page.Node {
         c.packed = true
         c.body = n.body
         for e in n.ents { append(mut &c.ents, e) }
+        c.cols = n.cols
+        for x in n.cdir { append(mut &c.cdir, x) }
         return c
     }
     for k in n.keys { append(mut &c.keys, k) }
@@ -1140,7 +1151,7 @@ fn (db: mut &Db) fixOverflow(tree: int, path: &[]int, from: int, atEnd: bool, in
         let sp = db.split(s, end, if j == len(path) - 1 { ins } else { -1 })
         let r = sp.path[0]
         if j == 0 {
-            let root = lexdb_page.Node{leaf: false, keys: [sp.upper], vals: [], kids: [s, r], size: 0, packed: false, lazy: false, body: "", ents: []}
+            let root = lexdb_page.Node{leaf: false, keys: [sp.upper], vals: [], kids: [s, r], size: 0, packed: false, lazy: false, body: "", ents: [], cols: "", cdir: []}
             var rn = root
             rn.size = nodeSize(&rn)
             let ns = db.newNode(rn)
@@ -3491,17 +3502,17 @@ fn walkDropped(f: &lexdb_disk.File, todo: mut &[]int, gone: mut &[]int, most: in
     return Ok(Unit{})
 }
 
-// Writes out the dirty nodes under s (children first): s's page.
-fn (db: mut &Db) encodeSlot(s: int, n: int, out: mut &[]PageOut): int {
+// Writes out the dirty nodes under s (children first) of tree: s's page.
+fn (db: mut &Db) encodeSlot(s: int, n: int, out: mut &[]PageOut, tree: int): int {
     if !db.meta[s].dirty { return db.meta[s].disk }
     var pages: []int = []
     if !db.pool[db.meta[s].frame].leaf {
         var kids: []int = []
         for k in db.pool[db.meta[s].frame].kids { append(mut &kids, k) }
-        for k in kids { append(mut &pages, db.encodeSlot(k, n, mut &out)) }
+        for k in kids { append(mut &pages, db.encodeSlot(k, n, mut &out, tree)) }
     }
     let p = db.allocPage()
-    let body = lexdb_page.nodeBody(&db.pool[db.meta[s].frame], &pages)
+    let body = db.leafBody(s, &pages, tree)
     lexdb_page.repack(mut &db.pool[db.meta[s].frame], &body)
     db.recost(s)
     db.meta[s].dirty = false
@@ -3509,6 +3520,74 @@ fn (db: mut &Db) encodeSlot(s: int, n: int, out: mut &[]PageOut): int {
     db.meta[s].ckpt = n
     append(mut &out, PageOut{no: p, leaf: db.pool[db.meta[s].frame].leaf, n: db.pool[db.meta[s].frame].count(), body: body, raw: []})
     return p
+}
+
+// What a checkpoint writes of node s of tree (nodeBody): a leaf of a tree
+// with layouts (setColSpec) as a column leaf when its rows encode
+// (lexdb_page.colBody, 9.112), else as rows.
+fn (db: mut &Db) leafBody(s: int, pages: &[]int, tree: int): str {
+    let f = db.meta[s].frame
+    if db.pool[f].leaf && lexdb_cols.on() && !db.colsOff {
+        match db.colSpecs.get(&tree) {
+            Some(i) {
+                match lexdb_page.colBody(&db.pool[f], &db.specs[i]) {
+                    Some(b) {
+                        db.colLeaves += 1
+                        return b
+                    }
+                    None { db.rowLeaves += 1 }
+                }
+            }
+            None {}
+        }
+    }
+    return lexdb_page.nodeBody(&db.pool[f], pages)
+}
+
+// Gives tree (a table's) its layouts, layout i's kind per place
+// (lexdb_exec Table.layouts): its leaves are written as column leaves
+// from then on when their rows are all in one of them (9.112). What a
+// column leaf holds does not depend on this being right: an encoder that
+// is given wrong kinds writes rows that do not parse in them as rows, and
+// the rows it does take come back byte for byte; a reader that reads
+// columns first checks the leaf's kinds against its table's.
+pub fn (st: &Store) setColSpec(tree: int, layouts: &[][]byte) {
+    if st.fo.isSome() { return }
+    st.sh.with(fn(db: mut &Db) {
+        match db.colSpecs.get(&tree) {
+            Some(i) {
+                if lexdb_cols.sameSpec(&db.specs[i], layouts) { return }
+                db.specs[i] = lexdb_cols.Spec{layouts: copyLayouts(layouts)}
+            }
+            None {
+                db.colSpecs.put(tree, len(db.specs))
+                append(mut &db.specs, lexdb_cols.Spec{layouts: copyLayouts(layouts)})
+            }
+        }
+    })
+}
+
+fn copyLayouts(ls: &[][]byte): [][]byte {
+    var out: [][]byte = []
+    for l in ls {
+        var x: []byte = []
+        for k in l { append(mut &x, k) }
+        append(mut &out, x)
+    }
+    return out
+}
+
+// Whether this store's checkpoints write column leaves (with
+// lexdb_cols.on(), LEXDB_COLUMNS): off, every leaf is written as rows
+// (tests compare the two).
+pub fn (st: &Store) setColumns(on: bool) { st.sh.with(fn(db: mut &Db) { db.colsOff = !on }) }
+
+// Leaves checkpoints wrote as column leaves, and as rows (of trees with
+// layouts: their rows did not all encode): 9.112.
+pub fn (st: &Store) colCounts(): []int {
+    var out: []int = []
+    st.sh.with(fn(db: mut &Db) { out = [db.colLeaves, db.rowLeaves] })
+    return out
 }
 
 // A checkpoint of everything applied so far, waiting first for one that
@@ -3622,7 +3701,7 @@ pub fn (st: &Store) checkpoint(): Result[Unit, lexdb_base.DbErr] {
         }
         for i in 0..len(ids) {
             append(mut &roots, ids[i])
-            append(mut &roots, db.encodeSlot(rs[i], n, mut &out))
+            append(mut &roots, db.encodeSlot(rs[i], n, mut &out, ids[i]))
         }
         var freed = replace(mut &db.freeAfterNext, [])
         for p in db.listPages { append(mut &freed, p) }
@@ -3862,7 +3941,8 @@ fn newDb(fs: lexdb_disk.Fs, data: lexdb_disk.File, opts: Options, m: &lexdb_page
               durableBatch: m.replayBatch - 1, waiters: [], locks: newMap(), lockWaits: [], waitFor: newMap(), nextLock: 0, writerWake: [], ckptWake: [], ckptDone: [], seg: m.replaySeg,
               segOff: m.replayOff, logSinceCkpt: 0, failed: [], closing: false, seq: 0, snaps: [], nextSnap: 0,
               hist: [], histCount: 0, histSlots: [], deferred: [], rootHist: [], durableSeq: 0, holds: newMap(), holdCkpt: -1, holdSeg: -1, heldFree: [], changeWake: [], durWaits: [], nextDurWait: 0, ckptCovers: m.covers, snapshots: 0, tooOld: 0, commits: 0,
-              conflicts: 0, loads: 0, aheadReads: 0, aheadPages: 0, evictions: 0, flushes: 0, logBytes: 0, checkpoints: 0, pagesWritten: 0, held: 0, wholes: 0}
+              conflicts: 0, loads: 0, aheadReads: 0, aheadPages: 0, evictions: 0, flushes: 0, logBytes: 0, checkpoints: 0, pagesWritten: 0, held: 0, wholes: 0,
+              colSpecs: newMap(), specs: [], colLeaves: 0, rowLeaves: 0, colsOff: false}
 }
 
 // Opens the store in fs (creating it when it is new) and recovers: the last

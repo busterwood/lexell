@@ -23,6 +23,13 @@
 // Each entry takes at most its bytes in T_LEAF (frontEntry), so a T_LEAF
 // page always fits again as T_FLEAF, and a leaf's size (Node.size) is its
 // bytes in T_FLEAF.
+// Leaf (type 7, T_CLEAF, 9.112; a table's leaf whose rows are all in one
+// fixed layout, written by a checkpoint): [16..18) n; [18..20) K, the
+// keys' bytes; [20..22) L, the columns' bytes; [22..22 + K) the keys, each
+// front coded against the key before (a varint of the bytes shared, a
+// varint of the tail's length, the tail); then L bytes, the rows by
+// column (lexdb_cols). The rows are given back as they were written,
+// byte for byte (lexdb_cols.rowOf).
 // Internal (type 3): [16..18) n keys; [18..26) child 0; then n entries: u16
 // key length, key, u64 child. Child i+1 holds the keys >= key i.
 // Meta (type 1, pages 0 and 1): see Meta.
@@ -32,6 +39,7 @@
 import "binary"
 import "./lexdb_base"
 import "./lexdb_disk"
+import "./lexdb_cols"
 
 extern "c" fn memcpy(dst: mut &[byte], src: &[byte], n: int): ptr
 
@@ -41,9 +49,10 @@ pub const T_LEAF = 2
 pub const T_INTERNAL = 3
 pub const T_LIST = 5
 pub const T_FLEAF = 6
+pub const T_CLEAF = 7
 
-// Whether page type t is a leaf's (either form).
-pub fn isLeafType(t: int): bool { return t == T_LEAF || t == T_FLEAF }
+// Whether page type t is a leaf's (any form).
+pub fn isLeafType(t: int): bool { return t == T_LEAF || t == T_FLEAF || t == T_CLEAF }
 
 const HDR = 16
 // The bytes a node's entries may use: the page less the header and count
@@ -77,9 +86,19 @@ pub type Node = record {
     pub lazy: bool       // a leaf whose entries are body's, at ents (keys and vals empty)
     pub body: str
     pub ents: []int      // a lazy leaf: where entry i's key and value are in body (kStart and the others)
+    // A column leaf (lazy, from a T_CLEAF page or a checkpoint, 9.112):
+    // body is colBody's (its keys, then cols), ents give the keys (no
+    // values), cols is the rows by column (lexdb_cols) and cdir its
+    // directory (lexdb_cols.parse); a value is rebuilt when asked for.
+    // Empty otherwise.
+    pub cols: str
+    pub cdir: []int
 }
 
-pub fn newNode(leaf: bool): Node { return Node{leaf: leaf, keys: [], vals: [], kids: [], size: 0, packed: false, lazy: false, body: "", ents: []} }
+pub fn newNode(leaf: bool): Node { return Node{leaf: leaf, keys: [], vals: [], kids: [], size: 0, packed: false, lazy: false, body: "", ents: [], cols: "", cdir: []} }
+
+// Whether n is a column leaf (its rows by column: cols, cdir).
+pub fn (n: &Node) isCols(): bool { return len(n.cdir) > 0 }
 
 pub fn newLeaf(): Node { return newNode(true) }
 
@@ -105,17 +124,20 @@ pub fn (n: &Node) key(i: int): str {
     return n.body[kStart(e)..kEnd(e)]
 }
 
-// Value i (a leaf's).
+// Value i (a leaf's); a column leaf's row is rebuilt.
 pub fn (n: &Node) val(i: int): str {
     if !n.lazy { return n.vals[i] }
+    if len(n.cdir) > 0 { return lexdb_cols.rowOf(&n.cols, &n.cdir, i) }
     let e = n.ents[i]
     return n.body[vStart(e)..vEnd(e)]
 }
 
 // Value i as a view of the node's bytes: nothing made or counted (a scan's
-// rows are read through it).
+// rows are read through it). Not of a column leaf (isCols), whose rows
+// are read by column or rebuilt (val).
 pub fn (n: &Node) valView(i: int): &str {
     if !n.lazy { return &n.vals[i] }
+    if len(n.cdir) > 0 { panic("valView of a column leaf") }
     let e = n.ents[i]
     return &n.body[vStart(e)..vEnd(e)]
 }
@@ -154,6 +176,11 @@ pub fn (n: &Node) lower(k: &str): int {
 // can be changed.
 pub fn (n: mut &Node) loosen() {
     if !n.lazy { return }
+    if len(n.cdir) > 0 {
+        // a column leaf: its rows rebuilt, as one string
+        n.loosenCols()
+        return
+    }
     let cnt = len(n.ents)
     var keys: []str = array(cnt, "")
     var vals: []str = array(cnt, "")
@@ -169,6 +196,28 @@ pub fn (n: mut &Node) loosen() {
     n.body = ""
     n.ents = []
     if n.size < 0 { n.size = leafSize(n) }
+}
+
+fn (n: mut &Node) loosenCols() {
+    let cnt = len(n.ents)
+    var ends: []int = array(cnt, 0)
+    let rows = lexdb_cols.allRows(&n.cols, &n.cdir, mut &ends)
+    var keys: []str = array(cnt, "")
+    var vals: []str = array(cnt, "")
+    for i in 0..cnt {
+        let e = n.ents[i]
+        keys[i] = n.body[kStart(e)..kEnd(e)]
+        vals[i] = rows[if i == 0 { 0 } else { ends[i - 1] }..ends[i]]
+    }
+    n.keys = keys
+    n.vals = vals
+    n.lazy = false
+    n.packed = false
+    n.body = ""
+    n.ents = []
+    n.cols = ""
+    n.cdir = []
+    n.size = leafSize(n)
 }
 
 // A leaf's body in memory: its entries whole, each a u16 key length, a u16
@@ -193,7 +242,7 @@ fn lazyLeaf(body: str, cnt: int): Node {
             at += 4 + kl + vl
         }
     }
-    return Node{leaf: true, keys: [], vals: [], kids: [], size: 0, packed: true, lazy: true, body: body, ents: ents}
+    return Node{leaf: true, keys: [], vals: [], kids: [], size: 0, packed: true, lazy: true, body: body, ents: ents, cols: "", cdir: []}
 }
 
 // The bytes of an entry in T_LEAF: what bounds an entry (MAX_ENTRY), and
@@ -377,7 +426,7 @@ fn frontLeaf(b: &[]byte, cnt: int): Node {
         at = h.at + n
         prev = ks
     }
-    return Node{leaf: true, keys: [], vals: [], kids: [], size: size, packed: true, lazy: true, body: strFromBytes(&out), ents: ents}
+    return Node{leaf: true, keys: [], vals: [], kids: [], size: size, packed: true, lazy: true, body: strFromBytes(&out), ents: ents, cols: "", cdir: []}
 }
 
 // Leaf n's page, numbered pageNo: front coded (T_FLEAF); or, should its
@@ -410,6 +459,184 @@ fn leafPage(n: &Node, pageNo: int): []byte {
     return w
 }
 
+// ---- column leaves (T_CLEAF, 9.112)
+//
+// In memory, and in a checkpoint's PageOut, a column leaf's body is
+// \xff\xff (no row body starts so: a key is at most MAX_KEY bytes), a u32
+// of its keys' bytes K, its keys as a lazy body holds them (a u16 key
+// length, a u16 0, the key), then its columns.
+
+const CB = 6
+
+// Whether body is a column leaf's.
+pub fn isColBody(body: &str): bool { return len(body) >= CB && body[0] == 0xff && body[1] == 0xff }
+
+// A column leaf's body: keys from (lazy body form, kb bytes) and columns cols.
+fn colBodyOf(keys: &[]byte, kb: int, cols: &str): str {
+    var out: []byte = array(CB + kb + len(cols), byte(0))
+    out[0] = byte(0xff)
+    out[1] = byte(0xff)
+    binary.setU32LE(mut &out, 2, kb)
+    for i in 0..kb { out[CB + i] = keys[i] }
+    for i in 0..len(cols) { out[CB + kb + i] = cols[i] }
+    return strFromBytes(&out)
+}
+
+// The column leaf of body (cnt rows).
+fn colNode(body: str, cnt: int): Node {
+    let kb = binary.readU32LEStr(&body, 2)
+    var ents: []int = array(cnt, 0)
+    var at = CB
+    for i in 0..cnt {
+        let kl = binary.readU16LEStr(&body, at)
+        ents[i] = ent(at + 4, kl, 0, 0)
+        at += 4 + kl
+    }
+    let cols = body[CB + kb..]
+    let dir = match lexdb_cols.parse(&cols, cnt) {
+        Some(d) { d }
+        None { panic("a column leaf's columns") }
+    }
+    return Node{leaf: true, keys: [], vals: [], kids: [], size: CB + len(body), packed: true, lazy: true, body: body, ents: ents, cols: cols, cdir: dir}
+}
+
+// The bytes leaf n's keys take front coded on a T_CLEAF page.
+fn colKeysSize(n: &Node): int {
+    var size = 0
+    for i in 0..n.count() {
+        let k = n.key(i)
+        let c = if i == 0 { 0 } else { commonLen(&n.key(i - 1), &k) }
+        size += varLen(c) + varLen(len(k) - c) + len(k) - c
+    }
+    return size
+}
+
+// Leaf n as a column leaf's body (colBodyOf), its rows encoded with the
+// tree's layouts: None when they do not all encode (lexdb_cols.encodeRows)
+// or the page would not hold them; a column leaf's own body.
+pub fn colBody(n: &Node, spec: &lexdb_cols.Spec): Option[str] {
+    if !n.leaf { return None }
+    if n.isCols() { return Some(n.body) }
+    let cnt = n.count()
+    if cnt == 0 { return None }
+    var rows: []&str = withCapacity(cnt)
+    for i in 0..cnt { append(mut &rows, n.valView(i)) }
+    let got = lexdb_cols.encodeChecked(&rows, spec)
+    if got.isNone() { return None }
+    let cols = got.unwrap()
+    if 22 + colKeysSize(n) + len(cols) > PAGE { return None }
+    var kb = 0
+    for i in 0..cnt { kb += 4 + len(n.key(i)) }
+    var keys: []byte = array(kb, byte(0))
+    var at = 0
+    for i in 0..cnt {
+        let k = n.key(i)
+        binary.setU16LE(mut &keys, at, len(k))
+        putStr(mut &keys, at + 4, &k)
+        at += 4 + len(k)
+    }
+    return Some(colBodyOf(&keys, kb, &cols))
+}
+
+// Page pageNo holding column leaf body (colBody's) of cnt rows.
+fn colPage(body: &str, cnt: int, pageNo: int): []byte {
+    var b = array(PAGE, byte(0))
+    let kb = binary.readU32LEStr(body, 2)
+    let cols = &body[CB + kb..]
+    binary.setU16LE(mut &b, 16, cnt)
+    var at = 22
+    var p = CB
+    var prev = -1
+    for i in 0..cnt {
+        let kl = binary.readU16LEStr(body, p)
+        let k = &body[p + 4..p + 4 + kl]
+        let c = if prev < 0 { 0 } else { commonLen(&body[prev + 4..prev + 4 + binary.readU16LEStr(body, prev)], k) }
+        at = putVar(mut &b, at, c)
+        at = putVar(mut &b, at, kl - c)
+        for j in c..kl { b[at + j - c] = k[j] }
+        at += kl - c
+        prev = p
+        p += 4 + kl
+    }
+    binary.setU16LE(mut &b, 18, at - 22)
+    binary.setU16LE(mut &b, 20, len(cols))
+    for j in 0..len(cols) { b[at + j] = cols[j] }
+    seal(mut &b, pageNo, T_CLEAF)
+    return b
+}
+
+fn getVar(b: &[]byte, at: mut &int): int {
+    var v = 0
+    var sh = 0
+    while true {
+        let x = int(b[at])
+        at += 1
+        v = v | ((x & 0x7f) << sh)
+        sh += 7
+        if x < 0x80 || sh > 21 { break }
+    }
+    return v
+}
+
+// Whether a T_CLEAF page's parts are where its header says, its keys
+// within them, and its columns a column region (a page that passed its
+// checksum, so a check of the format, not of the bytes).
+fn colPageOk(b: &[]byte): bool {
+    let n = binary.readU16LE(b, 16)
+    let kl = binary.readU16LE(b, 18)
+    let cl = binary.readU16LE(b, 20)
+    if n == 0 || 22 + kl + cl > PAGE { return false }
+    var at = 22
+    var prevLen = 0
+    for i in 0..n {
+        if at + 2 > 22 + kl { return false }
+        let c = getVar(b, mut &at)
+        if at >= 22 + kl { return false }
+        let t = getVar(b, mut &at)
+        if c > prevLen || at + t > 22 + kl || c + t > MAX_KEY { return false }
+        at += t
+        prevLen = c + t
+    }
+    if at != 22 + kl { return false }
+    return lexdb_cols.parse(&getStr(b, 22 + kl, cl), n).isSome()
+}
+
+// The column leaf on T_CLEAF page b (cnt rows; colPageOk checked it).
+fn colLeaf(b: &[]byte, cnt: int): Node {
+    let kl = binary.readU16LE(b, 18)
+    let cl = binary.readU16LE(b, 20)
+    // the keys made whole
+    var kb = 0
+    var at = 22
+    for i in 0..cnt {
+        let c = getVar(b, mut &at)
+        let t = getVar(b, mut &at)
+        kb += 4 + c + t
+        at += t
+    }
+    var out: []byte = array(CB + kb + cl, byte(0))
+    out[0] = byte(0xff)
+    out[1] = byte(0xff)
+    binary.setU32LE(mut &out, 2, kb)
+    at = 22
+    var o = CB
+    var prev = CB
+    for i in 0..cnt {
+        let c = getVar(b, mut &at)
+        let t = getVar(b, mut &at)
+        binary.setU16LE(mut &out, o, c + t)
+        for j in 0..c { out[o + 4 + j] = out[prev + 4 + j] }
+        for j in 0..t { out[o + 4 + c + j] = b[at + j] }
+        at += t
+        prev = o
+        o += 4 + c + t
+    }
+    for j in 0..cl { out[o + j] = b[22 + kl + j] }
+    var l = colNode(strFromBytes(&out), cnt)
+    l.size = 22 + kl + cl
+    return l
+}
+
 // ---- header and check
 
 fn seal(b: mut &[]byte, pageNo: int, typ: int) {
@@ -428,8 +655,11 @@ pub fn check(b: &[]byte, pageNo: int, typ: int): Result[Unit, lexdb_base.DbErr] 
     if int(binary.readU64LE(b, 4)) != pageNo {
         return Err(lexdb_base.corrupt("page " + pageNo.toStr() + ": holds page " + int(binary.readU64LE(b, 4)).toStr()))
     }
-    if int(b[12]) != typ && !(typ == T_LEAF && (int(b[12]) == T_INTERNAL || int(b[12]) == T_FLEAF)) {
+    if int(b[12]) != typ && !(typ == T_LEAF && (int(b[12]) == T_INTERNAL || int(b[12]) == T_FLEAF || int(b[12]) == T_CLEAF)) {
         return Err(lexdb_base.corrupt("page " + pageNo.toStr() + ": type " + int(b[12]).toStr()))
+    }
+    if int(b[12]) == T_CLEAF && !colPageOk(b) {
+        return Err(lexdb_base.corrupt("page " + pageNo.toStr() + ": a column leaf's columns"))
     }
     return Ok(Unit{})
 }
@@ -468,6 +698,7 @@ pub fn encodeNode(n: &Node, pages: &[]int, pageNo: int): []byte {
 pub fn decodeNode(b: &[]byte): Node {
     let n = binary.readU16LE(b, 16)
     if int(b[12]) == T_FLEAF { return frontLeaf(b, n) }
+    if int(b[12]) == T_CLEAF { return colLeaf(b, n) }
     let leaf = int(b[12]) == T_LEAF
     var end = if leaf { 18 } else { 26 }
     for i in 0..n {
@@ -481,7 +712,7 @@ pub fn decodeNode(b: &[]byte): Node {
         l.size = -1
         return l
     }
-    var node = Node{leaf: false, keys: array(n, ""), vals: [], kids: array(n + 1, 0), size: end - 18, packed: true, lazy: false, body: "", ents: []}
+    var node = Node{leaf: false, keys: array(n, ""), vals: [], kids: array(n + 1, 0), size: end - 18, packed: true, lazy: false, body: "", ents: [], cols: "", cdir: []}
     unpack(mut &node, &getStr(b, 18, end - 18), true)
     return node
 }
@@ -518,6 +749,7 @@ pub fn nodeBody(n: &Node, pages: &[]int): str {
 // coded (T_FLEAF), or, should its entries not fit so (a size miscounted),
 // whole (T_LEAF) when they fit that way.
 pub fn bodyPage(leaf: bool, n: int, body: &str, pageNo: int): []byte {
+    if leaf && isColBody(body) { return colPage(body, n, pageNo) }
     if leaf { return leafPage(&lazyLeaf(body.toStr(), n), pageNo) }
     var b = array(PAGE, byte(0))
     binary.setU16LE(mut &b, 16, n)
@@ -531,10 +763,25 @@ pub fn bodyPage(leaf: bool, n: int, body: &str, pageNo: int): []byte {
 // its own allocation in arrays with room to spare, takes less memory
 // after this.
 pub fn repack(n: mut &Node, body: &str) {
+    if n.leaf && isColBody(body) {
+        let cnt = n.count()
+        var l = colNode(body.toStr(), cnt)
+        n.keys = []
+        n.vals = []
+        n.ents = replace(mut &l.ents, [])
+        n.cdir = replace(mut &l.cdir, [])
+        n.cols = l.cols
+        n.body = l.body
+        n.lazy = true
+        n.packed = true
+        return
+    }
     if n.leaf {
         let cnt = n.count()
         n.keys = []
         n.vals = []
+        n.cols = ""
+        n.cdir = []
         var l = lazyLeaf(body.toStr(), cnt)
         n.ents = replace(mut &l.ents, [])
         n.body = l.body
@@ -591,7 +838,7 @@ fn unpack(n: mut &Node, body: &str, kids: bool) {
 // keeps for it, loaded or not: its SlotMeta and history list, about 120
 // bytes (measured, 9.17; a slot not in memory holds no node).
 pub fn nodeCost(n: &Node): int {
-    if n.lazy { return 160 + len(n.body) + 8 * len(n.ents) }
+    if n.lazy { return 160 + len(n.body) + 8 * len(n.ents) + 8 * len(n.cdir) }
     let keys = n.size + (if n.packed { 64 } else { 144 }) * len(n.keys)
     return 160 + keys + 120 * len(n.kids)
 }
