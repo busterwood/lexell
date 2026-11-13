@@ -232,3 +232,65 @@ Not proposed:
   and some of these queries cost more than that. Whether it ran in the
   timings above was not checked (EXPLAIN ANALYZE shows a JIT section when
   it does).
+
+## 5. Results (2026-11-13)
+
+Items 1 to 6 of section 4 were built by agents, reviewed, and merged:
+- semi-joins: lexdb.md 9.104;
+- the sort, top-N, DISTINCT and windows: 9.105;
+- indexes in batches: 9.107;
+- expressions and two-step decoding: 9.108;
+- data changes and front-coded leaves: 9.109.
+
+The column-page study is lexdb-pages.md and a second one in progress.
+
+Server CPU ms, median of three, the same data and harness as section 1.
+- **start:** c66474b0 (before 9.101).
+- **mid:** 25a7b4e2 (9.103, when this page was written).
+- **now:** fd437e6b.
+
+The machine had other work on it (load 2 to 3): an A/B of `select *` gave 510 to 531 for mid and 514 to 518 for now, so differences of about 5% are noise.
+
+| query | start | mid | now | PG 1 core | SQLite |
+|---|---:|---:|---:|---:|---:|
+| `order by b` (1M rows) | 4,110 | 4,095 | **82** | 400 | 161 |
+| `order by c desc limit 10` | 390 | 401 | **49** | 90 | 40 |
+| join, then sorted (103k) | 919 | 550 | **93** | 110 | 1,157 |
+| `distinct city` | 350 | 333 | **105** | 100 | 74 |
+| `select *` | 783 | 490 | **531** | 270 | 538 |
+| `a + b, price * 2, upper(city)` | 1,580 | 1,600 | **454** | 310 | 424 |
+| `where a = 5` | 70 | 71 | **50** | 40 | 36 |
+| `note like '%item 77%'` | 140 | 136 | **67** | 80 | 62 |
+| `group by city, avg(price)` | 240 | 192 | **195** | 130 | 250 |
+| hash join, text key, count | 788 | 113 | **119** | 90 | 81 |
+| `w join t` (1M × 1M) | 1,584 | 582 | **106** | 80 | 30 |
+| index range, 100k rows | 170 | 170 | **77** | 40 | 144 |
+| `in (subquery)` | 470 | 468 | **39** | 50 | 50 |
+| `exists (...)` | 590 | 602 | **49** | 50 | 43 |
+| `row_number() over (...)` | 940 | 967 | **247** | 130 | 184 |
+| `select id, b, name` | 364 | | **135** | 130 | 226 |
+| `where a < 10` | 103 | | **60** | 60 | 54 |
+| `id, a + b, c % 1000` | 550 | | **124** | 140 | 213 |
+| `count(*)` | 20 | | **20** | 30 | 3 |
+| `group by a` | 50 | | **51** | 100 | 167 |
+| index range, aggregate | 160 | | **52** | 30 | 110 |
+| key range, 100k rows | 38 | | **17** | 20 | 25 |
+| 20k point lookups | 560 | | **586** | 460 | |
+| hash join, rows (103k) | 584 | | **53** | 50 | |
+| hash join, text key, rows | 630 | | **121** | 80 | |
+| LEFT JOIN, rows (200k) | 304 | | **36** | 40 | |
+
+**Where lexdb is still behind PostgreSQL on one core:**
+- `select *`: 2 times;
+- windows: 1.9 times;
+- `expr_mix`: 1.5 times;
+- GROUP BY a text with avg(numeric): 1.5 times;
+- a text-keyed hash join: 1.3 to 1.5 times;
+- the index range: 1.9 times, or 1.7 with an aggregate;
+- point lookups: 1.3 times.
+
+Everything else is level or ahead. PostgreSQL in parallel is still about twice as fast in wall time on scans and aggregates (section 3E).
+
+**Row format.** The page studies' column leaves address the first of these (decoding whole rows); see lexdb-pages.md and its sequel.
+
+**Data changes** (9.109, wall ms): DELETE of 10k rows with an index fell from 2 to 12 s to 0.16 to 0.37 (PostgreSQL 0.05). INSERT … SELECT of 103k rows fell from 738 to 486 (PostgreSQL 202). UPDATE is unchanged (257 against 66); its scan decodes whole rows.
