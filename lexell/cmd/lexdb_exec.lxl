@@ -12817,9 +12817,12 @@ fn update(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
             if lexdb_sql.isDefault(&sets[k]) { all[targets[k]] = try defAt(st, txn, &defs, t, targets[k]) }
             else { all[targets[k]] = try coerceZ(try evalX(st, txn, &q, &sets[k], &env, mut &rs), &t.cols[targets[k]].typ, &txn.zone) }
         }
-        let old = rowPrefix(&joined, nt)
-        let row = rowPrefix(&all, nt)
-        try updRow(st, txn, t, &old, &row, &fw, mut &later)
+        // (the table's alone, without FROM: the rows as they are, not copied)
+        if len(joined) == nt {
+            try updRow(st, txn, t, &joined, &all, &fw, mut &later)
+        } else {
+            try updRow(st, txn, t, &rowPrefix(&joined, nt), &rowPrefix(&all, nt), &fw, mut &later)
+        }
         try retAddOld(st, txn, &q, &m, params, mut &ret, &all, &joined, mut &rs)
     }
     try fkFinish(st, txn, &fw, mut &later)
@@ -21113,7 +21116,7 @@ fn fetchRaw(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, sc: &S
 fn bPut(b: mut &Batch, c: int, r: int, v: Val, kind: int): bool {
     match v {
         Val.Null {
-            b.cols[c].nul[r] = true
+            bNull(b, c, r)
             return true
         }
         Val.Int(i) {
@@ -21161,6 +21164,34 @@ fn newBatch(bp: &BPlan, cap: int): Batch {
     return b
 }
 
+// Row r of column c NULL; a value column's slot set to NULL too, so a
+// batch used again (bReuse) holds no value from its last use there.
+fn bNull(b: mut &Batch, c: int, r: int) {
+    b.cols[c].nul[r] = true
+    if r < len(b.vals[c]) { b.vals[c][r] = Val.Null }
+}
+
+// A batch for a lazy fill (fillPick) of BROWS rows: spare, the last one the
+// caller used, when it is of this plan, else a new one. Its value columns
+// are kept as they are (each slot a fill decodes is written, a NULL
+// too: bNull), the integer and NULL columns new: making BROWS values of
+// each value column and dropping them per batch was about a third of an
+// UPDATE that keeps 1% of a million rows (design/lexdb.md 9.111).
+fn bReuse(spare: mut &Batch, bp: &BPlan): Batch {
+    var b = replace(spare, noRows())
+    var fits = len(b.cols) == len(bp.kinds) && len(b.vals) == len(bp.kinds)
+    if fits {
+        for i in 0..len(bp.kinds) {
+            let want = if bp.needCol[i] && bp.kinds[i] == BK_VAL { BROWS } else { 0 }
+            if len(b.vals[i]) != want { fits = false }
+        }
+    }
+    if !fits { return newBatch(bp, BROWS) }
+    b.n = 0
+    for i in 0..len(bp.kinds) { if bp.needCol[i] { b.cols[i] = bvec(BROWS) } }
+    return b
+}
+
 // Decodes stored row s into row r of b: 0 done, 1 a value of a kind its
 // column's batch does not hold (the row path reads the query), 2 a value
 // stored apart (the store must be read: the caller's).
@@ -21182,7 +21213,7 @@ fn bRowInto(s: &str, r: int, b: mut &Batch, bp: &BPlan, t: &Table): Result[int, 
             }
             let pk = lay.kinds[pl]
             if pk == PK_NONE || (int(s[lay.bm + pl / 8]) >> (pl % 8)) & 1 == 1 {
-                b.cols[c].nul[r] = true
+                bNull(b, c, r)
             } else if k == BK_INT && isIntKind(pk) {
                 b.cols[c].v[r] = readIntK(s, lay.off[pl], pk)
             } else if pk == PK_BOOL && k == BK_BOOL {
@@ -21227,7 +21258,7 @@ fn bRowInto(s: &str, r: int, b: mut &Batch, bp: &BPlan, t: &Table): Result[int, 
         }
         let k = kinds[c]
         if tag == 0 {
-            b.cols[c].nul[r] = true
+            bNull(b, c, r)
         } else if tag == 1 && k == BK_INT {
             b.cols[c].v[r] = binary.readI64LEStr(s, at)
             at += 8
@@ -21637,7 +21668,7 @@ fn bRunCols(rows: &[]&str, qs: &[]int, r0: int, ps: &[]int, b: mut &Batch, bp: &
         }
         let pk = lay.kinds[pl]
         if pk == PK_NONE {
-            for q in qs { b.cols[c].nul[r0 + q] = true }
+            for q in qs { bNull(b, c, r0 + q) }
             continue
         }
         let at = lay.bm + pl / 8
@@ -21689,7 +21720,12 @@ fn bRunCols(rows: &[]&str, qs: &[]int, r0: int, ps: &[]int, b: mut &Batch, bp: &
         } else if k == BK_VAL {
             for q in qs {
                 let s = rows[q]
-                if (int(s[at]) >> bit) & 1 == 1 { b.cols[c].nul[r0 + q] = true } else { b.vals[c][r0 + q] = try fixedVal(s, pl, pk, lay) }
+                if (int(s[at]) >> bit) & 1 == 1 {
+                    b.cols[c].nul[r0 + q] = true
+                    b.vals[c][r0 + q] = Val.Null
+                } else {
+                    b.vals[c][r0 + q] = try fixedVal(s, pl, pk, lay)
+                }
             }
         } else {
             return Ok(false)
@@ -21775,6 +21811,14 @@ fn bRunLazy(leaf: &lexdb_page.Node, from: int, to: int, b: mut &Batch, bp: &BPla
 // error on one of its rows (the caller reads the batch by the row path).
 fn fillPick(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, sc: &Scan, part: bool, cur: mut &Cursor,
             bp: &BPlan, rd: &IxRead, lz: &Lazy, conds: &[]BNode, bar: &Bar): Result[Option[Picked], DbErr] {
+    var none = noRows()
+    return fillPickIn(st, txn, t, sc, part, cur, bp, rd, lz, conds, bar, mut &none)
+}
+
+// fillPick, its batch spare's when that is of the plan (bReuse): a caller
+// that is done with a batch gives it back there for the next.
+fn fillPickIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, sc: &Scan, part: bool, cur: mut &Cursor,
+              bp: &BPlan, rd: &IxRead, lz: &Lazy, conds: &[]BNode, bar: &Bar, spare: mut &Batch): Result[Option[Picked], DbErr] {
     // (an index's read, 9.107, whole: an index-only entry's columns come
     // from its key all at once; its rows, fetched by their keys, as fillLevel reads them)
     if !lz.on || sc.empty || sc.point || (rd.ix >= 0 && !sc.whole) {
@@ -21786,7 +21830,7 @@ fn fillPick(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, sc: &S
         let idx = ch.unwrap()
         return Ok(Some(Picked{kept: len(idx), idx: idx, b: b}))
     }
-    var b = newBatch(bp, BROWS)
+    var b = bReuse(spare, bp)
     var idx: []int = []
     var pend: []int = []                // rows decoded whole: chosen at the end
     var kept = 0
@@ -23284,10 +23328,11 @@ fn batchLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &
     for sc in lp.scans {
         var cur = newCursor()
         var rowPath = false
+        var spare = noRows()            // the last batch, used again (bReuse)
         while !cur.done {
             let saved = Cursor{at: cur.at, started: cur.started, done: cur.done}
             // (decoded in two steps: 9.108)
-            let got = try fillPick(st, txn, t, &sc, lp.part, mut &cur, bp, &lp.rd, &lp.lazy, &lp.conds, &noBar())
+            let got = try fillPickIn(st, txn, t, &sc, lp.part, mut &cur, bp, &lp.rd, &lp.lazy, &lp.conds, &noBar(), mut &spare)
             if got.isNone() {
                 // a value a batch cannot hold, or an error on some row of
                 // the batch: the row path reads it, and gives the error
@@ -23300,7 +23345,10 @@ fn batchLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &
             let b = replace(mut &pk.b, noRows())
             let idx = replace(mut &pk.idx, [])
             let nr = b.n
-            if nr == 0 { continue }
+            if nr == 0 {
+                spare = b
+                continue
+            }
             if joined {
                 let got3 = try bJoinAll(st, txn, q, m, &jpl, &b, &idx, &zone, rs)
                 if got3.isNone() {
@@ -23320,6 +23368,7 @@ fn batchLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &
                     matched = true
                     if !(try emit(txn, row)) { return Ok(1) }
                 }
+                spare = b
                 continue
             }
             rs.cnt[0].batches += 1
@@ -23349,6 +23398,7 @@ fn batchLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &
                 rs.cnt[0].joined += went
                 try rs.tickN(nr - len(idx) + went)
                 if stopped { return Ok(1) }
+                spare = b
                 continue
             }
             // the rows dropped count as read, as the row path counts them
@@ -23360,6 +23410,7 @@ fn batchLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &
                 if got2 < 0 { return Ok(1) }
                 if got2 > 0 { matched = true }
             }
+            spare = b
         }
         while rowPath && !cur.done {
             var batch: [][]Val = []
@@ -24012,9 +24063,10 @@ fn eachOut(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: &Mat
     for sc in lp.scans {
         var cur = newCursor()
         var rowPath = false
+        var spare = noRows()            // the last batch, used again (bReuse)
         while !cur.done {
             let saved = Cursor{at: cur.at, started: cur.started, done: cur.done}
-            let got = try fillPick(st, txn, t, &sc, lp.part, mut &cur, bp, &lp.rd, &lp.lazy, &lp.conds, &noBar())
+            let got = try fillPickIn(st, txn, t, &sc, lp.part, mut &cur, bp, &lp.rd, &lp.lazy, &lp.conds, &noBar(), mut &spare)
             if got.isNone() {
                 cur = saved
                 rowPath = true
@@ -24024,7 +24076,10 @@ fn eachOut(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: &Mat
             var b = replace(mut &pk.b, noRows())
             var idx = replace(mut &pk.idx, [])
             let nr = b.n
-            if nr == 0 { continue }
+            if nr == 0 {
+                spare = b
+                continue
+            }
             let nRead = nr
             let nChosen = len(idx)
             if op.joined {
@@ -24072,11 +24127,18 @@ fn eachOut(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: &Mat
                 try rs.tickN(nr - len(idx) + take)
             }
             if take > 0 {
-                let ob = OutBatch{n: take, kinds: copyInts(&op.kinds), src: srcs, idx: move(idx),
+                var ob = OutBatch{n: take, kinds: copyInts(&op.kinds), src: srcs, idx: move(idx),
                                   cols: replace(mut &b.cols, []), vals: replace(mut &b.vals, []), ex: ex}
                 n += take
                 if !(try eachB(txn, &ob)) { return Ok(n) }
+                // the table's columns back, the outputs' added ones dropped
+                b.cols = replace(mut &ob.cols, [])
+                b.vals = replace(mut &ob.vals, [])
+                while len(b.cols) > len(bp.kinds) { let gone = pop(mut &b.cols) }
+                while len(b.vals) > len(bp.kinds) { let gone2 = pop(mut &b.vals) }
             }
+            // (a joined batch is the query's columns: not one to use again)
+            if !op.joined { spare = b }
             if sel.limit >= 0 && n >= sel.limit { return Ok(n) }
         }
         while rowPath && !cur.done {
