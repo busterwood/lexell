@@ -637,7 +637,12 @@ distinct, over 64 `sys` views, two dozen catalog and property functions,
   made with (below), else the nearest (text nvarchar(max), varchar(n)
   nvarchar(n), timestamp datetime2, numeric decimal, bytea varbinary(max)).
   A column made over PostgreSQL shows collation Latin1_General_BIN2 (lexdb's
-  exact comparison). Creation and change dates are 2000-01-01: lexdb keeps
+  exact comparison). An interval, an array (and an enum) are nvarchar(max),
+  as lexdb_tds sends them, as text; a timestamp, timestamptz or time without
+  a precision is datetime2(7), datetimeoffset(7), time(7), as sent; serial
+  and bigserial are int and bigint identity columns. Object Explorer labels
+  a schema made over PostgreSQL (`tests/lexdb/vscode_pg_schema.sql`) as SQL
+  Server labels a table of those types (checked against the oracle). Creation and change dates are 2000-01-01: lexdb keeps
   no times. A constraint's name is lexdb's (`customers_pkey`,
   `orders_customer_id_fkey`), not SQL Server's made-up `PK__customer__3213E83F...`.
 - **Databases (the decision).** `sys.databases` lists SQL Server's four
@@ -717,9 +722,22 @@ distinct, over 64 `sys` views, two dozen catalog and property functions,
   literal (lexdb has one string type: 20, 65); a sql_variant from a scalar
   subquery or a CASE (18, 21); a row count inside the server-information
   batches (12, 15).
+- **@@SPID** is the session's own number (`Session.number`), which
+  `sys.dm_exec_sessions` gives: the connect-time check of contained
+  authentication (`... FROM sys.dm_exec_sessions WHERE session_id =
+  @@SPID`) found no row once a PostgreSQL session had taken a number (they
+  are shared), and Object Explorer could not open Databases.
+  `run/tds_pgcatalog.lxl` (in the suite) makes a schema over a PostgreSQL
+  session, then reads it over TDS: that row, and the labels Object Explorer
+  makes of its columns, keys, indexes, defaults, its cascading foreign key,
+  its identity columns.
 - **The live check** (`tests/lexdb/vscode.py`, not in the suite): `STS=...
-  python3 lexell/tests/lexdb/vscode.py` starts lexdb, loads the schema
-  through STS and drives it as the extension does (`vscode_sts.py`, from the
+  python3 lexell/tests/lexdb/vscode.py` starts lexdb, makes
+  `vscode_pg_schema.sql` through psql (a schema app: serial and bigserial
+  keys, text, varchar(n), numeric(p,s), boolean defaults, date, timestamp,
+  timestamptz, float8, real, smallint, interval, bytea, uuid with a default,
+  time, text[], a cascading foreign key, an index, a view), loads
+  `vscode_schema.sql` through STS and drives it as the extension does (`vscode_sts.py`, from the
   trace's driver): connect with server info, Object Explorer down to each
   table's columns (`id (PK, int, not null)`, `email (varchar(200), null)`,
   a view's columns as their tables'), keys, constraints, indexes and

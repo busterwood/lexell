@@ -1,0 +1,115 @@
+// lexdb over TDS: SQL Server's catalog (design/lexdb-tds.md, section 13) of a
+// schema made over PostgreSQL's protocol (tests/lexdb/vscode_pg_schema.sql):
+// its tables' columns as VS Code's Object Explorer labels them (SMO's query on
+// sys.columns and sys.types), the same labels SQL Server 2022 gives a table of
+// the types lexdb's map to (checked against the oracle); keys, indexes and
+// defaults; and @@SPID, sys.dm_exec_sessions' row for it, after a
+// PostgreSQL session has been (the session numbers are shared).
+// expect: spid: 1
+// expect: tables: app.events,app.users
+// expect: app.events: id (PK, int, not null) | user_id (FK, bigint, not null) | took (nvarchar(max), null) | payload (varbinary(max), null) | at (time(7), null) | tags (nvarchar(max), null)
+// expect: app.users: id (PK, bigint, not null) | login (nvarchar(40), not null) | bio (nvarchar(max), null) | balance (decimal(12,2), not null) | active (bit, not null) | born (date, null) | seen (datetime2(7), null) | joined (datetimeoffset(7), not null) | score (float, null) | ratio (real, null) | level (smallint, null) | token (uniqueidentifier, not null)
+// expect: app.recent_events: id (int, not null) | user_id (bigint, not null) | at (time(7), null)
+// expect: keys: events_pkey PK,events_user_id_fkey F,users_login_key UQ,users_pkey PK
+// expect: indexes: events_pkey 1 CLUSTERED,events_user_at 2 NONCLUSTERED,users_pkey 1 CLUSTERED,users_login_key 2 NONCLUSTERED
+// expect: defaults: DF_users_balance ((0)),DF_users_active ((1)),DF_users_joined (getdate()),DF_users_token (newid())
+// expect: fk: CASCADE
+// expect: identity: events.id 1 1,users.id 1 1
+import "strings"
+import "task"
+import "net"
+import "sqlserver"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_wire"
+import "../../../cmd/lexdb_tds"
+
+const SCHEMA = "DROP VIEW IF EXISTS app.recent_events;\nDROP TABLE IF EXISTS app.events;\nDROP TABLE IF EXISTS app.users;\nDROP SCHEMA IF EXISTS app;\nCREATE SCHEMA app;\nCREATE TABLE app.users (id bigserial PRIMARY KEY, login varchar(40) NOT NULL UNIQUE, bio text, balance numeric(12,2) NOT NULL DEFAULT 0, active boolean NOT NULL DEFAULT true, born date, seen timestamp, joined timestamptz NOT NULL DEFAULT now(), score float8, ratio real, level smallint, token uuid NOT NULL DEFAULT gen_random_uuid());\nCREATE TABLE app.events (id serial PRIMARY KEY, user_id bigint NOT NULL REFERENCES app.users(id) ON DELETE CASCADE, took interval, payload bytea, at time, tags text[]);\nCREATE INDEX events_user_at ON app.events (user_id, at);\nCREATE VIEW app.recent_events AS SELECT id, user_id, at FROM app.events WHERE at > '12:00';\nINSERT INTO app.users (login, bio) VALUES ('ann', 'hello'), ('bob', NULL);\nINSERT INTO app.events (user_id, took, payload, at, tags) VALUES (1, '1 hour', '\\x00ff', '13:00', '{a,b}');"
+
+fn col(r: &sqlserver.Rows, i: int, j: int): str {
+    match r.value(i, j) {
+        Ok(v) {
+            let s = v.toStr()
+            return if strings.startsWith(&s, "'") { s[1..len(s) - 1] } else { s }
+        }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+// each row's columns joined by a space, the rows by sep
+fn list(c: mut &sqlserver.Conn, q: &str, sep: &str): str {
+    match c.query(q.toStr(), &[]) {
+        Ok(r) {
+            var rows: []str = []
+            for i in 0..r.rowCount() {
+                var cs: []str = []
+                for j in 0..r.columnCount() { append(mut &cs, col(&r, i, j)) }
+                append(mut &rows, strings.join(&cs, " "))
+            }
+            return strings.join(&rows, sep)
+        }
+        Err(e) { return "error " + e.code.toStr() + " " + e.msg }
+    }
+}
+
+// Object Explorer's label of each column (as SMO makes it)
+const LABELS = "SELECT c.name + ' (' + CASE WHEN ik.object_id IS NOT NULL THEN 'PK, ' ELSE '' END + " +
+    "CASE WHEN EXISTS (SELECT 1 FROM sys.foreign_key_columns f WHERE f.parent_object_id = c.object_id AND f.parent_column_id = c.column_id) THEN 'FK, ' ELSE '' END + " +
+    "t.name + CASE WHEN t.name IN ('nvarchar', 'varchar', 'varbinary', 'nchar', 'char') THEN '(' + CASE WHEN c.max_length = -1 THEN 'max' " +
+    "WHEN t.name IN ('nvarchar', 'nchar') THEN CAST(c.max_length / 2 AS nvarchar(10)) ELSE CAST(c.max_length AS nvarchar(10)) END + ')' " +
+    "WHEN t.name IN ('decimal', 'numeric') THEN '(' + CAST(c.precision AS nvarchar(10)) + ',' + CAST(c.scale AS nvarchar(10)) + ')' " +
+    "WHEN t.name IN ('datetime2', 'time', 'datetimeoffset') THEN '(' + CAST(c.scale AS nvarchar(10)) + ')' ELSE '' END + " +
+    "CASE WHEN c.is_nullable = 1 THEN ', null)' ELSE ', not null)' END " +
+    "FROM sys.all_columns c JOIN sys.types t ON t.user_type_id = c.user_type_id " +
+    "LEFT JOIN sys.indexes ik ON ik.object_id = c.object_id AND ik.is_primary_key = 1 " +
+    "LEFT JOIN sys.index_columns ic ON ic.object_id = c.object_id AND ic.index_id = ik.index_id AND ic.column_id = c.column_id " +
+    "WHERE c.object_id = OBJECT_ID(@t) AND (ik.object_id IS NULL OR ic.column_id IS NOT NULL OR NOT EXISTS (SELECT 1 FROM sys.index_columns x WHERE x.object_id = c.object_id AND x.index_id = ik.index_id AND x.column_id = c.column_id)) " +
+    "ORDER BY c.column_id"
+
+fn labels(c: mut &sqlserver.Conn, t: &str): str {
+    let q = "DECLARE @t nvarchar(200) = N'" + t + "'; " + strings.replaceAll(&LABELS, "ik.object_id IS NOT NULL", "ic.column_id IS NOT NULL")
+    return t + ": " + list(c, &q, &" | ")
+}
+
+fn check(dsn: &str) {
+    match sqlserver.connect(dsn.toStr()) {
+        Ok(c0) {
+            var c = c0
+            println("spid: " + list(mut &c, &"SELECT COUNT(*) FROM sys.dm_exec_sessions WHERE session_id = @@SPID", &","))
+            println("tables: " + list(mut &c, &"SELECT SCHEMA_NAME(schema_id) + '.' + name FROM sys.tables WHERE schema_id <> 1 ORDER BY name", &","))
+            println(labels(mut &c, &"app.events"))
+            println(labels(mut &c, &"app.users"))
+            println(labels(mut &c, &"app.recent_events"))
+            println("keys: " + list(mut &c, &"SELECT name, RTRIM(type) FROM sys.objects WHERE type IN ('PK', 'UQ', 'F') AND schema_id = SCHEMA_ID('app') ORDER BY name", &","))
+            println("indexes: " + list(mut &c, &"SELECT i.name, i.index_id, i.type_desc FROM sys.indexes i JOIN sys.tables t ON t.object_id = i.object_id WHERE t.schema_id = SCHEMA_ID('app') ORDER BY t.name, i.index_id", &","))
+            println("defaults: " + list(mut &c, &"SELECT name, definition FROM sys.default_constraints WHERE schema_id = SCHEMA_ID('app')", &","))
+            println("fk: " + list(mut &c, &"SELECT delete_referential_action_desc FROM sys.foreign_keys WHERE schema_id = SCHEMA_ID('app')", &","))
+            println("identity: " + list(mut &c, &"SELECT OBJECT_NAME(object_id) + '.' + name, CAST(seed_value AS int), CAST(increment_value AS int) FROM sys.identity_columns ORDER BY 1", &","))
+            c.close()
+        }
+        Err(e) { println("connect: error " + e.code.toStr() + " " + e.msg) }
+    }
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    // the schema made by a session of PostgreSQL's (its own session number)
+    var pg = lexdb_exec.newSession(st.handle())
+    for s in strings.split(&SCHEMA, "\n") { pg.exec(&s).unwrap() }
+    pg.close()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        lexdb_wire.configure(&st, &lexdb_wire.noAuth()).unwrap()
+        let f = s.start(lexdb_tds.acceptLoop, lexdb_tds.AcceptArg{ln: ln, st: st})
+        check(&("Server=127.0.0.1," + addr[10..len(addr)] + ";UID=tester;PWD=x;Database=lexdb;Encrypt=no"))
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(35), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024,
+                                                          snapNodes: 50000, bufferedPages: false}, body).unwrap()
+}
