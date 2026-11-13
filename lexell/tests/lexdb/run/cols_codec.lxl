@@ -1,0 +1,310 @@
+// lexdb_cols: column leaves' codec (design/lexdb.md 9.112). Random leaves
+// of every place kind (integers of the three widths at their limits, a
+// boolean, a numeric of one scale and of many, texts of few values and of
+// many, a dropped place), with every NULL pattern (none, some, all, the
+// last row's only) and at the bitmap's boundaries (1, 7, 8, 9, 63, 64, 65
+// rows and more), go through encodeRows and come back byte for byte: all
+// the rows at once (allRows), each alone (rowOf), and each value read in
+// place (intAt, varAt, boolAt, isNull and the run readers) as it was made.
+// Each codec is used. Rows the codec must not take are refused: two
+// layouts in a leaf, a tagged row, a value stored apart, a NULL place with
+// bytes, a boolean of 2, a row longer than its parts, a bitmap's spare bit
+// set, a layout the spec does not have. A numeric's units give
+// Decimal.toBin's bytes. A leaf like w's rows takes about 0.6 of its bytes.
+// expect: leaves 880, rows ok true, values ok true, runs ok true
+// expect: codecs used: for true raw true bool true text true dict true units true bin true none true
+// expect: refused: two layouts true tagged true stub true null bytes true bool 2 true long true spare bit true no layout true
+// expect: units bin ok true
+// expect: w-like: rows 73 encoded smaller true
+import "binary"
+import "strings"
+import "../../../cmd/lexdb_cols"
+import "../../../cmd/lexdb_base"
+
+const KI = 1
+const KB = 2
+const KN = 3
+const KT = 4
+const KI4 = 5
+const KI2 = 6
+
+// A value: kind of value, NULL, an integer, a text (numeric: its bin bytes).
+type V = value record { nul: bool; i: int; t: str }
+
+fn fixedSize(k: byte): int {
+    if k == 1 { return 8 }
+    if k == 5 { return 4 }
+    if k == 6 || k == 3 || k == 4 { return 2 }
+    if k == 2 { return 1 }
+    return 0
+}
+
+// The row of layout lid with kinds ks and values vs, as lexdb_exec encFixed writes it.
+fn row(lid: int, ks: &[]byte, vs: &[]V): str {
+    let np = len(ks)
+    var b = newStrBuf()
+    b.addByte(8)
+    binary.addU16LE(mut &b, lid)
+    var bits: []byte = array((np + 7) / 8, byte(0))
+    for p in 0..np { if vs[p].nul || ks[p] == 0 { bits[p / 8] = bits[p / 8] | byte(1 << (p % 8)) } }
+    for x in bits { b.addByte(x) }
+    var end = 0
+    var vars: []str = []
+    for p in 0..np {
+        let k = ks[p]
+        let v = vs[p]
+        if k == 1 { binary.addU64LE(mut &b, if v.nul { 0 } else { v.i }) }
+        else if k == 5 { binary.addU32LE(mut &b, if v.nul { 0 } else { v.i & 0xffffffff }) }
+        else if k == 6 { binary.addU16LE(mut &b, if v.nul { 0 } else { v.i & 0xffff }) }
+        else if k == 2 { b.addByte(if !v.nul && v.i == 1 { 1 } else { 0 }) }
+        else if k == 3 || k == 4 {
+            if !v.nul {
+                end += len(v.t)
+                append(mut &vars, v.t)
+            }
+            binary.addU16LE(mut &b, end)
+        }
+    }
+    for x in vars { b.add(x) }
+    return b.toStr()
+}
+
+fn pick(r: mut &lexdb_base.Rng, xs: &[]int): int { return xs[r.below(len(xs))] }
+
+// A random value of kind k; mode picks the column's character (few values,
+// one scale, or anything).
+fn value(r: mut &lexdb_base.Rng, k: byte, mode: int, row: int): V {
+    if k == 1 {
+        if mode == 0 { return V{nul: false, i: 1000000 + row * 3 + r.below(3), t: ""} }
+        if mode == 1 { return V{nul: false, i: pick(r, &[-9223372036854775807 - 1, 9223372036854775807, 0, -1, 1]), t: ""} }
+        return V{nul: false, i: (int(r.next() >> 1) -% 4611686018427387904 *% 2), t: ""}
+    }
+    if k == 5 {
+        if mode == 1 { return V{nul: false, i: pick(r, &[-2147483648, 2147483647, 0]), t: ""} }
+        return V{nul: false, i: r.below(200000) - 100000, t: ""}
+    }
+    if k == 6 {
+        if mode == 1 { return V{nul: false, i: pick(r, &[-32768, 32767, 0]), t: ""} }
+        return V{nul: false, i: r.below(65536) - 32768, t: ""}
+    }
+    if k == 2 { return V{nul: false, i: r.below(2), t: ""} }
+    if k == 4 {
+        if mode == 0 { return V{nul: false, i: 0, t: pick2(r, &["Paris", "Rome", "", "Oslo", "Lima"])} }
+        var b = newStrBuf()
+        let l = r.below(40)
+        for i in 0..l { b.addByte(byte(r.below(256))) }
+        return V{nul: false, i: 0, t: b.toStr()}
+    }
+    // numeric
+    if mode == 0 { return V{nul: false, i: 0, t: Decimal.fromUnits(r.below(2000000) - 1000000, 2).toBin()} }
+    if mode == 1 {
+        let u = pick(r, &[0, 1, -1, 10, 100, -100000, 9223372036854775807, -9223372036854775807 - 1, 120000000000])
+        return V{nul: false, i: 0, t: Decimal.fromUnits(u, 3).toBin()}
+    }
+    let s = pick2(r, &["1.5", "2.25", "-0.001", "1e30", "123456789012345678901234567890", "0", "7", "3.14159"])
+    match Decimal.parse(&s) {
+        Ok(d) { return V{nul: false, i: 0, t: d.toBin()} }
+        Err(_) { return V{nul: true, i: 0, t: ""} }
+    }
+}
+
+fn pick2(r: mut &lexdb_base.Rng, xs: &[]str): str { return xs[r.below(len(xs))] }
+
+fn spanStr(s: &str, x: int): str { return s[lexdb_cols.spanStart(x)..lexdb_cols.spanEnd(x)] }
+
+type Used = record { c: []bool }
+
+// One leaf: n rows of kinds ks; nulls: 0 none, 1 some, 2 all, 3 the last row only.
+fn oneLeaf(r: mut &lexdb_base.Rng, ks: &[]byte, n: int, nulls: int, modes: &[]int, used: mut &Used,
+           rowsOk: mut &bool, valsOk: mut &bool, runsOk: mut &bool) {
+    let np = len(ks)
+    var vals: [][]V = []
+    var rows: []str = []
+    for i in 0..n {
+        var vs: []V = []
+        for p in 0..np {
+            var v = value(r, ks[p], modes[p], i)
+            if nulls == 2 || (nulls == 1 && r.below(3) == 0) || (nulls == 3 && i == n - 1) { v = V{nul: true, i: 0, t: ""} }
+            if ks[p] == 0 { v = V{nul: true, i: 0, t: ""} }
+            append(mut &vs, v)
+        }
+        append(mut &rows, row(7, ks, &vs))
+        append(mut &vals, vs)
+    }
+    var layouts: [][]byte = []
+    for l in 0..8 {
+        var kk: []byte = []
+        for k in ks { append(mut &kk, if l == 7 { k } else { byte(1) }) }
+        append(mut &layouts, kk)
+    }
+    let spec = lexdb_cols.Spec{layouts: layouts}
+    let got = lexdb_cols.encodeRows(&rows, &spec)
+    if got.isNone() {
+        rowsOk = false
+        println("refused: " + n.toStr() + " rows, nulls " + nulls.toStr())
+        return
+    }
+    let s = got.unwrap()
+    let dirO = lexdb_cols.parse(&s, n)
+    if dirO.isNone() {
+        rowsOk = false
+        println("no directory")
+        return
+    }
+    let dir = dirO.unwrap()
+    for p in 0..np { used.c[lexdb_cols.codecOf(&dir, p)] = true }
+    var ends: []int = array(n, 0)
+    let body = lexdb_cols.allRows(&s, &dir, mut &ends)
+    for i in 0..n {
+        let a = if i == 0 { 0 } else { ends[i - 1] }
+        if body[a..ends[i]] != rows[i] || lexdb_cols.rowOf(&s, &dir, i) != rows[i] { rowsOk = false }
+    }
+    // each value in place, and runs from a few starts
+    var iv: []int = array(n + 4, 0)
+    for p in 0..np {
+        let k = ks[p]
+        let c = lexdb_cols.codecOf(&dir, p)
+        for i in 0..n {
+            let v = vals[i][p]
+            if lexdb_cols.isNull(&s, &dir, p, i) != v.nul {
+                valsOk = false
+                continue
+            }
+            if v.nul { continue }
+            if k == 1 || k == 5 || k == 6 { if lexdb_cols.intAt(&s, &dir, p, i) != v.i { valsOk = false } }
+            else if k == 2 { if lexdb_cols.boolAt(&s, &dir, p, i) != (v.i == 1) { valsOk = false } }
+            else if c == lexdb_cols.C_UNITS {
+                if Decimal.fromUnits(lexdb_cols.intAt(&s, &dir, p, i), lexdb_cols.scaleOf(&dir, p)).toBin() != v.t { valsOk = false }
+            } else if spanStr(&s, lexdb_cols.varAt(&s, &dir, p, i)) != v.t { valsOk = false }
+        }
+        for from in [0, 1, n / 2, n - 1] {
+            if from < 0 || from >= n { continue }
+            let cnt = n - from
+            var nul: []bool = array(cnt + 2, false)
+            lexdb_cols.nullsInto(&s, &dir, p, from, cnt, mut &nul, 2)
+            for q in 0..cnt { if nul[q + 2] != vals[from + q][p].nul { runsOk = false } }
+            if k == 1 || k == 5 || k == 6 || c == lexdb_cols.C_UNITS {
+                lexdb_cols.intsInto(&s, &dir, p, from, cnt, mut &iv, 1)
+                for q in 0..cnt { if !nul[q + 2] && iv[q + 1] != lexdb_cols.intAt(&s, &dir, p, from + q) { runsOk = false } }
+            } else if k == 2 {
+                lexdb_cols.boolsInto(&s, &dir, p, from, cnt, mut &iv, 0)
+                for q in 0..cnt { if !nul[q + 2] && (iv[q] == 1) != lexdb_cols.boolAt(&s, &dir, p, from + q) { runsOk = false } }
+            } else if k == 3 || k == 4 {
+                lexdb_cols.varsInto(&s, &dir, p, from, cnt, mut &iv, 3)
+                for q in 0..cnt { if !nul[q + 2] && spanStr(&s, iv[q + 3]) != vals[from + q][p].t { runsOk = false } }
+            }
+        }
+        // the range of an integer place
+        if (k == 1 || k == 5 || k == 6) && lexdb_cols.hasRange(&dir, p) {
+            var lo = 0
+            var hi = 0
+            var seen = false
+            for i in 0..n {
+                if vals[i][p].nul { continue }
+                let x = vals[i][p].i
+                if !seen || x < lo { lo = x }
+                if !seen || x > hi { hi = x }
+                seen = true
+            }
+            if lexdb_cols.least(&dir, p) != lo || lexdb_cols.greatest(&dir, p) != hi { runsOk = false }
+        }
+    }
+}
+
+fn refuse(rows: &[]str, spec: &lexdb_cols.Spec): bool { return lexdb_cols.encodeRows(rows, spec).isNone() }
+
+fn main() {
+    var r = lexdb_base.rng(42)
+    var used = Used{c: array(16, false)}
+    var rowsOk = true
+    var valsOk = true
+    var runsOk = true
+    let kindSets: [][]byte = [[byte(1), 5, 6, 2, 3, 4], [byte(4), 0, 3, 1], [byte(6)], [byte(3), 3, 4, 4, 2, 1, 1, 5]]
+    var leaves = 0
+    for ks in kindSets {
+        for n in [1, 2, 7, 8, 9, 63, 64, 65, 200, 1000] {
+            for nulls in 0..4 {
+                for m in 0..5 {
+                    var modes: []int = []
+                    for p in 0..len(ks) { append(mut &modes, if m < 3 { m } else { r.below(3) }) }
+                    oneLeaf(mut &r, &ks, n, nulls, &modes, mut &used, mut &rowsOk, mut &valsOk, mut &runsOk)
+                    leaves += 1
+                }
+            }
+        }
+        for extra in 0..20 {
+            var modes: []int = []
+            for p in 0..len(ks) { append(mut &modes, r.below(3)) }
+            oneLeaf(mut &r, &ks, 1 + r.below(300), r.below(4), &modes, mut &used, mut &rowsOk, mut &valsOk, mut &runsOk)
+            leaves += 1
+        }
+    }
+    println("leaves " + leaves.toStr() + ", rows ok " + rowsOk.toStr() + ", values ok " + valsOk.toStr() + ", runs ok " + runsOk.toStr())
+    println("codecs used: for " + used.c[1].toStr() + " raw " + used.c[2].toStr() + " bool " + used.c[3].toStr() + " text " + used.c[4].toStr() +
+            " dict " + used.c[5].toStr() + " units " + used.c[6].toStr() + " bin " + used.c[7].toStr() + " none " + used.c[0].toStr())
+
+    // refusals
+    let ks: []byte = [byte(1), 2, 4]
+    let spec = lexdb_cols.Spec{layouts: [[byte(1), 2, 4], [byte(1), 2, 4, 1]]}
+    let a = row(0, &ks, &[V{nul: false, i: 5, t: ""}, V{nul: false, i: 1, t: ""}, V{nul: false, i: 0, t: "x"}])
+    let ks2: []byte = [byte(1), 2, 4, 1]
+    let b = row(1, &ks2, &[V{nul: false, i: 5, t: ""}, V{nul: false, i: 1, t: ""}, V{nul: false, i: 0, t: "x"}, V{nul: true, i: 0, t: ""}])
+    let okBoth = !refuse(&[a, a], &spec) && !refuse(&[b], &spec)
+    let two = refuse(&[a, b], &spec)
+    let tagged = refuse(&[a, "\x01\x05xyz"], &spec)
+    let stub = refuse(&["\xff\x01" + strings.repeat("z", 12)], &spec)
+    // a NULL integer with bytes: the bit set, the 8 bytes left
+    var nb = strToBytes(&a)
+    nb[3] = byte(1)
+    let nullBytes = refuse(&[strFromBytes(&nb)], &spec)
+    var b2 = strToBytes(&a)
+    b2[4 + 8] = byte(2)
+    let bool2 = refuse(&[strFromBytes(&b2)], &spec)
+    let long = refuse(&[a + "!"], &spec)
+    var sp = strToBytes(&a)
+    sp[3] = byte(0x80)
+    let spare = refuse(&[strFromBytes(&sp)], &spec)
+    let noLay = refuse(&[row(5, &ks, &[V{nul: false, i: 5, t: ""}, V{nul: false, i: 1, t: ""}, V{nul: false, i: 0, t: "x"}])], &spec)
+    println("refused: two layouts " + (two && okBoth).toStr() + " tagged " + tagged.toStr() + " stub " + stub.toStr() + " null bytes " + nullBytes.toStr() +
+            " bool 2 " + bool2.toStr() + " long " + long.toStr() + " spare bit " + spare.toStr() + " no layout " + noLay.toStr())
+
+    // units against toBin, through a leaf of one value each
+    var unitsOk = true
+    for i in 0..3000 {
+        let ds = r.below(30)
+        var u = (int(r.next() >> 1) -% 4611686018427387904 *% 2)
+        if i % 3 == 0 { u = r.below(100000) - 50000 }
+        if i % 7 == 0 { u = u / 1000 * 1000 }
+        let t = Decimal.fromUnits(u, ds).toBin()
+        let one: []byte = [byte(3)]
+        let rw = row(0, &one, &[V{nul: false, i: 0, t: t}])
+        let sp1 = lexdb_cols.Spec{layouts: [one]}
+        let rws: []str = [rw]
+        match lexdb_cols.encodeRows(&rws, &sp1) {
+            Some(s) {
+                let dir = lexdb_cols.parse(&s, 1).unwrap()
+                if lexdb_cols.rowOf(&s, &dir, 0) != rw { unitsOk = false }
+            }
+            None { unitsOk = false }
+        }
+    }
+    println("units bin ok " + unitsOk.toStr())
+
+    // rows like w's: id bigint, a int, b int, c bigint, name, city, price numeric(10,2), flag, note
+    let wk: []byte = [byte(1), 5, 5, 1, 4, 4, 3, 2, 4]
+    var wrows: []str = []
+    var bytes = 0
+    let cities = ["Paris", "Rome", "Oslo", "Lima", "Tokyo", "Cairo", "Delhi", "Quito", "Bern", "Kyiv"]
+    for i in 0..73 {
+        let id = 500000 + i
+        let vs: []V = [V{nul: false, i: id, t: ""}, V{nul: false, i: id % 100, t: ""}, V{nul: false, i: r.below(100000), t: ""},
+                       V{nul: false, i: r.below(1000000000000), t: ""}, V{nul: false, i: 0, t: "name" + id.toStr()},
+                       V{nul: false, i: 0, t: cities[r.below(10)]}, V{nul: false, i: 0, t: Decimal.fromUnits(r.below(100000), 2).toBin()},
+                       V{nul: false, i: r.below(2), t: ""}, V{nul: false, i: 0, t: "note about item " + r.below(1000).toStr() + " ok"}]
+        let rw = row(0, &wk, &vs)
+        bytes += len(rw)
+        append(mut &wrows, rw)
+    }
+    let ws = lexdb_cols.encodeRows(&wrows, &lexdb_cols.Spec{layouts: [wk]}).unwrap()
+    println("w-like: rows 73 encoded smaller " + (len(ws) * 10 < bytes * 7).toStr())
+}

@@ -1,0 +1,1008 @@
+// lexdb: column leaves (design/lexdb.md 9.112): a table leaf's rows stored
+// a column at a time, each column in the smallest of a few light forms.
+//
+// The store keeps a changed leaf as rows (lexdb_page.Node's keys and vals)
+// and encodes it here when a checkpoint writes it; the page is then a
+// column leaf (lexdb_page T_CLEAF), and so is the node in memory until it
+// changes again. Every row of a column leaf is in the fixed layout of 9.50
+// (lexdb_exec encFixed), all of one layout; the encoder takes a leaf only
+// when every row parses in it to the byte (encodeRows), so the rows rebuilt
+// from the columns (rowOf, allRows) are the rows given, byte for byte, and
+// a reader that wants a row's bytes is given them.
+//
+// The store knows nothing of types: the executor gives it, per table tree,
+// its layouts (each a kind per place), and the page keeps the kinds of the
+// layout it used, so a column leaf is read without them.
+//
+// The column region (the page from after its keys; lexdb_page T_CLEAF):
+//   [0]      version (1)
+//   [1..3)   the rows' layout number (u16 LE)
+//   [3]      np: places (u8)
+//   [4..4+np) the kind of each place (K_*)
+//   then a block per place, in order: a codec byte (C_*, | C_NULLS when a
+//   NULL bitmap follows: a bit per row, 1 NULL, (n + 7) / 8 bytes), then:
+//   C_NONE   (a dropped place) nothing more: the bitmap keeps its rows' NULL bits
+//   C_FOR    an integer: zigzag varint least value (base), u8 width w
+//            (0..56), uvarint greatest less base, then each row's value
+//            less base in w bits, bit-packed (LSB first); a NULL row 0
+//   C_RAW    an integer too wide for C_FOR: zigzag varints least and
+//            greatest, then each row's value at its kind's width (LE)
+//   C_BOOL   a bit per row (a NULL row 0)
+//   C_TEXT   a text: u16 end per row, then the bytes
+//   C_DICT   a text: u8 entries less 1, u16 end per entry, the entries'
+//            bytes, u8 code width w, each row's entry number in w bits
+//   C_UNITS  a numeric, all rows of one display scale: u8 scale, then as
+//            C_FOR the value times 10^scale (its units)
+//   C_BIN    a numeric: as C_TEXT, each value's Decimal.toBin bytes
+// Integers of C_FOR and C_UNITS keep their least and greatest (for
+// skipping a leaf a condition excludes: minMax).
+import "binary"
+import "os"
+
+pub const FIXED: byte = 8           // a row in the fixed layout starts so (lexdb_exec FIXED)
+
+// Place kinds: as lexdb_exec's PK_* (the executor gives its own bytes).
+pub const K_NONE: byte = 0
+pub const K_INT: byte = 1
+pub const K_BOOL: byte = 2
+pub const K_NUM: byte = 3
+pub const K_TEXT: byte = 4
+pub const K_INT4: byte = 5
+pub const K_INT2: byte = 6
+
+pub const C_NONE = 0
+pub const C_FOR = 1
+pub const C_RAW = 2
+pub const C_BOOL = 3
+pub const C_TEXT = 4
+pub const C_DICT = 5
+pub const C_UNITS = 6
+pub const C_BIN = 7
+pub const C_NULLS = 0x80
+
+const VERSION = 1
+const MAX_W = 56                     // the widest bit-packed value (unpack reads a byte at a time into an int)
+
+// ---- switches
+
+var COLS_ON: int = -1                // -1 not read yet
+
+// Whether column leaves are written: LEXDB_COLUMNS=0 (or off) turns them
+// off; the store then writes row leaves (column leaves on disk are still
+// read). setOn overrides it (tests).
+pub fn on(): bool {
+    if COLS_ON < 0 {
+        let v = os.envOr("LEXDB_COLUMNS", "1")
+        COLS_ON = if v == "0" || v == "off" { 0 } else { 1 }
+    }
+    return COLS_ON == 1
+}
+
+pub fn setOn(x: bool) { COLS_ON = if x { 1 } else { 0 } }
+
+var CHECK: int = -1
+
+// Whether every leaf encoded is decoded again and compared with its rows
+// (LEXDB_COLCHECK=1; tests): a mismatch keeps the leaf in rows and counts it.
+pub fn checking(): bool {
+    if CHECK < 0 { CHECK = if os.envOr("LEXDB_COLCHECK", "0") == "1" { 1 } else { 0 } }
+    return CHECK == 1
+}
+
+pub fn setChecking(x: bool) { CHECK = if x { 1 } else { 0 } }
+
+var MISMATCH: int = 0
+
+// Leaves whose encoding, checked, did not give their rows back (a bug).
+pub fn mismatches(): int { return MISMATCH }
+
+// ---- a table's layouts (the encoder's spec)
+
+// A tree's layouts, as the executor keeps them (lexdb_exec Table.layouts):
+// layout i's kind per place.
+pub type Spec = record { pub layouts: [][]byte }
+
+pub fn sameSpec(a: &Spec, b: &[][]byte): bool {
+    if len(a.layouts) != len(b) { return false }
+    for i in 0..len(b) {
+        if len(a.layouts[i]) != len(b[i]) { return false }
+        for j in 0..len(b[i]) { if a.layouts[i][j] != b[i][j] { return false } }
+    }
+    return true
+}
+
+fn fixedSize(k: byte): int {
+    if k == K_INT { return 8 }
+    if k == K_INT4 { return 4 }
+    if k == K_INT2 || k == K_NUM || k == K_TEXT { return 2 }
+    if k == K_BOOL { return 1 }
+    return 0
+}
+
+fn isInt(k: byte): bool { return k == K_INT || k == K_INT4 || k == K_INT2 }
+fn isVar(k: byte): bool { return k == K_NUM || k == K_TEXT }
+
+// Where a layout's places are in a row (lexdb_exec layOfKinds): per place
+// its offset, and a variable one's previous end's offset (-1: the first).
+type Lay = record { off: []int; prev: []int; v0: int; bm: int }
+
+fn layOf(kinds: &[]byte): Lay {
+    let np = len(kinds)
+    let bm = 3
+    var at = bm + (np + 7) / 8
+    var off: []int = array(np, 0)
+    var prev: []int = array(np, -1)
+    var lastVar = -1
+    for p in 0..np {
+        off[p] = at
+        if isVar(kinds[p]) {
+            prev[p] = lastVar
+            lastVar = at
+        }
+        at += fixedSize(kinds[p])
+    }
+    return Lay{off: off, prev: prev, v0: at, bm: bm}
+}
+
+// ---- small codings
+
+fn putUVar(out: mut &[]byte, x: int) {
+    var v = x
+    while v < 0 || v >= 0x80 {
+        append(out, byte((v & 0x7f) | 0x80))
+        v = (v >> 7) & 0x01ffffffffffffff
+    }
+    append(out, byte(v))
+}
+
+fn zz(x: int): int { return (x << 1) ^ (x >> 63) }
+fn unzz(u: int): int { return ((u >> 1) & 0x7fffffffffffffff) ^ (0 - (u & 1)) }
+
+// A uvarint at s[at..]: its value, and (in at) where it ends.
+fn getUVar(s: &str, at: mut &int): int {
+    var v = 0
+    var sh = 0
+    while true {
+        let b = int(s[at])
+        at += 1
+        if sh < 64 { v = v | ((b & 0x7f) << sh) }
+        sh += 7
+        if b < 0x80 { break }
+    }
+    return v
+}
+
+// The bits an unsigned value below 2^63 needs.
+fn bitsOf(x: int): int {
+    var w = 0
+    var r = x
+    while r > 0 {
+        w += 1
+        r = r >> 1
+    }
+    return w
+}
+
+// vs[0..n] less base (each < 2^w as unsigned, w <= MAX_W) in w bits each.
+fn pack(out: mut &[]byte, vs: &[]int, n: int, base: int, w: int) {
+    if w == 0 { return }
+    var acc = 0
+    var have = 0
+    for q in 0..n {
+        acc = acc | ((vs[q] -% base) << have)
+        have += w
+        while have >= 8 {
+            append(out, byte(acc & 255))
+            acc = acc >> 8
+            have -= 8
+        }
+    }
+    if have > 0 { append(out, byte(acc & 255)) }
+}
+
+// cnt values of w bits from value `from` of those packed at s[d..], plus
+// base, into out[r0..].
+pub fn unpack(s: &str, d: int, w: int, base: int, from: int, cnt: int, out: mut &[]int, r0: int) {
+    if cnt <= 0 { return }
+    if w == 0 {
+        for q in 0..cnt { out[r0 + q] = base }
+        return
+    }
+    let mask = (1 << w) - 1
+    let bp = from * w
+    var pos = d + (bp >> 3)
+    let sk = bp & 7
+    var acc = int(s[pos]) >> sk
+    var have = 8 - sk
+    pos += 1
+    for q in 0..cnt {
+        while have < w {
+            acc = acc | (int(s[pos]) << have)
+            pos += 1
+            have += 8
+        }
+        out[r0 + q] = base +% (acc & mask)
+        acc = acc >> w
+        have -= w
+    }
+}
+
+// Value i of those packed in w bits at s[d..] (w > 0).
+pub fn bits1(s: &str, d: int, w: int, i: int): int {
+    let bp = i * w
+    var pos = d + (bp >> 3)
+    let sk = bp & 7
+    var acc = int(s[pos]) >> sk
+    var have = 8 - sk
+    pos += 1
+    while have < w {
+        acc = acc | (int(s[pos]) << have)
+        pos += 1
+        have += 8
+    }
+    return acc & ((1 << w) - 1)
+}
+
+fn u16At(s: &str, o: int): int { return int(s[o]) | (int(s[o + 1]) << 8) }
+
+fn bitAt(s: &str, at: int, i: int): bool { return (int(s[at + (i >> 3)]) >> (i & 7)) & 1 == 1 }
+
+// The integer of kind k at s[at..] (a row's fixed place).
+fn readIntK(s: &str, at: int, k: byte): int {
+    if k == K_INT { return binary.readI64LEStr(s, at) }
+    if k == K_INT4 { return binary.readI32LEStr(s, at) }
+    return binary.readI16LEStr(s, at)
+}
+
+// ---- numerics as units
+
+const POW10_18 = 1000000000000000000
+
+// A numeric's binary form (Decimal.toBin) at s[a..b] as units at display
+// scale ds (value * 10^ds), when it is exactly that: Decimal.fromUnits(u,
+// ds).toBin() gives the same bytes (unitsBin). None otherwise.
+fn binUnits(s: &str, a: int, b: int, ds: int): Option[int] {
+    match Decimal.fromBin(s, a, b - a) {
+        Ok(d) {
+            if d.scale() != ds { return None }
+            let e = d.exponent() + ds
+            if e < 0 || e > 18 { return None }
+            let c = d.coefficient()
+            if c >= u128(POW10_18) { return None }
+            var u = int(c)
+            for k in 0..e {
+                if u > 922337203685477580 { return None }
+                u = u * 10
+            }
+            if d.isNeg() { u = 0 - u }
+            return Some(u)
+        }
+        Err(_) { return None }
+    }
+}
+
+// The scale of a numeric's binary form at s[a..] (its second byte, and its
+// third when flagged).
+fn binScale(s: &str, a: int): int {
+    let fl = int(s[a])
+    var ds = int(s[a + 1])
+    if fl & 2 != 0 { ds += int(s[a + 2]) << 8 }
+    return ds
+}
+
+// Decimal.fromUnits(u, ds).toBin()'s bytes (ds <= 255), written at
+// out[at..] when write; its length.
+fn unitsBin(u: int, ds: int, out: mut &[]byte, at: int, write: bool): int {
+    if u == 0 {
+        if write {
+            out[at] = byte(0)
+            out[at + 1] = byte(ds)
+        }
+        return 2
+    }
+    let neg = u < 0
+    // the magnitude as u64 bits (u may be the least int)
+    var m = if neg { u64(0 -% (u +% 1)) + u64(1) } else { u64(u) }
+    var tz = 0
+    while m % u64(10) == u64(0) {
+        m = m / u64(10)
+        tz += 1
+    }
+    let exp = tz - ds
+    var flags = if neg { 1 } else { 0 }
+    var hdr = 2
+    if exp != 0 {
+        flags += 4
+        hdr += 1
+        if exp < -128 || exp > 127 {
+            flags += 8
+            hdr += 1
+        }
+    }
+    var nb = 0
+    var c = m
+    while c != u64(0) {
+        nb += 1
+        c = c >> 8
+    }
+    if write {
+        out[at] = byte(flags)
+        out[at + 1] = byte(ds)
+        var p = at + 2
+        if exp != 0 {
+            let e = exp & 0xFFFF
+            out[p] = byte(e & 255)
+            p += 1
+            if flags & 8 != 0 {
+                out[p] = byte(e >> 8)
+                p += 1
+            }
+        }
+        var x = m
+        for i in 0..nb {
+            out[p + i] = byte(int(x & u64(255)))
+            x = x >> 8
+        }
+    }
+    return hdr + nb
+}
+
+// ---- encoding
+
+// A leaf's rows as a column region, when every row is in the fixed layout
+// of one of spec's layouts (all the same one) and parses in it to the byte;
+// None otherwise (the leaf stays in rows).
+pub fn encodeRows(rows: &[]&str, spec: &Spec): Option[str] {
+    let n = len(rows)
+    if n == 0 || n > 65535 { return None }
+    let r0 = rows[0]
+    if len(r0) < 3 || r0[0] != FIXED { return None }
+    let lid = binary.readU16LEStr(r0, 1)
+    if lid >= len(spec.layouts) { return None }
+    let kinds = &spec.layouts[lid]
+    let np = len(kinds)
+    if np > 255 { return None }
+    let lay = layOf(kinds)
+    let v0 = lay.v0
+    let id0 = r0[1]
+    let id1 = r0[2]
+    // every row: in this layout, its length its parts', NULL places empty,
+    // booleans 0 or 1, the ends in order, the bitmap's spare bits 0
+    let spare = if np % 8 == 0 { 0 } else { 0xff & (0xff << (np % 8)) }
+    let lastBm = lay.bm + (np + 7) / 8 - 1
+    var lastVar = -1
+    for p in 0..np { if isVar(kinds[p]) { lastVar = p } }
+    for r in 0..n {
+        let s = rows[r]
+        if len(s) < v0 || s[0] != FIXED || s[1] != id0 || s[2] != id1 { return None }
+        if np > 0 && int(s[lastBm]) & spare != 0 { return None }
+        var prevEnd = 0
+        for p in 0..np {
+            let k = kinds[p]
+            if k == K_NONE { continue }
+            let o = lay.off[p]
+            let nul = bitAt(s, lay.bm, p)
+            if isVar(k) {
+                let e = u16At(s, o)
+                if e < prevEnd { return None }
+                if nul && e != prevEnd { return None }
+                prevEnd = e
+            } else if nul {
+                for j in 0..fixedSize(k) { if s[o + j] != 0 { return None } }
+            } else if k == K_BOOL {
+                if s[o] > 1 { return None }
+            }
+        }
+        if len(s) != v0 + prevEnd { return None }
+    }
+    var out: []byte = withCapacity(n * 64 + 64)
+    append(mut &out, byte(VERSION))
+    binary.appendU16LE(mut &out, lid)
+    append(mut &out, byte(np))
+    for k in kinds { append(mut &out, k) }
+    var vs: []int = array(n, 0)
+    var st: []int = array(n, 0)
+    var en: []int = array(n, 0)
+    var nul: []bool = array(n, false)
+    for p in 0..np {
+        let k = kinds[p]
+        var anyNull = false
+        var allNull = true
+        for r in 0..n {
+            let x = bitAt(rows[r], lay.bm, p)
+            nul[r] = x
+            if x { anyNull = true } else { allNull = false }
+        }
+        let cpos = len(out)
+        append(mut &out, byte(0))
+        if anyNull {
+            var acc = 0
+            for r in 0..n {
+                if nul[r] { acc = acc | (1 << (r & 7)) }
+                if r & 7 == 7 || r == n - 1 {
+                    append(mut &out, byte(acc))
+                    acc = 0
+                }
+            }
+        }
+        var c = C_NONE
+        let o = lay.off[p]
+        if k == K_NONE {
+            c = C_NONE
+        } else if isInt(k) {
+            var lo = 0
+            var hi = 0
+            var seen = false
+            for r in 0..n {
+                if nul[r] {
+                    vs[r] = 0
+                    continue
+                }
+                let v = readIntK(rows[r], o, k)
+                vs[r] = v
+                if !seen {
+                    lo = v
+                    hi = v
+                    seen = true
+                } else if v < lo { lo = v } else if v > hi { hi = v }
+            }
+            if anyNull { for r in 0..n { if nul[r] { vs[r] = lo } } }
+            c = encInts(mut &out, &vs, n, lo, hi, fixedSize(k))
+        } else if k == K_BOOL {
+            var acc = 0
+            for r in 0..n {
+                if !nul[r] && rows[r][o] == 1 { acc = acc | (1 << (r & 7)) }
+                if r & 7 == 7 || r == n - 1 {
+                    append(mut &out, byte(acc))
+                    acc = 0
+                }
+            }
+            c = C_BOOL
+        } else {
+            // a variable-length value: where it is in each row
+            let po = lay.prev[p]
+            var total = 0
+            for r in 0..n {
+                let s = rows[r]
+                let e = u16At(s, o)
+                let a = if po < 0 { 0 } else { u16At(s, po) }
+                st[r] = v0 + a
+                en[r] = v0 + e
+                total += e - a
+            }
+            c = -1
+            if k == K_TEXT && !allNull { c = encDict(mut &out, rows, &st, &en, &nul, n, total, mut &vs) }
+            if k == K_NUM && !allNull { c = encUnits(mut &out, rows, &st, &en, &nul, n, mut &vs) }
+            if c < 0 {
+                var end = 0
+                for r in 0..n {
+                    end += en[r] - st[r]
+                    binary.appendU16LE(mut &out, end)
+                }
+                for r in 0..n {
+                    let s = rows[r]
+                    for i in st[r]..en[r] { append(mut &out, s[i]) }
+                }
+                c = if k == K_TEXT { C_TEXT } else { C_BIN }
+            }
+        }
+        out[cpos] = byte(c | (if anyNull { C_NULLS } else { 0 }))
+    }
+    return Some(strFromBytes(&out))
+}
+
+// vs[0..n], all within lo..hi, as C_FOR (or C_RAW when the range is too
+// wide, its values at width wb bytes).
+fn encInts(out: mut &[]byte, vs: &[]int, n: int, lo: int, hi: int, wb: int): int {
+    let range = hi -% lo
+    let w = if range < 0 { 64 } else { bitsOf(range) }
+    if w <= MAX_W {
+        putUVar(out, zz(lo))
+        append(out, byte(w))
+        putUVar(out, range)
+        pack(out, vs, n, lo, w)
+        return C_FOR
+    }
+    putUVar(out, zz(lo))
+    putUVar(out, zz(hi))
+    for q in 0..n {
+        let v = vs[q]
+        if wb == 8 { binary.appendU64LE(out, v) } else if wb == 4 { binary.appendU32LE(out, v & 0xffffffff) } else { binary.appendU16LE(out, v & 0xffff) }
+    }
+    return C_RAW
+}
+
+// A text column as a dictionary (C_DICT) when that is smaller than its
+// ends and bytes: its distinct values in order of first use, given up when
+// there are many (24 or more, three quarters of the rows seen); -1 not.
+// codes: scratch, n long.
+fn encDict(out: mut &[]byte, rows: &[]&str, st: &[]int, en: &[]int, nul: &[]bool, n: int, total: int, codes: mut &[]int): int {
+    var dr: []int = []
+    var dbytes = 0
+    for r in 0..n {
+        if nul[r] {
+            codes[r] = 0
+            continue
+        }
+        let s = rows[r]
+        let l = en[r] - st[r]
+        let x = &s[st[r]..en[r]]
+        let last = if l > 0 { s[en[r] - 1] } else { byte(0) }
+        var at = -1
+        for j in 0..len(dr) {
+            let d = dr[j]
+            if en[d] - st[d] != l { continue }
+            let ds = rows[d]
+            if l > 0 && ds[en[d] - 1] != last { continue }
+            if &ds[st[d]..en[d]] == x {
+                at = j
+                break
+            }
+        }
+        if at < 0 {
+            if len(dr) == 256 || (len(dr) >= 24 && len(dr) * 4 > r * 3) { return -1 }
+            at = len(dr)
+            append(mut &dr, r)
+            dbytes += l
+        }
+        codes[r] = at
+    }
+    let nd = len(dr)
+    if nd == 0 { return -1 }
+    let cw = bitsOf(nd - 1)
+    if 2 + 2 * nd + dbytes + (n * cw + 7) / 8 >= 2 * n + total { return -1 }
+    append(out, byte(nd - 1))
+    var end = 0
+    for d in dr {
+        end += en[d] - st[d]
+        binary.appendU16LE(out, end)
+    }
+    for d in dr {
+        let s = rows[d]
+        for i in st[d]..en[d] { append(out, s[i]) }
+    }
+    append(out, byte(cw))
+    pack(out, codes, n, 0, cw)
+    return C_DICT
+}
+
+// A numeric column as units (C_UNITS) when every value has one display
+// scale (at most 255) and is a whole number of units in an int, and the
+// bytes rebuilt from the units are the row's; -1 not. us: scratch.
+fn encUnits(out: mut &[]byte, rows: &[]&str, st: &[]int, en: &[]int, nul: &[]bool, n: int, us: mut &[]int): int {
+    var ds = -1
+    var lo = 0
+    var hi = 0
+    var seen = false
+    var tmp: []byte = array(32, byte(0))
+    for r in 0..n {
+        if nul[r] {
+            us[r] = 0
+            continue
+        }
+        let s = rows[r]
+        let a = st[r]
+        let b = en[r]
+        if b - a < 2 { return -1 }
+        if ds < 0 {
+            ds = binScale(s, a)
+            if ds > 255 { return -1 }
+        }
+        let u = match binUnits(s, a, b, ds) {
+            Some(x) { x }
+            None { return -1 }
+        }
+        // the bytes as they will be rebuilt: the same
+        let l = unitsBin(u, ds, mut &tmp, 0, true)
+        if l != b - a { return -1 }
+        for i in 0..l { if tmp[i] != s[a + i] { return -1 } }
+        us[r] = u
+        if !seen {
+            lo = u
+            hi = u
+            seen = true
+        } else if u < lo { lo = u } else if u > hi { hi = u }
+    }
+    if !seen { return -1 }
+    for r in 0..n { if nul[r] { us[r] = lo } }
+    let range = hi -% lo
+    if range < 0 || bitsOf(range) > MAX_W { return -1 }
+    append(out, byte(ds))
+    putUVar(out, zz(lo))
+    append(out, byte(bitsOf(range)))
+    putUVar(out, range)
+    pack(out, us, n, lo, bitsOf(range))
+    return C_UNITS
+}
+
+// ---- reading
+//
+// A column region is read through its directory (parse): DIR_HDR ints,
+// then D per place.
+
+pub const DIR_HDR = 3       // [0] the layout number, [1] np, [2] n
+pub const D = 8
+// per place p, at DIR_HDR + D * p:
+pub const F_CODEC = 0       // C_* (without C_NULLS)
+pub const F_NULLS = 1       // where its NULL bitmap starts, -1 none
+pub const F_DATA = 2        // C_FOR, C_UNITS: the packed values; C_RAW: the values; C_BOOL: the bits;
+                            // C_TEXT, C_BIN: the ends; C_DICT: the packed codes
+pub const F_BASE = 3        // C_FOR, C_UNITS, C_RAW: the least value
+pub const F_W = 4           // C_FOR, C_UNITS, C_DICT: the bit width; C_RAW: the byte width
+pub const F_MAX = 5         // C_FOR, C_UNITS, C_RAW: the greatest value
+pub const F_X = 6           // C_TEXT, C_BIN: where the bytes start; C_DICT: entries; C_UNITS: the scale
+pub const F_Y = 7           // C_DICT: where its entries' ends start (their bytes follow); C_FOR, C_UNITS, C_RAW: 1 when a value is not NULL
+
+// The directory of column region s of a leaf of n rows; None when s is
+// not one (a damaged page that passed its check: not trusted).
+pub fn parse(s: &str, n: int): Option[[]int] {
+    if len(s) < 4 || int(s[0]) != VERSION { return None }
+    let np = int(s[3])
+    if len(s) < 4 + np { return None }
+    var dir: []int = array(DIR_HDR + D * np, 0)
+    dir[0] = u16At(s, 1)
+    dir[1] = np
+    dir[2] = n
+    var at = 4 + np
+    let nb = (n + 7) / 8
+    for p in 0..np {
+        let k = s[4 + p]
+        let x = DIR_HDR + D * p
+        if at >= len(s) { return None }
+        let cb = int(s[at])
+        at += 1
+        let c = cb & 0x7f
+        dir[x + F_CODEC] = c
+        dir[x + F_NULLS] = -1
+        var nnul = 0
+        if cb & C_NULLS != 0 {
+            if at + nb > len(s) { return None }
+            dir[x + F_NULLS] = at
+            for i in 0..n { if bitAt(s, at, i) { nnul += 1 } }
+            at += nb
+        }
+        dir[x + F_Y] = if nnul < n { 1 } else { 0 }
+        // the codec must be one for its kind
+        if c == C_NONE {
+            if k != K_NONE { return None }
+        } else if c == C_FOR || c == C_UNITS {
+            if c == C_FOR && !isInt(k) { return None }
+            if c == C_UNITS {
+                if k != K_NUM || at >= len(s) { return None }
+                dir[x + F_X] = int(s[at])
+                at += 1
+            }
+            if at + 2 > len(s) { return None }
+            let base = unzz(getUVar(s, mut &at))
+            if at >= len(s) { return None }
+            let w = int(s[at])
+            at += 1
+            if w > MAX_W || at >= len(s) { return None }
+            let range = getUVar(s, mut &at)
+            dir[x + F_BASE] = base
+            dir[x + F_W] = w
+            dir[x + F_MAX] = base +% range
+            dir[x + F_DATA] = at
+            at += (n * w + 7) / 8
+        } else if c == C_RAW {
+            if !isInt(k) || at + 2 > len(s) { return None }
+            dir[x + F_BASE] = unzz(getUVar(s, mut &at))
+            if at >= len(s) { return None }
+            dir[x + F_MAX] = unzz(getUVar(s, mut &at))
+            dir[x + F_W] = fixedSize(k)
+            dir[x + F_DATA] = at
+            at += n * fixedSize(k)
+        } else if c == C_BOOL {
+            if k != K_BOOL { return None }
+            dir[x + F_DATA] = at
+            at += nb
+        } else if c == C_TEXT || c == C_BIN {
+            if (c == C_TEXT && k != K_TEXT) || (c == C_BIN && k != K_NUM) { return None }
+            if at + 2 * n > len(s) || n == 0 { return None }
+            dir[x + F_DATA] = at
+            let total = u16At(s, at + 2 * n - 2)
+            dir[x + F_X] = at + 2 * n
+            at += 2 * n + total
+        } else if c == C_DICT {
+            if k != K_TEXT || at >= len(s) { return None }
+            let nd = int(s[at]) + 1
+            at += 1
+            if at + 2 * nd > len(s) { return None }
+            dir[x + F_X] = nd
+            dir[x + F_Y] = at
+            let dbytes = u16At(s, at + 2 * nd - 2)
+            at += 2 * nd + dbytes
+            if at >= len(s) { return None }
+            let w = int(s[at])
+            at += 1
+            if w > 8 { return None }
+            dir[x + F_W] = w
+            dir[x + F_DATA] = at
+            at += (n * w + 7) / 8
+        } else {
+            return None
+        }
+        if at > len(s) { return None }
+    }
+    if at != len(s) { return None }
+    return Some(dir)
+}
+
+pub fn layoutOf(dir: &[]int): int { return dir[0] }
+pub fn places(dir: &[]int): int { return dir[1] }
+
+// The kind of place p.
+pub fn kindOf(s: &str, p: int): byte { return s[4 + p] }
+
+// Whether the leaf's layout has these kinds (the executor's, for the
+// layout number: a leaf is read by its columns only when they agree).
+pub fn kindsAre(s: &str, dir: &[]int, kinds: &[]byte): bool {
+    let np = dir[1]
+    if len(kinds) != np { return false }
+    for p in 0..np { if s[4 + p] != kinds[p] { return false } }
+    return true
+}
+
+// Whether row i of place p is NULL.
+pub fn isNull(s: &str, dir: &[]int, p: int, i: int): bool {
+    let b = dir[DIR_HDR + D * p + F_NULLS]
+    return b >= 0 && bitAt(s, b, i)
+}
+
+// Whether place p has a NULL bitmap.
+pub fn hasNulls(dir: &[]int, p: int): bool { return dir[DIR_HDR + D * p + F_NULLS] >= 0 }
+
+// Rows from..from+cnt of place p's NULL bits into nul[r0..] (set where NULL;
+// left as they are elsewhere).
+pub fn nullsInto(s: &str, dir: &[]int, p: int, from: int, cnt: int, nul: mut &[]bool, r0: int) {
+    let b = dir[DIR_HDR + D * p + F_NULLS]
+    if b < 0 { return }
+    for q in 0..cnt { if bitAt(s, b, from + q) { nul[r0 + q] = true } }
+}
+
+pub fn codecOf(dir: &[]int, p: int): int { return dir[DIR_HDR + D * p + F_CODEC] }
+
+// An integer place's (C_FOR, C_RAW) or a units place's (C_UNITS) least
+// and greatest value, and whether it has a value at all (not every row NULL).
+pub fn hasRange(dir: &[]int, p: int): bool {
+    let c = dir[DIR_HDR + D * p + F_CODEC]
+    return (c == C_FOR || c == C_UNITS || c == C_RAW) && dir[DIR_HDR + D * p + F_Y] == 1
+}
+pub fn least(dir: &[]int, p: int): int { return dir[DIR_HDR + D * p + F_BASE] }
+pub fn greatest(dir: &[]int, p: int): int { return dir[DIR_HDR + D * p + F_MAX] }
+pub fn scaleOf(dir: &[]int, p: int): int { return dir[DIR_HDR + D * p + F_X] }
+
+// Rows from..from+cnt of an integer place (or a units place's units) into
+// out[r0..] (a NULL row: the least value).
+pub fn intsInto(s: &str, dir: &[]int, p: int, from: int, cnt: int, out: mut &[]int, r0: int) {
+    let x = DIR_HDR + D * p
+    let c = dir[x + F_CODEC]
+    if c == C_FOR || c == C_UNITS {
+        unpack(s, dir[x + F_DATA], dir[x + F_W], dir[x + F_BASE], from, cnt, out, r0)
+        return
+    }
+    let wb = dir[x + F_W]
+    var o = dir[x + F_DATA] + wb * from
+    if wb == 8 {
+        for q in 0..cnt {
+            out[r0 + q] = binary.readI64LEStr(s, o)
+            o += 8
+        }
+    } else if wb == 4 {
+        for q in 0..cnt {
+            out[r0 + q] = binary.readI32LEStr(s, o)
+            o += 4
+        }
+    } else {
+        for q in 0..cnt {
+            out[r0 + q] = binary.readI16LEStr(s, o)
+            o += 2
+        }
+    }
+}
+
+// Row i of an integer place (or a units place's units).
+pub fn intAt(s: &str, dir: &[]int, p: int, i: int): int {
+    let x = DIR_HDR + D * p
+    let c = dir[x + F_CODEC]
+    if c == C_FOR || c == C_UNITS {
+        let w = dir[x + F_W]
+        if w == 0 { return dir[x + F_BASE] }
+        return dir[x + F_BASE] +% bits1(s, dir[x + F_DATA], w, i)
+    }
+    let wb = dir[x + F_W]
+    let o = dir[x + F_DATA] + wb * i
+    if wb == 8 { return binary.readI64LEStr(s, o) }
+    if wb == 4 { return binary.readI32LEStr(s, o) }
+    return binary.readI16LEStr(s, o)
+}
+
+// Row i of a boolean place (false for a NULL row).
+pub fn boolAt(s: &str, dir: &[]int, p: int, i: int): bool { return bitAt(s, dir[DIR_HDR + D * p + F_DATA], i) }
+
+// Rows from..from+cnt of a boolean place as 0 or 1 into out[r0..].
+pub fn boolsInto(s: &str, dir: &[]int, p: int, from: int, cnt: int, out: mut &[]int, r0: int) {
+    let b = dir[DIR_HDR + D * p + F_DATA]
+    for q in 0..cnt {
+        let i = from + q
+        out[r0 + q] = (int(s[b + (i >> 3)]) >> (i & 7)) & 1
+    }
+}
+
+// Where row i's bytes of a variable place (C_TEXT, C_BIN, C_DICT) are in
+// s: start << 32 | end.
+pub fn varAt(s: &str, dir: &[]int, p: int, i: int): int {
+    let x = DIR_HDR + D * p
+    let c = dir[x + F_CODEC]
+    if c == C_DICT {
+        let w = dir[x + F_W]
+        let code = if w == 0 { 0 } else { bits1(s, dir[x + F_DATA], w, i) }
+        return entryAt(s, dir, p, code)
+    }
+    let e = dir[x + F_DATA]
+    let b = dir[x + F_X]
+    let a = if i == 0 { 0 } else { u16At(s, e + 2 * i - 2) }
+    return ((b + a) << 32) | (b + u16At(s, e + 2 * i))
+}
+
+// Rows from..from+cnt of a variable place (C_TEXT, C_BIN, C_DICT): each
+// row's start << 32 | end in s, into out[r0..].
+pub fn varsInto(s: &str, dir: &[]int, p: int, from: int, cnt: int, out: mut &[]int, r0: int) {
+    if cnt <= 0 { return }
+    let x = DIR_HDR + D * p
+    let c = dir[x + F_CODEC]
+    if c == C_DICT {
+        unpack(s, dir[x + F_DATA], dir[x + F_W], 0, from, cnt, out, r0)
+        let nd = dir[x + F_X]
+        var ents: []int = array(nd, 0)
+        for j in 0..nd { ents[j] = entryAt(s, dir, p, j) }
+        for q in 0..cnt { out[r0 + q] = ents[out[r0 + q]] }
+        return
+    }
+    let e = dir[x + F_DATA]
+    let b = dir[x + F_X]
+    var a = if from == 0 { 0 } else { u16At(s, e + 2 * from - 2) }
+    for q in 0..cnt {
+        let z = u16At(s, e + 2 * (from + q))
+        out[r0 + q] = ((b + a) << 32) | (b + z)
+        a = z
+    }
+}
+
+// A dictionary place's entries (C_DICT), and entry j's start << 32 | end.
+pub fn dictSize(dir: &[]int, p: int): int { return dir[DIR_HDR + D * p + F_X] }
+pub fn entryAt(s: &str, dir: &[]int, p: int, j: int): int {
+    let x = DIR_HDR + D * p
+    let nd = dir[x + F_X]
+    let ends = dir[x + F_Y]
+    let b = ends + 2 * nd
+    let a = if j == 0 { 0 } else { u16At(s, ends + 2 * j - 2) }
+    return ((b + a) << 32) | (b + u16At(s, ends + 2 * j))
+}
+
+// Rows from..from+cnt of a dictionary place's codes into out[r0..].
+pub fn codesInto(s: &str, dir: &[]int, p: int, from: int, cnt: int, out: mut &[]int, r0: int) {
+    let x = DIR_HDR + D * p
+    unpack(s, dir[x + F_DATA], dir[x + F_W], 0, from, cnt, out, r0)
+}
+
+pub fn spanStart(x: int): int { return x >> 32 }
+pub fn spanEnd(x: int): int { return x & 0xffffffff }
+
+// ---- rows again
+
+// The length of place p's bytes in row i's variable part (a variable place).
+fn varLen(s: &str, dir: &[]int, p: int, i: int, tmp: mut &[]byte): int {
+    if isNull(s, dir, p, i) { return 0 }
+    let x = DIR_HDR + D * p
+    if dir[x + F_CODEC] == C_UNITS { return unitsBin(intAt(s, dir, p, i), dir[x + F_X], tmp, 0, false) }
+    let sp = varAt(s, dir, p, i)
+    return spanEnd(sp) - spanStart(sp)
+}
+
+// Row i written at out[at..] (its length rowLen); the row as it was given
+// to encodeRows, byte for byte.
+fn putRow(s: &str, dir: &[]int, i: int, out: mut &[]byte, at: int) {
+    let np = dir[1]
+    out[at] = FIXED
+    out[at + 1] = byte(dir[0] & 255)
+    out[at + 2] = byte(dir[0] >> 8)
+    let bm = at + 3
+    var o = bm + (np + 7) / 8
+    var v0 = o
+    for p in 0..np { v0 += fixedSize(s[4 + p]) }
+    var vend = 0
+    for p in 0..np {
+        let k = s[4 + p]
+        let x = DIR_HDR + D * p
+        let nul = isNull(s, dir, p, i)
+        if nul { out[bm + (p >> 3)] = byte(int(out[bm + (p >> 3)]) | (1 << (p & 7))) }
+        if k == K_NONE { continue }
+        if isInt(k) {
+            let v = if nul { 0 } else { intAt(s, dir, p, i) }
+            if k == K_INT { binary.setU64LE(out, o, v) } else if k == K_INT4 { binary.setU32LE(out, o, v & 0xffffffff) } else { binary.setU16LE(out, o, v & 0xffff) }
+            o += fixedSize(k)
+        } else if k == K_BOOL {
+            out[o] = if !nul && boolAt(s, dir, p, i) { byte(1) } else { byte(0) }
+            o += 1
+        } else {
+            if !nul {
+                if dir[x + F_CODEC] == C_UNITS {
+                    vend += unitsBin(intAt(s, dir, p, i), dir[x + F_X], out, v0 + vend, true)
+                } else {
+                    let sp = varAt(s, dir, p, i)
+                    let a = spanStart(sp)
+                    let l = spanEnd(sp) - a
+                    let d = v0 + vend
+                    for j in 0..l { out[d + j] = s[a + j] }
+                    vend += l
+                }
+            }
+            binary.setU16LE(out, o, vend)
+            o += 2
+        }
+    }
+}
+
+// Row i's length.
+fn rowLen(s: &str, dir: &[]int, i: int, tmp: mut &[]byte): int {
+    let np = dir[1]
+    var l = 3 + (np + 7) / 8
+    for p in 0..np {
+        let k = s[4 + p]
+        l += fixedSize(k)
+        if isVar(k) { l += varLen(s, dir, p, i, tmp) }
+    }
+    return l
+}
+
+// Row i of the leaf, rebuilt.
+pub fn rowOf(s: &str, dir: &[]int, i: int): str {
+    var tmp: []byte = array(32, byte(0))
+    let l = rowLen(s, dir, i, mut &tmp)
+    var out: []byte = array(l, byte(0))
+    putRow(s, dir, i, mut &out, 0)
+    return strFromBytes(&out)
+}
+
+// Every row of the leaf, rebuilt, in one string; row i is
+// body[ends[i - 1]..ends[i]] (from 0 for the first). ends: n long.
+pub fn allRows(s: &str, dir: &[]int, ends: mut &[]int): str {
+    let n = dir[2]
+    var tmp: []byte = array(32, byte(0))
+    var total = 0
+    for i in 0..n {
+        total += rowLen(s, dir, i, mut &tmp)
+        ends[i] = total
+    }
+    var out: []byte = array(total, byte(0))
+    for i in 0..n { putRow(s, dir, i, mut &out, if i == 0 { 0 } else { ends[i - 1] }) }
+    return strFromBytes(&out)
+}
+
+// encodeRows checked: its region decoded again gives rows back; None (and
+// counted) when not, or when the rows do not encode.
+pub fn encodeChecked(rows: &[]&str, spec: &Spec): Option[str] {
+    let got = encodeRows(rows, spec)
+    if got.isNone() || !checking() { return got }
+    let s = got.unwrap()
+    let n = len(rows)
+    match parse(&s, n) {
+        Some(dir) {
+            var ends: []int = array(n, 0)
+            let body = allRows(&s, &dir, mut &ends)
+            for i in 0..n {
+                let a = if i == 0 { 0 } else { ends[i - 1] }
+                if &body[a..ends[i]] != rows[i] {
+                    MISMATCH += 1
+                    return None
+                }
+            }
+            return Some(s)
+        }
+        None {
+            MISMATCH += 1
+            return None
+        }
+    }
+}
