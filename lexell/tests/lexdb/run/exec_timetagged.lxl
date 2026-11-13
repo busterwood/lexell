@@ -1,0 +1,109 @@
+// lexdb_exec: tagged rows whose first value is a time (design/lexdb.md
+// 9.115). Such a row began with the time's tag, 8, which is FIXED, and
+// read as a fixed row: "a row's layout number", or wrong values. Written
+// as older builds wrote them (setLegacyTimeRows; setLegacyKinds for a
+// table made before 9.113, whose times made rows tagged):
+// - opened again (bootstrap gives the legacy table its 9.113 layout, a
+//   time its first place: which tables can hold such rows), every row
+//   reads back as written, through the row path and batches,
+//   through a checkpoint (the legacy table's leaves become column leaves),
+//   VACUUM and a reopen;
+// - rows that read both ways (a time of 00:00 and an interval of 20
+//   months: a fixed row's layout 0 and length) are read as tagged;
+// - rows written now with a time first (and an interval: tagged) are in
+//   the long form (beginning with 6), read back as written.
+// expect: a: 2000 rows, wrong 0, batches off wrong 0, both ways 5
+// expect: b: 2000 rows, wrong 0, batches off wrong 0
+// expect: after a checkpoint and VACUUM: a wrong 0, b wrong 0, b column leaves true
+// expect: new rows: tagged:100 of 1 layouts, wrong 0
+// expect: after a reopen: a wrong 0, b wrong 0
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            var out: []str = []
+            for r in rs {
+                if !r.hasRows { append(mut &out, r.tag) }
+                for row in r.rows {
+                    var vs: []str = []
+                    for v in row { append(mut &vs, lexdb_exec.text(&v)) }
+                    append(mut &out, strings.join(&vs, "|"))
+                }
+            }
+            return strings.join(&out, " ")
+        }
+        Err(e) { return "ERROR " + e.state + " " + e.msg }
+    }
+}
+
+fn EA(): str { return "time '00:00' + (g % 97) * interval '1024 seconds'" }
+fn EI(): str { return "case when g % 5 = 0 then null when g % 3 = 0 then interval '20 months' else g * interval '1 day 3 hours' end" }
+fn EB(): str { return "case when g % 4 = 0 then null else time '00:00' + (g % 50) * interval '1024 seconds' end" }
+fn ED(): str { return "case when g % 3 = 0 then null else date '2024-01-01' + g end" }
+
+fn wrongA(s: mut &lexdb_exec.Session): str {
+    return q(s, &("select count(*) from a join generate_series(1, 2000) g on a.id = g where a.t is distinct from (" + EA() +
+                  ") or a.i is distinct from (" + EI() + ") or a.x is distinct from g * 7"))
+}
+
+fn wrongB(s: mut &lexdb_exec.Session): str {
+    return q(s, &("select count(*) from b join generate_series(1, 2000) g on b.id = g where b.t is distinct from (" + EB() +
+                  ") or b.d is distinct from (" + ED() + ") or b.n is distinct from g * 0.5 or b.s is distinct from 'b' || g"))
+}
+
+fn main() {
+    let fs = lexdb_disk.sim(115)
+    let opts = lexdb_store.Options{cacheBytes: 4 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 1024 * 1024, snapNodes: 50000, bufferedPages: false}
+    lexdb_store.run(fs, opts, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        // as older builds wrote them
+        lexdb_exec.setLegacyTimeRows(true)
+        let c1 = q(mut &s, &"create table a (t time, i interval, id int primary key, x int)")
+        let i1 = q(mut &s, &("insert into a select " + EA() + ", " + EI() + ", g, g * 7 from generate_series(1, 2000) g"))
+        lexdb_exec.setLegacyKinds(true)
+        let c2 = q(mut &s, &"create table b (t time, id int primary key, d date, n numeric(8,2), s text)")
+        let i2 = q(mut &s, &("insert into b select " + EB() + ", g, " + ED() + ", g * 0.5, 'b' || g from generate_series(1, 2000) g"))
+        lexdb_exec.setLegacyKinds(false)
+        lexdb_exec.setLegacyTimeRows(false)
+        return 0
+    }).unwrap()
+    // opened again by this build: bootstrap gives b a layout of 9.113's
+    // kinds (upgradeLayouts, 9.114), a time first place among them
+    lexdb_store.run(fs, opts, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        let wa = wrongA(mut &s)
+        let both = q(mut &s, &"select count(*) from a where t = '00:00' and i = interval '20 months'")
+        let wb = wrongB(mut &s)
+        let off = q(mut &s, &"set lexdb_batch = off")
+        let wa2 = wrongA(mut &s)
+        let wb2 = wrongB(mut &s)
+        let on = q(mut &s, &"set lexdb_batch = on")
+        println("a: " + q(mut &s, &"select count(*) from a") + " rows, wrong " + wa + ", batches off wrong " + wa2 + ", both ways " + both)
+        println("b: " + q(mut &s, &"select count(*) from b") + " rows, wrong " + wb + ", batches off wrong " + wb2)
+
+        st.checkpointAll().unwrap()
+        let v = q(mut &s, &"vacuum")
+        st.checkpointAll().unwrap()
+        let cols = st.colCounts()[0]
+        println("after a checkpoint and VACUUM: a wrong " + wrongA(mut &s) + ", b wrong " + wrongB(mut &s) + ", b column leaves " + (cols > 0).toStr())
+
+        // rows written now: none tagged that begins with 8
+        let c3 = q(mut &s, &"create table n (t time, i interval, id int primary key)")
+        let i3 = q(mut &s, &"insert into n select time '00:00' + g * interval '1 minute', g * interval '1 day', g from generate_series(1, 100) g")
+        println("new rows: " + lexdb_exec.rowLayouts(&st, &"n") + ", wrong " +
+                q(mut &s, &"select count(*) from n join generate_series(1, 100) g on n.id = g where n.t <> time '00:00' + g * interval '1 minute' or n.i <> g * interval '1 day'"))
+        return 0
+    }).unwrap()
+    lexdb_store.run(fs, opts, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        println("after a reopen: a wrong " + wrongA(mut &s) + ", b wrong " + wrongB(mut &s))
+        return 0
+    }).unwrap()
+}

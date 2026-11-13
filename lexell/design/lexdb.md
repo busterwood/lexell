@@ -10890,13 +10890,9 @@ the strict parse's refusals are of rows in the current layout);
 `exec_colsfill` (its root leaf, of two layouts, now also holds long texts, so
 it is still cut). The suite passes (127), also with `LEXDB_COLCHECK=1`.
 
-**Found, not fixed:** a tagged row whose first value is a time starts with
-its tag, 8, which is `FIXED`, so it is read as a fixed row and fails ("a
-row's layout number"). Since 9.113 a time is fixed, so only rows a pre-9.113
-table wrote (its first column a time, the value not NULL) and
-`LEXDB_ROWFMT=tagged` rows are such; `upgradeLayouts` stops the first from
-being written, but those already written stay unreadable, as before this
-change.
+**Found:** a tagged row whose first value is a time starts with its tag,
+8, which is `FIXED`, so it is read as a fixed row and fails ("a row's
+layout number"). Fixed in 9.115.
 
 **Not done, and next:**
 - Leaves converted while clean keep their rows (a T_LEAF page's 43 of w's
@@ -10910,3 +10906,89 @@ change.
   with "a row's layout number", as it already did for rows other sessions
   wrote in it.
 - Old column leaves of a table's earlier layout are left as they are.
+
+### 9.115 Tagged rows whose first value is a time
+
+**The bug.** A tagged row (9.31) begins with its first value's tag. A
+time's tag is 8, and so is `FIXED`, the first byte of a row in the fixed
+layout (9.50). So since 9.50 a tagged row whose first place held a
+non-NULL time was read as a fixed row: "a row's layout number" or "a row's
+variable part", or in principle wrong values. Every query of such a table
+failed. Such rows were written by:
+- tables made before 9.113 whose first column is a time (a time made the
+  row tagged);
+- since 9.113, a table whose first column is a time and whose row is
+  tagged for another reason (an interval, say);
+- `LEXDB_ROWFMT=tagged`.
+
+9.114's review found it. Data written so by 95d0678c and by 0b9a5fea
+reproduced it: every query of both tables failed.
+
+**New rows.** `encRow` writes a row whose first value is a time in the
+long form (9.31: tag 6, its column count, its values), which every reader
+reads, even with no long text in it. No row beginning with 8 is written
+tagged again. Such rows are taken by the row path, not the batch decoders,
+and stay rows in column leaves' trees (the converter takes no long
+rows). They are rare: a time first, and a value the fixed layout does not
+take.
+
+**Rows already written** are told from fixed rows (`lexdb_cols.timeTagged`):
+- **Which tables:** only a table one of whose layouts has a time as its
+  first place (`timeFirst`) can hold them. A pre-9.113 table gets such a
+  layout at its first start by a 9.114 build (`upgradeLayouts`, before
+  any session or checkpoint). Rows of other tables starting with 8 are
+  fixed, as before, at the cost of one test per row.
+- **The test:** in such a table a row beginning with 8 is tagged when it
+  reads to its last byte as a tagged row (`taggedFits`) and does not read
+  as a fixed row (`fixedFits`, the encoder's checks).
+  - `taggedFits` requires each value's tag to be one its place's kind in
+    the current layout holds (a text place, as older layouts gave dates and
+    the like, any but an integer, boolean or numeric). It also requires
+    the first value to be a time of day (0 to 24:00 in microseconds), and
+    at most the layout's places.
+  - `fixedFits` requires a known layout, its length its parts', NULL places
+    empty, booleans 0 or 1, the ends in order, and the bitmap's spare bits 0.
+- **Read both ways,** a row stays fixed, as every row read before. For
+  that, a tagged row's time and next values would have to make a valid
+  layout number, bitmap, NULL places and ends summing to its length.
+  - **Layout number:** a time of 00:00, or any multiple of 1024 seconds,
+    gives 0.
+  - **Bitmap and ends:** checked against the layout's kinds.
+
+  No such row has been found. The likeliest cases read as tagged, as
+  written:
+  - 00:00 and 00:17:04 with `interval '20 months'`;
+  - a table of only (time, interval), written by 95d0678c;
+  - the test's tables.
+- **Where it applies:**
+  - every place that tells the forms apart: `decRowNeed`, `bRowInto`, the
+    two fixed-run decoders (a run stops at such a row);
+  - in `lexdb_cols`, `encodeOne` (such a row is not encoded as fixed), the
+    converter (it reads such a row as tagged and converts it: 9.114) and
+    `placeTexts`;
+  - the tests' counters.
+
+**Tests:** new `exec_timetagged`.
+- **Setup:** rows written as older builds wrote them (`setLegacyTimeRows`;
+  `setLegacyKinds` for a pre-9.113 table), then the store opened again.
+- **Checks:** every value read back, through the batches and the row path;
+  the rows that read both ways; then a checkpoint and VACUUM (the
+  pre-9.113 table's leaves become column leaves), new rows in the long
+  form, and a reopen.
+- **Planted bug:** with the test made to answer "fixed" always, every
+  query fails as before.
+
+**Live:** tables written by 95d0678c (time, interval) and by 0b9a5fea
+(pre-9.113: time, date, numeric, text), 5,000 rows each. The old build
+fails every query. This one reads every value as written:
+- after updates and an insert;
+- with batches off;
+- after VACUUM with `LEXDB_COLCHECK=1`;
+- after a restart.
+
+**Other checks:**
+- the suite (128), also with `LEXDB_COLCHECK=1`;
+- crash runs, 6 rounds in each I/O mode, and the replica test;
+- fuzz, columns on and off, batches on and off, and 9.114's ALTER and
+  VACUUM fuzz: the same;
+- ordinary tables' queries (the column-leaf list): times unchanged.

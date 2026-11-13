@@ -3044,11 +3044,25 @@ fn succ(s: &str): str {
 // them stay at the row's start, which a large row keeps in its leaf.
 const LONG = 256
 
+// Rows written as before 9.115: a tagged row whose first value is a time
+// beginning with its tag (a test's way to write what older builds wrote).
+var legacyTimeRows: bool = false
+
+pub fn setLegacyTimeRows(on: bool) { legacyTimeRows = on }
+
 fn encRow(row: &[]Val): str {
     var long = false
     for v in row {
         match v {
             Val.Text(s) { if len(s) >= LONG { long = true } }
+            else {}
+        }
+    }
+    // a row whose first value is a time would begin with its tag, 8, which
+    // is FIXED: in the long form instead, which begins with 6 (9.115)
+    if len(row) > 0 && !legacyTimeRows {
+        match row[0] {
+            Val.Time(_) { long = true }
             else {}
         }
     }
@@ -3465,7 +3479,7 @@ fn decRow(s: &str, n: int): Result[[]Val, DbErr] {
 // decoded (9.31).
 // lays: the row's table's layouts (Table.lays), for a row in the fixed form.
 fn decRowNeed(s: &str, n: int, need: &[]bool, missing: &[]Val, lays: &[]FixedLay): Result[[]Val, DbErr] {
-    if len(s) > 0 && s[0] == FIXED { return decFixed(s, n, need, missing, lays) }
+    if len(s) > 0 && s[0] == FIXED && !timeTaggedLays(s, lays) { return decFixed(s, n, need, missing, lays) }
     var out: []Val = []
     var at = 0
     let some = len(need) > 0
@@ -21778,7 +21792,7 @@ fn bRowInto(s: &str, r: int, b: mut &Batch, bp: &BPlan, t: &Table): Result[int, 
     let kinds = &bp.kinds
     let placeCol = &bp.placeCol
     let missing = &bp.missing
-    if len(s) > 0 && s[0] == FIXED {
+    if isFixedRow(s, t) {
         // one load per column used, at its offset (9.50)
         let lay = &t.lays[try layOf(s, &t.lays)]
         let np = len(lay.kinds)
@@ -21883,7 +21897,8 @@ fn bRowInto(s: &str, r: int, b: mut &Batch, bp: &BPlan, t: &Table): Result[int, 
 fn bRunInto(leaf: &lexdb_page.Node, from: int, to: int, b: mut &Batch, bp: &BPlan, t: &Table): Result[int, DbErr] {
     if leaf.isCols() { return cRunInto(leaf, from, to, b, bp, t) }
     let s0 = leaf.valView(from)
-    if len(s0) < 3 || s0[0] != FIXED { return Ok(0) }
+    if len(s0) < 3 || !isFixedRow(s0, t) { return Ok(0) }
+    let tf = lexdb_cols.timeFirst(&t.layouts)
     let id = try layOf(s0, &t.lays)
     let lay = &t.lays[id]
     let id0 = s0[1]
@@ -21897,6 +21912,7 @@ fn bRunInto(leaf: &lexdb_page.Node, from: int, to: int, b: mut &Batch, bp: &BPla
     while end < to {
         let s = leaf.valView(end)
         if len(s) < v0 || s[0] != FIXED || s[1] != id0 || s[2] != id1 { break }
+        if tf && lexdb_cols.timeTagged(s, &t.layouts) { break }
         append(mut &rows, s)
         end += 1
     }
@@ -22401,7 +22417,8 @@ fn bRunLazy(leaf: &lexdb_page.Node, from: int, to: int, b: mut &Batch, bp: &BPla
             bar: &Bar, idx: mut &[]int, kept: mut &int): Result[int, DbErr] {
     if leaf.isCols() { return cRunLazy(leaf, from, to, b, bp, t, lz, conds, bar, idx, kept) }
     let s0 = leaf.valView(from)
-    if len(s0) < 3 || s0[0] != FIXED { return Ok(0) }
+    if len(s0) < 3 || !isFixedRow(s0, t) { return Ok(0) }
+    let tf = lexdb_cols.timeFirst(&t.layouts)
     let id = try layOf(s0, &t.lays)
     let lay = &t.lays[id]
     let id0 = s0[1]
@@ -22413,6 +22430,7 @@ fn bRunLazy(leaf: &lexdb_page.Node, from: int, to: int, b: mut &Batch, bp: &BPla
     while end < to {
         let s = leaf.valView(end)
         if len(s) < v0 || s[0] != FIXED || s[1] != id0 || s[2] != id1 { break }
+        if tf && lexdb_cols.timeTagged(s, &t.layouts) { break }
         append(mut &rows, s)
         end += 1
     }
@@ -25668,7 +25686,7 @@ pub fn countFixedRows(st: &lexdb_store.Store, name: &str): int {
     match found {
         Some(t) {
             let r = st.scan(mut &txn, t.tree, "", "", fn(en: &lexdb_store.Entry): bool {
-                if len(en.val) > 0 && en.val[0] == FIXED { n += 1 }
+                if isFixedRow(&en.val, &t) { n += 1 }
                 return true
             })
         }
@@ -25692,7 +25710,7 @@ pub fn rowLayouts(st: &lexdb_store.Store, name: &str): str {
             nl = len(t.layouts)
             counts = array(nl, 0)
             let r = st.scan(mut &txn, t.tree, "", "", fn(en: &lexdb_store.Entry): bool {
-                if len(en.val) > 2 && en.val[0] == FIXED {
+                if len(en.val) > 2 && isFixedRow(&en.val, &t) {
                     let id = binary.readU16LEStr(&en.val, 1)
                     if id < len(counts) { counts[id] += 1 }
                 } else {
@@ -25976,6 +25994,28 @@ type FixedLay = record {
     prev: []int
     bm: int                 // the bitmap's offset
     v0: int                 // the variable part's
+}
+
+// Whether s, beginning with FIXED, is a tagged row whose first value is a
+// time, written before 9.115 (lexdb_cols.timeTagged), in a table of these
+// layouts.
+fn timeTaggedLays(s: &str, lays: &[]FixedLay): bool {
+    var tf = false
+    for l in lays { if len(l.kinds) > 0 && l.kinds[0] == PK_TIME { tf = true } }
+    if !tf { return false }
+    var ks: [][]byte = []
+    for l in lays {
+        var k: []byte = []
+        for x in l.kinds { append(mut &k, x) }
+        append(mut &ks, k)
+    }
+    return lexdb_cols.timeTagged(s, &ks)
+}
+
+// Whether s is a row in the fixed layout of table t (not tagged; 9.115).
+fn isFixedRow(s: &str, t: &Table): bool {
+    if len(s) == 0 || s[0] != FIXED { return false }
+    return !(lexdb_cols.timeFirst(&t.layouts) && lexdb_cols.timeTagged(s, &t.layouts))
 }
 
 // The layout of rows with these places' kinds.
