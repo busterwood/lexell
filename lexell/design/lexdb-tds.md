@@ -755,3 +755,158 @@ distinct, over 64 `sys` views, two dozen catalog and property functions,
   session's S5 work: EXEC here knows sp_executesql and two extended
   procedures only); the SQL Server system views, functions and procedures
   beyond these.
+
+## 14. Bulk load: INSERT BULK and BULK_LOAD (2026-11-13)
+
+`bcp ... in` against lexdb failed: the endpoint knew neither INSERT BULK nor
+packet type 7. Bulk-copy clients (bcp, .NET's SqlBulkCopy, lib/tds's
+bulkWriter) now load into lexdb as into SQL Server, on lexdb's per-row
+insert path (COPY's, 9.45, 9.87, 9.119).
+
+- **What clients send**, recorded from the oracle by the Extended Events
+  trace of section 13 and by `tds_proxy.py` with every message dumped.
+  bcp (ODBC Driver 18): `set quoted_identifier off`; RPC
+  `sp_describe_first_result_set N'select * from db.dbo.t'`; RPC
+  `sp_prepare @p1 output, NULL, N'select * from db.dbo.t', 1` (options 1:
+  the statement's COLMETADATA comes back before RETURNSTATUS); `insert bulk
+  db.dbo.t([id] bigint,[amt] numeric(12,2),[cust] varchar(100) collate
+  SQL_Latin1_General_CP1_CI_AS, ...)with(TABLOCK, ORDER(id ASC),
+  ROWS_PER_BATCH=10, ..., KEEP_NULLS)`; the rows; `sp_unprepare`. bcp leaves
+  an identity column out of INSERT BULK unless `-E` (KEEPIDENTITY is no
+  option: naming the column is what keeps its values), sends (max) columns
+  last, and with `-b n` an INSERT BULK and a message per batch.
+  SqlBulkCopy (Microsoft.Data.SqlClient 6): one batch `select @@trancount;
+  SET FMTONLY ON select * from [dbo].[t] SET FMTONLY OFF exec
+  ..sp_tablecollations_100 N'[dbo].[t]'`, then `insert bulk [dbo].[t] ([i]
+  Int, [d] Decimal(12,2), [s] NVarChar(50) COLLATE ..., ...) with
+  (KEEP_NULLS, TABLOCK, CHECK_CONSTRAINTS)`, then the rows. Both send each
+  value in the type the metadata gave (bcp converts its text itself), so
+  that metadata must be the table's declared types.
+- **The message** (packet type 7, any number of packets): COLMETADATA (the
+  INSERT BULK's columns in its order; bcp says 19 for a numeric's length,
+  which lib/tds's reader now takes), a ROW per row, DONE (SqlClient's with a
+  4-byte count). SQL Server takes no NBCROW and no PLP of a known length in
+  it (4804, 4815: clients send (max) values as PLP of unknown length);
+  lexdb takes both.
+- **Metadata** (`lexdb_exec.DeclCol`, `Session.tableDecl` and
+  `describeDecl`): a column as SQL Server describes it, from lexdb's
+  `sqlTypeOf` (section 13): type, length, precision, scale, collation,
+  nullability (a primary key's columns NOT NULL), identity, default. A
+  query of one table gives a column of that table, by name and type, the
+  table's declaration; anything else its lexdb type's nearest. Used by:
+  `SET FMTONLY ON` (now kept: a SELECT gives a COLMETADATA of these and no
+  rows, nothing else runs; a batch that an error ends still leaves FMTONLY
+  as its last SET FMTONLY said, as SQL Server, which applies it as it
+  compiles: SqlBulkCopy's batch for a missing table depends on it);
+  sp_prepare with options 1; `sp_describe_first_result_set` (RPC and EXEC:
+  its 39 columns, those lexdb has nothing for NULL as SQL Server leaves them
+  for a plain table column; tds_type_id and tds_length as the oracle's:
+  INT4 for a NOT NULL int, INTN for a nullable one, ...); `EXEC
+  sp_tablecollations_100` (a row per column, the collation's 5 bytes and
+  name for text columns; none for a table that is not there). The
+  COLMETADATA writer (`declMetadata`) sends SQL Server's own types: fixed
+  INT4 and BIT for NOT NULL, decimal(p, s), varchar(n) and char(n) with the
+  collation, time(s), datetime2(s), and so on.
+- **INSERT BULK** (`lexdb_tsqlparse`: TS_INSERTBULK; `lexdb_tsql`): the table
+  (208, sent twice as SQL Server sends it), the columns with their types,
+  COLLATE and NULL / NOT NULL read and not used, WITH's CHECK_CONSTRAINTS,
+  FIRE_TRIGGERS, KEEP_NULLS, TABLOCK, ROWS_PER_BATCH, KILOBYTES_PER_BATCH,
+  ORDER (...) (another option: 102); a column named twice 264; with another
+  statement in the batch 428. Answered as SQL Server: DONE, CurCmd 0xFD, no
+  count. Kept on the connection (`State.bulk`) for the next request; any
+  other request drops it. A column the table does not have: SQL Server's
+  DONE has the error flag and no message, and so does the load's answer
+  (lexdb does the same; the oracle then closes the connection at the next
+  request, lexdb does not).
+- **The load** (`lexdb_tds.bulkLoad`, `lexdb_tsql.bulk`, `lexdb_exec.bulkStmt`):
+  one statement, a COPY of `copy.bulk` run by `Session.copyInFrom` (so in
+  the session's transaction when one is open, under the statement's
+  savepoint, else its own transaction; IMPLICIT_TRANSACTIONS begins one; not
+  run again on a conflict, its rows being read). Its pull reads the
+  message's next packet when the bytes it has hold no whole row
+  (`tds.scanRow`, now public, finds a row's values), decodes each value
+  straight to lexdb's (`bulkVal`: integers, bit, real and float, decimal and
+  numeric from the sign and magnitude, money, char, varchar and text in
+  their collation's code page (ASCII as it is), nchar, nvarchar, ntext and
+  xml from UTF-16, binary, varbinary, image, PLP values joined, date, time,
+  datetime2 and datetimeoffset from their units, datetime and
+  smalldatetime through lib/tds's decoder, uniqueidentifier; sql_variant
+  and UDTs 4816), and gives a packet's rows at a time. `bulkStmt` inserts
+  each with `insertOne`, as COPY: the value made the column's type as an
+  INSERT's (a bit into a number column 0 or 1), the other columns their
+  defaults, the hidden key's runs (9.119), keys, checks and foreign keys.
+  Without KEEP_NULLS a NULL for a column with a DEFAULT (or an identity)
+  takes it. An identity column named keeps its values and goes on past the
+  largest (as IDENTITY_INSERT). The message is read to its end whatever
+  happens, so the connection goes on.
+- **The answer**: DONE with DONE_COUNT, CurCmd 0xF0 and the row count (NOCOUNT
+  does not drop it); an error: ERROR, INFO 3621 "The statement has been
+  terminated.", DONE with the error flag, nothing loaded (in a transaction,
+  the transaction goes on, as the oracle's for 2627); a message ended by
+  the client (a last packet with IGNORE): DONE with the error flag alone,
+  as SQL Server.
+- **Differences from SQL Server.** CHECK constraints and foreign keys are
+  always checked (SQL Server skips both without CHECK_CONSTRAINTS and marks
+  them not trusted); FIRE_TRIGGERS, TABLOCK, ROWS_PER_BATCH,
+  KILOBYTES_PER_BATCH and ORDER are read and ignored (lexdb has no triggers;
+  its locking and commits are its own). The COLMETADATA's nullability is
+  not compared with the table's (SQL Server refuses another, 4816: lexdb's
+  own result metadata says nullable for every column, so lib/tds's writer,
+  which copies it, would be refused). Constraint and conversion errors
+  have SQL Server's numbers (2627, 515, 547, 2628 for a value too long for
+  varchar(n), as SQL Server 2022's); a malformed message (SQL Server's 4804,
+  4815) is an error of lexdb's own text, number 50000, and a type lexdb
+  does not take 4816, as a statement's error (SQL Server's 48xx end the
+  transaction too). Times keep microseconds (datetime2(7)'s last digit
+  rounded), a datetimeoffset its UTC instant (not its offset), money is
+  decimal(19,4): lexdb's types (section 13).
+- **Clients checked.** bcp (mssql-tools18, ODBC Driver 18) `-c` loads into
+  lexdb with and without `-E`, `-k`, `-h "..."` and `-b n`; the rows read
+  back are the oracle's. SqlBulkCopy (Microsoft.Data.SqlClient 6, a
+  throwaway program in the .NET SDK image: every common type from a
+  DataTable, default options and KEEP_NULLS | TABLOCK | CHECK_CONSTRAINTS,
+  a load in a transaction rolled back, a missing table) prints against
+  lexdb what it prints against SQL Server. lib/tds's bulkWriter (through
+  lib/sqlserver's bulkStream) loads as into SQL Server.
+- **Tests:** `tests/lexdb/run/tds_bulk.lxl` (in the suite; with
+  LEXDB_MSSQL it runs against a server, how its expect lines were
+  checked): a message made by hand with every type above and a row of
+  NULLs, KEEP_NULLS and defaults (515 for NULL into a NOT NULL column),
+  identity values kept and the identity going on past them, a duplicate
+  key part way (2627, 3621, none loaded, the connection usable), loads in
+  a transaction (rolled back; an error in one leaves it open), 5,000 rows
+  of lib/tds's writer in many packets, IGNORE, 208, 428, 264, 2628, a CHECK,
+  FMTONLY and sp_tablecollations_100 as SqlBulkCopy sends them,
+  sp_describe_first_result_set as bcp sends it, a column the table has
+  not. The oracle's answers but three, listed in its header (times' 100 ns,
+  the CHECK, the connection SQL Server closes).
+- **Measured** (2026-11-13; 1M rows of `w1m_bcp.tsv`, 12 columns, into
+  `t (id bigint primary key, a int, b bigint, amt numeric(12,2), f float,
+  cust varchar(100), note varchar(200), d date, ts datetimeoffset, flag bit,
+  u uniqueidentifier, sku varchar(20))`; medians of 3, one at a time; other
+  sessions' tests ran on the machine meanwhile):
+
+  | load | lexdb | SQL Server 2022 |
+  |---|---|---|
+  | `bcp -c`, bcp's own clock | 3.07 s | 3.08 s |
+  | `bcp -c`, the whole bcp run | 3.64 s | 3.16 s |
+  | lib/tds bulkWriter (lib/sqlserver bulkStream, parsing the file itself) | 3.43 s | 3.83 s |
+  | lexdb's COPY of the same rows over psql (`\copy`, PostgreSQL's types) | 3.08 s | |
+
+  bcp for SQL Server ran inside its container, for lexdb in a container
+  of the same image on the host's network. The half second between bcp's
+  clock and its end on lexdb is lexdb's checkpoint after a commit of 140 MB
+  of log, which holds up bcp's sp_unprepare; COPY's psql shows the same
+  0.48 s on a `select 1` after the load, and its timing above stops before
+  it. A profile of the load: the TDS decoding (`bulkVal`, `bulkRows`,
+  `scanRow`) about 15%, the rest insertOne, coercion, row encoding and the
+  store, as COPY's. Two things the profile found: a varchar(n) value's
+  characters were counted for every value (now only when its bytes are more
+  than n, which helps COPY too), and the ASCII test of a varchar value is
+  made on the packet's bytes before any copy.
+- **Not done:** NOT NULL in result metadata generally (lexdb's COLMETADATA
+  says nullable for every column but in the metadata above); `numeric`
+  table columns described as `decimal` (bcp then declares decimal(p,s), which
+  loads the same); SET FMTONLY ON for statements other than SELECT (they
+  are skipped, not described); CHECK_CONSTRAINTS off; triggers; tedious
+  and JDBC's bulk copy were not tried.

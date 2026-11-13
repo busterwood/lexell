@@ -1946,7 +1946,8 @@ fn typeInfo(c: mut &Cur, col: mut &Column): Result[Unit, Error] {
             col.size = try c.u8(what)
             col.precision = try c.u8(what)
             col.scale = try c.u8(what)
-            if col.size != 5 && col.size != 9 && col.size != 13 && col.size != 17 {
+            // (bcp declares 19 in a bulk load's COLMETADATA; its values are 17 at most)
+            if col.size != 5 && col.size != 9 && col.size != 13 && col.size != 17 && col.size != 19 {
                 return Err(proto(col.typeName() + " with length " + col.size.toStr()))
             }
             if col.precision < 1 || col.precision > 38 || col.scale > col.precision {
@@ -2567,6 +2568,26 @@ fn returnValue(c: mut &Cur): Result[ReturnValue, Error] {
     let v = try readValue(mut &c, &col)
     return Ok(ReturnValue{ordinal: ordinal, name: name, status: status, column: col, value: v})
 }
+
+// COLMETADATA's columns, the token's body at d[at..] (after its 0x81): the
+// columns and where the token ends. A server reads a bulk load's with it
+// (lexdb's TDS endpoint); Err when the bytes end inside it or make no sense.
+pub type Metadata = record { pub cols: []Column; pub end: int }
+
+pub fn parseColMetadata(d: &str, at: int): Result[Metadata, Error] {
+    var c = Cur{s: d.toStr(), pos: at, end: len(d)}
+    let cols = try colMetadata(mut &c)
+    return Ok(Metadata{cols: cols, end: c.pos})
+}
+
+// Whether a column's values are PLP (a (max) type, xml, a UDT): scanRow
+// gives such a value's chunks, each after its 4-byte length, up to the
+// terminator.
+pub fn (col: &Column) isPlp(): bool { return col.framing == F_PLP }
+
+// The non-NULL value of col whose bytes are b (a PLP value's chunks
+// joined) as a Cell.
+pub fn decodeCell(col: &Column, b: str): Cell { return decodeValue(col, b) }
 
 fn colMetadata(c: mut &Cur): Result[[]Column, Error] {
     let n = try c.u16("COLMETADATA")
@@ -3373,11 +3394,13 @@ const EV_DONE = 3       // a DONE, DONEPROC or DONEINPROC
 const EV_END = 4        // the end of the reply
 const EV_OTHER = 5      // another token, applied
 const EV_SHORT = -1     // the bytes end inside the token
+pub const ROW_SHORT = EV_SHORT
 
 // Where a ROW (an NBCROW when nbc) at d[at..] has each value, into starts
-// and lens (-1 for NULL), and the position after it; EV_SHORT when d ends
+// and lens (-1 for NULL; starts and lens hold one per column), and the
+// position after it; ROW_SHORT when d ends
 // first. E_PROTOCOL for a length its column's type cannot have.
-fn scanRow(d: &str, at: int, cols: &[]Column, nbc: bool, starts: mut &[]int, lens: mut &[]int): Result[int, Error] {
+pub fn scanRow(d: &str, at: int, cols: &[]Column, nbc: bool, starts: mut &[]int, lens: mut &[]int): Result[int, Error] {
     let n = len(d)
     let nc = len(cols)
     var p = at

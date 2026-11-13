@@ -1,0 +1,534 @@
+// lexdb over TDS: bulk load (INSERT BULK, then the rows in a BULK_LOAD
+// message: what bcp and SqlBulkCopy send), checked against SQL Server 2022
+// (design/lexdb-tds.md, section 14). Through lib/tds: a message made by
+// hand with every type SQL Server's clients send (ints, bit, real, float,
+// decimal, numeric, money, char, varchar, varchar(max) in PLP, nchar,
+// nvarchar, nvarchar(max), binary, varbinary, varbinary(max), date, time,
+// datetime2, datetimeoffset, datetime, smalldatetime, uniqueidentifier),
+// NULLs and defaults with and without KEEP_NULLS, identity values kept, an
+// error part way (none loaded, the connection usable), loads in a
+// transaction, a load of many packets from lib/tds's bulk writer, a load
+// ended by IGNORE, and the metadata the clients ask for first (SET FMTONLY
+// ON, sp_tablecollations_100, sp_describe_first_result_set).
+//
+// With LEXDB_MSSQL set to a connection string it runs against that server
+// instead (how the expect lines were checked, against the oracle's database
+// bulkdb). They are the oracle's but for three, as the design's section 14
+// says: the first row's datetime2(7) and datetimeoffset(7) (lexdb keeps
+// microseconds: .1234570, SQL Server .1234567); "check" (SQL Server loads
+// the row that fails the CHECK without CHECK_CONSTRAINTS: "(1) / error 547 /
+// info 3621 / count 1"); "no column" (SQL Server then closes the
+// connection at the next request).
+// timeout: 120
+// expect: setup ok
+// expect: all types: (2)
+// expect: 1|200|-300|70000|5000000000|1|1.5|2.25|123456.7891|-12.345|12.3400|ab   |café|chunked value|ab  |αβ 😀|long text|0x01020304|0xFF00|0xAABBCCDD|2024-02-29|13:14:15.123|2024-02-29 13:14:15.1234570|2024-02-29 13:14:15.1234570 +00:00|2024-02-29 13:14:15.123|2024-02-29 13:14:00|6F9619FF-8B86-D011-B42D-00C04FC964FF|42|x
+// expect: 2|NULL|NULL|NULL|NULL|NULL|NULL|NULL|NULL|NULL|NULL|NULL|NULL|NULL|NULL|NULL|NULL|NULL|NULL|NULL|NULL|NULL|NULL|NULL|NULL|NULL|NULL|42|x
+// expect: keep nulls: (1)
+// expect: 3|NULL|NULL
+// expect: not null with keep nulls: error 515 / info 3621
+// expect: count after: 3
+// expect: identity kept: (2)
+// expect: next identity: 101
+// expect: error part way: error 2627 / info 3621
+// expect: rows after error: 0
+// expect: usable: 1
+// expect: in a transaction: (3) / count 3 / trancount 1 / after rollback 0
+// expect: error in a transaction: error 2627 / info 3621 / trancount 1 / count 2
+// expect: many packets: (5000) / 5000|12502500|1000011
+// expect: ignored: done error / count 0 / usable 1
+// expect: no table: error 208 / error 208
+// expect: two statements: error 428
+// expect: twice: error 264
+// expect: too long: error 2628 / info 3621
+// expect: check: error 547 / info 3621 / error 547 / info 3621 / count 0
+// expect: fmtonly: trancount 0 / id int fixed 4 notnull identity / dc decimal(18,4) / vc varchar 50 / nv nvarchar 80 / d2 datetime2(7) / nn nvarchar 20 notnull / collations 3: id - / vc SQL_Latin1_General_CP1_CI_AS / nn SQL_Latin1_General_CP1_CI_AS
+// expect: describe: id int 4 0 identity 56 / dc decimal(18,4) 9 1 106 / vc varchar(50) 50 1 167 / nn nvarchar(10) 20 0 231
+// expect: no column: done error / done error / usable 1
+import "os"
+import "strings"
+import "task"
+import "net"
+import "tds"
+import "sqldialect"
+import "sqlserver"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_wire"
+import "../../../cmd/lexdb_tds"
+
+type Error = sqldialect.DbError
+
+// ---- the bytes of a bulk load's message, as a client makes them
+
+fn u8(b: mut &[]byte, v: int) { append(b, byte(v & 0xff)) }
+fn le(b: mut &[]byte, v: int, n: int) { for k in 0..n { u8(b, if k < 8 { v >> (8 * k) } else if v < 0 { 0xff } else { 0 }) } }
+fn utf16(s: &str): []byte { return tds.toUtf16(s.toStr()).unwrap() }
+
+// A column: its INSERT BULK declaration and its TYPE_INFO.
+// (nullable: as the table's column is: SQL Server refuses another, 4816)
+type Col = record { name: str; decl: str; info: []byte; nullable: bool }
+
+fn col(name: &str, decl: &str, info: &[]byte): Col {
+    var i: []byte = []
+    for x in info { append(mut &i, x) }
+    return Col{name: name.toStr(), decl: decl.toStr(), info: i, nullable: true}
+}
+
+fn notNull(c: Col): Col {
+    var x = c
+    x.nullable = false
+    return x
+}
+
+const COLL: []int = [0x09, 0x04, 0xd0, 0x00, 0x34]
+
+fn withColl(t: int, n: int): []byte {
+    var b: []byte = []
+    u8(mut &b, t)
+    le(mut &b, n, 2)
+    for x in COLL { u8(mut &b, x) }
+    return b
+}
+
+fn colmetadata(cols: &[]Col): []byte {
+    var b: []byte = []
+    u8(mut &b, tds.TK_COLMETADATA)
+    le(mut &b, len(cols), 2)
+    for c in cols {
+        le(mut &b, 0, 4)
+        le(mut &b, if c.nullable { 0x09 } else { 0x08 }, 2)       // nullable, updateable
+        for x in c.info { append(mut &b, x) }
+        let u = utf16(&c.name)
+        u8(mut &b, len(u) / 2)
+        for x in u { append(mut &b, x) }
+    }
+    return b
+}
+
+fn done(b: mut &[]byte) {
+    u8(b, tds.TK_DONE)
+    le(b, 0, 12)
+}
+
+fn insertBulk(table: &str, cols: &[]Col, with: &str): str {
+    var ds: []str = []
+    for c in cols { append(mut &ds, "[" + c.name + "] " + c.decl) }
+    return "insert bulk " + table + "(" + strings.join(&ds, ",") + ")" + with
+}
+
+// values: n bytes after a length byte; NULL a 0 length
+fn fixedN(b: mut &[]byte, v: int, n: int) {
+    u8(b, n)
+    le(b, v, n)
+}
+fn nullByte(b: mut &[]byte) { u8(b, 0) }
+fn nullShort(b: mut &[]byte) { le(b, 0xFFFF, 2) }
+fn nullPlp(b: mut &[]byte) { le(b, -1, 8) }
+fn short(b: mut &[]byte, s: &[]byte) {
+    le(b, len(s), 2)
+    for x in s { append(b, x) }
+}
+fn plp(b: mut &[]byte, s: &[]byte) {
+    le(b, len(s), 8)
+    // in two chunks (of whole UTF-16 units)
+    let h = (len(s) / 2) & ~1
+    if h > 0 {
+        le(b, h, 4)
+        for i in 0..h { append(b, s[i]) }
+    }
+    le(b, len(s) - h, 4)
+    for i in h..len(s) { append(b, s[i]) }
+    le(b, 0, 4)
+}
+// PLP of its length in one chunk
+fn plpOne(b: mut &[]byte, s: &[]byte) {
+    le(b, len(s), 8)
+    le(b, len(s), 4)
+    for x in s { append(b, x) }
+    le(b, 0, 4)
+}
+
+// PLP of unknown length, as bcp sends it
+fn plpUnknown(b: mut &[]byte, s: &[]byte) {
+    le(b, -2, 8)
+    le(b, len(s), 4)
+    for x in s { append(b, x) }
+    le(b, 0, 4)
+}
+fn bytesOf(s: &str): []byte { return strToBytes(s.toStr()) }
+fn decimal(b: mut &[]byte, neg: bool, units: int) {
+    u8(b, 17)
+    u8(b, if neg { 0 } else { 1 })
+    le(b, units, 8)
+    le(b, 0, 8)
+}
+
+const DAYS_0001_TO_2024_02_29: int = 738944     // 2024-02-29, days since 0001-01-01
+const DAYS_1900_TO_2024_02_29 = 45349      // ... since 1900-01-01
+
+fn allCols(): []Col {
+    return [col(&"ti", &"tinyint", &[byte(0x26), 1]), col(&"si", &"smallint", &[byte(0x26), 2]), col(&"i", &"int", &[byte(0x26), 4]),
+            col(&"bi", &"bigint", &[byte(0x26), 8]), col(&"b", &"bit", &[byte(0x68), 1]), col(&"r", &"real", &[byte(0x6d), 4]),
+            col(&"f", &"float", &[byte(0x6d), 8]), col(&"dc", &"decimal(18,4)", &[byte(0x6a), 17, 18, 4]),
+            col(&"nm", &"numeric(10,3)", &[byte(0x6c), 17, 10, 3]), col(&"mo", &"money", &[byte(0x6e), 8]),
+            col(&"c", &"char(5) collate SQL_Latin1_General_CP1_CI_AS", &withColl(0xaf, 5)),
+            col(&"vc", &"varchar(50) collate SQL_Latin1_General_CP1_CI_AS", &withColl(0xa7, 50)),
+            col(&"nc", &"nchar(4) collate SQL_Latin1_General_CP1_CI_AS", &withColl(0xef, 8)),
+            col(&"nv", &"nvarchar(40) collate SQL_Latin1_General_CP1_CI_AS", &withColl(0xe7, 80)),
+            col(&"bn", &"binary(4)", &[byte(0xad), 4, 0]), col(&"vb", &"varbinary(16)", &[byte(0xa5), 16, 0]),
+            col(&"dt", &"date", &[byte(0x28)]),
+            col(&"tm", &"time(3)", &[byte(0x29), 3]), col(&"d2", &"datetime2(7)", &[byte(0x2a), 7]),
+            col(&"dto", &"datetimeoffset(7)", &[byte(0x2b), 7]), col(&"dtm", &"datetime", &[byte(0x6f), 8]),
+            col(&"sdt", &"smalldatetime", &[byte(0x6f), 4]), col(&"g", &"uniqueidentifier", &[byte(0x24), 16]),
+            // (max) columns last, as bcp sends them: SQL Server takes them no other way
+            col(&"vmax", &"varchar(max) collate SQL_Latin1_General_CP1_CI_AS", &withColl(0xa7, 0xFFFF)),
+            col(&"nvmax", &"nvarchar(max) collate SQL_Latin1_General_CP1_CI_AS", &withColl(0xe7, 0xFFFF)),
+            col(&"vbmax", &"varbinary(max)", &[byte(0xa5), 0xff, 0xff])]
+}
+
+// row 1: a value of each; row 2: NULL for each
+fn allRows(): []byte {
+    var b: []byte = []
+    u8(mut &b, tds.TK_ROW)
+    fixedN(mut &b, 200, 1)
+    fixedN(mut &b, -300, 2)
+    fixedN(mut &b, 70000, 4)
+    fixedN(mut &b, 5000000000, 8)
+    fixedN(mut &b, 1, 1)
+    fixedN(mut &b, 0x3FC00000, 4)               // 1.5
+    fixedN(mut &b, 0x4002000000000000, 8)       // 2.25
+    decimal(mut &b, false, 1234567891)          // 123456.7891
+    decimal(mut &b, true, 12345)                // -12.345
+    u8(mut &b, 8)                               // money 12.34: 123400 units, high half first
+    le(mut &b, 0, 4)
+    le(mut &b, 123400, 4)
+    short(mut &b, &bytesOf(&"ab   "))
+    short(mut &b, &[byte('c'), 'a', 'f', 0xe9])     // café in code page 1252
+    short(mut &b, &utf16(&"ab"))
+    short(mut &b, &utf16(&"αβ 😀"))
+    short(mut &b, &[byte(1), 2, 3, 4])
+    short(mut &b, &[byte(0xff), 0])
+    fixedN(mut &b, DAYS_0001_TO_2024_02_29, 3)
+    fixedN(mut &b, 47655123, 4)                 // 13:14:15.123 in ms
+    u8(mut &b, 8)
+    le(mut &b, 476551234567, 5)                 // 13:14:15.1234567 in 100 ns
+    le(mut &b, DAYS_0001_TO_2024_02_29, 3)
+    u8(mut &b, 10)
+    le(mut &b, 476551234567, 5)
+    le(mut &b, DAYS_0001_TO_2024_02_29, 3)
+    le(mut &b, 0, 2)                            // +00:00
+    u8(mut &b, 8)
+    le(mut &b, DAYS_1900_TO_2024_02_29, 4)
+    le(mut &b, (47655 * 300) + 37, 4)           // 13:14:15.123 (37 ticks of 1/300 s)
+    u8(mut &b, 4)
+    le(mut &b, DAYS_1900_TO_2024_02_29, 2)
+    le(mut &b, 13 * 60 + 14, 2)
+    u8(mut &b, 16)
+    for x in [0xff, 0x19, 0x96, 0x6f, 0x86, 0x8b, 0x11, 0xd0, 0xb4, 0x2d, 0x00, 0xc0, 0x4f, 0xc9, 0x64, 0xff] { u8(mut &b, x) }
+    plpUnknown(mut &b, &bytesOf(&"chunked value"))
+    plpUnknown(mut &b, &utf16(&"long text"))
+    plpUnknown(mut &b, &[byte(0xaa), 0xbb, 0xcc, 0xdd])
+    // all NULL (a ROW: SQL Server takes no NBCROW in a bulk load, 4804)
+    u8(mut &b, tds.TK_ROW)
+    for k in 0..10 { nullByte(mut &b) }
+    for k in 0..6 { nullShort(mut &b) }
+    for k in 0..7 { nullByte(mut &b) }
+    for k in 0..3 { nullPlp(mut &b) }
+    return b
+}
+
+// ---- running
+
+fn cellText(c: &tds.Column, v: &tds.Cell): str {
+    match v {
+        tds.Cell.Null { return "NULL" }
+        tds.Cell.Bytes(b) {
+            var s = "0x"
+            for i in 0..len(b) { s = s + strings.padLeft(strings.toUpperAscii(&strings.hex(int(b[i]))), 2, '0') }
+            return s
+        }
+        else { return tds.cellText(c, v).unwrapOr("?") }
+    }
+}
+
+// A reply's errors and INFOs by number, else its count ("(n)").
+fn said(r: Result[tds.Reply, Error]): str {
+    match r {
+        Ok(rep) {
+            var parts: []str = []
+            for e in rep.errors { append(mut &parts, "error " + e.number.toStr()) }
+            for i in rep.infos { if i.number != 5701 && i.number != 5703 { append(mut &parts, "info " + i.number.toStr()) } }
+            if len(parts) > 0 { return strings.join(&parts, " / ") }
+            return "(" + rep.affected.toStr() + ")"
+        }
+        Err(e) { return "failed " + e.code.toStr() + " " + e.msg }
+    }
+}
+
+// Whether a reply's DONE says an error (SQL Server's for a load it did not make, without a message).
+fn doneErr(r: &Result[tds.Reply, Error]): bool {
+    match r {
+        Ok(x) {
+            for d in x.dones { if (d.status & tds.DONE_ERROR) != 0 { return true } }
+            return false
+        }
+        Err(_) { return false }
+    }
+}
+
+// The rows of a query, a line each: values joined by |.
+fn rows(s: mut &tds.Session, sql: &str): []str {
+    var out: []str = []
+    match s.batch(sql.toStr()) {
+        Ok(rep) {
+            for e in rep.errors { append(mut &out, "error " + e.number.toStr() + " " + e.text) }
+            for rs in rep.results {
+                for r in rs.rows {
+                    var cells: []str = []
+                    for i in 0..len(r) { append(mut &cells, cellText(&rs.columns[i], &r[i])) }
+                    append(mut &out, strings.join(&cells, "|"))
+                }
+            }
+        }
+        Err(e) { append(mut &out, "failed " + e.msg) }
+    }
+    return out
+}
+
+fn one(s: mut &tds.Session, sql: &str): str {
+    let r = rows(s, sql)
+    return if len(r) > 0 { r[0] } else { "none" }
+}
+
+// INSERT BULK, then the message.
+fn load(s: mut &tds.Session, stmt: &str, msg: &[]byte): str {
+    let rep = s.batch(stmt.toStr())
+    let de = doneErr(&rep)
+    var a = said(rep)
+    if a != "(-1)" && a != "(0)" { return a }
+    if de { a = "done error" }
+    match s.sendPart(tds.PT_BULK, msg, true) {
+        Ok(_) {}
+        Err(e) { return "failed " + e.msg }
+    }
+    let r = s.partReply()
+    let de2 = doneErr(&r)
+    var b = said(r)
+    if b == "(-1)" && de2 { b = "done error" }
+    return if a == "done error" { a + " / " + b } else { b }
+}
+
+fn message(cols: &[]Col, rowBytes: &[]byte): []byte {
+    var b = colmetadata(cols)
+    for x in rowBytes { append(mut &b, x) }
+    done(mut &b)
+    return b
+}
+
+fn intRow(vals: &[]int): []byte {
+    var b: []byte = []
+    u8(mut &b, tds.TK_ROW)
+    for v in vals { fixedN(mut &b, v, 4) }
+    return b
+}
+
+fn tests(s: mut &tds.Session) {
+    let setup = ["DROP TABLE IF EXISTS bt", "DROP TABLE IF EXISTS bk", "DROP TABLE IF EXISTS bc",
+        "CREATE TABLE bt (id int IDENTITY(1,1) PRIMARY KEY, ti tinyint, si smallint, i int, bi bigint, b bit, r real, f float, dc decimal(18,4), nm numeric(10,3), mo money, c char(5), vc varchar(50), vmax varchar(max), nc nchar(4), nv nvarchar(40), nvmax nvarchar(max), bn binary(4), vb varbinary(16), vbmax varbinary(max), dt date, tm time(3), d2 datetime2(7), dto datetimeoffset(7), dtm datetime, sdt smalldatetime, g uniqueidentifier, df int DEFAULT 42, nn nvarchar(10) NOT NULL DEFAULT N'x')",
+        "CREATE TABLE bk (id int PRIMARY KEY, n int)"]
+    var ok = true
+    for q in setup {
+        let r = said(s.batch(q.toStr()))
+        if strings.startsWith(&r, "error") || strings.startsWith(&r, "failed") {
+            println(q + ": " + r)
+            ok = false
+        }
+    }
+    println(if ok { "setup ok" } else { "setup failed" })
+    let cols = allCols()
+    println("all types: " + load(s, &insertBulk(&"bt", &cols, &""), &message(&cols, &allRows())))
+    for r in rows(s, &"SELECT id, ti, si, i, bi, b, r, f, dc, nm, mo, c, vc, vmax, nc, nv, nvmax, bn, vb, vbmax, dt, tm, d2, dto, dtm, sdt, g, df, nn FROM bt ORDER BY id") { println(r) }
+
+    // NULL into a column with a DEFAULT: the default, unless KEEP_NULLS
+    let dn = [col(&"df", &"int", &[byte(0x26), 4]), notNull(col(&"nn", &"nvarchar(10)", &withColl(0xe7, 20)))]
+    var nulls: []byte = []
+    u8(mut &nulls, tds.TK_ROW)
+    nullByte(mut &nulls)
+    nullShort(mut &nulls)
+    var onlyDf: []byte = []
+    u8(mut &onlyDf, tds.TK_ROW)
+    nullByte(mut &onlyDf)
+    println("keep nulls: " + load(s, &insertBulk(&"bt", &[col(&"df", &"int", &[byte(0x26), 4])], &" with (KEEP_NULLS)"),
+                                  &message(&[col(&"df", &"int", &[byte(0x26), 4])], &onlyDf)))
+    for r in rows(s, &"SELECT id, df, i FROM bt WHERE id = 3") { println(r) }
+    println("not null with keep nulls: " + load(s, &insertBulk(&"bt", &dn, &" with (KEEP_NULLS)"), &message(&dn, &nulls)))
+    println("count after: " + one(s, &"SELECT COUNT(*) FROM bt"))
+
+    // an identity column named: its values kept, and the identity goes on past them
+    let ic = [notNull(col(&"id", &"int", &[byte(0x26), 4])), col(&"i", &"int", &[byte(0x26), 4])]
+    var ir = intRow(&[99, 1])
+    for x in intRow(&[100, 2]) { append(mut &ir, x) }
+    println("identity kept: " + load(s, &insertBulk(&"bt", &ic, &""), &message(&ic, &ir)))
+    let ins = said(s.batch("INSERT INTO bt (i) VALUES (3)"))
+    println("next identity: " + one(s, &"SELECT MAX(id) FROM bt"))
+
+    // a duplicate key in the third of five rows: none loaded, the connection usable
+    let kc = [notNull(col(&"id", &"int", &[byte(0x26), 4])), col(&"n", &"int", &[byte(0x26), 4])]
+    var kr: []byte = []
+    for k in [1, 2, 1, 4, 5] { for x in intRow(&[k, k * 10]) { append(mut &kr, x) } }
+    println("error part way: " + load(s, &insertBulk(&"bk", &kc, &""), &message(&kc, &kr)))
+    println("rows after error: " + one(s, &"SELECT COUNT(*) FROM bk"))
+    println("usable: " + one(s, &"SELECT 1"))
+
+    // in a transaction: part of it
+    var tr: []byte = []
+    for k in [1, 2, 3] { for x in intRow(&[k, k]) { append(mut &tr, x) } }
+    let b1 = said(s.batch("BEGIN TRANSACTION"))
+    let l1 = load(s, &insertBulk(&"bk", &kc, &""), &message(&kc, &tr))
+    let c1 = one(s, &"SELECT COUNT(*) FROM bk")
+    let t1 = one(s, &"SELECT @@TRANCOUNT")
+    let r1 = said(s.batch("ROLLBACK TRANSACTION"))
+    println("in a transaction: " + l1 + " / count " + c1 + " / trancount " + t1 + " / after rollback " + one(s, &"SELECT COUNT(*) FROM bk"))
+    // an error in one: the load undone, the transaction goes on
+    let b2 = said(s.batch("BEGIN TRANSACTION; INSERT INTO bk VALUES (1, 1), (2, 2)"))
+    let l2 = load(s, &insertBulk(&"bk", &kc, &""), &message(&kc, &tr))
+    let t2 = one(s, &"SELECT @@TRANCOUNT")
+    let c2 = one(s, &"SELECT COUNT(*) FROM bk")
+    let r2 = said(s.batch("ROLLBACK TRANSACTION"))
+    println("error in a transaction: " + l2 + " / trancount " + t2 + " / count " + c2)
+
+    // many packets: lib/tds's writer, its packets sent as they are made
+    let mk = said(s.batch("DROP TABLE IF EXISTS bk2; CREATE TABLE bk2 (id int PRIMARY KEY, n bigint, s nvarchar(400))"))
+    match s.batch("SELECT TOP 0 id, n, s FROM bk2") {
+        Ok(rep) {
+            let pad = strings.repeat("x", 200)
+            var first: [][]sqldialect.Value = []
+            for k in 1..11 { append(mut &first, [sqldialect.Value.Int(k), sqldialect.Value.Int(k), sqldialect.Value.Text(pad + k.toStr())]) }
+            var bw = tds.bulkWriter("bk2", &rep.results[0].columns, &first, &sqlserver.bulkOptions(), &s.collation).unwrap()
+            let acc = said(s.batch(bw.statement))
+            var k = 11
+            while k <= 5000 {
+                var more: [][]sqldialect.Value = []
+                for j in k..min(k + 100, 5001) { append(mut &more, [sqldialect.Value.Int(j), sqldialect.Value.Int(j), sqldialect.Value.Text(pad + "")]) }
+                k += 100
+                bw.add(&more).unwrap()
+                s.bulkSend(mut &bw, false).unwrap()
+            }
+            bw.end()
+            s.bulkSend(mut &bw, true).unwrap()
+            println("many packets: " + said(s.partReply()) + " / " + one(s, &"SELECT COUNT(*), SUM(n), SUM(LEN(s)) FROM bk2"))
+        }
+        Err(e) { println("many packets: failed " + e.msg) }
+    }
+
+    // ended by the client (IGNORE): nothing loaded
+    let ig = said(s.batch(insertBulk(&"bk", &kc, &"")))
+    var part = colmetadata(&kc)
+    for k in 1..2001 { for x in intRow(&[k, k]) { append(mut &part, x) } }
+    let sent = s.sendPart(tds.PT_BULK, &part, false)
+    let cr = s.cancelPart(tds.PT_BULK)
+    let de = doneErr(&cr)
+    var cancelled = said(cr)
+    if cancelled == "(-1)" && de { cancelled = "done error" }
+    println("ignored: " + cancelled + " / count " + one(s, &"SELECT COUNT(*) FROM bk") + " / usable " + one(s, &"SELECT 1"))
+
+    // errors
+    println("no table: " + said(s.batch("insert bulk nosuch ([a] int)")))
+    println("two statements: " + said(s.batch("insert bulk bk ([id] int); select 1")))
+    println("twice: " + said(s.batch("insert bulk bk ([id] int, [id] int)")))
+    let lc = [col(&"vc", &"varchar(80)", &withColl(0xa7, 80))]
+    var lr: []byte = []
+    u8(mut &lr, tds.TK_ROW)
+    short(mut &lr, &bytesOf(&strings.repeat("y", 60)))
+    println("too long: " + load(s, &insertBulk(&"bt", &lc, &""), &message(&lc, &lr)))
+    // a CHECK constraint: SQL Server checks it only WITH (CHECK_CONSTRAINTS); lexdb always
+    let ck = said(s.batch("DROP TABLE IF EXISTS bc; CREATE TABLE bc (n int CHECK (n > 0))"))
+    let nc = [col(&"n", &"int", &[byte(0x26), 4])]
+    println("check: " + load(s, &insertBulk(&"bc", &nc, &""), &message(&nc, &intRow(&[-1]))) + " / " +
+            load(s, &insertBulk(&"bc", &nc, &" with (CHECK_CONSTRAINTS)"), &message(&nc, &intRow(&[-2]))) + " / count " + one(s, &"SELECT COUNT(*) FROM bc"))
+
+    // what SqlBulkCopy asks first: FMTONLY's columns, then the collations
+    match s.batch("select @@trancount; SET FMTONLY ON select * from [dbo].[bt] SET FMTONLY OFF exec ..sp_tablecollations_100 N'[dbo].[bt]'") {
+        Ok(rep) {
+            var parts: []str = []
+            if len(rep.results) >= 3 {
+                append(mut &parts, "trancount " + cellText(&rep.results[0].columns[0], &rep.results[0].rows[0][0]))
+                for c in rep.results[1].columns {
+                    if c.name == "id" || c.name == "dc" || c.name == "vc" || c.name == "nv" || c.name == "d2" || c.name == "nn" {
+                        var t = c.name + " " + c.typeName()
+                        if c.tdsType == tds.T_INT4 { t = t + " fixed " + c.size.toStr() }
+                        else if c.typeName() == "decimal" { t = t + "(" + c.precision.toStr() + "," + c.scale.toStr() + ")" }
+                        else if c.typeName() == "datetime2" { t = t + "(" + c.scale.toStr() + ")" }
+                        else { t = t + " " + c.size.toStr() }
+                        if (c.flags & 1) == 0 { t = t + " notnull" }
+                        if (c.flags & 0x10) != 0 { t = t + " identity" }
+                        append(mut &parts, t)
+                    }
+                }
+                var colls: []str = []
+                for r in rep.results[2].rows {
+                    let nm = cellText(&rep.results[2].columns[1], &r[1])
+                    if nm == "id" || nm == "vc" || nm == "nn" {
+                        append(mut &colls, nm + " " + (if cellText(&rep.results[2].columns[3], &r[3]) == "NULL" { "-" } else { cellText(&rep.results[2].columns[3], &r[3]) }))
+                    }
+                }
+                append(mut &parts, "collations " + len(colls).toStr() + ": " + strings.join(&colls, " / "))
+            } else {
+                append(mut &parts, said(Ok(rep)))
+            }
+            println("fmtonly: " + strings.join(&parts, " / "))
+        }
+        Err(e) { println("fmtonly: failed " + e.msg) }
+    }
+    // what bcp asks first
+    var ds: []str = []
+    for r in rows(s, &"exec sp_describe_first_result_set N'select * from bt'") {
+        let f = strings.split(&r, "|")
+        if f[2] == "id" || f[2] == "dc" || f[2] == "vc" || f[2] == "nn" {
+            append(mut &ds, f[2] + " " + f[5] + " " + f[6] + " " + f[3] + (if f[27] == "1" { " identity" } else { "" }) + " " + f[35])
+        }
+    }
+    println("describe: " + strings.join(&ds, " / "))
+    // a column the table has not: INSERT BULK ends with DONE's error flag
+    // and no message, and so does the load (SQL Server closes the
+    // connection at the next INSERT BULK)
+    let zc = [col(&"zz", &"int", &[byte(0x26), 4])]
+    println("no column: " + load(s, &insertBulk(&"bk", &zc, &""), &message(&zc, &intRow(&[1]))) + " / usable " + one(s, &"SELECT 1"))
+}
+
+fn run(dsn: &str) {
+    let st = sqlserver.parseConnString(dsn.toStr()).unwrap()
+    match tds.open(&st.config) {
+        Ok(s0) {
+            var s = s0
+            tests(mut &s)
+        }
+        Err(e) { println("connect: " + e.msg) }
+    }
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(sc: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        lexdb_wire.configure(&st, &lexdb_wire.noAuth()).unwrap()
+        let f = sc.start(lexdb_tds.acceptLoop, lexdb_tds.AcceptArg{ln: ln, st: st})
+        run(&("Server=127.0.0.1," + addr[10..len(addr)] + ";UID=sa;PWD=x;Encrypt=no"))
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    // LEXDB_MSSQL: the oracle, for the expect lines
+    match os.env("LEXDB_MSSQL") {
+        Some(dsn) { run(&dsn) }
+        None {
+            lexdb_store.run(lexdb_disk.sim(37), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024,
+                                                                     snapNodes: 50000, bufferedPages: false}, body).unwrap()
+        }
+    }
+}

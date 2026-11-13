@@ -427,7 +427,8 @@ pub fn coerce(v: Val, t: &lexdb_sql.TypeName): Result[Val, DbErr] {
             else { s = text(&v) }
         }
         if t.oid == lexdb_sql.OID_BPCHAR { return bpcharOf(s, t.len, false) }
-        if t.len > 0 && strings.runeCount(&s) > t.len {
+        // (characters are counted only when the bytes could be too many)
+        if t.len > 0 && len(s) > t.len && strings.runeCount(&s) > t.len {
             return Err(e("22001", "value too long for type character varying(" + t.len.toStr() + ")"))
         }
         return Ok(Val.Text(s))
@@ -21042,9 +21043,12 @@ fn noInput(): CopyInput { return CopyInput{have: false, data: "", fail: "", prot
 
 // A part of COPY FROM's data as the client sent it: end, the last (its
 // CopyDone, or CopyFail's message in fail; proto: not a COPY message).
-pub type CopyPart = record { pub data: str; pub end: bool; pub fail: str; pub proto: bool }
+// INSERT BULK's parts (copy.bulk) carry rows instead of data: a value per
+// target column, of the type the client sent; their fail is an error's
+// SQLSTATE, a colon, then its message.
+pub type CopyPart = record { pub rows: [][]Val; pub data: str; pub end: bool; pub fail: str; pub proto: bool }
 
-fn noPull(): CopyPart { return CopyPart{data: "", end: true, fail: "", proto: false} }
+fn noPull(): CopyPart { return CopyPart{rows: [], data: "", end: true, fail: "", proto: false} }
 
 fn copyStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int,
             lim: Limits, pc: mut &PlanCache, input: &CopyInput, out: &fn(int, &[]byte): bool, pull: &fn(): CopyPart): Result[Res, DbErr] {
@@ -21053,6 +21057,7 @@ fn copyStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
         if input.stream { return copyStream(st, txn, s, params, ptypes, lim, out) }
         return copyOut(st, txn, s, params, ptypes, lim, pc)
     }
+    if s.copy.bulk { return bulkStmt(st, txn, s, pull) }
     let t = try needTable(st, txn, &s.table)
     try needRel(st, txn, &(try whoNow(st, txn)), &t.name, &"a", &"table")
     var targets: []int = []
@@ -21103,9 +21108,9 @@ fn copyStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
     var given = false
     let next = fn(): CopyPart {
         if input.pull { return pull() }
-        if given { return CopyPart{data: "", end: true, fail: "", proto: false} }
+        if given { return CopyPart{rows: [], data: "", end: true, fail: "", proto: false} }
         given = true
-        return CopyPart{data: input.data, end: true, fail: input.fail, proto: input.proto}
+        return CopyPart{rows: [], data: input.data, end: true, fail: input.fail, proto: input.proto}
     }
     var header = s.copy.header
     while true {
@@ -21182,6 +21187,76 @@ fn copyStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
     }
     // what follows an end marker (\.) is not read; the wire drops it
     try fkFinish(st, txn, &fw, mut &later)
+    return Ok(Res{cols: [], rows: [], tag: "COPY " + count.toStr(), hasRows: false, copy: COPY_NONE})
+}
+
+// T-SQL's bulk load (INSERT BULK and the rows after it, lexdb_tds; design/
+// lexdb-tds.md section 14): the client's rows from pull as they arrive, a
+// value per column of s.names in the type the client sent, inserted as
+// COPY's are (insertOne: each value made its column's type as an INSERT's,
+// the rest of the columns their defaults, the table's keys and checks).
+// Without KEEP_NULLS a NULL for a column with a DEFAULT (or an identity)
+// takes that, as SQL Server's. An identity column given values keeps them,
+// and goes on past the largest (as SET IDENTITY_INSERT). The tag: COPY n.
+fn bulkStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, pull: &fn(): CopyPart): Result[Res, DbErr] {
+    let t = try needTable(st, txn, &s.table)
+    try needRel(st, txn, &(try whoNow(st, txn)), &t.name, &"a", &"table")
+    var targets: []int = []
+    for n in s.names {
+        let i = colIndex(&t.cols, &n)
+        if i < 0 || t.cols[i].name == ROWID { return Err(e("42703", "column \"" + n + "\" of relation \"" + lexdb_sql.baseName(&t.name) + "\" does not exist")) }
+        append(mut &targets, i)
+    }
+    let defs = try defaultsOf(st, txn, &t)
+    let fw = try fkTables(st, txn, &t, true, false)
+    var later: []FkLater = []
+    var up = noUpsert()
+    up.idBump = true
+    // the columns whose NULL takes the default; a bit sent for a column not boolean
+    var dflt: []bool = []
+    var notBool: []bool = []
+    for i in targets {
+        append(mut &dflt, !s.copy.keepNulls && (t.cols[i].def.isSome() || len(t.cols[i].seq) > 0))
+        append(mut &notBool, t.cols[i].typ.kind != lexdb_sql.K_BOOL)
+    }
+    let noCols: []lexdb_sql.ColDef = []
+    let none: []Val = []
+    let noSubs: []SubRes = []
+    let noEnv = Env{cols: &noCols, row: &none, aggs: &none, params: &none, subs: &noSubs, cur: &none, seq: None}
+    var count = 0
+    while true {
+        var part = pull()
+        if part.fail != "" {
+            let colon = strings.indexOf(&part.fail, ":", 0)
+            if colon >= 5 && colon <= 8 { return Err(e(part.fail[0..colon].toStr(), part.fail[colon + 1..len(part.fail)].toStr())) }
+            return Err(e("08P01", part.fail))
+        }
+        for r in 0..len(part.rows) {
+            var vs = replace(mut &part.rows[r], [])
+            if len(vs) != len(targets) { return Err(e("08P01", "a bulk load's row of " + len(vs).toStr() + " values for " + len(targets).toStr() + " columns")) }
+            for k in 0..len(vs) {
+                match vs[k] {
+                    Val.Null { if dflt[k] { vs[k] = try defAt(st, txn, &defs, &t, targets[k]) } }
+                    // SQL Server's bit into a number or a string: 1 or 0
+                    Val.Bool(b) { if notBool[k] { vs[k] = Val.Int(if b { 1 } else { 0 }) } }
+                    else {}
+                }
+            }
+            match insertOne(st, txn, &t, &targets, &vs, &defs, &fw, mut &later, mut &up, &noEnv) {
+                Ok(_) {}
+                Err(x) { return Err(within(x, "bulk load of " + lexdb_sql.baseName(&s.table) + ", row " + (count + 1).toStr())) }
+            }
+            count += 1
+        }
+        if part.end { break }
+    }
+    try fkFinish(st, txn, &fw, mut &later)
+    for j in 0..len(up.idCols) {
+        let d = try needSeq(st, txn, &t.cols[up.idCols[j]].seq)
+        let v = up.idMax[j]
+        let next = try seqPeek(st, txn, &d)
+        if (d.inc > 0 && v >= next) || (d.inc < 0 && v <= next) { try setVal(st, &d, v, true) }
+    }
     return Ok(Res{cols: [], rows: [], tag: "COPY " + count.toStr(), hasRows: false, copy: COPY_NONE})
 }
 
@@ -30264,6 +30339,110 @@ fn sqlTypeOf(t: &lexdb_sql.TypeName, collName: &str): SqlT {
         return sqlT(&"nvarchar", -1, 0, 0, &coll)
     }
     return sqlT(&"nvarchar", -1, 0, 0, &coll)
+}
+
+// A column as SQL Server describes it (lexdb_tds: SET FMTONLY ON, sp_prepare's
+// metadata, sp_describe_first_result_set, sp_tablecollations_100 and INSERT
+// BULK; design/lexdb-tds.md section 14): its label, SQL Server's type for it
+// (sqlTypeOf: name, system_type_id, max_length (-1 for max), precision, scale,
+// collation name, "" none), whether it takes NULL, whether it is an identity,
+// whether it has a default, and its lexdb type.
+pub type DeclCol = record {
+    pub name: str
+    pub typ: str
+    pub sys: int
+    pub maxLen: int
+    pub prec: int
+    pub scale: int
+    pub coll: str
+    pub nullable: bool
+    pub identity: bool
+    pub hasDefault: bool
+    pub oid: int
+}
+
+fn declOf(name: &str, t: &lexdb_sql.TypeName, coll: &str, nullable: bool, identity: bool, hasDefault: bool): DeclCol {
+    let q = sqlTypeOf(t, coll)
+    return DeclCol{name: name.toStr(), typ: q.name, sys: q.sys, maxLen: q.maxLen, prec: q.prec, scale: q.scale, coll: q.coll,
+                   nullable: nullable, identity: identity, hasDefault: hasDefault, oid: t.oid}
+}
+
+// A table's columns (the hidden key not), as SQL Server describes them; a
+// primary key's are not NULL.
+fn tableDecls(t: &Table): []DeclCol {
+    var out: []DeclCol = []
+    for i in 0..len(t.cols) {
+        let c = &t.cols[i]
+        if c.name == ROWID { continue }
+        var inPk = false
+        for k in t.pk { if k == i { inPk = true } }
+        append(mut &out, declOf(&(if len(c.spell) > 0 { c.spell } else { c.name }), &c.typ, &c.coll, !c.notNull && !inPk,
+                                c.identity == lexdb_sql.ID_ALWAYS || c.identity == lexdb_sql.ID_BY_DEFAULT, c.def.isSome() || len(c.seq) > 0))
+    }
+    return out
+}
+
+// A table by its name, read in the session's transaction block (a table it
+// made is there), else in a transaction of its own.
+fn (s: mut &Session) tableNamed(name: &str): Result[Table, DbErr] {
+    if len(s.txn) > 0 {
+        let st = s.st
+        return needTable(&st, mut &s.txn[0], name)
+    }
+    var t = lexdb_store.begin()
+    s.setUp(mut &t)
+    let r = needTable(&s.st, mut &t, name)
+    s.st.abort(t)
+    return r
+}
+
+// A table's columns as SQL Server describes them (INSERT BULK,
+// sp_tablecollations_100); 42P01 when there is none of the name.
+pub fn (s: mut &Session) tableDecl(name: &str): Result[[]DeclCol, DbErr] {
+    let t = try s.tableNamed(name)
+    return Ok(tableDecls(&t))
+}
+
+// The columns stmt returns as SQL Server describes them: describe's, each
+// as its lexdb type (and SQL Server's, where it carries one) says; but a
+// query of one table gives a column of that table, by name and type, the
+// table's declaration (varchar(100), decimal(12,2), NOT NULL, IDENTITY), as
+// SQL Server describes a query's columns from where they come.
+pub fn (s: mut &Session) describeDecl(stmt: &lexdb_sql.Stmt): Result[[]DeclCol, DbErr] {
+    let none: []int = []
+    let outs = try s.describe(stmt, &none)
+    var tab: []DeclCol = []
+    var tabNames: []str = []
+    var tabOids: []int = []
+    if stmt.kind == lexdb_sql.S_SELECT && len(stmt.from) == 1 && stmt.from[0].sub < 0 && len(stmt.srf) == 0 && stmt.setop == 0 {
+        match s.tableNamed(&stmt.from[0].table) {
+            Ok(t) {
+                tab = tableDecls(&t)
+                for c in t.cols {
+                    if c.name != ROWID {
+                        append(mut &tabNames, c.name)
+                        append(mut &tabOids, c.typ.oid)
+                    }
+                }
+            }
+            Err(_) {}
+        }
+    }
+    var out: []DeclCol = []
+    for o in outs {
+        var found = -1
+        for k in 0..len(tabNames) {
+            if tabNames[k] == o.name && tabOids[k] == o.oid { found = k }
+        }
+        if found >= 0 {
+            let d = &tab[found]
+            append(mut &out, DeclCol{name: o.label(), typ: d.typ, sys: d.sys, maxLen: d.maxLen, prec: d.prec, scale: d.scale, coll: d.coll,
+                                     nullable: d.nullable, identity: d.identity, hasDefault: d.hasDefault, oid: d.oid})
+        } else {
+            append(mut &out, declOf(&o.label(), &outType(&o), &o.coll, true, false, false))
+        }
+    }
+    return Ok(out)
 }
 
 // A table's indexes as SQL Server numbers them: the primary key clustered

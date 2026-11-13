@@ -57,10 +57,17 @@ pub type Event = record {
     pub number: int         // EV_ERROR, EV_INFO: SQL Server's number, severity and state
     pub sev: int
     pub state: int
+    // EV_ROWS of metadata only (SET FMTONLY ON, sp_prepare's): the columns as
+    // SQL Server describes them, no rows (cols and rows empty)
+    pub decl: []lexdb_exec.DeclCol
 }
 
+// An event to put in an emptied place (a DONE without a count).
+pub fn doneEvent(): Event { return ev0(EV_DONE) }
+
 fn ev0(kind: int): Event {
-    return Event{kind: kind, cols: [], rows: [], count: -1, cmd: 0, error: false, err: lexdb_base.err("", ""), tran: 0, number: 0, sev: 0, state: 0}
+    return Event{kind: kind, cols: [], rows: [], count: -1, cmd: 0, error: false, err: lexdb_base.err("", ""), tran: 0, number: 0, sev: 0, state: 0,
+                 decl: []}
 }
 
 // An error as SQL Server tells it: its number, text, severity and state
@@ -83,6 +90,8 @@ pub const CMD_SELECT = 0xC1
 pub const CMD_INSERT = 0xC3
 pub const CMD_DELETE = 0xC4
 pub const CMD_UPDATE = 0xC5
+pub const CMD_BULK = 0xF0       // a bulk load's rows (SQL Server's BULK INSERT)
+pub const CMD_SETOPT = 0xFD     // what SQL Server's DONE gives INSERT BULK
 
 fn cmdOf(kind: int): int {
     if kind == lexdb_sql.S_SELECT { return CMD_SELECT }
@@ -194,12 +203,21 @@ pub type State = record {
     doomed: bool                // XACT_ABORT's error in a TRY block: the transaction can only be rolled back
     temps: []str                // the #temporary tables made (dropped when the connection ends or is reset)
     tableVars: []str            // the batch's table variables (#@name), dropped after it
+    pub fmtOnly: bool           // SET FMTONLY ON: a SELECT's columns only, nothing else run
+    pub bulk: []BulkReq         // an INSERT BULK accepted: its rows come next (lexdb_tds), one at most
 }
+
+// An INSERT BULK accepted (design/lexdb-tds.md, section 14): the table, the
+// columns the rows give, KEEP_NULLS.
+// bad: a column the table has not (SQL Server's DONE then says an error,
+// with no message, and so does the load's).
+pub type BulkReq = record { pub table: str; pub cols: []str; pub keepNulls: bool; pub bad: bool }
 
 pub fn newState(spid: int): State {
     return State{nocount: false, xactAbort: false, implicitTx: false, quotedIdent: true, postgres: false, trancount: 0,
                  rowcount: 0, error: 0, spid: spid, saves: [], committed: false, tryDepth: 0, jump: false,
-                 pending: Caught{number: 0, message: "", severity: 0, state: 0}, caught: [], doomed: false, temps: [], tableVars: []}
+                 pending: Caught{number: 0, message: "", severity: 0, state: 0}, caught: [], doomed: false, temps: [], tableVars: [],
+                 fmtOnly: false, bulk: []}
 }
 
 // An error: to the client, or (in a TRY block) to its CATCH block.
@@ -330,8 +348,40 @@ fn startsTx(s: &lexdb_sql.Stmt): bool {
     return true
 }
 
+fn noPull(): lexdb_exec.CopyPart { return lexdb_exec.CopyPart{rows: [], data: "", end: true, fail: "", proto: false} }
+
 // Runs one statement of lexdb's parser; false when the batch ends.
 fn (st: mut &State) sqlStmt(sess: mut &lexdb_exec.Session, s: &lexdb_sql.Stmt, f: mut &Frame, ev: mut &[]Event, quiet: bool): bool {
+    if st.fmtOnly && !txStmt(s.kind) { return st.fmtStmt(sess, s, ev) }
+    return st.sqlStmtWith(sess, s, f, ev, quiet, noPull)
+}
+
+// SET FMTONLY ON: a SELECT gives its columns as SQL Server describes them,
+// and no rows; nothing is run.
+fn (st: mut &State) fmtStmt(sess: mut &lexdb_exec.Session, s: &lexdb_sql.Stmt, ev: mut &[]Event): bool {
+    if s.kind != lexdb_sql.S_SELECT || len(s.assign) > 0 {
+        doneEv(ev, -1, cmdOf(s.kind), false)
+        return true
+    }
+    match sess.describeDecl(s) {
+        Ok(cols) {
+            var x = ev0(EV_ROWS)
+            x.decl = cols
+            append(ev, x)
+            doneEv(ev, if st.nocount { -1 } else { 0 }, CMD_SELECT, false)
+            return true
+        }
+        Err(e) {
+            st.failErr(ev, &e, CMD_SELECT)
+            return st.tryDepth > 0 || !endsBatch(&e)
+        }
+    }
+}
+
+// sqlStmt; a bulk load's (s a COPY of copy.bulk) rows from pull.
+fn (st: mut &State) sqlStmtWith(sess: mut &lexdb_exec.Session, s: &lexdb_sql.Stmt, f: mut &Frame, ev: mut &[]Event, quiet: bool,
+                                pull: &fn(): lexdb_exec.CopyPart): bool {
+    let bulk = s.kind == lexdb_sql.S_COPY && s.copy.bulk
     if st.implicitTx && sess.status() == 'I' && startsTx(s) {
         match simple(sess, &"BEGIN") {
             Ok(_) {}
@@ -345,17 +395,25 @@ fn (st: mut &State) sqlStmt(sess: mut &lexdb_exec.Session, s: &lexdb_sql.Stmt, f
     if inTx {
         let sp = simple(sess, &("SAVEPOINT " + SAVE))
     }
-    let cmd = cmdOf(s.kind)
+    let cmd = if bulk { CMD_BULK } else { cmdOf(s.kind) }
     // as SQL Server: an INSERT, UPDATE or DELETE runs in a transaction of
     // its own, nested, so @@TRANCOUNT inside it is one more
     if s.kind == lexdb_sql.S_INSERT || s.kind == lexdb_sql.S_UPDATE || s.kind == lexdb_sql.S_DELETE {
         f.vals[0] = Val.Int(max(st.trancount, if sess.status() == 'I' { 0 } else { 1 }) + 1)
     }
     let oids = f.oids()
-    let r = sess.run(s, &f.vals, &oids)
+    let r = if bulk { sess.copyInFrom(s, pull) } else { sess.run(s, &f.vals, &oids) }
     if r.isErr() {
         let e = r.unwrapErr()
-        st.failErr(ev, &e, cmd)
+        if bulk && st.tryDepth == 0 {
+            // as SQL Server ends a bulk load: the error, then 3621
+            st.error = sqlNumber(&e.state)
+            errorEv(ev, &e)
+            caughtEv(ev, &Caught{number: 3621, message: "The statement has been terminated.", severity: 0, state: 0}, EV_INFO)
+            doneEv(ev, -1, cmd, true)
+        } else {
+            st.failErr(ev, &e, cmd)
+        }
         st.rowcount = 0
         if inTx {
             if (st.xactAbort || dooms(&e)) && st.tryDepth == 0 {
@@ -406,7 +464,7 @@ fn (st: mut &State) sqlStmt(sess: mut &lexdb_exec.Session, s: &lexdb_sql.Stmt, f
     }
     if res.tag == "COMMIT" { st.committed = true }
     if res.tag == "ROLLBACK" && !txStmt(s.kind) { st.committed = false }
-    doneEv(ev, if st.nocount { -1 } else { n }, cmd, false)
+    doneEv(ev, if st.nocount && !bulk { -1 } else { n }, cmd, false)
     // a #temporary table made: dropped with the connection
     if s.kind == lexdb_sql.S_CREATE && strings.startsWith(s.table, "#") && !strings.startsWith(s.table, "#@") { append(mut &st.temps, s.table) }
     return true
@@ -433,6 +491,30 @@ fn tsErr(n: int, msg: str): DbErr { return lexdb_base.err("TS" + n.toStr(), msg)
 // One statement of the batch; false when the batch ends.
 fn (st: mut &State) exec(sess: mut &lexdb_exec.Session, t: &lexdb_tsqlparse.TStmt, f: mut &Frame, ev: mut &[]Event): bool {
     if t.kind == lexdb_tsqlparse.TS_SQL { return st.sqlStmt(sess, &t.stmt[0], f, ev, false) }
+    if t.kind == lexdb_tsqlparse.TS_INSERTBULK {
+        // the table must be there (208); its columns are looked at when the rows come
+        match sess.tableDecl(&t.names[0]) {
+            Ok(decl) {
+                var cols: []str = []
+                var bad = false
+                for i in 1..len(t.names) {
+                    append(mut &cols, t.names[i])
+                    var k = -1
+                    for j in 0..len(decl) { if strings.toLowerAscii(&decl[j].name) == t.names[i] { k = j } }
+                    if k < 0 { bad = true }
+                }
+                st.bulk = [BulkReq{table: t.names[0], cols: cols, keepNulls: strings.contains(&t.value, "keep_nulls"), bad: bad}]
+                doneEv(ev, -1, CMD_SETOPT, bad)
+                return true
+            }
+            Err(e) {
+                // (SQL Server says 208 twice)
+                if sqlNumber(&e.state) == 208 { errorEv(ev, &e) }
+                st.failErr(ev, &e, 0)
+                return false
+            }
+        }
+    }
     if t.kind == lexdb_tsqlparse.TS_DECLARE {
         // DECLARE @a = x, @b = y counts one row, as SQL Server
         for i in 0..len(t.stmt) {
@@ -447,6 +529,7 @@ fn (st: mut &State) exec(sess: mut &lexdb_exec.Session, t: &lexdb_tsqlparse.TStm
             else if n == "xact_abort" { st.xactAbort = on }
             else if n == "implicit_transactions" { st.implicitTx = on }
             else if n == "quoted_identifier" { st.quotedIdent = on }
+            else if n == "fmtonly" { st.fmtOnly = on }
             else if n == "identity_insert" {
                 sess.setIdentityInsert(&(if on { t.names[1] } else { "" }))
                 break
@@ -569,7 +652,25 @@ pub fn run(sess: mut &lexdb_exec.Session, st: mut &State, sql: &str, f: mut &Fra
         doneEv(ev, -1, 0, false)
         return
     }
+    if len(b.stmts) > 1 {
+        for t in b.stmts {
+            if t.kind == lexdb_tsqlparse.TS_INSERTBULK {
+                st.fail(ev, Caught{number: 428, message: "Insert bulk cannot be used in a multi-statement batch.", severity: 16, state: 1}, 0)
+                return
+            }
+        }
+    }
     let r = st.block(sess, &b.stmts, f, ev)
+    if r == F_END {
+        // SET FMTONLY takes effect as the batch is compiled, as in SQL Server:
+        // a batch ended by an error (SqlBulkCopy's for a table that is not
+        // there) still leaves FMTONLY as its last SET FMTONLY says
+        for t in b.stmts {
+            if t.kind == lexdb_tsqlparse.TS_SETOPT {
+                for n in t.names { if n == "fmtonly" { st.fmtOnly = t.value == "on" } }
+            }
+        }
+    }
     // the batch's table variables go with it
     while len(st.tableVars) > 0 {
         let tv = pop(mut &st.tableVars)
@@ -946,6 +1047,39 @@ fn (st: mut &State) call(sess: mut &lexdb_exec.Session, t: &lexdb_tsqlparse.TStm
         doneEv(ev, -1, 0, false)
         return F_NEXT
     }
+    if proc == "sp_tablecollations_100" || proc == "sp_tablecollations_90" || proc == "sp_tablecollations" {
+        // a table's columns' collations (SqlBulkCopy's): none for no such table
+        var x = tableCollations(&[])
+        if len(vals) > 0 && !lexdb_exec.isNull(&vals[0]) {
+            match tableArg(&lexdb_exec.text(&vals[0])) {
+                Ok(name) {
+                    match sess.tableDecl(&name) {
+                        Ok(cols) { x = tableCollations(&cols) }
+                        Err(_) {}
+                    }
+                }
+                Err(_) {}
+            }
+        }
+        let n = len(x.rows)
+        append(ev, x)
+        doneEv(ev, if st.nocount { -1 } else { n }, CMD_SELECT, false)
+        return F_NEXT
+    }
+    if proc == "sp_describe_first_result_set" {
+        let sql = if len(vals) > 0 && !lexdb_exec.isNull(&vals[0]) { lexdb_exec.text(&vals[0]) } else { "" }
+        let none: []lexdb_tsqlparse.ParamDecl = []
+        match describeFirst(sess, st, &sql, &none) {
+            Ok(cols) {
+                let x = describeRows(&cols)
+                let n = len(x.rows)
+                append(ev, x)
+                doneEv(ev, if st.nocount { -1 } else { n }, CMD_SELECT, false)
+            }
+            Err(e) { st.failErr(ev, &e, 0) }
+        }
+        return F_NEXT
+    }
     if proc == "xp_msver" {
         var x = ev0(EV_ROWS)
         x.cols = [outCol(&"Index", lexdb_sql.OID_INT4), outCol(&"Name", lexdb_sql.OID_TEXT), outCol(&"Internal_Value", lexdb_sql.OID_INT4),
@@ -1061,3 +1195,145 @@ fn (st: mut &State) runPg(sess: mut &lexdb_exec.Session, sql: &str, ev: mut &[]E
         }
     }
 }
+
+// ---- bulk load and the metadata bulk-copy clients ask for first
+// (design/lexdb-tds.md, section 14)
+
+// The rows of the bulk load the last INSERT BULK accepted (st.bulk), from
+// pull as they arrive: one statement, as an INSERT is (a transaction of its
+// own, or under a savepoint in the open one; IMPLICIT_TRANSACTIONS begins
+// one); its row count, or its error then 3621, as SQL Server ends one.
+pub fn bulk(sess: mut &lexdb_exec.Session, st: mut &State, pull: &fn(): lexdb_exec.CopyPart, ev: mut &[]Event) {
+    var req = pop(mut &st.bulk)
+    st.bulk = []
+    var s = lexdb_sql.newStmt(lexdb_sql.S_COPY)
+    s.table = req.table
+    s.names = replace(mut &req.cols, [])
+    s.copy.from = true
+    s.copy.bulk = true
+    s.copy.keepNulls = req.keepNulls
+    var f = newFrame()
+    st.refresh(sess, mut &f)
+    let before = sess.status()
+    let go = st.sqlStmtWith(sess, &s, mut &f, ev, false, pull)
+    st.after(sess, before, ev)
+}
+
+// The columns sql's first statement returns, as SQL Server describes them
+// (sp_describe_first_result_set, sp_prepare's metadata): none for a
+// statement that returns none. params: its parameters (sp_prepare's).
+pub fn describeFirst(sess: mut &lexdb_exec.Session, st: &State, sql: &str, params: &[]lexdb_tsqlparse.ParamDecl): Result[[]lexdb_exec.DeclCol, DbErr] {
+    var f = newFrame()
+    for p in params { let k = f.add(&p.name, p.typ, Val.Null) }
+    let b = try lexdb_tsqlparse.parseBatch(sql, lexdb_sql.Dialect{tsql: true, quotedIdent: st.quotedIdent}, &f.names)
+    for t in b.stmts {
+        if t.kind == lexdb_tsqlparse.TS_SQL {
+            if t.stmt[0].kind != lexdb_sql.S_SELECT || len(t.stmt[0].assign) > 0 { return Ok([]) }
+            return sess.describeDecl(&t.stmt[0])
+        }
+    }
+    return Ok([])
+}
+
+// The TDS type a column of SQL Server's type goes as (its tds_type_id): a
+// fixed-length type when NOT NULL, else its nullable kind; text, ntext and
+// image as (max) types.
+pub fn tdsTypeOf(d: &lexdb_exec.DeclCol): int {
+    let fixed = !d.nullable
+    match d.typ {
+        "tinyint", "smallint", "int", "bigint" { return if fixed { d.sys } else { 0x26 } }
+        "bit" { return if fixed { 0x32 } else { 0x68 } }
+        "real", "float" { return if fixed { d.sys } else { 0x6D } }
+        "money", "smallmoney" { return if fixed { d.sys } else { 0x6E } }
+        "datetime", "smalldatetime" { return if fixed { d.sys } else { 0x6F } }
+        "text" { return 0xA7 }
+        "ntext" { return 0xE7 }
+        "image" { return 0xA5 }
+        else { return d.sys }
+    }
+}
+
+// The length TDS gives a column of SQL Server's type (its tds_length):
+// bytes, 65535 for a (max) type.
+pub fn tdsLenOf(d: &lexdb_exec.DeclCol): int {
+    if d.typ == "decimal" || d.typ == "numeric" { return 17 }
+    if d.typ == "xml" { return 8100 }
+    if d.maxLen < 0 || d.typ == "text" || d.typ == "ntext" || d.typ == "image" { return 65535 }
+    return d.maxLen
+}
+
+// SQL Server's name of a column's type with its length, precision or scale.
+fn typeText(d: &lexdb_exec.DeclCol): str {
+    let t = d.typ
+    if t == "varchar" || t == "char" || t == "varbinary" || t == "binary" { return t + "(" + (if d.maxLen < 0 { "max" } else { d.maxLen.toStr() }) + ")" }
+    if t == "nvarchar" || t == "nchar" { return t + "(" + (if d.maxLen < 0 { "max" } else { (d.maxLen / 2).toStr() }) + ")" }
+    if t == "decimal" || t == "numeric" { return t + "(" + d.prec.toStr() + "," + d.scale.toStr() + ")" }
+    if t == "time" || t == "datetime2" || t == "datetimeoffset" { return t + "(" + d.scale.toStr() + ")" }
+    return t.toStr()
+}
+
+// Whether the type carries a collation.
+fn textual(d: &lexdb_exec.DeclCol): bool {
+    let t = d.typ
+    return t == "varchar" || t == "char" || t == "nvarchar" || t == "nchar" || t == "text" || t == "ntext"
+}
+
+const DESCRIBE_COLS: []str = ["is_hidden:b", "column_ordinal:i", "name:s", "is_nullable:b", "system_type_id:i", "system_type_name:s",
+    "max_length:h", "precision:t", "scale:t", "collation_name:s", "user_type_id:i", "user_type_database:s", "user_type_schema:s",
+    "user_type_name:s", "assembly_qualified_type_name:s", "xml_collection_id:i", "xml_collection_database:s", "xml_collection_schema:s",
+    "xml_collection_name:s", "is_xml_document:b", "is_case_sensitive:b", "is_fixed_length_clr_type:b", "source_server:s",
+    "source_database:s", "source_schema:s", "source_table:s", "source_column:s", "is_identity_column:b", "is_part_of_unique_key:b",
+    "is_updateable:b", "is_computed_column:b", "is_sparse_column_set:b", "ordinal_in_order_by_list:h", "order_by_is_descending:h",
+    "order_by_list_length:h", "tds_type_id:i", "tds_length:i", "tds_collation_id:i", "tds_collation_sort_id:t"]
+
+// sp_describe_first_result_set's result: a row per column, SQL Server's 39
+// columns (those lexdb has nothing for NULL, as SQL Server leaves them for a
+// table's column read without browse information).
+pub fn describeRows(cols: &[]lexdb_exec.DeclCol): Event {
+    var x = ev0(EV_ROWS)
+    for c in DESCRIBE_COLS {
+        let p = strings.split(&c, ":")
+        let k = p[1]
+        let oid = if k == "b" { lexdb_sql.OID_BOOL } else if k == "s" { lexdb_sql.OID_TEXT } else if k == "i" { lexdb_sql.OID_INT4 } else { lexdb_sql.OID_INT2 }
+        append(mut &x.cols, lexdb_exec.OutCol{name: p[0].toStr(), oid: oid, spell: p[0].toStr(), coll: "",
+                                              scale: if k == "t" { lexdb_syscat.hint(lexdb_syscat.TS_TINYINT, 0) } else { -1 }})
+    }
+    for i in 0..len(cols) {
+        let d = &cols[i]
+        let tx = textual(d)
+        let n = Val.Null
+        let no = Val.Bool(false)
+        append(mut &x.rows, [no, Val.Int(i + 1), Val.Text(d.name), Val.Bool(d.nullable), Val.Int(d.sys), Val.Text(typeText(d)),
+                             Val.Int(d.maxLen), Val.Int(d.prec), Val.Int(d.scale), if len(d.coll) > 0 && tx { Val.Text(d.coll) } else { n },
+                             n, n, n, n, n, n, n, n, n, no, no, no, n, n, n, n, n, Val.Bool(d.identity), n, Val.Bool(!d.identity), no, no, n, n, n,
+                             Val.Int(tdsTypeOf(d)), Val.Int(tdsLenOf(d)), if tx { Val.Int(13632521) } else { n }, if tx { Val.Int(52) } else { n }])
+    }
+    return x
+}
+
+// sp_tablecollations_100's result for a table (SqlBulkCopy's): a row per
+// column, its collation where it has one (TDS's 5 bytes, then its name).
+fn tableCollations(cols: &[]lexdb_exec.DeclCol): Event {
+    var x = ev0(EV_ROWS)
+    x.cols = [outCol(&"colid", lexdb_sql.OID_INT4), outCol(&"name", lexdb_sql.OID_TEXT), outCol(&"tds_collation", lexdb_sql.OID_BYTEA),
+              outCol(&"collation", lexdb_sql.OID_TEXT)]
+    for i in 0..len(cols) {
+        let d = &cols[i]
+        let tx = textual(d)
+        append(mut &x.rows, [Val.Int(i + 1), Val.Text(d.name), if tx { Val.Bytes(TDS_COLLATION) } else { Val.Null },
+                             if tx { Val.Text(d.coll) } else { Val.Null }])
+    }
+    return x
+}
+
+// A table's name given as text ("[dbo].[t]", ".[t]", "db.dbo.t") as lexdb's.
+fn tableArg(text: &str): Result[str, DbErr] {
+    var t = strings.trim(text)
+    while strings.startsWith(&t, ".") { t = t[1..len(t)].toStr() }
+    let none: []str = []
+    var q = try lexdb_sql.tsqlParser(&t, lexdb_sql.Dialect{tsql: true, quotedIdent: true}, &none)
+    return q.tableName()
+}
+
+// SQL_Latin1_General_CP1_CI_AS in TDS's 5 bytes (lexdb_tds sends every text column so)
+const TDS_COLLATION = "\x09\x04\xd0\x00\x34"

@@ -24,7 +24,12 @@
 // (the request's first packet's status) gives a fresh session as after the
 // login: an open transaction rolled back, the SET options and prepared
 // statements gone; ENVCHANGE 18. ATTENTION is acknowledged once the request
-// it interrupts has answered.
+// it interrupts has answered. Bulk load (design/lexdb-tds.md, section 14):
+// after an INSERT BULK (lexdb_tsql keeps it), a BULK_LOAD message's rows,
+// read a packet at a time while lexdb_exec inserts them; the metadata bcp
+// and SqlBulkCopy ask for first (SET FMTONLY ON, sp_prepare's,
+// sp_describe_first_result_set, sp_tablecollations_100) gives a table's
+// columns with SQL Server's types.
 //
 // Results: COLMETADATA, ROW and DONE tokens. A column's TDS type comes from
 // its lexdb type: int2/int4/int8 as smallint/int/bigint, bool as bit,
@@ -45,6 +50,7 @@ import "strings"
 import "binary"
 import "math"
 import "tds"
+import "sqldialect"
 import "./lexdb_base"
 import "./lexdb_store"
 import "./lexdb_sql"
@@ -369,6 +375,40 @@ fn (o: mut &Out) colmetadata(cols: &[]lexdb_exec.OutCol, ts: &[]ColT) {
         o.typeInfo(&ts[i])
         let name = cols[i].label()
         o.bvarchar(&(if name == "?column?" { "" } else { name }))
+    }
+}
+
+// COLMETADATA for columns as SQL Server describes them (SET FMTONLY ON,
+// sp_prepare's metadata): each as SQL Server sends a table's column of its
+// type (lexdb_tsql.tdsTypeOf: a NOT NULL int as INT4, a nullable one as
+// INTN, decimal(p, s), varchar(n), datetime2(s), ...), NOT NULL and
+// IDENTITY in its flags.
+fn (o: mut &Out) declMetadata(cols: &[]lexdb_exec.DeclCol) {
+    o.u8(tds.TK_COLMETADATA)
+    o.u16(len(cols))
+    for d in cols {
+        o.u32(0)                                                    // UserType
+        o.u16((if d.nullable { 1 } else { 0 }) | (if d.identity { 0x10 } else { 0x08 }))     // Flags: nullable; identity, or updateable
+        let t = lexdb_tsql.tdsTypeOf(&d)
+        let n = lexdb_tsql.tdsLenOf(&d)
+        o.u8(t)
+        if t == tds.T_INTN || t == tds.T_BITN || t == tds.T_FLTN || t == tds.T_MONEYN || t == tds.T_DATETIMN || t == tds.T_GUID {
+            o.u8(n)
+        } else if t == tds.T_DECIMALN || t == tds.T_NUMERICN {
+            o.u8(17)
+            o.u8(d.prec)
+            o.u8(d.scale)
+        } else if t == tds.T_BIGVARCHR || t == tds.T_BIGCHAR || t == tds.T_NVARCHAR || t == tds.T_NCHAR {
+            o.u16(n)
+            o.raw(&COLLATION)
+        } else if t == tds.T_BIGVARBIN || t == tds.T_BIGBINARY {
+            o.u16(n)
+        } else if t == tds.T_TIMEN || t == tds.T_DATETIME2N || t == tds.T_DATETIMEOFFSETN {
+            o.u8(d.scale)
+        } else if t == tds.T_XML {
+            o.u8(0)                                                 // no schema
+        }
+        o.bvarchar(&d.name)
     }
 }
 
@@ -771,7 +811,9 @@ fn (c: mut &Conn) emit(ev: &[]lexdb_tsql.Event, inProc: bool): bool {
     while i < len(ev) {
         let e = &ev[i]
         i += 1
-        if e.kind == lexdb_tsql.EV_ROWS {
+        if e.kind == lexdb_tsql.EV_ROWS && len(e.decl) > 0 {
+            c.o.declMetadata(&e.decl)
+        } else if e.kind == lexdb_tsql.EV_ROWS {
             match c.o.rowSet(&e.cols, &e.rows) {
                 Ok(_) {}
                 Err(x) {
@@ -836,11 +878,22 @@ fn tsErr(n: int, msg: str): DbErr { return lexdb_base.err("TS" + n.toStr(), msg)
 
 // A parameter's value as lexdb's.
 fn valOf(p: &tds.RpcParam): Result[Val, DbErr] {
-    let t = p.column.tdsType
-    match p.value {
+    match cellVal(&p.column, &p.value) {
+        Ok(v) { return Ok(v) }
+        Err(x) {
+            if x.state == "0A000" { return Err(lexdb_base.err("0A000", "parameter " + p.name + ": " + x.msg)) }
+            return Err(x)
+        }
+    }
+}
+
+// A decoded value of a column of type col as lexdb's.
+fn cellVal(col: &tds.Column, cell: &tds.Cell): Result[Val, DbErr] {
+    let t = col.tdsType
+    match cell {
         tds.Cell.Null { return Ok(Val.Null) }
         tds.Cell.Int(n) { return Ok(if t == tds.T_BIT || t == tds.T_BITN { Val.Bool(n != 0) } else { Val.Int(n) }) }
-        tds.Cell.Float(x) { return Ok(if t == tds.T_FLT4 || (t == tds.T_FLTN && p.column.size == 4) { Val.Real(x) } else { Val.Float(x) }) }
+        tds.Cell.Float(x) { return Ok(if t == tds.T_FLT4 || (t == tds.T_FLTN && col.size == 4) { Val.Real(x) } else { Val.Float(x) }) }
         tds.Cell.Text(s) { return Ok(Val.Text(s)) }
         tds.Cell.Bytes(b) { return Ok(Val.Bytes(b)) }
         tds.Cell.Dec(d) { return Ok(Val.Num(d)) }
@@ -849,17 +902,17 @@ fn valOf(p: &tds.RpcParam): Result[Val, DbErr] {
         tds.Cell.DateTime(l) {
             match lexdb_time.tsOf(l) {
                 Some(us) { return Ok(Val.Ts(us)) }
-                None { return Err(lexdb_base.err("22008", "a datetime parameter out of range")) }
+                None { return Err(lexdb_base.err("22008", "a datetime value out of range")) }
             }
         }
         tds.Cell.Offset(o) {
             match lexdb_time.tsOf(o.local) {
                 Some(us) { return Ok(Val.Tstz(us - o.offset * 60000000)) }
-                None { return Err(lexdb_base.err("22008", "a datetimeoffset parameter out of range")) }
+                None { return Err(lexdb_base.err("22008", "a datetimeoffset value out of range")) }
             }
         }
         tds.Cell.Guid(g) { return Ok(Val.Uuid(strings.toLowerAscii(g))) }
-        tds.Cell.Failed(why) { return Err(lexdb_base.err("0A000", "parameter " + p.name + ": " + why)) }
+        tds.Cell.Failed(why) { return Err(lexdb_base.err("0A000", why)) }
     }
 }
 
@@ -994,6 +1047,15 @@ fn (c: mut &Conn) execute(sql: &str, decls: &str, call: &tds.RpcCall, first: int
     c.o.doneTok(tds.TK_DONEPROC, (if more { tds.DONE_MORE } else { 0 }) | (if status != 0 { tds.DONE_ERROR } else { 0 }), CMD_EXECUTE, 0)
 }
 
+// @params' declarations; none for none.
+fn declsOf(decls: &str): Result[[]lexdb_tsqlparse.ParamDecl, DbErr] {
+    if len(strings.trim(decls)) == 0 { return Ok([]) }
+    return lexdb_tsqlparse.parseParamDecls(decls)
+}
+
+// sp_describe_first_result_set, by name only (lexdb's own id for it here).
+const PROC_DESCRIBE = -2
+
 // A procedure's id from its name: sp_executesql and the prepared-statement ones; 0 for another.
 fn procIdOf(name: &str): int {
     var n = strings.toLowerAscii(name)
@@ -1006,6 +1068,7 @@ fn procIdOf(name: &str): int {
         "sp_execute" { return tds.PROC_EXECUTE }
         "sp_prepexec" { return tds.PROC_PREPEXEC }
         "sp_unprepare" { return tds.PROC_UNPREPARE }
+        "sp_describe_first_result_set" { return PROC_DESCRIBE }
         else { return 0 }
     }
 }
@@ -1055,6 +1118,24 @@ fn (c: mut &Conn) rpc(d: str) {
                     if id == tds.PROC_PREPEXEC {
                         c.execute(&sql, &decls, &call, 3, h, more)
                     } else {
+                        // @options 1: the statement's columns first (bcp's), as SQL Server
+                        if n >= 4 && (intOf(&call.params[3]) & 1) != 0 {
+                            let ds = declsOf(&decls)
+                            match ds {
+                                Ok(list) {
+                                    match lexdb_tsql.describeFirst(mut &c.sess, &c.ts, &sql, &list) {
+                                        Ok(cols) {
+                                            if len(cols) > 0 {
+                                                c.o.declMetadata(&cols)
+                                                c.o.doneTok(tds.TK_DONEINPROC, tds.DONE_MORE | tds.DONE_COUNT, lexdb_tsql.CMD_SELECT, 0)
+                                            }
+                                        }
+                                        Err(_) {}
+                                    }
+                                }
+                                Err(_) {}
+                            }
+                        }
                         c.o.returnStatus(0)
                         c.o.returnValue(0, &call.params[0].name, &lexdb_sql.TypeName{kind: lexdb_sql.K_INT, oid: lexdb_sql.OID_INT4, prec: 0, scale: 0, len: 0}, &Val.Int(h))
                         c.o.doneTok(tds.TK_DONEPROC, if more { tds.DONE_MORE } else { 0 }, CMD_EXECUTE, 0)
@@ -1076,6 +1157,28 @@ fn (c: mut &Conn) rpc(d: str) {
                 let sql = c.preps[h - 1].sql
                 let decls = c.preps[h - 1].decls
                 c.execute(&sql, &decls, &call, 1, 0, more)
+            }
+        } else if id == PROC_DESCRIBE {
+            // @tsql's first result's columns, a row each
+            let sql = if n > 0 { textOf(&call.params[0]).unwrapOr("") } else { "" }
+            let decls = if n > 1 { textOf(&call.params[1]).unwrapOr("") } else { "" }
+            let ds = declsOf(&decls)
+            let got = match ds {
+                Ok(list) { lexdb_tsql.describeFirst(mut &c.sess, &c.ts, &sql, &list) }
+                Err(e) { Err(e) }
+            }
+            match got {
+                Ok(cols) {
+                    let x = lexdb_tsql.describeRows(&cols)
+                    match c.o.rowSet(&x.cols, &x.rows) {
+                        Ok(_) {}
+                        Err(e) { c.o.error(&e) }
+                    }
+                    c.o.doneTok(tds.TK_DONEINPROC, tds.DONE_MORE | tds.DONE_COUNT, lexdb_tsql.CMD_SELECT, len(x.rows))
+                    c.o.returnStatus(0)
+                    c.o.doneTok(tds.TK_DONEPROC, if more { tds.DONE_MORE } else { 0 }, CMD_EXECUTE, 0)
+                }
+                Err(e) { c.procError(&e, more) }
             }
         } else {
             let name = if len(call.procName) > 0 { call.procName } else { "procedure " + call.procId.toStr() }
@@ -1123,6 +1226,318 @@ fn (c: mut &Conn) transMgr(d: &str) {
     c.batch(&sql)
 }
 
+// ---- bulk load (design/lexdb-tds.md, section 14)
+//
+// After an INSERT BULK (lexdb_tsql, which keeps it in its State), the
+// client sends the rows in a message of their own (BULK_LOAD, packet type
+// 7): COLMETADATA, a ROW or NBCROW per row, DONE; bcp and SqlBulkCopy send
+// it as they read their input, in as many packets as it takes. It is read a
+// packet at a time as the load runs (lexdb_tsql.bulk, lexdb_exec's bulkStmt
+// pulling a packet's rows at a time), each value decoded from its TDS type
+// straight to lexdb's (bulkVal), so the message is never held whole. A
+// last packet with IGNORE ends it unloaded.
+
+// Where the reading of a bulk load's message is.
+type BulkRd = record {
+    buf: str                    // the message's bytes read and not yet decoded: buf[at..]
+    at: int
+    eom: bool                   // its last packet is in
+    ignore: bool                // ... with IGNORE: the client dropped the load
+    cols: []tds.Column
+    starts: []int
+    lens: []int
+    done: bool                  // its DONE has been read
+    failed: bool                // the load ended with an error: the rest is skipped
+}
+
+fn bulkErr(n: int, msg: str): DbErr { return tsErr(n, msg) }
+
+// The next packet of the message onto rd.buf (what was decoded dropped);
+// Err when the message has ended, or another comes.
+fn (c: mut &Conn) bulkMore(rd: mut &BulkRd): Result[Unit, DbErr] {
+    if rd.eom { return Err(protoErr("the bulk load's rows end inside a row or before DONE")) }
+    match c.t.receivePacket() {
+        Ok(p) {
+            if p.ptype != tds.PT_BULK { return Err(protoErr("a packet of type " + p.ptype.toStr() + " inside a bulk load's rows")) }
+            rd.buf = if rd.at >= len(rd.buf) { p.data } else { rd.buf[rd.at..len(rd.buf)] + p.data }
+            rd.at = 0
+            rd.eom = p.eom
+            if p.eom && (p.status & tds.STATUS_IGNORE) != 0 { rd.ignore = true }
+            return Ok(Unit{})
+        }
+        Err(e) { return Err(lexdb_base.err("08006", "the connection was lost during a bulk load: " + e.msg)) }
+    }
+}
+
+// The rest of the message read and dropped.
+fn (c: mut &Conn) bulkDrain(rd: mut &BulkRd): Result[Unit, tds.Error] {
+    while !rd.eom {
+        let p = try c.t.receivePacket()
+        rd.eom = p.eom
+        if p.eom && (p.status & tds.STATUS_IGNORE) != 0 { rd.ignore = true }
+    }
+    rd.buf = ""
+    rd.at = 0
+    return Ok(Unit{})
+}
+
+// The message's COLMETADATA, read across packets as needed.
+fn (c: mut &Conn) bulkColumns(rd: mut &BulkRd): Result[Unit, DbErr] {
+    while true {
+        if len(rd.buf) > 0 {
+            if rd.buf[0] != tds.TK_COLMETADATA { return Err(protoErr("a bulk load's rows must begin with COLMETADATA")) }
+            match tds.parseColMetadata(&rd.buf, 1) {
+                Ok(m0) {
+                    var m = m0
+                    rd.cols = replace(mut &m.cols, [])
+                    rd.at = m.end
+                    rd.starts = array(len(rd.cols), 0)
+                    rd.lens = array(len(rd.cols), 0)
+                    return Ok(Unit{})
+                }
+                Err(e) { if rd.eom { return Err(protoErr("a bulk load's COLMETADATA: " + e.msg)) } }
+            }
+        }
+        if rd.ignore { return Ok(Unit{}) }
+        try c.bulkMore(rd)
+    }
+    return Ok(Unit{})
+}
+
+// The next rows of the message, those its bytes read hold (a packet's,
+// or more), at least one unless DONE has come.
+fn (c: mut &Conn) bulkRows(rd: mut &BulkRd): Result[[][]Val, DbErr] {
+    var rows: [][]Val = []
+    while true {
+        if rd.at >= len(rd.buf) {
+            if len(rows) > 0 { return Ok(rows) }
+            try c.bulkMore(rd)
+            if rd.ignore { return Err(lexdb_base.err("57014", "The bulk load was ended by the client (IGNORE).")) }
+            continue
+        }
+        let tok = int(rd.buf[rd.at])
+        if tok == tds.TK_ROW || tok == tds.TK_NBCROW {
+            let end = match tds.scanRow(&rd.buf, rd.at + 1, &rd.cols, tok == tds.TK_NBCROW, mut &rd.starts, mut &rd.lens) {
+                Ok(x) { x }
+                Err(e) { return Err(protoErr("a bulk load's row: " + e.msg)) }
+            }
+            if end == tds.ROW_SHORT {
+                if len(rows) > 0 { return Ok(rows) }
+                try c.bulkMore(rd)
+                if rd.ignore { return Err(lexdb_base.err("57014", "The bulk load was ended by the client (IGNORE).")) }
+                continue
+            }
+            var row: []Val = []
+            for i in 0..len(rd.cols) { append(mut &row, try bulkVal(&rd.cols[i], &rd.buf, rd.starts[i], rd.lens[i])) }
+            append(mut &rows, row)
+            rd.at = end
+        } else if tok == tds.TK_DONE {
+            // the end (its row count is 4 bytes from SqlClient, 8 from bcp): nothing after it is read
+            rd.at = len(rd.buf)
+            rd.done = true
+            return Ok(rows)
+        } else {
+            return Err(protoErr("token 0x" + strings.hex(tok) + " in a bulk load's rows"))
+        }
+    }
+    return Ok(rows)
+}
+
+// A bulk load's message, whose first packet is first: its rows inserted
+// as the INSERT BULK before it said (lexdb_tsql.bulk), then the reply: DONE
+// with the count, or the error. The message is read to its end whatever
+// happens, so the connection goes on.
+fn (c: mut &Conn) bulkLoad(first: tds.Packet): Result[Unit, tds.Error] {
+    var rd = BulkRd{buf: first.data, at: 0, eom: first.eom, ignore: first.eom && (first.status & tds.STATUS_IGNORE) != 0, cols: [], starts: [], lens: [],
+                    done: false, failed: false}
+    if len(c.ts.bulk) == 0 {
+        try c.bulkDrain(mut &rd)
+        c.o.message(tds.TK_ERROR, 4804, 1, 16, &"While reading current row from host, a premature end-of-message was encountered--an incoming data stream was interrupted when the server expected to see more data. The host program may have terminated. Ensure that you are using a supported client application programming interface (API).")
+        c.o.done(tds.DONE_ERROR, lexdb_tsql.CMD_BULK, 0)
+        return Ok(Unit{})
+    }
+    if c.ts.bulk[0].bad {
+        // after an INSERT BULK naming a column the table has not: no load, as SQL Server
+        c.ts.bulk = []
+        try c.bulkDrain(mut &rd)
+        c.o.done(tds.DONE_ERROR, 0, 0)
+        return Ok(Unit{})
+    }
+    var ev: []lexdb_tsql.Event = []
+    var sess = replace(mut &c.sess, lexdb_exec.parkedSession(c.st))
+    var ts = replace(mut &c.ts, lexdb_tsql.newState(0))
+    let want = len(ts.bulk[0].cols)
+    lexdb_tsql.bulk(mut &sess, mut &ts, fn(): lexdb_exec.CopyPart {
+        if rd.failed || rd.done { return lexdb_exec.CopyPart{rows: [], data: "", end: true, fail: "", proto: false} }
+        if len(rd.cols) == 0 {
+            match c.bulkColumns(mut &rd) {
+                Ok(_) {}
+                Err(e) {
+                    rd.failed = true
+                    return lexdb_exec.CopyPart{rows: [], data: "", end: true, fail: e.state + ":" + e.msg, proto: false}
+                }
+            }
+            if rd.ignore {
+                rd.failed = true
+                return lexdb_exec.CopyPart{rows: [], data: "", end: true, fail: "57014:The bulk load was ended by the client (IGNORE).", proto: false}
+            }
+            if len(rd.cols) != want {
+                rd.failed = true
+                return lexdb_exec.CopyPart{rows: [], data: "", end: true, proto: false,
+                                           fail: "TS4807:The bulk load's rows have " + len(rd.cols).toStr() + " columns; INSERT BULK named " + want.toStr() + "."}
+            }
+        }
+        match c.bulkRows(mut &rd) {
+            Ok(rows) { return lexdb_exec.CopyPart{rows: rows, data: "", end: rd.done, fail: "", proto: false} }
+            Err(e) {
+                rd.failed = true
+                return lexdb_exec.CopyPart{rows: [], data: "", end: true, fail: e.state + ":" + e.msg, proto: false}
+            }
+        }
+    }, mut &ev)
+    let parked = replace(mut &c.sess, sess)
+    let st0 = replace(mut &c.ts, ts)
+    let quiet = c.sess.takeNotices()
+    try c.bulkDrain(mut &rd)
+    if rd.ignore {
+        // ended by the client: SQL Server's answer is DONE's error flag alone
+        var kept: []lexdb_tsql.Event = []
+        for i in 0..len(ev) { if ev[i].kind == lexdb_tsql.EV_TRAN { append(mut &kept, replace(mut &ev[i], lexdb_tsql.doneEvent())) } }
+        let f0 = c.emit(&kept, false)
+        c.o.done(tds.DONE_ERROR, lexdb_tsql.CMD_SETOPT, 0)
+        return Ok(Unit{})
+    }
+    let failed = c.emit(&ev, false)
+    return Ok(Unit{})
+}
+
+// ---- a bulk load's values: a ROW's value of col at d[s..s + n] (n -1:
+// NULL) as lexdb's, without going through text: integers, bit, float and
+// real, decimal and numeric, the string types (varchar and char in their
+// collation's code page), binary, date, time, datetime2, datetimeoffset
+// and uniqueidentifier straight from their bytes; money, smallmoney,
+// datetime and smalldatetime through lib/tds's decoder. sql_variant and
+// UDTs are refused (SQL Server's 4816: an invalid column type).
+
+fn leInt(d: &str, s: int, n: int): int {
+    var v = 0
+    for k in 0..n { v = v | (int(d[s + k]) << (8 * k)) }
+    return v
+}
+
+const HEXL = "0123456789abcdef"
+
+fn bulkVal(col: &tds.Column, d: &str, s: int, n: int): Result[Val, DbErr] {
+    if n < 0 { return Ok(Val.Null) }
+    let t = col.tdsType
+    if t == tds.T_INTN || t == tds.T_INT4 || t == tds.T_INT8 || t == tds.T_INT2 || t == tds.T_INT1 {
+        var v = leInt(d, s, n)
+        if n > 1 && n < 8 && ((v >> (8 * n - 1)) & 1) == 1 { v = v - (1 << (8 * n)) }     // tinyint is unsigned
+        return Ok(Val.Int(v))
+    }
+    if t == tds.T_BITN || t == tds.T_BIT { return Ok(Val.Bool(d[s] != 0)) }
+    if t == tds.T_FLTN || t == tds.T_FLT8 || t == tds.T_FLT4 {
+        if n == 4 { return Ok(Val.Real(tds.floatOfBits32(leInt(d, s, 4)))) }
+        return Ok(Val.Float(tds.floatOfBits(leInt(d, s, 8))))
+    }
+    if t == tds.T_DECIMALN || t == tds.T_NUMERICN || t == tds.T_DECIMAL || t == tds.T_NUMERIC {
+        // a sign byte (1 positive), then the magnitude, little-endian
+        if n != 5 && n != 9 && n != 13 && n != 17 { return Err(protoErr("a decimal of " + n.toStr() + " bytes")) }
+        var m: u128 = 0
+        for k in 0..n - 1 { m = m | (u128(d[s + 1 + k]) << (8 * k)) }
+        let most: u128 = 99999999999999999999999999999999999999
+        if m > most { return Err(bulkErr(8115, "Arithmetic overflow error converting a bulk load's value to data type numeric.")) }
+        return Ok(Val.Num(fromFraction(if d[s] == 0 { -i128(m) } else { i128(m) }, col.scale)))
+    }
+    if t == tds.T_NVARCHAR || t == tds.T_NCHAR || t == tds.T_NTEXT || t == tds.T_XML {
+        var b = if col.isPlp() { plpBytes(d, s, n) } else { d[s..s + n].toStr() }
+        if t == tds.T_XML && len(b) >= 2 && b[0] == 0xFF && b[1] == 0xFE { b = b[2..len(b)].toStr() }
+        match tds.fromUtf16(b) {
+            Ok(x) { return Ok(Val.Text(x)) }
+            Err(m) { return Err(bulkErr(4816, "Invalid UTF-16 in a bulk load's value of column " + col.name + ": " + m)) }
+        }
+    }
+    if t == tds.T_BIGVARCHR || t == tds.T_BIGCHAR || t == tds.T_VARCHAR || t == tds.T_CHAR || t == tds.T_TEXT {
+        if !col.isPlp() {
+            var k = s
+            let e = s + n
+            while k < e && d[k] < 0x80 { k += 1 }
+            if k == e { return Ok(Val.Text(d[s..e].toStr())) }        // ASCII, the same in every code page
+        }
+        let b = if col.isPlp() { plpBytes(d, s, n) } else { d[s..s + n].toStr() }
+        if col.collation.utf8() {
+            if !strings.isValidUtf8(b) { return Err(bulkErr(4816, "Invalid UTF-8 in a bulk load's value of column " + col.name)) }
+            return Ok(Val.Text(b))
+        }
+        let cp = col.collation.codePage()
+        if !codepage.supported(cp) { return Err(bulkErr(4816, "Column " + col.name + ": varchar data in code page " + cp.toStr() + " (lexdb reads 1252, ISO-8859-1 and UTF-8)")) }
+        match codepage.decode(cp, &b) {
+            Ok(x) { return Ok(Val.Text(x)) }
+            Err(m) { return Err(bulkErr(4816, "Column " + col.name + ": " + m)) }
+        }
+    }
+    if t == tds.T_BIGVARBIN || t == tds.T_BIGBINARY || t == tds.T_VARBINARY || t == tds.T_BINARY || t == tds.T_IMAGE {
+        return Ok(Val.Bytes(if col.isPlp() { plpBytes(d, s, n) } else { d[s..s + n].toStr() }))
+    }
+    if t == tds.T_DATEN {
+        if n != 3 { return Err(protoErr("a date of " + n.toStr() + " bytes")) }
+        return Ok(Val.Date(leInt(d, s, 3) - DAYS_0001_TO_2000))
+    }
+    if t == tds.T_TIMEN || t == tds.T_DATETIME2N || t == tds.T_DATETIMEOFFSETN {
+        let sc = col.scale
+        let tn = timeLen(sc)
+        let want = if t == tds.T_TIMEN { tn } else if t == tds.T_DATETIME2N { tn + 3 } else { tn + 5 }
+        if n != want || sc > 7 { return Err(protoErr("a " + col.typeName() + "(" + sc.toStr() + ") of " + n.toStr() + " bytes")) }
+        // its units, 10^-sc seconds, as microseconds (100 ns rounded)
+        let u = leInt(d, s, tn)
+        var us = 0
+        if sc == 7 { us = (u + 5) / 10 } else {
+            var m = 1
+            for _ in sc..6 { m = m * 10 }
+            us = u * m
+        }
+        if us >= DAY_US { return Err(bulkErr(241, "Conversion failed when converting date and/or time from a bulk load's value.")) }
+        if t == tds.T_TIMEN { return Ok(Val.Time(us)) }
+        let days = leInt(d, s + tn, 3) - DAYS_0001_TO_2000
+        // (a datetimeoffset's time and date are UTC: its offset after them is not kept)
+        if t == tds.T_DATETIME2N { return Ok(Val.Ts(days * DAY_US + us)) }
+        return Ok(Val.Tstz(days * DAY_US + us))
+    }
+    if t == tds.T_GUID {
+        if n != 16 { return Err(protoErr("a uniqueidentifier of " + n.toStr() + " bytes")) }
+        var b = newStrBuf()
+        for k in [3, 2, 1, 0, -1, 5, 4, -1, 7, 6, -1, 8, 9, -1, 10, 11, 12, 13, 14, 15] {
+            if k < 0 {
+                b.addByte('-')
+            } else {
+                let v = int(d[s + k])
+                b.addByte(HEXL[v >> 4])
+                b.addByte(HEXL[v & 15])
+            }
+        }
+        return Ok(Val.Uuid(b.toStr()))
+    }
+    if t == tds.T_MONEYN || t == tds.T_MONEY || t == tds.T_MONEY4 || t == tds.T_DATETIMN || t == tds.T_DATETIME || t == tds.T_DATETIM4 {
+        return cellVal(col, &tds.decodeCell(col, d[s..s + n].toStr()))
+    }
+    return Err(bulkErr(4816, "Invalid column type from bcp client for column " + col.name + ": lexdb's bulk load does not take " + col.typeName() + "."))
+}
+
+// A PLP value's bytes: its chunks (each after its 4-byte length, to the
+// terminator) at d[s..s + n] joined.
+fn plpBytes(d: &str, s: int, n: int): str {
+    var b: []byte = []
+    var p = s
+    while p + 4 <= s + n {
+        let k = leInt(d, p, 4)
+        p += 4
+        if k == 0 { break }
+        appendStr(mut &b, d[p..p + k].toStr())
+        p += k
+    }
+    return strFromBytes(&b)
+}
+
 // ---- requests
 
 // RESETCONNECTION: the session as it was after the login (an open
@@ -1148,11 +1563,38 @@ fn (c: mut &Conn) reset() {
     c.o.envchangeBytes(18, &"", &"")
 }
 
-// Requests until the client goes: Ok(()) at its end, Err on the wire.
+// The rest of a request whose first packet is p: its packets' payloads
+// joined. E_LIMIT past MAX_REQUEST bytes, E_PROTOCOL for a packet of
+// another type.
+fn (c: mut &Conn) message(p: tds.Packet): Result[tds.Received, tds.Error] {
+    if p.eom { return Ok(tds.Received{ptype: p.ptype, data: p.data, status: p.status}) }
+    var b = strToBytes(p.data)
+    while true {
+        let q = try c.t.receivePacket()
+        if q.ptype != p.ptype {
+            return Err(sqldialect.dbError(sqldialect.E_PROTOCOL, "tds: a packet of type " + q.ptype.toStr() + " inside a message of type " + p.ptype.toStr()))
+        }
+        if len(b) + len(q.data) > MAX_REQUEST { return Err(sqldialect.dbError(sqldialect.E_LIMIT, "tds: a request larger than " + MAX_REQUEST.toStr() + " bytes")) }
+        appendStr(mut &b, q.data)
+        if q.eom { break }
+    }
+    return Ok(tds.Received{ptype: p.ptype, data: strFromBytes(&b), status: p.status})
+}
+
+// Requests until the client goes: Ok(()) at its end, Err on the wire. A
+// request is read whole, but a bulk load's rows, read as they come.
 fn (c: mut &Conn) requests(): Result[Unit, tds.Error] {
     while true {
-        let m = try c.t.receive(MAX_REQUEST)
-        if (m.status & tds.STATUS_RESET) != 0 { c.reset() }
+        let first = try c.t.receivePacket()
+        if (first.status & tds.STATUS_RESET) != 0 { c.reset() }
+        if first.ptype == tds.PT_BULK {
+            try c.bulkLoad(first)
+            try c.send()
+            continue
+        }
+        // an INSERT BULK's rows must come next
+        c.ts.bulk = []
+        let m = try c.message(first)
         if m.ptype == tds.PT_SQLBATCH {
             match batchText(&m.data) {
                 Ok(sql) { c.batch(&sql) }

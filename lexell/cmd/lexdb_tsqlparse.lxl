@@ -47,6 +47,10 @@ pub const TS_EXEC = 21      // EXEC [@r =] procedure args: names[0] the procedur
                             // arguments; names[1 + i] argument i's parameter name ("" positional); value: per
                             // argument, the variable an OUTPUT one sets ("" none), \x1f between them
 pub const TS_INSERTEXEC = 22 // INSERT [INTO] t [(columns)] EXEC ...: names[0] the table, names[1..] its columns; body[0] the EXEC
+// (design/lexdb-tds.md, section 14)
+pub const TS_INSERTBULK = 23 // INSERT BULK t (column type, ...) [WITH (...)]: names[0] the table, names[1..] the columns (folded),
+                             // types theirs; value: the options kept (keep_nulls, tablock, check_constraints, fire_triggers),
+                             // a space between
 
 pub type TStmt = record {
     pub kind: int
@@ -254,6 +258,67 @@ fn insertExec(q: &Parser): bool {
     return w.kind == lexdb_sql.T_IDENT && (w.text == "exec" || w.text == "execute")
 }
 
+// INSERT BULK, after it: the table, its columns as the client will send
+// them (name type [COLLATE c] [NULL | NOT NULL]), and WITH's options:
+// CHECK_CONSTRAINTS, FIRE_TRIGGERS, KEEP_NULLS, TABLOCK, ROWS_PER_BATCH = n,
+// KILOBYTES_PER_BATCH = n, ORDER (column [ASC | DESC], ...). A column named
+// twice is SQL Server's 264.
+fn insertBulk(q: mut &Parser): Result[TStmt, DbErr] {
+    var ts = tstmt(TS_INSERTBULK)
+    append(mut &ts.names, try q.tableName())
+    try q.expectKw("(")
+    while true {
+        let c = q.next()
+        if c.kind != lexdb_sql.T_IDENT && c.kind != lexdb_sql.T_QIDENT { return Err(lexdb_base.err("42601", "syntax error at or near \"" + c.text + "\"")) }
+        for k in 1..len(ts.names) {
+            if ts.names[k] == c.text {
+                return Err(lexdb_base.err("TS264", "The column name '" + (if len(c.spell) > 0 { c.spell } else { c.text }) +
+                                          "' is specified more than once in the SET clause or column list of an INSERT. A column cannot be assigned more than one value in the same clause. Modify the clause to make sure that a column is updated only once. If this statement updates or inserts columns into a view, column aliasing can conceal the duplication in your code."))
+            }
+        }
+        append(mut &ts.names, c.text)
+        append(mut &ts.types, try q.typeName())
+        if q.acceptKw("collate") { let coll = q.next() }
+        if q.acceptKw("not") { try q.expectKw("null") } else { let n = q.acceptKw("null") }
+        if !q.acceptKw(",") { break }
+    }
+    try q.expectKw(")")
+    var opts: []str = []
+    if q.acceptKw("with") {
+        try q.expectKw("(")
+        while true {
+            let o = q.peek()
+            if o.kind != lexdb_sql.T_IDENT { return Err(q.unexpected()) }
+            if o.text == "check_constraints" || o.text == "fire_triggers" || o.text == "keep_nulls" || o.text == "tablock" {
+                q.skip(1)
+                append(mut &opts, o.text)
+            } else if o.text == "rows_per_batch" || o.text == "kilobytes_per_batch" {
+                q.skip(1)
+                try q.expectKw("=")
+                let n = q.next()
+                if n.kind != lexdb_sql.T_NUM { return Err(lexdb_base.err("42601", "syntax error at or near \"" + n.text + "\"")) }
+            } else if o.text == "order" {
+                q.skip(1)
+                try q.expectKw("(")
+                while true {
+                    let c = q.next()
+                    if c.kind != lexdb_sql.T_IDENT && c.kind != lexdb_sql.T_QIDENT { return Err(lexdb_base.err("42601", "syntax error at or near \"" + c.text + "\"")) }
+                    if !q.acceptKw("asc") { let d = q.acceptKw("desc") }
+                    if !q.acceptKw(",") { break }
+                }
+                try q.expectKw(")")
+            } else {
+                return Err(q.unexpected())
+            }
+            if !q.acceptKw(",") { break }
+        }
+        try q.expectKw(")")
+    }
+    ts.value = strings.join(&opts, " ")
+    if q.peek().kind != lexdb_sql.T_EOF && !q.isKw(";") { return Err(q.unexpected()) }
+    return Ok(ts)
+}
+
 // One of the batch's statements, at a statement's start.
 fn tsqlStmt(q: mut &Parser, types: mut &[]TypeName): Result[TStmt, DbErr] {
     q.fresh()
@@ -271,6 +336,10 @@ fn tsqlStmt(q: mut &Parser, types: mut &[]TypeName): Result[TStmt, DbErr] {
         if t.text == "exec" || t.text == "execute" {
             q.skip(1)
             return execStmt(q)
+        }
+        if t.text == "insert" && w1.kind == lexdb_sql.T_IDENT && w1.text == "bulk" {
+            q.skip(2)
+            return insertBulk(q)
         }
         if t.text == "insert" && insertExec(q) {
             q.skip(1)
