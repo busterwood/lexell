@@ -473,12 +473,12 @@ pub fn isColBody(body: &str): bool { return len(body) >= CB && body[0] == 0xff &
 
 // A column leaf's body: keys from (lazy body form, kb bytes) and columns cols.
 fn colBodyOf(keys: &[]byte, kb: int, cols: &str): str {
-    var out: []byte = array(CB + kb + len(cols), byte(0))
-    out[0] = byte(0xff)
-    out[1] = byte(0xff)
-    binary.setU32LE(mut &out, 2, kb)
-    for i in 0..kb { out[CB + i] = keys[i] }
-    for i in 0..len(cols) { out[CB + kb + i] = cols[i] }
+    var out: []byte = withCapacity(CB + kb + len(cols))
+    append(mut &out, byte(0xff))
+    append(mut &out, byte(0xff))
+    binary.appendU32LE(mut &out, kb)
+    appendStr(mut &out, strFromBytes(&keys[0..kb]))
+    appendStr(mut &out, cols.toStr())
     return strFromBytes(&out)
 }
 
@@ -533,13 +533,12 @@ pub fn colBodyRange(n: &Node, from: int, to: int, spec: &lexdb_cols.Spec): Optio
     if 22 + colKeysSize(n, from, to) + len(cols) > PAGE { return None }
     var kb = 0
     for i in from..to { kb += 4 + len(n.key(i)) }
-    var keys: []byte = array(kb, byte(0))
-    var at = 0
+    var keys: []byte = withCapacity(kb)
     for i in from..to {
         let k = n.key(i)
-        binary.setU16LE(mut &keys, at, len(k))
-        putStr(mut &keys, at + 4, &k)
-        at += 4 + len(k)
+        binary.appendU16LE(mut &keys, len(k))
+        binary.appendU16LE(mut &keys, 0)
+        appendStr(mut &keys, k)
     }
     return Some(colBodyOf(&keys, kb, &cols))
 }
@@ -595,9 +594,13 @@ fn colPage(body: &str, cnt: int, pageNo: int): []byte {
     }
     binary.setU16LE(mut &b, 18, at - 22)
     binary.setU16LE(mut &b, 20, len(cols))
-    for j in 0..len(cols) { b[at + j] = cols[j] }
-    seal(mut &b, pageNo, T_CLEAF)
-    return b
+    // the columns, copied whole (appendStr)
+    var w: []byte = withCapacity(PAGE)
+    appendStr(mut &w, strFromBytes(&b[0..at]))
+    appendStr(mut &w, cols.toStr())
+    while len(w) < PAGE { append(mut &w, byte(0)) }
+    seal(mut &w, pageNo, T_CLEAF)
+    return w
 }
 
 fn getVar(b: &[]byte, at: mut &int): int {
@@ -649,7 +652,7 @@ fn colLeaf(b: &[]byte, cnt: int): Node {
         kb += 4 + c + t
         at += t
     }
-    var out: []byte = array(CB + kb + cl, byte(0))
+    var out: []byte = array(CB + kb, byte(0))
     out[0] = byte(0xff)
     out[1] = byte(0xff)
     binary.setU32LE(mut &out, 2, kb)
@@ -666,8 +669,10 @@ fn colLeaf(b: &[]byte, cnt: int): Node {
         prev = o
         o += 4 + c + t
     }
-    for j in 0..cl { out[o + j] = b[22 + kl + j] }
-    var l = colNode(strFromBytes(&out), cnt)
+    var whole: []byte = withCapacity(o + cl)
+    appendStr(mut &whole, strFromBytes(&out[0..o]))
+    appendStr(mut &whole, strFromBytes(&b[22 + kl..22 + kl + cl]))
+    var l = colNode(strFromBytes(&whole), cnt)
     l.size = 22 + kl + cl
     return l
 }
@@ -798,6 +803,7 @@ pub fn bodyPage(leaf: bool, n: int, body: &str, pageNo: int): []byte {
 // its own allocation in arrays with room to spare, takes less memory
 // after this.
 pub fn repack(n: mut &Node, body: &str) {
+    if n.leaf && n.isCols() && isColBody(body) && n.body == body { return }
     if n.leaf && isColBody(body) {
         let cnt = n.count()
         var l = colNode(body.toStr(), cnt)

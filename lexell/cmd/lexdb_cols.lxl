@@ -254,26 +254,42 @@ fn readIntK(s: &str, at: int, k: byte): int {
 const POW10_18 = 1000000000000000000
 
 // A numeric's binary form (Decimal.toBin) at s[a..b] as units at display
-// scale ds (value * 10^ds), when it is exactly that: Decimal.fromUnits(u,
-// ds).toBin() gives the same bytes (unitsBin). None otherwise.
-fn binUnits(s: &str, a: int, b: int, ds: int): Option[int] {
-    match Decimal.fromBin(s, a, b - a) {
-        Ok(d) {
-            if d.scale() != ds { return None }
-            let e = d.exponent() + ds
-            if e < 0 || e > 18 { return None }
-            let c = d.coefficient()
-            if c >= u128(POW10_18) { return None }
-            var u = int(c)
-            for k in 0..e {
-                if u > 922337203685477580 { return None }
-                u = u * 10
-            }
-            if d.isNeg() { u = 0 - u }
-            return Some(u)
+// scale ds (value * 10^ds), read from the bytes: the flag byte,
+// the scale, the exponent, then at most 8 bytes of coefficient. The caller
+// checks that the units give these bytes back (unitsBin), which holds only
+// for the form toBin writes.
+fn binUnitsFast(s: &str, a: int, b: int, ds: int): Option[int] {
+    let fl = int(s[a])
+    if fl > 15 || fl & 2 != 0 || int(s[a + 1]) != ds { return None }
+    var p = a + 2
+    var exp = 0
+    if fl & 4 != 0 {
+        if fl & 8 != 0 {
+            if p + 2 > b { return None }
+            exp = int(s[p]) | (int(s[p + 1]) << 8)
+            if exp >= 32768 { exp -= 65536 }
+            p += 2
+        } else {
+            if p >= b { return None }
+            exp = int(s[p])
+            if exp >= 128 { exp -= 256 }
+            p += 1
         }
-        Err(_) { return None }
     }
+    let m = b - p
+    if m > 8 { return None }
+    var c = u64(0)
+    for i in 0..m { c = c | (u64(int(s[p + i])) << (8 * i)) }
+    if c >= u64(POW10_18) { return None }
+    var u = int(c)
+    let e = exp + ds
+    if e < 0 || e > 18 { return None }
+    for k in 0..e {
+        if u > 922337203685477580 { return None }
+        u = u * 10
+    }
+    if fl & 1 != 0 { u = 0 - u }
+    return Some(u)
 }
 
 // The scale of a numeric's binary form at s[a..] (its second byte, and its
@@ -365,26 +381,32 @@ pub fn encodeRows(rows: &[]&str, spec: &Spec): Option[str] {
     // booleans 0 or 1, the ends in order, the bitmap's spare bits 0
     let spare = if np % 8 == 0 { 0 } else { 0xff & (0xff << (np % 8)) }
     let lastBm = lay.bm + (np + 7) / 8 - 1
-    var lastVar = -1
-    for p in 0..np { if isVar(kinds[p]) { lastVar = p } }
+    // per place: 0 dropped, 1 an integer, 2 a boolean, 3 variable; its fixed bytes
+    var kv: []int = array(np, 0)
+    var fs: []int = array(np, 0)
+    for p in 0..np {
+        let k = kinds[p]
+        kv[p] = if k == K_NONE { 0 } else if isInt(k) { 1 } else if k == K_BOOL { 2 } else { 3 }
+        fs[p] = fixedSize(k)
+    }
+    let off = &lay.off
     for r in 0..n {
         let s = rows[r]
         if len(s) < v0 || s[0] != FIXED || s[1] != id0 || s[2] != id1 { return None }
         if np > 0 && int(s[lastBm]) & spare != 0 { return None }
         var prevEnd = 0
         for p in 0..np {
-            let k = kinds[p]
-            if k == K_NONE { continue }
-            let o = lay.off[p]
-            let nul = bitAt(s, lay.bm, p)
-            if isVar(k) {
-                let e = u16At(s, o)
-                if e < prevEnd { return None }
-                if nul && e != prevEnd { return None }
+            let c = kv[p]
+            if c == 0 { continue }
+            let o = off[p]
+            let nul = (int(s[3 + (p >> 3)]) >> (p & 7)) & 1 == 1
+            if c == 3 {
+                let e = int(s[o]) | (int(s[o + 1]) << 8)
+                if e < prevEnd || (nul && e != prevEnd) { return None }
                 prevEnd = e
             } else if nul {
-                for j in 0..fixedSize(k) { if s[o + j] != 0 { return None } }
-            } else if k == K_BOOL {
+                for j in 0..fs[p] { if s[o + j] != 0 { return None } }
+            } else if c == 2 {
                 if s[o] > 1 { return None }
             }
         }
@@ -403,8 +425,10 @@ pub fn encodeRows(rows: &[]&str, spec: &Spec): Option[str] {
         let k = kinds[p]
         var anyNull = false
         var allNull = true
+        let nbAt = 3 + (p >> 3)
+        let nbit = p & 7
         for r in 0..n {
-            let x = bitAt(rows[r], lay.bm, p)
+            let x = (int(rows[r][nbAt]) >> nbit) & 1 == 1
             nul[r] = x
             if x { anyNull = true } else { allNull = false }
         }
@@ -433,7 +457,18 @@ pub fn encodeRows(rows: &[]&str, spec: &Spec): Option[str] {
                     vs[r] = 0
                     continue
                 }
-                let v = readIntK(rows[r], o, k)
+                let x = rows[r]
+                var v = 0
+                if k == K_INT {
+                    v = int(x[o]) | (int(x[o + 1]) << 8) | (int(x[o + 2]) << 16) | (int(x[o + 3]) << 24) |
+                        (int(x[o + 4]) << 32) | (int(x[o + 5]) << 40) | (int(x[o + 6]) << 48) | (int(x[o + 7]) << 56)
+                } else if k == K_INT4 {
+                    let u = int(x[o]) | (int(x[o + 1]) << 8) | (int(x[o + 2]) << 16) | (int(x[o + 3]) << 24)
+                    v = if u >= 0x80000000 { u - 0x100000000 } else { u }
+                } else {
+                    let u = int(x[o]) | (int(x[o + 1]) << 8)
+                    v = if u >= 0x8000 { u - 0x10000 } else { u }
+                }
                 vs[r] = v
                 if !seen {
                     lo = v
@@ -583,7 +618,7 @@ fn encUnits(out: mut &[]byte, rows: &[]&str, st: &[]int, en: &[]int, nul: &[]boo
             ds = binScale(s, a)
             if ds > 255 { return -1 }
         }
-        let u = match binUnits(s, a, b, ds) {
+        let u = match binUnitsFast(s, a, b, ds) {
             Some(x) { x }
             None { return -1 }
         }
@@ -961,17 +996,99 @@ pub fn rowOf(s: &str, dir: &[]int, i: int): str {
 }
 
 // Every row of the leaf, rebuilt, in one string; row i is
-// body[ends[i - 1]..ends[i]] (from 0 for the first). ends: n long.
+// body[ends[i - 1]..ends[i]] (from 0 for the first). ends: n long. The
+// places are read a column at a time (unpacked in runs), then the rows
+// written one after another (their bytes appended).
 pub fn allRows(s: &str, dir: &[]int, ends: mut &[]int): str {
     let n = dir[2]
+    let np = dir[1]
+    let nb = (np + 7) / 8
+    var vals: [][]int = []          // per place: its integers, booleans (0, 1), units or spans; [] none
+    var nuls: [][]bool = []         // per place: its NULLs; [] none
+    var fixed = 3 + nb
     var tmp: []byte = array(32, byte(0))
-    var total = 0
-    for i in 0..n {
-        total += rowLen(s, dir, i, mut &tmp)
-        ends[i] = total
+    var size: []int = array(n, 0)
+    for p in 0..np {
+        let k = s[4 + p]
+        let x = DIR_HDR + D * p
+        fixed += fixedSize(k)
+        var nl: []bool = []
+        if dir[x + F_NULLS] >= 0 {
+            nl = array(n, false)
+            nullsInto(s, dir, p, 0, n, mut &nl, 0)
+        }
+        var vs: []int = []
+        if k == K_NONE {
+        } else if isInt(k) {
+            vs = array(n, 0)
+            intsInto(s, dir, p, 0, n, mut &vs, 0)
+        } else if k == K_BOOL {
+            vs = array(n, 0)
+            boolsInto(s, dir, p, 0, n, mut &vs, 0)
+        } else if dir[x + F_CODEC] == C_UNITS {
+            vs = array(n, 0)
+            intsInto(s, dir, p, 0, n, mut &vs, 0)
+            let ds = dir[x + F_X]
+            for r in 0..n { if len(nl) == 0 || !nl[r] { size[r] += unitsBin(vs[r], ds, mut &tmp, 0, false) } }
+        } else {
+            vs = array(n, 0)
+            varsInto(s, dir, p, 0, n, mut &vs, 0)
+            for r in 0..n { if len(nl) == 0 || !nl[r] { size[r] += spanEnd(vs[r]) - spanStart(vs[r]) } }
+        }
+        append(mut &vals, vs)
+        append(mut &nuls, nl)
     }
-    var out: []byte = array(total, byte(0))
-    for i in 0..n { putRow(s, dir, i, mut &out, if i == 0 { 0 } else { ends[i - 1] }) }
+    var total = 0
+    for r in 0..n {
+        total += fixed + size[r]
+        ends[r] = total
+    }
+    var out: []byte = withCapacity(total)
+    let lid = dir[0]
+    for r in 0..n {
+        append(mut &out, FIXED)
+        append(mut &out, byte(lid & 255))
+        append(mut &out, byte(lid >> 8))
+        for bi in 0..nb {
+            var bits = 0
+            for j in 0..8 {
+                let p = bi * 8 + j
+                if p < np && len(nuls[p]) > 0 && nuls[p][r] { bits = bits | (1 << j) }
+            }
+            append(mut &out, byte(bits))
+        }
+        // the fixed part, a variable place's end counted as it goes
+        var vend = 0
+        for p in 0..np {
+            let k = s[4 + p]
+            if k == K_NONE { continue }
+            let nul = len(nuls[p]) > 0 && nuls[p][r]
+            if isInt(k) {
+                let v = if nul { 0 } else { vals[p][r] }
+                if k == K_INT { binary.appendU64LE(mut &out, v) } else if k == K_INT4 { binary.appendU32LE(mut &out, v & 0xffffffff) } else { binary.appendU16LE(mut &out, v & 0xffff) }
+            } else if k == K_BOOL {
+                append(mut &out, if !nul && vals[p][r] == 1 { byte(1) } else { byte(0) })
+            } else {
+                if !nul {
+                    if dir[DIR_HDR + D * p + F_CODEC] == C_UNITS { vend += unitsBin(vals[p][r], dir[DIR_HDR + D * p + F_X], mut &tmp, 0, false) }
+                    else { vend += spanEnd(vals[p][r]) - spanStart(vals[p][r]) }
+                }
+                binary.appendU16LE(mut &out, vend)
+            }
+        }
+        // the variable part
+        for p in 0..np {
+            let k = s[4 + p]
+            if !isVar(k) || (len(nuls[p]) > 0 && nuls[p][r]) { continue }
+            if dir[DIR_HDR + D * p + F_CODEC] == C_UNITS {
+                let l = unitsBin(vals[p][r], dir[DIR_HDR + D * p + F_X], mut &tmp, 0, true)
+                for j in 0..l { append(mut &out, tmp[j]) }
+            } else {
+                let sp = vals[p][r]
+                appendStr(mut &out, s[spanStart(sp)..spanEnd(sp)])
+            }
+        }
+    }
     return strFromBytes(&out)
 }
 
