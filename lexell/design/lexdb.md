@@ -9580,6 +9580,213 @@ The suite passes (113).
 - **A range's rows read in key order across batches** (a true bitmap
   heap scan): it would change the rows' order.
 
+### 9.108 Expressions of every type over batches; decoding in two steps; window rows from batches
+
+Items 4 and 5 of lexdb-engines.md, and the window input left over from
+9.105. Profiles at 78731801 (server CPU, the 1M-row `w` of 9.102):
+- **`select id, a + b, price * 2, upper(city) from w`, 1,600 ms:** two
+  outputs the batches did not compile sent every row to the row path:
+  `eval` by name per row, and eval's checks of a function's name before
+  it runs it (`isCatFn`, `isAgg`, `isWinFn`, `isTrig`, `isTsqlFn`, then
+  `callMisc`, `callFn` and `callAt`'s chains): about 42% of the time.
+- **`where a = 5` (71) and `where note like '%item 77%'` (137):**
+  `bRunInto` and `fixedVal` about 60%: every column the level uses
+  decoded for every row, `name` and `note` as a text value each.
+- **Top-N, 90:** half decoding, the outputs of rows the heap drops.
+- **The window query, 311:** `batchLevel`'s rows to `emit`, copied by
+  `execSel`'s closure (`copyRow`, `rowBytes`), about 22%; `winValues`
+  copying its key values twice.
+
+**Compiled expressions** (`CX`, `cxOf`, `cEval`).
+- **What:** an expression compiled once for a statement's run:
+  - its columns by their places in the row (or in a row of the columns it
+    reads, over a batch), not found by name per row;
+  - its parameters as their values;
+  - each function call bound once (`FnB`): the way `callAt` gives it,
+    chosen from its name and number of arguments when compiled.
+- **Exactly eval's values:** `eval`'s operations are now functions that
+  both run (`unaryVal`, `binVal`, `castVal`; `call1`, `substrOf`,
+  `concatOf`, `coalesceOf` taken out of `callAt`). A bound call runs one
+  of them directly only where none of `callAt`'s earlier ways takes the
+  name (sqrt, cbrt, exp, ln and log10 stay with `callFn`, which takes
+  them first); when the direct one does not give a value, `callAt` runs
+  by the name, so its error is the same. AND, OR and CASE evaluate as
+  eval does (CASE's branch only when taken), `#try` gives NULL for an
+  error, `||` keeps eval's array case (its function from `arrayConcat`,
+  found when compiled), and the session's zone and the transaction's
+  start are eval's (`CEnv`: a timestamptz's text, `now()`).
+- **Not compiled** (eval runs them): subqueries, aggregates and window
+  calls, sequence, session, lock and catalog functions (they need the
+  session or a run), reg casts, T-SQL's typed division and AVG.
+- **Over batches** (`BGen`, `BNode.Gen`):
+  - **Outputs and ORDER BY keys** of any type (`outNode`): the integer
+    and boolean nodes first, as before; else compiled. A compiled
+    output's values are added to the batch as a column of values
+    (`bAddVals`), so the OutBatch to the wire (9.101), the sort's
+    `SortSet` and DISTINCT read it as any column.
+  - **Conditions** of any type (`bLevelPlan`): a row is chosen where the
+    value is true (eval's `truth`), as the row path checks it.
+  - **Two shapes** run without a row and a walk per value, as `cEval`
+    would run them: a bound function of one argument of a column
+    (`upper(city)`), an operator of a column and a constant
+    (`price * 2`).
+  - **Errors:** an error on a row sends the batch, and the rest of its
+    scan, to the row path, as for the integer nodes.
+- **In the row path,** with batches on: a streamed SELECT's outputs
+  (`outRow`, `OutC`: no Env per row when every output is a column or
+  compiled), a sorted or DISTINCT SELECT's, a window's outputs (with the
+  window values as `#agg`'s slots), and each level's conditions and the
+  WHERE conjuncts after it (`Mats.cc`, `cp`, `allTrueC`: in their order,
+  with eval for those not compiled, so an earlier false condition still
+  hides a later one's error). With `SET lexdb_batch = off` the row path
+  runs `eval` as before: the reference.
+
+**Decoding in two steps** (`fillPick`, `bRunLazy`, `Lazy`).
+- **How:** in a run of rows in one fixed layout, inside the leaf's scan:
+  1. the simple LIKEs (literal text and %) on a text column no other
+     condition reads run on the rows' bytes (`likeRaw`), nothing decoded;
+  2. the other conditions' columns are decoded (`bRunCols`, the run
+     loops of `bRunInto` over a list of rows), and the conditions run
+     over the run;
+  3. the level's other columns are decoded for the rows kept only.
+- **Rows decoded whole, as before:** tagged rows (a date or a timestamp
+  makes a row tagged: 9.76), long texts kept in the leaf, rows stored
+  apart, and a range read merged with the transaction's writes. Their
+  conditions run once the batch is full, and their rows join the others
+  in order.
+- **Exactly as before:** every condition is pure, and a row kept has all
+  its columns. A condition's error, or a value a batch cannot hold, gives
+  the batch to the row path from its start (`None`, as `bChoose`'s).
+- **A LIKE on the bytes** (`likeRange`) is `likePieces` on a range: the
+  same pieces, each between found by the runtime's search (`strFind`)
+  from where the last ended; its first place in the row's bytes is in the
+  text when any is. `likePieces` is now `likeRange` of the whole text,
+  for the row path too.
+- **Top-N's bar** (`Bar`, `sortBatches`): when the first key is an
+  integer column of the first table, that column is read in step 2, and
+  a row it puts after the heap's last kept row (as `skCmp` orders it:
+  DESC, NULLS FIRST and LAST) is dropped before its outputs are decoded.
+  A tie is kept (the heap's own comparison decides). The rows the
+  conditions chose are counted, so EXPLAIN ANALYZE's counts stay the row
+  path's.
+- **Kept:** `bRunInto`'s whole-run path, for a level with no condition
+  (scan3, scan9), for aggregates, joins' tables and lookups.
+
+**Window rows from batches** (`winBatch`).
+- A windowed SELECT over one table whose conditions all compile takes its
+  rows from the batches: each kept row's columns put at their places, its
+  bytes counted as `rowBytes` counts them, against `max_statement_mem`.
+  No row goes to `emit` to be copied. A batch the batches cannot read
+  goes to the row path from its start, as `batchLevel`'s.
+- `winValues` builds its typed keys from the values borrowed
+  (`skOfValsRef`: copied only into a key of values), and moves the order
+  columns rather than copying them.
+
+**Measured.** Server CPU in ms, medians, `vec/bench.py`, base 78731801
+and these changes alternating, three rounds of three runs each, the median
+of the rounds' medians. Other agents were running on the machine (load 1.3
+to 2.7). The window query measured 188 in a quieter moment earlier; the
+table gives the later, loaded rounds, where both builds were measured.
+The last two rows stay on the row path (a scalar subquery in the WHERE):
+compiled outputs and conditions there.
+
+| query | before | now | PostgreSQL 1 core | SQLite |
+|---|---:|---:|---:|---:|
+| `select id, a + b, price * 2, upper(city) from w` (`expr_mix`) | 1,599 | **435** | 310 | 407 |
+| `select id, b, name from w where a = 5` (`filt1pct`) | 72 | **48** | 40 | 36 |
+| `... where a < 10` (`filt10pct`) | 78 | **60** | | |
+| `select id, name from w where note like '%item 77%'` (`filt_like`) | 138 | **67** | 80 | 59 |
+| `select id, b, name from w order by c desc limit 10` (`sort_lim`) | 90 | **46** | 90 | 42 |
+| `row_number() over (partition by a order by c) ... where a < 20` (`window`) | 317 | **242** | 130 | 180 |
+| `select * from w` (`scan9`) | 504 | 505 | 250 | 523 |
+| `select id, b, name from w` (`scan3`) | 133 | 134 | | |
+| `select id, a + b, c % 1000 from w` (`expr_int`) | 121 | 119 | | |
+| `select city, count(*), avg(price) ... group by city` (`grp_text`) | 191 | 189 | 130 | 247 |
+| row path: `select id, upper(city), price * 2 from w where a <> (select max(k) from d) and b > 10` | 1,895 | **1,244** | | |
+| row path, top-N: `... upper(city) \|\| name ... order by c limit 5` | 1,741 | **1,100** | | |
+
+Again after 9.107 (index reads in batches) was merged, against its
+d9acc086, three rounds alternating (load 3 to 4): `filt1pct` 71 to 49,
+`filt_like` 144 to 70, `expr_mix` 1,703 to 467, `sort_lim` 94 to 49,
+`window` 335 to 249; the index paths `idx_range100k` 89 to 75 (its
+range turned into a scan of the table by the switch, decoded in two
+steps) and `join_lookup_agg` 106 to 105. Outputs the same by checksum.
+
+What is left:
+- **`expr_mix`:** decoding (`bRunInto`, `fixedVal`, `Decimal.fromBin`)
+  about 15%, the wire about 15% (`dataBatch`, `Decimal.format`), the
+  values themselves (`arith`, `mulExact`, `toUpperAscii`), and reference
+  counts (`dup`) per value. A numeric is still a value per row.
+- **Tagged rows** gain nothing from two steps: a table with a date or a
+  timestamp column holds most rows tagged (9.76).
+- **The window query:** the scan (with two steps), the full rows kept
+  for the windows (a row of every column, most NULL, made and dropped
+  per row), the sort and `winPartition`, and the output.
+- **Index reads** (9.107): an index-only batch decodes its columns from
+  the key, all at once, and an index's rows are fetched by their keys, so
+  neither is decoded in two steps: `fillPick` reads such a level as
+  `fillLevel` does, whole, and chooses its rows after (`bChoose`), as
+  before. A level the switch (optimizer 19) turns into a whole scan of its
+  table is decoded in two steps.
+- **Not done:** the conditions of the tables joined (`bJoinPlan`'s) and
+  of aggregates (`batchGroups`' own) still compile integer and boolean
+  nodes only; a text compared with a constant could run on the bytes
+  too, as LIKE does; a window's rows are still full rows, as its
+  arguments and outputs read them by name where not compiled.
+
+**Checked against PostgreSQL 18.** 40 queries over a 3,000-row table of
+every type (`ex_e`), in Asia/Kolkata: expressions, filters (LIKE among
+them), top-N, DISTINCT, windows, a join, errors. lexdb gave the same with
+batches on and off for all 40. 28 gave PostgreSQL's output; the other
+12 differ as lexdb did before, with or without batches:
+- `upper`, `lower` and `initcap` change ASCII letters only (`été`
+  gives `éTé`; PostgreSQL `ÉTÉ`): 5 queries;
+- `round(NULL, 1)` is an error, "function round with 2 arguments does
+  not exist" (PostgreSQL: NULL): 2;
+- a numeric division's scale (16 digits; PostgreSQL 20): 1;
+- `cast(t as varchar(3))` of a longer text is an error, 22001
+  (PostgreSQL cuts it): 1;
+- numeric field overflow's DETAIL in the message: 1;
+- the order of rows with no ORDER BY: 2.
+
+These are left as they were; they are not batch questions.
+
+**Tests.**
+- **`exec_batchexpr`,** new: random queries over a 2,600-row table of
+  every kind of row (fixed, tagged, long texts kept in the leaf and
+  apart, a dropped column and two added with defaults), joined at times
+  to one of 300, run three ways as `exec_batchsort` does (batches off;
+  on, the rows held; on, through the sink as OutBatches):
+  - 600 committed, half in Asia/Kolkata and half in America/New_York;
+    150 in a transaction with its own writes, and `now()` there;
+  - expressions over numerics, texts, varchars, timestamptz, dates,
+    booleans and NULLs: casts, `||`, upper, lower, substr, length,
+    coalesce, abs, round, sqrt, exp, ln, concat, nullif, greatest, CASE,
+    to_char, date_trunc, intervals; overflow, division by zero, a text
+    not a number, a numeric too wide for its type;
+  - selective LIKEs, simple and not, with `_`, ILIKE, NOT LIKE, `'%'`;
+  - top-N with wide outputs, ORDER BY and DISTINCT of expressions, a
+    join, windows, and a scalar subquery that keeps the row path;
+  - 16 fixed queries (the benchmark's shapes among them), parameters,
+    EXPLAIN ANALYZE's counts of a two-step filter, a top-N with its bar,
+    a window and a row-path query, and a LIMIT reached before an error.
+
+  All agree; 265 of the 600 gave OutBatches, 123 were errors.
+- **Planted bugs:** 37 were planted; 35 were caught, 7 of them after the
+  test gained what the first version missed (a LIKE matching `''`,
+  `now()` in a transaction, sqrt, parameters, a window ordered DESC by an
+  integer, a constant on an operator's left, a function's error after
+  its direct way). The 2 not caught change nothing: a raw LIKE on a
+  column another condition decodes anyway, and a window row's columns
+  placed from 0 (a one-table query's first column is at 0).
+- **One expectation changed:** `exec_batchindex`'s count of queries that
+  read an index's rows in batches, 57 to 76 (and given as an OutBatch,
+  155 to 164). The 19 new ones all have the condition `f.ci = 'k..'` on a
+  column under a case-insensitive collation (a call the integer nodes did
+  not compile, now compiled). Their results are the same three ways and
+  as without indexes, as before.
+- The suite passes (114).
+
 ### 9.109 Data changes without quadratic costs; front-coded leaves
 
 Item 6 of [lexdb-engines.md](lexdb-engines.md) (DELETE with an index, 2 to
