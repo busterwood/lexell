@@ -5,7 +5,8 @@
 // runs one a second in a task of its own, autoAnalyzer, while commits have
 // counted changes).
 // - The threshold: a table never analyzed after 51 changes, not 50; one of
-//   51 rows after 56; 1,000 rows after 151.
+//   51 rows after 56; 1,000 rows after 151. Not at once after a commit:
+//   once the table's commits have paused (300 ms).
 // - What is counted: rows inserted, updated and deleted by statements and
 //   blocks that commit (a cascade too), per kind, in pg_stat_user_tables;
 //   not a rolled back block, a failed statement, a temporary table, a
@@ -26,7 +27,7 @@
 // expect: 49 rows: 49|0|0|49|49|0|0, look 0; 50: look 0; 51: look 1, 51|0|0|51|0|0|1
 // expect: before: scan ev: index ev_kind lookup
 // expect: after the look: scan ev: index ev_uid lookup (estimated 1 rows)
-// expect: 1,000 rows: look 1; scan ev: index ev_uid lookup (estimated 10 rows); 1000|0|0|1000|0|0|2
+// expect: 1,000 rows: at once 0 (its writes not paused), look 1; scan ev: index ev_uid lookup (estimated 10 rows); 1000|0|0|1000|0|0|2
 // expect: 150 updated: look 0; one more: look 1; 1000|151|0|1000|0|0|3
 // expect: not counted: session off 0, show off, rollback 0, failed 22012 0, process off 0 look 0, temp 0; reset on
 // expect: counted: block 1015|161|5|1010|30|0|3, savepoint 1016|161|5|1011|31, cascade child 0|7|7
@@ -97,6 +98,7 @@ type Arg = record { st: lexdb_store.Store; which: int }
 fn turns(a: Arg): int {
     if a.which == 0 {
         while a.st.memoGet(&"test.started").isNone() { let y = task.yield() }
+        let z = task.sleep(400)             // (big's writes paused)
         let t0 = time.monotonicNs()
         let n = look(&a.st)
         a.st.memoPut(&"test.look", &n)
@@ -154,8 +156,9 @@ fn main() {
         println("after the look: " + all(mut &m, &("explain " + q)))
         // 51 rows: 55; then 1,000 rows: kind 1 for 990, uid 100 values
         let i4 = all(mut &m, &"insert into ev select g, case when g <= 990 then 1 else 2 end, g % 100 from generate_series(52, 1000) g")
+        let now0 = lexdb_exec.autoAnalyzeStep(&st).unwrap()
         let l1k = look(&st)
-        println("1,000 rows: look " + l1k + "; " + all(mut &m, &("explain " + q)) + "; " + stat(mut &m, &"ev"))
+        println("1,000 rows: at once " + now0.toStr() + " (its writes not paused), look " + l1k + "; " + all(mut &m, &("explain " + q)) + "; " + stat(mut &m, &"ev"))
         // 1,000 rows: 150
         let u1 = all(mut &m, &"update ev set uid = uid where id <= 150")
         let l150 = look(&st)
@@ -229,7 +232,8 @@ fn main() {
         let jq = "select count(*), sum(b.v) from big b join small s on b.sid = s.id where s.label = 'x'"
         let jb = all(mut &m, &("explain " + jq))
         let r1 = all(mut &m, &jq)
-        let jl = look(&st)
+        var jl = look(&st)
+        if jl == "1" { jl = (strings.parseIntOpt(look(&st)).unwrapOr(0) + 1).toStr() }     // (one table's writes paused first)
         println("join before: " + jb)
         println("join after: " + all(mut &m, &("explain " + jq)))
         println("join result the same: " + (all(mut &m, &jq) == r1 && jl == "2").toStr())

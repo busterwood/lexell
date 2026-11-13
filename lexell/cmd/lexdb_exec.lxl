@@ -4230,8 +4230,8 @@ fn (sp: mut &Sampler) done(rows: int, numeric: bool): Samp {
 // An index's samples from ANALYZE's count of its leading values (none when
 // the count stopped at ANALYZE_DISTINCT_MAX): the key holding each
 // (k + 1/2) / SAMPLES of its rows not NULL.
-fn mapSamples(m: &Map[str, int], vm: &Map[str, float], numeric: bool): Samp {
-    if m.size() >= ANALYZE_DISTINCT_MAX { return noSamp() }
+fn mapSamples(m: &Map[str, int], vm: &Map[str, float], numeric: bool): Result[Samp, DbErr] {
+    if m.size() >= ANALYZE_DISTINCT_MAX { return Ok(noSamp()) }
     var nb = newStrBuf()
     encIdxPart(mut &nb, &Val.Null)
     let nullKey = nb.toStr()
@@ -4240,11 +4240,11 @@ fn mapSamples(m: &Map[str, int], vm: &Map[str, float], numeric: bool): Samp {
         let k = m.keyAt(x).toStr()
         if k != nullKey { append(mut &keys, k) }
     }
-    collections.sortBy(mut &keys, fn(a: &str, b: &str): int { return a.cmp(b) })
+    try sortTakingTurns(mut &keys)
     var nn = 0
     for k in keys { nn += m.getOr(&k, 0) }
     var out = Samp{nn: nn, keys: [], lt: [], eq: [], nums: [], numeric: numeric}
-    if nn == 0 { return out }
+    if nn == 0 { return Ok(out) }
     var lt = 0
     var next = 0
     for k in keys {
@@ -4262,7 +4262,44 @@ fn mapSamples(m: &Map[str, int], vm: &Map[str, float], numeric: bool): Samp {
         }
         lt += c
     }
-    return out
+    return Ok(out)
+}
+
+// Keys sorted, taking turns (9.15): sorted in runs of SORT_RUN, a yield
+// after each, then merged, a yield every SORT_RUN keys. An index of 100,000
+// distinct leading values took 42 ms to sort at the end of its analysis,
+// holding every session (optimizer 44).
+const SORT_RUN: int = 4096
+
+fn sortTakingTurns(keys: mut &[]str): Result[Unit, DbErr] {
+    let n = len(keys)
+    if n <= SORT_RUN {
+        collections.sortBy(keys, fn(a: &str, b: &str): int { return a.cmp(b) })
+        return Ok(Unit{})
+    }
+    var runs: [][]str = []
+    var at = 0
+    while at < n {
+        var run: []str = []
+        for k in at..min(n, at + SORT_RUN) { append(mut &run, replace(mut &keys[k], "")) }
+        collections.sortBy(mut &run, fn(a: &str, b: &str): int { return a.cmp(b) })
+        append(mut &runs, run)
+        at += SORT_RUN
+        if task.yield().isErr() { return Err(e("57014", "canceling statement: its session has ended")) }
+    }
+    var heads: []int = array(len(runs), 0)
+    var out: []str = withCapacity(n)
+    while len(out) < n {
+        var best = -1
+        for r in 0..len(runs) {
+            if heads[r] < len(runs[r]) && (best < 0 || runs[r][heads[r]] < runs[best][heads[best]]) { best = r }
+        }
+        append(mut &out, replace(mut &runs[best][heads[best]], ""))
+        heads[best] += 1
+        if len(out) % SORT_RUN == 0 && task.yield().isErr() { return Err(e("57014", "canceling statement: its session has ended")) }
+    }
+    keys = out
+    return Ok(Unit{})
 }
 
 // "nn/hex~lt~eq[~number],..." ("" none; the numbers when numeric).
@@ -4481,6 +4518,14 @@ fn analyzeTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, snap: mut &le
         try fetch(st, snap, t, &path, &sc, &all, mut &cur, mut &batch)
         for r in batch {
             rows += 1
+            // (a batch's rows counted take milliseconds with several indexes)
+            if rows % 128 == 0 && time.monotonicNs() > turnEnd {
+                match task.yield() {
+                    Ok(_) {}
+                    Err(_) { return Err(e("57014", "canceling statement: its session has ended")) }
+                }
+                turnEnd = time.monotonicNs() + TURN_NS
+            }
             for x in 0..len(others) {
                 if isNull(&r[others[x]]) { continue }
                 var ob = newStrBuf()
@@ -4583,7 +4628,7 @@ fn analyzeTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, snap: mut &le
             }
             var parts: []str = []
             for x in 0..len(keys) { append(mut &parts, toHex(&keys[x]) + "=" + cnts[x].toStr()) }
-            out.add(":" + strings.join(&parts, ",") + spanText(nums[i], mins[i], maxs[i]) + ":" + sampText(&mapSamples(m, &keyNums[i], nums[i] > 0)))
+            out.add(":" + strings.join(&parts, ",") + spanText(nums[i], mins[i], maxs[i]) + ":" + sampText(&(try mapSamples(m, &keyNums[i], nums[i] > 0))))
         } else {
             out.add(":" + spanText(0, 0.0f, 0.0f) + ":")
         }
@@ -4620,6 +4665,9 @@ const AUTO_THRESHOLD: int = 50
 const AUTO_SCALE_PCT: int = 10
 const AUTO_NAP_MS: int = 1000              // between looks (autovacuum_naptime is 60 s)
 const AUTO_COOL: int = 9                   // after an analysis of d ms, the table waits AUTO_COOL x d: at most a tenth of the time
+const AUTO_QUIET_NS: int = 300000000       // a table is analyzed once no commit has changed it for this long ...
+const AUTO_WAIT_NS: int = 30000000000      // ... or once it has waited this long for that
+const AUTO_SOON_MS: int = 200              // the next look's nap while one waits
 
 // The rows counted for one session and table, before they go to the memo
 // (chgFlush): a row's count is a few integer operations. Globals must be of
@@ -4649,6 +4697,7 @@ pub fn autoAnalyzeOn(): bool {
 }
 
 const AC_DUE: str = "\x00acdue"
+const AC_SOON: str = "\x00acsoon"
 fn acPendKey(sess: int): str { return "\x00acp\x00" + sess.toStr() }
 fn acKey(tree: int): str { return "\x00ac\x00" + tree.toStr() }
 fn acStateKey(tree: int): str { return "\x00acs\x00" + tree.toStr() }
@@ -4681,8 +4730,8 @@ fn noteChg(st: &lexdb_store.Store, txn: &lexdb_store.Txn, t: &Table, kind: int) 
 
 // A table's counts (acKey): its rows changed since its last analysis;
 // inserted, updated, deleted since the store opened; inserted less deleted
-// since its last analysis.
-fn acCounts(st: &lexdb_store.Store, tree: int): []int { return intsOf(&st.memoGet(&acKey(tree)).unwrapOr(""), 5) }
+// since its last analysis; when a commit last changed it (monotonic ns).
+fn acCounts(st: &lexdb_store.Store, tree: int): []int { return intsOf(&st.memoGet(&acKey(tree)).unwrapOr(""), 6) }
 
 // The rows counted so far into their session's pending counts:
 // "tree ins upd del" per table, ";" between.
@@ -4727,10 +4776,11 @@ fn chgEnd(st: &lexdb_store.Store, sess: int, keep: bool) {
     for p in strings.split(&got.unwrap(), ";") {
         let xs = intsOf(&p.toStr(), 4)
         // the table's: changed since its last analysis, then inserted, updated, deleted
-        var c = intsOf(&st.memoGet(&acKey(xs[0])).unwrapOr(""), 5)
+        var c = intsOf(&st.memoGet(&acKey(xs[0])).unwrapOr(""), 6)
         c[0] += xs[1] + xs[2] + xs[3]
         for i in 1..4 { c[i] += xs[i] }
         c[4] += xs[1] - xs[3]
+        c[5] = time.monotonicNs()
         st.memoPut(&acKey(xs[0]), &intsText(&c))
     }
     st.memoPut(&AC_DUE, &"1")
@@ -4738,34 +4788,36 @@ fn chgEnd(st: &lexdb_store.Store, sess: int, keep: bool) {
 
 // A table's analysis state: the rows at its last analysis (-1 not known),
 // when (lexdb_time.nowTstz(); 0 never) by ANALYZE and automatically, how
-// many of each, the time it took (ns, the automatic ones' in all), and
-// until when (monotonic ns) it waits before the next automatic one.
-type AcState = record { base: int; last: int; lastAuto: int; n: int; nAuto: int; ns: int; nsAuto: int; cool: int }
+// many of each, the time it took (ns, the automatic ones' in all), until
+// when (monotonic ns) it waits before the next automatic one, and since
+// when it has waited for its writes to pause (0 not waiting).
+type AcState = record { base: int; last: int; lastAuto: int; n: int; nAuto: int; ns: int; nsAuto: int; cool: int; since: int }
 
 fn acState(st: &lexdb_store.Store, tree: int): AcState {
     match st.memoGet(&acStateKey(tree)) {
         Some(v) {
-            let xs = intsOf(&v, 8)
-            return AcState{base: xs[0], last: xs[1], lastAuto: xs[2], n: xs[3], nAuto: xs[4], ns: xs[5], nsAuto: xs[6], cool: xs[7]}
+            let xs = intsOf(&v, 9)
+            return AcState{base: xs[0], last: xs[1], lastAuto: xs[2], n: xs[3], nAuto: xs[4], ns: xs[5], nsAuto: xs[6], cool: xs[7], since: xs[8]}
         }
-        None { return AcState{base: -1, last: 0, lastAuto: 0, n: 0, nAuto: 0, ns: 0, nsAuto: 0, cool: 0} }
+        None { return AcState{base: -1, last: 0, lastAuto: 0, n: 0, nAuto: 0, ns: 0, nsAuto: 0, cool: 0, since: 0} }
     }
 }
 
 fn acPut(st: &lexdb_store.Store, tree: int, a: &AcState) {
-    st.memoPut(&acStateKey(tree), &intsText(&[a.base, a.last, a.lastAuto, a.n, a.nAuto, a.ns, a.nsAuto, a.cool]))
+    st.memoPut(&acStateKey(tree), &intsText(&[a.base, a.last, a.lastAuto, a.n, a.nAuto, a.ns, a.nsAuto, a.cool, a.since]))
 }
 
 // Table t analyzed (auto: by the task), its rows counted; c0 its counts
 // when the analysis began (acKey's: changes since then stay counted); ns
 // its time.
 fn acDone(st: &lexdb_store.Store, t: &Table, rows: int, c0: &[]int, auto: bool, ns: int) {
-    var c = intsOf(&st.memoGet(&acKey(t.tree)).unwrapOr(""), 5)
+    var c = intsOf(&st.memoGet(&acKey(t.tree)).unwrapOr(""), 6)
     c[0] = max(0, c[0] - c0[0])
     c[4] = c[4] - c0[4]
     st.memoPut(&acKey(t.tree), &intsText(&c))
     var a = acState(st, t.tree)
     a.base = rows
+    a.since = 0
     if auto {
         a.lastAuto = lexdb_time.nowTstz()
         a.nAuto += 1
@@ -4801,6 +4853,13 @@ fn statRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table): Resul
 pub fn autoAnalyzeStep(st: &lexdb_store.Store): Result[int, DbErr] {
     if st.isReplica() || !autoAnalyzeOn() { return Ok(0) }
     st.memoDel(&AC_DUE)
+    let r = autoLook(st)
+    // (an error before a table's own: looked at again at the next look)
+    if r.isErr() { st.memoPut(&AC_DUE, &"1") }
+    return r
+}
+
+fn autoLook(st: &lexdb_store.Store): Result[int, DbErr] {
     var keys: []str = []
     var raw: []str = []
     var lt = lexdb_store.begin()
@@ -4828,8 +4887,17 @@ pub fn autoAnalyzeStep(st: &lexdb_store.Store): Result[int, DbErr] {
             acPut(st, t.tree, &a)
         }
         if mod <= AUTO_THRESHOLD + a.base * AUTO_SCALE_PCT / 100 { continue }
-        if time.monotonicNs() < a.cool {
+        // not while it is being written (a load committed in pieces): once
+        // its commits pause, or it has waited AUTO_WAIT_NS; not again soon
+        // after its last analysis
+        let now = time.monotonicNs()
+        if a.since == 0 {
+            a.since = now
+            acPut(st, t.tree, &a)
+        }
+        if now < a.cool || (now - c0[5] < AUTO_QUIET_NS && now - a.since < AUTO_WAIT_NS) {
             st.memoPut(&AC_DUE, &"1")
+            st.memoPut(&AC_SOON, &"1")
             continue
         }
         let t0 = time.monotonicNs()
@@ -4837,6 +4905,7 @@ pub fn autoAnalyzeStep(st: &lexdb_store.Store): Result[int, DbErr] {
         let t1 = time.monotonicNs()
         var b = acState(st, t.tree)
         b.cool = t1 + AUTO_COOL * (t1 - t0)
+        b.since = 0
         acPut(st, t.tree, &b)
         match r {
             Ok(rows) {
@@ -4915,7 +4984,10 @@ fn autoOne(st: &lexdb_store.Store, key: &str, raw: &str, t: &Table, mod: int): R
 pub fn autoAnalyzer(st: lexdb_store.Store): int {
     if st.isReplica() || !autoAnalyzeOn() { return 0 }
     while true {
-        if task.sleep(AUTO_NAP_MS).isErr() { return 0 }
+        // (sooner while a table waits for its writes to pause)
+        let soon = st.memoGet(&AC_SOON).isSome()
+        st.memoDel(&AC_SOON)
+        if task.sleep(if soon { AUTO_SOON_MS } else { AUTO_NAP_MS }).isErr() { return 0 }
         if st.memoGet(&AC_DUE).isNone() { continue }
         match autoAnalyzeStep(&st) {
             Ok(_) {}

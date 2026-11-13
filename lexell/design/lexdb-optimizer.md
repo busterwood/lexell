@@ -2600,6 +2600,136 @@ only after the join order, when `narrow` has the statement's columns
   now (the range holds over 1/16 of the table), so its two rows come in
   the key's order.
 
+## 44. Automatic statistics (2026-11-13)
+
+The cost-based join order (section 26) needs ANALYZE's statistics on every
+table of a join, and real applications rarely run ANALYZE. After a bulk
+load of `w` (1M rows) and `d` (1,000), `select count(*), sum(d.grp) from w
+join d on d.k = w.a` looked `d` up by key per row of `w`; with statistics it
+hashes `d` over batches (measured below). PostgreSQL's autovacuum analyzes
+a table once its changed rows pass `autovacuum_analyze_threshold` (50) +
+`autovacuum_analyze_scale_factor` (0.1) x its rows. lexdb does the same.
+
+**What is counted** (`noteChg`, `chgFlush`, `chgEnd`):
+- Each row an INSERT, UPDATE or DELETE writes, at the three places every
+  row write goes through: `storeRow` (INSERT, COPY, INSERT ... SELECT, ON
+  CONFLICT's insert), `updRow` (UPDATE, ON CONFLICT DO UPDATE, a cascade's
+  update), `delRow` (DELETE, a cascade's delete). A row costs a few integer
+  operations: the counts for one session and table at a time are kept in
+  copy-type globals (Lexell's globals must be of copy types; the SQL runs
+  on one thread) and go to the store's memo when the session or table
+  changes.
+- Per session while its transaction runs; added to the table's counts when
+  it commits (the COMMIT, or an autocommit statement's commit), dropped
+  when it does not (ROLLBACK, an error, a conflict retried), as
+  PostgreSQL's `changed_tuples`. A COPY that commits in batches
+  (`batch_rows`) adds its counts at the statement's end. ROLLBACK TO a
+  savepoint keeps its rows counted: too many at worst, which only brings
+  an analysis early.
+- Not counted: temporary tables (autovacuum does not see them either),
+  internal transactions (no session), TRUNCATE and ALTER TABLE's rewrite
+  (they make a new tree: the table starts again with no counts and the
+  threshold of a table never analyzed).
+- Kept in the store's memo (in memory): per table (by its tree) the rows
+  changed since its last analysis, inserted, updated and deleted since the
+  store opened, and inserted less deleted since its last analysis. Lost at
+  a restart, as PostgreSQL's statistics are after a crash. The rows at the
+  last analysis (PostgreSQL's `reltuples`) come from ANALYZE's own
+  statistics row when the memo has none; a table never analyzed counts 0
+  rows, so 50 changes are its threshold, as in PostgreSQL.
+
+**When** (`autoAnalyzeStep`, a "look"): a table is analyzed when its
+changes since its last analysis exceed `AUTO_THRESHOLD` (50) +
+`AUTO_SCALE_PCT` (10)% of its rows then. ANALYZE (outside a block, which
+may roll back) starts its count again too.
+
+**Who** (`autoAnalyzer`): a task the master starts beside the writer, the
+checkpointer and the replication server. It sleeps `AUTO_NAP_MS` (1 s;
+autovacuum's naptime is 60 s) and looks when a commit has counted
+changes since its last look (or a table is still waiting: below). Each table is analyzed by `analyzeTable`, the
+same code as ANALYZE, on a snapshot of its own, in a transaction of its
+own that reads the table's catalog row (so a DROP or ALTER meanwhile fails
+its commit and nothing is written) and writes the statistics row and the
+statistics' version (prepared statements are planned again). An error (a
+conflict, a snapshot gone too old beside heavy writes: 72000) leaves the
+table due; the next look tries again.
+
+**Taking turns** (lexdb 9.15). `analyzeTable` now yields after `TURN_NS`
+(0.1 ms) of reading, as a statement's run does. Before, an ANALYZE of a
+million rows held every session for about 1.2 s; explicit ANALYZE gains
+this too. With 30,000 rows analyzed beside a session doing point selects
+(`exec_autostats`), the longest wait between two selects was about 3.9 ms
+of a 33 ms analysis (the part between two yields: a batch of rows, and the
+counting at the end).
+
+**Not while the table is being written.** A table grows past its
+threshold again and again during a load committed in pieces: analyzed at
+each 10%, a load of N rows would be read about 10 N times, and each
+analysis read while the load runs. The first version did this: a load of
+1M rows as 100 COPYs of 10,000 was analyzed once at about 170,000 rows,
+taking 2.1 s beside the load, and the cooling below then kept the
+statistics of 170,000 rows for 19 s after the load ended. So a table due is
+analyzed once no commit has changed it for `AUTO_QUIET_NS` (300 ms), or
+once it has waited `AUTO_WAIT_NS` (30 s) for that, so that a table written
+all the time is analyzed too. While one waits, the task looks every
+`AUTO_SOON_MS` (200 ms). And a table analyzed in d ms waits `AUTO_COOL` (9)
+x d before its next automatic analysis: at most about a tenth of the time
+goes to it under steady writes. The look stays due meanwhile.
+
+**Off.**
+- `LEXDB_AUTOANALYZE=off` (also 0, false, no) in the server's
+  environment: nothing is counted and the task ends at once
+  (`setAutoAnalyze` does the same in a test program).
+- `SET lexdb_autoanalyze = off`: a session's changes are not counted (a
+  loader that runs ANALYZE itself). Saved and restored with a block, reset
+  by RESET ALL, shown by SHOW ALL. PostgreSQL's own switch, `autovacuum`, is
+  server-wide and cannot be SET in a session; lexdb has no configuration
+  file, so the server-wide switch is the environment variable.
+- A replica never analyzes: the task is not started there (`runReplica`),
+  a look does nothing on a replica store, and its sessions cannot write, so
+  they count nothing. The master's statistics reach it with the rest of
+  the catalog.
+
+**Results never change, only plans.** Statistics are read unnoted
+(`getUnnoted`), so an automatic analysis never makes a user's transaction
+fail (section 20); its writes are only the statistics' rows and version.
+
+**`pg_stat_user_tables`**, PostgreSQL 18's columns: lexdb fills
+`n_tup_ins`, `n_tup_upd`, `n_tup_del` (since the store opened),
+`n_live_tup` (the rows at the last analysis, plus inserted less deleted
+since), `n_mod_since_analyze`, `last_analyze`, `last_autoanalyze`,
+`analyze_count`, `autoanalyze_count`, `total_analyze_time` and
+`total_autoanalyze_time` (ms); the scan and vacuum columns are 0 or NULL.
+
+**Existing tests.** None changed its plans: the tests run sessions inside
+their own program, not lexdb's master, so no analyzer task runs in them,
+and none of them calls a look. (Were the task running, tables of fewer
+than 51 rows would never be analyzed, but most tests' tables are larger.)
+`exec_analyze`'s SHOW ALL lists the new setting: its only changed
+expectation.
+
+**Tests** (`exec_autostats`): the threshold (49, 50, 51 changes; 56 on 51
+rows; 151 on 1,000), and none at once after a commit (300 ms); what is counted and what is not (a rolled back block,
+a failed statement, a temporary table, a session with the setting off, the
+process switch off; a block per kind, ROLLBACK TO, a cascade); ANALYZE in
+and out of a block; plans changing as statistics come (the tie of section
+20, then the estimate on 1,000 rows; a join ordered by cost, its result the
+same); turns; the task itself analyzing within its naps; a replica that
+refuses the write, counts nothing, does nothing at a look, and plans with
+the master's statistics once it has them.
+
+MEASURED
+
+**Not done.**
+- Sampling: an analysis reads the whole table, as ANALYZE does (PostgreSQL
+  reads 30,000 rows). On a table of 100 million rows each automatic
+  analysis takes minutes, spread by the turns and spaced by `AUTO_COOL`.
+- Per-table settings (PostgreSQL's `autovacuum_enabled`,
+  `autovacuum_analyze_threshold` as storage parameters): lexdb has no
+  storage parameters.
+- The counts do not survive a restart; after one, a table that was never
+  analyzed needs 50 new changes, and one that was needs its threshold anew.
+
 ## Sources
 
 - SQLite, Query Planner Next Generation: https://sqlite.org/queryplanner-ng.html
