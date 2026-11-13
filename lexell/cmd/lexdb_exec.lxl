@@ -254,12 +254,17 @@ fn parseBool(s: &str): Option[bool] {
     return None
 }
 
+// The digits before d's point (0 for |d| < 1): the coefficient's digits
+// and the exponent (9.119; it was d's text, made and searched).
 fn intDigits(d: &Decimal): int {
-    let s = d.abs().toStr()
-    let dot = strings.indexOf(&s, ".", 0)
-    let ip = if dot < 0 { s } else { s[0..dot] }
-    if ip == "0" { return 0 }
-    return len(ip)
+    var c = d.coefficient()
+    var n = 0
+    while c > 0 {
+        c = c / 10
+        n += 1
+    }
+    let k = n + d.exponent()
+    return if n == 0 || k < 0 { 0 } else { k }
 }
 
 fn intRange(t: &lexdb_sql.TypeName, n: int): Result[int, DbErr] {
@@ -3191,6 +3196,11 @@ fn timeVal(s: &str, at: int, tag: byte): Val {
 
 extern "c" fn getrandom(buf: mut &[byte], n: int, flags: u32): int
 
+// Each byte's value as a hex digit, 255 for none: HEX_LOW lower case only
+// (a canonical uuid), HEX_ANY either case (9.119).
+const HEX_LOW: str = "\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\x0a\x0b\x0c\x0d\x0e\x0f\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff"
+const HEX_ANY: str = "\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\xff\xff\xff\xff\xff\xff\xff\x0a\x0b\x0c\x0d\x0e\x0f\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\x0a\x0b\x0c\x0d\x0e\x0f\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff"
+
 fn hexVal(c: byte): int {
     if c >= '0' && c <= '9' { return int(c - '0') }
     if c >= 'a' && c <= 'f' { return int(c - 'a') + 10 }
@@ -3201,6 +3211,12 @@ fn hexVal(c: byte): int {
 // A uuid in any of PostgreSQL's forms (upper or lower case, in braces, a
 // hyphen after any group of four digits or none), as its canonical form.
 fn parseUuid(s: &str): Result[str, DbErr] {
+    // the canonical form, lower case: taken as it is (9.119)
+    if len(s) == 36 && s[8] == '-' && s[13] == '-' && s[18] == '-' && s[23] == '-' {
+        var bad = 0
+        for i in 0..36 { if i != 8 && i != 13 && i != 18 && i != 23 { bad = bad | int(HEX_LOW[int(s[i])]) } }
+        if bad < 16 { return Ok(s.toStr()) }
+    }
     let bad = e("22P02", "invalid input syntax for type uuid: \"" + s + "\"")
     var t = strings.trim(s)
     if len(t) > 0 && t[0] == '{' {
@@ -3227,17 +3243,17 @@ fn parseUuid(s: &str): Result[str, DbErr] {
 
 // A canonical uuid's 16 bytes, and back.
 fn uuidBytes(u: &str): str {
-    var b = newStrBuf()
+    var b: []byte = withCapacity(16)
     var i = 0
-    while i < len(u) {
+    while i + 1 < len(u) {
         if u[i] == '-' {
             i += 1
             continue
         }
-        b.addByte(byte(hexVal(u[i]) * 16 + hexVal(u[i + 1])))
+        append(mut &b, byte(int(HEX_ANY[int(u[i])]) * 16 + int(HEX_ANY[int(u[i + 1])])))
         i += 2
     }
-    return b.toStr()
+    return strFromBytes(&b)
 }
 
 fn uuidText(raw: &str): str {
@@ -13949,7 +13965,24 @@ fn insertOne(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, targe
         given[ci] = true
     }
     // the others their defaults (a sequence's taken only for these)
-    for i in 0..len(t.cols) { if !given[i] { row[i] = try defAt(st, txn, defs, t, i) } }
+    for i in 0..len(t.cols) {
+        if given[i] { continue }
+        if len(defs.seqs[i].key) > 0 && t.cols[i].name == ROWID {
+            // the hidden key: the statement's run of its sequence's values;
+            // currval and lastval are not set, as PostgreSQL has no such key
+            if up.ridLeft == 0 {
+                let r = try nextRun(st, &defs.seqs[i], up.ridWant)
+                up.ridNext = r.first
+                up.ridLeft = r.count
+                if up.ridWant < ROWID_RUN { up.ridWant = up.ridWant * 2 }
+            }
+            row[i] = Val.Int(up.ridNext)
+            up.ridNext += defs.seqs[i].inc
+            up.ridLeft -= 1
+            continue
+        }
+        row[i] = try defAt(st, txn, defs, t, i)
+    }
     if up.idBump {
         for i in 0..len(t.cols) {
             if !given[i] || len(t.cols[i].seq) == 0 { continue }
@@ -13995,11 +14028,19 @@ type Upsert = record {
     idBump: bool
     idCols: []int
     idMax: []int
+    // the hidden key's values not yet used, from its sequence's last run
+    // (9.119): next, then left more; want, the next run's size (doubled each
+    // time, up to ROWID_RUN, so a one-row INSERT takes one)
+    ridNext: int
+    ridLeft: int
+    ridWant: int
 }
+
+const ROWID_RUN: int = 1024
 
 fn noUpsert(): Upsert {
     return Upsert{mode: lexdb_sql.CONFLICT_NONE, arb: [], targets: [], sets: [], cond: None, cols: [], touched: newMap(), idBump: false,
-                  idCols: [], idMax: []}
+                  idCols: [], idMax: [], ridNext: 0, ridLeft: 0, ridWant: 1}
 }
 
 fn sameCols(a: &[]int, b: &[]int): bool {
@@ -14131,7 +14172,10 @@ fn storeRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, row: [
             later: mut &[]FkLater): Result[[]Val, DbErr] {
     try checkEnums(st, txn, t, &row)
     let key = keyOf(t, &row)
-    if (try st.get(txn, t.tree, key)).isSome() { return Err(dupKey(t, &row)) }
+    // the hidden key is its sequence's next value, never given (no name in
+    // SQL can reach it): no row can have it already, so it is not looked
+    // for, nor read (9.119)
+    if !rowidKeyed(t) && (try st.get(txn, t.tree, key)).isSome() { return Err(dupKey(t, &row)) }
     let enc = encRowOf(t, &row)
     try txn.putRow(t.tree, key, enc, rowHead(&enc))
     noteChg(st, txn, t, 0)
@@ -20110,7 +20154,15 @@ fn seqWrite(st: &lexdb_store.Store, d: &Seq, v: int): Result[Unit, DbErr] {
 }
 
 // The sequence's next value.
-fn nextVal(st: &lexdb_store.Store, d: &Seq): Result[int, DbErr] {
+fn nextVal(st: &lexdb_store.Store, d: &Seq): Result[int, DbErr] { return Ok((try nextRun(st, d, 1)).first) }
+
+// Values given out together: first, then each inc after it, count of them.
+type SeqRun = value record { first: int; count: int }
+
+// The next values of d: up to want of them in a run, as many as its block
+// holds (at least 1); a new block, when one is needed, holds at least want
+// (9.119: a bulk load's hidden keys, a run at a time).
+fn nextRun(st: &lexdb_store.Store, d: &Seq, want: int): Result[SeqRun, DbErr] {
     let kn = memoNext(d)
     let kl = memoLast(d)
     while true {
@@ -20168,9 +20220,16 @@ fn nextVal(st: &lexdb_store.Store, d: &Seq): Result[int, DbErr] {
         let lv = st.memoGet(&kl).unwrapOr("")
         let held = len(lv) > 0 && (if d.inc > 0 { n <= num(&lv) } else { n >= num(&lv) })
         if held {
-            st.memoPut(&kn, &seqAfter(d, n))
-            st.memoPut(&memoGiven(d), &n.toStr())
-            return Ok(n)
+            var c = 1
+            if want > 1 && d.inc != INT_MIN {
+                let ln = num(&lv)
+                let avail = (if d.inc > 0 { span(ln, n) / d.inc } else { span(n, ln) / (0 - d.inc) }) + 1
+                c = if avail < want { avail } else { want }
+            }
+            let last = n + (c - 1) * d.inc
+            st.memoPut(&kn, &seqAfter(d, last))
+            st.memoPut(&memoGiven(d), &last.toStr())
+            return Ok(SeqRun{first: n, count: c})
         }
         // the next block: its last value written before its first is given
         if st.memoGet(&memoBusy(d)).isSome() {
@@ -20178,7 +20237,8 @@ fn nextVal(st: &lexdb_store.Store, d: &Seq): Result[int, DbErr] {
             continue
         }
         st.memoPut(&memoBusy(d), &"1")
-        let steps = (if d.cache > 32 { d.cache } else { 32 }) - 1
+        let base = if d.cache > 32 { d.cache } else { 32 }
+        let steps = (if want > base { want } else { base }) - 1
         // the steps left before the bound: n's distance to it over the
         // increment, each by span (the guards' own sums overflowed when
         // max < 0 or min > 0, 9.116; a distance over the largest integer,
@@ -20194,7 +20254,7 @@ fn nextVal(st: &lexdb_store.Store, d: &Seq): Result[int, DbErr] {
             Err(x) { return Err(x) }
         }
     }
-    return Ok(0)
+    return Ok(SeqRun{first: 0, count: 1})
 }
 
 // setval(d, v, called): the next value v + inc (called) or v; written at
@@ -21006,7 +21066,7 @@ fn copyStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
     let defs = try defaultsOf(st, txn, &t)
     let fw = try fkTables(st, txn, &t, true, false)
     var later: []FkLater = []
-    var rd = CopyRd{at: 0, line: 0, start: 0, notNull: try forced(&s.copy.forceNotNull, &names, &"FORCE_NOT_NULL"),
+    var rd = CopyRd{at: 0, line: 0, start: 0, stops: s.copy.delim[0..1] + "\n\r\\", notNull: try forced(&s.copy.forceNotNull, &names, &"FORCE_NOT_NULL"),
                     forceNull: try forced(&s.copy.forceNull, &names, &"FORCE_NULL")}
     var vs: []Val = []
     var count = 0
@@ -21122,6 +21182,7 @@ type CopyRd = record {
     at: int
     line: int
     start: int
+    stops: str                  // the text format's bytes that end a run of data: the delimiter, \n, \r, \\
     notNull: []bool             // per field: FORCE_NOT_NULL
     forceNull: []bool           // per field: FORCE_NULL
 }
@@ -21167,7 +21228,7 @@ fn copyRecord(data: &str, o: &lexdb_sql.CopyOpts, rd: mut &CopyRd, vs: mut &[]Va
     rd.start = rd.at
     replace(vs, [])
     if !o.csv {
-        rd.at = textRecord(data, o, rd.at, vs)
+        rd.at = textRecord(data, o, rd.at, &rd.stops, vs)
         return Ok(true)
     }
     let first = rd.line
@@ -21184,7 +21245,7 @@ fn copyRecord(data: &str, o: &lexdb_sql.CopyOpts, rd: mut &CopyRd, vs: mut &[]Va
 // The text format: fields split by the delimiter, backslash escapes, NULL
 // written as o.null (compared before the escapes are undone). The index
 // after the record's line.
-fn textRecord(data: &str, o: &lexdb_sql.CopyOpts, at: int, vs: mut &[]Val): int {
+fn textRecord(data: &str, o: &lexdb_sql.CopyOpts, at: int, stops: &str, vs: mut &[]Val): int {
     let n = len(data)
     let d = o.delim[0]
     var b = newStrBuf()
@@ -21192,6 +21253,11 @@ fn textRecord(data: &str, o: &lexdb_sql.CopyOpts, at: int, vs: mut &[]Val): int 
     var raw = at
     var i = at
     while true {
+        // the next byte that matters (9.119: found 16 at a time)
+        var j = strings.indexOfAny(data, stops, i)
+        if j < 0 { j = n }
+        if esc && j > i { b.add(data[i..j]) }
+        i = j
         let end = i >= n || data[i] == '\n' || (data[i] == '\r' && i + 1 < n && data[i + 1] == '\n')
         if end || data[i] == d {
             if data[raw..i] == o.null { append(vs, Val.Null) }
@@ -21215,6 +21281,7 @@ fn textRecord(data: &str, o: &lexdb_sql.CopyOpts, at: int, vs: mut &[]Val): int 
             i = lexdb_sql.unescape(data, i + 1, mut &b)
             continue
         }
+        // a lone \r, or a backslash ending the data: the byte itself
         if esc { b.addByte(data[i]) }
         i += 1
     }
@@ -26894,26 +26961,29 @@ pub fn setLegacyKinds(on: bool) { legacyKinds = on }
 // Each place's kind, from its column's type.
 fn placeKinds(t: &Table): []byte {
     var out: []byte = array(rowWidth(t), PK_NONE)
-    for i in 0..len(t.cols) {
-        let o = t.cols[i].typ.oid
-        var k = PK_TEXT
-        if o == lexdb_sql.OID_INT8 { k = PK_INT }
-        else if o == lexdb_sql.OID_INT4 { k = PK_INT4 }
-        else if o == lexdb_sql.OID_INT2 { k = PK_INT2 }
-        else if o == lexdb_sql.OID_BOOL { k = PK_BOOL }
-        else if o == lexdb_sql.OID_NUMERIC { k = PK_NUM }
-        else if o == lexdb_sql.OID_DATE { k = PK_DATE }
-        else if o == lexdb_sql.OID_TIME { k = PK_TIME }
-        else if o == lexdb_sql.OID_TS { k = PK_TS }
-        else if o == lexdb_sql.OID_TSTZ { k = PK_TSTZ }
-        else if o == lexdb_sql.OID_FLOAT8 { k = PK_F8 }
-        else if o == lexdb_sql.OID_FLOAT4 { k = PK_F4 }
-        else if o == lexdb_sql.OID_UUID { k = PK_UUID }
-        else if o == lexdb_sql.OID_BYTEA { k = PK_BYTEA }
-        if legacyKinds && k >= PK_DATE { k = PK_TEXT }
-        out[if len(t.slots) == 0 { i } else { t.slots[i] }] = k
-    }
+    for i in 0..len(t.cols) { out[if len(t.slots) == 0 { i } else { t.slots[i] }] = placeKind(&t.cols[i]) }
     return out
+}
+
+// The kind of place a column has in the current layout.
+fn placeKind(c: &lexdb_sql.ColDef): byte {
+    let o = c.typ.oid
+    var k = PK_TEXT
+    if o == lexdb_sql.OID_INT8 { k = PK_INT }
+    else if o == lexdb_sql.OID_INT4 { k = PK_INT4 }
+    else if o == lexdb_sql.OID_INT2 { k = PK_INT2 }
+    else if o == lexdb_sql.OID_BOOL { k = PK_BOOL }
+    else if o == lexdb_sql.OID_NUMERIC { k = PK_NUM }
+    else if o == lexdb_sql.OID_DATE { k = PK_DATE }
+    else if o == lexdb_sql.OID_TIME { k = PK_TIME }
+    else if o == lexdb_sql.OID_TS { k = PK_TS }
+    else if o == lexdb_sql.OID_TSTZ { k = PK_TSTZ }
+    else if o == lexdb_sql.OID_FLOAT8 { k = PK_F8 }
+    else if o == lexdb_sql.OID_FLOAT4 { k = PK_F4 }
+    else if o == lexdb_sql.OID_UUID { k = PK_UUID }
+    else if o == lexdb_sql.OID_BYTEA { k = PK_BYTEA }
+    if legacyKinds && k >= PK_DATE { k = PK_TEXT }
+    return k
 }
 
 fn fixedSize(k: byte): int {
@@ -27025,27 +27095,43 @@ fn encFixed(t: &Table, places: &[]Val): Option[str] {
     if n > 255 || len(places) != n { return None }
     // the table as it stands must have this layout as its current one (or
     // one stored before 9.113's kinds: olderKinds)
-    let cur = placeKinds(t)
-    if !sameKinds(kinds, &cur) && !olderKinds(kinds, &cur) { return None }
-    var bits: []byte = array((n + 7) / 8, byte(0))
-    var vars: []str = []
-    var words: []int = array(n, 0)
+    if !kindsFit(t, kinds) { return None }
+    // first the values checked against their places, and the variable
+    // part's size; a numeric's or a uuid's bytes made once (conv)
+    var fixed = 3 + (n + 7) / 8
+    var varLen = 0
+    var conv: []str = []
     for p in 0..n {
         let k = kinds[p]
         match places[p] {
-            Val.Null { bits[p / 8] = bits[p / 8] | byte(1 << (p % 8)) }
-            Val.Bool(_) { if k != PK_BOOL { return None } }
+            Val.Null { if isVarKind(k) { fixed += 2 } else { fixed += fixedSize(k) } }
+            Val.Bool(_) {
+                if k != PK_BOOL { return None }
+                fixed += 1
+            }
+            Val.Text(x) {
+                if k != PK_TEXT || len(x) >= LONG { return None }
+                varLen += len(x)
+                fixed += 2
+            }
+            Val.Bytes(x) {
+                if k != PK_BYTEA || len(x) >= LONG { return None }
+                varLen += len(x)
+                fixed += 2
+            }
             else {
                 if isWordKind(k) {
                     match wordOf(&places[p], k) {
-                        Some(w) { words[p] = w }
+                        Some(_) { fixed += fixedSize(k) }
                         None { return None }
                     }
                 } else if isVarKind(k) {
                     match varBytes(&places[p], k) {
                         Some(x) {
                             if len(x) >= LONG { return None }
-                            append(mut &vars, x)
+                            varLen += len(x)
+                            fixed += 2
+                            append(mut &conv, x)
                         }
                         None { return None }
                     }
@@ -27055,33 +27141,73 @@ fn encFixed(t: &Table, places: &[]Val): Option[str] {
             }
         }
     }
-    var b = newStrBuf()
-    b.addByte(FIXED)
-    binary.addU16LE(mut &b, nl - 1)
-    for x in bits { b.addByte(x) }
+    if varLen > 65535 { return None }
+    var b: []byte = withCapacity(fixed + varLen)
+    append(mut &b, FIXED)
+    binary.appendU16LE(mut &b, nl - 1)
+    let bits0 = len(b)
+    for i in 0..(n + 7) / 8 { append(mut &b, byte(0)) }
     var end = 0
-    var vi = 0
+    var ci = 0
     for p in 0..n {
         let k = kinds[p]
+        if isNull(&places[p]) { b[bits0 + p / 8] = b[bits0 + p / 8] | byte(1 << (p % 8)) }
         if isWordKind(k) {
-            let v = words[p]
-            let w = fixedSize(k)
-            if w == 8 { binary.addU64LE(mut &b, v) }
-            else if w == 4 { binary.addU32LE(mut &b, v & 0xFFFFFFFF) }
-            else { binary.addU16LE(mut &b, v & 0xFFFF) }
-        } else if k == PK_BOOL {
-            b.addByte(match places[p] { Val.Bool(x) { if x { 1 } else { 0 } } else { 0 } })
-        } else if isVarKind(k) {
-            if !isNull(&places[p]) {
-                end += len(vars[vi])
-                vi += 1
+            var v = 0
+            match wordOf(&places[p], k) {
+                Some(w) { v = w }
+                None {}
             }
-            if end > 65535 { return None }
-            binary.addU16LE(mut &b, end)
+            let w = fixedSize(k)
+            if w == 8 { binary.appendU64LE(mut &b, v) }
+            else if w == 4 { binary.appendU32LE(mut &b, v & 0xFFFFFFFF) }
+            else { binary.appendU16LE(mut &b, v & 0xFFFF) }
+        } else if k == PK_BOOL {
+            append(mut &b, match places[p] { Val.Bool(x) { if x { byte(1) } else { byte(0) } } else { byte(0) } })
+        } else if isVarKind(k) {
+            match places[p] {
+                Val.Null {}
+                Val.Text(x) { end += len(x) }
+                Val.Bytes(x) { end += len(x) }
+                else {
+                    end += len(conv[ci])
+                    ci += 1
+                }
+            }
+            binary.appendU16LE(mut &b, end)
         }
     }
-    for x in vars { b.add(x) }
-    return Some(b.toStr())
+    ci = 0
+    for p in 0..n {
+        if !isVarKind(kinds[p]) { continue }
+        match places[p] {
+            Val.Null {}
+            Val.Text(x) { appendStr(mut &b, x) }
+            Val.Bytes(x) { appendStr(mut &b, x) }
+            else {
+                appendStr(mut &b, conv[ci])
+                ci += 1
+            }
+        }
+    }
+    return Some(strFromBytes(&b))
+}
+
+// Whether kinds is the table's current layout (placeKinds(t)), or one
+// stored before 9.113's kinds (olderKinds), without making placeKinds'
+// array: every column's place of its kind (or text for an older one), and
+// every other place none.
+fn kindsFit(t: &Table, kinds: &[]byte): bool {
+    if len(kinds) != rowWidth(t) { return false }
+    var none = 0
+    for k in kinds { if k == PK_NONE { none += 1 } }
+    if none != len(kinds) - len(t.cols) { return false }
+    for i in 0..len(t.cols) {
+        let k = placeKind(&t.cols[i])
+        let have = kinds[if len(t.slots) == 0 { i } else { t.slots[i] }]
+        if have != k && !(have == PK_TEXT && k >= PK_DATE) { return false }
+    }
+    return true
 }
 
 // The layout of a row in the fixed form, of its table's lays.

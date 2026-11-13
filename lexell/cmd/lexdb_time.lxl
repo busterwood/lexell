@@ -563,6 +563,78 @@ fn parseTod(s: &str, from: int): Option[TodPart] {
     return Some(TodPart{us: total, end: i, ok: ok})
 }
 
+// The common ISO forms read at once (COPY's, drivers' parameters, design
+// lexdb 9.119): YYYY-MM-DD with a 4-digit year; for a timestamp then [ T]
+// HH:MM:SS[.f], at most 6 fraction digits, then Z or +-HH[[:]MM[:SS]], or
+// nothing. Every part in its plain range (no 24:00, no leap second). None for
+// anything else: the general parse decides, its errors included, and gives
+// the same value for whatever this takes.
+type FastTs = value record { us: int; has: bool; off: int }
+
+fn d2(s: &str, i: int): int {
+    let a = s[i]
+    let b = s[i + 1]
+    if a < '0' || a > '9' || b < '0' || b > '9' { return -1 }
+    return int(a - '0') * 10 + int(b - '0')
+}
+
+fn fastTs(s: &str, dateOnly: bool): Option[FastTs] {
+    let n = len(s)
+    if n < 10 || s[4] != '-' || s[7] != '-' { return None }
+    let y = num(s, 0, 4)
+    let m = d2(s, 5)
+    let d = d2(s, 8)
+    if y < 1 || m < 1 || m > 12 || d < 1 || (d > 28 && d > time.daysInMonth(y, m)) { return None }
+    var us = daysOf(time.Date{year: y, month: m, day: d}) * DAY_US
+    if n == 10 { return Some(FastTs{us: us, has: false, off: 0}) }
+    if dateOnly || n < 19 { return None }
+    let sep = s[10]
+    if (sep != ' ' && sep != 'T' && sep != 't') || s[13] != ':' || s[16] != ':' { return None }
+    let hh = d2(s, 11)
+    let mi = d2(s, 14)
+    let ss = d2(s, 17)
+    if hh < 0 || hh > 23 || mi < 0 || mi > 59 || ss < 0 || ss > 59 { return None }
+    us += ((hh * 60 + mi) * 60 + ss) * SEC_US
+    var i = 19
+    if i < n && s[i] == '.' {
+        i += 1
+        let f = i
+        var fr = 0
+        while i < n && isDigit(s[i]) && i - f < 7 {
+            fr = fr * 10 + int(s[i] - '0')
+            i += 1
+        }
+        let k = i - f
+        if k == 0 || k > 6 { return None }
+        for j in k..6 { fr *= 10 }
+        us += fr
+    }
+    if i == n { return Some(FastTs{us: us, has: false, off: 0}) }
+    let c = s[i]
+    if (c == 'Z' || c == 'z') && i + 1 == n { return Some(FastTs{us: us, has: true, off: 0}) }
+    if c != '+' && c != '-' { return None }
+    let r = n - i - 1
+    var oh = -1
+    var om = 0
+    var os = 0
+    if r == 2 {
+        oh = d2(s, i + 1)
+    } else if r == 4 {
+        oh = d2(s, i + 1)
+        om = d2(s, i + 3)
+    } else if r == 5 && s[i + 3] == ':' {
+        oh = d2(s, i + 1)
+        om = d2(s, i + 4)
+    } else if r == 8 && s[i + 3] == ':' && s[i + 6] == ':' {
+        oh = d2(s, i + 1)
+        om = d2(s, i + 4)
+        os = d2(s, i + 7)
+    }
+    if oh < 0 || oh > 15 || om < 0 || om > 59 || os < 0 || os > 59 { return None }
+    let off = (oh * 60 + om) * 60 + os
+    return Some(FastTs{us: us, has: true, off: if c == '-' { -off } else { off }})
+}
+
 fn lower(s: &str): str { return strings.toLowerAscii(strings.trim(s)) }
 
 // The special words of the date and time types, as days or microseconds
@@ -594,6 +666,12 @@ fn withEra(d: time.Date, bc: bool): time.Date { return if bc { time.Date{year: 1
 
 // A date ('today' and the like in zone z).
 pub fn parseDate(s: &str, z: &Zone): Result[int, lexdb_base.DbErr] {
+    if len(s) == 10 {
+        match fastTs(s, true) {
+            Some(f) { return Ok(f.us / DAY_US) }
+            None {}
+        }
+    }
     let w = lower(s)
     match special(&w, true, z) {
         Some(v) { return Ok(v) }
@@ -714,6 +792,10 @@ fn parseTsText(s: &str, kind: &str): Result[TsParse, lexdb_base.DbErr] {
 // A timestamp: a zone given with it is ignored, as PostgreSQL ignores it
 // ('today' and the like in zone z).
 pub fn parseTs(s: &str, z: &Zone): Result[int, lexdb_base.DbErr] {
+    match fastTs(s, false) {
+        Some(f) { return Ok(f.us) }
+        None {}
+    }
     match special(&lower(s), false, z) {
         Some(v) { return Ok(v) }
         None {}
@@ -725,6 +807,10 @@ pub fn parseTs(s: &str, z: &Zone): Result[int, lexdb_base.DbErr] {
 // A timestamptz: the zone given (an offset, an abbreviation, a zone's
 // name), else the session's, z.
 pub fn parseTstz(s: &str, z: &Zone): Result[int, lexdb_base.DbErr] {
+    match fastTs(s, false) {
+        Some(f) { return Ok(if f.has { f.us - f.off * SEC_US } else { tsToTstz(f.us, z) }) }
+        None {}
+    }
     let w = lower(s)
     match special(&w, false, z) {
         Some(v) {
