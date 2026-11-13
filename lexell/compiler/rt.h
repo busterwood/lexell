@@ -911,6 +911,10 @@ static int rt_hash_seed_env(unsigned char* k) {
     for (int j = 0; j < 8; j++) { k[j] = (uint8_t)(w0 >> (8 * j)); k[8 + j] = (uint8_t)(w1 >> (8 * j)); }
     return 1;
 }
+/* lib math's bitsOf and fromBits (math.lxl): a double's IEEE 754 bits as an int and back, as they
+   are in memory (math keeps its NaN rules). */
+int64_t lxllib_float_bits(double x) { int64_t b; memcpy(&b, &x, 8); return b; }
+double lxllib_float_from_bits(int64_t b) { double x; memcpy(&x, &b, 8); return x; }
 /* lib std's hash key (std.lxl, "keyed hashing"): the 16 random bytes the kernel gives every
    process (AT_RANDOM, no system call); std derives its key from them. Without AT_RANDOM (never
    on Linux since 2.6.29) getrandom fills them. Word i, 0 or 1. */

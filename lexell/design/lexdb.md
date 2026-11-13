@@ -11315,3 +11315,86 @@ server alone, other benchmarks held off by a lock):
   rolled back (9.43).
 - Generated (computed) columns, and OWNER TO a role that does not exist,
   are left out, as asked.
+
+### 9.118 Bulk loads compared; doubles parsed by Eisel-Lemire
+
+The user asked how lexdb's COPY compares with PostgreSQL's and with SQL
+Server's bulk copy, since fast batch ingestion matters most to them.
+
+**What SQL Server clients cannot do.** The TDS endpoint has no bulk load:
+neither `INSERT BULK` nor the BulkLoadBCP packet (type 7). So `SqlBulkCopy`,
+`bcp` and SSIS fail against lexdb.
+
+**Measured** (2026-11-13). The client was psql's `\copy` for lexdb and
+PostgreSQL 18, and `bcp -c` for SQL Server 2022. Each figure is the median of
+3 runs. The commits were made durable with each server's default settings, on
+data directories without copy-on-write. SQL Server ran in a container with its
+database in SIMPLE recovery; it is a reference, not a tuned figure. The
+scripts and results are in `~/Work/lexdb-bench/saved/results/2026-11-13-copy/`.
+
+| 1M rows unless said | lexdb (peak RSS) | PostgreSQL 18 | SQL Server bcp |
+|---|---:|---:|---:|
+| narrow: int key, int, text | 1.23 s (309 MB) | 0.55 s | 1.11 s |
+| wide: 12 columns of mixed types, 174 MB | 5.15 s (619 MB) | 1.96 s | 3.19 s (2.67 s with TABLOCK) |
+| wide, with 2 secondary indexes | 9.49 s (1.16 GB) | 4.49 s | 7.04 s |
+| wide, no key | 6.63 s (649 MB) | 1.40 s | 2.15 s |
+| narrow, 10M rows | 14.3 s (3.0 GB) | 5.93 s | 10.3 s |
+| narrow, 10M rows, `batch_rows 1000000` | 16.1 s (668 MB) | | |
+
+lexdb took 2.2 to 4.7 times PostgreSQL's time. A load runs on one thread and
+is bound by its CPU. Profiling the wide load showed the time spread thin:
+- turning text into values (`coerce`), led by:
+  - doubles, 16% (the runtime's exact parser, with its big integers, for
+    every value);
+  - uuids, 9%;
+  - dates and times, 6%;
+- splitting lines (`textRecord`), 9%;
+- the allocator and reference counts, about 10%;
+- for a table with no key, the commit's validation (`Db.validate`), a
+  further 7%.
+
+The narrow load's time went to each row's own work: `insertOne`, the tree
+descended twice, map lookups.
+
+**Doubles: the runtime's parser.** At the user's direction, Lemire's
+fast_double_parser algorithm (Clinger's fast path, then Eisel-Lemire) was
+written again in the native runtime's `flt_parse`, ahead of the exact path,
+which stays as the fallback. It is described in design/native.md section 2,
+with how it was checked: 18.5M texts, all the same as Python's correctly
+rounded `float()`. Parsing alone became 17 to 23 times faster.
+
+`math.bitsOf` and `fromBits`, which lexdb uses to store and read every
+double, were loops of halving or doubling. They are now one move of the bits,
+through a runtime helper in each runtime.
+
+The TDS and TNS codecs had their own copies of those loops, written before
+math had any:
+- `tds.bitsOfFloat` and `tds.floatOfBits`/`floatOfBits32`;
+- the same three functions in `tns`;
+- `math.fromBits32Int`.
+
+Their callers include the endpoint's `float` and `real` results and every
+stored `real`. They now go through math, and give the same results:
+400,000 random bit patterns and the edge cases were compared against the
+old code on both backends.
+
+| lexdb, 1M rows | before | after |
+|---|---:|---:|
+| wide | 5.15 s | 4.56 s |
+| wide, no key | 6.63 s | 5.88 s |
+| wide, 2 indexes | 9.49 s | 8.77 s |
+| narrow (no doubles) | 1.23 s | 1.24 s |
+
+**Not yet done**, in the order proposed:
+1. Each row's own work in COPY:
+   - each field parsed straight into its column's kind, not first into a
+     text value then coerced;
+   - uuids;
+   - rows' buffers reused;
+   - a load in key order appending to the last leaf, without descending
+     the tree each time;
+   - no validation of a keyless table's hidden ids at commit.
+2. Lines parsed and rows encoded on 3 or 4 threads while one inserts.
+   PostgreSQL's COPY uses one thread, so this is where lexdb could pass it.
+3. A large load's memory bounded by default, without `batch_rows`'s cost.
+4. TDS bulk load (`INSERT BULK`, BulkLoadBCP), on the same path.

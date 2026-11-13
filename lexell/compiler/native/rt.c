@@ -558,6 +558,10 @@ u64 lxllib_hash_key(i64 i) {
     for (int j = 7; j >= 0; j--) w = w << 8 | k[(i & 1) * 8 + j];
     return w;
 }
+/* lib math's bitsOf and fromBits (math.lxl): a double's IEEE 754 bits as an int and back, as they
+   are in memory (math keeps its NaN rules). */
+i64 lxllib_float_bits(double x) { union { double d; i64 b; } u; u.d = x; return u.b; }
+double lxllib_float_from_bits(i64 b) { union { double d; i64 b; } u; u.b = b; return u.d; }
 /* lib hash's crc32c (hash.lxl): the CRC32C (Castagnoli) of n bytes at p, continuing crc (0 to
    start). SSE4.2's crc32 instruction, which computes exactly this CRC, 8 bytes a step; x86-64-v3,
    which programs require, includes SSE4.2. */
@@ -1128,6 +1132,56 @@ static int flt_hex(char c) {
     c = (char)flt_lower(c);
     return c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1;
 }
+/* The fast path of decimal to double (design/native.md, "Parsing floats"): Clinger's, then the
+   Eisel-Lemire algorithm, as in Lemire's fast_double_parser (github.com/lemire/fast_double_parser;
+   D. Lemire, "Number Parsing at a Gigabyte per Second", Software: Practice and Experience 51(8),
+   2021), written again here. w * 10^q, w nonzero and at most 19 digits, into *out (the sign neg),
+   1; or 0 when it cannot be sure of the rounding (a near tie, a subnormal, out of range), and the
+   exact path below decides. */
+#include "pow5.inc"
+#define FLT_POW5_MIN (-342)
+#define FLT_POW5_MAX 308
+static const double flt_pow10[23] = {1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11,
+                                     1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22};
+static int flt_fast(uint64_t w, int q, int neg, double* out) {
+    /* Clinger: w and 10^|q| both exact doubles, so one correctly rounded multiply or divide */
+    if (w < ((uint64_t)1 << 53) && q >= -22 && q <= 22) {
+        double d = (double)w;
+        d = q < 0 ? d / flt_pow10[-q] : d * flt_pow10[q];
+        *out = neg ? -d : d;
+        return 1;
+    }
+    if (q < FLT_POW5_MIN || q > FLT_POW5_MAX) return 0;
+    const uint64_t* t = flt_pow5[q - FLT_POW5_MIN];
+    /* 1024 + 63 + q + floor(log2(5^q)), for q in (-400, 350) */
+    int64_t exponent = ((((int64_t)152170 + 65536) * q) >> 16) + 1024 + 63;
+    int lz = __builtin_clzll(w);
+    w <<= lz;
+    unsigned __int128 p = (unsigned __int128)w * t[0];
+    uint64_t lower = (uint64_t)p, upper = (uint64_t)(p >> 64);
+    /* the table's truncation can be off by w in lower: only when that could carry into the bits
+       kept is the low half of the power needed */
+    if ((upper & 0x1FF) == 0x1FF && lower + w < lower) {
+        unsigned __int128 p2 = (unsigned __int128)w * t[1];
+        uint64_t plow = (uint64_t)p2, mid = lower + (uint64_t)(p2 >> 64), high = upper;
+        if (mid < lower) high++;
+        if (mid + 1 == 0 && (high & 0x1FF) == 0x1FF && plow + w < plow) return 0;
+        upper = high;
+        lower = mid;
+    }
+    uint64_t upperbit = upper >> 63;
+    uint64_t m = upper >> (upperbit + 9);     /* 54 bits, the leading one set */
+    lz += (int)(1 ^ upperbit);
+    if (lower == 0 && (upper & 0x1FF) == 0 && (m & 3) == 1) return 0;     /* maybe a tie */
+    m += m & 1;
+    m >>= 1;
+    if (m >= ((uint64_t)1 << 53)) { m = (uint64_t)1 << 52; lz--; }
+    m &= ~((uint64_t)1 << 52);
+    int64_t re = exponent - lz;
+    if (re < 1 || re > 2046) return 0;        /* subnormal or out of range */
+    *out = flt_of_bits(m | (uint64_t)re << 52 | (uint64_t)neg << 63);
+    return 1;
+}
 /* strtod over [p, e): the end of the longest prefix that is a number (p when none). */
 static const char* flt_parse(const char* p, const char* e, double* out) {
     const char* s = p;
@@ -1183,15 +1237,25 @@ static const char* flt_parse(const char* p, const char* e, double* out) {
         *out = flt_of_bits(flt_round(q, sticky, drop + k, neg));
         return s;
     }
-    int frac = 0;
+    /* the first 19 significant digits as w (w * 10^dq the number, the digits after them dropped:
+       cut when one is not 0) */
+    const char* d0 = s;
+    uint64_t w = 0;
+    int nd = 0, dq = 0, frac = 0, cut = 0;
     for (; s < e; s++) {
         if (*s == '.' && !frac) { frac = 1; continue; }
         if (*s < '0' || *s > '9') break;
         any = 1;
-        if (m.n || *s != '0') { big_mul_small(&m, 10); big_add_small(&m, (uint32_t)(*s - '0')); digits++; }
-        if (frac) k--;
+        if (nd < 19) {
+            if (nd || *s != '0') { w = w * 10 + (uint64_t)(*s - '0'); nd++; }
+            if (frac) dq--;
+        } else {
+            if (*s != '0') cut = 1;
+            if (!frac) dq++;
+        }
     }
     if (!any) return p;
+    int ex = 0;
     if (s < e && (*s == 'e' || *s == 'E')) {
         const char* q = s + 1;
         int en = 0;
@@ -1199,11 +1263,23 @@ static const char* flt_parse(const char* p, const char* e, double* out) {
         if (q < e && *q >= '0' && *q <= '9') {
             int x = 0;
             for (; q < e && *q >= '0' && *q <= '9'; q++) if (x < 100000) x = x * 10 + (*q - '0');
-            k += en ? -x : x;
+            ex = en ? -x : x;
             s = q;
         }
     }
-    if (!m.n) { *out = flt_of_bits((uint64_t)neg << 63); return s; }
+    if (w == 0) { *out = flt_of_bits((uint64_t)neg << 63); return s; }
+    if (!cut && flt_fast(w, dq + ex, neg, out)) return s;
+    /* the exact path: the digits read again as a big integer m, m * 10^k the number */
+    const char* end = s;
+    frac = 0;
+    for (s = d0; s < end; s++) {
+        if (*s == '.' && !frac) { frac = 1; continue; }
+        if (*s < '0' || *s > '9') break;
+        if (m.n || *s != '0') { big_mul_small(&m, 10); big_add_small(&m, (uint32_t)(*s - '0')); digits++; }
+        if (frac) k--;
+    }
+    k += ex;
+    s = end;
     if (digits + k > 310) { *out = flt_of_bits((uint64_t)neg << 63 | 0x7ff0000000000000ULL); return s; }
     if (digits + k < -330) { *out = flt_of_bits((uint64_t)neg << 63); return s; }
     int drop, sticky;

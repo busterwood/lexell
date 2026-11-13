@@ -338,8 +338,10 @@ variants over `&str`, `appendU16/32/64LE/BE`, in-place `setU16/32LE/BE`, and
 `addU16/32/64LE/BE` into a `StrBuf`. Reads use the language's checked index
 and trap if `at` is out of range; callers validate wire lengths. `math.bitsOf`
 /`fromBits` give the exact IEEE 754 double bit pattern as a 64-bit signed int
-(the sign bit makes it negative); `bitsOf32`/`fromBits32` and their `Int`
-forms do the same for single precision.
+(the sign bit makes it negative), a move of the bits through the runtimes'
+`lxllib_float_bits`/`lxllib_float_from_bits` (a NaN still becomes the canonical
+quiet NaN with its sign); `bitsOf32`/`fromBits32` and their `Int` forms do the
+same for single precision.
 
 ### glob
 

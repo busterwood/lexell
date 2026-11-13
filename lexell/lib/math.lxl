@@ -132,27 +132,14 @@ pub fn near(a: float, b: float, tol: float): bool {
 
 // ---------------------------------------------------------------- bit patterns
 
-// x * 2^e, exact when the result is a float (each step is a power of two).
-fn pow2(x: float, e: int): float {
-    var f = x
-    var k = e
-    while k > 0 {
-        let s = if k > 60 { 60 } else { k }
-        f = f * float(1 << s)
-        k -= s
-    }
-    while k < 0 {
-        let s = if k < -60 { 60 } else { -k }
-        f = f / float(1 << s)
-        k += s
-    }
-    return f
-}
-
 fn negNaN(x: float): bool {
     let one: float = 1.0f
     return one.copySign(x) < 0.0f
 }
+
+// A double's bits as they are in memory, and back: the runtimes' helpers.
+extern "c" fn rtFloatBits(x: float): int as "lxllib_float_bits"
+extern "c" fn rtFloatFromBits(b: int): float as "lxllib_float_from_bits"
 
 // The exact IEEE 754 double bit pattern of x, as a 64-bit signed int (the
 // sign bit is the int's high bit, so a negative number gives a negative int).
@@ -161,49 +148,18 @@ pub fn bitsOf(x: float): int {
     if x != x {
         return 0x7ff8000000000000 | (if negNaN(x) { 1 << 63 } else { 0 })
     }
-    var sign = 0
-    if x < 0.0f || (x == 0.0f && 1.0f / x < 0.0f) { sign = 1 << 63 }
-    var a = if x < 0.0f { -x } else { x }
-    if a == 0.0f { return sign }
-    if a == inf() { return sign | 0x7ff0000000000000 }
-    var e = 0
-    while a >= 9007199254740992.0f {
-        a = a / 2.0f
-        e += 1
-    }
-    while a < 4503599627370496.0f && e > -1074 {
-        a = a * 2.0f
-        e -= 1
-    }
-    var m = int(a)
-    let biased = e + 1075
-    if m < (1 << 52) || biased <= 0 {
-        // subnormal: m * 2^e with e = -1074
-        while e < -1074 {
-            m = m >> 1
-            e += 1
-        }
-        return sign | m
-    }
-    return sign | (biased << 52) | (m & 0xfffffffffffff)
+    return rtFloatBits(x)
 }
 
 // The float with IEEE 754 double bit pattern b; the inverse of bitsOf,
-// including -0, the infinities, NaN and subnormals.
+// including -0, the infinities, NaN and subnormals. Every NaN pattern gives
+// the canonical quiet NaN with b's sign.
 pub fn fromBits(b: int): float {
-    let e = (b >> 52) & 0x7ff
-    let m = b & 0xfffffffffffff
-    var f: float = 0.0f
-    if e == 0x7ff {
-        f = if m == 0 { inf() } else { nan() }
-    } else {
-        f = pow2(float(if e == 0 { m } else { m | (1 << 52) }), (if e == 0 { 1 } else { e }) - 1075)
-    }
-    if f != f {
+    if (b >> 52) & 0x7ff == 0x7ff && b & 0xfffffffffffff != 0 {
         let n = nan()
         return n.copySign(if b < 0 { -1.0f } else { 1.0f })
     }
-    return if b < 0 { -f } else { f }
+    return rtFloatFromBits(b)
 }
 
 // The exact IEEE 754 single bit pattern of x, as a signed 32-bit int, rounded
@@ -301,8 +257,10 @@ pub fn fromBits32Int(b: int): float {
             return n.copySign(if v < 0 { -1.0f } else { 1.0f })
         }
         f = inf()
+    } else if e == 0 {
+        f = float(m) * rtFloatFromBits((1023 - 149) << 52)     // m * 2^-149: exact in a double
     } else {
-        f = pow2(float(if e == 0 { m } else { m | (1 << 23) }), (if e == 0 { 1 } else { e }) - 150)
+        f = rtFloatFromBits(((e - 127 + 1023) << 52) | (m << 29))   // the same value, widened
     }
     return if ((v >> 31) & 1) == 1 { -f } else { f }
 }

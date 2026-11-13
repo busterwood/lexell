@@ -219,6 +219,60 @@ checked against glibc's `printf`/`strtod` on 300,000 random doubles (all
 bit patterns, near-1 exponents, subnormals) and decimal strings, and the libm
 subset on 2,000,000 random inputs each, with a throwaway harness.
 
+**Parsing floats, the fast path** (2026-11-13, for lexdb's COPY, where a
+column of doubles spent most of its time in `big_shl`). `flt_parse` reads the
+first 19 significant digits into a 64-bit `w`, with `w * 10^q` the number, and
+tries `flt_fast` first:
+- Clinger's path: `w < 2^53` and `|q| <= 22` is one multiplication or division
+  of two exact doubles, so correctly rounded (x86-64's SSE doubles, no fused
+  operations: `-ffp-contract=off`).
+- Otherwise the Eisel-Lemire algorithm, as in Lemire's fast_double_parser
+  (github.com/lemire/fast_double_parser, Apache-2.0 or BSL-1.0; D. Lemire,
+  "Number Parsing at a Gigabyte per Second", Software: Practice and
+  Experience 51(8), 2021), written again in rt.c rather than taken as a
+  library:
+  - `w`, shifted so its top bit is set, is multiplied by the 128-bit
+    truncated mantissa of `5^q` (`native/pow5.inc`, q from -342 to 308,
+    written by `native/gen_pow5.py` with Python's exact integers; 10.4 KB);
+  - the low half of the power is used only when the truncation could carry
+    into the bits kept;
+  - the result is rounded half to even.
+
+  It gives up (returns 0) on:
+  - a possible tie;
+  - a product it cannot be sure of;
+  - a subnormal or out-of-range result;
+  - `q` outside the table.
+
+When it gives up, or when a significant digit after the 19th is not 0, the
+digits are read again into the big integer and the exact path below decides,
+as before. So no input changes its result: lexell's own exact code stays the
+fallback, where Lemire's falls back to the C library's `strtod`.
+
+Checked against Python's correctly rounded `float()`, and against the old
+parser:
+- 3.56M texts:
+  - random doubles printed as `%r`, `%.17g`, `%.16e`, `%.20e` and `%.25g`;
+  - 1-19 digit integers times `10^q`, written with the point in every place,
+    leading and trailing zeros;
+  - ties and near ties of up to 19 digits;
+  - exact midpoints between neighbouring doubles (hundreds of digits);
+  - the known hard cases (`7.3177701707893310e+15`, `7.2057594037927933e+16`,
+    `1e23`, `9007199254740993`, the subnormal and overflow edges);
+  - texts that are not numbers.
+- 15M random `w e q` (up to 19 digits, `q` in -345..311).
+
+All agree. Parsing 1M doubles five times went from 2.50 s to 0.11 s (lexdb's
+benchmark column, `421.921820`) and from 3.81 s to 0.23 s (`%.17g` of random
+doubles). `rt_float_to_str`, which parses its candidates back, gains too.
+`tests/run/s07_parse_float_hard.lxl` keeps the hard cases. The same day `math.bitsOf` and
+`math.fromBits`, loops that halved or doubled the value until it was normalized
+(about 40 steps for 421.92, up to about 1,000 near the ends of the range), became a
+move of the bits through `lxllib_float_bits` and `lxllib_float_from_bits` (in both
+runtimes; NaN's canonical form is still math's): 2M round trips, 3.6 s before, 13 ms
+after. lexdb stores and reads every double through them. The C backend's
+rt.h still uses glibc's `strtod`, which is correct and fast enough there.
+
 In a dynamically linked program (section 5a) the runtime is the same code (the
 parts the program reaches, and `rt_n_libc` always), but the dynamic linker fills
 `rt_n_libc` with libc's `exit`, `getenv` and
