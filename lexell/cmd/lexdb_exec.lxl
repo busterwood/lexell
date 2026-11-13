@@ -21623,10 +21623,14 @@ type BPlan = record {
     missing: []Val          // by place
     needP: []bool           // by place, for decRowNeed and rowOf
     width: int
+    // the ranges an integer place's values must be in for a row to be
+    // kept, (place, least, greatest) each: a column leaf whose values of
+    // one are all outside it is skipped (cRanges, 9.112)
+    ranges: []int
 }
 
 fn emptyBPlan(): BPlan {
-    return BPlan{kinds: [], needCol: [], placeCol: [], usedP: [], stopAt: 0, missing: [], needP: [], width: 0}
+    return BPlan{kinds: [], needCol: [], placeCol: [], usedP: [], stopAt: 0, missing: [], needP: [], width: 0, ranges: []}
 }
 
 fn newBatch(bp: &BPlan, cap: int): Batch {
@@ -21914,6 +21918,7 @@ fn fillBatch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, sc: &
         var bail = false
         var bad: []DbErr = []
         let inPlace = try st.scanLeaves(txn, t.tree, from, sc.hi, fn(leaf: &lexdb_page.Node, i: int, j: int): bool {
+            if len(bp.ranges) > 0 && leaf.isCols() && cExcluded(leaf, bp, t) { return true }
             var k = i
             while k < j {
                 if b.n == BROWS {
@@ -22471,6 +22476,96 @@ fn cCols(leaf: &lexdb_page.Node, from: int, qs: &[]int, all: bool, r0: int, ps: 
     return Ok(true)
 }
 
+// The ranges conds (each must hold for a row to be kept) put on integer
+// places: (place, least, greatest) per condition of a column of integers
+// (kinds: BK_INT) compared with an integer constant, or an AND of them.
+fn cRanges(conds: &[]BNode, kinds: &[]int, t: &Table): []int {
+    var out: []int = []
+    for c in conds { cRangesOf(&c, kinds, t, mut &out) }
+    return out
+}
+
+fn cRangesOf(n: &BNode, kinds: &[]int, t: &Table, out: mut &[]int) {
+    match n {
+        BNode.And(a, b) {
+            cRangesOf(&a, kinds, t, out)
+            cRangesOf(&b, kinds, t, out)
+        }
+        BNode.Cmp(op, a, b) {
+            var col = -1
+            var v = 0
+            var o = op
+            match a {
+                BNode.Col(c) {
+                    match b {
+                        BNode.Const(x, nul) { if !nul { col = c; v = x } }
+                        else {}
+                    }
+                }
+                BNode.Const(x, nul) {
+                    match b {
+                        BNode.Col(c) {
+                            if !nul {
+                                col = c
+                                v = x
+                                // the constant on the left: the comparison turned round
+                                o = if op == 2 { 4 } else if op == 3 { 5 } else if op == 4 { 2 } else if op == 5 { 3 } else { op }
+                            }
+                        }
+                        else {}
+                    }
+                }
+                else {}
+            }
+            if col < 0 || col >= len(kinds) || kinds[col] != BK_INT || o == 1 { return }
+            let MIN = -9223372036854775807 - 1
+            let MAX = 9223372036854775807
+            var lo = MIN
+            var hi = MAX
+            if o == 0 {
+                lo = v
+                hi = v
+            } else if o == 2 {
+                if v == MIN { lo = 1; hi = 0 } else { hi = v - 1 }
+            } else if o == 3 { hi = v }
+            else if o == 4 {
+                if v == MAX { lo = 1; hi = 0 } else { lo = v + 1 }
+            } else if o == 5 { lo = v }
+            append(out, if len(t.slots) == 0 { col } else { t.slots[col] })
+            append(out, lo)
+            append(out, hi)
+        }
+        else {}
+    }
+}
+
+// Whether column leaf leaf holds no row bp.ranges keep: an integer place
+// whose least and greatest in the leaf are outside its range (or whose
+// rows are all NULL).
+var C_SKIPPED: int = 0
+
+// Column leaves batch scans skipped (cExcluded), for the tests.
+pub fn colLeavesSkipped(): int { return C_SKIPPED }
+
+fn cExcluded(leaf: &lexdb_page.Node, bp: &BPlan, t: &Table): bool {
+    if !cLayoutOk(leaf, t) { return false }
+    let dir = &leaf.cdir
+    let np = lexdb_cols.places(dir)
+    var x = 0
+    while x + 2 < len(bp.ranges) {
+        let pl = bp.ranges[x]
+        let lo = bp.ranges[x + 1]
+        let hi = bp.ranges[x + 2]
+        x += 3
+        if pl >= np || !isIntKind(lexdb_cols.kindOf(&leaf.cols, pl)) { continue }
+        if lo > hi || !lexdb_cols.hasRange(dir, pl) || lexdb_cols.least(dir, pl) > hi || lexdb_cols.greatest(dir, pl) < lo {
+            C_SKIPPED += 1
+            return true
+        }
+    }
+    return false
+}
+
 // Column leaf rows from..to (rebuilt) into rows b.n on of b, a row at a
 // time: a leaf whose layout's kinds are not its table's. -1 as bRunInto.
 fn cRowsInto(leaf: &lexdb_page.Node, from: int, to: int, b: mut &Batch, bp: &BPlan, t: &Table): Result[int, DbErr] {
@@ -22633,6 +22728,7 @@ fn fillPickIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, sc: 
         var bail = false
         var bad: []DbErr = []
         let inPlace = try st.scanLeaves(txn, t.tree, from, sc.hi, fn(leaf: &lexdb_page.Node, i: int, j: int): bool {
+            if len(bp.ranges) > 0 && leaf.isCols() && cExcluded(leaf, bp, t) { return true }
             var k = i
             while k < j {
                 if b.n == BROWS {
@@ -23009,8 +23105,9 @@ fn bLevelPlan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &
     let stopAt = if len(usedP) == 0 { 0 } else { usedP[len(usedP) - 1] + 1 }
     var needList: []bool = []
     for x in lv.need { append(mut &needList, x) }
-    let bp = BPlan{kinds: kinds, needCol: needCol, placeCol: placeCol, usedP: usedP, stopAt: stopAt,
-                   missing: placesMissing(t), needP: placesNeeded(t, &needList), width: width}
+    var bp = BPlan{kinds: kinds, needCol: needCol, placeCol: placeCol, usedP: usedP, stopAt: stopAt,
+                   missing: placesMissing(t), needP: placesNeeded(t, &needList), width: width, ranges: []}
+    bp.ranges = cRanges(&conds, &bp.kinds, t)
     // key lookups: a row each, not worth a batch
     var ranges = false
     for sc in scans { if !sc.point && !sc.empty { ranges = true } }
@@ -23582,7 +23679,7 @@ fn bPlanOf(t: &Table, needCol: []bool, need: &[]bool): BPlan {
     var needList: []bool = []
     for x in need { append(mut &needList, x) }
     return BPlan{kinds: kinds, needCol: needCol, placeCol: placeCol, usedP: usedP, stopAt: stopAt,
-                 missing: placesMissing(t), needP: placesNeeded(t, &needList), width: width}
+                 missing: placesMissing(t), needP: placesNeeded(t, &needList), width: width, ranges: []}
 }
 
 // A join's candidates (per candidate, the joined batch j's row pj and the
@@ -25153,7 +25250,7 @@ fn batchGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
     for c in t.cols { append(mut &tkinds, colKind(&c)) }
     let bp = if jn { replace(mut &lp0[0].bp, emptyBPlan()) } else {
         BPlan{kinds: tkinds, needCol: needCol, placeCol: placeCol, usedP: usedP, stopAt: stopAt,
-              missing: placesMissing(t), needP: placesNeeded(t, &needList), width: width}
+              missing: placesMissing(t), needP: placesNeeded(t, &needList), width: width, ranges: cRanges(&conds, &tkinds, t)}
     }
     if jn { part = lp0[0].part }
     // a group's first row: the joined batch's columns, or the table's
