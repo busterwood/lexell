@@ -9966,3 +9966,206 @@ without front coding, 2,342 / 1,184 / 1,081 with it and leaves shifted by
 - Internal pages are not front coded.
 - The native backend cannot compile a `match` on a `Result[[]byte, DbErr]`
   popped from an array ("opt: no outer field"); `loadMany` uses `isErr`.
+
+### 9.110 A commit's bytes; the data file reserved ahead; large commits in key order
+
+Three costs found by [lexdb-columns-study.md](lexdb-columns-study.md) 10:
+a single-row commit writing 56 to 72 KB, a freshly loaded data file in
+over a thousand extents, and 20,000 deletes by key in one transaction
+taking seconds. Measured on the machine of 9.60 (btrfs over dm-crypt on
+NVMe, the data directory without copy-on-write, 9.61), each timing under
+a lock shared with the other agents' benchmarks; their compiles and test
+suites still ran meanwhile, so spreads of 10 to 20% are noise, and runs
+that looked off were repeated.
+
+**A commit's bytes are the file system's.** A commit writes one log
+frame, padded to a page (4.6): 4 KiB for a single-row commit. The rest of
+`write_bytes` is btrfs's: an `fdatasync` after an `O_DIRECT` write into a
+file without copy-on-write still has btrfs log the inode (as far as we
+can tell, btrfs updates the inode item as each write completes), so every
+flush commits btrfs's log tree: two or three 16 KiB nodes and the super
+block. A 20-line probe
+outside lexdb (a zeroed file in the same directory, a 4 KiB `O_DIRECT`
+write and `fdatasync`, 2,000 times) writes exactly what a lexdb commit
+does, in each of two sessions on different file system states:
+
+| bytes written | session 1 | session 2 |
+|---|---:|---:|
+| the probe, per write and flush | 53,248 | 36,864 |
+| lexdb, a single-row UPDATE, checkpoints off (`LEXDB_CKPT_KB` large) | 53,239 | 36,864 |
+| of which lexdb's log | 4,096 | 4,096 |
+
+Into a file reserved but not written (`fallocate`) the probe writes 69 KB
+a flush: why `openSeg` writes its zeros (3). With checkpoints, a commit
+also carries its share of their pages: 20,000 single-row updates, two
+checkpoints and the shutdown's wrote 17,420 pages, about 3.5 KB a commit
+(each random update dirties a leaf; 4 KiB a page). The measured 39 KB a
+commit (38.8 to 39.1 over 10 s) is 4 KiB of log, about 3 KiB of pages and
+about 32 KB of btrfs. At 32 clients a flush carries about 15 commits:
+2.3 to 3.2 KB a commit, of which 256 bytes are log. The segments are
+reused through `log.spare` (no zeros written while running), and the
+meta page and the checkpoint's two flushes are a few pages a checkpoint.
+
+So nothing in lexdb's format is out of proportion: a flush cannot write
+less than a page, and the page is what a commit changed. What btrfs adds
+per flush we found no way around without root: the only way to make the
+drive's cache durable is the file system's flush path, and the writes
+and flushes are already as few as the commits allow. On ext4 (not
+measured: a loop device needs root here), an overwrite of written blocks
+followed by `fdatasync` commits no journal when only the times changed,
+so a commit there is its 4 KiB and the drive's flush. Nothing is changed
+for it; Stats now count the log's bytes and the pages checkpoints write,
+and the server's last line shows them.
+
+Commit rates (`pgbench`, 10 s, TCP, a fresh copy of the 1M-row data each
+run, median of three; `upd` an UPDATE of `w` by key, `ins` an INSERT into
+`t` ON CONFLICT DO NOTHING by a random key):
+
+| | before | after |
+|---|---|---|
+| upd, 1 client | 1,415/s, 0.71 ms, 38.9 KB | 1,472/s, 0.68 ms, 38.8 KB |
+| upd, 32 clients | 20,852/s, 1.54 ms, 3.2 KB | 23,007/s, 1.39 ms, 2.7 KB |
+| ins, 1 client | 1,421/s, 0.70 ms, 53.3 KB | 1,321/s, 0.76 ms, 36.9 KB |
+| ins, 32 clients | 23,094/s, 1.39 ms, 3.0 KB | 19,626/s, 1.63 ms, 2.3 KB |
+
+Unchanged within the noise (each row's three runs spread 15 to 45%; the
+bytes move with btrfs's state, 37 or 53 KB a flush, not with the build).
+
+**The data file in a few extents.** A checkpoint writes its new pages past
+the file's end, in runs of up to 64 pages, 16 runs at once (9.63). Each
+write past the end allocates its own extent, and with 16 in flight btrfs
+put them wherever it had room as they came: a fresh load (`load.sh`: w
+by COPY, `w_b`, d, t) left 452 extents of 64 pages. Now a checkpoint whose
+pages pass the file's end first reserves the space (`fallocate`, through
+the ring) from the end to the pages needed plus an eighth of the file, at
+least 4 MiB and at most 256 MiB, in whole MiB (`reserveAhead`); the writes
+then fill the reserved extents in place. The file grows in about log(size)
+steps and at most an eighth of it is reserved and unused. The reserved
+tail is past the meta page's page count, so it is never read; recovery
+and older builds see the same pages as before. `fdatasync` makes the
+size change durable with the pages, before the meta page is written. If
+reserving fails (a file system without `fallocate`, no space), the store
+stops trying and the file grows by its writes as before; the simulated
+file system reserves nothing.
+
+| fresh load (median of 3 loads; reads median of 5) | before | after |
+|---|---:|---:|
+| extents | 452 | **3** |
+| sequential `O_DIRECT` read, 256 KiB blocks | 665 MB/s | **1,500 MB/s** |
+| 1 MiB blocks | 1,300 MB/s | **1,700 MB/s** |
+| load time | 7.77 s | 8.00 s |
+
+The load is 3% slower; COPY of w 2.40 to 2.47 s and CREATE INDEX 3.06 to
+3.17 s (both median of three), with or without the reservation (a build
+with it alone loaded in 7.76 s), so it is the commit changes below, not
+isolated further. The rest of the time is d's and t's loads and the
+shutdown's checkpoint.
+
+**Cold reads: a page decoded with one copy an entry.** With the file
+contiguous, cold scans were bound by the loop thread's decoding: a
+T_FLEAF leaf made whole (`frontLeaf`) copied each entry a byte at a time.
+Now the tail and the value, which follow each other on the page and in the
+body, are one `memcpy` (an `extern "c"` on byte slices, bounds checked as
+any slice). A T_LEAF leaf (written before 9.109) was counted front coded
+on every read (`leafSize`, as much as the read's decoding); now its size
+is -1 when read and is counted when it is loosened to change, the only
+time it is used. Cold queries (`cold.py`: a server started for each run,
+the first query, median of 5; ms, and the server's CPU ms):
+
+| query | before, its load | after, the old load (452 extents) | after, its load (3) |
+|---|---:|---:|---:|
+| `count(*)` of w | 303 (204) | 299 (146) | **211** (145) |
+| `sum(a + b), max(c % 1000)` | 346 (245) | 339 (186) | **255** (187) |
+| `city, count(*), avg(price)` | 471 (371) | 465 (311) | **380** (312) |
+| `note like '%item 77%'` | 351 (250) | 343 (190) | **257** (190) |
+| `count(*)` of t | 110 (78) | 110 (68) | **87** (65) |
+| `count(*), sum(c)` where `b < 10000` | 344 (243) | 338 (184) | **252** (184) |
+
+Either change alone gains little: on the scattered file the cheaper
+decoding waits for the reads (299 against 303 ms), and the old decoding
+kept up with the contiguous file's reads (count(*) of w 272 and 268 ms
+with the old decoding, the same build on both layouts); together, 25 to
+30%. Warm queries are unchanged.
+
+**Large transactions.** 20,000 DELETEs of w by key in one transaction
+(`w` with `w_b`; the ids of the study's `writes2.py`; `select count(*)
+from w` first, as there). The study's 3.2 s did not reproduce here: the
+same script took 1.0 to 1.5 s, 1.3 s typically, and 2.2 to 2.5 s with
+the cache cold. The profile (perf, the native map; the data directory
+`bd_ob`, which a build before 9.109 wrote):
+- **The COMMIT was half the time** (840 of 1,340 ms): 8,900 leaves of `w_b`
+  (old, whole leaves: 42 MB) not in memory, read 32 at a time, one page a
+  read; and 33% of the CPU, of which `descend` 15% (each write descended
+  twice, from the root, in the order made: random keys miss `lastLeaf`),
+  `leafSize` of the old leaves read 11%, decoding 6%, shifting a leaf's
+  entries (`removeStr`) 5%.
+- The statements themselves: their parse 8%, finding the table (its
+  catalog entry decoded per statement) 9%, the row read 9%: the same per
+  statement as INSERT's, in the executor.
+
+What changed:
+- **A large commit in key order** (`commitOrder`, from 32 writes): each run
+  of puts and deletes between creates and drops, tree by tree, and each
+  tree's writes by key, stably (a key's writes keep their order; the last
+  wins as before). A tree's writes already in order (loads, an index
+  built) are left as they are after one pass; sorting them again had made
+  a load a third slower. The writes are checked (`writeNeeds`) and
+  applied in that order; the log keeps them as made, and replay gives the
+  same rows (each key's last write; the trees' shapes may differ, as they
+  may for any two orders).
+- **`descend` from a finger**: `lastLeaf` keeps the separators around every
+  node on the last path, and a descent starts at the deepest node on it
+  whose range holds the key (as before only the leaf's), marking the
+  nodes above it referenced as a full descent does. In key order that is
+  mostly the parent.
+- **A commit's missing pages read in order**: `loadMany` sorts the pages
+  and reads each run of consecutive pages (at most 64) with one read, 32
+  reads in flight. In key order a commit needs a tree's leaves in a row,
+  which checkpoints write in key order.
+
+Measured (wall ms, the COMMIT's own in parentheses; the server's CPU):
+
+| 20,000 deletes in one transaction | before | key order, finger, decoding | and reads in runs |
+|---|---:|---:|---:|
+| `bd_ob`, quieter machine | 1,352 (838), 850 | 1,126 (615), 800 | **799 (294)**, 740 |
+| a fresh load (T_FLEAF), quieter | 889 (362), 750 | 794 (283), 710 | **728 (223)**, 690 |
+| `bd_ob`, final runs (median of 3) | 1,038 (533) | | **819 (304)** |
+| fresh, final runs | 866 (326) | | **802 (243)** |
+| fresh, cache cold (`select 1` first) | 2,220 | | 2,244 |
+| 20,000 INSERTs, final | 617 | | 553 |
+| 20,000 UPDATEs of `a`, final | 679 | | 668 |
+
+The cold case is the reads: each DELETE needs its row's leaf (14,700
+leaves read one per statement, at the drive's 100 us a random 4 KiB
+read here through dm-crypt: 108 us by a probe at queue depth 1). What is
+left warm is the statements' own work in the executor (parse, the
+catalog per statement), the same for INSERT, and in the commit loosening
+the leaves it changes and shifting their entries.
+
+**Tests:**
+- `store_order` (new): 30 commits of 32 to 432 random puts and deletes over
+  two trees interleaved, a key written three times in one (put, delete,
+  put: the last wins), and a commit with a create, writes to it, a drop
+  and writes after the drop; a 64 KB cache, so the commits load leaves
+  and evict; against a model by scan and by key, after a simulated crash
+  (replayed from the log in the order made) and after a checkpoint and a
+  reopen. It fails with the order made unstable.
+- `store_reserve` (new, a real directory): 20,000 rows in 40 commits, a
+  checkpoint after each; after each the file holds its pages, in whole
+  MiB, at least 4 MiB, at most an eighth (or 4 MiB) and 1 MiB past them;
+  it grows in at most 12 steps; reopened with a commit to replay; the
+  audit passes.
+- **Changed expectation:** `page_codec`'s old-format leaf reads with size
+  -1, and 598 (counted front coded, as before) once loosened.
+- `store_oldpages` passes unchanged: no page, log or meta format changed.
+- The suite passes (118); the crash test, 20 rounds each, by default (the
+  ring), with `LXL_URING=1` and with `LXL_URING=0`; the replica test.
+
+**Not done, and next:**
+- The 3% slower load is not explained.
+- The executor's per-statement work (a table's catalog entry decoded for
+  each statement, its parse) is now most of a large transaction's time.
+- `loadMany` may hold 32 reads of 64 pages (8 MiB) at once, where it held
+  32 pages.
+- A commit's sorted writes to one leaf could be applied together (one
+  shift of its entries, not one each).
