@@ -1,0 +1,298 @@
+// lexdb: leaves of rows made column leaves (design/lexdb.md 9.114). Store A
+// writes column leaves, B rows only (setColumns(false)); every statement
+// and query (batches on and off) must give the same on both.
+// - ALTER TABLE ADD COLUMN (with a default, so rows written before it read
+//   the default) and DROP COLUMN on a table of column leaves, then a row of
+//   each leaf updated: the checkpoint writes every leaf, of rows of three
+//   layouts, as a column leaf of its rows rewritten in the current layout.
+//   A block's snapshot from before the ALTER reads what it read before;
+//   so does one from after a leaf's last change and before the layout its
+//   rows are converted to (it reads the leaf's version from before). An
+//   ALTER in a block that rolls back: no row is converted to its layout.
+// - A table made before 9.113 (setLegacyKinds): its rows with a date are
+//   tagged, and its leaves stay rows (a date does not go in its layout's
+//   text place). Opened again (bootstrap), its catalog gets the layout of
+//   its kinds now; new rows take it, and VACUUM rewrites its tagged rows'
+//   leaves in it (a snapshot from before reads the rows as they were).
+// - Rows that do not convert stay rows: a leaf with a long text, a table
+//   with an interval. Tried once: a second VACUUM, and scans, do not try
+//   them again.
+// - VACUUM converts a table written as rows (columns off) to column leaves.
+// - A scan queues the clean row leaves it reads; each checkpoint converts
+//   the budget's number of them.
+// - A crash, and A reopened from its last checkpoint and log: the same.
+// expect: altered: leaves 0 rows; by layout: 2:3000 of 3 layouts; queries 6 of 6 the same
+// expect: snapshot: same as before true
+// expect: snapshot of mixed leaves: same as before true; by layout: 2:600 of 3 layouts
+// expect: rolled back: 600|1800; by layout: 1:600 of 2 layouts; queries 6 of 6 the same
+// expect: old table: no column leaves true; by layout: tagged:1500 of 1 layouts
+// expect: upgraded: tables 1; new row fixed: 1:1 tagged:1500 of 2 layouts
+// expect: snapshot of the old table: same as before true
+// expect: vacuumed old: leaves 0 rows; by layout: 1:1501 of 2 layouts; queries 6 of 6 the same
+// expect: kept as rows: long text leaf rows true, interval table no column leaves true; failed true; tried again false; queued after scans 0
+// expect: vacuum: before 0 cols; after 0 rows; queries 6 of 6 the same; vacuum analyze VACUUM
+// expect: queue: queued true; after one checkpoint 10 cols; after two 20 cols; after all 0 rows
+// expect: reopened: queries 6 of 6 the same
+// expect: different 0
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+
+var DIFF: int = 0
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            var out: []str = []
+            for r in rs {
+                if !r.hasRows { append(mut &out, r.tag) }
+                for row in r.rows {
+                    var vs: []str = []
+                    for v in row { append(mut &vs, lexdb_exec.text(&v)) }
+                    append(mut &out, strings.join(&vs, "|"))
+                }
+            }
+            return strings.join(&out, " ")
+        }
+        Err(e) { return "ERROR " + e.state + " " + e.msg }
+    }
+}
+
+fn both(a: mut &lexdb_exec.Session, b: mut &lexdb_exec.Session, sql: &str): str {
+    let x = q(a, sql)
+    let y = q(b, sql)
+    if x != y || strings.startsWith(&x, "ERROR") {
+        DIFF += 1
+        println("DIFFERENT: " + sql)
+        println("  A: " + x)
+        println("  B: " + y)
+    }
+    return x
+}
+
+// Queries of table t, each with batches on and off on both stores: how
+// many gave the same.
+fn compare(a: mut &lexdb_exec.Session, b: mut &lexdb_exec.Session, t: &str): int {
+    let qs = ["select * from " + t + " order by id",
+              "select count(*), sum(id), count(a), sum(a) from " + t,
+              "select * from " + t + " where id % 97 = 3 order by id",
+              "select a % 10, count(*), min(id), max(id) from " + t + " group by 1 order by 1",
+              "select * from " + t + " where id = 1234",
+              "select count(*) from " + t + " where id between 200 and 2600 and a > 50"]
+    var same = 0
+    for x in qs {
+        var ok = true
+        for mode in ["on", "off"] {
+            let s1 = q(a, &("set lexdb_batch = " + mode))
+            let s2 = q(b, &("set lexdb_batch = " + mode))
+            let ra = q(a, &x)
+            let rb = q(b, &x)
+            if ra != rb || strings.startsWith(&ra, "ERROR") {
+                ok = false
+                DIFF += 1
+                println("DIFFERENT (" + mode + "): " + x)
+                println("  A: " + ra)
+                println("  B: " + rb)
+            }
+        }
+        if ok { same += 1 }
+    }
+    let s3 = q(a, &"set lexdb_batch = on")
+    let s4 = q(b, &"set lexdb_batch = on")
+    return same
+}
+
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: 2 * 1024 * 1024, segBytes: 4 * 1024 * 1024, ckptBytes: 64 * 1024 * 1024, snapNodes: 100000, bufferedPages: false}
+}
+
+fn ck(sa: &lexdb_store.Store, sb: &lexdb_store.Store) {
+    sa.checkpointAll().unwrap()
+    sb.checkpointAll().unwrap()
+}
+
+// "C cols R rows": the C part and the R part.
+fn colsOf(k: &str): int { return strings.parseInt(strings.split(k, " ")[0]).unwrapOr(-1) }
+fn rowsOf(k: &str): int { return strings.parseInt(strings.split(k, " ")[2]).unwrapOr(-1) }
+
+fn body(sa: lexdb_store.Store, sb: lexdb_store.Store) {
+    lexdb_exec.bootstrap(&sa).unwrap()
+    lexdb_exec.bootstrap(&sb).unwrap()
+    sb.setColumns(false)
+    var a = lexdb_exec.newSession(sa)
+    var b = lexdb_exec.newSession(sb)
+
+    // ---- ALTER on a table of column leaves
+    let c1 = both(mut &a, mut &b, &("create table m (id int primary key, a int, b bigint, n numeric(10,2), t text, d date, ts timestamptz, f float8, " +
+                                    "u uuid, ok boolean)"))
+    let i1 = both(mut &a, mut &b, &("insert into m select g, g % 113, g * 1000003, g * 0.25, 'city ' || (g % 7), date '2024-01-01' + g % 500, " +
+                                    "timestamptz '2024-03-10 01:00:00+00' + g * interval '13 minutes', g / 7.0, " +
+                                    "case when g % 5 = 0 then null else ('a0eebc99-9c0b-4ef8-bb6d-' || lpad(to_hex(g), 12, '0'))::uuid end, g % 3 = 0 " +
+                                    "from generate_series(1, 3000) g"))
+    ck(&sa, &sb)
+    // a block's snapshot from before
+    var x = lexdb_exec.newSession(sa)
+    let x1 = q(mut &x, &"begin")
+    let before = q(mut &x, &"select count(*), sum(a), sum(n), max(t), min(d), count(u) from m")
+    let a1 = both(mut &a, mut &b, &"alter table m add column e int default 7")
+    let a2 = both(mut &a, mut &b, &"alter table m drop column b")
+    // a row of every leaf (of about 60) in the current layout
+    let u1 = both(mut &a, mut &b, &"update m set e = id where id % 40 = 0")
+    let i2 = both(mut &a, mut &b, &"insert into m (id, a, t, e) values (3001, 1, 'new', 1)")
+    let d1 = both(mut &a, mut &b, &"delete from m where id = 3001")
+    ck(&sa, &sb)
+    println("altered: leaves " + rowsOf(&lexdb_exec.leafKinds(&sa, &"m")).toStr() + " rows; by layout: " + lexdb_exec.rowLayouts(&sa, &"m") +
+            "; queries " + compare(mut &a, mut &b, &"m").toStr() + " of 6 the same")
+    let after = q(mut &x, &"select count(*), sum(a), sum(n), max(t), min(d), count(u) from m")
+    let x2 = q(mut &x, &"commit")
+    println("snapshot: same as before " + (before == after && !strings.startsWith(&before, "ERROR")).toStr())
+    let e1 = both(mut &a, mut &b, &"select count(*), sum(e) from m")
+    // a snapshot from after a leaf's last change, before the layout its rows
+    // are converted to: it reads the leaf as it was (willChange)
+    let c7 = both(mut &a, mut &b, &"create table m2 (id int primary key, a int)")
+    let i10 = both(mut &a, mut &b, &"insert into m2 select g, g from generate_series(1, 600) g")
+    ck(&sa, &sb)
+    let a3 = both(mut &a, mut &b, &"alter table m2 add column b int")
+    let u4 = both(mut &a, mut &b, &"update m2 set b = 1 where id % 40 = 0")
+    var x3 = lexdb_exec.newSession(sa)
+    let x4 = q(mut &x3, &"begin")
+    let before2 = q(mut &x3, &"select count(*), sum(a), sum(b) from m2")
+    let a4 = both(mut &a, mut &b, &"alter table m2 add column c int")
+    let r4 = both(mut &a, mut &b, &"select count(*) from m2")          // (the store learns the layouts committed)
+    ck(&sa, &sb)
+    let after2 = q(mut &x3, &"select count(*), sum(a), sum(b) from m2")
+    let x5 = q(mut &x3, &"commit")
+    println("snapshot of mixed leaves: same as before " + (before2 == after2 && !strings.startsWith(&before2, "ERROR")).toStr() + "; by layout: " +
+            lexdb_exec.rowLayouts(&sa, &"m2"))
+
+    // an ALTER in a block, rolled back: its layout is not the store's (its
+    // own transaction wrote it), so no row is converted to it
+    let c8 = both(mut &a, mut &b, &"create table m3 (id int primary key, a int)")
+    let i11 = both(mut &a, mut &b, &"insert into m3 select g, g from generate_series(1, 600) g")
+    ck(&sa, &sb)
+    let a5 = both(mut &a, mut &b, &"alter table m3 add column b int")
+    let u5 = both(mut &a, mut &b, &"update m3 set b = 1 where id % 40 = 0")
+    var z = lexdb_exec.newSession(sa)
+    let z1 = q(mut &z, &"begin")
+    let z2 = q(mut &z, &"alter table m3 add column c int default 3")
+    let z3 = q(mut &z, &"select count(*), sum(c) from m3")
+    ck(&sa, &sb)
+    let z4 = q(mut &z, &"rollback")
+    println("rolled back: " + z3 + "; by layout: " + lexdb_exec.rowLayouts(&sa, &"m3") + "; queries " + compare(mut &a, mut &b, &"m3").toStr() + " of 6 the same")
+
+    // ---- a table made before 9.113
+    lexdb_exec.setLegacyKinds(true)
+    let c2 = both(mut &a, mut &b, &"create table old (id int primary key, a int, d date, f float8, t text)")
+    lexdb_exec.setLegacyKinds(false)
+    let i3 = both(mut &a, mut &b, &("insert into old select g, g % 100, date '2020-01-01' + g, g * 1.5, 'x' || g from generate_series(1, 1500) g"))
+    ck(&sa, &sb)
+    println("old table: no column leaves " + (colsOf(&lexdb_exec.leafKinds(&sa, &"old")) == 0).toStr() + "; by layout: " + lexdb_exec.rowLayouts(&sa, &"old"))
+    // opened again: its catalog row given the layout of its kinds now
+    var x6 = lexdb_exec.newSession(sa)
+    let x7 = q(mut &x6, &"begin")
+    let before3 = q(mut &x6, &"select count(*), sum(a), min(d), sum(f) from old")
+    let up = lexdb_exec.upgradeLayouts(&sa).unwrap()
+    let upb = lexdb_exec.upgradeLayouts(&sb).unwrap()
+    lexdb_exec.bootstrap(&sa).unwrap()
+    var a2s = lexdb_exec.newSession(sa)
+    let i4 = q(mut &a2s, &"insert into old values (1501, 1, '2024-02-02', 2.5, 'new')")
+    let i4b = q(mut &b, &"insert into old values (1501, 1, '2024-02-02', 2.5, 'new')")
+    let rl = lexdb_exec.rowLayouts(&sa, &"old")
+    println("upgraded: tables " + up.toStr() + "; new row fixed: " + rl)
+    let v1 = both(mut &a, mut &b, &"vacuum old")
+    let after3 = q(mut &x6, &"select count(*), sum(a), min(d), sum(f) from old")
+    let x8 = q(mut &x6, &"commit")
+    println("snapshot of the old table: same as before " + (before3 == after3 && !strings.startsWith(&before3, "ERROR")).toStr())
+    println("vacuumed old: leaves " + rowsOf(&lexdb_exec.leafKinds(&sa, &"old")).toStr() + " rows; by layout: " + lexdb_exec.rowLayouts(&sa, &"old") +
+            "; queries " + compare(mut &a, mut &b, &"old").toStr() + " of 6 the same")
+
+    // ---- rows that do not convert
+    let c3 = both(mut &a, mut &b, &"create table lt (id int primary key, a int, t text)")
+    let i5 = both(mut &a, mut &b, &"insert into lt select g, g % 50, 'short ' || g from generate_series(1, 2000) g")
+    let i6 = both(mut &a, mut &b, &"update lt set t = repeat('long', 100) where id = 1000")
+    let c4 = both(mut &a, mut &b, &"create table iv (id int primary key, a int, w interval)")
+    let i7 = both(mut &a, mut &b, &"insert into iv select g, g % 50, g * interval '1 minute' from generate_series(1, 2000) g")
+    ck(&sa, &sb)
+    let lk = lexdb_exec.leafKinds(&sa, &"lt")
+    let f0 = sa.upgradeCounts()[1]
+    let v2 = both(mut &a, mut &b, &"vacuum lt, iv")
+    let f1 = sa.upgradeCounts()[1]
+    let v3 = both(mut &a, mut &b, &"vacuum lt, iv")
+    let f2 = sa.upgradeCounts()[1]
+    let s1 = both(mut &a, mut &b, &"select count(*), sum(a), max(length(t)) from lt")
+    let s2 = both(mut &a, mut &b, &"select count(*), sum(a), max(w) from iv")
+    let queued = sa.upgradeCounts()[2]
+    println("kept as rows: long text leaf rows " + (rowsOf(&lexdb_exec.leafKinds(&sa, &"lt")) == 1).toStr() + ", interval table no column leaves " +
+            (colsOf(&lexdb_exec.leafKinds(&sa, &"iv")) == 0).toStr() + "; failed " + (f1 > f0).toStr() + "; tried again " +
+            (f2 > f1).toStr() + "; queued after scans " + queued.toStr())
+
+    // ---- VACUUM: a table written as rows
+    sa.setColumns(false)
+    let c5 = both(mut &a, mut &b, &"create table v (id int primary key, a int, t text, n numeric)")
+    let i8 = both(mut &a, mut &b, &"insert into v select g, g % 211, 'v' || (g % 13), g * 1.5 from generate_series(1, 4000) g")
+    ck(&sa, &sb)
+    sa.setColumns(true)
+    let kb = lexdb_exec.leafKinds(&sa, &"v")
+    let v4 = both(mut &a, mut &b, &"vacuum (verbose) v")
+    let ka = lexdb_exec.leafKinds(&sa, &"v")
+    let v5 = both(mut &a, mut &b, &"vacuum analyze v")
+    println("vacuum: before " + colsOf(&kb).toStr() + " cols; after " + rowsOf(&ka).toStr() + " rows; queries " + compare(mut &a, mut &b, &"v").toStr() +
+            " of 6 the same; vacuum analyze " + v5)
+
+    // ---- leaves a scan read, converted by checkpoints within the budget
+    sa.setColumns(false)
+    let c6 = both(mut &a, mut &b, &"create table w (id int primary key, a int, t text)")
+    let i9 = both(mut &a, mut &b, &"insert into w select g, g % 97, 'w' || (g % 31) from generate_series(1, 4000) g")
+    ck(&sa, &sb)
+    sa.setColumns(true)
+    sa.setUpgradeBudget(10)
+    let s3 = both(mut &a, mut &b, &"select count(*), sum(a) from w")
+    let qd = sa.upgradeCounts()[2]
+    ck(&sa, &sb)
+    let k1 = colsOf(&lexdb_exec.leafKinds(&sa, &"w"))
+    ck(&sa, &sb)
+    let k2 = colsOf(&lexdb_exec.leafKinds(&sa, &"w"))
+    sa.setUpgradeBudget(1000)
+    ck(&sa, &sb)
+    println("queue: queued " + (qd > 20).toStr() + "; after one checkpoint " + k1.toStr() + " cols; after two " + k2.toStr() + " cols; after all " +
+            rowsOf(&lexdb_exec.leafKinds(&sa, &"w")).toStr() + " rows")
+    // writes after the last checkpoint, for the crash's log
+    let u2 = both(mut &a, mut &b, &"update m set a = a + 1 where id % 7 = 0")
+    let u3 = both(mut &a, mut &b, &"update w set a = a + 1 where id % 11 = 0")
+}
+
+fn main() {
+    let fa = lexdb_disk.sim(31)
+    let fb = lexdb_disk.sim(32)
+    var crashed = fa
+    let r = lexdb_store.run(fa, opts(), fn(sa: lexdb_store.Store): int {
+        let r2 = lexdb_store.run(fb, opts(), fn(sb: lexdb_store.Store): int {
+            body(sa, sb)
+            return 0
+        })
+        crashed = fa.crash(5)
+        return 0
+    })
+    let r3 = lexdb_store.run(crashed, opts(), fn(sa: lexdb_store.Store): int {
+        let r4 = lexdb_store.run(fb, opts(), fn(sb: lexdb_store.Store): int {
+            lexdb_exec.bootstrap(&sa).unwrap()
+            lexdb_exec.bootstrap(&sb).unwrap()
+            var a = lexdb_exec.newSession(sa)
+            var b = lexdb_exec.newSession(sb)
+            var same = 0
+            for t in ["m", "old", "lt", "iv", "v", "w"] {
+                let ra = q(mut &a, &("select * from " + t + " order by id"))
+                let rb = q(mut &b, &("select * from " + t + " order by id"))
+                if ra == rb && !strings.startsWith(&ra, "ERROR") { same += 1 } else {
+                    DIFF += 1
+                    println("DIFFERENT after the crash: " + t)
+                }
+            }
+            println("reopened: queries " + same.toStr() + " of 6 the same")
+            return 0
+        })
+        return 0
+    })
+    println("different " + DIFF.toStr())
+}

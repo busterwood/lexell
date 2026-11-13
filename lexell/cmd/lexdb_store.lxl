@@ -68,6 +68,7 @@ type SlotMeta = value record {
     cost: int           // loaded: what it counts against the cache (lexdb_page.nodeCost)
     listed: bool        // in Db.histSlots
     frame: int          // loaded: its node, pool[frame]; -1 when not (a slot not in memory holds no node)
+    upg: int            // a clean row leaf of a table (9.114): 0 not seen, 1 queued to be converted, 2 its rows did not convert
 }
 
 // A descent's path, with the separators around each node on it: keys in
@@ -204,6 +205,13 @@ pub type Db = record {
     specRatio: []int
     specSplits: []int
     pub refitCuts: int          // leaves a checkpoint cut to fit their pages (refit)
+    // Clean row leaves of table trees a scan read (9.114): converted to
+    // column leaves by the next checkpoint, upgBudget at most (upgradeQueued)
+    upgTree: []int
+    upgKey: []str
+    upgBudget: int
+    pub upgLeaves: int          // clean leaves rewritten as column leaves (upgradeLeaf)
+    pub upgFailed: int          // and those whose rows did not convert
 }
 
 // A handle to an open store; copies reach the same store. A replica's
@@ -371,6 +379,9 @@ fn (t: &Txn) lastWrite(tree: int, key: &str): Option[int] {
     return None
 }
 
+// Whether the transaction has written key in tree.
+pub fn (t: &Txn) wrote(tree: int, key: &str): bool { return t.lastWrite(tree, key).isSome() }
+
 fn (t: mut &Txn) noteWrite(tree: int, key: str, i: int) {
     for k in 0..len(t.idxTrees) {
         if t.idxTrees[k] == tree {
@@ -444,11 +455,12 @@ fn (db: mut &Db) allocSlot(): int {
         db.meta[s].since = 0
         db.meta[s].pinned = false
         db.meta[s].cost = 0
+        db.meta[s].upg = 0
         return s
     }
     append(mut &db.meta, SlotMeta{used: true, gen: 0, loaded: false, dirty: false, root: false, disk: -1,
                                   ckpt: 0, version: 0, ref: false, since: 0, pinned: false, cost: 0,
-                                  listed: false, frame: -1})
+                                  listed: false, frame: -1, upg: 0})
     append(mut &db.hist, [])
     return len(db.meta) - 1
 }
@@ -576,6 +588,7 @@ fn (db: mut &Db) dropSlot(s: int) {
 fn (db: mut &Db) markDirty(s: int) {
     if !db.meta[s].dirty {
         db.meta[s].dirty = true
+        db.meta[s].upg = 0
         if db.meta[s].disk >= 0 { db.freePage(db.meta[s].disk) }
         db.meta[s].disk = -1
     }
@@ -1331,8 +1344,10 @@ fn (db: mut &Db) refitLeaf(tree: int, i: int, first: &str) {
         if db.pool[f].isCols() { return }
         let n = db.pool[f].count()
         if cols {
+            let c0 = lexdb_cols.converted()
             match lexdb_page.colBody(&db.pool[f], &db.specs[i]) {
                 Some(b) {
+                    if lexdb_cols.converted() != c0 { db.willChange(s) }
                     lexdb_page.repack(mut &db.pool[f], &b)
                     db.recost(s)
                     return
@@ -2492,6 +2507,7 @@ pub fn (st: &Store) scanLeaves(t: mut &Txn, tree: int, from: str, to: str,
                     append(mut &bad, lexdb_base.err(lexdb_base.S_INTERNAL, "snapshot: a node version is missing"))
                     return
                 }
+                if d.ver == -1 { db.noteLeaf(tree, d.leaf) }
                 let n = db.snapNode(d.leaf, d.ver)
                 let i = n.lower(&cursor)
                 var j = n.count()
@@ -2515,6 +2531,7 @@ pub fn (st: &Store) scanLeaves(t: mut &Txn, tree: int, from: str, to: str,
                 return
             }
             let leaf = d.path[len(d.path) - 1]
+            db.noteLeaf(tree, leaf)
             let n = &db.pool[db.meta[leaf].frame]
             let i = n.lower(&cursor)
             var j = n.count()
@@ -3737,8 +3754,11 @@ fn (db: mut &Db) leafBody(s: int, pages: &[]int, tree: int): str {
     if db.pool[f].leaf && lexdb_cols.on() && !db.colsOff {
         match db.colSpecs.get(&tree) {
             Some(i) {
+                let c0 = lexdb_cols.converted()
                 match lexdb_page.colBody(&db.pool[f], &db.specs[i]) {
                     Some(b) {
+                        // its rows rewritten (9.114): a snapshot keeps them as they were
+                        if lexdb_cols.converted() != c0 { db.willChange(s) }
                         db.colLeaves += 1
                         // a full leaf's ratio (leafRoom)
                         let size = db.pool[f].size
@@ -3761,17 +3781,27 @@ fn (db: mut &Db) leafBody(s: int, pages: &[]int, tree: int): str {
 // is given wrong kinds writes rows that do not parse in them as rows, and
 // the rows it does take come back byte for byte; a reader that reads
 // columns first checks the leaf's kinds against its table's.
-pub fn (st: &Store) setColSpec(tree: int, layouts: &[][]byte) {
+//
+// Since 9.114 the last layout is the one rows are converted to, so the
+// layouts must be committed ones: the executor gives none its own
+// transaction has written. A table's layouts are only ever added to, so
+// layouts that begin the ones already given (a snapshot's older catalog)
+// are not taken. fill, fillOk: lexdb_cols.Spec's.
+pub fn (st: &Store) setColSpec(tree: int, layouts: &[][]byte, fill: &str, fillOk: bool) {
     if st.fo.isSome() { return }
     st.sh.with(fn(db: mut &Db) {
         match db.colSpecs.get(&tree) {
             Some(i) {
-                if lexdb_cols.sameSpec(&db.specs[i], layouts) { return }
-                db.specs[i] = lexdb_cols.Spec{layouts: copyLayouts(layouts)}
+                if lexdb_cols.sameSpec(&db.specs[i], layouts, fill, fillOk) { return }
+                let given = lexdb_cols.Spec{layouts: copyLayouts(layouts), fill: fill.toStr(), fillOk: fillOk}
+                if len(layouts) < len(db.specs[i].layouts) && lexdb_cols.extends(&given, &db.specs[i].layouts) { return }
+                db.specs[i] = given
+                // leaves whose rows did not convert may now
+                for x in 0..len(db.meta) { if db.meta[x].upg == 2 { db.meta[x].upg = 0 } }
             }
             None {
                 db.colSpecs.put(tree, len(db.specs))
-                append(mut &db.specs, lexdb_cols.Spec{layouts: copyLayouts(layouts)})
+                append(mut &db.specs, lexdb_cols.Spec{layouts: copyLayouts(layouts), fill: fill.toStr(), fillOk: fillOk})
                 append(mut &db.specRatio, 0)
                 append(mut &db.specSplits, 0)
             }
@@ -3799,6 +3829,237 @@ pub fn (st: &Store) setColumns(on: bool) { st.sh.with(fn(db: mut &Db) { db.colsO
 pub fn (st: &Store) colCounts(): []int {
     var out: []int = []
     st.sh.with(fn(db: mut &Db) { out = [db.colLeaves, db.rowLeaves, db.refitCuts] })
+    return out
+}
+
+// ---- clean row leaves made column leaves (9.114)
+//
+// A checkpoint writes changed leaves only, so a table's leaves written as
+// rows (T_LEAF before 9.109, T_FLEAF; or rows of two layouts, or tagged,
+// before 9.114) stay so while their rows do not change. Such a leaf is
+// converted the way a commit changes one: its version kept for the
+// snapshots that may read it (willChange), its rows made a column leaf in
+// memory (rewritten in the current layout when they were not in one:
+// lexdb_cols.encodeConv), and its path marked changed (copy on write: the
+// next checkpoint writes them to new pages and frees the old). Which:
+// - those a batch scan reads (scanLeaves, noteLeaf): queued by their first
+//   key, at most UPG_QUEUE; each checkpoint converts the first upgBudget
+//   (upgradeQueued), loading those no longer in memory;
+// - every leaf of a table, by VACUUM (upgradeTree), a step at a time, a
+//   checkpoint after each.
+// A leaf whose rows do not encode stays rows, and is marked (SlotMeta.upg)
+// so it is not queued again until it changes or its tree's layouts do.
+
+const UPG_QUEUE = 4096          // leaves queued at most
+const UPG_BUDGET = 256          // leaves a checkpoint converts at most (lexdb.md 9.114: its cost)
+
+// The leaves a checkpoint converts at most (tests set fewer).
+pub fn (st: &Store) setUpgradeBudget(n: int) { st.sh.with(fn(db: mut &Db) { db.upgBudget = n }) }
+
+// Leaf s of tree, just read by a scan: queued when it is a clean row leaf
+// of a table tree (one with layouts).
+fn (db: mut &Db) noteLeaf(tree: int, s: int) {
+    if db.meta[s].upg != 0 || db.meta[s].dirty || len(db.upgTree) >= UPG_QUEUE { return }
+    let f = db.meta[s].frame
+    if f < 0 || !db.pool[f].leaf || db.pool[f].isCols() || db.pool[f].count() == 0 { return }
+    if !lexdb_cols.on() || db.colsOff { return }
+    if !db.colSpecs.has(&tree) {
+        db.meta[s].upg = 2          // (an index's: until a tree's layouts change)
+        return
+    }
+    db.meta[s].upg = 1
+    append(mut &db.upgTree, tree)
+    append(mut &db.upgKey, db.pool[f].key(0))
+}
+
+// The leaf d reached (of tree), made a column leaf when it is a clean row
+// leaf of a table: 1 done, 0 its rows did not encode (it stays rows), -1
+// nothing to do (changed: the checkpoint encodes it; a column leaf; not a
+// table's).
+fn (db: mut &Db) upgradeLeaf(tree: int, d: &Descent): int {
+    let s = d.path[len(d.path) - 1]
+    let f = db.meta[s].frame
+    if db.meta[s].dirty || !db.pool[f].leaf || db.pool[f].isCols() || db.pool[f].count() == 0 { return -1 }
+    if !lexdb_cols.on() || db.colsOff { return -1 }
+    let i = match db.colSpecs.get(&tree) {
+        Some(x) { x }
+        None { return -1 }
+    }
+    if db.meta[s].upg == 2 { return 0 }
+    match lexdb_page.colBody(&db.pool[f], &db.specs[i]) {
+        Some(b) {
+            db.willChange(s)
+            lexdb_page.repack(mut &db.pool[db.meta[s].frame], &b)
+            db.meta[s].version += 1
+            db.recost(s)
+            for x in d.path { db.markDirty(x) }
+            db.upgLeaves += 1
+            return 1
+        }
+        None {
+            db.meta[s].upg = 2
+            db.upgFailed += 1
+            return 0
+        }
+    }
+}
+
+// The leaf of tree holding key, converted (upgradeLeaf), loaded first if
+// it is not in memory.
+fn (st: &Store) upgradeAt(tree: int, key: &str): Result[Unit, lexdb_base.DbErr] {
+    var guard = 0
+    while guard < 64 {
+        guard += 1
+        var need = -1
+        st.sh.with(fn(db: mut &Db) {
+            if len(db.failed) > 0 { return }
+            let d = db.descend(tree, key)
+            if d.need >= 0 {
+                need = d.need
+                return
+            }
+            if len(d.path) > 0 { let r = db.upgradeLeaf(tree, &d) }
+        })
+        if need < 0 { return Ok(Unit{}) }
+        try st.load(need)
+    }
+    return Ok(Unit{})
+}
+
+// The first upgBudget leaves queued, converted (by a checkpoint).
+fn (st: &Store) upgradeQueued(): Result[Unit, lexdb_base.DbErr] {
+    var trees: []int = []
+    var keys: []str = []
+    st.sh.with(fn(db: mut &Db) {
+        let k = min(db.upgBudget, len(db.upgTree))
+        if k <= 0 { return }
+        var restT: []int = []
+        var restK: []str = []
+        for i in 0..len(db.upgTree) {
+            if i < k {
+                append(mut &trees, db.upgTree[i])
+                append(mut &keys, replace(mut &db.upgKey[i], ""))
+            } else {
+                append(mut &restT, db.upgTree[i])
+                append(mut &restK, replace(mut &db.upgKey[i], ""))
+            }
+        }
+        db.upgTree = restT
+        db.upgKey = restK
+    })
+    for i in 0..len(trees) { try st.upgradeAt(trees[i], &keys[i]) }
+    return Ok(Unit{})
+}
+
+// What upgradeTree did: the key to go on from (when not done), the leaves
+// converted, and those left as rows (their rows did not encode).
+pub type Upgrade = value record { pub next: str; pub done: bool; pub converted: int; pub kept: int }
+
+// Converts tree's leaves (upgradeLeaf) from key from on, until most are
+// converted or the tree ends (VACUUM, 9.114). The leaves converted stay in
+// memory, changed, until a checkpoint writes them: the caller takes one
+// after each step.
+pub fn (st: &Store) upgradeTree(tree: int, from: str, most: int): Result[Upgrade, lexdb_base.DbErr] {
+    var out = Upgrade{next: "", done: true, converted: 0, kept: 0}
+    if st.fo.isSome() { return Ok(out) }           // a replica writes nothing
+    out.done = false
+    var cursor = from
+    var ahead = AHEAD_MIN
+    while true {
+        var need = -1
+        var run: []LoadReq = []
+        var bad: []lexdb_base.DbErr = []
+        var upper = ""
+        var hasUpper = false
+        var empty = false
+        var r = -1
+        st.sh.with(fn(db: mut &Db) {
+            if len(db.failed) > 0 {
+                append(mut &bad, db.failed[0])
+                return
+            }
+            let d = db.descend(tree, &cursor)
+            if d.need >= 0 {
+                need = d.need
+                if len(d.path) > 0 { run = db.runFor(d.path[len(d.path) - 1], &cursor, need, ahead) }
+                return
+            }
+            if len(d.path) == 0 {
+                empty = true
+                return
+            }
+            r = db.upgradeLeaf(tree, &d)
+            upper = d.upper
+            hasUpper = d.hasUpper
+        })
+        if len(bad) > 0 { return Err(bad[0]) }
+        if need >= 0 {
+            try st.loadAhead(need, &run)
+            if len(run) > 1 { ahead = min(ahead * 2, AHEAD_MAX) }
+            continue
+        }
+        if r == 1 { out.converted += 1 }
+        if r == 0 { out.kept += 1 }
+        if empty || !hasUpper {
+            out.done = true
+            return Ok(out)
+        }
+        cursor = upper
+        if out.converted >= most {
+            out.next = cursor
+            return Ok(out)
+        }
+    }
+    return Ok(out)
+}
+
+// Tree's leaves: column leaves, and leaves of rows (a test's look; every
+// leaf is read).
+pub fn (st: &Store) leafKinds(tree: int): Result[[]int, lexdb_base.DbErr] {
+    var out: []int = [0, 0]
+    if st.fo.isSome() { return Ok(out) }
+    var cursor = ""
+    while true {
+        var need = -1
+        var bad: []lexdb_base.DbErr = []
+        var upper = ""
+        var hasUpper = false
+        var empty = false
+        st.sh.with(fn(db: mut &Db) {
+            if len(db.failed) > 0 {
+                append(mut &bad, db.failed[0])
+                return
+            }
+            let d = db.descend(tree, &cursor)
+            if d.need >= 0 {
+                need = d.need
+                return
+            }
+            if len(d.path) == 0 {
+                empty = true
+                return
+            }
+            let n = &db.pool[db.meta[d.path[len(d.path) - 1]].frame]
+            if n.count() > 0 { if n.isCols() { out[0] += 1 } else { out[1] += 1 } }
+            upper = d.upper
+            hasUpper = d.hasUpper
+        })
+        if len(bad) > 0 { return Err(bad[0]) }
+        if need >= 0 {
+            try st.load(need)
+            continue
+        }
+        if empty || !hasUpper { return Ok(out) }
+        cursor = upper
+    }
+    return Ok(out)
+}
+
+// Leaves converted while clean (upgradeLeaf), and those left as rows; the
+// leaves queued now.
+pub fn (st: &Store) upgradeCounts(): []int {
+    var out: []int = []
+    st.sh.with(fn(db: mut &Db) { out = [db.upgLeaves, db.upgFailed, len(db.upgTree)] })
     return out
 }
 
@@ -3880,6 +4141,15 @@ pub fn (st: &Store) checkpoint(): Result[Unit, lexdb_base.DbErr] {
     })
     if len(bad) > 0 { return Err(bad[0]) }
     if busy { return Ok(Unit{}) }
+    // Clean row leaves the scans queued, made column leaves (9.114): changed
+    // nodes this checkpoint then writes.
+    match st.upgradeQueued() {
+        Ok(_) {}
+        Err(e) {
+            st.fail(e)
+            return Err(e)
+        }
+    }
     // Some of the dropped subtrees' pages: freed by this checkpoint, which
     // names the rest.
     var gone: []int = []
@@ -4156,7 +4426,7 @@ fn newDb(fs: lexdb_disk.Fs, data: lexdb_disk.File, opts: Options, m: &lexdb_page
               hist: [], histCount: 0, histSlots: [], deferred: [], rootHist: [], durableSeq: 0, holds: newMap(), holdCkpt: -1, holdSeg: -1, heldFree: [], changeWake: [], durWaits: [], nextDurWait: 0, ckptCovers: m.covers, snapshots: 0, tooOld: 0, commits: 0,
               conflicts: 0, loads: 0, aheadReads: 0, aheadPages: 0, evictions: 0, flushes: 0, logBytes: 0, checkpoints: 0, pagesWritten: 0, held: 0, wholes: 0,
               colSpecs: newMap(), specs: [], colLeaves: 0, rowLeaves: 0, colsOff: false,
-              specRatio: [], specSplits: [], refitCuts: 0}
+              specRatio: [], specSplits: [], refitCuts: 0, upgTree: [], upgKey: [], upgBudget: UPG_BUDGET, upgLeaves: 0, upgFailed: 0}
 }
 
 // Opens the store in fs (creating it when it is new) and recovers: the last

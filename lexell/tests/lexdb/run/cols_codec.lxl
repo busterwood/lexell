@@ -6,14 +6,16 @@
 // rows and more), go through encodeRows and come back byte for byte: all
 // the rows at once (allRows), each alone (rowOf), and each value read in
 // place (intAt, varAt, boolAt, isNull and the run readers) as it was made.
-// Each codec is used. Rows the codec must not take are refused: two
-// layouts in a leaf, a tagged row, a value stored apart, a NULL place with
+// Each codec is used. Rows of two layouts, and a tagged row, are converted
+// to the current layout (9.114). Rows the codec must not take are refused:
+// a tagged row cut short or long, a value stored apart, a NULL place with
 // bytes, a boolean of 2, a row longer than its parts, a bitmap's spare bit
-// set, a layout the spec does not have. A numeric's units give
+// set (each in the current layout), a layout the spec does not have. A numeric's units give
 // Decimal.toBin's bytes. A leaf like w's rows takes about 0.6 of its bytes.
 // expect: leaves 880, rows ok true, values ok true, runs ok true
 // expect: codecs used: for true raw true bool true text true dict true units true bin true none true
-// expect: refused: two layouts true tagged true stub true null bytes true bool 2 true long true spare bit true no layout true
+// expect: converted: two layouts true tagged true
+// expect: refused: bad tagged true stub true null bytes true bool 2 true long true spare bit true no layout true
 // expect: units bin ok true
 // expect: w-like: rows 73 encoded smaller true
 import "binary"
@@ -137,7 +139,7 @@ fn oneLeaf(r: mut &lexdb_base.Rng, ks: &[]byte, n: int, nulls: int, modes: &[]in
         for k in ks { append(mut &kk, if l == 7 { k } else { byte(1) }) }
         append(mut &layouts, kk)
     }
-    let spec = lexdb_cols.Spec{layouts: layouts}
+    let spec = lexdb_cols.specOf(layouts)
     let got = lexdb_cols.encodeRows(&rows, &spec)
     if got.isNone() {
         rowsOk = false
@@ -213,6 +215,18 @@ fn oneLeaf(r: mut &lexdb_base.Rng, ks: &[]byte, n: int, nulls: int, modes: &[]in
 
 fn refuse(rows: &[]str, spec: &lexdb_cols.Spec): bool { return lexdb_cols.encodeRows(rows, spec).isNone() }
 
+// Whether rows encode, and come back as want.
+fn backAs(rows: &[]str, spec: &lexdb_cols.Spec, want: &[]str): bool {
+    match lexdb_cols.encodeRows(rows, spec) {
+        Some(s) {
+            let dir = lexdb_cols.parse(&s, len(rows)).unwrap()
+            for i in 0..len(want) { if lexdb_cols.rowOf(&s, &dir, i) != want[i] { return false } }
+            return true
+        }
+        None { return false }
+    }
+}
+
 fn main() {
     var r = lexdb_base.rng(42)
     var used = Used{c: array(16, false)}
@@ -245,27 +259,32 @@ fn main() {
 
     // refusals
     let ks: []byte = [byte(1), 2, 4]
-    let spec = lexdb_cols.Spec{layouts: [[byte(1), 2, 4], [byte(1), 2, 4, 1]]}
+    let spec = lexdb_cols.specOf([[byte(1), 2, 4], [byte(1), 2, 4, 1]])
+    let spec0 = lexdb_cols.specOf([[byte(1), 2, 4]])
     let a = row(0, &ks, &[V{nul: false, i: 5, t: ""}, V{nul: false, i: 1, t: ""}, V{nul: false, i: 0, t: "x"}])
     let ks2: []byte = [byte(1), 2, 4, 1]
     let b = row(1, &ks2, &[V{nul: false, i: 5, t: ""}, V{nul: false, i: 1, t: ""}, V{nul: false, i: 0, t: "x"}, V{nul: true, i: 0, t: ""}])
     let okBoth = !refuse(&[a, a], &spec) && !refuse(&[b], &spec)
-    let two = refuse(&[a, b], &spec)
-    let tagged = refuse(&[a, "\x01\x05xyz"], &spec)
+    // two layouts, and a tagged row (9.114): converted to the current layout
+    let ta = "\x01\x05\x00\x00\x00\x00\x00\x00\x00\x02\x01\x04\x01\x00\x00\x00x"
+    let two = backAs(&[a, b], &spec, &[b, b])
+    let tagged = backAs(&[a, ta], &spec, &[b, b]) && backAs(&[ta], &spec0, &[a])
+    let badTag = refuse(&[a, "\x01\x05xyz"], &spec) && refuse(&[a, "\x06\x01\x00\x00\x00\x05\x01\x00\x00\x00x"], &spec)
     let stub = refuse(&["\xff\x01" + strings.repeat("z", 12)], &spec)
     // a NULL integer with bytes: the bit set, the 8 bytes left
     var nb = strToBytes(&a)
     nb[3] = byte(1)
-    let nullBytes = refuse(&[strFromBytes(&nb)], &spec)
+    let nullBytes = refuse(&[strFromBytes(&nb)], &spec0)
     var b2 = strToBytes(&a)
     b2[4 + 8] = byte(2)
-    let bool2 = refuse(&[strFromBytes(&b2)], &spec)
-    let long = refuse(&[a + "!"], &spec)
+    let bool2 = refuse(&[strFromBytes(&b2)], &spec0)
+    let long = refuse(&[a + "!"], &spec0)
     var sp = strToBytes(&a)
     sp[3] = byte(0x80)
-    let spare = refuse(&[strFromBytes(&sp)], &spec)
+    let spare = refuse(&[strFromBytes(&sp)], &spec0)
     let noLay = refuse(&[row(5, &ks, &[V{nul: false, i: 5, t: ""}, V{nul: false, i: 1, t: ""}, V{nul: false, i: 0, t: "x"}])], &spec)
-    println("refused: two layouts " + (two && okBoth).toStr() + " tagged " + tagged.toStr() + " stub " + stub.toStr() + " null bytes " + nullBytes.toStr() +
+    println("converted: two layouts " + (two && okBoth).toStr() + " tagged " + tagged.toStr())
+    println("refused: bad tagged " + badTag.toStr() + " stub " + stub.toStr() + " null bytes " + nullBytes.toStr() +
             " bool 2 " + bool2.toStr() + " long " + long.toStr() + " spare bit " + spare.toStr() + " no layout " + noLay.toStr())
 
     // units against toBin, through a leaf of one value each
@@ -278,7 +297,7 @@ fn main() {
         let t = Decimal.fromUnits(u, ds).toBin()
         let one: []byte = [byte(3)]
         let rw = row(0, &one, &[V{nul: false, i: 0, t: t}])
-        let sp1 = lexdb_cols.Spec{layouts: [one]}
+        let sp1 = lexdb_cols.specOf([one])
         let rws: []str = [rw]
         match lexdb_cols.encodeRows(&rws, &sp1) {
             Some(s) {
@@ -305,6 +324,6 @@ fn main() {
         bytes += len(rw)
         append(mut &wrows, rw)
     }
-    let ws = lexdb_cols.encodeRows(&wrows, &lexdb_cols.Spec{layouts: [wk]}).unwrap()
+    let ws = lexdb_cols.encodeRows(&wrows, &lexdb_cols.specOf([wk])).unwrap()
     println("w-like: rows 73 encoded smaller " + (len(ws) * 10 < bytes * 7).toStr())
 }

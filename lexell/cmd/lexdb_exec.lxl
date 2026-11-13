@@ -5208,12 +5208,107 @@ fn findTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, name: &str): Res
     match try st.get(txn, CATALOG, k) {
         Some(s) {
             let t = try decTable(&k, &s)
-            // its layouts, for the store's column leaves (9.112)
-            if t.tree > 0 && len(t.layouts) > 0 && len(t.view) == 0 { st.setColSpec(t.tree, &t.layouts) }
+            // its layouts, for the store's column leaves (9.112): committed
+            // ones only, which rows may be converted to (9.114)
+            if !txn.wrote(CATALOG, &k) { setSpec(st, &t) }
             return Ok(Some(t))
         }
         None { return Ok(None) }
     }
+}
+
+// Gives the store table t's layouts (lexdb_store.setColSpec), and the
+// values its rows written before a column was added have for it (as a row
+// in its current layout: lexdb_cols.Spec.fill).
+fn setSpec(st: &lexdb_store.Store, t: &Table) {
+    if t.tree <= 0 || len(t.layouts) == 0 || len(t.view) > 0 { return }
+    let miss = placesMissing(t)
+    var fill = ""
+    var ok = true
+    if len(miss) > 0 {
+        match encFixed(t, &miss) {
+            Some(f) { fill = f }
+            None { ok = false }
+        }
+    }
+    st.setColSpec(t.tree, &t.layouts, &fill, ok)
+}
+
+// Every table (not a view, nor another session's temporary table).
+fn seenTables(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[[]Table, DbErr] {
+    var keys: []str = []
+    var raw: []str = []
+    try catScan(st, txn, &"\x06", &"", &"", fn(en: &lexdb_store.Entry): bool {
+        append(mut &keys, en.key)
+        append(mut &raw, en.val)
+        return true
+    })
+    var tabs: []Table = []
+    for i in 0..len(keys) {
+        let t = try decTable(&keys[i], &raw[i])
+        if len(t.view) == 0 { append(mut &tabs, t) }
+    }
+    return Ok(tabs)
+}
+
+// Tables whose stored current layout is from before 9.113 (olderKinds:
+// text places where dates, times, floats, uuids and byteas are now) are
+// given the layout of their kinds now, as DDL gives it (encTable), in one
+// transaction (9.114): their new rows then take the new kinds, and their
+// leaves of older rows are converted to it as checkpoints write them.
+// At open, on a primary.
+pub fn upgradeLayouts(st: &lexdb_store.Store): Result[int, DbErr] {
+    if st.isReplica() { return Ok(0) }
+    var txn = lexdb_store.begin()
+    let tabs = try seenTables(st, mut &txn)
+    var n = 0
+    for t in tabs {
+        let nl = len(t.layouts)
+        if nl == 0 { continue }
+        let cur = placeKinds(&t)
+        if sameKinds(&t.layouts[nl - 1], &cur) || !olderKinds(&t.layouts[nl - 1], &cur) { continue }
+        try putTable(mut &txn, &t)
+        n += 1
+    }
+    if n == 0 {
+        st.abort(txn)
+        return Ok(0)
+    }
+    try bumpCatalog(st, mut &txn)
+    try st.commit(txn)
+    return Ok(n)
+}
+
+// VACUUM (9.114): the named tables' leaves, or every table's, made column
+// leaves where their rows allow (lexdb_store.upgradeTree), a checkpoint
+// after each VACUUM_STEP leaves converted.
+const VACUUM_STEP = 2048
+
+fn vacuumTables(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, names: &[]str): Result[Unit, DbErr] {
+    if st.isReplica() { return Ok(Unit{}) }
+    var tabs: []Table = []
+    if len(names) > 0 {
+        for n in names {
+            match try findTable(st, txn, &n) {
+                Some(t) { if len(t.view) == 0 { append(mut &tabs, t) } }
+                None {}
+            }
+        }
+    } else {
+        tabs = try seenTables(st, txn)
+        for t in tabs { setSpec(st, &t) }
+    }
+    for t in tabs {
+        if t.tree <= 0 || len(t.layouts) == 0 { continue }
+        var from = ""
+        while true {
+            let u = try st.upgradeTree(t.tree, from, VACUUM_STEP)
+            if u.converted > 0 { try st.checkpointAll() }
+            if u.done { break }
+            from = u.next
+        }
+    }
+    return Ok(Unit{})
 }
 
 fn needTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, name: &str): Result[Table, DbErr] {
@@ -5249,6 +5344,8 @@ pub fn bootstrap(st: &lexdb_store.Store): Result[Unit, DbErr] {
     }
     // temporary objects left by a crash (9.96); a replica's go with the master's
     if !st.isReplica() { try dropLeftTemps(st) }
+    // tables of layouts from before 9.113 (9.114)
+    let up = try upgradeLayouts(st)
     return Ok(Unit{})
 }
 
@@ -11580,6 +11677,9 @@ fn maint(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt):
             None { return Err(e("42P01", "relation \"" + lexdb_sql.shown(n) + "\" does not exist")) }
         }
     }
+    // VACUUM (and VACUUM ANALYZE, before its ANALYZE): leaves of rows made
+    // column leaves (9.114)
+    if s.alias == "VACUUM" && !txn.inBlock() { try vacuumTables(st, txn, &s.names) }
     if strings.startsWith(s.index, lexdb_sql.SCHEMA_MARK) {
         let sc = s.index[len(lexdb_sql.SCHEMA_MARK)..len(s.index)]
         if !(try schemaExists(st, txn, &sc)) && sc != "pg_catalog" && sc != "information_schema" {
@@ -25608,6 +25708,25 @@ pub fn rowLayouts(st: &lexdb_store.Store, name: &str): str {
     for i in 0..len(counts) { if counts[i] > 0 { append(mut &out, i.toStr() + ":" + counts[i].toStr()) } }
     if tagged > 0 { append(mut &out, "tagged:" + tagged.toStr()) }
     return strings.join(&out, " ") + " of " + nl.toStr() + " layouts"
+}
+
+// Table name's leaves: "C cols R rows" (column leaves, leaves of rows; a
+// test's look, 9.114).
+pub fn leafKinds(st: &lexdb_store.Store, name: &str): str {
+    var txn = lexdb_store.begin()
+    var out = "no table"
+    let found = findTable(st, mut &txn, name).unwrapOr(None)
+    st.abort(txn)
+    match found {
+        Some(t) {
+            match st.leafKinds(t.tree) {
+                Ok(k) { out = k[0].toStr() + " cols " + k[1].toStr() + " rows" }
+                Err(x) { out = x.toStr() }
+            }
+        }
+        None {}
+    }
+    return out
 }
 
 // Places of 9.113's kinds as text places, as before 9.113 (a test's look

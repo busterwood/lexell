@@ -10573,10 +10573,10 @@ off passes agreed within 4% on the geometric mean and 1% on `qL.txt`):
   test, 20 rounds direct and 20 with `LXL_URING=1`; the replica test.
 
 **Not done, and next:**
-- A leaf of two layouts is written as rows, so after an ALTER TABLE a
-  table's leaves stay rows until their rows are written again. A layout
-  per run of rows, or rows rewritten to the new layout at checkpoint, would
-  fix it.
+- (Done in 9.114.) A leaf of two layouts was written as rows, so after an
+  ALTER TABLE a table's leaves stayed rows until their rows were written
+  again. Its rows are now rewritten in the current layout when the leaf is
+  encoded, and clean leaves of rows are converted by scans and VACUUM.
 - A changed column leaf rebuilds all its rows (about 8 µs for 67), and the
   checkpoint encodes it whole (about 16 µs): the write cost above.
 - The encode runs inside the checkpoint's hold of the store (as the row
@@ -10686,3 +10686,227 @@ median of 3, under the shared lock:
 
 The suite passes (126), also with `LEXDB_COLCHECK=1`. Crash runs, 6 rounds
 in each I/O mode, pass.
+
+### 9.114 Leaves of rows made column leaves: rows converted to the current layout; scans and VACUUM
+
+A checkpoint wrote a changed leaf as a column leaf (9.112) only when every
+row in it was in the fixed form of one layout. Three kinds of leaf
+therefore stayed rows for good:
+- **After ALTER TABLE.** A column added or dropped makes a new layout, and
+  a leaf holding rows of two was written as rows until every row in it was
+  written again. Migrations (Django's, Alembic's) add columns all the time.
+- **Tables made before 9.113.** Their stored current layout has text places
+  for dates, floats and the like, so a row with a date is tagged, and its
+  leaf rows, until the table's next DDL.
+- **Clean leaves of rows.** T_LEAF and T_FLEAF pages from before column
+  leaves: a checkpoint writes changed leaves only.
+
+**Rows converted when a leaf is encoded** (`lexdb_cols.convertRows`). When
+a leaf's rows are not all in one layout, `encodeRows` (through
+`encodeConv`) rewrites each into the fixed form of the spec's current
+layout, and encodes those; when one does not convert, the leaf stays rows.
+Rows already in one layout take the encoder as before, untouched.
+- **The current layout** is the spec's last: `encFixed` writes rows in
+  `Table.layouts`' last (the number `nl - 1`), and refuses to write while
+  that is not the table's kinds (between a schema change and its catalog
+  row, `syncLayouts`).
+- **Read as the executor reads them:**
+  - a fixed row through its own layout (a dropped place, or a NULL bit,
+    NULL);
+  - a tagged row (`encRow`; not long: byte 6) value by value;
+  - a place past the row's (written before the place was added): the
+    column's missing value (`placesMissing`). The executor gives these as a
+    row of the current layout (`Spec.fill`, made by `encFixed`); "" when all
+    are NULL; when `encFixed` cannot write them (`fillOk` false), a row
+    lacking a place does not convert.
+- **Written as `encFixed` writes them:** NULL as NULL; a dropped place
+  left NULL; an integer at its place's width when it fits; any other value
+  only to a place of its own kind, its word or bytes copied (a tagged
+  numeric's text made `Decimal.toBin`, as `varBytes` makes it, and a tagged
+  real's 4 bytes and date's 8 as words); texts, byteas and numerics only
+  under `LONG` bytes. So a row converted is the row `encFixed` writes for the
+  values read, byte for byte.
+- **Not converted** (the leaf stays rows): a long row (tag 6), an
+  interval, a text where a date is now (and every other change of kind but
+  an integer's width), an integer too wide for its place, a date outside
+  int32, a row of more places than the layout, a value stored apart.
+- A row already in the current layout is taken as it is: the encoder then
+  parses it to the byte, as before.
+- `LEXDB_COLCHECK=1` compares the rows the region gives back with the
+  converted rows, byte for byte, and each converted row with its row as
+  given, value by value (`placeTexts`: words as integers, texts and bytes as
+  bytes, numerics as `Decimal` shows them, a tagged numeric from its text).
+
+**Only committed layouts.** A row converted names its layout by number, so
+the layout must be one every reader will know. `findTable` reads the
+catalog through its transaction, which sees its own uncommitted ALTER: it no
+longer gives the store a table's layouts from a catalog row its own
+transaction wrote (`Txn.wrote`). An ALTER in a block that rolls back is so
+never a layout rows were converted to. `setColSpec` also keeps the layouts it
+has when given fewer that begin them (a snapshot's older catalog: layouts are
+only added to). So the store learns an ALTER's layout from the first
+statement after it that finds the table; until then a leaf's rows are
+converted to the layout before, which is as good for every reader.
+
+**Snapshots.** A converted leaf's rows change their bytes (not their
+values), and a snapshot older than the layout they now name could not read
+them. So a leaf whose rows were converted is kept for the snapshots that may
+read it, as a commit's change is (`willChange`), in the checkpoint
+(`leafBody`, `refitLeaf`) and in a clean leaf's conversion.
+
+**Pre-9.113 tables get the layout of their kinds.** `bootstrap`, at open on a
+primary (not a replica), now calls `upgradeLayouts`: each table whose stored
+current layout differs from `placeKinds` only by text places where 9.113's
+kinds are (`olderKinds`) gets its catalog row written again, as DDL writes it
+(`encTable` adds the current layout), in one transaction with the catalog's
+version bumped. Its new rows then take the new kinds, and its leaves of older
+(tagged) rows are converted as they are encoded. `olderKinds` stays in
+`encFixed`, for a table not given its layout yet (a store opened without
+`bootstrap`, and the tests' `setLegacyKinds`).
+
+**Clean leaves of rows rewritten.** A clean leaf of a table tree (one with
+layouts) that is rows is converted the way a commit changes one
+(`lexdb_store.upgradeLeaf`, in one hold of the store): its version kept for
+snapshots (`willChange`), its rows encoded (`colBody`, converted if need be)
+and the node made the column leaf in memory (`repack`, as `refitLeaf` does),
+its version moved on, and its path marked changed (`markDirty`, copy on
+write: the next checkpoint writes the path to new pages and frees the old).
+Its rows not encoding, it is marked (`SlotMeta.upg` 2) and not tried again
+until it changes or its tree's layouts do. Leaves are 1:1: a leaf of 43 rows
+from a T_LEAF page becomes a column leaf of 43 rows (no refill).
+- **By scans.** The batch scan (`scanLeaves`) notes each clean row leaf of
+  a table tree it reads (`noteLeaf`): its first key, queued (at most 4,096).
+  Each checkpoint, before it takes the trees, converts the first
+  `UPG_BUDGET` (256) queued (`upgradeQueued`), loading those evicted
+  meanwhile, each in a hold of its own (not in the checkpoint's).
+- **By VACUUM.** `VACUUM [table, ...]` (any form; `VACUUM ANALYZE` then
+  analyzes, as before) walks the named tables, or every table, leaf by leaf
+  (`upgradeTree`, with read-ahead), converting each, and takes a checkpoint
+  after every 2,048 converted (`VACUUM_STEP`) and at the end, so the changed
+  leaves never fill the cache. Not in a block (as before), and nothing on a
+  replica.
+
+**Measured** (the store's CPU, medians of 3, a copy of the data directory
+each run, under the shared lock; base: this build's parent):
+- **Commits and checkpoints of normal work, unchanged.** A 1M-row table
+  like w, in column leaves:
+
+| | base | 9.114 |
+|---|---:|---:|
+| 20,000 updates of random rows, one transaction: statements | 1,127 ms | 1,126 ms |
+| the same, the server's whole life (its shutdown checkpoint in) | 1,433 ms | 1,431 ms |
+| its shutdown checkpoint, wall | 310 ms | 311 ms |
+| 20,000 inserts, ascending: statements | 446 ms | 445 ms |
+| `count(*)`, column leaves (a scan noting leaves) | 95 ms | 96 ms |
+| `count(*)`, leaves of rows (4,096 noted) | 136 ms | 137 ms |
+
+- **ALTER TABLE w ADD COLUMN e int, then `update w set e = id where id % 50
+  = 0`** (20,000 rows, every leaf):
+
+| | base | 9.114 |
+|---|---:|---:|
+| leaves after the checkpoint | 20,002 rows, 5,145 columns | **12,640 columns**, 2 rows |
+| the server's whole life | 904 ms | 1,165 ms |
+| its shutdown checkpoint, wall | 409 ms | 750 ms |
+| `count(*)` | 26 ms | **12** |
+| `count(*), sum(c) where b < 10000` | 42 | **24** |
+| `group by a` | 58 | **40** |
+| `group by city` | 190 | **163** |
+| `select id, b, name` (1M rows) | 216 | **188** |
+| `count(e), sum(e)` | 44 | **23** |
+
+  The checkpoint encodes 12,640 leaves as columns where base wrote 20,002
+  of rows (and 5,145 of columns): about 21 µs a leaf more.
+- **VACUUM of 1M rows** (w; wall, the cache cold, 3 runs within 1%):
+  T_FLEAF leaves (20,104, written with column leaves off) 621 ms, 540 ms of
+  CPU; T_LEAF leaves (about 23,300, `ldata`) 650 ms, 554 ms of CPU: about 27 µs a
+  leaf, reads and checkpoints included. Warm, 455 and 510 ms. Every table of
+  `ldata` (w, t, d), warm: 717 ms.
+- **The budget.** 512 queued leaves converted at a shutdown (its two
+  checkpoints) cost 12 ms of CPU and 12 ms of wall more: about 24 µs a leaf.
+  So 256 a checkpoint add about 6 ms and 1 MB of writes (and at most 256
+  page reads, outside the store's hold) to a checkpoint the log brings every
+  32 MB: the checkpoint of 20,000 random updates (about 10,000 leaves)
+  takes 310 ms, so about 2%. A table
+  of 20,000 leaves is converted by scans alone over about 80 checkpoints;
+  VACUUM does it in well under a second.
+- **`ldata`** (9.109's 1M-row w and t and the small d, all T_LEAF), a copy
+  opened by this build:
+
+| | Pages the trees reach | Data file |
+|---|---|---:|
+| as written | 41,072 T_LEAF, 256 internal | 169.3 MB |
+| 33 queries (scans), then a shutdown | 40,560 T_LEAF, 512 T_CLEAF | 190.8 MB |
+| VACUUM, then a shutdown | 10,226 T_LEAF (the indexes', the catalog's), 30,846 T_CLEAF | 190.8 MB |
+
+  The 33 queries (bench's list, and every table read whole) gave the same
+  output as the base build's on the untouched data, after each step and
+  reopened. The file does not shrink: leaves are converted 1:1, their old
+  pages freed for reuse (the file grew by the pages written before the old
+  were freed, and its reservation). w's queries after VACUUM: `count(*)` 24
+  to 17 ms, `count(*), sum(c) where b < 10000` 54 to 44, `group by a` 55
+  to 45, `group by city` 197 to 179, `select id, b, name` 219 to 198 (a fresh
+  load's column leaves, fuller, give 12, 24, 40, 163, 188).
+
+**Checked:**
+- **Fuzz** (`cmpup.sh`, after `cmpcol.sh`): `gen.py`'s table (every kind,
+  long varchars), as is, without dates, and with texts under 256 bytes;
+  loaded, checkpointed, its 1,200 queries; then ADD COLUMN (a default), an
+  update, DROP COLUMN, updates, deletes, inserts; the queries with batches
+  on and off; VACUUM; the queries again; every output the same with column
+  leaves on and off, 13 seeds (8 with `LEXDB_COLCHECK=1`). Its table's
+  leaves after the ALTER: every one columns when no row is long, about half
+  when one row in 40 has a text of 256 bytes or more.
+- **Crash test:** worker 0 now adds a column (with a default) in even
+  rounds, drops it in the next odd round divisible by 3, and VACUUMs `log`
+  every 1,500 operations; 8 rounds with `LEXDB_COLCHECK=1`, and 6 rounds in
+  each I/O mode, pass. The replica test passes.
+- **Planted bugs**, each caught by `exec_upgrade`: the missing value ignored
+  (a lacking place NULL); no `willChange` for a clean leaf converted (the
+  old table's snapshot); none in the checkpoint's conversion (the mixed
+  leaves' snapshot, through `refitLeaf`); the layouts of the transaction's
+  own catalog row given to the store (the rolled back ALTER: rows in a
+  layout that is gone, 5 of 6 queries failing).
+
+**Tests:** new `exec_upgrade` (store A with column leaves, B without; every
+query with batches on and off):
+- ADD COLUMN with a default and DROP COLUMN on a table of column leaves,
+  a row of every leaf updated: every leaf columns, all 3,000 rows in the
+  third layout; a block's snapshot from before reads as before; one taken
+  after the leaves' last change, before the layout they are converted to,
+  too; an ALTER in a block, rolled back: no row in its layout;
+- a pre-9.113 table (`setLegacyKinds`): tagged rows, no column leaves;
+  `upgradeLayouts` gives it a layout, a new row takes it, VACUUM converts
+  every leaf (a snapshot from before reads as before);
+- a leaf with a long text and a table with an interval stay rows; a second
+  VACUUM and scans do not try them again;
+- VACUUM of a table written as rows; `VACUUM ANALYZE` still runs;
+- a scan queues leaves, and checkpoints convert 10 at a time (a budget of
+  10);
+- A crashed and reopened from its last checkpoint and log: the same.
+
+Changed: `cols_codec` (rows of two layouts, and a tagged row, now convert;
+the strict parse's refusals are of rows in the current layout);
+`exec_colsfill` (its root leaf, of two layouts, now also holds long texts, so
+it is still cut). The suite passes (127), also with `LEXDB_COLCHECK=1`.
+
+**Found, not fixed:** a tagged row whose first value is a time starts with
+its tag, 8, which is `FIXED`, so it is read as a fixed row and fails ("a
+row's layout number"). Since 9.113 a time is fixed, so only rows a pre-9.113
+table wrote (its first column a time, the value not NULL) and
+`LEXDB_ROWFMT=tagged` rows are such; `upgradeLayouts` stops the first from
+being written, but those already written stay unreadable, as before this
+change.
+
+**Not done, and next:**
+- Leaves converted while clean keep their rows (a T_LEAF page's 43 of w's
+  against a column leaf's 67), so a table converted by VACUUM is about 40%
+  bigger and slower to scan than one loaded fresh. VACUUM could join
+  neighbouring leaves as it converts them.
+- A scan only notes leaves; they are converted at the next checkpoint, which
+  a read-only server takes only at shutdown.
+- A reader holding a table's catalog from before an ALTER (not a snapshot:
+  an UPDATE's scan, say) that meets a row converted to the new layout fails
+  with "a row's layout number", as it already did for rows other sessions
+  wrote in it.
+- Old column leaves of a table's earlier layout are left as they are.

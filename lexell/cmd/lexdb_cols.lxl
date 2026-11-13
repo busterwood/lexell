@@ -105,11 +105,32 @@ pub fn setChecking(x: bool) { CHECK = if x { 1 } else { 0 } }
 
 // A tree's layouts, as the executor keeps them (lexdb_exec Table.layouts):
 // layout i's kind per place.
-pub type Spec = record { pub layouts: [][]byte }
+// The last is the current one: the layout lexdb_exec's encFixed writes rows
+// in, and the one convertRows rewrites rows into (9.114). fill: a row in
+// the current layout's fixed form holding each place's value for rows
+// written before the place was added (its column's missing value), ""
+// when every such value is NULL; fillOk false when they are not known (the
+// executor could not write them so): a row lacking a place is then not
+// converted.
+pub type Spec = record { pub layouts: [][]byte; pub fill: str; pub fillOk: bool }
 
-pub fn sameSpec(a: &Spec, b: &[][]byte): bool {
-    if len(a.layouts) != len(b) { return false }
+// A spec of these layouts, rows lacking a place reading NULL there.
+pub fn specOf(layouts: [][]byte): Spec { return Spec{layouts: layouts, fill: "", fillOk: true} }
+
+pub fn sameSpec(a: &Spec, b: &[][]byte, fill: &str, fillOk: bool): bool {
+    if len(a.layouts) != len(b) || a.fill != fill || a.fillOk != fillOk { return false }
     for i in 0..len(b) {
+        if len(a.layouts[i]) != len(b[i]) { return false }
+        for j in 0..len(b[i]) { if a.layouts[i][j] != b[i][j] { return false } }
+    }
+    return true
+}
+
+// Whether layouts b begin with a's (a spec from an older catalog: b's
+// layouts are added to, never changed).
+pub fn extends(a: &Spec, b: &[][]byte): bool {
+    if len(b) < len(a.layouts) { return false }
+    for i in 0..len(a.layouts) {
         if len(a.layouts[i]) != len(b[i]) { return false }
         for j in 0..len(b[i]) { if a.layouts[i][j] != b[i][j] { return false } }
     }
@@ -384,10 +405,47 @@ fn unitsBin(u: int, ds: int, out: mut &[]byte, at: int, write: bool): int {
 
 // ---- encoding
 
-// A leaf's rows as a column region, when every row is in the fixed layout
-// of one of spec's layouts (all the same one) and parses in it to the byte;
-// None otherwise (the leaf stays in rows).
+// A leaf's rows as a column region: when every row is in the fixed layout
+// of one of spec's layouts (all the same one) and parses in it to the byte,
+// or else when every row converts to the current layout (convertRows,
+// 9.114); None otherwise (the leaf stays in rows).
 pub fn encodeRows(rows: &[]&str, spec: &Spec): Option[str] {
+    var conv: []str = []
+    return encodeConv(rows, spec, mut &conv)
+}
+
+var CONVERTED: int = 0
+
+// The leaves encodeConv has converted (in this process).
+pub fn converted(): int { return CONVERTED }
+
+// encodeRows; conv: the rows the region holds, converted (convertRows),
+// when they were not given in one layout; left empty when they were.
+pub fn encodeConv(rows: &[]&str, spec: &Spec, conv: mut &[]str): Option[str] {
+    match encodeOne(rows, spec) {
+        Some(x) { return Some(x) }
+        None {}
+    }
+    let cs = match convertRows(rows, spec) {
+        Some(x) { x }
+        None { return None }
+    }
+    let got = encodeStrs(&cs, spec)
+    if got.isSome() {
+        CONVERTED += 1
+        conv = cs
+    }
+    return got
+}
+
+fn encodeStrs(cs: &[]str, spec: &Spec): Option[str] {
+    var views: []&str = withCapacity(len(cs))
+    for i in 0..len(cs) { append(mut &views, &cs[i]) }
+    return encodeOne(&views, spec)
+}
+
+// encodeRows without conversion: the rows as given, all in one layout.
+fn encodeOne(rows: &[]&str, spec: &Spec): Option[str] {
     let n = len(rows)
     if n == 0 || n > 65535 { return None }
     let r0 = rows[0]
@@ -544,6 +602,322 @@ pub fn encodeRows(rows: &[]&str, spec: &Spec): Option[str] {
         out[cpos] = byte(c | (if anyNull { C_NULLS } else { 0 }))
     }
     return Some(strFromBytes(&out))
+}
+
+// ---- rows converted to the current layout (9.114)
+//
+// A leaf whose rows are of two layouts (after ALTER TABLE), or tagged (a
+// table's rows before 9.113's kinds, or a value its place's kind did not
+// take then), is written as a column leaf of its rows rewritten into the
+// spec's current layout, each value as the executor reads it now:
+// - a fixed row is read through its own layout (a dropped place, or a NULL
+//   bit, NULL; a place past its layout's, the spec's fill);
+// - a tagged row (lexdb_exec encRow; not long, tag 6) value by value, the
+//   values past its last the spec's fill;
+// - each value then goes to its place in the current layout as encFixed
+//   writes it: a NULL as NULL, a dropped place left NULL, an integer at
+//   its place's width when it fits, any other value only to a place of its
+//   own kind (a tagged numeric's text as Decimal.toBin), a text, bytea or
+//   numeric only under LONG bytes.
+// A value that does not go (an interval, a long text, a date outside int32,
+// a text where a date is now, an integer too wide) leaves the leaf in rows.
+
+const LONG = 256        // lexdb_exec LONG: a text this long or longer makes its row tagged
+
+// The class of a value read for conversion (by place): K_NONE NULL, K_INT
+// any integer, else the kind of place it may go to; its word, or its bytes
+// (src[sa..sb], or made when made).
+type Vals = record { cls: []byte; w: []int; sa: []int; sb: []int; made: []str; own: []bool }
+
+fn newVals(np: int): Vals {
+    return Vals{cls: array(np, K_NONE), w: array(np, 0), sa: array(np, 0), sb: array(np, 0), made: array(np, ""), own: array(np, false)}
+}
+
+// Place p of fixed row s (in layout lay of kinds) into vs at q; own: its
+// bytes copied into made. False when the row is not whole there.
+fn readPlace(s: &str, kinds: &[]byte, lay: &Lay, p: int, vs: mut &Vals, q: int, own: bool): bool {
+    vs.own[q] = false
+    let k = kinds[p]
+    if k == K_NONE || (int(s[lay.bm + (p >> 3)]) >> (p & 7)) & 1 == 1 {
+        vs.cls[q] = K_NONE
+        return true
+    }
+    let o = lay.off[p]
+    if isInt(k) {
+        let v = readIntK(s, o, k)
+        vs.cls[q] = if k == K_INT || k == K_INT4 || k == K_INT2 { K_INT } else { k }
+        vs.w[q] = if k == K_F4 { v & 0xffffffff } else { v }
+        return true
+    }
+    if k == K_BOOL {
+        vs.cls[q] = K_BOOL
+        vs.w[q] = if s[o] == 1 { 1 } else { 0 }
+        return true
+    }
+    let e = u16At(s, o)
+    let a = if lay.prev[p] < 0 { 0 } else { u16At(s, lay.prev[p]) }
+    if a > e || lay.v0 + e > len(s) { return false }
+    vs.cls[q] = k
+    if own {
+        vs.made[q] = s[lay.v0 + a..lay.v0 + e]
+        vs.own[q] = true
+    } else {
+        vs.sa[q] = lay.v0 + a
+        vs.sb[q] = lay.v0 + e
+    }
+    return true
+}
+
+// The values of tagged row s (not long) into vs: how many it has; -1 when
+// one is not convertible (a long text's, an interval, a tag not known) or
+// the row has more than np. asText: a numeric's text left where it is
+// (its span), not made binary.
+fn readTagged(s: &str, np: int, vs: mut &Vals, asText: bool): int {
+    var at = 0
+    var p = 0
+    let n = len(s)
+    while at < n {
+        if p >= np { return -1 }
+        let tag = int(s[at])
+        at += 1
+        vs.own[p] = false
+        if tag == 0 {
+            vs.cls[p] = K_NONE
+        } else if tag == 1 || (tag >= 7 && tag <= 10) || tag == 14 {
+            if at + 8 > n { return -1 }
+            vs.w[p] = binary.readI64LEStr(s, at)
+            at += 8
+            vs.cls[p] = if tag == 1 { K_INT } else if tag == 7 { K_DATE } else if tag == 8 { K_TIME } else if tag == 9 { K_TS } else if tag == 10 { K_TSTZ } else { K_F8 }
+        } else if tag == 15 {
+            if at + 4 > n { return -1 }
+            vs.w[p] = binary.readU32LEStr(s, at)
+            at += 4
+            vs.cls[p] = K_F4
+        } else if tag == 2 {
+            if at >= n { return -1 }
+            vs.w[p] = if s[at] == 1 { 1 } else { 0 }
+            at += 1
+            vs.cls[p] = K_BOOL
+        } else if tag == 3 || tag == 4 || tag == 13 {
+            if at + 4 > n { return -1 }
+            let l = binary.readU32LEStr(s, at)
+            at += 4
+            if l < 0 || at + l > n { return -1 }
+            if tag == 3 && !asText {
+                // its text, as the reader parses it, in its binary form (encFixed's varBytes)
+                match Decimal.parse(s[at..at + l]) {
+                    Ok(d) {
+                        vs.made[p] = d.toBin()
+                        vs.own[p] = true
+                    }
+                    Err(_) { return -1 }
+                }
+                vs.cls[p] = K_NUM
+            } else {
+                vs.sa[p] = at
+                vs.sb[p] = at + l
+                vs.cls[p] = if tag == 3 { K_NUM } else if tag == 4 { K_TEXT } else { K_BYTEA }
+            }
+            at += l
+        } else if tag == 12 {
+            if at + 16 > n { return -1 }
+            vs.sa[p] = at
+            vs.sb[p] = at + 16
+            at += 16
+            vs.cls[p] = K_UUID
+        } else {
+            return -1               // 5 a long text's place, 11 an interval, or not a tag
+        }
+        p += 1
+    }
+    return p
+}
+
+// The rows in the fixed form of spec's current layout (its last: the one
+// lexdb_exec's encFixed writes, Table.layouts' last), each value as the
+// executor reads it from the row given; None when a row does not convert.
+pub fn convertRows(rows: &[]&str, spec: &Spec): Option[[]str] {
+    let nl = len(spec.layouts)
+    if nl == 0 || nl > 65536 { return None }
+    let lid = nl - 1
+    let tk = &spec.layouts[lid]
+    let np = len(tk)
+    if np > 255 { return None }
+    let tl = layOf(tk)
+    var lays: []Lay = []            // each source layout's, made when first met
+    var have: []bool = array(nl, false)
+    for i in 0..nl { append(mut &lays, Lay{off: [], prev: [], v0: 0, bm: 3}) }
+    lays[lid] = layOf(tk)
+    have[lid] = true
+    // the fill row: in the current layout
+    let fill = &spec.fill
+    var fillOk = spec.fillOk
+    if len(fill) > 0 && (len(fill) < tl.v0 || fill[0] != FIXED || binary.readU16LEStr(fill, 1) != lid) { fillOk = false }
+    var vs = newVals(np)
+    var out: []str = withCapacity(len(rows))
+    for r in 0..len(rows) {
+        let s = rows[r]
+        if len(s) == 0 || s[0] == 6 { return None }
+        var got = 0                 // the places the row has
+        if s[0] == FIXED {
+            if len(s) < 3 { return None }
+            let id = binary.readU16LEStr(s, 1)
+            if id >= nl { return None }
+            if id == lid {
+                // already in it: as it is (the encoder then parses it to the byte)
+                append(mut &out, s.toStr())
+                continue
+            }
+            if !have[id] {
+                lays[id] = layOf(&spec.layouts[id])
+                have[id] = true
+            }
+            let sk = &spec.layouts[id]
+            got = len(sk)
+            if got > np || len(s) < lays[id].v0 { return None }
+            for p in 0..got { if !readPlace(s, sk, &lays[id], p, mut &vs, p, false) { return None } }
+        } else {
+            got = readTagged(s, np, mut &vs, false)
+            if got < 0 { return None }
+        }
+        // the places it lacks: their values for rows written before them
+        for p in got..np {
+            if tk[p] == K_NONE {
+                vs.cls[p] = K_NONE
+                continue
+            }
+            if !fillOk { return None }
+            if len(fill) == 0 {
+                vs.cls[p] = K_NONE
+                vs.own[p] = false
+            } else if !readPlace(fill, tk, &tl, p, mut &vs, p, true) {
+                return None
+            }
+        }
+        match placeRow(s, tk, &tl, lid, &vs) {
+            Some(x) { append(mut &out, x) }
+            None { return None }
+        }
+    }
+    return Some(out)
+}
+
+// vs (read from s) as a row of kinds tk (layout lid, laid out tl): encFixed's bytes.
+fn placeRow(s: &str, tk: &[]byte, tl: &Lay, lid: int, vs: &Vals): Option[str] {
+    let np = len(tk)
+    var total = 0
+    for p in 0..np {
+        let k = tk[p]
+        let c = vs.cls[p]
+        if k == K_NONE || c == K_NONE { continue }
+        if isVar(k) {
+            if c != k { return None }
+            let l = if vs.own[p] { len(vs.made[p]) } else { vs.sb[p] - vs.sa[p] }
+            if l >= LONG { return None }
+            total += l
+        }
+    }
+    if total > 65535 { return None }
+    var b: []byte = array(tl.v0 + total, byte(0))
+    b[0] = FIXED
+    b[1] = byte(lid & 255)
+    b[2] = byte(lid >> 8)
+    var end = 0
+    for p in 0..np {
+        let k = tk[p]
+        let c = vs.cls[p]
+        let o = tl.off[p]
+        if k == K_NONE || c == K_NONE {
+            b[tl.bm + (p >> 3)] = byte(int(b[tl.bm + (p >> 3)]) | (1 << (p & 7)))
+            if isVar(k) { binary.setU16LE(mut &b, o, end) }
+            continue
+        }
+        if isInt(k) {
+            let v = vs.w[p]
+            if k == K_INT || k == K_INT4 || k == K_INT2 {
+                if c != K_INT { return None }
+                if k == K_INT4 && (v < -2147483648 || v > 2147483647) { return None }
+                if k == K_INT2 && (v < -32768 || v > 32767) { return None }
+            } else {
+                if c != k { return None }
+                if k == K_DATE && (v < -2147483648 || v > 2147483647) { return None }
+            }
+            setWord(mut &b, o, k, v)
+        } else if k == K_BOOL {
+            if c != K_BOOL { return None }
+            b[o] = byte(vs.w[p])
+        } else {
+            // (its kind checked above)
+            let d = tl.v0 + end
+            if vs.own[p] {
+                let m = &vs.made[p]
+                for j in 0..len(m) { b[d + j] = m[j] }
+                end += len(m)
+            } else {
+                let a = vs.sa[p]
+                let l = vs.sb[p] - a
+                for j in 0..l { b[d + j] = s[a + j] }
+                end += l
+            }
+            binary.setU16LE(mut &b, o, end)
+        }
+    }
+    return Some(strFromBytes(&b))
+}
+
+// For the checks (checking()): each place's value in row s as the
+// executor reads it, as text ("N" NULL; else its class and value, a
+// numeric's as Decimal shows it), for np places of spec's current layout
+// (a place it drops: "-"); None when s does not read.
+fn placeTexts(s: &str, spec: &Spec): Option[[]str] {
+    let lid = len(spec.layouts) - 1
+    let tk = &spec.layouts[lid]
+    let np = len(tk)
+    var vs = newVals(np)
+    var got = 0
+    let tagged = !(len(s) > 0 && s[0] == FIXED)
+    if !tagged {
+        let id = binary.readU16LEStr(s, 1)
+        let sk = &spec.layouts[id]
+        let lay = layOf(sk)
+        got = len(sk)
+        for p in 0..got { if !readPlace(s, sk, &lay, p, mut &vs, p, false) { return None } }
+    } else {
+        got = readTagged(s, np, mut &vs, true)
+        if got < 0 { return None }
+    }
+    let tl = layOf(tk)
+    for p in got..np {
+        if len(spec.fill) == 0 || tk[p] == K_NONE { vs.cls[p] = K_NONE } else if !readPlace(&spec.fill, tk, &tl, p, mut &vs, p, true) { return None }
+    }
+    var out: []str = []
+    for p in 0..np {
+        let c = vs.cls[p]
+        if tk[p] == K_NONE {
+            append(mut &out, "-")
+            continue
+        }
+        if c == K_NONE {
+            append(mut &out, "N")
+            continue
+        }
+        var x = if vs.own[p] { vs.made[p].toStr() } else if isVar(c) { s[vs.sa[p]..vs.sb[p]] } else { "" }
+        if c == K_NUM && tagged && !vs.own[p] {
+            match Decimal.parse(x.toStr()) {
+                Ok(d) { x = d.toStr() }
+                Err(_) { return None }
+            }
+        } else if c == K_NUM {
+            match Decimal.fromBin(&x, 0, len(x)) {
+                Ok(d) { x = d.toStr() }
+                Err(_) { return None }
+            }
+        } else if !isVar(c) {
+            x = vs.w[p].toStr()
+        }
+        append(mut &out, int(c).toStr() + ":" + x)
+    }
+    return Some(out)
 }
 
 // vs[0..n], all within lo..hi, as C_FOR (or C_RAW when the range is too
@@ -1119,20 +1493,46 @@ pub fn allRows(s: &str, dir: &[]int, ends: mut &[]int): str {
 
 // encodeRows, checked when checking(): its region decoded again gives
 // the rows back.
+// A converted leaf's rows (conv) are compared with the rows the region
+// gives back, and each with its row as given, value by value (placeTexts).
 pub fn encodeChecked(rows: &[]&str, spec: &Spec): Option[str] {
-    let got = encodeRows(rows, spec)
+    var conv: []str = []
+    let got = encodeConv(rows, spec, mut &conv)
     if got.isNone() || !checking() { return got }
     let s = got.unwrap()
+    if len(conv) == 0 {
+        checkBack(&s, rows)
+        return Some(s)
+    }
+    for i in 0..len(rows) {
+        let a = placeTexts(rows[i], spec)
+        let b = placeTexts(&conv[i], spec)
+        if a.isNone() || b.isNone() { panic("a converted row " + i.toStr() + " does not read") }
+        let x = a.unwrap()
+        let y = b.unwrap()
+        for p in 0..len(x) { if x[p] != y[p] { panic("a converted row " + i.toStr() + " changed place " + p.toStr() + ": " + x[p] + " to " + y[p]) } }
+    }
+    checkStrs(&s, &conv)
+    return Some(s)
+}
+
+fn checkStrs(s: &str, cs: &[]str) {
+    var views: []&str = withCapacity(len(cs))
+    for i in 0..len(cs) { append(mut &views, &cs[i]) }
+    checkBack(s, &views)
+}
+
+// Region s gives rows back byte for byte (else a panic: a bug).
+fn checkBack(s: &str, rows: &[]&str) {
     let n = len(rows)
-    match parse(&s, n) {
+    match parse(s, n) {
         Some(dir) {
             var ends: []int = array(n, 0)
-            let body = allRows(&s, &dir, mut &ends)
+            let body = allRows(s, &dir, mut &ends)
             for i in 0..n {
                 let a = if i == 0 { 0 } else { ends[i - 1] }
                 if &body[a..ends[i]] != rows[i] { panic("a column leaf's row " + i.toStr() + " does not come back") }
             }
-            return Some(s)
         }
         None { panic("a column leaf's region does not parse") }
     }
