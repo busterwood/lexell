@@ -10568,7 +10568,7 @@ off passes agreed within 4% on the geometric mean and 1% on `qL.txt`):
 - **Changed expectations,** both from leaf skipping: `exec_switch`'s scan
   after a switch reads 1,386 rows, not 20,000 (x follows the key);
   `exec_hashagg`'s per-row subquery reads 326,750 rows of o, not 499,500.
-- The suite passes (122), with `LEXDB_COLCHECK=1` and without; the crash
+- The suite passes (121), with `LEXDB_COLCHECK=1` and without; the crash
   test, 20 rounds direct and 20 with `LXL_URING=1`; the replica test.
 
 **Not done, and next:**
