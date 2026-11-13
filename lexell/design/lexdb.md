@@ -2940,9 +2940,10 @@ owned by the column. It goes with its column:
 
 **Not done:**
 - ADD COLUMN with a sequence's default on a table with rows is 0A000
-  (PostgreSQL rewrites the table).
+  (PostgreSQL rewrites the table). Done in 9.117.
 - A non-owned sequence renamed or moved breaks the defaults naming it as
-  text (PostgreSQL binds them by OID).
+  text (PostgreSQL binds them by OID). RENAME and SET SCHEMA came in 9.117,
+  and the defaults naming it follow it.
 - RESTART takes effect at once, even if its transaction rolls back.
 - nextval runs in READ ONLY transactions (PostgreSQL refuses).
 - After ALTER SEQUENCE, the next value follows the last given in this
@@ -6949,7 +6950,7 @@ several at its end).
 
 **Not done:**
 - ALTER TABLE ADD PRIMARY KEY on a keyless table: still 0A000, since a
-  table's key cannot change;
+  table's key cannot change. Done in 9.117;
 - CREATE TABLE AS's typmods;
 - a very large CREATE TABLE AS holds its result in memory while it
   inserts;
@@ -11013,3 +11014,304 @@ are in lexdb-gaps.md 2.2.
 
 **Not fixed:** any integer overflow in the executor stops the whole
 server, and every session with it, not the statement.
+
+### 9.117 ALTER TABLE: primary keys changed, identity columns, NOT VALID, notices
+
+The user asked for ALTER TABLE and ALTER COLUMN to work much better, adding
+a primary key to a table above all. The target is what migration tools
+(Django, Alembic, Rails, Prisma) and people write, answered as PostgreSQL
+18 answers. A probe of those statements against both servers found:
+- every change of a key refused ("a table's primary key cannot be
+  changed");
+- no identity forms of ALTER COLUMN, and serial or identity columns refused
+  on a table with rows (0A000);
+- no NOT VALID, VALIDATE CONSTRAINT or RENAME CONSTRAINT;
+- no notices at all (IF EXISTS's "skipping");
+- the sequence leftovers of lexdb-gaps.md 2.2.
+
+**A new key is a new tree.** A table's rows are kept in a tree under their
+key (a table made without one under a hidden one, 9.88), so changing the
+key rewrites the table. The forms:
+- `ADD [CONSTRAINT name] PRIMARY KEY (cols)`, and `PRIMARY KEY` on a column
+  ADD COLUMN adds;
+- `ADD [CONSTRAINT name] PRIMARY KEY USING INDEX ix`;
+- `DROP CONSTRAINT` of the key, and DROP COLUMN of one of its columns,
+  which drops the key as PostgreSQL's does;
+- several in one statement, as Prisma writes them: `DROP CONSTRAINT
+  t_pkey, ADD CONSTRAINT t_pkey PRIMARY KEY (a, b)`.
+
+ALTER TABLE's actions change `Table.pk` as they come. The table is
+rewritten once, after them (`rewrite`, which ALTER COLUMN TYPE's `retype`
+became, 9.36):
+- **The rows** are read from the old tree, through a copy of the table as
+  the actions left it. Each gets its new values (a type's, a column
+  filled), is checked, and goes to a new tree under its new key.
+- **In key order.** The keys are sorted, unless they already come in order
+  (an id filled as the rows came). Two of one key are 23505.
+- **The indexes** are all made again when the key changes: their entries
+  hold it. Their entries are sorted and written as CREATE INDEX writes them
+  (`fillIndex`, which `addIndex` now shares). The old trees are dropped.
+- **What is held** is each row's key and bytes and the entries, not the
+  rows decoded, and counted against max_statement_mem: the bench's 1M rows
+  fit its default 256 MB. A USING still makes its rows by a query and
+  holds them, as before.
+- **The same key in the end** (dropped and added again on the same
+  columns) rewrites nothing.
+
+**The hidden key.**
+- Adding a key to a table without one drops the hidden column and its
+  sequence. Its place stays, as a dropped column's does (9.35).
+- Dropping the key adds a new hidden column. Its rows are numbered 1, 2,
+  ... in the old key's order, and its sequence is set to go on after
+  them.
+
+**PostgreSQL's checks and errors:**
+- a second key, 42P16 "multiple primary keys for table ... are not
+  allowed";
+- a column missing (42703) or named twice (42701);
+- a name taken: by a constraint (42710), or by a relation, the key's own
+  index's among them (42P07);
+- a NULL, 23502 "column ... contains null values": the key's columns are
+  made NOT NULL, and stay so when it is dropped, as in PostgreSQL 18;
+- two equal keys, 23505 "could not create unique index ...", DETAIL "Key
+  (a)=(2) is duplicated.";
+- a key a foreign key needs (no other unique index of its columns), 2BP01
+  with PostgreSQL's DETAIL and HINT. With CASCADE those foreign keys go,
+  with its notice ("drop cascades to constraint ... on table ...").
+
+**USING INDEX.** PostgreSQL's checks, in its order:
+- 42704, no such index;
+- 55000, an index that is a constraint's, or another table's;
+- 42809 with its DETAIL: not unique, an expression, filtered, or a column
+  not in the default order.
+
+`ADD [CONSTRAINT name] UNIQUE USING INDEX ix` makes the index the
+constraint's. A name given renames the index, with PostgreSQL's notice.
+
+**The key's name** is `Table.pkName`, kept in the catalog row ("" is the
+table's name and `_pkey`). It comes from `ADD CONSTRAINT name PRIMARY KEY`,
+and from CREATE TABLE's `CONSTRAINT name PRIMARY KEY`, whose name was
+ignored before. It changes with RENAME CONSTRAINT.
+- A table renamed now keeps its key's name, as PostgreSQL's index keeps
+  its name. Before, the key took the new table's name.
+- Rails' rename_table renames the key itself (`ALTER INDEX old_pkey RENAME
+  TO new_pkey`), and its sequence through `ALTER TABLE seq RENAME TO`.
+  Both now work. REINDEX and CLUSTER find the key's index by its name.
+
+**What goes with a new key:**
+- *Foreign keys* name their columns, and each statement finds the key or
+  unique index holding them (`keyIndex`), so neither the table's own nor
+  those referencing it change.
+- *Views* keep their text and read the table as before.
+- *Statistics:* the old tree's row is deleted, and the new tree's rows are
+  counted for the automatic statistics (optimizer 44), which then analyze
+  it.
+- *Column leaves:* the store is given the new tree's layouts at once
+  (`setSpec`), not from the first statement after the commit (9.114). A
+  new tree's rows are all in the layout its catalog row will have, and a
+  rollback drops the tree, so 9.114's reason does not apply. Without it, a
+  checkpoint before the next statement read the table wrote its leaves as
+  rows (17 leaves of rows for 3,000 rows in the test), and they stayed
+  rows until VACUUM. ALTER COLUMN TYPE's rewrite did the same before this.
+
+**Identity columns.** ALTER COLUMN c and then:
+- `ADD GENERATED {ALWAYS | BY DEFAULT} AS IDENTITY [(options)]`. Its
+  errors, in PostgreSQL's order:
+  - 22023 not an integer;
+  - 55000 not NOT NULL;
+  - 55000 already identity;
+  - 55000 a default.
+
+  It makes the sequence `t_c_seq`; the rows there keep their values.
+- `SET GENERATED ...`, `SET` each sequence option, `RESTART [WITH n]`, in
+  any number in one action, as ALTER SEQUENCE's. RESTART outside the
+  bounds is now PostgreSQL's 22023 "RESTART value ... cannot be greater
+  than MAXVALUE ...", for ALTER SEQUENCE too (it was setval's 22003). A
+  column not identity (a serial one) is 55000.
+- `DROP IDENTITY [IF EXISTS]`: the sequence goes, NOT NULL stays.
+- An identity column's type change retypes its sequence, as PostgreSQL's
+  does (Django's AutoField to BigAutoField). A serial column's sequence
+  keeps its type.
+
+**Columns added over rows with a value per row.** These were 0A000:
+- serial;
+- identity;
+- a default calling nextval;
+- now also `gen_random_uuid()`, `random()` and `clock_timestamp()`, made
+  per row.
+
+They are filled by the rewrite, in the rows' order. For a table without a
+key that is the order they came in, as PostgreSQL's heap order. For a keyed
+table it is key order, where PostgreSQL's is physical. Those three
+functions were not counted as volatile before: a default of one was made
+once per statement, so every row of a multi-row INSERT got the same uuid.
+
+**NOT VALID and VALIDATE.**
+- `ADD CONSTRAINT ... CHECK (...) NOT VALID` and `FOREIGN KEY ... NOT
+  VALID` skip the rows there. New rows are checked.
+- `VALIDATE CONSTRAINT name` checks them: 23514 or 23503. Another kind is
+  42809 with its DETAIL, and no such constraint is 42704.
+- Such constraints' names are in `Table.invalid`, in the catalog row after
+  the key's name.
+- `pg_constraint.convalidated` is false for them, and
+  `pg_get_constraintdef` ends with NOT VALID (psql's `\d` shows it).
+- As in PostgreSQL:
+  - a column's constraint may not be NOT VALID (42601);
+  - UNIQUE and PRIMARY KEY may not be (0A000);
+  - CREATE TABLE's table constraints take it and are valid.
+
+**RENAME CONSTRAINT** renames:
+- a CHECK;
+- a foreign key;
+- a UNIQUE, with its index;
+- the key.
+
+Errors: 42704, 42710, and 42P07 for an index's name taken.
+
+**Notices.** lexdb sent none.
+- `notice` keeps a statement's notices in the store's memo under its
+  session: the executor knows its session only as `Txn.sess`.
+- The wire sends them as NoticeResponse before the statement's
+  CommandComplete or ErrorResponse (`sendNotices`).
+- A statement run again on a conflict drops its first try's.
+- TDS sessions drop them: SQL Server sends none of these.
+
+Each has PostgreSQL's text and SQLSTATE (42701 for ADD COLUMN IF NOT
+EXISTS, 42P07 and 42P06 for the IF NOT EXISTS of relations and schemas,
+00000 else). The forms:
+- ALTER TABLE IF EXISTS, DROP COLUMN IF EXISTS, ADD COLUMN IF NOT EXISTS,
+  DROP CONSTRAINT IF EXISTS, DROP IDENTITY IF EXISTS;
+- USING INDEX's rename, a drop's cascade;
+- CREATE TABLE, CREATE TABLE AS, CREATE INDEX, CREATE SEQUENCE and CREATE
+  SCHEMA IF NOT EXISTS;
+- the IF EXISTS of DROP TABLE, INDEX, VIEW, SEQUENCE, SCHEMA, TYPE and
+  ROLE, of ALTER INDEX, VIEW and SEQUENCE.
+
+**DETAIL and HINT** are now fields of `DbErr`, sent as their own (lexdb
+folded them into the message: lexdb-gaps.md 2.4). They are given to:
+- duplicate keys and unique violations ("Key (a)=(1) already exists.");
+- foreign key violations;
+- NOT NULL's "Failing row contains (...)";
+- GENERATED ALWAYS's DETAIL and its HINT "Use OVERRIDING SYSTEM VALUE to
+  override.";
+- "could not create unique index", which CREATE UNIQUE INDEX gives now
+  too;
+- a drop refused for what depends on it.
+
+`DbErr.toStr()` appends the DETAIL. Other errors still fold theirs.
+
+**Sequences:**
+- `ALTER SEQUENCE ... RENAME TO` and `SET SCHEMA`, and ALTER TABLE's on a
+  sequence. Its id, so its values, stays. Its column's default follows it,
+  and so do defaults naming it as text (PostgreSQL binds them by OID). An
+  owned sequence moved to another schema is 0A000.
+- `DROP SEQUENCE a, b`.
+- A sequence read as a relation: `SELECT last_value, log_cnt, is_called
+  FROM s`, its one row made by the executor (`seqRelation`, `seqState`).
+  - last_value and is_called are PostgreSQL's: the last value given by any
+    session, or after setval(..., false) or RESTART the next, not called.
+    Not used since the store opened, it is the last value written, as
+    PostgreSQL's after a restart.
+  - log_cnt is the values left of the block written ahead, plus one. That
+    is PostgreSQL's for a sequence's first 32 values after its start, and
+    differs after (lexdb's blocks are 32 values, PostgreSQL logs 33).
+  - INSERT into one is 42809.
+- `nextval('app."Mixed"')`: a quoted part is folded too, as lexdb matches
+  every name folded (design/lexdb-tds.md L6). So `nextval('app.mixed')`
+  finds it as well, where PostgreSQL's does not.
+- `setval(pg_get_serial_sequence('"t"', 'c'), ...)`, Django's sequence
+  reset: a call of literals is bound at the statement's start under the
+  name it gives (`SERIAL_MARK`). setval took only a literal name before.
+- Defaults show `nextval('s'::regclass)`, and `pg_get_indexdef(oid, 0,
+  true)` PostgreSQL's pretty form (the table unqualified when on the path,
+  the predicate without its outer parentheses), as psql's `\d` reads them.
+
+**Overflow.** Sequence arithmetic on user-supplied numbers stopped the
+server (9.116) in more places:
+- an increment of nearly 2^63 against a bound of the other sign
+  (`increment by -9223372036854775807 minvalue 1`);
+- a block's last value, an increment times the steps;
+- setval's value less the increment.
+
+Every distance is now `span(hi, lo)`, capped at the largest integer, and a
+sum or product is made only once it is known to be within the bounds. The
+smallest bigint, `-9223372036854775808`, is now taken as an option (its
+digits alone are past the largest; it was 42601). exec_altertab has these
+cases, as PostgreSQL answers them.
+
+**Cost**, on real files, 1M rows `(a int, b text, c int, d int)` with an
+index on c and no key, a the rows' numbers shuffled, best of two (the
+server alone, other benchmarks held off by a lock):
+
+| | lexdb | PostgreSQL 18 (3 workers) |
+|---|---:|---:|
+| `ADD PRIMARY KEY (a)` | 5.20 s | 0.144 s |
+| the key dropped again | 4.76 s | 4 ms |
+| `ADD PRIMARY KEY` on a key in the rows' order | 3.66 s | |
+| CREATE TABLE AS of the same rows, for comparison | 3.55 s | |
+| CREATE UNIQUE INDEX on a, for comparison | 1.79 s | |
+
+- **Not comparable work.** PostgreSQL builds an index beside its heap.
+  lexdb rewrites the table and its indexes, about a CREATE TABLE AS and a
+  CREATE INDEX.
+- **Where the time goes:** the sorts of the rows' keys and of the index's
+  entries are 37% of it (string compares through a closure), and the
+  commit of 2M writes most of the rest.
+- **Memory:** the server's peak resident memory rose from 450 MB to 810 MB
+  over the first ADD and DROP. The transaction holds its writes until its
+  commit (lexdb-gaps.md 2.4).
+- **After it:** the first statement on the table pays for freeing the old
+  trees' pages (66 ms for 200K rows). ALTER COLUMN TYPE's rewrite does the
+  same.
+
+**Checked.**
+- **exec_altertab:** 444 statements generated from PostgreSQL 18 by
+  `gen_pg.py altertab`, all the same. Each form above with its errors and
+  its catalog effects: `pg_constraint`, `pg_index`, `pg_indexes`,
+  `information_schema.table_constraints`, `key_column_usage` and
+  `columns`' identity fields, `pg_attribute.attidentity`,
+  `pg_get_serial_sequence`, `pg_sequence`. Also psql's `\d` queries, taken
+  with `psql -E`, for the tables changed, and blocks rolled back.
+- **exec_rekey**, what the generated test cannot see:
+  - the notices and the errors' DETAIL and HINT;
+  - the store's trees, as many after ADD, DROP and a rollback;
+  - column leaves at the first checkpoint after the rewrite;
+  - a reopen after ADD and after DROP (a new row's hidden key past the
+    numbered ones), an ALTER rolled back;
+  - 60 crashes of the simulated disk around ALTERs that add and drop the
+    key between inserts and blocks rolled back. After each the table is as
+    its last commit left it: every committed row, the key as the last
+    ALTER that returned made it, lookups by key and index, a duplicate
+    refused.
+- **The whole-server crash test:** its load drops log's key and adds it
+  again, while the other connections write.
+- **Changed for this:** exec_dropcol (a key column's drop now drops the
+  key), exec_seq (serial over rows), exec_alter and exec_check (forms no
+  longer 0A000), exec_unique; and exec_join, exec_retype, exec_fkey and
+  exec_fkaction, whose errors now carry a DETAIL.
+- **Runs:** the suite (132), also with `LEXDB_COLCHECK=1`; crash.py, 6
+  rounds in each I/O mode; replica.py; a replica following ADD and DROP by
+  hand.
+- **Planted, each caught:**
+  - the new tree's layouts not given to the store (leaves of rows);
+  - the hidden key's sequence not set after the rows (a duplicate key
+    after a reopen);
+  - indexes not made again for a new key (wrong lookups, "an index entry
+    without its row" after crashes);
+  - the old tree kept (the trees' count);
+  - the key's DROP not seen.
+
+**Different from PostgreSQL, or not done:**
+- A key change rewrites the table: tens of times PostgreSQL's time (above).
+- Columns filled over rows go in key order on a keyed table: PostgreSQL's
+  is physical.
+- PostgreSQL 18 lists NOT NULL constraints in `pg_constraint` (contype n):
+  lexdb lists none.
+- A key's index name is a relation's name only against its own table: a
+  new relation may take another table's key's name.
+- On INSERT the key is checked before the unique indexes: where a row
+  breaks both, PostgreSQL may name the index first (the same SQLSTATE).
+- log_cnt as above. RESTART still takes effect at once, even in a block
+  rolled back (9.43).
+- Generated (computed) columns, and OWNER TO a role that does not exist,
+  are left out, as asked.

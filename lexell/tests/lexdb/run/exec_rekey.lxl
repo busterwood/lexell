@@ -1,0 +1,252 @@
+// lexdb_exec: a table's key changed by ALTER TABLE, and what goes with it
+// (design/lexdb.md 9.117). What the PostgreSQL-checked suite (exec_altertab)
+// cannot see: the notices, the errors' DETAIL and HINT, the store's trees
+// (a rewrite drops the old ones), the leaves a checkpoint writes for the new
+// tree, a reopen after the ALTER, an ALTER rolled back, and crashes of the
+// simulated disk around ALTERs that add and drop the key.
+// expect: notices: relation "nope" does not exist, skipping | column "nope" of relation "n" does not exist, skipping | column "x" of relation "n" already exists, skipping (42701) | constraint "nope" of relation "n" does not exist, skipping | column "id" of relation "n" is not an identity column, skipping
+// expect: using index: ALTER TABLE; ALTER TABLE / ADD CONSTRAINT USING INDEX will rename index "n_x" to "n_pk"
+// expect: cascade: ALTER TABLE; drop cascades to constraint c1_fkey on table c1 | drop cascades to 2 other objects / drop cascades to constraint c2_fkey on table c2 / drop cascades to constraint c3_fkey on table c3
+// expect: duplicates: 23505 could not create unique index "d_pkey" / Key (a)=(2) is duplicated.
+// expect: nulls: 23502 column "b" of relation "d" contains null values
+// expect: referenced: 2BP01 cannot drop constraint r_pkey on table r because other objects depend on it / constraint rc_fkey on table rc depends on index r_pkey / Use DROP ... CASCADE to drop the dependent objects too.
+// expect: identity: 428C9 cannot insert a non-DEFAULT value into column "id" / Column "id" is an identity column defined as GENERATED ALWAYS. / Use OVERRIDING SYSTEM VALUE to override.
+// expect: trees: the same number after ADD PRIMARY KEY true, after DROP true, after a rollback true
+// expect: leaves: 0 rows before; after the rewrite and a checkpoint: column leaves true, leaves of rows 0
+// expect: kept: 3000 rows, by key 1 row, by index 1 row, by expression 1 row, dup 23505
+// expect: reopened: 3000 rows, the key a, by key 2999|x2999, by index 1, a new row INSERT 0 1, dup 23505
+// expect: dropped and reopened: 3001 rows, no key, a row again INSERT 0 1, 3002
+// expect: rolled back: the key b, 3002 rows, by key 1
+// expect: crashes: 60, every state as committed
+import "strings"
+import "../../../cmd/lexdb_base"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: 1024 * 1024, segBytes: 1024 * 1024, ckptBytes: 512 * 1024, snapNodes: 100000, bufferedPages: false}
+}
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if !r.hasRows { return r.tag }
+            var out: []str = []
+            for row in r.rows {
+                var vs: []str = []
+                for v in row { append(mut &vs, lexdb_exec.text(&v)) }
+                append(mut &out, strings.join(&vs, "|"))
+            }
+            return strings.join(&out, " ")
+        }
+        Err(e) { return e.state + " " + e.msg }
+    }
+}
+
+// An error with its DETAIL and HINT, each after " / ".
+fn full(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) { return rs[len(rs) - 1].tag }
+        Err(e) {
+            var out = e.state + " " + e.msg
+            if len(e.detail) > 0 { out = out + " / " + e.detail }
+            if len(e.hint) > 0 { out = out + " / " + e.hint }
+            return out
+        }
+    }
+}
+
+// The session's notices, each with its SQLSTATE when that is not 00000 and
+// its DETAIL's lines after " / ".
+fn notices(s: mut &lexdb_exec.Session): str {
+    var out: []str = []
+    for n in s.takeNotices() {
+        var t = n.msg
+        if n.state != "00000" { t = t + " (" + n.state + ")" }
+        if len(n.detail) > 0 { t = t + " / " + strings.replaceAll(&n.detail, "\n", " / ") }
+        append(mut &out, t)
+    }
+    return strings.join(&out, " | ")
+}
+
+// The table's key's columns ("none").
+fn keyOf(s: mut &lexdb_exec.Session, t: &str): str {
+    let k = q(s, &("select a.attname from pg_index i join pg_attribute a on a.attrelid = i.indrelid and a.attnum = any(i.indkey) " +
+                       "where i.indrelid = '" + t + "'::regclass and i.indisprimary order by a.attnum"))
+    return if len(k) == 0 { "none" } else { k }
+}
+
+fn messages(st: lexdb_store.Store) {
+    var s = lexdb_exec.newSession(st)
+    let n0 = q(mut &s, &"create table n (id int primary key, x int)")
+    let n1 = q(mut &s, &"alter table if exists nope add column z int")
+    let n2 = q(mut &s, &"alter table n drop column if exists nope, add column if not exists x int")
+    let n3 = q(mut &s, &"alter table n drop constraint if exists nope")
+    let n4 = q(mut &s, &"alter table n alter column id drop identity if exists")
+    println("notices: " + notices(mut &s))
+    let n5 = q(mut &s, &"alter table n drop constraint n_pkey; create unique index n_x on n (x)")
+    let x = notices(mut &s)
+    println("using index: " + q(mut &s, &"alter table n add constraint n_pk primary key using index n_x") + "; " + notices(mut &s))
+    let c0 = q(mut &s, &"create table r1 (a int primary key); create table c1 (x int constraint c1_fkey references r1)")
+    let c1 = q(mut &s, &"alter table r1 drop constraint r1_pkey cascade")
+    let one = notices(mut &s)
+    let c2 = q(mut &s, &"create table r2 (a int primary key); create table c2 (x int constraint c2_fkey references r2); create table c3 (x int constraint c3_fkey references r2)")
+    let c3 = q(mut &s, &"alter table r2 drop column a cascade")
+    println("cascade: " + c1 + "; " + one + " | " + notices(mut &s))
+    let d0 = q(mut &s, &"create table d (a int, b int); insert into d values (1, 1), (2, 2), (2, null)")
+    println("duplicates: " + full(mut &s, &"alter table d add primary key (a)"))
+    println("nulls: " + full(mut &s, &"alter table d add primary key (b)"))
+    let r0 = q(mut &s, &"create table r (a int primary key); create table rc (x int constraint rc_fkey references r)")
+    println("referenced: " + full(mut &s, &"alter table r drop constraint r_pkey"))
+    let g0 = q(mut &s, &"create table g (id int generated always as identity, v int)")
+    println("identity: " + full(mut &s, &"insert into g values (1, 1)"))
+    s.close()
+}
+
+fn main() {
+    var fs = lexdb_disk.sim(117)
+    let made = lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        messages(st)
+        var s = lexdb_exec.newSession(st)
+        // the trees: a rewrite makes new ones and drops the old
+        let t0 = q(mut &s, &"create table tr (a int, b text); create index tr_b on tr (b); insert into tr values (1, 'x'), (2, 'y')")
+        let before = len(st.trees())
+        let t1 = q(mut &s, &"alter table tr add primary key (a)")
+        let added = len(st.trees()) == before
+        let t2 = q(mut &s, &"alter table tr drop constraint tr_pkey")
+        let dropped = len(st.trees()) == before
+        let t3 = q(mut &s, &"begin; alter table tr add primary key (b); rollback")
+        println("trees: the same number after ADD PRIMARY KEY " + added.toStr() + ", after DROP " + dropped.toStr() + ", after a rollback " +
+                (len(st.trees()) == before).toStr())
+        // a table without a key, made a keyed one: the new tree's leaves are
+        // column leaves from the first checkpoint, before any statement
+        // reads the table again
+        let k0 = q(mut &s, &"create table k (a int, b text, c int); create index k_c on k (c); create index k_e on k (lower(b))")
+        let k1 = q(mut &s, &"insert into k select 3001 - i, 'x' || (3001 - i), i * 7 from generate_series(1, 3000) i")
+        st.checkpointAll().unwrap()
+        let rowsBefore = lexdb_exec.leafKinds(&st, &"k")
+        let k2 = q(mut &s, &"alter table k add primary key (a)")
+        st.checkpointAll().unwrap()
+        let after = lexdb_exec.leafKinds(&st, &"k")
+        let parts = strings.split(&after, " ")
+        println("leaves: " + strings.split(&rowsBefore, " ")[2].toStr() + " rows before; after the rewrite and a checkpoint: column leaves " +
+                (strings.parseIntOpt(parts[0].toStr()).unwrapOr(0) > 10).toStr() + ", leaves of rows " + parts[2].toStr())
+        println("kept: " + q(mut &s, &"select count(*) from k") + " rows, by key " + q(mut &s, &"select count(*) from k where a = 17") + " row, by index " +
+                q(mut &s, &"select count(*) from k where c = 70") + " row, by expression " + q(mut &s, &"select count(*) from k where lower(b) = 'x5'") +
+                " row, dup " + strings.split(&q(mut &s, &"insert into k values (5, 'y', 1)"), " ")[0].toStr())
+        s.close()
+        return 0
+    }).unwrap()
+    // reopened: the new key, its indexes
+    let ro = lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int {
+        var s = lexdb_exec.newSession(st)
+        println("reopened: " + q(mut &s, &"select count(*) from k") + " rows, the key " + keyOf(mut &s, &"k") + ", by key " +
+                q(mut &s, &"select a, b from k where a = 2999") + ", by index " + q(mut &s, &"select count(*) from k where c = 14") +
+                ", a new row " + q(mut &s, &"insert into k values (3001, 'n', 0)") + ", dup " + strings.split(&q(mut &s, &"insert into k values (3001, 'n', 0)"), " ")[0].toStr())
+        let d = q(mut &s, &"alter table k drop constraint k_pkey")
+        s.close()
+        return 0
+    }).unwrap()
+    // the key dropped: the rows keyed by the hidden column, its sequence
+    // going on after them
+    let rd = lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int {
+        var s = lexdb_exec.newSession(st)
+        println("dropped and reopened: " + q(mut &s, &"select count(*) from k") + " rows, " + (if keyOf(mut &s, &"k") == "none" { "no key" } else { "a key" }) +
+                ", a row again " + q(mut &s, &"insert into k values (1, 'again', 0)") + ", " + q(mut &s, &"select count(*) from k"))
+        let a = q(mut &s, &"alter table k add primary key (b)")
+        let b = q(mut &s, &"begin; alter table k drop constraint k_pkey; alter table k add primary key (c); rollback")
+        s.close()
+        return 0
+    }).unwrap()
+    let rb = lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int {
+        var s = lexdb_exec.newSession(st)
+        println("rolled back: the key " + keyOf(mut &s, &"k") + ", " + q(mut &s, &"select count(*) from k") + " rows, by key " +
+                q(mut &s, &"select count(*) from k where b = 'again'"))
+        s.close()
+        return 0
+    }).unwrap()
+    println("crashes: " + crashes())
+}
+
+// Crashes of the simulated disk around ALTERs: the table's key added and
+// dropped, rows inserted and rolled back between, then a crash at a random
+// point. After each, the table is as its last commit left it: every row
+// committed there, the key as the last ALTER that returned made it, its
+// lookups by key and by index right, a new row taken, a duplicate key
+// refused when it has one.
+fn crashes(): str {
+    var n = 0
+    var bad: []str = []
+    for seed in 0..20 {
+        var rng = lexdb_base.rng(seed + 1170)
+        var fs = lexdb_disk.sim(seed + 1170)
+        var ids: []int = []
+        var keyed = false
+        let made = lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): str {
+            lexdb_exec.bootstrap(&st).unwrap()
+            var s = lexdb_exec.newSession(st)
+            let a = q(mut &s, &"create table k (a int, b text, c int); create index k_c on k (c)")
+            let r = q(mut &s, &"insert into k select i, 'v' || i, i * 3 from generate_series(1, 400) i")
+            for i in 1..401 { append(mut &ids, i) }
+            return ""
+        }).unwrap()
+        for round in 0..3 {
+            var crashed = fs
+            let w = lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): str {
+                var s = lexdb_exec.newSession(st)
+                let steps = 1 + rng.below(12)
+                for k in 0..steps {
+                    let r = rng.below(10)
+                    if r < 4 {
+                        let id = 1000 * (round + 1) + len(ids) + seed * 100000
+                        let got = q(mut &s, &("insert into k values (" + id.toStr() + ", 'n" + id.toStr() + "', " + (id * 3).toStr() + ")"))
+                        if got != "INSERT 0 1" { return "insert: " + got }
+                        append(mut &ids, id)
+                    } else if r < 6 {
+                        let x = q(mut &s, &"begin; insert into k values (-1, 'gone', -3); alter table k add column z serial; rollback")
+                        if x != "ROLLBACK" { return "rolled back: " + x }
+                    } else if r < 9 {
+                        let sql = if keyed { "alter table k drop constraint k_pkey" } else { "alter table k add primary key (a)" }
+                        let got = q(mut &s, &sql)
+                        if got != "ALTER TABLE" { return sql + ": " + got }
+                        keyed = !keyed
+                    } else {
+                        let x = q(mut &s, &"begin; alter table k drop constraint if exists k_pkey; alter table k add primary key (b); rollback")
+                        if x != "ROLLBACK" { return "rolled back: " + x }
+                    }
+                }
+                crashed = fs.crash(seed * 10 + round)
+                return ""
+            }).unwrap()
+            if len(w) > 0 { append(mut &bad, "seed " + seed.toStr() + ": " + w) }
+            fs = crashed
+            n += 1
+            let c = lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): str {
+                var s = lexdb_exec.newSession(st)
+                let cnt = q(mut &s, &"select count(*) from k")
+                if cnt != len(ids).toStr() { return "rows " + cnt + ", committed " + len(ids).toStr() }
+                let key = keyOf(mut &s, &"k")
+                if key != (if keyed { "a" } else { "none" }) { return "the key " + key + ", committed " + keyed.toStr() }
+                let last = ids[len(ids) - 1]
+                let byKey = q(mut &s, &("select b from k where a = " + last.toStr()))
+                if byKey != "n" + last.toStr() && byKey != "v" + last.toStr() { return "by key: " + byKey }
+                let byIdx = q(mut &s, &("select a from k where c = " + (last * 3).toStr()))
+                if byIdx != last.toStr() { return "by index: " + byIdx }
+                let ins = q(mut &s, &"insert into k values (-7, 'x', -21)")
+                if ins != "INSERT 0 1" { return "a new row: " + ins }
+                if keyed {
+                    let dup = q(mut &s, &"insert into k values (-7, 'y', 0)")
+                    if !strings.startsWith(&dup, "23505") { return "a duplicate: " + dup }
+                }
+                let del = q(mut &s, &"delete from k where a = -7")
+                return ""
+            }).unwrap()
+            if len(c) > 0 { append(mut &bad, "seed " + seed.toStr() + " round " + round.toStr() + ": " + c) }
+        }
+    }
+    if len(bad) > 0 { return strings.join(&bad, "; ") }
+    return n.toStr() + ", every state as committed"
+}

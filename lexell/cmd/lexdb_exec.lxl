@@ -91,6 +91,14 @@ pub type Table = record {
     // name (design/lexdb-tds.md L6: names are matched folded, shown as
     // written); "" else. Its columns' are their ColDef.spell.
     pub spell: str
+    // Its primary key constraint's name (and its index's, as the catalog
+    // shows it), "" the default: its name's and _pkey (pkConName). Kept
+    // once it differs: ADD CONSTRAINT name PRIMARY KEY, RENAME CONSTRAINT,
+    // RENAME TO (as PostgreSQL's index keeps its name). 9.117
+    pub pkName: str
+    // Its CHECK and foreign key constraints added NOT VALID and not
+    // validated since, by name (9.117)
+    pub invalid: []str
 }
 
 // A foreign key: cols of its table hold a key of table ref, refCols (a
@@ -108,7 +116,7 @@ pub type ForeignKey = record {
 
 fn emptyTable(name: str): Table {
     return Table{name: name, tree: 0, cols: [], pk: [], indexes: [], slots: [], width: 0, checks: [], fks: [], refBy: [], layouts: [], lays: [],
-                 view: "", deps: [], onCommit: 0, spell: ""}
+                 view: "", deps: [], onCommit: 0, spell: "", pkName: "", invalid: []}
 }
 
 // A CHECK constraint: a row may not make expr false (column names bare).
@@ -1468,6 +1476,10 @@ fn srfCols(name: &str, ordin: bool, args: &[]OutCol): Result[[]OutCol, DbErr] {
         }
         return Ok(out)
     }
+    if strings.startsWith(name, "#" + SEQ_REL) {
+        for c in seqRelation(&noSeq()).cols { append(mut &out, OutCol{name: c.name, oid: c.typ.oid, spell: "", coll: "", scale: -1}) }
+        return Ok(out)
+    }
     if strings.startsWith(name, "#") {
         // a catalog relation (9.80)
         for c in lexdb_pgcat.relCols(&name[1..len(name)]) { append(mut &out, OutCol{name: c.name, oid: c.oid, spell: "", coll: "", scale: -1}) }
@@ -1557,6 +1569,12 @@ fn execSrf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
             }
             append(mut &rows, row)
             i += k
+        }
+    } else if strings.startsWith(&sel.srf, "#" + SEQ_REL) {
+        let k = sel.srf[1 + len(SEQ_REL)..len(sel.srf)]
+        match try st.get(txn, CATALOG, seqRow(&k)) {
+            Some(v) { append(mut &rows, try seqState(st, &decSeq(&v))) }
+            None {}
         }
     } else if strings.startsWith(&sel.srf, "#") {
         rows = try catRows(st, txn, &sel.srf[1..len(sel.srf)])
@@ -3698,11 +3716,23 @@ fn encTable(t: &Table): str {
     if add { addKinds(mut &b, &cur) }
     // then a temporary table's ON COMMIT, when it is DELETE ROWS or DROP
     // (9.96), or when a spelling follows
-    if t.onCommit > lexdb_sql.ONC_PRESERVE || len(t.spell) > 0 { b.addByte(byte(t.onCommit)) }
+    let more = len(t.pkName) > 0 || len(t.invalid) > 0
+    if t.onCommit > lexdb_sql.ONC_PRESERVE || len(t.spell) > 0 || more { b.addByte(byte(t.onCommit)) }
     // then its name as written, if that is not its key's (L6)
-    if len(t.spell) > 0 { addStr(mut &b, &t.spell) }
+    if len(t.spell) > 0 || more { addStr(mut &b, &t.spell) }
+    // then its primary key's name and its constraints NOT VALID (9.117)
+    if more {
+        addStr(mut &b, &t.pkName)
+        addStrs(mut &b, &t.invalid)
+    }
     return b.toStr()
 }
+
+// The name of table t's primary key constraint (and its index).
+fn pkConName(t: &Table): str { return if len(t.pkName) > 0 { t.pkName } else { lexdb_sql.baseName(&t.name) + "_pkey" } }
+
+// Whether t has a primary key of its own (not the hidden one, 9.88).
+fn hasPk(t: &Table): bool { return len(t.pk) > 0 && !rowidKeyed(t) }
 
 // A column's name as written (L6).
 pub fn colShown(c: &lexdb_sql.ColDef): str { return if len(c.spell) > 0 { c.spell } else { c.name } }
@@ -3941,6 +3971,12 @@ fn decTable(name: str, s: &str): Result[Table, DbErr] {
     if at + 4 <= len(s) {
         t.spell = strAt(s, at)
         at += 4 + len(t.spell)
+    }
+    if at + 4 <= len(s) {
+        t.pkName = strAt(s, at)
+        at += 4 + len(t.pkName)
+        t.invalid = strsAt(s, at)
+        at += strsLen(&t.invalid)
     }
     return Ok(t)
 }
@@ -7708,7 +7744,7 @@ fn (q: &Query) orderedLevel(items: &[]lexdb_sql.OrderItem, out: mut &[]int): int
 // A table of nothing (a level's place while levels are moved).
 fn noTable(): Table {
     return Table{name: "", tree: -1, cols: [], pk: [], indexes: [], slots: [], width: 0, checks: [], fks: [], refBy: [], layouts: [], lays: [],
-                 view: "", deps: [], onCommit: 0, spell: ""}
+                 view: "", deps: [], onCommit: 0, spell: "", pkName: "", invalid: []}
 }
 
 // Whether a table is pinned to one row by its key's equalities with
@@ -8376,7 +8412,7 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
         }
         var viewSrc = -1
         var t = Table{name: f.alias, tree: -1, cols: [], pk: [], indexes: [], slots: [], width: 0, checks: [], fks: [], refBy: [], layouts: [], lays: [],
-                      view: "", deps: [], onCommit: 0, spell: ""}
+                      view: "", deps: [], onCommit: 0, spell: "", pkName: "", invalid: []}
         var lateral = false
         if f.sub >= 0 {
             sc.frames[me].hidden = !f.lateral
@@ -8419,8 +8455,15 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
             }
         } else {
             let found = try findTable(st, txn, &f.table)
-            if found.isNone() { return Err(e("42P01", "relation \"" + lexdb_sql.shown(&f.table) + "\" does not exist")) }
-            t = found.unwrap()
+            if found.isNone() {
+                // a sequence: its one row (9.117), as a view of it
+                match try findSeq(st, txn, &f.table) {
+                    Some(d) { t = seqRelation(&d) }
+                    None { return Err(e("42P01", "relation \"" + lexdb_sql.shown(&f.table) + "\" does not exist")) }
+                }
+            } else {
+                t = found.unwrap()
+            }
             if t.name != sc.target { try scCheck(st, txn, sc, &t.name, &(if len(t.view) > 0 { "view" } else { "table" })) }
             if len(t.view) > 0 {
                 // a view: its query planned as a subquery in FROM (9.82),
@@ -8440,7 +8483,7 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
                                  len(f.cols).toStr() + " columns specified"))
                 }
                 var vt = Table{name: f.alias, tree: -1, cols: [], pk: [], indexes: [], slots: [], width: 0, checks: [], fks: [], refBy: [], layouts: [], lays: [],
-                               view: "", deps: [], onCommit: 0, spell: ""}
+                               view: "", deps: [], onCommit: 0, spell: "", pkName: "", invalid: []}
                 for i in 0..len(sp.sel.outs) {
                     let name = if i < len(f.cols) { f.cols[i] } else if i < len(t.cols) { t.cols[i].name } else { sp.sel.outs[i].name }
                     var col = lexdb_sql.colDef(name, outType(&sp.sel.outs[i]), false)
@@ -11133,8 +11176,8 @@ fn checkUnique(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, ix:
         // the value as written, not its key (L2)
         append(mut &vals, text(&(if c >= 0 { row[c] } else { try idxVal(t, ix, k, row) })))
     }
-    return Err(e("23505", "duplicate key value violates unique constraint \"" + lexdb_sql.baseName(&ix.name) + "\": Key (" +
-                 strings.join(&names, ", ") + ")=(" + strings.join(&vals, ", ") + ") already exists."))
+    return Err(lexdb_base.errDetail("23505", "duplicate key value violates unique constraint \"" + lexdb_sql.baseName(&ix.name) + "\"",
+                                    "Key (" + strings.join(&names, ", ") + ")=(" + strings.join(&vals, ", ") + ") already exists.", ""))
 }
 
 // Whether a row belongs in an index: always, or its predicate is true.
@@ -11187,7 +11230,10 @@ fn createTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
     let base = lexdb_sql.baseName(&key)
     let exists = try relExists(st, txn, &key)
     if exists {
-        if s.ifFlag { return Ok(tagOnly("CREATE TABLE")) }
+        if s.ifFlag {
+            notice(st, txn, &"42P07", &("relation \"" + base + "\" already exists, skipping"), &"")
+            return Ok(tagOnly("CREATE TABLE"))
+        }
         return Err(e("42P07", "relation \"" + base + "\" already exists"))
     }
     try needCreate(st, txn, &key)
@@ -11221,6 +11267,8 @@ fn createTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
             }
         }
     }
+    // CONSTRAINT name PRIMARY KEY: its name (9.117)
+    if len(t.pk) > 0 && len(s.pkName) > 0 && s.pkName != base + "_pkey" { t.pkName = s.pkName }
     if len(t.pk) == 0 {
         // no primary key: the rows keyed by a hidden one (9.88)
         var rc = lexdb_sql.colDef(ROWID, lexdb_sql.TypeName{kind: lexdb_sql.K_INT, oid: lexdb_sql.OID_INT8, prec: 0, scale: 0, len: 0}, true)
@@ -11231,8 +11279,8 @@ fn createTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
     t.tree = st.createTree(txn)
     try makeColSeqs(st, txn, mut &t, -1, &s.idOpts)
     for c in t.cols { try defaultSeqs(st, txn, &c) }
-    for c in s.cons { if c.kind != lexdb_sql.C_FOREIGN { try addConstraint(st, txn, mut &t, &c) } }
-    for c in s.cons { if c.kind == lexdb_sql.C_FOREIGN { try addConstraint(st, txn, mut &t, &c) } }
+    for c in s.cons { if c.kind != lexdb_sql.C_FOREIGN { try addConstraint(st, txn, mut &t, &c, false) } }
+    for c in s.cons { if c.kind == lexdb_sql.C_FOREIGN { try addConstraint(st, txn, mut &t, &c, false) } }
     t.onCommit = s.onCommit
     if s.onCommit > lexdb_sql.ONC_PRESERVE { append(mut &txn.onCommit, key) }
     try txn.put(CATALOG, key, encTable(&t))
@@ -11326,7 +11374,10 @@ fn dropType(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
     for n in names {
         let oid = lexdb_sql.nameOid(&"T", &n)
         if (try readEnum(st, txn, oid)).isNone() {
-            if s.ifFlag { continue }
+            if s.ifFlag {
+                notice(st, txn, &"00000", &("type \"" + lexdb_sql.shown(&n) + "\" does not exist, skipping"), &"")
+                continue
+            }
             return Err(e("42704", "type \"" + lexdb_sql.baseName(&n) + "\" does not exist"))
         }
         // a column of the type: refused (CASCADE would drop the columns)
@@ -11464,7 +11515,10 @@ fn createTableAs(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sq
     if s.ifFlag {
         // (where it would be made: a temporary one in the session's schema)
         let k = try createKey(st, txn, &s.table, s.temp)
-        if (try relExists(st, txn, &k)) { return Ok(tagOnly("CREATE TABLE AS")) }
+        if (try relExists(st, txn, &k)) {
+            notice(st, txn, &"42P07", &("relation \"" + lexdb_sql.baseName(&k) + "\" already exists, skipping"), &"")
+            return Ok(tagOnly("CREATE TABLE AS"))
+        }
     }
     var sc = newScopeIn(st, txn, params, ptypes)
     let sel = try planSelect(st, txn, &s.inner[0], params, mut &sc)
@@ -11527,7 +11581,10 @@ fn dropTableNamed(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, name: &str,
             return Ok(tagOnly("DROP TABLE"))
         }
         None {
-            if s.ifFlag { return Ok(tagOnly("DROP TABLE")) }
+            if s.ifFlag {
+                notice(st, txn, &"00000", &("table \"" + lexdb_sql.shown(name) + "\" does not exist, skipping"), &"")
+                return Ok(tagOnly("DROP TABLE"))
+            }
             return Err(e("42P01", "table \"" + lexdb_sql.shown(name) + "\" does not exist"))
         }
     }
@@ -11763,10 +11820,10 @@ fn maint(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt):
     } else if len(s.index) > 0 {
         let ixKey = try catKey(st, txn, &s.index, true)
         var found = try st.get(txn, CATALOG, idxName(&ixKey))
-        if found.isNone() && strings.endsWith(&s.index, "_pkey") {
+        if found.isNone() {
             // a primary key's index is its table's own tree
-            match try findTable(st, txn, &s.index[0..len(s.index) - 5]) {
-                Some(t) { if len(t.view) == 0 && !rowidKeyed(&t) { found = Some(t.name) } }
+            match try pkIndexTable(st, txn, &ixKey) {
+                Some(t) { found = Some(t.name) }
                 None {}
             }
         }
@@ -11955,6 +12012,19 @@ fn moveTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, s
     return Ok(Unit{})
 }
 
+// The table whose primary key's index has catalog key k (its schema's
+// tables', by their keys' names: pkConName), if any.
+fn pkIndexTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, k: &str): Result[Option[Table], DbErr] {
+    let sc = lexdb_sql.schemaOf(k)
+    let base = lexdb_sql.baseName(k)
+    var tabs = try seenTables(st, txn)
+    while len(tabs) > 0 {
+        let t = pop(mut &tabs)
+        if lexdb_sql.schemaOf(&t.name) == sc && hasPk(&t) && pkConName(&t) == base { return Ok(Some(t)) }
+    }
+    return Ok(None)
+}
+
 // Whether a table or an index has catalog key k.
 fn relExists(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, k: &str): Result[bool, DbErr] {
     return Ok((try st.get(txn, CATALOG, k)).isSome() || (try st.get(txn, CATALOG, idxName(k))).isSome() ||
@@ -11981,7 +12051,28 @@ fn alterIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
     let ixKey = try catKey(st, txn, &s.index, true)
     let owner = try st.get(txn, CATALOG, idxName(&ixKey))
     if owner.isNone() {
-        if s.ifFlag { return Ok(tagOnly("ALTER INDEX")) }
+        // a primary key's index (its table's own tree): the key renamed,
+        // as Rails' rename_table renames it (9.117)
+        match try pkIndexTable(st, txn, &ixKey) {
+            Some(pt) {
+                var t = pt
+                try needRelOwner(st, txn, &t.name, &"index")
+                let to = s.alters[0].name
+                let key = lexdb_sql.qual(&lexdb_sql.schemaOf(&ixKey), &to)
+                if key == ixKey { return Ok(tagOnly("ALTER INDEX")) }
+                if try relExists(st, txn, &key) { return Err(e("42P07", "relation \"" + to + "\" already exists")) }
+                if conTaken(&t, &to) { return Err(e("42710", "constraint \"" + to + "\" for relation \"" + lexdb_sql.baseName(&t.name) + "\" already exists")) }
+                t.pkName = to
+                try txn.put(CATALOG, t.name, encTable(&t))
+                try bumpFor(st, txn, &t.name)
+                return Ok(tagOnly("ALTER INDEX"))
+            }
+            None {}
+        }
+        if s.ifFlag {
+            notice(st, txn, &"00000", &("relation \"" + lexdb_sql.shown(&s.index) + "\" does not exist, skipping"), &"")
+            return Ok(tagOnly("ALTER INDEX"))
+        }
         return Err(e("42P01", "relation \"" + lexdb_sql.shown(&s.index) + "\" does not exist"))
     }
     var t = try needTable(st, txn, &owner.unwrap())
@@ -12075,47 +12166,90 @@ fn widens(a: &lexdb_sql.TypeName, b: &lexdb_sql.TypeName): bool {
     return a.oid == b.oid
 }
 
-// Rewrites table t with its columns' new types, as PostgreSQL does: each
-// row, its new values converted to the column's type, goes to a new tree,
-// and the indexes on a column changed (on any, when one is in the key) are
-// made again; the old trees are dropped. All in the transaction, the rows
-// held in memory as an UPDATE's are (max_statement_mem).
-fn retype(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, changes: &[]Retype, lim: Limits): Result[Unit, DbErr] {
+// What a rewrite does besides the columns' new types (9.117):
+// - rekey: the key changed (t.pk is the new one), so every index is made
+//   again (its entries hold the key);
+// - fills: columns given their defaults row by row, in the rows' order (a
+//   serial or identity column added over rows: its sequence's next value;
+//   a volatile default);
+// - rowid: the hidden key column (9.88), numbered from 1 in the rows' order
+//   (a primary key dropped); -1 none;
+// - nn: the columns the statement made NOT NULL: a NULL there is 23502
+//   "contains null values", as PostgreSQL's;
+// - sorted: the rows are read in their new key's order (the key unchanged).
+type Rewrite = record { rekey: bool; fills: []int; rowid: int; nn: []int; sorted: bool }
+
+fn noRewrite(): Rewrite { return Rewrite{rekey: false, fills: [], rowid: -1, nn: [], sorted: true} }
+
+// A rewrite's rows as made: each row's key and stored bytes; per index made
+// again, its entries, each one's row and (a unique one's) the length of its
+// columns' part (-1 one NULL); the bytes held.
+type RwRows = record { keys: []str; encs: []str; redo: []int; ents: [][]str; rows: [][]int; pres: [][]int; held: int }
+
+// Rewrites table t, as PostgreSQL does: each row, with its columns' new
+// types (changes, USING's values converted to them) and what rw says,
+// goes to a new tree under its key, and the indexes whose entries change
+// (all of them when the key does) are made again into new trees; the old
+// trees are dropped. The rows go in key order and the index entries in
+// theirs, as CREATE INDEX writes them (addIndex), so the leaves are full.
+// All in the transaction. Only the rows' keys and bytes and the entries are
+// held (bounded by max_statement_mem), not the rows: but USING's rows are
+// made by a query, and held as an UPDATE's are.
+fn rewrite(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, changes: &[]Retype, rw: &Rewrite, lim: Limits): Result[int, DbErr] {
     let sqe = seqEnv(st, txn)
-    // the rows, read as the table stands (the statement's other actions done)
-    try txn.put(CATALOG, t.name, encTable(t))
-    var sc = newScopeIn(st, txn, &[], &[])
-    let noWhere: Option[Expr] = None
-    let noParams: []Val = []
-    let noSubs: []lexdb_sql.Stmt = []
-    var q = try buildQuery(st, txn, &oneTable(&t.name), &noWhere, &noParams, &noSubs, mut &sc, false)
-    var xs: []Expr = []
-    for ch in changes {
-        let x = match ch.using {
-            Some(u) { clone(&u) }
-            None { Expr.Col(t.cols[ch.col].name) }
-        }
-        if hasAgg(&x) { return Err(e("42803", "cannot use aggregate function in transform expression")) }
-        append(mut &xs, try resolve(&x, &q.cols, len(q.cols), mut &sc))
-    }
-    endScope(mut &sc, mut &q)
+    // the rows are read as the table stands (the statement's other actions
+    // done), through a copy of it: t takes the new types before they are
+    // written
+    let rd = try decTable(t.name, &encTable(t))
+    var withUsing = false
+    for ch in changes { if ch.using.isSome() { withUsing = true } }
     var found: [][]Val = []
-    var rs = newRun(&q)
-    rs.limit(&lim)
-    rs.writes = true                // optimizer 19: a write keeps its index paths (its read set)
-    let m = try prepare(st, txn, &q, &noParams, mut &rs)
-    let room = rs.room()
-    let max = rs.maxHeld
-    var held = 0
-    try runQuery(st, txn, &q, &m, &noParams, fn(tx: mut &lexdb_store.Txn, r: &[]Val): Result[bool, DbErr] {
-        held += 2 * rowBytes(r)             // the row found, and its new one
-        if room >= 0 && held > room { return Err(memErr(max)) }
-        append(mut &found, copyRow(r))
-        return Ok(true)
-    }, mut &rs)
+    if withUsing {
+        // USING's values, of the row as it was: by a query over the table
+        try txn.put(CATALOG, t.name, encTable(t))
+        var sc = newScopeIn(st, txn, &[], &[])
+        let noWhere: Option[Expr] = None
+        let noParams: []Val = []
+        let noSubs: []lexdb_sql.Stmt = []
+        var q = try buildQuery(st, txn, &oneTable(&t.name), &noWhere, &noParams, &noSubs, mut &sc, false)
+        var xs: []Expr = []
+        for ch in changes {
+            let x = match ch.using {
+                Some(u) { clone(&u) }
+                None { Expr.Col(t.cols[ch.col].name) }
+            }
+            if hasAgg(&x) { return Err(e("42803", "cannot use aggregate function in transform expression")) }
+            append(mut &xs, try resolve(&x, &q.cols, len(q.cols), mut &sc))
+        }
+        endScope(mut &sc, mut &q)
+        var rs = newRun(&q)
+        rs.limit(&lim)
+        rs.writes = true                // optimizer 19: a write keeps its index paths (its read set)
+        let m = try prepare(st, txn, &q, &noParams, mut &rs)
+        let room = rs.room()
+        let max = rs.maxHeld
+        var held = 0
+        try runQuery(st, txn, &q, &m, &noParams, fn(tx: mut &lexdb_store.Txn, r: &[]Val): Result[bool, DbErr] {
+            held += 2 * rowBytes(r)             // the row found, and its new one
+            if room >= 0 && held > room { return Err(memErr(max)) }
+            append(mut &found, copyRow(r))
+            return Ok(true)
+        }, mut &rs)
+        let noAggs: []Val = []
+        for f in 0..len(found) {
+            var vals: []Val = []
+            {
+                let env = Env{cols: &q.cols, row: &found[f], aggs: &noAggs, params: &noParams, subs: &m.subs, cur: &noAggs, seq: sqe}
+                for k in 0..len(changes) {
+                    append(mut &vals, try coerceZ(try evalX(st, txn, &q, &xs[k], &env, mut &rs), &changes[k].typ, &txn.zone))
+                }
+            }
+            for k in 0..len(changes) { found[f][changes[k].col] = vals[k] }
+        }
+    }
 
     var changed: []bool = array(len(t.cols), false)
-    var keyChanged = false
+    var keyChanged = rw.rekey
     // every row written below has every place
     for k in 0..len(t.cols) { t.cols[k].missing = Val.Null }
     for ch in changes {
@@ -12123,32 +12257,14 @@ fn retype(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, chan
         changed[ch.col] = true
         for k in t.pk { if k == ch.col { keyChanged = true } }
     }
+    for f in rw.fills { changed[f] = true }
     // the rows below are in the new types' layout
     syncLayouts(t)
     let old = t.tree
     t.tree = st.createTree(txn)
     txn.dropTree(old)
-    var rows: [][]Val = []
-    var keys: []str = []
-    let noAggs: []Val = []
-    for f in found {
-        let env = Env{cols: &q.cols, row: &f, aggs: &noAggs, params: &noParams, subs: &m.subs, cur: &noAggs, seq: sqe}
-        var row = copyRow(&f)
-        for k in 0..len(changes) {
-            row[changes[k].col] = try coerceZ(try evalX(st, txn, &q, &xs[k], &env, mut &rs), &changes[k].typ, &txn.zone)
-        }
-        try checkRow(t, &row)
-        try checkChecks(t, &row)
-        let key = keyOf(t, &row)
-        if (try st.get(txn, t.tree, key)).isSome() { return Err(dupKey(t, &row)) }
-        let enc = encRowOf(t, &row)
-        try txn.putRow(t.tree, key, enc, rowHead(&enc))
-        append(mut &rows, row)
-        append(mut &keys, key)
-    }
-
     // the indexes whose entries change
-    var redo: []int = []
+    var out = RwRows{keys: [], encs: [], redo: [], ents: [], rows: [], pres: [], held: 0}
     for k in 0..len(t.indexes) {
         var uses = keyChanged
         for c in t.indexes[k].cols { if c >= 0 && changed[c] { uses = true } }
@@ -12174,34 +12290,205 @@ fn retype(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, chan
         if uses {
             txn.dropTree(t.indexes[k].tree)
             t.indexes[k].tree = st.createTree(txn)
-            append(mut &redo, k)
+            append(mut &out.redo, k)
+            append(mut &out.ents, [])
+            append(mut &out.rows, [])
+            append(mut &out.pres, [])
         }
     }
-    for k in redo {
-        let ix = &t.indexes[k]
-        for r in 0..len(rows) {
-            if !(try inIndex(t, ix, &rows[r])) { continue }
-            match checkUnique(st, txn, t, ix, &rows[r], &keys[r]) {
-                Ok(_) {}
-                Err(x) {
-                    if x.state != "23505" { return Err(x) }
-                    return Err(e("23505", "could not create unique index \"" + lexdb_sql.baseName(&ix.name) + "\": a value is duplicated"))
-                }
+    // the defaults of the columns filled (only theirs: making them binds
+    // the sequences they name)
+    let defs = if len(rw.fills) > 0 { try defaultsOf(st, txn, t) } else { Defs{vals: [], seqs: [], exprs: []} }
+    let room = if lim.mem > 0 { lim.mem } else { -1 }
+    // a row's checks are those its new values may fail: not a key's change
+    let checked = len(changes) > 0 || len(rw.fills) > 0
+    var n = 0
+    if withUsing {
+        for f in found {
+            var row = copyRow(&f)
+            try rwRow(st, txn, t, &defs, rw, n, mut &row, checked)
+            try rwAdd(t, &row, mut &out, room)
+            n += 1
+        }
+    } else {
+        let path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: []}
+        let sc = Scan{empty: false, point: false, lo: "", hi: "", whole: false}
+        var cur = newCursor()
+        while !cur.done {
+            var batch: [][]Val = []
+            let all: []bool = []
+            try fetch(st, txn, &rd, &path, &sc, &all, mut &cur, mut &batch)
+            for r in batch {
+                var row = copyRow(&r)
+                for ch in changes { row[ch.col] = try coerceZ(row[ch.col], &ch.typ, &txn.zone) }
+                try rwRow(st, txn, t, &defs, rw, n, mut &row, checked)
+                try rwAdd(t, &row, mut &out, room)
+                n += 1
             }
-            try txn.put(ix.tree, try idxEntry(t, ix, &rows[r], &keys[r]), keys[r])
+        }
+    }
+    // the rows, in key order: two of one key are 23505, as the key's index
+    // made again would find them (PostgreSQL's "could not create unique index")
+    var order: []int = array(len(out.keys), 0)
+    for i in 0..len(order) { order[i] = i }
+    if (keyChanged || !rw.sorted) && !inOrder(&out.keys) { collections.sortBy(mut &order, fn(a: &int, b: &int): int { return out.keys[a].cmp(&out.keys[b]) }) }
+    for j in 0..len(order) {
+        let i = order[j]
+        if j > 0 && out.keys[i] == out.keys[order[j - 1]] {
+            let row = try rowOf(st, txn, t, &out.keys[i], &out.encs[i], rowWidth(t), &[], &[])
+            return Err(dupMade(t, &pkConName(t), &t.pk, &[], &row))
+        }
+        try txn.putRow(t.tree, out.keys[i], out.encs[i], rowHead(&out.encs[i]))
+        noteChg(st, txn, t, 0)          // the new tree's rows, for its statistics (optimizer 44)
+    }
+    for j in 0..len(out.redo) {
+        var pks: []str = []
+        for r in out.rows[j] { append(mut &pks, out.keys[r]) }
+        try fillIndex(st, txn, t, &t.indexes[out.redo[j]], &out.ents[j], &pks, &out.pres[j])
+    }
+    // the old trees' statistics are of no use (the new tree's are made as
+    // its rows are counted)
+    txn.del(CATALOG, statKey(&t.name))
+    // the store's column leaves for the new tree from the first checkpoint
+    // on: its rows are all in the layout the catalog row will have, and a
+    // rollback drops the tree (9.114 keeps an uncommitted layout from trees
+    // whose rows were there before)
+    setSpec(st, t)
+    return Ok(len(out.keys))
+}
+
+// Whether xs are in order already (a key that follows the rows' order, as
+// an id filled as rows came: no sort needed).
+fn inOrder(xs: &[]str): bool {
+    for i in 1..len(xs) { if xs[i - 1].cmp(&xs[i]) > 0 { return false } }
+    return true
+}
+
+// Row n of a rewrite (its new types' values in): rw's columns given, then
+// checked.
+fn rwRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, defs: &Defs, rw: &Rewrite, n: int, row: mut &[]Val,
+         checked: bool): Result[Unit, DbErr] {
+    for f in rw.fills { row[f] = try defAt(st, txn, defs, t, f) }
+    if rw.rowid >= 0 { row[rw.rowid] = Val.Int(n + 1) }
+    for c in rw.nn {
+        if isNull(&row[c]) {
+            return Err(e("23502", "column \"" + t.cols[c].name + "\" of relation \"" + lexdb_sql.baseName(&t.name) + "\" contains null values"))
+        }
+    }
+    try checkRow(t, row)
+    if checked {
+        for c in t.checks {
+            if hasStr(&t.invalid, &c.name) { continue }
+            if !(try passes(t, &c, row)) {
+                return Err(e("23514", "check constraint \"" + c.name + "\" of relation \"" + lexdb_sql.baseName(&t.name) + "\" is violated by some row"))
+            }
         }
     }
     return Ok(Unit{})
 }
 
-// ALTER TABLE: its actions in order, on the table's catalog row. None
-// rewrites a row: a row written before a column was added has fewer
+// A rewrite's row made: its key, its bytes, its entries in the indexes made
+// again.
+fn rwAdd(t: &Table, row: &[]Val, out: mut &RwRows, room: int): Result[Unit, DbErr] {
+    let key = keyOf(t, row)
+    let enc = encRowOf(t, row)
+    out.held += len(key) + len(enc) + 48
+    let r = len(out.keys)
+    for j in 0..len(out.redo) {
+        let ix = &t.indexes[out.redo[j]]
+        if !(try inIndex(t, ix, row)) { continue }
+        let en = try idxEntry(t, ix, row, &key)
+        out.held += len(en) + 32
+        append(mut &out.ents[j], en)
+        append(mut &out.rows[j], r)
+        if ix.unique { append(mut &out.pres[j], if try hasNull(t, ix, row) { -1 } else { len(en) - len(key) }) }
+    }
+    if room >= 0 && out.held > room { return Err(memErr(room)) }
+    append(mut &out.keys, key)
+    append(mut &out.encs, enc)
+    return Ok(Unit{})
+}
+
+// Fills index ix's (new) tree with its entries ents, each ending with its
+// row's key pks[i], in their order; a unique one's (pres: each entry's
+// columns' length, -1 one NULL) two of equal columns are then neighbours:
+// 23505, the row read back from t's tree for the DETAIL.
+fn fillIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, ix: &Index, ents: &[]str, pks: &[]str,
+             pres: &[]int): Result[Unit, DbErr] {
+    var order: []int = array(len(ents), 0)
+    for i in 0..len(ents) { order[i] = i }
+    if !inOrder(ents) { collections.sortBy(mut &order, fn(a: &int, b: &int): int { return ents[a].cmp(&ents[b]) }) }
+    for j in 0..len(order) {
+        let i = order[j]
+        if ix.unique && j > 0 {
+            let h = order[j - 1]
+            if pres[i] >= 0 && pres[h] == pres[i] && ents[i][0..pres[i]] == ents[h][0..pres[h]] {
+                var row: []Val = []
+                match try st.get(txn, t.tree, pks[i]) {
+                    Some(v) { row = try rowOf(st, txn, t, &pks[i], &v, rowWidth(t), &[], &placesMissing(t)) }
+                    None {}
+                }
+                return Err(dupMade(t, &lexdb_sql.baseName(&ix.name), &ix.cols, &ix.exprs, &row))
+            }
+        }
+        try txn.put(ix.tree, ents[i], pks[i])
+    }
+    return Ok(Unit{})
+}
+
+// 23505 for a unique index made over rows two of which have equal values
+// in cols (exprs, an expression's where cols holds -1): row is one of them
+// ([] not known).
+fn dupMade(t: &Table, name: &str, cols: &[]int, exprs: &[]Expr, row: &[]Val): DbErr {
+    let msg = "could not create unique index \"" + name + "\""
+    if len(row) == 0 { return e("23505", msg) }
+    var names: []str = []
+    var vals: []str = []
+    for k in 0..len(cols) {
+        if cols[k] >= 0 {
+            append(mut &names, quoteIfNeeded(&t.cols[cols[k]].name))
+            append(mut &vals, text(&row[cols[k]]))
+        } else {
+            let none: Option[lexdb_sql.TypeName] = None
+            append(mut &names, pgExprText(&exprs[k], &none))
+            let noAggs: []Val = []
+            let noParams: []Val = []
+            let noSubs: []SubRes = []
+            let env = Env{cols: &t.cols, row: row, aggs: &noAggs, params: &noParams, subs: &noSubs, cur: &noAggs, seq: None}
+            match bpEval(t, &exprs[k], &env) {
+                Ok(v) { append(mut &vals, text(&v)) }
+                Err(_) { append(mut &vals, "?") }
+            }
+        }
+    }
+    return lexdb_base.errDetail("23505", msg, "Key (" + strings.join(&names, ", ") + ")=(" + strings.join(&vals, ", ") + ") is duplicated.", "")
+}
+
+// ALTER TABLE: its actions in order, on the table's catalog row. Most
+// rewrite no row: a row written before a column was added has fewer
 // values, read as NULL (decRowNeed); a dropped column's place is skipped
-// (Table.slots).
+// (Table.slots). The table is rewritten once, after them, when its key
+// changes, a column added over rows takes a value per row (9.117), or a
+// type changes its values (9.36).
 fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, lim: Limits): Result[Res, DbErr] {
     let found = try findTable(st, txn, &s.table)
     if found.isNone() {
-        if s.ifFlag { return Ok(tagOnly("ALTER TABLE")) }
+        // a sequence's RENAME TO and SET SCHEMA (Rails' rename_table renames
+        // its key's sequence so)
+        if len(s.alters) == 1 && (s.alters[0].kind == lexdb_sql.A_RENAME || s.alters[0].kind == lexdb_sql.A_SET_SCHEMA) {
+            match try findSeq(st, txn, &s.table) {
+                Some(d) {
+                    try needRelOwner(st, txn, &d.key, &"sequence")
+                    let r = try moveSeq(st, txn, &d, &s.alters[0])
+                    return Ok(tagOnly("ALTER TABLE"))
+                }
+                None {}
+            }
+        }
+        if s.ifFlag {
+            notice(st, txn, &"00000", &("relation \"" + lexdb_sql.shown(&s.table) + "\" does not exist, skipping"), &"")
+            return Ok(tagOnly("ALTER TABLE"))
+        }
         return Err(e("42P01", "relation \"" + lexdb_sql.shown(&s.table) + "\" does not exist"))
     }
     match found {
@@ -12226,6 +12513,11 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         None {}
     }
     var t = found.unwrap()
+    // the key as it was, by its columns' names ([] the hidden one)
+    var keyWas: []str = []
+    if hasPk(&t) { for i in t.pk { append(mut &keyWas, t.cols[i].name) } }
+    var pk = PkChange{changed: false, nn: []}
+    var fills: []str = []               // columns added over rows that take a value per row
     // TYPE actions are done together, after the others, by the names then
     var types: []int = []
     var skipped: []str = []             // columns ADD COLUMN IF NOT EXISTS found there: their constraints not added
@@ -12237,25 +12529,43 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         } else if a.kind == lexdb_sql.A_ADD_CON {
             var skip = false
             for n in skipped { if len(a.name) > 0 && n == a.name { skip = true } }
-            if !skip { try addConstraint(st, txn, mut &t, &a.cons[0]) }
+            if skip { continue }
+            let c = &a.cons[0]
+            if c.kind == lexdb_sql.C_PRIMARY {
+                try addPrimary(st, txn, mut &t, c, mut &pk)
+            } else if c.kind == lexdb_sql.C_UNIQUE && len(c.index) > 0 {
+                try uniqueUsing(st, txn, mut &t, c)
+            } else {
+                try addConstraint(st, txn, mut &t, c, true)
+            }
         } else if a.kind == lexdb_sql.A_DROP_CON {
-            if !(try dropConstraint(st, txn, mut &t, &a.name, a.cascade)) {
-                if a.name == rel + "_pkey" { return Err(e("0A000", "lexdb: a table's primary key cannot be changed")) }
+            if hasPk(&t) && a.name == pkConName(&t) {
+                try dropPrimary(st, txn, mut &t, a.cascade, &"")
+                pk.changed = true
+            } else if !(try dropConstraint(st, txn, mut &t, &a.name, a.cascade)) {
                 if !a.ifFlag {
                     return Err(e("42704", "constraint \"" + a.name + "\" of relation \"" + rel + "\" does not exist"))
                 }
+                notice(st, txn, &"00000", &("constraint \"" + a.name + "\" of relation \"" + rel + "\" does not exist, skipping"), &"")
             }
+        } else if a.kind == lexdb_sql.A_RENAME_CON {
+            try renameConstraint(st, txn, mut &t, &a.name, &a.to)
+        } else if a.kind == lexdb_sql.A_VALIDATE {
+            try validateConstraint(st, txn, mut &t, &a.name)
         } else if a.kind == lexdb_sql.A_SET_SCHEMA {
             try setSchema(st, txn, mut &t, &a.name)
         } else if a.kind == lexdb_sql.A_ADD {
             if colIndex(&t.cols, &a.col.name) >= 0 {
                 if a.ifFlag {
                     append(mut &skipped, a.col.name)
+                    notice(st, txn, &"42701", &("column \"" + a.col.name + "\" of relation \"" + rel + "\" already exists, skipping"), &"")
                     continue
                 }
                 return Err(e("42701", "column \"" + a.col.name + "\" of relation \"" + rel + "\" already exists"))
             }
-            // the rows there read the default as it is now (no row is written)
+            // the rows there read the default as it is now (no row is
+            // written), unless it is a sequence's or volatile: then each row
+            // is given one when the table is rewritten (9.117)
             var col = lexdb_sql.colDef(a.col.name, a.col.typ, a.col.notNull)
             col.identity = a.col.identity
             col.spell = a.col.spell
@@ -12270,11 +12580,9 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
                 None {}
             }
             try defaultSeqs(st, txn, &col)
-            if perRow && try anyRow(st, txn, &t, -1) {
-                return Err(e("0A000", "lexdb: a column whose default is a sequence's cannot be added to a table with rows"))
-            }
-            let full = a.col.notNull && isNull(&col.missing) && try anyRow(st, txn, &t, -1)
-            if full {
+            let rows = (perRow || (a.col.notNull && isNull(&col.missing))) && try anyRow(st, txn, &t, -1)
+            if perRow && rows { append(mut &fills, a.col.name) }
+            if a.col.notNull && isNull(&col.missing) && rows && !perRow {
                 return Err(e("23502", "column \"" + a.col.name + "\" of relation \"" + rel + "\" contains null values"))
             }
             append(mut &t.cols, col)
@@ -12283,11 +12591,23 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
                 t.width += 1
             }
             try makeColSeqs(st, txn, mut &t, len(t.cols) - 1, &s.idOpts)
+            try ownColSeq(st, txn, &t, len(t.cols) - 1)
         } else if a.kind == lexdb_sql.A_DROP_COL {
             let i = colIndex(&t.cols, &a.name)
             if i < 0 {
-                if a.ifFlag { continue }
+                if a.ifFlag {
+                    notice(st, txn, &"00000", &("column \"" + a.name + "\" of relation \"" + rel + "\" does not exist, skipping"), &"")
+                    continue
+                }
                 return Err(e("42703", "column \"" + a.name + "\" of relation \"" + rel + "\" does not exist"))
+            }
+            // a key column's drop drops the key, as PostgreSQL's (its
+            // index goes with the column)
+            var inKey = false
+            for k in t.pk { if k == i { inKey = true } }
+            if inKey && hasPk(&t) {
+                try dropPrimary(st, txn, mut &t, a.cascade, &a.name)
+                pk.changed = true
             }
             try fkDropColumn(st, txn, mut &t, &a.name, a.cascade)
             try dropOwnedSeqs(st, txn, &t, &a.name)
@@ -12299,6 +12619,8 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             if try relExists(st, txn, &key) {
                 return Err(e("42P07", "relation \"" + a.name + "\" already exists"))
             }
+            // its key's index keeps its name, as PostgreSQL's
+            if hasPk(&t) && len(t.pkName) == 0 { t.pkName = pkConName(&t) }
             txn.del(CATALOG, t.name)
             let old = t.name
             t.name = key
@@ -12309,7 +12631,7 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             for ix in t.indexes { try txn.put(CATALOG, idxName(&ix.name), key) }
         } else {
             let i = colIndex(&t.cols, &a.name)
-            if i < 0 { return Err(e("42703", "column \"" + a.name + "\" does not exist")) }
+            if i < 0 { return Err(e("42703", "column \"" + a.name + "\" of relation \"" + rel + "\" does not exist")) }
             if a.kind == lexdb_sql.A_RENAME_COL {
                 t.cols[i].spell = a.col.spell
                 if a.to == a.name { continue }
@@ -12333,6 +12655,8 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
                 try renameFkCol(st, txn, mut &t, &a.name, &a.to)
                 let tn = t.name
                 try ownerMoved(st, txn, mut &t, &tn, &a.name, &a.to, &"")
+                for k in 0..len(pk.nn) { if pk.nn[k] == a.name { pk.nn[k] = a.to } }
+                for k in 0..len(fills) { if fills[k] == a.name { fills[k] = a.to } }
             } else if a.kind == lexdb_sql.A_SET_NOT_NULL {
                 let nulls = !t.cols[i].notNull && try anyRow(st, txn, &t, i)
                 if nulls {
@@ -12357,7 +12681,8 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
                 t.cols[i].identity = lexdb_sql.ID_NONE
             } else if a.kind == lexdb_sql.A_DROP_DEFAULT {
                 if t.cols[i].identity == lexdb_sql.ID_ALWAYS || t.cols[i].identity == lexdb_sql.ID_BY_DEFAULT {
-                    return Err(e("42601", "column \"" + a.name + "\" of relation \"" + rel + "\" is an identity column"))
+                    return Err(lexdb_base.errDetail("42601", "column \"" + a.name + "\" of relation \"" + rel + "\" is an identity column", "",
+                                                    "Use ALTER TABLE ... ALTER COLUMN ... DROP IDENTITY instead."))
                 }
                 t.cols[i].def = None
                 t.cols[i].seq = ""
@@ -12366,12 +12691,31 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
                 for k in t.pk {
                     if k == i { return Err(e("42P16", "column \"" + a.name + "\" is in a primary key")) }
                 }
+                if t.cols[i].identity == lexdb_sql.ID_ALWAYS || t.cols[i].identity == lexdb_sql.ID_BY_DEFAULT {
+                    return Err(e("42601", "column \"" + a.name + "\" of relation \"" + rel + "\" is an identity column"))
+                }
                 t.cols[i].notNull = false
+            } else if a.kind == lexdb_sql.A_ADD_IDENTITY {
+                try addIdentity(st, txn, mut &t, i, a)
+            } else if a.kind == lexdb_sql.A_SET_IDENTITY {
+                try setIdentity(st, txn, mut &t, i, a)
+            } else if a.kind == lexdb_sql.A_DROP_IDENTITY {
+                if !isIdentity(&t.cols[i]) {
+                    if !a.ifFlag { return Err(notIdentity(&t, &a.name)) }
+                    notice(st, txn, &"00000", &("column \"" + a.name + "\" of relation \"" + rel + "\" is not an identity column, skipping"), &"")
+                    continue
+                }
+                match try st.get(txn, CATALOG, seqRow(&t.cols[i].seq)) {
+                    Some(v) { try dropSeqRows(st, txn, &decSeq(&v)) }
+                    None {}
+                }
+                t.cols[i].seq = ""
+                t.cols[i].identity = lexdb_sql.ID_NONE
             }
         }
     }
     var changes: []Retype = []
-    var rewrite = false
+    var retyped = false
     for j in types {
         let a = &s.alters[j]
         let i = colIndex(&t.cols, &a.name)
@@ -12389,27 +12733,467 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             return Err(e("42804", "column \"" + a.name + "\" cannot be cast automatically to type " + lexdb_sql.typeText(&a.col.typ) +
                          " (USING " + a.name + "::" + lexdb_sql.typeText(&a.col.typ) + " would)"))
         }
-        if a.using.isSome() || !widens(&t.cols[i].typ, &a.col.typ) { rewrite = true }
+        if a.using.isSome() || !widens(&t.cols[i].typ, &a.col.typ) { retyped = true }
         let u = match a.using { Some(x) { Some(clone(&x)) } None { None } }
         append(mut &changes, Retype{col: i, typ: a.col.typ, using: u})
     }
-    if rewrite { try retype(st, txn, mut &t, &changes, lim) }
-    else { for ch in changes { t.cols[ch.col].typ = ch.typ } }
+    // the key: none left, the hidden one (9.88); one like the old, nothing
+    // to rewrite
+    var rw = noRewrite()
+    if pk.changed {
+        if len(t.pk) == 0 {
+            var rc = lexdb_sql.colDef(ROWID, lexdb_sql.TypeName{kind: lexdb_sql.K_INT, oid: lexdb_sql.OID_INT8, prec: 0, scale: 0, len: 0}, true)
+            rc.identity = lexdb_sql.ID_ALWAYS
+            append(mut &t.cols, rc)
+            if len(t.slots) > 0 {
+                append(mut &t.slots, t.width)
+                t.width += 1
+            }
+            t.pk = [len(t.cols) - 1]
+            t.pkName = ""
+            try makeColSeqs(st, txn, mut &t, len(t.cols) - 1, &[])
+            try ownColSeq(st, txn, &t, len(t.cols) - 1)
+            rw.rowid = len(t.cols) - 1
+        }
+        var keyNow: []str = []
+        if hasPk(&t) { for i in t.pk { append(mut &keyNow, t.cols[i].name) } }
+        var same = len(keyNow) == len(keyWas) && len(keyNow) > 0
+        if same { for k in 0..len(keyNow) { if keyNow[k] != keyWas[k] { same = false } } }
+        if !same {
+            rw.rekey = true
+            rw.sorted = rw.rowid >= 0
+            for n in pk.nn {
+                let c = colIndex(&t.cols, &n)
+                if c >= 0 { append(mut &rw.nn, c) }
+            }
+        }
+    }
+    for n in fills {
+        let c = colIndex(&t.cols, &n)
+        if c >= 0 { append(mut &rw.fills, c) }
+    }
+    if retyped || rw.rekey || len(rw.fills) > 0 {
+        let n = try rewrite(st, txn, mut &t, &changes, &rw, lim)
+        // the hidden key's sequence goes on after the rows numbered
+        if rw.rowid >= 0 {
+            if n > 0 {
+                match try st.get(txn, CATALOG, seqRow(&t.cols[rw.rowid].seq)) {
+                    Some(v) { try setVal(st, &decSeq(&v), n, true) }
+                    None {}
+                }
+            }
+        }
+    } else {
+        for ch in changes { t.cols[ch.col].typ = ch.typ }
+    }
     // a default must be one of the new type
     for ch in changes {
         match t.cols[ch.col].def {
             Some(x) { let v = try defaultValue(&x, &t.cols[ch.col], None) }
             None {}
         }
+        // an identity column's sequence takes its new type, its bounds the
+        // type's where they were the old's (PostgreSQL's AS; a serial's
+        // sequence keeps its own), 9.117
+        if isIdentity(&t.cols[ch.col]) && ch.typ.kind == lexdb_sql.K_INT {
+            match try st.get(txn, CATALOG, seqRow(&t.cols[ch.col].seq)) {
+                Some(v) {
+                    var d = decSeq(&v)
+                    if d.typ != ch.typ.oid {
+                        if d.max == typMax(d.typ) { d.max = typMax(ch.typ.oid) }
+                        if d.min == typMin(d.typ) { d.min = typMin(ch.typ.oid) }
+                        if d.max > typMax(ch.typ.oid) || d.min < typMin(ch.typ.oid) {
+                            return Err(e("22023", "MAXVALUE (" + d.max.toStr() + ") is out of range for sequence data type " + lexdb_sql.typeText(&ch.typ)))
+                        }
+                        d.typ = ch.typ.oid
+                        try txn.put(CATALOG, seqRow(&d.key), encSeq(&d))
+                    }
+                }
+                None {}
+            }
+        }
     }
+    pruneInvalid(mut &t)
     try txn.put(CATALOG, t.name, encTable(&t))
     try bumpFor(st, txn, &t.name)
     return Ok(tagOnly("ALTER TABLE"))
 }
 
+// ---- a table's primary key changed (9.117)
+//
+// lexdb keeps a table's rows in a tree under their key (a table without one
+// under a hidden one, 9.88), so a new key is a new tree: ALTER TABLE
+// changes t.pk as its actions come, and rewrites the table once after them
+// (rewrite). The key's name is t.pkName.
+
+// What ALTER TABLE's actions did to the key: changed, and the columns ADD
+// PRIMARY KEY made NOT NULL (their rows checked by the rewrite).
+type PkChange = record { changed: bool; nn: []str }
+
+// Whether name is taken among t's constraints, its key's among them.
+fn conTaken(t: &Table, name: &str): bool { return hasConName(t, name) || (hasPk(t) && pkConName(t) == name) }
+
+// ADD [CONSTRAINT name] PRIMARY KEY (cols) | USING INDEX ix: t.pk made
+// those columns (NOT NULL), the hidden key's column dropped.
+fn addPrimary(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, c: &lexdb_sql.Constraint, pk: mut &PkChange): Result[Unit, DbErr] {
+    let rel = lexdb_sql.baseName(&t.name)
+    if hasPk(t) { return Err(e("42P16", "multiple primary keys for table \"" + rel + "\" are not allowed")) }
+    var cols: []int = []
+    var name = c.name
+    if len(c.index) > 0 {
+        let k = try usableIndex(st, txn, t, &c.index)
+        for x in t.indexes[k].cols { append(mut &cols, x) }
+        if len(name) == 0 { name = lexdb_sql.baseName(&t.indexes[k].name) }
+        if conTaken(t, &name) { return Err(e("42710", "constraint \"" + name + "\" for relation \"" + rel + "\" already exists")) }
+        if name != lexdb_sql.baseName(&t.indexes[k].name) {
+            if try relExists(st, txn, &lexdb_sql.qual(&lexdb_sql.schemaOf(&t.name), &name)) {
+                return Err(e("42P07", "relation \"" + name + "\" already exists"))
+            }
+            notice(st, txn, &"00000", &("ALTER TABLE / ADD CONSTRAINT USING INDEX will rename index \"" + lexdb_sql.baseName(&t.indexes[k].name) +
+                                        "\" to \"" + name + "\""), &"")
+        }
+        // the key is the table's own tree: the index goes
+        let ix = collections.removeAt(mut &t.indexes, k)
+        txn.dropTree(ix.tree)
+        txn.del(CATALOG, idxName(&ix.name))
+    } else {
+        for n in c.cols {
+            let i = colIndex(&t.cols, &n)
+            if i < 0 { return Err(e("42703", "column \"" + n + "\" of relation \"" + rel + "\" does not exist")) }
+            for x in cols { if x == i { return Err(e("42701", "column \"" + n + "\" appears twice in primary key constraint")) } }
+            append(mut &cols, i)
+        }
+        if len(name) == 0 { name = try makeName(st, txn, t, &[], &"pkey", true) }
+        if conTaken(t, &name) { return Err(e("42710", "constraint \"" + name + "\" for relation \"" + rel + "\" already exists")) }
+        if try relExists(st, txn, &lexdb_sql.qual(&lexdb_sql.schemaOf(&t.name), &name)) {
+            return Err(e("42P07", "relation \"" + name + "\" already exists"))
+        }
+    }
+    for i in cols {
+        if !t.cols[i].notNull {
+            t.cols[i].notNull = true
+            append(mut &pk.nn, t.cols[i].name)
+        }
+    }
+    let hidden = if rowidKeyed(t) { t.pk[0] } else { -1 }
+    t.pk = cols
+    t.pkName = if name == rel + "_pkey" { "" } else { name }
+    if hidden >= 0 {
+        // the hidden key's column and its sequence go
+        try dropOwnedSeqs(st, txn, t, &ROWID)
+        try dropColumn(txn, t, hidden)
+    }
+    pk.changed = true
+    return Ok(Unit{})
+}
+
+// DROP CONSTRAINT of t's key (or DROP COLUMN of a column in it): the
+// foreign keys referencing it through it (refused, or with cascade
+// dropped); t.pk then [] (the statement's end gives it the hidden one).
+// Its columns stay NOT NULL, as in PostgreSQL 18.
+// col: the column whose drop drops it ("" DROP CONSTRAINT), for the errors.
+fn dropPrimary(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, cascade: bool, col: &str): Result[Unit, DbErr] {
+    let name = pkConName(t)
+    var key: []int = []
+    for i in t.pk { append(mut &key, i) }
+    let what = if len(col) > 0 { "column " + col + " of table " + lexdb_sql.baseName(&t.name) } else { "constraint " + name + " on table " + lexdb_sql.baseName(&t.name) }
+    let on = if len(col) > 0 { what } else { "index " + name }
+    try dropKeyRefs(st, txn, t, &what, &on, cascade, fn(f: &ForeignKey, p: &Table): bool {
+        let rc = colsOf(p, &f.refCols)
+        return len(rc) == len(key) && prefixSame(&key, len(rc), &rc) && keyIndex(p, &rc, -1) == -1 && uniqueOn(p, &rc, -1) < 0
+    })
+    t.pk = []
+    t.pkName = ""
+    return Ok(Unit{})
+}
+
+// Which of p's unique indexes (not filtered) is cols, in any order, other
+// than except; -1 none.
+fn uniqueOn(p: &Table, cols: &[]int, except: int): int {
+    for k in 0..len(p.indexes) {
+        let ix = &p.indexes[k]
+        if k != except && ix.unique && ix.pred.isNone() && len(ix.cols) == len(cols) && prefixSame(&ix.cols, len(cols), cols) { return k }
+    }
+    return -1
+}
+
+// The foreign keys referencing table t (its own among them) that depend on
+// its constraint con (hit says which): refused, as PostgreSQL's 2BP01 with
+// the first named, or with cascade dropped, a notice naming them.
+// what: what is dropped ("constraint x on table t"); on: what they depend
+// on ("index x").
+fn dropKeyRefs(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, what0: &str, on: &str, cascade: bool,
+               hit: &fn(&ForeignKey, &Table): bool): Result[Unit, DbErr] {
+    var gone: []str = []
+    var kids: []str = []
+    for k in t.refBy { append(mut &kids, k) }
+    for ck in kids {
+        if ck == t.name {
+            var k = 0
+            while k < len(t.fks) {
+                let h = t.fks[k].ref == t.name && hit(&t.fks[k], t)
+                if h {
+                    let what = "constraint " + t.fks[k].name + " on table " + lexdb_sql.baseName(&t.name)
+                    if !cascade { return Err(keyDepends(what0, on, &what)) }
+                    append(mut &gone, what)
+                    try dropOwnFk(st, txn, t, k)
+                } else {
+                    k += 1
+                }
+            }
+        } else {
+            var c = try byKey(st, txn, &ck)
+            var changed = false
+            var k = 0
+            while k < len(c.fks) {
+                let h = c.fks[k].ref == t.name && hit(&c.fks[k], t)
+                if h {
+                    let what = "constraint " + c.fks[k].name + " on table " + lexdb_sql.baseName(&c.name)
+                    if !cascade { return Err(keyDepends(what0, on, &what)) }
+                    append(mut &gone, what)
+                    let dropped = collections.removeAt(mut &c.fks, k)
+                    changed = true
+                } else {
+                    k += 1
+                }
+            }
+            if changed {
+                var still = false
+                for f in c.fks { if f.ref == t.name { still = true } }
+                if !still { dropKey(mut &t.refBy, &ck) }
+                try putTable(txn, &c)
+            }
+        }
+    }
+    if len(gone) == 1 { notice(st, txn, &"00000", &("drop cascades to " + gone[0]), &"") }
+    if len(gone) > 1 {
+        var lines: []str = []
+        for g in gone { append(mut &lines, "drop cascades to " + g) }
+        notice(st, txn, &"00000", &("drop cascades to " + len(gone).toStr() + " other objects"), &strings.join(&lines, "\n"))
+    }
+    return Ok(Unit{})
+}
+
+fn keyDepends(dropped: &str, on: &str, what: &str): DbErr {
+    return lexdb_base.errDetail("2BP01", "cannot drop " + dropped + " because other objects depend on it",
+                                what + " depends on " + on, "Use DROP ... CASCADE to drop the dependent objects too.")
+}
+
+// The index of t named n, for a constraint USING INDEX: PostgreSQL's
+// checks, in its order.
+fn usableIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, n: &str): Result[int, DbErr] {
+    let key = lexdb_sql.qual(&lexdb_sql.schemaOf(&t.name), n)
+    let owner = try st.get(txn, CATALOG, idxName(&key))
+    if owner.isNone() { return Err(e("42704", "index \"" + n + "\" does not exist")) }
+    var k = -1
+    for x in 0..len(t.indexes) { if t.indexes[x].name == key { k = x } }
+    if k < 0 {
+        // (another table's: PostgreSQL tells a constraint's first)
+        let other = try needTable(st, txn, &owner.unwrap())
+        for ox in other.indexes { if ox.name == key && ox.con { return Err(e("55000", "index \"" + n + "\" is already associated with a constraint")) } }
+        return Err(e("55000", "index \"" + n + "\" does not belong to table \"" + lexdb_sql.baseName(&t.name) + "\""))
+    }
+    let ix = &t.indexes[k]
+    let why = "Cannot create a primary key or unique constraint using such an index."
+    if ix.con { return Err(e("55000", "index \"" + n + "\" is already associated with a constraint")) }
+    if !ix.unique { return Err(lexdb_base.errDetail("42809", "\"" + n + "\" is not a unique index", why, "")) }
+    for c in ix.cols { if c < 0 { return Err(lexdb_base.errDetail("42809", "index \"" + n + "\" contains expressions", why, "")) } }
+    if ix.pred.isSome() { return Err(lexdb_base.errDetail("42809", "\"" + n + "\" is a partial index", why, "")) }
+    for j in 0..len(ix.opts) {
+        if len(ix.opts[j]) > 0 && strings.toLowerAscii(ix.opts[j]) != "asc" && strings.toLowerAscii(ix.opts[j]) != "asc nulls last" {
+            return Err(lexdb_base.errDetail("42809", "index \"" + n + "\" column number " + (j + 1).toStr() + " does not have default sorting behavior", why, ""))
+        }
+    }
+    return Ok(k)
+}
+
+// ADD [CONSTRAINT name] UNIQUE USING INDEX ix: the index made the
+// constraint's (renamed to its name).
+fn uniqueUsing(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, c: &lexdb_sql.Constraint): Result[Unit, DbErr] {
+    let k = try usableIndex(st, txn, t, &c.index)
+    let was = lexdb_sql.baseName(&t.indexes[k].name)
+    let name = if len(c.name) > 0 { c.name } else { was }
+    if conTaken(t, &name) { return Err(e("42710", "constraint \"" + name + "\" for relation \"" + lexdb_sql.baseName(&t.name) + "\" already exists")) }
+    if name != was {
+        let key = lexdb_sql.qual(&lexdb_sql.schemaOf(&t.name), &name)
+        if try relExists(st, txn, &key) { return Err(e("42P07", "relation \"" + name + "\" already exists")) }
+        notice(st, txn, &"00000", &("ALTER TABLE / ADD CONSTRAINT USING INDEX will rename index \"" + was + "\" to \"" + name + "\""), &"")
+        txn.del(CATALOG, idxName(&t.indexes[k].name))
+        t.indexes[k].name = key
+        try txn.put(CATALOG, idxName(&key), t.name)
+    }
+    t.indexes[k].con = true
+    return Ok(Unit{})
+}
+
+// RENAME CONSTRAINT from TO to: a CHECK's, a foreign key's, a UNIQUE's
+// (its index too) or the key's.
+fn renameConstraint(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, from: &str, to: &str): Result[Unit, DbErr] {
+    let rel = lexdb_sql.baseName(&t.name)
+    if !conTaken(t, from) { return Err(e("42704", "constraint \"" + from + "\" for table \"" + rel + "\" does not exist")) }
+    if from == to { return Ok(Unit{}) }
+    if conTaken(t, to) { return Err(e("42710", "constraint \"" + to + "\" for relation \"" + rel + "\" already exists")) }
+    let key = lexdb_sql.qual(&lexdb_sql.schemaOf(&t.name), to)
+    for k in 0..len(t.invalid) { if t.invalid[k] == from { t.invalid[k] = to.toStr() } }
+    for k in 0..len(t.checks) { if t.checks[k].name == from { t.checks[k].name = to.toStr() } }
+    for k in 0..len(t.fks) { if t.fks[k].name == from { t.fks[k].name = to.toStr() } }
+    for k in 0..len(t.indexes) {
+        if t.indexes[k].con && lexdb_sql.baseName(&t.indexes[k].name) == from {
+            if try relExists(st, txn, &key) { return Err(e("42P07", "relation \"" + to + "\" already exists")) }
+            txn.del(CATALOG, idxName(&t.indexes[k].name))
+            t.indexes[k].name = key
+            try txn.put(CATALOG, idxName(&key), t.name)
+        }
+    }
+    if hasPk(t) && pkConName(t) == from {
+        if try relExists(st, txn, &key) { return Err(e("42P07", "relation \"" + to + "\" already exists")) }
+        t.pkName = to.toStr()
+    }
+    return Ok(Unit{})
+}
+
+// VALIDATE CONSTRAINT name: a CHECK or foreign key added NOT VALID, its
+// rows checked now.
+fn validateConstraint(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, name: &str): Result[Unit, DbErr] {
+    let rel = lexdb_sql.baseName(&t.name)
+    var kind = 0
+    for c in t.checks { if c.name == name { kind = 1 } }
+    for f in t.fks { if f.name == name { kind = 2 } }
+    if kind == 0 {
+        if conTaken(t, name) {
+            return Err(lexdb_base.errDetail("42809", "cannot validate constraint \"" + name + "\" of relation \"" + rel + "\"",
+                                            "This operation is not supported for this type of constraint.", ""))
+        }
+        return Err(e("42704", "constraint \"" + name + "\" of relation \"" + rel + "\" does not exist"))
+    }
+    if !hasStr(&t.invalid, name) { return Ok(Unit{}) }
+    if kind == 1 {
+        for c in t.checks { if c.name == name { try checkRows(st, txn, t, &c) } }
+    } else {
+        for f in t.fks {
+            if f.name != name { continue }
+            if f.ref == t.name {
+                let pt = try decTable(t.name, &encTable(t))
+                try fkRows(st, txn, t, &f, &pt)
+            } else {
+                let pt = try byKey(st, txn, &f.ref)
+                try fkRows(st, txn, t, &f, &pt)
+            }
+        }
+    }
+    dropKey(mut &t.invalid, name)
+    return Ok(Unit{})
+}
+
+// t.invalid without the names of constraints gone.
+fn pruneInvalid(t: mut &Table) {
+    var keep: []str = []
+    for n in t.invalid {
+        var there = false
+        for c in t.checks { if c.name == n { there = true } }
+        for f in t.fks { if f.name == n { there = true } }
+        if there { append(mut &keep, n) }
+    }
+    t.invalid = keep
+}
+
+// The rows of t against check c (23514).
+fn checkRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, c: &Check): Result[Unit, DbErr] {
+    let path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: []}
+    let sc = Scan{empty: false, point: false, lo: "", hi: "", whole: false}
+    var cur = newCursor()
+    while !cur.done {
+        var batch: [][]Val = []
+        let all: []bool = []
+        try fetch(st, txn, t, &path, &sc, &all, mut &cur, mut &batch)
+        for r in batch {
+            if !(try passes(t, c, &r)) {
+                return Err(e("23514", "check constraint \"" + c.name + "\" of relation \"" + lexdb_sql.baseName(&t.name) + "\" is violated by some row"))
+            }
+        }
+    }
+    return Ok(Unit{})
+}
+
+// ---- identity columns changed (9.117)
+
+fn isIdentity(c: &lexdb_sql.ColDef): bool {
+    return (c.identity == lexdb_sql.ID_ALWAYS || c.identity == lexdb_sql.ID_BY_DEFAULT) && len(c.seq) > 0 && c.name != ROWID
+}
+
+fn notIdentity(t: &Table, col: &str): DbErr {
+    return e("55000", "column \"" + col + "\" of relation \"" + lexdb_sql.baseName(&t.name) + "\" is not an identity column")
+}
+
+// ALTER COLUMN c ADD GENERATED ... AS IDENTITY [(options)]: its sequence
+// made (t_c_seq), starting where its options say; the rows there keep their
+// values, as in PostgreSQL.
+fn addIdentity(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, i: int, a: &lexdb_sql.Alter): Result[Unit, DbErr] {
+    let rel = lexdb_sql.baseName(&t.name)
+    let cn = t.cols[i].name
+    if t.cols[i].typ.kind != lexdb_sql.K_INT { return Err(e("22023", "identity column type must be smallint, integer, or bigint")) }
+    if !t.cols[i].notNull {
+        return Err(e("55000", "column \"" + cn + "\" of relation \"" + rel + "\" must be declared NOT NULL before identity can be added"))
+    }
+    if isIdentity(&t.cols[i]) { return Err(e("55000", "column \"" + cn + "\" of relation \"" + rel + "\" is already an identity column")) }
+    if t.cols[i].def.isSome() || len(t.cols[i].seq) > 0 {
+        return Err(e("55000", "column \"" + cn + "\" of relation \"" + rel + "\" already has a default value"))
+    }
+    t.cols[i].identity = a.col.identity
+    try makeColSeqs(st, txn, t, i, &[lexdb_sql.IdOpts{col: cn, opts: seqOptsCopy(&a.seq)}])
+    return ownColSeq(st, txn, t, i)
+}
+
+fn seqOptsCopy(o: &lexdb_sql.SeqOpts): lexdb_sql.SeqOpts {
+    var r = lexdb_sql.noSeqOpts()
+    lexdb_sql.mergeSeqOpts(mut &r, o)
+    r.restart = o.restart
+    r.restartWith = o.restartWith
+    return r
+}
+
+// Column i's new sequence (serial, identity) owned by its table's owner,
+// as PostgreSQL's (a superuser's ALTER of another's table included).
+fn ownColSeq(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, i: int): Result[Unit, DbErr] {
+    if len(t.cols[i].seq) == 0 { return Ok(Unit{}) }
+    let a = try readAcl(st, txn, &relObj(&t.name))
+    let owner = if len(a.owner) > 0 { a.owner } else { currentRole(st, txn.sess) }
+    return writeAcl(txn, &relObj(&t.cols[i].seq), &Acl{owner: owner, grants: [], set: false})
+}
+
+// ALTER COLUMN c SET GENERATED ..., SET options, RESTART [WITH n]: its
+// sequence's options changed as ALTER SEQUENCE's; RESTART at once, as there.
+fn setIdentity(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, i: int, a: &lexdb_sql.Alter): Result[Unit, DbErr] {
+    if !isIdentity(&t.cols[i]) { return Err(notIdentity(t, &t.cols[i].name)) }
+    if a.col.identity != lexdb_sql.ID_NONE { t.cols[i].identity = a.col.identity }
+    let o = &a.seq
+    let any = o.typ != 0 || o.hasInc || o.hasMin != 0 || o.hasMax != 0 || o.hasStart || o.cache != 0 || o.cycle != 0 || o.restart != 0
+    if !any { return Ok(Unit{}) }
+    let old = match try st.get(txn, CATALOG, seqRow(&t.cols[i].seq)) {
+        Some(v) { decSeq(&v) }
+        None { return Err(lexdb_base.corrupt("the sequence of column \"" + t.cols[i].name + "\"")) }
+    }
+    let d = try seqFrom(o, &old, false)
+    try txn.put(CATALOG, seqRow(&d.key), encSeq(&d))
+    seqForget(st, &d)
+    if o.restart > 0 { try restartSeq(st, &d, if o.restart == 2 { o.restartWith } else { d.start }) }
+    return Ok(Unit{})
+}
+
+// RESTART [WITH v] of sequence d: PostgreSQL's bounds errors, then as
+// setval(d, v, false).
+fn restartSeq(st: &lexdb_store.Store, d: &Seq, v: int): Result[Unit, DbErr] {
+    if v < d.min { return Err(e("22023", "RESTART value (" + v.toStr() + ") cannot be less than MINVALUE (" + d.min.toStr() + ")")) }
+    if v > d.max { return Err(e("22023", "RESTART value (" + v.toStr() + ") cannot be greater than MAXVALUE (" + d.max.toStr() + ")")) }
+    return setVal(st, d, v, false)
+}
+
 fn createSchemaStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
     if try schemaExists(st, txn, &s.table) {
-        if s.ifFlag { return Ok(tagOnly("CREATE SCHEMA")) }
+        if s.ifFlag {
+            notice(st, txn, &"42P06", &("schema \"" + s.table + "\" already exists, skipping"), &"")
+            return Ok(tagOnly("CREATE SCHEMA"))
+        }
         return Err(e("42P06", "schema \"" + s.table + "\" already exists"))
     }
     if strings.startsWith(s.table, "pg_") { return Err(e("42939", "unacceptable schema name \"" + s.table + "\"")) }
@@ -12432,7 +13216,10 @@ fn createSchemaStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb
 fn dropSchema(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
     if s.table == "public" { return Err(e("0A000", "lexdb: schema public cannot be dropped")) }
     if !(try schemaExists(st, txn, &s.table)) {
-        if s.ifFlag { return Ok(tagOnly("DROP SCHEMA")) }
+        if s.ifFlag {
+            notice(st, txn, &"00000", &("schema \"" + s.table + "\" does not exist, skipping"), &"")
+            return Ok(tagOnly("DROP SCHEMA"))
+        }
         return Err(e("3F000", "schema \"" + s.table + "\" does not exist"))
     }
     try needOwner(st, txn, &(try whoNow(st, txn)), &nspObj(&s.table), &"schema", &s.table)
@@ -12488,7 +13275,10 @@ fn createIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
     let ixKey = lexdb_sql.qual(&lexdb_sql.schemaOf(&t.name), &ixName)     // in its table's schema
     let exists = try relExists(st, txn, &ixKey)
     if exists {
-        if s.ifFlag { return Ok(tagOnly("CREATE INDEX")) }
+        if s.ifFlag {
+            notice(st, txn, &"42P07", &("relation \"" + ixName + "\" already exists, skipping"), &"")
+            return Ok(tagOnly("CREATE INDEX"))
+        }
         return Err(e("42P07", "relation \"" + s.index + "\" already exists"))
     }
     var cols: []int = []
@@ -12568,19 +13358,7 @@ fn addIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, ix
             append(mut &pks, pk)
         }
     }
-    var order: []int = array(len(ents), 0)
-    for i in 0..len(ents) { order[i] = i }
-    collections.sortBy(mut &order, fn(a: &int, b: &int): int { return ents[a].cmp(&ents[b]) })
-    for j in 0..len(order) {
-        let i = order[j]
-        if ix.unique && j > 0 {
-            let h = order[j - 1]
-            if pres[i] >= 0 && pres[h] == pres[i] && ents[i][0..pres[i]] == ents[h][0..pres[h]] {
-                return Err(e("23505", "could not create unique index \"" + lexdb_sql.baseName(&ix.name) + "\": a value is duplicated"))
-            }
-        }
-        try txn.put(ix.tree, ents[i], pks[i])
-    }
+    try fillIndex(st, txn, t, &ix, &ents, &pks, &pres)
     try txn.put(CATALOG, idxName(&ix.name), t.name)
     append(mut &t.indexes, ix)
     return Ok(Unit{})
@@ -12692,9 +13470,12 @@ fn hasConName(t: &Table, name: &str): bool {
 }
 
 // Adds constraint c to table t (its rows checked against it).
-fn addConstraint(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, c: &lexdb_sql.Constraint): Result[Unit, DbErr] {
-    if c.kind == lexdb_sql.C_CHECK { return addCheck(st, txn, t, c) }
-    if c.kind == lexdb_sql.C_FOREIGN { return addForeign(st, txn, t, c) }
+// alter: ALTER TABLE's (its CHECK and FOREIGN KEY may be NOT VALID: the
+// rows there not checked, 9.117), not CREATE TABLE's.
+fn addConstraint(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, c: &lexdb_sql.Constraint, alter: bool): Result[Unit, DbErr] {
+    let later = alter && c.notValid
+    if c.kind == lexdb_sql.C_CHECK { return addCheck(st, txn, t, c, later) }
+    if c.kind == lexdb_sql.C_FOREIGN { return addForeign(st, txn, t, c, later) }
     var cols: []int = []
     for n in c.cols {
         let i = colIndex(&t.cols, &n)
@@ -12706,7 +13487,8 @@ fn addConstraint(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Tabl
     if len(name) == 0 { name = try makeName(st, txn, t, &c.cols, &"key", true) }
     let key = lexdb_sql.qual(&lexdb_sql.schemaOf(&t.name), &name)
     if hasConName(t, &name) { return Err(e("42710", "constraint \"" + name + "\" for relation \"" + lexdb_sql.baseName(&t.name) + "\" already exists")) }
-    if try relExists(st, txn, &key) { return Err(e("42P07", "relation \"" + name + "\" already exists")) }
+    // (the key's index's name is a relation's in PostgreSQL)
+    if (hasPk(t) && pkConName(t) == name) || try relExists(st, txn, &key) { return Err(e("42P07", "relation \"" + name + "\" already exists")) }
     let ix = Index{name: key, tree: st.createTree(txn), cols: cols, unique: true, pred: None, con: true, opts: [], exprs: []}
     return addIndex(st, txn, t, ix)
 }
@@ -12715,7 +13497,8 @@ fn addConstraint(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Tabl
 
 // Adds a CHECK to table t, the rows there checked. Its columns must be
 // t's; no aggregate (a subquery or parameter the parser refused).
-fn addCheck(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, c: &lexdb_sql.Constraint): Result[Unit, DbErr] {
+// later: NOT VALID, the rows there left unchecked until VALIDATE.
+fn addCheck(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, c: &lexdb_sql.Constraint, later: bool): Result[Unit, DbErr] {
     let x = match c.expr {
         Some(v) { clone(&v) }
         None { Expr.Lit(Val.Bool(true)) }
@@ -12753,19 +13536,7 @@ fn addCheck(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, c:
         Err(bad) { if bad.state == "42804" { return Err(bad) } }
     }
     // the rows there
-    let path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: []}
-    let sc = Scan{empty: false, point: false, lo: "", hi: "", whole: false}
-    var cur = newCursor()
-    while !cur.done {
-        var batch: [][]Val = []
-        let all: []bool = []
-        try fetch(st, txn, t, &path, &sc, &all, mut &cur, mut &batch)
-        for r in batch {
-            if !(try passes(t, &ck, &r)) {
-                return Err(e("23514", "check constraint \"" + name + "\" of relation \"" + lexdb_sql.baseName(&t.name) + "\" is violated by some row"))
-            }
-        }
-    }
+    if later { append(mut &t.invalid, name) } else { try checkRows(st, txn, t, &ck) }
     append(mut &t.checks, ck)
     return Ok(Unit{})
 }
@@ -12852,7 +13623,10 @@ fn dropIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.St
             return Ok(tagOnly("DROP INDEX"))
         }
         None {
-            if s.ifFlag { return Ok(tagOnly("DROP INDEX")) }
+            if s.ifFlag {
+                notice(st, txn, &"00000", &("index \"" + lexdb_sql.shown(&s.index) + "\" does not exist, skipping"), &"")
+                return Ok(tagOnly("DROP INDEX"))
+            }
             return Err(e("42704", "index \"" + lexdb_sql.shown(&s.index) + "\" does not exist"))
         }
     }
@@ -12861,11 +13635,22 @@ fn dropIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.St
 fn checkRow(t: &Table, row: &[]Val): Result[Unit, DbErr] {
     for i in 0..len(t.cols) {
         if t.cols[i].notNull && isNull(&row[i]) {
-            return Err(e("23502", "null value in column \"" + t.cols[i].name + "\" of relation \"" + lexdb_sql.baseName(&t.name) +
-                         "\" violates not-null constraint"))
+            return Err(lexdb_base.errDetail("23502", "null value in column \"" + t.cols[i].name + "\" of relation \"" + lexdb_sql.baseName(&t.name) +
+                                            "\" violates not-null constraint", failingRow(t, row), ""))
         }
     }
     return Ok(Unit{})
+}
+
+// PostgreSQL's DETAIL for a row refused: its values, NULL as null (the
+// hidden key's left out, 9.117).
+fn failingRow(t: &Table, row: &[]Val): str {
+    var vs: []str = []
+    for i in 0..len(t.cols) {
+        if t.cols[i].name == ROWID || i >= len(row) { continue }
+        append(mut &vs, if isNull(&row[i]) { "null" } else { text(&row[i]) })
+    }
+    return "Failing row contains (" + strings.join(&vs, ", ") + ")."
 }
 
 fn dupKey(t: &Table, row: &[]Val): DbErr {
@@ -12875,8 +13660,8 @@ fn dupKey(t: &Table, row: &[]Val): DbErr {
         append(mut &names, t.cols[i].name)
         append(mut &vals, text(&row[i]))
     }
-    return e("23505", "duplicate key value violates unique constraint \"" + lexdb_sql.baseName(&t.name) + "_pkey\": Key (" +
-             strings.join(&names, ", ") + ")=(" + strings.join(&vals, ", ") + ") already exists.")
+    return lexdb_base.errDetail("23505", "duplicate key value violates unique constraint \"" + pkConName(t) + "\"",
+                                "Key (" + strings.join(&names, ", ") + ")=(" + strings.join(&vals, ", ") + ") already exists.", "")
 }
 
 fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, lim: Limits): Result[Res, DbErr] {
@@ -13112,7 +13897,9 @@ fn idDefault(t: &Table, i: int, isDef: bool, ovr: int): Result[bool, DbErr] {
     if isDef || (id != lexdb_sql.ID_ALWAYS && id != lexdb_sql.ID_BY_DEFAULT) { return Ok(false) }
     if ovr == lexdb_sql.OVR_USER { return Ok(true) }
     if id == lexdb_sql.ID_ALWAYS && ovr != lexdb_sql.OVR_SYSTEM && ovr != lexdb_sql.OVR_TSQL {
-        return Err(e("428C9", "cannot insert a non-DEFAULT value into column \"" + t.cols[i].name + "\": it is GENERATED ALWAYS AS IDENTITY (OVERRIDING SYSTEM VALUE inserts it)"))
+        return Err(lexdb_base.errDetail("428C9", "cannot insert a non-DEFAULT value into column \"" + t.cols[i].name + "\"",
+                                        "Column \"" + t.cols[i].name + "\" is an identity column defined as GENERATED ALWAYS.",
+                                        "Use OVERRIDING SYSTEM VALUE to override."))
     }
     return Ok(false)
 }
@@ -13248,7 +14035,7 @@ fn upsertOf(s: &lexdb_sql.Stmt, t: &Table, sc: mut &Scope): Result[Upsert, DbErr
             return Err(e("42P10", "there is no unique or exclusion constraint matching the ON CONFLICT specification"))
         }
     } else if s.conflictCon != "" {
-        if s.conflictCon == tname + "_pkey" { append(mut &up.arb, -1) }
+        if hasPk(t) && s.conflictCon == pkConName(t) { append(mut &up.arb, -1) }
         for i in 0..len(t.indexes) {
             if t.indexes[i].unique && lexdb_sql.baseName(&t.indexes[i].name) == s.conflictCon { append(mut &up.arb, i) }
         }
@@ -13268,7 +14055,8 @@ fn upsertOf(s: &lexdb_sql.Stmt, t: &Table, sc: mut &Scope): Result[Upsert, DbErr
         let i = colIndex(&t.cols, &set.col)
         if i < 0 { return Err(e("42703", "column \"" + set.col + "\" of relation \"" + tname + "\" does not exist")) }
         if t.cols[i].identity == lexdb_sql.ID_ALWAYS && !lexdb_sql.isDefault(&set.expr) {
-            return Err(e("428C9", "column \"" + t.cols[i].name + "\" can only be updated to DEFAULT"))
+            return Err(lexdb_base.errDetail("428C9", "column \"" + t.cols[i].name + "\" can only be updated to DEFAULT",
+                                            "Column \"" + t.cols[i].name + "\" is an identity column defined as GENERATED ALWAYS.", ""))
         }
         append(mut &up.targets, i)
         append(mut &up.sets, bpAssign(try resolve(&set.expr, &up.cols, len(up.cols), sc), &t.cols[i].typ, &up.cols))
@@ -13410,7 +14198,8 @@ fn update(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     let defs = try defaultsOf(st, txn, t)
     for k in 0..len(sets) {
         if t.cols[targets[k]].identity == lexdb_sql.ID_ALWAYS && !lexdb_sql.isDefault(&sets[k]) {
-            return Err(e("428C9", "column \"" + t.cols[targets[k]].name + "\" can only be updated to DEFAULT"))
+            return Err(lexdb_base.errDetail("428C9", "column \"" + t.cols[targets[k]].name + "\" can only be updated to DEFAULT",
+                                            "Column \"" + t.cols[targets[k]].name + "\" is an identity column defined as GENERATED ALWAYS.", ""))
         }
     }
     let fw = try fkTables(st, txn, t, true, true)
@@ -17299,6 +18088,42 @@ pub fn (s: mut &Session) close() {
     advRelease(&s.st, s.id, true)
     s.st.memoDel(&collKey(s.id))
     s.st.memoDel(&identKey(s.id))
+    s.st.memoDel(&noticeKey(s.id))
+}
+
+// ---- notices (9.117): what a statement tells the client besides its
+// result (IF EXISTS's "skipping", a rename USING INDEX makes), as
+// PostgreSQL's NOTICE messages. Kept in the store's memo under the session
+// (the executor sees its session only as Txn.sess) until the wire sends
+// them before the statement's end; a statement run again drops its first
+// try's.
+
+fn noticeKey(sess: int): str { return "nt:" + sess.toStr() }
+
+// A notice for the session running txn: SQLSTATE state (00000, or the
+// condition's own, as PostgreSQL's 42701 for ADD COLUMN IF NOT EXISTS),
+// msg, and a DETAIL ("" none).
+fn notice(st: &lexdb_store.Store, txn: &lexdb_store.Txn, state: &str, msg: &str, detail: &str) {
+    let k = noticeKey(txn.sess)
+    let was = st.memoGet(&k).unwrapOr("")
+    st.memoPut(&k, &(was + state + "\x01" + msg + "\x01" + detail + "\x00"))
+}
+
+// The session's notices, oldest first, taken: each a DbErr (its state,
+// message and detail).
+pub fn (s: &Session) takeNotices(): []DbErr {
+    var out: []DbErr = []
+    match s.st.memoGet(&noticeKey(s.id)) {
+        Some(v) {
+            s.st.memoDel(&noticeKey(s.id))
+            for one in strings.split(&v, "\x00") {
+                let f = strings.split(one, "\x01")
+                if len(f) == 3 { append(mut &out, lexdb_base.errDetail(f[0].toStr(), f[1].toStr(), f[2].toStr(), "")) }
+            }
+        }
+        None {}
+    }
+    return out
 }
 
 // Its temporary objects dropped, in a transaction of their own (tried
@@ -17942,6 +18767,7 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
     }
     if stmt.waitFor { return s.waitForRun(stmt, params, ptypes, pc) }
     var tries = 0
+    let noticesWere = s.st.memoGet(&noticeKey(s.id)).unwrapOr("")
     let lim = s.limits()                    // retries share the statement's time
     while true {
         // A SELECT runs on a snapshot: it sees one state and never conflicts.
@@ -17959,6 +18785,8 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
         var t = if snap { try s.st.beginSnapshot() } else { lexdb_store.begin() }
         s.setUp(mut &t)
         chgEnd(&s.st, s.id, false)          // (a try before that failed: its counts go, optimizer 44)
+        // (and its notices: those of the statements before kept)
+        if len(noticesWere) > 0 { s.st.memoPut(&noticeKey(s.id), &noticesWere) } else { s.st.memoDel(&noticeKey(s.id)) }
         var sent = false
         let ran = execIn(&s.st, mut &t, stmt, params, ptypes, lim, pc, input, out, pull, fn(c: &[]OutCol, r: &[]Val, ob: &OutBatch, start: bool): bool {
             let ok = sink(c, r, ob, start)
@@ -18430,14 +19258,14 @@ fn keyText(names: &[]str, vals: &[]Val): str {
 }
 
 fn notPresent(c: &Table, f: &ForeignKey, p: &Table, vals: &[]Val): DbErr {
-    return e("23503", "insert or update on table \"" + lexdb_sql.baseName(&c.name) + "\" violates foreign key constraint \"" + f.name + "\": " +
-             keyText(&f.cols, vals) + " is not present in table \"" + lexdb_sql.baseName(&p.name) + "\".")
+    return lexdb_base.errDetail("23503", "insert or update on table \"" + lexdb_sql.baseName(&c.name) + "\" violates foreign key constraint \"" + f.name + "\"",
+                                keyText(&f.cols, vals) + " is not present in table \"" + lexdb_sql.baseName(&p.name) + "\".", "")
 }
 
 fn stillRef(p: &Table, c: &Table, f: &ForeignKey, vals: &[]Val): DbErr {
-    return e("23503", "update or delete on table \"" + lexdb_sql.baseName(&p.name) + "\" violates foreign key constraint \"" + f.name +
-             "\" on table \"" + lexdb_sql.baseName(&c.name) + "\": " + keyText(&f.refCols, vals) + " is still referenced from table \"" +
-             lexdb_sql.baseName(&c.name) + "\".")
+    return lexdb_base.errDetail("23503", "update or delete on table \"" + lexdb_sql.baseName(&p.name) + "\" violates foreign key constraint \"" + f.name +
+                                "\" on table \"" + lexdb_sql.baseName(&c.name) + "\"",
+                                keyText(&f.refCols, vals) + " is still referenced from table \"" + lexdb_sql.baseName(&c.name) + "\".", "")
 }
 
 // What a statement does at its end, in order (each may add more):
@@ -18770,8 +19598,9 @@ fn fkFinish(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, fw: &[]Table, lat
 // ---- foreign keys made, dropped, renamed
 
 // Adds foreign key c to table t, the table it references naming t back.
-fn addForeign(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, c: &lexdb_sql.Constraint): Result[Unit, DbErr] {
+fn addForeign(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, c: &lexdb_sql.Constraint, later: bool): Result[Unit, DbErr] {
     let refKey = try catKey(st, txn, &c.refTable, false)
+    if later { append(mut &t.invalid, try fkName(st, txn, t, c)) }
     if refKey == t.name {
         let f = try makeFk(st, txn, t, t, c, &refKey)
         append(mut &t.fks, f)
@@ -18825,8 +19654,7 @@ fn makeFk(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, p: &Tabl
     if via == -2 {
         return Err(e("42830", "there is no unique constraint matching given keys for referenced table \"" + lexdb_sql.baseName(&p.name) + "\""))
     }
-    var name = c.name
-    if len(name) == 0 { name = try makeName(st, txn, t, &c.cols, &"fkey", false) }
+    let name = try fkName(st, txn, t, c)
     if hasConName(t, &name) { return Err(e("42710", "constraint \"" + name + "\" for relation \"" + lexdb_sql.baseName(&t.name) + "\" already exists")) }
     for j in 0..len(cols) {
         let a = &t.cols[cols[j]]
@@ -18840,8 +19668,20 @@ fn makeFk(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, p: &Tabl
     for n in c.cols { append(mut &own, n) }
     let f = ForeignKey{name: name, cols: own, ref: refKey, refCols: refCols, onDelete: c.onDelete, onUpdate: c.onUpdate,
                        deferrable: c.deferrable, deferred: c.deferred}
-    // the rows there
-    let fc = FkCols{cols: cols, refCols: rc, via: via}
+    // the rows there (NOT VALID: when validated)
+    if !hasStr(&t.invalid, &name) { try fkRows(st, txn, t, &f, p) }
+    return Ok(f)
+}
+
+// A foreign key's name: given, or made as PostgreSQL makes it.
+fn fkName(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, c: &lexdb_sql.Constraint): Result[str, DbErr] {
+    if len(c.name) > 0 { return Ok(c.name) }
+    return makeName(st, txn, t, &c.cols, &"fkey", false)
+}
+
+// The rows of t against its foreign key f to table p (23503).
+fn fkRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, f: &ForeignKey, p: &Table): Result[Unit, DbErr] {
+    let fc = fkCols(t, f, p)
     let path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: []}
     let sc = Scan{empty: false, point: false, lo: "", hi: "", whole: false}
     var cur = newCursor()
@@ -18853,10 +19693,10 @@ fn makeFk(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, p: &Tabl
             if hasNullAt(&r, &fc.cols) { continue }
             let vals = valsAt(&r, &fc.cols)
             let has = try parentHas(st, txn, p, &fc, &vals)
-            if !has { return Err(notPresent(t, &f, p, &vals)) }
+            if !has { return Err(notPresent(t, f, p, &vals)) }
         }
     }
-    return Ok(f)
+    return Ok(Unit{})
 }
 
 // Drops table t's foreign key k; the table it references no longer names t
@@ -19108,8 +19948,10 @@ fn typMin(oid: int): int {
     return -9223372036854775807 - 1
 }
 
-// A sequence's name in a string, as nextval('...') takes it: unquoted
-// parts lower-cased, "quoted" ones kept, schema.name qualified.
+// A sequence's name in a string, as nextval('...') takes it: schema.name
+// qualified, "quoted" parts unquoted. Every part is lower-cased, quoted or
+// not: lexdb matches names folded (design/lexdb-tds.md L6), so 'app."Mixed"'
+// names what CREATE SEQUENCE app."Mixed" made (9.117).
 fn nameOfText(t: &str): str {
     var parts: []str = []
     var cur = newStrBuf()
@@ -19125,6 +19967,8 @@ fn nameOfText(t: &str): str {
                 } else {
                     quoted = false
                 }
+            } else if c >= 'A' && c <= 'Z' {
+                cur.addByte(byte(c + 32))
             } else {
                 cur.addByte(c)
             }
@@ -19229,11 +20073,24 @@ fn memoNext(d: &Seq): str { return "sn:" + d.id }
 fn memoLast(d: &Seq): str { return "sl:" + d.id }
 fn memoBusy(d: &Seq): str { return "sb:" + d.id }
 
-// What follows n ("e" past its bounds).
+// What follows n ("e" past its bounds). No sum overflows (an overflow
+// stops the server, 9.116): n + inc is made only once it is known to be
+// within the bounds (9.117).
 fn seqAfter(d: &Seq, n: int): str {
-    if d.inc > 0 && n > d.max - d.inc { return "e" }
-    if d.inc < 0 && n < d.min - d.inc { return "e" }
+    if d.inc > 0 && (n > d.max || span(d.max, n) < d.inc) { return "e" }
+    if d.inc < 0 && (n < d.min || d.inc == INT_MIN || span(n, d.min) < 0 - d.inc) { return "e" }
     return (n + d.inc).toStr()
+}
+
+const INT_MAX: int = 9223372036854775807
+const INT_MIN: int = -9223372036854775807 - 1
+
+// hi - lo, for hi >= lo, at most the largest integer: it overflows only when
+// they are of opposite signs and more than that apart.
+fn span(hi: int, lo: int): int {
+    if (hi >= 0) == (lo >= 0) { return hi - lo }
+    if hi - INT_MAX > lo { return INT_MAX }
+    return hi - lo
 }
 
 // Waits while a block of sequence d is being written, then marks one.
@@ -19322,16 +20179,13 @@ fn nextVal(st: &lexdb_store.Store, d: &Seq): Result[int, DbErr] {
         }
         st.memoPut(&memoBusy(d), &"1")
         let steps = (if d.cache > 32 { d.cache } else { 32 }) - 1
-        var room = steps
-        // max - n (min's distance, n - min) overflows only when they are of
-        // opposite signs and more than the largest integer apart: room then
-        // stays steps (the guards' own sums overflowed when max < 0 or
-        // min > 0)
-        if d.inc > 0 {
-            if !(n < 0 && d.max >= 0 && d.max - 9223372036854775807 > n) { room = (d.max - n) / d.inc }
-        } else {
-            if !(n > 0 && d.min < 0 && d.min + 9223372036854775807 < n) { room = (n - d.min) / (0 - d.inc) }
-        }
+        // the steps left before the bound: n's distance to it over the
+        // increment, each by span (the guards' own sums overflowed when
+        // max < 0 or min > 0, 9.116; a distance over the largest integer,
+        // or an increment of the smallest, 9.117). inc times them stays
+        // within the distance, so no product or sum overflows
+        var room = 0
+        if d.inc > 0 { room = span(d.max, n) / d.inc } else if d.inc != INT_MIN { room = span(n, d.min) / (0 - d.inc) }
         let hi = n + d.inc * (if room < steps { room } else { steps })
         let w = seqWrite(st, d, hi)
         st.memoDel(&memoBusy(d))
@@ -19356,7 +20210,10 @@ fn setVal(st: &lexdb_store.Store, d: &Seq, v: int, called: bool): Result[Unit, D
     var next = seqAfter(d, v)
     if !called {
         next = v.toStr()
-        last = v - d.inc
+        // (v itself where v - inc would be past the integers, 9.117)
+        last = v
+        if d.inc > 0 && span(v, INT_MIN) >= d.inc { last = v - d.inc }
+        if d.inc < 0 && d.inc != INT_MIN && span(INT_MAX, v) >= 0 - d.inc { last = v - d.inc }
         if (d.inc > 0 && v == typMin(d.typ)) || (d.inc < 0 && v == typMax(d.typ)) { last = v }
     }
     let w = seqWrite(st, d, last)
@@ -19388,6 +20245,73 @@ fn seqForget(st: &lexdb_store.Store, d: &Seq) {
     st.memoPut(&memoLast(d), &"")
 }
 
+// ---- a sequence read as a relation (9.117): SELECT last_value, log_cnt,
+// is_called FROM s, as PostgreSQL's one row.
+
+// The mark of a sequence's view (Table.view): then its catalog key.
+const SEQ_REL: str = "\x00seq:"
+
+// A table standing for sequence d in FROM: a view whose query is its row.
+fn seqRelation(d: &Seq): Table {
+    var t = emptyTable(d.key)
+    t.tree = -1
+    t.view = SEQ_REL + d.key
+    let i8 = lexdb_sql.TypeName{kind: lexdb_sql.K_INT, oid: lexdb_sql.OID_INT8, prec: 0, scale: 0, len: 0}
+    append(mut &t.cols, lexdb_sql.colDef("last_value", i8, true))
+    append(mut &t.cols, lexdb_sql.colDef("log_cnt", i8, true))
+    append(mut &t.cols, lexdb_sql.colDef("is_called", lexdb_sql.TypeName{kind: lexdb_sql.K_BOOL, oid: lexdb_sql.OID_BOOL, prec: 0, scale: 0, len: 0}, true))
+    return t
+}
+
+// Sequence d's row: its last value given (by any session) and is_called;
+// after setval(..., false) or RESTART the next, not called; not used since
+// the store opened, the last value written (as PostgreSQL's after a
+// restart), or its start. log_cnt: the values left of the block written
+// ahead (PostgreSQL's values logged ahead; the same for its first 32
+// values from its start, it differs after).
+fn seqState(st: &lexdb_store.Store, d: &Seq): Result[[]Val, DbErr] {
+    let gv = st.memoGet(&memoGiven(d)).unwrapOr("")
+    let nv = st.memoGet(&memoNext(d)).unwrapOr("")
+    let lv = st.memoGet(&memoLast(d)).unwrapOr("")
+    if len(gv) > 0 && len(nv) > 0 {
+        let g = num(&gv)
+        var left = 0
+        if len(lv) > 0 && d.inc != 0 {
+            let l = num(&lv)
+            // (no overflow: both of one sign, or each within half the range)
+            if (l >= 0) == (g >= 0) || (l < 4611686018427387904 && l > -4611686018427387904 && g < 4611686018427387904 && g > -4611686018427387904) {
+                left = (l - g) / d.inc + 1
+            }
+        }
+        if left < 0 { left = 0 }
+        return Ok([Val.Int(g), Val.Int(left), Val.Bool(true)])
+    }
+    if len(nv) > 0 && nv != "e" { return Ok([Val.Int(num(&nv)), Val.Int(0), Val.Bool(false)]) }
+    var t = lexdb_store.begin()
+    let tree = seqTree(st, mut &t)
+    var got: Option[str] = None
+    match tree {
+        Ok(tr) {
+            match st.get(mut &t, tr, d.id) {
+                Ok(x) { got = x }
+                Err(x) {
+                    st.abort(t)
+                    return Err(x)
+                }
+            }
+        }
+        Err(x) {
+            st.abort(t)
+            return Err(x)
+        }
+    }
+    st.abort(t)
+    match got {
+        Some(v) { return Ok([Val.Int(num(&v)), Val.Int(0), Val.Bool(true)]) }
+        None { return Ok([Val.Int(d.start), Val.Int(0), Val.Bool(false)]) }
+    }
+}
+
 // ---- the session's side: currval, lastval, and the names its statement binds
 
 fn curKey(sess: int, d: &Seq): str { return "cv:" + sess.toStr() + ":" + d.id }
@@ -19416,6 +20340,21 @@ fn bindSeqs(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, names: &[]str): R
             continue
         }
         if n == lexdb_sql.SET_MARK { continue }
+        if strings.startsWith(&n, lexdb_sql.SERIAL_MARK) {
+            // pg_get_serial_sequence('t', 'c'): bound as the name it gives
+            let tc = n[len(lexdb_sql.SERIAL_MARK)..len(n)]
+            let z = strings.indexOf(&tc, "\x00", 0)
+            let found = try findTable(st, txn, &nameOfText(&tc[0..z]))
+            if found.isNone() { continue }
+            let t = found.unwrap()
+            let ci = colIndex(&t.cols, &strings.toLowerAscii(tc[z + 1..len(tc)].toStr()))
+            if ci < 0 || len(t.cols[ci].seq) == 0 { continue }
+            match try st.get(txn, CATALOG, seqRow(&t.cols[ci].seq)) {
+                Some(v) { st.memoPut(&bindKey(txn.sess, &seqShown(&t.cols[ci].seq)), &(no.toStr() + "\n" + v)) }
+                None {}
+            }
+            continue
+        }
         if strings.startsWith(&n, lexdb_sql.TYPE_MARK) {
             // a type of the user's the statement names (9.90)
             let key = n[len(lexdb_sql.TYPE_MARK)..len(n)]
@@ -19436,6 +20375,10 @@ fn bindSeqs(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, names: &[]str): R
     }
     return Ok(Unit{})
 }
+
+// A sequence's key as pg_get_serial_sequence gives it: schema.name, each
+// quoted where need be.
+fn seqShown(k: &str): str { return quoteIfNeeded(&lexdb_sql.schemaOf(k)) + "." + quoteIfNeeded(&lexdb_sql.baseName(k)) }
 
 // The sequence a call names, as its statement bound it.
 fn boundSeq(q: &SeqEnv, name: &str, f: &str): Result[Seq, DbErr] {
@@ -19603,7 +20546,9 @@ fn seqCall(name: &str, vs: &[]Val, env: &Env): Result[Val, DbErr] {
 fn isVolatile(x: &Expr): bool {
     match x {
         Expr.Call(n, args, _) {
-            if isSeqFn(&n) || isAdvFn(&n) { return true }
+            // (and those whose every call differs: a default of one is made
+            // per row, 9.117)
+            if isSeqFn(&n) || isAdvFn(&n) || n == "gen_random_uuid" || n == "random" || n == "clock_timestamp" { return true }
             for a in args { if isVolatile(&a) { return true } }
             return false
         }
@@ -19702,7 +20647,10 @@ fn defAt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, d: &Defs, t: &Table,
 fn createSeq(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
     let key = try createKey(st, txn, &s.table, s.temp)
     if try relExists(st, txn, &key) {
-        if s.ifFlag { return Ok(tagOnly("CREATE SEQUENCE")) }
+        if s.ifFlag {
+            notice(st, txn, &"42P07", &("relation \"" + lexdb_sql.baseName(&key) + "\" already exists, skipping"), &"")
+            return Ok(tagOnly("CREATE SEQUENCE"))
+        }
         return Err(e("42P07", "relation \"" + lexdb_sql.baseName(&key) + "\" already exists"))
     }
     try needCreate(st, txn, &key)
@@ -19739,20 +20687,122 @@ fn ownSeq(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, d: mut &Seq, owned:
 fn alterSeq(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
     let found = try findSeq(st, txn, &s.table)
     if found.isNone() {
-        if s.ifFlag { return Ok(tagOnly("ALTER SEQUENCE")) }
+        if s.ifFlag {
+            notice(st, txn, &"00000", &("relation \"" + lexdb_sql.shown(&s.table) + "\" does not exist, skipping"), &"")
+            return Ok(tagOnly("ALTER SEQUENCE"))
+        }
         return Err(e("42P01", "relation \"" + lexdb_sql.shown(&s.table) + "\" does not exist"))
     }
     let old = found.unwrap()
     try needRelOwner(st, txn, &old.key, &"sequence")
+    if len(s.alters) > 0 { return moveSeq(st, txn, &old, &s.alters[0]) }
     var d = try seqFrom(&s.seq, &old, false)
     if len(s.seq.owned) == 2 { try ownSeq(st, txn, mut &d, &s.seq.owned) }
     try txn.put(CATALOG, seqRow(&d.key), encSeq(&d))
     seqForget(st, &d)
-    if s.seq.restart > 0 {
-        try setVal(st, &d, if s.seq.restart == 2 { s.seq.restartWith } else { d.start }, false)
-    }
+    if s.seq.restart > 0 { try restartSeq(st, &d, if s.seq.restart == 2 { s.seq.restartWith } else { d.start }) }
     try bumpFor(st, txn, &d.key)
     return Ok(tagOnly("ALTER SEQUENCE"))
+}
+
+// ALTER SEQUENCE ... RENAME TO name or SET SCHEMA name (9.117): its catalog
+// row under its new key (its id, so its values, kept), its owner column's
+// default, and the defaults naming it in their text (PostgreSQL binds them
+// by OID, so they follow it).
+fn moveSeq(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, old: &Seq, a: &lexdb_sql.Alter): Result[Res, DbErr] {
+    let base = lexdb_sql.baseName(&old.key)
+    var key = lexdb_sql.qual(&lexdb_sql.schemaOf(&old.key), &a.name)
+    if a.kind == lexdb_sql.A_SET_SCHEMA {
+        if tempRel(&old.key) || a.name == "pg_temp" || lexdb_base.isTempSchema(&a.name) { return Err(e("0A000", "cannot move objects into or out of temporary schemas")) }
+        if !(try schemaExists(st, txn, &a.name)) { return Err(e("3F000", "schema \"" + a.name + "\" does not exist")) }
+        key = lexdb_sql.qual(&a.name, &base)
+        if key != old.key && len(old.ownerT) > 0 {
+            return Err(lexdb_base.errDetail("0A000", "cannot move an owned sequence into another schema",
+                                            "Sequence \"" + base + "\" is linked to table \"" + lexdb_sql.baseName(&old.ownerT) + "\".", ""))
+        }
+    }
+    if key == old.key { return Ok(tagOnly("ALTER SEQUENCE")) }
+    if try relExists(st, txn, &key) {
+        if a.kind == lexdb_sql.A_SET_SCHEMA { return Err(e("42P07", "relation \"" + base + "\" already exists in schema \"" + a.name + "\"")) }
+        return Err(e("42P07", "relation \"" + a.name + "\" already exists"))
+    }
+    var d = seqCopy(old)
+    txn.del(CATALOG, seqRow(&old.key))
+    try moveAcl(st, txn, &relObj(&old.key), &relObj(&key))
+    d.key = key
+    try txn.put(CATALOG, seqRow(&key), encSeq(&d))
+    // the tables whose columns take it: their own (serial, identity) or a
+    // default naming it
+    var tabs = try seenTables(st, txn)
+    while len(tabs) > 0 {
+        var t = pop(mut &tabs)
+        var changed = false
+        for i in 0..len(t.cols) {
+            if t.cols[i].seq == old.key {
+                t.cols[i].seq = key
+                changed = true
+            }
+            var nd: Option[Expr] = None
+            match t.cols[i].def {
+                Some(x) { if namesSeq(&x, &old.key) { nd = Some(seqRenamed(&x, &old.key, &key)) } }
+                None {}
+            }
+            if nd.isSome() {
+                t.cols[i].def = nd
+                changed = true
+            }
+        }
+        if changed { try putTable(txn, &t) }
+    }
+    try bumpFor(st, txn, &key)
+    return Ok(tagOnly("ALTER SEQUENCE"))
+}
+
+// Whether x calls a sequence function on the sequence of key k (its name
+// as a literal).
+fn namesSeq(x: &Expr, k: &str): bool {
+    var ns: []str = []
+    seqNamesOf(x, mut &ns)
+    for n in ns { if nameOfText(&n) == k { return true } }
+    return false
+}
+
+// x with its sequence functions' literal names of sequence from naming to.
+fn seqRenamed(x: &Expr, from: &str, to: &str): Expr {
+    match x {
+        Expr.Call(f, args, star) {
+            var xs: []Expr = []
+            for k in 0..len(args) {
+                var done = false
+                if k == 0 && (f == "nextval" || f == "currval" || f == "setval") {
+                    match lexdb_sql.litText(&args[0]) {
+                        Some(n) {
+                            if nameOfText(&n) == from {
+                                append(mut &xs, Expr.Lit(Val.Text(seqText(to))))
+                                done = true
+                            }
+                        }
+                        None {}
+                    }
+                }
+                if !done { append(mut &xs, seqRenamed(&args[k], from, to)) }
+            }
+            return Expr.Call(f, xs, star)
+        }
+        Expr.Unary(op, a) { return Expr.Unary(op, seqRenamed(&a, from, to)) }
+        Expr.Bin(op, a, b) { return Expr.Bin(op, seqRenamed(&a, from, to), seqRenamed(&b, from, to)) }
+        Expr.IsNull(a, neg) { return Expr.IsNull(seqRenamed(&a, from, to), neg) }
+        Expr.Cast(a, ty) { return Expr.Cast(seqRenamed(&a, from, to), ty) }
+        else { return clone(x) }
+    }
+}
+
+// A sequence's key as nextval's text names it: schema.name, quoted where
+// need be (public's unqualified).
+fn seqText(k: &str): str {
+    let b = quoteIfNeeded(&lexdb_sql.baseName(k))
+    if !lexdb_sql.isQual(k) { return b }
+    return quoteIfNeeded(&lexdb_sql.schemaOf(k)) + "." + b
 }
 
 // Sequence d's rows deleted (its definition and last value).
@@ -19766,10 +20816,21 @@ fn dropSeqRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, d: &Seq): Resu
 // DROP SEQUENCE: refused while it is a column's (its default), unless
 // CASCADE, which takes the column's default away.
 fn dropSeq(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
-    let found = try findSeq(st, txn, &s.table)
+    // DROP SEQUENCE a, b, ...: each in turn (9.117)
+    var all = [s.table]
+    for n in s.names { append(mut &all, n) }
+    for n in all { try dropOneSeq(st, txn, s, &n) }
+    return Ok(tagOnly("DROP SEQUENCE"))
+}
+
+fn dropOneSeq(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, name: &str): Result[Res, DbErr] {
+    let found = try findSeq(st, txn, name)
     if found.isNone() {
-        if s.ifFlag { return Ok(tagOnly("DROP SEQUENCE")) }
-        return Err(e("42P01", "sequence \"" + lexdb_sql.shown(&s.table) + "\" does not exist"))
+        if s.ifFlag {
+            notice(st, txn, &"00000", &("sequence \"" + lexdb_sql.shown(name) + "\" does not exist, skipping"), &"")
+            return Ok(tagOnly("DROP SEQUENCE"))
+        }
+        return Err(e("42P01", "sequence \"" + lexdb_sql.shown(name) + "\" does not exist"))
     }
     let d = found.unwrap()
     try needRelOwner(st, txn, &d.key, &"sequence")
@@ -26225,6 +27286,7 @@ type CatCon = record {
     check: str              // a CHECK's expression, as PostgreSQL shows it
     deferrable: bool
     deferred: bool
+    valid: bool             // convalidated: false for a CHECK or foreign key added NOT VALID (9.117)
 }
 
 type CatSnap = record {
@@ -26418,6 +27480,13 @@ fn pgExprText(x: &Expr, typ: &Option[lexdb_sql.TypeName]): str {
             if strings.contains(n, " ") || strings.startsWith(n, "#") || strings.startsWith(n, "case") { return lexdb_sql.exprText(x) }
             var parts: []str = []
             for a in args { append(mut &parts, pgExprText(&a, &none)) }
+            // a sequence function's name: a regclass, as PostgreSQL keeps it (9.117)
+            if n == "nextval" || n == "currval" || n == "setval" {
+                match lexdb_sql.litText(&args[0]) {
+                    Some(t) { parts[0] = "'" + strings.replaceAll(&t, "'", "''") + "'::regclass" }
+                    None {}
+                }
+            }
             let shownName = if n == "coalesce" || n == "nullif" || n == "greatest" || n == "least" { strings.toUpperAscii(n) } else { n }
             return shownName + "(" + strings.join(&parts, ", ") + ")"
         }
@@ -26483,7 +27552,7 @@ fn catSnap(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[CatSnap, D
         if len(t.pk) > 0 && !rowidKeyed(&t) {
             var cs: []int = []
             for p in t.pk { append(mut &cs, p + 1) }
-            let pn = name + "_pkey"
+            let pn = pkConName(&t)
             append(mut &idxs, CatIdx{name: pn, oid: catOid(&"i", &lexdb_sql.qual(&schema, &pn)), cols: cs, unique: true, primary: true,
                                      con: true, pred: None, opts: [], exprs: []})
         }
@@ -26512,7 +27581,7 @@ fn catSnap(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[CatSnap, D
             let def = (if ix.primary { "PRIMARY KEY (" } else { "UNIQUE (" }) + colList(&ct.t, &ix.cols) + ")"
             append(mut &cons, CatCon{oid: catOid(&"c", &(ct.key + "\x00" + ix.name)), name: ix.name, typ: ty, rel: ct.oid,
                                           schema: ct.schema, cols: copyInts(&ix.cols), refRel: 0, refCols: [], idx: ix.oid, def: def,
-                                          upd: " ", del: " ", check: "", deferrable: false, deferred: false})
+                                          upd: " ", del: " ", check: "", deferrable: false, deferred: false, valid: true})
         }
         for fk in ct.t.fks {
             var cs: []int = []
@@ -26549,9 +27618,11 @@ fn catSnap(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[CatSnap, D
             if del != "a" { def = def + " ON DELETE " + fkActionText(&del) }
             if fk.deferrable { def = def + " DEFERRABLE" }
             if fk.deferred { def = def + " INITIALLY DEFERRED" }
+            let fvalid = !hasStr(&ct.t.invalid, &fk.name)
+            if !fvalid { def = def + " NOT VALID" }
             append(mut &cons, CatCon{oid: catOid(&"c", &(ct.key + "\x00" + fk.name)), name: fk.name, typ: "f", rel: ct.oid,
                                           schema: ct.schema, cols: cs, refRel: refRel, refCols: refCols, idx: refIdx, def: def,
-                                          upd: upd, del: del, check: "", deferrable: fk.deferrable, deferred: fk.deferred})
+                                          upd: upd, del: del, check: "", deferrable: fk.deferrable, deferred: fk.deferred, valid: fvalid})
         }
         for ck in ct.t.checks {
             let none: Option[lexdb_sql.TypeName] = None
@@ -26566,23 +27637,30 @@ fn catSnap(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[CatSnap, D
                 for n in used { if n == ct.t.cols[i].name { uses = true } }
                 if uses { append(mut &ccols, colNum(&ct.t, &ct.t.cols[i].name)) }
             }
+            let cvalid = !hasStr(&ct.t.invalid, &ck.name)
             append(mut &cons, CatCon{oid: catOid(&"c", &(ct.key + "\x00" + ck.name)), name: ck.name, typ: "c", rel: ct.oid,
-                                          schema: ct.schema, cols: ccols, refRel: 0, refCols: [], idx: 0, def: "CHECK (" + body + ")",
-                                          upd: " ", del: " ", check: body, deferrable: false, deferred: false})
+                                          schema: ct.schema, cols: ccols, refRel: 0, refCols: [], idx: 0,
+                                          def: "CHECK (" + body + ")" + (if cvalid { "" } else { " NOT VALID" }),
+                                          upd: " ", del: " ", check: body, deferrable: false, deferred: false, valid: cvalid})
         }
     }
     snap.cons = cons
     return Ok(snap)
 }
 
-fn idxDef(ct: &CatTab, ix: &CatIdx): str {
+fn idxDef(ct: &CatTab, ix: &CatIdx): str { return idxDefOn(ct, ix, &(quoteIfNeeded(&ct.schema) + "." + quoteIfNeeded(&ct.name)), false) }
+
+// The index's definition on table on as written; pretty, pg_get_indexdef's
+// pretty form (the table as the path shows it, its predicate's outer
+// parentheses dropped: 9.117).
+fn idxDefOn(ct: &CatTab, ix: &CatIdx, on: &str, pretty: bool): str {
     var d = "CREATE " + (if ix.unique { "UNIQUE " } else { "" }) + "INDEX " + quoteIfNeeded(&ix.name) + " ON " +
-            quoteIfNeeded(&ct.schema) + "." + quoteIfNeeded(&ct.name) + " USING btree (" + colOpts(&ct.t, ix) + ")"
+            on + " USING btree (" + colOpts(&ct.t, ix) + ")"
     match ix.pred {
         Some(p) {
             let none: Option[lexdb_sql.TypeName] = None
             let x = pgExprText(&p, &none)
-            d = d + " WHERE " + (if strings.startsWith(&x, "(") { x } else { "(" + x + ")" })
+            d = d + " WHERE " + (if pretty { unwrapParens(&x) } else if strings.startsWith(&x, "(") { x } else { "(" + x + ")" })
         }
         None {}
     }
@@ -26636,7 +27714,7 @@ fn bindCatalog(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[Unit, 
             b.add("r\t" + ix.oid.toStr() + "\t" + shownIn(&snap.path, &ct.schema, &ix.name) + "\t" + ct.schema + "\t" + ix.name + "\n")
             var cols: []str = []
             for c in ix.cols { append(mut &cols, if c >= 1 && c <= len(ct.t.cols) { ct.t.cols[c - 1].name } else { "" }) }
-            b.add("x\t" + ix.oid.toStr() + "\t" + clean(&idxDef(&ct, &ix)) + "\t" + strings.join(&cols, "\x1e") + "\n")
+            b.add("x\t" + ix.oid.toStr() + "\t" + clean(&idxDef(&ct, &ix)) + "\t" + strings.join(&cols, "\x1e") + "\t" + clean(&idxDefOn(&ct, &ix, &ct.shown, true)) + "\n")
         }
         for c in ct.t.cols {
             if len(c.seq) > 0 && c.name != ROWID {
@@ -28292,9 +29370,11 @@ fn callCat(name: &str, vs: &[]Val, se: &SeqEnv): Result[Option[Val], DbErr] {
         let pretty = n == 2 && truth(&vs[1]) == Some(true)
         for l in catLines(se, &"c") {
             if l[0] != k { continue }
-            // pretty: CHECK (x), not CHECK ((x))
-            if pretty && strings.startsWith(&l[1], "CHECK (") && strings.endsWith(&l[1], ")") {
-                return Ok(Some(Val.Text("CHECK (" + unwrapParens(&l[1][7..len(l[1]) - 1]) + ")")))
+            // pretty: CHECK (x), not CHECK ((x)) (and NOT VALID after it, 9.117)
+            let nv = strings.endsWith(&l[1], " NOT VALID")
+            let d = if nv { l[1][0..len(l[1]) - 10] } else { l[1] }
+            if pretty && strings.startsWith(&d, "CHECK (") && strings.endsWith(&d, ")") {
+                return Ok(Some(Val.Text("CHECK (" + unwrapParens(&d[7..len(d) - 1]) + ")" + (if nv { " NOT VALID" } else { "" }))))
             }
             return Ok(Some(Val.Text(l[1])))
         }
@@ -28303,9 +29383,10 @@ fn callCat(name: &str, vs: &[]Val, se: &SeqEnv): Result[Option[Val], DbErr] {
     if name == "pg_get_indexdef" && (n == 1 || n == 3) {
         let k = oidArg(&vs[0]).unwrapOr(0).toStr()
         let col = if n == 3 { oidArg(&vs[1]).unwrapOr(0) } else { 0 }
+        let pretty = n == 3 && truth(&vs[2]) == Some(true)
         for l in catLines(se, &"x") {
             if l[0] != k { continue }
-            if col == 0 { return Ok(Some(Val.Text(l[1]))) }
+            if col == 0 { return Ok(Some(Val.Text(if pretty && len(l) > 3 { l[3] } else { l[1] }))) }
             let cs = strings.split(&l[2], "\x1e")
             if col <= len(cs) { return Ok(Some(Val.Text(quoteIfNeeded(&cs[col - 1])))) }
             return Ok(Some(Val.Text("")))
@@ -28554,7 +29635,7 @@ fn catRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &str): Result
         "pg_constraint" {
             for c in snap.cons {
                 let isF = c.typ == "f"
-                append(mut &rows, [iv(c.oid), tv(&c.name), iv(nspOid(&c.schema)), tv(&c.typ), bv(c.deferrable), bv(c.deferred), bv(true), iv(c.rel),
+                append(mut &rows, [iv(c.oid), tv(&c.name), iv(nspOid(&c.schema)), tv(&c.typ), bv(c.deferrable), bv(c.deferred), bv(c.valid), iv(c.rel),
                                    iv(0), iv(c.idx), iv(0), iv(c.refRel), tv(&c.upd), tv(&c.del), tv(&if isF { "s" } else { " " }),
                                    bv(true), iv(0), bv(false), if c.typ == "c" && len(c.cols) == 0 { Val.Null } else { intsArr(&c.cols) },
                                    if isF { intsArr(&c.refCols) } else { Val.Null }, Val.Null, Val.Null, Val.Null, Val.Null, Val.Null,
@@ -30130,7 +31211,10 @@ fn roleStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
         for c in s.cols {
             let had = (try st.get(txn, CATALOG, roleKey(&c.name))).isSome()
             if !had {
-                if s.ifFlag { continue }
+                if s.ifFlag {
+                    notice(st, txn, &"00000", &("role \"" + c.name + "\" does not exist, skipping"), &"")
+                    continue
+                }
                 return Err(e("42704", "role \"" + c.name + "\" does not exist"))
             }
             if c.name == me { return Err(e("55006", "current user cannot be dropped")) }
@@ -30247,6 +31331,13 @@ fn decView(name: str, s: &str): Table {
 
 // A view's query, parsed to be planned where the view is used.
 fn viewQuery(t: &Table): Result[lexdb_sql.Stmt, DbErr] {
+    if strings.startsWith(&t.view, SEQ_REL) {
+        // a sequence's row: made by the executor, as a catalog relation's
+        var q = lexdb_sql.newStmt(lexdb_sql.S_SELECT)
+        q.srf = "#" + t.view
+        q.use = lexdb_sql.SUB_FROM
+        return Ok(q)
+    }
     var ss = try lexdb_sql.parseView(&t.view)
     if len(ss) != 1 || ss[0].kind != lexdb_sql.S_SELECT { return Err(lexdb_base.corrupt("the query of view \"" + t.name + "\"")) }
     var q = pop(mut &ss)
@@ -30262,7 +31353,10 @@ fn notView(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, name: &str, what: 
                 return Err(e("0A000", "cannot " + what + " view \"" + lexdb_sql.shown(name) + "\" (lexdb's views are read-only)"))
             }
         }
-        None {}
+        None {
+            // a sequence (9.117)
+            if (try findSeq(st, txn, name)).isSome() { return Err(e("42809", "cannot change sequence \"" + lexdb_sql.shown(name) + "\"")) }
+        }
     }
     return Ok(Unit{})
 }
@@ -30456,6 +31550,7 @@ fn dropView(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
             }
             None {
                 if !s.ifFlag { return Err(e("42P01", "view \"" + lexdb_sql.shown(&c.name) + "\" does not exist")) }
+                notice(st, txn, &"00000", &("view \"" + lexdb_sql.shown(&c.name) + "\" does not exist, skipping"), &"")
             }
         }
     }
@@ -30468,7 +31563,10 @@ fn dropView(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
 fn alterView(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
     let found = try findTable(st, txn, &s.table)
     if found.isNone() {
-        if s.ifFlag { return Ok(tagOnly("ALTER VIEW")) }
+        if s.ifFlag {
+            notice(st, txn, &"00000", &("relation \"" + lexdb_sql.shown(&s.table) + "\" does not exist, skipping"), &"")
+            return Ok(tagOnly("ALTER VIEW"))
+        }
         return Err(e("42P01", "relation \"" + lexdb_sql.shown(&s.table) + "\" does not exist"))
     }
     let t = found.unwrap()

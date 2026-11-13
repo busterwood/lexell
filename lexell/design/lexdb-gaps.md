@@ -55,7 +55,11 @@ feature.
   - index options and `CONCURRENTLY` (9.85);
   - temporary tables, sequences and views, `ON COMMIT`, `DISCARD TEMP`
     and `ALL`, each session's `pg_temp_N` searched first; their DDL does
-    not disturb other sessions (9.96).
+    not disturb other sessions (9.96);
+  - ALTER TABLE: primary keys added, dropped and changed (USING INDEX
+    too), ALTER COLUMN's identity forms, serial and identity columns added
+    over rows, NOT VALID and VALIDATE, RENAME CONSTRAINT, and PostgreSQL's
+    notices for the IF [NOT] EXISTS forms (9.117).
 - **Queries:**
   - `VALUES` as a query;
   - `~` and its kin;
@@ -138,28 +142,33 @@ In three tiers, by how soon a real application meets the gap.
 ### 2.2 Tier 2: common, each with a workaround
 
 - **Sequences and identity columns** (probed against PostgreSQL 18,
-  2026-11-13).
+  2026-11-13; the gaps found closed in 9.117).
   - **What matches:** nextval, currval, lastval and setval; the options,
     cycling, the types' bounds and RESTART; serial; identity ALWAYS and BY
     DEFAULT with options; OVERRIDING; `pg_get_serial_sequence`; nextval
     not rolled back; OWNED BY and its drop; `pg_sequences`,
     `pg_sequence` and `information_schema.sequences`; TRUNCATE RESTART
-    IDENTITY.
-  - **What is missing:**
-    - `ALTER TABLE ... ALTER COLUMN` identity forms (`ADD GENERATED ...
-      AS IDENTITY`, `SET GENERATED`, `RESTART`, `DROP IDENTITY`), which
-      migration tools use;
-    - `ADD COLUMN ... serial` (or identity) on a table with rows (0A000);
-    - reading a sequence as a relation (`SELECT last_value, is_called
-      FROM s`);
-    - `ALTER SEQUENCE` RENAME, OWNER and SET SCHEMA;
-    - `DROP SEQUENCE a, b`;
-    - nextval of a quoted, schema-qualified name (`'app."Mixed"'`).
-  - **Differences:** the GENERATED ALWAYS error's text (its SQLSTATE,
-    428C9, matches).
+    IDENTITY. Since 9.117:
+    - ALTER COLUMN's identity forms (`ADD GENERATED ... AS IDENTITY`,
+      `SET GENERATED`, `SET` options, `RESTART`, `DROP IDENTITY [IF
+      EXISTS]`);
+    - serial, identity and volatile defaults added over rows;
+    - a sequence read as a relation;
+    - `ALTER SEQUENCE` RENAME and SET SCHEMA, and `DROP SEQUENCE a, b`;
+    - nextval of a quoted, schema-qualified name;
+    - `setval(pg_get_serial_sequence(...), ...)` (Django's reset);
+    - the GENERATED ALWAYS error's text, DETAIL and HINT;
+    - arithmetic at the integers' ends.
+  - **Differences:**
+    - `log_cnt` is PostgreSQL's only for a sequence's first 32 values;
+    - a column filled over rows of a keyed table goes in key order, where
+      PostgreSQL's is physical order;
+    - RESTART takes effect at once, even in a block rolled back.
 - **Tables:**
-  - `ADD PRIMARY KEY` on a table made without one (a table's key cannot
-    change, 9.88);
+  - a primary key added, dropped or changed rewrites the table (9.117):
+    1M rows take 5 s where PostgreSQL builds an index in 0.15 s;
+  - PostgreSQL 18's NOT NULL constraints are not listed in `pg_constraint`
+    (contype n);
   - generated columns;
   - materialized views;
   - views are read-only, and a rename of a table one reads is refused
@@ -231,7 +240,8 @@ In three tiers, by how soon a real application meets the gap.
   in 9.92, and `percent_rank`'s type in 9.94.
 - **Errors:**
   - DETAIL and HINT are folded into the message rather than sent as their
-    own fields;
+    own fields, except for the errors 9.117 gave their own (key and unique
+    violations, foreign keys, NOT NULL, identity, a drop refused);
   - no error position is sent, so psql shows no `LINE` and caret.
 - **Memory:**
   - a query that sorts, groups or uses a window is made whole before it
