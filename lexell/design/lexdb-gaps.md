@@ -167,6 +167,18 @@ In three tiers, by how soon a real application meets the gap.
 - **Collations:** `COLLATE` is read and ignored; text compares by bytes.
 - **Date input:** a day or month of one digit (`'2024-01-2'`) is refused
   (22007); PostgreSQL reads it. Found writing `exec_batchjoin` (9.102).
+- **Differences from PostgreSQL 18,** found by 9.108's comparison
+  (2026-11-13), all older than 9.108:
+  - `upper`, `lower` and `initcap` change ASCII letters only (`été` gives
+    `éTé`; PostgreSQL gives `ÉTÉ` in a UTF-8 database);
+  - `round(NULL, 1)` gives 42883 ("function round with 2 arguments does
+    not exist") where PostgreSQL gives NULL;
+  - numeric division gives 16 decimal places where PostgreSQL gives up to
+    20 (its `select_div_scale` rule);
+  - `'abcdef'::varchar(3)` gives 22001; PostgreSQL truncates an explicit
+    cast to the length (an assignment, an INSERT, is what errors);
+  - a numeric overflow's message carries PostgreSQL's DETAIL line in the
+    message itself.
 - **Privileges** (9.83):
   - column privileges;
   - `WITH GRANT OPTION`;
