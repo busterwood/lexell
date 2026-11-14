@@ -11797,3 +11797,239 @@ SELECT seq, subject, payload FROM events WHERE seq > $1 ORDER BY seq LIMIT 100 W
 **Tests:** `exec_waitfor` (every case moved to the suffix; each unit and
 its timing, a parameter, `wait` as a name, the errors, the old form refused, T-SQL's
 suffix), `tns_wait` and `tds_wait` (the old form refused in each).
+
+### 9.129 Bulk delete measured: range delete, purge of 10M rows, stall, replica, batch_rows
+
+Stage 9 of [lexdb-bulkdelete.md](lexdb-bulkdelete.md), items 1 to 5 of its
+section 6. Stages 1 to 6 and 8 are built (stage 7, the foreign-key cascade,
+is parked); this section only measures them.
+
+**How it was run.**
+- Native `lxlc`, `LXL_NOCACHE=1`. Copies of `ldata` (w, d, t, plus a new
+  `w2` with the primary key only, filled from `w`: 1M rows, id 1 to
+  1,000,000) and of a new events table, each in a `chattr +C` directory; a
+  fresh copy for every run. Default options: the cache is 11,987 MB on this
+  machine (a quarter of the memory), `lexdb_range_delete` is on by default,
+  so "off" is `SET lexdb_range_delete = off`. `max_statement_mem 0` in the
+  runs of items 2 to 5, so the row path is not stopped by it.
+- One benchmark at a time, median of 3 (the three were within 3% of each
+  other except where a range is shown). Wall time is the client's round
+  trip of one `DELETE` in an open psql session. Server CPU is the sum of
+  the server's thread `schedstat`, as `dml.py` takes it (9.109).
+- **Warm:** the table read first (`sum` over its columns). **Cold:** a server
+  started on the copy after `sync` and `posix_fadvise(DONTNEED)` on the data
+  file and the logs (`fincore` showed 0 pages resident), so the file is read
+  from the NVMe. This is colder than 9.109's cold, which only restarted the
+  server. No root, so nothing else was dropped.
+- PostgreSQL 18 on port 55442 (shared_buffers 1 GB), on my own schema
+  `bd9`, `max_parallel_workers_per_gather = 3`, `max_parallel_maintenance_workers = 3`,
+  autovacuum off on the test tables. Warm only; cold was not measured
+  for PostgreSQL. The schema was dropped afterwards.
+- The delete is a range in the middle of the key order (`id between lo and
+  hi`, centred), so it has two edges.
+- Checkpoints: lexdb counts them at exit (`checkpoints` in its last line).
+  The dropped list was empty after the checkpoint at shutdown in every run,
+  so "checkpoints until `dropped` is empty" is **1** here (read from the
+  data file's meta page, offset 88, after each run). The log of a range
+  delete is 4 KB, far below the 32 MB that starts a checkpoint on its own,
+  so on a running server that one checkpoint comes when the log grows or the
+  server stops; the shutdown one was timed with the rest of the exit, not
+  separately. Not measured: how long that checkpoint takes.
+
+**1. w2, 1M rows of about 170 bytes, primary key only, `id` ranges.**
+
+lexdb, wall ms (server CPU ms), range seen across the three runs:
+
+| range | warm off | warm on | cold off | cold on |
+|---|---:|---:|---:|---:|
+| 1% (10,000 rows) | 21 (18) | **3** (1) | 22 (20) | **3** (2) |
+| 10% (100,000) | 173 (169) | **3** (1) | 188 (183) | **13** (10) |
+| 50% (500,000) | 852 (833) | **5** (2) [4 to 8] | 904 (880) | **47** (40) [46 to 49] |
+
+| range | log written, off | log written, on | peak RSS off / on (warm) |
+|---|---:|---:|---:|
+| 1% | 208 KB | 4 KB | 128 / 117 MB |
+| 10% | 2,052 KB | 4 KB | 243 / 117 MB |
+| 50% | 10,256 KB | 4 KB | 745 / 117 MB |
+
+(`Stats.logBytes`. RSS is the peak, `VmHWM`, of the whole server, which
+holds the warmed table, 117 MB, in both columns; cold runs peak at 28 / 14,
+152 / 22 and 694 / 29 MB.)
+
+PostgreSQL 18, the same table (PK only, 102 MB), DELETE and then VACUUM
+timed apart, wall ms (backend CPU ms), median of 3:
+
+| range | DELETE | VACUUM | WAL written by the DELETE |
+|---|---:|---:|---:|
+| 1% | 4 (0) | 1 (0) | 1.6 MB |
+| 10% | 34 (30) | 10 (10) | 16 MB |
+| 50% | 158 (130) | 28 (30) | 80 MB |
+
+What it says:
+- The range delete takes 3 to 5 ms warm whatever its size (1% to 50%),
+  against 21 to 852 ms for today's path and 4 to 158 ms (plus 1 to 28 ms for
+  VACUUM) for PostgreSQL. At 1% PostgreSQL's DELETE is still slower than
+  ours by little (4 ms to 3), at 50% lexdb on is 30 times faster than
+  PostgreSQL's DELETE alone.
+- The row path is 5.1 times slower than PostgreSQL's DELETE at 10% and
+  5.4 times at 50% (as 9.109 found for `w2`: 349 ms for 190k rows against
+  99), and writes an eighth of the bytes.
+- Cold, what remains is reading the covered leaves' headers for the count
+  (D1 of the design): 13 ms for 100,000 rows and 47 ms for 500,000, about
+  100 ns a row (about 20,000 leaves, 2.3 µs each [estimate of the leaf count]). The drop
+  itself reads no leaf. Warm, the count is from the cache.
+- The result agreed with the row path in every run (count left 990,000,
+  900,000, 500,000 and the same tag).
+
+**2. A purge of the oldest half of 10M rows.**
+
+`events (id bigint primary key, ts timestamp, user_id int, kind text,
+payload text)`, 10,000,000 rows of about 80 bytes, loaded by ten INSERT ...
+SELECT of 1M rows (55 s in all, peak RSS 1,625 MB). The data file is 765
+MB; the data directory 986 MB with two 110 MB log files. Purge: `DELETE
+FROM events WHERE id <= 5000000`, cold (as above), a fresh server for each
+run; then the half is filled again (five INSERT ... SELECT of 1M rows, ids
+10,000,001 to 15,000,000).
+
+| | lexdb on | lexdb off | PG DELETE, then VACUUM | PG partitioned (10 of 1M), 5 dropped |
+|---|---:|---:|---:|---:|
+| the purge, wall | **496 ms** [493 to 497] | 6,860 ms | DELETE 1,907 ms; VACUUM 1,054 ms | **90 ms** (5 DROPs) |
+| server CPU | 440 ms | 6,750 ms | 1,530 ms (DELETE) | |
+| peak RSS during it | **37 MB** | **4,385 MB** | 727 MB (backend, DELETE); 1,078 MB (VACUUM) | 36 MB |
+| log or WAL written | 4 KB | 102,540 KB | 864,750 KB | about 0.2 MB |
+| file after the purge | 765 MB | 765 MB | 1,368 MB | 684 MB |
+| file after refilling the half | **765 MB** | 765 MB | 1,475 MB | 1,369 MB |
+| the refill, wall | 30.4 s | 30.3 s | 9.0 s | 9.9 s |
+
+("Commit time" is the statement's wall time: the delete is one commit, and
+its count and its subtree drops run in it; the off path's commit applies
+5,000,000 deletes in a block.) PostgreSQL's sizes are the table with its
+primary key (`pg_total_relation_size`); lexdb's data file holds the table's
+tree only and 80 bytes a row against PostgreSQL's 137, so only the rows of
+a column compare.
+
+What it says:
+- On, the purge is 14 times faster than the row path and 3.8 times faster
+  than PostgreSQL's DELETE, 6 times with its VACUUM, and holds 37 MB, not 4.4
+  GB. PostgreSQL's partitioned drop is 5.5 times faster than ours still: it
+  unlinks five files and reads nothing; ours counts 5M rows' worth of
+  leaf headers (440 ms of CPU), which is the price of an exact row count
+  and a tag (D1). An unpartitioned lexdb table purges half of 10M rows in half a
+  second where partitioning does it in 90 ms.
+- The row path now holds about 880 bytes a row for 5M deletes (4,385 MB
+  peak), not the 176 bytes a write that 9.84 gave; the rows were read whole
+  and the allocator never gives memory back (9.99). At 100M rows that
+  would be about 88 GB [estimate, linear]: this is why `batch_rows` exists.
+- **Freed pages are reused in both lexdb paths:** after refilling 5M rows
+  the file is the size it was (765 MB), with no growth; on and off agree.
+  PostgreSQL's plain table stays 1,368 MB after DELETE and VACUUM (VACUUM
+  does not shrink it: the free space is in the middle) and grew 107 MB when
+  refilled. A partitioned PostgreSQL gives half of its space back at once
+  and gets it again. lexdb's file never shrinks (2.4) but needs no more
+  than it had.
+- The loads: lexdb 30 s for 5M rows against PostgreSQL's 9 s (an INSERT ...
+  SELECT with md5; not what this section is about, noted as it came with
+  the refill).
+
+**3. Stall: a client inserting at the tail during the purge.**
+
+A second session inserting one row at a time (autocommit, `events` ids from
+10,000,001) every 10 ms (100 a second), started 3 s before the purge and
+stopped 2 s after; latency is the client's round trip. The purge is that of
+item 2, cold. Three runs each:
+
+| | before the purge | during, on | during, off |
+|---|---:|---:|---:|
+| inserts completed in the window | 301 in 3 s | 37 to 43 in 0.5 s | 266 to 269 in 7.1 to 7.3 s |
+| p50 | 1.1 to 1.3 ms | 11.6 to 12.6 ms | 3.0 ms |
+| p99 | 2.6 to 2.9 ms | 20.8 to 24.2 ms | 4.4 to 4.7 ms |
+| **max** | 2.8 to 5.5 ms | 20.8 to 24.2 ms | **4,210 to 4,743 ms** |
+
+What it says:
+- Off: one insert waits 4.2 to 4.7 s, the commit of the 5M deletes, applied
+  with the store's commit lock held. At 100 inserts a second that is about
+  450 inserts that did not happen in the window (730 expected, 266 to 269
+  made). The p99 hides it: it is one sample in 266, so read the max.
+- On: no insert waits more than 24 ms. During the half second of the
+  purge they are about 10 times slower than normal (the count's reads and
+  CPU share the machine and the store with them), 12 ms a row, then back to
+  normal at once (p99 after 2.6 to 2.9 ms).
+
+**4. The replica's apply of the purge.**
+
+`lexdb --replica` on the same data directory, a second process; the master
+runs the purge of item 2, then inserts a row into a small table, `mark`;
+the replica is polled (`select count(*) from mark`, every 2 ms) until the
+row shows. Reported: from the purge's commit to the marker's being seen
+(the marker's own commit is 1 ms on, 55 to 74 ms off, included). Three runs
+each:
+
+| | on (1 record) | off (5,000,000 row records) |
+|---|---:|---:|
+| the replica sees the commit | **3 to 4 ms** | 2,669 to 2,722 ms (median 2,706) |
+| the master's purge | 487 to 513 ms | 6,939 to 7,003 ms |
+| replica peak RSS | 611 MB | 1,420 MB |
+
+The replica's peak includes a `select count(*) from events` run after, so
+each is above what the apply took (start 13 MB); the difference between
+the two (809 MB) is the apply of the row records. The replica's CPU for
+the apply was not separated from that count and is not reported. In both
+runs the replica then counted 5,000,000 rows, as the master did. Whether
+the replica began applying before the master's commit returned was not
+checked.
+
+**5. Step 2: 5M rows deleted by a column that is not the key.**
+
+`DELETE FROM events WHERE ts < '2026-01-01 13:53:20'` (ts is not the key
+and not indexed: the row path, 4,999,999 rows, in the first half of the key
+order), cold, `max_statement_mem 0`, three runs each:
+
+| | one statement | `WITH (batch_rows 100000)` |
+|---|---:|---:|
+| wall | 7,754 ms [7,746 to 7,819] | **6,995 ms** [6,995 to 7,005] |
+| server CPU | 7,610 ms | 6,725 ms |
+| peak RSS | 4,990 MB | **712 MB** |
+| commits | 1 | 50 |
+| log written | 102,540 KB | 102,600 KB |
+| checkpoints | 2 | 4 |
+| rows left | 5,000,001 | 5,000,001 |
+
+- Batching bounds memory (7 times less) and is 10% faster: each batch is
+  committed and its writes let go, where the one commit applies 5M deletes
+  at once. Its log is the same (60 KB more). The batches' reads do not make
+  it slower: the cursor resumes at the key after the last row, so the
+  whole is about one pass.
+- It is not all or nothing: a failure after batch k leaves k batches
+  committed (stage 8).
+- The table is read from its key order here, because `ts` follows `id`; a
+  predicate on a column that does not follow the key reads the whole table
+  once whatever the batch size (the design's sparse case, tested in
+  `exec_batchdml` at 20,000 rows), not measured at this size.
+
+**Compared with the estimate.** The design expected a warm range delete to
+commit in milliseconds, as a drop does (9.32: 1.5 to 13 ms for 105 MB), and
+a cold one to be bounded by reading the leaves for the count. Measured:
+3 to 5 ms warm for 1% to 50% of 1M rows; cold 3, 13 and 47 ms; for 5M rows
+of 10M cold, 496 ms. The cost is linear in the leaves covered, as expected,
+and about 100 ns a row.
+
+**Nothing found wrong.** Every pair of runs (on and off) left the same
+rows; the dropped list was empty after the shutdown checkpoint; the file
+did not grow when refilled.
+
+**Not done, and what is left:**
+- PostgreSQL cold, and its checkpoints, were not measured; no parallel
+  workers were used by a DELETE (they do not help one), VACUUM's were
+  allowed 3.
+- A checkpoint's time on a running server (the drop's walk, 256 internal
+  pages at most each) was not separated from the shutdown's; with more
+  than about 25,000 leaves covered it may take more than one. Not measured
+  past 5M rows.
+- The cost of the count (about 100 ns a row, cold) is the one thing a
+  range delete still reads; a count kept per subtree would remove it, and
+  is not planned.
+- A delete scattered across the key order still leaves sparse leaves
+  (leaves are never merged), and stage 7 (a range delete of a table others
+  reference by foreign key) is parked: it takes the row path in batches.
+- The scripts and raw results are in `~/Work/lexdb-bench/bd9/` (`py/`,
+  `res*.jsonl`); the data copies were removed.

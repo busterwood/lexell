@@ -1074,6 +1074,16 @@ The crash tests use the simulated Fs (`lexdb_disk.sim(seed)`, as
        batched statement (not tested).
 9. **Measure (section 6), then write it up in `lexdb.md`** as a new 9.x
    section, and update gaps 2.4 and 2.5.
+   - **As built (2026-11-14):** items 1 to 5 of section 6 were run and
+     written up as `lexdb.md` 9.129; gaps 2.4 and 2.5 are updated. Changes
+     to the plan: cold runs drop the data file and the logs from the OS
+     cache with `posix_fadvise` (no root), as well as starting a server;
+     PostgreSQL was measured warm only; "checkpoints until `dropped` is
+     empty" is 1 in every run (the checkpoint at shutdown; the online
+     checkpoint's own time was not separated); item 3's inserter is one
+     client at 100 inserts a second; item 4 times a marker row's
+     appearing on the replica after the purge's commit. The 10M-row table
+     is 765 MB in lexdb (the design said about 1 GB). No bug found.
 
 ## 6. Benchmarks
 
@@ -1111,9 +1121,19 @@ is not the key, so it would not take the new path. Add PK-range variants.
    key. One statement (max_statement_mem 0) against `batch_rows 100000`:
    wall time and peak RSS.
 
-Expected, [estimate] to be replaced by the numbers: a warm range delete
+Expected ([estimate], from before the measurements): a warm range delete
 commits in milliseconds, as a drop does (9.32: 1.5 to 13 ms for 105 MB). A
 cold one is bounded by reading the covered leaves for the count (D1).
+
+**Measured (9.129):** as expected. Warm, 3 to 5 ms for 1%, 10% and 50% of
+a 1M-row table (the row path 21, 173 and 852 ms; PostgreSQL's DELETE 4, 34
+and 158 ms, VACUUM 1, 10 and 28 ms). Cold, 3, 13 and 47 ms: the count's
+read of the leaf headers, about 100 ns a row. The purge of 5M of 10M rows:
+496 ms and 37 MB (row path 6.9 s and 4.4 GB; PostgreSQL DELETE 1.9 s plus
+VACUUM 1.1 s; partitions dropped 90 ms). A tail inserter waited at most 24
+ms (4.2 to 4.7 s with the switch off); a replica applied it in 3 to 4 ms
+(2.7 s for 5M row records); `batch_rows 100000`: 7.0 s and 712 MB against
+7.8 s and 4,990 MB.
 
 ## 7. Found while reading, not caused by this design
 

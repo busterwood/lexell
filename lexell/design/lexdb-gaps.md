@@ -253,7 +253,16 @@ In three tiers, by how soon a real application meets the gap.
   - the runtime's allocator never gives memory back to the system, so RSS
     stays at its highest (9.99);
   - a transaction's writes stay in memory until its commit, about 176
-    bytes a row (9.84);
+    bytes a row (9.84). Still true: a DELETE of 5M rows by a column that
+    is not the key held 4,990 MB at its peak, about 880 bytes a row,
+    because the rows are read whole (9.129). The bound is now a choice:
+    `WITH (batch_rows n)` on DELETE and UPDATE commits in parts (the same
+    delete in batches of 100,000: 712 MB, 7 times less, and 10% faster),
+    and a range delete on the primary key (2.5) is one small write whatever
+    its size (37 MB for 5M rows). Not bounded: a plain DELETE or UPDATE with
+    no `batch_rows`, a transaction block of many statements, INSERT ...
+    SELECT, and a range delete that has to remove index entries one by
+    one (its batched path takes the row path);
   - a large `CREATE TABLE AS` holds its result while it inserts (9.88).
 - **Storage** (items 8 and 10 of 9.4):
   - no compression;
@@ -296,6 +305,34 @@ Two next steps cover most of what partitioning would give:
    which commits in parts and is not.
 
 `design/lexdb-events.md` (expiry of old events) would use either.
+
+**Built and measured (2026-11-14, lexdb.md 9.129; design in
+[lexdb-bulkdelete.md](lexdb-bulkdelete.md)).** Both steps are in (stages 1
+to 6 and 8; stage 7, the foreign-key cascade, is parked). Measured, cold,
+on an events table of 10M rows (765 MB), purging the oldest 5M by key:
+
+| | wall | peak RSS | log or WAL |
+|---|---:|---:|---:|
+| lexdb range delete | 496 ms | 37 MB | 4 KB |
+| lexdb row path (switch off) | 6,860 ms | 4,385 MB | 100 MB |
+| PostgreSQL DELETE, then VACUUM | 1,907 + 1,054 ms | 727 / 1,078 MB | 865 MB |
+| PostgreSQL, 5 of 10 partitions dropped | 90 ms | 36 MB | 0.2 MB |
+
+On a 1M-row table the range delete took 3 to 5 ms warm for 1% to 50% of the
+rows (PostgreSQL's DELETE 4 to 158 ms). A client inserting at the tail
+waited at most 24 ms during it, against one wait of 4.2 to 4.7 s with the
+switch off. A replica applied it in 3 to 4 ms against 2.7 s for 5M row
+records. After refilling the purged half the file was the size it had
+been. So the first step gives most of what partitioning would, at about
+5 times partitioning's drop time on this table; the second bounds memory
+for purges by other columns.
+
+Still open: stage 7 (a range delete of a table others reference by foreign
+key, parked: it takes the row path in batches); a delete scattered across
+the key order leaves sparse leaves for good (no merging); the count
+(about 100 ns a row, read from the leaf headers) is the one thing a range
+delete reads; a purge by a column that is not the key still reads the whole
+table; PostgreSQL was measured warm only.
 
 ### 2.6 Tablespaces: decided against; a log directory instead (2026-11-14)
 
