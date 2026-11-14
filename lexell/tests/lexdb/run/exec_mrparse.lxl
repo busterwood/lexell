@@ -1,0 +1,254 @@
+// lexdb_sql: MATCH_RECOGNIZE's parser in the three front ends (design/lexdb-match-recognize.md, 5): each
+// statement through parse (PostgreSQL), oraParse (Oracle) or a T-SQL Parser, printing the clause as
+// mrText, or the error's state.
+// expect: v pg: m: partition by g; order by id nulls last; measures s, b; pattern (strt down+ up+); one row per match; skip past last row; define down, up
+// expect: v ora: m: partition by g; order by id nulls last; measures s, b; pattern (strt down+ up+); one row per match; skip past last row; define down, up
+// expect: v ts: m: partition by g; order by id nulls first; measures s, b; pattern (strt down+ up+); one row per match; skip past last row; define down, up
+// expect: all rows pg: m: order by id desc nulls first; measures c; pattern (a+); all rows per match; skip past last row; define a
+// expect: all rows ora: m: order by id desc nulls first; measures c; pattern (a+); all rows per match; skip past last row; define a
+// expect: all rows ts: m: order by id desc nulls last; measures c; pattern (a+); all rows per match; skip past last row; define a
+// expect: omit pg: m: measures m; pattern (a*); all rows per match omit empty matches; skip past last row; define a
+// expect: omit ora: m: measures m; pattern (a*); all rows per match omit empty matches; skip past last row; define a
+// expect: omit ts: m: measures m; pattern (a*); all rows per match omit empty matches; skip past last row; define a
+// expect: unmatched pg: m: order by id nulls first; pattern (a b?); all rows per match with unmatched rows; skip past last row; define a
+// expect: unmatched ora: m: order by id nulls first; pattern (a b?); all rows per match with unmatched rows; skip past last row; define a
+// expect: unmatched ts: m: order by id nulls first; pattern (a b?); all rows per match with unmatched rows; skip past last row; define a
+// expect: show pg: m: measures c; pattern (a*); all rows per match; skip past last row; define a
+// expect: show ora: m: measures c; pattern (a*); all rows per match; skip past last row; define a
+// expect: show ts: m: measures c; pattern (a*); all rows per match; skip past last row; define a
+// expect: skip next pg: m: measures one; pattern (a b); one row per match; skip to next row; define a
+// expect: skip next ora: m: measures one; pattern (a b); one row per match; skip to next row; define a
+// expect: skip next ts: m: measures one; pattern (a b); one row per match; skip to next row; define a
+// expect: skip first pg: m: measures one; pattern (a b+); one row per match; skip to first b; define a
+// expect: skip first ora: m: measures one; pattern (a b+); one row per match; skip to first b; define a
+// expect: skip first ts: m: measures one; pattern (a b+); one row per match; skip to first b; define a
+// expect: skip last pg: m: measures one; pattern (a b+); one row per match; skip to last a; define a
+// expect: skip last ora: m: measures one; pattern (a b+); one row per match; skip to last a; define a
+// expect: skip last ts: m: measures one; pattern (a b+); one row per match; skip to last a; define a
+// expect: skip var pg: m: measures one; pattern (a b+); one row per match; skip to last b; define a
+// expect: skip var ora: m: measures one; pattern (a b+); one row per match; skip to last b; define a
+// expect: skip var ts: m: measures one; pattern (a b+); one row per match; skip to last b; define a
+// expect: skip past pg: m: measures one; pattern (a); one row per match; skip past last row; define a
+// expect: skip past ora: m: measures one; pattern (a); one row per match; skip past last row; define a
+// expect: skip past ts: m: measures one; pattern (a); one row per match; skip past last row; define a
+// expect: quantifiers pg: m: pattern (a* b+ c? d{2} e{2,} f{,3} g{1,2} h*? i+? j?? k{2,3}?); one row per match; skip past last row; define a
+// expect: quantifiers ora: m: pattern (a* b+ c? d{2} e{2,} f{,3} g{1,2} h*? i+? j?? k{2,3}?); one row per match; skip past last row; define a
+// expect: quantifiers ts: m: pattern (a* b+ c? d{2} e{2,} f{,3} g{1,2} h*? i+? j?? k{2,3}?); one row per match; skip past last row; define a
+// expect: groups pg: m: pattern ((a | b c)+ (d | e)* ^ f $); one row per match; skip past last row; define a
+// expect: groups ora: m: pattern ((a | b c)+ (d | e)* ^ f $); one row per match; skip past last row; define a
+// expect: groups ts: m: pattern ((a | b c)+ (d | e)* ^ f $); one row per match; skip past last row; define a
+// expect: permute pg: m: pattern (permute(a, b c, d+)); one row per match; skip past last row; define a
+// expect: permute ora: m: pattern (permute(a, b c, d+)); one row per match; skip past last row; define a
+// expect: permute ts: m: pattern (permute(a, b c, d+)); one row per match; skip past last row; define a
+// expect: exclusion pg: m: pattern (a {- b+ -} c); all rows per match; skip past last row; define a
+// expect: exclusion ora: m: pattern (a {- b+ -} c); all rows per match; skip past last row; define a
+// expect: exclusion ts: m: pattern (a {- b+ -} c); all rows per match; skip past last row; define a
+// expect: subset pg: m: measures sv; pattern (a b); one row per match; skip past last row; subset s = (a, b); subset t = (a); define a
+// expect: subset ora: m: measures sv; pattern (a b); one row per match; skip past last row; subset s = (a, b); subset t = (a); define a
+// expect: subset ts: m: measures sv; pattern (a b); one row per match; skip past last row; subset s = (a, b); subset t = (a); define a
+// expect: rn pg: m: measures r, f, ca, n; pattern (a+); one row per match; skip past last row; define a
+// expect: rn ora: m: measures r, f, ca, n; pattern (a+); one row per match; skip past last row; define a
+// expect: rn ts: m: measures r, f, ca, n; pattern (a+); one row per match; skip past last row; define a
+// expect: no define pg: 42601
+// expect: no define ora: ORA02000
+// expect: no define ts: 42601
+// expect: no pattern pg: 42601
+// expect: no pattern ora: ORA02000
+// expect: no pattern ts: 42601
+// expect: measures no alias pg: 42601
+// expect: measures no alias ora: ORA02000
+// expect: measures no alias ts: 42601
+// expect: measures keyword alias pg: 42601
+// expect: measures keyword alias ora: ORA02000
+// expect: measures keyword alias ts: 42601
+// expect: empty pattern pg: 42601
+// expect: empty pattern ora: ORA00931
+// expect: empty pattern ts: 42601
+// expect: empty alt pg: 42601
+// expect: empty alt ora: ORA00931
+// expect: empty alt ts: 42601
+// expect: reserved var pg: 42601
+// expect: reserved var ora: ORA00931
+// expect: reserved var ts: 42601
+// expect: bad bound 0 pg: 42601
+// expect: bad bound 0 ora: ORA62501
+// expect: bad bound 0 ts: 42601
+// expect: bad bound 00 pg: 42601
+// expect: bad bound 00 ora: ORA62501
+// expect: bad bound 00 ts: 42601
+// expect: bad bound 32 pg: 42601
+// expect: bad bound 32 ora: ORA62501
+// expect: bad bound 32 ts: 42601
+// expect: huge bound pg: 54001
+// expect: huge bound ora: ORA62518
+// expect: huge bound ts: 54001
+// expect: define twice pg: 42601
+// expect: define twice ora: ORA62503
+// expect: define twice ts: 42601
+// expect: define non-var pg: 42601
+// expect: define non-var ora: ORA62503
+// expect: define non-var ts: 42601
+// expect: subset var twice pg: 42601
+// expect: subset var twice ora: ORA62503
+// expect: subset var twice ts: 42601
+// expect: subset dup pg: 42601
+// expect: subset dup ora: ORA62503
+// expect: subset dup ts: 42601
+// expect: subset non-var pg: 42P01
+// expect: subset non-var ora: ORA62504
+// expect: subset non-var ts: TS4104
+// expect: qualified partition pg: 42601
+// expect: qualified partition ora: ORA01748
+// expect: qualified partition ts: 42601
+// expect: expr partition pg: 42601
+// expect: expr partition ora: ORA02000
+// expect: expr partition ts: 42601
+// expect: qualified order pg: 42601
+// expect: qualified order ora: ORA01748
+// expect: qualified order ts: 42601
+// expect: expr order pg: m: order by <expr> nulls last; pattern (a); one row per match; skip past last row; define a
+// expect: expr order ora: ORA02000
+// expect: expr order ts: m: order by <expr> nulls first; pattern (a); one row per match; skip past last row; define a
+// expect: order after pattern pg: 42601
+// expect: order after pattern ora: ORA02000
+// expect: order after pattern ts: 42601
+// expect: skip after pattern pg: 42601
+// expect: skip after pattern ora: ORA02000
+// expect: skip after pattern ts: 42601
+// expect: unmatched with exclusion pg: 42601
+// expect: unmatched with exclusion ora: ORA62515
+// expect: unmatched with exclusion ts: 42601
+// expect: classifier arg pg: 42601
+// expect: classifier arg ora: ORA00907
+// expect: classifier arg ts: 42601
+// expect: over pg: 42P20
+// expect: over ora: ORA30483
+// expect: over ts: TS4108
+// expect: deep pg: 54001
+// expect: deep ora: ORA62518
+// expect: deep ts: 54001
+// expect: alias none pg: unnamed_subquery: pattern (a); one row per match; skip past last row; define a
+// expect: alias cols pg: m: pattern (a); one row per match; skip past last row; define a
+// expect: input alias ora: m: pattern (a); one row per match; skip past last row; define a
+// expect: subquery input pg: m: pattern (a); one row per match; skip past last row; define a
+// expect: cte input ora: m: pattern (a); one row per match; skip past last row; define a
+// expect: lateral pg: m lateral: pattern (a); one row per match; skip past last row; define a
+// expect: apply ts: m lateral: pattern (a); one row per match; skip past last row; define a
+// expect: join pg: m: pattern (a); one row per match; skip past last row; define a
+// expect: not a clause pg: no mr
+// expect: two pg: 42601
+// expect: quoted pg: m: pattern (a b); one row per match; skip past last row; define a
+// expect: char ops ora: m: pattern (a b $); one row per match; skip past last row; define a
+// expect: dollar name ora: m: pattern (b$ c); one row per match; skip past last row; define b$
+// expect: running not mr pg: 42601
+// expect: brace outside pg: 42601
+import "strings"
+import "../../../cmd/lexdb_base"
+import "../../../cmd/lexdb_sql"
+
+fn clause(st: &lexdb_sql.Stmt): str {
+    for f in st.from {
+        let k = f.sub
+        if k >= 0 && k < len(st.subs) && len(st.subs[k].mr) > 0 {
+            return f.alias + (if f.lateral { " lateral" } else { "" }) + ": " + lexdb_sql.mrText(&st.subs[k].mr[0])
+        }
+    }
+    return "no mr"
+}
+
+fn pg(sql: str): str {
+    match lexdb_sql.parse(&sql) {
+        Ok(ss) { return clause(&ss[0]) }
+        Err(e) { return e.state }
+    }
+}
+
+fn ora(sql: str): str {
+    match lexdb_sql.oraParse(&sql) {
+        Ok(ss) { return clause(&ss[0]) }
+        Err(e) { return e.state }
+    }
+}
+
+fn ts(sql: str): str {
+    match lexdb_sql.tsqlParser(&sql, lexdb_sql.Dialect{tsql: true, quotedIdent: true}, &[]) {
+        Ok(q) {
+            var p = q
+            match p.statement() {
+                Ok(st) { return clause(&st) }
+                Err(e) { return e.state }
+            }
+        }
+        Err(e) { return e.state }
+    }
+}
+
+const V = "select * from t match_recognize (partition by g order by id measures strt.id as s, last(down.id) as b pattern (strt down+ up+) define down as price < prev(price), up as price > prev(price)) m"
+
+fn all3(label: str, body: str) {
+    println(label + " pg: " + pg("select * from t match_recognize (" + body + ") m"))
+    println(label + " ora: " + ora("select * from t match_recognize (" + body + ") m"))
+    println(label + " ts: " + ts("select * from t match_recognize (" + body + ") m"))
+}
+
+fn main() {
+    println("v pg: " + pg(V))
+    println("v ora: " + ora(V))
+    println("v ts: " + ts(V))
+    all3("all rows", "order by id desc measures count(*) as c all rows per match pattern (a+) define a as true")
+    all3("omit", "measures match_number() as m all rows per match omit empty matches pattern (a*) define a as v > 1")
+    all3("unmatched", "order by id nulls first all rows per match with unmatched rows pattern (a b?) define a as true")
+    all3("show", "measures classifier() as c all rows per match show empty matches pattern (a*) define a as true")
+    all3("skip next", "measures 1 as one after match skip to next row pattern (a b) define a as true")
+    all3("skip first", "measures 1 as one after match skip to first b pattern (a b+) define a as true")
+    all3("skip last", "measures 1 as one after match skip to last a pattern (a b+) define a as true")
+    all3("skip var", "measures 1 as one after match skip to b pattern (a b+) define a as true")
+    all3("skip past", "measures 1 as one after match skip past last row pattern (a) define a as true")
+    all3("quantifiers", "pattern (a* b+ c? d{2} e{2,} f{,3} g{1,2} h*? i+? j?? k{2,3}?) define a as true")
+    all3("groups", "pattern ((a | b c)+ (d | e)* ^ f $) define a as true")
+    all3("permute", "pattern (permute(a, b c, d+)) define a as true")
+    all3("exclusion", "all rows per match pattern (a {- b+ -} c) define a as true")
+    all3("subset", "measures s.v as sv pattern (a b) subset s = (a, b), t = (a) define a as true")
+    all3("rn", "measures running sum(a.v) as r, final last(a.v, 1) as f, count(a.*) as ca, count(*) as n pattern (a+) define a as true")
+    all3("no define", "pattern (a)")
+    all3("no pattern", "define a as true")
+    all3("measures no alias", "measures a.v pattern (a) define a as true")
+    all3("measures keyword alias", "measures a.v one row per match pattern (a) define a as true")
+    all3("empty pattern", "pattern () define a as true")
+    all3("empty alt", "pattern (a | ) define a as true")
+    all3("reserved var", "pattern (select) define a as true")
+    all3("bad bound 0", "pattern (a{0}) define a as true")
+    all3("bad bound 00", "pattern (a{0,0}) define a as true")
+    all3("bad bound 32", "pattern (a{3,2}) define a as true")
+    all3("huge bound", "pattern (a{10001}) define a as true")
+    all3("define twice", "pattern (a) define a as true, a as false")
+    all3("define non-var", "pattern (a) define b as true")
+    all3("subset var twice", "pattern (a) subset a = (a) define a as true")
+    all3("subset dup", "pattern (a) subset s = (a), s = (a) define a as true")
+    all3("subset non-var", "pattern (a) subset s = (b) define a as true")
+    all3("qualified partition", "partition by t.g pattern (a) define a as true")
+    all3("expr partition", "partition by g + 1 pattern (a) define a as true")
+    all3("qualified order", "order by t.id pattern (a) define a as true")
+    all3("expr order", "order by id + 1 pattern (a) define a as true")
+    all3("order after pattern", "pattern (a) order by id define a as true")
+    all3("skip after pattern", "pattern (a) after match skip past last row define a as true")
+    all3("unmatched with exclusion", "all rows per match with unmatched rows pattern ({- a -}) define a as true")
+    all3("classifier arg", "measures classifier(a) as c pattern (a) define a as true")
+    all3("over", "measures sum(a.v) over () as c pattern (a) define a as true")
+    all3("deep", "pattern (((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((a))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))) define a as true")
+    println("alias none pg: " + pg("select * from t match_recognize (pattern (a) define a as true)"))
+    println("alias cols pg: " + pg("select * from t x match_recognize (pattern (a) define a as true) as m (c1, c2)"))
+    println("input alias ora: " + ora("select * from t x match_recognize (pattern (a) define a as true) m"))
+    println("subquery input pg: " + pg("select * from (select 1 as v) s match_recognize (pattern (a) define a as true) m"))
+    println("cte input ora: " + ora("with c as (select 1 v from dual) select * from c match_recognize (pattern (a) define a as true) m"))
+    println("lateral pg: " + pg("select * from u, lateral (select * from t where t.g = u.g) match_recognize (pattern (a) define a as true) m"))
+    println("apply ts: " + ts("select * from u cross apply (select * from t where t.g = u.g) match_recognize (pattern (a) define a as true) m"))
+    println("join pg: " + pg("select * from u join t match_recognize (pattern (a) define a as true) m on m.x = u.x"))
+    println("not a clause pg: " + pg("select match_recognize from t"))
+    println("two pg: " + pg("select * from t match_recognize (pattern (a) define a as true) m match_recognize (pattern (b) define b as true) n"))
+    println("quoted pg: " + pg("select * from t match_recognize (pattern (\"A\" b) define \"A\" as true) m"))
+    println("char ops ora: " + ora("select * from t match_recognize (pattern (a b $) define a as true) m"))
+    println("dollar name ora: " + ora("select * from t match_recognize (pattern (b$ c) define b$ as true) m"))
+    println("running not mr pg: " + pg("select running sum(x) from t"))
+    println("brace outside pg: " + pg("select {1}"))
+}

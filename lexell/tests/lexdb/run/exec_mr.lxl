@@ -1,0 +1,247 @@
+// lexdb_exec: MATCH_RECOGNIZE (design/lexdb-match-recognize.md) through the PostgreSQL door's executor.
+// The fixtures are the design's section 10 (Oracle Database Free 23ai's answers, CLASSIFIER in lower case);
+// the rest are hand-checked.
+// expect: v shape: ACME|5|6|10 ACME|10|12|13 ACME|14|16|18
+// expect: empty one: a|1|0|NULL a|2|2|a a|3|0|NULL a|4|1|a b|1|0|NULL b|2|0|NULL b|3|0|NULL
+// expect: omit all rows: 2|2|1|a 3|2|2|a 5|4|1|a
+// expect: skip next: 1|1|3 2|2|3 3|4|8 4|5|8 5|6|8 6|7|8
+// expect: bounded: 1|2|2 3|3|1 5|6|2 7|8|2 NULL|NULL|0
+// expect: running sum: 1|30 2|15 2|30 3|15
+// expect: all rows big: 1|10|30|10|10|75|NULL|NULL|NULL|20|2 2|20|30|20|30|75|20|10|NULL|15|2 3|15|30|15|45|75|20|20|10|NULL|2 4|NULL|30|NULL|45|75|20|15|20|30|2 5|30|30|30|75|75|20|NULL|15|NULL|2
+// expect: reluctant plus: 1|2|2 3|4|2 6|8|3
+// expect: reluctant star: 8|1|1
+// expect: reluctant opt: 1|2
+// expect: greedy opt: 1|5
+// expect: begin: a|1|2 b|6|7
+// expect: end: a|4|5 b|7|8
+// expect: begin star end: b|3
+// expect: permute: 1|b 2|a
+// expect: permute three: c|1|3
+// expect: exclusion all rows: 1|a|1 4|c|4
+// expect: exclusion one row: c|4
+// expect: exclusion at the end: 1|a
+// expect: everything excluded: 
+// expect: subset: 2|15|25
+// expect: classifier in define: 3 4
+// expect: match_number in define: 1|8
+// expect: history define: 1|3 6|7
+// expect: first define: 2|3|2 6|8|3
+// expect: nulls in define: 5|4
+// expect: skip past last row: 1|2 3|4 5|6 7|8
+// expect: skip to first: 1|3 2|4 3|5 4|6 5|7 6|8
+// expect: skip to last: 1|4 4|8
+// expect: skip to subset: 1|3 3|5 5|7
+// expect: skip unbounded: 22000
+// expect: skip same start: 22000
+// expect: show empty: 1|1|0 2|2|1 3|2|2 4|3|0 5|4|1
+// expect: unmatched: 1|NULL|NULL 2|1|a 3|1|a 4|NULL|NULL 5|2|a
+// expect: skip to next row overlaps: 1|1 2|1 2|2 3|2 3|3 4|3
+// expect: order desc: 3|2 5|4 8|7
+// expect: null partition: x|1 NULL|3
+// expect: order nulls first: 4|8
+// expect: order nulls last: 5|8
+// expect: two partition columns: a|0|2 a|1|3 b|0|2 b|1|1
+// expect: subquery: 5
+// expect: cte: 3
+// expect: view: 3
+// expect: join: 1|5 6|3
+// expect: lateral: a|3 a|1 b|1
+// expect: nested: 4
+// expect: group by over result: a|3
+// expect: input alias: 
+// expect: output alias: 3|6
+// expect: star of output: a|5 b|3
+// expect: column list: a|5 b|3
+// expect: binds: 3 1
+// expect: explain: scan m: rows of subquery 1 subquery 1 (from): run once   match_recognize: partition by g; order by id nulls last; measures c; pattern (a+ b); one row per match; skip past last row; define a; memo   scan t: full scan
+// expect: e partition unknown: 42703
+// expect: e column unknown: 42703
+// expect: e qualifier unknown: 42P01
+// expect: e input alias: 42P01
+// expect: e two variables: 42601
+// expect: e nested prev: 42601
+// expect: e agg in prev: 42601
+// expect: e offset: 42601
+// expect: e offset column: 42601
+// expect: e final in define: 42601
+// expect: e running misplaced: 42601
+// expect: e agg distinct: 0A000
+// expect: e agg other: 0A000
+// expect: e window: 42P20
+// expect: e subquery: 0A000
+// expect: e empty loop: 0A000
+// expect: e duplicate name: 42701
+// expect: e all rows duplicate: 42701
+// expect: e no output: 42601
+// expect: e unmatched exclusion: 42601
+// expect: e outside: 42883
+// expect: view of a match: a|3 a|1 b|1
+// expect: insert select: INSERT 0 2
+// expect: firsts: 2 5
+// expect: delete in: DELETE 2
+// expect: explain analyze: scan m: rows of subquery 1 (rows read 2,
+// expect: huge offsets: NULL|NULL
+// expect: empty input: 0
+// expect: prev leaves the match: 3|20|NULL
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_sql"
+import "../../../cmd/lexdb_exec"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if !r.hasRows { return r.tag }
+            var out: []str = []
+            for row in r.rows {
+                var vs: []str = []
+                for v in row { append(mut &vs, if lexdb_exec.isNull(&v) { "NULL" } else { lexdb_exec.text(&v) }) }
+                append(mut &out, strings.join(&vs, "|"))
+            }
+            return strings.join(&out, " ")
+        }
+        Err(e) { return e.state + " " + e.msg }
+    }
+}
+
+// a statement with binds (ints), through the parser and run
+fn qp(s: mut &lexdb_exec.Session, sql: &str, ps: []int): str {
+    match lexdb_sql.parse(sql) {
+        Ok(ss) {
+            var vals: []lexdb_sql.Val = []
+            var tys: []int = []
+            for p in ps {
+                append(mut &vals, lexdb_sql.Val.Int(p))
+                append(mut &tys, 20)
+            }
+            match s.run(&ss[0], &vals, &tys) {
+                Ok(r) {
+                    var out: []str = []
+                    for row in r.rows {
+                        var vs: []str = []
+                        for v in row { append(mut &vs, if lexdb_exec.isNull(&v) { "NULL" } else { lexdb_exec.text(&v) }) }
+                        append(mut &out, strings.join(&vs, "|"))
+                    }
+                    return strings.join(&out, " ")
+                }
+                Err(e) { return e.state + " " + e.msg }
+            }
+        }
+        Err(e) { return e.state + " " + e.msg }
+    }
+}
+
+fn state(s: mut &lexdb_exec.Session, sql: &str): str { return q(s, sql)[0..5] }
+
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: 256 * 1024, segBytes: 1024 * 1024, ckptBytes: 512 * 1024, snapNodes: 100000, bufferedPages: false}
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(47), opts(), fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        let c1 = q(mut &s, &"create table t (id int primary key, g text, v int)")
+        let c2 = q(mut &s, &"insert into t values (1,'a',10),(2,'a',20),(3,'a',15),(4,'a',null),(5,'a',30),(6,'b',5),(7,'b',6),(8,'b',4)")
+        let c3 = q(mut &s, &"create table ticker (symbol text, tstamp int, price int, primary key (symbol, tstamp))")
+        var prices = [12, 17, 19, 21, 25, 12, 15, 20, 24, 25, 19, 15, 25, 25, 14, 12, 14, 24, 23, 22]
+        var ins = ""
+        for i in 0..len(prices) { ins = ins + (if i > 0 { "," } else { "" }) + "('ACME'," + (i + 1).toStr() + "," + prices[i].toStr() + ")" }
+        let c4 = q(mut &s, &("insert into ticker values " + ins))
+        println("v shape: " + q(mut &s, &"select * from ticker match_recognize (partition by symbol order by tstamp measures strt.tstamp as start_t, last(down.tstamp) as bottom_t, last(up.tstamp) as end_t one row per match after match skip to last up pattern (strt down+ up+) define down as down.price < prev(down.price), up as up.price > prev(up.price)) order by start_t"))
+        println("empty one: " + q(mut &s, &"select * from t match_recognize (partition by g order by id measures match_number() as m, count(*) as c, classifier() as cl pattern (a*) define a as v > 12) order by g, m"))
+        println("omit all rows: " + q(mut &s, &"select id, m, c, cl from t match_recognize (partition by g order by id measures match_number() as m, count(*) as c, classifier() as cl all rows per match omit empty matches pattern (a*) define a as v > 12) order by id"))
+        println("skip next: " + q(mut &s, &"select m, f, l from t match_recognize (order by id measures match_number() as m, first(id) as f, last(id) as l after match skip to next row pattern (a b+) define b as v > 0) order by m"))
+        println("bounded: " + q(mut &s, &"select f, l, c from t match_recognize (order by id measures first(id) as f, last(id) as l, count(*) as c pattern (a{,2}) define a as id <> 4) order by f nulls last, l"))
+        println("running sum: " + q(mut &s, &"select c, sm from t match_recognize (order by id measures count(*) as c, sum(a.v) as sm pattern (a+) define a as sum(a.v) <= 30) order by c, sm"))
+        println("all rows big: " + q(mut &s, &"select id, rl, fl, vv, rs, fs, f1, l1, p2, nx, fa from t match_recognize (partition by g order by id measures running last(v) as rl, final last(v) as fl, v as vv, running sum(v) as rs, final sum(v) as fs, first(v, 1) as f1, last(v, 1) as l1, prev(v, 2) as p2, next(v) as nx, final last(a.id, 1) as fa all rows per match pattern (a+ b*) define a as id < 4 or id > 5, b as 1 = 1) where g = 'a' order by id"))
+        // reluctant, anchors, permute, exclusion, subsets
+        println("reluctant plus: " + q(mut &s, &"select f, l, c from t match_recognize (partition by g order by id measures first(id) as f, last(id) as l, count(*) as c pattern (a+? b) define b as id % 2 = 0) order by f"))
+        println("reluctant star: " + q(mut &s, &"select count(*), min(c), max(c) from t match_recognize (order by id measures count(*) as c pattern (a b*?) define b as true)"))
+        println("reluctant opt: " + q(mut &s, &"select f, l from t match_recognize (order by id measures first(id) as f, last(id) as l pattern (a b?? c{1,3}?) define a as id = 1, b as true, c as true) order by f"))
+        println("greedy opt: " + q(mut &s, &"select f, l from t match_recognize (order by id measures first(id) as f, last(id) as l pattern (a b? c{1,3}) define a as id = 1, b as true, c as true) order by f"))
+        println("begin: " + q(mut &s, &"select g, f, l from t match_recognize (partition by g order by id measures first(id) as f, last(id) as l pattern (^ a a) define a as true) order by g"))
+        println("end: " + q(mut &s, &"select g, f, l from t match_recognize (partition by g order by id measures first(id) as f, last(id) as l pattern (a a $) define a as true) order by g"))
+        println("begin star end: " + q(mut &s, &"select g, c from t match_recognize (partition by g order by id measures count(*) as c pattern (^ a* $) define a as v < 20 or v is null) order by g"))
+        println("permute: " + q(mut &s, &"select id, cl from t match_recognize (partition by g order by id measures classifier() as cl all rows per match pattern (permute(a, b)) define a as v > 12, b as v <= 12) order by id"))
+        println("permute three: " + q(mut &s, &"select cl, f, l from t match_recognize (partition by g order by id measures classifier() as cl, first(id) as f, last(id) as l pattern (permute(a, b, c)) define a as v = 10, b as v = 20, c as v = 15) order by f"))
+        println("exclusion all rows: " + q(mut &s, &"select id, cl, c from t match_recognize (order by id measures classifier() as cl, count(*) as c all rows per match pattern (a {- b+ -} c) define a as v = 10, b as v > 12, c as v is null) order by id"))
+        println("exclusion one row: " + q(mut &s, &"select cl, c from t match_recognize (order by id measures classifier() as cl, count(*) as c pattern (a {- b+ -} c) define a as v = 10, b as v > 12, c as v is null)"))
+        println("exclusion at the end: " + q(mut &s, &"select id, cl from t match_recognize (order by id measures classifier() as cl all rows per match pattern (a {- b -}) define a as v = 10, b as v = 20)"))
+        println("everything excluded: " + q(mut &s, &"select id from t match_recognize (order by id all rows per match pattern ({- a+ -}) define a as true)"))
+        println("subset: " + q(mut &s, &"select c, lv, tot from t match_recognize (partition by g order by id measures count(s.*) as c, last(s.v) as lv, sum(s.v) as tot pattern (a b c) subset s = (a, c) define a as v >= 10, b as v > 15, c as v is null or v < 40) order by g"))
+        println("classifier in define: " + q(mut &s, &"select c from t match_recognize (order by id measures count(*) as c pattern (a+) define a as classifier() = 'a' and v > 0)"))
+        println("match_number in define: " + q(mut &s, &"select m, c from t match_recognize (order by id measures match_number() as m, count(*) as c pattern (a+) define a as match_number() = 1 or v > 12) order by m"))
+        println("history define: " + q(mut &s, &"select f, l from t match_recognize (partition by g order by id measures first(id) as f, last(id) as l pattern (a b+) define b as v > a.v) order by f"))
+        println("first define: " + q(mut &s, &"select f, l, c from t match_recognize (partition by g order by id measures first(id) as f, last(id) as l, count(*) as c pattern (a b+) define a as true, b as v < first(a.v) + 10) order by f"))
+        println("nulls in define: " + q(mut &s, &"select c, cv from t match_recognize (order by id measures count(*) as c, count(v) as cv pattern (a+) define a as id <= 5) order by c"))
+        // skip
+        println("skip past last row: " + q(mut &s, &"select f, l from t match_recognize (order by id measures first(id) as f, last(id) as l after match skip past last row pattern (a b) define a as true, b as true) order by f"))
+        println("skip to first: " + q(mut &s, &"select f, l from t match_recognize (order by id measures first(id) as f, last(id) as l after match skip to first b pattern (a b c) define a as true, b as true, c as true) order by f"))
+        println("skip to last: " + q(mut &s, &"select f, l from t match_recognize (order by id measures first(id) as f, last(id) as l after match skip to last b pattern (a b+ c) define a as true, b as v > 0, c as true) order by f"))
+        println("skip to subset: " + q(mut &s, &"select f, l from t match_recognize (order by id measures first(id) as f, last(id) as l after match skip to last s pattern (a b c) subset s = (b, c) define a as true, b as true, c as true) order by f"))
+        println("skip unbounded: " + state(mut &s, &"select * from t match_recognize (order by id measures count(*) as c after match skip to b pattern (a b?) define a as v > 0, b as v > 100)"))
+        println("skip same start: " + state(mut &s, &"select * from t match_recognize (order by id measures count(*) as c after match skip to a pattern (a b) define a as true, b as true)"))
+        // rows per match
+        println("show empty: " + q(mut &s, &"select id, m, c from t match_recognize (partition by g order by id measures match_number() as m, count(*) as c all rows per match show empty matches pattern (a*) define a as v > 12) where g = 'a' order by id, m"))
+        println("unmatched: " + q(mut &s, &"select id, m, cl from t match_recognize (partition by g order by id measures match_number() as m, classifier() as cl all rows per match with unmatched rows pattern (a+) define a as v > 12) where g = 'a' order by id"))
+        println("skip to next row overlaps: " + q(mut &s, &"select id, m from t match_recognize (order by id measures match_number() as m all rows per match after match skip to next row pattern (a b) define a as id < 4, b as true) order by m, id"))
+        // partitions and order
+        println("order desc: " + q(mut &s, &"select f, l from t match_recognize (partition by g order by id desc measures first(id) as f, last(id) as l pattern (a b) define a as true, b as true) order by f"))
+        println("null partition: " + q(mut &s, &"select g, c from (values (1, null, 5), (2, null, 6), (3, 'x', 1), (4, null, 7)) as x(id, g, v) match_recognize (partition by g order by id measures count(*) as c pattern (a+) define a as true) order by g nulls last"))
+        println("order nulls first: " + q(mut &s, &"select f, c from t match_recognize (order by v nulls first, id measures first(id) as f, count(*) as c pattern (a b+) define a as true, b as true) order by f"))
+        println("order nulls last: " + q(mut &s, &"select f, c from t match_recognize (order by v desc nulls last, id measures first(id) as f, count(*) as c pattern (a b+) define a as true, b as true) order by f"))
+        println("two partition columns: " + q(mut &s, &"select * from (select id, g, id % 2 as p, v from t) x match_recognize (partition by g, p order by id measures count(*) as c pattern (a+) define a as true) order by g, p"))
+        // input forms
+        println("subquery: " + q(mut &s, &"select c from (select * from t where g = 'a') match_recognize (order by id measures count(*) as c pattern (a+) define a as true) m"))
+        println("cte: " + q(mut &s, &"with w as (select * from t where g = 'b') select c from w match_recognize (order by id measures count(*) as c pattern (a+) define a as true)"))
+        let vw = q(mut &s, &"create view vt as select * from t where g = 'b'")
+        println("view: " + q(mut &s, &"select c from vt match_recognize (order by id measures count(*) as c pattern (a+) define a as true) m"))
+        println("join: " + q(mut &s, &"select t.id, m.c from t join t match_recognize (partition by g order by id measures count(*) as c, first(id) as f pattern (a+) define a as true) m on m.f = t.id order by t.id"))
+        println("lateral: " + q(mut &s, &"select d.g, m.c from (select distinct g from t) d, lateral (select * from t where t.g = d.g) match_recognize (order by id measures count(*) as c pattern (a+) define a as v > 5) m order by d.g"))
+        println("nested: " + q(mut &s, &"select c2 from (select c from t match_recognize (order by id measures count(*) as c after match skip past last row pattern (a b) define a as true, b as true)) match_recognize (order by c measures count(*) as c2 pattern (x+) define x as true)"))
+        println("group by over result: " + q(mut &s, &"select cl, count(*) from t match_recognize (order by id measures classifier() as cl all rows per match pattern (a+) define a as v > 12) group by cl"))
+        println("input alias: " + q(mut &s, &"select * from t x match_recognize (order by id measures count(*) as c pattern (a+) define a as v > 100) m"))
+        println("output alias: " + q(mut &s, &"select m.c, m.f from t match_recognize (partition by g order by id measures count(*) as c, first(id) as f pattern (a+) define a as true) as m where m.g = 'b'"))
+        println("star of output: " + q(mut &s, &"select m.* from t match_recognize (partition by g order by id measures count(*) as c pattern (a+) define a as true) m order by g"))
+        println("column list: " + q(mut &s, &"select x, y from t match_recognize (partition by g order by id measures count(*) as c pattern (a+) define a as true) m (x, y) order by x"))
+        println("binds: " + qp(mut &s, &"select c from t match_recognize (order by id measures count(*) as c pattern (a+) define a as v > $1 + $2)", [3, 4]))
+        println("explain: " + q(mut &s, &"explain select * from t match_recognize (partition by g order by id measures count(*) as c pattern (a+ b) define a as v > 1) m"))
+        // errors
+        println("e partition unknown: " + state(mut &s, &"select * from t match_recognize (partition by zz order by id measures 1 as c pattern (a) define a as true)"))
+        println("e column unknown: " + state(mut &s, &"select * from t match_recognize (order by id measures zz as c pattern (a) define a as true)"))
+        println("e qualifier unknown: " + state(mut &s, &"select * from t match_recognize (order by id measures q.id as c pattern (a) define a as true)"))
+        println("e input alias: " + state(mut &s, &"select * from t x match_recognize (order by id measures x.id as c pattern (a) define a as true)"))
+        println("e two variables: " + state(mut &s, &"select * from t match_recognize (order by id measures sum(a.v + b.v) as c pattern (a b) define a as true, b as true)"))
+        println("e nested prev: " + state(mut &s, &"select * from t match_recognize (order by id measures prev(prev(v)) as c pattern (a) define a as true)"))
+        println("e agg in prev: " + state(mut &s, &"select * from t match_recognize (order by id measures prev(sum(v)) as c pattern (a) define a as true)"))
+        println("e offset: " + state(mut &s, &"select * from t match_recognize (order by id measures prev(v, -1) as c pattern (a) define a as true)"))
+        println("e offset column: " + state(mut &s, &"select * from t match_recognize (order by id measures prev(v, id) as c pattern (a) define a as true)"))
+        println("e final in define: " + state(mut &s, &"select * from t match_recognize (order by id measures 1 as c pattern (a) define a as final count(*) > 0)"))
+        println("e running misplaced: " + state(mut &s, &"select * from t match_recognize (order by id measures running v as c pattern (a) define a as true)"))
+        println("e agg distinct: " + state(mut &s, &"select * from t match_recognize (order by id measures count(distinct v) as c pattern (a) define a as true)"))
+        println("e agg other: " + state(mut &s, &"select * from t match_recognize (order by id measures string_agg(g, ',') as c pattern (a) define a as true)"))
+        println("e window: " + state(mut &s, &"select * from t match_recognize (order by id measures sum(v) over () as c pattern (a) define a as true)"))
+        println("e subquery: " + state(mut &s, &"select * from t match_recognize (order by id measures (select 1) as c pattern (a) define a as true)"))
+        println("e empty loop: " + state(mut &s, &"select * from t match_recognize (order by id measures 1 as c pattern ((a*)*) define a as true)"))
+        println("e duplicate name: " + state(mut &s, &"select * from t match_recognize (partition by g order by id measures 1 as g pattern (a) define a as true)"))
+        println("e all rows duplicate: " + state(mut &s, &"select * from t match_recognize (order by id measures 1 as v all rows per match pattern (a) define a as true)"))
+        println("e no output: " + state(mut &s, &"select * from t match_recognize (order by id pattern (a) define a as true)"))
+        println("e unmatched exclusion: " + state(mut &s, &"select * from t match_recognize (order by id all rows per match with unmatched rows pattern ({- a -}) define a as true)"))
+        println("e outside: " + state(mut &s, &"select classifier() from t"))
+        // in other statements, and a view over a match
+        let cv = q(mut &s, &"create view mv as select g, n from t match_recognize (partition by g order by id measures count(*) as n pattern (a+) define a as v > 5)")
+        println("view of a match: " + q(mut &s, &"select * from mv order by g"))
+        let c5 = q(mut &s, &"create table firsts (id int primary key)")
+        println("insert select: " + q(mut &s, &"insert into firsts select f from t match_recognize (partition by g order by id measures first(id) as f pattern (a+) define a as v > 12) m"))
+        println("firsts: " + q(mut &s, &"select id from firsts order by id"))
+        println("delete in: " + q(mut &s, &"delete from firsts where id in (select f from t match_recognize (order by id measures first(id) as f pattern (a+) define a as v > 12) m)"))
+        println("explain analyze: " + q(mut &s, &"explain analyze select * from t match_recognize (order by id measures count(*) as c pattern (a+) define a as v > 1) m")[0..40])
+        println("huge offsets: " + q(mut &s, &"select x, y from t match_recognize (order by id measures next(v, 9223372036854775807) as x, prev(v, 9223372036854775807) as y, first(v, 9223372036854775807) as z pattern (a) define a as id = 1) m"))
+        println("empty input: " + q(mut &s, &"select count(*) from (select * from t where id < 0) match_recognize (order by id measures count(*) as c pattern (a*) define a as true) m"))
+        println("prev leaves the match: " + q(mut &s, &"select f, p, n from t match_recognize (order by id measures first(id) as f, prev(first(a.v)) as p, next(last(a.v)) as n pattern (a) define a as id = 3) m"))
+        return 0
+    })
+}

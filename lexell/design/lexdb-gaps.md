@@ -222,10 +222,12 @@ In three tiers, by how soon a real application meets the gap.
   `DO` blocks, triggers, and `$$` quoting.
 - **Databases and authentication:**
   - more than one database per server (`current_database()` is always
-    `lexdb`);
+    `lexdb`); deferred, and for tests see 2.7;
   - `pg_hba.conf`-style rules.
 - **Large subsystems:**
-  - partitioning;
+  - partitioning (the user leans against it; see 2.5 for what is planned
+    instead);
+  - tablespaces: decided against (2.6);
   - extensions;
   - full-text search;
   - `TABLESAMPLE`;
@@ -260,6 +262,120 @@ In three tiers, by how soon a real application meets the gap.
     writes no WAL for them.
 - **Speed:** SIMD needs a Lexell language or runtime change: the user's
   decision (item 12 of 9.4).
+
+### 2.5 Bulk deletes, in place of partitioning (noted 2026-11-14)
+
+The user is leaning against declarative partitioning (2.3). Partitioning's
+lasting value today is cheap removal of old data. lexdb already avoids
+PostgreSQL's after-cost (no heap, no VACUUM: a DELETE removes rows and
+index entries at commit), and min/max leaf skipping already gives much of
+partition pruning. What is left is a large purge. Measured so far (9.109,
+warm): DELETE of 10k rows with one index 164 ms (PostgreSQL 52), about
+190k rows with no index 349 ms (PostgreSQL 99), so roughly 16 µs and 2 µs
+a row. A drop instead frees a 105 MB table in 1.5 to 13 ms without reading
+its leaves (9.32). Leaves are never merged, so a delete scattered across
+the key order leaves sparse leaves for good.
+
+Two next steps cover most of what partitioning would give:
+
+1. **A range delete as a subtree drop.** A DELETE whose WHERE is only a
+   range on the leading primary-key columns detaches the subtrees the range
+   covers whole, freed as a dropped table's are (9.32), and deletes rows
+   one by one only in the two edge leaves. The design question is the
+   secondary indexes: their order differs, so either the fast path applies
+   only to a table with none (or with indexes that lead with the same
+   key), or their entries are still deleted one by one. The log records
+   the range, not each row; recovery and the replicas' follower must apply
+   it the same way.
+2. **Bounded memory for a large transaction.** A transaction's writes stay
+   in memory until its commit, about 176 bytes a row (2.4), and DELETE has
+   no way to bound them: deleting 100M rows would hold something like 15
+   to 20 GB [estimate]. Either spill a transaction's writes to disk past a
+   size, as sorts spill, keeping the statement all or nothing; or give
+   DELETE (and UPDATE) a batched form like COPY's `WITH (batch_rows n)`,
+   which commits in parts and is not.
+
+`design/lexdb-events.md` (expiry of old events) would use either.
+
+### 2.6 Tablespaces: decided against; a log directory instead (2026-11-14)
+
+**Decision (the user's): lexdb will not support tablespaces.** They were
+made for small disks that nothing joined, raw devices, spreading I/O over
+spindles, and backup or offline by container. Today a filesystem or
+volume grows online and takes new disks (LVM, ZFS, btrfs, XFS, cloud
+volumes) without the database knowing. `CREATE TABLESPACE` and the
+`TABLESPACE` clauses stay unsupported. `pg_tablespace` keeps its one
+row, `pg_default` (oid 1663), for clients that only read it.
+
+Notes that go with the decision:
+- One data file means the filesystem's largest file is lexdb's largest
+  database: 16 TiB on ext4 with 4 KiB blocks, far more on XFS. Say so in
+  the docs.
+- A full filesystem (ENOSPC) on a data or log write must fail cleanly and
+  recover once space is added. Check that a test covers it.
+
+**To build: the log in a directory of its own.** Not supported today:
+`lexdb_disk.Fs.Real(dir)` is the one directory for every file, so the log
+segments (`log.N`, `log.spare`, `lexdb_store.segName`) sit beside the data
+file, and there is no flag (`cmd/lexdb.lxl` `usage`). Wanted: a
+`--log-dir DIR` (name to be chosen), so the log's fsyncs go to another
+device from the checkpoint's writes, and a full data disk does not stop
+the log. What it touches:
+- a second `Fs` for the log, used for opening, creating, renaming and
+  removing the segments and the spare;
+- `syncDir` on the log's directory after those, not the data's;
+- the replicas' follower, which reads segments (`lexdb_store` around
+  5090 to 5272);
+- startup: refuse a data directory whose log is missing or is somewhere
+  else (the directory recorded where the data file can check it), so
+  the wrong log is never replayed;
+- `--replica` and the supervisor passing the option to each worker;
+- the crash tests (the simulated `Fs` is one store; it needs two, or
+  names that tell them apart).
+
+A temporary or spill directory is not needed yet: lexdb spills nothing
+(2.4). Add one with the first spill.
+
+### 2.7 Fast empty databases for tests (2026-11-14)
+
+What the user wants from "multiple databases" (2.3, deferred) is cheap,
+isolated, known starting states for test fixtures, so tests can run in
+parallel. The plan, in place of `CREATE DATABASE ... TEMPLATE`:
+- **A template data directory, cloned per test worker** with `mkdir wN;
+  chattr +C wN; cp --reflink=always template/data.lxdb template/log.1 wN/`,
+  then one lexdb per worker. Nothing to build. Measured (btrfs, a build of
+  2026-11-13; 31 tables, 62 indexes, 56,000 seed rows; times include
+  psql's own start): a copy 2 to 5 ms, start to first answer 7 to 21 ms,
+  TRUNCATE of all 31 tables 8 to 16 ms, 14 MB RSS a server, 432 KB of
+  its own disk a clone. 8 and 16 at once were as fast as one. Ports must
+  be below the ephemeral range (32768 to 60999 here), or a client's
+  socket can take one.
+- **Reset within a fixture:** a rollback per test (free: the writes are in
+  memory until commit), or TRUNCATE.
+- **To build: a test-only no-sync mode** (`--no-sync` or similar): a
+  commit does not wait for fdatasync, about 1 ms a commit on this machine.
+  The user wants this. Name it so no one runs production with it, and say
+  in the log at start that it is on.
+- **To consider with it:** a cache budget option. Every server takes the
+  same default budget (11,987 MB here), so many servers at once could
+  together promise more memory than the machine has.
+- Later, only if restarts prove too slow: reset in place to a pinned
+  checkpoint.
+
+**Future task, after all the planned work (the user's, 2026-11-14):
+TRUNCATE CASCADE in the T-SQL and Oracle doors.** The PostgreSQL door has
+it (9.91): checked on a clone of the template above, `truncate ref
+cascade` emptied ref, the 30 tables referencing it and a table
+referencing one of those, in 3.3 ms. The aim is the same reset for tests
+through the other two doors. Each server differs:
+- **SQL Server** has no CASCADE on TRUNCATE, and refuses to truncate any
+  table a foreign key references (4712). `TRUNCATE TABLE t CASCADE` would
+  be lexdb's own extension. Keep 4712 for the plain form.
+- **Oracle** (12c on) has `TRUNCATE TABLE t CASCADE`, but follows only
+  foreign keys declared ON DELETE CASCADE, and refuses otherwise. To
+  decide: Oracle's rule, or PostgreSQL's (every referencing table), which
+  is what tests want.
+- Not yet checked: what the two doors do with CASCADE today.
 
 ## 3. A proposed order
 

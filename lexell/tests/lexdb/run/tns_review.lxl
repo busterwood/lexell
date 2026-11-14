@@ -1,0 +1,214 @@
+// lexdb_tns, the fixes of the review of the Oracle door (design/lexdb-oracle.md, "Review fixes"): arithmetic
+// that used to stop the whole process (an overflow, a float that is no int, a scale past the digits a number holds)
+// is an ORA- error now; the LOB_OP numbers and the pre-login request size are bounded; stored code only in one's own
+// schema (a DBA's: any); a call's value spliced into SQL stays a value; FOR UPDATE keeps its locks; DBMS_OUTPUT's
+// buffer is bounded; USER_ views list one's own schema; GRANT ... ON takes a name and nothing else.
+// expect: scram cleared: true true
+// expect: sysdate plus 1e12: error 1841
+// expect: sysdate minus 1e12: error 1841
+// expect: sysdate plus 1e300: error 1426
+// expect: add_months huge: error 1841
+// expect: substr huge length: 'a'
+// expect: substr huge position: NULL
+// expect: instr huge position: 0
+// expect: substr float huge: error 1426
+// expect: trunc scale: 0 0 0
+// expect: round scale: 0 0 1.5
+// expect: number overflow: error 1426
+// expect: lob ok: false false false false
+// expect: lob negative: true true true true
+// expect: lob huge: true true true true
+// expect: lob write grows: true false
+// expect: request cap: false true false true
+// expect: other user create: error 1031
+// expect: own create: 0
+// expect: dba create: 0
+// expect: other user drop: error 1031
+// expect: dba drop: 0
+// expect: own drop: 0
+// expect: spliced negative: 2
+// expect: spliced in subtraction: 5
+// expect: for update taken: 1
+// expect: for update held: error 54
+// expect: for update released: 1
+// expect: output buffer: error 20000
+// expect: output buffer ok: 0
+// expect: user_tables of app: 1
+// expect: user_tables of sa: 1
+// expect: grant object: error 942
+// expect: table survives: 1
+// expect: grant quoted: 0
+import "task"
+import "net"
+import "strings"
+import "oracle"
+import "sqldialect"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_tns"
+import "../../../cmd/lexdb_sql"
+import "../../../cmd/lexdb_auth"
+
+fn connect(s: &str): oracle.Conn {
+    match oracle.connect(s.toStr()) {
+        Ok(c) { return c }
+        Err(e) {
+            println("connect: error " + e.code.toStr() + " " + e.msg)
+            exit(1)
+        }
+    }
+}
+
+fn show(r: Result[oracle.Rows, oracle.Error]): str {
+    match r {
+        Ok(rows) { return "ok" }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+fn values(rows: &oracle.Rows, row: int): str {
+    var out: []str = []
+    for i in 0..rows.columnCount() {
+        match rows.isNull(row, i) {
+            Ok(n) {
+                if n { append(mut &out, "NULL") } else {
+                    match rows.value(row, i) {
+                        Ok(v) { append(mut &out, v.toStr()) }
+                        Err(e) { append(mut &out, "error " + e.code.toStr() + " " + e.msg) }
+                    }
+                }
+            }
+            Err(e) { append(mut &out, "error " + e.code.toStr()) }
+        }
+    }
+    return strings.join(&out, " ")
+}
+
+fn err(r: Result[int, oracle.Error]): str {
+    match r {
+        Ok(n) { return n.toStr() }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+fn q1(c: mut &oracle.Conn, sql: &str): str {
+    match c.query(sql.toStr(), &[]) {
+        Ok(r) {
+            var out: []str = []
+            for i in 0..r.rowCount() { append(mut &out, values(&r, i)) }
+            return strings.join(&out, ",")
+        }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+
+fn code(r: Result[oracle.Conn, oracle.Error]): str {
+    match r {
+        Ok(c) { return "connected" }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+
+fn lobs() {
+    // LOB_READ 2, LOB_TRIM 0x20, LOB_WRITE 0x40: offset, amount, bytes written, bytes the connection holds
+    println("lob ok: " + lexdb_tns.lobBad(2, 1, 100, 0, 0).toStr() + " " + lexdb_tns.lobBad(0x20, 1, 5, 0, 0).toStr() + " " +
+            lexdb_tns.lobBad(0x40, 1, 0, 10, 0).toStr() + " " + lexdb_tns.lobBad(1, -5, -5, 0, 0).toStr())
+    println("lob negative: " + lexdb_tns.lobBad(2, -1, 5, 0, 0).toStr() + " " + lexdb_tns.lobBad(2, 1, -5, 0, 0).toStr() + " " +
+            lexdb_tns.lobBad(0x20, 1, -1, 0, 0).toStr() + " " + lexdb_tns.lobBad(0x40, -9223372036854775807, 0, 1, 0).toStr())
+    println("lob huge: " + lexdb_tns.lobBad(2, 9223372036854775807, 1, 0, 0).toStr() + " " + lexdb_tns.lobBad(0x20, 1, 9223372036854775807, 0, 0).toStr() + " " +
+            lexdb_tns.lobBad(0x40, 4000000000, 0, 1, 0).toStr() + " " + lexdb_tns.lobBad(0x40, 1, 0, 536870912, 0).toStr())
+    println("lob write grows: " + lexdb_tns.lobBad(0x40, 1, 0, 200000000, 400000000).toStr() + " " + lexdb_tns.lobBad(0x40, 1, 0, 200000000, 0).toStr())
+    println("request cap: " + lexdb_tns.requestTooBig(false, 16384).toStr() + " " + lexdb_tns.requestTooBig(false, 16385).toStr() + " " +
+            lexdb_tns.requestTooBig(true, 1000000).toStr() + " " + lexdb_tns.requestTooBig(true, 67108865).toStr())
+}
+
+fn client(port: &str) {
+    let dsn = "127.0.0.1:" + port + "/lexdb"
+    var c = connect(&("User Id=sa;Password=sa;Data Source=" + dsn))
+    println("sysdate plus 1e12: " + q1(mut &c, &"select sysdate + 1e12 from dual"))
+    println("sysdate minus 1e12: " + q1(mut &c, &"select sysdate - 1000000000000 from dual"))
+    println("sysdate plus 1e300: " + q1(mut &c, &"select sysdate + 1e300 from dual"))
+    println("add_months huge: " + q1(mut &c, &"select add_months(sysdate, 9000000000000000000) from dual"))
+    println("substr huge length: " + q1(mut &c, &"select substr('a', 1, 9223372036854775807) from dual"))
+    println("substr huge position: " + q1(mut &c, &"select substr('a', 2, 9223372036854775807) from dual"))
+    println("instr huge position: " + q1(mut &c, &"select instr('abc', 'b', 9223372036854775807) from dual"))
+    println("substr float huge: " + q1(mut &c, &"select substr('abc', 1e300) from dual"))
+    println("trunc scale: " + q1(mut &c, &"select trunc(1, -40000), trunc(12345, -300), trunc(1.5, -9223372036854775807) from dual"))
+    println("round scale: " + q1(mut &c, &"select round(1.5, -40000), round(12345, -9223372036854775807), round(1.5, 9223372036854775807) from dual"))
+    println("number overflow: " + q1(mut &c, &"select 99999999999999999999999999999999999999 * 10 + 99999999999999999999999999999999999999 * 10 from dual"))
+    lobs()
+    c.exec("create table emp (id number(5) primary key, name varchar2(20))").unwrap()
+    c.exec("insert into emp values (1, 'a')").unwrap()
+    c.exec("commit").unwrap()
+    c.exec("create user app identified by pw").unwrap()
+    c.exec("grant create session, create table to app").unwrap()
+    var a = connect(&("User Id=app;Password=pw;Data Source=" + dsn))
+    println("other user create: " + err(a.run("create or replace procedure sa.pwn as begin null; end;", &[])))
+    println("own create: " + err(a.run("create or replace procedure mine as begin null; end;", &[])))
+    println("dba create: " + err(c.run("create or replace procedure app.theirs as begin null; end;", &[])))
+    c.exec("create or replace procedure sap as begin null; end;").unwrap()
+    println("other user drop: " + err(a.run("drop procedure sa.sap", &[])))
+    println("dba drop: " + err(c.run("drop procedure app.theirs", &[])))
+    println("own drop: " + err(a.run("drop procedure mine", &[])))
+    c.exec("create or replace function neg(x number) return number is begin return -1; end;").unwrap()
+    println("spliced negative: " + q1(mut &c, &"select 1 - neg(1) from dual"))
+    println("spliced in subtraction: " + q1(mut &c, &"select 4 --x\n - neg(0) from dual"))
+    // FOR UPDATE in an idle session: the lock is held until the transaction ends
+    var d = connect(&("User Id=sa;Password=sa;Data Source=" + dsn))
+    println("for update taken: " + q1(mut &c, &"select id from emp where id = 1 for update"))
+    println("for update held: " + q1(mut &d, &"select id from emp where id = 1 for update nowait"))
+    c.exec("rollback").unwrap()
+    println("for update released: " + q1(mut &d, &"select id from emp where id = 1 for update nowait"))
+    d.exec("rollback").unwrap()
+    println("output buffer: " + err(c.run("begin dbms_output.enable(2000); for i in 1..100 loop dbms_output.put_line(rpad('x', 100, 'x')); end loop; end;", &[])))
+    println("output buffer ok: " + err(c.run("begin dbms_output.enable(1000000); for i in 1..100 loop dbms_output.put_line(rpad('x', 100, 'x')); end loop; end;", &[])))
+    a.exec("create table mine (a number)").unwrap()
+    println("user_tables of app: " + q1(mut &a, &"select count(*) from user_tables"))
+    println("user_tables of sa: " + q1(mut &c, &"select count(*) from user_tables"))
+    println("grant object: " + err(c.run("grant select on emp; drop table emp to app", &[])))
+    println("table survives: " + q1(mut &c, &"select count(*) from emp"))
+    println("grant quoted: " + err(c.run("grant select on \"EMP\" to app", &[])))
+    a.logoff()
+    c.logoff()
+    d.logoff()
+}
+
+fn verifiers(st: lexdb_store.Store) {
+    var se = lexdb_exec.newSession(st)
+    let none: []lexdb_sql.Val = []
+    let nt: []int = []
+    for sql in ["create role vrole login password 'secret'"] {
+        for stmt in lexdb_sql.parse(&sql).unwrap() { let r = se.run(&stmt, &none, &nt).unwrap() }
+    }
+    let ov = lexdb_auth.makeOraVerifier(&"newpw").unwrap()
+    for stmt in lexdb_sql.parse(&("alter role vrole password '" + ov + "'")).unwrap() { let r = se.run(&stmt, &none, &nt).unwrap() }
+    var cleared = false
+    var kept = false
+    for r in lexdb_exec.roles(&st).unwrap() {
+        if r.name == "vrole" {
+            cleared = len(r.verifier) == 0
+            kept = r.oraVerifier == ov
+        }
+    }
+    println("scram cleared: " + cleared.toStr() + " " + kept.toStr())
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    verifiers(st)
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        let f = s.start(lexdb_tns.acceptLoop, lexdb_tns.AcceptArg{ln: ln, st: st})
+        client(&addr[10..len(addr)])
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(5), lexdb_store.Options{cacheBytes: 128 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000, bufferedPages: false}, body).unwrap()
+}

@@ -290,28 +290,28 @@ fn (c: mut &Cur) need(n: int, what: str): Result[Unit, Error] {
     return Ok(Unit{})
 }
 
-fn (c: mut &Cur) u8(what: str): Result[int, Error] {
+pub fn (c: mut &Cur) u8(what: str): Result[int, Error] {
     try c.need(1, what)
     let v = int(c.s[c.pos])
     c.pos += 1
     return Ok(v)
 }
 
-fn (c: mut &Cur) u16be(what: str): Result[int, Error] {
+pub fn (c: mut &Cur) u16be(what: str): Result[int, Error] {
     try c.need(2, what)
     let v = (int(c.s[c.pos]) << 8) | int(c.s[c.pos + 1])
     c.pos += 2
     return Ok(v)
 }
 
-fn (c: mut &Cur) u16le(what: str): Result[int, Error] {
+pub fn (c: mut &Cur) u16le(what: str): Result[int, Error] {
     try c.need(2, what)
     let v = int(c.s[c.pos]) | (int(c.s[c.pos + 1]) << 8)
     c.pos += 2
     return Ok(v)
 }
 
-fn (c: mut &Cur) u32be(what: str): Result[int, Error] {
+pub fn (c: mut &Cur) u32be(what: str): Result[int, Error] {
     try c.need(4, what)
     var v = 0
     for k in 0..4 { v = (v << 8) | int(c.s[c.pos + k]) }
@@ -319,14 +319,14 @@ fn (c: mut &Cur) u32be(what: str): Result[int, Error] {
     return Ok(v)
 }
 
-fn (c: mut &Cur) take(n: int, what: str): Result[str, Error] {
+pub fn (c: mut &Cur) take(n: int, what: str): Result[str, Error] {
     try c.need(n, what)
     let v = c.s[c.pos..c.pos + n]
     c.pos += n
     return Ok(v)
 }
 
-fn (c: mut &Cur) skip(n: int, what: str): Result[Unit, Error] {
+pub fn (c: mut &Cur) skip(n: int, what: str): Result[Unit, Error] {
     try c.need(n, what)
     c.pos += n
     return Ok(Unit{})
@@ -351,12 +351,12 @@ pub fn (c: mut &Cur) ub2(what: str): Result[int, Error] { return c.uni(2, what) 
 pub fn (c: mut &Cur) ub4(what: str): Result[int, Error] { return c.uni(4, what) }
 pub fn (c: mut &Cur) ub8(what: str): Result[int, Error] { return c.uni(8, what) }
 
-fn (c: mut &Cur) skipUb(what: str): Result[Unit, Error] {
+pub fn (c: mut &Cur) skipUb(what: str): Result[Unit, Error] {
     let v = try c.uni(8, what)
     return Ok(Unit{})
 }
 
-fn (c: mut &Cur) skipN(n: int, what: str): Result[Unit, Error] {
+pub fn (c: mut &Cur) skipN(n: int, what: str): Result[Unit, Error] {
     for i in 0..n { try c.skipUb(what) }
     return Ok(Unit{})
 }
@@ -376,7 +376,7 @@ pub fn (c: mut &Cur) bytes(what: str): Result[Option[str], Error] {
     return Ok(Some(strFromBytes(&out)))
 }
 
-fn (c: mut &Cur) bytesOrEmpty(what: str): Result[str, Error] {
+pub fn (c: mut &Cur) bytesOrEmpty(what: str): Result[str, Error] {
     match try c.bytes(what) {
         Some(b) { return Ok(b) }
         None { return Ok("") }
@@ -384,7 +384,7 @@ fn (c: mut &Cur) bytesOrEmpty(what: str): Result[str, Error] {
 }
 
 // A ub4 length, then (when not 0) bytes with a length.
-fn (c: mut &Cur) str2(what: str): Result[str, Error] {
+pub fn (c: mut &Cur) str2(what: str): Result[str, Error] {
     let n = try c.ub4(what)
     if n == 0 { return Ok("") }
     return c.bytesOrEmpty(what)
@@ -588,6 +588,37 @@ pub fn decodeFloat(b: str): Result[float, Error] {
     for k in 0..4 { bits = (bits << 8) | int(b[k]) }
     if (bits & 0x80000000) != 0 { bits = bits & 0x7fffffff } else { bits = (~bits) & 0xffffffff }
     return Ok(floatOfBits32(bits))
+}
+
+// ---------------------------------------------------------------- intervals
+
+fn pad(n: int, w: int): str {
+    let s = n.toStr()
+    return strings.repeat("0", max(0, w - len(s))) + s
+}
+
+fn iabs(n: int): int { return if n < 0 { -n } else { n } }
+
+fn be32(b: str, at: int): int { return (int(b[at]) << 24) | (int(b[at + 1]) << 16) | (int(b[at + 2]) << 8) | int(b[at + 3]) }
+
+// An INTERVAL DAY TO SECOND (11 bytes) or INTERVAL YEAR TO MONTH (5 bytes) as
+// Oracle writes it by default: "+000000001 02:03:04.000000500", "-000000001-02".
+pub fn intervalText(t: int, b: str): Result[str, Error] {
+    if t == T_INTERVAL_YM {
+        if len(b) != 5 { return Err(proto("an INTERVAL YEAR TO MONTH of " + len(b).toStr() + " bytes")) }
+        let y = be32(b, 0) - 0x80000000
+        let m = int(b[4]) - 60
+        let neg = y < 0 || m < 0
+        return Ok((if neg { "-" } else { "+" }) + pad(iabs(y), 9) + "-" + pad(iabs(m), 2))
+    }
+    if len(b) != 11 { return Err(proto("an INTERVAL DAY TO SECOND of " + len(b).toStr() + " bytes")) }
+    let d = be32(b, 0) - 0x80000000
+    let h = int(b[4]) - 60
+    let mi = int(b[5]) - 60
+    let s = int(b[6]) - 60
+    let f = be32(b, 7) - 0x80000000
+    let neg = d < 0 || h < 0 || mi < 0 || s < 0 || f < 0
+    return Ok((if neg { "-" } else { "+" }) + pad(iabs(d), 9) + " " + pad(iabs(h), 2) + ":" + pad(iabs(mi), 2) + ":" + pad(iabs(s), 2) + "." + pad(iabs(f), 9))
 }
 
 // ---------------------------------------------------------------- dates
@@ -1553,6 +1584,12 @@ fn cellOf(col: &Column, b: str): Cell {
     }
     if t == T_RAW || t == T_LONG_RAW { return Cell.Bytes(b) }
     if t == T_BOOLEAN { return Cell.Bool(len(b) > 0 && int(b[len(b) - 1]) == 1) }
+    if t == T_INTERVAL_DS || t == T_INTERVAL_YM {
+        match intervalText(t, b) {
+            Ok(x) { return Cell.Text(x) }
+            Err(e) { return Cell.Failed(e.msg) }
+        }
+    }
     if t == T_UROWID { return Cell.Failed("UROWID values are not supported yet") }
     return Cell.Failed(col.typeName() + " values are not supported yet")
 }
@@ -1640,9 +1677,18 @@ fn skipQuoted(sql: str, i: int, prev: byte): int {
 // occurrence in SQL, each name once in PL/SQL. Strings, q'[...]' strings,
 // quoted identifiers and comments are skipped; a colon right after a string
 // is JSON syntax, not a bind. (python-oracledb's StatementParser.)
-pub fn placeholders(sql: str): []Placeholder {
+// A placeholder with where it stands in the text: sql[start..end] is the
+// colon and the name.
+pub type Site = value record { pub name: str; pub returning: bool; pub start: int; pub end: int }
+
+// The placeholders of a statement (each occurrence in SQL, each name once in
+// PL/SQL) and where RETURNING ... INTO's INTO starts (-1: none).
+pub type Sites = value record { pub sites: []Site; pub into: int }
+
+pub fn bindSites(sql: str): Sites {
     let kind = statementKind(sql)
-    var out: []Placeholder = []
+    var out: []Site = []
+    var into = -1
     var returningSeen = false
     var returning = false
     var lastWasString = false
@@ -1663,6 +1709,7 @@ pub fn placeholders(sql: str): []Placeholder {
                 returningSeen = true
             } else if returningSeen && w == "INTO" {
                 returning = true
+                into = alphaStart
             }
         }
         if ch == '\'' {
@@ -1694,10 +1741,11 @@ pub fn placeholders(sql: str): []Placeholder {
                 }
                 if found {
                     var dup = false
+                    let colon = start
                     if kind == S_PLSQL {
                         for p in out { if p.name == name { dup = true } }
                     }
-                    if !dup { append(mut &out, Placeholder{name: name, returning: returning}) }
+                    if !dup { append(mut &out, Site{name: name, returning: returning, start: colon, end: i + 1}) }
                 }
             } else {
                 i = skipQuoted(sql, i, prev)
@@ -1708,6 +1756,12 @@ pub fn placeholders(sql: str): []Placeholder {
         prev = ch
         i += 1
     }
+    return Sites{sites: out, into: into}
+}
+
+pub fn placeholders(sql: str): []Placeholder {
+    var out: []Placeholder = []
+    for s in bindSites(sql).sites { append(mut &out, Placeholder{name: s.name, returning: s.returning}) }
     return out
 }
 
@@ -2243,7 +2297,7 @@ pub type Session = record {
     pendingCols: []Column       // its cursor's columns, to read the reply past
 }
 
-fn compileCaps(fv: int, eor: bool): str {
+pub fn compileCaps(fv: int, eor: bool): str {
     var c = array(55, byte(0))
     c[0] = byte(6)
     c[4] = byte(8 | 2 | 32 | 64 | 0x80)
@@ -2271,7 +2325,7 @@ fn compileCaps(fv: int, eor: bool): str {
     return strFromBytes(&c)
 }
 
-fn runtimeCaps(): str {
+pub fn runtimeCaps(): str {
     var c = array(13, byte(0))
     c[0] = byte(2)
     c[6] = byte(0x01 | 0x04)
@@ -3066,7 +3120,9 @@ fn kindsOf(c: &Column): int {
     }
     if t == T_BINARY_INTEGER { return sqlrows.kinds(&[sqlrows.Kind.Int, sqlrows.Kind.Decimal]) }
     if t == T_BINARY_FLOAT || t == T_BINARY_DOUBLE { return sqlrows.kinds(&[sqlrows.Kind.Float]) }
-    if t == T_VARCHAR || t == T_CHAR || t == T_LONG || t == T_ROWID { return sqlrows.kinds(&[sqlrows.Kind.Text]) }
+    if t == T_VARCHAR || t == T_CHAR || t == T_LONG || t == T_ROWID || t == T_INTERVAL_DS || t == T_INTERVAL_YM {
+        return sqlrows.kinds(&[sqlrows.Kind.Text])
+    }
     if t == T_RAW || t == T_LONG_RAW { return sqlrows.kinds(&[sqlrows.Kind.Bytes]) }
     if t == T_DATE { return sqlrows.kinds(&[sqlrows.Kind.DateTime, sqlrows.Kind.Date]) }
     if t == T_TIMESTAMP || t == T_TIMESTAMP_LTZ { return sqlrows.kinds(&[sqlrows.Kind.DateTime]) }

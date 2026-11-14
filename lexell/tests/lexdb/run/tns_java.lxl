@@ -1,0 +1,175 @@
+// lexdb over TNS, the fixes of the Java client pass (design/lexdb-oracle.md, "Java client pass"): the savepoint a
+// DML statement's guard released, the owner of an object in the catalog views (ALL_OBJECTS, ALL_TABLES and
+// ALL_TAB_COLUMNS named the account the templates were taken from), a view's text column as VARCHAR2, DBMS_LOB.GETLENGTH
+// and SUBSTR, UTL_RAW.CAST_TO_*, ALL_TAB_COL_STATISTICS, DBMS_UTILITY.NAME_RESOLVE and DBMS_METADATA.SET_TRANSFORM_PARAM
+// (SQLcl's INFO and DDL), and the ORA numbers of a mistyped FROM (923), a missing table name (903) and a missing right
+// parenthesis (907). The wire's own changes (JDBC's describe, bind and rowcount layouts) are checked by
+// tests/lexdb/java/OracleJdbc.java.
+// expect: savepoint before rollback: 2
+// expect: savepoint after rollback: 1
+// expect: all_objects owner: 'SA'
+// expect: all_tables owner: 'SA'
+// expect: all_tab_columns owner: 'SA'
+// expect: sys.all_objects like: 1
+// expect: view column type: 'VARCHAR2'
+// expect: table column type: 'CLOB'
+// expect: dbms_lob.getlength: 1 5
+// expect: dbms_lob.substr: 'world' 'ab'
+// expect: utl_raw.cast_to_number: 
+// expect: all_tab_col_statistics: 0
+// expect: user_tab_col_statistics: 0
+// expect: name_resolve table: error 20111
+// expect: name_resolve view: error 20112
+// expect: name_resolve missing: error 6564
+// expect: set_transform_param: 0
+// expect: missing FROM: error 923
+// expect: missing FROM, form: error 923
+// expect: nothing after FROM: error 903
+// expect: missing parenthesis: error 907
+// expect: other syntax: error 900
+import "task"
+import "net"
+import "strings"
+import "oracle"
+import "sqldialect"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_tns"
+import "../../../cmd/lexdb_sql"
+import "../../../cmd/lexdb_auth"
+
+fn connect(s: &str): oracle.Conn {
+    match oracle.connect(s.toStr()) {
+        Ok(c) { return c }
+        Err(e) {
+            println("connect: error " + e.code.toStr() + " " + e.msg)
+            exit(1)
+        }
+    }
+}
+
+fn show(r: Result[oracle.Rows, oracle.Error]): str {
+    match r {
+        Ok(rows) { return "ok" }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+fn values(rows: &oracle.Rows, row: int): str {
+    var out: []str = []
+    for i in 0..rows.columnCount() {
+        match rows.isNull(row, i) {
+            Ok(n) {
+                if n { append(mut &out, "NULL") } else {
+                    match rows.value(row, i) {
+                        Ok(v) { append(mut &out, v.toStr()) }
+                        Err(e) { append(mut &out, "error " + e.code.toStr() + " " + e.msg) }
+                    }
+                }
+            }
+            Err(e) { append(mut &out, "error " + e.code.toStr()) }
+        }
+    }
+    return strings.join(&out, " ")
+}
+
+fn err(r: Result[int, oracle.Error]): str {
+    match r {
+        Ok(n) { return n.toStr() }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+fn q1(c: mut &oracle.Conn, sql: &str): str {
+    match c.query(sql.toStr(), &[]) {
+        Ok(r) {
+            var out: []str = []
+            for i in 0..r.rowCount() { append(mut &out, values(&r, i)) }
+            return strings.join(&out, ",")
+        }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+
+fn code(r: Result[oracle.Conn, oracle.Error]): str {
+    match r {
+        Ok(c) { return "connected" }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+
+fn ex(c: mut &oracle.Conn, sql: &str) {
+    match c.run(sql.toStr(), &[]) {
+        Ok(_) {}
+        Err(e) { println("exec " + sql.toStr() + ": error " + e.code.toStr() + " " + e.msg) }
+    }
+}
+
+fn client(port: &str) {
+    let dsn = "127.0.0.1:" + port + "/lexdb"
+    var c = connect(&("User Id=sa;Password=sa;Data Source=" + dsn))
+    // the savepoint of a transaction that has run a DML statement (JDBC's Connection.setSavepoint): the statement's own
+    // guard must not release it
+    ex(mut &c, &"create table emp (id number(5) primary key, name varchar2(20), note clob)")
+    let tr = c.transaction(fn(t: mut &oracle.Conn): Result[int, oracle.Error] {
+        let z = try t.run("insert into emp values (1, 'a', 'x')", &[])
+        let a = try t.run("savepoint sp1", &[])
+        let b = try t.run("insert into emp values (2, 'b', 'y')", &[])
+        println("savepoint before rollback: " + q1(mut &t, &"select count(*) from emp"))
+        let r = try t.run("rollback to sp1", &[])
+        println("savepoint after rollback: " + q1(mut &t, &"select count(*) from emp"))
+        return Ok(0)
+    })
+    match tr {
+        Ok(_) {}
+        Err(e) { println("transaction: error " + e.code.toStr() + " " + e.msg) }
+    }
+    ex(mut &c, &"commit")
+    // the catalog views name the account that owns an object (the templates' owner is APP)
+    println("all_objects owner: " + q1(mut &c, &"select owner from all_objects where object_name = 'EMP' and object_type = 'TABLE'"))
+    println("all_tables owner: " + q1(mut &c, &"select owner from all_tables where table_name = 'EMP'"))
+    println("all_tab_columns owner: " + q1(mut &c, &"select distinct owner from all_tab_columns where table_name = 'EMP'"))
+    println("sys.all_objects like: " + q1(mut &c, &"select count(*) from sys.all_objects o where o.owner like 'SA' escape '/' and o.object_name like 'EMP' escape '/' and o.object_type in ('xxx', 'TABLE')"))
+    // a view's text column is a VARCHAR2, not a CLOB
+    ex(mut &c, &"create view v_emp as select id, name from emp")
+    println("view column type: " + q1(mut &c, &"select data_type from user_tab_columns where table_name = 'V_EMP' and column_name = 'NAME'"))
+    println("table column type: " + q1(mut &c, &"select data_type from user_tab_columns where table_name = 'EMP' and column_name = 'NOTE'"))
+    // DBMS_LOB, UTL_RAW and the column statistics view (what SQLcl's INFO runs)
+    println("dbms_lob.getlength: " + q1(mut &c, &"select dbms_lob.getlength(note), dbms_lob.getlength('hello') from emp where id = 1"))
+    println("dbms_lob.substr: " + q1(mut &c, &"select dbms_lob.substr('hello world', 5, 7), dbms_lob.substr('abc', 2) from dual"))
+    println("utl_raw.cast_to_number: " + q1(mut &c, &"select to_char(utl_raw.cast_to_number(low_value)), to_char(sys.utl_raw.cast_to_varchar2(high_value)) from all_tab_col_statistics where rownum <= 1"))
+    println("all_tab_col_statistics: " + q1(mut &c, &"select count(*) from all_tab_col_statistics"))
+    println("user_tab_col_statistics: " + q1(mut &c, &"select count(*) from user_tab_col_statistics"))
+    // DBMS_UTILITY.NAME_RESOLVE and DBMS_METADATA.SET_TRANSFORM_PARAM, which SQLcl calls before INFO and DDL
+    println("name_resolve table: " + err(c.run("declare s varchar2(100); p1 varchar2(100); p2 varchar2(100); d varchar2(100); t number; n number; begin dbms_utility.name_resolve(name => 'emp', context => 0, schema => s, part1 => p1, part2 => p2, dblink => d, part1_type => t, object_number => n); if s = 'SA' and p1 = 'EMP' and t = 2 and n is not null then raise_application_error(-20111, 'resolved'); end if; end;", &[])))
+    println("name_resolve view: " + err(c.run("declare s varchar2(100); p1 varchar2(100); p2 varchar2(100); d varchar2(100); t number; n number; begin dbms_utility.name_resolve('sa.v_emp', 0, s, p1, p2, d, t, n); if t = 4 then raise_application_error(-20112, 'view'); end if; end;", &[])))
+    println("name_resolve missing: " + err(c.run("declare s varchar2(100); p1 varchar2(100); p2 varchar2(100); d varchar2(100); t number; n number; begin dbms_utility.name_resolve('nosuch', 0, s, p1, p2, d, t, n); end;", &[])))
+    println("set_transform_param: " + err(c.run("begin dbms_metadata.set_transform_param(dbms_metadata.session_transform, 'SQLTERMINATOR', true); end;", &[])))
+    // syntax errors as Oracle numbers them
+    println("missing FROM: " + err(c.run("select 1 fro dual", &[])))
+    println("missing FROM, form: " + err(c.run("select * form dual", &[])))
+    println("nothing after FROM: " + err(c.run("select 1 from", &[])))
+    println("missing parenthesis: " + err(c.run("select (1 + 2 from dual", &[])))
+    println("other syntax: " + err(c.run("selec 1 from dual", &[])))
+    c.logoff()
+}
+
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        let f = s.start(lexdb_tns.acceptLoop, lexdb_tns.AcceptArg{ln: ln, st: st})
+        client(&addr[10..len(addr)])
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(5), lexdb_store.Options{cacheBytes: 128 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000, bufferedPages: false}, body).unwrap()
+}

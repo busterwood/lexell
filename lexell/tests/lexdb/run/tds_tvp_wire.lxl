@@ -1,0 +1,387 @@
+// A table-valued parameter (TVPTYPE 0xF3, MS-TDS 2.2.5.5.5) as lib/tds's parseRpc decodes it for lexdb's TDS door
+// (design/lexdb-tds.md, "As built: table-valued parameters"), byte for byte: lib/tds's own tableParam (its type
+// name, columns and rows; NULLs; the default, TVP_NULL_TOKEN, with the fDefaultValue status), one made by hand with
+// TVP_ORDER_UNIQUE and TVP_COLUMN_ORDERING, column names, PLP values in chunks and of unknown length and a column the
+// server fills (fDefault, its values not sent), a scalar after it; then every malformed or oversized TVP refused
+// as a protocol error (E_PROTOCOL), never a crash: no columns, 1,025 and 65,534 columns, a cut TYPE_INFO, an
+// unknown metadata token, an unknown row token, rows after the default, a value past the end, a value longer than
+// its column, an order list past the end, a PLP chunk past the end, a table type column, no TVP_END_TOKEN. Then
+// the same malformed requests sent to lexdb's door: each answered with an error, the connection usable after it,
+// as SQL Server 2022 does (its numbers are 8050 for the column counts, 4002 for a stream cut short, 8037 for the
+// value too long; lexdb's are 50000 with its own text), and the hand-made TVP refused for its database name (8047,
+// SQL Server's: only a schema and a name are allowed).
+// expect: lib: params 2 | tvp dbo.Items db '' | default false | status 0
+// expect:   cols 3: bigint/8/1/'' nvarchar/8000/1/'' decimal/17/1/''
+// expect:   rows 3: 1|a|1.50 ; 2|NULL|NULL ; 3|café|-0.25
+// expect:   then @k: 7
+// expect: default: tvp dbo.Items | default true | status 2 | cols 0 | rows 0
+// expect: by hand: tvp Wide db 'tv' schema 'sales' | default false
+// expect:   cols 4: int/4/1/'k' nvarchar/-1/1/'t' int/4/513/'' varbinary/-1/1/'b'
+// expect:   rows 2: 7|hello|0x00FF ; 8|NULL|NULL
+// expect: no columns: tds: a table-valued parameter of 0 columns (1 to 1024)
+// expect: 1025 columns: tds: a table-valued parameter of 1025 columns (1 to 1024)
+// expect: 65534 columns: tds: a table-valued parameter of 65534 columns (1 to 1024)
+// expect: cut type info: tds: TYPE_INFO: 1 bytes needed, 0 left
+// expect: unknown token: tds: a table-valued parameter's metadata token 0x12
+// expect: bad row token: tds: a table-valued parameter's row token 0x2
+// expect: rows after default: tds: rows in a table-valued parameter sent as its default
+// expect: value past end: tds: a value of column : 4 bytes needed, 2 left
+// expect: value too long: tds: a value of column : 10 bytes for a size of 8
+// expect: order past end: tds: TVP_ORDER_UNIQUE: 196605 bytes needed, 1 left
+// expect: plp past end: tds: a value of column : 4294967280 bytes needed, 2 left
+// expect: table column: tds: a table-valued parameter's column of a table type
+// expect: no row end: tds: a table-valued parameter's row: 1 bytes needed, 0 left
+// expect: server: setup ok
+// expect: server no columns: error 50000 | then 1
+// expect: server 65534 columns: error 50000 | then 1
+// expect: server cut: error 50000 | then 1
+// expect: server plp past end: error 50000 | then 1
+// expect: server value too long: error 50000 | then 1
+// expect: server by hand: error 8047
+import "strings"
+import "task"
+import "net"
+import "tds"
+import "sqldialect"
+import "sqlserver"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_wire"
+import "../../../cmd/lexdb_tds"
+
+type V = sqldialect.Value
+
+fn u8(b: mut &[]byte, v: int) { append(b, byte(v & 0xff)) }
+fn le(b: mut &[]byte, v: int, n: int) { for k in 0..n { u8(b, if k < 8 { v >> (8 * k) } else if v < 0 { 0xff } else { 0 }) } }
+fn utf16(s: &str): []byte { return tds.toUtf16(s.toStr()).unwrap() }
+fn bvarchar(b: mut &[]byte, s: &str) {
+    let u = utf16(s)
+    u8(b, len(u) / 2)
+    for x in u { append(b, x) }
+}
+fn bytesOf(s: &str): []byte { return strToBytes(s.toStr()) }
+
+// An RPC payload: sp_executesql (ProcID 10) with stmt and decls, then the parameters as name, status, TYPE_INFO, value.
+fn rpc(stmt: &str, decls: &str, params: &[tds.Param]): []byte {
+    var b: []byte = []
+    le(mut &b, 22, 4)
+    le(mut &b, 18, 4)
+    le(mut &b, 2, 2)
+    le(mut &b, 0, 8)
+    le(mut &b, 1, 4)
+    le(mut &b, 0xFFFF, 2)
+    le(mut &b, 10, 2)
+    le(mut &b, 0, 2)
+    var all: []tds.Param = [tds.textParam(stmt.toStr(), &tds.noCollation()).unwrap(), tds.textParam(decls.toStr(), &tds.noCollation()).unwrap()]
+    for p in params { append(mut &all, p) }
+    for p in all {
+        bvarchar(mut &b, &p.name)
+        u8(mut &b, (if p.output { 1 } else { 0 }) | (if p.byDefault { 2 } else { 0 }))
+        appendStr(mut &b, p.typeInfo)
+        appendStr(mut &b, p.data)
+    }
+    return b
+}
+
+fn raw(name: &str, ti: &[]byte, d: &[]byte): tds.Param {
+    return tds.Param{name: name.toStr(), output: false, byDefault: false, declared: "", typeInfo: strFromBytes(ti), data: strFromBytes(d)}
+}
+
+fn cellText(c: &tds.Column, v: &tds.Cell): str {
+    match v {
+        tds.Cell.Null { return "NULL" }
+        tds.Cell.Bytes(b) {
+            var s = "0x"
+            for i in 0..len(b) { s = s + strings.padLeft(strings.toUpperAscii(&strings.hex(int(b[i]))), 2, '0') }
+            return s
+        }
+        else { return tds.cellText(c, v).unwrapOr("?") }
+    }
+}
+
+// a decoded TVP: its type, columns (type/size/flags/'name') and rows (the values sent)
+fn showTable(tv: &tds.TableValue, status: int) {
+    println("  cols " + len(tv.columns).toStr() + ": " + colsText(tv))
+    var sentCols: []tds.Column = []
+    for c in tv.columns { if !c.byServer() { append(mut &sentCols, c) } }
+    var rows: []str = []
+    for r in tv.rows {
+        var cells: []str = []
+        for i in 0..len(r) { append(mut &cells, cellText(&sentCols[i], &r[i])) }
+        append(mut &rows, strings.join(&cells, "|"))
+    }
+    println("  rows " + len(tv.rows).toStr() + ": " + strings.join(&rows, " ; "))
+}
+
+fn colsText(tv: &tds.TableValue): str {
+    var cs: []str = []
+    for c in tv.columns { append(mut &cs, c.typeName() + "/" + c.size.toStr() + "/" + c.flags.toStr() + "/'" + c.name + "'") }
+    return strings.join(&cs, " ")
+}
+
+fn decoded(label: &str, payload: &[]byte) {
+    match tds.parseRpc(strFromBytes(payload)) {
+        Ok(calls) {
+            let ps = &calls[0].params
+            for i in 2..len(ps) {
+                match ps[i].table {
+                    Some(tv) {
+                        if label == "lib" { println("lib: params " + (len(ps) - 2).toStr() + " | tvp " + tv.schema + "." + tv.typeName + " db '" + tv.db +
+                                                    "' | default " + tv.isDefault.toStr() + " | status " + (if ps[i].byDefault { 2 } else { 0 }).toStr()) }
+                        else if label == "default" {
+                            println("default: tvp " + tv.schema + "." + tv.typeName + " | default " + tv.isDefault.toStr() + " | status " +
+                                    (if ps[i].byDefault { 2 } else { 0 }).toStr() + " | cols " + len(tv.columns).toStr() + " | rows " + len(tv.rows).toStr())
+                            continue
+                        } else {
+                            println(label + ": tvp " + tv.typeName + " db '" + tv.db + "' schema '" + tv.schema + "' | default " + tv.isDefault.toStr())
+                        }
+                        showTable(&tv, 0)
+                    }
+                    None { println("  then " + ps[i].name + ": " + cellText(&ps[i].column, &ps[i].value)) }
+                }
+            }
+        }
+        Err(e) { println(label + ": " + e.msg) }
+    }
+}
+
+// TYPE_INFO of a TVP of type name with the columns' metadata given whole (cols: UserType, Flags, TYPE_INFO, ColName each).
+fn tvpInfo(db: &str, schema: &str, name: &str, count: int, cols: &[]byte): []byte {
+    var ti: []byte = []
+    u8(mut &ti, 0xF3)
+    bvarchar(mut &ti, db)
+    bvarchar(mut &ti, schema)
+    bvarchar(mut &ti, name)
+    le(mut &ti, count, 2)
+    for x in cols { append(mut &ti, x) }
+    return ti
+}
+
+fn intCol(b: mut &[]byte, flags: int, name: &str) {
+    le(b, 0, 4)
+    le(b, flags, 2)
+    u8(b, 0x26)
+    u8(b, 4)
+    bvarchar(b, name)
+}
+
+fn nvarcharCol(b: mut &[]byte, size: int) {
+    le(b, 0, 4)
+    le(b, 1, 2)
+    u8(b, 0xE7)
+    le(b, size, 2)
+    for x in [0x09, 0x04, 0xd0, 0x00, 0x34] { u8(b, x) }
+    bvarchar(b, &"")
+}
+
+// one int column, then the metadata's end and rows (as given)
+fn oneInt(rest: &[]byte): []byte {
+    var cols: []byte = []
+    intCol(mut &cols, 1, &"")
+    var ti = tvpInfo(&"", &"dbo", &"T", 1, &cols)
+    for x in rest { append(mut &ti, x) }
+    return ti
+}
+
+fn byHand(): tds.Param {
+    var cols: []byte = []
+    intCol(mut &cols, 1, &"k")
+    le(mut &cols, 0, 4)
+    le(mut &cols, 1, 2)
+    u8(mut &cols, 0xE7)
+    le(mut &cols, 0xFFFF, 2)
+    for x in [0x09, 0x04, 0xd0, 0x00, 0x34] { u8(mut &cols, x) }
+    bvarchar(mut &cols, &"t")
+    intCol(mut &cols, 0x201, &"")               // fDefault: the server's to fill
+    le(mut &cols, 0, 4)
+    le(mut &cols, 1, 2)
+    u8(mut &cols, 0xA5)
+    le(mut &cols, 0xFFFF, 2)
+    bvarchar(mut &cols, &"b")
+    var ti = tvpInfo(&"tv", &"sales", &"Wide", 4, &cols)
+    u8(mut &ti, 0x10)                           // TVP_ORDER_UNIQUE: k ascending, unique
+    le(mut &ti, 1, 2)
+    le(mut &ti, 1, 2)
+    u8(mut &ti, 0x05)
+    u8(mut &ti, 0x11)                           // TVP_COLUMN_ORDERING: k
+    le(mut &ti, 1, 2)
+    le(mut &ti, 1, 2)
+    u8(mut &ti, 0)
+    var d: []byte = []
+    u8(mut &d, 1)
+    u8(mut &d, 4)
+    le(mut &d, 7, 4)
+    let h = utf16(&"hello")
+    le(mut &d, len(h), 8)
+    le(mut &d, 4, 4)
+    for i in 0..4 { append(mut &d, h[i]) }
+    le(mut &d, len(h) - 4, 4)
+    for i in 4..len(h) { append(mut &d, h[i]) }
+    le(mut &d, 0, 4)
+    le(mut &d, -2, 8)
+    le(mut &d, 2, 4)
+    u8(mut &d, 0)
+    u8(mut &d, 0xff)
+    le(mut &d, 0, 4)
+    u8(mut &d, 1)
+    u8(mut &d, 4)
+    le(mut &d, 8, 4)
+    le(mut &d, -1, 8)
+    le(mut &d, -1, 8)
+    u8(mut &d, 0)
+    return raw(&"@w", &ti, &d)
+}
+
+// The malformed TVPs: their labels and parameters.
+type Bad = record { labels: []str; ps: []tds.Param }
+
+fn malformed(): Bad {
+    var labels: []str = []
+    var ps: []tds.Param = []
+    let end: []byte = [0]
+    let none: []byte = []
+    append(mut &labels, "no columns")
+    append(mut &ps, raw(&"@t", &tvpInfo(&"", &"dbo", &"T", 0, &none), &end))
+    var many: []byte = []
+    for i in 0..1025 { intCol(mut &many, 1, &"") }
+    append(mut &labels, "1025 columns")
+    append(mut &ps, raw(&"@t", &tvpInfo(&"", &"dbo", &"T", 1025, &many), &end))
+    append(mut &labels, "65534 columns")
+    append(mut &ps, raw(&"@t", &tvpInfo(&"", &"dbo", &"T", 65534, &none), &none))
+    var cut: []byte = []
+    le(mut &cut, 0, 4)
+    le(mut &cut, 1, 2)
+    u8(mut &cut, 0x26)
+    append(mut &labels, "cut type info")
+    append(mut &ps, raw(&"@t", &tvpInfo(&"", &"dbo", &"T", 1, &cut), &none))
+    append(mut &labels, "unknown token")
+    append(mut &ps, raw(&"@t", &oneInt(&[0x12]), &end))
+    append(mut &labels, "bad row token")
+    append(mut &ps, raw(&"@t", &oneInt(&[0]), &[2, 0]))
+    var dflt: []byte = [0xF3, 0, 0, 1, 0x54, 0, 0xFF, 0xFF, 0]
+    append(mut &labels, "rows after default")
+    append(mut &ps, raw(&"@t", &dflt, &[1, 0]))
+    append(mut &labels, "value past end")
+    append(mut &ps, raw(&"@t", &oneInt(&[0]), &[1, 4, 1, 0]))
+    var nv: []byte = []
+    nvarcharCol(mut &nv, 8)
+    var nvti = tvpInfo(&"", &"dbo", &"T", 1, &nv)
+    u8(mut &nvti, 0)
+    append(mut &labels, "value too long")
+    append(mut &ps, raw(&"@t", &nvti, &[1, 10, 0, 0x41, 0, 0x41, 0, 0x41, 0, 0x41, 0, 0x41, 0, 0]))
+    append(mut &labels, "order past end")
+    append(mut &ps, raw(&"@t", &oneInt(&[0x10, 0xFF, 0xFF, 1]), &none))
+    var mx: []byte = []
+    le(mut &mx, 0, 4)
+    le(mut &mx, 1, 2)
+    u8(mut &mx, 0xA5)
+    le(mut &mx, 0xFFFF, 2)
+    bvarchar(mut &mx, &"")
+    var mxti = tvpInfo(&"", &"dbo", &"T", 1, &mx)
+    u8(mut &mxti, 0)
+    var mxd: []byte = [1]
+    le(mut &mxd, -2, 8)
+    le(mut &mxd, 0xFFFFFFF0, 4)
+    u8(mut &mxd, 1)
+    u8(mut &mxd, 2)
+    append(mut &labels, "plp past end")
+    append(mut &ps, raw(&"@t", &mxti, &mxd))
+    var tc: []byte = []
+    le(mut &tc, 0, 4)
+    le(mut &tc, 1, 2)
+    u8(mut &tc, 0xF3)
+    append(mut &labels, "table column")
+    append(mut &ps, raw(&"@t", &tvpInfo(&"", &"dbo", &"T", 1, &tc), &end))
+    append(mut &labels, "no row end")
+    append(mut &ps, raw(&"@t", &oneInt(&[0]), &[1, 0]))
+    return Bad{labels: labels, ps: ps}
+}
+
+fn libTests() {
+    let rows = [[V.Int(1), V.Text("a"), V.Dec(1.5m)], [V.Int(2), V.Null, V.Null], [V.Int(3), V.Text("café"), V.Dec(-0.25m)]]
+    var p = tds.tableParam("dbo.Items", &rows, &[], &[], &tds.noCollation()).unwrap()
+    p.name = "@items"
+    var k = tds.intParam(7)
+    k.name = "@k"
+    decoded(&"lib", &rpc(&"SELECT 1", &"@items dbo.Items READONLY, @k bigint", &[p, k]))
+    var e = tds.tableParam("dbo.Items", &[], &[], &[], &tds.noCollation()).unwrap()
+    e.name = "@items"
+    decoded(&"default", &rpc(&"SELECT 1", &"@items dbo.Items READONLY", &[e]))
+    decoded(&"by hand", &rpc(&"SELECT 1", &"@w sales.Wide READONLY", &[byHand()]))
+    let m = malformed()
+    for i in 0..len(m.labels) { decoded(&m.labels[i], &rpc(&"SELECT 1", &"@t T READONLY", &[m.ps[i]])) }
+}
+
+fn said(r: Result[tds.Reply, sqldialect.DbError]): str {
+    match r {
+        Ok(rep) {
+            if len(rep.errors) > 0 { return "error " + rep.errors[0].number.toStr() }
+            var parts: []str = []
+            for rs in rep.results {
+                var rows: []str = []
+                for row in rs.rows {
+                    var cells: []str = []
+                    for i in 0..len(row) { append(mut &cells, cellText(&rs.columns[i], &row[i])) }
+                    append(mut &rows, strings.join(&cells, "|"))
+                }
+                append(mut &parts, strings.join(&rows, ";"))
+            }
+            return if len(parts) == 0 { "ok" } else { strings.join(&parts, " / ") }
+        }
+        Err(e) { return "failed " + e.msg }
+    }
+}
+
+fn send(s: mut &tds.Session, payload: &[]byte): str {
+    match s.sendPart(tds.PT_RPC, payload, true) {
+        Ok(_) {}
+        Err(e) { return "failed " + e.msg }
+    }
+    return said(s.partReply())
+}
+
+fn serverTests(dsn: &str) {
+    let st = sqlserver.parseConnString(dsn.toStr()).unwrap()
+    let o = tds.open(&st.config)
+    if o.isErr() {
+        println("connect: " + o.unwrapErr().msg)
+        return
+    }
+    var s = o.unwrap()
+    let a = said(s.batch("CREATE TYPE T AS TABLE (a int)"))
+    let b = said(s.batch("CREATE SCHEMA sales"))
+    let c = said(s.batch("CREATE TYPE sales.Wide AS TABLE (k int, t nvarchar(max), d int DEFAULT 5, b varbinary(max))"))
+    println("server: " + (if a == "ok" && b == "ok" && c == "ok" { "setup ok" } else { a + " " + b + " " + c }))
+    let m = malformed()
+    let want = ["no columns", "65534 columns", "cut type info", "plp past end", "value too long"]
+    let shown = ["no columns", "65534 columns", "cut", "plp past end", "value too long"]
+    for w in 0..len(want) {
+        for i in 0..len(m.labels) {
+            if m.labels[i] == want[w] {
+                println("server " + shown[w] + ": " + send(mut &s, &rpc(&"SELECT COUNT(*) FROM @t", &"@t T READONLY", &[m.ps[i]])) + " | then " +
+                        said(s.batch("SELECT 1")))
+            }
+        }
+    }
+    println("server by hand: " + send(mut &s, &rpc(&"SELECT k, t, b FROM @w ORDER BY k", &"@w sales.Wide READONLY", &[byHand()])))
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(sc: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        lexdb_wire.configure(&st, &lexdb_wire.noAuth()).unwrap()
+        let f = sc.start(lexdb_tds.acceptLoop, lexdb_tds.AcceptArg{ln: ln, st: st})
+        serverTests(&("Server=127.0.0.1," + addr[10..len(addr)] + ";UID=sa;PWD=x;Encrypt=no"))
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    libTests()
+    lexdb_store.run(lexdb_disk.sim(43), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024,
+                                                             snapNodes: 50000, bufferedPages: false}, body).unwrap()
+}

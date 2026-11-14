@@ -969,24 +969,80 @@ fn (c: mut &Conn) execute(sql: &str, decls: &str, call: &tds.RpcCall, first: int
     var outs: []int = []                        // the frame's indexes of the output parameters
     var outNames: []str = []
     var bad: Option[DbErr] = None
+    var runSql = sql.toStr()                    // with the table-valued parameters named for their tables
+    // a table-valued parameter's type first, as SQL Server (351)
+    for i in first..len(call.params) {
+        match call.params[i].table {
+            Some(tv) {
+                if len(tv.db) > 0 && bad.isNone() {
+                    bad = Some(tsErr(8047, "The incoming tabular data stream (TDS) remote procedure call (RPC) protocol stream is incorrect. " +
+                                           "Table-valued parameter " + (i + 1).toStr() + " (\"" + call.params[i].name + "\"), row 0, column 0: " +
+                                           "Data type 0xF3 (user-defined table type) has a non-zero length database name specified.  Database name " +
+                                           "is not allowed with a table-valued parameter, only schema name and type name are valid."))
+                }
+                if len(tv.typeName) > 0 && bad.isNone() {
+                    match c.sess.tableType(&tvpKey(&tv)) {
+                        Ok(x) {
+                            if x.isNone() {
+                                bad = Some(tsErr(351, "Column, parameter, or variable " + call.params[i].name + ". : Cannot find data type " +
+                                                      tvpShown(&tv) + "."))
+                            }
+                        }
+                        Err(e) { bad = Some(e) }
+                    }
+                }
+            }
+            None {}
+        }
+    }
     let noDecls: []lexdb_tsqlparse.ParamDecl = []
     let ds: Result[[]lexdb_tsqlparse.ParamDecl, DbErr] = if len(strings.trim(decls)) == 0 { Ok(noDecls) } else { lexdb_tsqlparse.parseParamDecls(decls) }
-    if ds.isErr() {
+    if bad.isSome() {
+    } else if ds.isErr() {
         bad = Some(ds.unwrapErr())
     } else {
         let list = ds.unwrap()
         var given: []bool = []
-        for d in list {
+        var types: []lexdb_exec.TabType = []         // per declaration: its table type (key "": none)
+        var bound: []int = []                        // per declaration: the parameter given for it, -1 none
+        var isTable: []bool = []                     // per declaration: a table-valued parameter's
+        for j in 0..len(list) {
+            let d = &list[j]
             let k = f.add(&d.name, d.typ, Val.Null)
             append(mut &given, false)
+            append(mut &bound, -1)
+            append(mut &isTable, false)
+            append(mut &types, lexdb_exec.TabType{key: "", spell: "", body: ""})
             if d.output {
                 append(mut &outs, k)
                 append(mut &outNames, d.name)
+            }
+            if bad.isSome() { continue }
+            if len(d.tableType) > 0 {
+                let r = c.sess.tableType(&d.tableType)
+                if r.isErr() {
+                    bad = Some(r.unwrapErr())
+                } else {
+                    let x = r.unwrap()
+                    if x.isSome() {
+                        types[j] = x.unwrap()
+                        isTable[j] = true
+                    } else if d.readonly {
+                        bad = Some(tsErr(2715, "Column, parameter, or variable #" + (j + 1).toStr() + ": Cannot find data type " + d.typeText + "."))
+                    }
+                    // (else a type of lexdb's own that is no table type: a scalar, as before)
+                }
+                if bad.isNone() && isTable[j] && !d.readonly {
+                    bad = Some(tsErr(352, "The table-valued parameter \"" + d.name + "\" must be declared with the READONLY option."))
+                }
+            } else if d.readonly {
+                bad = Some(tsErr(346, "The parameter \"" + d.name + "\" can not be declared READONLY since it is not a table-valued parameter."))
             }
         }
         let base = len(f.names) - len(list)
         var pos = 0
         for i in first..len(call.params) {
+            if bad.isSome() { break }
             let p = &call.params[i]
             var k = -1
             if len(p.name) > 0 {
@@ -1000,6 +1056,26 @@ fn (c: mut &Conn) execute(sql: &str, decls: &str, call: &tds.RpcCall, first: int
                 bad = Some(tsErr(8145, "" + p.name + " is not a parameter for procedure sp_executesql."))
                 break
             }
+            given[k] = true
+            if isTable[k] {
+                match p.table {
+                    Some(tv) {
+                        if len(tv.typeName) > 0 && tvpKey(&tv) != list[k].tableType {
+                            bad = Some(tsErr(206, "Operand type clash: " + tv.typeName + " is incompatible with " + types[k].spell))
+                        }
+                    }
+                    None { bad = Some(tsErr(206, "Operand type clash: " + p.column.typeName() + " is incompatible with " + types[k].spell)) }
+                }
+                bound[k] = i
+                continue
+            }
+            match p.table {
+                Some(tv) {
+                    bad = Some(tsErr(206, "Operand type clash: " + tv.typeName + " is incompatible with " + lexdb_sql.typeText(&list[k].typ)))
+                    break
+                }
+                None {}
+            }
             match valOf(&p) {
                 Ok(v) {
                     match lexdb_exec.coerce(v, &list[k].typ) {
@@ -1009,17 +1085,64 @@ fn (c: mut &Conn) execute(sql: &str, decls: &str, call: &tds.RpcCall, first: int
                 }
                 Err(e) { bad = Some(e) }
             }
-            given[k] = true
         }
         if bad.isNone() {
             for j in 0..len(list) {
-                if !given[j] && !list[j].output {
+                // (a table-valued parameter not given is its type's default, an empty table)
+                if !given[j] && !list[j].output && !isTable[j] {
                     bad = Some(tsErr(8178, "The parameterized query '(" + decls + ")" + sql + "' expects the parameter '" + list[j].name +
                                            "', which was not supplied."))
                     break
                 }
             }
         }
+        // the table-valued parameters' tables, made and filled
+        var tvNames: []str = []
+        var tvTables: []str = []
+        for j in 0..len(list) {
+            if bad.isSome() { break }
+            if !isTable[j] { continue }
+            var ncols = -1
+            var sent: []int = []
+            var srcTypes: []str = []
+            var rows: [][]Val = []
+            if bound[j] >= 0 {
+                match call.params[bound[j]].table {
+                    Some(tv) {
+                        if !tv.isDefault {
+                            ncols = len(tv.columns)
+                            var colsSent: []tds.Column = []
+                            for k in 0..len(tv.columns) {
+                                if !tv.columns[k].byServer() {
+                                    append(mut &sent, k)
+                                    append(mut &srcTypes, tv.columns[k].typeName())
+                                    append(mut &colsSent, tv.columns[k])
+                                }
+                            }
+                            for r in tv.rows {
+                                var vs: []Val = []
+                                for k in 0..len(r) {
+                                    match cellVal(&colsSent[k], &r[k]) {
+                                        Ok(v) { append(mut &vs, v) }
+                                        Err(e) { if bad.isNone() { bad = Some(e) } }
+                                    }
+                                }
+                                append(mut &rows, vs)
+                            }
+                        }
+                    }
+                    None {}
+                }
+            }
+            if bad.isSome() { break }
+            match lexdb_tsql.bindTable(mut &c.sess, mut &c.ts, &list[j].name, &types[j], ncols, &sent, &srcTypes, mut &rows) {
+                Ok(_) {}
+                Err(e) { bad = Some(e) }
+            }
+            append(mut &tvNames, list[j].name)
+            append(mut &tvTables, lexdb_tsql.tvpTable(&list[j].name))
+        }
+        if len(tvNames) > 0 { runSql = lexdb_tsqlparse.renameVars(sql, &tvNames, &tvTables) }
     }
     var status = 0
     match bad {
@@ -1029,12 +1152,14 @@ fn (c: mut &Conn) execute(sql: &str, decls: &str, call: &tds.RpcCall, first: int
         }
         None {
             var ev: []lexdb_tsql.Event = []
-            lexdb_tsql.run(mut &c.sess, mut &c.ts, sql, mut &f, mut &ev)
+            lexdb_tsql.run(mut &c.sess, mut &c.ts, &runSql, mut &f, mut &ev)
             let quiet = c.sess.takeNotices()
             let failed = c.emit(&ev, true)
             if failed { status = c.ts.error }
         }
     }
+    lexdb_tsql.dropTables(mut &c.sess, mut &c.ts)
+    let dropped = c.sess.takeNotices()
     c.o.returnStatus(status)
     var ordinal = 0
     if handle > 0 {
@@ -1045,6 +1170,23 @@ fn (c: mut &Conn) execute(sql: &str, decls: &str, call: &tds.RpcCall, first: int
         c.o.returnValue(ordinal + i, &outNames[i], &f.types[outs[i]], &f.vals[outs[i]])
     }
     c.o.doneTok(tds.TK_DONEPROC, (if more { tds.DONE_MORE } else { 0 }) | (if status != 0 { tds.DONE_ERROR } else { 0 }), CMD_EXECUTE, 0)
+}
+
+// A table-valued parameter's type as a catalog key (T-SQL's: dbo, or no
+// schema, as public), and as SQL Server's messages name it.
+fn tvpKey(tv: &tds.TableValue): str {
+    let n = strings.toLowerAscii(&tv.typeName)
+    let sc = strings.toLowerAscii(&tv.schema)
+    if len(sc) == 0 || sc == "dbo" { return n }
+    return lexdb_sql.qual(&sc, &n)
+}
+
+fn tvpShown(tv: &tds.TableValue): str {
+    var parts: []str = []
+    if len(tv.db) > 0 { append(mut &parts, tv.db) }
+    if len(tv.schema) > 0 || len(tv.db) > 0 { append(mut &parts, tv.schema) }
+    append(mut &parts, tv.typeName)
+    return strings.join(&parts, ".")
 }
 
 // @params' declarations; none for none.
@@ -1442,7 +1584,8 @@ fn bulkVal(col: &tds.Column, d: &str, s: int, n: int): Result[Val, DbErr] {
     }
     if t == tds.T_DECIMALN || t == tds.T_NUMERICN || t == tds.T_DECIMAL || t == tds.T_NUMERIC {
         // a sign byte (1 positive), then the magnitude, little-endian
-        if n != 5 && n != 9 && n != 13 && n != 17 { return Err(protoErr("a decimal of " + n.toStr() + " bytes")) }
+        // (the length is the precision's 5, 9, 13 or 17, or less: mssql-jdbc sends the bytes its value needs, a sign byte and 1 to 16 more)
+        if n < 2 || n > 17 { return Err(protoErr("a decimal of " + n.toStr() + " bytes")) }
         var m: u128 = 0
         for k in 0..n - 1 { m = m | (u128(d[s + 1 + k]) << (8 * k)) }
         let most: u128 = 99999999999999999999999999999999999999

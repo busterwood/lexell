@@ -1,0 +1,430 @@
+// lexdb_match: MATCH_RECOGNIZE's pattern compiler and matcher (design/lexdb-match-recognize.md, 4.1).
+// Patterns are built with small constructors, DEFINE is a truth table per (variable, row). Checked:
+// preference order (alternation, greedy, reluctant, {n,m}, PERMUTE), anchors, exclusion flags, empty
+// matches, the compile errors, the step limit, memo against no memo against a brute-force reference
+// (every mapping, in preference order) on random patterns and tables, a reset between searches, and
+// a long match (the matcher keeps its own stack).
+// expect: checks failed: 0
+import "strings"
+import "../../../cmd/lexdb_base"
+import "../../../cmd/lexdb_match"
+
+var fails: int = 0
+var checks: int = 0
+
+fn check(label: str, got: str, want: str) {
+    checks += 1
+    if got != want {
+        fails += 1
+        println("FAIL " + label + ": got " + got + ", want " + want)
+    }
+}
+
+fn va(i: int): lexdb_match.PNode { return lexdb_match.PNode.Var(i) }
+fn sq(xs: []lexdb_match.PNode): lexdb_match.PNode { return lexdb_match.PNode.Seq(xs) }
+fn al(xs: []lexdb_match.PNode): lexdb_match.PNode { return lexdb_match.PNode.Alt(xs) }
+fn pm(xs: []lexdb_match.PNode): lexdb_match.PNode { return lexdb_match.PNode.Perm(xs) }
+fn ex(x: lexdb_match.PNode): lexdb_match.PNode { return lexdb_match.PNode.Excl(x) }
+fn qn(x: lexdb_match.PNode, mn: int, mx: int, rel: bool): lexdb_match.PNode { return lexdb_match.PNode.Quant(x, mn, mx, rel) }
+fn bg(): lexdb_match.PNode { return lexdb_match.PNode.Begin }
+fn en(): lexdb_match.PNode { return lexdb_match.PNode.End }
+
+// the table: one string per variable, one character per row, 1 true
+fn tb(rs: &[]str): [][]bool {
+    var t: [][]bool = []
+    for r in rs {
+        var row: []bool = []
+        for i in 0..len(r) { append(mut &row, r[i] == '1') }
+        append(mut &t, row)
+    }
+    return t
+}
+
+fn show(f: &lexdb_match.Found): str {
+    if f.over { return "over" }
+    if !f.ok { return "none" }
+    var out = f.end.toStr() + ":"
+    for i in 0..len(f.lab) {
+        let c = byte('a') + byte(f.lab[i])
+        out = out + strFromBytes(&[if f.exc[i] { c - 32 } else { c }])
+    }
+    return out
+}
+
+fn tick0(): Result[Unit, lexdb_base.DbErr] { return Ok(Unit{}) }
+
+// one attempt at row s of a fresh search
+fn run(p: &lexdb_match.PNode, nv: int, t: &[][]bool, s: int, memo: bool, maxSteps: int): str {
+    let pr = match lexdb_match.compile(p, nv) { Ok(x) { x } Err(c) { return "E" + c.toStr() } }
+    var m = lexdb_match.newMatcher()
+    m.reset(s)
+    let n = len(t[0])
+    let holds = fn(v: int, pos: int, lab: &[]int): Result[bool, lexdb_base.DbErr] { return Ok(t[v][pos]) }
+    match m.attempt(&pr, 0, n, s, memo, maxSteps, holds, tick0) {
+        Ok(f) { return show(&f) }
+        Err(e) { return "err " + e.state }
+    }
+}
+
+// both modes agree and give want
+fn both(label: str, p: &lexdb_match.PNode, nv: int, rows: &[]str, s: int, want: str) {
+    let t = tb(rows)
+    check(label + " memo", run(p, nv, &t, s, true, 0), want)
+    check(label + " nomemo", run(p, nv, &t, s, false, 0), want)
+}
+
+fn compileCode(p: &lexdb_match.PNode): str {
+    match lexdb_match.compile(p, 4) { Ok(x) { return "ok" } Err(c) { return c.toStr() } }
+}
+
+// ---- the brute-force reference
+
+var budget: int = 0
+
+type Path = record { end: int; lab: []int; exc: []bool }
+
+fn cat(a: &Path, b: &Path): Path {
+    var lab: []int = []
+    var exc: []bool = []
+    for x in a.lab { append(mut &lab, x) }
+    for x in b.lab { append(mut &lab, x) }
+    for x in a.exc { append(mut &exc, x) }
+    for x in b.exc { append(mut &exc, x) }
+    return Path{end: b.end, lab: lab, exc: exc}
+}
+
+fn emptyAt(pos: int): Path { return Path{end: pos, lab: [], exc: []} }
+
+// every mapping of p from row pos, in preference order
+fn enumP(p: &lexdb_match.PNode, pos: int, lo: int, hi: int): []Path {
+    var out: []Path = []
+    if budget < 0 { return out }
+    budget -= 1
+    match p {
+        lexdb_match.PNode.Var(v) {
+            if pos < hi { append(mut &out, Path{end: pos + 1, lab: [v], exc: [false]}) }
+        }
+        lexdb_match.PNode.Begin { if pos == lo { append(mut &out, emptyAt(pos)) } }
+        lexdb_match.PNode.End { if pos == hi { append(mut &out, emptyAt(pos)) } }
+        lexdb_match.PNode.Seq(xs) {
+            var cur: []Path = [emptyAt(pos)]
+            for x in xs {
+                var nxt: []Path = []
+                for c in cur {
+                    let ps = enumP(x, c.end, lo, hi)
+                    for q in ps { append(mut &nxt, cat(c, q)) }
+                }
+                cur = move(nxt)
+            }
+            out = move(cur)
+        }
+        lexdb_match.PNode.Alt(xs) {
+            for x in xs {
+                let ps = enumP(x, pos, lo, hi)
+                for q in ps { append(mut &out, cat(&emptyAt(pos), q)) }
+            }
+        }
+        lexdb_match.PNode.Perm(xs) {
+            var perms: [][]int = []
+            permsOf(len(xs), mut &perms)
+            for pe in perms {
+                var parts: []lexdb_match.PNode = []
+                for i in pe { append(mut &parts, cloneNode(&xs[i])) }
+                let ps = enumP(&sq(parts), pos, lo, hi)
+                for q in ps { append(mut &out, cat(&emptyAt(pos), q)) }
+            }
+        }
+        lexdb_match.PNode.Excl(x) {
+            let ps = enumP(x, pos, lo, hi)
+            for q in ps {
+                var e: []bool = []
+                for k in 0..len(q.lab) { append(mut &e, true) }
+                append(mut &out, Path{end: q.end, lab: copyInts(&q.lab), exc: e})
+            }
+        }
+        lexdb_match.PNode.Quant(x, mn, mx, rel) {
+            out = enumQ(x, mn, mx, rel, 0, pos, lo, hi)
+        }
+    }
+    return out
+}
+
+fn copyInts(a: &[]int): []int {
+    var r: []int = []
+    for x in a { append(mut &r, x) }
+    return r
+}
+
+fn enumQ(x: &lexdb_match.PNode, mn: int, mx: int, rel: bool, i: int, pos: int, lo: int, hi: int): []Path {
+    var out: []Path = []
+    if budget < 0 { return out }
+    budget -= len(out) + 1
+    var bodyFirst = true
+    if i >= mn && rel { bodyFirst = false }
+    var did = false
+    if i >= mn && !bodyFirst { append(mut &out, emptyAt(pos)); did = true }
+    if mx < 0 || i < mx {
+        let ps = enumP(x, pos, lo, hi)
+        for q in ps {
+            let rest = enumQ(x, mn, mx, rel, i + 1, q.end, lo, hi)
+            for r in rest { append(mut &out, cat(q, r)) }
+        }
+    }
+    if i >= mn && !did { append(mut &out, emptyAt(pos)) }
+    return out
+}
+
+fn permsOf(k: int, out: mut &[][]int) {
+    var cur: []int = []
+    permRec(k, mut &cur, mut &out)
+}
+
+fn permRec(k: int, cur: mut &[]int, out: mut &[][]int) {
+    if len(cur) == k { append(mut &out, copyInts(&cur)); return }
+    for i in 0..k {
+        var used = false
+        for c in cur { if c == i { used = true } }
+        if !used {
+            append(mut &cur, i)
+            permRec(k, mut &cur, mut &out)
+            pop(mut &cur)
+        }
+    }
+}
+
+fn cloneNode(p: &lexdb_match.PNode): lexdb_match.PNode {
+    match p {
+        lexdb_match.PNode.Var(v) { return va(v) }
+        lexdb_match.PNode.Begin { return bg() }
+        lexdb_match.PNode.End { return en() }
+        lexdb_match.PNode.Seq(xs) { return sq(cloneAll(xs)) }
+        lexdb_match.PNode.Alt(xs) { return al(cloneAll(xs)) }
+        lexdb_match.PNode.Perm(xs) { return pm(cloneAll(xs)) }
+        lexdb_match.PNode.Excl(x) { return ex(cloneNode(x)) }
+        lexdb_match.PNode.Quant(x, mn, mx, rel) { return qn(cloneNode(x), mn, mx, rel) }
+    }
+}
+
+fn cloneAll(xs: &[]lexdb_match.PNode): []lexdb_match.PNode {
+    var r: []lexdb_match.PNode = []
+    for x in xs { append(mut &r, cloneNode(x)) }
+    return r
+}
+
+// the first mapping from s whose variables all hold
+fn refMatch(p: &lexdb_match.PNode, t: &[][]bool, s: int): str {
+    let n = len(t[0])
+    budget = 100000
+    let ps = enumP(p, s, 0, n)
+    if budget < 0 { return "skip" }
+    for q in ps {
+        var ok = true
+        for i in 0..len(q.lab) { if !t[q.lab[i]][s + i] { ok = false; break } }
+        if ok {
+            var f = lexdb_match.Found{ok: true, end: q.end, lab: copyInts(&q.lab), exc: [], over: false}
+            for e in q.exc { append(mut &f.exc, e) }
+            return show(&f)
+        }
+    }
+    return "none"
+}
+
+// ---- random patterns
+
+fn pstr(p: &lexdb_match.PNode): str {
+    match p {
+        lexdb_match.PNode.Var(v) { return strFromBytes(&[byte('a') + byte(v)]) }
+        lexdb_match.PNode.Begin { return "^" }
+        lexdb_match.PNode.End { return "$" }
+        lexdb_match.PNode.Seq(xs) { return "(" + pjoin(xs, " ") + ")" }
+        lexdb_match.PNode.Alt(xs) { return "(" + pjoin(xs, " | ") + ")" }
+        lexdb_match.PNode.Perm(xs) { return "PERMUTE(" + pjoin(xs, ", ") + ")" }
+        lexdb_match.PNode.Excl(x) { return "{- " + pstr(x) + " -}" }
+        lexdb_match.PNode.Quant(x, mn, mx, rel) { return pstr(x) + "{" + mn.toStr() + "," + mx.toStr() + "}" + (if rel { "?" } else { "" }) }
+    }
+}
+
+fn pjoin(xs: &[]lexdb_match.PNode, sep: str): str {
+    var out = ""
+    for i in 0..len(xs) { out = out + (if i > 0 { sep } else { "" }) + pstr(&xs[i]) }
+    return out
+}
+
+fn gen(r: mut &lexdb_base.Rng, depth: int, nv: int): lexdb_match.PNode {
+    let k = r.below(if depth <= 0 { 3 } else { 12 })
+    if k < 3 { return va(r.below(nv)) }
+    if k == 3 || k == 4 {
+        var xs: []lexdb_match.PNode = []
+        for i in 0..2 + r.below(2) { append(mut &xs, gen(r, depth - 1, nv)) }
+        return sq(xs)
+    }
+    if k == 5 || k == 6 {
+        var xs: []lexdb_match.PNode = []
+        for i in 0..2 + r.below(2) { append(mut &xs, gen(r, depth - 1, nv)) }
+        return al(xs)
+    }
+    if k == 7 {
+        var xs: []lexdb_match.PNode = []
+        for i in 0..2 + r.below(2) { append(mut &xs, qn(va(r.below(nv)), r.below(2), if r.below(2) == 0 { -1 } else { 2 }, false)) }
+        return pm(xs)
+    }
+    if k == 8 { return ex(gen(r, depth - 1, nv)) }
+    if k == 9 {
+        let mn = r.below(3)
+        let mx = if r.below(3) == 0 { -1 } else { mn + r.below(3) }
+        return qn(gen(r, depth - 1, nv), mn, if mx == 0 { 1 } else { mx }, r.below(2) == 0)
+    }
+    if k == 10 { return sq([bg(), gen(r, depth - 1, nv)]) }
+    return sq([gen(r, depth - 1, nv), en()])
+}
+
+fn randTable(r: mut &lexdb_base.Rng, nv: int, n: int, density: int): [][]bool {
+    var t: [][]bool = []
+    for v in 0..nv {
+        var row: []bool = []
+        for i in 0..n { append(mut &row, r.below(10) < density) }
+        append(mut &t, row)
+    }
+    return t
+}
+
+fn randomChecks(seed: int) {
+    var r = lexdb_base.rng(seed)
+    var skipped = 0
+    var done = 0
+    var withMatch = 0
+    var skippedRef = 0
+    for case in 0..1000 {
+        let nv = 2 + r.below(2)
+        let p = gen(mut &r, 3, nv)
+        let n = 1 + r.below(8)
+        let t = randTable(mut &r, nv, n, 4 + r.below(6))
+        let cr = lexdb_match.compile(&p, nv)
+        if cr.isErr() { skipped += 1; continue }
+        let pr = cr.unwrap()
+        done += 1
+        // one search: every start row, as SKIP TO NEXT ROW does; memo and not, and the reference
+        var ma = lexdb_match.newMatcher()
+        var mb = lexdb_match.newMatcher()
+        ma.reset(0)
+        mb.reset(0)
+        let holds = fn(v: int, pos: int, lab: &[]int): Result[bool, lexdb_base.DbErr] { return Ok(t[v][pos]) }
+        for s in 0..n + 1 {
+            let want = refMatch(&p, &t, s)
+            let fa = ma.attempt(&pr, 0, n, s, true, 0, holds, tick0).unwrap()
+            let fb = mb.attempt(&pr, 0, n, s, false, 0, holds, tick0).unwrap()
+            if want == "skip" {
+                skippedRef += 1
+                check("random " + case.toStr() + " " + pstr(&p) + " s=" + s.toStr() + " memo is nomemo", show(&fa), show(&fb))
+            } else {
+                check("random " + case.toStr() + " " + pstr(&p) + " s=" + s.toStr() + " memo", show(&fa), want)
+                check("random " + case.toStr() + " " + pstr(&p) + " s=" + s.toStr() + " nomemo", show(&fb), want)
+            }
+            if fa.ok {
+                withMatch += 1
+                // a new search (reset) at the same row gives the same match
+                ma.reset(s)
+                let fc = ma.attempt(&pr, 0, n, s, true, 0, holds, tick0).unwrap()
+                check("random " + case.toStr() + " s=" + s.toStr() + " again", show(&fc), show(&fa))
+                ma.reset(s + 1)
+                mb.reset(s + 1)
+            }
+        }
+    }
+    check("random patterns compiled", if done > 400 { "many" } else { "few " + done.toStr() }, "many")
+    check("reference not skipped", if skippedRef < 100 { "most" } else { "skipped " + skippedRef.toStr() }, "most")
+    check("random matches found", if withMatch > 300 { "many" } else { "few " + withMatch.toStr() }, "many")
+}
+
+fn main() {
+    // preference order
+    both("greedy plus", &qn(va(0), 1, -1, false), 1, &["1111"], 0, "4:aaaa")
+    both("reluctant plus then b", &sq([qn(va(0), 1, -1, true), va(1)]), 2, &["1111", "0010"], 0, "3:aab")
+    both("greedy gives back", &sq([qn(va(0), 1, -1, false), va(1)]), 2, &["1111", "0010"], 0, "3:aab")
+    both("alt first", &al([va(0), va(1)]), 2, &["1", "1"], 0, "1:a")
+    both("alt second", &al([va(1), va(0)]), 2, &["1", "1"], 0, "1:b")
+    both("alt falls to second", &al([va(0), va(1)]), 2, &["0", "1"], 0, "1:b")
+    both("{2,3} greedy", &qn(va(0), 2, 3, false), 1, &["11111"], 0, "3:aaa")
+    both("{2,3} reluctant", &qn(va(0), 2, 3, true), 1, &["11111"], 0, "2:aa")
+    both("{2} too few rows", &qn(va(0), 2, 2, false), 1, &["1"], 0, "none")
+    both("{0,2} empty", &qn(va(0), 0, 2, false), 1, &["0000"], 0, "0:")
+    both("star empty", &qn(va(0), 0, -1, false), 1, &["0110"], 0, "0:")
+    both("star at 1", &qn(va(0), 0, -1, false), 1, &["0110"], 1, "3:aa")
+    both("b? reluctant is empty", &sq([va(0), qn(va(1), 0, 1, true)]), 2, &["11", "11"], 0, "1:a")
+    both("b? greedy", &sq([va(0), qn(va(1), 0, 1, false)]), 2, &["11", "11"], 0, "2:ab")
+    both("group plus", &qn(sq([va(0), va(1)]), 1, -1, false), 2, &["1010", "0101"], 0, "4:abab")
+    both("group {2}", &qn(sq([va(0), va(1)]), 2, 2, false), 2, &["1010", "0101"], 0, "4:abab")
+    both("backtrack into a group", &sq([qn(al([va(0), va(1)]), 1, -1, false), va(2)]), 3, &["1110", "0100", "0001"], 0, "4:aaac")
+    // PERMUTE
+    both("permute abc all true", &pm([va(0), va(1), va(2)]), 3, &["111", "111", "111"], 0, "3:abc")
+    both("permute bca only", &pm([va(0), va(1), va(2)]), 3, &["001", "100", "010"], 0, "3:bca")
+    both("permute acb", &pm([va(0), va(1), va(2)]), 3, &["101", "011", "110"], 0, "3:acb")
+    both("permute lexicographic", &pm([va(0), va(1), va(2)]), 3, &["011", "111", "111"], 0, "3:bac")
+    both("permute plus", &pm([qn(va(0), 1, -1, false), va(1)]), 2, &["110", "001"], 0, "3:aab")
+    both("permute plus b first", &pm([qn(va(0), 1, -1, false), va(1)]), 2, &["011", "100"], 0, "3:baa")
+    both("permute of sequences", &pm([sq([va(0), va(1)]), va(2)]), 3, &["100", "010", "001"], 0, "3:abc")
+    both("permute of sequences, other order", &pm([sq([va(0), va(1)]), va(2)]), 3, &["010", "001", "100"], 0, "3:cab")
+    // anchors
+    both("^ at the first row", &sq([bg(), va(0)]), 1, &["11"], 0, "1:a")
+    both("^ elsewhere", &sq([bg(), va(0)]), 1, &["11"], 1, "none")
+    both("$ at the last row", &sq([va(0), en()]), 1, &["11"], 1, "2:a")
+    both("$ not yet", &sq([va(0), en()]), 1, &["11"], 0, "none")
+    both("^ a* $", &sq([bg(), qn(va(0), 0, -1, false), en()]), 1, &["111"], 0, "3:aaa")
+    both("^ a* $ fails", &sq([bg(), qn(va(0), 0, -1, false), en()]), 1, &["110"], 0, "none")
+    both("a* $ from the end", &sq([qn(va(0), 0, -1, false), en()]), 1, &["110"], 3, "3:")
+    // exclusion
+    both("exclusion flags", &sq([va(0), ex(va(1)), va(2)]), 3, &["100", "010", "001"], 0, "3:aBc")
+    both("exclusion at the end", &sq([va(0), ex(va(1))]), 2, &["10", "01"], 0, "2:aB")
+    both("excluded run", &sq([va(0), ex(qn(va(1), 1, -1, false)), va(2)]), 3, &["1000", "0110", "0001"], 0, "4:aBBc")
+    both("exclusion in a quantifier", &qn(sq([va(0), ex(va(1))]), 2, 2, false), 2, &["1010", "0101"], 0, "4:aBaB")
+    // an empty exclusion-free alt with begin
+    both("alt with begin", &al([sq([bg(), va(0)]), va(1)]), 2, &["01", "11"], 1, "2:b")
+    // compile errors and limits
+    check("empty loop star star", compileCode(&qn(qn(va(0), 0, -1, false), 0, -1, false)), "1")
+    check("empty loop opt plus", compileCode(&qn(qn(va(0), 0, 1, false), 1, -1, false)), "1")
+    check("empty loop begin", compileCode(&qn(bg(), 0, 1, false)), "1")
+    check("empty loop alt", compileCode(&qn(al([va(0), qn(va(1), 0, -1, false)]), 1, -1, false)), "1")
+    check("loop over a plus group", compileCode(&qn(qn(va(0), 1, -1, false), 0, -1, false)), "ok")
+    check("a star", compileCode(&qn(va(0), 0, -1, false)), "ok")
+    check("too large bound", compileCode(&qn(va(0), 1, 10001, false)), "2")
+    check("too large bound unbounded", compileCode(&qn(va(0), 10001, -1, false)), "2")
+    check("largest bound", compileCode(&qn(va(0), 9998, 9998, false)), "ok")
+    check("one over", compileCode(&qn(va(0), 10000, 10000, false)), "2")
+    check("nested product", compileCode(&qn(qn(va(0), 100, 100, false), 100, 100, false)), "2")
+    check("nested product fits", compileCode(&qn(qn(va(0), 100, 100, false), 99, 99, false)), "ok")
+    check("huge product saturates", compileCode(&qn(qn(qn(qn(va(0), 10000, 10000, false), 10000, 10000, false), 10000, 10000, false), 10000, 10000, false)), "2")
+    check("permute of eight", compileCode(&pm([va(0), va(1), va(2), va(3), va(0), va(1), va(2), va(3)])), "2")
+    check("permute of six", compileCode(&pm([va(0), va(1), va(2), va(3), va(0), va(1)])), "ok")
+    var deep = va(0)
+    for i in 0..60 { deep = sq([deep]) }
+    check("depth 60", compileCode(&deep), "ok")
+    for i in 0..10 { deep = sq([deep]) }
+    check("depth 70", compileCode(&deep), "2")
+    // the step limit: without the memo ((a|a)+ b) is exponential, with it linear
+    var many = "1"
+    for i in 0..5 { many = many + many }
+    let hard = sq([qn(al([va(0), va(0)]), 1, -1, false), va(1)])
+    var zeros = "0"
+    for i in 0..5 { zeros = zeros + zeros }
+    let tt = tb(&[many, zeros])
+    check("step limit", run(&hard, 2, &tt, 0, false, 10000), "over")
+    check("memo needs none", run(&hard, 2, &tt, 0, true, 10000), "none")
+    check("no limit given with the memo", run(&hard, 2, &tt, 0, true, 0), "none")
+    // the step limit counts per attempt
+    check("limit not hit", run(&qn(va(0), 1, -1, false), 1, &tb(&[many]), 0, false, 1000), "32:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+    // a match 300,000 rows long: the matcher's own stack, not recursion
+    var big = lexdb_match.newMatcher()
+    big.reset(0)
+    let nbig = 300000
+    let prBig = lexdb_match.compile(&sq([qn(va(0), 1, -1, false), va(1)]), 2).unwrap()
+    let holdsBig = fn(v: int, pos: int, lab: &[]int): Result[bool, lexdb_base.DbErr] { return Ok(if v == 0 { pos < nbig - 1 } else { pos == nbig - 1 }) }
+    let fb = big.attempt(&prBig, 0, nbig, 0, false, 0, holdsBig, tick0).unwrap()
+    check("long match", fb.end.toStr() + " " + len(fb.lab).toStr(), "300000 300000")
+    check("long match stack", if big.bytes() > 4000000 { "kept" } else { "small" }, "kept")
+    // the matcher gives back the lab it found, and a later attempt starts clean
+    let fb2 = big.attempt(&prBig, 0, nbig, 0, false, 0, holdsBig, tick0).unwrap()
+    check("second attempt", fb2.end.toStr() + " " + len(fb2.lab).toStr(), "300000 300000")
+    randomChecks(11)
+    randomChecks(12)
+    println("checks failed: " + fails.toStr())
+}

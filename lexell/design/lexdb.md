@@ -11556,3 +11556,83 @@ tree while worker 0's ALTERs land.
   rounds with and without `LEXDB_COLCHECK=1`. The replica test passes.
 
 The suite passes (133), also with `LEXDB_COLCHECK=1`.
+
+### 9.121 MERGE, one statement for PostgreSQL, T-SQL and Oracle
+
+MERGE is built once and read in three dialects. The parser has three front ends in one function (`P.merge`, `P.mergeWhen`
+in `lexdb_sql.lxl`; each branch is `p.tsql`, `p.ora` or neither); the planner and the executor (`merge` in `lexdb_exec.lxl`)
+are shared. `Stmt.kind` is `S_MERGE`: the target in `table` (its alias in `alias`), the source in `from[0]` (a table, a
+subquery, `(VALUES ...)`, a CTE, DUAL), ON in `where`, the WHEN clauses in `merges` (`MergeClause`: which rows it is for,
+an optional condition, UPDATE / DELETE / INSERT / DO NOTHING, Oracle's `DELETE WHERE`), RETURNING (T-SQL's OUTPUT) in
+`items`, T-SQL's TOP in `limit`, and the dialect in `mdialect` (it picks the errors and what a deleted row shows).
+
+**How it runs.**
+- **One join, read first.** The source and the target are joined on ON as one query: the source first, so its rows come
+  out in its own order (the order identity values and sequences are taken in); the join is INNER, LEFT (clauses for source
+  rows with no target row), RIGHT (BY SOURCE clauses only) or FULL, by the clauses given. Every row is read before any is
+  written (the snapshot); the target rows read are locked as UPDATE's are.
+- **Then each row, in order.** A row with a target row is MATCHED (or BY SOURCE if the source side is all NULL and the
+  statement has such a clause); a row without one is NOT MATCHED. The first clause of that kind whose condition is true
+  is the action. UPDATE, DELETE and INSERT are `updRow`, `delRow` and `insertOne`, the code of the three statements, so
+  constraints, foreign keys, identity (also T-SQL's IDENTITY_INSERT and PostgreSQL's OVERRIDING), defaults, sequences,
+  CHECKs and the Oracle door's empty-string and identifier rules are theirs. lexdb has no triggers.
+- **A target row changed twice** is an error, only when it is really changed: PostgreSQL 21000 for UPDATE or DELETE;
+  SQL Server 8672 for two UPDATEs, or an UPDATE and a DELETE (two DELETEs of a row are one, and count once);
+  Oracle ORA-30926 for two UPDATEs (a clause's WHERE that leaves a row alone counts nothing).
+- **Row counts.** PostgreSQL's command tag `MERGE n`, n the rows inserted, updated and deleted (not DO NOTHING's);
+  T-SQL's the same as its row count; Oracle's rows merged, a row updated and then deleted by DELETE WHERE counting once.
+- **RETURNING and OUTPUT.** PostgreSQL 17's `RETURNING` with `merge_action()` (both the target's and the source's
+  columns; a deleted row shows its old values); T-SQL's `OUTPUT` with `$action`, `inserted.c` (NULL for a deleted row),
+  `deleted.c` (NULL for an inserted one) and `deleted.*`. (`#old` now has its argument's type and name, so `OUTPUT
+  deleted.c` of an UPDATE is typed and named as c.)
+- **The statement is one.** Any error undoes it whole, in a block or outside one (as an INSERT's).
+
+**Dialect rules checked against the servers** (suites below):
+- PostgreSQL: WHEN [NOT] MATCHED [BY SOURCE | BY TARGET] [AND cond], DO NOTHING, DEFAULT VALUES, OVERRIDING, WITH, a
+  clause that does not fit is 42601; MERGE into a missing table 42P01.
+- T-SQL: the semicolon is required (10713); at most one clause per action in each kind (10714), a clause with no condition
+  last in its kind (5324); INSERT in a MATCHED or BY SOURCE clause 10711, UPDATE or DELETE in NOT MATCHED 10710; 109,
+  110 and 213 for the wrong number of values; 8102 for an identity column in SET; TOP (n) takes the first n joined rows;
+  `WITH (HOLDLOCK)` and the other hints are read and ignored.
+- Oracle: ON must be in parentheses (ORA-00969), at least one clause (ORA-02000, "missing WHEN keyword" and its kin for
+  DELETE alone, INSERT in WHEN MATCHED, a clause twice, BY TARGET); the two clauses in either order; `UPDATE SET ... [WHERE]
+  [DELETE WHERE]` (the DELETE WHERE reads the row as updated); `INSERT ... [WHERE]`; ORA-38104 for a column ON names
+  in SET; ORA-38101 for the target's column in INSERT's values; ORA-32795, ORA-32796 for identity; ORA-01407 for a NULL
+  into a NOT NULL column by UPDATE; in an UPDATE clause a name both tables have is the target's, in ON it is ORA-00918.
+
+**Tests** (answers recorded from PostgreSQL 18.6, SQL Server 2022 CU27 and Oracle Database Free 23ai):
+- `exec_merge` (gen_pg.py merge, 140 queries): an upsert, conditional clauses, DO NOTHING, DELETE, subquery, VALUES,
+  CTE and aggregate sources, 21000, a failed insert undoing the rows before it, NULL keys, a table without a key,
+  identity, serial and sequence defaults, OVERRIDING, DEFAULT, BY SOURCE and BY TARGET, RETURNING with merge_action(),
+  constraints and foreign keys, BEGIN/ROLLBACK/COMMIT, privileges per action, the errors.
+- `tds_merge` (gen_mssql.py merge, 128 batches): the same, with OUTPUT, $action, TOP, IDENTITY_INSERT, 8672 and its
+  exceptions, the clause rules (5324, 10710, 10711, 10713, 10714), @@ROWCOUNT, TRY ... CATCH.
+- `tns_merge` (gen_oracle.py merge, 87 answers; the generator has new kinds `t` and `u`: statements run in a
+  transaction that is rolled back or committed): the Oracle forms above, and its errors.
+- By hand: python-oracledb binds, executemany with arraydmlrowcounts, MERGE in an anonymous block with SQL%ROWCOUNT, and
+  psql's extended protocol with RETURNING, all as for INSERT.
+
+**Not done; differences.**
+- MERGE into a view: PostgreSQL merges into an automatically updatable view; lexdb's views are read-only (0A000).
+- PostgreSQL 18's `RETURNING WITH (OLD AS o, NEW AS n)`; `MERGE TOP (n) PERCENT`; T-SQL's `OUTPUT ... INTO` and `OPTION`.
+- A source row of all NULLs that matches a target row, in a statement with a BY SOURCE clause, reads as unmatched.
+- The statement's CMD in T-SQL's DONE token is 0xC6, a guess (the row count is right).
+- Oracle's ORA-30926 text has no rowid; Oracle's ORA-14359 for DELETE WHERE over duplicate source rows is ORA-30926 here.
+- INSERT's `WHEN NOT MATCHED` clause is evaluated per source row, so with a duplicate key in the source its second row
+  fails on the unique key, as in all three servers (error 23505, 2627, ORA-00001).
+
+### 9.122 MATCH_RECOGNIZE, row pattern recognition in all three doors
+
+`FROM item MATCH_RECOGNIZE (...)` (SQL:2016 R010, Oracle's syntax and semantics) is built once and read in three doors; the
+design and its as-built notes are in lexdb-match-recognize.md (section 12). The parser (`P.matchRecognize`) turns the
+clause into a wrapper subquery in FROM: `Stmt.mr` holds the `MatchRec`, the input is its one FROM item, and the planner and
+executor treat it as any FROM subquery (joins, CTEs, views, LATERAL, nesting and GROUP BY over it work through existing
+code). `planMatch` rewrites DEFINE and MEASURES into slots (`#mrnav`, one per navigation, aggregate, CLASSIFIER or
+MATCH_NUMBER) and `execMatch` sorts and partitions the input rows and searches each partition. The matcher is
+`lexdb_match.lxl`: the pattern is compiled to a program of SPLIT, JMP, VAR, BEGIN, END and MATCH with quantifiers
+unrolled, and run on an explicit stack in preference order (never recursion over rows); where every DEFINE reads only its
+own row a memo of failed states makes a search O((splits + variables) x rows); a history-dependent DEFINE is bounded by the
+session setting `max_match_steps` (10,000,000 per start row, 54001; 0 none). Each step and each output row takes
+`Run.tick` (turns, statement_timeout), the memo and the output rows count against max_statement_mem. Tests: `match_vm`,
+`exec_mrparse`, `exec_mr`, `exec_mrlimits`, and `tns_mr`, `exec_mrdoors`, `tds_mr` (163 cases each, recorded on Oracle
+Database Free 23ai by gen_mr.py from mr_cases.txt).

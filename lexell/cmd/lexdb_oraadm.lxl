@@ -1,0 +1,151 @@
+// lexdb_oraadm: the parts of Oracle's session and user statements that need no
+// connection (design/lexdb-oracle.md, stage O5): the words of a statement,
+// the NLS territories and languages, the privilege names.
+import "strings"
+
+// A word of ALTER SESSION, CREATE USER, GRANT, ...: its text (a quoted one
+// without its quotes), whether it was quoted, a symbol (one of , ( ) = ;), and
+// where it starts and ends in the statement.
+pub type W = value record { pub t: str; pub q: bool; pub sym: bool; pub a: int; pub z: int }
+
+fn isSp(c: byte): bool { return c == ' ' || c == '\t' || c == '\n' || c == '\r' }
+
+fn isSymByte(c: byte): bool { return c == ',' || c == '(' || c == ')' || c == '=' || c == ';' }
+
+pub fn words(sql: &str): []W {
+    var out: []W = []
+    let n = len(sql)
+    var i = 0
+    while i < n {
+        let ch = sql[i]
+        if isSp(ch) {
+            i += 1
+            continue
+        }
+        if ch == '-' && i + 1 < n && sql[i + 1] == '-' {
+            while i < n && sql[i] != '\n' { i += 1 }
+            continue
+        }
+        if ch == '/' && i + 1 < n && sql[i + 1] == '*' {
+            i += 2
+            while i + 1 < n && !(sql[i] == '*' && sql[i + 1] == '/') { i += 1 }
+            i += 2
+            continue
+        }
+        if ch == byte(39) || ch == byte(34) {
+            var b: []byte = []
+            var j = i + 1
+            while j < n {
+                if sql[j] == ch {
+                    if j + 1 < n && sql[j + 1] == ch {
+                        append(mut &b, ch)
+                        j += 2
+                        continue
+                    }
+                    break
+                }
+                append(mut &b, sql[j])
+                j += 1
+            }
+            append(mut &out, W{t: strFromBytes(&b), q: true, sym: false, a: i, z: min(j + 1, n)})
+            i = min(j + 1, n)
+            continue
+        }
+        if isSymByte(ch) {
+            append(mut &out, W{t: sql[i..i + 1].toStr(), q: false, sym: true, a: i, z: i + 1})
+            i += 1
+            continue
+        }
+        var j = i
+        while j < n && !isSp(sql[j]) && !isSymByte(sql[j]) && sql[j] != byte(39) && sql[j] != byte(34) { j += 1 }
+        append(mut &out, W{t: sql[i..j].toStr(), q: false, sym: false, a: i, z: j})
+        i = j
+    }
+    return out
+}
+
+// A bare word in upper case, "" for a quoted word or a symbol.
+pub fn up(w: &W): str { return if w.q || w.sym { "" } else { strings.toUpperAscii(w.t) } }
+
+// Whether w is the bare word k (upper case).
+pub fn isKw(w: &W, k: &str): bool { return !w.q && !w.sym && strings.toUpperAscii(w.t) == k }
+
+pub fn isSym(w: &W, s: &str): bool { return w.sym && w.t == s }
+
+// The name a word gives: lower case (lexdb's names).
+pub fn nameOf(w: &W): str { return strings.toLowerAscii(w.t) }
+
+// A quoted identifier / literal of lexdb's SQL.
+pub fn qid(s: &str): str { return "\"" + strings.replaceAll(s, "\"", "\"\"") + "\"" }
+pub fn qlit(s: &str): str { return "'" + strings.replaceAll(s, "'", "''") + "'" }
+
+// ---- NLS
+
+// A territory: its date, timestamp and timestamp with time zone formats, its
+// numeric characters.
+pub type Terr = value record { pub name: str; pub date: str; pub ts: str; pub tstz: str; pub numchars: str }
+
+const AM_TS = "DD-MON-RR HH.MI.SSXFF AM"
+const AM_TZ = "DD-MON-RR HH.MI.SSXFF AM TZR"
+
+pub fn territories(): []Terr {
+    return [
+        Terr{name: "AMERICA", date: "DD-MON-RR", ts: AM_TS, tstz: AM_TZ, numchars: ".,"},
+        Terr{name: "UNITED KINGDOM", date: "DD-MON-RR", ts: "DD-MON-RR HH24.MI.SSXFF", tstz: "DD-MON-RR HH24.MI.SSXFF TZR", numchars: ".,"},
+        Terr{name: "CANADA", date: "DD-MON-RR", ts: AM_TS, tstz: AM_TZ, numchars: ".,"},
+        Terr{name: "AUSTRALIA", date: "DD-MON-RR", ts: AM_TS, tstz: AM_TZ, numchars: ".,"},
+        Terr{name: "CHINA", date: "DD-MON-RR", ts: AM_TS, tstz: AM_TZ, numchars: ".,"},
+        Terr{name: "INDIA", date: "DD-MM-RR", ts: "DD-MM-RR HH12:MI:SSXFF AM", tstz: "DD-MM-RR HH12:MI:SSXFF AM TZR", numchars: ".,"},
+        Terr{name: "ITALY", date: "DD-MON-RR", ts: "DD-MON-RR HH24:MI:SSXFF", tstz: "DD-MON-RR HH24:MI:SSXFF TZR", numchars: ",."},
+        Terr{name: "GERMANY", date: "DD.MM.RR", ts: "DD.MM.RR HH24:MI:SSXFF", tstz: "DD.MM.RR HH24:MI:SSXFF TZR", numchars: ",."},
+        Terr{name: "SWITZERLAND", date: "DD.MM.RR", ts: "DD.MM.RR HH24:MI:SSXFF", tstz: "DD.MM.RR HH24:MI:SSXFF TZR", numchars: ".'"},
+        Terr{name: "FRANCE", date: "DD/MM/RR", ts: "DD/MM/RR HH24:MI:SSXFF", tstz: "DD/MM/RR HH24:MI:SSXFF TZR", numchars: ", "},
+        Terr{name: "SPAIN", date: "DD/MM/RR", ts: "DD/MM/RR HH24:MI:SSXFF", tstz: "DD/MM/RR HH24:MI:SSXFF TZR", numchars: ",."},
+        Terr{name: "BRAZIL", date: "DD/MM/RR", ts: "DD/MM/RR HH24:MI:SSXFF", tstz: "DD/MM/RR HH24:MI:SSXFF TZR", numchars: ",."},
+        Terr{name: "NETHERLANDS", date: "DD-MM-RR", ts: "DD-MM-RR HH24:MI:SSXFF", tstz: "DD-MM-RR HH24:MI:SSXFF TZR", numchars: ",."},
+        Terr{name: "SWEDEN", date: "RR-MM-DD", ts: "RR-MM-DD HH24:MI:SSXFF", tstz: "RR-MM-DD HH24:MI:SSXFF TZR", numchars: ", "},
+        Terr{name: "JAPAN", date: "RR/MM/DD", ts: "RR/MM/DD HH24:MI:SSXFF", tstz: "RR/MM/DD HH24:MI:SSXFF TZR", numchars: ".,"}
+    ]
+}
+
+pub fn territoryOf(name: &str): Option[Terr] {
+    let u = strings.toUpperAscii(name.toStr())
+    for t in territories() { if t.name == u { return Some(t) } }
+    return None
+}
+
+pub const LANGUAGES: []str = ["AMERICAN", "ENGLISH", "GERMAN", "FRENCH", "SPANISH", "ITALIAN", "DUTCH", "PORTUGUESE", "BRAZILIAN PORTUGUESE", "SWEDISH",
+                              "JAPANESE", "SIMPLIFIED CHINESE", "RUSSIAN", "POLISH", "TURKISH", "KOREAN", "DANISH", "NORWEGIAN", "FINNISH", "CZECH"]
+
+pub fn isLanguage(name: &str): bool {
+    let u = strings.toUpperAscii(name.toStr())
+    for l in LANGUAGES { if l == u { return true } }
+    return false
+}
+
+// The ALTER SESSION parameters that are accepted and kept without effect (a
+// session's own settings the drivers send); the NLS_ ones are kept as set.
+pub const IGNORED: []str = ["ISOLATION_LEVEL", "SQL_TRACE", "TRACEFILE_IDENTIFIER", "EVENTS", "OPTIMIZER_MODE", "STATISTICS_LEVEL", "COMMIT_WAIT",
+                            "COMMIT_LOGGING", "CURSOR_SHARING", "RECYCLEBIN", "CONTAINER", "EDITION", "DDL_LOCK_TIMEOUT", "SKIP_UNUSABLE_INDEXES",
+                            "MAX_DUMP_FILE_SIZE", "HASH_AREA_SIZE", "SORT_AREA_SIZE", "SORT_AREA_RETAINED_SIZE", "QUERY_REWRITE_ENABLED",
+                            "QUERY_REWRITE_INTEGRITY", "PLSQL_WARNINGS", "PLSQL_CCFLAGS", "PLSQL_OPTIMIZE_LEVEL", "PLSQL_CODE_TYPE", "PLSQL_DEBUG",
+                            "PLSQL_V2_COMPATIBILITY", "OPTIMIZER_FEATURES_ENABLE", "OPTIMIZER_INDEX_COST_ADJ", "OPTIMIZER_INDEX_CACHING",
+                            "OPTIMIZER_DYNAMIC_SAMPLING", "OPTIMIZER_ADAPTIVE_PLANS", "PARALLEL_DEGREE_POLICY", "RESUMABLE_TIMEOUT", "REMOTE_DEPENDENCIES_MODE",
+                            "SESSION_CACHED_CURSORS", "WORKAREA_SIZE_POLICY", "INMEMORY_QUERY", "CONSTRAINTS", "FLAGGER", "GLOBAL_NAMES", "SMTP_OUT_SERVER",
+                            "STATISTICS_LEVEL", "TIMED_STATISTICS", "TIMED_OS_STATISTICS", "USE_STORED_OUTLINES", "CREATE_STORED_OUTLINES", "XML_DB_EVENTS",
+                            "CURRENT_EDITION", "ROW_ARCHIVAL_VISIBILITY", "PDB_LOCKDOWN", "EDITION", "ENABLE_DDL_LOGGING", "NLS_LENGTH_SEMANTICS_"]
+
+pub fn isIgnored(name: &str): bool {
+    for k in IGNORED { if k == name { return true } }
+    return false
+}
+
+// The NLS parameters (ALTER SESSION SET name = ...).
+pub const NLS_NAMES: []str = ["NLS_LANGUAGE", "NLS_TERRITORY", "NLS_CURRENCY", "NLS_ISO_CURRENCY", "NLS_NUMERIC_CHARACTERS", "NLS_CALENDAR",
+                              "NLS_DATE_FORMAT", "NLS_DATE_LANGUAGE", "NLS_SORT", "NLS_COMP", "NLS_TIMESTAMP_FORMAT", "NLS_TIMESTAMP_TZ_FORMAT",
+                              "NLS_TIME_FORMAT", "NLS_TIME_TZ_FORMAT", "NLS_DUAL_CURRENCY", "NLS_LENGTH_SEMANTICS", "NLS_NCHAR_CONV_EXCP"]
+
+pub fn isNls(name: &str): bool {
+    for k in NLS_NAMES { if k == name { return true } }
+    return false
+}

@@ -1,0 +1,318 @@
+// lexdb's Oracle SQL surface (design/lexdb-oracle.md, stage O3), through the
+// TNS door and lib/oracle: DUAL, SYSDATE, ROWNUM, FETCH FIRST and OFFSET, sequences
+// (.NEXTVAL, .CURRVAL), NVL, NVL2, DECODE, ||, TO_CHAR, TO_DATE, TO_NUMBER,
+// SUBSTR, INSTR, TRUNC, ADD_MONTHS, MONTHS_BETWEEN, LAST_DAY, NEXT_DAY, LISTAGG,
+// MINUS, Oracle's type names, the empty string as NULL, names folded up,
+// GENERATED AS IDENTITY, and (+) refused.
+//
+// VERIFIED against Oracle Database Free 23ai (gvenzl/oracle-free:slim) on 2026-11-13: each answer
+// below is what that server gives for the statement (names and values), except where noted:
+// USER is the login's name (SA here, APP there), DATE is a timestamp(0) (design/lexdb-oracle.md
+// section 14), and `rownum before order` has no fixed answer on Oracle (its plan chose 4;3).
+// Each line: a label, then the columns' names, then the rows (| between
+// columns' values, ; between rows), or error and the ORA- number.
+// expect: create emp: 0
+// expect: insert 1: 1
+// expect: insert 2: 1
+// expect: insert 3: 1
+// expect: insert 4 empty string: 1
+// expect: select star: ID,NAME,SAL,HIRED,DEPT,MGR = 1|'Ann'|5000.50|'2020-01-15T00:00:00'|'ENG'|NULL;2|'Bob'|4000.00|'2021-06-30T00:00:00'|'OPS'|1;3|'Cy'|3000.00|NULL|'ENG'|1;4|'Di'|2000.00|NULL|NULL|NULL
+// expect: dual: 1,'X' = 1|'x'
+// expect: star from dual: DUMMY = 'X'
+// expect: dummy: DUMMY = 'X'
+// expect: expression names: 1+1,COUNT(*),UPPER(NAME),DBL = 2|1|'ANN'|2
+// expect: empty is null: ID = 4
+// expect: empty equals: ID = 
+// expect: empty concat: NAME||DEPT||'!' = 'AnnENG!';'Di!'
+// expect: null concat: 'A'||NULL||'B',NULL||NULL,CONCAT('X',NULL) = 'ab'|NULL|'x'
+// expect: length empty: LENGTH(''),LENGTH(DEPT) = NULL|NULL
+// expect: nvl: NVL(DEPT,'NONE'),NVL(MGR,-1) = 'ENG'|-1;'OPS'|1;'ENG'|1;'none'|-1
+// expect: nvl2: NVL2(DEPT,'HAS','NO'),NVL2(NULL,1,2) = 'has'|2;'no'|2
+// expect: decode: DECODE(DEPT,'ENG',1,'OPS',2,0),DECODE(DEPT,NULL,'N',DEPT),DECODE(1,2,'X') = 1|'ENG'|NULL;2|'OPS'|NULL;1|'ENG'|NULL;0|'n'|NULL
+// expect: case: CASEWHENSAL>3500THEN'HI'ELSE'LO'END = 'hi';'hi';'lo';'lo'
+// expect: division: 1/3,10/4,6/3,7/2 = 0.3333333333333333333333333333333333333|2.5|2|3.5
+// expect: divide by zero: error 1476
+// expect: arithmetic: 5-3,2*3+1,-4+1,MOD(7,3),POWER(2,10),SQRT(16) = 2|7|-3|1|1024|4
+// expect: substr: SUBSTR('HELLO',2,3),SUBSTR('HELLO',-3),SUBSTR('HELLO',0,2),SUBSTR('HELLO',9),SUBSTR('HELLO',2,0) = 'ell'|'llo'|'he'|NULL|NULL
+// expect: instr: INSTR('ABCABC','C'),INSTR('ABCABC','C',4),INSTR('ABCABC','C',1,2),INSTR('ABCABC','C',-1),INSTR('ABC','Z') = 3|6|6|6|0
+// expect: string functions: UPPER('AB'),LOWER('AB'),INITCAP('HELLOWORLD'),LPAD('7',3,'0'),RPAD('AB',4,'*'),LTRIM('XXA','X'),RTRIM('AXX','X'),TRIM('B') = 'AB'|'ab'|'Hello World'|'007'|'ab**'|'a'|'a'|'b'
+// expect: replace translate: REPLACE('BANANA','AN','AN'),REPLACE('BANANA','AN',''),REPLACE('BANANA','AN'),TRANSLATE('ABC','AB','XY') = 'bANANa'|'ba'|'ba'|'xyc'
+// expect: to_char numbers: TO_CHAR(1234.5,'9,999.99'),TO_CHAR(-5,'9999'),TO_CHAR(5,'0000'),TO_CHAR(0.5),TO_CHAR(1.50),TO_CHAR(100),TO_CHAR(-0.25) = ' 1,234.50'|'   -5'|' 0005'|'.5'|'1.5'|'100'|'-.25'
+// expect: to_char more: TO_CHAR(1234.5,'FM9,999.00'),TO_CHAR(5,'S99'),TO_CHAR(-0.5,'99.99PR'),TO_CHAR(1234,'9999') = '1,234.50'|' +5'|'  <.50>'|' 1234'
+// expect: to_number: TO_NUMBER('12.5'),TO_NUMBER('1,234.5','9,999.9'),TO_NUMBER('-7') = 12.5|1234.5|-7
+// expect: to_number error: error 1722
+// expect: to_date: TO_DATE('2024-03-05','YYYY-MM-DD'),TO_DATE('15/03/202414:30','DD/MM/YYYYHH24:MI'),TO_DATE('05-MAR-24'),TO_DATE('12-31-2411:59PM','MM-DD-RRHH12:MIAM') = '2024-03-05T00:00:00'|'2024-03-15T14:30:00'|'2024-03-05T00:00:00'|'2024-12-31T23:59:00'
+// expect: to_date names: TO_DATE('MARCH5,2024','MONTHDD,YYYY'),TO_DATE('5MAR2024','DDMONYYYY') = '2024-03-05T00:00:00'|'2024-03-05T00:00:00'
+// expect: to_date errors: error 1843
+// expect: to_date non-numeric: error 1841
+// expect: to_timestamp: TO_TIMESTAMP('2024-03-0501:02:03.123456','YYYY-MM-DDHH24:MI:SS.FF6') = '2024-03-05T01:02:03.123456'
+// expect: to_char dates: TO_CHAR(HIRED,'YYYY-MM-DD'),TO_CHAR(HIRED,'DD-MON-YYYY'),TO_CHAR(HIRED,'DAY'),TO_CHAR(HIRED,'FMDDMONTH,YYYY'),TO_CHAR(HIRED) = '2020-01-15'|'15-JAN-2020'|'Wednesday'|'15 January, 2020'|'15-JAN-20'
+// expect: to_char date parts: TO_CHAR(DATE'2024-03-05','DD/MM/RR'),TO_CHAR(DATE'2024-03-05','DDDDQJ'),TO_CHAR(DATE'2024-12-25','MONDY'),TO_CHAR(DATE'2024-03-05','HH12:MIAM') = '05/03/24'|'3 065 1 2460375'|'Dec WED'|'12:00 AM'
+// expect: date arithmetic: HIRED+30,HIRED-1,DATE'2024-03-01'-DATE'2024-02-01',DATE'2024-03-01'-1.5 = '2020-02-14T00:00:00'|'2020-01-14T00:00:00'|29|'2024-02-28T12:00:00'
+// expect: date difference: MAX(HIRED)-MIN(HIRED) = 532
+// expect: add_months: ADD_MONTHS(DATE'2024-01-31',1),ADD_MONTHS(DATE'2024-02-29',12),ADD_MONTHS(DATE'2024-03-31',-1),ADD_MONTHS(DATE'2024-01-15',-13) = '2024-02-29T00:00:00'|'2025-02-28T00:00:00'|'2024-02-29T00:00:00'|'2022-12-15T00:00:00'
+// expect: months_between: MONTHS_BETWEEN(DATE'2024-03-31',DATE'2024-02-29'),MONTHS_BETWEEN(DATE'2024-03-15',DATE'2024-01-15'),MONTHS_BETWEEN(DATE'2024-01-31',DATE'2024-03-31') = 1|2|-2
+// expect: last_day next_day: LAST_DAY(DATE'2024-02-10'),LAST_DAY(DATE'2023-12-01'),NEXT_DAY(DATE'2024-02-10','MONDAY'),NEXT_DAY(DATE'2024-02-12','MON') = '2024-02-29T00:00:00'|'2023-12-31T00:00:00'|'2024-02-12T00:00:00'|'2024-02-19T00:00:00'
+// expect: trunc dates: TRUNC(DATE'2024-05-17'),TRUNC(DATE'2024-05-17','MM'),TRUNC(DATE'2024-05-17','YYYY'),TRUNC(DATE'2024-05-17','Q'),TRUNC(TIMESTAMP'2024-05-1713:14:15','HH') = '2024-05-17T00:00:00'|'2024-05-01T00:00:00'|'2024-01-01T00:00:00'|'2024-04-01T00:00:00'|'2024-05-17T13:00:00'
+// expect: trunc numbers: TRUNC(123.456),TRUNC(123.456,1),TRUNC(-123.456,-1),TRUNC(5),ROUND(123.456,1),CEIL(1.2),FLOOR(-1.2) = 123|123.4|-120|5|123.5|2|-2
+// expect: sysdate: TRUNC(SYSDATE)=TRUNC(CURRENT_DATE),SYSDATE-SYSDATE,SYSDATE>DATE'2020-01-01',SYSTIMESTAMPISNOTNULL = true|0|true|true
+// expect: user: USER,SYS_GUID()ISNOTNULL = 'SA'|true
+// expect: fetch first: NAME = 'Ann';'Bob'
+// expect: offset fetch: NAME = 'Bob';'Cy'
+// expect: fetch no order by: NAME = 'Ann'
+// expect: rownum select: ID,ROWNUM = 1|1;2|2;3|3;4|4
+// expect: rownum limit: ID = 1;2
+// expect: rownum less than: ID = 1
+// expect: rownum equals: ID = 1
+// expect: rownum greater: ID = 
+// expect: rownum and: ID = 1
+// expect: rownum before order: ID = 2;1
+// expect: rownum pagination: ID,NAME = 2|'Bob';3|'Cy'
+// expect: minus: DEPT = 'ENG'
+// expect: union all: 1 = 1;1
+// expect: listagg: DEPT,LISTAGG(NAME,',')WITHINGROUP(ORDERBYNAMEDESC) = 'ENG'|'Cy,Ann';'OPS'|'Bob'
+// expect: listagg no separator: LISTAGG(NAME)WITHINGROUP(ORDERBYID) = 'AnnBobCyDi'
+// expect: create sequence: 0
+// expect: nextval currval: NEXTVAL,CURRVAL = 10|10
+// expect: insert nextval: 1
+// expect: currval: ID,NAME = 15|'Ed'
+// expect: create identity: 0
+// expect: identity 1: 1
+// expect: identity 2: 1
+// expect: identity rows: ID,V,N = 1|'a'|1;2|'b'|2
+// expect: create by default: 0
+// expect: by default 1: 1
+// expect: by default 2: 1
+// expect: by default rows: ID,V,TRUNC(D)=TRUNC(SYSDATE) = 1|'q'|true;50|'dflt'|true
+// expect: update: 2
+// expect: delete without from: 1
+// expect: after update: ID,SAL = 1|5500.55;3|3300.00
+// expect: create types: 0
+// expect: too long: error 12899
+// expect: types ok: 1
+// expect: types rows: A,B,D,H,I,J,K = 999|1.25|'abcd'|123456789012|1.5|2.5|'2024-01-02T00:00:00'
+// expect: alter add list: 0
+// expect: alter modify: 0
+// expect: alter drop list: 0
+// expect: drop purge: 0
+// expect: comment: 0
+// expect: truncate: 0
+// expect: folded names: IDENT,Mixed Case = 1|'Ann'
+// expect: quoted table: 0
+// expect: quoted table rows: a = 
+// expect: outer join old style: ID = 1;2;3;15
+// expect: missing table: error 942
+// expect: bad column: error 904
+// expect: duplicate key: error 1
+// expect: not null: error 1400
+// expect: create view: 0
+// expect: view rows: ID,D = 1|'ENG';2|'OPS'
+// expect: subquery in from: CNT = 4
+// expect: exists: NAME = 'Bob';'Cy'
+// expect: regexp: REGEXP_SUBSTR('ABC123DEF','[0-9]+'),REGEXP_REPLACE('A1B2','[0-9]','#'),REGEXP_LIKE('ABC','^A') = '123'|'a#b#'|true
+// expect: extract: EXTRACT(YEARFROMHIRED),EXTRACT(MONTHFROMHIRED),EXTRACT(DAYFROMHIRED) = 2020|1|15
+// expect: cast: CAST('12'ASNUMBER),CAST(5ASVARCHAR2(10)),CAST(1.5ASNUMBER(5,1)),CAST(DATE'2024-01-02'ASTIMESTAMP) = 12|'5'|1.5|'2024-01-02T00:00:00'
+// expect: greatest least: GREATEST(1,5,3),LEAST(4,2,9),ABS(-4),SIGN(-2) = 5|2|4|-1
+// expect: bitand: BITAND(6,3) = 2
+// expect: connect by level: LEVEL = 1;2;3
+// expect: connect by less than: LEVEL*2 = 4;2
+// expect: interval literals: DATE'2024-01-01'+INTERVAL'1'DAY,DATE'2024-01-15'+INTERVAL'1'MONTH,TIMESTAMP'2024-01-0100:00:00'+INTERVAL'2'HOUR = '2024-01-02T00:00:00'|'2024-02-15T00:00:00'|'2024-01-01T02:00:00'
+// expect: interval to: TIMESTAMP'2024-01-0100:00:00'+INTERVAL'102:03:04'DAYTOSECOND,DATE'2024-01-15'+INTERVAL'1-2'YEARTOMONTH = '2024-01-02T02:03:04'|'2025-03-15T00:00:00'
+// expect: round negative: ROUND(1234.5678,-2),ROUND(15,-1),ROUND(-1234.5,-3),ROUND(2.5),ROUND(-1.5),ROUND(1.2345,2) = 1200|20|-1000|3|-2|1.23
+// expect: upper lower unicode: U,L = 'CAFÉ'|'äb'
+// expect: greatest least null: GREATEST(1,NULL,3),LEAST(2,NULL),GREATEST('A','B'),LEAST(3,1,2) = NULL|NULL|'b'|1
+// expect: rawtohex: RAWTOHEX(HEXTORAW('0A0B')),TO_CHAR(SYSDATE,'IYYY')=TO_CHAR(TRUNC(SYSDATE),'IYYY'),TO_CHAR(DATE'2024-12-30','IYYYIW'),TO_CHAR(DATE'2024-03-05','FMMONTHDDTH') = '0A0B'|true|'2025 01'|'March 5th'
+// expect: session time zone: SESSIONTIMEZONE,DBTIMEZONE = '+00:00'|'+00:00'
+// expect: to_char FF: TO_CHAR(TIMESTAMP'2024-03-0513:04:05.5','YYYY-MM-DD"T"HH24:MI:SS.FF'),TO_CHAR(TIMESTAMP'2024-03-0513:04:05.5','FF3') = '2024-03-05T13:04:05.500000000'|'500'
+import "task"
+import "net"
+import "strings"
+import "oracle"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_tns"
+
+fn values(rows: &oracle.Rows, row: int): str {
+    var out: []str = []
+    for i in 0..rows.columnCount() {
+        match rows.isNull(row, i) {
+            Ok(n) {
+                if n { append(mut &out, "NULL") } else {
+                    match rows.value(row, i) {
+                        Ok(v) { append(mut &out, v.toStr()) }
+                        Err(e) { append(mut &out, "error " + e.code.toStr() + " " + e.msg) }
+                    }
+                }
+            }
+            Err(e) { append(mut &out, "error " + e.code.toStr()) }
+        }
+    }
+    return strings.join(&out, "|")
+}
+
+// A query: its columns' names, then its rows.
+fn q(c: mut &oracle.Conn, label: &str, sql: &str) {
+    match c.query(sql.toStr(), &[]) {
+        Ok(rows) {
+            var names: []str = []
+            for j in 0..rows.columnCount() { append(mut &names, rows.columnName(j).unwrap()) }
+            var rs: []str = []
+            for i in 0..rows.rowCount() { append(mut &rs, values(&rows, i)) }
+            println(label + ": " + strings.join(&names, ",") + " = " + strings.join(&rs, ";"))
+        }
+        Err(e) { println(label + ": error " + e.code.toStr()) }
+    }
+}
+
+// A statement: its row count, or error and the number.
+fn x(c: mut &oracle.Conn, label: &str, sql: &str) {
+    match c.run(sql.toStr(), &[]) {
+        Ok(n) { println(label + ": " + n.toStr()) }
+        Err(e) { println(label + ": error " + e.code.toStr()) }
+    }
+}
+
+fn connect(s: &str): oracle.Conn {
+    match oracle.connect(s.toStr()) {
+        Ok(c) { return c }
+        Err(e) {
+            println("connect: error " + e.code.toStr() + " " + e.msg)
+            exit(1)
+        }
+    }
+}
+
+fn client(port: &str) {
+    var c = connect(&("User Id=sa;Password=sa;Data Source=127.0.0.1:" + port + "/lexdb"))
+    x(mut &c, "create emp", "create table emp (id number(10) primary key, name varchar2(50) not null, sal number(8,2), hired date, dept varchar2(10), mgr number)")
+    x(mut &c, "insert 1", "insert into emp values (1, 'Ann', 5000.5, to_date('2020-01-15', 'YYYY-MM-DD'), 'ENG', null)")
+    x(mut &c, "insert 2", "insert into emp values (2, 'Bob', 4000, to_date('2021-06-30', 'YYYY-MM-DD'), 'OPS', 1)")
+    x(mut &c, "insert 3", "insert into emp values (3, 'Cy', 3000, null, 'ENG', 1)")
+    x(mut &c, "insert 4 empty string", "insert into emp (id, name, sal, dept) values (4, 'Di', 2000, '')")
+    q(mut &c, "select star", "select * from emp order by id")
+    q(mut &c, "dual", "select 1, 'x' from dual")
+    q(mut &c, "star from dual", "select * from dual")
+    q(mut &c, "dummy", "select dummy from DUAL")
+    q(mut &c, "expression names", "select 1 + 1, count(*), upper(name), id * 2 as dbl from emp where id = 1 group by name, id")
+    q(mut &c, "empty is null", "select id from emp where dept is null")
+    q(mut &c, "empty equals", "select id from emp where dept = ''")
+    q(mut &c, "empty concat", "select name || dept || '!' from emp where id in (1, 4) order by id")
+    q(mut &c, "null concat", "select 'a' || null || 'b', null || null, concat('x', null) from dual")
+    q(mut &c, "length empty", "select length(''), length(dept) from emp where id = 4")
+    q(mut &c, "nvl", "select nvl(dept, 'none'), nvl(mgr, -1) from emp order by id")
+    q(mut &c, "nvl2", "select nvl2(dept, 'has', 'no'), nvl2(null, 1, 2) from emp where id in (1, 4) order by id")
+    q(mut &c, "decode", "select decode(dept, 'ENG', 1, 'OPS', 2, 0), decode(dept, null, 'n', dept), decode(1, 2, 'x') from emp order by id")
+    q(mut &c, "case", "select case when sal > 3500 then 'hi' else 'lo' end from emp order by id")
+    q(mut &c, "division", "select 1 / 3, 10 / 4, 6 / 3, 7 / 2 from dual")
+    q(mut &c, "divide by zero", "select 1 / 0 from dual")
+    q(mut &c, "arithmetic", "select 5 - 3, 2 * 3 + 1, -4 + 1, mod(7, 3), power(2, 10), sqrt(16) from dual")
+    q(mut &c, "substr", "select substr('hello', 2, 3), substr('hello', -3), substr('hello', 0, 2), substr('hello', 9), substr('hello', 2, 0) from dual")
+    q(mut &c, "instr", "select instr('abcabc', 'c'), instr('abcabc', 'c', 4), instr('abcabc', 'c', 1, 2), instr('abcabc', 'c', -1), instr('abc', 'z') from dual")
+    q(mut &c, "string functions", "select upper('ab'), lower('AB'), initcap('hello world'), lpad('7', 3, '0'), rpad('ab', 4, '*'), ltrim('xxa', 'x'), rtrim('axx', 'x'), trim('  b  ') from dual")
+    q(mut &c, "replace translate", "select replace('banana', 'an', 'AN'), replace('banana', 'an', ''), replace('banana', 'an'), translate('abc', 'ab', 'xy') from dual")
+    q(mut &c, "to_char numbers", "select to_char(1234.5, '9,999.99'), to_char(-5, '9999'), to_char(5, '0000'), to_char(0.5), to_char(1.50), to_char(100), to_char(-0.25) from dual")
+    q(mut &c, "to_char more", "select to_char(1234.5, 'FM9,999.00'), to_char(5, 'S99'), to_char(-0.5, '99.99PR'), to_char(1234, '9999') from dual")
+    q(mut &c, "to_number", "select to_number('12.5'), to_number('1,234.5', '9,999.9'), to_number('-7') from dual")
+    q(mut &c, "to_number error", "select to_number('abc') from dual")
+    q(mut &c, "to_date", "select to_date('2024-03-05', 'YYYY-MM-DD'), to_date('15/03/2024 14:30', 'DD/MM/YYYY HH24:MI'), to_date('05-MAR-24'), to_date('12-31-24 11:59 PM', 'MM-DD-RR HH12:MI AM') from dual")
+    q(mut &c, "to_date names", "select to_date('March 5, 2024', 'Month DD, YYYY'), to_date('5 Mar 2024', 'DD Mon YYYY') from dual")
+    q(mut &c, "to_date errors", "select to_date('2024-13-01', 'YYYY-MM-DD') from dual")
+    q(mut &c, "to_date non-numeric", "select to_date('abcd', 'YYYY') from dual")
+    q(mut &c, "to_timestamp", "select to_timestamp('2024-03-05 01:02:03.123456', 'YYYY-MM-DD HH24:MI:SS.FF6') from dual")
+    q(mut &c, "to_char dates", "select to_char(hired, 'YYYY-MM-DD'), to_char(hired, 'DD-MON-YYYY'), to_char(hired, 'Day'), to_char(hired, 'fmDD Month, YYYY'), to_char(hired) from emp where id = 1")
+    q(mut &c, "to_char date parts", "select to_char(date '2024-03-05', 'DD/MM/RR'), to_char(date '2024-03-05', 'D DDD Q J'), to_char(date '2024-12-25', 'Mon DY'), to_char(date '2024-03-05', 'HH12:MI AM') from dual")
+    q(mut &c, "date arithmetic", "select hired + 30, hired - 1, date '2024-03-01' - date '2024-02-01', date '2024-03-01' - 1.5 from emp where id = 1")
+    q(mut &c, "date difference", "select max(hired) - min(hired) from emp")
+    q(mut &c, "add_months", "select add_months(date '2024-01-31', 1), add_months(date '2024-02-29', 12), add_months(date '2024-03-31', -1), add_months(date '2024-01-15', -13) from dual")
+    q(mut &c, "months_between", "select months_between(date '2024-03-31', date '2024-02-29'), months_between(date '2024-03-15', date '2024-01-15'), months_between(date '2024-01-31', date '2024-03-31') from dual")
+    q(mut &c, "last_day next_day", "select last_day(date '2024-02-10'), last_day(date '2023-12-01'), next_day(date '2024-02-10', 'MONDAY'), next_day(date '2024-02-12', 'MON') from dual")
+    q(mut &c, "trunc dates", "select trunc(date '2024-05-17'), trunc(date '2024-05-17', 'MM'), trunc(date '2024-05-17', 'YYYY'), trunc(date '2024-05-17', 'Q'), trunc(timestamp '2024-05-17 13:14:15', 'HH') from dual")
+    q(mut &c, "trunc numbers", "select trunc(123.456), trunc(123.456, 1), trunc(-123.456, -1), trunc(5), round(123.456, 1), ceil(1.2), floor(-1.2) from dual")
+    q(mut &c, "sysdate", "select trunc(sysdate) = trunc(current_date), sysdate - sysdate, sysdate > date '2020-01-01', systimestamp is not null from dual")
+    q(mut &c, "user", "select user, sys_guid() is not null from dual")
+    q(mut &c, "fetch first", "select name from emp order by id fetch first 2 rows only")
+    q(mut &c, "offset fetch", "select name from emp order by id offset 1 row fetch next 2 rows only")
+    q(mut &c, "fetch no order by", "select name from emp fetch first 1 rows only")
+    q(mut &c, "rownum select", "select id, rownum from emp order by id")
+    q(mut &c, "rownum limit", "select id from emp where rownum <= 2")
+    q(mut &c, "rownum less than", "select id from emp where rownum < 2")
+    q(mut &c, "rownum equals", "select id from emp where rownum = 1")
+    q(mut &c, "rownum greater", "select id from emp where rownum > 1")
+    q(mut &c, "rownum and", "select id from emp where dept = 'ENG' and rownum <= 1")
+    q(mut &c, "rownum before order", "select id from emp where rownum <= 2 order by id desc")
+    q(mut &c, "rownum pagination", "select id, name from (select a.*, rownum rn from (select id, name from emp order by id) a where rownum <= 3) where rn > 1")
+    q(mut &c, "minus", "select dept from emp where dept is not null minus select dept from emp where id = 2")
+    q(mut &c, "union all", "select 1 from dual union all select 1 from dual")
+    q(mut &c, "listagg", "select dept, listagg(name, ',') within group (order by name desc) from emp where dept is not null group by dept order by dept")
+    q(mut &c, "listagg no separator", "select listagg(name) within group (order by id) from emp")
+    x(mut &c, "create sequence", "create sequence s1 start with 10 increment by 5 nocache nocycle")
+    q(mut &c, "nextval currval", "select s1.nextval, s1.currval from dual")
+    x(mut &c, "insert nextval", "insert into emp (id, name, sal) values (s1.nextval, 'Ed', 1)")
+    q(mut &c, "currval", "select id, name from emp where id = (select s1.currval from dual)")
+    x(mut &c, "create identity", "create table t2 (id number generated always as identity, v varchar2(10), n number)")
+    x(mut &c, "identity 1", "insert into t2 (v, n) values ('a', 1)")
+    x(mut &c, "identity 2", "insert into t2 (v, n) values ('b', 2)")
+    q(mut &c, "identity rows", "select * from t2 order by id")
+    x(mut &c, "create by default", "create table t3 (id number generated by default as identity primary key, v varchar2(10) default 'dflt', d date default sysdate)")
+    x(mut &c, "by default 1", "insert into t3 (v) values ('q')")
+    x(mut &c, "by default 2", "insert into t3 (id) values (50)")
+    q(mut &c, "by default rows", "select id, v, trunc(d) = trunc(sysdate) from t3 order by id")
+    x(mut &c, "update", "update emp set sal = sal * 1.1 where dept = 'ENG'")
+    x(mut &c, "delete without from", "delete emp where id = 4")
+    q(mut &c, "after update", "select id, sal from emp where dept = 'ENG' order by id")
+    x(mut &c, "create types", "create table ty (a number(3), b number(5,2), c char(3), d varchar2(4), e timestamp, f raw(8), g clob, h integer, i float, j binary_double, k date)")
+    x(mut &c, "too long", "insert into ty (d) values ('abcdef')")
+    x(mut &c, "types ok", "insert into ty (a, b, d, h, i, j, k) values (999, 1.25, 'abcd', 123456789012, 1.5, 2.5, date '2024-01-02')")
+    q(mut &c, "types rows", "select a, b, d, h, i, j, k from ty")
+    x(mut &c, "alter add list", "alter table ty add (m number, n varchar2(3))")
+    x(mut &c, "alter modify", "alter table ty modify d varchar2(10)")
+    x(mut &c, "alter drop list", "alter table ty drop (m, n)")
+    x(mut &c, "drop purge", "drop table ty purge")
+    x(mut &c, "comment", "comment on table emp is 'employees'")
+    x(mut &c, "truncate", "truncate table t3")
+    q(mut &c, "folded names", "select id Ident, name \"Mixed Case\" from emp where id = 1")
+    x(mut &c, "quoted table", "create table \"Lower\" (\"a\" number)")
+    q(mut &c, "quoted table rows", "select * from \"Lower\"")
+    q(mut &c, "outer join old style", "select e1.id from emp e1, emp e2 where e1.id = e2.id(+)")
+    q(mut &c, "missing table", "select * from nope")
+    q(mut &c, "bad column", "select nope from emp")
+    x(mut &c, "duplicate key", "insert into emp (id, name) values (1, 'Dup')")
+    x(mut &c, "not null", "insert into emp (id, name) values (60, '')")
+    x(mut &c, "create view", "create view v_emp as select id, nvl(dept, 'none') d, sysdate sd from emp")
+    q(mut &c, "view rows", "select id, d from v_emp where id <= 2 order by id")
+    q(mut &c, "subquery in from", "select cnt from (select count(*) cnt from emp)")
+    q(mut &c, "exists", "select e.name from emp e where exists (select 1 from emp m where m.id = e.mgr) order by e.id")
+    q(mut &c, "regexp", "select regexp_substr('abc123def', '[0-9]+'), regexp_replace('a1b2', '[0-9]', '#'), regexp_like('abc', '^a') from dual")
+    q(mut &c, "extract", "select extract(year from hired), extract(month from hired), extract(day from hired) from emp where id = 1")
+    q(mut &c, "cast", "select cast('12' as number), cast(5 as varchar2(10)), cast(1.5 as number(5,1)), cast(date '2024-01-02' as timestamp) from dual")
+    q(mut &c, "greatest least", "select greatest(1, 5, 3), least(4, 2, 9), abs(-4), sign(-2) from dual")
+    q(mut &c, "bitand", "select bitand(6, 3) from dual")
+    q(mut &c, "connect by level", "select level from dual connect by level <= 3")
+    q(mut &c, "connect by less than", "select level * 2 from dual connect by level < 3 order by level desc")
+    q(mut &c, "interval literals", "select date '2024-01-01' + interval '1' day, date '2024-01-15' + interval '1' month, timestamp '2024-01-01 00:00:00' + interval '2' hour from dual")
+    q(mut &c, "interval to", "select timestamp '2024-01-01 00:00:00' + interval '1 02:03:04' day to second, date '2024-01-15' + interval '1-2' year to month from dual")
+    q(mut &c, "round negative", "select round(1234.5678, -2), round(15, -1), round(-1234.5, -3), round(2.5), round(-1.5), round(1.2345, 2) from dual")
+    q(mut &c, "upper lower unicode", "select upper('café') u, lower('ÄB') l from dual")
+    q(mut &c, "greatest least null", "select greatest(1, null, 3), least(2, null), greatest('a', 'b'), least(3, 1, 2) from dual")
+    q(mut &c, "rawtohex", "select rawtohex(hextoraw('0a0B')), to_char(sysdate, 'IYYY') = to_char(trunc(sysdate), 'IYYY'), to_char(date '2024-12-30', 'IYYY IW'), to_char(date '2024-03-05', 'fmMonth ddth') from dual")
+    q(mut &c, "session time zone", "select sessiontimezone, dbtimezone from dual")
+    q(mut &c, "to_char FF", "select to_char(timestamp '2024-03-05 13:04:05.5', 'YYYY-MM-DD\"T\"HH24:MI:SS.FF'), to_char(timestamp '2024-03-05 13:04:05.5', 'FF3') from dual")
+    c.logoff()
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        let f = s.start(lexdb_tns.acceptLoop, lexdb_tns.AcceptArg{ln: ln, st: st})
+        client(&addr[10..len(addr)])
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(5), lexdb_store.Options{cacheBytes: 128 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000, bufferedPages: false}, body).unwrap()
+}

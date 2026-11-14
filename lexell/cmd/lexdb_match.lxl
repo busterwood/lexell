@@ -1,0 +1,453 @@
+// lexdb: MATCH_RECOGNIZE's pattern matcher (design/lexdb-match-recognize.md, 4.1).
+//
+// A pattern (PNode) is compiled to a small program (Prog) of SPLIT, JMP, VAR,
+// BEGIN, END and MATCH instructions, with every quantifier unrolled, so a
+// matcher's state is only (pc, pos). Matching is a depth-first search in
+// preference order (alternatives left to right, greedy before reluctant) on an
+// explicit stack: never recursion over rows, because a stack overflow stops
+// the whole server. Where every DEFINE reads only the row it is tested on
+// (local), a state that failed once fails again, so the search keeps a memo
+// of the failed states and of the DEFINE results (O((splits + vars) * rows)
+// per search); a history-dependent DEFINE can make the search exponential, so
+// each attempt is bounded by a step limit.
+import "./lexdb_base"
+
+pub type PNode = closed {
+    Var(int)                      // a primary variable, by index
+    Begin                         // ^
+    End                           // $
+    Seq([]PNode)
+    Alt([]PNode)
+    Perm([]PNode)                 // PERMUTE(...)
+    Excl(PNode)                   // {- ... -}
+    Quant(PNode, int, int, bool)  // min, max (-1 unbounded), reluctant
+}
+
+pub const OP_VAR = 1            // a: var; b: 1 if inside an exclusion. Needs a row whose DEFINE holds; maps it; pos += 1
+pub const OP_SPLIT = 2          // try a, then b (a choice point); c: this split's ordinal (0..nSplits-1)
+pub const OP_JMP = 3            // a
+pub const OP_BEGIN = 4          // pos == lo
+pub const OP_END = 5            // pos == hi
+pub const OP_MATCH = 6
+
+pub type MrIns = value record { pub op: int; pub a: int; pub b: int; pub c: int }
+pub type Prog = record { pub ins: []MrIns; pub nSplits: int; pub nVars: int }
+
+pub const MR_MAX_PROG = 10000   // instructions; also the largest quantifier bound
+pub const MR_MAX_DEPTH = 64     // pattern nesting (the compiler and canEmpty recurse)
+pub const MR_MEMO_MAX = 67108864    // bytes of memo kept by one search; past it the memo is off
+pub const CE_EMPTY_LOOP = 1     // compile's error codes
+pub const CE_TOO_LARGE = 2
+
+const CAP = MR_MAX_PROG + 1     // sizes saturate here
+
+fn addSat(a: int, b: int): int {
+    let s = a + b
+    return if s > CAP { CAP } else { s }
+}
+
+fn mulSat(a: int, b: int): int {
+    if a <= 0 || b <= 0 { return 0 }
+    if a > CAP / b { return CAP }
+    let p = a * b
+    return if p > CAP { CAP } else { p }
+}
+
+// Whether the nesting of p is at most MR_MAX_DEPTH (it recurses no deeper).
+fn depthOk(p: &PNode, d: int): bool {
+    if d > MR_MAX_DEPTH { return false }
+    match p {
+        PNode.Seq(xs) { for x in xs { if !depthOk(x, d + 1) { return false } } return true }
+        PNode.Alt(xs) { for x in xs { if !depthOk(x, d + 1) { return false } } return true }
+        PNode.Perm(xs) { for x in xs { if !depthOk(x, d + 1) { return false } } return true }
+        PNode.Excl(x) { return depthOk(x, d + 1) }
+        PNode.Quant(x, _, _, _) { return depthOk(x, d + 1) }
+        else { return true }
+    }
+}
+
+// Whether p can match no row at all.
+fn canEmpty(p: &PNode): bool {
+    match p {
+        PNode.Var(_) { return false }
+        PNode.Begin { return true }
+        PNode.End { return true }
+        PNode.Seq(xs) { for x in xs { if !canEmpty(x) { return false } } return true }
+        PNode.Alt(xs) { for x in xs { if canEmpty(x) { return true } } return false }
+        PNode.Perm(xs) { for x in xs { if !canEmpty(x) { return false } } return true }
+        PNode.Excl(x) { return canEmpty(x) }
+        PNode.Quant(x, mn, _, _) { return mn <= 0 || canEmpty(x) }
+    }
+}
+
+// Whether a Quant over something other than a variable can match empty.
+fn emptyLoop(p: &PNode): bool {
+    match p {
+        PNode.Seq(xs) { for x in xs { if emptyLoop(x) { return true } } return false }
+        PNode.Alt(xs) { for x in xs { if emptyLoop(x) { return true } } return false }
+        PNode.Perm(xs) { for x in xs { if emptyLoop(x) { return true } } return false }
+        PNode.Excl(x) { return emptyLoop(x) }
+        PNode.Quant(x, _, _, _) {
+            let isVar = match x { PNode.Var(_) { true } else { false } }
+            if !isVar && canEmpty(x) { return true }
+            return emptyLoop(x)
+        }
+        else { return false }
+    }
+}
+
+fn fact(k: int): int {
+    var f = 1
+    for i in 2..k + 1 { f = f * i }
+    return f
+}
+
+// The instructions p compiles to, saturating at CAP; worked out before
+// anything is emitted.
+fn sizeOf(p: &PNode): int {
+    match p {
+        PNode.Var(_) { return 1 }
+        PNode.Begin { return 1 }
+        PNode.End { return 1 }
+        PNode.Seq(xs) {
+            var n = 0
+            for x in xs { n = addSat(n, sizeOf(x)) }
+            return n
+        }
+        PNode.Alt(xs) {
+            var n = 0
+            for x in xs { n = addSat(n, sizeOf(x)) }
+            if len(xs) > 1 { n = addSat(n, mulSat(2, len(xs) - 1)) }
+            return n
+        }
+        PNode.Perm(xs) {
+            let k = len(xs)
+            if k > 7 { return CAP }
+            var s = 0
+            for x in xs { s = addSat(s, sizeOf(x)) }
+            let f = fact(k)
+            return addSat(mulSat(f, s), 2 * (f - 1))
+        }
+        PNode.Excl(x) { return sizeOf(x) }
+        PNode.Quant(x, mn0, mx0, _) {
+            if mn0 > MR_MAX_PROG || mx0 > MR_MAX_PROG { return CAP }
+            let mn = if mn0 < 0 { 0 } else { mn0 }
+            let s = sizeOf(x)
+            if mx0 < 0 { return addSat(mulSat(mn + 1, s), 2) }
+            let mx = if mx0 < mn { mn } else { mx0 }
+            return addSat(mulSat(mx, s), mx - mn)
+        }
+    }
+}
+
+type Emit = record { ins: []MrIns; nSplits: int }
+
+fn (e: mut &Emit) add(op: int, a: int, b: int, c: int) {
+    append(mut &e.ins, MrIns{op: op, a: a, b: b, c: c})
+}
+
+fn (e: mut &Emit) split(a: int, b: int) {
+    let c = e.nSplits
+    e.nSplits += 1
+    e.add(OP_SPLIT, a, b, c)
+}
+
+// Emits the alternatives xs[order[0]], xs[order[1]], ... as an alternation.
+fn emitAlt(e: mut &Emit, xs: &[]PNode, order: &[]int, excl: bool) {
+    var jmps: []int = []
+    for i in 0..len(order) {
+        if i < len(order) - 1 {
+            let sp = len(e.ins)
+            e.split(sp + 1, 0)
+            emit(e, &xs[order[i]], excl)
+            append(mut &jmps, len(e.ins))
+            e.add(OP_JMP, 0, 0, 0)
+            e.ins[sp].b = len(e.ins)
+        } else {
+            emit(e, &xs[order[i]], excl)
+        }
+    }
+    for j in jmps { e.ins[j].a = len(e.ins) }
+}
+
+fn emit(e: mut &Emit, p: &PNode, excl: bool) {
+    match p {
+        PNode.Var(v) { e.add(OP_VAR, v, if excl { 1 } else { 0 }, 0) }
+        PNode.Begin { e.add(OP_BEGIN, 0, 0, 0) }
+        PNode.End { e.add(OP_END, 0, 0, 0) }
+        PNode.Seq(xs) { for x in xs { emit(e, x, excl) } }
+        PNode.Alt(xs) {
+            var order: []int = []
+            for i in 0..len(xs) { append(mut &order, i) }
+            emitAlt(e, xs, &order, excl)
+        }
+        PNode.Perm(xs) {
+            let k = len(xs)
+            var perm: []int = []
+            for i in 0..k { append(mut &perm, i) }
+            if k <= 1 {
+                emitAlt(e, xs, &perm, excl)
+            } else {
+                // every permutation of the parts, in lexicographic order of the index lists
+                var jmps: []int = []
+                var more = true
+                var first = true
+                while more {
+                    // a split before every permutation but the last
+                    var last = true
+                    var i = k - 1
+                    while i > 0 { if perm[i - 1] < perm[i] { last = false; break } else { i -= 1 } }
+                    var sp = 0
+                    if !last {
+                        sp = len(e.ins)
+                        e.split(sp + 1, 0)
+                    }
+                    for j in 0..k { emit(e, &xs[perm[j]], excl) }
+                    if !last {
+                        append(mut &jmps, len(e.ins))
+                        e.add(OP_JMP, 0, 0, 0)
+                        e.ins[sp].b = len(e.ins)
+                    }
+                    // next permutation
+                    if last {
+                        more = false
+                    } else {
+                        var a = k - 2
+                        while perm[a] > perm[a + 1] { a -= 1 }
+                        var b = k - 1
+                        while perm[b] < perm[a] { b -= 1 }
+                        swap(mut &perm, a, b)
+                        var l = a + 1
+                        var r = k - 1
+                        while l < r { swap(mut &perm, l, r); l += 1; r -= 1 }
+                    }
+                    first = false
+                }
+                for j in jmps { e.ins[j].a = len(e.ins) }
+            }
+        }
+        PNode.Excl(x) { emit(e, x, true) }
+        PNode.Quant(x, mn0, mx0, rel) {
+            let mn = if mn0 < 0 { 0 } else { mn0 }
+            for k in 0..mn { emit(e, x, excl) }
+            var splits: []int = []
+            if mx0 < 0 {
+                let l = len(e.ins)
+                append(mut &splits, l)
+                e.split(l + 1, 0)
+                emit(e, x, excl)
+                e.add(OP_JMP, l, 0, 0)
+                e.ins[l].b = len(e.ins)
+            } else {
+                let mx = if mx0 < mn { mn } else { mx0 }
+                for k in mn..mx {
+                    let sp = len(e.ins)
+                    append(mut &splits, sp)
+                    e.split(sp + 1, 0)
+                    emit(e, x, excl)
+                }
+                for sp in splits { e.ins[sp].b = len(e.ins) }
+            }
+            if rel {
+                for sp in splits {
+                    let t = e.ins[sp].a
+                    e.ins[sp].a = e.ins[sp].b
+                    e.ins[sp].b = t
+                }
+            }
+        }
+    }
+}
+
+// Compiles pattern p over nVars variables; Err(CE_EMPTY_LOOP) for a quantified
+// group that can match no row, Err(CE_TOO_LARGE) for a pattern nested deeper
+// than MR_MAX_DEPTH or compiling to more than MR_MAX_PROG instructions.
+pub fn compile(p: &PNode, nVars: int): Result[Prog, int] {
+    if !depthOk(p, 0) { return Err(CE_TOO_LARGE) }
+    if emptyLoop(p) { return Err(CE_EMPTY_LOOP) }
+    if sizeOf(p) + 1 > MR_MAX_PROG { return Err(CE_TOO_LARGE) }
+    var e = Emit{ins: [], nSplits: 0}
+    emit(mut &e, p, false)
+    e.add(OP_MATCH, 0, 0, 0)
+    return Ok(Prog{ins: replace(mut &e.ins, []), nSplits: e.nSplits, nVars: nVars})
+}
+
+// A match: rows s .. end-1 mapped to the variables lab (exc: in an exclusion);
+// over: the step limit was hit (ok is false then).
+pub type Found = record { pub ok: bool; pub end: int; pub lab: []int; pub exc: []bool; pub over: bool }
+
+fn notFound(over: bool): Found { return Found{ok: false, end: 0, lab: [], exc: [], over: over} }
+
+// What one search keeps between its attempts (its start rows).
+pub type Matcher = record {
+    stack: []int                // pairs: pc, pos
+    lab: []int
+    exc: []bool
+    seen: []byte                // visited SPLIT states, one bit each: (pos - base) * nS + c
+    dcache: []byte              // DEFINE results: (pos - base) * nV + v: 0 unknown, 1 true, 2 false
+    capRows: int
+    hiRow: int                  // rows (from base) touched since the last reset
+    base: int
+    nS: int
+    nV: int
+    memoOff: bool
+    peak: int                   // the stack's longest length, in ints
+    pub steps: int              // the last attempt's steps
+}
+
+pub fn newMatcher(): Matcher {
+    return Matcher{stack: [], lab: [], exc: [], seen: [], dcache: [], capRows: 0, hiRow: 0, base: 0, nS: 0, nV: 0,
+                   memoOff: false, peak: 0, steps: 0}
+}
+
+// Bytes the matcher holds now (its stack at its longest, and the memo).
+pub fn (m: &Matcher) bytes(): int { return m.peak * 8 + len(m.seen) + len(m.dcache) }
+
+// Whether the memo was given up (past MR_MEMO_MAX) in this search.
+pub fn (m: &Matcher) memoGaveUp(): bool { return m.memoOff }
+
+fn (m: mut &Matcher) clearMemo() {
+    let nb = (m.hiRow * m.nS + 7) / 8
+    var i = 0
+    while i < nb && i < len(m.seen) { m.seen[i] = 0; i += 1 }
+    let nd = m.hiRow * m.nV
+    i = 0
+    while i < nd && i < len(m.dcache) { m.dcache[i] = 0; i += 1 }
+    m.hiRow = 0
+}
+
+// Starts a search at row base: the memo is cleared.
+pub fn (m: mut &Matcher) reset(base: int) {
+    m.clearMemo()
+    m.base = base
+    m.memoOff = false
+    while len(m.stack) > 0 { pop(mut &m.stack) }
+    while len(m.lab) > 0 { pop(mut &m.lab) }
+    while len(m.exc) > 0 { pop(mut &m.exc) }
+}
+
+// Makes room for row (from base) in the memo; gives the memo up past MR_MEMO_MAX.
+fn (m: mut &Matcher) room(row: int) {
+    if row < m.capRows {
+        if row >= m.hiRow { m.hiRow = row + 1 }
+        return
+    }
+    var nr = m.capRows * 2
+    if nr < row + 1 { nr = row + 1 }
+    if nr < 64 { nr = 64 }
+    let nbits = (nr * m.nS + 7) / 8
+    let ndc = nr * m.nV
+    if nbits + ndc > MR_MEMO_MAX {
+        m.memoOff = true
+        return
+    }
+    while len(m.seen) < nbits { append(mut &m.seen, 0) }
+    while len(m.dcache) < ndc { append(mut &m.dcache, 0) }
+    m.capRows = nr
+    if row >= m.hiRow { m.hiRow = row + 1 }
+}
+
+fn (m: mut &Matcher) cut(n: int) {
+    while len(m.lab) > n { pop(mut &m.lab) }
+    while len(m.exc) > n { pop(mut &m.exc) }
+}
+
+fn (m: mut &Matcher) push(pc: int, pos: int) {
+    append(mut &m.stack, pc)
+    append(mut &m.stack, pos)
+    if len(m.stack) > m.peak { m.peak = len(m.stack) }
+}
+
+// Tries the pattern anchored at row s of the partition lo .. hi-1: the first
+// mapping in preference order, or not ok. memo: every DEFINE is local (it reads
+// only its own row), so failed states and DEFINE results are kept; otherwise
+// maxSteps (0: none) bounds the attempt. holds(v, pos, lab) says whether
+// variable v's DEFINE holds on row pos, given the labels of rows s .. pos-1;
+// tick is the executor's yield and timeout check.
+pub fn (m: mut &Matcher) attempt(pr: &Prog, lo: int, hi: int, s: int, memo: bool, maxSteps: int,
+                                 holds: &fn(int, int, &[]int): Result[bool, lexdb_base.DbErr],
+                                 tick: &fn(): Result[Unit, lexdb_base.DbErr]): Result[Found, lexdb_base.DbErr] {
+    if pr.nSplits != m.nS || pr.nVars != m.nV {
+        m.clearMemo()
+        m.nS = pr.nSplits
+        m.nV = pr.nVars
+        m.capRows = 0
+        while len(m.seen) > 0 { pop(mut &m.seen) }
+        while len(m.dcache) > 0 { pop(mut &m.dcache) }
+    }
+    if s < m.base { m.reset(s) }
+    while len(m.stack) > 0 { pop(mut &m.stack) }
+    m.cut(0)
+    m.push(0, s)
+    var steps = 0
+    while len(m.stack) > 0 {
+        var pos = pop(mut &m.stack)
+        var pc = pop(mut &m.stack)
+        m.cut(pos - s)
+        var alive = true
+        while alive {
+            steps += 1
+            m.steps = steps
+            try tick()
+            if maxSteps > 0 && steps > maxSteps && (!memo || m.memoOff) { return Ok(notFound(true)) }
+            let ins = pr.ins[pc]
+            if ins.op == OP_VAR {
+                if pos >= hi {
+                    alive = false
+                } else {
+                    var ok = false
+                    var cached = false
+                    if memo && !m.memoOff {
+                        m.room(pos - m.base)
+                        if !m.memoOff {
+                            cached = true
+                            let k = (pos - m.base) * m.nV + ins.a
+                            if m.dcache[k] == 0 {
+                                let h = try holds(ins.a, pos, &m.lab)
+                                m.dcache[k] = if h { 1 } else { 2 }
+                                ok = h
+                            } else {
+                                ok = m.dcache[k] == 1
+                            }
+                        }
+                    }
+                    if !cached { ok = try holds(ins.a, pos, &m.lab) }
+                    if ok {
+                        append(mut &m.lab, ins.a)
+                        append(mut &m.exc, ins.b == 1)
+                        pos += 1
+                        pc += 1
+                    } else {
+                        alive = false
+                    }
+                }
+            } else if ins.op == OP_SPLIT {
+                var pruned = false
+                if memo && !m.memoOff {
+                    m.room(pos - m.base)
+                    if !m.memoOff {
+                        let bit = (pos - m.base) * m.nS + ins.c
+                        let mask = byte(1 << (bit & 7))
+                        if (m.seen[bit >> 3] & mask) != 0 { pruned = true } else { m.seen[bit >> 3] = m.seen[bit >> 3] | mask }
+                    }
+                }
+                if pruned {
+                    alive = false
+                } else {
+                    m.push(ins.b, pos)
+                    pc = ins.a
+                }
+            } else if ins.op == OP_JMP {
+                pc = ins.a
+            } else if ins.op == OP_BEGIN {
+                if pos == lo { pc += 1 } else { alive = false }
+            } else if ins.op == OP_END {
+                if pos == hi { pc += 1 } else { alive = false }
+            } else {
+                // OP_MATCH
+                return Ok(Found{ok: true, end: pos, lab: replace(mut &m.lab, []), exc: replace(mut &m.exc, []), over: false})
+            }
+        }
+    }
+    return Ok(notFound(false))
+}

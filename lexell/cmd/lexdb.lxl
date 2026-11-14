@@ -30,6 +30,7 @@ import "./lexdb_store"
 import "./lexdb_exec"
 import "./lexdb_wire"
 import "./lexdb_tds"
+import "./lexdb_tns"
 import "./lexdb_repl"
 
 extern "c" fn openLock(path: str, flags: i32, mode: u32): i32 as "open"
@@ -78,12 +79,18 @@ fn noCow(dir: str) {
 // protocol, TDS 7.4, there (design/lexdb-tds.md; SQL Server's port is
 // 1433), with the same roles, authentication and TLS settings. Replicas do
 // not serve it yet.
+//
+// --tns HOST:PORT (repeatable): the master also speaks Oracle's protocol,
+// TNS with TTC, there (design/lexdb-oracle.md; Oracle's port is 1521, which
+// is never a default), logins by the roles' Oracle 12c verifiers. Replicas
+// do not serve it.
 fn main() {
     let args = os.arguments()
     var replica = false
     var replicas = 0
     var raddrs: []str = []
     var tdsAddrs: []str = []
+    var tnsAddrs: []str = []
     var pos: []str = []
     var auth = lexdb_wire.noAuth()
     var i = 0
@@ -102,6 +109,16 @@ fn main() {
             // SQL Server's protocol (design/lexdb-tds.md): TCP only
             if i + 1 >= len(args) || strings.indexOf(args[i + 1], "/", 0) >= 0 { usage() }
             append(mut &tdsAddrs, args[i + 1])
+            i += 1
+        } else if a == "--tns" {
+            // Oracle's protocol (design/lexdb-oracle.md): TCP only
+            if i + 1 >= len(args) || strings.indexOf(args[i + 1], "/", 0) >= 0 { usage() }
+            append(mut &tnsAddrs, args[i + 1])
+            i += 1
+        } else if a == "--tcps" {
+            // Oracle's protocol inside TLS (TCPS), with the certificate of --tls-cert; kept with --tns's, marked
+            if i + 1 >= len(args) || strings.indexOf(args[i + 1], "/", 0) >= 0 { usage() }
+            append(mut &tnsAddrs, "tcps:" + args[i + 1])
             i += 1
         } else if a == "--replicas" || a == "--replica-addr" {
             if i + 1 >= len(args) { usage() }
@@ -146,14 +163,14 @@ fn main() {
     }
     noCow(dir)
     if replicas == 0 {
-        runMaster(dir, &addrs, &tdsAddrs, &auth)
+        runMaster(dir, &addrs, &tdsAddrs, &tnsAddrs, &auth)
         return
     }
-    supervise(dir, &addrs, &tdsAddrs, replicas, &raddrs, &auth)
+    supervise(dir, &addrs, &tdsAddrs, &tnsAddrs, replicas, &raddrs, &auth)
 }
 
 fn usage() {
-    eprintln("usage: lexdb DATADIR [ADDR ...] [--tds HOST:PORT ...] [--replicas N [--replica-addr ADDR ...]] [AUTH]")
+    eprintln("usage: lexdb DATADIR [ADDR ...] [--tds HOST:PORT ...] [--tns HOST:PORT ...] [--tcps HOST:PORT ...] [--replicas N [--replica-addr ADDR ...]] [AUTH]")
     eprintln("       lexdb --replica DATADIR [ADDR ...] [AUTH]")
     eprintln("AUTH:  [--auth trust|scram-sha-256] [--auth-local trust|scram-sha-256]")
     eprintln("       [--tls-cert FILE [--tls-key FILE]] [--require-tls]")
@@ -164,7 +181,7 @@ fn usage() {
 // 0 the master, the others replicas. A worker that ends badly is started
 // again; a replica ends when its master does, and so is started again with
 // it. SIGTERM or SIGINT stops them all.
-fn supervise(dir: str, addrs: &[]str, tdsAddrs: &[]str, n: int, given: &[]str, auth: &lexdb_wire.AuthConf) {
+fn supervise(dir: str, addrs: &[]str, tdsAddrs: &[]str, tnsAddrs: &[]str, n: int, given: &[]str, auth: &lexdb_wire.AuthConf) {
     // the replicas' addresses: given, or each of the master's one port up
     var raddrs: []str = []
     for a in given { append(mut &raddrs, a) }
@@ -227,7 +244,7 @@ fn supervise(dir: str, addrs: &[]str, tdsAddrs: &[]str, n: int, given: &[]str, a
     policy.maxBackoffMs = 2000
     let ends = task.workersWith(n + 1, policy, fn(w: int) {
         if w == 0 {
-            runMaster(dir, addrs, tdsAddrs, auth)
+            runMaster(dir, addrs, tdsAddrs, tnsAddrs, auth)
         } else {
             // each replica a copy of the shared sockets (this process's own
             // memory: the supervisor keeps its)
@@ -246,7 +263,7 @@ fn supervise(dir: str, addrs: &[]str, tdsAddrs: &[]str, n: int, given: &[]str, a
 
 // The master: the data directory's lock, the store, its listeners and the
 // replication socket, until SIGTERM or SIGINT.
-fn runMaster(dir: str, addrs: &[]str, tdsAddrs: &[]str, auth: &lexdb_wire.AuthConf) {
+fn runMaster(dir: str, addrs: &[]str, tdsAddrs: &[]str, tnsAddrs: &[]str, auth: &lexdb_wire.AuthConf) {
     // One server per data directory: two writing the same files would
     // corrupt them (a benchmark started a second server while the first
     // still wrote its shutdown checkpoint, 9.58). The lock is held, its
@@ -333,7 +350,35 @@ fn runMaster(dir: str, addrs: &[]str, tdsAddrs: &[]str, auth: &lexdb_wire.AuthCo
                     }
                 }
                 let g = s.start(lexdb_tds.acceptAll, lexdb_tds.ListenArg{lns: tdsLns, st: st})
+                // Oracle's protocol, likewise (design/lexdb-oracle.md)
+                var tnsFiles: []str = []
+                var tnsLns: []net.Listener = []
+                var tcpsLns: []net.Listener = []
+                for secure in [false, true] {
+                    var want: []str = []
+                    for ta in tnsAddrs {
+                        if strings.startsWith(ta, "tcps:") == secure { append(mut &want, if secure { ta[5..len(ta)].toStr() } else { ta }) }
+                    }
+                    if len(want) == 0 { continue }
+                    match lexdb_wire.listenAll(&want, mut &tnsFiles) {
+                        Ok(x) {
+                            var tn: []str = []
+                            for ln in x { append(mut &tn, ln.localAddr()) }
+                            println("lexdb: " + (if secure { "TCPS (Oracle over TLS)" } else { "TNS (Oracle)" }) + " on " + strings.join(&tn, ", "))
+                            let fl3 = io.flushStdout()
+                            if secure { tcpsLns = x } else { tnsLns = x }
+                        }
+                        Err(msg) {
+                            eprintln("lexdb: tns: " + msg)
+                            code = 1
+                        }
+                    }
+                }
+                let h = s.start(lexdb_tns.acceptAll, lexdb_tns.ListenArg{lns: tnsLns, st: st})
+                let h2 = s.start(lexdb_tns.acceptAllTls, lexdb_tns.ListenArg{lns: tcpsLns, st: st})
                 if code == 0 { let sig = task.terminated() }
+                { let stop = h }
+                { let stop = h2 }
                 { let stop = g }
                 { let stop = f }                       // cancels the accept loops and the connections
                 println("lexdb: stopping")

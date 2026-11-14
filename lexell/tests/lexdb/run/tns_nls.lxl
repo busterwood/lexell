@@ -1,0 +1,206 @@
+// lexdb_tns, NLS and session state, the ORA- errors, DESCRIBE's declared types, users and grants
+// (design/lexdb-oracle.md, stage O5), through lib/oracle. The LOB, cancel and define paths are
+// tests/lexdb/oracledb_o5.py's (python-oracledb), which drives the client side of them.
+// Answers checked against Oracle Database Free 23ai on 2026-11-13 (ORA-12705 for every bad NLS value).
+// expect: default: '05-MAR-24' '05-MAR-24 01.14.15.250000 PM'
+// expect: nls_date_format: '2024-03-05 13:14:15' '2025-01-02T03:04:05'
+// expect: nls_timestamp_format: '05/03/2024 13:14:15.250' '2024-03-05T01:02:03'
+// expect: explicit format wins: '05.03.2024'
+// expect: bad date format: error 1821
+// expect: territory: '05.03.24' 'GERMANY'
+// expect: bad territory: error 12705
+// expect: bad language: error 12705
+// expect: bad option: error 2248
+// expect: time zone: 'Europe/Paris' | error 1882
+// expect: settings: 'YYYY-MM-DD HH24:MI:SS' 'GERMAN'
+// expect: precision: error 1438
+// expect: scale: error 1438
+// expect: length: error 12899
+// expect: identity: error 32795
+// expect: describe: NUMBER DATE TIMESTAMP VARCHAR2 NUMBER CLOB BLOB
+// expect: date expressions: DATE DATE
+// expect: create user: 0
+// expect: user again: error 1920
+// expect: no session: error 1045
+// expect: granted session: connected
+// expect: own schema: 'app1'
+// expect: no privilege: error 942
+// expect: select granted: 7
+// expect: insert denied: error 1031
+// expect: insert granted: 1
+// expect: revoked: error 1031
+// expect: current_schema: 1
+// expect: bad current_schema: error 1435
+// expect: alter user: connected
+// expect: locked: error 1045
+// expect: drop needs cascade: error 1922
+// expect: dropped: 0 | error 1017
+// expect: no such user: error 1918
+// expect: grant to nobody: error 1917
+import "task"
+import "net"
+import "strings"
+import "time"
+import "oracle"
+import "sqldialect"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_tns"
+
+fn connect(s: &str): oracle.Conn {
+    match oracle.connect(s.toStr()) {
+        Ok(c) { return c }
+        Err(e) {
+            println("connect: error " + e.code.toStr() + " " + e.msg)
+            exit(1)
+        }
+    }
+}
+
+fn show(r: Result[oracle.Rows, oracle.Error]): str {
+    match r {
+        Ok(rows) { return "ok" }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+fn values(rows: &oracle.Rows, row: int): str {
+    var out: []str = []
+    for i in 0..rows.columnCount() {
+        match rows.isNull(row, i) {
+            Ok(n) {
+                if n { append(mut &out, "NULL") } else {
+                    match rows.value(row, i) {
+                        Ok(v) { append(mut &out, v.toStr()) }
+                        Err(e) { append(mut &out, "error " + e.code.toStr() + " " + e.msg) }
+                    }
+                }
+            }
+            Err(e) { append(mut &out, "error " + e.code.toStr()) }
+        }
+    }
+    return strings.join(&out, " ")
+}
+
+fn err(r: Result[int, oracle.Error]): str {
+    match r {
+        Ok(n) { return n.toStr() }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+fn q1(c: mut &oracle.Conn, sql: &str): str {
+    match c.query(sql.toStr(), &[]) {
+        Ok(r) {
+            var out: []str = []
+            for i in 0..r.rowCount() { append(mut &out, values(&r, i)) }
+            return strings.join(&out, ",")
+        }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+
+fn code(r: Result[oracle.Conn, oracle.Error]): str {
+    match r {
+        Ok(c) { return "connected" }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+fn dateOf(c: mut &oracle.Conn, sql: &str): str { return q1(mut &c, sql) }
+
+fn ty(r: &oracle.Rows, i: int): str {
+    let t = r.columnTypeName(i).unwrap()
+    return t
+}
+
+fn client(port: &str) {
+    let dsn = "127.0.0.1:" + port + "/lexdb"
+    var c = connect(&("User Id=sa;Password=sa;Data Source=" + dsn))
+    c.exec("create table ev (id number(10) primary key, d date, ts timestamp(6), name varchar2(30), amt number(10,2), body clob, img blob)").unwrap()
+    c.exec("insert into ev (id, d, ts, name, amt) values (1, to_date('2024-03-05 13:14:15', 'YYYY-MM-DD HH24:MI:SS'), to_timestamp('2024-03-05 13:14:15.250000', 'YYYY-MM-DD HH24:MI:SS.FF6'), 'one', 12.5)").unwrap()
+    println("default: " + q1(mut &c, &"select to_char(d), to_char(ts) from ev"))
+    c.exec("alter session set nls_date_format = 'YYYY-MM-DD HH24:MI:SS'").unwrap()
+    println("nls_date_format: " + q1(mut &c, &"select to_char(d), to_date('2025-01-02 03:04:05') from ev"))
+    c.exec("alter session set nls_timestamp_format = 'DD/MM/YYYY HH24:MI:SS.FF3'").unwrap()
+    println("nls_timestamp_format: " + q1(mut &c, &"select to_char(ts), to_timestamp('05/03/2024 01:02:03.000') from ev"))
+    println("explicit format wins: " + q1(mut &c, &"select to_char(d, 'DD.MM.YYYY') from ev"))
+    println("bad date format: " + err(c.run("alter session set nls_date_format = 'ZZZZ'", &[])))
+    c.exec("alter session set nls_date_format = 'DD.MM.RR'").unwrap()
+    c.exec("alter session set nls_territory = 'GERMANY'").unwrap()
+    println("territory: " + q1(mut &c, &"select to_char(d), current_setting('oracle.nls_territory') from ev"))
+    println("bad territory: " + err(c.run("alter session set nls_territory = 'ATLANTIS'", &[])))
+    println("bad language: " + err(c.run("alter session set nls_language = 'KLINGON'", &[])))
+    println("bad option: " + err(c.run("alter session set no_such_parameter = 1", &[])))
+    c.exec("alter session set nls_date_format = 'YYYY-MM-DD HH24:MI:SS'").unwrap()
+    c.exec("alter session set nls_language = 'GERMAN'").unwrap()
+    c.exec("alter session set time_zone = 'Europe/Paris'").unwrap()
+    println("time zone: " + q1(mut &c, &"select current_setting('TimeZone') from dual") + " | " + err(c.run("alter session set time_zone = 'Mars/Olympus'", &[])))
+    println("settings: " + q1(mut &c, &"select current_setting('oracle.nls_date_format'), current_setting('oracle.nls_language') from dual"))
+    c.exec("create table nn (a number(3), b number(5,2), c varchar2(3), id number generated always as identity)").unwrap()
+    println("precision: " + err(c.run("insert into nn (a) values (12345)", &[])))
+    println("scale: " + err(c.run("insert into nn (b) values (123456.7)", &[])))
+    println("length: " + err(c.run("insert into nn (c) values ('abcdef')", &[])))
+    println("identity: " + err(c.run("insert into nn (a, id) values (1, 5)", &[])))
+    let r = c.query("select id, d, ts, name, amt, body, img from ev", &[]).unwrap()
+    var ds: []str = []
+    for i in 0..r.columnCount() { append(mut &ds, r.columnTypeName(i).unwrap()) }
+    println("describe: " + strings.join(&ds, " "))
+    let r2 = c.query("select sysdate, to_date('2020-01-01', 'YYYY-MM-DD') from dual", &[]).unwrap()
+    println("date expressions: " + r2.columnTypeName(0).unwrap() + " " + r2.columnTypeName(1).unwrap())
+    println("create user: " + err(c.run("create user app1 identified by pw1", &[])))
+    println("user again: " + err(c.run("create user APP1 identified by pw2", &[])))
+    println("no session: " + code(oracle.connect(("User Id=app1;Password=pw1;Data Source=" + dsn))))
+    c.exec("grant create session, create table to app1").unwrap()
+    var a = connect(&("User Id=app1;Password=pw1;Data Source=" + dsn))
+    println("granted session: connected")
+    a.exec("create table mine (a number)").unwrap()
+    a.exec("insert into mine values (1)").unwrap()
+    a.exec("commit").unwrap()
+    println("own schema: " + q1(mut &c, &"select table_schema from information_schema.tables where lower(table_name) = 'mine'"))
+    c.exec("create table pub (a number)").unwrap()
+    c.exec("insert into pub values (7)").unwrap()
+    c.exec("commit").unwrap()
+    println("no privilege: " + show(a.query("select * from pub", &[])))
+    c.exec("grant select on pub to app1").unwrap()
+    println("select granted: " + q1(mut &a, &"select * from pub"))
+    println("insert denied: " + err(a.run("insert into pub values (8)", &[])))
+    c.exec("grant insert on pub to app1").unwrap()
+    println("insert granted: " + err(a.run("insert into pub values (8)", &[])))
+    a.exec("commit").unwrap()
+    c.exec("revoke insert on pub from app1").unwrap()
+    println("revoked: " + err(a.run("insert into pub values (9)", &[])))
+    c.exec("alter session set current_schema = app1").unwrap()
+    println("current_schema: " + q1(mut &c, &"select * from mine"))
+    println("bad current_schema: " + err(c.run("alter session set current_schema = nobody", &[])))
+    a.logoff()
+    c.exec("alter user app1 identified by pw3").unwrap()
+    var b = connect(&("User Id=app1;Password=pw3;Data Source=" + dsn))
+    b.logoff()
+    println("alter user: connected")
+    c.exec("alter user app1 account lock").unwrap()
+    println("locked: " + code(oracle.connect(("User Id=app1;Password=pw3;Data Source=" + dsn))))
+    println("drop needs cascade: " + err(c.run("drop user app1", &[])))
+    println("dropped: " + err(c.run("drop user app1 cascade", &[])) + " | " + code(oracle.connect(("User Id=app1;Password=pw3;Data Source=" + dsn))))
+    println("no such user: " + err(c.run("drop user app1", &[])))
+    println("grant to nobody: " + err(c.run("grant create session to nobody", &[])))
+    c.logoff()
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        let f = s.start(lexdb_tns.acceptLoop, lexdb_tns.AcceptArg{ln: ln, st: st})
+        client(&addr[10..len(addr)])
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(5), lexdb_store.Options{cacheBytes: 128 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000, bufferedPages: false}, body).unwrap()
+}

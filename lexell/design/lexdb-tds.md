@@ -85,7 +85,7 @@ queries and uses RPC differently.
 | S2 | RPC: `sp_executesql` with parameters, `sp_prepare`/`sp_execute`/`sp_unprepare`, `sp_prepexec`; parameters of every type; OUTPUT parameters and RETURNVALUE; transactions by Transaction Manager request and ENVCHANGE 8/9/10; RESETCONNECTION | the `sqlserver` client's parameter, transaction and pool tests pass against lexdb; a .NET SqlClient program with parameters works |
 | S3 | T-SQL surface: `[quoted]` names, `TOP n` / `TOP (n)`, `N'...'`, `+` on strings, `@@IDENTITY`/`SCOPE_IDENTITY()`, `IDENTITY(s,i)`, SQL Server's type names (nvarchar, datetime2, bit, uniqueidentifier, money, ...), common functions (GETDATE, ISNULL, LEN, CHARINDEX, CONVERT with styles, DATEADD, DATEDIFF, ...), `SELECT ... INTO`, `OFFSET ... FETCH` | gen_mssql suites for each pass |
 | S4 | T-SQL batches: `DECLARE`/`SET`/`SELECT @v =`, `IF`/`ELSE`, `WHILE`, `BEGIN ... END`, `PRINT`, `RAISERROR`/`THROW`, `TRY ... CATCH`, `#temp` tables, several result sets per batch, `OUTPUT`, `GO` handled by clients | gen_mssql suites pass |
-| S5 | procedures and functions (`CREATE PROCEDURE`, `EXEC`), `MERGE`, `sys.*` catalog views and SQL Server's `INFORMATION_SCHEMA`, collations (see L2) | EF Core's migrations and a Dapper program run against lexdb. The `sys.*` part is built (section 13: VS Code's SQL Server extension connects, browses and completes as against SQL Server); procedures, MERGE and SQL Server's INFORMATION_SCHEMA are not |
+| S5 | procedures and functions (`CREATE PROCEDURE`, `EXEC`), `MERGE`, `sys.*` catalog views and SQL Server's `INFORMATION_SCHEMA`, collations (see L2) | EF Core's migrations and a Dapper program run against lexdb. The `sys.*` part is built (section 13: VS Code's SQL Server extension connects, browses and completes as against SQL Server); MERGE is built (design/lexdb.md 9.121; `tds_merge`); procedures and SQL Server's INFORMATION_SCHEMA are not |
 
 S1 is one agent run. S3 to S5 split into independent slices that can run in
 parallel, each in its own worktree.
@@ -544,7 +544,8 @@ oracle's answers all.
   every string counts as nvarchar); FORMAT; CONVERT's number styles and a
   string's date styles (`CONVERT(date, '05/03/2024', 103)`); decimal
   precision past division and AVG (multiplication's and addition's scales
-  are the values'); OUTPUT ... INTO; MERGE (S5).
+  are the values'); OUTPUT ... INTO. (MERGE is built: design/lexdb.md 9.121; checked against SQL Server 2022 by
+  `tds_merge`, with OUTPUT, $action, TOP, 8672, 10710 to 10714 and 5324.)
 
 ## 12. Stage S4, as built (2026-11-12)
 
@@ -910,3 +911,132 @@ insert path (COPY's, 9.45, 9.87, 9.119).
   loads the same); SET FMTONLY ON for statements other than SELECT (they
   are skipped, not described); CHECK_CONSTRAINTS off; triggers; tedious
   and JDBC's bulk copy were not tried.
+
+## 15. Java client pass (2026-11-14)
+
+Microsoft's own JDBC driver (mssql-jdbc 13.6.2, `jre11`) was run against the door for the first time, and the same program
+(`tests/lexdb/java/MssqlJdbc.java`, about 190 checks; README there) against a real SQL Server 2022 (RTM-CU27, in a container of
+its own): connect with `encrypt=false`, `true;trustServerCertificate=true` and `true` with a trust store, every column type,
+DatabaseMetaData (all of it), parameters (sp_executesql, and a statement run more than the driver's threshold, sp_prepexec,
+sp_execute), generated keys, batches with and without `useBulkCopyForBatchInsert`, transactions and savepoints, MERGE with
+OUTPUT, errors by number, CallableStatement. SQL Server passes every check; lexdb, after the fixes, all but what is listed below.
+
+**Broke, and fixed.**
+- A decimal parameter: mssql-jdbc sends as many bytes as the value needs (a sign byte and 1 to 16 of magnitude), not the 5, 9,
+  13 or 17 of the precision (`lib/tds.lxl` `decimalCell`, `lexdb_tds.lxl`): "a decimal of 3 bytes" for any BigDecimal.
+- DatabaseMetaData is `sp_tables`, `sp_columns_170` (and `_100`), `sp_pkeys`, `sp_fkeys`, `sp_statistics_100`, `sp_special_columns_100`,
+  `sp_stored_procedures`, `sp_sproc_columns_100`, `sp_datatype_info_100`, `sp_table_privileges` and `sp_column_privileges`, whose rows
+  the driver collects in a table variable (`DECLARE @t TABLE (...); INSERT INTO @t EXEC sp_columns_170 ...; SELECT ... FROM @t`).
+  lexdb had none of the procedures and no table variable. A procedure is the SELECT of lexdb's sys views that has SQL Server's columns
+  (`catalogProcSql`; `sp_datatype_info_100` is SQL Server 2022's 37 rows as they are); a table variable is a temporary table `#tv_name`
+  (`DROP TABLE IF EXISTS` then `CREATE TABLE` where it is declared, every `@name` of the batch outside strings and comments renamed;
+  `tableVariables`). A batch may begin with a system procedure's name (`sp_executesql N'SET FMTONLY ON SELECT ...'`, which the bulk
+  copy for batches sends) without EXEC. BEGIN TRAN's name is not the keyword of the statement after it (`BEGIN TRAN IF @@TRANCOUNT =
+  2 COMMIT TRAN`, which `Connection.setSavepoint` sends).
+- `CONVERT(smallint, <bit column>)` and `CAST(bit AS int)` were an error (a boolean to an integer type: 1 or 0, in the shared explicit
+  cast, so `true::int` works in PostgreSQL mode too).
+- MERGE's DONE had command 0xC6; SQL Server's is 0x117, and the driver drops the count of a command it does not know: `executeUpdate`
+  of a MERGE said 0.
+- SET ROWCOUNT n was accepted and ignored (`Statement.setMaxRows`): a SELECT returns at most n rows now (not DML).
+- SQL Server's words for the errors programs read: 208 `Invalid object name 'x'.`, 207 `Invalid column name 'x'.`, 156 `Incorrect syntax near
+  the keyword 'x'.` (a reserved word; 102 otherwise: `Incorrect syntax near 'x'.`). The ERROR of a parse failure had lexdb's own text.
+- `encrypt=strict` (TDS 8.0, TLS before PRELOGIN): lexdb waited for a packet whose length the ClientHello read as; the driver timed out
+  after its login timeout. A TLS record where a packet header is now closes the connection at once (not supported).
+  Tests: `tests/lexdb/run/tds_java.lxl` (the catalog procedures in the driver's own form, the table variables, the implicit EXEC, the
+  savepoint batch, bit to int, SET ROWCOUNT, MERGE, the three error texts).
+
+**Left (KNOWN and SKIP lines of the program).**
+- `CREATE PROCEDURE` and `CREATE FUNCTION` (T-SQL): not supported, so a CallableStatement with an OUT parameter, a procedure's
+  result sets and `getProcedures`/`getProcedureColumns` of a real procedure are not run (`sp_stored_procedures` and `sp_sproc_columns_100` answer empty).
+- Server cursors: a scrollable or updatable result set is `sp_cursoropen` and `sp_cursorfetch` ("Could not find stored procedure 'procedure 2'").
+- `sp_describe_undeclared_parameters`: `ParameterMetaData` (`PreparedStatement.getMetaData()` works).
+- A result column of `decimal(12,3)` is described as `decimal(38,3)`, `money` as `decimal`, every column as nullable; a `datetimeoffset`
+  keeps no offset (the instant, UTC); a time parameter comes back as `datetime2` where SQL Server's driver sends `datetime`;
+  `@@VERSION` is lexdb's own text ("lexdb (SQL Server protocol, ...") not "Microsoft SQL Server ...".
+- SET ROWCOUNT does not limit INSERT, UPDATE or DELETE.
+- TDS 8.0 (`encrypt=strict`, TLS before PRELOGIN) is not supported: the connection closes at once.
+
+## 16. As built: table-valued parameters (2026-11-14)
+
+A client's table-valued parameter (TVP: RPC parameter type TVPTYPE 0xF3, MS-TDS 2.2.5.5.5) failed at lexdb's door: the RPC
+decoder knew no 0xF3, and T-SQL had no table types. mssql-jdbc's `SQLServerDataTable` (`setStructured`), SqlClient's
+`SqlDbType.Structured` and go-mssqldb's `mssql.TVP` all send one; lib/tds's `tableParam` (design/tds.md section 11, the
+client side of the same bytes) is the reference the server side was built and tested against. Every answer below was
+checked against SQL Server 2022 (RTM-CU27, a throwaway container of its own, removed after).
+
+- **Table types.** `CREATE TYPE [schema.]name AS TABLE (...)` (T-SQL only) is read with CREATE TABLE's grammar (columns,
+  NULL / NOT NULL, DEFAULT, IDENTITY, PRIMARY KEY, UNIQUE, CHECK) and kept as a catalog row `"\x02ttype\x00" + key` (the key
+  as a table's: dbo, or no schema, is public): the key, the name as written, and the definition's text, `( ... )`, read
+  again where it is used. A name an enum type or a table type has: 219 (`The type 'dbo.T' already exists, or you do not
+  have permission to create it.`). `DROP TYPE` drops either kind; in T-SQL a missing one is 218 (`Could not find the type
+  'dbo.Nope'. Either it does not exist or you do not have the necessary permission.`), with IF EXISTS nothing. Ids:
+  user_type_id is the type's OID (`nameOid("T", key)`, the enum types' space), its table's object_id `catOid("tt", key)`.
+  The catalog (lexdb_exec `sysRows`, from `CatSnap.ttypes`): a row in `sys.types` and `sys.table_types` as SQL Server's
+  (system_type_id 243, max_length -1, is_nullable 0, is_user_defined 1, is_table_type 1, type_table_object_id,
+  is_memory_optimized 0); its table in `sys.objects` and `sys.all_objects` (`TT_name_XXXXXXXX`, type TT, TYPE_TABLE,
+  is_ms_shipped 1); its columns in `sys.columns` and `sys.all_columns` under that object_id (a primary key's NOT NULL);
+  `TYPE_ID('dbo.T')` and `TYPE_NAME(id)` find it (the bound catalog's `Y` lines). `DECLARE @x [AS] type` makes a table
+  variable of the type (lexdb_tsql `withTableTypes`: `DECLARE @x TABLE (definition)`, then section 15's table variables),
+  its DEFAULTs and keys as the type's.
+- **The bytes** (lib/tds `parseRpc`, `tableValue`; `RpcParam.table: Option[TableValue]`): TVP_TYPENAME (DbName, schema,
+  name, B_VARCHAR each); the column count, or TVP_NULL_TOKEN (0xFFFF: the type's default, an empty table, `isDefault`;
+  SqlClient's and lib/tds's for no rows); per column UserType, Flags (fDefault 0x200: the server fills it, no values are
+  sent), a TYPE_INFO as a parameter's (text, ntext and image without a table name) and ColName (kept, not used); then
+  TVP_ORDER_UNIQUE (0x10) and TVP_COLUMN_ORDERING (0x11), read and dropped (hints), and TVP_END_TOKEN; then TVP_ROW_TOKEN
+  and a TYPE_VARBYTE per column sent, per row, to TVP_END_TOKEN. Every length is checked against what is left (the
+  cursor's `need`), so a malformed TVP is E_PROTOCOL, never a crash: no columns or more than 1,024, a column of a table
+  type, an unknown token, rows after TVP_NULL_TOKEN, a value longer than its column or past the request's end, more than
+  `MAX_TABLE_CELLS` (8,388,608) rows plus values. lexdb answers ERROR 50000 (its own text) and the RPC's DONE, and the
+  connection goes on, as SQL Server's does after its 8050 (column count), 4002 (stream cut short) and 8037 (length). A
+  decimal column of precision 0 (mssql-jdbc's for a `SQLServerDataTable` without rows, which SQL Server takes) is read as
+  decimal(38, its scale).
+- **Binding** (lexdb_tds `execute`, lexdb_tsql `bindTable`), in SQL Server's order: a database name in the TVP's type
+  name, 8047; a TVP's type that is not there, 351 (`Column, parameter, or variable @items. : Cannot find data type
+  dbo.Nope.`, before @params is read); in @params (`lexdb_tsqlparse.parseParamDecls`: `ParamDecl.tableType`, `typeText`,
+  `readonly`), a READONLY declaration of a type that is not there 2715 (`#n`, its place), a table type without READONLY 352,
+  READONLY on a scalar 346, a TVP for another type or a scalar for a TVP 206; a TVP not given is its type's default (no
+  8178). A declaration of a type of lexdb's own that is not a table type stays a scalar, as before. Each TVP becomes the
+  session's temporary table `#tvp_<name>` (`tvpTable`): `DROP TABLE IF EXISTS`, then `CREATE TABLE #tvp_name <the type's
+  definition>`; a column count other than the type's is 500 (`Trying to pass a table-valued parameter with 2 column(s)
+  where the corresponding user-defined table type requires 5 column(s).`); a value sent for an identity column 1077; a
+  text column sent for a binary one 257 (even all NULL, as SQL Server). Each value is decoded (`cellVal`, as a scalar
+  parameter's) and made its column's type (`coerce`; a bit into a number column 1 or 0), a failure SQL Server's error and
+  words (`convErr`): 245 into int, smallint, tinyint and bit (`Conversion failed when converting the nvarchar value 'x' to
+  data type int.`), 8114 into bigint, decimal, numeric, float and real (`Error converting data type nvarchar to bigint.`),
+  8115 for an overflow, 241 into a date or time, 8169 into uniqueidentifier, 206 for a type clash (`Operand type clash:
+  bigint is incompatible with date`), 2628 for text too long. The rows go in through the bulk load's path (`bulkStmt`,
+  section 14, KEEP_NULLS: a NULL sent stays NULL; a column not sent, fDefault, takes its DEFAULT or identity), so the
+  type's own constraints hold, with SQL Server's words: 2627 (`Violation of PRIMARY KEY constraint '#tvp_items_pkey'.
+  Cannot insert duplicate key in object 'dbo.@items'. The duplicate key value is (1).`), 515 (`... table '@items'; column
+  does not allow nulls. INSERT fails.`). In an open transaction all of it runs under a savepoint, and an error leaves the transaction as it was.
+- **The SQL.** Every `@name` of a TVP in the statement, outside strings, [quoted] names and comments, is made its table's
+  name (`lexdb_tsqlparse.renameVars`), so a TVP reads as any table: FROM, JOIN, `IN (SELECT ...)`, EXISTS, `INSERT ...
+  SELECT`, MERGE's USING, a subquery. Writing to one is 10700 (`The table-valued parameter "@items" is READONLY and cannot
+  be modified.`) for an INSERT, UPDATE, DELETE or MERGE whose target is its table (UPDATE and DELETE through an alias of
+  it in FROM too), found before anything of the batch runs (`State.writesReadOnly`), as SQL Server finds it compiling;
+  TRUNCATE TABLE of one is SQL Server's 102. When the call is done its tables are dropped (`dropTables`).
+- **Paths.** sp_executesql; sp_prepexec and sp_execute (the declarations kept with the handle, the TVP bound at each
+  execute). Drivers send these by ProcID; SQL Server refuses a TVP to them called by name (8144, 349), lexdb takes both.
+  T-SQL procedures are not built (section 15), so there is no procedure's TVP parameter.
+- **Clients checked.** mssql-jdbc 13.6.2 (`tests/lexdb/java/MssqlJdbcTvp.java`, 21 checks: every column kind with NULLs,
+  an empty table, a scalar beside one, JOIN, IN, INSERT ... SELECT, 3,000 rows, the same statement run until the driver
+  prepares it, `setStructured` with a `ResultSet`, a transaction rolled back, 351, 8114, 515, 2627, 10700) passes against
+  lexdb and SQL Server. lib/tds's live test `sqlserver_live_tvp`, pointed at lexdb, gives SQL Server's answers but for
+  its procedure and its computed column (both missing in lexdb). SqlClient and go-mssqldb were not tried.
+- **Tests.** `tests/lexdb/run/tds_tvp.lxl` (in the suite; with LEXDB_MSSQL against a SQL Server, which made its expect
+  lines: the rows, the default, fDefault, 5,000 rows, two TVPs, by ProcID, a TVP made by hand with TVP_ORDER_UNIQUE and PLP
+  values, a transaction, the catalog, DECLARE of a table type, and every error above); `tests/lexdb/run/tds_tvp_wire.lxl`
+  (the decoder byte for byte: lib/tds's TVPs, the default, one made by hand with both order tokens, column names, PLP in
+  chunks and of unknown length and a fDefault column; thirteen malformed ones; five sent to the door, each answered and
+  the connection usable).
+- **Differences from SQL Server, and not done.** A computed column in a table type (`x AS a * 2`: lexdb has no computed
+  columns; the CREATE TYPE fails). `EXEC sp_executesql ..., @p = @x` inside a batch, passing a table variable, is not
+  built (only the RPC paths bind TVPs). sp_describe_first_result_set and sp_prepare's metadata (options 1) for a statement
+  that reads a TVP give no columns. varbinary into an integer column is 206 (SQL Server converts the bytes). The
+  protocol errors are 50000, not 8050, 4002, 8037. 2627's text names lexdb's constraint of the temporary table
+  (`#tvp_items_pkey`, SQL Server's `PK__#A0A7B7B__3213E83F...`), 2628's the parameter (`'@items'`, SQL Server's
+  `'tempdb.dbo.#A0A7B7BC'`). A table type is not checked against the objects
+  that use it: DROP SCHEMA leaves its types, and a FOREIGN KEY in one is taken (SQL Server refuses both). Under
+  IMPLICIT_TRANSACTIONS the drop of a TVP's table is rolled back with the transaction, so the table stays until the next
+  call that names the parameter (which drops it first) or the session's end. TVP_ORDER_UNIQUE is not checked: uniqueness
+  is the type's own constraints'.

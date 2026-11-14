@@ -1,0 +1,165 @@
+# MERGE, compared with PostgreSQL (tests/lexdb/gen_pg.py merge).
+create table tgt (id int primary key, name text, qty int not null default 0, note text)
+insert into tgt values (1, 'a', 10, null), (2, 'b', 20, null), (3, 'c', 30, null)
+create table src (id int, name text, qty int)
+insert into src values (2, 'B', 5), (3, 'C', 7), (4, 'D', 9), (5, 'E', 11)
+# an upsert: matched rows updated, the others inserted
+merge into tgt t using src s on t.id = s.id when matched then update set name = s.name, qty = t.qty + s.qty when not matched then insert (id, name, qty) values (s.id, s.name, s.qty)
+select * from tgt order by id
+# no alias, INTO's table name qualifying; a column list left out; DEFAULT in values
+merge into tgt using (values (6, 'F', 1)) as v(id, name, qty) on tgt.id = v.id when not matched then insert values (v.id, v.name, default)
+select * from tgt where id = 6
+# conditional clauses: the first one whose condition holds is the one used
+merge into tgt t using src s on t.id = s.id when matched and s.qty > 10 then delete when matched and s.qty > 6 then update set note = 'big' when matched then update set note = 'small' when not matched and s.qty < 10 then insert (id, name) values (s.id, s.name)
+select * from tgt order by id
+# DO NOTHING, and a matched row with no clause for it
+merge into tgt t using src s on t.id = s.id when matched and t.id = 2 then do nothing when matched and t.id = 3 then update set note = 'three'
+select * from tgt where id in (2, 3) order by id
+merge into tgt t using src s on t.id = s.id when not matched then do nothing
+merge into tgt t using src s on t.id = s.id when matched then do nothing
+# DELETE
+merge into tgt t using (select 1 as id union all select 2) s on t.id = s.id when matched then delete
+select * from tgt order by id
+# a subquery source, VALUES, a source that is a table joined, an aggregate
+merge into tgt t using (select id, name from src where id > 3) s on t.id = s.id when matched then update set name = lower(s.name) when not matched then insert (id, name) values (s.id + 100, s.name)
+select * from tgt order by id
+merge into tgt t using (values (3, 'x'), (77, 'y')) as v (id, name) on t.id = v.id when matched then update set name = v.name when not matched then insert (id, name) values (v.id, v.name)
+select * from tgt order by id
+merge into tgt t using (select name, sum(qty) as q from src group by name) s on t.name = lower(s.name) when matched then update set qty = s.q
+select * from tgt order by id
+# the source rows many for one target row: an error when it would be changed twice
+create table dup (id int, name text)
+insert into dup values (3, 'p'), (3, 'q'), (8, 'r')
+merge into tgt t using dup d on t.id = d.id when matched then update set name = d.name
+merge into tgt t using dup d on t.id = d.id when matched then delete
+merge into tgt t using dup d on t.id = d.id when matched and d.name = 'p' then update set name = 'only p'
+select * from tgt order by id
+merge into tgt t using dup d on t.id = d.id when matched then do nothing when not matched then insert (id, name) values (d.id, d.name)
+select * from tgt order by id
+# two source rows inserting the same new key: a unique violation, nothing done
+merge into tgt t using (values (50, 'a'), (50, 'b')) as v(id, name) on t.id = v.id when not matched then insert (id, name) values (v.id, v.name)
+select count(*) from tgt where id = 50
+# an empty source, and a source with no match
+merge into tgt t using (select * from src where false) s on t.id = s.id when matched then delete when not matched then insert (id) values (s.id)
+merge into tgt t using (values (900, 'z')) as v(id, name) on t.id = v.id when matched then delete
+merge into tgt t using (values (900, 'z')) as v(id, name) on t.id = v.id and false when not matched then insert (id, name) values (v.id, v.name)
+select * from tgt where id = 900
+# NULLs in the join key never match
+create table nk (k int, v text)
+insert into nk values (1, 'one'), (null, 'n1')
+merge into nk t using (values (1, 'x1'), (null, 'n2')) as s(k, v) on t.k = s.k when matched then update set v = s.v when not matched then insert (k, v) values (s.k, s.v)
+select * from nk order by k nulls last, v
+merge into nk t using (values (1, 'x2'), (null, 'n3')) as s(k, v) on t.k is not distinct from s.k when matched then update set v = s.v
+select * from nk order by k nulls last, v
+# a table without a primary key: duplicate rows, one source row deleting both
+create table kl (a int, b text)
+insert into kl values (1, 'x'), (1, 'x'), (2, 'y')
+merge into kl using (values (1), (3)) as v(a) on kl.a = v.a when matched then update set b = 'hit' when not matched then insert (a, b) values (v.a, 'new')
+select * from kl order by a, b
+merge into kl using (values (2)) as v(a) on kl.a = v.a when matched then delete
+select * from kl order by a, b
+# identity, serial and sequence defaults, in the order the rows are given
+create table idt (id int generated always as identity primary key, v text)
+merge into idt t using (values ('a'), ('b'), ('c')) as s(v) on false when not matched then insert (v) values (s.v)
+select * from idt order by id
+merge into idt t using (values (1, 'A'), (9, 'z')) as s(id, v) on t.id = s.id when matched then update set v = s.v
+merge into idt t using (values (9, 'z')) as s(id, v) on t.id = s.id when not matched then insert (id, v) values (s.id, s.v)
+merge into idt t using (values (9, 'z')) as s(id, v) on t.id = s.id when not matched then insert overriding system value values (s.id, s.v)
+merge into idt t using (values (1, 'A')) as s(id, v) on t.id = s.id when matched then update set id = 5
+create sequence sq start 100
+create table sqt (id int default nextval('sq') primary key, ser serial, v text)
+merge into sqt t using (values ('p'), ('q')) as s(v) on false when not matched then insert (v) values (s.v)
+select * from sqt order by id
+# DEFAULT VALUES, and DEFAULT in SET
+merge into sqt t using (values (1)) as s(n) on false when not matched then insert default values
+select count(*) from sqt
+merge into tgt t using (values (1, 5)) as s(id, n) on t.id = s.id when matched then update set qty = default, note = default
+select * from tgt where id = 1
+# SET (a, b) = (x, y)
+merge into tgt t using (values (1, 'multi', 77)) as s(id, n, q) on t.id = s.id when matched then update set (name, qty) = (s.n, s.q)
+select * from tgt where id = 1
+# NOT MATCHED BY SOURCE, BY TARGET
+merge into tgt t using (values (1), (2), (900)) as s(id) on t.id = s.id when matched then update set note = 'kept' when not matched by source and t.id > 100 then delete when not matched by source then update set note = 'orphan' when not matched by target then insert (id, name) values (s.id + 1000, 'new')
+select * from tgt order by id
+merge into tgt t using (values (7)) as s(id) on t.id = s.id when not matched by target then insert (id, name) values (s.id, 'by target') when not matched by source then do nothing
+select * from tgt where id = 7
+# RETURNING, merge_action()
+merge into tgt t using (values (1, 'R1'), (60, 'R60')) as s(id, name) on t.id = s.id when matched then update set name = s.name when not matched then insert (id, name) values (s.id, s.name) returning merge_action(), t.id, t.name, s.name
+merge into tgt t using (values (1), (61)) as s(id) on t.id = s.id when matched then delete when not matched then insert (id, name) values (s.id, 'ret') returning merge_action() as act, t.*
+merge into tgt t using (values (2)) as s(id) on t.id = s.id when matched then delete when not matched by source and t.id = 1 then update set note = 'bysrc' returning merge_action(), id, s.id
+# the statement fails as a whole: a constraint, the rows before it undone
+merge into tgt t using (values (1, 'ok'), (1000, 'bad')) as s(id, name) on t.id = s.id when matched then update set name = s.name when not matched then insert (id, name, qty) values (s.id, s.name, null)
+select name from tgt where id = 1
+merge into tgt t using (values (1, 'ok')) as s(id, name) on t.id = s.id when matched then update set qty = null
+merge into tgt t using (values (1, 'ok')) as s(id, name) on t.id = s.id when matched then update set id = 2
+merge into tgt t using (values (1, 'ok')) as s(id, name) on t.id = s.id when matched then update set id = id + 5000
+select id from tgt where id in (1, 5001) order by id
+# in a transaction: rolled back, committed; an error in a block
+begin
+merge into tgt t using (values (1)) as s(id) on t.id = s.id when matched then update set name = 'in tx'
+select name from tgt where id = 1
+rollback
+select name from tgt where id = 1
+begin
+merge into tgt t using (values (1)) as s(id) on t.id = s.id when matched then update set name = 'committed'
+commit
+select name from tgt where id = 1
+begin
+merge into tgt t using dup d on t.id = d.id when matched then update set name = 'x'
+select 1
+rollback
+select name from tgt where id = 3
+# a CHECK and a foreign key
+create table par (id int primary key)
+insert into par values (1), (2)
+create table kid (id int primary key, p int references par, n int check (n > 0))
+merge into kid k using (values (1, 1, 5), (2, 2, 6)) as s(id, p, n) on k.id = s.id when not matched then insert values (s.id, s.p, s.n)
+merge into kid k using (values (3, 9, 5)) as s(id, p, n) on k.id = s.id when not matched then insert values (s.id, s.p, s.n)
+merge into kid k using (values (3, 1, 0)) as s(id, p, n) on k.id = s.id when not matched then insert values (s.id, s.p, s.n)
+merge into kid k using (values (1, 9)) as s(id, p) on k.id = s.id when matched then update set p = s.p
+merge into par t using (values (1)) as s(id) on t.id = s.id when matched then delete
+merge into par t using (values (3)) as s(id) on t.id = s.id when not matched then insert (id) values (s.id)
+select * from par order by id
+# WITH, an alias on the source table, the target joined in the condition
+with w as (select 4 as id, 'cte' as name) merge into tgt t using w on t.id = w.id when matched then update set name = w.name when not matched then insert (id, name) values (w.id, w.name)
+select * from tgt where id = 4
+merge into tgt as t using src as s on t.id = s.id and s.qty > 100 when not matched and s.id = 2 then insert (id, name) values (s.id + 2000, 'cond')
+select * from tgt where id = 2002
+# the same table as target and source
+merge into tgt t using tgt s on t.id = s.id + 1 when matched then update set note = s.name
+select id, note from tgt where id <= 4 order by id
+# errors: a missing table, a missing column, syntax, a clause that does not fit
+merge into nope t using src s on t.id = s.id when matched then delete
+merge into tgt t using nope s on t.id = s.id when matched then delete
+merge into tgt t using src s on t.id = s.id when matched then update set nope = 1
+merge into tgt t using src s on t.nope = s.id when matched then delete
+merge into tgt t using src s on t.id = s.id when matched then insert (id) values (1)
+merge into tgt t using src s on t.id = s.id when not matched then delete
+merge into tgt t using src s on t.id = s.id
+merge into tgt t using src s on t.id = s.id when matched then update set name = 'x' when
+merge into tgt t using src s on t.id = s.id when not matched then insert (id, name) values (s.id)
+merge into tgt t using src s on t.id = s.id when not matched then insert (id) values (s.id, s.name)
+merge into tgt t using src s on t.id = s.id when matched then update set name = (select 1, 2)
+# a subquery in a clause, a condition, and the source
+merge into tgt t using src s on t.id = s.id when matched and exists (select 1 from par p where p.id = t.id) then update set note = (select max(name) from src) when not matched and s.id in (select id from src where qty > 100) then insert (id) values (s.id)
+select id, note from tgt order by id limit 3
+# privileges: each action needs its own, and SELECT for the ON clause and the source
+drop role if exists lx_mrg
+create role lx_mrg
+create table pv (id int primary key, v text)
+insert into pv values (1, 'a'), (2, 'b')
+grant select on pv to lx_mrg
+grant select on src to lx_mrg
+set role lx_mrg
+merge into pv using src on pv.id = src.id when matched then update set v = 'x'
+reset role
+grant update on pv to lx_mrg
+set role lx_mrg
+merge into pv using src on pv.id = src.id when matched then update set v = 'x'
+merge into pv using src on pv.id = src.id when not matched then insert (id) values (src.id)
+merge into pv using src on pv.id = src.id when matched then delete
+reset role
+revoke select on src from lx_mrg
+set role lx_mrg
+merge into pv using src on pv.id = src.id when matched then update set v = 'x'
+reset role

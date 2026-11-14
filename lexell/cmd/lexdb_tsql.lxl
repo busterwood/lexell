@@ -75,13 +75,35 @@ fn ev0(kind: int): Event {
 pub type Caught = record { pub number: int; pub message: str; pub severity: int; pub state: int }
 
 fn caughtOf(e: &DbErr): Caught {
-    let n = sqlNumber(&e.state)
-    return Caught{number: n, message: sqlMessage(n, &e.msg), severity: sqlClass(n), state: 1}
+    var n = sqlNumber(&e.state)
+    var msg = sqlMessage(n, &e.msg)
+    if n == 102 && strings.startsWith(&e.msg, "syntax error at or near \"") {
+        // SQL Server says "near the keyword 'x'" (156) for a reserved word, else "near 'x'" (102)
+        let tok = quotedName(&e.msg)
+        if lexdb_sql.isReservedWord(&strings.toLowerAscii(tok)) {
+            n = 156
+            msg = "Incorrect syntax near the keyword '" + tok + "'."
+        } else {
+            msg = "Incorrect syntax near '" + tok + "'."
+        }
+    }
+    return Caught{number: n, message: msg, severity: sqlClass(n), state: 1}
+}
+
+// The text between the first pair of double quotes of msg.
+fn quotedName(msg: &str): str {
+    let a = strings.indexOf(msg, "\"", 0)
+    if a < 0 { return "" }
+    let b = strings.indexOf(msg, "\"", a + 1)
+    if b < 0 { return "" }
+    return msg[a + 1..b].toStr()
 }
 
 // SQL Server's text for the errors programs look at, where lexdb's differs.
 fn sqlMessage(n: int, msg: &str): str {
     if n == 8134 { return "Divide by zero error encountered." }
+    if n == 208 && strings.startsWith(msg, "relation \"") { return "Invalid object name '" + quotedName(msg) + "'." }
+    if n == 207 && strings.startsWith(msg, "column \"") { return "Invalid column name '" + quotedName(msg) + "'." }
     return msg.toStr()
 }
 
@@ -90,6 +112,7 @@ pub const CMD_SELECT = 0xC1
 pub const CMD_INSERT = 0xC3
 pub const CMD_DELETE = 0xC4
 pub const CMD_UPDATE = 0xC5
+pub const CMD_MERGE = 0x117       // (SQL Server's MERGE; its DONE carries the rows merged)
 pub const CMD_BULK = 0xF0       // a bulk load's rows (SQL Server's BULK INSERT)
 pub const CMD_SETOPT = 0xFD     // what SQL Server's DONE gives INSERT BULK
 
@@ -98,13 +121,14 @@ fn cmdOf(kind: int): int {
     if kind == lexdb_sql.S_INSERT { return CMD_INSERT }
     if kind == lexdb_sql.S_UPDATE { return CMD_UPDATE }
     if kind == lexdb_sql.S_DELETE { return CMD_DELETE }
+    if kind == lexdb_sql.S_MERGE { return CMD_MERGE }
     return 0
 }
 
 fn errorEv(ev: mut &[]Event, e: &DbErr) {
     var x = ev0(EV_ERROR)
-    x.err = e
     let c = caughtOf(e)
+    x.err = DbErr{state: e.state, msg: c.message, context: e.context, detail: e.detail, hint: e.hint}
     x.number = c.number
     x.sev = c.severity
     x.state = c.state
@@ -167,7 +191,7 @@ pub fn sqlNumber(state: &str): int {
 // failed login, 15 for a syntax error, else 16.
 pub fn sqlClass(n: int): int {
     if n == 2627 || n == 2601 || n == 18456 || n == 229 { return 14 }
-    if n == 102 || n == 156 || n == 105 { return 15 }
+    if n == 102 || n == 156 || n == 105 || n == 10713 || n == 10710 || n == 10711 || n == 10714 || n == 109 || n == 110 { return 15 }
     return 16
 }
 
@@ -190,6 +214,7 @@ pub type State = record {
     pub postgres: bool          // SET LEXDB_DIALECT POSTGRES
     pub trancount: int
     pub rowcount: int
+    pub rowLimit: int           // SET ROWCOUNT n: a SELECT returns at most n rows (0: all)
     pub error: int
     pub spid: int
     saves: []str                // SAVE TRAN names, in order
@@ -205,6 +230,8 @@ pub type State = record {
     tableVars: []str            // the batch's table variables (#@name), dropped after it
     pub fmtOnly: bool           // SET FMTONLY ON: a SELECT's columns only, nothing else run
     pub bulk: []BulkReq         // an INSERT BULK accepted: its rows come next (lexdb_tds), one at most
+    roTables: []str             // the table-valued parameters' temporary tables while their call runs (bindTable)
+    roParams: []str             // ... their parameters' names, parallel
 }
 
 // An INSERT BULK accepted (design/lexdb-tds.md, section 14): the table, the
@@ -215,9 +242,9 @@ pub type BulkReq = record { pub table: str; pub cols: []str; pub keepNulls: bool
 
 pub fn newState(spid: int): State {
     return State{nocount: false, xactAbort: false, implicitTx: false, quotedIdent: true, postgres: false, trancount: 0,
-                 rowcount: 0, error: 0, spid: spid, saves: [], committed: false, tryDepth: 0, jump: false,
+                 rowcount: 0, rowLimit: 0, error: 0, spid: spid, saves: [], committed: false, tryDepth: 0, jump: false,
                  pending: Caught{number: 0, message: "", severity: 0, state: 0}, caught: [], doomed: false, temps: [], tableVars: [],
-                 fmtOnly: false, bulk: []}
+                 fmtOnly: false, bulk: [], roTables: [], roParams: []}
 }
 
 // An error: to the client, or (in a TRY block) to its CATCH block.
@@ -398,7 +425,7 @@ fn (st: mut &State) sqlStmtWith(sess: mut &lexdb_exec.Session, s: &lexdb_sql.Stm
     let cmd = if bulk { CMD_BULK } else { cmdOf(s.kind) }
     // as SQL Server: an INSERT, UPDATE or DELETE runs in a transaction of
     // its own, nested, so @@TRANCOUNT inside it is one more
-    if s.kind == lexdb_sql.S_INSERT || s.kind == lexdb_sql.S_UPDATE || s.kind == lexdb_sql.S_DELETE {
+    if s.kind == lexdb_sql.S_INSERT || s.kind == lexdb_sql.S_UPDATE || s.kind == lexdb_sql.S_DELETE || s.kind == lexdb_sql.S_MERGE {
         f.vals[0] = Val.Int(max(st.trancount, if sess.status() == 'I' { 0 } else { 1 }) + 1)
     }
     let oids = f.oids()
@@ -460,6 +487,7 @@ fn (st: mut &State) sqlStmtWith(sess: mut &lexdb_exec.Session, s: &lexdb_sql.Stm
         var x = ev0(EV_ROWS)
         x.cols = replace(mut &res.cols, [])
         x.rows = replace(mut &res.rows, [])
+        if st.rowLimit > 0 && s.kind == lexdb_sql.S_SELECT && len(x.rows) > st.rowLimit { x.rows = copyRows(&x.rows, st.rowLimit) }
         append(ev, x)
     }
     if res.tag == "COMMIT" { st.committed = true }
@@ -468,6 +496,17 @@ fn (st: mut &State) sqlStmtWith(sess: mut &lexdb_exec.Session, s: &lexdb_sql.Stm
     // a #temporary table made: dropped with the connection
     if s.kind == lexdb_sql.S_CREATE && strings.startsWith(s.table, "#") && !strings.startsWith(s.table, "#@") { append(mut &st.temps, s.table) }
     return true
+}
+
+// The first n of rows.
+fn copyRows(rows: &[][]Val, n: int): [][]Val {
+    var out: [][]Val = []
+    for i in 0..n {
+        var r: []Val = []
+        for v in rows[i] { append(mut &r, v) }
+        append(mut &out, r)
+    }
+    return out
 }
 
 // A statement of lexdb's own (BEGIN, COMMIT, ...) for transaction control:
@@ -530,6 +569,7 @@ fn (st: mut &State) exec(sess: mut &lexdb_exec.Session, t: &lexdb_tsqlparse.TStm
             else if n == "implicit_transactions" { st.implicitTx = on }
             else if n == "quoted_identifier" { st.quotedIdent = on }
             else if n == "fmtonly" { st.fmtOnly = on }
+            else if n == "rowcount" { st.rowLimit = max(strings.parseIntOpt(&t.value).unwrapOr(0), 0) }
             else if n == "identity_insert" {
                 sess.setIdentityInsert(&(if on { t.names[1] } else { "" }))
                 break
@@ -635,7 +675,8 @@ pub fn run(sess: mut &lexdb_exec.Session, st: mut &State, sql: &str, f: mut &Fra
         st.runPg(sess, sql, ev)
         return
     }
-    let parsed = lexdb_tsqlparse.parseBatch(sql, lexdb_sql.Dialect{tsql: true, quotedIdent: st.quotedIdent}, &f.names)
+    let text = withTableTypes(sess, sql)
+    let parsed = lexdb_tsqlparse.parseBatch(&text, lexdb_sql.Dialect{tsql: true, quotedIdent: st.quotedIdent}, &f.names)
     if parsed.isErr() {
         let e = parsed.unwrapErr()
         errorEv(ev, &e)
@@ -644,6 +685,16 @@ pub fn run(sess: mut &lexdb_exec.Session, st: mut &State, sql: &str, f: mut &Fra
         return
     }
     let b = parsed.unwrap()
+    if len(st.roTables) > 0 {
+        // a table-valued parameter written to: the batch is not run (SQL Server finds it compiling)
+        match st.writesReadOnly(&b.stmts) {
+            Some(c) {
+                st.fail(ev, c, 0)
+                return
+            }
+            None {}
+        }
+    }
     let given = len(f.names)
     for k in given..len(b.vars) {
         let i = f.add(&b.vars[k], b.types[k - given], Val.Null)
@@ -675,6 +726,245 @@ pub fn run(sess: mut &lexdb_exec.Session, st: mut &State, sql: &str, f: mut &Fra
     while len(st.tableVars) > 0 {
         let tv = pop(mut &st.tableVars)
         let d = simple(sess, &("DROP TABLE IF EXISTS " + quoteName(&tv)))
+    }
+}
+
+// ---- table-valued parameters (design/lexdb-tds.md, "As built: table-valued parameters")
+//
+// A table-valued parameter @x of an RPC (lexdb_tds decodes it) is, while its
+// call runs, the temporary table tvpTable("@x") of the session: made from
+// its table type's definition (a CREATE TABLE of the type's text) and filled
+// with the client's rows; the call's SQL names it for @x (lexdb_tsqlparse's
+// renameVars), so it reads as any table in FROM, JOIN, IN (SELECT ...),
+// INSERT ... SELECT. Writing to it is SQL Server's 10700, found before the
+// batch runs. dropTables drops them when the call is done.
+
+// The temporary table of the table-valued parameter name (@x).
+pub fn tvpTable(name: &str): str {
+    let n = strings.toLowerAscii(name)
+    return "#tvp_" + (if strings.startsWith(&n, "@") { n[1..len(n)].toStr() } else { n })
+}
+
+const TVP_SAVE = "\"lexdb tsql tvp\""
+
+// Makes the table-valued parameter param (@x) of the table type tt: its
+// temporary table, and in it rows, each a value per column of sent (the
+// type's columns the client sent, by place; the rest take their defaults),
+// as the client sent them (srcTypes: their TDS types' names, for SQL
+// Server's messages). ncols: the columns the client described (-1: the
+// type's default, no rows). Errors as SQL Server's: 500 for another column
+// count, 1077 for a value of an identity column, conversion errors (257,
+// 245, 8114, 8115, 241, 8169, 206, 2628), 515 and 2627 for the type's own
+// constraints. In a transaction, under a savepoint: an error leaves it as
+// it was.
+pub fn bindTable(sess: mut &lexdb_exec.Session, st: mut &State, param: &str, tt: &lexdb_exec.TabType, ncols: int, sent: &[]int,
+                 srcTypes: &[]str, rows: mut &[][]Val): Result[Unit, DbErr] {
+    let tmp = tvpTable(param)
+    let inTx = sess.status() != 'I'
+    if inTx { let sp = simple(sess, &("SAVEPOINT " + TVP_SAVE)) }
+    let r = fillTable(sess, &tmp, param, tt, ncols, sent, srcTypes, rows)
+    if inTx {
+        if r.isErr() { let back = simple(sess, &("ROLLBACK TO SAVEPOINT " + TVP_SAVE)) }
+        let rel = simple(sess, &("RELEASE SAVEPOINT " + TVP_SAVE))
+    }
+    append(mut &st.roTables, tmp)
+    append(mut &st.roParams, param.toStr())
+    return r
+}
+
+fn fillTable(sess: mut &lexdb_exec.Session, tmp: &str, param: &str, tt: &lexdb_exec.TabType, ncols: int, sent: &[]int,
+             srcTypes: &[]str, rows: mut &[][]Val): Result[Unit, DbErr] {
+    let none: []Val = []
+    let nt: []int = []
+    let noVars: []str = []
+    let d0 = simple(sess, &("DROP TABLE IF EXISTS " + quoteName(tmp)))
+    var q = try lexdb_sql.tsqlParser(&tt.body, lexdb_sql.Dialect{tsql: true, quotedIdent: true}, &noVars)
+    let create = try q.tableDef(tmp)
+    let made = try sess.run(&create, &none, &nt)
+    let cols = try sess.tableColumns(tmp)
+    if ncols < 0 { return Ok(Unit{}) }
+    if ncols != len(cols) {
+        return Err(tsErr(500, "Trying to pass a table-valued parameter with " + ncols.toStr() + " column(s) where the corresponding " +
+                              "user-defined table type requires " + len(cols).toStr() + " column(s)."))
+    }
+    let decl = try sess.tableDecl(tmp)
+    var names: []str = []
+    for k in sent {
+        if cols[k].identity != lexdb_sql.ID_NONE { return Err(tsErr(1077, "INSERT into an identity column not allowed on table variables.")) }
+        append(mut &names, cols[k].name)
+    }
+    // a column SQL Server converts no value of (not even a NULL): text into binary
+    for j in 0..len(sent) {
+        let d = &decl[sent[j]]
+        let src = if j < len(srcTypes) { srcTypes[j] } else { "" }
+        let text = src == "nvarchar" || src == "varchar" || src == "nchar" || src == "char" || src == "ntext" || src == "text" || src == "xml"
+        if text && (d.typ == "varbinary" || d.typ == "binary" || d.typ == "image") {
+            let spec = if d.typ == "image" { "image" } else if d.maxLen < 0 { d.typ + "(max)" } else { d.typ + "(" + d.maxLen.toStr() + ")" }
+            return Err(tsErr(257, "Implicit conversion from data type " + src + " to " + spec + " is not allowed. Use the CONVERT function to run this query."))
+        }
+    }
+    // each value its column's type, as SQL Server converts a parameter's
+    for r in 0..len(rows) {
+        for j in 0..len(sent) {
+            if j >= len(rows[r]) { break }
+            let c = &cols[sent[j]]
+            var v = rows[r][j]
+            match v {
+                Val.Bool(b) { if c.typ.kind != lexdb_sql.K_BOOL { v = Val.Int(if b { 1 } else { 0 }) } }
+                else {}
+            }
+            match lexdb_exec.coerce(v, &c.typ) {
+                Ok(x) { rows[r][j] = x }
+                Err(e) { return Err(convErr(e, &(if j < len(srcTypes) { srcTypes[j].toStr() } else { "nvarchar" }), &decl[sent[j]], &rows[r][j], param)) }
+            }
+        }
+    }
+    if len(rows) == 0 { return Ok(Unit{}) }
+    var s = lexdb_sql.newStmt(lexdb_sql.S_COPY)
+    s.table = tmp.toStr()
+    s.names = names
+    s.copy.from = true
+    s.copy.bulk = true
+    s.copy.keepNulls = true
+    var all = replace(rows, [])
+    let pull = fn(): lexdb_exec.CopyPart { return lexdb_exec.CopyPart{rows: replace(mut &all, []), data: "", end: true, fail: "", proto: false} }
+    match sess.copyInFrom(&s, pull) {
+        Ok(_) { return Ok(Unit{}) }
+        Err(e) {
+            if e.state == "23502" {
+                let col = quotedName(&e.msg)
+                return Err(tsErr(515, "Cannot insert the value NULL into column '" + col + "', table '" + param + "'; column does not allow nulls. INSERT fails."))
+            }
+            if e.state == "22001" {
+                return Err(tsErr(2628, "String or binary data would be truncated in table '" + param + "'."))
+            }
+            if e.state == "23505" {
+                // SQL Server's words: the constraint (lexdb's name), the parameter as the object, the values
+                let con = quotedName(&e.msg)
+                let kind = if strings.endsWith(&con, "_pkey") { "PRIMARY KEY" } else { "UNIQUE KEY" }
+                var dup = ""
+                let eq = strings.indexOf(&e.detail, ")=(", 0)
+                let close = strings.lastIndexOf(&e.detail, ")")
+                if eq >= 0 && close > eq + 3 { dup = " The duplicate key value is (" + e.detail[eq + 3..close] + ")." }
+                return Err(tsErr(2627, "Violation of " + kind + " constraint '" + con + "'. Cannot insert duplicate key in object 'dbo." + param + "'." + dup))
+            }
+            return Err(e)
+        }
+    }
+}
+
+// SQL Server's error for a table-valued parameter's value v (of the TDS type
+// src) its column (d) cannot take; e: coerce's.
+fn convErr(e: DbErr, src: &str, d: &lexdb_exec.DeclCol, v: &Val, param: &str): DbErr {
+    let from = if src == "decimal" { "numeric" } else { src.toStr() }
+    let to = d.typ
+    let isNum = to == "decimal" || to == "numeric" || to == "money" || to == "smallmoney"
+    let isInt = to == "int" || to == "bigint" || to == "smallint" || to == "tinyint" || to == "bit"
+    let isTime = to == "date" || to == "time" || to == "datetime" || to == "datetime2" || to == "smalldatetime" || to == "datetimeoffset"
+    if e.state == "22001" {
+        return tsErr(2628, "String or binary data would be truncated in table '" + param + "', column '" + d.name + "'. Truncated value: '" +
+                           truncText(&lexdb_exec.text(v), d.maxLen, to == "nvarchar" || to == "nchar") + "'.")
+    }
+    if e.state == "22003" {
+        if isNum { return tsErr(8115, "Arithmetic overflow error converting " + from + " to data type numeric.") }
+        return tsErr(8115, "Arithmetic overflow error converting expression to data type " + to + ".")
+    }
+    if e.state == "42804" || e.state == "42846" { return tsErr(206, "Operand type clash: " + from + " is incompatible with " + to) }
+    if isTime { return tsErr(241, "Conversion failed when converting date and/or time from character string.") }
+    if to == "uniqueidentifier" { return tsErr(8169, "Conversion failed when converting from a character string to uniqueidentifier.") }
+    if isNum { return tsErr(8114, "Error converting data type " + from + " to numeric.") }
+    if to == "float" || to == "real" { return tsErr(8114, "Error converting data type " + from + " to " + to + ".") }
+    if to == "bigint" { return tsErr(8114, "Error converting data type " + from + " to bigint.") }
+    if isInt { return tsErr(245, "Conversion failed when converting the " + from + " value '" + lexdb_exec.text(v) + "' to data type " + to + ".") }
+    return e
+}
+
+// The first n characters of s (n bytes / 2 for an n-type), as SQL Server shows a truncated value.
+fn truncText(s: &str, maxLen: int, wide: bool): str {
+    let n = if maxLen <= 0 { len(s) } else if wide { maxLen / 2 } else { maxLen }
+    var out: []byte = []
+    var k = 0
+    var i = 0
+    while i < len(s) && k < n {
+        var j = i + 1
+        while j < len(s) && (s[j] & 0xC0) == 0x80 { j += 1 }
+        appendStr(mut &out, s[i..j])
+        k += 1
+        i = j
+    }
+    return strFromBytes(&out)
+}
+
+// The first statement of ts (any depth) that writes to a table-valued
+// parameter's table: SQL Server's 10700 for it (102 for TRUNCATE).
+fn (st: &State) writesReadOnly(ts: &[]lexdb_tsqlparse.TStmt): Option[Caught] {
+    for t in ts {
+        for s in t.stmt {
+            let k = s.kind
+            if k == lexdb_sql.S_INSERT || k == lexdb_sql.S_UPDATE || k == lexdb_sql.S_DELETE || k == lexdb_sql.S_MERGE || k == lexdb_sql.S_TRUNCATE {
+                var targets: []str = [s.table]
+                for n in s.names { if k == lexdb_sql.S_TRUNCATE { append(mut &targets, n) } }
+                // UPDATE x ... FROM @t x: the alias's table
+                if k == lexdb_sql.S_UPDATE || k == lexdb_sql.S_DELETE {
+                    for fi in s.from { if fi.alias == s.table && len(fi.table) > 0 { append(mut &targets, fi.table) } }
+                }
+                for x in targets {
+                    for i in 0..len(st.roTables) {
+                        if x == st.roTables[i] {
+                            if k == lexdb_sql.S_TRUNCATE {
+                                return Some(Caught{number: 102, message: "Incorrect syntax near '" + st.roParams[i] + "'.", severity: 15, state: 1})
+                            }
+                            return Some(Caught{number: 10700, message: "The table-valued parameter \"" + st.roParams[i] +
+                                                                       "\" is READONLY and cannot be modified.", severity: 16, state: 1})
+                        }
+                    }
+                }
+            }
+        }
+        match st.writesReadOnly(&t.body) {
+            Some(c) { return Some(c) }
+            None {}
+        }
+        match st.writesReadOnly(&t.els) {
+            Some(c) { return Some(c) }
+            None {}
+        }
+    }
+    return None
+}
+
+// sql with DECLARE @x name, name a table type, made DECLARE @x TABLE (its
+// definition): a table variable of the type.
+fn withTableTypes(sess: mut &lexdb_exec.Session, sql: &str): str {
+    let refs = lexdb_tsqlparse.userTypeDecls(sql)
+    if len(refs) == 0 { return sql.toStr() }
+    var out = newStrBuf()
+    var at = 0
+    for r in refs {
+        match sess.tableType(&r.key) {
+            Ok(x) {
+                match x {
+                    Some(tt) {
+                        out.add(sql[at..r.at])
+                        out.add("TABLE " + tt.body)
+                        at = r.end
+                    }
+                    None {}
+                }
+            }
+            Err(_) {}
+        }
+    }
+    out.add(sql[at..len(sql)])
+    return out.toStr()
+}
+
+// The table-valued parameters' tables of the call just run, dropped.
+pub fn dropTables(sess: mut &lexdb_exec.Session, st: mut &State) {
+    while len(st.roTables) > 0 {
+        let t = pop(mut &st.roTables)
+        let p = pop(mut &st.roParams)
+        let d = simple(sess, &("DROP TABLE IF EXISTS " + quoteName(&t)))
     }
 }
 
@@ -1094,8 +1384,210 @@ fn (st: mut &State) call(sess: mut &lexdb_exec.Session, t: &lexdb_tsqlparse.TStm
         doneEv(ev, if st.nocount { -1 } else { n }, CMD_SELECT, false)
         return F_NEXT
     }
+    let cat = catalogProcSql(&proc, &vals, &t.names)
+    if len(cat) > 0 {
+        var fr = newFrame()
+        return st.nested(sess, &cat, mut &fr, ev)
+    }
     st.fail(ev, Caught{number: 2812, message: "Could not find stored procedure '" + proc + "'.", severity: 16, state: 62}, 0)
     return if st.tryDepth > 0 { F_NEXT } else { F_END }
+}
+
+// ---- the catalog procedures a driver calls for its metadata (mssql-jdbc's DatabaseMetaData: sp_tables, sp_columns_100,
+// sp_pkeys, sp_fkeys, sp_statistics_100, sp_special_columns_100, sp_stored_procedures, sp_sproc_columns_100,
+// sp_datatype_info_100, sp_table_privileges, sp_column_privileges): each the SELECT that gives SQL Server's columns of the
+// same answer from lexdb's sys views. Their arguments: by name (@table_name = ...) or by place.
+
+// The argument named name (or at place pos, among those without a name) of a call: the SQL literal for it, "NULL" if none or NULL.
+fn argLit(vals: &[]Val, names: &[]str, name: str, pos: int): str {
+    for j in 0..len(vals) {
+        let pn = if 1 + j < len(names) { names[1 + j] } else { "" }
+        if (len(pn) > 0 && strings.toLowerAscii(pn) == name) || (len(pn) == 0 && j == pos) {
+            if lexdb_exec.isNull(&vals[j]) { return "NULL" }
+            return litOf(&vals[j])
+        }
+    }
+    return "NULL"
+}
+
+// "col LIKE lit" for a pattern argument, nothing for NULL (an empty owner or name matches nothing but a blank, as SQL Server's).
+fn likeCond(col: str, lit: str): str {
+    if lit == "NULL" { return "" }
+    return " AND " + col + " LIKE " + lit
+}
+
+// The JDBC/ODBC SQL type code of a system type's name.
+const SQLTYPE_CASE: str = "CASE ty.name WHEN 'int' THEN 4 WHEN 'bigint' THEN -5 WHEN 'smallint' THEN 5 WHEN 'tinyint' THEN -6 WHEN 'bit' THEN -7 " +
+    "WHEN 'decimal' THEN 3 WHEN 'numeric' THEN 2 WHEN 'money' THEN 3 WHEN 'smallmoney' THEN 3 WHEN 'float' THEN 6 WHEN 'real' THEN 7 " +
+    "WHEN 'varchar' THEN 12 WHEN 'char' THEN 1 WHEN 'nvarchar' THEN -9 WHEN 'nchar' THEN -15 WHEN 'text' THEN -1 WHEN 'ntext' THEN -16 " +
+    "WHEN 'datetime' THEN 93 WHEN 'smalldatetime' THEN 93 WHEN 'datetime2' THEN 93 WHEN 'date' THEN 91 WHEN 'time' THEN 92 " +
+    "WHEN 'datetimeoffset' THEN -155 WHEN 'varbinary' THEN -3 WHEN 'binary' THEN -2 WHEN 'image' THEN -4 WHEN 'uniqueidentifier' THEN 1 " +
+    "WHEN 'xml' THEN -152 WHEN 'sql_variant' THEN -150 WHEN 'timestamp' THEN -2 WHEN 'sysname' THEN -9 ELSE 12 END"
+
+// The column size (ODBC's PRECISION) of a column c of type ty.
+const SIZE_CASE: str = "CASE WHEN ty.name IN ('char', 'varchar', 'binary', 'varbinary') THEN CASE WHEN c.max_length < 0 THEN 2147483647 ELSE c.max_length END " +
+    "WHEN ty.name IN ('nchar', 'nvarchar') THEN CASE WHEN c.max_length < 0 THEN 1073741823 ELSE c.max_length / 2 END " +
+    "WHEN ty.name IN ('decimal', 'numeric') THEN c.precision WHEN ty.name = 'int' THEN 10 WHEN ty.name = 'bigint' THEN 19 WHEN ty.name = 'smallint' THEN 5 " +
+    "WHEN ty.name = 'tinyint' THEN 3 WHEN ty.name = 'bit' THEN 1 WHEN ty.name = 'float' THEN 15 WHEN ty.name = 'real' THEN 7 " +
+    "WHEN ty.name = 'money' THEN 19 WHEN ty.name = 'smallmoney' THEN 10 WHEN ty.name = 'datetime' THEN 23 WHEN ty.name = 'smalldatetime' THEN 16 " +
+    "WHEN ty.name = 'date' THEN 10 WHEN ty.name = 'time' THEN CASE WHEN c.scale > 0 THEN 9 + c.scale ELSE 8 END " +
+    "WHEN ty.name = 'datetime2' THEN CASE WHEN c.scale > 0 THEN 20 + c.scale ELSE 19 END " +
+    "WHEN ty.name = 'datetimeoffset' THEN CASE WHEN c.scale > 0 THEN 27 + c.scale ELSE 26 END WHEN ty.name = 'uniqueidentifier' THEN 36 " +
+    "WHEN ty.name IN ('text', 'ntext', 'image', 'xml') THEN 2147483647 ELSE c.max_length END"
+
+// sp_datatype_info_100: SQL Server 2022's own rows (mssql-jdbc's getTypeInfo).
+const DATATYPE_INFO_SQL: str = "SELECT TYPE_NAME = CONVERT(nvarchar(128), 'datetimeoffset'), DATA_TYPE = CONVERT(smallint, -155), PRECISION = CONVERT(int, 34), LITERAL_PREFIX = CONVERT(varchar(32), ''''), LITERAL_SUFFIX = CONVERT(varchar(32), ''''), CREATE_PARAMS = CONVERT(varchar(32), 'scale'), NULLABLE = CONVERT(smallint, 1), CASE_SENSITIVE = CONVERT(smallint, 0), SEARCHABLE = CONVERT(smallint, 3), UNSIGNED_ATTRIBUTE = CONVERT(smallint, NULL), FIXED_PREC_SCALE = CONVERT(smallint, 0), AUTO_INCREMENT = CONVERT(smallint, NULL), LOCAL_TYPE_NAME = CONVERT(nvarchar(128), 'datetimeoffset'), MINIMUM_SCALE = CONVERT(smallint, 0), MAXIMUM_SCALE = CONVERT(smallint, 7), SQL_DATA_TYPE = CONVERT(smallint, -155), SQL_DATETIME_SUB = CONVERT(smallint, 0), NUM_PREC_RADIX = CONVERT(int, NULL), INTERVAL_PRECISION = CONVERT(smallint, NULL), USERTYPE = CONVERT(smallint, 0) UNION ALL SELECT 'time', 92, 16, '''', '''', 'scale', 1, 0, 3, NULL, 0, NULL, 'time', 0, 7, -154, 0, NULL, NULL, 0 UNION ALL SELECT 'xml', -16, 0, 'N''', '''', NULL, 1, 1, 0, NULL, 0, NULL, 'xml', NULL, NULL, -152, NULL, NULL, NULL, 0 UNION ALL SELECT 'sql_variant', -150, 8000, NULL, NULL, NULL, 1, 0, 2, NULL, 0, NULL, 'sql_variant', 0, 0, -150, NULL, 10, NULL, 0 UNION ALL SELECT 'uniqueidentifier', 1, 36, '''', '''', NULL, 1, 0, 2, NULL, 0, NULL, 'uniqueidentifier', NULL, NULL, -11, NULL, NULL, NULL, 0 UNION ALL SELECT 'ntext', -16, 1073741823, 'N''', '''', NULL, 1, 0, 1, NULL, 0, NULL, 'ntext', NULL, NULL, -10, NULL, NULL, NULL, 0 UNION ALL SELECT 'nvarchar', -9, 4000, 'N''', '''', 'max length', 1, 0, 3, NULL, 0, NULL, 'nvarchar', NULL, NULL, -9, NULL, NULL, NULL, 0 UNION ALL SELECT 'sysname', -9, 128, 'N''', '''', NULL, 0, 0, 3, NULL, 0, NULL, 'sysname', NULL, NULL, -9, NULL, NULL, NULL, 18 UNION ALL SELECT 'nchar', -15, 4000, 'N''', '''', 'length', 1, 0, 3, NULL, 0, NULL, 'nchar', NULL, NULL, -8, NULL, NULL, NULL, 0 UNION ALL SELECT 'bit', -7, 1, NULL, NULL, NULL, 1, 0, 2, NULL, 0, NULL, 'bit', 0, 0, -7, NULL, NULL, NULL, 16 UNION ALL SELECT 'tinyint', -6, 3, NULL, NULL, NULL, 1, 0, 2, 1, 0, 0, 'tinyint', 0, 0, -6, NULL, 10, NULL, 5 UNION ALL SELECT 'tinyint identity', -6, 3, NULL, NULL, NULL, 0, 0, 2, 1, 0, 1, 'tinyint identity', 0, 0, -6, NULL, 10, NULL, 5 UNION ALL SELECT 'bigint', -5, 19, NULL, NULL, NULL, 1, 0, 2, 0, 0, 0, 'bigint', 0, 0, -5, NULL, 10, NULL, 0 UNION ALL SELECT 'bigint identity', -5, 19, NULL, NULL, NULL, 0, 0, 2, 0, 0, 1, 'bigint identity', 0, 0, -5, NULL, 10, NULL, 0 UNION ALL SELECT 'image', -4, 2147483647, '0x', NULL, NULL, 1, 0, 0, NULL, 0, NULL, 'image', NULL, NULL, -4, NULL, NULL, NULL, 20 UNION ALL SELECT 'varbinary', -3, 8000, '0x', NULL, 'max length', 1, 0, 2, NULL, 0, NULL, 'varbinary', NULL, NULL, -3, NULL, NULL, NULL, 4 UNION ALL SELECT 'binary', -2, 8000, '0x', NULL, 'length', 1, 0, 2, NULL, 0, NULL, 'binary', NULL, NULL, -2, NULL, NULL, NULL, 3 UNION ALL SELECT 'timestamp', -2, 8, '0x', NULL, NULL, 0, 0, 2, NULL, 0, NULL, 'timestamp', NULL, NULL, -2, NULL, NULL, NULL, 80 UNION ALL SELECT 'text', -1, 2147483647, '''', '''', NULL, 1, 0, 1, NULL, 0, NULL, 'text', NULL, NULL, -1, NULL, NULL, NULL, 19 UNION ALL SELECT 'char', 1, 8000, '''', '''', 'length', 1, 0, 3, NULL, 0, NULL, 'char', NULL, NULL, 1, NULL, NULL, NULL, 1 UNION ALL SELECT 'numeric', 2, 38, NULL, NULL, 'precision,scale', 1, 0, 2, 0, 0, 0, 'numeric', 0, 38, 2, NULL, 10, NULL, 10 UNION ALL SELECT 'numeric() identity', 2, 38, NULL, NULL, 'precision', 0, 0, 2, 0, 0, 1, 'numeric() identity', 0, 0, 2, NULL, 10, NULL, 10 UNION ALL SELECT 'decimal', 3, 38, NULL, NULL, 'precision,scale', 1, 0, 2, 0, 0, 0, 'decimal', 0, 38, 3, NULL, 10, NULL, 24 UNION ALL SELECT 'money', 3, 19, '$', NULL, NULL, 1, 0, 2, 0, 1, 0, 'money', 4, 4, 3, NULL, 10, NULL, 11 UNION ALL SELECT 'smallmoney', 3, 10, '$', NULL, NULL, 1, 0, 2, 0, 1, 0, 'smallmoney', 4, 4, 3, NULL, 10, NULL, 21 UNION ALL SELECT 'decimal() identity', 3, 38, NULL, NULL, 'precision', 0, 0, 2, 0, 0, 1, 'decimal() identity', 0, 0, 3, NULL, 10, NULL, 24 UNION ALL SELECT 'int', 4, 10, NULL, NULL, NULL, 1, 0, 2, 0, 0, 0, 'int', 0, 0, 4, NULL, 10, NULL, 7 UNION ALL SELECT 'int identity', 4, 10, NULL, NULL, NULL, 0, 0, 2, 0, 0, 1, 'int identity', 0, 0, 4, NULL, 10, NULL, 7 UNION ALL SELECT 'smallint', 5, 5, NULL, NULL, NULL, 1, 0, 2, 0, 0, 0, 'smallint', 0, 0, 5, NULL, 10, NULL, 6 UNION ALL SELECT 'smallint identity', 5, 5, NULL, NULL, NULL, 0, 0, 2, 0, 0, 1, 'smallint identity', 0, 0, 5, NULL, 10, NULL, 6 UNION ALL SELECT 'float', 8, 53, NULL, NULL, NULL, 1, 0, 2, 0, 0, 0, 'float', NULL, NULL, 6, NULL, 2, NULL, 8 UNION ALL SELECT 'real', 7, 24, NULL, NULL, NULL, 1, 0, 2, 0, 0, 0, 'real', NULL, NULL, 7, NULL, 2, NULL, 23 UNION ALL SELECT 'varchar', 12, 8000, '''', '''', 'max length', 1, 0, 3, NULL, 0, NULL, 'varchar', NULL, NULL, 12, NULL, NULL, NULL, 2 UNION ALL SELECT 'date', 91, 10, '''', '''', NULL, 1, 0, 3, NULL, 0, NULL, 'date', NULL, 0, 9, 1, NULL, NULL, 0 UNION ALL SELECT 'datetime2', 93, 27, '''', '''', 'scale', 1, 0, 3, NULL, 0, NULL, 'datetime2', 0, 7, 9, 3, NULL, NULL, 0 UNION ALL SELECT 'datetime', 93, 23, '''', '''', NULL, 1, 0, 3, NULL, 0, NULL, 'datetime', 3, 3, 9, 3, NULL, NULL, 12 UNION ALL SELECT 'smalldatetime', 93, 16, '''', '''', NULL, 1, 0, 3, NULL, 0, NULL, 'smalldatetime', 0, 0, 9, 3, NULL, NULL, 22"
+
+fn catalogProcSql(proc: &str, vals: &[]Val, names: &[]str): str {
+    let p = strings.toLowerAscii(proc)
+    let db = "db_name()"
+    if p == "sp_tables" {
+        let nm = argLit(vals, names, "@table_name", 0)
+        let ow = argLit(vals, names, "@table_owner", 1)
+        let tt = argLit(vals, names, "@table_type", 3)
+        var cond = likeCond("o.name", nm) + likeCond("schema_name(o.schema_id)", ow)
+        if tt != "NULL" {
+            var kinds: []str = []
+            let up = strings.toUpperAscii(tt)
+            if strings.contains(&up, "TABLE") && !strings.contains(&up, "SYSTEM TABLE") { append(mut &kinds, "'U'") }
+            if strings.contains(&up, "SYSTEM TABLE") { append(mut &kinds, "'S'") }
+            if strings.contains(&up, "VIEW") { append(mut &kinds, "'V'") }
+            if len(kinds) == 0 { append(mut &kinds, "'~'") }
+            cond = cond + " AND o.type IN (" + strings.join(&kinds, ", ") + ")"
+        }
+        return "SELECT TABLE_QUALIFIER = CONVERT(sysname, " + db + "), TABLE_OWNER = CONVERT(sysname, schema_name(o.schema_id)), TABLE_NAME = CONVERT(sysname, o.name), " +
+               "TABLE_TYPE = CONVERT(varchar(32), CASE o.type WHEN 'U' THEN 'TABLE' WHEN 'V' THEN 'VIEW' ELSE 'SYSTEM TABLE' END), REMARKS = CONVERT(varchar(254), NULL) " +
+               "FROM sys.all_objects o WHERE o.type IN ('U', 'V', 'S')" + cond + " ORDER BY 4, 2, 3"
+    }
+    if strings.startsWith(&p, "sp_columns") {
+        let nm = argLit(vals, names, "@table_name", 0)
+        let ow = argLit(vals, names, "@table_owner", 1)
+        let cn = argLit(vals, names, "@column_name", 3)
+        let cond = likeCond("o.name", nm) + likeCond("schema_name(o.schema_id)", ow) + likeCond("c.name", cn)
+        return "SELECT TABLE_QUALIFIER = CONVERT(sysname, " + db + "), TABLE_OWNER = CONVERT(sysname, schema_name(o.schema_id)), TABLE_NAME = CONVERT(sysname, o.name), " +
+               "COLUMN_NAME = CONVERT(sysname, c.name), DATA_TYPE = CONVERT(smallint, " + SQLTYPE_CASE + "), " +
+               "TYPE_NAME = CONVERT(sysname, ty.name + CASE WHEN c.is_identity = 1 THEN ' identity' ELSE '' END), PRECISION = CONVERT(int, " + SIZE_CASE + "), " +
+               "LENGTH = CONVERT(int, CASE WHEN ty.name IN ('decimal', 'numeric') THEN c.precision + 2 WHEN ty.name = 'datetime2' THEN 16 WHEN ty.name = 'datetimeoffset' THEN 20 " +
+               "WHEN ty.name = 'time' THEN 12 WHEN ty.name = 'date' THEN 6 WHEN ty.name IN ('nchar', 'nvarchar') THEN c.max_length ELSE CASE WHEN c.max_length < 0 THEN 2147483647 ELSE c.max_length END END), " +
+               "SCALE = CONVERT(smallint, CASE WHEN ty.name IN ('decimal', 'numeric', 'datetime2', 'datetimeoffset', 'time') THEN c.scale " +
+               "WHEN ty.name IN ('int', 'bigint', 'smallint', 'tinyint', 'money', 'smallmoney') THEN CASE WHEN ty.name IN ('money') THEN 4 WHEN ty.name = 'smallmoney' THEN 4 ELSE 0 END ELSE NULL END), " +
+               "RADIX = CONVERT(smallint, CASE WHEN ty.name IN ('decimal', 'numeric', 'int', 'bigint', 'smallint', 'tinyint', 'money', 'smallmoney') THEN 10 WHEN ty.name IN ('float', 'real') THEN 2 ELSE NULL END), " +
+               "NULLABLE = CONVERT(smallint, c.is_nullable), REMARKS = CONVERT(varchar(254), NULL), COLUMN_DEF = CONVERT(nvarchar(4000), NULL), " +
+               "SQL_DATA_TYPE = CONVERT(smallint, CASE WHEN ty.name IN ('datetime2', 'datetimeoffset', 'time', 'date', 'datetime', 'smalldatetime') THEN 9 ELSE " + SQLTYPE_CASE + " END), " +
+               "SQL_DATETIME_SUB = CONVERT(smallint, CASE WHEN ty.name IN ('datetime2', 'datetimeoffset', 'time', 'datetime', 'smalldatetime') THEN 3 WHEN ty.name = 'date' THEN 1 ELSE NULL END), " +
+               "CHAR_OCTET_LENGTH = CONVERT(int, CASE WHEN ty.name IN ('char', 'varchar', 'nchar', 'nvarchar', 'binary', 'varbinary') THEN CASE WHEN c.max_length < 0 THEN 2147483647 ELSE c.max_length END ELSE NULL END), " +
+               "ORDINAL_POSITION = CONVERT(int, c.column_id), IS_NULLABLE = CONVERT(varchar(254), CASE WHEN c.is_nullable = 1 THEN 'YES' ELSE 'NO' END), " +
+               "SS_IS_SPARSE = CONVERT(smallint, 0), SS_IS_COLUMN_SET = CONVERT(smallint, 0), SS_IS_COMPUTED = CONVERT(smallint, c.is_computed), SS_IS_IDENTITY = CONVERT(smallint, c.is_identity), " +
+               "SS_UDT_CATALOG_NAME = CONVERT(nvarchar(128), NULL), SS_UDT_SCHEMA_NAME = CONVERT(nvarchar(128), NULL), SS_UDT_ASSEMBLY_TYPE_NAME = CONVERT(nvarchar(max), NULL), " +
+               "SS_XML_SCHEMACOLLECTION_CATALOG_NAME = CONVERT(nvarchar(128), NULL), SS_XML_SCHEMACOLLECTION_SCHEMA_NAME = CONVERT(nvarchar(128), NULL), " +
+               "SS_XML_SCHEMACOLLECTION_NAME = CONVERT(nvarchar(128), NULL), SS_DATA_TYPE = CONVERT(tinyint, CASE WHEN ty.name = 'int' THEN CASE WHEN c.is_nullable = 1 THEN 38 ELSE 56 END " +
+               "WHEN ty.name IN ('varchar') THEN 39 WHEN ty.name IN ('decimal') THEN 106 WHEN ty.name IN ('numeric') THEN 108 WHEN ty.name = 'datetime2' THEN 0 ELSE c.system_type_id END) " +
+               "FROM sys.all_columns c JOIN sys.all_objects o ON o.object_id = c.object_id JOIN sys.types ty ON ty.user_type_id = c.user_type_id " +
+               "WHERE o.type IN ('U', 'V', 'S')" + cond + " ORDER BY 2, 3, c.column_id"
+    }
+    if p == "sp_pkeys" {
+        let nm = argLit(vals, names, "@table_name", 0)
+        let ow = argLit(vals, names, "@table_owner", 1)
+        var cond = ""
+        if nm != "NULL" { cond = cond + " AND o.name = " + nm }
+        if ow != "NULL" { cond = cond + " AND schema_name(o.schema_id) = " + ow }
+        return "SELECT TABLE_QUALIFIER = CONVERT(sysname, " + db + "), TABLE_OWNER = CONVERT(sysname, schema_name(o.schema_id)), TABLE_NAME = CONVERT(sysname, o.name), " +
+               "COLUMN_NAME = CONVERT(sysname, c.name), KEY_SEQ = CONVERT(smallint, ic.key_ordinal), PK_NAME = CONVERT(sysname, i.name) " +
+               "FROM sys.indexes i JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id " +
+               "JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id JOIN sys.objects o ON o.object_id = i.object_id " +
+               "WHERE i.is_primary_key = 1" + cond + " ORDER BY 3, ic.key_ordinal"
+    }
+    if p == "sp_fkeys" {
+        let pn = argLit(vals, names, "@pktable_name", 0)
+        let po = argLit(vals, names, "@pktable_owner", 1)
+        let fn2 = argLit(vals, names, "@fktable_name", 3)
+        let fo = argLit(vals, names, "@fktable_owner", 4)
+        var cond = ""
+        if pn != "NULL" { cond = cond + " AND po.name = " + pn }
+        if po != "NULL" { cond = cond + " AND schema_name(po.schema_id) = " + po }
+        if fn2 != "NULL" { cond = cond + " AND fo.name = " + fn2 }
+        if fo != "NULL" { cond = cond + " AND schema_name(fo.schema_id) = " + fo }
+        return "SELECT PKTABLE_QUALIFIER = CONVERT(sysname, " + db + "), PKTABLE_OWNER = CONVERT(sysname, schema_name(po.schema_id)), PKTABLE_NAME = CONVERT(sysname, po.name), " +
+               "PKCOLUMN_NAME = CONVERT(sysname, pc.name), FKTABLE_QUALIFIER = CONVERT(sysname, " + db + "), FKTABLE_OWNER = CONVERT(sysname, schema_name(fo.schema_id)), " +
+               "FKTABLE_NAME = CONVERT(sysname, fo.name), FKCOLUMN_NAME = CONVERT(sysname, fc.name), KEY_SEQ = CONVERT(smallint, k.constraint_column_id), " +
+               "UPDATE_RULE = CONVERT(smallint, CASE f.update_referential_action WHEN 0 THEN 1 WHEN 1 THEN 0 ELSE f.update_referential_action END), " +
+               "DELETE_RULE = CONVERT(smallint, CASE f.delete_referential_action WHEN 0 THEN 1 WHEN 1 THEN 0 ELSE f.delete_referential_action END), " +
+               "FK_NAME = CONVERT(sysname, f.name), PK_NAME = CONVERT(sysname, pi.name), DEFERRABILITY = CONVERT(smallint, 7) " +
+               "FROM sys.foreign_keys f JOIN sys.foreign_key_columns k ON k.constraint_object_id = f.object_id JOIN sys.objects po ON po.object_id = f.referenced_object_id " +
+               "JOIN sys.objects fo ON fo.object_id = f.parent_object_id JOIN sys.columns pc ON pc.object_id = k.referenced_object_id AND pc.column_id = k.referenced_column_id " +
+               "JOIN sys.columns fc ON fc.object_id = k.parent_object_id AND fc.column_id = k.parent_column_id " +
+               "LEFT JOIN sys.indexes pi ON pi.object_id = f.referenced_object_id AND pi.index_id = f.key_index_id WHERE 1 = 1" + cond +
+               " ORDER BY 3, 7, 12, k.constraint_column_id"
+    }
+    if p == "sp_statistics" || p == "sp_statistics_100" {
+        let nm = argLit(vals, names, "@table_name", 0)
+        let ow = argLit(vals, names, "@table_owner", 1)
+        let un = argLit(vals, names, "@is_unique", 4)
+        var cond = ""
+        if nm != "NULL" { cond = cond + " AND o.name = " + nm }
+        if ow != "NULL" { cond = cond + " AND schema_name(o.schema_id) = " + ow }
+        var cond2 = cond
+        if un == "'Y'" || un == "N'Y'" { cond2 = cond2 + " AND i.is_unique = 1" }
+        return "SELECT TABLE_QUALIFIER = CONVERT(sysname, " + db + "), TABLE_OWNER = CONVERT(sysname, schema_name(o.schema_id)), TABLE_NAME = CONVERT(sysname, o.name), " +
+               "NON_UNIQUE = CONVERT(smallint, NULL), INDEX_QUALIFIER = CONVERT(sysname, NULL), INDEX_NAME = CONVERT(sysname, NULL), TYPE = CONVERT(smallint, 0), " +
+               "SEQ_IN_INDEX = CONVERT(smallint, NULL), COLUMN_NAME = CONVERT(sysname, NULL), COLLATION = CONVERT(char(1), NULL), CARDINALITY = CONVERT(int, 0), " +
+               "PAGES = CONVERT(int, 0), FILTER_CONDITION = CONVERT(varchar(128), NULL) FROM sys.objects o WHERE o.type IN ('U', 'V')" + cond +
+               " UNION ALL " +
+               "SELECT CONVERT(sysname, " + db + "), CONVERT(sysname, schema_name(o.schema_id)), CONVERT(sysname, o.name), CONVERT(smallint, CASE WHEN i.is_unique = 1 THEN 0 ELSE 1 END), " +
+               "CONVERT(sysname, o.name), CONVERT(sysname, i.name), CONVERT(smallint, CASE WHEN i.type = 1 THEN 1 ELSE 3 END), CONVERT(smallint, ic.key_ordinal), " +
+               "CONVERT(sysname, c.name), CONVERT(char(1), CASE WHEN ic.is_descending_key = 1 THEN 'D' ELSE 'A' END), CONVERT(int, CASE WHEN i.type = 1 THEN 0 ELSE NULL END), CONVERT(int, CASE WHEN i.type = 1 THEN 0 ELSE NULL END), CONVERT(varchar(128), NULL) " +
+               "FROM sys.indexes i JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.key_ordinal > 0 " +
+               "JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id JOIN sys.objects o ON o.object_id = i.object_id " +
+               "WHERE i.type > 0" + cond2 + " ORDER BY 4, 7, 6, 8"
+    }
+    if strings.startsWith(&p, "sp_special_columns") {
+        let nm = argLit(vals, names, "@table_name", 0)
+        let ow = argLit(vals, names, "@table_owner", 1)
+        let ct = argLit(vals, names, "@col_type", 3)
+        var cond = ""
+        if nm != "NULL" { cond = cond + " AND o.name = " + nm }
+        if ow != "NULL" { cond = cond + " AND schema_name(o.schema_id) = " + ow }
+        if ct == "'V'" || ct == "N'V'" { cond = cond + " AND 1 = 0" }       // version columns: lexdb has none
+        return "SELECT SCOPE = CONVERT(smallint, 1), COLUMN_NAME = CONVERT(sysname, c.name), DATA_TYPE = CONVERT(smallint, " + SQLTYPE_CASE + "), " +
+               "TYPE_NAME = CONVERT(sysname, ty.name), PRECISION = CONVERT(int, " + SIZE_CASE + "), LENGTH = CONVERT(int, c.max_length), " +
+               "SCALE = CONVERT(smallint, CASE WHEN ty.name IN ('decimal', 'numeric') THEN c.scale WHEN ty.name IN ('int', 'bigint', 'smallint', 'tinyint') THEN 0 ELSE NULL END), PSEUDO_COLUMN = CONVERT(smallint, 1) " +
+               "FROM sys.indexes i JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id " +
+               "JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id JOIN sys.types ty ON ty.user_type_id = c.user_type_id " +
+               "JOIN sys.objects o ON o.object_id = i.object_id WHERE i.is_primary_key = 1" + cond + " ORDER BY ic.key_ordinal"
+    }
+    if strings.startsWith(&p, "sp_datatype_info") { return DATATYPE_INFO_SQL }
+    if p == "sp_stored_procedures" {
+        return "SELECT PROCEDURE_QUALIFIER = CONVERT(sysname, " + db + "), PROCEDURE_OWNER = CONVERT(sysname, NULL), PROCEDURE_NAME = CONVERT(nvarchar(134), NULL), " +
+               "NUM_INPUT_PARAMS = CONVERT(int, NULL), NUM_OUTPUT_PARAMS = CONVERT(int, NULL), NUM_RESULT_SETS = CONVERT(int, NULL), REMARKS = CONVERT(varchar(254), NULL), " +
+               "PROCEDURE_TYPE = CONVERT(smallint, NULL) WHERE 1 = 0"
+    }
+    if p == "sp_sproc_columns" || p == "sp_sproc_columns_100" {
+        return "SELECT PROCEDURE_QUALIFIER = CONVERT(sysname, " + db + "), PROCEDURE_OWNER = CONVERT(sysname, NULL), PROCEDURE_NAME = CONVERT(nvarchar(134), NULL), " +
+               "COLUMN_NAME = CONVERT(sysname, NULL), COLUMN_TYPE = CONVERT(smallint, NULL), DATA_TYPE = CONVERT(smallint, NULL), TYPE_NAME = CONVERT(sysname, NULL), " +
+               "PRECISION = CONVERT(int, NULL), LENGTH = CONVERT(int, NULL), SCALE = CONVERT(smallint, NULL), RADIX = CONVERT(smallint, NULL), NULLABLE = CONVERT(smallint, NULL), " +
+               "REMARKS = CONVERT(varchar(254), NULL), COLUMN_DEF = CONVERT(nvarchar(4000), NULL), SQL_DATA_TYPE = CONVERT(smallint, NULL), SQL_DATETIME_SUB = CONVERT(smallint, NULL), " +
+               "CHAR_OCTET_LENGTH = CONVERT(int, NULL), ORDINAL_POSITION = CONVERT(int, NULL), IS_NULLABLE = CONVERT(varchar(254), NULL), SS_TYPE_CATALOG_NAME = CONVERT(nvarchar(128), NULL), " +
+               "SS_TYPE_SCHEMA_NAME = CONVERT(nvarchar(128), NULL), SS_UDT_CATALOG_NAME = CONVERT(nvarchar(128), NULL), SS_UDT_SCHEMA_NAME = CONVERT(nvarchar(128), NULL), " +
+               "SS_UDT_ASSEMBLY_TYPE_NAME = CONVERT(nvarchar(max), NULL), SS_XML_SCHEMACOLLECTION_CATALOG_NAME = CONVERT(nvarchar(128), NULL), " +
+               "SS_XML_SCHEMACOLLECTION_SCHEMA_NAME = CONVERT(nvarchar(128), NULL), SS_XML_SCHEMACOLLECTION_NAME = CONVERT(nvarchar(128), NULL), SS_DATA_TYPE = CONVERT(tinyint, NULL) WHERE 1 = 0"
+    }
+    if p == "sp_table_privileges" || p == "sp_column_privileges" {
+        let col = p == "sp_column_privileges"
+        let nm = argLit(vals, names, "@table_name", 0)
+        let ow = argLit(vals, names, "@table_owner", 1)
+        var cond = ""
+        if nm != "NULL" { cond = cond + " AND o.name = " + nm }
+        if ow != "NULL" { cond = cond + " AND schema_name(o.schema_id) = " + ow }
+        if col { cond = cond + likeCond("c.name", argLit(vals, names, "@column_name", 3)) }
+        return "SELECT TABLE_QUALIFIER = CONVERT(sysname, " + db + "), TABLE_OWNER = CONVERT(sysname, schema_name(o.schema_id)), TABLE_NAME = CONVERT(sysname, o.name), " +
+               (if col { "COLUMN_NAME = CONVERT(sysname, c.name), " } else { "" }) + "GRANTOR = CONVERT(sysname, 'dbo'), GRANTEE = CONVERT(sysname, 'dbo'), " +
+               "PRIVILEGE = CONVERT(varchar(32), pv.p), IS_GRANTABLE = CONVERT(varchar(3), 'YES') FROM sys.objects o " +
+               (if col { "JOIN sys.columns c ON c.object_id = o.object_id " } else { "" }) +
+               "CROSS JOIN (SELECT 'DELETE' p UNION ALL SELECT 'INSERT' UNION ALL SELECT 'REFERENCES' UNION ALL SELECT 'SELECT' UNION ALL SELECT 'UPDATE') pv " +
+               (if col { "" } else { "" }) +
+               "WHERE o.type IN ('U', 'V')" + (if col { " AND pv.p <> 'DELETE'" } else { "" }) + cond + " ORDER BY 3, " + (if col { "4, " } else { "" }) + "pv.p"
+    }
+    return ""
 }
 
 // xp_msver's rows, as SQL Server 2022's: name|internal value|character value.
@@ -1126,7 +1618,8 @@ fn litOf(v: &Val): str {
 // A batch run inside this one (EXEC (string), sp_executesql), with its own
 // variables fr; its errors end it, not the batch that ran it.
 fn (st: mut &State) nested(sess: mut &lexdb_exec.Session, sql: &str, fr: mut &Frame, ev: mut &[]Event): int {
-    let parsed = lexdb_tsqlparse.parseBatch(sql, lexdb_sql.Dialect{tsql: true, quotedIdent: st.quotedIdent}, &fr.names)
+    let text = withTableTypes(sess, sql)
+    let parsed = lexdb_tsqlparse.parseBatch(&text, lexdb_sql.Dialect{tsql: true, quotedIdent: st.quotedIdent}, &fr.names)
     if parsed.isErr() {
         let e = parsed.unwrapErr()
         st.failErr(ev, &e, 0)
