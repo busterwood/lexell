@@ -1,0 +1,177 @@
+// lexdb_store: the log in a directory of its own (--log-dir, design/lexdb.md
+// 9.124), on two simulated file systems. The start-up check refuses the
+// wrong log: a data directory made with a log directory started without
+// one, or with an empty one, or with another database's; one made without
+// started with one; a new database given a log directory that already
+// holds a log. Then crashes (both file systems crash, each its own way):
+// the acknowledged commits are recovered, the log segments and the spare
+// are only ever in the log directory, and the data file only in the data
+// directory.
+// expect: refusals 8 ok
+// expect: seeds 30 crashes 90 ok 90 split 90
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_base"
+import "strings"
+
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: 3 * 2048, segBytes: 16 * 4096, ckptBytes: 6 * 4096, snapNodes: 1000}
+}
+
+fn key(i: int): str { return "key" + strings.padLeft(i.toStr(), 5, '0') }
+
+// A tree with n keys, or the error.
+fn make(st: lexdb_store.Store, n: int): int {
+    var t = lexdb_store.begin()
+    let tree = st.createTree(mut &t)
+    for i in 0..n { t.put(tree, key(i), "v" + i.toStr()).unwrap() }
+    st.commit(t).unwrap()
+    return tree
+}
+
+// "" when the run is refused with a message containing want, else what happened.
+fn refused(r: Result[int, lexdb_base.DbErr], want: str): str {
+    match r {
+        Ok(_) { return "was not refused (wanted " + want + ")" }
+        Err(e) {
+            if strings.contains(e.toStr(), want) { return "" }
+            return "refused with " + e.toStr() + " (wanted " + want + ")"
+        }
+    }
+}
+
+fn noop(st: lexdb_store.Store): int { return 0 }
+
+fn refusals(): int {
+    var ok = 0
+    // made with a log directory
+    let d = lexdb_disk.sim(1)
+    let l = lexdb_disk.sim(2)
+    lexdb_store.runSplit(d, l, opts(), fn(st: lexdb_store.Store): int { return make(st, 10) }).unwrap()
+    var bad: []str = []
+    append(mut &bad, refused(lexdb_store.run(d, opts(), noop), "start it with --log-dir"))
+    append(mut &bad, refused(lexdb_store.runSplit(d, lexdb_disk.sim(3), opts(), noop), "missing or is not this database's"))
+    // another database's log directory
+    let d2 = lexdb_disk.sim(4)
+    let l2 = lexdb_disk.sim(5)
+    lexdb_store.runSplit(d2, l2, opts(), fn(st: lexdb_store.Store): int { return make(st, 3) }).unwrap()
+    append(mut &bad, refused(lexdb_store.runSplit(d, l2, opts(), noop), "another database"))
+    // a data directory made without one
+    let p = lexdb_disk.sim(6)
+    lexdb_store.run(p, opts(), fn(st: lexdb_store.Store): int { return make(st, 10) }).unwrap()
+    append(mut &bad, refused(lexdb_store.runSplit(p, lexdb_disk.sim(7), opts(), noop), "without --log-dir"))
+    if p.exists(lexdb_store.LOGDIR_MARK) { append(mut &bad, "a plain directory got a log mark") }
+    // a new database, a log directory with a log
+    append(mut &bad, refused(lexdb_store.runSplit(lexdb_disk.sim(8), l, opts(), noop), "already holds a log"))
+    // a log directory that has run a while: log.57, no log.1, no log.2, no spare
+    let old = lexdb_disk.sim(9)
+    old.open("log.57", true).unwrap().close()
+    append(mut &bad, refused(lexdb_store.runSplit(lexdb_disk.sim(10), old, opts(), noop), "already holds a log"))
+    let junk = lexdb_disk.sim(11)
+    junk.open("notes.txt", true).unwrap().close()
+    append(mut &bad, refused(lexdb_store.runSplit(lexdb_disk.sim(12), junk, opts(), noop), "not empty"))
+    // a data directory with only a high-numbered segment is not new
+    let hi = lexdb_disk.sim(13)
+    hi.open("log.57", true).unwrap().close()
+    append(mut &bad, refused(lexdb_store.runSplit(hi, lexdb_disk.sim(14), opts(), noop), "without --log-dir"))
+    // the good ones still start: both, with their own logs
+    let a = lexdb_store.runSplit(d, l, opts(), fn(st: lexdb_store.Store): int { return 1 })
+    if a.isErr() { append(mut &bad, "d with l: " + a.unwrapErr().toStr()) }
+    let b = lexdb_store.run(p, opts(), fn(st: lexdb_store.Store): int { return 1 })
+    if b.isErr() { append(mut &bad, "p plain: " + b.unwrapErr().toStr()) }
+    // the data directory's own segments are not there for the split one
+    if d.exists("log.1") || d.exists("log.spare") { append(mut &bad, "log files in the data directory") }
+    if !l.exists("log.1") || l.exists("data.lxdb") { append(mut &bad, "the log directory has the wrong files") }
+    for m in bad {
+        if m == "" { ok += 1 } else { println("refusal: " + m) }
+    }
+    return ok
+}
+
+type Ctx = record { n: int; tree: int }
+
+// Counts the keys (all of key0.. n-1 there with their values).
+fn check(st: &lexdb_store.Store, tree: int, want: int): str {
+    var t = lexdb_store.begin()
+    var n = 0
+    var bad = ""
+    let r = st.scan(mut &t, tree, "", "", fn(e: &lexdb_store.Entry): bool {
+        if e.key != key(n) || e.val != "v" + n.toStr() { if bad == "" { bad = "entry " + e.key + "=" + e.val + " at " + n.toStr() } }
+        n += 1
+        return true
+    })
+    if r.isErr() { return "scan: " + r.unwrapErr().toStr() }
+    if bad != "" { return bad }
+    if n < want { return "lost commits: " + n.toStr() + " keys, " + want.toStr() + " acknowledged" }
+    return ""
+}
+
+fn main() {
+    let good = refusals()
+    println("refusals " + good.toStr() + " ok")
+    var crashes = 0
+    var okc = 0
+    var split = 0
+    for seed in 0..30 {
+        var d = lexdb_disk.sim(seed)
+        var l = lexdb_disk.sim(1000 + seed)
+        var tree = -1
+        var acked = 0
+        for k in 0..3 {
+            let crashAt = acked + 1 + (seed * 7 + k * 13) % 50
+            var nd = d
+            var nl = l
+            var msg = ""
+            let r = lexdb_store.runSplit(d, l, opts(), fn(st: lexdb_store.Store): str {
+                if tree < 0 {
+                    var t = lexdb_store.begin()
+                    tree = st.createTree(mut &t)
+                    st.commit(t).unwrap()
+                } else {
+                    let m = check(&st, tree, acked)
+                    if m != "" { msg = "after recovery: " + m }
+                }
+                // one key a commit, key(i) with value v + i, with a little padding in the log
+                while acked < crashAt && msg == "" {
+                    var t = lexdb_store.begin()
+                    // (the recovered count can be above the acknowledged: a commit not yet acknowledged may be there)
+                    var have = 0
+                    let c = st.scan(mut &t, tree, "", "", fn(e: &lexdb_store.Entry): bool { have += 1; return true })
+                    let n = have
+                    var w = lexdb_store.begin()
+                    w.put(tree, key(n), "v" + n.toStr()).unwrap()
+                    match st.commit(w) {
+                        Ok(_) { acked = n + 1 }
+                        Err(e) { msg = "commit: " + e.toStr() }
+                    }
+                }
+                nd = d.crash(seed * 10 + k)
+                nl = l.crash(seed * 10 + k + 5000)
+                return msg
+            })
+            match r {
+                Ok(m) { if m != "" { println("seed " + seed.toStr() + ": " + m) } }
+                Err(e) { println("seed " + seed.toStr() + ": open " + e.toStr()) }
+            }
+            d = nd
+            l = nl
+            crashes += 1
+            let v = lexdb_store.runSplit(d, l, opts(), fn(st: lexdb_store.Store): str { return check(&st, tree, acked) })
+            match v {
+                Ok(m) {
+                    if m == "" { okc += 1 } else { println("seed " + seed.toStr() + " crash " + k.toStr() + ": " + m) }
+                }
+                Err(e) { println("seed " + seed.toStr() + " crash " + k.toStr() + ": open " + e.toStr()) }
+            }
+            var inD = false
+            var inL = false
+            for g in 1..60 {
+                if d.exists(lexdb_store.segName(g)) { inD = true }
+                if l.exists(lexdb_store.segName(g)) { inL = true }
+            }
+            if d.exists("log.spare") { inD = true }
+            if !inD && inL && !l.exists("data.lxdb") && d.exists("data.lxdb") { split += 1 } else { println("seed " + seed.toStr() + ": files in the wrong directory") }
+        }
+    }
+    println("seeds 30 crashes " + crashes.toStr() + " ok " + okc.toStr() + " split " + split.toStr())
+}

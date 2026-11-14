@@ -301,7 +301,7 @@ fn body(st: lexdb_store.Store): int {
 
 fn main() {
     lexdb_store.run(lexdb_disk.sim(SEED), lexdb_store.Options{cacheBytes: 16 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024,
-                                                           snapNodes: 50000, bufferedPages: false}, body).unwrap()
+                                                           snapNodes: 50000}, body).unwrap()
 }
 '''
 

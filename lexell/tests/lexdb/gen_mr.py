@@ -321,7 +321,7 @@ fn body(st: lexdb_store.Store): int {
 }
 
 fn main() {
-    lexdb_store.run(lexdb_disk.sim(5), lexdb_store.Options{cacheBytes: 128 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000, bufferedPages: false}, body).unwrap()
+    lexdb_store.run(lexdb_disk.sim(5), lexdb_store.Options{cacheBytes: 128 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, body).unwrap()
 }
 '''
 
@@ -371,7 +371,7 @@ fn errcase(s: mut &lexdb_exec.Session, label: &str, sql: &str, state: &str) {
 }
 
 fn opts(): lexdb_store.Options {
-    return lexdb_store.Options{cacheBytes: 256 * 1024, segBytes: 1024 * 1024, ckptBytes: 512 * 1024, snapNodes: 100000, bufferedPages: false}
+    return lexdb_store.Options{cacheBytes: 256 * 1024, segBytes: 1024 * 1024, ckptBytes: 512 * 1024, snapNodes: 100000}
 }
 
 fn main() {
@@ -461,7 +461,7 @@ fn body(st: lexdb_store.Store): int {
 
 fn main() {
     lexdb_store.run(lexdb_disk.sim(7), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024,
-                                                             snapNodes: 50000, bufferedPages: false}, body).unwrap()
+                                                             snapNodes: 50000}, body).unwrap()
 }
 '''
 

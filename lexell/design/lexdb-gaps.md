@@ -314,24 +314,29 @@ Notes that go with the decision:
 - A full filesystem (ENOSPC) on a data or log write must fail cleanly and
   recover once space is added. Check that a test covers it.
 
-**To build: the log in a directory of its own.** Not supported today:
-`lexdb_disk.Fs.Real(dir)` is the one directory for every file, so the log
-segments (`log.N`, `log.spare`, `lexdb_store.segName`) sit beside the data
-file, and there is no flag (`cmd/lexdb.lxl` `usage`). Wanted: a
-`--log-dir DIR` (name to be chosen), so the log's fsyncs go to another
+**Built (2026-11-14, lexdb.md 9.124): the log in a directory of its own, `--log-dir DIR`.** The text that was the
+plan is kept below, with what was done to each point.
+
+Not supported before: `lexdb_disk.Fs.Real(dir)` was the one directory for every file, so the log
+segments (`log.N`, `log.spare`, `lexdb_store.segName`) sat beside the data
+file, and there was no flag (`cmd/lexdb.lxl` `usage`). Wanted: a
+`--log-dir DIR`, so the log's fsyncs go to another
 device from the checkpoint's writes, and a full data disk does not stop
-the log. What it touches:
+the log. What it touched:
 - a second `Fs` for the log, used for opening, creating, renaming and
-  removing the segments and the spare;
-- `syncDir` on the log's directory after those, not the data's;
-- the replicas' follower, which reads segments (`lexdb_store` around
-  5090 to 5272);
+  removing the segments and the spare: `Db.logFs` (`lexdb_store.openSplit`, `runSplit`);
+- `syncDir` on the log's directory after those, not the data's: it is a method of the `Fs`, so the log's does it;
+- the replicas' follower, which reads segments (`Fol.fs` is the log's `Fs`; `openReplicaSplit`);
 - startup: refuse a data directory whose log is missing or is somewhere
-  else (the directory recorded where the data file can check it), so
-  the wrong log is never replayed;
-- `--replica` and the supervisor passing the option to each worker;
-- the crash tests (the simulated `Fs` is one store; it needs two, or
-  names that tell them apart).
+  else, so the wrong log is never replayed: a `logdir` file in the data directory and a `logid` file in the log
+  directory carry one random id, compared at start (`checkLog`, 9.124);
+- `--replica` and the supervisor passing the option to each worker (a module variable set before the forks);
+- the crash tests: `store_logdir.lxl` runs two simulated file systems, each crashed its own way. Not done: an ENOSPC
+  test (below).
+
+Not done: a test of ENOSPC on a data or log write. There is none: no test in `tests/lexdb` mentions ENOSPC or
+errno 28; the simulated `Fs` can fail one call with EIO (`failIn`, used by `disk_sim.lxl`), which exercises the same
+error path, but not a full disk and its recovery once space is added.
 
 A temporary or spill directory is not needed yet: lexdb spills nothing
 (2.4). Add one with the first spill.

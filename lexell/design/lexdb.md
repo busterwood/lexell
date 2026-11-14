@@ -95,7 +95,7 @@ SQLite is about 150,000 lines of C and LMDB's core is about 10,000.
 | MySQL / InnoDB | Fast, non-transactional MyISAM for read-heavy websites. | Transactions came with a plug-in engine (InnoDB), giving two logs (binlog and redo) with an internal two-phase commit between them. InnoDB's doublewrite buffer guards against torn pages. The query cache was added for speed and removed in 8.0, because its global lock was a bottleneck. | Take the clustered primary key, and secondary indexes that store the primary key. Leave everything else. |
 | SQLite | Still small, as a library: one writer, file locks, a bytecode VM (VDBE). | It isn't a server. | Take the register-based bytecode VM as the first executor. |
 | LMDB | A copy-on-write B+tree with one writer and two meta pages. Readers keep an old root and never block. About 10,000 lines. | It uses `mmap` (see the next row), and each commit writes the path from changed leaves to the root plus a meta page. | Take copy-on-write pages, the two meta pages and readers on old roots. Leave `mmap`, and amortize the root-path writes over a checkpoint rather than every commit. |
-| *Are You Sure You Want to Use MMAP in Your DBMS?* (Crotty, Leis and Pavlo, CIDR 2022) | — | — | For Lexell there's a stronger reason than theirs: a page fault blocks the only thread, and a coroutine cannot park on a fault. One cold page would stall every connection. We keep our own cache with `O_DIRECT`. |
+| *Are You Sure You Want to Use MMAP in Your DBMS?* (Crotty, Leis and Pavlo, CIDR 2022) | — | — | For Lexell there's a stronger reason than theirs: a page fault blocks the only thread, and a coroutine cannot park on a fault. One cold page would stall every connection. We keep our own cache with `O_DIRECT`. (Since 9.125 the page file goes through the kernel's page cache; the log keeps `O_DIRECT`, and the argument against mmap stands.) |
 | H-Store / VoltDB; *OLTP Through the Looking Glass* (2008) | Serial execution in memory, by one thread per partition. | That paper found that buffer management, locking, latching and logging each took a large share of instructions in a conventional engine. | Take serial commit on one thread. Leave the requirement that data fit in memory. Anti-caching (DeBrabant et al., 2013) also handled cold data on disk under serial execution, by aborting and restarting the transaction. Our coroutines park instead. |
 | Silo (Tu et al., SOSP 2013) | Optimistic concurrency with validation at commit. | Multi-core, with per-record latches. | Take the idea of checking B+tree node versions at commit to catch phantoms (its "node set"). With one thread, no latches are needed. |
 | LeanStore, vmcache (Leis et al.) | Buffer managers that run close to in-memory speed. | Both are built for many threads. | One thread needs neither pointer swizzling nor optimistic latches. A hash table from page number to frame, plus clock eviction, is enough. |
@@ -153,7 +153,8 @@ What follows for the design:
 
 ### 4.1 Files and pages
 
-- **The page file.** It is made of 4 KiB pages, opened with `O_DIRECT`, and
+- **The page file.** It is made of 4 KiB pages, opened through the kernel's page
+  cache (since 9.125; `O_DIRECT` before), and
   read and written only in aligned 4 KiB units. Pages 0 and 1 are the two
   meta pages. Every page ends with a CRC32C (x86-64-v3 has the `crc32`
   instruction) and its own page number, so a page read from the wrong
@@ -312,7 +313,7 @@ written into this note.
 **D0: the disk interface and the simulated disk.**
 - A `Disk` interface (read, write, flush, allocate) with two
   implementations:
-  - the real one: `O_DIRECT` on the helper pool;
+  - the real one: the page file through the page cache (since 9.125), the log segments `O_DIRECT`, on the helper pool or io_uring;
   - a simulated one that keeps writes that haven't been flushed separately.
     A "crash" keeps a random subset of them and tears some at 512-byte
     boundaries.
@@ -2133,7 +2134,7 @@ Times vary between runs: another run of the second row gave 8.7 ms and
 8 ms.
 
 The walk's time is its reads: 117 took 27 ms, 0.7 ms of it decoding. The
-data file is opened with O_DIRECT, and each read waits for the device
+data file is opened with O_DIRECT (since 9.125: buffered), and each read waits for the device
 (here WSL2's virtual disk). The reads park the checkpoint's task on the
 helper pool: commits and queries go on, and only the checkpoint's end is
 later.
@@ -3811,7 +3812,7 @@ reader. The fixed layout is now the default.
 The user asked for read-ahead (2026-11-10) after 9.49 found cold scans
 25 times slower than warm ones.
 
-**Why cold scans were slow.** The data file is opened with O_DIRECT, so
+**Why cold scans were slow.** The data file is opened with O_DIRECT (since 9.125: buffered), so
 every page read is a disk read: the operating system caches none of it. A
 scan read one 4 KiB page at a time. A probe in C, on this machine's disk:
 
@@ -4157,7 +4158,7 @@ latency unchanged (233 us) where PostgreSQL's halved. The cause was not
 the socket: a Lexell echo server over a Unix socket answers in 55 us, as
 a C one does. It was the cache. The server's 128 MB default holds about
 two thirds of pgbench's 1M-row table. lexdb reads its data file past the
-kernel's cache (O_DIRECT), so every miss went to the disk: 189,086 pages
+kernel's cache (O_DIRECT; since 9.125 buffered), so every miss went to the disk: 189,086 pages
 read and 169,455 evicted in that run. PostgreSQL's 128 MB of shared
 buffers is backed by the kernel's cache, which on this machine is most of
 its 23 GB. The server now takes a quarter of `/proc/meminfo`'s MemTotal
@@ -5159,8 +5160,7 @@ of these.
   file without `O_DIRECT` (`Fs.openBuffered`; `File.Real` carries the
   flag). Log segments stay `O_DIRECT`. Pages, CRCs, writes and flushes
   are unchanged: a checkpoint's pages are written, then `fdatasync`ed,
-  then the meta page. The default stays `direct` until the replica uses
-  this.
+  then the meta page. The default stayed `direct` until 9.125, which made buffered the only mode and removed `LEXDB_PAGES` and `Options.bufferedPages`.
 - **Reads tried inline.** The runtime set `IOSQE_ASYNC` on every read
   issued while other tasks were runnable (9.62), so a page the kernel
   held was copied by an io-wq worker and woke the loop from there. Now
@@ -5473,7 +5473,7 @@ with its own port; pgbench prepared, 8 s; CPU from `/proc`):
   beside its own commits.
 - **Applying the master's writes** costs the replica about 2.6 us of CPU
   each, 7% of a core at 22,000 a second.
-- **Memory** (RSS, LEXDB_PAGES direct, all data cached): 40 MB and 39 MB
+- **Memory** (RSS, with the page file then `O_DIRECT`, all data cached): 40 MB and 39 MB
   warm. Under updates the master reaches 96 MB and the replica 61 to
   67 MB: one checkpoint's delta, and a 31 MB page cache with 11,892 pages
   evicted as freed in 15 s.
@@ -11669,3 +11669,64 @@ Built for the fast per-worker test servers of lexdb-gaps.md 2.7.
 - Tests: `tests/lexdb/nosync.py` (stand-alone, like crash.py and replica.py): bad `--cache-mb` values refused, the
   warning, the stop line's budget, a clean stop and restart keeping the rows (after a TRUNCATE too), and a supervised
   master with a replica under the flag.
+
+### 9.124 The log in a directory of its own: --log-dir
+
+`lexdb DATADIR --log-dir LOGDIR` keeps the write-ahead log segments (`log.N`) and the spare (`log.spare`) in LOGDIR,
+and only `data.lxdb`, the lock and the replication socket in DATADIR, so the log's fsyncs can go to another device and a
+full data disk does not stop the log (lexdb-gaps.md 2.6, which also records the decision against tablespaces). LOGDIR
+(and its parents) is made when DATADIR is new. It is fixed when the database is made: it is required at every later
+start, and for `--replica` and `--replicas` too (the option is a module variable set before the workers are forked, so
+each worker has it). The copy-on-write flag (9.61) is set on LOGDIR as on DATADIR.
+
+- **Code.** `Db` has `logFs` beside `fs`; the segment open and switch (`openSeg`), the checkpoint's removal and
+  renaming of old segments, and recovery's `replay` use it, and the follower's `Fol.fs` is the log's. `Fs.syncDir` is a
+  method of the `Fs` it is called on, so a create, rename or remove of a segment syncs LOGDIR and never DATADIR.
+  `--unsafe-no-sync` (9.123) is a module variable of `lexdb_disk`, so it covers both. `open`, `run` and `openReplica`
+  keep their signatures (log in the data `Fs`); `openSplit`, `runSplit` and `openReplicaSplit` take the second `Fs`. The
+  simulation is made of two `Fs` (two `lexdb_disk.sim`), crashed separately.
+- **The start-up check (`checkLog`).** DATADIR has a file `logdir` when it was made with a log directory: plain text (a page padded with zeros until 9.125; both read the same),
+  `lexdb-logdir 1`, a random 128-bit id in hex, and the directory's path (for messages only). LOGDIR has `logid`: `lexdb-log 1` and
+  the same id. Both are written to a temporary name, flushed and renamed (so never half written). At every start:
+  - DATADIR has `logdir` and no `--log-dir`: refused, naming the directory to give;
+  - DATADIR has `logdir` and `--log-dir`: LOGDIR must have a `logid` with the same id, else refused ("missing or is not
+    this database's" when there is none, "belongs to another database" when the id differs). LOGDIR is not made, and
+    the path is not compared, only the id, so a log directory moved or mounted elsewhere is fine and a copy of another
+    database's is not;
+  - no `logdir` and `--log-dir`: if DATADIR is new (no segment, and a missing or empty `data.lxdb`) a database is made:
+    LOGDIR is made if missing, refused when it holds any `log.<digits>` (whatever the number) or `log.spare`, or any file but `logid` (a log of some other database,
+    which would be replayed from its start), then `logid` is written, then `logdir`; otherwise (a database made without
+    the option) refused, "start it without --log-dir". A crash between the two writes leaves a `logid` and no segment, which the next start replaces;
+  - no `logdir` and no `--log-dir`: nothing changes, one `exists` call; a directory made without the option has no
+    new file in it, and existing directories keep working.
+  A replica runs the same check but never makes anything. Under `--replicas` a refusal ends the master worker, which the
+  supervisor restarts until it gives up ("the workers ended too often"), so check by hand first.
+- **Not done.** The two directories are not locked separately: the lock is DATADIR's, and two databases cannot share a
+  LOGDIR (the second is refused: it has a log), but a log directory is not locked against a stray server on a copy of
+  DATADIR with the same id. ENOSPC on either directory is not tested (lexdb-gaps.md 2.6).
+- **Tests.** `tests/lexdb/run/store_logdir.lxl`: the refusals on simulated file systems, and 90 crashes of two
+  `Fs` with the segments only in the log one and the data file only in the other. `tests/lexdb/logdir.py` (stand-alone,
+  like `nosync.py`): real processes, the segments in LOGDIR and none in DATADIR, restart and restart after SIGKILL, every
+  refusal above (also a moved-away log directory), a plain directory with no new files, `--replica` and `--replicas` with
+  `--log-dir` and a replica refused without it, and `--unsafe-no-sync` with it.
+
+### 9.125 The page file always through the page cache
+
+Decision (2026-11-14): `data.lxdb` is opened without `O_DIRECT` for the master, replicas and followers alike. The numbers
+are in 9.69 and 9.70: equal to `O_DIRECT` when the data is cached, faster on misses up to 8 clients, about 9% slower at
+32 clients with an 8 MB cache before the lazy-leaf change (9.70's later sections).
+
+- **Removed.** `LEXDB_PAGES` (the environment variable is no longer read, so setting it does nothing), `Options.bufferedPages`
+  and its plumbing (`openFollowerHow`'s flag, the test `Options` literals), and the `Fs.open` of the page file in `openIn`,
+  `openFollowerHow` and `audit`. The reads of the page file are the inline `fs.pread` of 9.69.
+- **Kept.** Log segments stay `O_DIRECT` (`Fs.open`, `fs.preadDirect`): the log is written once and read at recovery and
+  by followers, and its flush is the commit. `Fs.openBuffered` is now the page file's open (and the marker files').
+- **Marker files.** `logdir` and `logid` (9.124) are plain text with no padding, written and read through the buffered open
+  (`File.writeText`, `File.readText`; the tmp file is removed first so a stale longer one cannot leave a tail), still
+  written to a temporary name, flushed and renamed. A file padded to a page by an earlier build is read up to its first zero byte.
+- **Not measured, to watch.** A database larger than RAM (the kernel evicts pages the lexdb cache may want back); cold
+  scans with the kernel's read-ahead (it may help or read pages the scan skips); memory held twice, the kernel's page cache
+  and lexdb's decoded cache (`LEXDB_CACHE_MB` no longer bounds the RSS of the data); heavy writes filling the page cache
+  (checkpoints write dirty pages that the kernel flushes in its own time, then `fdatasync`).
+- **Tests.** The suite (156), `logdir.py`, `nosync.py`, `replica.py` and the crash test (20 rounds) pass; the crash test has
+  one mode.

@@ -401,7 +401,7 @@ fn main() {
         Some(dsn) { for a in answers(&dsn) { println(a) } }
         None {
             lexdb_store.run(lexdb_disk.sim(34), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024,
-                                                                  snapNodes: 50000, bufferedPages: false}, body).unwrap()
+                                                                  snapNodes: 50000}, body).unwrap()
         }
     }
 }
