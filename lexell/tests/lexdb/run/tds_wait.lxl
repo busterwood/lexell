@@ -1,0 +1,99 @@
+// lexdb over TDS: SELECT ... WAIT n SECONDS | MILLISECONDS after TOP (design/lexdb-events.md), a variable as n,
+// WAIT as a name, the errors, and the old WAITFOR (SELECT ...), TIMEOUT ms refused (a syntax error, 102) as in the other doors.
+// expect: (3) / (1)
+// expect: seq: 1;2
+// expect: seq: 2
+// expect: seq: 3 / : 'next'
+// expect: (1) / seq: 1
+// expect: seq: 
+// expect: wait: 7
+// expect: wait: 7
+// expect: wait: 7
+// expect: error 102
+// expect: error 102
+// expect: error 102
+// expect: error 102
+// expect: error 102
+// expect: error 50000
+// expect: seq: 1
+import "os"
+import "strings"
+import "task"
+import "net"
+import "sqlserver"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_wire"
+import "../../../cmd/lexdb_tds"
+
+const QUERIES = "CREATE TABLE ev (seq bigint PRIMARY KEY, payload nvarchar(20)); INSERT INTO ev VALUES (1, N'a'), (2, N'b'), (3, N'c'); CREATE TABLE wait (wait int PRIMARY KEY); INSERT INTO wait VALUES (7)\nSELECT TOP 2 seq FROM ev WHERE seq > 0 ORDER BY seq WAIT 1 SECONDS\nSELECT TOP 1 seq FROM ev WHERE seq > 1 ORDER BY seq WAIT 500 MILLISECONDS\nSELECT TOP 1 seq FROM ev WHERE seq > 2 ORDER BY seq WAIT 1 SECOND; SELECT 'next'\nDECLARE @n int = 1; SELECT TOP 1 seq FROM ev WHERE seq > 0 ORDER BY seq WAIT @n SECONDS\nSELECT TOP 1 seq FROM ev WHERE seq > 100 ORDER BY seq WAIT 200 MS\nSELECT TOP 1 wait FROM wait ORDER BY wait\nSELECT TOP 1 wait FROM wait WHERE wait > 0 ORDER BY wait WAIT 5 MS\nSELECT w.wait FROM wait w WHERE w.wait = 7\nWAITFOR (SELECT TOP 2 seq FROM ev WHERE seq > 0 ORDER BY seq), TIMEOUT 1000\nWAITFOR (SELECT TOP 1 seq FROM ev WHERE seq > 0 ORDER BY seq)\nSELECT TOP 1 seq FROM ev WHERE seq > 0 ORDER BY seq WAIT 5\nSELECT TOP 1 seq FROM ev WHERE seq > 0 ORDER BY seq WAIT\nSELECT TOP 1 seq FROM ev WHERE seq > 0 ORDER BY seq WAIT 5 DAYS\nSELECT COUNT(*) FROM ev WAIT 1 SECONDS\nBEGIN TRAN; SELECT TOP 1 seq FROM ev WHERE seq > 0 ORDER BY seq WAIT 1 SECONDS; COMMIT"
+
+fn rows(r: &sqlserver.Rows): str {
+    var names: []str = []
+    for j in 0..r.columnCount() { append(mut &names, r.columnName(j).unwrap()) }
+    var out: []str = []
+    for i in 0..r.rowCount() {
+        var cells: []str = []
+        for j in 0..r.columnCount() {
+            match r.value(i, j) {
+                Ok(v) { append(mut &cells, v.toStr()) }
+                Err(e) { append(mut &cells, "error " + e.code.toStr()) }
+            }
+        }
+        append(mut &out, strings.join(&cells, "|"))
+    }
+    return strings.join(&names, ",") + ": " + strings.join(&out, ";")
+}
+
+// a batch's result sets and row counts, in order; or its error
+fn show(c: mut &sqlserver.Conn, q: &str): str {
+    match c.queryAll(&(q.toStr()), &[]) {
+        Ok(r) {
+            var parts: []str = []
+            var shown = 0
+            for n in r.counts {
+                if n.resultSet >= 0 {
+                    append(mut &parts, rows(&r.sets[n.resultSet]))
+                    shown += 1
+                } else {
+                    append(mut &parts, "(" + n.rows.toStr() + ")")
+                }
+            }
+            if shown == 0 { for s in r.sets { append(mut &parts, rows(&s)) } }
+            if len(parts) == 0 { return "ok" }
+            return strings.join(&parts, " / ")
+        }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+fn batches(dsn: &str) {
+    match sqlserver.connect(&(dsn.toStr())) {
+        Ok(c0) {
+            var c = c0
+            let text: str = QUERIES
+            for q in strings.lines(&text) { println(show(mut &c, &q)) }
+            c.close()
+        }
+        Err(e) { println("connect: error " + e.code.toStr() + " " + e.msg) }
+    }
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        lexdb_wire.configure(&st, &lexdb_wire.noAuth()).unwrap()
+        let f = s.start(lexdb_tds.acceptLoop, lexdb_tds.AcceptArg{ln: ln, st: st})
+        batches(&("Server=127.0.0.1," + addr[10..len(addr)] + ";UID=sa;PWD=x;Encrypt=no"))
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(34), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024,
+                                                             snapNodes: 50000}, body).unwrap()
+}

@@ -1,0 +1,123 @@
+// lexdb over TNS: SELECT ... WAIT n SECONDS | MILLISECONDS (design/lexdb-events.md), the Oracle door's spellings
+// (FETCH FIRST, ROWNUM), WAIT as a name, the errors, and Oracle's own FOR UPDATE WAIT n, which is not this clause.
+// expect: fetch first: 1,2
+// expect: milliseconds: 2
+// expect: rownum: error 3001
+// expect: empty after wait: 
+// expect: wait as a name: 7 / 7
+// expect: no unit: error 900
+// expect: no count: error 900
+// expect: for update wait: error 900
+// expect: for update wait unit: error 900
+// expect: for update nowait: 1
+// expect: old form: error 900
+// expect: shape: error 3001
+import "task"
+import "net"
+import "strings"
+import "oracle"
+import "sqldialect"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_tns"
+import "../../../cmd/lexdb_sql"
+import "../../../cmd/lexdb_auth"
+
+fn connect(s: &str): oracle.Conn {
+    match oracle.connect(&(s.toStr())) {
+        Ok(c) { return c }
+        Err(e) {
+            println("connect: error " + e.code.toStr() + " " + e.msg)
+            exit(1)
+        }
+    }
+}
+
+fn show(r: Result[oracle.Rows, oracle.Error]): str {
+    match r {
+        Ok(rows) { return "ok" }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+fn values(rows: &oracle.Rows, row: int): str {
+    var out: []str = []
+    for i in 0..rows.columnCount() {
+        match rows.isNull(row, i) {
+            Ok(n) {
+                if n { append(mut &out, "NULL") } else {
+                    match rows.value(row, i) {
+                        Ok(v) { append(mut &out, v.toStr()) }
+                        Err(e) { append(mut &out, "error " + e.code.toStr() + " " + e.msg) }
+                    }
+                }
+            }
+            Err(e) { append(mut &out, "error " + e.code.toStr()) }
+        }
+    }
+    return strings.join(&out, " ")
+}
+
+fn err(r: Result[int, oracle.Error]): str {
+    match r {
+        Ok(n) { return n.toStr() }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+fn q1(c: mut &oracle.Conn, sql: &str): str {
+    match c.query(&(sql.toStr()), &[]) {
+        Ok(r) {
+            var out: []str = []
+            for i in 0..r.rowCount() { append(mut &out, values(&r, i)) }
+            return strings.join(&out, ",")
+        }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+
+fn client(port: &str) {
+    let dsn = "127.0.0.1:" + port + "/lexdb"
+    var c = connect(&("User Id=sa;Password=sa;Data Source=" + dsn))
+    c.exec("create table ev (seq number(10) primary key, payload varchar2(20))").unwrap()
+    c.exec("insert into ev values (1, 'a')").unwrap()
+    c.exec("insert into ev values (2, 'b')").unwrap()
+    c.exec("insert into ev values (3, 'c')").unwrap()
+    c.exec("commit").unwrap()
+    c.exec("create table wait (wait number(5) primary key)").unwrap()
+    c.exec("insert into wait values (7)").unwrap()
+    c.exec("commit").unwrap()
+    println("fetch first: " + q1(mut &c, &"select seq from ev where seq > 0 order by seq fetch first 2 rows only wait 1 seconds"))
+    println("milliseconds: " + q1(mut &c, &"select seq from ev where seq > 1 order by seq fetch first 1 rows only wait 500 milliseconds"))
+    println("rownum: " + q1(mut &c, &"select seq from ev where seq > 0 and rownum <= 2 order by seq wait 1 seconds"))
+    println("empty after wait: " + q1(mut &c, &"select seq from ev where seq > 100 order by seq fetch first 1 rows only wait 200 ms"))
+    println("wait as a name: " + q1(mut &c, &"select wait from wait where wait > 0 order by wait fetch first 1 rows only wait 5 ms") + " / " +
+            q1(mut &c, &"select wait from wait w where w.wait = 7"))
+    println("no unit: " + q1(mut &c, &"select seq from ev where seq > 0 order by seq fetch first 1 rows only wait 5"))
+    println("no count: " + q1(mut &c, &"select seq from ev where seq > 0 order by seq fetch first 1 rows only wait"))
+    println("for update wait: " + q1(mut &c, &"select seq from ev where seq > 0 order by seq for update wait 5"))
+    println("for update wait unit: " + q1(mut &c, &"select seq from ev where seq > 0 order by seq for update wait 5 seconds"))
+    println("for update nowait: " + q1(mut &c, &"select seq from ev where seq = 1 for update nowait"))
+    println("old form: " + q1(mut &c, &"waitfor (select seq from ev where seq > 0 order by seq fetch first 1 rows only), timeout 10"))
+    println("shape: " + q1(mut &c, &"select count(*) from ev wait 1 seconds"))
+    c.exec("rollback").unwrap()
+    c.logoff()
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        let f = s.start(lexdb_tns.acceptLoop, lexdb_tns.AcceptArg{ln: ln, st: st})
+        client(&addr[10..len(addr)])
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(5), lexdb_store.Options{cacheBytes: 128 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, body).unwrap()
+}

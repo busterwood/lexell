@@ -8199,24 +8199,27 @@ index 11 MB.
 Sizes themselves differ from PostgreSQL's (4 kB pages, B+trees), so the
 test compares them only with zero and with each other.
 
-### 9.98 WAITFOR (SELECT ...): a SELECT that waits for an event stream's rows
+### 9.98 SELECT ... WAIT n SECONDS: a SELECT that waits for an event stream's rows
 
 The user's design, `design/lexdb-events.md`: an event stream is a table,
 and a consumer reads the rows after its cursor with a SELECT that waits
-for them. Its first version is built. The spelling is SQL Server Service
-Broker's `WAITFOR (RECEIVE ...), TIMEOUT ms`, the same in both dialects:
+for them. Its first version is built. The spelling was SQL Server Service
+Broker's `WAITFOR (SELECT ...), TIMEOUT ms`; since 2026-11-14 it is a
+suffix clause with a unit (9.128):
 
 ```sql
-WAITFOR (SELECT seq, payload FROM events WHERE seq > $1 ORDER BY seq LIMIT 100), TIMEOUT 30000;
+SELECT seq, payload FROM events WHERE seq > $1 ORDER BY seq LIMIT 100 WAIT 30 SECONDS;
 ```
 
 **The statement.**
-- The parser reads `WAITFOR (SELECT ...) [, TIMEOUT n]` into an ordinary
-  S_SELECT with `Stmt.waitFor` set and `waitMs` (TIMEOUT's expression).
+- The parser reads `SELECT ... WAIT n unit` (9.128) into an ordinary
+  S_SELECT with `Stmt.waitFor` set, `waitMs` (the count's expression) and
+  `waitMul` (the unit in milliseconds).
   So Describe, the plan cache, the row description and T-SQL's batches
   take it as a SELECT.
-- TIMEOUT may be a parameter (typed bigint). A NULL, a missing TIMEOUT,
-  or one over 60 s is capped at 60 s (`WAITFOR_CAP_MS`).
+- The count may be a parameter (typed bigint). A NULL, a missing count
+  (T-SQL's alias without TIMEOUT), or a wait over 60 s is capped at 60 s
+  (`WAITFOR_CAP_MS`).
 
 **The one query it runs (`waitShape`), else 0A000:**
 - one ordinary table: not a view, a catalog relation or a temporary table;
@@ -8327,7 +8330,7 @@ can be run again.
   updates no row;
 - the refusals; `statement_timeout`;
 - a READ ONLY block seeing what woke it;
-- a partition's cursor; TIMEOUT and the cursor as parameters;
+- a partition's cursor; WAIT and the cursor as parameters;
 - after the review:
   - two workers updating the row both read: one commits, one gets 40001;
   - a row the filter skipped, changed by another session: 40001;
@@ -8337,13 +8340,14 @@ can be run again.
   - the client's parameter types kept (int4 stays 23);
   - `AS e(a, b, c)` refused; `seq > -1` taken;
   - timed-out waits leave no waiters behind;
-  - T-SQL's WAITFOR in a transaction;
+  - T-SQL's waiting SELECT in a transaction;
 - filters: an equality the index does not hold, `OR` with a function and
   `LIKE`, and an index's prefix with a filter after it. An event failing
   the filter wakes the waiter, which waits on for one that passes;
 - four producers numbering 40 events from a counter row, read by a
   consumer as they commit: in order, with no gaps;
-- T-SQL's `WAITFOR (SELECT TOP 2 ...), TIMEOUT 1000`.
+- T-SQL's `SELECT TOP 2 ... WAIT 1000 MILLISECONDS`;
+- (9.128) each unit, a parameter, `wait` as a name, the errors: in `exec_waitfor`, `tns_wait` and `tds_wait`.
 
 Over psql, a waiter returned within 5 ms of the insert that woke it.
 
@@ -11759,3 +11763,37 @@ Found by reading while designing bulk deletes (lexdb-bulkdelete.md section 7), t
 
 - **A page leak.** A snapshot that began before a DROP or TRUNCATE can read the dropped tree after it. The tree's slots not in memory at the drop were deferred with their heights (9.32); the snapshot loads one, `installOnly` gives its children slots, and once the snapshot ended `releaseSlot` freed only that node's page: the children's slots and pages were reached by nothing and never returned to the free list (`audit`: lost 107 to 179 pages of 747). `Deferred` has a `whole` flag, set by `applyDrop`; `releaseWhole` frees the loaded, unpinned children first (pinned ones have their own entries, after it in the list), then the node by `releaseSlot`. Test `store_dropsnap`: drop and truncate, a snapshot reading one path or a scan, `lost 0`.
 - **The frame length.** `frame` wrote a batch's payload length as a u32, unchecked; a batch of over 4 GiB would be a frame recovery stops at, losing it and what follows. `commitLive` now refuses, before applying anything, a commit whose records (`recordsLen`) pass `FRAME_MAX` (2^32 less a page) with 54000 "transaction too large"; one that fits but not the batch pending waits for the writer to take it (on `ckptDone`, which the writer completes). `Store.setFrameMax` lowers the limit for tests: `store_framemax`.
+
+### 9.128 The waiting SELECT is a suffix: WAIT n SECONDS
+
+On 2026-11-14 the user changed 9.98's spelling. `WAITFOR (SELECT ...),
+TIMEOUT ms` became the last clause of the SELECT, with a unit:
+
+```sql
+SELECT seq, subject, payload FROM events WHERE seq > $1 ORDER BY seq LIMIT 100 WAIT 30 SECONDS;
+```
+
+- Units `SECOND(S)`, `MILLISECOND(S)`, `MS`. The count is a whole number, a
+  parameter, a T-SQL variable or one in parentheses; a missing count or
+  unit, or a fraction, is 42601. There is no bare `WAIT` for the cap: any
+  wait of 60 s or more is the cap.
+- `wait` is not reserved. The parser takes it as the clause only where a
+  number, parameter or variable follows (`P.waitAhead`); the implicit alias
+  of a select item or a table skips it then, so `FROM wait w`, `AS wait`
+  and a column called `wait` work.
+- Statement level only (`P.waitSuffix`, after `select()`), in the three
+  doors: PostgreSQL; T-SQL after TOP/ORDER BY; Oracle after `FETCH FIRST n
+  ROWS ONLY`. Oracle's `FOR UPDATE WAIT n` is not taken for it (a locking
+  SELECT in the Oracle door leaves `WAIT` to be the syntax error it was).
+- One spelling in every door: `WAITFOR (SELECT ...), TIMEOUT ms` is a
+  syntax error in all three (42601; ORA-900 over TNS; 102 over TDS). T-SQL
+  kept it as an alias at first; the user asked the same day for the doors
+  to agree, and the `waitfor` statement went from the parser. (`WAITFOR`
+  stays in T-SQL's list of statement starts, so it is never an implicit
+  alias; `WAITFOR DELAY` is not supported, as before.)
+- Same shape rules (0A000), semantics, Describe, plan cache and row
+  description: `waitMs` still holds the count, and `waitMul` the unit.
+
+**Tests:** `exec_waitfor` (every case moved to the suffix; each unit and
+its timing, a parameter, `wait` as a name, the errors, the old form refused, T-SQL's
+suffix), `tns_wait` and `tds_wait` (the old form refused in each).

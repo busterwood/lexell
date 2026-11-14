@@ -26,13 +26,12 @@ CREATE TABLE events (
 );
 
 BEGIN;
-WAITFOR (
-    SELECT seq, subject, payload
-    FROM events
-    WHERE seq > $1
-    ORDER BY seq
-    LIMIT 100
-), TIMEOUT 30000;
+SELECT seq, subject, payload
+FROM events
+WHERE seq > $1
+ORDER BY seq
+LIMIT 100
+WAIT 30 SECONDS;
 
 -- Process the returned events, then advance the consumer cursor,
 -- only from the position this batch was read after (section 6).
@@ -42,13 +41,16 @@ WHERE consumer_id = $3 AND last_seen = $1;
 COMMIT;
 ```
 
-`TIMEOUT 30000` waits up to 30 seconds. `$1` is the last successfully processed sequence. Return immediately when matching rows exist; otherwise wait, re-evaluate, and return a nonempty batch or an empty result at timeout. Each independent consumer has its own durable offset, stored as ordinary SQL data. No server-side consumer groups or individual acknowledgments are required initially (section 7 shows how groups are built from what LexDB has).
+`WAIT 30 SECONDS` waits up to 30 seconds. `$1` is the last successfully processed sequence. Return immediately when matching rows exist; otherwise wait, re-evaluate, and return a nonempty batch or an empty result at timeout. Each independent consumer has its own durable offset, stored as ordinary SQL data. No server-side consumer groups or individual acknowledgments are required initially (section 7 shows how groups are built from what LexDB has).
 
-**Spelling: `WAITFOR (SELECT ...), TIMEOUT ms`**, from SQL Server Service Broker's `WAITFOR (RECEIVE ...), TIMEOUT ms`, the closest precedent (section 12):
-- The same form serves both front ends. Under TDS a suffix clause would be confusing: T-SQL needs no separator between statements, and `WAITFOR` already begins a statement there (`WAITFOR DELAY`, `WAITFOR TIME`; not done yet, `lexdb-tds.md`).
-- The parser turns it into an ordinary S_SELECT with a `waitMs` field. It still reuses the whole SELECT path: Describe, the plan cache and the row description. Only a SELECT may be inside; `RECEIVE`, which consumes rows as it reads them, is not needed, because the offset is ordinary data (section 6).
-- `waitfor` is not a keyword in PostgreSQL's grammar or in lexdb's today.
-- Without `TIMEOUT`, the wait runs to the cap (section 8). `TIMEOUT $n` is allowed, as LIMIT allows a parameter.
+**Spelling: `SELECT ... WAIT n SECONDS` (or `MILLISECONDS`, `MS`)**, a suffix clause, the last of the SELECT (changed on 2026-11-14, section 13):
+- The statement still starts with SELECT, so a query builder that only appends text and a tool that classifies statements by their first word keep working. The unit is written out; there is no bare number of milliseconds to misread.
+- Units: `SECOND`, `SECONDS`, `MILLISECOND`, `MILLISECONDS`, `MS`. The count is a whole number, a parameter (`WAIT $2 SECONDS`, T-SQL's `@n`, Oracle's `:2`), or one in parentheses, as LIMIT allows. `WAIT` with no count and unit, or a fraction (`WAIT 0.5 SECONDS`), is 42601.
+- `wait` is not a reserved word: it stays usable as a table, column or alias name. The clause is taken only where `wait` is followed by a number, a parameter, a variable or `(`. Only a statement's own SELECT takes it, not a subquery.
+- It follows ORDER BY and LIMIT (T-SQL: ORDER BY after TOP; Oracle: after FETCH FIRST ... ROWS ONLY). Oracle's `FOR UPDATE WAIT n` is a lock wait, which lexdb does not have; it stays the syntax error it is, and a locking clause is refused in a waiting SELECT anyway (0A000).
+- The parser turns it into an ordinary S_SELECT with `waitMs` and `waitMul` fields. It still reuses the whole SELECT path: Describe, the plan cache and the row description (the wait is not part of the result shape).
+- The spelling is the same in all three doors. The old Service Broker form, `WAITFOR (SELECT ...), TIMEOUT ms`, is a syntax error in each (T-SQL's too, since 2026-11-14; section 13).
+- The cap (section 8) needs no spelling of its own: a count at or over it (`WAIT 60 SECONDS`) waits the cap.
 
 **The parentheses take one query shape, enforced (0A000 otherwise):**
 - one ordinary table: not a view, a catalog relation or a temporary table;
@@ -209,11 +211,11 @@ All three patterns below use what LexDB has today: session advisory locks (`lexd
 
 **3. A work queue: any free worker takes any message, with no ordering.**
 - Per-message claims with `SELECT ... FOR UPDATE SKIP LOCKED`, or a claimed/done state column.
-- `WAITFOR` is used only when nothing is claimable.
+- The waiting SELECT is used only when nothing is claimable.
 - This is not an ordered stream. It suits jobs, not event processing.
 
 **Later, if measured: a keyed wake-one.**
-- Spelling: `WAITFOR (SELECT ...), TIMEOUT 30000, GROUP 'billing'` or similar. Waiters with the same key form a queue, and a flush wakes the first of each queue rather than every waiter.
+- Spelling: `... WAIT 30 SECONDS GROUP 'billing'` or similar. Waiters with the same key form a queue, and a flush wakes the first of each queue rather than every waiter.
 - A wake is still only a hint. Waking just one waiter needs a **pass-on rule**, or work stalls. The woken waiter wakes the next in its queue when it:
   - returns a full batch (LIMIT reached: there may be more);
   - finds nothing;
@@ -233,15 +235,15 @@ All three patterns below use what LexDB has today: session advisory locks (`lexd
 
 So the first version:
 - caps the wait, at 60 s say, and lets the cap bound cleanup;
-- waits for the smaller of `TIMEOUT` and the remaining `statement_timeout`, and raises 57014 if the latter ends first;
-- documents that client command timeouts must exceed `TIMEOUT`. Npgsql and SqlClient default to 30 s, exactly the example's value.
+- waits for the smaller of `WAIT` and the remaining `statement_timeout`, and raises 57014 if the latter ends first;
+- documents that client command timeouts must exceed `WAIT`. Npgsql and SqlClient default to 30 s, exactly the example's value.
 
 Real cancellation needs the connection loop to wait on "socket or wake": a separate project, shared with `LISTEN`/`NOTIFY`.
 
 **Refused with 0A000** (besides the shapes of section 2):
-- **`WAITFOR` around a locking clause** (FOR UPDATE and the rest), which reads live data rather than a snapshot. It would break section 5's durability argument.
-- **`WAITFOR` on a replica.** Nothing flushes locally on a replica; the follower advances in its poll, and writes fail at commit. A wake from the follower's poll can come later, for autocommit consumers only.
-- **`WAITFOR` on a temporary table.** It is session-private (`lexdb.md` 9.96), so no other session can ever add to it.
+- **A waiting SELECT with a locking clause** (FOR UPDATE and the rest), which reads live data rather than a snapshot. It would break section 5's durability argument.
+- **A waiting SELECT on a replica.** Nothing flushes locally on a replica; the follower advances in its poll, and writes fail at commit. A wake from the follower's poll can come later, for autocommit consumers only.
+- **A waiting SELECT on a temporary table.** It is session-private (`lexdb.md` 9.96), so no other session can ever add to it.
 
 **The rest:**
 - **Describe** only plans, so it never waits.
@@ -276,7 +278,7 @@ the test `exec_waitfor`.
 Start with one stream/table, a constrained indexed SELECT, timeout, generation-based notification and offsets held in SQL tables. Avoid a new messaging protocol, consumer group subsystem or partitioning requirement. Subject filtering came just after version one (section 2): with a filter, the cursor cannot advance past rows that do not match, so each wake rescans them, unless the index leads with the filtered column.
 
 **What it touches:**
-- **`lexdb_sql.lxl`:** `WAITFOR (SELECT ...) [, TIMEOUT n]` as a statement, in the PostgreSQL and T-SQL dialects, giving an S_SELECT with a `waitMs` field (beside `lockWait`).
+- **`lexdb_sql.lxl`:** `SELECT ... WAIT n SECONDS|MILLISECONDS` as a statement's last clause in all three dialects, giving an S_SELECT with `waitMs` and `waitMul` fields (beside `lockWait`).
 - **`lexdb_store.lxl`:**
   - `waitDurable(afterSeq, ms)`, modelled on `waitChange` and woken in the log writer's post-flush section;
   - an accessor for `Txn.snapSeq`.
@@ -351,7 +353,7 @@ The proposal was reviewed against the code the day it was written. What changed:
 - **Section 6:** the offset update must be a compare-and-set. Otherwise two competing workers can both commit.
 - **Sections 7 to 9 and 12 are new:** consumer groups, the first version's limits and refusals, `LISTEN`/`NOTIFY`, and the precedents.
 - **The open questions are settled:**
-  - `WAITFOR (SELECT ...), TIMEOUT ms`, after Service Broker (changed from `SELECT ... WAIT ms` once the precedents were listed);
+  - `WAITFOR (SELECT ...), TIMEOUT ms`, after Service Broker (changed from `SELECT ... WAIT ms` once the precedents were listed; changed back to a suffix on 2026-11-14, below);
   - a counter row first;
   - an ordinary table;
   - a timeout as zero rows, and retention as a `floor` column;
@@ -376,3 +378,41 @@ The proposal was reviewed against the code the day it was written. What changed:
   All of these are fixed (`lexdb.md` 9.98).
 
 **The event log is the table; the waiting SELECT is the subscription API.**
+
+**2026-11-14: the spelling is a suffix again, with a unit.** The user changed `WAITFOR (SELECT ...), TIMEOUT ms` to `SELECT ... WAIT n SECONDS|MILLISECONDS` (section 2). Why:
+- A statement keeps starting with SELECT: query builders that only append text, and tools that classify statements by their first word (read or write, which pool, which retry rule), keep working. `WAITFOR (...)` was a statement they had never seen.
+- An explicit unit instead of bare milliseconds: `TIMEOUT 30` and `TIMEOUT 30000` differ by a factor of a thousand without a hint.
+- The argument against a suffix under TDS was weak: `WAIT` begins no T-SQL statement (`WAITFOR` does), so a suffix is no more confusing there than TOP or OPTION.
+- T-SQL kept `WAITFOR (SELECT ...), TIMEOUT ms` as an alias at first; the same day the user asked for one spelling everywhere, so T-SQL dropped it too and it is a syntax error (102 over TDS) in every door. Same shape rules, errors (0A000) and wait as before. Built and tested (`lexdb.md` 9.128).
+
+## 14. Future idea: waiting on MATCH_RECOGNIZE
+
+Not built; written down on 2026-11-14, when the user asked whether people
+will want to wait on a MATCH_RECOGNIZE query (`lexdb-match-recognize.md`)
+too. Pattern matching over a live stream is a known use: Flink SQL and
+Oracle's event processing run MATCH_RECOGNIZE on streams ("three failed
+logins, then a success"; "the price falls, then rises past its start").
+The waiting SELECT of section 2 does not fit it as it stands:
+
+- **Finality.** On a table the end of the data ends every match; on a
+  stream it is only the end for now. `A B+ C` may complete with the next
+  row, and a greedy `B+` that ends at the last row may still grow. A
+  waiting MATCH_RECOGNIZE may return only matches no later row can change.
+  Flink refuses a pattern that ends in a greedy quantifier unless it has a
+  time bound (`WITHIN`); lexdb would do the same.
+- **The resume point.** A consumer's offset today is "the last seq I
+  processed", read as `seq > $1`. A partial match can start before it, so
+  a query reading only past the offset misses the match's start. The
+  result must say where the next wait starts: the first row of the
+  earliest unfinished match, or the offset when there is none.
+- **Shape rules.** Section 2's rules make the wait one indexed range read.
+  A pattern query needs its own: `PARTITION BY` on the index's prefix,
+  `ORDER BY` the cursor column, the cursor bound on that column, and a
+  `WITHIN` bound (time or rows) so that the window to re-read is bounded.
+- **Cost.** Each wake runs the query again from the resume point, so the
+  work per wake is bounded by the window, not by the stream.
+
+Until then a client can do it with what exists: wait with `SELECT ...
+WAIT n SECONDS` on the new rows, then run the MATCH_RECOGNIZE over a
+window that starts a bounded distance back (the earliest unfinished match
+it has kept itself), and move its offset only past finished matches.

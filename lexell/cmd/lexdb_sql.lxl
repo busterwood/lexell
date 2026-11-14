@@ -608,10 +608,12 @@ pub type Stmt = record {
     // where they name columns it makes (CREATE VIEW, CREATE TABLE ... AS)
     pub spell: str
     pub spells: []str
-    // WAITFOR (SELECT ...) [, TIMEOUT n] (design/lexdb-events.md): the
-    // SELECT, run again as commits reach the log until it gives rows
+    // SELECT ... WAIT n SECONDS | MILLISECONDS (design/lexdb-events.md),
+    // the same in all three doors: the SELECT, run again as commits reach
+    // the log until it gives rows
     pub waitFor: bool
-    pub waitMs: Option[Expr]    // TIMEOUT's; None: the cap
+    pub waitMs: Option[Expr]    // WAIT's count (in waitMul's unit); None: the cap
+    pub waitMul: int            // milliseconds in WAIT's unit: 1000 for SECONDS, 1 for MILLISECONDS
     pub pkName: str             // CREATE TABLE's CONSTRAINT name PRIMARY KEY: its name ("" the table's _pkey, 9.117)
     pub merges: []MergeClause   // S_MERGE's WHEN clauses, in order
     pub mdialect: int           // S_MERGE: MD_*
@@ -695,7 +697,7 @@ pub fn newStmt(kind: int): Stmt {
                 unique: false, inner: [], distinct: false, having: None, subs: [], use: 0, setop: 0, setAll: false,
                 cte: -1, rec: false, cascade: false, src: "", srf: "", ordin: false, alters: [], cons: [], seqNames: [], seq: noSeqOpts(), idOpts: [], overriding: OVR_NONE,
                 copy: noCopyOpts(), wins: [], windows: [], conflict: CONFLICT_NONE, conflictCols: [], conflictCon: "", alias: "", conc: false, lockMode: 0, lockOf: [], lockWait: 0, noData: false, into: "", exprs: [],
-                distinctOn: [], withTies: false, gsets: [], maintCols: [], temp: false, onCommit: ONC_NONE, assign: [], assignAt: [], topMode: 0, spell: "", spells: [], waitFor: false, waitMs: None, pkName: "", merges: [], mdialect: MD_PG, mr: []}
+                distinctOn: [], withTies: false, gsets: [], maintCols: [], temp: false, onCommit: ONC_NONE, assign: [], assignAt: [], topMode: 0, spell: "", spells: [], waitFor: false, waitMs: None, waitMul: 1, pkName: "", merges: [], mdialect: MD_PG, mr: []}
 }
 
 // ---- the lexer
@@ -4159,7 +4161,7 @@ fn (p: mut &P) itemListAssign(items: mut &[]SelItem, assign: mut &[]str): Result
             } else {
                 let t = p.peek()
                 let fetch = t.kind == T_IDENT && t.text == "fetch" && p.peekAt(1).kind == T_IDENT && (p.peekAt(1).text == "first" || p.peekAt(1).text == "next")
-                if !fetch && (t.kind == T_QIDENT || (t.kind == T_IDENT && !isReserved(&t.text) && !(p.tsql && tsqlStarts(&t.text)))) {
+                if !fetch && !p.waitAhead() && (t.kind == T_QIDENT || (t.kind == T_IDENT && !isReserved(&t.text) && !(p.tsql && tsqlStarts(&t.text)))) {
                     alias = t.text
                     spell = t.spell
                     p.pos += 1
@@ -4621,6 +4623,49 @@ fn (p: mut &P) top(s: mut &Stmt, sel: bool): Result[Unit, lexdb_base.DbErr] {
     return Ok(Unit{})
 }
 
+// Whether WAIT begins a SELECT's wait clause here: the word, then a number,
+// a parameter or a variable (not an alias or a name called wait).
+fn (p: &P) waitAhead(): bool {
+    if !(p.toks[p.pos].kind == T_IDENT && p.toks[p.pos].text == "wait") { return false }
+    let k = p.peekAt(1).kind
+    return k == T_NUM || k == T_PARAM || k == T_VAR
+}
+
+// A statement SELECT's last clause: WAIT n SECONDS | MILLISECONDS (| MS),
+// the SELECT that waits for rows (design/lexdb-events.md). n is a whole
+// number, a parameter or a variable, as LIMIT's. Not a reserved word.
+// (Oracle's FOR UPDATE WAIT n is a lock wait, not supported: left as the
+// syntax error it is.)
+fn (p: mut &P) waitSuffix(q: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
+    if !(p.peek().kind == T_IDENT && p.peek().text == "wait") { return Ok(Unit{}) }
+    if p.ora && q.lockMode > 0 { return Ok(Unit{}) }
+    p.pos += 1
+    let bad = lexdb_base.err("42601", "WAIT needs a number and a unit: WAIT n SECONDS or WAIT n MILLISECONDS")
+    let k = p.peek().kind
+    if !(k == T_NUM || k == T_PARAM || k == T_VAR || (k == T_OP && p.peek().text == "(")) { return Err(bad) }
+    let n = try p.primary()
+    match n {
+        Expr.Lit(v) {
+            match v {
+                Val.Int(_) {}
+                else { return Err(lexdb_base.err("42601", "WAIT takes a whole number of seconds or milliseconds")) }
+            }
+        }
+        else {}
+    }
+    let u = p.next()
+    if u.kind != T_IDENT { return Err(bad) }
+    match u.text {
+        "second", "seconds" { q.waitMul = 1000 }
+        "millisecond", "milliseconds", "ms" { q.waitMul = 1 }
+        else { return Err(bad) }
+    }
+    if len(q.into) > 0 { return Err(lexdb_base.err("0A000", "lexdb: WAIT cannot be used with SELECT INTO")) }
+    q.waitFor = true
+    q.waitMs = Some(n)
+    return Ok(Unit{})
+}
+
 fn (p: mut &P) orderLimit(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
     if p.acceptKw("order") {
         try p.expectKw("by")
@@ -4907,7 +4952,7 @@ fn (p: mut &P) aliasOf(alias: mut &str, cols: mut &[]str): Result[Unit, lexdb_ba
                  (t.kind == T_IDENT && t.text == "match_recognize" && p.peekAt(1).kind == T_OP && p.peekAt(1).text == "(")
         // (FETCH FIRST ... after a table: a clause, as OFFSET)
         let fetch = t.kind == T_IDENT && t.text == "fetch" && p.peekAt(1).kind == T_IDENT && (p.peekAt(1).text == "first" || p.peekAt(1).text == "next")
-        if !tw && !fetch && (t.kind == T_QIDENT || (t.kind == T_IDENT && !isReserved(&t.text))) {
+        if !tw && !fetch && !p.waitAhead() && (t.kind == T_QIDENT || (t.kind == T_IDENT && !isReserved(&t.text))) {
             let old = replace(alias, t.text)
             p.pos += 1
             got = true
@@ -6159,6 +6204,7 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
     match t.text {
         "select" {
             var q = try p.select()
+            try p.waitSuffix(mut &q)
             if len(q.into) == 0 { return Ok(q) }
             // SELECT ... INTO t: CREATE TABLE t AS the query (9.88)
             var c = newStmt(S_CREATE)
@@ -6170,21 +6216,6 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
             q.params = p.params
             append(mut &c.inner, q)
             return Ok(c)
-        }
-        "waitfor" {
-            // WAITFOR (SELECT ...) [, TIMEOUT n]: as SQL Server's WAITFOR
-            // (RECEIVE ...), in both dialects (design/lexdb-events.md)
-            try p.expectKw("(")
-            if !p.acceptKw("select") { return Err(lexdb_base.err("0A000", "lexdb: WAITFOR supports (SELECT ...) only")) }
-            var q = try p.select()
-            if len(q.into) > 0 { return Err(lexdb_base.err("0A000", "lexdb: WAITFOR's SELECT cannot have INTO")) }
-            try p.expectKw(")")
-            q.waitFor = true
-            if p.acceptKw(",") {
-                try p.expectKw("timeout")
-                q.waitMs = Some(try p.expr())
-            }
-            return Ok(q)
         }
         "values" {
             var vq = try p.valuesQuery()

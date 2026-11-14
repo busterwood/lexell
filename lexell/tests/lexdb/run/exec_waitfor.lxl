@@ -1,4 +1,5 @@
-// lexdb_exec: WAITFOR (SELECT ...) [, TIMEOUT ms] (design/lexdb-events.md),
+// lexdb_exec: SELECT ... WAIT n SECONDS | MILLISECONDS (design/lexdb-events.md;
+// the cases below were WAITFOR (SELECT ...), TIMEOUT ms before 9.128),
 // each session in a task of its own:
 // - rows there: returned at once; none: an empty result at the timeout;
 // - a waiter woken by another session's commit, and not by a rollback;
@@ -14,11 +15,11 @@
 //   a function, and an index's prefix with a filter after it (an event
 //   failing the filter wakes the waiter, which waits on);
 // - a READ ONLY block whose snapshot is the WAITFOR's; a partition's
-//   cursor (an equality, then the cursor, on the key); TIMEOUT $1 given;
+//   cursor (an equality, then the cursor, on the key); WAIT $1 given;
 // - four producers numbering their events from a counter row, and a
 //   consumer reading them as they commit: every batch in order, no gaps;
-// - T-SQL's WAITFOR (SELECT TOP n ...), TIMEOUT n, on its own and in a
-//   transaction;
+// - T-SQL's SELECT TOP n ... WAIT @n, on its own and in a transaction;
+//   the old WAITFOR (...), TIMEOUT n refused in every door;
 // - (the review's) the rows a block's WAITFOR read are checked at commit,
 //   though not the end past them: two workers updating the row both read,
 //   one fails (40001); a row its filter skipped, changed by another, fails
@@ -51,6 +52,13 @@
 // expect: after a savepoint: BEGIN / SAVEPOINT / 57014 / ROLLBACK / n / n / 1 / COMMIT
 // expect: parameter types: 23
 // expect: alias list: 0A000; minus: 1
+// expect: units: 1 / 1 / 1 / 1 / 1 / 1
+// expect: unit timing: 1s t, 150ms t, 1ms t, ms t
+// expect: wait param: empty t, empty t, 1;2
+// expect: wait names: 1|1 / 1 / 1 / 1
+// expect: wait errors: 42601 42601 42601 42601 42601 42601 42601
+// expect: old form: 42601
+// expect: t-sql suffix: 1;2 / 1;2 / 1 / 1
 // expect: waits left: 0
 import "task"
 import "time"
@@ -148,7 +156,7 @@ fn consumer(a: Cons): str {
     var rounds = 0
     while got < a.want && rounds < 1000 {
         rounds += 1
-        let r = one(mut &s, "waitfor (select seq from stream where seq > " + last.toStr() + " order by seq limit 7), timeout 2000")
+        let r = one(mut &s, "select seq from stream where seq > " + last.toStr() + " order by seq limit 7 wait 2000 milliseconds")
         if len(r) == 0 { continue }
         for x in strings.split(&r, ";") {
             let n = strings.parseIntOpt(x).unwrapOr(-1)
@@ -176,15 +184,15 @@ fn main() {
         let m9 = one(mut &a, "insert into ctr values ('o', 0)")
         let m10 = one(mut &a, "create table pev2 (part int, seq bigint, kind text, primary key (part, seq))")
 
-        println("there: " + one(mut &a, "waitfor (select seq from ev where seq > 0 order by seq limit 10), timeout 1000"))
+        println("there: " + one(mut &a, "select seq from ev where seq > 0 order by seq limit 10 wait 1000 milliseconds"))
         let t0 = time.monotonicNs()
-        let empty = one(mut &a, "waitfor (select seq from ev where seq > 2 order by seq limit 10), timeout 80")
+        let empty = one(mut &a, "select seq from ev where seq > 2 order by seq limit 10 wait 80 milliseconds")
         let waited = (time.monotonicNs() - t0) / 1000000
         println("timeout: " + (if len(empty) == 0 { "empty" } else { empty }) + ", waited " + (if waited >= 80 { "t" } else { "f " + waited.toStr() }))
 
         task.scope(fn(sc: mut &task.Scope) {
             // woken by a commit
-            let fw = sc.start(runJob, job(st, ["waitfor (select seq from ev where seq > 2 order by seq limit 10), timeout 5000"]))
+            let fw = sc.start(runJob, job(st, ["select seq from ev where seq > 2 order by seq limit 10 wait 5000 milliseconds"]))
             pause(30)
             let t1 = time.monotonicNs()
             let i3 = one(mut &a, "insert into ev values (3, 'x', 'three')")
@@ -193,7 +201,7 @@ fn main() {
             println("woken: " + w + ", soon " + (if soon { "t" } else { "f" }))
 
             // a rollback wakes nobody with rows
-            let fr = sc.start(runJob, job(st, ["waitfor (select seq from ev where seq > 3 order by seq limit 10), timeout 300"]))
+            let fr = sc.start(runJob, job(st, ["select seq from ev where seq > 3 order by seq limit 10 wait 300 milliseconds"]))
             pause(30)
             let rb = one(mut &a, "begin")
             let ri = one(mut &a, "insert into ev values (4, 'x', 'gone')")
@@ -203,7 +211,7 @@ fn main() {
 
             // three waiters, one commit
             var fs: []task.Future[Done] = []
-            for k in 0..3 { append(mut &fs, sc.start(runJob, job(st, ["waitfor (select seq from ev where seq > 3 order by seq limit 10), timeout 5000"]))) }
+            for k in 0..3 { append(mut &fs, sc.start(runJob, job(st, ["select seq from ev where seq > 3 order by seq limit 10 wait 5000 milliseconds"]))) }
             pause(30)
             let i4 = one(mut &a, "insert into ev values (4, 'x', 'four')")
             var outs: []str = []
@@ -211,7 +219,7 @@ fn main() {
             println("three waiters: " + strings.join(&outs, " / "))
 
             // a consumer's block: a producer commits between its WAITFOR and its COMMIT
-            let fc = sc.start(runJob, job(st, ["begin", "waitfor (select seq from ev where seq > 4 order by seq limit 1), timeout 5000", "pause",
+            let fc = sc.start(runJob, job(st, ["begin", "select seq from ev where seq > 4 order by seq limit 1 wait 5000 milliseconds", "pause",
                                                "update offs set last = 5 where id = 'a' and last = 0", "commit"]))
             pause(30)
             let i5 = one(mut &a, "insert into ev values (5, 'x', 'five')")
@@ -227,9 +235,9 @@ fn main() {
             println("plain select: " + outOf(fp))
 
             // two workers on one offset: compare-and-set
-            let w1 = sc.start(runJob, job(st, ["begin", "waitfor (select seq from ev where seq > 5 order by seq limit 1), timeout 5000", "pause",
+            let w1 = sc.start(runJob, job(st, ["begin", "select seq from ev where seq > 5 order by seq limit 1 wait 5000 milliseconds", "pause",
                                                "update offs set last = 6 where id = 'b' and last = 5", "commit"]))
-            let w2 = sc.start(runJob, job(st, ["begin", "waitfor (select seq from ev where seq > 5 order by seq limit 1), timeout 5000", "pause",
+            let w2 = sc.start(runJob, job(st, ["begin", "select seq from ev where seq > 5 order by seq limit 1 wait 5000 milliseconds", "pause",
                                                "update offs set last = 6 where id = 'b' and last = 5", "commit"]))
             let o1 = outOf(w1)
             let o2 = outOf(w2)
@@ -244,40 +252,40 @@ fn main() {
 
         var b = lexdb_exec.newSession(st)
         let nf = [one(mut &b, "begin"), one(mut &b, "select 1"),
-                  one(mut &b, "waitfor (select seq from ev where seq > 0 order by seq limit 1)"), one(mut &b, "rollback")]
+                  one(mut &b, "select seq from ev where seq > 0 order by seq limit 1 wait 60 seconds"), one(mut &b, "rollback")]
         println("not first: " + strings.join(&nf, " / "))
 
         let v1 = one(mut &b, "create view evv as select * from ev")
         let t1 = one(mut &b, "create temporary table tq (seq int primary key)")
         var refused: []str = []
-        for q in ["waitfor (select count(*) from ev where seq > 0 order by seq limit 1)",
-                  "waitfor (select seq from ev where seq > 0 limit 1)",
-                  "waitfor (select seq from ev where seq > 0 order by seq)",
-                  "waitfor (select seq from ev where payload > 'a' order by payload limit 1)",
-                  "waitfor (select seq from ev where seq > 0 and nextval('s') > 0 order by seq limit 1)",
-                  "waitfor (select seq from ev where seq > 0 order by seq desc limit 1)",
-                  "waitfor (select seq from ev where seq > 0 order by seq limit 1 for update)",
-                  "waitfor (select seq from ev where seq > (select 1) order by seq limit 1)",
-                  "waitfor (select seq from tq where seq > 0 order by seq limit 1)",
-                  "waitfor (select seq from evv where seq > 0 order by seq limit 1)",
-                  "waitfor (select seq from nope where seq > 0 order by seq limit 1)"] {
+        for q in ["select count(*) from ev where seq > 0 order by seq limit 1 wait 60 seconds",
+                  "select seq from ev where seq > 0 limit 1 wait 60 seconds",
+                  "select seq from ev where seq > 0 order by seq wait 60 seconds",
+                  "select seq from ev where payload > 'a' order by payload limit 1 wait 60 seconds",
+                  "select seq from ev where seq > 0 and nextval('s') > 0 order by seq limit 1 wait 60 seconds",
+                  "select seq from ev where seq > 0 order by seq desc limit 1 wait 60 seconds",
+                  "select seq from ev where seq > 0 order by seq limit 1 for update wait 60 seconds",
+                  "select seq from ev where seq > (select 1) order by seq limit 1 wait 60 seconds",
+                  "select seq from tq where seq > 0 order by seq limit 1 wait 60 seconds",
+                  "select seq from evv where seq > 0 order by seq limit 1 wait 60 seconds",
+                  "select seq from nope where seq > 0 order by seq limit 1 wait 60 seconds"] {
             append(mut &refused, one(mut &b, q))
         }
         println("refused: " + strings.join(&refused, " "))
 
         let so = one(mut &b, "set statement_timeout = 50")
-        println("statement_timeout: " + one(mut &b, "waitfor (select seq from ev where seq > 100 order by seq limit 1), timeout 5000"))
+        println("statement_timeout: " + one(mut &b, "select seq from ev where seq > 100 order by seq limit 1 wait 5000 milliseconds"))
         let sr = one(mut &b, "reset statement_timeout")
 
         task.scope(fn(sc: mut &task.Scope) {
             // READ ONLY: the block's snapshot is the one WAITFOR found rows in
-            let fo = sc.start(runJob, job(st, ["begin read only", "waitfor (select seq from ev where seq > 6 order by seq limit 1), timeout 5000",
+            let fo = sc.start(runJob, job(st, ["begin read only", "select seq from ev where seq > 6 order by seq limit 1 wait 5000 milliseconds",
                                                "select max(seq) from ev", "commit"]))
             pause(30)
             println("read only: " + outOf(fo))
 
             // a partition's cursor: part 1's event wakes it, part 2's is returned
-            let fq = sc.start(runJob, job(st, ["waitfor (select part, seq from pev where part = 2 and seq > 1 order by seq limit 5), timeout 5000"]))
+            let fq = sc.start(runJob, job(st, ["select part, seq from pev where part = 2 and seq > 1 order by seq limit 5 wait 5000 milliseconds"]))
             pause(30)
             let p1 = one(mut &a, "insert into pev values (1, 2)")
             pause(30)
@@ -285,19 +293,19 @@ fn main() {
             println("partition: " + outOf(fq))
 
             // filters: rows that fail them wake the waiter, which waits on
-            let ff = sc.start(runJob, job(st, ["waitfor (select seq, subject from ev where seq > 7 and subject = 'y' order by seq limit 5), timeout 5000"]))
+            let ff = sc.start(runJob, job(st, ["select seq, subject from ev where seq > 7 and subject = 'y' order by seq limit 5 wait 5000 milliseconds"]))
             pause(30)
             let f8 = one(mut &a, "insert into ev values (8, 'x', 'no')")
             pause(30)
             let f9 = one(mut &a, "insert into ev values (9, 'y', 'yes')")
             println("filter: " + outOf(ff))
-            let fo2 = sc.start(runJob, job(st, ["waitfor (select seq, subject from ev where seq > 9 and (lower(subject) = 'z' or payload like 'hot%') order by seq limit 5), timeout 5000"]))
+            let fo2 = sc.start(runJob, job(st, ["select seq, subject from ev where seq > 9 and (lower(subject) = 'z' or payload like 'hot%') order by seq limit 5 wait 5 seconds"]))
             pause(30)
             let f10 = one(mut &a, "insert into ev values (10, 'q', 'cold')")
             pause(30)
             let f11 = one(mut &a, "insert into ev values (11, 'Z', 'x')")
             println("or and a function: " + outOf(fo2))
-            let fp2 = sc.start(runJob, job(st, ["waitfor (select part, seq, kind from pev2 where part = 1 and seq > 0 and kind = 'b' order by seq limit 5), timeout 5000"]))
+            let fp2 = sc.start(runJob, job(st, ["select part, seq, kind from pev2 where part = 1 and seq > 0 and kind = 'b' order by seq limit 5 wait 5000 milliseconds"]))
             pause(30)
             let q1 = one(mut &a, "insert into pev2 values (1, 1, 'a'), (2, 1, 'b')")
             pause(30)
@@ -306,7 +314,7 @@ fn main() {
         })
 
         // TIMEOUT and the cursor as parameters
-        let ps = lexdb_sql.parse(&"waitfor (select seq from ev where seq > $1 order by seq limit 2), timeout $2").unwrap()
+        let ps = lexdb_sql.parse(&"select seq from ev where seq > $1 order by seq limit 2 wait $2 milliseconds").unwrap()
         let nt: []int = []
         let r1 = b.run(&ps[0], &[Val.Int(0), Val.Int(1000)], &nt).unwrap()
         let r2 = b.run(&ps[0], &[Val.Int(99), Val.Int(30)], &nt).unwrap()
@@ -329,7 +337,7 @@ fn main() {
         var ts = lexdb_tsql.newState(1)
         var fr = lexdb_tsql.newFrame()
         var evs: []lexdb_tsql.Event = []
-        lexdb_tsql.run(mut &b, mut &ts, &"WAITFOR (SELECT TOP 2 seq FROM ev WHERE seq > 0 ORDER BY seq), TIMEOUT 1000", mut &fr, mut &evs)
+        lexdb_tsql.run(mut &b, mut &ts, &"SELECT TOP 2 seq FROM ev WHERE seq > 0 ORDER BY seq WAIT 1000 MILLISECONDS", mut &fr, mut &evs)
         var tout: []str = []
         for x in evs {
             if x.kind == lexdb_tsql.EV_ROWS { append(mut &tout, rowsText(&x.rows)) }
@@ -339,7 +347,7 @@ fn main() {
 
         // T-SQL in a transaction: each statement under a savepoint of its own
         var evs2: []lexdb_tsql.Event = []
-        lexdb_tsql.run(mut &b, mut &ts, &"BEGIN TRAN; WAITFOR (SELECT TOP 1 seq FROM ev WHERE seq > 0 ORDER BY seq), TIMEOUT 1000; SELECT TOP 1 seq FROM ev WHERE seq > 1 ORDER BY seq; COMMIT", mut &fr, mut &evs2)
+        lexdb_tsql.run(mut &b, mut &ts, &"BEGIN TRAN; SELECT TOP 1 seq FROM ev WHERE seq > 0 ORDER BY seq WAIT 1 SECONDS; SELECT TOP 1 seq FROM ev WHERE seq > 1 ORDER BY seq; COMMIT", mut &fr, mut &evs2)
         var tout2: []str = []
         for x in evs2 {
             if x.kind == lexdb_tsql.EV_ROWS { append(mut &tout2, rowsText(&x.rows)) }
@@ -351,9 +359,9 @@ fn main() {
         let mq2 = one(mut &a, "insert into q values (1, 'pending'), (2, 'other')")
         task.scope(fn(sc: mut &task.Scope) {
             // two workers take the same row: the second's read of it is checked
-            let w1 = sc.start(runJob, job(st, ["begin", "waitfor (select seq from q where seq > 0 and status = 'pending' order by seq limit 1)", "pause",
+            let w1 = sc.start(runJob, job(st, ["begin", "select seq from q where seq > 0 and status = 'pending' order by seq limit 1 wait 60 seconds", "pause",
                                                "update q set status = 'done' where seq = 1", "commit"]))
-            let w2 = sc.start(runJob, job(st, ["begin", "waitfor (select seq from q where seq > 0 and status = 'pending' order by seq limit 1)", "pause",
+            let w2 = sc.start(runJob, job(st, ["begin", "select seq from q where seq > 0 and status = 'pending' order by seq limit 1 wait 60 seconds", "pause",
                                                "update q set status = 'done' where seq = 1", "commit"]))
             let o1 = outOf(w1)
             let o2 = outOf(w2)
@@ -366,7 +374,7 @@ fn main() {
             println("same row: " + ok.toStr() + " committed, " + conflict.toStr() + " 40001")
 
             // a row its filter skipped, changed meanwhile
-            let fk = sc.start(runJob, job(st, ["begin", "waitfor (select seq from q where seq > 0 and status = 'other' order by seq limit 5)", "pause",
+            let fk = sc.start(runJob, job(st, ["begin", "select seq from q where seq > 0 and status = 'other' order by seq limit 5 wait 60 seconds", "pause",
                                                "update offs set last = 99 where id = 'c'", "commit"]))
             pause(20)
             let ch = one(mut &a, "update q set status = 'x' where seq = 1")
@@ -378,7 +386,7 @@ fn main() {
         var c = lexdb_exec.newSession(st)
         let c0 = one(mut &c, "set statement_timeout = 50")
         var sp: []str = [one(mut &c, "begin"), one(mut &c, "savepoint a"),
-                         one(mut &c, "waitfor (select seq from ev where seq > 100 order by seq limit 1), timeout 5000"),
+                         one(mut &c, "select seq from ev where seq > 100 order by seq limit 1 wait 5000 milliseconds"),
                          one(mut &c, "rollback to a")]
         let n1 = one(mut &c, "select count(*) from ev")
         let ins = one(mut &a, "insert into ev values (12, 'x', 'twelve')")
@@ -389,23 +397,72 @@ fn main() {
         let rb = one(mut &c, "rollback")
         let bb = one(mut &c, "begin")
         let sv = one(mut &c, "savepoint a")
-        let w0 = one(mut &c, "waitfor (select seq from ev where seq > 100 order by seq limit 1), timeout 10")
+        let w0 = one(mut &c, "select seq from ev where seq > 100 order by seq limit 1 wait 10 milliseconds")
         let rb2 = one(mut &c, "rollback to a")
-        append(mut &sp, one(mut &c, "waitfor (select seq from ev where seq > 0 order by seq limit 1), timeout 10"))
+        append(mut &sp, one(mut &c, "select seq from ev where seq > 0 order by seq limit 1 wait 10 milliseconds"))
         append(mut &sp, one(mut &c, "commit"))
         // (the first ROLLBACK TO's result, then the block's counts)
         println("after a savepoint: " + strings.join(&sp, " / "))
         c.close()
 
         // the client's parameter types
-        let pt = lexdb_sql.parse(&"waitfor (select seq, $2 from ev where seq > $1 order by seq limit 1), timeout 100").unwrap()
+        let pt = lexdb_sql.parse(&"select seq, $2 from ev where seq > $1 order by seq limit 1 wait 100 milliseconds").unwrap()
         let r3 = b.run(&pt[0], &[Val.Int(0), Val.Int(5)], &[lexdb_sql.OID_INT8, lexdb_sql.OID_INT4]).unwrap()
         println("parameter types: " + r3.cols[1].oid.toStr())
 
-        println("alias list: " + one(mut &b, "waitfor (select seq from ev as e(subject, seq, payload) where seq > '' order by seq limit 1)") +
-                "; minus: " + one(mut &b, "waitfor (select seq from ev where seq > -1 order by seq limit 1)"))
+        println("alias list: " + one(mut &b, "select seq from ev as e(subject, seq, payload) where seq > '' order by seq limit 1 wait 60 seconds") +
+                "; minus: " + one(mut &b, "select seq from ev where seq > -1 order by seq limit 1 wait 60 seconds"))
 
-        for k in 0..5 { let w = one(mut &b, "waitfor (select seq from ev where seq > 1000 order by seq limit 1), timeout 5") }
+        // SELECT ... WAIT n unit: each unit, and a parameter (the units' timing too)
+        var us: []str = []
+        for q in ["wait 1 second", "wait 1 seconds", "wait 1000 millisecond", "wait 1000 milliseconds", "wait 1000 ms", "wait (1) seconds"] {
+            append(mut &us, one(mut &b, "select seq from ev where seq > 0 order by seq limit 1 " + q))
+        }
+        println("units: " + strings.join(&us, " / "))
+        var tm: []str = []
+        for q in ["1 second", "150 milliseconds", "1 millisecond", "120 ms"] {
+            let u0 = time.monotonicNs()
+            let r = one(mut &b, "select seq from ev where seq > 5000 order by seq limit 1 wait " + q)
+            let el = (time.monotonicNs() - u0) / 1000000
+            let want = if q == "1 second" { 900 } else if q == "150 milliseconds" { 120 } else if q == "1 millisecond" { 0 } else { 100 }
+            append(mut &tm, if r == "" && el >= want && el < want + 700 { "t" } else { "f " + r + " " + el.toStr() })
+        }
+        println("unit timing: 1s " + tm[0] + ", 150ms " + tm[1] + ", 1ms " + tm[2] + ", ms " + tm[3])
+        let wp = lexdb_sql.parse(&"select seq from ev where seq > 5000 order by seq limit 1 wait $1 seconds").unwrap()
+        let wnt: []int = []
+        let t1w = time.monotonicNs()
+        let w1 = b.run(&wp[0], &[Val.Int(0)], &wnt).unwrap()
+        let w2 = b.run(&wp[0], &[Val.Int(1)], &wnt).unwrap()
+        let w3 = (time.monotonicNs() - t1w) / 1000000
+        let wq = lexdb_sql.parse(&"select seq from ev where seq > $1 order by seq limit 2 wait $2 seconds").unwrap()
+        let w4 = b.run(&wq[0], &[Val.Int(0), Val.Int(60)], &wnt).unwrap()
+        println("wait param: " + (if len(w1.rows) == 0 { "empty" } else { "rows" }) + " " + (if w3 >= 900 { "t" } else { "f" }) + ", " +
+                (if len(w2.rows) == 0 { "empty" } else { "rows" }) + " " + (if w3 < 1700 { "t" } else { "f" }) + ", " + rowsText(&w4.rows))
+
+        // wait is not reserved
+        let wt = one(mut &b, "create table wait (wait bigint primary key, seconds int)")
+        let wi = one(mut &b, "insert into wait values (1, 1)")
+        println("wait names: " + one(mut &b, "select wait, seconds from wait where wait > 0 order by wait limit 1 wait 5 milliseconds") + " / " +
+                one(mut &b, "select wait from wait where wait > 0 order by wait limit 1") + " / " +
+                one(mut &b, "select 1 as wait") + " / " + one(mut &b, "select w.wait from wait w where w.wait = 1"))
+        var we: []str = []
+        for q in ["wait", "wait 5", "wait seconds", "wait 5 days", "wait 5 seconds seconds", "wait 0.5 seconds", "wait -1 seconds"] {
+            append(mut &we, one(mut &b, "select seq from ev where seq > 0 order by seq limit 1 " + q))
+        }
+        println("wait errors: " + strings.join(&we, " "))
+        println("old form: " + one(mut &b, "waitfor (select seq from ev where seq > 0 order by seq limit 1), timeout 10"))
+
+        // T-SQL: the clause after TOP, and WAIT as a name
+        var evs3: []lexdb_tsql.Event = []
+        lexdb_tsql.run(mut &b, mut &ts, &"DECLARE @n int = 1; SELECT TOP 2 seq FROM ev WHERE seq > 0 ORDER BY seq WAIT 1 SECONDS; SELECT TOP 2 seq FROM ev WHERE seq > 0 ORDER BY seq WAIT 1000 MS; SELECT TOP 1 seq FROM ev WHERE seq > 0 ORDER BY seq WAIT @n SECONDS; SELECT TOP 1 wait FROM wait ORDER BY wait", mut &fr, mut &evs3)
+        var tout3: []str = []
+        for x in evs3 {
+            if x.kind == lexdb_tsql.EV_ROWS { append(mut &tout3, rowsText(&x.rows)) }
+            if x.kind == lexdb_tsql.EV_ERROR { append(mut &tout3, x.err.state + " " + x.err.msg) }
+        }
+        println("t-sql suffix: " + strings.join(&tout3, " / "))
+
+        for k in 0..5 { let w = one(mut &b, "select seq from ev where seq > 1000 order by seq limit 1 wait 5 milliseconds") }
         println("waits left: " + st.durWaiting().toStr())
 
         b.close()

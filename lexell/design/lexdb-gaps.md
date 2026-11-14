@@ -95,8 +95,8 @@ feature.
   - `VACUUM`, `ANALYZE`, `CHECKPOINT`, `REINDEX` and `CLUSTER`, accepted
     as doing nothing.
 - **Replication:** read-only replicas on the same machine (9.68 to 9.73).
-- **Event streams** (9.98, `lexdb-events.md`): `WAITFOR (SELECT ...),
-  TIMEOUT ms`, a SELECT on an ordinary table that waits for a commit to add
+- **Event streams** (9.98, `lexdb-events.md`): `SELECT ... WAIT n
+  SECONDS`, a SELECT on an ordinary table that waits for a commit to add
   rows after a cursor.
 
 **Speed** (9.67, PostgreSQL 18 on the same machine, all the data in
