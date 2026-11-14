@@ -2063,8 +2063,13 @@ fn (g: &Gen) quietRt(e: int): bool {
     let dv = divOp(name)
     if dv.k >= 0 { return nargs == (if dv.op == ir.OP_SUB { 2 } else { 3 }) && g.isWhere(g.u.listAt(n.b, nargs - 1)) }
     if name == "rt_idx" || name == "rt_sidx" || name == "rt_str_byte" || name == "rt_str_word" { return nargs == 3 && g.isWhere(g.u.listAt(n.b, 2)) }
-    return name == "rt_str_dup" && nargs == 1
+    return name == "rt_str_dup" && nargs == 1 && !g.kern()
 }
+
+// A kernel function (kernel.lxl) may run on a par pool thread: its str counts are changed by the
+// runtime's rt_str_dup and rt_str_drop, which leave a block another thread owns alone
+// (design/parallel.md 2.3, 2.4), not inline.
+fn (g: &Gen) kern(): bool { return g.curFunc >= 0 && g.u.funcs[g.curFunc].kernel }
 
 // Whether the call e (not generated in place) leaves xmm8-xmm15 alone: a call of a function of
 // native/math.c (a static program's: a dynamically linked one imports libm's). The libm calls that
@@ -6309,7 +6314,7 @@ fn (g: &Gen) rtName(e: int): str {
 fn (g: mut &Gen) dupArg(e: int, j: int): bool {
     let l = g.u.nodes[e].b
     let x = g.u.listAt(l, j)
-    if g.u.nk(x) != ir.E_CALL || g.rtName(x) != "rt_str_dup" || g.u.listLen(g.u.nodes[x].b) != 1 { return false }
+    if g.u.nk(x) != ir.E_CALL || g.rtName(x) != "rt_str_dup" || g.u.listLen(g.u.nodes[x].b) != 1 || g.kern() { return false }
     let s = g.u.listAt(g.u.nodes[x].b, 0)
     if g.staticMem(s).base == -9 { return false }
     var r = s
@@ -7015,7 +7020,7 @@ fn (g: mut &Gen) inlineRt(e: int, name: str): bool {
         if wd { g.a.load(8, dst, x64.memx(RAX, RCX, 1, 8)) } else { g.a.loadZX(1, dst, x64.memx(RAX, RCX, 1, 8)) }
         return true
     }
-    if name == "rt_str_dup" && nargs == 1 {
+    if name == "rt_str_dup" && nargs == 1 && !g.kern() {
         // if (b && b->rc >= 0) b->rc++; the result is the same str: a local or a member of
         // one is its own result (an aggregate value is the address of its bytes, used at once)
         let x = g.u.listAt(n.b, 0)
@@ -7070,7 +7075,7 @@ fn (g: mut &Gen) inlineRt(e: int, name: str): bool {
         g.a.bind(done)
         return true
     }
-    if name == "rt_str_drop" && nargs == 1 {
+    if name == "rt_str_drop" && nargs == 1 && !g.kern() {
         // if (b && b->rc > 0 && --b->rc == 0) rt_free(b)
         let m = g.staticMem(g.u.listAt(n.b, 0))
         if m.base != -9 {

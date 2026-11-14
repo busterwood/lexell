@@ -196,6 +196,7 @@ typedef struct rt_wctx {
 #define PAR_SLOT ((size_t)8 << 20)      /* a worker's stack slot: guard page, stack, altstack, context */
 static char* rt_par_base;               /* the slots, or 0 before the pool starts */
 static size_t rt_par_span;
+static int rt_npar;                     /* par workers started: 0 not yet, -1 none (LXL_PAR=0, one CPU) */
 static inline __attribute__((always_inline)) rt_wctx* rt_wme(void) {
     size_t o = (size_t)((char*)__builtin_frame_address(0) - rt_par_base);
     if (__builtin_expect(o >= rt_par_span, 1)) return 0;
@@ -205,6 +206,20 @@ static inline rt_hp* rt_hp_me(void) {
     rt_wctx* w = rt_wme();
     return w ? &w->heap : &rt_mheap;
 }
+/* The par pool's side of allocation, traps and str counts (the par.map section at the end of this
+   file), reached only through these, which rt_par_start sets: a program without par.map links none
+   of it (the link keeps what is reachable). Called only when rt_wme() is a worker's. */
+typedef struct {
+    void* (*malloc)(rt_wctx* w, size_t n);
+    void (*free)(rt_wctx* w, void* p);
+    __attribute__((noreturn)) void (*stop)(rt_wctx* w, int code, const char* text, size_t n);
+    __attribute__((noreturn)) void (*trap)(rt_wctx* w, int code, const char* a, const char* b, size_t bn, const char* where);
+    bool (*count)(rt_wctx* w, void* b, int64_t d);
+} rt_par_hooks_t;
+static rt_par_hooks_t rt_par_hooks;
+/* A hook's value, opaque to gcc (which would otherwise call the one function stored in it, and so
+   link it into every program). */
+#define RT_HOOK(f) ({ __typeof__(rt_par_hooks.f) h_ = rt_par_hooks.f; __asm__("" : "+r"(h_)); h_; })
 
 static void* sys_mmap(size_t n) {
     i64 r = sys6(S_MMAP, 0, (i64)n, 3, 0x22, -1, 0);       /* PROT_READ|WRITE, MAP_PRIVATE|ANONYMOUS */
@@ -276,13 +291,12 @@ static inline __attribute__((always_inline)) void* malloc_h(rt_hp* h, size_t n, 
     ((size_t*)b)[0] = (size_t)c | h->tag << 8;
     return b + 8;
 }
-__attribute__((noinline)) static void* malloc_w(size_t n) {
-    rt_wctx* w = rt_wme();
-    return w ? malloc_h(&w->heap, n, true) : malloc_h(&rt_mheap, n, false);
-}
 void* malloc(size_t n) {
     if (!class_size[0]) heap_init();
-    if (__builtin_expect(rt_par_span != 0, 0)) return malloc_w(n);
+    if (__builtin_expect(rt_par_span != 0, 0)) {
+        rt_wctx* w = rt_wme();
+        if (w) return RT_HOOK(malloc)(w, n);
+    }
     return malloc_h(&rt_mheap, n, false);
 }
 static size_t block_size(void* p) {
@@ -298,13 +312,12 @@ static inline __attribute__((always_inline)) void free_h(rt_hp* hp, void* p) {
     *(void**)p = hp->free_list[h];
     hp->free_list[h] = p;
 }
-__attribute__((noinline)) static void free_w(void* p) {
-    rt_wctx* w = rt_wme();
-    free_h(w ? &w->heap : &rt_mheap, p);
-}
 void free(void* p) {
     if (!p) return;
-    if (__builtin_expect(rt_par_span != 0, 0)) { free_w(p); return; }
+    if (__builtin_expect(rt_par_span != 0, 0)) {
+        rt_wctx* w = rt_wme();
+        if (w) { RT_HOOK(free)(w, p); return; }
+    }
     free_h(&rt_mheap, p);
 }
 void* realloc(void* p, size_t n) {
@@ -348,6 +361,7 @@ static void write_all(int fd, const char* p, size_t n) {
 
 static int rt_oerr;                 /* the first failed write of rt_obuf (lxllib_flush_out) */
 void rt_flush(void) {
+    if (__builtin_expect(rt_par_span != 0, 0) && rt_wme()) return;     /* the buffer is the main thread's */
     size_t off = 0;
     while (off < rt_olen) {
         i64 n = SYS(S_WRITE, 1, rt_obuf + off, rt_olen - off);
@@ -375,6 +389,7 @@ static void eputd(int64_t v) {
 static void eflush(void) { write_all(2, ebuf, elen); elen = 0; }
 
 __attribute__((noreturn)) void rt_trap(int code, const char* msg, const char* where) {
+    if (__builtin_expect(rt_par_span != 0, 0)) { rt_wctx* w = rt_wme(); if (w) RT_HOOK(trap)(w, code, msg, "", 0, where); }
     rt_flush();
     eputs("Lexell: "); eputs(msg); eputs(" at "); eputs(where); eputs("\n");
     eflush();
@@ -411,10 +426,23 @@ static void rt_dgrow(rt_dact** ds, int64_t* cap) {
     *ds = realloc(*ds, (size_t)*cap * sizeof **ds);
     if (!*ds) rt_trap(2, "out of memory", "runtime");
 }
+/* A par worker's stack outlives its jobs, so it is a mapping of its own, not a block of its heap
+   (whose blocks belong to one job). */
+__attribute__((noinline)) static void rt_wdgrow(rt_wctx* w) {
+    int64_t cap = w->dcap ? w->dcap * 2 : 4096;
+    rt_dact* d = sys_mmap((size_t)cap * sizeof *d);
+    if (!d) rt_trap(2, "out of memory", "runtime");
+    if (w->ds) {
+        memcpy(d, w->ds, (size_t)w->dn * sizeof *d);
+        SYS(S_MUNMAP, w->ds, (size_t)w->dcap * sizeof *d, 0);
+    }
+    w->ds = d;
+    w->dcap = cap;
+}
 void rt_dpush(rt_dfn f, void* p) {
     rt_wctx* w = rt_par_span ? rt_wme() : 0;
     if (__builtin_expect(w != 0, 0)) {
-        if (w->dn == w->dcap) rt_dgrow(&w->ds, &w->dcap);
+        if (w->dn == w->dcap) rt_wdgrow(w);
         w->ds[w->dn].f = f; w->ds[w->dn++].p = p;
         return;
     }
@@ -713,6 +741,14 @@ static i64 rt_main_tid;         /* a fault on a helper thread (C code, stage C1c
 static void rt_segv(int sig, void* si, void* uc) {
     char* a = *(char**)((char*)si + 16);        /* si_addr */
     (void)uc;
+    if (rt_par_span) {                          /* a par worker's guard page (design/parallel.md 2.7) */
+        size_t o = (size_t)(a - rt_par_base);
+        rt_wctx* w = rt_wme();
+        if (w && o < rt_par_span && o % PAR_SLOT < 4096) {
+            static const char m[] = "Lexell: stack overflow\n";
+            RT_HOOK(stop)(w, 4, m, sizeof m - 1);
+        }
+    }
     if (SYS(186, 0, 0, 0) == rt_main_tid &&    /* gettid */
         ((a <= rt_stack_top && (size_t)(rt_stack_top - a) <= rt_stack_max + (1 << 20)) ||
          (rt_cur->stk && a >= rt_cur->stk && a < rt_cur->stk + RT_GUARD))) {
@@ -815,7 +851,11 @@ void rt_finish(void) {
         rt_quit(5);
     }
 }
-__attribute__((noreturn)) void rt_exit(int64_t code) { rt_flush(); rt_quit((int)code); }
+__attribute__((noreturn)) void rt_exit(int64_t code) {
+    if (__builtin_expect(rt_par_span != 0, 0)) { rt_wctx* w = rt_wme(); if (w) RT_HOOK(stop)(w, (int)code, "", 0); }
+    rt_flush();
+    rt_quit((int)code);
+}
 __attribute__((noreturn)) void exit(int code) { sys_exit(code); }
 
 /* ---- strings (see rt.h) */
@@ -836,8 +876,21 @@ lxl_str rt_str_of(const char* p, int64_t len) {
     if (len) memcpy(s.b->data, p, (size_t)len);
     return s;
 }
-lxl_str rt_str_dup(lxl_str s) { if (s.b && s.b->rc >= 0) s.b->rc++; return s; }
-void rt_str_drop(lxl_str s) { if (s.b && s.b->rc > 0 && --s.b->rc == 0) rt_free(s.b); }
+/* On a par worker, a block it does not own is not counted: the change goes to its log, and the
+   main thread makes it when the map ends (design/parallel.md 2.3). */
+lxl_str rt_str_dup(lxl_str s) {
+    if (s.b && s.b->rc >= 0) {
+        if (__builtin_expect(rt_par_span != 0, 0)) { rt_wctx* w = rt_wme(); if (w && RT_HOOK(count)(w, s.b, 1)) return s; }
+        s.b->rc++;
+    }
+    return s;
+}
+void rt_str_drop(lxl_str s) {
+    if (s.b && s.b->rc > 0) {
+        if (__builtin_expect(rt_par_span != 0, 0)) { rt_wctx* w = rt_wme(); if (w && RT_HOOK(count)(w, s.b, -1)) return; }
+        if (--s.b->rc == 0) rt_free(s.b);
+    }
+}
 bool rt_str_eq(lxl_str a, lxl_str b) {
     return a.len == b.len && (RT_SP(a) == RT_SP(b) || memcmp(RT_SP(a), RT_SP(b), (size_t)a.len) == 0);
 }
@@ -1462,6 +1515,10 @@ lxl_str rt_float_to_str(double d) {
     return rt_str_of(buf, n);
 }
 int64_t rt_write_fd(int64_t fd, lxl_str s) {
+    if (__builtin_expect(rt_par_span != 0, 0) && rt_wme()) {   /* a stop's message on a par worker: unbuffered */
+        write_all((int)fd, RT_SP(s), (size_t)s.len);
+        return s.len;
+    }
     if (fd == 1 && !rt_ended) {
         if (rt_olen + (size_t)s.len > sizeof rt_obuf) rt_flush();
         if ((size_t)s.len <= sizeof rt_obuf) {
@@ -1513,6 +1570,7 @@ bool rt_getenv(lxl_str name, lxl_str* out) {
     return true;
 }
 __attribute__((noreturn)) void rt_panic(lxl_str msg, const char* w) {
+    if (__builtin_expect(rt_par_span != 0, 0)) { rt_wctx* wc = rt_wme(); if (wc) RT_HOOK(trap)(wc, 12, "panic: ", RT_SP(msg), msg.len, w); }
     rt_flush();
     eputs("Lexell: panic: "); eput(RT_SP(msg), msg.len); eputs(" at "); eputs(w); eputs("\n");
     eflush();
@@ -1558,7 +1616,7 @@ void* rt_arr_push(lxl_arr* a, size_t size) {
         int64_t nc = a->cap ? a->cap * 2 : 4;
         void* d = realloc(a->data, (size_t)nc * size);
         if (!d) rt_trap(2, "out of memory", "runtime");
-        if (!a->data && rt_check) rt_live++;
+        if (!a->data && rt_check) rt_live_add(1);
         a->data = d; a->cap = nc;
     }
     return (char*)a->data + (size_t)(a->len++) * size;
@@ -1588,7 +1646,7 @@ void rt_str_append(lxl_arr* a, lxl_str s) {
         while (nc < n) nc *= 2;
         void* d = realloc(a->data, (size_t)nc);
         if (!d) rt_trap(2, "out of memory", "runtime");
-        if (!a->data && rt_check) rt_live++;
+        if (!a->data && rt_check) rt_live_add(1);
         a->data = d; a->cap = nc;
     }
     memcpy((char*)a->data + a->len, RT_SP(s), (size_t)s.len);
@@ -2969,6 +3027,17 @@ static void* rt_helper(void* unused) {
     }
     return 0;
 }
+/* The eventfd in the epoll set that a finished job (a helper's, or a par.map's) writes when the
+   event loop sleeps: opened by whichever pool starts first. */
+static void rt_pool_efd_open(void) {
+    if (rt_pool_efd >= 0) return;
+    i64 fd = rt_fd_room(0);
+    if (fd >= 0) fd = SYS(S_EVENTFD2, 0, K_O_NONBLOCK | K_O_CLOEXEC, 0);
+    if (fd < 0) rt_trap(2, "out of memory (a thread pool)", "runtime");
+    rt_pool_efd = (int)fd;
+    struct k_epoll_event ev = {K_EPOLLIN | K_EPOLLET, RT_POOL_TAG};
+    if (SYS4(S_EPOLL_CTL, rt_epfd, 1, fd, &ev) < 0) rt_trap(2, "out of memory (a thread pool)", "runtime");
+}
 static void rt_pool_start(void) {
     const char* e = getenv("LXL_HELPERS");
     int n = e && *e ? atoi(e) : 4;
@@ -2979,12 +3048,7 @@ static void rt_pool_start(void) {
     i64 nb = SYS(204, 0, sizeof cpus, cpus), ncpu = 0;
     for (i64 i = 0; i < nb / 8; i++) ncpu += __builtin_popcountll(cpus[i]);
     rt_pool_spins = ncpu > 1;
-    i64 fd = rt_fd_room(0);
-    if (fd >= 0) fd = SYS(S_EVENTFD2, 0, K_O_NONBLOCK | K_O_CLOEXEC, 0);
-    if (fd < 0) rt_trap(2, "out of memory (the helper pool)", "runtime");
-    rt_pool_efd = (int)fd;
-    struct k_epoll_event ev = {K_EPOLLIN | K_EPOLLET, RT_POOL_TAG};
-    if (SYS4(S_EPOLL_CTL, rt_epfd, 1, fd, &ev) < 0) rt_trap(2, "out of memory (the helper pool)", "runtime");
+    rt_pool_efd_open();
     unsigned long all = ~0UL, old = 0;
     SYS4(S_RT_SIGPROCMASK, 2, &all, &old, 8);                    /* SIG_SETMASK */
     int (*create)(unsigned long*, const void*, void* (*)(void*), void*) =
@@ -3145,6 +3209,7 @@ static int64_t rt_regs(void) {
 void lxllib_workers_begin(const char* w) {
     rt_nopark(w);
     if (rt_npool > 0) rt_trap(15, "task.workers after the helper pool has started (fork is unsafe once threads exist)", w);
+    if (rt_npar > 0) rt_trap(15, "task.workers after the par pool has started (fork is unsafe once threads exist)", w);
     if (rt_ntasks) rt_trap(15, "task.workers while other tasks exist", w);
     if (rt_regs()) rt_trap(15, "task.workers while the event loop holds registrations (a socket in use, or a signal watch)", w);
     uint64_t s = K_SUP_SET;
@@ -3640,11 +3705,318 @@ int64_t lxllib_net_wait_for(int64_t fd, int64_t dir, int64_t ms, bool cancellabl
 }
 
 /* ------------------------------------------------------------ par.map (design/parallel.md)
-   lib/par.lxl's runtime: n items, item(f, xs, i) boxing the result of item i. */
+   lib/par.lxl's runtime: n items, item(f, xs, i) boxing the result of item i into res[i].
+
+   The pool: LXL_PAR worker threads (at most 64; by default the CPUs the process may use, less
+   one), started at the first map, by raw clone (they run only kernels: no libc, no TLS). Each has
+   a slot of PAR_SLOT bytes in one mapping: a guard page, its stack, an alternate signal stack and
+   its context (rt_wctx) at the top, so rt_wme() finds the context from the stack pointer.
+
+   A map is a job on the stack of its caller, queued under rt_pool_lk (the helper pool's lock).
+   Workers take ranges of indexes with an atomic add. The calling task parks until the job is done
+   (rt_njobs counts it, so the loop waits for it as for a helper's call); when no other task could
+   run, the calling thread first takes ranges itself, as ordinary main-thread code. The last thread
+   to leave the job (users 0, every range handed out) finishes it: a worker pushes it on rt_jdone
+   and wakes the loop as a helper does.
+
+   A worker runs each job under a fresh tag: the blocks it allocates are its own while the job
+   runs and pass to the main thread with the results. It never changes the count of a str block
+   it does not own; it logs the change (rt_clog), and the main thread makes it when the job ends.
+   A trap on a worker (or an exit, or stack overflow) is recorded in the job, which finishes at
+   once; the main thread then stops the program with that message and code. */
+
+struct rt_clog {                        /* a worker's count changes, block -> net change */
+    void** k;
+    int64_t* d;
+    size_t cap, n;
+    rt_clog* next;
+};
+struct rt_pjob {
+    rt_job done;                        /* the loop's record (rt_jdone, rt_pool_drain) */
+    void* (*item)(void*, void*, int64_t);
+    void* f;
+    void* xs;
+    void** res;
+    int64_t n, chunk;
+    int64_t next;                       /* the next index handed out (atomic) */
+    int users;                          /* threads working on it (under the lock) */
+    bool removed, finished;             /* out of the queue; finished (under the lock) */
+    int fail;                           /* a stop's exit code, 0 for none (under the lock) */
+    size_t msgn;
+    char msg[1024];                     /* its message */
+    rt_clog* logs;                      /* the workers' logs (under the lock) */
+    int64_t live;                       /* the workers' LXL_CHECK counts (under the lock) */
+    rt_pjob* qnext;
+};
+static rt_pjob *rt_pq, *rt_pq_tail;     /* the jobs not yet handed out whole (under the lock) */
+static int rt_par_seq;                  /* changed (and woken) when a job is queued */
+static uint64_t rt_par_tags;            /* the last tag given to a worker (atomic) */
+#define PAR_ALT (1 << 16)
+
+__attribute__((noreturn)) static void rt_wstop(rt_wctx* w, int code, const char* text, size_t n);
+static void* rt_wmalloc(rt_wctx* w, size_t n) { return malloc_h(&w->heap, n, true); }
+static void rt_wfree(rt_wctx* w, void* p) {
+    static const char m[] = "Lexell: internal error: a par worker freed a block it does not own\n";
+    if (((size_t*)p)[-1] >> 8 != w->heap.tag) rt_wstop(w, 2, m, sizeof m - 1);
+    free_h(&w->heap, p);
+}
+/* "Lexell: <a><b> at <where>\n" for a par worker's stop, in its own buffer. */
+__attribute__((noreturn, noinline)) static void rt_wtrap(rt_wctx* w, int code, const char* a, const char* b, size_t bn,
+                                                          const char* where) {
+    char t[1024];
+    size_t n = 0;
+    const char* parts[3] = {"Lexell: ", a, 0};
+    for (int i = 0; parts[i]; i++) for (const char* q = parts[i]; *q && n < 900; q++) t[n++] = *q;
+    for (size_t i = 0; i < bn && n < 900; i++) t[n++] = b[i];
+    for (const char* q = " at "; *q; q++) t[n++] = *q;
+    for (const char* q = where; *q && n < 1020; q++) t[n++] = *q;
+    t[n++] = '\n';
+    rt_wstop(w, code, t, n);
+}
+static bool rt_str_wcount(rt_wctx* w, void* b, int64_t d) {
+    if (((size_t*)b)[-1] >> 8 == w->heap.tag) return false;
+    rt_clog* l = w->log;
+    if (!l || l->n * 2 >= l->cap) {
+        size_t cap = l ? l->cap * 2 : 64;
+        rt_clog* m = malloc(sizeof *m);
+        void** k = malloc(cap * sizeof *k);
+        int64_t* dd = malloc(cap * sizeof *dd);
+        if (!m || !k || !dd) rt_trap(2, "out of memory", "runtime");
+        memset(k, 0, cap * sizeof *k);
+        m->k = k; m->d = dd; m->cap = cap; m->n = 0; m->next = 0;
+        if (l) {
+            for (size_t i = 0; i < l->cap; i++) {
+                if (!l->k[i]) continue;
+                size_t h = ((size_t)l->k[i] >> 4) * 0x9E3779B97F4A7C15ULL >> 32 & (cap - 1);
+                while (m->k[h]) h = (h + 1) & (cap - 1);
+                m->k[h] = l->k[i]; m->d[h] = l->d[i]; m->n++;
+            }
+            free(l->k); free(l->d); free(l);
+        }
+        w->log = l = m;
+    }
+    size_t h = ((size_t)b >> 4) * 0x9E3779B97F4A7C15ULL >> 32 & (l->cap - 1);
+    while (l->k[h] && l->k[h] != b) h = (h + 1) & (l->cap - 1);
+    if (!l->k[h]) { l->k[h] = b; l->d[h] = 0; l->n++; }
+    l->d[h] += d;
+    return true;
+}
+
+/* Under the lock: j out of the queue, once every index is handed out. */
+static void rt_par_unqueue(rt_pjob* j) {
+    if (j->removed || __atomic_load_n(&j->next, __ATOMIC_RELAXED) < j->n) return;
+    j->removed = true;
+    rt_pjob** pp = &rt_pq;
+    rt_pjob* prev = 0;
+    while (*pp && *pp != j) { prev = *pp; pp = &(*pp)->qnext; }
+    if (*pp) {
+        *pp = j->qnext;
+        if (rt_pq_tail == j) rt_pq_tail = prev;
+    }
+}
+/* Under the lock: whether this leave finishes j. A worker then hands it to the loop. */
+static bool rt_par_last(rt_pjob* j) {
+    if (j->users != 0 || !j->removed || j->finished) return false;
+    j->finished = true;
+    return true;
+}
+static void rt_par_post(rt_pjob* j) {           /* a worker finished j: wake its task */
+    rt_pool_lock();
+    j->done.next = rt_jdone;
+    __atomic_store_n(&rt_jdone, &j->done, __ATOMIC_RELEASE);
+    rt_pool_unlock();
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    if (__atomic_load_n(&rt_pool_asleep, __ATOMIC_RELAXED)) {
+        uint64_t one = 1;
+        SYS(S_WRITE, rt_pool_efd, &one, 8);
+    }
+}
+/* Items of j until none is left (or it failed), on any thread. */
+static void rt_par_items(rt_pjob* j) {
+    for (;;) {
+        int64_t i0 = __atomic_fetch_add(&j->next, j->chunk, __ATOMIC_RELAXED);
+        if (i0 >= j->n) return;
+        int64_t i1 = i0 + j->chunk < j->n ? i0 + j->chunk : j->n;
+        for (int64_t i = i0; i < i1; i++) {
+            if (__atomic_load_n(&j->fail, __ATOMIC_RELAXED)) return;
+            j->res[i] = j->item(j->f, j->xs, i);
+        }
+    }
+}
+__attribute__((noreturn)) static void rt_wstop(rt_wctx* w, int code, const char* text, size_t n) {
+    rt_pjob* j = w->job;
+    if (!j) sys_exit(code);             /* not in a job: cannot happen */
+    rt_pool_lock();
+    if (!j->fail) {
+        j->fail = code ? code : 1;
+        if (n > sizeof j->msg) n = sizeof j->msg;
+        memcpy(j->msg, text, n);
+        j->msgn = n;
+    }
+    __atomic_store_n(&j->next, j->n, __ATOMIC_RELAXED);    /* nothing more is handed out */
+    rt_par_unqueue(j);
+    j->users--;
+    bool fin = rt_par_last(j);
+    rt_pool_unlock();
+    if (fin) rt_par_post(j);
+    for (;;) { int z = 0; SYS4(S_FUTEX, &z, K_FUTEX_WAIT_PRIVATE, 0, 0); }     /* the main thread stops the program */
+}
+static void rt_par_worker(rt_wctx* w) {
+    struct { void* sp; int flags; size_t size; } ss = {(char*)w - PAR_ALT, 0, PAR_ALT};
+    SYS(S_SIGALTSTACK, &ss, 0, 0);
+    unsigned long segv = (unsigned long)1 << 10;                 /* SIGSEGV: stack overflow is reported */
+    SYS4(S_RT_SIGPROCMASK, 1, &segv, 0, 8);                       /* SIG_UNBLOCK */
+    for (;;) {
+        rt_pool_lock();
+        while (!rt_pq) {
+            int seq = __atomic_load_n(&rt_par_seq, __ATOMIC_RELAXED);
+            rt_pool_unlock();
+            SYS4(S_FUTEX, &rt_par_seq, K_FUTEX_WAIT_PRIVATE, seq, 0);
+            rt_pool_lock();
+        }
+        rt_pjob* j = rt_pq;
+        j->users++;
+        rt_pool_unlock();
+        w->heap.tag = __atomic_add_fetch(&rt_par_tags, 1, __ATOMIC_RELAXED);
+        w->log = 0;
+        w->live = 0;
+        w->job = j;
+        rt_par_items(j);
+        rt_pool_lock();
+        if (w->log) { w->log->next = j->logs; j->logs = w->log; }
+        j->live += w->live;
+        rt_par_unqueue(j);
+        j->users--;
+        bool fin = rt_par_last(j);
+        rt_pool_unlock();
+        w->job = 0;
+        w->log = 0;
+        if (fin) rt_par_post(j);
+    }
+}
+/* clone(2) of a thread on stack top running fn(arg); 0 on failure. */
+static bool rt_clone(void* top, void (*fn)(rt_wctx*), rt_wctx* arg) {
+    void** sp = (void**)top;
+    *--sp = (void*)arg;
+    *--sp = (void*)fn;
+    register long r10 __asm__("r10") = 0;
+    register long r8 __asm__("r8") = 0;
+    long r;
+    __asm__ volatile(
+        "syscall\n\t"
+        "test %%rax, %%rax\n\t"
+        "jnz 1f\n\t"
+        "xor %%ebp, %%ebp\n\t"
+        "pop %%rax\n\t"
+        "pop %%rdi\n\t"
+        "and $-16, %%rsp\n\t"
+        "call *%%rax\n\t"
+        "mov $60, %%eax\n\t"
+        "xor %%edi, %%edi\n\t"
+        "syscall\n\t"
+        "1:\n\t"
+        : "=a"(r)
+        : "0"(56L), "D"(0x50f00L), "S"(sp), "d"(0L), "r"(r10), "r"(r8)
+        : "rcx", "r11", "memory");
+    return r > 0;
+}
+static int rt_ncpu(void) {
+    uint64_t cpus[16] = {0};                                     /* sched_getaffinity */
+    i64 nb = SYS(204, 0, sizeof cpus, cpus), n = 0;
+    for (i64 i = 0; i < nb / 8; i++) n += __builtin_popcountll(cpus[i]);
+    return n > 0 ? (int)n : 1;
+}
+static void rt_par_start(void) {
+    const char* e = getenv("LXL_PAR");
+    int ncpu = rt_ncpu();
+    int n = e && *e ? atoi(e) : ncpu - 1;
+    if (n > 64) n = 64;
+    rt_npar = -1;
+    if (n <= 0) return;
+    lxllib_hash_key(0);                                          /* its key, before any worker reads it */
+    rt_par_hooks.malloc = rt_wmalloc;
+    rt_par_hooks.free = rt_wfree;
+    rt_par_hooks.stop = rt_wstop;
+    rt_par_hooks.trap = rt_wtrap;
+    rt_par_hooks.count = rt_str_wcount;
+    rt_pool_efd_open();
+    if (ncpu > 1) rt_pool_spins = true;
+    i64 m = sys6(S_MMAP, 0, (i64)((size_t)n * PAR_SLOT), 3, 0x4022, -1, 0);  /* MAP_PRIVATE|ANONYMOUS|NORESERVE */
+    if (m < 0 && m > -4096) return;
+    char* base = (char*)m;
+    for (int i = 0; i < n; i++) {
+        char* slot = base + (size_t)i * PAR_SLOT;
+        SYS(10, slot, 4096, 0);                                  /* mprotect PROT_NONE: the guard page */
+        rt_wctx* w = (rt_wctx*)(slot + PAR_SLOT - sizeof(rt_wctx));
+        memset(w, 0, sizeof *w);
+        w->id = i + 1;
+    }
+    rt_par_base = base;
+    __atomic_store_n(&rt_par_span, (size_t)n * PAR_SLOT, __ATOMIC_RELEASE);
+    unsigned long all = ~0UL, old = 0;
+    SYS4(S_RT_SIGPROCMASK, 2, &all, &old, 8);                    /* SIG_SETMASK: workers start with all blocked */
+    int k = 0;
+    for (; k < n; k++) {
+        char* slot = base + (size_t)k * PAR_SLOT;
+        rt_wctx* w = (rt_wctx*)(slot + PAR_SLOT - sizeof(rt_wctx));
+        char* top = (char*)(((uintptr_t)w - PAR_ALT - 64) & ~(uintptr_t)63);
+        if (!rt_clone(top, rt_par_worker, w)) break;
+    }
+    SYS4(S_RT_SIGPROCMASK, 2, &old, 0, 8);
+    rt_npar = k > 0 ? k : -1;
+}
+
 void* lxllib_par_run(int64_t n, void* (*item)(void*, void*, int64_t), void* f, void* xs, const char* w) {
     rt_nopark(w);
     void** r = (void**)rt_alloc((size_t)n * sizeof(void*));
-    for (int64_t i = 0; i < n; i++) r[i] = item(f, xs, i);
+    if (!rt_npar) rt_par_start();
+    if (rt_npar < 0 || n == 1) {
+        for (int64_t i = 0; i < n; i++) r[i] = item(f, xs, i);
+        return r;
+    }
+    bool alone = !rt_rq_head && !rt_nio && !rt_nheap && !rt_njobs && !rt_cc_timed();
+    int64_t chunk = n / (8 * (int64_t)(rt_npar + 1));
+    if (chunk < 1) chunk = 1;
+    rt_pjob j;
+    memset(&j, 0, sizeof j);
+    j.done.t = rt_cur;
+    j.item = item; j.f = f; j.xs = xs; j.res = r; j.n = n; j.chunk = chunk;
+    rt_pool_lock();
+    if (rt_pq_tail) rt_pq_tail->qnext = &j; else rt_pq = &j;
+    rt_pq_tail = &j;
+    if (alone) j.users++;
+    __atomic_add_fetch(&rt_par_seq, 1, __ATOMIC_RELEASE);
+    rt_pool_unlock();
+    int64_t ranges = (n + chunk - 1) / chunk;
+    SYS4(S_FUTEX, &rt_par_seq, K_FUTEX_WAKE_PRIVATE, ranges < rt_npar ? ranges : rt_npar, 0);
+    if (alone) {                                            /* nothing else to run: work too */
+        rt_par_items(&j);
+        rt_pool_lock();
+        rt_par_unqueue(&j);
+        j.users--;
+        if (rt_par_last(&j)) j.done.done = true;
+        rt_pool_unlock();
+    }
+    rt_njobs++;
+    while (!__atomic_load_n(&j.done.done, __ATOMIC_ACQUIRE)) rt_park(false, w);
+    rt_njobs--;
+    if (j.fail) {                                           /* a worker stopped: stop the program */
+        rt_flush();
+        write_all(2, j.msg, j.msgn);
+        rt_quit(j.fail);
+    }
+    for (rt_clog* l = j.logs; l;) {                         /* the workers' count changes */
+        for (size_t i = 0; i < l->cap; i++) {
+            lxl_sblk* b = (lxl_sblk*)l->k[i];
+            if (!b || !l->d[i]) continue;
+            b->rc += l->d[i];
+            if (b->rc <= 0) rt_trap(2, "internal error: a par worker dropped a string it did not own", w);
+        }
+        rt_clog* nx = l->next;
+        free(l->k); free(l->d); free(l);
+        l = nx;
+    }
+    if (rt_check) rt_live += j.live;
     return r;
 }
 void* lxllib_par_get(void* r, int64_t i) { return ((void**)r)[i]; }
