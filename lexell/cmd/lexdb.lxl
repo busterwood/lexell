@@ -47,7 +47,7 @@ extern "c" fn ioctlFlags(fd: i32, req: int, flags: mut &int): i32 as "ioctl"
 // the directory, the flag (FS_NOCOW_FL) is taken by files created in it;
 // a file that already has data keeps copy-on-write. Other file systems
 // refuse the flag, and any failure is ignored: it is an optimisation.
-fn noCow(dir: str) {
+fn noCow(dir: &str) {
     let fd = openLock(dir, i32(65536 | 524288), u32(0))           // O_RDONLY|O_DIRECTORY|O_CLOEXEC
     if fd < 0 { return }
     var fl = 0                                                      // the kernel uses the low 4 bytes
@@ -108,10 +108,14 @@ const EXIT_REFUSED = 3
 var START_FAIL: int = 1
 
 // The log's file system: the data directory's own, or the one --log-dir names.
-fn logFs(dir: str): lexdb_disk.Fs { return lexdb_disk.real(if LOG_DIR == "" { dir } else { LOG_DIR }) }
+fn logFs(dir: &str): lexdb_disk.Fs {
+    if LOG_DIR == "" { return lexdb_disk.real(dir) }
+    let d = LOG_DIR
+    return lexdb_disk.real(&d)
+}
 
 // The MB of --cache-mb or LEXDB_CACHE_MB: 1 to 1048576 (1 TB), else None.
-fn parseCacheMb(v: str): Option[int] {
+fn parseCacheMb(v: &str): Option[int] {
     match strings.parseIntOpt(&v) {
         Some(mb) {
             if mb >= 1 && mb <= 1048576 { return Some(mb) }
@@ -144,7 +148,7 @@ fn main() {
             i += 1
         } else if a == "--cache-mb" {
             if i + 1 >= len(args) { usage() }
-            match parseCacheMb(args[i + 1]) {
+            match parseCacheMb(&(args[i + 1])) {
                 Some(mb) { CACHE_MB = mb }
                 None {
                     eprintln("lexdb: --cache-mb: a whole number of MB from 1 to 1048576, not " + args[i + 1])
@@ -219,7 +223,7 @@ fn main() {
             exit(1)
         }
     }
-    noCow(dir)
+    noCow(&dir)
     if replicas == 0 {
         runMaster(dir, &addrs, &tdsAddrs, &tnsAddrs, &auth)
         return
@@ -358,13 +362,16 @@ fn runMaster(dir: str, addrs: &[]str, tdsAddrs: &[]str, tnsAddrs: &[]str, auth: 
     // file is read past the kernel's cache (O_DIRECT), so this cache is all
     // there is
     let opts = opts0()
-    let opened = if LOG_DIR == "" { lexdb_store.open(lexdb_disk.real(dir), opts) } else { lexdb_store.openSplit(lexdb_disk.real(dir), logFs(dir), opts) }
+    let opened = if LOG_DIR == "" { lexdb_store.open(lexdb_disk.real(&dir), opts) } else { lexdb_store.openSplit(lexdb_disk.real(&dir), logFs(&dir), opts) }
     if opened.isErr() {
         eprintln("lexdb: open " + dir + ": " + opened.unwrapErr().toStr())
         exit(START_FAIL)
     }
     let st = opened.unwrap()
-    if LOG_DIR != "" { noCow(LOG_DIR) }
+    if LOG_DIR != "" {
+        let ld = LOG_DIR
+        noCow(&ld)
+    }
     var code = 0
     task.scope(fn(s: mut &task.Scope) {
         s.spawn(lexdb_store.writer, st)
@@ -495,7 +502,7 @@ fn memBytes(): int {
 }
 
 // The environment variable name in KiB as bytes, else d.
-fn envKb(name: str, d: int): int {
+fn envKb(name: &str, d: int): int {
     match os.env(&name) {
         Some(v) {
             match strings.parseIntOpt(&v) {
@@ -517,7 +524,7 @@ fn opts0(): lexdb_store.Options {
     opts.cacheBytes = max(opts.cacheBytes, memBytes() / 4)
     match os.env("LEXDB_CACHE_MB") {
         Some(v) {
-            match parseCacheMb(v) {
+            match parseCacheMb(&v) {
                 Some(mb) { opts.cacheBytes = mb * 1024 * 1024 }
                 None {
                     eprintln("lexdb: LEXDB_CACHE_MB: a whole number of MB from 1 to 1048576, not " + v)
@@ -542,7 +549,7 @@ fn runReplica(dir: str, addrs: &[]str, opts: lexdb_store.Options, reusePort: boo
               auth: &lexdb_wire.AuthConf) {
     task.watchSignals(&[task.SIGTERM, task.SIGINT])
     var sharedLns = shared
-    let conn = lexdb_repl.connect(dir, if LOG_DIR == "" { None } else { Some(logFs(dir)) }, opts, waitMs)
+    let conn = lexdb_repl.connect(&dir, if LOG_DIR == "" { None } else { Some(logFs(&dir)) }, opts, waitMs)
     if conn.isErr() {
         eprintln("lexdb: replica of " + dir + ": " + conn.unwrapErr().toStr())
         exit(1)

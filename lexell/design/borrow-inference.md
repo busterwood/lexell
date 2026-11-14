@@ -249,10 +249,9 @@ the sweep with the pass off:
 
 ### 7.2 The compiler and cmd/ (2026-11-14)
 
-The same sweep over `compiler/` and `cmd/` changed 463 parameters. The 76
-in the lexdb server's modules were left as they were: lexdb work is going on
-elsewhere, and only the call sites the library change needed were touched
-there. The call-site script gained three repairs, and each `let` it adds
+The same sweep over `compiler/` and `cmd/` changed 463 parameters. The
+lexdb server's modules were left for a later sweep (7.3), with only the call
+sites the library change needed touched there. The call-site script gained three repairs, and each `let` it adds
 goes only at the start of a statement, never into a condition or a branch:
 - `var x = s` becomes `var x: str = s`;
 - an argument borrowed from the receiver of a `mut` method (`p.node(...,
@@ -275,3 +274,41 @@ instances and interface methods.
 
 **The compiler is faster from the sweeps:** a default compile of itself
 takes 465 ms, against 489 before them, and an `-O` compile 550 against 596.
+
+### 7.3 The lexdb server's modules (2026-11-14)
+
+The same sweep over `cmd/lexdb*.lxl`, with the report run over `cmd/lexdb.lxl`,
+every program in `tests/lexdb/run/` and the crash client, combined as in
+`tools/borrow_check.py`, changed 152 parameters that no program keeps:
+tns 30, store 28, sql 25, exec 21, base 8, plsql 5, disk, lexdb, orafn, tds
+and tsql 4 each, wire 3, and 2 each in auth, func, oratext, page, repl and
+tsqlfn. Their call sites, in the modules and in 26 test programs, got `&x` or
+`&(expr)`. Besides the three repairs of 7.2 there were three more by hand:
+- an `if` expression as an argument became `&(if ...)` when every branch
+  makes a temporary, and a statement `if` with a call in each branch when one
+  branch is a borrow (the two leaf scans of `Store`, `catKey`,
+  `logFs`);
+- a global cannot be borrowed, so `noCow(LOG_DIR)` copies it into a `let`;
+- `t.noteWrite(..., &t.writes[i].key, ...)` and `w.paramStatus(..., &w.tzShown)`
+  borrow the receiver of a `mut` method, so the argument is copied into a
+  `let` first.
+
+Existing `&(s.toStr())` on a parameter that is already `&str` became `s`.
+
+20 `str` parameters remain, each kept by some program: the `Fs` methods `openWith`,
+`exists`, `remove`, `rename` and `holdFlushes`,
+`cachePut`, `putSmall`, `Store.getIn`, `snapGet`, `scanIn`,
+`scanBackIn`, `scanLeaves`'s `to`, and the `dir` of `supervise`, `runMaster`
+and `runReplica`, and the `sql` of `Conn.simple` and `Conn.rowsOf`.
+
+The server's speed does not change. Alternating the binaries three times each
+(pgbench, prepared, the 1M-row table): 142.1k against 142.3k tps at 32
+clients, 143.7k against 143.1k at 8, 85.7k against 86.6k at 1, 21.86k
+against 21.78k for updates, and the same CPU per transaction (7.0 and 32.1
+microseconds), peak RSS (172 MB) and scan times. The binary is 2.5% smaller
+(11.99 MB against 11.70). The server's reads do not copy strings in the
+paths the benchmark runs, so the sweep is for the code that does.
+
+Dups were not counted: `LXL_RCSTAT=1` printed nothing at exit for the server
+or for the lexdb test programs, only the compile line (owned-convention `str`
+parameters left for the pass in `lexdb.lxl -O`: 35 before, 32 after).
