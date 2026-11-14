@@ -440,6 +440,35 @@ pub fn (t: mut &Txn) putRow(tree: int, key: &str, val: &str, head: int): Result[
     return Ok(Unit{})
 }
 
+// Notes every write so far in the transaction's own-writes map, as putRow
+// would have. For a load that began without the map (putRowLoad) and meets an
+// out-of-order key: its duplicate check needs the earlier rows.
+pub fn (t: mut &Txn) indexWrites() {
+    t.idxTrees = []
+    t.idx = []
+    t.sortedKeys = []
+    t.sortedN = []
+    for i in 0..len(t.writes) {
+        if t.writes[i].op == OP_DELRANGE { continue }
+        let k = t.writes[i].key
+        t.noteWrite(t.writes[i].tree, &k, i)
+    }
+}
+
+// putRow for a load that reads none of its own writes: no noteWrite, so no
+// per-key map entry. The caller checks its keys itself (design/par-db-perf.md:
+// COPY's sorted fast path).
+pub fn (t: mut &Txn) putRowLoad(tree: int, key: &str, val: &str, head: int): Result[Unit, lexdb_base.DbErr] {
+    if len(key) > lexdb_page.MAX_KEY {
+        return Err(lexdb_base.err(lexdb_base.S_LIMIT, &("key too large: " + len(key).toStr() + " bytes, at most " + lexdb_page.MAX_KEY.toStr())))
+    }
+    if len(val) > MAX_VALUE {
+        return Err(lexdb_base.err(lexdb_base.S_LIMIT, &("row too large: " + len(val).toStr() + " bytes, at most " + MAX_VALUE.toStr())))
+    }
+    append(mut &t.writes, TxWrite{op: OP_PUT, tree: tree, key: key, val: val, head: head})
+    return Ok(Unit{})
+}
+
 pub fn (t: mut &Txn) del(tree: int, key: &str) {
     t.noteWrite(tree, key, len(t.writes))
     append(mut &t.writes, TxWrite{op: OP_DEL, tree: tree, key: key, val: "", head: 0})
