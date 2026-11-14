@@ -103,12 +103,21 @@ pub type Emitter = record {
     fns: []FnDef
     ress: [][]int       // what the holes of each instance stand for
     podMemo: []int
+    // for kernel.lxl (ir.Ir's fields of the same names)
+    fsrc: Map[str, str]
+    gsrc: Map[str, str]
+    parMaps: Map[str, bool]
+    parBounds: Map[str, bool]
+    kglobals: Map[str, bool]
+    stops: Map[str, bool]
 }
 
 pub fn newEmitter(c: ck.Checker): Emitter {
     return Emitter{c: c, names: newMap(), nnames: 0, structs: [], fntypes: [], insts: newMapWith[str, str](fxHashStr), ninsts: 0, work: [],
         glue: newMap(), nglue: 0, gluework: [], reachIdx: newMap(), reachSets: [], strs: newMapWith[str, str](fxHashStr), strKeys: [],
-        fns: [], ress: [], podMemo: []}
+        fns: [], ress: [], podMemo: [], fsrc: newMapWith[str, str](fxHashStr), gsrc: newMapWith[str, str](fxHashStr),
+        parMaps: newMapWith[str, bool](fxHashStr), parBounds: newMapWith[str, bool](fxHashStr), kglobals: newMapWith[str, bool](fxHashStr),
+        stops: newMapWith[str, bool](fxHashStr)}
 }
 
 fn (e: mut &Emitter) pod(t: int): bool { return ck.isPod(mut &e.c.pg, mut &e.podMemo, t) }
@@ -545,6 +554,8 @@ fn (e: mut &Emitter) define(name: str, ret: str, ptys: []str, pnames: []str, lin
 fn (e: mut &Emitter) makeGlue(kind: int, t: int) {
     let key = t * 8 + kind
     let n = e.glue.getOr(&key, "")
+    let gk: []str = ["the drop of", "a drop action of", "the drop of the rest of", "the copy of", "the closure made of"]
+    e.fsrc.put(n, gk[kind] + " " + e.c.pg.tstr(t))
     let ct = e.ctype(t)
     if kind == G_TRAMP {        // a plain function seen as a closure: the environment is the function
         var ps: []str = ["void*"]
@@ -799,6 +810,16 @@ fn (e: mut &Emitter) makeInstance(f: int, targs: int) {
         append(mut &pns, "p_" + p.name)
     }
     let rc = e.ctype(e.c.pg.subst(e.c.pg.fns[f].ret, &env))
+    let fm = e.c.pg.fns[f].mod
+    let label = e.c.pg.label(f)
+    let file = e.c.pg.mods[fm].fname
+    e.fsrc.put(name, label + " (" + file + ":" + intToStr(e.c.pg.fns[f].line) + ")")
+    if e.c.pg.fns[f].ret == sema.T_NEVER { e.stops.put(name, true) }
+    if e.c.pg.mods[fm].isLib && e.c.pg.mods[fm].name == "par" {
+        let fnm = e.c.pg.fns[f].name
+        if fnm == "map" { e.parMaps.put(name, true) }
+        if fnm == "item" || fnm == "callAt" { e.parBounds.put(name, true) }
+    }
     let tm = replace(mut &e.c.tmpls[f], ck.Tmpl{done: false, lines: [], holes: [], lifted: []})
     var res = newRes(len(tm.holes))
     for l in tm.lines { e.fill(l, &tm.holes, &env, &name, mut &res) }
@@ -817,6 +838,7 @@ fn (e: mut &Emitter) makeInstance(f: int, targs: int) {
         var lines: []int = [e.c.x.decl(e.ct("void**"), "ce_", e.nm("cv_")), e.c.x.sx(e.c.x.cast(e.ct("void"), e.nm("ce_")))]
         for x in l.lines { append(mut &lines, x) }
         e.define(name + "_c" + intToStr(l.k), lrc, cps, cns, lines, ri)
+        e.fsrc.put(name + "_c" + intToStr(l.k), "the closure in " + label + " (" + file + ":" + intToStr(l.line) + ")")
     }
     append(mut &e.ress, res)
     e.c.tmpls[f] = tm
@@ -882,6 +904,11 @@ pub fn (e: mut &Emitter) program(main: int, libs: mut &[]str): ir.Ir {
             if !gi.has { continue }
             let t = if isG { e.c.pg.globals[s.i].ty } else { e.c.pg.consts[s.i].table }
             let cn = if isG { e.c.pg.globals[s.i].cname } else { e.c.pg.consts[s.i].cname }
+            e.gsrc.put(cn, e.c.pg.mods[m].name + "." + n)
+            if isG && e.c.pg.mods[m].isLib && e.c.pg.mods[m].name == "hash" &&
+                (n == "sipKeyed" || n == "sipK0" || n == "sipK1" || n == "mapSeed") {
+                e.kglobals.put(cn, true)        // par.map derives the key before its workers run (hash.keyReady)
+            }
             if gi.isOnce {          // a set-once global: 0 empty, 1 set, 2 dropped
                 let ct = e.ctype(t)
                 append(mut &globs, GDef{name: cn, ty: ct, n: -1, init: -1, isConst: false, res: []})
@@ -948,6 +975,12 @@ pub fn (e: mut &Emitter) program(main: int, libs: mut &[]str): ir.Ir {
 // literals, externs, globals, functions, main.
 fn (e: mut &Emitter) lower(entry: str, externs: &[]Extern, globs: &[]GDef, gdrops: &[]int): ir.Ir {
     var u = lw.newLower()
+    u.ir.fsrc = replace(mut &e.fsrc, newMapWith[str, str](fxHashStr))
+    u.ir.gsrc = replace(mut &e.gsrc, newMapWith[str, str](fxHashStr))
+    u.ir.parMaps = replace(mut &e.parMaps, newMapWith[str, bool](fxHashStr))
+    u.ir.parBounds = replace(mut &e.parBounds, newMapWith[str, bool](fxHashStr))
+    u.ir.kglobals = replace(mut &e.kglobals, newMapWith[str, bool](fxHashStr))
+    u.ir.stops = replace(mut &e.stops, newMapWith[str, bool](fxHashStr))
     let structs = copyInts(&e.structs)
     for t in structs { u.newStruct(e.names.getOr(&t, ""), false) }
     for ft in e.fntypes {
@@ -966,6 +999,7 @@ fn (e: mut &Emitter) lower(entry: str, externs: &[]Extern, globs: &[]GDef, gdrop
         let st = u.newStruct("<anonymous>", false)
         u.layout(st, [ir.Field{name: "rc", ty: ir.TY_I64, off: 0}, ir.Field{name: "data", ty: u.ir.arrOf(ir.TY_I8, len(b) + 1), off: 0}])
         u.global(n + "b", st, u.x.init([u.x.num("-1"), u.x.str(b)]), false)
+        u.ir.kglobals.put(n + "b", true)        // written by nothing: its count is -1
         let p = u.x.cast(u.x.ptr(u.x.ct("lxl_sblk")), u.x.pre("&", u.x.nm(n + "b")))
         u.global(n, u.ctName("lxl_str"), u.x.init([p, u.x.lit(0), u.x.lit(len(b))]), true)
     }

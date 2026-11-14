@@ -1,0 +1,367 @@
+// kernel: the purity check of par.map's closures (design/parallel.md 2.5), on the IR after emit
+// has instantiated everything, for both backends.
+//
+// A par.map closure runs on the pool's threads, so it and everything it can reach must be a
+// kernel: no I/O, no park, no var or once global, no C function. The roots are the closures
+// passed to the instances of par.map, found at each call (check.lxl has made sure each is written
+// at the call). From them the walk follows
+//   - direct calls;
+//   - calls through a function value or closure: to every function whose address is taken that
+//     has the call's function type (concurrency.md Q9's conservative rule), to the function a
+//     trampoline was made for (a plain function seen as a closure), and not at all in par's own
+//     item functions, whose call is the closure the roots already cover;
+//   - functions a kernel names without calling them (a closure it makes, a drop action it pushes):
+//     they may run there too.
+// Runtime functions and externs are leaves, allowed by name; a global that is not constant is
+// refused unless emit marked it (string literals' blocks, hash's key). The functions reached are
+// marked kernel: the native backend calls the runtime's dup and drop in them (2.4).
+//
+// The first failure is a compile error at the par.map call with the chain of calls from the
+// closure, its shortest one (the walk is breadth first).
+
+import "strings"
+import "./ir"
+
+type Kern = record {
+    byName: Map[str, int]
+    taken: []bool               // the address is taken (an E_FUNC not called directly)
+    tramps: Map[int, int]       // a trampoline -> its list in tlists
+    tlists: [][]int
+    seen: []bool
+    from: []int                 // the function that reached it, -1 for a root
+    rootAt: []str               // a root's par.map call ("file:line")
+    queue: []int
+    head: int
+}
+
+// The runtime's functions (native/lxlrt.h) a kernel may not reach, and why.
+fn rtRefused(name: str): str {
+    return match name {
+        "rt_write_fd" { "I/O (writeFd)" }
+        "rt_read_file" { "I/O (readFile)" }
+        "rt_flush" { "I/O (the output buffer)" }
+        "rt_getenv" { "the environment (getenv)" }
+        "rt_args" { "the program's arguments (args)" }
+        "rt_exit" { "exit" }
+        "rt_finish" { "exit" }
+        "rt_init" { "the runtime's start" }
+        "rt_n_start" { "the runtime's start" }
+        "rt_on_end" { "the program's end" }
+        "rt_blocking" { "a blocking C call" }
+        "rt_sh_dup" { "a Shared or Frozen value" }
+        "rt_sh_drop" { "a Shared or Frozen value" }
+        "rt_cstr" { "a C call's string" }
+        "rt_cdata" { "a C call's string" }
+        "rt_cfree" { "a C call's string" }
+        "rt_cmark" { "a C call's string" }
+        else { "" }
+    }
+}
+
+// The externs a kernel may call: the C maths (the native runtime's own libm) and the runtime's
+// pure helpers.
+fn externAllowed(name: str): bool {
+    return match name {
+        "sqrt" { true } "cbrt" { true } "exp2" { true } "expm1" { true } "log1p" { true } "fma" { true }
+        "pow" { true } "exp" { true } "log" { true } "log2" { true } "log10" { true } "sin" { true }
+        "cos" { true } "tan" { true } "asin" { true } "acos" { true } "atan" { true } "atan2" { true }
+        "sinh" { true } "cosh" { true } "tanh" { true } "floor" { true } "ceil" { true } "trunc" { true }
+        "round" { true } "rint" { true } "fabs" { true } "fmod" { true } "hypot" { true } "copysign" { true }
+        "lxllib_hash_key" { true } "lxllib_hash_crc32c" { true }
+        else { false }
+    }
+}
+
+fn externWhy(name: str): str {
+    let prefixes: []str = ["lxllib_task_", "lxllib_net_", "lxllib_file_", "lxllib_fd_", "lxllib_sig_",
+        "lxllib_workers_", "lxllib_sh_", "lxllib_par_"]
+    for pf in prefixes {
+        if strings.startsWith(name, pf) { return "a park or I/O (" + name + ")" }
+    }
+    return "the C function " + name
+}
+
+// Two IR types that are the same type (function types are not interned).
+fn sameTy(p: &ir.Ir, a: int, b: int): bool {
+    if a == b { return true }
+    let ka = p.tys[a].k
+    if ka != p.tys[b].k { return false }
+    if ka == ir.TY_PTR { return sameTy(p, p.tys[a].base, p.tys[b].base) }
+    if ka == ir.TY_ARR { return p.tys[a].n == p.tys[b].n && sameTy(p, p.tys[a].base, p.tys[b].base) }
+    if ka == ir.TY_STRUCT { return p.tys[a].sid == p.tys[b].sid }
+    if ka == ir.TY_FN {
+        if p.tys[a].sid != p.tys[b].sid || !sameTy(p, p.tys[a].base, p.tys[b].base) { return false }
+        let la = p.tys[a].n
+        let lb = p.tys[b].n
+        if p.listLen(la) != p.listLen(lb) { return false }
+        for j in 0..p.listLen(la) {
+            if !sameTy(p, p.listAt(la, j), p.listAt(lb, j)) { return false }
+        }
+        return true
+    }
+    return true
+}
+
+// The function a direct call calls, or -1.
+fn directCallee(p: &ir.Ir, x: int): int {
+    let c = p.nodes[x].a
+    if p.nk(c) != ir.E_DECAY || p.nk(p.nodes[c].a) != ir.E_FUNC { return -1 }
+    return p.nodes[p.nodes[c].a].a
+}
+
+// The children of node x.
+fn kids(p: &ir.Ir, x: int): []int {
+    var out: []int = []
+    let n = p.nodes[x]
+    let kk = if n.k >= 0 && n.k < len(ir.KIDS) { ir.KIDS[n.k] } else { -1 }
+    if kk == ir.K_A || kk == ir.K_AB || kk == ir.K_ABC || kk == ir.K_FOR || kk == ir.K_CALL { if n.a >= 0 { append(mut &out, n.a) } }
+    if kk == ir.K_AB || kk == ir.K_ABC || kk == ir.K_FOR { if n.b >= 0 { append(mut &out, n.b) } }
+    if kk == ir.K_ABC || kk == ir.K_FOR { if n.c >= 0 { append(mut &out, n.c) } }
+    if kk == ir.K_FOR { if n.d >= 0 { append(mut &out, n.d) } }
+    if kk == ir.K_CALL || kk == ir.K_CLIT { if n.b >= 0 { for j in 0..p.listLen(n.b) { append(mut &out, p.listAt(n.b, j)) } } }
+    if kk == ir.K_BLOCK { if n.a >= 0 { for j in 0..p.listLen(n.a) { append(mut &out, p.listAt(n.a, j)) } } }
+    if kk == ir.K_DECL {
+        if n.b >= 0 { append(mut &out, n.b) }
+        if n.c >= 0 { for j in 0..p.listLen(n.c) { append(mut &out, p.listAt(n.c, j)) } }
+    }
+    return out
+}
+
+// The function an initializer entry or cast chain names (void*)f, or -1.
+fn funcIn(p: &ir.Ir, x0: int): int {
+    var x = x0
+    while x >= 0 && (p.nk(x) == ir.E_IENT || p.nk(x) == ir.E_CAST || p.nk(x) == ir.E_DECAY) { x = p.nodes[x].a }
+    return if x >= 0 && p.nk(x) == ir.E_FUNC { p.nodes[x].a } else { -1 }
+}
+
+// Over the whole program: the functions whose address is taken, and each trampoline's function
+// (a closure literal {(void*)tramp, (void*)f}).
+fn scan(p: &ir.Ir, k: mut &Kern, x: int, callee: bool) {
+    let nk = p.nk(x)
+    if nk == ir.E_FUNC {
+        if !callee { k.taken[p.nodes[x].a] = true }
+        return
+    }
+    if nk == ir.E_CLIT && p.nodes[x].b >= 0 && p.listLen(p.nodes[x].b) == 2 {
+        let t = funcIn(p, p.listAt(p.nodes[x].b, 0))
+        let g = funcIn(p, p.listAt(p.nodes[x].b, 1))
+        if t >= 0 && g >= 0 {
+            let li = k.tramps.getOr(&t, -1)
+            if li < 0 {
+                k.tramps.put(t, len(k.tlists))
+                append(mut &k.tlists, [g])
+            } else {
+                append(mut &k.tlists[li], g)
+            }
+        }
+    }
+    let ks = kids(p, x)
+    for j in 0..len(ks) {
+        let direct = nk == ir.E_CALL && j == 0 && directCallee(p, x) >= 0
+        scan(p, k, if direct { p.nodes[ks[j]].a } else { ks[j] }, direct)
+    }
+}
+
+// The functions named in the tree x (a par.map call's closure argument), following a local to its
+// declaration's initializer and the assignments to it in the function's body.
+fn rootsIn(p: &ir.Ir, body: int, x: int, out: mut &[]int) {
+    let nk = p.nk(x)
+    if nk == ir.E_FUNC {
+        append(out, p.nodes[x].a)
+        return
+    }
+    if nk == ir.E_LOCAL {
+        localInits(p, body, p.nodes[x].a, out)
+        return
+    }
+    for c in kids(p, x) { rootsIn(p, body, c, out) }
+}
+
+fn localInits(p: &ir.Ir, x: int, l: int, out: mut &[]int) {
+    let nk = p.nk(x)
+    if nk == ir.S_DECL && p.nodes[x].a == l && p.nodes[x].b >= 0 { rootsIn(p, -1, p.nodes[x].b, out) }
+    if nk == ir.E_ASSIGN && p.nk(p.nodes[x].a) == ir.E_LOCAL && p.nodes[p.nodes[x].a].a == l {
+        rootsIn(p, -1, p.nodes[x].b, out)
+    }
+    for c in kids(p, x) { localInits(p, c, l, out) }
+}
+
+// The "file:line" text in a par.map call's Where argument.
+fn whereIn(p: &ir.Ir, x: int): str {
+    if p.nk(x) == ir.E_STR { return p.strs[p.nodes[x].v] }
+    for c in kids(p, x) {
+        let s = whereIn(p, c)
+        if s != "" { return s }
+    }
+    return ""
+}
+
+// The par.map calls in the tree x of function f: their closures become roots.
+fn findRoots(p: &ir.Ir, k: mut &Kern, body: int, x: int) {
+    if p.nk(x) == ir.E_CALL {
+        let g = directCallee(p, x)
+        if g >= 0 && p.parMaps.has(&p.funcs[g].name) {
+            let args = p.nodes[x].b
+            var rs: []int = []
+            rootsIn(p, body, p.listAt(args, 1), mut &rs)
+            let at = if p.listLen(args) > 2 { whereIn(p, p.listAt(args, 2)) } else { "" }
+            if len(rs) == 0 { fail(at, "internal error: par.map's closure was not found", "", []) }
+            for r in rs {
+                if !k.seen[r] {
+                    k.seen[r] = true
+                    k.rootAt[r] = at
+                    append(mut &k.queue, r)
+                }
+            }
+        }
+    }
+    for c in kids(p, x) { findRoots(p, k, body, c) }
+}
+
+fn display(p: &ir.Ir, f: int): str {
+    let s = p.fsrc.getOr(&p.funcs[f].name, "")
+    if s == "" { return p.funcs[f].name }
+    return s
+}
+
+fn fail(at: str, why: str, root: str, chain: []str): never {
+    var msg = at + ": par.map: " + why + "\n"
+    for c in chain { msg = msg + "    " + c + "\n" }
+    writeFd(2, msg)
+    exit(1)
+}
+
+// Stops with the chain from f's root to f, and what f reaches.
+fn refuse(p: &ir.Ir, k: &Kern, f: int, what: str) {
+    var chain: []str = []
+    var g = f
+    var root = f
+    while g >= 0 {
+        append(mut &chain, display(p, g))
+        root = g
+        g = k.from[g]
+    }
+    var rev: []str = []
+    var i = len(chain) - 1
+    while i >= 0 {
+        append(mut &rev, chain[i])
+        i -= 1
+    }
+    append(mut &rev, "-> " + what)
+    fail(k.rootAt[root], "the closure is not a kernel: it can reach " + what, "", rev)
+}
+
+fn reach(p: &ir.Ir, k: mut &Kern, from: int, g: int) {
+    if g < 0 || k.seen[g] { return }
+    if g < p.nRtFuncs {
+        let nm = p.funcs[g].name
+        let why = rtRefused(nm)
+        // a function that never returns stops the program: it may say why on stderr and exit
+        // (the runtime has a pool thread's exit made by the main thread, design/parallel.md 2.7)
+        let stop = from >= 0 && p.stops.has(&p.funcs[from].name) && (nm == "rt_write_fd" || nm == "rt_exit" || nm == "rt_flush")
+        if why != "" && !stop { refuse(p, k, from, why) }
+        if why == "" { k.seen[g] = true }
+        return
+    }
+    if p.funcs[g].isExtern {
+        if !externAllowed(p.funcs[g].asmName) { refuse(p, k, from, externWhy(p.funcs[g].asmName)) }
+        k.seen[g] = true
+        return
+    }
+    k.seen[g] = true
+    k.from[g] = from
+    append(mut &k.queue, g)
+}
+
+// The kernel's body x of function f: what it calls, names and reads.
+fn walk(p: &ir.Ir, k: mut &Kern, f: int, x: int, bound: bool) {
+    let nk = p.nk(x)
+    if nk == ir.E_FUNC {
+        reach(p, k, f, p.nodes[x].a)
+        return
+    }
+    if nk == ir.E_GLOBAL {
+        let gl = p.nodes[x].a
+        if !p.globals[gl].isConst && !p.kglobals.has(&p.globals[gl].name) {
+            let gn = p.gsrc.getOr(&p.globals[gl].name, p.globals[gl].name)
+            refuse(p, k, f, "the global " + gn)
+        }
+        return
+    }
+    if nk == ir.E_CALL && directCallee(p, x) < 0 && !bound {
+        let li = k.tramps.getOr(&f, -1)
+        if li >= 0 {
+            for g in copyInts(&k.tlists[li]) { reach(p, k, f, g) }
+        } else {
+            let ft = p.nodes[x].c
+            for g in p.nRtFuncs..len(p.funcs) {
+                if k.taken[g] && sameTy(p, p.funcs[g].ty, ft) { reach(p, k, f, g) }
+            }
+        }
+    }
+    for c in kids(p, x) { walk(p, k, f, c, bound) }
+}
+
+fn copyInts(xs: &[]int): []int {
+    var out: []int = []
+    for x in xs { append(mut &out, x) }
+    return out
+}
+
+// The check, and the kernel marks. Nothing to do when the program has no par.map.
+pub fn check(p: mut &ir.Ir) {
+    if p.parMaps.size() == 0 { return }
+    let n = len(p.funcs)
+    var k = Kern{byName: newMapWith[str, int](fxHashStr), taken: [], tramps: newMap(), tlists: [], seen: [], from: [],
+        rootAt: [], queue: [], head: 0}
+    for f in 0..n {
+        append(mut &k.taken, false)
+        append(mut &k.seen, false)
+        append(mut &k.from, -1)
+        append(mut &k.rootAt, "")
+    }
+    for f in p.nRtFuncs..n {
+        if p.funcs[f].body >= 0 { scan(p, mut &k, p.funcs[f].body, false) }
+    }
+    for f in p.nRtFuncs..n {
+        if p.funcs[f].body >= 0 { findRoots(p, mut &k, p.funcs[f].body, p.funcs[f].body) }
+    }
+    while k.head < len(k.queue) {
+        let f = k.queue[k.head]
+        k.head += 1
+        if f < p.nRtFuncs || p.funcs[f].isExtern { continue }
+        if p.funcs[f].body < 0 {
+            refuse(p, &k, f, "a function without a body (" + p.funcs[f].name + ")")
+        }
+        walk(p, mut &k, f, p.funcs[f].body, p.parBounds.has(&p.funcs[f].name))
+    }
+    for f in p.nRtFuncs..n {
+        if k.seen[f] && !p.funcs[f].isExtern { p.funcs[f].kernel = true }
+    }
+    // par's item functions run on the pool's threads too
+    for f in p.nRtFuncs..n {
+        if p.parBounds.has(&p.funcs[f].name) { markFrom(p, f) }
+    }
+}
+
+// Marks f and the functions it reaches (par's item functions, which only box the closure's
+// result) as kernel functions; their indirect call is the closure, already checked.
+fn markFrom(p: mut &ir.Ir, f0: int) {
+    var stack: []int = [f0]
+    while len(stack) > 0 {
+        let f = pop(mut &stack)
+        if f < p.nRtFuncs || p.funcs[f].isExtern || p.funcs[f].kernel || p.funcs[f].body < 0 { continue }
+        p.funcs[f].kernel = true
+        var names: []int = []
+        namedIn(p, p.funcs[f].body, mut &names)
+        for g in names { append(mut &stack, g) }
+    }
+}
+
+fn namedIn(p: &ir.Ir, x: int, out: mut &[]int) {
+    if p.nk(x) == ir.E_FUNC {
+        append(out, p.nodes[x].a)
+        return
+    }
+    for c in kids(p, x) { namedIn(p, c, out) }
+}
