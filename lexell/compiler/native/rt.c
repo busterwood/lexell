@@ -198,7 +198,9 @@ static char* rt_par_base;               /* the slots, or 0 before the pool start
 static size_t rt_par_span;
 static int rt_npar;                     /* par workers started: 0 not yet, -1 none (LXL_PAR=0, one CPU) */
 static inline __attribute__((always_inline)) rt_wctx* rt_wme(void) {
-    size_t o = (size_t)((char*)__builtin_frame_address(0) - rt_par_base);
+    char* sp;
+    __asm__("mov %%rsp, %0" : "=r"(sp));        /* not __builtin_frame_address: no frame for its callers */
+    size_t o = (size_t)(sp - rt_par_base);
     if (__builtin_expect(o >= rt_par_span, 1)) return 0;
     return (rt_wctx*)(rt_par_base + (o & ~(PAR_SLOT - 1)) + PAR_SLOT - sizeof(rt_wctx));
 }
@@ -210,11 +212,14 @@ static inline rt_hp* rt_hp_me(void) {
    file), reached only through these, which rt_par_start sets: a program without par.map links none
    of it (the link keeps what is reachable). Called only when rt_wme() is a worker's. */
 typedef struct {
-    void* (*malloc)(rt_wctx* w, size_t n);
-    void (*free)(rt_wctx* w, void* p);
+    void* (*malloc)(size_t n);
+    void (*free)(void* p, size_t h);
+    lxl_str (*dup)(lxl_str s);
+    void (*drop)(lxl_str s);
     __attribute__((noreturn)) void (*stop)(rt_wctx* w, int code, const char* text, size_t n);
     __attribute__((noreturn)) void (*trap)(rt_wctx* w, int code, const char* a, const char* b, size_t bn, const char* where);
-    bool (*count)(rt_wctx* w, void* b, int64_t d);
+    int64_t (*write)(int64_t fd, const char* p, int64_t n);
+    void (*segv)(char* a);
 } rt_par_hooks_t;
 static rt_par_hooks_t rt_par_hooks;
 /* A hook's value, opaque to gcc (which would otherwise call the one function stored in it, and so
@@ -288,15 +293,21 @@ static inline __attribute__((always_inline)) void* malloc_h(rt_hp* h, size_t n, 
     char* b = h->chunk_at;
     h->chunk_at += bs;
     h->chunk_left -= bs;
-    ((size_t*)b)[0] = (size_t)c | h->tag << 8;
+    ((size_t*)b)[0] = tagit ? (size_t)c | h->tag << 8 : (size_t)c;     /* the main thread's tag is 0 */
     return b + 8;
 }
+/* malloc's one test, as before there were workers: rt_heap_slow is set until the heap is set up,
+   and again once a par pool has started (then a worker's malloc is its own heap's). */
+static bool rt_heap_slow = true;
+void* malloc(size_t n);
+__attribute__((noinline)) static void* malloc_slow(size_t n) {
+    if (rt_par_span) return RT_HOOK(malloc)(n);       /* the pool's (worker or main thread) */
+    heap_init();                                      /* the first malloc, before any pool */
+    rt_heap_slow = false;
+    return malloc(n);
+}
 void* malloc(size_t n) {
-    if (!class_size[0]) heap_init();
-    if (__builtin_expect(rt_par_span != 0, 0)) {
-        rt_wctx* w = rt_wme();
-        if (w) return RT_HOOK(malloc)(w, n);
-    }
+    if (__builtin_expect(rt_heap_slow, 0)) return malloc_slow(n);
     return malloc_h(&rt_mheap, n, false);
 }
 static size_t block_size(void* p) {
@@ -312,13 +323,19 @@ static inline __attribute__((always_inline)) void free_h(rt_hp* hp, void* p) {
     *(void**)p = hp->free_list[h];
     hp->free_list[h] = p;
 }
+/* free's one test, as before there were workers: a header word at or above NCLASS is a large
+   block, or a block with a worker's tag (a worker's own, or one that came to the main thread with
+   par.map's results). Only untagged blocks of the main thread take the short path. */
+__attribute__((noinline)) static void free_slow(void* p, size_t h) {
+    if (rt_par_span) { RT_HOOK(free)(p, h); return; }   /* the pool's (worker or main thread) */
+    free_large(&rt_mheap, (size_t*)((char*)p - 16));
+}
 void free(void* p) {
     if (!p) return;
-    if (__builtin_expect(rt_par_span != 0, 0)) {
-        rt_wctx* w = rt_wme();
-        if (w) { RT_HOOK(free)(w, p); return; }
-    }
-    free_h(&rt_mheap, p);
+    size_t h = ((size_t*)p)[-1];
+    if (__builtin_expect(h >= NCLASS, 0)) { free_slow(p, h); return; }
+    *(void**)p = rt_mheap.free_list[h];
+    rt_mheap.free_list[h] = p;
 }
 void* realloc(void* p, size_t n) {
     if (!p) return malloc(n);
@@ -439,24 +456,30 @@ __attribute__((noinline)) static void rt_wdgrow(rt_wctx* w) {
     w->ds = d;
     w->dcap = cap;
 }
-void rt_dpush(rt_dfn f, void* p) {
-    rt_wctx* w = rt_par_span ? rt_wme() : 0;
-    if (__builtin_expect(w != 0, 0)) {
-        if (w->dn == w->dcap) rt_wdgrow(w);
-        w->ds[w->dn].f = f; w->ds[w->dn++].p = p;
+__attribute__((noinline)) static void rt_dpush_w(rt_dfn f, void* p) {
+    rt_wctx* w = rt_wme();
+    if (!w) {
+        if (rt_dn == rt_dcap) rt_dgrow(&rt_ds, &rt_dcap);
+        rt_ds[rt_dn].f = f; rt_ds[rt_dn++].p = p;
         return;
     }
+    if (w->dn == w->dcap) rt_wdgrow(w);
+    w->ds[w->dn].f = f; w->ds[w->dn++].p = p;
+}
+__attribute__((noinline)) static void rt_drun_w(rt_dfn f, void* p) {
+    rt_wctx* w = rt_wme();
+    int64_t* dn = w ? &w->dn : &rt_dn;
+    int64_t base = *dn;
+    f(p);
+    while (*dn > base) { rt_dact a = (w ? w->ds : rt_ds)[--*dn]; a.f(a.p); }
+}
+void rt_dpush(rt_dfn f, void* p) {
+    if (__builtin_expect(rt_par_span != 0, 0)) { rt_dpush_w(f, p); return; }
     if (rt_dn == rt_dcap) rt_dgrow(&rt_ds, &rt_dcap);
     rt_ds[rt_dn].f = f; rt_ds[rt_dn++].p = p;
 }
 void rt_drun(rt_dfn f, void* p) {
-    rt_wctx* w = rt_par_span ? rt_wme() : 0;
-    if (__builtin_expect(w != 0, 0)) {
-        int64_t base = w->dn;
-        f(p);
-        while (w->dn > base) { rt_dact a = w->ds[--w->dn]; a.f(a.p); }
-        return;
-    }
+    if (__builtin_expect(rt_par_span != 0, 0)) { rt_drun_w(f, p); return; }
     int64_t base = rt_dn;
     f(p);
     while (rt_dn > base) { rt_dact a = rt_ds[--rt_dn]; a.f(a.p); }
@@ -741,14 +764,7 @@ static i64 rt_main_tid;         /* a fault on a helper thread (C code, stage C1c
 static void rt_segv(int sig, void* si, void* uc) {
     char* a = *(char**)((char*)si + 16);        /* si_addr */
     (void)uc;
-    if (rt_par_span) {                          /* a par worker's guard page (design/parallel.md 2.7) */
-        size_t o = (size_t)(a - rt_par_base);
-        rt_wctx* w = rt_wme();
-        if (w && o < rt_par_span && o % PAR_SLOT < 4096) {
-            static const char m[] = "Lexell: stack overflow\n";
-            RT_HOOK(stop)(w, 4, m, sizeof m - 1);
-        }
-    }
+    if (rt_par_span) RT_HOOK(segv)(a);          /* a par worker's guard page (design/parallel.md 2.7) */
     if (SYS(186, 0, 0, 0) == rt_main_tid &&    /* gettid */
         ((a <= rt_stack_top && (size_t)(rt_stack_top - a) <= rt_stack_max + (1 << 20)) ||
          (rt_cur->stk && a >= rt_cur->stk && a < rt_cur->stk + RT_GUARD))) {
@@ -880,14 +896,14 @@ lxl_str rt_str_of(const char* p, int64_t len) {
    main thread makes it when the map ends (design/parallel.md 2.3). */
 lxl_str rt_str_dup(lxl_str s) {
     if (s.b && s.b->rc >= 0) {
-        if (__builtin_expect(rt_par_span != 0, 0)) { rt_wctx* w = rt_wme(); if (w && RT_HOOK(count)(w, s.b, 1)) return s; }
+        if (__builtin_expect(rt_par_span != 0, 0)) return RT_HOOK(dup)(s);
         s.b->rc++;
     }
     return s;
 }
 void rt_str_drop(lxl_str s) {
     if (s.b && s.b->rc > 0) {
-        if (__builtin_expect(rt_par_span != 0, 0)) { rt_wctx* w = rt_wme(); if (w && RT_HOOK(count)(w, s.b, -1)) return; }
+        if (__builtin_expect(rt_par_span != 0, 0)) { RT_HOOK(drop)(s); return; }
         if (--s.b->rc == 0) rt_free(s.b);
     }
 }
@@ -1515,10 +1531,7 @@ lxl_str rt_float_to_str(double d) {
     return rt_str_of(buf, n);
 }
 int64_t rt_write_fd(int64_t fd, lxl_str s) {
-    if (__builtin_expect(rt_par_span != 0, 0) && rt_wme()) {   /* a stop's message on a par worker: unbuffered */
-        write_all((int)fd, RT_SP(s), (size_t)s.len);
-        return s.len;
-    }
+    if (__builtin_expect(rt_par_span != 0, 0) && rt_wme()) return RT_HOOK(write)(fd, RT_SP(s), s.len);  /* a par worker's stop */
     if (fd == 1 && !rt_ended) {
         if (rt_olen + (size_t)s.len > sizeof rt_obuf) rt_flush();
         if ((size_t)s.len <= sizeof rt_obuf) {
@@ -3754,12 +3767,32 @@ static uint64_t rt_par_tags;            /* the last tag given to a worker (atomi
 #define PAR_ALT (1 << 16)
 
 __attribute__((noreturn)) static void rt_wstop(rt_wctx* w, int code, const char* text, size_t n);
-static void* rt_wmalloc(rt_wctx* w, size_t n) { return malloc_h(&w->heap, n, true); }
-static void rt_wfree(rt_wctx* w, void* p) {
-    static const char m[] = "Lexell: internal error: a par worker freed a block it does not own\n";
-    if (((size_t*)p)[-1] >> 8 != w->heap.tag) rt_wstop(w, 2, m, sizeof m - 1);
-    free_h(&w->heap, p);
+/* Once the pool has started: malloc and free of any thread (a worker's heap, or the main thread's). */
+static void* rt_pmalloc(size_t n) {
+    rt_wctx* w = rt_wme();
+    return w ? malloc_h(&w->heap, n, true) : malloc_h(&rt_mheap, n, false);
 }
+static void rt_pfree(void* p, size_t h) {          /* a large block, or one with a worker's tag */
+    rt_wctx* w = rt_wme();
+    rt_hp* hp = w ? &w->heap : &rt_mheap;
+    if ((h & 0xff) >= NCLASS) { free_large(hp, (size_t*)((char*)p - 16)); return; }
+    static const char m[] = "Lexell: internal error: a par worker freed a block it does not own\n";
+    if (w && h >> 8 != w->heap.tag) rt_wstop(w, 2, m, sizeof m - 1);
+    *(void**)p = hp->free_list[h & 0xff];
+    hp->free_list[h & 0xff] = p;
+}
+static bool rt_str_wcount(rt_wctx* w, void* b, int64_t d);
+__attribute__((noinline)) static lxl_str rt_str_dup_p(lxl_str s) {
+    rt_wctx* w = rt_wme();
+    if (!w || !rt_str_wcount(w, s.b, 1)) s.b->rc++;
+    return s;
+}
+__attribute__((noinline)) static void rt_str_drop_p(lxl_str s) {
+    rt_wctx* w = rt_wme();
+    if (w && rt_str_wcount(w, s.b, -1)) return;
+    if (--s.b->rc == 0) rt_free(s.b);
+}
+
 /* "Lexell: <a><b> at <where>\n" for a par worker's stop, in its own buffer. */
 __attribute__((noreturn, noinline)) static void rt_wtrap(rt_wctx* w, int code, const char* a, const char* b, size_t bn,
                                                           const char* where) {
@@ -3772,6 +3805,18 @@ __attribute__((noreturn, noinline)) static void rt_wtrap(rt_wctx* w, int code, c
     for (const char* q = where; *q && n < 1020; q++) t[n++] = *q;
     t[n++] = '\n';
     rt_wstop(w, code, t, n);
+}
+static int64_t rt_wwrite(int64_t fd, const char* p, int64_t n) {    /* a stop's message: unbuffered */
+    write_all((int)fd, p, (size_t)n);
+    return n;
+}
+static void rt_wsegv(char* a) {
+    size_t o = (size_t)(a - rt_par_base);
+    rt_wctx* w = rt_wme();
+    if (w && o < rt_par_span && o % PAR_SLOT < 4096) {
+        static const char m[] = "Lexell: stack overflow\n";
+        rt_wstop(w, 4, m, sizeof m - 1);
+    }
 }
 static bool rt_str_wcount(rt_wctx* w, void* b, int64_t d) {
     if (((size_t*)b)[-1] >> 8 == w->heap.tag) return false;
@@ -3934,11 +3979,15 @@ static void rt_par_start(void) {
     rt_npar = -1;
     if (n <= 0) return;
     lxllib_hash_key(0);                                          /* its key, before any worker reads it */
-    rt_par_hooks.malloc = rt_wmalloc;
-    rt_par_hooks.free = rt_wfree;
+    if (!class_size[0]) heap_init();
+    rt_par_hooks.malloc = rt_pmalloc;
+    rt_par_hooks.free = rt_pfree;
+    rt_par_hooks.dup = rt_str_dup_p;
+    rt_par_hooks.drop = rt_str_drop_p;
     rt_par_hooks.stop = rt_wstop;
     rt_par_hooks.trap = rt_wtrap;
-    rt_par_hooks.count = rt_str_wcount;
+    rt_par_hooks.write = rt_wwrite;
+    rt_par_hooks.segv = rt_wsegv;
     rt_pool_efd_open();
     if (ncpu > 1) rt_pool_spins = true;
     i64 m = sys6(S_MMAP, 0, (i64)((size_t)n * PAR_SLOT), 3, 0x4022, -1, 0);  /* MAP_PRIVATE|ANONYMOUS|NORESERVE */
@@ -3953,6 +4002,7 @@ static void rt_par_start(void) {
     }
     rt_par_base = base;
     __atomic_store_n(&rt_par_span, (size_t)n * PAR_SLOT, __ATOMIC_RELEASE);
+    rt_heap_slow = true;
     unsigned long all = ~0UL, old = 0;
     SYS4(S_RT_SIGPROCMASK, 2, &all, &old, 8);                    /* SIG_SETMASK: workers start with all blocked */
     int k = 0;
