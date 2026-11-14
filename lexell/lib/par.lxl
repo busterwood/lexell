@@ -1,0 +1,53 @@
+// par: a map over a slice on more cores (design/parallel.md).
+//
+//     let parts = par.map(&chunks, fn(c) { sumChunk(&rates, c) })
+//
+// par.map(xs, f) gives what a loop of f over xs would, in order, while a
+// pool of threads works through the items. f is a kernel: the compiler
+// refuses the call if f, or anything it can reach, could do I/O, park, read
+// or write a var or once global, or call a C function, and names the calls
+// that lead there. f may read the variables around it but not change them,
+// and it is written at the call (a closure or a named function).
+//
+// The calling task waits for the items, as for a socket, and other tasks run
+// meanwhile; when none could, the calling thread works through items too.
+// par.map is not cancellable: a cancellation or deadline takes effect at the
+// task's next wait. Inside Shared.with it is exit 13, like any park. A trap
+// in f stops the program, as in a loop.
+//
+// The pool starts at the first par.map: LXL_PAR=N threads (at most 64; by
+// default the CPUs the process may use, less one). LXL_PAR=0 runs every
+// map as a loop on the calling thread. The C backend always runs the loop.
+
+import "hash"
+
+extern "c" fn rtParRun(n: int, item: extern fn(ptr, ptr, int): ptr, f: ptr, xs: ptr, w: ptr): ptr as "lxllib_par_run"
+extern "c" fn rtParGet(r: ptr, i: int): ptr as "lxllib_par_get"
+extern "c" fn rtParFree(r: ptr) as "lxllib_par_free"
+
+type Cell[T] = record { v: T }
+
+// Item i: f(&xs[i]), boxed. Run by the pool's threads (and the caller's),
+// with f and xs read back from the addresses par.map gave the runtime.
+fn item[A, T](fp: ptr, xp: ptr, i: int): ptr {
+    let f: &fn(&A): T = rawAt(fp)
+    return intoPtr(Cell[T]{v: callAt(f, rawAt(xp), i)})
+}
+
+fn callAt[A, T](f: &fn(&A): T, xs: &[A], i: int): T { return f(&xs[i]) }
+
+// f of every element of xs, in order, worked through by the pool.
+pub fn map[A, T](xs: &[A], f: &fn(&A): T, w: Where): []T {
+    let n = len(xs)
+    var out: []T = withCapacity(n)
+    if n == 0 { return out }
+    hash.keyReady()
+    let r = rtParRun(n, item[A, T], rawAddr(f), rawAddr(xs), w.cstr())
+    for i in 0..n {
+        let c: Cell[T] = fromPtr(rtParGet(r, i))
+        let Cell{v: v} = move(c)
+        append(mut &out, v)
+    }
+    rtParFree(r)
+    return out
+}

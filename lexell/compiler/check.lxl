@@ -4785,6 +4785,7 @@ fn (c: mut &Checker) call(sig: &Sig, hasRecv: bool, recv: Val, args: &[]Arg, lin
             if c.pg.tk(v.t) != sema.TK_CLO || !c.pg.unify(pt, v.t, mut &bind, &tps) {
                 c.err(line, what + " is " + c.tstr(pe) + ", not " + c.tstr(v.t))
             }
+            if c.isParMap(sig) { c.parKernelArg(an, v, line) }
             if v.caps >= 0 {     // rule 3: captures are held while the call runs
                 for k in 0..len(c.capl[v.caps]) {
                     let cp = c.capl[v.caps][k]
@@ -5199,6 +5200,9 @@ fn (c: mut &Checker) xCall(e: int, exp: int): Val {
         if (fname == "intoPtr" || fname == "fromPtr") && c.pg.mods[c.cx.mod].isLib && c.pg.lookup(c.cx.mod, fname).k < 0 {
             return c.rawPtr(fname, e, exp)
         }
+        if (fname == "rawAddr" || fname == "rawAt") && c.pg.mods[c.cx.mod].isLib && c.pg.lookup(c.cx.mod, fname).k < 0 {
+            return c.rawRef(fname, e, exp)
+        }
         let ii = intrinsic(fname)
         if ii >= 0 && c.pg.lookup(c.cx.mod, fname).k < 0 {
             let sig = c.intrSig(ii)
@@ -5293,6 +5297,62 @@ fn (c: mut &Checker) rawPtr(name: str, e: int, exp: int): Val {
     let p = c.rd(c.expr(c.arg(e, 0), sema.T_PTR))
     if p.t != sema.T_PTR { c.err(line, "fromPtr needs a ptr, not " + c.tstr(p.t)) }
     return c.holdtmp(c.x.pcast(c.T(exp), p.c), exp)
+}
+
+// par.map (lib/par.lxl), whose closure runs on the pool's threads (design/parallel.md 0, 2.5).
+fn (c: &Checker) isParMap(sig: &Sig): bool {
+    if sig.kind != SK_FN || sig.fd < 0 { return false }
+    let m = c.pg.fns[sig.fd].mod
+    return c.pg.fns[sig.fd].name == "map" && c.pg.mods[m].isLib && c.pg.mods[m].name == "par"
+}
+
+// par.map's closure: written at the call (a closure, or a function named there), so the kernel
+// pass knows exactly what runs, and changing none of the variables it captures (the pool's
+// threads run it at once).
+fn (c: mut &Checker) parKernelArg(an: int, v: Val, line: int) {
+    var named = false
+    if an >= 0 && c.kind(an) != sx.N_CLOSURE {
+        let st = c.static(an)
+        named = st.k == ST_DECL && st.dk == sema.D_FN
+    }
+    if an < 0 || (c.kind(an) != sx.N_CLOSURE && !named) {
+        c.err(line, "par.map needs its closure written at the call (a closure, or the name of a function), " +
+            "so that the compiler can check what the pool's threads run")
+    }
+    if v.caps >= 0 {
+        for cp in c.capl[v.caps] {
+            if cp.m {
+                c.err(line, "par.map: the closure changes '" + c.vars[cp.v].name + "', which it captures: " +
+                    "its runs share the variables around it, so it may only read them")
+            }
+        }
+    }
+}
+
+// The library intrinsics of lib/par (design/parallel.md 2.6): rawAddr(x), x a closure or slice
+// parameter or local, gives the address of its value as a ptr; rawAt(p), whose expected type is a
+// closure or slice type, reads such a value back. Unchecked, like intoPtr: par.map passes its
+// closure and slice to the runtime this way, and the item function reads them back while
+// par.map's call (which holds them, SPEC 10 rule 3) is running.
+fn (c: mut &Checker) rawRef(name: str, e: int, exp: int): Val {
+    c.nargs(e, 1)
+    let line = c.line(e)
+    if name == "rawAddr" {
+        let a = c.arg(e, 0)
+        let vi = if c.kind(a) == sx.N_NAME { c.lookupVar(c.nd(a).s, false) } else { -1 }
+        if vi < 0 { c.err(line, "rawAddr needs the name of a closure or slice parameter or local") }
+        let k = c.pg.tk(c.vars[vi].t)
+        if k != sema.TK_CLO && k != sema.TK_SLICE {
+            c.err(line, "rawAddr needs a closure or a slice, not " + c.tstr(c.vars[vi].t))
+        }
+        return rv(c.x.pcast(c.ct("void*"), c.x.pre("&", c.vars[vi].c)), sema.T_PTR)
+    }
+    if exp < 0 || (c.pg.tk(exp) != sema.TK_CLO && c.pg.tk(exp) != sema.TK_SLICE) {
+        c.err(line, "rawAt needs a closure or slice type as its expected type (let f: &fn(&A): T = rawAt(p))")
+    }
+    let p = c.rd(c.expr(c.arg(e, 0), sema.T_PTR))
+    if p.t != sema.T_PTR { c.err(line, "rawAt needs a ptr, not " + c.tstr(p.t)) }
+    return rv(c.x.par(c.x.at(c.T(exp), p.c)), exp)
 }
 
 fn (c: mut &Checker) allTypeish(l: int): bool {

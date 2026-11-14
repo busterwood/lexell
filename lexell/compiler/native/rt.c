@@ -3638,3 +3638,14 @@ int64_t lxllib_net_wait_for(int64_t fd, int64_t dir, int64_t ms, bool cancellabl
     if (ur) rt_ur_interest(fd, 0);
     return r;
 }
+
+/* ------------------------------------------------------------ par.map (design/parallel.md)
+   lib/par.lxl's runtime: n items, item(f, xs, i) boxing the result of item i. */
+void* lxllib_par_run(int64_t n, void* (*item)(void*, void*, int64_t), void* f, void* xs, const char* w) {
+    rt_nopark(w);
+    void** r = (void**)rt_alloc((size_t)n * sizeof(void*));
+    for (int64_t i = 0; i < n; i++) r[i] = item(f, xs, i);
+    return r;
+}
+void* lxllib_par_get(void* r, int64_t i) { return ((void**)r)[i]; }
+void lxllib_par_free(void* r) { rt_free(r); }
