@@ -1,0 +1,97 @@
+// lexdb_exec: COPY's serial fast path (design/lexdb-copy-fast.md): a full
+// column list of simple scalars, one integer key, no indexes or checks. It
+// parses straight into the stored row; sorted keys avoid the own-writes map,
+// and an out-of-order key switches to it. Other shapes, and a load into a
+// non-empty table, keep the generic path.
+// expect: sorted: COPY 2; 1|a;2|b
+// expect: unsorted: COPY 2; 1|a;2|b
+// expect: duplicate: 23505 COPY t, line 2
+// expect: escapes: COPY 3; 1|a\tb;2|NULL;3|x\slash
+// expect: append: COPY 1; 1|a\tb;2|NULL;3|x\slash;4|d
+// expect: types: COPY 1; 1|123.45|2024-01-02|2024-01-02 03:04:05.123456+00|t|12345678-1234-5678-9abc-def012345678
+import "strings"
+import "../../../cmd/lexdb_base"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_sql"
+import "../../../cmd/lexdb_exec"
+
+fn err(e: &lexdb_base.DbErr): str {
+    return e.state + (if e.context != "" { " " + e.context } else { "" })
+}
+
+fn q(s: mut &lexdb_exec.Session, sql: str): str {
+    match s.exec(&sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if r.hasRows {
+                var rows: []str = []
+                for row in r.rows {
+                    var cells: []str = []
+                    for v in row { append(mut &cells, if lexdb_exec.isNull(&v) { "NULL" } else { lexdb_exec.text(&v) }) }
+                    append(mut &rows, strings.join(&cells, "|"))
+                }
+                return strings.join(&rows, ";")
+            }
+            return r.tag
+        }
+        Err(e) { return err(&e) }
+    }
+}
+
+// COPY ... FROM STDIN with data: its tag, or its error.
+fn copyIn(s: mut &lexdb_exec.Session, sql: str, data: &str): str {
+    let stmts = lexdb_sql.parse(&sql).unwrap()
+    let none: []lexdb_sql.Val = []
+    let nt: []int = []
+    match s.run(&stmts[0], &none, &nt) {
+        Ok(r) {
+            if r.copy != lexdb_exec.COPY_IN { return "not COPY_IN: " + r.tag }
+            match s.copyIn(&stmts[0], lexdb_exec.CopyInput{have: true, data: data, fail: "", proto: false, stream: false, pull: false}) {
+                Ok(r2) { return r2.tag }
+                Err(e) { return err(&e) }
+            }
+        }
+        Err(e) { return err(&e) }
+    }
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(31), lexdb_store.Options{cacheBytes: 16 * 1024 * 1024, segBytes: 256 * 1024,
+        ckptBytes: 128 * 1024, snapNodes: 50000}, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        let mk = "create table t (id int primary key, v text)"
+
+        let d = q(mut &s, "drop table if exists t")
+        let m = q(mut &s, mk)
+        let c = copyIn(mut &s, "copy t from stdin", &"1\ta\n2\tb\n")
+        println("sorted: " + c + "; " + q(mut &s, "select * from t order by 1"))
+
+        let d2 = q(mut &s, "drop table if exists t")
+        let m2 = q(mut &s, mk)
+        let c2 = copyIn(mut &s, "copy t from stdin", &"2\tb\n1\ta\n")
+        println("unsorted: " + c2 + "; " + q(mut &s, "select * from t order by 1"))
+
+        let d3 = q(mut &s, "drop table if exists t")
+        let m3 = q(mut &s, mk)
+        println("duplicate: " + copyIn(mut &s, "copy t from stdin", &"2\tb\n2\tc\n"))
+
+        let d4 = q(mut &s, "drop table if exists t")
+        let m4 = q(mut &s, mk)
+        let c4 = copyIn(mut &s, "copy t from stdin", &"1\ta\\tb\n2\t\\N\n3\tx\\\\slash\n")
+        let rows = strings.replaceAll(&q(mut &s, "select * from t order by 1"), "\t", "\\t")
+        println("escapes: " + c4 + "; " + rows)
+
+        let c5 = copyIn(mut &s, "copy t from stdin", &"4\td\n")
+        let rows5 = strings.replaceAll(&q(mut &s, "select * from t order by 1"), "\t", "\\t")
+        println("append: " + c5 + "; " + rows5)
+
+        let d6 = q(mut &s, "drop table if exists t")
+        let m6 = q(mut &s, "create table w (id int primary key, n numeric(12,2), d date, ts timestamptz, flag boolean, u uuid)")
+        let c6 = copyIn(mut &s, "copy w from stdin",
+            &"1\t123.45\t2024-01-02\t2024-01-02 03:04:05.123456+00:00\tt\t12345678-1234-5678-9abc-def012345678\n")
+        println("types: " + c6 + "; " + q(mut &s, "select * from w"))
+        return 0
+    })
+}

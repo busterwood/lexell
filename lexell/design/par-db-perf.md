@@ -343,13 +343,12 @@ writes the row (which `encFixed` does anyway).
    moves (one line, probe above). Split the plain ISO timestamp/date fast
    path from the general parser; keep clocks and `Zone` out of kernels.
    These are prerequisites for a COPY kernel, and each is small.
-2. **COPY is the best target.** Use borrowed fields, 16 chunks, and a
-   batched parse+encode kernel. Expect about 1.7 s at 4 threads or 1.5 s
-   at 8 from 3.31 s, roughly level with PostgreSQL here. If that works,
-   pipeline the store insert with the next chunk's parse: the load becomes
-   insert-bound at about 1.2 s, which beats PostgreSQL's single-threaded
-   COPY on either machine. The pipeline needs tasks or a producer/consumer
-   handoff; one `par.map` call cannot overlap the two.
+2. **COPY: a serial fast path first, `par.map` later.** The prototype in
+   [lexdb-copy-fast.md](lexdb-copy-fast.md) parses text straight into the
+   stored row and reaches 1.5 s serial from 3.31 s, at PostgreSQL's 1.42 s,
+   with no worker handoff or kernel purity rules. That is the first fix;
+   parallel chunks are a later multiplier for larger loads or for
+   overlapping parse with the store, not a substitute for the serial path.
 3. **Aggregates: parallel partial aggregation over batches, merge on the
    caller.** Expect 2 to 3x, which takes `group by city` from 190 to 68 to
    96 ms, still behind PostgreSQL's 45 ms at four processes. Parallelism
