@@ -435,13 +435,15 @@ pub type WorkerPolicy = value record {
     pub backoffMs: int      // the wait before a restart; doubled for each crash in a row of one worker
     pub maxBackoffMs: int   // (a run that lasted windowMs ends the row), up to this
     pub drainMs: int        // after the stop signal, how long before SIGKILL; 0: no limit
+    pub fatalCode: int      // an exit code (not 0) that means "do not start me again": a worker that exits with it
+                            // before it is ready ends the supervision at once, as if it had crashed too often; 0: none
 }
 
 // The defaults: more than 5 crashes in 10 s gives up; restarts after 100 ms,
 // 200, 400, ... up to 5 s; the drain has no time limit (a second SIGTERM or
 // SIGINT sends SIGKILL).
 pub fn workerPolicy(): WorkerPolicy {
-    return WorkerPolicy{maxCrashes: 5, windowMs: 10000, backoffMs: 100, maxBackoffMs: 5000, drainMs: 0}
+    return WorkerPolicy{maxCrashes: 5, windowMs: 10000, backoffMs: 100, maxBackoffMs: 5000, drainMs: 0, fatalCode: 0}
 }
 
 // workers' error: the workers crashed too often, so the supervisor stopped
@@ -476,6 +478,8 @@ pub fn workers(n: int, f: &fn(int), w: Where): Result[[]WorkerEnd, GaveUp] {
 // panic or other runtime error ends it with its exit code, as a program).
 // The calling process supervises them until all have ended:
 //
+// - a worker that exits with p.fatalCode before it is ready is not started again, and the others are
+//   stopped as when the workers crashed too often (Err(GaveUp), the worker's WorkerEnd has the code);
 // - a worker that crashes (a signal or a code other than 0) is started again
 //   after p's backoff, unless the workers crashed more than p.maxCrashes
 //   times within p.windowMs: then the others are asked to stop and workers
@@ -511,6 +515,7 @@ pub fn workersWith(n: int, p: WorkerPolicy, f: &fn(int), w: Where): Result[[]Wor
     var crashes: []int = []     // the times of the crashes within the window
     var stopping = false
     var gaveUp = false
+    var fatal = false           // a worker ended with the policy's fatalCode before it was ready
     var killAt = -1             // when stopping: when to send SIGKILL (ms), or -1
     for i in 0..n { launch(mut &slots[i], f, mut &crashes, &p) }
     while true {
@@ -543,6 +548,9 @@ pub fn workersWith(n: int, p: WorkerPolicy, f: &fn(int), w: Where): Result[[]Wor
                         slots[i].end.drained = true
                     } else if slots[i].end.signal == 0 && slots[i].end.code == 0 {
                         slots[i].done = true
+                    } else if p.fatalCode != 0 && slots[i].end.signal == 0 && slots[i].end.code == p.fatalCode && rtWorkerMark(i, -1) != 1 {
+                        slots[i].done = true
+                        fatal = true
                     } else {
                         crashed(mut &slots[i], mut &crashes, &p, now, rtWorkerMark(i, -1) != 1)
                     }
@@ -581,7 +589,7 @@ pub fn workersWith(n: int, p: WorkerPolicy, f: &fn(int), w: Where): Result[[]Wor
                 }
             }
         }
-        if !gaveUp && len(crashes) > p.maxCrashes {
+        if !gaveUp && (fatal || len(crashes) > p.maxCrashes) {
             gaveUp = true
             stopping = true
             killAt = stopAll(mut &slots, SIGTERM, &p, nowMs())

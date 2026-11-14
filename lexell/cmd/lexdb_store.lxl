@@ -33,6 +33,9 @@ const SPARE = "log.spare"
 const PAGE = 4096
 const LOG_MAGIC = 0x4C474C58
 const FRAME_HDR = 32
+// The most record bytes a log frame holds: its length is 32 bits, and a frame
+// past it would be one recovery stops at (9.127). Tests set fewer.
+pub const FRAME_MAX = 4294967296 - 4096
 
 pub const OP_PUT = 1
 pub const OP_DEL = 2
@@ -83,7 +86,7 @@ type Hist = record { since: int; until: int; node: lexdb_page.Node }
 // A live snapshot: it sees the store as it was after commit seq.
 type Snap = value record { id: int; seq: int; cancelled: bool }
 
-type Deferred = value record { slot: int; seq: int; height: int }
+type Deferred = value record { slot: int; seq: int; height: int; whole: bool }  // whole: a dropped tree's slot (its children's too, 9.127)
 
 // A tree's root changed by commit seq (prev: the root before, -1 none): a
 // snapshot at an earlier commit starts from prev.
@@ -134,6 +137,7 @@ pub type Db = record {
     freeAfterNext: []int        // pages the next checkpoint frees
     pendingFree: []int          // runs the checkpoint in flight frees when durable
     dropped: []int              // subtrees no tree reaches, their pages to free: (page, height or -1) pairs (9.32)
+    frameMax: int               // FRAME_MAX (tests set fewer)
     dropReads: int              // the most of their pages a checkpoint reads (DROP_READS; tests set fewer)
     memo: Map[str, str]         // what the SQL layer keeps while the store is open, outside transactions (its sequences' blocks: 9.43)
     listPages: []int            // the list pages of the last durable checkpoint
@@ -530,15 +534,33 @@ fn (db: &Db) maxSnap(): int {
 
 // Frees a slot the tree no longer reaches; while a snapshot may still reach
 // it (it sees a version the slot holds), the slot is kept until then.
-fn (db: mut &Db) freeSlot(s: int) { db.freeSubtree(s, -1) }
+fn (db: mut &Db) freeSlot(s: int) { db.freeSubtree(s, -1, false) }
 
 // freeSlot for a slot whose subtree is h high (-1: not known), which
-// matters when it is not in memory (releaseSlot).
-fn (db: mut &Db) freeSubtree(s: int, h: int) {
+// matters when it is not in memory (releaseSlot). whole: s is a dropped
+// tree's, so that the slots a snapshot gave its children after the drop
+// are freed with it (releaseWhole).
+fn (db: mut &Db) freeSubtree(s: int, h: int, whole: bool) {
     if (db.seq > db.durableSeq || db.maxSnap() >= 0) && !db.meta[s].pinned {
         db.meta[s].pinned = true
-        append(mut &db.deferred, Deferred{slot: s, seq: db.seq, height: h})
+        append(mut &db.deferred, Deferred{slot: s, seq: db.seq, height: h, whole: whole})
         return
+    }
+    db.releaseSlot(s, h)
+}
+
+// releaseSlot for a dropped tree's deferred slot. A snapshot may have
+// loaded it after the drop, which gave its children slots no deferral names
+// (those loaded before the drop are deferred, pinned, and freed by their
+// own entries, after their parent's, which came first): freed here, down to
+// the pages not in memory (9.127).
+fn (db: mut &Db) releaseWhole(s: int, h: int) {
+    if db.meta[s].loaded && !db.pool[db.meta[s].frame].leaf {
+        var kids: []int = []
+        for k in db.pool[db.meta[s].frame].kids { append(mut &kids, k) }
+        for k in kids {
+            if db.meta[k].used && !db.meta[k].pinned { db.releaseWhole(k, if h >= 0 { h - 1 } else { -1 }) }
+        }
     }
     db.releaseSlot(s, h)
 }
@@ -664,7 +686,7 @@ fn (db: mut &Db) prune() {
     for d in replace(mut &db.deferred, []) {
         var need = d.seq > db.durableSeq
         for q in live { if q < d.seq { need = true } }
-        if need { append(mut &still, d) } else { db.releaseSlot(d.slot, d.height) }
+        if need { append(mut &still, d) } else if d.whole { db.releaseWhole(d.slot, d.height) } else { db.releaseSlot(d.slot, d.height) }
     }
     db.deferred = still
 }
@@ -1563,7 +1585,7 @@ fn (db: mut &Db) applyDrop(tree: int) {
                 append(mut &stack, depth + 1)
             }
         }
-        db.freeSubtree(s, if height >= 0 { height - depth } else { -1 })
+        db.freeSubtree(s, if height >= 0 { height - depth } else { -1 }, true)
     }
 }
 
@@ -1792,6 +1814,13 @@ fn (st: &Store) unstore(t: mut &Txn, tree: int, key: &str, v: &str): Result[str,
 }
 
 // ---- the log record format
+
+// The bytes t's records take in a frame.
+fn recordsLen(writes: &[]TxWrite): int {
+    var n = 0
+    for w in writes { n += 13 + len(w.key) + len(w.val) + (if w.op == OP_PUT && w.head > 0 { 4 } else { 0 }) }
+    return n
+}
 
 fn addRecord(b: mut &[]byte, w: &TxWrite) {
     let withHead = w.op == OP_PUT && w.head > 0
@@ -2984,6 +3013,20 @@ fn (st: &Store) commitLive(t: Txn, durable: bool): Result[Unit, lexdb_base.DbErr
             }
             var b = db.appliedBatch
             if len(t.writes) > 0 {
+                // A frame's length is 32 bits: a commit that would not fit
+                // one fails, before anything is written (9.127); one that
+                // would not fit the batch waits for the writer to take it.
+                let recs = recordsLen(&t.writes)
+                if recs > db.frameMax {
+                    append(mut &bad, lexdb_base.err(lexdb_base.S_LIMIT, "transaction too large: its log records take " + recs.toStr() + " bytes, at most " + db.frameMax.toStr()))
+                    return
+                }
+                if len(db.batch) > FRAME_HDR && len(db.batch) - FRAME_HDR + recs > db.frameMax {
+                    let task.Handoff{promise: p, future: f} = task.promise[Unit]()
+                    append(mut &db.ckptDone, p)
+                    append(mut &held, f)
+                    return
+                }
                 db.seq += 1
                 db.logWrites(&t)
                 db.reserveBatch(&t)
@@ -3492,6 +3535,7 @@ pub fn writer(st: Store): int {
         var upto = 0
         var stop = false
         var idle: []task.Future[Unit] = []
+        var room: []task.Promise[Unit] = []
         st.sh.with(fn(db: mut &Db) {
             if len(db.failed) > 0 || (db.closing && db.batchCount == 0) {
                 stop = true
@@ -3504,12 +3548,14 @@ pub fn writer(st: Store): int {
                 no = db.batchNo
                 db.batchNo += 1
                 db.batchCount = 0
+                while len(db.ckptDone) > 0 { append(mut &room, pop(mut &db.ckptDone)) }     // (commits waiting for room in a batch, 9.127)
             } else {
                 let task.Handoff{promise: p, future: f} = task.promise[Unit]()
                 append(mut &db.writerWake, p)
                 append(mut &idle, f)
             }
         })
+        while len(room) > 0 { pop(mut &room).complete(Unit{}) }
         if stop { break }
         if len(idle) > 0 {
             match pop(mut &idle).wait() {
@@ -4569,7 +4615,7 @@ fn checkLog(fs: &lexdb_disk.Fs, logFs: &lexdb_disk.Fs, split: bool, create: bool
 fn newDb(fs: lexdb_disk.Fs, logFs: lexdb_disk.Fs, data: lexdb_disk.File, opts: Options, m: &lexdb_page.Meta): Db {
     return Db{opts: opts, fs: fs, logFs: logFs, data: data, watched: -1, watchedWrites: 0, pool: [], owner: [], meta: [], freeSlots: [], loadedCount: 0, cacheUsed: 0, wlog: [], wlogFloor: 0, hand: 0,
               trees: newMap(), lastLeaf: LastLeaf{tree: -1, shape: -1, path: [], lo: [], hasLo: [], hi: [], hasHi: []}, shape: 0, nextTree: m.nextTree, npages: m.npages, fileEnd: 0, reserving: true, free: [], freeAfterNext: [],
-              pendingFree: [], dropped: [], dropReads: DROP_READS, memo: newMap(), listPages: [], ckpt: m.ckpt, durableCkpt: m.ckpt, ckptRunning: false,
+              pendingFree: [], dropped: [], frameMax: FRAME_MAX, dropReads: DROP_READS, memo: newMap(), listPages: [], ckpt: m.ckpt, durableCkpt: m.ckpt, ckptRunning: false,
               batch: [], batchCount: 0, batchNo: m.replayBatch, appliedBatch: m.replayBatch - 1,
               durableBatch: m.replayBatch - 1, waiters: [], locks: newMap(), lockWaits: [], waitFor: newMap(), nextLock: 0, writerWake: [], ckptWake: [], ckptDone: [], seg: m.replaySeg,
               segOff: m.replayOff, logSinceCkpt: 0, failed: [], closing: false, seq: 0, snaps: [], nextSnap: 0,
@@ -4855,6 +4901,7 @@ pub type Stats = value record {
 }
 
 // The most pages of dropped subtrees one checkpoint reads (tests).
+pub fn (st: &Store) setFrameMax(n: int) { st.sh.with(fn(db: mut &Db) { db.frameMax = n }) }
 pub fn (st: &Store) setDropReads(n: int) { st.sh.with(fn(db: mut &Db) { db.dropReads = n }) }
 
 // The memo: values the SQL layer keeps while the store is open, outside any

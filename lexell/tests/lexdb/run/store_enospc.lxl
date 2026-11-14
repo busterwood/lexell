@@ -1,0 +1,132 @@
+// lexdb_store: a full disk (ENOSPC, errno 28) fails cleanly and recovers once space is added
+// (design/lexdb-gaps.md 2.6). The simulated disk is limited to a size (Fs.limitSpace). Twice: the log
+// runs out of room (a new segment cannot be made), and a checkpoint's page file cannot grow. In each:
+// commits go on until one fails; it returns the error (errno 28) and the earlier ones stay; with the
+// disk still full reads work and writes (and checkpoints) keep failing; after space is added the failed
+// store stays failed, and a reopen (after a clean close, and after a crash) holds every acknowledged
+// commit and none that failed, and takes new ones.
+// expect: log: failed true errno28 true reads-when-restarted-full true again true poisoned true reopen true crash true continues true
+// expect: ckpt: failed true errno28 true reads-when-restarted-full true again true poisoned true reopen true crash true continues true
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_base"
+import "strings"
+
+fn key(i: int): str { return "key" + strings.padLeft(i.toStr(), 5, '0') }
+fn val(i: int): str { return "v" + i.toStr() + strings.repeat("x", 150) }
+
+// small log segments; no checkpoint unless asked for
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: 128 * 1024 * 1024, segBytes: 16 * 4096, ckptBytes: 1024 * 1024 * 1024, snapNodes: 1000}
+}
+
+fn commitOne(st: &lexdb_store.Store, tree: int, i: int): Result[Unit, lexdb_base.DbErr] {
+    var t = lexdb_store.begin()
+    try t.put(tree, key(i), val(i))
+    return st.commit(t)
+}
+
+// the number of keys the store holds, which must be key(0) .. key(n - 1) with their values
+fn count(st: &lexdb_store.Store, tree: int): Result[int, lexdb_base.DbErr] {
+    var t = lexdb_store.begin()
+    var n = 0
+    var good = true
+    try st.scan(mut &t, tree, "", "", fn(e: &lexdb_store.Entry): bool {
+        if e.key != key(n) || e.val != val(n) { good = false }
+        n += 1
+        return true
+    })
+    if !good { return Err(lexdb_base.err(lexdb_base.S_INTERNAL, "wrong content")) }
+    return Ok(n)
+}
+
+fn yn(b: bool): str { return b.toStr() }
+
+// the store after a reopen holds exactly n keys, and takes another commit
+type Re = record { holds: bool; goes: bool }
+
+fn reopened(fs: lexdb_disk.Fs, tree: int, n: int): Re {
+    var holds = false
+    var goes = false
+    let r = lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int {
+        match count(&st, tree) {
+            Ok(c) { holds = c == n }
+            Err(_) {}
+        }
+        goes = commitOne(&st, tree, n).isOk() && count(&st, tree).unwrapOr(-1) == n + 1
+        return 0
+    })
+    if r.isErr() { println("reopen: " + r.unwrapErr().toStr()) }
+    return Re{holds: holds, goes: goes}
+}
+
+fn scenario(name: str, ckpt: bool) {
+    let fs = lexdb_disk.sim(7)
+    var crashed = fs
+    var tree = 0
+    var acked = 0
+    var errno28 = false
+    var full = fs
+    var again = false
+    var poisoned = false
+    let r = lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int {
+        var t = lexdb_store.begin()
+        tree = st.createTree(mut &t)
+        st.commit(t).unwrap()
+        // room for a few more segments' worth of log, or for a handful of pages in the page file
+        if ckpt {
+            // the commits fit in the log's first segment; the page file is what runs out
+            while acked < 60 {
+                commitOne(&st, tree, acked).unwrap()
+                acked += 1
+            }
+            fs.limitSpace(fs.usedSpace() + 2 * 4096)
+        } else {
+            fs.limitSpace(fs.usedSpace() + 40 * 4096)
+        }
+        var i = acked
+        while i < 2000 && !ckpt {
+            match commitOne(&st, tree, i) {
+                Ok(_) { acked += 1 }
+                Err(e) {
+                    errno28 = strings.contains(e.msg, "errno 28") && e.state == lexdb_base.S_IO
+                    break
+                }
+            }
+            i += 1
+        }
+        if ckpt {
+            match st.checkpoint() {
+                Ok(_) { errno28 = false }
+                Err(e) { errno28 = strings.contains(e.msg, "errno 28") && e.state == lexdb_base.S_IO }
+            }
+        }
+        // a failed store fails reads too (the first error); the disk is still full when it is restarted
+        full = fs.crash(12)
+        full.limitSpace(full.usedSpace())
+        again = commitOne(&st, tree, acked).isErr() && commitOne(&st, tree, acked).isErr()
+        if ckpt { again = again && st.checkpoint().isErr() }
+        fs.limitSpace(-1)
+        // space is back, but a store whose write failed does not go on
+        poisoned = commitOne(&st, tree, acked).isErr()
+        crashed = fs.crash(11)
+        return 0
+    })
+    if r.isErr() { println("run: " + r.unwrapErr().toStr()) }
+    var reads = false
+    let rr = lexdb_store.run(full, opts(), fn(st: lexdb_store.Store): int {
+        reads = count(&st, tree).unwrapOr(-1) == acked
+        return 0
+    })
+    if rr.isErr() { println("full reopen: " + rr.unwrapErr().toStr()) }
+    let clean = reopened(fs, tree, acked)
+    let afterCrash = reopened(crashed, tree, acked)
+    println(name + ": failed " + yn(acked > 0 && acked < 2000) + " errno28 " + yn(errno28) + " reads-when-restarted-full " + yn(reads)
+            + " again " + yn(again) + " poisoned " + yn(poisoned) + " reopen " + yn(clean.holds) + " crash " + yn(afterCrash.holds)
+            + " continues " + yn(clean.goes && afterCrash.goes))
+}
+
+fn main() {
+    scenario("log", false)
+    scenario("ckpt", true)
+}

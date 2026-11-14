@@ -102,6 +102,11 @@ var CACHE_MB: int = 0
 // Set once at start, before any worker process is made (a worker is a fork, so it keeps it).
 var LOG_DIR: str = ""
 
+// The exit code of a master that cannot start (a refused log directory, the data directory's lock held, a store that will not open,
+// a listener that will not bind): 1, and under --replicas EXIT_REFUSED, which the supervisor does not restart (design/lexdb.md 9.126).
+const EXIT_REFUSED = 3
+var START_FAIL: int = 1
+
 // The log's file system: the data directory's own, or the one --log-dir names.
 fn logFs(dir: str): lexdb_disk.Fs { return lexdb_disk.real(if LOG_DIR == "" { dir } else { LOG_DIR }) }
 
@@ -298,6 +303,8 @@ fn supervise(dir: str, addrs: &[]str, tdsAddrs: &[]str, tnsAddrs: &[]str, n: int
     let fl = io.flushStdout()
     var policy = task.workerPolicy()
     policy.maxBackoffMs = 2000
+    policy.fatalCode = EXIT_REFUSED
+    START_FAIL = EXIT_REFUSED
     let ends = task.workersWith(n + 1, policy, fn(w: int) {
         if w == 0 {
             runMaster(dir, addrs, tdsAddrs, tnsAddrs, auth)
@@ -311,7 +318,13 @@ fn supervise(dir: str, addrs: &[]str, tdsAddrs: &[]str, tnsAddrs: &[]str, n: int
     match ends {
         Ok(_) {}
         Err(g) {
-            eprintln("lexdb: the workers ended too often (" + g.crashes.toStr() + " times): stopped")
+            var refused = false
+            for e in g.ends { if e.code == EXIT_REFUSED && !e.drained { refused = true } }
+            if refused {
+                eprintln("lexdb: the master was refused at start-up (see the message above): stopped, not restarted")
+            } else {
+                eprintln("lexdb: the workers ended too often (" + g.crashes.toStr() + " times): stopped")
+            }
             exit(1)
         }
     }
@@ -328,7 +341,7 @@ fn runMaster(dir: str, addrs: &[]str, tdsAddrs: &[]str, tnsAddrs: &[]str, auth: 
     let lfd = openLock(lockPath, i32(2 | 64 | 524288), u32(384))    // O_RDWR|O_CREAT|O_CLOEXEC, 0600
     if lfd < 0 {
         eprintln("lexdb: " + lockPath + ": " + lockStrerror(i32(lockErrno())))
-        exit(1)
+        exit(START_FAIL)
     }
     if flock(lfd, i32(2 | 4)) != 0 {                                // LOCK_EX|LOCK_NB
         let e = lockErrno()
@@ -337,7 +350,7 @@ fn runMaster(dir: str, addrs: &[]str, tdsAddrs: &[]str, tnsAddrs: &[]str, auth: 
         } else {
             eprintln("lexdb: " + lockPath + ": " + lockStrerror(i32(e)))
         }
-        exit(1)
+        exit(START_FAIL)
     }
     task.watchSignals(&[task.SIGTERM, task.SIGINT])
     // LEXDB_CACHE_MB: the cache's budget (lexdb_store.Options.cacheBytes);
@@ -348,7 +361,7 @@ fn runMaster(dir: str, addrs: &[]str, tdsAddrs: &[]str, tnsAddrs: &[]str, auth: 
     let opened = if LOG_DIR == "" { lexdb_store.open(lexdb_disk.real(dir), opts) } else { lexdb_store.openSplit(lexdb_disk.real(dir), logFs(dir), opts) }
     if opened.isErr() {
         eprintln("lexdb: open " + dir + ": " + opened.unwrapErr().toStr())
-        exit(1)
+        exit(START_FAIL)
     }
     let st = opened.unwrap()
     if LOG_DIR != "" { noCow(LOG_DIR) }
@@ -360,7 +373,7 @@ fn runMaster(dir: str, addrs: &[]str, tdsAddrs: &[]str, tnsAddrs: &[]str, auth: 
             Ok(_) {}
             Err(e) {
                 eprintln("lexdb: " + e.toStr())
-                code = 1
+                code = START_FAIL
                 st.close()
                 return
             }
@@ -369,7 +382,7 @@ fn runMaster(dir: str, addrs: &[]str, tdsAddrs: &[]str, tnsAddrs: &[]str, auth: 
             Ok(_) {}
             Err(msg) {
                 eprintln("lexdb: " + msg)
-                code = 1
+                code = START_FAIL
                 st.close()
                 return
             }
@@ -402,7 +415,7 @@ fn runMaster(dir: str, addrs: &[]str, tdsAddrs: &[]str, tnsAddrs: &[]str, auth: 
                         }
                         Err(msg) {
                             eprintln("lexdb: tds: " + msg)
-                            code = 1
+                            code = START_FAIL
                         }
                     }
                 }
@@ -427,7 +440,7 @@ fn runMaster(dir: str, addrs: &[]str, tdsAddrs: &[]str, tnsAddrs: &[]str, auth: 
                         }
                         Err(msg) {
                             eprintln("lexdb: tns: " + msg)
-                            code = 1
+                            code = START_FAIL
                         }
                     }
                 }
@@ -442,7 +455,7 @@ fn runMaster(dir: str, addrs: &[]str, tdsAddrs: &[]str, tnsAddrs: &[]str, auth: 
             }
             Err(msg) {
                 eprintln("lexdb: " + msg)
-                code = 1
+                code = START_FAIL
             }
         }
         { let stop = auto }

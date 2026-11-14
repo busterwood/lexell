@@ -11699,11 +11699,11 @@ each worker has it). The copy-on-write flag (9.61) is set on LOGDIR as on DATADI
     the option) refused, "start it without --log-dir". A crash between the two writes leaves a `logid` and no segment, which the next start replaces;
   - no `logdir` and no `--log-dir`: nothing changes, one `exists` call; a directory made without the option has no
     new file in it, and existing directories keep working.
-  A replica runs the same check but never makes anything. Under `--replicas` a refusal ends the master worker, which the
-  supervisor restarts until it gives up ("the workers ended too often"), so check by hand first.
+  A replica runs the same check but never makes anything. Under `--replicas` a refusal ends the master worker with exit
+  code 3; since 9.126 the supervisor does not restart it but stops at once (it used to retry until "the workers ended too often").
 - **Not done.** The two directories are not locked separately: the lock is DATADIR's, and two databases cannot share a
   LOGDIR (the second is refused: it has a log), but a log directory is not locked against a stray server on a copy of
-  DATADIR with the same id. ENOSPC on either directory is not tested (lexdb-gaps.md 2.6).
+  DATADIR with the same id. ENOSPC on either directory is tested since 9.126 (lexdb-gaps.md 2.6).
 - **Tests.** `tests/lexdb/run/store_logdir.lxl`: the refusals on simulated file systems, and 90 crashes of two
   `Fs` with the segments only in the log one and the data file only in the other. `tests/lexdb/logdir.py` (stand-alone,
   like `nosync.py`): real processes, the segments in LOGDIR and none in DATADIR, restart and restart after SIGKILL, every
@@ -11730,3 +11730,32 @@ are in 9.69 and 9.70: equal to `O_DIRECT` when the data is cached, faster on mis
   (checkpoints write dirty pages that the kernel flushes in its own time, then `fdatasync`).
 - **Tests.** The suite (156), `logdir.py`, `nosync.py`, `replica.py` and the crash test (20 rounds) pass; the crash test has
   one mode.
+
+### 9.126 ENOSPC tested; the supervisor stops on a refused start
+
+**A full disk (lexdb-gaps.md 2.6).** The simulated `Fs` has `limitSpace(n)`: all files together may hold n bytes (`-1`
+lifts it), and a write or `grow` past it fails with errno 28 (`ioErr`: `pwrite: errno 28`, `fallocate: errno 28`, state
+`S_IO`), as a full file system does; `usedSpace()` gives the bytes in use. `tests/lexdb/run/store_enospc.lxl` runs it for
+the log (a new segment cannot be made) and for a checkpoint (the page file cannot grow). Behaviour, the same as for EIO:
+- the failing commit (or checkpoint) returns the error to its caller; no crash, no hang; the commits acknowledged before it stay;
+- the store is then **failed** (`Db.failed`): every later commit, checkpoint and also read returns the first error, even
+  after space is added. It does not continue: **it needs a restart**. Closing it is clean;
+- a restart with the disk still full opens and reads every acknowledged commit; a reopen after space is added (clean
+  close, and after a simulated crash) holds exactly the acknowledged commits, none that failed, and takes new ones.
+The real `Fs` passes the errno on as `ioErr(op, errno)`: the message is `pwrite: errno 28` (no text such as "No space left on
+device"); not changed. `writeText` (the small marker files) does not check the limit.
+
+**The supervisor does not restart a refused master.** A master that cannot start (`runMaster`: the lock held, the store
+refusing to open, such as `checkLog`'s refusals, the bootstrap, a listener that will not bind) exits with `EXIT_REFUSED`
+(3) under `--replicas` (1 as before without it: `START_FAIL`). `task.WorkerPolicy` has a new field `fatalCode`: a worker
+that exits with it before `workerReady()` is not restarted, the others get SIGTERM, and `workers` returns `Err(GaveUp)` at
+once; `lexdb` prints "the master was refused at start-up (see the message above): stopped, not restarted" and exits 1.
+Crashes after serving keep the restart behaviour. A replica waiting for its master (`lexdb_repl.connect`) now ends its wait
+on SIGTERM (it ignored it for up to 60 s). Tests: `logdir.py`'s two supervised refusals (exit 1 within seconds, the message once).
+
+### 9.127 Dropped trees a snapshot loaded are freed whole; a log frame's length is checked
+
+Found by reading while designing bulk deletes (lexdb-bulkdelete.md section 7), then confirmed by tests.
+
+- **A page leak.** A snapshot that began before a DROP or TRUNCATE can read the dropped tree after it. The tree's slots not in memory at the drop were deferred with their heights (9.32); the snapshot loads one, `installOnly` gives its children slots, and once the snapshot ended `releaseSlot` freed only that node's page: the children's slots and pages were reached by nothing and never returned to the free list (`audit`: lost 107 to 179 pages of 747). `Deferred` has a `whole` flag, set by `applyDrop`; `releaseWhole` frees the loaded, unpinned children first (pinned ones have their own entries, after it in the list), then the node by `releaseSlot`. Test `store_dropsnap`: drop and truncate, a snapshot reading one path or a scan, `lost 0`.
+- **The frame length.** `frame` wrote a batch's payload length as a u32, unchecked; a batch of over 4 GiB would be a frame recovery stops at, losing it and what follows. `commitLive` now refuses, before applying anything, a commit whose records (`recordsLen`) pass `FRAME_MAX` (2^32 less a page) with 54000 "transaction too large"; one that fits but not the batch pending waits for the writer to take it (on `ckptDone`, which the writer completes). `Store.setFrameMax` lowers the limit for tests: `store_framemax`.

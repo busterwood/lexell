@@ -70,6 +70,7 @@ pub type SimFs = record {
     pub flushes: int
     failAt: int                     // the I/O call that fails (EIO), or -1
     ios: int
+    space: int                      // the most bytes all files together may hold (ENOSPC past it), or -1
     hold: str                       // flushes of files whose names start with it wait ("" none)
 }
 
@@ -83,7 +84,7 @@ pub fn real(dir: str): Fs { return Fs.Real(dir) }
 
 pub fn sim(seed: int): Fs {
     return Fs.Sim(task.shared(SimFs{files: [], rng: lexdb_base.rng(seed), writes: 0, flushes: 0,
-                                     failAt: -1, ios: 0, hold: ""}))
+                                     failAt: -1, ios: 0, space: -1, hold: ""}))
 }
 
 fn alignedCheck(off: int, n: int, op: str): Result[Unit, lexdb_base.DbErr] {
@@ -284,7 +285,7 @@ pub fn (f: &Fs) crash(seed: int): Fs {
         }
     }
     return Fs.Sim(task.shared(SimFs{files: files, rng: lexdb_base.rng(seed + 1), writes: 0, flushes: 0,
-                                     failAt: -1, ios: 0, hold: ""}))
+                                     failAt: -1, ios: 0, space: -1, hold: ""}))
 }
 
 // Makes the n-th I/O call from now (0: the next) fail with EIO, for the tests.
@@ -293,6 +294,25 @@ pub fn (f: &Fs) failIn(n: int) {
         Fs.Real(_) {}
         Fs.Sim(sh) { sh.with(fn(st: mut &SimFs) { st.failAt = st.ios + n }) }
     }
+}
+
+// Limits the simulated disk to n bytes in all (the files' sizes added): a write or grow that would pass it
+// fails with errno 28 (ENOSPC), as a full file system does, until the limit is raised; -1 lifts it. For the tests.
+pub fn (f: &Fs) limitSpace(n: int) {
+    match f {
+        Fs.Real(_) {}
+        Fs.Sim(sh) { sh.with(fn(st: mut &SimFs) { st.space = n }) }
+    }
+}
+
+// The bytes of every live simulated file.
+pub fn (f: &Fs) usedSpace(): int {
+    var n = 0
+    match f {
+        Fs.Real(_) {}
+        Fs.Sim(sh) { sh.with(fn(st: mut &SimFs) { for x in st.files { if x.live { n += len(x.cur) } } }) }
+    }
+    return n
 }
 
 // Makes the flushes of files whose names start with prefix wait until it is
@@ -322,6 +342,14 @@ pub fn (f: &Fs) flushes(): int {
 }
 
 // ---- files
+
+// Whether file idx may be made end - its size bytes longer within the limit (limitSpace).
+fn simRoom(st: &SimFs, idx: int, end: int): bool {
+    if st.space < 0 || end <= len(st.files[idx].cur) { return true }
+    var used = 0
+    for x in st.files { if x.live { used += len(x.cur) } }
+    return used + end - len(st.files[idx].cur) <= st.space
+}
 
 fn simIo(st: mut &SimFs): bool {
     let fail = st.failAt >= 0 && st.ios == st.failAt
@@ -353,10 +381,13 @@ pub fn (f: &File) grow(n: int): Result[Unit, lexdb_base.DbErr] {
             return Ok(Unit{})
         }
         File.Sim(sh, i) {
+            var full = false
             sh.with(fn(st: mut &SimFs) {
+                if !simRoom(st, i, n) { full = true; return }
                 while len(st.files[i].cur) < n { append(mut &st.files[i].cur, byte(0)) }
                 while len(st.files[i].durable) < n { append(mut &st.files[i].durable, byte(0)) }
             })
+            if full { return Err(lexdb_base.ioErr("fallocate", 28)) }
             return Ok(Unit{})
         }
     }
@@ -461,8 +492,10 @@ pub fn (f: &File) write(off: int, src: &[byte]): Result[Unit, lexdb_base.DbErr] 
         File.Sim(sh, idx) {
             let yd = task.yield()
             var fail = false
+            var full = false
             sh.with(fn(st: mut &SimFs) {
                 fail = simIo(st)
+                if !fail && !simRoom(st, idx, off + n) { full = true; return }
                 if !fail {
                     st.writes += 1
                     while len(st.files[idx].cur) < off + n { append(mut &st.files[idx].cur, byte(0)) }
@@ -474,6 +507,7 @@ pub fn (f: &File) write(off: int, src: &[byte]): Result[Unit, lexdb_base.DbErr] 
                     append(mut &st.files[idx].pending, Pending{off: off, data: strFromBytes(&bs)})
                 }
             })
+            if full { return Err(lexdb_base.ioErr("pwrite", 28)) }
             if fail { return Err(lexdb_base.ioErr("pwrite", 5)) }
             return Ok(Unit{})
         }

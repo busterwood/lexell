@@ -241,6 +241,26 @@ def main():
         check('supervised replica follows', wait_rows(port5 + 1, 'select count(*) from t', '500') == '500')
         check('supervised: segments in the log directory only', 'log.1' in segs(logd5) and segs(data5) == [])
         check('supervised stops', stop(p) == 0)
+    # supervised and refused at start-up: the supervisor stops at once, it does not restart the master
+    for what, flags in (('a missing log directory', ['--log-dir', os.path.join(work, 'wal5.gone')]),
+                        ('no --log-dir where the database has one', [])):
+        pre = 'supervised refusal (%s): ' % what
+        rlog = os.path.join(work, 'sup.log')
+        open(rlog, 'w').close()
+        t0 = time.time()
+        sp = subprocess.Popen([exe, data5, '127.0.0.1:%d' % free_port(), '--replicas', '1'] + flags,
+                              stdout=open(rlog, 'a'), stderr=subprocess.STDOUT)
+        try:
+            rc = sp.wait(30)
+        except subprocess.TimeoutExpired:
+            sp.kill()
+            sp.wait()
+            rc = 'hung'
+        took = time.time() - t0
+        out = read(rlog)
+        check(pre + 'exits non-zero at once', rc == 1 and took < 8, repr((rc, took, out)))
+        check(pre + 'says why, once', ('missing or is not this database' in out or 'start it with --log-dir' in out)
+              and out.count('lexdb: open') == 1 and 'ended too often' not in out and 'not restarted' in out, out)
     shutil.rmtree(work, ignore_errors=True)
     print('FAILED: ' + ', '.join(fails) if fails else 'all passed')
     sys.exit(1 if fails else 0)

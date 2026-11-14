@@ -312,7 +312,10 @@ Notes that go with the decision:
   database: 16 TiB on ext4 with 4 KiB blocks, far more on XFS. Say so in
   the docs.
 - A full filesystem (ENOSPC) on a data or log write must fail cleanly and
-  recover once space is added. Check that a test covers it.
+  recover once space is added. **Covered (2026-11-14, lexdb.md 9.126)** by `store_enospc.lxl`: the failing commit or
+  checkpoint returns errno 28 to its caller, acknowledged commits stay, and the store is then failed (like EIO): later
+  writes and reads return the error even after space is added, so it needs a restart, which recovers every acknowledged
+  commit and none that failed (also with the disk still full, for reading).
 
 **Built (2026-11-14, lexdb.md 9.124): the log in a directory of its own, `--log-dir DIR`.** The text that was the
 plan is kept below, with what was done to each point.
@@ -331,12 +334,9 @@ the log. What it touched:
   else, so the wrong log is never replayed: a `logdir` file in the data directory and a `logid` file in the log
   directory carry one random id, compared at start (`checkLog`, 9.124);
 - `--replica` and the supervisor passing the option to each worker (a module variable set before the forks);
-- the crash tests: `store_logdir.lxl` runs two simulated file systems, each crashed its own way. Not done: an ENOSPC
-  test (below).
+- the crash tests: `store_logdir.lxl` runs two simulated file systems, each crashed its own way.
 
-Not done: a test of ENOSPC on a data or log write. There is none: no test in `tests/lexdb` mentions ENOSPC or
-errno 28; the simulated `Fs` can fail one call with EIO (`failIn`, used by `disk_sim.lxl`), which exercises the same
-error path, but not a full disk and its recovery once space is added.
+ENOSPC: now tested, see the note above (9.126).
 
 A temporary or spill directory is not needed yet: lexdb spills nothing
 (2.4). Add one with the first spill.

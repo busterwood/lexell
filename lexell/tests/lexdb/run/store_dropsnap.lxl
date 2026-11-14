@@ -1,0 +1,104 @@
+// lexdb_store: a snapshot that loads part of a dropped tree after the drop
+// (design/lexdb.md 9.32, 9.127). The drop defers the slots of a tree a
+// snapshot may still reach; one not in memory at the drop is loaded by the
+// snapshot later, and its children get slots of their own, which nothing
+// reached once the snapshot ended: their pages were never freed. After the
+// snapshot ends and the checkpoints have walked what is left, audit finds
+// every page in a tree or the free list: none lost (before: hundreds).
+// - DROP TABLE and TRUNCATE (a drop and a new tree under the same name,
+//   here a drop and a refill of the same rows in a new tree).
+// - The snapshot reads a few rows (one path), then scans a part.
+// expect: drop, one path: pages 747: trees 1 1, dropped 0, free 744 in 2 runs, lists 2, lost 0, twice 0; internal 0
+// expect: drop, scan: pages 747: trees 1 1, dropped 0, free 744 in 2 runs, lists 2, lost 0, twice 0; internal 0
+// expect: truncate: lost 0, twice 0
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_base"
+import "strings"
+
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: 3 * 2048, segBytes: 16 * 4096, ckptBytes: 1024 * 1024, snapNodes: 1000}
+}
+
+fn key(i: int): str { return "k" + strings.padLeft(i.toStr(), 5, '0') + strings.repeat("x", 94) }
+
+fn value(i: int): str {
+    let tag = "v" + i.toStr() + ":"
+    if i % 40 == 0 { return tag + strings.repeat("abcdefghij", 2000) }
+    return tag + strings.repeat("r", 300)
+}
+
+fn fill(st: &lexdb_store.Store, tree: int) {
+    var i = 0
+    while i < 3000 {
+        var t = lexdb_store.begin()
+        for j in i..i + 100 { t.put(tree, key(j), value(j)).unwrap() }
+        st.commit(t).unwrap()
+        i += 100
+    }
+}
+
+fn audit(fs: lexdb_disk.Fs): str {
+    return match lexdb_store.audit(fs) { Ok(s) { s } Err(e) { "audit: " + e.toStr() } }
+}
+
+// Builds a tree a and a big tree b; then with b dropped (and, if refill, its
+// rows written to a new tree) while a snapshot began before it reads.
+fn scenario(scan: bool, refill: bool): str {
+    let fs = lexdb_disk.sim(7)
+    var a = -1
+    var b = -1
+    lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int {
+        var t = lexdb_store.begin()
+        a = st.createTree(mut &t)
+        b = st.createTree(mut &t)
+        t.put(a, "a", "small").unwrap()
+        st.commit(t).unwrap()
+        fill(&st, b)
+        return 0
+    }).unwrap()
+    lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int {
+        st.setDropReads(2)
+        var snap = st.beginSnapshot().unwrap()
+        var t = lexdb_store.begin()
+        t.dropTree(b)
+        st.commit(t).unwrap()
+        if refill {
+            var u = lexdb_store.begin()
+            let c = st.createTree(mut &u)
+            st.commit(u).unwrap()
+            fill(&st, c)
+        }
+        st.checkpointAll().unwrap()
+        // the snapshot reads the dropped tree: its nodes load now
+        for i in 0..5 { st.get(mut &snap, b, key(1000 + i * 7)).unwrap() }
+        if scan {
+            var n = 0
+            st.scan(mut &snap, b, key(500), key(900), fn(e: &lexdb_store.Entry): bool {
+                n += 1
+                return true
+            }).unwrap()
+        }
+        st.checkpointAll().unwrap()
+        st.releaseSnapshot(mut &snap)
+        var rounds = 0
+        while rounds < 1000 {
+            var t2 = lexdb_store.begin()
+            t2.put(a, "a", "small" + rounds.toStr()).unwrap()
+            st.commit(t2).unwrap()
+            st.checkpoint().unwrap()
+            rounds += 1
+            if st.stats().dropped == 0 && rounds > 20 { break }
+        }
+        st.checkpointAll().unwrap()
+        return 0
+    }).unwrap()
+    return audit(fs)
+}
+
+fn main() {
+    println("drop, one path: " + scenario(false, false))
+    println("drop, scan: " + scenario(true, false))
+    let r = scenario(true, true)
+    println("truncate: " + (if strings.contains(&r, &"lost 0, twice 0") { "lost 0, twice 0" } else { r }))
+}

@@ -1,0 +1,75 @@
+// lexdb_store: a log frame's length is 32 bits, so a commit whose records
+// would not fit one fails cleanly (54000) before anything is written, and
+// nothing of it applies (design/lexdb.md 9.127). The limit is lowered here
+// (setFrameMax) to a few KB instead of 4 GiB.
+// - A commit of 6 KB of records against a 4 KB limit: 54000, its rows not
+//   there, not in the log after a crash and reopen.
+// - Commits just within the limit, and ones after the refusal, go on.
+// expect: refused: 54000 transaction too large: its log records take 6085 bytes, at most 4000
+// expect: after: big no, small 20, 30 rows
+// expect: reopened 30
+// expect: limit constant: 4294963200
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_base"
+import "strings"
+
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: 1000 * 2048, segBytes: 64 * 4096, ckptBytes: 1024 * 1024, snapNodes: 1000}
+}
+
+fn rows(st: &lexdb_store.Store, tree: int): int {
+    var t = lexdb_store.begin()
+    var n = 0
+    st.scan(mut &t, tree, "", "", fn(e: &lexdb_store.Entry): bool {
+        n += 1
+        return true
+    }).unwrap()
+    return n
+}
+
+fn main() {
+    let fs = lexdb_disk.sim(3)
+    var tree = -1
+    lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int {
+        var t = lexdb_store.begin()
+        tree = st.createTree(mut &t)
+        st.commit(t).unwrap()
+        st.setFrameMax(4000)
+        var big = lexdb_store.begin()
+        for i in 0..5 { big.put(tree, "big" + i.toStr(), strings.repeat("x", 1200)).unwrap() }
+        match st.commit(big) {
+            Ok(_) { println("refused: no") }
+            Err(e) { println("refused: " + e.state + " " + e.msg) }
+        }
+        var gotBig = false
+        var s = lexdb_store.begin()
+        match st.get(mut &s, tree, "big0").unwrap() {
+            Some(_) { gotBig = true }
+            None {}
+        }
+        // commits within the limit (3 KB each) and one more after
+        for i in 0..20 {
+            var w = lexdb_store.begin()
+            w.put(tree, "small" + strings.padLeft(i.toStr(), 3, '0'), strings.repeat("y", 2500)).unwrap()
+            st.commit(w).unwrap()
+        }
+        var w2 = lexdb_store.begin()
+        for i in 0..10 { w2.put(tree, "more" + i.toStr(), "z").unwrap() }
+        st.commit(w2).unwrap()
+        var small = 0
+        var t3 = lexdb_store.begin()
+        st.scan(mut &t3, tree, "small", "smalm", fn(e: &lexdb_store.Entry): bool {
+            small += 1
+            return true
+        }).unwrap()
+        println("after: big " + (if gotBig { "yes" } else { "no" }) + ", small " + small.toStr() + ", " + rows(&st, tree).toStr() + " rows")
+        return 0
+    }).unwrap()
+    let crashed = fs.crash(1)
+    lexdb_store.run(crashed, opts(), fn(st: lexdb_store.Store): int {
+        println("reopened " + rows(&st, tree).toStr())
+        return 0
+    }).unwrap()
+    println("limit constant: " + lexdb_store.FRAME_MAX.toStr())
+}
