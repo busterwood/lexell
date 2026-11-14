@@ -8,7 +8,8 @@ The master runs with a 4 MB cache, 1 MB log segments and a checkpoint every
 by many checkpoints. Through psql:
 
 - each round writes on the master (inserts, updates, deletes, large values,
-  a table added now and then); the replica must then give the master's
+  a table added now and then, and range deletes of table r, which has no
+  index: one write that drops subtrees, design/lexdb-bulkdelete.md); the replica must then give the master's
   answers to a set of queries (it follows: it is waited for, up to 10 s);
 - the replica refuses writes (25006) and goes on;
 - the replica is killed (SIGKILL) during a round's writes every third round
@@ -47,6 +48,9 @@ QUERIES = [
     "select count(*) from t where g = 3 and v > 50",
     "select id from t where id between 100 and 140 order by id",
     "select count(*), min(id), max(id) from u",
+    "select count(*), sum(id), min(id), max(id) from r",
+    "select id from r order by id desc limit 5",
+    "select id from r where id between 7000 and 7010 order by id",
 ]
 
 
@@ -118,7 +122,7 @@ def writes(rng, rnd):
     """One round's statements for the master."""
     sql = []
     for _ in range(rng.randrange(3, 8)):
-        k = rng.randrange(6)
+        k = rng.randrange(8)
         a = rng.randrange(1, 3000)
         if k == 0:
             sql.append("insert into t select i, i %% 97, i %% 5, 'r%d-' || i from generate_series(%d, %d) i "
@@ -132,8 +136,14 @@ def writes(rng, rnd):
         elif k == 4:
             k = rnd * 100 + rng.randrange(100)
             sql.append("insert into u select i, 'u%d' from generate_series(%d, %d) i where i not in (select id from u)" % (rnd, k, k))
-        else:
+        elif k == 5:
             sql.append("update t set g = (g + 1) %% 5 where id %% 13 = %d" % rng.randrange(13))
+        elif k == 6:
+            # a range delete of r, whose key is its whole index
+            sql.append("delete from r where id >= %d and id < %d" % (a * 10, a * 10 + rng.randrange(100, 5000)))
+        else:
+            sql.append("insert into r select i, repeat('r', 60) from generate_series(%d, %d) i where i not in (select id from r)"
+                       % (a * 10, a * 10 + rng.randrange(100, 3000)))
     return sql
 
 
@@ -272,6 +282,8 @@ def main():
     psql(mport, "create table t (id int primary key, v int not null, g int not null, s text)")
     psql(mport, "create index t_g on t (g)")
     psql(mport, "create table u (id int primary key, name text)")
+    psql(mport, "create table r (id int primary key, s text)")
+    psql(mport, "insert into r select i, repeat('r', 60) from generate_series(1, 30000) i")
     psql(mport, "insert into t select i, i % 97, i % 5, 'row ' || i from generate_series(1, 20000) i")
     replica.start()
     if not replica.ready():

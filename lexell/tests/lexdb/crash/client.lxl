@@ -13,18 +13,27 @@
 // - a transfer in a block: two balance updates and a log row, then COMMIT;
 // - an insert of a log row with a note of about 180 bytes (the tree splits);
 // - a delete of one of its own acknowledged rows.
+// - an insert of a row into ev (the same columns, no secondary index), and
+//   a range delete of its own rows of ev below a point (id >= its first and
+//   id < the point, which takes lexdb's range path: the subtrees go as one
+//   write, design/lexdb-bulkdelete.md), whose count must be the rows it
+//   had.
 // Worker 0 also adds and drops columns of log, VACUUMs it, and drops and
 // adds its primary key (9.114, 9.117).
 // A worker writes what happened to DIR/ROUND.WORKER: "I id" an insert
 // acknowledged (a transfer's log row too), "D id" a delete acknowledged,
 // "? id" in flight when the connection died (either outcome is allowed),
+// "J id", "X id", "?J id" the same for ev (X: deleted by an acknowledged range
+// delete), "R id,id,..." the rows an unanswered range delete had: all
+// there or all gone (it is one write),
 // "C" a conflict (40001: not applied). Ids are unique over all rounds:
 // round * 10^7 + worker * 10^5 + n.
 //
 // check: sum(bal) is 1,000,000 and there are 1,000 accounts; every
 // acknowledged insert not acknowledged deleted is there, every acknowledged
 // delete is not; no row is there that was never attempted; every row's
-// worker and note are what its id says; for each worker, the index
+// worker and note are what its id says (ev: the same, and every unanswered
+// range delete whole or not at all); for each worker, the index
 // (worker = $1) and the scan count the same rows. It prints "ok ROWS" or
 // the problems, and exits 1 on any.
 import "os"
@@ -81,11 +90,20 @@ fn worker(a: Arg): int {
         return 0
     }
     let ins = pr.unwrap()
+    let pr2 = c.prepare("insert into ev values ($1, $2, $3)")
+    if pr2.isErr() {
+        let e = pr2.unwrapErr()
+        if len(e.state) > 0 { append(mut &out, "# prepare ev: " + e.toStr()) }
+        save(&a, &out)
+        return 0
+    }
+    let ins2 = pr2.unwrap()
+    var mineEv: []int = []
     var going = true
     while going && n < 99000 {
         n += 1
         let id = base + n
-        let op = rnd(mut &seed) % 10
+        let op = rnd(mut &seed) % 13
         // worker 0's schema changes and VACUUMs (design/lexdb.md 9.114):
         // log's leaves of rows of several layouts, converted by
         // checkpoints, and clean ones by VACUUM, while the others write
@@ -109,7 +127,54 @@ fn worker(a: Arg): int {
             }
             if !going { break }
         }
-        if op < 4 {
+        if op >= 10 {
+            if op < 12 || len(mineEv) == 0 {
+                // an insert into ev
+                match c.queryPrepared(&ins2, &[V.Int(id), V.Int(a.worker), V.Text(note(id))]) {
+                    Ok(_) {
+                        append(mut &out, "J " + id.toStr())
+                        append(mut &mineEv, id)
+                    }
+                    Err(e) {
+                        let k = kind(&e)
+                        if k == "?" {
+                            append(mut &out, "?J " + id.toStr())
+                            going = false
+                        } else if k == "C" { append(mut &out, "C") }
+                        else { append(mut &out, "# ev insert " + id.toStr() + ": " + k) }
+                    }
+                }
+            } else {
+                // a range delete of its own rows below a point
+                let first = base + 1
+                let cut = first + rnd(mut &seed) % n
+                var alive: []int = []
+                var rest: []int = []
+                for x in mineEv { if x < cut { append(mut &alive, x) } else { append(mut &rest, x) } }
+                match c.query(&("delete from ev where id >= " + first.toStr() + " and id < " + cut.toStr()), &[]) {
+                    Ok(r) {
+                        if r.affected() != len(alive) {
+                            append(mut &out, "# ev range delete [" + first.toStr() + ", " + cut.toStr() + "): " + r.affected().toStr() + " rows, it had " + len(alive).toStr())
+                        }
+                        for x in alive { append(mut &out, "X " + x.toStr()) }
+                        mineEv = rest
+                    }
+                    Err(e) {
+                        let k = kind(&e)
+                        if k == "?" {
+                            var ids: []str = []
+                            for x in alive {
+                                append(mut &out, "?J " + x.toStr())
+                                append(mut &ids, x.toStr())
+                            }
+                            if len(ids) > 0 { append(mut &out, "R " + strings.join(&ids, ",")) }
+                            going = false
+                        } else if k == "C" { append(mut &out, "C") }
+                        else { append(mut &out, "# ev range delete: " + k) }
+                    }
+                }
+            }
+        } else if op < 4 {
             // a transfer in a block
             let x = rnd(mut &seed) % ACCTS
             var y = rnd(mut &seed) % ACCTS
@@ -200,6 +265,7 @@ fn setup(dsn: str): int {
     c.exec("create table acct (id int primary key, bal int)").unwrap()
     c.exec("create table log (id bigint primary key, worker int, note text)").unwrap()
     c.exec("create index log_worker on log (worker)").unwrap()
+    c.exec("create table ev (id bigint primary key, worker int, note text)").unwrap()
     var vals: []str = []
     for i in 0..ACCTS { append(mut &vals, "(" + i.toStr() + ", 1000)") }
     c.exec(&("insert into acct values " + strings.join(&vals, ", "))).unwrap()
@@ -223,6 +289,9 @@ fn check(dsn: str, dir: str): int {
     // what the records say: per id, its last acknowledged state
     var acked: Map[int, bool] = newMap()        // true: inserted, false: deleted
     var maybe: Map[int, bool] = newMap()        // in flight
+    var evAcked: Map[int, bool] = newMap()      // ev: true inserted, false range-deleted
+    var evMaybe: Map[int, bool] = newMap()
+    var groups: [][]int = []                    // ev: the rows of each unanswered range delete
     var problems: []str = []
     var conflicts = 0
     for name in fs.listNames(&dir).unwrap() {
@@ -233,7 +302,16 @@ fn check(dsn: str, dir: str): int {
             if line == "C" { conflicts += 1; continue }
             if strings.startsWith(line, "#") { append(mut &problems, name + ": " + line); continue }
             let parts = strings.split(&line, " ")
+            if parts[0] == "R" {
+                var g: []int = []
+                for x in strings.split(parts[1], ",") { append(mut &g, strings.parseIntOpt(x).unwrap()) }
+                append(mut &groups, g)
+                continue
+            }
             let id = strings.parseIntOpt(parts[1]).unwrap()
+            if parts[0] == "J" { evAcked.put(id, true); continue }
+            if parts[0] == "X" { evAcked.put(id, false); continue }
+            if parts[0] == "?J" { evMaybe.put(id, true); continue }
             if parts[0] == "I" { acked.put(id, true) }
             else if parts[0] == "D" { acked.put(id, false) }
             else { maybe.put(id, true) }
@@ -269,6 +347,29 @@ fn check(dsn: str, dir: str): int {
         if want && !has && !maybe.has(&id) { append(mut &problems, "acknowledged insert " + id.toStr() + " is missing") }
         if !want && has && !maybe.has(&id) { append(mut &problems, "acknowledged delete " + id.toStr() + " is still there") }
     }
+    // ev: as log, and each unanswered range delete whole or not at all
+    let evRows = c.query("select id, worker, note from ev", &[]).unwrap()
+    var evPresent: Map[int, bool] = newMap()
+    for i in 0..evRows.rowCount() {
+        let id = evRows.int(i, 0).unwrap()
+        evPresent.put(id, true)
+        if evRows.int(i, 1).unwrap() != (id % 10000000) / 100000 || evRows.text(i, 2).unwrap() != note(id) {
+            append(mut &problems, "ev row " + id.toStr() + ": worker or note is not what was written")
+        }
+        let known = match evAcked.get(&id) { Some(_) { true } None { evMaybe.has(&id) } }
+        if !known { append(mut &problems, "ev row " + id.toStr() + " was never acknowledged nor in flight") }
+    }
+    for id in evAcked.keys() {
+        let want = evAcked.at(id)
+        let has = evPresent.has(&id)
+        if want && !has && !evMaybe.has(&id) { append(mut &problems, "acknowledged ev insert " + id.toStr() + " is missing") }
+        if !want && has && !evMaybe.has(&id) { append(mut &problems, "ev row " + id.toStr() + " is still there after an acknowledged range delete") }
+    }
+    for g in groups {
+        var there = 0
+        for x in g { if evPresent.has(&x) { there += 1 } }
+        if there != 0 && there != len(g) { append(mut &problems, "an unanswered range delete of " + len(g).toStr() + " rows left " + there.toStr() + " of them") }
+    }
     for w in 0..WORKERS {
         let r = c.query("select count(*) from log where worker = $1", &[V.Int(w)]).unwrap()
         let n = r.int(0, 0).unwrap()
@@ -283,7 +384,9 @@ fn check(dsn: str, dir: str): int {
         println(len(problems).toStr() + " problems")
         return 1
     }
-    println("ok " + rows.rowCount().toStr() + " rows, " + len(acked.keys()).toStr() + " acknowledged, " + len(maybe.keys()).toStr() +
+    var evGone = 0
+    for id in evAcked.keys() { if !evAcked.at(id) { evGone += 1 } }
+    println("ok " + rows.rowCount().toStr() + " rows, " + evRows.rowCount().toStr() + " in ev (" + evGone.toStr() + " range-deleted), " + len(acked.keys()).toStr() + " acknowledged, " + len(maybe.keys()).toStr() +
             " in flight, " + conflicts.toStr() + " conflicts")
     return 0
 }

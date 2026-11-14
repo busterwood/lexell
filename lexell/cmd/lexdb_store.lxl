@@ -42,6 +42,9 @@ pub const OP_DEL = 2
 pub const OP_CREATE = 3
 pub const OP_DROP = 4
 const OP_PUT_HEAD = 5       // in the log only: a put with its head (TxWrite.head)
+// Every key of [key, val) of a tree removed (val "": to its end); the
+// subtrees wholly inside are freed as a dropped tree's are (design/lexdb-bulkdelete.md).
+pub const OP_DELRANGE = 6
 
 pub fn segName(g: int): str { return "log." + g.toStr() }
 
@@ -138,6 +141,10 @@ pub type Db = record {
     pendingFree: []int          // runs the checkpoint in flight frees when durable
     dropped: []int              // subtrees no tree reaches, their pages to free: (page, height or -1) pairs (9.32)
     frameMax: int               // FRAME_MAX (tests set fewer)
+    countHook: []fn(Store, int, str, int)       // a test's, called in countRange between its finding and its reading
+    countMode: int
+    countArg: str
+    countCalls: int
     dropReads: int              // the most of their pages a checkpoint reads (DROP_READS; tests set fewer)
     memo: Map[str, str]         // what the SQL layer keeps while the store is open, outside transactions (its sequences' blocks: 9.43)
     listPages: []int            // the list pages of the last durable checkpoint
@@ -239,8 +246,9 @@ type Mark = value record { tree: int; lo: str; hi: str; seq: int }
 // tree (every key).
 // A key range [key, hi] (hi "": the key alone): a commit of many writes to
 // a tree logs their range, not each (a large COPY's commit would otherwise
-// add an entry per row).
-type WEntry = value record { seq: int; tree: int; key: str; hi: str; all: bool }
+// add an entry per row). open: a range delete's [key, hi), hi "" being no
+// end (not the key alone).
+type WEntry = value record { seq: int; tree: int; key: str; hi: str; all: bool; open: bool }
 
 // Past this many writes to one tree, a commit logs their range.
 const WLOG_RANGE = 1024
@@ -436,9 +444,24 @@ pub fn (t: mut &Txn) undoTo(n: int) {
     t.sortedKeys = []
     t.sortedN = []
     for i in 0..len(t.writes) {
+        // a range's key is its start, not a key written
+        if t.writes[i].op == OP_DELRANGE { continue }
         let k = t.writes[i].key
         t.noteWrite(t.writes[i].tree, &k, i)
     }
+}
+
+// Removes every key of [lo, hi) of tree (hi "": to the end) when the
+// transaction commits. The transaction's own earlier puts in the range
+// become deletes first, so that its own reads stay right for them without
+// a rule of their own; the range itself is not a key written (not in idx).
+pub fn (t: mut &Txn) delRange(tree: int, lo: &str, hi: &str) {
+    var mine: []str = []
+    for w in t.ownRange(tree, lo, hi) {
+        if w.op == OP_PUT { append(mut &mine, w.key) }
+    }
+    for k in mine { t.del(tree, &k) }
+    append(mut &t.writes, TxWrite{op: OP_DELRANGE, tree: tree, key: lo, val: hi, head: 0})
 }
 
 pub fn (t: mut &Txn) dropTree(tree: int) {
@@ -1578,17 +1601,235 @@ fn (db: mut &Db) applyDrop(tree: int) {
         height += 1
     }
     if !db.meta[x].loaded { height = -1 }
-    var stack = [r, 0]
+    db.dropSubtree(r, height)
+}
+
+// Drops slot s's subtree, h high (-1: not known): its nodes in memory are
+// freed, those that are not go to the dropped subtrees (applyDrop's way).
+fn (db: mut &Db) dropSubtree(s: int, h: int) {
+    var stack = [s, 0]
     while len(stack) > 0 {
         let depth = pop(mut &stack)
-        let s = pop(mut &stack)
-        if db.meta[s].loaded && !db.pool[db.meta[s].frame].leaf {
-            for k in db.pool[db.meta[s].frame].kids {
+        let x = pop(mut &stack)
+        if db.meta[x].loaded && !db.pool[db.meta[x].frame].leaf {
+            for k in db.pool[db.meta[x].frame].kids {
                 append(mut &stack, k)
                 append(mut &stack, depth + 1)
             }
         }
-        db.freeSubtree(s, if height >= 0 { height - depth } else { -1 }, true)
+        db.freeSubtree(x, if h >= 0 { h - depth } else { -1 }, true)
+    }
+}
+
+// The slot to load first for the paths to lo and hi of a range delete of
+// tree, or -1: hi "" is the tree's last leaf. A range with no keys needs
+// nothing.
+fn (db: mut &Db) edgeNeeds(tree: int, lo: &str, hi: &str): int {
+    if len(hi) > 0 && lo >= hi { return -1 }
+    let a = db.descend(tree, lo)
+    if a.need >= 0 { return a.need }
+    let b = if len(hi) == 0 { db.descendBack(tree, &"") } else { db.descend(tree, hi) }
+    return b.need
+}
+
+// Whether leaf s has an entry with a key in [lo, hi) (hi "": to its end).
+fn (db: &Db) leafHas(s: int, lo: &str, hi: &str): bool {
+    let f = db.meta[s].frame
+    let j = if len(hi) == 0 { db.pool[f].count() } else { db.pool[f].lower(hi) }
+    return db.pool[f].lower(lo) < j
+}
+
+// The index of child c among inner node s's.
+fn (db: &Db) kidAt(s: int, c: int): int {
+    var i = 0
+    while db.pool[db.meta[s].frame].kids[i] != c { i += 1 }
+    return i
+}
+
+// Removes the entries of leaf s with keys in [lo, hi) (hi "": to its end).
+fn (db: mut &Db) cutLeafRange(s: int, lo: &str, hi: &str) {
+    let f = db.meta[s].frame
+    let i = db.pool[f].lower(lo)
+    let j = if len(hi) == 0 { db.pool[f].count() } else { db.pool[f].lower(hi) }
+    if i >= j { return }
+    db.willChange(s)
+    db.pool[f].loosen()
+    var keys: []str = withCapacity(len(db.pool[f].keys) - (j - i))
+    var vals: []str = withCapacity(len(db.pool[f].keys) - (j - i))
+    for x in 0..len(db.pool[f].keys) {
+        if x < i || x >= j {
+            append(mut &keys, replace(mut &db.pool[f].keys[x], ""))
+            append(mut &vals, replace(mut &db.pool[f].vals[x], ""))
+        }
+    }
+    db.pool[f].keys = keys
+    db.pool[f].vals = vals
+    db.pool[f].size = nodeSize(&db.pool[f])
+    db.pool[f].packed = false
+    db.meta[s].version += 1
+    db.recost(s)
+}
+
+// Takes children [kf, kt) and separators [sf, st) out of inner node s,
+// and frees the children's subtrees, h high each. Its remaining children
+// then hold the removed ones' ranges.
+fn (db: mut &Db) cutKids(s: int, kf: int, kt: int, sf: int, st: int, h: int) {
+    if kt <= kf { return }
+    db.willChange(s)
+    let f = db.meta[s].frame
+    var gone: []int = []
+    var kids: []int = []
+    for i in 0..len(db.pool[f].kids) {
+        if i >= kf && i < kt { append(mut &gone, db.pool[f].kids[i]) } else { append(mut &kids, db.pool[f].kids[i]) }
+    }
+    var keys: []str = []
+    for i in 0..len(db.pool[f].keys) {
+        if i < sf || i >= st { append(mut &keys, replace(mut &db.pool[f].keys[i], "")) }
+    }
+    db.pool[f].kids = kids
+    db.pool[f].keys = keys
+    db.pool[f].size = nodeSize(&db.pool[f])
+    db.pool[f].packed = false
+    db.meta[s].version += 1
+    db.recost(s)
+    for c in gone { db.dropSubtree(c, h) }
+}
+
+// Removes every key of [lo, hi) of tree (hi "": to its end); writeNeeds
+// loaded the paths to lo and hi, and nothing else is read. L and H are
+// those paths, A their last common node. The children of A between them,
+// and the children of the nodes of L below A to the right of L, and of the
+// nodes of H below A to the left of H, lie wholly in the range: they are
+// dropped, with their separators, and the two edge leaves lose their keys
+// in the range. The range of a dropped child goes to the neighbour on L
+// or H, so that a later write of the commit never descends into a node
+// that is not in memory (applyDel's edgeLoaded). Edge leaves left empty
+// stay, as applyDel leaves them.
+fn (db: mut &Db) applyDelRange(tree: int, lo: &str, hi: &str) {
+    if len(hi) > 0 && lo >= hi { return }
+    let l = db.descend(tree, lo)
+    if l.need < 0 && len(l.path) == 0 { return }       // no such tree (recovery replays a dropped tree's rows)
+    let h = if len(hi) == 0 { db.descendBack(tree, &"") } else { db.descend(tree, hi) }
+    if l.need >= 0 || h.need >= 0 || len(l.path) != len(h.path) { panic("lexdb: range delete of tree " + tree.toStr() + " without its edge paths") }
+    let n = len(l.path)
+    // the edge leaves' entries in range, and the inner nodes' children to go
+    var a = 0
+    while a + 1 < n && l.path[a + 1] == h.path[a + 1] { a += 1 }
+    if a == n - 1 {
+        // one leaf holds both ends
+        let leaf = l.path[a]
+        if !db.leafHas(leaf, lo, hi) { return }
+        for s in l.path { db.markDirty(s) }
+        db.cutLeafRange(leaf, lo, hi)
+        return
+    }
+    // the children to go: at A, those between L's and H's; below A, L's to
+    // the right of its path and H's to the left of its path
+    let iL = db.kidAt(l.path[a], l.path[a + 1])
+    let iH = db.kidAt(l.path[a], h.path[a + 1])
+    var any = iH - iL > 1 || db.leafHas(l.path[n - 1], lo, hi) || db.leafHas(h.path[n - 1], lo, hi)
+    for x in a + 1..n - 1 {
+        if db.kidAt(l.path[x], l.path[x + 1]) + 1 < len(db.pool[db.meta[l.path[x]].frame].kids) { any = true }
+        if db.kidAt(h.path[x], h.path[x + 1]) > 0 { any = true }
+    }
+    if !any { return }
+    for s in l.path { db.markDirty(s) }
+    for s in h.path { db.markDirty(s) }
+    db.shape += 1
+    // A keeps the separator after L's child, so that the range of the
+    // children between goes to H's side
+    db.cutKids(l.path[a], iL + 1, iH, iL + 1, iH, n - 2 - a)
+    for x in a + 1..n - 1 {
+        let s = l.path[x]
+        let c = db.kidAt(s, l.path[x + 1])
+        let nk = len(db.pool[db.meta[s].frame].kids)
+        db.cutKids(s, c + 1, nk, c, nk - 1, n - 2 - x)
+        let t = h.path[x]
+        let d = db.kidAt(t, h.path[x + 1])
+        db.cutKids(t, 0, d, 0, d, n - 2 - x)
+    }
+    db.cutLeafRange(l.path[n - 1], lo, hi)
+    db.cutLeafRange(h.path[n - 1], lo, hi)
+}
+
+// The chunk keys in the companion tree for main keys of length l are
+// u16(l) then the key then the chunk's number (chunkKey): in the order of
+// the keys among those of one length. The first chunk key of the keys >= lo
+// of length l; when lo is longer than l, a key of l bytes is >= lo only if
+// it is past lo's first l bytes, so the chunks of that prefix are skipped.
+fn chunkLo(l: int, lo: &str): str {
+    var b = newStrBuf()
+    binary.addU16BE(mut &b, l)
+    if len(lo) <= l {
+        b.add(lo)
+        return b.toStr()
+    }
+    return chunkKey(&lo[0..l], LAST_CHUNK)
+}
+
+// The first chunk key past the keys < hi of length l (hi "": past all of
+// length l); when hi is longer than l, the keys of l bytes below it are
+// those up to its first l bytes, themselves included.
+fn chunkHi(l: int, hi: &str): str {
+    if len(hi) == 0 {
+        var b = newStrBuf()
+        binary.addU16BE(mut &b, l + 1)
+        return b.toStr()
+    }
+    if len(hi) <= l {
+        var b = newStrBuf()
+        binary.addU16BE(mut &b, l)
+        b.add(hi)
+        return b.toStr()
+    }
+    return chunkKey(&hi[0..l], LAST_CHUNK)
+}
+
+// The key lengths that have chunks in companion tree ovf, ascending, found
+// by skipping from one length to the next, or the slot to load first.
+fn (db: mut &Db) chunkLens(ovf: int, lens: mut &[]int): int {
+    var cursor = ""
+    while true {
+        let d = db.descend(ovf, &cursor)
+        if d.need >= 0 { return d.need }
+        if len(d.path) == 0 { return -1 }
+        let leaf = d.path[len(d.path) - 1]
+        let i = db.pool[db.meta[leaf].frame].lower(&cursor)
+        if i < db.pool[db.meta[leaf].frame].count() {
+            let k = db.pool[db.meta[leaf].frame].key(i)
+            let l = (int(k[0]) << 8) | int(k[1])
+            append(lens, l)
+            var b = newStrBuf()
+            binary.addU16BE(mut &b, l + 1)
+            cursor = b.toStr()
+        } else if d.hasUpper {
+            cursor = lexdb_base.own(&d.upper)
+        } else {
+            return -1
+        }
+    }
+    return -1
+}
+
+// A range delete of tree: its keys in [lo, hi), and the chunks of the large
+// values among them, which the companion tree holds per key length. Only
+// the lengths there are loaded (writeNeeds); one that an earlier write of
+// the commit made has no chunks in the range (the range's own puts were
+// made deletes: Txn.delRange), and its edge paths may not be in memory.
+fn (db: mut &Db) applyRange(tree: int, lo: &str, hi: &str) {
+    db.applyDelRange(tree, lo, hi)
+    let ovf = tree + OVF
+    if !db.trees.has(&ovf) { return }
+    var lens: []int = []
+    // writeNeeds loaded every node chunkLens passes, and nothing since
+    // evicted them: a slot missing here would leave chunks behind silently
+    if db.chunkLens(ovf, mut &lens) >= 0 { panic("lexdb: range delete's companion not in memory at apply") }
+    for l in lens {
+        let cl = chunkLo(l, lo)
+        let ch = chunkHi(l, hi)
+        if cl >= ch { continue }
+        if db.edgeNeeds(ovf, &cl, &ch) >= 0 { continue }
+        db.applyDelRange(ovf, &cl, &ch)
     }
 }
 
@@ -1605,6 +1846,7 @@ fn (db: mut &Db) applyWrite(w: &TxWrite) {
         db.applyDrop(w.tree)
         db.applyDrop(w.tree + OVF)
     }
+    else if w.op == OP_DELRANGE { db.applyRange(w.tree, &w.key, &w.val) }
 }
 
 // The slot a write needs loaded before it can be applied, or -1: the leaf
@@ -1617,6 +1859,27 @@ fn (db: mut &Db) writeNeeds(w: &TxWrite): int {
         for t in [w.tree, w.tree + OVF] {
             let d = db.descend(t, &"")
             if d.need >= 0 { return d.need }
+        }
+        return -1
+    }
+    // A range delete: the paths to its two ends, in the tree and in the
+    // companion (per key length); nothing inside the range.
+    if w.op == OP_DELRANGE {
+        let n = db.edgeNeeds(w.tree, &w.key, &w.val)
+        if n >= 0 { return n }
+        let ovf = w.tree + OVF
+        if db.trees.has(&ovf) {
+            var lens: []int = []
+            let c = db.chunkLens(ovf, mut &lens)
+            if c >= 0 { return c }
+            for l in lens {
+                let cl = chunkLo(l, &w.key)
+                let ch = chunkHi(l, &w.val)
+                if cl < ch {
+                    let e = db.edgeNeeds(ovf, &cl, &ch)
+                    if e >= 0 { return e }
+                }
+            }
         }
         return -1
     }
@@ -1842,6 +2105,9 @@ fn parseRecords(b: &[]byte, from: int, to: int): Result[[]TxWrite, lexdb_base.Db
     while at < to {
         if at + 13 > to { return Err(lexdb_base.corrupt("log record cut short")) }
         let op = int(b[at])
+        // An op this binary does not know would be skipped by the apply, and
+        // its effect lost (a range delete's rows come back): stop here.
+        if op < OP_PUT || op > OP_DELRANGE { return Err(lexdb_base.corrupt(&("log record with unknown op " + op.toStr()))) }
         let tree = binary.readU32LE(b, at + 1)
         let kl = binary.readU32LE(b, at + 5)
         if at + 9 + kl + 4 > to { return Err(lexdb_base.corrupt("log record cut short")) }
@@ -1987,6 +2253,321 @@ fn (st: &Store) getIn(t: mut &Txn, tree: int, key: str, mode: int): Result[Optio
         try st.load(need)
     }
     return Ok(None)
+}
+
+// ---- counting a range (design/lexdb-bulkdelete.md 2.2)
+
+// What a count of [lo, hi) of a tree (hi "": to its end) has so far: the
+// keys counted from nodes in memory, and the pages still to read. q: the
+// snapshot's commit, -1 the live tree.
+type Cnt = record { q: int; lo: str; hi: str; total: int; items: []CItem; tops: []CTop; err: str }
+
+// A page to read, under the not-loaded slot tops[top], whose subtree it is
+// in: node range [nlo, nhi) (a bound only when has...), whole: the node
+// lies inside the range, so its leaves are counted by their headers.
+type CItem = record { page: int; top: int; nlo: str; hasNlo: bool; nhi: str; hasNhi: bool; whole: bool; depth: int }
+
+// A slot not in memory a count reads under, as it was when it was seen.
+type CTop = value record { slot: int; gen: int; disk: int }
+
+// A count starts again at most this many times, then gives up (-1).
+const COUNT_TRIES = 4
+
+// A page read this far down is not a tree's (corrupt, or a page freed and
+// reused under the read: the slot check finds that).
+const COUNT_DEPTH = 64
+
+// For the tests: f(store, mode, arg, try) is called after a count has found
+// what to read and before it reads (try 0 the first), outside the store's
+// lock. A closure cannot be kept here, so mode and arg carry what it needs.
+pub fn (st: &Store) setCountHook(f: fn(Store, int, str, int), mode: int, arg: &str) {
+    st.sh.with(fn(db: mut &Db) {
+        db.countHook = [f]
+        db.countMode = mode
+        db.countArg = arg.toStr()
+        db.countCalls = 0
+    })
+}
+pub fn (st: &Store) clearCountHook() { st.sh.with(fn(db: mut &Db) { db.countHook = [] }) }
+
+// How many times the hook was called since it was set.
+pub fn (st: &Store) countHookCalls(): int {
+    var n = 0
+    st.sh.with(fn(db: mut &Db) { n = db.countCalls })
+    return n
+}
+
+// How a child of an inner node lies to the range: 0 outside it, 1 partly,
+// 2 inside. Child i holds [keys[i-1], keys[i]), cut by the node's own range.
+type Span = value record { act: int; cl: str; hasCl: bool; ch: str; hasCh: bool }
+
+fn childSpan(lo: &str, hi: &str, keys: &[]str, i: int, nlo: &str, hasNlo: bool, nhi: &str, hasNhi: bool): Span {
+    var sp = Span{act: 0, cl: "", hasCl: false, ch: "", hasCh: false}
+    if i > 0 {
+        sp.cl = keys[i - 1]
+        sp.hasCl = true
+    } else {
+        sp.cl = nlo.toStr()
+        sp.hasCl = hasNlo
+    }
+    if i < len(keys) {
+        sp.ch = keys[i]
+        sp.hasCh = true
+    } else {
+        sp.ch = nhi.toStr()
+        sp.hasCh = hasNhi
+    }
+    if len(hi) > 0 && sp.hasCl && sp.cl >= hi { return sp }
+    if sp.hasCh && sp.ch <= lo { return sp }
+    let lowIn = len(lo) == 0 || (sp.hasCl && sp.cl >= lo)
+    let highIn = len(hi) == 0 || (sp.hasCh && sp.ch <= hi)
+    sp.act = if lowIn && highIn { 2 } else { 1 }
+    return sp
+}
+
+// The keys of a node that is a leaf, in [lo, hi).
+fn leafIn(n: &lexdb_page.Node, lo: &str, hi: &str): int {
+    let i = n.lower(lo)
+    let j = if len(hi) == 0 { n.count() } else { n.lower(hi) }
+    return if j > i { j - i } else { 0 }
+}
+
+// Counts what is in memory under slot s: a node's keys and children from
+// memory (live, or the snapshot's version: verOf); no reference bit is set.
+// A slot not in memory is left as an item to read, with its page,
+// generation and the page it was read from. Nothing is loaded, so the
+// cache is as it was.
+fn (db: &Db) countSlot(c: mut &Cnt, s: int, nlo: &str, hasNlo: bool, nhi: &str, hasNhi: bool, whole: bool) {
+    if len(c.err) > 0 { return }
+    var v = -3
+    if c.q < 0 {
+        if db.meta[s].used { v = if db.meta[s].loaded { -1 } else { -2 } }
+    } else {
+        v = db.verOf(s, c.q)
+    }
+    if v == -3 {
+        c.err = "count: a node version is missing"
+        return
+    }
+    if v == -2 {
+        if db.meta[s].disk < 0 {
+            c.err = "count: a slot without a page"
+            return
+        }
+        append(mut &c.tops, CTop{slot: s, gen: db.meta[s].gen, disk: db.meta[s].disk})
+        append(mut &c.items, CItem{page: db.meta[s].disk, top: len(c.tops) - 1, nlo: nlo.toStr(), hasNlo: hasNlo, nhi: nhi.toStr(), hasNhi: hasNhi, whole: whole, depth: 0})
+        return
+    }
+    let n = db.snapNode(s, v)
+    if n.leaf {
+        c.total += if whole { n.count() } else { leafIn(n, &c.lo, &c.hi) }
+        return
+    }
+    for i in 0..len(n.kids) {
+        if whole {
+            db.countSlot(c, n.kids[i], &"", false, &"", false, true)
+            continue
+        }
+        let sp = childSpan(&c.lo, &c.hi, &n.keys, i, nlo, hasNlo, nhi, hasNhi)
+        if sp.act == 0 { continue }
+        db.countSlot(c, n.kids[i], &sp.cl, sp.hasCl, &sp.ch, sp.hasCh, sp.act == 2)
+    }
+}
+
+// Reads the pages of c.items (under the slots in c.tops) and counts them,
+// the reads on the helper pool, READS_IN_FLIGHT at a time, in runs of
+// pages in a row: nothing is installed, so the cache keeps what it had.
+// A page that is wrong (a read, checksum or shape) is the error: a page
+// freed and reused since the slots were seen reads as another page, which
+// the caller's slot check finds first.
+fn (st: &Store) countPages(f: lexdb_disk.File, c: mut &Cnt): Result[Unit, lexdb_base.DbErr] {
+    while len(c.items) > 0 {
+        var batch: []CItem = []
+        while len(c.items) > 0 && len(batch) < READS_IN_FLIGHT * AHEAD_MAX { append(mut &batch, pop(mut &c.items)) }
+        collections.sortBy(mut &batch, fn(a, b) { return a.page.cmp(&b.page) })
+        var runs: []int = []
+        var i = 0
+        while i < len(batch) {
+            var j = i + 1
+            while j < len(batch) && j - i < AHEAD_MAX && batch[j].page == batch[j - 1].page + 1 { j += 1 }
+            append(mut &runs, i)
+            append(mut &runs, j - i)
+            i = j
+        }
+        var r = 0
+        while r < len(runs) {
+            let rend = min(r + 2 * READS_IN_FLIGHT, len(runs))
+            let at = runs[r]
+            var reads: []PageRead = []
+            var q = r
+            while q < rend {
+                append(mut &reads, PageRead{f: f, page: batch[runs[q]].page, n: runs[q + 1]})
+                q += 2
+            }
+            var got: []Result[[][]byte, lexdb_base.DbErr] = []
+            var res: Result[Unit, lexdb_base.DbErr] = Ok(Unit{})
+            task.scope(fn(sc: mut &task.Scope) {
+                var fs: []task.Future[Result[[][]byte, lexdb_base.DbErr]] = []
+                while len(reads) > 0 { append(mut &fs, sc.start(readOne, pop(mut &reads))) }
+                match task.all(fs) {
+                    Ok(rs) { got = rs }
+                    Err(_) { res = Err(lexdb_base.err(lexdb_base.S_INTERNAL, "count: a page read was cancelled")) }
+                }
+            })
+            try res
+            var pages: [][]byte = []
+            while len(got) > 0 {
+                let g = pop(mut &got)
+                if g.isErr() { return Err(g.unwrapErr()) }
+                var bufs = g.unwrap()
+                for k in 0..len(bufs) { append(mut &pages, replace(mut &bufs[k], [])) }
+            }
+            for j in 0..len(pages) { try c.countPage(&batch[at + j], &pages[j]) }
+            r = rend
+        }
+    }
+    return Ok(Unit{})
+}
+
+// Counts one page read for item it: a leaf's keys, from its header when it
+// lies inside the range (the same u16 at 16 in every leaf type), else its
+// keys in the range; an inner page's children become items.
+fn (c: mut &Cnt) countPage(it: &CItem, b: &[]byte): Result[Unit, lexdb_base.DbErr] {
+    try lexdb_page.check(b, it.page, lexdb_page.T_LEAF)
+    if lexdb_page.isLeafType(int(b[12])) {
+        if it.whole {
+            c.total += binary.readU16LE(b, 16)
+        } else {
+            let leaf = lexdb_page.decodeNode(b)
+            c.total += leafIn(&leaf, &c.lo, &c.hi)
+        }
+        return Ok(Unit{})
+    }
+    if it.depth >= COUNT_DEPTH { return Err(lexdb_base.corrupt(&("page " + it.page.toStr() + ": its subtree is over " + COUNT_DEPTH.toStr() + " deep"))) }
+    let n = binary.readU16LE(b, 16)
+    if it.whole {
+        // the children's pages, read straight from the entries
+        append(mut &c.items, CItem{page: int(binary.readU64LE(b, 18)), top: it.top, nlo: "", hasNlo: false, nhi: "", hasNhi: false, whole: true, depth: it.depth + 1})
+        var at = 26
+        for i in 0..n {
+            let kl = binary.readU16LE(b, at)
+            append(mut &c.items, CItem{page: int(binary.readU64LE(b, at + 2 + kl)), top: it.top, nlo: "", hasNlo: false, nhi: "", hasNhi: false, whole: true, depth: it.depth + 1})
+            at += 2 + kl + 8
+        }
+        return Ok(Unit{})
+    }
+    let node = lexdb_page.decodeNode(b)
+    for i in 0..len(node.kids) {
+        let sp = childSpan(&c.lo, &c.hi, &node.keys, i, &it.nlo, it.hasNlo, &it.nhi, it.hasNhi)
+        if sp.act == 0 { continue }
+        append(mut &c.items, CItem{page: node.kids[i], top: it.top, nlo: sp.cl, hasNlo: sp.hasCl, nhi: sp.ch, hasNhi: sp.hasCh, whole: sp.act == 2, depth: it.depth + 1})
+    }
+    return Ok(Unit{})
+}
+
+// The number of keys in [lo, hi) of tree (hi "": to its end) in the tree
+// the transaction reads (a snapshot's view, or the live tree), not
+// counting its own writes. Exact, from the leaves' headers: a leaf wholly
+// inside the range is not decoded, and a leaf not in memory is read raw on
+// the helper pool and not put in the cache, so the cache holds what it did
+// (2.2). A subtree not in memory is trusted only if its slot is unchanged
+// when the reads are done (same generation and page, still not loaded: a
+// change below it would have loaded and dirtied it), else the count starts
+// again; after COUNT_TRIES tries it gives -1, and the caller counts rows.
+// Writes of other commits to the range are for noteRange to catch.
+pub fn (st: &Store) countRange(t: mut &Txn, tree: int, lo: &str, hi: &str): Result[int, lexdb_base.DbErr] {
+    if len(hi) > 0 && lo >= hi { return Ok(0) }
+    match st.fo {
+        Some(_) {
+            // a replica: its follower's rows, counted by a scan (which skips the cut ranges: the base leaves of a purge are not read; rows outside it are)
+            var n = 0
+            try st.scan(t, tree, lo, hi, fn(e: &Entry): bool {
+                n += 1
+                return true
+            })
+            return Ok(n)
+        }
+        None {}
+    }
+    let snap = t.snap >= 0 && !t.live
+    for attempt in 0..COUNT_TRIES {
+        var c = Cnt{q: if snap { t.snapSeq } else { -1 }, lo: lo.toStr(), hi: hi.toStr(), total: 0, items: [], tops: [], err: ""}
+        var f = lexdb_disk.File.Real(-1, false)
+        var bad: []lexdb_base.DbErr = []
+        st.sh.with(fn(db: mut &Db) {
+            f = db.data
+            if len(db.failed) > 0 {
+                append(mut &bad, db.failed[0])
+                return
+            }
+            var root = -1
+            if snap {
+                if db.snapGone(t.snap) {
+                    append(mut &bad, snapCancelled())
+                    return
+                }
+                root = match t.snapTrees.get(&tree) { Some(r) { r } None { -1 } }
+            } else {
+                root = match db.trees.get(&tree) { Some(r) { r } None { -1 } }
+            }
+            if root >= 0 { db.countSlot(mut &c, root, &"", false, &"", false, false) }
+        })
+        if len(bad) > 0 { return Err(bad[0]) }
+        if len(c.err) > 0 { return Err(lexdb_base.err(lexdb_base.S_INTERNAL, &c.err)) }
+        if len(c.items) == 0 { return Ok(c.total) }
+        var hook: []fn(Store, int, str, int) = []
+        var mode = 0
+        var arg = ""
+        st.sh.with(fn(db: mut &Db) {
+            if len(db.countHook) > 0 {
+                hook = [db.countHook[0]]
+                mode = db.countMode
+                arg = db.countArg
+                db.countCalls += 1
+            }
+        })
+        if len(hook) > 0 { hook[0](st.handle(), mode, arg, attempt) }
+        let read = st.countPages(f, mut &c)
+        var same = true
+        st.sh.with(fn(db: mut &Db) {
+            for tp in c.tops {
+                let m = &db.meta[tp.slot]
+                if !m.used || m.gen != tp.gen || m.loaded || m.disk != tp.disk { same = false }
+            }
+        })
+        if !same { continue }
+        try read
+        return Ok(c.total)
+    }
+    return Ok(-1)
+}
+
+// Notes that the transaction read the keys [lo, hi) of tree (hi "": to the
+// end), as of the commit its reads see (the live tree's now, a snapshot's
+// own): a commit of another transaction that wrote a key of the range
+// since fails this one's commit. A range delete notes its range before
+// countRange, so the rows it counts and the rows it removes are the same
+// (a row inserted into the range in between is a conflict, and the
+// statement runs again).
+pub fn (st: &Store) noteRange(t: mut &Txn, tree: int, lo: &str, hi: &str) {
+    if len(hi) > 0 && lo >= hi { return }
+    if !t.noting() || st.fo.isSome() { return }
+    var seq = 0
+    if t.snap >= 0 && !t.live { seq = t.snapSeq } else { st.sh.with(fn(db: mut &Db) { seq = db.seq }) }
+    t.noteRead(tree, lo, hi, seq)
+}
+
+// The nodes in memory, as text (slot, whether referenced, whether dirty,
+// version): a test's check that a read leaves the cache as it was.
+pub fn (st: &Store) cacheState(): str {
+    var b = newStrBuf()
+    st.sh.with(fn(db: mut &Db) {
+        for s in 0..len(db.meta) {
+            if !db.meta[s].used || !db.meta[s].loaded { continue }
+            b.add(&(s.toStr() + ":" + (if db.meta[s].ref { "r" } else { "-" }) + (if db.meta[s].dirty { "d" } else { "-" }) + db.meta[s].version.toStr() + " "))
+        }
+    })
+    return b.toStr()
 }
 
 // ---- many keys at once (lexdb.md 9.107)
@@ -2781,6 +3362,12 @@ fn (db: &Db) validate(t: &Txn): bool {
             let e = &db.wlog[i]
             if e.tree == m.tree {
                 if e.all { return false }
+                // a range delete: [key, hi), hi "" no end
+                if e.open {
+                    if (len(e.hi) == 0 || e.hi > m.lo) && (len(m.hi) == 0 || e.key < m.hi) { return false }
+                    i += 1
+                    continue
+                }
                 let top = if len(e.hi) > 0 { &e.hi } else { &e.key }
                 if top >= m.lo && (len(m.hi) == 0 || e.key < m.hi) { return false }
             }
@@ -2822,15 +3409,16 @@ fn (db: mut &Db) logWrites(t: &Txn) {
         if w.key > his[k] { his[k] = w.key }
     }
     for k in 0..len(trees) {
-        if counts[k] > WLOG_RANGE { append(mut &db.wlog, WEntry{seq: db.seq, tree: trees[k], key: los[k], hi: his[k], all: false}) }
+        if counts[k] > WLOG_RANGE { append(mut &db.wlog, WEntry{seq: db.seq, tree: trees[k], key: los[k], hi: his[k], all: false, open: false}) }
     }
     for w in t.writes {
         if w.op == OP_PUT || w.op == OP_DEL {
             var k = 0
             while trees[k] != w.tree { k += 1 }
-            if counts[k] <= WLOG_RANGE { append(mut &db.wlog, WEntry{seq: db.seq, tree: w.tree, key: w.key, hi: "", all: false}) }
+            if counts[k] <= WLOG_RANGE { append(mut &db.wlog, WEntry{seq: db.seq, tree: w.tree, key: w.key, hi: "", all: false, open: false}) }
         }
-        else if w.op == OP_DROP { append(mut &db.wlog, WEntry{seq: db.seq, tree: w.tree, key: "", hi: "", all: true}) }
+        else if w.op == OP_DROP { append(mut &db.wlog, WEntry{seq: db.seq, tree: w.tree, key: "", hi: "", all: true, open: false}) }
+        else if w.op == OP_DELRANGE { append(mut &db.wlog, WEntry{seq: db.seq, tree: w.tree, key: w.key, hi: w.val, all: false, open: true}) }
     }
     if len(db.wlog) > WLOG_MAX {
         let half = len(db.wlog) / 2
@@ -2890,8 +3478,9 @@ pub fn (st: &Store) commitAhead(t0: Txn): Result[Unit, lexdb_base.DbErr] {
 
 // The order a commit checks and applies its writes in (9.110): each run of
 // puts and deletes tree by tree, and each tree's writes by key, stably (a
-// key's writes keep their order, so the last still wins); creates and drops
-// stay where they are. Each descent then starts where the one before ended
+// key's writes keep their order, so the last still wins); creates, drops
+// and range deletes stay where they are (the writes before one and after
+// it do not cross it). Each descent then starts where the one before ended
 // (descend's finger), and the writes to one leaf come together. The final
 // state is the same in any order (each key's last write; the trees' shapes
 // may differ). The log keeps the writes as made. A tree's writes already
@@ -3384,6 +3973,29 @@ pub fn (st: &Store) unlockAll(id: int, held: &[]str) {
         db.lockWaits = keep
     })
     while len(wake) > 0 { pop(mut &wake).complete(Unit{}) }
+}
+
+// Whether any row of [lo, hi) of tree (hi "": to the end) is locked by a
+// transaction other than t (a range delete falls back to the row path when
+// one is, which waits for it, 9.86). Keys are "tree:key", so a scan of the
+// locks; none are held most of the time.
+pub fn (st: &Store) locksIn(t: &Txn, tree: int, lo: &str, hi: &str): bool {
+    var any = false
+    let pre = tree.toStr() + ":"
+    st.sh.with(fn(db: mut &Db) {
+        if db.locks.size() == 0 { return }
+        for i in 0..db.locks.size() {
+            let k: str = db.locks.keyAt(i)
+            if !strings.startsWith(&k, &pre) { continue }
+            let key = k[len(pre)..len(k)]
+            if key < lo || (len(hi) > 0 && key >= hi) { continue }
+            var ids: []int = []
+            var modes: []int = []
+            holdersOf(&db.locks.get(&k).unwrapOr(""), mut &ids, mut &modes)
+            for h in ids { if h != t.lockId { any = true } }
+        }
+    })
+    return any
 }
 
 // The rows locked now (for tests and EXPLAIN-like checks): count.
@@ -4624,7 +5236,7 @@ fn checkLog(fs: &lexdb_disk.Fs, logFs: &lexdb_disk.Fs, split: bool, create: bool
 fn newDb(fs: lexdb_disk.Fs, logFs: lexdb_disk.Fs, data: lexdb_disk.File, opts: Options, m: &lexdb_page.Meta): Db {
     return Db{opts: opts, fs: fs, logFs: logFs, data: data, watched: -1, watchedWrites: 0, pool: [], owner: [], meta: [], freeSlots: [], loadedCount: 0, cacheUsed: 0, wlog: [], wlogFloor: 0, hand: 0,
               trees: newMap(), lastLeaf: LastLeaf{tree: -1, shape: -1, path: [], lo: [], hasLo: [], hi: [], hasHi: []}, shape: 0, nextTree: m.nextTree, npages: m.npages, fileEnd: 0, reserving: true, free: [], freeAfterNext: [],
-              pendingFree: [], dropped: [], frameMax: FRAME_MAX, dropReads: DROP_READS, memo: newMap(), listPages: [], ckpt: m.ckpt, durableCkpt: m.ckpt, ckptRunning: false,
+              pendingFree: [], dropped: [], frameMax: FRAME_MAX, dropReads: DROP_READS, countHook: [], countMode: 0, countArg: "", countCalls: 0, memo: newMap(), listPages: [], ckpt: m.ckpt, durableCkpt: m.ckpt, ckptRunning: false,
               batch: [], batchCount: 0, batchNo: m.replayBatch, appliedBatch: m.replayBatch - 1,
               durableBatch: m.replayBatch - 1, waiters: [], locks: newMap(), lockWaits: [], waitFor: newMap(), nextLock: 0, writerWake: [], ckptWake: [], ckptDone: [], seg: m.replaySeg,
               segOff: m.replayOff, logSinceCkpt: 0, failed: [], closing: false, seq: 0, snaps: [], nextSnap: 0,
@@ -5268,14 +5880,25 @@ type Ver = value record { batch: int; val: str; gone: bool }
 // A tree's rows since the base: each key's versions, oldest first, and the
 // keys in sorted runs of their numbers (each key in one run; runs merge as
 // they grow, so a scan merges a few).
+//
+// cuts are the range deletes (OP_DELRANGE) since the base: a base key in
+// [lo, hi) (hi "": to the end) is gone for a snapshot at or after the cut's
+// batch, unless the delta has a version of it. Each delta key in the range
+// gets a gone version at the cut, so a version before it never shows
+// through, and a put after it wins. Large values need nothing more: their
+// chunks (the base's companion tree) are read only through a main-tree base
+// entry, which the cut hides, as an OP_DEL of one does.
+type Cut = value record { lo: str; hi: str; batch: int }
+
 type Delta = record {
     idx: Map[str, int]      // key -> its number: keys and vers index
     keys: []str
     vers: [][]Ver
     runs: [][]int
+    cuts: []Cut             // oldest first
 }
 
-fn newDelta(): Delta { return Delta{idx: newMap(), keys: [], vers: [], runs: []} }
+fn newDelta(): Delta { return Delta{idx: newMap(), keys: [], vers: [], runs: [], cuts: []} }
 
 // A tree created (or dropped) by the batch.
 type Life = value record { batch: int; created: bool }
@@ -5490,6 +6113,14 @@ fn (f: mut &Fol) apply(batch: int, w: &TxWrite) {
         if !f.deltas.has(&w.tree) { f.deltas.put(w.tree, newDelta()) }
         let gone = w.op == OP_DEL
         f.deltas.atMut(w.tree).add(&w.key, Ver{batch: batch, val: if gone { "" } else { w.val }, gone: gone})
+    } else if w.op == OP_DELRANGE {
+        if len(w.val) > 0 && w.key >= w.val { return }      // an empty range (the master's applyDelRange does nothing)
+        if !f.deltas.has(&w.tree) { f.deltas.put(w.tree, newDelta()) }
+        let d = f.deltas.atMut(w.tree)
+        for k in deltaKeysIn(d, &w.key, &w.val) {
+            if !d.vers[k][len(d.vers[k]) - 1].gone { append(mut &d.vers[k], Ver{batch: batch, val: "", gone: true}) }
+        }
+        append(mut &d.cuts, Cut{lo: lexdb_base.own(&w.key), hi: lexdb_base.own(&w.val), batch: batch})
     } else if w.op == OP_CREATE || w.op == OP_DROP {
         if !f.life.has(&w.tree) { f.life.put(w.tree, []) }
         append(f.life.atMut(w.tree), Life{batch: batch, created: w.op == OP_CREATE})
@@ -5633,10 +6264,10 @@ fn (f: mut &Fol) prune(floor: int) {
                 append(mut &run, n)
             }
         }
-        if len(nd.vers) > 0 {
-            append(mut &nd.runs, run)
-            f.deltas.put(t, nd)
-        }
+        // a cut before the floor is in the base
+        for c in d.cuts { if c.batch >= floor { append(mut &nd.cuts, c) } }
+        if len(nd.vers) > 0 { append(mut &nd.runs, run) }
+        if len(nd.vers) > 0 || len(nd.cuts) > 0 { f.deltas.put(t, nd) }
     }
     var lt: []int = []
     for i in 0..f.life.size() {
@@ -5765,10 +6396,74 @@ fn (f: &Fol) live(s: &FSnap, tree: int, bi: int): bool {
 fn (f: &Fol) version(tree: int, key: &str, batch: int, out: mut &[]str): int {
     if !f.deltas.has(&tree) { return 0 }
     let d = f.deltas.at(tree)
-    return match d.idx.get(key) {
+    let k = match d.idx.get(key) {
         Some(i) { versionAt(d, i, batch, out) }
         None { 0 }
     }
+    if k == 0 && cutBy(d, key, batch) { return 2 }
+    return k
+}
+
+// Whether a cut at or before the batch holds key (the base's key is gone).
+fn cutBy(d: &Delta, key: &str, batch: int): bool {
+    for c in d.cuts {
+        if c.batch <= batch && key >= c.lo && (len(c.hi) == 0 || key < c.hi) { return true }
+    }
+    return false
+}
+
+// The numbers of d's keys in [from, to) (to "": to the end), in key order:
+// each run's keys in the range, merged (the runs are sorted, and hold no
+// key twice).
+fn deltaKeysIn(d: &Delta, from: &str, to: &str): []int {
+    var ks: []int = []
+    for run in d.runs {
+        var lo = 0
+        var hi = len(run)
+        while lo < hi {
+            let m = (lo + hi) / 2
+            if d.keys[run[m]] < from { lo = m + 1 } else { hi = m }
+        }
+        var end = lo
+        if len(to) == 0 { end = len(run) } else {
+            var h = len(run)
+            while end < h {
+                let m = (end + h) / 2
+                if d.keys[run[m]] < to { end = m + 1 } else { h = m }
+            }
+        }
+        if end > lo { ks = mergeKeys(&d.keys, &ks, &run[lo..end]) }
+    }
+    return ks
+}
+
+// The parts of [from, to) that no cut at or before the batch covers, in
+// order, as (start, end) pairs ("" end: to the end): the ranges of the base
+// to read.
+type Seg = value record { from: str; to: str }
+
+fn uncut(d: &Delta, batch: int, from: &str, to: &str): []Seg {
+    var cs: []Cut = []
+    for c in d.cuts {
+        if c.batch > batch { continue }
+        var i = len(cs)
+        append(mut &cs, c)
+        while i > 0 && cs[i - 1].lo > cs[i].lo {
+            swap(mut &cs, i - 1, i)
+            i -= 1
+        }
+    }
+    var out: []Seg = []
+    var cur = lexdb_base.own(from)
+    for c in cs {
+        if len(c.hi) > 0 && c.hi <= cur { continue }
+        if len(to) > 0 && c.lo >= to { break }
+        if c.lo > cur { append(mut &out, Seg{from: cur, to: c.lo}) }
+        if len(c.hi) == 0 { return out }
+        cur = c.hi
+    }
+    if len(to) == 0 || cur < to { append(mut &out, Seg{from: cur, to: lexdb_base.own(to)}) }
+    return out
 }
 
 // version, for key number i of d.
@@ -5944,36 +6639,19 @@ pub fn (fo: &Follower) get(s: &FSnap, tree: int, key: &str): Result[Option[str],
 // the snapshot, in order, while f gives true.
 // The delta's keys in [from, to) as of the snapshot, in order, each a
 // value or gone; and the snapshot's base and whether the tree is there.
-type DRange = record { bi: int; live: bool; keys: []str; vals: []str; gone: []bool }
+// segs are the parts of the range the base is read in (no cut covers them).
+type DRange = record { bi: int; live: bool; keys: []str; vals: []str; gone: []bool; segs: []Seg }
 
 fn (fo: &Follower) deltaRange(s: &FSnap, tree: int, from: &str, to: &str): DRange {
-    var r = DRange{bi: -1, live: false, keys: [], vals: [], gone: []}
+    var r = DRange{bi: -1, live: false, keys: [], vals: [], gone: [], segs: [Seg{from: lexdb_base.own(from), to: lexdb_base.own(to)}]}
     fo.sh.with(fn(fl: mut &Fol) {
         r.bi = fl.baseOf(s.ckpt)
         if r.bi < 0 { return }
         r.live = fl.live(s, tree, r.bi)
         if !r.live || !fl.deltas.has(&tree) { return }
         let d = fl.deltas.at(tree)
-        // each run's keys in the range, merged (the runs are sorted, and
-        // hold no key twice)
-        var ks: []int = []
-        for run in d.runs {
-            var lo = 0
-            var hi = len(run)
-            while lo < hi {
-                let m = (lo + hi) / 2
-                if d.keys[run[m]] < from { lo = m + 1 } else { hi = m }
-            }
-            var end = lo
-            if len(to) == 0 { end = len(run) } else {
-                var h = len(run)
-                while end < h {
-                    let m = (end + h) / 2
-                    if d.keys[run[m]] < to { end = m + 1 } else { h = m }
-                }
-            }
-            if end > lo { ks = mergeKeys(&d.keys, &ks, &run[lo..end]) }
-        }
+        r.segs = uncut(d, s.batch, from, to)
+        let ks = deltaKeysIn(d, from, to)
         for k in ks {
             var vs: []str = []
             let kind = versionAt(d, k, s.batch, mut &vs)
@@ -5999,41 +6677,44 @@ pub fn (fo: &Follower) scan(s: &FSnap, tree: int, from: &str, to: &str, f: &fn(&
     var j = 0
     var go = true
     var bad: []lexdb_base.DbErr = []
-    try fo.baseScan(bi, tree, from, to, fn(e: &Entry): bool {
-        // the delta's keys before this one, then this one, its version first
-        while j < len(dkeys) && dkeys[j] < e.key {
-            if !dgone[j] && !f(&Entry{key: dkeys[j], val: dvals[j]}) {
-                go = false
-                return false
+    for sg in dr.segs {
+        if !go { break }
+        try fo.baseScan(bi, tree, &sg.from, &sg.to, fn(e: &Entry): bool {
+            // the delta's keys before this one, then this one, its version first
+            while j < len(dkeys) && dkeys[j] < e.key {
+                if !dgone[j] && !f(&Entry{key: dkeys[j], val: dvals[j]}) {
+                    go = false
+                    return false
+                }
+                j += 1
             }
-            j += 1
-        }
-        if j < len(dkeys) && dkeys[j] == e.key {
-            let gone = dgone[j]
-            let v = dvals[j]
-            j += 1
-            if gone { return true }
-            if !f(&Entry{key: e.key, val: v}) {
-                go = false
-                return false
-            }
-            return true
-        }
-        match fo.unstore(bi, tree, &e.key, &e.val) {
-            Ok(v) {
+            if j < len(dkeys) && dkeys[j] == e.key {
+                let gone = dgone[j]
+                let v = dvals[j]
+                j += 1
+                if gone { return true }
                 if !f(&Entry{key: e.key, val: v}) {
                     go = false
                     return false
                 }
+                return true
             }
-            Err(x) {
-                append(mut &bad, x)
-                go = false
-                return false
+            match fo.unstore(bi, tree, &e.key, &e.val) {
+                Ok(v) {
+                    if !f(&Entry{key: e.key, val: v}) {
+                        go = false
+                        return false
+                    }
+                }
+                Err(x) {
+                    append(mut &bad, x)
+                    go = false
+                    return false
+                }
             }
-        }
-        return true
-    })
+            return true
+        })
+    }
     if len(bad) > 0 { return Err(bad[0]) }
     while go && j < len(dkeys) {
         if !dgone[j] && !f(&Entry{key: dkeys[j], val: dvals[j]}) { return Ok(Unit{}) }
@@ -6042,15 +6723,19 @@ pub fn (fo: &Follower) scan(s: &FSnap, tree: int, from: &str, to: &str, f: &fn(&
     return Ok(Unit{})
 }
 
-pub type FStats = value record { pub applied: int; pub bases: int; pub ckpt: int; pub cached: int; pub cacheBytes: int; pub loads: int; pub evictions: int; pub freed: int; pub deltaKeys: int; pub snaps: int }
+pub type FStats = value record { pub applied: int; pub bases: int; pub ckpt: int; pub cached: int; pub cacheBytes: int; pub loads: int; pub evictions: int; pub freed: int; pub deltaKeys: int; pub cuts: int; pub snaps: int }
 
 pub fn (fo: &Follower) stats(): FStats {
-    var s = FStats{applied: 0, bases: 0, ckpt: -1, cached: 0, cacheBytes: 0, loads: 0, evictions: 0, freed: 0, deltaKeys: 0, snaps: 0}
+    var s = FStats{applied: 0, bases: 0, ckpt: -1, cached: 0, cacheBytes: 0, loads: 0, evictions: 0, freed: 0, deltaKeys: 0, cuts: 0, snaps: 0}
     fo.sh.with(fn(f: mut &Fol) {
         var dk = 0
-        for i in 0..f.deltas.size() { dk += f.deltas.valAt(i).idx.size() }
+        var nc = 0
+        for i in 0..f.deltas.size() {
+            dk += f.deltas.valAt(i).idx.size()
+            nc += len(f.deltas.valAt(i).cuts)
+        }
         s = FStats{applied: f.applied, bases: len(f.bases), ckpt: if len(f.bases) > 0 { f.bases[len(f.bases) - 1].ckpt } else { -1 },
-                   cached: len(f.pool), cacheBytes: f.used, loads: f.loads, evictions: f.evictions, freed: f.freed, deltaKeys: dk, snaps: len(f.snaps)}
+                   cached: len(f.pool), cacheBytes: f.used, loads: f.loads, evictions: f.evictions, freed: f.freed, deltaKeys: dk, cuts: nc, snaps: len(f.snaps)}
     })
     return s
 }
@@ -6139,41 +6824,46 @@ pub fn (fo: &Follower) scanBack(s: &FSnap, tree: int, from: &str, to: &str, f: &
     var j = len(dr.keys) - 1
     var go = true
     var bad: []lexdb_base.DbErr = []
-    try fo.baseScanBack(bi, tree, from, to, fn(e: &Entry): bool {
-        // the delta's keys after this one, then this one, its version first
-        while j >= 0 && dr.keys[j] > e.key {
-            if !dr.gone[j] && !f(&Entry{key: dr.keys[j], val: dr.vals[j]}) {
-                go = false
-                return false
+    var si = len(dr.segs) - 1
+    while si >= 0 && go {
+        let sg = &dr.segs[si]
+        si -= 1
+        try fo.baseScanBack(bi, tree, &sg.from, &sg.to, fn(e: &Entry): bool {
+            // the delta's keys after this one, then this one, its version first
+            while j >= 0 && dr.keys[j] > e.key {
+                if !dr.gone[j] && !f(&Entry{key: dr.keys[j], val: dr.vals[j]}) {
+                    go = false
+                    return false
+                }
+                j -= 1
             }
-            j -= 1
-        }
-        if j >= 0 && dr.keys[j] == e.key {
-            let gone = dr.gone[j]
-            let v = dr.vals[j]
-            j -= 1
-            if gone { return true }
-            if !f(&Entry{key: e.key, val: v}) {
-                go = false
-                return false
-            }
-            return true
-        }
-        match fo.unstore(bi, tree, &e.key, &e.val) {
-            Ok(v) {
+            if j >= 0 && dr.keys[j] == e.key {
+                let gone = dr.gone[j]
+                let v = dr.vals[j]
+                j -= 1
+                if gone { return true }
                 if !f(&Entry{key: e.key, val: v}) {
                     go = false
                     return false
                 }
+                return true
             }
-            Err(x) {
-                append(mut &bad, x)
-                go = false
-                return false
+            match fo.unstore(bi, tree, &e.key, &e.val) {
+                Ok(v) {
+                    if !f(&Entry{key: e.key, val: v}) {
+                        go = false
+                        return false
+                    }
+                }
+                Err(x) {
+                    append(mut &bad, x)
+                    go = false
+                    return false
+                }
             }
-        }
-        return true
-    })
+            return true
+        })
+    }
     if len(bad) > 0 { return Err(bad[0]) }
     while go && j >= 0 {
         if !dr.gone[j] && !f(&Entry{key: dr.keys[j], val: dr.vals[j]}) { return Ok(Unit{}) }

@@ -1,0 +1,574 @@
+// lexdb_exec: a DELETE of a primary key range drops the key range from the
+// tree as one write (design/lexdb-bulkdelete.md 2.1, stage 4). Each shape
+// below is run twice on identical tables, with SET lexdb_range_delete on
+// and off: the command tags, the rows left (a full ordered dump, with
+// checks through the indexes) and the data file's audit after the store
+// closes must agree, and EXPLAIN and the count of range deletes taken
+// (lexdb_exec.rangeDeletes) must show the path chosen: a shape that should
+// take it does, a fallback does not. The tables hold 4,000 to 6,000 rows
+// of about 200 bytes in a 256 KB cache, so most of a covered range is on
+// disk and its subtrees are dropped without being read.
+// - takes the path: one-, two- and three-column keys of int, bigint,
+//   numeric, date, timestamp, timestamptz, uuid and text; =, <, <=, >, >=,
+//   BETWEEN, both bounds, a bound flipped, parameters, now(), a scalar
+//   subquery, NULL, no WHERE; keys at the ends of the type; deletes in a
+//   row with inserts into the dropped range between; large values in the
+//   range; indexes that lead with the range's key columns; a temporary
+//   table; a keyless table.
+// - falls back: an index of another column, an expression index with a
+//   range, a table others reference, RETURNING, USING, a residual
+//   conjunct, OR, IN, a bound that does not survive the column's type
+//   (1500.5 on an int, a numeric scale, a timestamp on a date, a bigint
+//   past an int, a float), a float key, a case-insensitive key, a volatile
+//   function, a point, a column after the first, an equality and a range on
+//   one column, two bounds one way, a transaction block.
+// - the switch (SET, SHOW, RESET, a block's ROLLBACK); a row locked by
+//   another session; a row inserted into the range by another session
+//   between the count and the commit (40001: the statement runs again and
+//   deletes it too).
+// expect: shapes 121: tags equal 121, rows equal 121, audits clean 242
+// expect: path as expected 121: 81 took it, 40 fell back
+// expect: switch: on, off, on after RESET, on after the block's ROLLBACK, 22023 for junk
+// expect: locked: explain without the line true, with it after COMMIT true
+// expect: concurrent insert: DELETE 1801, the count ran again true, left 2200, the inserted row gone true, audit clean true
+// timeout: 600
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_sql"
+import "../../../cmd/lexdb_exec"
+
+type Val = lexdb_sql.Val
+
+type Q = record { sql: str; ps: []Val }
+
+type Shape = record {
+    name: str
+    fam: str
+    pre: []str                  // run before: SET and the like
+    stmts: []Q
+    take: bool                  // the statements take the range path
+    block: bool                 // EXPLAIN is asked inside a block
+}
+
+type Fam = record { setup: []str; dump: []str }
+
+type Out = record { tags: str; dump: str; audit: str; ex: str; taken: int }
+
+fn q(sql: str): Q { return Q{sql: sql, ps: []} }
+
+fn qp(sql: str, ps: []Val): Q { return Q{sql: sql, ps: ps} }
+
+fn sh(name: str, fam: str, stmts: []Q, take: bool): Shape {
+    return Shape{name: name, fam: fam, pre: [], stmts: stmts, take: take, block: false}
+}
+
+fn gs(n: int): str { return "generate_series(1, " + n.toStr() + ") i" }
+
+const PAD: str = "repeat('x', 150)"
+
+fn famOf(name: str): Fam {
+    let ck = ["select count(*) from t"]
+    if name == "int" {
+        return Fam{setup: ["create table t (id int primary key, v int not null, pad text not null)",
+                           "insert into t select i, i % 7, " + PAD + " from " + gs(6000),
+                           "create table u (id int primary key)", "insert into u select i from " + gs(200)],
+                   dump: ["select id, v, pad from t order by id", "select count(*), min(id), max(id) from t"]}
+    }
+    if name == "bigint" {
+        return Fam{setup: ["create table t (id bigint primary key, pad text not null)",
+                           "insert into t select 9223372036854775807 - i, " + PAD + " from " + gs(4000)],
+                   dump: ["select id, pad from t order by id", "select count(*) from t"]}
+    }
+    if name == "numeric" {
+        return Fam{setup: ["create table t (id numeric(12,2) primary key, pad text not null)",
+                           "insert into t select i * 0.5 - 1500, " + PAD + " from " + gs(4000)],
+                   dump: ["select id, pad from t order by id", "select count(*) from t"]}
+    }
+    if name == "date" {
+        return Fam{setup: ["create table t (d date primary key, pad text not null)",
+                           "insert into t select date '2000-01-01' + i, " + PAD + " from " + gs(4000)],
+                   dump: ["select d, pad from t order by d", "select count(*) from t"]}
+    }
+    if name == "ts" {
+        return Fam{setup: ["create table t (ts timestamp primary key, pad text not null)",
+                           "insert into t select timestamp '2020-01-01 00:00:00' + i * interval '1 hour', " + PAD + " from " + gs(4000)],
+                   dump: ["select ts, pad from t order by ts", "select count(*) from t"]}
+    }
+    if name == "tstz" {
+        // 3,000 rows in the past, 1,500 in the future
+        return Fam{setup: ["create table t (ts timestamptz primary key, pad text not null)",
+                           "insert into t select timestamptz '2020-01-01 00:00:00+00' + i * interval '1 hour', " + PAD + " from " + gs(3000),
+                           "insert into t select timestamptz '2999-01-01 00:00:00+00' + i * interval '1 hour', " + PAD + " from " + gs(1500)],
+                   dump: ["select ts, pad from t order by ts", "select count(*) from t"]}
+    }
+    if name == "uuid" {
+        return Fam{setup: ["create table t (u uuid primary key, pad text not null)",
+                           "insert into t select ('00000000-0000-0000-0000-' || lpad(to_hex(i), 12, '0'))::uuid, " + PAD + " from " + gs(4000)],
+                   dump: ["select u, pad from t order by u", "select count(*) from t"]}
+    }
+    if name == "text" {
+        return Fam{setup: ["create table t (k text primary key, pad text not null)",
+                           "insert into t select 'k' || lpad(i::text, 6, '0'), " + PAD + " from " + gs(6000)],
+                   dump: ["select k, pad from t order by k", "select count(*) from t"]}
+    }
+    if name == "textedge" {
+        return Fam{setup: ["create table t (k text primary key, n int)",
+                           "insert into t values ('', 0), ('a', 1), ('a ', 2), ('a b', 3), ('a b c', 4), ('aa', 5), ('ab', 6), ('abc', 7), ('b', 8), ('B', 9), ('a~', 10), ('ab ', 11), ('z', 12)"],
+                   dump: ["select k, n from t order by k", "select count(*) from t"]}
+    }
+    if name == "two" {
+        return Fam{setup: ["create table t (a int, b int, v int not null, pad text not null, primary key (a, b))",
+                           "insert into t select i / 100, i % 100, i % 5, " + PAD + " from " + gs(6000)],
+                   dump: ["select a, b, v, pad from t order by a, b", "select count(*), min(a), max(a) from t"]}
+    }
+    if name == "twotext" {
+        return Fam{setup: ["create table t (g text, n int, pad text not null, primary key (g, n))",
+                           "insert into t select 'g' || lpad((i / 100)::text, 3, '0'), i % 100, " + PAD + " from " + gs(6000)],
+                   dump: ["select g, n, pad from t order by g, n", "select count(*) from t"]}
+    }
+    if name == "three" {
+        return Fam{setup: ["create table t (a int, b int, c int, pad text not null, primary key (a, b, c))",
+                           "insert into t select i / 1000, (i / 100) % 10, i % 100, " + PAD + " from " + gs(6000)],
+                   dump: ["select a, b, c, pad from t order by a, b, c", "select count(*) from t"]}
+    }
+    if name == "idx" {
+        // an index that leads with the key's column: its range goes with the table's
+        return Fam{setup: ["create table t (id int primary key, v int not null, pad text not null)",
+                           "insert into t select i, i % 7, " + PAD + " from " + gs(6000),
+                           "create index t_id on t (id)"],
+                   dump: ["select id, v, pad from t order by id", "select count(*) from t where id >= 0", "select count(*), sum(id) from t where id > 100 and id < 5000"]}
+    }
+    if name == "idxa" {
+        // indexes that lead with a: a lone (a) is too short for a range on b
+        return Fam{setup: ["create table t (a int, b int, v int not null, pad text not null, primary key (a, b))",
+                           "insert into t select i / 100, i % 100, i % 5, " + PAD + " from " + gs(6000),
+                           "create index t_a on t (a)", "create index t_ab on t (a, b)", "create index t_abv on t (a, b, v)",
+                           "create index t_av on t (a, v) where b > 10"],
+                   dump: ["select a, b, v, pad from t order by a, b", "select count(*) from t where a >= 0", "select count(*) from t where a >= 0 and b >= 0",
+                          "select count(*) from t where a >= 0 and v >= 0", "select count(*), sum(b) from t where a > 20 and v = 2"]}
+    }
+    if name == "idxab" {
+        return Fam{setup: ["create table t (a int, b int, v int not null, pad text not null, primary key (a, b))",
+                           "insert into t select i / 100, i % 100, i % 5, " + PAD + " from " + gs(6000),
+                           "create index t_ab on t (a, b)", "create index t_abv on t (a, b, v)", "create unique index t_ba on t (a, b, pad)"],
+                   dump: ["select a, b, v, pad from t order by a, b", "select count(*) from t where a >= 0 and b >= 0",
+                          "select count(*), sum(b) from t where a >= 0 and b >= 0 and v >= 0", "select count(*) from t where a = 5 and b < 90"]}
+    }
+    if name == "idxv" {
+        return Fam{setup: ["create table t (id int primary key, v int not null, pad text not null)",
+                           "insert into t select i, i % 7, " + PAD + " from " + gs(6000),
+                           "create index t_v on t (v)"],
+                   dump: ["select id, v from t order by id", "select count(*) from t where v >= 0", "select count(*), sum(id) from t where v = 3"]}
+    }
+    if name == "idxx" {
+        return Fam{setup: ["create table t (id int primary key, pad text not null)",
+                           "insert into t select i, 'N' || i from " + gs(6000),
+                           "create index t_l on t (lower(pad))"],
+                   dump: ["select id, pad from t order by id", "select count(*) from t where lower(pad) >= ''", "select count(*) from t where lower(pad) = 'n77'"]}
+    }
+    if name == "fk" || name == "fkcascade" || name == "fkfar" {
+        let act = if name == "fkcascade" { " on delete cascade" } else { "" }
+        let lo = if name == "fkfar" { 3000 } else { 1 }
+        return Fam{setup: ["create table t (id int primary key, pad text not null)",
+                           "insert into t select i, " + PAD + " from " + gs(6000),
+                           "create table c (id int primary key, pid int references t (id)" + act + ")",
+                           "insert into c select i, i + " + (lo - 1).toStr() + " from " + gs(100)],
+                   dump: ["select id, pad from t order by id", "select id, pid from c order by id", "select count(*) from t"]}
+    }
+    if name == "float" {
+        return Fam{setup: ["create table t (f double precision primary key, pad text not null)",
+                           "insert into t select i * 0.5, " + PAD + " from " + gs(4000)],
+                   dump: ["select f, pad from t order by f", "select count(*) from t"]}
+    }
+    if name == "ci" {
+        return Fam{setup: ["create table t (k varchar(20) collate SQL_Latin1_General_CP1_CI_AS primary key, pad text not null)",
+                           "insert into t select 'k' || lpad(i::text, 6, '0'), " + PAD + " from " + gs(4000)],
+                   dump: ["select k, pad from t order by k", "select count(*) from t"]}
+    }
+    if name == "temp" {
+        return Fam{setup: ["create temp table t (id int primary key, pad text not null)",
+                           "insert into t select i, " + PAD + " from " + gs(4000)],
+                   dump: ["select id, pad from t order by id", "select count(*) from t"]}
+    }
+    if name == "big" {
+        // every 40th value is 20,000 bytes: the range holds large values
+        return Fam{setup: ["create table t (id int primary key, pad text not null)",
+                           "insert into t select i, case when i % 40 = 0 then repeat('z', 20000) else " + PAD + " end from " + gs(3000)],
+                   dump: ["select id, length(pad), md5(pad) from t order by id", "select count(*), sum(length(pad)) from t"]}
+    }
+    if name == "keyless" {
+        return Fam{setup: ["create table t (a int, b text)", "insert into t select i, " + PAD + " from " + gs(3000)],
+                   dump: ["select a, b from t order by a", "select count(*) from t"]}
+    }
+    return Fam{setup: [], dump: []}
+}
+
+fn shapes(): []Shape {
+    var out: []Shape = []
+    // ---- int key: bounds
+    append(mut &out, sh("int <", "int", [q("delete from t where id < 1500")], true))
+    append(mut &out, sh("int <=", "int", [q("delete from t where id <= 1500")], true))
+    append(mut &out, sh("int >", "int", [q("delete from t where id > 4500")], true))
+    append(mut &out, sh("int >=", "int", [q("delete from t where id >= 4500")], true))
+    append(mut &out, sh("int between", "int", [q("delete from t where id between 1000 and 2000")], true))
+    append(mut &out, sh("int >= and <", "int", [q("delete from t where id >= 1000 and id < 2000")], true))
+    append(mut &out, sh("int > and <=", "int", [q("delete from t where id > 1000 and id <= 2000")], true))
+    append(mut &out, sh("int no where", "int", [q("delete from t")], true))
+    append(mut &out, sh("int flipped", "int", [q("delete from t where 1500 > id")], true))
+    append(mut &out, sh("int flipped >=", "int", [q("delete from t where 5000 <= id and 5500 >= id")], true))
+    append(mut &out, sh("int empty below", "int", [q("delete from t where id < 1")], true))
+    append(mut &out, sh("int empty above", "int", [q("delete from t where id > 6000")], true))
+    append(mut &out, sh("int inverted", "int", [q("delete from t where id between 20 and 10")], true))
+    append(mut &out, sh("int whole by range", "int", [q("delete from t where id >= 1 and id <= 6000")], true))
+    append(mut &out, sh("int constant arithmetic", "int", [q("delete from t where id < 1000 + 500")], true))
+    append(mut &out, sh("int text literal", "int", [q("delete from t where id < '1500'")], true))
+    append(mut &out, sh("int parameter", "int", [qp("delete from t where id < $1", [Val.Int(1500)])], true))
+    append(mut &out, sh("int parameters", "int", [qp("delete from t where id >= $1 and id < $2", [Val.Int(2000), Val.Int(2500)])], true))
+    append(mut &out, sh("int subquery", "int", [q("delete from t where id < (select min(id) + 1500 from t)")], true))
+    append(mut &out, sh("int subquery value", "int", [q("delete from t where id >= (select 4000)")], true))
+    append(mut &out, sh("int NULL bound", "int", [q("delete from t where id < null")], true))
+    append(mut &out, sh("int NULL equality (a point)", "int", [q("delete from t where id = null")], false))
+    append(mut &out, sh("two NULL equality", "two", [q("delete from t where a = null")], true))
+    append(mut &out, sh("int deletes in a row", "int", [q("delete from t where id < 1000"), q("delete from t where id < 2000"), q("delete from t where id > 5000"),
+                                                        q("delete from t where id between 2500 and 2600")], true))
+    append(mut &out, sh("int insert into the dropped range", "int", [q("delete from t where id < 3000"), q("insert into t select i, 0, 'again' from " + gs(100)),
+                                                                     q("delete from t where id < 50"), q("select count(*) from t where id < 3000"),
+                                                                     q("delete from t where id < 3000")], true))
+    // ---- int key: fall back
+    append(mut &out, sh("int residual", "int", [q("delete from t where id < 1500 and v = 3")], false))
+    append(mut &out, sh("int OR", "int", [q("delete from t where id < 100 or id > 5900")], false))
+    append(mut &out, sh("int IN", "int", [q("delete from t where id in (1, 2, 3, 4000)")], false))
+    append(mut &out, sh("int ANY", "int", [q("delete from t where id = any (array[5, 6, 7])")], false))
+    append(mut &out, sh("int non-exact bound", "int", [q("delete from t where id < 1500.5")], false))
+    append(mut &out, sh("int non-exact float parameter", "int", [qp("delete from t where id < $1", [Val.Float(1500.5f)])], false))
+    append(mut &out, sh("int bound past the type", "int", [q("delete from t where id < 3000000000")], false))
+    append(mut &out, sh("int bound below the type", "int", [q("delete from t where id > -3000000000")], false))
+    append(mut &out, sh("int point", "int", [q("delete from t where id = 77")], false))
+    append(mut &out, sh("int not equal", "int", [q("delete from t where id <> 77")], false))
+    append(mut &out, sh("int RETURNING", "int", [q("delete from t where id < 300 returning id, v")], false))
+    append(mut &out, sh("int USING", "int", [q("delete from t using u where t.id = u.id and t.id < 100")], false))
+    append(mut &out, sh("int column against column", "int", [q("delete from t where id < v * 100")], false))
+    append(mut &out, sh("int two lower bounds", "int", [q("delete from t where id > 5 and id > 10 and id < 500")], false))
+    append(mut &out, sh("int two upper bounds", "int", [q("delete from t where id < 500 and id < 400")], false))
+    append(mut &out, sh("int volatile bound", "int", [q("delete from t where id < 100 + (random() * 0)::int")], false))
+    append(mut &out, sh("int correlated subquery", "int", [q("delete from t where id < 200 and exists (select 1 from u where u.id = t.id)")], false))
+    append(mut &out, sh("int IS NOT NULL", "int", [q("delete from t where id is not null and id < 100")], false))
+    append(mut &out, sh("int expression of the key", "int", [q("delete from t where id + 0 < 1500")], false))
+    var blk = sh("int in a block", "int", [q("begin"), q("delete from t where id < 1500"), q("select count(*) from t"), q("commit")], false)
+    blk.block = true
+    append(mut &out, blk)
+    var blk2 = sh("int in a block, rolled back", "int", [q("begin"), q("delete from t where id < 1500"), q("rollback"), q("select count(*) from t")], false)
+    blk2.block = true
+    append(mut &out, blk2)
+    // ---- bigint: the type's end (the key of the greatest is all ones)
+    append(mut &out, sh("bigint top", "bigint", [q("delete from t where id > 9223372036854775807 - 100")], true))
+    append(mut &out, sh("bigint <= max", "bigint", [q("delete from t where id <= 9223372036854775807")], true))
+    append(mut &out, sh("bigint > max", "bigint", [q("delete from t where id > 9223372036854775807")], true))
+    append(mut &out, sh("bigint >= max", "bigint", [q("delete from t where id >= 9223372036854775807")], true))
+    append(mut &out, sh("bigint between", "bigint", [q("delete from t where id between 9223372036854772000 and 9223372036854774000")], true))
+    // ---- numeric
+    append(mut &out, sh("numeric <", "numeric", [q("delete from t where id < -500.5")], true))
+    append(mut &out, sh("numeric range", "numeric", [q("delete from t where id >= 10 and id <= 20.5")], true))
+    append(mut &out, sh("numeric integers", "numeric", [q("delete from t where id between 1 and 50")], true))
+    append(mut &out, sh("numeric scale lost", "numeric", [q("delete from t where id < 10.123")], false))
+    // ---- date, timestamp, timestamptz
+    append(mut &out, sh("date <", "date", [q("delete from t where d < '2005-01-01'")], true))
+    append(mut &out, sh("date range", "date", [q("delete from t where d >= date '2003-03-01' and d < date '2003-04-01'")], true))
+    append(mut &out, sh("date given a timestamp", "date", [q("delete from t where d < timestamp '2005-01-01 10:00:00'")], false))
+    append(mut &out, sh("timestamp range", "ts", [q("delete from t where ts >= '2020-02-01' and ts < '2020-03-01 12:00:00'")], true))
+    append(mut &out, sh("timestamptz now()", "tstz", [q("delete from t where ts < now()")], true))
+    append(mut &out, sh("timestamptz future", "tstz", [q("delete from t where ts >= now() - interval '1 day'")], true))
+    append(mut &out, sh("timestamptz current_timestamp", "tstz", [q("delete from t where ts < current_timestamp")], true))
+    append(mut &out, sh("timestamptz text range", "tstz", [q("delete from t where ts >= '2020-02-01 00:00:00+00' and ts < '2020-03-01 00:00:00+00'")], true))
+    var tz = sh("timestamptz in another zone", "tstz", [q("delete from t where ts < '2020-02-01 00:00:00'")], true)
+    tz.pre = ["set timezone = 'Asia/Tokyo'"]
+    append(mut &out, tz)
+    // ---- uuid and text
+    append(mut &out, sh("uuid <", "uuid", [q("delete from t where u < '00000000-0000-0000-0000-0000000007D0'")], true))
+    append(mut &out, sh("uuid >=", "uuid", [q("delete from t where u >= '00000000-0000-0000-0000-000000000BB8'")], true))
+    append(mut &out, sh("text <", "text", [q("delete from t where k < 'k002000'")], true))
+    append(mut &out, sh("text >=", "text", [q("delete from t where k >= 'k004000'")], true))
+    append(mut &out, sh("text between", "text", [q("delete from t where k between 'k000100' and 'k000200'")], true))
+    append(mut &out, sh("text >", "text", [q("delete from t where k > 'k005990'")], true))
+    append(mut &out, sh("text LIKE", "text", [q("delete from t where k like 'k0001%'")], false))
+    append(mut &out, sh("text edge >", "textedge", [q("delete from t where k > 'a'")], true))
+    append(mut &out, sh("text edge <=", "textedge", [q("delete from t where k <= 'a'")], true))
+    append(mut &out, sh("text edge range", "textedge", [q("delete from t where k >= 'ab' and k < 'b'")], true))
+    append(mut &out, sh("text edge empty string", "textedge", [q("delete from t where k >= ''")], true))
+    append(mut &out, sh("text edge >= 'a '", "textedge", [q("delete from t where k >= 'a ' and k <= 'a b c'")], true))
+    // ---- two-column and three-column keys
+    append(mut &out, sh("two a =", "two", [q("delete from t where a = 5")], true))
+    append(mut &out, sh("two a = and b <", "two", [q("delete from t where a = 5 and b < 50")], true))
+    append(mut &out, sh("two a = and b range", "two", [q("delete from t where a = 5 and b >= 20 and b < 80")], true))
+    append(mut &out, sh("two a >", "two", [q("delete from t where a > 30")], true))
+    append(mut &out, sh("two a range", "two", [q("delete from t where a >= 10 and a < 20")], true))
+    append(mut &out, sh("two a <", "two", [q("delete from t where a < 20")], true))
+    append(mut &out, sh("two a = and b >", "two", [q("delete from t where a = 59 and b > 90")], true))
+    append(mut &out, sh("two a = parameter", "two", [qp("delete from t where a = $1", [Val.Int(7)])], true))
+    append(mut &out, sh("two b < (not the first)", "two", [q("delete from t where b < 50")], false))
+    append(mut &out, sh("two whole key", "two", [q("delete from t where a = 5 and b = 7")], false))
+    append(mut &out, sh("two equality and range on a", "two", [q("delete from t where a = 5 and a < 20")], false))
+    append(mut &out, sh("two b = and a <", "two", [q("delete from t where b = 5 and a < 10")], false))
+    append(mut &out, sh("two residual", "two", [q("delete from t where a = 5 and b < 50 and v = 1")], false))
+    append(mut &out, sh("text-first a =", "twotext", [q("delete from t where g = 'g005'")], true))
+    append(mut &out, sh("text-first range", "twotext", [q("delete from t where g >= 'g010' and g < 'g020'")], true))
+    append(mut &out, sh("text-first g = and n >=", "twotext", [q("delete from t where g = 'g030' and n >= 40")], true))
+    append(mut &out, sh("three a = b = c <", "three", [q("delete from t where a = 1 and b = 2 and c < 50")], true))
+    append(mut &out, sh("three a = b >=", "three", [q("delete from t where a = 1 and b >= 3")], true))
+    append(mut &out, sh("three a <", "three", [q("delete from t where a < 3")], true))
+    append(mut &out, sh("three a = c <", "three", [q("delete from t where a = 1 and c < 50")], false))
+    // ---- indexes
+    append(mut &out, sh("index leading with the key", "idx", [q("delete from t where id < 1500")], true))
+    append(mut &out, sh("index leading with the key, whole", "idx", [q("delete from t")], true))
+    append(mut &out, sh("indexes on a, a = ", "idxa", [q("delete from t where a = 5")], true))
+    append(mut &out, sh("indexes on a, a range", "idxa", [q("delete from t where a >= 10 and a < 20")], true))
+    append(mut &out, sh("indexes on a, too short for b", "idxa", [q("delete from t where a = 5 and b < 50")], false))
+    append(mut &out, sh("indexes on a and b, a = b <", "idxab", [q("delete from t where a = 5 and b < 50")], true))
+    append(mut &out, sh("indexes on a and b, a = b range", "idxab", [q("delete from t where a = 20 and b >= 10 and b < 90")], true))
+    append(mut &out, sh("indexes on a and b, a >", "idxab", [q("delete from t where a > 40")], true))
+    append(mut &out, sh("index of another column", "idxv", [q("delete from t where id < 1500")], false))
+    append(mut &out, sh("index of another column, whole", "idxv", [q("delete from t")], true))
+    append(mut &out, sh("expression index, whole", "idxx", [q("delete from t")], true))
+    append(mut &out, sh("expression index, range", "idxx", [q("delete from t where id < 1500")], false))
+    // ---- foreign keys, key types, large values, temporary and keyless tables
+    append(mut &out, sh("referenced, rows in the range", "fk", [q("delete from t where id < 1500"), q("select count(*) from t")], false))
+    append(mut &out, sh("referenced, rows elsewhere", "fkfar", [q("delete from t where id < 1500")], false))
+    append(mut &out, sh("referenced, cascade", "fkcascade", [q("delete from t where id < 50")], false))
+    append(mut &out, sh("float key", "float", [q("delete from t where f < 1000.5")], false))
+    append(mut &out, sh("float key, whole", "float", [q("delete from t")], true))
+    append(mut &out, sh("case-insensitive key", "ci", [q("delete from t where k < 'k002000'")], false))
+    append(mut &out, sh("case-insensitive key, whole", "ci", [q("delete from t")], true))
+    append(mut &out, sh("temporary table", "temp", [q("delete from t where id < 1500")], true))
+    append(mut &out, sh("large values in the range", "big", [q("delete from t where id between 100 and 2000")], true))
+    append(mut &out, sh("large values, then new ones", "big", [q("delete from t where id between 100 and 2000"),
+                                                               q("insert into t select i, repeat('q', 30000) from generate_series(150, 1990) i"),
+                                                               q("delete from t where id >= 1000 and id < 1500")], true))
+    append(mut &out, sh("large values, whole", "big", [q("delete from t")], true))
+    append(mut &out, sh("keyless, whole", "keyless", [q("delete from t")], true))
+    append(mut &out, sh("keyless, a range", "keyless", [q("delete from t where a < 1000")], false))
+    return out
+}
+
+fn show(r: &lexdb_exec.Res): str {
+    if !r.hasRows { return r.tag }
+    var rows: []str = []
+    for row in r.rows {
+        var cells: []str = []
+        for v in row { append(mut &cells, lexdb_exec.text(&v)) }
+        append(mut &rows, strings.join(&cells, "|"))
+    }
+    return r.tag + ": " + strings.join(&rows, ";")
+}
+
+fn runOne(s: mut &lexdb_exec.Session, sql: &str, ps: &[]Val): str {
+    let nt: []int = []
+    match lexdb_sql.parse(sql) {
+        Ok(stmts) {
+            match s.run(&stmts[0], ps, &nt) {
+                Ok(r) { return show(&r) }
+                Err(e) { return "error " + e.state }
+            }
+        }
+        Err(e) { return "parse error " + e.state }
+    }
+}
+
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: 256 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 100000}
+}
+
+fn runShape(n: int, sh: &Shape, on: bool): Out {
+    var out = Out{tags: "", dump: "", audit: "", ex: "", taken: 0}
+    let fam = famOf(sh.fam)
+    let fs = lexdb_disk.sim(300 + n)
+    let none: []Val = []
+    // the tables are built and the store closed, then opened again: nothing is in memory when the statements run
+    // (a temporary table does not outlive its session: one run)
+    let reopen = sh.fam != "temp"
+    if reopen {
+        lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int {
+            lexdb_exec.bootstrap(&st).unwrap()
+            var s = lexdb_exec.newSession(st)
+            for sql in fam.setup {
+                let r = runOne(mut &s, &sql, &none)
+                if strings.contains(&r, "error") { out.tags = out.tags + "setup " + sql + ": " + r + "\n" }
+            }
+            s.close()
+            return 0
+        }).unwrap()
+    }
+    lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int {
+        if !reopen { lexdb_exec.bootstrap(&st).unwrap() }
+        var s = lexdb_exec.newSession(st)
+        if !reopen {
+            for sql in fam.setup {
+                let r = runOne(mut &s, &sql, &none)
+                if strings.contains(&r, "error") { out.tags = out.tags + "setup " + sql + ": " + r + "\n" }
+            }
+            st.checkpoint().unwrap()
+        }
+        for sql in sh.pre { let r = runOne(mut &s, &sql, &none) }
+        let sw = runOne(mut &s, &("set lexdb_range_delete = " + (if on { "on" } else { "off" })), &none)
+        // what EXPLAIN says of the first DELETE
+        for x in sh.stmts {
+            if strings.startsWith(&x.sql, "delete") {
+                if sh.block { let b = runOne(mut &s, &"begin", &none) }
+                out.ex = runOne(mut &s, &("explain " + x.sql), &x.ps)
+                if sh.block { let b = runOne(mut &s, &"rollback", &none) }
+                break
+            }
+        }
+        let before = lexdb_exec.rangeDeletes()
+        for x in sh.stmts { out.tags = out.tags + runOne(mut &s, &x.sql, &x.ps) + "\n" }
+        out.taken = lexdb_exec.rangeDeletes() - before
+        for d in fam.dump { out.dump = out.dump + runOne(mut &s, &d, &none) + "\n" }
+        s.close()
+        return 0
+    }).unwrap()
+    out.audit = match lexdb_store.audit(fs) { Ok(a) { a } Err(e) { "audit: " + e.msg } }
+    return out
+}
+
+fn clean(a: &str): bool { return strings.contains(a, "lost 0, twice 0") }
+
+fn firstDiff(a: &str, b: &str): str {
+    var i = 0
+    while i < len(a) && i < len(b) && a[i] == b[i] { i += 1 }
+    var j = i
+    while j > 0 && a[j - 1] != '\n' { j -= 1 }
+    var e1 = i
+    while e1 < len(a) && a[e1] != '\n' { e1 += 1 }
+    var e2 = i
+    while e2 < len(b) && b[e2] != '\n' { e2 += 1 }
+    // (a long line cut where it differs)
+    let c1 = if e1 > i + 80 { i + 80 } else { e1 }
+    let c2 = if e2 > i + 80 { i + 80 } else { e2 }
+    let from = if i > j + 40 { i - 40 } else { j }
+    return "on: " + a[from..c1] + " / off: " + b[from..c2]
+}
+
+fn switchTest() {
+    let fs = lexdb_disk.sim(900)
+    var res: []str = []
+    lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        let none: []Val = []
+        let a = runOne(mut &s, &"show lexdb_range_delete", &none)
+        let b0 = runOne(mut &s, &"set lexdb_range_delete = off", &none)
+        let b = runOne(mut &s, &"show lexdb_range_delete", &none)
+        let c0 = runOne(mut &s, &"reset lexdb_range_delete", &none)
+        let c = runOne(mut &s, &"show lexdb_range_delete", &none)
+        let d0 = runOne(mut &s, &"begin", &none)
+        let d1 = runOne(mut &s, &"set lexdb_range_delete = off", &none)
+        let d2 = runOne(mut &s, &"rollback", &none)
+        let d = runOne(mut &s, &"show lexdb_range_delete", &none)
+        let e = runOne(mut &s, &"set lexdb_range_delete = 'maybe'", &none)
+        append(mut &res, "switch: " + strings.replaceAll(&a, "SHOW: ", "") + ", " + strings.replaceAll(&b, "SHOW: ", "") + ", " + strings.replaceAll(&c, "SHOW: ", "") +
+               " after RESET, " + strings.replaceAll(&d, "SHOW: ", "") + " after the block's ROLLBACK, " + strings.replaceAll(&e, "error ", "") + " for junk")
+        s.close()
+        return 0
+    }).unwrap()
+    for l in res { println(l) }
+}
+
+// Another session's row locked in the range: the row path, which waits for
+// the lock, is the one to take.
+fn lockTest() {
+    let fs = lexdb_disk.sim(901)
+    var res: []str = []
+    lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var a = lexdb_exec.newSession(st)
+        var b = lexdb_exec.newSession(st)
+        let none: []Val = []
+        for sql in famOf("int").setup { let r = runOne(mut &a, &sql, &none) }
+        let b0 = runOne(mut &a, &"begin", &none)
+        let b1 = runOne(mut &a, &"select id from t where id between 100 and 110 for update", &none)
+        let locked = runOne(mut &b, &"explain delete from t where id < 1500", &none)
+        let other = runOne(mut &b, &"explain delete from t where id > 1500", &none)
+        let c = runOne(mut &a, &"commit", &none)
+        let free = runOne(mut &b, &"explain delete from t where id < 1500", &none)
+        append(mut &res, "locked: explain without the line " + (!strings.contains(&locked, "range delete:") && strings.contains(&other, "range delete:")).toStr() +
+               ", with it after COMMIT " + strings.contains(&free, "range delete:").toStr())
+        a.close()
+        b.close()
+        return 0
+    }).unwrap()
+    for l in res { println(l) }
+}
+
+var HOOKED: int = 0
+
+// During the count, once: another session commits a row into the range.
+fn hook(st: lexdb_store.Store, mode: int, arg: str, k: int) {
+    if HOOKED > 0 { return }
+    HOOKED = 1
+    var s2 = lexdb_exec.newSession(st)
+    let none: []Val = []
+    let r = runOne(mut &s2, &arg, &none)
+    s2.close()
+}
+
+// A row inserted into the range after the count began fails the commit
+// (40001); the statement runs again, counts it and deletes it too.
+fn concurrentTest() {
+    let fs = lexdb_disk.sim(902)
+    var res: []str = []
+    lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var a = lexdb_exec.newSession(st)
+        let none: []Val = []
+        let c1 = runOne(mut &a, &"create table t (id int primary key, pad text not null)", &none)
+        let c2 = runOne(mut &a, &("insert into t select i * 2, " + PAD + " from " + gs(4000)), &none)
+        a.close()
+        return 0
+    }).unwrap()
+    lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int {
+        var a = lexdb_exec.newSession(st)
+        let none: []Val = []
+        st.setCountHook(hook, 0, "insert into t values (2001, 'new')")
+        let tag = runOne(mut &a, &"delete from t where id >= 1000 and id < 4600", &none)
+        let calls = st.countHookCalls()
+        st.clearCountHook()
+        let left = runOne(mut &a, &"select count(*) from t", &none)
+        let gone = runOne(mut &a, &"select count(*) from t where id = 2001", &none)
+        res = [tag, calls.toStr(), left, gone]
+        a.close()
+        return 0
+    }).unwrap()
+    let au = match lexdb_store.audit(fs) { Ok(x) { x } Err(e) { e.msg } }
+    println("concurrent insert: " + res[0] + ", the count ran again " + (strings.parseIntOpt(&res[1]).unwrapOr(0) >= 2).toStr() + ", left " + res[2][strings.indexOf(&res[2], ": ", 0) + 2..len(res[2])] + ", the inserted row gone " +
+            strings.endsWith(&res[3], "0").toStr() + ", audit clean " + clean(&au).toStr())
+}
+
+fn main() {
+    let list = shapes()
+    var tagsEq = 0
+    var rowsEq = 0
+    var clean2 = 0
+    var asWanted = 0
+    var took = 0
+    var fell = 0
+    for n in 0..len(list) {
+        let a = runShape(n, &list[n], true)
+        let b = runShape(n, &list[n], false)
+        if a.tags == b.tags { tagsEq += 1 } else { println(list[n].name + ": tags differ " + firstDiff(&a.tags, &b.tags)) }
+        if a.dump == b.dump { rowsEq += 1 } else { println(list[n].name + ": rows differ " + firstDiff(&a.dump, &b.dump)) }
+        if clean(&a.audit) { clean2 += 1 } else { println(list[n].name + ": audit on: " + a.audit) }
+        if clean(&b.audit) { clean2 += 1 } else { println(list[n].name + ": audit off: " + b.audit) }
+        let line = strings.contains(&a.ex, "range delete:")
+        let ok = line == list[n].take && (a.taken > 0) == list[n].take && !strings.contains(&b.ex, "range delete:") && b.taken == 0
+        if ok { asWanted += 1 } else {
+            println(list[n].name + ": expected " + (if list[n].take { "the range path" } else { "a fallback" }) + ", explain line " + line.toStr() + ", taken on " +
+                    a.taken.toStr() + ", off " + b.taken.toStr() + "; explain: " + a.ex)
+        }
+        if list[n].take { took += 1 } else { fell += 1 }
+    }
+    println("shapes " + len(list).toStr() + ": tags equal " + tagsEq.toStr() + ", rows equal " + rowsEq.toStr() + ", audits clean " + clean2.toStr())
+    println("path as expected " + asWanted.toStr() + ": " + took.toStr() + " took it, " + fell.toStr() + " fell back")
+    switchTest()
+    lockTest()
+    concurrentTest()
+}

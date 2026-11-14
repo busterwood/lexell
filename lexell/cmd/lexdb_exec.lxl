@@ -5889,9 +5889,10 @@ pub type Limits = value record {
     pub batch: bool             // SET lexdb_batch: aggregates over batches of rows (9.47)
     pub rules: bool             // SET lexdb_planner = rules: kept with the others for a block's ROLLBACK (optimizer 20)
     pub auto: bool              // SET lexdb_autoanalyze: the session's changes counted for the automatic statistics (optimizer 44)
+    pub rdel: bool              // SET lexdb_range_delete: a DELETE of a key range may drop its subtrees (design/lexdb-bulkdelete.md)
 }
 
-pub fn noLimits(): Limits { return Limits{rounds: 0, steps: 0, mem: 0, deadline: 0, batch: true, rules: false, auto: true} }
+pub fn noLimits(): Limits { return Limits{rounds: 0, steps: 0, mem: 0, deadline: 0, batch: true, rules: false, auto: true, rdel: true} }
 
 fn (rs: mut &Run) limit(l: &Limits) {
     rs.maxRounds = l.rounds
@@ -14478,6 +14479,10 @@ fn delete(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     var ret = try retOf(s, &q, mut &sc)
     endScope(mut &sc, mut &q)
     delNarrow(mut &q, s)
+    match try rangeDelete(st, txn, s, &q, params, &lim) {
+        Some(r) { return Ok(r) }
+        None {}
+    }
     let t = &q.levels[0].t
     var found: [][]Val = []
     var rs = newRun(&q)
@@ -14516,6 +14521,335 @@ fn delete(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     }
     try fkFinish(st, txn, &fw, mut &later)
     return Ok(retRes(ret, &("DELETE " + len(found).toStr())))
+}
+
+// ---- range delete (design/lexdb-bulkdelete.md 2.1)
+//
+// A DELETE whose WHERE is exactly a range of the primary key's leading
+// columns (equalities on the first k, at most a lower and an upper bound on
+// the next, or no WHERE) drops the key range from the tree as one write
+// (Txn.delRange) instead of deleting the rows one by one. The count is the
+// store's (countRange: exact, from the leaf headers).
+// - Taken only in the statement's own transaction with no write yet: the
+//   count does not see a transaction's own writes, and a block's later reads
+//   would still see the rows (until the block stage). So never inside BEGIN,
+//   and so never from Oracle's door, which begins a block for each DML.
+// - The WHERE is read from the level's conjuncts, not from its Path: the
+//   Path's bounds are supersets, the rows being checked again. Every
+//   conjunct must be column op constant on a key column, in the leading
+//   columns, one equality per column and at most one bound each way on the
+//   next. Anything else (an OR, IN, a residual, a function of the column)
+//   takes the row path unchanged.
+// - A bound counts only if its value survives the column's type: the value
+//   made the column's type compares equal to it (id < 10.5 on an int does
+//   not: the planner's bounds are inclusive for that, here the range must
+//   be the whole predicate).
+// - Not: RETURNING or OUTPUT, TOP and ROWNUM (a limit), USING, a table
+//   others reference (their FK actions need the rows), a table whose
+//   indexes do not lead with the range's key columns (an index entry is
+//   marker, value, ..., key: the rows of the range are one range of an
+//   index that leads with the same columns), a key of float, a collation
+//   other than the exact one, rows locked by others in the range (the row
+//   path waits for them), a point lookup (all key columns equal: one row).
+
+// The DELETEs that took the range path since the process began (a test's check).
+var RDEL_TAKEN: int = 0
+
+pub fn rangeDeletes(): int { return RDEL_TAKEN }
+
+type RdBound = record { pos: int; op: str; x: Expr }
+
+// [lo, hi) of a tree (hi "": to the end), or nothing.
+type RdRange = value record { lo: str; hi: str; empty: bool }
+
+type RPlan = record {
+    empty: bool                 // no row can match (a NULL bound): DELETE 0
+    main: RdRange
+    ixs: []int                  // the indexes (places in t.indexes) that take the same op, with their ranges
+    ixr: []RdRange
+    text: str                   // EXPLAIN's line
+}
+
+const RD_FNS: []str = ["now", "current_timestamp", "current_date", "current_time", "localtimestamp", "localtime", "transaction_timestamp",
+                       "statement_timestamp", "date_trunc", "make_date", "make_timestamp", "make_timestamptz", "to_timestamp", "to_date",
+                       "timezone", "#dateadd", "dateadd", "add_months", "trunc", "abs", "greatest", "least"]
+
+// Whether x has the same value throughout the statement and reads no row:
+// a literal, a parameter, a stable function of those, an uncorrelated
+// scalar subquery.
+fn rdConst(q: &Query, x: &Expr): bool {
+    match x {
+        Expr.Lit(_) { return true }
+        Expr.Param(_) { return true }
+        Expr.Col(_) { return false }
+        Expr.Unary(op, a) { return op == "-" && rdConst(q, &a) }
+        Expr.Bin(op, a, b) {
+            if op != "+" && op != "-" && op != "*" && op != "/" && op != "%" && op != "||" && op != "t+" { return false }
+            return rdConst(q, &a) && rdConst(q, &b)
+        }
+        Expr.Cast(a, _) { return rdConst(q, &a) }
+        Expr.Call(n, args, star) {
+            if star { return false }
+            if n == "#sub" {
+                let i = if len(args) > 0 { litInt(&args[0]) } else { -1 }
+                if i < 0 || i >= len(q.subs) { return false }
+                let sp = &q.subs[i]
+                return sp.use == lexdb_sql.SUB_SCALAR && len(sp.sel.q.refs) == 0 && !sp.hashed && !sp.semi && sp.cte < 0
+            }
+            var known = false
+            for f in RD_FNS { if f == n { known = true } }
+            if !known { return false }
+            for a in args { if !rdConst(q, &a) { return false } }
+            return true
+        }
+        else { return false }
+    }
+}
+
+// The primary key position of the column name (alias.column) names, -1 none.
+fn rdPos(lv: &Level, name: &str): int {
+    for i in 0..len(lv.t.pk) {
+        if lv.alias + "." + lv.t.cols[lv.t.pk[i]].name == name { return i }
+    }
+    return -1
+}
+
+fn rdFlip(op: &str): str { return match op { "<" { ">" } "<=" { ">=" } ">" { "<" } ">=" { "<=" } else { "=" } } }
+
+// The conjunct as a bound on a key column; None when it is anything else.
+fn rdBound(q: &Query, lv: &Level, c: &Expr): Option[RdBound] {
+    match c {
+        Expr.Bin(op, a, b) {
+            if op != "=" && op != "<" && op != "<=" && op != ">" && op != ">=" { return None }
+            match a {
+                Expr.Col(n) {
+                    let p = rdPos(lv, &n)
+                    if p >= 0 && rdConst(q, &b) { return Some(RdBound{pos: p, op: op, x: clone(&b)}) }
+                }
+                else {}
+            }
+            match b {
+                Expr.Col(n) {
+                    let p = rdPos(lv, &n)
+                    if p >= 0 && rdConst(q, &a) { return Some(RdBound{pos: p, op: rdFlip(&op), x: clone(&a)}) }
+                }
+                else {}
+            }
+            return None
+        }
+        else { return None }
+    }
+}
+
+// Whether a key column's values order as their keys do, and a bound on it
+// is one value: the integers, numeric, the date and time kinds, uuid and
+// text under the exact collation (not float: NaN and -0; not a case-
+// insensitive or padded text; not char(n)).
+fn rdExactCol(c: &lexdb_sql.ColDef): bool {
+    let k = c.typ.kind
+    if k == lexdb_sql.K_TEXT { return colCollKind(c) == lexdb_sql.COLL_EXACT && c.typ.oid != lexdb_sql.OID_BPCHAR }
+    return k == lexdb_sql.K_INT || k == lexdb_sql.K_NUM || k == lexdb_sql.K_DATE || k == lexdb_sql.K_TIME || k == lexdb_sql.K_TS ||
+           k == lexdb_sql.K_TSTZ || k == lexdb_sql.K_UUID
+}
+
+// The keys of [lo, hi) for equalities eqs on the first columns and a lower
+// and an upper bound on the next (in an index: each part under its marker).
+fn rdRange(eqs: &[]Val, lower: &Option[Val], lowIncl: bool, upper: &Option[Val], upIncl: bool, ix: bool): RdRange {
+    var pb = newStrBuf()
+    for v in eqs { encPart(mut &pb, &v, ix) }
+    let p = pb.toStr()
+    var lo = p
+    var hi = if len(p) > 0 { succ(&p) } else { "" }
+    match lower {
+        Some(v) {
+            var kb = newStrBuf()
+            kb.add(&p)
+            encPart(mut &kb, &v, ix)
+            let e = kb.toStr()
+            if lowIncl {
+                lo = e
+            } else {
+                // just after every key that starts with e; none: nothing is above it
+                let n = succ(&e)
+                if n == "" { return RdRange{lo: "", hi: "", empty: true} }
+                lo = n
+            }
+        }
+        None {}
+    }
+    match upper {
+        Some(v) {
+            var kb = newStrBuf()
+            kb.add(&p)
+            encPart(mut &kb, &v, ix)
+            let e = kb.toStr()
+            // (inclusive with nothing after e: to the end, no tighter than hi)
+            let h = if upIncl { succ(&e) } else { e }
+            if h != "" && (hi == "" || h < hi) { hi = h }
+        }
+        None {}
+    }
+    if len(hi) > 0 && lo >= hi { return RdRange{lo: "", hi: "", empty: true} }
+    return RdRange{lo: lo, hi: hi, empty: false}
+}
+
+fn rdNone(): RPlan { return RPlan{empty: false, main: RdRange{lo: "", hi: "", empty: false}, ixs: [], ixr: [], text: ""} }
+
+// The range delete s makes of q's one table, or None for the row path.
+fn rangePlan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, q: &Query, params: &[]Val,
+             lim: &Limits, shown: bool): Result[Option[RPlan], DbErr] {
+    // (EXPLAIN runs on a snapshot, whose reads are not noted: it shows what a DELETE would do)
+    if !lim.rdel || txn.inBlock() || txn.hasWrites() || txn.quiet || !(shown || txn.noting()) { return Ok(None) }
+    if len(s.items) > 0 || s.limit.isSome() || len(s.from) > 0 || len(q.levels) != 1 || len(q.top) > 0 { return Ok(None) }
+    let lv = &q.levels[0]
+    if lv.virt() || lv.lateral { return Ok(None) }
+    let t = &lv.t
+    if len(t.view) > 0 || len(t.refBy) > 0 || len(t.pk) == 0 { return Ok(None) }
+    for sp in q.subs {
+        if !(sp.use == lexdb_sql.SUB_SCALAR && len(sp.sel.q.refs) == 0 && !sp.hashed && !sp.semi && sp.cte < 0) { return Ok(None) }
+    }
+    // the conjuncts: one equality per column, in the leading columns, then a bound each way on the next
+    let np = len(t.pk)
+    var eqAt: []int = array(np, -1)
+    var loAt: []int = array(np, -1)
+    var hiAt: []int = array(np, -1)
+    var bs: []RdBound = []
+    for c in lv.cond {
+        match rdBound(q, lv, &c) {
+            Some(b) {
+                let at = len(bs)
+                if b.op == "=" {
+                    if eqAt[b.pos] >= 0 { return Ok(None) }
+                    eqAt[b.pos] = at
+                } else if b.op == ">" || b.op == ">=" {
+                    if loAt[b.pos] >= 0 { return Ok(None) }
+                    loAt[b.pos] = at
+                } else {
+                    if hiAt[b.pos] >= 0 { return Ok(None) }
+                    hiAt[b.pos] = at
+                }
+                append(mut &bs, b)
+            }
+            None { return Ok(None) }
+        }
+    }
+    var k = 0
+    while k < np && eqAt[k] >= 0 { k += 1 }
+    for j in k + 1..np { if eqAt[j] >= 0 { return Ok(None) } }          // an equality after a gap
+    // bounds only on column k
+    for j in 0..np {
+        if j != k && (loAt[j] >= 0 || hiAt[j] >= 0) { return Ok(None) }
+    }
+    if k == np { return Ok(None) }                  // the whole key: one row, a lookup
+    let ranged = loAt[k] >= 0 || hiAt[k] >= 0
+    let used = k + (if ranged { 1 } else { 0 })
+    for j in 0..used { if !rdExactCol(&t.cols[t.pk[j]]) { return Ok(None) } }
+    // the indexes: each must lead with the key columns the range uses
+    var ixs: []int = []
+    for x in 0..len(t.indexes) {
+        let ix = &t.indexes[x]
+        if len(ix.cols) < used { return Ok(None) }
+        for j in 0..used { if ix.cols[j] != t.pk[j] { return Ok(None) } }
+        append(mut &ixs, x)
+    }
+    // the values, once
+    var rs = newRun(q)
+    rs.limit(lim)
+    rs.writes = true
+    let m = try prepare(st, txn, q, params, mut &rs)
+    let noAggs: []Val = []
+    let noRow: []Val = []
+    let env = Env{cols: &q.cols, row: &noRow, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: seqEnv(st, txn)}
+    var vals: []Val = array(len(bs), Val.Null)
+    for i in 0..len(bs) {
+        let col = &t.cols[t.pk[bs[i].pos]]
+        var v = Val.Null
+        match eval(&bs[i].x, &env) {
+            Ok(x) { v = x }
+            Err(_) { return Ok(None) }                  // the row path gives its error
+        }
+        if isNull(&v) {
+            // col op NULL is never true: no row
+            var p = rdNone()
+            p.empty = true
+            p.text = "range delete: no row can match"
+            return Ok(Some(p))
+        }
+        let typ = boundType(&col.typ)
+        match coerceZ(v, &typ, &txn.zone) {
+            Ok(c) {
+                match compareZ(&v, &c, &txn.zone) {
+                    Ok(r) { if r != 0 { return Ok(None) } }
+                    Err(_) { return Ok(None) }
+                }
+                vals[i] = c
+            }
+            Err(_) { return Ok(None) }
+        }
+    }
+    var eqs: []Val = []
+    for j in 0..k { append(mut &eqs, vals[eqAt[j]]) }
+    var lower: Option[Val] = None
+    var upper: Option[Val] = None
+    var lowIncl = true
+    var upIncl = true
+    if loAt[k] >= 0 {
+        lower = Some(vals[loAt[k]])
+        lowIncl = bs[loAt[k]].op == ">="
+    }
+    if hiAt[k] >= 0 {
+        upper = Some(vals[hiAt[k]])
+        upIncl = bs[hiAt[k]].op == "<="
+    }
+    var p = rdNone()
+    p.main = rdRange(&eqs, &lower, lowIncl, &upper, upIncl, false)
+    if p.main.empty {
+        p.empty = true
+        p.text = "range delete: no row can match"
+        return Ok(Some(p))
+    }
+    if st.locksIn(txn, t.tree, &p.main.lo, &p.main.hi) { return Ok(None) }
+    for x in ixs {
+        append(mut &p.ixs, x)
+        append(mut &p.ixr, rdRange(&eqs, &lower, lowIncl, &upper, upIncl, true))
+    }
+    p.text = "range delete: primary key " + (if used == 0 { "whole table" } else { "range" }) + ", subtrees dropped" +
+             (if len(ixs) > 0 { " (" + len(ixs).toStr() + " index" + (if len(ixs) > 1 { "es" } else { "" }) + " too)" } else { "" })
+    return Ok(Some(p))
+}
+
+// Rows of table t deleted: n of them counted for the automatic statistics.
+fn noteChgN(st: &lexdb_store.Store, txn: &lexdb_store.Txn, t: &Table, n: int) {
+    if AUTO_STATE == 2 { return }
+    if txn.sess != CHG_SESS || t.tree != CHG_TREE {
+        if !autoAnalyzeOn() || tempRel(&t.name) || txn.sess <= 0 { return }
+        chgFlush(st)
+        CHG_SESS = txn.sess
+        CHG_TREE = t.tree
+    }
+    CHG_D += n
+}
+
+// DELETE as a range delete when it can be one: its result, or None for the
+// row path (also when the count gave up after its restarts).
+fn rangeDelete(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, q: &Query, params: &[]Val,
+               lim: &Limits): Result[Option[Res], DbErr] {
+    let pl = match try rangePlan(st, txn, s, q, params, lim, false) { Some(p) { p } None { return Ok(None) } }
+    if pl.empty {
+        RDEL_TAKEN += 1
+        return Ok(Some(tagOnly(&"DELETE 0")))
+    }
+    let t = &q.levels[0].t
+    // noted before the count: a commit into the range meanwhile fails this one (40001), not unseen
+    st.noteRange(txn, t.tree, &pl.main.lo, &pl.main.hi)
+    let n = try st.countRange(txn, t.tree, &pl.main.lo, &pl.main.hi)
+    if n < 0 { return Ok(None) }
+    RDEL_TAKEN += 1
+    if n == 0 { return Ok(Some(tagOnly(&"DELETE 0"))) }
+    txn.delRange(t.tree, &pl.main.lo, &pl.main.hi)
+    for i in 0..len(pl.ixs) { txn.delRange(t.indexes[pl.ixs[i]].tree, &pl.ixr[i].lo, &pl.ixr[i].hi) }
+    noteChgN(st, txn, t, n)
+    return Ok(Some(tagOnly(&("DELETE " + n.toStr()))))
 }
 
 // ---- MERGE (design/lexdb.md 9.121): the same statement in all three dialects
@@ -14971,6 +15305,13 @@ fn explain(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, x: &lexdb_sql.Stmt
         lines = explainLines(&q, &none)
         let noStats: []SubStat = []
         subLines(&q, &noStats, mut &lines)
+        if s.kind == lexdb_sql.S_DELETE {
+            // (what delete would take, its bounds evaluated now)
+            match try rangePlan(st, txn, s, &q, params, &lim, true) {
+                Some(p) { append(mut &lines, p.text) }
+                None {}
+            }
+        }
     }
     for l in lines { append(mut &res.rows, [Val.Text(l)]) }
     return Ok(res)
@@ -18412,6 +18753,7 @@ pub type Session = record {
     batch: bool                 // SET lexdb_batch (9.47)
     rules: bool                 // SET lexdb_planner = rules: no statistics in planning (optimizer 20)
     auto: bool                  // SET lexdb_autoanalyze: its committed changes counted for the automatic statistics (optimizer 44)
+    rdel: bool                  // SET lexdb_range_delete: a DELETE of a key range may drop its subtrees (design/lexdb-bulkdelete.md)
     saves: []SavePt             // the open block's savepoints, oldest first (9.80)
     savedRoles: []str           // in a transaction block: SET ROLE's and SET SESSION AUTHORIZATION's at its BEGIN (9.83)
     custom: []str               // the settings with a dot in their names (SET my.x, set_config): "name\x00value" (9.92)
@@ -18545,6 +18887,7 @@ fn (s: &Session) setting(name: &str): Option[str] {
         "lexdb_planner" { return Some(if s.rules { "rules" } else { "cost" }) }
         "lexdb_batch" { return Some(if s.batch { "on" } else { "off" }) }
         "lexdb_autoanalyze" { return Some(if s.auto { "on" } else { "off" }) }
+        "lexdb_range_delete" { return Some(if s.rdel { "on" } else { "off" }) }
         else {}
     }
     let k = strings.toLowerAscii(&name)
@@ -18561,7 +18904,7 @@ const SHOWN: []str = ["search_path", "max_recursion", "max_match_steps", "statem
                       "transaction_read_only", "default_transaction_read_only", "in_hot_standby", "server_version",
                       "server_version_num", "server_encoding", "client_encoding", "datestyle", "timezone", "log_timezone",
                       "intervalstyle", "lc_collate", "lc_ctype", "lc_messages", "lc_monetary", "lc_numeric", "lc_time",
-                      "max_identifier_length", "application_name", "bytea_output", "lexdb_batch", "lexdb_planner", "lexdb_autoanalyze"]
+                      "max_identifier_length", "application_name", "bytea_output", "lexdb_batch", "lexdb_planner", "lexdb_autoanalyze", "lexdb_range_delete"]
 
 // The session's settings for current_setting and set_config (9.92), in the
 // memo while a statement calling them runs: a line each, name TAB value.
@@ -18653,6 +18996,13 @@ fn (s: mut &Session) applySetting(name: &str, value: &str, local: bool): Result[
         }
         return Ok(Unit{})
     }
+    if k == "lexdb_range_delete" {
+        match parseBool(&strings.toLowerAscii(&(strings.trim(value)))) {
+            Some(y) { s.rdel = y }
+            None { return Err(e("22023", "parameter \"lexdb_range_delete\" requires a Boolean value")) }
+        }
+        return Ok(Unit{})
+    }
     if k == "max_recursion" || k == "max_match_steps" || k == "statement_timeout" || k == "max_statement_mem" {
         let v = try settingValue(&k, &Val.Text(value.toStr()))
         if k == "max_recursion" { s.maxRecursion = v }
@@ -18705,7 +19055,7 @@ fn (s: &Session) show(name: &str): Result[Res, DbErr] {
 // lexdb_wire): no id of its own, never run.
 pub fn parkedSession(st: lexdb_store.Store): Session {
     return Session{st: st, txn: [], failed: false, maxRecursion: MAX_RECURSION, maxSteps: MAX_MATCH_STEPS, timeoutMs: 0, maxMem: MAX_STATEMENT_MEM,
-                   saved: [], readOnly: false, path: [], pathAt: 0, savedPath: [], id: 0, batch: true, rules: false, auto: true, saves: [], savedRoles: [],
+                   saved: [], readOnly: false, path: [], pathAt: 0, savedPath: [], id: 0, batch: true, rules: false, auto: true, rdel: true, saves: [], savedRoles: [],
                    custom: [], savedCustom: [], localUndo: [], zone: lexdb_time.utc(), savedZone: [], tmp: "", onCommit: [], fresh: false}
 }
 
@@ -18719,7 +19069,7 @@ pub fn newSession(st: lexdb_store.Store): Session {
     let id = num(&st.memoGet(&"sessions").unwrapOr("0")) + 1
     st.memoPut(&"sessions", &id.toStr())
     return Session{st: st, txn: [], failed: false, maxRecursion: MAX_RECURSION, maxSteps: MAX_MATCH_STEPS, timeoutMs: 0, maxMem: MAX_STATEMENT_MEM,
-                   saved: [], readOnly: false, path: [], pathAt: 0, savedPath: [], id: id, batch: true, rules: false, auto: true, saves: [], savedRoles: [],
+                   saved: [], readOnly: false, path: [], pathAt: 0, savedPath: [], id: id, batch: true, rules: false, auto: true, rdel: true, saves: [], savedRoles: [],
                    custom: [], savedCustom: [], localUndo: [], zone: lexdb_time.utc(), savedZone: [], tmp: "", onCommit: [], fresh: false}
 }
 
@@ -18752,12 +19102,13 @@ fn (s: mut &Session) restore() {
     s.batch = l.batch
     s.rules = l.rules
     s.auto = l.auto
+    s.rdel = l.rdel
 }
 
 // The limits for a statement starting now.
 fn (s: &Session) limits(): Limits {
     let dl = if s.timeoutMs > 0 { time.monotonicNs() + s.timeoutMs * 1000000 } else { 0 }
-    return Limits{rounds: s.maxRecursion, steps: s.maxSteps, mem: s.maxMem, deadline: dl, batch: s.batch, rules: s.rules, auto: s.auto}
+    return Limits{rounds: s.maxRecursion, steps: s.maxSteps, mem: s.maxMem, deadline: dl, batch: s.batch, rules: s.rules, auto: s.auto, rdel: s.rdel}
 }
 
 // A setting's value: a number (statement_timeout in ms, max_statement_mem
@@ -18933,6 +19284,7 @@ fn (s: mut &Session) resetAll() {
     s.rules = false
     if len(s.txn) > 0 { s.txn[0].rules = false }
     s.auto = true
+    s.rdel = true
 }
 
 // Whether a statement a READ ONLY block refuses writes only temporary
@@ -19311,6 +19663,24 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
                     None {}
                 }
                 s.auto = on
+            } else if stmt.table == "lexdb_range_delete" {
+                var on = true                       // DEFAULT, RESET
+                match stmt.limit {
+                    Some(x) {
+                        let noCols: []lexdb_sql.ColDef = []
+                        let none: []Val = []
+                        let noSubs: []SubRes = []
+                        let env = Env{cols: &noCols, row: &none, aggs: &none, params: params, subs: &noSubs, cur: &none, seq: None}
+                        let v = try eval(&x, &env)
+                        let b = match v { Val.Text(t) { parseBool(&t) } Val.Bool(y) { Some(y) } else { None } }
+                        match b {
+                            Some(y) { on = y }
+                            None { return Err(e("22023", "parameter \"lexdb_range_delete\" requires a Boolean value")) }
+                        }
+                    }
+                    None {}
+                }
+                s.rdel = on
             } else if stmt.table != "" {
                 var v = -1                          // DEFAULT, RESET
                 match stmt.limit {
@@ -19345,7 +19715,7 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
                 s.failed = false
                 s.fresh = true
                 s.saves = []
-                s.saved = [Limits{rounds: s.maxRecursion, steps: s.maxSteps, mem: s.maxMem, deadline: s.timeoutMs, batch: s.batch, rules: s.rules, auto: s.auto}]
+                s.saved = [Limits{rounds: s.maxRecursion, steps: s.maxSteps, mem: s.maxMem, deadline: s.timeoutMs, batch: s.batch, rules: s.rules, auto: s.auto, rdel: s.rdel}]
                 var p: []str = []
                 for n in s.path { append(mut &p, n) }
                 s.savedPath = [p]

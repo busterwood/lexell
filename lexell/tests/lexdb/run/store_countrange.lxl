@@ -1,0 +1,545 @@
+// lexdb_store: countRange and noteRange (design/lexdb-bulkdelete.md 2.2,
+// stage 2). Trees b (3,000 random keys of lengths 66, 86 and 106, about
+// 300 leaves under three levels) and c (a second tree, to flush the cache),
+// a 256 KB cache, and the keys sorted as the model.
+// - Shapes: empty, one key, one leaf, a part of one, across levels, from
+//   the start, to the end, the whole tree, bounds at the first keys of
+//   leaves (about the separators), short bounds, lo after hi, outside the
+//   keys, a tree with no rows or no tree, and 60 random ranges.
+// - Cold (each in a store just opened), mixed (one store, its cache part
+//   full) and warm (everything in memory): the count equals the model's
+//   and a scan's; a count loads nothing, evicts nothing and leaves the
+//   cache's nodes (which, whether referenced, dirty, version) as they were.
+// - During a count: a commit and a checkpoint under the slots it is to
+//   read (it counts again, with the new row), a flush of the cache (the
+//   parents are evicted, the slots freed), a change at every try (it gives
+//   up: -1).
+// - A snapshot counts its own view, while commits delete, insert into and
+//   change the range, checkpoints run and the cache is flushed.
+// - noteRange: a range delete whose range was noted fails to commit when a
+//   commit of an insert, an update or a delete in the range came first, and
+//   commits when that was below lo, at hi or in another tree; then the
+//   statement run again counts the new row.
+// expect: cold: 14 ranges, counts ok, cache unchanged
+// expect: mixed: 72 ranges, counts ok, scans ok, cache unchanged
+// expect: warm: 72 ranges, counts ok, scans ok, cache unchanged, no loads
+// expect: empty trees: ok
+// expect: checkpoint during: count ok, tries 2
+// expect: insert during: count ok, tries 2
+// expect: eviction during: count ok, tries 2
+// expect: changes at every try: -1, then count ok
+// expect: snapshots: before ok, after ok, fresh ok, cache unchanged, audit ok
+// expect: noted: insert fails, update fails, delete fails, below lo ok, at hi ok, past hi ok, other tree ok, unnoted commits and loses the row, rerun counts 1 more, rows ok
+// timeout: 120
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_base"
+import "../../../cmd/lexdb_page"
+import "strings"
+import "collections"
+
+fn opts(cache: int): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: cache, segBytes: 16 * 4096, ckptBytes: 1024 * 1024, snapNodes: 1000}
+}
+
+const ROWS = 3000
+
+fn key(id: int): str { return "k" + strings.padLeft(&(id.toStr()), 5, '0') + strings.repeat("x", 60 + 20 * (id % 3)) }
+
+fn value(n: int): str { return "v" + n.toStr() + ":" + strings.repeat("r", 300) }
+
+type World = record { keys: []str; a: int; b: int; c: int }
+
+fn sorted(ks: &[]str): []str {
+    var out: []str = []
+    for k in ks { append(mut &out, k) }
+    collections.sortBy(mut &out, fn(x: &str, y: &str): int { return x.cmp(y) })
+    return out
+}
+
+fn audit(fs: lexdb_disk.Fs): str {
+    return match lexdb_store.audit(fs) { Ok(s) { s } Err(e) { "audit: " + e.toStr() } }
+}
+
+fn clean(au: &str): bool { return strings.contains(au, &"lost 0, twice 0") }
+
+// The keys of b, as made.
+fn world(): World {
+    var w = World{keys: [], a: -1, b: -1, c: -1}
+    var seen: Map[str, int] = newMap()
+    var rng = lexdb_base.rng(7)
+    while len(w.keys) < ROWS {
+        let k = key(rng.below(60000))
+        if seen.has(&k) { continue }
+        seen.put(k, 1)
+        append(mut &w.keys, k)
+    }
+    return w
+}
+
+fn fill(st: &lexdb_store.Store, tree: int, keys: &[]str, tag: str) {
+    var i = 0
+    while i < len(keys) {
+        var t = lexdb_store.begin()
+        var j = i
+        while j < i + 100 && j < len(keys) {
+            t.put(tree, &keys[j], &(tag + j.toStr() + strings.repeat("r", 300))).unwrap()
+            j += 1
+        }
+        st.commit(t).unwrap()
+        i = j
+    }
+}
+
+// Trees a, b and c made and checkpointed.
+fn build(fs: lexdb_disk.Fs, w: mut &World) {
+    lexdb_store.run(fs, opts(256 * 1024), fn(st: lexdb_store.Store): int {
+        var t = lexdb_store.begin()
+        w.a = st.createTree(mut &t)
+        w.b = st.createTree(mut &t)
+        w.c = st.createTree(mut &t)
+        t.put(w.a, "a", "small").unwrap()
+        st.commit(t).unwrap()
+        fill(&st, w.b, &w.keys, "v")
+        var other: []str = []
+        for i in 0..2500 { append(mut &other, key(100000 + i)) }
+        fill(&st, w.c, &other, "c")
+        st.checkpointAll().unwrap()
+        return 0
+    }).unwrap()
+}
+
+fn inRange(k: &str, lo: &str, hi: &str): bool { return k >= lo && (len(hi) == 0 || k < hi) }
+
+fn modelCount(all: &[]str, lo: &str, hi: &str): int {
+    var n = 0
+    for k in all { if inRange(&k, lo, hi) { n += 1 } }
+    return n
+}
+
+fn scanCount(st: &lexdb_store.Store, tree: int, lo: &str, hi: &str): int {
+    var t = lexdb_store.begin()
+    var n = 0
+    st.scan(mut &t, tree, lo, hi, fn(e: &lexdb_store.Entry): bool {
+        n += 1
+        return true
+    }).unwrap()
+    st.abort(t)
+    return n
+}
+
+fn leafStarts(st: &lexdb_store.Store, tree: int): []str {
+    var t = lexdb_store.begin()
+    var out: []str = []
+    let done = st.scanLeaves(mut &t, tree, "", "", fn(leaf: &lexdb_page.Node, a: int, b: int): bool {
+        if b > a { append(mut &out, lexdb_base.own(&leaf.key(a))) }
+        return true
+    }).unwrap()
+    st.abort(t)
+    return out
+}
+
+type Range = value record { lo: str; hi: str }
+
+// The ranges of the shapes in the header.
+fn shapes(all: &[]str, starts: &[]str): []Range {
+    let n = len(all)
+    let m = len(starts)
+    var out: []Range = []
+    out = [Range{lo: "", hi: ""}, Range{lo: "", hi: all[n / 5]}, Range{lo: all[n * 4 / 5], hi: ""}, Range{lo: all[n / 2], hi: all[n / 2]},
+           Range{lo: all[7], hi: all[7] + "\x00"}, Range{lo: all[9], hi: all[3]}, Range{lo: "z", hi: ""}, Range{lo: "", hi: "a"},
+           Range{lo: "", hi: all[0]}, Range{lo: all[n - 1], hi: ""}, Range{lo: all[n - 1], hi: all[n - 1] + "\x00"}, Range{lo: all[0], hi: all[n - 1]},
+           // exactly one leaf, and a part of one
+           Range{lo: starts[3], hi: starts[4]}, Range{lo: all[n / 3 + 2], hi: all[n / 3 + 5]},
+           // across levels
+           Range{lo: all[n / 10], hi: all[n * 7 / 10]}, Range{lo: all[n / 3], hi: all[n / 3 + n / 2]},
+           // bounds at leaf starts, and next to them
+           Range{lo: starts[10], hi: starts[m - 12]}, Range{lo: starts[1], hi: starts[2]}, Range{lo: starts[m - 2], hi: starts[m - 1]},
+           Range{lo: starts[m - 1], hi: ""}, Range{lo: starts[5] + "\x00", hi: starts[9]}, Range{lo: starts[5], hi: starts[9] + "\x00"},
+           Range{lo: all[0], hi: starts[1]}, Range{lo: starts[m / 2], hi: starts[m / 2]},
+           // short bounds
+           Range{lo: "k02000", hi: "k02400"}, Range{lo: "k", hi: "k3"}, Range{lo: "k5", hi: ""}]
+    var rng = lexdb_base.rng(31)
+    while len(out) < 72 {
+        let a = rng.below(n)
+        let b = rng.below(n)
+        let pick = rng.below(4)
+        var lo = if a < b { all[a] } else { all[b] }
+        var hi = if a < b { all[b] } else { all[a] }
+        if pick == 1 { lo = starts[rng.below(m)] }
+        if pick == 2 { hi = starts[rng.below(m)] }
+        if pick == 3 { hi = "" }
+        append(mut &out, Range{lo: lo, hi: hi})
+    }
+    return out
+}
+
+fn countOf(st: &lexdb_store.Store, tree: int, r: &Range): int {
+    var t = lexdb_store.begin()
+    let n = st.countRange(mut &t, tree, &r.lo, &r.hi).unwrap()
+    st.abort(t)
+    return n
+}
+
+// Every range: the count against the model (and a scan's, when scans: they
+// load, so the cache changes after), the cache as it was after the count.
+fn check(st: &lexdb_store.Store, w: &World, all: &[]str, rs: &[]Range, scans: bool, quiet: bool): str {
+    var bad = ""
+    for i in 0..len(rs) {
+        let before = st.cacheState()
+        let s0 = st.stats()
+        let n = countOf(st, w.b, &rs[i])
+        let s1 = st.stats()
+        let want = modelCount(all, &rs[i].lo, &rs[i].hi)
+        if n != want && bad == "" { bad = "range " + i.toStr() + ": counted " + n.toStr() + ", want " + want.toStr() }
+        if (st.cacheState() != before || s1.loads != s0.loads || s1.evictions != s0.evictions || s1.loaded != s0.loaded) && bad == "" { bad = "range " + i.toStr() + ": the cache changed" }
+        if scans {
+            let sc = scanCount(st, w.b, &rs[i].lo, &rs[i].hi)
+            if sc != want && bad == "" { bad = "range " + i.toStr() + ": scan counted " + sc.toStr() + ", want " + want.toStr() }
+        }
+    }
+    return bad
+}
+
+fn mode(): str {
+    var w = world()
+    let fs = lexdb_disk.sim(500)
+    build(fs, mut &w)
+    let all = sorted(&w.keys)
+    var starts: []str = []
+    lexdb_store.run(fs, opts(256 * 1024), fn(st: lexdb_store.Store): int {
+        starts = leafStarts(&st, w.b)
+        return 0
+    }).unwrap()
+    let rs = shapes(&all, &starts)
+    // cold: the first of each shape in a store just opened
+    var cold = ""
+    var coldN = 0
+    for i in 0..14 {
+        lexdb_store.run(fs, opts(256 * 1024), fn(st: lexdb_store.Store): int {
+            let one = [rs[i * 5 % len(rs)]]
+            let r = check(&st, &w, &all, &one, false, true)
+            if r != "" && cold == "" { cold = r }
+            return 0
+        }).unwrap()
+        coldN += 1
+    }
+    println("cold: " + coldN.toStr() + " ranges, counts " + (if cold == "" { "ok" } else { cold }) + ", cache " + (if cold == "" { "unchanged" } else { "?" }))
+    var mixed = ""
+    lexdb_store.run(fs, opts(256 * 1024), fn(st: lexdb_store.Store): int {
+        mixed = check(&st, &w, &all, &rs, true, true)
+        return 0
+    }).unwrap()
+    println("mixed: " + len(rs).toStr() + " ranges, " + (if mixed == "" { "counts ok, scans ok, cache unchanged" } else { mixed }))
+    var warm = ""
+    var loadsOk = true
+    lexdb_store.run(fs, opts(256 * 1024 * 1024), fn(st: lexdb_store.Store): int {
+        scanCount(&st, w.b, "", "")
+        let l0 = st.stats().loads
+        warm = check(&st, &w, &all, &rs, true, true)
+        loadsOk = st.stats().loads == l0
+        return 0
+    }).unwrap()
+    println("warm: " + len(rs).toStr() + " ranges, " + (if warm == "" { "counts ok, scans ok, cache unchanged" } else { warm }) + (if loadsOk { ", no loads" } else { ", loads" }))
+    return ""
+}
+
+fn emptyTrees(): str {
+    let fs = lexdb_disk.sim(501)
+    var bad = ""
+    lexdb_store.run(fs, opts(256 * 1024), fn(st: lexdb_store.Store): int {
+        var t = lexdb_store.begin()
+        let e = st.createTree(mut &t)
+        let f = st.createTree(mut &t)
+        t.put(f, "x", "1").unwrap()
+        st.commit(t).unwrap()
+        var rs = [Range{lo: "", hi: ""}, Range{lo: "a", hi: "b"}, Range{lo: "", hi: "a"}]
+        for r in rs {
+            if countOf(&st, e, &r) != 0 { bad = "an empty tree: not 0" }
+            if countOf(&st, e + 50, &r) != 0 { bad = "no tree: not 0" }
+        }
+        if countOf(&st, f, &Range{lo: "", hi: ""}) != 1 { bad = "one row: not 1" }
+        if countOf(&st, f, &Range{lo: "x", hi: "y"}) != 1 { bad = "one row from x: not 1" }
+        if countOf(&st, f, &Range{lo: "x" + "\x00", hi: ""}) != 0 { bad = "one row after x: not 0" }
+        if countOf(&st, f, &Range{lo: "", hi: "x"}) != 0 { bad = "one row before x: not 0" }
+        return 0
+    }).unwrap()
+    return "empty trees: " + (if bad == "" { "ok" } else { bad })
+}
+
+// What the hook does during a count (lexdb_store.setCountHook): mode 0, at
+// the first try, puts the key arg (a row changed, or one more), commits and
+// checkpoints, so the leaf it is in is loaded and rewritten; mode 1 flushes
+// the cache by a scan of tree c at the first try; mode 2 changes a row of b
+// further on at every try.
+fn hook(st: lexdb_store.Store, mode: int, arg: str, k: int) {
+    var ids = st.trees()
+    collections.sortBy(mut &ids, fn(x: &int, y: &int): int { return x.cmp(y) })
+    if mode == 0 {
+        if k != 0 { return }
+        var t = lexdb_store.begin()
+        t.put(ids[1], &arg, "changed").unwrap()
+        st.commit(t).unwrap()
+        st.checkpoint().unwrap()
+        return
+    }
+    if mode == 2 {
+        // a row further on each try
+        var t = lexdb_store.begin()
+        var at = 0
+        var target = ""
+        st.scan(mut &t, ids[1], "", "", fn(e: &lexdb_store.Entry): bool {
+            at += 1
+            if at == 500 + 300 * k {
+                target = lexdb_base.own(&e.key)
+                return false
+            }
+            return true
+        }).unwrap()
+        st.abort(t)
+        var w = lexdb_store.begin()
+        w.put(ids[1], &target, "changed").unwrap()
+        st.commit(w).unwrap()
+        st.checkpoint().unwrap()
+        return
+    }
+    if k != 0 { return }
+    scanCount(&st, ids[2], "", "")
+}
+
+// A count of the range with the hook: what it gives and the hook's calls.
+type Counted = value record { n: int; tries: int }
+
+fn counted(st: &lexdb_store.Store, tree: int, r: &Range, mode: int, arg: &str): Counted {
+    st.setCountHook(hook, mode, arg)
+    let n = countOf(st, tree, r)
+    let tries = st.countHookCalls()
+    st.clearCountHook()
+    return Counted{n: n, tries: tries}
+}
+
+// A row of b changed (kind 0) or added (1) and a checkpoint, or the cache
+// flushed (2), while a count reads: the count starts again.
+fn during(name: str, kind: int): str {
+    var w = world()
+    let fs = lexdb_disk.sim(510 + kind)
+    build(fs, mut &w)
+    let all = sorted(&w.keys)
+    let n = len(all)
+    let r = Range{lo: all[n / 5], hi: all[n * 4 / 5]}
+    let want = modelCount(&all, &r.lo, &r.hi) + (if kind == 1 { 1 } else { 0 })
+    var got = Counted{n: -9, tries: 0}
+    var again = -9
+    lexdb_store.run(fs, opts(256 * 1024), fn(st: lexdb_store.Store): int {
+        if kind == 2 { scanCount(&st, w.b, "", "") }
+        if kind == 0 { got = counted(&st, w.b, &r, 0, &all[n / 2]) }
+        else if kind == 1 { got = counted(&st, w.b, &r, 0, &(all[n / 2] + "!")) }
+        else { got = counted(&st, w.b, &r, 1, "") }
+        again = countOf(&st, w.b, &r)
+        return 0
+    }).unwrap()
+    var bad = ""
+    if got.n != want { bad = "counted " + got.n.toStr() + ", want " + want.toStr() }
+    if again != want { bad = "then counted " + again.toStr() }
+    return name + ": count " + (if bad == "" { "ok" } else { bad }) + ", tries " + got.tries.toStr()
+}
+
+// A change under the slots at every try: the count gives up, -1; the
+// caller counts rows (a scan's count is right).
+fn everyTry(): str {
+    var w = world()
+    let fs = lexdb_disk.sim(520)
+    build(fs, mut &w)
+    let all = sorted(&w.keys)
+    let n = len(all)
+    let r = Range{lo: all[n / 10], hi: all[n * 9 / 10]}
+    var got = Counted{n: -9, tries: 0}
+    var after = -9
+    lexdb_store.run(fs, opts(256 * 1024), fn(st: lexdb_store.Store): int {
+        got = counted(&st, w.b, &r, 2, "")
+        after = countOf(&st, w.b, &r)
+        return 0
+    }).unwrap()
+    let want = modelCount(&all, &r.lo, &r.hi)
+    return "changes at every try: " + got.n.toStr() + (if got.tries == 4 { "" } else { " in " + got.tries.toStr() + " tries" }) + ", then count " + (if after == want { "ok" } else { after.toStr() })
+}
+
+// A snapshot counts its own view.
+fn snapshots(): str {
+    var w = world()
+    let fs = lexdb_disk.sim(530)
+    build(fs, mut &w)
+    let all = sorted(&w.keys)
+    let n = len(all)
+    let lo = all[n / 10]
+    let hi = all[n * 8 / 10]
+    let r = Range{lo: lo, hi: hi}
+    let before = modelCount(&all, &lo, &hi)
+    var bad = ""
+    var after = 0
+    var cacheSame = true
+    lexdb_store.run(fs, opts(256 * 1024), fn(st: lexdb_store.Store): int {
+        var old = st.beginSnapshot().unwrap()
+        // read in part first (some nodes in memory, some not)
+        st.scan(mut &old, w.b, &all[n / 3], &all[n / 3 + 200], fn(e: &lexdb_store.Entry): bool { return true }).unwrap()
+        let m0 = st.cacheState()
+        let c0 = st.countRange(mut &old, w.b, &lo, &hi).unwrap()
+        if c0 != before { bad = "before any commit: " + c0.toStr() }
+        // commits: a range deleted in the middle of it, then 600 rows inserted into
+        // what is left (new leaves, newer than the snapshot), rows changed
+        var t = lexdb_store.begin()
+        t.delRange(w.b, &all[n / 4], &all[n / 2])
+        st.commit(t).unwrap()
+        var added: []str = []
+        for i in 0..600 { append(mut &added, all[n * 6 / 10 + i % 100] + strings.padLeft(&(i.toStr()), 4, '0')) }
+        fill(&st, w.b, &added, "n")
+        var t2 = lexdb_store.begin()
+        for i in 0..50 { t2.put(w.b, &all[n / 8 + i], "changed").unwrap() }
+        st.commit(t2).unwrap()
+        st.checkpoint().unwrap()
+        scanCount(&st, w.c, "", "")
+        var fresh = st.beginSnapshot().unwrap()
+        var m1 = st.cacheState()
+        let l0 = st.stats().loads
+        let c1 = st.countRange(mut &old, w.b, &lo, &hi).unwrap()
+        if c1 != before && bad == "" { bad = "after the commits: " + c1.toStr() + ", want " + before.toStr() }
+        let c2 = st.countRange(mut &old, w.b, &all[n / 3], &all[n * 2 / 3]).unwrap()
+        let w2 = modelCount(&all, &all[n / 3], &all[n * 2 / 3])
+        if c2 != w2 && bad == "" { bad = "a part: " + c2.toStr() + ", want " + w2.toStr() }
+        cacheSame = st.cacheState() == m1 && st.stats().loads == l0
+        // the fresh snapshot and the live tree see the new state
+        let live = countOf(&st, w.b, &Range{lo: lo, hi: hi})
+        let f1 = st.countRange(mut &fresh, w.b, &lo, &hi).unwrap()
+        let wantNew = before - (n / 2 - n / 4) + 600
+        after = live
+        if live != wantNew && bad == "" { bad = "live: " + live.toStr() + ", want " + wantNew.toStr() }
+        if f1 != wantNew && bad == "" { bad = "fresh: " + f1.toStr() + ", want " + wantNew.toStr() }
+        // a hook: a checkpoint and a flush between its finding and its reading
+        let hooked = counted(&st, w.b, &r, 1, "")
+        let c3 = st.countRange(mut &old, w.b, &lo, &hi).unwrap()
+        if c3 != before && bad == "" { bad = "the snapshot after a flush: " + c3.toStr() }
+        st.releaseSnapshot(mut &old)
+        st.releaseSnapshot(mut &fresh)
+        st.checkpointAll().unwrap()
+        return 0
+    }).unwrap()
+    let au = audit(fs)
+    return "snapshots: before " + (if bad == "" { "ok, after ok, fresh ok" } else { bad }) + ", cache " + (if cacheSame { "unchanged" } else { "changed" }) + ", audit " + (if clean(&au) { "ok" } else { au })
+}
+
+fn conflicted(r: &Result[Unit, lexdb_base.DbErr]): bool {
+    return match r {
+        Ok(_) { false }
+        Err(e) { e.state == lexdb_base.S_CONFLICT }
+    }
+}
+
+// A write of another transaction: put (op 0) or delete (op 1) of key.
+type Op = value record { op: int; tree: int; key: str }
+
+// What a transaction that (note) noted [lo, hi) of b, counted it and
+// deleted it finds when ops committed first: whether its commit fails. The
+// model (b's keys) follows what committed.
+fn raced(st: &lexdb_store.Store, w: &World, model: mut &Map[str, int], lo: &str, hi: &str, note: bool, ops: &[]Op): bool {
+    var t1 = lexdb_store.begin()
+    if note { st.noteRange(mut &t1, w.b, lo, hi) }
+    let c = st.countRange(mut &t1, w.b, lo, hi).unwrap()
+    t1.delRange(w.b, lo, hi)
+    var t2 = lexdb_store.begin()
+    for o in ops {
+        if o.op == 0 { t2.put(o.tree, &o.key, "other").unwrap() } else { t2.del(o.tree, &o.key) }
+        if o.tree == w.b {
+            if o.op == 0 { model.put(o.key, 1) } else { let x = model.remove(&o.key) }
+        }
+    }
+    st.commit(t2).unwrap()
+    let failed = conflicted(&st.commit(t1))
+    if !failed {
+        for k in sorted(&modelKeys(model)) { if inRange(&k, lo, hi) { let x = model.remove(&k) } }
+    }
+    return failed
+}
+
+fn modelKeys(m: &Map[str, int]): []str {
+    var ks: []str = []
+    for i in 0..m.size() { append(mut &ks, m.keyAt(i)) }
+    return ks
+}
+
+fn noted(): str {
+    var w = world()
+    let fs = lexdb_disk.sim(540)
+    build(fs, mut &w)
+    let all = sorted(&w.keys)
+    let n = len(all)
+    var model: Map[str, int] = newMap()
+    for k in all { model.put(k, 1) }
+    var out = "noted:"
+    var rerun = -1
+    var wantRerun = -1
+    var finalCount = -1
+    var cases: []Op = []
+    lexdb_store.run(fs, opts(256 * 1024), fn(st: lexdb_store.Store): int {
+        // the marks: one, and none for an empty range
+        var probe = lexdb_store.begin()
+        st.noteRange(mut &probe, w.b, &all[n / 4], &all[n / 2])
+        if probe.readCount() != 1 { out = out + " (marks " + probe.readCount().toStr() + ")" }
+        st.noteRange(mut &probe, w.b, &all[n / 2], &all[n / 2])
+        if probe.readCount() != 1 { out = out + " (an empty range noted)" }
+        st.abort(probe)
+        let lo = all[n / 4]
+        let hi = all[n / 2]
+        let mid = all[n / 3]
+        // inside [lo, hi): an insert, then (other ranges) an update and a delete
+        out = out + " insert " + (if raced(&st, &w, mut &model, &lo, &hi, true, &[Op{op: 0, tree: w.b, key: mid + "!"}]) { "fails" } else { "commits" })
+        out = out + ", update " + (if raced(&st, &w, mut &model, &all[n / 2 + 1], &all[n * 3 / 4], true, &[Op{op: 0, tree: w.b, key: all[n / 2 + 10]}]) { "fails" } else { "commits" })
+        out = out + ", delete " + (if raced(&st, &w, mut &model, &all[n * 3 / 4 + 1], &all[n * 9 / 10], true, &[Op{op: 1, tree: w.b, key: all[n * 3 / 4 + 7]}]) { "fails" } else { "commits" })
+        // outside: below lo, at hi, past hi, another tree
+        out = out + ", below lo " + (if raced(&st, &w, mut &model, &all[n / 10], &all[n / 10 + 100], true, &[Op{op: 0, tree: w.b, key: all[n / 10 - 1] + "!"}]) { "fails" } else { "ok" })
+        out = out + ", at hi " + (if raced(&st, &w, mut &model, &all[n / 10 + 200], &all[n / 10 + 300], true, &[Op{op: 0, tree: w.b, key: all[n / 10 + 300]}]) { "fails" } else { "ok" })
+        out = out + ", past hi " + (if raced(&st, &w, mut &model, &all[n / 10 + 400], &all[n / 10 + 500], true, &[Op{op: 1, tree: w.b, key: all[n / 10 + 501]}]) { "fails" } else { "ok" })
+        out = out + ", other tree " + (if raced(&st, &w, mut &model, &all[n / 10 + 600], &all[n / 10 + 700], true, &[Op{op: 0, tree: w.c, key: all[n / 10 + 650]}]) { "fails" } else { "ok" })
+        // not noted: the insert commits first and the range delete removes it unseen
+        let key8 = all[n * 6 / 10 + 3] + "!"
+        let lost = !raced(&st, &w, mut &model, &all[n * 6 / 10], &all[n * 6 / 10 + 100], false, &[Op{op: 0, tree: w.b, key: key8}])
+        var t = lexdb_store.begin()
+        let left = st.get(mut &t, w.b, &key8).unwrap()
+        st.abort(t)
+        out = out + ", unnoted " + (if lost && left.isNone() { "commits and loses the row" } else { "?" })
+        // the first statement run again: the insert (in the model now) is counted and removed
+        wantRerun = modelCount(&modelKeys(&model), &lo, &hi)
+        var t3 = lexdb_store.begin()
+        st.noteRange(mut &t3, w.b, &lo, &hi)
+        rerun = st.countRange(mut &t3, w.b, &lo, &hi).unwrap()
+        t3.delRange(w.b, &lo, &hi)
+        st.commit(t3).unwrap()
+        for k in modelKeys(&model) { if inRange(&k, &lo, &hi) { let x = model.remove(&k) } }
+        out = out + ", rerun counts " + (if rerun == wantRerun { "1 more" } else { rerun.toStr() + ", want " + wantRerun.toStr() })
+        finalCount = scanCount(&st, w.b, "", "")
+        return 0
+    }).unwrap()
+    var rows = "ok"
+    if finalCount != model.size() { rows = "b has " + finalCount.toStr() + " rows, want " + model.size().toStr() }
+    var bad = ""
+    lexdb_store.run(fs, opts(256 * 1024), fn(st: lexdb_store.Store): int {
+        for k in modelKeys(&model) {
+            var t = lexdb_store.begin()
+            if st.get(mut &t, w.b, &k).unwrap().isNone() { bad = "a row is gone" }
+            st.abort(t)
+        }
+        return 0
+    }).unwrap()
+    if bad != "" { rows = bad }
+    return out + ", rows " + rows
+}
+
+fn main() {
+    mode()
+    println(emptyTrees())
+    println(during("checkpoint during", 0))
+    println(during("insert during", 1))
+    println(during("eviction during", 2))
+    println(everyTry())
+    println(snapshots())
+    println(noted())
+}

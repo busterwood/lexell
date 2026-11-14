@@ -1,0 +1,146 @@
+// lexdb over TDS: T-SQL's DELETE of a primary key range as a range delete
+// (design/lexdb-bulkdelete.md 2.1, stage 4): the same batches run with
+// SET lexdb_range_delete on and off must give the same row counts and rows
+// (the second line says so); lines end with whether the DELETE took the
+// range path (lexdb_exec.rangeDeletes). Taken: DELETE FROM and DELETE
+// alone, BETWEEN, a variable, a date function, no WHERE, an empty range,
+// @@ROWCOUNT after. Not: TOP, OUTPUT, a residual condition, inside BEGIN
+// TRAN (SQL Server's statements there run under a savepoint, and the
+// transaction's later reads must see the rows gone). A TRY block is not a
+// transaction: its DELETE takes the path.
+// expect: range path on: (999) took the range path
+// expect: range path on: (101) took the range path
+// expect: range path on: (50) / : 50 took the range path
+// expect: range path on: (1) / (50) / : 50 took the range path
+// expect: range path on: (0) took the range path
+// expect: range path on: (10) fell back
+// expect: range path on: id: 2000;2001;2002 fell back
+// expect: range path on: (97) fell back
+// expect: range path on: (1390) / : 1390 / : 3300 / : 4690 fell back
+// expect: range path on: (1090) took the range path
+// expect: range path on: (3000) took the range path
+// expect: range path on: (3600) took the range path
+// expect: range path on: : 0 fell back
+// expect: range path on: (0) took the range path
+// expect: same rows and counts with the switch off: true
+import "os"
+import "strings"
+import "task"
+import "net"
+import "sqlserver"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_wire"
+import "../../../cmd/lexdb_tds"
+
+const BATCHES: []str = [
+    "DELETE FROM t WHERE id < 1000",
+    "DELETE t WHERE id BETWEEN 3000 AND 3100",
+    "DELETE FROM t WHERE id >= 5900 AND id < 5950; SELECT @@ROWCOUNT",
+    "DECLARE @n int = 5950; DELETE FROM t WHERE id > @n; SELECT @@ROWCOUNT",
+    "DELETE FROM t WHERE id < 0",
+    "DELETE TOP (10) FROM t WHERE id < 2000",
+    "DELETE FROM t OUTPUT deleted.id WHERE id >= 2000 AND id < 2003",
+    "DELETE FROM t WHERE id >= 2003 AND id < 2100 AND v = 'x'",
+    "BEGIN TRAN; DELETE FROM t WHERE id < 2500; SELECT @@ROWCOUNT; SELECT COUNT(*) FROM t; ROLLBACK; SELECT COUNT(*) FROM t",
+    "BEGIN TRY DELETE FROM t WHERE id < 2200; END TRY BEGIN CATCH SELECT 1; END CATCH",
+    "DELETE FROM d WHERE d < CAST(DATEADD(day, -10, GETDATE()) AS date)",
+    "DELETE FROM t WHERE id >= 2200",
+    "SELECT COUNT(*) FROM t",
+    "DELETE FROM t"
+]
+
+fn rows(r: &sqlserver.Rows): str {
+    var names: []str = []
+    for j in 0..r.columnCount() { append(mut &names, r.columnName(j).unwrap()) }
+    var out: []str = []
+    for i in 0..r.rowCount() {
+        var cells: []str = []
+        for j in 0..r.columnCount() {
+            match r.value(i, j) {
+                Ok(v) { append(mut &cells, v.toStr()) }
+                Err(e) { append(mut &cells, "error " + e.code.toStr()) }
+            }
+        }
+        append(mut &out, strings.join(&cells, "|"))
+    }
+    return strings.join(&names, ",") + ": " + strings.join(&out, ";")
+}
+
+fn show(c: mut &sqlserver.Conn, q: &str): str {
+    match c.queryAll(&(q.toStr()), &[]) {
+        Ok(r) {
+            var parts: []str = []
+            var shown = 0
+            for n in r.counts {
+                if n.resultSet >= 0 {
+                    append(mut &parts, rows(&r.sets[n.resultSet]))
+                    shown += 1
+                } else {
+                    append(mut &parts, "(" + n.rows.toStr() + ")")
+                }
+            }
+            if shown == 0 { for s in r.sets { append(mut &parts, rows(&s)) } }
+            if len(parts) == 0 { return "ok" }
+            return strings.join(&parts, " / ")
+        }
+        Err(e) { return "error " + e.code.toStr() + " " + e.msg }
+    }
+}
+
+fn batches(dsn: &str, sw: &str, lines: mut &[]str, took: mut &[]bool) {
+    match sqlserver.connect(&(dsn.toStr())) {
+        Ok(c0) {
+            var c = c0
+            let s0 = show(mut &c, &("SET lexdb_range_delete = " + sw))
+            if s0 != "ok" { append(lines, "SET: " + s0) }
+            for q in BATCHES {
+                let before = lexdb_exec.rangeDeletes()
+                let r = show(mut &c, &q)
+                append(lines, r)
+                append(took, lexdb_exec.rangeDeletes() > before)
+            }
+            c.close()
+        }
+        Err(e) { append(lines, "connect: error " + e.code.toStr() + " " + e.msg) }
+    }
+}
+
+fn body(st: lexdb_store.Store, sw: str, lines: mut &[]str, took: mut &[]bool): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    var s = lexdb_exec.newSession(st)
+    for sql in ["create table t (id int primary key, v varchar(20) not null)",
+                "insert into t select i, 'x' from generate_series(1, 6000) i",
+                "create table d (d date primary key, pad varchar(200))",
+                "insert into d select date '2000-01-01' + i, repeat('x', 150) from generate_series(1, 3000) i"] {
+        let r = s.exec(&sql).unwrap()
+    }
+    s.close()
+    task.scope(fn(sc: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        lexdb_wire.configure(&st, &lexdb_wire.noAuth()).unwrap()
+        let f = sc.start(lexdb_tds.acceptLoop, lexdb_tds.AcceptArg{ln: ln, st: st})
+        batches(&("Server=127.0.0.1," + addr[10..len(addr)] + ";UID=sa;PWD=x;Encrypt=no"), &sw, lines, took)
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    var on: []str = []
+    var onTook: []bool = []
+    var off: []str = []
+    var offTook: []bool = []
+    let o = lexdb_store.Options{cacheBytes: 256 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}
+    lexdb_store.run(lexdb_disk.sim(41), o, fn(st: lexdb_store.Store): int { return body(st, "on", mut &on, mut &onTook) }).unwrap()
+    lexdb_store.run(lexdb_disk.sim(42), o, fn(st: lexdb_store.Store): int { return body(st, "off", mut &off, mut &offTook) }).unwrap()
+    for i in 0..len(on) {
+        println("range path on: " + on[i] + (if i < len(onTook) && onTook[i] { " took the range path" } else { " fell back" }))
+    }
+    var same = len(on) == len(off)
+    for i in 0..len(off) { if i < len(on) && on[i] != off[i] { same = false } }
+    for t in offTook { if t { same = false } }
+    println("same rows and counts with the switch off: " + same.toStr())
+}

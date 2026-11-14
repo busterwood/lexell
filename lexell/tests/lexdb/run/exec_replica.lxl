@@ -11,6 +11,11 @@
 // - writes are refused with 25006 (INSERT, UPDATE, CREATE TABLE, COPY
 //   FROM, DELETE, and nextval at its commit), and the
 //   session goes on;
+// - a range DELETE of the master's (one write, design/lexdb-bulkdelete.md)
+//   shows on the replica once applied: the rows in the range gone, its
+//   edges and a scan in both directions as on the master, a block that began
+//   before keeps its rows, and the same after a checkpoint the replica
+//   adopts;
 // - the replica's snapshots are let go: the master's pages held for them
 //   are free again once it closes, and the page file audits clean.
 // expect: queries 12, same on both 12
@@ -18,6 +23,8 @@
 // expect: block: 201 then 201 after the master's insert, 202 after COMMIT
 // expect: DDL: column w on the replica true, index used true
 // expect: refused: 25006 25006 25006 25006 25006 25006; then 202
+// expect: range delete: master DELETE 1901 by the range path true; replica before the poll 3000, after 1099; edges 1 0 0 1; scans 1099 1099 same as master true
+// expect: block: 1099 then 1099 after DELETE 200, 700 after COMMIT; after a checkpoint 700, same as master true
 // expect: audit ok true
 import "strings"
 import "../../../cmd/lexdb_store"
@@ -59,7 +66,9 @@ fn main() {
                      "insert into t select i, i * 7 % 100, i % 5, 'row ' || i from generate_series(1, 200) i",
                      "insert into u values (0, 'zero'), (1, 'one'), (2, 'two'), (3, 'three')",
                      "update t set s = '" + strings.repeat("x", 5000) + "' where id = 77",
-                     "create sequence q"]
+                     "create sequence q",
+                     "create table rd (id int primary key, s text)",
+                     "insert into rd select i, repeat('x', 100) from generate_series(1, 3000) i"]
         for q in setup {
             let r = all(mut &m, &q)
             if strings.startsWith(&r, "4") || strings.startsWith(&r, "0") || strings.startsWith(&r, "X") { append(mut &lines, "setup failed: " + r) }
@@ -117,6 +126,37 @@ fn main() {
             append(mut &refused, all(mut &r, &q))
         }
         append(mut &lines, "refused: " + strings.join(&refused, " ") + "; then " + all(mut &r, &"select count(*) from t"))
+        // a range DELETE on the master
+        let rb = lexdb_exec.rangeDeletes()
+        poll(&rep, &st)
+        let tag = all(mut &m, &"delete from rd where id between 500 and 2400")
+        let took = lexdb_exec.rangeDeletes() > rb
+        let rc0 = all(mut &r, &"select count(*) from rd")
+        poll(&rep, &st)
+        let rc1 = all(mut &r, &"select count(*) from rd")
+        let edges = all(mut &r, &"select count(*) from rd where id = 499") + " " + all(mut &r, &"select count(*) from rd where id = 500") + " " +
+                    all(mut &r, &"select count(*) from rd where id = 2400") + " " + all(mut &r, &"select count(*) from rd where id = 2401")
+        let fwd = all(mut &r, &"select count(*), sum(id), min(id), max(id) from rd")
+        let back = all(mut &r, &"select id from rd order by id desc limit 3") + "/" + all(mut &r, &"select id from rd where id < 2500 order by id desc limit 2")
+        let mfwd = all(mut &m, &"select count(*), sum(id), min(id), max(id) from rd")
+        let mback = all(mut &m, &"select id from rd order by id desc limit 3") + "/" + all(mut &m, &"select id from rd where id < 2500 order by id desc limit 2")
+        let scanned = all(mut &r, &"select count(*) from rd where id >= 0 and s like 'x%'")
+        append(mut &lines, "range delete: master " + tag + " by the range path " + took.toStr() + "; replica before the poll " + rc0 + ", after " + rc1 +
+               "; edges " + edges + "; scans " + rc1 + " " + scanned + " same as master " + (fwd == mfwd && back == mback).toStr())
+        // a block that began before another range delete keeps its rows
+        let bb = all(mut &r, &"begin")
+        let b1 = all(mut &r, &"select count(*) from rd")
+        let t2 = all(mut &m, &"delete from rd where id >= 2800 and id < 3000")
+        let t3 = all(mut &m, &"delete from rd where id < 200")
+        poll(&rep, &st)
+        let b2 = all(mut &r, &"select count(*) from rd")
+        let bc = all(mut &r, &"commit")
+        let b3 = all(mut &r, &"select count(*) from rd")
+        st.checkpoint().unwrap()
+        poll(&rep, &st)
+        let b4 = all(mut &r, &"select count(*), sum(id) from rd")
+        append(mut &lines, "block: " + b1 + " then " + b2 + " after " + t2 + ", " + b3 + " after COMMIT; after a checkpoint " + b3 + ", same as master " +
+               (b4 == all(mut &m, &"select count(*), sum(id) from rd")).toStr())
         r.close()
         m.close()
         rep.close()

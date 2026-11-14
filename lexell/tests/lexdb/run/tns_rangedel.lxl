@@ -1,0 +1,90 @@
+// lexdb over TNS: Oracle's DELETE of a primary key range. Oracle's sessions
+// are in a transaction until COMMIT, and the door begins a block for each
+// DML statement (lexdb_tns.runCursor), so a range delete (which is only for
+// a statement's own transaction: the count does not see a transaction's own
+// writes, nor would the block's later reads see the rows gone) never
+// applies: each DELETE below takes the row path, with the row counts
+// Oracle gives (verified against the row path with the switch off through
+// the PostgreSQL door in exec_rangedel). Each line: the statement's row
+// count, and whether it took the range path (lexdb_exec.rangeDeletes).
+// expect: DELETE ... WHERE id < 1000: 999 fell back
+// expect: DELETE t WHERE id BETWEEN: 101 fell back
+// expect: DELETE with a bind: 50 fell back
+// expect: DELETE with a residual: 100 fell back
+// expect: DELETE with TRUNC(SYSDATE): 3000 fell back
+// expect: DELETE empty range: 0 fell back
+// expect: left: 4750
+// expect: DELETE all in a transaction, rolled back: 4750 deleted, 4750 after
+// expect: DELETE FROM t: 4750 fell back
+import "task"
+import "net"
+import "strings"
+import "oracle"
+import "sqldialect"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_tns"
+
+fn cnt(c: mut &oracle.Conn, sql: &str): str {
+    match c.query(&(sql.toStr()), &[]) {
+        Ok(r) { return r.int(0, 0).unwrap().toStr() }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+fn x(c: mut &oracle.Conn, label: &str, sql: &str, args: &[sqldialect.Value]) {
+    let before = lexdb_exec.rangeDeletes()
+    match c.run(&(sql.toStr()), args) {
+        Ok(n) { println(label + ": " + n.toStr() + (if lexdb_exec.rangeDeletes() > before { " took the range path" } else { " fell back" })) }
+        Err(e) { println(label + ": error " + e.code.toStr() + " " + e.msg) }
+    }
+}
+
+fn client(port: &str) {
+    match oracle.connect(&("User Id=sa;Password=sa;Data Source=127.0.0.1:" + port + "/lexdb;")) {
+        Ok(c0) {
+            var c = c0
+            x(mut &c, "DELETE ... WHERE id < 1000", "DELETE FROM t WHERE id < 1000", &[])
+            x(mut &c, "DELETE t WHERE id BETWEEN", "DELETE t WHERE id BETWEEN 3000 AND 3100", &[])
+            x(mut &c, "DELETE with a bind", "DELETE FROM t WHERE id > :1", &[sqldialect.Value.Int(5950)])
+            x(mut &c, "DELETE with a residual", "DELETE FROM t WHERE id >= 2000 AND id < 2100 AND v = 'x'", &[])
+            x(mut &c, "DELETE with TRUNC(SYSDATE)", "DELETE FROM d WHERE d < TRUNC(SYSDATE) - 10", &[])
+            x(mut &c, "DELETE empty range", "DELETE FROM t WHERE id < 0", &[])
+            println("left: " + cnt(mut &c, &"select count(*) from t"))
+            var deleted = -1
+            let tr = c.transaction(fn(y: mut &oracle.Conn): Result[int, oracle.Error] {
+                deleted = try y.run("DELETE FROM t", &[])
+                return Err(sqldialect.inputError("undo"))
+            })
+            println("DELETE all in a transaction, rolled back: " + deleted.toStr() + " deleted, " + cnt(mut &c, &"select count(*) from t") + " after")
+            x(mut &c, "DELETE FROM t", "DELETE FROM t", &[])
+            c.logoff()
+        }
+        Err(e) { println("connect: error " + e.code.toStr() + " " + e.msg) }
+    }
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    var s = lexdb_exec.newSession(st)
+    for sql in ["create table t (id int primary key, v varchar(20) not null)",
+                "insert into t select i, 'x' from generate_series(1, 6000) i",
+                "create table d (d date primary key, pad varchar(200))",
+                "insert into d select date '2000-01-01' + i, repeat('x', 150) from generate_series(1, 3000) i"] {
+        let r = s.exec(&sql).unwrap()
+    }
+    s.close()
+    task.scope(fn(sc: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        let f = sc.start(lexdb_tns.acceptLoop, lexdb_tns.AcceptArg{ln: ln, st: st})
+        client(&addr[10..len(addr)])
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(43), lexdb_store.Options{cacheBytes: 256 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, body).unwrap()
+}

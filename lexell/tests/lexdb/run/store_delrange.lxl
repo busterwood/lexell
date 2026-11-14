@@ -1,0 +1,747 @@
+// lexdb_store: OP_DELRANGE, a range of keys removed as one write, the
+// subtrees wholly inside freed as a dropped tree's are (design/
+// lexdb-bulkdelete.md 2.3, stage 1). A tree b of 3,000 random keys of
+// three lengths (66, 86 and 106 bytes; every 40th value 20 KB, in the
+// companion tree, so that the companion has chunks under three key
+// lengths), a 256 KB cache (most covered subtrees are on disk when the
+// range is deleted: each step reopens the store), and a Map as the model.
+// - Ranges: empty, inside one leaf, across levels, from the start, to the
+//   end, the whole tree, bounds that are the first keys of leaves (about
+//   the separators), and bounds shorter than every key. Each: the range
+//   deleted (a checkpoint after it in some, the log's replay alone in the
+//   others; few nodes loaded), audit, b read back (scan, scanBack, get)
+//   against the model, the walk of the freed subtrees, audit again, b read
+//   again, the rows written again and the file not grown.
+// - A snapshot that began before a range delete reads every old row (get,
+//   scan, scanBack) while checkpoints run; a second one reads the new
+//   state; after both end and the walk is done, audit finds nothing lost.
+// - Conflicts: a transaction that read a key in the range fails, one that
+//   read just below lo or at hi commits (as does one that scanned up to lo
+//   or from hi on); a range to the end against a read of the tail; one that
+//   only wrote commits.
+// - In one transaction: put, range delete, put of the same key; a put and
+//   a range delete covering it (a large value of a new key length too); two
+//   overlapping ranges; a range undone by a savepoint.
+// - The log: an op this binary does not know is a corrupt record.
+// - 12 crashes at random points (the commit, the checkpoint, the walk),
+//   with commits to another tree going on: each recovers to the model.
+// expect: empty [mid, mid): removed 0, audit ok, loaded few, walked ok, read ok, refilled ok
+// expect: one leaf: removed 3, audit ok, loaded few, walked ok, read ok, refilled ok
+// expect: across levels: removed 1800, audit ok, loaded few, subtrees dropped, walked ok, read ok, refilled ok
+// expect: from the start: removed 600, audit ok, loaded few, walked ok, read ok, refilled ok
+// expect: to the end: removed 600, audit ok, loaded few, subtrees dropped, walked ok, read ok, refilled ok
+// expect: whole tree: removed 3000, audit ok, loaded few, subtrees dropped, walked ok, read ok, refilled ok
+// expect: leaf starts: removed 2847, audit ok, loaded few, subtrees dropped, walked ok, read ok, refilled ok
+// expect: from the first key to a leaf start: removed 5, audit ok, loaded few, walked ok, read ok, refilled ok
+// expect: short bounds: removed 27, audit ok, loaded few, subtrees dropped, walked ok, read ok, refilled ok
+// expect: snapshots: old rows ok, new rows ok, audit ok, walked ok
+// expect: conflicts: in range fails, below lo ok, at hi ok, last in range fails, tail read fails, just before it ok, scan up to lo ok, scan from hi ok, written only ok, rows ok
+// expect: in one transaction: ok
+// expect: unknown op: corrupt record
+// expect: crashes 12: ok 12, with the walk partway done some
+// timeout: 180
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_base"
+import "../../../cmd/lexdb_page"
+import "strings"
+import "collections"
+import "binary"
+
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: 256 * 1024, segBytes: 16 * 4096, ckptBytes: 1024 * 1024, snapNodes: 1000}
+}
+
+const ROWS = 3000
+
+// Key lengths 66, 86 and 106 by id: the companion holds chunks of three.
+fn key(id: int): str { return "k" + strings.padLeft(&(id.toStr()), 5, '0') + strings.repeat("x", 60 + 20 * (id % 3)) }
+
+fn value(n: int): str {
+    let tag = "v" + n.toStr() + ":"
+    if n % 40 == 0 { return tag + strings.repeat("abcdefghij", 2000) }
+    return tag + strings.repeat("r", 300)
+}
+
+// The tree b's rows as made (a model: key to value), in the order written.
+type World = record {
+    model: Map[str, str]
+    order: []str
+    a: int
+    b: int
+}
+
+fn world(): World {
+    var w = World{model: newMap(), order: [], a: -1, b: -1}
+    var rng = lexdb_base.rng(5)
+    while len(w.order) < ROWS {
+        let k = key(rng.below(60000))
+        if w.model.has(&k) { continue }
+        w.model.put(k, value(len(w.order)))
+        append(mut &w.order, k)
+    }
+    return w
+}
+
+fn sorted(m: &Map[str, str]): []str {
+    var ks: []str = []
+    for i in 0..m.size() { append(mut &ks, m.keyAt(i)) }
+    collections.sortBy(mut &ks, fn(x: &str, y: &str): int { return x.cmp(y) })
+    return ks
+}
+
+fn audit(fs: lexdb_disk.Fs): str {
+    return match lexdb_store.audit(fs) { Ok(s) { s } Err(e) { "audit: " + e.toStr() } }
+}
+
+fn clean(au: &str): bool { return strings.contains(au, &"lost 0, twice 0") }
+
+// Creates the trees and writes the rows of w (100 a commit, in the order
+// made), checkpointed.
+fn build(fs: lexdb_disk.Fs, w: mut &World) {
+    lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int {
+        var t = lexdb_store.begin()
+        w.a = st.createTree(mut &t)
+        w.b = st.createTree(mut &t)
+        t.put(w.a, "a", "small").unwrap()
+        st.commit(t).unwrap()
+        write(&st, w.b, &w.order, &w.model, 0, len(w.order))
+        st.checkpointAll().unwrap()
+        return 0
+    }).unwrap()
+}
+
+fn write(st: &lexdb_store.Store, tree: int, order: &[]str, model: &Map[str, str], from: int, to: int) {
+    var i = from
+    while i < to {
+        var t = lexdb_store.begin()
+        var j = i
+        while j < i + 100 && j < to {
+            t.put(tree, &order[j], &(model.get(&order[j]).unwrap())).unwrap()
+            j += 1
+        }
+        st.commit(t).unwrap()
+        i = j
+    }
+}
+
+// What a whole read of the tree (scan, scanBack, then get of every stride-th
+// key and of the keys in gone) finds different from the model: "" none.
+fn verify(st: &lexdb_store.Store, t: mut &lexdb_store.Txn, tree: int, model: &Map[str, str], gone: &[]str, stride: int): str {
+    let want = sorted(model)
+    var got: []lexdb_store.Entry = []
+    st.scan(t, tree, "", "", fn(e: &lexdb_store.Entry): bool {
+        append(mut &got, lexdb_store.Entry{key: lexdb_base.own(&e.key), val: lexdb_base.own(&e.val)})
+        return true
+    }).unwrap()
+    if len(got) != len(want) { return "scan gave " + len(got).toStr() + " rows, want " + len(want).toStr() }
+    for i in 0..len(want) {
+        if got[i].key != want[i] { return "scan: key " + i.toStr() + " differs" }
+        if got[i].val != model.get(&want[i]).unwrap() { return "scan: value of key " + i.toStr() + " differs" }
+    }
+    var back = 0
+    var bad = ""
+    st.scanBack(t, tree, "", "", fn(e: &lexdb_store.Entry): bool {
+        let i = len(want) - 1 - back
+        if i < 0 || e.key != want[i] || e.val != model.get(&want[i]).unwrap() {
+            bad = "scanBack: row " + back.toStr() + " differs"
+            return false
+        }
+        back += 1
+        return true
+    }).unwrap()
+    if bad != "" { return bad }
+    if back != len(want) { return "scanBack gave " + back.toStr() + " rows, want " + len(want).toStr() }
+    var i = 0
+    while i < len(want) {
+        match st.get(t, tree, &want[i]).unwrap() {
+            Some(v) { if v != model.get(&want[i]).unwrap() { return "get: value of key " + i.toStr() + " differs" } }
+            None { return "get: key " + i.toStr() + " missing" }
+        }
+        i += stride
+    }
+    for k in gone {
+        match st.get(t, tree, &k).unwrap() {
+            Some(v) { return "get: a removed key is there" }
+            None {}
+        }
+    }
+    return ""
+}
+
+// The companion tree holds chunks for exactly the large values of the
+// model: the keys it has chunks of are those, none left over by a range
+// delete, none lost.
+fn companionOf(st: &lexdb_store.Store, tree: int, model: &Map[str, str]): str {
+    var t = lexdb_store.begin()
+    var have: Map[str, int] = newMap()
+    st.scan(mut &t, tree + lexdb_store.OVF, "", "", fn(e: &lexdb_store.Entry): bool {
+        let n = (int(e.key[0]) << 8) | int(e.key[1])
+        have.put(lexdb_base.own(&e.key[2..2 + n]), 1)
+        return true
+    }).unwrap()
+    st.abort(t)
+    var want = 0
+    for i in 0..model.size() {
+        let k = model.keyAt(i)
+        if len(k) + len(model.get(&k).unwrap()) > 1350 {
+            want += 1
+            if !have.has(&k) { return "the chunks of a large value are gone" }
+        }
+    }
+    if have.size() != want { return "the companion has chunks of " + have.size().toStr() + " keys, want " + want.toStr() }
+    return ""
+}
+
+fn verifyLive(st: &lexdb_store.Store, tree: int, model: &Map[str, str], gone: &[]str): str {
+    var t = lexdb_store.begin()
+    let r = verify(st, mut &t, tree, model, gone, 11)
+    st.abort(t)
+    if r != "" { return r }
+    return companionOf(st, tree, model)
+}
+
+// The first key of each leaf of tree b, from the store.
+fn leafStarts(st: &lexdb_store.Store, tree: int): []str {
+    var t = lexdb_store.begin()
+    var out: []str = []
+    let done = st.scanLeaves(mut &t, tree, "", "", fn(leaf: &lexdb_page.Node, a: int, b: int): bool {
+        if b > a { append(mut &out, lexdb_base.own(&leaf.key(a))) }
+        return true
+    }).unwrap()
+    st.abort(t)
+    return out
+}
+
+fn indexOf(ks: &[]str, k: &str): int {
+    for i in 0..len(ks) { if ks[i] == k { return i } }
+    return -1
+}
+
+// Removes [lo, hi) from the model; the rows removed.
+fn removeRange(model: mut &Map[str, str], lo: &str, hi: &str): []lexdb_store.Entry {
+    var gone: []lexdb_store.Entry = []
+    for k in sorted(model) {
+        if k >= lo && (len(hi) == 0 || k < hi) {
+            append(mut &gone, lexdb_store.Entry{key: k, val: model.get(&k).unwrap()})
+            let x = model.remove(&k)
+        }
+    }
+    return gone
+}
+
+fn keysOf(rows: &[]lexdb_store.Entry): []str {
+    var ks: []str = []
+    for r in rows { append(mut &ks, r.key) }
+    return ks
+}
+
+// Checkpoints until the freed subtrees are walked; whether any was left to
+// walk after a checkpoint.
+fn walk(st: &lexdb_store.Store): bool {
+    var seen = false
+    var rounds = 0
+    st.setDropReads(2)
+    while st.stats().dropped > 0 && rounds < 1000 {
+        st.checkpoint().unwrap()
+        if st.stats().dropped > 0 { seen = true }
+        rounds += 1
+    }
+    return seen
+}
+
+// One range of tree b of a fresh world, step by step (the header).
+fn step(name: str, kind: int): str {
+    var w = world()
+    let fs = lexdb_disk.sim(100 + kind)
+    build(fs, mut &w)
+    let all = sorted(&w.model)
+    var starts: []str = []
+    var pages0 = 0
+    lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int {
+        starts = leafStarts(&st, w.b)
+        pages0 = st.stats().pages
+        return 0
+    }).unwrap()
+    let n = len(all)
+    var lo = ""
+    var hi = ""
+    if kind == 0 { lo = all[n / 2]; hi = all[n / 2] }
+    else if kind == 1 {
+        // inside the third leaf: keys 2 to 5 of it
+        let at = indexOf(&all, &starts[3])
+        lo = all[at + 2]
+        hi = all[at + 5]
+    }
+    else if kind == 2 { lo = all[n / 10]; hi = all[n / 10 + n * 6 / 10] }
+    else if kind == 3 { lo = ""; hi = all[n / 5] }
+    else if kind == 4 { lo = all[n * 4 / 5]; hi = "" }
+    else if kind == 5 { lo = ""; hi = "" }
+    else if kind == 6 { lo = starts[10]; hi = starts[len(starts) - 12] }
+    else if kind == 7 { lo = all[0]; hi = starts[1] }
+    else { lo = "k02000"; hi = "k02400" }
+    let rows = removeRange(mut &w.model, &lo, &hi)
+    let gone = keysOf(&rows)
+    var line = name + ": removed " + len(gone).toStr()
+    // the range deleted, beside commits to tree a; a checkpoint after it
+    // in the odd kinds, the log alone in the even
+    var dropped = false
+    var loads = 0
+    lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int {
+        st.setDropReads(2)
+        let l0 = st.stats().loads
+        var t = lexdb_store.begin()
+        t.delRange(w.b, &lo, &hi)
+        t.put(w.a, "a-after", "x").unwrap()
+        st.commit(t).unwrap()
+        loads = st.stats().loads - l0
+        if kind % 2 == 1 { st.checkpoint().unwrap() }
+        dropped = st.stats().dropped > 0
+        return 0
+    }).unwrap()
+    let au = audit(fs)
+    let au2 = if kind % 2 == 1 { au } else { "" }
+    var problem = ""
+    // read cold: a recovered store, or the checkpoint's
+    lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int {
+        problem = verifyLive(&st, w.b, &w.model, &gone)
+        if problem == "" {
+            var t = lexdb_store.begin()
+            match st.get(mut &t, w.a, &"a-after").unwrap() { Some(_) {} None { problem = "tree a lost its write" } }
+            st.abort(t)
+        }
+        return 0
+    }).unwrap()
+    if !clean(&au) || problem != "" { return line + ", audit " + au + ", read " + problem }
+    line = line + ", audit ok" + (if loads <= 40 { ", loaded few" } else { ", loaded " + loads.toStr() })
+    // the walk of what was freed
+    var walked = ""
+    var pages1 = 0
+    lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int {
+        if walk(&st) { dropped = true }
+        st.checkpointAll().unwrap()
+        if st.stats().dropped > 0 { walked = "walk not done" }
+        return 0
+    }).unwrap()
+    let au3 = audit(fs)
+    if walked != "" || !clean(&au3) || !strings.contains(&au3, &"dropped 0,") { return line + ", walked " + walked + " " + au3 }
+    line = line + (if dropped { ", subtrees dropped" } else { "" }) + ", walked ok"
+    lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int {
+        problem = verifyLive(&st, w.b, &w.model, &gone)
+        return 0
+    }).unwrap()
+    line = line + ", read " + (if problem == "" { "ok" } else { problem })
+    // the rows written again (as first, in key order): the freed pages are used
+    var refill = ""
+    lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int {
+        var i = 0
+        while i < len(rows) {
+            var t = lexdb_store.begin()
+            var j = i
+            while j < i + 100 && j < len(rows) {
+                t.put(w.b, &rows[j].key, &rows[j].val).unwrap()
+                j += 1
+            }
+            st.commit(t).unwrap()
+            i = j
+        }
+        st.checkpointAll().unwrap()
+        return 0
+    }).unwrap()
+    lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int {
+        pages1 = st.stats().pages
+        return 0
+    }).unwrap()
+    let au4 = audit(fs)
+    // the same rows again (in key order, not as first written): the file
+    // must not grow past what the first fill took, plus a few pages
+    refill = if clean(&au4) && pages1 <= pages0 + pages0 / 20 { "ok" } else { "grew " + pages0.toStr() + " to " + pages1.toStr() + ", " + au4 }
+    return line + ", refilled " + refill
+}
+
+fn conflicted(r: &Result[Unit, lexdb_base.DbErr]): bool {
+    return match r {
+        Ok(_) { false }
+        Err(e) { e.state == lexdb_base.S_CONFLICT }
+    }
+}
+
+fn delRange(st: &lexdb_store.Store, tree: int, lo: &str, hi: &str) {
+    var t = lexdb_store.begin()
+    t.delRange(tree, lo, hi)
+    st.commit(t).unwrap()
+}
+
+// A snapshot that began before a range delete reads every old row while
+// checkpoints run; one that began after reads the new state.
+fn snapshots(): str {
+    var w = world()
+    let w0 = world()
+    let before = &w0.model
+    let fs = lexdb_disk.sim(300)
+    build(fs, mut &w)
+    let all = sorted(&w.model)
+    let n = len(all)
+    let lo = all[n / 10]
+    let hi = all[n * 7 / 10]
+    let rows = removeRange(mut &w.model, &lo, &hi)
+    let gone = keysOf(&rows)
+    var oldRows = ""
+    var newRows = ""
+    lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int {
+        st.setDropReads(2)
+        var old = st.beginSnapshot().unwrap()
+        oldRows = verify(&st, mut &old, w.b, before, &[], 1)        // loads the tree's nodes in part
+        delRange(&st, w.b, &lo, &hi)
+        var fresh = st.beginSnapshot().unwrap()
+        for round in 0..4 {
+            // the old snapshot again, a checkpoint and a commit between
+            if oldRows == "" { oldRows = verify(&st, mut &old, w.b, before, &[], 1) }
+            st.checkpoint().unwrap()
+            var t = lexdb_store.begin()
+            t.put(w.a, &("a" + round.toStr()), "x").unwrap()
+            st.commit(t).unwrap()
+            if newRows == "" { newRows = verify(&st, mut &fresh, w.b, &w.model, &gone, 1) }
+            st.checkpoint().unwrap()
+        }
+        st.releaseSnapshot(mut &old)
+        st.releaseSnapshot(mut &fresh)
+        walk(&st)
+        st.checkpointAll().unwrap()
+        return 0
+    }).unwrap()
+    let au = audit(fs)
+    var after = ""
+    lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int {
+        after = verifyLive(&st, w.b, &w.model, &gone)
+        return 0
+    }).unwrap()
+    return "snapshots: old rows " + (if oldRows == "" { "ok" } else { oldRows }) + ", new rows " + (if newRows == "" && after == "" { "ok" } else { newRows + " " + after }) +
+           ", audit " + (if clean(&au) { "ok" } else { au }) + ", walked " + (if strings.contains(&au, &"dropped 0,") { "ok" } else { au })
+}
+
+// A transaction t1 that does read (a get of key, or a scan of [from, to))
+// and writes tree a, then a range delete of [lo, hi) by another that
+// commits first: whether t1's commit fails.
+fn raced(st: &lexdb_store.Store, w: &World, read: &fn(&lexdb_store.Store, mut &lexdb_store.Txn, &World), lo: &str, hi: &str): bool {
+    var t1 = lexdb_store.begin()
+    read(st, mut &t1, w)
+    t1.put(w.a, "marker", "x").unwrap()
+    delRange(st, w.b, lo, hi)
+    return conflicted(&st.commit(t1))
+}
+
+fn conflicts(): str {
+    var w = world()
+    let fs = lexdb_disk.sim(400)
+    build(fs, mut &w)
+    let all = sorted(&w.model)
+    let n = len(all)
+    let lo = all[n / 4]
+    let hi = all[n / 2]
+    let below = all[n / 4 - 1]
+    let last = all[n / 2 - 1]
+    let tail = all[n - 1] + "z"
+    let from = all[n * 3 / 4]
+    var out = "conflicts:"
+    lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int {
+        let inRange = all[n / 3]
+        let f1 = fn(s: &lexdb_store.Store, t: mut &lexdb_store.Txn, x: &World) { s.get(t, x.b, &inRange).unwrap() }
+        out = out + " in range " + (if raced(&st, &w, f1, &lo, &hi) { "fails" } else { "commits" })
+        let f2 = fn(s: &lexdb_store.Store, t: mut &lexdb_store.Txn, x: &World) { s.get(t, x.b, &below).unwrap() }
+        out = out + ", below lo " + (if raced(&st, &w, f2, &lo, &hi) { "fails" } else { "ok" })
+        let f3 = fn(s: &lexdb_store.Store, t: mut &lexdb_store.Txn, x: &World) { s.get(t, x.b, &hi).unwrap() }
+        out = out + ", at hi " + (if raced(&st, &w, f3, &lo, &hi) { "fails" } else { "ok" })
+        let f4 = fn(s: &lexdb_store.Store, t: mut &lexdb_store.Txn, x: &World) { s.get(t, x.b, &last).unwrap() }
+        out = out + ", last in range " + (if raced(&st, &w, f4, &lo, &hi) { "fails" } else { "commits" })
+        // a range to the end against a read of the tail (and of a key before it)
+        let f5 = fn(s: &lexdb_store.Store, t: mut &lexdb_store.Txn, x: &World) { s.get(t, x.b, &tail).unwrap() }
+        out = out + ", tail read " + (if raced(&st, &w, f5, &from, "") { "fails" } else { "commits" })
+        let before = all[n * 3 / 4 - 1]
+        let f6 = fn(s: &lexdb_store.Store, t: mut &lexdb_store.Txn, x: &World) { s.get(t, x.b, &before).unwrap() }
+        out = out + ", just before it " + (if raced(&st, &w, f6, &from, "") { "fails" } else { "ok" })
+        // a range scanned up to lo, and one from hi on
+        let f7 = fn(s: &lexdb_store.Store, t: mut &lexdb_store.Txn, x: &World) {
+            s.scan(t, x.b, &below, &lo, fn(e: &lexdb_store.Entry): bool { return true }).unwrap()
+        }
+        out = out + ", scan up to lo " + (if raced(&st, &w, f7, &lo, &hi) { "fails" } else { "ok" })
+        let f8 = fn(s: &lexdb_store.Store, t: mut &lexdb_store.Txn, x: &World) {
+            s.scan(t, x.b, &hi, &(hi + "~"), fn(e: &lexdb_store.Entry): bool { return true }).unwrap()
+        }
+        out = out + ", scan from hi " + (if raced(&st, &w, f8, &lo, &hi) { "fails" } else { "ok" })
+        // one that only wrote commits, and its row is there after
+        var t1 = lexdb_store.begin()
+        t1.put(w.b, &lo, "written").unwrap()
+        delRange(&st, w.b, &lo, &hi)
+        out = out + ", written only " + (if conflicted(&st.commit(t1)) { "fails" } else { "ok" })
+        return 0
+    }).unwrap()
+    // the rows: [lo, hi) and [from, end) gone, lo written back
+    let x = removeRange(mut &w.model, &lo, &hi)
+    let y = removeRange(mut &w.model, &from, "")
+    w.model.put(lo, "written")
+    var problem = ""
+    lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int {
+        problem = verifyLive(&st, w.b, &w.model, &keysOf(&y))
+        return 0
+    }).unwrap()
+    return out + ", rows " + (if problem == "" { "ok" } else { problem })
+}
+
+// The chunks of key in the companion tree of b.
+fn chunks(st: &lexdb_store.Store, b: int, key: &str): int {
+    var t = lexdb_store.begin()
+    var n = 0
+    st.scan(mut &t, b + lexdb_store.OVF, &lexdb_store.chunkKey(key, 0), &lexdb_store.chunkKey(key, lexdb_store.LAST_CHUNK), fn(e: &lexdb_store.Entry): bool {
+        n += 1
+        return true
+    }).unwrap()
+    st.abort(t)
+    return n
+}
+
+fn getOf(st: &lexdb_store.Store, t: mut &lexdb_store.Txn, tree: int, k: &str): str {
+    return match st.get(t, tree, k).unwrap() { Some(v) { v } None { "<none>" } }
+}
+
+// Writes and range deletes of one transaction mixed (the header).
+fn mixes(): str {
+    var w = world()
+    let fs = lexdb_disk.sim(500)
+    build(fs, mut &w)
+    let all = sorted(&w.model)
+    let n = len(all)
+    var bad: []str = []
+    var gone: []str = []
+    var big = ""
+    var big2 = ""
+    lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int {
+        // put, range delete, put of the same key
+        var lo = all[n / 4]
+        var hi = all[n / 2]
+        let k = all[n / 3]
+        var t = lexdb_store.begin()
+        t.put(w.b, &k, "v1").unwrap()
+        t.delRange(w.b, &lo, &hi)
+        if getOf(&st, mut &t, w.b, &k) != "<none>" { append(mut &bad, "own get after the range delete") }
+        var seen = 0
+        st.scan(mut &t, w.b, &lo, &hi, fn(e: &lexdb_store.Entry): bool {
+            if e.key == k { seen += 1 }
+            return true
+        }).unwrap()
+        if seen != 0 { append(mut &bad, "own scan after the range delete") }
+        t.put(w.b, &k, "v2").unwrap()
+        if getOf(&st, mut &t, w.b, &k) != "v2" { append(mut &bad, "own get after the put again") }
+        st.commit(t).unwrap()
+        for r in removeRange(mut &w.model, &lo, &hi) { append(mut &gone, r.key) }
+        w.model.put(k, "v2")
+        // a put of a new key, then a range delete covering it
+        lo = all[n * 5 / 8]
+        hi = all[n * 3 / 4]
+        let x = all[n * 11 / 16] + "m"
+        t = lexdb_store.begin()
+        t.put(w.b, &x, "tmp").unwrap()
+        t.delRange(w.b, &lo, &hi)
+        if getOf(&st, mut &t, w.b, &x) != "<none>" { append(mut &bad, "own get of a key put before") }
+        st.commit(t).unwrap()
+        for r in removeRange(mut &w.model, &lo, &hi) { append(mut &gone, r.key) }
+        append(mut &gone, x)
+        // a large value of a key length no other has, put and covered
+        lo = "k30000"
+        hi = "k32000"
+        big = "k31000" + strings.repeat("y", 194)
+        t = lexdb_store.begin()
+        t.put(w.b, &big, &(strings.repeat("0123456789", 2000))).unwrap()
+        t.delRange(w.b, &lo, &hi)
+        st.commit(t).unwrap()
+        for r in removeRange(mut &w.model, &lo, &hi) { append(mut &gone, r.key) }
+        append(mut &gone, big)
+        if chunks(&st, w.b, &big) != 0 { append(mut &bad, "chunks of a covered key left") }
+        // a large value of another new length, outside the range
+        lo = all[n / 20]
+        hi = all[n / 10]
+        big2 = "k59999" + strings.repeat("z", 294)
+        let v2 = strings.repeat("abcdefghij", 3000)
+        t = lexdb_store.begin()
+        t.put(w.b, &big2, &v2).unwrap()
+        t.delRange(w.b, &lo, &hi)
+        st.commit(t).unwrap()
+        for r in removeRange(mut &w.model, &lo, &hi) { append(mut &gone, r.key) }
+        w.model.put(big2, v2)
+        if chunks(&st, w.b, &big2) == 0 { append(mut &bad, "chunks of a key outside the range gone") }
+        // two ranges that overlap, a put between them
+        lo = all[n * 3 / 5]
+        hi = all[n * 7 / 10]
+        let again = all[n * 13 / 20]
+        let after = all[n * 13 / 20 + 1]
+        let top = all[n * 3 / 4]
+        t = lexdb_store.begin()
+        t.delRange(w.b, &lo, &hi)
+        t.put(w.b, &again, "again").unwrap()
+        t.delRange(w.b, &after, &top)
+        st.commit(t).unwrap()
+        for r in removeRange(mut &w.model, &lo, &top) { append(mut &gone, r.key) }
+        w.model.put(again, "again")
+        // a range delete undone by its savepoint: nothing is removed
+        lo = all[n * 4 / 5]
+        hi = all[n * 9 / 10]
+        let kept = all[n * 17 / 20]
+        t = lexdb_store.begin()
+        t.put(w.a, "s0", "x").unwrap()
+        let m = t.mark()
+        t.put(w.b, &kept, "tmp").unwrap()
+        t.delRange(w.b, &lo, &hi)
+        t.undoTo(m)
+        if getOf(&st, mut &t, w.b, &kept) != w.model.get(&kept).unwrap() { append(mut &bad, "own get after the savepoint") }
+        st.commit(t).unwrap()
+        return 0
+    }).unwrap()
+    let au = audit(fs)
+    var problem = ""
+    lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int {
+        // (keys put again are in the model)
+        var absent: []str = []
+        for k in gone { if !w.model.has(&k) { append(mut &absent, k) } }
+        problem = verifyLive(&st, w.b, &w.model, &absent)
+        if chunks(&st, w.b, &big) != 0 { append(mut &bad, "chunks of a covered key left after reopening") }
+        return 0
+    }).unwrap()
+    if problem != "" { append(mut &bad, problem) }
+    if !clean(&au) { append(mut &bad, au) }
+    return "in one transaction: " + (if len(bad) == 0 { "ok" } else { strings.join(&bad, "; ") })
+}
+
+// A log record of an op this binary does not know stops recovery.
+fn unknownOp(): str {
+    let fs = lexdb_disk.sim(600)
+    var crashed = fs
+    lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int {
+        var t = lexdb_store.begin()
+        let a = st.createTree(mut &t)
+        t.put(a, "k", "v").unwrap()
+        st.commit(t).unwrap()
+        crashed = fs.crash(1)
+        return 0
+    }).unwrap()
+    // the first record's op byte, with the frame's checksum made again
+    var seg = ""
+    for nm in crashed.names() { if strings.startsWith(&nm, &"log.") && nm != "log.spare" { seg = nm } }
+    let f = crashed.open(&seg, false).unwrap()
+    var b = array(4096, byte(0))
+    f.read(0, mut &b[0..4096], 4096).unwrap()
+    if binary.readU32LE(&b, 0) != 0x4C474C58 { return "unknown op: no frame at the start of the log" }
+    b[32] = byte(9)
+    let plen = binary.readU32LE(&b, 20)
+    binary.setU32LE(mut &b, 4, int(lexdb_base.crc32c(&b, 8, 32 + plen)))
+    f.write(0, &b).unwrap()
+    f.flush().unwrap()
+    f.close()
+    let r = lexdb_store.run(crashed, opts(), fn(st: lexdb_store.Store): int { return 0 })
+    return match r {
+        Ok(_) { "unknown op: opened" }
+        Err(e) { if e.state == lexdb_base.S_CORRUPT && strings.contains(&e.msg, &"unknown op 9") { "unknown op: corrupt record" } else { "unknown op: " + e.toStr() } }
+    }
+}
+
+// Appends n small rows to tree a from number `from` on.
+fn grow(st: &lexdb_store.Store, a: int, from: int, n: int) {
+    var t = lexdb_store.begin()
+    for j in from..from + n { t.put(a, &("a" + strings.padLeft(&(j.toStr()), 6, '0')), "small").unwrap() }
+    st.commit(t).unwrap()
+}
+
+fn countOf(st: &lexdb_store.Store, tree: int): int {
+    var t = lexdb_store.begin()
+    var n = 0
+    st.scan(mut &t, tree, "", "", fn(e: &lexdb_store.Entry): bool {
+        n += 1
+        return true
+    }).unwrap()
+    st.abort(t)
+    return n
+}
+
+// 12 crashes at random points of a range delete (its commit, the
+// checkpoints after it, the walk of what it freed), with commits to tree a
+// going on: each recovers to the model, with nothing lost or freed twice.
+fn crashes(): str {
+    var w = world()
+    let fs = lexdb_disk.sim(700)
+    build(fs, mut &w)
+    let base = fs.crash(0)
+    let all = sorted(&w.model)
+    let n = len(all)
+    var ok = 0
+    var partway = 0
+    let runs = 12
+    for seed in 1..runs + 1 {
+        let c = base.crash(seed)
+        var rng = lexdb_base.rng(seed)
+        let kind = rng.below(4)
+        var lo = all[n / 10 + rng.below(n / 5)]
+        var hi = all[n / 2 + rng.below(n / 4)]
+        if kind == 1 { lo = "" }
+        if kind == 2 { hi = "" }
+        if kind == 3 { lo = ""; hi = "" }
+        let at = rng.below(12)
+        let delAt = rng.below(6)
+        var crashed = c
+        var added = 0
+        var deleted = false
+        lexdb_store.run(c, opts(), fn(st: lexdb_store.Store): int {
+            st.setDropReads(1 + rng.below(4))
+            for k in 0..12 {
+                if k == at {
+                    crashed = c.crash(seed)
+                    return 0
+                }
+                if k == delAt {
+                    delRange(&st, w.b, &lo, &hi)
+                    deleted = true
+                }
+                grow(&st, w.a, 20 + added, 5)
+                added += 5
+                if rng.below(2) == 0 { st.checkpoint().unwrap() }
+            }
+            crashed = c.crash(seed)
+            return 0
+        }).unwrap()
+        if !strings.contains(&audit(crashed), &"dropped 0,") { partway += 1 }
+        var w2 = world()
+        var model = replace(mut &w2.model, newMap())
+        var rows: []lexdb_store.Entry = []
+        if deleted { rows = removeRange(mut &model, &lo, &hi) }
+        var problem = ""
+        var gone = false
+        lexdb_store.run(crashed, opts(), fn(st: lexdb_store.Store): int {
+            problem = verifyLive(&st, w.b, &model, &keysOf(&rows))
+            if countOf(&st, w.a) != 1 + added { problem = "tree a has " + countOf(&st, w.a).toStr() + " rows, want " + (1 + added).toStr() }
+            walk(&st)
+            st.checkpointAll().unwrap()
+            gone = st.stats().dropped == 0
+            if problem == "" { problem = verifyLive(&st, w.b, &model, &keysOf(&rows)) }
+            return 0
+        }).unwrap()
+        let au = audit(crashed)
+        if problem == "" && gone && clean(&au) { ok += 1 }
+        else { println("seed " + seed.toStr() + ": " + problem + " " + au) }
+    }
+    return "crashes " + runs.toStr() + ": ok " + ok.toStr() + ", with the walk partway done " + (if partway > 0 { "some" } else { "none" })
+}
+
+fn main() {
+    println(step("empty [mid, mid)", 0))
+    println(step("one leaf", 1))
+    println(step("across levels", 2))
+    println(step("from the start", 3))
+    println(step("to the end", 4))
+    println(step("whole tree", 5))
+    println(step("leaf starts", 6))
+    println(step("from the first key to a leaf start", 7))
+    println(step("short bounds", 8))
+    println(snapshots())
+    println(conflicts())
+    println(mixes())
+    println(unknownOp())
+    println(crashes())
+}

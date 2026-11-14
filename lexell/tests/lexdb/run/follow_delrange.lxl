@@ -1,0 +1,413 @@
+// lexdb_store, the follower: range deletes (OP_DELRANGE, design/lexdb-bulkdelete.md stage 3)
+// are kept as range tombstones, and a snapshot sees exactly what a master
+// snapshot saw at its batch.
+// A scripted run, a master with two trees of 3,000 and 600 keys (every
+// 40th key of the first a large value), a follower beside it (cache 48 KB
+// and 16 MB), and after each step the follower's snapshot must equal the
+// master's: whole, backward over a range, and by point reads. The steps:
+// a cut in the middle of a tree; puts after it, in a later batch and in
+// the batch of the cut (put, cut, put of the same key in one transaction);
+// the base adopted across the delete (a checkpoint, the snapshots begun
+// before it still reading their own state); a cut from the start and one to
+// the end; the whole tree, then puts into it; large values in the range,
+// and a large value put again after; and prune (with the snapshots ended
+// and a checkpoint taken, the follower holds no cut).
+// Then a cold follower: a cut of the whole tree is read with no page
+// loaded, and a cut in the middle of one tree loads fewer pages than the
+// same scan of an untouched copy.
+// Then 60 random rounds (puts, deletes, range deletes of every shape: from
+// the start, to the end, the whole tree, empty, inside one key's gap), the
+// follower a round behind (five, now and then), checkpoints every sixth
+// round, snapshots kept across them.
+// expect: cache 48 KB: scripted: 15 steps same true, kept snapshots same true, cuts held true, cuts after prune 0
+// expect: cache 48 KB: random: rounds 59, same 59, kept 6, still same 6, cuts seen true
+// expect: cache 48 KB: audit ok true
+// expect: cache 16384 KB: scripted: 15 steps same true, kept snapshots same true, cuts held true, cuts after prune 0
+// expect: cache 16384 KB: random: rounds 59, same 59, kept 6, still same 6, cuts seen true
+// expect: cache 16384 KB: audit ok true
+// expect: cold: whole-tree cut loads 0, rows 0, half cut loads fewer true, rows 1000
+import "task"
+import "collections"
+import "strings"
+import "../../../cmd/lexdb_base"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+
+fn key(i: int): str { return "k" + strings.padLeft(&(i.toStr()), 5, '0') }
+
+// every 40th key is a large value (chunks in the companion tree)
+fn val(i: int, tag: str): str {
+    if i % 40 == 0 { return tag + strings.repeat("L", 3000 + i % 7) }
+    return tag + "v" + i.toStr()
+}
+
+fn dumpMaster(st: &lexdb_store.Store, t: mut &lexdb_store.Txn, tree: int): str {
+    var out: []str = []
+    let r = st.scan(t, tree, "", "", fn(e: &lexdb_store.Entry): bool {
+        append(mut &out, e.key + "=" + e.val)
+        return true
+    })
+    if r.isErr() { return "error " + r.unwrapErr().state + " " + r.unwrapErr().msg }
+    return len(out).toStr() + ":" + strings.join(&out, ",")
+}
+
+fn backMaster(st: &lexdb_store.Store, t: mut &lexdb_store.Txn, tree: int, from: str, to: str): str {
+    var out: []str = []
+    let r = st.scanBack(t, tree, &from, &to, fn(e: &lexdb_store.Entry): bool {
+        append(mut &out, e.key + "=" + e.val)
+        return true
+    })
+    if r.isErr() { return "error " + r.unwrapErr().state + " " + r.unwrapErr().msg }
+    return len(out).toStr() + ":" + strings.join(&out, ",")
+}
+
+fn backFollower(fo: &lexdb_store.Follower, s: &lexdb_store.FSnap, tree: int, from: &str, to: &str): str {
+    var out: []str = []
+    let r = fo.scanBack(s, tree, from, to, fn(e: &lexdb_store.Entry): bool {
+        append(mut &out, e.key + "=" + e.val)
+        return true
+    })
+    if r.isErr() { return "error " + r.unwrapErr().state + " " + r.unwrapErr().msg }
+    return len(out).toStr() + ":" + strings.join(&out, ",")
+}
+
+fn dumpFollower(fo: &lexdb_store.Follower, s: &lexdb_store.FSnap, tree: int): str {
+    var out: []str = []
+    let r = fo.scan(s, tree, &"", &"", fn(e: &lexdb_store.Entry): bool {
+        append(mut &out, e.key + "=" + e.val)
+        return true
+    })
+    if r.isErr() { return "error " + r.unwrapErr().state + " " + r.unwrapErr().msg }
+    return len(out).toStr() + ":" + strings.join(&out, ",")
+}
+
+fn cut(s: &str, n: int): str { return if len(s) > n { s[0..n] + "..." } else { lexdb_base.own(s) } }
+
+// What a master snapshot saw at a batch: each tree whole, a range of it
+// backward, and some keys.
+type Rec = record { batch: int; trees: []int; dumps: []str; backs: []str; bfrom: []str; bto: []str; ptree: []int; pkey: []str; pval: []str }
+
+fn recordOf(st: &lexdb_store.Store, trees: &[]int, r: mut &lexdb_base.Rng, span: int): Rec {
+    var ms = st.beginSnapshot().unwrap()
+    var rec = Rec{batch: st.durableBatch(), trees: [], dumps: [], backs: [], bfrom: [], bto: [], ptree: [], pkey: [], pval: []}
+    for tr in trees {
+        append(mut &rec.trees, tr)
+        append(mut &rec.dumps, dumpMaster(st, mut &ms, tr))
+        let bf = if r.below(3) == 0 { "" } else { key(r.below(span)) }
+        let bt = if r.below(3) == 0 { "" } else { key(r.below(span)) }
+        append(mut &rec.backs, backMaster(st, mut &ms, tr, bf, bt))
+        append(mut &rec.bfrom, bf)
+        append(mut &rec.bto, bt)
+        for _ in 0..25 {
+            let ky = key(r.below(span))
+            let ma = st.get(mut &ms, tr, &ky)
+            append(mut &rec.ptree, tr)
+            append(mut &rec.pkey, ky)
+            append(mut &rec.pval, if ma.isOk() { ma.unwrap().unwrapOr("-") } else { "err" })
+        }
+    }
+    st.endSnapshot(&ms)
+    return rec
+}
+
+// Whether the follower's snapshot s gives the record's state; the follower's
+// dumps are left in dumps.
+fn matches(fo: &lexdb_store.Follower, s: &lexdb_store.FSnap, rec: &Rec, what: &str, lines: mut &[]str, dumps: mut &[]str): bool {
+    var ok = true
+    for i in 0..len(rec.trees) {
+        let b = dumpFollower(fo, s, rec.trees[i])
+        append(dumps, b)
+        if b != rec.dumps[i] {
+            ok = false
+            if len(lines) < 6 { append(lines, what + ": tree " + rec.trees[i].toStr() + ": master " + cut(&rec.dumps[i], 160) + " follower " + cut(&b, 160)) }
+        }
+        let bk = backFollower(fo, s, rec.trees[i], &rec.bfrom[i], &rec.bto[i])
+        if bk != rec.backs[i] {
+            ok = false
+            if len(lines) < 6 { append(lines, what + ": tree " + rec.trees[i].toStr() + " backward [" + rec.bfrom[i] + ", " + rec.bto[i] + "): master " + cut(&rec.backs[i], 160) + " follower " + cut(&bk, 160)) }
+        }
+    }
+    for i in 0..len(rec.pkey) {
+        let fa = fo.get(s, rec.ptree[i], &rec.pkey[i])
+        let fv = if fa.isOk() { fa.unwrap().unwrapOr("-") } else { "err " + fa.unwrapErr().msg }
+        if fv != rec.pval[i] {
+            ok = false
+            if len(lines) < 6 { append(lines, what + ": get " + rec.ptree[i].toStr() + " " + rec.pkey[i] + ": " + cut(&rec.pval[i], 60) + " / " + cut(&fv, 60)) }
+        }
+    }
+    return ok
+}
+
+type Kept = record { snap: lexdb_store.FSnap; rec: Rec; name: str }
+
+fn delRange(st: &lexdb_store.Store, tree: int, lo: &str, hi: &str) {
+    var t = lexdb_store.begin()
+    t.delRange(tree, lo, hi)
+    st.commit(t).unwrap()
+}
+
+fn putOne(st: &lexdb_store.Store, tree: int, k: &str, v: &str) {
+    var t = lexdb_store.begin()
+    t.put(tree, k, v).unwrap()
+    st.commit(t).unwrap()
+}
+
+type Sc = record { kept: []Kept; steps: int; same: bool; maxCuts: int }
+
+// Checks the follower against the master as of now; keep: the snapshot is
+// kept for later.
+fn check(st: &lexdb_store.Store, fo: &lexdb_store.Follower, trees: &[]int, r: mut &lexdb_base.Rng, sc: mut &Sc, lines: mut &[]str, tag: &str, name: &str, keep: bool) {
+    fo.poll(st.durableBatch()).unwrap()
+    let rec = recordOf(st, trees, r, 3100)
+    let sn = fo.begin().unwrap()
+    var dumps: []str = []
+    let ok = matches(fo, &sn, &rec, &(tag + name), lines, mut &dumps)
+    sc.steps += 1
+    if !ok { sc.same = false }
+    if sn.batch != rec.batch { append(lines, tag + name + ": batch " + sn.batch.toStr() + " recorded " + rec.batch.toStr()) }
+    if keep { append(mut &sc.kept, Kept{snap: sn, rec: rec, name: name.toStr()}) } else { fo.end(&sn) }
+    let c = fo.stats().cuts
+    if c > sc.maxCuts { sc.maxCuts = c }
+}
+
+fn scripted(fs: lexdb_disk.Fs, seed: int, followerCache: int, tag: str, lines: mut &[]str) {
+    let opts = lexdb_store.Options{cacheBytes: 4 * 1024 * 1024, segBytes: 64 * 1024, ckptBytes: 64 * 1024 * 1024, snapNodes: 100000}
+    lexdb_store.run(fs, opts, fn(st: lexdb_store.Store): int {
+        var r = lexdb_base.rng(seed)
+        var t = lexdb_store.begin()
+        let a = st.createTree(mut &t)
+        let b = st.createTree(mut &t)
+        for i in 0..3000 { t.put(a, &(key(i)), &(val(i, "init"))).unwrap() }
+        for i in 0..600 { t.put(b, &(key(i)), &("b" + i.toStr())).unwrap() }
+        st.commit(t).unwrap()
+        st.checkpoint().unwrap()
+        let trees = [a, b]
+        let fo = lexdb_store.openFollower(lexdb_store.Link.LocalId(st, 1), fs, followerCache).unwrap()
+        var sc = Sc{kept: [], steps: 0, same: true, maxCuts: 0}
+        check(&st, &fo, &trees, mut &r, mut &sc, mut &lines, &tag, "start", true)                                              // 1
+        delRange(&st, a, &key(500), &key(1500))
+        check(&st, &fo, &trees, mut &r, mut &sc, mut &lines, &tag, "cut in the middle", true)                                  // 2
+        putOne(&st, a, &key(600), "after the cut")
+        putOne(&st, a, &key(720), &(val(720, "again")))                   // large, in a later batch
+        check(&st, &fo, &trees, mut &r, mut &sc, mut &lines, &tag, "puts after the cut", false)                                // 3
+        var t2 = lexdb_store.begin()
+        t2.put(a, &key(850), "before").unwrap()
+        t2.delRange(a, &key(800), &key(1000))
+        t2.put(a, &key(900), "same batch").unwrap()
+        t2.put(a, &key(1200), "same batch 2").unwrap()
+        st.commit(t2).unwrap()
+        check(&st, &fo, &trees, mut &r, mut &sc, mut &lines, &tag, "put, cut, put in one batch", true)                         // 4
+        st.checkpoint().unwrap()
+        check(&st, &fo, &trees, mut &r, mut &sc, mut &lines, &tag, "base adopted across the delete", false)                    // 5
+        delRange(&st, a, "", &key(100))
+        delRange(&st, a, &key(2500), "")
+        check(&st, &fo, &trees, mut &r, mut &sc, mut &lines, &tag, "from the start, to the end", true)                         // 6
+        delRange(&st, b, "", "")
+        check(&st, &fo, &trees, mut &r, mut &sc, mut &lines, &tag, "whole tree", false)                                        // 7
+        putOne(&st, b, &key(1), "new b")
+        putOne(&st, b, &key(599), "new b 599")
+        check(&st, &fo, &trees, mut &r, mut &sc, mut &lines, &tag, "puts into the emptied tree", false)                        // 8
+        delRange(&st, a, &key(1600), &key(2000))                          // 1600, 1640 ... are large
+        check(&st, &fo, &trees, mut &r, mut &sc, mut &lines, &tag, "large values in the range", false)                         // 9
+        putOne(&st, a, &key(1640), &(val(1640, "second")))
+        check(&st, &fo, &trees, mut &r, mut &sc, mut &lines, &tag, "a large value put after the cut", false)                   // 10
+        st.checkpoint().unwrap()
+        check(&st, &fo, &trees, mut &r, mut &sc, mut &lines, &tag, "a checkpoint after them", false)                           // 11
+        delRange(&st, a, &key(2000), &key(2100))                          // after the checkpoint: only the log has it
+        delRange(&st, a, &key(2100), &key(2100))                          // empty
+        delRange(&st, a, &key(2200), &key(2100))                          // backwards: empty
+        delRange(&st, a, &(key(2300) + "x"), &(key(2300) + "y"))          // between two keys
+        check(&st, &fo, &trees, mut &r, mut &sc, mut &lines, &tag, "a cut after the checkpoint, empty ranges", false)                                      // 12
+        // every kept snapshot still reads its state, across the checkpoints
+        var keptSame = true
+        for k in sc.kept {
+            var d: []str = []
+            if !matches(&fo, &k.snap, &k.rec, &(tag + "kept " + k.name), mut &lines, mut &d) { keptSame = false }
+        }
+        let before = fo.stats()
+        while len(sc.kept) > 0 { fo.end(&pop(mut &sc.kept).snap) }
+        check(&st, &fo, &trees, mut &r, mut &sc, mut &lines, &tag, "the snapshots ended", false)       // 13: the old bases go, the log's cuts stay
+        // prune: the snapshots are over, a checkpoint holds the deletes
+        putOne(&st, b, &key(2), "x")
+        st.checkpoint().unwrap()
+        fo.poll(st.durableBatch()).unwrap()
+        check(&st, &fo, &trees, mut &r, mut &sc, mut &lines, &tag, "after the checkpoint", false)                              // 14
+        fo.poll(st.durableBatch()).unwrap()
+        check(&st, &fo, &trees, mut &r, mut &sc, mut &lines, &tag, "after prune", false)                                       // 15
+        let after = fo.stats()
+        fo.close()
+        append(mut &lines, tag + "scripted: " + sc.steps.toStr() + " steps same " + sc.same.toStr() + ", kept snapshots same " + keptSame.toStr() +
+               ", cuts held " + (sc.maxCuts >= 5 && before.cuts >= 5).toStr() + ", cuts after prune " + after.cuts.toStr())
+        return 0
+    }).unwrap()
+}
+
+// A random range: a shape of each kind.
+type Rg = value record { lo: str; hi: str }
+
+fn randomRange(r: mut &lexdb_base.Rng, span: int): Rg {
+    let kind = r.below(8)
+    let x = key(r.below(span))
+    let y = key(r.below(span))
+    if kind == 0 { return Rg{lo: "", hi: ""} }
+    if kind == 1 { return Rg{lo: "", hi: x} }
+    if kind == 2 { return Rg{lo: x, hi: ""} }
+    if kind == 3 { return Rg{lo: x, hi: x} }
+    if kind == 4 { return Rg{lo: x + "a", hi: x + "b"} }
+    if kind == 5 { return if x < y { Rg{lo: x, hi: y} } else { Rg{lo: y, hi: x} } }
+    // a short one
+    let i = r.below(span)
+    return Rg{lo: key(i), hi: key(i + 1 + r.below(12))}
+}
+
+fn randomPhase(fs: lexdb_disk.Fs, seed: int, followerCache: int, tag: str, lines: mut &[]str) {
+    let opts = lexdb_store.Options{cacheBytes: 4 * 1024 * 1024, segBytes: 64 * 1024, ckptBytes: 96 * 1024, snapNodes: 100000}
+    lexdb_store.run(fs, opts, fn(st: lexdb_store.Store): int {
+        var r = lexdb_base.rng(seed + 1)
+        let span = 700
+        var t = lexdb_store.begin()
+        let a = st.createTree(mut &t)
+        let b = st.createTree(mut &t)
+        for i in 0..span { t.put(a, &(key(i)), &(val(i, "init"))).unwrap() }
+        for i in 0..span { t.put(b, &(key(i)), &(val(i, "binit"))).unwrap() }
+        st.commit(t).unwrap()
+        st.checkpoint().unwrap()
+        let trees = [a, b]
+        let fo = lexdb_store.openFollower(lexdb_store.Link.LocalId(st, 1), fs, followerCache).unwrap()
+        var prev: []Rec = []
+        var kept: []Kept = []
+        var compared = 0
+        var same = 0
+        var keptCount = 0
+        var keptSame = 0
+        var cutsSeen = false
+        for round in 0..60 {
+            for c in 0..1 + r.below(2) {
+                var tx = lexdb_store.begin()
+                for _ in 0..1 + r.below(30) {
+                    let tree = trees[r.below(2)]
+                    let i = r.below(span)
+                    let q = r.below(10)
+                    if q < 2 { tx.del(tree, &key(i)) }
+                    else if q < 3 {
+                        let rg = randomRange(mut &r, span)
+                        tx.delRange(tree, &rg.lo, &rg.hi)
+                    } else { tx.put(tree, &key(i), &(val(i, "r" + round.toStr() + "."))).unwrap() }
+                }
+                st.commit(tx).unwrap()
+            }
+            if round % 6 == 5 { st.checkpoint().unwrap() }
+            append(mut &prev, recordOf(&st, &trees, mut &r, span + 20))
+            let lag = if round % 17 >= 12 { 5 } else { 1 }
+            while len(prev) > lag {
+                let p = collections.removeAt(mut &prev, 0)
+                fo.poll(p.batch).unwrap()
+                let sn = fo.begin().unwrap()
+                compared += 1
+                var d: []str = []
+                if matches(&fo, &sn, &p, &(tag + "round " + round.toStr()), mut &lines, mut &d) { same += 1 }
+                if fo.stats().cuts > 0 { cutsSeen = true }
+                if round % 7 == 5 {
+                    append(mut &kept, Kept{snap: sn, rec: p, name: "round " + round.toStr()})
+                    keptCount += 1
+                } else {
+                    fo.end(&sn)
+                }
+                var stay: []Kept = []
+                while len(kept) > 0 {
+                    let k = pop(mut &kept)
+                    if round % 7 == 3 || round == 59 {
+                        var dd: []str = []
+                        if matches(&fo, &k.snap, &k.rec, &(tag + "kept " + k.name), mut &lines, mut &dd) { keptSame += 1 }
+                        fo.end(&k.snap)
+                    } else {
+                        append(mut &stay, k)
+                    }
+                }
+                kept = stay
+            }
+        }
+        fo.close()
+        append(mut &lines, tag + "random: rounds " + compared.toStr() + ", same " + same.toStr() + ", kept " + keptCount.toStr() + ", still same " + keptSame.toStr() + ", cuts seen " + cutsSeen.toStr())
+        return 0
+    }).unwrap()
+}
+
+fn phase(seed: int, followerCache: int): []str {
+    let tag = "cache " + (followerCache / 1024).toStr() + " KB: "
+    var lines: []str = []
+    let fs1 = lexdb_disk.sim(seed)
+    let fs2 = lexdb_disk.sim(seed + 10)
+    scripted(fs1, seed, followerCache, tag, mut &lines)
+    randomPhase(fs2, seed + 10, followerCache, tag, mut &lines)
+    let a1 = lexdb_store.audit(fs1)
+    let a2 = lexdb_store.audit(fs2)
+    append(mut &lines, tag + "audit ok " + (a1.isOk() && a2.isOk()).toStr())
+    if a1.isErr() { append(mut &lines, a1.unwrapErr().msg) }
+    if a2.isErr() { append(mut &lines, a2.unwrapErr().msg) }
+    return lines
+}
+
+fn rowsOf(fo: &lexdb_store.Follower, s: &lexdb_store.FSnap, tree: int, back: bool): int {
+    var n = 0
+    if back {
+        fo.scanBack(s, tree, "", "", fn(e: &lexdb_store.Entry): bool {
+            n += 1
+            return true
+        }).unwrap()
+    } else {
+        fo.scan(s, tree, "", "", fn(e: &lexdb_store.Entry): bool {
+            n += 1
+            return true
+        }).unwrap()
+    }
+    return n
+}
+
+// A cut hides the base's leaves: they are not read.
+fn cold(lines: mut &[]str) {
+    let fs = lexdb_disk.sim(31)
+    let opts = lexdb_store.Options{cacheBytes: 4 * 1024 * 1024, segBytes: 1024 * 1024, ckptBytes: 64 * 1024 * 1024, snapNodes: 100000}
+    lexdb_store.run(fs, opts, fn(st: lexdb_store.Store): int {
+        var t = lexdb_store.begin()
+        let w = st.createTree(mut &t)     // cut whole
+        let h = st.createTree(mut &t)     // cut in the middle
+        let u = st.createTree(mut &t)     // untouched copy of h
+        for i in 0..3000 {
+            t.put(w, &(key(i)), &("w" + strings.repeat("x", 40) + i.toStr())).unwrap()
+            t.put(h, &(key(i)), &("w" + strings.repeat("x", 40) + i.toStr())).unwrap()
+            t.put(u, &(key(i)), &("w" + strings.repeat("x", 40) + i.toStr())).unwrap()
+        }
+        st.commit(t).unwrap()
+        st.checkpoint().unwrap()
+        let fo = lexdb_store.openFollower(lexdb_store.Link.LocalId(st, 1), fs, 48 * 1024).unwrap()
+        delRange(&st, w, "", "")
+        delRange(&st, h, &key(500), &key(2500))
+        fo.poll(st.durableBatch()).unwrap()
+        let s = fo.begin().unwrap()
+        let l0 = fo.stats().loads
+        let wr = rowsOf(&fo, &s, w, false) + rowsOf(&fo, &s, w, true)
+        let g = fo.get(&s, w, &key(1234)).unwrap().isSome()
+        let wl = fo.stats().loads - l0
+        let l1 = fo.stats().loads
+        let hr = rowsOf(&fo, &s, h, false)
+        let hl = fo.stats().loads - l1
+        let l2 = fo.stats().loads
+        let ur = rowsOf(&fo, &s, u, false)
+        let ul = fo.stats().loads - l2
+        let hb = rowsOf(&fo, &s, h, true)
+        fo.end(&s)
+        fo.close()
+        append(mut &lines, "cold: whole-tree cut loads " + wl.toStr() + ", rows " + (wr + (if g { 1 } else { 0 })).toStr() + ", half cut loads fewer " + (hl < ul).toStr() + ", rows " + hr.toStr())
+        if hb != hr || ur != 3000 { append(mut &lines, "cold: backward " + hb.toStr() + " untouched " + ur.toStr()) }
+        return 0
+    }).unwrap()
+}
+
+fn main() {
+    var lines: []str = []
+    for l in phase(81, 48 * 1024) { append(mut &lines, l) }
+    for l in phase(82, 16 * 1024 * 1024) { append(mut &lines, l) }
+    cold(mut &lines)
+    for l in lines { println(l) }
+}

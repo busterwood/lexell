@@ -520,12 +520,142 @@ The crash tests use the simulated Fs (`lexdb_disk.sim(seed)`, as
    - Planted bugs to catch: a separator left in place, a height off by
      one, a child at the range's edge removed, an edge leaf's key at `hi`
      deleted, a companion length skipped, the `validate` case missing.
+   - **As built (2026-11-14).** Code in `lexdb_store.lxl`, test
+     `store_delrange`; `Txn.delRange`, `OP_DELRANGE` (6), `WEntry.open`,
+     `edgeNeeds`/`writeNeeds`, `applyRange`, `applyDelRange`, `cutKids`,
+     `cutLeafRange`, `dropSubtree` (`applyDrop` now calls it), `chunkLens`,
+     `chunkLo`/`chunkHi`. Where it differs from 2.3 or adds to it:
+     - **Record:** the usual one (op 6, tree, key = lo, val = hi, no head).
+       `parseRecords` now rejects any op outside 1 to 6 as corrupt (D7).
+       `Fol.apply` panics on op 6 until stage 3: a follower that skipped it
+       would show the deleted rows.
+     - **`delRange` and the write set:** the range is not a key written, so
+       it is not in `idx` (a key `lo` there would hide a put of `lo`), and
+       `undoTo` skips it when it rebuilds `idx`. Only the transaction's own
+       *puts* in the range get an `OP_DEL` first (a key whose last write is
+       a delete needs none). Base rows in the range stay visible to the
+       transaction's own reads until stage 5.
+     - **Which side keeps the range:** at A the separator after L's child
+       stays, so the range of the removed middle children goes to H's side;
+       below A it goes to the path child, as 2.3 says. Both are in memory.
+       No root collapse is needed: A keeps both its L and H children.
+     - **Dirty and `willChange`:** a range that changes nothing (empty, or
+       no key in it in the edge leaves and no child to remove) marks and
+       changes nothing. Otherwise every node on L and H is marked dirty,
+       and `willChange` is called on those whose contents change.
+     - **`writeNeeds` for the companion:** the lengths present come from
+       `chunkLens`, which skips from one length to the next (descend to
+       `u16(L+1)`); `edgeNeeds` then loads the two paths of each length's
+       range. `cb(L, lo)` and `cb(L, hi)` are as in 2.3; for `hi == ""` the
+       end is `u16(L+1)`. One write returns one slot per pass, as before.
+     - **Lengths at apply time:** `applyRange` finds them again. A length
+       that an earlier write of the same commit made has no chunks in the
+       range (the range's own puts were made deletes first) and may have no
+       edge paths in memory: it is skipped (`edgeNeeds` finds a slot to
+       load). The main tree's paths must be in memory (`panic` otherwise,
+       as no later pass can load them).
+     - **Found on the way, fixed:** a descent whose root is not in memory
+       gives an empty path *and* `need >= 0`; the first version of
+       `chunkLens` tested the path first, took the tree for empty, and left
+       every chunk behind. `applyDelRange` and `chunkLens` test `need`
+       first. `store_delrange` checks the companion against the model for
+       this (`companionOf`: the keys it has chunks of are the model's large
+       values); `audit` does not see leftover chunks.
+     - **Test:** 3,000 random keys of lengths 66, 86 and 106, a 256 KB cache,
+       nine range shapes (each in a fresh store, reopened for every step, a
+       checkpoint after the commit in half of them and the log's replay
+       alone in the others), snapshots, conflicts (also scans up to `lo` and
+       from `hi`), same-transaction mixes (also a large value of a new key
+       length, a savepoint), the unknown op, 12 crashes. A range delete
+       loads at most 40 nodes in all of them.
+     - **Planted bugs, all caught:** separator left in place (a page index
+       out of range), height one too low at A (`lost` pages in the audit),
+       the edge child removed (rows missing), the key at `hi` deleted (one
+       row missing), the last companion length skipped (the companion's
+       leftover chunks), the `validate` case missing (a read at `hi`, and
+       the read of the tail, give the wrong answer). Also freeing the
+       removed slots at once instead of through `freeSubtree`: the
+       snapshot test fails.
 2. **Store: `countRange` and `noteRange`.**
    - Raw reads on the helper pool, the slot check and its restart.
    - Tests in `store_delrange`:
      - counts equal scan counts, cold and warm;
      - a checkpoint and an eviction during the count;
      - the cache's contents unchanged by a count.
+   - **As built (2026-11-14).** `Store.countRange`, `Store.noteRange`
+     (`lexdb_store.lxl`, before "many keys at once"), test
+     `store_countrange` (a new file, about 2 s). Where it differs from 2.2
+     or adds to it:
+     - **Nothing is loaded, edge leaves included.** 2.2 counts the edge
+       leaves from memory. A leaf that is cut by a bound is read raw and
+       decoded for its keys in range (`leafIn`), as is any inner page the
+       range cuts, so the count makes no load, no eviction and sets no
+       reference bit. `cacheState` (the nodes in memory, with their
+       reference and dirty bits and versions) is the same after, as are
+       `loads`, `evictions` and `loaded`.
+     - **Two steps.** Under one `sh.with` (no I/O) `countSlot` walks what is
+       in memory and leaves an item (page, the slot it hangs from, the
+       node's key range, whether it lies inside the range) for each slot not
+       in memory. Then `countPages` reads the items outside the lock, 2,048
+       pages at a time in sorted runs of consecutive pages
+       (`READS_IN_FLIGHT` reads at once on the helper pool, as `loadMany`),
+       counting a whole leaf from its header (u16 at 16, the same in every
+       leaf type) and turning an inner page's children into items: a whole
+       inner page reads its entries straight, no decoding. Memory is the
+       batch plus the items waiting (about one inner page's children per
+       batch page), not the subtree.
+     - **The slot check** covers every slot the reads started from (`CTop`:
+       slot, `gen`, `disk`), under one `with` after all the reads. Any
+       change (`gen` or `disk` differs, loaded, not used) starts the count
+       again from the root; the pages read in that try are dropped, and so
+       are their errors (a page freed and reused under the read is another
+       page: wrong checksum number, type or shape). An error with the slots
+       unchanged is real and returned. The first try and 3 restarts, then
+       `Ok(-1)`: the caller counts rows (stage 4's fallback to the row
+       path). A page chain over 64 deep is corrupt (a loop made by a reused
+       page).
+     - **Eviction frees the slots.** Evicting a parent frees its children's
+       slots (`dropSlot`), so a flush of the cache under a count is a
+       restart by `gen`, as a commit and checkpoint are by `disk`. A slot
+       whose parent is the root cannot be freed this way, and a flush leaves
+       the count as it was (nothing it counted changed).
+     - **A snapshot's view.** The design is silent. A transaction that reads
+       a snapshot (and is not `live`) counts the snapshot's tree, as of its
+       commit: `verOf` picks the version of each node in memory (current or
+       from `hist`), a slot not in memory at the snapshot's commit is read
+       raw, and a slot changed since has been loaded and has its old version
+       in `hist`, so the slot check restarts onto it. Leaves newer than the
+       snapshot (splits, inserts) are not reached: the old inner versions do
+       not name them. A cancelled snapshot gives 72000.
+     - **Own writes are not counted.** The count is of the tree, the
+       transaction's own puts and deletes in the range are not applied. The
+       executor's range delete (outside a block) has none in that tree. In a
+       block (stage 5) it must correct for `Txn.writes` or fall back.
+     - **A replica** counts by a scan (stage 3 may read headers).
+     - **`noteRange(t, tree, lo, hi)`** is `noteRead` at the commit the
+       transaction's reads see (`db.seq` live, the snapshot's own): a commit
+       of a put or delete of a key in `[lo, hi)` after it fails the
+       transaction (40001) at `validate`, the existing mark case. It does
+       nothing for an empty range, a `quiet` transaction, a read-only
+       snapshot (not tracked) or a replica. Without it, an insert that
+       commits first is removed by the range delete unseen (tested).
+     - **Hook for the tests:** `setCountHook(f, mode, arg)`, a plain `fn`
+       (a closure cannot be kept in the store), called between the walk and
+       the reads, outside the lock.
+     - **Tests:** counts against the model and a scan's for 72 ranges
+       (cold: 14 in freshly opened stores; mixed; warm: all in memory),
+       empty trees and absent tree, a commit and checkpoint, a new row, a
+       flush, and a change at every try (-1) during the count, a snapshot
+       counting its view through a delete, 600 inserts, changes, a
+       checkpoint and a flush, and the `noteRange` conflicts: insert,
+       update and delete in the range fail; below `lo`, a write at `hi`,
+       past `hi` and another tree commit; the statement run again counts the
+       inserted row.
+     - **Planted bugs, all caught:** the leaf's `hi` inclusive; the last
+       child of a whole inner page skipped; the restart missing (the insert
+       during the count is lost: counted 1800, want 1801); a child that
+       starts at `lo` skipped; the low edge, and the high edge, taken as
+       whole; `noteRange` not noting.
 3. **Follower: range tombstones.**
    - `Delta.cuts: [](lo, hi, batch)`.
    - `Fol.apply` adds a gone version for each delta key in range, then the
@@ -542,6 +672,46 @@ The crash tests use the simulated Fs (`lexdb_disk.sim(seed)`, as
      - `exec_replica`, with a range DELETE on the master read on the
        replica;
      - `tests/lexdb/replica.py`.
+   - **As built (2026-11-14).** `Delta.cuts` (`Cut{lo, hi, batch}`),
+     `Fol.apply`, `cutBy`, `deltaKeysIn`, `uncut`, `DRange.segs`,
+     `FStats.cuts` (`lexdb_store.lxl`); test `follow_delrange`. Where it
+     differs from the plan above or adds to it:
+     - **Apply:** an empty range is ignored. Each delta key in `[lo, hi)`
+       whose last version is not already gone gets a gone version at the
+       cut's batch, then the cut is appended. A put of the same batch after
+       the cut is a later version, so it wins.
+     - **No companion cuts.** The follower reads a large value's chunks
+       from the base's companion tree only through the main tree's base
+       entry (`unstore`), and keeps delta values whole. A cut that hides
+       the main entry hides the chunks, as an `OP_DEL` of a large value
+       does (it touches only the main key). So no per-length chunk ranges.
+     - **`get`:** `version` gives gone when the key has no delta version at
+       or before the batch and a cut at or before it holds the key.
+     - **Scans:** `deltaRange` gives `segs`, the parts of `[from, to)` not
+       covered by a cut at or before the snapshot's batch (`uncut`);
+       `scan` reads the base over each, `scanBack` over each from the last.
+       The delta merge runs on across them. Base leaves in a purged range
+       are not loaded (tested: a whole-tree cut loads no page).
+     - **`prune(floor)`** drops cuts below the floor, as versions; a delta
+       with cuts and no versions stays.
+     - **Base adopted across the delete:** nothing special. A snapshot on
+       the new base sees the delete in its pages (and the cut, kept while an
+       older base is in use, hides nothing the base has that a later put
+       did not restore: the put's version is in the delta).
+     - **Replica `countRange`** stays a scan: correct, and now it skips the
+       cut ranges. An exact count from leaf headers would have to correct
+       for the delta's versions and cuts over a base range, which is not
+       cheap; not done.
+     - **Tests:** `follow_delrange`: 15 scripted steps, each
+       checked against a master snapshot (whole, backward, point reads) with
+       kept snapshots across checkpoints, then a cold follower, then 60
+       random rounds with every range shape, at a 48 KB and a 16 MB follower
+       cache. Planted bugs, all caught: a cut ignored by `scanBack`, a cut
+       visible to an older snapshot, `prune` dropping cuts above the floor
+       (needed a check between the snapshots ending and the next
+       checkpoint).
+     - **`exec_replica`:** done in stage 4 (a range DELETE on the master
+       read on the replica), and `replica.py` has range deletes.
 4. **Executor: the statement.**
    - `rangeDelete` and its detector, the exact bounds and the
      coerce-back check, the lock check, `noteChg`, the tag,
@@ -560,6 +730,83 @@ The crash tests use the simulated Fs (`lexdb_disk.sim(seed)`, as
      `tds_tsql`-like cases.
    - Add range deletes to `tests/lexdb/crash/client.lxl`, and run
      `crash.py` for 6 rounds in each I/O mode.
+   - **As built (2026-11-14).** `rangeDelete`, `rangePlan`, `rdRange`,
+     `rdBound`, `rdConst`, `noteChgN` (`lexdb_exec.lxl`, after `delete`);
+     `Store.locksIn` (`lexdb_store.lxl`); `SET lexdb_range_delete` (parser,
+     `Session.rdel`, `Limits.rdel`, SHOW, RESET, a block's ROLLBACK);
+     `lexdb_exec.rangeDeletes()` counts the statements that took the path (a
+     test's check). Tests: `exec_rangedel` (121 shapes, each with the
+     switch on and off), `tds_rangedel`, `tns_rangedel`, `exec_replica`
+     (a range DELETE on the master), the crash client (table `ev`), and
+     `replica.py` (table `r`). Where it differs from 2.1 or adds to it:
+     - **The WHERE is read from the level's conjuncts** (`Level.cond`, all
+       of the WHERE for a DELETE), not from the `Path`. A conjunct counts
+       when it is `key column op c` (either side), `c` built only from
+       literals, parameters, `+ - * / % ||`, casts, a few stable functions
+       (`RD_FNS`: now(), current_timestamp, date_trunc, dateadd, ...) and
+       uncorrelated scalar subqueries. A function not in the list (user
+       functions, random(), sequences) is a residual, so the row path.
+     - **At most one equality per key column, in the leading columns, then
+       at most one lower and one upper bound on the next.** Two bounds the
+       same way (`id > 5 and id > 10`), an equality and a range on one
+       column, or an equality after a gap fall back.
+     - **A point (all key columns equal) falls back:** it is one row, and
+       the lookup is cheaper than a count.
+     - **The coerce-back check** is `compareZ(v, coerceZ(v, column type))
+       == 0` in the session's zone, so `id < 1500.5` on an int, a numeric
+       with a lost scale, a timestamp on a date, a float and a bigint past
+       an int (22003) all fall back. An evaluation error also falls back
+       (the row path gives it).
+     - **Key columns of exact kinds only where the range uses them**: a
+       float, a case-insensitive or padded text, `char(n)` or an enum in
+       the columns the range names falls back; one in a later column does
+       not matter.
+     - **Indexes (D2):** an index takes the same op when its leading
+       columns are the key columns the range uses (a partial index and an
+       index with more columns after them too): its entries are marker,
+       value, ..., so the rows of the range are one range of it
+       (`rdRange` with the marker). An index that is too short (an index on
+       `a` for a range on `(a, b)`), of another column or on an expression
+       sends the statement to the row path. **The whole table** (no WHERE)
+       takes the path with any indexes: each index's whole range goes.
+     - **Not taken inside a transaction block, with any write already in the
+       transaction (`hasWrites`), or in a `quiet` transaction** (a locking
+       SELECT's). Checked for the doors: T-SQL runs a statement of a batch
+       under a savepoint only when the session is already in a transaction
+       (`status != 'I'`: a block), and `IMPLICIT_TRANSACTIONS` begins one; a
+       DELETE in a TRY block outside a transaction takes the path.
+       **Oracle's door begins a block for every DML statement**
+       (`lexdb_tns.runCursor`: `BEGIN` when idle, then `SAVEPOINT`s), so a
+       DELETE from Oracle never takes the path in v1; `tns_rangedel`
+       checks the counts and that it falls back. Stage 5 is what makes
+       Oracle's (and psycopg2's) DELETE eligible.
+     - **Locks:** `Store.locksIn(tree, lo, hi)` scans the lock table for a
+       key of the tree in the range held by another owner; if one is, the
+       row path runs (it waits). EXPLAIN on a snapshot does the same check.
+     - **`noteChg`:** `noteChgN` adds n deletes to the session's pending
+       counts (the same memo the row path's `noteChg` fills).
+     - **The count's restarts:** `countRange` giving -1 sends the statement
+       to the row path (the statement then runs as today, after the range's
+       read mark was noted, which only makes it more likely to conflict).
+       `n == 0` writes nothing (`DELETE 0`), as does a NULL bound or an
+       empty range.
+     - **EXPLAIN** of a DELETE adds a line `range delete: primary key
+       range, subtrees dropped` (or `whole table`, with `(n indexes too)`,
+       or `no row can match`) when the statement would take the path; the
+       bounds are evaluated, so a scalar subquery in them runs.
+     - **`ROWNUM` in a DELETE** is refused by lexdb on both paths today
+       (`ORA-20000: window functions are not allowed in DELETE`), so
+       there was nothing to fall back from; TOP is a `limit` and falls
+       back.
+     - **Crash and replica tests.** The crash client has a table `ev` (no
+       secondary index): each worker inserts into it and range-deletes its
+       own rows below a point (count checked against its record; an
+       unanswered range delete must be whole or gone, being one write);
+       `crash.py --rounds 6` passed with io_uring (the default) and with
+       `LXL_URING=0`. `replica.py` has a table `r` with range deletes and
+       refills among its writes. `exec_replica`'s step shows the delete on
+       the replica (edges, both scan directions, a block that began
+       before, a checkpoint adopted).
 5. **Blocks.**
    - `Txn.cuts`, filtered in `getIn`, `getMany`, `scanIn`, `scanLeaves`,
      `scanBackIn` and `snapGet`, where the transaction's own writes
