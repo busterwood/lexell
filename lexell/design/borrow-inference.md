@@ -246,3 +246,32 @@ the sweep with the pass off:
   parameters were not swept.
 - **Code outside the sweep, generic instances and interface methods.** The
   pass keeps working there, which is why it stays.
+
+### 7.2 The compiler and cmd/ (2026-11-14)
+
+The same sweep over `compiler/` and `cmd/` changed 463 parameters. The 76
+in the lexdb server's modules were left as they were: lexdb work is going on
+elsewhere, and only the call sites the library change needed were touched
+there. The call-site script gained three repairs, and each `let` it adds
+goes only at the start of a statement, never into a condition or a branch:
+- `var x = s` becomes `var x: str = s`;
+- an argument borrowed from the receiver of a `mut` method (`p.node(...,
+  &p.toks[t].s)`) is moved into a `let` copy first;
+- a temporary that the result keeps a borrow of is moved into a `let`.
+
+The compiler, compiling itself with `-O`:
+
+| | dups | instructions |
+|---|---:|---:|
+| library swept, pass off | 7.43M | 6.382G |
+| library swept, pass on | 5.26M | 6.328G |
+| everything swept, pass off | 5.01M | 6.209G |
+| everything swept, pass on | 5.01M | 6.209G |
+
+**The pass now finds nothing to do** in any workload measured here, and
+leaves the binaries the same size. It costs 1.6% of `-O` compile time (550
+against 559 ms). It stays for code the sweeps have not reached, generic
+instances and interface methods.
+
+**The compiler is faster from the sweeps:** a default compile of itself
+takes 465 ms, against 489 before them, and an `-O` compile 550 against 596.
