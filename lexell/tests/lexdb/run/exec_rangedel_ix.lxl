@@ -1,0 +1,308 @@
+// lexdb_exec: a range DELETE on a table with indexes that do not lead with
+// the key columns (design/lexdb-bulkdelete.md stage 6, D2-b): the table's
+// subtrees are dropped, the indexes that lead with the range's key columns
+// are cut by range, and the entries of the others are deleted one by one
+// from the rows read. Each shape is run twice on identical tables, with SET
+// lexdb_range_delete on and off: the command tags, the rows left, EVERY
+// tree's contents (lexdb_exec.treeDump: the table's and each index's count
+// and a hash of all its entries), counts through each index against counts
+// by scan, and the data file's audit must agree; EXPLAIN says how many
+// indexes are cut by range and how many go entry by entry, and the count of
+// range deletes taken shows the path.
+// Families (t has id int primary key, v, w, x, u, s and a 150-byte pad; 4,000
+// rows, a 256 KB cache):
+// - one: an index on v. several: v; (w, s); s; (v, w). unique: unique
+//   indexes on u and on s, and on x (a third of its values NULL).
+// - expr: lower(s), v * 100 + coalesce(w, 0). partial: (v) where w > 10,
+//   (s) where w is null, unique (u) where v = 3. two: (v, w), (w, v), (w).
+// - ck: a two-column key (a, b) with indexes (b), (b, a), (a) and (a, b, v),
+//   a range on a. mix: all of those on one table, with (id) and (id, v), which
+//   are cut by range. big: every 40th pad is 20,000 bytes, an index on v,
+//   on length(pad) (an expression that reads the large value) and a partial
+//   one on it.
+// Statements: ranges (<, between, >=, equality on the first column), several
+// in a row, a re-insert of the very values deleted (unique entries must be
+// gone), the whole table, a DELETE with a residual (the row path), and in a
+// block: own writes before (inserts in the range, updates of indexed
+// columns, deletes), earlier range deletes, savepoints, ROLLBACK, a
+// re-insert of a deleted unique value in the same block, and a table made in
+// it.
+// expect: shapes 68: tags equal 68, rows equal 68, trees equal 68, consistent 68, audits clean 136
+// expect: path as expected 68
+// timeout: 600
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_sql"
+import "../../../cmd/lexdb_exec"
+
+type Val = lexdb_sql.Val
+
+type Shape = record {
+    name: str
+    fam: str
+    stmts: []str
+    want: str                   // EXPLAIN of the first DELETE must hold this ("" it takes no path; "taken": only that one did)
+    block: bool                 // EXPLAIN is asked inside a block
+}
+
+type Fam = record { setup: []str; pairs: [][]str; dump: []str; table: str }
+
+type Out = record { tags: str; dump: str; trees: str; pairs: int; audit: str; ex: str; taken: int }
+
+const PAD: str = "repeat('x', 150)"
+
+fn gs(n: int): str { return "generate_series(1, " + n.toStr() + ") i" }
+
+const T_COLS: str = "create table t (id int primary key, v int not null, w int, x int, u int not null, s text not null, pad text not null)"
+const T_ROWS: str = "insert into t select i, i % 7, case when i % 5 = 0 then null else i % 50 end, case when i % 3 = 0 then null else i end, i * 3, 's' || lpad(i::text, 6, '0'), "
+
+// The pairs of queries, one served by the indexes and one by a scan.
+fn tPairs(): [][]str {
+    return [["select count(*), sum(id) from t where v = 3", "select count(*), sum(id) from t where v + 0 = 3"],
+            ["select count(*), sum(v) from t where v >= 0", "select count(*), sum(v + 0) from t"],
+            ["select count(*), sum(id) from t where w = 7 and s >= 's001000'", "select count(*), sum(id) from t where w + 0 = 7 and s || '' >= 's001000'"],
+            ["select count(*) from t where s >= 's000000'", "select count(*) from t"],
+            ["select count(*), sum(id) from t where u >= 0 and u < 9000", "select count(*), sum(id) from t where u + 0 >= 0 and u + 0 < 9000"],
+            ["select count(*), sum(id) from t where x >= 0", "select count(*), sum(id) from t where x + 0 >= 0"],
+            ["select count(*), sum(id) from t where lower(s) >= 's001000' and lower(s) < 's002500'", "select count(*), sum(id) from t where upper(s) >= 'S001000' and upper(s) < 'S002500'"],
+            ["select count(*), sum(id) from t where v * 100 + coalesce(w, 0) = 307", "select count(*), sum(id) from t where v * 100 + coalesce(w, 0) + 0 = 307"],
+            ["select count(*), sum(id) from t where v = 2 and w > 10", "select count(*), sum(id) from t where v + 0 = 2 and w + 0 > 10"],
+            ["select count(*), sum(id) from t where w is null and s >= 's000500'", "select count(*), sum(id) from t where w is null and s || '' >= 's000500'"],
+            ["select count(*), sum(id) from t where length(pad) > 1000", "select count(*), sum(id) from t where length(pad) + 0 > 1000"],
+            ["select count(*), sum(id) from t where id > 100 and id < 3000", "select count(*), sum(id) from t where id + 0 > 100 and id + 0 < 3000"]]
+}
+
+fn tDump(): []str {
+    return ["select id, v, w, x, u, s, md5(pad) from t order by id", "select count(*), min(id), max(id) from t"]
+}
+
+fn famOf(name: str): Fam {
+    let pad = "case when i % 40 = 0 and " + (if name == "big" { "true" } else { "false" }) + " then repeat('z', 20000) else " + PAD + " end"
+    var setup = [T_COLS, T_ROWS + pad + " from " + gs(4000)]
+    if name == "one" { append(mut &setup, "create index t_v on t (v)") }
+    if name == "several" {
+        for x in ["create index t_v on t (v)", "create index t_ws on t (w, s)", "create index t_s on t (s)", "create index t_vw on t (v, w)"] { append(mut &setup, x) }
+    }
+    if name == "unique" {
+        for x in ["create unique index t_u on t (u)", "create unique index t_s on t (s)", "create unique index t_x on t (x)"] { append(mut &setup, x) }
+    }
+    if name == "expr" {
+        for x in ["create index t_ls on t (lower(s))", "create index t_e on t ((v * 100 + coalesce(w, 0)))"] { append(mut &setup, x) }
+    }
+    if name == "partial" {
+        for x in ["create index t_p on t (v) where w > 10", "create index t_p2 on t (s) where w is null", "create unique index t_pu on t (u) where v = 3"] { append(mut &setup, x) }
+    }
+    if name == "two" {
+        for x in ["create index t_vw on t (v, w)", "create index t_wv on t (w, v)", "create index t_w on t (w)"] { append(mut &setup, x) }
+    }
+    if name == "mix" {
+        for x in ["create index t_id on t (id)", "create index t_idv on t (id, v)", "create index t_v on t (v)", "create index t_ws on t (w, s)",
+                  "create unique index t_u on t (u)", "create unique index t_x on t (x)", "create index t_ls on t (lower(s))",
+                  "create index t_e on t ((v * 100 + coalesce(w, 0)))", "create index t_p on t (v) where w > 10", "create unique index t_pu on t (u) where v = 3"] { append(mut &setup, x) }
+    }
+    if name == "big" {
+        for x in ["create index t_v on t (v)", "create index t_len on t (length(pad))", "create index t_lenp on t (v) where length(pad) > 1000"] { append(mut &setup, x) }
+    }
+    if name == "ck" {
+        return Fam{table: "t", setup: ["create table t (a int, b int, v int not null, pad text not null, primary key (a, b))",
+                                       "insert into t select i / 100, i % 100, i % 5, " + PAD + " from " + gs(4000),
+                                       "create index t_b on t (b)", "create index t_ba on t (b, a)", "create index t_a on t (a)", "create index t_abv on t (a, b, v)"],
+                   pairs: [["select count(*), sum(a) from t where b = 7", "select count(*), sum(a) from t where b + 0 = 7"],
+                           ["select count(*), sum(v) from t where b >= 0 and a >= 0", "select count(*), sum(v + 0) from t"],
+                           ["select count(*), sum(b) from t where a >= 5 and a < 30", "select count(*), sum(b) from t where a + 0 >= 5 and a + 0 < 30"],
+                           ["select count(*), sum(v) from t where a = 12 and b >= 0 and v >= 0", "select count(*), sum(v) from t where a + 0 = 12"]],
+                   dump: ["select a, b, v, md5(pad) from t order by a, b", "select count(*) from t"]}
+    }
+    return Fam{table: "t", setup: setup, pairs: tPairs(), dump: tDump()}
+}
+
+fn sh(name: str, fam: str, stmts: []str, want: str): Shape { return Shape{name: name, fam: fam, stmts: stmts, want: want, block: false} }
+
+fn bl(name: str, fam: str, stmts: []str, want: str): Shape {
+    var b = sh(name, fam, stmts, want)
+    b.block = true
+    return b
+}
+
+// What a re-insert of rows lo..hi of t's first rows is: the very values deleted.
+fn reins(lo: int, hi: int, big: bool): str {
+    return "insert into t select i, i % 7, case when i % 5 = 0 then null else i % 50 end, case when i % 3 = 0 then null else i end, i * 3, 's' || lpad(i::text, 6, '0'), " +
+           (if big { "case when i % 40 = 0 then repeat('z', 20000) else " + PAD + " end" } else { PAD }) + " from generate_series(" + lo.toStr() + ", " + hi.toStr() + ") i"
+}
+
+// the families and their indexes, as EXPLAIN counts them
+fn ex(cut: int, all: int): str { return "(" + cut.toStr() + " of " + all.toStr() + " indexes cut by range, " + (all - cut).toStr() + " entry by entry)" }
+
+fn shapes(): []Shape {
+    var out: []Shape = []
+    for f in [["one", "1"], ["several", "4"], ["unique", "3"], ["expr", "2"], ["partial", "3"], ["two", "3"], ["big", "3"]] {
+        let n = strings.parseIntOpt(&f[1]).unwrapOr(0)
+        let w = ex(0, n)
+        let big = f[0] == "big"
+        append(mut &out, sh(f[0] + ": <", f[0], ["delete from t where id < 1500"], w))
+        append(mut &out, sh(f[0] + ": between", f[0], ["delete from t where id between 1000 and 2000", "select count(*) from t"], w))
+        append(mut &out, sh(f[0] + ": >= then <", f[0], ["delete from t where id >= 3500", "delete from t where id < 500", "delete from t where id between 1000 and 1100"], w))
+        append(mut &out, sh(f[0] + ": delete, re-insert, delete", f[0],
+                            ["delete from t where id < 1500", reins(1, 1500, big), "delete from t where id between 100 and 200", reins(100, 150, big), "delete from t where id < 1000"], w))
+        append(mut &out, bl(f[0] + ": block, own writes before", f[0], [
+            "begin", "insert into t values (0, 1, 5, 6, 1, 'own0', 'p'), (-3, 2, null, null, 7, 'own-3', 'p')", "update t set v = 5, s = 'u' || s where id between 100 and 120",
+            "update t set u = u + 100000 where id between 300 and 310", "delete from t where id between 200 and 210", "delete from t where id = 400",
+            "insert into t select i, 1, 20, i, i * 3 + 1000000, 'n' || i, 'p' from generate_series(5000, 5030) i",
+            "delete from t where id < 600", "select count(*), min(id) from t",
+            "delete from t where id between 4999 and 5100", "select count(*), max(id) from t", "commit"], w))
+        append(mut &out, bl(f[0] + ": block, delete then re-insert the same values", f[0], [
+            "begin", "delete from t where id < 800", reins(1, 800, big), "select count(*) from t", "delete from t where id between 300 and 500", reins(300, 400, big), "commit"], w))
+        append(mut &out, bl(f[0] + ": block, earlier range deletes and savepoints", f[0], [
+            "begin", "delete from t where id < 200", "delete from t where id < 300", "savepoint a", "delete from t where id between 150 and 700", "insert into t values (160, 1, 1, 1, 480, 's000160', 'p')",
+            "delete from t where id between 100 and 900", "rollback to a", "select count(*) from t", "delete from t where id between 250 and 400", "release a",
+            "delete from t where id >= 3000", "insert into t values (3500, 1, 1, 1, 10500, 's003500', 'p')", "delete from t where id >= 3400", "commit"], w))
+        append(mut &out, bl(f[0] + ": block, rolled back", f[0], ["begin", "delete from t where id < 1500", "select count(*) from t", "rollback", "select count(*) from t"], w))
+    }
+    // the row path stays for a residual
+    append(mut &out, sh("several: residual", "several", ["delete from t where id < 1500 and v = 3"], ""))
+    // a table with a two-column key
+    append(mut &out, sh("ck: a =", "ck", ["delete from t where a = 12"], ex(2, 4)))
+    append(mut &out, sh("ck: a range", "ck", ["delete from t where a >= 5 and a < 30", "delete from t where a > 35"], ex(2, 4)))
+    append(mut &out, sh("ck: a = b <", "ck", ["delete from t where a = 12 and b < 50"], ex(1, 4)))
+    append(mut &out, sh("ck: a = b range, then again", "ck", ["delete from t where a = 20 and b >= 10 and b < 90", "delete from t where a = 20 and b < 30", "delete from t where a < 8"], ex(1, 4)))
+    append(mut &out, bl("ck: block", "ck", ["begin", "delete from t where a = 12", "insert into t values (12, 5, 1, 'x')", "delete from t where a < 14", "select count(*), sum(b) from t where b = 5", "commit"], ex(2, 4)))
+    // everything on one table: the indexes of the key cut by range, the rest entry by entry
+    append(mut &out, sh("mix: <", "mix", ["delete from t where id < 1500"], ex(2, 10)))
+    append(mut &out, sh("mix: between, >=", "mix", ["delete from t where id between 1000 and 2000", "delete from t where id >= 3700"], ex(2, 10)))
+    append(mut &out, sh("mix: whole table", "mix", ["delete from t", reins(1, 100, false), "select count(*) from t"], ex(10, 10)))
+    append(mut &out, sh("mix: delete, re-insert", "mix", ["delete from t where id < 1500", reins(1, 1500, false), "delete from t where id < 800"], ex(2, 10)))
+    append(mut &out, bl("mix: block", "mix", [
+        "begin", "insert into t values (0, 1, 5, 6, 1, 'own0', 'p')", "update t set v = 5, s = 'u' || s, x = null where id between 100 and 120", "delete from t where id between 200 and 210",
+        "delete from t where id < 600", "insert into t values (300, 1, 5, 6, 900, 's000300', 'p')", "delete from t where id < 700", reins(1, 650, false), "delete from t where id between 100 and 300",
+        "savepoint a", "delete from t where id >= 3000", "rollback to a", "delete from t where id >= 3500", "commit"], ex(2, 10)))
+    append(mut &out, bl("mix: a table made in the block", "mix", [
+        "begin", "create table nt (id int primary key, v int, s text)", "create index nt_v on nt (v)", "create unique index nt_s on nt (lower(s))",
+        "insert into nt select i, i % 5, 'n' || i from generate_series(1, 300) i", "delete from nt where id < 100", "insert into nt values (50, 1, 'n50')", "delete from nt where id < 200",
+        "select count(*) from nt where v >= 0", "insert into nt values (60, 1, 'n60')", "commit", "select count(*), min(id) from nt"], "taken"))
+    return out
+}
+
+fn show(r: &lexdb_exec.Res): str {
+    if !r.hasRows { return r.tag }
+    var rows: []str = []
+    for row in r.rows {
+        var cells: []str = []
+        for v in row { append(mut &cells, lexdb_exec.text(&v)) }
+        append(mut &rows, strings.join(&cells, "|"))
+    }
+    return r.tag + ": " + strings.join(&rows, ";")
+}
+
+fn runOne(s: mut &lexdb_exec.Session, sql: &str): str {
+    let nt: []int = []
+    let ps: []Val = []
+    match lexdb_sql.parse(sql) {
+        Ok(stmts) {
+            match s.run(&stmts[0], &ps, &nt) {
+                Ok(r) { return show(&r) }
+                Err(e) { return "error " + e.state }
+            }
+        }
+        Err(e) { return "parse error " + e.state }
+    }
+}
+
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: 256 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 100000}
+}
+
+fn runShape(n: int, sh: &Shape, on: bool): Out {
+    var out = Out{tags: "", dump: "", trees: "", pairs: 0, audit: "", ex: "", taken: 0}
+    let fam = famOf(sh.fam)
+    let fs = lexdb_disk.sim(400 + n)
+    // the tables are built and the store closed, then opened again: nothing is in memory when the statements run
+    lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        for sql in fam.setup {
+            let r = runOne(mut &s, &sql)
+            if strings.contains(&r, "error") { out.tags = out.tags + "setup " + sql + ": " + r + "\n" }
+        }
+        s.close()
+        return 0
+    }).unwrap()
+    lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int {
+        var s = lexdb_exec.newSession(st)
+        let sw = runOne(mut &s, &("set lexdb_range_delete = " + (if on { "on" } else { "off" })))
+        for x in sh.stmts {
+            if strings.startsWith(&x, "delete") {
+                if sh.block { let b = runOne(mut &s, &"begin") }
+                out.ex = runOne(mut &s, &("explain " + x))
+                if sh.block { let b = runOne(mut &s, &"rollback") }
+                break
+            }
+        }
+        let before = lexdb_exec.rangeDeletes()
+        for x in sh.stmts { out.tags = out.tags + runOne(mut &s, &x) + "\n" }
+        out.taken = lexdb_exec.rangeDeletes() - before
+        for d in fam.dump { out.dump = out.dump + runOne(mut &s, &d) + "\n" }
+        out.trees = lexdb_exec.treeDump(&st, &fam.table)
+        if sh.name == "mix: a table made in the block" { out.trees = out.trees + " / " + lexdb_exec.treeDump(&st, &"nt") }
+        var ok = true
+        for p in fam.pairs {
+            let a = runOne(mut &s, &p[0])
+            let b = runOne(mut &s, &p[1])
+            if a != b || strings.contains(&a, "error") { ok = false }
+        }
+        if ok { out.pairs = 1 }
+        s.close()
+        return 0
+    }).unwrap()
+    out.audit = match lexdb_store.audit(fs) { Ok(a) { a } Err(e) { "audit: " + e.msg } }
+    return out
+}
+
+fn clean(a: &str): bool { return strings.contains(a, "lost 0, twice 0") }
+
+fn firstDiff(a: &str, b: &str): str {
+    var i = 0
+    while i < len(a) && i < len(b) && a[i] == b[i] { i += 1 }
+    var j = i
+    while j > 0 && a[j - 1] != '\n' { j -= 1 }
+    var e1 = i
+    while e1 < len(a) && a[e1] != '\n' { e1 += 1 }
+    var e2 = i
+    while e2 < len(b) && b[e2] != '\n' { e2 += 1 }
+    let c1 = if e1 > i + 80 { i + 80 } else { e1 }
+    let c2 = if e2 > i + 80 { i + 80 } else { e2 }
+    let from = if i > j + 40 { i - 40 } else { j }
+    return "on: " + a[from..c1] + " / off: " + b[from..c2]
+}
+
+fn main() {
+    let list = shapes()
+    var tagsEq = 0
+    var rowsEq = 0
+    var treesEq = 0
+    var cons = 0
+    var clean2 = 0
+    var asWanted = 0
+    for n in 0..len(list) {
+        let a = runShape(n, &list[n], true)
+        let b = runShape(n, &list[n], false)
+        let nm = list[n].name
+        if a.tags == b.tags && !strings.contains(&a.tags, "setup ") { tagsEq += 1 } else { println(nm + ": tags differ " + firstDiff(&a.tags, &b.tags)) }
+        if a.dump == b.dump { rowsEq += 1 } else { println(nm + ": rows differ " + firstDiff(&a.dump, &b.dump)) }
+        if a.trees == b.trees { treesEq += 1 } else { println(nm + ": trees differ: on " + a.trees + " off " + b.trees) }
+        if a.pairs == 1 && b.pairs == 1 { cons += 1 } else { println(nm + ": an index disagrees with a scan: on " + a.pairs.toStr() + " off " + b.pairs.toStr()) }
+        if clean(&a.audit) { clean2 += 1 } else { println(nm + ": audit on: " + a.audit) }
+        if clean(&b.audit) { clean2 += 1 } else { println(nm + ": audit off: " + b.audit) }
+        let want = list[n].want
+        let line = strings.contains(&a.ex, "range delete:")
+        let ok = if want == "" { !line && a.taken == 0 }
+                 else if want == "taken" { a.taken > 0 }
+                 else { line && strings.contains(&a.ex, &want) && a.taken > 0 }
+        if ok && !strings.contains(&b.ex, "range delete:") && b.taken == 0 { asWanted += 1 } else {
+            println(nm + ": expected " + want + ", taken on " + a.taken.toStr() + ", off " + b.taken.toStr() + "; explain: " + a.ex)
+        }
+    }
+    println("shapes " + len(list).toStr() + ": tags equal " + tagsEq.toStr() + ", rows equal " + rowsEq.toStr() + ", trees equal " + treesEq.toStr() + ", consistent " + cons.toStr() +
+            ", audits clean " + clean2.toStr())
+    println("path as expected " + asWanted.toStr())
+}

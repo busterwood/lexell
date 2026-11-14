@@ -140,7 +140,13 @@ def writes(rng, rnd):
             sql.append("update t set g = (g + 1) %% 5 where id %% 13 = %d" % rng.randrange(13))
         elif k == 6:
             # a range delete of r, whose key is its whole index
-            sql.append("delete from r where id >= %d and id < %d" % (a * 10, a * 10 + rng.randrange(100, 5000)))
+            # (half of them in a block, after an insert into the range: the block's own writes count, stage 5)
+            lo, hi = a * 10, a * 10 + rng.randrange(100, 5000)
+            if rng.randrange(2):
+                sql.append("begin; insert into r select i, repeat('b', 60) from generate_series(%d, %d) i where i not in (select id from r); "
+                           "delete from r where id >= %d and id < %d; commit" % (lo, lo + 50, lo + 20, hi))
+            else:
+                sql.append("delete from r where id >= %d and id < %d" % (lo, hi))
         else:
             sql.append("insert into r select i, repeat('r', 60) from generate_series(%d, %d) i where i not in (select id from r)"
                        % (a * 10, a * 10 + rng.randrange(100, 3000)))

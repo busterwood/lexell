@@ -1,0 +1,227 @@
+// lexdb_exec: DELETE ... WITH (batch_rows n) and UPDATE ... WITH (batch_rows n)
+// commit each n rows as their own transaction (design/lexdb-bulkdelete.md
+// section 3, stage 8), so that a huge statement that cannot take the range
+// path holds n rows' writes. Not atomic: a failure keeps the batches before
+// it, and its context says how many.
+// - 10 rows in batches of 3 (4 batches), 9 in batches of 3 (the last finds
+//   nothing), the tags, the rows left; a key range takes the range path and
+//   ignores batch_rows; one with an index whose entries go one by one does
+//   not (it is as many writes as rows).
+// - a failure in the third batch keeps the six rows of the first two (a
+//   foreign key for DELETE, a division by zero for UPDATE).
+// - the refusals: a block, RETURNING, USING and FROM, TOP, an UPDATE of a
+//   key column, batch_rows 0, junk.
+// - an UPDATE moves no row twice: its WHERE reads the column it changes (and
+//   an index on it), a two-column key, a table with an index it is planned
+//   by: every row changed exactly once.
+// - a sparse predicate over 20,000 rows reads the table once in all (the
+//   scan's own batch of 256 rows at most again after each of 6 batches; the
+//   rows read, counted by the executor), where running the query again from
+//   the start would read it per batch; a DELETE read through an index runs
+//   again and does not read the table at all.
+// - max_statement_mem: a statement that holds all its rows fails (53200);
+//   the same in batches of 100 passes.
+// - a conflict at a batch's commit (a writer between the batch's rows and
+//   its commit) runs that batch again.
+// - the same suffix in T-SQL's and Oracle's parsers.
+// expect: ten: DELETE 10, left 0, batches 4
+// expect: nine: DELETE 9, left 0, batches 4
+// expect: range path: DELETE 5, left 5, batches 0, range deletes 1
+// expect: range path with an index entry by entry: DELETE 5, left 5, batches 2, range deletes 0
+// expect: update: UPDATE 10, v 101,102,103,104,105,106,107,108,109,110, batches 4
+// expect: halloween, an index on the column: UPDATE 10, every row once true, batches 4
+// expect: halloween, two-column key: UPDATE 12, every row once true
+// expect: halloween, past the index: UPDATE 9, every row once true
+// expect: delete failure: 23503 DELETE with batch_rows 3: 6 rows committed before the error; left 7,8,9,10
+// expect: update failure: 22012 UPDATE with batch_rows 3: 6 rows committed before the error; changed 6, not changed 4
+// expect: refused: block 25001, returning 0A000, using 0A000, from 0A000, key 0A000, zero 22023, junk 42601
+// expect: refused in a block: nothing changed true
+// expect: sparse: DELETE 20, left 19980, read once true, batches 6
+// expect: by an index: DELETE 20, left 19980, read less than the table true
+// expect: memory: all at once 53200, in batches DELETE 4000
+// expect: conflict: DELETE 10, a batch again 1, left 0, the writer's row gone true
+// expect: oracle: DELETE 4, left 1
+// expect: tsql parse: 3 5, top 0A000
+// timeout: 300
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_sql"
+
+// The last statement's tag, or the first error's state and context.
+fn r(s: mut &lexdb_exec.Session, sql: str): str {
+    match s.exec(&sql) {
+        Ok(rs) {
+            let x = &rs[len(rs) - 1]
+            if x.hasRows {
+                var rows: []str = []
+                for row in x.rows {
+                    var cells: []str = []
+                    for v in row { append(mut &cells, if lexdb_exec.isNull(&v) { "<null>" } else { lexdb_exec.text(&v) }) }
+                    append(mut &rows, strings.join(&cells, "|"))
+                }
+                return strings.join(&rows, ";")
+            }
+            return x.tag
+        }
+        Err(e) { return e.state + (if len(e.context) > 0 { " " + e.context } else { "" }) }
+    }
+}
+
+fn state(s: mut &lexdb_exec.Session, sql: str): str { return strings.split(&r(s, sql), " ")[0].toStr() }
+
+fn fill(s: mut &lexdb_exec.Session, n: int) {
+    let d = r(s, "drop table if exists t")
+    let c = r(s, "create table t (n int primary key, a text, v int)")
+    let i = r(s, "insert into t select i, 'x', i from generate_series(1, " + n.toStr() + ") i")
+}
+
+// The batch at which another session writes a row the batch read (-1 never).
+var HOOK_AT: int = -1
+
+fn hook(st: lexdb_store.Store, b: int) {
+    if b != HOOK_AT { return }
+    HOOK_AT = -1
+    var w = lexdb_exec.newSession(st)
+    let x = r(mut &w, "update t set a = 'other' where n = 5")
+    w.close()
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(41), lexdb_store.Options{cacheBytes: 16 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+
+        // 10 rows in batches of 3; 9 in batches of 3
+        fill(mut &s, 10)
+        var b0 = lexdb_exec.batchRuns()
+        var tag = r(mut &s, "delete from t where v >= 0 with (batch_rows 3)")
+        println("ten: " + tag + ", left " + r(mut &s, "select count(*) from t") + ", batches " + (lexdb_exec.batchRuns() - b0).toStr())
+        fill(mut &s, 9)
+        b0 = lexdb_exec.batchRuns()
+        tag = r(mut &s, "delete from t where v >= 0 with (batch_rows 3)")
+        println("nine: " + tag + ", left " + r(mut &s, "select count(*) from t") + ", batches " + (lexdb_exec.batchRuns() - b0).toStr())
+
+        // a key range: the range path, one write
+        fill(mut &s, 10)
+        b0 = lexdb_exec.batchRuns()
+        var rd0 = lexdb_exec.rangeDeletes()
+        tag = r(mut &s, "delete from t where n <= 5 with (batch_rows 3)")
+        println("range path: " + tag + ", left " + r(mut &s, "select count(*) from t") + ", batches " + (lexdb_exec.batchRuns() - b0).toStr() + ", range deletes " + (lexdb_exec.rangeDeletes() - rd0).toStr())
+        // ... an index on another column: its entries go one by one, so the row path in batches
+        fill(mut &s, 10)
+        let ix = r(mut &s, "create index t_v on t (v)")
+        b0 = lexdb_exec.batchRuns()
+        rd0 = lexdb_exec.rangeDeletes()
+        tag = r(mut &s, "delete from t where n <= 5 with (batch_rows 3)")
+        println("range path with an index entry by entry: " + tag + ", left " + r(mut &s, "select count(*) from t") + ", batches " + (lexdb_exec.batchRuns() - b0).toStr() + ", range deletes " + (lexdb_exec.rangeDeletes() - rd0).toStr())
+
+        // UPDATE: each row once; the WHERE reads the column it changes
+        fill(mut &s, 10)
+        b0 = lexdb_exec.batchRuns()
+        tag = r(mut &s, "update t set v = v + 100 where v < 1000 with (batch_rows 3)")
+        println("update: " + tag + ", v " + r(mut &s, "select string_agg(v::text, ',' order by n) from t") + ", batches " + (lexdb_exec.batchRuns() - b0).toStr())
+        // ... the same with an index on v (the planner reads by it: the UPDATE reads by the key)
+        fill(mut &s, 10)
+        let i2 = r(mut &s, "create index t_v on t (v)")
+        let z = r(mut &s, "alter table t add column c int default 0")
+        b0 = lexdb_exec.batchRuns()
+        tag = r(mut &s, "update t set v = v + 100, c = c + 1 where v between 1 and 1000 with (batch_rows 3)")
+        println("halloween, an index on the column: " + tag + ", every row once " + (r(mut &s, "select count(*) from t where c = 1 and v = n + 100") == "10").toStr() +
+                ", batches " + (lexdb_exec.batchRuns() - b0).toStr())
+        // ... a two-column key
+        let d3 = r(mut &s, "drop table if exists t2")
+        let c3 = r(mut &s, "create table t2 (a int, b int, c int not null default 0, primary key (a, b))")
+        let n3 = r(mut &s, "insert into t2 select i / 4, i % 4, 0 from generate_series(0, 11) i")
+        tag = r(mut &s, "update t2 set c = c + 1 where c < 100 with (batch_rows 5)")
+        println("halloween, two-column key: " + tag + ", every row once " + (r(mut &s, "select count(*) from t2 where c = 1") == "12").toStr())
+        // ... a column that moves the row past the index range it is read by
+        fill(mut &s, 9)
+        let i4 = r(mut &s, "create index t_v on t (v)")
+        let z4 = r(mut &s, "alter table t add column c int default 0")
+        tag = r(mut &s, "update t set v = v + 10, c = c + 1 where v >= 1 with (batch_rows 2)")
+        println("halloween, past the index: " + tag + ", every row once " + (r(mut &s, "select count(*) from t where c = 1 and v = n + 10") == "9").toStr())
+
+        // a failure in the third batch
+        let d5 = r(mut &s, "drop table if exists c; drop table if exists p")
+        let c5 = r(mut &s, "create table p (n int primary key, v int); create table c (id int primary key, p int references p)")
+        let n5 = r(mut &s, "insert into p select i, i from generate_series(1, 10) i; insert into c values (1, 7)")
+        let f5 = r(mut &s, "delete from p where v >= 0 with (batch_rows 3)")
+        println("delete failure: " + f5 + "; left " + r(mut &s, "select string_agg(n::text, ',' order by n) from p"))
+        fill(mut &s, 10)
+        let f6 = r(mut &s, "update t set v = 100 / (n - 7) where n >= 1 with (batch_rows 3)")
+        println("update failure: " + f6 + "; changed " + r(mut &s, "select count(*) from t where v != n and v < 100 and n < 7") +
+                ", not changed " + r(mut &s, "select count(*) from t where v = n"))
+
+        // the refusals
+        fill(mut &s, 10)
+        let bl = r(mut &s, "begin")
+        let inBlock = state(mut &s, "delete from t where v >= 0 with (batch_rows 3)")
+        let rb = r(mut &s, "rollback")
+        println("refused: block " + inBlock + ", returning " + state(mut &s, "delete from t where v >= 0 returning n with (batch_rows 3)") +
+                ", using " + state(mut &s, "delete from t using t u where t.n = u.n with (batch_rows 3)") +
+                ", from " + state(mut &s, "update t set v = 1 from t u where t.n = u.n with (batch_rows 3)") +
+                ", key " + state(mut &s, "update t set n = n + 100 where v >= 0 with (batch_rows 3)") +
+                ", zero " + state(mut &s, "delete from t where v >= 0 with (batch_rows 0)") +
+                ", junk " + state(mut &s, "delete from t where v >= 0 with (batch_rows x)"))
+        println("refused in a block: nothing changed " + (r(mut &s, "select count(*) from t") == "10").toStr())
+
+        // a sparse predicate: read once in all
+        fill(mut &s, 20000)
+        b0 = lexdb_exec.batchRuns()
+        var rd = lexdb_exec.batchRead()
+        tag = r(mut &s, "delete from t where v % 1000 = 0 with (batch_rows 4)")
+        println("sparse: " + tag + ", left " + r(mut &s, "select count(*) from t") + ", read once " + (lexdb_exec.batchRead() - rd <= 20000 + 6 * 256).toStr() +
+                ", batches " + (lexdb_exec.batchRuns() - b0).toStr())
+        // ... through an index: run again, and the index gives the rows
+        fill(mut &s, 20000)
+        let i6 = r(mut &s, "create index t_v on t (v)")
+        let u6 = r(mut &s, "update t set v = -1 where v % 1000 = 0")
+        rd = lexdb_exec.batchRead()
+        tag = r(mut &s, "delete from t where v = -1 with (batch_rows 4)")
+        println("by an index: " + tag + ", left " + r(mut &s, "select count(*) from t") + ", read less than the table " + (lexdb_exec.batchRead() - rd < 2000).toStr())
+
+        // max_statement_mem: the rows held
+        let d7 = r(mut &s, "drop table t")
+        let c7 = r(mut &s, "create table t (n int primary key, a text, v int)")
+        let i7 = r(mut &s, "insert into t select i, repeat('x', 500), i from generate_series(1, 4000) i")
+        let m7 = r(mut &s, "set max_statement_mem = '512kB'")
+        let all = state(mut &s, "delete from t where v >= 0")
+        let batched = r(mut &s, "delete from t where v >= 0 with (batch_rows 100)")
+        println("memory: all at once " + all + ", in batches " + batched)
+        let m8 = r(mut &s, "set max_statement_mem = 0")
+
+        // a conflict at a batch's commit
+        fill(mut &s, 10)
+        HOOK_AT = lexdb_exec.batchRuns() + 2
+        lexdb_exec.setBatchHook(hook)
+        let re0 = lexdb_exec.batchRetries()
+        tag = r(mut &s, "delete from t where v >= 0 with (batch_rows 3)")
+        HOOK_AT = -1
+        println("conflict: " + tag + ", a batch again " + (lexdb_exec.batchRetries() - re0).toStr() + ", left " + r(mut &s, "select count(*) from t") +
+                ", the writer's row gone " + (r(mut &s, "select count(*) from t where a = 'other'") == "0").toStr())
+
+        // the suffix in Oracle's and T-SQL's parsers
+        fill(mut &s, 5)
+        let noVars: []str = []
+        let os = lexdb_sql.oraParse(&"delete from t where v >= 2 with (batch_rows 3)").unwrap()
+        let none: []lexdb_sql.Val = []
+        let nt: []int = []
+        match s.run(&os[0], &none, &nt) {
+            Ok(x) { println("oracle: " + x.tag + ", left " + r(mut &s, "select count(*) from t")) }
+            Err(e) { println("oracle: " + e.state + " " + e.msg) }
+        }
+        var tp = lexdb_sql.tsqlParser(&"delete from t where v >= 2 with (batch_rows 3)", lexdb_sql.pgDialect(), &noVars).unwrap()
+        let ts = tp.statement().unwrap()
+        var tp2 = lexdb_sql.tsqlParser(&"update t set v = 1 where v >= 2 with (batch_rows 5)", lexdb_sql.pgDialect(), &noVars).unwrap()
+        let ts2 = tp2.statement().unwrap()
+        let tt = lexdb_sql.tsqlParser(&"delete top (2) from t with (batch_rows 3)", lexdb_sql.pgDialect(), &noVars).unwrap()
+        var tp3 = tt
+        let ts3 = tp3.statement().unwrap()
+        let top = match s.run(&ts3, &none, &nt) { Ok(x) { x.tag } Err(e) { e.state } }
+        println("tsql parse: " + ts.copy.batchRows.toStr() + " " + ts2.copy.batchRows.toStr() + ", top " + top)
+        s.close()
+        return 0
+    }).unwrap()
+}

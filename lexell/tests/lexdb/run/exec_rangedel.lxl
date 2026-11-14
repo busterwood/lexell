@@ -13,24 +13,47 @@
 //   BETWEEN, both bounds, a bound flipped, parameters, now(), a scalar
 //   subquery, NULL, no WHERE; keys at the ends of the type; deletes in a
 //   row with inserts into the dropped range between; large values in the
-//   range; indexes that lead with the range's key columns; a temporary
+//   range; indexes that lead with the range's key columns, and (stage 6)
+//   indexes that do not, whose entries go one by one (exec_rangedel_ix
+//   has those at length); a temporary
 //   table; a keyless table.
-// - falls back: an index of another column, an expression index with a
-//   range, a table others reference, RETURNING, USING, a residual
+// - falls back: a table others reference, RETURNING, USING, a residual
 //   conjunct, OR, IN, a bound that does not survive the column's type
 //   (1500.5 on an int, a numeric scale, a timestamp on a date, a bigint
 //   past an int, a float), a float key, a case-insensitive key, a volatile
 //   function, a point, a column after the first, an equality and a range on
-//   one column, two bounds one way, a transaction block.
+//   one column, two bounds one way.
+// - inside a transaction block (stage 5; Txn.cuts, Store.countView): 12
+//   scripts run on and off, each reading the rows after the range delete
+//   (point, range, backward, IN, through an index), inserting into the
+//   deleted range, updating and deleting in it (0 rows), own writes before
+//   the delete (inserts of new keys, updates, deletes, earlier overlapping
+//   range deletes, adjacent ones), savepoints (ROLLBACK TO before and
+//   after), ROLLBACK, a table made in the block, large values and
+//   qualifying indexes; the counts must equal the row path's. Then two
+//   sessions: 40001 both ways, a write of a row in the range that commits
+//   first or second, a locked row, a lock taken after.
 // - the switch (SET, SHOW, RESET, a block's ROLLBACK); a row locked by
 //   another session; a row inserted into the range by another session
 //   between the count and the commit (40001: the statement runs again and
 //   deletes it too).
-// expect: shapes 121: tags equal 121, rows equal 121, audits clean 242
-// expect: path as expected 121: 81 took it, 40 fell back
+// expect: shapes 134: tags equal 134, rows equal 134, audits clean 268
+// expect: path as expected 134: 99 took it, 35 fell back
 // expect: switch: on, off, on after RESET, on after the block's ROLLBACK, 22023 for junk
 // expect: locked: explain without the line true, with it after COMMIT true
 // expect: concurrent insert: DELETE 1801, the count ran again true, left 2200, the inserted row gone true, audit clean true
+// expect: blocks, insert first: DELETE 300, in block SELECT 1: 0, INSERT 0 1, commit error 40001, then SELECT 1: 301
+// expect: blocks, again: DELETE 301, COMMIT, left SELECT 1: 0
+// expect: blocks, outside: DELETE 101, INSERT 0 1, UPDATE 1, commit COMMIT, left SELECT 1: 20
+// expect: blocks, delete first: DELETE 11, the block's commit error 40001
+// expect: blocks, update first: DELETE 101, UPDATE 1, COMMIT, delete's commit error 40001
+// expect: blocks, delete first, update second: DELETE 101, UPDATE 1, COMMIT, update's commit error 40001
+// expect: blocks, locked first: explain over the locked rows true, elsewhere true
+// expect: blocks, lock after: DELETE 101, the locker SELECT 1: 5250 and UPDATE 1 at once, delete's commit COMMIT, locker's commit error 40001
+// expect: blocks, lock after, locker first: DELETE 101, locker's commit COMMIT, delete's commit error 40001, row left SELECT 1: 1
+// expect: blocks, range deletes taken 8
+// expect: blocks, table SELECT 1: 5375|16585139
+// expect: blocks: audit clean true
 // timeout: 600
 import "strings"
 import "../../../cmd/lexdb_store"
@@ -49,6 +72,7 @@ type Shape = record {
     stmts: []Q
     take: bool                  // the statements take the range path
     block: bool                 // EXPLAIN is asked inside a block
+    noex: bool                  // the first DELETE is not the one to check EXPLAIN on
 }
 
 type Fam = record { setup: []str; dump: []str }
@@ -59,8 +83,18 @@ fn q(sql: str): Q { return Q{sql: sql, ps: []} }
 
 fn qp(sql: str, ps: []Val): Q { return Q{sql: sql, ps: ps} }
 
+// A script run in one session: its DELETEs without a residual take the path.
+fn blockShape(name: str, fam: str, sqls: []str): Shape {
+    var qs: []Q = []
+    for x in sqls { append(mut &qs, q(x)) }
+    var b = sh(name, fam, qs, true)
+    b.block = true
+    b.noex = name == "block: own writes before the delete" || name == "block: a table made in it"
+    return b
+}
+
 fn sh(name: str, fam: str, stmts: []Q, take: bool): Shape {
-    return Shape{name: name, fam: fam, pre: [], stmts: stmts, take: take, block: false}
+    return Shape{name: name, fam: fam, pre: [], stmts: stmts, take: take, block: false, noex: false}
 }
 
 fn gs(n: int): str { return "generate_series(1, " + n.toStr() + ") i" }
@@ -255,12 +289,84 @@ fn shapes(): []Shape {
     append(mut &out, sh("int correlated subquery", "int", [q("delete from t where id < 200 and exists (select 1 from u where u.id = t.id)")], false))
     append(mut &out, sh("int IS NOT NULL", "int", [q("delete from t where id is not null and id < 100")], false))
     append(mut &out, sh("int expression of the key", "int", [q("delete from t where id + 0 < 1500")], false))
-    var blk = sh("int in a block", "int", [q("begin"), q("delete from t where id < 1500"), q("select count(*) from t"), q("commit")], false)
+    // ---- inside a transaction block (stage 5): the transaction's own reads see the range gone
+    var blk = sh("int in a block", "int", [q("begin"), q("delete from t where id < 1500"), q("select count(*) from t"), q("commit")], true)
     blk.block = true
     append(mut &out, blk)
-    var blk2 = sh("int in a block, rolled back", "int", [q("begin"), q("delete from t where id < 1500"), q("rollback"), q("select count(*) from t")], false)
+    var blk2 = sh("int in a block, rolled back", "int", [q("begin"), q("delete from t where id < 1500"), q("select count(*) from t"), q("rollback"), q("select count(*) from t")], true)
     blk2.block = true
     append(mut &out, blk2)
+    append(mut &out, blockShape("block: delete, read, count, insert, update, delete again", "int", [
+        "begin", "delete from t where id < 1500", "select count(*), min(id), max(id) from t", "select count(*) from t where id < 2000",
+        "select id from t where id = 700", "select id, v from t where id between 695 and 705 order by id",
+        "select id from t where id < 1600 order by id desc limit 3", "select id from t where id in (5, 700, 1499, 1500, 1501) order by id",
+        "select id from t where id < 1500 order by id desc limit 3", "select count(*) from u join t on t.id = u.id",
+        "select count(*) from t where id in (select id from u)", "select count(*), min(t.id) from t join u on u.id = t.id + 1000",
+        "insert into t values (700, 1, 'n')", "select id from t where id < 1500 order by id desc limit 3", "select count(*) from u join t on t.id = u.id", "select id, v, pad from t where id between 695 and 705 order by id",
+        "select id from t where id < 1600 order by id desc limit 3",
+        "update t set v = 9 where id = 800", "update t set v = 9 where id = 700", "delete from t where id = 800",
+        "update t set id = 701 where id = 5000", "select id from t where id between 695 and 705 order by id",
+        "delete from t where id < 1500", "select count(*) from t", "delete from t where id < 1500", "delete from t where id < 1700 and v = 3",
+        "select count(*) from t", "commit"]))
+    append(mut &out, blockShape("block: own writes before the delete", "int", [
+        "begin", "delete from t where id = 100", "update t set v = 99 where id = 101", "insert into t values (0, 1, 'a'), (-5, 1, 'a')",
+        "update t set pad = 'zz' where id between 110 and 120", "insert into t select i, 1, 'n' from generate_series(6001, 6050) i",
+        "delete from t where id < 300", "select count(*), min(id), max(id) from t", "delete from t where id > 5990",
+        "select count(*), min(id), max(id) from t", "delete from t where id between 4000 and 4010", "insert into t values (4005, 1, 'b')",
+        "delete from t where id between 4000 and 4010", "select count(*) from t where id between 3990 and 4020", "commit"]))
+    append(mut &out, blockShape("block: earlier range deletes overlap", "int", [
+        "begin", "delete from t where id < 200", "delete from t where id < 300", "delete from t where id between 150 and 250",
+        "insert into t values (150, 1, 'a'), (260, 1, 'a'), (280, 1, 'a')", "delete from t where id between 100 and 270",
+        "select count(*), min(id) from t", "delete from t where id between 100 and 400",
+        "delete from t where id between 1000 and 1100", "delete from t where id between 1101 and 1200", "delete from t where id between 1050 and 1150",
+        "delete from t where id between 900 and 1300", "select count(*) from t where id between 800 and 1400",
+        "delete from t where id >= 5000", "delete from t where id >= 4000", "insert into t values (5500, 1, 'a')", "delete from t",
+        "select count(*) from t", "insert into t values (1, 1, 'a')", "select id from t", "commit"]))
+    append(mut &out, blockShape("block: savepoints", "int", [
+        "begin", "savepoint a", "delete from t where id < 1500", "select count(*) from t", "rollback to a", "select count(*) from t",
+        "delete from t where id < 800", "savepoint b", "delete from t where id < 1500", "select count(*) from t where id < 1000", "insert into t values (900, 1, 'a')",
+        "rollback to b", "select count(*) from t where id < 1000", "select id from t where id between 795 and 805 order by id",
+        "savepoint c", "delete from t where id between 2000 and 2100", "insert into t values (2050, 1, 'a')", "delete from t where id between 2040 and 2060",
+        "rollback to c", "select count(*) from t where id between 1990 and 2110", "delete from t where id between 2000 and 2100",
+        "release c", "select count(*) from t where id between 1990 and 2110", "commit"]))
+    append(mut &out, blockShape("block: rolled back after own writes", "int", [
+        "begin", "insert into t values (0, 1, 'a')", "delete from t where id < 100", "select count(*) from t where id < 200", "rollback",
+        "select count(*) from t where id < 200"]))
+    append(mut &out, blockShape("block: a failed statement undone", "int", [
+        "begin", "delete from t where id < 100", "insert into t values (50, 1, 'a'), (50, 2, 'b')", "rollback", "select count(*) from t"]))
+    append(mut &out, blockShape("block: two keys", "two", [
+        "begin", "delete from t where a = 3", "select count(*) from t where a between 2 and 4", "insert into t values (3, 5, 1, 'x')",
+        "select a, b from t where a = 3", "delete from t where a = 3 and b < 50", "delete from t where a = 3", "delete from t where a < 10 and b < 50",
+        "delete from t where a < 10", "select count(*), min(a) from t", "commit"]))
+    append(mut &out, blockShape("block: large values", "big", [
+        "begin", "delete from t where id between 100 and 2000", "select count(*) from t where id between 90 and 2010",
+        "insert into t select i, repeat('q', 30000) from generate_series(150, 1990, 10) i", "select count(*), sum(length(pad)) from t where id between 90 and 2010",
+        "delete from t where id between 500 and 1500", "select count(*), sum(length(pad)) from t where id between 90 and 2010",
+        "delete from t where id between 1400 and 1600", "select md5(pad) from t where id = 160", "commit"]))
+    // (two range deletes of one commit over large values, the first from the start: the second's skip over the
+    // companion's key lengths passed nodes the plan had not loaded, and the commit panicked)
+    append(mut &out, blockShape("block: two range deletes, large values", "big", [
+        "begin", "delete from t where id < 600", "delete from t where id >= 2400", "select count(*) from t", "delete from t where id between 1000 and 1200", "commit",
+        "select count(*), sum(length(pad)) from t"]))
+    append(mut &out, blockShape("block: a table made in it", "int", [
+        "begin", "create table nt (id int primary key, pad text not null)", "insert into nt select i, 'p' from generate_series(1, 300) i",
+        "delete from nt where id < 100", "select count(*), min(id) from nt", "insert into nt values (50, 'z')", "delete from nt where id < 200",
+        "select count(*) from nt", "commit", "select count(*), min(id) from nt"]))
+    // (t_av, a partial index on (a, v), serves the first query alone: EXPLAIN says "index t_av ... index only")
+    append(mut &out, blockShape("block: indexes read after the delete", "idxa", [
+        "begin", "explain select count(*) from t where a >= 0 and b > 10 and v >= 0",
+        "delete from t where a = 5", "select count(*), sum(v) from t where a >= 0 and b > 10 and v >= 0", "select count(*) from t where a = 5 and b > 10 and v >= 0",
+        "select count(*) from t where a >= 0 and b >= 0", "select count(*) from t where a >= 0 and v >= 0",
+        "insert into t values (5, 17, 1, 'x'), (5, 3, 1, 'x')", "select count(*), sum(v) from t where a >= 0 and b > 10 and v >= 0",
+        "select count(*) from t where a = 5 and b > 10 and v >= 0", "delete from t where a < 8", "select count(*) from t where a >= 0 and b > 10 and v >= 0",
+        "select count(*) from t where a >= 0 and v >= 0", "commit", "select count(*), sum(v) from t where a >= 0 and b > 10 and v >= 0"]))
+    append(mut &out, blockShape("block: an index of the key, read by it", "idx", [
+        "begin", "delete from t where id < 1500", "select count(*) from t where id >= 0", "select count(*), sum(id) from t where id > 100 and id < 5000",
+        "insert into t values (700, 1, 'n')", "select count(*), sum(id) from t where id > 100 and id < 5000", "delete from t where id < 800",
+        "select count(*) from t where id >= 0", "rollback", "select count(*) from t where id >= 0"]))
+    append(mut &out, blockShape("block: after other writes", "int", [
+        "begin", "update t set v = 1 where id = 5", "insert into t values (7000, 1, 'a')", "delete from t where id < 1500",
+        "select count(*) from t", "delete from t where id < 7500", "select count(*) from t", "commit"]))
     // ---- bigint: the type's end (the key of the greatest is all ones)
     append(mut &out, sh("bigint top", "bigint", [q("delete from t where id > 9223372036854775807 - 100")], true))
     append(mut &out, sh("bigint <= max", "bigint", [q("delete from t where id <= 9223372036854775807")], true))
@@ -323,14 +429,14 @@ fn shapes(): []Shape {
     append(mut &out, sh("index leading with the key, whole", "idx", [q("delete from t")], true))
     append(mut &out, sh("indexes on a, a = ", "idxa", [q("delete from t where a = 5")], true))
     append(mut &out, sh("indexes on a, a range", "idxa", [q("delete from t where a >= 10 and a < 20")], true))
-    append(mut &out, sh("indexes on a, too short for b", "idxa", [q("delete from t where a = 5 and b < 50")], false))
+    append(mut &out, sh("indexes on a, too short for b (entry by entry)", "idxa", [q("delete from t where a = 5 and b < 50")], true))
     append(mut &out, sh("indexes on a and b, a = b <", "idxab", [q("delete from t where a = 5 and b < 50")], true))
     append(mut &out, sh("indexes on a and b, a = b range", "idxab", [q("delete from t where a = 20 and b >= 10 and b < 90")], true))
     append(mut &out, sh("indexes on a and b, a >", "idxab", [q("delete from t where a > 40")], true))
-    append(mut &out, sh("index of another column", "idxv", [q("delete from t where id < 1500")], false))
+    append(mut &out, sh("index of another column (entry by entry)", "idxv", [q("delete from t where id < 1500")], true))
     append(mut &out, sh("index of another column, whole", "idxv", [q("delete from t")], true))
     append(mut &out, sh("expression index, whole", "idxx", [q("delete from t")], true))
-    append(mut &out, sh("expression index, range", "idxx", [q("delete from t where id < 1500")], false))
+    append(mut &out, sh("expression index, range (entry by entry)", "idxx", [q("delete from t where id < 1500")], true))
     // ---- foreign keys, key types, large values, temporary and keyless tables
     append(mut &out, sh("referenced, rows in the range", "fk", [q("delete from t where id < 1500"), q("select count(*) from t")], false))
     append(mut &out, sh("referenced, rows elsewhere", "fkfar", [q("delete from t where id < 1500")], false))
@@ -374,6 +480,11 @@ fn runOne(s: mut &lexdb_exec.Session, sql: &str, ps: &[]Val): str {
     }
 }
 
+fn one(s: mut &lexdb_exec.Session, sql: str): str {
+    let none: []Val = []
+    return runOne(s, &sql, &none)
+}
+
 fn opts(): lexdb_store.Options {
     return lexdb_store.Options{cacheBytes: 256 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 100000}
 }
@@ -412,7 +523,7 @@ fn runShape(n: int, sh: &Shape, on: bool): Out {
         let sw = runOne(mut &s, &("set lexdb_range_delete = " + (if on { "on" } else { "off" })), &none)
         // what EXPLAIN says of the first DELETE
         for x in sh.stmts {
-            if strings.startsWith(&x.sql, "delete") {
+            if !sh.noex && strings.startsWith(&x.sql, "delete") {
                 if sh.block { let b = runOne(mut &s, &"begin", &none) }
                 out.ex = runOne(mut &s, &("explain " + x.sql), &x.ps)
                 if sh.block { let b = runOne(mut &s, &"rollback", &none) }
@@ -543,6 +654,105 @@ fn concurrentTest() {
             strings.endsWith(&res[3], "0").toStr() + ", audit clean " + clean(&au).toStr())
 }
 
+// Two sessions, a range delete in a block (stage 5): serializable as the row
+// path is. A commit into the range, or a write of one of its rows, that
+// commits first fails the block's commit (40001); a range delete that
+// commits first fails the block that read or wrote in its range. A row
+// locked by another session sends the statement to the row path (it waits);
+// a lock taken after the range delete does not wait for it.
+fn blockTest() {
+    let fs = lexdb_disk.sim(903)
+    var res: []str = []
+    lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var a = lexdb_exec.newSession(st)
+        var b = lexdb_exec.newSession(st)
+        let none: []Val = []
+        for sql in famOf("int").setup { let r = runOne(mut &a, &sql, &none) }
+        let g = runOne(mut &a, &"delete from t where id = 1100 or id between 2000 and 2010", &none)
+        let rd0 = lexdb_exec.rangeDeletes()
+        let cnt = "select count(*) from t where id between 1000 and 1300"
+        // 1. a row committed into the range first
+        let a1 = one(mut &a, "begin")
+        let a2 = one(mut &a, "delete from t where id between 1000 and 1300")
+        let a3 = one(mut &a, cnt)
+        let a4 = one(mut &b, "insert into t values (1100, 1, 'b')")
+        let a5 = one(mut &a, "commit")
+        append(mut &res, "insert first: " + a2 + ", in block " + a3 + ", " + a4 + ", commit " + a5 + ", then " + one(mut &b, cnt))
+        // ... run again: it counts the row
+        let a6 = one(mut &a, "begin")
+        let a7 = one(mut &a, "delete from t where id between 1000 and 1300")
+        let a8 = one(mut &a, "commit")
+        append(mut &res, "again: " + a7 + ", " + a8 + ", left " + one(mut &b, cnt))
+        // 2. a row outside it
+        let b1 = one(mut &a, "begin")
+        let b2 = one(mut &a, "delete from t where id between 1500 and 1600")
+        let b3 = one(mut &b, "insert into t values (99999, 1, 'b')")
+        let b4 = one(mut &b, "update t set v = 2 where id = 1499")
+        let b5 = one(mut &a, "commit")
+        append(mut &res, "outside: " + b2 + ", " + b3 + ", " + b4 + ", commit " + b5 + ", left " + one(mut &b, "select count(*) from t where id between 1490 and 1610"))
+        // 3. the other way: a block read the range, a range delete commits first
+        let c1 = one(mut &b, "begin")
+        let c2 = one(mut &b, "select count(*) from t where id between 3000 and 3100")
+        let c3 = one(mut &a, "delete from t where id between 3050 and 3060")
+        let c4 = one(mut &b, "insert into t values (88888, 1, 'b')")
+        let c5 = one(mut &b, "commit")
+        append(mut &res, "delete first: " + c3 + ", the block's commit " + c5)
+        // 4. both in blocks, each writing a row of the other's range: the first to commit wins
+        let d1 = one(mut &a, "begin")
+        let d2 = one(mut &a, "delete from t where id between 4000 and 4100")
+        let d3 = one(mut &b, "begin")
+        let d4 = one(mut &b, "update t set v = 3 where id = 4050")
+        let d5 = one(mut &b, "commit")
+        let d6 = one(mut &a, "commit")
+        append(mut &res, "update first: " + d2 + ", " + d4 + ", " + d5 + ", delete's commit " + d6)
+        let e1 = one(mut &a, "begin")
+        let e2 = one(mut &a, "delete from t where id between 4200 and 4300")
+        let e3 = one(mut &b, "begin")
+        let e4 = one(mut &b, "update t set v = 3 where id = 4250")
+        let e5 = one(mut &a, "commit")
+        let e6 = one(mut &b, "commit")
+        append(mut &res, "delete first, update second: " + e2 + ", " + e4 + ", " + e5 + ", update's commit " + e6)
+        // 5. a row locked by another session first: the row path (it waits)
+        let f1 = one(mut &b, "begin")
+        let f2 = one(mut &b, "select id from t where id between 5000 and 5003 for update")
+        let f3 = one(mut &a, "begin")
+        let f4 = one(mut &a, "explain delete from t where id between 4990 and 5010")
+        let f5 = one(mut &a, "explain delete from t where id between 5100 and 5110")
+        let f6 = one(mut &a, "rollback")
+        let f7 = one(mut &b, "commit")
+        append(mut &res, "locked first: explain over the locked rows " + (!strings.contains(&f4, "range delete:")).toStr() + ", elsewhere " +
+               strings.contains(&f5, "range delete:").toStr())
+        // 6. a lock taken after the range delete does not wait: the commit that comes second fails
+        let h1 = one(mut &a, "begin")
+        let h2 = one(mut &a, "delete from t where id between 5200 and 5300")
+        let h3 = one(mut &b, "begin")
+        let h4 = one(mut &b, "select id from t where id = 5250 for update")
+        let h5 = one(mut &b, "update t set v = 4 where id = 5250")
+        let h6 = one(mut &a, "commit")
+        let h7 = one(mut &b, "commit")
+        append(mut &res, "lock after: " + h2 + ", the locker " + h4 + " and " + h5 + " at once, delete's commit " + h6 + ", locker's commit " + h7)
+        // ... and a delete that commits second
+        let k1 = one(mut &a, "begin")
+        let k2 = one(mut &a, "delete from t where id between 5400 and 5500")
+        let k3 = one(mut &b, "begin")
+        let k4 = one(mut &b, "select id from t where id = 5450 for update")
+        let k5 = one(mut &b, "update t set v = 4 where id = 5450")
+        let k6 = one(mut &b, "commit")
+        let k7 = one(mut &a, "commit")
+        append(mut &res, "lock after, locker first: " + k2 + ", locker's commit " + k6 + ", delete's commit " + k7 + ", row left " + one(mut &b, "select count(*) from t where id = 5450"))
+        append(mut &res, "range deletes taken " + (lexdb_exec.rangeDeletes() - rd0).toStr())
+        let z = one(mut &a, "select count(*), sum(id) from t")
+        append(mut &res, "table " + z)
+        a.close()
+        b.close()
+        return 0
+    }).unwrap()
+    let au = match lexdb_store.audit(fs) { Ok(x) { x } Err(e) { e.msg } }
+    for l in res { println("blocks, " + l) }
+    println("blocks: audit clean " + clean(&au).toStr())
+}
+
 fn main() {
     let list = shapes()
     var tagsEq = 0
@@ -558,8 +768,9 @@ fn main() {
         if a.dump == b.dump { rowsEq += 1 } else { println(list[n].name + ": rows differ " + firstDiff(&a.dump, &b.dump)) }
         if clean(&a.audit) { clean2 += 1 } else { println(list[n].name + ": audit on: " + a.audit) }
         if clean(&b.audit) { clean2 += 1 } else { println(list[n].name + ": audit off: " + b.audit) }
+        if list[n].name == "block: indexes read after the delete" && !strings.contains(&a.tags, "index t_av") { println(list[n].name + ": the partial index was not the one read") }
         let line = strings.contains(&a.ex, "range delete:")
-        let ok = line == list[n].take && (a.taken > 0) == list[n].take && !strings.contains(&b.ex, "range delete:") && b.taken == 0
+        let ok = (line == list[n].take || list[n].noex) && (a.taken > 0) == list[n].take && !strings.contains(&b.ex, "range delete:") && b.taken == 0
         if ok { asWanted += 1 } else {
             println(list[n].name + ": expected " + (if list[n].take { "the range path" } else { "a fallback" }) + ", explain line " + line.toStr() + ", taken on " +
                     a.taken.toStr() + ", off " + b.taken.toStr() + "; explain: " + a.ex)
@@ -571,4 +782,5 @@ fn main() {
     switchTest()
     lockTest()
     concurrentTest()
+    blockTest()
 }

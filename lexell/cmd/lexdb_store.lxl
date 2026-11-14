@@ -139,6 +139,7 @@ pub type Db = record {
     free: []int                 // pages free now: runs, (first, count) pairs, highest first (9.33)
     freeAfterNext: []int        // pages the next checkpoint frees
     pendingFree: []int          // runs the checkpoint in flight frees when durable
+    ovfLens: Map[int, str]      // per companion tree: the key lengths (u16 each) its chunks had when the commit's writes were last planned (applyRange's fallback)
     dropped: []int              // subtrees no tree reaches, their pages to free: (page, height or -1) pairs (9.32)
     frameMax: int               // FRAME_MAX (tests set fewer)
     countHook: []fn(Store, int, str, int)       // a test's, called in countRange between its finding and its reading
@@ -263,9 +264,21 @@ pub fn setWriteLogMax(n: int) { WLOG_MAX = n }
 // head: a large value's first bytes its writer wants kept in its leaf (9.31).
 pub type TxWrite = value record { pub op: int; pub tree: int; pub key: str; pub val: str; pub head: int }
 
+// A range delete of the transaction (Txn.delRange) as its own reads see it:
+// the keys of [lo, hi) of tree (hi "": to the end) are gone, except those it
+// wrote itself (an earlier own write inside the range was made a delete by
+// delRange, a later one stands). pos: the range's place in writes, so that
+// undoTo forgets it with the writes after a savepoint.
+pub type TCut = value record { pub tree: int; pub lo: str; pub hi: str; pub pos: int }
+
 pub type Txn = record {
     reads: []Mark
     writes: []TxWrite
+    // Its range deletes, in order (stage 5, design/lexdb-bulkdelete.md): the
+    // reads that overlay the transaction's own writes (getIn, getMany,
+    // scanIn, scanBackIn, scanLeaves, snapGet) hide a stored key in one
+    // unless the transaction wrote that key itself.
+    cuts: []TCut
     // Per tree written (idxTrees[k]), key -> the last write of it: keyed by
     // the write's own key string (shared, not copied), one map per tree.
     idxTrees: []int
@@ -322,7 +335,7 @@ pub type Txn = record {
 }
 
 pub fn begin(): Txn {
-    return Txn{reads: [], writes: [], idxTrees: [], idx: [], sortedKeys: [], sortedN: [], created: [], snap: -1, snapSeq: 0, snapTrees: newMap(), track: false, live: false, path: [], sess: 0, rules: false, memMax: 0,
+    return Txn{reads: [], writes: [], cuts: [], idxTrees: [], idx: [], sortedKeys: [], sortedN: [], created: [], snap: -1, snapSeq: 0, snapTrees: newMap(), track: false, live: false, path: [], sess: 0, rules: false, memMax: 0,
                raTree: -1, ra: AHEAD_MIN, fsnap: [], now: time.now().unixMicros(), zone: lexdb_time.utc(),
                pending: [], consAll: 0, consNames: [], consDeferred: [], lockId: 0, held: [], quiet: false, openEnd: false,
                tmp: "", tmpDdl: false, onCommit: []}
@@ -439,6 +452,8 @@ pub fn (t: &Txn) mark(): int { return len(t.writes) }
 
 pub fn (t: mut &Txn) undoTo(n: int) {
     while len(t.writes) > n { let w = pop(mut &t.writes) }
+    // the range deletes made after the savepoint go with them
+    while len(t.cuts) > 0 && t.cuts[len(t.cuts) - 1].pos >= n { let c = pop(mut &t.cuts) }
     t.idxTrees = []
     t.idx = []
     t.sortedKeys = []
@@ -461,7 +476,35 @@ pub fn (t: mut &Txn) delRange(tree: int, lo: &str, hi: &str) {
         if w.op == OP_PUT { append(mut &mine, w.key) }
     }
     for k in mine { t.del(tree, &k) }
+    append(mut &t.cuts, TCut{tree: tree, lo: lo.toStr(), hi: hi.toStr(), pos: len(t.writes)})
     append(mut &t.writes, TxWrite{op: OP_DELRANGE, tree: tree, key: lo, val: hi, head: 0})
+}
+
+// Whether the transaction's range deletes hide stored key of tree (not
+// counting its own write of the key, which the caller checked first).
+fn (t: &Txn) cutKey(tree: int, key: &str): bool {
+    for c in t.cuts {
+        if c.tree == tree && key >= c.lo && (len(c.hi) == 0 || key < c.hi) { return true }
+    }
+    return false
+}
+
+// Whether the transaction has a range delete of tree that meets [lo, hi)
+// (hi "": no end).
+fn (t: &Txn) cutsMeet(tree: int, lo: &str, hi: &str): bool {
+    for c in t.cuts {
+        if c.tree != tree { continue }
+        if len(hi) > 0 && c.lo >= hi { continue }
+        if len(c.hi) > 0 && c.hi <= lo { continue }
+        return true
+    }
+    return false
+}
+
+// Whether the transaction has a range delete of tree.
+fn (t: &Txn) hasCuts(tree: int): bool {
+    for c in t.cuts { if c.tree == tree { return true } }
+    return false
 }
 
 pub fn (t: mut &Txn) dropTree(tree: int) {
@@ -1822,8 +1865,26 @@ fn (db: mut &Db) applyRange(tree: int, lo: &str, hi: &str) {
     if !db.trees.has(&ovf) { return }
     var lens: []int = []
     // writeNeeds loaded every node chunkLens passes, and nothing since
-    // evicted them: a slot missing here would leave chunks behind silently
-    if db.chunkLens(ovf, mut &lens) >= 0 { panic("lexdb: range delete's companion not in memory at apply") }
+    // evicted them. An earlier range delete of the same commit may have
+    // changed the tree since: the skip from one length to the next may now
+    // pass nodes the plan did not (an emptied first leaf sends it to the
+    // separator's side). The lengths the plan found are then the ones to
+    // go by: a superset of those with chunks in the range (an earlier write
+    // only removes chunks of the range, and its own puts there were made
+    // deletes), each one's edge paths being loaded or its chunks gone.
+    if db.chunkLens(ovf, mut &lens) >= 0 {
+        lens = []
+        match db.ovfLens.get(&ovf) {
+            Some(l) {
+                var i = 0
+                while i + 2 <= len(l) {
+                    append(mut &lens, (int(l[i]) << 8) | int(l[i + 1]))
+                    i += 2
+                }
+            }
+            None { panic("lexdb: range delete's companion not in memory at apply") }
+        }
+    }
     for l in lens {
         let cl = chunkLo(l, lo)
         let ch = chunkHi(l, hi)
@@ -1872,6 +1933,9 @@ fn (db: mut &Db) writeNeeds(w: &TxWrite): int {
             var lens: []int = []
             let c = db.chunkLens(ovf, mut &lens)
             if c >= 0 { return c }
+            var lb = newStrBuf()
+            for l in lens { binary.addU16BE(mut &lb, l) }
+            db.ovfLens.put(ovf, lb.toStr())
             for l in lens {
                 let cl = chunkLo(l, &w.key)
                 let ch = chunkHi(l, &w.val)
@@ -2190,6 +2254,14 @@ fn (st: &Store) getIn(t: mut &Txn, tree: int, key: str, mode: int): Result[Optio
         }
         None {}
     }
+    // a key in one of its range deletes, not written since: gone
+    if t.cutKey(tree, &key) { return Ok(None) }
+    return st.getBaseIn(t, tree, key, mode)
+}
+
+// getIn without the transaction's own writes and range deletes: the stored
+// row (as the transaction's reads see the store).
+fn (st: &Store) getBaseIn(t: mut &Txn, tree: int, key: str, mode: int): Result[Option[str], lexdb_base.DbErr] {
     match st.fo {
         Some(fo) {
             let s = try repSnap(&fo, t)
@@ -2542,6 +2614,80 @@ pub fn (st: &Store) countRange(t: mut &Txn, tree: int, lo: &str, hi: &str): Resu
     return Ok(-1)
 }
 
+// The most own writes in a range that countView corrects for (a lookup each).
+const COUNT_OWN_MAX = 10000
+
+// The rows of [lo, hi) of tree (hi "": to the end) as the transaction's own
+// reads see them (stage 5): countRange's count of the stored rows, corrected
+// for the transaction's own writes and range deletes of that tree.
+//   rows = stored in the range
+//        - stored in the range and in one of its earlier range deletes
+//          (counted, merged, each by countRange)
+//        - stored, written by it (a put or a delete: the write replaces the
+//          stored row), outside those range deletes (one lookup each)
+//        + its puts in the range (a put after a range delete counts: it is
+//          the only row of its key).
+// Ok(-1): not exact (countRange gave up, or more than COUNT_OWN_MAX own
+// writes in the range): the caller counts rows.
+pub fn (st: &Store) countView(t: mut &Txn, tree: int, lo: &str, hi: &str): Result[int, lexdb_base.DbErr] {
+    if len(hi) > 0 && lo >= hi { return Ok(0) }
+    let own = t.ownRange(tree, lo, hi)
+    if len(own) == 0 && !t.cutsMeet(tree, lo, hi) { return st.countRange(t, tree, lo, hi) }
+    if len(own) > COUNT_OWN_MAX { return Ok(-1) }
+    var n = try st.countRange(t, tree, lo, hi)
+    if n < 0 { return Ok(-1) }
+    // the earlier range deletes inside [lo, hi), merged into disjoint intervals in order
+    var ls: []str = []
+    var hs: []str = []
+    for c in t.cuts {
+        if c.tree != tree { continue }
+        if len(hi) > 0 && c.lo >= hi { continue }
+        if len(c.hi) > 0 && c.hi <= lo { continue }
+        let a = if c.lo > lo { c.lo } else { lo.toStr() }
+        let b = if len(hi) == 0 { c.hi } else if len(c.hi) == 0 || c.hi > hi { hi.toStr() } else { c.hi }
+        // insert in order of a, then merge with the neighbours it meets
+        var at = len(ls)
+        while at > 0 && ls[at - 1] > a { at -= 1 }
+        collections.insert(mut &ls, at, a)
+        collections.insert(mut &hs, at, b)
+    }
+    var ml: []str = []
+    var mh: []str = []
+    for i in 0..len(ls) {
+        let m = len(ml)
+        // (an end "" is no end: the interval runs to the end of the tree)
+        if m > 0 && (len(mh[m - 1]) == 0 || ls[i] <= mh[m - 1]) {
+            if len(mh[m - 1]) > 0 && (len(hs[i]) == 0 || hs[i] > mh[m - 1]) { mh[m - 1] = hs[i] }
+        } else {
+            append(mut &ml, ls[i])
+            append(mut &mh, hs[i])
+        }
+    }
+    for i in 0..len(ml) {
+        let c = try st.countRange(t, tree, &ml[i], &mh[i])
+        if c < 0 { return Ok(-1) }
+        n -= c
+    }
+    let was = t.quiet
+    t.quiet = true                      // (the range is noted whole by the caller)
+    for w in own {
+        var inCut = false
+        for i in 0..len(ml) { if w.key >= ml[i] && (len(mh[i]) == 0 || w.key < mh[i]) { inCut = true } }
+        if w.op == OP_PUT { n += 1 }
+        if !inCut {
+            match st.getBaseIn(t, tree, w.key, M_PART) {
+                Ok(v) { if v.isSome() { n -= 1 } }
+                Err(e) {
+                    t.quiet = was
+                    return Err(e)
+                }
+            }
+        }
+    }
+    t.quiet = was
+    return Ok(n)
+}
+
 // Notes that the transaction read the keys [lo, hi) of tree (hi "": to the
 // end), as of the commit its reads see (the live tree's now, a snapshot's
 // own): a commit of another transaction that wrote a key of the range
@@ -2704,6 +2850,11 @@ pub fn (st: &Store) getMany(t: mut &Txn, tree: int, keys: &[]str, part: bool, ou
                         continue
                     }
                     None {}
+                }
+                if t.cutKey(tree, &keys[i]) {
+                    append(out, None)
+                    i += 1
+                    continue
                 }
                 var d = -1
                 if root >= 0 {
@@ -2952,6 +3103,7 @@ fn (st: &Store) scanIn(t: mut &Txn, tree: int, from: str, to: str, f: &fn(&Entry
     }
     let raw = mode == M_RAW
     let own: []TxWrite = if raw { [] } else { t.ownRange(tree, &from, &to) }
+    let cut = !raw && t.hasCuts(tree)           // stored keys in a range delete of its own are skipped
     let root = if t.snap >= 0 && !t.live { match t.snapTrees.get(&tree) { Some(r) { r } None { -1 } } } else { -1 }
     var oi = 0
     var cursor = from
@@ -3048,6 +3200,10 @@ fn (st: &Store) scanIn(t: mut &Txn, tree: int, from: str, to: str, f: &fn(&Entry
                     }
                 }
             } else {
+                if cut && t.cutKey(tree, &chunk[ci].key) {
+                    ci += 1
+                    continue
+                }
                 if !raw && marked(&chunk[ci].val) && !isOvf(tree) && !(mode == M_PART && isStub(&chunk[ci].val)) {
                     let v = try st.unstore(t, tree, &chunk[ci].key, &chunk[ci].val)
                     chunk[ci].val = v
@@ -3082,7 +3238,7 @@ fn (st: &Store) scanIn(t: mut &Txn, tree: int, from: str, to: str, f: &fn(&Entry
 pub fn (st: &Store) scanLeaves(t: mut &Txn, tree: int, from: &str, to: str,
                                f: &fn(&lexdb_page.Node, int, int): bool): Result[bool, lexdb_base.DbErr] {
     if st.fo.isSome() { return Ok(false) }         // a replica's reads go through scan
-    if len(t.ownRange(tree, &from, &to)) > 0 { return Ok(false) }
+    if len(t.ownRange(tree, &from, &to)) > 0 || t.cutsMeet(tree, &from, &to) { return Ok(false) }
     let root = if t.snap >= 0 && !t.live { match t.snapTrees.get(&tree) { Some(r) { r } None { -1 } } } else { -1 }
     var cursor: str = from
     var more = true
@@ -3227,6 +3383,7 @@ fn (st: &Store) scanBackIn(t: mut &Txn, tree: int, from: str, to: str, f: &fn(&E
         None {}
     }
     let own = t.ownRange(tree, &from, &to)
+    let cut = t.hasCuts(tree)
     let root = if t.snap >= 0 && !t.live { match t.snapTrees.get(&tree) { Some(r) { r } None { -1 } } } else { -1 }
     var oi = len(own) - 1
     var cursor = to
@@ -3312,6 +3469,10 @@ fn (st: &Store) scanBackIn(t: mut &Txn, tree: int, from: str, to: str, f: &fn(&E
                     }
                 }
             } else {
+                if cut && t.cutKey(tree, &chunk[ci].key) {
+                    ci += 1
+                    continue
+                }
                 if marked(&chunk[ci].val) && !isOvf(tree) && !(mode == M_PART && isStub(&chunk[ci].val)) {
                     let v = try st.unstore(t, tree, &chunk[ci].key, &chunk[ci].val)
                     chunk[ci].val = v
@@ -5234,7 +5395,7 @@ fn checkLog(fs: &lexdb_disk.Fs, logFs: &lexdb_disk.Fs, split: bool, create: bool
 // ---- open, recovery, close
 
 fn newDb(fs: lexdb_disk.Fs, logFs: lexdb_disk.Fs, data: lexdb_disk.File, opts: Options, m: &lexdb_page.Meta): Db {
-    return Db{opts: opts, fs: fs, logFs: logFs, data: data, watched: -1, watchedWrites: 0, pool: [], owner: [], meta: [], freeSlots: [], loadedCount: 0, cacheUsed: 0, wlog: [], wlogFloor: 0, hand: 0,
+    return Db{opts: opts, fs: fs, logFs: logFs, data: data, watched: -1, watchedWrites: 0, pool: [], owner: [], meta: [], freeSlots: [], ovfLens: newMap(), loadedCount: 0, cacheUsed: 0, wlog: [], wlogFloor: 0, hand: 0,
               trees: newMap(), lastLeaf: LastLeaf{tree: -1, shape: -1, path: [], lo: [], hasLo: [], hi: [], hasHi: []}, shape: 0, nextTree: m.nextTree, npages: m.npages, fileEnd: 0, reserving: true, free: [], freeAfterNext: [],
               pendingFree: [], dropped: [], frameMax: FRAME_MAX, dropReads: DROP_READS, countHook: [], countMode: 0, countArg: "", countCalls: 0, memo: newMap(), listPages: [], ckpt: m.ckpt, durableCkpt: m.ckpt, ckptRunning: false,
               batch: [], batchCount: 0, batchNo: m.replayBatch, appliedBatch: m.replayBatch - 1,

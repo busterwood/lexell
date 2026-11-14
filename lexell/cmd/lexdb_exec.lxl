@@ -5872,6 +5872,7 @@ type Run = record {
     swKeys: []str
     swLo: str
     swHi: str
+    after: str                  // a batched DELETE or UPDATE (stage 8): the first level's primary key scan starts at this key; "" none
 }
 
 // A statement that does not wait (its pages in the cache) lets the other
@@ -6002,7 +6003,7 @@ fn newRun(q: &Query): Run {
     }
     return Run{noLimit: false, cnt: array(len(q.levels), Counts{starts: 0, read: 0, joined: 0, nulls: 0, built: 0, kept: 0, unmatched: 0, batches: 0, switched: 0}),
                seen: seen, memo: memo, memoRes: memoRes, stats: stats, cache: newCache(), maxRounds: MAX_RECURSION, maxSteps: MAX_MATCH_STEPS,
-               held: 0, maxHeld: 0, deadline: 0, ticks: 0, turnEnd: 0, batch: true, writes: false, sw: -1, swKeys: [], swLo: "", swHi: ""}
+               held: 0, maxHeld: 0, deadline: 0, ticks: 0, turnEnd: 0, batch: true, writes: false, sw: -1, swKeys: [], swLo: "", swHi: "", after: ""}
 }
 
 fn keepsRight(join: int): bool { return join == lexdb_sql.J_RIGHT || join == lexdb_sql.J_FULL }
@@ -8298,6 +8299,25 @@ type Cursor = record { at: str; started: bool; done: bool }
 
 fn newCursor(): Cursor { return Cursor{at: "", started: false, done: false} }
 
+// The scans of a primary key path from key from on (a batched statement's resume): a point before it is dropped, a range starts
+// at it at the latest, and the whole table is a range from it.
+fn afterScans(scans: &[]Scan, from: &str): []Scan {
+    var out: []Scan = []
+    for sc in scans {
+        if sc.empty { append(mut &out, Scan{empty: true, point: false, lo: "", hi: "", whole: false}); continue }
+        if sc.point {
+            if sc.lo >= from { append(mut &out, Scan{empty: false, point: true, lo: sc.lo, hi: "", whole: false}) }
+            continue
+        }
+        var lo = if sc.whole { "" } else { sc.lo }
+        let hi = if sc.whole { "" } else { sc.hi }
+        if lo < from { lo = from.toStr() }
+        if len(hi) > 0 && lo >= hi { continue }
+        append(mut &out, Scan{empty: false, point: false, lo: lo, hi: hi, whole: false})
+    }
+    return out
+}
+
 // The smallest key after k.
 fn after(k: &str): str {
     var b = newStrBuf()
@@ -9288,6 +9308,8 @@ fn runLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Ma
         // - an index read alone (9.107): it costs no more than a scan.
         var keys: []str = []
         var byKeys = false
+        // a batched DELETE or UPDATE's next batch (stage 8): the primary key scan goes on after the last key done
+        if k == 0 && len(rs.after) > 0 && lv.path.index < 0 { scans = afterScans(&scans, &rs.after) }
         if k == 0 {
             let how = try firstSwitch(st, txn, q, &scans, rs, mut &keys)
             if how == 1 {
@@ -14388,6 +14410,12 @@ fn storeRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, row: [
 }
 
 fn update(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, lim: Limits): Result[Res, DbErr] {
+    if s.copy.batchRows > 0 { return batchDml(st, txn, s, params, lim) }
+    var win = noWin()
+    return updateB(st, txn, s, params, lim, mut &win)
+}
+
+fn updateB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, lim: Limits, win: mut &Win): Result[Res, DbErr] {
     try notView(st, txn, &s.table, &"update")
     try dmlCheck(st, txn, s, &"w")
     let sqe = seqEnv(st, txn)
@@ -14406,15 +14434,29 @@ fn update(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     }
     var ret = try retOf(s, &q, mut &sc)
     endScope(mut &sc, mut &q)
+    if win.n > 0 {
+        // a batch's rows are found in primary key order, from the key after the last batch's (stage 8): an UPDATE
+        // always reads by the key, so that a row it changed is not found again (the Halloween problem across
+        // batches), and may not change the key, which would move a row past the cursor
+        if q.levels[0].path.index >= 0 || q.levels[0].path.desc {
+            q.levels[0].path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: []}
+        }
+        win.keyed = true
+        for k in targets { for p in q.levels[0].t.pk { if p == k {
+            return Err(e("0A000", "lexdb: UPDATE with batch_rows cannot assign a primary key column"))
+        } } }
+    }
     let t = &q.levels[0].t
     var found: [][]Val = []
     var rs = newRun(&q)
     rs.limit(&lim)
     rs.writes = true                // optimizer 19: a write keeps its index paths (its read set)
+    rs.after = win.after
     var m = try prepare(st, txn, &q, params, mut &rs)
     let room = rs.room()
     let max = rs.maxHeld
     var held = 0
+    let wn = win.n
     // a key changed: FOR UPDATE's lock, else FOR NO KEY UPDATE's (9.86)
     var lmode = lexdb_sql.LOCK_NO_KEY_UPDATE
     for k in targets { for p in t.pk { if p == k { lmode = lexdb_sql.LOCK_UPDATE } } }
@@ -14424,7 +14466,7 @@ fn update(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
             held += 2 * rowBytes(r)             // the row found, and its write
             if room >= 0 && held > room { return Err(memErr(max)) }
             append(mut &found, copyRow(r))
-            return Ok(true)
+            return Ok(wn == 0 || len(found) < wn)         // a batch stops at its n rows
         }, mut &rs)
         found = onceEach(t, found, len(s.from) > 0)
         var nolk: []Look = []
@@ -14436,8 +14478,10 @@ fn update(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
         txn.forgetReads(reads0)
         rs = newRun(&q)
         rs.limit(&lim)
+        rs.after = win.after
         m = try prepare(st, txn, &q, params, mut &rs)
     }
+    if win.n > 0 { winEnd(win, t, &found, rs.cnt[0].read) }
     let noAggs: []Val = []
     let defs = try defaultsOf(st, txn, t)
     for k in 0..len(sets) {
@@ -14471,6 +14515,12 @@ fn update(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
 }
 
 fn delete(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, lim: Limits): Result[Res, DbErr] {
+    if s.copy.batchRows > 0 { return batchDml(st, txn, s, params, lim) }
+    var win = noWin()
+    return deleteB(st, txn, s, params, lim, mut &win)
+}
+
+fn deleteB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, lim: Limits, win: mut &Win): Result[Res, DbErr] {
     try notView(st, txn, &s.table, &"delete from")
     try dmlCheck(st, txn, s, &"d")
     var sc = newScopeIn(st, txn, params, &[])
@@ -14479,26 +14529,38 @@ fn delete(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     var ret = try retOf(s, &q, mut &sc)
     endScope(mut &sc, mut &q)
     delNarrow(mut &q, s)
-    match try rangeDelete(st, txn, s, &q, params, &lim) {
-        Some(r) { return Ok(r) }
-        None {}
+    // a batched DELETE (stage 8) takes the range path when it can, in its first batch: one write, so already bounded, and
+    // atomic; not with entries of other indexes to delete one by one, which are writes too
+    if win.n == 0 || win.first {
+        match try rangeDelete(st, txn, s, &q, params, &lim, win.n > 0) {
+            Some(r) {
+                win.done = true
+                return Ok(r)
+            }
+            None {}
+        }
     }
+    // a batch of a DELETE read by the primary key goes on after the last key done; one read by an index runs
+    // again (the entries of the rows deleted are gone), and finds its next rows first
+    win.keyed = win.n > 0 && !q.levels[0].virt() && q.levels[0].path.index < 0 && !q.levels[0].path.desc
     let t = &q.levels[0].t
     var found: [][]Val = []
     var rs = newRun(&q)
     rs.limit(&lim)
     rs.writes = true                // optimizer 19: a write keeps its index paths (its read set)
+    if win.keyed { rs.after = win.after }
     var m = try prepare(st, txn, &q, params, mut &rs)
     let room = rs.room()
     let max = rs.maxHeld
     var held = 0
+    let wn = win.n
     let reads0 = txn.readCount()
     while true {
         try runQuery(st, txn, &q, &m, params, fn(tx: mut &lexdb_store.Txn, r: &[]Val): Result[bool, DbErr] {
             held += 2 * rowBytes(r)             // the row found, and its write
             if room >= 0 && held > room { return Err(memErr(max)) }
             append(mut &found, copyRow(r))
-            return Ok(true)
+            return Ok(wn == 0 || len(found) < wn)         // a batch stops at its n rows
         }, mut &rs)
         found = onceEach(t, found, len(s.from) > 0)
         var nolk: []Look = []
@@ -14509,8 +14571,10 @@ fn delete(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
         txn.forgetReads(reads0)
         rs = newRun(&q)
         rs.limit(&lim)
+        if win.keyed { rs.after = win.after }
         m = try prepare(st, txn, &q, params, mut &rs)
     }
+    if win.n > 0 { winEnd(win, t, &found, rs.cnt[0].read) }
     let fw = try fkTables(st, txn, t, false, true)
     var later: []FkLater = []
     let nt = len(t.cols)
@@ -14523,6 +14587,142 @@ fn delete(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     return Ok(retRes(ret, &("DELETE " + len(found).toStr())))
 }
 
+// ---- batched DELETE and UPDATE (design/lexdb-bulkdelete.md section 3, stage 8)
+//
+// DELETE ... WITH (batch_rows n) and UPDATE ... WITH (batch_rows n) commit
+// each n rows as their own transaction (as COPY's batch_rows, 9.87), so a
+// statement over millions of rows holds n rows' writes, not all of them. Not
+// atomic: a failure keeps the batches committed before it, and says how
+// many in its context.
+// - Each batch (deleteB, updateB with a Win) runs the statement for at most
+//   n rows, changes them, checks their foreign keys, and batchDml commits
+//   and starts a new transaction (the same path, session, temporary schema,
+//   time zone and now()).
+// - Where the next batch starts: a DELETE or UPDATE read by the primary key
+//   goes on from the key after the last row of the batch (Run.after, applied
+//   to the first level's scans), so no row is read twice: not those that did
+//   not match (the scan is linear over the statement, not over each batch),
+//   nor an UPDATE's own (a row whose changed column the WHERE reads is not
+//   found again: the Halloween problem). An UPDATE always reads by the key
+//   (its path is made the key's, whatever the planner chose) and may not
+//   assign a key column (0A000: the row would move past the cursor). A
+//   DELETE read by an index runs again: the entries of the rows deleted are
+//   gone, so the next run starts at the next match.
+// - A DELETE that takes the range path (2.1) in its first batch ignores
+//   batch_rows: it is one write whatever its rows, and atomic. A range
+//   delete with indexes whose entries go one by one (stage 6) is not taken:
+//   those are as many writes as rows, and batch_rows is for those.
+// - A conflict at a batch's commit (40001) runs that batch again from the
+//   same key, up to 10 times in all; the statement as a whole does not.
+// - Refused: inside a transaction block (25001: it must commit), RETURNING
+//   or OUTPUT (0A000: the rows would grow without bound), UPDATE of a key
+//   column (0A000), and (not in the design) USING or FROM and TOP (0A000: a
+//   joined row is not a key to resume from, and TOP is a limit of its own).
+// - Not seen: rows committed behind the cursor by others during the run, and
+//   a subquery in the WHERE reads the table as it is at each batch.
+
+type Win = record {
+    n: int              // rows a batch finds at most; 0 not batched
+    first: bool         // the first batch
+    after: str          // the key to start at (the last key done, then a zero byte); "" the start
+    keyed: bool         // the batch is read by the primary key: the cursor applies
+    done: bool          // the statement took the range path: it is whole, one write
+    count: int          // the rows the batch changed
+    full: bool          // it stopped at n rows: there may be more
+    last: str           // the key of the batch's last row
+}
+
+fn noWin(): Win { return Win{n: 0, first: false, after: "", keyed: false, done: false, count: 0, full: false, last: ""} }
+
+// The rows read, and the batches run, by batched statements since the process began (a test's check).
+var BATCH_READ: int = 0
+var BATCH_RUNS: int = 0
+var BATCH_RETRIES: int = 0
+var BATCH_HOOK: once []fn(lexdb_store.Store, int)
+
+pub fn batchRead(): int { return BATCH_READ }
+pub fn batchRuns(): int { return BATCH_RUNS }
+pub fn batchRetries(): int { return BATCH_RETRIES }
+
+// A test's, set once for the process: called with the number of batches run so far after a batch's rows are changed and before it commits.
+pub fn setBatchHook(f: fn(lexdb_store.Store, int)) { if !BATCH_HOOK.isSet() { BATCH_HOOK.set([f]) } }
+
+// A batch's end: the rows it found.
+fn winEnd(win: mut &Win, t: &Table, found: &[][]Val, read: int) {
+    BATCH_READ += read
+    BATCH_RUNS += 1
+    win.count = len(found)
+    win.full = len(found) >= win.n
+    if len(found) > 0 { win.last = keyOf(t, &found[len(found) - 1]) }
+}
+
+// A transaction like txn's for the next batch.
+fn freshTxn(txn: &lexdb_store.Txn): lexdb_store.Txn {
+    var fresh = lexdb_store.begin()
+    for n in txn.path { append(mut &fresh.path, n) }
+    fresh.sess = txn.sess
+    fresh.tmp = txn.tmp
+    fresh.now = txn.now
+    fresh.zone = txn.zone
+    fresh.rules = txn.rules
+    fresh.memMax = txn.memMax
+    return fresh
+}
+
+fn batchFail(x: DbErr, total: int, what: &str, n: int): DbErr {
+    let c = what + " with batch_rows " + n.toStr() + ": " + total.toStr() + " rows committed before the error"
+    return within(x, &(if len(x.context) > 0 { x.context + "; " + c } else { c }))
+}
+
+fn batchDml(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, lim: Limits): Result[Res, DbErr] {
+    let del = s.kind == lexdb_sql.S_DELETE
+    let what = if del { "DELETE" } else { "UPDATE" }
+    if txn.inBlock() { return Err(e("25001", &("lexdb: " + what + " with batch_rows cannot run inside a transaction block"))) }
+    if len(s.items) > 0 { return Err(e("0A000", &("lexdb: " + what + " with batch_rows cannot return rows (RETURNING, OUTPUT)"))) }
+    if len(s.from) > 0 { return Err(e("0A000", &("lexdb: " + what + " with batch_rows cannot join (" + (if del { "USING" } else { "FROM" }) + ")"))) }
+    if s.limit.isSome() { return Err(e("0A000", &("lexdb: " + what + " with batch_rows cannot have TOP"))) }
+    var win = noWin()
+    win.n = s.copy.batchRows
+    win.first = true
+    var total = 0
+    var tries = 0
+    while true {
+        let r = if del { deleteB(st, txn, s, params, lim, mut &win) } else { updateB(st, txn, s, params, lim, mut &win) }
+        match move(r) {
+            Ok(res) { if win.done { return Ok(res) } }
+            Err(x) {
+                // a conflict found as the batch ran (it read the live tree): the batch again, on a new transaction
+                tries += 1
+                if x.state != lexdb_base.S_CONFLICT || tries >= 10 { return Err(batchFail(x, total, &what, win.n)) }
+                BATCH_RETRIES += 1
+                let fresh = freshTxn(txn)
+                let old = replace(txn, fresh)
+                st.abort(old)
+                continue
+            }
+        }
+        if BATCH_HOOK.isSet() { BATCH_HOOK.get()[0](st.handle(), BATCH_RUNS) }
+        win.first = false
+        let fresh = freshTxn(txn)
+        let done = replace(txn, fresh)
+        match st.commit(done) {
+            Ok(_) {
+                total += win.count
+                tries = 0
+                if !win.full { break }
+                if win.keyed { win.after = after(&win.last) }
+            }
+            Err(x) {
+                // a conflict: this batch again, from the same key
+                tries += 1
+                if x.state != lexdb_base.S_CONFLICT || tries >= 10 { return Err(batchFail(x, total, &what, win.n)) }
+                BATCH_RETRIES += 1
+            }
+        }
+    }
+    return Ok(tagOnly(&(what + " " + total.toStr())))
+}
+
 // ---- range delete (design/lexdb-bulkdelete.md 2.1)
 //
 // A DELETE whose WHERE is exactly a range of the primary key's leading
@@ -14530,10 +14730,15 @@ fn delete(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
 // the next, or no WHERE) drops the key range from the tree as one write
 // (Txn.delRange) instead of deleting the rows one by one. The count is the
 // store's (countRange: exact, from the leaf headers).
-// - Taken only in the statement's own transaction with no write yet: the
-//   count does not see a transaction's own writes, and a block's later reads
-//   would still see the rows (until the block stage). So never inside BEGIN,
-//   and so never from Oracle's door, which begins a block for each DML.
+// - In a transaction block, or after writes (stage 5), the count is the
+//   store's corrected for the transaction's own writes and range deletes of
+//   the tree (countView), which falls back to the row path when it is not
+//   exact; the transaction's own reads then see the range gone (Txn.cuts).
+//   The rows are not locked, as the row path locks them in a block: a
+//   session that locks or writes one of them later is not made to wait, and
+//   one of the two fails with 40001 at its commit (the range is a read
+//   noted by noteRange, the delete a write); a lock held by another
+//   session already sends the statement to the row path, which waits.
 // - The WHERE is read from the level's conjuncts, not from its Path: the
 //   Path's bounds are supersets, the rows being checked again. Every
 //   conjunct must be column op constant on a key column, in the leading
@@ -14544,13 +14749,16 @@ fn delete(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
 //   made the column's type compares equal to it (id < 10.5 on an int does
 //   not: the planner's bounds are inclusive for that, here the range must
 //   be the whole predicate).
+// - Indexes: one that leads with the range's key columns is cut by range
+//   (an index entry is marker, value, ..., key: the rows of the range are
+//   one range of it); the others (stage 6) have their entries deleted one
+//   by one from the rows read (delEntries), the table's subtrees still
+//   being dropped, and the count is the rows read.
 // - Not: RETURNING or OUTPUT, TOP and ROWNUM (a limit), USING, a table
-//   others reference (their FK actions need the rows), a table whose
-//   indexes do not lead with the range's key columns (an index entry is
-//   marker, value, ..., key: the rows of the range are one range of an
-//   index that leads with the same columns), a key of float, a collation
-//   other than the exact one, rows locked by others in the range (the row
-//   path waits for them), a point lookup (all key columns equal: one row).
+//   others reference (their FK actions need the rows), a key of float, a
+//   collation other than the exact one, rows locked by others in the range
+//   (the row path waits for them), a point lookup (all key columns equal:
+//   one row).
 
 // The DELETEs that took the range path since the process began (a test's check).
 var RDEL_TAKEN: int = 0
@@ -14567,6 +14775,7 @@ type RPlan = record {
     main: RdRange
     ixs: []int                  // the indexes (places in t.indexes) that take the same op, with their ranges
     ixr: []RdRange
+    slow: []int                 // the others: their entries are deleted one by one, from the rows read (stage 6)
     text: str                   // EXPLAIN's line
 }
 
@@ -14693,13 +14902,14 @@ fn rdRange(eqs: &[]Val, lower: &Option[Val], lowIncl: bool, upper: &Option[Val],
     return RdRange{lo: lo, hi: hi, empty: false}
 }
 
-fn rdNone(): RPlan { return RPlan{empty: false, main: RdRange{lo: "", hi: "", empty: false}, ixs: [], ixr: [], text: ""} }
+fn rdNone(): RPlan { return RPlan{empty: false, main: RdRange{lo: "", hi: "", empty: false}, ixs: [], ixr: [], slow: [], text: ""} }
 
 // The range delete s makes of q's one table, or None for the row path.
 fn rangePlan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, q: &Query, params: &[]Val,
              lim: &Limits, shown: bool): Result[Option[RPlan], DbErr] {
     // (EXPLAIN runs on a snapshot, whose reads are not noted: it shows what a DELETE would do)
-    if !lim.rdel || txn.inBlock() || txn.hasWrites() || txn.quiet || !(shown || txn.noting()) { return Ok(None) }
+    // (inside a block, or after writes, the count is corrected for the transaction's own writes and range deletes: countView)
+    if !lim.rdel || txn.quiet || !(shown || txn.noting()) { return Ok(None) }
     if len(s.items) > 0 || s.limit.isSome() || len(s.from) > 0 || len(q.levels) != 1 || len(q.top) > 0 { return Ok(None) }
     let lv = &q.levels[0]
     if lv.virt() || lv.lateral { return Ok(None) }
@@ -14744,13 +14954,15 @@ fn rangePlan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.St
     let ranged = loAt[k] >= 0 || hiAt[k] >= 0
     let used = k + (if ranged { 1 } else { 0 })
     for j in 0..used { if !rdExactCol(&t.cols[t.pk[j]]) { return Ok(None) } }
-    // the indexes: each must lead with the key columns the range uses
+    // the indexes: one that leads with the key columns the range uses is cut by range too; any other
+    // (another column, an expression, too short) has its entries deleted one by one (delEntries)
     var ixs: []int = []
+    var slow: []int = []
     for x in 0..len(t.indexes) {
         let ix = &t.indexes[x]
-        if len(ix.cols) < used { return Ok(None) }
-        for j in 0..used { if ix.cols[j] != t.pk[j] { return Ok(None) } }
-        append(mut &ixs, x)
+        var lead = len(ix.cols) >= used
+        if lead { for j in 0..used { if ix.cols[j] != t.pk[j] { lead = false } } }
+        if lead { append(mut &ixs, x) } else { append(mut &slow, x) }
     }
     // the values, once
     var rs = newRun(q)
@@ -14813,8 +15025,10 @@ fn rangePlan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.St
         append(mut &p.ixs, x)
         append(mut &p.ixr, rdRange(&eqs, &lower, lowIncl, &upper, upIncl, true))
     }
+    p.slow = slow
     p.text = "range delete: primary key " + (if used == 0 { "whole table" } else { "range" }) + ", subtrees dropped" +
-             (if len(ixs) > 0 { " (" + len(ixs).toStr() + " index" + (if len(ixs) > 1 { "es" } else { "" }) + " too)" } else { "" })
+             (if len(t.indexes) > 0 { " (" + len(ixs).toStr() + " of " + len(t.indexes).toStr() + " indexes cut by range, " +
+                                      len(p.slow).toStr() + " entry by entry)" } else { "" })
     return Ok(Some(p))
 }
 
@@ -14830,11 +15044,56 @@ fn noteChgN(st: &lexdb_store.Store, txn: &lexdb_store.Txn, t: &Table, n: int) {
     CHG_D += n
 }
 
+// The entries of the indexes slow (places in t.indexes) of the rows of [lo, hi) of table t, deleted one by one
+// as the row path's delRow does (an expression's value, a filtered index's predicate, the key from the row's
+// key): the number of rows read. Only the columns those indexes use are read, in batches (the rows are not
+// held), and through the transaction's own view, so a row it wrote is read as written and one it deleted or
+// cut is not.
+fn delEntries(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, lo: &str, hi: &str, slow: &[]int): Result[int, DbErr] {
+    var names: []str = []
+    for x in slow {
+        let ix = &t.indexes[x]
+        for c in ix.cols { if c >= 0 { append(mut &names, t.cols[c].name) } }
+        for e in ix.exprs { colNames(&e, mut &names) }
+        match ix.pred { Some(e) { colNames(&e, mut &names) } None {} }
+    }
+    var used: Map[str, int] = newMap()
+    for x in names { used.put(colPart(&x), 1) }
+    var need: []bool = []
+    for c in t.cols { append(mut &need, used.has(&c.name)) }
+    let n = rowWidth(t)
+    let places = placesNeeded(t, &need)
+    let missing = placesMissing(t)
+    var from = lo.toStr()
+    var count = 0
+    while true {
+        var keys: []str = []
+        var vals: []str = []
+        try st.scanPart(txn, t.tree, &from, hi, fn(en: &lexdb_store.Entry): bool {
+            append(mut &vals, en.val)
+            append(mut &keys, en.key)
+            return len(vals) < BATCH
+        })
+        for k in 0..len(keys) {
+            let row = try rowOf(st, txn, t, &keys[k], &vals[k], n, &places, &missing)
+            for x in slow {
+                let ix = &t.indexes[x]
+                if try inIndex(t, ix, &row) { txn.del(ix.tree, &(try idxEntry(t, ix, &row, &keys[k]))) }
+            }
+        }
+        count += len(keys)
+        if len(keys) < BATCH { break }
+        from = after(&keys[len(keys) - 1])
+    }
+    return Ok(count)
+}
+
 // DELETE as a range delete when it can be one: its result, or None for the
 // row path (also when the count gave up after its restarts).
 fn rangeDelete(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, q: &Query, params: &[]Val,
-               lim: &Limits): Result[Option[Res], DbErr] {
+               lim: &Limits, noSlow: bool): Result[Option[Res], DbErr] {
     let pl = match try rangePlan(st, txn, s, q, params, lim, false) { Some(p) { p } None { return Ok(None) } }
+    if noSlow && len(pl.slow) > 0 { return Ok(None) }
     if pl.empty {
         RDEL_TAKEN += 1
         return Ok(Some(tagOnly(&"DELETE 0")))
@@ -14842,7 +15101,10 @@ fn rangeDelete(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
     let t = &q.levels[0].t
     // noted before the count: a commit into the range meanwhile fails this one (40001), not unseen
     st.noteRange(txn, t.tree, &pl.main.lo, &pl.main.hi)
-    let n = try st.countRange(txn, t.tree, &pl.main.lo, &pl.main.hi)
+    // with indexes to delete entry by entry, the rows are read (through the transaction's own view) and
+    // counted: the rows read are the rows deleted, whatever the transaction wrote or cut before
+    let n = if len(pl.slow) > 0 { try delEntries(st, txn, t, &pl.main.lo, &pl.main.hi, &pl.slow) }
+            else { try st.countView(txn, t.tree, &pl.main.lo, &pl.main.hi) }
     if n < 0 { return Ok(None) }
     RDEL_TAKEN += 1
     if n == 0 { return Ok(Some(tagOnly(&"DELETE 0"))) }
@@ -19930,7 +20192,7 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
                         tries += 1
                         // (a COPY whose data was read as it came, or that committed
                         // batches, cannot run again)
-                        if x.state != lexdb_base.S_CONFLICT || tries >= 10 || input.pull || (stmt.kind == lexdb_sql.S_COPY && stmt.copy.batchRows > 0) { return Err(x) }
+                        if x.state != lexdb_base.S_CONFLICT || tries >= 10 || input.pull || stmt.copy.batchRows > 0 { return Err(x) }
                     }
                 }
             }
@@ -19943,7 +20205,7 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
                 // A conflict found as it ran (it read the live tree: execIn's
                 // stale reads, 9.120) is run again, as one its commit finds is
                 let again = (snap && x.state == "72000") ||
-                            (!snap && x.state == lexdb_base.S_CONFLICT && !input.pull && !(stmt.kind == lexdb_sql.S_COPY && stmt.copy.batchRows > 0))
+                            (!snap && x.state == lexdb_base.S_CONFLICT && !input.pull && stmt.copy.batchRows == 0)
                 if !again || tries >= 10 || input.stream || sent { return Err(x) }
             }
         }
@@ -22224,12 +22486,7 @@ fn copyStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
             // rows after it go into a new transaction
             try fkFinish(st, txn, &fw, mut &later)
             later = []
-            var fresh = lexdb_store.begin()
-            for n in txn.path { append(mut &fresh.path, n) }
-            fresh.sess = txn.sess
-            fresh.tmp = txn.tmp
-            fresh.now = txn.now
-            let done = replace(txn, fresh)
+            let done = replace(txn, freshTxn(txn))
             match st.commit(done) {
                 Ok(_) {}
                 Err(x) { return Err(within(x, &(where + rd.line.toStr() + " (" + (count - batch).toStr() + " rows committed before)"))) }
@@ -25586,6 +25843,8 @@ fn bLevelPlan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &
     }
     let all = len(conds) == len(lv.cond)
     var scans = try pathScans(t, p, &env)
+    // a batched DELETE or UPDATE's next batch (stage 8): the primary key scan goes on after the last key done
+    if len(rs.after) > 0 && p.index < 0 { scans = afterScans(&scans, &rs.after) }
     var rd = noIxRead()
     if p.index >= 0 {
         rd.ix = p.index
@@ -28094,6 +28353,40 @@ pub fn leafKinds(st: &lexdb_store.Store, name: &str): str {
         None {}
     }
     return out
+}
+
+// Table name's trees as text, "name entries hash" per line, the table's
+// first and then each index's: every entry's key and value (a test's
+// comparison of what two ways of deleting left in the indexes).
+pub fn treeDump(st: &lexdb_store.Store, name: &str): str {
+    var txn = lexdb_store.begin()
+    var out: []str = []
+    let found = findTable(st, mut &txn, name).unwrapOr(None)
+    match found {
+        Some(t) {
+            var trees: []int = [t.tree]
+            var names: []str = ["table"]
+            for ix in t.indexes {
+                append(mut &trees, ix.tree)
+                append(mut &names, ix.name)
+            }
+            for k in 0..len(trees) {
+                var n = 0
+                var h = 0
+                let r = st.scan(mut &txn, trees[k], "", "", fn(en: &lexdb_store.Entry): bool {
+                    n += 1
+                    for i in 0..len(en.key) { h = (h * 131 + int(en.key[i]) + 1) & 0xffffffffffff }
+                    h = (h * 131 + 7) & 0xffffffffffff
+                    for i in 0..len(en.val) { h = (h * 131 + int(en.val[i]) + 1) & 0xffffffffffff }
+                    return true
+                })
+                append(mut &out, names[k] + " " + n.toStr() + " " + h.toStr())
+            }
+        }
+        None { append(mut &out, "no table") }
+    }
+    st.abort(txn)
+    return strings.join(&out, "; ")
 }
 
 // Places of 9.113's kinds as text places, as before 9.113 (a test's look

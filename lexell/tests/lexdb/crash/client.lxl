@@ -13,11 +13,14 @@
 // - a transfer in a block: two balance updates and a log row, then COMMIT;
 // - an insert of a log row with a note of about 180 bytes (the tree splits);
 // - a delete of one of its own acknowledged rows.
-// - an insert of a row into ev (the same columns, no secondary index), and
+// - an insert of a row into ev (the same columns, with two secondary indexes
+//   that do not lead with the key: one on worker, one on worker where id is
+//   even, whose entries the range delete removes one by one, stage 6), and
 //   a range delete of its own rows of ev below a point (id >= its first and
 //   id < the point, which takes lexdb's range path: the subtrees go as one
 //   write, design/lexdb-bulkdelete.md), whose count must be the rows it
-//   had.
+//   had. Some of those are in a block, after an insert of a new row that
+//   the range covers too (stage 5).
 // Worker 0 also adds and drops columns of log, VACUUMs it, and drops and
 // adds its primary key (9.114, 9.117).
 // A worker writes what happened to DIR/ROUND.WORKER: "I id" an insert
@@ -147,6 +150,50 @@ fn worker(a: Arg): int {
             } else {
                 // a range delete of its own rows below a point
                 let first = base + 1
+                if rnd(mut &seed) % 3 == 0 {
+                    // in a block, after its own insert of a new row, which the range covers (id < id + 1):
+                    // one commit, so the rows are all there or all gone, and the new row is gone either way
+                    var failed = ""
+                    var affected = -1
+                    for sql in ["begin", "insert into ev values (" + id.toStr() + ", " + a.worker.toStr() + ", '" + note(id) + "')",
+                                "delete from ev where id >= " + first.toStr() + " and id < " + (id + 1).toStr(), "commit"] {
+                        if len(failed) == 0 {
+                            if strings.startsWith(&sql, "delete") {
+                                match c.query(&sql, &[]) {
+                                    Ok(r) { affected = r.affected() }
+                                    Err(e) { failed = kind(&e) }
+                                }
+                            } else {
+                                match c.exec(&sql) {
+                                    Ok(_) {}
+                                    Err(e) { failed = kind(&e) }
+                                }
+                            }
+                        }
+                    }
+                    if failed == "" {
+                        if affected != len(mineEv) + 1 {
+                            append(mut &out, "# ev block range delete [" + first.toStr() + ", " + id.toStr() + "]: " + affected.toStr() + " rows, it had " + (len(mineEv) + 1).toStr())
+                        }
+                        append(mut &out, "J " + id.toStr())
+                        append(mut &out, "X " + id.toStr())
+                        for x in mineEv { append(mut &out, "X " + x.toStr()) }
+                        mineEv = []
+                    } else if failed == "?" {
+                        var ids: []str = []
+                        append(mut &out, "?J " + id.toStr())
+                        for x in mineEv {
+                            append(mut &out, "?J " + x.toStr())
+                            append(mut &ids, x.toStr())
+                        }
+                        if len(ids) > 0 { append(mut &out, "R " + strings.join(&ids, ",")) }
+                        going = false
+                    } else {
+                        if failed == "C" { append(mut &out, "C") } else { append(mut &out, "# ev block range delete: " + failed) }
+                        match c.exec("rollback") { Ok(_) {} Err(_) {} }
+                    }
+                    continue
+                }
                 let cut = first + rnd(mut &seed) % n
                 var alive: []int = []
                 var rest: []int = []
@@ -266,6 +313,8 @@ fn setup(dsn: str): int {
     c.exec("create table log (id bigint primary key, worker int, note text)").unwrap()
     c.exec("create index log_worker on log (worker)").unwrap()
     c.exec("create table ev (id bigint primary key, worker int, note text)").unwrap()
+    c.exec("create index ev_worker on ev (worker)").unwrap()
+    c.exec("create index ev_even on ev (worker) where id % 2 = 0").unwrap()
     var vals: []str = []
     for i in 0..ACCTS { append(mut &vals, "(" + i.toStr() + ", 1000)") }
     c.exec(&("insert into acct values " + strings.join(&vals, ", "))).unwrap()
@@ -350,9 +399,16 @@ fn check(dsn: str, dir: str): int {
     // ev: as log, and each unanswered range delete whole or not at all
     let evRows = c.query("select id, worker, note from ev", &[]).unwrap()
     var evPresent: Map[int, bool] = newMap()
+    var evPer: []int = array(WORKERS, 0)
+    var evEven: []int = array(WORKERS, 0)
     for i in 0..evRows.rowCount() {
         let id = evRows.int(i, 0).unwrap()
         evPresent.put(id, true)
+        let ew = (id % 10000000) / 100000
+        if ew >= 0 && ew < WORKERS {
+            evPer[ew] += 1
+            if id % 2 == 0 { evEven[ew] += 1 }
+        }
         if evRows.int(i, 1).unwrap() != (id % 10000000) / 100000 || evRows.text(i, 2).unwrap() != note(id) {
             append(mut &problems, "ev row " + id.toStr() + ": worker or note is not what was written")
         }
@@ -370,6 +426,15 @@ fn check(dsn: str, dir: str): int {
         for x in g { if evPresent.has(&x) { there += 1 } }
         if there != 0 && there != len(g) { append(mut &problems, "an unanswered range delete of " + len(g).toStr() + " rows left " + there.toStr() + " of them") }
     }
+    // ev's indexes (entries deleted one by one by a range delete) agree with its rows
+    for w in 0..WORKERS {
+        let r = c.query("select count(*) from ev where worker = $1", &[V.Int(w)]).unwrap()
+        if r.int(0, 0).unwrap() != evPer[w] { append(mut &problems, "ev worker " + w.toStr() + ": the index counts " + r.int(0, 0).unwrap().toStr() + ", the scan " + evPer[w].toStr()) }
+        let r2 = c.query("select count(*) from ev where worker = $1 and id % 2 = 0", &[V.Int(w)]).unwrap()
+        if r2.int(0, 0).unwrap() != evEven[w] { append(mut &problems, "ev worker " + w.toStr() + ": the partial index counts " + r2.int(0, 0).unwrap().toStr() + ", the scan " + evEven[w].toStr()) }
+    }
+    let rall = c.query("select count(*) from ev where worker >= 0", &[]).unwrap()
+    if rall.int(0, 0).unwrap() != evRows.rowCount() { append(mut &problems, "ev: the index counts " + rall.int(0, 0).unwrap().toStr() + " rows, the scan " + evRows.rowCount().toStr()) }
     for w in 0..WORKERS {
         let r = c.query("select count(*) from log where worker = $1", &[V.Int(w)]).unwrap()
         let n = r.int(0, 0).unwrap()

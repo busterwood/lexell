@@ -1,6 +1,6 @@
 # lexdb: bulk deletes without partitioning (a design, 2026-11-14)
 
-The two steps of [lexdb-gaps.md](lexdb-gaps.md) 2.5. Nothing here is built.
+The two steps of [lexdb-gaps.md](lexdb-gaps.md) 2.5. Stages 1 to 6 are built (see the "as built" notes in section 5).
 Line numbers are as of 2026-11-14. Statements marked [read] come from
 reading the code and were not run; [estimate] means not measured.
 
@@ -819,12 +819,164 @@ The crash tests use the simulated Fs (`lexdb_disk.sim(seed)`, as
      - two sessions: serializable 40001 both ways (as `exec_dmlscale`'s
        case);
      - a concurrent `FOR UPDATE`.
+   - **As built (2026-11-14).** `Txn.cuts` (`TCut{tree, lo, hi, pos}`),
+     `Txn.cutKey`/`cutsMeet`/`hasCuts`, `Store.getBaseIn`, `Store.countView`
+     (`lexdb_store.lxl`); `rangePlan` and `rangeDelete` (`lexdb_exec.lxl`).
+     Tests: 12 block scripts and a two-session `blockTest` in
+     `exec_rangedel` (now 133 shapes, about 18 s), `tds_rangedel` and
+     `tns_rangedel` (the Oracle door and BEGIN TRAN take the path), blocks in
+     the crash client's `ev` and in `replica.py`'s `r`. Where it differs from
+     the plan or adds to it:
+     - **A cut hides stored keys only.** The rule in every read: the
+       transaction's own write of a key (`idx`) first, as before; else, if a
+       cut of the tree holds the key, gone; else the store. So a later own
+       put beats an earlier cut, and an earlier own put inside a cut is
+       already a delete (`delRange`, stage 1). `getIn` checks the cut after
+       its own-write match and before `getBaseIn` (the old rest of `getIn`,
+       with the replica, snapshot and live reads, so `snapGet` is covered);
+       `getMany`, `scanIn` and `scanBackIn` skip a stored entry in a cut
+       that no own write took the place of; `scanLeaves` gives up (`Ok(false)`,
+       as for own writes) when a cut meets its range, and the scan runs
+       instead. Raw scans (a companion tree's chunks) have no cuts: chunks
+       are reached only through the main entry. A scan through a cut still
+       reads the cut's leaves (no jump to `hi`): not worth the own-write
+       merge it would need; the leaves of a purged range are often few
+       reads after the range delete has run, and the commit drops them.
+     - **`undoTo`** pops the cuts whose `pos` is at or after the savepoint's
+       write count (the `OP_DELRANGE` write goes with them; the rebuilt `idx`
+       never held it).
+     - **The count: `countView`**, used by `rangeDelete` in place of
+       `countRange` (which still counts the tree only):
+       `rows = countRange(range) - sum countRange(earlier cuts inside the
+       range, merged into disjoint intervals) - #(own-written keys in the
+       range outside those cuts that are stored: one lookup each, not noted)
+       + #(own puts in the range)`. An own write is the last write of a key
+       (`ownRange`); a put after a cut counts once (its cut interval removed
+       the stored row from the first term, if any). Falls back to the row
+       path (`Ok(-1)`) when `countRange` gives up, or when the range holds
+       more than `COUNT_OWN_MAX` (10,000) own writes (a lookup each). No
+       other case falls back: the formula is exact for every mix tested
+       (own insert of new keys, updates, deletes, earlier overlapping and
+       adjacent cuts, a cut then an own put, savepoints).
+     - **`rangePlan`:** only the `inBlock`/`hasWrites` refusal is gone;
+       `quiet`, EXPLAIN-snapshot and every other refusal stay.
+     - **Locks (D4-b).** The range delete takes no row lock. The row path in
+       a block locks each found row and keeps it (`lockFound`: a concurrent
+       UPDATE or `FOR UPDATE` then waits for the block's end). The range
+       delete keeps what stage 4 has: a lock held by another session on a
+       key in the range (`Store.locksIn`) sends the statement to the row
+       path, which waits as today; and a session that locks or updates a row
+       of the range after it is not made to wait: both go on, and the one
+       that commits second fails 40001 (the delete's `noteRange` read mark
+       against the locker's write, or the locker's read of the row against
+       the `OP_DELRANGE` entry in the write log). `blockTest` shows both
+       orders, and an UPDATE or a `SELECT ... FOR UPDATE` taken after the
+       delete returns at once. A `SELECT ... FOR UPDATE` alone writes
+       nothing and notes no read, so it is not made to fail by the delete
+       (not tested alone).
+     - **Doors.** Oracle's door (a block for every DML statement) and
+       T-SQL inside BEGIN TRAN (each statement under a savepoint, so a
+       failed one `undoTo`s its cut) take the path; so do psycopg2 and JDBC
+       with autocommit off.
+     - **Planted bugs, all caught** (`exec_rangedel`): a cut ignored by
+       `scanBackIn`, by `scanIn`, by `getIn`, by `getMany` (the join with
+       `u`), by `scanLeaves` (the plain count read); the cut not undone by
+       `undoTo` (the savepoint script); the count not adding own puts.
+     - **Open for stage 6:** a table with non-qualifying indexes still takes
+       the row path; the count correction is already for the main tree only
+       (the index trees' cuts need none: their entries are deleted and
+       hidden by the same rule).
 6. **(D2-b) Tables with indexes.**
    - Read the rows' index columns, delete the index entries one by one,
      and still drop the table's subtrees.
    - Indexes that lead with the PK's columns take the range op directly.
    - Tests: `exec_dmlscale`-style counts through every index against
      counts by scan; expression and partial indexes.
+   - **As built (2026-11-14).** `delEntries`, `RPlan.slow`, `treeDump` (a
+     test's look at every tree of a table) in `lexdb_exec.lxl`;
+     `Db.ovfLens` and a fix in `applyRange` (`lexdb_store.lxl`). Tests: the
+     new `exec_rangedel_ix` (68 shapes, about 25 s), three shapes of
+     `exec_rangedel` changed from fallbacks to the path plus one new (134),
+     the crash client's `ev` (two indexes, checked), `replica.py`
+     unchanged. Where it differs from the plan or adds to it:
+     - **Which indexes:** `rangePlan` sorts every index of the table into
+       `ixs` (leads with the key columns the range uses: cut by range as in
+       stage 4) or `slow` (any other: another column, an expression, one
+       that is too short). Nothing refuses on an index any more. The whole
+       table (no WHERE) still has every index in `ixs`.
+     - **`delEntries(st, txn, t, lo, hi, slow)`:** scans the main tree's
+       `[lo, hi)` with `scanPart` in batches of `BATCH` (256) rows, so
+       the rows are not held, builds each row with `rowOf` from only the
+       columns the slow indexes use (`need`: their columns, their
+       expressions' and predicates' column names, as `delNarrow` does; a
+       large value is read whole only when one of them names it), and for
+       each slow index deletes `idxEntry(row, key)` when `inIndex` holds, as
+       `delRow` does (the key is the tree's own key, the same as `keyOf`).
+       It returns the rows read. The scan goes through the transaction's own
+       view (own writes, `Txn.cuts`), so the rows read are exactly the rows
+       the statement deletes, whatever the transaction did before: no
+       `countView`, and no `COUNT_OWN_MAX` fallback for such a table. The
+       batches are read before their deletes are made (a scan is not
+       resumed after a write to the transaction). Then `delRange` of the
+       table and of the indexes in `ixs`, as before. A statement that finds
+       no row writes nothing. The deletes of the index entries are the
+       memory the row path holds too (one write each, in the transaction);
+       the rows themselves are not.
+     - **The same contents as the row path:** unique indexes: the entry of a
+       deleted row is deleted, so a re-insert of the same value in the same
+       transaction passes `checkUnique` (a put after a delete, own-write
+       view). NULLs in a unique index have entries and are deleted the same
+       way. A filtered index's entries are deleted for the rows its
+       predicate holds for (`inIndex`; deleting the entry of a row it does
+       not hold would be a harmless extra delete, but the predicate may
+       evaluate an expression that errors).
+     - **EXPLAIN:** `range delete: primary key range, subtrees dropped (1 of
+       3 indexes cut by range, 2 entry by entry)`; no indexes, no
+       parenthesis.
+     - **Not changed:** `SET lexdb_range_delete = off` gives the row path
+       (tested for every shape); a table others reference falls back (D3-a).
+     - **Found and fixed, in the store (stage 1/5):** two range deletes of
+       one tree in one commit, the first starting at the tree's beginning,
+       on a tree with large values (a companion tree) panicked at apply
+       ("range delete's companion not in memory"). `applyRange` finds the key
+       lengths of the companion's chunks by skipping from length to length
+       (`chunkLens`); after the first range had emptied the leftmost leaf,
+       the skip went to the separator's side, passing a node the plan
+       (`writeNeeds`) had not loaded. A block with two range deletes
+       (stage 5) on such a table hit it. `writeNeeds` now keeps the lengths
+       it found (`Db.ovfLens`, per companion tree, as u16s: the map holds
+       copy types), and `applyRange` goes by those when its own walk cannot
+       finish; they are a superset of the lengths with chunks in the range
+       (earlier writes only remove chunks there). Test: `exec_rangedel`'s
+       "block: two range deletes, large values", and the big family of
+       `exec_rangedel_ix`.
+     - **Tests (`exec_rangedel_ix`):** each shape on and off on identical
+       tables: tags, rows, `treeDump` (count and a hash of every entry of
+       the table's tree and of each index's), 12 pairs of queries (served
+       by an index, and by a scan), the audit, EXPLAIN's text and the path
+       taken. Families: one index; several (single, two-column with the key
+       not first, a text one); unique (with NULLs); expression; partial
+       (and a partial unique); two-column; a two-column key with indexes
+       (b), (b, a), (a), (a, b, v) for ranges on a; large values (an
+       expression over the large column, read whole); everything on one
+       table with the key's own indexes too. Statements: `<`, between, `>=`,
+       several in a row, delete then re-insert of the very values, the whole
+       table, a residual (row path), and blocks: own writes before (inserts,
+       updates of indexed columns, deletes), a re-insert of a deleted unique
+       value in the same block, earlier range deletes, savepoints,
+       ROLLBACK, a table made in the block.
+     - **Planted bugs, all caught:** an expression index's entries not
+       deleted (trees differ and the pair of queries disagrees); a filtered
+       index skipped (trees differ); the unique indexes skipped (trees
+       differ, with the row path's re-insert passing where this fails); the
+       count one short after a batch (tags differ).
+     - **Crash:** the crash client's `ev` has two secondary indexes
+       (`worker`, and `worker where id % 2 = 0`); the check compares the
+       counts through each with the rows.
+     - **For stage 8:** the batch loop of `WITH (batch_rows n)` can use
+       `delEntries` as it is on a key range: it already reads in batches and
+       holds no rows; its writes (one per index entry) are what a batch
+       bounds.
 7. **(D3-b, optional) Referencing FKs:** the probe and the cascading
    range. Tests: cases from `exec_fkaction` and `exec_fkey` run with the
    switch on and off.
@@ -845,6 +997,81 @@ The crash tests use the simulated Fs (`lexdb_disk.sim(seed)`, as
        counts);
      - `held` stays under n rows' bytes;
      - a conflict on one batch runs that batch again.
+   - **As built (2026-11-14).** Parser: `batchOpt` (`lexdb_sql.lxl`),
+     after RETURNING at the end of `update` and `delete`; the option lands
+     in `Stmt.copy.batchRows`, COPY's own field, so the session's no-retry
+     rule for COPY (a batched statement is not run again whole on a 40001)
+     now reads `stmt.copy.batchRows > 0` for any kind. Executor
+     (`lexdb_exec.lxl`): `batchDml` (the loop), `Win` (one batch's state),
+     `deleteB` and `updateB` (the old `delete` and `update`, which call them
+     with `n = 0` or hand over to `batchDml`), `Run.after` and `afterScans`,
+     `freshTxn`, `winEnd`. Tests: new `exec_batchdml` (18 lines of output),
+     about 2 s. Where it differs from the plan or adds to it:
+     - **Syntax, all three doors:** `DELETE ... [WHERE ...] WITH (batch_rows
+       n)` and `UPDATE ... SET ... [WHERE ...] WITH (batch_rows n)`. The
+       three doors share the statement parser, so T-SQL and Oracle take the
+       same suffix. In T-SQL `tableHints` leaves `WITH (batch_rows` alone, so
+       `DELETE FROM t WITH (batch_rows 3)` is not read as a table hint. With
+       RETURNING (or T-SQL's OUTPUT) the suffix goes after it, and is refused.
+     - **The batch:** the statement runs with its callback stopping at n
+       rows found (the scan's own read-ahead batch is 256 rows, so up to 255
+       rows past the nth are read and read again by the next batch); the rows
+       are changed, `fkFinish` runs, and the batch commits on a new `Txn`
+       (`freshTxn`: path, session, temporary schema, `now()`, and also the
+       zone, `rules` and `memMax`, which COPY's loop lost; COPY now uses
+       `freshTxn` too). The statement's last batch is committed by the loop
+       as well, so a conflict there is retried like the others. The tag is
+       the total.
+     - **Where the next batch starts:** `Run.after`, the key after the last
+       row of the batch (`after(key)`), applied by `afterScans` to the first
+       level's primary key scans (in `runLevel` and in `bLevelPlan`, the
+       batched reader): points before it are dropped, ranges start at it,
+       the whole table becomes a range. DELETE read by the primary key (no
+       index path, not backward) uses it; DELETE read by an index runs again
+       with no cursor, as the design says. UPDATE always reads by the key:
+       an index or backward path is replaced by the key's full scan before
+       `prepare`, and the WHERE stays as conditions. The reads of a sparse
+       predicate are about one pass over the table in all.
+     - **The range path:** only the first batch may take it
+       (`rangeDelete` with `noSlow`): one write, atomic, `batch_rows`
+       ignored. A range delete that has indexes whose entries go one by one
+       (stage 6, `slow`) is not taken in a batched statement: those entries
+       are as many writes as rows, so the memory argument does not hold; the
+       row path in batches takes it.
+     - **Refusals:** in a block 25001; RETURNING or OUTPUT 0A000; UPDATE
+       that assigns a primary key column 0A000; n below 1 or not a number
+       22023 or 42601 (parse). Added: USING or FROM 0A000 (a joined row has
+       no key to resume from, and the join order may not read the target
+       first), and T-SQL's TOP 0A000 (a limit of its own).
+     - **Failure:** the error is the batch's, with `context` set (or
+       appended to) as `DELETE with batch_rows 3: 6 rows committed before
+       the error`; rows of the failed batch are rolled back, those of the
+       batches before it stay. A conflict found as the batch ran (an old
+       read of the live tree) or at its commit runs that batch again on a new
+       transaction; the tenth in a row is the error.
+     - **Memory:** `rs.held` and the callback's `held` are per batch, so
+       `max_statement_mem` bounds a batch: a DELETE of 4,000 rows of 500
+       bytes fails with 53200 under 512 kB, and passes in batches of 100.
+     - **Tests (`exec_batchdml`):** 10 rows in 4 batches and 9 in 4 (the
+       last finds none); the range path (no batches, one range delete) and
+       the same with an index (batches); UPDATE with the WHERE on the changed
+       column (exactly once), with an index on it, a two-column key, and a
+       change that moves the row past the index; a foreign key failing in
+       the third batch (6 rows kept, context), a division by zero in the
+       third batch of an UPDATE; the refusals; a sparse predicate over
+       20,000 rows (20,384 rows read, the pass and one scan batch per
+       batch); a DELETE by an index; `max_statement_mem`; a writer between a
+       batch and its commit (`setBatchHook`: the batch runs again); the
+       suffix in Oracle's parser (run) and T-SQL's (parsed, TOP refused).
+     - **Planted bugs, all caught:** the cursor kept at the last key instead
+       of after it (rows updated twice: tags and counts differ); a conflict
+       that advanced the cursor (a batch's rows skipped); the batch aborted
+       instead of committed, an UPDATE read by the planner's index path, no
+       cursor for UPDATE (these three loop for ever, so the test times out).
+     - **Not covered:** a table others reference by foreign key falls to
+       the row path in batches as before (cascades run per batch); rows
+       committed behind the cursor by others are not seen; EXPLAIN is not changed for a
+       batched statement (not tested).
 9. **Measure (section 6), then write it up in `lexdb.md`** as a new 9.x
    section, and update gaps 2.4 and 2.5.
 

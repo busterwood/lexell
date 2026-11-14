@@ -4924,7 +4924,8 @@ fn (p: mut &P) fromFunction(join: int): Result[FromItem, lexdb_base.DbErr] {
 // (lexdb's reads are snapshots; its writes lock rows).
 fn (p: mut &P) tableHints(): Result[Unit, lexdb_base.DbErr] {
     if !p.tsql { return Ok(Unit{}) }
-    let w = p.isKw("with") && p.peekAt(1).kind == T_OP && p.peekAt(1).text == "("
+    // (not WITH (batch_rows n), lexdb's own at the end of an UPDATE or DELETE: batchOpt)
+    let w = p.isKw("with") && p.peekAt(1).kind == T_OP && p.peekAt(1).text == "(" && !(p.peekAt(2).kind == T_IDENT && p.peekAt(2).text == "batch_rows")
     let bare = p.isKw("(") && p.peekAt(1).kind == T_IDENT && (p.peekAt(1).text == "nolock" || p.peekAt(1).text == "readuncommitted" ||
                p.peekAt(1).text == "holdlock" || p.peekAt(1).text == "updlock" || p.peekAt(1).text == "rowlock" || p.peekAt(1).text == "tablock")
     if !w && !bare { return Ok(Unit{}) }
@@ -5500,8 +5501,27 @@ fn (p: mut &P) update(): Result[Stmt, lexdb_base.DbErr] {
     if p.acceptKw("from") { try p.fromList(mut &s.from, J_CROSS) }
     if p.acceptKw("where") { s.where = Some(try p.expr()) }
     try p.returning(mut &s)
+    try p.batchOpt(mut &s)
     if p.tsql { try tsqlDml(mut &s, out) }
     return Ok(s)
+}
+
+// lexdb's WITH (batch_rows n) at the end of an UPDATE or DELETE (design/
+// lexdb-bulkdelete.md stage 8; in all three dialects: they share this
+// parser): the statement commits each n rows. Kept in copy.batchRows, as
+// COPY's (n must be positive: 22023); the executor refuses what it cannot
+// batch.
+fn (p: mut &P) batchOpt(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
+    if !(p.isKw("with") && p.peekAt(1).kind == T_OP && p.peekAt(1).text == "(" && p.peekAt(2).kind == T_IDENT && p.peekAt(2).text == "batch_rows") { return Ok(Unit{}) }
+    p.pos += 3
+    let v = p.peek()
+    if v.kind != T_NUM { return Err(near(&v)) }
+    p.pos += 1
+    let n = strings.parseIntOpt(&v.text).unwrapOr(0)
+    if n < 1 { return Err(lexdb_base.err("22023", "batch_rows must be a positive integer")) }
+    s.copy.batchRows = n
+    try p.expectKw(")")
+    return Ok(Unit{})
 }
 
 // DELETE FROM [ONLY] t [[AS] alias] [USING list] [WHERE ...] [RETURNING ...]
@@ -5516,6 +5536,7 @@ fn (p: mut &P) delete(): Result[Stmt, lexdb_base.DbErr] {
     if p.acceptKw("using") || (p.tsql && p.acceptKw("from")) { try p.fromList(mut &s.from, J_CROSS) }
     if p.acceptKw("where") { s.where = Some(try p.expr()) }
     try p.returning(mut &s)
+    try p.batchOpt(mut &s)
     if p.tsql { try tsqlDml(mut &s, out) }
     return Ok(s)
 }
