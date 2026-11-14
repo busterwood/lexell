@@ -1,0 +1,418 @@
+// borrow: borrow inference for str parameters (design/borrow-inference.md), on the IR before the
+// native backend's optimisations.
+//
+// A str parameter is owned: the caller passes a counted copy (f(rt_str_dup(x))) and the
+// function drops it. When a function only reads such a parameter, the count is wasted. For each
+// function f with such parameters:
+//   - f's body moves to a new function f_b, whose borrowed parameters are not dropped;
+//   - f becomes a wrapper with the old convention: f_b(params), then the drops (the inliner may
+//     put it in place at its calls);
+//   - a direct call of f whose argument for each borrowed parameter is rt_str_dup(y) of a place y
+//     that stays as it is during the call calls f_b(y) instead: no count, no drop.
+// Every other caller (a fresh string, a moved local, a call through a pointer) still calls f.
+//
+// A parameter that f drops (a &str parameter is never dropped; it is "lent") is borrowed when
+// every use of it is a read:
+//   - a member of it;
+//   - an argument of a runtime function other than a drop;
+//   - the argument of a dup (a new count of its own);
+//   - an argument for a lent parameter of a function;
+//   - its drop, as a statement.
+// Anything else makes it owned: a store, an initializer, a return, an assignment to it or to a
+// part of it, its address, a move into an owned parameter, a call through a pointer, a use not
+// understood. A lent parameter that is stored or moved is "kept" and lends to nothing. Candidates
+// start borrowed and become owned until nothing changes (recursion).
+//
+// y stays as it is during the call when y is a local, or members of a local, whose address the
+// caller never takes, and no other argument of the call names that local except to copy it.
+
+import "./ir"
+
+type B = record {
+    strTy: int
+    dupF: int
+    dropF: int
+    // per function: its parameters' states: 0 not a str (or not looked at), 1 borrowed (so far),
+    // 2 owned, 3 lent (never dropped, never kept), 4 kept
+    ps: [][]int
+    bOf: []int          // a function's f_b, or -1
+    aTaken: []bool      // per local: its address is taken in its function
+    hasSlot: []bool     // per function: it has a candidate parameter
+    callsCand: bool     // the body being walked calls a function with a candidate
+}
+
+const OWNED = 2
+const LENT = 3
+const KEPT = 4
+
+fn callee(p: &ir.Ir, x: int): int {
+    let c = p.nodes[x].a
+    if p.nk(c) != ir.E_DECAY || p.nk(p.nodes[c].a) != ir.E_FUNC { return -1 }
+    return p.nodes[p.nodes[c].a].a
+}
+
+// The children of node x by number, without making a list (kernel.lxl's kids makes one): the
+// number of child slots, and child i (-1 when the slot is empty). A call's callee is child 0,
+// its arguments 1 and on.
+fn nkid(p: &ir.Ir, x: int): int {
+    let n = p.nodes[x]
+    let kk = if n.k >= 0 && n.k < len(ir.KIDS) { ir.KIDS[n.k] } else { -1 }
+    if kk == ir.K_A { return 1 }
+    if kk == ir.K_AB { return 2 }
+    if kk == ir.K_ABC { return 3 }
+    if kk == ir.K_FOR { return 4 }
+    if kk == ir.K_CALL { return 1 + (if n.b >= 0 { p.listLen(n.b) } else { 0 }) }
+    if kk == ir.K_CLIT { return if n.b >= 0 { p.listLen(n.b) } else { 0 } }
+    if kk == ir.K_BLOCK { return if n.a >= 0 { p.listLen(n.a) } else { 0 } }
+    if kk == ir.K_DECL { return 1 + (if n.c >= 0 { p.listLen(n.c) } else { 0 }) }
+    return 0
+}
+
+fn kid(p: &ir.Ir, x: int, i: int): int {
+    let n = p.nodes[x]
+    let kk = ir.KIDS[n.k]
+    if kk == ir.K_A || kk == ir.K_AB || kk == ir.K_ABC || kk == ir.K_FOR {
+        return if i == 0 { n.a } else if i == 1 { n.b } else if i == 2 { n.c } else { n.d }
+    }
+    if kk == ir.K_CALL { return if i == 0 { n.a } else { p.listAt(n.b, i - 1) } }
+    if kk == ir.K_CLIT { return p.listAt(n.b, i) }
+    if kk == ir.K_BLOCK { return p.listAt(n.a, i) }
+    return if i == 0 { n.b } else { p.listAt(n.c, i - 1) }     // K_DECL
+}
+
+// The local a place x is rooted in through members only, or -1.
+fn rootLocal(p: &ir.Ir, x0: int): int {
+    var x = x0
+    while p.nk(x) == ir.E_MEMBER { x = p.nodes[x].a }
+    return if p.nk(x) == ir.E_LOCAL { p.nodes[x].a } else { -1 }
+}
+
+// Whether x is the drop of local l: rt_str_drop(l).
+fn isDropOf(p: &ir.Ir, b: &B, x: int, l: int): bool {
+    if p.nk(x) != ir.E_CALL || callee(p, x) != b.dropF || p.listLen(p.nodes[x].b) != 1 { return false }
+    let a = p.listAt(p.nodes[x].b, 0)
+    return p.nk(a) == ir.E_LOCAL && p.nodes[a].a == l
+}
+
+
+// What one walk of a body finds about each candidate parameter (Use, by slot): its drops,
+// uses that keep it, and arguments it is for other functions' parameters (deps: pairs g, j).
+type Use = record {
+    hasDrop: bool
+    badDrop: bool       // a drop that is not a statement of its own
+    bad: bool           // a use other than a read (see the comment at the top)
+    deps: []int
+}
+
+fn collect(p: &ir.Ir, b: mut &B, us: mut &[]Use, slotOf: &[]int, x: int, px: int, i: int) {
+    if x < 0 { return }
+    let k = p.nk(x)
+    if k == ir.E_ADDR {
+        let r = rootLocal(p, p.nodes[x].a)
+        if r >= 0 {
+            b.aTaken[r] = true
+            if slotOf[r] >= 0 { us[slotOf[r]].bad = true }
+        }
+    }
+    if k == ir.E_CALL {
+        let g = callee(p, x)
+        if g >= 0 && g < len(b.hasSlot) && b.hasSlot[g] { b.callsCand = true }
+    }
+    if k == ir.E_ASSIGN || k == ir.E_POSTINC {
+        let r = rootLocal(p, p.nodes[x].a)
+        if r >= 0 && slotOf[r] >= 0 { us[slotOf[r]].bad = true }
+    }
+    if k == ir.E_CALL && callee(p, x) == b.dropF && p.listLen(p.nodes[x].b) == 1 {
+        let a = p.listAt(p.nodes[x].b, 0)
+        if p.nk(a) == ir.E_LOCAL && slotOf[p.nodes[a].a] >= 0 {
+            let u = slotOf[p.nodes[a].a]
+            us[u].hasDrop = true
+            if px < 0 || p.nk(px) != ir.S_EXPR { us[u].badDrop = true }
+            return
+        }
+    }
+    if k == ir.E_LOCAL {
+        let u = slotOf[p.nodes[x].a]
+        if u < 0 { return }
+        if px < 0 {
+            us[u].bad = true
+            return
+        }
+        let pk = p.nk(px)
+        if pk == ir.E_MEMBER || pk == ir.S_EXPR { return }
+        if pk != ir.E_CALL || i == 0 {
+            us[u].bad = true
+            return
+        }
+        let g = callee(p, px)
+        if g < 0 {
+            us[u].bad = true
+            return
+        }
+        if g == b.dupF || g < p.nRtFuncs || p.funcs[g].isExtern { return }
+        append(mut &us[u].deps, g)
+        append(mut &us[u].deps, i - 1)
+        return
+    }
+    let kk = ir.KIDS[k]
+    if kk == ir.K_CALL {
+        collect(p, b, us, slotOf, p.nodes[x].a, x, 0)
+        for j in 0..p.listLen(p.nodes[x].b) { collect(p, b, us, slotOf, p.listAt(p.nodes[x].b, j), x, j + 1) }
+    } else if kk == ir.K_BLOCK {
+        for j in 0..p.listLen(p.nodes[x].a) { collect(p, b, us, slotOf, p.listAt(p.nodes[x].a, j), x, j) }
+    } else if kk == ir.K_CLIT {
+        if p.nodes[x].b >= 0 { for j in 0..p.listLen(p.nodes[x].b) { collect(p, b, us, slotOf, p.listAt(p.nodes[x].b, j), x, j) } }
+    } else if kk == ir.K_DECL {
+        collect(p, b, us, slotOf, p.nodes[x].b, x, 0)
+        if p.nodes[x].c >= 0 { for j in 0..p.listLen(p.nodes[x].c) { collect(p, b, us, slotOf, p.listAt(p.nodes[x].c, j), x, j + 1) } }
+    } else if kk == ir.K_A {
+        collect(p, b, us, slotOf, p.nodes[x].a, x, 0)
+    } else if kk == ir.K_AB {
+        collect(p, b, us, slotOf, p.nodes[x].a, x, 0)
+        collect(p, b, us, slotOf, p.nodes[x].b, x, 1)
+    } else if kk == ir.K_ABC || kk == ir.K_FOR {
+        collect(p, b, us, slotOf, p.nodes[x].a, x, 0)
+        collect(p, b, us, slotOf, p.nodes[x].b, x, 1)
+        collect(p, b, us, slotOf, p.nodes[x].c, x, 2)
+        if kk == ir.K_FOR { collect(p, b, us, slotOf, p.nodes[x].d, x, 3) }
+    }
+}
+
+// Drops of the borrowed parameters made empty statements (in f_b's body).
+fn unDrop(p: mut &ir.Ir, b: &B, x: int, ls: &[]int) {
+    if p.nk(x) == ir.S_EXPR {
+        for l in ls {
+            if isDropOf(p, b, p.nodes[x].a, l) {
+                p.nodes[x].k = ir.S_EMPTY
+                return
+            }
+        }
+    }
+    for j in 0..nkid(p, x) {
+        let c = kid(p, x, j)
+        if c >= 0 { unDrop(p, b, c, ls) }
+    }
+}
+
+// Whether the tree x names the local l other than as rt_str_dup(...l...).
+fn names(p: &ir.Ir, b: &B, x: int, l: int): bool {
+    if p.nk(x) == ir.E_CALL && callee(p, x) == b.dupF { return false }
+    if p.nk(x) == ir.E_LOCAL && p.nodes[x].a == l { return true }
+    for j in 0..nkid(p, x) {
+        let c = kid(p, x, j)
+        if c >= 0 && names(p, b, c, l) { return true }
+    }
+    return false
+}
+
+// Calls of functions with an f_b, in the tree x, made calls of f_b where every borrowed
+// argument is a copy of a place that stays as it is during the call.
+fn rewrite(p: mut &ir.Ir, b: &B, x: int) {
+    let k = p.nk(x)
+    let kk = ir.KIDS[k]
+    let nd = p.nodes[x]
+    if kk == ir.K_CALL {
+        for j in 0..p.listLen(nd.b) { rewrite(p, b, p.listAt(nd.b, j)) }
+    } else if kk == ir.K_BLOCK {
+        for j in 0..p.listLen(nd.a) { rewrite(p, b, p.listAt(nd.a, j)) }
+    } else if kk == ir.K_CLIT {
+        if nd.b >= 0 { for j in 0..p.listLen(nd.b) { rewrite(p, b, p.listAt(nd.b, j)) } }
+    } else if kk == ir.K_DECL {
+        if nd.b >= 0 { rewrite(p, b, nd.b) }
+        if nd.c >= 0 { for j in 0..p.listLen(nd.c) { rewrite(p, b, p.listAt(nd.c, j)) } }
+    } else if kk == ir.K_A || kk == ir.K_AB || kk == ir.K_ABC || kk == ir.K_FOR {
+        if nd.a >= 0 { rewrite(p, b, nd.a) }
+        if kk != ir.K_A && nd.b >= 0 { rewrite(p, b, nd.b) }
+        if (kk == ir.K_ABC || kk == ir.K_FOR) && nd.c >= 0 { rewrite(p, b, nd.c) }
+        if kk == ir.K_FOR && nd.d >= 0 { rewrite(p, b, nd.d) }
+    }
+    if k != ir.E_CALL { return }
+    let g = callee(p, x)
+    if g < 0 || g >= len(b.bOf) || b.bOf[g] < 0 { return }
+    let args = p.nodes[x].b
+    let n = p.listLen(args)
+    var places: []int = []
+    for j in 0..n {
+        let a = p.listAt(args, j)
+        if j >= len(b.ps[g]) || b.ps[g][j] != 1 {
+            append(mut &places, a)
+            continue
+        }
+        if p.nk(a) != ir.E_CALL || callee(p, a) != b.dupF || p.listLen(p.nodes[a].b) != 1 { return }
+        let y = p.listAt(p.nodes[a].b, 0)
+        let l = rootLocal(p, y)
+        if l < 0 || b.aTaken[l] { return }
+        for o in 0..n {
+            if o != j && names(p, b, p.listAt(args, o), l) { return }
+        }
+        append(mut &places, y)
+    }
+    let fb = b.bOf[g]
+    let ft = p.funcs[fb].ty
+    append(mut &p.nodes, ir.Node{k: ir.E_FUNC, ty: ft, line: 0, a: fb, b: -1, c: -1, d: -1, v: 0})
+    let fnode = len(p.nodes) - 1
+    let pt = p.ptrTo(ft)
+    append(mut &p.nodes, ir.Node{k: ir.E_DECAY, ty: pt, line: 0, a: fnode, b: -1, c: -1, d: -1, v: 0})
+    p.nodes[x].a = len(p.nodes) - 1
+    p.nodes[x].b = p.list(&places)
+}
+
+fn node(p: mut &ir.Ir, k: int, ty: int, a: int, b: int, c: int): int {
+    append(mut &p.nodes, ir.Node{k: k, ty: ty, line: 0, a: a, b: b, c: c, d: -1, v: 0})
+    return len(p.nodes) - 1
+}
+
+// f's new body: return f_b(params) after dropping the borrowed ones.
+fn wrapper(p: mut &ir.Ir, b: &B, f: int, fb: int) {
+    let ft = p.funcs[f].ty
+    let rt = p.tys[ft].base
+    var ps: []int = []
+    var args: []int = []
+    for j in 0..len(p.funcs[fb].params) {
+        let old = p.funcs[fb].params[j]
+        append(mut &p.locals, ir.Local{name: p.locals[old].name, ty: p.locals[old].ty})
+        let l = len(p.locals) - 1
+        append(mut &ps, l)
+        append(mut &args, node(p, ir.E_LOCAL, p.locals[l].ty, l, -1, -1))
+    }
+    let fnode = node(p, ir.E_FUNC, ft, fb, -1, -1)
+    let dec = node(p, ir.E_DECAY, p.ptrTo(ft), fnode, -1, -1)
+    let call = node(p, ir.E_CALL, rt, dec, p.list(&args), ft)
+    var sts: []int = []
+    var r = -1
+    if rt == ir.TY_VOID {
+        append(mut &sts, node(p, ir.S_EXPR, 0, call, -1, -1))
+    } else {
+        append(mut &p.locals, ir.Local{name: "r_borrow", ty: rt})
+        r = len(p.locals) - 1
+        append(mut &sts, node(p, ir.S_DECL, 0, r, call, -1))
+    }
+    let dt = p.funcs[b.dropF].ty
+    for j in 0..len(ps) {
+        if b.ps[f][j] != 1 { continue }
+        let dn = node(p, ir.E_FUNC, dt, b.dropF, -1, -1)
+        let dd = node(p, ir.E_DECAY, p.ptrTo(dt), dn, -1, -1)
+        let a = node(p, ir.E_LOCAL, p.locals[ps[j]].ty, ps[j], -1, -1)
+        let one: []int = [a]
+        let dc = node(p, ir.E_CALL, ir.TY_VOID, dd, p.list(&one), dt)
+        append(mut &sts, node(p, ir.S_EXPR, 0, dc, -1, -1))
+    }
+    let rv = if r >= 0 { node(p, ir.E_LOCAL, rt, r, -1, -1) } else { -1 }
+    append(mut &sts, node(p, ir.S_RETURN, 0, rv, -1, -1))
+    p.funcs[f].params = ps
+    p.funcs[f].body = node(p, ir.S_BLOCK, 0, p.list(&sts), -1, -1)
+}
+
+// The pass. Its counts: the borrowed parameters, and the functions given an f_b.
+pub fn optimize(p: mut &ir.Ir): int {
+    var b = B{strTy: -1, dupF: -1, dropF: -1, ps: [], bOf: [], aTaken: [], hasSlot: [], callsCand: false}
+    for f in 0..p.nRtFuncs {
+        if p.funcs[f].name == "rt_str_dup" { b.dupF = f }
+        if p.funcs[f].name == "rt_str_drop" { b.dropF = f }
+    }
+    if b.dupF < 0 || b.dropF < 0 { return 0 }
+    b.strTy = p.tys[p.funcs[b.dupF].ty].base
+    let n = len(p.funcs)
+    for l in 0..len(p.locals) { append(mut &b.aTaken, false) }
+    for f in 0..n {
+        append(mut &b.ps, [])
+        append(mut &b.bOf, -1)
+    }
+    // the candidates (str parameters whose address is not taken), one slot each, and one walk of
+    // each body for their uses
+    var slotOf: []int = []
+    for l in 0..len(p.locals) { append(mut &slotOf, -1) }
+    var us: []Use = []
+    var slotF: []int = []
+    var slotJ: []int = []
+    for f in 0..n { append(mut &b.hasSlot, false) }
+    for f in p.nRtFuncs..n {
+        var ps: []int = []
+        let body = p.funcs[f].body
+        for j in 0..len(p.funcs[f].params) {
+            let l = p.funcs[f].params[j]
+            append(mut &ps, 0)
+            if body >= 0 && !p.funcs[f].isExtern && p.locals[l].ty == b.strTy {
+                slotOf[l] = len(us)
+                append(mut &us, Use{hasDrop: false, badDrop: false, bad: false, deps: []})
+                append(mut &slotF, f)
+                append(mut &slotJ, j)
+                b.hasSlot[f] = true
+            }
+        }
+        b.ps[f] = ps
+    }
+    // one walk of every body: the uses of the candidates, the locals whose address is taken, and
+    // the bodies that call a function with candidates (the only ones rewrite looks at)
+    var callers: []bool = []
+    for f in 0..n { append(mut &callers, false) }
+    for f in p.nRtFuncs..n {
+        if p.funcs[f].body < 0 { continue }
+        b.callsCand = false
+        collect(p, mut &b, mut &us, &slotOf, p.funcs[f].body, -1, 0)
+        callers[f] = b.callsCand
+    }
+    for u in 0..len(us) {
+        let st = if us[u].hasDrop { (if us[u].badDrop || us[u].bad { OWNED } else { 1 }) } else {
+            (if us[u].bad { KEPT } else { LENT }) }
+        b.ps[slotF[u]][slotJ[u]] = st
+    }
+    // a parameter given as an argument for another function's parameter stays borrowed (or lent)
+    // only while that one is lent
+    var changed = true
+    while changed {
+        changed = false
+        for u in 0..len(us) {
+            let f = slotF[u]
+            let j = slotJ[u]
+            let st = b.ps[f][j]
+            if st != 1 && st != LENT { continue }
+            var ok = true
+            var d = 0
+            while ok && d < len(us[u].deps) {
+                let g = us[u].deps[d]
+                let gj = us[u].deps[d + 1]
+                if gj >= len(b.ps[g]) || b.ps[g][gj] != LENT { ok = false }
+                d += 2
+            }
+            if !ok {
+                b.ps[f][j] = if st == 1 { OWNED } else { KEPT }
+                changed = true
+            }
+        }
+    }
+    var nparams = 0
+    for f in p.nRtFuncs..n {
+        var ls: []int = []
+        for j in 0..len(b.ps[f]) {
+            if b.ps[f][j] == 1 { append(mut &ls, p.funcs[f].params[j]) }
+        }
+        if len(ls) == 0 { continue }
+        nparams += len(ls)
+        let nm = p.funcs[f].name
+        let params = copyInts(&p.funcs[f].params)
+        append(mut &p.funcs, ir.Func{name: nm + "_b", ty: p.funcs[f].ty, params: params, body: p.funcs[f].body,
+            asmName: nm + "_b", isExtern: false, line: p.funcs[f].line, kernel: p.funcs[f].kernel})
+        let fb = len(p.funcs) - 1
+        b.bOf[f] = fb
+        append(mut &b.ps, copyInts(&b.ps[f]))
+        append(mut &b.bOf, -1)
+        let disp = p.fsrc.getOr(&nm, nm)
+        p.fsrc.put(nm + "_b", disp)
+        unDrop(p, &b, p.funcs[fb].body, &ls)
+        wrapper(p, &b, f, fb)
+    }
+    for l in len(b.aTaken)..len(p.locals) { append(mut &b.aTaken, false) }
+    // the callers (f_b bodies are the old bodies; the wrappers call f_b already)
+    for f in p.nRtFuncs..n {
+        if !callers[f] { continue }
+        if b.bOf[f] >= 0 { rewrite(p, &b, p.funcs[b.bOf[f]].body) } else if p.funcs[f].body >= 0 { rewrite(p, &b, p.funcs[f].body) }
+    }
+    return nparams
+}
+
+fn copyInts(xs: &[]int): []int {
+    var out: []int = []
+    for x in xs { append(mut &out, x) }
+    return out
+}

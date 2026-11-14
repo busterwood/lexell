@@ -1,8 +1,8 @@
 # Borrow inference for str parameters: a measurement
 
-Status: an experiment, 2026-11-14, on branch `exp/borrow`, taken from `par`.
-Nothing is optimised. The compiler only counts what borrow inference would
-remove.
+Status: built, 2026-11-14, on branch `exp/borrow`, taken from `par`.
+Sections 1 to 4 are the measurement that came first. Section 6 is the pass
+as built (`compiler/borrow.lxl`, `-O` only), with its results.
 
 ## 1. The idea
 
@@ -81,7 +81,7 @@ for an input string, a log entry), several times the cost of the inline one.
 So the same removal is worth more there (design/parallel.md 6.2, the user
 time column).
 
-## 5. Next, if it is built
+## 5. Next, as planned before it was built
 
 1. **Make the rule a real optimisation.**
    - The caller passes the place: no dup, and no drop of a fresh temporary
@@ -96,3 +96,100 @@ time column).
    and on `bench/par.lxl`.
 3. **Records holding strings passed by value** (their dup glue) are not
    counted here. They are the same idea one level up.
+
+## 6. As built (2026-11-14)
+
+`compiler/borrow.lxl` runs on the IR before the inliner (`opt.lxl`), under
+`-O` only. `LXL_NOBORROW=1` turns it off, for measurements.
+
+For each function `f` with parameters found borrowed:
+- **`f_b`.** `f`'s body moves to a new function `f_b`. In it, the borrowed
+  parameters' drops are empty statements. `f_b` keeps `f`'s kernel mark
+  (design/parallel.md 2.4).
+- **The wrapper.** `f` becomes a wrapper with the old convention: it calls
+  `f_b(params)`, drops the borrowed parameters and returns the result. A
+  caller that passes a fresh string or a moved local, a call through a
+  pointer, and the runtime's callbacks all keep calling `f`. The inliner then
+  puts small wrappers in place.
+- **The call rewrite.** A direct call of `f` becomes `f_b(y)` when the
+  argument for each borrowed parameter is `rt_str_dup(y)`, provided:
+  - `y` is a local, or members of a local;
+  - the caller never takes that local's address;
+  - no other argument of the call names the local except to copy it.
+
+  Then nothing can change or free `y` during the call: the callee cannot
+  reach the caller's locals, and globals cannot be borrowed. A task that
+  parks inside `f_b` changes nothing, because other tasks cannot reach the
+  caller's frame either.
+
+The rule (section 1) has one change. A parameter passed straight on as an
+argument, without a copy, counts as a read only when the other function's
+parameter is lent (a `&str`: never dropped, never kept). Passed to an owned
+parameter, it is a move, so the parameter is owned.
+
+**The analysis** is one walk of every body. For each candidate it records
+its drops, the uses that keep it, and the parameters it is passed to. A fixed
+point over those records follows. Only bodies that call a function with
+candidates are walked again for the rewrite. The first version walked each
+body once per parameter per round, and cost 46 ms of the compiler's 470 ms
+self-compile.
+
+### 6.1 Results
+
+**Counts** with `LXL_RCSTAT=1`. Counted dups, against `LXL_NOBORROW=1`:
+
+| program | dups before | dups after | drops removed |
+|---|---:|---:|---:|
+| the compiler, compiling itself | 9.16M | 6.17M (−33%) | 2.99M |
+| bench/json (5 MB) | 13.0M | 9.97M (−23%) | 3.04M |
+| jq (5 MB) | 3.44M | 2.63M (−24%) | 0.81M |
+| cmark (2.2 MB) | 425k | 328k (−23%) | 98k |
+
+The compiler gains more than section 3 predicted, because the pass sees its
+calls before inlining. bench/json and cmark gain less: many of their copies
+are of array elements (`rt_str_dup(*(slice.data + i))`), which the rewrite
+does not take (section 6.2).
+
+**Instructions and cycles,** `-O`, `perf stat`, against `LXL_NOBORROW=1`:
+
+| program | instructions | cycles |
+|---|---:|---:|
+| the compiler, compiling itself | −1.2% | −0.7% |
+| bench/json | −2.0% | −0.9% |
+| jq | −2.3% | −1.7% |
+| cmark | −1.2% | −0.9% |
+| bench strings, maps, trees, lists, alloc | 0 to −0.7% (time) | |
+| bench/par hash, decimal, 8 threads | | −9% and −10% (wall time) |
+
+The par kernels gain most: on a worker, each count change is an out-of-line
+call (design/parallel.md 2.4).
+
+**Costs:**
+- **Compile time:** none without `-O` (491 against 489 ms for the compiler).
+  With `-O`, 615 against 596 ms (+3%): the pass, and the extra functions the
+  inliner and the code generator see.
+- **Code size:** +0.8% (the compiler: 3,255,232 against 3,230,656 bytes),
+  from the `f_b` copies and their wrappers.
+
+**Tests:**
+- lib/tests/run/borrow_infer_params.lxl: a borrowed function also called
+  with fresh strings and through a function value; recursion; members of a
+  record local; one local passed twice; a copy kept in a result; a par.map
+  kernel; a task parking inside a borrowed function.
+- The native suites (`--lib`, `--lib --opt`, epoll) against the C backend,
+  which the pass does not touch, with `LXL_CHECK=1` leak checks: 648 of 648.
+- The `-O` self-build reaches a fixed point.
+- The full gate passes, but for red-team round 2's `so_big_frames`, which
+  fails on main too.
+
+### 6.2 Not done
+
+- **Array elements as the borrowed argument.** An element read through a
+  shared slice cannot change during the call: the array is frozen while the
+  slice lives, SPEC 10. But the IR does not say whether a slice is shared
+  or `mut`. Carrying that through lower, or proving that the call writes no
+  memory the slice reaches, would take bench/json and cmark nearer section
+  3's figures.
+- **Records holding strings passed by value** (their dup glue).
+- **A wrapper whose callers are all rewritten** stays until the inliner's
+  dead-function removal drops it, when nothing names it.
