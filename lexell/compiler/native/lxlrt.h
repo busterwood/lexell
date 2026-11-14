@@ -43,6 +43,8 @@ lxl_str rt_str_new(int64_t len);
 lxl_str rt_str_of(const char* p, int64_t len);
 lxl_str rt_str_dup(lxl_str s);
 void rt_str_drop(lxl_str s);
+lxl_str rt_str_dup_k(lxl_str s, int64_t k);
+void rt_str_drop_k(lxl_str s, int64_t k);
 bool rt_str_eq(lxl_str a, lxl_str b);
 int rt_str_cmp(lxl_str a, lxl_str b);
 lxl_str rt_str_concat(lxl_str a, lxl_str b);

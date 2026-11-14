@@ -62,7 +62,9 @@ __attribute__((noreturn)) static void sys_exit(int code) {
 static int rt_ended;
 /* The end of the program (rt.h's exit): with libc, its exit runs the atexit handlers and
    flushes stdio, after the runtime has flushed its own buffer. */
+static void (*rt_rc_report)(void);         /* rcstat (exp/borrow): the counts at exit */
 __attribute__((noreturn, noinline)) static void rt_quit(int code) {
+    if (rt_rc_report) rt_rc_report();
     rt_ended = 1;
     if (rt_n_libc[0]) ((void (*)(int))rt_n_libc[0])(code);
     sys_exit(code);
@@ -4071,3 +4073,38 @@ void* lxllib_par_run(int64_t n, void* (*item)(void*, void*, int64_t), void* f, v
 }
 void* lxllib_par_get(void* r, int64_t i) { return ((void**)r)[i]; }
 void lxllib_par_free(void* r) { rt_free(r); }
+
+/* ------------------------------------------------------------ rcstat (exp/borrow: compiler/rcstat.lxl)
+   rt_str_dup and rt_str_drop counted by kind (0 other, 1 a dup for a borrowed parameter, 2 the drop
+   of a borrowed parameter), and by whether the block is counted (a literal's is not). */
+static int64_t rt_rcs[3][2][2];             /* kind, dup or drop, literal or counted */
+static void rt_rcs_put(const char* name, int64_t v) {
+    char b[24];
+    int i = 24;
+    uint64_t u = (uint64_t)v;
+    do b[--i] = (char)('0' + u % 10); while (u /= 10);
+    write_all(2, name, strlen(name));
+    write_all(2, b + i, (size_t)(24 - i));
+}
+static void rt_rcs_print(void) {
+    static const char* kinds[3] = {"other", "for a borrowed parameter", "of a borrowed parameter"};
+    for (int k = 0; k < 3; k++) {
+        write_all(2, "rcstat: ", 8);
+        write_all(2, kinds[k], strlen(kinds[k]));
+        rt_rcs_put(": dups ", rt_rcs[k][0][1]);
+        rt_rcs_put(" (+ literals ", rt_rcs[k][0][0]);
+        rt_rcs_put("), drops ", rt_rcs[k][1][1]);
+        rt_rcs_put(" (+ literals ", rt_rcs[k][1][0]);
+        write_all(2, ")\n", 2);
+    }
+}
+lxl_str rt_str_dup_k(lxl_str s, int64_t k) {
+    rt_rc_report = rt_rcs_print;
+    rt_rcs[k][0][s.b && s.b->rc >= 0]++;
+    return rt_str_dup(s);
+}
+void rt_str_drop_k(lxl_str s, int64_t k) {
+    rt_rc_report = rt_rcs_print;
+    rt_rcs[k][1][s.b && s.b->rc > 0]++;
+    rt_str_drop(s);
+}

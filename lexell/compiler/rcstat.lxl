@@ -1,0 +1,220 @@
+// rcstat: an experiment (branch exp/borrow). How many str count changes would borrow inference
+// remove? With LXL_RCSTAT=1 when compiling natively, after the optimisations, each
+// rt_str_dup and rt_str_drop becomes rt_str_dup_k or rt_str_drop_k with a kind, and the program
+// prints the counts at exit:
+//   kind 1: a dup that is an argument, at a direct call, for a parameter found borrowed;
+//   kind 2: the drop of a borrowed parameter in its own function;
+//   kind 0: every other dup and drop.
+// Kinds 1 and 2 are what borrow inference would remove (each borrowed call saves a dup in the
+// caller and the drop in the callee).
+//
+// A str parameter is a candidate when its function drops it (the owned convention; a &str
+// parameter is never dropped) and the function's address is never taken. It is borrowed when
+// every use of it is a read: a member of it, an argument of a runtime function other than a
+// drop, the argument of a dup (a new count of its own), or an argument for another function's
+// parameter that is borrowed or lent (never dropped and never kept). Anything else (a store, an
+// initializer, a return, a move into a parameter that keeps it, a call through a pointer, or any
+// use not understood) makes it owned. Candidates start borrowed and are made owned until nothing
+// changes (recursion).
+
+import "./ir"
+
+type St = record {
+    strTy: int
+    dupF: int
+    dropF: int
+    dupK: int
+    dropK: int
+    taken: []bool
+    // per function: its parameters' states, by index: 0 not a str or not looked at, 1 candidate
+    // still borrowed, 2 owned, 3 lent (a str parameter never dropped, never kept), 4 kept
+    ps: [][]int
+}
+
+fn callee(p: &ir.Ir, x: int): int {
+    let c = p.nodes[x].a
+    if p.nk(c) != ir.E_DECAY || p.nk(p.nodes[c].a) != ir.E_FUNC { return -1 }
+    return p.nodes[p.nodes[c].a].a
+}
+
+fn kids(p: &ir.Ir, x: int): []int {
+    var out: []int = []
+    let n = p.nodes[x]
+    let kk = if n.k >= 0 && n.k < len(ir.KIDS) { ir.KIDS[n.k] } else { -1 }
+    if kk == ir.K_A || kk == ir.K_AB || kk == ir.K_ABC || kk == ir.K_FOR || kk == ir.K_CALL { if n.a >= 0 { append(mut &out, n.a) } }
+    if kk == ir.K_AB || kk == ir.K_ABC || kk == ir.K_FOR { if n.b >= 0 { append(mut &out, n.b) } }
+    if kk == ir.K_ABC || kk == ir.K_FOR { if n.c >= 0 { append(mut &out, n.c) } }
+    if kk == ir.K_FOR { if n.d >= 0 { append(mut &out, n.d) } }
+    if kk == ir.K_CALL || kk == ir.K_CLIT { if n.b >= 0 { for j in 0..p.listLen(n.b) { append(mut &out, p.listAt(n.b, j)) } } }
+    if kk == ir.K_BLOCK { if n.a >= 0 { for j in 0..p.listLen(n.a) { append(mut &out, p.listAt(n.a, j)) } } }
+    if kk == ir.K_DECL {
+        if n.b >= 0 { append(mut &out, n.b) }
+        if n.c >= 0 { for j in 0..p.listLen(n.c) { append(mut &out, p.listAt(n.c, j)) } }
+    }
+    return out
+}
+
+fn scanTaken(p: &ir.Ir, s: mut &St, x: int, isCallee: bool) {
+    if p.nk(x) == ir.E_FUNC {
+        if !isCallee { s.taken[p.nodes[x].a] = true }
+        return
+    }
+    let ks = kids(p, x)
+    let direct = p.nk(x) == ir.E_CALL && callee(p, x) >= 0
+    for j in 0..len(ks) {
+        if direct && j == 0 { scanTaken(p, s, p.nodes[ks[0]].a, true) } else { scanTaken(p, s, ks[j], false) }
+    }
+}
+
+fn paramIndex(p: &ir.Ir, f: int, l: int): int {
+    for j in 0..len(p.funcs[f].params) {
+        if p.funcs[f].params[j] == l { return j }
+    }
+    return -1
+}
+
+// Whether the tree x drops the local l (rt_str_drop(l)).
+fn drops(p: &ir.Ir, s: &St, x: int, l: int): bool {
+    if p.nk(x) == ir.E_CALL && callee(p, x) == s.dropF && p.listLen(p.nodes[x].b) == 1 {
+        let a = p.listAt(p.nodes[x].b, 0)
+        if p.nk(a) == ir.E_LOCAL && p.nodes[a].a == l { return true }
+    }
+    for c in kids(p, x) {
+        if drops(p, s, c, l) { return true }
+    }
+    return false
+}
+
+// The verdict of the uses of local l in the tree x (parent px, x its child number i there):
+// 0 all reads, 1 a use that depends on a parameter still borrowed (fine for now), 2 a use that
+// makes l owned (or kept).
+fn useOf(p: &ir.Ir, s: &St, x: int, px: int, i: int, l: int): int {
+    if p.nk(x) == ir.E_LOCAL && p.nodes[x].a == l {
+        if px < 0 { return 2 }
+        let pk = p.nk(px)
+        if pk == ir.E_MEMBER { return 0 }
+        if pk == ir.S_EXPR { return 0 }
+        if pk == ir.E_CALL {
+            if i == 0 { return 2 }
+            let g = callee(p, px)
+            if g < 0 { return 2 }
+            if g == s.dropF || g == s.dupF { return 0 }
+            if g < p.nRtFuncs { return 0 }
+            if p.funcs[g].isExtern { return 0 }
+            let j = i - 1
+            if j >= len(s.ps[g]) { return 2 }
+            let st = s.ps[g][j]
+            if st == 1 { return 1 }
+            if st == 3 { return 0 }
+            return 2
+        }
+        return 2
+    }
+    var worst = 0
+    let ks = kids(p, x)
+    for j in 0..len(ks) {
+        let v = useOf(p, s, ks[j], x, j, l)
+        if v > worst { worst = v }
+    }
+    return worst
+}
+
+pub fn instrument(p: mut &ir.Ir) {
+    var s = St{strTy: -1, dupF: -1, dropF: -1, dupK: -1, dropK: -1, taken: [], ps: []}
+    for f in 0..p.nRtFuncs {
+        let nm = p.funcs[f].name
+        if nm == "rt_str_dup" { s.dupF = f }
+        if nm == "rt_str_drop" { s.dropF = f }
+        if nm == "rt_str_dup_k" { s.dupK = f }
+        if nm == "rt_str_drop_k" { s.dropK = f }
+    }
+    if s.dupF >= 0 { s.strTy = p.tys[p.funcs[s.dupF].ty].base }     // lxl_str, as rt_str_dup gives it
+    if s.strTy < 0 || s.dupF < 0 || s.dropF < 0 || s.dupK < 0 || s.dropK < 0 { return }
+    let n = len(p.funcs)
+    for f in 0..n {
+        append(mut &s.taken, false)
+        append(mut &s.ps, [])
+    }
+    for f in p.nRtFuncs..n {
+        if p.funcs[f].body >= 0 { scanTaken(p, mut &s, p.funcs[f].body, false) }
+    }
+    // the parameters' first states
+    for f in p.nRtFuncs..n {
+        var ps: []int = []
+        let body = p.funcs[f].body
+        for l in p.funcs[f].params {
+            var st = 0
+            if body >= 0 && p.locals[l].ty == s.strTy {
+                st = if drops(p, &s, body, l) { (if s.taken[f] { 2 } else { 1 }) } else { 3 }
+            }
+            append(mut &ps, st)
+        }
+        s.ps[f] = ps
+    }
+    // lent parameters that are kept, and candidates that are owned, until nothing changes
+    var changed = true
+    while changed {
+        changed = false
+        for f in p.nRtFuncs..n {
+            let body = p.funcs[f].body
+            if body < 0 { continue }
+            for j in 0..len(s.ps[f]) {
+                let st = s.ps[f][j]
+                if st != 1 && st != 3 { continue }
+                let v = useOf(p, &s, body, -1, 0, p.funcs[f].params[j])
+                if v == 2 {
+                    s.ps[f][j] = if st == 1 { 2 } else { 4 }
+                    changed = true
+                }
+            }
+        }
+    }
+    // the rewrite
+    for f in p.nRtFuncs..n {
+        if p.funcs[f].body >= 0 { rewrite(p, &s, f, p.funcs[f].body, -1, 0) }
+    }
+    var nb = 0
+    var nc = 0
+    for f in p.nRtFuncs..n {
+        for st in s.ps[f] {
+            if st == 1 { nb += 1 }
+            if st == 1 || st == 2 { nc += 1 }
+        }
+    }
+    writeFd(2, "rcstat: " + intToStr(nb) + " of " + intToStr(nc) + " owned-convention str parameters found borrowed\n")
+}
+
+fn rewrite(p: mut &ir.Ir, s: &St, f: int, x: int, px: int, i: int) {
+    let ks = kids(p, x)
+    for j in 0..len(ks) { rewrite(p, s, f, ks[j], x, j) }
+    if p.nk(x) != ir.E_CALL { return }
+    let g = callee(p, x)
+    if g != s.dupF && g != s.dropF { return }
+    var kind = 0
+    if g == s.dupF && px >= 0 && p.nk(px) == ir.E_CALL && i > 0 {
+        let h = callee(p, px)
+        if h >= p.nRtFuncs && !p.funcs[h].isExtern && i - 1 < len(s.ps[h]) && s.ps[h][i - 1] == 1 { kind = 1 }
+    }
+    if g == s.dropF {
+        let a = p.listAt(p.nodes[x].b, 0)
+        if p.nk(a) == ir.E_LOCAL {
+            let j = paramIndex(p, f, p.nodes[a].a)
+            if j >= 0 && s.ps[f][j] == 1 { kind = 2 }
+        }
+    }
+    let k2 = if g == s.dupF { s.dupK } else { s.dropK }
+    let ft = p.funcs[k2].ty
+    append(mut &p.nodes, ir.Node{k: ir.E_FUNC, ty: ft, line: 0, a: k2, b: -1, c: -1, d: -1, v: 0})
+    let fn0 = len(p.nodes) - 1
+    let pt = p.ptrTo(ft)
+    append(mut &p.nodes, ir.Node{k: ir.E_DECAY, ty: pt, line: 0, a: fn0, b: -1, c: -1, d: -1, v: 0})
+    let dec = len(p.nodes) - 1
+    append(mut &p.nodes, ir.Node{k: ir.E_INT, ty: ir.TY_I64, line: 0, a: -1, b: -1, c: -1, d: -1, v: kind})
+    let ki = len(p.nodes) - 1
+    let arg = p.listAt(p.nodes[x].b, 0)
+    let args: []int = [arg, ki]
+    let l = p.list(&args)
+    p.nodes[x].a = dec
+    p.nodes[x].b = l
+    p.nodes[x].c = ft
+}
