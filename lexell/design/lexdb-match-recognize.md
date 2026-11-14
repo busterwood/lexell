@@ -825,3 +825,14 @@ real difference, the one below (empty match and SKIP TO FIRST or LAST).
   T-SQL procedures (the same parser reads them, no test).
 - Only `tools/native_selfbuild.sh` of the gate was run (it passes: a fixed point; nothing it builds reads lexdb), not the
   whole `gate.sh`.
+
+**The fuzz tool** (added later): `tests/lexdb/fuzz_mr.py` generates random MATCH_RECOGNIZE queries (every quantifier
+including reluctant, alternation, groups, PERMUTE, exclusion, anchors, SUBSET, ONE ROW and the four ALL ROWS forms, every
+SKIP, navigation, running and final aggregates, CLASSIFIER, MATCH_NUMBER, local and history-dependent DEFINEs) over a small
+seeded table with NULLs, runs each on Oracle and through lexdb's TNS endpoint (the Oracle door), and compares columns, rows
+(numbers by value) and error numbers. A difference is shrunk (fewer measures, no SKIP, no PARTITION, simpler rows form) and
+printed with both answers; `--save FILE` appends it as `q` lines for `mr_cases.txt`. Options: `--dsn user/pw@host:port/service`
+(a scratch user), `--seed`, `-n`, `--batch`, `--save`, `--compiler`. The script header says how to start a throwaway Oracle
+container. It leaves out what is known to differ (LATERAL, subqueries in the clause, ORDER BY expressions, quoted
+variables). Run against the tree with the Oracle door's LATERAL and APPLY change: 2,700 queries (seeds 21 and 31 to 34; about
+13% are Oracle errors, which lexdb matched by number): 0 differences.
