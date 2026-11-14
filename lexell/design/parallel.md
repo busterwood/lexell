@@ -312,7 +312,11 @@ called on a worker (2.1's test). This cannot happen if the pass is right.
   `rt_write_fd` writes unbuffered, `rt_flush` does nothing, and `rt_exit` is a
   stop forwarded to the main thread (2.7).
 - **Externs allowed.** The C maths of lib/std.lxl (the native runtime's own
-  libm), `lxllib_hash_key` and `lxllib_hash_crc32c`.
+  libm), `lxllib_hash_key`, `lxllib_hash_crc32c`, and the two float bit
+  moves (`lxllib_float_bits`, `lxllib_float_from_bits`). The last are union
+  casts in the runtime, with no state and no allocation; they are what lets
+  `math.bitsOf`/`fromBits` and a database's double parsing and encoding run
+  in a kernel (design/par-db-perf.md 5).
 - **Roots.** The pass finds a closure argument either in the call's
   expression, or in the initializer of, or an assignment to, the local the
   closure was spilled into. par's `item` and `callAt` instances are marked
