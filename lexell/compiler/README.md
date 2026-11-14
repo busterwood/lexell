@@ -16,6 +16,7 @@ only gcc.
     ./lxlc --emit-c file.lxl...                             # the C of each program, in `== path` sections
     ./lxlc --dump-ast file.lxl...                           # the parse tree
     ./lxlc --dump-types file.lxl...                         # what sema resolves
+    ./lxlc --borrow-report file.lxl                         # str parameters the program only reads: declare them &str
     python3 lexell/compiler/fuzz.py [-n N] [--seed S] [--cc]   # mutants must compile or fail cleanly
     lexell/tools/gate.sh quick                                 # the suites (lexell/tests/README.md)
 

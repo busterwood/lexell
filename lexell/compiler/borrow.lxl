@@ -27,6 +27,7 @@
 // caller never takes, and no other argument of the call names that local except to copy it.
 
 import "os"
+import "strings"
 import "./ir"
 
 type B = record {
@@ -305,7 +306,10 @@ fn wrapper(p: mut &ir.Ir, b: &B, f: int, fb: int) {
 }
 
 // The pass. Its counts: the borrowed parameters, and the functions given an f_b.
-pub fn optimize(p: mut &ir.Ir): int {
+// The pass. Its count: the borrowed parameters. With report set, nothing is changed: each
+// parameter declared str that every instance in the program only reads is printed (lxlc
+// --borrow-report), as "file:line: ...", in the order of the source functions.
+pub fn optimize(p: mut &ir.Ir, report: bool): int {
     var b = B{strTy: -1, dupF: -1, dropF: -1, ps: [], bOf: [], aTaken: [], hasSlot: [], callsCand: false}
     for f in 0..p.nRtFuncs {
         if p.funcs[f].name == "rt_str_dup" { b.dupF = f }
@@ -382,18 +386,47 @@ pub fn optimize(p: mut &ir.Ir): int {
             }
         }
     }
-    // LXL_BORROW_REPORT=1: each parameter declared str, borrowed or not, by its source function
-    if os.envOr("LXL_BORROW_REPORT", "") == "1" {
+    if report {
+        var verdict: Map[str, int] = newMapWith[str, int](fxHashStr)     // "label\x00param" -> 1 only read, 2 kept somewhere
+        var order: []str = []
         for u in 0..len(us) {
             let f = slotF[u]
             let j = slotJ[u]
             let mask = p.pstr.getOr(&p.funcs[f].name, "")
-            if j >= len(mask) || mask[j] != 49 { continue }      // "1"
+            if j >= len(mask) || mask[j] != 49 { continue }      // "1": declared str
             let st = b.ps[f][j]
             if st != 1 && st != OWNED { continue }
-            writeFd(2, "BORROW\t" + p.fsrc.getOr(&p.funcs[f].name, p.funcs[f].name) + "\t" + p.locals[p.funcs[f].params[j]].name +
-                "\t" + (if st == 1 { "only-read" } else { "kept" }) + "\n")
+            let pn = p.locals[p.funcs[f].params[j]].name
+            let src = p.fsrc.getOr(&p.funcs[f].name, p.funcs[f].name)
+            let lp0 = strings.lastIndexOf(&src, " (")
+            let fn1 = (if lp0 >= 0 { src[0..lp0] } else { src }) + " (" + p.fpath.getOr(&p.funcs[f].name, "?") + ")"
+            let key = fn1 + "\x00" + (if strings.startsWith(&pn, "p_") { pn[2..len(pn)] } else { pn })
+            let old = verdict.getOr(&key, 0)
+            if old == 0 { append(mut &order, key) }
+            if old != 2 { verdict.put(key, if st == 1 { 1 } else { 2 }) }
         }
+        let all = os.envOr("LXL_BORROW_REPORT", "") == "all"     // the kept ones too (tools/borrow_check.py)
+        for key in order {
+            if verdict.getOr(&key, 0) != 1 {
+                if all {
+                    let z = strings.indexOf(&key, "\x00", 0)
+                    let fn0 = key[0..z]
+                    let lp = strings.lastIndexOf(&fn0, " (")
+                    let at = if lp >= 0 { fn0[lp + 2..len(fn0) - 1] } else { "?" }
+                    let label = if lp >= 0 { fn0[0..lp] } else { fn0 }
+                    writeFd(1, at + ": parameter '" + key[z + 1..len(key)] + "' of " + label + " is declared str and kept\n")
+                }
+                continue
+            }
+            let z = strings.indexOf(&key, "\x00", 0)
+            let fn0 = key[0..z]
+            let pn = key[z + 1..len(key)]
+            let lp = strings.lastIndexOf(&fn0, " (")
+            let label = if lp >= 0 { fn0[0..lp] } else { fn0 }
+            let at = if lp >= 0 { fn0[lp + 2..len(fn0) - 1] } else { "?" }
+            writeFd(1, at + ": parameter '" + pn + "' of " + label + " is declared str but only read: declare it &str\n")
+        }
+        return 0
     }
     var nparams = 0
     for f in p.nRtFuncs..n {

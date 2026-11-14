@@ -193,3 +193,56 @@ call (design/parallel.md 2.4).
 - **Records holding strings passed by value** (their dup glue).
 - **A wrapper whose callers are all rewritten** stays until the inliner's
   dead-function removal drops it, when nothing names it.
+
+## 7. The library's signatures (2026-11-14)
+
+The pass removes counts the source could have avoided: many library
+functions declared `s: str` for a string they only read. So the signatures
+were fixed as well.
+
+**The report.** `lxlc --borrow-report prog.lxl` runs the analysis without
+changing anything. It prints each parameter declared `str` that every
+instance in the program only reads:
+
+    path:line: parameter 's' of f is declared str but only read: declare it &str
+
+With `LXL_BORROW_REPORT=all` it also prints the parameters that are kept
+somewhere ("... is declared str and kept").
+
+**The sweep.** The report was run over the compiler, `cmd/`, `bench/` and
+every test.
+- 1,026 library parameters that no program keeps became `&str`.
+- Their call sites got `&x` or `&(expr)`. A script did this from the
+  compiler's errors, and four Haiku agents fixed the rest.
+- A `&str` parameter copied into a `var` became `var x: str = s`.
+- Interface methods (`Writer.write` for `Sink`) stay `str`.
+- `str`'s own methods now borrow their receiver. red-team round 5's
+  `m10_receiver_str_field`, which moved the receiver's owner in an argument,
+  is now refused, and is an error case.
+
+**The check.** `tools/borrow_check.py` runs the report over the same programs
+(11 s) and combines the verdicts. It fails when a module in `lib/` has a
+`str` parameter that no program keeps, unless `tools/borrow_allow.txt` lists
+it. It is a step of the quick gate.
+
+### 7.1 Results
+
+Counted dups (`LXL_RCSTAT=1`) and instructions, against the library before
+the sweep with the pass off:
+
+| workload | sweep only | pass only | both |
+|---|---:|---:|---:|
+| the compiler, compiling itself | −19% dups, −1.1% instr. | −33%, −1.3% | −43%, −1.9% |
+| cmark | −49%, −3.3% | −23%, −1.2% | as the sweep |
+| jq | −29%, −3.3% | −24%, −2.3% | as the sweep |
+| bench/json | −34%, −4.4% | −23%, −2.0% | as the sweep |
+
+**Where each one pays:**
+- **The library's programs.** The signatures do more than the pass ever
+  could. They cover every build, not only `-O`, and the calls that pass an
+  array element, which the pass does not take. Once they are right, the pass
+  adds nothing there.
+- **The compiler.** It still gains from the pass, because its own 199
+  parameters were not swept.
+- **Code outside the sweep, generic instances and interface methods.** The
+  pass keeps working there, which is why it stays.
