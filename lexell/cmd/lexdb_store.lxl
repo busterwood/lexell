@@ -21,6 +21,7 @@ import "binary"
 import "collections"
 import "strings"
 import "time"
+import "crypto"
 import "./lexdb_base"
 import "./lexdb_disk"
 import "./lexdb_page"
@@ -32,6 +33,9 @@ const SPARE = "log.spare"
 const PAGE = 4096
 const LOG_MAGIC = 0x4C474C58
 const FRAME_HDR = 32
+// The most record bytes a log frame holds: its length is 32 bits, and a frame
+// past it would be one recovery stops at (9.127). Tests set fewer.
+pub const FRAME_MAX = 4294967296 - 4096
 
 pub const OP_PUT = 1
 pub const OP_DEL = 2
@@ -46,11 +50,10 @@ pub type Options = value record {
     pub segBytes: int       // the size of a log segment
     pub ckptBytes: int      // log bytes after which the checkpointer runs (an eighth when the cache is full)
     pub snapNodes: int      // old node versions kept for snapshots before the oldest is cancelled
-    pub bufferedPages: bool // the page file through the kernel's page cache, not O_DIRECT (9.69)
 }
 
 pub fn defaults(): Options {
-    return Options{cacheBytes: 128 * 1024 * 1024, segBytes: 64 * 1024 * 1024, ckptBytes: 32 * 1024 * 1024, snapNodes: 50000, bufferedPages: false}
+    return Options{cacheBytes: 128 * 1024 * 1024, segBytes: 64 * 1024 * 1024, ckptBytes: 32 * 1024 * 1024, snapNodes: 50000}
 }
 
 type SlotMeta = value record {
@@ -83,7 +86,7 @@ type Hist = record { since: int; until: int; node: lexdb_page.Node }
 // A live snapshot: it sees the store as it was after commit seq.
 type Snap = value record { id: int; seq: int; cancelled: bool }
 
-type Deferred = value record { slot: int; seq: int; height: int }
+type Deferred = value record { slot: int; seq: int; height: int; whole: bool }  // whole: a dropped tree's slot (its children's too, 9.127)
 
 // A tree's root changed by commit seq (prev: the root before, -1 none): a
 // snapshot at an earlier commit starts from prev.
@@ -105,6 +108,7 @@ type PageOut = record { no: int; leaf: bool; n: int; body: str; raw: []byte }
 pub type Db = record {
     opts: Options
     fs: lexdb_disk.Fs
+    logFs: lexdb_disk.Fs        // the log segments and the spare: fs, or a directory of their own (--log-dir, 9.124)
     data: lexdb_disk.File
     watched: int                // a tree whose writes are counted (watch), -1 none
     watchedWrites: int
@@ -133,6 +137,7 @@ pub type Db = record {
     freeAfterNext: []int        // pages the next checkpoint frees
     pendingFree: []int          // runs the checkpoint in flight frees when durable
     dropped: []int              // subtrees no tree reaches, their pages to free: (page, height or -1) pairs (9.32)
+    frameMax: int               // FRAME_MAX (tests set fewer)
     dropReads: int              // the most of their pages a checkpoint reads (DROP_READS; tests set fewer)
     memo: Map[str, str]         // what the SQL layer keeps while the store is open, outside transactions (its sequences' blocks: 9.43)
     listPages: []int            // the list pages of the last durable checkpoint
@@ -529,15 +534,33 @@ fn (db: &Db) maxSnap(): int {
 
 // Frees a slot the tree no longer reaches; while a snapshot may still reach
 // it (it sees a version the slot holds), the slot is kept until then.
-fn (db: mut &Db) freeSlot(s: int) { db.freeSubtree(s, -1) }
+fn (db: mut &Db) freeSlot(s: int) { db.freeSubtree(s, -1, false) }
 
 // freeSlot for a slot whose subtree is h high (-1: not known), which
-// matters when it is not in memory (releaseSlot).
-fn (db: mut &Db) freeSubtree(s: int, h: int) {
+// matters when it is not in memory (releaseSlot). whole: s is a dropped
+// tree's, so that the slots a snapshot gave its children after the drop
+// are freed with it (releaseWhole).
+fn (db: mut &Db) freeSubtree(s: int, h: int, whole: bool) {
     if (db.seq > db.durableSeq || db.maxSnap() >= 0) && !db.meta[s].pinned {
         db.meta[s].pinned = true
-        append(mut &db.deferred, Deferred{slot: s, seq: db.seq, height: h})
+        append(mut &db.deferred, Deferred{slot: s, seq: db.seq, height: h, whole: whole})
         return
+    }
+    db.releaseSlot(s, h)
+}
+
+// releaseSlot for a dropped tree's deferred slot. A snapshot may have
+// loaded it after the drop, which gave its children slots no deferral names
+// (those loaded before the drop are deferred, pinned, and freed by their
+// own entries, after their parent's, which came first): freed here, down to
+// the pages not in memory (9.127).
+fn (db: mut &Db) releaseWhole(s: int, h: int) {
+    if db.meta[s].loaded && !db.pool[db.meta[s].frame].leaf {
+        var kids: []int = []
+        for k in db.pool[db.meta[s].frame].kids { append(mut &kids, k) }
+        for k in kids {
+            if db.meta[k].used && !db.meta[k].pinned { db.releaseWhole(k, if h >= 0 { h - 1 } else { -1 }) }
+        }
     }
     db.releaseSlot(s, h)
 }
@@ -663,7 +686,7 @@ fn (db: mut &Db) prune() {
     for d in replace(mut &db.deferred, []) {
         var need = d.seq > db.durableSeq
         for q in live { if q < d.seq { need = true } }
-        if need { append(mut &still, d) } else { db.releaseSlot(d.slot, d.height) }
+        if need { append(mut &still, d) } else if d.whole { db.releaseWhole(d.slot, d.height) } else { db.releaseSlot(d.slot, d.height) }
     }
     db.deferred = still
 }
@@ -1562,7 +1585,7 @@ fn (db: mut &Db) applyDrop(tree: int) {
                 append(mut &stack, depth + 1)
             }
         }
-        db.freeSubtree(s, if height >= 0 { height - depth } else { -1 })
+        db.freeSubtree(s, if height >= 0 { height - depth } else { -1 }, true)
     }
 }
 
@@ -1791,6 +1814,13 @@ fn (st: &Store) unstore(t: mut &Txn, tree: int, key: &str, v: &str): Result[str,
 }
 
 // ---- the log record format
+
+// The bytes t's records take in a frame.
+fn recordsLen(writes: &[]TxWrite): int {
+    var n = 0
+    for w in writes { n += 13 + len(w.key) + len(w.val) + (if w.op == OP_PUT && w.head > 0 { 4 } else { 0 }) }
+    return n
+}
 
 fn addRecord(b: mut &[]byte, w: &TxWrite) {
     let withHead = w.op == OP_PUT && w.head > 0
@@ -2983,6 +3013,20 @@ fn (st: &Store) commitLive(t: Txn, durable: bool): Result[Unit, lexdb_base.DbErr
             }
             var b = db.appliedBatch
             if len(t.writes) > 0 {
+                // A frame's length is 32 bits: a commit that would not fit
+                // one fails, before anything is written (9.127); one that
+                // would not fit the batch waits for the writer to take it.
+                let recs = recordsLen(&t.writes)
+                if recs > db.frameMax {
+                    append(mut &bad, lexdb_base.err(lexdb_base.S_LIMIT, "transaction too large: its log records take " + recs.toStr() + " bytes, at most " + db.frameMax.toStr()))
+                    return
+                }
+                if len(db.batch) > FRAME_HDR && len(db.batch) - FRAME_HDR + recs > db.frameMax {
+                    let task.Handoff{promise: p, future: f} = task.promise[Unit]()
+                    append(mut &db.ckptDone, p)
+                    append(mut &held, f)
+                    return
+                }
                 db.seq += 1
                 db.logWrites(&t)
                 db.reserveBatch(&t)
@@ -3424,7 +3468,7 @@ fn (db: &Db) snapGone(id: int): bool {
 
 fn (st: &Store) openSeg(g: int, size: int): Result[lexdb_disk.File, lexdb_base.DbErr] {
     var fs = lexdb_disk.Fs.Real("")
-    st.sh.with(fn(db: mut &Db) { fs = db.fs })
+    st.sh.with(fn(db: mut &Db) { fs = db.logFs })
     let name = segName(g)
     if !fs.exists(name) && fs.exists(SPARE) { try fs.rename(SPARE, name) }
     let f = try fs.open(name, true)
@@ -3491,6 +3535,7 @@ pub fn writer(st: Store): int {
         var upto = 0
         var stop = false
         var idle: []task.Future[Unit] = []
+        var room: []task.Promise[Unit] = []
         st.sh.with(fn(db: mut &Db) {
             if len(db.failed) > 0 || (db.closing && db.batchCount == 0) {
                 stop = true
@@ -3503,12 +3548,14 @@ pub fn writer(st: Store): int {
                 no = db.batchNo
                 db.batchNo += 1
                 db.batchCount = 0
+                while len(db.ckptDone) > 0 { append(mut &room, pop(mut &db.ckptDone)) }     // (commits waiting for room in a batch, 9.127)
             } else {
                 let task.Handoff{promise: p, future: f} = task.promise[Unit]()
                 append(mut &db.writerWake, p)
                 append(mut &idle, f)
             }
         })
+        while len(room) > 0 { pop(mut &room).complete(Unit{}) }
         if stop { break }
         if len(idle) > 0 {
             match pop(mut &idle).wait() {
@@ -4182,7 +4229,7 @@ pub fn (st: &Store) checkpoint(): Result[Unit, lexdb_base.DbErr] {
         db.ckpt += 1
         n = db.ckpt
         f = db.data
-        fs = db.fs
+        fs = db.logFs
         db.refit()      // (it may split leaves, and roots: before the roots are taken)
         var roots: []int = []
         var ids: []int = []
@@ -4425,12 +4472,150 @@ pub fn checkpointer(st: Store): int {
     return 0
 }
 
+// ---- the log directory's check (--log-dir, design/lexdb.md 9.124)
+//
+// A data directory made with a log directory has a small file, LOGDIR_MARK,
+// naming a random id (and, for the messages, the log directory's path); the
+// log directory has LOGID with the same id. Start-up compares them, so the
+// wrong log is never replayed: a data directory with the mark needs a log
+// directory with its id; one without the mark (made without --log-dir) is
+// started without. A directory made without --log-dir has no new file at all.
+pub const LOGDIR_MARK = "logdir"
+pub const LOGID = "logid"
+
+fn hexOf(raw: &str): str {
+    let digits = "0123456789abcdef"
+    var b = newStrBuf()
+    for i in 0..len(raw) {
+        b.addByte(digits[int(raw[i]) / 16])
+        b.addByte(digits[int(raw[i]) % 16])
+    }
+    return b.toStr()
+}
+
+// A small file, replaced whole: written beside under another name,
+// flushed, then renamed over (the rename syncs the directory). Plain text,
+// through the page cache (before 9.125 a zero-padded page).
+fn putSmall(fs: &lexdb_disk.Fs, name: str, text: str): Result[Unit, lexdb_base.DbErr] {
+    let tmp = name + ".tmp"
+    if fs.exists(tmp) { try fs.remove(tmp) }
+    let f = try fs.openBuffered(tmp, true)
+    try f.writeText(&text)
+    try f.flush()
+    f.close()
+    return fs.rename(tmp, name)
+}
+
+// A small file's text (up to its first zero byte, so a file padded to a page
+// by an earlier version reads the same), None when there is no such file.
+fn getSmall(fs: &lexdb_disk.Fs, name: str): Result[Option[str], lexdb_base.DbErr] {
+    if !fs.exists(name) { return Ok(None) }
+    let f = try fs.openBuffered(name, false)
+    let text = try f.readText()
+    f.close()
+    return Ok(Some(text))
+}
+
+// The lines of text after its first line (the format's name), the id first.
+fn smallLines(text: &str): []str {
+    let ls = strings.splitByte(&(text.toStr()), byte(10))
+    var out: []str = []
+    var i = 1
+    while i < len(ls) {
+        append(mut &out, ls[i])
+        i += 1
+    }
+    return out
+}
+
+// Whether fs has a log segment: log.<digits> (any number: they are not reused) or log.spare.
+fn hasSegments(fs: &lexdb_disk.Fs): bool {
+    for n in fs.names() {
+        if n == SPARE { return true }
+        if strings.startsWith(&n, "log.") && len(n) > 4 {
+            var digits = true
+            for i in 4..len(n) { if n[i] < byte(48) || n[i] > byte(57) { digits = false } }
+            if digits { return true }
+        }
+    }
+    return false
+}
+
+fn logRefuse(msg: str): Result[Unit, lexdb_base.DbErr] { return Err(lexdb_base.err(lexdb_base.S_INTERNAL, msg)) }
+
+// Refuses a data directory whose log is not the one given (split: a log
+// directory was given). create: a new database may be set up (the master);
+// a replica only checks.
+fn checkLog(fs: &lexdb_disk.Fs, logFs: &lexdb_disk.Fs, split: bool, create: bool): Result[Unit, lexdb_base.DbErr] {
+    let mark = try getSmall(fs, LOGDIR_MARK)
+    if !split {
+        if mark.isSome() {
+            let l = smallLines(&mark.unwrap())
+            let where = if len(l) >= 2 { l[1] } else { "(unknown)" }
+            return logRefuse("this data directory's log is in " + where + " (it was made with --log-dir): start it with --log-dir " + where)
+        }
+        return Ok(Unit{})
+    }
+    match mark {
+        Some(text) {
+            let l = smallLines(&text)
+            if len(l) < 2 || len(l[0]) == 0 { return logRefuse("the data directory's " + LOGDIR_MARK + " file is damaged") }
+            let where = l[1]
+            let have = try getSmall(logFs, LOGID)
+            match have {
+                None {
+                    return logRefuse("the log directory is missing or is not this database's: it has no " + LOGID + " file; this data directory's log is in " + where)
+                }
+                Some(t) {
+                    let ls = smallLines(&t)
+                    if len(ls) < 1 || ls[0] != l[0] {
+                        return logRefuse("the log directory belongs to another database (log id differs); this data directory's log is in " + where)
+                    }
+                }
+            }
+            return Ok(Unit{})
+        }
+        None {}
+    }
+    // no mark: a new database, or one made without a log directory
+    var fresh = !hasSegments(fs)
+    if fresh && fs.exists(DATA) {
+        let d = try fs.openBuffered(DATA, false)
+        let n = try d.size()
+        d.close()
+        if n > 0 { fresh = false }
+    }
+    if !fresh { return logRefuse("this data directory has its log inside it (it was made without --log-dir): start it without --log-dir") }
+    if !create { return Ok(Unit{}) }
+    // a new database needs a log directory with nothing in it but, maybe, what a crashed first start left
+    if hasSegments(logFs) {
+        return logRefuse("the log directory already holds a log (another database's): a new database needs an empty log directory")
+    }
+    for n in logFs.names() {
+        if n != LOGID && n != LOGID + ".tmp" {
+            return logRefuse("the log directory is not empty (" + n + "): a new database needs an empty log directory")
+        }
+    }
+    try logFs.ensureDir()
+    var raw = ""
+    match crypto.randomBytes(16) {
+        Ok(r) { raw = r }
+        Err(e) { return logRefuse("random: " + e.toStr()) }
+    }
+    let id = hexOf(&raw)
+    // the log's id first, then the data directory's mark: a crash between leaves a log directory
+    // with an id and no log, which a start replaces
+    try putSmall(logFs, LOGID, "lexdb-log 1\n" + id + "\n")
+    try putSmall(fs, LOGDIR_MARK, "lexdb-logdir 1\n" + id + "\n" + logFs.where() + "\n")
+    return Ok(Unit{})
+}
+
 // ---- open, recovery, close
 
-fn newDb(fs: lexdb_disk.Fs, data: lexdb_disk.File, opts: Options, m: &lexdb_page.Meta): Db {
-    return Db{opts: opts, fs: fs, data: data, watched: -1, watchedWrites: 0, pool: [], owner: [], meta: [], freeSlots: [], loadedCount: 0, cacheUsed: 0, wlog: [], wlogFloor: 0, hand: 0,
+fn newDb(fs: lexdb_disk.Fs, logFs: lexdb_disk.Fs, data: lexdb_disk.File, opts: Options, m: &lexdb_page.Meta): Db {
+    return Db{opts: opts, fs: fs, logFs: logFs, data: data, watched: -1, watchedWrites: 0, pool: [], owner: [], meta: [], freeSlots: [], loadedCount: 0, cacheUsed: 0, wlog: [], wlogFloor: 0, hand: 0,
               trees: newMap(), lastLeaf: LastLeaf{tree: -1, shape: -1, path: [], lo: [], hasLo: [], hi: [], hasHi: []}, shape: 0, nextTree: m.nextTree, npages: m.npages, fileEnd: 0, reserving: true, free: [], freeAfterNext: [],
-              pendingFree: [], dropped: [], dropReads: DROP_READS, memo: newMap(), listPages: [], ckpt: m.ckpt, durableCkpt: m.ckpt, ckptRunning: false,
+              pendingFree: [], dropped: [], frameMax: FRAME_MAX, dropReads: DROP_READS, memo: newMap(), listPages: [], ckpt: m.ckpt, durableCkpt: m.ckpt, ckptRunning: false,
               batch: [], batchCount: 0, batchNo: m.replayBatch, appliedBatch: m.replayBatch - 1,
               durableBatch: m.replayBatch - 1, waiters: [], locks: newMap(), lockWaits: [], waitFor: newMap(), nextLock: 0, writerWake: [], ckptWake: [], ckptDone: [], seg: m.replaySeg,
               segOff: m.replayOff, logSinceCkpt: 0, failed: [], closing: false, seq: 0, snaps: [], nextSnap: 0,
@@ -4442,8 +4627,17 @@ fn newDb(fs: lexdb_disk.Fs, data: lexdb_disk.File, opts: Options, m: &lexdb_page
 
 // Opens the store in fs (creating it when it is new) and recovers: the last
 // checkpoint, then the log after it.
-pub fn open(fs: lexdb_disk.Fs, opts: Options): Result[Store, lexdb_base.DbErr] {
-    let data = try if opts.bufferedPages { fs.openBuffered(DATA, true) } else { fs.open(DATA, true) }
+pub fn open(fs: lexdb_disk.Fs, opts: Options): Result[Store, lexdb_base.DbErr] { return openIn(fs, fs, false, opts) }
+
+// open with the log segments in logFs, a directory of their own (--log-dir,
+// design/lexdb.md 9.124): refused unless fs's data was made with this log.
+pub fn openSplit(fs: lexdb_disk.Fs, logFs: lexdb_disk.Fs, opts: Options): Result[Store, lexdb_base.DbErr] {
+    return openIn(fs, logFs, true, opts)
+}
+
+fn openIn(fs: lexdb_disk.Fs, logFs: lexdb_disk.Fs, split: bool, opts: Options): Result[Store, lexdb_base.DbErr] {
+    try checkLog(&fs, &logFs, split, true)
+    let data = try fs.openBuffered(DATA, true)
     let size = try data.size()
     var best: Option[lexdb_page.Meta] = None
     if size >= 2 * PAGE {
@@ -4469,7 +4663,7 @@ pub fn open(fs: lexdb_disk.Fs, opts: Options): Result[Store, lexdb_base.DbErr] {
     let free = try lexdb_page.readList(&data, m.free, mut &lists)
     let runs = try lexdb_page.readList(&data, m.runs, mut &lists)
     let dropped = try lexdb_page.readList(&data, m.dropped, mut &lists)
-    var db = newDb(fs, data, opts, &m)
+    var db = newDb(fs, logFs, data, opts, &m)
     db.fileEnd = size
     db.free = mergeRuns(&runsOf(&free), &runs)
     var d = 0
@@ -4497,7 +4691,7 @@ pub fn open(fs: lexdb_disk.Fs, opts: Options): Result[Store, lexdb_base.DbErr] {
 // closed): every page below its high-water mark is in one tree, one dropped
 // subtree, the free list or a list page, and in no more than one of them.
 pub fn audit(fs: lexdb_disk.Fs): Result[str, lexdb_base.DbErr] {
-    let data = try fs.open(DATA, false)
+    let data = try fs.openBuffered(DATA, false)
     var best: Option[lexdb_page.Meta] = None
     var b = array(PAGE, byte(0))
     for i in 0..2 {
@@ -4611,7 +4805,7 @@ pub fn frameLen(recs: &[]TxWrite): int {
 // goes on where the last valid frame ended.
 fn (st: &Store) replay(m: &lexdb_page.Meta): Result[Unit, lexdb_base.DbErr] {
     var fs = lexdb_disk.Fs.Real("")
-    st.sh.with(fn(db: mut &Db) { fs = db.fs })
+    st.sh.with(fn(db: mut &Db) { fs = db.logFs })
     var seg = m.replaySeg
     var off = m.replayOff
     var batch = m.replayBatch
@@ -4707,6 +4901,7 @@ pub type Stats = value record {
 }
 
 // The most pages of dropped subtrees one checkpoint reads (tests).
+pub fn (st: &Store) setFrameMax(n: int) { st.sh.with(fn(db: mut &Db) { db.frameMax = n }) }
 pub fn (st: &Store) setDropReads(n: int) { st.sh.with(fn(db: mut &Db) { db.dropReads = n }) }
 
 // The memo: values the SQL layer keeps while the store is open, outside any
@@ -4945,7 +5140,16 @@ pub fn (st: &Store) trees(): []int {
 // Opens the store, runs the writer and the checkpointer as tasks, calls f,
 // then closes the store and waits for them.
 pub fn run[R](fs: lexdb_disk.Fs, opts: Options, f: &fn(Store): R): Result[R, lexdb_base.DbErr] {
-    let st = try open(fs, opts)
+    return runWith(open(fs, opts), f)
+}
+
+// run with the log in logFs (openSplit).
+pub fn runSplit[R](fs: lexdb_disk.Fs, logFs: lexdb_disk.Fs, opts: Options, f: &fn(Store): R): Result[R, lexdb_base.DbErr] {
+    return runWith(openSplit(fs, logFs, opts), f)
+}
+
+fn runWith[R](opened: Result[Store, lexdb_base.DbErr], f: &fn(Store): R): Result[R, lexdb_base.DbErr] {
+    let st = try opened
     var out: []R = []
     task.scope(fn(s: mut &task.Scope) {
         s.spawn(writer, st)
@@ -5072,7 +5276,7 @@ type FolSnap = value record { id: int; batch: int; ckpt: int }
 type Fol = record {
     link: Link
     data: lexdb_disk.File
-    fs: lexdb_disk.Fs
+    fs: lexdb_disk.Fs       // the log's (the data file is opened from the data directory's)
     bases: []Base           // oldest first; snapshots begin on the last
     next: []Base            // a newer checkpoint, used once applied reaches its covers
     pool: []lexdb_page.Node // cached pages
@@ -5144,19 +5348,18 @@ fn loadBase(f: &lexdb_disk.File, m: &lexdb_page.Meta): Result[Base, lexdb_base.D
 // cacheBytes. It is ready (ready) once it has applied the log up to its
 // first checkpoint's covers batch.
 pub fn openFollower(link: Link, fs: lexdb_disk.Fs, cacheBytes: int): Result[Follower, lexdb_base.DbErr] {
-    return openFollowerHow(link, fs, cacheBytes, false)
+    return openFollowerHow(link, fs, fs, cacheBytes)
 }
 
-// openFollower, the page file read through the kernel's page cache when
-// buffered (9.69).
-fn openFollowerHow(link: Link, fs: lexdb_disk.Fs, cacheBytes: int, buffered: bool): Result[Follower, lexdb_base.DbErr] {
+// openFollower, with the log in logFs.
+fn openFollowerHow(link: Link, fs: lexdb_disk.Fs, logFs: lexdb_disk.Fs, cacheBytes: int): Result[Follower, lexdb_base.DbErr] {
     let held = link.holdNow()
-    let data = try if buffered { fs.openBuffered(DATA, false) } else { fs.open(DATA, false) }
+    let data = try fs.openBuffered(DATA, false)
     let m = try readMeta(&data)
     if m.ckpt < held { return Err(lexdb_base.corrupt("follower: the meta page is older than the store's checkpoint")) }
     let b = try loadBase(&data, &m)
     link.hold(m.ckpt, m.replaySeg)
-    let fol = Fol{link: link, data: data, fs: fs, bases: [], next: [b], pool: [], pageOf: [], refd: [], at: newMap(),
+    let fol = Fol{link: link, data: data, fs: logFs, bases: [], next: [b], pool: [], pageOf: [], refd: [], at: newMap(),
                   used: 0, budget: cacheBytes, hand: 0, deltas: newMap(), life: newMap(), applied: m.replayBatch - 1,
                   seg: m.replaySeg, off: m.replayOff, segF: [], segNo: -1, snaps: [], nextSnap: 0,
                   loads: 0, evictions: 0, batches: 0, freed: 0, watched: -1, watchedWrites: 0, metaDue: false}
@@ -6012,11 +6215,21 @@ pub fn (fo: &Follower) changes(): int {
 // its writes fail (25006, read_only_sql_transaction). It is ready once the
 // follower is (Follower.ready); poll applies the master's batches.
 pub fn openReplica(fs: lexdb_disk.Fs, opts: Options, link: Link): Result[Store, lexdb_base.DbErr] {
-    let fo = try openFollowerHow(link, fs, opts.cacheBytes, opts.bufferedPages)
+    return openReplicaIn(fs, fs, false, opts, link)
+}
+
+// openReplica of a master whose log is in logFs (--log-dir): the same check as the master's.
+pub fn openReplicaSplit(fs: lexdb_disk.Fs, logFs: lexdb_disk.Fs, opts: Options, link: Link): Result[Store, lexdb_base.DbErr] {
+    return openReplicaIn(fs, logFs, true, opts, link)
+}
+
+fn openReplicaIn(fs: lexdb_disk.Fs, logFs: lexdb_disk.Fs, split: bool, opts: Options, link: Link): Result[Store, lexdb_base.DbErr] {
+    try checkLog(&fs, &logFs, split, false)
+    let fo = try openFollowerHow(link, fs, logFs, opts.cacheBytes)
     // the Db keeps what the SQL layer keeps (the memo) and the counters
     let m = lexdb_page.Meta{ckpt: 0, npages: 2, roots: 0, free: 0, replaySeg: 1, replayOff: 0, replayBatch: 1, nextTree: 1,
                             dropped: 0, runs: 0, covers: -1}
-    let db = newDb(fs, lexdb_disk.File.Real(-1, false), opts, &m)
+    let db = newDb(fs, logFs, lexdb_disk.File.Real(-1, false), opts, &m)
     return Ok(Store{sh: task.shared(db), fo: Some(fo)})
 }
 

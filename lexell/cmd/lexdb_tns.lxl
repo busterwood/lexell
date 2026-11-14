@@ -1,0 +1,3435 @@
+// lexdb_tns: Oracle Database's protocol, TNS with TTC on top, server side
+// (design/lexdb-oracle.md, stage O1). One task per connection, as lexdb_tds's.
+// The codecs are lib/tns.lxl's (the client's), run in the other direction.
+//
+// CONNECT: the descriptor's SERVICE_NAME (or SID) must be "lexdb" or
+// "freepdb1" (or none), else REFUSE (ERR=12514); ACCEPT at the lesser of the
+// client's TNS version and 319, no NA, no end-of-response, no fast
+// authentication. Then TTC: Protocol (the banner of Oracle Database 23ai
+// Free, character set 873, TTC field version 18 whatever the client's own),
+// DataTypes (the client's table is answered with itself), and the two
+// authentication phases with the 12c verifier (0x4815, PBKDF2-SHA512):
+// the role's verifier is the one made when its password was set (CREATE or
+// ALTER ROLE ... PASSWORD, lexdb_auth.makeOraVerifier); a user that is no
+// role, or has none, gets a made-up salt so that the failure comes at phase
+// two as ORA-01017. Oracle's exchange proves the password through keys
+// derived from it, so --auth trust cannot take any password: under it a
+// user with no verifier logs in with its own name as the password. SYS and
+// logins AS SYSDBA are refused.
+//
+// Requests: EXECUTE (parse, execute, fetch the first rows: SQL text of
+// lexdb's dialect, with "FROM dual" dropped; no binds yet), FETCH, COMMIT,
+// ROLLBACK, LOGOFF, PING and the CLOSE_CURSORS piggyback. A query's rows are
+// kept in a server cursor, read by FETCH, ending with ORA-01403. Oracle's
+// transactions on lexdb's: the first DML begins one, COMMIT or an EXECUTE's
+// commit flag ends it, DDL commits the open one first, and a failed
+// statement is undone alone. A failure is an ERROR message with the ORA-
+// number for lexdb's SQLSTATE.
+//
+// Results: a column's Oracle type comes from its lexdb type: integers and
+// numeric as NUMBER, float8 and float4 as BINARY_DOUBLE and BINARY_FLOAT,
+// bool as BOOLEAN (NUMBER(1) below field version 17), date, timestamp and
+// timestamptz as DATE, TIMESTAMP and TIMESTAMP WITH TIME ZONE, bytea and uuid
+// as RAW, anything else as VARCHAR2 holding the text PostgreSQL's protocol
+// gives it.
+import "net"
+import "tls"
+import "task"
+import "math"
+import "sqldialect"
+import "strings"
+import "crypto"
+import "tns"
+import "./lexdb_base"
+import "./lexdb_store"
+import "./lexdb_sql"
+import "./lexdb_exec"
+import "./lexdb_auth"
+import "./lexdb_wire"
+import "./lexdb_time"
+import "./lexdb_orafn"
+import "./lexdb_oraadm"
+import "./lexdb_oratext"
+import "./lexdb_plsql"
+
+type Val = lexdb_sql.Val
+type DbErr = lexdb_base.DbErr
+
+const PROTOCOL_BANNER = "Oracle Database 23ai Free Release 23.0.0.0.0"   // the protocol message's banner: under 50 bytes
+const BANNER = "Oracle Database 23ai Free Release 23.0.0.0.0 - Develop, Learn, and Run for Free"
+const VERSION_NO = 385875968            // 23.0.0.0.0 as AUTH_VERSION_NO says it (23 << 24)
+const SERVICE = "lexdb"
+const SERVICE2 = "freepdb1"             // the container's own, for programs written against it
+const FV_SERVER = 18                    // the TTC field version this server speaks (FV_23_1_EXT_1)
+const FV_BOOLEAN = 17                   // BOOLEAN values from here (FV_23_1)
+const TNS_VERSION = 319
+const MAX_OPEN_CURSORS = 300            // AUTH_MAX_OPEN_CURSORS: a connection's open cursors (ORA-01000 past it)
+const MAX_PREAUTH_REQUEST = 16384       // the largest request read before the login
+const MAX_REQUEST = 67108864            // 64 MiB: the largest request read
+const SHORT = "\x00short"               // parseRequest: the message goes on in the next packet
+
+const PT_CONNECT = 1
+const PT_ACCEPT = 2
+const PT_REFUSE = 4
+const PT_DATA = 6
+const PT_MARKER = 12
+const PT_CONTROL = 14
+const DATA_EOF = 0x40
+
+const FN_REEXECUTE = 4
+const FN_FETCH = 5
+const FN_OVERSION = 59
+const FN_LOGOFF = 9
+const FN_COMMIT = 14
+const FN_ROLLBACK = 15
+const FN_REEXECUTE_FETCH = 78
+const FN_EXECUTE = 94
+const FN_CLOSE_CURSORS = 105
+const FN_CLOSE_CURSORS2 = 120                // JDBC's other close of cursors (OCANA): the same body
+const FN_LOB_OP = 96
+const FN_SET_END_TO_END = 135
+const FN_SET_SCHEMA = 152
+const FN_AUTH2 = 115
+const FN_AUTH1 = 118
+const FN_PING = 147
+
+const R_PROTOCOL = 1
+const R_DATATYPES = 2
+const R_FUNCTION = 3
+
+const OPT_PARSE = 0x01
+const OPT_FETCH = 0x40
+const OPT_DEFINE = 0x10
+const OPT_COMMIT = 0x100
+const OPT_BATCH_ERRORS = 0x80000
+const EXEC_ROWCOUNTS = 0x4000
+const LOB_PARAM = 0x00
+const LOB_GET_LENGTH = 0x0001
+const LOB_READ = 0x0002
+const LOB_TRIM = 0x0020
+const LOB_WRITE = 0x0040
+const LOB_GET_CHUNK_SIZE = 0x4000
+const LOB_CREATE_TEMP = 0x0110
+const LOB_FREE_TEMP = 0x0111
+const LOB_OPEN = 0x8000
+const LOB_CLOSE = 0x10000
+const LOB_IS_OPEN = 0x11000
+const LOB_CHUNK = 8132
+const MAX_LOBS = 4096                  // the LOB locators a connection holds (the oldest go past it)
+const LOB_LIMIT = 268435456       // the bytes the connection's LOB locators may hold
+const MAX_STRING = 4000                 // a bind buffer over this is a LONG one: its value is sent last
+
+// ---- bytes out
+
+type Out = record { b: []byte; sb1u: bool; lobPre: bool }   // sb1u: the client's table has SB1 universal (JDBC): a scale is a signed variable-length integer
+
+fn newOut(): Out { return Out{b: [], sb1u: false, lobPre: false} }
+
+fn (o: mut &Out) u8(v: int) { append(mut &o.b, byte(v & 0xff)) }
+fn (o: mut &Out) u16be(v: int) {
+    append(mut &o.b, byte((v >> 8) & 0xff))
+    append(mut &o.b, byte(v & 0xff))
+}
+fn (o: mut &Out) u16le(v: int) {
+    append(mut &o.b, byte(v & 0xff))
+    append(mut &o.b, byte((v >> 8) & 0xff))
+}
+fn (o: mut &Out) ub(v: int) { tns.putUb(mut &o.b, v) }
+fn (o: mut &Out) ubs(n: int) { for i in 0..n { o.ub(0) } }
+fn (o: mut &Out) zeros(n: int) { for i in 0..n { o.u8(0) } }
+fn (o: mut &Out) raw(s: str) { appendStr(mut &o.b, s) }
+// bytes with a length (a NULL or empty one is a 0 byte)
+fn (o: mut &Out) bytes(s: str) { tns.putBytes(mut &o.b, &s) }
+// a ub4 length, then (when not empty) the bytes with a length
+fn (o: mut &Out) str2(s: str) {
+    o.ub(len(s))
+    if len(s) > 0 { o.bytes(s) }
+}
+fn (o: mut &Out) pair(k: str, v: str, flags: int) {
+    o.str2(k)
+    o.str2(v)
+    o.ub(flags)
+}
+
+fn (o: mut &Out) take(): []byte { return replace(mut &o.b, []) }
+
+// ---- packets
+
+type Pkt = value record { ptype: int; flags: int; data: str }
+
+// A connection's packets: the 8-byte header's length is 16 bits until the
+// ACCEPT, 32 after it (TNS 315 and up).
+type Wire = record {
+    plain: []net.Conn       // the socket (one), or none once TLS has it
+    secure: []tls.Conn      // TCPS: the TLS connection over the socket (none, or one)
+    buf: []byte
+    pos: int
+    end: int
+    large: bool
+    sdu: int
+}
+
+fn newWire(sock: net.Conn): Wire {
+    return Wire{plain: [sock], secure: [], buf: array(65536, byte(0)), pos: 0, end: 0, large: false, sdu: 8192}
+}
+
+// buf[pos..end] holds at least n bytes, reading as the socket has them.
+fn (t: mut &Wire) fill(n: int): Result[Unit, str] {
+    while t.end - t.pos < n {
+        if t.pos == t.end {
+            t.pos = 0
+            t.end = 0
+        }
+        if t.pos + n > len(t.buf) {
+            let k = t.end - t.pos
+            if n > len(t.buf) {
+                var nb = array(max(n, 2 * len(t.buf)), byte(0))
+                for i in 0..k { nb[i] = t.buf[t.pos + i] }
+                t.buf = nb
+            } else {
+                for i in 0..k { t.buf[i] = t.buf[t.pos + i] }
+            }
+            t.pos = 0
+            t.end = k
+        }
+        if len(t.secure) > 0 {
+            match t.secure[0].read(mut &t.buf[t.end..]) {
+                Ok(got) {
+                    if got == 0 { return Err("closed") }
+                    t.end += got
+                }
+                Err(e) { return Err(e.toStr()) }
+            }
+            continue
+        }
+        match t.plain[0].read(mut &t.buf[t.end..]) {
+            Ok(got) {
+                if got == 0 { return Err("closed") }
+                t.end += got
+            }
+            Err(e) { return Err(e.toStr()) }
+        }
+    }
+    return Ok(Unit{})
+}
+
+fn (t: mut &Wire) receive(): Result[Pkt, str] {
+    try t.fill(8)
+    let h = t.pos
+    var n = 0
+    if t.large {
+        n = (int(t.buf[h]) << 24) | (int(t.buf[h + 1]) << 16) | (int(t.buf[h + 2]) << 8) | int(t.buf[h + 3])
+    } else {
+        n = (int(t.buf[h]) << 8) | int(t.buf[h + 1])
+    }
+    if n < 8 || n > 4194304 { return Err("a packet length of " + n.toStr()) }
+    try t.fill(n)
+    let at = t.pos
+    t.pos += n
+    return Ok(Pkt{ptype: int(t.buf[at + 4]), flags: int(t.buf[at + 5]), data: strFromBytes(&t.buf[at + 8..at + n])})
+}
+
+fn (t: mut &Wire) sendPacket(ptype: int, payload: str): Result[Unit, str] {
+    let b = tns.packet(ptype, 0, &payload, t.large)
+    return t.put(&b)
+}
+
+// Bytes to the client, through TLS on TCPS.
+fn (t: mut &Wire) put(b: &[]byte): Result[Unit, str] {
+    if len(t.secure) > 0 {
+        match t.secure[0].write(b) {
+            Ok(_) { return Ok(Unit{}) }
+            Err(e) { return Err(e.toStr()) }
+        }
+    }
+    match t.plain[0].write(b) {
+        Ok(_) { return Ok(Unit{}) }
+        Err(e) { return Err(e.toStr()) }
+    }
+}
+
+// A TTC message as DATA packets of at most the SDU, written together.
+fn (t: mut &Wire) sendData(msg: &[]byte): Result[Unit, str] {
+    let room = max(512, t.sdu) - 8 - 2
+    var off = 0
+    var out: []byte = []
+    while true {
+        let k = min(room, len(msg) - off)
+        let one = tns.packet(PT_DATA, 0, &("\x00\x00" + strFromBytes(&msg[off..off + k])), t.large)
+        for x in one { append(mut &out, x) }
+        off += k
+        if off >= len(msg) { break }
+    }
+    return t.put(&out)
+}
+
+// ---- Oracle's errors for lexdb's
+
+type OraErr = lexdb_oratext.OraErr
+fn pad5(n: int): str { return lexdb_oratext.pad5(n) }
+fn oraText(n: int, text: str): str { return lexdb_oratext.oraText(n, text) }
+fn quotedName(s: &str): str { return lexdb_oratext.quotedName(s) }
+fn oraOf(e: &DbErr, user: &str): OraErr { return lexdb_oratext.oraOf(e, user) }
+
+
+// ---- SQL text: Oracle's "FROM dual" is nothing in lexdb's SELECT
+
+fn isIdentByte(c: byte): bool { return lexdb_oratext.isIdentByte(c) }
+fn isSpaceByte(c: byte): bool { return lexdb_oratext.isSpaceByte(c) }
+fn oracleSql(sql: str): str { return lexdb_oratext.oracleSql(sql) }
+
+// Whether sql is ALTER SESSION: the drivers' set-up (time zone, NLS), accepted and
+// ignored at this stage.
+fn isAlterSession(sql: &str): bool {
+    var i = 0
+    while i < len(sql) && isSpaceByte(sql[i]) { i += 1 }
+    var words: []str = []
+    var j = i
+    while j < len(sql) && len(words) < 2 {
+        while j < len(sql) && isSpaceByte(sql[j]) { j += 1 }
+        let s = j
+        while j < len(sql) && isIdentByte(sql[j]) { j += 1 }
+        if j > s { append(mut &words, strings.toLowerAscii(&(sql[s..j].toStr()))) } else { break }
+    }
+    return len(words) == 2 && words[0] == "alter" && words[1] == "session"
+}
+
+// The rows a command's tag counts ("INSERT 0 3", "UPDATE 2"), else 0.
+fn tagCount(tag: &str): int {
+    let at = strings.lastIndexOf(tag, " ")
+    if at < 0 { return 0 }
+    return strings.parseIntOpt(&(tag[at + 1..len(tag)].toStr())).unwrapOr(0)
+}
+
+// ---- result columns: Oracle types from lexdb's
+
+const SP_NONE = 0
+const SP_ALTER_SESSION = 1
+const SP_ADMIN = 2         // CREATE/ALTER/DROP USER, GRANT, REVOKE
+
+const K_TEXT = 0
+const K_NUM = 1
+const K_DOUBLE = 2
+const K_REAL = 3
+const K_BOOL = 4
+const K_DATE = 5
+const K_TS = 6
+const K_TSTZ = 7
+const K_RAW = 8
+const K_IDS = 9              // INTERVAL DAY TO SECOND
+const K_IYM = 10             // INTERVAL YEAR TO MONTH
+
+type CT = value record {
+    kind: int
+    ora: int            // tns.T_*
+    size: int           // the describe's buffer size
+    prec: int
+    scale: int
+}
+
+fn kindOf(oid: int): int {
+    if oid == lexdb_sql.OID_INT2 || oid == lexdb_sql.OID_INT4 || oid == lexdb_sql.OID_INT8 || oid == lexdb_sql.OID_NUMERIC { return K_NUM }
+    if oid == lexdb_sql.OID_FLOAT8 { return K_DOUBLE }
+    if oid == lexdb_sql.OID_FLOAT4 { return K_REAL }
+    if oid == lexdb_sql.OID_BOOL { return K_BOOL }
+    if oid == lexdb_sql.OID_DATE { return K_DATE }
+    if oid == lexdb_sql.OID_TS { return K_TS }
+    if oid == lexdb_sql.OID_TSTZ { return K_TSTZ }
+    if oid == lexdb_sql.OID_BYTEA || oid == lexdb_sql.OID_UUID { return K_RAW }
+    if oid == lexdb_sql.OID_IVAL { return K_IDS }
+    return K_TEXT
+}
+
+// Whether v can be sent as kind (NULL always can).
+fn fits(kind: int, v: &Val): bool {
+    match v {
+        Val.Null { return true }
+        Val.Int(_) { return kind == K_NUM }
+        Val.Num(_) { return kind == K_NUM }
+        Val.Bool(_) { return kind == K_BOOL }
+        Val.Float(_) { return kind == K_DOUBLE }
+        Val.Real(_) { return kind == K_REAL }
+        Val.Date(_) { return kind == K_DATE }
+        Val.Ts(_) { return kind == K_TS }
+        Val.Tstz(_) { return kind == K_TSTZ }
+        Val.Bytes(_) { return kind == K_RAW }
+        Val.Uuid(_) { return kind == K_RAW }
+        Val.Ival(iv) {
+            if kind == K_IDS { return iv.months == 0 }
+            if kind == K_IYM { return iv.days == 0 && iv.us == 0 }
+            return kind == K_TEXT
+        }
+        else { return kind == K_TEXT }
+    }
+}
+
+fn hexNibble(c: byte): int {
+    if c >= '0' && c <= '9' { return int(c) - 48 }
+    if c >= 'a' && c <= 'f' { return int(c) - 87 }
+    if c >= 'A' && c <= 'F' { return int(c) - 55 }
+    return 0
+}
+
+// The bytes of a uuid's text (36 characters, dashes and all).
+fn uuidBytes(u: &str): str {
+    var out: []byte = []
+    var hi = -1
+    for i in 0..len(u) {
+        let c = u[i]
+        if c == '-' { continue }
+        if hi < 0 {
+            hi = hexNibble(c)
+        } else {
+            append(mut &out, byte(hi * 16 + hexNibble(c)))
+            hi = -1
+        }
+    }
+    return strFromBytes(&out)
+}
+
+fn rawOf(v: &Val): str {
+    match v {
+        Val.Bytes(b) { return b }
+        Val.Uuid(u) { return uuidBytes(&u) }
+        else { return "" }
+    }
+}
+
+// The columns' Oracle types for these rows.
+fn colTypes(cols: &[]lexdb_exec.OutCol, rows: &[][]Val, fv: int, sess: &lexdb_exec.Session): []CT {
+    var ts: []CT = []
+    for i in 0..len(cols) {
+        var kind = kindOf(cols[i].oid)
+        for r in rows { if i < len(r) && !fits(kind, &r[i]) { kind = K_TEXT } }
+        if kind == K_TEXT && cols[i].oid == lexdb_sql.OID_IVAL {
+            // months only: YEAR TO MONTH
+            var ym = true
+            for r in rows { if i < len(r) && !fits(K_IYM, &r[i]) { ym = false } }
+            if ym { kind = K_IYM }
+        }
+        let oid = cols[i].oid
+        var t = CT{kind: kind, ora: tns.T_VARCHAR, size: 1, prec: 0, scale: 0}
+        if kind == K_NUM {
+            t = CT{kind: kind, ora: tns.T_NUMBER, size: 22, prec: 0, scale: -127}
+            if oid == lexdb_sql.OID_INT2 { t = CT{kind: kind, ora: tns.T_NUMBER, size: 22, prec: 5, scale: 0} }
+            if oid == lexdb_sql.OID_INT4 { t = CT{kind: kind, ora: tns.T_NUMBER, size: 22, prec: 10, scale: 0} }
+            if oid == lexdb_sql.OID_INT8 { t = CT{kind: kind, ora: tns.T_NUMBER, size: 22, prec: 19, scale: 0} }
+            if lexdb_exec.declTag(cols[i].scale) == lexdb_exec.ORA_NUMBER {
+                t = CT{kind: kind, ora: tns.T_NUMBER, size: 22, prec: lexdb_exec.declA(cols[i].scale), scale: lexdb_exec.declB(cols[i].scale)}
+            }
+        } else if kind == K_DOUBLE {
+            t = CT{kind: kind, ora: tns.T_BINARY_DOUBLE, size: 8, prec: 0, scale: 0}
+        } else if kind == K_REAL {
+            t = CT{kind: kind, ora: tns.T_BINARY_FLOAT, size: 4, prec: 0, scale: 0}
+        } else if kind == K_BOOL {
+            t = if fv >= FV_BOOLEAN { CT{kind: kind, ora: tns.T_BOOLEAN, size: 1, prec: 0, scale: 0} }
+                else { CT{kind: kind, ora: tns.T_NUMBER, size: 22, prec: 1, scale: 0} }
+        } else if kind == K_DATE {
+            t = CT{kind: kind, ora: tns.T_DATE, size: 7, prec: 0, scale: 0}
+        } else if kind == K_TS {
+            // lexdb has no DATE of Oracle's: a timestamp to the second is one
+            let fs = cols[i].scale
+            if fs == 0 {
+                t = CT{kind: kind, ora: tns.T_DATE, size: 7, prec: 0, scale: 0}
+            } else {
+                t = CT{kind: kind, ora: tns.T_TIMESTAMP, size: 11, prec: 0, scale: if fs > 0 && fs <= 9 { fs } else { 6 }}
+            }
+        } else if kind == K_TSTZ {
+            t = CT{kind: kind, ora: tns.T_TIMESTAMP_TZ, size: 13, prec: 0, scale: 6}
+        } else if kind == K_IDS {
+            t = CT{kind: kind, ora: tns.T_INTERVAL_DS, size: 11, prec: 0, scale: 0}
+        } else if kind == K_IYM {
+            t = CT{kind: kind, ora: tns.T_INTERVAL_YM, size: 5, prec: 0, scale: 0}
+        } else if kind == K_RAW {
+            var m = 1
+            for r in rows { if i < len(r) { m = max(m, len(rawOf(&r[i]))) } }
+            t = CT{kind: kind, ora: tns.T_RAW, size: max(m, if oid == lexdb_sql.OID_UUID { 16 } else { 1 }), prec: 0, scale: 0}
+            if lexdb_exec.declTag(cols[i].scale) == lexdb_exec.ORA_BLOB { t = CT{kind: kind, ora: tns.T_BLOB, size: 4000, prec: 0, scale: 0} }
+        } else {
+            var m = 1
+            for r in rows { if i < len(r) && !lexdb_exec.isNull(&r[i]) { m = max(m, len(sess.text(&r[i], oid))) } }
+            t = CT{kind: K_TEXT, ora: tns.T_VARCHAR, size: m, prec: 0, scale: 0}
+            let tag = lexdb_exec.declTag(cols[i].scale)
+            if tag == lexdb_exec.ORA_VARCHAR && oid != lexdb_sql.OID_IVAL { t = CT{kind: K_TEXT, ora: tns.T_VARCHAR, size: max(m, lexdb_exec.declA(cols[i].scale)), prec: 0, scale: 0} }
+            if tag == lexdb_exec.ORA_CLOB { t = CT{kind: K_TEXT, ora: tns.T_CLOB, size: 4000, prec: 0, scale: 0} }
+        }
+        append(mut &ts, t)
+    }
+    return ts
+}
+
+fn (o: mut &Out) describe(cols: &[]lexdb_exec.OutCol, ts: &[]CT, fv: int) {
+    o.u8(tns.MT_DESCRIBE_INFO)
+    o.u8(0)                                     // (bytes: none)
+    o.describeBody(cols, ts, fv)
+}
+
+// The describe of a REF CURSOR value or an implicit result: the columns, without the message's own header.
+fn (o: mut &Out) describeBody(cols: &[]lexdb_exec.OutCol, ts: &[]CT, fv: int) {
+    o.ub(0)                                     // the longest row
+    o.ub(len(cols))
+    if len(cols) > 0 { o.u8(1) }
+    for i in 0..len(cols) {
+        let t = ts[i]
+        o.u8(t.ora)
+        o.u8(0)
+        o.u8(t.prec & 0xff)
+        if o.sb1u {
+            // a signed variable-length integer: 0 is 00, 2 is 01 02, -127 is 81 7f
+            if t.scale == 0 { o.u8(0) } else {
+                o.u8((if t.scale < 0 { 0x80 } else { 0 }) | 1)
+                o.u8(if t.scale < 0 { -t.scale } else { t.scale })
+            }
+        } else {
+            o.u8(t.scale & 0xff)
+        }
+        o.ub(t.size)                            // the buffer size
+        o.ubs(2)
+        o.ub(0)                                 // the type's OID
+        o.ubs(2)
+        o.u8(if t.ora == tns.T_VARCHAR || t.ora == tns.T_CLOB { tns.CS_IMPLICIT } else { 0 })
+        o.ub(t.size)                            // the maximum size
+        if fv >= 8 { o.ub(0) }
+        o.u8(1)                                 // nullable
+        o.u8(0)
+        o.str2(cols[i].label())
+        o.str2("")                              // the schema
+        o.str2("")                              // the type's name
+        o.ub(0)
+        o.ub(0)
+        if fv >= 17 {
+            o.str2("")
+            o.str2("")
+        }
+        if fv >= 20 { o.ub(0) }
+        if fv >= 24 {
+            o.ub(0)
+            o.zeros(2)
+        }
+    }
+    o.str2("")
+    o.ubs(4)
+    o.str2("")
+}
+
+// The bytes of one value (not NULL) as column type t holds it.
+fn cellBytes(v: &Val, t: &CT, oid: int, sess: &lexdb_exec.Session): Result[str, DbErr] {
+    let over = lexdb_base.err("22003", "numeric overflow")
+    if t.kind == K_NUM {
+        match v {
+            Val.Int(n) {
+                match tns.encodeNumber(&tns.numOfInt(n)) {
+                    Ok(b) { return Ok(b) }
+                    Err(_) { return Err(over) }
+                }
+            }
+            Val.Num(d) {
+                match tns.encodeNumber(&tns.numOfDecimal(d)) {
+                    Ok(b) { return Ok(b) }
+                    Err(_) { return Err(over) }
+                }
+            }
+            Val.Bool(b) { return Ok(if b { "\xc1\x02" } else { "\x80" }) }
+            else {}
+        }
+    } else if t.kind == K_DOUBLE {
+        match v {
+            Val.Float(x) { return Ok(tns.encodeDouble(x)) }
+            else {}
+        }
+    } else if t.kind == K_REAL {
+        match v {
+            Val.Real(x) {
+                var bits = int(math.bitsOf32(x))
+                bits = bits & 0xffffffff
+                if (bits & 0x80000000) != 0 { bits = (~bits) & 0xffffffff } else { bits = bits | 0x80000000 }
+                var b: []byte = []
+                for k in 0..4 { append(mut &b, byte((bits >> (24 - 8 * k)) & 0xff)) }
+                return Ok(strFromBytes(&b))
+            }
+            else {}
+        }
+    } else if t.kind == K_BOOL {
+        match v {
+            Val.Bool(b) {
+                if t.ora == tns.T_BOOLEAN { return Ok(if b { "\x01" } else { "\x00" }) }
+                return Ok(if b { "\xc1\x02" } else { "\x80" })
+            }
+            else {}
+        }
+    } else if t.kind == K_DATE {
+        match v {
+            Val.Date(d) { return Ok(tns.encodeDate(&lexdb_time.localOf(lexdb_time.dateToTs(d)))) }
+            else {}
+        }
+    } else if t.kind == K_TS {
+        match v {
+            Val.Ts(us) {
+                if t.ora == tns.T_DATE { return Ok(tns.encodeDate(&lexdb_time.localOf(us))) }
+                return Ok(tns.encodeTimestamp(&lexdb_time.localOf(us)))
+            }
+            else {}
+        }
+    } else if t.kind == K_TSTZ {
+        match v {
+            Val.Tstz(us) {
+                match lexdb_time.localOf(us).withOffset(0) {
+                    Some(o) { return Ok(tns.encodeTimestampTz(&o)) }
+                    None {}
+                }
+            }
+            else {}
+        }
+    } else if t.kind == K_RAW {
+        return Ok(rawOf(v))
+    } else if t.kind == K_IDS || t.kind == K_IYM {
+        match v {
+            Val.Ival(iv) { return Ok(intervalBytes(t.ora, &iv)) }
+            else {}
+        }
+    }
+    return Ok(sess.text(v, oid))
+}
+
+// ---- the server's cursors
+
+type Cursor = record {
+    id: int
+    sql: str
+    query: bool
+    cols: []lexdb_exec.OutCol
+    ts: []CT
+    rows: [][]Val
+    pos: int
+    count: int              // a DML statement's rows
+    // what a run again needs
+    meta: []BindMeta        // the binds' types as the client last sent them
+    sites: []tns.Site       // the placeholders of sql
+    into: int               // where RETURNING ... INTO's INTO starts, -1 none
+    stmts: []lexdb_sql.Stmt // sql as lexdb's, parsed (a placeholder is $n)
+    prepared: bool
+    special: int            // SP_*: a statement that is not lexdb's SQL
+    lobPre: bool            // the client defined a LOB column with a prefetch (JDBC): its rows carry the empty prefetch
+    modes: []int            // per column after a define: the Oracle type the client wants it in (0 not defined)
+    pc: lexdb_exec.PlanCache
+    pts: []int              // the types the plan in pc was made for
+    dyn: bool               // its text had calls of stored functions made at prepare: prepared again at each execute
+    dirs: []int             // a PL/SQL block's binds: 16 OUT, 32 IN, 48 IN OUT, as the IO vector told the client
+}
+
+// A bind as the client describes it.
+type BindMeta = value record {
+    ora: int
+    csfrm: int
+    size: int
+    array: bool
+    pre: int                // the characters of a LOB the client wants prefetched (JDBC's mxlc)
+}
+
+fn newCursor(id: int, sql: str): Cursor {
+    return Cursor{id: id, sql: sql, query: false, cols: [], ts: [], rows: [], pos: 0, count: 0, meta: [], sites: [], into: -1,
+                  stmts: [], prepared: false, special: 0, lobPre: false, modes: [], pc: lexdb_exec.newPlanCache(), pts: [], dyn: false, dirs: []}
+}
+
+// ---- what a request says
+
+type Req = record {
+    kind: int               // R_*
+    fnCode: int
+    seq: int                // the call's sequence number: JDBC checks it in the reply's ERROR message
+    closes: []int           // cursors the piggyback closes
+    // authentication
+    user: str
+    mode: int
+    pairs: []tns.KeyValue
+    // EXECUTE
+    options: int
+    cursor: int
+    sql: str
+    parse: bool
+    prefetch: int
+    binds: int
+    iters: int              // the times to run (array DML)
+    batchErrors: bool
+    rowCounts: bool         // the rows of each run are asked for
+    meta: []BindMeta        // the binds, when the request describes them
+    hasMeta: bool
+    vals: [][]Option[str]   // each run's values of the binds that are not RETURNING's
+    sites: []tns.Site       // the placeholders of a SQL text the request brings
+    into: int
+    defs: []BindMeta        // EXECUTE with the define option: the types the client wants the columns in
+    hasDefs: bool
+    // piggybacks
+    schema: str             // SET_SCHEMA: the current schema
+    hasSchema: bool
+    e2e: []str              // END_TO_END: client identifier, module, action, client info, dbop (set ones as "\x01" + text)
+    // LOB_OP
+    lobOp: int
+    lobLoc: str
+    lobOff: int
+    lobDst: int
+    lobAmount: int
+    lobData: str
+    lobSend: bool           // the amount is asked for
+    lobHasData: bool
+    // FETCH
+    n: int
+    // DataTypes
+    caps: str
+    table: str
+}
+
+fn newReq(): Req {
+    return Req{kind: 0, fnCode: 0, seq: 0, closes: [], user: "", mode: 0, pairs: [], options: 0, cursor: 0, sql: "", parse: false,
+               prefetch: 0, binds: 0, iters: 1, batchErrors: false, rowCounts: false, meta: [], hasMeta: false, vals: [],
+               sites: [], into: -1, defs: [], hasDefs: false, schema: "", hasSchema: false, e2e: [], lobOp: 0, lobLoc: "", lobOff: 0, lobDst: 0,
+               lobAmount: 0, lobData: "", lobSend: false, lobHasData: false, n: 0, caps: "", table: ""}
+}
+
+fn pairOf(kv: &[]tns.KeyValue, key: str): str {
+    for p in kv { if p.key == key { return p.value } }
+    return ""
+}
+
+fn rerr(msg: str): tns.Error { return sqldialect.dbError(sqldialect.E_PROTOCOL, &msg) }
+
+// A string whose length n was sent before it: python-oracledb follows it with a length byte (or a chunked
+// 0xfe form), JDBC's thin driver sends the bare bytes.
+fn lenStr(c: mut &tns.Cur, d: str, n: int, what: str): Result[str, tns.Error] {
+    if c.pos < len(d) && ((int(d[c.pos]) == n && n < 0xfd) || int(d[c.pos]) == 0xfe) {
+        return c.bytesOrEmpty(&what)
+    }
+    if n < 0 || c.pos + n > len(d) {
+        c.short = true
+        return Err(rerr(what + ": short"))
+    }
+    let r = d[c.pos..c.pos + n]
+    try c.skip(n, &what)
+    return Ok(r)
+}
+
+// One request, from the bytes of its packets so far. Err(SHORT) when it
+// goes on in the next one.
+fn parseRequest(d: str, fv: int, lenient: bool, cursors: &[]Cursor): Result[Req, str] {
+    var c = tns.cursor(&d)
+    match readRequest(mut &c, d, fv, lenient, cursors) {
+        Ok(r) { return Ok(r) }
+        Err(e) {
+            if c.short { return Err(SHORT) }
+            return Err(e.msg)
+        }
+    }
+}
+
+// Skips what the string says: b a byte, U a universal integer.
+fn skipSeq(c: mut &tns.Cur, seq: str): Result[Unit, tns.Error] {
+    for i in 0..len(seq) {
+        if seq[i] == 'b' { try c.skip(1, "execute") } else { try c.skipUb("execute") }
+    }
+    return Ok(Unit{})
+}
+
+fn findIn(cursors: &[]Cursor, id: int): int {
+    for i in 0..len(cursors) { if cursors[i].id == id { return i } }
+    return -1
+}
+
+// One bind's description in an EXECUTE.
+fn readMeta(c: mut &tns.Cur, fv: int): Result[BindMeta, tns.Error] {
+    let t = try c.u8("bind")
+    let flag = try c.u8("bind")
+    try c.skip(1, "bind")
+    // the scale: JDBC writes it as a universal integer for the types that have one (NUMBER, the TIMESTAMPs), else a byte
+    if t == tns.T_NUMBER || t == 180 || t == 181 || t == 231 || t == 183 { try c.skipUb("bind") } else { try c.skip(1, "bind") }
+    let size = try c.ub4("bind")
+    let elems = try c.ub4("bind")
+    try c.skipUb("bind")
+    let oid = try c.ub4("bind")
+    if oid != 0 { return Err(rerr("object binds are not supported")) }
+    try c.skipUb("bind")
+    try c.skipUb("bind")
+    let cs = try c.u8("bind")
+    let pre = try c.ub4("bind")
+    if fv >= 8 { try c.skipUb("bind") }
+    return Ok(BindMeta{ora: t, csfrm: cs, size: size, array: (flag & 0x40) != 0 || elems > 0, pre: pre})
+}
+
+fn longBind(m: &BindMeta): bool { return m.size > MAX_STRING || m.ora == tns.T_LONG || m.ora == tns.T_LONG_RAW }
+
+// The values of n runs: each is ROW_DATA, then the bind values that are not RETURNING's, the long ones last
+// (kind 0: SQL; PL/SQL has them all in order).
+fn readValues(c: mut &tns.Cur, d: str, meta: &[]BindMeta, sites: &[]tns.Site, kind: int, dirs: &[]int, n: int,
+              vals: mut &[][]Option[str]): Result[Unit, tns.Error] {
+    var idx: []int = []
+    for k in 0..len(meta) {
+        if k < len(sites) && sites[k].returning { continue }
+        append(mut &idx, k)
+    }
+    var live = 0
+    for k in idx { if !(len(dirs) > k && dirs[k] == 16) { live += 1 } }
+    if live == 0 { return Ok(Unit{}) }
+    for run in 0..n {
+        let mt = try c.u8("bind values")
+        if mt != tns.MT_ROW_DATA { return Err(rerr("message type " + mt.toStr() + " where the bind values are")) }
+        var row: []Option[str] = []
+        for k in 0..len(idx) { append(mut &row, None) }
+        for pass in 0..2 {
+            for q in 0..len(idx) {
+                let m = &meta[idx[q]]
+                if len(dirs) > idx[q] && dirs[idx[q]] == 16 { continue }
+                if kind != tns.S_PLSQL && longBind(m) != (pass == 1) { continue }
+                if kind == tns.S_PLSQL && pass == 1 { continue }
+                if m.array {
+                    // the elements of a PL/SQL index-by table: read, and kept as nothing (an OUT array comes back as the block makes it)
+                    let ne = try c.ub4("array bind")
+                    for e in 0..ne { let x = try c.bytes("array bind") }
+                    row[q] = Some("")
+                    continue
+                }
+                if m.ora == tns.T_BOOLEAN {
+                    // NULL is the escape byte and 1
+                    if c.pos < len(d) && int(d[c.pos]) == 253 {
+                        try c.skip(2, "bind value")
+                        continue
+                    }
+                }
+                if m.ora == tns.T_CURSOR {
+                    try c.skip(2, "bind value")
+                    continue
+                }
+                if m.ora == tns.T_CLOB || m.ora == tns.T_BLOB {
+                    let ll = try c.ub4("lob bind")
+                    if ll > 0 { row[q] = Some(try c.bytesOrEmpty("lob bind")) }
+                    continue
+                }
+                row[q] = try c.bytes("bind value")
+            }
+        }
+        append(mut &vals, row)
+    }
+    return Ok(Unit{})
+}
+
+fn readRequest(c: mut &tns.Cur, d: str, fv: int, lenient: bool, cursors: &[]Cursor): Result[Req, tns.Error] {
+    var r = newReq()
+    while true {
+        let mt = try c.u8("message type")
+        if mt == tns.MT_PIGGYBACK {
+            let code = try c.u8("piggyback")
+            try c.skip(1, "piggyback")
+            if fv >= 18 { try c.skipUb("piggyback") }
+            if code == FN_SET_SCHEMA {
+                try c.skip(1, "piggyback")
+                let n = try c.ub4("piggyback")
+                if n > 0 { r.schema = try lenStr(mut &c, d, n, "schema") }
+                r.hasSchema = true
+                continue
+            }
+            if code == FN_LOB_OP {
+                // the temporary LOBs to free: their locators follow, 40 bytes or so each; they are not tracked
+                try c.skip(1, "piggyback")
+                let total = try c.ub4("piggyback")
+                try skipSeq(c, "bUUUbbbUbUUUbbUbUbU")
+                try c.skip(total, "piggyback")
+                continue
+            }
+            if code == FN_SET_END_TO_END {
+                try c.skip(2, "piggyback")
+                let flags = try c.ub4("piggyback")
+                var lens: []int = []
+                // client identifier, module, action, (unused), client info, (2 unused), dbop
+                for k in 0..3 {
+                    try c.skip(1, "piggyback")
+                    append(mut &lens, try c.ub4("piggyback"))
+                }
+                try c.skip(1, "piggyback")
+                let l1 = try c.ub4("piggyback")
+                try c.skip(1, "piggyback")
+                let l2 = try c.ub4("piggyback")
+                try c.skip(1, "piggyback")
+                append(mut &lens, try c.ub4("piggyback"))
+                try c.skip(1, "piggyback")
+                let l3 = try c.ub4("piggyback")
+                try c.skip(1, "piggyback")
+                let l4 = try c.ub4("piggyback")
+                try c.skip(1, "piggyback")
+                append(mut &lens, try c.ub4("piggyback"))
+                let bits = [0x1, 0x8, 0x10, 0x100, 0x200]
+                r.e2e = ["", "", "", "", ""]
+                for k in 0..5 {
+                    if (flags & bits[k]) != 0 {
+                        r.e2e[k] = "\x01"
+                        if lens[k] > 0 { r.e2e[k] = "\x01" + (try lenStr(mut &c, d, lens[k], "piggyback")) }
+                    }
+                }
+                continue
+            }
+            if code != FN_CLOSE_CURSORS && code != FN_CLOSE_CURSORS2 {
+                return Err(rerr("piggyback " + code.toStr() + " is not supported"))
+            }
+            try c.skip(1, "piggyback")
+            let n = try c.ub4("piggyback")
+            if n > 100000 { return Err(rerr("too many cursors to close")) }
+            for i in 0..n { append(mut &r.closes, try c.ub4("piggyback")) }
+            continue
+        }
+        if mt == tns.MT_PROTOCOL {
+            try c.skip(2, "protocol")
+            while true {
+                let b = try c.u8("protocol")
+                if b == 0 { break }
+            }
+            r.kind = R_PROTOCOL
+            return Ok(r)
+        }
+        if mt == tns.MT_DATA_TYPES {
+            try c.skip(5, "data types")
+            r.caps = try c.bytesOrEmpty("compile capabilities")
+            let rc = try c.bytesOrEmpty("runtime capabilities")
+            let at = c.pos
+            while true {
+                let t = try c.u16be("data type")
+                if t == 0 { break }
+                // (type, converted type) and, for a converted type other than 0, its representation and a zero
+                let conv = try c.u16be("data type")
+                if conv != 0 { try c.skip(4, "data type") }
+            }
+            r.table = d[at..c.pos]
+            r.kind = R_DATATYPES
+            return Ok(r)
+        }
+        if mt != tns.MT_FUNCTION {
+            return Err(rerr("message type " + mt.toStr()))
+        }
+        r.kind = R_FUNCTION
+        r.fnCode = try c.u8("function")
+        r.seq = try c.u8("sequence")
+        if fv >= 18 { try c.skipUb("token") }
+        if r.fnCode == FN_AUTH1 || r.fnCode == FN_AUTH2 {
+            let has = try c.u8("authentication")
+            let ulen = try c.ub4("authentication")
+            r.mode = try c.ub4("authentication")
+            try c.skip(1, "authentication")
+            let np = try c.ub4("authentication")
+            try c.skip(2, "authentication")
+            if has != 0 && ulen > 0 { r.user = try lenStr(mut &c, d, ulen, "user") }
+            if np > 1000 { return Err(rerr("too many authentication pairs")) }
+            for i in 0..np {
+                let k = try c.str2("key")
+                let v = try c.str2("value")
+                let f = try c.ub4("flags")
+                append(mut &r.pairs, tns.KeyValue{key: k, value: v, flags: f})
+            }
+        } else if r.fnCode == FN_EXECUTE {
+            r.options = try c.ub4("options")
+            r.cursor = try c.ub4("cursor")
+            let ptr = try c.u8("sql")
+            let sl = try c.ub4("sql")
+            r.parse = ptr != 0 && sl > 0
+            try skipSeq(c, "bUbbU")
+            r.prefetch = try c.ub4("prefetch")
+            try c.skipUb("execute")
+            try c.skip(1, "binds")
+            r.binds = try c.ub4("binds")
+            try c.skip(5, "execute")
+            try c.skip(1, "execute")
+            let ndef = try c.ub4("defines")
+            try skipSeq(c, "UbbbUbUUbUb")
+            if fv >= 8 {
+                try skipSeq(c, "bUbUb")
+                if fv >= 9 { try skipSeq(c, "bU") }
+            }
+            if r.parse { r.sql = try lenStr(mut &c, d, sl, "sql") }
+            r.batchErrors = (r.options & OPT_BATCH_ERRORS) != 0
+            // the 13 words that follow the text; the second is the runs, the tenth the flags
+            // (a request cut in two is waited for, unless the packet was not full: then it is all there is)
+            var words: []int = []
+            var tailErr: Option[tns.Error] = None
+            for k in 0..13 {
+                match c.ub4("execute") {
+                    Ok(v) { append(mut &words, v) }
+                    Err(e) {
+                        tailErr = Some(e)
+                        break
+                    }
+                }
+            }
+            if tailErr.isSome() {
+                if c.short && lenient { c.short = false } else { return Err(tailErr.unwrap()) }
+            } else {
+                r.iters = max(words[1], 1)
+                r.n = words[1]                    // (JDBC: the rows a query run again is to return)
+                r.rowCounts = (words[9] & EXEC_ROWCOUNTS) != 0
+                var sites: []tns.Site = []
+                var text = r.sql
+                if r.parse {
+                    var sc = tns.bindSites(&r.sql)
+                    r.into = sc.into
+                    sites = replace(mut &sc.sites, [])
+                    for st in sites { append(mut &r.sites, st) }
+                } else {
+                    let ci = findIn(cursors, r.cursor)
+                    if ci >= 0 {
+                        for st in cursors[ci].sites { append(mut &sites, st) }
+                        text = cursors[ci].sql
+                    }
+                }
+                let kind = tns.statementKind(&text)
+                if kind == tns.S_QUERY { r.iters = 1 }
+                if r.binds > 0 {
+                    if r.binds > 1000 { return Err(rerr("too many binds")) }
+                    for i in 0..r.binds { append(mut &r.meta, try readMeta(c, fv)) }
+                    r.hasMeta = true
+                    let nodirs: []int = []
+                    try readValues(c, d, &r.meta, &sites, kind, &nodirs, r.iters, mut &r.vals)
+                }
+                if (r.options & OPT_DEFINE) != 0 && ndef > 0 {
+                    if ndef > 1000 { return Err(rerr("too many defines")) }
+                    for i in 0..ndef { append(mut &r.defs, try readMeta(c, fv)) }
+                    r.hasDefs = true
+                }
+            }
+        } else if r.fnCode == FN_LOB_OP {
+            let sp = try c.u8("lob")
+            let sl = try c.ub4("lob")
+            try c.skip(1, "lob")
+            try c.skipUb("lob")
+            try c.skipUb("lob")
+            try c.skipUb("lob")
+            try c.skip(3, "lob")
+            r.lobOp = try c.ub4("lob")
+            try c.skip(2, "lob")
+            r.lobOff = try c.ub8("lob")
+            r.lobDst = try c.ub8("lob")
+            let ap = try c.u8("lob")
+            try c.skip(6, "lob")
+            if sp != 0 && sl > 0 { r.lobLoc = try c.take(sl, "lob") }
+            if r.lobOp == LOB_CREATE_TEMP { try c.skipUb("lob") }
+            if c.pos < len(d) && int(d[c.pos]) == tns.MT_LOB_DATA {
+                try c.skip(1, "lob")
+                r.lobData = try c.bytesOrEmpty("lob")
+                r.lobHasData = true
+            }
+            if ap != 0 {
+                r.lobAmount = try c.ub8("lob")
+                r.lobSend = true
+            }
+        } else if r.fnCode == FN_REEXECUTE || r.fnCode == FN_REEXECUTE_FETCH {
+            // a cursor run again: its id, the rows to prefetch (or the runs), the two option words,
+            // then the values of its binds (their types are the cursor's) for each run
+            r.cursor = try c.ub4("cursor")
+            r.prefetch = try c.ub4("rows")
+            let o1 = try c.ub4("options")
+            let o2 = try c.ub4("options")
+            r.options = (if (o2 & 1) != 0 { OPT_COMMIT } else { 0 }) | (if r.fnCode == FN_REEXECUTE_FETCH { OPT_FETCH } else { 0 })
+            let ci = findIn(cursors, r.cursor)
+            if ci >= 0 {
+                let cu = &cursors[ci]
+                var plain = 0
+                for k in 0..len(cu.sites) { if !cu.sites[k].returning { plain += 1 } }
+                if len(cu.meta) > 0 && plain > 0 {
+                    r.iters = if r.fnCode == FN_REEXECUTE_FETCH { 1 } else { max(r.prefetch, 1) }
+                    try readValues(c, d, &cu.meta, &cu.sites, tns.statementKind(&cu.sql), &cu.dirs, r.iters, mut &r.vals)
+                } else {
+                    r.iters = if r.fnCode == FN_REEXECUTE_FETCH { 1 } else { max(r.prefetch, 1) }
+                }
+            }
+        } else if r.fnCode == FN_FETCH {
+            r.cursor = try c.ub4("cursor")
+            r.n = try c.ub4("rows")
+        }
+        return Ok(r)
+    }
+    return Err(rerr("unreachable"))
+}
+
+// ---- a connection
+
+type Auth = record {
+    have: bool              // phase one has run
+    role: str
+    salt: str
+    count: int
+    hash: str
+    partA: str
+    csk: str
+    noLogin: bool           // the role exists with a verifier but without LOGIN (CREATE SESSION not granted)
+}
+
+type Conn = record {
+    w: Wire
+    sess: lexdb_exec.Session
+    st: lexdb_store.Store
+    o: Out
+    secret: str
+    fv: int
+    seq: int                // the sequence number of the call being answered
+    user: str
+    auth: Auth
+    cursors: []Cursor
+    nextCursor: int
+    loggedIn: bool
+    batch: []BatchErr       // the batch errors the next ERROR message carries
+    secure: bool            // TCPS
+    nls: Nls
+    localZone: str          // the zone the session started in (TIME_ZONE = LOCAL)
+    lobs: []Lob
+    nextLob: int
+    lobBytes: int           // the bytes the lobs hold
+    pl: lexdb_plsql.Ip      // PL/SQL: DBMS_OUTPUT, the statements parsed, ...
+    prog: lexdb_plsql.Prog  // the stored procedures and functions, compiled
+}
+
+// The session's state ALTER SESSION sets (O5).
+type Nls = record {
+    vals: []str             // the NLS parameters as set, "NAME\x00value"
+    tz: str                 // TIME_ZONE as set, "" none
+    zset: str               // ... as lexdb's TimeZone setting
+    schema: str             // CURRENT_SCHEMA as a lexdb schema name, "" none set
+    redo: bool              // a ROLLBACK may have undone the zone, path and settings: put them again
+}
+
+fn newNls(): Nls { return Nls{vals: [], tz: "", zset: "", schema: "", redo: false} }
+
+fn (n: &Nls) active(): bool { return len(n.vals) > 0 || len(n.zset) > 0 || len(n.schema) > 0 }
+
+fn (n: &Nls) get(k: &str): str {
+    for v in n.vals {
+        let at = strings.indexOf(&v, "\x00", 0)
+        if v[0..at] == k { return v[at + 1..len(v)].toStr() }
+    }
+    return ""
+}
+
+fn (n: mut &Nls) put(k: &str, v: &str) {
+    var out: []str = []
+    for x in n.vals {
+        let at = strings.indexOf(&x, "\x00", 0)
+        if x[0..at] != k { append(mut &out, x) }
+    }
+    if len(v) > 0 { append(mut &out, k.toStr() + "\x00" + v) }
+    n.vals = out
+}
+
+// A LOB the client holds a locator of: the whole value (text for a CLOB, bytes for a BLOB).
+type Lob = record { id: int; blob: bool; data: str; temp: bool }
+
+fn (c: mut &Conn) send(): Result[Unit, str] {
+    let m = c.o.take()
+    if len(m) == 0 { return Ok(Unit{}) }
+    return c.w.sendData(&m)
+}
+
+// The ERROR message that ends a call: num 0 success (rows the count, for DML),
+// 1403 no (more) rows, else the failure's text.
+fn (c: mut &Conn) endCall(num: int, text: str, cursor: int, rows: int) {
+    c.o.u8(tns.MT_ERROR)
+    c.o.ub(if c.sess.status() != 'I' { 0x2 } else { 0 })   // the call's status: a transaction is open
+    c.o.ub(0)                                   // the end-to-end sequence
+    c.o.ub(rows)                                // the current row (JDBC's rows processed)
+    c.o.ub(if len(c.batch) > 0 { 24381 } else { num })   // the error number (JDBC reads it here, python-oracledb below)
+    c.o.ubs(2)
+    c.o.ub(cursor)
+    c.o.ub(0)
+    c.o.zeros(6)
+    c.o.ubs(2)
+    c.o.zeros(1)
+    c.o.ubs(2)
+    c.o.ub(0)
+    c.o.u8(0)
+    c.o.u8(c.seq)                               // the call number: JDBC compares it with the request's sequence
+    c.o.ubs(2)
+    c.o.str2("")
+    let nb = len(c.batch)
+    c.o.ub(nb)                                  // the batch errors: codes, rows, messages
+    if nb > 0 {
+        c.o.u8(1)
+        for k in 0..nb { c.o.ub(c.batch[k].num) }
+    }
+    c.o.ub(nb)
+    if nb > 0 {
+        c.o.u8(1)
+        for k in 0..nb { c.o.ub(c.batch[k].offset) }
+    }
+    c.o.ub(nb)
+    if nb > 0 {
+        c.o.u8(1)
+        for k in 0..nb {
+            c.o.ub(len(c.batch[k].text))
+            c.o.bytes(c.batch[k].text)
+            c.o.zeros(2)
+        }
+    }
+    c.batch = []
+    c.o.ub(if nb > 0 { 24381 } else { num })
+    c.o.ub(rows)
+    if c.fv >= 14 { c.o.ubs(2) }
+    if nb > 0 { c.o.bytes(oraText(24381, "error(s) in array DML")) } else if num != 0 { c.o.bytes(text) }
+}
+
+// oraOf with what the connection knows: a table the user cannot see at all is ORA-00942, one it can read but not change ORA-01031.
+fn (c: mut &Conn) oraErr(e: &DbErr): OraErr {
+    if e.state == "42501" && strings.startsWith(&e.msg, "permission denied for table ") {
+        let t = e.msg[28..len(e.msg)].toStr()
+        match c.rowsOf("select has_table_privilege(current_user, " + lexdb_oraadm.qlit(&t) + ", 'select')") {
+            Ok(r) {
+                if len(r) == 1 && len(r[0]) == 1 {
+                    match r[0][0] {
+                        Val.Bool(b) { if !b { return OraErr{num: 942, text: "table or view does not exist"} } }
+                        else {}
+                    }
+                }
+            }
+            Err(_) {}
+        }
+    }
+    return oraOf(e, &c.user)
+}
+
+fn (c: mut &Conn) fail(e: &DbErr, cursor: int) {
+    let x = c.oraErr(e)
+    c.endCall(x.num, oraText(x.num, x.text), cursor, 0)
+}
+
+fn (c: mut &Conn) failOra(num: int, text: str, cursor: int) {
+    c.endCall(num, oraText(num, text), cursor, 0)
+}
+
+// STATUS: the reply that ends a call without an ERROR message.
+fn (c: mut &Conn) statusMsg() {
+    c.o.u8(tns.MT_STATUS)
+    c.o.ub(if c.sess.status() != 'I' { 0x2 } else { 0 })
+    c.o.ub(0)
+}
+
+fn (c: mut &Conn) params(kv: &[]tns.KeyValue) {
+    c.o.u8(tns.MT_PARAMETER)
+    c.o.ub(len(kv))
+    for p in kv { c.o.pair(p.key, p.value, p.flags) }
+}
+
+fn kv(k: str, v: str, flags: int): tns.KeyValue { return tns.KeyValue{key: k, value: v, flags: flags} }
+
+// ---- Protocol and DataTypes
+
+fn (c: mut &Conn) protocolReply() {
+    c.o.u8(tns.MT_PROTOCOL)
+    c.o.u8(6)
+    c.o.u8(0)
+    c.o.raw(PROTOCOL_BANNER)                    // JDBC reads at most 50 bytes of it, and takes a longer text for no NUL
+    c.o.u8(0)
+    c.o.u16le(tns.CHARSET_UTF8)
+    c.o.u8(0)                                   // server flags
+    c.o.u16le(0)                                // (no elements)
+    // the FDO: its 5th and 6th bytes are lengths (0), then the national character set at +3
+    var fdo: []byte = array(11, byte(0))
+    fdo[9] = byte((tns.CHARSET_UTF16 >> 8) & 0xff)
+    fdo[10] = byte(tns.CHARSET_UTF16 & 0xff)
+    c.o.u16be(len(fdo))
+    for b in fdo { append(mut &c.o.b, b) }
+    c.o.bytes(tns.compileCaps(FV_SERVER, false))
+    var rc = tns.runtimeCaps()
+    // no 32K strings: VARCHAR2 is 4000 bytes
+    var rb = strToBytes(rc)
+    rb[6] = byte(int(rb[6]) & ~0x04)
+    c.o.bytes(strFromBytes(&rb))
+}
+
+fn (c: mut &Conn) dataTypesReply(rq: &Req) {
+    if len(rq.caps) > 7 { c.fv = min(FV_SERVER, int(rq.caps[7])) }
+    c.o.u8(tns.MT_DATA_TYPES)
+    c.o.raw(rq.table)
+    // the table's SB1 entry (27): representation 1, universal, is JDBC's; python-oracledb's is Oracle's own (10)
+    var at = 0
+    c.o.sb1u = false
+    while at + 4 <= len(rq.table) {
+        let t = be16(rq.table, at)
+        let cv = be16(rq.table, at + 2)
+        if cv == 0 { at += 4 } else {
+            if t == 27 && at + 6 <= len(rq.table) { c.o.sb1u = be16(rq.table, at + 4) == 1 }
+            at += 8
+        }
+    }
+}
+
+// ---- authentication
+
+fn hexUpper(s: str): str { return strings.toUpperAscii(&(crypto.hex(&s))) }
+
+const IV0 = "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+
+fn random(n: int): str {
+    match crypto.randomBytes(n) {
+        Ok(b) { return b }
+        Err(_) { return strings.repeat("\x5a", n) }
+    }
+}
+
+// The salt of a user that has no verifier, the same each time: its failure
+// must look like any other, and never name a user as unknown.
+fn (c: &Conn) fakeSalt(user: str): str {
+    match crypto.hmacSha256(&c.secret, &("salt:" + strings.toLowerAscii(&user))) {
+        Ok(h) { return h[0..16] }
+        Err(_) { return strings.repeat("\x11", 16) }
+    }
+}
+
+// Phase one: the salt and the encrypted half of the session key.
+fn (c: mut &Conn) auth1(rq: &Req) {
+    let user = rq.user
+    let role = strings.toLowerAscii(&user)
+    if (rq.mode & (0x20 | 0x40 | 0x400000)) != 0 {
+        c.failOra(1031, "insufficient privileges", 0)
+        return
+    }
+    let conf = lexdb_wire.confOf(&c.st)
+    var found = false
+    var login = false
+    var ov = ""
+    match lexdb_exec.roles(&c.st) {
+        Ok(rs) {
+            for r in rs {
+                if r.name == role {
+                    found = true
+                    login = r.login
+                    ov = r.oraVerifier
+                }
+            }
+        }
+        Err(_) {}
+    }
+    let trust = conf.tcp != "scram-sha-256"
+    var salt = c.fakeSalt(user)
+    var count = lexdb_auth.ORA_COUNT
+    var hash = random(32)
+    if role == "sys" || (conf.requireTls && !c.secure) {
+        // never: the hash is one nobody knows
+    } else {
+        match lexdb_auth.parseOraVerifier(&ov) {
+            Some(v) {
+                if found {
+                    salt = v.salt
+                    count = v.count
+                    hash = v.hash
+                }
+            }
+            None {
+                if trust {
+                    // the key exchange needs a password: with none stored, the user's name
+                    match lexdb_auth.oraHash(&user, &salt, count) {
+                        Ok(h) { hash = h }
+                        Err(_) {}
+                    }
+                }
+            }
+        }
+    }
+    let partA = random(32)
+    var sk = ""
+    match crypto.aesCbcEncrypt(&hash, IV0, &partA, false) {
+        Ok(x) { sk = hexUpper(x) }
+        Err(_) {}
+    }
+    let csk = random(16)
+    c.auth = Auth{have: true, role: role, salt: salt, count: count, hash: hash, partA: partA, csk: csk, noLogin: found && !login}
+    var ps: []tns.KeyValue = []
+    append(mut &ps, kv("AUTH_VFR_DATA", hexUpper(salt), 0x4815))
+    append(mut &ps, kv("AUTH_SESSKEY", sk, 0))
+    append(mut &ps, kv("AUTH_PBKDF2_CSK_SALT", hexUpper(csk), 0))
+    append(mut &ps, kv("AUTH_PBKDF2_VGEN_COUNT", count.toStr(), 0))
+    append(mut &ps, kv("AUTH_PBKDF2_SDER_COUNT", "3", 0))
+    c.params(&ps)
+    c.statusMsg()
+}
+
+// Whether the phase-two pairs prove the password; the combined key when they do.
+fn (c: &Conn) proves(rq: &Req): Result[str, str] {
+    let a = &c.auth
+    if !a.have { return Err("no phase one") }
+    let sk = match crypto.unhex(&(pairOf(&rq.pairs, "AUTH_SESSKEY"))) {
+        Some(x) { x }
+        None { return Err("AUTH_SESSKEY") }
+    }
+    let pw = match crypto.unhex(&(pairOf(&rq.pairs, "AUTH_PASSWORD"))) {
+        Some(x) { x }
+        None { return Err("AUTH_PASSWORD") }
+    }
+    if len(sk) < 32 || len(sk) % 16 != 0 || len(pw) < 32 || len(pw) % 16 != 0 { return Err("lengths") }
+    let partB = match crypto.aesCbcDecrypt(&a.hash, IV0, sk[0..32], false) {
+        Ok(x) { x }
+        Err(_) { return Err("session key") }
+    }
+    let combo = match crypto.pbkdf2Sha512(&(hexUpper(partB + a.partA)), &a.csk, 3, 32) {
+        Ok(x) { x }
+        Err(_) { return Err("combined key") }
+    }
+    let plain = match crypto.aesCbcDecrypt(&combo, IV0, &pw, true) {
+        Ok(x) { x }
+        Err(_) { return Err("password") }
+    }
+    if len(plain) < 16 { return Err("password") }
+    let h = match lexdb_auth.oraHash(&plain[16..len(plain)], &a.salt, a.count) {
+        Ok(x) { x }
+        Err(_) { return Err("password") }
+    }
+    var diff = 0
+    for i in 0..32 { diff = diff | int(h[i] ^ a.hash[i]) }
+    if diff != 0 { return Err("wrong password") }
+    return Ok(combo)
+}
+
+// Phase two: the password proved, the session starts.
+fn (c: mut &Conn) auth2(rq: &Req) {
+    match c.proves(rq) {
+        Ok(combo) {
+            if c.auth.noLogin {
+                c.failOra(1045, "user " + strings.toUpperAscii(&c.auth.role) + " lacks CREATE SESSION privilege; logon denied", 0)
+                return
+            }
+            let resp = match crypto.aesCbcEncrypt(&combo, IV0, &(random(16) + "SERVER_TO_CLIENT"), true) {
+                Ok(x) { x }
+                Err(_) { "" }
+            }
+            c.sess.setUser(&c.auth.role)
+            c.user = c.auth.role
+            c.loggedIn = true
+            c.localZone = c.sess.zone().name
+            // a user that has a schema of its name works in it
+            let me = c.user
+            if c.schemaExists(&me) { c.nls.schema = me }
+            c.reapply()
+            var ps: []tns.KeyValue = []
+            append(mut &ps, kv("AUTH_SVR_RESPONSE", hexUpper(resp), 0))
+            append(mut &ps, kv("AUTH_VERSION_NO", VERSION_NO.toStr(), 0))
+            append(mut &ps, kv("AUTH_MAX_OPEN_CURSORS", MAX_OPEN_CURSORS.toStr(), 0))
+            append(mut &ps, kv("AUTH_SESSION_ID", c.sess.number().toStr(), 0))
+            append(mut &ps, kv("AUTH_SERIAL_NUM", "1", 0))
+            append(mut &ps, kv("AUTH_SC_SERVICE_NAME", SERVICE, 0))
+            append(mut &ps, kv("AUTH_SC_INSTANCE_NAME", SERVICE, 0))
+            append(mut &ps, kv("AUTH_SC_DB_UNIQUE_NAME", SERVICE, 0))
+            c.params(&ps)
+            c.statusMsg()
+        }
+        Err(_) {
+            c.auth = Auth{have: false, role: "", salt: "", count: 0, hash: "", partA: "", csk: "", noLogin: false}
+            c.failOra(1017, "invalid username/password; logon denied", 0)
+        }
+    }
+}
+
+// ---- statements
+
+fn emptyRes(tag: str): lexdb_exec.Res {
+    return lexdb_exec.Res{cols: [], rows: [], tag: tag, hasRows: false, copy: lexdb_exec.COPY_NONE}
+}
+
+// A statement of lexdb's own, run for its effect.
+fn (c: mut &Conn) simple(sql: str): Result[Unit, DbErr] {
+    let stmts = try lexdb_sql.parse(&sql)
+    let none: []Val = []
+    let nt: []int = []
+    for s in stmts { let r = try c.sess.run(&s, &none, &nt) }
+    return Ok(Unit{})
+}
+
+// ---- binds: the client's values as lexdb's
+
+type BV = value record { v: Val; oid: int }
+
+fn badBind(msg: str): DbErr { return lexdb_base.err("22P02", msg) }
+
+fn tnsErr(e: &tns.Error): DbErr { return lexdb_base.err("22P02", e.msg) }
+
+// One bind's value (None: NULL, which is also the empty string) as a lexdb value and its type (0: not told).
+fn bindVal(m: &BindMeta, raw: &Option[str]): Result[BV, DbErr] {
+    match raw {
+        None { return Ok(BV{v: Val.Null, oid: 0}) }
+        Some(b) {
+            let t = m.ora
+            if t == tns.T_VARCHAR || t == tns.T_CHAR || t == tns.T_LONG {
+                if m.csfrm == tns.CS_NCHAR {
+                    match tns.fromUtf16be(b) {
+                        Ok(x) { return Ok(BV{v: Val.Text(x), oid: 0}) }
+                        Err(e) { return Err(tnsErr(&e)) }
+                    }
+                }
+                if !strings.isValidUtf8(b) { return Err(badBind("invalid UTF-8 in a text bind")) }
+                return Ok(BV{v: Val.Text(b), oid: 0})
+            }
+            if t == tns.T_NUMBER || t == tns.T_BINARY_INTEGER {
+                match tns.decodeNumber(b) {
+                    Ok(n) {
+                        match n.int() {
+                            Some(i) { return Ok(BV{v: Val.Int(i), oid: lexdb_sql.OID_INT8}) }
+                            None {}
+                        }
+                        match n.decimal() {
+                            Ok(d) { return Ok(BV{v: Val.Num(d), oid: lexdb_sql.OID_NUMERIC}) }
+                            Err(_) { return Err(lexdb_base.err("22003", "numeric overflow")) }
+                        }
+                    }
+                    Err(e) { return Err(tnsErr(&e)) }
+                }
+            }
+            if t == tns.T_BINARY_DOUBLE {
+                match tns.decodeDouble(b) {
+                    Ok(x) { return Ok(BV{v: Val.Float(x), oid: lexdb_sql.OID_FLOAT8}) }
+                    Err(e) { return Err(tnsErr(&e)) }
+                }
+            }
+            if t == tns.T_BINARY_FLOAT {
+                match tns.decodeFloat(b) {
+                    Ok(x) { return Ok(BV{v: Val.Real(x), oid: lexdb_sql.OID_FLOAT4}) }
+                    Err(e) { return Err(tnsErr(&e)) }
+                }
+            }
+            if t == tns.T_RAW || t == tns.T_LONG_RAW { return Ok(BV{v: Val.Bytes(b), oid: lexdb_sql.OID_BYTEA}) }
+            if t == tns.T_BOOLEAN { return Ok(BV{v: Val.Bool(len(b) > 0 && int(b[len(b) - 1]) == 1), oid: lexdb_sql.OID_BOOL}) }
+            if t == tns.T_DATE || t == tns.T_TIMESTAMP || t == tns.T_TIMESTAMP_LTZ || t == tns.T_TIMESTAMP_TZ {
+                match tns.decodeStamp(b) {
+                    Ok(st) {
+                        match lexdb_time.tsOf(st.local) {
+                            Some(us) {
+                                if t == tns.T_TIMESTAMP_TZ { return Ok(BV{v: Val.Tstz(us - st.offset * 60000000), oid: lexdb_sql.OID_TSTZ}) }
+                                return Ok(BV{v: Val.Ts(us), oid: lexdb_sql.OID_TS})
+                            }
+                            None { return Err(lexdb_base.err("22008", "a date or timestamp bind out of range")) }
+                        }
+                    }
+                    Err(e) { return Err(tnsErr(&e)) }
+                }
+            }
+            if t == tns.T_INTERVAL_DS && len(b) == 11 {
+                let days = ((int(b[0]) << 24) | (int(b[1]) << 16) | (int(b[2]) << 8) | int(b[3])) - 0x80000000
+                let fr = ((int(b[7]) << 24) | (int(b[8]) << 16) | (int(b[9]) << 8) | int(b[10])) - 0x80000000
+                let us = (((int(b[4]) - 60) * 60 + (int(b[5]) - 60)) * 60 + (int(b[6]) - 60)) * 1000000 + fr / 1000
+                return Ok(BV{v: Val.Ival(lexdb_time.Ival{months: 0, days: days, us: us}), oid: lexdb_sql.OID_IVAL})
+            }
+            if t == tns.T_INTERVAL_YM && len(b) == 5 {
+                let y = ((int(b[0]) << 24) | (int(b[1]) << 16) | (int(b[2]) << 8) | int(b[3])) - 0x80000000
+                return Ok(BV{v: Val.Ival(lexdb_time.Ival{months: y * 12 + int(b[4]) - 60, days: 0, us: 0}), oid: lexdb_sql.OID_IVAL})
+            }
+            return Err(lexdb_base.err("0A000", "a bind of Oracle type " + tns.typeNameOf(t, m.csfrm) + " is not supported"))
+        }
+    }
+}
+
+// A value as the bind type m holds it on the wire (for RETURNING INTO).
+fn bytesAs(m: &BindMeta, v: &Val, oid: int, sess: &lexdb_exec.Session): Result[str, DbErr] {
+    let t = m.ora
+    let over = lexdb_base.err("22003", "numeric overflow")
+    if t == tns.T_NUMBER || t == tns.T_BINARY_INTEGER {
+        var d: Option[Decimal] = None
+        match v {
+            Val.Int(n) { d = Some(Decimal.fromInt(n)) }
+            Val.Num(x) { d = Some(x) }
+            Val.Bool(b) { d = Some(Decimal.fromInt(if b { 1 } else { 0 })) }
+            Val.Float(f) { d = Decimal.parse(&(f.toStr())).ok() }
+            Val.Real(f) { d = Decimal.parse(&(f.toStr())).ok() }
+            else { d = Decimal.parse(&(strings.trim(&(sess.text(v, oid))))).ok() }
+        }
+        match d {
+            Some(x) {
+                match tns.encodeNumber(&tns.numOfDecimal(x)) {
+                    Ok(b) { return Ok(b) }
+                    Err(_) { return Err(over) }
+                }
+            }
+            None { return Err(lexdb_base.err("22P02", "invalid number")) }
+        }
+    }
+    if t == tns.T_BINARY_DOUBLE || t == tns.T_BINARY_FLOAT {
+        var f = 0.0f
+        match v {
+            Val.Float(x) { f = x }
+            Val.Real(x) { f = x }
+            Val.Int(n) { f = float(n) }
+            Val.Num(x) { f = x.toFloat() }
+            else { f = Decimal.parse(&(strings.trim(&(sess.text(v, oid))))).map(fn(d: Decimal): float { return d.toFloat() }).unwrapOr(0.0f) }
+        }
+        if t == tns.T_BINARY_DOUBLE { return Ok(tns.encodeDouble(f)) }
+        return cellBytes(&Val.Real(f), &CT{kind: K_REAL, ora: t, size: 4, prec: 0, scale: 0}, oid, sess)
+    }
+    if t == tns.T_BOOLEAN {
+        match v {
+            Val.Bool(b) { return Ok(if b { "\x01" } else { "\x00" }) }
+            else { return Ok(if sess.text(v, oid) == "0" { "\x00" } else { "\x01" }) }
+        }
+    }
+    if t == tns.T_RAW || t == tns.T_LONG_RAW {
+        match v {
+            Val.Bytes(b) { return Ok(b) }
+            Val.Uuid(u) { return Ok(uuidBytes(&u)) }
+            else { return Ok(sess.text(v, oid)) }
+        }
+    }
+    if t == tns.T_DATE || t == tns.T_TIMESTAMP || t == tns.T_TIMESTAMP_LTZ || t == tns.T_TIMESTAMP_TZ {
+        var us = 0
+        var ok = true
+        match v {
+            Val.Date(d) { us = lexdb_time.dateToTs(d) }
+            Val.Ts(x) { us = x }
+            Val.Tstz(x) { us = x }
+            else { ok = false }
+        }
+        if ok {
+            let l = lexdb_time.localOf(us)
+            if t == tns.T_DATE { return Ok(tns.encodeDate(&l)) }
+            if t == tns.T_TIMESTAMP || t == tns.T_TIMESTAMP_LTZ { return Ok(tns.encodeTimestamp(&l)) }
+            match l.withOffset(0) {
+                Some(o) { return Ok(tns.encodeTimestampTz(&o)) }
+                None {}
+            }
+        }
+    }
+    if t == tns.T_INTERVAL_DS || t == tns.T_INTERVAL_YM {
+        match v {
+            Val.Ival(iv) { return Ok(intervalBytes(t, &iv)) }
+            else {}
+        }
+    }
+    var txt = sess.text(v, oid)
+    if m.csfrm == tns.CS_NCHAR {
+        match tns.toUtf16be(&txt) {
+            Ok(x) { txt = x }
+            Err(_) {}
+        }
+    }
+    return Ok(txt)
+}
+
+fn be32bytes(v: int, b: mut &[]byte) {
+    let x = v & 0xffffffff
+    append(b, byte((x >> 24) & 0xff))
+    append(b, byte((x >> 16) & 0xff))
+    append(b, byte((x >> 8) & 0xff))
+    append(b, byte(x & 0xff))
+}
+
+// An interval as INTERVAL DAY TO SECOND (11 bytes) or YEAR TO MONTH (5): every part takes the sign.
+fn intervalBytes(t: int, iv: &lexdb_time.Ival): str {
+    var b: []byte = []
+    if t == tns.T_INTERVAL_YM {
+        let neg = iv.months < 0
+        let m = if neg { -iv.months } else { iv.months }
+        let sg = if neg { -1 } else { 1 }
+        be32bytes((m / 12) * sg + 0x80000000, mut &b)
+        append(mut &b, byte((m % 12) * sg + 60))
+        return strFromBytes(&b)
+    }
+    let total = iv.days * 86400000000 + iv.us
+    let neg = total < 0
+    let a = if neg { -total } else { total }
+    let sg = if neg { -1 } else { 1 }
+    let secs = a / 1000000
+    let frac = (a % 1000000) * 1000
+    be32bytes((secs / 86400) * sg + 0x80000000, mut &b)
+    append(mut &b, byte(((secs / 3600) % 24) * sg + 60))
+    append(mut &b, byte(((secs / 60) % 60) * sg + 60))
+    append(mut &b, byte((secs % 60) * sg + 60))
+    be32bytes(frac * sg + 0x80000000, mut &b)
+    return strFromBytes(&b)
+}
+
+// ---- statements: the text as lexdb's, and how a call runs it
+
+// A statement of Oracle's text as lexdb's: a placeholder :1 or :name is $n (the nth one that is not
+// RETURNING INTO's), the INTO of RETURNING ... INTO and what follows it are cut, "FROM dual" is dropped.
+// Oracle's own words for the commonest syntax errors, which lexdb's parser reports alike (ORA-00900 stands for the rest):
+// a query with no FROM at all (a mistyped keyword: 923), FROM with nothing after it (903), a missing right parenthesis (907).
+fn syntaxRefined(sql: &str, e: &DbErr): DbErr {
+    if e.state != "42601" || !strings.startsWith(&e.msg, "syntax error") { return e }
+    if tns.statementKind(&(sql.toStr())) != tns.S_QUERY { return e }
+    let low = " " + strings.toLowerAscii(&(strings.trim(&(sql.toStr())))) + " "
+    let atEnd = strings.contains(&e.msg, "end of input")
+    var depth = 0
+    var inq = false
+    for k in 0..len(sql) {
+        if sql[k] == '\'' { inq = !inq }
+        if !inq && sql[k] == '(' { depth += 1 }
+        if !inq && sql[k] == ')' { depth -= 1 }
+    }
+    if depth > 0 { return lexdb_base.err("ORA00907", "missing right parenthesis") }
+    if atEnd && strings.endsWith(&low, " from ") { return lexdb_base.err("ORA00903", "invalid table name") }
+    if !strings.contains(&low, " from ") && !strings.contains(&low, "\nfrom ") && !strings.contains(&low, "\tfrom ") && !atEnd {
+        return lexdb_base.err("ORA00923", "FROM keyword not found where expected")
+    }
+    return e
+}
+
+fn (c: mut &Conn) prepare(i: int): Result[Unit, DbErr] {
+    if c.cursors[i].prepared { return Ok(Unit{}) }
+    let sql = c.cursors[i].sql
+    var out: []byte = []
+    var pos = 0
+    var n = 0
+    for st in c.cursors[i].sites {
+        if st.returning { break }
+        n += 1
+        appendStr(mut &out, sql[pos..st.start])
+        appendStr(mut &out, "$" + n.toStr())
+        pos = st.end
+    }
+    let into = c.cursors[i].into
+    let tail = if into >= pos { into } else { len(sql) }
+    appendStr(mut &out, sql[pos..tail])
+    var text = strFromBytes(&out)
+    let sk = tns.statementKind(&text)
+    if sk == tns.S_QUERY || sk == tns.S_DML {
+        // calls of stored functions with constant arguments are made now (and again at each execute)
+        let nf = c.nlsFormats()
+        lexdb_plsql.setNls(mut &c.pl, nf, &c.user)
+        let ep = lexdb_plsql.ensureProg(mut &c.prog, mut &c.pl, mut &c.sess)
+        let ex = try lexdb_plsql.expandCalls(&c.prog, mut &c.pl, mut &c.sess, &text)
+        if ex != text {
+            text = ex
+            c.cursors[i].dyn = true
+        }
+    }
+    var stmts: []lexdb_sql.Stmt = []
+    c.cursors[i].special = SP_NONE
+    if isAlterSession(&text) {
+        c.cursors[i].special = SP_ALTER_SESSION
+    } else if isAdminSql(&text) {
+        c.cursors[i].special = SP_ADMIN
+    } else {
+        match lexdb_sql.oraParseNls(&text, c.nlsFormats()) {
+            Ok(x) { stmts = x }
+            Err(e) { return Err(syntaxRefined(&text, &e)) }
+        }
+        if len(stmts) != 1 { return Err(lexdb_base.err("42601", "SQL command not properly ended")) }
+    }
+    c.cursors[i].stmts = stmts
+    c.cursors[i].prepared = true
+    return Ok(Unit{})
+}
+
+fn sameTypes(a: &[]int, b: &[]int): bool {
+    if len(a) != len(b) { return false }
+    for k in 0..len(a) { if a[k] != b[k] { return false } }
+    return true
+}
+
+fn setTypes(to: mut &[]int, from: &[]int) {
+    to = []
+    for x in from { append(to, x) }
+}
+
+type BatchErr = value record { offset: int; num: int; text: str }
+
+// What the runs of one statement came to.
+type Runs = record {
+    counts: []int               // rows each run affected
+    total: int
+    rets: [][][]Val             // each run's RETURNING rows
+    errs: []BatchErr            // runs that failed, with batch errors on
+    failed: Option[DbErr]       // the run that stopped the call
+    res: lexdb_exec.Res         // a query's or a statement's last result
+}
+
+fn newRuns(): Runs {
+    return Runs{counts: [], total: 0, rets: [], errs: [], failed: None, res: emptyRes("")}
+}
+
+// Cursor i's statement run once per element of params, on lexdb's transactions: a DML statement starts one
+// (committed when commit is set), DDL ends the open one first. A DML run that fails is undone alone: with
+// batch errors on it is recorded and the next one goes on, else the call ends there (the runs before it stay).
+fn (c: mut &Conn) runCursor(i: int, kind: int, params: &[][]Val, ptypes: &[][]int, commit: bool, batch: bool): Runs {
+    var out = newRuns()
+    var stmts = replace(mut &c.cursors[i].stmts, [])
+    var pc = replace(mut &c.cursors[i].pc, lexdb_exec.oneShot())
+    let n = max(len(params), 1)
+    let none: []Val = []
+    let nt: []int = []
+    var rets = false
+    for st in c.cursors[i].sites { if st.returning { rets = true } }
+    if c.cursors[i].special == SP_ALTER_SESSION {
+        let asql = c.cursors[i].sql
+        match c.alterSession(&asql) {
+            Ok(_) { out.res = emptyRes("ALTER SESSION") }
+            Err(e) { out.failed = Some(e) }
+        }
+    } else if c.cursors[i].special == SP_ADMIN {
+        // DDL: the open transaction is committed first
+        if c.sess.status() != 'I' {
+            match c.simple("COMMIT") {
+                Ok(_) {}
+                Err(e) { out.failed = Some(e) }
+            }
+        }
+        if out.failed.isNone() {
+            let asql = c.cursors[i].sql
+            match c.admin(&asql) {
+                Ok(_) { out.res = emptyRes("OK") }
+                Err(e) { out.failed = Some(e) }
+            }
+        }
+    } else if kind == tns.S_DML {
+        let began = c.sess.status() == 'I'
+        var ok = true
+        if began {
+            match c.simple("BEGIN") {
+                Ok(_) {}
+                Err(e) {
+                    out.failed = Some(e)
+                    ok = false
+                }
+            }
+        }
+        if ok {
+            let sp = n > 1 || !began
+            for k in 0..n {
+                if sp {
+                    match c.simple("SAVEPOINT lxl_stmt") {
+                        Ok(_) {}
+                        Err(e) {
+                            out.failed = Some(e)
+                            break
+                        }
+                    }
+                }
+                if len(ptypes) > 0 && !sameTypes(&c.cursors[i].pts, &ptypes[k]) { pc = lexdb_exec.newPlanCache() }
+                if len(ptypes) > 0 { setTypes(mut &c.cursors[i].pts, &ptypes[k]) }
+                match c.sess.runCached(&stmts[0], if len(params) > 0 { &params[k] } else { &none }, if len(ptypes) > 0 { &ptypes[k] } else { &nt }, mut &pc) {
+                    Ok(rr) {
+                        var r = rr
+                        if sp { let x = c.simple("RELEASE SAVEPOINT lxl_stmt") }
+                        let cnt = tagCount(&r.tag)
+                        append(mut &out.counts, cnt)
+                        out.total += cnt
+                        if rets { append(mut &out.rets, replace(mut &r.rows, [])) }
+                        out.res = r
+                    }
+                    Err(e) {
+                        if sp {
+                            let x = c.simple("ROLLBACK TO SAVEPOINT lxl_stmt")
+                            let y = c.simple("RELEASE SAVEPOINT lxl_stmt")
+                        }
+                        if batch {
+                            let x = oraOf(&e, &c.user)
+                            append(mut &out.errs, BatchErr{offset: k, num: x.num, text: oraText(x.num, x.text)})
+                            append(mut &out.counts, 0)
+                            continue
+                        }
+                        out.failed = Some(e)
+                        break
+                    }
+                }
+            }
+            if began && out.total == 0 && c.sess.status() != 'I' && (out.failed.isSome() || len(out.errs) == n) {
+                let x = c.simple("ROLLBACK")
+                c.nls.redo = c.nls.active()
+            }
+        }
+    } else {
+        if kind == tns.S_DDL { lexdb_plsql.noteDdl(mut &c.pl) }
+        if kind == tns.S_DDL && c.sess.status() != 'I' {
+            match c.simple("COMMIT") {
+                Ok(_) {}
+                Err(e) { out.failed = Some(e) }
+            }
+        }
+        // SELECT ... FOR UPDATE and LOCK TABLE hold their locks to the end of the transaction: one is begun
+        // when the session is idle (the client's COMMIT or ROLLBACK, or the call's autocommit, ends it)
+        if out.failed.isNone() && kind != tns.S_DDL && c.sess.status() == 'I' && len(stmts) > 0 {
+            let first = strings.toUpperAscii(&(strings.trim(&c.cursors[i].sql)))
+            if stmts[0].lockMode != 0 || strings.startsWith(&first, "LOCK ") {
+                match c.simple("BEGIN") {
+                    Ok(_) {}
+                    Err(e) { out.failed = Some(e) }
+                }
+            }
+        }
+        // a query that fails in an open transaction must not end it, as it would in PostgreSQL's
+        // (not SAVEPOINT, ROLLBACK TO or RELEASE: the guard's own release would drop the savepoint the statement makes)
+        let up = strings.toUpperAscii(&(strings.trim(&c.cursors[i].sql)))
+        let sv = strings.startsWith(&up, "SAVEPOINT") || strings.startsWith(&up, "ROLLBACK") || strings.startsWith(&up, "RELEASE")
+        let guard = out.failed.isNone() && kind != tns.S_DDL && !sv && c.sess.status() != 'I'
+        if guard {
+            match c.simple("SAVEPOINT lxl_stmt") {
+                Ok(_) {}
+                Err(e) { out.failed = Some(e) }
+            }
+        }
+        if out.failed.isNone() {
+            if len(ptypes) > 0 && !sameTypes(&c.cursors[i].pts, &ptypes[0]) { pc = lexdb_exec.newPlanCache() }
+            if len(ptypes) > 0 { setTypes(mut &c.cursors[i].pts, &ptypes[0]) }
+            match c.sess.runCached(&stmts[0], if len(params) > 0 { &params[0] } else { &none }, if len(ptypes) > 0 { &ptypes[0] } else { &nt }, mut &pc) {
+                Ok(r) {
+                    out.res = r
+                    if guard { let x = c.simple("RELEASE SAVEPOINT lxl_stmt") }
+                }
+                Err(e) {
+                    out.failed = Some(e)
+                    if guard {
+                        let x = c.simple("ROLLBACK TO SAVEPOINT lxl_stmt")
+                        let y = c.simple("RELEASE SAVEPOINT lxl_stmt")
+                    }
+                }
+            }
+        }
+    }
+    c.cursors[i].stmts = stmts
+    c.cursors[i].pc = pc
+    if commit && out.failed.isNone() && c.sess.status() != 'I' {
+        match c.simple("COMMIT") {
+            Ok(_) {}
+            Err(e) { out.failed = Some(e) }
+        }
+    }
+    return out
+}
+
+fn (c: &Conn) find(id: int): int {
+    for i in 0..len(c.cursors) { if c.cursors[i].id == id { return i } }
+    return -1
+}
+
+fn (c: mut &Conn) closeCursor(id: int) {
+    let i = c.find(id)
+    if i < 0 { return }
+    let last = pop(mut &c.cursors)
+    if i < len(c.cursors) { c.cursors[i] = last }
+}
+
+// The rows of cursor i from its position, at most n, then ERROR: 0 when there are more
+// rows, 1403 when there are none left.
+// The ROW_DATA message of cursor i's current row.
+fn (c: mut &Conn) rowBytes(i: int, o: mut &Out) {
+    let pos = c.cursors[i].pos
+    o.u8(tns.MT_ROW_DATA)
+    for j in 0..len(c.cursors[i].rows[pos]) {
+        let t = c.cursors[i].ts[j]
+        // the type the client defined the column in (a LOB column: a locator or LONG)
+        let mode = if j < len(c.cursors[i].modes) { c.cursors[i].modes[j] } else { 0 }
+        let long = mode == tns.T_LONG || mode == tns.T_LONG_RAW
+        if lexdb_exec.isNull(&c.cursors[i].rows[pos][j]) {
+            o.u8(0)
+            if long { o.ubs(2) }
+            continue
+        }
+        if mode == tns.T_CLOB || mode == tns.T_BLOB {
+            let v = c.cursors[i].rows[pos][j]
+            let oid = c.cursors[i].cols[j].oid
+            let data = if t.ora == tns.T_BLOB { rawOf(&v) } else { c.sess.text(&v, oid) }
+            c.putLocator(data, t.ora == tns.T_BLOB, false, mut &o)
+            continue
+        }
+        match cellBytes(&c.cursors[i].rows[pos][j], &t, c.cursors[i].cols[j].oid, &c.sess) {
+            Ok(b) { o.bytes(b) }
+            Err(_) { o.u8(0) }
+        }
+        if long { o.ubs(2) }
+    }
+}
+
+fn (c: mut &Conn) sendRows(i: int, n: int) {
+    var sent = 0
+    let total = len(c.cursors[i].rows)
+    if n > 0 && c.cursors[i].pos < total {
+        c.o.u8(tns.MT_ROW_HEADER)
+        c.o.u8(0)
+        c.o.ubs(4)
+        c.o.ub(0)
+        c.o.ub(0)
+    }
+    while sent < n && c.cursors[i].pos < total {
+        var ob = newOut()
+        ob.lobPre = c.cursors[i].lobPre
+        c.rowBytes(i, mut &ob)
+        c.o.raw(strFromBytes(&ob.b))
+        c.cursors[i].pos += 1
+        sent += 1
+    }
+    let id = c.cursors[i].id
+    let pos = c.cursors[i].pos
+    if pos >= total {
+        c.cursors[i].rows = []
+        c.endCall(1403, oraText(1403, "no data found"), id, pos)
+    } else {
+        c.endCall(0, "", id, pos)
+    }
+}
+
+fn (c: mut &Conn) execute(rq: &Req) {
+    var i = -1
+    if rq.parse {
+        // the cursor named, parsed again, or a new one
+        if rq.cursor != 0 { i = c.find(rq.cursor) }
+        if i < 0 {
+            if len(c.cursors) >= MAX_OPEN_CURSORS {
+                c.failOra(1000, "maximum open cursors exceeded", 0)
+                return
+            }
+            c.nextCursor += 1
+            append(mut &c.cursors, newCursor(c.nextCursor, rq.sql))
+            i = len(c.cursors) - 1
+        }
+        if c.cursors[i].sql != rq.sql { c.cursors[i].prepared = false }
+        c.cursors[i].sql = rq.sql
+        c.cursors[i].sites = []
+        for st in rq.sites { append(mut &c.cursors[i].sites, st) }
+        c.cursors[i].into = rq.into
+        c.cursors[i].dirs = []
+        if !rq.hasMeta { c.cursors[i].meta = [] }
+    } else {
+        i = c.find(rq.cursor)
+        if i < 0 {
+            c.failOra(1001, "invalid cursor", rq.cursor)
+            return
+        }
+    }
+    let id = c.cursors[i].id
+    if !rq.parse && (rq.options & 0x20) == 0 && c.cursors[i].query && len(c.cursors[i].ts) > 0 && len(c.cursors[i].sql) == 0 {
+        // a REF CURSOR or an implicit result the client reads: no statement to run, only its rows
+        c.sendRows(i, max(rq.prefetch, 1))
+        return
+    }
+    if rq.hasMeta {
+        c.cursors[i].meta = []
+        for m in rq.meta { append(mut &c.cursors[i].meta, m) }
+    }
+    if rq.hasDefs {
+        // the client names the types it wants the columns in (it does for a LOB column): the rows kept from the
+        // statement's run are read by the FETCHes that follow
+        var modes: []int = []
+        var lp = false
+        for m in rq.defs {
+            append(mut &modes, m.ora)
+            if m.pre > 0 && (m.ora == tns.T_CLOB || m.ora == tns.T_BLOB) { lp = true }
+        }
+        c.cursors[i].lobPre = lp
+        if len(c.cursors[i].ts) > 0 {
+            c.cursors[i].modes = modes
+            c.cursors[i].pos = 0
+            // (JDBC takes a describe here as a change of the columns, and drops the types it has made for them)
+            if !c.o.sb1u { c.o.describe(&c.cursors[i].cols, &c.cursors[i].ts, c.fv) }
+            if (rq.options & OPT_FETCH) != 0 {
+                // JDBC defines the columns and asks for the rows in the same call (the count is the call's iterations)
+                c.sendRows(i, max(rq.prefetch, rq.iters))
+                return
+            }
+            c.endCall(0, "", id, 0)
+            return
+        }
+    }
+    if c.cursors[i].dyn { c.cursors[i].prepared = false }
+    let sql = c.cursors[i].sql
+    var kind = tns.statementKind(&sql)
+    if kind == tns.S_OTHER && len(lexdb_plsql.execToBlock(&sql)) > 0 { kind = tns.S_PLSQL }
+    if c.nls.redo { c.reapply() }
+    if kind == tns.S_PLSQL {
+        c.runPlsql(i, rq)
+        return
+    }
+    if kind == tns.S_DDL {
+        let ud = lexdb_plsql.unitDdl(&sql)
+        if ud != 0 {
+            c.unitDdl(ud, &sql, id)
+            return
+        }
+    }
+    match c.prepare(i) {
+        Ok(_) {}
+        Err(e) {
+            c.cursors[i].prepared = false
+            c.fail(&e, id)
+            return
+        }
+    }
+    // the binds: each run's values, in the order of the placeholders that are not RETURNING's
+    var plain: []int = []
+    var nret = 0
+    for k in 0..len(c.cursors[i].sites) {
+        if c.cursors[i].sites[k].returning { nret += 1 } else { append(mut &plain, k) }
+    }
+    if len(c.cursors[i].meta) < len(c.cursors[i].sites) || (len(plain) > 0 && len(rq.vals) == 0) {
+        c.failOra(1008, "not all variables bound", id)
+        return
+    }
+    var params: [][]Val = []
+    var ptypes: [][]int = []
+    for row in rq.vals {
+        var vs: []Val = []
+        var ts: []int = []
+        for q in 0..len(plain) {
+            var bm = c.cursors[i].meta[plain[q]]
+            var raw = row[q]
+            if bm.ora == tns.T_CLOB || bm.ora == tns.T_BLOB {
+                // a LOB bind is a locator: its value
+                match row[q] {
+                    Some(loc) {
+                        let li = c.findLob(idOfLocator(&loc))
+                        if li < 0 {
+                            c.failOra(22275, "invalid LOB locator specified", id)
+                            return
+                        }
+                        raw = Some(c.lobs[li].data)
+                    }
+                    None {}
+                }
+                bm = BindMeta{ora: if bm.ora == tns.T_BLOB { tns.T_RAW } else { tns.T_VARCHAR }, csfrm: tns.CS_IMPLICIT, size: bm.size, array: false, pre: 0}
+            }
+            match bindVal(&bm, &raw) {
+                Ok(b) {
+                    append(mut &vs, b.v)
+                    append(mut &ts, b.oid)
+                }
+                Err(e) {
+                    c.fail(&e, id)
+                    return
+                }
+            }
+        }
+        append(mut &params, vs)
+        append(mut &ptypes, ts)
+    }
+    let query = kind == tns.S_QUERY
+    var runs = c.runCursor(i, kind, &params, &ptypes, (rq.options & OPT_COMMIT) != 0, rq.batchErrors && !query)
+    match runs.failed {
+        Some(e) {
+            var x = c.oraErr(&e)
+            let jj = c.find(id)
+            if x.num == 1400 && jj >= 0 && (strings.startsWith(&strings.toLowerAscii(&(strings.trim(&c.cursors[jj].sql))), "update") || e.context == "update") {
+                x = OraErr{num: 1407, text: "cannot update (" + x.text[strings.indexOf(&x.text, "(", 0) + 1..len(x.text) - 1].toStr() + ") to NULL"}
+            }
+            c.endCall(x.num, oraText(x.num, x.text), id, runs.total)
+            return
+        }
+        None {}
+    }
+    var res = replace(mut &runs.res, emptyRes(""))
+    let j = c.find(id)
+    if query && res.hasRows {
+        c.cursors[j].query = true
+        let ts = colTypes(&res.cols, &res.rows, c.fv, &c.sess)
+        // the client keeps the columns of a cursor it runs again: told again when they differ
+        var same = len(ts) == len(c.cursors[j].ts) && len(res.cols) == len(c.cursors[j].cols)
+        if same {
+            for k in 0..len(ts) {
+                let a = ts[k]
+                let b = c.cursors[j].ts[k]
+                if a.ora != b.ora || a.size != b.size || a.prec != b.prec || a.scale != b.scale || res.cols[k].label() != c.cursors[j].cols[k].label() { same = false }
+            }
+        }
+        if rq.parse || !same { c.o.describe(&res.cols, &ts, c.fv) }
+        c.cursors[j].cols = replace(mut &res.cols, [])
+        c.cursors[j].rows = replace(mut &res.rows, [])
+        c.cursors[j].pos = 0
+        var hasLob = false
+        for t in ts { if t.ora == tns.T_CLOB || t.ora == tns.T_BLOB { hasLob = true } }
+        if rq.parse || !same || !hasLob { c.cursors[j].modes = [] }
+        c.cursors[j].ts = ts
+        if hasLob {
+            // the client defines these columns next (or has: then its rows come by FETCH as well)
+            c.endCall(0, "", id, 0)
+            return
+        }
+        c.sendRows(j, max(rq.prefetch, rq.n))    // JDBC sends no FETCH bit and asks for its prefetch rows with the run
+        return
+    }
+    c.cursors[j].query = false
+    c.cursors[j].count = runs.total
+    if len(runs.rets) > 0 {
+        // RETURNING INTO: for each run a ROW_DATA, for each bind its row count and its values
+        for r in 0..len(runs.rets) {
+            let rows = &runs.rets[r]
+            c.o.u8(tns.MT_ROW_DATA)
+            for k in 0..nret {
+                let m = c.cursors[j].meta[len(plain) + k]
+                c.o.ub(len(rows))
+                for row in rows {
+                    var cell = Val.Null
+                    var oid = 0
+                    if k < len(row) {
+                        cell = row[k]
+                        if k < len(res.cols) { oid = res.cols[k].oid }
+                    }
+                    if lexdb_exec.isNull(&cell) {
+                        c.o.u8(0)
+                    } else {
+                        match bytesAs(&m, &cell, oid, &c.sess) {
+                            Ok(b) { c.o.bytes(b) }
+                            Err(_) { c.o.u8(0) }
+                        }
+                    }
+                    c.o.u8(0)                   // the length the value had when cut to the buffer: none was
+                }
+            }
+        }
+    }
+    if rq.rowCounts {
+        c.o.u8(tns.MT_PARAMETER)
+        if c.o.sb1u {
+            // JDBC sets the flag on every DML statement and reads six words (the second pair of the SCN, then the cursor) first
+            c.o.ub(6)
+            c.o.ub(0)
+            c.o.ub(0)
+            c.o.ub(id)
+            c.o.ubs(3)
+            c.o.ubs(3)
+        } else {
+            c.o.ubs(4)
+        }
+        c.o.ub(len(runs.counts))
+        for n in runs.counts { c.o.ub(n) }
+    }
+    if len(runs.errs) > 0 { c.batch = replace(mut &runs.errs, []) }
+    c.endCall(0, "", id, runs.total)
+}
+
+fn (c: mut &Conn) fetch(rq: &Req) {
+    let i = c.find(rq.cursor)
+    if i < 0 {
+        c.failOra(1001, "invalid cursor", rq.cursor)
+        return
+    }
+    if !c.cursors[i].query {
+        c.failOra(1002, "fetch out of sequence", rq.cursor)
+        return
+    }
+    c.sendRows(i, rq.n)
+}
+
+// ---- PL/SQL (O6)
+
+// A cursor the client is handed (a REF CURSOR OUT, an implicit result): the one that holds its rows now; its id.
+fn (c: mut &Conn) handOut(var co: lexdb_plsql.CurOut): int {
+    c.nextCursor += 1
+    var cu = newCursor(c.nextCursor, "")
+    var cols = replace(mut &co.cols, [])
+    var rows = replace(mut &co.rows, [])
+    cu.ts = colTypes(&cols, &rows, c.fv, &c.sess)
+    cu.cols = cols
+    cu.rows = rows
+    cu.query = true
+    cu.prepared = true
+    append(mut &c.cursors, cu)
+    return c.nextCursor
+}
+
+// A REF CURSOR value on the wire: its columns and its id.
+fn (c: mut &Conn) putCursor(id: int) {
+    let j = c.find(id)
+    c.o.u8(1)
+    c.o.describeBody(&c.cursors[j].cols, &c.cursors[j].ts, c.fv)
+    c.o.ub(id)
+}
+
+fn (c: mut &Conn) plsqlOuts(i: int, res: &lexdb_plsql.BlockRes, curIds: &[]int) {
+    let n = len(res.outs)
+    if n == 0 { return }
+    let meta = &c.cursors[i].meta
+    c.o.u8(tns.MT_IO_VECTOR)
+    c.o.u8(0)
+    c.o.ub(n % 256)
+    c.o.ub(n / 256)
+    c.o.ubs(4)
+    var any = false
+    for b in res.outs {
+        c.o.u8(b.dir)
+        if b.dir != 32 { any = true }
+    }
+    if !any { return }
+    c.o.u8(tns.MT_ROW_DATA)
+    for k in 0..n {
+        let b = &res.outs[k]
+        if b.dir == 32 { continue }
+        let m = c.cursors[i].meta[k]
+        if m.ora == tns.T_CURSOR {
+            c.putCursor(curIds[k])
+            c.o.u8(0)
+            continue
+        }
+        if b.isArr {
+            c.o.ub(len(b.arr))
+            for e in b.arr {
+                if lexdb_exec.isNull(&e) { c.o.u8(0) } else {
+                    match bytesAs(&m, &e, lexdb_exec.kindOid(&e), &c.sess) {
+                        Ok(x) { c.o.bytes(x) }
+                        Err(_) { c.o.u8(0) }
+                    }
+                }
+                c.o.u8(0)
+            }
+            continue
+        }
+        if lexdb_exec.isNull(&b.v) {
+            c.o.u8(0)
+        } else {
+            match bytesAs(&m, &b.v, lexdb_exec.kindOid(&b.v), &c.sess) {
+                Ok(x) { c.o.bytes(x) }
+                Err(_) { c.o.u8(0) }
+            }
+        }
+        c.o.u8(0)
+    }
+}
+
+// EXECUTE of a PL/SQL block (or CALL): its binds in, the block run, the OUT binds back.
+fn (c: mut &Conn) runPlsql(i: int, rq: &Req) {
+    let id = c.cursors[i].id
+    let sql0 = c.cursors[i].sql
+    var sql = sql0
+    if strings.startsWith(&(strings.toUpperAscii(&(strings.trim(&sql0)))), "CALL") { sql = lexdb_plsql.callToBlock(&sql0) }
+    let eb = lexdb_plsql.execToBlock(&sql0)
+    if len(eb) > 0 { sql = eb }
+    let ns = len(c.cursors[i].sites)
+    var needVals = false
+    for k in 0..ns { if !(len(c.cursors[i].dirs) > k && c.cursors[i].dirs[k] == 16) { needVals = true } }
+    if len(c.cursors[i].meta) < ns || (needVals && len(rq.vals) == 0) {
+        c.failOra(1008, "not all variables bound", id)
+        return
+    }
+    let runs = max(len(rq.vals), 1)
+    var res = lexdb_plsql.BlockRes{err: None, outs: [], curs: [], implicit: [], rows: 0}
+    if c.nls.redo { c.reapply() }
+    let nf = c.nlsFormats()
+    lexdb_plsql.setNls(mut &c.pl, nf, &c.user)
+    match lexdb_plsql.ensureProg(mut &c.prog, mut &c.pl, mut &c.sess) {
+        Ok(_) {}
+        Err(e) {
+            c.fail(&e, id)
+            return
+        }
+    }
+    // each run of an array execution (executemany): the block run again with the next row's values; the last run's OUT binds are the call's
+    for run in 0..runs {
+        var binds: []lexdb_plsql.BindIn = []
+        for k in 0..ns {
+            var bm = c.cursors[i].meta[k]
+            var raw: Option[str] = None
+            if len(rq.vals) > run && k < len(rq.vals[run]) { raw = rq.vals[run][k] }
+            let name = c.cursors[i].sites[k].name
+            if bm.ora == tns.T_CURSOR {
+                append(mut &binds, lexdb_plsql.BindIn{name: name, v: Val.Null, array: false, cursor: true})
+                continue
+            }
+            if bm.array {
+                append(mut &binds, lexdb_plsql.BindIn{name: name, v: Val.Null, array: true, cursor: false})
+                continue
+            }
+            if bm.ora == tns.T_CLOB || bm.ora == tns.T_BLOB {
+                match raw {
+                    Some(loc) {
+                        let li = c.findLob(idOfLocator(&loc))
+                        if li < 0 {
+                            c.failOra(22275, "invalid LOB locator specified", id)
+                            return
+                        }
+                        raw = Some(c.lobs[li].data)
+                    }
+                    None {}
+                }
+                bm = BindMeta{ora: if bm.ora == tns.T_BLOB { tns.T_RAW } else { tns.T_VARCHAR }, csfrm: tns.CS_IMPLICIT, size: bm.size, array: false, pre: 0}
+            }
+            match bindVal(&bm, &raw) {
+                Ok(b) { append(mut &binds, lexdb_plsql.BindIn{name: name, v: b.v, array: false, cursor: false}) }
+                Err(e) {
+                    c.fail(&e, id)
+                    return
+                }
+            }
+        }
+        res = lexdb_plsql.runBlock(&c.prog, mut &c.pl, mut &c.sess, &sql, &binds, (rq.options & OPT_COMMIT) != 0)
+        if res.err.isSome() { break }
+    }
+    match res.err {
+        Some(e) {
+            let fe = lexdb_plsql.finalError(&e)
+            c.endCall(fe.num, oraText(fe.num, fe.text), id, 0)
+            return
+        }
+        None {}
+    }
+    var r = res
+    let j = c.find(id)
+    c.cursors[j].dirs = []
+    for b in r.outs { append(mut &c.cursors[j].dirs, b.dir) }
+    var curIds: []int = []
+    var made: []int = []
+    for k in 0..len(r.outs) {
+        var cid = 0
+        if r.outs[k].cur >= 0 {
+            cid = c.handOut(replace(mut &r.curs[r.outs[k].cur], lexdb_plsql.CurOut{cols: [], rows: []}))
+        } else if k < len(c.cursors[j].meta) && c.cursors[j].meta[k].ora == tns.T_CURSOR && r.outs[k].dir != 32 {
+            cid = c.handOut(lexdb_plsql.CurOut{cols: [], rows: []})
+        }
+        append(mut &curIds, cid)
+    }
+    var implicit: []int = []
+    for x in 0..len(r.implicit) {
+        append(mut &implicit, c.handOut(replace(mut &r.implicit[x], lexdb_plsql.CurOut{cols: [], rows: []})))
+    }
+    c.plsqlOuts(c.find(id), &r, &curIds)
+    if len(implicit) > 0 {
+        c.o.u8(tns.MT_IMPLICIT_RESULTSET)
+        c.o.ub(len(implicit))
+        for cid in implicit {
+            let q = c.find(cid)
+            c.o.u8(0)
+            c.o.describeBody(&c.cursors[q].cols, &c.cursors[q].ts, c.fv)
+            c.o.ub(cid)
+        }
+    }
+    c.cursors[c.find(id)].query = false
+    c.endCall(0, "", id, 0)
+}
+
+// CREATE / DROP / ALTER ... COMPILE of a procedure or function.
+fn (c: mut &Conn) unitDdl(ud: int, sql: &str, id: int) {
+    if c.sess.status() != 'I' {
+        match c.simple("COMMIT") {
+            Ok(_) {}
+            Err(e) {
+                c.fail(&e, id)
+                return
+            }
+        }
+    }
+    if c.nls.redo { c.reapply() }
+    let nf = c.nlsFormats()
+    lexdb_plsql.setNls(mut &c.pl, nf, &c.user)
+    var r: Result[bool, DbErr] = Ok(false)
+    match lexdb_plsql.ensureProg(mut &c.prog, mut &c.pl, mut &c.sess) {
+        Ok(_) {}
+        Err(e) { r = Err(e) }
+    }
+    if r.isOk() {
+        if ud == 1 { r = lexdb_plsql.createUnit(&c.prog, mut &c.pl, mut &c.sess, sql, c.isSuper()) }
+        else if ud == 2 {
+            match lexdb_plsql.dropUnit(mut &c.pl, sql, c.isSuper()) {
+                Ok(_) {}
+                Err(e) { r = Err(e) }
+            }
+        }
+    }
+    match r {
+        Ok(warn) {
+            if warn {
+                // stored, but invalid: ORA-24344 as a warning of the call
+                let wt = oraText(24344, "success with compilation error")
+                c.o.u8(tns.MT_WARNING)
+                c.o.ub(24344)
+                c.o.ub(len(wt))
+                c.o.ub(0)
+                c.o.bytes(wt)
+            }
+            c.endCall(0, "", id, 0)
+        }
+        Err(e) {
+            let fe = lexdb_plsql.finalError(&e)
+            c.endCall(fe.num, oraText(fe.num, fe.text), id, 0)
+        }
+    }
+}
+
+// COMMIT or ROLLBACK as a function.
+fn (c: mut &Conn) finish(commit: bool) {
+    if !commit { c.nls.redo = c.nls.active() }
+    if c.sess.status() != 'I' {
+        match c.simple(if commit { "COMMIT" } else { "ROLLBACK" }) {
+            Ok(_) {}
+            Err(e) {
+                c.fail(&e, 0)
+                return
+            }
+        }
+    }
+    c.endCall(0, "", 0, 0)
+}
+
+// ---- ALTER SESSION and the session's state (O5)
+
+fn oraE(num: int, msg: str): DbErr { return lexdb_base.err("ORA" + pad5(num), msg) }
+
+// The rows a statement of lexdb's own gives.
+fn (c: mut &Conn) rowsOf(sql: str): Result[[][]Val, DbErr] {
+    let stmts = try lexdb_sql.parse(&sql)
+    let none: []Val = []
+    let nt: []int = []
+    var out: [][]Val = []
+    for s in stmts {
+        var r = try c.sess.run(&s, &none, &nt)
+        out = replace(mut &r.rows, [])
+    }
+    return Ok(out)
+}
+
+// Whether the login is a superuser (Oracle's DBA); a trust login that has no role is one.
+fn (c: mut &Conn) isSuper(): bool {
+    let me = strings.toLowerAscii(&c.user)
+    match lexdb_exec.roles(&c.st) {
+        Ok(rs) { for r in rs { if r.name == me { return r.superuser } } }
+        Err(_) { return false }
+    }
+    // no such role: a login under trust (as lexdb's own role statements take it: no role is a DBA)
+    return true
+}
+
+fn (c: mut &Conn) hasRole(n: &str): bool {
+    match lexdb_exec.roles(&c.st) {
+        Ok(rs) { for r in rs { if r.name == n { return true } } }
+        Err(_) {}
+    }
+    return false
+}
+
+fn (c: mut &Conn) schemaExists(n: &str): bool {
+    match c.rowsOf("select 1 from pg_namespace where nspname = " + lexdb_oraadm.qlit(n)) {
+        Ok(r) { return len(r) > 0 }
+        Err(_) { return false }
+    }
+}
+
+// TIME_ZONE's value as lexdb's TimeZone setting: 'LOCAL', 'DBTIMEZONE', '+hh:mm' or a region.
+fn zoneSetting(v: &str, local: &str): Result[str, DbErr] {
+    let u = strings.toUpperAscii(&(v.toStr()))
+    if u == "LOCAL" { return Ok(local.toStr()) }
+    if u == "DBTIMEZONE" { return Ok("UTC") }
+    let sign = len(v) > 0 && (v[0] == '+' || v[0] == '-')
+    let body = if sign { v[1..len(v)].toStr() } else { v.toStr() }
+    let at = strings.indexOf(&body, ":", 0)
+    if at > 0 && at < len(body) - 1 {
+        let hh = strings.parseIntOpt(&(body[0..at].toStr()))
+        let mm = strings.parseIntOpt(&(body[at + 1..len(body)].toStr()))
+        if hh.isSome() && mm.isSome() {
+            if hh.unwrap() > 15 { return Err(oraE(1874, "time zone hour must be between -15 and 15")) }
+            if mm.unwrap() > 59 { return Err(oraE(1875, "time zone minute must be between 0 and 59")) }
+            return Ok("interval '" + (if v[0] == '-' { "-" } else { "+" }) + body + "' hour to minute")
+        }
+    }
+    match lexdb_time.settingZone(v) {
+        Ok(_) { return Ok(v.toStr()) }
+        Err(_) { return Err(oraE(1882, "time zone region not found")) }
+    }
+}
+
+// What the session has set, in lexdb's settings (the SQL sees them as
+// current_setting('oracle.nls_date_format') and the like), and its zone and path.
+fn (c: mut &Conn) reapply() {
+    c.nls.redo = false
+    if len(c.nls.zset) > 0 { let x = c.sess.startupZone(&c.nls.zset) }
+    if len(c.nls.schema) > 0 {
+        let x = c.simple("SET search_path = " + lexdb_oraadm.qid(&c.nls.schema) + ", public")
+    }
+    for k in 0..len(c.nls.vals) {
+        let v = c.nls.vals[k]
+        let at = strings.indexOf(&v, "\x00", 0)
+        let key = "oracle." + strings.toLowerAscii(&(v[0..at].toStr()))
+        let val = v[at + 1..len(v)].toStr()
+        let y = c.simple("SELECT set_config(" + lexdb_oraadm.qlit(&key) + ", " + lexdb_oraadm.qlit(&val) + ", false)")
+    }
+    let schema: str = if len(c.nls.schema) > 0 { c.nls.schema } else { c.user }
+    let sch = strings.toUpperAscii(&schema)
+    let tzv = if len(c.nls.tz) > 0 { c.nls.tz } else { "LOCAL" }
+    let a = c.simple("SELECT set_config('oracle.current_schema', " + lexdb_oraadm.qlit(&sch) + ", false)")
+    let b = c.simple("SELECT set_config('oracle.time_zone', " + lexdb_oraadm.qlit(&tzv) + ", false)")
+}
+
+// The NLS formats the parser puts in TO_CHAR/TO_DATE/TO_TIMESTAMP without one:
+// date, timestamp, timestamp with time zone; [] when none is set.
+fn (c: &Conn) nlsFormats(): []str {
+    let d = c.nls.get("NLS_DATE_FORMAT")
+    let t = c.nls.get("NLS_TIMESTAMP_FORMAT")
+    let z = c.nls.get("NLS_TIMESTAMP_TZ_FORMAT")
+    let terr = c.nls.get("NLS_TERRITORY")
+    if len(d) == 0 && len(t) == 0 && len(z) == 0 && len(terr) == 0 { return [] }
+    var dd = d
+    var tt = t
+    var zz = z
+    match lexdb_oraadm.territoryOf(&terr) {
+        Some(x) {
+            if len(dd) == 0 { dd = x.date }
+            if len(tt) == 0 { tt = x.ts }
+            if len(zz) == 0 { zz = x.tstz }
+        }
+        None {}
+    }
+    return [dd, tt, zz]
+}
+
+// Every cursor's statement is read again (the NLS formats it was made under changed).
+fn (c: mut &Conn) forgetParsed() {
+    for i in 0..len(c.cursors) {
+        c.cursors[i].prepared = false
+        c.cursors[i].pc = lexdb_exec.newPlanCache()
+    }
+}
+
+fn (c: mut &Conn) setParam(name: &str, v: &str, quoted: bool): Result[Unit, DbErr] {
+    if name == "CURRENT_SCHEMA" {
+        let sch = strings.toLowerAscii(&(v.toStr()))
+        let has = c.schemaExists(&sch)
+        if !has && sch != c.user && !c.hasRole(&sch) { return Err(oraE(1435, "user does not exist")) }
+        if !has && sch == c.user {
+            // the user's own, which has no schema of its name: the default path
+            c.nls.schema = ""
+            let x = c.simple("RESET search_path")
+        } else {
+            c.nls.schema = sch
+        }
+        c.reapply()
+        return Ok(Unit{})
+    }
+    if name == "TIME_ZONE" {
+        let z = try zoneSetting(v, &c.localZone)
+        try c.sess.startupZone(&z)
+        c.nls.tz = v.toStr()
+        c.nls.zset = z
+        c.reapply()
+        return Ok(Unit{})
+    }
+    if lexdb_oraadm.isNls(name) {
+        if name == "NLS_DATE_FORMAT" || name == "NLS_TIMESTAMP_FORMAT" || name == "NLS_TIMESTAMP_TZ_FORMAT" || name == "NLS_TIME_FORMAT" || name == "NLS_TIME_TZ_FORMAT" {
+            if len(v) == 0 { return Err(oraE(1821, "date format not recognized")) }
+            try lexdb_orafn.checkFormat(v)
+        } else if name == "NLS_TERRITORY" {
+            if lexdb_oraadm.territoryOf(v).isNone() { return Err(oraE(12705, "Cannot access NLS data files or invalid environment specified")) }
+        } else if name == "NLS_LANGUAGE" || name == "NLS_DATE_LANGUAGE" {
+            if !lexdb_oraadm.isLanguage(v) { return Err(oraE(12705, "Cannot access NLS data files or invalid environment specified")) }
+        } else if name == "NLS_NUMERIC_CHARACTERS" {
+            if len(v) != 2 { return Err(oraE(12705, "Cannot access NLS data files or invalid environment specified")) }
+        } else if name == "NLS_COMP" {
+            let u = strings.toUpperAscii(&(v.toStr()))
+            if u != "BINARY" && u != "LINGUISTIC" && u != "ANSI" { return Err(oraE(12705, "Cannot access NLS data files or invalid environment specified")) }
+        } else if name == "NLS_SORT" {
+            var u = strings.toUpperAscii(&(v.toStr()))
+            for suf in ["_CI", "_AI", "_CS", "_AS"] { if strings.endsWith(&u, &suf) { u = u[0..len(u) - 3].toStr() } }
+            if u != "BINARY" && !lexdb_oraadm.isLanguage(&u) && !(len(u) > 1 && u[0] == 'X' && lexdb_oraadm.isLanguage(&u[1..len(u)].toStr())) { return Err(oraE(12705, "Cannot access NLS data files or invalid environment specified")) }
+        } else if name == "NLS_CALENDAR" {
+            let u = strings.toUpperAscii(&(v.toStr()))
+            if u != "GREGORIAN" && u != "JAPANESE IMPERIAL" && u != "ISLAMIC" && u != "PERSIAN" && u != "THAI BUDDHA" && u != "ROC OFFICIAL" && u != "HIJRAH" { return Err(oraE(12705, "Cannot access NLS data files or invalid environment specified")) }
+        } else if name == "NLS_LENGTH_SEMANTICS" {
+            let u = strings.toUpperAscii(&(v.toStr()))
+            if u != "BYTE" && u != "CHAR" { return Err(oraE(12705, "Cannot access NLS data files or invalid environment specified")) }
+        }
+        let val = if name == "NLS_DATE_FORMAT" || name == "NLS_TIMESTAMP_FORMAT" || name == "NLS_TIMESTAMP_TZ_FORMAT" || name == "NLS_TIME_FORMAT" || name == "NLS_TIME_TZ_FORMAT" || name == "NLS_NUMERIC_CHARACTERS" || name == "NLS_CURRENCY" { v.toStr() } else { strings.toUpperAscii(&(v.toStr())) }
+        c.nls.put(name, &val)
+        // a territory sets its own defaults for what was not set apart
+        if name == "NLS_TERRITORY" {
+            match lexdb_oraadm.territoryOf(v) {
+                Some(t) { if len(c.nls.get("NLS_NUMERIC_CHARACTERS")) == 0 { c.nls.put("NLS_NUMERIC_CHARACTERS", &t.numchars) } }
+                None {}
+            }
+        }
+        c.forgetParsed()
+        c.reapply()
+        return Ok(Unit{})
+    }
+    if lexdb_oraadm.isIgnored(name) || quoted && strings.startsWith(name, "_") { return Ok(Unit{}) }
+    return Err(oraE(2248, "invalid option for ALTER SESSION"))
+}
+
+// ALTER SESSION SET name = value ...; ENABLE/DISABLE/FORCE/CLOSE/ADVISE are accepted and ignored.
+fn (c: mut &Conn) alterSession(sql: &str): Result[Unit, DbErr] {
+    let ws = lexdb_oraadm.words(sql)
+    if len(ws) < 3 { return Err(oraE(2248, "invalid option for ALTER SESSION")) }
+    let verb = lexdb_oraadm.up(&ws[2])
+    if verb == "ENABLE" || verb == "DISABLE" || verb == "FORCE" || verb == "CLOSE" || verb == "ADVISE" { return Ok(Unit{}) }
+    if verb != "SET" { return Err(oraE(2248, "invalid option for ALTER SESSION")) }
+    var i = 3
+    if i >= len(ws) { return Err(oraE(2248, "invalid option for ALTER SESSION")) }
+    while i < len(ws) {
+        if lexdb_oraadm.isSym(&ws[i], ";") { break }
+        if ws[i].sym || ws[i].q { return Err(oraE(2248, "invalid option for ALTER SESSION")) }
+        let name = strings.toUpperAscii(&ws[i].t)
+        i += 1
+        if i < len(ws) && lexdb_oraadm.isSym(&ws[i], "=") { i += 1 }
+        var parts: []str = []
+        var quoted = false
+        if i < len(ws) && !lexdb_oraadm.isSym(&ws[i], ";") {
+            append(mut &parts, ws[i].t)
+            quoted = ws[i].q
+            i += 1
+        }
+        while i < len(ws) && !ws[i].sym && !ws[i].q && !(i + 1 < len(ws) && lexdb_oraadm.isSym(&ws[i + 1], "=")) {
+            append(mut &parts, ws[i].t)
+            i += 1
+        }
+        try c.setParam(&name, &strings.join(&parts, " "), quoted)
+    }
+    return Ok(Unit{})
+}
+
+// ---- CREATE USER, ALTER USER, DROP USER, GRANT, REVOKE in Oracle's syntax, as lexdb's roles and schemas (O5)
+
+// Whether sql is one of them.
+fn isAdminSql(sql: &str): bool {
+    let ws = lexdb_oraadm.words(sql)
+    if len(ws) < 1 { return false }
+    let a = lexdb_oraadm.up(&ws[0])
+    if a == "GRANT" || a == "REVOKE" { return true }
+    if len(ws) < 2 { return false }
+    return (a == "CREATE" || a == "ALTER" || a == "DROP") && lexdb_oraadm.up(&ws[1]) == "USER"
+}
+
+fn upperName(n: &str): str { return strings.toUpperAscii(&(n.toStr())) }
+
+fn (c: mut &Conn) createUser(ws: &[]lexdb_oraadm.W): Result[Unit, DbErr] {
+    if len(ws) < 3 || ws[2].sym { return Err(oraE(922, "missing or invalid option")) }
+    let name = lexdb_oraadm.nameOf(&ws[2])
+    if c.hasRole(&name) || c.schemaExists(&name) {
+        return Err(oraE(1920, "user name '" + upperName(&name) + "' conflicts with another user or role name"))
+    }
+    var pw = ""
+    var have = false
+    var i = 3
+    while i < len(ws) {
+        if lexdb_oraadm.isKw(&ws[i], "IDENTIFIED") && i + 2 < len(ws) && lexdb_oraadm.isKw(&ws[i + 1], "BY") {
+            pw = ws[i + 2].t
+            have = true
+            i += 3
+            continue
+        }
+        i += 1
+    }
+    try c.simple("CREATE ROLE " + lexdb_oraadm.qid(&name) + " NOLOGIN" + (if have { " PASSWORD " + lexdb_oraadm.qlit(&pw) } else { "" }))
+    try c.simple("CREATE SCHEMA " + lexdb_oraadm.qid(&name) + " AUTHORIZATION " + lexdb_oraadm.qid(&name))
+    return Ok(Unit{})
+}
+
+fn (c: mut &Conn) alterUser(ws: &[]lexdb_oraadm.W): Result[Unit, DbErr] {
+    if len(ws) < 3 || ws[2].sym { return Err(oraE(922, "missing or invalid option")) }
+    let name = lexdb_oraadm.nameOf(&ws[2])
+    if !c.hasRole(&name) { return Err(oraE(1918, "user '" + upperName(&name) + "' does not exist")) }
+    var i = 3
+    while i < len(ws) {
+        if lexdb_oraadm.isKw(&ws[i], "IDENTIFIED") && i + 2 < len(ws) && lexdb_oraadm.isKw(&ws[i + 1], "BY") {
+            try c.simple("ALTER ROLE " + lexdb_oraadm.qid(&name) + " PASSWORD " + lexdb_oraadm.qlit(&ws[i + 2].t))
+            i += 3
+            continue
+        }
+        if lexdb_oraadm.isKw(&ws[i], "ACCOUNT") && i + 1 < len(ws) {
+            if lexdb_oraadm.isKw(&ws[i + 1], "LOCK") { try c.simple("ALTER ROLE " + lexdb_oraadm.qid(&name) + " NOLOGIN") }
+            if lexdb_oraadm.isKw(&ws[i + 1], "UNLOCK") { try c.simple("ALTER ROLE " + lexdb_oraadm.qid(&name) + " LOGIN") }
+            i += 2
+            continue
+        }
+        i += 1
+    }
+    return Ok(Unit{})
+}
+
+fn (c: mut &Conn) dropUser(ws: &[]lexdb_oraadm.W): Result[Unit, DbErr] {
+    if len(ws) < 3 || ws[2].sym { return Err(oraE(922, "missing or invalid option")) }
+    let name = lexdb_oraadm.nameOf(&ws[2])
+    if !c.hasRole(&name) { return Err(oraE(1918, "user '" + upperName(&name) + "' does not exist")) }
+    if name == c.user { return Err(oraE(1940, "cannot drop a user that is currently connected")) }
+    var cascade = false
+    for w in ws { if lexdb_oraadm.isKw(&w, "CASCADE") { cascade = true } }
+    if c.schemaExists(&name) {
+        if !cascade {
+            match c.rowsOf("select 1 from pg_class c join pg_namespace n on n.oid = c.relnamespace where n.nspname = " + lexdb_oraadm.qlit(&name) + " limit 1") {
+                Ok(r) { if len(r) > 0 { return Err(oraE(1922, "CASCADE must be specified to drop '" + upperName(&name) + "'")) } }
+                Err(_) {}
+            }
+        }
+        try c.simple("DROP SCHEMA " + lexdb_oraadm.qid(&name) + " CASCADE")
+    }
+    try c.simple("DROP ROLE " + lexdb_oraadm.qid(&name))
+    return Ok(Unit{})
+}
+
+// The names in a list after index i of ws, up to the word kw or the end: lower case; PUBLIC as "public".
+fn namesFrom(ws: &[]lexdb_oraadm.W, from: int, stop: &str): []str {
+    var out: []str = []
+    var i = from
+    while i < len(ws) && !lexdb_oraadm.isKw(&ws[i], stop) {
+        if !ws[i].sym && !(lexdb_oraadm.isKw(&ws[i], "WITH")) { append(mut &out, lexdb_oraadm.nameOf(&ws[i])) }
+        if lexdb_oraadm.isKw(&ws[i], "WITH") { break }
+        i += 1
+    }
+    return out
+}
+
+// An object name of GRANT ... ON (name or schema.name, quoted or not) as lexdb's quoted, lower case form; None when it
+// is anything else (a second statement, a comma, blanks inside).
+fn quotedObject(t: &str): Option[str] {
+    var parts: []str = []
+    var i = 0
+    let n = len(t)
+    while i < n {
+        var cur: []byte = []
+        if t[i] == '"' {
+            i += 1
+            var shut = false
+            while i < n {
+                if t[i] == '"' {
+                    if i + 1 < n && t[i + 1] == '"' {
+                        append(mut &cur, t[i])
+                        i += 2
+                        continue
+                    }
+                    shut = true
+                    i += 1
+                    break
+                }
+                append(mut &cur, t[i])
+                i += 1
+            }
+            if !shut { return None }
+        } else {
+            while i < n && ((t[i] >= 'a' && t[i] <= 'z') || (t[i] >= 'A' && t[i] <= 'Z') || (t[i] >= '0' && t[i] <= '9') || t[i] == '_' || t[i] == '$' || t[i] == '#') {
+                append(mut &cur, t[i])
+                i += 1
+            }
+        }
+        if len(cur) == 0 { return None }
+        append(mut &parts, strings.toLowerAscii(&(strFromBytes(&cur))))
+        if i < n {
+            if t[i] != '.' || i + 1 >= n { return None }
+            i += 1
+        }
+    }
+    if len(parts) == 0 || len(parts) > 2 { return None }
+    var out = ""
+    for p in parts { out = out + (if len(out) > 0 { "." } else { "" }) + lexdb_oraadm.qid(&p) }
+    return Some(out)
+}
+
+// GRANT and REVOKE. System privileges and roles (no ON) become LOGIN (CONNECT, CREATE SESSION),
+// SUPERUSER (DBA) or lexdb role grants; the rest (RESOURCE, CREATE TABLE, ...) are accepted: a user's
+// own schema is its to create in. With ON, the object privileges as lexdb's.
+fn (c: mut &Conn) grant(sql: &str, ws: &[]lexdb_oraadm.W, grant: bool): Result[Unit, DbErr] {
+    var on = -1
+    var to = -1
+    let sep = if grant { "TO" } else { "FROM" }
+    var depth = 0
+    for k in 1..len(ws) {
+        if lexdb_oraadm.isSym(&ws[k], "(") { depth += 1 }
+        if lexdb_oraadm.isSym(&ws[k], ")") { depth -= 1 }
+        if depth > 0 { continue }
+        if on < 0 && to < 0 && lexdb_oraadm.isKw(&ws[k], "ON") { on = k }
+        if to < 0 && lexdb_oraadm.isKw(&ws[k], &sep) { to = k }
+    }
+    if to < 0 { return Err(oraE(990, "missing or invalid privilege")) }
+    let grantees = namesFrom(ws, to + 1, "\x00")
+    if len(grantees) == 0 { return Err(oraE(1917, "user or role '' does not exist")) }
+    for g in grantees {
+        if g != "public" && !c.hasRole(&g) { return Err(oraE(1917, "user or role '" + upperName(&g) + "' does not exist")) }
+    }
+    // the privileges: the words up to ON or TO, a comma ending one
+    let upto = if on >= 0 { on } else { to }
+    var privs: []str = []
+    var cur = ""
+    var d = 0
+    for k in 1..upto {
+        if lexdb_oraadm.isSym(&ws[k], "(") { d += 1 }
+        if lexdb_oraadm.isSym(&ws[k], ")") { d -= 1 }
+        if d > 0 || lexdb_oraadm.isSym(&ws[k], ")") { continue }
+        if lexdb_oraadm.isSym(&ws[k], ",") {
+            if len(cur) > 0 { append(mut &privs, cur) }
+            cur = ""
+            continue
+        }
+        cur = cur + (if len(cur) > 0 { " " } else { "" }) + (if ws[k].q { ws[k].t } else { strings.toUpperAscii(&ws[k].t) })
+    }
+    if len(cur) > 0 { append(mut &privs, cur) }
+    if len(privs) == 0 { return Err(oraE(990, "missing or invalid privilege")) }
+    if on < 0 {
+        for g in grantees {
+            for pv in privs {
+                var priv = pv
+                if strings.startsWith(&priv, "ALL PRIVILEGES") { priv = "DBA" }
+                let role = strings.toLowerAscii(&priv)
+                if priv == "CONNECT" || priv == "CREATE SESSION" {
+                    if g != "public" { try c.simple("ALTER ROLE " + lexdb_oraadm.qid(&g) + (if grant { " LOGIN" } else { " NOLOGIN" })) }
+                } else if priv == "DBA" {
+                    if g != "public" { try c.simple("ALTER ROLE " + lexdb_oraadm.qid(&g) + (if grant { " LOGIN SUPERUSER" } else { " NOSUPERUSER" })) }
+                } else if c.hasRole(&role) {
+                    try c.simple((if grant { "GRANT " } else { "REVOKE " }) + lexdb_oraadm.qid(&role) + (if grant { " TO " } else { " FROM " }) + (if g == "public" { "PUBLIC" } else { lexdb_oraadm.qid(&g) }))
+                }
+            }
+        }
+        return Ok(Unit{})
+    }
+    // object privileges: the object's text, lower case; TABLE and VIEW are no more than a noise word
+    var objFrom = ws[on].z
+    var seq = false
+    if on + 1 < len(ws) {
+        let w = lexdb_oraadm.up(&ws[on + 1])
+        if w == "TABLE" || w == "VIEW" { objFrom = ws[on + 1].z }
+        if w == "SEQUENCE" {
+            objFrom = ws[on + 1].z
+            seq = true
+        }
+        if w == "DIRECTORY" || w == "PROCEDURE" || w == "FUNCTION" || w == "PACKAGE" || w == "TYPE" || w == "JAVA" { return Ok(Unit{}) }
+    }
+    let obj = match quotedObject(&strings.trim(&sql[objFrom..ws[to].a])) {
+        Some(o) { o }
+        None { return Err(oraE(942, "table or view does not exist")) }
+    }
+    var kept: []str = []
+    for pv in privs {
+        if pv == "SELECT" || pv == "INSERT" || pv == "UPDATE" || pv == "DELETE" || pv == "REFERENCES" || pv == "ALL" || pv == "ALL PRIVILEGES" { append(mut &kept, pv) }
+    }
+    if len(kept) == 0 { return Ok(Unit{}) }
+    var to_ = ""
+    for g in grantees { to_ = to_ + (if len(to_) > 0 { ", " } else { "" }) + (if g == "public" { "PUBLIC" } else { lexdb_oraadm.qid(&g) }) }
+    // (WITH GRANT OPTION and WITH ADMIN OPTION are accepted and not kept: lexdb has no grant options)
+    let opt = ""
+    let verb = if grant { "GRANT " } else { "REVOKE " }
+    let tail = (if grant { " TO " } else { " FROM " }) + to_ + (if grant { opt } else { "" })
+    var list = ""
+    for pv in kept { list = list + (if len(list) > 0 { ", " } else { "" }) + pv }
+    if !seq {
+        match c.simple(verb + list + " ON " + obj + tail) {
+            Ok(_) { return Ok(Unit{}) }
+            Err(e) {
+                if e.state != "42P01" { return Err(e) }
+            }
+        }
+    }
+    // a sequence: its SELECT is USAGE
+    var sl = ""
+    for pv in kept {
+        if pv == "SELECT" || pv == "ALL" || pv == "ALL PRIVILEGES" { sl = sl + (if len(sl) > 0 { ", " } else { "" }) + (if pv == "SELECT" { "SELECT, USAGE" } else { "ALL" }) }
+    }
+    if len(sl) == 0 { return Err(oraE(942, "table or view does not exist")) }
+    match c.simple(verb + sl + " ON SEQUENCE " + obj + tail) {
+        Ok(_) { return Ok(Unit{}) }
+        Err(_) { return Err(oraE(942, "table or view does not exist")) }
+    }
+}
+
+fn (c: mut &Conn) admin(sql: &str): Result[Unit, DbErr] {
+    let ws = lexdb_oraadm.words(sql)
+    if len(ws) < 1 { return Ok(Unit{}) }
+    let a = lexdb_oraadm.up(&ws[0])
+    // each of them is several statements of lexdb's: one transaction, so a failure leaves nothing half done
+    if a != "CREATE" && a != "ALTER" && a != "DROP" { return c.grant(sql, &ws, a == "GRANT") }
+    try c.simple("BEGIN")
+    var r: Result[Unit, DbErr] = Ok(Unit{})
+    if a == "CREATE" { r = c.createUser(&ws) }
+    else if a == "ALTER" { r = c.alterUser(&ws) }
+    else { r = c.dropUser(&ws) }
+    if r.isOk() {
+        try c.simple("COMMIT")
+    } else if c.sess.status() != 'I' {
+        let x = c.simple("ROLLBACK")
+    }
+    return r
+}
+
+// ---- LOBs: a CLOB or BLOB column is sent as a locator when the client defines it as one, else as LONG;
+// the locator is 40 bytes naming a value the connection holds (LOB_OP reads, writes and trims it)
+
+// Characters of UTF-8 text.
+fn charCount(s: &str): int {
+    var n = 0
+    for i in 0..len(s) { if (int(s[i]) & 0xc0) != 0x80 { n += 1 } }
+    return n
+}
+
+// The byte index of character k (0-based) of s (len(s) at the end).
+fn byteAt(s: &str, k: int): int {
+    var n = 0
+    for i in 0..len(s) {
+        if (int(s[i]) & 0xc0) != 0x80 {
+            if n == k { return i }
+            n += 1
+        }
+    }
+    return len(s)
+}
+
+fn locatorOf(id: int, blob: bool, temp: bool): str {
+    var b: []byte = []
+    for i in 0..40 { append(mut &b, byte(0)) }
+    // flags: [4] the BLOB bit, [7] the temporary bit; [8..16] the id
+    b[4] = byte(if blob { 0x01 } else { 0 } | 0x08)
+    b[7] = byte(if temp { 0x01 } else { 0 })
+    for k in 0..8 { b[8 + k] = byte((id >> (56 - 8 * k)) & 0xff) }
+    b[0] = byte(0x00)
+    b[1] = byte(0x54)
+    return strFromBytes(&b)
+}
+
+fn idOfLocator(loc: &str): int {
+    if len(loc) < 16 { return -1 }
+    var id = 0
+    for k in 0..8 { id = (id << 8) | int(loc[8 + k]) }
+    return id
+}
+
+fn (c: &Conn) findLob(id: int): int {
+    for i in 0..len(c.lobs) { if c.lobs[i].id == id { return i } }
+    return -1
+}
+
+// A new LOB holding data; its id.
+fn (c: mut &Conn) newLob(data: str, blob: bool, temp: bool): int {
+    c.nextLob += 1
+    append(mut &c.lobs, Lob{id: c.nextLob, blob: blob, data: data, temp: temp})
+    c.lobBytes += len(data)
+    // the oldest go when the connection holds too much
+    if (c.lobBytes > LOB_LIMIT || len(c.lobs) > MAX_LOBS) && len(c.lobs) > 1 {
+        var keep: []Lob = []
+        var total = 0
+        var k = len(c.lobs) - 1
+        while k > 0 && total + len(c.lobs[k].data) <= LOB_LIMIT / 2 && len(c.lobs) - 1 - k < MAX_LOBS / 2 {
+            total += len(c.lobs[k].data)
+            k -= 1
+        }
+        for q in (k + 1)..len(c.lobs) { append(mut &keep, Lob{id: c.lobs[q].id, blob: c.lobs[q].blob, data: c.lobs[q].data, temp: c.lobs[q].temp}) }
+        c.lobs = keep
+        c.lobBytes = total
+    }
+    return c.nextLob
+}
+
+// A LOB cell of a row: its size, chunk size and locator.
+fn (c: mut &Conn) putLocator(data: str, blob: bool, temp: bool, o: mut &Out) {
+    let id = c.newLob(data, blob, temp)
+    let loc = locatorOf(id, blob, temp)
+    o.ub(len(loc))
+    o.ub(if blob { len(data) } else { charCount(&data) })
+    o.ub(LOB_CHUNK)
+    if o.lobPre {
+        // no prefetched data: JDBC reads the LOB with LOB_OP (a CLOB's has a flag and a form of use before the data)
+        if !blob {
+            o.u8(0)
+            o.u8(1)
+        }
+        o.u8(0)
+    }
+    o.bytes(loc)
+}
+
+// Whether a LOB_OP's offset, amount or data is one no slice or allocation may be made of: the numbers come off the wire as
+// signed 64-bit values; a write may not grow a LOB (or the connection's LOBs) past LOB_LIMIT.
+pub fn lobBad(op: int, off: int, amount: int, dataLen: int, held: int): bool {
+    if op != LOB_READ && op != LOB_WRITE && op != LOB_TRIM { return false }
+    if off < 0 || off > LOB_LIMIT + 1 { return true }
+    if op != LOB_WRITE && amount < 0 { return true }
+    if op == LOB_TRIM && amount > LOB_LIMIT { return true }
+    if op == LOB_WRITE && (max(off - 1, 0) + dataLen > LOB_LIMIT || held + max(off - 1, 0) + dataLen > 2 * LOB_LIMIT) { return true }
+    return false
+}
+
+// LOB_OP: the reply is the LOB_DATA message (a read), then the locator and the amount, then ERROR.
+fn (c: mut &Conn) lobOp(rq: &Req) {
+    let id = idOfLocator(&rq.lobLoc)
+    var i = if id >= 0 { c.findLob(id) } else { -1 }
+    let op = rq.lobOp
+    if op == LOB_CREATE_TEMP {
+        // source offset: the character set form, destination offset: the type (CLOB 112, BLOB 113)
+        let blob = rq.lobDst == tns.T_BLOB
+        let nid = c.newLob("", blob, true)
+        c.o.u8(tns.MT_PARAMETER)
+        c.o.raw(locatorOf(nid, blob, true))
+        c.o.ub(0)
+        c.o.u8(0)
+        c.endCall(0, "", 0, 0)
+        return
+    }
+    if i < 0 && op != LOB_FREE_TEMP {
+        c.failOra(22275, "invalid LOB locator specified", 0)
+        return
+    }
+    if lobBad(op, rq.lobOff, rq.lobAmount, len(rq.lobData), c.lobBytes) {
+        c.failOra(21560, "argument is null, invalid, or out of range", 0)
+        return
+    }
+    let readAmount = min(rq.lobAmount, 4 * LOB_LIMIT)
+    var amount = 0
+    var data = ""
+    var hasData = false
+    var flag = false
+    if op == LOB_GET_LENGTH {
+        amount = if c.lobs[i].blob { len(c.lobs[i].data) } else { charCount(&c.lobs[i].data) }
+    } else if op == LOB_GET_CHUNK_SIZE {
+        amount = LOB_CHUNK
+    } else if op == LOB_READ {
+        let d = &c.lobs[i].data
+        if c.lobs[i].blob {
+            let from = max(rq.lobOff - 1, 0)
+            let upto = min(from + readAmount, len(d))
+            if from < len(d) { data = d[from..upto].toStr() }
+            amount = len(data)
+        } else {
+            let a = byteAt(d, max(rq.lobOff - 1, 0))
+            let b = byteAt(d, max(rq.lobOff - 1, 0) + readAmount)
+            if a < len(d) { data = d[a..b].toStr() }
+            amount = charCount(&data)
+        }
+        hasData = true
+    } else if op == LOB_WRITE {
+        let cur = c.lobs[i].data
+        var nd = ""
+        if c.lobs[i].blob {
+            let from = max(rq.lobOff - 1, 0)
+            let head = if from <= len(cur) { cur[0..from].toStr() } else { cur + strings.repeat("\x00", from - len(cur)) }
+            let tailAt = from + len(rq.lobData)
+            nd = head + rq.lobData + (if tailAt < len(cur) { cur[tailAt..len(cur)].toStr() } else { "" })
+        } else {
+            let from = max(rq.lobOff - 1, 0)
+            let a = byteAt(&cur, from)
+            let head = if from <= charCount(&cur) { cur[0..a].toStr() } else { cur + strings.repeat(" ", from - charCount(&cur)) }
+            let b = byteAt(&cur, from + charCount(&rq.lobData))
+            nd = head + rq.lobData + (if b < len(cur) { cur[b..len(cur)].toStr() } else { "" })
+        }
+        if len(nd) > LOB_LIMIT {
+            c.failOra(21560, "LOB value too large", 0)
+            return
+        }
+        c.lobBytes += len(nd) - len(cur)
+        c.lobs[i].data = nd
+    } else if op == LOB_TRIM {
+        let cur = c.lobs[i].data
+        var nd = cur
+        if c.lobs[i].blob {
+            if rq.lobAmount < len(cur) { nd = cur[0..rq.lobAmount].toStr() }
+        } else {
+            nd = cur[0..byteAt(&cur, rq.lobAmount)].toStr()
+        }
+        c.lobBytes += len(nd) - len(cur)
+        c.lobs[i].data = nd
+    } else if op == LOB_IS_OPEN {
+        flag = true
+    } else if op == LOB_FREE_TEMP {
+        // a temporary LOB is let go (a locator of a row's LOB stays: the row's value is kept until the connection has too many)
+        if i >= 0 && c.lobs[i].temp {
+            var keep: []Lob = []
+            for q in 0..len(c.lobs) {
+                if q != i { append(mut &keep, Lob{id: c.lobs[q].id, blob: c.lobs[q].blob, data: c.lobs[q].data, temp: c.lobs[q].temp}) }
+            }
+            c.lobBytes -= len(c.lobs[i].data)
+            c.lobs = keep
+        }
+    } else if op == LOB_OPEN || op == LOB_CLOSE {
+        // nothing to do
+    } else {
+        c.failOra(22275, "invalid LOB locator specified", 0)
+        return
+    }
+    if hasData {
+        c.o.u8(tns.MT_LOB_DATA)
+        c.o.bytes(data)
+    }
+    c.o.u8(tns.MT_PARAMETER)
+    c.o.raw(rq.lobLoc)
+    if rq.lobSend { c.o.ub(amount) }
+    if op == LOB_IS_OPEN { c.o.u8(if flag { 1 } else { 0 }) }
+    c.endCall(0, "", 0, 0)
+}
+
+// The state a request's piggybacks set: the current schema, the end-to-end attributes.
+fn (c: mut &Conn) piggybacks(rq: &Req) {
+    if rq.hasSchema {
+        let sch = strings.toLowerAscii(&rq.schema)
+        if len(sch) > 0 && c.schemaExists(&sch) {
+            c.nls.schema = sch
+            c.reapply()
+        }
+    }
+    if len(rq.e2e) == 5 {
+        let names = ["CLIENT_IDENTIFIER", "MODULE", "ACTION", "CLIENT_INFO", "DBOP"]
+        var any = false
+        for k in 0..5 {
+            if len(rq.e2e[k]) > 0 {
+                let nm = names[k]
+                let val = rq.e2e[k][1..len(rq.e2e[k])].toStr()
+                c.nls.put(&nm, &val)
+                any = true
+            }
+        }
+        if any { c.reapply() }
+    }
+}
+
+// One request answered; false when the session ends with it.
+fn (c: mut &Conn) dispatch(rq: &Req): bool {
+    c.seq = rq.seq
+    for id in rq.closes { c.closeCursor(id) }
+    if rq.kind == R_PROTOCOL {
+        c.protocolReply()
+        return true
+    }
+    if rq.kind == R_DATATYPES {
+        c.dataTypesReply(rq)
+        return true
+    }
+    if rq.fnCode == FN_AUTH1 {
+        c.auth1(rq)
+        return true
+    }
+    if rq.fnCode == FN_AUTH2 {
+        c.auth2(rq)
+        // a failed login ends the connection: one challenge allows one guess
+        return c.loggedIn
+    }
+    if !c.loggedIn { return false }
+    c.piggybacks(rq)
+    if rq.fnCode == FN_LOB_OP {
+        c.lobOp(rq)
+    } else if rq.fnCode == FN_EXECUTE || rq.fnCode == FN_REEXECUTE || rq.fnCode == FN_REEXECUTE_FETCH {
+        c.execute(rq)
+    } else if rq.fnCode == FN_FETCH {
+        c.fetch(rq)
+    } else if rq.fnCode == FN_COMMIT {
+        c.finish(true)
+    } else if rq.fnCode == FN_ROLLBACK {
+        c.finish(false)
+    } else if rq.fnCode == FN_LOGOFF {
+        c.statusMsg()
+        return false
+    } else if rq.fnCode == FN_OVERSION {
+        // JDBC's getDatabaseProductVersion: the banner, then the version number
+        c.o.u8(tns.MT_PARAMETER)
+        c.o.ub(len(BANNER))
+        c.o.raw(BANNER)                         // no length byte: the client's charset is the server's
+        c.o.ub(VERSION_NO)
+        c.statusMsg()
+    } else if rq.fnCode == FN_PING {
+        c.endCall(0, "", 0, 0)
+    } else {
+        c.failOra(3115, "unsupported network datatype or representation", 0)
+    }
+    return true
+}
+
+// The client's break: our BREAK marker, the client's RESET and ours, then ORA-01013 as the reply of the call
+// it interrupted. Nothing is undone: statements run to their end before the break is read (lexdb has no
+// cancel of a statement in flight), so it comes after the call's own reply.
+fn (c: mut &Conn) breakOut(): Result[Unit, str] {
+    try c.w.sendPacket(PT_MARKER, "\x01\x00\x01")
+    while true {
+        let q = try c.w.receive()
+        if q.ptype == PT_MARKER && len(q.data) >= 3 && int(q.data[2]) == 2 { break }
+        if q.ptype != PT_MARKER && q.ptype != PT_DATA && q.ptype != PT_CONTROL { return Err("a packet of type " + q.ptype.toStr() + " during a break") }
+    }
+    try c.w.sendPacket(PT_MARKER, "\x01\x00\x02")
+    c.failOra(1013, "user requested cancel of current operation", 0)
+    return c.send()
+}
+
+pub fn requestTooBig(loggedIn: bool, n: int): bool { return n > MAX_REQUEST || (!loggedIn && n > MAX_PREAUTH_REQUEST) }
+
+// Requests until the client goes: Ok at its end, Err on the wire.
+fn (c: mut &Conn) requests(): Result[Unit, str] {
+    var pending = ""
+    while true {
+        let p = try c.w.receive()
+        if p.ptype == PT_MARKER {
+            // a break (the client's cancel): answered whether or not a call is running
+            try c.breakOut()
+            continue
+        }
+        if p.ptype == PT_CONTROL { continue }
+        if p.ptype != PT_DATA { return Err("a packet of type " + p.ptype.toStr()) }
+        if len(p.data) < 2 { return Err("a DATA packet without flags") }
+        let flags = (int(p.data[0]) << 8) | int(p.data[1])
+        if (flags & DATA_EOF) != 0 { return Ok(Unit{}) }
+        if len(p.data) == 2 { continue }
+        pending = pending + p.data[2..len(p.data)]
+        // before the login a request is a few hundred bytes: a small cap, so no one costs the server a 64 MiB re-parse
+        if requestTooBig(c.loggedIn, len(pending)) { return Err("a request larger than " + (if c.loggedIn { MAX_REQUEST } else { MAX_PREAUTH_REQUEST }).toStr() + " bytes") }
+        match parseRequest(pending, c.fv, len(p.data) < c.w.sdu - 24, &c.cursors) {
+            Ok(rq) {
+                pending = ""
+                let more = c.dispatch(&rq)
+                try c.send()
+                if !more { return Ok(Unit{}) }
+            }
+            Err(m) {
+                if m == SHORT { continue }
+                return Err(m)
+            }
+        }
+    }
+    return Ok(Unit{})
+}
+
+// ---- CONNECT
+
+type Connect = record { version: int; sdu: int; service: str }
+
+// The service named in a connect descriptor: SERVICE_NAME= or SID=, lower case; "" none.
+fn serviceOf(desc: str): str {
+    let low = strings.toLowerAscii(&desc)
+    var at = strings.indexOf(&low, "service_name=", 0)
+    var skip = 13
+    if at < 0 {
+        at = strings.indexOf(&low, "(sid=", 0)
+        skip = 5
+    }
+    if at < 0 { return "" }
+    let from = at + skip
+    var to = from
+    while to < len(low) && low[to] != ')' { to += 1 }
+    return strings.trim(low[from..to])
+}
+
+fn be16(s: str, at: int): int { return (int(s[at]) << 8) | int(s[at + 1]) }
+
+fn be32(s: str, at: int): int { return (be16(s, at) << 16) | be16(s, at + 2) }
+
+// CONNECT, ACCEPT or REFUSE. Ok(false): the client was refused or went.
+fn (c: mut &Conn) connect(): Result[bool, str] {
+    let p = try c.w.receive()
+    if p.ptype != PT_CONNECT { return Ok(false) }
+    let d = p.data
+    if len(d) < 66 { return Ok(false) }
+    let version = be16(d, 0)
+    var sdu = be16(d, 6)
+    if len(d) >= 54 { sdu = be32(d, 50) }
+    let dlen = be16(d, 16)
+    let off = be16(d, 18)
+    var desc = ""
+    if off >= 8 && off - 8 + dlen <= len(d) {
+        desc = d[off - 8..off - 8 + dlen]
+    } else {
+        // the descriptor follows in a DATA packet of its own
+        let q = try c.w.receive()
+        if q.ptype != PT_DATA || len(q.data) < 2 { return Ok(false) }
+        desc = q.data[2..len(q.data)]
+    }
+    let svc = serviceOf(desc)
+    if len(svc) > 0 && svc != SERVICE && svc != SERVICE2 {
+        let text = "(DESCRIPTION=(ERR=12514)(VSNNUM=386465792)(ERROR_STACK=(ERROR=(CODE=12514)(EMFI=4))))"
+        var b: []byte = []
+        append(mut &b, byte(0))
+        append(mut &b, byte(0))
+        append(mut &b, byte((len(text) >> 8) & 0xff))
+        append(mut &b, byte(len(text) & 0xff))
+        appendStr(mut &b, text)
+        try c.w.sendPacket(PT_REFUSE, strFromBytes(&b))
+        return Ok(false)
+    }
+    let v = min(TNS_VERSION, version)
+    var a = newOut()
+    a.u16be(v)
+    a.zeros(6)                                  // service options, SDU, TDU (the 32-bit ones are below)
+    a.u16be(1)                                  // the byte order JDBC reads the FDO's length in
+    a.zeros(4)
+    a.u8(4)                                     // flags: NA disabled (JDBC sends no NA packet), not required
+    a.zeros(9)
+    var s32 = max(512, min(sdu, 2097152))
+    a.u16be((s32 >> 16) & 0xffff)
+    a.u16be(s32 & 0xffff)
+    if v >= 318 {
+        a.zeros(5)
+        a.u16be(0)                              // flags 2: no end of response, no fast authentication
+        a.u16be(0)
+        if v >= 319 { a.zeros(16) }             // the database's UUID (JDBC 23 reads it)
+    }
+    try c.w.sendPacket(PT_ACCEPT, strFromBytes(&a.b))
+    c.w.large = v >= 315
+    c.w.sdu = s32
+    return Ok(true)
+}
+
+pub type ConnArg = record { pub conn: net.Conn; pub st: lexdb_store.Store; pub id: int; secret: str; ctx: []tls.Context }
+
+// Serves one client until it goes away.
+pub fn serve(a: ConnArg): int {
+    let ConnArg{conn: sock, st: st, id: id, secret: secret, ctx: ctx} = move(a)
+    let nd = sock.setNoDelay(true)
+    let sess = lexdb_exec.newSession(st)
+    var c = Conn{w: newWire(sock), sess: sess, st: st, o: newOut(), secret: secret, fv: FV_SERVER, seq: 0, user: "",
+                 auth: Auth{have: false, role: "", salt: "", count: 0, hash: "", partA: "", csk: "", noLogin: false}, cursors: [],
+                 nextCursor: 0, loggedIn: false, batch: [], secure: false, nls: newNls(), localZone: "UTC", lobs: [], nextLob: 0, lobBytes: 0, pl: lexdb_plsql.newIp(st), prog: lexdb_plsql.newProg()}
+    var go = true
+    if len(ctx) > 0 {
+        // TCPS: TLS first, then TNS inside it
+        let sk = pop(mut &c.w.plain)
+        match ctx[0].accept(sk) {
+            Ok(t) {
+                append(mut &c.w.secure, t)
+                c.secure = true
+            }
+            Err(_) { go = false }
+        }
+    }
+    if go && c.connect().unwrapOr(false) {
+        let r = c.requests()
+    }
+    if len(c.w.secure) > 0 { let x = c.w.secure[0].shutdown() }
+    c.sess.close()
+    return 0
+}
+
+// ---- listening
+
+pub type ListenArg = record { pub lns: []net.Listener; pub st: lexdb_store.Store }
+
+pub type AcceptArg = record { pub ln: net.Listener; pub st: lexdb_store.Store }
+
+type LoopArg = record { ln: net.Listener; st: lexdb_store.Store; tls: bool }
+
+// Serves each TNS listener in an accept loop of its own, until the task
+// running it is cancelled.
+pub fn acceptAll(a: ListenArg): int {
+    let ListenArg{lns: lns, st: st} = move(a)
+    return listenAll(lns, st, false)
+}
+
+// The same on TCPS: TLS first, with the certificate of --tls-cert (as TDS's), then TNS inside it.
+pub fn acceptAllTls(a: ListenArg): int {
+    let ListenArg{lns: lns, st: st} = move(a)
+    return listenAll(lns, st, true)
+}
+
+fn listenAll(lns0: []net.Listener, st: lexdb_store.Store, tcps: bool): int {
+    var lns = move(lns0)
+    task.scope(fn(s: mut &task.Scope) {
+        while len(lns) > 0 {
+            let ln = pop(mut &lns)
+            s.spawn(loopOf, LoopArg{ln: ln, st: st, tls: tcps})
+        }
+    })
+    return 0
+}
+
+// Accepts TNS connections and serves each in a task of its own, until the
+// task running it is cancelled.
+pub fn acceptLoop(a: AcceptArg): int {
+    let AcceptArg{ln: ln, st: st} = move(a)
+    return loopOf(LoopArg{ln: ln, st: st, tls: false})
+}
+
+fn loopOf(a: LoopArg): int {
+    let LoopArg{ln: ln, st: st, tls: tcps} = move(a)
+    var id = 0
+    let secret = random(32)
+    var ctxs: []tls.Context = []
+    if tcps {
+        // the certificate TDS uses (--tls-cert, --tls-key)
+        let conf = lexdb_wire.confOf(&st)
+        var o = tls.defaults()
+        o.certFile = conf.cert
+        o.keyFile = if len(conf.key) > 0 { conf.key } else { conf.cert }
+        if len(conf.cert) == 0 {
+            eprintln("lexdb: tns: TCPS needs --tls-cert")
+            return 1
+        }
+        match tls.server(o) {
+            Ok(x) { append(mut &ctxs, x) }
+            Err(x) {
+                eprintln("lexdb: tns: tls: " + x.toStr())
+                return 1
+            }
+        }
+    }
+    task.scope(fn(s: mut &task.Scope) {
+        while true {
+            match ln.accept() {
+                Ok(c) {
+                    id += 1
+                    var mine: []tls.Context = []
+                    if len(ctxs) > 0 { append(mut &mine, ctxs[0].share()) }
+                    s.spawn(serve, ConnArg{conn: c, st: st, id: id, secret: secret, ctx: mine})
+                }
+                Err(e) {
+                    if e.isCancelled() || e.isTimeout() { return }
+                    eprintln("lexdb: tns: accept: " + e.toStr())
+                    let r = task.sleep(100)
+                    if r.isErr() { return }
+                }
+            }
+        }
+    })
+    return 0
+}

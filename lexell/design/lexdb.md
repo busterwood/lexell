@@ -95,7 +95,7 @@ SQLite is about 150,000 lines of C and LMDB's core is about 10,000.
 | MySQL / InnoDB | Fast, non-transactional MyISAM for read-heavy websites. | Transactions came with a plug-in engine (InnoDB), giving two logs (binlog and redo) with an internal two-phase commit between them. InnoDB's doublewrite buffer guards against torn pages. The query cache was added for speed and removed in 8.0, because its global lock was a bottleneck. | Take the clustered primary key, and secondary indexes that store the primary key. Leave everything else. |
 | SQLite | Still small, as a library: one writer, file locks, a bytecode VM (VDBE). | It isn't a server. | Take the register-based bytecode VM as the first executor. |
 | LMDB | A copy-on-write B+tree with one writer and two meta pages. Readers keep an old root and never block. About 10,000 lines. | It uses `mmap` (see the next row), and each commit writes the path from changed leaves to the root plus a meta page. | Take copy-on-write pages, the two meta pages and readers on old roots. Leave `mmap`, and amortize the root-path writes over a checkpoint rather than every commit. |
-| *Are You Sure You Want to Use MMAP in Your DBMS?* (Crotty, Leis and Pavlo, CIDR 2022) | — | — | For Lexell there's a stronger reason than theirs: a page fault blocks the only thread, and a coroutine cannot park on a fault. One cold page would stall every connection. We keep our own cache with `O_DIRECT`. |
+| *Are You Sure You Want to Use MMAP in Your DBMS?* (Crotty, Leis and Pavlo, CIDR 2022) | — | — | For Lexell there's a stronger reason than theirs: a page fault blocks the only thread, and a coroutine cannot park on a fault. One cold page would stall every connection. We keep our own cache with `O_DIRECT`. (Since 9.125 the page file goes through the kernel's page cache; the log keeps `O_DIRECT`, and the argument against mmap stands.) |
 | H-Store / VoltDB; *OLTP Through the Looking Glass* (2008) | Serial execution in memory, by one thread per partition. | That paper found that buffer management, locking, latching and logging each took a large share of instructions in a conventional engine. | Take serial commit on one thread. Leave the requirement that data fit in memory. Anti-caching (DeBrabant et al., 2013) also handled cold data on disk under serial execution, by aborting and restarting the transaction. Our coroutines park instead. |
 | Silo (Tu et al., SOSP 2013) | Optimistic concurrency with validation at commit. | Multi-core, with per-record latches. | Take the idea of checking B+tree node versions at commit to catch phantoms (its "node set"). With one thread, no latches are needed. |
 | LeanStore, vmcache (Leis et al.) | Buffer managers that run close to in-memory speed. | Both are built for many threads. | One thread needs neither pointer swizzling nor optimistic latches. A hash table from page number to frame, plus clock eviction, is enough. |
@@ -153,7 +153,8 @@ What follows for the design:
 
 ### 4.1 Files and pages
 
-- **The page file.** It is made of 4 KiB pages, opened with `O_DIRECT`, and
+- **The page file.** It is made of 4 KiB pages, opened through the kernel's page
+  cache (since 9.125; `O_DIRECT` before), and
   read and written only in aligned 4 KiB units. Pages 0 and 1 are the two
   meta pages. Every page ends with a CRC32C (x86-64-v3 has the `crc32`
   instruction) and its own page number, so a page read from the wrong
@@ -312,7 +313,7 @@ written into this note.
 **D0: the disk interface and the simulated disk.**
 - A `Disk` interface (read, write, flush, allocate) with two
   implementations:
-  - the real one: `O_DIRECT` on the helper pool;
+  - the real one: the page file through the page cache (since 9.125), the log segments `O_DIRECT`, on the helper pool or io_uring;
   - a simulated one that keeps writes that haven't been flushed separately.
     A "crash" keeps a random subset of them and tears some at 512-byte
     boundaries.
@@ -2133,7 +2134,7 @@ Times vary between runs: another run of the second row gave 8.7 ms and
 8 ms.
 
 The walk's time is its reads: 117 took 27 ms, 0.7 ms of it decoding. The
-data file is opened with O_DIRECT, and each read waits for the device
+data file is opened with O_DIRECT (since 9.125: buffered), and each read waits for the device
 (here WSL2's virtual disk). The reads park the checkpoint's task on the
 helper pool: commits and queries go on, and only the checkpoint's end is
 later.
@@ -3811,7 +3812,7 @@ reader. The fixed layout is now the default.
 The user asked for read-ahead (2026-11-10) after 9.49 found cold scans
 25 times slower than warm ones.
 
-**Why cold scans were slow.** The data file is opened with O_DIRECT, so
+**Why cold scans were slow.** The data file is opened with O_DIRECT (since 9.125: buffered), so
 every page read is a disk read: the operating system caches none of it. A
 scan read one 4 KiB page at a time. A probe in C, on this machine's disk:
 
@@ -4157,7 +4158,7 @@ latency unchanged (233 us) where PostgreSQL's halved. The cause was not
 the socket: a Lexell echo server over a Unix socket answers in 55 us, as
 a C one does. It was the cache. The server's 128 MB default holds about
 two thirds of pgbench's 1M-row table. lexdb reads its data file past the
-kernel's cache (O_DIRECT), so every miss went to the disk: 189,086 pages
+kernel's cache (O_DIRECT; since 9.125 buffered), so every miss went to the disk: 189,086 pages
 read and 169,455 evicted in that run. PostgreSQL's 128 MB of shared
 buffers is backed by the kernel's cache, which on this machine is most of
 its 23 GB. The server now takes a quarter of `/proc/meminfo`'s MemTotal
@@ -5159,8 +5160,7 @@ of these.
   file without `O_DIRECT` (`Fs.openBuffered`; `File.Real` carries the
   flag). Log segments stay `O_DIRECT`. Pages, CRCs, writes and flushes
   are unchanged: a checkpoint's pages are written, then `fdatasync`ed,
-  then the meta page. The default stays `direct` until the replica uses
-  this.
+  then the meta page. The default stayed `direct` until 9.125, which made buffered the only mode and removed `LEXDB_PAGES` and `Options.bufferedPages`.
 - **Reads tried inline.** The runtime set `IOSQE_ASYNC` on every read
   issued while other tasks were runnable (9.62), so a page the kernel
   held was copied by an io-wq worker and woke the loop from there. Now
@@ -5473,7 +5473,7 @@ with its own port; pgbench prepared, 8 s; CPU from `/proc`):
   beside its own commits.
 - **Applying the master's writes** costs the replica about 2.6 us of CPU
   each, 7% of a core at 22,000 a second.
-- **Memory** (RSS, LEXDB_PAGES direct, all data cached): 40 MB and 39 MB
+- **Memory** (RSS, with the page file then `O_DIRECT`, all data cached): 40 MB and 39 MB
   warm. Under updates the master reaches 96 MB and the replica 61 to
   67 MB: one checkpoint's delta, and a 31 MB page cache with 11,892 pages
   evicted as freed in 15 s.
@@ -11556,3 +11556,206 @@ tree while worker 0's ALTERs land.
   rounds with and without `LEXDB_COLCHECK=1`. The replica test passes.
 
 The suite passes (133), also with `LEXDB_COLCHECK=1`.
+
+### 9.121 MERGE, one statement for PostgreSQL, T-SQL and Oracle
+
+MERGE is built once and read in three dialects. The parser has three front ends in one function (`P.merge`, `P.mergeWhen`
+in `lexdb_sql.lxl`; each branch is `p.tsql`, `p.ora` or neither); the planner and the executor (`merge` in `lexdb_exec.lxl`)
+are shared. `Stmt.kind` is `S_MERGE`: the target in `table` (its alias in `alias`), the source in `from[0]` (a table, a
+subquery, `(VALUES ...)`, a CTE, DUAL), ON in `where`, the WHEN clauses in `merges` (`MergeClause`: which rows it is for,
+an optional condition, UPDATE / DELETE / INSERT / DO NOTHING, Oracle's `DELETE WHERE`), RETURNING (T-SQL's OUTPUT) in
+`items`, T-SQL's TOP in `limit`, and the dialect in `mdialect` (it picks the errors and what a deleted row shows).
+
+**How it runs.**
+- **One join, read first.** The source and the target are joined on ON as one query: the source first, so its rows come
+  out in its own order (the order identity values and sequences are taken in); the join is INNER, LEFT (clauses for source
+  rows with no target row), RIGHT (BY SOURCE clauses only) or FULL, by the clauses given. Every row is read before any is
+  written (the snapshot); the target rows read are locked as UPDATE's are.
+- **Then each row, in order.** A row with a target row is MATCHED (or BY SOURCE if the source side is all NULL and the
+  statement has such a clause); a row without one is NOT MATCHED. The first clause of that kind whose condition is true
+  is the action. UPDATE, DELETE and INSERT are `updRow`, `delRow` and `insertOne`, the code of the three statements, so
+  constraints, foreign keys, identity (also T-SQL's IDENTITY_INSERT and PostgreSQL's OVERRIDING), defaults, sequences,
+  CHECKs and the Oracle door's empty-string and identifier rules are theirs. lexdb has no triggers.
+- **A target row changed twice** is an error, only when it is really changed: PostgreSQL 21000 for UPDATE or DELETE;
+  SQL Server 8672 for two UPDATEs, or an UPDATE and a DELETE (two DELETEs of a row are one, and count once);
+  Oracle ORA-30926 for two UPDATEs (a clause's WHERE that leaves a row alone counts nothing).
+- **Row counts.** PostgreSQL's command tag `MERGE n`, n the rows inserted, updated and deleted (not DO NOTHING's);
+  T-SQL's the same as its row count; Oracle's rows merged, a row updated and then deleted by DELETE WHERE counting once.
+- **RETURNING and OUTPUT.** PostgreSQL 17's `RETURNING` with `merge_action()` (both the target's and the source's
+  columns; a deleted row shows its old values); T-SQL's `OUTPUT` with `$action`, `inserted.c` (NULL for a deleted row),
+  `deleted.c` (NULL for an inserted one) and `deleted.*`. (`#old` now has its argument's type and name, so `OUTPUT
+  deleted.c` of an UPDATE is typed and named as c.)
+- **The statement is one.** Any error undoes it whole, in a block or outside one (as an INSERT's).
+
+**Dialect rules checked against the servers** (suites below):
+- PostgreSQL: WHEN [NOT] MATCHED [BY SOURCE | BY TARGET] [AND cond], DO NOTHING, DEFAULT VALUES, OVERRIDING, WITH, a
+  clause that does not fit is 42601; MERGE into a missing table 42P01.
+- T-SQL: the semicolon is required (10713); at most one clause per action in each kind (10714), a clause with no condition
+  last in its kind (5324); INSERT in a MATCHED or BY SOURCE clause 10711, UPDATE or DELETE in NOT MATCHED 10710; 109,
+  110 and 213 for the wrong number of values; 8102 for an identity column in SET; TOP (n) takes the first n joined rows;
+  `WITH (HOLDLOCK)` and the other hints are read and ignored.
+- Oracle: ON must be in parentheses (ORA-00969), at least one clause (ORA-02000, "missing WHEN keyword" and its kin for
+  DELETE alone, INSERT in WHEN MATCHED, a clause twice, BY TARGET); the two clauses in either order; `UPDATE SET ... [WHERE]
+  [DELETE WHERE]` (the DELETE WHERE reads the row as updated); `INSERT ... [WHERE]`; ORA-38104 for a column ON names
+  in SET; ORA-38101 for the target's column in INSERT's values; ORA-32795, ORA-32796 for identity; ORA-01407 for a NULL
+  into a NOT NULL column by UPDATE; in an UPDATE clause a name both tables have is the target's, in ON it is ORA-00918.
+
+**Tests** (answers recorded from PostgreSQL 18.6, SQL Server 2022 CU27 and Oracle Database Free 23ai):
+- `exec_merge` (gen_pg.py merge, 140 queries): an upsert, conditional clauses, DO NOTHING, DELETE, subquery, VALUES,
+  CTE and aggregate sources, 21000, a failed insert undoing the rows before it, NULL keys, a table without a key,
+  identity, serial and sequence defaults, OVERRIDING, DEFAULT, BY SOURCE and BY TARGET, RETURNING with merge_action(),
+  constraints and foreign keys, BEGIN/ROLLBACK/COMMIT, privileges per action, the errors.
+- `tds_merge` (gen_mssql.py merge, 128 batches): the same, with OUTPUT, $action, TOP, IDENTITY_INSERT, 8672 and its
+  exceptions, the clause rules (5324, 10710, 10711, 10713, 10714), @@ROWCOUNT, TRY ... CATCH.
+- `tns_merge` (gen_oracle.py merge, 87 answers; the generator has new kinds `t` and `u`: statements run in a
+  transaction that is rolled back or committed): the Oracle forms above, and its errors.
+- By hand: python-oracledb binds, executemany with arraydmlrowcounts, MERGE in an anonymous block with SQL%ROWCOUNT, and
+  psql's extended protocol with RETURNING, all as for INSERT.
+
+**Not done; differences.**
+- MERGE into a view: PostgreSQL merges into an automatically updatable view; lexdb's views are read-only (0A000).
+- PostgreSQL 18's `RETURNING WITH (OLD AS o, NEW AS n)`; `MERGE TOP (n) PERCENT`; T-SQL's `OUTPUT ... INTO` and `OPTION`.
+- A source row of all NULLs that matches a target row, in a statement with a BY SOURCE clause, reads as unmatched.
+- The statement's CMD in T-SQL's DONE token is 0xC6, a guess (the row count is right).
+- Oracle's ORA-30926 text has no rowid; Oracle's ORA-14359 for DELETE WHERE over duplicate source rows is ORA-30926 here.
+- INSERT's `WHEN NOT MATCHED` clause is evaluated per source row, so with a duplicate key in the source its second row
+  fails on the unique key, as in all three servers (error 23505, 2627, ORA-00001).
+
+### 9.122 MATCH_RECOGNIZE, row pattern recognition in all three doors
+
+`FROM item MATCH_RECOGNIZE (...)` (SQL:2016 R010, Oracle's syntax and semantics) is built once and read in three doors; the
+design and its as-built notes are in lexdb-match-recognize.md (section 12). The parser (`P.matchRecognize`) turns the
+clause into a wrapper subquery in FROM: `Stmt.mr` holds the `MatchRec`, the input is its one FROM item, and the planner and
+executor treat it as any FROM subquery (joins, CTEs, views, LATERAL, nesting and GROUP BY over it work through existing
+code). `planMatch` rewrites DEFINE and MEASURES into slots (`#mrnav`, one per navigation, aggregate, CLASSIFIER or
+MATCH_NUMBER) and `execMatch` sorts and partitions the input rows and searches each partition. The matcher is
+`lexdb_match.lxl`: the pattern is compiled to a program of SPLIT, JMP, VAR, BEGIN, END and MATCH with quantifiers
+unrolled, and run on an explicit stack in preference order (never recursion over rows); where every DEFINE reads only its
+own row a memo of failed states makes a search O((splits + variables) x rows); a history-dependent DEFINE is bounded by the
+session setting `max_match_steps` (10,000,000 per start row, 54001; 0 none). Each step and each output row takes
+`Run.tick` (turns, statement_timeout), the memo and the output rows count against max_statement_mem. Tests: `match_vm`,
+`exec_mrparse`, `exec_mr`, `exec_mrlimits`, and `tns_mr`, `exec_mrdoors`, `tds_mr` (163 cases each, recorded on Oracle
+Database Free 23ai by gen_mr.py from mr_cases.txt).
+A LATERAL input (and Oracle 12c's CROSS APPLY and OUTER APPLY) resolves outer references in the Oracle door as in the PostgreSQL door, an
+extension on Oracle, which raises 62521; tests in `tns_oracle` and `exec_mr`. In the Oracle door a qualifier naming no FROM item is
+ORA-00904 (was 942).
+
+### 9.123 Test options: --unsafe-no-sync and --cache-mb
+
+Built for the fast per-worker test servers of lexdb-gaps.md 2.7.
+
+- **`--unsafe-no-sync`** (tests only): no fdatasync and no fsync. There are two places that sync, both in
+  `lexdb_disk.lxl`: `File.flush` (fdatasync: log commits, checkpoint and data file) and `Fs.syncDir` (after a create,
+  rename or remove; the log segment switch, the spare file and the checkpoint all go through them). With the flag
+  (`lexdb_disk.setNoSync`, one module variable, set in `main` before anything starts) both return at once. Data is still
+  written with pwrite, so a clean stop and restart keeps everything, and so does a SIGKILL of the process (the kernel
+  keeps its page cache); only a power cut or kernel crash can lose or tear it. The simulated `Fs` is untouched: its
+  flush is the model of durability, so `store_crash`, `disk_sim` and `tests/lexdb/crash.py` still test with syncing on
+  (crash.py does not pass the flag). A warning line goes to stderr at start. Workers of `--replicas` are forks, so they
+  inherit the flag, and `--replica` takes it too (a replica writes its own files); no combination is refused.
+- **`--cache-mb N`**: the cache budget, 1 to 1,048,576 MB; anything else (zero, negative, not a number, or too big to
+  parse as an integer) exits 2 with a message, so the `N * 1048576` can never overflow. The default is a quarter of the
+  memory, 128 MB at least (`opts0`), which is where "cache 4 of 11987 MB" came from. The option beats
+  `LEXDB_CACHE_MB`, which is now checked the same way (it used to ignore 0 and could overflow).
+- **Measured** (btrfs, one psql session running a file, 2,000 autocommit single-row INSERTs into a table with a primary
+  key; then 500 pairs of INSERT and TRUNCATE; two runs each, they agreed within 1%):
+
+  | | default | `--unsafe-no-sync` |
+  |---|---|---|
+  | 2,000 autocommit INSERTs | 1,275 to 1,287 ms (0.64 ms each) | 136 to 139 ms (0.07 ms each) |
+  | 500 INSERT + TRUNCATE pairs | 639 to 641 ms | 67 ms |
+
+  About 9.4 times faster.
+- Tests: `tests/lexdb/nosync.py` (stand-alone, like crash.py and replica.py): bad `--cache-mb` values refused, the
+  warning, the stop line's budget, a clean stop and restart keeping the rows (after a TRUNCATE too), and a supervised
+  master with a replica under the flag.
+
+### 9.124 The log in a directory of its own: --log-dir
+
+`lexdb DATADIR --log-dir LOGDIR` keeps the write-ahead log segments (`log.N`) and the spare (`log.spare`) in LOGDIR,
+and only `data.lxdb`, the lock and the replication socket in DATADIR, so the log's fsyncs can go to another device and a
+full data disk does not stop the log (lexdb-gaps.md 2.6, which also records the decision against tablespaces). LOGDIR
+(and its parents) is made when DATADIR is new. It is fixed when the database is made: it is required at every later
+start, and for `--replica` and `--replicas` too (the option is a module variable set before the workers are forked, so
+each worker has it). The copy-on-write flag (9.61) is set on LOGDIR as on DATADIR.
+
+- **Code.** `Db` has `logFs` beside `fs`; the segment open and switch (`openSeg`), the checkpoint's removal and
+  renaming of old segments, and recovery's `replay` use it, and the follower's `Fol.fs` is the log's. `Fs.syncDir` is a
+  method of the `Fs` it is called on, so a create, rename or remove of a segment syncs LOGDIR and never DATADIR.
+  `--unsafe-no-sync` (9.123) is a module variable of `lexdb_disk`, so it covers both. `open`, `run` and `openReplica`
+  keep their signatures (log in the data `Fs`); `openSplit`, `runSplit` and `openReplicaSplit` take the second `Fs`. The
+  simulation is made of two `Fs` (two `lexdb_disk.sim`), crashed separately.
+- **The start-up check (`checkLog`).** DATADIR has a file `logdir` when it was made with a log directory: plain text (a page padded with zeros until 9.125; both read the same),
+  `lexdb-logdir 1`, a random 128-bit id in hex, and the directory's path (for messages only). LOGDIR has `logid`: `lexdb-log 1` and
+  the same id. Both are written to a temporary name, flushed and renamed (so never half written). At every start:
+  - DATADIR has `logdir` and no `--log-dir`: refused, naming the directory to give;
+  - DATADIR has `logdir` and `--log-dir`: LOGDIR must have a `logid` with the same id, else refused ("missing or is not
+    this database's" when there is none, "belongs to another database" when the id differs). LOGDIR is not made, and
+    the path is not compared, only the id, so a log directory moved or mounted elsewhere is fine and a copy of another
+    database's is not;
+  - no `logdir` and `--log-dir`: if DATADIR is new (no segment, and a missing or empty `data.lxdb`) a database is made:
+    LOGDIR is made if missing, refused when it holds any `log.<digits>` (whatever the number) or `log.spare`, or any file but `logid` (a log of some other database,
+    which would be replayed from its start), then `logid` is written, then `logdir`; otherwise (a database made without
+    the option) refused, "start it without --log-dir". A crash between the two writes leaves a `logid` and no segment, which the next start replaces;
+  - no `logdir` and no `--log-dir`: nothing changes, one `exists` call; a directory made without the option has no
+    new file in it, and existing directories keep working.
+  A replica runs the same check but never makes anything. Under `--replicas` a refusal ends the master worker with exit
+  code 3; since 9.126 the supervisor does not restart it but stops at once (it used to retry until "the workers ended too often").
+- **Not done.** The two directories are not locked separately: the lock is DATADIR's, and two databases cannot share a
+  LOGDIR (the second is refused: it has a log), but a log directory is not locked against a stray server on a copy of
+  DATADIR with the same id. ENOSPC on either directory is tested since 9.126 (lexdb-gaps.md 2.6).
+- **Tests.** `tests/lexdb/run/store_logdir.lxl`: the refusals on simulated file systems, and 90 crashes of two
+  `Fs` with the segments only in the log one and the data file only in the other. `tests/lexdb/logdir.py` (stand-alone,
+  like `nosync.py`): real processes, the segments in LOGDIR and none in DATADIR, restart and restart after SIGKILL, every
+  refusal above (also a moved-away log directory), a plain directory with no new files, `--replica` and `--replicas` with
+  `--log-dir` and a replica refused without it, and `--unsafe-no-sync` with it.
+
+### 9.125 The page file always through the page cache
+
+Decision (2026-11-14): `data.lxdb` is opened without `O_DIRECT` for the master, replicas and followers alike. The numbers
+are in 9.69 and 9.70: equal to `O_DIRECT` when the data is cached, faster on misses up to 8 clients, about 9% slower at
+32 clients with an 8 MB cache before the lazy-leaf change (9.70's later sections).
+
+- **Removed.** `LEXDB_PAGES` (the environment variable is no longer read, so setting it does nothing), `Options.bufferedPages`
+  and its plumbing (`openFollowerHow`'s flag, the test `Options` literals), and the `Fs.open` of the page file in `openIn`,
+  `openFollowerHow` and `audit`. The reads of the page file are the inline `fs.pread` of 9.69.
+- **Kept.** Log segments stay `O_DIRECT` (`Fs.open`, `fs.preadDirect`): the log is written once and read at recovery and
+  by followers, and its flush is the commit. `Fs.openBuffered` is now the page file's open (and the marker files').
+- **Marker files.** `logdir` and `logid` (9.124) are plain text with no padding, written and read through the buffered open
+  (`File.writeText`, `File.readText`; the tmp file is removed first so a stale longer one cannot leave a tail), still
+  written to a temporary name, flushed and renamed. A file padded to a page by an earlier build is read up to its first zero byte.
+- **Not measured, to watch.** A database larger than RAM (the kernel evicts pages the lexdb cache may want back); cold
+  scans with the kernel's read-ahead (it may help or read pages the scan skips); memory held twice, the kernel's page cache
+  and lexdb's decoded cache (`LEXDB_CACHE_MB` no longer bounds the RSS of the data); heavy writes filling the page cache
+  (checkpoints write dirty pages that the kernel flushes in its own time, then `fdatasync`).
+- **Tests.** The suite (156), `logdir.py`, `nosync.py`, `replica.py` and the crash test (20 rounds) pass; the crash test has
+  one mode.
+
+### 9.126 ENOSPC tested; the supervisor stops on a refused start
+
+**A full disk (lexdb-gaps.md 2.6).** The simulated `Fs` has `limitSpace(n)`: all files together may hold n bytes (`-1`
+lifts it), and a write or `grow` past it fails with errno 28 (`ioErr`: `pwrite: errno 28`, `fallocate: errno 28`, state
+`S_IO`), as a full file system does; `usedSpace()` gives the bytes in use. `tests/lexdb/run/store_enospc.lxl` runs it for
+the log (a new segment cannot be made) and for a checkpoint (the page file cannot grow). Behaviour, the same as for EIO:
+- the failing commit (or checkpoint) returns the error to its caller; no crash, no hang; the commits acknowledged before it stay;
+- the store is then **failed** (`Db.failed`): every later commit, checkpoint and also read returns the first error, even
+  after space is added. It does not continue: **it needs a restart**. Closing it is clean;
+- a restart with the disk still full opens and reads every acknowledged commit; a reopen after space is added (clean
+  close, and after a simulated crash) holds exactly the acknowledged commits, none that failed, and takes new ones.
+The real `Fs` passes the errno on as `ioErr(op, errno)`: the message is `pwrite: errno 28` (no text such as "No space left on
+device"); not changed. `writeText` (the small marker files) does not check the limit.
+
+**The supervisor does not restart a refused master.** A master that cannot start (`runMaster`: the lock held, the store
+refusing to open, such as `checkLog`'s refusals, the bootstrap, a listener that will not bind) exits with `EXIT_REFUSED`
+(3) under `--replicas` (1 as before without it: `START_FAIL`). `task.WorkerPolicy` has a new field `fatalCode`: a worker
+that exits with it before `workerReady()` is not restarted, the others get SIGTERM, and `workers` returns `Err(GaveUp)` at
+once; `lexdb` prints "the master was refused at start-up (see the message above): stopped, not restarted" and exits 1.
+Crashes after serving keep the restart behaviour. A replica waiting for its master (`lexdb_repl.connect`) now ends its wait
+on SIGTERM (it ignored it for up to 60 s). Tests: `logdir.py`'s two supervised refusals (exit 1 within seconds, the message once).
+
+### 9.127 Dropped trees a snapshot loaded are freed whole; a log frame's length is checked
+
+Found by reading while designing bulk deletes (lexdb-bulkdelete.md section 7), then confirmed by tests.
+
+- **A page leak.** A snapshot that began before a DROP or TRUNCATE can read the dropped tree after it. The tree's slots not in memory at the drop were deferred with their heights (9.32); the snapshot loads one, `installOnly` gives its children slots, and once the snapshot ended `releaseSlot` freed only that node's page: the children's slots and pages were reached by nothing and never returned to the free list (`audit`: lost 107 to 179 pages of 747). `Deferred` has a `whole` flag, set by `applyDrop`; `releaseWhole` frees the loaded, unpinned children first (pinned ones have their own entries, after it in the list), then the node by `releaseSlot`. Test `store_dropsnap`: drop and truncate, a snapshot reading one path or a scan, `lost 0`.
+- **The frame length.** `frame` wrote a batch's payload length as a u32, unchecked; a batch of over 4 GiB would be a frame recovery stops at, losing it and what follows. `commitLive` now refuses, before applying anything, a commit whose records (`recordsLen`) pass `FRAME_MAX` (2^32 less a page) with 54000 "transaction too large"; one that fits but not the batch pending waits for the writer to take it (on `ckptDone`, which the writer completes). `Store.setFrameMax` lowers the limit for tests: `store_framemax`.

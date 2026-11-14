@@ -371,6 +371,9 @@ pub type Header = value record {
 // The header in the first 8 bytes of h. E_PROTOCOL for a length below 8.
 pub fn parseHeader(h: &[byte]): Result[Header, Error] {
     if len(h) < HEADER { return Err(proto("a packet header needs 8 bytes")) }
+    // a TLS handshake record (type 22) first: TDS 8.0's strict encryption, which starts with TLS (not supported here: the
+    // connection is closed at once, not left waiting for a packet its length asks for)
+    if h[0] == 22 && h[1] == 3 { return Err(proto("a TLS record where a TDS packet is expected (encrypt=strict, TDS 8.0, is not supported)")) }
     let n = (int(h[2]) << 8) | int(h[3])
     if n < HEADER { return Err(proto(&("a packet length of " + n.toStr()))) }
     return Ok(Header{ptype: int(h[0]), status: int(h[1]), length: n, spid: (int(h[4]) << 8) | int(h[5]), id: int(h[6])})
@@ -1625,6 +1628,130 @@ pub type RpcParam = record {
     pub byDefault: bool
     pub column: Column
     pub value: Cell
+    pub table: Option[TableValue]     // a table-valued parameter (column.tdsType T_TABLE; value Null)
+}
+
+// A table-valued parameter as a server reads it (MS-TDS 2.2.5.5.5, TVP_TYPE_INFO
+// and its rows): the type's name in its three parts (as sent; "" when not),
+// its columns (flags: COL_DEFAULT for a column whose values are not sent,
+// the server's to fill; name: ColName, usually ""), and its rows, a Cell
+// for every column but those. isDefault: TVP_NULL_TOKEN, no metadata (the
+// type's default, an empty table).
+pub type TableValue = record {
+    pub db: str
+    pub schema: str
+    pub typeName: str
+    pub columns: []Column
+    pub rows: [][]Cell
+    pub isDefault: bool
+}
+
+// Whether a table-valued parameter's column is the server's to fill (fDefault).
+pub fn (c: &Column) byServer(): bool { return (c.flags & COL_DEFAULT) != 0 }
+
+// The most rows plus values a table-valued parameter read by parseRpc may
+// hold (a request is at most what the server reads whole; this bounds the
+// memory its cells take).
+pub const MAX_TABLE_CELLS = 8388608
+
+const TVP_ORDER_UNIQUE = 0x10
+const TVP_COLUMN_ORDERING = 0x11
+
+// A parameter's TYPE_INFO, its value after it: as a column's, but text,
+// ntext and image without a table name, and their values without a text
+// pointer: the length (0xFFFFFFFF NULL), then the bytes (SqlClient sends a
+// long string as ntext).
+fn paramTypeInfo(c: mut &Cur, col: mut &Column): Result[Unit, Error] {
+    if col.tdsType == T_TEXT || col.tdsType == T_NTEXT || col.tdsType == T_IMAGE {
+        col.framing = F_TEXT
+        col.size = try c.u32("TYPE_INFO")
+        if col.tdsType != T_IMAGE { col.collation = try parseCollation(&(try c.take(5, "TYPE_INFO"))) }
+        return Ok(Unit{})
+    }
+    return typeInfo(c, col)
+}
+
+fn paramValue(c: mut &Cur, col: &Column): Result[Cell, Error] {
+    if col.tdsType == T_TEXT || col.tdsType == T_NTEXT || col.tdsType == T_IMAGE {
+        let vlen = try c.u32("a parameter's value")
+        if vlen == 0xFFFFFFFF { return Ok(Cell.Null) }
+        return Ok(decodeValue(col, &(try c.take(vlen, "a parameter's value"))))
+    }
+    return readValue(c, col)
+}
+
+// TVP_TYPE_INFO after its TVPTYPE byte, then the rows (TVP_ROW_TOKEN and a
+// TYPE_VARBYTE per column sent, ..., TVP_END_TOKEN). E_PROTOCOL for
+// anything malformed: no columns, more than MAX_TABLE_COLUMNS, a column of
+// a table type, an unknown token, more than MAX_TABLE_CELLS
+// rows and values, a column count of a type's default with rows after it.
+fn tableValue(c: mut &Cur): Result[TableValue, Error] {
+    var tv = TableValue{db: "", schema: "", typeName: "", columns: [], rows: [], isDefault: false}
+    tv.db = try c.bvarchar("a table type's database")
+    tv.schema = try c.bvarchar("a table type's schema")
+    tv.typeName = try c.bvarchar("a table type's name")
+    let n = try c.u16("a table-valued parameter's column count")
+    if n == TVP_NULL {
+        tv.isDefault = true
+    } else {
+        if n < 1 || n > MAX_TABLE_COLUMNS {
+            return Err(proto(&("a table-valued parameter of " + n.toStr() + " columns (1 to " + MAX_TABLE_COLUMNS.toStr() + ")")))
+        }
+        for i in 0..n {
+            let userType = try c.u32("a table-valued parameter's column")
+            let flags = try c.u16("a table-valued parameter's column")
+            var col = column(try c.u8("a table-valued parameter's column type"))
+            if col.tdsType == T_TABLE { return Err(proto("a table-valued parameter's column of a table type")) }
+            let t = col.tdsType
+            if (t == T_DECIMALN || t == T_NUMERICN) && c.left() >= 3 && int(c.s[c.pos + 1]) == 0 {
+                // mssql-jdbc's column of a table without rows, its precision unknown: decimal(0, 0), taken as 38
+                col.framing = F_BYTE
+                col.size = try c.u8("TYPE_INFO")
+                let p = try c.u8("TYPE_INFO")
+                col.precision = 38
+                col.scale = try c.u8("TYPE_INFO")
+                if col.size != 5 && col.size != 9 && col.size != 13 && col.size != 17 { return Err(proto(&(col.typeName() + " with length " + col.size.toStr()))) }
+                if col.scale > 38 { return Err(proto(&(col.typeName() + " with scale " + col.scale.toStr()))) }
+            } else {
+                try paramTypeInfo(c, mut &col)
+            }
+            col.userType = userType
+            col.flags = flags
+            col.name = try c.bvarchar("a table-valued parameter's column name")
+            append(mut &tv.columns, col)
+        }
+    }
+    // TVP_ORDER_UNIQUE, TVP_COLUMN_ORDERING (hints: read, not kept), then TVP_END_TOKEN
+    while true {
+        let t = try c.u8("a table-valued parameter's metadata")
+        if t == TVP_END { break }
+        if t == TVP_ORDER_UNIQUE {
+            let k = try c.u16("TVP_ORDER_UNIQUE")
+            try c.skip(3 * k, "TVP_ORDER_UNIQUE")
+        } else if t == TVP_COLUMN_ORDERING {
+            let k = try c.u16("TVP_COLUMN_ORDERING")
+            try c.skip(2 * k, "TVP_COLUMN_ORDERING")
+        } else {
+            return Err(proto(&("a table-valued parameter's metadata token 0x" + strings.hex(t))))
+        }
+    }
+    var cells = 0
+    while true {
+        let t = try c.u8("a table-valued parameter's row")
+        if t == TVP_END { break }
+        if t != TVP_ROW { return Err(proto(&("a table-valued parameter's row token 0x" + strings.hex(t)))) }
+        if tv.isDefault { return Err(proto("rows in a table-valued parameter sent as its default")) }
+        cells += 1 + len(tv.columns)
+        if cells > MAX_TABLE_CELLS {
+            return Err(proto(&("a table-valued parameter of more than " + MAX_TABLE_CELLS.toStr() + " rows and values")))
+        }
+        var row: []Cell = []
+        for i in 0..len(tv.columns) {
+            if !tv.columns[i].byServer() { append(mut &row, try paramValue(c, &tv.columns[i])) }
+        }
+        append(mut &tv.rows, row)
+    }
+    return Ok(tv)
 }
 
 // One procedure call of an RPC request: a well-known procedure by its id
@@ -1644,11 +1771,12 @@ pub const PROC_PREPEXECRPC = 14
 pub const PROC_UNPREPARE = 15
 
 // An RPC request's calls (several in one request, each after a batch
-// separator). E_PROTOCOL for anything malformed; a table-valued parameter
-// or another type this decoder does not know is E_PROTOCOL too.
+// separator). E_PROTOCOL for anything malformed; a type this decoder does
+// not know is E_PROTOCOL too. A table-valued parameter's rows are in its
+// table (tableValue).
 pub fn parseRpc(d: &str): Result[[]RpcCall, Error] {
     let h = try allHeadersOf(&d)
-    var c = cursor(d)
+    var c = cursor(&d)
     c.pos = h.end
     var calls: []RpcCall = []
     while c.left() > 0 {
@@ -1671,20 +1799,16 @@ pub fn parseRpc(d: &str): Result[[]RpcCall, Error] {
             var col = column(try c.u8("a parameter's type"))
             col.name = name
             var v = Cell.Null
-            if col.tdsType == T_TEXT || col.tdsType == T_NTEXT || col.tdsType == T_IMAGE {
-                // a parameter's TYPE_INFO has no table name, and its value no
-                // text pointer: the length (0xFFFFFFFF NULL), then the bytes
-                // (SqlClient sends a long string as ntext)
-                col.framing = F_TEXT
-                col.size = try c.u32("TYPE_INFO")
-                if col.tdsType != T_IMAGE { col.collation = try parseCollation(&(try c.take(5, "TYPE_INFO"))) }
-                let vlen = try c.u32("a parameter's value")
-                if vlen != 0xFFFFFFFF { v = decodeValue(&col, &(try c.take(vlen, "a parameter's value"))) }
+            var table: Option[TableValue] = None
+            if col.tdsType == T_TABLE {
+                col.framing = F_NONE
+                table = Some(try tableValue(mut &c))
             } else {
-                try typeInfo(mut &c, mut &col)
-                v = try readValue(mut &c, &col)
+                try paramTypeInfo(mut &c, mut &col)
+                v = try paramValue(mut &c, &col)
             }
-            append(mut &call.params, RpcParam{name: name, output: (status & 1) != 0, byDefault: (status & 2) != 0, column: col, value: v})
+            append(mut &call.params, RpcParam{name: name, output: (status & 1) != 0, byDefault: (status & 2) != 0, column: col, value: v,
+                                              table: table})
         }
         append(mut &calls, call)
     }
@@ -2189,7 +2313,8 @@ fn pow10i(n: int): int {
 // with the column's scale as its display scale.
 fn decimalCell(b: &str, scale: int): Cell {
     let n = len(b) - 1
-    if n != 4 && n != 8 && n != 12 && n != 16 { return Cell.Failed("a decimal of " + len(b).toStr() + " bytes") }
+    // (SQL Server always sends 4, 8, 12 or 16 bytes of magnitude, the client's parameter (mssql-jdbc) as many as the value needs)
+    if n < 1 || n > 16 { return Cell.Failed("a decimal of " + len(b).toStr() + " bytes") }
     if scale < 0 || scale > 38 { return Cell.Failed("a decimal with scale " + scale.toStr()) }
     var m: u128 = 0
     for k in 0..n { m = m | (u128(b[1 + k]) << (8 * k)) }

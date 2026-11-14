@@ -1,0 +1,4410 @@
+// lexdb_plsql: PL/SQL for the Oracle door (design/lexdb-oracle.md, stage O6): anonymous blocks, stored
+// procedures and functions, and the interpreter that runs them. Parsed whole before anything runs (a
+// syntax error runs none of it), then run against a session.
+//
+// A unit's variables are slots of a frame, numbered when it is compiled: the first are SQL%ROWCOUNT and
+// the like, then the block's binds (:name), then the declared variables, record fields (a record is one slot
+// per field), cursor attributes and temporaries. An expression is lexdb's SQL: the text of
+// `SELECT expr` with each variable replaced by $slot+1, run by the executor with the frame's values as its
+// parameters (as lexdb_tsql runs T-SQL's @variables). A call of a stored function inside an expression is
+// run first, its value put in a temporary slot the text names ("hoisted"); so such a call cannot be inside
+// a SQL statement of the block. Errors are lexdb's DbErr: an Oracle number is the state ORAnnnnn, a user
+// exception PLXn; `context` has the ORA-06512 lines that say where it went through.
+import "strings"
+import "tns"
+import "task"
+import "./lexdb_base"
+import "./lexdb_sql"
+import "./lexdb_exec"
+import "./lexdb_store"
+import "./lexdb_oratext"
+import "./lexdb_time"
+
+type DbErr = lexdb_base.DbErr
+type Val = lexdb_sql.Val
+type TypeName = lexdb_sql.TypeName
+type Stmt = lexdb_sql.Stmt
+
+// ---- tokens
+
+const TK_EOF = 0
+const TK_ID = 1         // an identifier or keyword; up is its upper case
+const TK_QID = 2        // "quoted": text is the name as written, up too
+const TK_STR = 3        // 'text', q'[text]', N'text'
+const TK_NUM = 4
+const TK_OP = 5
+const TK_BIND = 6       // :name or :1 (up the upper-case name)
+
+type Tok = value record { kind: int; text: str; up: str; s: int; e: int; line: int; col: int }
+
+fn isIdStart(c: byte): bool { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c >= 0x80 }
+fn isIdChar(c: byte): bool { return isIdStart(c) || (c >= '0' && c <= '9') || c == '_' || c == '$' || c == '#' }
+fn isDig(c: byte): bool { return c >= '0' && c <= '9' }
+
+fn plErr(state: str, msg: str): DbErr { return lexdb_base.err(state, msg) }
+
+fn closer(c: byte): byte {
+    if c == '[' { return ']' }
+    if c == '(' { return ')' }
+    if c == '{' { return '}' }
+    if c == '<' { return '>' }
+    return c
+}
+
+fn lex(src: &str): Result[[]Tok, DbErr] {
+    var out: []Tok = []
+    let n = len(src)
+    var i = 0
+    var line = 1
+    var ls = 0
+    while i < n {
+        let c = src[i]
+        if c == '\n' {
+            line += 1
+            ls = i + 1
+            i += 1
+            continue
+        }
+        if c == ' ' || c == '\t' || c == '\r' || c == '\x0c' {
+            i += 1
+            continue
+        }
+        if c == '-' && i + 1 < n && src[i + 1] == '-' {
+            while i < n && src[i] != '\n' { i += 1 }
+            continue
+        }
+        if c == '/' && i + 1 < n && src[i + 1] == '*' {
+            var j = i + 2
+            while j + 1 < n && !(src[j] == '*' && src[j + 1] == '/') {
+                if src[j] == '\n' {
+                    line += 1
+                    ls = j + 1
+                }
+                j += 1
+            }
+            if j + 1 >= n { return Err(plErr("ORA06550", "unterminated comment")) }
+            i = j + 2
+            continue
+        }
+        let col = i - ls + 1
+        let start = i
+        // q'[...]' and nq'[...]'
+        if (c == 'q' || c == 'Q' || ((c == 'n' || c == 'N') && i + 1 < n && (src[i + 1] == 'q' || src[i + 1] == 'Q'))) {
+            var j = i + 1
+            if c == 'n' || c == 'N' { j += 1 }
+            if j + 1 < n && src[j] == '\'' {
+                let d = src[j + 1]
+                let cl = closer(d)
+                var k = j + 2
+                while k + 1 < n && !(src[k] == cl && src[k + 1] == '\'') {
+                    if src[k] == '\n' {
+                        line += 1
+                        ls = k + 1
+                    }
+                    k += 1
+                }
+                if k + 1 >= n { return Err(plErr("ORA01756", "quoted string not properly terminated")) }
+                append(mut &out, Tok{kind: TK_STR, text: src[start..k + 2], up: "", s: start, e: k + 2, line: line, col: col})
+                i = k + 2
+                continue
+            }
+        }
+        if isIdStart(c) {
+            // N'...' national strings
+            if (c == 'n' || c == 'N') && i + 1 < n && src[i + 1] == '\'' {
+                i += 1
+                var j = i + 1
+                while j < n {
+                    if src[j] == '\'' {
+                        if j + 1 < n && src[j + 1] == '\'' {
+                            j += 2
+                            continue
+                        }
+                        break
+                    }
+                    j += 1
+                }
+                if j >= n { return Err(plErr("ORA01756", "quoted string not properly terminated")) }
+                append(mut &out, Tok{kind: TK_STR, text: src[start..j + 1], up: "", s: start, e: j + 1, line: line, col: col})
+                i = j + 1
+                continue
+            }
+            var j = i
+            while j < n && isIdChar(src[j]) { j += 1 }
+            let w = src[i..j]
+            append(mut &out, Tok{kind: TK_ID, text: w, up: strings.toUpperAscii(&w), s: i, e: j, line: line, col: col})
+            i = j
+            continue
+        }
+        if isDig(c) || (c == '.' && i + 1 < n && isDig(src[i + 1])) {
+            var j = i
+            while j < n && isDig(src[j]) { j += 1 }
+            if j < n && src[j] == '.' && !(j + 1 < n && src[j + 1] == '.') {
+                j += 1
+                while j < n && isDig(src[j]) { j += 1 }
+            }
+            if j < n && (src[j] == 'e' || src[j] == 'E') {
+                var k = j + 1
+                if k < n && (src[k] == '+' || src[k] == '-') { k += 1 }
+                if k < n && isDig(src[k]) {
+                    while k < n && isDig(src[k]) { k += 1 }
+                    j = k
+                }
+            }
+            if j < n && (src[j] == 'f' || src[j] == 'F' || src[j] == 'd' || src[j] == 'D') && !(j + 1 < n && isIdChar(src[j + 1])) { j += 1 }
+            append(mut &out, Tok{kind: TK_NUM, text: src[i..j], up: "", s: i, e: j, line: line, col: col})
+            i = j
+            continue
+        }
+        if c == '\'' {
+            var j = i + 1
+            while j < n {
+                if src[j] == '\n' {
+                    line += 1
+                    ls = j + 1
+                }
+                if src[j] == '\'' {
+                    if j + 1 < n && src[j + 1] == '\'' {
+                        j += 2
+                        continue
+                    }
+                    break
+                }
+                j += 1
+            }
+            if j >= n { return Err(plErr("ORA01756", "quoted string not properly terminated")) }
+            append(mut &out, Tok{kind: TK_STR, text: src[i..j + 1], up: "", s: i, e: j + 1, line: line, col: col})
+            i = j + 1
+            continue
+        }
+        if c == '"' {
+            var j = i + 1
+            while j < n && src[j] != '"' { j += 1 }
+            if j >= n { return Err(plErr("ORA00972", "identifier is too long")) }
+            append(mut &out, Tok{kind: TK_QID, text: src[i + 1..j], up: src[i + 1..j], s: i, e: j + 1, line: line, col: col})
+            i = j + 1
+            continue
+        }
+        if c == ':' && i + 1 < n && src[i + 1] != '=' && (isIdStart(src[i + 1]) || isDig(src[i + 1])) {
+            var j = i + 1
+            while j < n && (isIdChar(src[j])) { j += 1 }
+            append(mut &out, Tok{kind: TK_BIND, text: src[i..j], up: strings.toUpperAscii(src[i + 1..j]), s: i, e: j, line: line, col: col})
+            i = j
+            continue
+        }
+        // operators
+        var op = src[i..i + 1]
+        if i + 1 < n {
+            let two = src[i..i + 2]
+            if two == ":=" || two == "=>" || two == ".." || two == "**" || two == "||" || two == "<<" || two == ">>" || two == "<>" ||
+               two == "!=" || two == "~=" || two == "^=" || two == "<=" || two == ">=" {
+                op = two
+            }
+        }
+        append(mut &out, Tok{kind: TK_OP, text: op, up: op, s: i, e: i + len(op), line: line, col: col})
+        i += len(op)
+    }
+    append(mut &out, Tok{kind: TK_EOF, text: "", up: "", s: n, e: n, line: line, col: n - ls + 1})
+    return Ok(out)
+}
+
+// ---- types of variables
+
+const PK_NUM = 1
+const PK_INT = 2        // INTEGER, PLS_INTEGER, ...: whole numbers
+const PK_TEXT = 3       // VARCHAR2(len), CHAR, CLOB (len 0: no limit)
+const PK_BOOL = 4
+const PK_DATE = 5
+const PK_TS = 6
+const PK_TSTZ = 7
+const PK_RAW = 8
+const PK_FLOAT = 9      // BINARY_FLOAT (oid 700), BINARY_DOUBLE (701)
+const PK_REFCUR = 10    // a REF CURSOR variable (and SYS_REFCURSOR)
+const PK_CUR = 11       // an explicit cursor
+const PK_REC = 12       // a record: its fields are the slots from its own
+const PK_EXC = 13       // an exception
+const PK_ANY = 14       // not known (a temporary)
+
+type PT = value record { k: int; len: int; prec: int; scale: int; oid: int; rec: int }
+
+fn pt(k: int): PT { return PT{k: k, len: 0, prec: 0, scale: 0, oid: 0, rec: -1} }
+
+fn oidOf(t: &PT): int {
+    if t.k == PK_NUM { return lexdb_sql.OID_NUMERIC }
+    if t.k == PK_INT { return lexdb_sql.OID_INT8 }
+    if t.k == PK_TEXT { return lexdb_sql.OID_TEXT }
+    if t.k == PK_BOOL { return lexdb_sql.OID_BOOL }
+    if t.k == PK_DATE || t.k == PK_TS { return lexdb_sql.OID_TS }
+    if t.k == PK_TSTZ { return lexdb_sql.OID_TSTZ }
+    if t.k == PK_RAW { return lexdb_sql.OID_BYTEA }
+    if t.k == PK_FLOAT { return if t.oid == lexdb_sql.OID_FLOAT4 { lexdb_sql.OID_FLOAT4 } else { lexdb_sql.OID_FLOAT8 } }
+    if t.k == PK_ANY { return lexdb_sql.OID_UNKNOWN }
+    return lexdb_sql.OID_TEXT
+}
+
+// The type a value of a column's result as PL/SQL's %TYPE sees it.
+fn ptOfOut(o: &lexdb_exec.OutCol): PT {
+    let tag = lexdb_exec.declTag(o.scale)
+    var t = pt(PK_TEXT)
+    if tag == lexdb_exec.ORA_VARCHAR {
+        t.len = lexdb_exec.declA(o.scale)
+        return t
+    }
+    if tag == lexdb_exec.ORA_NUMBER {
+        t = pt(PK_NUM)
+        t.prec = lexdb_exec.declA(o.scale)
+        t.scale = lexdb_exec.declB(o.scale)
+        return t
+    }
+    if tag == lexdb_exec.ORA_CLOB { return t }
+    if tag == lexdb_exec.ORA_BLOB { return pt(PK_RAW) }
+    let d = o.oid
+    if d == lexdb_sql.OID_INT8 || d == lexdb_sql.OID_INT4 || d == lexdb_sql.OID_INT2 { return pt(PK_INT) }
+    if d == lexdb_sql.OID_NUMERIC { return pt(PK_NUM) }
+    if d == lexdb_sql.OID_BOOL { return pt(PK_BOOL) }
+    if d == lexdb_sql.OID_TS || d == lexdb_sql.OID_DATE { return pt(if o.scale == 0 { PK_DATE } else { PK_TS }) }
+    if d == lexdb_sql.OID_TSTZ { return pt(PK_TSTZ) }
+    if d == lexdb_sql.OID_BYTEA { return pt(PK_RAW) }
+    if d == lexdb_sql.OID_FLOAT4 || d == lexdb_sql.OID_FLOAT8 {
+        t = pt(PK_FLOAT)
+        t.oid = d
+        return t
+    }
+    return t
+}
+
+// ---- the tree
+
+const K_EXPR = 1        // an expression: sql (SELECT ...), pre (stored function calls to run first)
+const K_ASSIGN = 2      // slot := x[0]
+const K_SQL = 3         // a SQL statement: sql, ival SQ_*, slots the INTO targets
+const K_IF = 4          // body: K_BRANCHes (x[0] the condition), els
+const K_BRANCH = 5
+const K_CASE = 6        // x[0] the selector (none: searched); body: K_BRANCHes (x[0] the value or condition); els; flag has ELSE
+const K_LOOP = 7
+const K_WHILE = 8       // x[0] the condition
+const K_FORNUM = 9      // slot, x[0] low, x[1] high, flag REVERSE
+const K_FORCUR = 10     // slot the first field of the record; x[0] the query (or cursor ival >= 0 by its def); slots: cursor params
+const K_EXIT = 11       // x[0] condition (if any), names[0] label
+const K_CONT = 12
+const K_RETURN = 13     // x[0] the value (a function's)
+const K_NULL = 14
+const K_BLOCK = 15      // decl, body, hs
+const K_HANDLER = 16    // names the exceptions (OTHERS), body
+const K_RAISE = 17      // names[0] the exception, none: raise the one handled; ival the uid
+const K_RAPP = 18       // RAISE_APPLICATION_ERROR: x[0] code, x[1] message
+const K_EXECIMM = 19    // x[0] the statement text; slots INTO; x[1..] USING values, names the modes ("IN", "OUT", "IN OUT"), els target
+const K_OPEN = 20       // slot the cursor variable, ival the cursor def (-1: OPEN FOR x[0] query text or query), x the arguments
+const K_FETCH = 21      // slot the cursor, slots INTO
+const K_CLOSE = 22
+const K_CALL = 23       // a stored procedure: names the path, x the arguments (names2 their names), slots the OUT targets (-1 none)
+const K_HOIST = 24      // a stored function inside an expression: slot gets its value
+const K_BUILTIN = 25    // DBMS_OUTPUT.PUT_LINE and the like: names[0] the name, x the arguments
+const K_DECL = 26       // a variable's start value: slot, x[0] its initialiser (none: NULL), flag NOT NULL, pt in ival's slot type
+const K_ELEM = 27       // an element of a collection assigned (not built)
+const K_FORALL = 28
+
+const SQ_DML = 1
+const SQ_SELECT_INTO = 2
+const SQ_TCL = 3        // COMMIT, ROLLBACK, SAVEPOINT, ROLLBACK TO
+const SQ_OTHER = 4      // DDL, LOCK, SET TRANSACTION, ...
+const SQ_RETURNING = 5  // DML ... RETURNING ... INTO slots
+const SQ_QUERY = 6      // a SELECT run for its rows only (a cursor's, an implicit result)
+
+// A node of the tree: one record for every kind, as lexdb_tsqlparse's TStmt is.
+type P = record {
+    kind: int
+    line: int
+    sql: str
+    sid: int
+    slot: int
+    slots: []int
+    names: []str
+    names2: []str
+    ival: int
+    flag: bool
+    lit: Val
+    isLit: bool
+    x: []P
+    pre: []P
+    body: []P
+    els: []P
+    hs: []P
+    decl: []P
+}
+
+fn node(kind: int, line: int): P {
+    return P{kind: kind, line: line, sql: "", sid: -1, slot: -1, slots: [], names: [], names2: [], ival: 0, flag: false, lit: Val.Null, isLit: false,
+             x: [], pre: [], body: [], els: [], hs: [], decl: []}
+}
+
+const M_IN = 1
+const M_OUT = 2
+const M_INOUT = 3
+
+type Prm = value record { name: str; mode: int; pt: PT; slot: int; hasDef: bool }
+
+const U_BLOCK = 1
+const U_PROC = 2
+const U_FUNC = 3
+const U_PKG = 4
+
+// A compiled unit: a block, a procedure or a function.
+type PUnit = record {
+    owner: str
+    name: str
+    kind: int
+    prms: []Prm
+    defs: []P               // the default of each parameter (kind K_EXPR), an empty node when none
+    ret: PT
+    retSlot: int
+    nslots: int
+    slotPt: []PT
+    body: P
+    src: str
+    bindUse: []int          // per bind of a block: 1 read, 2 written
+    bindSlot: []int
+    nbinds: int
+    sid0: int
+    sid1: int
+    curs: []CurDef          // its cursors
+    bad: str                // a compile error, "" none
+    pkg: str                // the package a member belongs to, "" none (a package itself: kind U_PKG, its name)
+    isPub: bool               // a member the package's specification declares
+    pkgSlots: []int         // a package's variables: their slots (in every member's frame too)
+}
+
+// ---- compile state
+
+type Var = value record { name: str; slot: int; pt: PT; konst: bool }
+type RecField = value record { name: str; pt: PT }
+type RecDef = record { name: str; fields: []RecField }
+type CurDef = record { name: str; slot: int; params: []int; q: P; rec: int }
+type ExcDef = value record { name: str; uid: int; code: int }
+type NamedType = value record { name: str; kind: int; idx: int }       // kind: 0 record (idx the recs), 1 REF CURSOR
+
+const SYS_ROWCOUNT = 0
+const SYS_FOUND = 1
+const SYS_NOTFOUND = 2
+const SYS_ISOPEN = 3
+const SYS_CODE = 4
+const SYS_ERRM = 5
+const NSYS = 6
+
+type Cx = record {
+    src: str
+    toks: []Tok
+    pos: int
+    vars: []Var
+    marks: []int
+    slotPt: []PT
+    recs: []RecDef
+    curs: []CurDef
+    excs: []ExcDef
+    types: []NamedType
+    bindNames: []str
+    bindUse: []int
+    bindSlot: []int
+    nsid: int
+    uid: int
+    unit: str
+    owner: str
+    retPt: PT
+    isFunc: bool
+    self: PUnit              // the signature of the unit being compiled (a recursive call)
+    hasSelf: bool
+    sigs: []SigEntry
+    nls: []str
+    pkg: str                // the package being compiled, "" none
+    inMember: bool          // inside a package member's own text
+    stopAtEnd: bool         // declarations of a package end at END as well as at BEGIN
+    members: []PUnit        // the members of the package compiled so far
+    ranges: []int           // their slots: from, to, from, to, ...
+    pubs: []str             // the names the package's specification declares
+    specMode: bool          // compiling a package's specification: procedure and function headers are signatures
+    stmtLine: int           // where the statement being compiled starts
+    stmtCol: int
+    uses: bool              // the expression just rendered reads SQL%... or SQLCODE
+    hoistOk: bool           // a stored function's call may be run before the expression (not inside a SQL statement)
+    colScope: []str         // the columns of the tables of the statement being rendered: a name among them is not a variable's (Oracle's scope)
+    noSubA: int             // tokens noSubA..noSubB are not substituted (an INSERT's column list)
+    noSubB: int
+}
+
+fn (cx: &Cx) tk(i: int): Tok { return cx.toks[min(i, len(cx.toks) - 1)] }
+fn (cx: &Cx) isK(i: int, w: &str): bool {
+    let t = cx.tk(i)
+    return t.kind == TK_ID && t.up == w
+}
+fn (cx: &Cx) isO(i: int, o: &str): bool {
+    let t = cx.tk(i)
+    return t.kind == TK_OP && t.text == o
+}
+
+fn (cx: &Cx) bad(i: int, expecting: &str): DbErr {
+    let t = cx.tk(i)
+    var sym = t.text.toStr()
+    if t.kind == TK_EOF { sym = "end-of-file" }
+    return plErr("ORA06550", "line " + t.line.toStr() + ", column " + t.col.toStr() + ":\nPLS-00103: Encountered the symbol \"" + sym + "\"" +
+                 (if len(expecting) > 0 { " when expecting one of the following: " + expecting } else { "" }))
+}
+
+fn (cx: &Cx) ident(i: int): bool {
+    let t = cx.tk(i)
+    return t.kind == TK_ID || t.kind == TK_QID
+}
+
+// A new slot of type t: its number.
+fn (cx: mut &Cx) newSlot(t: PT): int {
+    append(mut &cx.slotPt, t)
+    return len(cx.slotPt) - 1
+}
+
+fn (cx: mut &Cx) declare(name: &str, t: PT, konst: bool): int {
+    let s = cx.newSlot(t)
+    append(mut &cx.vars, Var{name: name.toStr(), slot: s, pt: t, konst: konst})
+    return s
+}
+
+fn (cx: &Cx) find(name: &str): int {
+    var i = len(cx.vars) - 1
+    while i >= 0 {
+        if cx.vars[i].name == name { return i }
+        i -= 1
+    }
+    return -1
+}
+
+fn (cx: mut &Cx) push() { append(mut &cx.marks, len(cx.vars)) }
+fn (cx: mut &Cx) pop() {
+    let m = pop(mut &cx.marks)
+    while len(cx.vars) > m { let v = pop(mut &cx.vars) }
+}
+
+// The slot of a bind (:name), made when first met.
+fn (cx: mut &Cx) bindSlotOf(name: &str): int {
+    for i in 0..len(cx.bindNames) { if cx.bindNames[i] == name { return cx.bindSlot[i] } }
+    let s = cx.newSlot(pt(PK_ANY))
+    append(mut &cx.bindNames, name.toStr())
+    append(mut &cx.bindUse, 0)
+    append(mut &cx.bindSlot, s)
+    return s
+}
+
+fn (cx: mut &Cx) useBind(slot: int, w: int) {
+    for i in 0..len(cx.bindSlot) { if cx.bindSlot[i] == slot { cx.bindUse[i] = cx.bindUse[i] | w } }
+}
+
+fn (cx: mut &Cx) newSid(): int {
+    cx.nsid += 1
+    return cx.nsid - 1
+}
+
+// ---- the state of a connection's PL/SQL
+
+type Stored = record { owner: str; name: str; kind: str; src: str }
+
+// An open cursor: the rows its query gave, read as it is fetched.
+type Cur = record { cols: []lexdb_exec.OutCol; rows: [][]Val; pos: int; open: bool }
+
+// A cursor a call hands to the client (a REF CURSOR OUT, an implicit result): its columns and all its rows.
+pub type CurOut = record { pub cols: []lexdb_exec.OutCol; pub rows: [][]Val }
+
+// A package's variables in a session: all the slots of its frame, those of its own variables the ones that count.
+type PkgInst = record { owner: str; name: str; vals: []Val; oids: []int; ready: bool; stamp: str }
+
+// The elements an array bind gets back (DBMS_OUTPUT.GET_LINES).
+type ArrOut = record { slot: int; elems: []Val }
+
+pub type Ip = record {
+    st: lexdb_store.Store
+    out: []str              // DBMS_OUTPUT's lines not read yet
+    outOn: bool
+    outPart: str            // PUT's partial line
+    scache: []Option[Stmt]
+    stored: []Stored
+    storedVer: int
+    storedOk: bool
+    curs: []Cur
+    results: []CurOut       // implicit results of the call
+    nls: []str
+    user: str
+    sqlRows: int
+    sqlFound: int           // -1 none yet, 0, 1
+    errCode: int            // SQLCODE and SQLERRM of the handler that runs
+    errMsg: str
+    depth: int
+    uid: int
+    sps: bool               // lxl_pl_s is a savepoint of the open transaction
+    sp0: bool               // lxl_pl_0 is
+    exitLabel: str
+    ctl: []Stmt
+    curErr: DbErr
+    outPos: int
+    outBytes: int           // the bytes DBMS_OUTPUT holds (the lines not read, and the partial line): at most outLimit
+    arrOut: []ArrOut
+    outLimit: int
+    keep: int               // the statement cache entries of the stored units
+    pkgs: []PkgInst         // the packages' state in this session
+    ddl: int                // bumped by DDL: cached units' types may be stale
+    lines: int
+}
+
+pub fn newIp(st: lexdb_store.Store): Ip {
+    return Ip{st: st, out: [], outOn: false, outPart: "", scache: [], stored: [], storedVer: -1, storedOk: false,
+              curs: [], results: [], nls: [], user: "", sqlRows: 0, sqlFound: -1, errCode: 0, errMsg: "", depth: 0, uid: 0, sps: false, sp0: false,
+              exitLabel: "", ctl: [], curErr: plErr("", ""), outPos: 0, outBytes: 0, arrOut: [], outLimit: 20000, keep: 0, pkgs: [], ddl: 0, lines: 0}
+}
+
+// ---- stored source (the catalog tree's "\x02src\x00" keys: owner, kind and name)
+
+const SRC_PRE: str = "\x02src\x00"
+const MEMO_VER: str = "plsql.ver"
+
+fn srcKey(owner: &str, kind: &str, name: &str): str { return SRC_PRE + owner + "\x00" + kind + "\x00" + name }
+
+fn memoVer(st: &lexdb_store.Store): int {
+    return strings.parseIntOpt(&(st.memoGet(&MEMO_VER).unwrapOr("0"))).unwrapOr(0)
+}
+
+fn bumpVer(st: &lexdb_store.Store) { let nv = (memoVer(st) + 1).toStr()
+    st.memoPut(&MEMO_VER, &nv) }
+
+// Writes (src nonempty) or deletes (src empty) a unit's source, in a transaction of its own.
+pub fn putSource(st: &lexdb_store.Store, owner: &str, kind: &str, name: &str, src: &str): Result[Unit, DbErr] {
+    var t = lexdb_store.begin()
+    if len(src) > 0 {
+        match t.put(lexdb_exec.CATALOG, srcKey(owner, kind, name), src.toStr()) {
+            Ok(_) {}
+            Err(e) {
+                st.abort(t)
+                return Err(e)
+            }
+        }
+    } else {
+        t.del(lexdb_exec.CATALOG, srcKey(owner, kind, name))
+    }
+    try st.commit(t)
+    bumpVer(st)
+    return Ok(Unit{})
+}
+
+fn loadStored(ip: mut &Ip): Result[Unit, DbErr] {
+    let v = memoVer(&ip.st)
+    if ip.storedOk && ip.storedVer == v { return Ok(Unit{}) }
+    var out: []Stored = []
+    var t = try ip.st.beginSnapshot()
+    let r = ip.st.scan(mut &t, lexdb_exec.CATALOG, SRC_PRE, SRC_PRE + "\xff", fn(en: &lexdb_store.Entry): bool {
+        let k = en.key[len(SRC_PRE)..len(en.key)]
+        let f = strings.split(&k, "\x00")
+        if len(f) == 3 { append(mut &out, Stored{owner: f[0].toStr(), kind: f[1].toStr(), name: f[2].toStr(), src: en.val}) }
+        return true
+    })
+    ip.st.abort(t)
+    try r
+    ip.stored = out
+    ip.storedVer = v
+    ip.storedOk = true
+    return Ok(Unit{})
+}
+
+// ---- stored units: the signatures a compile sees, and the compiled program
+
+type Sig = record { found: bool; kind: int; prms: []Prm; ret: PT; canon: []str }
+
+fn noSig(): Sig { return Sig{found: false, kind: 0, prms: [], ret: pt(PK_ANY), canon: []} }
+
+// The signature of a stored procedure or function, as a compile of its callers sees it.
+type SigEntry = record { owner: str; pkg: str; name: str; kind: int; prms: []Prm; ret: PT; isPub: bool }
+
+fn cloneRow(a: &[]Val): []Val {
+    var out: []Val = []
+    for x in a { append(mut &out, x) }
+    return out
+}
+
+fn cloneStrs(a: &[]str): []str {
+    var out: []str = []
+    for x in a { append(mut &out, x) }
+    return out
+}
+
+fn copyPrms(a: &[]Prm): []Prm {
+    var out: []Prm = []
+    for x in a { append(mut &out, x) }
+    return out
+}
+
+fn upperName(s: &str): str { return strings.toUpperAscii(&(s.toStr())) }
+
+fn (cx: &Cx) sigOf(names: &[]str): Sig {
+    if len(names) == 0 || len(names) > 3 { return noSig() }
+    let nm = names[len(names) - 1]
+    if cx.hasSelf && nm == cx.self.name && len(names) == 1 && len(cx.self.pkg) == 0 {
+        return Sig{found: true, kind: cx.self.kind, prms: copyPrms(&cx.self.prms), ret: cx.self.ret, canon: [cx.self.owner, "", cx.self.name]}
+    }
+    var pick = -1
+    for i in 0..len(cx.sigs) {
+        let s = &cx.sigs[i]
+        if s.name != nm { continue }
+        if len(names) == 1 {
+            // a bare name: a member of the package being compiled, else a standalone unit (of this owner first)
+            if len(cx.pkg) > 0 && s.pkg == cx.pkg && s.owner == cx.owner { pick = i }
+            else if pick < 0 && len(s.pkg) == 0 || (len(s.pkg) == 0 && s.owner == cx.owner && !(pick >= 0 && cx.sigs[pick].pkg == cx.pkg && len(cx.pkg) > 0)) { pick = i }
+        } else if len(names) == 2 {
+            // PKG.NAME (a public member) or OWNER.NAME
+            if s.pkg == names[0] && (s.isPub || (len(cx.pkg) > 0 && cx.pkg == s.pkg)) && (pick < 0 || s.owner == cx.owner) { pick = i }
+            else if len(s.pkg) == 0 && s.owner == names[0] && pick < 0 { pick = i }
+        } else {
+            if s.owner == names[0] && s.pkg == names[1] && s.isPub { pick = i }
+        }
+    }
+    if pick < 0 { return noSig() }
+    let e = &cx.sigs[pick]
+    return Sig{found: true, kind: e.kind, prms: copyPrms(&e.prms), ret: e.ret, canon: [e.owner, e.pkg, e.name]}
+}
+
+// Every stored unit compiled, for one version of the catalog.
+pub type Prog = record {
+    units: []PUnit
+    ver: int
+    ddl: int
+    errs: []str
+}
+
+pub fn newProg(): Prog { return Prog{units: [], ver: -1, ddl: -1, errs: []} }
+
+// The index of the compiled procedure or function that names (NAME, OWNER.NAME or PKG.NAME) mean, -1 none.
+fn (pg: &Prog) find(names: &[]str, user: &str): int {
+    if len(names) == 0 || len(names) > 3 { return -1 }
+    let nm = names[len(names) - 1]
+    var pick = -1
+    for i in 0..len(pg.units) {
+        let u = &pg.units[i]
+        if u.name != nm || (u.kind != U_PROC && u.kind != U_FUNC) { continue }
+        if len(names) == 1 {
+            if len(u.pkg) == 0 && (pick < 0 || u.owner == user) { pick = i }
+        } else if len(names) == 2 {
+            if u.pkg == names[0] && u.isPub && (pick < 0 || u.owner == user) { pick = i }
+            else if len(u.pkg) == 0 && u.owner == names[0] { pick = i }
+        } else if u.owner == names[0] && u.pkg == names[1] && u.isPub { pick = i }
+    }
+    return pick
+}
+
+// The unit a compile resolved a call to: owner, package ("" none) and name.
+fn (pg: &Prog) findC(c: &[]str): int {
+    if len(c) != 3 { return -1 }
+    for i in 0..len(pg.units) {
+        let u = &pg.units[i]
+        if (u.kind == U_PROC || u.kind == U_FUNC) && u.owner == c[0] && u.pkg == c[1] && u.name == c[2] { return i }
+    }
+    return -1
+}
+
+// The package unit (its variables and its initialisation) of a member.
+fn (pg: &Prog) pkgOf(owner: &str, name: &str): int {
+    for i in 0..len(pg.units) {
+        let u = &pg.units[i]
+        if u.kind == U_PKG && u.owner == owner && u.name == name { return i }
+    }
+    return -1
+}
+
+fn sigsOf(pg: &Prog): []SigEntry {
+    var out: []SigEntry = []
+    for u in pg.units {
+        if (u.kind == U_PROC || u.kind == U_FUNC) && (u.isPub || len(u.pkg) == 0) { append(mut &out, SigEntry{owner: u.owner, pkg: u.pkg, name: u.name, kind: u.kind, prms: copyPrms(&u.prms), ret: u.ret, isPub: u.isPub}) }
+    }
+    return out
+}
+
+// ---- expressions and SQL text
+
+// The index of the ")" that closes the "(" at i, -1 none.
+fn (cx: &Cx) matchParen(i: int): int {
+    var d = 0
+    var j = i
+    while j < len(cx.toks) {
+        let t = cx.toks[j]
+        if t.kind == TK_OP {
+            if t.text == "(" { d += 1 }
+            else if t.text == ")" {
+                d -= 1
+                if d == 0 { return j }
+            }
+        }
+        j += 1
+    }
+    return -1
+}
+
+// The ranges of the arguments between a and b (exclusive), split at commas outside brackets: s0, e0, s1, e1, ...
+fn (cx: &Cx) splitArgs(a: int, b: int): []int {
+    var out: []int = []
+    if b <= a { return out }
+    var d = 0
+    var s = a
+    var j = a
+    while j < b {
+        let t = cx.toks[j]
+        if t.kind == TK_OP {
+            if t.text == "(" { d += 1 }
+            else if t.text == ")" { d -= 1 }
+            else if t.text == "," && d == 0 {
+                append(mut &out, s)
+                append(mut &out, j)
+                s = j + 1
+            }
+        }
+        j += 1
+    }
+    append(mut &out, s)
+    append(mut &out, b)
+    return out
+}
+
+// The index of the first token from `from` that is one of stops (by upper-case text, or an operator), outside
+// brackets and CASE ... END; the last token (the end) when none.
+fn (cx: &Cx) findEnd(from: int, stops: &[]str): int {
+    var d = 0
+    var cs = 0
+    var j = from
+    while j < len(cx.toks) {
+        let t = cx.toks[j]
+        if t.kind == TK_EOF { return j }
+        if t.kind == TK_OP && t.text == "(" { d += 1 }
+        else if t.kind == TK_OP && t.text == ")" {
+            if d == 0 {
+                for s in stops { if s == ")" { return j } }
+                return j
+            }
+            d -= 1
+        }
+        else if d == 0 {
+            var hit = false
+            if cs == 0 {
+                for s in stops {
+                    if (t.kind == TK_ID && t.up == s) || (t.kind == TK_OP && t.text == s) { hit = true }
+                }
+            }
+            if hit { return j }
+        }
+        if t.kind == TK_ID && t.up == "CASE" { cs += 1 }
+        else if t.kind == TK_ID && t.up == "END" && cs > 0 {
+            cs -= 1
+            if cx.isK(j + 1, "CASE") { j += 1 }
+        }
+        j += 1
+    }
+    return len(cx.toks) - 1
+}
+
+// The text a string literal token holds.
+fn strText(raw: &str): str {
+    var s = raw.toStr()
+    if len(s) > 0 && (s[0] == 'n' || s[0] == 'N') { s = s[1..len(s)] }
+    if len(s) > 2 && (s[0] == 'q' || s[0] == 'Q') && s[1] == '\'' { return s[3..len(s) - 2] }
+    return strings.replaceAll(s[1..len(s) - 1], "''", "'")
+}
+
+fn litOf(t: &Tok): Val {
+    if t.kind == TK_STR {
+        let s = strText(&t.text)
+        if len(s) == 0 { return Val.Null }
+        return Val.Text(s)
+    }
+    var s = t.text.toStr()
+    var isF = false
+    let last = s[len(s) - 1]
+    if last == 'f' || last == 'F' || last == 'd' || last == 'D' {
+        s = s[0..len(s) - 1]
+        isF = true
+    }
+    if isF {
+        match Decimal.parse(&s) {
+            Ok(d) { return Val.Float(d.toFloat()) }
+            Err(_) { return Val.Null }
+        }
+    }
+    if !strings.contains(&s, ".") && !strings.contains(&s, "e") && !strings.contains(&s, "E") {
+        match strings.parseInt(&s) {
+            Ok(n) { return Val.Int(n) }
+            Err(_) {}
+        }
+    }
+    match Decimal.parse(&s) {
+        Ok(d) { return Val.Num(d) }
+        Err(_) { return Val.Null }
+    }
+}
+
+fn dollar(slot: int): str { return "$" + (slot + 1).toStr() }
+
+// A variable's record fields: the index of the field named up in rec, -1 none.
+fn (cx: &Cx) fieldOf(rec: int, up: &str): int {
+    let r = &cx.recs[rec]
+    for i in 0..len(r.fields) { if r.fields[i].name == up { return i } }
+    return -1
+}
+
+fn attrOff(w: &str): int {
+    if w == "FOUND" { return 1 }
+    if w == "NOTFOUND" { return 2 }
+    if w == "ISOPEN" { return 3 }
+    if w == "ROWCOUNT" { return 4 }
+    return -1
+}
+
+fn sqlAttr(w: &str): int {
+    if w == "ROWCOUNT" { return SYS_ROWCOUNT }
+    if w == "FOUND" { return SYS_FOUND }
+    if w == "NOTFOUND" { return SYS_NOTFOUND }
+    if w == "ISOPEN" { return SYS_ISOPEN }
+    return -1
+}
+
+// SQL text for tokens a..b (exclusive) with the PL/SQL variables in it replaced by $slot (skipping tokens
+// skipA..skipB); a call of a stored function is run first when hoist is allowed: its node is put in pre.
+fn (cx: mut &Cx) render(ip: mut &Ip, sess: mut &lexdb_exec.Session, a: int, b: int, skipA: int, skipB: int, hoist: bool,
+                        pre: mut &[]P): Result[str, DbErr] {
+    var sb = strings.newStrBuf()
+    var from = if b > a { cx.toks[a].s } else { 0 }
+    var i = a
+    while i < b {
+        let t = cx.toks[i]
+        if i == skipA && skipB > skipA {
+            sb.add(cx.src[from..t.s])
+            from = cx.toks[skipB - 1].e
+            i = skipB
+            continue
+        }
+        var rep = ""
+        var endTok = i + 1
+        if t.kind == TK_BIND {
+            let s = cx.bindSlotOf(&t.up)
+            cx.useBind(s, 1)
+            rep = dollar(s)
+        } else if t.kind == TK_ID || t.kind == TK_QID {
+            let prevDot = i > a && cx.isO(i - 1, ".")
+            if t.kind == TK_ID && t.up == "MOD" && !prevDot && !cx.isO(i + 1, "(") && i > a {
+                rep = "%"
+            } else if prevDot {
+                // a qualified name's last part: SQL's
+            } else if t.kind == TK_ID && t.up == "SQL" && cx.isO(i + 1, "%") && cx.ident(i + 2) {
+                let k = sqlAttr(&cx.tk(i + 2).up)
+                if k < 0 { return Err(cx.bad(i + 2, "")) }
+                rep = dollar(k)
+                endTok = i + 3
+                cx.uses = true
+            } else if t.kind == TK_ID && (t.up == "SQLCODE" || t.up == "SQLERRM") && !cx.isO(i + 1, "(") && cx.find(&t.up) < 0 {
+                rep = dollar(if t.up == "SQLCODE" { SYS_CODE } else { SYS_ERRM })
+                cx.uses = true
+            } else {
+                var vi = cx.find(&t.up)
+                if vi >= 0 && cx.shadowed(i, &t.up) { vi = -1 }
+                if vi >= 0 {
+                    let v = cx.vars[vi]
+                    if cx.isO(i + 1, "%") && cx.ident(i + 2) {
+                        let off = attrOff(&cx.tk(i + 2).up)
+                        if off < 0 || (v.pt.k != PK_CUR && v.pt.k != PK_REFCUR) { return Err(cx.bad(i + 2, "")) }
+                        rep = dollar(v.slot + off)
+                        endTok = i + 3
+                    } else if v.pt.k == PK_REC {
+                        if cx.isO(i + 1, ".") && cx.ident(i + 2) {
+                            let f = cx.fieldOf(v.pt.rec, &cx.tk(i + 2).up)
+                            if f < 0 {
+                                let nm = cx.tk(i + 2)
+                                return Err(plErr("ORA06550", "line " + nm.line.toStr() + ", column " + nm.col.toStr() + ":\nPLS-00302: component '" + nm.up + "' must be declared"))
+                            }
+                            rep = dollar(v.slot + f)
+                            endTok = i + 3
+                        } else {
+                            return Err(cx.bad(i, ""))
+                        }
+                    } else if cx.isO(i + 1, ".") && cx.ident(i + 2) {
+                        // a table's alias that a variable's name hides: the SQL's
+                    } else if v.pt.k == PK_EXC || v.pt.k == PK_CUR {
+                        // not a value
+                    } else {
+                        rep = dollar(v.slot)
+                    }
+                } else if hoist && cx.hoistOk {
+                    var names: []str = [t.up]
+                    var j = i
+                    while cx.isO(j + 1, ".") && cx.ident(j + 2) {
+                        append(mut &names, cx.tk(j + 2).up)
+                        j += 2
+                    }
+                    if cx.isO(j + 1, "(") {
+                        let m = cx.matchParen(j + 1)
+                        if m < 0 { return Err(cx.bad(j + 1, "")) }
+                        let sg = cx.sigOf(&names)
+                        if sg.found && sg.kind == U_FUNC {
+                            let tmp = try cx.hoistCall(ip, sess, &sg.canon, j + 2, m, &sg, pre)
+                            rep = dollar(tmp)
+                            endTok = m + 1
+                        } else {
+                            endTok = j + 1
+                        }
+                    } else {
+                        // a function called without arguments (and without brackets)
+                        let sg = cx.sigOf(&names)
+                        if sg.found && sg.kind == U_FUNC {
+                            let tmp = try cx.hoistCall(ip, sess, &sg.canon, j + 1, j + 1, &sg, pre)
+                            rep = dollar(tmp)
+                        }
+                        endTok = j + 1
+                    }
+                }
+            }
+        }
+        if len(rep) > 0 {
+            sb.add(cx.src[from..t.s])
+            sb.add(&rep)
+            from = cx.toks[endTok - 1].e
+        }
+        i = max(endTok, i + 1)
+    }
+    if b > a { sb.add(cx.src[from..cx.toks[b - 1].e]) }
+    return Ok(sb.toStr())
+}
+
+// Whether the arguments of a call (by name or position) cover the parameters that have no default.
+fn (cx: &Cx) argCheck(prms: &[]Prm, names2: &[]str, name: &str, line: int, col: int): Result[Unit, DbErr] {
+    var given: []bool = array(len(prms), false)
+    var bad = false
+    for i in 0..len(names2) {
+        var pi = i
+        if len(names2[i]) > 0 {
+            pi = -1
+            for k in 0..len(prms) { if prms[k].name == names2[i] { pi = k } }
+        }
+        if pi < 0 || pi >= len(prms) { bad = true } else { given[pi] = true }
+    }
+    for k in 0..len(prms) { if !given[k] && !prms[k].hasDef { bad = true } }
+    if bad {
+        return Err(plErr("ORA06550", "line " + line.toStr() + ", column " + col.toStr() + ":\nPLS-00306: wrong number or types of arguments in call to '" + name + "'" + cx.ignored()))
+    }
+    return Ok(Unit{})
+}
+
+// Whether the name at token i is not the variable's: a column of a table the statement reads, or in an INSERT's column list.
+fn (cx: &Cx) shadowed(i: int, up: &str): bool {
+    if i >= cx.noSubA && i < cx.noSubB { return true }
+    for c in cx.colScope { if c == up { return true } }
+    return false
+}
+
+// A call of a stored function with arguments in tokens a..b: a K_HOIST node in pre; its result's slot.
+fn (cx: mut &Cx) hoistCall(ip: mut &Ip, sess: mut &lexdb_exec.Session, names: &[]str, a: int, b: int, sg: &Sig, pre: mut &[]P): Result[int, DbErr] {
+    var n = node(K_HOIST, cx.tk(a).line)
+    for nm in names { append(mut &n.names, nm) }
+    let rs = cx.splitArgs(a, b)
+    var k = 0
+    while k < len(rs) {
+        var s = rs[k]
+        let e = rs[k + 1]
+        var an = ""
+        if cx.ident(s) && cx.isO(s + 1, "=>") {
+            an = cx.tk(s).up
+            s += 2
+        }
+        let x = try cx.expr(ip, sess, s, e, false)
+        append(mut &n.x, x)
+        append(mut &n.names2, an)
+        k += 2
+    }
+    try cx.argCheck(&sg.prms, &n.names2, &names[len(names) - 1], cx.tk(a).line, cx.tk(a).col)
+    n.slot = cx.newSlot(sg.ret)
+    let r = n.slot
+    append(pre, n)
+    return Ok(r)
+}
+
+// An expression of tokens a..b: a K_EXPR node; cond: its truth as 1 or 0.
+fn (cx: mut &Cx) expr(ip: mut &Ip, sess: mut &lexdb_exec.Session, a: int, b: int, cond: bool): Result[P, DbErr] {
+    var n = node(K_EXPR, cx.tk(a).line)
+    if b <= a { return Err(cx.bad(a, "")) }
+    n.ival = if cond { 1 } else { 0 }
+    if !cond {
+        if b - a == 1 && (cx.tk(a).kind == TK_NUM || cx.tk(a).kind == TK_STR) {
+            n.lit = litOf(&cx.tk(a))
+            n.isLit = true
+            return Ok(n)
+        }
+        if b - a == 1 && cx.isK(a, "NULL") {
+            n.isLit = true
+            return Ok(n)
+        }
+        if b - a == 1 && (cx.isK(a, "TRUE") || cx.isK(a, "FALSE")) {
+            n.lit = Val.Bool(cx.isK(a, "TRUE"))
+            n.isLit = true
+            return Ok(n)
+        }
+        if b - a == 2 && cx.isO(a, "-") && cx.tk(a + 1).kind == TK_NUM {
+            let v = litOf(&cx.tk(a + 1))
+            match v {
+                Val.Int(k) {
+                    n.lit = Val.Int(-k)
+                    n.isLit = true
+                    return Ok(n)
+                }
+                Val.Num(d) {
+                    n.lit = Val.Num(d.neg())
+                    n.isLit = true
+                    return Ok(n)
+                }
+                else {}
+            }
+        }
+    }
+    // a lone name: a variable, or a stored function without arguments
+    var chain = cx.ident(a)
+    var j = a + 1
+    while chain && j < b {
+        if cx.isO(j, ".") && cx.ident(j + 1) { j += 2 } else { chain = false }
+    }
+    if chain {
+        let vi = cx.find(&cx.tk(a).up)
+        if vi >= 0 && b - a == 1 && cx.vars[vi].pt.k != PK_REC && cx.vars[vi].pt.k != PK_EXC && cx.vars[vi].pt.k != PK_CUR {
+            n.slot = cx.vars[vi].slot
+            return Ok(n)
+        }
+        if vi < 0 && cx.hoistOk {
+            var names: []str = []
+            var q = a
+            while q < b {
+                append(mut &names, cx.tk(q).up)
+                q += 2
+            }
+            let sg = cx.sigOf(&names)
+            if sg.found && sg.kind == U_FUNC {
+                let tmp = try cx.hoistCall(ip, sess, &sg.canon, a, a, &sg, mut &n.pre)
+                n.slot = tmp
+                return Ok(n)
+            }
+        }
+    }
+    cx.uses = false
+    var pre: []P = []
+    let text = try cx.render(ip, sess, a, b, -1, -1, true, mut &pre)
+    n.sql = if cond { "SELECT CASE WHEN (" + text + ") THEN 1 ELSE 0 END" } else { "SELECT " + text }
+    n.sid = cx.newSid()
+    n.pre = pre
+    n.flag = cx.uses
+    return Ok(n)
+}
+
+// ---- types and declarations
+
+fn predefined(w: &str): int {
+    if w == "NO_DATA_FOUND" { return 1403 }
+    if w == "TOO_MANY_ROWS" { return 1422 }
+    if w == "ZERO_DIVIDE" { return 1476 }
+    if w == "DUP_VAL_ON_INDEX" { return 1 }
+    if w == "INVALID_NUMBER" { return 1722 }
+    if w == "VALUE_ERROR" { return 6502 }
+    if w == "CURSOR_ALREADY_OPEN" { return 6511 }
+    if w == "INVALID_CURSOR" { return 1001 }
+    if w == "LOGIN_DENIED" { return 1017 }
+    if w == "NOT_LOGGED_ON" { return 1012 }
+    if w == "PROGRAM_ERROR" { return 6501 }
+    if w == "STORAGE_ERROR" { return 6500 }
+    if w == "TIMEOUT_ON_RESOURCE" { return 51 }
+    if w == "ACCESS_INTO_NULL" { return 6530 }
+    if w == "COLLECTION_IS_NULL" { return 6531 }
+    if w == "SUBSCRIPT_BEYOND_COUNT" { return 6533 }
+    if w == "SUBSCRIPT_OUTSIDE_LIMIT" { return 6532 }
+    if w == "CASE_NOT_FOUND" { return 6592 }
+    if w == "SELF_IS_NULL" { return 30625 }
+    if w == "SYS_INVALID_ROWID" { return 1410 }
+    if w == "ROWTYPE_MISMATCH" { return 6504 }
+    if w == "NO_DATA_NEEDED" { return 6548 }
+    return 0
+}
+
+fn sqlOid(t: &PT): int { return oidOf(t) }
+
+// The result columns of a SELECT of SQL text (variables as $n).
+fn (cx: &Cx) describeText(sess: mut &lexdb_exec.Session, sql: &str): Result[[]lexdb_exec.OutCol, DbErr] {
+    let text = lexdb_oratext.oracleSql(sql.toStr())
+    let stmts = try lexdb_sql.oraParseNls(&text, cloneStrs(&cx.nls))
+    if len(stmts) != 1 { return Err(plErr("42601", "SQL command not properly ended")) }
+    var pts: []int = []
+    for t in cx.slotPt { append(mut &pts, oidOf(&t)) }
+    return sess.describe(&stmts[0], &pts)
+}
+
+// A compile error from a SQL statement the block names, as Oracle's PL/SQL tells it.
+fn (cx: &Cx) sqlErr(line: int, e: &DbErr): DbErr {
+    let x = lexdb_oratext.oraOf(e, &"")
+    return plErr("ORA06550", "line " + line.toStr() + ", column " + cx.stmtCol.toStr() + ":\nPL/SQL: " + lexdb_oratext.oraText(x.num, x.text) +
+                 "\nORA-06550: line " + cx.stmtLine.toStr() + ", column " + cx.stmtCol.toStr() + ":\nPL/SQL: SQL Statement ignored")
+}
+
+// A record's fields from the columns a query gives.
+fn (cx: mut &Cx) recOf(name: &str, cols: &[]lexdb_exec.OutCol): int {
+    var r = RecDef{name: name.toStr(), fields: []}
+    for c in cols {
+        append(mut &r.fields, RecField{name: strings.toUpperAscii(&c.name), pt: ptOfOut(&c)})
+    }
+    append(mut &cx.recs, r)
+    return len(cx.recs) - 1
+}
+
+// A variable declared: its slot; a record takes a slot per field, a cursor four more for its attributes.
+fn (cx: mut &Cx) declareVar(name: &str, t: PT, konst: bool): int {
+    if t.k == PK_REC {
+        var first = -1
+        let nf = len(cx.recs[t.rec].fields)
+        for i in 0..nf {
+            let s = cx.newSlot(cx.recs[t.rec].fields[i].pt)
+            if first < 0 { first = s }
+        }
+        if first < 0 { first = cx.newSlot(pt(PK_ANY)) }
+        append(mut &cx.vars, Var{name: name.toStr(), slot: first, pt: t, konst: konst})
+        return first
+    }
+    let s = cx.declare(name, t, konst)
+    if t.k == PK_CUR || t.k == PK_REFCUR {
+        for i in 0..4 { let x = cx.newSlot(pt(PK_ANY)) }
+    }
+    return s
+}
+
+fn intArg(cx: &Cx, i: int): int { return strings.parseIntOpt(&(cx.tk(i).text)).unwrapOr(0) }
+
+// A type name at cx.pos.
+fn (cx: mut &Cx) parseType(sess: mut &lexdb_exec.Session): Result[PT, DbErr] {
+    let t0 = cx.tk(cx.pos)
+    if !cx.ident(cx.pos) { return Err(cx.bad(cx.pos, "")) }
+    let w = t0.up
+    // %TYPE and %ROWTYPE: NAME[.NAME[.NAME]]%
+    var j = cx.pos
+    while cx.isO(j + 1, ".") && cx.ident(j + 2) { j += 2 }
+    if cx.isO(j + 1, "%") && (cx.isK(j + 2, "TYPE") || cx.isK(j + 2, "ROWTYPE")) {
+        let isType = cx.isK(j + 2, "TYPE")
+        var names: []str = []
+        var q = cx.pos
+        while q <= j {
+            append(mut &names, cx.tk(q).up)
+            q += 2
+        }
+        cx.pos = j + 3
+        if isType {
+            if len(names) == 1 {
+                let vi = cx.find(&names[0])
+                if vi >= 0 { return Ok(cx.vars[vi].pt) }
+            }
+            if len(names) >= 2 && len(names) <= 3 {
+                // [schema.]table.column
+                let col = names[len(names) - 1]
+                var tab = names[len(names) - 2]
+                if len(names) == 3 { tab = names[0] + "." + tab }
+                if len(names) == 2 {
+                    let vi = cx.find(&names[0])
+                    if vi >= 0 && cx.vars[vi].pt.k == PK_REC {
+                        let f = cx.fieldOf(cx.vars[vi].pt.rec, &col)
+                        if f >= 0 { return Ok(cx.recs[cx.vars[vi].pt.rec].fields[f].pt) }
+                    }
+                }
+                match cx.describeText(sess, &("SELECT " + col + " FROM " + tab)) {
+                    Ok(cols) { if len(cols) == 1 { return Ok(ptOfOut(&cols[0])) } }
+                    Err(e) { return Err(cx.sqlErr(t0.line, &e)) }
+                }
+            }
+            return Err(plErr("ORA06550", "line " + t0.line.toStr() + ", column " + t0.col.toStr() + ":\nPLS-00201: identifier '" + t0.up + "' must be declared\nORA-06550: line 0, column 0:\nPL/SQL: Compilation unit analysis terminated"))
+        }
+        // %ROWTYPE: a cursor's or a table's
+        if len(names) == 1 {
+            for c in cx.curs {
+                if c.name == names[0] {
+                    var r = pt(PK_REC)
+                    r.rec = c.rec
+                    return Ok(r)
+                }
+            }
+        }
+        var tab = names[0]
+        for k in 1..len(names) { tab = tab + "." + names[k] }
+        match cx.describeText(sess, &("SELECT * FROM " + tab)) {
+            Ok(cols) {
+                var r = pt(PK_REC)
+                r.rec = cx.recOf(&tab, &cols)
+                return Ok(r)
+            }
+            Err(e) { return Err(cx.sqlErr(t0.line, &e)) }
+        }
+    }
+    for k in 0..len(cx.types) {
+        let nt = cx.types[k]
+        if nt.name == w {
+            cx.pos += 1
+            if nt.kind == 0 {
+                var r = pt(PK_REC)
+                r.rec = nt.idx
+                return Ok(r)
+            }
+            return Ok(pt(PK_REFCUR))
+        }
+    }
+    cx.pos += 1
+    var t = pt(PK_TEXT)
+    if w == "NUMBER" || w == "DEC" || w == "DECIMAL" || w == "NUMERIC" || w == "FLOAT" {
+        t = pt(PK_NUM)
+        if cx.isO(cx.pos, "(") {
+            t.prec = intArg(cx, cx.pos + 1)
+            cx.pos += 2
+            if cx.isO(cx.pos, ",") {
+                let neg = cx.isO(cx.pos + 1, "-")
+                t.scale = intArg(cx, cx.pos + (if neg { 2 } else { 1 }))
+                if neg { t.scale = -t.scale }
+                cx.pos += (if neg { 3 } else { 2 })
+            }
+            if !cx.isO(cx.pos, ")") { return Err(cx.bad(cx.pos, "")) }
+            cx.pos += 1
+            if w == "FLOAT" { t.prec = 0 }
+        }
+        return Ok(t)
+    }
+    if w == "INTEGER" || w == "INT" || w == "SMALLINT" || w == "PLS_INTEGER" || w == "BINARY_INTEGER" || w == "NATURAL" ||
+       w == "NATURALN" || w == "POSITIVE" || w == "POSITIVEN" || w == "SIGNTYPE" || w == "SIMPLE_INTEGER" {
+        t = pt(PK_INT)
+        if w == "POSITIVE" || w == "POSITIVEN" { t.prec = 1 }
+        if w == "NATURAL" || w == "NATURALN" { t.prec = 0 }
+        return Ok(t)
+    }
+    if w == "REAL" { return Ok(pt(PK_NUM)) }
+    if w == "DOUBLE" && cx.isK(cx.pos, "PRECISION") {
+        cx.pos += 1
+        return Ok(pt(PK_NUM))
+    }
+    if w == "BINARY_FLOAT" || w == "BINARY_DOUBLE" {
+        t = pt(PK_FLOAT)
+        t.oid = if w == "BINARY_FLOAT" { lexdb_sql.OID_FLOAT4 } else { lexdb_sql.OID_FLOAT8 }
+        return Ok(t)
+    }
+    if w == "VARCHAR2" || w == "VARCHAR" || w == "CHAR" || w == "NCHAR" || w == "NVARCHAR2" || w == "CHARACTER" || w == "STRING" ||
+       w == "ROWID" || w == "UROWID" || w == "LONG" {
+        if w == "LONG" && cx.isK(cx.pos, "RAW") {
+            cx.pos += 1
+            return Ok(pt(PK_RAW))
+        }
+        if w == "CHARACTER" && cx.isK(cx.pos, "VARYING") { cx.pos += 1 }
+        if cx.isO(cx.pos, "(") {
+            t.len = intArg(cx, cx.pos + 1)
+            cx.pos += 2
+            if cx.isK(cx.pos, "BYTE") || cx.isK(cx.pos, "CHAR") { cx.pos += 1 }
+            if !cx.isO(cx.pos, ")") { return Err(cx.bad(cx.pos, "")) }
+            cx.pos += 1
+        }
+        return Ok(t)
+    }
+    if w == "CLOB" || w == "NCLOB" { return Ok(t) }
+    if w == "BLOB" { return Ok(pt(PK_RAW)) }
+    if w == "RAW" {
+        if cx.isO(cx.pos, "(") { cx.pos += 3 }
+        return Ok(pt(PK_RAW))
+    }
+    if w == "DATE" { return Ok(pt(PK_DATE)) }
+    if w == "TIMESTAMP" {
+        t = pt(PK_TS)
+        if cx.isO(cx.pos, "(") { cx.pos += 3 }
+        if cx.isK(cx.pos, "WITH") {
+            cx.pos += 1
+            if cx.isK(cx.pos, "LOCAL") { cx.pos += 1 }
+            cx.pos += 2
+            t = pt(PK_TSTZ)
+        }
+        return Ok(t)
+    }
+    if w == "BOOLEAN" { return Ok(pt(PK_BOOL)) }
+    if w == "SYS_REFCURSOR" { return Ok(pt(PK_REFCUR)) }
+    return Err(plErr("ORA06550", "line " + t0.line.toStr() + ", column " + t0.col.toStr() + ":\nPLS-00201: identifier '" + t0.up + "' must be declared\nORA-06550: line 0, column 0:\nPL/SQL: Compilation unit analysis terminated"))
+}
+
+// ---- statements
+
+fn (cx: &Cx) needK(i: int, w: &str): Result[Unit, DbErr] {
+    if cx.isK(i, w) { return Ok(Unit{}) }
+    return Err(cx.bad(i, w))
+}
+
+fn (cx: &Cx) needO(i: int, o: &str): Result[Unit, DbErr] {
+    if cx.isO(i, o) { return Ok(Unit{}) }
+    return Err(cx.bad(i, o))
+}
+
+fn (cx: &Cx) undeclared(i: int): DbErr {
+    let t = cx.tk(i)
+    return plErr("ORA06550", "line " + t.line.toStr() + ", column " + t.col.toStr() + ":\nPLS-00201: identifier '" + t.up + "' must be declared" + cx.ignored())
+}
+
+// The second part of a compile error of a statement.
+fn (cx: &Cx) ignored(): str {
+    return "\nORA-06550: line " + cx.stmtLine.toStr() + ", column " + cx.stmtCol.toStr() + ":\nPL/SQL: Statement ignored"
+}
+
+// An assignment target: a slot, how many (a record), its type, and the token after it.
+type Tgt = value record { slot: int; n: int; pt: PT; next: int }
+
+fn (cx: mut &Cx) target(i: int): Result[Tgt, DbErr] {
+    let t = cx.tk(i)
+    if t.kind == TK_BIND {
+        let s = cx.bindSlotOf(&t.up)
+        cx.useBind(s, 2)
+        return Ok(Tgt{slot: s, n: 1, pt: pt(PK_ANY), next: i + 1})
+    }
+    if !cx.ident(i) { return Err(cx.bad(i, "")) }
+    let vi = cx.find(&t.up)
+    if vi < 0 { return Err(cx.undeclared(i)) }
+    let v = cx.vars[vi]
+    if v.konst {
+        return Err(plErr("ORA06550", "line " + t.line.toStr() + ", column " + t.col.toStr() + ":\nPLS-00363: expression '" + t.up + "' cannot be used as an assignment target"))
+    }
+    if v.pt.k == PK_REC {
+        if cx.isO(i + 1, ".") && cx.ident(i + 2) {
+            let f = cx.fieldOf(v.pt.rec, &cx.tk(i + 2).up)
+            if f < 0 {
+                let nm = cx.tk(i + 2)
+                return Err(plErr("ORA06550", "line " + nm.line.toStr() + ", column " + nm.col.toStr() + ":\nPL/SQL: PLS-00302: component '" + nm.up + "' must be declared"))
+            }
+            return Ok(Tgt{slot: v.slot + f, n: 1, pt: cx.recs[v.pt.rec].fields[f].pt, next: i + 3})
+        }
+        return Ok(Tgt{slot: v.slot, n: len(cx.recs[v.pt.rec].fields), pt: v.pt, next: i + 1})
+    }
+    return Ok(Tgt{slot: v.slot, n: 1, pt: v.pt, next: i + 1})
+}
+
+// INTO targets from i: their slots (a record's fields each) and the token after the last.
+fn (cx: mut &Cx) targets(i: int, slots: mut &[]int): Result[int, DbErr] {
+    var j = i
+    while true {
+        let g = try cx.target(j)
+        for k in 0..g.n { append(slots, g.slot + k) }
+        j = g.next
+        if cx.isO(j, ",") { j += 1 } else { break }
+    }
+    return Ok(j)
+}
+
+fn (cx: &Cx) stmtEnd(i: int): int { return cx.findEnd(i, &[";"]) }
+
+// An SQL statement of tokens a..b as a K_SQL node.
+fn (cx: mut &Cx) sqlNode(ip: mut &Ip, sess: mut &lexdb_exec.Session, a: int, b: int, skipA: int, skipB: int, sub: int): Result[P, DbErr] {
+    var n = node(K_SQL, cx.tk(a).line)
+    var pre: []P = []
+    cx.uses = false
+    let was = cx.hoistOk
+    cx.hoistOk = false
+    cx.scopeOf(sess, a, b)
+    let text = cx.render(ip, sess, a, b, skipA, skipB, false, mut &pre)
+    cx.colScope = []
+    cx.noSubA = -1
+    cx.noSubB = -1
+    cx.hoistOk = was
+    n.sql = try text
+    n.ival = sub
+    n.sid = cx.newSid()
+    n.flag = cx.uses
+    if sub == SQ_SELECT_INTO || sub == SQ_DML || sub == SQ_RETURNING {
+        // a table that is not there is a compile error, as Oracle's
+        match cx.describeText(sess, &n.sql) {
+            Ok(_) {}
+            Err(e) { if e.state == "42P01" { return Err(cx.sqlErr(cx.tk(a).line, &e)) } }
+        }
+    }
+    return Ok(n)
+}
+
+// A statement at cx.pos, with its label (loops).
+fn (cx: mut &Cx) stmt(ip: mut &Ip, sess: mut &lexdb_exec.Session, label: str): Result[P, DbErr] {
+    let i = cx.pos
+    let t = cx.tk(i)
+    let line = t.line
+    if !(t.kind == TK_OP && t.text == "<<") {
+        cx.stmtLine = t.line
+        cx.stmtCol = t.col
+    }
+    if t.kind == TK_OP && t.text == "<<" {
+        if !cx.ident(i + 1) || !cx.isO(i + 2, ">>") { return Err(cx.bad(i, "")) }
+        cx.pos = i + 3
+        return cx.stmt(ip, sess, cx.tk(i + 1).up)
+    }
+    if t.kind == TK_ID {
+        let w = t.up
+        if w == "NULL" {
+            try cx.needO(i + 1, ";")
+            cx.pos = i + 2
+            return Ok(node(K_NULL, line))
+        }
+        if w == "IF" { return cx.ifStmt(ip, sess) }
+        if w == "CASE" { return cx.caseStmt(ip, sess) }
+        if w == "LOOP" {
+            cx.pos = i + 1
+            var n = node(K_LOOP, line)
+            if len(label) > 0 { append(mut &n.names, label) }
+            n.body = try cx.stmts(ip, sess, &["END"])
+            try cx.needK(cx.pos, "END")
+            try cx.needK(cx.pos + 1, "LOOP")
+            cx.pos += 2
+            if cx.ident(cx.pos) { cx.pos += 1 }
+            try cx.needO(cx.pos, ";")
+            cx.pos += 1
+            return Ok(n)
+        }
+        if w == "WHILE" {
+            var n = node(K_WHILE, line)
+            if len(label) > 0 { append(mut &n.names, label) }
+            let e = cx.findEnd(i + 1, &["LOOP"])
+            append(mut &n.x, try cx.expr(ip, sess, i + 1, e, true))
+            try cx.needK(e, "LOOP")
+            cx.pos = e + 1
+            n.body = try cx.stmts(ip, sess, &["END"])
+            try cx.needK(cx.pos, "END")
+            try cx.needK(cx.pos + 1, "LOOP")
+            cx.pos += 2
+            if cx.ident(cx.pos) { cx.pos += 1 }
+            try cx.needO(cx.pos, ";")
+            cx.pos += 1
+            return Ok(n)
+        }
+        if w == "FOR" { return cx.forStmt(ip, sess, label) }
+        if w == "EXIT" || w == "CONTINUE" {
+            var n = node(if w == "EXIT" { K_EXIT } else { K_CONT }, line)
+            var j = i + 1
+            if cx.ident(j) && !cx.isK(j, "WHEN") {
+                append(mut &n.names, cx.tk(j).up)
+                j += 1
+            }
+            if cx.isK(j, "WHEN") {
+                let e = cx.stmtEnd(j + 1)
+                append(mut &n.x, try cx.expr(ip, sess, j + 1, e, true))
+                j = e
+            }
+            try cx.needO(j, ";")
+            cx.pos = j + 1
+            return Ok(n)
+        }
+        if w == "RETURN" {
+            var n = node(K_RETURN, line)
+            var j = i + 1
+            if !cx.isO(j, ";") {
+                let e = cx.stmtEnd(j)
+                append(mut &n.x, try cx.expr(ip, sess, j, e, false))
+                j = e
+            }
+            try cx.needO(j, ";")
+            cx.pos = j + 1
+            return Ok(n)
+        }
+        if w == "RAISE" {
+            var n = node(K_RAISE, line)
+            var j = i + 1
+            if cx.ident(j) {
+                let nm = cx.tk(j).up
+                append(mut &n.names, nm)
+                n.ival = 0
+                var found = false
+                var k = len(cx.excs) - 1
+                while k >= 0 {
+                    if cx.excs[k].name == nm {
+                        n.ival = cx.excs[k].uid
+                        n.slot = cx.excs[k].code
+                        found = true
+                        break
+                    }
+                    k -= 1
+                }
+                if !found && predefined(&nm) == 0 { return Err(cx.undeclared(j)) }
+                j += 1
+            }
+            try cx.needO(j, ";")
+            cx.pos = j + 1
+            return Ok(n)
+        }
+        if w == "GOTO" {
+            return Err(plErr("ORA06550", "line " + line.toStr() + ", column " + t.col.toStr() + ":\nPLS-00103: GOTO is not supported"))
+        }
+        if w == "DECLARE" || w == "BEGIN" { return cx.blockStmt(ip, sess) }
+        if w == "OPEN" { return cx.openStmt(ip, sess) }
+        if w == "FETCH" { return cx.fetchStmt(ip, sess) }
+        if w == "CLOSE" {
+            var n = node(K_CLOSE, line)
+            if !cx.ident(i + 1) && cx.tk(i + 1).kind != TK_BIND { return Err(cx.bad(i + 1, "")) }
+            n.slot = try cx.cursorSlot(i + 1)
+            try cx.needO(i + 2, ";")
+            cx.pos = i + 3
+            return Ok(n)
+        }
+        if w == "EXECUTE" && cx.isK(i + 1, "IMMEDIATE") { return cx.execImm(ip, sess) }
+        if w == "COMMIT" || w == "ROLLBACK" || w == "SAVEPOINT" {
+            let e = cx.stmtEnd(i)
+            var n = node(K_SQL, line)
+            n.ival = SQ_TCL
+            var text = w
+            if w == "SAVEPOINT" || (w == "ROLLBACK" && cx.isK(i + 1, "TO")) {
+                var j = i + 1
+                if w == "ROLLBACK" { j += 1 }
+                if cx.isK(j, "SAVEPOINT") { j += 1 }
+                if !cx.ident(j) { return Err(cx.bad(j, "")) }
+                text = (if w == "SAVEPOINT" { "SAVEPOINT " } else { "ROLLBACK TO SAVEPOINT " }) + "\"" + cx.tk(j).up + "\""
+            }
+            n.sql = text
+            cx.pos = e + 1
+            return Ok(n)
+        }
+        if w == "SELECT" || w == "WITH" {
+            let e = cx.stmtEnd(i)
+            // INTO at the top level of the query's own text: its targets are removed
+            var intoAt = -1
+            var d = 0
+            var j = i + 1
+            while j < e {
+                if cx.isO(j, "(") { d += 1 }
+                else if cx.isO(j, ")") { d -= 1 }
+                else if d == 0 && cx.isK(j, "INTO") {
+                    intoAt = j
+                    break
+                }
+                j += 1
+            }
+            if intoAt < 0 {
+                // a SELECT with no INTO: not PL/SQL
+                return Err(plErr("ORA06550", "line " + line.toStr() + ", column " + t.col.toStr() + ":\nPLS-00428: an INTO clause is expected in this SELECT statement"))
+            }
+            if cx.isK(intoAt - 1, "COLLECT") {
+                return Err(plErr("ORA06550", "line " + line.toStr() + ", column " + t.col.toStr() + ":\nPLS-00103: BULK COLLECT is not supported"))
+            }
+            var slots: []int = []
+            let after = try cx.targets(intoAt + 1, mut &slots)
+            var n = try cx.sqlNode(ip, sess, i, e, intoAt, after, SQ_SELECT_INTO)
+            n.slots = slots
+            cx.pos = e + 1
+            return Ok(n)
+        }
+        if w == "INSERT" || w == "UPDATE" || w == "DELETE" || w == "MERGE" {
+            let e = cx.stmtEnd(i)
+            // RETURNING ... INTO targets
+            var retAt = -1
+            var intoAt = -1
+            var d = 0
+            var j = i + 1
+            while j < e {
+                if cx.isO(j, "(") { d += 1 }
+                else if cx.isO(j, ")") { d -= 1 }
+                else if d == 0 && cx.isK(j, "RETURNING") { retAt = j }
+                else if d == 0 && retAt >= 0 && cx.isK(j, "INTO") && intoAt < 0 { intoAt = j }
+                j += 1
+            }
+            if intoAt >= 0 {
+                var slots: []int = []
+                let after = try cx.targets(intoAt + 1, mut &slots)
+                var n = try cx.sqlNode(ip, sess, i, e, intoAt, after, SQ_RETURNING)
+                n.slots = slots
+                cx.pos = e + 1
+                return Ok(n)
+            }
+            let n = try cx.sqlNode(ip, sess, i, e, -1, -1, SQ_DML)
+            cx.pos = e + 1
+            return Ok(n)
+        }
+        if w == "LOCK" || w == "SET" {
+            let e = cx.stmtEnd(i)
+            let n = try cx.sqlNode(ip, sess, i, e, -1, -1, SQ_OTHER)
+            cx.pos = e + 1
+            return Ok(n)
+        }
+        if w == "CREATE" || w == "DROP" || w == "ALTER" || w == "TRUNCATE" || w == "GRANT" || w == "REVOKE" {
+            return Err(plErr("ORA06550", "line " + line.toStr() + ", column " + t.col.toStr() + ":\nPLS-00103: Encountered the symbol \"" + t.text + "\"\nUse EXECUTE IMMEDIATE for this statement"))
+        }
+    }
+    // an assignment or a call
+    if t.kind == TK_BIND || cx.ident(i) {
+        var j = i
+        if t.kind == TK_BIND { j = i + 1 } else {
+            while cx.isO(j + 1, ".") && cx.ident(j + 2) { j += 2 }
+            j += 1
+        }
+        if cx.isO(j, ":=") {
+            let g = try cx.target(i)
+            var n = node(K_ASSIGN, line)
+            n.slot = g.slot
+            n.ival = g.n
+            n.sid = -1
+            let e = cx.stmtEnd(j + 1)
+            if g.pt.k == PK_REC {
+                // record := record
+                let src = cx.find(&cx.tk(j + 1).up)
+                if e != j + 2 || src < 0 || cx.vars[src].pt.k != PK_REC { return Err(cx.bad(j + 1, "")) }
+                append(mut &n.slots, cx.vars[src].slot)
+            } else {
+                append(mut &n.x, try cx.expr(ip, sess, j + 1, e, false))
+            }
+            try cx.needO(e, ";")
+            cx.pos = e + 1
+            return Ok(n)
+        }
+        return cx.callStmt(ip, sess)
+    }
+    return Err(cx.bad(i, ""))
+}
+
+// The slot of a cursor variable named at i (a bind for a REF CURSOR OUT).
+fn (cx: mut &Cx) cursorSlot(i: int): Result[int, DbErr] {
+    let t = cx.tk(i)
+    if t.kind == TK_BIND {
+        let s = cx.bindSlotOf(&t.up)
+        cx.useBind(s, 2)
+        return Ok(s)
+    }
+    let vi = cx.find(&t.up)
+    if vi < 0 { return Err(cx.undeclared(i)) }
+    return Ok(cx.vars[vi].slot)
+}
+
+// Statements until a token among stops (not read).
+fn (cx: mut &Cx) stmts(ip: mut &Ip, sess: mut &lexdb_exec.Session, stops: &[]str): Result[[]P, DbErr] {
+    var out: []P = []
+    while true {
+        let t = cx.tk(cx.pos)
+        if t.kind == TK_EOF { return Err(cx.bad(cx.pos, "")) }
+        if t.kind == TK_ID {
+            var stop = false
+            for s in stops { if s == t.up { stop = true } }
+            if stop { break }
+        }
+        append(mut &out, try cx.stmt(ip, sess, ""))
+    }
+    return Ok(out)
+}
+
+fn (cx: mut &Cx) ifStmt(ip: mut &Ip, sess: mut &lexdb_exec.Session): Result[P, DbErr] {
+    var n = node(K_IF, cx.tk(cx.pos).line)
+    var i = cx.pos + 1
+    while true {
+        var br = node(K_BRANCH, cx.tk(i).line)
+        let e = cx.findEnd(i, &["THEN"])
+        append(mut &br.x, try cx.expr(ip, sess, i, e, true))
+        try cx.needK(e, "THEN")
+        cx.pos = e + 1
+        br.body = try cx.stmts(ip, sess, &["ELSIF", "ELSIF", "ELSE", "END"])
+        append(mut &n.body, br)
+        if cx.isK(cx.pos, "ELSIF") {
+            i = cx.pos + 1
+            continue
+        }
+        break
+    }
+    if cx.isK(cx.pos, "ELSE") {
+        cx.pos += 1
+        n.els = try cx.stmts(ip, sess, &["END"])
+    }
+    try cx.needK(cx.pos, "END")
+    try cx.needK(cx.pos + 1, "IF")
+    try cx.needO(cx.pos + 2, ";")
+    cx.pos += 3
+    return Ok(n)
+}
+
+fn (cx: mut &Cx) caseStmt(ip: mut &Ip, sess: mut &lexdb_exec.Session): Result[P, DbErr] {
+    var n = node(K_CASE, cx.tk(cx.pos).line)
+    var i = cx.pos + 1
+    var sel = -1
+    if !cx.isK(i, "WHEN") {
+        let e = cx.findEnd(i, &["WHEN"])
+        append(mut &n.x, try cx.expr(ip, sess, i, e, false))
+        sel = cx.newSlot(pt(PK_ANY))
+        n.slot = sel
+        i = e
+    }
+    while cx.isK(i, "WHEN") {
+        var br = node(K_BRANCH, cx.tk(i).line)
+        let e = cx.findEnd(i + 1, &["THEN"])
+        if sel >= 0 {
+            var pre: []P = []
+            cx.uses = false
+            let text = try cx.render(ip, sess, i + 1, e, -1, -1, true, mut &pre)
+            var c = node(K_EXPR, cx.tk(i).line)
+            c.sql = "SELECT CASE WHEN $" + (sel + 1).toStr() + " = (" + text + ") THEN 1 ELSE 0 END"
+            c.sid = cx.newSid()
+            c.pre = pre
+            c.ival = 1
+            c.flag = cx.uses
+            append(mut &br.x, c)
+        } else {
+            append(mut &br.x, try cx.expr(ip, sess, i + 1, e, true))
+        }
+        try cx.needK(e, "THEN")
+        cx.pos = e + 1
+        br.body = try cx.stmts(ip, sess, &["WHEN", "ELSE", "END"])
+        append(mut &n.body, br)
+        i = cx.pos
+    }
+    if cx.isK(i, "ELSE") {
+        cx.pos = i + 1
+        n.flag = true
+        n.els = try cx.stmts(ip, sess, &["END"])
+        i = cx.pos
+    }
+    try cx.needK(i, "END")
+    try cx.needK(i + 1, "CASE")
+    if cx.ident(i + 2) && !cx.isO(i + 2, ";") { i += 1 }
+    try cx.needO(i + 2, ";")
+    cx.pos = i + 3
+    return Ok(n)
+}
+
+fn (cx: mut &Cx) forStmt(ip: mut &Ip, sess: mut &lexdb_exec.Session, label: str): Result[P, DbErr] {
+    let i = cx.pos
+    let line = cx.tk(i).line
+    if !cx.ident(i + 1) || !cx.isK(i + 2, "IN") { return Err(cx.bad(i + 1, "")) }
+    let vname = cx.tk(i + 1).up
+    var j = i + 3
+    let loopAt = cx.findEnd(j, &["LOOP"])
+    // a cursor or a query
+    var isQuery = false
+    if cx.isO(j, "(") && (cx.isK(j + 1, "SELECT") || cx.isK(j + 1, "WITH")) { isQuery = true }
+    var curIdx = -1
+    if !isQuery && cx.ident(j) {
+        for k in 0..len(cx.curs) { if cx.curs[k].name == cx.tk(j).up { curIdx = k } }
+    }
+    if isQuery || curIdx >= 0 {
+        var n = node(K_FORCUR, line)
+        if len(label) > 0 { append(mut &n.names, label) }
+        cx.push()
+        var cols: []lexdb_exec.OutCol = []
+        if isQuery {
+            let close = cx.matchParen(j)
+            if close < 0 { return Err(cx.bad(j, "")) }
+            let q = try cx.sqlNode(ip, sess, j + 1, close, -1, -1, SQ_QUERY)
+            match cx.describeText(sess, &q.sql) {
+                Ok(c) { cols = c }
+                Err(e) { return Err(cx.sqlErr(line, &e)) }
+            }
+            append(mut &n.x, q)
+            n.ival = -1
+            if close + 1 != loopAt { return Err(cx.bad(close + 1, "LOOP")) }
+        } else {
+            n.ival = curIdx
+            cols = []
+            var r = pt(PK_REC)
+            r.rec = cx.curs[curIdx].rec
+            // the arguments
+            var k = j + 1
+            if cx.isO(k, "(") {
+                let close = cx.matchParen(k)
+                let rs = cx.splitArgs(k + 1, close)
+                var q = 0
+                while q < len(rs) {
+                    append(mut &n.x, try cx.expr(ip, sess, rs[q], rs[q + 1], false))
+                    q += 2
+                }
+                k = close + 1
+            } else { k = j + 1 }
+            if k != loopAt { return Err(cx.bad(k, "LOOP")) }
+        }
+        var rt = pt(PK_REC)
+        if isQuery { rt.rec = cx.recOf(&vname, &cols) } else { rt.rec = cx.curs[curIdx].rec }
+        n.slot = cx.declareVar(&vname, rt, false)
+        cx.pos = loopAt + 1
+        n.body = try cx.stmts(ip, sess, &["END"])
+        try cx.needK(cx.pos, "END")
+        try cx.needK(cx.pos + 1, "LOOP")
+        cx.pos += 2
+        if cx.ident(cx.pos) { cx.pos += 1 }
+        try cx.needO(cx.pos, ";")
+        cx.pos += 1
+        cx.pop()
+        return Ok(n)
+    }
+    var n = node(K_FORNUM, line)
+    if len(label) > 0 { append(mut &n.names, label) }
+    if cx.isK(j, "REVERSE") {
+        n.flag = true
+        j += 1
+    }
+    let dots = cx.findEnd(j, &[".."])
+    if !cx.isO(dots, "..") || dots >= loopAt { return Err(cx.bad(dots, "..")) }
+    append(mut &n.x, try cx.expr(ip, sess, j, dots, false))
+    append(mut &n.x, try cx.expr(ip, sess, dots + 1, loopAt, false))
+    cx.push()
+    n.slot = cx.declareVar(&vname, pt(PK_INT), true)
+    cx.pos = loopAt + 1
+    n.body = try cx.stmts(ip, sess, &["END"])
+    try cx.needK(cx.pos, "END")
+    try cx.needK(cx.pos + 1, "LOOP")
+    cx.pos += 2
+    if cx.ident(cx.pos) { cx.pos += 1 }
+    try cx.needO(cx.pos, ";")
+    cx.pos += 1
+    cx.pop()
+    return Ok(n)
+}
+
+fn (cx: mut &Cx) openStmt(ip: mut &Ip, sess: mut &lexdb_exec.Session): Result[P, DbErr] {
+    let i = cx.pos
+    var n = node(K_OPEN, cx.tk(i).line)
+    n.slot = try cx.cursorSlot(i + 1)
+    var j = i + 2
+    if cx.isK(j, "FOR") {
+        n.ival = -1
+        j += 1
+        if cx.isK(j, "SELECT") || cx.isK(j, "WITH") || cx.isO(j, "(") {
+            let e = cx.stmtEnd(j)
+            append(mut &n.x, try cx.sqlNode(ip, sess, j, e, -1, -1, SQ_QUERY))
+            j = e
+        } else {
+            n.flag = true
+            let e = cx.findEnd(j, &[";", "USING"])
+            append(mut &n.x, try cx.expr(ip, sess, j, e, false))
+            j = e
+            if cx.isK(j, "USING") {
+                let e2 = cx.stmtEnd(j + 1)
+                let rs = cx.splitArgs(j + 1, e2)
+                var q = 0
+                while q < len(rs) {
+                    var s = rs[q]
+                    if cx.isK(s, "IN") { s += 1 }
+                    append(mut &n.x, try cx.expr(ip, sess, s, rs[q + 1], false))
+                    q += 2
+                }
+                j = e2
+            }
+        }
+        try cx.needO(j, ";")
+        cx.pos = j + 1
+        return Ok(n)
+    }
+    // OPEN cursor [(args)]
+    let name = cx.tk(i + 1).up
+    var di = -1
+    for k in 0..len(cx.curs) { if cx.curs[k].name == name { di = k } }
+    if di < 0 { return Err(cx.undeclared(i + 1)) }
+    n.ival = di
+    if cx.isO(j, "(") {
+        let close = cx.matchParen(j)
+        let rs = cx.splitArgs(j + 1, close)
+        var q = 0
+        while q < len(rs) {
+            append(mut &n.x, try cx.expr(ip, sess, rs[q], rs[q + 1], false))
+            q += 2
+        }
+        j = close + 1
+    }
+    try cx.needO(j, ";")
+    cx.pos = j + 1
+    return Ok(n)
+}
+
+fn (cx: mut &Cx) fetchStmt(ip: mut &Ip, sess: mut &lexdb_exec.Session): Result[P, DbErr] {
+    let i = cx.pos
+    var n = node(K_FETCH, cx.tk(i).line)
+    n.slot = try cx.cursorSlot(i + 1)
+    if cx.isK(i + 2, "BULK") {
+        return Err(plErr("ORA06550", "line " + cx.tk(i).line.toStr() + ", column " + cx.tk(i).col.toStr() + ":\nPLS-00103: BULK COLLECT is not supported"))
+    }
+    try cx.needK(i + 2, "INTO")
+    let j = try cx.targets(i + 3, mut &n.slots)
+    try cx.needO(j, ";")
+    cx.pos = j + 1
+    return Ok(n)
+}
+
+// EXECUTE IMMEDIATE text [INTO targets] [USING [IN | OUT | IN OUT] value, ...]
+fn (cx: mut &Cx) execImm(ip: mut &Ip, sess: mut &lexdb_exec.Session): Result[P, DbErr] {
+    let i = cx.pos
+    var n = node(K_EXECIMM, cx.tk(i).line)
+    let e = cx.stmtEnd(i + 2)
+    let tx = cx.findEnd(i + 2, &["INTO", "USING", "RETURNING", "RETURN"])
+    let te = min(tx, e)
+    append(mut &n.x, try cx.expr(ip, sess, i + 2, te, false))
+    var j = te
+    if cx.isK(j, "INTO") {
+        j = try cx.targets(j + 1, mut &n.slots)
+    }
+    if cx.isK(j, "USING") {
+        let rs = cx.splitArgs(j + 1, e)
+        var q = 0
+        while q < len(rs) {
+            var s = rs[q]
+            var mode = "IN"
+            if cx.isK(s, "IN") && cx.isK(s + 1, "OUT") {
+                mode = "IN OUT"
+                s += 2
+            } else if cx.isK(s, "IN") {
+                s += 1
+            } else if cx.isK(s, "OUT") {
+                mode = "OUT"
+                s += 1
+            }
+            append(mut &n.names, mode)
+            if mode == "OUT" {
+                append(mut &n.x, node(K_NULL, n.line))
+            } else {
+                append(mut &n.x, try cx.expr(ip, sess, s, rs[q + 1], false))
+            }
+            if mode != "IN" {
+                let g = try cx.target(s)
+                append(mut &n.names2, g.slot.toStr())
+            } else {
+                append(mut &n.names2, "")
+            }
+            q += 2
+        }
+        j = e
+    }
+    if j != e { return Err(cx.bad(j, "")) }
+    try cx.needO(e, ";")
+    cx.pos = e + 1
+    return Ok(n)
+}
+
+fn dotted(names: &[]str): str {
+    var s = ""
+    for i in 0..len(names) {
+        if i > 0 { s = s + "." }
+        s = s + names[i]
+    }
+    return s
+}
+
+// A call of a procedure as a statement: `name(args);`, `name;`, the packages of Oracle's that are built in.
+fn (cx: mut &Cx) callStmt(ip: mut &Ip, sess: mut &lexdb_exec.Session): Result[P, DbErr] {
+    let i = cx.pos
+    let line = cx.tk(i).line
+    var names: []str = [cx.tk(i).up]
+    var j = i
+    while cx.isO(j + 1, ".") && cx.ident(j + 2) {
+        append(mut &names, cx.tk(j + 2).up)
+        j += 2
+    }
+    j += 1
+    var a = j
+    var b = j
+    if cx.isO(j, "(") {
+        let close = cx.matchParen(j)
+        if close < 0 { return Err(cx.bad(j, "")) }
+        a = j + 1
+        b = close
+        j = close + 1
+    }
+    try cx.needO(j, ";")
+    cx.pos = j + 1
+    var full = dotted(&names)
+    if strings.startsWith(&full, "SYS.") { full = full[4..len(full)].toStr() }
+    let rs = cx.splitArgs(a, b)
+    if full == "RAISE_APPLICATION_ERROR" {
+        var n = node(K_RAPP, line)
+        if len(rs) < 4 { return Err(cx.bad(i, "")) }
+        append(mut &n.x, try cx.expr(ip, sess, rs[0], rs[1], false))
+        append(mut &n.x, try cx.expr(ip, sess, rs[2], rs[3], false))
+        return Ok(n)
+    }
+    if strings.startsWith(&full, "DBMS_OUTPUT.") || full == "DBMS_SQL.RETURN_RESULT" {
+        var n = node(K_BUILTIN, line)
+        append(mut &n.names, full)
+        if full == "DBMS_OUTPUT.PUT_LINE" || full == "DBMS_OUTPUT.PUT" {
+            if len(rs) != 2 { return Err(cx.bad(i, "")) }
+            // TO_CHAR gives a date or a number the session's format
+            var x = try cx.expr(ip, sess, rs[0], rs[1], false)
+            if len(x.sql) > 0 && !x.isLit { x.sql = "SELECT TO_CHAR(" + x.sql[7..len(x.sql)] + ")" }
+            if x.slot >= 0 && x.sql == "" && cx.slotPt[x.slot].k != PK_TEXT && cx.slotPt[x.slot].k != PK_INT {
+                x.sql = "SELECT TO_CHAR($" + (x.slot + 1).toStr() + ")"
+                x.sid = cx.newSid()
+                x.slot = -1
+            }
+            append(mut &n.x, x)
+        } else if full == "DBMS_OUTPUT.GET_LINE" || full == "DBMS_OUTPUT.GET_LINES" {
+            if len(rs) != 4 { return Err(cx.bad(i, "")) }
+            var q = 0
+            while q < 4 {
+                let g = try cx.target(rs[q])
+                append(mut &n.slots, g.slot)
+                q += 2
+            }
+            if full == "DBMS_OUTPUT.GET_LINES" {
+                // the count in is the most lines to take
+                append(mut &n.x, try cx.expr(ip, sess, rs[2], rs[3], false))
+            }
+        } else if full == "DBMS_OUTPUT.ENABLE" || full == "DBMS_OUTPUT.DISABLE" || full == "DBMS_OUTPUT.NEW_LINE" {
+            if full == "DBMS_OUTPUT.ENABLE" && len(rs) == 2 { append(mut &n.x, try cx.expr(ip, sess, rs[0], rs[1], false)) }
+        } else if full == "DBMS_SQL.RETURN_RESULT" {
+            if len(rs) < 2 { return Err(cx.bad(i, "")) }
+            n.slot = try cx.cursorSlot(rs[0])
+        } else {
+            return Err(plErr("ORA06550", "line " + line.toStr() + ", column " + cx.tk(i).col.toStr() + ":\nPLS-00201: identifier '" + full + "' must be declared"))
+        }
+        return Ok(n)
+    }
+    if full == "DBMS_UTILITY.NAME_RESOLVE" {
+        // NAME_RESOLVE(name, context, schema, part1, part2, dblink, part1_type, object_number): SQLcl's INFO, DESC and DDL
+        // resolve a name with it. The parameters by position or by name; the six outputs are targets.
+        var n = node(K_BUILTIN, line)
+        append(mut &n.names, full)
+        var want = ["NAME", "CONTEXT", "SCHEMA", "PART1", "PART2", "DBLINK", "PART1_TYPE", "OBJECT_NUMBER"]
+        var starts: []int = []
+        for w in want { append(mut &starts, -1) }
+        var q = 0
+        var pos = 0
+        while q < len(rs) {
+            var st = rs[q]
+            var which = pos
+            if cx.ident(st) && cx.isO(st + 1, "=>") {
+                which = -1
+                for w in 0..len(want) { if want[w] == cx.tk(st).up { which = w } }
+                st += 2
+            }
+            if which < 0 || which >= len(want) { return Err(cx.bad(i, "")) }
+            starts[which] = st
+            pos += 1
+            q += 2
+        }
+        if starts[0] < 0 { return Err(cx.bad(i, "")) }
+        for w in 0..len(starts) { if w >= 2 && starts[w] < 0 { return Err(cx.bad(i, "")) } }
+        // the name's expression ends where its argument does
+        var nameEnd = -1
+        q = 0
+        while q < len(rs) {
+            var st = rs[q]
+            if cx.ident(st) && cx.isO(st + 1, "=>") { st += 2 }
+            if st == starts[0] { nameEnd = rs[q + 1] }
+            q += 2
+        }
+        append(mut &n.x, try cx.expr(ip, sess, starts[0], nameEnd, false))
+        for w in 2..8 {
+            let g = try cx.target(starts[w])
+            append(mut &n.slots, g.slot)
+        }
+        return Ok(n)
+    }
+    if full == "DBMS_METADATA.SET_TRANSFORM_PARAM" || full == "DBMS_METADATA.SET_COUNT" || full == "DBMS_METADATA.SET_FILTER" {
+        return Ok(node(K_NULL, line))
+    }
+    if (full == "DBMS_LOCK.SLEEP" || full == "DBMS_SESSION.SLEEP") && len(rs) == 2 {
+        var n = node(K_BUILTIN, line)
+        append(mut &n.names, "DBMS_LOCK.SLEEP")
+        append(mut &n.x, try cx.expr(ip, sess, rs[0], rs[1], false))
+        return Ok(n)
+    }
+    if strings.startsWith(&full, "DBMS_APPLICATION_INFO.") || strings.startsWith(&full, "DBMS_SESSION.") || full == "DBMS_LOCK.SLEEP" ||
+       strings.startsWith(&full, "DBMS_STATS.") {
+        return Ok(node(K_NULL, line))
+    }
+    let sg = cx.sigOf(&names)
+    if !sg.found && len(names) >= 2 {
+        // a package that has no such member (or not public)
+        var isPkg = false
+        for e in cx.sigs { if e.pkg == names[len(names) - 2] { isPkg = true } }
+        if isPkg {
+            let lt = cx.tk(i + 2 * (len(names) - 1))
+            return Err(plErr("ORA06550", "line " + line.toStr() + ", column " + lt.col.toStr() + ":\nPLS-00302: component '" + names[len(names) - 1] + "' must be declared" + cx.ignored()))
+        }
+    }
+    if !sg.found || sg.kind != U_PROC {
+        return Err(plErr("ORA06550", "line " + line.toStr() + ", column " + cx.tk(i).col.toStr() + ":\nPLS-00201: identifier '" + full + "' must be declared" + cx.ignored()))
+    }
+    var n = node(K_CALL, line)
+    for nm in sg.canon { append(mut &n.names, nm) }
+    var q = 0
+    var pos = 0
+    while q < len(rs) {
+        var s = rs[q]
+        let e = rs[q + 1]
+        var an = ""
+        if cx.ident(s) && cx.isO(s + 1, "=>") {
+            an = cx.tk(s).up
+            s += 2
+        }
+        var pi = pos
+        if len(an) > 0 {
+            pi = -1
+            for k in 0..len(sg.prms) { if sg.prms[k].name == an { pi = k } }
+        }
+        if pi < 0 || pi >= len(sg.prms) {
+            return Err(plErr("ORA06550", "line " + line.toStr() + ", column " + cx.tk(s).col.toStr() + ":\nPLS-00306: wrong number or types of arguments in call to '" + full + "'" + cx.ignored()))
+        }
+        let mode = sg.prms[pi].mode
+        append(mut &n.names2, an)
+        if mode == M_IN {
+            append(mut &n.x, try cx.expr(ip, sess, s, e, false))
+            append(mut &n.slots, -1)
+        } else {
+            let g = try cx.target(s)
+            if mode == M_INOUT {
+                append(mut &n.x, try cx.expr(ip, sess, s, e, false))
+            } else {
+                append(mut &n.x, node(K_NULL, line))
+            }
+            append(mut &n.slots, g.slot)
+        }
+        pos += 1
+        q += 2
+    }
+    try cx.argCheck(&sg.prms, &n.names2, &names[len(names) - 1], line, cx.tk(i).col)
+    return Ok(n)
+}
+
+fn (cx: mut &Cx) blockStmt(ip: mut &Ip, sess: mut &lexdb_exec.Session): Result[P, DbErr] {
+    let n = try cx.block(ip, sess)
+    try cx.needO(cx.pos, ";")
+    cx.pos += 1
+    return Ok(n)
+}
+
+// DECLARE ... BEGIN ... [EXCEPTION ...] END [label] (not the ";"), from DECLARE or BEGIN.
+fn (cx: mut &Cx) block(ip: mut &Ip, sess: mut &lexdb_exec.Session): Result[P, DbErr] {
+    var n = node(K_BLOCK, cx.tk(cx.pos).line)
+    cx.push()
+    if cx.isK(cx.pos, "DECLARE") {
+        cx.pos += 1
+        n.decl = try cx.decls(ip, sess)
+    }
+    try cx.bodyOf(ip, sess, mut &n)
+    cx.pop()
+    return Ok(n)
+}
+
+// BEGIN stmts [EXCEPTION handlers] END [label]
+fn (cx: mut &Cx) bodyOf(ip: mut &Ip, sess: mut &lexdb_exec.Session, n: mut &P): Result[Unit, DbErr] {
+    try cx.needK(cx.pos, "BEGIN")
+    cx.pos += 1
+    n.body = try cx.stmts(ip, sess, &["EXCEPTION", "END"])
+    if cx.isK(cx.pos, "EXCEPTION") {
+        cx.pos += 1
+        while cx.isK(cx.pos, "WHEN") {
+            var h = node(K_HANDLER, cx.tk(cx.pos).line)
+            cx.pos += 1
+            while true {
+                if !cx.ident(cx.pos) { return Err(cx.bad(cx.pos, "")) }
+                let nm = cx.tk(cx.pos).up
+                append(mut &h.names, nm)
+                if nm == "OTHERS" {
+                    append(mut &h.slots, 0)
+                } else {
+                    var found = false
+                    var k = len(cx.excs) - 1
+                    while k >= 0 {
+                        if cx.excs[k].name == nm {
+                            append(mut &h.slots, cx.excs[k].uid)
+                            if cx.excs[k].code != 0 { append(mut &h.slots, -cx.excs[k].code) }
+                            found = true
+                            break
+                        }
+                        k -= 1
+                    }
+                    if !found {
+                        let pn = predefined(&nm)
+                        if pn == 0 { return Err(cx.undeclared(cx.pos)) }
+                        append(mut &h.slots, -pn)
+                    }
+                }
+                cx.pos += 1
+                if cx.isK(cx.pos, "OR") { cx.pos += 1 } else { break }
+            }
+            try cx.needK(cx.pos, "THEN")
+            cx.pos += 1
+            h.body = try cx.stmts(ip, sess, &["WHEN", "END"])
+            append(mut &n.hs, h)
+        }
+    }
+    try cx.needK(cx.pos, "END")
+    cx.pos += 1
+    if cx.ident(cx.pos) && !cx.isO(cx.pos, ";") { cx.pos += 1 }
+    return Ok(Unit{})
+}
+
+// Declarations up to BEGIN (not read): K_DECL nodes, in order.
+fn (cx: mut &Cx) decls(ip: mut &Ip, sess: mut &lexdb_exec.Session): Result[[]P, DbErr] {
+    var out: []P = []
+    while !cx.isK(cx.pos, "BEGIN") && !(cx.stopAtEnd && cx.isK(cx.pos, "END")) {
+        let i = cx.pos
+        let t = cx.tk(i)
+        if t.kind == TK_EOF { return Err(cx.bad(i, "")) }
+        if t.kind == TK_ID && t.up == "PRAGMA" {
+            if cx.isK(i + 1, "EXCEPTION_INIT") {
+                let nm = cx.tk(i + 3).up
+                var neg = false
+                var k = i + 5
+                if cx.isO(k, "-") {
+                    neg = true
+                    k += 1
+                }
+                let code = intArg(cx, k)
+                for x in 0..len(cx.excs) { if cx.excs[x].name == nm { cx.excs[x].code = if neg { code } else { -code } } }
+                let e = cx.stmtEnd(i)
+                cx.pos = e + 1
+                // the code is the Oracle number (positive): -20001 is 20001
+                for x in 0..len(cx.excs) { if cx.excs[x].name == nm { cx.excs[x].code = code } }
+            } else {
+                cx.pos = cx.stmtEnd(i) + 1
+            }
+            continue
+        }
+        if t.kind == TK_ID && t.up == "TYPE" {
+            let nm = cx.tk(i + 1).up
+            try cx.needK(i + 2, "IS")
+            if cx.isK(i + 3, "RECORD") {
+                var rd = RecDef{name: nm, fields: []}
+                var k = i + 5
+                while true {
+                    let fname = cx.tk(k).up
+                    cx.pos = k + 1
+                    let ft = try cx.parseType(sess)
+                    append(mut &rd.fields, RecField{name: fname, pt: ft})
+                    k = cx.pos
+                    // NOT NULL, := default: read past
+                    while !cx.isO(k, ",") && !cx.isO(k, ")") && cx.tk(k).kind != TK_EOF { k += 1 }
+                    if cx.isO(k, ",") { k += 1 } else { break }
+                }
+                try cx.needO(k, ")")
+                try cx.needO(k + 1, ";")
+                append(mut &cx.recs, rd)
+                append(mut &cx.types, NamedType{name: nm, kind: 0, idx: len(cx.recs) - 1})
+                cx.pos = k + 2
+                continue
+            }
+            if cx.isK(i + 3, "REF") && cx.isK(i + 4, "CURSOR") {
+                append(mut &cx.types, NamedType{name: nm, kind: 1, idx: 0})
+                cx.pos = cx.stmtEnd(i) + 1
+                continue
+            }
+            return Err(plErr("ORA06550", "line " + t.line.toStr() + ", column " + t.col.toStr() + ":\nPLS-00103: collection types are not supported"))
+        }
+        if t.kind == TK_ID && t.up == "CURSOR" {
+            let nm = cx.tk(i + 1).up
+            var k = i + 2
+            cx.push()
+            var params: []int = []
+            if cx.isO(k, "(") {
+                let close = cx.matchParen(k)
+                let rs = cx.splitArgs(k + 1, close)
+                var q = 0
+                while q < len(rs) {
+                    let pname = cx.tk(rs[q]).up
+                    cx.pos = rs[q] + 1
+                    if cx.isK(cx.pos, "IN") { cx.pos += 1 }
+                    let ptp = try cx.parseType(sess)
+                    append(mut &params, cx.declareVar(&pname, ptp, false))
+                    q += 2
+                }
+                k = close + 1
+            }
+            try cx.needK(k, "IS")
+            let e = cx.stmtEnd(k + 1)
+            let q = try cx.sqlNode(ip, sess, k + 1, e, -1, -1, SQ_QUERY)
+            var cols: []lexdb_exec.OutCol = []
+            match cx.describeText(sess, &q.sql) {
+                Ok(c) { cols = c }
+                Err(er) { return Err(cx.sqlErr(t.line, &er)) }
+            }
+            cx.pop()
+            let ri = cx.recOf(&nm, &cols)
+            let slot = cx.declareVar(&nm, pt(PK_CUR), false)
+            append(mut &cx.curs, CurDef{name: nm, slot: slot, params: params, q: q, rec: ri})
+            var d = node(K_DECL, t.line)
+            d.slot = slot
+            d.ival = 5
+            append(mut &out, d)
+            cx.pos = e + 1
+            continue
+        }
+        if t.kind == TK_ID && (t.up == "PROCEDURE" || t.up == "FUNCTION") {
+            if len(cx.pkg) > 0 && !cx.inMember {
+                try cx.pkgMember(ip, sess)
+                continue
+            }
+            return Err(plErr("ORA06550", "line " + t.line.toStr() + ", column " + t.col.toStr() + ":\nPLS-00103: subprograms declared in a block are not supported"))
+        }
+        if !cx.ident(i) { return Err(cx.bad(i, "")) }
+        let nm = t.up
+        if cx.isK(i + 1, "EXCEPTION") {
+            cx.uid += 1
+            append(mut &cx.excs, ExcDef{name: nm, uid: cx.uid, code: 0})
+            let s = cx.declare(&nm, pt(PK_EXC), false)
+            cx.pos = i + 3
+            continue
+        }
+        var j = i + 1
+        var konst = false
+        if cx.isK(j, "CONSTANT") {
+            konst = true
+            j += 1
+        }
+        cx.pos = j
+        let ty = try cx.parseType(sess)
+        j = cx.pos
+        var notNull = false
+        if cx.isK(j, "NOT") && cx.isK(j + 1, "NULL") {
+            notNull = true
+            j += 2
+        }
+        var d = node(K_DECL, t.line)
+        d.flag = notNull
+        if cx.isO(j, ":=") || cx.isK(j, "DEFAULT") {
+            let e = cx.stmtEnd(j + 1)
+            // the initialiser sees the variables declared before it
+            d.x = [try cx.expr(ip, sess, j + 1, e, false)]
+            j = e
+        }
+        try cx.needO(j, ";")
+        d.slot = cx.declareVar(&nm, ty, konst)
+        if ty.k == PK_REC { d.ival = len(cx.recs[ty.rec].fields) } else if ty.k == PK_REFCUR { d.ival = 5 } else { d.ival = 1 }
+        append(mut &out, d)
+        cx.pos = j + 1
+    }
+    return Ok(out)
+}
+
+// ---- units
+
+fn newCx(src: &str, toks: []Tok, owner: &str, nls: []str, sigs: []SigEntry, uid: int): Cx {
+    var cx = Cx{src: src.toStr(), toks: toks, pos: 0, vars: [], marks: [], slotPt: [], recs: [], curs: [], excs: [], types: [], bindNames: [],
+                bindUse: [], bindSlot: [], nsid: 0, uid: uid, unit: "", owner: owner.toStr(), retPt: pt(PK_ANY), isFunc: false,
+                self: emptyUnit(), hasSelf: false, sigs: sigs, nls: nls, pkg: "", inMember: false, stopAtEnd: false, members: [], ranges: [], pubs: [], specMode: false, stmtLine: 1, stmtCol: 1, uses: false, hoistOk: true, colScope: [], noSubA: -1, noSubB: -1}
+    append(mut &cx.slotPt, pt(PK_INT))
+    append(mut &cx.slotPt, pt(PK_BOOL))
+    append(mut &cx.slotPt, pt(PK_BOOL))
+    append(mut &cx.slotPt, pt(PK_BOOL))
+    append(mut &cx.slotPt, pt(PK_INT))
+    append(mut &cx.slotPt, pt(PK_TEXT))
+    return cx
+}
+
+fn emptyUnit(): PUnit {
+    return PUnit{owner: "", name: "", kind: U_BLOCK, prms: [], defs: [], ret: pt(PK_ANY), retSlot: -1, nslots: 0, slotPt: [], body: node(K_NULL, 0), src: "",
+                 bindUse: [], bindSlot: [], nbinds: 0, sid0: 0, sid1: 0, curs: [], bad: "", pkg: "", isPub: true, pkgSlots: []}
+}
+
+// The unit cx has compiled, with its tables moved into it.
+fn (cx: mut &Cx) finish(kind: int, body: P): PUnit {
+    var u = emptyUnit()
+    u.kind = kind
+    u.body = body
+    u.nslots = len(cx.slotPt)
+    u.slotPt = replace(mut &cx.slotPt, [])
+    u.curs = replace(mut &cx.curs, [])
+    u.bindUse = replace(mut &cx.bindUse, [])
+    u.bindSlot = replace(mut &cx.bindSlot, [])
+    u.nbinds = len(u.bindSlot)
+    return u
+}
+
+// An anonymous block, its binds' names in order (a bind's slot is the first after the system ones).
+fn compileBlock(ip: mut &Ip, sess: mut &lexdb_exec.Session, src: &str, binds: &[]str, sigs: []SigEntry): Result[PUnit, DbErr] {
+    let toks = try lex(src)
+    var cx = newCx(src, toks, &ip.user, cloneStrs(&ip.nls), sigs, ip.uid)
+    cx.unit = ""
+    cx.nsid = len(ip.scache)
+    for b in binds { let s = cx.bindSlotOf(&b) }
+    var n = node(K_NULL, 1)
+    if cx.isK(0, "DECLARE") || cx.isK(0, "BEGIN") {
+        n = try cx.block(ip, sess)
+    } else {
+        return Err(cx.bad(0, ""))
+    }
+    if cx.isO(cx.pos, ";") { cx.pos += 1 }
+    if cx.tk(cx.pos).kind != TK_EOF { return Err(cx.bad(cx.pos, "")) }
+    ip.uid = cx.uid
+    while len(ip.scache) < cx.nsid { append(mut &ip.scache, None) }
+    var u = cx.finish(U_BLOCK, n)
+    return Ok(u)
+}
+
+// A procedure's or function's header from cx.pos (after PROCEDURE or FUNCTION): its name, owner and parameters; the
+// parameters are variables of the unit (declared in cx).
+fn (cx: mut &Cx) header(ip: mut &Ip, sess: mut &lexdb_exec.Session, kind: int, u: mut &PUnit): Result[Unit, DbErr] {
+    if !cx.ident(cx.pos) { return Err(cx.bad(cx.pos, "")) }
+    var nm = cx.tk(cx.pos).up
+    var owner = cx.owner
+    cx.pos += 1
+    if cx.isO(cx.pos, ".") {
+        owner = nm
+        nm = cx.tk(cx.pos + 1).up
+        cx.pos += 2
+    }
+    u.owner = owner
+    u.name = nm
+    u.kind = kind
+    cx.unit = nm
+    if cx.isO(cx.pos, "(") {
+        let close = cx.matchParen(cx.pos)
+        if close < 0 { return Err(cx.bad(cx.pos, "")) }
+        let rs = cx.splitArgs(cx.pos + 1, close)
+        var q = 0
+        while q < len(rs) {
+            let s = rs[q]
+            let e = rs[q + 1]
+            if !cx.ident(s) { return Err(cx.bad(s, "")) }
+            let pname = cx.tk(s).up
+            var j = s + 1
+            var mode = M_IN
+            if cx.isK(j, "IN") && cx.isK(j + 1, "OUT") {
+                mode = M_INOUT
+                j += 2
+            } else if cx.isK(j, "IN") {
+                j += 1
+            } else if cx.isK(j, "OUT") {
+                mode = M_OUT
+                j += 1
+            }
+            if cx.isK(j, "NOCOPY") { j += 1 }
+            cx.pos = j
+            let ty = try cx.parseType(sess)
+            j = cx.pos
+            var hasDef = false
+            var dn = node(K_NULL, cx.tk(s).line)
+            if j < e && (cx.isO(j, ":=") || cx.isK(j, "DEFAULT")) {
+                dn = try cx.expr(ip, sess, j + 1, e, false)
+                hasDef = true
+            }
+            let slot = cx.declareVar(&pname, ty, false)
+            append(mut &u.prms, Prm{name: pname, mode: mode, pt: ty, slot: slot, hasDef: hasDef})
+            append(mut &u.defs, dn)
+            q += 2
+        }
+        cx.pos = close + 1
+    }
+    if kind == U_FUNC {
+        try cx.needK(cx.pos, "RETURN")
+        cx.pos += 1
+        u.ret = try cx.parseType(sess)
+    }
+    // AUTHID, DETERMINISTIC, ...: read past
+    while cx.ident(cx.pos) && !cx.isK(cx.pos, "IS") && !cx.isK(cx.pos, "AS") { cx.pos += 1 }
+    return Ok(Unit{})
+}
+
+// CREATE [OR REPLACE] [EDITIONABLE] PROCEDURE | FUNCTION: the kind (0 not one), and the token after it.
+type Head = value record { kind: int; next: int; body: bool }
+
+fn unitHead(toks: &[]Tok): Head {
+    var i = 0
+    let n = len(toks)
+    if i >= n || toks[i].kind != TK_ID || toks[i].up != "CREATE" { return Head{kind: 0, next: 0, body: false} }
+    i += 1
+    if i + 1 < n && toks[i].up == "OR" && toks[i + 1].up == "REPLACE" { i += 2 }
+    if i < n && (toks[i].up == "EDITIONABLE" || toks[i].up == "NONEDITIONABLE") { i += 1 }
+    if i < n && toks[i].up == "PACKAGE" {
+        if i + 1 < n && toks[i + 1].up == "BODY" { return Head{kind: U_PKG, next: i + 2, body: true} }
+        return Head{kind: U_PKG, next: i + 1, body: false}
+    }
+    if i < n && toks[i].up == "PROCEDURE" { return Head{kind: U_PROC, next: i + 1, body: false} }
+    if i < n && toks[i].up == "FUNCTION" { return Head{kind: U_FUNC, next: i + 1, body: false} }
+    return Head{kind: 0, next: 0, body: false}
+}
+
+// A stored procedure or function from its CREATE text; headerOnly: its signature, no body.
+fn compileStored(ip: mut &Ip, sess: mut &lexdb_exec.Session, src: &str, owner: &str, sigs: []SigEntry, headerOnly: bool): Result[PUnit, DbErr] {
+    let toks = try lex(src)
+    let h = unitHead(&toks)
+    if h.kind == 0 { return Err(plErr("ORA06550", "line 1, column 1:\nPLS-00103: Encountered the symbol \"" + (if len(toks) > 0 { toks[0].text } else { "" }) + "\"")) }
+    var cx = newCx(src, toks, owner, cloneStrs(&ip.nls), sigs, ip.uid)
+    cx.pos = h.next
+    cx.nsid = len(ip.scache)
+    var u = emptyUnit()
+    u.src = src.toStr()
+    try cx.header(ip, sess, h.kind, mut &u)
+    if headerOnly {
+        u.slotPt = replace(mut &cx.slotPt, [])
+        return Ok(u)
+    }
+    cx.self = emptyUnit()
+    cx.self.owner = u.owner
+    cx.self.name = u.name
+    cx.self.kind = u.kind
+    cx.self.prms = copyPrms(&u.prms)
+    cx.self.ret = u.ret
+    cx.hasSelf = true
+    if !(cx.isK(cx.pos, "IS") || cx.isK(cx.pos, "AS")) { return Err(cx.bad(cx.pos, "IS")) }
+    cx.pos += 1
+    var n = node(K_BLOCK, cx.tk(cx.pos).line)
+    n.decl = try cx.decls(ip, sess)
+    try cx.bodyOf(ip, sess, mut &n)
+    if cx.isO(cx.pos, ";") { cx.pos += 1 }
+    if cx.tk(cx.pos).kind != TK_EOF { return Err(cx.bad(cx.pos, "")) }
+    ip.uid = cx.uid
+    while len(ip.scache) < cx.nsid { append(mut &ip.scache, None) }
+    let prms = replace(mut &u.prms, [])
+    let defs = replace(mut &u.defs, [])
+    var r = cx.finish(h.kind, n)
+    r.owner = u.owner
+    r.name = u.name
+    r.prms = prms
+    r.defs = defs
+    r.ret = u.ret
+    r.src = src.toStr()
+    return Ok(r)
+}
+
+// ---- running
+
+const F_NEXT = 0
+const F_EXIT = 1
+const F_CONT = 2
+const F_RET = 3
+
+type Fr = record { vals: []Val; oids: []int; ret: Val; line: int; hasRet: bool }
+
+fn newFr(u: &PUnit): Fr {
+    var f = Fr{vals: [], oids: [], ret: Val.Null, line: 0, hasRet: false}
+    for t in u.slotPt {
+        append(mut &f.vals, Val.Null)
+        append(mut &f.oids, oidOf(&t))
+    }
+    return f
+}
+
+fn ora(n: int, text: str): DbErr { return plErr("ORA" + lexdb_oratext.pad5(n), text) }
+
+fn stdText(n: int): str {
+    if n == 1403 { return "no data found" }
+    if n == 1422 { return "exact fetch returned more than the requested number of rows " }
+    if n == 1476 { return "divisor is equal to zero" }
+    if n == 1 { return "unique constraint violated" }
+    if n == 1722 { return "invalid number" }
+    if n == 6502 { return "PL/SQL: value or conversion error" }
+    if n == 6511 { return "PL/SQL: cursor already open" }
+    if n == 1001 { return "cursor number is invalid or does not exist" }
+    if n == 6592 { return "CASE not found while executing CASE statement" }
+    if n == 6530 { return "Reference to uninitialized composite" }
+    if n == 6531 { return "Reference to uninitialized collection" }
+    if n == 6501 { return "PL/SQL: program error" }
+    if n == 1017 { return "invalid username/password; logon denied" }
+    if n == 1012 { return "not logged on" }
+    if n == 51 { return "timeout occurred while waiting for a resource" }
+    return "User-Defined Exception"
+}
+
+// The ORA- number an error stands for: its own, or the one of lexdb's SQLSTATE.
+fn errNum(e: &DbErr): int {
+    if len(e.state) == 8 && strings.startsWith(&e.state, "ORA") { return strings.parseIntOpt(&(e.state[3..8].toStr())).unwrapOr(20000) }
+    if strings.startsWith(&e.state, "PLX") { return 0 }
+    return lexdb_oratext.oraOf(e, &"").num
+}
+
+fn errUid(e: &DbErr): int {
+    if strings.startsWith(&e.state, "PLX") { return strings.parseIntOpt(&(e.state[3..len(e.state)].toStr())).unwrapOr(0) }
+    return 0
+}
+
+fn errText(e: &DbErr): str {
+    if len(e.state) == 8 && strings.startsWith(&e.state, "ORA") { return e.msg.toStr() }
+    return lexdb_oratext.oraOf(e, &"").text
+}
+
+fn sqlcodeOf(e: &DbErr): int {
+    if errUid(e) > 0 { return 1 }
+    let n = errNum(e)
+    if n == 1403 { return 100 }
+    return -n
+}
+
+fn sqlerrmOf(e: &DbErr): str {
+    if errUid(e) > 0 { return "User-Defined Exception" }
+    let n = errNum(e)
+    return lexdb_oratext.oraText(n, errText(e))
+}
+
+fn tnOf(t: &PT): TypeName {
+    if t.k == PK_INT { return TypeName{kind: lexdb_sql.K_INT, oid: lexdb_sql.OID_INT8, prec: 0, scale: 0, len: 0} }
+    if t.k == PK_NUM { return TypeName{kind: lexdb_sql.K_NUM, oid: lexdb_sql.OID_NUMERIC, prec: t.prec, scale: t.scale, len: 0} }
+    if t.k == PK_BOOL { return TypeName{kind: lexdb_sql.K_BOOL, oid: lexdb_sql.OID_BOOL, prec: 0, scale: 0, len: 0} }
+    if t.k == PK_DATE || t.k == PK_TS { return TypeName{kind: lexdb_sql.K_TS, oid: lexdb_sql.OID_TS, prec: 0, scale: 0, len: 0} }
+    if t.k == PK_TSTZ { return TypeName{kind: lexdb_sql.K_TSTZ, oid: lexdb_sql.OID_TSTZ, prec: 0, scale: 0, len: 0} }
+    if t.k == PK_RAW { return TypeName{kind: lexdb_sql.K_BYTEA, oid: lexdb_sql.OID_BYTEA, prec: 0, scale: 0, len: 0} }
+    if t.k == PK_FLOAT { return lexdb_sql.floatType(if t.oid == lexdb_sql.OID_FLOAT4 { lexdb_sql.OID_FLOAT4 } else { lexdb_sql.OID_FLOAT8 }) }
+    return TypeName{kind: lexdb_sql.K_TEXT, oid: lexdb_sql.OID_TEXT, prec: 0, scale: 0, len: 0}
+}
+
+// A value converted as an assignment to a variable of type t does (PL/SQL's rules: the empty string is NULL, a
+// VARCHAR2 holds only its length, a NUMBER its precision).
+fn conv(t: &PT, v: Val): Result[Val, DbErr] {
+    match v {
+        Val.Null { return Ok(Val.Null) }
+        else {}
+    }
+    if t.k == PK_ANY || t.k == PK_REC || t.k == PK_CUR || t.k == PK_REFCUR || t.k == PK_EXC {
+        match v {
+            Val.Text(s) { if len(s) == 0 { return Ok(Val.Null) } }
+            else {}
+        }
+        return Ok(v)
+    }
+    if t.k == PK_TEXT {
+        var s = ""
+        match v {
+            Val.Text(x) { s = x }
+            Val.Bytes(b) { s = lexdb_exec.text(&Val.Bytes(b)) }
+            else {
+                match lexdb_exec.coerce(v, &tnOf(t)) {
+                    Ok(c) {
+                        match c {
+                            Val.Text(x) { s = x }
+                            else {}
+                        }
+                    }
+                    Err(_) { return Err(ora(6502, "PL/SQL: value or conversion error")) }
+                }
+            }
+        }
+        if len(s) == 0 { return Ok(Val.Null) }
+        if t.len > 0 && strings.runeCount(&s) > t.len { return Err(ora(6502, "PL/SQL: value or conversion error: character string buffer too small")) }
+        return Ok(Val.Text(s))
+    }
+    match v {
+        Val.Text(s) {
+            if len(s) == 0 { return Ok(Val.Null) }
+            if t.k == PK_INT || t.k == PK_NUM || t.k == PK_FLOAT {
+                match lexdb_exec.coerce(Val.Text(strings.trim(&s)), &tnOf(t)) {
+                    Ok(c) { return Ok(c) }
+                    Err(_) { return Err(ora(6502, "PL/SQL: value or conversion error: character to number conversion error")) }
+                }
+            }
+        }
+        else {}
+    }
+    var tn = tnOf(t)
+    if t.k == PK_INT && t.prec == 1 {
+        // POSITIVE
+        match v {
+            Val.Int(n) { if n < 1 { return Err(ora(6502, "PL/SQL: value or conversion error")) } }
+            else {}
+        }
+    }
+    match lexdb_exec.coerce(v, &tn) {
+        Ok(c) {
+            if t.k == PK_DATE {
+                match c {
+                    Val.Ts(us) { return Ok(Val.Ts(us - us % 1000000)) }
+                    else {}
+                }
+            }
+            return Ok(c)
+        }
+        Err(e) {
+            if e.state == "22003" { return Err(ora(6502, "PL/SQL: value or conversion error: number precision too large")) }
+            return Err(ora(6502, "PL/SQL: value or conversion error"))
+        }
+    }
+}
+
+// slot := v, converted to the slot's type.
+fn assign(u: &PUnit, fr: mut &Fr, slot: int, v: Val): Result[Unit, DbErr] {
+    let c = try conv(&u.slotPt[slot], v)
+    putv(u, fr, slot, c)
+    return Ok(Unit{})
+}
+
+fn putv(u: &PUnit, fr: mut &Fr, slot: int, v: Val) {
+    match v {
+        Val.Null { fr.oids[slot] = oidOf(&u.slotPt[slot]) }
+        else { fr.oids[slot] = lexdb_exec.kindOid(&v) }
+    }
+    fr.vals[slot] = v
+}
+
+fn tagCount(tag: &str): int {
+    let at = strings.lastIndexOf(&(tag.toStr()), " ")
+    if at < 0 { return 0 }
+    return strings.parseIntOpt(&(tag[at + 1..len(tag)].toStr())).unwrapOr(0)
+}
+
+// ---- the session's transaction around the block's statements: a savepoint before each DML (its failure undoes it
+// alone), and lxl_pl_s after the last one (a failed read goes back to it: a failed statement would otherwise fail
+// the transaction).
+
+const C_BEGIN = 0
+const C_SP_W = 1
+const C_REL_W = 2
+const C_RB_W = 3
+const C_SP_S = 4
+const C_RB_S = 5
+const C_COMMIT = 6
+const C_ROLLBACK = 7
+const C_SP_0 = 8
+const C_RB_0 = 9
+const C_REL_0 = 10
+const C_REL_S = 11
+
+const CTL: []str = ["BEGIN", "SAVEPOINT lxl_pl_w", "RELEASE SAVEPOINT lxl_pl_w", "ROLLBACK TO SAVEPOINT lxl_pl_w", "SAVEPOINT lxl_pl_s",
+                    "ROLLBACK TO SAVEPOINT lxl_pl_s", "COMMIT", "ROLLBACK", "SAVEPOINT lxl_pl_0", "ROLLBACK TO SAVEPOINT lxl_pl_0",
+                    "RELEASE SAVEPOINT lxl_pl_0", "RELEASE SAVEPOINT lxl_pl_s"]
+
+fn ctl(ip: mut &Ip, sess: mut &lexdb_exec.Session, k: int): Result[Unit, DbErr] {
+    while len(ip.ctl) < len(CTL) {
+        var stmts = try lexdb_sql.parse(&CTL[len(ip.ctl)])
+        let st = pop(mut &stmts)
+        append(mut &ip.ctl, st)
+    }
+    let none: []Val = []
+    let nt: []int = []
+    let r = try sess.run(&ip.ctl[k], &none, &nt)
+    return Ok(Unit{})
+}
+
+fn ensureStmt(ip: mut &Ip, sid: int, sql: &str): Result[Unit, DbErr] {
+    while len(ip.scache) <= sid { append(mut &ip.scache, None) }
+    match ip.scache[sid] {
+        Some(_) { return Ok(Unit{}) }
+        None {}
+    }
+    let text = lexdb_oratext.oracleSql(sql.toStr())
+    var stmts = try lexdb_sql.oraParseNls(&text, cloneStrs(&ip.nls))
+    if len(stmts) != 1 { return Err(plErr("42601", "SQL command not properly ended")) }
+    ip.scache[sid] = Some(pop(mut &stmts))
+    return Ok(Unit{})
+}
+
+// Before a statement: a DML statement begins the transaction when there is none, and is under a savepoint.
+fn preRun(ip: mut &Ip, sess: mut &lexdb_exec.Session, write: bool): Result[bool, DbErr] {
+    if write && sess.status() == 'I' {
+        try ctl(ip, sess, C_BEGIN)
+        ip.sps = false
+    }
+    let inTx = sess.status() != 'I'
+    if inTx {
+        if write {
+            try ctl(ip, sess, C_SP_W)
+        } else if !ip.sps {
+            try ctl(ip, sess, C_SP_S)
+            ip.sps = true
+        }
+    }
+    return Ok(inTx)
+}
+
+// After it: the savepoint of a DML statement that went well is the new safe place; one that failed is undone.
+fn postRun(ip: mut &Ip, sess: mut &lexdb_exec.Session, write: bool, inTx: bool, ok: bool) {
+    if ok {
+        if write && inTx && sess.status() != 'I' {
+            let a = ctl(ip, sess, C_REL_W)
+            let b = ctl(ip, sess, C_SP_S)
+            ip.sps = true
+        }
+        return
+    }
+    if inTx {
+        if write {
+            let a = ctl(ip, sess, C_RB_W)
+            let b = ctl(ip, sess, C_REL_W)
+        } else if ip.sps {
+            let a = ctl(ip, sess, C_RB_S)
+        }
+    }
+}
+
+// A statement of the unit run with the frame's values: write is a DML statement.
+fn runSql(ip: mut &Ip, sess: mut &lexdb_exec.Session, sid: int, sql: &str, fr: &Fr, write: bool): Result[lexdb_exec.Res, DbErr] {
+    try ensureStmt(ip, sid, sql)
+    let inTx = try preRun(ip, sess, write)
+    var r: Result[lexdb_exec.Res, DbErr] = Err(plErr("XX000", ""))
+    match &ip.scache[sid] {
+        Some(s) { r = sess.run(s, &fr.vals, &fr.oids) }
+        None {}
+    }
+    postRun(ip, sess, write, inTx, r.isOk())
+    return r
+}
+
+fn syncSys(ip: &Ip, fr: mut &Fr) {
+    fr.vals[SYS_ROWCOUNT] = Val.Int(ip.sqlRows)
+    fr.vals[SYS_FOUND] = if ip.sqlFound < 0 { Val.Null } else { Val.Bool(ip.sqlFound == 1) }
+    fr.vals[SYS_NOTFOUND] = if ip.sqlFound < 0 { Val.Null } else { Val.Bool(ip.sqlFound == 0) }
+    fr.vals[SYS_ISOPEN] = Val.Bool(false)
+    fr.vals[SYS_CODE] = Val.Int(ip.errCode)
+    fr.vals[SYS_ERRM] = if len(ip.errMsg) == 0 { Val.Null } else { Val.Text(ip.errMsg) }
+}
+
+fn isTrue(v: &Val): bool {
+    match v {
+        Val.Bool(b) { return b }
+        Val.Int(n) { return n != 0 }
+        else { return false }
+    }
+}
+
+fn withTrace(e: &DbErr, where: &str, line: int): DbErr {
+    if e.state == "ORA06550" { return e }
+    return DbErr{state: e.state, msg: e.msg, context: e.context + "ORA-06512: at " + where + (if len(where) > 0 { ", " } else { "" }) + "line " + line.toStr() + "\n",
+                 detail: e.detail, hint: e.hint}
+}
+
+fn unitWhere(u: &PUnit): str {
+    if u.kind == U_BLOCK { return "" }
+    if len(u.pkg) > 0 { return "\"" + u.owner + "." + u.pkg + "\"" }
+    return "\"" + u.owner + "." + u.name + "\""
+}
+
+// ---- a package's variables
+
+// A package made again or dropped: the session's state of it goes.
+fn forgetPkg(ip: mut &Ip, owner: &str, name: &str) {
+    let i = pkgIndex(ip, owner, name)
+    if i >= 0 {
+        ip.pkgs[i].ready = false
+        ip.pkgs[i].stamp = "\x01"
+    }
+}
+
+fn pkgIndex(ip: &Ip, owner: &str, name: &str): int {
+    for i in 0..len(ip.pkgs) { if ip.pkgs[i].owner == owner && ip.pkgs[i].name == name { return i } }
+    return -1
+}
+
+// The state of the package a member belongs to, made (its variables initialised, its own statements run) when first needed.
+fn pkgState(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, cu: &PUnit): Result[int, DbErr] {
+    // its state is discarded when its own source changes, not for other DDL
+    var stamp = ""
+    for s in ip.stored { if s.owner == cu.owner && s.name == cu.pkg && (s.kind == "PACKAGE" || s.kind == "PACKAGE BODY") { stamp = stamp + s.kind + "\x00" + s.src + "\x00" } }
+    var i = pkgIndex(ip, &cu.owner, &cu.pkg)
+    if i >= 0 && ip.pkgs[i].stamp != stamp {
+        ip.pkgs[i].ready = false
+        ip.pkgs[i].stamp = stamp
+    }
+    if i < 0 {
+        append(mut &ip.pkgs, PkgInst{owner: cu.owner, name: cu.pkg, vals: [], oids: [], ready: false, stamp: stamp})
+        i = len(ip.pkgs) - 1
+    }
+    if ip.pkgs[i].ready { return Ok(i) }
+    let pi = pg.pkgOf(&cu.owner, &cu.pkg)
+    if pi < 0 { return Err(ora(4067, "not executed, package body \"" + cu.owner + "." + cu.pkg + "\" does not exist")) }
+    let pu = &pg.units[pi]
+    var fr = newFr(pu)
+    ip.pkgs[i].ready = true
+    ip.pkgs[i].vals = cloneRow(&fr.vals)
+    ip.pkgs[i].oids = cloneInts(&fr.oids)
+    ip.depth += 1
+    let r = execBlock(pg, ip, sess, pu, &pu.body, mut &fr)
+    ip.depth -= 1
+    ip.pkgs[i].vals = replace(mut &fr.vals, [])
+    ip.pkgs[i].oids = replace(mut &fr.oids, [])
+    match r {
+        Ok(_) {}
+        Err(e) {
+            ip.pkgs[i].ready = false
+            return Err(withTrace(&e, &unitWhere(pu), fr.line))
+        }
+    }
+    return Ok(i)
+}
+
+fn pkgSave(u: &PUnit, fr: &Fr, ip: mut &Ip, i: int) {
+    for s in u.pkgSlots {
+        ip.pkgs[i].vals[s] = fr.vals[s]
+        ip.pkgs[i].oids[s] = fr.oids[s]
+    }
+}
+
+fn pkgLoad(u: &PUnit, fr: mut &Fr, ip: &Ip, i: int) {
+    for s in u.pkgSlots {
+        fr.vals[s] = ip.pkgs[i].vals[s]
+        fr.oids[s] = ip.pkgs[i].oids[s]
+    }
+}
+
+// The value of an expression.
+fn eval(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, u: &PUnit, x: &P, fr: mut &Fr): Result[Val, DbErr] {
+    for i in 0..len(x.pre) { try hoist(pg, ip, sess, u, &x.pre[i], fr) }
+    if x.isLit { return Ok(x.lit) }
+    if x.slot >= 0 && len(x.sql) == 0 {
+        let v = fr.vals[x.slot]
+        if x.ival == 1 { return Ok(Val.Int(if isTrue(&v) { 1 } else { 0 })) }
+        return Ok(v)
+    }
+    if x.flag { syncSys(ip, fr) }
+    let rr = runSql(ip, sess, x.sid, &x.sql, fr, false)
+    match rr {
+        Ok(_) {}
+        Err(e) {
+            // PL/SQL's own conversions say VALUE_ERROR where SQL says "invalid number"
+            if e.state == "22P02" || e.state == "22023" || e.state == "ORA01722" { return Err(ora(6502, "PL/SQL: value or conversion error: character to number conversion error")) }
+            return Err(e)
+        }
+    }
+    let r = try rr
+    if len(r.rows) == 0 || len(r.rows[0]) == 0 { return Ok(Val.Null) }
+    return Ok(r.rows[0][0])
+}
+
+fn evalCond(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, u: &PUnit, x: &P, fr: mut &Fr): Result[bool, DbErr] {
+    let v = try eval(pg, ip, sess, u, x, fr)
+    return Ok(isTrue(&v))
+}
+
+fn hoist(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, u: &PUnit, h: &P, fr: mut &Fr): Result[Unit, DbErr] {
+    let v = try callUnit(pg, ip, sess, u, h, fr)
+    try assign(u, fr, h.slot, v)
+    return Ok(Unit{})
+}
+
+fn undefinedErr(names: &[]str): DbErr {
+    return plErr("ORA06550", "line 1, column 1:\nPLS-00201: identifier '" + dotted(names) + "' must be declared")
+}
+
+// A call of a stored procedure or function (a K_CALL or K_HOIST node of unit u, in frame fr): its result.
+fn callUnit(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, u: &PUnit, p: &P, fr: mut &Fr): Result[Val, DbErr] {
+    let ci = pg.findC(&p.names)
+    if ci < 0 { return Err(undefinedErr(&p.names)) }
+    let cu = &pg.units[ci]
+    if len(cu.bad) > 0 {
+        return Err(plErr("ORA06550", "line " + p.line.toStr() + ", column 1:\nPLS-00905: object " + cu.owner + "." + cu.name + " is invalid\nORA-06550: line " +
+                         p.line.toStr() + ", column 1:\nPL/SQL: Statement ignored"))
+    }
+    if ip.depth > 60 { return Err(ora(4030, "out of process memory when trying to allocate PL/SQL stack")) }
+    var f2 = newFr(cu)
+    var given: []bool = array(len(cu.prms), false)
+    for i in 0..len(p.x) {
+        var pi = i
+        if len(p.names2[i]) > 0 {
+            pi = -1
+            for k in 0..len(cu.prms) { if cu.prms[k].name == p.names2[i] { pi = k } }
+        }
+        if pi < 0 || pi >= len(cu.prms) { return Err(plErr("ORA06550", "line " + p.line.toStr() + ", column 1:\nPLS-00306: wrong number or types of arguments in call to '" + cu.name + "'")) }
+        given[pi] = true
+        if cu.prms[pi].mode == M_OUT { continue }
+        let v = try eval(pg, ip, sess, u, &p.x[i], fr)
+        try assign(cu, mut &f2, cu.prms[pi].slot, v)
+    }
+    for k in 0..len(cu.prms) {
+        if given[k] { continue }
+        if cu.prms[k].hasDef {
+            let v = try eval(pg, ip, sess, cu, &cu.defs[k], mut &f2)
+            try assign(cu, mut &f2, cu.prms[k].slot, v)
+        } else if cu.prms[k].mode != M_OUT {
+            return Err(plErr("ORA06550", "line " + p.line.toStr() + ", column 1:\nPLS-00306: wrong number or types of arguments in call to '" + cu.name + "'"))
+        }
+    }
+    // package variables: the caller's and the callee's go through the session's copy
+    var callerPi = -1
+    var calleePi = -1
+    if len(cu.pkg) > 0 {
+        calleePi = try pkgState(pg, ip, sess, cu)
+        if len(u.pkg) > 0 {
+            callerPi = pkgIndex(ip, &u.owner, &u.pkg)
+            if callerPi >= 0 { pkgSave(u, fr, ip, callerPi) }
+        }
+        pkgLoad(cu, mut &f2, ip, calleePi)
+    } else if len(u.pkg) > 0 {
+        callerPi = pkgIndex(ip, &u.owner, &u.pkg)
+        if callerPi >= 0 { pkgSave(u, fr, ip, callerPi) }
+    }
+    ip.depth += 1
+    let r = execBlock(pg, ip, sess, cu, &cu.body, mut &f2)
+    ip.depth -= 1
+    if calleePi >= 0 { pkgSave(cu, &f2, ip, calleePi) }
+    if callerPi >= 0 { pkgLoad(u, fr, ip, callerPi) }
+    match r {
+        Ok(_) {}
+        Err(e) { return Err(withTrace(&e, &unitWhere(cu), f2.line)) }
+    }
+    if cu.kind == U_FUNC && !f2.hasRet { return Err(withTrace(&ora(6503, "PL/SQL: function returned without value"), &unitWhere(cu), f2.line)) }
+    for i in 0..len(p.x) {
+        if i >= len(p.slots) || p.slots[i] < 0 { continue }
+        var pi = i
+        if len(p.names2[i]) > 0 {
+            for k in 0..len(cu.prms) { if cu.prms[k].name == p.names2[i] { pi = k } }
+        }
+        try assign(u, fr, p.slots[i], f2.vals[cu.prms[pi].slot])
+    }
+    if cu.kind == U_FUNC { return conv(&cu.ret, f2.ret) }
+    return Ok(Val.Null)
+}
+
+fn (u: &PUnit) kindName(): str { return if u.kind == U_FUNC { "FUNCTION" } else if u.kind == U_PROC { "PROCEDURE" } else { "PACKAGE BODY" } }
+
+fn handles(h: &P, e: &DbErr): bool {
+    let n = errNum(e)
+    let uid = errUid(e)
+    for s in h.slots {
+        if s == 0 { return true }
+        if s > 0 && uid == s { return true }
+        if s < 0 && uid == 0 && n == -s { return true }
+    }
+    return false
+}
+
+fn execDecl(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, u: &PUnit, d: &P, fr: mut &Fr): Result[Unit, DbErr] {
+    fr.line = d.line
+    for k in 0..d.ival { putv(u, fr, d.slot + k, Val.Null) }
+    if d.ival == 5 && d.slot + 4 < len(fr.vals) {
+        // a cursor: its attributes
+        putv(u, fr, d.slot + 1, Val.Null)
+        putv(u, fr, d.slot + 2, Val.Null)
+        putv(u, fr, d.slot + 3, Val.Bool(false))
+        putv(u, fr, d.slot + 4, Val.Int(0))
+    }
+    if len(d.x) > 0 {
+        let v = try eval(pg, ip, sess, u, &d.x[0], fr)
+        try assign(u, fr, d.slot, v)
+        if d.flag {
+            match fr.vals[d.slot] {
+                Val.Null { return Err(ora(6502, "PL/SQL: value or conversion error")) }
+                else {}
+            }
+        }
+    }
+    return Ok(Unit{})
+}
+
+fn execBlock(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, u: &PUnit, p: &P, fr: mut &Fr): Result[int, DbErr] {
+    for i in 0..len(p.decl) { try execDecl(pg, ip, sess, u, &p.decl[i], fr) }
+    let r = execList(pg, ip, sess, u, &p.body, fr)
+    match r {
+        Ok(f) { return Ok(f) }
+        Err(e) {
+            if len(p.hs) == 0 { return Err(e) }
+            var hi = -1
+            for i in 0..len(p.hs) {
+                if hi < 0 && handles(&p.hs[i], &e) { hi = i }
+            }
+            if hi < 0 { return Err(e) }
+            let oc = ip.errCode
+            let om = ip.errMsg
+            let oe = ip.curErr
+            ip.errCode = sqlcodeOf(&e)
+            ip.errMsg = sqlerrmOf(&e)
+            ip.curErr = e
+            let r2 = execList(pg, ip, sess, u, &p.hs[hi].body, fr)
+            ip.errCode = oc
+            ip.errMsg = om
+            ip.curErr = oe
+            return r2
+        }
+    }
+}
+
+fn execList(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, u: &PUnit, body: &[]P, fr: mut &Fr): Result[int, DbErr] {
+    for i in 0..len(body) {
+        fr.line = body[i].line
+        let f = try exec(pg, ip, sess, u, &body[i], fr)
+        if f != F_NEXT { return Ok(f) }
+    }
+    return Ok(F_NEXT)
+}
+
+// After a loop body: 0 go on, 1 leave the loop, 2 the flow goes outward.
+fn loopStep(ip: mut &Ip, p: &P, f: int): int {
+    // scheduling is cooperative: a loop that runs no SQL (LOOP NULL; END LOOP;) would freeze every door
+    ip.lines += 1
+    if ip.lines % 1024 == 0 { let y = task.yield() }
+    if f == F_NEXT { return 0 }
+    if f == F_RET { return 2 }
+    let mine = len(ip.exitLabel) == 0 || (len(p.names) > 0 && p.names[0] == ip.exitLabel)
+    if !mine { return 2 }
+    ip.exitLabel = ""
+    return if f == F_EXIT { 1 } else { 0 }
+}
+
+fn toInt(v: &Val): Result[int, DbErr] {
+    match v {
+        Val.Int(n) { return Ok(n) }
+        Val.Num(d) {
+            match d.toInt(Rounding.HALF_AWAY) {
+                Ok(n) { return Ok(n) }
+                Err(_) { return Err(ora(6502, "PL/SQL: value or conversion error")) }
+            }
+        }
+        Val.Float(x) { return Ok(int(x + (if x < 0.0f { -0.5f } else { 0.5f }))) }
+        else { return Err(ora(6502, "PL/SQL: value or conversion error: NULL index table key value")) }
+    }
+}
+
+fn exec_assign(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, u: &PUnit, p: &P, fr: mut &Fr): Result[int, DbErr] {
+    let k = p.kind
+        if len(p.slots) > 0 {
+            for j in 0..p.ival { putv(u, fr, p.slot + j, fr.vals[p.slots[0] + j]) }
+            return Ok(F_NEXT)
+        }
+        let v = try eval(pg, ip, sess, u, &p.x[0], fr)
+        try assign(u, fr, p.slot, v)
+        return Ok(F_NEXT)
+}
+
+fn exec_if(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, u: &PUnit, p: &P, fr: mut &Fr): Result[int, DbErr] {
+    let k = p.kind
+        for i in 0..len(p.body) {
+            let br = &p.body[i]
+            if try evalCond(pg, ip, sess, u, &br.x[0], fr) { return execList(pg, ip, sess, u, &br.body, fr) }
+        }
+        return execList(pg, ip, sess, u, &p.els, fr)
+}
+
+fn exec_case(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, u: &PUnit, p: &P, fr: mut &Fr): Result[int, DbErr] {
+    let k = p.kind
+        if p.slot >= 0 {
+            let v = try eval(pg, ip, sess, u, &p.x[0], fr)
+            putv(u, fr, p.slot, v)
+        }
+        for i in 0..len(p.body) {
+            let br = &p.body[i]
+            if try evalCond(pg, ip, sess, u, &br.x[0], fr) { return execList(pg, ip, sess, u, &br.body, fr) }
+        }
+        if !p.flag { return Err(ora(6592, "CASE not found while executing CASE statement")) }
+        return execList(pg, ip, sess, u, &p.els, fr)
+}
+
+fn exec_loop(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, u: &PUnit, p: &P, fr: mut &Fr): Result[int, DbErr] {
+    let k = p.kind
+        while true {
+            let f = try execList(pg, ip, sess, u, &p.body, fr)
+            let s = loopStep(ip, p, f)
+            if s == 1 { break }
+            if s == 2 { return Ok(f) }
+        }
+        return Ok(F_NEXT)
+}
+
+fn exec_while(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, u: &PUnit, p: &P, fr: mut &Fr): Result[int, DbErr] {
+    let k = p.kind
+        while try evalCond(pg, ip, sess, u, &p.x[0], fr) {
+            let f = try execList(pg, ip, sess, u, &p.body, fr)
+            let s = loopStep(ip, p, f)
+            if s == 1 { break }
+            if s == 2 { return Ok(f) }
+        }
+        return Ok(F_NEXT)
+}
+
+fn exec_fornum(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, u: &PUnit, p: &P, fr: mut &Fr): Result[int, DbErr] {
+    let k = p.kind
+        let lo = try toInt(&(try eval(pg, ip, sess, u, &p.x[0], fr)))
+        let hi = try toInt(&(try eval(pg, ip, sess, u, &p.x[1], fr)))
+        var i = if p.flag { hi } else { lo }
+        while (if p.flag { i >= lo } else { i <= hi }) {
+            putv(u, fr, p.slot, Val.Int(i))
+            let f = try execList(pg, ip, sess, u, &p.body, fr)
+            let s = loopStep(ip, p, f)
+            if s == 1 { break }
+            if s == 2 { return Ok(f) }
+            i += if p.flag { -1 } else { 1 }
+        }
+        return Ok(F_NEXT)
+}
+
+fn exec_forcur(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, u: &PUnit, p: &P, fr: mut &Fr): Result[int, DbErr] {
+    let k = p.kind
+        var res: lexdb_exec.Res = lexdb_exec.Res{cols: [], rows: [], tag: "", hasRows: false, copy: 0}
+        if p.ival >= 0 {
+            let cd = &u.curs[p.ival]
+            for i in 0..len(p.x) {
+                let v = try eval(pg, ip, sess, u, &p.x[i], fr)
+                if i < len(cd.params) { try assign(u, fr, cd.params[i], v) }
+            }
+            res = try runSql(ip, sess, cd.q.sid, &cd.q.sql, fr, false)
+        } else {
+            res = try runSql(ip, sess, p.x[0].sid, &p.x[0].sql, fr, false)
+        }
+        ip.sqlRows = 0
+        for ri in 0..len(res.rows) {
+            for j in 0..len(res.rows[ri]) { try assign(u, fr, p.slot + j, res.rows[ri][j]) }
+            let f = try execList(pg, ip, sess, u, &p.body, fr)
+            let s = loopStep(ip, p, f)
+            if s == 1 { break }
+            if s == 2 { return Ok(f) }
+        }
+        return Ok(F_NEXT)
+}
+
+fn exec_exit_cont(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, u: &PUnit, p: &P, fr: mut &Fr): Result[int, DbErr] {
+    let k = p.kind
+        if len(p.x) > 0 {
+            if !(try evalCond(pg, ip, sess, u, &p.x[0], fr)) { return Ok(F_NEXT) }
+        }
+        ip.exitLabel = if len(p.names) > 0 { p.names[0] } else { "" }
+        return Ok(if k == K_EXIT { F_EXIT } else { F_CONT })
+}
+
+fn exec_return(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, u: &PUnit, p: &P, fr: mut &Fr): Result[int, DbErr] {
+    let k = p.kind
+        if len(p.x) > 0 { fr.ret = try eval(pg, ip, sess, u, &p.x[0], fr) }
+        fr.hasRet = true
+        return Ok(F_RET)
+}
+
+fn exec_raise(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, u: &PUnit, p: &P, fr: mut &Fr): Result[int, DbErr] {
+    let k = p.kind
+        if len(p.names) == 0 { return Err(ip.curErr) }
+        if p.ival > 0 {
+            if p.slot > 0 { return Err(ora(p.slot, "User-Defined Exception")) }
+            return Err(plErr("PLX" + p.ival.toStr(), "User-Defined Exception"))
+        }
+        let n = predefined(&p.names[0])
+        return Err(ora(n, stdText(n)))
+}
+
+fn exec_rapp(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, u: &PUnit, p: &P, fr: mut &Fr): Result[int, DbErr] {
+    let k = p.kind
+        let c = try toInt(&(try eval(pg, ip, sess, u, &p.x[0], fr)))
+        let mv = try eval(pg, ip, sess, u, &p.x[1], fr)
+        if c > -20000 || c < -20999 { return Err(ora(21000, "error number argument to raise_application_error of " + c.toStr() + " is out of range")) }
+        var m = ""
+        match mv {
+            Val.Text(s) { m = s }
+            Val.Null {}
+            else { m = lexdb_exec.text(&mv) }
+        }
+        return Err(ora(-c, m))
+}
+
+fn exec_call(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, u: &PUnit, p: &P, fr: mut &Fr): Result[int, DbErr] {
+    let k = p.kind
+        let v = try callUnit(pg, ip, sess, u, p, fr)
+        return Ok(F_NEXT)
+}
+
+fn exec_close(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, u: &PUnit, p: &P, fr: mut &Fr): Result[int, DbErr] {
+    let k = p.kind
+        let h = try handleOf(ip, fr, p.slot)
+        ip.curs[h].open = false
+        ip.curs[h].rows = []
+        setAttrs(u, fr, p.slot, false, -1, 0)
+        return Ok(F_NEXT)
+}
+
+fn exec(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, u: &PUnit, p: &P, fr: mut &Fr): Result[int, DbErr] {
+    let k = p.kind
+    if k == K_ASSIGN { return exec_assign(pg, ip, sess, u, p, fr) }
+    if k == K_NULL { return Ok(F_NEXT) }
+    if k == K_IF { return exec_if(pg, ip, sess, u, p, fr) }
+    if k == K_CASE { return exec_case(pg, ip, sess, u, p, fr) }
+    if k == K_LOOP { return exec_loop(pg, ip, sess, u, p, fr) }
+    if k == K_WHILE { return exec_while(pg, ip, sess, u, p, fr) }
+    if k == K_FORNUM { return exec_fornum(pg, ip, sess, u, p, fr) }
+    if k == K_FORCUR { return exec_forcur(pg, ip, sess, u, p, fr) }
+    if k == K_EXIT || k == K_CONT { return exec_exit_cont(pg, ip, sess, u, p, fr) }
+    if k == K_RETURN { return exec_return(pg, ip, sess, u, p, fr) }
+    if k == K_BLOCK { return execBlock(pg, ip, sess, u, p, fr) }
+    if k == K_RAISE { return exec_raise(pg, ip, sess, u, p, fr) }
+    if k == K_RAPP { return exec_rapp(pg, ip, sess, u, p, fr) }
+    if k == K_SQL { return execSql(pg, ip, sess, u, p, fr) }
+    if k == K_CALL { return exec_call(pg, ip, sess, u, p, fr) }
+    if k == K_BUILTIN { return builtin(pg, ip, sess, u, p, fr) }
+    if k == K_OPEN { return openCur(pg, ip, sess, u, p, fr) }
+    if k == K_FETCH { return fetchCur(pg, ip, sess, u, p, fr) }
+    if k == K_CLOSE { return exec_close(pg, ip, sess, u, p, fr) }
+    if k == K_EXECIMM { return execImm(pg, ip, sess, u, p, fr) }
+    return Err(plErr("XX000", "PL/SQL statement kind " + k.toStr()))
+}
+
+// ---- SQL statements
+
+fn tcl(ip: mut &Ip, sess: mut &lexdb_exec.Session, text: &str): Result[Unit, DbErr] {
+    if text == "COMMIT" || text == "ROLLBACK" {
+        if sess.status() != 'I' { try ctl(ip, sess, if text == "COMMIT" { C_COMMIT } else { C_ROLLBACK }) }
+        ip.sps = false
+        ip.sp0 = false
+        return Ok(Unit{})
+    }
+    if sess.status() == 'I' { try ctl(ip, sess, C_BEGIN) }
+    let stmts = try lexdb_sql.parse(text)
+    let none: []Val = []
+    let nt: []int = []
+    let r = try sess.run(&stmts[0], &none, &nt)
+    return Ok(Unit{})
+}
+
+fn execSql(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, u: &PUnit, p: &P, fr: mut &Fr): Result[int, DbErr] {
+    let sub = p.ival
+    if p.flag { syncSys(ip, fr) }
+    if sub == SQ_TCL {
+        try tcl(ip, sess, &p.sql)
+        return Ok(F_NEXT)
+    }
+    if sub == SQ_OTHER {
+        if strings.startsWith(&(strings.toUpperAscii(&p.sql)), "SET") { return Ok(F_NEXT) }
+        let r = try runSql(ip, sess, p.sid, &p.sql, fr, true)
+        return Ok(F_NEXT)
+    }
+    if sub == SQ_DML || sub == SQ_RETURNING {
+        let r = try runSql(ip, sess, p.sid, &p.sql, fr, true)
+        let n = tagCount(&r.tag)
+        ip.sqlRows = n
+        ip.sqlFound = if n > 0 { 1 } else { 0 }
+        if sub == SQ_RETURNING {
+            if len(r.rows) > 1 { return Err(ora(1422, stdText(1422))) }
+            if len(r.rows) == 1 {
+                for j in 0..len(p.slots) { if j < len(r.rows[0]) { try assign(u, fr, p.slots[j], r.rows[0][j]) } }
+            }
+        }
+        return Ok(F_NEXT)
+    }
+    // SELECT ... INTO
+    let r = try runSql(ip, sess, p.sid, &p.sql, fr, false)
+    if len(r.rows) == 0 {
+        ip.sqlRows = 0
+        ip.sqlFound = 0
+        return Err(ora(1403, stdText(1403)))
+    }
+    ip.sqlRows = 1
+    ip.sqlFound = 1
+    for j in 0..len(p.slots) { if j < len(r.rows[0]) { try assign(u, fr, p.slots[j], r.rows[0][j]) } }
+    if len(r.rows) > 1 { return Err(ora(1422, stdText(1422))) }
+    return Ok(F_NEXT)
+}
+
+// ---- cursors
+
+fn setAttrs(u: &PUnit, fr: mut &Fr, slot: int, open: bool, found: int, rowc: int) {
+    if slot < 0 || slot + 4 >= len(fr.vals) { return }
+    if u.slotPt[slot].k != PK_CUR && u.slotPt[slot].k != PK_REFCUR { return }
+    putv(u, fr, slot + 1, if found < 0 { Val.Null } else { Val.Bool(found == 1) })
+    putv(u, fr, slot + 2, if found < 0 { Val.Null } else { Val.Bool(found == 0) })
+    putv(u, fr, slot + 3, Val.Bool(open))
+    putv(u, fr, slot + 4, Val.Int(rowc))
+}
+
+fn handleOf(ip: &Ip, fr: &Fr, slot: int): Result[int, DbErr] {
+    match fr.vals[slot] {
+        Val.Int(h) {
+            if h >= 0 && h < len(ip.curs) && ip.curs[h].open { return Ok(h) }
+        }
+        else {}
+    }
+    return Err(ora(1001, stdText(1001)))
+}
+
+fn isOpenCur(ip: &Ip, fr: &Fr, slot: int): bool {
+    match fr.vals[slot] {
+        Val.Int(h) { return h >= 0 && h < len(ip.curs) && ip.curs[h].open }
+        else { return false }
+    }
+}
+
+// The query text of a dynamic statement with its placeholders as $n, and the number of them.
+fn dynText(text: &str): str {
+    let sc = tns.bindSites(&(text.toStr()))
+    var out: []byte = []
+    var pos = 0
+    var n = 0
+    for st in sc.sites {
+        if st.returning { break }
+        n += 1
+        appendStr(mut &out, text[pos..st.start])
+        appendStr(mut &out, "$" + n.toStr())
+        pos = st.end
+    }
+    appendStr(mut &out, text[pos..len(text)])
+    return strFromBytes(&out)
+}
+
+fn usingOids(vals: &[]Val): []int {
+    var o: []int = []
+    for v in vals {
+        match v {
+            Val.Null { append(mut &o, lexdb_sql.OID_UNKNOWN) }
+            else { append(mut &o, lexdb_exec.kindOid(&v)) }
+        }
+    }
+    return o
+}
+
+// The text of a dynamic statement value, trimmed of a trailing ";" (not of PL/SQL).
+fn dynSql(v: &Val): Result[str, DbErr] {
+    match v {
+        Val.Text(s) {
+            var t = strings.trim(s)
+            return Ok(t)
+        }
+        else { return Err(ora(900, "invalid SQL statement")) }
+    }
+}
+
+fn statementOf(text: &str, nls: &[]str): Result[Stmt, DbErr] {
+    let sql = lexdb_oratext.oracleSql(dynText(text))
+    var stmts = try lexdb_sql.oraParseNls(&sql, cloneStrs(nls))
+    if len(stmts) != 1 { return Err(plErr("42601", "SQL command not properly ended")) }
+    return Ok(pop(mut &stmts))
+}
+
+fn openCur(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, u: &PUnit, p: &P, fr: mut &Fr): Result[int, DbErr] {
+    var res: lexdb_exec.Res = lexdb_exec.Res{cols: [], rows: [], tag: "", hasRows: false, copy: 0}
+    if p.ival >= 0 {
+        if isOpenCur(ip, fr, p.slot) { return Err(ora(6511, stdText(6511))) }
+        let cd = &u.curs[p.ival]
+        for i in 0..len(p.x) {
+            let v = try eval(pg, ip, sess, u, &p.x[i], fr)
+            if i < len(cd.params) { try assign(u, fr, cd.params[i], v) }
+        }
+        res = try runSql(ip, sess, cd.q.sid, &cd.q.sql, fr, false)
+    } else if !p.flag {
+        res = try runSql(ip, sess, p.x[0].sid, &p.x[0].sql, fr, false)
+    } else {
+        let tv = try eval(pg, ip, sess, u, &p.x[0], fr)
+        let text = try dynSql(&tv)
+        var vals: []Val = []
+        for i in 1..len(p.x) { append(mut &vals, try eval(pg, ip, sess, u, &p.x[i], fr)) }
+        let st = try statementOf(&text, &ip.nls)
+        let ptypes = usingOids(&vals)
+        let inTx = try preRun(ip, sess, false)
+        let r = sess.run(&st, &vals, &ptypes)
+        postRun(ip, sess, false, inTx, r.isOk())
+        res = try r
+    }
+    append(mut &ip.curs, Cur{cols: replace(mut &res.cols, []), rows: replace(mut &res.rows, []), pos: 0, open: true})
+    let h = len(ip.curs) - 1
+    putv(u, fr, p.slot, Val.Int(h))
+    setAttrs(u, fr, p.slot, true, -1, 0)
+    return Ok(F_NEXT)
+}
+
+fn fetchCur(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, u: &PUnit, p: &P, fr: mut &Fr): Result[int, DbErr] {
+    let h = try handleOf(ip, fr, p.slot)
+    let pos = ip.curs[h].pos
+    var rowc = 0
+    if p.slot + 4 < len(fr.vals) && (u.slotPt[p.slot].k == PK_CUR || u.slotPt[p.slot].k == PK_REFCUR) {
+        match fr.vals[p.slot + 4] {
+            Val.Int(n) { rowc = n }
+            else {}
+        }
+    }
+    if pos >= len(ip.curs[h].rows) {
+        setAttrs(u, fr, p.slot, true, 0, rowc)
+        return Ok(F_NEXT)
+    }
+    for j in 0..len(p.slots) {
+        if j < len(ip.curs[h].rows[pos]) { try assign(u, fr, p.slots[j], ip.curs[h].rows[pos][j]) }
+    }
+    ip.curs[h].pos = pos + 1
+    setAttrs(u, fr, p.slot, true, 1, rowc + 1)
+    return Ok(F_NEXT)
+}
+
+// ---- DBMS_OUTPUT and the rest of the built-in packages
+
+fn plainText(v: &Val): str {
+    match v {
+        Val.Null { return "" }
+        Val.Text(s) { return s }
+        else { return lexdb_exec.text(v) }
+    }
+}
+
+fn putLine(ip: mut &Ip, s: &str): Result[Unit, DbErr] {
+    if !ip.outOn { return Ok(Unit{}) }
+    if len(ip.outPart) + len(s) > 32767 { return Err(ora(20000, "ORU-10028: line length overflow, limit of 32767 bytes per line")) }
+    // (the partial line is counted already: the line adds only the text it gets now)
+    if ip.outBytes + len(s) + 1 > ip.outLimit { return Err(ora(20000, "ORU-10027: buffer overflow, limit of " + ip.outLimit.toStr() + " bytes")) }
+    append(mut &ip.out, ip.outPart + s)
+    ip.outBytes += len(s) + 1
+    ip.outPart = ""
+    return Ok(Unit{})
+}
+
+// The lines read are no longer held.
+fn outRead(ip: mut &Ip, n: int) {
+    ip.outBytes = max(ip.outBytes - n - 1, 0)
+}
+
+fn builtin(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, u: &PUnit, p: &P, fr: mut &Fr): Result[int, DbErr] {
+    let nm = p.names[0]
+    if nm == "DBMS_OUTPUT.PUT_LINE" || nm == "DBMS_OUTPUT.PUT" {
+        let v = try eval(pg, ip, sess, u, &p.x[0], fr)
+        let s = plainText(&v)
+        if nm == "DBMS_OUTPUT.PUT" {
+            if ip.outOn {
+                if len(ip.outPart) + len(s) > 32767 { return Err(ora(20000, "ORU-10028: line length overflow, limit of 32767 bytes per line")) }
+                if ip.outBytes + len(s) > ip.outLimit { return Err(ora(20000, "ORU-10027: buffer overflow, limit of " + ip.outLimit.toStr() + " bytes")) }
+                ip.outPart = ip.outPart + s
+                ip.outBytes += len(s)
+            }
+        } else {
+            try putLine(ip, &s)
+        }
+        return Ok(F_NEXT)
+    }
+    if nm == "DBMS_OUTPUT.NEW_LINE" {
+        let s = ""
+        try putLine(ip, &s)
+        return Ok(F_NEXT)
+    }
+    if nm == "DBMS_OUTPUT.ENABLE" {
+        ip.outOn = true
+        ip.outLimit = 20000
+        if len(p.x) > 0 {
+            // buffer_size: at least 2000; NULL is unlimited (here 16 MiB)
+            let v = try eval(pg, ip, sess, u, &p.x[0], fr)
+            match v {
+                Val.Null { ip.outLimit = 16777216 }
+                else { ip.outLimit = min(max(try toInt(&v), 2000), 16777216) }
+            }
+        }
+        return Ok(F_NEXT)
+    }
+    if nm == "DBMS_OUTPUT.DISABLE" {
+        ip.outOn = false
+        ip.out = []
+        ip.outPos = 0
+        ip.outBytes = 0
+        ip.outPart = ""
+        return Ok(F_NEXT)
+    }
+    if nm == "DBMS_OUTPUT.GET_LINE" {
+        if ip.outPos < len(ip.out) {
+            try assign(u, fr, p.slots[0], Val.Text(ip.out[ip.outPos]))
+            try assign(u, fr, p.slots[1], Val.Int(0))
+            outRead(ip, len(ip.out[ip.outPos]))
+            ip.outPos += 1
+            if ip.outPos >= len(ip.out) {
+                ip.out = []
+                ip.outPos = 0
+                ip.outBytes = len(ip.outPart)
+            }
+        } else {
+            try assign(u, fr, p.slots[0], Val.Null)
+            try assign(u, fr, p.slots[1], Val.Int(1))
+        }
+        return Ok(F_NEXT)
+    }
+    if nm == "DBMS_OUTPUT.GET_LINES" {
+        let want = try toInt(&(try eval(pg, ip, sess, u, &p.x[0], fr)))
+        var elems: []Val = []
+        while len(elems) < want && ip.outPos < len(ip.out) {
+            append(mut &elems, Val.Text(ip.out[ip.outPos]))
+            outRead(ip, len(ip.out[ip.outPos]))
+            ip.outPos += 1
+        }
+        if ip.outPos >= len(ip.out) {
+            ip.out = []
+            ip.outPos = 0
+            ip.outBytes = len(ip.outPart)
+        }
+        try assign(u, fr, p.slots[1], Val.Int(len(elems)))
+        append(mut &ip.arrOut, ArrOut{slot: p.slots[0], elems: elems})
+        return Ok(F_NEXT)
+    }
+    if nm == "DBMS_UTILITY.NAME_RESOLVE" {
+        // schema.name or name: a table, view, sequence, procedure, function or package of the session's user (or the schema named)
+        let nv = try eval(pg, ip, sess, u, &p.x[0], fr)
+        var raw = ""
+        match nv {
+            Val.Text(t) { raw = t }
+            else {}
+        }
+        var schema = ""
+        var obj = strings.toUpperAscii(&(strings.trim(&raw)))
+        let dot = strings.indexOf(&obj, ".", 0)
+        if dot > 0 {
+            schema = obj[0..dot].toStr()
+            obj = obj[dot + 1..len(obj)].toStr()
+        }
+        if len(obj) >= 2 && obj[0] == '"' && obj[len(obj) - 1] == '"' { obj = obj[1..len(obj) - 1].toStr() }
+        if len(schema) >= 2 && schema[0] == '"' && schema[len(schema) - 1] == '"' { schema = schema[1..len(schema) - 1].toStr() }
+        var q = "SELECT owner, object_type, object_id FROM all_objects WHERE object_name = '" + strings.replaceAll(&obj, "'", "''") + "'"
+        if len(schema) > 0 { q = q + " AND owner = '" + strings.replaceAll(&schema, "'", "''") + "'" }
+        else { q = q + " AND owner = (SELECT user FROM dual)" }
+        q = q + " AND object_type IN ('TABLE', 'VIEW', 'SEQUENCE', 'PROCEDURE', 'FUNCTION', 'PACKAGE', 'SYNONYM') ORDER BY object_type"
+        let st = try statementOf(&q, &ip.nls)
+        let none: []Val = []
+        let nt: []int = []
+        let inTx = try preRun(ip, sess, false)
+        let r = sess.run(&st, &none, &nt)
+        postRun(ip, sess, false, inTx, r.isOk())
+        let res = try r
+        if len(res.rows) == 0 { return Err(ora(6564, "object " + (if len(schema) > 0 { schema + "." } else { "" }) + obj + " does not exist")) }
+        var ty = 0
+        var tn = ""
+        match res.rows[0][1] {
+            Val.Text(t) { tn = t }
+            else {}
+        }
+        if tn == "TABLE" { ty = 2 } else if tn == "VIEW" { ty = 4 } else if tn == "SEQUENCE" { ty = 6 } else if tn == "PROCEDURE" { ty = 7 }
+        else if tn == "FUNCTION" { ty = 8 } else if tn == "PACKAGE" { ty = 9 } else if tn == "SYNONYM" { ty = 5 }
+        try assign(u, fr, p.slots[0], res.rows[0][0])
+        try assign(u, fr, p.slots[1], Val.Text(obj))
+        try assign(u, fr, p.slots[2], Val.Null)
+        try assign(u, fr, p.slots[3], Val.Null)
+        try assign(u, fr, p.slots[4], Val.Int(ty))
+        try assign(u, fr, p.slots[5], res.rows[0][2])
+        return Ok(F_NEXT)
+    }
+    if nm == "DBMS_LOCK.SLEEP" {
+        let v = try eval(pg, ip, sess, u, &p.x[0], fr)
+        var secs = 0.0f
+        match v {
+            Val.Int(n) { secs = float(n) }
+            Val.Num(d) { secs = d.toFloat() }
+            Val.Float(x) { secs = x }
+            else {}
+        }
+        let sl = task.sleep(int(secs * 1000.0f))
+        return Ok(F_NEXT)
+    }
+    if nm == "DBMS_SQL.RETURN_RESULT" {
+        let h = try handleOf(ip, fr, p.slot)
+        var rows: [][]Val = []
+        let from = ip.curs[h].pos
+        for i in from..len(ip.curs[h].rows) { append(mut &rows, cloneRow(&ip.curs[h].rows[i])) }
+        let cols = replace(mut &ip.curs[h].cols, [])
+        ip.curs[h].open = false
+        ip.curs[h].rows = []
+        append(mut &ip.results, CurOut{cols: cols, rows: rows})
+        return Ok(F_NEXT)
+    }
+    return Err(plErr("XX000", nm))
+}
+
+// ---- EXECUTE IMMEDIATE
+
+// The columns in scope of the SQL statement of tokens a..b: those of the tables after FROM, JOIN and UPDATE (not of the target
+// of an INSERT: its column list is left alone as it is).
+fn (cx: mut &Cx) scopeOf(sess: mut &lexdb_exec.Session, a: int, b: int) {
+    cx.colScope = []
+    cx.noSubA = -1
+    cx.noSubB = -1
+    var i = a
+    while i < b {
+        let t = cx.tk(i)
+        if t.kind == TK_ID && (t.up == "FROM" || t.up == "JOIN" || t.up == "UPDATE") && cx.ident(i + 1) && !cx.isK(i + 1, "SELECT") && !cx.isO(i + 1, "(") {
+            var name = cx.tk(i + 1).text
+            var j = i + 1
+            while cx.isO(j + 1, ".") && cx.ident(j + 2) {
+                name = name + "." + cx.tk(j + 2).text
+                j += 2
+            }
+            if cx.find(&cx.tk(i + 1).up) < 0 || cx.isO(i + 2, ".") {
+                match cx.describeText(sess, &("SELECT * FROM " + name)) {
+                    Ok(cols) { for c in cols { append(mut &cx.colScope, strings.toUpperAscii(&c.name)) } }
+                    Err(_) {}
+                }
+            }
+        }
+        if t.kind == TK_ID && t.up == "INTO" && i > a && cx.isK(a, "INSERT") && cx.ident(i + 1) {
+            var j = i + 1
+            while cx.isO(j + 1, ".") && cx.ident(j + 2) { j += 2 }
+            if cx.isO(j + 1, "(") && !cx.isK(j + 2, "SELECT") {
+                let close = cx.matchParen(j + 1)
+                if close > 0 {
+                    cx.noSubA = j + 2
+                    cx.noSubB = close
+                }
+            }
+        }
+        i += 1
+    }
+}
+
+fn firstWord(s: &str): str {
+    var i = 0
+    while i < len(s) && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r' || s[i] == '(') { i += 1 }
+    var j = i
+    while j < len(s) && isIdChar(s[j]) { j += 1 }
+    return strings.toUpperAscii(&(s[i..j].toStr()))
+}
+
+fn execImm(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, u: &PUnit, p: &P, fr: mut &Fr): Result[int, DbErr] {
+    let tv = try eval(pg, ip, sess, u, &p.x[0], fr)
+    var text = try dynSql(&tv)
+    var vals: []Val = []
+    for i in 1..len(p.x) {
+        if p.names[i - 1] == "OUT" { append(mut &vals, Val.Null) } else { append(mut &vals, try eval(pg, ip, sess, u, &p.x[i], fr)) }
+    }
+    let w = firstWord(&text)
+    if w == "BEGIN" || w == "DECLARE" {
+        let sc = tns.bindSites(&text)
+        var names: []str = []
+        for st in sc.sites { append(mut &names, st.name) }
+        let cu = try compileBlock(ip, sess, &text, &names, sigsOf(pg))
+        var f2 = newFr(&cu)
+        for k in 0..len(names) {
+            if k < len(vals) { putv(&cu, mut &f2, cu.bindSlot[k], vals[k]) }
+        }
+        let r = execBlock(pg, ip, sess, &cu, &cu.body, mut &f2)
+        match r {
+            Ok(_) {}
+            Err(e) { return Err(withTrace(&e, &"", f2.line)) }
+        }
+        for k in 0..len(p.names) {
+            if p.names[k] != "IN" && k < len(names) && len(p.names2[k]) > 0 {
+                let tslot = strings.parseIntOpt(&p.names2[k]).unwrapOr(-1)
+                if tslot >= 0 { try assign(u, fr, tslot, f2.vals[cu.bindSlot[k]]) }
+            }
+        }
+        return Ok(F_NEXT)
+    }
+    if len(text) > 0 && text[len(text) - 1] == ';' { text = text[0..len(text) - 1].toStr() }
+    let st = try statementOf(&text, &ip.nls)
+    let ptypes = usingOids(&vals)
+    let kind = st.kind
+    let write = kind == lexdb_sql.S_INSERT || kind == lexdb_sql.S_UPDATE || kind == lexdb_sql.S_DELETE || kind == lexdb_sql.S_MERGE
+    let query = kind == lexdb_sql.S_SELECT
+    if kind == lexdb_sql.S_COMMIT || kind == lexdb_sql.S_ROLLBACK {
+        try tcl(ip, sess, if kind == lexdb_sql.S_COMMIT { "COMMIT" } else { "ROLLBACK" })
+        return Ok(F_NEXT)
+    }
+    if !write && !query {
+        // DDL and the rest: the open transaction ends first
+        if kind != lexdb_sql.S_SAVEPOINT && kind != lexdb_sql.S_ROLLBACK_TO && kind != lexdb_sql.S_SET && kind != lexdb_sql.S_SHOW &&
+           sess.status() != 'I' {
+            try ctl(ip, sess, C_COMMIT)
+            ip.sps = false
+            ip.sp0 = false
+        }
+        if kind != lexdb_sql.S_SET && kind != lexdb_sql.S_SAVEPOINT && kind != lexdb_sql.S_ROLLBACK_TO { ip.ddl += 1 }
+        let r = try sess.run(&st, &vals, &ptypes)
+        return Ok(F_NEXT)
+    }
+    let inTx = try preRun(ip, sess, write)
+    let r = sess.run(&st, &vals, &ptypes)
+    postRun(ip, sess, write, inTx, r.isOk())
+    let res = try r
+    if write {
+        let n = tagCount(&res.tag)
+        ip.sqlRows = n
+        ip.sqlFound = if n > 0 { 1 } else { 0 }
+        return Ok(F_NEXT)
+    }
+    if len(p.slots) > 0 {
+        if len(res.rows) == 0 {
+            ip.sqlRows = 0
+            ip.sqlFound = 0
+            return Err(ora(1403, stdText(1403)))
+        }
+        ip.sqlRows = 1
+        ip.sqlFound = 1
+        for j in 0..len(p.slots) { if j < len(res.rows[0]) { try assign(u, fr, p.slots[j], res.rows[0][j]) } }
+        if len(res.rows) > 1 { return Err(ora(1422, stdText(1422))) }
+    }
+    return Ok(F_NEXT)
+}
+
+// ---- the compiled program of the stored units
+
+// Every stored procedure and function compiled for the catalog as it is now: their signatures first (so they
+// may call one another), then their bodies; one that does not compile is kept as invalid, with its error.
+pub fn ensureProg(pg: mut &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session): Result[Unit, DbErr] {
+    try loadStored(ip)
+    if pg.ver == ip.storedVer && pg.ddl == ip.ddl { return Ok(Unit{}) }
+    var srcs: []Stored = []
+    var specs: []Stored = []
+    var bodies: []Stored = []
+    for s in ip.stored {
+        let c = Stored{owner: s.owner, name: s.name, kind: s.kind, src: s.src}
+        if s.kind == "PROCEDURE" || s.kind == "FUNCTION" { append(mut &srcs, c) }
+        else if s.kind == "PACKAGE" { append(mut &specs, c) }
+        else if s.kind == "PACKAGE BODY" { append(mut &bodies, c) }
+    }
+    ip.scache = []
+    var units: []PUnit = []
+    var sigs: []SigEntry = []
+    for s in srcs {
+        match compileStored(ip, sess, &s.src, &s.owner, [], true) {
+            Ok(u) { append(mut &sigs, SigEntry{owner: u.owner, pkg: "", name: u.name, kind: u.kind, prms: copyPrms(&u.prms), ret: u.ret, isPub: true}) }
+            Err(_) {}
+        }
+    }
+    // the packages once, for what they offer
+    for sp in specs {
+        var body = ""
+        for b in bodies { if b.owner == sp.owner && b.name == sp.name { body = b.src } }
+        match compilePackage(ip, sess, &sp.owner, &sp.name, &sp.src, &body, cloneSigs(&sigs)) {
+            Ok(us) {
+                for u in us { if u.kind != U_PKG && u.isPub { append(mut &sigs, sigOfUnit(&u)) } }
+            }
+            Err(_) {}
+        }
+    }
+    for s in srcs {
+        match compileStored(ip, sess, &s.src, &s.owner, cloneSigs(&sigs), false) {
+            Ok(u) { append(mut &units, u) }
+            Err(e) {
+                var u = emptyUnit()
+                u.owner = s.owner
+                u.name = s.name
+                u.kind = if s.kind == "FUNCTION" { U_FUNC } else { U_PROC }
+                u.bad = e.msg
+                append(mut &units, u)
+            }
+        }
+    }
+    for sp in specs {
+        var body = ""
+        for b in bodies { if b.owner == sp.owner && b.name == sp.name { body = b.src } }
+        match compilePackage(ip, sess, &sp.owner, &sp.name, &sp.src, &body, cloneSigs(&sigs)) {
+            Ok(us0) {
+                var us = us0
+                for k in 0..len(us) { append(mut &units, replace(mut &us[k], emptyUnit())) }
+            }
+            Err(_) {}
+        }
+    }
+    pg.units = units
+    pg.ver = ip.storedVer
+    pg.ddl = ip.ddl
+    ip.keep = len(ip.scache)
+    return Ok(Unit{})
+}
+
+fn sigOfUnit(u: &PUnit): SigEntry {
+    return SigEntry{owner: u.owner, pkg: u.pkg, name: u.name, kind: u.kind, prms: copyPrms(&u.prms), ret: u.ret, isPub: u.isPub}
+}
+
+fn cloneSigs(a: &[]SigEntry): []SigEntry {
+    var out: []SigEntry = []
+    for x in a { append(mut &out, SigEntry{owner: x.owner, pkg: x.pkg, name: x.name, kind: x.kind, prms: copyPrms(&x.prms), ret: x.ret, isPub: x.isPub}) }
+    return out
+}
+
+// ---- the entry points of the Oracle door
+
+// A bind of a block as the client gave it (array: the elements it brought, for IN; none for OUT).
+pub type BindIn = record { pub name: str; pub v: Val; pub array: bool; pub cursor: bool }
+
+// A bind as the block left it: its direction as the IO vector says it (16 OUT, 32 IN, 48 IN OUT), its value, the
+// cursor it is (an index into the result's curs), the elements of an array.
+pub type BindOut = record { pub name: str; pub dir: int; pub v: Val; pub cur: int; pub isArr: bool; pub arr: []Val }
+
+pub type BlockRes = record { pub err: Option[DbErr]; pub outs: []BindOut; pub curs: []CurOut; pub implicit: []CurOut; pub rows: int }
+
+pub type FinalErr = value record { pub num: int; pub text: str }
+
+// An error as the client is told it: its ORA- number, its text, and the ORA-06512 lines of where it went through.
+pub fn finalError(e: &DbErr): FinalErr {
+    var n = errNum(e)
+    var t = errText(e)
+    if errUid(e) > 0 {
+        n = 6510
+        t = "PL/SQL: unhandled user-defined exception"
+    }
+    if len(e.context) > 0 { t = t + "\n" + e.context }
+    return FinalErr{num: n, text: t}
+}
+
+fn emptyRes(): BlockRes { return BlockRes{err: None, outs: [], curs: [], implicit: [], rows: 0} }
+
+fn endRun(ip: mut &Ip) {
+    ip.curs = []
+    ip.results = []
+    ip.arrOut = []
+    while len(ip.scache) > ip.keep { let x = pop(mut &ip.scache) }
+}
+
+pub fn setNls(ip: mut &Ip, nls: []str, user: &str) {
+    var same = len(nls) == len(ip.nls)
+    if same { for i in 0..len(nls) { if nls[i] != ip.nls[i] { same = false } } }
+    if !same {
+        ip.nls = nls
+        for i in 0..len(ip.scache) { ip.scache[i] = None }
+    }
+    ip.user = strings.toUpperAscii(&(user.toStr()))
+}
+
+// Runs an anonymous block with its binds. commit: the call's commit flag.
+pub fn runBlock(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, text: &str, binds: &[]BindIn, commit: bool): BlockRes {
+    var res = emptyRes()
+    var names: []str = []
+    for b in binds { append(mut &names, b.name) }
+    let cr = compileBlock(ip, sess, text, &names, sigsOf(pg))
+    var u = emptyUnit()
+    match move(cr) {
+        Ok(x) { u = x }
+        Err(e) {
+            res.err = Some(e)
+            endRun(ip)
+            return res
+        }
+    }
+    var fr = newFr(&u)
+    for k in 0..len(binds) {
+        if k < len(u.bindSlot) { putv(&u, mut &fr, u.bindSlot[k], binds[k].v) }
+    }
+    ip.sqlRows = 0
+    ip.sqlFound = -1
+    ip.errCode = 0
+    ip.errMsg = ""
+    ip.depth = 0
+    ip.exitLabel = ""
+    ip.results = []
+    ip.arrOut = []
+    ip.curs = []
+    ip.sp0 = false
+    ip.sps = false
+    if sess.status() != 'I' {
+        let a = ctl(ip, sess, C_SP_0)
+        let b = ctl(ip, sess, C_SP_S)
+        ip.sp0 = true
+        ip.sps = true
+    }
+    let r = execBlock(pg, ip, sess, &u, &u.body, mut &fr)
+    match r {
+        Err(e) {
+            if ip.sp0 && sess.status() != 'I' {
+                let a = ctl(ip, sess, C_RB_0)
+                let b = ctl(ip, sess, C_REL_0)
+            } else if sess.status() != 'I' {
+                let a = ctl(ip, sess, C_ROLLBACK)
+            }
+            ip.sps = false
+            ip.sp0 = false
+            res.err = Some(withTrace(&e, &"", fr.line))
+            endRun(ip)
+            return res
+        }
+        Ok(_) {}
+    }
+    if commit && sess.status() != 'I' {
+        let a = ctl(ip, sess, C_COMMIT)
+    } else if sess.status() != 'I' {
+        if ip.sps { let a = ctl(ip, sess, C_REL_S) }
+        if ip.sp0 { let b = ctl(ip, sess, C_REL_0) }
+    }
+    ip.sps = false
+    ip.sp0 = false
+    for k in 0..u.nbinds {
+        let use = u.bindUse[k]
+        let dir = if (use & 2) != 0 { if (use & 1) != 0 { 48 } else { 16 } } else { 32 }
+        let slot = u.bindSlot[k]
+        var bo = BindOut{name: if k < len(names) { names[k] } else { "" }, dir: dir, v: fr.vals[slot], cur: -1, isArr: false, arr: []}
+        if dir != 32 && k < len(binds) && binds[k].cursor {
+            match fr.vals[slot] {
+                Val.Int(h) {
+                    if h >= 0 && h < len(ip.curs) {
+                        let from = ip.curs[h].pos
+                        var rows: [][]Val = []
+                        for i in from..len(ip.curs[h].rows) { append(mut &rows, cloneRow(&ip.curs[h].rows[i])) }
+                        append(mut &res.curs, CurOut{cols: replace(mut &ip.curs[h].cols, []), rows: rows})
+                        bo.cur = len(res.curs) - 1
+                    }
+                }
+                else {}
+            }
+        }
+        for a in ip.arrOut {
+            if a.slot == slot {
+                bo.isArr = true
+                bo.arr = cloneRow(&a.elems)
+            }
+        }
+        append(mut &res.outs, bo)
+    }
+    res.implicit = replace(mut &ip.results, [])
+    endRun(ip)
+    return res
+}
+
+// What kind of DDL on stored code a statement is: 1 CREATE [OR REPLACE] PROCEDURE | FUNCTION, 2 DROP PROCEDURE | FUNCTION,
+// 3 ALTER ... COMPILE, 0 neither.
+pub fn unitDdl(sql: &str): int {
+    let toks = lex(sql)
+    match toks {
+        Ok(t) {
+            if len(t) < 3 { return 0 }
+            if t[0].kind == TK_ID && t[0].up == "CREATE" && unitHead(&t).kind != 0 { return 1 }
+            if t[0].kind == TK_ID && t[0].up == "DROP" && (t[1].up == "PROCEDURE" || t[1].up == "FUNCTION" || t[1].up == "PACKAGE") { return 2 }
+            if t[0].kind == TK_ID && t[0].up == "ALTER" && (t[1].up == "PROCEDURE" || t[1].up == "FUNCTION" || t[1].up == "PACKAGE") { return 3 }
+            return 0
+        }
+        Err(_) { return 0 }
+    }
+}
+
+// CREATE [OR REPLACE] PROCEDURE | FUNCTION: compiled (an error when it does not), then stored.
+// (true: it was stored invalid, as Oracle does with a warning.)
+pub fn createUnit(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, text: &str, super: bool): Result[bool, DbErr] {
+    var src = strings.trim(&(text.toStr()))
+    while len(src) > 0 && src[len(src) - 1] == '/' { src = strings.trim(&(src[0..len(src) - 1].toStr())) }
+    let toks = try lex(&src)
+    let h = unitHead(&toks)
+    let replace = toks[1].up == "OR"
+    let own = ip.user
+    if h.kind == U_PKG { return createPackage(pg, ip, sess, &src, &toks, &h, replace, super) }
+    var u = emptyUnit()
+    var warn = false
+    match compileStored(ip, sess, &src, &own, sigsOf(pg), false) {
+        Ok(x) { u = x }
+        Err(e) {
+            // stored as it is, invalid: "created with compilation errors"
+            match compileStored(ip, sess, &src, &own, sigsOf(pg), true) {
+                Ok(x) { u = x }
+                Err(e2) { return Err(e) }
+            }
+            warn = true
+        }
+    }
+    // stored code lives in a schema: one's own, unless one is a DBA
+    if u.owner != ip.user && !super { return Err(ora(1031, "insufficient privileges")) }
+    try loadStored(ip)
+    let kind = if u.kind == U_FUNC { "FUNCTION" } else { "PROCEDURE" }
+    for s in ip.stored {
+        if s.owner == u.owner && s.name == u.name {
+            if !replace { return Err(ora(955, "name is already used by an existing object")) }
+            if s.kind != kind {
+                try putSource(&ip.st, &s.owner, &s.kind, &s.name, &"")
+            }
+        }
+    }
+    try putSource(&ip.st, &u.owner, &kind, &u.name, &src)
+    ip.ddl += 1
+    return Ok(warn)
+}
+
+// CREATE [OR REPLACE] PACKAGE [BODY] name: its text compiled (with the specification when it is the body), then stored.
+fn createPackage(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, src: &str, toks: &[]Tok, h: &Head, replace: bool, super: bool): Result[bool, DbErr] {
+    var nm = toks[h.next].up
+    var owner = ip.user
+    if h.next + 2 < len(toks) && toks[h.next + 1].kind == TK_OP && toks[h.next + 1].text == "." {
+        owner = nm
+        nm = toks[h.next + 2].up
+    }
+    if owner != ip.user && !super { return Err(ora(1031, "insufficient privileges")) }
+    let kind = if h.body { "PACKAGE BODY" } else { "PACKAGE" }
+    try loadStored(ip)
+    var spec = if h.body { "" } else { src.toStr() }
+    var body = if h.body { src.toStr() } else { "" }
+    var have = false
+    for s in ip.stored {
+        if s.owner == owner && s.name == nm {
+            if s.kind == "PACKAGE" && h.body { spec = s.src }
+            if s.kind == kind { have = true }
+        }
+    }
+    if have && !replace { return Err(ora(955, "name is already used by an existing object")) }
+    if h.body && len(spec) == 0 { return Err(plErr("ORA06550", "line 1, column 1:\nPLS-00304: cannot compile body of '" + nm + "' without its specification")) }
+    var warn = false
+    match compilePackage(ip, sess, &owner, &nm, &spec, &body, sigsOf(pg)) {
+        Ok(_) {}
+        Err(e) {
+            if !h.body { return Err(e) }
+            warn = true
+        }
+    }
+    try putSource(&ip.st, &owner, &kind, &nm, src)
+    ip.ddl += 1
+    forgetPkg(ip, &owner, &nm)
+    return Ok(warn)
+}
+
+// DROP PROCEDURE | FUNCTION | PACKAGE [BODY] name
+pub fn dropUnit(ip: mut &Ip, text: &str, super: bool): Result[Unit, DbErr] {
+    let toks = try lex(text)
+    if len(toks) < 3 { return Err(plErr("42601", "invalid SQL statement")) }
+    var kw = toks[1].up
+    var at0 = 2
+    if kw == "PACKAGE" && toks[2].up == "BODY" {
+        kw = "PACKAGE BODY"
+        at0 = 3
+    }
+    var nm = toks[at0].up
+    var owner = ip.user
+    if len(toks) > at0 + 2 && toks[at0 + 1].up == "." {
+        owner = nm
+        nm = toks[at0 + 2].up
+    }
+    if owner != ip.user && !super { return Err(ora(1031, "insufficient privileges")) }
+    try loadStored(ip)
+    var found = false
+    for i in 0..len(ip.stored) {
+        if ip.stored[i].owner == owner && ip.stored[i].name == nm && (ip.stored[i].kind == kw || (kw == "PACKAGE" && ip.stored[i].kind == "PACKAGE BODY")) {
+            found = true
+            try putSource(&ip.st, &ip.stored[i].owner, &ip.stored[i].kind, &ip.stored[i].name, &"")
+        }
+    }
+    if !found { return Err(ora(4043, "object " + nm + " does not exist")) }
+    ip.ddl += 1
+    forgetPkg(ip, &owner, &nm)
+    return Ok(Unit{})
+}
+
+// CALL name(args) [INTO :bind] as the block that does it.
+pub fn callToBlock(sql: &str): str {
+    var s = strings.trim(&(sql.toStr()))
+    while len(s) > 0 && s[len(s) - 1] == ';' { s = strings.trim(&(s[0..len(s) - 1].toStr())) }
+    let body = strings.trim(&(s[4..len(s)].toStr()))
+    let up = strings.toUpperAscii(&body)
+    let at = strings.lastIndexOf(&up, " INTO ")
+    if at > 0 {
+        let call = strings.trim(&(body[0..at].toStr()))
+        let into = strings.trim(&(body[at + 6..len(body)].toStr()))
+        return "BEGIN " + into + " := " + call + "; END;"
+    }
+    return "BEGIN " + body + "; END;"
+}
+
+// The DBMS_OUTPUT lines not read yet are for the client (SQLcl's SET SERVEROUTPUT ON reads them by GET_LINES itself).
+pub fn outputLines(ip: &Ip): int { return len(ip.out) - ip.outPos }
+
+// A DDL statement ran: the types in the compiled units may be stale.
+pub fn noteDdl(ip: mut &Ip) { ip.ddl += 1 }
+
+fn sqlLiteral(v: &Val): str {
+    match v {
+        Val.Null { return "NULL" }
+        Val.Int(n) { return n.toStr() }
+        Val.Num(d) { return d.toStr() }
+        Val.Bool(b) { return if b { "TRUE" } else { "FALSE" } }
+        Val.Ts(_) { return "TO_TIMESTAMP('" + lexdb_exec.textOut(v, lexdb_sql.OID_TS, &lexdb_time.utc()) + "', 'YYYY-MM-DD HH24:MI:SS.FF6')" }
+        else { return "'" + strings.replaceAll(&(plainText(v)), "'", "''") + "'" }
+    }
+}
+
+// A SQL statement with the calls of stored functions in it that take constants as their arguments replaced by their
+// values (`SELECT f(5) FROM dual`): run first, as blocks. A call with another argument is left to fail in the
+// executor (a function of a column is not done).
+pub fn expandCalls(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, text: &str): Result[str, DbErr] {
+    if len(pg.units) == 0 { return Ok(text.toStr()) }
+    var toks: []Tok = []
+    match lex(text) {
+        Ok(t) { toks = t }
+        Err(_) { return Ok(text.toStr()) }
+    }
+    var sb = strings.newStrBuf()
+    var from = 0
+    var i = 0
+    while i + 1 < len(toks) {
+        let t = toks[i]
+        var ni = i
+        var names: []str = []
+        if t.kind == TK_ID && !(i > 0 && toks[i - 1].kind == TK_OP && toks[i - 1].text == ".") {
+            append(mut &names, t.up)
+            while ni + 2 < len(toks) && toks[ni + 1].kind == TK_OP && toks[ni + 1].text == "." && toks[ni + 2].kind == TK_ID {
+                append(mut &names, toks[ni + 2].up)
+                ni += 2
+            }
+        }
+        if len(names) > 0 && toks[ni + 1].kind == TK_OP && toks[ni + 1].text == "(" {
+            let pi = pg.find(&names, &ip.user)
+            if pi >= 0 && pg.units[pi].kind == U_FUNC {
+                var d = 0
+                var close = -1
+                var j = ni + 1
+                var simple = true
+                while j < len(toks) && close < 0 {
+                    let x = toks[j]
+                    if x.kind == TK_OP && x.text == "(" { d += 1 }
+                    else if x.kind == TK_OP && x.text == ")" {
+                        d -= 1
+                        if d == 0 { close = j }
+                    } else if j > ni + 1 {
+                        let ok = x.kind == TK_NUM || x.kind == TK_STR || (x.kind == TK_OP && (x.text == "," || x.text == "-" || x.text == "+")) ||
+                                 (x.kind == TK_ID && (x.up == "NULL" || x.up == "TRUE" || x.up == "FALSE"))
+                        if !ok { simple = false }
+                    }
+                    j += 1
+                }
+                if close > 0 && simple {
+                    let blk = "BEGIN :r__ := " + text[t.s..toks[ni].e] + text[toks[ni + 1].s..toks[close].e] + "; END;"
+                    let binds: []BindIn = [BindIn{name: "R__", v: Val.Null, array: false, cursor: false}]
+                    let res = runBlock(pg, ip, sess, &blk, &binds, false)
+                    match res.err {
+                        Some(e) { return Err(e) }
+                        None {}
+                    }
+                    sb.add(text[from..t.s])
+                    // in parentheses: a negative number beside a minus would be a comment (a--1)
+                    sb.add(&("(" + sqlLiteral(&res.outs[0].v) + ")"))
+                    from = toks[close].e
+                    i = close + 1
+                    continue
+                }
+            }
+        }
+        i += 1
+    }
+    sb.add(text[from..len(text)])
+    return Ok(sb.toStr())
+}
+
+// ---- packages
+
+fn cloneP(p: &P): P {
+    var n = node(p.kind, p.line)
+    n.sql = p.sql
+    n.sid = p.sid
+    n.slot = p.slot
+    n.slots = cloneInts(&p.slots)
+    n.names = cloneStrs(&p.names)
+    n.names2 = cloneStrs(&p.names2)
+    n.ival = p.ival
+    n.flag = p.flag
+    n.lit = p.lit
+    n.isLit = p.isLit
+    for x in p.x { append(mut &n.x, cloneP(&x)) }
+    for x in p.pre { append(mut &n.pre, cloneP(&x)) }
+    for x in p.body { append(mut &n.body, cloneP(&x)) }
+    for x in p.els { append(mut &n.els, cloneP(&x)) }
+    for x in p.hs { append(mut &n.hs, cloneP(&x)) }
+    for x in p.decl { append(mut &n.decl, cloneP(&x)) }
+    return n
+}
+
+fn cloneInts(a: &[]int): []int {
+    var out: []int = []
+    for x in a { append(mut &out, x) }
+    return out
+}
+
+fn cloneCurs(a: &[]CurDef): []CurDef {
+    var out: []CurDef = []
+    for c in a { append(mut &out, CurDef{name: c.name, slot: c.slot, params: cloneInts(&c.params), q: cloneP(&c.q), rec: c.rec}) }
+    return out
+}
+
+fn (cx: mut &Cx) useText(src: &str): Result[Unit, DbErr] {
+    cx.toks = try lex(src)
+    cx.src = src.toStr()
+    cx.pos = 0
+    return Ok(Unit{})
+}
+
+fn (cx: &Cx) sigIndex(name: &str): int {
+    for i in 0..len(cx.sigs) {
+        if cx.sigs[i].pkg == cx.pkg && cx.sigs[i].owner == cx.owner && cx.sigs[i].name == name { return i }
+    }
+    return -1
+}
+
+// A procedure or function in a package's text: in the specification a signature; in the body a signature again (a forward
+// declaration) or the member itself, compiled here.
+fn (cx: mut &Cx) pkgMember(ip: mut &Ip, sess: mut &lexdb_exec.Session): Result[Unit, DbErr] {
+    let kind = if cx.isK(cx.pos, "PROCEDURE") { U_PROC } else { U_FUNC }
+    cx.pos += 1
+    cx.push()
+    cx.inMember = true
+    let first = len(cx.slotPt)
+    var u = emptyUnit()
+    u.owner = cx.owner
+    try cx.header(ip, sess, kind, mut &u)
+    u.pkg = cx.pkg
+    var si = cx.sigIndex(&u.name)
+    let known = si >= 0
+    if si < 0 {
+        append(mut &cx.sigs, SigEntry{owner: cx.owner, pkg: cx.pkg, name: u.name, kind: kind, prms: copyPrms(&u.prms), ret: u.ret, isPub: cx.specMode})
+    }
+    if cx.specMode { append(mut &cx.pubs, u.name) }
+    if cx.specMode || cx.isO(cx.pos, ";") {
+        try cx.needO(cx.pos, ";")
+        cx.pos += 1
+        cx.inMember = false
+        cx.pop()
+        return Ok(Unit{})
+    }
+    if !(cx.isK(cx.pos, "IS") || cx.isK(cx.pos, "AS")) { return Err(cx.bad(cx.pos, "IS")) }
+    cx.pos += 1
+    var isP = false
+    for x in cx.pubs { if x == u.name { isP = true } }
+    var n = node(K_BLOCK, cx.tk(cx.pos).line)
+    let was = cx.stopAtEnd
+    cx.stopAtEnd = false
+    n.decl = try cx.decls(ip, sess)
+    try cx.bodyOf(ip, sess, mut &n)
+    cx.stopAtEnd = was
+    try cx.needO(cx.pos, ";")
+    cx.pos += 1
+    u.body = n
+    u.isPub = isP
+    append(mut &cx.members, u)
+    append(mut &cx.ranges, first)
+    append(mut &cx.ranges, len(cx.slotPt))
+    cx.inMember = false
+    cx.pop()
+    return Ok(Unit{})
+}
+
+// The index of the token after `PACKAGE [BODY] name IS|AS` in a package's text, -1 when it is not one.
+fn (cx: &Cx) pkgHead(body: bool): int {
+    var i = 0
+    if !cx.isK(i, "CREATE") { return -1 }
+    i += 1
+    if cx.isK(i, "OR") && cx.isK(i + 1, "REPLACE") { i += 2 }
+    if cx.isK(i, "EDITIONABLE") || cx.isK(i, "NONEDITIONABLE") { i += 1 }
+    if !cx.isK(i, "PACKAGE") { return -1 }
+    i += 1
+    if body {
+        if !cx.isK(i, "BODY") { return -1 }
+        i += 1
+    }
+    if !cx.ident(i) { return -1 }
+    i += 1
+    if cx.isO(i, ".") { i += 2 }
+    // AUTHID ...
+    while cx.ident(i) && !cx.isK(i, "IS") && !cx.isK(i, "AS") { i += 1 }
+    if !(cx.isK(i, "IS") || cx.isK(i, "AS")) { return -1 }
+    return i + 1
+}
+
+// A package: its specification and body compiled together; the units: the package itself (its variables and what it does
+// once, first), then each member. Without a body the members are not there.
+fn compilePackage(ip: mut &Ip, sess: mut &lexdb_exec.Session, owner: &str, name: &str, spec: &str, body: &str, sigs: []SigEntry): Result[[]PUnit, DbErr] {
+    var cx = newCx(spec, try lex(spec), owner, cloneStrs(&ip.nls), sigs, ip.uid)
+    cx.pkg = name.toStr()
+    cx.nsid = len(ip.scache)
+    cx.stopAtEnd = true
+    cx.specMode = true
+    var at = cx.pkgHead(false)
+    if at < 0 { return Err(plErr("ORA06550", "line 1, column 1:\nPLS-00103: Encountered the symbol \"CREATE\"")) }
+    cx.pos = at
+    var specDecls = try cx.decls(ip, sess)
+    try cx.needK(cx.pos, "END")
+    var out: []PUnit = []
+    if len(body) == 0 { return Ok(out) }
+    try cx.useText(body)
+    cx.specMode = false
+    at = cx.pkgHead(true)
+    if at < 0 { return Err(plErr("ORA06550", "line 1, column 1:\nPLS-00103: Encountered the symbol \"CREATE\"")) }
+    cx.pos = at
+    var bodyDecls = try cx.decls(ip, sess)
+    var init = node(K_BLOCK, cx.tk(cx.pos).line)
+    if cx.isK(cx.pos, "BEGIN") {
+        try cx.bodyOf(ip, sess, mut &init)
+    } else {
+        try cx.needK(cx.pos, "END")
+        cx.pos += 1
+        if cx.ident(cx.pos) { cx.pos += 1 }
+    }
+    if cx.isO(cx.pos, ";") { cx.pos += 1 }
+    ip.uid = cx.uid
+    while len(ip.scache) < cx.nsid { append(mut &ip.scache, None) }
+    // the package's own variables: the slots no member's text made
+    var pkgSlots: []int = []
+    for sl in NSYS..len(cx.slotPt) {
+        var inMem = false
+        var q = 0
+        while q < len(cx.ranges) {
+            if sl >= cx.ranges[q] && sl < cx.ranges[q + 1] { inMem = true }
+            q += 2
+        }
+        if !inMem { append(mut &pkgSlots, sl) }
+    }
+    var pk = emptyUnit()
+    pk.kind = U_PKG
+    pk.owner = owner.toStr()
+    pk.name = name.toStr()
+    var blk = node(K_BLOCK, 1)
+    blk.decl = specDecls
+    for k in 0..len(bodyDecls) { append(mut &blk.decl, replace(mut &bodyDecls[k], node(K_NULL, 0))) }
+    blk.body = replace(mut &init.body, [])
+    blk.hs = replace(mut &init.hs, [])
+    pk.body = blk
+    pk.nslots = len(cx.slotPt)
+    pk.slotPt = cloneSlotPt(&cx.slotPt)
+    pk.pkgSlots = cloneInts(&pkgSlots)
+    pk.curs = cloneCurs(&cx.curs)
+    append(mut &out, pk)
+    for k in 0..len(cx.members) {
+        var m = replace(mut &cx.members[k], emptyUnit())
+        m.nslots = len(cx.slotPt)
+        m.slotPt = cloneSlotPt(&cx.slotPt)
+        m.pkgSlots = cloneInts(&pkgSlots)
+        m.curs = cloneCurs(&cx.curs)
+        append(mut &out, m)
+    }
+    return Ok(out)
+}
+
+fn cloneSlotPt(a: &[]PT): []PT {
+    var out: []PT = []
+    for x in a { append(mut &out, x) }
+    return out
+}
+
+// EXEC[UTE] name(args): SQL*Plus's own way to call a procedure, as the block it stands for ("" if sql is not one).
+pub fn execToBlock(sql: &str): str {
+    let t = strings.trim(&(sql.toStr()))
+    let w = firstWord(&t)
+    if w != "EXEC" && w != "EXECUTE" { return "" }
+    var rest = strings.trim(&(t[len(w)..len(t)].toStr()))
+    if strings.startsWith(&(strings.toUpperAscii(&rest)), "IMMEDIATE") { return "" }
+    while len(rest) > 0 && rest[len(rest) - 1] == ';' { rest = strings.trim(&(rest[0..len(rest) - 1].toStr())) }
+    return "BEGIN " + rest + "; END;"
+}

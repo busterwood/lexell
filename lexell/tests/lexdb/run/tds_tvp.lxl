@@ -1,0 +1,401 @@
+// lexdb over TDS: table-valued parameters (design/lexdb-tds.md, "As built: table-valued parameters"). CREATE TYPE ...
+// AS TABLE, DROP TYPE, the type in sys.types, sys.table_types, sys.objects, sys.columns and TYPE_ID; a TVP (RPC
+// parameter type 0xF3) sent by lib/tds's tableParam through sp_executesql and through sp_prepexec and sp_execute (by
+// ProcID, as drivers send them; SQL Server takes no TVP for them by name), read in FROM, JOIN, IN (SELECT ...) and
+// INSERT ... SELECT, with NULLs, an empty table (the type's default), a column the server fills (fDefault), many rows,
+// two tables and a scalar beside one; one made by hand with TVP_ORDER_UNIQUE and PLP nvarchar(max) and varbinary(max)
+// values; the server's errors (a type that is not there 351 and 2715, a short row 500, conversions 257, 206, 245, 8114, 8115,
+// 241, 8169 and 2628, keys 2627, NULL 515, writing to the parameter 10700, no READONLY 352, CREATE and DROP TYPE 219
+// and 218), each leaving the connection usable; a TVP inside a transaction rolled back; DECLARE @x of a table type.
+// With LEXDB_MSSQL it runs against a SQL Server, which is how its expect lines were made (SQL Server 2022 RTM-CU27,
+// a throwaway container); errors whose text names an object as each server names it (2627, 2628, 515) print their
+// number only.
+// expect: setup ok
+// expect: rows: 1|a|2|1.50|2026-01-02;2|b|NULL|NULL|NULL;3|café|0|-0.01|NULL
+// expect: empty: 0
+// expect: join: one|2;three|0
+// expect: in: two;four
+// expect: insert select: 3|2
+// expect: with a scalar: 2
+// expect: two: 31
+// expect: many: 5000|12502500|1|5000
+// expect: default column: 1|1;2|1
+// expect: no type: error 351: Column, parameter, or variable @items. : Cannot find data type dbo.Nope.
+// expect: short row: error 500: Trying to pass a table-valued parameter with 2 column(s) where the corresponding user-defined table type requires 5 column(s).
+// expect: text into int: error 245: Conversion failed when converting the nvarchar value 'x' to data type int.
+// expect: text into bigint: error 8114: Error converting data type nvarchar to bigint.
+// expect: null text into varbinary: error 257: Implicit conversion from data type nvarchar to varbinary(max) is not allowed. Use the CONVERT function to run this query.
+// expect: int into date: error 206: Operand type clash: bigint is incompatible with date
+// expect: int into uniqueidentifier: error 206: Operand type clash: bigint is incompatible with uniqueidentifier
+// expect: text into smallint: error 245: Conversion failed when converting the nvarchar value 'x' to data type smallint.
+// expect: smallint overflow: error 8115: Arithmetic overflow error converting expression to data type smallint.
+// expect: decimal overflow: error 8115: Arithmetic overflow error converting numeric to data type numeric.
+// expect: text into decimal: error 8114: Error converting data type nvarchar to numeric.
+// expect: text into date: error 241: Conversion failed when converting date and/or time from character string.
+// expect: text into uniqueidentifier: error 8169: Conversion failed when converting from a character string to uniqueidentifier.
+// expect: text into float: error 8114: Error converting data type nvarchar to float.
+// expect: too long: error 2628
+// expect: duplicate key: error 2627
+// expect: null into not null: error 515
+// expect: insert into it: error 10700: The table-valued parameter "@items" is READONLY and cannot be modified.
+// expect: update it: error 10700: The table-valued parameter "@items" is READONLY and cannot be modified.
+// expect: delete from it: error 10700: The table-valued parameter "@items" is READONLY and cannot be modified.
+// expect: after errors: 1
+// expect: not readonly: error 352: The table-valued parameter "@items" must be declared with the READONLY option.
+// expect: not given: 0
+// expect: declared type missing: error 2715: Column, parameter, or variable #1: Cannot find data type dbo.Nope.
+// expect: prepexec: 2 / handle
+// expect: execute: 3
+// expect: unprepare: ok
+// expect: by hand: 7|hello|0x00FF|1;8|NULL|NULL|1
+// expect: in a transaction: (3)
+// expect: rolled back: 0
+// expect: declared: 1|a|1;2|b|1
+// expect: declared as: 5
+// expect: declared not null: error 515
+// expect: types: TvpIds|243|1|1;TvpItems|243|1|1
+// expect: type columns: id|1|int|4|0;name|2|nvarchar|40|0;qty|3|int|4|1;price|4|decimal|9|1;born|5|date|3|1
+// expect: table types: TvpIds|TT;TvpItems|TT
+// expect: type_id: 1|NULL
+// expect: create again: error 219: The type 'dbo.TvpIds' already exists, or you do not have permission to create it.
+// expect: drop missing: error 218: Could not find the type 'dbo.Nope'. Either it does not exist or you do not have the necessary permission.
+// expect: drop if exists: ok
+// expect: drop: ok / NULL
+// expect: dropped type: error 351: Column, parameter, or variable @ids. : Cannot find data type TvpIds.
+import "os"
+import "strings"
+import "task"
+import "net"
+import "tds"
+import "sqldialect"
+import "sqlserver"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_wire"
+import "../../../cmd/lexdb_tds"
+
+type V = sqldialect.Value
+
+fn u8(b: mut &[]byte, v: int) { append(b, byte(v & 0xff)) }
+fn le(b: mut &[]byte, v: int, n: int) { for k in 0..n { u8(b, if k < 8 { v >> (8 * k) } else if v < 0 { 0xff } else { 0 }) } }
+fn utf16(s: &str): []byte { return tds.toUtf16(&(s.toStr())).unwrap() }
+fn bvarchar(b: mut &[]byte, s: &str) {
+    let u = utf16(s)
+    u8(b, len(u) / 2)
+    for x in u { append(b, x) }
+}
+
+fn cellText(c: &tds.Column, v: &tds.Cell): str {
+    match v {
+        tds.Cell.Null { return "NULL" }
+        tds.Cell.Bytes(b) {
+            var s = "0x"
+            for i in 0..len(b) { s = s + strings.padLeft(&(strings.toUpperAscii(&strings.hex(int(b[i])))), 2, '0') }
+            return s
+        }
+        else { return tds.cellText(c, v).unwrapOr("?") }
+    }
+}
+
+// A reply: its first error (number and text, or the number only), else its result sets' rows ("a|b;c|d") and the
+// counts of statements without rows ("(n)"), joined by " / ".
+fn said(r: Result[tds.Reply, sqldialect.DbError], textToo: bool): str {
+    match r {
+        Ok(rep) {
+            if len(rep.errors) > 0 {
+                let e = &rep.errors[0]
+                return "error " + e.number.toStr() + (if textToo { ": " + e.text } else { "" })
+            }
+            var parts: []str = []
+            for rs in rep.results {
+                var rows: []str = []
+                for row in rs.rows {
+                    var cells: []str = []
+                    for i in 0..len(row) { append(mut &cells, cellText(&rs.columns[i], &row[i])) }
+                    append(mut &rows, strings.join(&cells, "|"))
+                }
+                append(mut &parts, strings.join(&rows, ";"))
+            }
+            if len(rep.results) == 0 {
+                for c in rep.counts { if c.resultSet < 0 { append(mut &parts, "(" + c.rows.toStr() + ")") } }
+            }
+            if len(parts) == 0 { return "ok" }
+            return strings.join(&parts, " / ")
+        }
+        Err(e) { return "failed " + e.code.toStr() + " " + e.msg }
+    }
+}
+
+fn batch(s: mut &tds.Session, sql: &str): str { return said(s.batch(sql), true) }
+
+// rows in a TVP named name of the type typeName (lib/tds's tableParam)
+fn tvp(name: &str, typeName: &str, rows: &[[]V], defaults: &[int]): tds.Param {
+    var p = tds.tableParam(&(typeName.toStr()), rows, &[], defaults, &tds.noCollation()).unwrap()
+    p.name = name.toStr()
+    return p
+}
+
+fn run(s: mut &tds.Session, label: &str, sql: &str, params: &[tds.Param], textToo: bool) {
+    println(label + ": " + said(s.executeSql(&(sql.toStr()), params), textToo))
+}
+
+fn named(p: tds.Param, n: &str): tds.Param {
+    var x = p
+    x.name = n.toStr()
+    return x
+}
+
+// an int (INTN 4: sp_prepexec's and sp_execute's handle)
+fn int4(n: int): tds.Param {
+    var d: []byte = []
+    u8(mut &d, 4)
+    le(mut &d, n, 4)
+    return tds.Param{name: "", output: false, byDefault: false, declared: "int", typeInfo: "\x26\x04", data: strFromBytes(&d)}
+}
+
+// An RPC of the procedure with id proc (PROC_PREPEXEC, ...), as drivers send them: ProcIDSwitch, not a name.
+fn byId(s: mut &tds.Session, proc: int, params: &[tds.Param]): Result[tds.Reply, sqldialect.DbError] {
+    var b: []byte = []
+    le(mut &b, 22, 4)                   // ALL_HEADERS: the transaction descriptor (none), one request outstanding
+    le(mut &b, 18, 4)
+    le(mut &b, 2, 2)
+    le(mut &b, 0, 8)
+    le(mut &b, 1, 4)
+    le(mut &b, 0xFFFF, 2)
+    le(mut &b, proc, 2)
+    le(mut &b, 0, 2)
+    for p in params {
+        bvarchar(mut &b, &p.name)
+        u8(mut &b, (if p.output { 1 } else { 0 }) | (if p.byDefault { 2 } else { 0 }))
+        appendStr(mut &b, p.typeInfo)
+        appendStr(mut &b, p.data)
+    }
+    match s.sendPart(tds.PT_RPC, &b, true) {
+        Ok(_) {}
+        Err(e) { return Err(e) }
+    }
+    return s.partReply()
+}
+
+fn text(t: &str): tds.Param { return tds.textParam(&(t.toStr()), &tds.noCollation()).unwrap() }
+
+fn items(): [][]V {
+    return [[V.Int(1), V.Text("a"), V.Int(2), V.Dec(1.5m), V.Text("2026-01-02")],
+            [V.Int(2), V.Text("b"), V.Null, V.Null, V.Null],
+            [V.Int(3), V.Text("café"), V.Int(0), V.Dec(-0.01m), V.Null]]
+}
+
+fn ids(from: int, to: int): [][]V {
+    var out: [][]V = []
+    for i in from..to + 1 { append(mut &out, [V.Int(i)]) }
+    return out
+}
+
+// A TVP of dbo.TvpWide (k int, txt nvarchar(max), b varbinary(max)) made by hand: columns named, TVP_ORDER_UNIQUE (k
+// ascending, unique), the text in two PLP chunks, the bytes PLP of unknown length, then a row of NULLs.
+fn byHand(): tds.Param {
+    var ti: []byte = []
+    u8(mut &ti, 0xF3)
+    u8(mut &ti, 0)
+    bvarchar(mut &ti, &"dbo")
+    bvarchar(mut &ti, &"TvpWide")
+    le(mut &ti, 3, 2)
+    le(mut &ti, 0, 4)
+    le(mut &ti, 1, 2)
+    u8(mut &ti, 0x26)
+    u8(mut &ti, 4)
+    bvarchar(mut &ti, &"")
+    le(mut &ti, 0, 4)
+    le(mut &ti, 1, 2)
+    u8(mut &ti, 0xE7)
+    le(mut &ti, 0xFFFF, 2)
+    for x in [0x09, 0x04, 0xd0, 0x00, 0x34] { u8(mut &ti, x) }
+    bvarchar(mut &ti, &"")
+    le(mut &ti, 0, 4)
+    le(mut &ti, 1, 2)
+    u8(mut &ti, 0xA5)
+    le(mut &ti, 0xFFFF, 2)
+    bvarchar(mut &ti, &"")
+    u8(mut &ti, 0x10)                   // TVP_ORDER_UNIQUE: k, ascending and unique
+    le(mut &ti, 1, 2)
+    le(mut &ti, 1, 2)
+    u8(mut &ti, 0x05)
+    u8(mut &ti, 0)                      // TVP_END_TOKEN
+    var d: []byte = []
+    u8(mut &d, 1)
+    u8(mut &d, 4)
+    le(mut &d, 7, 4)
+    let h = utf16(&"hello")
+    le(mut &d, len(h), 8)
+    le(mut &d, 4, 4)
+    for i in 0..4 { append(mut &d, h[i]) }
+    le(mut &d, len(h) - 4, 4)
+    for i in 4..len(h) { append(mut &d, h[i]) }
+    le(mut &d, 0, 4)
+    le(mut &d, -2, 8)                   // PLP_UNKNOWN_LEN
+    le(mut &d, 2, 4)
+    u8(mut &d, 0)
+    u8(mut &d, 0xff)
+    le(mut &d, 0, 4)
+    u8(mut &d, 1)
+    u8(mut &d, 4)
+    le(mut &d, 8, 4)
+    le(mut &d, -1, 8)
+    le(mut &d, -1, 8)
+    u8(mut &d, 0)
+    return tds.Param{name: "@w", output: false, byDefault: false, declared: "dbo.TvpWide READONLY", typeInfo: strFromBytes(&ti),
+                     data: strFromBytes(&d)}
+}
+
+fn tests(s: mut &tds.Session) {
+    let setup = ["DROP TABLE IF EXISTS tvp_prod", "DROP TABLE IF EXISTS tvp_target", "DROP TYPE IF EXISTS dbo.TvpItems",
+                 "DROP TYPE IF EXISTS TvpIds", "DROP TYPE IF EXISTS dbo.TvpWide",
+                 "CREATE TYPE dbo.TvpItems AS TABLE (id int PRIMARY KEY, name nvarchar(20) NOT NULL, qty int DEFAULT 1, price decimal(10,2) NULL, born date NULL, UNIQUE (name))",
+                 "CREATE TYPE TvpIds AS TABLE (id bigint)",
+                 "CREATE TYPE dbo.TvpWide AS TABLE (k int, txt nvarchar(max), b varbinary(max))",
+                 "DROP TYPE IF EXISTS dbo.TvpNums",
+                 "CREATE TYPE dbo.TvpNums AS TABLE (s smallint, d decimal(5,2), dt date, g uniqueidentifier, f float)",
+                 "CREATE TABLE tvp_prod (id int PRIMARY KEY, label varchar(20))",
+                 "INSERT INTO tvp_prod VALUES (1, 'one'), (2, 'two'), (3, 'three'), (4, 'four')",
+                 "CREATE TABLE tvp_target (id int, name nvarchar(20), qty int)"]
+    var ok = true
+    for q in setup {
+        let r = batch(s, &q)
+        if strings.startsWith(&r, "error") || strings.startsWith(&r, "failed") {
+            println(q + ": " + r)
+            ok = false
+        }
+    }
+    println(if ok { "setup ok" } else { "setup failed" })
+    let it = "dbo.TvpItems"
+    run(s, &"rows", &"SELECT id, name, qty, price, born FROM @items ORDER BY id", &[tvp(&"@items", &it, &items(), &[])], true)
+    run(s, &"empty", &"SELECT COUNT(*) FROM @items", &[tvp(&"@items", &it, &[], &[])], true)
+    run(s, &"join", &"SELECT p.label, i.qty FROM tvp_prod p JOIN @items i ON i.id = p.id WHERE i.qty IS NOT NULL ORDER BY p.id",
+        &[tvp(&"@items", &it, &items(), &[])], true)
+    run(s, &"in", &"SELECT label FROM tvp_prod WHERE id IN (SELECT id FROM @ids) ORDER BY id",
+        &[tvp(&"@ids", &"TvpIds", &[[V.Int(2)], [V.Int(4)], [V.Int(9)]], &[])], true)
+    run(s, &"insert select", &"INSERT INTO tvp_target SELECT id, name, qty FROM @items; SELECT COUNT(*), SUM(qty) FROM tvp_target",
+        &[tvp(&"@items", &it, &items(), &[])], true)
+    run(s, &"with a scalar", &"SELECT COUNT(*) FROM @items WHERE id > @p1", &[named(tds.intParam(1), &"@p1"), tvp(&"@items", &it, &items(), &[])], true)
+    run(s, &"two", &"SELECT (SELECT COUNT(*) FROM @a) * 10 + (SELECT COUNT(*) FROM @b)",
+        &[tvp(&"@a", &it, &items(), &[]), tvp(&"@b", &"TvpIds", &ids(1, 1), &[])], true)
+    run(s, &"many", &"SELECT COUNT(*), SUM(id), MIN(id), MAX(id) FROM @ids", &[tvp(&"@ids", &"TvpIds", &ids(1, 5000), &[])], true)
+    run(s, &"default column", &"SELECT id, qty FROM @items ORDER BY id",
+        &[tvp(&"@items", &it, &[[V.Int(1), V.Text("a"), V.Null, V.Null, V.Null], [V.Int(2), V.Text("b"), V.Null, V.Null, V.Null]], &[2])], true)
+    // errors, each leaving the connection usable
+    run(s, &"no type", &"SELECT COUNT(*) FROM @items", &[tvp(&"@items", &"dbo.Nope", &items(), &[])], true)
+    run(s, &"short row", &"SELECT COUNT(*) FROM @items", &[tvp(&"@items", &it, &[[V.Int(1), V.Text("a")]], &[])], true)
+    run(s, &"text into int", &"SELECT COUNT(*) FROM @items", &[tvp(&"@items", &it, &[[V.Text("x"), V.Text("a"), V.Null, V.Null, V.Null]], &[])], true)
+    run(s, &"text into bigint", &"SELECT COUNT(*) FROM @ids", &[tvp(&"@ids", &"TvpIds", &[[V.Text("x")]], &[])], true)
+    let nums = "dbo.TvpNums"
+    let conv = [[V.Text("x"), V.Null, V.Null, V.Null, V.Null], [V.Int(100000), V.Null, V.Null, V.Null, V.Null],
+                [V.Null, V.Dec(12345.6m), V.Null, V.Null, V.Null], [V.Null, V.Text("abc"), V.Null, V.Null, V.Null],
+                [V.Null, V.Null, V.Text("abc"), V.Null, V.Null], [V.Null, V.Null, V.Null, V.Text("abc"), V.Null],
+                [V.Null, V.Null, V.Null, V.Null, V.Text("abc")]]
+    let convNames = ["text into smallint", "smallint overflow", "decimal overflow", "text into decimal", "text into date", "text into uniqueidentifier",
+                     "text into float"]
+    run(s, &"null text into varbinary", &"SELECT COUNT(*) FROM @w", &[tvp(&"@w", &"dbo.TvpWide", &[[V.Int(1), V.Null, V.Null]], &[])], true)
+    run(s, &"int into date", &"SELECT COUNT(*) FROM @n", &[tvp(&"@n", &nums, &[[V.Null, V.Null, V.Int(5), V.Null, V.Null]], &[])], true)
+    run(s, &"int into uniqueidentifier", &"SELECT COUNT(*) FROM @n", &[tvp(&"@n", &nums, &[[V.Null, V.Null, V.Null, V.Int(5), V.Null]], &[])], true)
+    var cv = conv
+    for i in 0..len(cv) { run(s, &convNames[i], &"SELECT COUNT(*) FROM @n", &[tvp(&"@n", &nums, &[replace(mut &cv[i], [])], &[])], true) }
+    run(s, &"too long", &"SELECT COUNT(*) FROM @items",
+        &[tvp(&"@items", &it, &[[V.Int(1), V.Text(strings.padLeft("", 21, 'y')), V.Null, V.Null, V.Null]], &[])], false)
+    run(s, &"duplicate key", &"SELECT COUNT(*) FROM @items",
+        &[tvp(&"@items", &it, &[[V.Int(1), V.Text("a"), V.Null, V.Null, V.Null], [V.Int(1), V.Text("b"), V.Null, V.Null, V.Null]], &[])], false)
+    run(s, &"null into not null", &"SELECT COUNT(*) FROM @items", &[tvp(&"@items", &it, &[[V.Int(1), V.Null, V.Null, V.Null, V.Null]], &[])], false)
+    run(s, &"insert into it", &"SELECT 1; INSERT INTO @items (id, name) VALUES (9, N'z')", &[tvp(&"@items", &it, &items(), &[])], true)
+    run(s, &"update it", &"UPDATE @items SET qty = 0", &[tvp(&"@items", &it, &items(), &[])], true)
+    run(s, &"delete from it", &"DELETE FROM @items WHERE id = 1", &[tvp(&"@items", &it, &items(), &[])], true)
+    println("after errors: " + batch(s, &"SELECT 1"))
+    var nr = tvp(&"@items", &it, &items(), &[])
+    nr.declared = "dbo.TvpItems"
+    run(s, &"not readonly", &"SELECT COUNT(*) FROM @items", &[nr], true)
+    println("not given: " + said(s.callProc("sp_executesql", &[text(&"SELECT COUNT(*) FROM @items"), text(&"@items dbo.TvpItems READONLY")]), true))
+    println("declared type missing: " + said(s.callProc("sp_executesql", &[text(&"SELECT COUNT(*) FROM @t"), text(&"@t dbo.Nope READONLY")]), true))
+    // sp_prepexec, sp_execute, sp_unprepare
+    var h = int4(0)
+    h.output = true
+    let decl = "@items dbo.TvpItems READONLY"
+    let stmt = "SELECT COUNT(*) FROM @items WHERE qty IS NOT NULL"
+    let pe = byId(s, tds.PROC_PREPEXEC, &[h, text(&decl), text(&stmt), tvp(&"", &it, &items(), &[])])
+    var handle = 0
+    match pe {
+        Ok(rep) { for rv in rep.returnValues { if rv.ordinal == 0 { match rv.value { tds.Cell.Int(n) { handle = n } else {} } } } }
+        Err(_) {}
+    }
+    println("prepexec: " + said(pe, true) + " / " + (if handle > 0 { "handle" } else { "no handle" }))
+    var more = items()
+    append(mut &more, [V.Int(4), V.Text("d"), V.Int(5), V.Null, V.Null])
+    println("execute: " + said(byId(s, tds.PROC_EXECUTE, &[int4(handle), tvp(&"", &it, &more, &[])]), true))
+    println("unprepare: " + said(byId(s, tds.PROC_UNPREPARE, &[int4(handle)]), true))
+    run(s, &"by hand", &"SELECT k, txt, b, LEN(k) FROM @w ORDER BY k", &[byHand()], true)
+    // in a transaction rolled back
+    let b0 = batch(s, &"DELETE FROM tvp_target; BEGIN TRANSACTION")
+    run(s, &"in a transaction", &"INSERT INTO tvp_target SELECT id, name, qty FROM @items", &[tvp(&"@items", &it, &items(), &[])], true)
+    let b1 = batch(s, &"ROLLBACK")
+    println("rolled back: " + batch(s, &"SELECT COUNT(*) FROM tvp_target"))
+    // a table variable of a table type
+    println("declared: " + batch(s, &"DECLARE @x dbo.TvpItems; INSERT INTO @x (id, name) VALUES (1, N'a'), (2, N'b'); SELECT id, name, qty FROM @x ORDER BY id"))
+    println("declared as: " + batch(s, &"DECLARE @x AS TvpIds; INSERT @x VALUES (5); SELECT id FROM @x"))
+    println("declared not null: " + said(s.batch("DECLARE @x dbo.TvpItems; INSERT INTO @x (id) VALUES (1)"), false))
+    // the catalog
+    println("types: " + batch(s, &"SELECT name, system_type_id, is_table_type, is_user_defined FROM sys.types WHERE is_table_type = 1 AND name LIKE 'TvpI%' ORDER BY name"))
+    println("type columns: " + batch(s, &"SELECT c.name, c.column_id, TYPE_NAME(c.system_type_id), c.max_length, c.is_nullable FROM sys.columns c JOIN sys.table_types t ON c.object_id = t.type_table_object_id WHERE t.name = 'TvpItems' ORDER BY c.column_id"))
+    println("table types: " + batch(s, &"SELECT t.name, o.type FROM sys.table_types t JOIN sys.objects o ON o.object_id = t.type_table_object_id WHERE t.name LIKE 'TvpI%' ORDER BY t.name"))
+    println("type_id: " + batch(s, &"SELECT CASE WHEN TYPE_ID('dbo.TvpItems') IS NULL THEN 0 ELSE 1 END, TYPE_ID('dbo.Nope')"))
+    println("create again: " + batch(s, &"CREATE TYPE dbo.TvpIds AS TABLE (a int)"))
+    println("drop missing: " + batch(s, &"DROP TYPE dbo.Nope"))
+    println("drop if exists: " + batch(s, &"DROP TYPE IF EXISTS dbo.Nope"))
+    println("drop: " + batch(s, &"DROP TYPE TvpIds") + " / " + batch(s, &"SELECT TYPE_ID('TvpIds')"))
+    run(s, &"dropped type", &"SELECT COUNT(*) FROM @ids", &[tvp(&"@ids", &"TvpIds", &ids(1, 2), &[])], true)
+    let cleanup = ["DROP TABLE IF EXISTS tvp_prod", "DROP TABLE IF EXISTS tvp_target", "DROP TYPE IF EXISTS dbo.TvpItems", "DROP TYPE IF EXISTS dbo.TvpWide",
+                   "DROP TYPE IF EXISTS dbo.TvpNums"]
+    for q in cleanup { let r = batch(s, &q) }
+}
+
+fn connect(dsn: &str): Option[tds.Session] {
+    let st = sqlserver.parseConnString(&(dsn.toStr())).unwrap()
+    match tds.open(&st.config) {
+        Ok(s) { return Some(s) }
+        Err(e) {
+            println("connect: " + e.msg)
+            return None
+        }
+    }
+}
+
+fn runAll(dsn: &str) {
+    match connect(dsn) {
+        Some(s0) {
+            var s = s0
+            tests(mut &s)
+        }
+        None {}
+    }
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(sc: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        lexdb_wire.configure(&st, &lexdb_wire.noAuth()).unwrap()
+        let f = sc.start(lexdb_tds.acceptLoop, lexdb_tds.AcceptArg{ln: ln, st: st})
+        runAll(&("Server=127.0.0.1," + addr[10..len(addr)] + ";UID=sa;PWD=x;Encrypt=no"))
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    // LEXDB_MSSQL: the oracle, for the expect lines
+    match os.env("LEXDB_MSSQL") {
+        Some(dsn) { runAll(&dsn) }
+        None {
+            lexdb_store.run(lexdb_disk.sim(41), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024,
+                                                                     snapNodes: 50000}, body).unwrap()
+        }
+    }
+}

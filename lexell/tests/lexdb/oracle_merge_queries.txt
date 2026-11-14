@@ -1,0 +1,90 @@
+# MERGE (design/lexdb-oracle.md O3), checked against Oracle Database Free: run by gen_oracle.py merge on the container as APP.
+# x<TAB>label<TAB>statement  (its row count)      q<TAB>label<TAB>query  (its columns and rows)
+# t<TAB>label<TAB>a ;; b ;; c  (statements and queries in one transaction that is rolled back; u: committed): each answer, joined by " / "
+x	create tgt	create table m_tgt (id number(10) primary key, name varchar2(20), qty number(10) default 0 not null, note varchar2(20))
+x	tgt 1	insert into m_tgt values (1, 'a', 10, null)
+x	tgt 2	insert into m_tgt values (2, 'b', 20, null)
+x	tgt 3	insert into m_tgt values (3, 'c', 30, null)
+x	create src	create table m_src (id number(10), name varchar2(20), qty number(10))
+x	src 1	insert into m_src values (2, 'B', 5)
+x	src 2	insert into m_src values (3, 'C', 7)
+x	src 3	insert into m_src values (4, 'D', 9)
+x	src 4	insert into m_src values (5, 'E', 11)
+t	upsert	merge into m_tgt t using m_src s on (t.id = s.id) when matched then update set t.name = s.name, t.qty = t.qty + s.qty when not matched then insert (id, name, qty) values (s.id, s.name, s.qty) ;; select * from m_tgt order by id
+q	after rollback	select * from m_tgt order by id
+t	update where	merge into m_tgt t using m_src s on (t.id = s.id) when matched then update set t.name = s.name where s.qty > 6 ;; select id, name from m_tgt order by id
+t	delete where	merge into m_tgt t using m_src s on (t.id = s.id) when matched then update set t.note = 'x' delete where (t.id = 3) ;; select id, note from m_tgt order by id
+t	delete where new values	merge into m_tgt t using m_src s on (t.id = s.id) when matched then update set t.qty = 0 delete where (t.qty = 0) ;; select id, qty from m_tgt order by id
+t	update where and delete where	merge into m_tgt t using m_src s on (t.id = s.id) when matched then update set t.note = 'x' where t.id = 2 delete where (t.id = 2) ;; select id, note from m_tgt order by id
+t	insert where	merge into m_tgt t using m_src s on (t.id = s.id) when not matched then insert (id, name) values (s.id, s.name) where s.qty > 9 ;; select id, name, qty from m_tgt order by id
+t	update only	merge into m_tgt t using m_src s on (t.id = s.id) when matched then update set t.name = lower(s.name) ;; merge into m_tgt t using m_src s on (t.id = s.id) when not matched then insert values (s.id, s.name, s.qty, null) ;; select * from m_tgt order by id
+t	insert first	merge into m_tgt t using m_src s on (t.id = s.id) when not matched then insert (id, name) values (s.id, s.name) when matched then update set t.note = 'upd' ;; select id, name, note from m_tgt order by id
+t	no alias	merge into m_tgt using m_src on (m_tgt.id = m_src.id) when matched then update set name = m_src.name ;; merge into m_tgt t using m_src s on (t.id = s.id) when matched then update set name = s.name, qty = qty + 1 ;; select id, name, qty from m_tgt order by id
+t	using dual	merge into m_tgt t using dual on (t.id = 1) when matched then update set t.note = 'dual' when not matched then insert (id) values (1) ;; merge into m_tgt t using dual on (t.id = 99) when matched then update set t.note = 'dual' when not matched then insert (id, name) values (99, 'nn') ;; select id, name, note from m_tgt order by id
+t	subquery source	merge into m_tgt t using (select 9 id, 'nine' name from dual union all select 1, 'one' from dual) s on (t.id = s.id) when matched then update set t.name = s.name when not matched then insert (id, name) values (s.id, s.name) ;; merge into m_tgt t using (select count(*) c, 3 id from m_src where qty > 6) s on (t.id = s.id) when matched then update set t.qty = s.c ;; merge into m_tgt t using (select s.id, t2.name from m_src s join m_tgt t2 on t2.id = s.id) j on (t.id = j.id) when matched then update set t.note = j.name ;; select id, name, qty, note from m_tgt order by id
+t	no source rows	merge into m_tgt t using (select * from m_src where 1 = 0) s on (t.id = s.id) when matched then update set t.name = 'x' when not matched then insert (id) values (s.id) ;; merge into m_tgt t using (select 900 id from dual) s on (t.id = s.id) when matched then update set t.name = 'x' ;; merge into m_tgt t using m_src s on (1 = 0) when not matched then insert (id, name) values (s.id + 1000, s.name) ;; select count(*) c, max(id) m from m_tgt
+x	create dup	create table m_dup (id number(10), name varchar2(20))
+x	dup 1	insert into m_dup values (3, 'p')
+x	dup 2	insert into m_dup values (3, 'q')
+x	dup 3	insert into m_dup values (8, 'r')
+t	dup update	merge into m_tgt t using m_dup d on (t.id = d.id) when matched then update set t.name = d.name ;; merge into m_tgt t using m_dup d on (t.id = d.id) when matched then update set t.name = d.name where d.name = 'p' ;; select id, name from m_tgt order by id
+t	dup insert only	merge into m_tgt t using m_dup d on (t.id = d.id) when not matched then insert (id, name) values (d.id, d.name) ;; merge into m_tgt t using (select 50 id from dual union all select 50 from dual) d on (t.id = d.id) when not matched then insert (id) values (d.id) ;; select id from m_tgt order by id
+x	create nk	create table m_nk (k number, v varchar2(10))
+x	nk 1	insert into m_nk values (1, 'one')
+x	nk 2	insert into m_nk values (null, 'n1')
+t	null keys	merge into m_nk t using (select 1 k, 'x1' v from dual union all select null, 'n2' from dual) s on (t.k = s.k) when matched then update set t.v = s.v when not matched then insert (k, v) values (s.k, s.v) ;; select k, v from m_nk order by k, v ;; merge into m_tgt t using m_src s on (t.id = s.id) when matched then update set t.note = '' when not matched then insert (id, name) values (s.id, '') ;; select id, name, note, nvl(name, '<null>') n2 from m_tgt order by id
+t	empty source value	merge into m_tgt t using (select 2 id, '' name from dual) s on (t.id = s.id) when matched then update set t.name = s.name ;; select id, name from m_tgt where id = 2
+x	create kl	create table m_kl (a number, b varchar2(10))
+x	kl 1	insert into m_kl values (1, 'x')
+x	kl 2	insert into m_kl values (1, 'x')
+x	kl 3	insert into m_kl values (2, 'y')
+x	keyless	merge into m_kl using (select 1 a from dual union all select 3 from dual) v on (m_kl.a = v.a) when matched then update set b = 'hit' when not matched then insert (a, b) values (v.a, 'new')
+x	keyless delete	merge into m_kl using (select 2 a from dual) v on (m_kl.a = v.a) when matched then update set b = 'gone' delete where (b = 'gone')
+q	keyless rows	select a, b from m_kl order by a, b
+x	create idt	create table m_idt (id number generated always as identity primary key, v varchar2(10))
+x	create seq	create sequence m_sq start with 100
+x	create sqt	create table m_sqt (id number default m_sq.nextval primary key, v varchar2(10))
+x	identity insert	merge into m_idt t using (select 'a' v from dual union all select 'b' from dual union all select 'c' from dual) s on (1 = 0) when not matched then insert (v) values (s.v)
+q	identity rows	select id, v from m_idt order by id
+x	identity explicit	merge into m_idt t using (select 9 id, 'z' v from dual) s on (t.id = s.id) when not matched then insert (id, v) values (s.id, s.v)
+x	identity update	merge into m_idt t using (select 'a' v from dual) s on (t.v = s.v) when matched then update set t.id = 5
+x	sequence default	merge into m_sqt t using (select 'p' v from dual union all select 'q' from dual) s on (1 = 0) when not matched then insert (v) values (s.v)
+x	sequence nextval	merge into m_sqt t using (select 'p' v from dual union all select 'q' from dual) s on (1 = 0) when not matched then insert (id, v) values (m_sq.nextval, s.v)
+q	sequence rows	select id, v from m_sqt order by id
+x	update on column	merge into m_tgt t using m_src s on (t.id = s.id) when matched then update set t.id = 7
+x	update on column 2	merge into m_tgt t using m_src s on (t.id = s.id and t.name = s.name) when matched then update set t.name = 'z'
+x	not null update	merge into m_tgt t using m_src s on (t.id = s.id) when matched then update set t.qty = null
+x	not null insert	merge into m_tgt t using (select 1000 id, 'bad' name from dual union all select 2, 'ok' from dual) s on (t.id = s.id) when matched then update set t.name = s.name when not matched then insert (id, name, qty) values (s.id, s.name, null)
+q	whole statement rows	select id, name from m_tgt where id in (2, 1000) order by id
+x	unique violation	merge into m_tgt t using m_src s on (t.id = s.id) when matched then update set t.note = 'u' when not matched then insert (id, name) values (1, s.name)
+q	unique rows	select count(*) c from m_tgt where note = 'u'
+x	create par	create table m_par (id number primary key, tag varchar2(5))
+x	par 1	insert into m_par values (1, 'x')
+x	par 2	insert into m_par values (2, 'y')
+x	create kid	create table m_kid (id number primary key, p number references m_par, n number check (n > 0))
+u	kid ok	merge into m_kid k using (select 1 id, 1 p, 5 n from dual union all select 2, 2, 6 from dual) s on (k.id = s.id) when not matched then insert values (s.id, s.p, s.n) ;; merge into m_kid k using (select 3 id, 9 p, 5 n from dual) s on (k.id = s.id) when not matched then insert values (s.id, s.p, s.n) ;; merge into m_kid k using (select 3 id, 1 p, 0 n from dual) s on (k.id = s.id) when not matched then insert values (s.id, s.p, s.n) ;; merge into m_kid k using (select 1 id, 9 p from dual) s on (k.id = s.id) when matched then update set k.p = s.p ;; merge into m_par t using (select 1 id from dual) s on (t.id = s.id) when matched then update set t.tag = 'd' delete where (1 = 1) ;; select id from m_par order by id
+t	tx merge	merge into m_tgt t using (select 1 id from dual) s on (t.id = s.id) when matched then update set t.name = 'in tx' ;; select name from m_tgt where id = 1
+q	after tx rollback	select name from m_tgt where id = 1
+u	tx merge 2	merge into m_tgt t using (select 1 id from dual) s on (t.id = s.id) when matched then update set t.name = 'committed'
+q	after commit	select name from m_tgt where id = 1
+t	upper case	MERGE INTO M_TGT T USING M_SRC S ON (T.ID = S.ID) WHEN MATCHED THEN UPDATE SET T.NOTE = 'UP' WHEN NOT MATCHED THEN INSERT (ID, NAME) VALUES (S.ID, S.NAME) ;; select id, name, note from m_tgt order by id
+t	quoted names	merge into "M_TGT" "T" using "M_SRC" "S" on ("T"."ID" = "S"."ID") when matched then update set "T"."NOTE" = 'q' ;; select id, note from m_tgt order by id
+t	unqualified where	merge into m_tgt t using m_src s on (t.id = s.id) when matched then update set t.note = 'w' where qty = 20 ;; select id, note from m_tgt order by id
+t	unqualified delete where	merge into m_tgt t using m_src s on (t.id = s.id) when matched then update set t.note = 'w' delete where (qty = 30) ;; select id, note from m_tgt order by id
+t	ambiguous on	merge into m_tgt t using m_src s on (t.id = s.id and qty = 20) when matched then update set t.note = 'x' ;; merge into m_tgt t using m_src s on (t.id = s.id) when not matched then insert (id) values (t.id) ;; merge into m_tgt t using m_src s on (t.id = s.id) when not matched then insert (id) values (id) ;; merge into m_tgt t using m_src s on (t.id = s.id) when matched then update set t.note = (select max(name) from m_src) where exists (select 1 from m_par p where p.id = t.id) when not matched then insert (id) values (s.id) where s.id in (select id from m_src where qty > 8) ;; select id, note from m_tgt order by id
+x	err no when	merge into m_tgt t using m_src s on (t.id = s.id)
+x	err no parens	merge into m_tgt t using m_src s on t.id = s.id when matched then update set t.name = s.name
+x	err delete alone	merge into m_tgt t using m_src s on (t.id = s.id) when matched then delete
+x	err matched insert	merge into m_tgt t using m_src s on (t.id = s.id) when matched then insert (id) values (1)
+x	err not matched update	merge into m_tgt t using m_src s on (t.id = s.id) when not matched then update set t.name = 'x'
+x	err matched twice	merge into m_tgt t using m_src s on (t.id = s.id) when matched then update set t.name = 'x' when matched then update set t.name = 'y'
+x	err not matched twice	merge into m_tgt t using m_src s on (t.id = s.id) when not matched then insert (id) values (s.id) when not matched then insert (id) values (s.id)
+x	err by target	merge into m_tgt t using m_src s on (t.id = s.id) when matched then update set t.name = s.name when not matched by target then insert (id) values (s.id)
+x	err not enough values	merge into m_tgt t using m_src s on (t.id = s.id) when not matched then insert (id, name) values (s.id)
+x	err too many values	merge into m_tgt t using m_src s on (t.id = s.id) when not matched then insert (id, name) values (s.id, 1, 2)
+x	err no list not enough	merge into m_tgt t using m_src s on (t.id = s.id) when not matched then insert values (s.id)
+x	err set column	merge into m_tgt t using m_src s on (t.id = s.id) when matched then update set t.nope = 1
+x	err on column	merge into m_tgt t using m_src s on (t.nope = s.id) when matched then update set t.name = 'x'
+x	err no target	merge into m_nope t using m_src s on (t.id = s.id) when matched then update set t.name = 'x'
+x	err no source	merge into m_tgt t using m_nope s on (t.id = s.id) when matched then update set t.name = 'x'
+x	err source column	merge into m_tgt t using m_src s on (t.id = s.nope) when matched then update set t.name = 'x'

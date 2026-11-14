@@ -1,0 +1,148 @@
+# MERGE (design/lexdb-tds.md S5), checked against SQL Server 2022. One batch a line: gen_mssql.py
+CREATE TABLE tgt (id int PRIMARY KEY, name varchar(20), qty int NOT NULL DEFAULT 0, note varchar(20) NULL)
+INSERT INTO tgt VALUES (1, 'a', 10, NULL), (2, 'b', 20, NULL), (3, 'c', 30, NULL)
+CREATE TABLE src (id int, name varchar(20), qty int)
+INSERT INTO src VALUES (2, 'B', 5), (3, 'C', 7), (4, 'D', 9), (5, 'E', 11)
+MERGE tgt AS t USING src AS s ON t.id = s.id WHEN MATCHED THEN UPDATE SET name = s.name, qty = t.qty + s.qty WHEN NOT MATCHED THEN INSERT (id, name, qty) VALUES (s.id, s.name, s.qty);
+SELECT * FROM tgt ORDER BY id
+# the semicolon is required
+MERGE tgt AS t USING src AS s ON t.id = s.id WHEN MATCHED THEN DELETE
+MERGE tgt AS t USING src AS s ON t.id = s.id WHEN MATCHED THEN DELETE WHEN NOT MATCHED THEN INSERT (id) VALUES (s.id) ; SELECT 1
+SELECT COUNT(*) FROM tgt
+# INTO, no alias, BY TARGET, the column list left out, DEFAULT in values
+MERGE INTO tgt USING (VALUES (6, 'F', 1)) AS v(id, name, qty) ON tgt.id = v.id WHEN NOT MATCHED BY TARGET THEN INSERT VALUES (v.id, v.name, DEFAULT, NULL);
+SELECT * FROM tgt WHERE id = 6
+DELETE FROM tgt; INSERT INTO tgt VALUES (1, 'a', 10, NULL), (2, 'b', 20, NULL), (3, 'c', 30, NULL)
+# conditional clauses: the first one whose condition holds
+MERGE tgt AS t USING src AS s ON t.id = s.id WHEN MATCHED AND s.qty > 6 THEN DELETE WHEN MATCHED THEN UPDATE SET note = 'small' WHEN NOT MATCHED AND s.qty < 10 THEN INSERT (id, name) VALUES (s.id, s.name);
+SELECT * FROM tgt ORDER BY id
+MERGE tgt AS t USING src AS s ON t.id = s.id WHEN MATCHED THEN UPDATE SET note = 'a' WHEN MATCHED THEN DELETE;
+MERGE tgt AS t USING src AS s ON t.id = s.id WHEN MATCHED AND s.qty > 6 THEN UPDATE SET note = 'a' WHEN MATCHED AND s.qty > 5 THEN DELETE;
+MERGE tgt AS t USING src AS s ON t.id = s.id WHEN NOT MATCHED THEN INSERT (id) VALUES (s.id) WHEN NOT MATCHED THEN INSERT (id) VALUES (s.id);
+SELECT * FROM tgt ORDER BY id
+DELETE FROM tgt; INSERT INTO tgt VALUES (1, 'a', 10, NULL), (2, 'b', 20, NULL), (3, 'c', 30, NULL)
+DELETE FROM src; INSERT INTO src VALUES (2, 'B', 5), (3, 'C', 7), (4, 'D', 9), (5, 'E', 11)
+# a matched row with no clause for it, no source rows, @@ROWCOUNT
+MERGE tgt AS t USING src AS s ON t.id = s.id WHEN MATCHED AND t.id = 3 THEN UPDATE SET note = 'three'; SELECT @@ROWCOUNT
+MERGE tgt AS t USING (SELECT * FROM src WHERE 1 = 0) AS s ON t.id = s.id WHEN MATCHED THEN DELETE WHEN NOT MATCHED THEN INSERT (id) VALUES (s.id); SELECT @@ROWCOUNT
+SELECT * FROM tgt ORDER BY id
+DELETE FROM tgt; INSERT INTO tgt VALUES (1, 'a', 10, NULL), (2, 'b', 20, NULL), (3, 'c', 30, NULL)
+# DELETE, subquery, VALUES and aggregate sources
+MERGE tgt AS t USING (SELECT 1 AS id UNION ALL SELECT 2) AS s ON t.id = s.id WHEN MATCHED THEN DELETE;
+MERGE tgt AS t USING (SELECT id, name FROM src WHERE id > 3) AS s ON t.id = s.id WHEN MATCHED THEN UPDATE SET name = LOWER(s.name) WHEN NOT MATCHED THEN INSERT (id, name) VALUES (s.id + 100, s.name);
+MERGE tgt AS t USING (VALUES (3, 'x'), (77, 'y')) AS v (id, name) ON t.id = v.id WHEN MATCHED THEN UPDATE SET name = v.name WHEN NOT MATCHED THEN INSERT (id, name) VALUES (v.id, v.name);
+MERGE tgt AS t USING (SELECT name, SUM(qty) AS q FROM src GROUP BY name) AS s ON t.name = LOWER(s.name) WHEN MATCHED THEN UPDATE SET qty = s.q;
+SELECT * FROM tgt ORDER BY id
+DELETE FROM tgt; INSERT INTO tgt VALUES (1, 'a', 10, NULL), (2, 'b', 20, NULL), (3, 'c', 30, NULL)
+# a target row matching several source rows: 8672 when it would be changed twice
+CREATE TABLE dup (id int, name varchar(20))
+INSERT INTO dup VALUES (3, 'p'), (3, 'q'), (8, 'r')
+MERGE tgt AS t USING dup AS d ON t.id = d.id WHEN MATCHED THEN UPDATE SET name = d.name;
+MERGE tgt AS t USING dup AS d ON t.id = d.id WHEN MATCHED THEN DELETE;
+MERGE tgt AS t USING dup AS d ON t.id = d.id WHEN MATCHED AND d.name = 'p' THEN UPDATE SET name = 'only p';
+SELECT * FROM tgt ORDER BY id
+MERGE tgt AS t USING dup AS d ON t.id = d.id WHEN NOT MATCHED THEN INSERT (id, name) VALUES (d.id, d.name);
+SELECT * FROM tgt ORDER BY id
+# two source rows inserting one new key
+MERGE tgt AS t USING (VALUES (50, 'a'), (50, 'b')) AS v(id, name) ON t.id = v.id WHEN NOT MATCHED THEN INSERT (id, name) VALUES (v.id, v.name);
+SELECT COUNT(*) FROM tgt WHERE id = 50
+# NULLs in the join key never match
+CREATE TABLE nk (k int, v varchar(10))
+INSERT INTO nk VALUES (1, 'one'), (NULL, 'n1')
+MERGE nk AS t USING (VALUES (1, 'x1'), (NULL, 'n2')) AS s(k, v) ON t.k = s.k WHEN MATCHED THEN UPDATE SET v = s.v WHEN NOT MATCHED THEN INSERT (k, v) VALUES (s.k, s.v);
+SELECT * FROM nk ORDER BY k, v
+DELETE FROM tgt; INSERT INTO tgt VALUES (1, 'a', 10, NULL), (2, 'b', 20, NULL), (3, 'c', 30, NULL)
+# NOT MATCHED BY SOURCE
+MERGE tgt AS t USING (VALUES (1), (2), (900)) AS s(id) ON t.id = s.id WHEN MATCHED THEN UPDATE SET note = 'kept' WHEN NOT MATCHED BY SOURCE AND t.id > 100 THEN DELETE WHEN NOT MATCHED BY SOURCE THEN UPDATE SET note = 'orphan' WHEN NOT MATCHED BY TARGET THEN INSERT (id, name) VALUES (s.id + 1000, 'new');
+SELECT * FROM tgt ORDER BY id
+DELETE FROM tgt; INSERT INTO tgt VALUES (1, 'a', 10, NULL), (2, 'b', 20, NULL), (3, 'c', 30, NULL)
+# OUTPUT with $action, inserted and deleted
+MERGE tgt AS t USING (VALUES (1, 'R1'), (60, 'R60')) AS s(id, name) ON t.id = s.id WHEN MATCHED THEN UPDATE SET name = s.name WHEN NOT MATCHED THEN INSERT (id, name) VALUES (s.id, s.name) OUTPUT $action, inserted.id, deleted.id, inserted.name, deleted.name, s.name;
+MERGE tgt AS t USING (VALUES (1), (61)) AS s(id) ON t.id = s.id WHEN MATCHED THEN DELETE WHEN NOT MATCHED THEN INSERT (id, name) VALUES (s.id, 'ret') OUTPUT $action AS act, inserted.*, deleted.*;
+MERGE tgt AS t USING (VALUES (2)) AS s(id) ON t.id = s.id WHEN MATCHED THEN DELETE WHEN NOT MATCHED BY SOURCE AND t.id = 1 THEN UPDATE SET note = 'bysrc' OUTPUT $action, deleted.id, inserted.id, s.id, deleted.note, inserted.note;
+SET NOCOUNT ON; MERGE tgt AS t USING (VALUES (3)) AS s(id) ON t.id = s.id WHEN MATCHED THEN UPDATE SET note = 'nocount' OUTPUT inserted.id; SET NOCOUNT OFF
+DELETE FROM tgt; INSERT INTO tgt VALUES (1, 'a', 10, NULL), (2, 'b', 20, NULL), (3, 'c', 30, NULL)
+# TOP
+MERGE TOP (1) tgt AS t USING (VALUES (3), (4)) AS s(id) ON t.id = s.id WHEN MATCHED THEN UPDATE SET note = 'top';
+MERGE TOP (1) tgt AS t USING (VALUES (2000), (2001)) AS s(id) ON t.id = s.id WHEN NOT MATCHED THEN INSERT (id) VALUES (s.id);
+SELECT COUNT(*) FROM tgt WHERE note = 'top' OR id IN (2000, 2001)
+DELETE FROM tgt; INSERT INTO tgt VALUES (1, 'a', 10, NULL), (2, 'b', 20, NULL), (3, 'c', 30, NULL)
+# identity, IDENTITY_INSERT, DEFAULT in SET
+CREATE TABLE idt (id int IDENTITY(1, 1) PRIMARY KEY, v varchar(10))
+MERGE idt AS t USING (VALUES ('a'), ('b'), ('c')) AS s(v) ON 1 = 0 WHEN NOT MATCHED THEN INSERT (v) VALUES (s.v);
+SELECT * FROM idt ORDER BY id
+MERGE idt AS t USING (VALUES (9, 'z')) AS s(id, v) ON t.id = s.id WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v);
+SET IDENTITY_INSERT idt ON; MERGE idt AS t USING (VALUES (9, 'z')) AS s(id, v) ON t.id = s.id WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v); SET IDENTITY_INSERT idt OFF; INSERT INTO idt (v) VALUES ('after'); SELECT * FROM idt ORDER BY id
+MERGE idt AS t USING (VALUES (1, 'A')) AS s(id, v) ON t.id = s.id WHEN MATCHED THEN UPDATE SET id = 5;
+MERGE idt AS t USING (VALUES (1)) AS s(id) ON t.id = s.id WHEN NOT MATCHED THEN INSERT DEFAULT VALUES;
+MERGE idt AS t USING (VALUES (77)) AS s(id) ON t.id = s.id WHEN NOT MATCHED THEN INSERT DEFAULT VALUES; SELECT COUNT(*) FROM idt
+MERGE tgt AS t USING (VALUES (1, 5)) AS s(id, n) ON t.id = s.id WHEN MATCHED THEN UPDATE SET qty = DEFAULT, note = DEFAULT;
+SELECT * FROM tgt WHERE id = 1
+# a table without a key
+CREATE TABLE kl (a int, b varchar(10))
+INSERT INTO kl VALUES (1, 'x'), (1, 'x'), (2, 'y')
+MERGE kl USING (VALUES (1), (3)) AS v(a) ON kl.a = v.a WHEN MATCHED THEN UPDATE SET b = 'hit' WHEN NOT MATCHED THEN INSERT (a, b) VALUES (v.a, 'new');
+MERGE kl USING (VALUES (2)) AS v(a) ON kl.a = v.a WHEN MATCHED THEN DELETE;
+SELECT * FROM kl ORDER BY a, b
+DELETE FROM tgt; INSERT INTO tgt VALUES (1, 'a', 10, NULL), (2, 'b', 20, NULL), (3, 'c', 30, NULL)
+# the statement fails as a whole
+MERGE tgt AS t USING (VALUES (1, 'ok'), (1000, 'bad')) AS s(id, name) ON t.id = s.id WHEN MATCHED THEN UPDATE SET name = s.name WHEN NOT MATCHED THEN INSERT (id, name, qty) VALUES (s.id, s.name, NULL);
+SELECT name FROM tgt WHERE id = 1
+MERGE tgt AS t USING (VALUES (1, 'ok')) AS s(id, name) ON t.id = s.id WHEN MATCHED THEN UPDATE SET id = 2;
+CREATE TABLE par (id int PRIMARY KEY)
+INSERT INTO par VALUES (1), (2)
+CREATE TABLE kid (id int PRIMARY KEY, p int REFERENCES par, n int CHECK (n > 0))
+MERGE kid AS k USING (VALUES (1, 1, 5), (2, 2, 6)) AS s(id, p, n) ON k.id = s.id WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.p, s.n);
+MERGE kid AS k USING (VALUES (3, 9, 5)) AS s(id, p, n) ON k.id = s.id WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.p, s.n);
+MERGE kid AS k USING (VALUES (3, 1, 0)) AS s(id, p, n) ON k.id = s.id WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.p, s.n);
+MERGE par AS t USING (VALUES (1)) AS s(id) ON t.id = s.id WHEN MATCHED THEN DELETE;
+# in a transaction: rolled back, committed
+BEGIN TRAN; MERGE tgt AS t USING (VALUES (1)) AS s(id) ON t.id = s.id WHEN MATCHED THEN UPDATE SET name = 'in tx'; SELECT name FROM tgt WHERE id = 1; ROLLBACK; SELECT name FROM tgt WHERE id = 1
+BEGIN TRAN; MERGE tgt AS t USING (VALUES (1)) AS s(id) ON t.id = s.id WHEN MATCHED THEN UPDATE SET name = 'committed'; COMMIT; SELECT name FROM tgt WHERE id = 1
+BEGIN TRAN; MERGE tgt AS t USING dup AS d ON t.id = d.id WHEN MATCHED THEN UPDATE SET name = 'x'; SELECT @@TRANCOUNT; ROLLBACK
+BEGIN TRY MERGE tgt AS t USING dup AS d ON t.id = d.id WHEN MATCHED THEN UPDATE SET name = 'x'; END TRY BEGIN CATCH SELECT ERROR_NUMBER() AS n; END CATCH
+# the target alias used by the target's own columns; the same table as source; a CTE as the source
+WITH w AS (SELECT 4 AS id, 'cte' AS name) MERGE tgt AS t USING w ON t.id = w.id WHEN MATCHED THEN UPDATE SET name = w.name WHEN NOT MATCHED THEN INSERT (id, name) VALUES (w.id, w.name);
+SELECT * FROM tgt WHERE id = 4
+MERGE tgt AS t USING tgt AS s ON t.id = s.id + 1 WHEN MATCHED THEN UPDATE SET note = s.name;
+SELECT id, note FROM tgt WHERE id <= 4 ORDER BY id
+# errors
+MERGE nope AS t USING src AS s ON t.id = s.id WHEN MATCHED THEN DELETE;
+MERGE tgt AS t USING nope AS s ON t.id = s.id WHEN MATCHED THEN DELETE;
+MERGE tgt AS t USING src AS s ON t.id = s.id WHEN MATCHED THEN UPDATE SET nope = 1;
+MERGE tgt AS t USING src AS s ON t.nope = s.id WHEN MATCHED THEN DELETE;
+MERGE tgt AS t USING src AS s ON t.id = s.id WHEN MATCHED THEN DO NOTHING;
+MERGE tgt AS t USING src AS s ON t.id = s.id WHEN MATCHED THEN INSERT (id) VALUES (1);
+MERGE tgt AS t USING src AS s ON t.id = s.id WHEN NOT MATCHED THEN DELETE;
+MERGE tgt AS t USING src AS s ON t.id = s.id;
+MERGE tgt AS t USING src AS s ON t.id = s.id WHEN NOT MATCHED THEN INSERT (id, name) VALUES (s.id);
+# more of the one-row rule, and SQL Server's rules for the clauses
+DELETE FROM tgt; INSERT INTO tgt VALUES (1, 'a', 10, NULL), (2, 'b', 20, NULL), (3, 'c', 30, NULL)
+CREATE TABLE s2 (id int, k int)
+INSERT INTO s2 VALUES (1, 1), (1, 2), (2, 1), (2, 2)
+MERGE tgt AS t USING s2 ON t.id = s2.id WHEN MATCHED AND s2.k = 1 THEN DELETE WHEN MATCHED THEN UPDATE SET qty = 0;
+MERGE tgt AS t USING s2 ON t.id = s2.id WHEN MATCHED AND s2.k = 1 THEN UPDATE SET qty = 0 WHEN MATCHED THEN DELETE;
+MERGE tgt AS t USING s2 ON t.id = s2.id WHEN MATCHED AND s2.k = 2 THEN UPDATE SET qty = 7;
+MERGE tgt AS t USING s2 ON t.id = s2.id WHEN MATCHED THEN DELETE OUTPUT deleted.id, deleted.qty;
+SELECT * FROM tgt ORDER BY id
+MERGE tgt AS t USING s2 ON t.id = s2.id WHEN NOT MATCHED BY SOURCE THEN INSERT (id) VALUES (1);
+MERGE tgt AS t USING s2 ON t.id = s2.id WHEN NOT MATCHED BY TARGET THEN UPDATE SET qty = 1;
+MERGE tgt AS t USING s2 ON t.id = s2.id WHEN MATCHED THEN UPDATE SET qty = 1 WHEN MATCHED THEN UPDATE SET qty = 2;
+MERGE tgt AS t USING s2 ON t.id = s2.id WHEN MATCHED THEN DELETE WHEN MATCHED AND t.id = 1 THEN UPDATE SET qty = 2;
+MERGE tgt AS t USING s2 ON t.id = s2.id WHEN MATCHED AND t.id = 1 THEN DELETE WHEN MATCHED AND t.id = 2 THEN DELETE;
+MERGE tgt AS t USING s2 ON t.id = s2.id WHEN NOT MATCHED BY SOURCE THEN DELETE WHEN NOT MATCHED BY SOURCE AND t.id = 1 THEN DELETE;
+MERGE tgt AS t USING s2 ON t.id = s2.id WHEN NOT MATCHED THEN INSERT (id, qty) VALUES (s2.id);
+MERGE tgt AS t USING s2 ON t.id = s2.id WHEN NOT MATCHED THEN INSERT (id) VALUES (s2.id, 5);
+MERGE tgt AS t USING s2 ON t.id = s2.id WHEN NOT MATCHED THEN INSERT VALUES (s2.id);
+MERGE tgt AS t USING s2 ON t.id = s2.id WHEN NOT MATCHED THEN INSERT (id, qty) VALUES (s2.id + 100, DEFAULT)
+MERGE tgt AS t USING s2 ON t.id = s2.id WHEN NOT MATCHED THEN INSERT (id, qty) VALUES (s2.id + 100, DEFAULT); SELECT 1
+# table hints, schema-qualified and bracketed names, a qualified SET column, variables, OUTPUT expressions
+DELETE FROM tgt; INSERT INTO tgt VALUES (1, 'a', 10, NULL), (2, 'b', 20, NULL), (3, 'c', 30, NULL)
+MERGE tgt WITH (HOLDLOCK) AS t USING src AS s ON t.id = s.id WHEN MATCHED THEN UPDATE SET note = 'hl';
+MERGE dbo.tgt t USING dbo.src s ON t.id = s.id WHEN MATCHED THEN UPDATE SET note = 'dbo';
+MERGE [tgt] AS [t] USING [src] AS [s] ON [t].[id] = [s].[id] WHEN MATCHED THEN UPDATE SET [note] = 'br';
+MERGE tgt AS t USING src AS s ON t.id = s.id WHEN MATCHED THEN UPDATE SET t.note = 'qual';
+DECLARE @n int = 3; MERGE tgt AS t USING (SELECT @n AS id) AS s ON t.id = s.id WHEN MATCHED THEN UPDATE SET note = 'var' + CAST(@n AS varchar(5));
+SELECT id, note FROM tgt ORDER BY id
+MERGE tgt AS t USING src AS s ON t.id = s.id WHEN MATCHED THEN UPDATE SET qty = t.qty + 1 OUTPUT inserted.qty - deleted.qty AS diff, $action, UPPER(inserted.name) AS up;
+MERGE tgt AS t USING src AS s ON t.id = s.id WHEN MATCHED THEN DELETE OUTPUT deleted.*;

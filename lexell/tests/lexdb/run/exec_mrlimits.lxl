@@ -1,0 +1,97 @@
+// lexdb_exec: MATCH_RECOGNIZE's limits (design/lexdb-match-recognize.md 4.1, 6): the memo makes a
+// catastrophic pattern fast where every DEFINE reads only its own row; a history-dependent DEFINE
+// has max_match_steps (54001), statement_timeout (57014) and max_statement_mem (53200); SET, SHOW
+// and RESET of max_match_steps; ALL ROWS PER MATCH over 100,000 rows in one match takes linear time;
+// a long search lets other sessions take their turns.
+// expect: show: 10000000
+// expect: set: 100
+// expect: reset: 10000000
+// expect: local catastrophic: 0
+// expect: dependent catastrophic: 54001 MATCH_RECOGNIZE: the search from one row took more than max_match_steps (20000) steps; SET max_match_steps = n to allow more, 0 for no limit
+// expect: dependent, no limit, timeout: 57014
+// expect: dependent, a short one: 1
+// expect: memory: 53200
+// expect: linear all rows: 100000|5000050000|100000
+// expect: linear one row: 1|100000
+// expect: order: short, long
+import "strings"
+import "task"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+
+type Arg = record { st: lexdb_store.Store; which: int }
+
+fn one(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if len(r.rows) == 0 { return r.tag }
+            var cells: []str = []
+            for v in r.rows[0] { append(mut &cells, lexdb_exec.text(&v)) }
+            return strings.join(&cells, "|")
+        }
+        Err(e) { return e.state + " " + e.msg }
+    }
+}
+
+fn order(a: Arg): int {
+    var s = lexdb_exec.newSession(a.st)
+    if a.which == 0 {
+        let n = one(mut &s, &"select count(*) from d match_recognize (order by id measures count(*) as c pattern (a+) define a as v >= first(a.v) - 1)")
+        let m = one(mut &s, &"insert into log values ((select count(*) from log), 'long')")
+    } else {
+        for i in 0..20 { let r = one(mut &s, &("select v from d where id = " + (i * 7).toStr())) }
+        let m = one(mut &s, &"insert into log values ((select count(*) from log), 'short')")
+    }
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(48), lexdb_store.Options{cacheBytes: 128 * 1024 * 1024, segBytes: 4 * 1024 * 1024, ckptBytes: 2 * 1024 * 1024, snapNodes: 50000}, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        println("show: " + one(mut &s, &"show max_match_steps"))
+        let a = one(mut &s, &"set max_match_steps = 100")
+        println("set: " + one(mut &s, &"show max_match_steps"))
+        let b = one(mut &s, &"reset max_match_steps")
+        println("reset: " + one(mut &s, &"show max_match_steps"))
+        let c1 = one(mut &s, &"create table r (id int primary key, v int)")
+        var vals: []str = []
+        for j in 1..41 { append(mut &vals, "(" + j.toStr() + ", " + j.toStr() + ")") }
+        let c2 = one(mut &s, &("insert into r values " + strings.join(&vals, ", ")))
+        println("local catastrophic: " + one(mut &s, &"select count(*) from r match_recognize (order by id measures count(*) as c pattern ((a | a)+ b) define a as true, b as false)"))
+        let s1 = one(mut &s, &"set max_match_steps = 20000")
+        println("dependent catastrophic: " + one(mut &s, &"select count(*) from r match_recognize (order by id measures count(*) as c pattern ((a | a)+ b) define a as true, b as sum(a.v) < 0)"))
+        let s2 = one(mut &s, &"set max_match_steps = 0")
+        let s3 = one(mut &s, &"set statement_timeout = 300")
+        println("dependent, no limit, timeout: " + one(mut &s, &"select count(*) from r match_recognize (order by id measures count(*) as c pattern ((a | a)+ b) define a as true, b as sum(a.v) < 0)")[0..5])
+        let s4 = one(mut &s, &"reset statement_timeout")
+        let s5 = one(mut &s, &"reset max_match_steps")
+        println("dependent, a short one: " + one(mut &s, &"select count(*) from r match_recognize (order by id measures count(*) as c pattern (a b+) define b as v > a.v and v < 6)"))
+        // memory
+        let c3 = one(mut &s, &"create table d (id int primary key, v int)")
+        var i = 0
+        while i < 100000 {
+            var vs: []str = []
+            for j in i..i + 1000 { append(mut &vs, "(" + j.toStr() + ", 1)") }
+            let ins = one(mut &s, &("insert into d values " + strings.join(&vs, ", ")))
+            i += 1000
+        }
+        let m1 = one(mut &s, &"set max_statement_mem = 1024")
+        println("memory: " + one(mut &s, &"select count(*) from d match_recognize (order by id measures count(*) as c pattern (a+) define a as true)")[0..5])
+        let m2 = one(mut &s, &"reset max_statement_mem")
+        // 100,000 rows in one match: ALL ROWS with running and final measures, in linear time
+        println("linear all rows: " + one(mut &s, &"select count(*), sum(rs), min(fc) from d match_recognize (order by id measures running sum(v) as rs, final count(*) as fc all rows per match pattern (a+) define a as true)"))
+        println("linear one row: " + one(mut &s, &"select count(*), max(c) from d match_recognize (order by id measures count(*) as c, last(v) as lv pattern (a+) define a as v = 1)"))
+        // turns: a long search, and short queries of another session
+        let c4 = one(mut &s, &"create table log (id int primary key, who text)")
+        let del = one(mut &s, &"delete from d where id >= 6000")
+        task.scope(fn(sc: mut &task.Scope) {
+            sc.spawn(order, Arg{st: st, which: 0})
+            sc.spawn(order, Arg{st: st, which: 1})
+        })
+        println("order: " + one(mut &s, &"select who from log where id = 0") + ", " + one(mut &s, &"select who from log where id = 1"))
+        return 0
+    }).unwrap()
+}

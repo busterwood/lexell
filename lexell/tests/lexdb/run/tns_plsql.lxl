@@ -1,0 +1,183 @@
+// lexdb_tns, PL/SQL (design/lexdb-oracle.md, stage O6), through lib/oracle: anonymous blocks with OUT and IN OUT binds,
+// control flow, exceptions with their ORA- numbers, SELECT INTO, cursor loops, EXECUTE IMMEDIATE, DBMS_OUTPUT read back by
+// GET_LINE, stored procedures and functions (CREATE OR REPLACE, called by a block and by CALL), REF CURSOR OUT values and implicit
+// results (DBMS_SQL.RETURN_RESULT). The expected answers are those Oracle Database Free gives
+// (tests/lexdb/oracledb_o6.py records and checks the same against python-oracledb).
+// expect: arith: 7 'ab5' 3.5
+// expect: if: 'mid' 'big' 'small'
+// expect: loops: 5 12 10 '321'
+// expect: in out: 42 'abz'
+// expect: select into: 'two' 202
+// expect: no data found: error 1403
+// expect: handled: 'many' -1422 'ORA-01422: exact fetch returned more than the requested number of rows '
+// expect: raise_application_error: error 20001
+// expect: block undone: 1
+// expect: cursor loop: 't2o1' 6
+// expect: execute immediate: 'five' 42
+// expect: dbms_output: 'hello'|'ab'|'1.5x'|'42'
+// expect: procedure: 10 'hey!'
+// expect: function: 30 132
+// expect: wrong arguments: error 6550
+// expect: unknown procedure: error 6550
+// expect: call: 2 40
+// expect: ref cursor: 2 rows: 1 'one', 2 'two'
+// expect: ref cursor out of a procedure: 1 rows: 2 'two'
+// expect: implicit results: 2 sets: 1 2 | 'two' 'one'
+// expect: unhandled: error 20002
+// expect: returned without value: error 6503
+import "task"
+import "net"
+import "strings"
+import "time"
+import "oracle"
+import "sqldialect"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_tns"
+
+fn connect(s: &str): oracle.Conn {
+    match oracle.connect(&(s.toStr())) {
+        Ok(c) { return c }
+        Err(e) {
+            println("connect: error " + e.code.toStr() + " " + e.msg)
+            exit(1)
+        }
+    }
+}
+
+fn text(r: &oracle.Rows, row: int, col: int): str {
+    match r.isNull(row, col) {
+        Ok(n) {
+            if n { return "NULL" }
+        }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+    match r.value(row, col) {
+        Ok(v) { return v.toStr() }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+fn row(r: &oracle.Rows, row: int): str {
+    var out: []str = []
+    for i in 0..r.columnCount() { append(mut &out, text(r, row, i)) }
+    return strings.join(&out, " ")
+}
+
+fn rowsOf(r: &oracle.Rows): str {
+    var out: []str = []
+    for i in 0..r.rowCount() { append(mut &out, row(r, i)) }
+    return strings.join(&out, ", ")
+}
+
+fn outs(c: mut &oracle.Conn, sql: str, args: &[sqldialect.Value], os: &[oracle.Out]): oracle.Results {
+    match c.call(&sql, args, os) {
+        Ok(r) { return r }
+        Err(e) {
+            println("call: error " + e.code.toStr() + " " + e.msg + " for " + sql)
+            exit(1)
+        }
+    }
+}
+
+fn failure(c: mut &oracle.Conn, sql: str, args: &[sqldialect.Value], os: &[oracle.Out]): str {
+    match c.call(&sql, args, os) {
+        Ok(_) { return "ok" }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+fn client(port: &str) {
+    var c = connect(&("User Id=sa;Password=sa;Data Source=127.0.0.1:" + port + "/lexdb"))
+    let none: []sqldialect.Value = []
+    let r1 = outs(mut &c, "begin :r := 1 + 2 * 3; :s := 'a' || 'b' || 5; :f := 7 / 2; end;", &none,
+                  &[oracle.out("r", "NUMBER"), oracle.out("s", "VARCHAR2(40)"), oracle.out("f", "NUMBER")])
+    println("arith: " + row(&r1.outputs, 0))
+    var xs: []str = []
+    for x in [7, 70, 1] {
+        let r = outs(mut &c, "begin if :x > 10 then :r := 'big'; elsif :x > 5 then :r := 'mid'; else :r := 'small'; end if; end;",
+                     &[sqldialect.Value.Int(x)], &[oracle.out("r", "VARCHAR2(10)")])
+        append(mut &xs, text(&r.outputs, 0, 0))
+    }
+    println("if: " + strings.join(&xs, " "))
+    let r2 = outs(mut &c, "declare i number := 0; j number := 0; s number := 0; t varchar2(20); begin loop i := i + 1; exit when i >= 5; end loop; :a := i; " +
+                  "while j < 10 loop j := j + 3; end loop; :b := j; for k in 1..4 loop s := s + k; end loop; :c := s; " +
+                  "for k in reverse 1..3 loop t := t || k; end loop; :d := t; end;", &none,
+                  &[oracle.out("a", "NUMBER"), oracle.out("b", "NUMBER"), oracle.out("c", "NUMBER"), oracle.out("d", "VARCHAR2(20)")])
+    println("loops: " + row(&r2.outputs, 0))
+    let r3 = outs(mut &c, "begin :x := :x * 2; :y := :y || 'z'; end;", &none,
+                  &[oracle.inOut("x", "NUMBER", oracle.Param.Of(sqldialect.Value.Int(21))), oracle.inOut("y", "VARCHAR2(20)", oracle.Param.Of(sqldialect.Value.Text("ab")))])
+    println("in out: " + row(&r3.outputs, 0))
+    c.exec("create table pt (a number, b varchar2(20))").unwrap()
+    c.exec("insert into pt values (1, 'one')").unwrap()
+    c.exec("insert into pt values (2, 'two')").unwrap()
+    let r4 = outs(mut &c, "declare s varchar2(20); n number; m number; begin select b into s from pt where a = :x; :r := s; select count(*), max(a) into n, m from pt; :c := n * 100 + m; end;",
+                  &[sqldialect.Value.Int(2)], &[oracle.out("r", "VARCHAR2(20)"), oracle.out("c", "NUMBER")])
+    println("select into: " + row(&r4.outputs, 0))
+    println("no data found: " + failure(mut &c, "declare s varchar2(20); begin select b into s from pt where a = 99; end;", &none, &[]))
+    let r5 = outs(mut &c, "declare s varchar2(20); begin begin select b into s from pt; exception when too_many_rows then :r := 'many'; :c := sqlcode; :e := sqlerrm; end; end;", &none,
+                  &[oracle.out("r", "VARCHAR2(20)"), oracle.out("c", "NUMBER"), oracle.out("e", "VARCHAR2(100)")])
+    println("handled: " + row(&r5.outputs, 0))
+    println("raise_application_error: " + failure(mut &c, "begin raise_application_error(-20001, 'boom'); end;", &none, &[]))
+    c.exec("create table pu (a number primary key)").unwrap()
+    c.exec("insert into pu values (100)").unwrap()
+    let f2 = failure(mut &c, "begin insert into pu values (1); insert into pu values (2); raise_application_error(-20001, 'x'); end;", &none, &[])
+    println("block undone: " + rowsOf(&c.query("select count(*) from pu", &none).unwrap()))
+    let r6 = outs(mut &c, "declare t varchar2(20); n number := 0; begin for r in (select a, b from pt order by a desc) loop t := t || substr(r.b, 1, 1) || r.a; end loop; " +
+                  "for r in (select a from pt) loop n := n + r.a * 2; end loop; :r := t; :n := n; end;", &none, &[oracle.out("r", "VARCHAR2(20)"), oracle.out("n", "NUMBER")])
+    println("cursor loop: " + row(&r6.outputs, 0))
+    let r7 = outs(mut &c, "declare s varchar2(20); n number; begin execute immediate 'insert into pt values (:1, :2)' using 5, 'five'; " +
+                  "execute immediate 'select b from pt where a = :x' into s using 5; :r := s; n := 3; execute immediate 'begin :1 := :2 * 2; end;' using out n, 21; :n := n; end;", &none,
+                  &[oracle.out("r", "VARCHAR2(20)"), oracle.out("n", "NUMBER")])
+    println("execute immediate: " + row(&r7.outputs, 0))
+    let r8 = outs(mut &c, "begin dbms_output.enable(null); dbms_output.put_line('hello'); dbms_output.put('a'); dbms_output.put('b'); dbms_output.new_line; dbms_output.put_line(1.5 || 'x'); dbms_output.put_line(42); end;", &none, &[])
+    var lines: []str = []
+    for k in 0..5 {
+        let g = outs(mut &c, "begin dbms_output.get_line(:l, :s); end;", &none, &[oracle.out("l", "VARCHAR2(100)"), oracle.out("s", "NUMBER")])
+        if text(&g.outputs, 0, 1) == "0" { append(mut &lines, text(&g.outputs, 0, 0)) }
+    }
+    println("dbms_output: " + strings.join(&lines, "|"))
+    outs(mut &c, "create or replace procedure p1(x in number, y out number, z in out varchar2) is begin y := x * 2; z := z || '!'; end;", &none, &[])
+    let r9 = outs(mut &c, "begin p1(:x, :y, :z); end;", &[sqldialect.Value.Int(5)], &[oracle.out("y", "NUMBER"), oracle.inOut("z", "VARCHAR2(20)", oracle.Param.Of(sqldialect.Value.Text("hey")))])
+    println("procedure: " + row(&r9.outputs, 0))
+    outs(mut &c, "create or replace function f1(a number, b number default 10) return number is begin return a * b; end;", &none, &[])
+    outs(mut &c, "create or replace function f2(n number) return number is begin if n <= 1 then return 1; end if; return n * f2(n - 1); end;", &none, &[])
+    let r10 = outs(mut &c, "begin :r := f1(3); :q := f1(3, 4) + f2(5); end;", &none, &[oracle.out("r", "NUMBER"), oracle.out("q", "NUMBER")])
+    println("function: " + row(&r10.outputs, 0))
+    println("wrong arguments: " + failure(mut &c, "begin p1(1); end;", &none, &[]))
+    println("unknown procedure: " + failure(mut &c, "begin p9(1); end;", &none, &[]))
+    outs(mut &c, "create or replace procedure p2(x number, y out number) is begin y := x + 1; end;", &none, &[])
+    let r11 = outs(mut &c, "call p2(1, :y)", &none, &[oracle.out("y", "NUMBER")])
+    let r12 = outs(mut &c, "call f1(4) into :r", &none, &[oracle.out("r", "NUMBER")])
+    println("call: " + row(&r11.outputs, 0) + " " + row(&r12.outputs, 0))
+    let r13 = outs(mut &c, "begin open :rc for select a, b from pt where a < 3 order by a; end;", &none, &[oracle.out("rc", "SYS_REFCURSOR")])
+    println("ref cursor: " + r13.sets[0].rowCount().toStr() + " rows: " + rowsOf(&r13.sets[0]))
+    outs(mut &c, "create or replace procedure p3(n number, rc out sys_refcursor) is begin open rc for select a, b from pt where a = n; end;", &none, &[])
+    let r14 = outs(mut &c, "begin p3(2, :rc); end;", &none, &[oracle.out("rc", "SYS_REFCURSOR")])
+    println("ref cursor out of a procedure: " + r14.sets[0].rowCount().toStr() + " rows: " + rowsOf(&r14.sets[0]))
+    let r15 = outs(mut &c, "declare c1 sys_refcursor; c2 sys_refcursor; begin open c1 for select a from pt where a < 3 order by a; dbms_sql.return_result(c1); " +
+                   "open c2 for select b from pt where a < 3 order by b desc; dbms_sql.return_result(c2); end;", &none, &[])
+    println("implicit results: " + len(r15.sets).toStr() + " sets: " + strings.replaceAll(&(rowsOf(&r15.sets[0])), ", ", " ") + " | " + strings.replaceAll(&(rowsOf(&r15.sets[1])), ", ", " "))
+    outs(mut &c, "create or replace procedure p4(n number) is begin if n = 0 then raise_application_error(-20002, 'zero!'); end if; end;", &none, &[])
+    println("unhandled: " + failure(mut &c, "begin p4(0); end;", &none, &[]))
+    outs(mut &c, "create or replace function f3(a number) return number is begin null; end;", &none, &[])
+    println("returned without value: " + failure(mut &c, "begin :r := f3(1); end;", &none, &[oracle.out("r", "NUMBER")]))
+    c.logoff()
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        let f = s.start(lexdb_tns.acceptLoop, lexdb_tns.AcceptArg{ln: ln, st: st})
+        client(&addr[10..len(addr)])
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(5), lexdb_store.Options{cacheBytes: 128 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, body).unwrap()
+}

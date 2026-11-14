@@ -1,11 +1,13 @@
 // lexdb: files, real and simulated (design/lexdb.md 4.1 and stage D0).
 //
-// A Fs is a directory of files. The real one opens files with O_DIRECT
-// (or through the page cache: openBuffered) and
+// A Fs is a directory of files. The real one opens the log segments with
+// O_DIRECT (open) and the page file and the small marker files through the
+// page cache (openBuffered; since design/lexdb.md 9.125) and
 // does its reads, writes and flushes with fs.preadDirect (fs.pread), pwrite and fdatasync,
 // which park the task: through io_uring when the runtime has a ring
 // (the native backend unless LXL_URING=0), else on the helper pool. Offsets and lengths are multiples of 4 KiB, and
-// the bytes go through a 4 KiB-aligned C buffer, as O_DIRECT requires.
+// the bytes go through a 4 KiB-aligned C buffer, as O_DIRECT requires (and
+// the buffered files keep the same shape, except readText and writeText).
 //
 // The simulated one keeps each file in memory twice: what reads see, and
 // what a crash would leave (the state at the last flush). Writes since the
@@ -68,14 +70,21 @@ pub type SimFs = record {
     pub flushes: int
     failAt: int                     // the I/O call that fails (EIO), or -1
     ios: int
+    space: int                      // the most bytes all files together may hold (ENOSPC past it), or -1
     hold: str                       // flushes of files whose names start with it wait ("" none)
 }
+
+// --unsafe-no-sync (design/lexdb.md 9.123): fdatasync and fsync are skipped, data is still written.
+// Set once at start, before any worker process is made (a worker is a fork, so it keeps it).
+var NO_SYNC: bool = false
+pub fn setNoSync(on: bool) { NO_SYNC = on }
+pub fn noSync(): bool { return NO_SYNC }
 
 pub fn real(dir: str): Fs { return Fs.Real(dir) }
 
 pub fn sim(seed: int): Fs {
     return Fs.Sim(task.shared(SimFs{files: [], rng: lexdb_base.rng(seed), writes: 0, flushes: 0,
-                                     failAt: -1, ios: 0, hold: ""}))
+                                     failAt: -1, ios: 0, space: -1, hold: ""}))
 }
 
 fn alignedCheck(off: int, n: int, op: str): Result[Unit, lexdb_base.DbErr] {
@@ -97,7 +106,7 @@ fn simFind(st: &SimFs, name: &str): int {
 // Opens a file, creating it (empty) when create is true and it does not exist.
 pub fn (f: &Fs) open(name: str, create: bool): Result[File, lexdb_base.DbErr] { return f.openWith(name, create, true) }
 
-// open, through the kernel's page cache: reads of pages it holds are copies
+// open, through the kernel's page cache (the page file, always: 9.125): reads of pages it holds are copies
 // from memory every process shares, and writes stay there too until
 // evicted. Offsets and lengths are still whole pages. A simulated file is
 // the same either way.
@@ -139,6 +148,25 @@ pub fn (f: &Fs) exists(name: str): bool {
             return found
         }
     }
+}
+
+// The names in the directory (the live files of a simulated one); none when it does not exist.
+pub fn (f: &Fs) names(): []str {
+    var out: []str = []
+    match f {
+        Fs.Real(dir) {
+            match fs.listNames(dir) {
+                Ok(ns) { for n in ns { if n != "." && n != ".." { append(mut &out, n) } } }
+                Err(_) {}
+            }
+        }
+        Fs.Sim(sh) {
+            sh.with(fn(st: mut &SimFs) {
+                for x in st.files { if x.live { append(mut &out, x.name) } }
+            })
+        }
+    }
+    return out
 }
 
 pub fn (f: &Fs) remove(name: str): Result[Unit, lexdb_base.DbErr] {
@@ -187,10 +215,33 @@ pub fn (f: &Fs) rename(from: str, to: str): Result[Unit, lexdb_base.DbErr] {
     }
 }
 
+// Makes the directory when it does not exist (a log directory for a new database); the simulation's has none to make.
+pub fn (f: &Fs) ensureDir(): Result[Unit, lexdb_base.DbErr] {
+    match f {
+        Fs.Real(dir) {
+            match fs.mkdirAll(dir) {
+                Ok(_) {}
+                Err(e) { return Err(lexdb_base.ioErr("mkdir " + dir, e.errno)) }
+            }
+            return Ok(Unit{})
+        }
+        Fs.Sim(_) { return Ok(Unit{}) }
+    }
+}
+
+// The directory's name, for messages ("(simulated)" for the simulation).
+pub fn (f: &Fs) where(): str {
+    match f {
+        Fs.Real(dir) { return dir }
+        Fs.Sim(_) { return "(simulated)" }
+    }
+}
+
 // Makes the directory's entries durable (after a create, rename or remove).
 pub fn (f: &Fs) syncDir(): Result[Unit, lexdb_base.DbErr] {
     match f {
         Fs.Real(dir) {
+            if NO_SYNC { return Ok(Unit{}) }
             let fd = openFile(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0)
             if fd < 0 { return Err(lexdb_base.ioErr("open " + dir, errno())) }
             let r = fs.fsync(int(fd))
@@ -234,7 +285,7 @@ pub fn (f: &Fs) crash(seed: int): Fs {
         }
     }
     return Fs.Sim(task.shared(SimFs{files: files, rng: lexdb_base.rng(seed + 1), writes: 0, flushes: 0,
-                                     failAt: -1, ios: 0, hold: ""}))
+                                     failAt: -1, ios: 0, space: -1, hold: ""}))
 }
 
 // Makes the n-th I/O call from now (0: the next) fail with EIO, for the tests.
@@ -243,6 +294,25 @@ pub fn (f: &Fs) failIn(n: int) {
         Fs.Real(_) {}
         Fs.Sim(sh) { sh.with(fn(st: mut &SimFs) { st.failAt = st.ios + n }) }
     }
+}
+
+// Limits the simulated disk to n bytes in all (the files' sizes added): a write or grow that would pass it
+// fails with errno 28 (ENOSPC), as a full file system does, until the limit is raised; -1 lifts it. For the tests.
+pub fn (f: &Fs) limitSpace(n: int) {
+    match f {
+        Fs.Real(_) {}
+        Fs.Sim(sh) { sh.with(fn(st: mut &SimFs) { st.space = n }) }
+    }
+}
+
+// The bytes of every live simulated file.
+pub fn (f: &Fs) usedSpace(): int {
+    var n = 0
+    match f {
+        Fs.Real(_) {}
+        Fs.Sim(sh) { sh.with(fn(st: mut &SimFs) { for x in st.files { if x.live { n += len(x.cur) } } }) }
+    }
+    return n
 }
 
 // Makes the flushes of files whose names start with prefix wait until it is
@@ -272,6 +342,14 @@ pub fn (f: &Fs) flushes(): int {
 }
 
 // ---- files
+
+// Whether file idx may be made end - its size bytes longer within the limit (limitSpace).
+fn simRoom(st: &SimFs, idx: int, end: int): bool {
+    if st.space < 0 || end <= len(st.files[idx].cur) { return true }
+    var used = 0
+    for x in st.files { if x.live { used += len(x.cur) } }
+    return used + end - len(st.files[idx].cur) <= st.space
+}
 
 fn simIo(st: mut &SimFs): bool {
     let fail = st.failAt >= 0 && st.ios == st.failAt
@@ -303,10 +381,13 @@ pub fn (f: &File) grow(n: int): Result[Unit, lexdb_base.DbErr] {
             return Ok(Unit{})
         }
         File.Sim(sh, i) {
+            var full = false
             sh.with(fn(st: mut &SimFs) {
+                if !simRoom(st, i, n) { full = true; return }
                 while len(st.files[i].cur) < n { append(mut &st.files[i].cur, byte(0)) }
                 while len(st.files[i].durable) < n { append(mut &st.files[i].durable, byte(0)) }
             })
+            if full { return Err(lexdb_base.ioErr("fallocate", 28)) }
             return Ok(Unit{})
         }
     }
@@ -411,8 +492,10 @@ pub fn (f: &File) write(off: int, src: &[byte]): Result[Unit, lexdb_base.DbErr] 
         File.Sim(sh, idx) {
             let yd = task.yield()
             var fail = false
+            var full = false
             sh.with(fn(st: mut &SimFs) {
                 fail = simIo(st)
+                if !fail && !simRoom(st, idx, off + n) { full = true; return }
                 if !fail {
                     st.writes += 1
                     while len(st.files[idx].cur) < off + n { append(mut &st.files[idx].cur, byte(0)) }
@@ -424,6 +507,7 @@ pub fn (f: &File) write(off: int, src: &[byte]): Result[Unit, lexdb_base.DbErr] 
                     append(mut &st.files[idx].pending, Pending{off: off, data: strFromBytes(&bs)})
                 }
             })
+            if full { return Err(lexdb_base.ioErr("pwrite", 28)) }
             if fail { return Err(lexdb_base.ioErr("pwrite", 5)) }
             return Ok(Unit{})
         }
@@ -453,10 +537,90 @@ pub fn (f: &File) writePages(off: int, pages: &[][]byte): Result[Unit, lexdb_bas
     }
 }
 
+// Writes text (any length) at offset 0 of a file opened with openBuffered, for
+// the small marker files. Durable only after flush.
+pub fn (f: &File) writeText(text: &str): Result[Unit, lexdb_base.DbErr] {
+    let n = len(text)
+    if n == 0 { return Ok(Unit{}) }
+    match f {
+        File.Real(fd, _) {
+            var buf = nullPtr()
+            if posix_memalign(mut &buf, PAGE, n) != 0 { panic("lexdb: out of memory (an I/O buffer)") }
+            var bs: []byte = []
+            for i in 0..n { append(mut &bs, text[i]) }
+            copyIn(buf, 0, &bs, n)
+            let put = fs.pwrite(int(fd), buf, n, 0)
+            freeMem(buf)
+            if put < 0 { return Err(lexdb_base.ioErr("pwrite", -put)) }
+            if put != n { return Err(lexdb_base.ioErr("pwrite (short)", 5)) }
+            return Ok(Unit{})
+        }
+        File.Sim(sh, idx) {
+            let yd = task.yield()
+            var fail = false
+            sh.with(fn(st: mut &SimFs) {
+                fail = simIo(st)
+                if !fail {
+                    st.writes += 1
+                    while len(st.files[idx].cur) < n { append(mut &st.files[idx].cur, byte(0)) }
+                    for i in 0..n { st.files[idx].cur[i] = text[i] }
+                    append(mut &st.files[idx].pending, Pending{off: 0, data: text.toStr()})
+                }
+            })
+            if fail { return Err(lexdb_base.ioErr("pwrite", 5)) }
+            return Ok(Unit{})
+        }
+    }
+}
+
+// The whole file as text, up to its first zero byte (a file once padded with
+// zeros to a page reads the same), of a file opened with openBuffered.
+pub fn (f: &File) readText(): Result[str, lexdb_base.DbErr] {
+    let n = try f.size()
+    if n == 0 { return Ok("") }
+    match f {
+        File.Real(fd, _) {
+            var buf = nullPtr()
+            if posix_memalign(mut &buf, PAGE, n) != 0 { panic("lexdb: out of memory (an I/O buffer)") }
+            let got = fs.pread(int(fd), buf, n, 0)
+            if got < 0 {
+                freeMem(buf)
+                return Err(lexdb_base.ioErr("pread", -got))
+            }
+            var bs = array(got, byte(0))
+            copyOut(mut &bs, buf, 0, got)
+            freeMem(buf)
+            return Ok(textUpToZero(&bs, got))
+        }
+        File.Sim(sh, idx) {
+            let yd = task.yield()
+            var bs: []byte = []
+            var fail = false
+            sh.with(fn(st: mut &SimFs) {
+                fail = simIo(st)
+                for i in 0..n { append(mut &bs, st.files[idx].cur[i]) }
+            })
+            if fail { return Err(lexdb_base.ioErr("pread", 5)) }
+            return Ok(textUpToZero(&bs, n))
+        }
+    }
+}
+
+fn textUpToZero(bs: &[byte], n: int): str {
+    var b = newStrBuf()
+    var i = 0
+    while i < n && bs[i] != 0 {
+        b.addByte(bs[i])
+        i += 1
+    }
+    return b.toStr()
+}
+
 // Makes every write before it durable (fdatasync).
 pub fn (f: &File) flush(): Result[Unit, lexdb_base.DbErr] {
     match f {
         File.Real(fd, _) {
+            if NO_SYNC { return Ok(Unit{}) }
             let r = fs.fdatasync(int(fd))
             if r != 0 { return Err(lexdb_base.ioErr("fdatasync", -r)) }
             return Ok(Unit{})

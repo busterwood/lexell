@@ -193,7 +193,7 @@ pub type Replica = record { pub st: lexdb_store.Store; c: net.Conn; ob: task.Sha
 // Connects to the master of the data directory dir (waiting up to waitMs
 // for its socket), and opens a replica store on it, ready (applied up to
 // its first checkpoint's covers batch) when this returns.
-pub fn connect(dir: str, opts: lexdb_store.Options, waitMs: int): Result[Replica, lexdb_base.DbErr] {
+pub fn connect(dir: str, logFs: Option[lexdb_disk.Fs], opts: lexdb_store.Options, waitMs: int): Result[Replica, lexdb_base.DbErr] {
     // tried again until waitMs has passed: the master may not be up yet
     let end = time.monotonicNs() + waitMs * 1000000
     var last = lexdb_base.ioErr("replication: no master", 111)
@@ -206,11 +206,16 @@ pub fn connect(dir: str, opts: lexdb_store.Options, waitMs: int): Result[Replica
         }
         if held >= 0 {
             let ob = lexdb_store.newOutbox(held)
-            let st = try lexdb_store.openReplica(lexdb_disk.real(dir), opts, lexdb_store.Link.Remote(ob))
+            let st = try match logFs {
+                Some(l) { lexdb_store.openReplicaSplit(lexdb_disk.real(dir), l, opts, lexdb_store.Link.Remote(ob)) }
+                None { lexdb_store.openReplica(lexdb_disk.real(dir), opts, lexdb_store.Link.Remote(ob)) }
+            }
             return Ok(Replica{st: st, c: pop(mut &cs), ob: ob, ckpt: held})
         }
         if time.monotonicNs() >= end { return Err(last) }
-        let z = task.sleep(100)
+        // the wait is cut short by SIGTERM or SIGINT (a supervisor stopping its workers)
+        let sig = task.within(100, fn(): Result[int, task.Cancelled] { return task.terminated() })
+        if sig.isOk() { return Err(lexdb_base.ioErr("replication: stopped while waiting for the master", 4)) }
     }
     return Err(last)
 }

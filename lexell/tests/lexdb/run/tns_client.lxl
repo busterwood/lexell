@@ -1,0 +1,263 @@
+// lexdb_tns, Oracle's protocol (design/lexdb-oracle.md, stage O1), against
+// Lexell's own Oracle client (lib/oracle over tns): CONNECT and ACCEPT, the
+// service names, Protocol and DataTypes, the two authentication phases with
+// the 12c verifier (a role's, made when its password was set; under trust a
+// user with none logs in with its name as the password), SELECT ... FROM
+// dual, every lexdb type as its Oracle type, a result that needs FETCH after
+// FETCH, DML row counts, errors by ORA- number, COMMIT and ROLLBACK, DDL that
+// commits, and LOGOFF.
+// expect: trust: connected, banner Oracle Database 23ai Free Release 23.0.0.0.0, version 23.0.0.0.0
+// expect: dual: 1 NUMBER | 1
+// expect: dual upper case: 'x' 2.5 DUAL
+// expect: create, insert: 3
+// expect: update: 2
+// expect: select: ID NUMBER, NAME VARCHAR2, AMOUNT NUMBER, AT TIMESTAMP | 1 'café' 12.50 '2026-11-11T00:00:00' | 2 NULL -3.10 NULL | 3 'naïve 😀' 0.00 '2000-01-01T00:00:00'
+// expect: types: NUMBER NUMBER NUMBER BINARY_DOUBLE BINARY_FLOAT BOOLEAN DATE TIMESTAMP TIMESTAMP WITH TIME ZONE RAW RAW INTERVAL DAY TO SECOND VARCHAR2
+// expect: values: 7 -8 123456789012345678901234567890.123 1.5 0.25 true '2026-11-11T00:00:00' '2026-11-11T10:00:00.25' '2026-11-11T10:00:00+00:00' x'00ff' x'00000000000000000000000000000001' '+000000001 00:00:00.000000000' 'text'
+// expect: nulls: 13 NULL
+// expect: fetch: 1000 rows, first 1, last 1000, sum 500500
+// expect: fetch size 7: 1000 rows, sum 500500
+// expect: no rows: 0
+// expect: wide rows: 200 rows 5000 5000
+// expect: missing table: error 942
+// expect: syntax: error 900
+// expect: duplicate: error 1
+// expect: divide: error 1476
+// expect: not null: error 1400
+// expect: second statement after an error: 1
+// expect: transaction committed: 7
+// expect: transaction rolled back: 0
+// expect: statement undone alone: error 1, rows 1
+// expect: ddl commits: 1
+// expect: alter session: ok
+// expect: bound: 1
+// expect: close, reuse: 3
+// expect: scram: 'app'
+// expect: wrong password: error 1017
+// expect: no such role: error 1017
+// expect: no login: error 1045
+// expect: sys: error 1017
+// expect: password changed: old error 1017, new connected
+// expect: service: connected
+// expect: other service: error 12514
+// expect: freepdb1: connected
+// expect: logoff: ok
+import "task"
+import "net"
+import "strings"
+import "oracle"
+import "sqldialect"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_wire"
+import "../../../cmd/lexdb_tns"
+
+fn cs(port: &str, user: &str, pw: &str, svc: &str, extra: &str): str {
+    return "User Id=" + user + ";Password=" + pw + ";Data Source=127.0.0.1:" + port + "/" + svc + ";" + extra
+}
+
+fn connect(s: &str): oracle.Conn {
+    match oracle.connect(&(s.toStr())) {
+        Ok(c) { return c }
+        Err(e) {
+            println("connect: error " + e.code.toStr() + " " + e.msg)
+            exit(1)
+        }
+    }
+}
+
+fn code(r: Result[oracle.Conn, oracle.Error]): str {
+    match r {
+        Ok(c) { return "connected" }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+fn values(rows: &oracle.Rows, row: int): str {
+    var out: []str = []
+    for i in 0..rows.columnCount() {
+        match rows.isNull(row, i) {
+            Ok(n) {
+                if n { append(mut &out, "NULL") } else {
+                    match rows.value(row, i) {
+                        Ok(v) { append(mut &out, v.toStr()) }
+                        Err(e) { append(mut &out, "error " + e.code.toStr() + " " + e.msg) }
+                    }
+                }
+            }
+            Err(e) { append(mut &out, "error " + e.code.toStr()) }
+        }
+    }
+    return strings.join(&out, " ")
+}
+
+fn err(r: Result[int, oracle.Error]): str {
+    match r {
+        Ok(n) { return n.toStr() }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+fn q1(c: mut &oracle.Conn, sql: &str): str {
+    match c.query(&(sql.toStr()), &[]) {
+        Ok(r) {
+            var out: []str = []
+            for i in 0..r.rowCount() { append(mut &out, values(&r, i)) }
+            return strings.join(&out, ",")
+        }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+fn show(r: Result[oracle.Rows, oracle.Error]): str {
+    match r {
+        Ok(rows) {
+            var cols: []str = []
+            for j in 0..rows.columnCount() {
+                append(mut &cols, rows.columnName(j).unwrap() + " " + rows.columnTypeName(j).unwrap())
+            }
+            var out = strings.join(&cols, ", ")
+            for i in 0..rows.rowCount() { out = out + " | " + values(&rows, i) }
+            return out
+        }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+fn client(st: &lexdb_store.Store, port: &str) {
+    // trust: the user is no role, so its name is its password
+    var c = connect(&cs(port, &"sa", &"sa", &"lexdb", &""))
+    println("trust: connected, banner " + c.banner() + ", version " + c.serverVersion())
+    println("dual: " + show(c.query("select 1 from dual", &[])))
+    let d2 = c.query("SELECT 'x' AS a, 2.5 AS b FROM DUAL", &[]).unwrap()
+    println("dual upper case: " + values(&d2, 0) + " DUAL")
+    c.exec("create table t (id int primary key, name text, amount numeric(10,2), at timestamp)").unwrap()
+    println("create, insert: " + err(c.run("insert into t values (1, 'café', 12.5, '2026-11-11'), (2, null, -3.1, null), (3, 'naïve 😀', 0, '2000-01-01')", &[])))
+    println("update: " + err(c.run("update t set amount = amount where id < 3", &[])))
+    println("select: " + show(c.query("select id, name, amount, at from t order by id", &[])))
+    let typed = "select cast(7 as smallint) as a, -8 as b, 123456789012345678901234567890.123 as c, cast(1.5 as double precision) as d, cast(0.25 as real) as e, true as f, " +
+                "cast('2026-11-11' as date) as g, cast('2026-11-11 10:00:00.25' as timestamp) as h, cast('2026-11-11 10:00:00+00' as timestamptz) as i, " +
+                "cast('\\x00ff' as bytea) as j, cast('00000000-0000-0000-0000-000000000001' as uuid) as k, interval '1 day' as l, 'text' as m"
+    match c.query(&typed, &[]) {
+        Ok(rows) {
+            var ts: []str = []
+            for j in 0..rows.columnCount() { append(mut &ts, rows.columnTypeName(j).unwrap()) }
+            println("types: " + strings.join(&ts, " "))
+            println("values: " + values(&rows, 0))
+        }
+        Err(e) { println("types: error " + e.code.toStr() + " " + e.msg) }
+    }
+    let nulls = "select cast(null as smallint), cast(null as int), cast(null as numeric), cast(null as double precision), cast(null as real), cast(null as bool), " +
+                "cast(null as date), cast(null as timestamp), cast(null as timestamptz), cast(null as bytea), cast(null as uuid), cast(null as text), null"
+    match c.query(&nulls, &[]) {
+        Ok(rows) {
+            var n = 0
+            for j in 0..rows.columnCount() { if rows.isNull(0, j).unwrap() { n += 1 } }
+            println("nulls: " + n.toStr() + " NULL")
+        }
+        Err(e) { println("nulls: error " + e.code.toStr() + " " + e.msg) }
+    }
+    match c.query("select i from generate_series(1, 1000) as g(i)", &[]) {
+        Ok(rows) {
+            var sum = 0
+            for i in 0..rows.rowCount() { sum += rows.int(i, 0).unwrap() }
+            println("fetch: " + rows.rowCount().toStr() + " rows, first " + rows.int(0, 0).unwrap().toStr() + ", last " +
+                    rows.int(rows.rowCount() - 1, 0).unwrap().toStr() + ", sum " + sum.toStr())
+        }
+        Err(e) { println("fetch: error " + e.code.toStr() + " " + e.msg) }
+    }
+    var small = connect(&cs(port, &"sa", &"sa", &"lexdb", &"Fetch Size=7"))
+    match small.query("select i from generate_series(1, 1000) as g(i)", &[]) {
+        Ok(rows) {
+            var sum = 0
+            for i in 0..rows.rowCount() { sum += rows.int(i, 0).unwrap() }
+            println("fetch size 7: " + rows.rowCount().toStr() + " rows, sum " + sum.toStr())
+        }
+        Err(e) { println("fetch size 7: error " + e.code.toStr() + " " + e.msg) }
+    }
+    println("no rows: " + small.query("select id from t where id > 100", &[]).unwrap().rowCount().toStr())
+    match c.query("select repeat('x', 5000) as s, i from generate_series(1, 200) as g(i)", &[]) {
+        Ok(rows) {
+            println("wide rows: " + rows.rowCount().toStr() + " rows " + len(rows.text(0, 0).unwrap()).toStr() + " " + len(rows.text(199, 0).unwrap()).toStr())
+        }
+        Err(e) { println("wide rows: error " + e.code.toStr() + " " + e.msg) }
+    }
+    small.logoff()
+    println("missing table: " + show(c.query("select * from nope", &[])))
+    println("syntax: " + show(c.query("selec 1", &[])))
+    println("duplicate: " + err(c.run("insert into t values (1, 'again', 0, null)", &[])))
+    println("divide: " + show(c.query("select 1 / 0 from dual", &[])))
+    c.exec("create table nn (a int not null)").unwrap()
+    println("not null: " + err(c.run("insert into nn values (null)", &[])))
+    println("second statement after an error: " + q1(mut &c, &"select 1 from dual"))
+    c.exec("create table acct (id int primary key, n int)").unwrap()
+    let tc = c.transaction(fn(x: mut &oracle.Conn): Result[int, oracle.Error] {
+        return x.run("insert into acct values (1, 7)", &[])
+    })
+    println("transaction committed: " + q1(mut &c, &"select n from acct"))
+    let tr = c.transaction(fn(x: mut &oracle.Conn): Result[int, oracle.Error] {
+        let n = try x.run("insert into acct values (2, 8)", &[])
+        return Err(sqldialect.inputError("no"))
+    })
+    println("transaction rolled back: " + q1(mut &c, &"select count(*) from acct where id = 2"))
+    let ua = c.transaction(fn(x: mut &oracle.Conn): Result[int, oracle.Error] {
+        let n = try x.run("insert into acct values (3, 1)", &[])
+        let bad = x.run("insert into acct values (3, 2)", &[])
+        return Ok(n + (if bad.isErr() { 1000 + bad.unwrapErr().code } else { 0 }))
+    })
+    println("statement undone alone: error " + (match ua { Ok(n) { (n - 1) % 1000 } Err(e) { e.code } }).toStr() + ", rows " + q1(mut &c, &"select count(*) from acct where id = 3"))
+    c.exec("insert into acct values (4, 1)").unwrap()
+    c.exec("create table later (a int)").unwrap()
+    println("ddl commits: " + q1(mut &c, &"select count(*) from acct where id = 4"))
+    match c.exec("ALTER SESSION SET TIME_ZONE = '+00:00'") {
+        Ok(_) { println("alter session: ok") }
+        Err(e) { println("alter session: error " + e.code.toStr() + " " + e.msg) }
+    }
+    println("bound: " + values(&c.query("select :1 from dual", &[sqldialect.Value.Int(1)]).unwrap(), 0))
+    // statements run again: each cursor is closed with the next request
+    var total = 0
+    for i in 0..3 { total += c.query("select 1 from dual", &[]).unwrap().int(0, 0).unwrap() }
+    println("close, reuse: " + total.toStr())
+    c.exec("create role app login password 'S3cret'").unwrap()
+    c.exec("create role ro password 'S3cret'").unwrap()
+    c.exec("grant select on t to app").unwrap()
+    c.logoff()
+
+    // passwords: the roles' Oracle verifiers
+    var conf = lexdb_wire.confOf(st)
+    conf.tcp = "scram-sha-256"
+    lexdb_wire.configure(st, &conf).unwrap()
+    var a = connect(&cs(port, &"APP", &"S3cret", &"lexdb", &""))
+    println("scram: " + q1(mut &a, &"select current_user from dual"))
+    a.logoff()
+    println("wrong password: " + code(oracle.connect(&(cs(port, &"app", &"nope", &"lexdb", &"")))))
+    println("no such role: " + code(oracle.connect(&(cs(port, &"ghost", &"S3cret", &"lexdb", &"")))))
+    println("no login: " + code(oracle.connect(&(cs(port, &"ro", &"S3cret", &"lexdb", &"")))))
+    println("sys: " + code(oracle.connect(&(cs(port, &"sys", &"sys", &"lexdb", &"")))))
+    var b = connect(&cs(port, &"app", &"S3cret", &"lexdb", &""))
+    b.exec("alter role app password 'N3w'").unwrap()
+    b.logoff()
+    println("password changed: old " + code(oracle.connect(&(cs(port, &"app", &"S3cret", &"lexdb", &"")))) + ", new " +
+            code(oracle.connect(&(cs(port, &"app", &"N3w", &"lexdb", &"")))))
+    println("service: " + code(oracle.connect(&(cs(port, &"app", &"N3w", &"LEXDB", &"")))))
+    println("other service: " + code(oracle.connect(&(cs(port, &"app", &"N3w", &"sales", &"")))))
+    println("freepdb1: " + code(oracle.connect(&(cs(port, &"app", &"N3w", &"FREEPDB1", &"")))))
+    println("logoff: ok")
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        let f = s.start(lexdb_tns.acceptLoop, lexdb_tns.AcceptArg{ln: ln, st: st})
+        client(&st, &addr[10..len(addr)])
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(5), lexdb_store.Options{cacheBytes: 128 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, body).unwrap()
+}

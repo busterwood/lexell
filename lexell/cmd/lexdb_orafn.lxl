@@ -1,0 +1,1243 @@
+// lexdb_orafn: Oracle's functions and operators that lexdb's own do not
+// cover (design/lexdb-oracle.md, stage O3). The parser (lexdb_sql in Oracle
+// mode) maps Oracle's calls onto lexdb's where they agree (NVL is coalesce,
+// LISTAGG string_agg, DECODE a CASE, ...) and onto these, named #ora_...,
+// where they do not; lexdb_tsqlfn.call hands every such name to call().
+//
+// The empty string is NULL here: a function whose result is '' gives NULL;
+// || ignores a NULL; a date is Oracle's DATE (lexdb's timestamp, seconds
+// kept); a number prints as Oracle prints one (.5, not 0.5).
+//
+// Written from Oracle's documentation and checked by hand: no Oracle server
+// was available (design/lexdb-oracle.md, section 14).
+
+import "strings"
+import "unicode"
+import "time"
+import "./lexdb_base"
+import "./lexdb_sql"
+import "./lexdb_time"
+
+type Val = lexdb_sql.Val
+type DbErr = lexdb_base.DbErr
+
+// An error as ORA-nnnnn: the state carries the number (lexdb_tns).
+fn ora(num: int, msg: str): DbErr { return lexdb_base.err("ORA" + strings.padLeft(&(num.toStr()), 5, '0'), msg) }
+
+pub fn isOraFn(name: &str): bool { return strings.startsWith(name, "#ora_") }
+
+fn isNull(v: &Val): bool {
+    match v {
+        Val.Null { return true }
+        else { return false }
+    }
+}
+
+fn nz(s: str): Val { return if len(s) == 0 { Val.Null } else { Val.Text(s) } }
+
+// ---- result types (lexdb_exec.exprOid asks)
+
+fn isTimeOid(o: int): bool { return lexdb_sql.timeKind(o) > 0 && o != lexdb_sql.OID_TIME && o != lexdb_sql.OID_IVAL }
+fn isFloatO(o: int): bool { return o == lexdb_sql.OID_FLOAT4 || o == lexdb_sql.OID_FLOAT8 }
+fn isIntO(o: int): bool { return o == lexdb_sql.OID_INT2 || o == lexdb_sql.OID_INT4 || o == lexdb_sql.OID_INT8 }
+
+// The type of name's result for arguments of these types.
+pub fn resultOid(name: &str, os: &[]int): int {
+    let a = if len(os) > 0 { os[0] } else { lexdb_sql.OID_TEXT }
+    let b = if len(os) > 1 { os[1] } else { lexdb_sql.OID_TEXT }
+    match name {
+        "#ora_cat", "#ora_substr", "#ora_replace", "#ora_tochar", "#ora_tochar1", "#ora_sessiontz", "#ora_upper", "#ora_lower" { return lexdb_sql.OID_TEXT }
+        "#ora_instr" { return lexdb_sql.OID_INT4 }
+        "#ora_todate", "#ora_totimestamp", "#ora_addmonths", "#ora_lastday", "#ora_nextday" { return lexdb_sql.OID_TS }
+        "#ora_tonumber", "#ora_div", "#ora_monthsbetween" { return lexdb_sql.OID_NUMERIC }
+        "#ora_trunc" {
+            if isTimeOid(a) { return lexdb_sql.OID_TS }
+            return if a == lexdb_sql.OID_TEXT || a == 0 { lexdb_sql.OID_NUMERIC } else { a }
+        }
+        "#ora_add", "#ora_sub" {
+            if isTimeOid(a) || isTimeOid(b) {
+                if name == "#ora_sub" && isTimeOid(a) && isTimeOid(b) { return lexdb_sql.OID_NUMERIC }
+                let t = if isTimeOid(a) { a } else { b }
+                return if t == lexdb_sql.OID_TSTZ { t } else { lexdb_sql.OID_TS }
+            }
+            if isFloatO(a) || isFloatO(b) { return lexdb_sql.OID_FLOAT8 }
+            if isIntO(a) && isIntO(b) { return lexdb_sql.OID_INT8 }
+            return lexdb_sql.OID_NUMERIC
+        }
+        else { return lexdb_sql.OID_TEXT }
+    }
+}
+
+// ---- values as Oracle shows them
+
+// A number as TO_CHAR without a format shows it: no trailing zeros, no
+// leading 0 before the point.
+pub fn numText(d: &Decimal): str {
+    var s = d.toStr()
+    if strings.contains(&s, ".") && !strings.contains(&s, "e") && !strings.contains(&s, "E") {
+        var n = len(s)
+        while n > 0 && s[n - 1] == '0' { n -= 1 }
+        if n > 0 && s[n - 1] == '.' { n -= 1 }
+        s = s[0..n].toStr()
+    }
+    if strings.startsWith(&s, "0.") { return s[1..len(s)].toStr() }
+    if strings.startsWith(&s, "-0.") { return "-" + s[2..len(s)] }
+    if s == "-0" { return "0" }
+    return s
+}
+
+// A number with its trailing zeros dropped (scale 0 when whole).
+fn norm(d: Decimal): Decimal {
+    let s = d.toStr()
+    if !strings.contains(&s, ".") { return d }
+    var n = len(s)
+    while n > 0 && s[n - 1] == '0' { n -= 1 }
+    if n > 0 && s[n - 1] == '.' { n -= 1 }
+    match Decimal.parse(&(s[0..n].toStr())) {
+        Ok(x) { return x }
+        Err(_) { return d }
+    }
+}
+
+const MONTHS: []str = ["JANUARY", "FEBRUARY", "MARCH", "APRIL", "MAY", "JUNE", "JULY", "AUGUST", "SEPTEMBER", "OCTOBER", "NOVEMBER", "DECEMBER"]
+const DAYS: []str = ["SUNDAY", "MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY"]
+
+fn floorDiv(a: int, b: int): int {
+    let q = a / b
+    return if (a % b != 0) && ((a < 0) != (b < 0)) { q - 1 } else { q }
+}
+fn floorMod(a: int, b: int): int { return a - floorDiv(a, b) * b }
+
+fn pad(n: int, w: int): str { return strings.padLeft(&(n.toStr()), w, '0') }
+fn npad(fill: bool, n: int, w: int): str { return if fill { pad(n, w) } else { n.toStr() } }
+
+// A date-time's parts.
+type Parts = record { y: int; m: int; d: int; hh: int; mi: int; ss: int; us: int; days: int; wd: int; doy: int }
+
+fn partsOf(us: int): Parts {
+    let l = lexdb_time.localOf(us)
+    let tod = floorMod(us, lexdb_time.DAY_US)
+    let days = floorDiv(us, lexdb_time.DAY_US)
+    let jan1 = lexdb_time.daysOf(time.Date{year: l.date.year, month: 1, day: 1})
+    return Parts{y: l.date.year, m: l.date.month, d: l.date.day, hh: tod / 3600000000, mi: (tod / 60000000) % 60, ss: (tod / 1000000) % 60,
+                 us: tod % 1000000, days: days, wd: time.weekday(l.date), doy: days - jan1 + 1}
+}
+
+fn tsOfParts(y: int, m: int, d: int, hh: int, mi: int, ss: int, us: int): Result[int, DbErr] {
+    let days = try lexdb_time.makeDate(y, m, d)
+    return Ok(days * lexdb_time.DAY_US + ((hh * 60 + mi) * 60 + ss) * 1000000 + us)
+}
+
+// A value as a date-time (microseconds since 2000, local). A text is read as
+// NLS_DATE_FORMAT (DD-MON-RR), else as ISO.
+fn asTs(v: &Val, z: &lexdb_time.Zone): Result[int, DbErr] {
+    match v {
+        Val.Date(d) { return Ok(lexdb_time.dateToTs(d)) }
+        Val.Ts(u) { return Ok(u) }
+        Val.Tstz(u) { return Ok(lexdb_time.tstzToTs(u, z)) }
+        Val.Text(s) {
+            match readDate(&strings.trim(s), &"DD-MON-RR", z, false) {
+                Ok(u) { return Ok(u) }
+                Err(x) {
+                    match lexdb_time.parseTs(&strings.trim(s), z) {
+                        Ok(u) { return Ok(u) }
+                        Err(_) { return Err(x) }
+                    }
+                }
+            }
+        }
+        else { return Err(ora(932, "inconsistent datatypes: expected DATE got " + typeName(v))) }
+    }
+}
+
+fn typeName(v: &Val): str {
+    match v {
+        Val.Int(_) { return "NUMBER" }
+        Val.Num(_) { return "NUMBER" }
+        Val.Float(_) { return "NUMBER" }
+        Val.Text(_) { return "CHAR" }
+        Val.Bool(_) { return "BOOLEAN" }
+        else { return "UNKNOWN" }
+    }
+}
+
+// A value as text where Oracle converts one implicitly.
+fn sv(v: &Val, z: &lexdb_time.Zone): str {
+    match v {
+        Val.Text(s) { return s }
+        Val.Int(n) { return n.toStr() }
+        Val.Num(d) { return numText(&d) }
+        Val.Bool(b) { return if b { "1" } else { "0" } }
+        Val.Float(x) { return floatText(x) }
+        Val.Real(x) { return floatText(x) }
+        Val.Date(d) { return fmtDate(lexdb_time.dateToTs(d), &"DD-MON-RR").unwrapOr("") }
+        Val.Ts(u) { return fmtDate(u, &"DD-MON-RR").unwrapOr("") }
+        Val.Tstz(u) { return fmtDate(lexdb_time.tstzToTs(u, z), &"DD-MON-RR").unwrapOr("") }
+        Val.Uuid(u) { return strings.toUpperAscii(&(strings.replaceAll(u, "-", ""))) }
+        Val.Bytes(b) { return hexUpper(&b) }
+        else { return "" }
+    }
+}
+
+fn floatText(x: float): str {
+    match Decimal.parse(&(x.toStr())) {
+        Ok(d) { return numText(&d) }
+        Err(_) { return x.toStr() }
+    }
+}
+
+fn hexUpper(b: &str): str {
+    let hx = "0123456789ABCDEF"
+    var out = newStrBuf()
+    for i in 0..len(b) {
+        out.addByte(hx[int(b[i]) >> 4])
+        out.addByte(hx[int(b[i]) & 15])
+    }
+    return out.toStr()
+}
+
+// A float as an int, or ORA-01426 (NaN, infinity and beyond 64 bits would stop the process).
+fn floatInt(x: float): Result[int, DbErr] {
+    if x != x || x >= 9.2e18f || x <= -9.2e18f { return Err(ora(1426, "numeric overflow")) }
+    return Ok(int(x))
+}
+
+// A date-time inside the range the server keeps (else ORA-01841); no arithmetic past 64 bits.
+const ORA_MIN_TS = -211813488000000000
+const ORA_MAX_TS = 9223371331200000000
+
+fn chkTs(x: int): Result[int, DbErr] {
+    if x < ORA_MIN_TS || x >= ORA_MAX_TS { return Err(ora(1841, "(full) year must be between -4712 and +9999, and not be 0")) }
+    return Ok(x)
+}
+
+// us + delta, checked (delta is below 4e17 in size).
+fn tsAdd(us: int, delta: int): Result[int, DbErr] {
+    if (delta > 0 && us > ORA_MAX_TS - delta) || (delta < 0 && us < ORA_MIN_TS - delta) {
+        return Err(ora(1841, "(full) year must be between -4712 and +9999, and not be 0"))
+    }
+    return chkTs(us + delta)
+}
+
+fn intOf(v: &Val): Result[int, DbErr] {
+    match v {
+        Val.Int(n) { return Ok(n) }
+        Val.Num(d) {
+            match d.toInt(Rounding.TOWARD_ZERO) {
+                Ok(n) { return Ok(n) }
+                Err(_) { return Err(ora(1426, "numeric overflow")) }
+            }
+        }
+        Val.Float(x) { return floatInt(x) }
+        Val.Real(x) { return floatInt(x) }
+        Val.Text(s) {
+            match strings.parseIntOpt(&(strings.trim(s))) {
+                Some(n) { return Ok(n) }
+                None { return Err(ora(1722, "invalid number")) }
+            }
+        }
+        else { return Err(ora(1722, "invalid number")) }
+    }
+}
+
+fn decOf(v: &Val): Result[Decimal, DbErr] {
+    match v {
+        Val.Int(n) { return Ok(Decimal.fromInt(n)) }
+        Val.Num(d) { return Ok(d) }
+        Val.Float(x) { return decText(x.toStr()) }
+        Val.Real(x) { return decText(x.toStr()) }
+        Val.Text(s) { return decText(strings.trim(s)) }
+        Val.Bool(b) { return Ok(Decimal.fromInt(if b { 1 } else { 0 })) }
+        else { return Err(ora(1722, "invalid number")) }
+    }
+}
+
+fn decText(s: str): Result[Decimal, DbErr] {
+    if len(s) == 0 { return Err(ora(1722, "invalid number")) }
+    for i in 0..len(s) {
+        let c = s[i]
+        if !((c >= '0' && c <= '9') || c == '.' || c == '-' || c == '+' || c == 'e' || c == 'E') { return Err(ora(1722, "invalid number")) }
+    }
+    match Decimal.parse(&s) {
+        Ok(d) { return Ok(d) }
+        Err(_) { return Err(ora(1722, "invalid number")) }
+    }
+}
+
+fn isFloatV(v: &Val): bool {
+    match v {
+        Val.Float(_) { return true }
+        Val.Real(_) { return true }
+        else { return false }
+    }
+}
+
+fn floatOf(v: &Val): Result[float, DbErr] {
+    match v {
+        Val.Float(x) { return Ok(x) }
+        Val.Real(x) { return Ok(x) }
+        else {
+            let d = try decOf(v)
+            return Ok(d.toFloat())
+        }
+    }
+}
+
+fn isTimeV(v: &Val): bool {
+    match v {
+        Val.Date(_) { return true }
+        Val.Ts(_) { return true }
+        Val.Tstz(_) { return true }
+        else { return false }
+    }
+}
+
+// ---- arithmetic
+
+// a + b and a - b (neg): numbers, a date and days, a date and an interval,
+// two dates (days between).
+fn plusMinus(a: &Val, b: &Val, neg: bool, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if isNull(a) || isNull(b) { return Ok(Val.Null) }
+    let ta = isTimeV(a)
+    let tb = isTimeV(b)
+    if ta && tb {
+        if !neg { return Err(ora(975, "date + date not allowed")) }
+        let x = try asTs(a, z)
+        let y = try asTs(b, z)
+        let q = try divDec(Decimal.fromInt(x - y), Decimal.fromInt(lexdb_time.DAY_US))
+        return Ok(Val.Num(q))
+    }
+    if ta || tb {
+        let tv = if ta { a } else { b }
+        let ov = if ta { b } else { a }
+        if !ta && neg { return Err(ora(30076, "invalid extract field for extract source")) }
+        match ov {
+            Val.Ival(iv) {
+                let us = try asTs(&tv, z)
+                let r = try lexdb_time.tsPlus(us, &(if neg { lexdb_time.ivalNeg(&iv) } else { iv }))
+                return Ok(Val.Ts(r))
+            }
+            else {}
+        }
+        let n = try decOf(&ov)
+        let whole = match n.trunc(0) { Ok(w) { w } Err(_) { n } }
+        let dn = try intOf(&Val.Num(whole))
+        if dn > 4000000 || dn < -4000000 { return Err(ora(1841, "(full) year must be between -4712 and +9999, and not be 0")) }
+        let frac = n.sub(whole).mul(Decimal.fromInt(lexdb_time.DAY_US))
+        let fus = match frac.toInt(Rounding.HALF_AWAY) { Ok(f) { f } Err(_) { 0 } }
+        let sign = if neg { -1 } else { 1 }
+        match tv {
+            Val.Tstz(u) { return Ok(Val.Tstz(try tsAdd(u, sign * (dn * lexdb_time.DAY_US + fus)))) }
+            else {
+                let us = try asTs(&tv, z)
+                return Ok(Val.Ts(try tsAdd(us, sign * (dn * lexdb_time.DAY_US + fus))))
+            }
+        }
+    }
+    match a {
+        Val.Int(x) {
+            match b {
+                Val.Int(y) {
+                    let r = if neg { x - y } else { x + y }
+                    // past 64 bits: a number
+                    if (neg && ((x >= 0) != (y >= 0)) && ((r >= 0) != (x >= 0))) || (!neg && ((x >= 0) == (y >= 0)) && ((r >= 0) != (x >= 0))) {
+                        let d = if neg { Decimal.fromInt(x).sub(Decimal.fromInt(y)) } else { Decimal.fromInt(x).add(Decimal.fromInt(y)) }
+                        return Ok(Val.Num(d))
+                    }
+                    return Ok(Val.Int(r))
+                }
+                else {}
+            }
+        }
+        else {}
+    }
+    if isFloatV(a) || isFloatV(b) {
+        let x = try floatOf(a)
+        let y = try floatOf(b)
+        return Ok(Val.Float(if neg { x - y } else { x + y }))
+    }
+    let x = try decOf(a)
+    let y = try decOf(b)
+    match (if neg { x.subExact(y) } else { x.addExact(y) }) {
+        Ok(r) { return Ok(Val.Num(r)) }
+        Err(_) { return Err(ora(1426, "numeric overflow")) }
+    }
+}
+
+fn divide(a: &Val, b: &Val): Result[Val, DbErr] {
+    if isNull(a) || isNull(b) { return Ok(Val.Null) }
+    if isFloatV(a) || isFloatV(b) {
+        let x = try floatOf(a)
+        let y = try floatOf(b)
+        if y == 0.0f { return Err(lexdb_base.err("22012", "division by zero")) }
+        return Ok(Val.Float(x / y))
+    }
+    let x = try decOf(a)
+    let y = try decOf(b)
+    if y.isZero() { return Err(lexdb_base.err("22012", "division by zero")) }
+    return Ok(Val.Num(try divDec(x, y)))
+}
+
+// x / y to 38 significant digits, as NUMBER's, trailing zeros dropped.
+fn divDec(x: Decimal, y: Decimal): Result[Decimal, DbErr] {
+    let q0 = match x.div(y, 0, Rounding.TOWARD_ZERO) { Ok(q) { q } Err(_) { Decimal.fromInt(0) } }
+    var digits = 0
+    let qs = q0.abs().toStr()
+    if qs != "0" { digits = len(qs) }
+    var scale = 38 - digits
+    if digits == 0 { scale = 37 }
+    while scale >= 0 {
+        match x.div(y, scale, Rounding.HALF_EVEN) {
+            Ok(q) { return Ok(norm(q)) }
+            Err(_) { scale -= 1 }
+        }
+    }
+    return Err(ora(1426, "numeric overflow"))
+}
+
+// ---- date formats
+
+type Elem = record { key: str; lit: str; text: str }     // an element (key: its upper case form) or a literal
+
+const ELEMS: []str = ["SSSSS", "IYYY", "IYY", "IY", "YYYY", "RRRR", "MONTH", "HH24", "HH12", "A.M.", "P.M.", "FF1", "FF2", "FF3", "FF4", "FF5", "FF6", "FF7", "FF8", "FF9",
+                      "MON", "DAY", "DDD", "YYY", "MM", "DD", "HH", "MI", "SS", "YY", "RR", "DY", "AM", "PM", "AD", "BC", "WW", "IW", "FM", "TH",
+                      "FF", "FX", "SP", "Q", "D", "Y", "W", "J", "X"]
+
+fn elems(fmt: &str): Result[[]Elem, DbErr] {
+    var out: []Elem = []
+    var i = 0
+    let n = len(fmt)
+    while i < n {
+        let c = fmt[i]
+        if c == '"' {
+            var j = i + 1
+            var sb = newStrBuf()
+            while j < n && fmt[j] != '"' {
+                sb.addByte(fmt[j])
+                j += 1
+            }
+            if j >= n { return Err(ora(1756, "quoted string not properly terminated")) }
+            append(mut &out, Elem{key: "", lit: sb.toStr(), text: ""})
+            i = j + 1
+            continue
+        }
+        var found = ""
+        for k in ELEMS {
+            if i + len(k) <= n && strings.toUpperAscii(&(fmt[i..i + len(k)].toStr())) == k {
+                found = k
+                break
+            }
+        }
+        if len(found) > 0 {
+            append(mut &out, Elem{key: found, lit: "", text: fmt[i..i + len(found)].toStr()})
+            i += len(found)
+            continue
+        }
+        if strings.isLetter(c) { return Err(ora(1821, "date format not recognized")) }
+        append(mut &out, Elem{key: "", lit: fmt[i..i + 1].toStr(), text: ""})
+        i += 1
+    }
+    return Ok(out)
+}
+
+// A name in the case its format element was written in: MON, Mon, mon.
+fn cased(name: str, tok: &str): str {
+    let up = strings.toUpperAscii(&(tok.toStr()))
+    if tok == up { return strings.toUpperAscii(&name) }
+    if strings.toLowerAscii(&(tok.toStr())) == tok { return strings.toLowerAscii(&name) }
+    let l = strings.toLowerAscii(&name)
+    return strings.toUpperAscii(&(l[0..1].toStr())) + l[1..len(l)]
+}
+
+fn isoWeek(p: &Parts): int {
+    let wd = if p.wd == 0 { 7 } else { p.wd }
+    let w = (p.doy - wd + 10) / 7
+    if w < 1 {
+        // the last week of the year before
+        let py = p.y - 1
+        let jan1 = time.weekday(time.Date{year: py, month: 1, day: 1})
+        let leap = time.isLeapYear(py)
+        return if jan1 == 4 || (leap && jan1 == 3) { 53 } else { 52 }
+    }
+    if w == 53 {
+        let jan1 = time.weekday(time.Date{year: p.y, month: 1, day: 1})
+        let leap = time.isLeapYear(p.y)
+        if !(jan1 == 4 || (leap && jan1 == 3)) { return 1 }
+    }
+    return w
+}
+
+// An explicit format's FF (no digit after it) is nine digits in Oracle, where the NLS default prints the column's six.
+fn ff9(fmt: &str): str {
+    var out = newStrBuf()
+    var i = 0
+    var q = false
+    while i < len(fmt) {
+        let c = fmt[i]
+        if c == '"' { q = !q }
+        if !q && (c == 'F' || c == 'f') && i + 1 < len(fmt) && (fmt[i + 1] == 'F' || fmt[i + 1] == 'f') && !(i + 2 < len(fmt) && fmt[i + 2] >= '0' && fmt[i + 2] <= '9') {
+            out.add("FF9")
+            i += 2
+            continue
+        }
+        out.addByte(c)
+        i += 1
+    }
+    return out.toStr()
+}
+
+// TO_CHAR(date, fmt).
+fn fmtDate(us: int, fmt: &str): Result[str, DbErr] {
+    let es = try elems(fmt)
+    let p = partsOf(us)
+    var fill = true
+    var sb = newStrBuf()
+    for e in es {
+        if len(e.key) == 0 {
+            sb.add(&e.lit)
+            continue
+        }
+        match e.key {
+            "FM" { fill = !fill }
+            "TH" {
+                // the ordinal suffix of the number just written
+                var k = len(sb.toStr())
+                var dg = 0
+                var cnt = 0
+                let cur = sb.toStr()
+                while k > 0 && cur[k - 1] >= '0' && cur[k - 1] <= '9' {
+                    k -= 1
+                    cnt += 1
+                }
+                if cnt > 0 { dg = int(cur[len(cur) - 1]) - int('0') }
+                let last2 = if cnt >= 2 { (int(cur[len(cur) - 2]) - int('0')) * 10 + dg } else { dg }
+                let sfx = if last2 >= 11 && last2 <= 13 { "TH" } else if dg == 1 { "ST" } else if dg == 2 { "ND" } else if dg == 3 { "RD" } else { "TH" }
+                let suffix: str = if e.text == "th" { strings.toLowerAscii(&sfx) } else { sfx }
+                sb.add(&suffix)
+            }
+            "FX", "SP" {}
+            "YYYY", "RRRR" { sb.add(&(pad(if p.y > 0 { p.y } else { 1 - p.y }, 4))) }
+            "YYY" { sb.add(&(pad(p.y % 1000, 3))) }
+            "YY", "RR" { sb.add(&(pad(p.y % 100, 2))) }
+            "Y" { sb.add(&((p.y % 10).toStr())) }
+            "MM" { sb.add(&(npad(fill, p.m, 2))) }
+            "MON" { sb.add(&(cased(MONTHS[p.m - 1][0..3].toStr(), &e.text))) }
+            "MONTH" {
+                let nm = cased(MONTHS[p.m - 1], &e.text)
+                let month: str = if fill { strings.padRight(&nm, 9, ' ') } else { nm }
+                sb.add(&month)
+            }
+            "DD" { sb.add(&(npad(fill, p.d, 2))) }
+            "DDD" { sb.add(&(npad(fill, p.doy, 3))) }
+            "D" { sb.add(&((p.wd + 1).toStr())) }
+            "DAY" {
+                let nm = cased(DAYS[p.wd], &e.text)
+                let day: str = if fill { strings.padRight(&nm, 9, ' ') } else { nm }
+                sb.add(&day)
+            }
+            "DY" { sb.add(&(cased(DAYS[p.wd][0..3].toStr(), &e.text))) }
+            "HH", "HH12" { sb.add(&(npad(fill, if p.hh % 12 == 0 { 12 } else { p.hh % 12 }, 2))) }
+            "HH24" { sb.add(&(npad(fill, p.hh, 2))) }
+            "MI" { sb.add(&(npad(fill, p.mi, 2))) }
+            "SS" { sb.add(&(npad(fill, p.ss, 2))) }
+            "SSSSS" { sb.add(&(pad(p.hh * 3600 + p.mi * 60 + p.ss, 5))) }
+            "X" { sb.add(".") }
+            "FF", "FF1", "FF2", "FF3", "FF4", "FF5", "FF6", "FF7", "FF8", "FF9" {
+                let k = if e.key == "FF" { 6 } else { int(e.key[2]) - int('0') }
+                let full = pad(p.us, 6) + "000"
+                sb.add(&(full[0..k].toStr()))
+            }
+            "AM", "PM" { sb.add(&(cased(if p.hh < 12 { "AM" } else { "PM" }, &e.text))) }
+            "A.M.", "P.M." { sb.add(&(cased(if p.hh < 12 { "A.M." } else { "P.M." }, &e.text))) }
+            "AD", "BC" { sb.add(&(cased(if p.y > 0 { "AD" } else { "BC" }, &e.text))) }
+            "Q" { sb.add(&(((p.m - 1) / 3 + 1).toStr())) }
+            "WW" { sb.add(&(npad(fill, (p.doy - 1) / 7 + 1, 2))) }
+            "W" { sb.add(&(((p.d - 1) / 7 + 1).toStr())) }
+            "IW" { sb.add(&(npad(fill, isoWeek(&p), 2))) }
+            "IYYY", "IYY", "IY" {
+                let tp = partsOf(us + (3 - ((p.wd + 6) % 7)) * lexdb_time.DAY_US)
+                let k = len(e.key)
+                sb.add(&(pad(if k == 4 { tp.y } else if k == 3 { tp.y % 1000 } else { tp.y % 100 }, k)))
+            }
+            "J" { sb.add(&((2451545 + p.days).toStr())) }
+            else {}
+        }
+    }
+    return Ok(sb.toStr())
+}
+
+// The number at s[at..], up to max digits; (value, digits read); None if
+// there is no digit.
+fn digitsAt(s: &str, at: int, max: int): Option[[]int] {
+    var j = at
+    var v = 0
+    while j < len(s) && j < at + max && s[j] >= '0' && s[j] <= '9' {
+        v = v * 10 + (int(s[j]) - int('0'))
+        j += 1
+    }
+    if j == at { return None }
+    return Some([v, j - at])
+}
+
+// TO_DATE(s, fmt): the date-time s is as fmt says. fracOk: FF allowed.
+fn readDate(s: &str, fmt: &str, z: &lexdb_time.Zone, fracOk: bool): Result[int, DbErr] {
+    let es = try elems(fmt)
+    let today = lexdb_time.localOf(lexdb_time.today(z) * lexdb_time.DAY_US).date
+    var y = today.year
+    var m = today.month
+    var d = 1
+    var hh = 0
+    var mi = 0
+    var ss = 0
+    var us = 0
+    var pm = -1
+    var h12 = false
+    var doy = -1
+    var secs = -1
+    var at = 0
+    for e in es {
+        if len(e.key) == 0 {
+            // a literal: matched as it is, or any one punctuation
+            if at < len(s) && (s[at] == e.lit[0] || !strings.isAlnum(s[at])) {
+                if len(e.lit) == 1 || s[at] == e.lit[0] { at += 1 }
+                continue
+            }
+            if len(e.lit) == 1 && e.lit[0] == ' ' { continue }
+            if at >= len(s) { return Err(ora(1840, "input value not long enough for date format")) }
+            return Err(ora(1861, "literal does not match format string"))
+        }
+        if e.key == "FM" || e.key == "FX" || e.key == "TH" || e.key == "SP" { continue }
+        // blanks before an element are skipped
+        while at < len(s) && s[at] == ' ' { at += 1 }
+        if at >= len(s) && e.key != "X" && e.key != "AD" && e.key != "BC" { return Err(ora(1840, "input value not long enough for date format")) }
+        match e.key {
+            "YYYY", "RRRR", "YYY", "YY", "RR", "Y" {
+                let mx = if e.key == "YYYY" || e.key == "RRRR" { 4 } else if e.key == "YYY" { 3 } else if e.key == "Y" { 1 } else { 2 }
+                match digitsAt(s, at, mx) {
+                    Some(r) {
+                        at += r[1]
+                        y = r[0]
+                        if (e.key == "RR" || (e.key == "RRRR" && r[1] <= 2)) {
+                            let cur = today.year % 100
+                            let cen = today.year - cur
+                            if y < 50 { y = if cur < 50 { cen + y } else { cen + 100 + y } }
+                            else { y = if cur < 50 { cen - 100 + y } else { cen + y } }
+                        } else if r[1] < 4 { y = today.year - today.year % (if r[1] == 1 { 10 } else if r[1] == 2 { 100 } else { 1000 }) + y }
+                        if y == 0 { return Err(ora(1841, "(full) year must be between -4713 and +9999, and not be 0")) }
+                    }
+                    None { return Err(ora(1841, "(full) year must be between -4713 and +9999, and not be 0")) }
+                }
+            }
+            "MM" {
+                match digitsAt(s, at, 2) {
+                    Some(r) {
+                        at += r[1]
+                        m = r[0]
+                        if m < 1 || m > 12 { return Err(ora(1843, "An invalid month was specified.")) }
+                    }
+                    None { return Err(ora(1858, "A non-numeric character was found instead of a numeric character.")) }
+                }
+            }
+            "MON", "MONTH" {
+                var k = 0
+                while at + k < len(s) && strings.isLetter(s[at + k]) { k += 1 }
+                let w = strings.toUpperAscii(&(s[at..at + k].toStr()))
+                var found = -1
+                for i in 0..12 {
+                    if (e.key == "MON" && len(w) >= 3 && MONTHS[i][0..3] == w[0..3] && (len(w) == 3 || w == MONTHS[i])) || w == MONTHS[i] { found = i }
+                }
+                if found < 0 { return Err(ora(1843, "An invalid month was specified.")) }
+                m = found + 1
+                at += k
+            }
+            "DD" {
+                match digitsAt(s, at, 2) {
+                    Some(r) {
+                        at += r[1]
+                        d = r[0]
+                    }
+                    None { return Err(ora(1858, "A non-numeric character was found instead of a numeric character.")) }
+                }
+            }
+            "DDD" {
+                match digitsAt(s, at, 3) {
+                    Some(r) {
+                        at += r[1]
+                        doy = r[0]
+                    }
+                    None { return Err(ora(1858, "A non-numeric character was found instead of a numeric character.")) }
+                }
+            }
+            "HH", "HH12", "HH24" {
+                match digitsAt(s, at, 2) {
+                    Some(r) {
+                        at += r[1]
+                        hh = r[0]
+                        if e.key == "HH24" {
+                            if hh > 23 { return Err(ora(1850, "hour must be between 0 and 23")) }
+                        } else {
+                            h12 = true
+                            if hh < 1 || hh > 12 { return Err(ora(1849, "hour must be between 1 and 12")) }
+                        }
+                    }
+                    None { return Err(ora(1858, "A non-numeric character was found instead of a numeric character.")) }
+                }
+            }
+            "MI" {
+                match digitsAt(s, at, 2) {
+                    Some(r) {
+                        at += r[1]
+                        mi = r[0]
+                        if mi > 59 { return Err(ora(1851, "minutes must be between 0 and 59")) }
+                    }
+                    None { return Err(ora(1858, "A non-numeric character was found instead of a numeric character.")) }
+                }
+            }
+            "SS" {
+                match digitsAt(s, at, 2) {
+                    Some(r) {
+                        at += r[1]
+                        ss = r[0]
+                        if ss > 59 { return Err(ora(1852, "seconds must be between 0 and 59")) }
+                    }
+                    None { return Err(ora(1858, "A non-numeric character was found instead of a numeric character.")) }
+                }
+            }
+            "SSSSS" {
+                match digitsAt(s, at, 5) {
+                    Some(r) {
+                        at += r[1]
+                        secs = r[0]
+                    }
+                    None { return Err(ora(1858, "A non-numeric character was found instead of a numeric character.")) }
+                }
+            }
+            "X" { if at < len(s) && (s[at] == '.' || s[at] == ',') { at += 1 } }
+            "FF", "FF1", "FF2", "FF3", "FF4", "FF5", "FF6", "FF7", "FF8", "FF9" {
+                if !fracOk { return Err(ora(1821, "date format not recognized")) }
+                var k = 0
+                var v = 0
+                while at + k < len(s) && s[at + k] >= '0' && s[at + k] <= '9' && k < 9 {
+                    if k < 6 { v = v * 10 + (int(s[at + k]) - int('0')) }
+                    k += 1
+                }
+                if k == 0 { return Err(ora(1858, "A non-numeric character was found instead of a numeric character.")) }
+                var sc = k
+                while sc < 6 {
+                    v = v * 10
+                    sc += 1
+                }
+                us = v
+                at += k
+            }
+            "AM", "PM", "A.M.", "P.M." {
+                let k = len(e.key)
+                if at + k > len(s) { return Err(ora(1858, "A non-numeric character was found instead of a numeric character.")) }
+                let w = strings.toUpperAscii(&(s[at..at + k].toStr()))
+                if w == "AM" || w == "A.M." { pm = 0 } else if w == "PM" || w == "P.M." { pm = 1 } else { return Err(ora(1855, "AM/A.M. or PM/P.M. required")) }
+                at += k
+            }
+            "AD", "BC" { at += 2 }
+            "DAY", "DY" {
+                while at < len(s) && strings.isLetter(s[at]) { at += 1 }
+            }
+            "D", "Q", "W" {
+                match digitsAt(s, at, 1) {
+                    Some(r) { at += r[1] }
+                    None { return Err(ora(1858, "A non-numeric character was found instead of a numeric character.")) }
+                }
+            }
+            else { return Err(ora(1821, "date format not recognized")) }
+        }
+    }
+    if at < len(s) { return Err(ora(1830, "Date format picture ends before converting entire input string.")) }
+    if h12 {
+        if pm < 0 { pm = 0 }
+        hh = hh % 12 + (if pm == 1 { 12 } else { 0 })
+    }
+    if secs >= 0 {
+        hh = secs / 3600
+        mi = (secs / 60) % 60
+        ss = secs % 60
+    }
+    if doy >= 0 {
+        let base = try lexdb_time.makeDate(y, 1, 1)
+        return Ok((base + doy - 1) * lexdb_time.DAY_US + ((hh * 60 + mi) * 60 + ss) * 1000000 + us)
+    }
+    if !(time.Date{year: y, month: m, day: 1}).valid() { return Err(ora(1843, "An invalid month was specified.")) }
+    if d < 1 || d > 31 { return Err(ora(1847, "day of month must be between 1 and last day of month")) }
+    if d > time.daysInMonth(y, m) { return Err(ora(1839, "date not valid for month specified")) }
+    return tsOfParts(y, m, d, hh, mi, ss, us)
+}
+
+// ---- number formats
+
+// TO_CHAR(number, fmt).
+fn fmtNumber(n: &Decimal, fmt: &str): Result[str, DbErr] {
+    var f = strings.toUpperAscii(&(fmt.toStr()))
+    var fm = false
+    if strings.startsWith(&f, "FM") {
+        fm = true
+        f = f[2..len(f)].toStr()
+    }
+    var lead = ""          // S before the digits, $ or L
+    var trail = ""         // MI, PR, S after
+    var cur = ""
+    while len(f) > 0 {
+        if f[0] == 'S' { lead = "S"; f = f[1..len(f)].toStr() }
+        else if f[0] == '$' { cur = "$"; f = f[1..len(f)].toStr() }
+        else if strings.startsWith(&f, "L") { cur = "$"; f = f[1..len(f)].toStr() }
+        else { break }
+    }
+    if strings.endsWith(&f, "MI") { trail = "MI"; f = f[0..len(f) - 2].toStr() }
+    else if strings.endsWith(&f, "PR") { trail = "PR"; f = f[0..len(f) - 2].toStr() }
+    else if strings.endsWith(&f, "S") { trail = "S"; f = f[0..len(f) - 1].toStr() }
+    if strings.contains(&f, "EEEE") { return Err(ora(1481, "invalid number format model")) }
+    // the pattern: before and after the point
+    var ints = 0
+    var fracs = 0
+    var seenPoint = false
+    var firstZero = -1
+    var fracNine = 0           // fraction places that are 9 (trailing zeros dropped under FM) from the end
+    for i in 0..len(f) {
+        let c = f[i]
+        if c == '9' || c == '0' {
+            if seenPoint { fracs += 1 } else { ints += 1 }
+            if c == '0' && firstZero < 0 && !seenPoint { firstZero = ints - 1 }
+            if c == '0' && seenPoint { fracNine = 0 } else if seenPoint { fracNine += 1 }
+        } else if c == '.' || c == 'D' {
+            seenPoint = true
+        } else if c == ',' || c == 'G' {
+        } else if c == 'X' {
+            return Err(ora(1481, "invalid number format model"))
+        } else {
+            return Err(ora(1481, "invalid number format model"))
+        }
+    }
+    let neg = n.isNeg() && !n.isZero()
+    let r = match n.abs().quantize(fracs, Rounding.HALF_AWAY) { Ok(x) { x } Err(_) { n.abs() } }
+    var txt = r.toStr()
+    var ip = txt
+    var fp = ""
+    let dot = strings.indexOf(&txt, ".", 0)
+    if dot >= 0 {
+        ip = txt[0..dot].toStr()
+        fp = txt[dot + 1..len(txt)].toStr()
+    }
+    while len(fp) < fracs { fp = fp + "0" }
+    if ip == "0" { ip = "" }
+    if len(ip) > ints {
+        // too many digits: ####
+        return Ok(strings.repeat("#", len(f) + 1))
+    }
+    var body = newStrBuf()
+    var intIdx = 0                    // integer places consumed
+    var fracIdx = 0
+    var started = false
+    seenPoint = false
+    let pad0 = ints - len(ip)         // places before the first digit of the value
+    for i in 0..len(f) {
+        let c = f[i]
+        if c == '9' || c == '0' {
+            if !seenPoint {
+                let k = intIdx
+                intIdx += 1
+                if k < pad0 {
+                    if firstZero >= 0 && k >= firstZero { body.addByte('0'); started = true } else { body.addByte(' ') }
+                } else {
+                    body.addByte(ip[k - pad0])
+                    started = true
+                }
+            } else {
+                body.addByte(fp[fracIdx])
+                fracIdx += 1
+            }
+        } else if c == '.' || c == 'D' {
+            seenPoint = true
+            body.addByte('.')
+        } else if c == ',' || c == 'G' {
+            body.addByte(if started || (firstZero >= 0 && intIdx > firstZero) { ',' } else { ' ' })
+        }
+    }
+    var out = body.toStr()
+    if fm {
+        // trailing zeros of the 9 places go; blanks go
+        if seenPoint && fracNine > 0 {
+            var end = len(out)
+            var cut = 0
+            while cut < fracNine && end > 0 && out[end - 1] == '0' {
+                end -= 1
+                cut += 1
+            }
+            out = out[0..end].toStr()
+        }
+        out = strings.trim(&out)
+    }
+    if len(cur) > 0 {
+        // $ just before the first digit
+        var k = 0
+        while k < len(out) && out[k] == ' ' { k += 1 }
+        out = out[0..k] + cur + out[k..len(out)]
+    }
+    // the sign
+    if trail == "MI" { out = out + (if neg { "-" } else if fm { "" } else { " " }) }
+    else if trail == "PR" {
+        if neg {
+            var k = 0
+            while k < len(out) && out[k] == ' ' { k += 1 }
+            out = out[0..k] + "<" + out[k..len(out)] + ">"
+        } else if !fm { out = " " + out + " " }
+    }
+    else if trail == "S" { out = out + (if neg { "-" } else { "+" }) }
+    else if lead == "S" {
+        var k = 0
+        while k < len(out) && out[k] == ' ' { k += 1 }
+        out = out[0..k] + (if neg { "-" } else { "+" }) + out[k..len(out)]
+    } else {
+        if neg {
+            var k = 0
+            while k < len(out) && out[k] == ' ' { k += 1 }
+            if k > 0 && !fm { out = " " + out[0..k - 1] + "-" + out[k..len(out)] }
+            else if !fm { out = "-" + out }
+            else { out = "-" + strings.trim(&out) }
+        } else if !fm { out = " " + out }
+    }
+    return Ok(out)
+}
+
+// TO_NUMBER(s, fmt).
+fn readNumber(s0: &str, fmt: &str): Result[Val, DbErr] {
+    let f = strings.toUpperAscii(&(fmt.toStr()))
+    var s = strings.trim(&(s0.toStr()))
+    if strings.contains(&f, "X") {
+        var v = 0
+        for i in 0..len(s) {
+            let c = strings.toUpperAscii(&(s[i..i + 1].toStr()))[0]
+            let h = if c >= '0' && c <= '9' { int(c) - int('0') } else if c >= 'A' && c <= 'F' { int(c) - int('A') + 10 } else { -1 }
+            if h < 0 { return Err(ora(1722, "invalid number")) }
+            v = v * 16 + h
+        }
+        return Ok(Val.Int(v))
+    }
+    var neg = false
+    if strings.endsWith(&s, "-") { neg = true; s = s[0..len(s) - 1].toStr() }
+    else if strings.startsWith(&s, "<") && strings.endsWith(&s, ">") { neg = true; s = s[1..len(s) - 1].toStr() }
+    var out = newStrBuf()
+    for i in 0..len(s) {
+        let c = s[i]
+        if (c >= '0' && c <= '9') || c == '.' { out.addByte(c) }
+        else if c == '-' && out.size() == 0 { neg = true }
+        else if c == '+' && out.size() == 0 {}
+        else if c == ',' || c == '$' || c == ' ' {}
+        else { return Err(ora(1722, "invalid number")) }
+    }
+    let t = out.toStr()
+    if len(t) == 0 { return Err(ora(1722, "invalid number")) }
+    let d = try decText(t)
+    return Ok(Val.Num(if neg { d.neg() } else { d }))
+}
+
+// ---- strings
+
+fn runesOf(s: &str): []int { return strings.runes(&(s.toStr())) }
+
+fn fromRunes(rs: &[]int, a: int, b: int): str {
+    var sb = newStrBuf()
+    for i in a..b { strings.addRune(mut &sb, rs[i]) }
+    return sb.toStr()
+}
+
+// ---- date functions
+
+fn lastDay(y: int, m: int): int { return time.daysInMonth(y, m) }
+
+fn addMonths(us: int, n: int): Result[int, DbErr] {
+    if n > 130000 || n < -130000 { return Err(ora(1841, "(full) year must be between -4712 and +9999, and not be 0")) }
+    let p = partsOf(us)
+    let m0 = p.y * 12 + (p.m - 1) + n
+    let y = floorDiv(m0, 12)
+    let m = floorMod(m0, 12) + 1
+    let d = if p.d == lastDay(p.y, p.m) { lastDay(y, m) } else { min(p.d, lastDay(y, m)) }
+    return chkTs(try tsOfParts(y, m, d, p.hh, p.mi, p.ss, p.us))
+}
+
+fn monthsBetween(a: int, b: int): Result[Decimal, DbErr] {
+    let p = partsOf(a)
+    let q = partsOf(b)
+    var months = (p.y - q.y) * 12 + (p.m - q.m)
+    if p.d == q.d || (p.d == lastDay(p.y, p.m) && q.d == lastDay(q.y, q.m)) { return Ok(Decimal.fromInt(months)) }
+    // the days (and time) between, a month taken as 31 days
+    let da = (p.d - 1) * lexdb_time.DAY_US + ((p.hh * 60 + p.mi) * 60 + p.ss) * 1000000 + p.us
+    let db = (q.d - 1) * lexdb_time.DAY_US + ((q.hh * 60 + q.mi) * 60 + q.ss) * 1000000 + q.us
+    let frac = try divDec(Decimal.fromInt(da - db), Decimal.fromInt(31 * lexdb_time.DAY_US))
+    return Ok(norm(Decimal.fromInt(months).add(frac)))
+}
+
+fn truncDate(us: int, fmt: &str): Result[int, DbErr] {
+    let f = strings.toUpperAscii(&(fmt.toStr()))
+    let p = partsOf(us)
+    let day = p.days * lexdb_time.DAY_US
+    match f {
+        "Y", "YY", "YYY", "YYYY", "YEAR", "SYEAR", "SYYYY" { return lexdb_time.truncTs("year", us) }
+        "Q" { return lexdb_time.truncTs("quarter", us) }
+        "MM", "MON", "MONTH", "RM" { return lexdb_time.truncTs("month", us) }
+        "IW" { return lexdb_time.truncTs("week", us) }
+        "WW" { return Ok(day - ((p.doy - 1) % 7) * lexdb_time.DAY_US) }
+        "W" { return Ok(day - ((p.d - 1) % 7) * lexdb_time.DAY_US) }
+        "D", "DAY", "DY" { return Ok(day - p.wd * lexdb_time.DAY_US) }
+        "DD", "DDD", "J" { return Ok(day) }
+        "HH", "HH12", "HH24" { return lexdb_time.truncTs("hour", us) }
+        "MI" { return lexdb_time.truncTs("minute", us) }
+        else { return Err(ora(1899, "bad precision specifier")) }
+    }
+}
+
+fn pow10(k: int): Result[Decimal, DbErr] {
+    var d = Decimal.fromInt(1)
+    if k < 0 || k > 200 { return Err(ora(1426, "numeric overflow")) }
+    for i in 0..k {
+        match d.mulExact(Decimal.fromInt(10)) {
+            Ok(r) { d = r }
+            Err(_) { return Err(ora(1426, "numeric overflow")) }
+        }
+    }
+    return Ok(d)
+}
+
+fn numToChar(vs: &[]Val, z: &lexdb_time.Zone): Result[str, DbErr] {
+    if len(vs) < 2 { return Ok(sv(&vs[0], z)) }
+    let d = try decOf(&vs[0])
+    return fmtNumber(&d, &sv(&vs[1], z))
+}
+
+// ---- the dispatch
+
+pub fn call(name: &str, vs: &[]Val, z: &lexdb_time.Zone): Result[Option[Val], DbErr] {
+    let n = len(vs)
+    if name == "#ora_sessiontz" {
+        if z.name == "UTC" || z.name == "Etc/UTC" || z.name == "GMT" { return Ok(Some(Val.Text("+00:00"))) }
+        if strings.startsWith(&z.name, "<") {
+            let e = strings.indexOf(&z.name, ">", 0)
+            if e > 0 { return Ok(Some(Val.Text(z.name[1..e].toStr()))) }
+        }
+        return Ok(Some(Val.Text(z.name)))
+    }
+    if name == "#ora_cat" {
+        // || : a NULL is nothing; the empty string is NULL
+        if n < 2 { return Ok(None) }
+        let a = if isNull(&vs[0]) { "" } else { sv(&vs[0], z) }
+        let b = if isNull(&vs[1]) { "" } else { sv(&vs[1], z) }
+        return Ok(Some(nz(a + b)))
+    }
+    if name == "#ora_replace" {
+        if n < 2 || isNull(&vs[0]) { return Ok(Some(Val.Null)) }
+        let s = sv(&vs[0], z)
+        if isNull(&vs[1]) { return Ok(Some(nz(s))) }
+        let a = sv(&vs[1], z)
+        let b = if n > 2 && !isNull(&vs[2]) { sv(&vs[2], z) } else { "" }
+        if len(a) == 0 { return Ok(Some(nz(s))) }
+        return Ok(Some(nz(strings.replaceAll(&s, &a, &b))))
+    }
+    if name == "#ora_upper" || name == "#ora_lower" {
+        if n != 1 { return Err(ora(909, "invalid number of arguments")) }
+        if isNull(&vs[0]) { return Ok(Some(Val.Null)) }
+        let rs = runesOf(&sv(&vs[0], z))
+        var out = newStrBuf()
+        for r in rs { strings.addRune(mut &out, if name == "#ora_upper" { unicode.upper(r) } else { unicode.lower(r) }) }
+        return Ok(Some(nz(out.toStr())))
+    }
+    var lo = 0
+    var hi = 9
+    match name {
+        "#ora_add", "#ora_sub", "#ora_div" { lo = 2; hi = 2 }
+        "#ora_substr" { lo = 2; hi = 3 }
+        "#ora_instr" { lo = 2; hi = 4 }
+        "#ora_tochar1" { lo = 1; hi = 4 }
+        "#ora_tochar", "#ora_tonumber", "#ora_todate", "#ora_totimestamp" { lo = 1; hi = 3 }
+        "#ora_trunc" { lo = 1; hi = 2 }
+        "#ora_addmonths", "#ora_monthsbetween", "#ora_nextday" { lo = 2; hi = 2 }
+        "#ora_lastday" { lo = 1; hi = 1 }
+        else { }
+    }
+    if n < lo { return Err(ora(938, "not enough arguments for function")) }
+    if n > hi { return Err(ora(939, "too many arguments for function")) }
+    for v in vs { if isNull(&v) { return Ok(Some(Val.Null)) } }
+    match name {
+        "#ora_add" { return Ok(Some(try plusMinus(&vs[0], &vs[1], false, z))) }
+        "#ora_sub" { return Ok(Some(try plusMinus(&vs[0], &vs[1], true, z))) }
+        "#ora_div" { return Ok(Some(try divide(&vs[0], &vs[1]))) }
+        "#ora_substr" {
+            // SUBSTR(s, pos [, len]): pos 0 is 1; negative counts from the end
+            let r = runesOf(&sv(&vs[0], z))
+            var pos = try intOf(&vs[1])
+            var cnt = if n > 2 { try intOf(&vs[2]) } else { len(r) }
+            if cnt < 1 { return Ok(Some(Val.Null)) }
+            if pos == 0 { pos = 1 }
+            if pos < 0 { pos = len(r) + pos + 1 }
+            if pos < 1 || pos > len(r) { return Ok(Some(Val.Null)) }
+            let end = if cnt >= len(r) - (pos - 1) { len(r) } else { pos - 1 + cnt }
+            return Ok(Some(nz(fromRunes(&r, pos - 1, end))))
+        }
+        "#ora_instr" {
+            // INSTR(s, sub [, pos [, occurrence]]): its place from 1; 0 none; a negative pos searches backwards
+            let s = runesOf(&sv(&vs[0], z))
+            let f = runesOf(&sv(&vs[1], z))
+            var pos = if n > 2 { try intOf(&vs[2]) } else { 1 }
+            let occ = if n > 3 { try intOf(&vs[3]) } else { 1 }
+            if occ < 1 { return Err(ora(1428, "'" + occ.toStr() + "' is out of range")) }
+            if pos == 0 || len(f) == 0 || pos > len(s) + 1 { return Ok(Some(Val.Int(0))) }
+            var found = 0
+            if pos > 0 {
+                var i = pos - 1
+                while i + len(f) <= len(s) {
+                    var ok = true
+                    for k in 0..len(f) { if s[i + k] != f[k] { ok = false; break } }
+                    if ok {
+                        found += 1
+                        if found == occ { return Ok(Some(Val.Int(i + 1))) }
+                    }
+                    i += 1
+                }
+            } else {
+                var i = len(s) + pos
+                if i + len(f) > len(s) { i = len(s) - len(f) }
+                while i >= 0 {
+                    var ok = true
+                    for k in 0..len(f) { if s[i + k] != f[k] { ok = false; break } }
+                    if ok {
+                        found += 1
+                        if found == occ { return Ok(Some(Val.Int(i + 1))) }
+                    }
+                    i -= 1
+                }
+            }
+            return Ok(Some(Val.Int(0)))
+        }
+        "#ora_tochar1" {
+            // TO_CHAR(x) under the session's NLS formats: vs[1] date, vs[2] timestamp, vs[3] timestamp with time zone
+            if n < 4 { return Ok(None) }
+            let dfmt = if len(sv(&vs[1], z)) > 0 { sv(&vs[1], z) } else { "DD-MON-RR" }
+            let tfmt = if len(sv(&vs[2], z)) > 0 { sv(&vs[2], z) } else { "DD-MON-RR HH.MI.SSXFF AM" }
+            let zfmt = if len(sv(&vs[3], z)) > 0 { sv(&vs[3], z) } else { "DD-MON-RR HH.MI.SSXFF AM TZR" }
+            match vs[0] {
+                Val.Date(_) { return Ok(Some(nz(try fmtDate(try asTs(&vs[0], z), &dfmt)))) }
+                Val.Ts(u) {
+                    // lexdb's DATE and TIMESTAMP are one type: fractions make it a timestamp
+                    return Ok(Some(nz(try fmtDate(u, &(if u % 1000000 != 0 { tfmt } else { dfmt })))))
+                }
+                Val.Tstz(_) { return Ok(Some(nz(try fmtDate(try asTs(&vs[0], z), &zfmt)))) }
+                Val.Int(_) { return Ok(Some(nz(try numToChar(&[vs[0]], z)))) }
+                Val.Num(_) { return Ok(Some(nz(try numToChar(&[vs[0]], z)))) }
+                Val.Float(_) { return Ok(Some(nz(try numToChar(&[vs[0]], z)))) }
+                else { return Ok(Some(nz(sv(&vs[0], z)))) }
+            }
+        }
+        "#ora_tochar" {
+            match vs[0] {
+                Val.Date(_) { return Ok(Some(nz(try fmtDate(try asTs(&vs[0], z), &(if n > 1 { ff9(&sv(&vs[1], z)) } else { "DD-MON-RR" }))))) }
+                Val.Ts(u) {
+                    // (lexdb's DATE and TIMESTAMP are one type: a fraction of a second makes it a timestamp)
+                    return Ok(Some(nz(try fmtDate(u, &(if n > 1 { ff9(&sv(&vs[1], z)) } else if u % 1000000 != 0 { "DD-MON-RR HH.MI.SSXFF AM" } else { "DD-MON-RR" })))))
+                }
+                Val.Tstz(_) {
+                    let us = try asTs(&vs[0], z)
+                    let fmt = if n > 1 { ff9(&sv(&vs[1], z)) } else { "DD-MON-RR" }
+                    return Ok(Some(nz(try fmtDate(us, &fmt))))
+                }
+                Val.Int(_) { return Ok(Some(nz(try numToChar(&vs, z)))) }
+                Val.Num(_) { return Ok(Some(nz(try numToChar(&vs, z)))) }
+                Val.Float(_) { return Ok(Some(nz(try numToChar(&vs, z)))) }
+                else { return Ok(Some(nz(sv(&vs[0], z)))) }
+            }
+        }
+        "#ora_todate", "#ora_totimestamp" {
+            match vs[0] {
+                Val.Date(_) { return Ok(Some(Val.Ts(try asTs(&vs[0], z)))) }
+                Val.Ts(_) { return Ok(Some(vs[0])) }
+                else {}
+            }
+            let s = sv(&vs[0], z)
+            let ts = name == "#ora_totimestamp"
+            let fmt = if n > 1 { sv(&vs[1], z) } else if ts { "DD-MON-RR HH.MI.SSXFF AM" } else { "DD-MON-RR" }
+            if ts && n == 1 {
+                match lexdb_time.parseTs(&strings.trim(&s), z) {
+                    Ok(u) { return Ok(Some(Val.Ts(u))) }
+                    Err(_) {}
+                }
+            }
+            return Ok(Some(Val.Ts(try readDate(&s, &fmt, z, ts))))
+        }
+        "#ora_tonumber" {
+            match vs[0] {
+                Val.Int(_) { return Ok(Some(Val.Num(try decOf(&vs[0])))) }
+                Val.Num(_) { return Ok(Some(vs[0])) }
+                Val.Float(_) { return Ok(Some(Val.Num(try decOf(&vs[0])))) }
+                else {}
+            }
+            let s = sv(&vs[0], z)
+            if n > 1 { return Ok(Some(try readNumber(&s, &sv(&vs[1], z)))) }
+            return Ok(Some(Val.Num(try decText(strings.trim(&s)))))
+        }
+        "#ora_trunc" {
+            if isTimeV(&vs[0]) {
+                let us = try asTs(&vs[0], z)
+                let fmt = if n > 1 { sv(&vs[1], z) } else { "DD" }
+                return Ok(Some(Val.Ts(try truncDate(us, &fmt))))
+            }
+            var k = if n > 1 { try intOf(&vs[1]) } else { 0 }
+            if k > 200 { k = 200 }
+            match vs[0] {
+                Val.Int(x) { if k >= 0 { return Ok(Some(vs[0])) } }
+                else {}
+            }
+            let d = try decOf(&vs[0])
+            if k >= 0 {
+                match d.trunc(k) {
+                    Ok(r) { return Ok(Some(Val.Num(norm(r)))) }
+                    Err(_) { return Ok(Some(vs[0])) }
+                }
+            }
+            // beyond the 38 digits a NUMBER holds, everything truncates to 0
+            if k < -200 { return Ok(Some(Val.Num(Decimal.fromInt(0)))) }
+            let p = match pow10(-k) { Ok(x) { x } Err(_) { return Ok(Some(Val.Num(Decimal.fromInt(0)))) } }
+            let q = match d.div(p, 0, Rounding.TOWARD_ZERO) { Ok(x) { x } Err(_) { Decimal.fromInt(0) } }
+            match q.mulExact(p) {
+                Ok(r) { return Ok(Some(Val.Num(r))) }
+                Err(_) { return Ok(Some(Val.Num(Decimal.fromInt(0)))) }
+            }
+        }
+        "#ora_addmonths" {
+            let us = try asTs(&vs[0], z)
+            let k = try intOf(&vs[1])
+            return Ok(Some(Val.Ts(try addMonths(us, k))))
+        }
+        "#ora_monthsbetween" {
+            let a = try asTs(&vs[0], z)
+            let b = try asTs(&vs[1], z)
+            return Ok(Some(Val.Num(try monthsBetween(a, b))))
+        }
+        "#ora_lastday" {
+            let us = try asTs(&vs[0], z)
+            let p = partsOf(us)
+            return Ok(Some(Val.Ts(try tsOfParts(p.y, p.m, lastDay(p.y, p.m), p.hh, p.mi, p.ss, p.us))))
+        }
+        "#ora_nextday" {
+            let us = try asTs(&vs[0], z)
+            let w = strings.toUpperAscii(&(sv(&vs[1], z)))
+            var target = -1
+            for i in 0..7 { if len(w) >= 3 && DAYS[i][0..3] == w[0..3] { target = i } }
+            if target < 0 { return Err(ora(1846, "not a valid day of the week")) }
+            let p = partsOf(us)
+            var ahead = (target - p.wd + 7) % 7
+            if ahead == 0 { ahead = 7 }
+            return Ok(Some(Val.Ts(us + ahead * lexdb_time.DAY_US)))
+        }
+        else { return Ok(None) }
+    }
+}
+
+// Whether fmt is a date format model Oracle knows (ALTER SESSION SET NLS_DATE_FORMAT).
+pub fn checkFormat(fmt: &str): Result[Unit, DbErr] {
+    let x = try fmtDate(0, fmt)
+    return Ok(Unit{})
+}

@@ -202,3 +202,64 @@ pub fn serverFinal(sc: mut &Scram, clientFinal: &str, endPoint: &str): Result[st
     if !sc.real || (try sha(&clientKey)) != sc.v.stored { return Err(e("28P01", "")) }
     return Ok("v=" + crypto.base64(&(try hmac(&sc.v.server, &authMsg))))
 }
+
+// ---- Oracle's 12c verifier (design/lexdb-oracle.md section 5, decision R1)
+//
+// Oracle's login proves knowledge of a key derived from the clear password,
+// which a SCRAM verifier cannot give; so at every password set the 12c one
+// is made as well: ORA12C$salt$count$hash, hex, with
+//   key  = PBKDF2-HMAC-SHA512(password, salt + "AUTH_PBKDF2_SPEEDY_KEY", count, 64)
+//   hash = SHA-512(key + salt)[0..32]
+// The hash is what encrypts the exchange's session key (password-equivalent
+// for a TNS login, as Oracle's own SPARE4 "T:" verifier is); the password is
+// not kept.
+
+pub const ORA_MECH = "ORA12C"
+pub const ORA_COUNT = 4096
+
+pub type OraVerifier = record {
+    pub salt: str           // raw bytes
+    pub count: int
+    pub hash: str           // raw, 32 bytes
+}
+
+// The 12c hash of password under salt and count.
+pub fn oraHash(password: &str, salt: &str, count: int): Result[str, DbErr] {
+    let key = match crypto.pbkdf2Sha512(&(password.toStr()), &(salt.toStr() + "AUTH_PBKDF2_SPEEDY_KEY"), count, 64) {
+        Ok(k) { k }
+        Err(x) { return Err(cryptoErr(x)) }
+    }
+    let h = match crypto.sha512(&(key + salt.toStr())) {
+        Ok(x) { x }
+        Err(x) { return Err(cryptoErr(x)) }
+    }
+    return Ok(h[0..32])
+}
+
+// A password's 12c verifier, with a new random salt.
+pub fn makeOraVerifier(password: &str): Result[str, DbErr] {
+    let salt = try random(16)
+    let hash = try oraHash(password, &salt, ORA_COUNT)
+    return Ok(ORA_MECH + "$" + crypto.hex(&salt) + "$" + ORA_COUNT.toStr() + "$" + crypto.hex(&hash))
+}
+
+// A 12c verifier's parts; None if s is not one.
+pub fn parseOraVerifier(s: &str): Option[OraVerifier] {
+    let parts = strings.split(s, "$")
+    if len(parts) != 4 || parts[0] != ORA_MECH { return None }
+    let count = strings.parseIntOpt(&(parts[2].toStr())).unwrapOr(0)
+    if count < 1 || count > 1000000 { return None }
+    match crypto.unhex(&(parts[1].toStr())) {
+        Some(salt) {
+            match crypto.unhex(&(parts[3].toStr())) {
+                Some(hash) {
+                    if len(salt) != 16 || len(hash) != 32 { return None }
+                    return Some(OraVerifier{salt: salt, count: count, hash: hash})
+                }
+                None {}
+            }
+        }
+        None {}
+    }
+    return None
+}

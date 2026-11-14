@@ -1348,6 +1348,9 @@ loop for sockets (`net`) and timers. The rules the language relies on:
   share one accept queue (the kernel wakes one of them per connection,
   `EPOLLEXCLUSIVE`). The supervisor (`task.workersWith(n, policy, f)` sets
   its `WorkerPolicy`):
+  - does not restart a worker that exits with the policy's `fatalCode` (when
+    not 0) before it called `task.workerReady()`: a refusal to start, not a
+    crash. The others get `SIGTERM` and `Err(GaveUp)` is returned at once;
   - restarts a worker that crashed (ended by a signal, or with a code other
     than 0) after a backoff (100 ms, doubled for each crash in a row of that
     worker, at most 5 s); once more than `maxCrashes` (5) crashes happen

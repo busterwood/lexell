@@ -1,0 +1,216 @@
+// lexdb_oratext: what the Oracle door and PL/SQL share (design/lexdb-oracle.md): the ORA- number and text for a
+// lexdb error, and the SQL text rewrites Oracle needs (FROM dual). Moved out of lexdb_tns for lexdb_plsql (O6).
+import "strings"
+import "./lexdb_base"
+
+type DbErr = lexdb_base.DbErr
+pub type OraErr = value record { pub num: int; pub text: str }
+
+pub fn pad5(n: int): str {
+    let s = n.toStr()
+    return strings.repeat("0", max(0, 5 - len(s))) + s
+}
+
+// "ORA-00942: table or view does not exist"
+pub fn oraText(n: int, text: str): str { return "ORA-" + pad5(n) + ": " + text }
+
+// A name between the first pair of double quotes of s, upper case ("" none).
+pub fn quotedName(s: &str): str {
+    let a = strings.indexOf(s, "\"", 0)
+    if a < 0 { return "" }
+    let b = strings.indexOf(s, "\"", a + 1)
+    if b < 0 { return "" }
+    return strings.toUpperAscii(&(s[a + 1..b].toStr()))
+}
+
+// The n-th (from 0) double-quoted name of s, upper case ("" none).
+pub fn quotedNth(s: &str, n: int): str {
+    var from = 0
+    var k = 0
+    while true {
+        let a = strings.indexOf(s, "\"", from)
+        if a < 0 { return "" }
+        let b = strings.indexOf(s, "\"", a + 1)
+        if b < 0 { return "" }
+        if k == n { return strings.toUpperAscii(&(s[a + 1..b].toStr())) }
+        k += 1
+        from = b + 1
+    }
+    return ""
+}
+
+// The ORA- number and text for a lexdb error (design/lexdb-oracle.md, section 7).
+pub fn oraOf(e: &DbErr, user: &str): OraErr {
+    let s = e.state
+    if s == "42P01" && strings.startsWith(&e.msg, "sequence ") { return OraErr{num: 2289, text: "sequence does not exist"} }
+    // a qualifier that names no FROM item (d.g, d not there): the column is invalid in Oracle, as for an outer reference without LATERAL
+    if s == "42P01" && strings.startsWith(&e.msg, "missing FROM-clause entry") { return OraErr{num: 904, text: "invalid identifier"} }
+    if s == "42P01" {
+        let n = quotedName(&e.msg)
+        if len(user) > 0 && len(n) > 0 && !strings.contains(&n, ".") { return OraErr{num: 942, text: "table or view \"" + strings.toUpperAscii(&(user.toStr())) + "\".\"" + n + "\" does not exist"} }
+        return OraErr{num: 942, text: "table or view does not exist"}
+    }
+    if s == "42703" {
+        let n = quotedName(&e.msg)
+        if len(user) > 0 && len(n) > 0 && !strings.contains(&n, ".") { return OraErr{num: 904, text: "\"" + n + "\": invalid identifier"} }
+        return OraErr{num: 904, text: "invalid identifier"}
+    }
+    if s == "42601" {
+        if strings.contains(&e.msg, "query must have the same number of columns") { return OraErr{num: 1789, text: "query block has incorrect number of result columns"} }
+        if strings.startsWith(&e.msg, "INSERT has more expressions") { return OraErr{num: 913, text: "too many values"} }
+        return OraErr{num: 900, text: "invalid SQL statement"}
+    }
+    if s == "23505" {
+        let n = quotedName(&e.msg)
+        return OraErr{num: 1, text: "unique constraint (" + strings.toUpperAscii(&(user.toStr())) + (if len(n) > 0 { "." + n } else { "" }) + ") violated"}
+    }
+    if s == "23503" {
+        if strings.contains(&e.msg, "update or delete on table") {
+            return OraErr{num: 2292, text: "integrity constraint violated - child record found"}
+        }
+        return OraErr{num: 2291, text: "integrity constraint violated - parent key not found"}
+    }
+    if s == "23502" {
+        let col = quotedNth(&e.msg, 0)
+        let tab = quotedNth(&e.msg, 1)
+        if len(user) > 0 && len(tab) > 0 { return OraErr{num: 1400, text: "cannot insert NULL into (\"" + strings.toUpperAscii(&(user.toStr())) + "\".\"" + tab + "\".\"" + col + "\")"} }
+        return OraErr{num: 1400, text: "cannot insert NULL into (" + col + ")"}
+    }
+    if s == "23514" { return OraErr{num: 2290, text: "check constraint violated"} }
+    if s == "22001" { return OraErr{num: 12899, text: "value too large for column"} }
+    if s == "22012" { return OraErr{num: 1476, text: "divisor is equal to zero"} }
+    if s == "22003" {
+        if strings.startsWith(&e.msg, "numeric field overflow") { return OraErr{num: 1438, text: "value larger than specified precision allowed for this column"} }
+        return OraErr{num: 1426, text: "numeric overflow"}
+    }
+    if s == "428C9" { return OraErr{num: 32795, text: "cannot insert into a generated always identity column"} }
+    if s == "2201F" || (s == "2201E" && !strings.contains(&e.msg, "zero")) { return OraErr{num: 1428, text: "Argument is out of range."} }
+    if s == "2201E" { return OraErr{num: 1428, text: "Argument 0 is out of range."} }
+    if s == "22007" && strings.contains(&e.msg, "\"") {
+        let a = strings.indexOf(&e.msg, "\"", 0)
+        if a >= 0 && a + 1 < len(e.msg) && !(e.msg[a + 1] >= '0' && e.msg[a + 1] <= '9') { return OraErr{num: 1858, text: "A non-numeric character was found instead of a numeric character."} }
+    }
+    if s == "22007" { return OraErr{num: 1861, text: "literal does not match format string"} }
+    if s == "22008" || s == "22009" { return OraErr{num: 1881, text: "invalid time zone displacement value"} }
+    if s == "22015" { return OraErr{num: 1873, text: "the leading precision of the interval is too small"} }
+    if s == "22019" || s == "22025" { return OraErr{num: 1424, text: "missing or illegal character following the escape character"} }
+    if s == "22021" || s == "22P05" { return OraErr{num: 29275, text: "partial multibyte character"} }
+    if s == "22P01" { return OraErr{num: 1426, text: "numeric overflow"} }
+    if s == "22P03" { return OraErr{num: 1465, text: "invalid hex number"} }
+    if s == "22004" { return OraErr{num: 1400, text: "cannot insert NULL into column"} }
+    if s == "22026" { return OraErr{num: 12899, text: "value too large for column"} }
+    if s == "22023" { return OraErr{num: 1722, text: "invalid number"} }
+    if s == "42804" || s == "42P18" { return OraErr{num: 932, text: "inconsistent datatypes: " + e.msg} }
+    if s == "42883" && strings.startsWith(&e.msg, "operator does not exist: ") {
+        let at = strings.indexOf(&e.msg, " compared with ", 0)
+        if at > 0 {
+            let l = e.msg[25..at].toStr()
+            let r = e.msg[at + 15..len(e.msg)].toStr()
+            if strings.parseIntOpt(&l).isSome() != strings.parseIntOpt(&r).isSome() { return OraErr{num: 1722, text: "invalid number"} }
+        }
+        return OraErr{num: 932, text: "inconsistent datatypes"}
+    }
+    if s == "42883" { return OraErr{num: 904, text: "invalid identifier"} }
+    if s == "42803" { return OraErr{num: 979, text: "not a GROUP BY expression"} }
+    if s == "42702" || s == "42P09" { return OraErr{num: 918, text: "column ambiguously defined"} }
+    if s == "42701" && strings.contains(&e.msg, "already exists") { return OraErr{num: 1430, text: "column being added already exists in table"} }
+    if s == "42P10" && strings.startsWith(&e.msg, "ORDER BY position") { return OraErr{num: 1785, text: "ORDER BY item must be the number of a SELECT-list expression"} }
+    if s == "42701" { return OraErr{num: 957, text: "duplicate column name"} }
+    if s == "42710" {
+        if strings.startsWith(&e.msg, "role ") { return OraErr{num: 1920, text: "user name conflicts with another user or role name"} }
+        return OraErr{num: 955, text: "name is already used by an existing object"}
+    }
+    if s == "42704" {
+        if strings.startsWith(&e.msg, "role ") { return OraErr{num: 1917, text: "user or role '" + strings.toUpperAscii(&(quotedName(&e.msg))) + "' does not exist"} }
+        if strings.startsWith(&e.msg, "type ") { return OraErr{num: 902, text: "invalid datatype"} }
+        if strings.startsWith(&e.msg, "constraint ") { return OraErr{num: 2443, text: "cannot drop constraint  - nonexistent constraint"} }
+        if strings.startsWith(&e.msg, "index ") { return OraErr{num: 1418, text: "specified index does not exist"} }
+        return OraErr{num: 4043, text: "object does not exist"}
+    }
+    if s == "3F000" { return OraErr{num: 1918, text: "user '" + quotedName(&e.msg) + "' does not exist"} }
+    if s == "2BP01" { return OraErr{num: 2449, text: "unique/primary keys in table referenced by foreign keys"} }
+    if s == "55P03" { return OraErr{num: 54, text: "resource busy and acquire with NOWAIT specified or timeout expired"} }
+    if s == "42P16" || s == "42611" { return OraErr{num: 907, text: "missing right parenthesis"} }
+    if s == "42P02" { return OraErr{num: 1008, text: "not all variables bound"} }
+    if s == "25P02" { return OraErr{num: 25402, text: "transaction must roll back"} }
+    if s == "54000" || s == "54001" || s == "54011" { return OraErr{num: 1792, text: "maximum number of columns in a table or view is 1000"} }
+    if s == "53200" { return OraErr{num: 4030, text: "out of process memory when trying to allocate"} }
+    if s == "53300" { return OraErr{num: 20, text: "maximum number of processes exceeded"} }
+    if s == "57P01" || s == "57P02" || s == "57P03" { return OraErr{num: 1089, text: "immediate shutdown or close in progress - no operations are permitted"} }
+    if s == "25006" { return OraErr{num: 1456, text: "may not perform insert/delete/update operation inside a READ ONLY transaction"} }
+    if s == "2D000" { return OraErr{num: 2089, text: "COMMITs are not allowed in this context"} }
+    if s == "22P02" { return OraErr{num: 1722, text: "invalid number"} }
+    if s == "42P07" { return OraErr{num: 955, text: "name is already used by an existing object"} }
+    if s == "28P01" || s == "28000" { return OraErr{num: 1017, text: "invalid username/password; logon denied"} }
+    if s == "42501" { return OraErr{num: 1031, text: "insufficient privileges"} }
+    if s == "40001" { return OraErr{num: 8177, text: "can't serialize access for this transaction"} }
+    if s == "40P01" { return OraErr{num: 60, text: "deadlock detected while waiting for resource"} }
+    if s == "57014" { return OraErr{num: 1013, text: "user requested cancel of current operation"} }
+    if s == "0A000" { return OraErr{num: 3001, text: "unimplemented feature: " + e.msg} }
+    if len(s) == 8 && strings.startsWith(&s, "ORA") { return OraErr{num: strings.parseIntOpt(&(s[3..8].toStr())).unwrapOr(20000), text: e.msg} }       // an Oracle error of lexdb_orafn and the dialect (O3)
+    return OraErr{num: 20000, text: e.msg}
+}
+
+
+pub fn isIdentByte(c: byte): bool {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '$' || c == '#' || c >= 0x80
+}
+
+pub fn isSpaceByte(c: byte): bool { return c == ' ' || c == '\t' || c == '\n' || c == '\r' }
+
+// sql without its "FROM dual" (outside quotes and comments), and a trailing
+// ';' kept as it is: lexdb's parser takes it.
+pub fn oracleSql(sql: str): str {
+    var out: []byte = []
+    let n = len(sql)
+    var i = 0
+    while i < n {
+        let ch = sql[i]
+        if ch == byte(39) || ch == byte(34) {
+            var j = i + 1
+            while j < n {
+                if sql[j] == ch {
+                    if j + 1 < n && sql[j + 1] == ch {
+                        j += 2
+                        continue
+                    }
+                    break
+                }
+                j += 1
+            }
+            j = min(j + 1, n)
+            appendStr(mut &out, sql[i..j])
+            i = j
+        } else if ch == '-' && i + 1 < n && sql[i + 1] == '-' {
+            var j = i
+            while j < n && sql[j] != '\n' { j += 1 }
+            appendStr(mut &out, sql[i..j])
+            i = j
+        } else if ch == '/' && i + 1 < n && sql[i + 1] == '*' {
+            var j = i + 2
+            while j + 1 < n && !(sql[j] == '*' && sql[j + 1] == '/') { j += 1 }
+            j = min(j + 2, n)
+            appendStr(mut &out, sql[i..j])
+            i = j
+        } else if isIdentByte(ch) {
+            var j = i
+            while j < n && isIdentByte(sql[j]) { j += 1 }
+            if strings.toLowerAscii(sql[i..j]) == "from" {
+                var k = j
+                while k < n && isSpaceByte(sql[k]) { k += 1 }
+                if k > j && k + 4 <= n && strings.toLowerAscii(sql[k..k + 4]) == "dual" && (k + 4 == n || (!isIdentByte(sql[k + 4]) && sql[k + 4] != '.')) {
+                    append(mut &out, byte(32))
+                    i = k + 4
+                    continue
+                }
+            }
+            appendStr(mut &out, sql[i..j])
+            i = j
+        } else {
+            append(mut &out, ch)
+            i += 1
+        }
+    }
+    return strFromBytes(&out)
+}
+

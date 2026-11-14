@@ -112,6 +112,13 @@ fn atEnd(q: &Parser): bool {
 // An optional transaction or savepoint name after BEGIN TRAN, COMMIT, ROLLBACK.
 fn tranName(q: mut &Parser, names: mut &[]str) {
     let t = q.peek()
+    // (a statement's keyword after BEGIN TRAN is the next statement, not the transaction's name: mssql-jdbc's
+    // "BEGIN TRAN IF @@TRANCOUNT = 2 COMMIT TRAN")
+    if t.kind == lexdb_sql.T_IDENT && (t.text == "if" || t.text == "begin" || t.text == "end" || t.text == "commit" || t.text == "rollback" ||
+       t.text == "save" || t.text == "set" || t.text == "declare" || t.text == "while" || t.text == "print" || t.text == "exec" || t.text == "execute" ||
+       t.text == "return" || t.text == "merge" || t.text == "use" || t.text == "throw" || t.text == "raiserror" || t.text == "goto" || t.text == "else") {
+        return
+    }
     if t.kind == lexdb_sql.T_IDENT && !lexdb_sql.isReservedWord(&t.text) || t.kind == lexdb_sql.T_QIDENT || t.kind == lexdb_sql.T_VAR {
         q.skip(1)
         append(names, t.text)
@@ -337,6 +344,10 @@ fn tsqlStmt(q: mut &Parser, types: mut &[]TypeName): Result[TStmt, DbErr] {
             q.skip(1)
             return execStmt(q)
         }
+        // a batch that begins with a system procedure's name executes it (mssql-jdbc's "sp_executesql N'SET FMTONLY ON ...'")
+        if (strings.startsWith(&t.text, "sp_") || strings.startsWith(&t.text, "xp_")) && !(w1.kind == lexdb_sql.T_OP && (w1.text == "=" || w1.text == ".")) {
+            return execStmt(q)
+        }
         if t.text == "insert" && w1.kind == lexdb_sql.T_IDENT && w1.text == "bulk" {
             q.skip(2)
             return insertBulk(q)
@@ -523,9 +534,246 @@ fn tsqlStmt(q: mut &Parser, types: mut &[]TypeName): Result[TStmt, DbErr] {
     return Ok(ts)
 }
 
+// DECLARE @t TABLE (...) as a temporary table of the session: "DROP TABLE IF EXISTS #tv_t; CREATE TABLE #tv_t (...)", every other
+// @t of the batch the table's name (mssql-jdbc's DatabaseMetaData collects its catalog procedures' rows in table variables:
+// DECLARE @jdbc_temp_fkeys_result table (...); INSERT INTO @jdbc_temp_fkeys_result EXEC sp_fkeys ...; SELECT ... FROM @jdbc_temp_fkeys_result).
+// Strings, quoted names and comments are left alone. A table variable the batch does not see again (it is gone with it in SQL
+// Server) stays until its name is declared again.
+fn tableVariables(sql: &str): str {
+    let low = strings.toLowerAscii(sql)
+    if !strings.contains(&low, "table") || !strings.contains(&low, "declare") { return sql.toStr() }
+    // the names declared as tables: DECLARE @name TABLE
+    var names: []str = []
+    var i = 0
+    let n = len(sql)
+    while i < n {
+        let c = sql[i]
+        if c == '\'' {
+            i += 1
+            while i < n && !(sql[i] == '\'' && !(i + 1 < n && sql[i + 1] == '\'')) { if sql[i] == '\'' { i += 1 }; i += 1 }
+            i += 1
+        } else if c == '-' && i + 1 < n && sql[i + 1] == '-' {
+            while i < n && sql[i] != '\n' { i += 1 }
+        } else if c == 'd' || c == 'D' {
+            if i + 7 < n && low[i..i + 7] == "declare" && (i == 0 || !isWordByte(sql[i - 1])) && !isWordByte(sql[i + 7]) {
+                var j = i + 7
+                while j < n && (sql[j] == ' ' || sql[j] == '\t' || sql[j] == '\n' || sql[j] == '\r') { j += 1 }
+                if j < n && sql[j] == '@' {
+                    var k = j + 1
+                    while k < n && isWordByte(sql[k]) { k += 1 }
+                    var m = k
+                    while m < n && (sql[m] == ' ' || sql[m] == '\t' || sql[m] == '\n' || sql[m] == '\r') { m += 1 }
+                    if m + 5 <= n && low[m..m + 5] == "table" && !(m + 5 < n && isWordByte(sql[m + 5])) { append(mut &names, low[j..k].toStr()) }
+                }
+            }
+            i += 1
+        } else {
+            i += 1
+        }
+    }
+    if len(names) == 0 { return sql.toStr() }
+    var out: []byte = []
+    i = 0
+    while i < n {
+        let c = sql[i]
+        if c == '\'' {
+            let a = i
+            i += 1
+            while i < n && !(sql[i] == '\'' && !(i + 1 < n && sql[i + 1] == '\'')) { if sql[i] == '\'' { i += 1 }; i += 1 }
+            i += 1
+            appendStr(mut &out, sql[a..min(i, n)])
+        } else if c == '-' && i + 1 < n && sql[i + 1] == '-' {
+            let a = i
+            while i < n && sql[i] != '\n' { i += 1 }
+            appendStr(mut &out, sql[a..i])
+        } else if c == '@' && (i == 0 || !isWordByte(sql[i - 1])) {
+            var k = i + 1
+            while k < n && isWordByte(sql[k]) { k += 1 }
+            let nm = low[i..k].toStr()
+            var hit = false
+            for t in names { if t == nm { hit = true } }
+            if hit { appendStr(mut &out, "#tv_" + nm[1..len(nm)].toStr()) } else { appendStr(mut &out, sql[i..k]) }
+            i = k
+        } else {
+            append(mut &out, c)
+            i += 1
+        }
+    }
+    var text = strFromBytes(&out)
+    // each declaration: DECLARE #tv_t TABLE (...) becomes DROP TABLE IF EXISTS #tv_t; CREATE TABLE #tv_t (...)
+    for t in names {
+        let nm = "#tv_" + t[1..len(t)].toStr()
+        text = replaceDeclare(&text, &nm)
+    }
+    return text
+}
+
+// DECLARE @x [AS] name, a variable of a type of the user's (name not one
+// T-SQL knows): where [AS] name is in sql (at, end) and its catalog key (dbo,
+// or no schema, as public; brackets off; lower case). lexdb_tsql makes one
+// that is a table type a table variable (DECLARE @x TABLE (its definition)).
+pub type TypeRef = record { pub at: int; pub end: int; pub key: str }
+
+pub fn userTypeDecls(sql: &str): []TypeRef {
+    var out: []TypeRef = []
+    let low = strings.toLowerAscii(sql)
+    if !strings.contains(&low, "declare") { return out }
+    let n = len(sql)
+    var i = 0
+    while i < n {
+        let c = sql[i]
+        if c == '\'' {
+            i += 1
+            while i < n && !(sql[i] == '\'' && !(i + 1 < n && sql[i + 1] == '\'')) { if sql[i] == '\'' { i += 1 }; i += 1 }
+            i += 1
+        } else if c == '-' && i + 1 < n && sql[i + 1] == '-' {
+            while i < n && sql[i] != '\n' { i += 1 }
+        } else if c == '/' && i + 1 < n && sql[i + 1] == '*' {
+            i += 2
+            while i + 1 < n && !(sql[i] == '*' && sql[i + 1] == '/') { i += 1 }
+            i += 2
+        } else if (c == 'd' || c == 'D') && i + 7 < n && low[i..i + 7] == "declare" && (i == 0 || !isWordByte(sql[i - 1])) && !isWordByte(sql[i + 7]) {
+            var j = skipSpace(sql, i + 7)
+            i += 7
+            if j >= n || sql[j] != '@' { continue }
+            var k = j + 1
+            while k < n && isWordByte(sql[k]) { k += 1 }
+            k = skipSpace(sql, k)
+            let at = k                          // (AS too: DECLARE @x TABLE has none)
+            if k + 2 < n && low[k..k + 2] == "as" && !isWordByte(sql[k + 2]) { k = skipSpace(sql, k + 2) }
+            // the type's name: one to three parts, plain or [quoted]
+            var parts: []str = []
+            while k < n {
+                if sql[k] == '[' {
+                    var m = k + 1
+                    while m < n && sql[m] != ']' { m += 1 }
+                    if m >= n { break }
+                    append(mut &parts, strings.toLowerAscii(&sql[k + 1..m]))
+                    k = m + 1
+                } else if isWordByte(sql[k]) && sql[k] != '#' && sql[k] != '$' {
+                    var m = k
+                    while m < n && isWordByte(sql[m]) { m += 1 }
+                    append(mut &parts, low[k..m].toStr())
+                    k = m
+                } else {
+                    break
+                }
+                if k < n && sql[k] == '.' { k += 1 } else { break }
+            }
+            if len(parts) == 0 || len(parts) > 3 { continue }
+            let last = parts[len(parts) - 1]
+            if len(parts) == 1 && (last == "table" || lexdb_sql.isReservedWord(&last) || builtinType(&last)) { continue }
+            // a declaration of one variable, without a value: what follows is not ( , = or another part
+            let after = skipSpace(sql, k)
+            if after < n && (sql[after] == '(' || sql[after] == ',' || sql[after] == '=') { continue }
+            let sc = if len(parts) >= 2 { parts[len(parts) - 2] } else { "" }
+            let key = if sc == "" || sc == "dbo" { last } else { lexdb_sql.qual(&sc, &last) }
+            append(mut &out, TypeRef{at: at, end: k, key: key})
+            i = k
+        } else {
+            i += 1
+        }
+    }
+    return out
+}
+
+const BUILTIN_TYPES: []str = ["int", "bigint", "smallint", "tinyint", "bit", "decimal", "numeric", "money", "smallmoney", "float", "real", "date",
+                               "time", "datetime", "datetime2", "smalldatetime", "datetimeoffset", "char", "varchar", "nchar", "nvarchar", "text",
+                               "ntext", "binary", "varbinary", "image", "uniqueidentifier", "xml", "sql_variant", "sysname", "cursor",
+                               "hierarchyid", "geography", "geometry", "rowversion", "timestamp", "integer", "dec", "character"]
+
+fn builtinType(w: &str): bool {
+    for t in BUILTIN_TYPES { if t == w { return true } }
+    return false
+}
+
+fn skipSpace(s: &str, at: int): int {
+    var i = at
+    while i < len(s) && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r') { i += 1 }
+    return i
+}
+
+// sql with each variable names[i] (lower case, its @ too) outside strings,
+// quoted names and comments made the table name tables[i]: a table-valued
+// parameter's temporary table (lexdb_tds; design/lexdb-tds.md, "As built:
+// table-valued parameters").
+pub fn renameVars(sql: &str, names: &[]str, tables: &[]str): str {
+    if len(names) == 0 { return sql.toStr() }
+    let low = strings.toLowerAscii(sql)
+    let n = len(sql)
+    var out: []byte = []
+    var i = 0
+    while i < n {
+        let c = sql[i]
+        let a = i
+        if c == '\'' {
+            i += 1
+            while i < n && !(sql[i] == '\'' && !(i + 1 < n && sql[i + 1] == '\'')) { if sql[i] == '\'' { i += 1 }; i += 1 }
+            i = min(i + 1, n)
+            appendStr(mut &out, sql[a..i])
+        } else if c == '[' || c == '"' {
+            let close: byte = if c == '[' { ']' } else { '"' }
+            i += 1
+            while i < n && !(sql[i] == close && !(i + 1 < n && sql[i + 1] == close)) { if sql[i] == close { i += 1 }; i += 1 }
+            i = min(i + 1, n)
+            appendStr(mut &out, sql[a..i])
+        } else if c == '-' && i + 1 < n && sql[i + 1] == '-' {
+            while i < n && sql[i] != '\n' { i += 1 }
+            appendStr(mut &out, sql[a..i])
+        } else if c == '/' && i + 1 < n && sql[i + 1] == '*' {
+            i += 2
+            while i < n && !(sql[i] == '*' && i + 1 < n && sql[i + 1] == '/') { i += 1 }
+            i = min(i + 2, n)
+            appendStr(mut &out, sql[a..i])
+        } else if c == '@' && (i == 0 || !isWordByte(sql[i - 1])) {
+            var k = i + 1
+            while k < n && (isWordByte(sql[k]) || sql[k] == '@') { k += 1 }
+            let nm = low[i..k]
+            var hit = -1
+            for j in 0..len(names) { if names[j] == nm { hit = j } }
+            if hit >= 0 { appendStr(mut &out, tables[hit]) } else { appendStr(mut &out, sql[i..k]) }
+            i = k
+        } else {
+            append(mut &out, c)
+            i += 1
+        }
+    }
+    return strFromBytes(&out)
+}
+
+fn isWordByte(c: byte): bool { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '#' || c == '$' || c >= 0x80 }
+
+// "DECLARE <nm> TABLE" (any case) -> "DROP TABLE IF EXISTS <nm>; CREATE TABLE <nm>"
+fn replaceDeclare(text: &str, nm: &str): str {
+    let low = strings.toLowerAscii(text)
+    let pat = "declare"
+    var out: []byte = []
+    var i = 0
+    let n = len(text)
+    while i < n {
+        if i + 7 <= n && low[i..i + 7] == pat && (i == 0 || !isWordByte(text[i - 1])) {
+            var j = i + 7
+            while j < n && (text[j] == ' ' || text[j] == '\t' || text[j] == '\n' || text[j] == '\r') { j += 1 }
+            if j + len(nm) <= n && low[j..j + len(nm)] == strings.toLowerAscii(nm) {
+                var m = j + len(nm)
+                while m < n && (text[m] == ' ' || text[m] == '\t' || text[m] == '\n' || text[m] == '\r') { m += 1 }
+                if m + 5 <= n && low[m..m + 5] == "table" {
+                    appendStr(mut &out, "DROP TABLE IF EXISTS " + nm + "; CREATE TABLE " + nm)
+                    i = m + 5
+                    continue
+                }
+            }
+        }
+        append(mut &out, text[i])
+        i += 1
+    }
+    return strFromBytes(&out)
+}
+
 // A batch of T-SQL. vars: the variables it starts with ($1, $2, ... in that order).
-pub fn parseBatch(sql: &str, d: lexdb_sql.Dialect, vars: &[]str): Result[TBatch, DbErr] {
-    var q = try lexdb_sql.tsqlParser(sql, d, vars)
+pub fn parseBatch(sql0: &str, d: lexdb_sql.Dialect, vars: &[]str): Result[TBatch, DbErr] {
+    let sql = tableVariables(sql0)
+    var q = try lexdb_sql.tsqlParser(&sql, d, vars)
     var out: []TStmt = []
     var types: []TypeName = []
     while true {
@@ -538,7 +786,9 @@ pub fn parseBatch(sql: &str, d: lexdb_sql.Dialect, vars: &[]str): Result[TBatch,
 
 // A parameter of sp_executesql's or sp_prepare's @params: "@p1 int, @p2
 // nvarchar(50) OUTPUT".
-pub type ParamDecl = record { pub name: str; pub typ: TypeName; pub output: bool }
+// tableType: a table type's catalog key (a table-valued parameter), "" for
+// another type; typeText: that type's name as written; readonly: READONLY.
+pub type ParamDecl = record { pub name: str; pub typ: TypeName; pub output: bool; pub tableType: str; pub typeText: str; pub readonly: bool }
 
 pub fn parseParamDecls(text: &str): Result[[]ParamDecl, DbErr] {
     let none: []str = []
@@ -548,11 +798,11 @@ pub fn parseParamDecls(text: &str): Result[[]ParamDecl, DbErr] {
         let t = q.next()
         if t.kind != lexdb_sql.T_VAR { return Err(lexdb_base.err("42601", "syntax error at or near \"" + t.text + "\"")) }
         let a = q.acceptKw("as")
-        let ty = try q.typeName()
+        let pt = try q.paramType()
         if q.acceptKw("=") { let dflt = try q.expr() }
         let output = q.acceptKw("output") || q.acceptKw("out")
         let ro = q.acceptKw("readonly")
-        append(mut &out, ParamDecl{name: t.text, typ: ty, output: output})
+        append(mut &out, ParamDecl{name: t.text, typ: pt.typ, output: output, tableType: pt.key, typeText: pt.written, readonly: ro})
         if !q.acceptKw(",") { break }
     }
     if q.peek().kind != lexdb_sql.T_EOF { return Err(q.unexpected()) }

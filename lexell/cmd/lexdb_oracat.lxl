@@ -1,0 +1,187 @@
+// lexdb_oracat: Oracle's catalog views (V$VERSION, ALL_TABLES, USER_TAB_COLUMNS,
+// DBA_OBJECTS, NLS_SESSION_PARAMETERS, DICTIONARY, ...) for the Oracle door
+// (design/lexdb-oracle.md, O4), as lexdb_syscat gives SQL Server's sys.* to T-SQL
+// sessions. Their shapes (columns, types, order), the rows lexdb takes from
+// Oracle as they are, and a template row for each kind of object are Oracle
+// Database Free's, recorded by tools/gen_oracle_catalog.py in lexdb_oradata;
+// the rows that describe lexdb's own tables lexdb_exec makes from its catalog
+// (oraRows), each from a template row with the columns that describe the
+// object set.
+//
+// A view is a catalog relation as pg_catalog's are (lexdb_pgcat): the Oracle
+// parser makes ALL_TABLES, SYS.ALL_TABLES, V$VERSION (V_$VERSION), a public
+// synonym such as TABS, ... the function "#ora.ALL_TABLES" in FROM, whose rows
+// lexdb_exec makes when the statement runs. PostgreSQL and T-SQL sessions never
+// see them.
+
+import "strings"
+import "./lexdb_oradata"
+
+// A view's column: as DBA_TAB_COLUMNS describes SYS's own view.
+pub type OraCol = record {
+    pub name: str
+    pub typ: str            // VARCHAR2, NUMBER, DATE, TIMESTAMP(6), CHAR, LONG, RAW, ...
+    pub len: int
+    pub prec: int           // -1 none
+    pub scale: int          // -1 none
+    pub nullable: bool
+}
+
+// lexdb's OIDs (as lexdb_sql's; this module is below it)
+const O_INT8 = 20
+const O_TEXT = 25
+const O_FLOAT8 = 701
+const O_BYTEA = 17
+const O_TS = 1114
+const O_TSTZ = 1184
+const O_NUMERIC = 1700
+
+// Public synonyms too short or too common to take a name from a user's table.
+const HIDDEN_SYN: []str = ["TAB", "SYN", "SEQ", "IND", "OBJ", "CLU", "CAT", "COL", "DICT_COLUMNS_X"]
+
+// The name of a view, spelled as SYS's: upper case, V$X as V_$X.
+fn real(name: &str): str {
+    let u = strings.toUpperAscii(name)
+    if strings.startsWith(&u, "V$") { return "V_$" + u[2..len(u)] }
+    if strings.startsWith(&u, "GV$") { return "GV_$" + u[3..len(u)] }
+    return u
+}
+
+fn specOf(view: &str): str {
+    for v in lexdb_oradata.VIEWS {
+        let t = strings.indexOf(&v, "\t", 0)
+        if v[0..t] == view { return v.toStr() }
+    }
+    return ""
+}
+
+// Whether view (a name as SYS has it: V_$VERSION) is served.
+pub fn isView(view: &str): bool { return len(specOf(view)) > 0 }
+
+// Every view's name (as SYS's).
+pub fn viewNames(): []str {
+    var out: []str = []
+    for v in lexdb_oradata.VIEWS { append(mut &out, v[0..strings.indexOf(&v, "\t", 0)].toStr()) }
+    return out
+}
+
+// The view a name in FROM (schema "" if none) means, as SYS's name ("" if it is
+// none of ours): the view itself, in SYS or unqualified, or a PUBLIC synonym of one.
+pub fn relOf(schema: &str, name: &str): str {
+    let sc = strings.toUpperAscii(schema)
+    if len(sc) > 0 && sc != "SYS" && sc != "PUBLIC" { return "" }
+    let r = real(name)
+    if isView(&r) { return "ora." + r }
+    for s in lexdb_oradata.SYNONYMS {
+        let f = strings.split(&s, "\t")
+        if f[0] == strings.toUpperAscii(name) {
+            var hidden = false
+            for h in HIDDEN_SYN { if h == f[0] { hidden = true } }
+            if !hidden { return "ora." + f[1].toStr() }
+        }
+    }
+    return ""
+}
+
+pub fn cols(view: &str): []OraCol {
+    var out: []OraCol = []
+    let s = specOf(view)
+    if len(s) == 0 { return out }
+    let f = strings.split(&s, "\t")
+    for i in 1..len(f) {
+        let p = strings.split(&f[i], ":")
+        append(mut &out, OraCol{name: p[0].toStr(), typ: p[1].toStr(), len: strings.parseIntOpt(p[2]).unwrapOr(0),
+                                prec: strings.parseIntOpt(p[3]).unwrapOr(-1), scale: strings.parseIntOpt(p[4]).unwrapOr(-1),
+                                nullable: p[5] == "1"})
+    }
+    return out
+}
+
+// The lexdb type a column is computed as.
+pub fn lexOid(c: &OraCol): int {
+    let t = c.typ
+    if t == "NUMBER" { return if c.scale > 0 { O_NUMERIC } else { O_INT8 } }
+    if t == "FLOAT" { return O_NUMERIC }
+    if t == "BINARY_DOUBLE" { return O_FLOAT8 }
+    if t == "DATE" || strings.startsWith(&t, "TIMESTAMP") {
+        if strings.contains(&t, "WITH TIME ZONE") || strings.contains(&t, "LOCAL") { return O_TSTZ }
+        return O_TS
+    }
+    if t == "RAW" || t == "LONG RAW" || t == "BLOB" { return O_BYTEA }
+    return O_TEXT
+}
+
+// A view's rows Oracle has: kind "full" (every one lexdb gives) or "template"
+// (one of each kind of object, for lexdb_exec to fill in); values as text, NULL
+// "\x00".
+pub fn rows(view: &str, kind: &str): [][]str {
+    var out: [][]str = []
+    let head = view + "\t" + kind + "\t"
+    for r in lexdb_oradata.ROWS {
+        if !strings.startsWith(&r, &head) { continue }
+        let body = r[len(head)..len(r)]
+        if len(body) == 0 { return out }
+        for row in strings.split(&body, "\x1e") {
+            var vs: []str = []
+            for v in strings.split(&row, "\x1f") { append(mut &vs, v.toStr()) }
+            append(mut &out, vs)
+        }
+    }
+    return out
+}
+
+fn colIndex(cs: &[]OraCol, name: &str): int {
+    for i in 0..len(cs) { if cs[i].name == name { return i } }
+    return -1
+}
+
+// A view's template row for kind want of column col (exact, else the same first
+// word: TIMESTAMP(3) for TIMESTAMP(6), else the first); [] if it has none.
+fn copyRow(r: &[]str): []str {
+    var out: []str = []
+    for v in r { append(mut &out, v.toStr()) }
+    return out
+}
+
+pub fn template(view: &str, col: &str, want: &str): []str {
+    let ts = rows(view, "template")
+    if len(ts) == 0 { return [] }
+    let ci = colIndex(&cols(view), col)
+    if ci < 0 { return copyRow(&ts[0]) }
+    for t in ts { if t[ci] == want { return copyRow(&t) } }
+    let w = strings.split(&want, "(")[0]
+    for t in ts { if strings.split(&t[ci], "(")[0] == w { return copyRow(&t) } }
+    return copyRow(&ts[0])
+}
+
+// The family of an ALL_/USER_/DBA_ view: its scope ("ALL", "USER", "DBA") and
+// base name (TABLES); "" and the name for any other.
+pub type Family = record {
+    pub scope: str
+    pub base: str
+}
+
+pub fn family(view: &str): Family {
+    for p in ["ALL_", "USER_", "DBA_"] {
+        if strings.startsWith(view, &p) { return Family{scope: p[0..len(p) - 1].toStr(), base: view[len(p)..len(view)].toStr()} }
+    }
+    return Family{scope: "", base: view.toStr()}
+}
+
+// The bases lexdb_exec builds the rows of from its catalog.
+pub fn isBuilt(base: &str): bool {
+    match base.toStr() {
+        "TABLES", "TAB_COLUMNS", "TAB_COLS", "INDEXES", "IND_COLUMNS", "CONSTRAINTS", "CONS_COLUMNS", "OBJECTS", "SEQUENCES",
+        "VIEWS", "TAB_COMMENTS", "COL_COMMENTS", "TAB_IDENTITY_COLS", "CATALOG", "SOURCE", "PROCEDURES" { return true }
+        else { return false }
+    }
+}
+
+// The upper-cased name of a view's PUBLIC synonym for view, "" if none.
+pub fn synonymOf(view: &str): str {
+    for s in lexdb_oradata.SYNONYMS {
+        let f = strings.split(&s, "\t")
+        if f[1] == view { return f[0].toStr() }
+    }
+    return ""
+}
