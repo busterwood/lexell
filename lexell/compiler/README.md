@@ -11,6 +11,7 @@ only gcc.
     lexell/compiler/reseed.sh                                  # after a compiler change: rebuild seed/lxlc.c, check the fixed point
     python3 lexell/tools/seed_check.py                         # the fixed point without writing the seed (the gate's first step)
     ./lxlc file.lxl [-O] [-o out] [--run] [-L root] [-- args]   # x86-64 ELF, no gcc (default)
+    ./lxlc --help                                           # every option and environment variable (also -h)
     ./lxlc file.lxl --c [-o out]                            # the C backend: gcc builds the binary
     ./lxlc file.lxl --emit-c                                # print the C to stdout
     ./lxlc --emit-c file.lxl...                             # the C of each program, in `== path` sections
@@ -25,6 +26,8 @@ stop). gcc runs with `-O2 -w`; an `extern "lib"` links `-llib` (or the
 library by its full path when only `libX.so.N` exists). Run a program with
 `LXL_CHECK=1` to make a leak (live objects at exit) exit 5. out/lxlc finds
 the library at `../../lib` (lexell/lib); set `LXL_LIB` to use another.
+`lxlc --help` lists the options and the environment variables (the compiler's, and
+the ones a built program reads at run time).
 
 ## Layout
 

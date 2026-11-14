@@ -9,6 +9,7 @@
 //     lxlc --emit-c file.lxl file.lxl...  the C of each program, in `== path` sections
 //     lxlc --dump-ast file.lxl...          the tree of each file (no imports)
 //     lxlc --dump-types file.lxl...        what sema computes for each program
+//     lxlc --help                          every option and environment variable
 //
 // In the multi-file forms an error is written to stdout as `error: ...` and
 // ends the run (the first error stops the compiler, as in ref).
@@ -42,7 +43,81 @@ import "./elf"
 
 extern "c" fn mkdtemp(template: str): str
 
-const USAGE = "usage: lxlc file.lxl [-O] [-o out] [--run] [--c] [--emit-c] [--native] [-L libroot]\n"
+const USAGE = "usage: lxlc file.lxl [-O] [-o out] [--run] [--c] [--emit-c] [--native] [-L libroot] [-- args]\n       (lxlc --help lists every option and environment variable)\n"
+
+fn help() {
+    let text: []str = [
+    "lxlc: the Lexell compiler",
+    "",
+    "usage: lxlc file.lxl [options] [-- args...]",
+    "       lxlc --emit-c|--dump-ast|--dump-types file.lxl...",
+    "       lxlc --help",
+    "",
+    "Compiles file.lxl to an executable: x86-64 ELF written directly, no C compiler",
+    "(the default), or through C and gcc (--c). Without -o the program is written",
+    "next to the source, without the .lxl (foo.lxl gives foo).",
+    "",
+    "Options",
+    "  -o out             write the executable to out",
+    "  --run              build, run, and exit with the program's status; with no -o the",
+    "                     executable is a temporary one that is removed afterwards",
+    "  --                 the rest of the arguments go to the program (with --run)",
+    "  -O                 optimize: loops and range checks, repeated loads, borrow",
+    "                     inference for str parameters",
+    "  -L dir, -Ldir      add dir to the library import roots (std libraries come from",
+    "                     $LXL_LIB, else lib/ next to compiler/)",
+    "  --native           the native backend (the default; accepted for scripts)",
+    "  --c                the C backend: write C, build it with gcc -O2 -march=x86-64-v3",
+    "  --emit-c           print the C to stdout; nothing is built or run",
+    "  --emit-c-json      print {\"c\": text, \"cmd\": gcc command} (tools/cbuild.py)",
+    "  --borrow-report    print the str parameters the program only reads (declare",
+    "                     them &str), then exit; nothing is built",
+    "  -h, --help         print this help to stdout and exit 0",
+    "",
+    "Other modes (the first argument; one or more files, no imports for --dump-ast):",
+    "  --emit-c f.lxl...      the C of each program, in \"== path\" sections",
+    "  --dump-ast f.lxl...    the parse tree of each file",
+    "  --dump-types f.lxl...  what the type checker computes for each program",
+    "  --encode-test file     the x86-64 encoder test (tools/x64_encode_test.py)",
+    "",
+    "A compile error is printed to stderr as \"file:line: message\" and exits 1 (the",
+    "first error stops the compiler); a usage error prints a usage line to stderr",
+    "and exits 1. In the multi-file modes errors go to stdout as \"error: ...\".",
+    "",
+    "Environment: the compiler",
+    "  LXL_LIB=dir        the library directory (default: ../../lib from out/lxlc)",
+    "  TMPDIR=dir         where --run (no -o) and --c put temporary files (default /tmp)",
+    "  LXL_NOBORROW=1     with -O, skip borrow inference",
+    "  LXL_BORROW_REPORT=all  with --borrow-report, list the kept parameters too",
+    "  LXL_RCSTAT=1       count str dups and drops by kind; the built program prints",
+    "                     \"rcstat: ...\" lines to stderr at exit (design/borrow-inference.md)",
+    "  LXL_INLINE=N       inliner size limit (default 25; 0 turns inlining off)",
+    "  LXL_CSE=0|dry|v    -O: 0 no repeated-load reuse, dry only count, v print counts",
+    "  LXL_LOOPS=0|v      -O: 0 no loop optimization, v print counts to stderr",
+    "  LXL_STRS=0         -O: leave str values out of the loop optimizations",
+    "  LXL_NATIVE_IR=file write the IR as C to file and build nothing (native backend)",
+    "  LXL_NATIVE_MAP=file  write a symbol map \"address size name\" of the executable",
+    "  LXL_FALIGN=N, LXL_PADB=N  native code placement: function alignment (default",
+    "                     64) and padding bytes before each function (default 0)",
+    "  The C backend always runs \"gcc\"; no variable selects another compiler or flags.",
+    "  The build cache (LXL_NOCACHE, LXL_CACHE, LXL_CACHE_MB) belongs to",
+    "  tools/cbuild.py, not to lxlc.",
+    "",
+    "Environment: programs built by lxlc, read when they run",
+    "  LXL_CHECK=1        a leak (live objects at exit) exits 5",
+    "  LXL_HASH_SEED=n    a fixed hash key (decimal) instead of a random one per process",
+    "  LXL_PAR=n          par.map pool threads (default: CPUs - 1, at most 64; 0 runs",
+    "                     every par.map as a loop on the calling thread)",
+    "  LXL_HELPERS=n      helper threads for blocking extern calls (default 4, at most",
+    "                     64; 0 runs them on the program's thread)",
+    "  LXL_URING=0        use epoll and the helper pool instead of io_uring",
+    "  LXL_SPIN_US=n      event loop polls n microseconds before sleeping (0 never,",
+    "                     aN adapts up to N; default adaptive, up to 50)",
+    "  LXL_NO_PIDFD=1     do not use pidfd_open for child processes",
+    "  LXL_NO_VDSO=1      do not use the vDSO clock; make the system call",
+    "  Only the tests read: LXL_PG_*, LXL_REDIS*, LXL_*_LIVE, LXL_LIB_TEST_VAR."]
+    for l in text { writeFd(1, l + "\n") }
+}
 
 fn usage(): never {
     writeFd(2, USAGE)
@@ -373,6 +448,10 @@ fn buildNative(p: ir.Ir, libs: &[]str, src: &str, out: &str, isRun: bool, optim:
 
 fn main() {
     let argv = args()
+    if len(argv) == 2 && (argv[1] == "--help" || argv[1] == "-h") {
+        help()
+        return
+    }
     if len(argv) == 3 && argv[1] == "--encode-test" {      // the x86-64 encoder test (tools/x64_encode_test.py)
         var text = ""
         if readFile(argv[2], mut &text) != 0 { sx.failText("cannot read " + argv[2]) }
@@ -431,6 +510,9 @@ fn main() {
             isNative = false
         } else if a == "--native" {
             isNative = true
+        } else if a == "--help" || a == "-h" {
+            help()
+            return
         } else if a == "-O" {
             optim = true
         } else if a == "--borrow-report" {

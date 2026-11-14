@@ -55,4 +55,27 @@ bad = [(f, m) for f in units for m in [unit(os.path.join(udir, f))] if m]
 for f, m in bad:
     print(f"FAIL unit/{f}: {m}")
 print(f"== tests/compiler/unit: {len(units) - len(bad)} passed, {len(bad)} failed")
-sys.exit(status or (1 if bad else 0))
+
+
+def cli():
+    """--help and -h: the full help on stdout, exit 0; a usage error: stderr, exit 1, points at --help."""
+    bad = []
+    for flag in ('--help', '-h'):
+        r = subprocess.run([cbuild.LXLC, flag], capture_output=True, text=True)
+        need = ['usage: lxlc', '--run', '--emit-c-json', '--borrow-report', '-L dir', 'LXL_LIB', 'TMPDIR', 'LXL_NOBORROW',
+                'LXL_RCSTAT', 'LXL_NATIVE_IR', 'LXL_NATIVE_MAP', 'LXL_INLINE', 'LXL_CSE', 'LXL_LOOPS', 'LXL_STRS',
+                'LXL_PAR', 'LXL_URING', 'LXL_HELPERS', 'LXL_CHECK', 'LXL_HASH_SEED', 'LXL_SPIN_US', 'LXL_NOCACHE']
+        miss = [w for w in need if w not in r.stdout]
+        if r.returncode or r.stderr or miss:
+            bad.append(f"{flag}: exit {r.returncode}, stderr {r.stderr[:80]!r}, missing {miss}")
+    r = subprocess.run([cbuild.LXLC], capture_output=True, text=True)
+    if r.returncode != 1 or r.stdout or '--help' not in r.stderr:
+        bad.append(f"no arguments: exit {r.returncode}, stdout {r.stdout[:80]!r}, stderr {r.stderr[:80]!r}")
+    return bad
+
+
+bad_cli = cli()
+for m in bad_cli:
+    print(f"FAIL cli {m}")
+print(f"== tests/compiler/cli: {3 - len(bad_cli)} passed, {len(bad_cli)} failed")
+sys.exit(status or (1 if bad or bad_cli else 0))

@@ -309,6 +309,13 @@ microseconds), peak RSS (172 MB) and scan times. The binary is 2.5% smaller
 (11.99 MB against 11.70). The server's reads do not copy strings in the
 paths the benchmark runs, so the sweep is for the code that does.
 
-Dups were not counted: `LXL_RCSTAT=1` printed nothing at exit for the server
-or for the lexdb test programs, only the compile line (owned-convention `str`
-parameters left for the pass in `lexdb.lxl -O`: 35 before, 32 after).
+At first dups were not counted: `LXL_RCSTAT=1` printed nothing at exit for
+the server or the lexdb test programs, only the compile line (owned-convention
+`str` parameters left for the pass in `lexdb.lxl -O`: 35 before, 32 after).
+The cause: a program that links libc returns from `main` into libc's `exit`,
+not through `rt_quit`, which was the only caller of the report; `rt_finish`
+now prints it too (`rt_rc_done`, once). Counted afterwards with the same
+compiler, `tests/lexdb/run/exec_agg.lxl -O`, before the sweep (8e5d1b4e)
+against after (001b323f): dups 6526 against 6461 (-1%), literal dups 10396
+against 10355, drops 11215 against 11150, and literal drops 25273 against
+18032 (-29%).

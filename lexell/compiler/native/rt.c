@@ -63,8 +63,12 @@ static int rt_ended;
 /* The end of the program (rt.h's exit): with libc, its exit runs the atexit handlers and
    flushes stdio, after the runtime has flushed its own buffer. */
 static void (*rt_rc_report)(void);         /* rcstat (exp/borrow): the counts at exit */
+static void rt_rc_done(void) {             /* once: main's end (rt_finish) and rt_quit both come here */
+    static int done;
+    if (rt_rc_report && !done) { done = 1; rt_rc_report(); }
+}
 __attribute__((noreturn, noinline)) static void rt_quit(int code) {
-    if (rt_rc_report) rt_rc_report();
+    rt_rc_done();
     rt_ended = 1;
     if (rt_n_libc[0]) ((void (*)(int))rt_n_libc[0])(code);
     sys_exit(code);
@@ -862,6 +866,7 @@ static rt_dfn rt_end_fn;                   /* the program's global drops (task.w
 void rt_on_end(rt_dfn f) { rt_end_fn = f; }
 void rt_finish(void) {
     rt_flush();
+    rt_rc_done();           /* a dynamic program returns from main into libc's exit, not rt_quit */
     rt_ended = 1;
     if (rt_check && rt_live != 0) {
         eputs("Lexell: leak: "); eputd(rt_live); eputs(" live objects at exit at runtime\n");
