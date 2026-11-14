@@ -1115,8 +1115,10 @@ compiler small. None of them needs a change to the rules above.
   inside a process, parking sockets and timers, and C calls on helper
   threads (`blocking`, section 12) are in section 16; several processes for
   several cores are planned ([design/concurrency.md](design/concurrency.md)).
-  Lexell code has no threads (the helper threads run only C): a shared-nothing
-  decision, for safety and for performance.
+  Lexell code has no threads (the helper threads run only C) but for
+  `par.map`'s pool, whose threads run only closures the compiler has proved
+  pure (section 16): a shared-nothing decision, for safety and for
+  performance.
 
 ## 14. Runtime errors
 
@@ -1253,6 +1255,17 @@ loop for sockets (`net`) and timers. The rules the language relies on:
   (up to 50 us, none when they come late); `LXL_SPIN_US=N` polls a fixed N
   microseconds, `0` never, `aN` adapts up to N. Observable behaviour is the
   same either way; only CPU time and latency change.
+- `par.map(xs, f)` (`lib/par.lxl`; design/parallel.md) gives what a loop of
+  `f` over `xs` would, in order, computed on a pool of `LXL_PAR` threads.
+  The calling task parks until the items are done, and is not cancellable
+  meanwhile. `f` must be written at the call (a closure or a named
+  function) and may not change what it captures. Everything `f` can reach,
+  after instantiation, must be a kernel: no I/O, no park, no `var` or
+  `once` global, and no extern other than the maths functions. A call
+  through a function value counts every function of its type whose address
+  is taken. A function whose result is `never` may write to stderr and exit.
+  Otherwise the call is a compile error naming the chain of calls. A trap in
+  `f` stops the program as it would in a loop.
 - `Future[T]` is owned (one place waits for it). Dropping it without
   waiting cancels its task; its scope still waits for the task to finish,
   and its result is dropped then.
@@ -1327,8 +1340,8 @@ loop for sockets (`net`) and timers. The rules the language relies on:
   nothing written before is written twice. A worker shares no memory with
   the supervisor or the other workers: each has a copy of what existed at
   its fork (copy on write). `task.workers` stops the program with exit 15
-  (section 14) when it cannot fork safely: the helper pool has started
-  (threads exist), another task exists, or the event loop holds a
+  (section 14) when it cannot fork safely: the helper pool or the par pool
+  has started (threads exist), another task exists, or the event loop holds a
   registration (a socket that has been waited on, or a signal watch). A
   listener made before the call and not yet used is not a registration: it
   joins each worker's own event loop at its first `accept`, so the workers

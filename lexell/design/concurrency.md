@@ -48,6 +48,9 @@ section 5 records how it was built.
   real program shows a measured bottleneck those alternatives cannot fix.
   The one exception is the helper pool for blocking C calls (C1c): threads
   that run only C code, never Lexell code, invisible to the language.
+  A second, narrow one (2026-11-14, [parallel.md](parallel.md)): `par.map`'s
+  pool, whose threads run only closures the compiler has proved pure, with a
+  heap per thread and no count changed across threads.
 
 - **Q1, Q3 to Q8 as recommended** (section 8): processes are the only way to
   use several cores for now; every task is started from a scope; scheduling

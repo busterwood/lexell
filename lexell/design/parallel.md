@@ -1,6 +1,7 @@
 # Parallel map: pure closures on more cores
 
-Status: design, 2026-11-14. It is being built on the `par` branch. The note
+Status: built, 2026-11-14, on the `par` branch (stages 1 to 5 of section 4;
+section 6 records what was built and measured). The note
 narrows the "no threads" decision of [concurrency.md](concurrency.md)
 section 0 by one exception, like the helper pool's.
 
@@ -288,3 +289,117 @@ called on a worker (2.1's test). This cannot happen if the pass is right.
      formatting kernels;
    - the cost on the main thread of 2.4's compare (the quick benchmarks, and
      the self-build).
+
+## 6. As built (2026-11-14)
+
+### 6.1 Where the build differs from sections 2 to 4
+
+- **lib/par.lxl.** `map` passes `rawAddr(f)` and `rawAddr(xs)` to the
+  runtime: the addresses of the closure and the slice in its frame, which
+  stay put while the call parks.
+  - `rawAddr` and `rawAt` are two new library-only intrinsics, like `intoPtr`.
+    `rawAt` reads a closure or slice back from such an address.
+  - The item function `item[A, T]` boxes `callAt(f, xs, i)`.
+  - `callAt` makes the call through the closure. It exists because a slice
+    read back with `rawAt` may be an argument but not a `let`.
+- **The hash key.** `hash.keyReady()` derives the process key on the calling
+  thread before any worker runs. The kernel pass then allows hash.lxl's four
+  key globals: emit marks them, as it marks string literals' blocks (their
+  count is -1 and nothing writes them).
+- **Stops.** A function whose result is `never` may reach `rt_write_fd`,
+  `rt_exit` and `rt_flush`. Emit marks such functions. This is how `Decimal`'s
+  overflow (`decStop`) and `money`'s stop stay usable in kernels. On a worker,
+  `rt_write_fd` writes unbuffered, `rt_flush` does nothing, and `rt_exit` is a
+  stop forwarded to the main thread (2.7).
+- **Externs allowed.** The C maths of lib/std.lxl (the native runtime's own
+  libm), `lxllib_hash_key` and `lxllib_hash_crc32c`.
+- **Roots.** The pass finds a closure argument either in the call's
+  expression, or in the initializer of, or an assignment to, the local the
+  closure was spilled into. par's `item` and `callAt` instances are marked
+  kernel too. Their call through the closure is not followed: the roots
+  cover it.
+- **Error messages.** IR nodes carry no lines, so emit records each
+  function's source (`label (file:line)`), each lifted closure's line and
+  each global's name. The call's location comes from its `Where` argument.
+- **The main thread's paths.** Each keeps the one test it had before workers
+  existed:
+  - `malloc` tests a flag that is set until the heap is set up, and again
+    once a pool starts.
+  - `free` tests its header word: a worker's tag makes the word large, so a
+    worker's block and a large block take the same branch.
+  - `rt_str_dup`, `rt_str_drop`, `rt_dpush` and `rt_drun`, the out-of-line
+    versions, test `rt_par_span` once.
+  - Every pool path is a hook that `rt_par_start` sets, behind an empty `asm`
+    so that gcc cannot fold in the one function stored in it. A program
+    without `par.map` links none of the pool: hello world is 16,416 bytes, as
+    on main.
+  - An earlier version of stage 1 seemed to cost nothing. That was gcc
+    folding `rt_par_span`, which nothing wrote yet, to 0.
+- **Worker stacks.** A worker's drop-action stack is a mapping of its own,
+  because it outlives its jobs and a heap block belongs to one job's tag.
+  `rt_wme()` reads `rsp` with `asm`, not `__builtin_frame_address`, so its
+  callers need no frame.
+- **Sharing with the helper pool.** Jobs queue under the helper pool's lock,
+  and finish through its done list and eventfd. The eventfd is opened by
+  whichever pool starts first. Workers take ranges of `n / (8 * (threads +
+  1))` items, at least 1.
+
+### 6.2 Measured
+
+8-core Ryzen (16 hardware threads), Linux, `-O`, wall and user time, single
+runs while other sessions were active (load 2.5 to 3.5). `bench/par.lxl`
+maps 64 chunks:
+
+| kernel | 1 thread | 2 | 4 | 8 | speed-up at 8 | user time at 8 vs 1 |
+|---|---:|---:|---:|---:|---:|---:|
+| `hash`: strings built and counted in a Map | 0.437 s | 0.263 | 0.133 | 0.070 | 6.2 × | 1.19 |
+| `decimal`: parse, sum, multiply and round | 0.772 s | 0.444 | 0.229 | 0.121 | 6.4 × | 1.18 |
+| `format`: floats to text | 0.857 s | 0.441 | 0.218 | 0.115 | 7.5 × | 1.05 |
+
+The user-time column is the price of a worker's paths: `str` counts out of
+line, with the log for foreign blocks, and `malloc` and `free` through the
+hooks.
+
+**One call.** `calls` runs 100,000 maps of 8 trivial items:
+
+- as a loop (`LXL_PAR=0`), 0.08 µs a call;
+- with a pool, 0.8 µs a call at 2 threads and 1.6 µs at 8 (futex wakes, and
+  the caller working too).
+
+So `par.map` suits calls of tens of microseconds or more.
+
+**Programs without `par.map`** (bench, `-O`, instructions against main):
+
+| bench | instructions |
+|---|---:|
+| alloc | +1.4% |
+| strings | +0.8% |
+| trees | +1.7% |
+| maps | +0.1% |
+| lists | +2.0% |
+| fib, sieve, loop | 0 |
+
+Wall times are level within noise.
+
+**Tests.** lib/tests: 7 run tests and 7 error tests (`par_*`) on both
+backends:
+- results;
+- strings whose counts the main thread makes;
+- other tasks running meanwhile;
+- each refusal of the kernel pass;
+- traps, overflow, stack overflow and Decimal's stop on workers.
+
+A stress program (4 tasks mapping 600 rounds of up to 2,000 records with
+strings, Maps and arrays) gave the same output in 50 of 50 runs at the
+default pool size, at `LXL_PAR` 1, 2 and 15, at `LXL_PAR=0`, and on the C
+backend, all with no leak under `LXL_CHECK=1`.
+
+### 6.3 Not done
+
+- **The C backend** runs the loop. TSan therefore sees no pool, and the
+  stress program and `LXL_CHECK` carry that weight.
+- **Speed of a worker's paths.** Inline worker versions of dup and drop in
+  kernel functions would recover some of the 5 to 19% user time.
+- **Tiny maps.** No inline threshold by size: `par.map` cannot know an item's
+  cost.
+- **A `kernel` marker, and a `par` block or `par for`** (section 0).

@@ -59,6 +59,7 @@ for leaks.
 | `tns.lxl` | 3,308 | Oracle's TNS and TTC protocol, ported from python-oracledb's thin mode: packets, connect (TLS renegotiation over tcps), fast auth and the classic login with the 12c and 11g verifiers, execute, fetch, binds, the value codecs (NUMBER, DATE, TIMESTAMP[ TZ], BINARY_FLOAT/DOUBLE, BOOLEAN), OUT and IN OUT binds, REF CURSORs and implicit results, the bind placeholder parser |
 | `oracle.lxl` | 1,696 | Oracle Database natively over `tns`, for tasks: connection strings, Conn, Value and typed Param binds, buffered Rows, Stream, errors with ORA- codes, transaction[T], call with OUT binds and REF CURSORs, Pool/Lease on `pool` (stages O1 to O3, O5) |
 | `task.lxl` | 702 | concurrent tasks on one thread: Scope, Future, Promise, Shared, Frozen, all/any, yield, cancellation, sleep, deadlines; signals; worker processes |
+| `par.lxl` | 50 | par.map: a map over a slice on a pool of threads, of a closure the compiler proves pure (design/parallel.md) |
 | `net.lxl` | 1,077 | TCP over IPv4 and IPv6 for tasks: listen (also with SO_REUSEPORT), accept, connect, read, write; name lookup and dial |
 | `tls.lxl` | 1,113 | TLS 1.2 and 1.3 through OpenSSL 3: an engine over memory buffers, and connections over net sockets for tasks; client and server contexts, verification, pins, client certificates, ALPN (a client offers, a server selects) |
 | `proc.lxl` | 614 | other programs: start with pipes, a Command's environment, directory and streams; wait on a pidfd as a task; output, communicate, run; cancellation sends SIGTERM then SIGKILL; PATH lookup in the child's environment; optional process group |
@@ -795,6 +796,36 @@ A `Conn` is used by one task at a time (it is owned). `httpserver` is an
 HTTP/1.1 server built on it, `cmd/httpd.lxl` an example program on that
 (with worker processes and a shared listener: `httpd ADDR POOL WORKERS`),
 `cmd/httpload.lxl` a load client, and `http` an HTTP client.
+
+### par
+
+`par.map(xs: &[A], f: &fn(&A): T): []T` gives what a loop of `f` over `xs`
+would, in order, while a pool of threads works through the items
+(design/parallel.md):
+
+- `f` is a kernel. The compiler refuses the call when `f`, or anything it
+  can reach, could do I/O, park, read or write a `var` or `once` global, or
+  call a C function other than the maths functions and the hash key. The
+  error names the chain of calls from the closure to the first such call.
+  Calls through function values count every function of that type whose
+  address is taken. A function whose result is `never` may write its message
+  to stderr and exit, as `Decimal`'s overflow does; on a pool thread, the
+  main thread then stops the program.
+- `f` is written at the call: a closure, or the name of a function. It may
+  read the variables around it but not change them.
+- The calling task waits as it would for a socket, and other tasks run
+  meanwhile. When no other task could run, the calling thread works through
+  items as well. `par.map` is not cancellable. Inside `Shared.with` it is
+  exit 13, like any park.
+- A trap in `f` (a panic, an overflow, a stack overflow) stops the program
+  with its message and code, as it would in a loop.
+- The pool starts at the first map: `LXL_PAR=N` threads, at most 64. The
+  default is the CPUs the process may use, less one. `LXL_PAR=0` runs every
+  map as a loop on the calling thread. The C backend always runs the loop.
+  `task.workers` refuses to fork once the pool has started.
+- One call costs about 1.6 µs with 8 threads, against 0.08 µs as a loop of
+  8 trivial items. Give it work of tens of microseconds or more per call, and
+  map over chunks to build partial aggregates that the caller merges.
 
 ### proc
 
