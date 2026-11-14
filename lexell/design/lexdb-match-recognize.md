@@ -299,9 +299,8 @@ literal in `cmd/lexdb_tsqlparse.lxl`.
   `join = J_FIRST`, `comma = true`, `on = None`), and `mr = [the clause]`.
 - **The outer FromItem:** `sub` is the wrapper's index in the outer `p.subs`, `alias` is the output alias
   (default `unnamed_subquery`, as for subqueries), and `cols` is the output column list.
-- **Laterality:** the outer item's `lateral` is the input's (a LATERAL subquery or an APPLY item). In the
-  Oracle door it is always false: there `LATERAL (subq) MATCH_RECOGNIZE` gives ORA-00904 for an outer
-  reference **(V)**.
+- **Laterality:** the outer item's `lateral` is the input's (a LATERAL subquery or an APPLY item), in all three doors
+  (D8; Oracle itself refuses it with 62521).
 
 Because the wrapper is an ordinary FROM subquery, joins, CTEs, views, LATERAL, nested MATCH_RECOGNIZE
 (input is a subquery with its own) **(V)**, GROUP BY over the result **(V)** and EXPLAIN all work through
@@ -733,6 +732,11 @@ The answers:
   variable, where Oracle has two. **Recommended: accept the difference**, as for tables and columns.
 - **D8. LATERAL inputs.** **Recommended: allow `LATERAL (subq) MATCH_RECOGNIZE` and `CROSS APPLY` in the
   PG and T-SQL doors**, and follow Oracle (the input is not lateral) in the Oracle door.
+  **Changed by the user (2026-11-14): the Oracle door supports LATERAL inputs too**, as an extension, and
+  does not raise 62521. **Done (2026-11-14):** the Oracle door resolves outer references in a LATERAL input by the
+  PG door's own mechanism (the outer item's `lateral` is no longer cleared for Oracle); an unknown column stays
+  ORA-00904. Oracle's `CROSS APPLY` and `OUTER APPLY` (12c) are accepted as in the T-SQL door. Tests: `tns_oracle`
+  (hand-written, through TNS) and `exec_mr` (the same queries through the PG door).
 
 ## 12. As built (2026-11-14)
 
@@ -798,8 +802,8 @@ real difference, the one below (empty match and SKIP TO FIRST or LAST).
   62504, too many output columns is ORA-01792, a variable named `classifier` or `match_number` is fine. 62519 (a
   MATCH_RECOGNIZE in a subquery of MEASURES) and 62521 (`LATERAL (...) MATCH_RECOGNIZE`, with or without an outer
   reference; with one, 00904 comes first) exist. lexdb gives 0A000 / ORA-03001 for any subquery in the clause (D5), and in
-  the Oracle door treats a LATERAL input as an ordinary one: an outer reference is ORA-00904 as in Oracle, an input with
-  none is accepted where Oracle says 62521. A measure without an alias is always 62505 or 02000 (`MEASURES x PATTERN` takes
+  the Oracle door accepts a LATERAL input (D8, changed by the user: an extension, no 62521) and resolves its outer
+  references as the PG door does. A measure without an alias is always 62505 or 02000 (`MEASURES x PATTERN` takes
   PATTERN for the alias), also for a plain column.
 - **Differences in what lexdb accepts**: a column list after the output alias (`m (x, y)`: Oracle refuses it, ORA-03048),
   `{,}` (as `*`; Oracle takes it too), `a{1,300}` (D6), a quoted and a bare variable of one name (D7).
@@ -814,8 +818,8 @@ real difference, the one below (empty match and SKIP TO FIRST or LAST).
 
 **Not done.**
 - R020 (the window form), and subqueries in MEASURES and DEFINE (D5), as scoped.
-- 62519 and 62521 exactly; `LATERAL` over a `MATCH_RECOGNIZE` input was only tried in the PostgreSQL door and in the T-SQL
-  parser (APPLY).
+- 62519 exactly (62521 is deliberately not raised, D8); `LATERAL` over a `MATCH_RECOGNIZE` input is tested in the
+  PostgreSQL and Oracle doors and in the T-SQL parser (APPLY).
 - Binds in the TNS and TDS generated tests (the PostgreSQL door's `$1` is in `exec_mr`; Oracle's `:1` was not run).
 - The step limit does not count rows scanned inside a DEFINE; the typed sort; MATCH_RECOGNIZE inside PL/SQL blocks and
   T-SQL procedures (the same parser reads them, no test).

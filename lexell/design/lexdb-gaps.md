@@ -352,6 +352,9 @@ parallel. The plan, in place of `CREATE DATABASE ... TEMPLATE`:
   socket can take one.
 - **Reset within a fixture:** a rollback per test (free: the writes are in
   memory until commit), or TRUNCATE.
+- **Built (2026-11-14, lexdb.md 9.123): `--unsafe-no-sync` and `--cache-mb N`.** No-sync makes 2,000 autocommit
+  INSERTs 9.4 times faster (1,280 to 137 ms) and warns at start; it reaches `--replicas` workers and `--replica`.
+  `--cache-mb` takes 1 to 1,048,576. The original plan follows.
 - **To build: a test-only no-sync mode** (`--no-sync` or similar): a
   commit does not wait for fdatasync, about 1 ms a commit on this machine.
   The user wants this. Name it so no one runs production with it, and say

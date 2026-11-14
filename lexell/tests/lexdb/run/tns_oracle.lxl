@@ -124,6 +124,21 @@
 // expect: rawtohex: RAWTOHEX(HEXTORAW('0A0B')),TO_CHAR(SYSDATE,'IYYY')=TO_CHAR(TRUNC(SYSDATE),'IYYY'),TO_CHAR(DATE'2024-12-30','IYYYIW'),TO_CHAR(DATE'2024-03-05','FMMONTHDDTH') = '0A0B'|true|'2025 01'|'March 5th'
 // expect: session time zone: SESSIONTIMEZONE,DBTIMEZONE = '+00:00'|'+00:00'
 // expect: to_char FF: TO_CHAR(TIMESTAMP'2024-03-0513:04:05.5','YYYY-MM-DD"T"HH24:MI:SS.FF'),TO_CHAR(TIMESTAMP'2024-03-0513:04:05.5','FF3') = '2024-03-05T13:04:05.500000000'|'500'
+// expect: create mrl: 0
+// expect: insert mrl: 8
+// expect: mr lateral where: G,C = 'a'|3;'a'|1;'b'|1
+// expect: mr lateral partition by outer: G,K,C = 'a'|'ax'|3;'a'|'ax'|1;'b'|'bx'|1
+// expect: mr lateral order by outer: G,C = 'a'|3;'a'|1;'b'|1
+// expect: mr lateral all rows: G,ID,CL = 'a'|1|'A';'a'|2|'A';'a'|3|'A';'a'|5|'A';'b'|7|'A'
+// expect: mr lateral no outer reference: G,C = 'a'|3;'a'|1;'a'|1;'b'|3;'b'|1;'b'|1
+// expect: mr lateral outer join: G,C = 'a'|3;'a'|1;'b'|1
+// expect: mr lateral unknown column: error 904
+// expect: mr lateral unknown inner column: error 904
+// expect: mr no lateral outer reference: error 904
+// expect: lateral plain: G,N = 'a'|5;'b'|3
+// expect: lateral unknown column: error 904
+// expect: cross apply: G,N = 'a'|5;'b'|3
+// expect: outer apply: G,N = 'a'|1;'c'|NULL
 import "task"
 import "net"
 import "strings"
@@ -298,6 +313,21 @@ fn client(port: &str) {
     q(mut &c, "rawtohex", "select rawtohex(hextoraw('0a0B')), to_char(sysdate, 'IYYY') = to_char(trunc(sysdate), 'IYYY'), to_char(date '2024-12-30', 'IYYY IW'), to_char(date '2024-03-05', 'fmMonth ddth') from dual")
     q(mut &c, "session time zone", "select sessiontimezone, dbtimezone from dual")
     q(mut &c, "to_char FF", "select to_char(timestamp '2024-03-05 13:04:05.5', 'YYYY-MM-DD\"T\"HH24:MI:SS.FF'), to_char(timestamp '2024-03-05 13:04:05.5', 'FF3') from dual")
+    x(mut &c, "create mrl", "create table mrl (id number primary key, g varchar2(5), v number)")
+    x(mut &c, "insert mrl", "insert into mrl select 1,'a',10 from dual union all select 2,'a',20 from dual union all select 3,'a',15 from dual union all select 4,'a',null from dual union all select 5,'a',30 from dual union all select 6,'b',5 from dual union all select 7,'b',6 from dual union all select 8,'b',4 from dual")
+    q(mut &c, "mr lateral where", "select d.g, m.c from (select distinct g from mrl) d, lateral (select * from mrl where mrl.g = d.g) match_recognize (order by id measures count(*) as c pattern (a+) define a as v > 5) m order by d.g, m.c desc")
+    q(mut &c, "mr lateral partition by outer", "select d.g, m.k, m.c from (select distinct g from mrl) d, lateral (select id, v, d.g || 'x' as k from mrl where mrl.g = d.g) match_recognize (partition by k order by id measures count(*) as c pattern (a+) define a as v > 5) m order by d.g, m.c desc")
+    q(mut &c, "mr lateral order by outer", "select d.g, m.c from (select 'a' as g, 1 as s from dual union all select 'b', -1 from dual) d, lateral (select id * d.s as o, v from mrl where mrl.g = d.g) match_recognize (order by o measures count(*) as c pattern (a+) define a as v > 5) m order by d.g, m.c desc")
+    q(mut &c, "mr lateral all rows", "select d.g, m.id, m.cl from (select distinct g from mrl) d, lateral (select * from mrl where mrl.g = d.g) match_recognize (order by id measures classifier() as cl all rows per match pattern (a+) define a as v > 5) m order by d.g, m.id")
+    q(mut &c, "mr lateral no outer reference", "select d.g, m.c from (select distinct g from mrl) d, lateral (select * from mrl) match_recognize (order by id measures count(*) as c pattern (a+) define a as v > 5) m order by d.g, m.c desc")
+    q(mut &c, "mr lateral outer join", "select d.g, m.c from (select distinct g from mrl) d left join lateral (select * from mrl where mrl.g = d.g) match_recognize (order by id measures count(*) as c pattern (a+) define a as v > 5) m on 1 = 1 order by d.g, m.c desc")
+    q(mut &c, "mr lateral unknown column", "select d.g, m.c from (select distinct g from mrl) d, lateral (select * from mrl where mrl.g = d.nope) match_recognize (order by id measures count(*) as c pattern (a+) define a as v > 5) m")
+    q(mut &c, "mr lateral unknown inner column", "select d.g, m.c from (select distinct g from mrl) d, lateral (select * from mrl where nope = d.g) match_recognize (order by id measures count(*) as c pattern (a+) define a as v > 5) m")
+    q(mut &c, "mr no lateral outer reference", "select d.g, m.c from (select distinct g from mrl) d, (select * from mrl where mrl.g = d.g) match_recognize (order by id measures count(*) as c pattern (a+) define a as v > 5) m")
+    q(mut &c, "lateral plain", "select d.g, l.n from (select distinct g from mrl) d, lateral (select count(*) n from mrl where mrl.g = d.g) l order by d.g")
+    q(mut &c, "lateral unknown column", "select d.g, l.n from (select distinct g from mrl) d, lateral (select count(*) n from mrl where mrl.g = d.nope) l")
+    q(mut &c, "cross apply", "select d.g, l.n from (select distinct g from mrl) d cross apply (select count(*) n from mrl where mrl.g = d.g) l order by d.g")
+    q(mut &c, "outer apply", "select d.g, l.n from (select 'a' g from dual union all select 'c' from dual) d outer apply (select id n from mrl where mrl.g = d.g and id = 1) l order by d.g")
     c.logoff()
 }
 

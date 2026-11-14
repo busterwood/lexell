@@ -11636,3 +11636,36 @@ session setting `max_match_steps` (10,000,000 per start row, 54001; 0 none). Eac
 `Run.tick` (turns, statement_timeout), the memo and the output rows count against max_statement_mem. Tests: `match_vm`,
 `exec_mrparse`, `exec_mr`, `exec_mrlimits`, and `tns_mr`, `exec_mrdoors`, `tds_mr` (163 cases each, recorded on Oracle
 Database Free 23ai by gen_mr.py from mr_cases.txt).
+A LATERAL input (and Oracle 12c's CROSS APPLY and OUTER APPLY) resolves outer references in the Oracle door as in the PostgreSQL door, an
+extension on Oracle, which raises 62521; tests in `tns_oracle` and `exec_mr`. In the Oracle door a qualifier naming no FROM item is
+ORA-00904 (was 942).
+
+### 9.123 Test options: --unsafe-no-sync and --cache-mb
+
+Built for the fast per-worker test servers of lexdb-gaps.md 2.7.
+
+- **`--unsafe-no-sync`** (tests only): no fdatasync and no fsync. There are two places that sync, both in
+  `lexdb_disk.lxl`: `File.flush` (fdatasync: log commits, checkpoint and data file) and `Fs.syncDir` (after a create,
+  rename or remove; the log segment switch, the spare file and the checkpoint all go through them). With the flag
+  (`lexdb_disk.setNoSync`, one module variable, set in `main` before anything starts) both return at once. Data is still
+  written with pwrite, so a clean stop and restart keeps everything, and so does a SIGKILL of the process (the kernel
+  keeps its page cache); only a power cut or kernel crash can lose or tear it. The simulated `Fs` is untouched: its
+  flush is the model of durability, so `store_crash`, `disk_sim` and `tests/lexdb/crash.py` still test with syncing on
+  (crash.py does not pass the flag). A warning line goes to stderr at start. Workers of `--replicas` are forks, so they
+  inherit the flag, and `--replica` takes it too (a replica writes its own files); no combination is refused.
+- **`--cache-mb N`**: the cache budget, 1 to 1,048,576 MB; anything else (zero, negative, not a number, or too big to
+  parse as an integer) exits 2 with a message, so the `N * 1048576` can never overflow. The default is a quarter of the
+  memory, 128 MB at least (`opts0`), which is where "cache 4 of 11987 MB" came from. The option beats
+  `LEXDB_CACHE_MB`, which is now checked the same way (it used to ignore 0 and could overflow).
+- **Measured** (btrfs, one psql session running a file, 2,000 autocommit single-row INSERTs into a table with a primary
+  key; then 500 pairs of INSERT and TRUNCATE; two runs each, they agreed within 1%):
+
+  | | default | `--unsafe-no-sync` |
+  |---|---|---|
+  | 2,000 autocommit INSERTs | 1,275 to 1,287 ms (0.64 ms each) | 136 to 139 ms (0.07 ms each) |
+  | 500 INSERT + TRUNCATE pairs | 639 to 641 ms | 67 ms |
+
+  About 9.4 times faster.
+- Tests: `tests/lexdb/nosync.py` (stand-alone, like crash.py and replica.py): bad `--cache-mb` values refused, the
+  warning, the stop line's budget, a clean stop and restart keeping the rows (after a TRUNCATE too), and a supervised
+  master with a replica under the flag.
