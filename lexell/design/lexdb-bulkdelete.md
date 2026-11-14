@@ -337,7 +337,7 @@ written again by the checkpoint as any dirty leaf is. A queued upgrade
 - **Temporary tables:** fine. They are logged like any table (9.96).
 - **Statistics:** `noteChg` with n. `ANALYZE` estimates go stale until
   auto-analyze, as today.
-- **WAITFOR consumers** (lexdb-events): producers append above the
+- **Waiting-SELECT consumers** (lexdb-events): producers append above the
   cursor and the purge removes below it, so there is no conflict. The
   `floor` column is the application's.
 
@@ -433,7 +433,10 @@ those is asked for.
 
 ## 4. Decisions for the user
 
-Each has a recommendation.
+Each has a recommendation. **Decided 2026-11-14: the user took every
+recommendation** (D1 a; D2 a, then b; D3 a; D4 a, then b; D5 yes; D6 a,
+after step 1; D7 yes, in stage 1). So stages 1 to 6 and 8 are to be built;
+stage 7 (D3-b) waits for a schema that needs it.
 
 - **D1. The count.**
   - (a) Exact, from raw leaf headers: the leaves are read, but nothing per
