@@ -74,7 +74,7 @@ fn run(name: str, steps: &[]ht.Step, method: str, want: &[]str, mode: int, size:
         let c = http.newClient(http.defaults())
         var bad = ""
         for i in 0..len(want) {
-            let rq = http.request(method, u)
+            let rq = http.request(&method, &u)
             let got = body(c.send(&rq), mode, size)
             if got != want[i] {
                 bad = bad + " request " + intToStr(i) + ": " + intToStr(len(got)) + " bytes, want " + intToStr(len(want[i])) + ": " + got[0..min(len(got), 120)]

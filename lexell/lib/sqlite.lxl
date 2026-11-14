@@ -130,7 +130,8 @@ pub fn version(): str { return sqlite3_libversion() }
 pub fn errorText(code: int): str { return sqlite3_errstr(i32(code)) }
 
 fn sqlError(db: ptr, rc: int): Error {
-    return sqldialect.dbError(rc, if isNull(db) { sqlite3_errstr(i32(rc)) } else { sqlite3_errmsg(db) })
+    let msg: str = if isNull(db) { sqlite3_errstr(i32(rc)) } else { sqlite3_errmsg(db) }
+    return sqldialect.dbError(rc, &msg)
 }
 
 // -------------------------------------------------------------- connections
@@ -146,10 +147,10 @@ fn (d: mut &Db) drop() {
 
 // Opens (creating) the database at path, ":memory:" for a private in-memory
 // one, or a file: URI.
-pub fn open(path: str): Result[Db, Error] { return openWith(path, OPEN_READWRITE | OPEN_CREATE | OPEN_URI) }
+pub fn open(path: &str): Result[Db, Error] { return openWith(path, OPEN_READWRITE | OPEN_CREATE | OPEN_URI) }
 
 // Opens with sqlite3_open_v2's flags (OPEN_READONLY, ...).
-pub fn openWith(path: str, flags: int): Result[Db, Error] {
+pub fn openWith(path: &str, flags: int): Result[Db, Error] {
     try sqldialect.noNul(path, "database path")
     var h = nullPtr()
     let rc = int(sqlite3_open_v2(path, mut &h, i32(flags), nullPtr()))
@@ -173,7 +174,7 @@ pub fn (var d: Db) close(): Result[Unit, Error] {
 }
 
 // Runs a script of any number of statements, without parameters or results.
-pub fn (d: &Db) exec(script: str): Result[Unit, Error] {
+pub fn (d: &Db) exec(script: &str): Result[Unit, Error] {
     try sqldialect.noNul(script, "SQL text")
     var msg = nullPtr()
     let cc = task.onCancelCall(interrupt, d.h)   // cancelled or past the deadline: sqlite3_interrupt
@@ -181,12 +182,12 @@ pub fn (d: &Db) exec(script: str): Result[Unit, Error] {
     if rc == SQLITE_OK { return Ok(Unit{}) }
     let text = if isNull(msg) { sqlite3_errstr(i32(rc)) } else { strFromC(msg) }
     sqlite3_free(msg)
-    return Err(sqldialect.dbError(rc, text))
+    return Err(sqldialect.dbError(rc, &text))
 }
 
 // Compiles one statement. Text after it other than spaces and comments is an
 // error: use exec for a script.
-pub fn (d: &Db) prepare(sql: str): Result[Stmt, Error] {
+pub fn (d: &Db) prepare(sql: &str): Result[Stmt, Error] {
     try sqldialect.noNul(sql, "SQL text")
     let text = ffi.cstr(sql)          // our copy, so that the tail points into live memory
     var st = nullPtr()
@@ -197,7 +198,7 @@ pub fn (d: &Db) prepare(sql: str): Result[Stmt, Error] {
     let s = Stmt{h: st, db: d.h, row: false}   // finalized when dropped, on every path below
     if isNull(st) { return Err(sqldialect.inputError("no SQL statement in the text")) }
     var more = false
-    if len(strings.trim(strFromC(tail))) > 0 {
+    if len(strings.trim(&(strFromC(tail)))) > 0 {
         var next = nullPtr()
         var rest = nullPtr()
         let rc2 = sqlite3_prepare_v2(d.h, tail, -1, mut &next, mut &rest)
@@ -209,7 +210,7 @@ pub fn (d: &Db) prepare(sql: str): Result[Stmt, Error] {
 }
 
 // Prepares sql and binds args to its parameters, in order.
-pub fn (d: &Db) query(sql: str, args: &[Value]): Result[Stmt, Error] {
+pub fn (d: &Db) query(sql: &str, args: &[Value]): Result[Stmt, Error] {
     var st = try d.prepare(sql)
     try st.bindAll(args)
     return Ok(st)
@@ -217,11 +218,11 @@ pub fn (d: &Db) query(sql: str, args: &[Value]): Result[Stmt, Error] {
 
 // Prepares a fragment with `?` placeholders and binds its arguments.
 pub fn (d: &Db) querySql(q: &Sql): Result[Stmt, Error] {
-    return d.query(q.render(sqldialect.Dialect.Sqlite), q.args())
+    return d.query(&(q.render(sqldialect.Dialect.Sqlite)), q.args())
 }
 
 // Runs one statement with args to its end; the number of rows it changed.
-pub fn (d: &Db) run(sql: str, args: &[Value]): Result[int, Error] {
+pub fn (d: &Db) run(sql: &str, args: &[Value]): Result[int, Error] {
     var st = try d.query(sql, args)
     while try st.step() {}
     return Ok(d.changes())
@@ -297,7 +298,7 @@ pub fn (s: mut &Stmt) bind(i: int, v: Value): Result[Unit, Error] {
         Value.Float(f) { rc = int(sqlite3_bind_double(s.h, n, f)) }
         Value.Bool(b) { rc = int(sqlite3_bind_int64(s.h, n, if b { 1 } else { 0 })) }
         Value.Text(t) {
-            try sqldialect.noNul(t, "text value")
+            try sqldialect.noNul(&t, "text value")
             if len(t) > 2147483647 { return Err(sqldialect.inputError("text value is too long")) }
             rc = int(sqlite3_bind_text(s.h, n, t, i32(len(t)), TRANSIENT))
         }
@@ -316,7 +317,7 @@ pub fn (s: mut &Stmt) bind(i: int, v: Value): Result[Unit, Error] {
 // Binds args to parameters 1, 2, ...; there must be one for each parameter.
 pub fn (s: mut &Stmt) bindAll(args: &[Value]): Result[Unit, Error] {
     if len(args) != s.paramCount() {
-        return Err(sqldialect.inputError(len(args).toStr() + " arguments for " + s.paramCount().toStr() + " parameters"))
+        return Err(sqldialect.inputError(&(len(args).toStr() + " arguments for " + s.paramCount().toStr() + " parameters")))
     }
     for i in 0..len(args) { try s.bind(i + 1, args[i]) }
     return Ok(Unit{})
@@ -341,7 +342,7 @@ pub fn (s: &Stmt) columnName(col: int): Result[str, Error] {
 // The storage class of col in the current row (INTEGER ... NULL).
 fn (s: &Stmt) check(col: int, needRow: bool): Result[int, Error] {
     if col < 0 || col >= s.columnCount() {
-        return Err(sqldialect.inputError("column " + col.toStr() + " out of range (" + s.columnCount().toStr() + " columns)"))
+        return Err(sqldialect.inputError(&("column " + col.toStr() + " out of range (" + s.columnCount().toStr() + " columns)")))
     }
     if needRow && !s.row { return Err(sqldialect.inputError("no current row")) }
     return Ok(if needRow { int(sqlite3_column_type(s.h, i32(col))) } else { 0 })
@@ -349,13 +350,13 @@ fn (s: &Stmt) check(col: int, needRow: bool): Result[int, Error] {
 
 fn (s: &Stmt) kind(col: int): Result[int, Error] {
     let t = try s.check(col, true)
-    if t == NULL { return Err(sqldialect.dbError(sqldialect.E_NULL, "column " + col.toStr() + " is NULL")) }
+    if t == NULL { return Err(sqldialect.dbError(sqldialect.E_NULL, &("column " + col.toStr() + " is NULL"))) }
     return Ok(t)
 }
 
-fn typeError(col: int, want: str, t: int): Error {
+fn typeError(col: int, want: &str, t: int): Error {
     let names = ["", "INTEGER", "REAL", "TEXT", "BLOB", "NULL"]
-    return sqldialect.dbError(sqldialect.E_TYPE, "column " + col.toStr() + " is " + names[t] + ", not " + want)
+    return sqldialect.dbError(sqldialect.E_TYPE, &("column " + col.toStr() + " is " + names[t] + ", not " + want))
 }
 
 pub fn (s: &Stmt) isNull(col: int): Result[bool, Error] { return Ok(try s.check(col, true) == NULL) }
@@ -412,9 +413,9 @@ fn (s: &Stmt) raw(col: int): str {
 pub fn (s: &Stmt) decimal(col: int): Result[Decimal, Error] {
     let t = try s.kind(col)
     if t == INTEGER { return Ok(decimalOf(sqlite3_column_int64(s.h, i32(col)))) }
-    if t == REAL { return Err(sqldialect.dbError(sqldialect.E_INEXACT, "column " + col.toStr() + " is REAL, not an exact decimal")) }
+    if t == REAL { return Err(sqldialect.dbError(sqldialect.E_INEXACT, &("column " + col.toStr() + " is REAL, not an exact decimal"))) }
     if t != TEXT { return Err(typeError(col, "a decimal", t)) }
-    return sqldialect.parseDecimal(s.raw(col))
+    return sqldialect.parseDecimal(&(s.raw(col)))
 }
 
 // None for NULL (never zero), otherwise as decimal().

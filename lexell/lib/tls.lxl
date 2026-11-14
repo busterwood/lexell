@@ -202,12 +202,12 @@ pub fn (e: Error) isCancelled(): bool { return e.kind == Kind.Cancelled }
 
 fn noCause(): io.IoError { return io.ioError(0, "", "") }
 
-fn fail(k: Kind, msg: str, code: int, peer: str): Error {
+fn fail(k: Kind, msg: &str, code: int, peer: &str): Error {
     return Error{kind: k, msg: msg, code: code, peer: peer, cause: noCause()}
 }
 
 // The error of a socket call.
-fn ioFail(e: io.IoError, peer: str): Error {
+fn ioFail(e: io.IoError, peer: &str): Error {
     let k = if e.isTimeout() { Kind.Timeout } else if e.isCancelled() { Kind.Cancelled } else { Kind.Io }
     return Error{kind: k, msg: e.toStr(), code: e.errno, peer: peer, cause: e}
 }
@@ -216,7 +216,7 @@ fn ioFail(e: io.IoError, peer: str): Error {
 // repeats), emptied; what when it is empty.
 type Queue = value record { text: str; code: int }
 
-fn drainQueue(what: str): Queue {
+fn drainQueue(what: &str): Queue {
     var text = ""
     var first = 0
     var buf = array(256, byte(0))
@@ -234,29 +234,29 @@ fn drainQueue(what: str): Queue {
             while k > 0 && r[k - 1] != ':' { k -= 1 }
             r = r[k..]
         }
-        if !strings.contains(text, r) { text = if len(text) == 0 { r } else { text + "; " + r } }
+        if !strings.contains(&text, &r) { text = if len(text) == 0 { r } else { text + "; " + r } }
     }
     if len(text) == 0 { text = what }
     return Queue{text: text, code: first}
 }
 
-fn queueFail(k: Kind, what: str, peer: str): Error {
+fn queueFail(k: Kind, what: &str, peer: &str): Error {
     let q = drainQueue(what)
-    return fail(k, q.text, q.code, peer)
+    return fail(k, &q.text, q.code, peer)
 }
 
 // A file of the options that OpenSSL could not load: "the CA file x.pem: No
 // such file or directory" when it cannot be read, else OpenSSL's reasons
 // ("the CA file x.pem: no certificate or crl found").
-fn fileFail(what: str, file: str): Error {
+fn fileFail(what: &str, file: &str): Error {
     match fs.stat(file) {
         Err(e) {
             ERR_clear_error()
-            return fail(Kind.Config, what + " " + file + ": " + io.errorText(e.errno), e.errno, "")
+            return fail(Kind.Config, &(what + " " + file + ": " + io.errorText(e.errno)), e.errno, "")
         }
         Ok(_) {
             let q = drainQueue("cannot load it")
-            return fail(Kind.Config, what + " " + file + ": " + q.text, q.code, "")
+            return fail(Kind.Config, &(what + " " + file + ": " + q.text), q.code, "")
         }
     }
 }
@@ -316,7 +316,7 @@ pub fn defaults(): Options {
 }
 
 // "AB:cd:..." fingerprints as lowercase hex without colons, joined by ",".
-fn normalPins(s: str): Result[str, str] {
+fn normalPins(s: &str): Result[str, str] {
     var out = ""
     for part in strings.splitByte(s, ',') {
         var b = newStrBuf()
@@ -352,10 +352,10 @@ fn alpnSelect(ssl: ptr, out: ptr, outlen: ptr, inp: ptr, inlen: u32, arg: ptr): 
 }
 
 // ALPN's wire form: each protocol after its length byte.
-fn alpnWire(s: str): Result[[]byte, str] {
+fn alpnWire(s: &str): Result[[]byte, str] {
     var b: []byte = []
     for part in strings.splitByte(s, ',') {
-        let p = strings.trim(part)
+        let p = strings.trim(&part)
         if len(p) == 0 { continue }
         if len(p) > 255 { return Err("an ALPN protocol name over 255 bytes") }
         append(mut &b, byte(len(p)))
@@ -365,10 +365,10 @@ fn alpnWire(s: str): Result[[]byte, str] {
 }
 
 // The protocols of an alpn option, trimmed, without empty ones, joined by ",".
-fn alpnNormal(s: str): str {
+fn alpnNormal(s: &str): str {
     var ps: []str = []
     for part in strings.splitByte(s, ',') {
-        let p = strings.trim(part)
+        let p = strings.trim(&part)
         if len(p) > 0 { append(mut &ps, p) }
     }
     return strings.join(&ps, ",")
@@ -403,9 +403,9 @@ pub fn client(o: Options): Result[Context, Error] { return newContext(&o, false)
 pub fn server(o: Options): Result[Context, Error] { return newContext(&o, true) }
 
 fn newContext(o: &Options, server: bool): Result[Context, Error] {
-    let pins = match normalPins(o.pins) {
+    let pins = match normalPins(&o.pins) {
         Ok(p) { p }
-        Err(m) { return Err(fail(Kind.Config, m, 0, "")) }
+        Err(m) { return Err(fail(Kind.Config, &m, 0, "")) }
     }
     if versionCode(o.minVersion) > versionCode(o.maxVersion) {
         return Err(fail(Kind.Config, "minVersion is above maxVersion", 0, ""))
@@ -415,7 +415,7 @@ fn newContext(o: &Options, server: bool): Result[Context, Error] {
     if isNull(h) { return Err(queueFail(Kind.Config, "SSL_CTX_new failed", "")) }
     OPEN += 1
     var c = Context{ctx: h, server: server, verify: false, pins: pins, names: o.verifyName, sni: o.sni,
-                    alpn: alpnNormal(o.alpn)}   // freed by its drop on an error below
+                    alpn: alpnNormal(&o.alpn)}   // freed by its drop on an error below
     if SSL_CTX_ctrl(h, i32(SSL_CTRL_SET_MIN_PROTO_VERSION), versionCode(o.minVersion), nullPtr()) != 1 ||
        SSL_CTX_ctrl(h, i32(SSL_CTRL_SET_MAX_PROTO_VERSION), versionCode(o.maxVersion), nullPtr()) != 1 {
         return Err(queueFail(Kind.Config, "cannot set the protocol versions", ""))
@@ -427,11 +427,11 @@ fn newContext(o: &Options, server: bool): Result[Context, Error] {
                 return Err(queueFail(Kind.Config, "cannot load the system's trust store", ""))
             }
         }
-        try loadCas(h, o.caFile, o.caDir)
+        try loadCas(h, &o.caFile, &o.caDir)
         SSL_CTX_set_verify(h, i32(SSL_VERIFY_PEER), nullPtr())
         c.verify = true
     } else if server && len(o.clientCaFile) > 0 {
-        try loadCas(h, o.clientCaFile, "")
+        try loadCas(h, &o.clientCaFile, "")
         SSL_CTX_set_verify(h, i32(SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT), nullPtr())
         c.verify = true
     } else {
@@ -439,23 +439,23 @@ fn newContext(o: &Options, server: bool): Result[Context, Error] {
     }
     if len(o.certFile) > 0 {
         if SSL_CTX_use_certificate_chain_file(h, o.certFile) != 1 {
-            return Err(fileFail("the certificate file", o.certFile))
+            return Err(fileFail("the certificate file", &o.certFile))
         }
         let key = if len(o.keyFile) > 0 { o.keyFile } else { o.certFile }
         if SSL_CTX_use_PrivateKey_file(h, key, i32(SSL_FILETYPE_PEM)) != 1 {
-            return Err(fileFail("the key file", key))
+            return Err(fileFail("the key file", &key))
         }
         if SSL_CTX_check_private_key(h) != 1 {
             ERR_clear_error()
-            return Err(fail(Kind.Config, "the key file " + key + " does not match the certificate", 0, ""))
+            return Err(fail(Kind.Config, &("the key file " + key + " does not match the certificate"), 0, ""))
         }
     } else if server {
         return Err(fail(Kind.Config, "a server needs a certificate (certFile)", 0, ""))
     }
     if len(c.alpn) > 0 {
-        let wire = match alpnWire(c.alpn) {
+        let wire = match alpnWire(&c.alpn) {
             Ok(b) { b }
-            Err(m) { return Err(fail(Kind.Config, m, 0, "")) }
+            Err(m) { return Err(fail(Kind.Config, &m, 0, "")) }
         }
         if server {
             SSL_CTX_set_alpn_select_cb(h, alpnSelect, nullPtr())    // each engine holds the list
@@ -467,7 +467,7 @@ fn newContext(o: &Options, server: bool): Result[Context, Error] {
     return Ok(c)
 }
 
-fn loadCas(h: ptr, file: str, dir: str): Result[Unit, Error] {
+fn loadCas(h: ptr, file: &str, dir: &str): Result[Unit, Error] {
     if len(file) > 0 && SSL_CTX_load_verify_file(h, file) != 1 {
         return Err(fileFail("the CA file", file))
     }
@@ -492,7 +492,7 @@ pub fn (c: &Context) isServer(): bool { return c.server }
 pub fn (c: &Context) alpn(): str { return c.alpn }
 
 // Whether h is an IPv4 or IPv6 address literal (no SNI is sent for one).
-fn isIpLiteral(h: str): bool {
+fn isIpLiteral(h: &str): bool {
     if strings.contains(h, ":") { return true }
     var dots = 0
     for i in 0..len(h) {
@@ -506,15 +506,15 @@ fn isIpLiteral(h: str): bool {
 // serverName is the name sent as SNI and checked against the certificate
 // (an IP address is checked as one, and sends no SNI); "" only with
 // insecureSkipVerify. A server's serverName is only used in errors.
-pub fn (c: &Context) engine(serverName: str): Result[Engine, Error] {
-    var host = serverName
+pub fn (c: &Context) engine(serverName: &str): Result[Engine, Error] {
+    var host: str = serverName
     if len(host) > 1 && host[0] == '[' && host[len(host) - 1] == ']' { host = host[1..len(host) - 1] }
     if !c.server && c.verify && c.names && len(host) == 0 {
         return Err(fail(Kind.Config, "a server name is needed to verify the server's certificate", 0, ""))
     }
     ERR_clear_error()
     let ssl = SSL_new(c.ctx)
-    if isNull(ssl) { return Err(queueFail(Kind.Config, "SSL_new failed", host)) }
+    if isNull(ssl) { return Err(queueFail(Kind.Config, "SSL_new failed", &host)) }
     let rb = BIO_new(BIO_s_mem())
     let wb = BIO_new(BIO_s_mem())
     if isNull(rb) || isNull(wb) { panic("tls: out of memory (BIO_new)") }
@@ -526,20 +526,20 @@ pub fn (c: &Context) engine(serverName: str): Result[Engine, Error] {
         SSL_set_accept_state(ssl)
         if len(c.alpn) > 0 {
             // alpnSelect's list: the wire form and a 0 byte, as long as the SSL
-            let wire = alpnWire(c.alpn).unwrap()    // checked by newContext
-            let m = ffi.copyBytes(strFromBytes(&wire) + "\x00")
+            let wire = alpnWire(&c.alpn).unwrap()    // checked by newContext
+            let m = ffi.copyBytes(&(strFromBytes(&wire) + "\x00"))
             let r = SSL_set_ex_data(ssl, i32(0), m.ptr())
             e.alpn = Some(m)
         }
     } else {
         SSL_set_connect_state(ssl)
         if len(host) > 0 {
-            if c.sni && !isIpLiteral(host) &&
+            if c.sni && !isIpLiteral(&host) &&
                SSL_ctrl(ssl, i32(SSL_CTRL_SET_TLSEXT_HOSTNAME), TLSEXT_NAMETYPE_host_name, host) != 1 {
-                return Err(queueFail(Kind.Config, "cannot set the server name (SNI)", host))
+                return Err(queueFail(Kind.Config, "cannot set the server name (SNI)", &host))
             }
             if c.verify && c.names && SSL_set1_host(ssl, host) != 1 {
-                return Err(queueFail(Kind.Config, "cannot set the name to verify", host))
+                return Err(queueFail(Kind.Config, "cannot set the name to verify", &host))
             }
         }
     }
@@ -548,7 +548,7 @@ pub fn (c: &Context) engine(serverName: str): Result[Engine, Error] {
 
 // A client connection over sock: the handshake, the task parked on the
 // socket meanwhile. serverName as for engine.
-pub fn (c: &Context) connect(sock: net.Conn, serverName: str, w: Where): Result[Conn, Error] {
+pub fn (c: &Context) connect(sock: net.Conn, serverName: &str, w: Where): Result[Conn, Error] {
     let e = try c.engine(serverName)
     var conn = over(e, sock)
     try conn.handshake(w)
@@ -590,7 +590,7 @@ fn (e: mut &Engine) drop() {
     }
 }
 
-fn (e: &Engine) err(k: Kind, msg: str): Error { return fail(k, msg, 0, e.host) }
+fn (e: &Engine) err(k: Kind, msg: &str): Error { return fail(k, msg, 0, &e.host) }
 
 // Gives ciphertext that arrived from the peer to the engine.
 pub fn (e: mut &Engine) feed(data: &[byte]) {
@@ -665,9 +665,9 @@ pub fn (e: mut &Engine) handshake(): Result[bool, Error] {
     let v = SSL_get_verify_result(e.ssl)
     if e.verify && v != X509_V_OK {
         ERR_clear_error()
-        return Err(fail(Kind.Verify, X509_verify_cert_error_string(v), v, e.host))
+        return Err(fail(Kind.Verify, &(X509_verify_cert_error_string(v)), v, &e.host))
     }
-    return Err(queueFail(Kind.Handshake, "the handshake failed (SSL error " + intToStr(k) + ")", e.host))
+    return Err(queueFail(Kind.Handshake, &("the handshake failed (SSL error " + intToStr(k) + ")"), &e.host))
 }
 
 fn (e: mut &Engine) checkPins(): Result[Unit, Error] {
@@ -676,11 +676,11 @@ fn (e: mut &Engine) checkPins(): Result[Unit, Error] {
         Some(c) { c.sha256 }
         None { "" }
     }
-    for p in strings.splitByte(e.pins, ',') {
+    for p in strings.splitByte(&e.pins, ',') {
         if p == got { return Ok(Unit{}) }
     }
     e.state = ST_FAILED
-    return Err(fail(Kind.Verify, "the certificate is not one of the pinned ones (sha256 " + got + ")", 0, e.host))
+    return Err(fail(Kind.Verify, &("the certificate is not one of the pinned ones (sha256 " + got + ")"), 0, &e.host))
 }
 
 // Plaintext into buf: Ok(n > 0) bytes, Ok(0) when the peer has sent
@@ -700,7 +700,7 @@ pub fn (e: mut &Engine) read(buf: mut &[byte]): Result[int, Error] {
     if k == SSL_ERROR_WANT_READ { return Ok(WANT_INPUT) }
     if k == SSL_ERROR_ZERO_RETURN { return Ok(0) }
     e.state = ST_FAILED
-    return Err(queueFail(Kind.Protocol, "read failed (SSL error " + intToStr(k) + ")", e.host))
+    return Err(queueFail(Kind.Protocol, &("read failed (SSL error " + intToStr(k) + ")"), &e.host))
 }
 
 // Encrypts all of data into the output. The handshake must be done.
@@ -715,7 +715,7 @@ pub fn (e: mut &Engine) write(data: &[byte]): Result[Unit, Error] {
         if r <= 0 {
             let k = int(SSL_get_error(e.ssl, r))
             e.state = ST_FAILED
-            return Err(queueFail(Kind.Protocol, "write failed (SSL error " + intToStr(k) + ")", e.host))
+            return Err(queueFail(Kind.Protocol, &("write failed (SSL error " + intToStr(k) + ")"), &e.host))
         }
         off += int(r)
     }
@@ -796,8 +796,8 @@ const NID_sha1 = 64
 // signature algorithm".
 pub fn (e: &Engine) endPoint(): Result[str, Error] {
     let x = SSL_get1_peer_certificate(e.ssl)
-    if isNull(x) { return Err(fail(Kind.Verify, "no server certificate to take the channel binding data from", 0, e.host)) }
-    let r = certEndPoint(x, e.host)
+    if isNull(x) { return Err(fail(Kind.Verify, "no server certificate to take the channel binding data from", 0, &e.host)) }
+    let r = certEndPoint(x, &e.host)
     X509_free(x)
     return r
 }
@@ -806,11 +806,11 @@ pub fn (e: &Engine) endPoint(): Result[str, Error] {
 // (SCRAM-SHA-256-PLUS, as PostgreSQL's server computes it).
 pub fn (e: &Engine) ownEndPoint(): Result[str, Error] {
     let x = SSL_get_certificate(e.ssl)          // not a new reference: not freed
-    if isNull(x) { return Err(fail(Kind.Verify, "no certificate of our own to take the channel binding data from", 0, e.host)) }
-    return certEndPoint(x, e.host)
+    if isNull(x) { return Err(fail(Kind.Verify, "no certificate of our own to take the channel binding data from", 0, &e.host)) }
+    return certEndPoint(x, &e.host)
 }
 
-fn certEndPoint(x: ptr, host: str): Result[str, Error] {
+fn certEndPoint(x: ptr, host: &str): Result[str, Error] {
     var dig = array(1, i32(0))
     var pk = array(1, i32(0))
     var md = nullPtr()
@@ -818,12 +818,12 @@ fn certEndPoint(x: ptr, host: str): Result[str, Error] {
     if sig != i32(0) && OBJ_find_sigid_algs(sig, mut &dig, mut &pk) == 1 && dig[0] != i32(0) {
         md = if int(dig[0]) == NID_md5 || int(dig[0]) == NID_sha1 { EVP_sha256() } else { EVP_get_digestbyname(OBJ_nid2sn(dig[0])) }
     }
-    if isNull(md) { return Err(fail(Kind.Verify, "could not determine server certificate signature algorithm", 0, host)) }
+    if isNull(md) { return Err(fail(Kind.Verify, "could not determine server certificate signature algorithm", 0, &host)) }
     var out = array(64, byte(0))
     var n = 0
     let ok = X509_digest(x, md, mut &out, mut &n) == 1
     ERR_clear_error()
-    if !ok { return Err(fail(Kind.Verify, "could not hash the server certificate", 0, host)) }
+    if !ok { return Err(fail(Kind.Verify, "could not hash the server certificate", 0, &host)) }
     return Ok(strFromBytes(&out[0..(n & 255)]))
 }
 
@@ -925,7 +925,7 @@ fn (c: mut &Conn) flushStall(w: Where, dl: int, stallMs: int): Result[Unit, Erro
         }
         match sent {
             Ok(_) {}
-            Err(x) { return Err(ioFail(x, c.e.host)) }
+            Err(x) { return Err(ioFail(x, &c.e.host)) }
         }
     }
     return Ok(Unit{})
@@ -938,7 +938,7 @@ fn (c: mut &Conn) fill(w: Where, dl: int): Result[bool, Error] {
     let got = if dl < 0 { c.sock.read(mut &c.buf, w) } else { c.sock.readFor(mut &c.buf, leftMs(dl), w) }
     let n = match got {
         Ok(k) { k }
-        Err(x) { return Err(ioFail(x, c.e.host)) }
+        Err(x) { return Err(ioFail(x, &c.e.host)) }
     }
     if n == 0 {
         c.eof = true
@@ -1018,7 +1018,7 @@ pub fn (c: mut &Conn) readNow(buf: mut &[byte]): Result[int, Error] {
         if c.eof { return Ok(0) }
         let k = match c.sock.readNow(mut &c.buf) {
             Ok(x) { x }
-            Err(x) { return if x.errno == EAGAIN { Ok(WANT_INPUT) } else { Err(ioFail(x, c.e.host)) } }
+            Err(x) { return if x.errno == EAGAIN { Ok(WANT_INPUT) } else { Err(ioFail(x, &c.e.host)) } }
         }
         if k == 0 {
             c.eof = true
@@ -1063,7 +1063,7 @@ fn (c: mut &Conn) writeD(data: &[byte], w: Where, dl: int): Result[Unit, Error] 
 }
 
 // write for the bytes of s.
-pub fn (c: mut &Conn) writeStr(s: str, w: Where): Result[Unit, Error] {
+pub fn (c: mut &Conn) writeStr(s: &str, w: Where): Result[Unit, Error] {
     let b = strToBytes(s)
     return c.write(&b, w)
 }
@@ -1130,6 +1130,6 @@ pub fn (c: &Conn) localAddr(): str { return c.sock.localAddr() }
 pub fn (c: &Conn) setNoDelay(on: bool): Result[Unit, Error] {
     match c.sock.setNoDelay(on) {
         Ok(_) { return Ok(Unit{}) }
-        Err(x) { return Err(ioFail(x, c.e.host)) }
+        Err(x) { return Err(ioFail(x, &c.e.host)) }
     }
 }

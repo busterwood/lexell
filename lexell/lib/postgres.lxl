@@ -101,7 +101,7 @@ fn (c: mut &Conn) drop() {
 // URI (pgwire.parseConfig, pgwire.connect). The task's cancellation
 // (E_CANCELLED) and deadline, and the string's connect_timeout (E_TIMEOUT),
 // end the wait.
-pub fn connect(conninfo: str, w: Where): Result[Conn, Error] {
+pub fn connect(conninfo: &str, w: Where): Result[Conn, Error] {
     let cfg = try pgwire.parseConfig(conninfo)
     return Conn.open(&cfg, w)
 }
@@ -123,7 +123,7 @@ pub fn (c: &Conn) idle(): bool { return c.s.ready() && c.s.txStatus() == pgwire.
 pub fn (c: &Conn) inTransaction(): bool { return c.s.txStatus() != pgwire.TX_IDLE }
 
 // The server's ParameterStatus value (TimeZone, server_version, ...).
-pub fn (c: &Conn) parameter(name: str): Option[str] { return c.s.parameter(name) }
+pub fn (c: &Conn) parameter(name: str): Option[str] { return c.s.parameter(&name) }
 
 // The server process id (BackendKeyData).
 pub fn (c: &Conn) backendPid(): int { return c.s.backendPid() }
@@ -132,14 +132,14 @@ pub fn (c: &Conn) backendPid(): int { return c.s.backendPid() }
 pub fn (c: &Conn) lastServerError(): Option[pgwire.ServerError] { return c.s.lastServerError() }
 
 // Runs a script of any number of statements, without parameters.
-pub fn (c: mut &Conn) exec(script: str, w: Where): Result[Unit, Error] {
+pub fn (c: mut &Conn) exec(script: &str, w: Where): Result[Unit, Error] {
     try c.s.settle(w)
     let r = try c.s.script(script, w)
     return Ok(Unit{})
 }
 
 // Runs one statement with $1, $2, ... bound to args, in order.
-pub fn (c: mut &Conn) query(sql: str, args: &[Value], w: Where): Result[Rows, Error] {
+pub fn (c: mut &Conn) query(sql: &str, args: &[Value], w: Where): Result[Rows, Error] {
     try c.s.settle(w)
     var ps: []pgwire.Param = []
     for v in args { append(mut &ps, try pgwire.param(&v)) }
@@ -162,31 +162,31 @@ pub fn (c: mut &Conn) prepare(sql: str, w: Where): Result[Prepared, Error] {
     try c.s.settle(w)
     PREPARED += 1
     let name = "lxl_" + PREPARED.toStr()
-    try c.s.prepare(name, sql, w)
+    try c.s.prepare(&name, &sql, w)
     return Ok(Prepared{name: name, conn: c.id})
 }
 
 // Runs a prepared statement with $1, $2, ... bound to args, in order.
 pub fn (c: mut &Conn) queryPrepared(p: &Prepared, args: &[Value], w: Where): Result[Rows, Error] {
-    if p.conn != c.id { return Err(sqldialect.inputError("prepared statement " + p.name + " belongs to another connection")) }
+    if p.conn != c.id { return Err(sqldialect.inputError(&("prepared statement " + p.name + " belongs to another connection"))) }
     try c.s.settle(w)
     var ps: []pgwire.Param = []
     for v in args { append(mut &ps, try pgwire.param(&v)) }
-    let pgwire.Reply{columns: cols, rows: raw, tag: tag, empty: empty} = try c.s.queryPrepared(p.name, &ps, w)
+    let pgwire.Reply{columns: cols, rows: raw, tag: tag, empty: empty} = try c.s.queryPrepared(&p.name, &ps, w)
     OPEN += 1
     return Ok(Rows{cols: cols, raw: raw, tag: tag, empty: empty})
 }
 
 // Closes a prepared statement: the server frees it.
 pub fn (c: mut &Conn) closePrepared(p: Prepared, w: Where): Result[Unit, Error] {
-    if p.conn != c.id { return Err(sqldialect.inputError("prepared statement " + p.name + " belongs to another connection")) }
+    if p.conn != c.id { return Err(sqldialect.inputError(&("prepared statement " + p.name + " belongs to another connection"))) }
     try c.s.settle(w)
-    return c.s.closePrepared(p.name, w)
+    return c.s.closePrepared(&p.name, w)
 }
 
 // Runs a fragment with $1, $2, ... placeholders and its arguments.
 pub fn (c: mut &Conn) querySql(q: &Sql, w: Where): Result[Rows, Error] {
-    return c.query(q.render(sqldialect.Dialect.Postgres), q.args(), w)
+    return c.query(&(q.render(sqldialect.Dialect.Postgres)), q.args(), w)
 }
 
 // Runs body in a transaction: BEGIN, then COMMIT when it returns Ok, ROLLBACK
@@ -227,11 +227,11 @@ pub fn (r: &Rows) rowCount(): int { return r.raw.count() }
 pub fn (r: &Rows) columnCount(): int { return len(r.cols) }
 
 // Rows inserted, updated, deleted, ... by the command (0 when it says none).
-pub fn (r: &Rows) affected(): int { return pgwire.affectedOf(r.tag) }
+pub fn (r: &Rows) affected(): int { return pgwire.affectedOf(&r.tag) }
 
 fn (r: &Rows) col(col: int): Result[int, Error] {
     if col < 0 || col >= len(r.cols) {
-        return Err(sqldialect.inputError("column " + col.toStr() + " out of range (" + len(r.cols).toStr() + " columns)"))
+        return Err(sqldialect.inputError(&("column " + col.toStr() + " out of range (" + len(r.cols).toStr() + " columns)")))
     }
     return Ok(col)
 }
@@ -257,26 +257,26 @@ pub fn (r: &Rows) decimalType(col: int): Result[DecimalType, Error] {
     let p = (t >> 16) & 0xffff
     let s = ((t & 0x7ff) ^ 1024) - 1024
     if tm < 4 || p < 1 || p > 1000 || s < -1000 || s > 1000 {
-        return Err(sqldialect.dbError(sqldialect.E_DEC_METADATA, "invalid numeric typmod " + tm.toStr()))
+        return Err(sqldialect.dbError(sqldialect.E_DEC_METADATA, &("invalid numeric typmod " + tm.toStr())))
     }
     return Ok(DecimalType{precision: p, scale: s, constrained: true})
 }
 
-fn typeError(col: int, want: str): Error {
-    return sqldialect.dbError(sqldialect.E_TYPE, "column " + col.toStr() + " is not " + want)
+fn typeError(col: int, want: &str): Error {
+    return sqldialect.dbError(sqldialect.E_TYPE, &("column " + col.toStr() + " is not " + want))
 }
 
 pub fn (r: &Rows) isNull(row: int, col: int): Result[bool, Error] {
     let c = try r.col(col)
     if row < 0 || row >= r.rowCount() {
-        return Err(sqldialect.inputError("row " + row.toStr() + " out of range (" + r.rowCount().toStr() + " rows)"))
+        return Err(sqldialect.inputError(&("row " + row.toStr() + " out of range (" + r.rowCount().toStr() + " rows)")))
     }
     return Ok(r.raw.isNull(row, c))
 }
 
 // The value's text form, as the server sent it. E_NULL for NULL.
 pub fn (r: &Rows) text(row: int, col: int): Result[str, Error] {
-    if try r.isNull(row, col) { return Err(sqldialect.dbError(sqldialect.E_NULL, "column " + col.toStr() + " is NULL")) }
+    if try r.isNull(row, col) { return Err(sqldialect.dbError(sqldialect.E_NULL, &("column " + col.toStr() + " is NULL"))) }
     return Ok(r.raw.bytes(row, col))
 }
 
@@ -285,7 +285,7 @@ pub fn (r: &Rows) int(row: int, col: int): Result[int, Error] {
     let t = try r.text(row, col)
     let oid = try r.columnType(col)
     if oid != OID_INT8 && oid != OID_INT4 && oid != OID_INT2 { return Err(typeError(col, "an integer")) }
-    match strings.parseIntOpt(t) {
+    match strings.parseIntOpt(&t) {
         Some(v) { return Ok(v) }
         None { return Err(typeError(col, "an integer")) }
     }
@@ -305,7 +305,7 @@ pub fn (r: &Rows) float(row: int, col: int): Result[float, Error] {
     if oid != OID_FLOAT8 && oid != OID_FLOAT4 { return Err(typeError(col, "a float")) }
     if t == "Infinity" { return Ok(math.inf()) }
     if t == "-Infinity" { return Ok(-math.inf()) }
-    match math.parse(t) {
+    match math.parse(&t) {
         Some(f) { return Ok(f) }
         None { return Err(typeError(col, "a float")) }
     }
@@ -374,7 +374,7 @@ pub type PoolStats = pool.PoolStats
 
 // A pool over a libpq connection string, parsed now: one that cannot be
 // parsed is E_INPUT here, not at the first acquire.
-pub fn newPool(conninfo: str, size: int): Result[Pool, Error] {
+pub fn newPool(conninfo: &str, size: int): Result[Pool, Error] {
     let cfg = try pgwire.parseConfig(conninfo)
     return Ok(pool.newPool[Conn, pgwire.Config, Error](cfg, size))
 }
@@ -389,7 +389,7 @@ pub fn (Conn) open(cfg: &pgwire.Config, w: Where): Result[Conn, Error] {
 
 pub fn (Conn) waitFailed(why: task.Cancelled): Error {
     return sqldialect.dbError(if why == task.Cancelled.Timeout { sqldialect.E_TIMEOUT } else { sqldialect.E_CANCELLED },
-        "pool: " + why.toStr() + " while waiting for a connection")
+        &("pool: " + why.toStr() + " while waiting for a connection"))
 }
 
 pub fn (c: mut &Conn) release(): bool { return c.idle() }
@@ -438,7 +438,7 @@ pub type Stream[B, T] = value record {
 // rest of the server's reply to ReadyForQuery, with no cancel request: the
 // connection is idle again when it returns (a dropped stream is settled by the
 // connection's next call; idle() is false until then).
-pub fn (c: mut &Conn) stream[B, T](sql: str, args: []Value, bind: fn(&Columns): Result[B, Error],
+pub fn (c: mut &Conn) stream[B, T](sql: &str, args: []Value, bind: fn(&Columns): Result[B, Error],
                                    read: fn(&B, &RowView): Result[T, Error], w: Where): Result[Stream[B, T], Error] {
     try c.s.settle(w)
     var ps: []pgwire.Param = []

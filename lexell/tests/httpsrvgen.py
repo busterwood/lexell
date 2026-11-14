@@ -51,12 +51,12 @@ const HEX = "0123456789abcdef"
 fn echo(app: &App, rq: mut &http.Request, w: mut &http.Response): Result[Unit, http.Error] {
     let b = try rq.bytes(1000000)
     var out = newStrBuf()
-    out.add(rq.method + " " + rq.rawTarget() + " ")
+    out.add(&(rq.method + " " + rq.rawTarget() + " "))
     for c in b {
         out.addByte(HEX[int(c) / 16])
         out.addByte(HEX[int(c) % 16])
     }
-    return w.text(out.toStr())
+    return w.text(&(out.toStr()))
 }
 
 fn stop(app: &App, rq: mut &http.Request, w: mut &http.Response): Result[Unit, http.Error] {

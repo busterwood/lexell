@@ -49177,7 +49177,7 @@ static void f0_main_main(void) {
                     lxl_str ap77 = t76;
                     *(lxl_str*)rt_arr_push(&v_roots_46, 16ULL) = ap77;
                   } else {
-                    bool t78 = f10_strings_startsWith(rt_str_dup(v_a_54), sl8636);
+                    bool t78 = f10_strings_startsWith(v_a_54, sl8636);
                     bool c79 = t78;
                     if (c79) {
                       lxl_str t80 = rt_str_dup(v_a_54);
@@ -49266,6 +49266,7 @@ static int64_t f11_main_build(lxl_str p_lib, lxl_arr*p_roots, lxl_str p_src, lxl
     lxl_str t23 = rt_str_concat(t21, t22);
     lxl_str t24 = rt_str_concat(t23, sl8638);
     f19_strings_StrBuf_add(&v_b_20, t24);
+    rt_str_drop(t24);
     rt_str_drop(t23);
     rt_str_drop(t22);
     rt_str_drop(t21);
@@ -49280,6 +49281,7 @@ static int64_t f11_main_build(lxl_str p_lib, lxl_arr*p_roots, lxl_str p_src, lxl
       int64_t ix30 = v_i_28;
       lxl_str t31 = f18_main_jsonStr(rt_str_dup(*((lxl_str*)v_cmd_26.data + rt_idx(ix30, v_cmd_26.len, "main.lxl:220"))));
       f19_strings_StrBuf_add(&v_b_20, t31);
+      rt_str_drop(t31);
     }
     f19_strings_StrBuf_add(&v_b_20, sl8642);
     lxl_str t32 = f21_strings_StrBuf_toStr(&v_b_20);
@@ -49309,7 +49311,7 @@ static int64_t f11_main_build(lxl_str p_lib, lxl_arr*p_roots, lxl_str p_src, lxl
   }
   lxl_str t41 = rt_str_concat(v_tmp_39, sl8647);
   lxl_str v_cfile_42 = t41;
-  struct S10_std_Result t43 = f23_io_write(rt_str_dup(v_cfile_42), rt_str_dup(v_csrc_14));
+  struct S10_std_Result t43 = f23_io_write(v_cfile_42, v_csrc_14);
   struct S10_std_Result s44 = t43;
   if (s44.tag == 0LL) {
     struct S11_std_Unit v_u_45 = s44.u.V_Ok.f_0;
@@ -49330,7 +49332,7 @@ static int64_t f11_main_build(lxl_str p_lib, lxl_arr*p_roots, lxl_str p_src, lxl
       lxl_str t53 = rt_str_concat(v_tmp_39, sl8650);
       ifx52 = t53;
     } else {
-      bool t54 = f25_strings_endsWith(rt_str_dup(p_src), sl8651);
+      bool t54 = f25_strings_endsWith(p_src, sl8651);
       lxl_str ifx55;
       if (t54) {
         lxl_str t56 = rt_str_dup(p_src);
@@ -49387,13 +49389,13 @@ static int64_t f11_main_build(lxl_str p_lib, lxl_arr*p_roots, lxl_str p_src, lxl
     rt_str_drop(p_lib);
     return r76;
   }
-  struct S10_std_Result t77 = f27_fs_remove(rt_str_dup(v_cfile_42));
+  struct S10_std_Result t77 = f27_fs_remove(v_cfile_42);
   gl3_drop(t77);
-  struct S10_std_Result t78 = f27_fs_remove(rt_str_dup(v_errf_63));
+  struct S10_std_Result t78 = f27_fs_remove(v_errf_63);
   gl3_drop(t78);
   bool c79 = (bool)!p_isRun;
   if (c79) {
-    struct S10_std_Result t80 = f27_fs_remove(rt_str_dup(v_tmp_39));
+    struct S10_std_Result t80 = f27_fs_remove(v_tmp_39);
     gl3_drop(t80);
     int64_t r81 = 0LL;
     rt_str_drop(v_errf_63);
@@ -49422,7 +49424,7 @@ static int64_t f11_main_build(lxl_str p_lib, lxl_arr*p_roots, lxl_str p_src, lxl
   int64_t v_st_89 = t88;
   bool c90 = (bool)((int64_t)p_out.len == 0LL);
   if (c90) {
-    struct S10_std_Result t91 = f28_fs_removeAll(rt_str_dup(v_tmp_39));
+    struct S10_std_Result t91 = f28_fs_removeAll(v_tmp_39);
     gl3_drop(t91);
   }
   int64_t r92 = v_st_89;
@@ -49440,12 +49442,11 @@ static int64_t f11_main_build(lxl_str p_lib, lxl_arr*p_roots, lxl_str p_src, lxl
   return r92;
 }
 static struct S10_std_Result f28_fs_removeAll(lxl_str p_path) {
-  struct S13_std_Result t1 = f29_fs_lstat(rt_str_dup(p_path));
+  struct S13_std_Result t1 = f29_fs_lstat(p_path);
   struct S13_std_Result tr2 = t1;
   if (tr2.tag == 1LL) {
     struct S12_io_IoError e3 = tr2.u.V_Err.f_0;
     struct S10_std_Result r4 = (struct S10_std_Result){.tag = 1LL, .u = {.V_Err = {.f_0 = e3}}};
-    rt_str_drop(p_path);
     return r4;
   }
   struct S14_fs_Stat t5 = tr2.u.V_Ok.f_0;
@@ -49453,12 +49454,11 @@ static struct S10_std_Result f28_fs_removeAll(lxl_str p_path) {
   bool t7 = f30_fs_Stat_isDir(v_s_6);
   bool c8 = t7;
   if (c8) {
-    struct S15_std_Result t9 = f31_fs_list(rt_str_dup(p_path));
+    struct S15_std_Result t9 = f31_fs_list(p_path);
     struct S15_std_Result tr10 = t9;
     if (tr10.tag == 1LL) {
       struct S12_io_IoError e11 = tr10.u.V_Err.f_0;
       struct S10_std_Result r12 = (struct S10_std_Result){.tag = 1LL, .u = {.V_Err = {.f_0 = e11}}};
-      rt_str_drop(p_path);
       return r12;
     }
     lxl_arr t13 = tr10.u.V_Ok.f_0;
@@ -49466,23 +49466,23 @@ static struct S10_std_Result f28_fs_removeAll(lxl_str p_path) {
     lxl_slice ap15 = rt_as_slice(&v_es_14);
     for (int64_t i16 = 0LL; i16 < ap15.len; i16++) {
       struct S16_fs_Entry**v_e_17 = (struct S16_fs_Entry**)ap15.data + i16;
-      lxl_str t18 = f32_fs_join(rt_str_dup(p_path), rt_str_dup((*v_e_17)->f_name));
+      lxl_str t18 = f32_fs_join(p_path, (*v_e_17)->f_name);
       struct S10_std_Result t19 = f28_fs_removeAll(t18);
       struct S10_std_Result tr20 = t19;
       if (tr20.tag == 1LL) {
         struct S12_io_IoError e21 = tr20.u.V_Err.f_0;
         struct S10_std_Result r22 = (struct S10_std_Result){.tag = 1LL, .u = {.V_Err = {.f_0 = e21}}};
+        rt_str_drop(t18);
         gl4_drop(v_es_14);
-        rt_str_drop(p_path);
         return r22;
       }
       struct S11_std_Unit t23 = tr20.u.V_Ok.f_0;
+      rt_str_drop(t18);
     }
     gl4_drop(v_es_14);
   }
-  struct S10_std_Result t24 = f27_fs_remove(rt_str_dup(p_path));
+  struct S10_std_Result t24 = f27_fs_remove(p_path);
   struct S10_std_Result r25 = t24;
-  rt_str_drop(p_path);
   return r25;
 }
 static lxl_str f32_fs_join(lxl_str p_a, lxl_str p_b) {
@@ -49498,8 +49498,6 @@ static lxl_str f32_fs_join(lxl_str p_a, lxl_str p_b) {
   bool c4 = b1;
   if (c4) {
     lxl_str r5 = rt_str_dup(p_b);
-    rt_str_drop(p_b);
-    rt_str_drop(p_a);
     return r5;
   }
   lxl_str t6 = rt_str_dup(p_a);
@@ -49509,16 +49507,12 @@ static lxl_str f32_fs_join(lxl_str p_a, lxl_str p_b) {
   if (c8) {
     lxl_str t9 = rt_str_concat(p_a, p_b);
     lxl_str r10 = t9;
-    rt_str_drop(p_b);
-    rt_str_drop(p_a);
     return r10;
   }
   lxl_str t11 = rt_str_concat(p_a, sl65);
   lxl_str t12 = rt_str_concat(t11, p_b);
   lxl_str r13 = t12;
   rt_str_drop(t11);
-  rt_str_drop(p_b);
-  rt_str_drop(p_a);
   return r13;
 }
 static struct S15_std_Result f31_fs_list(lxl_str p_path) {
@@ -49529,10 +49523,9 @@ static struct S15_std_Result f31_fs_list(lxl_str p_path) {
   bool c4 = (bool)((uint64_t)v_d_3 == (uint64_t)0);
   if (c4) {
     int64_t t5 = x_lxl_errno();
-    struct S12_io_IoError t6 = f33_io_ioError(t5, sl466, rt_str_dup(p_path));
+    struct S12_io_IoError t6 = f33_io_ioError(t5, sl466, p_path);
     struct S15_std_Result t7 = (struct S15_std_Result){.tag = 1LL, .u = {.V_Err = {.f_0 = t6}}};
     struct S15_std_Result r8 = t7;
-    rt_str_drop(p_path);
     return r8;
   }
   lxl_arr a9 = rt_arr_new(0LL, 8ULL);
@@ -49558,7 +49551,7 @@ static struct S15_std_Result f31_fs_list(lxl_str p_path) {
       struct S17_fs_Kind t21 = (struct S17_fs_Kind){.tag = 7LL};
       bool c22 = (bool)(v_kind_20.tag == t21.tag);
       if (c22) {
-        lxl_str t23 = f32_fs_join(rt_str_dup(p_path), rt_str_dup(v_name_15));
+        lxl_str t23 = f32_fs_join(p_path, v_name_15);
         struct S13_std_Result t24 = f29_fs_lstat(t23);
         struct S13_std_Result s25 = t24;
         if (s25.tag == 0LL) {
@@ -49568,6 +49561,7 @@ static struct S15_std_Result f31_fs_list(lxl_str p_path) {
         } else if (s25.tag == 1LL) {
           gl5_drop(s25.u.V_Err.f_0);
         }
+        rt_str_drop(t23);
       }
       struct S16_fs_Entry*o29 = (struct S16_fs_Entry*)rt_alloc(32ULL);
       o29->f_name = rt_str_dup(v_name_15);
@@ -49581,7 +49575,6 @@ static struct S15_std_Result f31_fs_list(lxl_str p_path) {
   int32_t t32 = x_closedir(v_d_3);
   struct S15_std_Result t33 = (struct S15_std_Result){.tag = 0LL, .u = {.V_Ok = {.f_0 = v_out_10}}};
   struct S15_std_Result r34 = t33;
-  rt_str_drop(p_path);
   return r34;
 }
 static struct S17_fs_Kind f35_fs_Stat_kind(struct S14_fs_Stat p_s) {
@@ -49628,8 +49621,6 @@ static struct S17_fs_Kind f34_fs_kindOfDirent(int64_t p_t) {
 static struct S12_io_IoError f33_io_ioError(int64_t p_errno, lxl_str p_op, lxl_str p_path) {
   struct S12_io_IoError t1 = (struct S12_io_IoError){.f_errno = p_errno, .f_op = rt_str_dup(p_op), .f_path = rt_str_dup(p_path)};
   struct S12_io_IoError r2 = t1;
-  rt_str_drop(p_path);
-  rt_str_drop(p_op);
   return r2;
 }
 static bool f30_fs_Stat_isDir(struct S14_fs_Stat p_s) {
@@ -49637,9 +49628,8 @@ static bool f30_fs_Stat_isDir(struct S14_fs_Stat p_s) {
   return r1;
 }
 static struct S13_std_Result f29_fs_lstat(lxl_str p_path) {
-  struct S13_std_Result t1 = f37_fs_statHow(rt_str_dup(p_path), 0LL, sl8655);
+  struct S13_std_Result t1 = f37_fs_statHow(p_path, 0LL, sl8655);
   struct S13_std_Result r2 = t1;
-  rt_str_drop(p_path);
   return r2;
 }
 static struct S13_std_Result f37_fs_statHow(lxl_str p_path, int64_t p_follow, lxl_str p_op) {
@@ -49649,11 +49639,9 @@ static struct S13_std_Result f37_fs_statHow(lxl_str p_path, int64_t p_follow, lx
   int64_t v_e_3 = t2;
   bool c4 = (bool)(v_e_3 != 0LL);
   if (c4) {
-    struct S12_io_IoError t5 = f33_io_ioError(v_e_3, rt_str_dup(p_op), rt_str_dup(p_path));
+    struct S12_io_IoError t5 = f33_io_ioError(v_e_3, p_op, p_path);
     struct S13_std_Result t6 = (struct S13_std_Result){.tag = 1LL, .u = {.V_Err = {.f_0 = t5}}};
     struct S13_std_Result r7 = t6;
-    rt_str_drop(p_op);
-    rt_str_drop(p_path);
     return r7;
   }
   int64_t t8 = x_lxl_stat_field(0LL);
@@ -49669,12 +49657,10 @@ static struct S13_std_Result f37_fs_statHow(lxl_str p_path, int64_t p_follow, lx
   struct S14_fs_Stat t18 = (struct S14_fs_Stat){.f_size = t8, .f_mode = t9, .f_mtime = t10, .f_mtimeNs = t11, .f_nlink = t12, .f_uid = t13, .f_gid = t14, .f_ino = t15, .f_dev = t16, .f_blocks = t17};
   struct S13_std_Result t19 = (struct S13_std_Result){.tag = 0LL, .u = {.V_Ok = {.f_0 = t18}}};
   struct S13_std_Result r20 = t19;
-  rt_str_drop(p_op);
-  rt_str_drop(p_path);
   return r20;
 }
 static struct S10_std_Result f27_fs_remove(lxl_str p_path) {
-  struct S13_std_Result t1 = f29_fs_lstat(rt_str_dup(p_path));
+  struct S13_std_Result t1 = f29_fs_lstat(p_path);
   struct S13_std_Result s2 = t1;
   if (s2.tag == 0LL) {
     struct S14_fs_Stat v_s_3 = s2.u.V_Ok.f_0;
@@ -49687,16 +49673,14 @@ static struct S10_std_Result f27_fs_remove(lxl_str p_path) {
       bool c8 = (bool)(t7 != 0);
       if (c8) {
         int64_t t9 = x_lxl_errno();
-        struct S12_io_IoError t10 = f33_io_ioError(t9, sl452, rt_str_dup(p_path));
+        struct S12_io_IoError t10 = f33_io_ioError(t9, sl452, p_path);
         struct S10_std_Result t11 = (struct S10_std_Result){.tag = 1LL, .u = {.V_Err = {.f_0 = t10}}};
         struct S10_std_Result r12 = t11;
-        rt_str_drop(p_path);
         return r12;
       }
       struct S11_std_Unit t13 = (struct S11_std_Unit){._e = (char)0LL};
       struct S10_std_Result t14 = (struct S10_std_Result){.tag = 0LL, .u = {.V_Ok = {.f_0 = t13}}};
       struct S10_std_Result r15 = t14;
-      rt_str_drop(p_path);
       return r15;
     }
   } else if (s2.tag == 1LL) {
@@ -49704,7 +49688,6 @@ static struct S10_std_Result f27_fs_remove(lxl_str p_path) {
     struct S10_std_Result t17 = (struct S10_std_Result){.tag = 1LL, .u = {.V_Err = {.f_0 = gl2_dup(v_e_16)}}};
     struct S10_std_Result r18 = t17;
     gl5_drop(v_e_16);
-    rt_str_drop(p_path);
     return r18;
   }
   int64_t cm19 = rt_cmark();
@@ -49713,16 +49696,14 @@ static struct S10_std_Result f27_fs_remove(lxl_str p_path) {
   bool c21 = (bool)(t20 != 0);
   if (c21) {
     int64_t t22 = x_lxl_errno();
-    struct S12_io_IoError t23 = f33_io_ioError(t22, sl453, rt_str_dup(p_path));
+    struct S12_io_IoError t23 = f33_io_ioError(t22, sl453, p_path);
     struct S10_std_Result t24 = (struct S10_std_Result){.tag = 1LL, .u = {.V_Err = {.f_0 = t23}}};
     struct S10_std_Result r25 = t24;
-    rt_str_drop(p_path);
     return r25;
   }
   struct S11_std_Unit t26 = (struct S11_std_Unit){._e = (char)0LL};
   struct S10_std_Result t27 = (struct S10_std_Result){.tag = 0LL, .u = {.V_Ok = {.f_0 = t26}}};
   struct S10_std_Result r28 = t27;
-  rt_str_drop(p_path);
   return r28;
 }
 static int64_t f26_main_run(lxl_arr*p_words, lxl_str p_errFile) {
@@ -49734,7 +49715,7 @@ static int64_t f26_main_run(lxl_arr*p_words, lxl_str p_errFile) {
     lxl_str ap6 = rt_str_dup(*((lxl_str*)p_words->data + rt_idx(ix5, p_words->len, "main.lxl:144")));
     *(lxl_str*)rt_arr_push(&v_args_2, 16ULL) = ap6;
   }
-  struct S18_proc_Command*t7 = f38_proc_command(rt_str_dup(*((lxl_str*)p_words->data + rt_idx(0LL, p_words->len, "main.lxl:145"))), v_args_2);
+  struct S18_proc_Command*t7 = f38_proc_command(*((lxl_str*)p_words->data + rt_idx(0LL, p_words->len, "main.lxl:145")), v_args_2);
   struct S18_proc_Command*v_c_8 = t7;
   bool c9 = (bool)((int64_t)p_errFile.len > 0LL);
   if (c9) {
@@ -49839,13 +49820,13 @@ static struct S20_std_Result f43_proc_Child_wait(struct S25_proc_Child**p_c, str
     bool c13 = (bool)(v_k_12 != 0LL);
     if (c13) {
       f47_proc_Child_terminate(p_c, p_w);
-      struct S23_proc_ProcError t14 = f48_proc_stopped(v_k_12, sl8656, rt_str_dup((*p_c)->f_program));
+      struct S23_proc_ProcError t14 = f48_proc_stopped(v_k_12, sl8656, (*p_c)->f_program);
       struct S20_std_Result t15 = (struct S20_std_Result){.tag = 1LL, .u = {.V_Err = {.f_0 = t14}}};
       struct S20_std_Result r16 = t15;
       return r16;
     }
   }
-  struct S23_proc_ProcError t17 = f49_proc_perr(22LL, sl8656, rt_str_dup((*p_c)->f_program));
+  struct S23_proc_ProcError t17 = f49_proc_perr(22LL, sl8656, (*p_c)->f_program);
   struct S20_std_Result t18 = (struct S20_std_Result){.tag = 1LL, .u = {.V_Err = {.f_0 = t17}}};
   struct S20_std_Result r19 = t18;
   return r19;
@@ -49853,23 +49834,17 @@ static struct S20_std_Result f43_proc_Child_wait(struct S25_proc_Child**p_c, str
 static struct S23_proc_ProcError f49_proc_perr(int64_t p_errno, lxl_str p_op, lxl_str p_program) {
   struct S23_proc_ProcError t1 = (struct S23_proc_ProcError){.f_errno = p_errno, .f_op = rt_str_dup(p_op), .f_program = rt_str_dup(p_program)};
   struct S23_proc_ProcError r2 = t1;
-  rt_str_drop(p_program);
-  rt_str_drop(p_op);
   return r2;
 }
 static struct S23_proc_ProcError f48_proc_stopped(int64_t p_r, lxl_str p_op, lxl_str p_program) {
   bool c1 = (bool)(p_r < 0LL);
   if (c1) {
-    struct S23_proc_ProcError t2 = f49_proc_perr(rt_neg_int(p_r, "proc.lxl:115"), rt_str_dup(p_op), rt_str_dup(p_program));
+    struct S23_proc_ProcError t2 = f49_proc_perr(rt_neg_int(p_r, "proc.lxl:115"), p_op, p_program);
     struct S23_proc_ProcError r3 = t2;
-    rt_str_drop(p_program);
-    rt_str_drop(p_op);
     return r3;
   }
-  struct S23_proc_ProcError t5 = f49_proc_perr(p_r == 1LL ? 125LL : 110LL, rt_str_dup(p_op), rt_str_dup(p_program));
+  struct S23_proc_ProcError t5 = f49_proc_perr(p_r == 1LL ? 125LL : 110LL, p_op, p_program);
   struct S23_proc_ProcError r6 = t5;
-  rt_str_drop(p_program);
-  rt_str_drop(p_op);
   return r6;
 }
 static void f47_proc_Child_terminate(struct S25_proc_Child**p_c, struct S21_std_Where p_w) {
@@ -49987,7 +49962,7 @@ static struct S26_std_Result f44_proc_Child_reapNow(struct S25_proc_Child**p_c) 
   int64_t v_r_6 = t5;
   bool c7 = (bool)(v_r_6 < 0LL);
   if (c7) {
-    struct S23_proc_ProcError t8 = f49_proc_perr(rt_neg_int(v_r_6, "proc.lxl:441"), sl8656, rt_str_dup((*p_c)->f_program));
+    struct S23_proc_ProcError t8 = f49_proc_perr(rt_neg_int(v_r_6, "proc.lxl:441"), sl8656, (*p_c)->f_program);
     struct S26_std_Result t9 = (struct S26_std_Result){.tag = 1LL, .u = {.V_Err = {.f_0 = t8}}};
     struct S26_std_Result r10 = t9;
     return r10;
@@ -50027,7 +50002,7 @@ static struct S24_std_Result f52_proc_spawn(struct S18_proc_Command**p_cmd, stru
   }
   bool c10 = b9;
   if (c10) {
-    struct S23_proc_ProcError t11 = f49_proc_perr(22LL, sl8657, rt_str_dup(v_prog_1));
+    struct S23_proc_ProcError t11 = f49_proc_perr(22LL, sl8657, v_prog_1);
     struct S24_std_Result t12 = (struct S24_std_Result){.tag = 1LL, .u = {.V_Err = {.f_0 = t11}}};
     struct S24_std_Result r13 = t12;
     rt_str_drop(v_prog_1);
@@ -50036,15 +50011,15 @@ static struct S24_std_Result f52_proc_spawn(struct S18_proc_Command**p_cmd, stru
     gl6_drop(p_sin);
     return r13;
   }
-  bool t14 = f54_proc_hasNul(rt_str_dup(v_prog_1));
+  bool t14 = f54_proc_hasNul(v_prog_1);
   bool b15 = t14;
   if (!b15) {
-    bool t16 = f54_proc_hasNul(rt_str_dup((*p_cmd)->f_cwd));
+    bool t16 = f54_proc_hasNul((*p_cmd)->f_cwd);
     b15 = t16;
   }
   bool c17 = b15;
   if (c17) {
-    struct S23_proc_ProcError t18 = f49_proc_perr(22LL, sl8657, rt_str_dup(v_prog_1));
+    struct S23_proc_ProcError t18 = f49_proc_perr(22LL, sl8657, v_prog_1);
     struct S24_std_Result t19 = (struct S24_std_Result){.tag = 1LL, .u = {.V_Err = {.f_0 = t18}}};
     struct S24_std_Result r20 = t19;
     rt_str_drop(v_prog_1);
@@ -50055,9 +50030,9 @@ static struct S24_std_Result f52_proc_spawn(struct S18_proc_Command**p_cmd, stru
   }
   struct S9_strings_StrBuf*t21 = f17_std_newStrBuf();
   struct S9_strings_StrBuf*v_b_22 = t21;
-  f19_strings_StrBuf_add(&v_b_22, rt_str_dup(v_prog_1));
+  f19_strings_StrBuf_add(&v_b_22, v_prog_1);
   f55_strings_StrBuf_addByte(&v_b_22, (uint8_t)0LL);
-  f19_strings_StrBuf_add(&v_b_22, rt_str_dup((*p_cmd)->f_cwd));
+  f19_strings_StrBuf_add(&v_b_22, (*p_cmd)->f_cwd);
   f55_strings_StrBuf_addByte(&v_b_22, (uint8_t)0LL);
   lxl_str t23 = f56_proc_path(&p_sin);
   lxl_str t24 = f56_proc_path(&p_sout);
@@ -50069,10 +50044,10 @@ static struct S24_std_Result f52_proc_spawn(struct S18_proc_Command**p_cmd, stru
   lxl_slice ap27 = rt_as_slice(&a26);
   for (int64_t i28 = 0LL; i28 < ap27.len; i28++) {
     lxl_str v_p_29 = rt_str_dup(*((lxl_str*)ap27.data + i28));
-    bool t30 = f54_proc_hasNul(rt_str_dup(v_p_29));
+    bool t30 = f54_proc_hasNul(v_p_29);
     bool c31 = t30;
     if (c31) {
-      struct S23_proc_ProcError t32 = f49_proc_perr(22LL, sl8657, rt_str_dup(v_prog_1));
+      struct S23_proc_ProcError t32 = f49_proc_perr(22LL, sl8657, v_prog_1);
       struct S24_std_Result t33 = (struct S24_std_Result){.tag = 1LL, .u = {.V_Err = {.f_0 = t32}}};
       struct S24_std_Result r34 = t33;
       gl0_drop(a26);
@@ -50084,7 +50059,7 @@ static struct S24_std_Result f52_proc_spawn(struct S18_proc_Command**p_cmd, stru
       gl6_drop(p_sin);
       return r34;
     }
-    f19_strings_StrBuf_add(&v_b_22, rt_str_dup(v_p_29));
+    f19_strings_StrBuf_add(&v_b_22, v_p_29);
     f55_strings_StrBuf_addByte(&v_b_22, (uint8_t)0LL);
     rt_str_drop(v_p_29);
   }
@@ -50092,10 +50067,10 @@ static struct S24_std_Result f52_proc_spawn(struct S18_proc_Command**p_cmd, stru
   lxl_slice ap35 = rt_as_slice(&(*p_cmd)->f_args);
   for (int64_t i36 = 0LL; i36 < ap35.len; i36++) {
     lxl_str v_a_37 = rt_str_dup(*((lxl_str*)ap35.data + i36));
-    bool t38 = f54_proc_hasNul(rt_str_dup(v_a_37));
+    bool t38 = f54_proc_hasNul(v_a_37);
     bool c39 = t38;
     if (c39) {
-      struct S23_proc_ProcError t40 = f49_proc_perr(22LL, sl8657, rt_str_dup(v_prog_1));
+      struct S23_proc_ProcError t40 = f49_proc_perr(22LL, sl8657, v_prog_1);
       struct S24_std_Result t41 = (struct S24_std_Result){.tag = 1LL, .u = {.V_Err = {.f_0 = t40}}};
       struct S24_std_Result r42 = t41;
       rt_str_drop(v_a_37);
@@ -50106,17 +50081,17 @@ static struct S24_std_Result f52_proc_spawn(struct S18_proc_Command**p_cmd, stru
       gl6_drop(p_sin);
       return r42;
     }
-    f19_strings_StrBuf_add(&v_b_22, rt_str_dup(v_a_37));
+    f19_strings_StrBuf_add(&v_b_22, v_a_37);
     f55_strings_StrBuf_addByte(&v_b_22, (uint8_t)0LL);
     rt_str_drop(v_a_37);
   }
   lxl_slice ap43 = rt_as_slice(&(*p_cmd)->f_env);
   for (int64_t i44 = 0LL; i44 < ap43.len; i44++) {
     lxl_str v_e_45 = rt_str_dup(*((lxl_str*)ap43.data + i44));
-    bool t46 = f54_proc_hasNul(rt_str_dup(v_e_45));
+    bool t46 = f54_proc_hasNul(v_e_45);
     bool c47 = t46;
     if (c47) {
-      struct S23_proc_ProcError t48 = f49_proc_perr(22LL, sl8657, rt_str_dup(v_prog_1));
+      struct S23_proc_ProcError t48 = f49_proc_perr(22LL, sl8657, v_prog_1);
       struct S24_std_Result t49 = (struct S24_std_Result){.tag = 1LL, .u = {.V_Err = {.f_0 = t48}}};
       struct S24_std_Result r50 = t49;
       rt_str_drop(v_e_45);
@@ -50127,7 +50102,7 @@ static struct S24_std_Result f52_proc_spawn(struct S18_proc_Command**p_cmd, stru
       gl6_drop(p_sin);
       return r50;
     }
-    f19_strings_StrBuf_add(&v_b_22, rt_str_dup(v_e_45));
+    f19_strings_StrBuf_add(&v_b_22, v_e_45);
     f55_strings_StrBuf_addByte(&v_b_22, (uint8_t)0LL);
     rt_str_drop(v_e_45);
   }
@@ -50148,7 +50123,7 @@ static struct S24_std_Result f52_proc_spawn(struct S18_proc_Command**p_cmd, stru
   int64_t v_pid_64 = t63;
   bool c65 = (bool)(v_pid_64 < 0LL);
   if (c65) {
-    struct S23_proc_ProcError t66 = f49_proc_perr(rt_neg_int(v_pid_64, "proc.lxl:392"), sl8657, rt_str_dup(v_prog_1));
+    struct S23_proc_ProcError t66 = f49_proc_perr(rt_neg_int(v_pid_64, "proc.lxl:392"), sl8657, v_prog_1);
     struct S24_std_Result t67 = (struct S24_std_Result){.tag = 1LL, .u = {.V_Err = {.f_0 = t66}}};
     struct S24_std_Result r68 = t67;
     gl11_drop(v_out_57);
@@ -50221,12 +50196,10 @@ static bool f54_proc_hasNul(lxl_str p_s) {
     bool c4 = (bool)((int32_t)t3 == 0);
     if (c4) {
       bool r5 = (bool)1LL;
-      rt_str_drop(p_s);
       return r5;
     }
   }
   bool r6 = (bool)0LL;
-  rt_str_drop(p_s);
   return r6;
 }
 static int64_t f53_proc_mode(struct S19_proc_Stdio*p_s, int64_t p_which) {
@@ -50270,22 +50243,18 @@ static struct S18_proc_Command*f38_proc_command(lxl_str p_program, lxl_arr p_arg
   o5->f_stderr = t4;
   struct S18_proc_Command*t6 = o5;
   struct S18_proc_Command*r7 = t6;
-  rt_str_drop(p_program);
   return r7;
 }
 static bool f25_strings_endsWith(lxl_str p_s, lxl_str p_suffix) {
   int64_t t1 = (int64_t)p_suffix.len;
   bool b2 = (bool)(t1 <= (int64_t)p_s.len);
   if (b2) {
-    lxl_str t3 = rt_str_dup(p_s);
-    int64_t t4 = (int64_t)p_s.len;
-    bool t5 = f57_strings_matchAt(t3, rt_sub_int(t4, (int64_t)p_suffix.len, "strings.lxl:970"), rt_str_dup(p_suffix));
-    b2 = t5;
+    int64_t t3 = (int64_t)p_s.len;
+    bool t4 = f57_strings_matchAt(p_s, rt_sub_int(t3, (int64_t)p_suffix.len, "strings.lxl:970"), p_suffix);
+    b2 = t4;
   }
-  bool r6 = b2;
-  rt_str_drop(p_suffix);
-  rt_str_drop(p_s);
-  return r6;
+  bool r5 = b2;
+  return r5;
 }
 static bool f57_strings_matchAt(lxl_str p_s, int64_t p_at, lxl_str p_sub) {
   int64_t end1 = (int64_t)p_sub.len;
@@ -50297,14 +50266,10 @@ static bool f57_strings_matchAt(lxl_str p_s, int64_t p_at, lxl_str p_sub) {
     rt_str_drop(t3);
     if (c6) {
       bool r7 = (bool)0LL;
-      rt_str_drop(p_sub);
-      rt_str_drop(p_s);
       return r7;
     }
   }
   bool r8 = (bool)1LL;
-  rt_str_drop(p_sub);
-  rt_str_drop(p_s);
   return r8;
 }
 static lxl_str f24_io_IoError_toStr(struct S12_io_IoError p_e) {
@@ -50382,10 +50347,8 @@ static lxl_str f59_io_lookupText(int64_t p_n) {
   }
 }
 static struct S10_std_Result f23_io_write(lxl_str p_path, lxl_str p_data) {
-  struct S10_std_Result t1 = f60_io_writeHow(rt_str_dup(p_path), rt_str_dup(p_data), 1LL);
+  struct S10_std_Result t1 = f60_io_writeHow(p_path, p_data, 1LL);
   struct S10_std_Result r2 = t1;
-  rt_str_drop(p_data);
-  rt_str_drop(p_path);
   return r2;
 }
 static struct S10_std_Result f60_io_writeHow(lxl_str p_path, lxl_str p_data, int64_t p_how) {
@@ -50395,11 +50358,9 @@ static struct S10_std_Result f60_io_writeHow(lxl_str p_path, lxl_str p_data, int
   int64_t v_fd_3 = t2;
   bool c4 = (bool)(v_fd_3 < 0LL);
   if (c4) {
-    struct S12_io_IoError t5 = f33_io_ioError(rt_neg_int(v_fd_3, "io.lxl:122"), sl8671, rt_str_dup(p_path));
+    struct S12_io_IoError t5 = f33_io_ioError(rt_neg_int(v_fd_3, "io.lxl:122"), sl8671, p_path);
     struct S10_std_Result t6 = (struct S10_std_Result){.tag = 1LL, .u = {.V_Err = {.f_0 = t5}}};
     struct S10_std_Result r7 = t6;
-    rt_str_drop(p_data);
-    rt_str_drop(p_path);
     return r7;
   }
   int64_t t8 = rt_write_fd(v_fd_3, p_data);
@@ -50408,29 +50369,23 @@ static struct S10_std_Result f60_io_writeHow(lxl_str p_path, lxl_str p_data, int
     int64_t t10 = x_lxl_errno();
     int64_t v_e_11 = t10;
     int32_t t12 = x_close(rt_cvs_i32((__int128)v_fd_3, "io.lxl:125"));
-    struct S12_io_IoError t13 = f33_io_ioError(v_e_11, sl8672, rt_str_dup(p_path));
+    struct S12_io_IoError t13 = f33_io_ioError(v_e_11, sl8672, p_path);
     struct S10_std_Result t14 = (struct S10_std_Result){.tag = 1LL, .u = {.V_Err = {.f_0 = t13}}};
     struct S10_std_Result r15 = t14;
-    rt_str_drop(p_data);
-    rt_str_drop(p_path);
     return r15;
   }
   int32_t t16 = x_close(rt_cvs_i32((__int128)v_fd_3, "io.lxl:128"));
   bool c17 = (bool)(t16 != 0);
   if (c17) {
     int64_t t18 = x_lxl_errno();
-    struct S12_io_IoError t19 = f33_io_ioError(t18, sl450, rt_str_dup(p_path));
+    struct S12_io_IoError t19 = f33_io_ioError(t18, sl450, p_path);
     struct S10_std_Result t20 = (struct S10_std_Result){.tag = 1LL, .u = {.V_Err = {.f_0 = t19}}};
     struct S10_std_Result r21 = t20;
-    rt_str_drop(p_data);
-    rt_str_drop(p_path);
     return r21;
   }
   struct S11_std_Unit t22 = (struct S11_std_Unit){._e = (char)0LL};
   struct S10_std_Result t23 = (struct S10_std_Result){.tag = 0LL, .u = {.V_Ok = {.f_0 = t22}}};
   struct S10_std_Result r24 = t23;
-  rt_str_drop(p_data);
-  rt_str_drop(p_path);
   return r24;
 }
 static lxl_str f22_os_envOr(lxl_str p_name, lxl_str p_d) {
@@ -50440,14 +50395,10 @@ static lxl_str f22_os_envOr(lxl_str p_name, lxl_str p_d) {
   if (c3) {
     lxl_str r4 = rt_str_dup(v_v_1);
     rt_str_drop(v_v_1);
-    rt_str_drop(p_d);
-    rt_str_drop(p_name);
     return r4;
   }
   lxl_str r5 = rt_str_dup(p_d);
   rt_str_drop(v_v_1);
-  rt_str_drop(p_d);
-  rt_str_drop(p_name);
   return r5;
 }
 static lxl_str f21_strings_StrBuf_toStr(struct S9_strings_StrBuf**p_b) {
@@ -50505,6 +50456,7 @@ static lxl_arr f61_main_libFlags(lxl_arr*p_libs) {
       lxl_str t12 = rt_str_concat(t11, sl8684);
       bool t13 = f62_fs_exists(t12);
       bool c14 = t13;
+      rt_str_drop(t12);
       rt_str_drop(t11);
       rt_str_drop(t10);
       if (c14) {
@@ -50529,14 +50481,14 @@ static lxl_arr f61_main_libFlags(lxl_arr*p_libs) {
     lxl_slice ap23 = k4_main_LIBDIRS;
     for (int64_t i24 = 0LL; i24 < ap23.len; i24++) {
       lxl_str v_d_25 = rt_str_dup(*((lxl_str*)ap23.data + i24));
-      struct S29_std_Result t26 = f63_fs_listNames(rt_str_dup(v_d_25));
+      struct S29_std_Result t26 = f63_fs_listNames(v_d_25);
       struct S29_std_Result s27 = t26;
       if (s27.tag == 0LL) {
         lxl_arr v_ns_28 = s27.u.V_Ok.f_0;
         lxl_slice ap29 = rt_as_slice(&v_ns_28);
         for (int64_t i30 = 0LL; i30 < ap29.len; i30++) {
           lxl_str v_n_31 = rt_str_dup(*((lxl_str*)ap29.data + i30));
-          bool t32 = f10_strings_startsWith(rt_str_dup(v_n_31), rt_str_dup(v_pre_22));
+          bool t32 = f10_strings_startsWith(v_n_31, v_pre_22);
           bool c33 = t32;
           if (c33) {
             lxl_str t34 = rt_str_concat(v_d_25, sl65);
@@ -50609,7 +50561,7 @@ static void f66_collections_siftDown(lxl_slice p_xs, int64_t p_start, int64_t p_
       int64_t ix5 = v_child_2;
       (void)((lxl_str*)p_xs.data + rt_idx(ix5, p_xs.len, "collections.lxl:702"));
       int64_t ix6 = rt_add_int(v_child_2, 1LL, "collections.lxl:702");
-      int64_t t7 = f67_std_str_cmp(rt_str_dup(*((lxl_str*)p_xs.data + rt_idx(ix5, p_xs.len, "collections.lxl:702"))), *((lxl_str*)p_xs.data + rt_idx(ix6, p_xs.len, "collections.lxl:702")));
+      int64_t t7 = f67_std_str_cmp(*((lxl_str*)p_xs.data + rt_idx(ix5, p_xs.len, "collections.lxl:702")), *((lxl_str*)p_xs.data + rt_idx(ix6, p_xs.len, "collections.lxl:702")));
       b4 = (bool)(t7 < 0LL);
     }
     bool c8 = b4;
@@ -50619,7 +50571,7 @@ static void f66_collections_siftDown(lxl_slice p_xs, int64_t p_start, int64_t p_
     int64_t ix9 = v_root_1;
     (void)((lxl_str*)p_xs.data + rt_idx(ix9, p_xs.len, "collections.lxl:703"));
     int64_t ix10 = v_child_2;
-    int64_t t11 = f67_std_str_cmp(rt_str_dup(*((lxl_str*)p_xs.data + rt_idx(ix9, p_xs.len, "collections.lxl:703"))), *((lxl_str*)p_xs.data + rt_idx(ix10, p_xs.len, "collections.lxl:703")));
+    int64_t t11 = f67_std_str_cmp(*((lxl_str*)p_xs.data + rt_idx(ix9, p_xs.len, "collections.lxl:703")), *((lxl_str*)p_xs.data + rt_idx(ix10, p_xs.len, "collections.lxl:703")));
     bool c12 = (bool)(t11 < 0LL);
     if (c12) {
       rt_swap(p_xs, v_root_1, v_child_2, 16ULL, "collections.lxl:704");
@@ -50633,7 +50585,6 @@ static int64_t f67_std_str_cmp(lxl_str p_a, lxl_str p_b) {
   bool t1 = (bool)(rt_str_cmp(p_a, p_b) < 0);
   int64_t t2 = f68_std_cmpOf(t1, (bool)(rt_str_cmp(p_a, p_b) > 0));
   int64_t r3 = t2;
-  rt_str_drop(p_a);
   return r3;
 }
 static int64_t f68_std_cmpOf(bool p_lt, bool p_gt) {
@@ -50651,12 +50602,11 @@ static int64_t f68_std_cmpOf(bool p_lt, bool p_gt) {
   return r5;
 }
 static struct S29_std_Result f63_fs_listNames(lxl_str p_path) {
-  struct S15_std_Result t1 = f31_fs_list(rt_str_dup(p_path));
+  struct S15_std_Result t1 = f31_fs_list(p_path);
   struct S15_std_Result tr2 = t1;
   if (tr2.tag == 1LL) {
     struct S12_io_IoError e3 = tr2.u.V_Err.f_0;
     struct S29_std_Result r4 = (struct S29_std_Result){.tag = 1LL, .u = {.V_Err = {.f_0 = e3}}};
-    rt_str_drop(p_path);
     return r4;
   }
   lxl_arr t5 = tr2.u.V_Ok.f_0;
@@ -50673,7 +50623,6 @@ static struct S29_std_Result f63_fs_listNames(lxl_str p_path) {
   struct S29_std_Result t13 = (struct S29_std_Result){.tag = 0LL, .u = {.V_Ok = {.f_0 = v_names_8}}};
   struct S29_std_Result r14 = t13;
   gl4_drop(v_es_6);
-  rt_str_drop(p_path);
   return r14;
 }
 static bool f62_fs_exists(lxl_str p_path) {
@@ -50681,12 +50630,10 @@ static bool f62_fs_exists(lxl_str p_path) {
   int64_t t2 = x_lxl_stat(rt_cstr(p_path, "fs.lxl:99"), 1LL);
   rt_cfree(cm1);
   bool r3 = (bool)(t2 == 0LL);
-  rt_str_drop(p_path);
   return r3;
 }
 static void f19_strings_StrBuf_add(struct S9_strings_StrBuf**p_b, lxl_str p_s) {
   rt_str_append(&(*p_b)->f_bytes, p_s);
-  rt_str_drop(p_s);
 }
 static lxl_str f18_main_jsonStr(lxl_str p_s) {
   struct S9_strings_StrBuf*t1 = f17_std_newStrBuf();
@@ -50763,7 +50710,7 @@ static lxl_str f16_cgen_print(struct S8_ir_Ir*p_p, lxl_str p_prefix) {
   o6->f_tn = a5;
   struct S30_cgen_Gen*t7 = o6;
   struct S30_cgen_Gen*v_g_8 = t7;
-  f19_strings_StrBuf_add(&v_g_8->f_out, rt_str_dup(p_prefix));
+  f19_strings_StrBuf_add(&v_g_8->f_out, p_prefix);
   f70_cgen_Gen_program(&v_g_8);
   lxl_str t9 = f21_strings_StrBuf_toStr(&v_g_8->f_out);
   lxl_str r10 = t9;
@@ -51122,25 +51069,23 @@ static bool f92_ir_isSignedK(int64_t p_k) {
 static lxl_str f91_cgen_hex32(int64_t p_v) {
   lxl_str t1 = f93_strings_hex(p_v);
   lxl_str v_s_2 = t1;
-  lxl_str t3 = sl8715;
-  lxl_str t4 = f94_strings_repeat(t3, rt_sub_int(8LL, (int64_t)v_s_2.len, "cgen.lxl:616"));
-  lxl_str t5 = rt_str_concat(t4, v_s_2);
-  lxl_str r6 = t5;
-  rt_str_drop(t4);
+  lxl_str t3 = f94_strings_repeat(sl8715, rt_sub_int(8LL, (int64_t)v_s_2.len, "cgen.lxl:616"));
+  lxl_str t4 = rt_str_concat(t3, v_s_2);
+  lxl_str r5 = t4;
+  rt_str_drop(t3);
   rt_str_drop(v_s_2);
-  return r6;
+  return r5;
 }
 static lxl_str f94_strings_repeat(lxl_str p_s, int64_t p_n) {
   struct S9_strings_StrBuf*t1 = f69_strings_newStrBuf();
   struct S9_strings_StrBuf*v_b_2 = t1;
   int64_t end3 = p_n;
   for (int64_t v_i_4 = 0LL; v_i_4 < end3; v_i_4++) {
-    f19_strings_StrBuf_add(&v_b_2, rt_str_dup(p_s));
+    f19_strings_StrBuf_add(&v_b_2, p_s);
   }
   lxl_str t5 = f21_strings_StrBuf_toStr(&v_b_2);
   lxl_str r6 = t5;
   gl1_drop(v_b_2);
-  rt_str_drop(p_s);
   return r6;
 }
 static lxl_str f93_strings_hex(int64_t p_n) {
@@ -51250,6 +51195,7 @@ static void f97_cgen_Gen_put(struct S30_cgen_Gen**p_g, int64_t p_x, int64_t p_ne
     }
     lxl_str t12 = f98_cgen_paren(t7, b9 ? 14LL : 15LL, p_need);
     f19_strings_StrBuf_add(p_b, t12);
+    rt_str_drop(t12);
     rt_str_drop(v_s_6);
   } else {
     bool c13 = (bool)(v_k_3 == 2LL);
@@ -51258,27 +51204,29 @@ static void f97_cgen_Gen_put(struct S30_cgen_Gen**p_g, int64_t p_x, int64_t p_ne
       lxl_str t15 = f99_cgen_fltLit(*((double*)(*p_g)->f_u->f_flts.data + rt_idx(ix14, (*p_g)->f_u->f_flts.len, "cgen.lxl:478")));
       lxl_str t16 = f98_cgen_paren(t15, 14LL, p_need);
       f19_strings_StrBuf_add(p_b, t16);
+      rt_str_drop(t16);
     } else {
       bool c17 = (bool)(v_k_3 == 3LL);
       if (c17) {
         int64_t ix18 = v_n_2->f_v;
         lxl_str t19 = f100_cgen_strLit(rt_str_dup(*((lxl_str*)(*p_g)->f_u->f_strs.data + rt_idx(ix18, (*p_g)->f_u->f_strs.len, "cgen.lxl:480"))));
         f19_strings_StrBuf_add(p_b, t19);
+        rt_str_drop(t19);
       } else {
         bool c20 = (bool)(v_k_3 == 4LL);
         if (c20) {
           int64_t ix21 = v_n_2->f_a;
-          f19_strings_StrBuf_add(p_b, rt_str_dup(*((lxl_str*)(*p_g)->f_lname.data + rt_idx(ix21, (*p_g)->f_lname.len, "cgen.lxl:482"))));
+          f19_strings_StrBuf_add(p_b, *((lxl_str*)(*p_g)->f_lname.data + rt_idx(ix21, (*p_g)->f_lname.len, "cgen.lxl:482")));
         } else {
           bool c22 = (bool)(v_k_3 == 5LL);
           if (c22) {
             int64_t ix23 = v_n_2->f_a;
-            f19_strings_StrBuf_add(p_b, rt_str_dup((*((struct S35_ir_Global**)(*p_g)->f_u->f_globals.data + rt_idx(ix23, (*p_g)->f_u->f_globals.len, "cgen.lxl:484")))->f_name));
+            f19_strings_StrBuf_add(p_b, (*((struct S35_ir_Global**)(*p_g)->f_u->f_globals.data + rt_idx(ix23, (*p_g)->f_u->f_globals.len, "cgen.lxl:484")))->f_name);
           } else {
             bool c24 = (bool)(v_k_3 == 6LL);
             if (c24) {
               int64_t ix25 = v_n_2->f_a;
-              f19_strings_StrBuf_add(p_b, rt_str_dup((*((struct S32_ir_Func**)(*p_g)->f_u->f_funcs.data + rt_idx(ix25, (*p_g)->f_u->f_funcs.len, "cgen.lxl:486")))->f_name));
+              f19_strings_StrBuf_add(p_b, (*((struct S32_ir_Func**)(*p_g)->f_u->f_funcs.data + rt_idx(ix25, (*p_g)->f_u->f_funcs.len, "cgen.lxl:486")))->f_name);
             } else {
               bool c26 = (bool)(v_k_3 == 7LL);
               if (c26) {
@@ -51303,8 +51251,9 @@ static void f97_cgen_Gen_put(struct S30_cgen_Gen**p_g, int64_t p_x, int64_t p_ne
                   if (c37) {
                     lxl_str t38 = rt_str_concat(sl8718, (*v_cf_34)->f_asmName);
                     f19_strings_StrBuf_add(p_b, t38);
+                    rt_str_drop(t38);
                   } else {
-                    f19_strings_StrBuf_add(p_b, rt_str_dup((*v_cf_34)->f_name));
+                    f19_strings_StrBuf_add(p_b, (*v_cf_34)->f_name);
                   }
                 } else {
                   f97_cgen_Gen_put(p_g, v_n_2->f_a, 15LL, p_b);
@@ -51337,7 +51286,7 @@ static void f97_cgen_Gen_put(struct S30_cgen_Gen**p_g, int64_t p_x, int64_t p_ne
                     f97_cgen_Gen_put(p_g, v_n_2->f_a, 15LL, p_b);
                     f55_strings_StrBuf_addByte(p_b, (uint8_t)46LL);
                   }
-                  f19_strings_StrBuf_add(p_b, rt_str_dup(v_f_48));
+                  f19_strings_StrBuf_add(p_b, v_f_48);
                   f104_cgen_close(15LL, p_need, p_b);
                   rt_str_drop(v_f_48);
                 } else {
@@ -51361,96 +51310,85 @@ static void f97_cgen_Gen_put(struct S30_cgen_Gen**p_g, int64_t p_x, int64_t p_ne
                   bool c55 = b52;
                   if (c55) {
                     f103_cgen_open(14LL, p_need, p_b);
-                    lxl_str ifx56;
-                    if (v_k_3 == 9LL) {
-                      ifx56 = sl64;
-                    } else {
-                      lxl_str ifx57;
-                      if (v_k_3 == 15LL) {
-                        ifx57 = sl61;
-                      } else {
-                        lxl_str t59 = v_k_3 == 16LL ? sl70 : sl58;
-                        ifx57 = t59;
-                      }
-                      ifx56 = ifx57;
-                    }
-                    f19_strings_StrBuf_add(p_b, ifx56);
+                    f19_strings_StrBuf_add(p_b, v_k_3 == 9LL ? sl64 : v_k_3 == 15LL ? sl61 : v_k_3 == 16LL ? sl70 : sl58);
                     f97_cgen_Gen_put(p_g, v_n_2->f_a, 14LL, p_b);
                     f104_cgen_close(14LL, p_need, p_b);
                   } else {
-                    bool c60 = (bool)(v_k_3 == 10LL);
-                    if (c60) {
-                      int64_t ix61 = v_n_2->f_a;
-                      f97_cgen_Gen_put(p_g, ((struct S33_ir_Node*)(*p_g)->f_u->f_nodes.data + rt_idx(ix61, (*p_g)->f_u->f_nodes.len, "cgen.lxl:525"))->f_a, p_need, p_b);
+                    bool c59 = (bool)(v_k_3 == 10LL);
+                    if (c59) {
+                      int64_t ix60 = v_n_2->f_a;
+                      f97_cgen_Gen_put(p_g, ((struct S33_ir_Node*)(*p_g)->f_u->f_nodes.data + rt_idx(ix60, (*p_g)->f_u->f_nodes.len, "cgen.lxl:525"))->f_a, p_need, p_b);
                     } else {
-                      bool b62 = (bool)(v_k_3 == 11LL);
-                      if (!b62) {
-                        bool b63 = (bool)(v_k_3 == 12LL);
-                        if (b63) {
-                          int64_t ix64 = v_n_2->f_a;
-                          b63 = (bool)(v_n_2->f_ty == ((struct S33_ir_Node*)(*p_g)->f_u->f_nodes.data + rt_idx(ix64, (*p_g)->f_u->f_nodes.len, "cgen.lxl:526"))->f_ty);
+                      bool b61 = (bool)(v_k_3 == 11LL);
+                      if (!b61) {
+                        bool b62 = (bool)(v_k_3 == 12LL);
+                        if (b62) {
+                          int64_t ix63 = v_n_2->f_a;
+                          b62 = (bool)(v_n_2->f_ty == ((struct S33_ir_Node*)(*p_g)->f_u->f_nodes.data + rt_idx(ix63, (*p_g)->f_u->f_nodes.len, "cgen.lxl:526"))->f_ty);
                         }
-                        b62 = b63;
+                        b61 = b62;
                       }
-                      bool c65 = b62;
-                      if (c65) {
+                      bool c64 = b61;
+                      if (c64) {
                         f97_cgen_Gen_put(p_g, v_n_2->f_a, p_need, p_b);
                       } else {
-                        bool c66 = (bool)(v_k_3 == 12LL);
-                        if (c66) {
+                        bool c65 = (bool)(v_k_3 == 12LL);
+                        if (c65) {
                           f103_cgen_open(14LL, p_need, p_b);
-                          int64_t ix67 = v_n_2->f_ty;
-                          lxl_str t68 = rt_str_concat(sl50, *((lxl_str*)(*p_g)->f_tn.data + rt_idx(ix67, (*p_g)->f_tn.len, "cgen.lxl:530")));
-                          lxl_str t69 = rt_str_concat(t68, sl51);
-                          f19_strings_StrBuf_add(p_b, t69);
+                          int64_t ix66 = v_n_2->f_ty;
+                          lxl_str t67 = rt_str_concat(sl50, *((lxl_str*)(*p_g)->f_tn.data + rt_idx(ix66, (*p_g)->f_tn.len, "cgen.lxl:530")));
+                          lxl_str t68 = rt_str_concat(t67, sl51);
+                          f19_strings_StrBuf_add(p_b, t68);
                           rt_str_drop(t68);
+                          rt_str_drop(t67);
                           f97_cgen_Gen_put(p_g, v_n_2->f_a, 14LL, p_b);
                           f104_cgen_close(14LL, p_need, p_b);
                         } else {
-                          bool c70 = (bool)(v_k_3 == 13LL);
-                          if (c70) {
-                            lxl_slice t71 = k4_cgen_OP_PREC;
-                            int64_t ix72 = v_n_2->f_v;
-                            int64_t v_p_73 = *((int64_t*)t71.data + rt_idx(ix72, t71.len, "cgen.lxl:534"));
-                            lxl_slice t74 = k4_cgen_OP_TEXT;
-                            int64_t ix75 = v_n_2->f_v;
-                            lxl_str t76 = rt_str_concat(sl8658, *((lxl_str*)t74.data + rt_idx(ix75, t74.len, "cgen.lxl:535")));
-                            lxl_str t77 = rt_str_concat(t76, sl8658);
-                            f105_cgen_Gen_infix(p_g, v_n_2->f_a, t77, v_n_2->f_b, v_p_73, v_p_73, rt_add_int(v_p_73, 1LL, "cgen.lxl:535"), p_need, p_b);
-                            rt_str_drop(t76);
+                          bool c69 = (bool)(v_k_3 == 13LL);
+                          if (c69) {
+                            lxl_slice t70 = k4_cgen_OP_PREC;
+                            int64_t ix71 = v_n_2->f_v;
+                            int64_t v_p_72 = *((int64_t*)t70.data + rt_idx(ix71, t70.len, "cgen.lxl:534"));
+                            lxl_slice t73 = k4_cgen_OP_TEXT;
+                            int64_t ix74 = v_n_2->f_v;
+                            lxl_str t75 = rt_str_concat(sl8658, *((lxl_str*)t73.data + rt_idx(ix74, t73.len, "cgen.lxl:535")));
+                            lxl_str t76 = rt_str_concat(t75, sl8658);
+                            f105_cgen_Gen_infix(p_g, v_n_2->f_a, t76, v_n_2->f_b, v_p_72, v_p_72, rt_add_int(v_p_72, 1LL, "cgen.lxl:535"), p_need, p_b);
+                            rt_str_drop(t75);
                           } else {
-                            bool c78 = (bool)(v_k_3 == 14LL);
-                            if (c78) {
-                              lxl_str t79 = f106_cgen_Gen_expr(p_g, v_n_2->f_a, 14LL);
-                              lxl_str v_s_80 = t79;
-                              lxl_str t81 = sl63;
-                              uint8_t t82 = rt_str_byte(v_s_80, 0LL, "cgen.lxl:538");
-                              lxl_str ifx83;
-                              if ((int32_t)t82 == 45) {
-                                lxl_str t84 = rt_str_concat(sl50, v_s_80);
-                                lxl_str t85 = rt_str_concat(t84, sl51);
-                                ifx83 = t85;
-                                rt_str_drop(t84);
+                            bool c77 = (bool)(v_k_3 == 14LL);
+                            if (c77) {
+                              lxl_str t78 = f106_cgen_Gen_expr(p_g, v_n_2->f_a, 14LL);
+                              lxl_str v_s_79 = t78;
+                              lxl_str t80 = sl63;
+                              uint8_t t81 = rt_str_byte(v_s_79, 0LL, "cgen.lxl:538");
+                              lxl_str ifx82;
+                              if ((int32_t)t81 == 45) {
+                                lxl_str t83 = rt_str_concat(sl50, v_s_79);
+                                lxl_str t84 = rt_str_concat(t83, sl51);
+                                ifx82 = t84;
+                                rt_str_drop(t83);
                               } else {
-                                ifx83 = rt_str_dup(v_s_80);
+                                ifx82 = rt_str_dup(v_s_79);
                               }
-                              lxl_str t86 = rt_str_concat(t81, ifx83);
-                              lxl_str t87 = f98_cgen_paren(t86, 14LL, p_need);
-                              f19_strings_StrBuf_add(p_b, t87);
-                              rt_str_drop(ifx83);
-                              rt_str_drop(t81);
-                              rt_str_drop(v_s_80);
+                              lxl_str t85 = rt_str_concat(t80, ifx82);
+                              lxl_str t86 = f98_cgen_paren(t85, 14LL, p_need);
+                              f19_strings_StrBuf_add(p_b, t86);
+                              rt_str_drop(t86);
+                              rt_str_drop(ifx82);
+                              rt_str_drop(t80);
+                              rt_str_drop(v_s_79);
                             } else {
-                              bool c88 = (bool)(v_k_3 == 17LL);
-                              if (c88) {
+                              bool c87 = (bool)(v_k_3 == 17LL);
+                              if (c87) {
                                 f105_cgen_Gen_infix(p_g, v_n_2->f_a, sl8720, v_n_2->f_b, 5LL, 5LL, 6LL, p_need, p_b);
                               } else {
-                                bool c89 = (bool)(v_k_3 == 18LL);
-                                if (c89) {
+                                bool c88 = (bool)(v_k_3 == 18LL);
+                                if (c88) {
                                   f105_cgen_Gen_infix(p_g, v_n_2->f_a, sl8721, v_n_2->f_b, 4LL, 4LL, 5LL, p_need, p_b);
                                 } else {
-                                  bool c90 = (bool)(v_k_3 == 19LL);
-                                  if (c90) {
+                                  bool c89 = (bool)(v_k_3 == 19LL);
+                                  if (c89) {
                                     f103_cgen_open(3LL, p_need, p_b);
                                     f97_cgen_Gen_put(p_g, v_n_2->f_a, 4LL, p_b);
                                     f19_strings_StrBuf_add(p_b, sl8722);
@@ -51459,74 +51397,76 @@ static void f97_cgen_Gen_put(struct S30_cgen_Gen**p_g, int64_t p_x, int64_t p_ne
                                     f97_cgen_Gen_put(p_g, v_n_2->f_c, 3LL, p_b);
                                     f104_cgen_close(3LL, p_need, p_b);
                                   } else {
-                                    bool c91 = (bool)(v_k_3 == 20LL);
-                                    if (c91) {
+                                    bool c90 = (bool)(v_k_3 == 20LL);
+                                    if (c90) {
                                       f105_cgen_Gen_infix(p_g, v_n_2->f_a, sl8724, v_n_2->f_b, 2LL, 14LL, 2LL, p_need, p_b);
                                     } else {
-                                      bool c92 = (bool)(v_k_3 == 21LL);
-                                      if (c92) {
+                                      bool c91 = (bool)(v_k_3 == 21LL);
+                                      if (c91) {
                                         f103_cgen_open(15LL, p_need, p_b);
                                         f97_cgen_Gen_put(p_g, v_n_2->f_a, 15LL, p_b);
-                                        lxl_str t94 = v_n_2->f_v > 0LL ? sl8725 : sl8629;
-                                        f19_strings_StrBuf_add(p_b, t94);
+                                        f19_strings_StrBuf_add(p_b, v_n_2->f_v > 0LL ? sl8725 : sl8629);
                                         f104_cgen_close(15LL, p_need, p_b);
                                       } else {
-                                        bool c95 = (bool)(v_k_3 == 22LL);
-                                        if (c95) {
-                                          int64_t ix96 = v_n_2->f_ty;
-                                          lxl_str t97 = rt_str_concat(sl50, *((lxl_str*)(*p_g)->f_tn.data + rt_idx(ix96, (*p_g)->f_tn.len, "cgen.lxl:559")));
-                                          lxl_str t98 = rt_str_concat(t97, sl51);
-                                          lxl_str t99 = f107_cgen_Gen_initText(p_g, v_n_2->f_ty, v_n_2->f_b);
-                                          lxl_str t100 = rt_str_concat(t98, t99);
-                                          lxl_str t101 = f98_cgen_paren(t100, 15LL, p_need);
-                                          f19_strings_StrBuf_add(p_b, t101);
+                                        bool c93 = (bool)(v_k_3 == 22LL);
+                                        if (c93) {
+                                          int64_t ix94 = v_n_2->f_ty;
+                                          lxl_str t95 = rt_str_concat(sl50, *((lxl_str*)(*p_g)->f_tn.data + rt_idx(ix94, (*p_g)->f_tn.len, "cgen.lxl:559")));
+                                          lxl_str t96 = rt_str_concat(t95, sl51);
+                                          lxl_str t97 = f107_cgen_Gen_initText(p_g, v_n_2->f_ty, v_n_2->f_b);
+                                          lxl_str t98 = rt_str_concat(t96, t97);
+                                          lxl_str t99 = f98_cgen_paren(t98, 15LL, p_need);
+                                          f19_strings_StrBuf_add(p_b, t99);
                                           rt_str_drop(t99);
-                                          rt_str_drop(t98);
                                           rt_str_drop(t97);
+                                          rt_str_drop(t96);
+                                          rt_str_drop(t95);
                                         } else {
-                                          bool c102 = (bool)(v_k_3 == 24LL);
-                                          if (c102) {
-                                            int64_t ix103 = v_n_2->f_ty;
-                                            int64_t v_pt_104 = ((struct S34_ir_Ty*)(*p_g)->f_u->f_tys.data + rt_idx(ix103, (*p_g)->f_u->f_tys.len, "cgen.lxl:561"))->f_base;
-                                            int64_t t105 = f108_ir_Ir_sizeOf(&(*p_g)->f_u, v_pt_104);
-                                            int64_t ifx106;
-                                            if (t105 == 0LL) {
-                                              ifx106 = 1LL;
+                                          bool c100 = (bool)(v_k_3 == 24LL);
+                                          if (c100) {
+                                            int64_t ix101 = v_n_2->f_ty;
+                                            int64_t v_pt_102 = ((struct S34_ir_Ty*)(*p_g)->f_u->f_tys.data + rt_idx(ix101, (*p_g)->f_u->f_tys.len, "cgen.lxl:561"))->f_base;
+                                            int64_t t103 = f108_ir_Ir_sizeOf(&(*p_g)->f_u, v_pt_102);
+                                            int64_t ifx104;
+                                            if (t103 == 0LL) {
+                                              ifx104 = 1LL;
                                             } else {
-                                              int64_t t107 = f108_ir_Ir_sizeOf(&(*p_g)->f_u, v_pt_104);
-                                              ifx106 = t107;
+                                              int64_t t105 = f108_ir_Ir_sizeOf(&(*p_g)->f_u, v_pt_102);
+                                              ifx104 = t105;
                                             }
-                                            int64_t v_es_108 = ifx106;
-                                            bool c109 = (bool)(v_es_108 == v_n_2->f_v);
-                                            if (c109) {
+                                            int64_t v_es_106 = ifx104;
+                                            bool c107 = (bool)(v_es_106 == v_n_2->f_v);
+                                            if (c107) {
                                               f105_cgen_Gen_infix(p_g, v_n_2->f_a, sl8726, v_n_2->f_b, 12LL, 12LL, 13LL, p_need, p_b);
                                             } else {
                                               f103_cgen_open(14LL, p_need, p_b);
-                                              int64_t ix110 = v_n_2->f_ty;
-                                              lxl_str t111 = rt_str_concat(sl50, *((lxl_str*)(*p_g)->f_tn.data + rt_idx(ix110, (*p_g)->f_tn.len, "cgen.lxl:567")));
-                                              lxl_str t112 = rt_str_concat(t111, sl8727);
-                                              f19_strings_StrBuf_add(p_b, t112);
-                                              rt_str_drop(t111);
+                                              int64_t ix108 = v_n_2->f_ty;
+                                              lxl_str t109 = rt_str_concat(sl50, *((lxl_str*)(*p_g)->f_tn.data + rt_idx(ix108, (*p_g)->f_tn.len, "cgen.lxl:567")));
+                                              lxl_str t110 = rt_str_concat(t109, sl8727);
+                                              f19_strings_StrBuf_add(p_b, t110);
+                                              rt_str_drop(t110);
+                                              rt_str_drop(t109);
                                               f97_cgen_Gen_put(p_g, v_n_2->f_a, 14LL, p_b);
                                               f19_strings_StrBuf_add(p_b, sl8726);
                                               f97_cgen_Gen_put(p_g, v_n_2->f_b, 13LL, p_b);
-                                              lxl_str t113 = sl8728;
-                                              lxl_str t114 = rt_int_to_str(v_n_2->f_v);
-                                              lxl_str t115 = rt_str_concat(t113, t114);
-                                              lxl_str t116 = rt_str_concat(t115, sl51);
-                                              f19_strings_StrBuf_add(p_b, t116);
-                                              rt_str_drop(t115);
+                                              lxl_str t111 = sl8728;
+                                              lxl_str t112 = rt_int_to_str(v_n_2->f_v);
+                                              lxl_str t113 = rt_str_concat(t111, t112);
+                                              lxl_str t114 = rt_str_concat(t113, sl51);
+                                              f19_strings_StrBuf_add(p_b, t114);
                                               rt_str_drop(t114);
                                               rt_str_drop(t113);
+                                              rt_str_drop(t112);
+                                              rt_str_drop(t111);
                                               f104_cgen_close(14LL, p_need, p_b);
                                             }
                                           } else {
-                                            lxl_str t117 = sl8729;
-                                            int64_t t118 = v_n_2->f_line;
-                                            lxl_str t119 = sl8730;
-                                            lxl_str t120 = rt_int_to_str(v_k_3);
-                                            lxl_str t121 = rt_str_concat(t119, t120);
-                                            f109_ir_failAt(t117, t118, t121);
+                                            lxl_str t115 = sl8729;
+                                            int64_t t116 = v_n_2->f_line;
+                                            lxl_str t117 = sl8730;
+                                            lxl_str t118 = rt_int_to_str(v_k_3);
+                                            lxl_str t119 = rt_str_concat(t117, t118);
+                                            f109_ir_failAt(t115, t116, t119);
                                           }
                                         }
                                       }
@@ -51746,15 +51686,14 @@ static lxl_str f114_strings_join(lxl_slice p_parts, lxl_str p_sep) {
   for (int64_t v_i_4 = 0LL; v_i_4 < end3; v_i_4++) {
     bool c5 = (bool)(v_i_4 > 0LL);
     if (c5) {
-      f19_strings_StrBuf_add(&v_b_2, rt_str_dup(p_sep));
+      f19_strings_StrBuf_add(&v_b_2, p_sep);
     }
     int64_t ix6 = v_i_4;
-    f19_strings_StrBuf_add(&v_b_2, rt_str_dup(*((lxl_str*)p_parts.data + rt_idx(ix6, p_parts.len, "strings.lxl:192"))));
+    f19_strings_StrBuf_add(&v_b_2, *((lxl_str*)p_parts.data + rt_idx(ix6, p_parts.len, "strings.lxl:192")));
   }
   lxl_str t7 = f21_strings_StrBuf_toStr(&v_b_2);
   lxl_str r8 = t7;
   gl1_drop(v_b_2);
-  rt_str_drop(p_sep);
   return r8;
 }
 static lxl_arr f113_cgen_Gen_elements(struct S30_cgen_Gen**p_g, lxl_arr*p_es, int64_t p_base, int64_t p_es0, int64_t p_n) {
@@ -51932,7 +51871,7 @@ static lxl_str f106_cgen_Gen_expr(struct S30_cgen_Gen**p_g, int64_t p_x, int64_t
 static void f105_cgen_Gen_infix(struct S30_cgen_Gen**p_g, int64_t p_a, lxl_str p_op, int64_t p_c, int64_t p_p, int64_t p_pa, int64_t p_pc, int64_t p_need, struct S9_strings_StrBuf**p_b) {
   f103_cgen_open(p_p, p_need, p_b);
   f97_cgen_Gen_put(p_g, p_a, p_pa, p_b);
-  f19_strings_StrBuf_add(p_b, rt_str_dup(p_op));
+  f19_strings_StrBuf_add(p_b, p_op);
   f97_cgen_Gen_put(p_g, p_c, p_pc, p_b);
   f104_cgen_close(p_p, p_need, p_b);
   rt_str_drop(p_op);
@@ -52244,100 +52183,98 @@ static lxl_str f117_num_pyFloatRepr(double p_x) {
     bool c58 = (bool)(v_decpt_16 <= 0LL);
     if (c58) {
       lxl_str t59 = rt_str_concat(v_sign_10, sl8746);
-      lxl_str t60 = sl8715;
-      lxl_str t61 = f94_strings_repeat(t60, rt_neg_int(v_decpt_16, "num.lxl:486"));
-      lxl_str t62 = rt_str_concat(t59, t61);
-      lxl_str t63 = rt_str_concat(t62, v_d_45);
-      lxl_str r64 = t63;
-      rt_str_drop(t62);
+      lxl_str t60 = f94_strings_repeat(sl8715, rt_neg_int(v_decpt_16, "num.lxl:486"));
+      lxl_str t61 = rt_str_concat(t59, t60);
+      lxl_str t62 = rt_str_concat(t61, v_d_45);
+      lxl_str r63 = t62;
       rt_str_drop(t61);
+      rt_str_drop(t60);
       rt_str_drop(t59);
       rt_str_drop(v_d_45);
       gl1_drop(v_digits_15);
       rt_str_drop(v_sign_10);
       rt_str_drop(v_s_4);
-      return r64;
+      return r63;
     }
-    int64_t t65 = v_decpt_16;
-    bool c66 = (bool)(t65 < (int64_t)v_d_45.len);
-    if (c66) {
-      int64_t ix67 = v_decpt_16;
-      lxl_str t68 = rt_str_sub(v_d_45, 0LL, ix67, "num.lxl:487");
-      lxl_str t69 = rt_str_concat(v_sign_10, t68);
-      lxl_str t70 = rt_str_concat(t69, sl57);
-      int64_t ix71 = v_decpt_16;
-      lxl_str t72 = rt_str_sub(v_d_45, ix71, (int64_t)v_d_45.len, "num.lxl:487");
-      lxl_str t73 = rt_str_concat(t70, t72);
-      lxl_str r74 = t73;
-      rt_str_drop(t72);
-      rt_str_drop(t70);
+    int64_t t64 = v_decpt_16;
+    bool c65 = (bool)(t64 < (int64_t)v_d_45.len);
+    if (c65) {
+      int64_t ix66 = v_decpt_16;
+      lxl_str t67 = rt_str_sub(v_d_45, 0LL, ix66, "num.lxl:487");
+      lxl_str t68 = rt_str_concat(v_sign_10, t67);
+      lxl_str t69 = rt_str_concat(t68, sl57);
+      int64_t ix70 = v_decpt_16;
+      lxl_str t71 = rt_str_sub(v_d_45, ix70, (int64_t)v_d_45.len, "num.lxl:487");
+      lxl_str t72 = rt_str_concat(t69, t71);
+      lxl_str r73 = t72;
+      rt_str_drop(t71);
       rt_str_drop(t69);
       rt_str_drop(t68);
+      rt_str_drop(t67);
       rt_str_drop(v_d_45);
       gl1_drop(v_digits_15);
       rt_str_drop(v_sign_10);
       rt_str_drop(v_s_4);
-      return r74;
+      return r73;
     }
-    lxl_str t75 = rt_str_concat(v_sign_10, v_d_45);
-    lxl_str t76 = sl8715;
-    int64_t t77 = v_decpt_16;
-    lxl_str t78 = f94_strings_repeat(t76, rt_sub_int(t77, (int64_t)v_d_45.len, "num.lxl:488"));
-    lxl_str t79 = rt_str_concat(t75, t78);
-    lxl_str t80 = rt_str_concat(t79, sl8747);
-    lxl_str r81 = t80;
-    rt_str_drop(t79);
-    rt_str_drop(t78);
-    rt_str_drop(t75);
+    lxl_str t74 = rt_str_concat(v_sign_10, v_d_45);
+    int64_t t75 = v_decpt_16;
+    lxl_str t76 = f94_strings_repeat(sl8715, rt_sub_int(t75, (int64_t)v_d_45.len, "num.lxl:488"));
+    lxl_str t77 = rt_str_concat(t74, t76);
+    lxl_str t78 = rt_str_concat(t77, sl8747);
+    lxl_str r79 = t78;
+    rt_str_drop(t77);
+    rt_str_drop(t76);
+    rt_str_drop(t74);
     rt_str_drop(v_d_45);
     gl1_drop(v_digits_15);
     rt_str_drop(v_sign_10);
     rt_str_drop(v_s_4);
-    return r81;
+    return r79;
   }
-  lxl_str ifx82;
+  lxl_str ifx80;
   if ((int64_t)v_d_45.len > 1LL) {
-    lxl_str t83 = rt_str_sub(v_d_45, 0LL, 1LL, "num.lxl:490");
-    lxl_str t84 = rt_str_concat(t83, sl57);
-    lxl_str t85 = rt_str_sub(v_d_45, 1LL, (int64_t)v_d_45.len, "num.lxl:490");
-    lxl_str t86 = rt_str_concat(t84, t85);
-    ifx82 = t86;
-    rt_str_drop(t85);
-    rt_str_drop(t84);
+    lxl_str t81 = rt_str_sub(v_d_45, 0LL, 1LL, "num.lxl:490");
+    lxl_str t82 = rt_str_concat(t81, sl57);
+    lxl_str t83 = rt_str_sub(v_d_45, 1LL, (int64_t)v_d_45.len, "num.lxl:490");
+    lxl_str t84 = rt_str_concat(t82, t83);
+    ifx80 = t84;
     rt_str_drop(t83);
+    rt_str_drop(t82);
+    rt_str_drop(t81);
   } else {
-    lxl_str t87 = rt_str_sub(v_d_45, 0LL, 1LL, "num.lxl:490");
-    ifx82 = t87;
+    lxl_str t85 = rt_str_sub(v_d_45, 0LL, 1LL, "num.lxl:490");
+    ifx80 = t85;
   }
-  lxl_str v_m_88 = ifx82;
-  int64_t v_e_89 = rt_sub_int(v_decpt_16, 1LL, "num.lxl:491");
-  lxl_str t91 = rt_int_to_str(v_e_89 < 0LL ? rt_neg_int(v_e_89, "num.lxl:492") : v_e_89);
-  lxl_str v_es_92 = t91;
-  lxl_str t93 = rt_str_concat(v_sign_10, v_m_88);
-  lxl_str t94 = rt_str_concat(t93, sl8748);
-  lxl_str t96 = v_e_89 < 0LL ? sl63 : sl62;
-  lxl_str t97 = rt_str_concat(t94, t96);
-  lxl_str ifx98;
-  if ((int64_t)v_es_92.len < 2LL) {
-    lxl_str t99 = rt_str_concat(sl8715, v_es_92);
-    ifx98 = t99;
+  lxl_str v_m_86 = ifx80;
+  int64_t v_e_87 = rt_sub_int(v_decpt_16, 1LL, "num.lxl:491");
+  lxl_str t89 = rt_int_to_str(v_e_87 < 0LL ? rt_neg_int(v_e_87, "num.lxl:492") : v_e_87);
+  lxl_str v_es_90 = t89;
+  lxl_str t91 = rt_str_concat(v_sign_10, v_m_86);
+  lxl_str t92 = rt_str_concat(t91, sl8748);
+  lxl_str t94 = v_e_87 < 0LL ? sl63 : sl62;
+  lxl_str t95 = rt_str_concat(t92, t94);
+  lxl_str ifx96;
+  if ((int64_t)v_es_90.len < 2LL) {
+    lxl_str t97 = rt_str_concat(sl8715, v_es_90);
+    ifx96 = t97;
   } else {
-    ifx98 = rt_str_dup(v_es_92);
+    ifx96 = rt_str_dup(v_es_90);
   }
-  lxl_str t100 = rt_str_concat(t97, ifx98);
-  lxl_str r101 = t100;
-  rt_str_drop(ifx98);
-  rt_str_drop(t97);
-  rt_str_drop(t96);
+  lxl_str t98 = rt_str_concat(t95, ifx96);
+  lxl_str r99 = t98;
+  rt_str_drop(ifx96);
+  rt_str_drop(t95);
   rt_str_drop(t94);
-  rt_str_drop(t93);
-  rt_str_drop(v_es_92);
-  rt_str_drop(v_m_88);
+  rt_str_drop(t92);
+  rt_str_drop(t91);
+  rt_str_drop(v_es_90);
+  rt_str_drop(v_m_86);
   rt_str_drop(v_d_45);
   gl1_drop(v_digits_15);
   rt_str_drop(v_sign_10);
   rt_str_drop(v_s_4);
-  return r101;
+  return r99;
 }
 static int64_t f119_strings_StrBuf_size(struct S9_strings_StrBuf**p_b) {
   int64_t r1 = (*p_b)->f_bytes.len;
@@ -52351,7 +52288,7 @@ static lxl_str f118_std_float_toStr(double p_a) {
   }
   lxl_str t3 = rt_float_to_str(p_a);
   lxl_str v_s_4 = t3;
-  int64_t t5 = f120_strings_indexOf(rt_str_dup(v_s_4), sl8748, 0LL);
+  int64_t t5 = f120_strings_indexOf(v_s_4, sl8748, 0LL);
   int64_t v_e_6 = t5;
   bool c7 = (bool)(v_e_6 < 0LL);
   if (c7) {
@@ -52385,7 +52322,7 @@ static lxl_str f118_std_float_toStr(double p_a) {
   lxl_str v_mant_22 = t21;
   bool c23 = (bool)(v_x_9 <= -308LL);
   if (c23) {
-    lxl_str t24 = f122_std_shortestMantissa(p_a, rt_str_dup(v_mant_22), v_x_9);
+    lxl_str t24 = f122_std_shortestMantissa(p_a, v_mant_22, v_x_9);
     {
       lxl_str nw25 = t24;
       rt_str_drop(v_mant_22);
@@ -52504,7 +52441,6 @@ static lxl_str f122_std_shortestMantissa(double p_a, lxl_str p_mant, int64_t p_x
         rt_str_drop(v_d_13);
         gl1_drop(v_digits_3);
         rt_str_drop(v_sign_1);
-        rt_str_drop(p_mant);
         return r49;
       }
       rt_str_drop(v_m_34);
@@ -52516,7 +52452,6 @@ static lxl_str f122_std_shortestMantissa(double p_a, lxl_str p_mant, int64_t p_x
   rt_str_drop(v_d_13);
   gl1_drop(v_digits_3);
   rt_str_drop(v_sign_1);
-  rt_str_drop(p_mant);
   return r50;
 }
 static bool f121_strings_isDigit(uint8_t p_c) {
@@ -52536,13 +52471,9 @@ static int64_t f120_strings_indexOf(lxl_str p_s, lxl_str p_sub, int64_t p_from) 
     bool c6 = (bool)(t5 <= (int64_t)p_s.len);
     if (c6) {
       int64_t r7 = v_start_2;
-      rt_str_drop(p_sub);
-      rt_str_drop(p_s);
       return r7;
     }
     int64_t r8 = -1LL;
-    rt_str_drop(p_sub);
-    rt_str_drop(p_s);
     return r8;
   }
   bool c9 = (bool)((int64_t)p_s.len >= 16LL);
@@ -52551,8 +52482,6 @@ static int64_t f120_strings_indexOf(lxl_str p_s, lxl_str p_sub, int64_t p_from) 
     if (c10) {
       int64_t t11 = rt_str_find(p_s, v_start_2, p_sub);
       int64_t r12 = t11;
-      rt_str_drop(p_sub);
-      rt_str_drop(p_s);
       return r12;
     }
     int64_t v_rem_13 = rt_sub_int((int64_t)p_s.len, v_start_2, "strings.lxl:944");
@@ -52561,8 +52490,6 @@ static int64_t f120_strings_indexOf(lxl_str p_s, lxl_str p_sub, int64_t p_from) 
     if (c17) {
       int64_t t18 = rt_str_find(p_s, v_start_2, p_sub);
       int64_t r19 = t18;
-      rt_str_drop(p_sub);
-      rt_str_drop(p_s);
       return r19;
     }
   }
@@ -52578,21 +52505,17 @@ static int64_t f120_strings_indexOf(lxl_str p_s, lxl_str p_sub, int64_t p_from) 
     uint8_t t25 = rt_str_byte(p_s, v_i_22, "strings.lxl:951");
     bool b26 = (bool)((int32_t)t25 == (int32_t)v_first_21);
     if (b26) {
-      bool t27 = f57_strings_matchAt(rt_str_dup(p_s), v_i_22, rt_str_dup(p_sub));
+      bool t27 = f57_strings_matchAt(p_s, v_i_22, p_sub);
       b26 = t27;
     }
     bool c28 = b26;
     if (c28) {
       int64_t r29 = v_i_22;
-      rt_str_drop(p_sub);
-      rt_str_drop(p_s);
       return r29;
     }
     v_i_22 = rt_add_int(v_i_22, 1LL, "strings.lxl:952");
   }
   int64_t r30 = -1LL;
-  rt_str_drop(p_sub);
-  rt_str_drop(p_s);
   return r30;
 }
 static lxl_str f98_cgen_paren(lxl_str p_s, int64_t p_p, int64_t p_need) {
@@ -52621,6 +52544,7 @@ static void f86_cgen_Gen_simple(struct S30_cgen_Gen**p_g, int64_t p_x) {
     int64_t ix8 = v_a_4;
     lxl_str t9 = f71_cgen_Gen_decl(p_g, v_t_7, rt_str_dup(*((lxl_str*)(*p_g)->f_lname.data + rt_idx(ix8, (*p_g)->f_lname.len, "cgen.lxl:418"))));
     f19_strings_StrBuf_add(&(*p_g)->f_out, t9);
+    rt_str_drop(t9);
     int64_t ix10 = p_x;
     int64_t v_b_11 = ((struct S33_ir_Node*)(*p_g)->f_u->f_nodes.data + rt_idx(ix10, (*p_g)->f_u->f_nodes.len, "cgen.lxl:419"))->f_b;
     int64_t ix12 = p_x;
@@ -52636,6 +52560,7 @@ static void f86_cgen_Gen_simple(struct S30_cgen_Gen**p_g, int64_t p_x) {
       lxl_str t17 = f107_cgen_Gen_initText(p_g, v_t_7, v_c_13);
       lxl_str t18 = rt_str_concat(t16, t17);
       f19_strings_StrBuf_add(&(*p_g)->f_out, t18);
+      rt_str_drop(t18);
       rt_str_drop(t17);
       rt_str_drop(t16);
     }
@@ -52649,59 +52574,51 @@ static void f86_cgen_Gen_simple(struct S30_cgen_Gen**p_g, int64_t p_x) {
     if (c20) {
       bool c21 = (bool)(v_k_2 == 47LL);
       if (c21) {
-        lxl_str t23 = v_a_4 < 0LL ? sl92 : sl8750;
-        f19_strings_StrBuf_add(&(*p_g)->f_out, t23);
+        f19_strings_StrBuf_add(&(*p_g)->f_out, v_a_4 < 0LL ? sl92 : sl8750);
       }
-      bool c24 = (bool)(v_a_4 >= 0LL);
-      if (c24) {
+      bool c23 = (bool)(v_a_4 >= 0LL);
+      if (c23) {
         f87_cgen_Gen_ex(p_g, v_a_4, 0LL);
       }
       f55_strings_StrBuf_addByte(&(*p_g)->f_out, (uint8_t)59LL);
     } else {
-      bool b25 = (bool)(v_k_2 == 45LL);
+      bool b24 = (bool)(v_k_2 == 45LL);
+      if (!b24) {
+        b24 = (bool)(v_k_2 == 46LL);
+      }
+      bool b25 = b24;
       if (!b25) {
-        b25 = (bool)(v_k_2 == 46LL);
+        b25 = (bool)(v_k_2 == 52LL);
       }
-      bool b26 = b25;
-      if (!b26) {
-        b26 = (bool)(v_k_2 == 52LL);
-      }
-      bool c27 = b26;
-      if (c27) {
-        lxl_str ifx28;
-        if (v_k_2 == 45LL) {
-          ifx28 = sl8751;
-        } else {
-          lxl_str t30 = v_k_2 == 46LL ? sl8752 : sl56;
-          ifx28 = t30;
-        }
-        f19_strings_StrBuf_add(&(*p_g)->f_out, ifx28);
+      bool c26 = b25;
+      if (c26) {
+        f19_strings_StrBuf_add(&(*p_g)->f_out, v_k_2 == 45LL ? sl8751 : v_k_2 == 46LL ? sl8752 : sl56);
       } else {
-        bool b31 = (bool)(v_k_2 == 48LL);
-        if (b31) {
-          int64_t ix32 = p_x;
-          b31 = (bool)(((struct S33_ir_Node*)(*p_g)->f_u->f_nodes.data + rt_idx(ix32, (*p_g)->f_u->f_nodes.len, "cgen.lxl:433"))->f_v == 1LL);
+        bool b29 = (bool)(v_k_2 == 48LL);
+        if (b29) {
+          int64_t ix30 = p_x;
+          b29 = (bool)(((struct S33_ir_Node*)(*p_g)->f_u->f_nodes.data + rt_idx(ix30, (*p_g)->f_u->f_nodes.len, "cgen.lxl:433"))->f_v == 1LL);
         }
-        bool c33 = b31;
-        if (c33) {
-          int64_t t34 = f79_ir_Ir_listLen(&(*p_g)->f_u, v_a_4);
-          int64_t end35 = t34;
-          for (int64_t v_j_36 = 0LL; v_j_36 < end35; v_j_36++) {
-            bool c37 = (bool)(v_j_36 > 0LL);
-            if (c37) {
+        bool c31 = b29;
+        if (c31) {
+          int64_t t32 = f79_ir_Ir_listLen(&(*p_g)->f_u, v_a_4);
+          int64_t end33 = t32;
+          for (int64_t v_j_34 = 0LL; v_j_34 < end33; v_j_34++) {
+            bool c35 = (bool)(v_j_34 > 0LL);
+            if (c35) {
               f55_strings_StrBuf_addByte(&(*p_g)->f_out, (uint8_t)32LL);
             }
-            int64_t t38 = f80_ir_Ir_listAt(&(*p_g)->f_u, v_a_4, v_j_36);
-            f86_cgen_Gen_simple(p_g, t38);
+            int64_t t36 = f80_ir_Ir_listAt(&(*p_g)->f_u, v_a_4, v_j_34);
+            f86_cgen_Gen_simple(p_g, t36);
           }
         } else {
-          lxl_str t39 = sl8729;
-          int64_t ix40 = p_x;
-          int64_t t41 = ((struct S33_ir_Node*)(*p_g)->f_u->f_nodes.data + rt_idx(ix40, (*p_g)->f_u->f_nodes.len, "cgen.lxl:439"))->f_line;
-          lxl_str t42 = sl8753;
-          lxl_str t43 = rt_int_to_str(v_k_2);
-          lxl_str t44 = rt_str_concat(t42, t43);
-          f109_ir_failAt(t39, t41, t44);
+          lxl_str t37 = sl8729;
+          int64_t ix38 = p_x;
+          int64_t t39 = ((struct S33_ir_Node*)(*p_g)->f_u->f_nodes.data + rt_idx(ix38, (*p_g)->f_u->f_nodes.len, "cgen.lxl:439"))->f_line;
+          lxl_str t40 = sl8753;
+          lxl_str t41 = rt_int_to_str(v_k_2);
+          lxl_str t42 = rt_str_concat(t40, t41);
+          f109_ir_failAt(t37, t39, t42);
         }
       }
     }
@@ -52745,7 +52662,7 @@ static void f82_cgen_Gen_start(struct S30_cgen_Gen**p_g, int64_t p_d, lxl_str p_
   for (int64_t v_i_2 = 0LL; v_i_2 < end1; v_i_2++) {
     f19_strings_StrBuf_add(&(*p_g)->f_out, sl8754);
   }
-  f19_strings_StrBuf_add(&(*p_g)->f_out, rt_str_dup(p_s));
+  f19_strings_StrBuf_add(&(*p_g)->f_out, p_s);
   rt_str_drop(p_s);
 }
 static int64_t f80_ir_Ir_listAt(struct S8_ir_Ir**p_p, int64_t p_l, int64_t p_j) {
@@ -52884,7 +52801,7 @@ static void f128_collections_Map_put(struct S38_collections_Map**p_m, lxl_str p_
     uint64_t t2 = (*p_m)->f_hashFn(p_k);
     ifx1 = t2;
   } else {
-    uint64_t t3 = f129_std_str_hash(rt_str_dup(p_k));
+    uint64_t t3 = f129_std_str_hash(p_k);
     ifx1 = t3;
   }
   uint64_t v_h_4 = ifx1;
@@ -52984,7 +52901,7 @@ static struct S39_collections_Probe f130_collections_Map_find(struct S38_collect
     if (c14) {
       int64_t v_e_15 = rt_sub_int(rt_cvs_int((__int128)v_d_13, "collections.lxl:840"), 1LL, "collections.lxl:840");
       int64_t ix16 = v_e_15;
-      bool t17 = f134_std_str_eq(rt_str_dup(*((lxl_str*)(*p_m)->f_keys.data + rt_idx(ix16, (*p_m)->f_keys.len, "collections.lxl:841"))), p_k);
+      bool t17 = f134_std_str_eq(*((lxl_str*)(*p_m)->f_keys.data + rt_idx(ix16, (*p_m)->f_keys.len, "collections.lxl:841")), p_k);
       bool c18 = t17;
       if (c18) {
         struct S39_collections_Probe t19 = (struct S39_collections_Probe){.f_slot = v_i_7, .f_entry = v_e_15};
@@ -52997,13 +52914,11 @@ static struct S39_collections_Probe f130_collections_Map_find(struct S38_collect
 }
 static bool f134_std_str_eq(lxl_str p_a, lxl_str p_b) {
   bool r1 = rt_str_eq(p_a, p_b);
-  rt_str_drop(p_a);
   return r1;
 }
 static uint64_t f129_std_str_hash(lxl_str p_s) {
   uint64_t t1 = f135_hash_sipStr(p_s);
   uint64_t r2 = t1;
-  rt_str_drop(p_s);
   return r2;
 }
 static uint64_t f135_hash_sipStr(lxl_str p_s) {
@@ -53173,7 +53088,7 @@ static int64_t f127_collections_Map_getOr(struct S38_collections_Map**p_m, lxl_s
     uint64_t t2 = (*p_m)->f_hashFn(p_k);
     ifx1 = t2;
   } else {
-    uint64_t t3 = f129_std_str_hash(rt_str_dup(p_k));
+    uint64_t t3 = f129_std_str_hash(p_k);
     ifx1 = t3;
   }
   uint64_t v_h_4 = ifx1;
@@ -53435,6 +53350,7 @@ static void f73_cgen_Gen_structDef(struct S30_cgen_Gen**p_g, int64_t p_s) {
   int64_t ix11 = p_s;
   lxl_str t12 = rt_str_concat(*((lxl_str*)(*p_g)->f_sname.data + rt_idx(ix11, (*p_g)->f_sname.len, "cgen.lxl:109")), sl8757);
   f19_strings_StrBuf_add(&v_b_10, t12);
+  rt_str_drop(t12);
   int64_t ix13 = p_s;
   lxl_slice ap14 = rt_as_slice(&(*((struct S31_ir_Struct**)(*p_g)->f_u->f_structs.data + rt_idx(ix13, (*p_g)->f_u->f_structs.len, "cgen.lxl:110")))->f_fields);
   for (int64_t i15 = 0LL; i15 < ap14.len; i15++) {
@@ -53444,6 +53360,7 @@ static void f73_cgen_Gen_structDef(struct S30_cgen_Gen**p_g, int64_t p_s) {
     lxl_str t19 = rt_str_concat(t17, t18);
     lxl_str t20 = rt_str_concat(t19, sl56);
     f19_strings_StrBuf_add(&v_b_10, t20);
+    rt_str_drop(t20);
     rt_str_drop(t19);
     rt_str_drop(t18);
     rt_str_drop(t17);
@@ -53472,7 +53389,7 @@ static void f148_cgen_Gen_needDefs(struct S30_cgen_Gen**p_g, int64_t p_t) {
   }
 }
 static void f72_cgen_Gen_line(struct S30_cgen_Gen**p_g, lxl_str p_s) {
-  f19_strings_StrBuf_add(&(*p_g)->f_out, rt_str_dup(p_s));
+  f19_strings_StrBuf_add(&(*p_g)->f_out, p_s);
   f55_strings_StrBuf_addByte(&(*p_g)->f_out, (uint8_t)10LL);
   rt_str_drop(p_s);
 }
@@ -53743,157 +53660,157 @@ static int64_t f13_main_buildNative(struct S8_ir_Ir*p_p, lxl_arr*p_libs, lxl_str
   lxl_str v_irFile_42 = t41;
   bool c43 = (bool)!rt_str_eq(v_irFile_42, sl0);
   if (c43) {
-    lxl_str t44 = rt_str_dup(v_irFile_42);
-    lxl_str t45 = f16_cgen_print(v_q_38, sl0);
-    struct S10_std_Result t46 = f23_io_write(t44, t45);
-    struct S10_std_Result s47 = t46;
-    if (s47.tag == 0LL) {
-      struct S11_std_Unit v_u_48 = s47.u.V_Ok.f_0;
-    } else if (s47.tag == 1LL) {
-      struct S12_io_IoError v_e_49 = s47.u.V_Err.f_0;
-      lxl_str t50 = rt_str_concat(sl8648, v_irFile_42);
-      lxl_str t51 = rt_str_concat(t50, sl8649);
-      lxl_str t52 = f24_io_IoError_toStr(gl2_dup(v_e_49));
-      lxl_str t53 = rt_str_concat(t51, t52);
-      f1_syntax_failText(t53);
+    lxl_str t44 = f16_cgen_print(v_q_38, sl0);
+    struct S10_std_Result t45 = f23_io_write(v_irFile_42, t44);
+    struct S10_std_Result s46 = t45;
+    if (s46.tag == 0LL) {
+      struct S11_std_Unit v_u_47 = s46.u.V_Ok.f_0;
+    } else if (s46.tag == 1LL) {
+      struct S12_io_IoError v_e_48 = s46.u.V_Err.f_0;
+      lxl_str t49 = rt_str_concat(sl8648, v_irFile_42);
+      lxl_str t50 = rt_str_concat(t49, sl8649);
+      lxl_str t51 = f24_io_IoError_toStr(gl2_dup(v_e_48));
+      lxl_str t52 = rt_str_concat(t50, t51);
+      f1_syntax_failText(t52);
     }
-    int64_t r54 = 0LL;
+    rt_str_drop(t44);
+    int64_t r53 = 0LL;
     rt_str_drop(v_irFile_42);
     rt_str_drop(v_symMap_26);
     gl21_drop(v_dl_4);
     gl0_drop(v_names_2);
     rt_str_drop(p_out);
     rt_str_drop(p_src);
-    return r54;
+    return r53;
   }
-  lxl_arr t55 = f161_x64gen_buildMap(v_q_38, v_dl_4, &v_symMap_26);
-  lxl_arr v_img_56 = t55;
-  lxl_str t57 = f22_os_envOr(sl8773, sl0);
-  lxl_str v_mapFile_58 = t57;
-  bool c59 = (bool)!rt_str_eq(v_mapFile_58, sl0);
-  if (c59) {
-    struct S10_std_Result t60 = f23_io_write(rt_str_dup(v_mapFile_58), rt_str_dup(v_symMap_26));
-    struct S10_std_Result s61 = t60;
-    if (s61.tag == 0LL) {
-      struct S11_std_Unit v_u_62 = s61.u.V_Ok.f_0;
-    } else if (s61.tag == 1LL) {
-      struct S12_io_IoError v_e_63 = s61.u.V_Err.f_0;
-      lxl_str t64 = rt_str_concat(sl8648, v_mapFile_58);
-      lxl_str t65 = rt_str_concat(t64, sl8649);
-      lxl_str t66 = f24_io_IoError_toStr(gl2_dup(v_e_63));
-      lxl_str t67 = rt_str_concat(t65, t66);
-      f1_syntax_failText(t67);
+  lxl_arr t54 = f161_x64gen_buildMap(v_q_38, v_dl_4, &v_symMap_26);
+  lxl_arr v_img_55 = t54;
+  lxl_str t56 = f22_os_envOr(sl8773, sl0);
+  lxl_str v_mapFile_57 = t56;
+  bool c58 = (bool)!rt_str_eq(v_mapFile_57, sl0);
+  if (c58) {
+    struct S10_std_Result t59 = f23_io_write(v_mapFile_57, v_symMap_26);
+    struct S10_std_Result s60 = t59;
+    if (s60.tag == 0LL) {
+      struct S11_std_Unit v_u_61 = s60.u.V_Ok.f_0;
+    } else if (s60.tag == 1LL) {
+      struct S12_io_IoError v_e_62 = s60.u.V_Err.f_0;
+      lxl_str t63 = rt_str_concat(sl8648, v_mapFile_57);
+      lxl_str t64 = rt_str_concat(t63, sl8649);
+      lxl_str t65 = f24_io_IoError_toStr(gl2_dup(v_e_62));
+      lxl_str t66 = rt_str_concat(t64, t65);
+      f1_syntax_failText(t66);
     }
   }
-  lxl_str v_tmp_68 = sl0;
-  lxl_str v_exe_69 = rt_str_dup(p_out);
-  bool c70 = (bool)((int64_t)v_exe_69.len == 0LL);
-  if (c70) {
-    bool c71 = p_isRun;
-    if (c71) {
-      lxl_str t72 = f22_os_envOr(sl8643, sl8644);
-      lxl_str t73 = rt_str_concat(t72, sl8645);
-      int64_t cm74 = rt_cmark();
-      lxl_str t75 = rt_str_from_c((void*)x_mkdtemp(rt_cstr(t73, "main.lxl:353")));
-      rt_cfree(cm74);
+  lxl_str v_tmp_67 = sl0;
+  lxl_str v_exe_68 = rt_str_dup(p_out);
+  bool c69 = (bool)((int64_t)v_exe_68.len == 0LL);
+  if (c69) {
+    bool c70 = p_isRun;
+    if (c70) {
+      lxl_str t71 = f22_os_envOr(sl8643, sl8644);
+      lxl_str t72 = rt_str_concat(t71, sl8645);
+      int64_t cm73 = rt_cmark();
+      lxl_str t74 = rt_str_from_c((void*)x_mkdtemp(rt_cstr(t72, "main.lxl:353")));
+      rt_cfree(cm73);
       {
-        lxl_str nw76 = t75;
-        rt_str_drop(v_tmp_68);
-        v_tmp_68 = nw76;
+        lxl_str nw75 = t74;
+        rt_str_drop(v_tmp_67);
+        v_tmp_67 = nw75;
       }
-      rt_str_drop(t73);
       rt_str_drop(t72);
-      bool c77 = rt_str_eq(v_tmp_68, sl0);
-      if (c77) {
+      rt_str_drop(t71);
+      bool c76 = rt_str_eq(v_tmp_67, sl0);
+      if (c76) {
         f1_syntax_failText(sl8646);
       }
-      lxl_str t78 = rt_str_concat(v_tmp_68, sl8650);
+      lxl_str t77 = rt_str_concat(v_tmp_67, sl8650);
       {
-        lxl_str nw79 = t78;
-        rt_str_drop(v_exe_69);
-        v_exe_69 = nw79;
+        lxl_str nw78 = t77;
+        rt_str_drop(v_exe_68);
+        v_exe_68 = nw78;
       }
     } else {
-      bool t80 = f25_strings_endsWith(rt_str_dup(p_src), sl8651);
-      lxl_str ifx81;
-      if (t80) {
-        lxl_str t82 = rt_str_dup(p_src);
-        int64_t ix83 = rt_sub_int((int64_t)p_src.len, 4LL, "main.lxl:357");
-        lxl_str t84 = rt_str_sub(t82, 0LL, ix83, "main.lxl:357");
-        ifx81 = t84;
-        rt_str_drop(t82);
+      bool t79 = f25_strings_endsWith(p_src, sl8651);
+      lxl_str ifx80;
+      if (t79) {
+        lxl_str t81 = rt_str_dup(p_src);
+        int64_t ix82 = rt_sub_int((int64_t)p_src.len, 4LL, "main.lxl:357");
+        lxl_str t83 = rt_str_sub(t81, 0LL, ix82, "main.lxl:357");
+        ifx80 = t83;
+        rt_str_drop(t81);
       } else {
-        lxl_str t85 = rt_str_concat(p_src, sl8774);
-        ifx81 = t85;
+        lxl_str t84 = rt_str_concat(p_src, sl8774);
+        ifx80 = t84;
       }
       {
-        lxl_str nw86 = ifx81;
-        rt_str_drop(v_exe_69);
-        v_exe_69 = nw86;
+        lxl_str nw85 = ifx80;
+        rt_str_drop(v_exe_68);
+        v_exe_68 = nw85;
       }
     }
   }
-  struct S10_std_Result t87 = f27_fs_remove(rt_str_dup(v_exe_69));
-  gl3_drop(t87);
-  lxl_str t88 = rt_str_dup(v_exe_69);
-  lxl_str t89 = rt_str_from_bytes(rt_as_slice(&v_img_56));
-  struct S10_std_Result t90 = f23_io_write(t88, t89);
-  struct S10_std_Result s91 = t90;
-  if (s91.tag == 0LL) {
-    struct S11_std_Unit v_u_92 = s91.u.V_Ok.f_0;
-  } else if (s91.tag == 1LL) {
-    struct S12_io_IoError v_e_93 = s91.u.V_Err.f_0;
-    lxl_str t94 = rt_str_concat(sl8648, v_exe_69);
-    lxl_str t95 = rt_str_concat(t94, sl8649);
-    lxl_str t96 = f24_io_IoError_toStr(gl2_dup(v_e_93));
-    lxl_str t97 = rt_str_concat(t95, t96);
-    f1_syntax_failText(t97);
+  struct S10_std_Result t86 = f27_fs_remove(v_exe_68);
+  gl3_drop(t86);
+  lxl_str t87 = rt_str_from_bytes(rt_as_slice(&v_img_55));
+  struct S10_std_Result t88 = f23_io_write(v_exe_68, t87);
+  struct S10_std_Result s89 = t88;
+  if (s89.tag == 0LL) {
+    struct S11_std_Unit v_u_90 = s89.u.V_Ok.f_0;
+  } else if (s89.tag == 1LL) {
+    struct S12_io_IoError v_e_91 = s89.u.V_Err.f_0;
+    lxl_str t92 = rt_str_concat(sl8648, v_exe_68);
+    lxl_str t93 = rt_str_concat(t92, sl8649);
+    lxl_str t94 = f24_io_IoError_toStr(gl2_dup(v_e_91));
+    lxl_str t95 = rt_str_concat(t93, t94);
+    f1_syntax_failText(t95);
   }
-  struct S10_std_Result t98 = f162_fs_chmod(rt_str_dup(v_exe_69), 493LL);
-  gl3_drop(t98);
-  bool c99 = (bool)!p_isRun;
-  if (c99) {
-    int64_t r100 = 0LL;
-    rt_str_drop(v_exe_69);
-    rt_str_drop(v_tmp_68);
-    rt_str_drop(v_mapFile_58);
-    gl12_drop(v_img_56);
+  rt_str_drop(t87);
+  struct S10_std_Result t96 = f162_fs_chmod(v_exe_68, 493LL);
+  gl3_drop(t96);
+  bool c97 = (bool)!p_isRun;
+  if (c97) {
+    int64_t r98 = 0LL;
+    rt_str_drop(v_exe_68);
+    rt_str_drop(v_tmp_67);
+    rt_str_drop(v_mapFile_57);
+    gl12_drop(v_img_55);
     rt_str_drop(v_irFile_42);
     rt_str_drop(v_symMap_26);
     gl0_drop(v_names_2);
     rt_str_drop(p_out);
     rt_str_drop(p_src);
-    return r100;
+    return r98;
   }
-  lxl_arr a101 = rt_arr_new(1LL, 16ULL);
-  *((lxl_str*)a101.data + 0LL) = rt_str_dup(v_exe_69);
-  lxl_arr v_words_102 = a101;
-  lxl_slice ap103 = rt_as_slice(p_rest);
-  for (int64_t i104 = 0LL; i104 < ap103.len; i104++) {
-    lxl_str v_a_105 = rt_str_dup(*((lxl_str*)ap103.data + i104));
-    lxl_str ap106 = rt_str_dup(v_a_105);
-    *(lxl_str*)rt_arr_push(&v_words_102, 16ULL) = ap106;
-    rt_str_drop(v_a_105);
+  lxl_arr a99 = rt_arr_new(1LL, 16ULL);
+  *((lxl_str*)a99.data + 0LL) = rt_str_dup(v_exe_68);
+  lxl_arr v_words_100 = a99;
+  lxl_slice ap101 = rt_as_slice(p_rest);
+  for (int64_t i102 = 0LL; i102 < ap101.len; i102++) {
+    lxl_str v_a_103 = rt_str_dup(*((lxl_str*)ap101.data + i102));
+    lxl_str ap104 = rt_str_dup(v_a_103);
+    *(lxl_str*)rt_arr_push(&v_words_100, 16ULL) = ap104;
+    rt_str_drop(v_a_103);
   }
-  int64_t t107 = f26_main_run(&v_words_102, sl0);
-  int64_t v_st_108 = t107;
-  bool c109 = (bool)((int64_t)v_tmp_68.len > 0LL);
-  if (c109) {
-    struct S10_std_Result t110 = f28_fs_removeAll(rt_str_dup(v_tmp_68));
-    gl3_drop(t110);
+  int64_t t105 = f26_main_run(&v_words_100, sl0);
+  int64_t v_st_106 = t105;
+  bool c107 = (bool)((int64_t)v_tmp_67.len > 0LL);
+  if (c107) {
+    struct S10_std_Result t108 = f28_fs_removeAll(v_tmp_67);
+    gl3_drop(t108);
   }
-  int64_t r111 = v_st_108;
-  gl0_drop(v_words_102);
-  rt_str_drop(v_exe_69);
-  rt_str_drop(v_tmp_68);
-  rt_str_drop(v_mapFile_58);
-  gl12_drop(v_img_56);
+  int64_t r109 = v_st_106;
+  gl0_drop(v_words_100);
+  rt_str_drop(v_exe_68);
+  rt_str_drop(v_tmp_67);
+  rt_str_drop(v_mapFile_57);
+  gl12_drop(v_img_55);
   rt_str_drop(v_irFile_42);
   rt_str_drop(v_symMap_26);
   gl0_drop(v_names_2);
   rt_str_drop(p_out);
   rt_str_drop(p_src);
-  return r111;
+  return r109;
 }
 static struct S10_std_Result f162_fs_chmod(lxl_str p_path, int64_t p_perm) {
   lxl_str t1 = rt_str_dup(p_path);
@@ -53905,16 +53822,14 @@ static struct S10_std_Result f162_fs_chmod(lxl_str p_path, int64_t p_perm) {
   rt_str_drop(t1);
   if (c5) {
     int64_t t6 = x_lxl_errno();
-    struct S12_io_IoError t7 = f33_io_ioError(t6, sl456, rt_str_dup(p_path));
+    struct S12_io_IoError t7 = f33_io_ioError(t6, sl456, p_path);
     struct S10_std_Result t8 = (struct S10_std_Result){.tag = 1LL, .u = {.V_Err = {.f_0 = t7}}};
     struct S10_std_Result r9 = t8;
-    rt_str_drop(p_path);
     return r9;
   }
   struct S11_std_Unit t10 = (struct S11_std_Unit){._e = (char)0LL};
   struct S10_std_Result t11 = (struct S10_std_Result){.tag = 0LL, .u = {.V_Ok = {.f_0 = t10}}};
   struct S10_std_Result r12 = t11;
-  rt_str_drop(p_path);
   return r12;
 }
 static lxl_arr f161_x64gen_buildMap(struct S8_ir_Ir*p_p, lxl_arr p_libs, lxl_str*p_symMap) {
@@ -53962,6 +53877,7 @@ static lxl_arr f161_x64gen_buildMap(struct S8_ir_Ir*p_p, lxl_arr p_libs, lxl_str
       lxl_str t29 = rt_str_concat(t26, *((lxl_str*)t27.data + rt_idx(ix28, t27.len, "x64gen.lxl:329")));
       lxl_str t30 = rt_str_concat(t29, sl8628);
       f19_strings_StrBuf_add(&v_b_8, t30);
+      rt_str_drop(t30);
       rt_str_drop(t29);
       rt_str_drop(t26);
       rt_str_drop(t25);
@@ -53996,6 +53912,7 @@ static lxl_arr f161_x64gen_buildMap(struct S8_ir_Ir*p_p, lxl_arr p_libs, lxl_str
     lxl_str t49 = rt_str_concat(t47, (*((struct S32_ir_Func**)v_g_2->f_u->f_funcs.data + rt_idx(ix48, v_g_2->f_u->f_funcs.len, "x64gen.lxl:336")))->f_name);
     lxl_str t50 = rt_str_concat(t49, sl8628);
     f19_strings_StrBuf_add(&v_b_8, t50);
+    rt_str_drop(t50);
     rt_str_drop(t49);
     rt_str_drop(t47);
     rt_str_drop(t46);
@@ -55153,7 +55070,7 @@ static lxl_str f190_collections_Map_getOr(struct S53_collections_Map**p_m, lxl_s
     uint64_t t2 = (*p_m)->f_hashFn(p_k);
     ifx1 = t2;
   } else {
-    uint64_t t3 = f129_std_str_hash(rt_str_dup(p_k));
+    uint64_t t3 = f129_std_str_hash(p_k);
     ifx1 = t3;
   }
   uint64_t v_h_4 = ifx1;
@@ -55192,7 +55109,7 @@ static struct S39_collections_Probe f191_collections_Map_find(struct S53_collect
     if (c14) {
       int64_t v_e_15 = rt_sub_int(rt_cvs_int((__int128)v_d_13, "collections.lxl:840"), 1LL, "collections.lxl:840");
       int64_t ix16 = v_e_15;
-      bool t17 = f134_std_str_eq(rt_str_dup(*((lxl_str*)(*p_m)->f_keys.data + rt_idx(ix16, (*p_m)->f_keys.len, "collections.lxl:841"))), p_k);
+      bool t17 = f134_std_str_eq(*((lxl_str*)(*p_m)->f_keys.data + rt_idx(ix16, (*p_m)->f_keys.len, "collections.lxl:841")), p_k);
       bool c18 = t17;
       if (c18) {
         struct S39_collections_Probe t19 = (struct S39_collections_Probe){.f_slot = v_i_7, .f_entry = v_e_15};
@@ -55218,7 +55135,7 @@ static bool f189_collections_Map_has(struct S53_collections_Map**p_m, lxl_str p_
     uint64_t t2 = (*p_m)->f_hashFn(p_k);
     ifx1 = t2;
   } else {
-    uint64_t t3 = f129_std_str_hash(rt_str_dup(p_k));
+    uint64_t t3 = f129_std_str_hash(p_k);
     ifx1 = t3;
   }
   uint64_t v_h_4 = ifx1;
@@ -55697,10 +55614,10 @@ static int64_t f207_x64gen_Gen_symImport(struct S44_x64gen_Gen**p_g, lxl_str p_n
   return r9;
 }
 static bool f206_x64gen_rtHelper(lxl_str p_name) {
-  bool t1 = f10_strings_startsWith(rt_str_dup(p_name), sl8718);
+  bool t1 = f10_strings_startsWith(p_name, sl8718);
   bool b2 = t1;
   if (!b2) {
-    bool t3 = f10_strings_startsWith(rt_str_dup(p_name), sl8797);
+    bool t3 = f10_strings_startsWith(p_name, sl8797);
     b2 = t3;
   }
   bool r4 = b2;
@@ -58511,7 +58428,7 @@ static bool f340_x64gen_Gen_kern(struct S44_x64gen_Gen**p_g) {
 static struct S60_x64gen_ArOp f339_x64gen_divOp(lxl_str p_name) {
   struct S60_x64gen_ArOp t1 = (struct S60_x64gen_ArOp){.f_k = -1LL, .f_op = 0LL, .f_wrap = (bool)0LL};
   struct S60_x64gen_ArOp v_none_2 = t1;
-  bool t3 = f10_strings_startsWith(rt_str_dup(p_name), sl8803);
+  bool t3 = f10_strings_startsWith(p_name, sl8803);
   bool b4 = (bool)!t3;
   if (!b4) {
     b4 = (bool)((int64_t)p_name.len < 8LL);
@@ -58572,10 +58489,10 @@ static int64_t f341_x64gen_suffixKind(lxl_str p_ty) {
 static bool f338_x64gen_Gen_cvInline(struct S44_x64gen_Gen**p_g, int64_t p_e) {
   lxl_str t1 = f335_x64gen_Gen_rtName(p_g, p_e);
   lxl_str v_name_2 = t1;
-  bool t3 = f10_strings_startsWith(rt_str_dup(v_name_2), sl8805);
+  bool t3 = f10_strings_startsWith(v_name_2, sl8805);
   bool b4 = (bool)!t3;
   if (b4) {
-    bool t5 = f10_strings_startsWith(rt_str_dup(v_name_2), sl8806);
+    bool t5 = f10_strings_startsWith(v_name_2, sl8806);
     b4 = (bool)!t5;
   }
   bool c6 = b4;
@@ -58656,7 +58573,7 @@ static bool f337_x64gen_Gen_isWhere(struct S44_x64gen_Gen**p_g, int64_t p_w) {
 static struct S60_x64gen_ArOp f336_x64gen_arOp(lxl_str p_name) {
   struct S60_x64gen_ArOp t1 = (struct S60_x64gen_ArOp){.f_k = -1LL, .f_op = 0LL, .f_wrap = (bool)0LL};
   struct S60_x64gen_ArOp v_none_2 = t1;
-  bool t3 = f10_strings_startsWith(rt_str_dup(p_name), sl8803);
+  bool t3 = f10_strings_startsWith(p_name, sl8803);
   bool c4 = (bool)!t3;
   if (c4) {
     struct S60_x64gen_ArOp r5 = v_none_2;
@@ -58669,7 +58586,7 @@ static struct S60_x64gen_ArOp f336_x64gen_arOp(lxl_str p_name) {
   lxl_str v_rest_9 = t8;
   rt_str_drop(t6);
   bool v_wrap_10 = (bool)0LL;
-  bool t11 = f10_strings_startsWith(rt_str_dup(v_rest_9), sl8807);
+  bool t11 = f10_strings_startsWith(v_rest_9, sl8807);
   bool c12 = t11;
   if (c12) {
     v_wrap_10 = (bool)1LL;
@@ -58683,17 +58600,17 @@ static struct S60_x64gen_ArOp f336_x64gen_arOp(lxl_str p_name) {
     }
     rt_str_drop(t13);
   }
-  bool t17 = f10_strings_startsWith(rt_str_dup(v_rest_9), sl8808);
+  bool t17 = f10_strings_startsWith(v_rest_9, sl8808);
   int64_t ifx18;
   if (t17) {
     ifx18 = 0LL;
   } else {
-    bool t19 = f10_strings_startsWith(rt_str_dup(v_rest_9), sl8809);
+    bool t19 = f10_strings_startsWith(v_rest_9, sl8809);
     int64_t ifx20;
     if (t19) {
       ifx20 = 1LL;
     } else {
-      bool t21 = f10_strings_startsWith(rt_str_dup(v_rest_9), sl8810);
+      bool t21 = f10_strings_startsWith(v_rest_9, sl8810);
       ifx20 = t21 ? 2LL : -1LL;
     }
     ifx18 = ifx20;
@@ -66142,7 +66059,7 @@ static bool f432_x64gen_Gen_inlineRt(struct S44_x64gen_Gen**p_g, int64_t p_e, lx
     rt_str_drop(p_name);
     return r15;
   }
-  bool t16 = f25_strings_endsWith(rt_str_dup(p_name), sl8819);
+  bool t16 = f25_strings_endsWith(p_name, sl8819);
   bool b17 = t16;
   if (b17) {
     int64_t t18 = p_e;
@@ -66302,10 +66219,10 @@ static bool f432_x64gen_Gen_inlineRt(struct S44_x64gen_Gen**p_g, int64_t p_e, lx
     rt_str_drop(p_name);
     return r85;
   }
-  bool t86 = f10_strings_startsWith(rt_str_dup(p_name), sl8805);
+  bool t86 = f10_strings_startsWith(p_name, sl8805);
   bool b87 = t86;
   if (!b87) {
-    bool t88 = f10_strings_startsWith(rt_str_dup(p_name), sl8806);
+    bool t88 = f10_strings_startsWith(p_name, sl8806);
     b87 = t88;
   }
   bool b89 = b87;
@@ -74520,7 +74437,7 @@ static bool f562_collections_Map_getOr(struct S43_collections_Map**p_m, lxl_str 
     uint64_t t2 = (*p_m)->f_hashFn(p_k);
     ifx1 = t2;
   } else {
-    uint64_t t3 = f129_std_str_hash(rt_str_dup(p_k));
+    uint64_t t3 = f129_std_str_hash(p_k);
     ifx1 = t3;
   }
   uint64_t v_h_4 = ifx1;
@@ -74559,7 +74476,7 @@ static struct S39_collections_Probe f563_collections_Map_find(struct S43_collect
     if (c14) {
       int64_t v_e_15 = rt_sub_int(rt_cvs_int((__int128)v_d_13, "collections.lxl:840"), 1LL, "collections.lxl:840");
       int64_t ix16 = v_e_15;
-      bool t17 = f134_std_str_eq(rt_str_dup(*((lxl_str*)(*p_m)->f_keys.data + rt_idx(ix16, (*p_m)->f_keys.len, "collections.lxl:841"))), p_k);
+      bool t17 = f134_std_str_eq(*((lxl_str*)(*p_m)->f_keys.data + rt_idx(ix16, (*p_m)->f_keys.len, "collections.lxl:841")), p_k);
       bool c18 = t17;
       if (c18) {
         struct S39_collections_Probe t19 = (struct S39_collections_Probe){.f_slot = v_i_7, .f_entry = v_e_15};
@@ -74614,10 +74531,10 @@ static bool f548_x64gen_Gen_inline128(struct S44_x64gen_Gen**p_g, int64_t p_e) {
     rt_str_drop(v_name_6);
     return r18;
   }
-  bool t19 = f25_strings_endsWith(rt_str_dup(v_name_6), sl8819);
+  bool t19 = f25_strings_endsWith(v_name_6, sl8819);
   bool b20 = (bool)!t19;
   if (!b20) {
-    bool t21 = f10_strings_startsWith(rt_str_dup(v_name_6), sl8803);
+    bool t21 = f10_strings_startsWith(v_name_6, sl8803);
     b20 = (bool)!t21;
   }
   bool b22 = b20;
@@ -76740,25 +76657,26 @@ static void f569_x64gen_Gen_countUses(struct S44_x64gen_Gen**p_g) {
   (*p_g)->f_noCopy = -1LL;
 }
 static int64_t f568_x64gen_padFromEnv(lxl_str p_name, int64_t p_d) {
-  lxl_str t1 = f22_os_envOr(rt_str_dup(p_name), sl0);
+  lxl_str t1 = f22_os_envOr(p_name, sl0);
   struct S66_std_Result t2 = f587_strings_parseInt(t1);
   struct S66_std_Result s3 = t2;
   if (s3.tag == 0LL) {
     int64_t v_n_4 = s3.u.V_Ok.f_0;
     int64_t r5 = v_n_4;
+    rt_str_drop(t1);
     rt_str_drop(p_name);
     return r5;
   } else if (s3.tag == 1LL) {
     struct S67_strings_ParseError v_e_6 = s3.u.V_Err.f_0;
     int64_t r7 = p_d;
+    rt_str_drop(t1);
     rt_str_drop(p_name);
     return r7;
   }
 }
 static struct S66_std_Result f587_strings_parseInt(lxl_str p_s) {
-  struct S66_std_Result t1 = f588_strings_parseIntBase(rt_str_dup(p_s), 10LL);
+  struct S66_std_Result t1 = f588_strings_parseIntBase(p_s, 10LL);
   struct S66_std_Result r2 = t1;
-  rt_str_drop(p_s);
   return r2;
 }
 static struct S66_std_Result f588_strings_parseIntBase(lxl_str p_s, int64_t p_base) {
@@ -76794,7 +76712,6 @@ static struct S66_std_Result f588_strings_parseIntBase(lxl_str p_s, int64_t p_ba
     struct S67_strings_ParseError t13 = (struct S67_strings_ParseError){.tag = 0LL};
     struct S66_std_Result t14 = (struct S66_std_Result){.tag = 1LL, .u = {.V_Err = {.f_0 = t13}}};
     struct S66_std_Result r15 = t14;
-    rt_str_drop(p_s);
     return r15;
   }
   __int128 v_n_16 = (__int128)0ULL;
@@ -76816,7 +76733,6 @@ static struct S66_std_Result f588_strings_parseIntBase(lxl_str p_s, int64_t p_ba
       struct S67_strings_ParseError t24 = (struct S67_strings_ParseError){.tag = 1LL, .u = {.V_Invalid = {.f_0 = v_i_3}}};
       struct S66_std_Result t25 = (struct S66_std_Result){.tag = 1LL, .u = {.V_Err = {.f_0 = t24}}};
       struct S66_std_Result r26 = t25;
-      rt_str_drop(p_s);
       return r26;
     }
     __int128 t27 = v_n_16;
@@ -76827,7 +76743,6 @@ static struct S66_std_Result f588_strings_parseIntBase(lxl_str p_s, int64_t p_ba
       struct S67_strings_ParseError t30 = (struct S67_strings_ParseError){.tag = 2LL};
       struct S66_std_Result t31 = (struct S66_std_Result){.tag = 1LL, .u = {.V_Err = {.f_0 = t30}}};
       struct S66_std_Result r32 = t31;
-      rt_str_drop(p_s);
       return r32;
     }
     v_i_3 = rt_add_int(v_i_3, 1LL, "strings.lxl:394");
@@ -76841,12 +76756,10 @@ static struct S66_std_Result f588_strings_parseIntBase(lxl_str p_s, int64_t p_ba
     struct S67_strings_ParseError t35 = (struct S67_strings_ParseError){.tag = 2LL};
     struct S66_std_Result t36 = (struct S66_std_Result){.tag = 1LL, .u = {.V_Err = {.f_0 = t35}}};
     struct S66_std_Result r37 = t36;
-    rt_str_drop(p_s);
     return r37;
   }
   struct S66_std_Result t38 = (struct S66_std_Result){.tag = 0LL, .u = {.V_Ok = {.f_0 = rt_cvs_int(v_n_16, "strings.lxl:398")}}};
   struct S66_std_Result r39 = t38;
-  rt_str_drop(p_s);
   return r39;
 }
 static int64_t f589_strings_digitValue(uint8_t p_c) {
@@ -77815,7 +77728,7 @@ static struct S65_collections_Map*f607_collections_newMap(void) {
   return r10;
 }
 static void f602_std_eprintln(lxl_str p_x) {
-  lxl_str t1 = f608_std_str_toStr(rt_str_dup(p_x));
+  lxl_str t1 = f608_std_str_toStr(p_x);
   lxl_str t2 = rt_str_concat(t1, sl8628);
   int64_t t3 = rt_write_fd(2LL, t2);
   rt_str_drop(t2);
@@ -77824,7 +77737,6 @@ static void f602_std_eprintln(lxl_str p_x) {
 }
 static lxl_str f608_std_str_toStr(lxl_str p_a) {
   lxl_str r1 = rt_str_dup(p_a);
-  rt_str_drop(p_a);
   return r1;
 }
 static void f601_cse_Cse_function(struct S70_cse_Cse**p_o, int64_t p_body) {
@@ -78744,7 +78656,7 @@ static int64_t f626_cse_Cse_hash(struct S70_cse_Cse**p_o, int64_t p_x) {
   if (c13) {
     int64_t t14 = rt_wmul_int(v_h_3, 31LL);
     int64_t ix15 = v_n_2->f_v;
-    uint64_t t16 = f129_std_str_hash(rt_str_dup(*((lxl_str*)(*p_o)->f_u->f_strs.data + rt_idx(ix15, (*p_o)->f_u->f_strs.len, "cse.lxl:487"))));
+    uint64_t t16 = f129_std_str_hash(*((lxl_str*)(*p_o)->f_u->f_strs.data + rt_idx(ix15, (*p_o)->f_u->f_strs.len, "cse.lxl:487")));
     int64_t r17 = rt_wadd_int(t14, rt_cvs_int((__int128)t16, "cse.lxl:487")) & 4611686018427387903LL;
     return r17;
   }
@@ -79342,10 +79254,10 @@ static bool f599_cse_pureName(lxl_str p_name) {
     rt_str_drop(p_name);
     return r7;
   }
-  bool t8 = f10_strings_startsWith(rt_str_dup(p_name), sl8805);
+  bool t8 = f10_strings_startsWith(p_name, sl8805);
   bool b9 = t8;
   if (!b9) {
-    bool t10 = f10_strings_startsWith(rt_str_dup(p_name), sl8806);
+    bool t10 = f10_strings_startsWith(p_name, sl8806);
     b9 = t10;
   }
   bool c11 = b9;
@@ -86470,15 +86382,15 @@ static int64_t f639_loops_rtWrites(lxl_str p_name) {
     rt_str_drop(p_name);
     return r31;
   }
-  bool t32 = f10_strings_startsWith(rt_str_dup(p_name), sl8873);
+  bool t32 = f10_strings_startsWith(p_name, sl8873);
   bool b33 = t32;
   if (!b33) {
-    bool t34 = f10_strings_startsWith(rt_str_dup(p_name), sl8874);
+    bool t34 = f10_strings_startsWith(p_name, sl8874);
     b33 = t34;
   }
   bool b35 = b33;
   if (!b35) {
-    bool t36 = f25_strings_endsWith(rt_str_dup(p_name), sl8875);
+    bool t36 = f25_strings_endsWith(p_name, sl8875);
     b35 = t36;
   }
   bool c37 = b35;
@@ -86487,7 +86399,7 @@ static int64_t f639_loops_rtWrites(lxl_str p_name) {
     rt_str_drop(p_name);
     return r38;
   }
-  bool t39 = f10_strings_startsWith(rt_str_dup(p_name), sl8876);
+  bool t39 = f10_strings_startsWith(p_name, sl8876);
   bool b40 = t39;
   if (b40) {
     b40 = (bool)!rt_str_eq(p_name, sl299);
@@ -86579,10 +86491,10 @@ static int64_t f636_loops_rtClass(lxl_str p_name) {
     rt_str_drop(p_name);
     return r14;
   }
-  bool t15 = f10_strings_startsWith(rt_str_dup(p_name), sl8805);
+  bool t15 = f10_strings_startsWith(p_name, sl8805);
   bool b16 = t15;
   if (!b16) {
-    bool t17 = f10_strings_startsWith(rt_str_dup(p_name), sl8806);
+    bool t17 = f10_strings_startsWith(p_name, sl8806);
     b16 = t17;
   }
   bool c18 = b16;
@@ -86699,7 +86611,7 @@ static struct S8_ir_Ir*f157_opt_optimize(struct S8_ir_Ir*p_p) {
   lxl_str v_ev_18 = t17;
   bool c19 = (bool)!rt_str_eq(v_ev_18, sl0);
   if (c19) {
-    struct S78_std_Option t20 = f752_strings_parseIntOpt(rt_str_dup(v_ev_18));
+    struct S78_std_Option t20 = f752_strings_parseIntOpt(v_ev_18);
     int64_t t21 = f753_std_Option_unwrapOr(t20, 25LL);
     v_o_16->f_limit = t21;
   }
@@ -87232,10 +87144,10 @@ static bool f769_opt_Opt_pureRt(struct S77_opt_Opt**p_o, lxl_str p_name) {
     rt_str_drop(p_name);
     return r7;
   }
-  bool t8 = f10_strings_startsWith(rt_str_dup(p_name), sl8805);
+  bool t8 = f10_strings_startsWith(p_name, sl8805);
   bool b9 = t8;
   if (!b9) {
-    bool t10 = f10_strings_startsWith(rt_str_dup(p_name), sl8806);
+    bool t10 = f10_strings_startsWith(p_name, sl8806);
     b9 = t10;
   }
   bool c11 = b9;
@@ -91418,10 +91330,10 @@ static void f824_opt_Opt_declare(struct S77_opt_Opt**p_o, int64_t p_x) {
 static bool f823_opt_Opt_dropGlue(struct S77_opt_Opt**p_o, int64_t p_f) {
   int64_t ix1 = p_f;
   lxl_str v_n_2 = rt_str_dup((*((struct S32_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix1, (*p_o)->f_u->f_funcs.len, "opt.lxl:1439")))->f_name);
-  bool t3 = f10_strings_startsWith(rt_str_dup(v_n_2), sl8880);
+  bool t3 = f10_strings_startsWith(v_n_2, sl8880);
   bool b4 = t3;
   if (b4) {
-    bool t5 = f25_strings_endsWith(rt_str_dup(v_n_2), sl8881);
+    bool t5 = f25_strings_endsWith(v_n_2, sl8881);
     b4 = t5;
   }
   bool r6 = b4;
@@ -92402,7 +92314,6 @@ static struct S78_std_Option f752_strings_parseIntOpt(lxl_str p_s) {
   if (c10) {
     struct S78_std_Option t11 = (struct S78_std_Option){.tag = 1LL};
     struct S78_std_Option r12 = t11;
-    rt_str_drop(p_s);
     return r12;
   }
   __int128 v_n_13 = (__int128)0ULL;
@@ -92422,7 +92333,6 @@ static struct S78_std_Option f752_strings_parseIntOpt(lxl_str p_s) {
     if (c19) {
       struct S78_std_Option t20 = (struct S78_std_Option){.tag = 1LL};
       struct S78_std_Option r21 = t20;
-      rt_str_drop(p_s);
       return r21;
     }
     __int128 t22 = rt_mul_i128(v_n_13, (__int128)10ULL, "strings.lxl:1015");
@@ -92431,7 +92341,6 @@ static struct S78_std_Option f752_strings_parseIntOpt(lxl_str p_s) {
     if (c23) {
       struct S78_std_Option t24 = (struct S78_std_Option){.tag = 1LL};
       struct S78_std_Option r25 = t24;
-      rt_str_drop(p_s);
       return r25;
     }
     v_i_1 = rt_add_int(v_i_1, 1LL, "strings.lxl:1017");
@@ -92444,12 +92353,10 @@ static struct S78_std_Option f752_strings_parseIntOpt(lxl_str p_s) {
   if (c27) {
     struct S78_std_Option t28 = (struct S78_std_Option){.tag = 1LL};
     struct S78_std_Option r29 = t28;
-    rt_str_drop(p_s);
     return r29;
   }
   struct S78_std_Option t30 = (struct S78_std_Option){.tag = 0LL, .u = {.V_Some = {.f_0 = rt_cvs_int(v_n_13, "strings.lxl:1021")}}};
   struct S78_std_Option r31 = t30;
-  rt_str_drop(p_s);
   return r31;
 }
 static int64_t f156_borrow_optimize(struct S8_ir_Ir**p_p) {
@@ -93493,7 +93400,7 @@ static void f837_collections_Map_put(struct S53_collections_Map**p_m, lxl_str p_
     uint64_t t2 = (*p_m)->f_hashFn(p_k);
     ifx1 = t2;
   } else {
-    uint64_t t3 = f129_std_str_hash(rt_str_dup(p_k));
+    uint64_t t3 = f129_std_str_hash(p_k);
     ifx1 = t3;
   }
   uint64_t v_h_4 = ifx1;
@@ -94220,7 +94127,7 @@ static bool f853_collections_Map_has(struct S43_collections_Map**p_m, lxl_str p_
     uint64_t t2 = (*p_m)->f_hashFn(p_k);
     ifx1 = t2;
   } else {
-    uint64_t t3 = f129_std_str_hash(rt_str_dup(p_k));
+    uint64_t t3 = f129_std_str_hash(p_k);
     ifx1 = t3;
   }
   uint64_t v_h_4 = ifx1;
@@ -94395,7 +94302,7 @@ static lxl_arr f154_main_libPaths(lxl_arr*p_libs) {
       rt_str_drop(t17);
       bool b21 = rt_str_eq(v_path_13, sl0);
       if (b21) {
-        bool t22 = f62_fs_exists(rt_str_dup(v_p_20));
+        bool t22 = f62_fs_exists(v_p_20);
         b21 = t22;
       }
       bool b23 = b21;
@@ -94425,14 +94332,14 @@ static lxl_arr f154_main_libPaths(lxl_arr*p_libs) {
       lxl_slice ap33 = k4_main_LIBDIRS;
       for (int64_t i34 = 0LL; i34 < ap33.len; i34++) {
         lxl_str v_d_35 = rt_str_dup(*((lxl_str*)ap33.data + i34));
-        struct S29_std_Result t36 = f63_fs_listNames(rt_str_dup(v_d_35));
+        struct S29_std_Result t36 = f63_fs_listNames(v_d_35);
         struct S29_std_Result s37 = t36;
         if (s37.tag == 0LL) {
           lxl_arr v_ns_38 = s37.u.V_Ok.f_0;
           lxl_slice ap39 = rt_as_slice(&v_ns_38);
           for (int64_t i40 = 0LL; i40 < ap39.len; i40++) {
             lxl_str v_n_41 = rt_str_dup(*((lxl_str*)ap39.data + i40));
-            bool t42 = f10_strings_startsWith(rt_str_dup(v_n_41), rt_str_dup(v_pre_32));
+            bool t42 = f10_strings_startsWith(v_n_41, v_pre_32);
             bool c43 = t42;
             if (c43) {
               lxl_str t44 = rt_str_concat(v_d_35, sl65);
@@ -94491,6 +94398,7 @@ static lxl_arr f154_main_libPaths(lxl_arr*p_libs) {
         lxl_str t66 = rt_str_concat(t65, v_so_59);
         bool t67 = f62_fs_exists(t66);
         b64 = t67;
+        rt_str_drop(t66);
         rt_str_drop(t65);
       }
       bool c68 = b64;
@@ -94548,7 +94456,7 @@ static void f153_collections_Map_put(struct S43_collections_Map**p_m, lxl_str p_
     uint64_t t2 = (*p_m)->f_hashFn(p_k);
     ifx1 = t2;
   } else {
-    uint64_t t3 = f129_std_str_hash(rt_str_dup(p_k));
+    uint64_t t3 = f129_std_str_hash(p_k);
     ifx1 = t3;
   }
   uint64_t v_h_4 = ifx1;
@@ -95395,7 +95303,7 @@ static lxl_str f888_kernel_externWhy(lxl_str p_name) {
   lxl_slice ap3 = rt_as_slice(&v_prefixes_2);
   for (int64_t i4 = 0LL; i4 < ap3.len; i4++) {
     lxl_str v_pf_5 = rt_str_dup(*((lxl_str*)ap3.data + i4));
-    bool t6 = f10_strings_startsWith(rt_str_dup(p_name), rt_str_dup(v_pf_5));
+    bool t6 = f10_strings_startsWith(p_name, v_pf_5);
     bool c7 = t6;
     if (c7) {
       lxl_str t8 = rt_str_concat(sl8913, p_name);
@@ -96970,7 +96878,7 @@ static struct S78_std_Option f954_collections_Map_remove(struct S38_collections_
     uint64_t t2 = (*p_m)->f_hashFn(p_k);
     ifx1 = t2;
   } else {
-    uint64_t t3 = f129_std_str_hash(rt_str_dup(p_k));
+    uint64_t t3 = f129_std_str_hash(p_k);
     ifx1 = t3;
   }
   uint64_t v_h_4 = ifx1;
@@ -97706,7 +97614,7 @@ static void f975_lower_Lower_initializer(struct S97_lower_Lower**p_u, int64_t*p_
           int64_t v_ft_41 = v_t_3;
           int64_t v_top_42 = -1LL;
           int64_t ix43 = v_it_37;
-          lxl_arr t44 = f978_strings_splitByte(rt_str_dup(((struct S101_tmpl_Node*)(*p_u)->f_x->f_nodes.data + rt_idx(ix43, (*p_u)->f_x->f_nodes.len, "lower.lxl:451"))->f_s), (uint8_t)46LL);
+          lxl_arr t44 = f978_strings_splitByte(((struct S101_tmpl_Node*)(*p_u)->f_x->f_nodes.data + rt_idx(ix43, (*p_u)->f_x->f_nodes.len, "lower.lxl:451"))->f_s, (uint8_t)46LL);
           lxl_slice ap45 = rt_as_slice(&t44);
           for (int64_t i46 = 0LL; i46 < ap45.len; i46++) {
             lxl_str v_name_47 = rt_str_dup(*((lxl_str*)ap45.data + i46));
@@ -97907,7 +97815,6 @@ static lxl_arr f978_strings_splitByte(lxl_str p_s, uint8_t p_sep) {
   *(lxl_str*)rt_arr_push(&v_out_2, 16ULL) = ap13;
   rt_str_drop(t10);
   lxl_arr r14 = v_out_2;
-  rt_str_drop(p_s);
   return r14;
 }
 static lxl_arr f977_tmpl_Arena_elems(struct S99_tmpl_Arena**p_x, int64_t p_l) {
@@ -99155,15 +99062,15 @@ static int64_t f981_lower_Lower_number(struct S97_lower_Lower**p_u, lxl_str p_s)
     rt_str_drop(p_s);
     return r12;
   }
-  bool t13 = f998_strings_contains(rt_str_dup(p_s), sl57);
+  bool t13 = f998_strings_contains(p_s, sl57);
   bool b14 = t13;
   if (!b14) {
-    bool t15 = f998_strings_contains(rt_str_dup(p_s), sl8748);
+    bool t15 = f998_strings_contains(p_s, sl8748);
     b14 = t15;
   }
   bool b16 = b14;
   if (!b16) {
-    bool t17 = f998_strings_contains(rt_str_dup(p_s), sl8993);
+    bool t17 = f998_strings_contains(p_s, sl8993);
     b16 = t17;
   }
   bool c18 = b16;
@@ -99215,9 +99122,9 @@ static int64_t f1000_lower_Lower_intLit(struct S97_lower_Lower**p_u, lxl_str p_s
     }
     v_i_1 = rt_add_int(v_i_1, 1LL, "lower.lxl:535");
   }
-  bool t12 = f998_strings_contains(rt_str_dup(p_s), sl8714);
+  bool t12 = f998_strings_contains(p_s, sl8714);
   bool v_uns_13 = t12;
-  bool t14 = f998_strings_contains(rt_str_dup(p_s), sl8996);
+  bool t14 = f998_strings_contains(p_s, sl8996);
   bool v_long_15 = t14;
   int64_t v_ty_16 = 9LL;
   bool c17 = v_uns_13;
@@ -99255,10 +99162,8 @@ static int64_t f999_ir_Ir_addFlt(struct S8_ir_Ir**p_p, double p_f) {
   return r2;
 }
 static bool f998_strings_contains(lxl_str p_s, lxl_str p_sub) {
-  int64_t t1 = f120_strings_indexOf(rt_str_dup(p_s), rt_str_dup(p_sub), 0LL);
+  int64_t t1 = f120_strings_indexOf(p_s, p_sub, 0LL);
   bool r2 = (bool)(t1 >= 0LL);
-  rt_str_drop(p_sub);
-  rt_str_drop(p_s);
   return r2;
 }
 static int64_t f980_lower_Lower_name(struct S97_lower_Lower**p_u, lxl_str p_name) {
@@ -99413,7 +99318,7 @@ static bool f1002_collections_Map_has(struct S38_collections_Map**p_m, lxl_str p
     uint64_t t2 = (*p_m)->f_hashFn(p_k);
     ifx1 = t2;
   } else {
-    uint64_t t3 = f129_std_str_hash(rt_str_dup(p_k));
+    uint64_t t3 = f129_std_str_hash(p_k);
     ifx1 = t3;
   }
   uint64_t v_h_4 = ifx1;
@@ -99840,6 +99745,7 @@ static int64_t f1011_sema_Program_intern(struct S83_sema_Program**p_pg, int64_t 
 static void f1016_strings_StrBuf_addInt(struct S9_strings_StrBuf**p_b, int64_t p_n) {
   lxl_str t1 = rt_int_to_str(p_n);
   f19_strings_StrBuf_add(p_b, t1);
+  rt_str_drop(t1);
 }
 static bool f1010_sema_Program_tm(struct S83_sema_Program**p_pg, int64_t p_t) {
   int64_t ix1 = p_t;
@@ -100032,8 +99938,8 @@ static int64_t f924_lower_Lower_ctName(struct S97_lower_Lower**p_u, lxl_str p_s)
   bool v_uns_14 = (bool)0LL;
   int64_t v_base_15 = -1LL;
   int64_t ix16 = v_n_5;
-  lxl_str t17 = rt_str_sub(p_s, 0LL, ix16, "lower.lxl:67");
-  lxl_arr t18 = f978_strings_splitByte(t17, (uint8_t)32LL);
+  lxl_str vw17 = rt_str_view(p_s, 0LL, ix16, "lower.lxl:67");
+  lxl_arr t18 = f978_strings_splitByte(vw17, (uint8_t)32LL);
   lxl_slice ap19 = rt_as_slice(&t18);
   for (int64_t i20 = 0LL; i20 < ap19.len; i20++) {
     lxl_str v_w_21 = rt_str_dup(*((lxl_str*)ap19.data + i20));
@@ -100210,49 +100116,50 @@ static struct S97_lower_Lower*f922_lower_newLower(void) {
 }
 static void f1018_lower_Lower_header(struct S97_lower_Lower**p_u, lxl_str p_text) {
   bool v_comment_1 = (bool)0LL;
-  lxl_arr t2 = f978_strings_splitByte(rt_str_dup(p_text), (uint8_t)10LL);
+  lxl_arr t2 = f978_strings_splitByte(p_text, (uint8_t)10LL);
   lxl_slice ap3 = rt_as_slice(&t2);
   for (int64_t i4 = 0LL; i4 < ap3.len; i4++) {
     lxl_str v_l_5 = rt_str_dup(*((lxl_str*)ap3.data + i4));
-    lxl_str t6 = f1019_strings_trim(rt_str_dup(v_l_5));
+    lxl_str t6 = f1019_strings_trim(v_l_5);
     lxl_str v_line_7 = t6;
     bool b8 = v_comment_1;
     if (!b8) {
-      bool t9 = f10_strings_startsWith(rt_str_dup(v_line_7), sl5627);
+      bool t9 = f10_strings_startsWith(v_line_7, sl5627);
       b8 = t9;
     }
     bool c10 = b8;
     if (c10) {
-      bool t11 = f998_strings_contains(rt_str_dup(v_line_7), sl8073);
+      bool t11 = f998_strings_contains(v_line_7, sl8073);
       v_comment_1 = (bool)!t11;
     } else {
-      bool t12 = f10_strings_startsWith(rt_str_dup(v_line_7), sl9015);
+      bool t12 = f10_strings_startsWith(v_line_7, sl9015);
       bool c13 = t12;
       if (c13) {
-        int64_t t14 = f1020_strings_lastIndexOf(rt_str_dup(v_line_7), sl49);
+        int64_t t14 = f1020_strings_lastIndexOf(v_line_7, sl49);
         int64_t v_close_15 = t14;
         int64_t t16 = f923_lower_Lower_newStruct(p_u, sl8696, (bool)0LL);
         int64_t v_ty_17 = t16;
         lxl_arr a18 = rt_arr_new(0LL, 32ULL);
         lxl_arr v_fs_19 = a18;
         int64_t ix20 = v_close_15;
-        lxl_str t21 = rt_str_sub(v_line_7, 16LL, ix20, "lower.lxl:190");
-        lxl_arr t22 = f978_strings_splitByte(t21, (uint8_t)59LL);
+        lxl_str vw21 = rt_str_view(v_line_7, 16LL, ix20, "lower.lxl:190");
+        lxl_arr t22 = f978_strings_splitByte(vw21, (uint8_t)59LL);
         lxl_slice ap23 = rt_as_slice(&t22);
         for (int64_t i24 = 0LL; i24 < ap23.len; i24++) {
           lxl_str v_d_25 = rt_str_dup(*((lxl_str*)ap23.data + i24));
-          lxl_str t26 = f1019_strings_trim(rt_str_dup(v_d_25));
+          lxl_str t26 = f1019_strings_trim(v_d_25);
           bool c27 = rt_str_eq(t26, sl0);
           rt_str_drop(t26);
           if (c27) {
             rt_str_drop(v_d_25);
             continue;
           }
-          lxl_str t28 = f1019_strings_trim(rt_str_dup(v_d_25));
+          lxl_str t28 = f1019_strings_trim(v_d_25);
           lxl_arr t29 = f978_strings_splitByte(t28, (uint8_t)44LL);
           lxl_arr v_names_30 = t29;
+          rt_str_drop(t28);
           lxl_str v_first_31 = rt_str_dup(*((lxl_str*)v_names_30.data + rt_idx(0LL, v_names_30.len, "lower.lxl:193")));
-          int64_t t32 = f1020_strings_lastIndexOf(rt_str_dup(v_first_31), sl8658);
+          int64_t t32 = f1020_strings_lastIndexOf(v_first_31, sl8658);
           int64_t v_at_33 = t32;
           int64_t ix34 = v_at_33;
           lxl_str t35 = rt_str_sub(v_first_31, 0LL, ix34, "lower.lxl:195");
@@ -100271,9 +100178,9 @@ static void f1018_lower_Lower_header(struct S97_lower_Lower**p_u, lxl_str p_text
           lxl_slice ap43 = rt_as_slice(&v_names_30);
           for (int64_t i44 = 0LL; i44 < ap43.len; i44++) {
             lxl_str v_n0_45 = rt_str_dup(*((lxl_str*)ap43.data + i44));
-            lxl_str t46 = f1019_strings_trim(rt_str_dup(v_n0_45));
+            lxl_str t46 = f1019_strings_trim(v_n0_45);
             lxl_str v_n_47 = t46;
-            bool t48 = f25_strings_endsWith(rt_str_dup(v_n_47), sl9016);
+            bool t48 = f25_strings_endsWith(v_n_47, sl9016);
             bool c49 = t48;
             if (c49) {
               lxl_str t50 = rt_str_dup(v_n_47);
@@ -100298,88 +100205,86 @@ static void f1018_lower_Lower_header(struct S97_lower_Lower**p_u, lxl_str p_text
         }
         gl0_drop(t22);
         f931_lower_Lower_layout(p_u, v_ty_17, v_fs_19);
-        lxl_str t58 = rt_str_dup(v_line_7);
-        int64_t ix59 = rt_add_int(v_close_15, 1LL, "lower.lxl:207");
-        int64_t ix60 = rt_sub_int((int64_t)v_line_7.len, 1LL, "lower.lxl:207");
-        lxl_str t61 = rt_str_sub(t58, ix59, ix60, "lower.lxl:207");
-        lxl_str t62 = f1019_strings_trim(t61);
-        lxl_str v_name_63 = t62;
-        rt_str_drop(t58);
-        int64_t ix64 = v_ty_17;
-        int64_t ix65 = ((struct S34_ir_Ty*)(*p_u)->f_ir->f_tys.data + rt_idx(ix64, (*p_u)->f_ir->f_tys.len, "lower.lxl:208"))->f_sid;
+        int64_t ix58 = rt_add_int(v_close_15, 1LL, "lower.lxl:207");
+        int64_t ix59 = rt_sub_int((int64_t)v_line_7.len, 1LL, "lower.lxl:207");
+        lxl_str vw60 = rt_str_view(v_line_7, ix58, ix59, "lower.lxl:207");
+        lxl_str t61 = f1019_strings_trim(vw60);
+        lxl_str v_name_62 = t61;
+        int64_t ix63 = v_ty_17;
+        int64_t ix64 = ((struct S34_ir_Ty*)(*p_u)->f_ir->f_tys.data + rt_idx(ix63, (*p_u)->f_ir->f_tys.len, "lower.lxl:208"))->f_sid;
         {
-          lxl_str nw66 = rt_str_dup(v_name_63);
-          rt_str_drop((*((struct S31_ir_Struct**)(*p_u)->f_ir->f_structs.data + rt_idx(ix65, (*p_u)->f_ir->f_structs.len, "lower.lxl:208")))->f_name);
-          (*((struct S31_ir_Struct**)(*p_u)->f_ir->f_structs.data + rt_idx(ix65, (*p_u)->f_ir->f_structs.len, "lower.lxl:208")))->f_name = nw66;
+          lxl_str nw65 = rt_str_dup(v_name_62);
+          rt_str_drop((*((struct S31_ir_Struct**)(*p_u)->f_ir->f_structs.data + rt_idx(ix64, (*p_u)->f_ir->f_structs.len, "lower.lxl:208")))->f_name);
+          (*((struct S31_ir_Struct**)(*p_u)->f_ir->f_structs.data + rt_idx(ix64, (*p_u)->f_ir->f_structs.len, "lower.lxl:208")))->f_name = nw65;
         }
-        f128_collections_Map_put(&(*p_u)->f_types, rt_str_dup(v_name_63), v_ty_17);
-        rt_str_drop(v_name_63);
+        f128_collections_Map_put(&(*p_u)->f_types, rt_str_dup(v_name_62), v_ty_17);
+        rt_str_drop(v_name_62);
       } else {
-        bool t67 = f10_strings_startsWith(rt_str_dup(v_line_7), sl9017);
-        bool c68 = t67;
-        if (c68) {
-          int64_t t69 = f120_strings_indexOf(rt_str_dup(v_line_7), sl8765, 0LL);
-          int64_t v_fp_70 = t69;
-          bool c71 = (bool)(v_fp_70 >= 0LL);
-          if (c71) {
-            int64_t t72 = f120_strings_indexOf(rt_str_dup(v_line_7), sl51, v_fp_70);
-            int64_t v_close_73 = t72;
-            lxl_str t74 = rt_str_dup(v_line_7);
-            int64_t ix75 = rt_add_int(v_close_73, 1LL, "lower.lxl:214");
-            int64_t ix76 = (int64_t)v_line_7.len;
-            lxl_str t77 = rt_str_sub(t74, ix75, ix76, "lower.lxl:214");
-            lxl_arr t78 = f1021_lower_Lower_hparams(p_u, t77);
-            lxl_arr v_pts_79 = t78;
-            rt_str_drop(t74);
-            int64_t ix80 = rt_add_int(v_fp_70, 2LL, "lower.lxl:215");
-            int64_t ix81 = v_close_73;
-            lxl_str t82 = rt_str_sub(v_line_7, ix80, ix81, "lower.lxl:215");
-            int64_t ix83 = v_fp_70;
-            lxl_str t84 = rt_str_sub(v_line_7, 8LL, ix83, "lower.lxl:215");
-            lxl_str t85 = f1019_strings_trim(t84);
-            int64_t t86 = f924_lower_Lower_ctName(p_u, t85);
-            int64_t t87 = f925_ir_Ir_fnType(&(*p_u)->f_ir, t86, &v_pts_79);
-            int64_t t88 = f597_ir_Ir_ptrTo(&(*p_u)->f_ir, t87);
-            f128_collections_Map_put(&(*p_u)->f_types, t82, t88);
-            gl11_drop(v_pts_79);
+        bool t66 = f10_strings_startsWith(v_line_7, sl9017);
+        bool c67 = t66;
+        if (c67) {
+          int64_t t68 = f120_strings_indexOf(v_line_7, sl8765, 0LL);
+          int64_t v_fp_69 = t68;
+          bool c70 = (bool)(v_fp_69 >= 0LL);
+          if (c70) {
+            int64_t t71 = f120_strings_indexOf(v_line_7, sl51, v_fp_69);
+            int64_t v_close_72 = t71;
+            lxl_str t73 = rt_str_dup(v_line_7);
+            int64_t ix74 = rt_add_int(v_close_72, 1LL, "lower.lxl:214");
+            int64_t ix75 = (int64_t)v_line_7.len;
+            lxl_str t76 = rt_str_sub(t73, ix74, ix75, "lower.lxl:214");
+            lxl_arr t77 = f1021_lower_Lower_hparams(p_u, t76);
+            lxl_arr v_pts_78 = t77;
+            rt_str_drop(t73);
+            int64_t ix79 = rt_add_int(v_fp_69, 2LL, "lower.lxl:215");
+            int64_t ix80 = v_close_72;
+            lxl_str t81 = rt_str_sub(v_line_7, ix79, ix80, "lower.lxl:215");
+            int64_t ix82 = v_fp_69;
+            lxl_str vw83 = rt_str_view(v_line_7, 8LL, ix82, "lower.lxl:215");
+            lxl_str t84 = f1019_strings_trim(vw83);
+            int64_t t85 = f924_lower_Lower_ctName(p_u, t84);
+            int64_t t86 = f925_ir_Ir_fnType(&(*p_u)->f_ir, t85, &v_pts_78);
+            int64_t t87 = f597_ir_Ir_ptrTo(&(*p_u)->f_ir, t86);
+            f128_collections_Map_put(&(*p_u)->f_types, t81, t87);
+            gl11_drop(v_pts_78);
           } else {
-            int64_t t89 = f1020_strings_lastIndexOf(rt_str_dup(v_line_7), sl8658);
-            int64_t v_at_90 = t89;
-            lxl_str t91 = rt_str_dup(v_line_7);
-            int64_t ix92 = rt_add_int(v_at_90, 1LL, "lower.lxl:218");
-            int64_t ix93 = rt_sub_int((int64_t)v_line_7.len, 1LL, "lower.lxl:218");
-            lxl_str t94 = rt_str_sub(t91, ix92, ix93, "lower.lxl:218");
-            int64_t ix95 = v_at_90;
-            lxl_str t96 = rt_str_sub(v_line_7, 8LL, ix95, "lower.lxl:218");
-            int64_t t97 = f924_lower_Lower_ctName(p_u, t96);
-            f128_collections_Map_put(&(*p_u)->f_types, t94, t97);
-            rt_str_drop(t91);
+            int64_t t88 = f1020_strings_lastIndexOf(v_line_7, sl8658);
+            int64_t v_at_89 = t88;
+            lxl_str t90 = rt_str_dup(v_line_7);
+            int64_t ix91 = rt_add_int(v_at_89, 1LL, "lower.lxl:218");
+            int64_t ix92 = rt_sub_int((int64_t)v_line_7.len, 1LL, "lower.lxl:218");
+            lxl_str t93 = rt_str_sub(t90, ix91, ix92, "lower.lxl:218");
+            int64_t ix94 = v_at_89;
+            lxl_str t95 = rt_str_sub(v_line_7, 8LL, ix94, "lower.lxl:218");
+            int64_t t96 = f924_lower_Lower_ctName(p_u, t95);
+            f128_collections_Map_put(&(*p_u)->f_types, t93, t96);
+            rt_str_drop(t90);
           }
         } else {
-          bool c98 = (bool)!rt_str_eq(v_line_7, sl0);
-          if (c98) {
-            int64_t t99 = f120_strings_indexOf(rt_str_dup(v_line_7), sl50, 0LL);
-            int64_t v_open_100 = t99;
-            int64_t ix101 = v_open_100;
-            lxl_str t102 = rt_str_sub(v_line_7, 0LL, ix101, "lower.lxl:222");
-            int64_t t103 = f1020_strings_lastIndexOf(t102, sl8658);
-            int64_t v_at_104 = t103;
-            lxl_str t105 = rt_str_dup(v_line_7);
-            int64_t ix106 = v_open_100;
-            int64_t ix107 = (int64_t)v_line_7.len;
-            lxl_str t108 = rt_str_sub(t105, ix106, ix107, "lower.lxl:223");
-            lxl_arr t109 = f1021_lower_Lower_hparams(p_u, t108);
-            lxl_arr v_pts_110 = t109;
-            rt_str_drop(t105);
-            int64_t ix111 = rt_add_int(v_at_104, 1LL, "lower.lxl:224");
-            int64_t ix112 = v_open_100;
-            lxl_str t113 = rt_str_sub(v_line_7, ix111, ix112, "lower.lxl:224");
-            int64_t ix114 = v_at_104;
-            lxl_str t115 = rt_str_sub(v_line_7, 0LL, ix114, "lower.lxl:224");
-            int64_t t116 = f924_lower_Lower_ctName(p_u, t115);
-            int64_t t117 = f925_ir_Ir_fnType(&(*p_u)->f_ir, t116, &v_pts_110);
-            f940_lower_Lower_declFunc(p_u, t113, t117, sl0, (bool)0LL);
-            gl11_drop(v_pts_110);
+          bool c97 = (bool)!rt_str_eq(v_line_7, sl0);
+          if (c97) {
+            int64_t t98 = f120_strings_indexOf(v_line_7, sl50, 0LL);
+            int64_t v_open_99 = t98;
+            int64_t ix100 = v_open_99;
+            lxl_str vw101 = rt_str_view(v_line_7, 0LL, ix100, "lower.lxl:222");
+            int64_t t102 = f1020_strings_lastIndexOf(vw101, sl8658);
+            int64_t v_at_103 = t102;
+            lxl_str t104 = rt_str_dup(v_line_7);
+            int64_t ix105 = v_open_99;
+            int64_t ix106 = (int64_t)v_line_7.len;
+            lxl_str t107 = rt_str_sub(t104, ix105, ix106, "lower.lxl:223");
+            lxl_arr t108 = f1021_lower_Lower_hparams(p_u, t107);
+            lxl_arr v_pts_109 = t108;
+            rt_str_drop(t104);
+            int64_t ix110 = rt_add_int(v_at_103, 1LL, "lower.lxl:224");
+            int64_t ix111 = v_open_99;
+            lxl_str t112 = rt_str_sub(v_line_7, ix110, ix111, "lower.lxl:224");
+            int64_t ix113 = v_at_103;
+            lxl_str t114 = rt_str_sub(v_line_7, 0LL, ix113, "lower.lxl:224");
+            int64_t t115 = f924_lower_Lower_ctName(p_u, t114);
+            int64_t t116 = f925_ir_Ir_fnType(&(*p_u)->f_ir, t115, &v_pts_109);
+            f940_lower_Lower_declFunc(p_u, t112, t116, sl0, (bool)0LL);
+            gl11_drop(v_pts_109);
           }
         }
       }
@@ -100394,7 +100299,7 @@ static lxl_arr f1021_lower_Lower_hparams(struct S97_lower_Lower**p_u, lxl_str p_
   lxl_arr a1 = rt_arr_new(0LL, 8ULL);
   lxl_arr v_pts_2 = a1;
   lxl_str t3 = rt_str_dup(p_s);
-  int64_t t4 = f1020_strings_lastIndexOf(rt_str_dup(p_s), sl51);
+  int64_t t4 = f1020_strings_lastIndexOf(p_s, sl51);
   int64_t ix5 = t4;
   lxl_str t6 = rt_str_sub(t3, 1LL, ix5, "lower.lxl:232");
   lxl_str v_inner_7 = t6;
@@ -100406,13 +100311,13 @@ static lxl_arr f1021_lower_Lower_hparams(struct S97_lower_Lower**p_u, lxl_str p_
     rt_str_drop(p_s);
     return r9;
   }
-  lxl_arr t10 = f978_strings_splitByte(rt_str_dup(v_inner_7), (uint8_t)44LL);
+  lxl_arr t10 = f978_strings_splitByte(v_inner_7, (uint8_t)44LL);
   lxl_slice ap11 = rt_as_slice(&t10);
   for (int64_t i12 = 0LL; i12 < ap11.len; i12++) {
     lxl_str v_p0_13 = rt_str_dup(*((lxl_str*)ap11.data + i12));
-    lxl_str t14 = f1019_strings_trim(rt_str_dup(v_p0_13));
+    lxl_str t14 = f1019_strings_trim(v_p0_13);
     lxl_str v_p_15 = t14;
-    int64_t t16 = f1020_strings_lastIndexOf(rt_str_dup(v_p_15), sl8658);
+    int64_t t16 = f1020_strings_lastIndexOf(v_p_15, sl8658);
     int64_t v_at_17 = t16;
     lxl_str t18 = rt_str_dup(v_p_15);
     int64_t ix19 = rt_add_int(v_at_17, 1LL, "lower.lxl:237");
@@ -100422,7 +100327,7 @@ static lxl_arr f1021_lower_Lower_hparams(struct S97_lower_Lower**p_u, lxl_str p_
     rt_str_drop(t18);
     bool b23 = (bool)(v_at_17 >= 0LL);
     if (b23) {
-      bool t24 = f25_strings_endsWith(rt_str_dup(v_p_15), sl64);
+      bool t24 = f25_strings_endsWith(v_p_15, sl64);
       b23 = (bool)!t24;
     }
     bool b25 = b23;
@@ -100464,19 +100369,15 @@ static int64_t f1020_strings_lastIndexOf(lxl_str p_s, lxl_str p_sub) {
     if (!c3) {
       break;
     }
-    bool t4 = f1022_strings_matches(rt_str_dup(p_s), v_i_2, rt_str_dup(p_sub));
+    bool t4 = f1022_strings_matches(p_s, v_i_2, p_sub);
     bool c5 = t4;
     if (c5) {
       int64_t r6 = v_i_2;
-      rt_str_drop(p_sub);
-      rt_str_drop(p_s);
       return r6;
     }
     v_i_2 = rt_sub_int(v_i_2, 1LL, "strings.lxl:28");
   }
   int64_t r7 = -1LL;
-  rt_str_drop(p_sub);
-  rt_str_drop(p_s);
   return r7;
 }
 static bool f1022_strings_matches(lxl_str p_s, int64_t p_at, lxl_str p_sub) {
@@ -100489,8 +100390,6 @@ static bool f1022_strings_matches(lxl_str p_s, int64_t p_at, lxl_str p_sub) {
   bool c4 = b1;
   if (c4) {
     bool r5 = (bool)0LL;
-    rt_str_drop(p_sub);
-    rt_str_drop(p_s);
     return r5;
   }
   int64_t end6 = (int64_t)p_sub.len;
@@ -100502,14 +100401,10 @@ static bool f1022_strings_matches(lxl_str p_s, int64_t p_at, lxl_str p_sub) {
     rt_str_drop(t8);
     if (c11) {
       bool r12 = (bool)0LL;
-      rt_str_drop(p_sub);
-      rt_str_drop(p_s);
       return r12;
     }
   }
   bool r13 = (bool)1LL;
-  rt_str_drop(p_sub);
-  rt_str_drop(p_s);
   return r13;
 }
 static lxl_str f1019_strings_trim(lxl_str p_s) {
@@ -100543,7 +100438,6 @@ static lxl_str f1019_strings_trim(lxl_str p_s) {
   }
   lxl_str t11 = rt_str_sub(p_s, v_a_1, v_b_2, "strings.lxl:995");
   lxl_str r12 = t11;
-  rt_str_drop(p_s);
   return r12;
 }
 static bool f1023_strings_isSpace(uint8_t p_c) {
@@ -102021,6 +101915,7 @@ static lxl_str f1024_sema_Program_tstr(struct S83_sema_Program**p_pg, int64_t p_
       int64_t t34 = f1013_sema_Program_ti(p_pg, p_t, v_i_32);
       lxl_str t35 = f1024_sema_Program_tstr(p_pg, t34);
       f19_strings_StrBuf_add(&v_b_28, t35);
+      rt_str_drop(t35);
     }
     f55_strings_StrBuf_addByte(&v_b_28, (uint8_t)41LL);
     int64_t t36 = f1014_sema_Program_tb(p_pg, p_t);
@@ -102030,6 +101925,7 @@ static lxl_str f1024_sema_Program_tstr(struct S83_sema_Program**p_pg, int64_t p_
       int64_t t38 = f1014_sema_Program_tb(p_pg, p_t);
       lxl_str t39 = f1024_sema_Program_tstr(p_pg, t38);
       f19_strings_StrBuf_add(&v_b_28, t39);
+      rt_str_drop(t39);
     }
     lxl_str t40 = f21_strings_StrBuf_toStr(&v_b_28);
     lxl_str r41 = t40;
@@ -102049,7 +101945,7 @@ static lxl_str f1024_sema_Program_tstr(struct S83_sema_Program**p_pg, int64_t p_
   struct S9_strings_StrBuf*v_b_47 = t46;
   int64_t t48 = f914_sema_Program_ta(p_pg, p_t);
   int64_t ix49 = t48;
-  f19_strings_StrBuf_add(&v_b_47, rt_str_dup(((struct S103_sema_TypeDecl*)(*p_pg)->f_types.data + rt_idx(ix49, (*p_pg)->f_types.len, "sema.lxl:505"))->f_name));
+  f19_strings_StrBuf_add(&v_b_47, ((struct S103_sema_TypeDecl*)(*p_pg)->f_types.data + rt_idx(ix49, (*p_pg)->f_types.len, "sema.lxl:505"))->f_name);
   int64_t t50 = f1012_sema_Program_tn(p_pg, p_t);
   bool c51 = (bool)(t50 > 0LL);
   if (c51) {
@@ -102064,6 +101960,7 @@ static lxl_str f1024_sema_Program_tstr(struct S83_sema_Program**p_pg, int64_t p_
       int64_t t56 = f1013_sema_Program_ti(p_pg, p_t, v_i_54);
       lxl_str t57 = f1024_sema_Program_tstr(p_pg, t56);
       f19_strings_StrBuf_add(&v_b_47, t57);
+      rt_str_drop(t57);
     }
     f55_strings_StrBuf_addByte(&v_b_47, (uint8_t)93LL);
   }
@@ -103583,7 +103480,7 @@ static struct S5_sema_Sym f869_collections_Map_getOr(struct S112_collections_Map
     uint64_t t2 = (*p_m)->f_hashFn(p_k);
     ifx1 = t2;
   } else {
-    uint64_t t3 = f129_std_str_hash(rt_str_dup(p_k));
+    uint64_t t3 = f129_std_str_hash(p_k);
     ifx1 = t3;
   }
   uint64_t v_h_4 = ifx1;
@@ -103622,7 +103519,7 @@ static struct S39_collections_Probe f1077_collections_Map_find(struct S112_colle
     if (c14) {
       int64_t v_e_15 = rt_sub_int(rt_cvs_int((__int128)v_d_13, "collections.lxl:840"), 1LL, "collections.lxl:840");
       int64_t ix16 = v_e_15;
-      bool t17 = f134_std_str_eq(rt_str_dup(*((lxl_str*)(*p_m)->f_keys.data + rt_idx(ix16, (*p_m)->f_keys.len, "collections.lxl:841"))), p_k);
+      bool t17 = f134_std_str_eq(*((lxl_str*)(*p_m)->f_keys.data + rt_idx(ix16, (*p_m)->f_keys.len, "collections.lxl:841")), p_k);
       bool c18 = t17;
       if (c18) {
         struct S39_collections_Probe t19 = (struct S39_collections_Probe){.f_slot = v_i_7, .f_entry = v_e_15};
@@ -104048,6 +103945,7 @@ static lxl_str f1100_num_bigStr(struct S116_num_Big p_a) {
   int64_t ix27 = v_k_26;
   lxl_str t28 = rt_int_to_str(*((int64_t*)v_chunks_8.data + rt_idx(ix27, v_chunks_8.len, "num.lxl:112")));
   f19_strings_StrBuf_add(&v_b_24, t28);
+  rt_str_drop(t28);
   v_k_26 = rt_sub_int(v_k_26, 1LL, "num.lxl:113");
   while (1) {
     bool c29 = (bool)(v_k_26 >= 0LL);
@@ -104061,7 +103959,7 @@ static lxl_str f1100_num_bigStr(struct S116_num_Big p_a) {
     for (int64_t v_z_34 = (int64_t)v_s_32.len; v_z_34 < end33; v_z_34++) {
       f55_strings_StrBuf_addByte(&v_b_24, (uint8_t)48LL);
     }
-    f19_strings_StrBuf_add(&v_b_24, rt_str_dup(v_s_32));
+    f19_strings_StrBuf_add(&v_b_24, v_s_32);
     v_k_26 = rt_sub_int(v_k_26, 1LL, "num.lxl:118");
     rt_str_drop(v_s_32);
   }
@@ -104888,7 +104786,7 @@ static struct S113_sema_CVal f1091_sema_Program_fold(struct S83_sema_Program**p_
     }
     bool c98 = b97;
     if (c98) {
-      bool t99 = f10_strings_startsWith(rt_str_dup(v_v_68.f_s), sl63);
+      bool t99 = f10_strings_startsWith(v_v_68.f_s, sl63);
       lxl_str ifx100;
       if (t99) {
         lxl_str t101 = rt_str_sub(v_v_68.f_s, 1LL, (int64_t)v_v_68.f_s.len, "sema.lxl:1890");
@@ -109849,7 +109747,7 @@ static void f1240_check_Checker_sMatch(struct S84_check_Checker**p_c, int64_t p_
           f19_strings_StrBuf_add(&v_b_257, sl8641);
         }
         int64_t ix267 = v_x_262;
-        f19_strings_StrBuf_add(&v_b_257, rt_str_dup(((struct S104_sema_Variant*)(*p_c)->f_pg->f_variants.data + rt_idx(ix267, (*p_c)->f_pg->f_variants.len, "check.lxl:2694"))->f_name));
+        f19_strings_StrBuf_add(&v_b_257, ((struct S104_sema_Variant*)(*p_c)->f_pg->f_variants.data + rt_idx(ix267, (*p_c)->f_pg->f_variants.len, "check.lxl:2694"))->f_name);
         v_k_258 = rt_add_int(v_k_258, 1LL, "check.lxl:2695");
       }
     }
@@ -110360,28 +110258,28 @@ static int64_t f1280_check_Checker_joinRoots(struct S84_check_Checker**p_c, int6
     bool c50 = (bool)(v_i_49 > 0LL);
     if (c50) {
       int64_t t51 = v_i_49;
-      lxl_str t53 = t51 == rt_sub_int(v_ms_18.len, 1LL, "check.lxl:696") ? sl8954 : sl8641;
-      f19_strings_StrBuf_add(&v_name_47, t53);
+      f19_strings_StrBuf_add(&v_name_47, t51 == rt_sub_int(v_ms_18.len, 1LL, "check.lxl:696") ? sl8954 : sl8641);
     }
-    int64_t ix54 = v_i_49;
-    lxl_str t55 = f1285_check_Checker_rootDesc(p_c, *((int64_t*)v_ms_18.data + rt_idx(ix54, v_ms_18.len, "check.lxl:697")));
-    f19_strings_StrBuf_add(&v_name_47, t55);
+    int64_t ix53 = v_i_49;
+    lxl_str t54 = f1285_check_Checker_rootDesc(p_c, *((int64_t*)v_ms_18.data + rt_idx(ix53, v_ms_18.len, "check.lxl:697")));
+    f19_strings_StrBuf_add(&v_name_47, t54);
+    rt_str_drop(t54);
   }
-  lxl_arr ap56 = v_ms_18;
-  *(lxl_arr*)rt_arr_push(&(*p_c)->f_joins, 24ULL) = ap56;
-  lxl_str t57 = f21_strings_StrBuf_toStr(&v_name_47);
-  int64_t t58 = f1210_check_Checker_newVar(p_c, t57, sl0, 11LL, (bool)0LL, 3LL, 0LL);
-  int64_t v_j_59 = t58;
-  int64_t t60 = rt_sub_int((*p_c)->f_joins.len, 1LL, "check.lxl:701");
-  int64_t ix61 = v_j_59;
-  ((struct S123_check_Var*)(*p_c)->f_vars.data + rt_idx(ix61, (*p_c)->f_vars.len, "check.lxl:701"))->f_jn = t60;
-  int64_t ix62 = v_j_59;
-  ((struct S123_check_Var*)(*p_c)->f_vars.data + rt_idx(ix62, (*p_c)->f_vars.len, "check.lxl:702"))->f_depth = -1LL;
-  int64_t ap63 = v_j_59;
-  *(int64_t*)rt_arr_push(&(*p_c)->f_joinVars, 8ULL) = ap63;
-  int64_t r64 = v_j_59;
+  lxl_arr ap55 = v_ms_18;
+  *(lxl_arr*)rt_arr_push(&(*p_c)->f_joins, 24ULL) = ap55;
+  lxl_str t56 = f21_strings_StrBuf_toStr(&v_name_47);
+  int64_t t57 = f1210_check_Checker_newVar(p_c, t56, sl0, 11LL, (bool)0LL, 3LL, 0LL);
+  int64_t v_j_58 = t57;
+  int64_t t59 = rt_sub_int((*p_c)->f_joins.len, 1LL, "check.lxl:701");
+  int64_t ix60 = v_j_58;
+  ((struct S123_check_Var*)(*p_c)->f_vars.data + rt_idx(ix60, (*p_c)->f_vars.len, "check.lxl:701"))->f_jn = t59;
+  int64_t ix61 = v_j_58;
+  ((struct S123_check_Var*)(*p_c)->f_vars.data + rt_idx(ix61, (*p_c)->f_vars.len, "check.lxl:702"))->f_depth = -1LL;
+  int64_t ap62 = v_j_58;
+  *(int64_t*)rt_arr_push(&(*p_c)->f_joinVars, 8ULL) = ap62;
+  int64_t r63 = v_j_58;
   gl1_drop(v_name_47);
-  return r64;
+  return r63;
 }
 static lxl_str f1285_check_Checker_rootDesc(struct S84_check_Checker**p_c, int64_t p_r) {
   bool c1 = (bool)(p_r == -1000000000LL);
@@ -110415,7 +110313,7 @@ static lxl_str f1285_check_Checker_rootDesc(struct S84_check_Checker**p_c, int64
   bool b14 = (bool)(((struct S123_check_Var*)(*p_c)->f_vars.data + rt_idx(ix13, (*p_c)->f_vars.len, "check.lxl:546"))->f_kind == 3LL);
   if (b14) {
     int64_t ix15 = p_r;
-    bool t16 = f10_strings_startsWith(rt_str_dup(((struct S123_check_Var*)(*p_c)->f_vars.data + rt_idx(ix15, (*p_c)->f_vars.len, "check.lxl:546"))->f_name), sl64);
+    bool t16 = f10_strings_startsWith(((struct S123_check_Var*)(*p_c)->f_vars.data + rt_idx(ix15, (*p_c)->f_vars.len, "check.lxl:546"))->f_name, sl64);
     b14 = t16;
   }
   bool c17 = b14;
@@ -110442,7 +110340,7 @@ static lxl_str f1285_check_Checker_rootDesc(struct S84_check_Checker**p_c, int64
 static lxl_str f1286_check_Checker_varDesc(struct S84_check_Checker**p_c, int64_t p_x) {
   int64_t ix1 = p_x;
   lxl_str v_n_2 = rt_str_dup(((struct S123_check_Var*)(*p_c)->f_vars.data + rt_idx(ix1, (*p_c)->f_vars.len, "check.lxl:554"))->f_name);
-  bool t3 = f10_strings_startsWith(rt_str_dup(v_n_2), sl9193);
+  bool t3 = f10_strings_startsWith(v_n_2, sl9193);
   lxl_str ifx4;
   if (t3) {
     ifx4 = rt_str_dup(v_n_2);
@@ -111446,7 +111344,7 @@ static lxl_str f1303_check_Checker_vpathText(struct S84_check_Checker**p_c, int6
     }
     int64_t t7 = f1189_check_Checker_item(p_c, p_vpath, v_i_5);
     struct S114_syntax_Node t8 = f1171_check_Checker_nd(p_c, t7);
-    f19_strings_StrBuf_add(&v_b_2, rt_str_dup(t8.f_s));
+    f19_strings_StrBuf_add(&v_b_2, t8.f_s);
     gl70_drop(t8);
   }
   lxl_str t9 = f21_strings_StrBuf_toStr(&v_b_2);
@@ -113387,11 +113285,13 @@ static void f1333_check_Checker_checkResult(struct S84_check_Checker**p_c, int64
       lxl_str t30 = rt_str_concat(sl9191, v_p_26.f_name);
       lxl_str t31 = rt_str_concat(t30, sl9192);
       f19_strings_StrBuf_add(&v_desc_16, t31);
+      rt_str_drop(t31);
       rt_str_drop(t30);
     } else {
       lxl_str t32 = rt_str_concat(sl8794, v_p_26.f_name);
       lxl_str t33 = rt_str_concat(t32, sl8794);
       f19_strings_StrBuf_add(&v_desc_16, t33);
+      rt_str_drop(t33);
       rt_str_drop(t32);
     }
     v_k_17 = rt_add_int(v_k_17, 1LL, "check.lxl:800");
@@ -114793,7 +114693,7 @@ static struct S125_check_Val f1344_check_Checker_call(struct S84_check_Checker**
         f19_strings_StrBuf_add(&v_missing_450, sl8641);
       }
       int64_t ix458 = v_tp_454;
-      f19_strings_StrBuf_add(&v_missing_450, rt_str_dup(((struct S108_sema_TParam*)(*p_c)->f_pg->f_tparams.data + rt_idx(ix458, (*p_c)->f_pg->f_tparams.len, "check.lxl:4854"))->f_name));
+      f19_strings_StrBuf_add(&v_missing_450, ((struct S108_sema_TParam*)(*p_c)->f_pg->f_tparams.data + rt_idx(ix458, (*p_c)->f_pg->f_tparams.len, "check.lxl:4854"))->f_name);
       v_nm_451 = rt_add_int(v_nm_451, 1LL, "check.lxl:4855");
     }
   }
@@ -117517,7 +117417,7 @@ static void f1388_check_Checker_immutable(struct S84_check_Checker**p_c, struct 
   if (c2) {
     int64_t ix3 = v_r_1;
     lxl_str v_name_4 = rt_str_dup(((struct S123_check_Var*)(*p_c)->f_vars.data + rt_idx(ix3, (*p_c)->f_vars.len, "check.lxl:1539"))->f_name);
-    bool t5 = f25_strings_endsWith(rt_str_dup(p_verb), sl9340);
+    bool t5 = f25_strings_endsWith(p_verb, sl9340);
     lxl_str ifx6;
     if (t5) {
       lxl_str t7 = rt_str_dup(p_verb);
@@ -119102,7 +119002,7 @@ static int64_t f1402_check_Checker_shiftCount(struct S84_check_Checker**p_c, int
   }
   bool b5 = b4;
   if (!b5) {
-    bool t6 = f25_strings_endsWith(rt_str_dup(v_x_2.f_s), sl8711);
+    bool t6 = f25_strings_endsWith(v_x_2.f_s, sl8711);
     b5 = (bool)!t6;
   }
   bool c7 = b5;
@@ -119652,7 +119552,7 @@ static void f1232_check_Checker_sDestructure(struct S84_check_Checker**p_c, int6
       }
       int64_t t47 = f1189_check_Checker_item(p_c, v_parts_6, v_i_45);
       struct S114_syntax_Node t48 = f1171_check_Checker_nd(p_c, t47);
-      f19_strings_StrBuf_add(&v_b_43, rt_str_dup(t48.f_s));
+      f19_strings_StrBuf_add(&v_b_43, t48.f_s);
       gl70_drop(t48);
     }
     int64_t t49 = v_n_2.f_line;
@@ -125727,7 +125627,7 @@ static struct S125_check_Val f1413_check_Checker_xFrac(struct S84_check_Checker*
     rt_str_drop(p_text);
     return r3;
   }
-  bool t4 = f10_strings_startsWith(rt_str_dup(p_text), sl63);
+  bool t4 = f10_strings_startsWith(p_text, sl63);
   bool v_neg_5 = t4;
   struct S9_strings_StrBuf*t6 = f17_std_newStrBuf();
   struct S9_strings_StrBuf*v_b_7 = t6;
@@ -125792,8 +125692,10 @@ static struct S125_check_Val f1413_check_Checker_xFrac(struct S84_check_Checker*
   }
   lxl_str t31 = f21_strings_StrBuf_toStr(&v_whole_9);
   f19_strings_StrBuf_add(&v_b_7, t31);
+  rt_str_drop(t31);
   lxl_str t32 = f21_strings_StrBuf_toStr(&v_frac_11);
   f19_strings_StrBuf_add(&v_b_7, t32);
+  rt_str_drop(t32);
   lxl_str t33 = f21_strings_StrBuf_toStr(&v_b_7);
   struct S116_num_Big t34 = f1117_num_bigParse(t33, v_neg_5);
   struct S116_num_Big v_units_35 = t34;
@@ -127850,12 +127752,12 @@ static bool f1492_sema_cHelper(lxl_str p_s) {
 static bool f1491_sema_cReserved(lxl_str p_s) {
   bool b1 = rt_str_eq(p_s, sl8755);
   if (!b1) {
-    bool t2 = f10_strings_startsWith(rt_str_dup(p_s), sl8803);
+    bool t2 = f10_strings_startsWith(p_s, sl8803);
     b1 = t2;
   }
   bool b3 = b1;
   if (!b3) {
-    bool t4 = f10_strings_startsWith(rt_str_dup(p_s), sl8718);
+    bool t4 = f10_strings_startsWith(p_s, sl8718);
     b3 = t4;
   }
   bool c5 = b3;
@@ -127874,7 +127776,7 @@ static bool f1491_sema_cReserved(lxl_str p_s) {
   lxl_slice ap8 = rt_as_slice(&a7);
   for (int64_t i9 = 0LL; i9 < ap8.len; i9++) {
     lxl_str v_p_10 = rt_str_dup(*((lxl_str*)ap8.data + i9));
-    bool t11 = f10_strings_startsWith(rt_str_dup(p_s), rt_str_dup(v_p_10));
+    bool t11 = f10_strings_startsWith(p_s, v_p_10);
     bool c12 = t11;
     if (c12) {
       int64_t v_i_13 = (int64_t)v_p_10.len;
@@ -127925,7 +127827,7 @@ static bool f1491_sema_cReserved(lxl_str p_s) {
   lxl_slice ap28 = rt_as_slice(&a27);
   for (int64_t i29 = 0LL; i29 < ap28.len; i29++) {
     lxl_str v_p_30 = rt_str_dup(*((lxl_str*)ap28.data + i29));
-    bool t31 = f10_strings_startsWith(rt_str_dup(p_s), rt_str_dup(v_p_30));
+    bool t31 = f10_strings_startsWith(p_s, v_p_30);
     bool b32 = t31;
     if (b32) {
       int64_t t33 = (int64_t)p_s.len;
@@ -128415,11 +128317,13 @@ static int64_t f1500_sema_Program_load(struct S83_sema_Program**p_pg, lxl_str p_
           lxl_str t89 = f863_sema_baseName(rt_str_dup(*((lxl_str*)v_chain_8.data + rt_idx(ix88, v_chain_8.len, "sema.lxl:806"))));
           lxl_str t90 = f1508_sema_dropLast(t89, 4LL);
           f19_strings_StrBuf_add(&v_b_84, t90);
+          rt_str_drop(t90);
           f19_strings_StrBuf_add(&v_b_84, sl9640);
         }
         lxl_str t91 = f863_sema_baseName(rt_str_dup(v_target_68));
         lxl_str t92 = f1508_sema_dropLast(t91, 4LL);
         f19_strings_StrBuf_add(&v_b_84, t92);
+        rt_str_drop(t92);
         lxl_str t93 = f21_strings_StrBuf_toStr(&v_b_84);
         {
           lxl_str nw94 = t93;
@@ -128431,10 +128335,10 @@ static int64_t f1500_sema_Program_load(struct S83_sema_Program**p_pg, lxl_str p_
       lxl_str t95 = rt_str_concat(sl9641, v_names_75);
       f1084_sema_Program_err(p_pg, v_m_55, v_imp_64.f_line, t95);
     }
-    bool t96 = f10_strings_startsWith(rt_str_dup(v_imp_64.f_s), sl9642);
+    bool t96 = f10_strings_startsWith(v_imp_64.f_s, sl9642);
     bool b97 = (bool)!t96;
     if (b97) {
-      bool t98 = f10_strings_startsWith(rt_str_dup(v_imp_64.f_s), sl9643);
+      bool t98 = f10_strings_startsWith(v_imp_64.f_s, sl9643);
       b97 = (bool)!t98;
     }
     bool v_lib_99 = b97;
@@ -128756,7 +128660,7 @@ static void f1515_collections_Map_put(struct S112_collections_Map**p_m, lxl_str 
     uint64_t t2 = (*p_m)->f_hashFn(p_k);
     ifx1 = t2;
   } else {
-    uint64_t t3 = f129_std_str_hash(rt_str_dup(p_k));
+    uint64_t t3 = f129_std_str_hash(p_k);
     ifx1 = t3;
   }
   uint64_t v_h_4 = ifx1;
@@ -128872,7 +128776,7 @@ static bool f1513_collections_Map_has(struct S112_collections_Map**p_m, lxl_str 
     uint64_t t2 = (*p_m)->f_hashFn(p_k);
     ifx1 = t2;
   } else {
-    uint64_t t3 = f129_std_str_hash(rt_str_dup(p_k));
+    uint64_t t3 = f129_std_str_hash(p_k);
     ifx1 = t3;
   }
   uint64_t v_h_4 = ifx1;
@@ -128896,10 +128800,10 @@ static lxl_str f1508_sema_dropLast(lxl_str p_s, int64_t p_n) {
   return r5;
 }
 static lxl_str f1507_sema_Program_findModule(struct S83_sema_Program**p_pg, lxl_str p_rel, lxl_str p_here, int64_t p_m, int64_t p_line) {
-  bool t1 = f10_strings_startsWith(rt_str_dup(p_rel), sl9642);
+  bool t1 = f10_strings_startsWith(p_rel, sl9642);
   bool b2 = t1;
   if (!b2) {
-    bool t3 = f10_strings_startsWith(rt_str_dup(p_rel), sl9643);
+    bool t3 = f10_strings_startsWith(p_rel, sl9643);
     b2 = t3;
   }
   bool v_local_4 = b2;
@@ -128960,24 +128864,22 @@ static bool f1518_sema_isFile(lxl_str p_path) {
       return r5;
     }
   }
-  bool t6 = f1519_fs_isFile(rt_str_dup(p_path));
+  bool t6 = f1519_fs_isFile(p_path);
   bool r7 = t6;
   rt_str_drop(p_path);
   return r7;
 }
 static bool f1519_fs_isFile(lxl_str p_path) {
-  struct S13_std_Result t1 = f1520_fs_stat(rt_str_dup(p_path));
+  struct S13_std_Result t1 = f1520_fs_stat(p_path);
   struct S13_std_Result s2 = t1;
   if (s2.tag == 0LL) {
     struct S14_fs_Stat v_s_3 = s2.u.V_Ok.f_0;
     bool t4 = f1521_fs_Stat_isFile(v_s_3);
     bool r5 = t4;
-    rt_str_drop(p_path);
     return r5;
   } else if (s2.tag == 1LL) {
     gl5_drop(s2.u.V_Err.f_0);
     bool r7 = (bool)0LL;
-    rt_str_drop(p_path);
     return r7;
   }
 }
@@ -128986,9 +128888,8 @@ static bool f1521_fs_Stat_isFile(struct S14_fs_Stat p_s) {
   return r1;
 }
 static struct S13_std_Result f1520_fs_stat(lxl_str p_path) {
-  struct S13_std_Result t1 = f37_fs_statHow(rt_str_dup(p_path), 1LL, sl9657);
+  struct S13_std_Result t1 = f37_fs_statHow(p_path, 1LL, sl9657);
   struct S13_std_Result r2 = t1;
-  rt_str_drop(p_path);
   return r2;
 }
 static lxl_str f1517_sema_joinPath(lxl_str p_a, lxl_str p_b) {
@@ -132699,8 +132600,8 @@ static int64_t f1605_syntax_Lexer_string(struct S145_syntax_Lexer**p_lx, int64_t
   struct S9_strings_StrBuf*v_b_20 = t19;
   int64_t ix21 = rt_add_int(p_i, 1LL, "syntax.lxl:627");
   int64_t ix22 = v_j_4;
-  lxl_str t23 = rt_str_sub(v_src_1, ix21, ix22, "syntax.lxl:627");
-  f19_strings_StrBuf_add(&v_b_20, t23);
+  lxl_str vw23 = rt_str_view(v_src_1, ix21, ix22, "syntax.lxl:627");
+  f19_strings_StrBuf_add(&v_b_20, vw23);
   while (1) {
     bool b24 = (bool)(v_j_4 >= v_n_2);
     if (!b24) {
@@ -133488,12 +133389,10 @@ static bool f10_strings_startsWith(lxl_str p_s, lxl_str p_prefix) {
   int64_t t1 = (int64_t)p_prefix.len;
   bool b2 = (bool)(t1 <= (int64_t)p_s.len);
   if (b2) {
-    bool t3 = f57_strings_matchAt(rt_str_dup(p_s), 0LL, rt_str_dup(p_prefix));
+    bool t3 = f57_strings_matchAt(p_s, 0LL, p_prefix);
     b2 = t3;
   }
   bool r4 = b2;
-  rt_str_drop(p_prefix);
-  rt_str_drop(p_s);
   return r4;
 }
 static lxl_str f9_sema_absPath(lxl_str p_path) {
@@ -133516,7 +133415,7 @@ static lxl_str f9_sema_absPath(lxl_str p_path) {
   lxl_str v_p_7 = ifx3;
   lxl_arr a8 = rt_arr_new(0LL, 16ULL);
   lxl_arr v_parts_9 = a8;
-  lxl_arr t10 = f978_strings_splitByte(rt_str_dup(v_p_7), (uint8_t)47LL);
+  lxl_arr t10 = f978_strings_splitByte(v_p_7, (uint8_t)47LL);
   lxl_slice ap11 = rt_as_slice(&t10);
   for (int64_t i12 = 0LL; i12 < ap11.len; i12++) {
     lxl_str v_part_13 = rt_str_dup(*((lxl_str*)ap11.data + i12));
@@ -133550,7 +133449,7 @@ static lxl_str f9_sema_absPath(lxl_str p_path) {
   for (int64_t i23 = 0LL; i23 < ap22.len; i23++) {
     lxl_str v_part_24 = rt_str_dup(*((lxl_str*)ap22.data + i23));
     f55_strings_StrBuf_addByte(&v_b_21, (uint8_t)47LL);
-    f19_strings_StrBuf_add(&v_b_21, rt_str_dup(v_part_24));
+    f19_strings_StrBuf_add(&v_b_21, v_part_24);
     rt_str_drop(v_part_24);
   }
   bool c25 = (bool)(v_parts_9.len == 0LL);
@@ -134478,7 +134377,7 @@ static lxl_str f1635_tdump_dumpTypes(struct S83_sema_Program**p_pg) {
   return r59;
 }
 static void f1642_tdump_TDumper_line(struct S147_tdump_TDumper**p_d, lxl_str p_s) {
-  f19_strings_StrBuf_add(&(*p_d)->f_b, rt_str_dup(p_s));
+  f19_strings_StrBuf_add(&(*p_d)->f_b, p_s);
   f55_strings_StrBuf_addByte(&(*p_d)->f_b, (uint8_t)10LL);
   rt_str_drop(p_s);
 }
@@ -134489,10 +134388,10 @@ static lxl_str f1641_tdump_join(lxl_arr*p_xs, lxl_str p_sep) {
   for (int64_t v_i_4 = 0LL; v_i_4 < end3; v_i_4++) {
     bool c5 = (bool)(v_i_4 > 0LL);
     if (c5) {
-      f19_strings_StrBuf_add(&v_b_2, rt_str_dup(p_sep));
+      f19_strings_StrBuf_add(&v_b_2, p_sep);
     }
     int64_t ix6 = v_i_4;
-    f19_strings_StrBuf_add(&v_b_2, rt_str_dup(*((lxl_str*)p_xs->data + rt_idx(ix6, p_xs->len, "tdump.lxl:19"))));
+    f19_strings_StrBuf_add(&v_b_2, *((lxl_str*)p_xs->data + rt_idx(ix6, p_xs->len, "tdump.lxl:19")));
   }
   lxl_str t7 = f21_strings_StrBuf_toStr(&v_b_2);
   lxl_str r8 = t7;
@@ -134654,6 +134553,7 @@ static lxl_str f1649_tdump_TDumper_list(struct S147_tdump_TDumper**p_d, struct S
     int64_t ix6 = v_i_4;
     lxl_str t7 = f1644_tdump_TDumper_ts(p_d, p_pg, *((int64_t*)p_ts->data + rt_idx(ix6, p_ts->len, "tdump.lxl:64")));
     f19_strings_StrBuf_add(&v_b_2, t7);
+    rt_str_drop(t7);
   }
   lxl_str t8 = f21_strings_StrBuf_toStr(&v_b_2);
   lxl_str r9 = t8;
@@ -135212,7 +135112,7 @@ static void f1636_tdump_TDumper_header(struct S147_tdump_TDumper**p_d, struct S8
   for (int64_t i23 = 0LL; i23 < ap22.len; i23++) {
     lxl_str v_n_24 = rt_str_dup(*((lxl_str*)ap22.data + i23));
     f55_strings_StrBuf_addByte(&v_sc_21, (uint8_t)32LL);
-    f19_strings_StrBuf_add(&v_sc_21, rt_str_dup(v_n_24));
+    f19_strings_StrBuf_add(&v_sc_21, v_n_24);
     rt_str_drop(v_n_24);
   }
   lxl_str t25 = f21_strings_StrBuf_toStr(&v_sc_21);
@@ -135258,11 +135158,11 @@ static lxl_str f2_x64_runTest(lxl_str p_text) {
   struct S9_strings_StrBuf*t1 = f17_std_newStrBuf();
   struct S9_strings_StrBuf*v_out_2 = t1;
   lxl_str v_hex_3 = sl8692;
-  lxl_arr t4 = f978_strings_splitByte(rt_str_dup(p_text), (uint8_t)10LL);
+  lxl_arr t4 = f978_strings_splitByte(p_text, (uint8_t)10LL);
   lxl_slice ap5 = rt_as_slice(&t4);
   for (int64_t i6 = 0LL; i6 < ap5.len; i6++) {
     lxl_str v_l_7 = rt_str_dup(*((lxl_str*)ap5.data + i6));
-    lxl_str t8 = f1019_strings_trim(rt_str_dup(v_l_7));
+    lxl_str t8 = f1019_strings_trim(v_l_7);
     bool c9 = (bool)((int64_t)t8.len == 0LL);
     rt_str_drop(t8);
     if (c9) {
