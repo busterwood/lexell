@@ -160,14 +160,51 @@ static int str_eqn(const char* a, const char* b, size_t n) {
    the same with its dynamic mmap threshold, up to 32 MiB. */
 
 #define NCLASS 40
+#define LARGE_MARK 0xff                 /* a large block's class byte */
 static size_t class_size[NCLASS];
-static void* free_list[NCLASS];
-static char* chunk_at;
-static size_t chunk_left;
 #define CHUNK (1 << 20)
 #define LARGE (1 << 16)
 #define KEEP ((size_t)32 << 20)
-static size_t* large_kept;          /* the kept mapping (its size in word 1), or 0 */
+/* A thread's heap (design/parallel.md 2.2). The main thread's is rt_mheap; each par worker has
+   its own in its context (rt_wctx). A block's header word is its class (or LARGE_MARK) in the
+   low 8 bits and its owner's tag in the other 56: 0 for the main thread, a fresh tag for each
+   par.map a worker works on. A large block's mapping size is in word 0 of its mapping. Blocks
+   pass from a worker to the main thread with par.map's results and are then the main thread's:
+   it frees them onto its own lists (their stale tags match no worker's again). */
+typedef struct {
+    void* free_list[NCLASS];
+    char* chunk_at;
+    size_t chunk_left;
+    size_t* large_kept;             /* the kept mapping (its size in word 0), or 0 */
+    uint64_t tag;                   /* the owner tag written into each block's header */
+} rt_hp;
+static rt_hp rt_mheap;
+/* A par worker's context, at the top of its stack slot (design/parallel.md 2.1). rt_wme() is the
+   calling thread's, or 0 on the main thread: a stack-range test, no TLS. */
+typedef struct { rt_dfn f; void* p; } rt_dact;
+typedef struct rt_clog rt_clog;
+typedef struct rt_pjob rt_pjob;
+typedef struct rt_wctx {
+    rt_hp heap;
+    rt_dact* ds;                    /* the drop-action stack (rt_dpush) */
+    int64_t dn, dcap;
+    int64_t live;                   /* LXL_CHECK's count of this worker's objects, given to the job */
+    rt_clog* log;                   /* the counts of foreign strings changed (2.3) */
+    rt_pjob* job;                   /* the job being worked on */
+    int id;
+} rt_wctx;
+#define PAR_SLOT ((size_t)8 << 20)      /* a worker's stack slot: guard page, stack, altstack, context */
+static char* rt_par_base;               /* the slots, or 0 before the pool starts */
+static size_t rt_par_span;
+static inline __attribute__((always_inline)) rt_wctx* rt_wme(void) {
+    size_t o = (size_t)((char*)__builtin_frame_address(0) - rt_par_base);
+    if (__builtin_expect(o >= rt_par_span, 1)) return 0;
+    return (rt_wctx*)(rt_par_base + (o & ~(PAR_SLOT - 1)) + PAR_SLOT - sizeof(rt_wctx));
+}
+static inline rt_hp* rt_hp_me(void) {
+    rt_wctx* w = rt_wme();
+    return w ? &w->heap : &rt_mheap;
+}
 
 static void* sys_mmap(size_t n) {
     i64 r = sys6(S_MMAP, 0, (i64)n, 3, 0x22, -1, 0);       /* PROT_READ|WRITE, MAP_PRIVATE|ANONYMOUS */
@@ -189,76 +226,98 @@ static int class_of(size_t n) {
     return -1;
 }
 /* The large blocks, out of line: the small classes' paths in malloc and free stay straight. */
-__attribute__((noinline)) static void* malloc_large(size_t need) {
+__attribute__((noinline)) static void* malloc_large(rt_hp* h, size_t need) {
     size_t m = (need + 16 + 4095) & ~(size_t)4095;
     if (m < need) return 0;
-    size_t* k = large_kept;
-    if (k && k[1] >= m && k[1] / 2 <= m) {
-        large_kept = 0;
-        return (char*)k + 16;       /* k[1] stays its mapping size */
+    size_t* k = h->large_kept;
+    if (k && k[0] >= m && k[0] / 2 <= m) {
+        h->large_kept = 0;
+        k[1] = LARGE_MARK | h->tag << 8;
+        return (char*)k + 16;       /* k[0] stays its mapping size */
     }
     char* p = sys_mmap(m);
     if (!p) return 0;
-    ((size_t*)p)[1] = m;
+    ((size_t*)p)[0] = m;
+    ((size_t*)p)[1] = LARGE_MARK | h->tag << 8;
     return p + 16;
 }
-__attribute__((noinline)) static void free_large(size_t* k) {
-    if (k[1] <= KEEP) {
-        size_t* old = large_kept;
-        large_kept = k;
+__attribute__((noinline)) static void free_large(rt_hp* h, size_t* k) {
+    if (k[0] <= KEEP) {
+        size_t* old = h->large_kept;
+        h->large_kept = k;
         k = old;
         if (!k) return;
     }
-    SYS(S_MUNMAP, k, k[1], 0);
+    SYS(S_MUNMAP, k, k[0], 0);
 }
-void* malloc(size_t n) {
-    if (!class_size[0]) heap_init();
+/* The main thread's paths test one word (rt_par_span: 0 until the pool starts) and then work on
+   rt_mheap at fixed addresses, as before there were workers. A block popped from the main thread's
+   lists keeps its header: a stale worker tag in it matches no worker's tag again. */
+static inline __attribute__((always_inline)) void* malloc_h(rt_hp* h, size_t n, bool tagit) {
     size_t need = n ? n : 1;
-    if (__builtin_expect(need > LARGE, 0)) return malloc_large(need);
+    if (__builtin_expect(need > LARGE, 0)) return malloc_large(h, need);
     int c = class_of(need);
-    void* f = free_list[c];
+    void* f = h->free_list[c];
     if (f) {
-        free_list[c] = *(void**)f;
+        h->free_list[c] = *(void**)f;
+        if (tagit) ((size_t*)f)[-1] = (size_t)c | h->tag << 8;
         return f;
     }
     size_t bs = class_size[c] + 8;
-    if (chunk_left < bs) {
+    if (h->chunk_left < bs) {
         char* p = sys_mmap(CHUNK);
         if (!p) return 0;
-        chunk_at = p + 8;
-        chunk_left = CHUNK - 8;
+        h->chunk_at = p + 8;
+        h->chunk_left = CHUNK - 8;
     }
-    char* b = chunk_at;
-    chunk_at += bs;
-    chunk_left -= bs;
-    ((size_t*)b)[0] = (size_t)c;
+    char* b = h->chunk_at;
+    h->chunk_at += bs;
+    h->chunk_left -= bs;
+    ((size_t*)b)[0] = (size_t)c | h->tag << 8;
     return b + 8;
 }
+__attribute__((noinline)) static void* malloc_w(size_t n) {
+    rt_wctx* w = rt_wme();
+    return w ? malloc_h(&w->heap, n, true) : malloc_h(&rt_mheap, n, false);
+}
+void* malloc(size_t n) {
+    if (!class_size[0]) heap_init();
+    if (__builtin_expect(rt_par_span != 0, 0)) return malloc_w(n);
+    return malloc_h(&rt_mheap, n, false);
+}
 static size_t block_size(void* p) {
-    size_t h = ((size_t*)p)[-1];
-    return h < NCLASS ? class_size[h] : h - 16;
+    size_t h = ((size_t*)p)[-1] & 0xff;
+    return h < NCLASS ? class_size[h] : ((size_t*)p)[-2] - 16;
+}
+static inline __attribute__((always_inline)) void free_h(rt_hp* hp, void* p) {
+    size_t h = ((size_t*)p)[-1] & 0xff;
+    if (__builtin_expect(h >= NCLASS, 0)) {
+        free_large(hp, (size_t*)((char*)p - 16));
+        return;
+    }
+    *(void**)p = hp->free_list[h];
+    hp->free_list[h] = p;
+}
+__attribute__((noinline)) static void free_w(void* p) {
+    rt_wctx* w = rt_wme();
+    free_h(w ? &w->heap : &rt_mheap, p);
 }
 void free(void* p) {
     if (!p) return;
-    size_t h = ((size_t*)p)[-1];
-    if (__builtin_expect(h >= NCLASS, 0)) {
-        free_large((size_t*)((char*)p - 16));
-        return;
-    }
-    *(void**)p = free_list[h];
-    free_list[h] = p;
+    if (__builtin_expect(rt_par_span != 0, 0)) { free_w(p); return; }
+    free_h(&rt_mheap, p);
 }
 void* realloc(void* p, size_t n) {
     if (!p) return malloc(n);
     size_t have = block_size(p);
     if (n <= have) return p;
-    if (((size_t*)p)[-1] >= NCLASS) {       /* a large block grows by moving its pages, not its bytes */
+    if ((((size_t*)p)[-1] & 0xff) >= NCLASS) {     /* a large block grows by moving its pages, not its bytes */
         size_t* k = (size_t*)((char*)p - 16);
         size_t m = (n + 16 + 4095) & ~(size_t)4095;
         if (m < n) return 0;
-        i64 r = sys6(S_MREMAP, (i64)k, (i64)k[1], (i64)m, 1, 0, 0);    /* MREMAP_MAYMOVE */
+        i64 r = sys6(S_MREMAP, (i64)k, (i64)k[0], (i64)m, 1, 0, 0);    /* MREMAP_MAYMOVE */
         if (r < 0 && r > -4096) return 0;
-        ((size_t*)r)[1] = m;
+        ((size_t*)r)[0] = m;
         return (char*)r + 16;
     }
     void* q = malloc(n);
@@ -329,28 +388,47 @@ __attribute__((noreturn)) static void rt_trap_with(int code, const char* msg, co
     rt_quit(code);
 }
 
-/* Not zeroed: every caller stores each byte it later reads. */
+/* Not zeroed: every caller stores each byte it later reads. A par worker counts its own objects,
+   and gives the count to its job (design/parallel.md 2.4): rt_live is the main thread's. */
+__attribute__((noinline, cold)) static void rt_live_add(int64_t d) {
+    rt_wctx* w = rt_wme();
+    if (w) w->live += d; else rt_live += d;
+}
 void* rt_alloc(size_t n) {
     void* p = malloc(n ? n : 1);
     if (!p) rt_trap(2, "out of memory", "runtime");
-    if (rt_check) rt_live++;
+    if (rt_check) rt_live_add(1);
     return p;
 }
-void rt_free(void* p) { free(p); if (rt_check) rt_live--; }
+void rt_free(void* p) { free(p); if (rt_check) rt_live_add(-1); }
 
-/* Drop actions: drop glue pushes the parts of a value instead of recursing (SPEC 9.4). */
-typedef struct { rt_dfn f; void* p; } rt_dact;
+/* Drop actions: drop glue pushes the parts of a value instead of recursing (SPEC 9.4). The
+   stack is the current task's (rt_switch swaps it), or a par worker's own. */
 static rt_dact* rt_ds;
 static int64_t rt_dn, rt_dcap;
+static void rt_dgrow(rt_dact** ds, int64_t* cap) {
+    *cap = *cap ? *cap * 2 : 256;
+    *ds = realloc(*ds, (size_t)*cap * sizeof **ds);
+    if (!*ds) rt_trap(2, "out of memory", "runtime");
+}
 void rt_dpush(rt_dfn f, void* p) {
-    if (rt_dn == rt_dcap) {
-        rt_dcap = rt_dcap ? rt_dcap * 2 : 256;
-        rt_ds = realloc(rt_ds, (size_t)rt_dcap * sizeof *rt_ds);
-        if (!rt_ds) rt_trap(2, "out of memory", "runtime");
+    rt_wctx* w = rt_par_span ? rt_wme() : 0;
+    if (__builtin_expect(w != 0, 0)) {
+        if (w->dn == w->dcap) rt_dgrow(&w->ds, &w->dcap);
+        w->ds[w->dn].f = f; w->ds[w->dn++].p = p;
+        return;
     }
+    if (rt_dn == rt_dcap) rt_dgrow(&rt_ds, &rt_dcap);
     rt_ds[rt_dn].f = f; rt_ds[rt_dn++].p = p;
 }
 void rt_drun(rt_dfn f, void* p) {
+    rt_wctx* w = rt_par_span ? rt_wme() : 0;
+    if (__builtin_expect(w != 0, 0)) {
+        int64_t base = w->dn;
+        f(p);
+        while (w->dn > base) { rt_dact a = w->ds[--w->dn]; a.f(a.p); }
+        return;
+    }
     int64_t base = rt_dn;
     f(p);
     while (rt_dn > base) { rt_dact a = rt_ds[--rt_dn]; a.f(a.p); }
@@ -1205,7 +1283,7 @@ static const char* flt_parse(const char* p, const char* e, double* out) {
         *out = flt_of_bits((uint64_t)neg << 63 | 0x7ff8000000000000ULL);
         return s;
     }
-    static rt_big m, d, r, t;
+    rt_big m, d, r, t;          /* on the stack: par workers parse floats too */
     big_set(&m, 0);
     int digits = 0, k = 0, any = 0;
     if (e - s >= 3 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X') &&
@@ -1320,8 +1398,8 @@ static int flt_fmt(double d, int p, char* b) {
     if (ex == 0 && mant == 0) { b[n++] = '0'; return n; }
     uint64_t m = ex ? mant | (uint64_t)1 << 52 : mant;
     int e2 = ex ? ex - 1075 : -1074;
-    static rt_big a, t;
-    static char dg[800];
+    rt_big a, t;                /* on the stack: par workers format floats too */
+    char dg[800];
     big_set(&a, m);
     int dexp = 0;
     if (e2 >= 0) { t = a; big_shl(&a, &t, e2); } else { big_pow5(&a, -e2); dexp = e2; }
