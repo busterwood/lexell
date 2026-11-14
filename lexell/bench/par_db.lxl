@@ -1,0 +1,206 @@
+// par_db: CPU-bound kernels shaped like lexdb's, run as a loop or on par.map's pool.
+//     par_db group1 N R   one Map over N rows, R rounds (the current serial shape)
+//     par_db groupN N R   N rows in 16 chunks, one Map each, merged (the parallel shape)
+//     par_db distinct ... two-column DISTINCT through a Map[Key2, int]
+//     par_db join ...     1M probes of a 20-key Map[str, int]
+//     par_db expr ...     a + b, price * 2, upper(city), made into text
+// Run with LXL_PAR=0, 1, 3, 7 for 1, 2, 4 and 8 threads.
+// groupN copies a str key per row (Map.atOrPut); lexdb's batch path carries
+// a group id. Its absolute time is a little heavy; the scaling is the point.
+import "par"
+import "collections"
+import "time"
+import "strings"
+import "hash"
+
+type Row = record { a: int; city: str; price: Decimal }
+type Agg = value record { n: int; sum: Decimal }
+type Key2 = value record { a: int; city: str }
+
+fn (k: &Key2) eq(o: &Key2): bool { return k.a == o.a && k.city == o.city }
+fn (k: &Key2) hash(): u64 { return hash.sipWords(u64(k.a), k.city.hash(), 0) }
+
+fn cities(): []str {
+    return ["Amsterdam", "Athens", "Berlin", "Bergen", "Dublin", "Helsinki", "Lisbon", "London",
+            "Madrid", "Milan", "Munich", "Oslo", "Paris", "Prague", "Rome", "Seville",
+            "Stockholm", "Vienna", "Warsaw", "Zurich"]
+}
+
+fn rowsOf(n: int): []Row {
+    let cs = cities()
+    var rs: []Row = withCapacity(n)
+    for i in 0..n {
+        append(mut &rs, Row{a: i % 1000, city: cs[(i * 7) % 20], price: Decimal.fromUnits(i % 100000, 2)})
+    }
+    return rs
+}
+
+fn groupOne(rows: &[]Row, lo: int, hi: int): Map[str, Agg] {
+    var m: Map[str, Agg] = newMap()
+    for i in lo..hi {
+        let r = &rows[i]
+        let g = m.atOrPut(r.city, Agg{n: 0, sum: Decimal.zero()})
+        g.n += 1
+        g.sum = g.sum.add(r.price)
+    }
+    return m
+}
+
+fn groupSerial(rows: &[]Row): int {
+    let m = groupOne(rows, 0, len(rows))
+    var k = 0
+    for i in 0..m.size() { let g = m.valAt(i); k += g.n + len(m.keyAt(i)) }
+    return k + m.size()
+}
+
+fn groupChunk(rows: &[]Row, c: &int): Map[str, Agg] {
+    let n = len(rows)
+    let per = (n + 15) / 16
+    let lo = c * per
+    let hi = min(n, lo + per)
+    return groupOne(rows, lo, hi)
+}
+
+fn mergeInto(into: mut &Map[str, Agg], m: &Map[str, Agg]) {
+    for i in 0..m.size() {
+        let g = into.atOrPut(m.keyAt(i), Agg{n: 0, sum: Decimal.zero()})
+        let o = m.valAt(i)
+        g.n += o.n
+        g.sum = g.sum.add(o.sum)
+    }
+}
+
+fn groupParallel(rows: &[]Row): int {
+    var chunks: []int = []
+    for c in 0..16 { append(mut &chunks, c) }
+    var all: Map[str, Agg] = newMap()
+    for part in par.map(&chunks, fn(c): Map[str, Agg] { return groupChunk(&rows, c) }) { mergeInto(mut &all, &part) }
+    var k = 0
+    for i in 0..all.size() { let g = all.valAt(i); k += g.n + len(all.keyAt(i)) }
+    return k + all.size()
+}
+
+fn distinctOne(rows: &[]Row, lo: int, hi: int): Map[Key2, int] {
+    var m: Map[Key2, int] = newMap()
+    for i in lo..hi {
+        let r = &rows[i]
+        let g = m.atOrPut(Key2{a: r.a, city: r.city}, 0)
+        g += 1
+    }
+    return m
+}
+
+fn distinctSerial(rows: &[]Row): int {
+    let m = distinctOne(rows, 0, len(rows))
+    var k = 0
+    for i in 0..m.size() { k += m.valAt(i) }
+    return k + m.size()
+}
+
+fn distinctChunk(rows: &[]Row, c: &int): Map[Key2, int] {
+    let n = len(rows)
+    let per = (n + 15) / 16
+    let lo = c * per
+    return distinctOne(rows, lo, min(n, lo + per))
+}
+
+fn distinctParallel(rows: &[]Row): int {
+    var chunks: []int = []
+    for c in 0..16 { append(mut &chunks, c) }
+    var all: Map[Key2, int] = newMap()
+    for part in par.map(&chunks, fn(c): Map[Key2, int] { return distinctChunk(&rows, c) }) {
+        for i in 0..part.size() {
+            let g = all.atOrPut(part.keyAt(i), 0)
+            g += part.valAt(i)
+        }
+    }
+    var k = 0
+    for i in 0..all.size() { k += all.valAt(i) }
+    return k + all.size()
+}
+
+// A read-only build map: 20 city names to a count.
+fn buildMap(): Map[str, int] {
+    let cs = cities()
+    var m: Map[str, int] = newMap()
+    for i in 0..20 { m.put(cs[i], i + 1) }
+    return m
+}
+
+fn probeOne(m: &Map[str, int], rows: &[]Row, lo: int, hi: int): int {
+    var k = 0
+    for i in lo..hi { k += m.getOr(&(rows[i].city), 0) }
+    return k
+}
+
+fn probeSerial(m: &Map[str, int], rows: &[]Row): int {
+    return probeOne(m, rows, 0, len(rows))
+}
+
+fn probeChunk(m: &Map[str, int], rows: &[]Row, c: &int): int {
+    let n = len(rows)
+    let per = (n + 15) / 16
+    let lo = c * per
+    return probeOne(m, rows, lo, min(n, lo + per))
+}
+
+fn probeParallel(m: &Map[str, int], rows: &[]Row): int {
+    var chunks: []int = []
+    for c in 0..16 { append(mut &chunks, c) }
+    var k = 0
+    for n in par.map(&chunks, fn(c): int { return probeChunk(&m, &rows, c) }) { k += n }
+    return k
+}
+
+fn exprOne(rows: &[]Row, lo: int, hi: int): int {
+    var b = newStrBuf()
+    for i in lo..hi {
+        let r = &rows[i]
+        b.add(&((r.a + r.a).toStr() + "\t"))
+        b.add(&((r.price.mul(Decimal.fromInt(2))).toStr() + "\t"))
+        b.add(&(strings.toUpperAscii(&(r.city)) + "\n"))
+    }
+    return len(b.toStr())
+}
+
+fn exprSerial(rows: &[]Row): int { return exprOne(rows, 0, len(rows)) }
+
+fn exprChunk(rows: &[]Row, c: &int): int {
+    let n = len(rows)
+    let per = (n + 15) / 16
+    let lo = c * per
+    return exprOne(rows, lo, min(n, lo + per))
+}
+
+fn exprParallel(rows: &[]Row): int {
+    var chunks: []int = []
+    for c in 0..16 { append(mut &chunks, c) }
+    var k = 0
+    for n in par.map(&chunks, fn(c): int { return exprChunk(&rows, c) }) { k += n }
+    return k
+}
+
+fn ms(ns: int): str { return (ns / 1000000).toStr() }
+
+fn main() {
+    let a = args()
+    let mode = a[1]
+    let n = strings.parseInt(&a[2]).unwrap()
+    let rounds = strings.parseInt(&a[3]).unwrap()
+    let rows = rowsOf(n)
+    let bm = buildMap()
+    var check = 0
+    for r in 0..rounds {
+        let t0 = time.monotonicNs()
+        if mode == "group1" { check += groupSerial(&rows) }
+        else if mode == "groupN" { check += groupParallel(&rows) }
+        else if mode == "distinct1" { check += distinctSerial(&rows) }
+        else if mode == "distinctN" { check += distinctParallel(&rows) }
+        else if mode == "join1" { check += probeSerial(&bm, &rows) }
+        else if mode == "joinN" { check += probeParallel(&bm, &rows) }
+        else if mode == "expr1" { check += exprSerial(&rows) }
+        else { check += exprParallel(&rows) }
+        let t1 = time.monotonicNs()
+        println(mode + "\t" + ms(t1 - t0) + "\t" + check.toStr())
+    }
+}

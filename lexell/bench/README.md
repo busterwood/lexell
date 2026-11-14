@@ -185,6 +185,15 @@ benchmarks and do the same work, written the Lexell way: `Option[Node]` links
 instead of nullable references, the list `sum` recursing over borrows,
 `StrBuf` for building identifiers.
 
+## Parallel map
+
+`par.lxl` measures `par.map`'s kernels and the cost of a call
+(design/parallel.md 6.2). `par_db.lxl` and `par_copy.lxl` apply it to work
+shaped like lexdb's (aggregation, DISTINCT, hash probes, expressions, and
+the wide COPY parse/encode). `par_db_run.py` runs the matrix and writes its
+TSV; design/par-db-perf.md gives the results, the profiles and the
+projections.
+
 ## Notes
 
 - **Native and C.** The native backend is ahead on allocation and strings

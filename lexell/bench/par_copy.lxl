@@ -1,0 +1,308 @@
+// par_copy: the CPU work of a wide COPY, as a loop or on par.map's pool.
+// The data is the 12-column load of design/lexdb.md 9.118 (w1m.tsv).
+//     par_copy split1|splitN   FILE N R [CHUNKS]   split fields only, owned fields
+//     par_copy splitB1|splitBN FILE ...            split fields only, borrowed fields
+//     par_copy parse1|parseN   FILE ...            split and parse, owned
+//     par_copy parseB1|parseBN FILE ...            split and parse, borrowed
+//     par_copy all1|allN       FILE ...            split, parse, encode, owned
+//     par_copy borrow1|borrowN FILE ...            split, parse, encode, borrowed
+// Run with LXL_PAR=0, 1, 3, 7 for 1, 2, 4 and 8 threads. N caps the lines
+// read; CHUNKS is the number of par.map items (default 16).
+import "par"
+import "strings"
+import "binary"
+import "time"
+
+fn hexVal(c: byte): int {
+    if c >= '0' && c <= '9' { return int(c) - 48 }
+    if c >= 'a' && c <= 'f' { return int(c) - 87 }
+    if c >= 'A' && c <= 'F' { return int(c) - 55 }
+    return 0
+}
+
+type Words = value record { a: int; b: int }
+type Span = value record { lo: int; hi: int }
+
+// The 32 hex digits of a uuid, as two words (what uuidBytes makes: 16 bytes).
+fn uuidWords(s: &str): Words {
+    var a = 0
+    var b = 0
+    var k = 0
+    for i in 0..len(s) {
+        let c = s[i]
+        if c == '-' { continue }
+        if k < 16 { a = (a << 4) | hexVal(c) } else { b = (b << 4) | hexVal(c) }
+        k += 1
+    }
+    return Words{a: a, b: b}
+}
+
+fn d2(s: &str, at: int): int { return (int(s[at]) - 48) * 10 + (int(s[at + 1]) - 48) }
+fn d4(s: &str, at: int): int { return (int(s[at]) - 48) * 1000 + (int(s[at + 1]) - 48) * 100 + (int(s[at + 2]) - 48) * 10 + (int(s[at + 3]) - 48) }
+
+// lexdb_time's fastTs, as COPY's fast path uses it: a plain ISO date or
+// timestamp, with no words like 'today' and no zone name.
+fn fastDate(s: &str): int {
+    let y = d4(s, 0)
+    let mo = d2(s, 5)
+    let d = d2(s, 8)
+    return y * 372 + mo * 31 + d
+}
+
+fn fastTs(s: &str): int {
+    let y = d4(s, 0)
+    let mo = d2(s, 5)
+    let d = d2(s, 8)
+    let hh = d2(s, 11)
+    let mi = d2(s, 14)
+    let ss = d2(s, 17)
+    var us = d2(s, 20) * 10000 + d2(s, 22) * 100 + d2(s, 24)
+    us += ((y * 372 + mo * 31 + d) * 24 + hh) * 3600000000 + mi * 60000000 + ss * 1000000
+    return us
+}
+
+fn splitOnly(line: &str): int {
+    let fs = strings.splitByte(line, '\t')
+    var n = len(fs)
+    for f in fs { n += len(f) }
+    return n
+}
+
+fn parseOnly(line: &str): int {
+    let fs = strings.splitByte(line, '\t')
+    let id = strings.parseInt(&fs[0]).unwrap()
+    let a = strings.parseInt(&fs[1]).unwrap()
+    let b = strings.parseInt(&fs[2]).unwrap()
+    let amt = Decimal.parse(&fs[3]).unwrap()
+    var f = 0.0f
+    if !parseFloat(&fs[4], mut &f) { f = 0.0f }
+    let d = fastDate(&fs[7])
+    let ts = fastTs(&fs[8])
+    let flag = fs[9] == "1"
+    let u = uuidWords(&fs[10])
+    return (id % 1000003) + (a % 1000003) + (b % 1000003) + (d % 1000003) + (ts % 1000003) + (if flag { 1 } else { 0 }) + (u.a % 1000003) + (u.b % 1000003) + amt.scale() + (int(f) % 1000003)
+}
+
+fn encodeAll(line: &str): int {
+    let fs = strings.splitByte(line, '\t')
+    let id = strings.parseInt(&fs[0]).unwrap()
+    let a = strings.parseInt(&fs[1]).unwrap()
+    let b = strings.parseInt(&fs[2]).unwrap()
+    let amt = Decimal.parse(&fs[3]).unwrap()
+    var f = 0.0f
+    if !parseFloat(&fs[4], mut &f) { f = 0.0f }
+    let d = fastDate(&fs[7])
+    let ts = fastTs(&fs[8])
+    let flag = fs[9] == "1"
+    let u = uuidWords(&fs[10])
+    // the fixed form: a header, a null bitmap, the fixed-size values, then
+    // the variable part's ends and its bytes (encFixed, 9.119)
+    let varlen = len(fs[5]) + len(fs[6]) + len(fs[11]) + len(amt.toBin())
+    var row: []byte = withCapacity(3 + 2 + 8 + 4 + 8 + 8 + 4 + 8 + 8 + 1 + 16 + 2 * 4 + varlen)
+    append(mut &row, byte(7))
+    binary.appendU16LE(mut &row, 0)
+    append(mut &row, byte(0))
+    append(mut &row, byte(0))
+    binary.appendU64LE(mut &row, id)
+    binary.appendU32LE(mut &row, a)
+    binary.appendU64LE(mut &row, b)
+    binary.appendU64LE(mut &row, int(f))
+    binary.appendU32LE(mut &row, d)
+    binary.appendU64LE(mut &row, ts)
+    append(mut &row, if flag { byte(1) } else { byte(0) })
+    binary.appendU64LE(mut &row, u.a)
+    binary.appendU64LE(mut &row, u.b)
+    var end = 0
+    end += len(fs[5]); binary.appendU16LE(mut &row, end)
+    end += len(fs[6]); binary.appendU16LE(mut &row, end)
+    end += len(fs[11]); binary.appendU16LE(mut &row, end)
+    end += len(amt.toBin()); binary.appendU16LE(mut &row, end)
+    appendStr(mut &row, fs[5])
+    appendStr(mut &row, fs[6])
+    appendStr(mut &row, fs[11])
+    appendStr(mut &row, amt.toBin())
+    return len(row)
+}
+
+fn splitBorrow(line: &str): int {
+    let fs = strings.split(line, "\t")
+    var n = len(fs)
+    for f in fs { n += len(f) }
+    return n
+}
+
+fn parseBorrowOnly(line: &str): int {
+    let fs = strings.split(line, "\t")
+    let id = strings.parseInt(fs[0]).unwrap()
+    let a = strings.parseInt(fs[1]).unwrap()
+    let b = strings.parseInt(fs[2]).unwrap()
+    let amt = Decimal.parse(fs[3]).unwrap()
+    var f = 0.0f
+    if !parseFloat(fs[4], mut &f) { f = 0.0f }
+    let d = fastDate(fs[7])
+    let ts = fastTs(fs[8])
+    let flag = fs[9] == "1"
+    let u = uuidWords(fs[10])
+    return (id % 1000003) + (a % 1000003) + (b % 1000003) + (d % 1000003) + (ts % 1000003) + (if flag { 1 } else { 0 }) + (u.a % 1000003) + (u.b % 1000003) + amt.scale() + (int(f) % 1000003)
+}
+
+fn encodeBorrow(line: &str): int {
+    let fs = strings.split(line, "\t")
+    let id = strings.parseInt(fs[0]).unwrap()
+    let a = strings.parseInt(fs[1]).unwrap()
+    let b = strings.parseInt(fs[2]).unwrap()
+    let amt = Decimal.parse(fs[3]).unwrap()
+    var f = 0.0f
+    if !parseFloat(fs[4], mut &f) { f = 0.0f }
+    let d = fastDate(fs[7])
+    let ts = fastTs(fs[8])
+    let flag = fs[9] == "1"
+    let u = uuidWords(fs[10])
+    let amtBin = amt.toBin()
+    let varlen = len(fs[5]) + len(fs[6]) + len(fs[11]) + len(amtBin)
+    var row: []byte = withCapacity(3 + 2 + 8 + 4 + 8 + 8 + 4 + 8 + 8 + 1 + 16 + 2 * 4 + varlen)
+    append(mut &row, byte(7))
+    binary.appendU16LE(mut &row, 0)
+    append(mut &row, byte(0))
+    append(mut &row, byte(0))
+    binary.appendU64LE(mut &row, id)
+    binary.appendU32LE(mut &row, a)
+    binary.appendU64LE(mut &row, b)
+    binary.appendU64LE(mut &row, int(f))
+    binary.appendU32LE(mut &row, d)
+    binary.appendU64LE(mut &row, ts)
+    append(mut &row, if flag { byte(1) } else { byte(0) })
+    binary.appendU64LE(mut &row, u.a)
+    binary.appendU64LE(mut &row, u.b)
+    var end = 0
+    end += len(fs[5]); binary.appendU16LE(mut &row, end)
+    end += len(fs[6]); binary.appendU16LE(mut &row, end)
+    end += len(fs[11]); binary.appendU16LE(mut &row, end)
+    end += len(amtBin); binary.appendU16LE(mut &row, end)
+    appendStr(mut &row, fs[5])
+    appendStr(mut &row, fs[6])
+    appendStr(mut &row, fs[11])
+    appendStr(mut &row, amtBin)
+    return len(row)
+}
+
+fn partSplitB(lines: &[str], c: &int, nc: int): int {
+    let sp = chunkRange(len(lines), c, nc)
+    var k = 0
+    for i in sp.lo..sp.hi { k = (k + splitBorrow(&lines[i])) % 1000000007 }
+    return k
+}
+
+fn partParseB(lines: &[str], c: &int, nc: int): int {
+    let sp = chunkRange(len(lines), c, nc)
+    var k = 0
+    for i in sp.lo..sp.hi { k = (k + parseBorrowOnly(&lines[i])) % 1000000007 }
+    return k
+}
+
+fn partAllB(lines: &[str], c: &int, nc: int): int {
+    let sp = chunkRange(len(lines), c, nc)
+    var k = 0
+    for i in sp.lo..sp.hi { k = (k + encodeBorrow(&lines[i])) % 1000000007 }
+    return k
+}
+
+fn chunkRange(n: int, c: &int, nc: int): Span {
+    let per = (n + nc - 1) / nc
+    let lo = c * per
+    return Span{lo: lo, hi: min(n, lo + per)}
+}
+
+fn oneSplit(lines: &[str], lo: int, hi: int): int {
+    var k = 0
+    for i in lo..hi { k = (k + splitOnly(&lines[i])) % 1000000007 }
+    return k
+}
+
+fn oneParse(lines: &[str], lo: int, hi: int): int {
+    var k = 0
+    for i in lo..hi { k = (k + parseOnly(&lines[i])) % 1000000007 }
+    return k
+}
+
+fn oneAll(lines: &[str], lo: int, hi: int): int {
+    var k = 0
+    for i in lo..hi { k = (k + encodeAll(&lines[i])) % 1000000007 }
+    return k
+}
+
+fn oneSplitB(lines: &[str], lo: int, hi: int): int {
+    var k = 0
+    for i in lo..hi { k = (k + splitBorrow(&lines[i])) % 1000000007 }
+    return k
+}
+
+fn oneParseB(lines: &[str], lo: int, hi: int): int {
+    var k = 0
+    for i in lo..hi { k = (k + parseBorrowOnly(&lines[i])) % 1000000007 }
+    return k
+}
+
+fn oneAllB(lines: &[str], lo: int, hi: int): int {
+    var k = 0
+    for i in lo..hi { k = (k + encodeBorrow(&lines[i])) % 1000000007 }
+    return k
+}
+
+fn partSplit(lines: &[str], c: &int, nc: int): int {
+    let sp = chunkRange(len(lines), c, nc)
+    return oneSplit(lines, sp.lo, sp.hi)
+}
+
+fn partParse(lines: &[str], c: &int, nc: int): int {
+    let sp = chunkRange(len(lines), c, nc)
+    return oneParse(lines, sp.lo, sp.hi)
+}
+
+fn partAll(lines: &[str], c: &int, nc: int): int {
+    let sp = chunkRange(len(lines), c, nc)
+    return oneAll(lines, sp.lo, sp.hi)
+}
+
+fn ms(ns: int): str { return (ns / 1000000).toStr() }
+
+fn main() {
+    let a = args()
+    let mode = a[1]
+    var text = ""
+    if readFile(a[2], mut &text) != 0 { exit(1) }
+    let n = strings.parseInt(&a[3]).unwrap()
+    let rounds = strings.parseInt(&a[4]).unwrap()
+    let nc = if len(a) > 5 { strings.parseInt(&a[5]).unwrap() } else { 16 }
+    var all: []str = strings.splitByte(&text, '\n')
+    let end = if len(all) > 0 && all[len(all) - 1] == "" { len(all) - 1 } else { len(all) }
+    // a borrow of the line views, not the owned slice: the closure copies no counts
+    let lines: &[str] = &all[0..min(end, n)]
+    var chunks: []int = []
+    for c in 0..nc { append(mut &chunks, c) }
+    var check = 0
+    for r in 0..rounds {
+        let t0 = time.monotonicNs()
+        if mode == "split1" { check += oneSplit(lines, 0, len(lines)) }
+        else if mode == "splitN" {
+            for k in par.map(&chunks, fn(c): int { return partSplit(lines, c, nc) }) { check += k }
+        } else if mode == "splitB1" { check += oneSplitB(lines, 0, len(lines)) }
+        else if mode == "splitBN" {
+            for k in par.map(&chunks, fn(c): int { return partSplitB(lines, c, nc) }) { check += k }
+        } else if mode == "parseB1" { check += oneParseB(lines, 0, len(lines)) }
+        else if mode == "parseBN" {
+            for k in par.map(&chunks, fn(c): int { return partParseB(lines, c, nc) }) { check += k }
+        } else if mode == "borrow1" { check += oneAllB(lines, 0, len(lines)) }
+        else if mode == "borrowN" {
+            for k in par.map(&chunks, fn(c): int { return partAllB(lines, c, nc) }) { check += k }
+        } else if mode == "parse1" { check += oneParse(lines, 0, len(lines)) }
+        else if mode == "parseN" {
+            for k in par.map(&chunks, fn(c): int { return partParse(lines, c, nc) }) { check += k }
+        } else if mode == "all1" { check += oneAll(lines, 0, len(lines)) }
+        else {
+            for k in par.map(&chunks, fn(c): int { return partAll(lines, c, nc) }) { check += k }
+        }
+        let t1 = time.monotonicNs()
+        println(mode + "\t" + ms(t1 - t0) + "\t" + check.toStr())
+    }
+}
