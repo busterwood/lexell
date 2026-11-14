@@ -389,10 +389,13 @@ backends:
 - each refusal of the kernel pass;
 - traps, overflow, stack overflow and Decimal's stop on workers.
 
-A stress program (4 tasks mapping 600 rounds of up to 2,000 records with
-strings, Maps and arrays) gave the same output in 50 of 50 runs at the
-default pool size, at `LXL_PAR` 1, 2 and 15, at `LXL_PAR=0`, and on the C
-backend, all with no leak under `LXL_CHECK=1`.
+Two stress programs, both with no leak under `LXL_CHECK=1` in any run:
+- **Smaller:** 4 tasks mapping 300 rounds of up to 200 records with strings,
+  Maps and arrays. The same output at the default pool size (6 runs), at
+  `LXL_PAR` 1, 2 and 15, at `LXL_PAR=0`, and on the C backend.
+- **Larger:** 600 rounds of up to 2,000 records. Its output matched
+  `LXL_PAR=0`'s in every one of 85 runs at the default pool size, spread over
+  the builds of stages 4 and 5.
 
 ### 6.3 Not done
 
