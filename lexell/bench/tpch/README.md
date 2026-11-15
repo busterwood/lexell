@@ -16,7 +16,8 @@ suite in `~/Work/lexdb-bench/hp` do not.
 
 | file | what |
 |---|---|
-| `schema.sql` | the TPC-H tables, primary keys, no foreign keys |
+| `schema.sql` | the TPC-H tables and primary keys, no foreign keys |
+| `indexes.sql` | the conventional secondary index set, built after the load |
 | `queries/q1.sql` … `q22.sql` | the 22 queries, fixed substitution values |
 | `fetch.sh` | clone and build dbgen (tpch-kit, pinned commit) |
 | `run.sh` | generate, load, warm, time, compare; one server at a time |
@@ -59,8 +60,10 @@ plan and exits without generating, starting or measuring anything.
 - **CPU:** the server's cgroup (`CPUUsageNSec` of its transient systemd
   unit) across the same psql call, so it includes any checkpoint or
   background work that lands in the query.
-- **Load:** `\copy` of each `dbgen` table through psql, per table, then
-  `ANALYZE` (PostgreSQL: `VACUUM (ANALYZE)`), timed separately.
+- **Load and indexes:** `\copy` of each `dbgen` table through psql, per
+  table; then the secondary index set (`indexes.sql`, unless
+  `TPCH_INDEXES=none`), timed separately; then `ANALYZE` (PostgreSQL:
+  `VACUUM (ANALYZE)`), timed separately.
 - **Runs:** one unrecorded warm run per query, then RUNS timed runs; the
   TSV keeps median/min/max. Every run's row count and MD5 are checked
   against the warm run; a failure or a changed result is a finding, not a
@@ -92,8 +95,9 @@ too. The `pg1` column sets
 
 Output: `WORKDIR/out/lexdb.tsv`, `pg1.tsv`, `pg4.tsv` (one row per query:
 name, rows, median/min/max wall ms, median/min/max CPU ms, MD5, status),
-`load-*.tsv` and `analyze-*.ms`, `config.txt` (the quotas, buffers and
-versions actually used), and `summary.md` / `summary.txt`.
+`load-*.tsv` and `analyze-*.ms`, `index-*.ms` (the secondary-index build),
+`config.txt` (the quotas, buffers and versions actually used), and
+`summary.md` / `summary.txt`.
 
 ## Options
 
@@ -105,6 +109,7 @@ versions actually used), and `summary.md` / `summary.txt`.
 | `PG_SHARED_BUFFERS` | `12GB` | PostgreSQL `shared_buffers` |
 | `QUERY_TIMEOUT` | `900` | seconds per query; lexdb cancels on the server, psql gets 30 s more |
 | `TPCH_CPUS` | `0-7` | CPUs both servers are confined to; empty for none |
+| `TPCH_INDEXES` | `conventional` | secondary indexes after the load; `none` for PKs only |
 | `LEXDB_CACHE_MB` | lexdb's default | passed to lexdb |
 | `LEXDB_CPU_QUOTA` | unset | lexdb's cgroup quota; `400%` budget-matches PG |
 | `PG_CPU_QUOTA` | unset | PostgreSQL's cgroup quota; unset for none |
@@ -141,7 +146,11 @@ rm -rf "$W/lexdb" "$W/lexdb.loaded"
 - No RF1/RF2 refresh functions. This measures the query half of TPC-H.
 - No foreign keys: the spec has them, but they do not affect a plan after
   the load and checking them on 60M rows would measure the load. Say so if
-  the schema is described.
+  the schema is described. Secondary indexes are in `indexes.sql`, built
+  after the load and timed separately; `TPCH_INDEXES=none` gives the PK-only
+  baseline. Without `lineitem(l_partkey, l_suppkey)` q17 and q20 scan
+  `lineitem` once per candidate row on both engines. The set is the same on
+  both, though a planner may still choose a scan.
 - Checksums can differ on decimal formatting even when the values agree;
   the summary marks those `different result` rather than asserting a bug.
   Compare the values with a separate query before treating a difference as

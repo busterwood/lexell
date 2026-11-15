@@ -28,6 +28,7 @@
 #                             default WORKDIR/tpch-kit/dbgen/dbgen
 #   PG_SHARED_BUFFERS=12GB
 #   TPCH_CPUS=0-7             CPUs both servers are confined to
+#   TPCH_INDEXES=conventional secondary index set, or none for PKs only
 #   QUERY_TIMEOUT=900         seconds per query; lexdb cancels on the server
 #                             (statement_timeout), psql gets 30 s more
 #   LEXDB_CACHE_MB=N          passed to lexdb when set
@@ -67,6 +68,7 @@ UNIT_P=tpch-pg
 PG_SHARED_BUFFERS=${PG_SHARED_BUFFERS:-12GB}
 QUERY_TIMEOUT=${QUERY_TIMEOUT:-900}
 TPCH_CPUS=${TPCH_CPUS:-0-7}
+TPCH_INDEXES=${TPCH_INDEXES:-conventional}
 LEXDB_CPU_QUOTA=${LEXDB_CPU_QUOTA:-}
 PG_CPU_QUOTA=${PG_CPU_QUOTA:-}
 MODES=${TPCH_ONLY:-lexdb,pg1,pg4}
@@ -86,6 +88,10 @@ for m in $MODES; do
         *) echo "run.sh: unknown mode '$m' in TPCH_ONLY" >&2; exit 2 ;;
     esac
 done
+case $TPCH_INDEXES in
+    conventional|none) ;;
+    *) echo "run.sh: TPCH_INDEXES must be conventional or none" >&2; exit 2 ;;
+esac
 
 [ -x "$BIN" ] || { echo "run.sh: $BIN is not an executable" >&2; exit 2; }
 case $QUERY_TIMEOUT in
@@ -215,6 +221,14 @@ load_tables() {
         total=$((total + ms))
         printf 'load  %-6s %-8s %9s rows  %7d ms\n' "$label" "$t" "$n" "$ms"
     done
+    local i0 i1
+    i0=$(date +%s%N)
+    if [ "$TPCH_INDEXES" = conventional ]; then
+        psql_at "$port" -f "$HERE/indexes.sql"
+    fi
+    i1=$(date +%s%N)
+    echo $(( (i1 - i0) / 1000000 )) > "$OUT/index-$label.ms"
+    printf 'load  %-6s indexes %d ms\n' "$label" "$(( (i1 - i0) / 1000000 ))"
     local a0 a1
     a0=$(date +%s%N)
     if [ "$label" = pg ]; then
@@ -291,6 +305,7 @@ rm -f "$OUT"/lexdb.tsv "$OUT"/pg1.tsv "$OUT"/pg4.tsv \
     printf 'runs\t%s\n' "$RUNS"
     printf 'modes\t%s\n' "$MODES"
     printf 'cpus\t%s\n' "${TPCH_CPUS:-all}"
+    printf 'indexes\t%s\n' "$TPCH_INDEXES"
     printf 'lexdb_binary\t%s\n' "$BIN"
     printf 'lexdb_cpu_quota\t%s\n' "${LEXDB_CPU_QUOTA:-none}"
     printf 'lexdb_cache_mb\t%s\n' "${LEXDB_CACHE_MB:-default}"

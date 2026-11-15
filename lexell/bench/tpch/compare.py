@@ -81,6 +81,7 @@ def main():
     wall_ratios, cpu_ratios, wall4_ratios = [], [], []
     level = 0
     failed = 0
+    different = 0
     for q in names:
         l, g, g4 = lex.get(q), pg1.get(q), pg4.get(q)
         status = "ok"
@@ -89,7 +90,7 @@ def main():
             failed += 1
         elif l and g and (l["rows"] != g["rows"] or l["md5"] != g["md5"]):
             status = "different result"
-            failed += 1
+            different += 1
         usable = (l and g and l["status"] == "ok" and g["status"] == "ok")
         if usable:
             r = ratio(l["wall"], g["wall"])
@@ -123,6 +124,8 @@ def main():
                      % (gm(wall4_ratios), len(wall4_ratios)))
     if failed:
         lines.append("- queries that failed: **%d**" % failed)
+    if different:
+        lines.append("- queries with different result text (check formatting before treating as an error): **%d**" % different)
 
     ltab = load_tables(os.path.join(outdir, "load-lexdb.tsv"))
     ptab = load_tables(os.path.join(outdir, "load-pg.tsv"))
@@ -147,6 +150,9 @@ def main():
         lines.append("| **total** | | **%s** | | **%s** | %s |" % (
             fmt(lt, 2), fmt(pt, 2), fmt(ratio(lt, pt) if lt and pt else None)))
         for label in ("lexdb", "pg"):
+            ipath = os.path.join(outdir, "index-%s.ms" % label)
+            if os.path.exists(ipath):
+                lines.append("\nIndex build, %s: %s s" % (label, fmt(int(open(ipath).read()) / 1000, 2)))
             path = os.path.join(outdir, "analyze-%s.ms" % label)
             if os.path.exists(path):
                 lines.append("\nANALYZE, %s: %s s" % (label, fmt(int(open(path).read()) / 1000, 2)))
