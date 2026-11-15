@@ -2984,6 +2984,51 @@ fn (db: mut &Db) lookupAhead(root: int, snap: bool, q: int, keys: &[]str, i: int
     return out
 }
 
+// Brings into memory the nodes the lookups of keys will need (lexdb.md
+// 9.132), each round's missing nodes read together as getMany reads them
+// (lookupAhead, loadMany). It reads no value and notes nothing: what the
+// caller then reads key by key (get) is as before, and so is what it notes.
+// A failed store, a cancelled snapshot or a missing version ends it
+// quietly: the reads after it give the error.
+pub fn (st: &Store) warm(t: &Txn, tree: int, keys: &[]str): Result[Unit, lexdb_base.DbErr] {
+    let n = len(keys)
+    if st.fo.isSome() || n < 2 { return Ok(Unit{}) }
+    let snap = t.snap >= 0 && !t.live
+    let sroot = if snap { match t.snapTrees.get(&tree) { Some(r) { r } None { -1 } } } else { -1 }
+    var i = 0
+    while i < n {
+        var ahead: []int = []
+        st.sh.with(fn(db: mut &Db) {
+            if len(db.failed) > 0 || (snap && db.snapGone(t.snap)) {
+                i = n
+                return
+            }
+            let root = if snap { sroot } else { match db.trees.get(&tree) { Some(r) { r } None { -1 } } }
+            if root < 0 {
+                i = n
+                return
+            }
+            let q = if snap { t.snapSeq } else { db.seq }
+            var f = newFinger()
+            while i < n {
+                var need = -1
+                let d = db.fingerTo(mut &f, root, snap, q, &keys[i], mut &need)
+                if d == -2 {
+                    i = n
+                    return
+                }
+                if d == -1 {
+                    ahead = db.lookupAhead(root, snap, q, keys, i, need)
+                    return
+                }
+                i += 1
+            }
+        })
+        if len(ahead) > 0 { try st.loadMany(&ahead) }
+    }
+    return Ok(Unit{})
+}
+
 // The pages of tree and of its companion (large values), as the latest
 // commit has them: for pg_relation_size and the like. The interior nodes
 // are read (loaded if they are not in the cache); the leaves under the

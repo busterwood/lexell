@@ -12119,3 +12119,39 @@ passes alternating; `~/Work/lexdb-bench/ds/run.sh`; the passes agree within
   only where the drive reports it (`queue/fua`: 1 on both drives here).
 - The checkpoint's page writes still end with `fdatasync` (one per
   checkpoint, many pages).
+
+### 9.132 IN lists' keys read ahead (Store.warm)
+
+9.130's read ahead reached only `getMany`'s callers. A list of primary keys
+(`id in (...)`, an IN subquery's or an array's values) is a list of point
+scans (`pathScans`), read key by key by `fetch`'s `get` in the row path and
+in the batch loops (`batchLevel`, `eachOut`, `sortBatches`, `winBatch`).
+
+**Now:** before such a list is read, `warmPoints` gives its keys to
+`Store.warm`: the keys' paths are followed through the nodes in memory and
+each round's missing nodes are read together (`lookupAhead`, `loadMany`),
+as `getMany` reads them. `warm` reads no value and notes nothing, so what
+the list's reads then give and note is as before, writes and locking reads
+included. A failed store, a cancelled snapshot or a missing version ends it
+quietly; the reads after it give the error.
+
+**Measured** (`~/Work/lexdb-bench/la`, `cold.py`, on a settled copy of bd_ob:
+every table vacuumed (column leaves) and checkpointed, a fresh copy per
+build; cold, 5 runs, ms):
+
+| Query | main | 9.130 | 9.132 |
+|---|---:|---:|---:|
+| `in1000` (1,000 keys scattered over w) | 132 | 132 | 57 |
+| `idx_range1k` | 99 | 35 | 30 |
+| `idx_range5k` | 354 | 80 | 80 |
+| `join_d_w` | 93 | 23 | 23 |
+| `idx_range20k` | 144 | 193 | 194 |
+| `idx_range50k` | 208 | 229 | 226 |
+
+The dense ranges (20k and 50k rows) are the cost model's (optimizer 45).
+A note on method: bd_ob's tables were written before column leaves, and
+scans convert leaves as they read them (9.114), so a copy's layout changed
+as the benchmark ran (the file grew 169 to 191 MB, and cold reads on it
+slowed by up to 4 times). Cold benchmarks need a settled copy.
+
+The suite passes (170).
