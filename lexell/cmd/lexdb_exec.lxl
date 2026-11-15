@@ -2115,8 +2115,8 @@ pub fn eval(x: &Expr, env: &Env): Result[Val, DbErr] {
                 }
                 return Ok(vs[0])
             }
-            if lexdb_tsqlfn.isTsqlFn(&name) {
-                match try lexdb_tsqlfn.call(&name, &vs, &envZone(env)) {
+            if isDialectFn(&name) {
+                match try callDialectFn(&name, &vs, &envZone(env)) {
                     Some(v) { return Ok(v) }
                     None {}
                 }
@@ -2267,7 +2267,7 @@ type FnB = record {
     name: str
     way: int
     id: int                 // FN_ONE: call1's
-    tsql: bool              // a T-SQL function's name: lexdb_tsqlfn.call first, as eval
+    dialect: bool           // a T-SQL or Oracle function's name: callDialectFn first, as eval
 }
 
 type CX = closed {
@@ -2307,13 +2307,23 @@ fn cenvOf(seq: Option[SeqEnv]): CEnv {
     return CEnv{seq: seq, now: now, zone: z}
 }
 
+// Whether name is a T-SQL or Oracle function that lexdb's own functions do
+// not cover (lexdb_tsqlfn, lexdb_orafn).
+fn isDialectFn(name: &str): bool { return lexdb_tsqlfn.isTsqlFn(name) || lexdb_orafn.isOraFn(name) }
+
+// The call of a dialect function (isDialectFn).
+fn callDialectFn(name: &str, vs: &[]Val, z: &lexdb_time.Zone): Result[Option[Val], DbErr] {
+    if lexdb_orafn.isOraFn(name) { return lexdb_orafn.call(name, vs, z) }
+    return lexdb_tsqlfn.call(name, vs, z)
+}
+
 // name's call of n arguments, bound: callAt's way for it, when none of
 // callAt's earlier ways (callMisc, callFn, callTime, ...) can take it.
 fn fnBind(name: &str, n: int): FnB {
     var way = FN_GEN
     var id = 0
-    let tsql = lexdb_tsqlfn.isTsqlFn(name)
-    if !tsql {
+    let special = isDialectFn(name)
+    if !special {
         // (callFn takes sqrt, cbrt, exp, ln and log10 first)
         if n == 1 && name != "sqrt" && name != "cbrt" && name != "exp" && name != "ln" && name != "log10" {
             id = fn1Of(name)
@@ -2323,7 +2333,7 @@ fn fnBind(name: &str, n: int): FnB {
         if name == "substr" && (n == 2 || n == 3) { way = FN_SUBSTR }
         if name == "concat" { way = FN_CONCAT }
     }
-    return FnB{name: name.toStr(), way: way, id: id, tsql: tsql}
+    return FnB{name: name.toStr(), way: way, id: id, dialect: special}
 }
 
 // x compiled; None: eval evaluates it. cols: the row's columns; params:
@@ -2478,8 +2488,8 @@ fn callB(fb: &FnB, vs: &[]Val, ce: &CEnv): Result[Val, DbErr] {
     } else if fb.way == FN_CONCAT {
         return Ok(concatOf(vs, &ce.zone))
     }
-    if fb.tsql {
-        match try lexdb_tsqlfn.call(&fb.name, vs, &ce.zone) {
+    if fb.dialect {
+        match try callDialectFn(&fb.name, vs, &ce.zone) {
             Some(v) { return Ok(v) }
             None {}
         }
