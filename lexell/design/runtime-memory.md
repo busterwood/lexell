@@ -214,8 +214,9 @@ The section 2 numbers predate the 2 MB chunks. This measures the current
 allocator with its own report, on one CPU, with no lexdb and no `par`: a
 Lexell probe allocates through `lxllib_alloc` and frees through `lxllib_free`
 in a simple pattern, then the runtime reports what is free. Host: Ryzen 7
-8745HS, `transparent_hugepage/enabled` is `always`. The instrumentation is
-`experiments/heap_trim/`; it is not in the runtime.
+8745HS, `transparent_hugepage/enabled` is `always`. The instrumentation and probes
+were on the design branch (`f881aeb4`, `e4f8adbe`), and were removed before
+the merge; the measurements are what matters here, not the report code.
 
 | Probe | Chunks | Mapped | On free lists | 4 KiB pages free | Lost to page boundaries | Whole 2 MB chunks |
 |---|---:|---:|---:|---:|---:|---:|
@@ -342,10 +343,9 @@ the 1M sort and keeps 20 chunks.
 - Worker heaps get the chunk-local lists but no trim: their queues are not
   retired. Blocks that move between heaps go to a per-heap legacy list, and a
   chunk that has lent one never reaches zero; that is conservative and safe.
-- The `hp_chunk`, `hp_freechunk`, `lxllib_heapstat` and trim hooks are
-  experiment code (about 1 MB of BSS); a production version should keep only
-  the chunk header, the retire queue and a small trim entry point, and remove
-  the report arrays.
+- The report arrays and the probe hooks were removed before the merge; what
+  remains is the chunk header, the retire queue and `lxllib_heaptrim`. The
+  free-chunk pool is a list through the chunk header, not an array.
 - The floor of four chunks and the 250 µs budget are guesses; the next
   measurement is a repeated-sort loop and a container memory limit, to see
   whether the floor causes refault thrash.
