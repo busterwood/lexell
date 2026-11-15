@@ -208,3 +208,69 @@ page splits it. The pass should give back runs of whole, aligned 2 MB (or
 accept the split where only 4 KB pages are free), and the page pool should
 hand out whole 2 MB chunks first.
 
+## 7. Measured on the current 2 MB / THP allocator (2026-11-15)
+
+The section 2 numbers predate the 2 MB chunks. This measures the current
+allocator with its own report, on one CPU, with no lexdb and no `par`: a
+Lexell probe allocates through `lxllib_alloc` and frees through `lxllib_free`
+in a simple pattern, then the runtime reports what is free. Host: Ryzen 7
+8745HS, `transparent_hugepage/enabled` is `always`. The instrumentation is
+`experiments/heap_trim/`; it is not in the runtime.
+
+| Probe | Chunks | Mapped | On free lists | 4 KiB pages free | Lost to page boundaries | Whole 2 MB chunks |
+|---|---:|---:|---:|---:|---:|---:|
+| 1M x 16 B, all transient | 16 | 32,768 KiB | 31,399 KiB | 32,768 KiB | 0 | **16 (32,768 KiB)** |
+| 800k mixed sizes, all transient | 111 | 227,328 KiB | 227,101 KiB | 227,328 KiB | 0 | **111 (227,328 KiB)** |
+| 20k live, then 800k transient freed | 14 | 28,672 KiB | 25,149 KiB | 25,792 KiB (90%) | 16 KiB (5 blocks) | **12 (24,576 KiB, 86%)** |
+| live block every 50th, transient freed | 14 | 28,672 KiB | 24,648 KiB | 2,004 KiB (7%) | 11 KiB (9 blocks) | **0** |
+| 20 batches with live clusters between | 17 | 34,816 KiB | 31,398 KiB | 31,896 KiB (92%) | 1 KiB (40 blocks) | **0** |
+
+The 4 KiB column is the count if every page covered wholly by free blocks is
+returned; the "lost" column is the free bytes on the other side of a page
+boundary, which a page-level pass would drop with the block it unlinks. It is
+small: 1 KiB in the `batches` probe, 16 KiB in the live-before one.
+
+**The whole-chunk prototype.** `lxllib_heaptrim` returns every whole, 2 MB,
+wholly free chunk but the current one, `MADV_DONTNEED`s it, and pools it for
+reuse. Measured with `VmHWM`/`VmRSS` from `/proc`:
+
+| Probe | Chunks before -> after | Heap before -> after | VmHWM | VmRSS after |
+|---|---:|---:|---:|---:|
+| 1M x 16 B, all transient | 16 -> 1 | 32,768 -> 2,048 KiB | 40.0 MiB | 10.1 MiB |
+| 20k live, then 800k transient | 14 -> 3 | 28,672 -> 6,144 KiB | 36.2 MiB | 14.2 MiB |
+| 20 batches with live clusters | 17 -> 17 | 34,816 -> 34,816 KiB | 42.2 MiB | 42.2 MiB |
+
+`VmHWM` stays at the peak, as the kernel keeps it. A refill after a trim
+reused the pooled chunks and reached the same 16 chunks, with no failure and
+no lost block. Re-touching 30 MiB of returned chunks cost 10.0 ms, or 0.33 ms a
+MiB (median of five: 18.9 ms without the trim, 28.9 ms with it, for the same
+two fills of 1M).
+
+**Pass cost.** One trim of 1M free blocks (32 MiB) took 8.5 ms (the difference
+between fill+free and fill+free+trim, seven runs). The report, which walks the
+lists twice, took 11 ms at 1M, 25 ms at 2M and 55 ms at 4M: the walk is
+dominated by cache misses over the free lists, not by the 4 KiB page scan.
+
+**What it means.**
+
+- If the live set is compact and a burst is allocated after it, whole 2 MB
+  chunks give back 86 to 100% of the heap with **no THP split and no lost free
+  bytes**. That is the section 2 `INSERT/SELECT` and held-sort shape; the 90% here
+  is close to the 88% there.
+- If live blocks are scattered through the chunks, whole chunks give back
+  **nothing** (`batches`: 0 of 17), while 4 KiB pages give back 92%. That is
+  the case in which the page pool is essential, and in which returning pages
+  splits huge pages.
+- The straddling-block loss is negligible (1 to 16 KiB), so the page-level
+  pass's real cost is the split, not the abandoned bytes.
+
+So the section 3 recommendation stands, with an order now: **whole 2 MB
+chunks first** (simple, no split, no loss), then page-level only if a
+measurement of lexdb shows that its cache leaves many pages free in chunks
+that are not wholly free. The probes above say that can happen, but they are
+synthetic; lexdb's own layout after a held sort and after a load is the next
+measurement, and it needs the user's go-ahead because it loads the machine.
+If lexdb's cache is scattered, a programme-level fix (allocate the page cache
+in its own large blocks or arena, so transient chunks stay whole) may be
+cheaper than splitting every huge page.
+

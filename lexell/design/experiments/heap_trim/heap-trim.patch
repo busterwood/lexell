@@ -1,0 +1,227 @@
+diff --git i/lexell/compiler/native/lxlrt.h w/lexell/compiler/native/lxlrt.h
+index d109c2f9..ec52b476 100644
+--- i/lexell/compiler/native/lxlrt.h
++++ w/lexell/compiler/native/lxlrt.h
+@@ -26,6 +26,8 @@ void rt_flush(void);
+ /* memory and drop actions */
+ void* rt_alloc(size_t n);
+ void rt_free(void* p);
++void lxllib_heapstat(void);
++void lxllib_heaptrim(void);
+ void rt_dpush(rt_dfn f, void* p);
+ void rt_drun(rt_dfn f, void* p);
+ void rt_free_act(void* p);
+diff --git i/lexell/compiler/native/rt.c w/lexell/compiler/native/rt.c
+index afc4ae46..1889203d 100644
+--- i/lexell/compiler/native/rt.c
++++ w/lexell/compiler/native/rt.c
+@@ -185,6 +185,15 @@ typedef struct {
+     uint64_t tag;                   /* the owner tag written into each block's header */
+ } rt_hp;
+ static rt_hp rt_mheap;
++/* EXPERIMENT (design/runtime-memory.md 2): the main heap's chunks and, for every chunk but the
++   last, where its use stopped when the next was mapped. lxllib_heapstat walks the free lists and
++   reports how much of this could be returned. Remove with the experiment. */
++#define HP_MAXCHUNKS 65536
++static char* hp_chunk[HP_MAXCHUNKS];
++static char* hp_stop[HP_MAXCHUNKS];
++static int hp_nchunks;
++static char* hp_freechunk[HP_MAXCHUNKS];   /* whole chunks returned, for reuse */
++static int hp_nfreechunks;
+ /* A par worker's context, at the top of its stack slot (design/parallel.md 2.1). rt_wme() is the
+    calling thread's, or 0 on the main thread: a stack-range test, no TLS. */
+ typedef struct { rt_dfn f; void* p; } rt_dact;
+@@ -258,8 +267,16 @@ __attribute__((noinline)) static void* sys_mmap_thp(size_t n) {
+ }
+ /* A fresh chunk for the small classes, out of line. */
+ __attribute__((noinline)) static bool heap_chunk(rt_hp* h) {
+-    char* p = sys_mmap_thp(CHUNK);
++    char* p = hp_nfreechunks > 0 ? hp_freechunk[--hp_nfreechunks] : sys_mmap_thp(CHUNK);
+     if (!p) return false;
++    if (h == &rt_mheap) {
++        if (hp_nchunks > 0) hp_stop[hp_nchunks - 1] = h->chunk_at;
++        if (hp_nchunks < HP_MAXCHUNKS) {
++            hp_chunk[hp_nchunks] = p;
++            hp_stop[hp_nchunks] = 0;
++            hp_nchunks++;
++        }
++    }
+     h->chunk_at = p + 8;
+     h->chunk_left = CHUNK - 8;
+     return true;
+@@ -438,6 +455,175 @@ static void eputd(int64_t v) {
+ }
+ static void eflush(void) { write_all(2, ebuf, elen); elen = 0; }
+ 
++/* EXPERIMENT (design/runtime-memory.md 2): how much of the main heap's chunk memory is on
++   wholly free pages, and how much of that is safely returnable. The page count is exact only
++   with no par workers (the main heap alone is walked). Remove with the experiment. */
++#define HP_PPCH ((int)(CHUNK >> 12))
++static void hp_sort_chunks(void) {
++    for (int i = 1; i < hp_nchunks; i++) {
++        char* k = hp_chunk[i];
++        char* s = hp_stop[i];
++        int j = i - 1;
++        while (j >= 0 && (uintptr_t)hp_chunk[j] > (uintptr_t)k) {
++            hp_chunk[j + 1] = hp_chunk[j];
++            hp_stop[j + 1] = hp_stop[j];
++            j--;
++        }
++        hp_chunk[j + 1] = k;
++        hp_stop[j + 1] = s;
++    }
++}
++static int hp_chunk_of(char* p) {
++    int lo = 0, hi = hp_nchunks - 1;
++    while (lo <= hi) {
++        int m = lo + (hi - lo) / 2;
++        if ((uintptr_t)hp_chunk[m] <= (uintptr_t)p) lo = m + 1; else hi = m - 1;
++    }
++    if (hi >= 0 && (uintptr_t)p < (uintptr_t)hp_chunk[hi] + CHUNK) return hi;
++    return -1;
++}
++static void hp_cover(unsigned short* cov, int ci, char* a, char* b) {
++    char* base = hp_chunk[ci];
++    char* end = base + CHUNK;
++    if (a < base) a = base;
++    if (b > end) b = end;
++    if (a >= b) return;
++    size_t p0 = (size_t)(a - base) >> 12, p1 = (size_t)(b - base - 1) >> 12;
++    for (size_t p = p0; p <= p1; p++) {
++        char* ps = base + (p << 12), * pe = ps + 4096;
++        char* lo = a > ps ? a : ps;
++        char* hi = b < pe ? b : pe;
++        cov[(size_t)ci * HP_PPCH + p] += (unsigned short)(hi - lo);
++    }
++}
++/* EXPERIMENT: return whole, 2 MiB, wholly free chunks to the system (MADV_DONTNEED), keeping
++   them in a pool for heap_chunk to reuse. Whole chunks do not split a huge page and lose no
++   free block. The current chunk stays. Remove with the experiment. */
++void lxllib_heaptrim(void) {
++    if (hp_nchunks == 0) return;
++    hp_sort_chunks();
++    int n0 = hp_nchunks;
++    size_t np = (size_t)n0 * (size_t)HP_PPCH;
++    unsigned short* cov = sys_mmap(np * sizeof *cov);
++    unsigned char* ret = sys_mmap((size_t)n0);
++    if (!cov || !ret) return;
++    int cur = hp_chunk_of(rt_mheap.chunk_at - 1);
++    for (int i = 0; i < hp_nchunks; i++) {
++        char* stop = i == cur ? rt_mheap.chunk_at : hp_stop[i];
++        hp_cover(cov, i, hp_chunk[i], hp_chunk[i] + 8);
++        if (stop) hp_cover(cov, i, stop, hp_chunk[i] + CHUNK);
++    }
++    for (int c = 0; c < NCLASS; c++) {
++        for (void* f = rt_mheap.free_list[c]; f; f = *(void**)f) {
++            char* h = (char*)f - 8;
++            int ci = hp_chunk_of(h);
++            if (ci >= 0) hp_cover(cov, ci, h, h + class_size[c] + 8);
++        }
++    }
++    for (int ci = 0; ci < hp_nchunks; ci++) {
++        size_t cf = 0;
++        for (int p = 0; p < HP_PPCH; p++) if (cov[(size_t)ci * HP_PPCH + p] == 4096) cf++;
++        ret[ci] = ci != cur && cf == (size_t)HP_PPCH;
++    }
++    for (int c = 0; c < NCLASS; c++) {
++        void* keep = 0;
++        for (void* f = rt_mheap.free_list[c]; f; ) {
++            void* nx = *(void**)f;
++            int ci = hp_chunk_of((char*)f - 8);
++            if (ci < 0 || !ret[ci]) { *(void**)f = keep; keep = f; }
++            f = nx;
++        }
++        rt_mheap.free_list[c] = keep;
++    }
++    int w = 0;
++    for (int i = 0; i < hp_nchunks; i++) {
++        if (ret[i]) {
++            SYS(S_MADVISE, hp_chunk[i], CHUNK, 4);      /* MADV_DONTNEED */
++            if (hp_nfreechunks < HP_MAXCHUNKS) hp_freechunk[hp_nfreechunks++] = hp_chunk[i];
++        } else {
++            hp_chunk[w] = hp_chunk[i];
++            hp_stop[w] = hp_stop[i];
++            w++;
++        }
++    }
++    hp_nchunks = w;
++    SYS(S_MUNMAP, cov, np * sizeof *cov, 0);
++    SYS(S_MUNMAP, ret, (size_t)n0, 0);
++}
++
++void lxllib_heapstat(void) {
++    if (hp_nchunks == 0) { eputs("Lexell heap: no chunks\n"); eflush(); return; }
++    hp_sort_chunks();
++    size_t np = (size_t)hp_nchunks * (size_t)HP_PPCH;
++    unsigned short* cov = sys_mmap(np * sizeof *cov);
++    if (!cov) { eputs("Lexell heap: no memory for the report\n"); eflush(); return; }
++    int cur = hp_chunk_of(rt_mheap.chunk_at - 1);
++    for (int i = 0; i < hp_nchunks; i++) {
++        char* stop = i == cur ? rt_mheap.chunk_at : hp_stop[i];
++        hp_cover(cov, i, hp_chunk[i], hp_chunk[i] + 8);
++        if (stop) hp_cover(cov, i, stop, hp_chunk[i] + CHUNK);
++    }
++    int64_t nblocks = 0, nbytes = 0, nstraddle = 0;
++    for (int c = 0; c < NCLASS; c++) {
++        for (void* f = rt_mheap.free_list[c]; f; f = *(void**)f) {
++            char* h = (char*)f - 8;
++            size_t bs = class_size[c] + 8;
++            int ci = hp_chunk_of(h);
++            if (ci < 0) continue;
++            if (((size_t)(h - hp_chunk[ci]) >> 12) != ((size_t)(h + bs - 1 - hp_chunk[ci]) >> 12)) nstraddle++;
++            hp_cover(cov, ci, h, h + bs);
++            nblocks++;
++            nbytes += (int64_t)bs;
++        }
++    }
++    /* Wholly covered pages can go back. A free block that straddles one into a page that
++       stays costs the bytes on the staying side: the block comes off its list, since its
++       link is in the page being returned. */
++    int64_t lost = 0, nlost = 0;
++    for (int c = 0; c < NCLASS; c++) {
++        for (void* f = rt_mheap.free_list[c]; f; f = *(void**)f) {
++            char* h = (char*)f - 8;
++            size_t bs = class_size[c] + 8;
++            int ci = hp_chunk_of(h);
++            if (ci < 0) continue;
++            size_t p0 = (size_t)(h - hp_chunk[ci]) >> 12;
++            size_t p1 = (size_t)(h + bs - 1 - hp_chunk[ci]) >> 12;
++            bool anyfull = false, anynot = false;
++            for (size_t p = p0; p <= p1; p++) {
++                if (cov[(size_t)ci * HP_PPCH + p] == 4096) anyfull = true; else anynot = true;
++            }
++            if (!(anyfull && anynot)) continue;
++            nlost++;
++            char* base = hp_chunk[ci];
++            for (size_t p = p0; p <= p1; p++) {
++                if (cov[(size_t)ci * HP_PPCH + p] == 4096) continue;
++                char* ps = base + (p << 12), * pe = ps + 4096;
++                char* lo = h > ps ? h : ps;
++                char* hi = h + bs < pe ? h + bs : pe;
++                lost += (int64_t)(hi - lo);
++            }
++        }
++    }
++    size_t full = 0, whole = 0;
++    for (int ci = 0; ci < hp_nchunks; ci++) {
++        size_t cf = 0;
++        for (int p = 0; p < HP_PPCH; p++) if (cov[(size_t)ci * HP_PPCH + p] == 4096) cf++;
++        full += cf;
++        if (cf == (size_t)HP_PPCH) whole++;
++    }
++    eputs("Lexell heap: "); eputd(hp_nchunks); eputs(" chunks, ");
++    eputd((int64_t)((size_t)hp_nchunks * CHUNK >> 10)); eputs(" KiB mapped\n");
++    eputs("  free lists: "); eputd(nblocks); eputs(" blocks, "); eputd(nbytes >> 10);
++    eputs(" KiB (with headers); "); eputd(nstraddle); eputs(" straddle a page\n");
++    eputs("  4 KiB pages: "); eputd((int64_t)(full * 4096 >> 10)); eputs(" KiB free");
++    eputs("; dropped with straddling frees: "); eputd(lost >> 10); eputs(" KiB (");
++    eputd(nlost); eputs(" blocks)\n");
++    eputs("  whole 2 MiB chunks: "); eputd((int64_t)whole); eputs(" (");
++    eputd((int64_t)(whole * (CHUNK >> 10))); eputs(" KiB)\n");
++    eflush();
++    SYS(S_MUNMAP, cov, np * sizeof *cov, 0);
++}
++
+ __attribute__((noreturn)) void rt_trap(int code, const char* msg, const char* where) {
+     if (__builtin_expect(rt_par_span != 0, 0)) { rt_wctx* w = rt_wme(); if (w) RT_HOOK(trap)(w, code, msg, "", 0, where); }
+     rt_flush();
