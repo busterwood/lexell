@@ -25330,18 +25330,9 @@ fn bLevelPlan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &
         }
     }
     let part = len(lv.need) > 0
-    let width = rowWidth(t)
-    var placeCol: []int = array(width, -1)
-    for i in 0..len(t.cols) {
-        if needCol[i] { placeCol[if len(t.slots) == 0 { i } else { t.slots[i] }] = i }
-    }
-    var usedP: []int = []
-    for pl in 0..width { if placeCol[pl] >= 0 { append(mut &usedP, pl) } }
-    let stopAt = if len(usedP) == 0 { 0 } else { usedP[len(usedP) - 1] + 1 }
     var needList: []bool = []
     for x in lv.need { append(mut &needList, x) }
-    var bp = BPlan{kinds: kinds, needCol: needCol, placeCol: placeCol, usedP: usedP, stopAt: stopAt,
-                   missing: placesMissing(t), needP: placesNeeded(t, &needList), width: width, ranges: []}
+    var bp = lexdb_rows.projectionOf(kinds, needCol, &t.slots, rowWidth(t), placesMissing(t), placesNeeded(t, &needList))
     bp.ranges = cRanges(&conds, &bp.kinds, t)
     // key lookups: a row each, not worth a batch
     var ranges = false
@@ -25903,18 +25894,9 @@ fn bLookup(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, jp: &JP
 fn bPlanOf(t: &Table, needCol: []bool, need: &[]bool): BPlan {
     var kinds: []int = []
     for c in t.cols { append(mut &kinds, colKind(&c)) }
-    let width = rowWidth(t)
-    var placeCol: []int = array(width, -1)
-    for i in 0..len(t.cols) {
-        if needCol[i] { placeCol[if len(t.slots) == 0 { i } else { t.slots[i] }] = i }
-    }
-    var usedP: []int = []
-    for pl in 0..width { if placeCol[pl] >= 0 { append(mut &usedP, pl) } }
-    let stopAt = if len(usedP) == 0 { 0 } else { usedP[len(usedP) - 1] + 1 }
     var needList: []bool = []
     for x in need { append(mut &needList, x) }
-    return BPlan{kinds: kinds, needCol: needCol, placeCol: placeCol, usedP: usedP, stopAt: stopAt,
-                 missing: placesMissing(t), needP: placesNeeded(t, &needList), width: width, ranges: []}
+    return lexdb_rows.projectionOf(kinds, needCol, &t.slots, rowWidth(t), placesMissing(t), placesNeeded(t, &needList))
 }
 
 // A join's candidates (per candidate, the joined batch j's row pj and the
@@ -27475,20 +27457,15 @@ fn batchGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
         }
     }
     // where each column used is in a stored row
-    let width = rowWidth(t)
-    var placeCol: []int = array(width, -1)
-    for i in 0..len(t.cols) {
-        if needCol[i] { placeCol[if len(t.slots) == 0 { i } else { t.slots[i] }] = i }
-    }
-    var usedP: []int = []
-    for pl in 0..width { if placeCol[pl] >= 0 { append(mut &usedP, pl) } }
-    // a tagged row is read up to its last place used (none: not at all)
-    let stopAt = if len(usedP) == 0 { 0 } else { usedP[len(usedP) - 1] + 1 }
     var tkinds: []int = []
     for c in t.cols { append(mut &tkinds, colKind(&c)) }
-    let bp = if jn { replace(mut &lp0[0].bp, emptyBPlan()) } else {
-        BPlan{kinds: tkinds, needCol: needCol, placeCol: placeCol, usedP: usedP, stopAt: stopAt,
-              missing: placesMissing(t), needP: placesNeeded(t, &needList), width: width, ranges: cRanges(&conds, &tkinds, t)}
+    var bp = emptyBPlan()
+    if jn {
+        bp = replace(mut &lp0[0].bp, emptyBPlan())
+    } else {
+        var proj = lexdb_rows.projectionOf(tkinds, needCol, &t.slots, rowWidth(t), placesMissing(t), placesNeeded(t, &needList))
+        proj.ranges = cRanges(&conds, &proj.kinds, t)
+        bp = proj
     }
     if jn { part = lp0[0].part }
     // a group's first row: the joined batch's columns, or the table's
