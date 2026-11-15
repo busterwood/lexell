@@ -4143,7 +4143,7 @@ fn analyzeTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, snap: mut &le
     var pkMax = 0.0f
     var pkNums = 0
     let all: []bool = []
-    let path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: []}
+    let path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false}
     let sc = Scan{empty: false, point: false, lo: "", hi: "", whole: true}
     // the primary key (optimizer 24; of one column too, optimizer 29): rows
     // come in its order, so each prefix's distinct values are counted where
@@ -5025,6 +5025,7 @@ type Path = record {
     ins: []Expr         // x IN (...) on the column after the equalities: a lookup per value
     inSub: int          // or x IN (subquery), uncorrelated: a lookup per value it gives; -1 none
     inArr: []Expr       // or x = ANY (array): its one expression, a lookup per element (9.28); [] none
+    stats: bool         // a pure range the planner chose from its samples: the executor need not recount (optimizer 19)
 }
 
 // An IN subquery's values looked up one by one at most; past this many its
@@ -6412,6 +6413,17 @@ const COST_PK_RANGE: float = 1.8f
 const COST_DESCENT: float = 12.0f
 const COST_KEY_ROW: float = 36.0f
 const COST_IX_ROW: float = 49.0f
+// A range over at least this share of the table is read as a scan: the
+// index's entries and rows cost more than reading the table once. The
+// threshold is twice the measured crossover (SWITCH_TIMES), so a sampling
+// error does not put the plan on the wrong path; PostgreSQL would keep a
+// 3% index range and use a bitmap scan, which LexDB does not have yet.
+// The plan decides from ANALYZE's samples; the counted switch (optimizer
+// 38) is the fallback for a range they do not estimate.
+const SCAN_SHARE: int = 32
+// The switch is for tables where reading the index is real work; a small
+// table's index-only range is cheap and keeps its order.
+const SCAN_MIN_ROWS: int = 1024
 const HASH_PROBE: float = 2.0f
 const HASH_BUILD: float = 19.0f
 const ROW_COST: float = 2.0f
@@ -6512,7 +6524,7 @@ fn (q: &Query) constWay(k: int, cands: &[]WayCand, cs: &[]Expr, cols: &[]int): b
             if !konst { break }
             append(mut &eqs, Expr.Lit(Val.Null))
         }
-        let p = Path{index: wc.index, eqs: eqs, rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: []}
+        let p = Path{index: wc.index, eqs: eqs, rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false}
         if !servesOrder(&lv.t, &p, cols) { return true }
     }
     return false
@@ -7297,7 +7309,7 @@ fn (q: &Query) orderedLevel(items: &[]lexdb_sql.OrderItem, out: mut &[]int): int
     for c0 in 0..len(t.indexes) + 1 {
         let c = c0 - 1
         if c >= 0 && t.indexes[c].pred.isSome() { continue }
-        let p = Path{index: c, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: []}
+        let p = Path{index: c, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false}
         if servesOrder(t, &p, &cols) {
             for x in cols { append(out, x) }
             return lv
@@ -7537,12 +7549,25 @@ fn choosePath(q: &Query, k: int, cs: &[]Expr, params: &[]Val, lk: mut &[]Look): 
             if c < 0 { score = 500 } else if lv.t.indexes[c].unique { score = 499 }
         }
         if score == 0 { continue }
-        var p = Path{index: c, eqs: eqs, rng: rng, desc: false, noNulls: false, ins: ins, inSub: inSub, inArr: inArr}
+        var p = Path{index: c, eqs: eqs, rng: rng, desc: false, noNulls: false, ins: ins, inSub: inSub, inArr: inArr, stats: false}
         if lv.readOnce && q.pathOuter(&p) { continue }          // read once (optimizer 26)
         let po = q.pathOuter(&p)
         var saved: []Expr = []
         if fdiff { saved = replace(mut &p.eqs, feqs) }
         let f = pathFig(lv, &p, params)
+        // The first table's pure range, if the samples estimate it over
+        // 1/SCAN_SHARE of the table, is read as a scan: skip the candidate.
+        // (A later table's range is a hash build, read once: q10's orders
+        // range of 3.8% is 57k rows to build from and 1.5M to scan.) A
+        // range they estimate as narrower is the planner's index (stats: the
+        // executor must not count it again). No sample: the counted switch
+        // decides at run time; a per-row (correlated) range keeps its index.
+        if !q.pinned && k == 0 && c >= 0 && lv.est.rows >= SCAN_MIN_ROWS &&
+           len(p.eqs) == 0 && len(p.rng) > 0 && len(cols) > 0 && cols[0] >= 0 &&
+           f.rows >= 0 && !f.bound && lv.est.rows > 0 && !ixCovers(lv, c) {
+            if f.rows * SCAN_SHARE >= lv.est.rows { continue }
+            p.stats = true
+        }
         // the first equality's value set the figure: a look (optimizer 23)
         var lo = Look{kind: -1, c: Expr.Lit(Val.Null), p: Expr.Lit(Val.Null), out: 0, typ: noType(), cm: noCommon()}
         if f.rows >= 0 && len(p.eqs) >= 1 && !hasIn && score < 999 {
@@ -7561,7 +7586,7 @@ fn choosePath(q: &Query, k: int, cs: &[]Expr, params: &[]Val, lk: mut &[]Look): 
         append(mut &looks, lo)
         if best < 0 || score > scores[best] { best = len(scores) - 1 }
     }
-    if best < 0 { return Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: []} }
+    if best < 0 { return Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false} }
     var pick = best
     if scores[best] < 999 && figs[best].rows >= 0 {
         var pc = figCost(&figs[best], paths[best].index, k == 0)
@@ -7587,7 +7612,7 @@ fn choosePath(q: &Query, k: int, cs: &[]Expr, params: &[]Val, lk: mut &[]Look): 
             }
         }
     }
-    return replace(mut &paths[pick], Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: []})
+    return replace(mut &paths[pick], Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false})
 }
 
 // A level read once (a hash join, optimizer 26) takes only the bounds whose
@@ -7931,7 +7956,7 @@ fn allTrue(cs: &[]Expr, cols: &[]lexdb_sql.ColDef, row: &[]Val, params: &[]Val):
 }
 
 fn newLevel(t: Table, alias: &str, join: int, first: int): Level {
-    return Level{t: t, alias: alias, join: join, first: first, path: Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: []}, cond: [],
+    return Level{t: t, alias: alias, join: join, first: first, path: Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false}, cond: [],
                  post: [], local: [], perRow: true, hashCols: [], hashVals: [], hashKinds: [], src: -1, work: -1, lateral: false, need: [],
                  lock: 0, lockWait: 0, keeps: false, est: noEst(), stops: false, estRows: -1, estMax: false, readOnce: false, semi: false}
 }
@@ -7942,7 +7967,8 @@ fn newLevel(t: Table, alias: &str, join: int, first: int): Level {
 // reorder: the tables of inner joins may run in another order than FROM's
 // (a SELECT's; UPDATE ... FROM and DELETE ... USING keep their target first).
 fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_sql.FromItem,
-              where: &Option[Expr], params: &[]Val, subs: &[]lexdb_sql.Stmt, sc: mut &Scope, reorder: bool): Result[Query, DbErr] {
+              where: &Option[Expr], params: &[]Val, subs: &[]lexdb_sql.Stmt, selNames: &Map[str, int], star: bool,
+              sc: mut &Scope, reorder: bool): Result[Query, DbErr] {
     var q = Query{levels: [], cols: [], top: [], subs: [], base: sc.base, corr: false, refs: [], implied: false, colAt: newMap(), pinned: false, noRefKeys: false}
     // this query's (its subqueries set their own)
     let early = sc.early
@@ -8257,7 +8283,8 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
         }
     }
     match where {
-        Some(w) {
+        Some(w0) {
+            let w = pullCommonOr(w0)
             let r = try enumOrder(st, txn, &(try resolve(&w, &q.cols, len(q.cols), sc)), &q.cols)
             var cs: []Expr = []
             conjuncts(&r, mut &cs)
@@ -8274,6 +8301,16 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
             }
         }
         None {}
+    }
+    // the columns the SELECT names, for the index-only choice (9.31):
+    // narrow's, but before the paths are chosen rather than after
+    if !star {
+        for k in 0..len(q.levels) {
+            if q.levels[k].virt() { continue }
+            var need: []bool = []
+            for c in q.levels[k].t.cols { append(mut &need, selNames.has(&c.name)) }
+            q.levels[k].need = need
+        }
     }
     if reorder && nl >= 2 && !txn.rules {
         // the join order: by cost with statistics (optimizer 26), else bound
@@ -8369,14 +8406,14 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
     for k in 0..nl {
         let m = replace(mut &ms[k], [])
         // a subquery's rows have no key: read them all
-        var path = if q.levels[k].virt() { Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: []} } else {
+        var path = if q.levels[k].virt() { Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false} } else {
             choosePath(&q, k, &m, params, mut &sc.looks)
         }
         var perRow = k == 0 || q.pathOuter(&path) || q.levels[k].lateral
         let right = keepsRight(q.levels[k].join)
         if right {
             // Every row of it is kept: read it all once, and remember which joined.
-            path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: []}
+            path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false}
             perRow = false
         }
         var local: []Expr = []
@@ -8524,20 +8561,22 @@ fn tryRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Mats
 // The table is counted a leaf at a time. No statistics are needed.
 const SWITCH_ENTRIES: int = 1024
 
-// The cost mode's switch (optimizer 38) uses the measured costs, as the join
-// order does (optimizer 36): an index range's entry and its row cost
-// COST_IX_ROW (16: in batches, the rows read in key order), and the switched
-// scan's row COST_SCAN (1: in batches too, 9.107), so a scan is taken when
-// the table has at most 16 times the range's entries (it was 45/12, when
-// both were read row by row); and a range ended within SWITCH_ENTRIES_COST
-// entries is compared too (a small table is scanned even for a short
-// range). The rules mode keeps section 19's guess: 2, and SWITCH_ENTRIES.
+// The cost mode's switch: an index range's entry and the row it fetches cost
+// about 16 scanned rows when both are read in batches (optimizer 45), so a
+// scan is cheaper when the table has at most 16 times the range's entries
+// (a range over about a sixteenth of the table). The plan decides a pure
+// range's path from ANALYZE's samples (choosePath); this counted check is
+// for a range they do not estimate. COST_IX_ROW (49) is the row-by-row
+// measure; switching at 1/49 read the whole table for every date range, and
+// a flat quarter kept q6's 15% lineitem range on an index 2.2x slower than
+// the scan.
 const SWITCH_ENTRIES_COST: int = 64
+const SWITCH_TIMES: int = 16
 
 // The table's rows at most for a scan in place of a range of n entries.
 fn switchMost(rules: bool, n: int): int {
     if rules { return 2 * n }
-    return int(float(n) * COST_IX_ROW / COST_SCAN)
+    return SWITCH_TIMES * n
 }
 
 // The table's rows, counted until there are more than most.
@@ -8554,7 +8593,7 @@ fn countRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, most:
 // SWITCH_ENTRIES, so it is read once); 2: the index, its range read again;
 // 1: a scan.
 fn indexOrScan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, p: &Path, sc: &Scan,
-               keys: mut &[]str): Result[int, DbErr] {
+               keys: mut &[]str, decided: bool): Result[int, DbErr] {
     let tree = t.indexes[p.index].tree
     let start = if txn.rules { SWITCH_ENTRIES } else { SWITCH_ENTRIES_COST }
     var lim = start
@@ -8579,6 +8618,10 @@ fn indexOrScan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, p: 
             if first {
                 // a short range: the index, unless (cost mode) the table is
                 // smaller than r times it
+                if decided {
+                    for x in got { append(keys, x) }
+                    return Ok(0)
+                }
                 if !txn.rules && n > 0 && try countRows(st, txn, t, switchMost(false, n)) <= switchMost(false, n) { return Ok(1) }
                 for x in got { append(keys, x) }
                 return Ok(0)
@@ -8589,6 +8632,8 @@ fn indexOrScan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, p: 
             return Ok(2)
         }
         from = after(&last)
+        // the planner chose this range from its samples: no count
+        if decided { return Ok(2) }
         let most = switchMost(txn.rules, lim)
         if try countRows(st, txn, t, most) <= most { return Ok(1) }
         lim = lim * 2
@@ -8608,7 +8653,7 @@ fn firstSwitch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, sca
        scans[0].whole || ixCovers(lv, lv.path.index) { return Ok(-1) }
     if rs.sw < 0 || rs.swLo != scans[0].lo || rs.swHi != scans[0].hi {
         var got: []str = []
-        rs.sw = try indexOrScan(st, txn, &lv.t, &lv.path, &scans[0], mut &got)
+        rs.sw = try indexOrScan(st, txn, &lv.t, &lv.path, &scans[0], mut &got, lv.path.stats)
         rs.swKeys = got
         rs.swLo = scans[0].lo
         rs.swHi = scans[0].hi
@@ -10286,6 +10331,89 @@ fn inVal(sp: &SubPlan, v: Val): Val {
     return v
 }
 
+fn matchesOr(x: &Expr): bool {
+    match x { Expr.Bin(op, _, _) { if op == "or" { return true } } else {} }
+    return false
+}
+
+// The OR's operands, flattened.
+fn orParts(x: &Expr, out: mut &[]Expr) {
+    match x {
+        Expr.Bin(op, a, b) {
+            if op == "or" { orParts(&a, out); orParts(&b, out); return }
+        }
+        else {}
+    }
+    append(out, clone(x))
+}
+
+// The AND's operands, flattened.
+fn andParts(x: &Expr, out: mut &[]Expr) {
+    match x {
+        Expr.Bin(op, a, b) {
+            if op == "and" { andParts(&a, out); andParts(&b, out); return }
+        }
+        else {}
+    }
+    append(out, clone(x))
+}
+
+fn andOf(xs: &[]Expr): Expr {
+    if len(xs) == 0 { return Expr.Lit(Val.Bool(true)) }
+    var out = clone(&xs[0])
+    for i in 1..len(xs) { out = Expr.Bin("and", out, clone(&xs[i])) }
+    return out
+}
+
+fn orOf(xs: &[]Expr): Expr {
+    if len(xs) == 0 { return Expr.Lit(Val.Bool(false)) }
+    var out = clone(&xs[0])
+    for i in 1..len(xs) { out = Expr.Bin("or", out, clone(&xs[i])) }
+    return out
+}
+
+// (A and X) or (A and Y) -> A and (X or Y), when A is the same conjunct in
+// every branch. q19's OR of three joins shares p_partkey = l_partkey, and
+// pulling it out is what lets the planner join the tables instead of
+// crossing them. Only immutable, subquery-free conjuncts are pulled, so
+// evaluation is not moved.
+fn pullCommonOr(x: &Expr): Expr {
+    if !matchesOr(x) { return clone(x) }
+    var branches: []Expr = []
+    orParts(x, mut &branches)
+    if len(branches) < 2 { return clone(x) }
+    var parts: [][]Expr = []
+    for b in branches {
+        var ps: []Expr = []
+        andParts(&b, mut &ps)
+        append(mut &parts, ps)
+    }
+    var common: []Expr = []
+    for c in parts[0] {
+        if !immutable(&c) || hasSubCall(&c) { continue }
+        var all = true
+        for j in 1..len(parts) {
+            var found = false
+            for d in parts[j] { if sameExpr(&c, &d) { found = true } }
+            if !found { all = false }
+        }
+        if all { append(mut &common, clone(&c)) }
+    }
+    if len(common) == 0 { return clone(x) }
+    var rest: []Expr = []
+    for j in 0..len(parts) {
+        var rem: []Expr = []
+        for d in parts[j] {
+            var used = false
+            for c in common { if sameExpr(&c, &d) { used = true } }
+            if !used { append(mut &rem, clone(&d)) }
+        }
+        append(mut &rest, andOf(&rem))
+    }
+    append(mut &common, orOf(&rest))
+    return andOf(&common)
+}
+
 // Runs a subquery: EXISTS stops at its first row, a scalar at its second.
 fn runSub(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sp: &SubPlan, params: &[]Val, parent: mut &Run,
           i: int): Result[SubRes, DbErr] {
@@ -11636,7 +11764,7 @@ fn renameCol(x: &Expr, from: &str, to: &str): Expr {
 
 // Whether the table has a row (col < 0), or a row whose column col is NULL.
 fn anyRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, col: int): Result[bool, DbErr] {
-    let path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: []}
+    let path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false}
     let sc = Scan{empty: false, point: false, lo: "", hi: "", whole: false}
     var need: []bool = []
     if col >= 0 {
@@ -11932,7 +12060,7 @@ fn rewrite(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, cha
         let noWhere: Option[Expr] = None
         let noParams: []Val = []
         let noSubs: []lexdb_sql.Stmt = []
-        var q = try buildQuery(st, txn, &oneTable(&t.name), &noWhere, &noParams, &noSubs, mut &sc, false)
+        var q = try buildQuery(st, txn, &oneTable(&t.name), &noWhere, &noParams, &noSubs, &newMap(), true, mut &sc, false)
         var xs: []Expr = []
         for ch in changes {
             let x = match ch.using {
@@ -12032,7 +12160,7 @@ fn rewrite(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, cha
             n += 1
         }
     } else {
-        let path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: []}
+        let path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false}
         let sc = Scan{empty: false, point: false, lo: "", hi: "", whole: false}
         var cur = newCursor()
         while !cur.done {
@@ -12820,7 +12948,7 @@ fn pruneInvalid(t: mut &Table) {
 
 // The rows of t against check c (23514).
 fn checkRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, c: &Check): Result[Unit, DbErr] {
-    let path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: []}
+    let path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false}
     let sc = Scan{empty: false, point: false, lo: "", hi: "", whole: false}
     var cur = newCursor()
     while !cur.done {
@@ -13060,7 +13188,7 @@ fn createIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
 // unique index's duplicates are then neighbours: two entries with the same
 // columns, none NULL (the tree is new, so they are all there is to check).
 fn addIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, ix: Index): Result[Unit, DbErr] {
-    let path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: []}
+    let path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false}
     let sc = Scan{empty: false, point: false, lo: "", hi: "", whole: false}
     var cur = newCursor()
     var ents: []str = []
@@ -13407,7 +13535,7 @@ fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     let noFrom: []lexdb_sql.FromItem = []
     let noWhere: Option[Expr] = None
     let from = if len(s.items) > 0 { oneTable(&s.table) } else { noFrom }
-    var q = try buildQuery(st, txn, &from, &noWhere, params, &s.subs, mut &sc, false)
+    var q = try buildQuery(st, txn, &from, &noWhere, params, &s.subs, &newMap(), true, mut &sc, false)
     var rows: [][]Expr = []
     let resolved = len(s.subs) > 0 || len(s.items) > 0
     if resolved && len(s.inner) == 0 {
@@ -13904,7 +14032,7 @@ fn updateB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
     let sqe = seqEnv(st, txn)
     var sc = newScopeIn(st, txn, params, &[])
     sc.target = try catKey(st, txn, &s.table, false)
-    var q = try buildQuery(st, txn, &(try dmlFrom(s)), &s.where, params, &s.subs, mut &sc, false)
+    var q = try buildQuery(st, txn, &(try dmlFrom(s)), &s.where, params, &s.subs, &newMap(), true, mut &sc, false)
     var targets: []int = []
     var sets: []Expr = []
     for set in s.sets {
@@ -13922,7 +14050,7 @@ fn updateB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
         // always reads by the key, so that a row it changed is not found again (the Halloween problem across
         // batches), and may not change the key, which would move a row past the cursor
         if q.levels[0].path.index >= 0 || q.levels[0].path.desc {
-            q.levels[0].path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: []}
+            q.levels[0].path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false}
         }
         win.keyed = true
         for k in targets { for p in q.levels[0].t.pk { if p == k {
@@ -14008,7 +14136,7 @@ fn deleteB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
     try dmlCheck(st, txn, s, &"d")
     var sc = newScopeIn(st, txn, params, &[])
     sc.target = try catKey(st, txn, &s.table, false)
-    var q = try buildQuery(st, txn, &(try dmlFrom(s)), &s.where, params, &s.subs, mut &sc, false)
+    var q = try buildQuery(st, txn, &(try dmlFrom(s)), &s.where, params, &s.subs, &newMap(), true, mut &sc, false)
     var ret = try retOf(s, &q, mut &sc)
     endScope(mut &sc, mut &q)
     delNarrow(mut &q, s)
@@ -14753,7 +14881,7 @@ fn merge(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, 
     var sc = newScopeIn(st, txn, params, &[])
     sc.target = try catKey(st, txn, &s.table, false)
     let none: Option[Expr] = None
-    var q = try buildQuery(st, txn, &mergeFrom(s), &none, params, &s.subs, mut &sc, false)
+    var q = try buildQuery(st, txn, &mergeFrom(s), &none, params, &s.subs, &newMap(), true, mut &sc, false)
     let tl = len(q.levels) - 1
     let t = try needTable(st, txn, &s.table)
     let nt = len(t.cols)
@@ -15044,8 +15172,8 @@ fn explain(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, x: &lexdb_sql.Stmt
     } else {
         var sc = newScopeIn(st, txn, params, ptypes)
         let noOn: Option[Expr] = None
-        var q = if s.kind == lexdb_sql.S_MERGE { try buildQuery(st, txn, &mergeFrom(s), &noOn, params, &s.subs, mut &sc, false) }
-                else { try buildQuery(st, txn, &(try dmlFrom(s)), &s.where, params, &s.subs, mut &sc, false) }
+        var q = if s.kind == lexdb_sql.S_MERGE { try buildQuery(st, txn, &mergeFrom(s), &noOn, params, &s.subs, &newMap(), true, mut &sc, false) }
+                else { try buildQuery(st, txn, &(try dmlFrom(s)), &s.where, params, &s.subs, &newMap(), true, mut &sc, false) }
         endScope(mut &sc, mut &q)
         lines = explainLines(&q, &none)
         let noStats: []SubStat = []
@@ -16477,7 +16605,7 @@ fn orderedScan(q: &Query, cols: &[]int, params: &[]Val, lk: mut &[]Look): Option
     let t = &q.levels[0].t
     for c0 in 0..len(t.indexes) + 1 {
         if !q.usable(0, c0 - 1, &q.levels[0].cond, params, lk) { continue }
-        let p = Path{index: c0 - 1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: []}
+        let p = Path{index: c0 - 1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false}
         if servesOrder(t, &p, cols) { return Some(c0 - 1) }
     }
     return None
@@ -16655,7 +16783,10 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             for o in s.order { append(mut &sc.ordBy, lexdb_sql.OrderItem{expr: clone(&o.expr), desc: o.desc, nullsFirst: o.nullsFirst}) }
         }
     }
-    var q = try buildQuery(st, txn, &s.from, &s.where, params, &s.subs, sc, true)
+    var needNames: Map[str, int] = newMap()
+    var needStar = false
+    stmtNames(s, mut &needNames, mut &needStar)
+    var q = try buildQuery(st, txn, &s.from, &s.where, params, &s.subs, &needNames, needStar, sc, true)
     if s.kind == lexdb_sql.S_SELECT { narrow(mut &q, s) }
     if s.lockMode > 0 { try applyLocks(mut &q, s) }
     var exprs: []Expr = []
@@ -18375,9 +18506,9 @@ fn guessParams(st: &lexdb_store.Store, s: &lexdb_sql.Stmt, out: mut &[]int, path
     let np: []Val = array(len(out), Val.Null)
     let noTypes: []int = []
     var sc = newScopeIn(st, &txn, &np, &noTypes)
-    let built = if s.kind == lexdb_sql.S_SELECT { buildQuery(st, mut &txn, &s.from, &s.where, &np, &s.subs, mut &sc, false) } else {
+    let built = if s.kind == lexdb_sql.S_SELECT { buildQuery(st, mut &txn, &s.from, &s.where, &np, &s.subs, &newMap(), true, mut &sc, false) } else {
         match dmlFrom(s) {
-            Ok(from) { buildQuery(st, mut &txn, &from, &s.where, &np, &s.subs, mut &sc, false) }
+            Ok(from) { buildQuery(st, mut &txn, &from, &s.where, &np, &s.subs, &newMap(), true, mut &sc, false) }
             Err(x) { Err(x) }
         }
     }
@@ -18454,7 +18585,7 @@ fn describe(st: &lexdb_store.Store, s: &lexdb_sql.Stmt, ptypes: &[]int, path: &[
         let np: []Val = array(if s.params > len(ptypes) { s.params } else { len(ptypes) }, Val.Null)
         var sc = newScopeIn(st, &txn, &np, ptypes)
         let from = if s.kind == lexdb_sql.S_INSERT { oneTable(&s.table) } else if s.kind == lexdb_sql.S_MERGE { mergeFrom(s) } else { try dmlFrom(s) }
-        let q = try buildQuery(st, mut &txn, &from, &none, &np, &s.subs, mut &sc, false)
+        let q = try buildQuery(st, mut &txn, &from, &none, &np, &s.subs, &newMap(), true, mut &sc, false)
         var exprs: []Expr = []
         if s.kind == lexdb_sql.S_MERGE {
             let items = mergeItems(s, &q.levels[len(q.levels) - 1].t, &(if len(s.alias) > 0 { s.alias } else { lexdb_sql.baseName(&s.table) }))
@@ -18473,7 +18604,7 @@ fn describe(st: &lexdb_store.Store, s: &lexdb_sql.Stmt, ptypes: &[]int, path: &[
     let none: Option[Expr] = None
     let np: []Val = array(if s.params > len(ptypes) { s.params } else { len(ptypes) }, Val.Null)
     var sc = newScopeIn(st, &txn, &np, ptypes)
-    let q = try buildQuery(st, mut &txn, &s.from, &none, &np, &s.subs, mut &sc, false)
+    let q = try buildQuery(st, mut &txn, &s.from, &none, &np, &s.subs, &newMap(), true, mut &sc, false)
     var exprs: []Expr = []
     return selectCols(s, &q.cols, mut &sc, mut &exprs)
 }
@@ -20066,7 +20197,7 @@ fn refRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, c: &Table, cols: &
     let n = len(cols)
     var crow = nullRow(len(c.cols))
     for j in 0..n { crow[cols[j]] = vals[j] }
-    var path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: []}
+    var path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false}
     var sc = Scan{empty: false, point: false, lo: "", hi: "", whole: false}
     if prefixSame(&c.pk, n, cols) {
         var b = newStrBuf()
@@ -20534,7 +20665,7 @@ fn fkName(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, c: &lexd
 // The rows of t against its foreign key f to table p (23503).
 fn fkRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, f: &ForeignKey, p: &Table): Result[Unit, DbErr] {
     let fc = fkCols(t, f, p)
-    let path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: []}
+    let path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false}
     let sc = Scan{empty: false, point: false, lo: "", hi: "", whole: false}
     var cur = newCursor()
     while !cur.done {

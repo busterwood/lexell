@@ -1,0 +1,57 @@
+// lexdb_exec: a first table's range that keeps most of a table is read as a
+// scan, not by its index. The statistics must exist to see the share (two
+// indexes, so loadEst loads them); a selective range keeps the index. A
+// covering index (count(*)) and the primary key are read in order: the
+// broad range keeps them. Checked by hand against the plans below.
+// expect: CREATE TABLE
+// expect: INSERT 0 10000
+// expect: CREATE INDEX
+// expect: CREATE INDEX
+// expect: ANALYZE
+// expect: [QUERY PLAN] scan wide: full scan; aggregate
+// expect: [QUERY PLAN] scan wide: index wide_d range (estimated 9 rows); aggregate
+// expect: [QUERY PLAN] scan wide: index wide_d range, index only (estimated 6999 rows); aggregate
+// expect: [QUERY PLAN] scan wide: primary key range (estimated 9900 rows); aggregate
+// expect: 24503500
+// expect: 55
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+
+const QUERIES = "create table wide (id int primary key, d int, v int)\ninsert into wide select g, g, g from generate_series(1, 10000) g\ncreate index wide_d on wide (d)\ncreate index wide_v on wide (v)\nanalyze\nexplain select sum(v) from wide where d <= 7000\nexplain select sum(v) from wide where d <= 10\nexplain select count(*) from wide where d <= 7000\nexplain select sum(v) from wide where id > 100\nselect sum(v) from wide where d <= 7000\nselect sum(v) from wide where d <= 10"
+
+fn show(s: mut &lexdb_exec.Session, q: &str): str {
+    match s.exec(q) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if !r.hasRows { return r.tag }
+            var rows: []str = []
+            for row in r.rows {
+                var cells: []str = []
+                for v in row { append(mut &cells, lexdb_exec.text(&v)) }
+                append(mut &rows, strings.join(&cells, "|"))
+            }
+            if len(r.cols) > 0 && r.cols[0].name == "QUERY PLAN" {
+                return "[QUERY PLAN] " + strings.join(&rows, "; ")
+            }
+            if r.tag != "" && !strings.startsWith(&r.tag, "SELECT") && r.tag != "SHOW" { append(mut &rows, r.tag) }
+            return strings.join(&rows, ";")
+        }
+        Err(e) { return "ERROR " + e.state }
+    }
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    var s = lexdb_exec.newSession(st)
+    let text: str = QUERIES
+    for q in strings.lines(&text) { println(show(mut &s, &q)) }
+    s.close()
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(95), lexdb_store.Options{cacheBytes: 16 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024,
+                                                           snapNodes: 50000}, body).unwrap()
+}

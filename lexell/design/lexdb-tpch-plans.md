@@ -240,14 +240,12 @@ join. q2 is also faster in lexdb.
    EXISTS under an aggregate. Apply the filter before the aggregate.
    Expected to fix q4, q18, q21, q22 and q16; q21/q22 are the difference
    between a timeout and a normal query.
-2. **OR predicates.** Per-branch predicate extraction and index nested
-   loops first; a BitmapOr operator after. q19.
-3. **Access-path cost.** The runtime index-to-scan switch exists but fires
-   only after the index has been paid for; price the initial choice so it
-   starts with the scan, price a range index by selectivity and by whether
-   it must fetch rows, add bitmap scans and index-only scans, and make the
-   per-row lookup cost grow with the outer row count. q1, q3, q7, q12,
-   q13, q14.
+2. **OR predicates.** Common-conjunct extraction is done; per-branch
+   predicate extraction and a BitmapOr operator remain. q19.
+3. **Access-path cost.** The first table's range now chooses scan or index
+   up front from ANALYZE's samples, with a counted fallback; bitmap scans,
+   the per-row lookup cost and correlated index costs remain. q1, q3, q7,
+   q12, q13, q14.
 4. **Join order and predicate pushdown.** Push single-table filters into
    the access path before the cost search; use the filtered row count;
    collapse equality classes; start from the selective dimension. q5, q7,
@@ -267,14 +265,65 @@ ahead, and lexdb runs one query on one SQL thread. That is a design
 choice, not one of the planner gaps above; fix the single-thread plan
 first, then decide what `par.map` should do for query execution.
 
-## 6. Caveats
+## 6. Fixed since this comparison
 
-- One run per query at SF1. The plan shapes are stable; the exact ratios
-  are not medians.
+Two changes on `bench/tpch` are measured on the same SF1 data and query
+text. The A/B figures are warm medians of three timed runs of the pre-fix
+and post-fix binaries. They supersede the deltas in section 2: that run was
+the first after the load, so its first queries read cold tables (q2's 1.09x
+and q3's 8.30x against PostgreSQL are mostly that, not code).
+
+- **A first table's range is decided before it starts.** `choosePath`
+  estimates a pure range's share from ANALYZE's samples; at 1/32 of the
+  table or more it plans the scan, and a narrower range is marked so the
+  executor does not count it again. A covering index and a primary key
+  range are exempt (both are read in order; q4's count-only range on
+  `orders_date` is 9 ms). The counted runtime switch remains for a range
+  the samples do not estimate (parameters, expressions, correlated inner
+  ranges), at 16 scanned rows per index entry, the batched measure. Warm
+  medians: q4 8.49 -> 8.30 s, q5 1.91 -> 1.86 s, q6 1.14 -> 1.07 s, q15
+  1.73 -> 1.47 s. q3 (2.62 -> 2.68 s), q7 (12.39 -> 12.66 s), q10, q12
+  and q14 are within the 2-8% run-to-run spread. q1 is unchanged at 16.8 s
+  and still execution-bound.
+- **Common conjuncts are pulled out of an OR.** `(A and X) or (A and Y)`
+  becomes `A and (X or Y)` before planning. q19's three branches share
+  `p_partkey = l_partkey`, so it is now a hash join instead of a cross
+  join: **timeout (>120 s) -> 8.96 s**, the PostgreSQL checksum. It is
+  still 260x PostgreSQL's 34 ms because the branch predicates are not a
+  BitmapOr; the cross product is gone.
+- The plan choice is in `choosePath`, the fallback in `indexOrScan`;
+  `exec_scanchoice.lxl` covers the broad, selective, index-only and
+  primary-key cases, and `exec_switch.lxl` the counted fallback. The
+  suite's 169 tests pass; `exec_batchexpr`, `exec_cols_diff` and
+  `exec_seqcrash` time out only under the full parallel load and pass
+  alone.
+
+A warm full run (one run, `out/lexdb.tsv`) has q19 8.96 s, q1 17.2 s, q7
+12.8 s, q4 7.95 s, q12 7.13 s and q13 6.16 s; q21 still times out at
+120 s. The 18 queries timed in both runs are 0.99x their baseline
+geomean (unchanged); the nine the scan choice touches are 0.97x in the
+warm A/B, 0.96x without q3 and q7.
+
+Still open: q4/q21/q22's per-row EXISTS needs a semi/anti-join executor,
+not just a cost change (q4 is 57,218 subplan runs at about 140 us each;
+q22's 150k runs at about 7 us). q18's grouped IN is a lookup per value.
+q1 is execution-bound, not planner-bound: `count(*)` is 0.50 s, four simple
+sums 2.48 s, and the complex expressions with `avg` 8.23 s, so the 16.8 s
+is decimal aggregate evaluation. None of those are addressed by the plan
+changes here.
+
+## 7. Caveats
+
+- Section 2 is one run per query at SF1; section 6's A/B figures are
+  medians of three. The plan shapes are stable; the exact ratios are not
+  to a few percent.
+- Section 2's run was the first after the data was loaded, so its first
+  queries read cold tables. The q2 and q3 deltas are mostly that; section
+  6's warm A/B supersedes them.
 - Fixed TPC-H substitution values, no qgen variation, no RF1/RF2.
 - The secondary index set is the same on both engines and is stated in
   `bench/tpch/indexes.sql`. q17's advantage and q20's remaining cost both
   depend on it.
-- q19 and q21 are timeouts, not completed times; do not read their ratios
-  as measurements.
+- q19 now completes; q21 is still a timeout, and its ratio would not be a
+  measurement.
 - The three different checksums are decimal scale, not wrong values.
