@@ -240,8 +240,9 @@ join. q2 is also faster in lexdb.
    (section 6). Derived tables (q22) and IN with GROUP BY (q18) still
    take a lookup per value; q18 is the remaining large one. Apply the
    filter before the aggregate.
-2. **OR predicates.** Common-conjunct extraction is done; per-branch
-   predicate extraction and a BitmapOr operator remain. q19.
+2. **OR predicates.** Common-conjunct extraction and per-table branch
+   filters are done (section 6); a BitmapOr operator remains (the branch
+   lookups are per row now). q19 is 13x PostgreSQL, down from 248x.
 3. **Access-path cost.** The first table's range now chooses scan or index
    up front from ANALYZE's samples, with a counted fallback; bitmap scans,
    the per-row lookup cost and correlated index costs remain. q1, q3, q7,
@@ -267,7 +268,7 @@ first, then decide what `par.map` should do for query execution.
 
 ## 6. Fixed since this comparison
 
-Three changes on `bench/tpch` are measured on the same SF1 data and query
+The changes on `bench/tpch` are measured on the same SF1 data and query
 text. The A/B figures are warm medians of three timed runs of the pre-fix
 and post-fix binaries. They supersede the deltas in section 2: that run was
 the first after the load, so its first queries read cold tables (q2's 1.09x
@@ -322,6 +323,16 @@ and q3's 8.30x against PostgreSQL are mostly that, not code).
   both the PostgreSQL checksums. A 6M-row stream costs about 3.1-3.5 s
   at one or two columns against 9.9 s at sixteen, so the width was the
   cost, not the row count.
+- **An OR across tables gives each table its own filter.** `(P1 and L1)
+  or (P2 and L2) or ...` implies `P1 or P2 or ...` on one table and
+  `L1 or L2 or ...` on the other; the full OR stays at the join to decide
+  the pairing. Each table's part is pushed to its own conditions and a
+  disjunction is estimated as `1 - (1-s1)(1-s2)...` from the branches
+  instead of a flat half. q19 then starts from part's 485 rows and does
+  485 index lookups on `lineitem_part_supp` (14,301 rows) instead of
+  scanning lineitem's 6M and probing 214k: **8.49 s -> 448 ms** warm,
+  the PostgreSQL checksum. The same estimate picks q7's order: **11.74 ->
+  4.48 s** warm. All 22 queries keep their checksums.
 - The plan choice is in `choosePath`, the fallback in `indexOrScan`;
   `exec_scanchoice.lxl` covers the broad, selective, index-only and
   primary-key cases, and `exec_switch.lxl` the counted fallback. The
@@ -330,14 +341,15 @@ and q3's 8.30x against PostgreSQL are mostly that, not code).
   alone.
 
 A warm full run (one run, `out/lexdb.tsv`) completes all 22 queries: q1
-16.3 s, q21 14.6 s, q7 11.6 s, q19 8.49 s, q12 6.84 s, q13 5.53 s, q4
-4.13 s. The A/B figures above are the measurements; the run-level
+16.0 s, q21 14.6 s, q12 6.86 s, q13 5.49 s, q7 4.60 s, q4 4.09 s, q19
+0.44 s. The A/B figures above are the measurements; the run-level
 comparison to the pre-fix baseline is not, because that baseline run was
 the first after the load (queries it did not touch moved 0.84-1.01x from
 cache warmth alone).
 
 Still open: q4's semi-join is now 24x PostgreSQL and q21's 21x, down
-from 44x and 35x. PostgreSQL's q21 plan scans lineitem once (433 ms),
+from 44x and 35x; q19 is 13x and q7 8.6x, down from 248x and 22x.
+PostgreSQL's q21 plan scans lineitem once (433 ms),
 hashes supplier/nation to 156,739 rows, then probes lineitem's primary
 key 156k times for the anti join and 13.8k for the semi join
 (1.04 s total). lexdb's per-row subplan costs milliseconds per run when
