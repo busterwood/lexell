@@ -3124,116 +3124,7 @@ fn succ(s: &str): str {
 // them stay at the row's start, which a large row keeps in its leaf.
 const LONG: int = lexdb_rows.LONG
 
-// Rows written as before 9.115: a tagged row whose first value is a time
-// beginning with its tag (a test's way to write what older builds wrote).
-var legacyTimeRows: bool = false
-
-pub fn setLegacyTimeRows(on: bool) { legacyTimeRows = on }
-
-fn encRow(row: &[]Val): str {
-    var long = false
-    for v in row {
-        match v {
-            Val.Text(s) { if len(s) >= LONG { long = true } }
-            else {}
-        }
-    }
-    // a row whose first value is a time would begin with its tag, 8, which
-    // is FIXED: in the long form instead, which begins with 6 (9.115)
-    if len(row) > 0 && !legacyTimeRows {
-        match row[0] {
-            Val.Time(_) { long = true }
-            else {}
-        }
-    }
-    if long { return encLong(row) }
-    var b = newStrBuf()
-    for v in row { encVal(mut &b, &v) }
-    return b.toStr()
-}
-
-// A value in a row: its tag and its bytes (a text of any length in place).
-// Tags 7 to 10 are a date, time, timestamp and timestamptz (8 bytes), 11 an
-// interval (months, days, microseconds: 24 bytes) (9.76).
-fn encVal(b: mut &StrBuf, v: &Val) {
-    match v {
-        Val.Null { b.addByte(0) }
-        Val.Int(n) {
-            b.addByte(1)
-            binary.addU64LE(b, n)
-        }
-        Val.Bool(x) {
-            b.addByte(2)
-            b.addByte(if x { 1 } else { 0 })
-        }
-        Val.Num(d) {
-            b.addByte(3)
-            let s = d.toStr()
-            binary.addU32LE(b, len(s))
-            b.add(&s)
-        }
-        Val.Text(s) {
-            b.addByte(4)
-            binary.addU32LE(b, len(s))
-            b.add(&s)
-        }
-        Val.Date(n) {
-            b.addByte(7)
-            binary.addU64LE(b, n)
-        }
-        Val.Time(n) {
-            b.addByte(8)
-            binary.addU64LE(b, n)
-        }
-        Val.Ts(n) {
-            b.addByte(9)
-            binary.addU64LE(b, n)
-        }
-        Val.Tstz(n) {
-            b.addByte(10)
-            binary.addU64LE(b, n)
-        }
-        Val.Ival(iv) {
-            b.addByte(11)
-            binary.addU64LE(b, iv.months)
-            binary.addU64LE(b, iv.days)
-            binary.addU64LE(b, iv.us)
-        }
-        Val.Uuid(u) {
-            b.addByte(12)
-            b.add(&(lexdb_rows.uuidBytes(&u)))
-        }
-        Val.Bytes(x) {
-            b.addByte(13)
-            binary.addU32LE(b, len(x))
-            b.add(&x)
-        }
-        Val.Float(x) {
-            b.addByte(14)
-            binary.addU64LE(b, math.bitsOf(x))
-        }
-        Val.Real(x) {
-            b.addByte(15)
-            binary.addU32LE(b, math.bitsOf32Int(x))
-        }
-        Val.Reg(o, _) { encVal(b, &Val.Int(o)) }      // stored as its OID
-    }
-}
-
-// A value of tag 7 to 15 in a row at s[at..]: a date or time kind, a
-// uuid, a bytea, a double precision or a real.
-fn timeVal(s: &str, at: int, tag: byte): Val {
-    if tag == 12 { return Val.Uuid(lexdb_rows.uuidText(&s[at..at + 16])) }
-    if tag == 13 { return Val.Bytes(s[at + 4..at + 4 + binary.readU32LEStr(s, at)]) }
-    if tag == 14 { return Val.Float(math.fromBits(binary.readI64LEStr(s, at))) }
-    if tag == 15 { return Val.Real(math.fromBits32Int(binary.readU32LEStr(s, at))) }
-    let x = binary.readI64LEStr(s, at)
-    if tag == 7 { return Val.Date(x) }
-    if tag == 8 { return Val.Time(x) }
-    if tag == 9 { return Val.Ts(x) }
-    if tag == 10 { return Val.Tstz(x) }
-    return Val.Ival(lexdb_time.Ival{months: x, days: binary.readI64LEStr(s, at + 8), us: binary.readI64LEStr(s, at + 16)})
-}
+pub fn setLegacyTimeRows(on: bool) { lexdb_rows.setLegacyTimeRows(on) }
 
 // ---- uuid and bytea (9.78)
 
@@ -3381,48 +3272,6 @@ fn decodeBytes(t: &str, f: &str): Result[str, DbErr] {
     return Err(e("22023", &("unrecognized encoding: \"" + f + "\"")))
 }
 
-// The bytes after its tag a value of tag takes in a row at s[at..]; -1 for
-// a tag that is not one.
-fn valSize(s: &str, at: int, tag: byte): int {
-    if tag == 0 { return 0 }
-    if tag == 1 || (tag >= 7 && tag <= 10) { return 8 }
-    if tag == 2 { return 1 }
-    if tag == 3 || tag == 4 { return 4 + binary.readU32LEStr(s, at) }
-    if tag == 5 { return 4 }
-    if tag == 11 { return 24 }
-    if tag == 12 { return 16 }
-    if tag == 13 { return 4 + binary.readU32LEStr(s, at) }
-    if tag == 14 { return 8 }
-    if tag == 15 { return 4 }
-    return -1
-}
-
-fn encLong(row: &[]Val): str {
-    var b = newStrBuf()
-    b.addByte(6)
-    binary.addU32LE(mut &b, len(row))
-    for v in row {
-        match v {
-            Val.Text(s) {
-                if len(s) >= LONG {
-                    b.addByte(5)
-                    binary.addU32LE(mut &b, len(s))
-                } else {
-                    encVal(mut &b, &v)
-                }
-            }
-            else { encVal(mut &b, &v) }
-        }
-    }
-    for v in row {
-        match v {
-            Val.Text(s) { if len(s) >= LONG { b.add(&s) } }
-            else {}
-        }
-    }
-    return b.toStr()
-}
-
 // A row from a stored value as a Part read gives it: a large row from its
 // first bytes when the columns used are all there, else read whole (9.31).
 // n and need are of the row's places (rowWidth, placesNeeded); the values
@@ -3482,60 +3331,22 @@ fn encRowOf(t: &Table, row: &[]Val): str {
             }
         }
     }
-    if len(t.slots) == 0 { return encRow(row) }
+    if len(t.slots) == 0 { return lexdb_rows.encodeRow(row) }
     var places: []Val = array(t.width, Val.Null)
     for i in 0..len(t.slots) { places[t.slots[i]] = row[i] }
-    return encRow(&places)
+    return lexdb_rows.encodeRow(&places)
 }
 
 fn placesOf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, key: &str, v: &str, n: int,
             need: &[]bool, missing: &[]Val): Result[[]Val, DbErr] {
     match lexdb_store.partOf(v) {
         Some(p) {
-            if fitsIn(&p, n, need) { return decRowNeed(&p, n, need, missing, &t.lays) }
+            if lexdb_rows.fitsIn(&p, n, need) { return decRowNeed(&p, n, need, missing, &t.lays) }
             let w = try st.whole(txn, t.tree, key, v)
             return decRowNeed(&w, n, need, missing, &t.lays)
         }
         None { return decRowNeed(v, n, need, missing, &t.lays) }
     }
-}
-
-// Whether a large row's first bytes hold all the columns used: all its
-// columns before its long texts, and none of those texts used.
-fn fitsIn(p: &str, n: int, need: &[]bool): bool {
-    if len(need) == 0 || len(p) < 5 || p[0] != 6 { return false }
-    let cols = binary.readU32LEStr(p, 1)
-    var at = 5
-    for i in 0..cols {
-        if at >= len(p) { return false }
-        let tag = p[at]
-        at += 1
-        if tag == 5 {
-            if i < n && need[i] { return false }
-            at += 4
-        } else {
-            if (tag == 3 || tag == 4 || tag == 13) && at + 4 > len(p) { return false }
-            let sz = valSize(p, at, tag)
-            if sz < 0 { return false }
-            at += sz
-        }
-        if at > len(p) { return false }
-    }
-    return true
-}
-
-// A stored row's columns before its long texts: the bytes a large row
-// keeps in its leaf (lexdb_store.putRow), 0 for a row with no long text.
-fn rowHead(s: &str): int {
-    if len(s) < 5 || s[0] != 6 { return 0 }
-    let cols = binary.readU32LEStr(s, 1)
-    var at = 5
-    for i in 0..cols {
-        let tag = s[at]
-        at += 1
-        at += valSize(s, at, tag)
-    }
-    return at
 }
 
 fn decRow(s: &str, n: int): Result[[]Val, DbErr] {
@@ -3545,94 +3356,8 @@ fn decRow(s: &str, n: int): Result[[]Val, DbErr] {
     return decRowNeed(s, n, &all, &none, &lays)
 }
 
-// A row's values; need: the columns used ([] all), the others NULL and not
-// decoded (9.31).
-// lays: the row's table's layouts (Table.lays), for a row in the fixed form.
 fn decRowNeed(s: &str, n: int, need: &[]bool, missing: &[]Val, lays: &[]FixedLay): Result[[]Val, DbErr] {
-    if len(s) > 0 && s[0] == FIXED && !timeTaggedLays(s, lays) { return decFixed(s, n, need, missing, lays) }
-    var out: []Val = []
-    var at = 0
-    let some = len(need) > 0
-    // a row with long texts: its column count, and where each long text is
-    var cols = n
-    let long = len(s) > 0 && s[0] == 6
-    if long {
-        cols = binary.readU32LEStr(s, 1)
-        at = 5
-    }
-    var longAt: []int = []               // the long texts' columns, in order
-    var longLen: []int = []
-    for i in 0..n {
-        if i >= cols || (!long && at >= len(s)) {
-            // a column added after the row was written: its default then
-            append(mut &out, if i < len(missing) { missing[i] } else { Val.Null })
-            continue
-        }
-        let tag = s[at]
-        at += 1
-        if tag == 5 {
-            append(mut &longAt, i)
-            append(mut &longLen, binary.readU32LEStr(s, at))
-            at += 4
-            append(mut &out, Val.Null)
-            continue
-        }
-        if some && !need[i] {
-            let sz = valSize(s, at, tag)
-            if sz < 0 { return Err(lexdb_base.corrupt("a row's value tag")) }
-            at += sz
-            append(mut &out, Val.Null)
-            continue
-        }
-        if tag == 0 {
-            append(mut &out, Val.Null)
-        } else if tag == 1 {
-            append(mut &out, Val.Int(binary.readI64LEStr(s, at)))
-            at += 8
-        } else if tag == 2 {
-            append(mut &out, Val.Bool(s[at] == 1))
-            at += 1
-        } else if tag == 3 || tag == 4 {
-            let l = binary.readU32LEStr(s, at)
-            let t = s[at + 4..at + 4 + l]
-            at += 4 + l
-            if tag == 4 {
-                append(mut &out, Val.Text(t))
-            } else {
-                match Decimal.parse(&t) {
-                    Ok(d) { append(mut &out, Val.Num(d)) }
-                    Err(_) { return Err(lexdb_base.corrupt("a numeric value in a row")) }
-                }
-            }
-        } else if tag >= 7 && tag <= 15 {
-            append(mut &out, timeVal(s, at, tag))
-            at += valSize(s, at, tag)
-        } else {
-            return Err(lexdb_base.corrupt("a row's value tag"))
-        }
-    }
-    if long {
-        // the columns not read when the row has more than the table (none yet)
-        for i in n..cols {
-            let tag = s[at]
-            at += 1
-            if tag == 5 {
-                append(mut &longAt, i)
-                append(mut &longLen, binary.readU32LEStr(s, at))
-                at += 4
-            } else { at += valSize(s, at, tag) }
-        }
-        for k in 0..len(longAt) {
-            let l = longLen[k]
-            let i = longAt[k]
-            if i < n && (!some || need[i]) {
-                if at + l > len(s) { return Err(lexdb_base.corrupt("a row's long text")) }
-                out[i] = Val.Text(s[at..at + l])
-            }
-            at += l
-        }
-    }
-    return Ok(out)
+    return lexdb_rows.decodeRowNeed(s, n, need, missing, lays)
 }
 
 // ---- the catalog
@@ -3708,7 +3433,7 @@ fn encTable(t: &Table): str {
                 None {}
             }
             if missing {
-                let v = encRow(&[c.missing])
+                let v = lexdb_rows.encodeRow(&[c.missing])
                 binary.addU32LE(mut &b, len(v))
                 b.add(&v)
             }
@@ -12586,7 +12311,7 @@ fn rewrite(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, cha
             let row = try rowOf(st, txn, t, &out.keys[i], &out.encs[i], rowWidth(t), &[], &[])
             return Err(dupMade(t, &pkConName(t), &t.pk, &[], &row))
         }
-        try txn.putRow(t.tree, &out.keys[i], &out.encs[i], rowHead(&out.encs[i]))
+        try txn.putRow(t.tree, &out.keys[i], &out.encs[i], lexdb_rows.rowHead(&out.encs[i]))
         noteChg(st, txn, t, 0)          // the new tree's rows, for its statistics (optimizer 44)
     }
     for j in 0..len(out.redo) {
@@ -14409,7 +14134,7 @@ fn storeRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, row: [
     // for, nor read (9.119)
     if !rowidKeyed(t) && (try st.get(txn, t.tree, &key)).isSome() { return Err(dupKey(t, &row)) }
     let enc = encRowOf(t, &row)
-    try txn.putRow(t.tree, &key, &enc, rowHead(&enc))
+    try txn.putRow(t.tree, &key, &enc, lexdb_rows.rowHead(&enc))
     noteChg(st, txn, t, 0)
     try addIndexes(st, txn, t, &row, &key)
     if len(t.fks) > 0 {
@@ -20724,7 +20449,7 @@ fn updRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, old: &[]
         txn.del(t.tree, &oldKey)
     }
     let enc = encRowOf(t, row)
-    try txn.putRow(t.tree, &key, &enc, rowHead(&enc))
+    try txn.putRow(t.tree, &key, &enc, lexdb_rows.rowHead(&enc))
     noteChg(st, txn, t, 1)
     try changeIndexes(st, txn, t, old, &oldKey, row, &key)
     if len(t.fks) > 0 { try childSide(st, txn, t, fw, row, old, later) }
@@ -20825,7 +20550,7 @@ fn pendingCheck(kind: int, child: &str, fname: &str, vals: &[]Val): str {
     addStr(mut &b, child)
     addStr(mut &b, fname)
     binary.addU32LE(mut &b, len(vals))
-    b.add(&(encRow(vals)))
+    b.add(&(lexdb_rows.encodeRow(vals)))
     return b.toStr()
 }
 
@@ -24845,7 +24570,7 @@ fn bRowInto(s: &str, r: int, b: mut &Batch, bp: &BPlan, t: &Table): Result[int, 
         let tag = s[at]
         at += 1
         if c < 0 {
-            let sz = valSize(s, at, tag)
+            let sz = lexdb_rows.valSize(s, at, tag)
             if sz < 0 { return Err(lexdb_base.corrupt("a row's value tag")) }
             at += sz
             continue
@@ -24880,8 +24605,8 @@ fn bRowInto(s: &str, r: int, b: mut &Batch, bp: &BPlan, t: &Table): Result[int, 
                 }
             }
         } else if tag >= 7 && tag <= 15 {
-            b.vals[c][r] = timeVal(s, at, tag)
-            at += valSize(s, at, tag)
+            b.vals[c][r] = lexdb_rows.timeVal(s, at, tag)
+            at += lexdb_rows.valSize(s, at, tag)
         } else {
             return Err(lexdb_base.corrupt("a row's value tag"))
         }
@@ -28651,7 +28376,7 @@ fn batchGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
 // in their binary form (Decimal.toBin). Each place is at an offset its
 // layout gives, so reading one is a load, not a walk over the places before
 // it. A row this cannot hold is in the tagged form (encRow): one with a
-// long text (LONG, encLong), over 255 places, a value not of its place's
+// long text (LONG, lexdb_rows.encodeLong), over 255 places, a value not of its place's
 // kind, or written with the test hook setFixedRows(false).
 //
 // Since 9.113 a date, a time, a timestamp and a timestamptz are words in
