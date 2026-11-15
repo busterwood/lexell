@@ -56,10 +56,12 @@ point 7 (continuous cleanup), and planner option B.
   `choosePath`, `pathFig`, `costOrder` and EXPLAIN are still in exec.
 - **Dialect boundary (1): naming and the snapshot moved.** The seven
   exec→dialect imports remain.
-- **Session memo moved out of Store.** `lexdb_memo.Memo` owns the map and
-  its lock; `Store` carries a handle (`Store.memo`) and never reads a key.
-  The three `memo*` methods left the Store interface (Store 118 → 115
-  public functions).
+- **Store capabilities split out.** `lexdb_memo.Memo` owns the session
+  scratch map; `lexdb_locks.Locks` owns row locks, waiters and the deadlock
+  walk; `lexdb_session.SqlTxn` holds the SQL state a transaction carries
+  (`Txn.sql`, which the store never reads — the import gate checks it).
+  Test and diagnostic knobs sit behind `Store.testHooks()`. Store's public
+  functions went 126 → 91 (lines per export 55.9 → 72.1).
 
 ## Remaining: 1. closing the dialect imports
 

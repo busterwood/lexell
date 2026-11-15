@@ -12511,5 +12511,16 @@ the 5% gate. The scan family is still five methods; one reader over a
 **Session memo out of the store** (2026-11-15). The SQL layer's scratch map
 (session user and settings, a sequence's block, the catalog binding) moved
 to `lexdb_memo.Memo`, with its own lock; `Store` carries the handle and
-never reads a key. Store's public functions went 118 → 115. The 35-query
-A/B is 1.017 CPU geometric mean (median 1.01), inside the gate.
+never reads a key. The 35-query A/B is 1.017 CPU geometric mean (median
+1.01), inside the gate.
+
+**Locks, SQL payload, test hooks.** `lexdb_locks.Locks` owns the lock
+table, waiters and deadlock walk; Store keeps `lockRow`, the wrapper that
+manages `Txn.lockId/held`. `lexdb_session.SqlTxn` collects the SQL state a
+transaction carries (path, session, planner mode, memory budget, zone,
+deferred constraints); `Txn.sql` is a payload the store never reads, and
+the import gate fails if it does. Test and diagnostic knobs (cache state,
+counters, column/cut counts, hooks, frame/cut/read-drop limits, upgrade
+budget, audit, segment and chunk names) are private functions behind
+`Store.testHooks()`. Store's public functions went 126 → 91, lines per
+export 55.9 → 72.1; suite 168, replica 12 rounds, A/B 1.010 CPU.
