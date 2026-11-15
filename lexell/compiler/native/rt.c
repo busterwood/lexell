@@ -154,16 +154,18 @@ static int str_eqn(const char* a, const char* b, size_t n) {
     return 1;
 }
 
-/* ---- the heap: size classes on mmap'd chunks, one free list per class; a large block is
-   its own mapping. Every block has an 8-byte header just below it: its class (below NCLASS),
+/* ---- the heap: size classes on mmap'd chunks, a free list per chunk and class; a large block
+   is its own mapping. Every block has an 8-byte header just below it: its class (below NCLASS),
    or for a large block its mapping size. The small classes are 8 bytes short of a multiple of
-   16 (8, 24, 40, ...) and a chunk's first block starts 8 bytes in, so header and block fill a
+   16 (8, 24, 40, ...) and a chunk's blocks start at an aligned header, so header and block fill a
    multiple of 16 and blocks are 16-byte aligned like malloc's (a 70-byte string takes 80 bytes,
-   as with glibc, not 96). A large block starts 16 bytes into its mapping. Memory of the small
-   classes is reused, never unmapped. The last large block freed, up to KEEP bytes, is kept for
-   the next large malloc it fits (at most twice the size asked for): a program that allocates
-   and frees one big array in a loop then faults its pages in once, not each round. glibc does
-   the same with its dynamic mmap threshold, up to 32 MiB. */
+   as with glibc, not 96). A large block starts 16 bytes into its mapping.
+
+   EXPERIMENT (design/runtime-memory.md 8): the free lists moved from the heap into the chunk, and
+   a chunk is retired whole when its last live block is freed. The intent is to return memory with
+   no scan: a wholly free chunk's blocks are all in its own lists, so it can be detached from the
+   heap's per-class chunk lists without walking them. The last large block freed, up to KEEP bytes,
+   is kept for the next large malloc it fits, as before. */
 
 #define NCLASS 40
 #define LARGE_MARK 0xff                 /* a large block's class byte */
@@ -177,14 +179,37 @@ static size_t class_size[NCLASS];
    par.map a worker works on. A large block's mapping size is in word 0 of its mapping. Blocks
    pass from a worker to the main thread with par.map's results and are then the main thread's:
    it frees them onto its own lists (their stale tags match no worker's again). */
-typedef struct {
-    void* free_list[NCLASS];
-    char* chunk_at;
-    size_t chunk_left;
+typedef struct rt_chunk rt_chunk;
+typedef struct rt_hp {
+    rt_chunk* cur;                  /* the chunk being carved, or 0 */
+    uint64_t cur_live;              /* the current chunk's live blocks (its header's live is stale) */
+    void* cur_free[NCLASS];         /* the current chunk's free blocks, off the class lists */
+    rt_chunk* class_head[NCLASS];   /* chunks with a free block of a class, doubly linked */
+    rt_chunk* queue;                /* chunks with no live block, to retire */
+    int64_t queued;                 /* the queue's length */
+    void* legacy[NCLASS];           /* blocks freed here whose chunk another heap owns */
     size_t* large_kept;             /* the kept mapping (its size in word 0), or 0 */
     uint64_t tag;                   /* the owner tag written into each block's header */
 } rt_hp;
+struct rt_chunk {
+    rt_chunk* qnext;                /* the retire queue */
+    rt_chunk* class_next[NCLASS];
+    rt_chunk* class_prev[NCLASS];
+    void* free_list[NCLASS];
+    char* at;                       /* where the next new block starts */
+    size_t left;
+    uint64_t live;                  /* blocks of this chunk not freed */
+    uint32_t queued;                /* in the retire queue */
+    struct rt_hp* owner;
+};
+#define CHUNK_HDR ((sizeof(rt_chunk) + 15) & ~(size_t)15)
 static rt_hp rt_mheap;
+/* EXPERIMENT (design/runtime-memory.md 8): the main heap's chunks, for lxllib_heapstat. */
+#define HP_MAXCHUNKS 65536
+static char* hp_chunk[HP_MAXCHUNKS];
+static int hp_nchunks;
+static char* hp_freechunk[HP_MAXCHUNKS];   /* whole chunks returned, for reuse */
+static int hp_nfreechunks;
 /* A par worker's context, at the top of its stack slot (design/parallel.md 2.1). rt_wme() is the
    calling thread's, or 0 on the main thread: a stack-range test, no TLS. */
 typedef struct { rt_dfn f; void* p; } rt_dact;
@@ -256,12 +281,47 @@ __attribute__((noinline)) static void* sys_mmap_thp(size_t n) {
     SYS(S_MADVISE, p, n, rt_thp_adv);
     return p;
 }
-/* A fresh chunk for the small classes, out of line. */
+static void class_link(rt_hp* h, rt_chunk* ch, int c);
+/* The current chunk's free blocks sit in the heap (one load on the fast path); when it is
+   full, they move into its header and onto the class lists, and a new chunk is carved. */
+__attribute__((noinline)) static void cur_flush(rt_hp* h) {
+    rt_chunk* ch = h->cur;
+    if (!ch) return;
+    for (int c = 0; c < NCLASS; c++) {
+        if (!h->cur_free[c]) continue;
+        ch->free_list[c] = h->cur_free[c];
+        h->cur_free[c] = 0;
+        class_link(h, ch, c);
+    }
+}
+/* A chunk with no live block goes on the heap's retire queue; trimHeap takes it off. */
+static inline void chunk_queue(rt_hp* h, rt_chunk* ch) {
+    if (!ch->queued && ch != h->cur) {
+        ch->queued = 1;
+        ch->qnext = h->queue;
+        h->queue = ch;
+        h->queued++;
+    }
+}
+/* A fresh (or pooled) chunk for the small classes, out of line. */
 __attribute__((noinline)) static bool heap_chunk(rt_hp* h) {
-    char* p = sys_mmap_thp(CHUNK);
+    char* p = h == &rt_mheap && hp_nfreechunks > 0 ? hp_freechunk[--hp_nfreechunks] : sys_mmap_thp(CHUNK);
     if (!p) return false;
-    h->chunk_at = p + 8;
-    h->chunk_left = CHUNK - 8;
+    rt_chunk* old = h->cur;
+    if (old) {
+        old->live = h->cur_live;
+        h->cur_live = 0;
+        cur_flush(h);
+        h->cur = 0;
+        if (old->live == 0) chunk_queue(h, old);
+    }
+    rt_chunk* ch = (rt_chunk*)p;
+    memset(ch, 0, sizeof *ch);
+    ch->owner = h;
+    ch->at = p + CHUNK_HDR;
+    ch->left = CHUNK - CHUNK_HDR;
+    if (h == &rt_mheap && hp_nchunks < HP_MAXCHUNKS) hp_chunk[hp_nchunks++] = p;
+    h->cur = ch;
     return true;
 }
 static void heap_init(void) {
@@ -311,22 +371,57 @@ __attribute__((noinline)) static void free_large(rt_hp* h, size_t* k) {
 /* The main thread's paths test one word (rt_par_span: 0 until the pool starts) and then work on
    rt_mheap at fixed addresses, as before there were workers. A block popped from the main thread's
    lists keeps its header: a stale worker tag in it matches no worker's tag again. */
+static inline void class_link(rt_hp* h, rt_chunk* ch, int c) {
+    rt_chunk* old = h->class_head[c];
+    ch->class_next[c] = old;
+    ch->class_prev[c] = 0;
+    if (old) old->class_prev[c] = ch;
+    h->class_head[c] = ch;
+}
+static inline void class_unlink(rt_hp* h, rt_chunk* ch, int c) {
+    rt_chunk* nx = ch->class_next[c], * pv = ch->class_prev[c];
+    if (pv) pv->class_next[c] = nx; else h->class_head[c] = nx;
+    if (nx) nx->class_prev[c] = pv;
+    ch->class_next[c] = 0;
+    ch->class_prev[c] = 0;
+}
+/* The main thread's paths test one word (rt_par_span: 0 until the pool starts) and then work on
+   rt_mheap at fixed addresses, as before there were workers. A block popped from the main thread's
+   lists keeps its header: a stale worker tag in it matches no worker's tag again. */
 static inline __attribute__((always_inline)) void* malloc_h(rt_hp* h, size_t n, bool tagit) {
     size_t need = n ? n : 1;
     if (__builtin_expect(need > LARGE, 0)) return malloc_large(h, need);
     int c = class_of(need);
-    void* f = h->free_list[c];
+    void* f = h->cur_free[c];
     if (f) {
-        h->free_list[c] = *(void**)f;
+        h->cur_free[c] = *(void**)f;
+        h->cur_live++;
+        if (tagit) ((size_t*)f)[-1] = (size_t)c | h->tag << 8;
+        return f;
+    }
+    rt_chunk* ch = h->class_head[c];
+    if (ch) {
+        void* f = ch->free_list[c];
+        ch->free_list[c] = *(void**)f;
+        if (!ch->free_list[c]) class_unlink(h, ch, c);
+        ch->live++;
+        if (tagit) ((size_t*)f)[-1] = (size_t)c | h->tag << 8;
+        return f;
+    }
+    f = h->legacy[c];
+    if (f) {
+        h->legacy[c] = *(void**)f;
         if (tagit) ((size_t*)f)[-1] = (size_t)c | h->tag << 8;
         return f;
     }
     size_t bs = class_size[c] + 8;
-    if (h->chunk_left < bs && !heap_chunk(h)) return 0;
-    char* b = h->chunk_at;
-    h->chunk_at += bs;
-    h->chunk_left -= bs;
+    if ((!h->cur || h->cur->left < bs) && !heap_chunk(h)) return 0;
+    rt_chunk* cur = h->cur;
+    char* b = cur->at;
+    cur->at += bs;
+    cur->left -= bs;
     ((size_t*)b)[0] = tagit ? (size_t)c | h->tag << 8 : (size_t)c;     /* the main thread's tag is 0 */
+    h->cur_live++;
     return b + 8;
 }
 /* malloc's one test, as before there were workers: rt_heap_slow is set until the heap is set up,
@@ -348,13 +443,30 @@ static size_t block_size(void* p) {
     return h < NCLASS ? class_size[h] : ((size_t*)p)[-2] - 16;
 }
 static inline __attribute__((always_inline)) void free_h(rt_hp* hp, void* p) {
-    size_t h = ((size_t*)p)[-1] & 0xff;
-    if (__builtin_expect(h >= NCLASS, 0)) {
+    size_t h = ((size_t*)p)[-1];
+    int c = (int)(h & 0xff);
+    if (__builtin_expect(c >= NCLASS, 0)) {
         free_large(hp, (size_t*)((char*)p - 16));
         return;
     }
-    *(void**)p = hp->free_list[h];
-    hp->free_list[h] = p;
+    rt_chunk* ch = (rt_chunk*)((uintptr_t)p & ~(CHUNK - 1));
+    if (__builtin_expect(ch == hp->cur, 1)) {            /* the common case: the chunk being carved */
+        *(void**)p = hp->cur_free[c];
+        hp->cur_free[c] = p;
+        hp->cur_live--;
+        return;
+    }
+    if (__builtin_expect(ch->owner != hp, 0)) {         /* a block whose chunk another heap owns */
+        *(void**)p = hp->legacy[c];
+        hp->legacy[c] = p;
+        return;
+    }
+    bool was_empty = ch->free_list[c] == 0;
+    *(void**)p = ch->free_list[c];
+    ch->free_list[c] = p;
+    if (was_empty) class_link(hp, ch, c);
+    ch->live--;
+    if (ch->live == 0) chunk_queue(hp, ch);
 }
 /* free's one test, as before there were workers: a header word at or above NCLASS is a large
    block, or a block with a worker's tag (a worker's own, or one that came to the main thread with
@@ -363,13 +475,13 @@ __attribute__((noinline)) static void free_slow(void* p, size_t h) {
     if (rt_par_span) { RT_HOOK(free)(p, h); return; }   /* the pool's (worker or main thread) */
     free_large(&rt_mheap, (size_t*)((char*)p - 16));
 }
-void free(void* p) {
+static inline __attribute__((always_inline)) void free_fast(void* p) {
     if (!p) return;
     size_t h = ((size_t*)p)[-1];
     if (__builtin_expect(h >= NCLASS, 0)) { free_slow(p, h); return; }
-    *(void**)p = rt_mheap.free_list[h];
-    rt_mheap.free_list[h] = p;
+    free_h(&rt_mheap, p);
 }
+void free(void* p) { free_fast(p); }
 void* realloc(void* p, size_t n) {
     if (!p) return malloc(n);
     size_t have = block_size(p);
@@ -438,6 +550,126 @@ static void eputd(int64_t v) {
 }
 static void eflush(void) { write_all(2, ebuf, elen); elen = 0; }
 
+/* EXPERIMENT (design/runtime-memory.md 8): how much of the main heap's chunk memory is on
+   wholly free pages, and how much of that a page-level pass could return. The page count is exact
+   only with no par workers (the main heap alone is walked). Remove with the experiment. */
+#define HP_PPCH ((int)(CHUNK >> 12))
+static void hp_cover(unsigned short* cov, int ci, char* a, char* b) {
+    char* base = hp_chunk[ci];
+    char* end = base + CHUNK;
+    if (a < base) a = base;
+    if (b > end) b = end;
+    if (a >= b) return;
+    size_t p0 = (size_t)(a - base) >> 12, p1 = (size_t)(b - base - 1) >> 12;
+    for (size_t p = p0; p <= p1; p++) {
+        char* ps = base + (p << 12), * pe = ps + 4096;
+        char* lo = a > ps ? a : ps;
+        char* hi = b < pe ? b : pe;
+        cov[(size_t)ci * HP_PPCH + p] += (unsigned short)(hi - lo);
+    }
+}
+void lxllib_heapstat(void) {
+    if (hp_nchunks == 0) { eputs("Lexell heap: no chunks\n"); eflush(); return; }
+    size_t np = (size_t)hp_nchunks * (size_t)HP_PPCH;
+    unsigned short* cov = sys_mmap(np * sizeof *cov);
+    if (!cov) { eputs("Lexell heap: no memory for the report\n"); eflush(); return; }
+    for (int i = 0; i < hp_nchunks; i++) {
+        rt_chunk* ch = (rt_chunk*)hp_chunk[i];
+        hp_cover(cov, i, hp_chunk[i], hp_chunk[i] + CHUNK_HDR);
+        hp_cover(cov, i, ch->at, hp_chunk[i] + CHUNK);
+    }
+    int64_t nblocks = 0, nbytes = 0, nstraddle = 0, nlegacy = 0;
+    for (int i = 0; i < hp_nchunks; i++) {
+        rt_chunk* ch = (rt_chunk*)hp_chunk[i];
+        for (int c = 0; c < NCLASS; c++) {
+            for (void* f = ch == rt_mheap.cur ? rt_mheap.cur_free[c] : ch->free_list[c]; f; f = *(void**)f) {
+                char* h = (char*)f - 8;
+                size_t bs = class_size[c] + 8;
+                if (((size_t)(h - hp_chunk[i]) >> 12) != ((size_t)(h + bs - 1 - hp_chunk[i]) >> 12)) nstraddle++;
+                hp_cover(cov, i, h, h + bs);
+                nblocks++;
+                nbytes += (int64_t)bs;
+            }
+        }
+    }
+    for (int c = 0; c < NCLASS; c++)
+        for (void* f = rt_mheap.legacy[c]; f; f = *(void**)f) nlegacy++;
+    /* Wholly covered pages can go back. A free block that straddles one into a page that
+       stays costs the bytes on the staying side: the block comes off its list, since its
+       link is in the page being returned. */
+    int64_t lost = 0, nlost = 0;
+    for (int i = 0; i < hp_nchunks; i++) {
+        rt_chunk* ch = (rt_chunk*)hp_chunk[i];
+        for (int c = 0; c < NCLASS; c++) {
+            for (void* f = ch == rt_mheap.cur ? rt_mheap.cur_free[c] : ch->free_list[c]; f; f = *(void**)f) {
+                char* h = (char*)f - 8;
+                size_t bs = class_size[c] + 8;
+                size_t p0 = (size_t)(h - hp_chunk[i]) >> 12;
+                size_t p1 = (size_t)(h + bs - 1 - hp_chunk[i]) >> 12;
+                bool anyfull = false, anynot = false;
+                for (size_t p = p0; p <= p1; p++) {
+                    if (cov[(size_t)i * HP_PPCH + p] == 4096) anyfull = true; else anynot = true;
+                }
+                if (!(anyfull && anynot)) continue;
+                nlost++;
+                for (size_t p = p0; p <= p1; p++) {
+                    if (cov[(size_t)i * HP_PPCH + p] == 4096) continue;
+                    char* ps = hp_chunk[i] + (p << 12), * pe = ps + 4096;
+                    char* lo = h > ps ? h : ps;
+                    char* hi = h + bs < pe ? h + bs : pe;
+                    lost += (int64_t)(hi - lo);
+                }
+            }
+        }
+    }
+    size_t full = 0, whole = 0;
+    for (int i = 0; i < hp_nchunks; i++) {
+        size_t cf = 0;
+        for (int p = 0; p < HP_PPCH; p++) if (cov[(size_t)i * HP_PPCH + p] == 4096) cf++;
+        full += cf;
+        if (cf == (size_t)HP_PPCH) whole++;
+    }
+    eputs("Lexell heap: "); eputd(hp_nchunks); eputs(" chunks, ");
+    eputd((int64_t)((size_t)hp_nchunks * CHUNK >> 10)); eputs(" KiB mapped\n");
+    eputs("  free lists: "); eputd(nblocks); eputs(" blocks, "); eputd(nbytes >> 10);
+    eputs(" KiB (with headers); "); eputd(nstraddle); eputs(" straddle a page");
+    eputs("; "); eputd(nlegacy); eputs(" foreign\n");
+    eputs("  4 KiB pages: "); eputd((int64_t)(full * 4096 >> 10)); eputs(" KiB free");
+    eputs("; dropped with straddling frees: "); eputd(lost >> 10); eputs(" KiB (");
+    eputd(nlost); eputs(" blocks)\n");
+    eputs("  whole 2 MiB chunks: "); eputd((int64_t)whole); eputs(" (");
+    eputd((int64_t)(whole * (CHUNK >> 10))); eputs(" KiB); queued to retire: ");
+    eputd(rt_mheap.queued); eputs("\n");
+    eflush();
+    SYS(S_MUNMAP, cov, np * sizeof *cov, 0);
+}
+
+/* EXPERIMENT: retire one wholly free chunk: detach its (all-free) lists, MADV_DONTNEED it, and
+   keep it for reuse. O(NCLASS), no scan of the blocks. Returns 1 if it took a chunk off the
+   queue, 0 when the queue is empty. */
+int64_t lxllib_heaptrim(void) {
+    rt_chunk* ch = rt_mheap.queue;
+    if (!ch) return 0;
+    rt_mheap.queue = ch->qnext;
+    rt_mheap.queued--;
+    ch->qnext = 0;
+    if (ch->live != 0 || ch == rt_mheap.cur) { ch->queued = 0; return 1; }
+    for (int c = 0; c < NCLASS; c++)
+        if (ch->free_list[c]) class_unlink(&rt_mheap, ch, c);
+    char* base = (char*)ch;
+    for (int i = 0; i < hp_nchunks; i++) {
+        if (hp_chunk[i] == base) {
+            for (int j = i + 1; j < hp_nchunks; j++) hp_chunk[j - 1] = hp_chunk[j];
+            hp_nchunks--;
+            break;
+        }
+    }
+    SYS(S_MADVISE, base, CHUNK, 4);                 /* MADV_DONTNEED */
+    if (hp_nfreechunks < HP_MAXCHUNKS) hp_freechunk[hp_nfreechunks++] = base;
+    else SYS(S_MUNMAP, base, CHUNK, 0);
+    return 1;
+}
+
 __attribute__((noreturn)) void rt_trap(int code, const char* msg, const char* where) {
     if (__builtin_expect(rt_par_span != 0, 0)) { rt_wctx* w = rt_wme(); if (w) RT_HOOK(trap)(w, code, msg, "", 0, where); }
     rt_flush();
@@ -465,7 +697,7 @@ void* rt_alloc(size_t n) {
     if (rt_check) rt_live_add(1);
     return p;
 }
-void rt_free(void* p) { free(p); if (rt_check) rt_live_add(-1); }
+void rt_free(void* p) { free_fast(p); if (rt_check) rt_live_add(-1); }
 
 /* Drop actions: drop glue pushes the parts of a value instead of recursing (SPEC 9.4). The
    stack is the current task's (rt_switch swaps it), or a par worker's own. */
@@ -2405,6 +2637,14 @@ static void rt_poll(bool block, const char* w) {
             }
             continue;                       /* timers again; then sleep if still nothing */
         }
+        if (wait != 0 && rt_mheap.queue) {
+            static int trim_on = -1;
+            if (trim_on < 0) { const char* e = getenv("LXL_TRIM"); trim_on = e && e[0] == '1'; }
+            if (trim_on && rt_mheap.queued >= 4) {   /* keep a few chunks; do not thrash */
+                int64_t until = rt_mono() + 250000;      /* at most 250 us of retiring */
+                while (rt_mheap.queue && lxllib_heaptrim() && rt_mono() < until) {}
+            }
+        }
         if (rt_nio || rt_njobs) {
             int ms = wait < 0 ? -1 : wait > (int64_t)INT32_MAX * 1000000 ? INT32_MAX
                    : (int)(wait / 1000000 + (wait % 1000000 != 0));
@@ -3814,8 +4054,7 @@ static void rt_pfree(void* p, size_t h) {          /* a large block, or one with
     if ((h & 0xff) >= NCLASS) { free_large(hp, (size_t*)((char*)p - 16)); return; }
     static const char m[] = "Lexell: internal error: a par worker freed a block it does not own\n";
     if (w && h >> 8 != w->heap.tag) rt_wstop(w, 2, m, sizeof m - 1);
-    *(void**)p = hp->free_list[h & 0xff];
-    hp->free_list[h & 0xff] = p;
+    free_h(hp, p);
 }
 static bool rt_str_wcount(rt_wctx* w, void* b, int64_t d);
 __attribute__((noinline)) static lxl_str rt_str_dup_p(lxl_str s) {
