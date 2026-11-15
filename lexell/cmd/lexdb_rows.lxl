@@ -11,7 +11,6 @@ import "binary"
 import "math"
 import "./lexdb_base"
 import "./lexdb_cols"
-import "./lexdb_page"
 import "./lexdb_sql"
 import "./lexdb_time"
 
@@ -465,6 +464,101 @@ pub fn placesNeeded(r: &Rows, need: &[]bool): []bool {
     return out
 }
 
+// ---- column leaf bodies (T_CLEAF, 9.112)
+//
+// A column leaf's body is \xff\xff (no row body starts so: a key is at most
+// MAX_KEY bytes), a u32 of its keys' bytes K, its keys as a lazy body holds
+// them (a u16 key length, a u16 0, the key), then its columns (lexdb_cols).
+
+pub const CB: int = 6
+const PAGE: int = 4096
+
+// The bytes a leaf's keys from..to take front coded on a T_CLEAF page.
+fn colKeysSize(keys: &[]str, from: int, to: int): int {
+    var size = 0
+    for i in from..to {
+        let k = keys[i]
+        let c = if i == from { 0 } else { commonLen(&keys[i - 1], &k) }
+        size += varLen(c) + varLen(len(k) - c) + len(k) - c
+    }
+    return size
+}
+
+// A column leaf's body: keys from (lazy body form, kb bytes) and columns cols.
+fn colBodyOf(keys: &[]byte, kb: int, cols: &str): str {
+    var out: []byte = withCapacity(CB + kb + len(cols))
+    append(mut &out, byte(0xff))
+    append(mut &out, byte(0xff))
+    binary.appendU32LE(mut &out, kb)
+    appendStr(mut &out, strFromBytes(&keys[0..kb]))
+    appendStr(mut &out, cols.toStr())
+    return strFromBytes(&out)
+}
+
+// Leaf keys and vals as a column leaf's body: None when the rows do not all
+// encode (lexdb_cols.encodeRows) or the page would not hold them.
+pub fn colBody(keys: &[]str, vals: &[]&str, spec: &lexdb_cols.Spec): Option[str] {
+    return colBodyRange(keys, vals, 0, len(keys), spec)
+}
+
+// colBody of the entries from..to.
+pub fn colBodyRange(keys: &[]str, vals: &[]&str, from: int, to: int, spec: &lexdb_cols.Spec): Option[str] {
+    var conv = false
+    let got = colBodyRangeK(keys, vals, from, to, spec, lexdb_cols.checking(), mut &conv)
+    if conv { lexdb_cols.noteConverted() }
+    return got
+}
+
+// colBodyRange as a kernel (par.map): check is lexdb_cols.checking(); conv
+// set when the rows were converted (9.114), which the caller counts
+// (lexdb_cols.noteConverted).
+pub fn colBodyRangeK(keys: &[]str, vals: &[]&str, from: int, to: int, spec: &lexdb_cols.Spec,
+                     check: bool, conv: mut &bool): Option[str] {
+    let cnt = to - from
+    if cnt <= 0 { return None }
+    var rows: []&str = withCapacity(cnt)
+    for i in from..to { append(mut &rows, vals[i]) }
+    var cv: []str = []
+    let got = lexdb_cols.encodeCheckedK(&rows, spec, check, mut &cv)
+    if len(cv) > 0 { conv = true }
+    if got.isNone() { return None }
+    let cols = got.unwrap()
+    if 22 + colKeysSize(keys, from, to) + len(cols) > PAGE { return None }
+    var kb = 0
+    for i in from..to { kb += 4 + len(keys[i]) }
+    var keyBytes: []byte = withCapacity(kb)
+    for i in from..to {
+        let k = keys[i]
+        binary.appendU16LE(mut &keyBytes, len(k))
+        binary.appendU16LE(mut &keyBytes, 0)
+        appendStr(mut &keyBytes, k)
+    }
+    return Some(colBodyOf(&keyBytes, kb, &cols))
+}
+
+// The bytes a column leaf of the entries from..to would take on its page
+// (its header, keys and columns), -1 when the rows do not encode.
+pub fn colSize(keys: &[]str, vals: &[]&str, from: int, to: int, spec: &lexdb_cols.Spec): int {
+    if to <= from { return -1 }
+    var rows: []&str = withCapacity(to - from)
+    for i in from..to { append(mut &rows, vals[i]) }
+    match lexdb_cols.encodeRows(&rows, spec) {
+        Some(cols) { return 22 + colKeysSize(keys, from, to) + len(cols) }
+        None { return -1 }
+    }
+}
+
+// The bytes two keys share at the start (front coding), and the bytes a
+// varint of x takes: page's front coding calls these too.
+pub fn commonLen(a: &str, b: &str): int {
+    let m = if len(a) < len(b) { len(a) } else { len(b) }
+    var n = 0
+    while n < m && a[n] == b[n] { n += 1 }
+    return n
+}
+
+pub fn varLen(x: int): int { return if x < 0x80 { 1 } else if x < 0x4000 { 2 } else { 3 } }
+
 // A table's row as stored: its values at their places, NULL at a dropped
 // column's.
 pub fn encodeRowOf(r: &Rows, row: &[]Val): str {
@@ -763,39 +857,4 @@ pub fn decodeRowNeed(s: &str, n: int, need: &[]bool, missing: &[]Val, lays: &[]F
         }
     }
     return Ok(out)
-}
-
-// A leaf to encode (encodeLeaf): its version at the cut, and the index of
-// its tree's layouts in the cut's (-1 none).
-pub type LeafJob = record { pub node: lexdb_page.Node; pub spec: int }
-
-// A leaf encoded: its page's body (lexdb_page.bodyPage), kind 0 its rows,
-// 1 a column leaf, 2 neither fits a page (refit cuts it); conv: its rows
-// were converted to the current layout (9.114).
-// packed: the leaf as repack would make it of body (lexdb_page.packedLeaf),
-// none when it is already a column leaf of that body.
-pub type LeafEnc = record { pub body: str; pub kind: int; pub conv: bool; pub packed: Option[lexdb_page.Node] }
-
-// What the checkpoint writes of a leaf (leafBody's choice, and refit's test
-// of a leaf that does not fit): a kernel, run on the par pool.
-pub fn encodeLeaf(j: &LeafJob, specs: &[]lexdb_cols.Spec, colsOn: bool, check: bool): LeafEnc {
-    let n = &j.node
-    if j.spec >= 0 {
-        if colsOn {
-            if n.isCols() { return LeafEnc{body: n.body, kind: 1, conv: false, packed: None} }
-            var conv = false
-            match lexdb_page.colBodyRangeK(n, 0, n.count(), &specs[j.spec], check, mut &conv) {
-                Some(b) {
-                    let p = lexdb_page.packedLeaf(&b, n.count())
-                    return LeafEnc{body: b, kind: 1, conv: conv, packed: Some(p)}
-                }
-                None {}
-            }
-        }
-        if n.size > lexdb_page.NODE_ROOM && !n.isCols() && n.count() > 0 { return LeafEnc{body: "", kind: 2, conv: false, packed: None} }
-    }
-    let b = lexdb_page.leafNodeBody(n)
-    if n.lazy { return LeafEnc{body: b, kind: 0, conv: false, packed: None} }
-    let p = lexdb_page.packedLeaf(&b, n.count())
-    return LeafEnc{body: b, kind: 0, conv: false, packed: Some(p)}
 }

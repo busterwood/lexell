@@ -5251,7 +5251,7 @@ pub fn (st: &Store) checkpoint(): Result[Unit, lexdb_base.DbErr] {
         var at = 0
         while at < len(leaves) && !lost {
             let end = min(at + c.chunk, len(leaves))
-            var jobs: []lexdb_rows.LeafJob = []
+            var jobs: []LeafJob = []
             st.sh.with(fn(db: mut &Db) {
                 if len(db.failed) > 0 || !db.snapLive(c.snap) {
                     lost = true
@@ -5264,16 +5264,16 @@ pub fn (st: &Store) checkpoint(): Result[Unit, lexdb_base.DbErr] {
                         lost = true
                         return
                     }
-                    append(mut &jobs, lexdb_rows.LeafJob{node: copyNode(db.snapNode(cn.slot, v)), spec: cn.spec})
+                    append(mut &jobs, LeafJob{node: copyNode(db.snapNode(cn.slot, v)), spec: cn.spec})
                 }
             })
             if lost { break }
             let colsOn = c.colsOn
             let check = c.check
             let specs = &c.specs
-            var encs: []lexdb_rows.LeafEnc = []
-            if c.pool { encs = par.map(&jobs, fn(j: &lexdb_rows.LeafJob): lexdb_rows.LeafEnc { return lexdb_rows.encodeLeaf(j, specs, colsOn, check) }) } else {
-                for j in &jobs { append(mut &encs, lexdb_rows.encodeLeaf(j, specs, colsOn, check)) }
+            var encs: []LeafEnc = []
+            if c.pool { encs = par.map(&jobs, fn(j: &LeafJob): LeafEnc { return encodeLeaf(j, specs, colsOn, check) }) } else {
+                for j in &jobs { append(mut &encs, encodeLeaf(j, specs, colsOn, check)) }
             }
             st.sh.with(fn(db: mut &Db) {
                 for x in at..end {
@@ -5694,6 +5694,41 @@ fn refitAll(st: &Store, trees: &[]int, keys: &[]str) {
             }
         })
     }
+}
+
+// A leaf to encode (encodeLeaf): its version at the cut, and the index of
+// its tree's layouts in the cut's (-1 none).
+type LeafJob = record { node: lexdb_page.Node; spec: int }
+
+// A leaf encoded: its page's body (lexdb_page.bodyPage), kind 0 its rows,
+// 1 a column leaf, 2 neither fits a page (refit cuts it); conv: its rows
+// were converted to the current layout (9.114).
+// packed: the leaf as repack would make it of body (lexdb_page.packedLeaf),
+// none when it is already a column leaf of that body.
+type LeafEnc = record { body: str; kind: int; conv: bool; packed: Option[lexdb_page.Node] }
+
+// What the checkpoint writes of a leaf (leafBody's choice, and refit's test
+// of a leaf that does not fit): a kernel, run on the par pool.
+fn encodeLeaf(j: &LeafJob, specs: &[]lexdb_cols.Spec, colsOn: bool, check: bool): LeafEnc {
+    let n = &j.node
+    if j.spec >= 0 {
+        if colsOn {
+            if n.isCols() { return LeafEnc{body: n.body, kind: 1, conv: false, packed: None} }
+            var conv = false
+            match lexdb_page.colBodyRangeK(n, 0, n.count(), &specs[j.spec], check, mut &conv) {
+                Some(b) {
+                    let p = lexdb_page.packedLeaf(&b, n.count())
+                    return LeafEnc{body: b, kind: 1, conv: conv, packed: Some(p)}
+                }
+                None {}
+            }
+        }
+        if n.size > lexdb_page.NODE_ROOM && !n.isCols() && n.count() > 0 { return LeafEnc{body: "", kind: 2, conv: false, packed: None} }
+    }
+    let b = lexdb_page.leafNodeBody(n)
+    if n.lazy { return LeafEnc{body: b, kind: 0, conv: false, packed: None} }
+    let p = lexdb_page.packedLeaf(&b, n.count())
+    return LeafEnc{body: b, kind: 0, conv: false, packed: Some(p)}
 }
 
 // A run of consecutive pages, written with one call (writePages).

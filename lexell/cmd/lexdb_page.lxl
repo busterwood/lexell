@@ -40,6 +40,7 @@ import "binary"
 import "./lexdb_base"
 import "./lexdb_disk"
 import "./lexdb_cols"
+import "./lexdb_rows"
 
 extern "c" fn memcpy(dst: mut &[byte], src: &[byte], n: int): ptr
 
@@ -252,12 +253,7 @@ pub fn kidEntry(k: &str): int { return 2 + len(k) + 8 }
 
 // ---- front coding (T_FLEAF)
 
-fn commonLen(a: &str, b: &str): int {
-    let m = if len(a) < len(b) { len(a) } else { len(b) }
-    var n = 0
-    while n < m && a[n] == b[n] { n += 1 }
-    return n
-}
+fn commonLen(a: &str, b: &str): int { return lexdb_rows.commonLen(a, b) }
 
 // Whether value v is key k's last bytes (an index entry's primary key).
 fn isSuffix(k: &str, v: &str): bool {
@@ -268,7 +264,7 @@ fn isSuffix(k: &str, v: &str): bool {
     return true
 }
 
-fn varLen(x: int): int { return if x < 0x80 { 1 } else if x < 0x4000 { 2 } else { 3 } }
+fn varLen(x: int): int { return lexdb_rows.varLen(x) }
 
 fn putVar(b: mut &[]byte, at: int, x: int): int {
     var v = x
@@ -466,21 +462,10 @@ fn leafPage(n: &Node, pageNo: int): []byte {
 // of its keys' bytes K, its keys as a lazy body holds them (a u16 key
 // length, a u16 0, the key), then its columns.
 
-const CB = 6
+const CB: int = lexdb_rows.CB
 
 // Whether body is a column leaf's.
 pub fn isColBody(body: &str): bool { return len(body) >= CB && body[0] == 0xff && body[1] == 0xff }
-
-// A column leaf's body: keys from (lazy body form, kb bytes) and columns cols.
-fn colBodyOf(keys: &[]byte, kb: int, cols: &str): str {
-    var out: []byte = withCapacity(CB + kb + len(cols))
-    append(mut &out, byte(0xff))
-    append(mut &out, byte(0xff))
-    binary.appendU32LE(mut &out, kb)
-    appendStr(mut &out, strFromBytes(&keys[0..kb]))
-    appendStr(mut &out, cols.toStr())
-    return strFromBytes(&out)
-}
 
 // The column leaf of body (cnt rows).
 fn colNode(body: &str, cnt: int): Node {
@@ -500,20 +485,9 @@ fn colNode(body: &str, cnt: int): Node {
     return Node{leaf: true, keys: [], vals: [], kids: [], size: CB + len(body), packed: true, lazy: true, body: body, ents: ents, cols: cols, cdir: dir}
 }
 
-// The bytes leaf n's keys from..to take front coded on a T_CLEAF page.
-fn colKeysSize(n: &Node, from: int, to: int): int {
-    var size = 0
-    for i in from..to {
-        let k = n.key(i)
-        let c = if i == from { 0 } else { commonLen(&n.key(i - 1), &k) }
-        size += varLen(c) + varLen(len(k) - c) + len(k) - c
-    }
-    return size
-}
-
-// Leaf n as a column leaf's body (colBodyOf), its rows encoded with the
-// tree's layouts: None when they do not all encode (lexdb_cols.encodeRows)
-// or the page would not hold them; a column leaf's own body.
+// Leaf n as a column leaf's body (lexdb_rows.colBody), its rows encoded
+// with the tree's layouts: None when they do not all encode or the page
+// would not hold them; a column leaf's own body.
 pub fn colBody(n: &Node, spec: &lexdb_cols.Spec): Option[str] {
     if !n.leaf { return None }
     if n.isCols() { return Some(n.body) }
@@ -523,49 +497,32 @@ pub fn colBody(n: &Node, spec: &lexdb_cols.Spec): Option[str] {
 // colBody of the leaf of n's entries from..to (a changed leaf, not a
 // column leaf).
 pub fn colBodyRange(n: &Node, from: int, to: int, spec: &lexdb_cols.Spec): Option[str] {
-    var conv = false
-    let got = colBodyRangeK(n, from, to, spec, lexdb_cols.checking(), mut &conv)
-    if conv { lexdb_cols.noteConverted() }
-    return got
+    let cnt = n.count()
+    var keys: []str = withCapacity(cnt)
+    var vals: []&str = withCapacity(cnt)
+    for i in 0..cnt { append(mut &keys, n.key(i)); append(mut &vals, n.valView(i)) }
+    return lexdb_rows.colBodyRange(&keys, &vals, from, to, spec)
 }
 
 // colBodyRange as a kernel (par.map): check is lexdb_cols.checking(); conv
 // set when the rows were converted (9.114), which the caller counts
 // (lexdb_cols.noteConverted).
 pub fn colBodyRangeK(n: &Node, from: int, to: int, spec: &lexdb_cols.Spec, check: bool, conv: mut &bool): Option[str] {
-    let cnt = to - from
-    if cnt <= 0 { return None }
-    var rows: []&str = withCapacity(cnt)
-    for i in from..to { append(mut &rows, n.valView(i)) }
-    var cv: []str = []
-    let got = lexdb_cols.encodeCheckedK(&rows, spec, check, mut &cv)
-    if len(cv) > 0 { conv = true }
-    if got.isNone() { return None }
-    let cols = got.unwrap()
-    if 22 + colKeysSize(n, from, to) + len(cols) > PAGE { return None }
-    var kb = 0
-    for i in from..to { kb += 4 + len(n.key(i)) }
-    var keys: []byte = withCapacity(kb)
-    for i in from..to {
-        let k = n.key(i)
-        binary.appendU16LE(mut &keys, len(k))
-        binary.appendU16LE(mut &keys, 0)
-        appendStr(mut &keys, k)
-    }
-    return Some(colBodyOf(&keys, kb, &cols))
+    let cnt = n.count()
+    var keys: []str = withCapacity(cnt)
+    var vals: []&str = withCapacity(cnt)
+    for i in 0..cnt { append(mut &keys, n.key(i)); append(mut &vals, n.valView(i)) }
+    return lexdb_rows.colBodyRangeK(&keys, &vals, from, to, spec, check, conv)
 }
 
 // The bytes a column leaf of n's entries from..to would take on its page
-// (its header, keys and columns), -1 when the rows do not encode (a
-// changed leaf, not a column leaf).
+// (its header, keys and columns), -1 when the rows do not encode.
 pub fn colSize(n: &Node, from: int, to: int, spec: &lexdb_cols.Spec): int {
-    if to <= from { return -1 }
-    var rows: []&str = withCapacity(to - from)
-    for i in from..to { append(mut &rows, n.valView(i)) }
-    match lexdb_cols.encodeRows(&rows, spec) {
-        Some(cols) { return 22 + colKeysSize(n, from, to) + len(cols) }
-        None { return -1 }
-    }
+    let cnt = n.count()
+    var keys: []str = withCapacity(cnt)
+    var vals: []&str = withCapacity(cnt)
+    for i in 0..cnt { append(mut &keys, n.key(i)); append(mut &vals, n.valView(i)) }
+    return lexdb_rows.colSize(&keys, &vals, from, to, spec)
 }
 
 // The bytes column leaf body (colBody's) of cnt rows takes on its page.
