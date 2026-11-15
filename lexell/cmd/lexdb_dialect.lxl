@@ -1,0 +1,175 @@
+// lexdb_dialect: the dialect facts the parser needs, below lexdb_sql: the
+// T-SQL type codes and SERVERPROPERTY values, the SQL Server and Oracle
+// view names, and PostgreSQL's catalog relation names. The dialect modules
+// and lexdb_sql both use it; it imports only the generated data modules, so
+// a dialect module may import lexdb_sql without a cycle.
+import "strings"
+import "io"
+import "./lexdb_sysdata"
+import "./lexdb_oradata"
+import "./lexdb_pgdata"
+
+pub const TS_IMAGE = 34
+pub const TS_TEXT = 35
+pub const TS_GUID = 36
+pub const TS_DATE = 40
+pub const TS_TIME = 41
+pub const TS_DATETIME2 = 42
+pub const TS_DTO = 43
+pub const TS_TINYINT = 48
+pub const TS_SMALLINT = 52
+pub const TS_INT = 56
+pub const TS_SMALLDATETIME = 58
+pub const TS_REAL = 59
+pub const TS_MONEY = 60
+pub const TS_DATETIME = 61
+pub const TS_FLOAT = 62
+pub const TS_VARIANT = 98
+pub const TS_NTEXT = 99
+pub const TS_BIT = 104
+pub const TS_DECIMAL = 106
+pub const TS_NUMERIC = 108
+pub const TS_SMALLMONEY = 122
+pub const TS_BIGINT = 127
+pub const TS_VARBINARY = 165
+pub const TS_VARCHAR = 167
+pub const TS_BINARY = 173
+pub const TS_CHAR = 175
+pub const TS_TIMESTAMP = 189
+pub const TS_NVARCHAR = 231
+pub const TS_NCHAR = 239
+pub const TS_XML = 241
+pub const TS_SYSNAME = 256      // its user_type_id (its system_type_id is nvarchar's)
+
+// msdb's tables SMO reads, as SQL Server 2022 has them (empty here).
+const MSDB: []str = [
+    "syspolicy_system_health_state\t0\thealth_state_id:bigint:8:19:0:0:\tpolicy_id:int:4:10:0:0:\tlast_run_date:datetime:8:23:3:0:\t" +
+        "target_query_expression_with_id:nvarchar:800:0:0:0:SQL_Latin1_General_CP1_CI_AS\ttarget_query_expression:nvarchar:-1:0:0:0:SQL_Latin1_General_CP1_CI_AS\t" +
+        "result:bit:1:1:0:0:",
+]
+
+pub fn msdbSpec(view: &str): str {
+    if !strings.startsWith(view, "msdb.") { return "" }
+    let n = view[5..len(view)]
+    for m in MSDB { if strings.startsWith(&m, &(n + "\t")) { return m.toStr() } }
+    return ""
+}
+
+pub fn isMsdb(name: &str): bool {
+    for m in MSDB { if strings.startsWith(&m, &(name + "\t")) { return true } }
+    return false
+}
+
+
+// ---- SERVERPROPERTY, DATABASEPROPERTYEX, FULLTEXTSERVICEPROPERTY and the
+// constant @@ values, as SQL Server 2022 gives them (lexdb_sysdata.PROPS):
+// the machine's and the server's name are this host's.
+
+pub type Prop = record {
+    pub found: bool
+    pub typ: str            // SQL Server's type of the value: int, nvarchar, tinyint, datetime, ...
+    pub val: str            // "\x00" NULL
+}
+
+// This machine's name.
+pub fn hostName(): str {
+    for f in ["/proc/sys/kernel/hostname", "/etc/hostname"] {
+        match io.read(&(f.toStr())) {
+            Ok(s) {
+                let h = strings.trim(&s)
+                if len(h) > 0 { return h.toStr() }
+            }
+            Err(_) {}
+        }
+    }
+    return "lexdb"
+}
+
+// A property's value: kind "server", "database", "fulltext" or "global"
+// (@@name, lower case); the name as written (case is ignored).
+pub fn prop(kind: &str, name: &str): Prop {
+    let want = strings.toLowerAscii(&(strings.trim(name)))
+    if kind == "server" && (want == "machinename" || want == "servername" || want == "computernamephysicalnetbios") {
+        return Prop{found: true, typ: "nvarchar", val: hostName()}
+    }
+    let head = kind + "\t"
+    for p in lexdb_sysdata.PROPS {
+        if !strings.startsWith(&p, &head) { continue }
+        let f = strings.split(&p, "\t")
+        if strings.toLowerAscii(&f[1]) == want { return Prop{found: true, typ: f[2].toStr(), val: f[3].toStr()} }
+    }
+    return Prop{found: false, typ: "", val: "\x00"}
+}
+
+
+// ---- relation names the parser resolves
+
+// Whether view (tables, all_columns, ...) is one of sys's.
+pub fn tsqlView(name: &str): bool {
+    for v in lexdb_sysdata.VIEWS {
+        let t = strings.indexOf(&v, "\t", 0)
+        if v[0..t] == name { return true }
+    }
+    return false
+}
+
+// The catalog relation a T-SQL FROM item names: "sys.tables" for sys.tables
+// (any database's: master.sys.tables is lexdb's own); "" if none.
+pub fn tsqlRelOf(schema: &str, name: &str): str {
+    if schema == "sys" && tsqlView(name) { return "sys." + name }
+    if schema == "msdb" && isMsdb(name) { return "sys.msdb." + name }
+    return ""
+}
+
+// Oracle's spelling of a view: upper case, V$X as V_$X.
+pub fn oraReal(name: &str): str {
+    let u = strings.toUpperAscii(name)
+    if strings.startsWith(&u, "V$") { return "V_$" + u[2..len(u)] }
+    if strings.startsWith(&u, "GV$") { return "GV_$" + u[3..len(u)] }
+    return u
+}
+
+pub fn oraView(view: &str): bool {
+    for v in lexdb_oradata.VIEWS {
+        let t = strings.indexOf(&v, "\t", 0)
+        if v[0..t] == view { return true }
+    }
+    return false
+}
+
+const HIDDEN_SYN: []str = ["TAB", "SYN", "SEQ", "IND", "OBJ", "CLU", "CAT", "COL", "DICT_COLUMNS_X"]
+
+// The view a name in FROM (schema "" if none) means, as SYS's name ("" if
+// it is none of ours): the view itself, in SYS or unqualified, or a PUBLIC
+// synonym of one.
+pub fn oraRelOf(schema: &str, name: &str): str {
+    let sc = strings.toUpperAscii(schema)
+    if len(sc) > 0 && sc != "SYS" && sc != "PUBLIC" { return "" }
+    let r = oraReal(name)
+    if oraView(&r) { return "ora." + r }
+    for s in lexdb_oradata.SYNONYMS {
+        let f = strings.split(&s, "\t")
+        if f[0] == strings.toUpperAscii(name) {
+            var hidden = false
+            for h in HIDDEN_SYN { if h == f[0] { hidden = true } }
+            if !hidden { return "ora." + f[1].toStr() }
+        }
+    }
+    return ""
+}
+
+pub fn pgView(rel: &str): bool {
+    for r in lexdb_pgdata.REL_NAMES { if r == rel { return true } }
+    return false
+}
+
+// The catalog relation a PG FROM item names: pg_catalog's by its name or
+// qualified; information_schema's qualified; "" if none.
+pub fn pgRelOf(schema: &str, name: &str): str {
+    if schema == "information_schema" {
+        let r = "information_schema." + name
+        return if pgView(&r) { r } else { "" }
+    }
+    if (schema == "" || schema == "pg_catalog") && pgView(name) { return name }
+    return ""
+}

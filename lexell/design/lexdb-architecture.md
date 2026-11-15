@@ -99,6 +99,7 @@ main
                      ▼
                 lexdb_core
                  ├── lexdb_like    (simple LIKE pieces)
+                 ├── lexdb_dialect (parser-facing dialect facts; data only)
                  ├── lexdb_store   (page, repl internal)
                  ├── lexdb_rows    (cols, page internal)
                  ├── lexdb_catalog
@@ -231,7 +232,10 @@ stay inside a module and the caller pays one dispatch, not one per value.
 5. **Dialect port.** PG first, then MSSQL and Oracle. Normalise syntax into
    the common plan; no dialect branches in exec. Progress: `lexdb_pg` holds
    PostgreSQL's identifier/name rendering, OID mapping, catalog row helpers
-   and expression deparser; the PG catalog generators, wire/auth and the
+   and expression deparser. `lexdb_dialect` now holds the parser-facing
+   facts (T-SQL type codes, SERVERPROPERTY, the view/relation names), so
+   `lexdb_sql` no longer imports a dialect module and a dialect module may
+   import `lexdb_sql`. The PG catalog generators, wire/auth and the
    `Dialect` facade remain.
 6. **ExecStrategy / one batch driver.** Sink and fallback policies; one
    `BPlan` builder; compiled expressions and typed sort always on.

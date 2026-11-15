@@ -12,9 +12,7 @@ import "strings"
 import "./lexdb_base"
 import "./lexdb_time"
 import "./lexdb_float"
-import "./lexdb_pgcat"
-import "./lexdb_syscat"
-import "./lexdb_oracat"
+import "./lexdb_dialect"
 import "./lexdb_match"
 
 // Column kinds.
@@ -1164,7 +1162,7 @@ fn (p: mut &P) qname(): Result[str, lexdb_base.DbErr] {
         p.spelled = spell
         let n = len(parts)
         // msdb's objects lexdb_syscat has (msdb.dbo.x: msdb.x)
-        if n >= 3 && parts[n - 3] == "msdb" && lexdb_syscat.isMsdb(&parts[n - 1]) { return Ok(qual(&"msdb", &parts[n - 1])) }
+        if n >= 3 && parts[n - 3] == "msdb" && lexdb_dialect.isMsdb(&parts[n - 1]) { return Ok(qual(&"msdb", &parts[n - 1])) }
         let sc = if n >= 2 { parts[n - 2] } else { "" }
         if n == 1 || sc == "" || sc == "dbo" { return Ok(parts[n - 1]) }
         return Ok(qual(&sc, &parts[n - 1]))
@@ -1226,7 +1224,7 @@ fn (p: mut &P) typeName(): Result[TypeName, lexdb_base.DbErr] {
         "smallint", "int2" { t = TypeName{kind: K_INT, oid: OID_INT2, prec: 0, scale: 0, len: 0} }
         "boolean", "bool" { t = TypeName{kind: K_BOOL, oid: OID_BOOL, prec: 0, scale: 0, len: 0} }
         // T-SQL's numeric, apart from decimal, in len (lexdb_tds sends it as numeric)
-        "numeric", "decimal" { t = TypeName{kind: K_NUM, oid: OID_NUMERIC, prec: 0, scale: 0, len: if p.tsql && w == "numeric" { lexdb_syscat.TS_NUMERIC } else { 0 }} }
+        "numeric", "decimal" { t = TypeName{kind: K_NUM, oid: OID_NUMERIC, prec: 0, scale: 0, len: if p.tsql && w == "numeric" { lexdb_dialect.TS_NUMERIC } else { 0 }} }
         "text" { t = TypeName{kind: K_TEXT, oid: OID_TEXT, prec: 0, scale: 0, len: 0} }
         "varchar" { t = TypeName{kind: K_TEXT, oid: OID_VARCHAR, prec: 0, scale: 0, len: 0} }
         "date" { t = timeType(OID_DATE) }
@@ -2654,7 +2652,7 @@ fn (p: mut &P) tsqlCall(name: &str, args: []Expr, star: bool): Result[Expr, lexd
 }
 
 // A property function's value, as SQL Server's sql_variant (lexdb_tds
-// sends it so: lexdb_syscat.TS_VARIANT in prec).
+// sends it so: lexdb_dialect.TS_VARIANT in prec).
 fn variant(x: Expr): Expr {
     // the type it is: 1 an integer, 2 text (and NULL), 0 neither
     var k = 0
@@ -2670,23 +2668,23 @@ fn variant(x: Expr): Expr {
         Expr.Cast(_, t) { if t.kind == K_INT { k = 1 } }
         else {}
     }
-    if k == 1 { return Expr.Cast(x, TypeName{kind: K_INT, oid: OID_INT4, prec: lexdb_syscat.TS_VARIANT, scale: 0, len: 0}) }
-    if k == 2 { return Expr.Cast(x, TypeName{kind: K_TEXT, oid: OID_TEXT, prec: lexdb_syscat.TS_VARIANT, scale: 0, len: 0}) }
+    if k == 1 { return Expr.Cast(x, TypeName{kind: K_INT, oid: OID_INT4, prec: lexdb_dialect.TS_VARIANT, scale: 0, len: 0}) }
+    if k == 2 { return Expr.Cast(x, TypeName{kind: K_TEXT, oid: OID_TEXT, prec: lexdb_dialect.TS_VARIANT, scale: 0, len: 0}) }
     return x
 }
 
-// A property's value as SQL Server's type gives it (lexdb_syscat.prop).
-fn propExpr(pr: &lexdb_syscat.Prop): Expr {
+// A property's value as SQL Server's type gives it (lexdb_dialect.prop).
+fn propExpr(pr: &lexdb_dialect.Prop): Expr {
     if !pr.found || pr.val == "\x00" { return Expr.Lit(Val.Null) }
     let n = strings.parseIntOpt(&pr.val).unwrapOr(0)
     match pr.typ.toStr() {
         "int" { return Expr.Lit(Val.Int(n)) }
-        "tinyint" { return Expr.Cast(Expr.Lit(Val.Int(n)), TypeName{kind: K_INT, oid: OID_INT2, prec: lexdb_syscat.TS_TINYINT, scale: 0, len: 0}) }
+        "tinyint" { return Expr.Cast(Expr.Lit(Val.Int(n)), TypeName{kind: K_INT, oid: OID_INT2, prec: lexdb_dialect.TS_TINYINT, scale: 0, len: 0}) }
         "smallint" { return Expr.Cast(Expr.Lit(Val.Int(n)), TypeName{kind: K_INT, oid: OID_INT2, prec: 0, scale: 0, len: 0}) }
         "bigint" { return Expr.Cast(Expr.Lit(Val.Int(n)), TypeName{kind: K_INT, oid: OID_INT8, prec: 0, scale: 0, len: 0}) }
         "datetime" {
             var t = timeType(OID_TS)
-            t.prec = lexdb_syscat.TS_DATETIME
+            t.prec = lexdb_dialect.TS_DATETIME
             t.scale = 3
             return Expr.Cast(Expr.Lit(Val.Text(pr.val)), t)
         }
@@ -2702,7 +2700,7 @@ fn (p: mut &P) tsqlCatCall(name: &str, a: mut &[]Expr): Result[Option[Expr], lex
     let none: Option[Expr] = None
     if (name == "serverproperty" || name == "fulltextserviceproperty") && n == 1 {
         match litText(&a[0]) {
-            Some(t) { return Ok(Some(variant(propExpr(&lexdb_syscat.prop(if name == "serverproperty" { "server" } else { "fulltext" }, &t))))) }
+            Some(t) { return Ok(Some(variant(propExpr(&lexdb_dialect.prop(if name == "serverproperty" { "server" } else { "fulltext" }, &t))))) }
             None {}
         }
         return Ok(Some(Expr.Call("#" + name, replace(a, []), false)))
@@ -2739,7 +2737,7 @@ fn (p: mut &P) tsqlCatCall(name: &str, a: mut &[]Expr): Result[Option[Expr], lex
         // the property of a database there is (lexdb's, or SQL Server's system ones)
         match litText(&a[1]) {
             Some(t) {
-                let v = variant(propExpr(&lexdb_syscat.prop("database", &t)))
+                let v = variant(propExpr(&lexdb_dialect.prop("database", &t)))
                 let db = replace(mut &a[0], Expr.Lit(Val.Null))
                 return Ok(Some(Expr.Call("case else", [Expr.IsNull(Expr.Call("#db_id", [db], false), false), Expr.Lit(Val.Null), v], false)))
             }
@@ -4848,11 +4846,11 @@ fn (p: mut &P) fromItem0(join: int): Result[FromItem, lexdb_base.DbErr] {
     // qualified name is always a table
     var ci = -1
     for i in 0..len(p.ctes) { if p.ctes[i].name == table { ci = i } }
-    var rel = if ci >= 0 { "" } else { lexdb_pgcat.relOf(&(if isQual(&table) { schemaOf(&table) } else { "" }), &baseName(&table)) }
+    var rel = if ci >= 0 { "" } else { lexdb_dialect.pgRelOf(&(if isQual(&table) { schemaOf(&table) } else { "" }), &baseName(&table)) }
     // T-SQL: SQL Server's catalog views, sys.x (design/lexdb-tds.md, section 13)
-    if p.tsql && ci < 0 && len(rel) == 0 && isQual(&table) { rel = lexdb_syscat.relOf(&schemaOf(&table), &baseName(&table)) }
+    if p.tsql && ci < 0 && len(rel) == 0 && isQual(&table) { rel = lexdb_dialect.tsqlRelOf(&schemaOf(&table), &baseName(&table)) }
     // Oracle: its catalog views, ALL_TABLES, V$VERSION, ... (design/lexdb-oracle.md, O4)
-    if p.ora && ci < 0 && len(rel) == 0 { rel = lexdb_oracat.relOf(&(if isQual(&table) { schemaOf(&table) } else { "" }), &baseName(&table)) }
+    if p.ora && ci < 0 && len(rel) == 0 { rel = lexdb_dialect.oraRelOf(&(if isQual(&table) { schemaOf(&table) } else { "" }), &baseName(&table)) }
     if len(rel) > 0 {
         // a pg_catalog or information_schema relation (9.80): a function
         // in FROM whose rows the executor makes from its catalog
@@ -7137,7 +7135,7 @@ fn (p: mut &P) variable(t: &Tok): Result[Expr, lexdb_base.DbErr] {
     }
     if strings.startsWith(&t.text, "@@") {
         // SQL Server's constant ones (@@MICROSOFTVERSION, @@MAX_PRECISION, ...: lexdb_syscat)
-        let pr = lexdb_syscat.prop(&"global", &t.text)
+        let pr = lexdb_dialect.prop(&"global", &t.text)
         if pr.found { return Ok(propExpr(&pr)) }
         return Err(lexdb_base.err("TS195", &("'" + t.text + "' is not a recognized built-in function name.")))
     }
@@ -7154,14 +7152,14 @@ fn (p: mut &P) tsqlLen(): Result[int, lexdb_base.DbErr] {
     return Ok(n)
 }
 
-// The SQL Server type (its system_type_id, lexdb_syscat.TS_*) a type made
+// The SQL Server type (its system_type_id, lexdb_dialect.TS_*) a type made
 // from a T-SQL type name keeps where lexdb's own does not say it: in prec,
 // which a text, integer or binary type does not use (varchar, char, nchar,
 // tinyint, varbinary, ...), and which a time type's says its scale is
 // given in (1; datetime, smalldatetime). 0 none.
 pub fn tsqlCode(t: &TypeName): int {
     if t.kind == K_TEXT || t.kind == K_INT || t.kind == K_BYTEA { return if t.prec >= 34 { t.prec } else { 0 } }
-    if timeKind(t.oid) > 0 && (t.prec == lexdb_syscat.TS_DATETIME || t.prec == lexdb_syscat.TS_SMALLDATETIME) { return t.prec }
+    if timeKind(t.oid) > 0 && (t.prec == lexdb_dialect.TS_DATETIME || t.prec == lexdb_dialect.TS_SMALLDATETIME) { return t.prec }
     return 0
 }
 
@@ -7173,21 +7171,21 @@ fn (p: mut &P) tsqlType(w: &str): Result[Option[TypeName], lexdb_base.DbErr] {
             var n = try p.tsqlLen()
             if w == "sysname" { n = 128 }
             // SQL Server's type, where it is not nvarchar's, in prec (tsqlCode)
-            let code = if w == "varchar" { lexdb_syscat.TS_VARCHAR } else if w == "char" { lexdb_syscat.TS_CHAR } else if w == "nchar" { lexdb_syscat.TS_NCHAR } else { 0 }
+            let code = if w == "varchar" { lexdb_dialect.TS_VARCHAR } else if w == "char" { lexdb_dialect.TS_CHAR } else if w == "nchar" { lexdb_dialect.TS_NCHAR } else { 0 }
             if n > 0 { return Ok(Some(TypeName{kind: K_TEXT, oid: OID_VARCHAR, prec: code, scale: 0, len: n})) }
             return Ok(Some(TypeName{kind: K_TEXT, oid: OID_TEXT, prec: code, scale: 0, len: 0}))
         }
         "ntext", "xml" {
-            return Ok(Some(TypeName{kind: K_TEXT, oid: OID_TEXT, prec: if w == "xml" { lexdb_syscat.TS_XML } else { lexdb_syscat.TS_NTEXT }, scale: 0, len: 0}))
+            return Ok(Some(TypeName{kind: K_TEXT, oid: OID_TEXT, prec: if w == "xml" { lexdb_dialect.TS_XML } else { lexdb_dialect.TS_NTEXT }, scale: 0, len: 0}))
         }
         "bit" { return Ok(Some(TypeName{kind: K_BOOL, oid: OID_BOOL, prec: 0, scale: 0, len: 1})) }     // len 1: takes numbers
-        "tinyint" { return Ok(Some(TypeName{kind: K_INT, oid: OID_INT2, prec: lexdb_syscat.TS_TINYINT, scale: 0, len: 0})) }
+        "tinyint" { return Ok(Some(TypeName{kind: K_INT, oid: OID_INT2, prec: lexdb_dialect.TS_TINYINT, scale: 0, len: 0})) }
         "money" { return Ok(Some(TypeName{kind: K_NUM, oid: OID_NUMERIC, prec: 19, scale: 4, len: 0})) }
         "smallmoney" { return Ok(Some(TypeName{kind: K_NUM, oid: OID_NUMERIC, prec: 10, scale: 4, len: 0})) }
         "uniqueidentifier" { return Ok(Some(TypeName{kind: K_UUID, oid: OID_UUID, prec: 0, scale: 0, len: 0})) }
         "varbinary", "binary", "image", "rowversion", "timestamp" {
             let n = try p.tsqlLen()
-            let code = if w == "varbinary" { lexdb_syscat.TS_VARBINARY } else if w == "binary" { lexdb_syscat.TS_BINARY } else if w == "image" { lexdb_syscat.TS_IMAGE } else { lexdb_syscat.TS_TIMESTAMP }
+            let code = if w == "varbinary" { lexdb_dialect.TS_VARBINARY } else if w == "binary" { lexdb_dialect.TS_BINARY } else if w == "image" { lexdb_dialect.TS_IMAGE } else { lexdb_dialect.TS_TIMESTAMP }
             return Ok(Some(TypeName{kind: K_BYTEA, oid: OID_BYTEA, prec: code, scale: 0, len: if n > 0 { n } else { 0 }}))
         }
         "datetime", "smalldatetime", "datetime2", "datetimeoffset", "time" {
@@ -7200,7 +7198,7 @@ fn (p: mut &P) tsqlType(w: &str): Result[Option[TypeName], lexdb_base.DbErr] {
                 try p.expectKw(")")
             }
             // prec: 1 (the scale given), or SQL Server's datetime or smalldatetime (tsqlCode)
-            t.prec = if w == "datetime" { lexdb_syscat.TS_DATETIME } else if w == "smalldatetime" { lexdb_syscat.TS_SMALLDATETIME } else { 1 }
+            t.prec = if w == "datetime" { lexdb_dialect.TS_DATETIME } else if w == "smalldatetime" { lexdb_dialect.TS_SMALLDATETIME } else { 1 }
             t.scale = n                     // (lexdb keeps microseconds: 7 rounds as 6; TDS sends the 7)
             return Ok(Some(t))
         }
@@ -7458,7 +7456,7 @@ fn oraSysContext(a: &[]Expr): Expr {
         "CON_ID", "CURRENT_SCHEMAID_X" { return Expr.Lit(Val.Text("3")) }
         "INSTANCE" { return Expr.Lit(Val.Text("1")) }
         "INSTANCE_NAME" { return Expr.Lit(Val.Text("lexdb")) }
-        "HOST", "SERVER_HOST" { return Expr.Lit(Val.Text(lexdb_syscat.hostName())) }
+        "HOST", "SERVER_HOST" { return Expr.Lit(Val.Text(lexdb_dialect.hostName())) }
         "IP_ADDRESS" { return Expr.Lit(Val.Text("127.0.0.1")) }
         "NETWORK_PROTOCOL" { return Expr.Lit(Val.Text("tcp")) }
         "AUTHENTICATION_METHOD" { return Expr.Lit(Val.Text("PASSWORD")) }
