@@ -235,11 +235,11 @@ join. q2 is also faster in lexdb.
 
 ## 5. What to build, in order
 
-1. **Subquery unnesting.** Extend the semi/anti-join rewrite to derived
-   tables, correlated EXISTS with extra predicates, IN with GROUP BY, and
-   EXISTS under an aggregate. Apply the filter before the aggregate.
-   Expected to fix q4, q18, q21, q22 and q16; q21/q22 are the difference
-   between a timeout and a normal query.
+1. **Subquery unnesting.** Done for correlated EXISTS/NOT EXISTS and IN
+   whose outer values are equality keys, including extra non-key filters
+   (section 6). Derived tables (q22) and IN with GROUP BY (q18) still
+   take a lookup per value; q18 is the remaining large one. Apply the
+   filter before the aggregate.
 2. **OR predicates.** Common-conjunct extraction is done; per-branch
    predicate extraction and a BitmapOr operator remain. q19.
 3. **Access-path cost.** The first table's range now chooses scan or index
@@ -294,16 +294,34 @@ and q3's 8.30x against PostgreSQL are mostly that, not code).
 - **Correlated EXISTS and NOT EXISTS are semi/anti joins.** A subquery
   whose outer values are only equality keys is run once and hashed; a
   non-key filter (q21's `l_suppkey <> outer`) stays on the semi-join
-  level and is checked per candidate; NOT EXISTS is an anti join. A
-  semi-join key of one integer gets its own value map, not the string
-  key's. The hash/per-row choice follows PostgreSQL's join cost: the
-  inner side is read once and hashed, or the outer rows look it up, with
-  the per-row run's measured setup charged by the path's shape (a
-  primary-key range's run is about 140 us; a secondary index's lookup
-  about 26 us). q21 completes: **timeout (>120 s) -> 23.2 s**, the
-  PostgreSQL checksum. q4 8.49 -> 6.61 s. q22 stays at 1.26 s (1.16
-  before): its NOT EXISTS is a per-row index lookup, cheaper than
-  hashing 1.5M orders.
+  level; NOT EXISTS is an anti join. A semi-join key of one integer gets
+  its own value map, not the string key's. The hash/per-row choice
+  follows PostgreSQL's join cost: the inner side is read once and
+  hashed, or the outer rows look it up, with the per-row run's measured
+  setup charged by the path's shape (a primary-key range's run is about
+  140 us; a secondary index's lookup about 26 us). q21 completes:
+  **timeout (>120 s) -> 23.2 s**, the PostgreSQL checksum. q4 8.49 ->
+  6.61 s. q22 stays at 1.26 s (1.16 before): its NOT EXISTS is a per-row
+  index lookup, cheaper than hashing 1.5M orders.
+- **A `<>` residual is summarized per key.** q21's semi/anti filter is
+  `l_suppkey <> l1.l_suppkey`; the hash kept every candidate row and
+  compared it per probe. Instead each key records whether its inner
+  column has more than one value or the one it has: for `<>` that is the
+  whole check, since a mixed key always holds a value that differs from
+  whatever the outer row has, and a NULL never matches. The batch probe
+  filters the key's rows without making a candidate row. q21 21.16 ->
+  19.88 s warm.
+- **A semi-join subquery's scan reads only its key columns.** The
+  subquery is planned while its SELECT list is still `select *`, so its
+  level has no `need` and the scan fetches every column; unnesting then
+  rewrites the output to the key (and residual) columns but left the
+  scan alone. q4 read 6M lineitem rows 16 columns wide for one order
+  key. Narrowing the subquery's levels after unnesting to the columns
+  its output and conditions name is the largest win so far: q4 6.18 ->
+  **4.07 s**, q21 20.33 -> **14.46 s** warm (14.6 s in the full run),
+  both the PostgreSQL checksums. A 6M-row stream costs about 3.1-3.5 s
+  at one or two columns against 9.9 s at sixteen, so the width was the
+  cost, not the row count.
 - The plan choice is in `choosePath`, the fallback in `indexOrScan`;
   `exec_scanchoice.lxl` covers the broad, selective, index-only and
   primary-key cases, and `exec_switch.lxl` the counted fallback. The
@@ -311,22 +329,29 @@ and q3's 8.30x against PostgreSQL are mostly that, not code).
   `exec_seqcrash` time out only under the full parallel load and pass
   alone.
 
-A warm full run (one run, `out/lexdb.tsv`) completes all 22 queries: q21
-23.9 s, q19 8.98 s, q1 16.2 s, q7 12.4 s, q4 6.41 s, q13 6.57 s, q12
-7.09 s. The 18 queries timed in both runs are 0.99x their baseline
-geomean (unchanged); the nine the scan choice touches are 0.97x in the
-warm A/B, 0.96x without q3 and q7. q4 is 37x PostgreSQL and q21 35x:
-both now plan a hash semi/anti join, but the hash builds read lineitem
-twice and materialize 6M and 3.79M rows.
+A warm full run (one run, `out/lexdb.tsv`) completes all 22 queries: q1
+16.3 s, q21 14.6 s, q7 11.6 s, q19 8.49 s, q12 6.84 s, q13 5.53 s, q4
+4.13 s. The A/B figures above are the measurements; the run-level
+comparison to the pre-fix baseline is not, because that baseline run was
+the first after the load (queries it did not touch moved 0.84-1.01x from
+cache warmth alone).
 
-Still open: q4/q21's semi-joins would be cheaper as a right semi/anti
-join, hashing the smaller side and scanning the larger once, as
-PostgreSQL's JOIN_RIGHT_SEMI/JOIN_RIGHT_ANTI paths do; the hash build
-itself (millions of `[]Val` rows) is the other half. q18's grouped IN is a
-lookup per value. q1 is execution-bound, not planner-bound: `count(*)` is
-0.50 s, four simple sums 2.48 s, and the complex expressions with `avg`
-8.23 s, so the 16.8 s is decimal aggregate evaluation. None of those are
-addressed by the plan changes here.
+Still open: q4's semi-join is now 24x PostgreSQL and q21's 21x, down
+from 44x and 35x. PostgreSQL's q21 plan scans lineitem once (433 ms),
+hashes supplier/nation to 156,739 rows, then probes lineitem's primary
+key 156k times for the anti join and 13.8k for the semi join
+(1.04 s total). lexdb's per-row subplan costs milliseconds per run when
+a query asks for millions of them — forcing the lookup path ran past
+ten minutes — so the hash build's full scan stands. The remaining cost
+is that scan and per-row `[]Val`: 6M two-column rows stream in about
+3.1-3.5 s. A right semi/anti join (PostgreSQL's JOIN_RIGHT_SEMI/
+JOIN_RIGHT_ANTI) hashes the smaller side instead, but the experiments
+here were neutral: a key-set build was 5.92 vs 5.95 s on q4, and moving
+the semi joins after supplier/nation was 19.88 vs 19.93 s on q21 (the
+builds, not the probes, dominate). q18's grouped IN is a lookup per
+value. q1 is execution-bound, not planner-bound: `count(*)` is 0.50 s,
+four simple sums 2.48 s, and the complex expressions with `avg` 8.23 s,
+so the 16.8 s is decimal aggregate evaluation.
 
 ## 7. Caveats
 
