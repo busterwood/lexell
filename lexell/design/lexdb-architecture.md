@@ -69,7 +69,7 @@ small; behavior belongs in the deep modules.
 | **`lexdb_catalog`** | Metadata, DDL, dependencies, temp objects | `lookup/define/alter/drop/list` | lives inside exec |
 | **`lexdb_plan`** | Path search, join order, cost model, subquery strategy | `plan(catalog, stmt, params) -> Plan`, `explain` | `Sel`/`Query`/`Level`/`Path` leak into exec |
 | **`lexdb_exec`** | Execution: vectorization, operators, sinks, fallback | `execute(plan, params, sink)`, `collect` | 1,381 functions; 17 representations |
-| **`lexdb_pg`** | PG wire, `pg_catalog`/`information_schema`, auth, PG type/function names, error text, deparse | one `Dialect` facade | started: identifier quoting and `pg_get_expr` deparse moved; catalog rows, wire/auth and the facade remain in exec |
+| **`lexdb_pg`** | PG wire, `pg_catalog`/`information_schema`, auth, PG type/function names, error text, deparse | one `Dialect` facade | started: identifier and name rendering, OID mapping and `pg_get_expr` deparse moved; catalog rows, wire/auth and the facade remain in exec |
 | **`lexdb_mssql`** | T-SQL grammar/quirks, TDS, `sys.*`, T-SQL functions, temp-table semantics | one `Dialect` facade | `lexdb_tsql*` / `lexdb_tds` / `lexdb_sys*` |
 | **`lexdb_oracle`** | PL/SQL, TNS, Oracle data dictionary, functions/types, error text | one `Dialect` facade | `lexdb_plsql` / `lexdb_tns` / `lexdb_ora*` |
 
@@ -213,8 +213,8 @@ stay inside a module and the caller pays one dispatch, not one per value.
    `CUT_POOL`.
 5. **Dialect port.** PG first, then MSSQL and Oracle. Normalise syntax into
    the common plan; no dialect branches in exec. Progress: `lexdb_pg` holds
-   PostgreSQL's identifier quoting and expression deparser; the PG catalog
-   rows, wire/auth and the `Dialect` facade remain.
+   PostgreSQL's identifier and name rendering, OID mapping and expression
+   deparser; the PG catalog rows, wire/auth and the `Dialect` facade remain.
 6. **ExecStrategy / one batch driver.** Sink and fallback policies; one
    `BPlan` builder; compiled expressions and typed sort always on.
 7. **One expression IR.** Scalar and vector backends; delete `BNode` /
