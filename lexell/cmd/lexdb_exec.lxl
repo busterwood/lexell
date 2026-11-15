@@ -70,6 +70,11 @@ pub type Role = lexdb_catalog.Role
 type CatView = lexdb_catalog.CatView
 
 fn emptyTable(name: &str): Table { return lexdb_catalog.emptyTable(name) }
+pub const SYS_DB_NAME: str = lexdb_syscat.SYS_DB_NAME
+pub const SYS_DB_ID: int = lexdb_syscat.SYS_DB_ID
+
+fn sysSchemaId(s: &str): int { return lexdb_syscat.sysSchemaId(s) }
+
 
 fn e(state: &str, msg: &str): DbErr { return lexdb_base.err(state, msg) }
 
@@ -101,25 +106,7 @@ fn tagOnly(tag: &str): Res { return Res{cols: [], rows: [], tag: tag, hasRows: f
 // ---- values
 
 // The text a client sees for a value (NULL is told apart by the caller).
-pub fn text(v: &Val): str {
-    match v {
-        Val.Null { return "" }
-        Val.Int(n) { return n.toStr() }
-        Val.Bool(b) { return if b { "t" } else { "f" } }
-        Val.Num(d) { return d.toStr() }
-        Val.Text(s) { return s }
-        Val.Date(d) { return lexdb_time.fmtDate(d) }
-        Val.Time(u) { return lexdb_time.fmtTime(u) }
-        Val.Ts(u) { return lexdb_time.fmtTs(u) }
-        Val.Tstz(u) { return lexdb_time.fmtTstz(u, &lexdb_time.utc()) }
-        Val.Ival(iv) { return lexdb_time.fmtIval(&iv) }
-        Val.Uuid(u) { return u }
-        Val.Bytes(b) { return lexdb_sql.bytesHex(&b) }
-        Val.Float(x) { return lexdb_float.fmt8(x) }
-        Val.Real(x) { return lexdb_float.fmt4(x) }
-        Val.Reg(_, n) { return n }
-    }
-}
+pub fn text(v: &Val): str { return lexdb_sql.text(v) }
 
 // text, a timestamptz in zone z (the session's: 9.95). text itself gives
 // UTC: the form kept (arrays, keys) and where no session is.
@@ -5690,7 +5677,7 @@ fn resolve(x: &Expr, cols: &[]lexdb_sql.ColDef, n: int, sc: mut &Scope): Result[
         Expr.Cast(a, t) {
             let cx = try resolve(&a, cols, n, sc)
             // T-SQL: '' as an integer, a float or a bit is 0 (design/lexdb-tds.md, section 13)
-            if len(sc.coll) > 0 && tsqlBlank(&cx) && (t.kind == lexdb_sql.K_INT || t.kind == lexdb_sql.K_FLOAT || t.kind == lexdb_sql.K_BOOL) {
+            if len(sc.coll) > 0 && lexdb_syscat.tsqlBlank(&cx) && (t.kind == lexdb_sql.K_INT || t.kind == lexdb_sql.K_FLOAT || t.kind == lexdb_sql.K_BOOL) {
                 return Ok(Expr.Cast(Expr.Lit(Val.Int(0)), t))
             }
             // a char cast to a text: without its blanks (9.94)
@@ -5755,7 +5742,7 @@ fn resolve(x: &Expr, cols: &[]lexdb_sql.ColDef, n: int, sc: mut &Scope): Result[
                         let xo = exprOid(&ca, cols, &pt)
                         let lit = match ca { Expr.Lit(v) { kindOf(&v) == lexdb_sql.K_TEXT } else { false } }
                         // (T-SQL: '' as a number is 0)
-                        let blank = len(sc.coll) > 0 && tsqlBlank(&ca) && (isIntOid(o) || isFloatOid(o) || o == lexdb_sql.OID_BOOL)
+                        let blank = len(sc.coll) > 0 && lexdb_syscat.tsqlBlank(&ca) && (isIntOid(o) || isFloatOid(o) || o == lexdb_sql.OID_BOOL)
                         append(mut &cast, if blank { Expr.Cast(Expr.Lit(Val.Int(0)), oidType(o)) } else if lit || xo == 705 { Expr.Cast(clone(&ca), oidType(o)) } else { clone(&ca) })
                     }
                     out = cast
@@ -5795,20 +5782,7 @@ fn resolve(x: &Expr, cols: &[]lexdb_sql.ColDef, n: int, sc: mut &Scope): Result[
     }
 }
 
-fn colNames(x: &Expr, out: mut &[]str) {
-    match x {
-        Expr.Col(n) { append(out, n) }
-        Expr.Unary(_, a) { colNames(&a, out) }
-        Expr.Bin(_, a, b) {
-            colNames(&a, out)
-            colNames(&b, out)
-        }
-        Expr.IsNull(a, _) { colNames(&a, out) }
-        Expr.Cast(a, _) { colNames(&a, out) }
-        Expr.Call(_, args, _) { for a in args { colNames(&a, out) } }
-        else {}
-    }
-}
+fn colNames(x: &Expr, out: mut &[]str) { lexdb_sql.colNames(x, out) }
 
 fn (q: &Query) valBefore(x: &Expr, k: int): bool { return q.maxLevel(x) < k && !(q.corr && hasCorr(x)) && !(q.noRefKeys && usesRefs(x, q.base)) }
 
@@ -11145,31 +11119,9 @@ fn allTabTypes(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[[]TabT
 
 // A table type's user_type_id, and its table's object_id.
 pub fn tabTypeId(key: &str): int { return lexdb_sql.nameOid(&"T", key) }
-fn tabTypeObj(key: &str): int { return lexdb_pg.catOid(&"tt", key) }
+fn tabTypeObj(key: &str): int { return lexdb_catalog.tabTypeObj(key) }
 
-// A table type's columns, from its definition (T-SQL's CREATE TABLE): the
-// primary key's NOT NULL.
-fn tabTypeCols(t: &TabType): []lexdb_sql.ColDef {
-    let none: []str = []
-    match lexdb_sql.tsqlParser(&t.body, lexdb_sql.Dialect{tsql: true, quotedIdent: true}, &none) {
-        Ok(q0) {
-            var q = q0
-            match q.tableDef(&"#t") {
-                Ok(s0) {
-                    var s = s0
-                    var all = replace(mut &s.cols, [])
-                    for i in 0..len(all) {
-                        for p in s.pk { if p == all[i].name { all[i].notNull = true } }
-                    }
-                    return all
-                }
-                Err(_) {}
-            }
-        }
-        Err(_) {}
-    }
-    return []
-}
+fn tabTypeCols(t: &TabType): []lexdb_sql.ColDef { return lexdb_catalog.tabTypeCols(t) }
 
 // The table type of key (T-SQL's name: dbo as public), None if there is none.
 pub fn (s: mut &Session) tableType(key: &str): Result[Option[TabType], DbErr] {
@@ -11268,7 +11220,7 @@ pub const ROWID: str = lexdb_catalog.ROWID
 fn hiddenName(n: &str): bool { return strings.contains(&n, "\x00rowid") }
 
 // Whether t's key is the hidden column.
-fn rowidKeyed(t: &Table): bool { return len(t.pk) == 1 && t.pk[0] < len(t.cols) && t.cols[t.pk[0]].name == ROWID }
+fn rowidKeyed(t: &Table): bool { return lexdb_catalog.rowidKeyed(t) }
 
 // CREATE TABLE t [(names)] AS query [WITH [NO] DATA], and SELECT ... INTO t
 // (9.88): t's columns the query's (named as given, else as its output),
@@ -20789,14 +20741,9 @@ fn relink(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, old:
 // block written, skipping what was left of it (as PostgreSQL skips what it
 // logged ahead).
 
-fn seqCopy(d: &Seq): Seq {
-    return Seq{key: d.key, id: d.id, typ: d.typ, inc: d.inc, min: d.min, max: d.max, start: d.start, cache: d.cache,
-               cycle: d.cycle, ownerT: d.ownerT, ownerC: d.ownerC}
-}
+fn seqCopy(d: &Seq): Seq { return lexdb_catalog.seqCopy(d) }
 
-fn noSeq(): Seq {
-    return Seq{key: "", id: "", typ: 0, inc: 1, min: 1, max: 1, start: 1, cache: 1, cycle: false, ownerT: "", ownerC: ""}
-}
+fn noSeq(): Seq { return lexdb_catalog.noSeq() }
 
 // The catalog key holding the id of the sequences' tree.
 const SEQ_TREE: str = "\x02seqs"
@@ -27670,10 +27617,7 @@ pub fn (s: &Session) number(): int { return s.id }
 // The session's user, from its startup message.
 pub fn (s: &Session) user(): str { return s.st.memoGet(&userKey(s.id)).unwrapOr("lexdb") }
 
-fn colNum(t: &Table, name: &str): int {
-    for i in 0..len(t.cols) { if t.cols[i].name == name { return i + 1 } }
-    return 0
-}
+fn colNum(t: &Table, name: &str): int { return lexdb_catalog.colNum(t, name) }
 
 
 
@@ -27911,7 +27855,7 @@ fn bindCatalog(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[Unit, 
               lexdb_pg.shownIn(&snap.path, &sc, &nm) + "\t" + sc + "\t" + nm + "\n"))
     }
     for c in snap.cons { b.add(&("c\t" + c.oid.toStr() + "\t" + lexdb_pg.clean(&c.def) + "\n")) }
-    sysBind(&snap, mut &b)
+    lexdb_syscat.bind(&snap, mut &b)
     for s in snap.schemas { b.add(&("n\t" + lexdb_pg.nspOid(&s).toStr() + "\t" + s + "\n")) }
     b.add("n\t11\tpg_catalog\nn\t13000\tinformation_schema\n")
     st.memoPut(&catMemoKey(txn.sess), &b.toStr())
@@ -29580,9 +29524,12 @@ fn zeros(n: int): Val {
 // The rows of catalog relation rel.
 // pg_class.relpersistence: t for a temporary relation (9.96), else p.
 fn catRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &str): Result[[][]Val, DbErr] {
-    if strings.startsWith(rel, "sys.") { return sysRows(st, txn, &rel[4..len(rel)]) }
     let snap = try catSnap(st, txn)
     let roles = try rolesIn(st, txn)
+    if strings.startsWith(rel, "sys.") {
+        var cq = CatView{snap: snap, roles: roles, sess: txn.sess}
+        return lexdb_syscat.viewRows(&cq, &rel[4..len(rel)])
+    }
     if strings.startsWith(rel, "ora.") {
         var cq = CatView{snap: snap, roles: roles, sess: txn.sess}
         return lexdb_oracat.viewRows(&cq, &rel[4..len(rel)])
@@ -30011,116 +29958,6 @@ fn catRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &str): Result
     return Ok(rows)
 }
 
-// ---- SQL Server's catalog views, sys.* (design/lexdb-tds.md, section 13)
-//
-// For T-SQL sessions: "#sys.x" in FROM (lexdb_sql, from lexdb_syscat). The
-// views' shapes, and the rows lexdb takes as SQL Server has them, are
-// lexdb_syscat's; the rows that describe lexdb's own objects are made here
-// from the catalog (catSnap), each from SQL Server's template row for such
-// an object with the columns that describe it set. Ids: a table's or a
-// view's object_id is its OID (catOid), a constraint's its pg_constraint
-// OID, a default's its pg_attrdef OID; a sys view's SQL Server's own
-// (negative). public is dbo (schema_id 1); another schema's id is its
-// OID. lexdb's database is database_id 5, after master, tempdb, model and
-// msdb, which are listed (as SQL Server's) but cannot be opened.
-
-pub const SYS_DB_NAME: str = "lexdb"
-pub const SYS_DB_ID = 5
-const SYS_DATE: str = "2000-01-01 00:00:00"     // create_date and modify_date: lexdb keeps no times
-
-// A row of a sys view being made: its columns and values.
-type SysRow = record {
-    cols: []lexdb_syscat.SysCol
-    vals: []Val
-}
-
-// A value as lexdb_syscat holds it ("\x00" NULL), as its column's type.
-fn sysVal(c: &lexdb_syscat.SysCol, s: &str): Val {
-    if s == "\x00" { return Val.Null }
-    let o = lexdb_syscat.lexOid(&c.typ)
-    if o == lexdb_sql.OID_INT2 || o == lexdb_sql.OID_INT4 || o == lexdb_sql.OID_INT8 { return Val.Int(strings.parseIntOpt(&s).unwrapOr(0)) }
-    if o == lexdb_sql.OID_BOOL { return Val.Bool(s == "1") }
-    if o == lexdb_sql.OID_NUMERIC {
-        match Decimal.parse(&s) {
-            Ok(d) { return Val.Num(d) }
-            Err(_) { return Val.Null }
-        }
-    }
-    if o == lexdb_sql.OID_FLOAT8 || o == lexdb_sql.OID_FLOAT4 {
-        match lexdb_float.parse(s, o == lexdb_sql.OID_FLOAT4) {
-            Ok(x) { return if o == lexdb_sql.OID_FLOAT8 { Val.Float(x) } else { Val.Real(x) } }
-            Err(_) { return Val.Null }
-        }
-    }
-    if o == lexdb_sql.OID_TS {
-        match lexdb_time.parseTs(s, &lexdb_time.utc()) {
-            Ok(u) { return Val.Ts(u) }
-            Err(_) { return Val.Null }
-        }
-    }
-    if o == lexdb_sql.OID_UUID { return Val.Uuid(strings.toLowerAscii(&s)) }
-    if o == lexdb_sql.OID_BYTEA { return Val.Bytes(lexdb_catalog.hexBytes(s)) }
-    // sql_variant: a number as a number
-    if c.typ == "sql_variant" {
-        match strings.parseIntOpt(&s) {
-            Some(n) { return Val.Int(n) }
-            None {}
-        }
-    }
-    return Val.Text(s.toStr())
-}
-
-fn sysVals(cols: &[]lexdb_syscat.SysCol, r: &[]str): []Val {
-    var out: []Val = []
-    for i in 0..len(cols) { append(mut &out, if i < len(r) { sysVal(&cols[i], &r[i]) } else { Val.Null }) }
-    return out
-}
-
-// The view's template row (NULLs where it has none).
-fn sysTemplate(view: &str): SysRow {
-    let cols = lexdb_syscat.cols(view)
-    let ts = lexdb_syscat.rows(view, &"template")
-    var vals: []Val = []
-    if len(ts) > 0 { vals = sysVals(&cols, &ts[0]) } else { for c in cols { append(mut &vals, Val.Null) } }
-    return SysRow{cols: cols, vals: vals}
-}
-
-// The rows SQL Server has, as they are.
-fn sysFull(view: &str): [][]Val {
-    let cols = lexdb_syscat.cols(view)
-    var out: [][]Val = []
-    for r in lexdb_syscat.rows(view, &"full") { append(mut &out, sysVals(&cols, &r)) }
-    return out
-}
-
-fn (r: mut &SysRow) set(name: &str, v: Val) {
-    for i in 0..len(r.cols) {
-        if r.cols[i].name == name {
-            r.vals[i] = v
-            return
-        }
-    }
-}
-
-fn (r: &SysRow) row(): []Val {
-    var out: []Val = []
-    for v in r.vals { append(mut &out, v) }
-    return out
-}
-
-fn sysTs(): Val {
-    match lexdb_time.parseTs(&SYS_DATE, &lexdb_time.utc()) {
-        Ok(u) { return Val.Ts(u) }
-        Err(_) { return Val.Null }
-    }
-}
-
-// A schema's id and name as SQL Server shows them: public is dbo.
-fn sysSchemaId(s: &str): int { return if s == "public" { 1 } else { lexdb_pg.nspOid(s) } }
-fn sysSchemaName(s: &str): str { return if s == "public" { "dbo" } else { s.toStr() } }
-
-// A column's SQL Server type: its name, system_type_id, user_type_id,
-// max_length, precision, scale, collation ("" none).
 // A column as SQL Server describes it (lexdb_tds: SET FMTONLY ON, sp_prepare's
 // metadata, sp_describe_first_result_set, sp_tablecollations_100 and INSERT
 // BULK; design/lexdb-tds.md section 14): its label, SQL Server's type for it
@@ -30223,742 +30060,6 @@ pub fn (s: mut &Session) describeDecl(stmt: &lexdb_sql.Stmt): Result[[]DeclCol, 
         }
     }
     return Ok(out)
-}
-
-// A table's indexes as SQL Server numbers them: the primary key clustered
-// (index_id 1; a table without one is a heap, index 0), the rest
-// nonclustered from 2.
-type SysIdx = record {
-    id: int
-    name: str
-    oid: int
-    clustered: bool
-    heap: bool
-    unique: bool
-    pk: bool
-    uq: bool                // a UNIQUE constraint's
-    cols: []int             // the table's attnums (0: an expression's)
-    descs: []bool
-    filter: str
-}
-
-fn sysIdxs(ct: &CatTab): []SysIdx {
-    var out: []SysIdx = []
-    var next = 2
-    var hasPk = false
-    for ix in ct.idxs { if ix.primary { hasPk = true } }
-    if !hasPk {
-        append(mut &out, SysIdx{id: 0, name: "", oid: 0, clustered: false, heap: true, unique: false, pk: false, uq: false, cols: [], descs: [],
-                                filter: ""})
-    }
-    for ix in ct.idxs {
-        var descs: []bool = []
-        for k in 0..len(ix.cols) { append(mut &descs, k < len(ix.opts) && strings.contains(&ix.opts[k], "DESC")) }
-        let filt = match ix.pred {
-            Some(p) { "(" + tsqlText(&p) + ")" }
-            None { "" }
-        }
-        var id = 1
-        if !ix.primary {
-            id = next
-            next += 1
-        }
-        append(mut &out, SysIdx{id: id, name: ix.name, oid: ix.oid, clustered: ix.primary, heap: false, unique: ix.unique, pk: ix.primary,
-                                uq: ix.con && !ix.primary, cols: copyInts(&ix.cols), descs: descs, filter: filt})
-    }
-    return out
-}
-
-// The column_id of each of a table's columns: its place among those shown
-// (0 for lexdb's hidden row id).
-fn sysColIds(t: &Table): []int {
-    var out: []int = []
-    var n = 0
-    for c in t.cols {
-        if c.name == ROWID {
-            append(mut &out, 0)
-        } else {
-            n += 1
-            append(mut &out, n)
-        }
-    }
-    return out
-}
-
-fn sysColId(t: &Table, attnum: int): int {
-    let ids = sysColIds(t)
-    return if attnum >= 1 && attnum <= len(ids) { ids[attnum - 1] } else { 0 }
-}
-
-// A default's object (SQL Server's default constraint): its id and name.
-fn sysDefOid(ct: &CatTab, c: &lexdb_sql.ColDef): int { return lexdb_pg.catOid(&"d", &(ct.key + "\x00" + c.name)) }
-fn sysDefName(ct: &CatTab, c: &lexdb_sql.ColDef): str { return "DF_" + ct.name + "_" + c.name }
-
-fn sysHasDefault(c: &lexdb_sql.ColDef): bool {
-    return c.def.isSome() && c.identity != lexdb_sql.ID_ALWAYS && c.identity != lexdb_sql.ID_BY_DEFAULT && c.name != ROWID
-}
-
-// An expression as SQL Server shows a definition: [names], (literals),
-// operators without spaces ((([amount]>=(0))).
-fn tsqlText(x: &Expr): str {
-    match x {
-        Expr.Lit(v) {
-            match v {
-                Val.Null { return "NULL" }
-                Val.Text(s) { return "'" + strings.replaceAll(&s, "'", "''") + "'" }
-                Val.Bool(b) { return if b { "(1)" } else { "(0)" } }
-                else { return "(" + text(&v) + ")" }
-            }
-        }
-        Expr.Col(n) { return "[" + n + "]" }
-        Expr.Unary(op, a) { return (if op == "not" { "NOT " } else { op }) + tsqlText(&a) }
-        Expr.Bin(op, a, b) {
-            if op == "and" || op == "or" { return tsqlText(&a) + " " + strings.toUpperAscii(&op) + " " + tsqlText(&b) }
-            return "(" + tsqlText(&a) + op + tsqlText(&b) + ")"
-        }
-        Expr.IsNull(a, not) { return tsqlText(&a) + (if not { " IS NOT NULL" } else { " IS NULL" }) }
-        Expr.Call(f, args, star) {
-            var n = f.toStr()
-            if n == "#utcnow" { n = "sysutcdatetime" }
-            if n == "localtimestamp" { n = "getdate" }
-            if n == "gen_random_uuid" { n = "newid" }
-            if n == "current_timestamp" || n == "now" { n = "getdate" }
-            var parts: []str = []
-            for a in args { append(mut &parts, tsqlText(&a)) }
-            return n + "(" + (if star { "*" } else { strings.join(&parts, ",") }) + ")"
-        }
-        Expr.Cast(a, t) { return tsqlText(&a) }
-        else { return lexdb_sql.exprText(x) }
-    }
-}
-
-fn sysDefText(c: &lexdb_sql.ColDef): str {
-    match c.def {
-        Some(d) {
-            let t = tsqlText(&d)
-            return if strings.startsWith(&t, "(") { "(" + t + ")" } else { "(" + t + ")" }
-        }
-        None { return "" }
-    }
-}
-
-fn fkActionCode(a: &str): int { return if a == "c" { 1 } else if a == "n" { 2 } else if a == "d" { 3 } else { 0 } }
-fn fkActionDesc(a: &str): str { return if a == "c" { "CASCADE" } else if a == "n" { "SET_NULL" } else if a == "d" { "SET_DEFAULT" } else { "NO_ACTION" } }
-
-// An object row (sys.objects, all_objects): name, id, schema, parent, type.
-fn sysObj(name: &str, id: int, schemaId: int, parent: int, typ: &str, desc: &str, shipped: bool): []Val {
-    var r = sysTemplate(&"objects")
-    r.set(&"name", tv(name))
-    r.set(&"object_id", iv(id))
-    r.set(&"principal_id", Val.Null)
-    r.set(&"schema_id", iv(schemaId))
-    r.set(&"parent_object_id", iv(parent))
-    r.set(&"type", tv(&(if len(typ) == 1 { typ + " " } else { typ.toStr() })))
-    r.set(&"type_desc", tv(desc))
-    r.set(&"create_date", sysTs())
-    r.set(&"modify_date", sysTs())
-    r.set(&"is_ms_shipped", bv(shipped))
-    return r.row()
-}
-
-// The user objects SQL Server lists in sys.objects: tables, views,
-// constraints, defaults, sequences.
-fn sysObjects(snap: &CatSnap): [][]Val {
-    var rows: [][]Val = []
-    for ct in snap.tabs {
-        if lexdb_base.isTempSchema(&ct.schema) { continue }
-        let sid = sysSchemaId(&ct.schema)
-        append(mut &rows, sysObj(&tabShown(&ct), ct.oid, sid, 0, &"U", &"USER_TABLE", false))
-        for c in ct.t.cols {
-            if sysHasDefault(&c) { append(mut &rows, sysObj(&sysDefName(&ct, &c), sysDefOid(&ct, &c), sid, ct.oid, &"D", &"DEFAULT_CONSTRAINT", false)) }
-        }
-    }
-    for c in snap.cons {
-        if lexdb_base.isTempSchema(&c.schema) { continue }
-        let ty = if c.typ == "p" { "PK" } else if c.typ == "u" { "UQ" } else if c.typ == "f" { "F" } else { "C" }
-        let desc = if c.typ == "p" { "PRIMARY_KEY_CONSTRAINT" } else if c.typ == "u" { "UNIQUE_CONSTRAINT" } else if c.typ == "f" { "FOREIGN_KEY_CONSTRAINT" } else { "CHECK_CONSTRAINT" }
-        append(mut &rows, sysObj(&c.name, c.oid, sysSchemaId(&c.schema), c.rel, &ty, &desc, false))
-    }
-    for v in snap.views {
-        if lexdb_base.isTempSchema(&v.schema) { continue }
-        append(mut &rows, sysObj(&tabShown(&v), v.oid, sysSchemaId(&v.schema), 0, &"V", &"VIEW", false))
-    }
-    for d in snap.seqs {
-        if len(d.ownerT) > 0 { continue }
-        let sc = lexdb_sql.schemaOf(&d.key)
-        if lexdb_base.isTempSchema(&sc) { continue }
-        append(mut &rows, sysObj(&lexdb_sql.baseName(&d.key), seqOid(&d), sysSchemaId(&sc), 0, &"SO", &"SEQUENCE_OBJECT", false))
-    }
-    // a table type's table: TT_name_hex, SQL Server's own
-    for t in snap.ttypes {
-        let id = tabTypeObj(&t.key)
-        let hx = strings.padLeft(&(strings.toUpperAscii(&strings.hex(id))), 8, '0')
-        append(mut &rows, sysObj(&("TT_" + t.spell + "_" + hx), id, sysSchemaId(&lexdb_sql.schemaOf(&t.key)), 0, &"TT", &"TYPE_TABLE", true))
-    }
-    return rows
-}
-
-// A table type's row of sys.types or sys.table_types.
-fn sysTabTypeRow(t: &TabType, view: &str): []Val {
-    var r = sysTemplate(view)
-    r.set(&"name", tv(&t.spell))
-    r.set(&"system_type_id", iv(243))
-    r.set(&"user_type_id", iv(tabTypeId(&t.key)))
-    r.set(&"schema_id", iv(sysSchemaId(&lexdb_sql.schemaOf(&t.key))))
-    r.set(&"principal_id", Val.Null)
-    r.set(&"max_length", iv(-1))
-    r.set(&"precision", iv(0))
-    r.set(&"scale", iv(0))
-    r.set(&"collation_name", Val.Null)
-    r.set(&"is_nullable", bv(false))
-    r.set(&"is_user_defined", bv(true))
-    r.set(&"is_assembly_type", bv(false))
-    r.set(&"default_object_id", iv(0))
-    r.set(&"rule_object_id", iv(0))
-    r.set(&"is_table_type", bv(true))
-    r.set(&"type_table_object_id", iv(tabTypeObj(&t.key)))
-    r.set(&"is_memory_optimized", bv(false))
-    return r.row()
-}
-
-// The columns of the table types' tables (sys.columns).
-fn sysTabTypeColumns(snap: &CatSnap): [][]Val {
-    var rows: [][]Val = []
-    for t in snap.ttypes {
-        let cols = tabTypeCols(&t)
-        for i in 0..len(cols) {
-            let c = &cols[i]
-            let ty = lexdb_syscat.sqlTypeOf(&c.typ, &c.coll)
-            let ident = c.identity == lexdb_sql.ID_ALWAYS || c.identity == lexdb_sql.ID_BY_DEFAULT || c.identity == lexdb_sql.ID_SERIAL
-            append(mut &rows, sysColumn(tabTypeObj(&t.key), &(if len(c.spell) > 0 { c.spell } else { c.name }), i + 1, &ty, !c.notNull, ident, 0))
-        }
-    }
-    return rows
-}
-
-// The sys views themselves, as system objects.
-fn sysSysObjects(): [][]Val {
-    var rows: [][]Val = []
-    for v in lexdb_syscat.viewNames() { append(mut &rows, sysObj(&v, lexdb_syscat.viewId(&v), 4, 0, &"V", &"VIEW", true)) }
-    return rows
-}
-
-fn tabShown(ct: &CatTab): str { return if len(ct.t.spell) > 0 { ct.t.spell } else { ct.name } }
-
-// A column row (sys.columns, all_columns) of a column of type ty.
-fn sysColumn(objId: int, name: &str, colId: int, ty: &SqlT, nullable: bool, identity: bool, defId: int): []Val {
-    var r = sysTemplate(&"columns")
-    r.set(&"object_id", iv(objId))
-    r.set(&"name", tv(name))
-    r.set(&"column_id", iv(colId))
-    r.set(&"system_type_id", iv(ty.sys))
-    r.set(&"user_type_id", iv(ty.user))
-    r.set(&"max_length", iv(ty.maxLen))
-    r.set(&"precision", iv(ty.prec))
-    r.set(&"scale", iv(ty.scale))
-    r.set(&"collation_name", if len(ty.coll) > 0 { tv(&ty.coll) } else { Val.Null })
-    r.set(&"is_nullable", bv(nullable))
-    let padded = ty.name == "char" || ty.name == "varchar" || ty.name == "nchar" || ty.name == "nvarchar" || ty.name == "sysname" ||
-                 ty.name == "binary" || ty.name == "varbinary"
-    r.set(&"is_ansi_padded", bv(padded))
-    r.set(&"is_identity", bv(identity))
-    r.set(&"default_object_id", iv(defId))
-    return r.row()
-}
-
-fn sysUserColumns(snap: &CatSnap): [][]Val {
-    var rows: [][]Val = []
-    for ct in snap.tabs {
-        if lexdb_base.isTempSchema(&ct.schema) { continue }
-        let ids = sysColIds(&ct.t)
-        for i in 0..len(ct.t.cols) {
-            let c = &ct.t.cols[i]
-            if ids[i] == 0 { continue }
-            var nn = c.notNull
-            for p in ct.t.pk { if p == i { nn = true } }
-            let ty = lexdb_syscat.sqlTypeOf(&c.typ, &c.coll)
-            let ident = c.identity == lexdb_sql.ID_ALWAYS || c.identity == lexdb_sql.ID_BY_DEFAULT || c.identity == lexdb_sql.ID_SERIAL
-            append(mut &rows, sysColumn(ct.oid, &lexdb_sql.colShown(c), ids[i], &ty, !nn, ident, if sysHasDefault(c) { sysDefOid(&ct, c) } else { 0 }))
-        }
-    }
-    for v in snap.views {
-        if lexdb_base.isTempSchema(&v.schema) { continue }
-        for i in 0..len(v.t.cols) {
-            let c = &v.t.cols[i]
-            // a column of the one table it reads that has its name and type:
-            // that column's type and nullability (as SQL Server derives them)
-            var ty = lexdb_syscat.sqlTypeOf(&c.typ, &c.coll)
-            var nullable = true
-            var found = 0
-            for d in v.t.deps {
-                for ct in snap.tabs {
-                    if ct.key != d { continue }
-                    for k in 0..len(ct.t.cols) {
-                        let b = &ct.t.cols[k]
-                        if b.name != c.name || b.typ.oid != c.typ.oid { continue }
-                        found += 1
-                        ty = lexdb_syscat.sqlTypeOf(&b.typ, &b.coll)
-                        var nn = b.notNull
-                        for p in ct.t.pk { if p == k { nn = true } }
-                        nullable = !nn
-                    }
-                }
-            }
-            if found != 1 {
-                ty = lexdb_syscat.sqlTypeOf(&c.typ, &c.coll)
-                nullable = true
-            }
-            append(mut &rows, sysColumn(v.oid, &lexdb_sql.colShown(c), i + 1, &ty, nullable, false, 0))
-        }
-    }
-    return rows
-}
-
-fn sysSysColumns(): [][]Val {
-    var rows: [][]Val = []
-    for v in lexdb_syscat.viewNames() {
-        let id = lexdb_syscat.viewId(&v)
-        let cs = lexdb_syscat.cols(&v)
-        for k in 0..len(cs) {
-            let c = &cs[k]
-            let ty = lexdb_syscat.sqlT(&c.typ, c.maxLen, c.prec, c.scale, &c.coll)
-            append(mut &rows, sysColumn(id, &c.name, k + 1, &ty, c.nullable, false, 0))
-        }
-    }
-    return rows
-}
-
-fn sysTableRow(ct: &CatTab, view: &str): []Val {
-    var r = sysTemplate(view)
-    r.set(&"name", tv(&tabShown(ct)))
-    r.set(&"object_id", iv(ct.oid))
-    r.set(&"schema_id", iv(sysSchemaId(&ct.schema)))
-    r.set(&"create_date", sysTs())
-    r.set(&"modify_date", sysTs())
-    r.set(&"is_ms_shipped", bv(false))
-    var lob = false
-    for c in ct.t.cols {
-        let ty = lexdb_syscat.sqlTypeOf(&c.typ, &c.coll)
-        if ty.maxLen == -1 { lob = true }
-    }
-    r.set(&"lob_data_space_id", iv(if lob { 1 } else { 0 }))
-    r.set(&"max_column_id_used", iv(len(ct.t.cols) - (if rowidKeyed(&ct.t) { 1 } else { 0 })))
-    return r.row()
-}
-
-fn sysViewRow(v: &CatTab, view: &str): []Val {
-    var r = sysTemplate(view)
-    r.set(&"name", tv(&tabShown(v)))
-    r.set(&"object_id", iv(v.oid))
-    r.set(&"schema_id", iv(sysSchemaId(&v.schema)))
-    r.set(&"create_date", sysTs())
-    r.set(&"modify_date", sysTs())
-    r.set(&"is_ms_shipped", bv(false))
-    return r.row()
-}
-
-fn sysSysViewRows(view: &str): [][]Val {
-    var rows: [][]Val = []
-    for v in lexdb_syscat.viewNames() {
-        var r = sysTemplate(view)
-        r.set(&"name", tv(&v))
-        r.set(&"object_id", iv(lexdb_syscat.viewId(&v)))
-        r.set(&"schema_id", iv(4))
-        r.set(&"is_ms_shipped", bv(true))
-        append(mut &rows, r.row())
-    }
-    return rows
-}
-
-// A login's sid: 0x4C58 ("LX") and its role's OID, big-endian.
-fn sysSid(role: &str): str {
-    let o = lexdb_pg.catOid(&"a", role)
-    var b = newStrBuf()
-    b.addByte(0x4C)
-    b.addByte(0x58)
-    for k in 0..4 { b.addByte(byte((o >> (8 * (3 - k))) & 0xFF)) }
-    return b.toStr()
-}
-
-fn sysDbRow(snap: &CatSnap): []Val {
-    var r = sysTemplate(&"databases")
-    r.set(&"name", tv(&SYS_DB_NAME))
-    r.set(&"database_id", iv(SYS_DB_ID))
-    r.set(&"source_database_id", Val.Null)
-    r.set(&"owner_sid", Val.Bytes("\x01"))
-    r.set(&"create_date", sysTs())
-    return r.row()
-}
-
-// A string literal of nothing but spaces (T-SQL converts it to 0).
-fn tsqlBlank(x: &Expr): bool {
-    match x {
-        Expr.Lit(v) {
-            match v {
-                Val.Text(t) { return len(strings.trim(&t)) == 0 }
-                else { return false }
-            }
-        }
-        else { return false }
-    }
-}
-
-fn appendRows(rows: mut &[][]Val, more: [][]Val) {
-    var m = more
-    for i in 0..len(m) { append(rows, replace(mut &m[i], [])) }
-}
-
-fn sysRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, view: &str): Result[[][]Val, DbErr] {
-    let snap = try catSnap(st, txn)
-    var rows: [][]Val = []
-    match view.toStr() {
-        "objects" { rows = sysObjects(&snap) }
-        "all_objects" {
-            rows = sysObjects(&snap)
-            appendRows(mut &rows, sysSysObjects())
-        }
-        "system_objects" { rows = sysSysObjects() }
-        "tables" {
-            for ct in snap.tabs { if !lexdb_base.isTempSchema(&ct.schema) { append(mut &rows, sysTableRow(&ct, &"tables")) } }
-        }
-        "views", "all_views" {
-            for v in snap.views { if !lexdb_base.isTempSchema(&v.schema) { append(mut &rows, sysViewRow(&v, view)) } }
-            if view == "all_views" { appendRows(mut &rows, sysSysViewRows(&"all_views")) }
-        }
-        "system_views" { rows = sysSysViewRows(&"system_views") }
-        "columns" {
-            rows = sysUserColumns(&snap)
-            appendRows(mut &rows, sysTabTypeColumns(&snap))
-        }
-        "all_columns" {
-            rows = sysUserColumns(&snap)
-            appendRows(mut &rows, sysTabTypeColumns(&snap))
-            appendRows(mut &rows, sysSysColumns())
-        }
-        "types" {
-            rows = sysFull(&"types")
-            for t in snap.ttypes { append(mut &rows, sysTabTypeRow(&t, &"types")) }
-        }
-        "table_types" { for t in snap.ttypes { append(mut &rows, sysTabTypeRow(&t, &"table_types")) } }
-        "system_columns" { rows = sysSysColumns() }
-        "schemas" {
-            rows = sysFull(&"schemas")
-            for s in snap.schemas {
-                if s == "public" || lexdb_base.isTempSchema(&s) { continue }
-                append(mut &rows, [tv(&s), iv(lexdb_pg.nspOid(&s)), iv(1)])
-            }
-        }
-        "configurations", "syslanguages", "fulltext_languages", "database_scoped_configurations", "data_spaces",
-        "database_files", "dm_os_host_info", "database_permissions" { rows = sysFull(view) }
-        "databases" {
-            rows = sysFull(&"databases")
-            append(mut &rows, sysDbRow(&snap))
-        }
-        "database_recovery_status", "database_filestream_options" {
-            rows = sysFull(view)
-            var r = sysTemplate(view)
-            r.set(&"database_id", iv(SYS_DB_ID))
-            append(mut &rows, r.row())
-        }
-        "server_principals" {
-            rows = sysFull(&"server_principals")
-            var n = 0
-            for role in try rolesIn(st, txn) {
-                if !role.login { continue }
-                var r = sysTemplate(&"server_principals")
-                r.set(&"name", tv(&role.name))
-                r.set(&"principal_id", iv(300 + n))
-                r.set(&"sid", Val.Bytes(sysSid(&role.name)))
-                r.set(&"create_date", sysTs())
-                r.set(&"modify_date", sysTs())
-                append(mut &rows, r.row())
-                n += 1
-            }
-        }
-        "database_principals" {
-            // superusers are dbo; another role that logs in is a user of its name
-            rows = sysFull(&"database_principals")
-            var n = 0
-            for role in try rolesIn(st, txn) {
-                if !role.login || role.superuser { continue }
-                var r = sysTemplate(&"database_principals")
-                r.set(&"name", tv(&role.name))
-                r.set(&"principal_id", iv(5 + n))
-                r.set(&"sid", Val.Bytes(sysSid(&role.name)))
-                r.set(&"create_date", sysTs())
-                r.set(&"modify_date", sysTs())
-                append(mut &rows, r.row())
-                n += 1
-            }
-        }
-        "dm_exec_sessions" {
-            var r = sysTemplate(&"dm_exec_sessions")
-            r.set(&"session_id", iv(txn.sess))
-            r.set(&"login_name", tv(&snap.user))
-            r.set(&"original_login_name", tv(&snap.user))
-            r.set(&"nt_user_name", tv(&""))
-            r.set(&"database_id", iv(SYS_DB_ID))
-            r.set(&"authenticating_database_id", iv(1))
-            append(mut &rows, r.row())
-        }
-        "indexes" {
-            for ct in snap.tabs {
-                if lexdb_base.isTempSchema(&ct.schema) { continue }
-                for x in sysIdxs(&ct) {
-                    var r = sysTemplate(&"indexes")
-                    r.set(&"object_id", iv(ct.oid))
-                    r.set(&"name", if x.heap { Val.Null } else { tv(&x.name) })
-                    r.set(&"index_id", iv(x.id))
-                    r.set(&"type", iv(if x.heap { 0 } else if x.clustered { 1 } else { 2 }))
-                    r.set(&"type_desc", tv(&(if x.heap { "HEAP" } else if x.clustered { "CLUSTERED" } else { "NONCLUSTERED" })))
-                    r.set(&"is_unique", bv(x.unique))
-                    r.set(&"is_primary_key", bv(x.pk))
-                    r.set(&"is_unique_constraint", bv(x.uq))
-                    r.set(&"has_filter", bv(len(x.filter) > 0))
-                    r.set(&"filter_definition", if len(x.filter) > 0 { tv(&x.filter) } else { Val.Null })
-                    append(mut &rows, r.row())
-                }
-            }
-        }
-        "index_columns" {
-            for ct in snap.tabs {
-                if lexdb_base.isTempSchema(&ct.schema) { continue }
-                for x in sysIdxs(&ct) {
-                    var k = 0
-                    for j in 0..len(x.cols) {
-                        let cid = sysColId(&ct.t, x.cols[j])
-                        if cid == 0 { continue }
-                        k += 1
-                        var r = sysTemplate(&"index_columns")
-                        r.set(&"object_id", iv(ct.oid))
-                        r.set(&"index_id", iv(x.id))
-                        r.set(&"index_column_id", iv(k))
-                        r.set(&"column_id", iv(cid))
-                        r.set(&"key_ordinal", iv(k))
-                        r.set(&"is_descending_key", bv(j < len(x.descs) && x.descs[j]))
-                        r.set(&"is_included_column", bv(false))
-                        append(mut &rows, r.row())
-                    }
-                }
-            }
-        }
-        "stats" {
-            for ct in snap.tabs {
-                if lexdb_base.isTempSchema(&ct.schema) { continue }
-                for x in sysIdxs(&ct) {
-                    if x.heap { continue }
-                    var r = sysTemplate(&"stats")
-                    r.set(&"object_id", iv(ct.oid))
-                    r.set(&"name", tv(&x.name))
-                    r.set(&"stats_id", iv(x.id))
-                    r.set(&"has_filter", bv(len(x.filter) > 0))
-                    r.set(&"filter_definition", if len(x.filter) > 0 { tv(&x.filter) } else { Val.Null })
-                    append(mut &rows, r.row())
-                }
-            }
-        }
-        "key_constraints" {
-            for c in snap.cons {
-                if c.typ != "p" && c.typ != "u" { continue }
-                let ti = catTabIdx(&snap, c.rel)
-                if ti < 0 || lexdb_base.isTempSchema(&c.schema) { continue }
-                var idx = 0
-                for x in sysIdxs(&snap.tabs[ti]) { if x.oid == c.idx { idx = x.id } }
-                var r = sysTemplate(&"key_constraints")
-                r.set(&"name", tv(&c.name))
-                r.set(&"object_id", iv(c.oid))
-                r.set(&"schema_id", iv(sysSchemaId(&c.schema)))
-                r.set(&"parent_object_id", iv(c.rel))
-                r.set(&"type", tv(&(if c.typ == "p" { "PK" } else { "UQ" })))
-                r.set(&"type_desc", tv(&(if c.typ == "p" { "PRIMARY_KEY_CONSTRAINT" } else { "UNIQUE_CONSTRAINT" })))
-                r.set(&"create_date", sysTs())
-                r.set(&"modify_date", sysTs())
-                r.set(&"unique_index_id", iv(idx))
-                r.set(&"is_system_named", bv(!lexdb_catalog.sysNamed(&c, &snap.tabs[ti].name)))
-                append(mut &rows, r.row())
-            }
-        }
-        "foreign_keys" {
-            for c in snap.cons {
-                if c.typ != "f" || lexdb_base.isTempSchema(&c.schema) { continue }
-                let ti = catTabIdx(&snap, c.rel)
-                let ri = catTabIdx(&snap, c.refRel)
-                if ti < 0 { continue }
-                var keyIdx = 0
-                if ri >= 0 { for x in sysIdxs(&snap.tabs[ri]) { if x.oid == c.idx { keyIdx = x.id } } }
-                var r = sysTemplate(&"foreign_keys")
-                r.set(&"name", tv(&c.name))
-                r.set(&"object_id", iv(c.oid))
-                r.set(&"schema_id", iv(sysSchemaId(&c.schema)))
-                r.set(&"parent_object_id", iv(c.rel))
-                r.set(&"create_date", sysTs())
-                r.set(&"modify_date", sysTs())
-                r.set(&"referenced_object_id", iv(c.refRel))
-                r.set(&"key_index_id", iv(keyIdx))
-                r.set(&"delete_referential_action", iv(fkActionCode(&c.del)))
-                r.set(&"delete_referential_action_desc", tv(&fkActionDesc(&c.del)))
-                r.set(&"update_referential_action", iv(fkActionCode(&c.upd)))
-                r.set(&"update_referential_action_desc", tv(&fkActionDesc(&c.upd)))
-                r.set(&"is_system_named", bv(!lexdb_catalog.sysNamed(&c, &snap.tabs[ti].name)))
-                append(mut &rows, r.row())
-            }
-        }
-        "foreign_key_columns" {
-            for c in snap.cons {
-                if c.typ != "f" || lexdb_base.isTempSchema(&c.schema) { continue }
-                let ti = catTabIdx(&snap, c.rel)
-                let ri = catTabIdx(&snap, c.refRel)
-                if ti < 0 || ri < 0 { continue }
-                for k in 0..len(c.cols) {
-                    var r = sysTemplate(&"foreign_key_columns")
-                    r.set(&"constraint_object_id", iv(c.oid))
-                    r.set(&"constraint_column_id", iv(k + 1))
-                    r.set(&"parent_object_id", iv(c.rel))
-                    r.set(&"parent_column_id", iv(sysColId(&snap.tabs[ti].t, c.cols[k])))
-                    r.set(&"referenced_object_id", iv(c.refRel))
-                    r.set(&"referenced_column_id", iv(if k < len(c.refCols) { sysColId(&snap.tabs[ri].t, c.refCols[k]) } else { 0 }))
-                    append(mut &rows, r.row())
-                }
-            }
-        }
-        "check_constraints" {
-            for ti in 0..len(snap.tabs) {
-                let ct = &snap.tabs[ti]
-                if lexdb_base.isTempSchema(&ct.schema) { continue }
-                for ck in ct.t.checks {
-                    let oid = lexdb_pg.catOid(&"c", &(ct.key + "\x00" + ck.name))
-                    var r = sysTemplate(&"check_constraints")
-                    r.set(&"name", tv(&ck.name))
-                    r.set(&"object_id", iv(oid))
-                    r.set(&"schema_id", iv(sysSchemaId(&ct.schema)))
-                    r.set(&"parent_object_id", iv(ct.oid))
-                    r.set(&"create_date", sysTs())
-                    r.set(&"modify_date", sysTs())
-                    var used: []str = []
-                    colNames(&ck.expr, mut &used)
-                    var pc = 0
-                    if len(used) == 1 { pc = sysColId(&ct.t, colNum(&ct.t, &used[0])) }
-                    r.set(&"parent_column_id", iv(pc))
-                    let x = tsqlText(&ck.expr)
-                    r.set(&"definition", tv(&(if strings.startsWith(&x, "(") { x } else { "(" + x + ")" })))
-                    let auto = strings.startsWith(&ck.name, &(ct.name + "_")) && strings.endsWith(&ck.name, "_check")
-                    r.set(&"is_system_named", bv(auto))
-                    append(mut &rows, r.row())
-                }
-            }
-        }
-        "default_constraints" {
-            for ct in snap.tabs {
-                if lexdb_base.isTempSchema(&ct.schema) { continue }
-                let ids = sysColIds(&ct.t)
-                for i in 0..len(ct.t.cols) {
-                    let c = &ct.t.cols[i]
-                    if !sysHasDefault(c) { continue }
-                    var r = sysTemplate(&"default_constraints")
-                    r.set(&"name", tv(&sysDefName(&ct, c)))
-                    r.set(&"object_id", iv(sysDefOid(&ct, c)))
-                    r.set(&"schema_id", iv(sysSchemaId(&ct.schema)))
-                    r.set(&"parent_object_id", iv(ct.oid))
-                    r.set(&"create_date", sysTs())
-                    r.set(&"modify_date", sysTs())
-                    r.set(&"parent_column_id", iv(ids[i]))
-                    r.set(&"definition", tv(&sysDefText(c)))
-                    r.set(&"is_system_named", bv(true))
-                    append(mut &rows, r.row())
-                }
-            }
-        }
-        "identity_columns" {
-            for ct in snap.tabs {
-                if lexdb_base.isTempSchema(&ct.schema) { continue }
-                let ids = sysColIds(&ct.t)
-                for i in 0..len(ct.t.cols) {
-                    let c = &ct.t.cols[i]
-                    if ids[i] == 0 || !(c.identity == lexdb_sql.ID_ALWAYS || c.identity == lexdb_sql.ID_BY_DEFAULT || c.identity == lexdb_sql.ID_SERIAL) { continue }
-                    var sq = noSeq()
-                    for d in snap.seqs { if d.key == c.seq { sq = seqCopy(&d) } }
-                    let ty = lexdb_syscat.sqlTypeOf(&c.typ, &c.coll)
-                    var nn = c.notNull
-                    for p in ct.t.pk { if p == i { nn = true } }
-                    var r = sysTemplate(&"identity_columns")
-                    let cr = sysColumn(ct.oid, &lexdb_sql.colShown(c), ids[i], &ty, !nn, true, 0)
-                    let ccols = lexdb_syscat.cols(&"columns")
-                    for k in 0..len(ccols) { if k < len(cr) { r.set(&ccols[k].name, cr[k]) } }
-                    r.set(&"seed_value", iv(sq.start))
-                    r.set(&"increment_value", iv(sq.inc))
-                    r.set(&"last_value", Val.Null)
-                    append(mut &rows, r.row())
-                }
-            }
-        }
-        "sql_modules" {
-            for v in snap.views {
-                if lexdb_base.isTempSchema(&v.schema) { continue }
-                var r = sysTemplate(&"sql_modules")
-                r.set(&"object_id", iv(v.oid))
-                r.set(&"definition", tv(&("CREATE VIEW " + sysSchemaName(&v.schema) + "." + tabShown(&v) + " AS " + lexdb_sql.viewShown(&v.t.view))))
-                append(mut &rows, r.row())
-            }
-        }
-        "sequences" {
-            for d in snap.seqs {
-                if len(d.ownerT) > 0 { continue }
-                let sc = lexdb_sql.schemaOf(&d.key)
-                if lexdb_base.isTempSchema(&sc) { continue }
-                var r = sysTemplate(&"sequences")
-                r.set(&"name", tv(&lexdb_sql.baseName(&d.key)))
-                r.set(&"object_id", iv(seqOid(&d)))
-                r.set(&"schema_id", iv(sysSchemaId(&sc)))
-                r.set(&"create_date", sysTs())
-                r.set(&"modify_date", sysTs())
-                r.set(&"start_value", iv(d.start))
-                r.set(&"increment", iv(d.inc))
-                r.set(&"minimum_value", iv(d.min))
-                r.set(&"maximum_value", iv(d.max))
-                r.set(&"is_cycling", bv(d.cycle))
-                r.set(&"cache_size", iv(d.cache))
-                append(mut &rows, r.row())
-            }
-        }
-        else {}     // the rest have no rows: triggers, extended properties, xml and spatial indexes, ...
-    }
-    return Ok(rows)
-}
-
-
-// What SQL Server's catalog functions look up, in the bound catalog
-// (bindCatalog): O objects (id, schema, name, type, parent), K columns
-// (table, name, column_id, nullable, identity), I indexes (table, name,
-// index_id, clustered, unique).
-fn sysBind(snap: &CatSnap, b: mut &StrBuf) {
-    // Y table types (user_type_id, schema_id, name)
-    for t in snap.ttypes { b.add(&("Y\t" + tabTypeId(&t.key).toStr() + "\t" + sysSchemaId(&lexdb_sql.schemaOf(&t.key)).toStr() + "\t" + lexdb_pg.clean(&t.spell) + "\n")) }
-    for r in sysObjects(snap) {
-        // name 0, object_id 1, principal_id 2, schema_id 3, parent 4, type 5
-        b.add(&("O\t" + text(&r[1]) + "\t" + text(&r[3]) + "\t" + lexdb_pg.clean(&text(&r[0])) + "\t" + strings.trim(&text(&r[5])) + "\t" + text(&r[4]) + "\n"))
-    }
-    for ct in snap.tabs {
-        if lexdb_base.isTempSchema(&ct.schema) { continue }
-        let ids = sysColIds(&ct.t)
-        for i in 0..len(ct.t.cols) {
-            let c = &ct.t.cols[i]
-            if ids[i] == 0 { continue }
-            var nn = c.notNull
-            for p in ct.t.pk { if p == i { nn = true } }
-            let ident = c.identity == lexdb_sql.ID_ALWAYS || c.identity == lexdb_sql.ID_BY_DEFAULT || c.identity == lexdb_sql.ID_SERIAL
-            b.add(&("K\t" + ct.oid.toStr() + "\t" + lexdb_sql.colShown(c) + "\t" + ids[i].toStr() + "\t" + (if nn { "0" } else { "1" }) + "\t" +
-                  (if ident { "1" } else { "0" }) + "\n"))
-        }
-        for x in sysIdxs(&ct) {
-            if x.heap { continue }
-            b.add(&("I\t" + ct.oid.toStr() + "\t" + x.name + "\t" + x.id.toStr() + "\t" + (if x.clustered { "1" } else { "0" }) + "\t" +
-                  (if x.unique { "1" } else { "0" }) + "\n"))
-        }
-    }
-    for v in snap.views {
-        if lexdb_base.isTempSchema(&v.schema) { continue }
-        for i in 0..len(v.t.cols) { b.add(&("K\t" + v.oid.toStr() + "\t" + lexdb_sql.colShown(&v.t.cols[i]) + "\t" + (i + 1).toStr() + "\t1\t0\n")) }
-    }
 }
 
 fn sysInt(v: &Val): Option[int] {
@@ -31226,7 +30327,7 @@ fn sysCall(name: &str, vs: &[]Val, se: &SeqEnv): Result[Option[Val], DbErr] {
             }
             var owner = ""
             for l in catLines(se, &"R") {
-                if sysSid(&l[1]) == sid { return Ok(Some(Val.Text(l[1]))) }
+                if lexdb_catalog.sysSid(&l[1]) == sid { return Ok(Some(Val.Text(l[1]))) }
                 if l[2] == "1" && (len(owner) == 0 || l[1] < owner) { owner = l[1] }
             }
             // 0x01: the database's owner (dbo's login): lexdb's first superuser
@@ -31236,7 +30337,7 @@ fn sysCall(name: &str, vs: &[]Val, se: &SeqEnv): Result[Option[Val], DbErr] {
         }
         "#suser_sid" {
             let who = if n < 1 || isNull(&vs[0]) { catUser(se) } else { text(&vs[0]) }
-            for l in catLines(se, &"R") { if l[1] == who { return Ok(Some(Val.Bytes(sysSid(&who)))) } }
+            for l in catLines(se, &"R") { if l[1] == who { return Ok(Some(Val.Bytes(lexdb_catalog.sysSid(&who)))) } }
             return Ok(Some(Val.Null))
         }
         "#sid_binary" { return Ok(Some(Val.Null)) }
