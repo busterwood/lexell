@@ -50,7 +50,7 @@ const OP_PUT_HEAD = 5       // in the log only: a put with its head (TxWrite.hea
 // subtrees wholly inside are freed as a dropped tree's are (design/lexdb-bulkdelete.md).
 pub const OP_DELRANGE = 6
 
-pub fn segName(g: int): str { return "log." + g.toStr() }
+fn segName(g: int): str { return "log." + g.toStr() }
 
 pub type Options = value record {
     pub cacheBytes: int     // about the memory nodes take before clean ones are evicted (lexdb_page.nodeCost)
@@ -233,6 +233,38 @@ pub type Db = record {
 
 // A handle to an open store; copies reach the same store. A replica's
 // (openReplica) reads through its follower (fo), and takes no writes.
+// The test and diagnostic surface: knobs and checks that no serving path
+// calls. They stay in the store because they inspect its internals; this
+// record names them so Store's serving methods do not carry them.
+pub type TestHooks = value record {
+    pub audit: fn(lexdb_disk.Fs): Result[str, lexdb_base.DbErr]
+    pub cacheState: fn(Store): str
+    pub clearCountHook: fn(Store)
+    pub colCounts: fn(Store): []int
+    pub countHookCalls: fn(Store): int
+    pub cutCounts: fn(Store): []int
+    pub durWaiting: fn(Store): int
+    pub readsText: fn(&Txn): str
+    pub segName: fn(int): str
+    pub setColumns: fn(Store, bool)
+    pub setCountHook: fn(Store, fn(Store, int, str, int), int, &str)
+    pub setCutChunk: fn(Store, int)
+    pub setDropReads: fn(Store, int)
+    pub setFrameMax: fn(Store, int)
+    pub setUpgradeBudget: fn(Store, int)
+    pub setWriteLogMax: fn(int)
+    pub chunkKey: fn(&str, int): str
+    pub upgradeCounts: fn(Store): []int
+}
+
+pub fn testHooks(): TestHooks {
+    return TestHooks{audit: audit, cacheState: cacheState, clearCountHook: clearCountHook, colCounts: colCounts,
+                     countHookCalls: countHookCalls, cutCounts: cutCounts, durWaiting: durWaiting, readsText: readsText,
+                     segName: segName, setColumns: setColumns, setCountHook: setCountHook, setCutChunk: setCutChunk,
+                     setDropReads: setDropReads, setFrameMax: setFrameMax, setUpgradeBudget: setUpgradeBudget,
+                     setWriteLogMax: setWriteLogMax, chunkKey: chunkKey, upgradeCounts: upgradeCounts}
+}
+
 pub type Store = value record { sh: task.Shared[Db]; fo: Option[Follower]; pub memo: lexdb_memo.Memo; pub locks: lexdb_locks.Locks }
 
 // Which tree a transaction's reads see: the live tree, its snapshot, or a
@@ -278,7 +310,7 @@ const WLOG_RANGE = 1024
 var WLOG_MAX: int = 131072
 
 // For the tests: keeps fewer writes.
-pub fn setWriteLogMax(n: int) { WLOG_MAX = n }
+fn setWriteLogMax(n: int) { WLOG_MAX = n }
 
 // head: a large value's first bytes its writer wants kept in its leaf (9.31).
 pub type TxWrite = value record { pub op: int; pub tree: int; pub key: str; pub val: str; pub head: int }
@@ -392,7 +424,7 @@ fn hexTo(b: mut &StrBuf, s: &str) {
 }
 
 // The reads noted, as text (for the tests: tree, range, seq of each).
-pub fn (t: &Txn) readsText(): str {
+fn readsText(t: &Txn): str {
     var b = newStrBuf()
     for r in t.reads {
         b.add(&(r.tree.toStr()))
@@ -2046,7 +2078,7 @@ pub fn (st: &Store) whole(t: mut &Txn, tree: int, key: &str, v: &str): Result[st
     return st.unstore(t, tree, key, v)
 }
 
-pub fn chunkKey(key: &str, i: int): str {
+fn chunkKey(key: &str, i: int): str {
     var b = newStrBuf()
     binary.addU16BE(mut &b, len(key))
     b.add(key)
@@ -2392,7 +2424,7 @@ const COUNT_DEPTH = 64
 // For the tests: f(store, mode, arg, try) is called after a count has found
 // what to read and before it reads (try 0 the first), outside the store's
 // lock. A closure cannot be kept here, so mode and arg carry what it needs.
-pub fn (st: &Store) setCountHook(f: fn(Store, int, str, int), mode: int, arg: &str) {
+fn setCountHook(st: Store, f: fn(Store, int, str, int), mode: int, arg: &str) {
     st.sh.with(fn(db: mut &Db) {
         db.countHook = [f]
         db.countMode = mode
@@ -2400,10 +2432,10 @@ pub fn (st: &Store) setCountHook(f: fn(Store, int, str, int), mode: int, arg: &s
         db.countCalls = 0
     })
 }
-pub fn (st: &Store) clearCountHook() { st.sh.with(fn(db: mut &Db) { db.countHook = [] }) }
+fn clearCountHook(st: Store) { st.sh.with(fn(db: mut &Db) { db.countHook = [] }) }
 
 // How many times the hook was called since it was set.
-pub fn (st: &Store) countHookCalls(): int {
+fn countHookCalls(st: Store): int {
     var n = 0
     st.sh.with(fn(db: mut &Db) { n = db.countCalls })
     return n
@@ -2747,7 +2779,7 @@ pub fn (st: &Store) noteRange(t: mut &Txn, tree: int, lo: &str, hi: &str) {
 
 // The nodes in memory, as text (slot, whether referenced, whether dirty,
 // version): a test's check that a read leaves the cache as it was.
-pub fn (st: &Store) cacheState(): str {
+fn cacheState(st: Store): str {
     var b = newStrBuf()
     st.sh.with(fn(db: mut &Db) {
         for s in 0..len(db.meta) {
@@ -4716,11 +4748,11 @@ fn (db: &Db) colsOn(): bool { return !db.colsOff }
 
 // Whether this store's checkpoints write column leaves: off, every leaf
 // is written as rows (tests compare the two).
-pub fn (st: &Store) setColumns(on: bool) { st.sh.with(fn(db: mut &Db) { db.colsOff = !on }) }
+fn setColumns(st: Store, on: bool) { st.sh.with(fn(db: mut &Db) { db.colsOff = !on }) }
 
 // Checkpoints taken whole under one with, cuts taken again, and cuts
 // written (9.136).
-pub fn (st: &Store) cutCounts(): []int {
+fn cutCounts(st: Store): []int {
     var out: []int = []
     st.sh.with(fn(db: mut &Db) { out = [db.ckptLocked, db.cutRetries, db.cutEnds] })
     return out
@@ -4728,7 +4760,7 @@ pub fn (st: &Store) cutCounts(): []int {
 
 // Leaves checkpoints wrote as column leaves, and as rows (of trees with
 // layouts: their rows did not all encode), and cut to fit (refit): 9.112.
-pub fn (st: &Store) colCounts(): []int {
+fn colCounts(st: Store): []int {
     var out: []int = []
     st.sh.with(fn(db: mut &Db) { out = [db.colLeaves, db.rowLeaves, db.refitCuts] })
     return out
@@ -4756,7 +4788,7 @@ const UPG_QUEUE = 4096          // leaves queued at most
 const UPG_BUDGET = 256          // leaves a checkpoint converts at most (lexdb.md 9.114: its cost)
 
 // The leaves a checkpoint converts at most (tests set fewer).
-pub fn (st: &Store) setUpgradeBudget(n: int) { st.sh.with(fn(db: mut &Db) { db.upgBudget = n }) }
+fn setUpgradeBudget(st: Store, n: int) { st.sh.with(fn(db: mut &Db) { db.upgBudget = n }) }
 
 // Leaf s of tree, just read by a scan: queued when it is a clean row leaf
 // of a table tree (one with layouts).
@@ -4966,7 +4998,7 @@ pub fn (st: &Store) leafKinds(tree: int): Result[[]int, lexdb_base.DbErr] {
 
 // Leaves converted while clean (upgradeLeaf), and those left as rows; the
 // leaves queued now.
-pub fn (st: &Store) upgradeCounts(): []int {
+fn upgradeCounts(st: Store): []int {
     var out: []int = []
     st.sh.with(fn(db: mut &Db) { out = [db.upgLeaves, db.upgFailed, len(db.upgTree)] })
     return out
@@ -5925,7 +5957,7 @@ fn openIn(fs: lexdb_disk.Fs, logFs: lexdb_disk.Fs, split: bool, opts: Options): 
 // Checks the data file's last checkpoint (a test's check, with the store
 // closed): every page below its high-water mark is in one tree, one dropped
 // subtree, the free list or a list page, and in no more than one of them.
-pub fn audit(fs: lexdb_disk.Fs): Result[str, lexdb_base.DbErr] {
+fn audit(fs: lexdb_disk.Fs): Result[str, lexdb_base.DbErr] {
     let data = try fs.openBuffered(DATA, false)
     var best: Option[lexdb_page.Meta] = None
     var b = array(PAGE, byte(0))
@@ -6145,9 +6177,9 @@ pub type Stats = value record {
 }
 
 // The most pages of dropped subtrees one checkpoint reads (tests).
-pub fn (st: &Store) setFrameMax(n: int) { st.sh.with(fn(db: mut &Db) { db.frameMax = n }) }
-pub fn (st: &Store) setCutChunk(n: int) { st.sh.with(fn(db: mut &Db) { db.cutChunk = n }) }
-pub fn (st: &Store) setDropReads(n: int) { st.sh.with(fn(db: mut &Db) { db.dropReads = n }) }
+fn setFrameMax(st: Store, n: int) { st.sh.with(fn(db: mut &Db) { db.frameMax = n }) }
+fn setCutChunk(st: Store, n: int) { st.sh.with(fn(db: mut &Db) { db.cutChunk = n }) }
+fn setDropReads(st: Store, n: int) { st.sh.with(fn(db: mut &Db) { db.dropReads = n }) }
 
 // The memo: values the SQL layer keeps while the store is open, outside any
 // transaction (lost when it closes).
@@ -6215,7 +6247,7 @@ pub fn (st: &Store) durableCheckpoint(): int {
 }
 
 // The waitDurable calls waiting now (for the tests).
-pub fn (st: &Store) durWaiting(): int {
+fn durWaiting(st: Store): int {
     var n = 0
     st.sh.with(fn(db: mut &Db) { n = len(db.durWaits) })
     return n
