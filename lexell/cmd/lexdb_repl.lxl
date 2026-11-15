@@ -6,13 +6,18 @@
 //   master -> replica   C <ckpt>       held from this checkpoint on
 //   master -> replica   D <batch> <ckpt>   the log holds batches to <batch>;
 //                                      the last checkpoint is <ckpt>
+//   master -> replica   F <batch> <seg> <off> <len>, then <len> bytes:
+//                                      batch's frame, durable, as written at
+//                                      <off> of log segment <seg> (9.135)
 //   replica -> master   H <ckpt> <seg> keep checkpoints from <ckpt> on and
 //                                      log segments from <seg> on (Store.hold)
 //
-// The master sends D after each flush and each checkpoint, coalesced: a
-// replica that is behind gets the newest only. The replica reads the
-// batches from the log itself and the pages from the page file: nothing
-// else crosses. When the replica goes, the master lets go of its hold; when
+// After each flush the master pushes the durable batches' frames (F), from
+// the frames it keeps (Store.framesAfter); the replica applies them from
+// memory. When a replica is too far behind for those, or at the start, the
+// master sends D instead, and the replica reads the batches from the log
+// itself; D also tells it of a new checkpoint. Pages come from the page
+// file: nothing else crosses. When the replica goes, the master lets go of its hold; when
 // the master goes, the replica stops (a master that starts again may reuse
 // pages the replica reads). Any number of replicas: each has its hold, and
 // the master keeps what the oldest needs (9.73).
@@ -29,7 +34,31 @@ pub const SOCK = "repl.sock"
 // Lines from a connection's read side.
 type Lines = record { buf: []byte; at: int; end: int }
 
-fn newLines(): Lines { return Lines{buf: array(4096, byte(0)), at: 0, end: 0} }
+fn newLines(): Lines { return Lines{buf: array(65536, byte(0)), at: 0, end: 0} }
+
+// The next n bytes of the stream (a pushed frame), after a line.
+fn (l: mut &Lines) take(r: &net.ReadHalf, n: int): Result[[]byte, lexdb_base.DbErr] {
+    var out: []byte = withCapacity(n)
+    while len(out) < n && l.at < l.end {
+        append(mut &out, l.buf[l.at])
+        l.at += 1
+    }
+    while len(out) < n {
+        let want = min(n - len(out), len(l.buf))
+        match r.read(mut &l.buf[0..want]) {
+            Ok(k) {
+                if k == 0 { return Err(lexdb_base.ioErr("replication: the master closed the link in a frame", 104)) }
+                for i in 0..k { append(mut &out, l.buf[i]) }
+            }
+            Err(e) { return Err(lexdb_base.ioErr("replication: read", 5)) }
+        }
+    }
+    if l.at == l.end {
+        l.at = 0
+        l.end = 0
+    }
+    return Ok(out)
+}
 
 // The next line (without its newline), or None at the end of the stream.
 fn (l: mut &Lines) next(r: &net.ReadHalf): Result[Option[str], lexdb_base.DbErr] {
@@ -167,16 +196,33 @@ fn serveOne(p: Peer): int {
 
 type Changes = record { st: lexdb_store.Store; w: net.WriteHalf }
 
-// D lines: the durable batch and checkpoint, after each change.
+// After each change: the durable batches' frames (F, one write for all of
+// them), or a D line when they are not kept (at the start, or a replica
+// that fell behind) and when the checkpoint has moved.
 fn sendChanges(x: Changes): int {
     var lastB = -1
     var lastC = -1
     while true {
         let b = x.st.durableBatch()
         let c = x.st.durableCheckpoint()
+        if lastB >= 0 && b > lastB {
+            var fs: []lexdb_store.PushFrame = []
+            if x.st.framesAfter(lastB, b, mut &fs) {
+                var out: []byte = []
+                var top = lastB
+                for f in fs {
+                    let h = "F " + f.batch.toStr() + " " + f.seg.toStr() + " " + f.off.toStr() + " " + len(f.data).toStr() + "\n"
+                    for i in 0..len(h) { append(mut &out, strByte(h, i)) }
+                    for v in f.data { append(mut &out, v) }
+                    top = f.batch
+                }
+                if x.w.write(&out).isErr() { return 1 }
+                lastB = top
+            }
+        }
         if b != lastB || c != lastC {
             if x.w.writeStr(&("D " + b.toStr() + " " + c.toStr() + "\n")).isErr() { return 1 }
-            lastB = b
+            if b > lastB { lastB = b }
             lastC = c
         }
         if !x.st.waitChange() { return 0 }
@@ -276,15 +322,30 @@ pub fn follow(x: Follow): int {
             }
             match got.unwrap() {
                 Some(l) {
-                    // the newest of the lines already here: a replica behind
-                    // applies up to it at once
-                    var cur = l
-                    while true {
-                        match lines.ready() {
-                            Some(m) { cur = m }
-                            None { break }
+                    if strings.startsWith(&l, "F ") {
+                        // a pushed frame: applied from memory (9.135)
+                        let v = ints(&l)
+                        if len(v) != 4 {
+                            code = 1
+                            break
                         }
+                        let data = lines.take(&r, v[3])
+                        if data.isErr() {
+                            code = 1
+                            break
+                        }
+                        match fo.pushed(v[0], v[1], v[2], &data.unwrap()) {
+                            Ok(_) {}
+                            Err(e) {
+                                eprintln("lexdb: replica: " + e.toStr())
+                                code = 1
+                                break
+                            }
+                        }
+                        if len(waiting) > 0 && fo.ready() { pop(mut &waiting).complete(Unit{}) }
+                        continue
                     }
+                    let cur = l
                     if !strings.startsWith(&cur, "D ") { continue }
                     let v = ints(&cur)
                     if len(v) != 2 { continue }

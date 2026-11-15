@@ -12287,3 +12287,69 @@ data, pgbench on the replicas' socket (`replicas.txt`):
   against 3.7. The replica reads through the follower's snapshot, which
   does not take the batches' column-leaf scans. For reports on replicas
   this is the gap to close.
+
+### 9.135 Replicas: the log pushed, the delta in epochs (sub-millisecond lag)
+
+The user's acceptance test for read replicas (2026-11-15): commits visible
+on the replicas within 1 ms at p99, at about 17,000 updates/s on the master
+and 300,000 selects/s on 3 replicas; replicas show only commits the master
+has made durable. Same machine for now, the data directory shared.
+
+**Measured before** (`~/Work/lexdb-bench/lag/probe.py`: a counter updated
+on the master every 50 ms, read back on six replica connections; 9.134's
+data, pgbench updates on the master (8 clients) and selects on the
+replicas (24)): visible after p50 4.6 ms, p99 355 ms, max 1.08 s; idle
+0.7 ms. A trace of the follower's steps over 5 ms (2,333 of them in 20 s):
+- 97% reading the log back: each batch's frame read from its segment
+  (`O_DIRECT`, a header page then the frame, and an `fstat`), 221 µs a
+  batch, one batch after another. A replica applied at most about 4,500
+  batches a second, and fell behind without bound when the master made
+  more.
+- taking up a checkpoint: `prune` rebuilt the whole delta, 9 to 14 ms for
+  32,500 keys of which 120 to 155 were kept; evicting the freed pages
+  0.6 ms; the meta page and its lists 0.4 ms.
+- applying a write: about 0.5 µs.
+
+**Now:**
+- **The log is pushed.** The writer keeps each durable frame (`keepFrame`,
+  up to 16 MB, `PUSH_KEEP`), as written. After each flush a replica's
+  sender sends the frames it has not had (`F batch seg off len` and the
+  bytes, one write for all of them), and the replica applies them from
+  memory (`Follower.pushed`, `decodeFrame`), moving its log position on, so
+  the log's files are read only to catch up: at the start, and when the
+  frames it needs are no longer kept (a `D` line, as before, which also
+  names a new checkpoint).
+- **The delta is in epochs** (`Epoch`): one begins each time a base is
+  adopted, writes go to the newest, and a key's version is its newest at or
+  before the snapshot's batch in any epoch, newest epoch first. Releasing
+  a base drops whole the epochs every kept base holds; the one straddling
+  the floor keeps its older versions, which are what the base has or older
+  than a later version, so they never show. A range delete marks the keys
+  of every epoch (`keysIn`, `lastGone`).
+
+**Measured now** (`probe2.py`: a thread per replica connection reads
+without pause, so a delay is timed from the master's commit
+acknowledgement to within one read; commits every 20 ms; three runs):
+
+| ack to visible on a replica | p50 | p90 | p99 | p99.9 | max |
+|---|---:|---:|---:|---:|---:|
+| idle | 0.10 ms | 0.16 | 0.24 | 1.17 | 1.20 |
+| mixed load (16,700 updates/s, 220,000 selects/s) | 0.26-0.32 ms | 0.37-0.44 | **0.54-1.10** | 3.5-72 | 4.3-72 |
+
+(The first probe, reading the six connections in turn, gave p50 0.43 and
+p99 1.09 with epochs, and p99 6.1 with the push alone: its own reads took
+about 0.4 ms a round.)
+
+**What is left: the master's checkpoint.** The slow commits are seen late
+by all three replicas at once, about every 2 s. A trace of the master's
+checkpoint: its encode runs in one critical section (`st.sh.with`, which
+cannot yield), 65 to 70 ms for 2,168 pages (about 30 µs a column leaf,
+lexdb-columns-study.md section 3), every 2 s at this rate. Nothing else
+runs on the master meanwhile: not its commits (a 66 ms stall in their
+latency too), nor the senders. Making that encode incremental is the next
+step for both.
+
+**Tests:** the suite (170, among them `follow_basic` twice, `follow_covers`
+and `exec_replica`); `replica.py` (20 rounds: replicas killed and started
+again 6 times, the master once, the supervised master with 2 replicas);
+the crash test (10 rounds).
