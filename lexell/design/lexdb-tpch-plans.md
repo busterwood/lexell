@@ -267,7 +267,7 @@ first, then decide what `par.map` should do for query execution.
 
 ## 6. Fixed since this comparison
 
-Two changes on `bench/tpch` are measured on the same SF1 data and query
+Three changes on `bench/tpch` are measured on the same SF1 data and query
 text. The A/B figures are warm medians of three timed runs of the pre-fix
 and post-fix binaries. They supersede the deltas in section 2: that run was
 the first after the load, so its first queries read cold tables (q2's 1.09x
@@ -291,6 +291,19 @@ and q3's 8.30x against PostgreSQL are mostly that, not code).
   join: **timeout (>120 s) -> 8.96 s**, the PostgreSQL checksum. It is
   still 260x PostgreSQL's 34 ms because the branch predicates are not a
   BitmapOr; the cross product is gone.
+- **Correlated EXISTS and NOT EXISTS are semi/anti joins.** A subquery
+  whose outer values are only equality keys is run once and hashed; a
+  non-key filter (q21's `l_suppkey <> outer`) stays on the semi-join
+  level and is checked per candidate; NOT EXISTS is an anti join. A
+  semi-join key of one integer gets its own value map, not the string
+  key's. The hash/per-row choice follows PostgreSQL's join cost: the
+  inner side is read once and hashed, or the outer rows look it up, with
+  the per-row run's measured setup charged by the path's shape (a
+  primary-key range's run is about 140 us; a secondary index's lookup
+  about 26 us). q21 completes: **timeout (>120 s) -> 23.2 s**, the
+  PostgreSQL checksum. q4 8.49 -> 6.61 s. q22 stays at 1.26 s (1.16
+  before): its NOT EXISTS is a per-row index lookup, cheaper than
+  hashing 1.5M orders.
 - The plan choice is in `choosePath`, the fallback in `indexOrScan`;
   `exec_scanchoice.lxl` covers the broad, selective, index-only and
   primary-key cases, and `exec_switch.lxl` the counted fallback. The
@@ -298,19 +311,22 @@ and q3's 8.30x against PostgreSQL are mostly that, not code).
   `exec_seqcrash` time out only under the full parallel load and pass
   alone.
 
-A warm full run (one run, `out/lexdb.tsv`) has q19 8.96 s, q1 17.2 s, q7
-12.8 s, q4 7.95 s, q12 7.13 s and q13 6.16 s; q21 still times out at
-120 s. The 18 queries timed in both runs are 0.99x their baseline
+A warm full run (one run, `out/lexdb.tsv`) completes all 22 queries: q21
+23.9 s, q19 8.98 s, q1 16.2 s, q7 12.4 s, q4 6.41 s, q13 6.57 s, q12
+7.09 s. The 18 queries timed in both runs are 0.99x their baseline
 geomean (unchanged); the nine the scan choice touches are 0.97x in the
-warm A/B, 0.96x without q3 and q7.
+warm A/B, 0.96x without q3 and q7. q4 is 37x PostgreSQL and q21 35x:
+both now plan a hash semi/anti join, but the hash builds read lineitem
+twice and materialize 6M and 3.79M rows.
 
-Still open: q4/q21/q22's per-row EXISTS needs a semi/anti-join executor,
-not just a cost change (q4 is 57,218 subplan runs at about 140 us each;
-q22's 150k runs at about 7 us). q18's grouped IN is a lookup per value.
-q1 is execution-bound, not planner-bound: `count(*)` is 0.50 s, four simple
-sums 2.48 s, and the complex expressions with `avg` 8.23 s, so the 16.8 s
-is decimal aggregate evaluation. None of those are addressed by the plan
-changes here.
+Still open: q4/q21's semi-joins would be cheaper as a right semi/anti
+join, hashing the smaller side and scanning the larger once, as
+PostgreSQL's JOIN_RIGHT_SEMI/JOIN_RIGHT_ANTI paths do; the hash build
+itself (millions of `[]Val` rows) is the other half. q18's grouped IN is a
+lookup per value. q1 is execution-bound, not planner-bound: `count(*)` is
+0.50 s, four simple sums 2.48 s, and the complex expressions with `avg`
+8.23 s, so the 16.8 s is decimal aggregate evaluation. None of those are
+addressed by the plan changes here.
 
 ## 7. Caveats
 
@@ -324,6 +340,6 @@ changes here.
 - The secondary index set is the same on both engines and is stated in
   `bench/tpch/indexes.sql`. q17's advantage and q20's remaining cost both
   depend on it.
-- q19 now completes; q21 is still a timeout, and its ratio would not be a
-  measurement.
+- q19 and q21 now complete; their ratios (261x and 35x) are real but
+  dominated by executor work the planner does not model.
 - The three different checksums are decimal scale, not wrong values.
