@@ -56,6 +56,10 @@ point 7 (continuous cleanup), and planner option B.
   `choosePath`, `pathFig`, `costOrder` and EXPLAIN are still in exec.
 - **Dialect boundary (1): naming and the snapshot moved.** The seven
   exec→dialect imports remain.
+- **Session memo moved out of Store.** `lexdb_memo.Memo` owns the map and
+  its lock; `Store` carries a handle (`Store.memo`) and never reads a key.
+  The three `memo*` methods left the Store interface (Store 118 → 115
+  public functions).
 
 ## Remaining: 1. closing the dialect imports
 

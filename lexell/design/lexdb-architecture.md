@@ -109,6 +109,7 @@ the deep modules.
 | Module | Secret it hides | Interface | Leak today |
 |---|---|---|---|
 | **`lexdb_store`** | How bytes become durable and visible: COW B+tree, slots, versions, snapshots, cache, log, checkpoint cut, free space, follower push/epochs | `open/begin/commit/abort`, `cursor/lookup/lookupMany/count`, `checkpoint/follow` | `viewOf` selects live/snapshot/replica once per read; the scan/lookup families and test/replication hooks still widen the interface |
+| **`lexdb_memo`** | The SQL layer's scratch values kept while the store is open, outside transactions | `Memo.get/put/del` | one small lock; the store carries the handle and never reads a key |
 | **`lexdb_rows`** (new) | How a row is represented: fixed/tagged/column, layouts, overflow, conversion, projection | `Rows` (exec's `rowsFor`), `encodeRow`, `decodeRow`, `encodeLeaf`, `decodeLeaf`, `convert`, one `Projection` | leaf, fixed, tagged/long, column body, batch decoders, `Spec` and `LeafView` moved; the lazy two-step orchestration stays in exec over `LeafView`; universal column leaf and old-format deletion remain |
 | **`lexdb_catalog`** | Metadata, the catalog tree's encoding, dependency checks, temp objects | catalog codec and readers, `CatSnap`, `Naming`; `lookup/define/alter/drop` still to come | codec, readers and the snapshot moved; DDL behavior and name resolution still in exec |
 | **`lexdb_sql`** | The language model: values, types, expressions, columns and statements, and their text | `Val`, `Expr`, `TypeName`, `ColDef`, `Stmt`, naming helpers | no tokenizer, no parser, no dialect import |
@@ -137,9 +138,9 @@ main
        └── lexdb_dialect  (parser-facing facts) → pgdata/sysdata/oradata
 
 lexdb_exec → lexdb_plan, lexdb_catalog, lexdb_store, lexdb_rows,
-             lexdb_sql, lexdb_parse
+             lexdb_sql, lexdb_parse, lexdb_memo
 lexdb_plan → lexdb_catalog, lexdb_sql
-lexdb_catalog → lexdb_store, lexdb_rows, lexdb_sql
+lexdb_catalog → lexdb_store, lexdb_rows, lexdb_sql, lexdb_memo
 lexdb_store → lexdb_page → lexdb_rows → lexdb_cols → lexdb_sql
 ```
 

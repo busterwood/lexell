@@ -2861,9 +2861,9 @@ a transaction that rolls back is not given again, and two sessions taking
 values never conflict. Kept as an ordinary row, every two concurrent
 inserts would conflict under serializable validation.
 
-They are handed out from the store's memo (`Store.memoGet` and
-`memoPut`: a map kept while the store is open, outside any transaction) a
-block at a time. Before a block's first value is given, its last is
+They are handed out from the session memo (`lexdb_memo`, reached as
+`Store.memo`: a map kept while the store is open, outside any transaction)
+a block at a time. Before a block's first value is given, its last is
 written (`seqWrite`) to the sequences' tree, in a transaction of its own.
 The tree is made by `bootstrap`, its id under the catalog key "\x02seqs".
 It is not the catalog, whose writes make the wire describe statements
@@ -12507,3 +12507,9 @@ unused and are gone. Store exports 141 → 134, lines per export 55.9 →
 59.0. The 35-query A/B is 1.013 CPU geometric mean (median 1.011), inside
 the 5% gate. The scan family is still five methods; one reader over a
 `Sink` is the next cut.
+
+**Session memo out of the store** (2026-11-15). The SQL layer's scratch map
+(session user and settings, a sequence's block, the catalog binding) moved
+to `lexdb_memo.Memo`, with its own lock; `Store` carries the handle and
+never reads a key. Store's public functions went 118 → 115. The 35-query
+A/B is 1.017 CPU geometric mean (median 1.01), inside the gate.

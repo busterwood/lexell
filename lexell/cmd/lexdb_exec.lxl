@@ -4031,7 +4031,7 @@ fn noteChg(st: &lexdb_store.Store, txn: &lexdb_store.Txn, t: &Table, kind: int) 
 // A table's counts (acKey): its rows changed since its last analysis;
 // inserted, updated, deleted since the store opened; inserted less deleted
 // since its last analysis; when a commit last changed it (monotonic ns).
-fn acCounts(st: &lexdb_store.Store, tree: int): []int { return intsOf(&st.memoGet(&acKey(tree)).unwrapOr(""), 6) }
+fn acCounts(st: &lexdb_store.Store, tree: int): []int { return intsOf(&st.memo.get(&acKey(tree)).unwrapOr(""), 6) }
 
 // The rows counted so far into their session's pending counts:
 // "tree ins upd del" per table, ";" between.
@@ -4041,7 +4041,7 @@ fn chgFlush(st: &lexdb_store.Store) {
     let add: []int = [CHG_TREE, CHG_I, CHG_U, CHG_D]
     var parts: []str = []
     var found = false
-    match st.memoGet(&k) {
+    match st.memo.get(&k) {
         Some(v) {
             for p in strings.split(&v, ";") {
                 var xs = intsOf(&p.toStr(), 4)
@@ -4055,7 +4055,7 @@ fn chgFlush(st: &lexdb_store.Store) {
         None {}
     }
     if !found { append(mut &parts, intsText(&add)) }
-    st.memoPut(&k, &strings.join(&parts, ";"))
+    st.memo.put(&k, &strings.join(&parts, ";"))
     CHG_SESS = -1
     CHG_TREE = -1
     CHG_I = 0
@@ -4069,21 +4069,21 @@ fn chgEnd(st: &lexdb_store.Store, sess: int, keep: bool) {
     if AUTO_STATE == 2 { return }
     if CHG_SESS == sess { chgFlush(st) }
     let k = acPendKey(sess)
-    let got = st.memoGet(&k)
+    let got = st.memo.get(&k)
     if got.isNone() { return }
-    st.memoDel(&k)
+    st.memo.del(&k)
     if !keep { return }
     for p in strings.split(&got.unwrap(), ";") {
         let xs = intsOf(&p.toStr(), 4)
         // the table's: changed since its last analysis, then inserted, updated, deleted
-        var c = intsOf(&st.memoGet(&acKey(xs[0])).unwrapOr(""), 6)
+        var c = intsOf(&st.memo.get(&acKey(xs[0])).unwrapOr(""), 6)
         c[0] += xs[1] + xs[2] + xs[3]
         for i in 1..4 { c[i] += xs[i] }
         c[4] += xs[1] - xs[3]
         c[5] = time.monotonicNs()
-        st.memoPut(&acKey(xs[0]), &intsText(&c))
+        st.memo.put(&acKey(xs[0]), &intsText(&c))
     }
-    st.memoPut(&AC_DUE, &"1")
+    st.memo.put(&AC_DUE, &"1")
 }
 
 // A table's analysis state: the rows at its last analysis (-1 not known),
@@ -4094,7 +4094,7 @@ fn chgEnd(st: &lexdb_store.Store, sess: int, keep: bool) {
 type AcState = record { base: int; last: int; lastAuto: int; n: int; nAuto: int; ns: int; nsAuto: int; cool: int; since: int }
 
 fn acState(st: &lexdb_store.Store, tree: int): AcState {
-    match st.memoGet(&acStateKey(tree)) {
+    match st.memo.get(&acStateKey(tree)) {
         Some(v) {
             let xs = intsOf(&v, 9)
             return AcState{base: xs[0], last: xs[1], lastAuto: xs[2], n: xs[3], nAuto: xs[4], ns: xs[5], nsAuto: xs[6], cool: xs[7], since: xs[8]}
@@ -4104,17 +4104,17 @@ fn acState(st: &lexdb_store.Store, tree: int): AcState {
 }
 
 fn acPut(st: &lexdb_store.Store, tree: int, a: &AcState) {
-    st.memoPut(&acStateKey(tree), &intsText(&[a.base, a.last, a.lastAuto, a.n, a.nAuto, a.ns, a.nsAuto, a.cool, a.since]))
+    st.memo.put(&acStateKey(tree), &intsText(&[a.base, a.last, a.lastAuto, a.n, a.nAuto, a.ns, a.nsAuto, a.cool, a.since]))
 }
 
 // Table t analyzed (auto: by the task), its rows counted; c0 its counts
 // when the analysis began (acKey's: changes since then stay counted); ns
 // its time.
 fn acDone(st: &lexdb_store.Store, t: &Table, rows: int, c0: &[]int, auto: bool, ns: int) {
-    var c = intsOf(&st.memoGet(&acKey(t.tree)).unwrapOr(""), 6)
+    var c = intsOf(&st.memo.get(&acKey(t.tree)).unwrapOr(""), 6)
     c[0] = max(0, c[0] - c0[0])
     c[4] = c[4] - c0[4]
-    st.memoPut(&acKey(t.tree), &intsText(&c))
+    st.memo.put(&acKey(t.tree), &intsText(&c))
     var a = acState(st, t.tree)
     a.base = rows
     a.since = 0
@@ -4152,10 +4152,10 @@ fn statRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table): Resul
 // later look. Nothing on a replica.
 pub fn autoAnalyzeStep(st: &lexdb_store.Store): Result[int, DbErr] {
     if st.isReplica() || !autoAnalyzeOn() { return Ok(0) }
-    st.memoDel(&AC_DUE)
+    st.memo.del(&AC_DUE)
     let r = autoLook(st)
     // (an error before a table's own: looked at again at the next look)
-    if r.isErr() { st.memoPut(&AC_DUE, &"1") }
+    if r.isErr() { st.memo.put(&AC_DUE, &"1") }
     return r
 }
 
@@ -4196,8 +4196,8 @@ fn autoLook(st: &lexdb_store.Store): Result[int, DbErr] {
             acPut(st, t.tree, &a)
         }
         if now < a.cool || (now - c0[5] < AUTO_QUIET_NS && now - a.since < AUTO_WAIT_NS) {
-            st.memoPut(&AC_DUE, &"1")
-            st.memoPut(&AC_SOON, &"1")
+            st.memo.put(&AC_DUE, &"1")
+            st.memo.put(&AC_SOON, &"1")
             continue
         }
         let t0 = time.monotonicNs()
@@ -4216,7 +4216,7 @@ fn autoLook(st: &lexdb_store.Store): Result[int, DbErr] {
             }
             Err(x) {
                 // tried again at a later look; a cancelled task ends
-                st.memoPut(&AC_DUE, &"1")
+                st.memo.put(&AC_DUE, &"1")
                 if x.state == "57014" { return Err(x) }
             }
         }
@@ -4285,10 +4285,10 @@ pub fn autoAnalyzer(st: lexdb_store.Store): int {
     if st.isReplica() || !autoAnalyzeOn() { return 0 }
     while true {
         // (sooner while a table waits for its writes to pause)
-        let soon = st.memoGet(&AC_SOON).isSome()
-        st.memoDel(&AC_SOON)
+        let soon = st.memo.get(&AC_SOON).isSome()
+        st.memo.del(&AC_SOON)
         if task.sleep(if soon { AUTO_SOON_MS } else { AUTO_NAP_MS }).isErr() { return 0 }
-        if st.memoGet(&AC_DUE).isNone() { continue }
+        if st.memo.get(&AC_DUE).isNone() { continue }
         match autoAnalyzeStep(&st) {
             Ok(_) {}
             Err(x) { if x.state == "57014" { return 0 } }
@@ -4414,7 +4414,7 @@ fn useTmp(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): str {
     let n = tmpName(txn.sess)
     txn.path = withTmp(&txn.path, &n)
     txn.tmp = n
-    st.memoPut(&tmpMemo(txn.sess), &n)
+    st.memo.put(&tmpMemo(txn.sess), &n)
     return n
 }
 
@@ -4428,7 +4428,7 @@ fn tmpBump(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn) {
 
 fn tmpChanged(st: &lexdb_store.Store, sess: int) {
     let k = tmpVerKey(sess)
-    st.memoPut(&k, &(num(&st.memoGet(&k).unwrapOr("0")) + 1).toStr())
+    st.memo.put(&k, &(num(&st.memo.get(&k).unwrapOr("0")) + 1).toStr())
 }
 
 // The catalog's version bumped for DDL on relation key k: a temporary
@@ -8551,28 +8551,28 @@ fn collKey(sess: int): str { return "\x00coll\x00" + sess.toStr() }
 
 // A session's default collation (L2): "" exact, PostgreSQL's; a TDS
 // session's SQL Server's (lexdb_tds sets it).
-fn sessColl(st: &lexdb_store.Store, sess: int): str { return st.memoGet(&collKey(sess)).unwrapOr("") }
+fn sessColl(st: &lexdb_store.Store, sess: int): str { return st.memo.get(&collKey(sess)).unwrapOr("") }
 
 fn identKey(sess: int): str { return "\x00idins\x00" + sess.toStr() }
 
 // The table SET IDENTITY_INSERT is ON for in a session (its name, folded),
 // "" none.
-fn identityInsertOf(st: &lexdb_store.Store, sess: int): str { return st.memoGet(&identKey(sess)).unwrapOr("") }
+fn identityInsertOf(st: &lexdb_store.Store, sess: int): str { return st.memo.get(&identKey(sess)).unwrapOr("") }
 
 pub fn (s: &Session) setIdentityInsert(table: &str) {
-    if len(table) == 0 { s.st.memoDel(&identKey(s.id)) } else { s.st.memoPut(&identKey(s.id), table) }
+    if len(table) == 0 { s.st.memo.del(&identKey(s.id)) } else { s.st.memo.put(&identKey(s.id), table) }
 }
 
 // The session's last identity (or sequence) value: @@IDENTITY.
 pub fn (s: &Session) lastIdentity(): Option[int] {
-    match s.st.memoGet(&lastKey(s.id)) {
+    match s.st.memo.get(&lastKey(s.id)) {
         Some(v) { return Some(num(&v)) }
         None { return None }
     }
 }
 
 pub fn (s: &Session) setCollation(name: &str) {
-    if len(name) == 0 { s.st.memoDel(&collKey(s.id)) } else { s.st.memoPut(&collKey(s.id), name) }
+    if len(name) == 0 { s.st.memo.del(&collKey(s.id)) } else { s.st.memo.put(&collKey(s.id), name) }
 }
 
 // A numeric expression's precision and scale as SQL Server types it (an
@@ -12977,7 +12977,7 @@ fn stmtReads(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.St
 
 // The value a sequence's nextval would give now (not taking it).
 fn seqPeek(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, d: &Seq): Result[int, DbErr] {
-    match st.memoGet(&memoNext(d)) {
+    match st.memo.get(&memoNext(d)) {
         Some(nv) { return Ok(if nv == "e" { if d.inc > 0 { d.max } else { d.min } } else { num(&nv) }) }
         None {}
     }
@@ -15021,16 +15021,16 @@ fn select(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     var ver = try catVersion(st, txn)
     if len(txn.path) > 0 { ver = ver + "|" + strings.join(&txn.path, ",") }      // its names resolved by the path
     // the session's temporary objects (9.96): their DDL bumps this, not the catalog's version
-    if len(txn.tmp) > 0 { ver = ver + "|t" + st.memoGet(&tmpVerKey(txn.sess)).unwrapOr("0") }
+    if len(txn.tmp) > 0 { ver = ver + "|t" + st.memo.get(&tmpVerKey(txn.sess)).unwrapOr("0") }
     // the time zone (9.95): nothing planned depends on it now (a value is
     // read in it when the plan runs), but a plan is not kept across it
     if !txn.zone.isUtc() { ver = ver + "|z" + txn.zone.name }
     // its privileges checked as the role: SET ROLE plans it again (9.83)
-    match st.memoGet(&roleKeyOf(txn.sess)) {
+    match st.memo.get(&roleKeyOf(txn.sess)) {
         Some(r) { if len(r) > 0 { ver = ver + "|r" + r } }
         None {}
     }
-    match st.memoGet(&sessAuthKey(txn.sess)) {
+    match st.memo.get(&sessAuthKey(txn.sess)) {
         Some(r) { if len(r) > 0 { ver = ver + "|s" + r } }
         None {}
     }
@@ -18005,7 +18005,7 @@ pub fn (s: &Session) paramTypes(stmt: &lexdb_sql.Stmt, given: &[]int): []int {
 // (9.96).
 pub fn (s: &Session) pathVersion(): int {
     if len(s.tmp) == 0 { return s.pathAt }
-    return s.pathAt + num(&s.st.memoGet(&tmpVerKey(s.id)).unwrapOr("0"))
+    return s.pathAt + num(&s.st.memo.get(&tmpVerKey(s.id)).unwrapOr("0"))
 }
 
 // The path its statements' transactions carry: its temporary schema
@@ -18126,8 +18126,8 @@ fn (s: &Session) publishSettings() {
         b.add(&(c[z + 1..len(c)].toStr()))
         b.addByte('\n')
     }
-    s.st.memoPut(&settingsKey(s.id), &b.toStr())
-    s.st.memoPut(&setCfgKey(s.id), &"")
+    s.st.memo.put(&settingsKey(s.id), &b.toStr())
+    s.st.memo.put(&setCfgKey(s.id), &"")
 }
 
 // A setting given a value as text, as SET would: lexdb's own (SETTINGS), a
@@ -18211,8 +18211,8 @@ fn (s: mut &Session) applySetting(name: &str, value: &str, local: bool): Result[
 
 // After a statement that called set_config: its changes made.
 fn (s: mut &Session) takeSetConfigs(): Result[Unit, DbErr] {
-    let pending = s.st.memoGet(&setCfgKey(s.id)).unwrapOr("")
-    s.st.memoPut(&setCfgKey(s.id), &"")
+    let pending = s.st.memo.get(&setCfgKey(s.id)).unwrapOr("")
+    s.st.memo.put(&setCfgKey(s.id), &"")
     for l in strings.split(&pending, "\n") {
         if len(l) == 0 { continue }
         let f = strings.split(&l, "\t")
@@ -18255,8 +18255,8 @@ pub fn parkedSession(st: lexdb_store.Store): Session {
 }
 
 pub fn newSession(st: lexdb_store.Store): Session {
-    let id = num(&st.memoGet(&"sessions").unwrapOr("0")) + 1
-    st.memoPut(&"sessions", &id.toStr())
+    let id = num(&st.memo.get(&"sessions").unwrapOr("0")) + 1
+    st.memo.put(&"sessions", &id.toStr())
     return Session{st: st, txn: [], failed: false, maxRecursion: MAX_RECURSION, maxSteps: MAX_MATCH_STEPS, timeoutMs: 0, maxMem: MAX_STATEMENT_MEM,
                    saved: [], readOnly: false, path: [], pathAt: 0, savedPath: [], id: id, batch: true, rules: false, auto: true, rdel: true, saves: [], savedRoles: [],
                    custom: [], savedCustom: [], localUndo: [], zone: lexdb_time.utc(), savedZone: [], tmp: "", onCommit: [], fresh: false}
@@ -18273,8 +18273,8 @@ fn (s: mut &Session) restore() {
     if len(s.savedRoles) > 0 {
         let r = pop(mut &s.savedRoles)
         let nl = strings.indexOf(&r, "\n", 0)
-        s.st.memoPut(&roleKeyOf(s.id), &r[0..nl])
-        s.st.memoPut(&sessAuthKey(s.id), &r[nl + 1..len(r)])
+        s.st.memo.put(&roleKeyOf(s.id), &r[0..nl])
+        s.st.memo.put(&sessAuthKey(s.id), &r[nl + 1..len(r)])
     }
     if len(s.saved) == 0 { return }
     let l = pop(mut &s.saved)
@@ -18348,9 +18348,9 @@ pub fn (s: mut &Session) close() {
     // its temporary objects (9.96); should this fail, the next start drops them
     if len(s.tmp) > 0 { let r = s.dropTemps() }
     advRelease(&s.st, s.id, true)
-    s.st.memoDel(&collKey(s.id))
-    s.st.memoDel(&identKey(s.id))
-    s.st.memoDel(&noticeKey(s.id))
+    s.st.memo.del(&collKey(s.id))
+    s.st.memo.del(&identKey(s.id))
+    s.st.memo.del(&noticeKey(s.id))
 }
 
 // ---- notices (9.117): what a statement tells the client besides its
@@ -18367,17 +18367,17 @@ fn noticeKey(sess: int): str { return "nt:" + sess.toStr() }
 // msg, and a DETAIL ("" none).
 fn notice(st: &lexdb_store.Store, txn: &lexdb_store.Txn, state: &str, msg: &str, detail: &str) {
     let k = noticeKey(txn.sess)
-    let was = st.memoGet(&k).unwrapOr("")
-    st.memoPut(&k, &(was + state + "\x01" + msg + "\x01" + detail + "\x00"))
+    let was = st.memo.get(&k).unwrapOr("")
+    st.memo.put(&k, &(was + state + "\x01" + msg + "\x01" + detail + "\x00"))
 }
 
 // The session's notices, oldest first, taken: each a DbErr (its state,
 // message and detail).
 pub fn (s: &Session) takeNotices(): []DbErr {
     var out: []DbErr = []
-    match s.st.memoGet(&noticeKey(s.id)) {
+    match s.st.memo.get(&noticeKey(s.id)) {
         Some(v) {
-            s.st.memoDel(&noticeKey(s.id))
+            s.st.memo.del(&noticeKey(s.id))
             for one in strings.split(&v, "\x00") {
                 let f = strings.split(&one, "\x01")
                 if len(f) == 3 { append(mut &out, lexdb_base.errDetail(&(f[0].toStr()), &(f[1].toStr()), &(f[2].toStr()), "")) }
@@ -18749,7 +18749,7 @@ fn (s: mut &Session) runIn(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int
     if !marked { return s.runStmt(stmt, params, ptypes, pc, input, out, pull, sink) }
     s.publishSettings()
     let r = s.runStmt(stmt, params, ptypes, pc, input, out, pull, sink)
-    if r.isOk() { try s.takeSetConfigs() } else { s.st.memoPut(&setCfgKey(s.id), &"") }
+    if r.isOk() { try s.takeSetConfigs() } else { s.st.memo.put(&setCfgKey(s.id), &"") }
     return r
 }
 
@@ -18908,7 +18908,7 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
                 var p: []str = []
                 for n in s.path { append(mut &p, n) }
                 s.savedPath = [p]
-                s.savedRoles = [s.st.memoGet(&roleKeyOf(s.id)).unwrapOr("") + "\n" + s.st.memoGet(&sessAuthKey(s.id)).unwrapOr("")]
+                s.savedRoles = [s.st.memo.get(&roleKeyOf(s.id)).unwrapOr("") + "\n" + s.st.memo.get(&sessAuthKey(s.id)).unwrapOr("")]
                 var cs: []str = []
                 for c in s.custom { append(mut &cs, c) }
                 s.savedCustom = [cs]
@@ -19066,7 +19066,7 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
     }
     if stmt.waitFor { return s.waitForRun(stmt, params, ptypes, pc) }
     var tries = 0
-    let noticesWere = s.st.memoGet(&noticeKey(s.id)).unwrapOr("")
+    let noticesWere = s.st.memo.get(&noticeKey(s.id)).unwrapOr("")
     let lim = s.limits()                    // retries share the statement's time
     while true {
         // A SELECT runs on a snapshot: it sees one state and never conflicts.
@@ -19085,7 +19085,7 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
         s.setUp(mut &t)
         chgEnd(&s.st, s.id, false)          // (a try before that failed: its counts go, optimizer 44)
         // (and its notices: those of the statements before kept)
-        if len(noticesWere) > 0 { s.st.memoPut(&noticeKey(s.id), &noticesWere) } else { s.st.memoDel(&noticeKey(s.id)) }
+        if len(noticesWere) > 0 { s.st.memo.put(&noticeKey(s.id), &noticesWere) } else { s.st.memo.del(&noticeKey(s.id)) }
         var sent = false
         let ran = execIn(&s.st, mut &t, stmt, params, ptypes, lim, pc, input, out, pull, fn(c: &[]OutCol, r: &[]Val, ob: &OutBatch, start: bool): bool {
             let ok = sink(c, r, ob, start)
@@ -20181,8 +20181,8 @@ fn relink(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, old:
 //
 // Its values are outside any transaction, as PostgreSQL's: nextval in a
 // transaction rolled back is not given again, and two transactions taking
-// values never conflict. They are handed out from the store's memo
-// (Store.memoGet), a block at a time: before a block's first value is given,
+// values never conflict. They are handed out from the session memo
+// (Store.memo, lexdb_memo), a block at a time: before a block's first value is given,
 // its last is written, in a transaction of its own, to the sequences' tree
 // (SEQ_TREE, not the catalog, whose writes make the wire describe
 // statements again). After a crash the sequence goes on after the last
@@ -20367,8 +20367,8 @@ fn span(hi: int, lo: int): int {
 
 // Waits while a block of sequence d is being written, then marks one.
 fn seqLock(st: &lexdb_store.Store, d: &Seq) {
-    while st.memoGet(&memoBusy(d)).isSome() { let y = task.yield() }
-    st.memoPut(&memoBusy(d), &"1")
+    while st.memo.get(&memoBusy(d)).isSome() { let y = task.yield() }
+    st.memo.put(&memoBusy(d), &"1")
 }
 
 // Writes v as sequence d's last durable value, in a transaction of its own,
@@ -20394,10 +20394,10 @@ fn nextRun(st: &lexdb_store.Store, d: &Seq, want: int): Result[SeqRun, DbErr] {
     let kn = memoNext(d)
     let kl = memoLast(d)
     while true {
-        if st.memoGet(&kn).isNone() {
+        if st.memo.get(&kn).isNone() {
             // first used since the store opened: after its last value written
             seqLock(st, d)
-            if st.memoGet(&kn).isNone() {
+            if st.memo.get(&kn).isNone() {
                 var t = lexdb_store.begin()
                 let tree = seqTree(st, mut &t)
                 match tree {
@@ -20406,46 +20406,46 @@ fn nextRun(st: &lexdb_store.Store, d: &Seq, want: int): Result[SeqRun, DbErr] {
                             Ok(got) {
                                 match got {
                                     Some(v) {
-                                        st.memoPut(&kn, &seqAfter(d, num(&v)))
-                                        st.memoPut(&kl, &v)
+                                        st.memo.put(&kn, &seqAfter(d, num(&v)))
+                                        st.memo.put(&kl, &v)
                                     }
                                     None {
-                                        st.memoPut(&kn, &d.start.toStr())
-                                        st.memoPut(&kl, &"")
+                                        st.memo.put(&kn, &d.start.toStr())
+                                        st.memo.put(&kl, &"")
                                     }
                                 }
                             }
                             Err(x) {
                                 st.abort(t)
-                                st.memoDel(&memoBusy(d))
+                                st.memo.del(&memoBusy(d))
                                 return Err(x)
                             }
                         }
                     }
                     Err(x) {
                         st.abort(t)
-                        st.memoDel(&memoBusy(d))
+                        st.memo.del(&memoBusy(d))
                         return Err(x)
                     }
                 }
                 st.abort(t)
             }
-            st.memoDel(&memoBusy(d))
+            st.memo.del(&memoBusy(d))
             continue
         }
-        let nv = st.memoGet(&kn).unwrap()
+        let nv = st.memo.get(&kn).unwrap()
         if nv == "e" {
             if !d.cycle {
                 let edge = if d.inc > 0 { "maximum value of sequence \"" + lexdb_sql.baseName(&d.key) + "\" (" + d.max.toStr() + ")" }
                            else { "minimum value of sequence \"" + lexdb_sql.baseName(&d.key) + "\" (" + d.min.toStr() + ")" }
                 return Err(e("2200H", &("nextval: reached " + edge)))
             }
-            st.memoPut(&kn, &(if d.inc > 0 { d.min } else { d.max }).toStr())
-            st.memoPut(&kl, &"")
+            st.memo.put(&kn, &(if d.inc > 0 { d.min } else { d.max }).toStr())
+            st.memo.put(&kl, &"")
             continue
         }
         let n = num(&nv)
-        let lv = st.memoGet(&kl).unwrapOr("")
+        let lv = st.memo.get(&kl).unwrapOr("")
         let held = len(lv) > 0 && (if d.inc > 0 { n <= num(&lv) } else { n >= num(&lv) })
         if held {
             var c = 1
@@ -20455,16 +20455,16 @@ fn nextRun(st: &lexdb_store.Store, d: &Seq, want: int): Result[SeqRun, DbErr] {
                 c = if avail < want { avail } else { want }
             }
             let last = n + (c - 1) * d.inc
-            st.memoPut(&kn, &seqAfter(d, last))
-            st.memoPut(&memoGiven(d), &last.toStr())
+            st.memo.put(&kn, &seqAfter(d, last))
+            st.memo.put(&memoGiven(d), &last.toStr())
             return Ok(SeqRun{first: n, count: c})
         }
         // the next block: its last value written before its first is given
-        if st.memoGet(&memoBusy(d)).isSome() {
+        if st.memo.get(&memoBusy(d)).isSome() {
             let y = task.yield()
             continue
         }
-        st.memoPut(&memoBusy(d), &"1")
+        st.memo.put(&memoBusy(d), &"1")
         let base = if d.cache > 32 { d.cache } else { 32 }
         let steps = (if want > base { want } else { base }) - 1
         // the steps left before the bound: n's distance to it over the
@@ -20476,9 +20476,9 @@ fn nextRun(st: &lexdb_store.Store, d: &Seq, want: int): Result[SeqRun, DbErr] {
         if d.inc > 0 { room = span(d.max, n) / d.inc } else if d.inc != INT_MIN { room = span(n, d.min) / (0 - d.inc) }
         let hi = n + d.inc * (if room < steps { room } else { steps })
         let w = seqWrite(st, d, hi)
-        st.memoDel(&memoBusy(d))
+        st.memo.del(&memoBusy(d))
         match w {
-            Ok(_) { st.memoPut(&kl, &hi.toStr()) }
+            Ok(_) { st.memo.put(&kl, &hi.toStr()) }
             Err(x) { return Err(x) }
         }
     }
@@ -20507,13 +20507,13 @@ fn setVal(st: &lexdb_store.Store, d: &Seq, v: int, called: bool): Result[Unit, D
     let w = seqWrite(st, d, last)
     match w {
         Ok(_) {
-            st.memoPut(&memoNext(d), &next)
-            st.memoPut(&memoLast(d), &(if called { last.toStr() } else { "" }))
-            if called { st.memoPut(&memoGiven(d), &v.toStr()) } else { st.memoDel(&memoGiven(d)) }
+            st.memo.put(&memoNext(d), &next)
+            st.memo.put(&memoLast(d), &(if called { last.toStr() } else { "" }))
+            if called { st.memo.put(&memoGiven(d), &v.toStr()) } else { st.memo.del(&memoGiven(d)) }
         }
         Err(_) {}
     }
-    st.memoDel(&memoBusy(d))
+    st.memo.del(&memoBusy(d))
     return w
 }
 
@@ -20521,16 +20521,16 @@ fn setVal(st: &lexdb_store.Store, d: &Seq, v: int, called: bool): Result[Unit, D
 // by its new increment, in a block written anew (or, none given since the
 // store opened, the last written).
 fn seqForget(st: &lexdb_store.Store, d: &Seq) {
-    match st.memoGet(&memoGiven(d)) {
+    match st.memo.get(&memoGiven(d)) {
         Some(g) {
             let gv = num(&g)
             var nx = seqAfter(d, gv)
             if nx != "e" && (num(&nx) < d.min || num(&nx) > d.max) { nx = "e" }
-            st.memoPut(&memoNext(d), &nx)
+            st.memo.put(&memoNext(d), &nx)
         }
-        None { st.memoDel(&memoNext(d)) }
+        None { st.memo.del(&memoNext(d)) }
     }
-    st.memoPut(&memoLast(d), &"")
+    st.memo.put(&memoLast(d), &"")
 }
 
 // ---- a sequence read as a relation (9.117): SELECT last_value, log_cnt,
@@ -20558,9 +20558,9 @@ fn seqRelation(d: &Seq): Table {
 // ahead (PostgreSQL's values logged ahead; the same for its first 32
 // values from its start, it differs after).
 fn seqState(st: &lexdb_store.Store, d: &Seq): Result[[]Val, DbErr] {
-    let gv = st.memoGet(&memoGiven(d)).unwrapOr("")
-    let nv = st.memoGet(&memoNext(d)).unwrapOr("")
-    let lv = st.memoGet(&memoLast(d)).unwrapOr("")
+    let gv = st.memo.get(&memoGiven(d)).unwrapOr("")
+    let nv = st.memo.get(&memoNext(d)).unwrapOr("")
+    let lv = st.memo.get(&memoLast(d)).unwrapOr("")
     if len(gv) > 0 && len(nv) > 0 {
         let g = num(&gv)
         var left = 0
@@ -20610,8 +20610,8 @@ fn stmtKey(sess: int): str { return "bs:" + sess.toStr() }
 // nextval for session sess: its currval and lastval too.
 fn nextFor(st: &lexdb_store.Store, sess: int, d: &Seq): Result[int, DbErr] {
     let v = try nextVal(st, d)
-    st.memoPut(&curKey(sess, d), &v.toStr())
-    st.memoPut(&lastKey(sess), &v.toStr())
+    st.memo.put(&curKey(sess, d), &v.toStr())
+    st.memo.put(&lastKey(sess), &v.toStr())
     return Ok(v)
 }
 
@@ -20620,8 +20620,8 @@ fn nextFor(st: &lexdb_store.Store, sess: int, d: &Seq): Result[int, DbErr] {
 // evaluation, under a number of this statement's.
 fn bindSeqs(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, names: &[]str): Result[Unit, DbErr] {
     if len(names) == 0 { return Ok(Unit{}) }
-    let no = num(&st.memoGet(&stmtKey(txn.sess)).unwrapOr("0")) + 1
-    st.memoPut(&stmtKey(txn.sess), &no.toStr())
+    let no = num(&st.memo.get(&stmtKey(txn.sess)).unwrapOr("0")) + 1
+    st.memo.put(&stmtKey(txn.sess), &no.toStr())
     for n in names {
         if n == lexdb_sql.CAT_MARK {
             try bindCatalog(st, txn)
@@ -20638,7 +20638,7 @@ fn bindSeqs(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, names: &[]str): R
             let ci = colIndex(&t.cols, &strings.toLowerAscii(&(tc[z + 1..len(tc)].toStr())))
             if ci < 0 || len(t.cols[ci].seq) == 0 { continue }
             match try st.get(txn, CATALOG, &(seqRow(&t.cols[ci].seq))) {
-                Some(v) { st.memoPut(&bindKey(txn.sess, &seqShown(&t.cols[ci].seq)), &(no.toStr() + "\n" + v)) }
+                Some(v) { st.memo.put(&bindKey(txn.sess, &seqShown(&t.cols[ci].seq)), &(no.toStr() + "\n" + v)) }
                 None {}
             }
             continue
@@ -20659,7 +20659,7 @@ fn bindSeqs(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, names: &[]str): R
             let a = try readAcl(st, txn, &relObj(&d.key))
             if !allows(&w, &a, &"U") && !allows(&w, &a, &"w") && !allows(&w, &a, &"r") { return Err(denied(&"sequence", &d.key)) }
         }
-        st.memoPut(&bindKey(txn.sess, &n), &(no.toStr() + "\n" + encSeq(&d)))
+        st.memo.put(&bindKey(txn.sess, &n), &(no.toStr() + "\n" + encSeq(&d)))
     }
     return Ok(Unit{})
 }
@@ -20670,8 +20670,8 @@ fn seqShown(k: &str): str { return quoteIfNeeded(&lexdb_sql.schemaOf(k)) + "." +
 
 // The sequence a call names, as its statement bound it.
 fn boundSeq(q: &SeqEnv, name: &str, f: &str): Result[Seq, DbErr] {
-    let no = q.st.memoGet(&stmtKey(q.sess)).unwrapOr("")
-    match q.st.memoGet(&bindKey(q.sess, name)) {
+    let no = q.st.memo.get(&stmtKey(q.sess)).unwrapOr("")
+    match q.st.memo.get(&bindKey(q.sess, name)) {
         Some(v) {
             let i = strings.indexOf(&v, "\n", 0)
             if i > 0 && v[0..i] == no { return Ok(decSeq(&v[i + 1..len(v)])) }
@@ -20724,7 +20724,7 @@ fn advCall(name: &str, vs: &[]Val, env: &Env): Result[Val, DbErr] {
             let shared = strings.endsWith(&name, "_shared")
             let line = (if strings.contains(&name, "_xact_") { "x" } else { "s" }) + (if shared { "s" } else { "e" }) + k
             var lines: []str = []
-            match q.st.memoGet(&advMemo(q.sess)) {
+            match q.st.memo.get(&advMemo(q.sess)) {
                 Some(m) { for l in strings.split(&m, "\n") { if len(l) > 0 { append(mut &lines, l.toStr()) } } }
                 None {}
             }
@@ -20740,7 +20740,7 @@ fn advCall(name: &str, vs: &[]Val, env: &Env): Result[Val, DbErr] {
                     append(mut &keep, lines[i])
                     if lines[i][2..len(lines[i])] == k { still = true }
                 }
-                q.st.memoPut(&advMemo(q.sess), &strings.join(&keep, "\n"))
+                q.st.memo.put(&advMemo(q.sess), &strings.join(&keep, "\n"))
                 if !still { q.st.unlockAll(me, &[k]) }
                 return Ok(Val.Bool(true))
             }
@@ -20750,7 +20750,7 @@ fn advCall(name: &str, vs: &[]Val, env: &Env): Result[Val, DbErr] {
                                      if tryIt { lexdb_sql.WAIT_SKIP } else { lexdb_sql.WAIT_BLOCK }, true, mut &added)
             if got == lexdb_store.LOCK_SKIPPED { return Ok(Val.Bool(false)) }
             append(mut &lines, line)
-            q.st.memoPut(&advMemo(q.sess), &strings.join(&lines, "\n"))
+            q.st.memo.put(&advMemo(q.sess), &strings.join(&lines, "\n"))
             return Ok(if tryIt { Val.Bool(true) } else { Val.Text("") })
         }
     }
@@ -20758,7 +20758,7 @@ fn advCall(name: &str, vs: &[]Val, env: &Env): Result[Val, DbErr] {
 
 // Releases a session's transaction-level advisory locks (all: every one).
 fn advRelease(st: &lexdb_store.Store, sess: int, all: bool) {
-    let m = st.memoGet(&advMemo(sess)).unwrapOr("")
+    let m = st.memo.get(&advMemo(sess)).unwrapOr("")
     if len(m) == 0 { return }
     var keep: []str = []
     var gone: []str = []
@@ -20766,7 +20766,7 @@ fn advRelease(st: &lexdb_store.Store, sess: int, all: bool) {
         if len(l) == 0 { continue }
         if all || l[0] == 'x' { append(mut &gone, l[2..len(l)].toStr()) } else { append(mut &keep, l.toStr()) }
     }
-    st.memoPut(&advMemo(sess), &strings.join(&keep, "\n"))
+    st.memo.put(&advMemo(sess), &strings.join(&keep, "\n"))
     var free: []str = []
     for k in gone {
         var still = false
@@ -20784,14 +20784,14 @@ fn seqCall(name: &str, vs: &[]Val, env: &Env): Result[Val, DbErr] {
             if name == "scope_identity" {
                 // T-SQL's SCOPE_IDENTITY(): the session's last identity (or
                 // sequence) value, NULL before one (design/lexdb-tds.md S3)
-                match q.st.memoGet(&lastKey(q.sess)) {
+                match q.st.memo.get(&lastKey(q.sess)) {
                     Some(v) { return Ok(Val.Num(Decimal.fromInt(num(&v)))) }
                     None { return Ok(Val.Null) }
                 }
             }
             if name == "lastval" {
                 if len(vs) != 0 { return Err(e("42883", "function lastval takes no arguments")) }
-                match q.st.memoGet(&lastKey(q.sess)) {
+                match q.st.memo.get(&lastKey(q.sess)) {
                     Some(v) { return Ok(Val.Int(num(&v))) }
                     None { return Err(e("55000", "lastval is not yet defined in this session")) }
                 }
@@ -20804,7 +20804,7 @@ fn seqCall(name: &str, vs: &[]Val, env: &Env): Result[Val, DbErr] {
             }
             if name == "currval" {
                 if len(vs) != 1 { return Err(e("42883", "function currval takes one argument")) }
-                match q.st.memoGet(&curKey(q.sess, &d)) {
+                match q.st.memo.get(&curKey(q.sess, &d)) {
                     Some(v) { return Ok(Val.Int(num(&v))) }
                     None { return Err(e("55000", &("currval of sequence \"" + lexdb_sql.baseName(&d.key) + "\" is not yet defined in this session"))) }
                 }
@@ -27026,13 +27026,13 @@ fn quoteIfNeeded(n: &str): str { return lexdb_pg.quoteIfNeeded(n) }
 fn catMemoKey(sess: int): str { return "\x00cat\x00" + sess.toStr() }
 
 // The session's user, from its startup message.
-pub fn (s: &Session) setUser(u: &str) { s.st.memoPut(&userKey(s.id), u) }
+pub fn (s: &Session) setUser(u: &str) { s.st.memo.put(&userKey(s.id), u) }
 
 // The session's number (its catalog memos' key; T-SQL's @@SPID).
 pub fn (s: &Session) number(): int { return s.id }
 
 // The session's user, from its startup message.
-pub fn (s: &Session) user(): str { return s.st.memoGet(&userKey(s.id)).unwrapOr("lexdb") }
+pub fn (s: &Session) user(): str { return s.st.memo.get(&userKey(s.id)).unwrapOr("lexdb") }
 
 fn colNum(t: &Table, name: &str): int { return lexdb_catalog.colNum(t, name) }
 
@@ -27128,13 +27128,13 @@ fn bindCatalog(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[Unit, 
     lexdb_syscat.bind(&snap, mut &b)
     for s in snap.schemas { b.add(&("n\t" + lexdb_pg.nspOid(&s).toStr() + "\t" + s + "\n")) }
     b.add("n\t11\tpg_catalog\nn\t13000\tinformation_schema\n")
-    st.memoPut(&catMemoKey(txn.sess), &b.toStr())
+    st.memo.put(&catMemoKey(txn.sess), &b.toStr())
     return Ok(Unit{})
 }
 
 // The bound catalog's lines of a kind, split at tabs.
 fn catLines(se: &SeqEnv, kind: &str): [][]str {
-    let all = se.st.memoGet(&catMemoKey(se.sess)).unwrapOr("")
+    let all = se.st.memo.get(&catMemoKey(se.sess)).unwrapOr("")
     var out: [][]str = []
     for l in strings.split(&all, "\n") {
         if len(l) > 2 && l[0..1] == kind && l[1] == '\t' {
@@ -27148,7 +27148,7 @@ fn catLines(se: &SeqEnv, kind: &str): [][]str {
 
 fn catUser(se: &SeqEnv): str {
     for l in catLines(se, &"u") { return l[0] }
-    return se.st.memoGet(&userKey(se.sess)).unwrapOr("lexdb")
+    return se.st.memo.get(&userKey(se.sess)).unwrapOr("lexdb")
 }
 
 // A relation's OID by its name as written (schema.name, or a name on the
@@ -28398,7 +28398,7 @@ fn sessCall(name: &str, vs: &[]Val, env: &Env): Result[Val, DbErr] {
     // another session's (9.96: they are not in lexdb's pg_namespace, so
     // no OID of one is known)
     if name == "pg_my_temp_schema" && n == 0 {
-        match se.st.memoGet(&tmpMemo(se.sess)) {
+        match se.st.memo.get(&tmpMemo(se.sess)) {
             Some(t) { return Ok(Val.Int(lexdb_pg.nspOid(&t))) }
             None { return Ok(Val.Int(0)) }
         }
@@ -28408,15 +28408,15 @@ fn sessCall(name: &str, vs: &[]Val, env: &Env): Result[Val, DbErr] {
         // a number per transaction: the next of the store's count the first time
         // a transaction asks, the same after
         let key = "\x00xid\x00" + se.sess.toStr()
-        let mine = se.st.memoGet(&key).unwrapOr("")
+        let mine = se.st.memo.get(&key).unwrapOr("")
         let nl = strings.indexOf(&mine, "\n", 0)
         if nl > 0 && mine[0..nl] == se.now.toStr() { return Ok(Val.Int(num(&mine[nl + 1..len(mine)]))) }
-        let x = num(&se.st.memoGet(&"xids").unwrapOr("1000")) + 1
-        se.st.memoPut(&"xids", &x.toStr())
-        se.st.memoPut(&key, &(se.now.toStr() + "\n" + x.toStr()))
+        let x = num(&se.st.memo.get(&"xids").unwrapOr("1000")) + 1
+        se.st.memo.put(&"xids", &x.toStr())
+        se.st.memo.put(&key, &(se.now.toStr() + "\n" + x.toStr()))
         return Ok(Val.Int(x))
     }
-    let lines = se.st.memoGet(&settingsKey(se.sess)).unwrapOr("")
+    let lines = se.st.memo.get(&settingsKey(se.sess)).unwrapOr("")
     if name == "current_setting" && (n == 1 || n == 2) {
         if isNull(&vs[0]) || (n == 2 && isNull(&vs[1])) { return Ok(Val.Null) }
         let k = strings.toLowerAscii(&(text(&vs[0])))
@@ -28438,8 +28438,8 @@ fn sessCall(name: &str, vs: &[]Val, env: &Env): Result[Val, DbErr] {
         if strings.contains(&v, "\n") || strings.contains(&v, "\t") { return Err(e("0A000", "lexdb: a setting's value may not hold a newline or a tab")) }
         if k == "max_recursion" || k == "max_match_steps" || k == "statement_timeout" || k == "max_statement_mem" { let ok = try settingValue(&k, &Val.Text(v)) }
         let local = truth(&vs[2]) == Some(true)
-        let pend = se.st.memoGet(&setCfgKey(se.sess)).unwrapOr("")
-        se.st.memoPut(&setCfgKey(se.sess), &(pend + k + "\t" + v + "\t" + (if local { "1" } else { "0" }) + "\n"))
+        let pend = se.st.memo.get(&setCfgKey(se.sess)).unwrapOr("")
+        se.st.memo.put(&setCfgKey(se.sess), &(pend + k + "\t" + v + "\t" + (if local { "1" } else { "0" }) + "\n"))
         // seen by current_setting later in the statement
         var out = newStrBuf()
         for l in strings.split(&lines, "\n") {
@@ -28448,7 +28448,7 @@ fn sessCall(name: &str, vs: &[]Val, env: &Env): Result[Val, DbErr] {
             out.addByte('\n')
         }
         out.add(&(k + "\t" + v + "\n"))
-        se.st.memoPut(&settingsKey(se.sess), &out.toStr())
+        se.st.memo.put(&settingsKey(se.sess), &out.toStr())
         return Ok(Val.Text(v))
     }
     return Err(e("42883", &("function " + name + " with " + n.toStr() + " arguments does not exist")))
@@ -28791,7 +28791,7 @@ fn catRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &str): Result
     var stats: Map[int, TabStat] = newMap()
     if rel == "pg_stat_user_tables" {
         for ct in cq.snap.tabs {
-            let c = intsOf(&st.memoGet(&acKey(ct.t.tree)).unwrapOr(""), 5)
+            let c = intsOf(&st.memo.get(&acKey(ct.t.tree)).unwrapOr(""), 5)
             let a = acState(st, ct.t.tree)
             let base = if a.base >= 0 { a.base } else { try statRows(st, txn, &ct.t) }
             stats.put(ct.t.tree, TabStat{c0: c[0], c1: c[1], c2: c[2], c3: c[3], c4: c[4], base: a.base, last: a.last, lastAuto: a.lastAuto, n: a.n,
@@ -29632,16 +29632,16 @@ fn sessAuthKey(sess: int): str { return "\x00sessauth\x00" + sess.toStr() }
 
 // The session's user as SET SESSION AUTHORIZATION made it, else its login's.
 fn sessionUser(st: &lexdb_store.Store, sess: int): str {
-    match st.memoGet(&sessAuthKey(sess)) {
+    match st.memo.get(&sessAuthKey(sess)) {
         Some(u) { if len(u) > 0 { return u } }
         None {}
     }
-    return st.memoGet(&userKey(sess)).unwrapOr("lexdb")
+    return st.memo.get(&userKey(sess)).unwrapOr("lexdb")
 }
 
 // The role privileges are checked as: SET ROLE's, else the session user.
 fn currentRole(st: &lexdb_store.Store, sess: int): str {
-    match st.memoGet(&roleKeyOf(sess)) {
+    match st.memo.get(&roleKeyOf(sess)) {
         Some(r) { if len(r) > 0 { return r } }
         None {}
     }
@@ -29992,19 +29992,19 @@ fn (s: mut &Session) setRole(stmt: &lexdb_sql.Stmt): Result[Res, DbErr] {
 fn setRoleIn(st: &lexdb_store.Store, t: mut &lexdb_store.Txn, id: int, what: &str, name: &str): Result[Unit, DbErr] {
     if len(name) > 0 && !(try roleExists(st, t, name)) { return Err(e("22023", &("role \"" + name + "\" does not exist"))) }
     if what == "session_authorization" {
-        let login = st.memoGet(&userKey(id)).unwrapOr("lexdb")
+        let login = st.memo.get(&userKey(id)).unwrapOr("lexdb")
         if !(try whoIs(st, t, &login)).super && name != login {
             return Err(e("42501", "permission denied to set session authorization"))
         }
-        st.memoPut(&sessAuthKey(id), name)
-        st.memoPut(&roleKeyOf(id), &"")
+        st.memo.put(&sessAuthKey(id), name)
+        st.memo.put(&roleKeyOf(id), &"")
         return Ok(Unit{})
     }
     if len(name) > 0 {
         let w = try whoIs(st, t, &sessionUser(st, id))
         if !w.super && !hasStr(&w.roles, name) { return Err(e("42501", &("permission denied to set role \"" + name + "\""))) }
     }
-    st.memoPut(&roleKeyOf(id), name)
+    st.memo.put(&roleKeyOf(id), name)
     return Ok(Unit{})
 }
 
