@@ -67,15 +67,32 @@ plan and exits without generating, starting or measuring anything.
   stopped run. Each run is a fresh psql session, so no session state or
   plan cache carries over.
 
-PostgreSQL is capped at 4 CPUs (`CPUQuota=400%`) and gets
-`shared_buffers=12GB`; lexdb runs at its defaults (its cache defaults to a
-quarter of RAM; `LEXDB_CACHE_MB` passes through). Both are warm. The
-`pg1` column sets `max_parallel_workers_per_gather=0`; `pg4` sets it to 3
-with `max_parallel_workers=3`.
+lexdb is deliberately **not** CPU-capped: its SQL execution is one thread,
+but checkpoint encode runs on the `par.map` pool (`LEXDB_CKPT_POOL=1` on the
+checkpoint branch) and its I/O helpers use other cores. A 100% quota would
+make the pool's threads contend for one core and measure an artificial
+server, not lexdb. PostgreSQL is capped at 4 CPUs (`CPUQuota=400%`), the
+project's 4-process rule, and gets `shared_buffers=12GB`;
+`LEXDB_CPU_QUOTA=400%` gives lexdb the same aggregate budget; add
+`LXL_PAR=3` so the pool plus the caller is four-way rather than
+oversubscribed. Report a budget-matched run separately from the uncapped
+default. lexdb's cache
+defaults to a quarter of RAM; `LEXDB_CACHE_MB` passes through, as do
+`LEXDB_CKPT_POOL` and `LXL_PAR` (systemd-run does not inherit them). Both
+are warm.
+
+TPC-H is read-only: after the load there is no new log, so checkpoints are
+driven by the load rather than the queries (unless the checkpoint change
+adds time-driven ones). The parallel checkpoint work therefore shows in the
+load table. Add RF1/RF2 or concurrent writes and it enters the query phase
+too. The `pg1` column sets
+`max_parallel_workers_per_gather=0`; `pg4` sets it to 3 with
+`max_parallel_workers=3`.
 
 Output: `WORKDIR/out/lexdb.tsv`, `pg1.tsv`, `pg4.tsv` (one row per query:
 name, rows, median/min/max wall ms, median/min/max CPU ms, MD5, status),
-`load-*.tsv` and `analyze-*.ms`, and `summary.md` / `summary.txt`.
+`load-*.tsv` and `analyze-*.ms`, `config.txt` (the quotas, buffers and
+versions actually used), and `summary.md` / `summary.txt`.
 
 ## Options
 
@@ -87,6 +104,10 @@ name, rows, median/min/max wall ms, median/min/max CPU ms, MD5, status),
 | `PG_SHARED_BUFFERS` | `12GB` | PostgreSQL `shared_buffers` |
 | `QUERY_TIMEOUT` | `900` | seconds per psql call |
 | `LEXDB_CACHE_MB` | lexdb's default | passed to lexdb |
+| `LEXDB_CPU_QUOTA` | unset | lexdb's cgroup quota; `400%` budget-matches PG |
+| `PG_CPU_QUOTA` | `400%` | PostgreSQL's cgroup quota; unset for none |
+| `LEXDB_CKPT_POOL` | lexdb's default | `1` enables the parallel checkpoint encode on the checkpoint branch |
+| `LXL_PAR` | lexdb's default | par.map threads (`0` runs the caller's thread only) |
 | `POSTGRES` | `command -v postgres` | PostgreSQL server binary |
 | `LEXDB_PORT`, `PG_PORT` | `5598`, `5599` | ports |
 

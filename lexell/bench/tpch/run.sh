@@ -14,9 +14,14 @@
 # restarted between modes, never run together.
 #
 # The servers run as transient systemd user units, so a server's CPU is its
-# cgroup's. lexdb runs at its defaults (LEXDB_CACHE_MB passes through when
-# set); PostgreSQL gets shared_buffers 12GB and a 400% CPU quota, the
-# project's 4-process rule. The queries run one at a time, warm.
+# cgroup's. lexdb is deliberately not CPU-capped: its SQL execution is one
+# thread, but checkpoints encode leaves on the par pool (LEXDB_CKPT_POOL=1 on
+# the checkpoint branch) and its I/O helpers use other cores. A 100% quota
+# would throttle all of them; par.map would still start its pool and the
+# threads would contend for one core. PostgreSQL gets shared_buffers 12GB and
+# a 400% CPU quota, the project's 4-process rule. To budget-match lexdb to
+# that rule, set LEXDB_CPU_QUOTA=400% and report that row separately from the
+# uncapped default. The queries run one at a time, warm.
 #
 # Env:
 #   TPCH_ONLY=lexdb,pg1,pg4   modes to run (default all three)
@@ -25,6 +30,10 @@
 #   PG_SHARED_BUFFERS=12GB
 #   QUERY_TIMEOUT=900         seconds per psql call
 #   LEXDB_CACHE_MB=N          passed to lexdb when set
+#   LEXDB_CKPT_POOL=1, LXL_PAR=N   passed to lexdb when set
+#   LEXDB_CPU_QUOTA=400%      lexdb cgroup quota (default: none; a 100%
+#                             quota throttles its parallel checkpoint pool)
+#   PG_CPU_QUOTA=400%         PostgreSQL cgroup quota (default: 400%)
 #   TPCH_CHECK_ONLY=1         check prerequisites and the plan; run nothing
 #
 # First time:
@@ -56,6 +65,8 @@ UNIT_L=tpch-lexdb
 UNIT_P=tpch-pg
 PG_SHARED_BUFFERS=${PG_SHARED_BUFFERS:-12GB}
 QUERY_TIMEOUT=${QUERY_TIMEOUT:-900}
+LEXDB_CPU_QUOTA=${LEXDB_CPU_QUOTA:-}
+PG_CPU_QUOTA=${PG_CPU_QUOTA:-400%}
 MODES=${TPCH_ONLY:-lexdb,pg1,pg4}
 MODES=${MODES//,/ }
 TABLES="region nation part supplier partsupp customer orders lineitem"
@@ -130,12 +141,19 @@ trap 'stop lexdb; stop pg' EXIT
 
 start_lexdb() {
     stop lexdb
-    local envargs=()
-    if [ -n "${LEXDB_CACHE_MB:-}" ]; then
-        envargs+=(--setenv="LEXDB_CACHE_MB=$LEXDB_CACHE_MB")
+    local envargs=() cap=() v
+    # systemd-run does not inherit the caller's environment: the pool knobs
+    # must be passed explicitly or they never reach the server.
+    for v in LEXDB_CACHE_MB LEXDB_CKPT_POOL LXL_PAR; do
+        if [ -n "${!v:-}" ]; then
+            envargs+=(--setenv="$v=${!v}")
+        fi
+    done
+    if [ -n "$LEXDB_CPU_QUOTA" ]; then
+        cap=(-p "CPUQuota=$LEXDB_CPU_QUOTA")
     fi
     mkdir -p "$W/lexdb"
-    systemd-run --user --quiet --collect -u "$UNIT_L" "${envargs[@]}" \
+    systemd-run --user --quiet --collect -u "$UNIT_L" "${cap[@]}" "${envargs[@]}" \
         "$BIN" "$W/lexdb" "127.0.0.1:$LPORT"
     for _ in $(seq 100); do
         psql_at "$LPORT" -Atc 'select 1' >/dev/null 2>&1 && return 0
@@ -148,8 +166,12 @@ start_lexdb() {
 
 start_pg() {
     stop pg
+    local cap=()
+    if [ -n "$PG_CPU_QUOTA" ]; then
+        cap=(-p "CPUQuota=$PG_CPU_QUOTA")
+    fi
     mkdir -p "$W/psock"
-    systemd-run --user --quiet --collect -u "$UNIT_P" -p CPUQuota=400% \
+    systemd-run --user --quiet --collect -u "$UNIT_P" "${cap[@]}" \
         "$POSTGRES" -D "$W/pg" -k "$W/psock" -p "$PPORT" \
         -c listen_addresses=127.0.0.1 -c shared_buffers="$PG_SHARED_BUFFERS"
     for _ in $(seq 100); do
@@ -245,6 +267,19 @@ fi
 rm -f "$OUT"/lexdb.tsv "$OUT"/pg1.tsv "$OUT"/pg4.tsv \
       "$OUT"/load-*.tsv "$OUT"/analyze-*.ms "$OUT"/*.log "$OUT"/summary.md \
       "$OUT"/summary.txt
+{
+    printf 'scale\t%s\n' "$SF"
+    printf 'runs\t%s\n' "$RUNS"
+    printf 'modes\t%s\n' "$MODES"
+    printf 'lexdb_binary\t%s\n' "$BIN"
+    printf 'lexdb_cpu_quota\t%s\n' "${LEXDB_CPU_QUOTA:-none}"
+    printf 'lexdb_cache_mb\t%s\n' "${LEXDB_CACHE_MB:-default}"
+    printf 'lexdb_ckpt_pool\t%s\n' "${LEXDB_CKPT_POOL:-default}"
+    printf 'lxl_par\t%s\n' "${LXL_PAR:-default}"
+    printf 'pg_cpu_quota\t%s\n' "${PG_CPU_QUOTA:-none}"
+    printf 'pg_shared_buffers\t%s\n' "$PG_SHARED_BUFFERS"
+    printf 'pg_binary\t%s\n' "$POSTGRES"
+} > "$OUT/config.txt"
 gen_data
 
 rc=0
