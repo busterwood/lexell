@@ -36,6 +36,21 @@ pub const PK_BYTEA: byte = 14   // variable: its bytes
 
 pub const LONG: int = 256
 
+// A large value's stored form (lexdb_store): a stub begins with 0xFF, which
+// no row does (a key is at most MAX_KEY bytes), version 1 whole, version 2
+// followed by the value's first bytes (9.29, 9.31).
+pub const BIG: byte = 0xFF
+pub const STUB_LEN: int = 14
+
+pub fn isStub(v: &str): bool { return len(v) >= STUB_LEN && v[0] == BIG && ((v[1] == 1 && len(v) == STUB_LEN) || v[1] == 2) }
+
+// A large value's stored form as the store's part scans give it: its first
+// bytes, or None for any other value.
+pub fn partOf(v: &str): Option[str] {
+    if isStub(v) && v[1] == 2 { return Some(v[STUB_LEN..len(v)]) }
+    return None
+}
+
 fn isNullVal(v: &Val): bool { match v { Val.Null { return true } else { return false } } }
 
 // Where the places of rows in one layout are: each one's offset in the row,
@@ -857,4 +872,623 @@ pub fn decodeRowNeed(s: &str, n: int, need: &[]bool, missing: &[]Val, lays: &[]F
         }
     }
     return Ok(out)
+}
+
+// ---- Batches (design/lexdb.md 9.47)
+//
+// A query reads a table's rows in batches: each column used decoded into an
+// integer or boolean array (with NULL flags) or an array of values, as a
+// Projection says, from a leaf in place (decodeRun) or from a stored row
+// (decodeRow). The row format and what a reader needs stay here; the
+// operators run over the batches in the executor.
+
+pub const BROWS: int = 1024
+
+pub const BK_INT: int = 0    // a column's kind in a batch: an integer ...
+pub const BK_BOOL: int = 1   // ... a boolean (0, 1) ...
+pub const BK_VAL: int = 2    // ... or any other, as values
+pub const BK_NONE: int = -1  // a query's column not in the batch (of another table)
+
+// A column of a batch: its integers or booleans, and its NULLs.
+pub type BVec = record {
+    pub v: []int
+    pub nul: []bool
+}
+
+// A batch of rows: per column used its vectors, per column of values its
+// values (a slot per row, NULL too when the batch is used again).
+pub type Batch = record {
+    pub cols: []BVec
+    pub vals: [][]Val
+    pub n: int
+}
+
+// What a reader needs of a table's rows: per column its batch kind, the
+// places used in order and each place's column, the last one's end (a
+// tagged row is read to it), the values rows written before a column was
+// added have for it, and the ranges a place's words must be in for a row to
+// be kept (rangeConditions: place, kind, least, greatest, each).
+pub type Projection = record {
+    pub kinds: []int
+    pub needCol: []bool
+    pub placeCol: []int
+    pub usedP: []int
+    pub stopAt: int
+    pub missing: []Val
+    pub needP: []bool
+    pub width: int
+    pub ranges: []int
+}
+
+pub fn emptyProjection(): Projection {
+    return Projection{kinds: [], needCol: [], placeCol: [], usedP: [], stopAt: 0, missing: [], needP: [], width: 0, ranges: []}
+}
+
+pub fn noRows(): Batch { return Batch{cols: [], vals: [], n: 0} }
+
+pub fn bvec(m: int): BVec { return BVec{v: array(m, 0), nul: array(m, false)} }
+
+// A column's kind in a batch, from its type.
+pub fn colKind(c: &lexdb_sql.ColDef): int {
+    let o = c.typ.oid
+    if o == lexdb_sql.OID_INT2 || o == lexdb_sql.OID_INT4 || o == lexdb_sql.OID_INT8 { return BK_INT }
+    if o == lexdb_sql.OID_BOOL { return BK_BOOL }
+    return BK_VAL
+}
+
+// A batch of a projection's columns, cap rows each.
+pub fn newBatch(bp: &Projection, cap: int): Batch {
+    var b = Batch{cols: [], vals: [], n: 0}
+    for i in 0..len(bp.kinds) {
+        if bp.needCol[i] { append(mut &b.cols, bvec(cap)) } else { append(mut &b.cols, bvec(0)) }
+        if bp.needCol[i] && bp.kinds[i] == BK_VAL { append(mut &b.vals, array(cap, Val.Null)) } else { append(mut &b.vals, []) }
+    }
+    return b
+}
+
+// Row r of column c NULL; a value column's slot set to NULL too, so a
+// batch used again (reuse) holds no value from its last use there.
+pub fn setNull(b: mut &Batch, c: int, r: int) {
+    b.cols[c].nul[r] = true
+    if r < len(b.vals[c]) { b.vals[c][r] = Val.Null }
+}
+
+// A batch for a lazy fill (fillPick) of BROWS rows: spare, the last one the
+// caller used, when it is of this projection, else a new one. Its value
+// columns are kept as they are (each slot a fill decodes is written, a NULL
+// too: setNull), the integer and NULL columns new (9.111).
+pub fn reuse(spare: mut &Batch, bp: &Projection): Batch {
+    var b = replace(spare, noRows())
+    var fits = len(b.cols) == len(bp.kinds) && len(b.vals) == len(bp.kinds)
+    if fits {
+        for i in 0..len(bp.kinds) {
+            let want = if bp.needCol[i] && bp.kinds[i] == BK_VAL { BROWS } else { 0 }
+            if len(b.vals[i]) != want { fits = false }
+        }
+    }
+    if !fits { return newBatch(bp, BROWS) }
+    b.n = 0
+    for i in 0..len(bp.kinds) { if bp.needCol[i] { b.cols[i] = bvec(BROWS) } }
+    return b
+}
+
+// Puts value v at row r of column c; false: not of the column's kind.
+pub fn put(b: mut &Batch, c: int, r: int, v: Val, kind: int): bool {
+    match v {
+        Val.Null {
+            setNull(b, c, r)
+            return true
+        }
+        Val.Int(i) {
+            if kind == BK_INT {
+                b.cols[c].v[r] = i
+                return true
+            }
+        }
+        Val.Bool(x) {
+            if kind == BK_BOOL {
+                b.cols[c].v[r] = if x { 1 } else { 0 }
+                return true
+            }
+        }
+        else {}
+    }
+    if kind != BK_VAL { return false }
+    b.vals[c][r] = v
+    return true
+}
+
+// ---- Leaf views (the page's entries as the codec reads them)
+//
+// A leaf's rows as a scan gives them, without copying: body and ents for a
+// lazy leaf (entry i's key and value are at kStart and the others), vals for
+// one in memory, cols and dir for a column leaf. page makes one from its
+// Node; the row codec reads rows through it.
+
+pub type LeafView = value record {
+    pub isCols: bool
+    pub lazy: bool
+    pub n: int
+    pub body: &str
+    pub ents: &[]int
+    pub keys: &[]str
+    pub vals: &[]str
+    pub cols: &str
+    pub dir: &[]int
+}
+
+pub fn kStart(e: int): int { return e & 0xfffff }
+pub fn kEnd(e: int): int { return (e & 0xfffff) + ((e >> 20) & 0xfff) }
+pub fn vStart(e: int): int { return (e >> 32) & 0xfffff }
+pub fn vEnd(e: int): int { return ((e >> 32) & 0xfffff) + ((e >> 52) & 0x7ff) }
+
+pub fn leafKey(l: &LeafView, i: int): str {
+    if !l.lazy { return l.keys[i] }
+    let e = l.ents[i]
+    return l.body[kStart(e)..kEnd(e)]
+}
+
+// Row i (a column leaf's rebuilt).
+pub fn leafVal(l: &LeafView, i: int): str {
+    if l.isCols { return lexdb_cols.rowOf(l.cols, l.dir, i) }
+    if !l.lazy { return l.vals[i] }
+    let e = l.ents[i]
+    return l.body[vStart(e)..vEnd(e)]
+}
+
+// Row i as a view of the leaf's bytes (not of a column leaf, whose rows are
+// read by column or rebuilt).
+pub fn leafValAt(l: &LeafView, i: int): &str {
+    if !l.lazy { return &l.vals[i] }
+    if l.isCols { panic("leafValAt of a column leaf") }
+    let e = l.ents[i]
+    return &l.body[vStart(e)..vEnd(e)]
+}
+
+// Decodes stored row s into row r of b: 0 done, 1 a value of a kind its
+// column's batch does not hold (the row path reads the query), 2 a value
+// stored apart (the store must be read: the caller's).
+pub fn decodeRow(s: &str, r: int, b: mut &Batch, bp: &Projection, rw: &Rows): Result[int, DbErr] {
+    let kinds = &bp.kinds
+    let placeCol = &bp.placeCol
+    let missing = &bp.missing
+    if isFixedRow(s, rw) {
+        // one load per column used, at its offset (9.50)
+        let lay = &rw.lays[try layOf(s, rw.lays)]
+        let np = len(lay.kinds)
+        for pl in bp.usedP {
+            let c = placeCol[pl]
+            let k = kinds[c]
+            if pl >= np {
+                let mv = if pl < len(missing) { missing[pl] } else { Val.Null }
+                if !put(b, c, r, mv, k) { return Ok(1) }
+                continue
+            }
+            let pk = lay.kinds[pl]
+            if pk == PK_NONE || (int(s[lay.bm + pl / 8]) >> (pl % 8)) & 1 == 1 {
+                setNull(b, c, r)
+            } else if k == BK_INT && isIntKind(pk) {
+                b.cols[c].v[r] = readIntK(s, lay.off[pl], pk)
+            } else if pk == PK_BOOL && k == BK_BOOL {
+                b.cols[c].v[r] = if s[lay.off[pl]] == 1 { 1 } else { 0 }
+            } else if k != BK_VAL {
+                return Ok(1)
+            } else {
+                b.vals[c][r] = try fixedVal(s, pl, pk, lay)
+            }
+        }
+        return Ok(0)
+    }
+    if len(s) > 0 && s[0] == BIG { return Ok(2) }
+    if len(s) > 0 && s[0] == 6 {
+        // a row with long texts, kept whole in its leaf: read as the row path reads it
+        let places = try decodeRowNeed(s, bp.width, &bp.needP, missing, rw.lays)
+        for i in 0..len(kinds) {
+            if !bp.needCol[i] { continue }
+            let pl = if len(rw.slots) == 0 { i } else { rw.slots[i] }
+            if !put(b, i, r, places[pl], kinds[i]) { return Ok(1) }
+        }
+        return Ok(0)
+    }
+    var at = 0
+    for pl in 0..bp.stopAt {
+        let c = placeCol[pl]
+        if at >= len(s) {
+            // a column added after the row was written: its value then
+            if c >= 0 {
+                let mv = if pl < len(missing) { missing[pl] } else { Val.Null }
+                if !put(b, c, r, mv, kinds[c]) { return Ok(1) }
+            }
+            continue
+        }
+        let tag = s[at]
+        at += 1
+        if c < 0 {
+            let sz = valSize(s, at, tag)
+            if sz < 0 { return Err(lexdb_base.corrupt("a row's value tag")) }
+            at += sz
+            continue
+        }
+        let k = kinds[c]
+        if tag == 0 {
+            setNull(b, c, r)
+        } else if tag == 1 && k == BK_INT {
+            b.cols[c].v[r] = binary.readI64LEStr(s, at)
+            at += 8
+        } else if tag == 2 && k == BK_BOOL {
+            b.cols[c].v[r] = if s[at] == 1 { 1 } else { 0 }
+            at += 1
+        } else if k != BK_VAL {
+            return Ok(1)
+        } else if tag == 1 {
+            b.vals[c][r] = Val.Int(binary.readI64LEStr(s, at))
+            at += 8
+        } else if tag == 2 {
+            b.vals[c][r] = Val.Bool(s[at] == 1)
+            at += 1
+        } else if tag == 3 || tag == 4 {
+            let l = binary.readU32LEStr(s, at)
+            let tx = s[at + 4..at + 4 + l]
+            at += 4 + l
+            if tag == 4 {
+                b.vals[c][r] = Val.Text(tx)
+            } else {
+                match Decimal.parse(&tx) {
+                    Ok(d) { b.vals[c][r] = Val.Num(d) }
+                    Err(_) { return Err(lexdb_base.corrupt("a numeric value in a row")) }
+                }
+            }
+        } else if tag >= 7 && tag <= 15 {
+            b.vals[c][r] = timeVal(s, at, tag)
+            at += valSize(s, at, tag)
+        } else {
+            return Err(lexdb_base.corrupt("a row's value tag"))
+        }
+    }
+    return Ok(0)
+}
+
+// Decodes the rows of a leaf in the fixed layout of its first, up to to,
+// into rows b.n on of b, a column at a time (9.53). The number of rows
+// decoded: 0 when the first is not in the fixed layout (decodeRow reads
+// it), -1 a value of a kind its column's batch does not hold (as
+// decodeRow's 1).
+pub fn decodeRun(leaf: &LeafView, from: int, to: int, b: mut &Batch, bp: &Projection, rw: &Rows): Result[int, DbErr] {
+    if leaf.isCols { return decodeCols(leaf, from, to, b, bp, rw) }
+    let s0 = leafValAt(leaf, from)
+    if len(s0) < 3 || !isFixedRow(s0, rw) { return Ok(0) }
+    let tf = lexdb_cols.timeFirst(rw.layouts)
+    let id = try layOf(s0, rw.lays)
+    let lay = &rw.lays[id]
+    let id0 = s0[1]
+    let id1 = s0[2]
+    let v0 = lay.v0
+    // each row's bytes, found once (a lazy leaf's are in its page's body)
+    var rows: []&str = withCapacity(to - from)
+    append(mut &rows, s0)
+    var end = from + 1
+    while end < to {
+        let s = leafValAt(leaf, end)
+        if len(s) < v0 || s[0] != FIXED || s[1] != id0 || s[2] != id1 { break }
+        if tf && lexdb_cols.timeTagged(s, rw.layouts) { break }
+        append(mut &rows, s)
+        end += 1
+    }
+    let n = end - from
+    let r0 = b.n
+    let np = len(lay.kinds)
+    for pl in bp.usedP {
+        let c = bp.placeCol[pl]
+        let k = bp.kinds[c]
+        if pl >= np {
+            let mv = if pl < len(bp.missing) { bp.missing[pl] } else { Val.Null }
+            for q in 0..n { if !put(b, c, r0 + q, mv, k) { return Ok(-1) } }
+            continue
+        }
+        let pk = lay.kinds[pl]
+        if pk == PK_NONE {
+            for q in 0..n { b.cols[c].nul[r0 + q] = true }
+            continue
+        }
+        let at = lay.bm + pl / 8
+        let bit = pl % 8
+        let o = lay.off[pl]
+        if k == BK_INT && pk == PK_INT4 {
+            var col = replace(mut &b.cols[c], bvec(0))
+            for q in 0..n {
+                let s = rows[q]
+                if (int(s[at]) >> bit) & 1 == 1 {
+                    col.nul[r0 + q] = true
+                } else {
+                    let u = int(s[o]) | (int(s[o + 1]) << 8) | (int(s[o + 2]) << 16) | (int(s[o + 3]) << 24)
+                    col.v[r0 + q] = if u >= 0x80000000 { u - 0x100000000 } else { u }
+                }
+            }
+            b.cols[c] = col
+        } else if k == BK_INT && pk == PK_INT {
+            var col = replace(mut &b.cols[c], bvec(0))
+            for q in 0..n {
+                let s = rows[q]
+                if (int(s[at]) >> bit) & 1 == 1 {
+                    col.nul[r0 + q] = true
+                } else {
+                    col.v[r0 + q] = int(s[o]) | (int(s[o + 1]) << 8) | (int(s[o + 2]) << 16) | (int(s[o + 3]) << 24) |
+                                    (int(s[o + 4]) << 32) | (int(s[o + 5]) << 40) | (int(s[o + 6]) << 48) | (int(s[o + 7]) << 56)
+                }
+            }
+            b.cols[c] = col
+        } else if k == BK_INT && pk == PK_INT2 {
+            var col = replace(mut &b.cols[c], bvec(0))
+            for q in 0..n {
+                let s = rows[q]
+                if (int(s[at]) >> bit) & 1 == 1 {
+                    col.nul[r0 + q] = true
+                } else {
+                    let u = int(s[o]) | (int(s[o + 1]) << 8)
+                    col.v[r0 + q] = if u >= 0x8000 { u - 0x10000 } else { u }
+                }
+            }
+            b.cols[c] = col
+        } else if k == BK_BOOL && pk == PK_BOOL {
+            var col = replace(mut &b.cols[c], bvec(0))
+            for q in 0..n {
+                let s = rows[q]
+                if (int(s[at]) >> bit) & 1 == 1 { col.nul[r0 + q] = true } else { col.v[r0 + q] = if s[o] == 1 { 1 } else { 0 } }
+            }
+            b.cols[c] = col
+        } else if k == BK_VAL {
+            for q in 0..n {
+                let s = rows[q]
+                if (int(s[at]) >> bit) & 1 == 1 { b.cols[c].nul[r0 + q] = true } else { b.vals[c][r0 + q] = try fixedVal(s, pl, pk, lay) }
+            }
+        } else {
+            return Ok(-1)
+        }
+    }
+    return Ok(n)
+}
+
+// Decodes places ps of a run's rows (their bytes in rows, of layout lay)
+// at offsets qs into b's rows r0 + q, a column at a time, as decodeRun
+// does; false: a value of a kind its column's batch does not hold.
+pub fn runCols(rows: &[]&str, qs: &[]int, r0: int, ps: &[]int, b: mut &Batch, bp: &Projection, lay: &FixedLay): Result[bool, DbErr] {
+    let np = len(lay.kinds)
+    for pl in ps {
+        let c = bp.placeCol[pl]
+        let k = bp.kinds[c]
+        if pl >= np {
+            let mv = if pl < len(bp.missing) { bp.missing[pl] } else { Val.Null }
+            for q in qs { if !put(b, c, r0 + q, mv, k) { return Ok(false) } }
+            continue
+        }
+        let pk = lay.kinds[pl]
+        if pk == PK_NONE {
+            for q in qs { setNull(b, c, r0 + q) }
+            continue
+        }
+        let at = lay.bm + pl / 8
+        let bit = pl % 8
+        let o = lay.off[pl]
+        if k == BK_INT && pk == PK_INT4 {
+            var col = replace(mut &b.cols[c], bvec(0))
+            for q in qs {
+                let s = rows[q]
+                if (int(s[at]) >> bit) & 1 == 1 {
+                    col.nul[r0 + q] = true
+                } else {
+                    let u = int(s[o]) | (int(s[o + 1]) << 8) | (int(s[o + 2]) << 16) | (int(s[o + 3]) << 24)
+                    col.v[r0 + q] = if u >= 0x80000000 { u - 0x100000000 } else { u }
+                }
+            }
+            b.cols[c] = col
+        } else if k == BK_INT && pk == PK_INT {
+            var col = replace(mut &b.cols[c], bvec(0))
+            for q in qs {
+                let s = rows[q]
+                if (int(s[at]) >> bit) & 1 == 1 {
+                    col.nul[r0 + q] = true
+                } else {
+                    col.v[r0 + q] = int(s[o]) | (int(s[o + 1]) << 8) | (int(s[o + 2]) << 16) | (int(s[o + 3]) << 24) |
+                                    (int(s[o + 4]) << 32) | (int(s[o + 5]) << 40) | (int(s[o + 6]) << 48) | (int(s[o + 7]) << 56)
+                }
+            }
+            b.cols[c] = col
+        } else if k == BK_INT && pk == PK_INT2 {
+            var col = replace(mut &b.cols[c], bvec(0))
+            for q in qs {
+                let s = rows[q]
+                if (int(s[at]) >> bit) & 1 == 1 {
+                    col.nul[r0 + q] = true
+                } else {
+                    let u = int(s[o]) | (int(s[o + 1]) << 8)
+                    col.v[r0 + q] = if u >= 0x8000 { u - 0x10000 } else { u }
+                }
+            }
+            b.cols[c] = col
+        } else if k == BK_BOOL && pk == PK_BOOL {
+            var col = replace(mut &b.cols[c], bvec(0))
+            for q in qs {
+                let s = rows[q]
+                if (int(s[at]) >> bit) & 1 == 1 { col.nul[r0 + q] = true } else { col.v[r0 + q] = if s[o] == 1 { 1 } else { 0 } }
+            }
+            b.cols[c] = col
+        } else if k == BK_VAL {
+            for q in qs {
+                let s = rows[q]
+                if (int(s[at]) >> bit) & 1 == 1 {
+                    b.cols[c].nul[r0 + q] = true
+                    b.vals[c][r0 + q] = Val.Null
+                } else {
+                    b.vals[c][r0 + q] = try fixedVal(s, pl, pk, lay)
+                }
+            }
+        } else {
+            return Ok(false)
+        }
+    }
+    return Ok(true)
+}
+
+// Whether column leaf leaf's rows are in a layout of rw with the same kinds.
+pub fn layoutOk(leaf: &LeafView, rw: &Rows): bool {
+    let lid = lexdb_cols.layoutOf(leaf.dir)
+    return lid < len(rw.lays) && lexdb_cols.kindsAre(leaf.cols, leaf.dir, &rw.lays[lid].kinds)
+}
+
+// Places ps of column leaf rows from + qs[x] into b's rows r0 + qs[x]
+// (all: qs is 0, 1, 2 ... in order, read as a run); false: a value of a
+// kind its column's batch does not hold.
+pub fn colsInto(leaf: &LeafView, from: int, qs: &[]int, all: bool, r0: int, ps: &[]int, b: mut &Batch, bp: &Projection): Result[bool, DbErr] {
+    let s = leaf.cols
+    let dir = leaf.dir
+    let np = lexdb_cols.places(dir)
+    let n = len(qs)
+    if n == 0 { return Ok(true) }
+    for pl in ps {
+        let c = bp.placeCol[pl]
+        let k = bp.kinds[c]
+        if pl >= np {
+            let mv = if pl < len(bp.missing) { bp.missing[pl] } else { Val.Null }
+            for q in qs { if !put(b, c, r0 + q, mv, k) { return Ok(false) } }
+            continue
+        }
+        let pk = lexdb_cols.kindOf(s, pl)
+        if pk == PK_NONE {
+            for q in qs { setNull(b, c, r0 + q) }
+            continue
+        }
+        let nulls = lexdb_cols.hasNulls(dir, pl)
+        if nulls {
+            if all { lexdb_cols.nullsInto(s, dir, pl, from, n, mut &b.cols[c].nul, r0) } else {
+                for q in qs { if lexdb_cols.isNull(s, dir, pl, from + q) { b.cols[c].nul[r0 + q] = true } }
+            }
+        }
+        if k == BK_INT && isIntKind(pk) {
+            var col = replace(mut &b.cols[c], bvec(0))
+            if all { lexdb_cols.intsInto(s, dir, pl, from, n, mut &col.v, r0) } else {
+                for q in qs { col.v[r0 + q] = lexdb_cols.intAt(s, dir, pl, from + q) }
+            }
+            b.cols[c] = col
+        } else if k == BK_BOOL && pk == PK_BOOL {
+            var col = replace(mut &b.cols[c], bvec(0))
+            if all { lexdb_cols.boolsInto(s, dir, pl, from, n, mut &col.v, r0) } else {
+                for q in qs { col.v[r0 + q] = if lexdb_cols.boolAt(s, dir, pl, from + q) { 1 } else { 0 } }
+            }
+            b.cols[c] = col
+        } else if k == BK_VAL {
+            var vals = replace(mut &b.vals[c], [])
+            // a NULL row's value written too: a batch's value columns are
+            // used again (reuse, 9.111)
+            if nulls { for q in qs { if b.cols[c].nul[r0 + q] { vals[r0 + q] = Val.Null } } }
+            let codec = lexdb_cols.codecOf(dir, pl)
+            if isWordKind(pk) {
+                // an integer, a date or time, a float's bits (9.113)
+                for q in qs { if !b.cols[c].nul[r0 + q] { vals[r0 + q] = wordVal(pk, lexdb_cols.intAt(s, dir, pl, from + q)) } }
+            } else if pk == PK_BOOL {
+                for q in qs { if !b.cols[c].nul[r0 + q] { vals[r0 + q] = Val.Bool(lexdb_cols.boolAt(s, dir, pl, from + q)) } }
+            } else if codec == lexdb_cols.C_DICT {
+                // each entry made once
+                let nd = lexdb_cols.dictSize(dir, pl)
+                var dv: []Val = withCapacity(nd)
+                for j in 0..nd {
+                    let sp = lexdb_cols.entryAt(s, dir, pl, j)
+                    append(mut &dv, Val.Text(s[lexdb_cols.spanStart(sp)..lexdb_cols.spanEnd(sp)]))
+                }
+                var codes: []int = array(n, 0)
+                if all { lexdb_cols.codesInto(s, dir, pl, from, n, mut &codes, 0) } else {
+                    for x in 0..n { codes[x] = lexdb_cols.codeAt(s, dir, pl, from + qs[x]) }
+                }
+                for x in 0..n {
+                    let q = qs[x]
+                    if !b.cols[c].nul[r0 + q] { vals[r0 + q] = dv[codes[x]] }
+                }
+            } else if codec == lexdb_cols.C_UNITS {
+                let ds = lexdb_cols.scaleOf(dir, pl)
+                for q in qs { if !b.cols[c].nul[r0 + q] { vals[r0 + q] = Val.Num(Decimal.fromUnits(lexdb_cols.intAt(s, dir, pl, from + q), ds)) } }
+            } else {
+                var sp: []int = array(n, 0)
+                if all { lexdb_cols.varsInto(s, dir, pl, from, n, mut &sp, 0) } else {
+                    for x in 0..n { sp[x] = lexdb_cols.varAt(s, dir, pl, from + qs[x]) }
+                }
+                for x in 0..n {
+                    let q = qs[x]
+                    if b.cols[c].nul[r0 + q] { continue }
+                    let a = lexdb_cols.spanStart(sp[x])
+                    let e = lexdb_cols.spanEnd(sp[x])
+                    if pk == PK_TEXT {
+                        vals[r0 + q] = Val.Text(s[a..e])
+                    } else {
+                        // a numeric, a uuid, a bytea (9.113)
+                        match varVal(pk, s, a, e) {
+                            Ok(v) { vals[r0 + q] = v }
+                            Err(bad) {
+                                b.vals[c] = vals
+                                return Err(bad)
+                            }
+                        }
+                    }
+                }
+            }
+            b.vals[c] = vals
+        } else {
+            return Ok(false)
+        }
+    }
+    return Ok(true)
+}
+
+// Column leaves batch scans skipped (excluded), for the tests.
+var skipped: int = 0
+
+pub fn colLeavesSkipped(): int { return skipped }
+
+// Whether column leaf leaf holds no row bp.ranges keep: a place of the
+// range's kind whose least and greatest in the leaf are outside its range
+// (or whose rows are all NULL).
+pub fn excluded(leaf: &LeafView, bp: &Projection, rw: &Rows): bool {
+    if !layoutOk(leaf, rw) { return false }
+    let dir = leaf.dir
+    let np = lexdb_cols.places(dir)
+    var x = 0
+    while x + 3 < len(bp.ranges) {
+        let pl = bp.ranges[x]
+        let want = bp.ranges[x + 1]
+        let lo = bp.ranges[x + 2]
+        let hi = bp.ranges[x + 3]
+        x += 4
+        if pl >= np { continue }
+        // the place's words must be what the range is of: any integer's, or
+        // the one date or time kind (a column retyped keeps older leaves of
+        // its old kind)
+        let pk = lexdb_cols.kindOf(leaf.cols, pl)
+        if !(if want == 0 { isIntKind(pk) } else { int(pk) == want }) { continue }
+        if lo > hi || !lexdb_cols.hasRange(dir, pl) || lexdb_cols.least(dir, pl) > hi || lexdb_cols.greatest(dir, pl) < lo {
+            skipped += 1
+            return true
+        }
+    }
+    return false
+}
+
+// Column leaf rows from..to (rebuilt) into rows b.n on of b, a row at a
+// time: a leaf whose layout's kinds are not its table's. -1 as decodeRun.
+pub fn rowsInto(leaf: &LeafView, from: int, to: int, b: mut &Batch, bp: &Projection, rw: &Rows): Result[int, DbErr] {
+    for k in from..to {
+        let row = leafVal(leaf, k)
+        let at = b.n
+        let code = try decodeRow(&row, at + k - from, b, bp, rw)
+        if code != 0 { return Ok(-1) }
+    }
+    return Ok(to - from)
+}
+
+// decodeRun for a column leaf: rows from..to into rows b.n on of b. The
+// rows decoded (to - from), -1 as decodeRun.
+fn decodeCols(leaf: &LeafView, from: int, to: int, b: mut &Batch, bp: &Projection, rw: &Rows): Result[int, DbErr] {
+    if !layoutOk(leaf, rw) { return rowsInto(leaf, from, to, b, bp, rw) }
+    let n = to - from
+    var qs: []int = withCapacity(n)
+    for q in 0..n { append(mut &qs, q) }
+    if !(try colsInto(leaf, from, &qs, true, b.n, &bp.usedP, b, bp)) { return Ok(-1) }
+    return Ok(n)
 }

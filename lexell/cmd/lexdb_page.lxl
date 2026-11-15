@@ -101,6 +101,14 @@ pub fn newNode(leaf: bool): Node { return Node{leaf: leaf, keys: [], vals: [], k
 // Whether n is a column leaf (its rows by column: cols, cdir).
 pub fn (n: &Node) isCols(): bool { return len(n.cdir) > 0 }
 
+// n's entries as the row codec reads them (lexdb_rows.LeafView): a lazy
+// leaf's body and directory, one in memory's keys and values, a column
+// leaf's columns.
+pub fn leafView(n: &Node): lexdb_rows.LeafView {
+    return lexdb_rows.LeafView{isCols: n.isCols(), lazy: n.lazy, n: n.count(), body: &n.body, ents: &n.ents,
+                                keys: &n.keys, vals: &n.vals, cols: &n.cols, dir: &n.cdir}
+}
+
 pub fn newLeaf(): Node { return newNode(true) }
 
 // Its entries (a leaf's) or keys (an internal node's).
@@ -112,17 +120,13 @@ pub fn (n: &Node) count(): int { return if n.lazy { len(n.ents) } else { len(n.k
 // far more than 4 KiB (at most about 1,360 keys of 530 bytes), and keys
 // and values are at most MAX_KEY and MAX_ENTRY bytes. A value that is its
 // key's last bytes is a slice of the key.
-fn kStart(e: int): int { return e & 0xfffff }
-fn kEnd(e: int): int { return (e & 0xfffff) + ((e >> 20) & 0xfff) }
-fn vStart(e: int): int { return (e >> 32) & 0xfffff }
-fn vEnd(e: int): int { return ((e >> 32) & 0xfffff) + ((e >> 52) & 0x7ff) }
 fn ent(ks: int, kl: int, vs: int, vl: int): int { return ks | (kl << 20) | (vs << 32) | (vl << 52) }
 
 // Key i.
 pub fn (n: &Node) key(i: int): str {
     if !n.lazy { return n.keys[i] }
     let e = n.ents[i]
-    return n.body[kStart(e)..kEnd(e)]
+    return n.body[lexdb_rows.kStart(e)..lexdb_rows.kEnd(e)]
 }
 
 // Value i (a leaf's); a column leaf's row is rebuilt.
@@ -130,7 +134,7 @@ pub fn (n: &Node) val(i: int): str {
     if !n.lazy { return n.vals[i] }
     if len(n.cdir) > 0 { return lexdb_cols.rowOf(&n.cols, &n.cdir, i) }
     let e = n.ents[i]
-    return n.body[vStart(e)..vEnd(e)]
+    return n.body[lexdb_rows.vStart(e)..lexdb_rows.vEnd(e)]
 }
 
 // Value i as a view of the node's bytes: nothing made or counted (a scan's
@@ -140,11 +144,11 @@ pub fn (n: &Node) valView(i: int): &str {
     if !n.lazy { return &n.vals[i] }
     if len(n.cdir) > 0 { panic("valView of a column leaf") }
     let e = n.ents[i]
-    return &n.body[vStart(e)..vEnd(e)]
+    return &n.body[lexdb_rows.vStart(e)..lexdb_rows.vEnd(e)]
 }
 
 // Where a lazy leaf's value i starts in its body.
-pub fn valStart(n: &Node, i: int): int { return vStart(n.ents[i]) }
+pub fn valStart(n: &Node, i: int): int { return lexdb_rows.vStart(n.ents[i]) }
 
 // The first i whose key is >= k (count() when none).
 pub fn (n: &Node) lower(k: &str): int {
@@ -161,13 +165,13 @@ pub fn (n: &Node) lower(k: &str): int {
     if hi > 0 {
         // a scan going on into the next leaf asks for its first key
         let e0 = n.ents[0]
-        let k0 = &n.body[kStart(e0)..kEnd(e0)]
+        let k0 = &n.body[lexdb_rows.kStart(e0)..lexdb_rows.kEnd(e0)]
         if k0 >= k { return 0 }
     }
     while lo < hi {
         let m = (lo + hi) / 2
         let e = n.ents[m]
-        let km = &n.body[kStart(e)..kEnd(e)]
+        let km = &n.body[lexdb_rows.kStart(e)..lexdb_rows.kEnd(e)]
         if km < k { lo = m + 1 } else { hi = m }
     }
     return lo
@@ -187,8 +191,8 @@ pub fn (n: mut &Node) loosen() {
     var vals: []str = array(cnt, "")
     for i in 0..cnt {
         let e = n.ents[i]
-        keys[i] = n.body[kStart(e)..kEnd(e)]
-        vals[i] = n.body[vStart(e)..vEnd(e)]
+        keys[i] = n.body[lexdb_rows.kStart(e)..lexdb_rows.kEnd(e)]
+        vals[i] = n.body[lexdb_rows.vStart(e)..lexdb_rows.vEnd(e)]
     }
     n.keys = keys
     n.vals = vals
@@ -207,7 +211,7 @@ fn (n: mut &Node) loosenCols() {
     var vals: []str = array(cnt, "")
     for i in 0..cnt {
         let e = n.ents[i]
-        keys[i] = n.body[kStart(e)..kEnd(e)]
+        keys[i] = n.body[lexdb_rows.kStart(e)..lexdb_rows.kEnd(e)]
         vals[i] = rows[if i == 0 { 0 } else { ends[i - 1] }..ends[i]]
     }
     n.keys = keys
