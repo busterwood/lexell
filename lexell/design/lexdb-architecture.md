@@ -23,7 +23,8 @@ format and the pre-9.113/9.115 layout and time-tagged row compatibility are
 deleted. Table leaves are now always column leaves: a leaf the typed
 encoder cannot take (tagged/odd values, a stored-apart stub, mixed layouts)
 is a `C_ANY` column of its rows' bytes. The rest of `ReadView`, the rest of
-the dialect port and the executor/planner phases remain.
+the dialect port and the executor/planner phases remain. The flat free
+list is deleted; checkpoints use the runs lists only.
 
 ## 1. Why this exists
 
@@ -222,7 +223,10 @@ stay inside a module and the caller pays one dispatch, not one per value.
    raw-row driver are gone. Next: one `ReadView` selection over the
    remaining `st.fo` branches, and the follower's apply paths.
 4. **Checkpoint unification.** Cut-only; delete `ckptLocked`; decide
-   `CUT_POOL`.
+   `CUT_POOL`. Progress: the flat free list is gone (the meta page's runs
+   are the one encoding; the old slot is reserved); `CUT_POOL` still needs
+   its measurement decision, and `ckptLocked` is still the cancelled-cut
+   fallback.
 5. **Dialect port.** PG first, then MSSQL and Oracle. Normalise syntax into
    the common plan; no dialect branches in exec. Progress: `lexdb_pg` holds
    PostgreSQL's identifier/name rendering, OID mapping, catalog row helpers
