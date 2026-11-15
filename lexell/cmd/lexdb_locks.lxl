@@ -1,0 +1,219 @@
+// lexdb_locks: row locks, their waiters and deadlock check. A lock owner is
+// a transaction's id (Txn.lockId) or a session's negative one for advisory
+// locks. The store carries the handle; commit, abort and rollback release
+// through it. One lock of its own, so a waiter's cycle walk does not hold
+// the storage lock.
+import "strings"
+import "task"
+import "collections"
+import "./lexdb_base"
+
+pub type Locks = value record { sh: task.Shared[LockState] }
+
+type LockWait = record { key: str; id: int; p: task.Promise[Unit] }
+
+type LockState = record {
+    held: Map[str, str]        // lock key -> "id mode;id mode"
+    waits: []LockWait
+    waitFor: Map[int, str]     // owner -> the key it waits for
+    next: int
+}
+
+pub fn newLocks(): Locks {
+    return Locks{sh: task.shared(LockState{held: newMap(), waits: [], waitFor: newMap(), next: 0})}
+}
+
+// A new owner id (a transaction's first lock).
+pub fn (l: &Locks) newId(): int {
+    var id = 0
+    l.sh.with(fn(s: mut &LockState) {
+        s.next += 1
+        id = s.next
+    })
+    return id
+}
+
+// What lockRow did.
+pub const LOCKED = 0
+pub const LOCKED_AFTER_WAIT = 1     // the row may have changed meanwhile
+pub const LOCK_SKIPPED = 2          // SKIP LOCKED: another holds it
+
+// Takes lock key lk in mode (lexdb_sql.LOCK_*) for owner me, waiting while
+// others hold it in a conflicting mode (wait 0), failing (1: 55P03), or
+// skipping (2). keep false: only waits for others, takes no lock (an UPDATE
+// outside a block: its own commit ends it at once). added: me did not hold
+// it before.
+pub fn (l: &Locks) lockAs(me: int, lk: &str, mode: int, wait: int, keep: bool, added: mut &bool): Result[int, lexdb_base.DbErr] {
+    var waited = false
+    while true {
+        var out = -1
+        var bad: []lexdb_base.DbErr = []
+        var fut: []task.Future[Unit] = []
+        l.sh.with(fn(s: mut &LockState) {
+            let gone = s.waitFor.remove(&me)
+            var ids: []int = []
+            var modes: []int = []
+            holdersOf(&s.held.get(&lk).unwrapOr(""), mut &ids, mut &modes)
+            var others: []int = []
+            var mine = -1
+            for i in 0..len(ids) {
+                if ids[i] == me { mine = i } else if lockConflict(mode, modes[i]) { append(mut &others, ids[i]) }
+            }
+            if len(others) == 0 {
+                if keep {
+                    if mine < 0 {
+                        append(mut &ids, me)
+                        append(mut &modes, mode)
+                        added = true
+                    } else if modes[mine] < mode {
+                        modes[mine] = mode
+                    }
+                    s.held.put(lk.toStr(), holdersText(&ids, &modes))
+                }
+                out = if waited { LOCKED_AFTER_WAIT } else { LOCKED }
+                return
+            }
+            if wait == 1 {
+                append(mut &bad, lexdb_base.err("55P03", "could not obtain lock on row"))
+                return
+            }
+            if wait == 2 {
+                out = LOCK_SKIPPED
+                return
+            }
+            if s.cycle(me, &others) {
+                append(mut &bad, lexdb_base.err("40P01", "deadlock detected"))
+                return
+            }
+            let task.Handoff{promise: p, future: f} = task.promise[Unit]()
+            append(mut &s.waits, LockWait{key: lk.toStr(), id: me, p: p})
+            s.waitFor.put(me, lk.toStr())
+            append(mut &fut, f)
+        })
+        if len(bad) > 0 { return Err(bad[0]) }
+        if out >= 0 { return Ok(out) }
+        match pop(mut &fut).wait() {
+            Ok(_) {}
+            Err(_) { return Err(lexdb_base.err(lexdb_base.S_INTERNAL, "lock: the waker has gone")) }
+        }
+        waited = true
+    }
+    return Ok(LOCKED)
+}
+
+// Releases the row locks of owner id (held, its keys), waking those waiting
+// for them.
+pub fn (l: &Locks) release(id: int, held: &[]str) {
+    if id == 0 { return }
+    var wake: []task.Promise[Unit] = []
+    l.sh.with(fn(s: mut &LockState) {
+        let w = s.waitFor.remove(&id)
+        for lk in held {
+            var ids: []int = []
+            var modes: []int = []
+            holdersOf(&s.held.get(&lk).unwrapOr(""), mut &ids, mut &modes)
+            var ki: []int = []
+            var km: []int = []
+            for i in 0..len(ids) {
+                if ids[i] != id {
+                    append(mut &ki, ids[i])
+                    append(mut &km, modes[i])
+                }
+            }
+            if len(ki) == 0 { let r = s.held.remove(&lk) } else { s.held.put(lk.toStr(), holdersText(&ki, &km)) }
+        }
+        if len(held) == 0 { return }
+        var keep: []LockWait = []
+        while len(s.waits) > 0 {
+            let lw = pop(mut &s.waits)
+            var mine = false
+            for lk in held { if lk == lw.key { mine = true } }
+            if mine {
+                let LockWait{key: _, id: _, p: p} = move(lw)
+                append(mut &wake, p)
+            } else { append(mut &keep, lw) }
+        }
+        s.waits = keep
+    })
+    while len(wake) > 0 { pop(mut &wake).complete(Unit{}) }
+}
+
+// Whether any row of [lo, hi) of tree (hi "": to the end) is locked by an
+// owner other than me (a range delete falls back to the row path when one
+// is, which waits for it, 9.86). Keys are "tree:key", so a scan of the
+// locks; none are held most of the time.
+pub fn (l: &Locks) locksIn(me: int, tree: int, lo: &str, hi: &str): bool {
+    var any = false
+    let pre = tree.toStr() + ":"
+    l.sh.with(fn(s: mut &LockState) {
+        if s.held.size() == 0 { return }
+        for i in 0..s.held.size() {
+            let k: str = s.held.keyAt(i)
+            if !strings.startsWith(&k, &pre) { continue }
+            let key = k[len(pre)..len(k)]
+            if key < lo || (len(hi) > 0 && key >= hi) { continue }
+            var ids: []int = []
+            var modes: []int = []
+            holdersOf(&s.held.get(&k).unwrapOr(""), mut &ids, mut &modes)
+            for h in ids { if h != me { any = true } }
+        }
+    })
+    return any
+}
+
+// The rows locked now (for tests and EXPLAIN-like checks).
+pub fn (l: &Locks) count(): int {
+    var n = 0
+    l.sh.with(fn(s: mut &LockState) { n = s.held.size() })
+    return n
+}
+
+fn lockConflict(a: int, b: int): bool {
+    let hi = if a > b { a } else { b }
+    let lo = if a > b { b } else { a }
+    if hi == 4 { return true }
+    if hi == 3 { return lo >= 2 }
+    return false
+}
+
+// A row's holders: ids and their modes.
+fn holdersOf(x: &str, ids: mut &[]int, modes: mut &[]int) {
+    if len(x) == 0 { return }
+    for h in strings.split(x, ";") {
+        let sp = strings.indexOf(&h, " ", 0)
+        append(ids, strings.parseIntOpt(&(h[0..sp].toStr())).unwrapOr(0))
+        append(modes, strings.parseIntOpt(&(h[sp + 1..len(h)].toStr())).unwrapOr(0))
+    }
+}
+
+fn holdersText(ids: &[]int, modes: &[]int): str {
+    var parts: []str = []
+    for i in 0..len(ids) { append(mut &parts, ids[i].toStr() + " " + modes[i].toStr()) }
+    return strings.join(&parts, ";")
+}
+
+// Whether owner me waiting for holders hs would wait for itself: a holder
+// that is me, or waits (in turn) for a row me holds.
+fn (s: &LockState) cycle(me: int, hs: &[]int): bool {
+    var todo: []int = []
+    for h in hs { append(mut &todo, h) }
+    var seen: []int = []
+    while len(todo) > 0 {
+        let h = pop(mut &todo)
+        if h == me { return true }
+        var was = false
+        for x in seen { if x == h { was = true } }
+        if was { continue }
+        append(mut &seen, h)
+        match s.waitFor.get(&h) {
+            Some(k) {
+                var ids: []int = []
+                var modes: []int = []
+                holdersOf(&s.held.get(&k).unwrapOr(""), mut &ids, mut &modes)
+                for i in ids { append(mut &todo, i) }
+            }
+            None {}
+        }
+    }
+    return false
+}

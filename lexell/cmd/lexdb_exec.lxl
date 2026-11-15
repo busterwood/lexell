@@ -38,6 +38,7 @@ import "./lexdb_store"
 import "./lexdb_catalog"
 import "./lexdb_sql"
 import "./lexdb_plan"
+import "./lexdb_locks"
 import "./lexdb_func"
 import "./lexdb_sqlcoll"
 import "./lexdb_tsqlfn"
@@ -13954,7 +13955,7 @@ fn rangePlan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.St
         p.text = "range delete: no row can match"
         return Ok(Some(p))
     }
-    if st.locksIn(txn, t.tree, &p.main.lo, &p.main.hi) { return Ok(None) }
+    if st.locks.locksIn(txn.lockOwner(), t.tree, &p.main.lo, &p.main.hi) { return Ok(None) }
     for x in ixs {
         append(mut &p.ixs, x)
         append(mut &p.ixr, rdRange(&eqs, &lower, lowIncl, &upper, upIncl, true))
@@ -15137,8 +15138,8 @@ fn runLocking(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, para
                 let lt = &sel.q.levels[lk.level].t
                 for j in 0..lk.n { encKeyPart(mut &b, &collKeyVal(&lt.cols[lt.pk[j]], &res.rows[i][lk.at + j])) }
                 let got = try lockOf(st, txn, &sel.q.levels[lk.level].t, &b.toStr(), lk.mode, lk.wait, true)
-                if got == lexdb_store.LOCK_SKIPPED { skip = true }
-                if got == lexdb_store.LOCKED_AFTER_WAIT { waited = true }
+                if got == lexdb_locks.LOCK_SKIPPED { skip = true }
+                if got == lexdb_locks.LOCKED_AFTER_WAIT { waited = true }
                 if skip || waited { break }
             }
             if waited { break }
@@ -16069,11 +16070,11 @@ fn lockOf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, key: &st
 // once). true: one was waited for, so what was found may have changed.
 fn lockFound(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, found: &[][]Val, mode: int): Result[bool, DbErr] {
     let keep = txn.inBlock()
-    if !keep && st.lockCount() == 0 { return Ok(false) }
+    if !keep && st.locks.count() == 0 { return Ok(false) }
     var waited = false
     for r in found {
         let got = try lockOf(st, txn, t, &keyOf(t, &r), mode, lexdb_sql.WAIT_BLOCK, keep)
-        if got == lexdb_store.LOCKED_AFTER_WAIT { waited = true }
+        if got == lexdb_locks.LOCKED_AFTER_WAIT { waited = true }
     }
     return Ok(waited)
 }
@@ -20741,14 +20742,14 @@ fn advCall(name: &str, vs: &[]Val, env: &Env): Result[Val, DbErr] {
                     if lines[i][2..len(lines[i])] == k { still = true }
                 }
                 q.st.memo.put(&advMemo(q.sess), &strings.join(&keep, "\n"))
-                if !still { q.st.unlockAll(me, &[k]) }
+                if !still { q.st.locks.release(me, &[k]) }
                 return Ok(Val.Bool(true))
             }
             let tryIt = strings.startsWith(&name, "pg_try_")
             var added = false
-            let got = try q.st.lockAs(me, &k, if shared { lexdb_sql.LOCK_SHARE } else { lexdb_sql.LOCK_UPDATE },
+            let got = try q.st.locks.lockAs(me, &k, if shared { lexdb_sql.LOCK_SHARE } else { lexdb_sql.LOCK_UPDATE },
                                      if tryIt { lexdb_sql.WAIT_SKIP } else { lexdb_sql.WAIT_BLOCK }, true, mut &added)
-            if got == lexdb_store.LOCK_SKIPPED { return Ok(Val.Bool(false)) }
+            if got == lexdb_locks.LOCK_SKIPPED { return Ok(Val.Bool(false)) }
             append(mut &lines, line)
             q.st.memo.put(&advMemo(q.sess), &strings.join(&lines, "\n"))
             return Ok(if tryIt { Val.Bool(true) } else { Val.Text("") })
@@ -20773,7 +20774,7 @@ fn advRelease(st: &lexdb_store.Store, sess: int, all: bool) {
         for l in keep { if l[2..len(l)] == k { still = true } }
         if !still { append(mut &free, k) }
     }
-    if len(free) > 0 { st.unlockAll(0 - sess, &free) }
+    if len(free) > 0 { st.locks.release(0 - sess, &free) }
 }
 
 // nextval, currval, setval, lastval.
