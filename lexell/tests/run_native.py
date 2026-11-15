@@ -35,6 +35,7 @@ LIBDIRS = ['/usr/lib/x86_64-linux-gnu', '/lib/x86_64-linux-gnu', '/usr/lib64', '
 TIMEOUT = 10
 OPT = False          # build the native side with -O (the optimising path)
 os.environ.setdefault('LXL_LIB', os.path.normpath(os.path.join(HERE, '..', 'lib')))   # for compilers outside out/
+os.environ.setdefault('LXL_CC', '1')   # this runner needs the C backend; it may use the cache
 
 
 def redteam():
@@ -117,7 +118,7 @@ def one(path, lxlc):
         cexe = os.path.join(tmp, 'c.out')
         nexe = os.path.join(tmp, 'n.out')
         try:
-            rc, out, err = cbuild.build_lxl(path, cexe, lxlc=lxlc, timeout=60, cwd=tmp)
+            rc, out, err = cbuild.build_lxl(path, cexe, lxlc=lxlc, timeout=60, cwd=tmp, backend='c')
         except subprocess.TimeoutExpired:
             return rel, 'differ', 'C build timeout'
         if rc != 0:

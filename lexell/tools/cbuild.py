@@ -1,18 +1,25 @@
-"""Content-hash build cache shared by the lxl test runners.
+"""Build helpers shared by the lxl test runners.
 
-    build_lxl(src, out, ...)  lxl -> C (lxlc --emit-c-json) -> binary, like `lxlc src -o out`
+    build_lxl(src, out, ...)  lxl -> binary: native by default, or C through the cache
     cc_build(csrc, cmd, out)  C text -> binary; cmd uses '@SRC@' and '@OUT@' placeholders
 
-The key is the hash of the C text (rt.h is embedded in it), the exact C compiler command
-and the compiler's version string. A hit hard-links (or copies) the cached binary to
-`out`; a miss builds into a temporary file in the cache and renames it (atomic, so
-parallel runners are safe). Cached binaries are read-only (0555): a hit's `out` is the
-same file, so writing into `out` in place (`cp new out`, say) would change the cache
-entry and every other checkout linked to it; read-only, that write fails instead.
-`private=True` gives `out` its own copy, for a file people replace by hand. The cache is $LXL_CACHE or ~/.cache/lxl-build and is trimmed
-to $LXL_CACHE_MB (default 2000) megabytes, oldest use first. LXL_NOCACHE=1 disables it:
-build_lxl then runs lxlc -o as before, and cc_build compiles every time.
-Compile errors from lxlc produce no C and are never cached.
+Native is the default: build_lxl runs `lxlc src -o out`. `LXL_CC=1` (or
+`LXL_CACHE=1`, or `LXL_CACHE=/dir`) builds through the C backend
+(`lxlc --emit-c-json`) and enables the cache; `LXL_NOCACHE=1` forces native.
+`build_lxl(..., backend='c')` forces the C side for a runner that must compare
+it; `backend='native'` forces native.
+
+The cache's key is the hash of the C text (rt.h is embedded in it), the exact C
+compiler command and the compiler's version string. A hit hard-links (or copies)
+the cached binary to `out`; a miss builds into a temporary file in the cache and
+renames it (atomic, so parallel runners are safe). Cached binaries are read-only
+(0555): a hit's `out` is the same file, so writing into `out` in place (`cp new
+out`, say) would change the cache entry and every other checkout linked to it;
+read-only, that write fails instead. `private=True` gives `out` its own copy,
+for a file people replace by hand. `LXL_CACHE` names the directory
+(`~/.cache/lxl-build` by default); `LXL_CACHE=1` uses the default. It is trimmed
+to `LXL_CACHE_MB` (default 2000) megabytes, oldest use first. Compile errors
+from lxlc produce no C and are never cached.
 
 The compiler is $LXLC, else compiler/out/lxlc (built from the C seed by compiler/build.sh).
 """
@@ -32,14 +39,26 @@ def lxlc_argv(lxlc=None):
     return [sys.executable, lxlc] if lxlc.endswith('.py') else [lxlc]
 
 
+def _truthy(name):
+    return os.environ.get(name, '').strip().lower() in ('1', 'true', 'on', 'yes')
+
+
 def enabled():
-    return os.environ.get('LXL_NOCACHE', '') in ('', '0')
+    """The C backend and its cache: LXL_CC=1 or LXL_CACHE, unless LXL_NOCACHE=1."""
+    if _truthy('LXL_NOCACHE'):
+        return False
+    if _truthy('LXL_CC'):
+        return True
+    v = os.environ.get('LXL_CACHE', '').strip().lower()
+    return v not in ('', '0', 'false', 'off', 'no')
 
 
 def cache_dir():
-    d = os.environ.get('LXL_CACHE') or os.path.expanduser('~/.cache/lxl-build')
-    os.makedirs(d, exist_ok=True)
-    return d
+    v = os.environ.get('LXL_CACHE', '').strip()
+    if v.lower() in ('', '1', 'true', 'on', 'yes', '0', 'false', 'off', 'no'):
+        v = os.path.expanduser('~/.cache/lxl-build')
+    os.makedirs(v, exist_ok=True)
+    return v
 
 
 @functools.lru_cache(maxsize=None)
@@ -123,11 +142,13 @@ def cc_build(csrc, cmd, out, timeout=None, private=False):
     return 0, ''
 
 
-def build_lxl(src, out, extra_args=(), cflags=(), lxlc=None, cwd=None, timeout=None):
+def build_lxl(src, out, extra_args=(), cflags=(), lxlc=None, cwd=None, timeout=None, backend=None):
     """Like `lxlc src -o out [extra_args]`: returns (returncode, stdout, stderr).
-    cflags go before -o (they are part of the key)."""
+    Native by default; backend="c" or LXL_CC/LXL_CACHE builds through C and its
+    cache. cflags force the C backend and go before -o (they are part of the key)."""
     py = lxlc_argv(lxlc)
-    if not enabled() and not cflags:
+    use_c = (backend == 'c') if backend is not None else (enabled() or bool(cflags))
+    if not use_c:
         r = subprocess.run(py + [src, '-o', out, *extra_args], capture_output=True, text=True,
                            errors='replace', timeout=timeout, cwd=cwd)
         return r.returncode, r.stdout, r.stderr

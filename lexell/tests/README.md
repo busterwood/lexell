@@ -88,12 +88,13 @@ captures), many ending in a bounds or overflow trap: a check of the native loop 
 compiler, outside the gates: every mutant of a test program must compile or be rejected
 with one `file:line: message`, never crash or leak.
 
-Every runner that builds a binary goes through `lexell/tools/cbuild.py`: lxlc emits the
-C (`--emit-c-json`), and the binary is cached under the hash of the C text (rt.h is part
-of it), the exact C compiler command and the compiler's version. A test that did not
-change in C is not compiled again. The cache is `$LXL_CACHE` (default
-`~/.cache/lexell-build`), trimmed to `$LXL_CACHE_MB` (default 2000) MB; `LXL_NOCACHE=1`
-turns it off. Compile errors produce no C and are never cached.
+Every runner that builds a binary goes through `lexell/tools/cbuild.py`. Native is the
+default: lxlc builds the binary directly. `LXL_CC=1` (or `LXL_CACHE=1`) builds through
+the C backend (`lxlc --emit-c-json`) and enables the cache; `LXL_NOCACHE=1` forces
+native. The cache is `$LXL_CACHE` (default `~/.cache/lxl-build`; `LXL_CACHE=1`
+uses the default), trimmed to `$LXL_CACHE_MB` (default 2000) MB; a test that did
+not change in C is not compiled again. Compile errors produce no C and are
+never cached.
 
 `LXLC` chooses the compiler for every runner: `lexell/compiler/out/lxlc` by default, or
 another build, e.g. `LXLC=/tmp/lxlc python3 lexell/tests/run.py`. The gate's first step

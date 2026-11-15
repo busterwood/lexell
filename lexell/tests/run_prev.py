@@ -40,7 +40,7 @@ def build(lxlc, path, exe, native, cwd):
             r = subprocess.run([lxlc, path, '--native', '-o', exe], capture_output=True, timeout=120, cwd=cwd)
             res = (r.returncode, r.stdout, r.stderr)
         else:
-            rc, out, err = cbuild.build_lxl(path, exe, lxlc=lxlc, timeout=120, cwd=cwd)
+            rc, out, err = cbuild.build_lxl(path, exe, lxlc=lxlc, timeout=120, cwd=cwd, backend='c')
             res = (rc, out.encode(), err.encode())
     except subprocess.TimeoutExpired:
         res = ('timeout', b'', b'')

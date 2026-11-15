@@ -108,7 +108,7 @@ def run_test(kind, path, compiler):
     with tempfile.TemporaryDirectory(prefix='lxltest_') as tmp:
         out = os.path.join(tmp, 'out')
         try:
-            # cached builds through --emit-c-json (tools/cbuild.py)
+            # native by default; LXL_CC=1 builds through C and the cache (tools/cbuild.py)
             c = subprocess.CompletedProcess([], *cbuild.build_lxl(
                 path, out, lxlc=os.path.abspath(compiler), timeout=COMPILE_TIMEOUT, cwd=tmp))
         except subprocess.TimeoutExpired:

@@ -201,8 +201,9 @@ in parallel once the port is stable. Phases 6–8 are sequential.
 
 ## 9. Gates
 
-The machine is shared with benchmarks, so gates are targeted and
-interleaved:
+Tests build natively by default; `LXL_CC=1` opts into the C-backed compile
+cache when a C build is wanted. The machine is shared with benchmarks, so
+gates are targeted and interleaved:
 
 - storage: `store_ckptcut`, `follow_basic`, `follow_covers`,
   `exec_replica`, `replica.py`;
