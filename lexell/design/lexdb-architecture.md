@@ -311,10 +311,32 @@ the performance gate at each phase boundary.
 ## 11. Open decisions
 
 - Is `SET lexdb_batch=off` still user-facing, or test-only after the split?
-- Universal column leaves, or an explicit per-table row option for
-  point-read-heavy tables?
-- Does `lexdb_catalog` earn its own module, or does it live inside Plan/Exec?
 - How much of the `Dialect` facade is needed before Oracle/Postgres
   differences stop being normalisable?
 - Do we keep the SQL Server client (`lib/sqlserver` / `lib/tds`) on a
   separate dependency line from the server dialect? (Yes, but state it.)
+
+Resolved since this note was written: table leaves are always column
+leaves (`C_ANY` is the escape hatch; `setColumns(false)` is only a test
+hook), and `lexdb_catalog` earned its own module (types, CatView, ACLs and
+pure metadata helpers).
+
+## 12. Compatibility
+
+The format changes on this branch are deliberate; there is no dual-read or
+dual-write mode.
+
+- **Read:** front-coded (`T_FLEAF`) and column (`T_CLEAF`) leaves, the
+  runs free-page list, and the current meta page. `T_LEAF` pages are
+  refused. Rows in pre-9.113 layouts or the pre-9.115 time-tagged form are
+  not converted; see the known limits in
+  [lexdb-switches.md](lexdb-switches.md) for the one ambiguous time-first
+  case.
+- **Write:** a table leaf the typed columns cannot take is a `C_ANY`
+  column (codec 8), and the meta page's old flat-free slot at 48 is
+  reserved zero. Checkpoints write runs only.
+- **Downgrade:** unsupported. An older binary sees the same file magic and
+  opens the directory, but it does not know `C_ANY` (a read of such a leaf
+  fails) and it does not know the runs-only free list (free pages leak).
+  Use the new binary from then on; to keep an old directory, run the old
+  binary first to export or rebuild it, or start fresh.
