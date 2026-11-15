@@ -10142,6 +10142,37 @@ fn semiCheaper(outer: float, inner: float, pk: bool): bool {
     return inner * (COST_SCAN + HASH_BUILD) + outer * HASH_PROBE < outer * (run + COST_DESCENT + COST_KEY_ROW)
 }
 
+// Reads a subquery's tables only the columns its output and its conditions
+// name. Planned before it was unhashed, a semi-join's subquery still said
+// "select *": its scan then fetched every column (q4/q21's lineitem) though
+// the keys were all the join needed.
+fn narrowSub(sel: mut &Sel) {
+    // a window, a lock or a set-returning function reads columns its own
+    // code names; those queries keep every column
+    if len(sel.wins) > 0 || len(sel.locks) > 0 || len(sel.srf) > 0 { return }
+    var xs: []str = []
+    for x in sel.exprs { colNames(&x, mut &xs) }
+    for g in sel.groupBy { colNames(&g, mut &xs) }
+    match sel.having { Some(x) { colNames(&x, mut &xs) } None {} }
+    for x in sel.order { colNames(&x, mut &xs) }
+    for x in sel.q.top { colNames(&x, mut &xs) }
+    for k in 0..len(sel.q.levels) {
+        let lv = &sel.q.levels[k]
+        for x in lv.cond { colNames(&x, mut &xs) }
+        for x in lv.post { colNames(&x, mut &xs) }
+        for x in lv.local { colNames(&x, mut &xs) }
+        for x in lv.hashVals { colNames(&x, mut &xs) }
+    }
+    var names: Map[str, int] = newMap()
+    for x in xs { if !names.has(&colPart(&x)) { names.put(colPart(&x), 1) } }
+    for k in 0..len(sel.q.levels) {
+        if sel.q.levels[k].virt() { continue }
+        var need: []bool = []
+        for c in sel.q.levels[k].t.cols { append(mut &need, names.has(&c.name)) }
+        sel.q.levels[k].need = need
+    }
+}
+
 // The semi-join level of conjunct c (subquery i) of q, or None: c stays.
 // kind: IN's collation kind (resolve's); outer: about the rows reaching it.
 fn semiLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query, c: &Expr, i: int, kind: int, pt: &[]int,
@@ -10288,6 +10319,7 @@ fn semiLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query, c
     q.subs[i].semi = true
     // run whole, once: not stopping at its first row (EXISTS)
     if len(q.subs[i].sel.q.levels) > 0 { q.subs[i].sel.q.levels[0].stops = false }
+    narrowSub(mut &q.subs[i].sel)
     return Ok(Some(lv))
 }
 
