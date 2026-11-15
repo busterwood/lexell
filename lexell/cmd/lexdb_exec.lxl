@@ -27992,25 +27992,6 @@ pub fn (s: &Session) number(): int { return s.id }
 // The session's user, from its startup message.
 pub fn (s: &Session) user(): str { return s.st.memoGet(&userKey(s.id)).unwrapOr("lexdb") }
 
-fn visibleIn(path: &[]str, schema: &str): bool {
-    if schema == "pg_catalog" { return true }
-    if len(path) == 0 { return schema == "public" }
-    for p in path { if p == schema { return true } }
-    return false
-}
-
-fn shownIn(path: &[]str, schema: &str, name: &str): str {
-    if visibleIn(path, schema) { return quoteIfNeeded(name) }
-    return quoteIfNeeded(schema) + "." + quoteIfNeeded(name)
-}
-
-// shownIn, a name a temporary relation hides (tnames, 9.96) qualified;
-// spelt, the name as written (L6).
-fn shownBy(path: &[]str, tnames: &[]str, schema: &str, name: &str, spelt: &str): str {
-    if len(tnames) > 0 && !lexdb_base.isTempSchema(schema) && hasStr(tnames, name) { return quoteIfNeeded(schema) + "." + quoteIfNeeded(spelt) }
-    return shownIn(path, schema, spelt)
-}
-
 fn colNum(t: &Table, name: &str): int {
     for i in 0..len(t.cols) { if t.cols[i].name == name { return i + 1 } }
     return 0
@@ -28076,7 +28057,7 @@ fn colList(t: &Table, nums: &[]int): str {
 fn defaultText(snap: &CatSnap, c: &lexdb_sql.ColDef): Option[str] {
     if c.identity == lexdb_sql.ID_ALWAYS || c.identity == lexdb_sql.ID_BY_DEFAULT { return None }
     if c.identity == lexdb_sql.ID_SERIAL && len(c.seq) > 0 {
-        return Some("nextval('" + shownIn(&snap.path, &lexdb_sql.schemaOf(&c.seq), &lexdb_sql.baseName(&c.seq)) + "'::regclass)")
+        return Some("nextval('" + lexdb_pg.shownIn(&snap.path, &lexdb_sql.schemaOf(&c.seq), &lexdb_sql.baseName(&c.seq)) + "'::regclass)")
     }
     match c.def {
         Some(d) { return Some(lexdb_pg.exprText(&d, &Some(c.typ))) }
@@ -28130,7 +28111,7 @@ fn catSnap(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[CatSnap, D
         let spelt = if len(t.spell) > 0 { t.spell } else { name }      // as written (L6)
         if len(t.view) > 0 {
             append(mut &snap.views, CatTab{key: keys[i], t: t, oid: catOid(&"r", &keys[i]), schema: schema, name: name,
-                                           shown: shownBy(&txn.path, &tnames, &schema, &name, &spelt), idxs: []})
+                                           shown: lexdb_pg.shownBy(&txn.path, &tnames, &schema, &name, &spelt), idxs: []})
             continue
         }
         var idxs: []CatIdx = []
@@ -28154,7 +28135,7 @@ fn catSnap(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[CatSnap, D
                                      primary: false, con: ix.con, pred: cloneOptE(&ix.pred), opts: copyStrs(&ix.opts), exprs: xs})
         }
         append(mut &snap.tabs, CatTab{key: keys[i], t: t, oid: catOid(&"r", &keys[i]), schema: schema, name: name,
-                                      shown: shownBy(&txn.path, &tnames, &schema, &name, &spelt), idxs: idxs})
+                                      shown: lexdb_pg.shownBy(&txn.path, &tnames, &schema, &name, &spelt), idxs: idxs})
     }
     // the constraints, now that every table's OID is known
     var cons: []CatCon = []
@@ -28296,7 +28277,7 @@ fn bindCatalog(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[Unit, 
             for x in ct.t.indexes { if lexdb_sql.baseName(&x.name) == ix.name { b.add(&("z\t" + ix.oid.toStr() + "\ti\t" + x.tree.toStr() + "\n")) } }
         }
         for ix in ct.idxs {
-            b.add(&("r\t" + ix.oid.toStr() + "\t" + shownIn(&snap.path, &ct.schema, &ix.name) + "\t" + ct.schema + "\t" + ix.name + "\n"))
+            b.add(&("r\t" + ix.oid.toStr() + "\t" + lexdb_pg.shownIn(&snap.path, &ct.schema, &ix.name) + "\t" + ct.schema + "\t" + ix.name + "\n"))
             var cols: []str = []
             for c in ix.cols { append(mut &cols, if c >= 1 && c <= len(ct.t.cols) { ct.t.cols[c - 1].name } else { "" }) }
             b.add(&("x\t" + ix.oid.toStr() + "\t" + clean(&idxDef(&ct, &ix)) + "\t" + strings.join(&cols, "\x1e") + "\t" + clean(&idxDefOn(&ct, &ix, &ct.shown, true)) + "\n"))
@@ -28315,20 +28296,20 @@ fn bindCatalog(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[Unit, 
     for en in snap.enums {
         let sc = lexdb_sql.schemaOf(&en.key)
         let nm = lexdb_sql.baseName(&en.key)
-        b.add(&("e\t" + en.oid.toStr() + "\t" + shownIn(&snap.path, &sc, &nm) + "\n"))
+        b.add(&("e\t" + en.oid.toStr() + "\t" + lexdb_pg.shownIn(&snap.path, &sc, &nm) + "\n"))
     }
     for d in snap.seqs {
         let sc = lexdb_sql.schemaOf(&d.key)
         let nm = lexdb_sql.baseName(&d.key)
         b.add(&("z\t" + seqOid(&d).toStr() + "\tS\t\n"))
-        b.add(&("r\t" + seqOid(&d).toStr() + "\t" + shownIn(&snap.path, &sc, &nm) + "\t" + sc + "\t" + nm + "\n"))
+        b.add(&("r\t" + seqOid(&d).toStr() + "\t" + lexdb_pg.shownIn(&snap.path, &sc, &nm) + "\t" + sc + "\t" + nm + "\n"))
     }
     for r in lexdb_pgcat.relNames() {
         let dot = strings.indexOf(&r, ".", 0)
         let sc = if dot < 0 { "pg_catalog" } else { r[0..dot] }
         let nm = if dot < 0 { r } else { r[dot + 1..len(r)] }
         b.add(&("r\t" + (if dot < 0 { sysRelOid(&r) } else { catOid(&"r", &(sc + "\x1f" + nm)) }).toStr() + "\t" +
-              shownIn(&snap.path, &sc, &nm) + "\t" + sc + "\t" + nm + "\n"))
+              lexdb_pg.shownIn(&snap.path, &sc, &nm) + "\t" + sc + "\t" + nm + "\n"))
     }
     for c in snap.cons { b.add(&("c\t" + c.oid.toStr() + "\t" + clean(&c.def) + "\n")) }
     sysBind(&snap, mut &b)
