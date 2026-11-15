@@ -38,7 +38,7 @@ No new runtime flag without a named seam and a deletion phase.
 | `legacyTimeRows`, `timeTagged` | pre-9.115 tagged-time rows | delete | — | 2 |
 | flat free list in the meta page | pre-runs free encoding | delete | runs only | 4 |
 | `st.fo` | live vs follower read view | seam | `ReadView` (batch-level) | 3 |
-| `scanLeaves` returning false on a follower | leaf representation leaking to exec | done for batch scans | `LeafView` + `scanLeavesMerged`; one `ReadView` selection remains | 3 |
+| `scanLeaves` returning false on a follower | leaf representation leaking to exec | deleted | `LeafView` + `scanLeavesMerged`; one `ReadView` selection remains | 3 |
 | `rs.batch` / `Run.batch` | master switch for batches, compiled expressions, outputs, typed sort | seam | `ExecStrategy`; compiled/typed always on | split 1, seam 6 |
 | `lexdb_planner` / `Session.rules` | rules vs cost planner | seam | `CostModel`; rules as no-stats fallback/test | 9 |
 | `ckptLocked` / `CUT_TRIES` | checkpoint cut vs whole-under-`with` fallback | fallback | cut-only, with a retry; delete locked | 4 |
@@ -93,7 +93,7 @@ and `lexdb_planner` are next.
 |---|---|---|
 | 1 | `LEXDB_ROWFMT` (done); move dead test hooks to the test build; keep the tagged writer as the overflow form for now | suite subset, targeted native tests |
 | 2 | `T_LEAF`, old layouts, tagged row as a general format (replaced by `C_ANY`/`C_STUB`), mixed-layout leaves, row-leaf table fallback, `setUpgradeBudget` / upgrade queue | `cols_codec`, `exec_cols`, `exec_upgrade`, `exec_rowfmt`, byte-exact checks |
-| 3 | `st.fo` branches, push/poll duplication (`scanLeaves`' follower path is done) | `follow_basic`, `follow_covers`, `exec_replica`, `replica.py` |
+| 3 | `st.fo` branches, push/poll duplication (`scanLeaves`' follower path is done; it no longer returns false) | `follow_basic`, `follow_covers`, `exec_replica`, `replica.py` |
 | 4 | `ckptLocked` / `CUT_TRIES` fallback; decide `CUT_POOL`; flat free list | `store_ckptcut` (including cancelled snapshot, real disk, pool) |
 | 6 | `rs.batch` master switch, old row SELECT operators or test-only | `exec_batch*`, EXPLAIN counts |
 | 9 | `lexdb_planner` production mode if cost covers no-stats | `exec_joincost`, `exec_joinorder`, `exec_switch` |

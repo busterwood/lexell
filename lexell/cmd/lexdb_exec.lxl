@@ -8661,18 +8661,10 @@ fn switchMost(rules: bool, n: int): int {
 // The table's rows, counted until there are more than most.
 fn countRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, most: int): Result[int, DbErr] {
     var n = 0
-    let done = try st.scanLeaves(txn, t.tree, "", "", fn(leaf: &lexdb_rows.LeafView, i: int, j: int): bool {
+    try st.scanLeaves(txn, t.tree, "", "", fn(leaf: &lexdb_rows.LeafView, i: int, j: int): bool {
         n += j - i
         return n <= most
     })
-    if !done {
-        // the transaction's own writes in the table (or a replica): entry by entry
-        n = 0
-        try st.scan(txn, t.tree, "", "", fn(en: &lexdb_store.Entry): bool {
-            n += 1
-            return n <= most
-        })
-    }
     return Ok(n)
 }
 
@@ -24275,13 +24267,6 @@ fn emptyBPlan(): BPlan { return lexdb_rows.emptyProjection() }
 
 fn newBatch(bp: &BPlan, cap: int): Batch { return lexdb_rows.newBatch(bp, cap) }
 
-// Decodes stored row s into row r of b (0 done, 1 not of the column's
-// kind, 2 stored apart), as lexdb_rows.decodeRow.
-fn bRowInto(s: &str, r: int, b: mut &Batch, bp: &BPlan, t: &Table): Result[int, DbErr] {
-    let rw = rowsFor(t)
-    return lexdb_rows.decodeRow(s, r, b, bp, &rw)
-}
-
 // A row read whole by the row path (a value stored apart) into row r of b;
 // false: a value of a kind its column's batch does not hold.
 fn bRowOf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, key: &str, v: &str, r: int, b: mut &Batch,
@@ -24293,97 +24278,36 @@ fn bRowOf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, key: &st
     return Ok(true)
 }
 
-// Up to BROWS rows of a scan decoded as they are read: the transaction's
-// own writes merged (scan/scanPart), a replica's base and delta, or a stored
-// value read whole (a stub) decoded after the scan. None: a value of a
-// kind its column's batch does not hold.
-fn fillScan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, sc: &Scan, part: bool,
-            cur: mut &Cursor, bp: &BPlan): Result[Option[Batch], DbErr] {
+// An empty range or a key lookup as a batch: a stored value read whole
+// (a stub) is decoded by the row path. None: a value of a kind its
+// column's batch does not hold.
+fn fillPoint(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, sc: &Scan, part: bool,
+             cur: mut &Cursor, bp: &BPlan): Result[Option[Batch], DbErr] {
     let rw = rowsFor(t)
-    if sc.empty {
-        cur.done = true
-        return Ok(Some(lexdb_rows.newBatch(bp, 0)))
-    }
-    if sc.point {
-        cur.done = true
-        var b = lexdb_rows.newBatch(bp, 1)
-        let got = if part { try st.getPart(txn, t.tree, &sc.lo) } else { try st.get(txn, t.tree, &sc.lo) }
-        match got {
-            Some(v) {
-                let code = try lexdb_rows.decodeRow(&v, 0, mut &b, bp, &rw)
-                if code == 1 { return Ok(None) }
-                if code == 2 && !(try bRowOf(st, txn, t, &sc.lo, &v, 0, mut &b, bp)) { return Ok(None) }
-                b.n = 1
-            }
-            None {}
+    cur.done = true
+    if sc.empty { return Ok(Some(lexdb_rows.newBatch(bp, 0))) }
+    var b = lexdb_rows.newBatch(bp, 1)
+    let got = if part { try st.getPart(txn, t.tree, &sc.lo) } else { try st.get(txn, t.tree, &sc.lo) }
+    match got {
+        Some(v) {
+            let code = try lexdb_rows.decodeRow(&v, 0, mut &b, bp, &rw)
+            if code == 1 { return Ok(None) }
+            if code == 2 && !(try bRowOf(st, txn, t, &sc.lo, &v, 0, mut &b, bp)) { return Ok(None) }
+            b.n = 1
         }
-        return Ok(Some(b))
+        None {}
     }
-    var b = lexdb_rows.newBatch(bp, BROWS)
-    let from = if cur.started { cur.at } else { sc.lo }
-    cur.started = true
-    var last = ""
-    var full = false
-    var bail = false
-    var bad: []DbErr = []
-    var pend: []int = []                // rows stored apart: decoded after the scan
-    var pkeys: []str = []
-    var pvals: []str = []
-    let one = fn(en: &lexdb_store.Entry, bb: mut &Batch, bp2: &BPlan, rw2: &lexdb_rows.Rows, pend2: mut &[]int,
-                 pkeys2: mut &[]str, pvals2: mut &[]str, bail2: mut &bool, bad2: mut &[]DbErr, last2: mut &str,
-                 full2: mut &bool): bool {
-        match lexdb_rows.decodeRow(&en.val, bb.n, bb, bp2, rw2) {
-            Ok(code) {
-                if code == 0 {
-                    bb.n += 1
-                } else if code == 1 {
-                    bail2 = true
-                    return false
-                } else {
-                    append(pend2, bb.n)
-                    append(pkeys2, en.key)
-                    append(pvals2, en.val)
-                    bb.n += 1
-                }
-            }
-            Err(x) {
-                append(bad2, x)
-                return false
-            }
-        }
-        last2 = en.key
-        if bb.n >= BROWS {
-            full2 = true
-            return false
-        }
-        return true
-    }
-    if part {
-        try st.scanPart(txn, t.tree, &from, &sc.hi, fn(en: &lexdb_store.Entry): bool {
-            return one(en, mut &b, bp, &rw, mut &pend, mut &pkeys, mut &pvals, mut &bail, mut &bad, mut &last, mut &full)
-        })
-    } else {
-        try st.scan(txn, t.tree, &from, &sc.hi, fn(en: &lexdb_store.Entry): bool {
-            return one(en, mut &b, bp, &rw, mut &pend, mut &pkeys, mut &pvals, mut &bail, mut &bad, mut &last, mut &full)
-        })
-    }
-    if len(bad) > 0 { return Err(bad[0]) }
-    if bail { return Ok(None) }
-    for i in 0..len(pend) {
-        if !(try bRowOf(st, txn, t, &pkeys[i], &pvals[i], pend[i], mut &b, bp)) { return Ok(None) }
-    }
-    if full { cur.at = after(&last) } else { cur.done = true }
     return Ok(Some(b))
 }
 
 // The next batch of a scan, its rows decoded from the leaves in place
 // (lexdb_store.scanLeaves: no entry copied out); None: a value of a kind
-// its column's batch does not hold. A key lookup, and a scan whose range
-// the transaction has written or a replica's scan, go through fillScan
-// (scan merges those writes); a value stored apart is read by the row path.
+// its column's batch does not hold. A key lookup or an empty range goes
+// through fillPoint; scanLeaves gives a replica's rows and the
+// transaction's own writes and cuts as one path too.
 fn fillBatch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, sc: &Scan, part: bool, cur: mut &Cursor,
              bp: &BPlan): Result[Option[Batch], DbErr] {
-    if sc.empty || sc.point { return fillScan(st, txn, t, sc, part, cur, bp) }
+    if sc.empty || sc.point { return fillPoint(st, txn, t, sc, part, cur, bp) }
     var b = lexdb_rows.newBatch(bp, BROWS)
     let rw = rowsFor(t)
     while b.n < BROWS && !cur.done {
@@ -24393,7 +24317,7 @@ fn fillBatch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, sc: &
         var stop = 0                // 1 the batch is full, 2 a value stored apart
         var bail = false
         var bad: []DbErr = []
-        let inPlace = try st.scanLeaves(txn, t.tree, &from, sc.hi, fn(leaf: &lexdb_rows.LeafView, i: int, j: int): bool {
+        try st.scanLeaves(txn, t.tree, &from, sc.hi, fn(leaf: &lexdb_rows.LeafView, i: int, j: int): bool {
             if len(bp.ranges) > 0 && leaf.isCols && lexdb_rows.excluded(leaf, bp, &rw) { return true }
             var k = i
             while k < j {
@@ -24444,13 +24368,7 @@ fn fillBatch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, sc: &
         })
         if len(bad) > 0 { return Err(bad[0]) }
         if bail { return Ok(None) }
-        if !inPlace {
-            // the transaction's own writes in the range: copied and merged
-            cur.at = from
-            if b.n > 0 { return Ok(Some(b)) }
-            return fillScan(st, txn, t, sc, part, cur, bp)
-        }
-        if stop == 1 {
+                if stop == 1 {
             cur.at = stopKey
             return Ok(Some(b))
         }
@@ -24568,7 +24486,7 @@ fn lazyOf(bp: &BPlan, t: &Table, conds: &[]BNode, extra: int): Lazy {
                 bf: bf, br: br}
 }
 
-// bp reading places ps only, as a tagged row is read (bRowInto): its
+// bp reading places ps only, as a tagged row is read (decodeRow): its
 // placeCol those places' (-1 the others), stopAt the last one's end.
 fn placesOnly(bp: &BPlan, ps: &[]int): BPlan {
     var pc: []int = array(len(bp.placeCol), -1)
@@ -24585,7 +24503,7 @@ fn placesOnly(bp: &BPlan, ps: &[]int): BPlan {
                  missing: copyRow(&bp.missing), needP: np, width: bp.width, ranges: []}
 }
 
-// Whether stored row s is a tagged one (bRowInto's last way): not in the
+// Whether stored row s is a tagged one (decodeRow's last way): not in the
 // fixed layout, not stored apart, not one with long texts kept whole.
 fn plainTagged(s: &str): bool {
     if len(s) > 0 && (s[0] == FIXED || s[0] == 6 || s[0] == 0xFF) { return false }
@@ -24962,7 +24880,7 @@ fn fillPickIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, sc: 
         var stop = 0                // 1 the batch is full, 2 a value stored apart
         var bail = false
         var bad: []DbErr = []
-        let inPlace = try st.scanLeaves(txn, t.tree, &from, sc.hi, fn(leaf: &lexdb_rows.LeafView, i: int, j: int): bool {
+        try st.scanLeaves(txn, t.tree, &from, sc.hi, fn(leaf: &lexdb_rows.LeafView, i: int, j: int): bool {
             if len(bp.ranges) > 0 && leaf.isCols && lexdb_rows.excluded(leaf, bp, &rw) { return true }
             var k = i
             while k < j {
@@ -25030,19 +24948,7 @@ fn fillPickIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, sc: 
         })
         if len(bad) > 0 { return Err(bad[0]) }
         if bail { return Ok(None) }
-        if !inPlace {
-            // the transaction's own writes in the range: copied and merged
-            cur.at = from
-            if b.n > 0 { break }
-            let got = try fillScan(st, txn, t, sc, part, cur, bp)
-            if got.isNone() { return Ok(None) }
-            let b2 = got.unwrap()
-            let ch = bChoose(conds, &b2)
-            if ch.isNone() { return Ok(None) }
-            let idx2 = ch.unwrap()
-            return Ok(Some(Picked{kept: len(idx2), idx: idx2, b: b2}))
-        }
-        if stop == 1 {
+                if stop == 1 {
             cur.at = stopKey
             break
         }
@@ -25753,7 +25659,7 @@ fn lookupPath(q: &Query, lv: &Level): bool {
 // row (9.103): each row's key made as the row path makes it (pathScan:
 // keyVal, encPart), its row read as fetch reads it (get, or getPart when
 // only some columns are used: noted as read the same way), decoded into
-// columns (bRowInto); then as a hash's candidates (bJoinTail). None: a key
+// columns (decodeRow); then as a hash's candidates (bJoinTail). None: a key
 // gives an error, or a value its column's batch cannot hold.
 // The batch's keys are read at once (getMany, 9.107): each from the leaf
 // of the one before, not from the root. Unless the transaction's reads
@@ -25863,12 +25769,13 @@ fn bLookup(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, jp: &JP
     var got: []Option[str] = withCapacity(len(ks))
     try st.getMany(txn, t.tree, &ks, part, mut &got)
     // each row read decoded once, in the order read
+    let rw = rowsFor(t)
     var rows = lexdb_rows.newBatch(&bp, len(ks))
     var at: []int = array(len(ks), -1)        // per key read: its row in rows
     for x in 0..len(ks) {
         match got[x] {
             Some(v) {
-                let code = try bRowInto(&v, rows.n, mut &rows, &bp, t)
+                let code = try lexdb_rows.decodeRow(&v, rows.n, mut &rows, &bp, &rw)
                 if code == 1 { return Ok(None) }
                 if code == 2 && !(try bRowOf(st, txn, t, &ks[x], &v, rows.n, mut &rows, &bp)) { return Ok(None) }
                 at[x] = rows.n
@@ -26230,7 +26137,7 @@ fn fillIdxOnly(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, rd:
         cur.started = true
         var stopKey = ""
         var full = false
-        let inPlace = try st.scanLeaves(txn, tree, &from, sc.hi, fn(leaf: &lexdb_rows.LeafView, i: int, j: int): bool {
+        try st.scanLeaves(txn, tree, &from, sc.hi, fn(leaf: &lexdb_rows.LeafView, i: int, j: int): bool {
             var k = i
             while k < j {
                 if b.n == BROWS {
@@ -26248,25 +26155,7 @@ fn fillIdxOnly(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, rd:
             return true
         })
         if bail { return Ok(None) }
-        if !inPlace {
-            // the transaction's own writes in the range: copied and merged
-            cur.at = from
-            if b.n > 0 { return Ok(Some(b)) }
-            var last = ""
-            try st.scan(txn, tree, &from, &sc.hi, fn(en: &lexdb_store.Entry): bool {
-                if !bIdxInto(&en.key, b.n, mut &b, bp, &rd.dec) {
-                    bail = true
-                    return false
-                }
-                b.n += 1
-                last = en.key
-                return b.n < BROWS
-            })
-            if bail { return Ok(None) }
-            if b.n < BROWS { cur.done = true } else { cur.at = after(&last) }
-            return Ok(Some(b))
-        }
-        if full {
+                if full {
             cur.at = stopKey
             return Ok(Some(b))
         }
@@ -26302,7 +26191,7 @@ fn fillIdxRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, rd:
             cur.started = true
             var stopKey = ""
             var full = false
-            let inPlace = try st.scanLeaves(txn, tree, &from, sc.hi, fn(leaf: &lexdb_rows.LeafView, i: int, j: int): bool {
+            try st.scanLeaves(txn, tree, &from, sc.hi, fn(leaf: &lexdb_rows.LeafView, i: int, j: int): bool {
                 var k = i
                 while k < j {
                     if len(pks) == BROWS {
@@ -26315,19 +26204,7 @@ fn fillIdxRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, rd:
                 }
                 return true
             })
-            if !inPlace {
-                cur.at = from
-                if len(pks) > 0 { break }
-                var last = ""
-                try st.scan(txn, tree, &from, &sc.hi, fn(en: &lexdb_store.Entry): bool {
-                    append(mut &pks, en.val)
-                    last = en.key
-                    return len(pks) < BROWS
-                })
-                if len(pks) < BROWS { cur.done = true } else { cur.at = after(&last) }
-                break
-            }
-            if full {
+                        if full {
                 cur.at = stopKey
                 break
             }
@@ -26345,11 +26222,12 @@ fn fillIdxRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, rd:
     for i in order { append(mut &ks, pks[i]) }
     var got: []Option[str] = withCapacity(n)
     try st.getMany(txn, t.tree, &ks, part, mut &got)
+    let rw = rowsFor(t)
     for j in 0..n {
         let r = order[j]
         match got[j] {
             Some(v) {
-                let code = try bRowInto(&v, r, mut &b, bp, t)
+                let code = try lexdb_rows.decodeRow(&v, r, mut &b, bp, &rw)
                 if code == 1 { return Ok(None) }
                 if code == 2 && !(try bRowOf(st, txn, t, &ks[j], &v, r, mut &b, bp)) { return Ok(None) }
             }
