@@ -37,6 +37,7 @@ import "./lexdb_like"
 import "./lexdb_store"
 import "./lexdb_catalog"
 import "./lexdb_sql"
+import "./lexdb_plan"
 import "./lexdb_func"
 import "./lexdb_sqlcoll"
 import "./lexdb_tsqlfn"
@@ -4587,90 +4588,35 @@ fn conjuncts(x: &Expr, out: mut &[]Expr) {
 
 
 // A conjunct "col op value" (or "value op col", turned round).
-type Bound = record { op: str; val: Expr }
 
 // A table's way in: its primary key (index -1) or one of its indexes, with
 // an equality for each of the first len(eqs) key columns, then perhaps
 // bounds on the next one. No equality and no bound is a full scan.
-type Path = record {
-    index: int
-    eqs: []Expr
-    rng: []Bound
-    desc: bool          // read backward (ORDER BY ... DESC, MAX)
-    noNulls: bool       // an index path: leave out its next column's NULLs (MIN, MAX)
-    ins: []Expr         // x IN (...) on the column after the equalities: a lookup per value
-    inSub: int          // or x IN (subquery), uncorrelated: a lookup per value it gives; -1 none
-    inArr: []Expr       // or x = ANY (array): its one expression, a lookup per element (9.28); [] none
-}
 
 // An IN subquery's values looked up one by one at most; past this many its
 // path reads the whole table instead (no row counts to choose by yet).
-const IN_LOOKUP_MAX: int = 1000
 
 // ANALYZE's statistics for a table (optimizer 20): its rows, and per index (by its
 // tree) its entries, the distinct values of each leading prefix of its
 // columns (a NULL counted as a value), and its leading column's most common
 // values (cm, optimizer 23). rows -1: none (no ANALYZE, an ANALYZE of an older table
 // of the name, or SET lexdb_planner = rules).
-type Est = record { rows: int; trees: []int; entries: []int; dist: [][]int; cm: []Common; lo: []float; hi: []float; span: []bool; samp: []str;
-                    cols: []str; cnd: []int }
 
-fn noEst(): Est { return Est{rows: -1, trees: [], entries: [], dist: [], cm: [], lo: [], hi: [], span: [], samp: [], cols: [], cnd: []} }
 
 // An index's leading column (optimizer 23): its entries, its distinct values, and its
 // most common values (their encoded index parts) with their exact counts:
 // those above the average, at most COMMON_MAX. d -1: unknown.
-type Common = record { entries: int; d: int; keys: []str; cnts: []int }
 
-fn noCommon(): Common { return Common{entries: 0, d: -1, keys: [], cnts: []} }
 
-const COMMON_MAX: int = 16
 
 // The rows expected equal to key (an encoded index part; "" unknown): its
 // count when it is a common value, else the average of the other values.
-fn rowsOf(cm: &Common, key: &str): int {
-    if cm.d <= 0 { return -1 }
-    if len(key) > 0 && len(cm.keys) > 0 {
-        let k = key.toStr()
-        var inCommon = 0
-        for j in 0..len(cm.keys) {
-            if cm.keys[j] == k { return cm.cnts[j] }
-            inCommon += cm.cnts[j]
-        }
-        let rest = cm.d - len(cm.keys)
-        if rest <= 0 { return 0 }
-        return (cm.entries - inCommon + rest - 1) / rest
-    }
-    return (cm.entries + cm.d - 1) / cm.d
-}
 
 // The rows an index path with eqs leading equalities is expected to read, the
 // first equal to key ("" unknown): with one equality, by the common values;
 // else its entries over the distinct values of that prefix. -1 unknown.
-fn (es: &Est) rowsFor(tree: int, eqs: int, key: &str): int {
-    if es.rows < 0 || eqs <= 0 { return -1 }
-    for i in 0..len(es.trees) {
-        if es.trees[i] == tree && eqs <= len(es.dist[i]) {
-            if eqs == 1 { return rowsOf(&es.cm[i], key) }
-            let d = es.dist[i][eqs - 1]
-            if d > 0 { return (es.entries[i] + d - 1) / d }
-        }
-    }
-    return -1
-}
 
 // A copy of an index's common values, for a look (optimizer 23).
-fn (es: &Est) commonOf(tree: int): Common {
-    for i in 0..len(es.trees) {
-        if es.trees[i] == tree {
-            let c = &es.cm[i]
-            var n: []int = []
-            for x in c.cnts { append(mut &n, x) }
-            return Common{entries: c.entries, d: c.d, keys: copyStrs(&c.keys), cnts: n}
-        }
-    }
-    return noCommon()
-}
 
 // The encoded index part of a constant equality value: a literal, or one of
 // the statement's parameters, coerced to the column's type. "" when it is
@@ -4715,15 +4661,10 @@ fn scaleOf(n: int): int {
 }
 
 // An index's (or the primary key's, by the table's tree) entries; -1 none.
-fn (es: &Est) entriesOf(tree: int): int {
-    for i in 0..len(es.trees) { if es.trees[i] == tree { return es.entries[i] } }
-    return -1
-}
 
 // What the statistics say a path reads (optimizer 24): rows, and whether that is an
 // estimate or only a bound (at most rows). rows -1: no figure (no
 // statistics, or an index ANALYZE has not seen).
-type Fig = record { rows: int; bound: bool }
 
 // A path's figure: its equalities' rows by the statistics, the first by its
 // value when it is constant; an IN list a lookup per value; a range, an IN
@@ -5508,7 +5449,6 @@ fn constVal(x: &Expr, params: &[]Val): Option[Val] {
 fn isCmp(op: &str): bool { return op == "=" || op == "<>" || op == "<" || op == "<=" || op == ">" || op == ">=" }
 
 // "column op value", from a comparison of a column with a constant.
-type Cmp = record { col: str; op: str; val: Val }
 
 fn asCmp(x: &Expr, params: &[]Val): Option[Cmp] {
     match x {
@@ -5572,7 +5512,6 @@ fn mentions(x: &Expr, col: &str): bool {
 // kind 0: an implication (c implies p; out 1 yes); 1: a LIMIT or OFFSET (c;
 // out its value); 2: an estimate (c a parameter equal to an index's leading
 // column of type typ, its common values cm; out the estimate's scale, optimizer 23).
-type Look = record { kind: int; c: Expr; p: Expr; out: int; typ: lexdb_sql.TypeName; cm: Common }
 
 fn noType(): lexdb_sql.TypeName { return lexdb_sql.TypeName{kind: 0, oid: 0, prec: 0, scale: 0, len: 0} }
 
@@ -5809,7 +5748,6 @@ fn keyCols(t: &Table, index: int): []int {
 // whenever the written ones do (a row where a = b and b = c are true has
 // a = c true), so the results are the same.
 
-type EqClass = record { names: []str; levels: []int; konst: []Expr }
 
 fn (q: &Query) colKind(name: &str): int {
     let i = colIndex(&q.cols, name)
@@ -5956,11 +5894,8 @@ fn (q: &Query) implied(cs: &[]Expr): []Expr {
 // 2^n). Without statistics for every table, the order bound by keys
 // (optimizer 25) stands.
 
-const JOIN_SEARCH_MAX: int = 24
 // Exact search to this many tables; past it SQLite's N-best search, keeping
 // the JOIN_BEST cheapest partial orders at each step (optimizer 28).
-const JOIN_EXACT_MAX: int = 8
-const JOIN_BEST: int = 10
 // The costs, measured (optimizer 36, design/experiments/calib.lxl, in
 // memory), in units of a row of a scan in batches (25 ns): a scan read row
 // by row (a hashed table's) 12 (307 ns); a primary key range's row, first
@@ -5982,29 +5917,17 @@ const JOIN_BEST: int = 10
 // an index range's entry and its row 584 ns, 49; a lookup by primary key
 // 436 to 648 ns, 36 to 54 (12 + 36); a row read once and hashed 757 ns, so
 // 19 for the hash over the read; a probe 18 ns (a text key's 71).
-const COST_SCAN: float = 1.0f
-const COST_SCAN_INNER: float = 44.0f
-const COST_PK_RANGE: float = 1.8f
-const COST_DESCENT: float = 12.0f
-const COST_KEY_ROW: float = 36.0f
-const COST_IX_ROW: float = 49.0f
-const HASH_PROBE: float = 2.0f
-const HASH_BUILD: float = 19.0f
-const ROW_COST: float = 2.0f
 
 // A key column's values among the conjuncts: per value, the levels it uses
 // (a bit each; 0 constants and parameters) and its key when it is a literal
 // ("" else).
-type BindCol = record { deps: []int; keys: []str }
 
 // A way into a level: its primary key (index -1) or an unfiltered index.
-type WayCand = record { index: int; tree: int; unique: bool; cols: []BindCol; colIds: []int }
 
 // Its expected rows and reads each time it is taken; outer: it uses values of
 // the levels placed. rows -1: none.
 // cost: as the first table (scanned in batches) or per lookup; inner: read
 // once as a hashed table (row by row, optimizer 36).
-type Way = record { rows: float; cost: float; outer: bool; inner: float }
 
 fn fmax(a: float, b: float): float { return if a > b { a } else { b } }
 
@@ -6388,7 +6311,6 @@ fn (q: &Query) eqShare(k: int, col: int, v: &Expr, guessed: mut &bool): float {
 // guess (a quarter). The table's rows / 10 (distinctOf's guess) made it
 // about 10 rows whatever the table's size, which the measured costs
 // (optimizer 36) turned into a full scan of the largest table (optimizer 39).
-const EQ_GUESS: float = 0.25f
 
 fn fmin(a: float, b: float): float { return if a < b { a } else { b } }
 
@@ -6565,7 +6487,6 @@ fn (q: &Query) joinStep(k: int, cands: &[]WayCand, base: &Way, mask: int, rin: f
 // A hash join's rows at most, in bytes, unless there is no lookup: a
 // quarter of the default statement memory (MAX_STATEMENT_MEM); less when
 // the session's max_statement_mem is lower (half of it).
-const HASH_MAX_BYTES: float = 67108864.0f
 
 // A row's size in a hash, estimated as rowBytes counts a row held: 32
 // bytes, 24 a value, and a text's bytes (32 taken as its length).
@@ -31199,3 +31120,39 @@ fn catSnap(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[CatSnap, D
     let naming = lexdb_pg.naming()
     return lexdb_catalog.catSnap(st, txn, lexdb_parse.parseExpr, &naming)
 }
+
+
+// ---- the planner's vocabulary (lexdb_plan; the search moves there next)
+
+pub type Path = lexdb_plan.Path
+pub type Bound = lexdb_plan.Bound
+pub type Look = lexdb_plan.Look
+pub type Cmp = lexdb_plan.Cmp
+pub type EqClass = lexdb_plan.EqClass
+pub type BindCol = lexdb_plan.BindCol
+pub type WayCand = lexdb_plan.WayCand
+pub type Way = lexdb_plan.Way
+pub type Est = lexdb_plan.Est
+pub type Common = lexdb_plan.Common
+pub type Fig = lexdb_plan.Fig
+
+const IN_LOOKUP_MAX = lexdb_plan.IN_LOOKUP_MAX
+const COMMON_MAX = lexdb_plan.COMMON_MAX
+const JOIN_SEARCH_MAX = lexdb_plan.JOIN_SEARCH_MAX
+const JOIN_EXACT_MAX = lexdb_plan.JOIN_EXACT_MAX
+const JOIN_BEST = lexdb_plan.JOIN_BEST
+const COST_SCAN = lexdb_plan.COST_SCAN
+const COST_SCAN_INNER = lexdb_plan.COST_SCAN_INNER
+const COST_PK_RANGE = lexdb_plan.COST_PK_RANGE
+const COST_DESCENT = lexdb_plan.COST_DESCENT
+const COST_KEY_ROW = lexdb_plan.COST_KEY_ROW
+const COST_IX_ROW = lexdb_plan.COST_IX_ROW
+const HASH_PROBE = lexdb_plan.HASH_PROBE
+const HASH_BUILD = lexdb_plan.HASH_BUILD
+const ROW_COST = lexdb_plan.ROW_COST
+const EQ_GUESS = lexdb_plan.EQ_GUESS
+const HASH_MAX_BYTES = lexdb_plan.HASH_MAX_BYTES
+
+fn noEst(): Est { return lexdb_plan.noEst() }
+fn noCommon(): Common { return lexdb_plan.noCommon() }
+fn rowsOf(cm: &Common, key: &str): int { return lexdb_plan.rowsOf(cm, key) }

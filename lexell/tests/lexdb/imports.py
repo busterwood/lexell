@@ -22,7 +22,7 @@ IMPORT = re.compile(r'import\s+"\./([A-Za-z0-9_]+)"')
 CORE = {
     "lexdb_base", "lexdb_catalog", "lexdb_cols", "lexdb_dialect", "lexdb_disk",
     "lexdb_exec", "lexdb_float", "lexdb_func", "lexdb_like", "lexdb_match",
-    "lexdb_page", "lexdb_parse", "lexdb_repl", "lexdb_rows", "lexdb_sql", "lexdb_sqlcoll",
+    "lexdb_page", "lexdb_parse", "lexdb_plan", "lexdb_repl", "lexdb_rows", "lexdb_sql", "lexdb_sqlcoll",
     "lexdb_store", "lexdb_time",
 }
 
