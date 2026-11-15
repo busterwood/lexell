@@ -5,7 +5,7 @@ from
     orders
 where
         o_orderdate >= '1993-07-01'
-  and o_orderdate < date '1993-07-01' + interval '3' month
+  and o_orderdate < date '1993-07-01' + interval '3 months'
   and exists (
         select
             *

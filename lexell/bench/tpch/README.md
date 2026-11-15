@@ -67,19 +67,20 @@ plan and exits without generating, starting or measuring anything.
   stopped run. Each run is a fresh psql session, so no session state or
   plan cache carries over.
 
-lexdb is deliberately **not** CPU-capped: its SQL execution is one thread,
-but checkpoint encode runs on the `par.map` pool (`LEXDB_CKPT_POOL=1` on the
-checkpoint branch) and its I/O helpers use other cores. A 100% quota would
-make the pool's threads contend for one core and measure an artificial
-server, not lexdb. PostgreSQL is capped at 4 CPUs (`CPUQuota=400%`), the
-project's 4-process rule, and gets `shared_buffers=12GB`;
-`LEXDB_CPU_QUOTA=400%` gives lexdb the same aggregate budget; add
-`LXL_PAR=3` so the pool plus the caller is four-way rather than
-oversubscribed. Report a budget-matched run separately from the uncapped
-default. lexdb's cache
-defaults to a quarter of RAM; `LEXDB_CACHE_MB` passes through, as do
-`LEXDB_CKPT_POOL` and `LXL_PAR` (systemd-run does not inherit them). Both
-are warm.
+Both servers are confined to `TPCH_CPUS` (default `0-7`), half of this
+16-thread machine, leaving the other half for everything else. They run one
+at a time, so each sees the same set. Neither is CPU-capped by default;
+`LEXDB_CPU_QUOTA` and `PG_CPU_QUOTA` add a quota on top. lexdb is
+deliberately **not** capped to one core: its SQL execution is one thread,
+but checkpoint encode runs on the `par.map` pool (`LEXDB_CKPT_POOL=1` on
+the checkpoint branch) and its I/O helpers use other cores. A 100% quota
+would make the pool's threads contend for one core and measure an
+artificial server, not lexdb. PostgreSQL gets `shared_buffers=12GB`;
+`LEXDB_CPU_QUOTA=400%` plus `LXL_PAR=3` gives lexdb the same four-way
+budget as PostgreSQL's leader + 3 workers, for a separately reported run.
+lexdb's cache defaults to a quarter of RAM; `LEXDB_CACHE_MB` passes
+through, as do `LEXDB_CKPT_POOL` and `LXL_PAR` (systemd-run does not
+inherit them). Both are warm.
 
 TPC-H is read-only: after the load there is no new log, so checkpoints are
 driven by the load rather than the queries (unless the checkpoint change
@@ -102,10 +103,11 @@ versions actually used), and `summary.md` / `summary.txt`.
 | `TPCH_DBGEN` | `WORKDIR/tpch-kit/dbgen/dbgen` | dbgen binary (or its kit directory) |
 | `TPCH_QUERIES` | all | query numbers, e.g. `3,5,15` |
 | `PG_SHARED_BUFFERS` | `12GB` | PostgreSQL `shared_buffers` |
-| `QUERY_TIMEOUT` | `900` | seconds per psql call |
+| `QUERY_TIMEOUT` | `900` | seconds per query; lexdb cancels on the server, psql gets 30 s more |
+| `TPCH_CPUS` | `0-7` | CPUs both servers are confined to; empty for none |
 | `LEXDB_CACHE_MB` | lexdb's default | passed to lexdb |
 | `LEXDB_CPU_QUOTA` | unset | lexdb's cgroup quota; `400%` budget-matches PG |
-| `PG_CPU_QUOTA` | `400%` | PostgreSQL's cgroup quota; unset for none |
+| `PG_CPU_QUOTA` | unset | PostgreSQL's cgroup quota; unset for none |
 | `LEXDB_CKPT_POOL` | lexdb's default | `1` enables the parallel checkpoint encode on the checkpoint branch |
 | `LXL_PAR` | lexdb's default | par.map threads (`0` runs the caller's thread only) |
 | `POSTGRES` | `command -v postgres` | PostgreSQL server binary |
@@ -121,6 +123,19 @@ rm -rf "$W/lexdb" "$W/lexdb.loaded"
 
 ## Caveats
 
+- One textual adaptation: the specification's queries write `interval '3'
+  month`; lexdb's parser takes the unit inside the string, so the query
+  files say `interval '3 months'`. The semantics are identical. The
+  alternative is extending lexdb's parser to PostgreSQL's trailing-unit
+  form.
+- lexdb query sessions set `max_statement_mem = 0`. The server's default
+  of 256 MB is too small for q13 and q18 at SF1; the existing load tests do
+  the same. PostgreSQL has no such setting.
+- q19 is a known optimizer stressor: at `04fa4b80` lexdb plans its
+  OR-of-three-ANDs as a full scan of `lineitem` followed by a cross join
+  against `part`, so it does not finish. `QUERY_TIMEOUT` cancels it and
+  records a failure; a first pass with 120 s is reasonable. Do not read a
+  timeout as a hardware limit.
 - Fixed parameters only. qgen varies the substitution values between runs;
   here every run is the same SQL, the usual choice for a first comparison.
 - No RF1/RF2 refresh functions. This measures the query half of TPC-H.

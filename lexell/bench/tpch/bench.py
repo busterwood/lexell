@@ -6,9 +6,14 @@
 
 Each query runs once unrecorded (the warm run), then RUNS times. The wall
 time is psql's own \\timing around the statements, so psql's start-up is
-outside it (when a query reports no time, the wall around psql is used and
-the line says so). The CPU is the server's cgroup: CPUUsageNSec of the
-systemd unit the shell started, before and after the psql call.
+outside it (if a query reports no time, the wall around psql is used). The
+CPU is the server's cgroup: CPUUsageNSec of the systemd unit the shell
+started, before and after the psql call.
+
+psql's query output goes to result.txt with \\o, so rows and the result
+checksum never include psql's timing lines or command tags; stdout carries
+only the timing. --pre runs a statement before each query, e.g. lexdb's
+SET max_statement_mem = 0.
 
 The output is one TSV line per query, no header:
 
@@ -31,29 +36,35 @@ import subprocess
 import sys
 import time
 
-TIME_RE = re.compile(r"^Time: ([0-9.]+) ms$", re.M)
+TIME_RE = re.compile(r"^Time: ([0-9.]+) ms(?: \([0-9:.]+\))?$", re.M)
 # psql prints these around a query; they are not result rows. -q suppresses
-# most command tags, but not all versions suppress all of them.
+# most command tags, but keep the filter for q15's view DDL and for old psql
+# versions.
 NOISE_RE = re.compile(
-    r"^(Time: [0-9.]+ ms|Timing is on\.|Timing is off\.|SET|RESET|"
+    r"^(Timing is on\.|Timing is off\.|SET|RESET|"
     r"CREATE VIEW|DROP VIEW|CREATE TABLE|DROP TABLE|ANALYZE|VACUUM.*)$"
 )
 
 
 def cpu_ns(unit):
-    out = subprocess.check_output(
-        ["systemctl", "--user", "show", "-p", "CPUUsageNSec", "--value", unit],
-        text=True,
-    ).strip()
-    return int(out) if out else 0
+    try:
+        out = subprocess.check_output(
+            ["systemctl", "--user", "show", "-p", "CPUUsageNSec", "--value", unit],
+            text=True,
+        ).strip()
+        return int(out) if out.isdigit() else 0
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return 0
 
 
-def parse_result(out):
-    """Rows, md5 and the largest psql-reported time in a run."""
-    times = [float(x) for x in TIME_RE.findall(out)]
-    lines = [line for line in out.splitlines() if not NOISE_RE.match(line)]
-    digest = hashlib.md5("\n".join(lines).encode()).hexdigest()
-    return len(lines), digest, (max(times) if times else None)
+def parse_result(path):
+    """Rows and md5 of the query output file (not psql's timing chatter)."""
+    try:
+        with open(path) as f:
+            lines = [line for line in f.read().splitlines() if not NOISE_RE.match(line)]
+    except FileNotFoundError:
+        return 0, hashlib.md5(b"").hexdigest()
+    return len(lines), hashlib.md5("\n".join(lines).encode()).hexdigest()
 
 
 def main():
@@ -69,6 +80,7 @@ def main():
     ap.add_argument("--runs", type=int, default=3)
     ap.add_argument("--timeout", type=float, default=900)
     ap.add_argument("--only", default="", help="query numbers, e.g. 3,5,15")
+    ap.add_argument("--pre", default="", help="SQL before each query (e.g. SET)")
     args = ap.parse_args()
 
     if args.runs < 1:
@@ -96,8 +108,11 @@ def main():
         psql, "-X", "-q", "-A", "-t", "-v", "ON_ERROR_STOP=1",
         "-h", args.host, "-p", args.port, "-U", args.user, "-d", args.db,
     ]
-    tmp = os.path.join(os.path.dirname(os.path.abspath(args.out)), "query.sql")
-    os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
+    outdir = os.path.dirname(os.path.abspath(args.out))
+    os.makedirs(outdir, exist_ok=True)
+    tmp = os.path.join(outdir, "query.sql")
+    result = "result.txt"
+    result_path = os.path.join(outdir, result)
 
     failed = 0
     out = open(args.out, "w")
@@ -109,16 +124,27 @@ def main():
             sql = f.read()
         with open(tmp, "w") as f:
             f.write("\\timing on\n")
+            if args.pre:
+                f.write(args.pre)
+                if not args.pre.endswith("\n"):
+                    f.write("\n")
+            f.write("\\o " + result + "\n")
             f.write(sql)
             if not sql.endswith("\n"):
                 f.write("\n")
+            f.write("\\o\n")
 
         def run():
+            try:
+                os.unlink(result_path)
+            except OSError:
+                pass
             return subprocess.run(
                 base + ["-f", tmp],
                 capture_output=True,
                 text=True,
                 timeout=args.timeout,
+                cwd=outdir,
             )
 
         def drop_view():
@@ -127,6 +153,7 @@ def main():
                 capture_output=True,
                 text=True,
                 timeout=args.timeout,
+                cwd=outdir,
             )
 
         def attempt():
@@ -155,8 +182,7 @@ def main():
             continue
 
         walls, cpus = [], []
-        rows = parse_result(warm.stdout)[0]
-        digest = parse_result(warm.stdout)[1]
+        rows, digest = parse_result(result_path)
         for _ in range(args.runs):
             try:
                 proc, elapsed, cpu = attempt()
@@ -166,8 +192,9 @@ def main():
             if proc.returncode != 0:
                 error = first_line(proc.stderr)
                 break
-            n, d, reported = parse_result(proc.stdout)
-            walls.append(reported if reported is not None else elapsed)
+            times = [float(x) for x in TIME_RE.findall(proc.stdout)]
+            n, d = parse_result(result_path)
+            walls.append(max(times) if times else elapsed)
             cpus.append(cpu)
             # The result must be the same on every run; keep the first
             # result's checksum and count in the line.
@@ -197,10 +224,11 @@ def main():
         out.write("%s\t%d\t0\t0\t0\t0\t0\t0\t%s\terror\n" % (name, rows, digest))
 
     out.close()
-    try:
-        os.unlink(tmp)
-    except OSError:
-        pass
+    for path in (tmp, result_path):
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
     if failed:
         print("%s: %d of %d queries failed" % (args.label, failed, len(files)),
               file=sys.stderr)

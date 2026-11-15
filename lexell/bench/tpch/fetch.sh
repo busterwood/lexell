@@ -32,7 +32,10 @@ if ! git -C "$DIR" cat-file -e "$COMMIT^{commit}" 2>/dev/null; then
 fi
 git -C "$DIR" checkout --quiet "$COMMIT"
 
-make -C "$DIR/dbgen" MACHINE=LINUX DATABASE=POSTGRESQL >/dev/null
+# gcc 14 makes the old K&R-style function-pointer initialisers an error;
+# -std=gnu89 -fpermissive still builds the 2009 generator.
+make -C "$DIR/dbgen" MACHINE=LINUX DATABASE=POSTGRESQL \
+    CC='gcc -std=gnu89 -fpermissive' >/dev/null
 
 if [ ! -x "$DIR/dbgen/dbgen" ]; then
     echo "fetch.sh: $DIR/dbgen/dbgen was not built" >&2

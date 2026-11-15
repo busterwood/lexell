@@ -14,21 +14,22 @@
 # restarted between modes, never run together.
 #
 # The servers run as transient systemd user units, so a server's CPU is its
-# cgroup's. lexdb is deliberately not CPU-capped: its SQL execution is one
-# thread, but checkpoints encode leaves on the par pool (LEXDB_CKPT_POOL=1 on
-# the checkpoint branch) and its I/O helpers use other cores. A 100% quota
-# would throttle all of them; par.map would still start its pool and the
-# threads would contend for one core. PostgreSQL gets shared_buffers 12GB and
-# a 400% CPU quota, the project's 4-process rule. To budget-match lexdb to
-# that rule, set LEXDB_CPU_QUOTA=400% and report that row separately from the
-# uncapped default. The queries run one at a time, warm.
+# cgroup's. Both are confined to TPCH_CPUS (default 0-7, half of this
+# machine), and they run one at a time. lexdb is deliberately not CPU-capped
+# to one core: its SQL execution is one thread, but checkpoints encode leaves
+# on the par pool (LEXDB_CKPT_POOL=1) and its I/O helpers use other cores. A
+# 100% quota would throttle all of them; par.map would still start its pool
+# and the threads would contend for one core. LEXDB_CPU_QUOTA and
+# PG_CPU_QUOTA add a quota when a budget-matched run is wanted.
 #
 # Env:
 #   TPCH_ONLY=lexdb,pg1,pg4   modes to run (default all three)
 #   TPCH_DBGEN=PATH           dbgen binary or kit directory;
 #                             default WORKDIR/tpch-kit/dbgen/dbgen
 #   PG_SHARED_BUFFERS=12GB
-#   QUERY_TIMEOUT=900         seconds per psql call
+#   TPCH_CPUS=0-7             CPUs both servers are confined to
+#   QUERY_TIMEOUT=900         seconds per query; lexdb cancels on the server
+#                             (statement_timeout), psql gets 30 s more
 #   LEXDB_CACHE_MB=N          passed to lexdb when set
 #   LEXDB_CKPT_POOL=1, LXL_PAR=N   passed to lexdb when set
 #   LEXDB_CPU_QUOTA=400%      lexdb cgroup quota (default: none; a 100%
@@ -65,8 +66,9 @@ UNIT_L=tpch-lexdb
 UNIT_P=tpch-pg
 PG_SHARED_BUFFERS=${PG_SHARED_BUFFERS:-12GB}
 QUERY_TIMEOUT=${QUERY_TIMEOUT:-900}
+TPCH_CPUS=${TPCH_CPUS:-0-7}
 LEXDB_CPU_QUOTA=${LEXDB_CPU_QUOTA:-}
-PG_CPU_QUOTA=${PG_CPU_QUOTA:-400%}
+PG_CPU_QUOTA=${PG_CPU_QUOTA:-}
 MODES=${TPCH_ONLY:-lexdb,pg1,pg4}
 MODES=${MODES//,/ }
 TABLES="region nation part supplier partsupp customer orders lineitem"
@@ -86,6 +88,10 @@ for m in $MODES; do
 done
 
 [ -x "$BIN" ] || { echo "run.sh: $BIN is not an executable" >&2; exit 2; }
+case $QUERY_TIMEOUT in
+    ''|*[!0-9]*) echo "run.sh: QUERY_TIMEOUT must be a whole number of seconds" >&2; exit 2 ;;
+esac
+[ "$QUERY_TIMEOUT" -gt 0 ] || { echo "run.sh: QUERY_TIMEOUT must be positive" >&2; exit 2; }
 command -v psql >/dev/null || { echo "run.sh: psql is not on PATH" >&2; exit 2; }
 command -v systemd-run >/dev/null || { echo "run.sh: systemd-run is not on PATH" >&2; exit 2; }
 command -v python3 >/dev/null || { echo "run.sh: python3 is not on PATH" >&2; exit 2; }
@@ -149,8 +155,11 @@ start_lexdb() {
             envargs+=(--setenv="$v=${!v}")
         fi
     done
+    if [ -n "$TPCH_CPUS" ]; then
+        cap+=(-p "CPUAffinity=$TPCH_CPUS")
+    fi
     if [ -n "$LEXDB_CPU_QUOTA" ]; then
-        cap=(-p "CPUQuota=$LEXDB_CPU_QUOTA")
+        cap+=(-p "CPUQuota=$LEXDB_CPU_QUOTA")
     fi
     mkdir -p "$W/lexdb"
     systemd-run --user --quiet --collect -u "$UNIT_L" "${cap[@]}" "${envargs[@]}" \
@@ -167,8 +176,11 @@ start_lexdb() {
 start_pg() {
     stop pg
     local cap=()
+    if [ -n "$TPCH_CPUS" ]; then
+        cap+=(-p "CPUAffinity=$TPCH_CPUS")
+    fi
     if [ -n "$PG_CPU_QUOTA" ]; then
-        cap=(-p "CPUQuota=$PG_CPU_QUOTA")
+        cap+=(-p "CPUQuota=$PG_CPU_QUOTA")
     fi
     mkdir -p "$W/psock"
     systemd-run --user --quiet --collect -u "$UNIT_P" "${cap[@]}" \
@@ -221,7 +233,8 @@ gen_data() {
         rm -rf "$DATA"
         mkdir -p "$DATA"
         echo "tpch: dbgen -s $SF -> $DATA"
-        DSS_PATH="$DATA" DSS_DIST="$DISTS" "$DBGEN" -s "$SF" -f
+        DSS_PATH="$DATA" DSS_CONFIG="$(dirname "$DBGEN")" DSS_DIST=dists.dss \
+            "$DBGEN" -s "$SF" -f
     fi
     for t in $TABLES; do
         [ -s "$DATA/$t.tbl" ] || {
@@ -234,12 +247,18 @@ gen_data() {
 
 run_bench() {
     local label=$1 unit=$2 port=$3 pgoptions=$4
+    local client_timeout=$((QUERY_TIMEOUT + 30))
     local cmd=(python3 "$HERE/bench.py" --label "$label" --unit "$unit"
         --port "$port" --user "$DBUSER" --db "$DBNAME"
         --queries "$HERE/queries" --out "$OUT/$label.tsv"
-        --runs "$RUNS" --timeout "$QUERY_TIMEOUT")
+        --runs "$RUNS" --timeout "$client_timeout")
     if [ -n "${TPCH_QUERIES:-}" ]; then
         cmd+=(--only "$TPCH_QUERIES")
+    fi
+    if [ "$label" = lexdb ]; then
+        cmd+=(--pre "SET max_statement_mem = 0; SET statement_timeout = '${QUERY_TIMEOUT}s';")
+    elif [ -n "$pgoptions" ]; then
+        pgoptions="$pgoptions -c statement_timeout=${QUERY_TIMEOUT}s"
     fi
     set +e
     if [ -n "$pgoptions" ]; then
@@ -271,6 +290,7 @@ rm -f "$OUT"/lexdb.tsv "$OUT"/pg1.tsv "$OUT"/pg4.tsv \
     printf 'scale\t%s\n' "$SF"
     printf 'runs\t%s\n' "$RUNS"
     printf 'modes\t%s\n' "$MODES"
+    printf 'cpus\t%s\n' "${TPCH_CPUS:-all}"
     printf 'lexdb_binary\t%s\n' "$BIN"
     printf 'lexdb_cpu_quota\t%s\n' "${LEXDB_CPU_QUOTA:-none}"
     printf 'lexdb_cache_mb\t%s\n' "${LEXDB_CACHE_MB:-default}"
