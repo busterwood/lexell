@@ -49,7 +49,6 @@ import "./lexdb_parse"
 type SqlT = lexdb_syscat.SqlT
 type OraT = lexdb_oracat.OraT
 
-pub const CATALOG = 1
 
 type Val = lexdb_sql.Val
 type Expr = lexdb_sql.Expr
@@ -3203,387 +3202,30 @@ fn decRowNeed(s: &str, n: int, need: &[]bool, missing: &[]Val, lays: &[]FixedLay
 
 // ---- the catalog
 
-fn encTable(t: &Table): str {
-    var b = newStrBuf()
-    binary.addU32LE(mut &b, t.tree)
-    binary.addU32LE(mut &b, len(t.cols))
-    for c in t.cols {
-        // as written (L6): decTable folds it for the name
-        let cn = lexdb_sql.colShown(&c)
-        binary.addU32LE(mut &b, len(cn))
-        b.add(&cn)
-        binary.addU32LE(mut &b, c.typ.kind)
-        binary.addU32LE(mut &b, c.typ.oid)
-        binary.addU32LE(mut &b, c.typ.prec)
-        binary.addU32LE(mut &b, c.typ.scale)
-        binary.addU32LE(mut &b, c.typ.len)
-        b.addByte(if c.notNull { 1 } else { 0 })
-    }
-    binary.addU32LE(mut &b, len(t.pk))
-    for i in t.pk { binary.addU32LE(mut &b, i) }
-    binary.addU32LE(mut &b, len(t.indexes))
-    for ix in t.indexes {
-        binary.addU32LE(mut &b, len(ix.name))
-        b.add(&ix.name)
-        binary.addU32LE(mut &b, ix.tree)
-        let filtered = ix.pred.isSome()
-        var shown = false
-        for o in ix.opts { if len(o) > 0 { shown = true } }
-        let exprd = len(ix.exprs) > 0
-        b.addByte((if ix.unique { 1 } else { 0 }) + (if filtered { 2 } else { 0 }) + (if ix.con { 4 } else { 0 }) + (if shown { 8 } else { 0 }) +
-                  (if exprd { 16 } else { 0 }))
-        binary.addU32LE(mut &b, len(ix.cols))
-        for c in ix.cols { binary.addU32LE(mut &b, c & 0xFFFFFFFF) }
-        match ix.pred {
-            Some(x) {
-                let text = lexdb_sql.exprText(&x)
-                binary.addU32LE(mut &b, len(text))
-                b.add(&text)
-            }
-            None {}
-        }
-        if shown { addStrs(mut &b, &ix.opts) }
-        if exprd {
-            var texts: []str = []
-            for k in 0..len(ix.cols) { append(mut &texts, if ix.cols[k] < 0 { lexdb_sql.exprText(&ix.exprs[k]) } else { "" }) }
-            addStrs(mut &b, &texts)
-        }
-    }
-    // then defaults, after the places (written, with none, when there are
-    // defaults)
-    // (all written: the layouts come last)
-    let defs = true
-    let fkx = true
-    let checks = true
-    if len(t.slots) > 0 || defs || checks {
-        binary.addU32LE(mut &b, t.width)
-        binary.addU32LE(mut &b, len(t.slots))
-        for k in t.slots { binary.addU32LE(mut &b, k) }
-    }
-    if defs || checks {
-        for c in t.cols {
-            let missing = !isNull(&c.missing)
-            b.addByte((if c.def.isSome() { 1 } else { 0 }) + (if missing { 2 } else { 0 }) + (if len(c.seq) > 0 { 4 } else { 0 }) +
-                      (if len(c.coll) > 0 { 8 } else { 0 }))
-            match c.def {
-                Some(x) {
-                    let text = lexdb_sql.exprText(&x)
-                    binary.addU32LE(mut &b, len(text))
-                    b.add(&text)
-                }
-                None {}
-            }
-            if missing {
-                let v = lexdb_rows.encodeRow(&[c.missing])
-                binary.addU32LE(mut &b, len(v))
-                b.add(&v)
-            }
-            if len(c.seq) > 0 {
-                b.addByte(byte(c.identity))
-                addStr(mut &b, &c.seq)
-            }
-            if len(c.coll) > 0 { addStr(mut &b, &c.coll) }      // its collation (L2)
-        }
-    }
-    // then the checks
-    if checks {
-        binary.addU32LE(mut &b, len(t.checks))
-        for c in t.checks {
-            binary.addU32LE(mut &b, len(c.name))
-            b.add(&c.name)
-            let text = lexdb_sql.exprText(&c.expr)
-            binary.addU32LE(mut &b, len(text))
-            b.add(&text)
-        }
-    }
-    // then the foreign keys, and the tables referencing it
-    if fkx {
-        binary.addU32LE(mut &b, len(t.fks))
-        for f in t.fks {
-            addStr(mut &b, &f.name)
-            addStrs(mut &b, &f.cols)
-            addStr(mut &b, &f.ref)
-            addStrs(mut &b, &f.refCols)
-            b.addByte(byte(f.onDelete))
-            // DEFERRABLE and INITIALLY DEFERRED in the high bits (9.85: a
-            // row written before has none)
-            b.addByte(byte(f.onUpdate | (if f.deferrable { 16 } else { 0 }) | (if f.deferred { 32 } else { 0 })))
-        }
-        addStrs(mut &b, &t.refBy)
-    }
-    // then the row layouts, the current one last
-    let cur = placeKinds(t)
-    let n = len(t.layouts)
-    let add = n == 0 || !sameKinds(&t.layouts[n - 1], &cur)
-    binary.addU32LE(mut &b, n + (if add { 1 } else { 0 }))
-    for l in t.layouts { addKinds(mut &b, &l) }
-    if add { addKinds(mut &b, &cur) }
-    // then a temporary table's ON COMMIT, when it is DELETE ROWS or DROP
-    // (9.96), or when a spelling follows
-    let more = len(t.pkName) > 0 || len(t.invalid) > 0
-    if t.onCommit > lexdb_sql.ONC_PRESERVE || len(t.spell) > 0 || more { b.addByte(byte(t.onCommit)) }
-    // then its name as written, if that is not its key's (L6)
-    if len(t.spell) > 0 || more { addStr(mut &b, &t.spell) }
-    // then its primary key's name and its constraints NOT VALID (9.117)
-    if more {
-        addStr(mut &b, &t.pkName)
-        addStrs(mut &b, &t.invalid)
-    }
-    return b.toStr()
-}
 
 // The name of table t's primary key constraint (and its index).
-fn pkConName(t: &Table): str { return if len(t.pkName) > 0 { t.pkName } else { lexdb_sql.baseName(&t.name) + "_pkey" } }
 
 // Whether t has a primary key of its own (not the hidden one, 9.88).
-fn hasPk(t: &Table): bool { return len(t.pk) > 0 && !rowidKeyed(t) }
 
 // A column's name as written (L6).
 
 
 // A name as stored (its spelling, L6) made a column: its name folded, its
 // spelling kept if that differs.
-fn spelledCol(stored: &str, ty: lexdb_sql.TypeName, notNull: bool): lexdb_sql.ColDef {
-    let f = strings.toLowerAscii(&stored)
-    var c = lexdb_sql.colDef(&f, ty, notNull)
-    if f != stored { c.spell = stored.toStr() }
-    return c
-}
 
-fn foldAll(xs: []str): []str {
-    var out: []str = []
-    for x in xs { append(mut &out, strings.toLowerAscii(&x)) }
-    return out
-}
 
-fn addKinds(b: mut &StrBuf, ks: &[]byte) {
-    binary.addU32LE(b, len(ks))
-    for k in ks { b.addByte(k) }
-}
 
-fn sameKinds(a: &[]byte, b: &[]byte): bool {
-    if len(a) != len(b) { return false }
-    for i in 0..len(a) { if a[i] != b[i] { return false } }
-    return true
-}
 
 // Makes the table's current layout (placeKinds) its last, as encTable
 // will store it: for rows written before the catalog row is.
-fn syncLayouts(t: mut &Table) {
-    let cur = placeKinds(t)
-    let n = len(t.layouts)
-    if n > 0 && sameKinds(&t.layouts[n - 1], &cur) { return }
-    append(mut &t.lays, layOfKinds(&cur))
-    append(mut &t.layouts, cur)
-}
 
-fn addStr(b: mut &StrBuf, x: &str) {
-    binary.addU32LE(b, len(x))
-    b.add(&x)
-}
 
-fn addStrs(b: mut &StrBuf, xs: &[]str) {
-    binary.addU32LE(b, len(xs))
-    for x in xs { addStr(b, &x) }
-}
 
 // A string addStr wrote at at (it takes 4 + its length).
-fn strAt(s: &str, at: int): str {
-    let l = binary.readU32LEStr(s, at)
-    return s[at + 4..at + 4 + l]
-}
 
 // The strings addStrs wrote at at.
-fn strsAt(s: &str, at: int): []str {
-    let n = binary.readU32LEStr(s, at)
-    var p = at + 4
-    var out: []str = []
-    for i in 0..n {
-        let x = strAt(s, p)
-        p += 4 + len(x)
-        append(mut &out, x)
-    }
-    return out
-}
 
-fn strsLen(xs: &[]str): int {
-    var n = 4
-    for x in xs { n += 4 + len(x) }
-    return n
-}
 
-fn decTable(name: &str, s: &str): Result[Table, DbErr] {
-    if strings.startsWith(&s, VIEW_MARK) { return Ok(decView(name, s)) }
-    var t = emptyTable(name)
-    t.tree = binary.readU32LEStr(s, 0)
-    let n = binary.readU32LEStr(s, 4)
-    var at = 8
-    for i in 0..n {
-        let l = binary.readU32LEStr(s, at)
-        let cn = s[at + 4..at + 4 + l]
-        at += 4 + l
-        let ty = lexdb_sql.TypeName{kind: binary.readU32LEStr(s, at), oid: binary.readU32LEStr(s, at + 4),
-                                    prec: binary.readU32LEStr(s, at + 8), scale: binary.readU32LEStr(s, at + 12),
-                                    len: binary.readU32LEStr(s, at + 16)}
-        at += 20
-        append(mut &t.cols, spelledCol(&cn, ty, s[at] == 1))
-        at += 1
-    }
-    let k = binary.readU32LEStr(s, at)
-    at += 4
-    for i in 0..k {
-        append(mut &t.pk, binary.readU32LEStr(s, at))
-        at += 4
-    }
-    if at >= len(s) { return Ok(t) }
-    let ni = binary.readU32LEStr(s, at)
-    at += 4
-    for i in 0..ni {
-        let l = binary.readU32LEStr(s, at)
-        var ix = Index{name: s[at + 4..at + 4 + l], tree: 0, cols: [], unique: false, pred: None, con: false, opts: [], exprs: []}
-        at += 4 + l
-        ix.tree = binary.readU32LEStr(s, at)
-        let flags = s[at + 4]
-        ix.unique = flags & 1 != 0
-        ix.con = flags & 4 != 0
-        let nc = binary.readU32LEStr(s, at + 5)
-        at += 9
-        for j in 0..nc {
-            let c = binary.readU32LEStr(s, at)
-            append(mut &ix.cols, if c == 0xFFFFFFFF { -1 } else { c })
-            at += 4
-        }
-        if flags & 2 != 0 {
-            let pl = binary.readU32LEStr(s, at)
-            match lexdb_parse.parseExpr(&s[at + 4..at + 4 + pl]) {
-                Ok(x) { ix.pred = Some(x) }
-                Err(_) { return Err(lexdb_base.corrupt(&("the predicate of index \"" + ix.name + "\""))) }
-            }
-            at += 4 + pl
-        }
-        if flags & 8 != 0 {
-            ix.opts = strsAt(s, at)
-            at += strsLen(&ix.opts)
-        }
-        if flags & 16 != 0 {
-            let texts = strsAt(s, at)
-            at += strsLen(&texts)
-            for x in texts {
-                if len(x) == 0 {
-                    append(mut &ix.exprs, Expr.Lit(Val.Null))
-                    continue
-                }
-                match lexdb_parse.parseExpr(&x) {
-                    Ok(e1) { append(mut &ix.exprs, e1) }
-                    Err(_) { return Err(lexdb_base.corrupt(&("an expression of index \"" + ix.name + "\""))) }
-                }
-            }
-        }
-        append(mut &t.indexes, ix)
-    }
-    if at + 8 <= len(s) {
-        t.width = binary.readU32LEStr(s, at)
-        let ns = binary.readU32LEStr(s, at + 4)
-        at += 8
-        for i in 0..ns {
-            append(mut &t.slots, binary.readU32LEStr(s, at))
-            at += 4
-        }
-    }
-    if at < len(s) {
-        for i in 0..len(t.cols) {
-            let flags = s[at]
-            at += 1
-            if flags & 1 != 0 {
-                let l = binary.readU32LEStr(s, at)
-                match lexdb_parse.parseExpr(&s[at + 4..at + 4 + l]) {
-                    Ok(x) { t.cols[i].def = Some(x) }
-                    Err(_) { return Err(lexdb_base.corrupt(&("the default of column \"" + t.cols[i].name + "\""))) }
-                }
-                at += 4 + l
-            }
-            if flags & 2 != 0 {
-                let l = binary.readU32LEStr(s, at)
-                let vs = try decRow(&s[at + 4..at + 4 + l], 1)
-                t.cols[i].missing = vs[0]
-                at += 4 + l
-            }
-            if flags & 4 != 0 {
-                t.cols[i].identity = int(s[at])
-                t.cols[i].seq = strAt(s, at + 1)
-                at += 5 + len(t.cols[i].seq)
-            }
-            if flags & 8 != 0 {
-                t.cols[i].coll = strAt(s, at)
-                at += 4 + len(t.cols[i].coll)
-            }
-        }
-    }
-    if at + 4 <= len(s) {
-        let nc = binary.readU32LEStr(s, at)
-        at += 4
-        for i in 0..nc {
-            let l = binary.readU32LEStr(s, at)
-            let cn = s[at + 4..at + 4 + l]
-            at += 4 + l
-            let xl = binary.readU32LEStr(s, at)
-            match lexdb_parse.parseExpr(&s[at + 4..at + 4 + xl]) {
-                Ok(x) { append(mut &t.checks, Check{name: cn, expr: x}) }
-                Err(_) { return Err(lexdb_base.corrupt(&("check constraint \"" + cn + "\""))) }
-            }
-            at += 4 + xl
-        }
-    }
-    if at + 4 <= len(s) {
-        let nf = binary.readU32LEStr(s, at)
-        at += 4
-        for i in 0..nf {
-            let fname = strAt(s, at)
-            at += 4 + len(fname)
-            let fcols = strsAt(s, at)
-            at += strsLen(&fcols)
-            let fref = strAt(s, at)
-            at += 4 + len(fref)
-            let frefCols = strsAt(s, at)
-            at += strsLen(&frefCols)
-            let ub = int(s[at + 1])
-            append(mut &t.fks, ForeignKey{name: fname, cols: foldAll(fcols), ref: fref, refCols: foldAll(frefCols), onDelete: int(s[at]), onUpdate: ub & 15,
-                                          deferrable: ub & 16 != 0, deferred: ub & 32 != 0})
-            at += 2
-        }
-        t.refBy = strsAt(s, at)
-        at += strsLen(&t.refBy)
-    }
-    if at + 4 <= len(s) {
-        let nl = binary.readU32LEStr(s, at)
-        at += 4
-        for i in 0..nl {
-            let np = binary.readU32LEStr(s, at)
-            at += 4
-            if at + np > len(s) { return Err(lexdb_base.corrupt(&("the row layouts of table \"" + t.name + "\""))) }
-            var ks: []byte = []
-            for j in 0..np { append(mut &ks, s[at + j]) }
-            at += np
-            append(mut &t.lays, layOfKinds(&ks))
-            append(mut &t.layouts, ks)
-        }
-    }
-    if at < len(s) {
-        t.onCommit = int(s[at])
-        at += 1
-    }
-    if at + 4 <= len(s) {
-        t.spell = strAt(s, at)
-        at += 4 + len(t.spell)
-    }
-    if at + 4 <= len(s) {
-        t.pkName = strAt(s, at)
-        at += 4 + len(t.pkName)
-        t.invalid = strsAt(s, at)
-        at += strsLen(&t.invalid)
-    }
-    return Ok(t)
-}
 
 // The catalog's version: a row every DDL statement bumps, read through the
 // transaction, so it names the schema the transaction sees (a snapshot may
@@ -4824,41 +4466,6 @@ fn createKey(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, n: &str, temp: b
 // temporary objects: keys pre + "pg_temp_..." (pre "" a relation's, "\x01"
 // an index's, "\x04" a sequence's, ACL_PRE + "r:" an owner's), whose range
 // is read quietly, so their DDL never conflicts with this transaction.
-fn catScan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, lo: &str, hi: &str, pre: &str, f: &fn(&lexdb_store.Entry): bool): Result[Unit, DbErr] {
-    let tlo = pre + "pg_temp_"
-    let thi = pre + "pg_temp`"
-    var going = true
-    // below the temporary range
-    if lo < tlo {
-        let to = if len(hi) == 0 || hi > tlo { tlo } else { hi.toStr() }
-        try st.scan(txn, CATALOG, lo, &to, fn(en: &lexdb_store.Entry): bool {
-            going = f(en)
-            return going
-        })
-    }
-    if !going || (len(hi) > 0 && hi <= tlo) { return Ok(Unit{}) }
-    // in it: the session's own, and keys there of no temporary schema
-    let a = if lo > tlo { lo.toStr() } else { tlo }
-    let b = if len(hi) > 0 && hi < thi { hi.toStr() } else { thi }
-    if a < b {
-        let mine = txn.tmp
-        let quiet = txn.quiet
-        txn.quiet = true
-        let r = st.scan(txn, CATALOG, &a, &b, fn(en: &lexdb_store.Entry): bool {
-            let k = &en.key[len(pre)..len(en.key)]
-            let sc = lexdb_sql.schemaOf(k)
-            if lexdb_base.isTempSchema(&sc) && lexdb_sql.isQual(k) && sc != mine { return true }
-            going = f(en)
-            return going
-        })
-        txn.quiet = quiet
-        try r
-    }
-    if !going || (len(hi) > 0 && hi <= thi) { return Ok(Unit{}) }
-    // above it
-    if lo > thi { return st.scan(txn, CATALOG, lo, hi, f) }
-    return st.scan(txn, CATALOG, &thi, hi, f)
-}
 
 fn findTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, name: &str): Result[Option[Table], DbErr] {
     let k = try catKey(st, txn, name, false)
@@ -4892,21 +4499,6 @@ fn setSpec(st: &lexdb_store.Store, t: &Table) {
 }
 
 // Every table (not a view, nor another session's temporary table).
-fn seenTables(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[[]Table, DbErr] {
-    var keys: []str = []
-    var raw: []str = []
-    try catScan(st, txn, &"\x06", &"", &"", fn(en: &lexdb_store.Entry): bool {
-        append(mut &keys, en.key)
-        append(mut &raw, en.val)
-        return true
-    })
-    var tabs: []Table = []
-    for i in 0..len(keys) {
-        let t = try decTable(&keys[i], &raw[i])
-        if len(t.view) == 0 { append(mut &tabs, t) }
-    }
-    return Ok(tabs)
-}
 
 // VACUUM (9.114): the named tables' leaves, or every table's, made column
 // leaves where their rows allow (lexdb_store.upgradeTree), a checkpoint
@@ -4991,24 +4583,7 @@ fn conjuncts(x: &Expr, out: mut &[]Expr) {
     }
     append(out, clone(x))
 }
-fn cloneAll(xs: &[]Expr): []Expr {
-    var out: []Expr = []
-    for x in xs { append(mut &out, clone(&x)) }
-    return out
-}
 // A copy of an expression (Expr is boxed and owned).
-pub fn clone(x: &Expr): Expr {
-    match x {
-        Expr.Lit(v) { return Expr.Lit(v) }
-        Expr.Param(n) { return Expr.Param(n) }
-        Expr.Col(n) { return Expr.Col(n) }
-        Expr.Unary(op, a) { return Expr.Unary(op, clone(&a)) }
-        Expr.Bin(op, a, b) { return Expr.Bin(op, clone(&a), clone(&b)) }
-        Expr.IsNull(a, neg) { return Expr.IsNull(clone(&a), neg) }
-        Expr.Call(n, args, star) { return Expr.Call(n, cloneAll(&args), star) }
-        Expr.Cast(a, t) { return Expr.Cast(clone(&a), t) }
-    }
-}
 
 
 // A conjunct "col op value" (or "value op col", turned round).
@@ -10265,20 +9840,6 @@ fn runChild(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params
 }
 
 // A column type for a result's OID.
-fn oidType(oid: int): lexdb_sql.TypeName {
-    if lexdb_sql.timeKind(oid) > 0 { return lexdb_sql.timeType(oid) }
-    if oid == lexdb_sql.OID_UUID { return lexdb_sql.TypeName{kind: lexdb_sql.K_UUID, oid: oid, prec: 0, scale: 0, len: 0} }
-    if oid == lexdb_sql.OID_BYTEA { return lexdb_sql.TypeName{kind: lexdb_sql.K_BYTEA, oid: oid, prec: 0, scale: 0, len: 0} }
-    if oid == lexdb_sql.OID_FLOAT4 || oid == lexdb_sql.OID_FLOAT8 { return lexdb_sql.floatType(oid) }
-    if lexdb_sql.elemOid(oid) > 0 { return lexdb_sql.TypeName{kind: lexdb_sql.K_ARRAY, oid: oid, prec: 0, scale: 0, len: 0} }
-    var kind = lexdb_sql.K_TEXT
-    var o = oid
-    if oid == lexdb_sql.OID_BOOL { kind = lexdb_sql.K_BOOL }
-    if oid == lexdb_sql.OID_INT2 || oid == lexdb_sql.OID_INT4 || oid == lexdb_sql.OID_INT8 { kind = lexdb_sql.K_INT }
-    if oid == lexdb_sql.OID_NUMERIC { kind = lexdb_sql.K_NUM }
-    if kind == lexdb_sql.K_TEXT && oid != lexdb_sql.OID_VARCHAR && oid != lexdb_sql.OID_BPCHAR { o = lexdb_sql.OID_TEXT }
-    return lexdb_sql.TypeName{kind: kind, oid: o, prec: 0, scale: 0, len: 0}
-}
 
 // An IN subquery's value as compared: a char's without its blanks (the
 // value IN it is made a text by resolve, 9.94).
@@ -10940,43 +10501,11 @@ fn createTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
 // the query is planned, so an index on the column (in the labels' text
 // order) serves equality only.
 
-fn enumKey(oid: int): str { return "\x02enum\x00" + oid.toStr() }
 
 
-fn encEnum(en: &EnumType): str {
-    var all: []str = [en.key]
-    for l in en.labels { append(mut &all, l) }
-    var b = newStrBuf()
-    addStrs(mut &b, &all)
-    return b.toStr()
-}
 
-fn decEnum(oid: int, v: &str): EnumType {
-    let all = strsAt(v, 0)
-    var labels: []str = []
-    for i in 1..len(all) { append(mut &labels, all[i]) }
-    return EnumType{key: all[0], oid: oid, labels: labels}
-}
 
-fn readEnum(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, oid: int): Result[Option[EnumType], DbErr] {
-    match try st.get(txn, CATALOG, &(enumKey(oid))) {
-        Some(v) { return Ok(Some(decEnum(oid, &v))) }
-        None { return Ok(None) }
-    }
-}
 
-fn allEnums(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[[]EnumType, DbErr] {
-    var keys: []str = []
-    var vals: []str = []
-    try st.scan(txn, CATALOG, "\x02enum\x00", "\x02enum\x01", fn(en: &lexdb_store.Entry): bool {
-        append(mut &keys, en.key)
-        append(mut &vals, en.val)
-        return true
-    })
-    var out: []EnumType = []
-    for i in 0..len(keys) { append(mut &out, decEnum(num(&keys[i][6..len(keys[i])]), &vals[i])) }
-    return Ok(out)
-}
 
 fn createType(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
     let key = s.table
@@ -11088,7 +10617,6 @@ fn alterType(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.St
 // table's object_id (sys.table_types) are OIDs of its key. It shares its
 // names with the enum types (9.90): DROP TYPE drops either.
 
-fn tabTypeKey(key: &str): str { return "\x02ttype\x00" + key }
 
 
 
@@ -11117,33 +10645,9 @@ fn parseTabTypeCols(body: &str): []lexdb_sql.ColDef {
     return []
 }
 
-fn encTabType(t: &TabType): str {
-    var b = newStrBuf()
-    addStrs(mut &b, &[t.key, t.spell, t.body])
-    return b.toStr()
-}
 
-fn decTabType(v: &str): TabType {
-    let all = strsAt(v, 0)
-    if len(all) < 3 { return TabType{key: "", spell: "", body: "()", cols: []} }
-    return TabType{key: all[0], spell: all[1], body: all[2], cols: parseTabTypeCols(&all[2])}
-}
 
-fn readTabType(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, key: &str): Result[Option[TabType], DbErr] {
-    match try st.get(txn, CATALOG, &(tabTypeKey(key))) {
-        Some(v) { return Ok(Some(decTabType(&v))) }
-        None { return Ok(None) }
-    }
-}
 
-fn allTabTypes(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[[]TabType, DbErr] {
-    var out: []TabType = []
-    try st.scan(txn, CATALOG, "\x02ttype\x00", "\x02ttype\x01", fn(en: &lexdb_store.Entry): bool {
-        append(mut &out, decTabType(&en.val))
-        return true
-    })
-    return Ok(out)
-}
 
 // A table type's user_type_id, and its table's object_id.
 pub fn tabTypeId(key: &str): int { return lexdb_sql.nameOid(&"T", key) }
@@ -11241,7 +10745,6 @@ pub const ROWID: str = lexdb_catalog.ROWID
 
 // A name of the hidden column (a table's, a query's "alias.column", its
 // sequence's).
-fn hiddenName(n: &str): bool { return strings.contains(&n, "\x00rowid") }
 
 // Whether t's key is the hidden column.
 fn rowidKeyed(t: &Table): bool { return lexdb_catalog.rowidKeyed(t) }
@@ -20772,7 +20275,6 @@ fn noSeq(): Seq { return lexdb_catalog.noSeq() }
 // The catalog key holding the id of the sequences' tree.
 const SEQ_TREE: str = "\x02seqs"
 
-fn seqRow(k: &str): str { return "\x04" + k }
 
 // What a session's evaluation needs for nextval and its kind (Env.seq).
 pub type SeqEnv = value record { st: lexdb_store.Store; sess: int; now: int; zone: lexdb_time.Zone }
@@ -20781,20 +20283,9 @@ fn seqEnv(st: &lexdb_store.Store, txn: &lexdb_store.Txn): Option[SeqEnv] {
     return Some(SeqEnv{st: st.handle(), sess: txn.sess, now: txn.now, zone: txn.zone})
 }
 
-fn encSeq(d: &Seq): str {
-    var b = newStrBuf()
-    addStrs(mut &b, &[d.key, d.id, d.typ.toStr(), d.inc.toStr(), d.min.toStr(), d.max.toStr(), d.start.toStr(), d.cache.toStr(),
-                     if d.cycle { "1" } else { "0" }, d.ownerT, d.ownerC])
-    return b.toStr()
-}
 
 fn num(s: &str): int { return strings.parseIntOpt(&s).unwrapOr(0) }
 
-fn decSeq(s: &str): Seq {
-    let f = strsAt(s, 0)
-    return Seq{key: f[0], id: f[1], typ: num(&f[2]), inc: num(&f[3]), min: num(&f[4]), max: num(&f[5]), start: num(&f[6]),
-               cache: num(&f[7]), cycle: f[8] == "1", ownerT: f[9], ownerC: f[10]}
-}
 
 fn typMax(oid: int): int {
     if oid == lexdb_sql.OID_INT2 { return 32767 }
@@ -21737,24 +21228,6 @@ fn dropOneSeq(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
 }
 
 // The sequences in the catalog: in schema sc ("" all).
-fn allSeqs(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &str): Result[[]Seq, DbErr] {
-    let from = if len(sc) > 0 { seqRow(&lexdb_sql.qual(sc, &"")) } else { "\x04" }
-    let to = if len(sc) > 0 { from + "\xff" } else { "\x05" }
-    var out: []Seq = []
-    // (all of them: not other sessions' temporary ones, 9.96)
-    if len(sc) == 0 {
-        try catScan(st, txn, &from, &to, &"\x04", fn(en: &lexdb_store.Entry): bool {
-            append(mut &out, decSeq(&en.val))
-            return true
-        })
-    } else {
-        try st.scan(txn, CATALOG, &from, &to, fn(en: &lexdb_store.Entry): bool {
-            append(mut &out, decSeq(&en.val))
-            return true
-        })
-    }
-    return Ok(out)
-}
 
 // Table t's columns' sequences (SERIAL, identity) made: named table_column_seq
 // as PostgreSQL names them, owned by their columns. Its own options from
@@ -27629,7 +27102,6 @@ fn cloneOptE(x: &Option[Expr]): Option[Expr] {
 // quote_ident: the name as is when it needs no quotes.
 fn quoteIfNeeded(n: &str): str { return lexdb_pg.quoteIfNeeded(n) }
 
-fn userKey(sess: int): str { return "\x00user\x00" + sess.toStr() }
 fn catMemoKey(sess: int): str { return "\x00cat\x00" + sess.toStr() }
 
 // The session's user, from its startup message.
@@ -27652,153 +27124,6 @@ fn colNum(t: &Table, name: &str): int { return lexdb_catalog.colNum(t, name) }
 
 
 // The catalog as the transaction sees it.
-fn catSnap(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[CatSnap, DbErr] {
-    var keys: []str = []
-    var schemas: []str = ["public"]
-    try st.scan(txn, CATALOG, "\x03", "\x04", fn(en: &lexdb_store.Entry): bool {
-        append(mut &schemas, en.key[1..len(en.key)])
-        return true
-    })
-    if len(txn.tmp) > 0 { append(mut &schemas, txn.tmp) }      // the session's temporary schema (9.96)
-    var raw: []str = []
-    try catScan(st, txn, &"\x06", &"", &"", fn(en: &lexdb_store.Entry): bool {
-        append(mut &keys, en.key)
-        append(mut &raw, en.val)
-        return true
-    })
-    var seqs: []Seq = []
-    for d in try allSeqs(st, txn, &"") { if !hiddenName(&d.key) { append(mut &seqs, seqCopy(&d)) } }
-    var procs: []ProcSrc = []
-    let srcPre = "\x02src\x00"
-    try st.scan(txn, CATALOG, &srcPre, &(srcPre + "\xff"), fn(en: &lexdb_store.Entry): bool {
-        let f = strings.split(&en.key[len(srcPre)..len(en.key)], "\x00")
-        if len(f) == 3 { append(mut &procs, ProcSrc{owner: f[0].toStr(), kind: f[1].toStr(), name: f[2].toStr(), src: en.val}) }
-        return true
-    })
-    var snap = CatSnap{acls: newMap(), tabs: [], views: [], cons: [], seqs: seqs, schemas: schemas, path: copyStrs(&txn.path),
-                       user: st.memoGet(&userKey(txn.sess)).unwrapOr("lexdb"), enums: try allEnums(st, txn), procs: procs,
-                       ttypes: try allTabTypes(st, txn)}
-    var aclKeys: []str = []
-    var aclVals: []str = []
-    try catScan(st, txn, &ACL_PRE, &(ACL_PRE + "\xff"), &(ACL_PRE + "r:"), fn(en: &lexdb_store.Entry): bool {
-        append(mut &aclKeys, en.key[len(ACL_PRE)..len(en.key)].toStr())
-        append(mut &aclVals, en.val)
-        return true
-    })
-    for i in 0..len(aclKeys) { snap.acls.put(aclKeys[i], aclVals[i]) }
-    // the session's temporary relations' names: a permanent one of the same
-    // name is hidden by it (9.96)
-    var tnames: []str = []
-    if len(txn.tmp) > 0 { for k in keys { if lexdb_sql.schemaOf(&k) == txn.tmp { append(mut &tnames, lexdb_sql.baseName(&k)) } } }
-    for i in 0..len(keys) {
-        let t = try decTable(&keys[i], &raw[i])
-        let schema = lexdb_sql.schemaOf(&keys[i])
-        let name = lexdb_sql.baseName(&keys[i])
-        let spelt = if len(t.spell) > 0 { t.spell } else { name }      // as written (L6)
-        if len(t.view) > 0 {
-            append(mut &snap.views, CatTab{key: keys[i], t: t, oid: lexdb_pg.catOid(&"r", &keys[i]), schema: schema, name: name,
-                                           shown: lexdb_pg.shownBy(&txn.path, &tnames, &schema, &name, &spelt), idxs: []})
-            continue
-        }
-        var idxs: []CatIdx = []
-        if len(t.pk) > 0 && !rowidKeyed(&t) {
-            var cs: []int = []
-            for p in t.pk { append(mut &cs, p + 1) }
-            let pn = pkConName(&t)
-            append(mut &idxs, CatIdx{name: pn, oid: lexdb_pg.catOid(&"i", &lexdb_sql.qual(&schema, &pn)), cols: cs, unique: true, primary: true,
-                                     con: true, pred: None, opts: [], exprs: []})
-        }
-        for ix in t.indexes {
-            var cs: []int = []
-            for c in ix.cols { append(mut &cs, if c < 0 { 0 } else { c + 1 }) }
-            var xs: []str = []
-            for k in 0..len(ix.exprs) {
-                let none: Option[lexdb_sql.TypeName] = None
-                append(mut &xs, if ix.cols[k] < 0 { lexdb_pg.exprText(&ix.exprs[k], &none) } else { "" })
-            }
-            let iname = lexdb_sql.baseName(&ix.name)
-            append(mut &idxs, CatIdx{name: iname, oid: lexdb_pg.catOid(&"i", &lexdb_sql.qual(&schema, &iname)), cols: cs, unique: ix.unique,
-                                     primary: false, con: ix.con, pred: cloneOptE(&ix.pred), opts: copyStrs(&ix.opts), exprs: xs})
-        }
-        append(mut &snap.tabs, CatTab{key: keys[i], t: t, oid: lexdb_pg.catOid(&"r", &keys[i]), schema: schema, name: name,
-                                      shown: lexdb_pg.shownBy(&txn.path, &tnames, &schema, &name, &spelt), idxs: idxs})
-    }
-    // the constraints, now that every table's OID is known
-    var cons: []CatCon = []
-    for ti in 0..len(snap.tabs) {
-        let ct = &snap.tabs[ti]
-        for ix in ct.idxs {
-            if !ix.con { continue }
-            let ty = if ix.primary { "p" } else { "u" }
-            let def = (if ix.primary { "PRIMARY KEY (" } else { "UNIQUE (" }) + lexdb_pg.colList(&ct.t, &ix.cols) + ")"
-            append(mut &cons, CatCon{oid: lexdb_pg.catOid(&"c", &(ct.key + "\x00" + ix.name)), name: ix.name, typ: ty, rel: ct.oid,
-                                          schema: ct.schema, cols: copyInts(&ix.cols), refRel: 0, refCols: [], idx: ix.oid, def: def,
-                                          upd: " ", del: " ", check: "", deferrable: false, deferred: false, valid: true})
-        }
-        for fk in ct.t.fks {
-            var cs: []int = []
-            for c in fk.cols { append(mut &cs, colNum(&ct.t, &c)) }
-            var refRel = 0
-            var refCols: []int = []
-            var refIdx = 0
-            var refShown = lexdb_sql.shown(&fk.ref)
-            for rt in snap.tabs {
-                if rt.key != fk.ref { continue }
-                refRel = rt.oid
-                refShown = rt.shown
-                for c in fk.refCols { append(mut &refCols, colNum(&rt.t, &c)) }
-                for ix in rt.idxs {
-                    if ix.unique && len(ix.cols) == len(refCols) {
-                        var same = true
-                        for c in refCols {
-                            var has = false
-                            for d in ix.cols { if d == c { has = true } }
-                            if !has { same = false }
-                        }
-                        if same && refIdx == 0 { refIdx = ix.oid }
-                    }
-                }
-            }
-            var refNames: []str = []
-            for c in fk.refCols { append(mut &refNames, quoteIfNeeded(&c)) }
-            var fcols: []str = []
-            for c in fk.cols { append(mut &fcols, quoteIfNeeded(&c)) }
-            let upd = lexdb_pg.fkAction(fk.onUpdate)
-            let del = lexdb_pg.fkAction(fk.onDelete)
-            var def = "FOREIGN KEY (" + strings.join(&fcols, ", ") + ") REFERENCES " + refShown + "(" + strings.join(&refNames, ", ") + ")"
-            if upd != "a" { def = def + " ON UPDATE " + lexdb_pg.fkActionText(&upd) }
-            if del != "a" { def = def + " ON DELETE " + lexdb_pg.fkActionText(&del) }
-            if fk.deferrable { def = def + " DEFERRABLE" }
-            if fk.deferred { def = def + " INITIALLY DEFERRED" }
-            let fvalid = !hasStr(&ct.t.invalid, &fk.name)
-            if !fvalid { def = def + " NOT VALID" }
-            append(mut &cons, CatCon{oid: lexdb_pg.catOid(&"c", &(ct.key + "\x00" + fk.name)), name: fk.name, typ: "f", rel: ct.oid,
-                                          schema: ct.schema, cols: cs, refRel: refRel, refCols: refCols, idx: refIdx, def: def,
-                                          upd: upd, del: del, check: "", deferrable: fk.deferrable, deferred: fk.deferred, valid: fvalid})
-        }
-        for ck in ct.t.checks {
-            let none: Option[lexdb_sql.TypeName] = None
-            let x = lexdb_pg.exprText(&ck.expr, &none)
-            let body = if strings.startsWith(&x, "(") { x } else { "(" + x + ")" }
-            // conkey: the columns it uses, in the table's order
-            var used: []str = []
-            colNames(&ck.expr, mut &used)
-            var ccols: []int = []
-            for i in 0..len(ct.t.cols) {
-                var uses = false
-                for n in used { if n == ct.t.cols[i].name { uses = true } }
-                if uses { append(mut &ccols, colNum(&ct.t, &ct.t.cols[i].name)) }
-            }
-            let cvalid = !hasStr(&ct.t.invalid, &ck.name)
-            append(mut &cons, CatCon{oid: lexdb_pg.catOid(&"c", &(ct.key + "\x00" + ck.name)), name: ck.name, typ: "c", rel: ct.oid,
-                                          schema: ct.schema, cols: ccols, refRel: 0, refCols: [], idx: 0,
-                                          def: "CHECK (" + body + ")" + (if cvalid { "" } else { " NOT VALID" }),
-                                          upd: " ", del: " ", check: body, deferrable: false, deferred: false, valid: cvalid})
-        }
-    }
-    snap.cons = cons
-    return Ok(snap)
-}
 
 
 
@@ -30100,68 +29425,11 @@ fn roleStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
 // names relations by name, so a relation it reads is not renamed, dropped,
 // or changed in a column under it (dependentViews).
 
-const VIEW_MARK: str = "\xff\xff\xff\xffview"
 
-fn encView(cols: &[]lexdb_sql.ColDef, text: &str, deps: &[]str, spell: &str): str {
-    var b = newStrBuf()
-    b.add(&VIEW_MARK)
-    var names: []str = []
-    var oids: []str = []
-    var mods: []str = []
-    for c in cols {
-        append(mut &names, lexdb_sql.colShown(&c))
-        append(mut &oids, c.typ.oid.toStr())
-        append(mut &mods, lexdb_pg.typmodOf(&c.typ).toStr())
-    }
-    addStrs(mut &b, &names)
-    addStrs(mut &b, &oids)
-    addStrs(mut &b, &mods)
-    addStrs(mut &b, &[text.toStr()])
-    addStrs(mut &b, deps)
-    // then its name as written, if that is not its key's (L6)
-    if len(spell) > 0 { addStr(mut &b, spell) }
-    return b.toStr()
-}
 
 // A column's type from its OID and typmod (varchar's length, numeric's
 // precision and scale), as a view keeps it.
-fn typeOfMod(oid: int, mod: int): lexdb_sql.TypeName {
-    var t = oidType(oid)
-    if mod >= 4 && (t.oid == lexdb_sql.OID_VARCHAR || t.oid == lexdb_sql.OID_BPCHAR) { t.len = mod - 4 }
-    if mod >= 4 && t.kind == lexdb_sql.K_NUM {
-        t.prec = (mod - 4) >> 16
-        t.scale = (mod - 4) & 0xFFFF
-    }
-    if mod >= 0 && lexdb_sql.isTimeKind(t.kind) && t.oid != lexdb_sql.OID_DATE {
-        t.prec = 1
-        t.scale = mod
-    }
-    return t
-}
 
-fn decView(name: &str, s: &str): Table {
-    var t = emptyTable(name)
-    var at = len(VIEW_MARK)
-    let names = strsAt(s, at)
-    at += strsLen(&names)
-    let oids = strsAt(s, at)
-    at += strsLen(&oids)
-    let mods = strsAt(s, at)
-    at += strsLen(&mods)
-    let text = strsAt(s, at)
-    at += strsLen(&text)
-    t.deps = strsAt(s, at)
-    at += strsLen(&t.deps)
-    if at + 4 <= len(s) { t.spell = strAt(s, at) }
-    t.tree = -1
-    t.view = if len(text) > 0 { text[0] } else { "select" }
-    for i in 0..len(names) {
-        let o = strings.parseIntOpt(&oids[i]).unwrapOr(lexdb_sql.OID_TEXT)
-        let m = if i < len(mods) { strings.parseIntOpt(&mods[i]).unwrapOr(-1) } else { -1 }
-        append(mut &t.cols, spelledCol(&names[i], typeOfMod(o, m), false))
-    }
-    return t
-}
 
 // A view's query, parsed to be planned where the view is used.
 fn viewQuery(t: &Table): Result[lexdb_sql.Stmt, DbErr] {
@@ -30213,63 +29481,12 @@ fn readsOf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
 }
 
 // Every view, by catalog key.
-fn allViews(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[[]Table, DbErr] { return viewsIn(st, txn, &"\x06", &"") }
 
 // The views with keys in [lo, hi).
-fn viewsIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, lo: &str, hi: &str): Result[[]Table, DbErr] {
-    var out: []Table = []
-    var keys: []str = []
-    var vals: []str = []
-    try st.scan(txn, CATALOG, lo, hi, fn(en: &lexdb_store.Entry): bool {
-        if strings.startsWith(&en.val, VIEW_MARK) {
-            append(mut &keys, en.key)
-            append(mut &vals, en.val)
-        }
-        return true
-    })
-    for i in 0..len(keys) { append(mut &out, decView(&keys[i], &vals[i])) }
-    return Ok(out)
-}
 
 // Every table (not views), from the catalog.
-fn allTables(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[[]Table, DbErr] {
-    var keys: []str = []
-    var vals: []str = []
-    try st.scan(txn, CATALOG, "\x06", "", fn(en: &lexdb_store.Entry): bool {
-        if !strings.startsWith(&en.val, VIEW_MARK) {
-            append(mut &keys, en.key)
-            append(mut &vals, en.val)
-        }
-        return true
-    })
-    var out: []Table = []
-    for i in 0..len(keys) { append(mut &out, try decTable(&keys[i], &vals[i])) }
-    return Ok(out)
-}
 
 // The views that read relation k, directly or through other views.
-fn dependentViews(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, k: &str): Result[[]str, DbErr] {
-    // a temporary relation's: its schema's views only (a view reading it is
-    // temporary, and no other session's can), 9.96
-    let sc = lexdb_sql.schemaOf(k)
-    let vs = if tempRel(k) { try viewsIn(st, txn, &(sc + "\x1f"), &(sc + "\x20")) } else { try allViews(st, txn) }
-    var out: []str = []
-    var todo: []str = [k.toStr()]
-    while len(todo) > 0 {
-        let cur = pop(mut &todo)
-        for v in vs {
-            var reads = false
-            for d in v.deps { if d == cur { reads = true } }
-            var seen = false
-            for x in out { if x == v.name { seen = true } }
-            if reads && !seen {
-                append(mut &out, v.name)
-                append(mut &todo, v.name)
-            }
-        }
-    }
-    return Ok(out)
-}
 
 // Before relation k is dropped: the views on it dropped (CASCADE), or 2BP01.
 fn dropDependentViews(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, k: &str, cascade: bool, kind: &str): Result[Unit, DbErr] {
@@ -30436,7 +29653,7 @@ fn alterView(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.St
 // aclitem: r SELECT, a INSERT, w UPDATE, d DELETE, x REFERENCES, t TRIGGER,
 // U USAGE, C CREATE.
 
-const ACL_PRE: str = "\x02acl\x00"
+const ACL_PRE: str = lexdb_catalog.ACL_PRE
 const MEM_PRE: str = "\x02mem\x00"
 
 fn relObj(k: &str): str { return lexdb_catalog.relObj(k) }
@@ -31927,3 +31144,58 @@ fn fromCols(sel: &Sel): &[]OutCol {
     return &sel.outs
 }
 
+
+
+// The expression and type helpers now in the language model.
+fn cloneAll(xs: &[]Expr): []Expr { return lexdb_sql.cloneAllExpr(xs) }
+pub fn clone(x: &Expr): Expr { return lexdb_sql.cloneExpr(x) }
+fn oidType(oid: int): lexdb_sql.TypeName { return lexdb_sql.oidType(oid) }
+
+// ---- the catalog: its encoding and readers are lexdb_catalog's (4a)
+
+pub const CATALOG: int = lexdb_catalog.CATALOG
+const VIEW_MARK: str = lexdb_catalog.VIEW_MARK
+
+fn encTable(t: &Table): str { return lexdb_catalog.encTable(t) }
+fn pkConName(t: &Table): str { return lexdb_catalog.pkConName(t) }
+fn hasPk(t: &Table): bool { return lexdb_catalog.hasPk(t) }
+fn spelledCol(stored: &str, ty: lexdb_sql.TypeName, notNull: bool): lexdb_sql.ColDef { return lexdb_catalog.spelledCol(stored, ty, notNull) }
+fn syncLayouts(t: mut &Table) { lexdb_catalog.syncLayouts(t) }
+fn addStr(b: mut &StrBuf, x: &str) { lexdb_catalog.addStr(b, x) }
+fn addStrs(b: mut &StrBuf, xs: &[]str) { lexdb_catalog.addStrs(b, xs) }
+fn strAt(s: &str, at: int): str { return lexdb_catalog.strAt(s, at) }
+fn strsAt(s: &str, at: int): []str { return lexdb_catalog.strsAt(s, at) }
+fn strsLen(xs: &[]str): int { return lexdb_catalog.strsLen(xs) }
+fn decTable(name: &str, s: &str): Result[Table, DbErr] { return lexdb_catalog.decTable(name, s, lexdb_parse.parseExpr) }
+fn catScan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, lo: &str, hi: &str, pre: &str,
+           f: &fn(&lexdb_store.Entry): bool): Result[Unit, DbErr] { return lexdb_catalog.catScan(st, txn, lo, hi, pre, f) }
+fn seenTables(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[[]Table, DbErr] {
+    return lexdb_catalog.seenTables(st, txn, lexdb_parse.parseExpr)
+}
+fn enumKey(oid: int): str { return lexdb_catalog.enumKey(oid) }
+fn encEnum(en: &EnumType): str { return lexdb_catalog.encEnum(en) }
+fn decEnum(oid: int, v: &str): EnumType { return lexdb_catalog.decEnum(oid, v) }
+fn readEnum(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, oid: int): Result[Option[EnumType], DbErr] { return lexdb_catalog.readEnum(st, txn, oid) }
+fn allEnums(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[[]EnumType, DbErr] { return lexdb_catalog.allEnums(st, txn) }
+fn tabTypeKey(key: &str): str { return lexdb_catalog.tabTypeKey(key) }
+fn encTabType(t: &TabType): str { return lexdb_catalog.encTabType(t) }
+fn decTabType(v: &str): TabType { return lexdb_catalog.decTabType(v) }
+fn readTabType(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, key: &str): Result[Option[TabType], DbErr] { return lexdb_catalog.readTabType(st, txn, key) }
+fn allTabTypes(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[[]TabType, DbErr] { return lexdb_catalog.allTabTypes(st, txn) }
+fn seqRow(k: &str): str { return lexdb_catalog.seqRow(k) }
+fn encSeq(d: &Seq): str { return lexdb_catalog.encSeq(d) }
+fn decSeq(s: &str): Seq { return lexdb_catalog.decSeq(s) }
+fn allSeqs(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &str): Result[[]Seq, DbErr] { return lexdb_catalog.allSeqs(st, txn, sc) }
+fn encView(cols: &[]lexdb_sql.ColDef, text: &str, deps: &[]str, spell: &str): str { return lexdb_catalog.encView(cols, text, deps, spell) }
+fn typeOfMod(oid: int, mod: int): lexdb_sql.TypeName { return lexdb_catalog.typeOfMod(oid, mod) }
+fn decView(name: &str, s: &str): Table { return lexdb_catalog.decView(name, s) }
+fn allViews(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[[]Table, DbErr] { return lexdb_catalog.allViews(st, txn) }
+fn viewsIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, lo: &str, hi: &str): Result[[]Table, DbErr] { return lexdb_catalog.viewsIn(st, txn, lo, hi) }
+fn allTables(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[[]Table, DbErr] { return lexdb_catalog.allTables(st, txn, lexdb_parse.parseExpr) }
+fn dependentViews(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, k: &str): Result[[]str, DbErr] { return lexdb_catalog.dependentViews(st, txn, k) }
+fn hiddenName(n: &str): bool { return lexdb_catalog.hiddenName(n) }
+fn userKey(sess: int): str { return lexdb_catalog.userKey(sess) }
+fn catSnap(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[CatSnap, DbErr] {
+    let naming = lexdb_pg.naming()
+    return lexdb_catalog.catSnap(st, txn, lexdb_parse.parseExpr, &naming)
+}
