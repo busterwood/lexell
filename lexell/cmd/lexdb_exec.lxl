@@ -26,6 +26,7 @@ import "./lexdb_base"
 import "./lexdb_time"
 import "./lexdb_float"
 import "./lexdb_pgcat"
+import "./lexdb_pg"
 import "./lexdb_auth"
 import "regex"
 import "unicode"
@@ -10927,7 +10928,7 @@ fn checkUnique(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, ix:
         let c = ix.cols[k]
         if c >= 0 { append(mut &names, t.cols[c].name) } else {
             let none: Option[lexdb_sql.TypeName] = None
-            append(mut &names, pgExprText(&ix.exprs[k], &none))
+            append(mut &names, lexdb_pg.exprText(&ix.exprs[k], &none))
         }
         // the value as written, not its key (L2)
         append(mut &vals, text(&(if c >= 0 { row[c] } else { try idxVal(t, ix, k, row) })))
@@ -12324,7 +12325,7 @@ fn dupMade(t: &Table, name: &str, cols: &[]int, exprs: &[]Expr, row: &[]Val): Db
             append(mut &vals, text(&row[cols[k]]))
         } else {
             let none: Option[lexdb_sql.TypeName] = None
-            append(mut &names, pgExprText(&exprs[k], &none))
+            append(mut &names, lexdb_pg.exprText(&exprs[k], &none))
             let noAggs: []Val = []
             let noParams: []Val = []
             let noSubs: []SubRes = []
@@ -27918,15 +27919,7 @@ fn sysRelOid(rel: &str): int {
 }
 
 // quote_ident: the name as is when it needs no quotes.
-fn quoteIfNeeded(n: &str): str {
-    var plain = len(n) > 0 && ((n[0] >= 'a' && n[0] <= 'z') || n[0] == '_')
-    for i in 0..len(n) {
-        let c = n[i]
-        if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_') { plain = false }
-    }
-    if plain && lexdb_sql.isReservedWord(n) { plain = false }
-    return if plain { n.toStr() } else { "\"" + strings.replaceAll(&n, "\"", "\"\"") + "\"" }
-}
+fn quoteIfNeeded(n: &str): str { return lexdb_pg.quoteIfNeeded(n) }
 
 type CatIdx = record {
     name: str
@@ -28078,108 +28071,6 @@ fn colList(t: &Table, nums: &[]int): str {
     return strings.join(&parts, ", ")
 }
 
-// An expression as PostgreSQL's deparser writes it (near enough): names
-// bare where they can be, constants typed, AND and OR in capitals.
-fn pgExprText(x: &Expr, typ: &Option[lexdb_sql.TypeName]): str {
-    match x {
-        Expr.Lit(v) {
-            let tn = match typ {
-                Some(t) { lexdb_pgcat.formatType(t.oid, -1) }
-                None { "" }
-            }
-            match v {
-                Val.Null { return if len(tn) > 0 { "NULL::" + tn } else { "NULL" } }
-                Val.Int(n) {
-                    if n >= 0 { return n.toStr() }
-                    return "'" + n.toStr() + "'::" + (if n < -2147483648 { "bigint" } else { "integer" })
-                }
-                Val.Num(d) { return if d.isNeg() { "'" + d.toStr() + "'::numeric" } else { d.toStr() } }
-                Val.Bool(b) { return if b { "true" } else { "false" } }
-                Val.Text(s) { return "'" + strings.replaceAll(&s, "'", "''") + "'::" + (if len(tn) > 0 { tn } else { "text" }) }
-                else { return lexdb_sql.exprText(x) }
-            }
-        }
-        Expr.Col(n) {
-            let d = strings.indexOf(&n, ".", 0)
-            return quoteIfNeeded(&(if d < 0 { n } else { n[d + 1..len(n)] }))
-        }
-        Expr.Bin(op, a, b) {
-            let o = if op == "and" { "AND" } else if op == "or" { "OR" } else { op }
-            let none: Option[lexdb_sql.TypeName] = None
-            return "(" + pgExprText(&a, &none) + " " + o + " " + pgExprText(&b, &none) + ")"
-        }
-        Expr.Unary(op, a) {
-            let none: Option[lexdb_sql.TypeName] = None
-            if op == "-" {
-                // a negative constant: as PostgreSQL folds it, '-1'::integer
-                match a {
-                    Expr.Lit(v) {
-                        match v {
-                            Val.Int(n) { return pgExprText(&Expr.Lit(Val.Int(-n)), &none) }
-                            Val.Num(d) { return pgExprText(&Expr.Lit(Val.Num(d.neg())), &none) }
-                            else {}
-                        }
-                    }
-                    else {}
-                }
-            }
-            return if op == "not" { "(NOT " + pgExprText(&a, &none) + ")" } else { "(- " + pgExprText(&a, &none) + ")" }
-        }
-        Expr.IsNull(a, neg) {
-            let none: Option[lexdb_sql.TypeName] = None
-            return "(" + pgExprText(&a, &none) + (if neg { " IS NOT NULL)" } else { " IS NULL)" })
-        }
-        Expr.Cast(a, t) {
-            match a {
-                Expr.Lit(v) {
-                    match v {
-                        Val.Text(s) { return "'" + strings.replaceAll(&s, "'", "''") + "'::" + lexdb_pgcat.formatType(t.oid, -1) }
-                        else {}
-                    }
-                }
-                else {}
-            }
-            let none: Option[lexdb_sql.TypeName] = None
-            return "(" + pgExprText(&a, &none) + ")::" + lexdb_pgcat.formatType(t.oid, -1)
-        }
-        Expr.Call(n, args, _) {
-            if len(args) == 0 {
-                if n == "current_timestamp" || n == "current_date" || n == "current_time" || n == "localtimestamp" || n == "localtime" {
-                    return strings.toUpperAscii(&n)
-                }
-                return n + "()"
-            }
-            // as PostgreSQL's deparser: arguments as expressions (columns
-            // bare, constants typed), its special forms (9.89)
-            let none: Option[lexdb_sql.TypeName] = None
-            if n == "date_part" && len(args) == 2 {
-                match args[0] {
-                    Expr.Lit(v) {
-                        match v {
-                            Val.Text(f) { return "EXTRACT(" + f + " FROM " + pgExprText(&args[1], &none) + ")" }
-                            else {}
-                        }
-                    }
-                    else {}
-                }
-            }
-            if strings.contains(&n, " ") || strings.startsWith(&n, "#") || strings.startsWith(&n, "case") { return lexdb_sql.exprText(x) }
-            var parts: []str = []
-            for a in args { append(mut &parts, pgExprText(&a, &none)) }
-            // a sequence function's name: a regclass, as PostgreSQL keeps it (9.117)
-            if n == "nextval" || n == "currval" || n == "setval" {
-                match lexdb_sql.litText(&args[0]) {
-                    Some(t) { parts[0] = "'" + strings.replaceAll(&t, "'", "''") + "'::regclass" }
-                    None {}
-                }
-            }
-            let shownName = if n == "coalesce" || n == "nullif" || n == "greatest" || n == "least" { strings.toUpperAscii(&n) } else { n }
-            return shownName + "(" + strings.join(&parts, ", ") + ")"
-        }
-        else { return lexdb_sql.exprText(x) }
-    }
-}
-
 // A column's DEFAULT as pg_attrdef shows it; None for none (an identity
 // column has none: its sequence is its own).
 fn defaultText(snap: &CatSnap, c: &lexdb_sql.ColDef): Option[str] {
@@ -28188,7 +28079,7 @@ fn defaultText(snap: &CatSnap, c: &lexdb_sql.ColDef): Option[str] {
         return Some("nextval('" + shownIn(&snap.path, &lexdb_sql.schemaOf(&c.seq), &lexdb_sql.baseName(&c.seq)) + "'::regclass)")
     }
     match c.def {
-        Some(d) { return Some(pgExprText(&d, &Some(c.typ))) }
+        Some(d) { return Some(lexdb_pg.exprText(&d, &Some(c.typ))) }
         None { return None }
     }
 }
@@ -28256,7 +28147,7 @@ fn catSnap(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[CatSnap, D
             var xs: []str = []
             for k in 0..len(ix.exprs) {
                 let none: Option[lexdb_sql.TypeName] = None
-                append(mut &xs, if ix.cols[k] < 0 { pgExprText(&ix.exprs[k], &none) } else { "" })
+                append(mut &xs, if ix.cols[k] < 0 { lexdb_pg.exprText(&ix.exprs[k], &none) } else { "" })
             }
             let iname = lexdb_sql.baseName(&ix.name)
             append(mut &idxs, CatIdx{name: iname, oid: catOid(&"i", &lexdb_sql.qual(&schema, &iname)), cols: cs, unique: ix.unique,
@@ -28320,7 +28211,7 @@ fn catSnap(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[CatSnap, D
         }
         for ck in ct.t.checks {
             let none: Option[lexdb_sql.TypeName] = None
-            let x = pgExprText(&ck.expr, &none)
+            let x = lexdb_pg.exprText(&ck.expr, &none)
             let body = if strings.startsWith(&x, "(") { x } else { "(" + x + ")" }
             // conkey: the columns it uses, in the table's order
             var used: []str = []
@@ -28353,7 +28244,7 @@ fn idxDefOn(ct: &CatTab, ix: &CatIdx, on: &str, pretty: bool): str {
     match ix.pred {
         Some(p) {
             let none: Option[lexdb_sql.TypeName] = None
-            let x = pgExprText(&p, &none)
+            let x = lexdb_pg.exprText(&p, &none)
             d = d + " WHERE " + (if pretty { unwrapParens(&x) } else if strings.startsWith(&x, "(") { x } else { "(" + x + ")" })
         }
         None {}
@@ -31967,7 +31858,7 @@ fn sysCall(name: &str, vs: &[]Val, se: &SeqEnv): Result[Option[Val], DbErr] {
 fn predVal(p: &Option[Expr]): Val {
     let none: Option[lexdb_sql.TypeName] = None
     match p {
-        Some(x) { return tv(&pgExprText(&x, &none)) }
+        Some(x) { return tv(&lexdb_pg.exprText(&x, &none)) }
         None { return Val.Null }
     }
 }

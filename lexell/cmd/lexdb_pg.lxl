@@ -1,0 +1,120 @@
+// lexdb_pg: PostgreSQL's view of a statement and a catalog: identifier
+// quoting, the deparser pg_get_expr/pg_get_indexdef show, and (as the
+// module grows) the rest of PostgreSQL's own names and text.
+import "strings"
+import "./lexdb_sql"
+import "./lexdb_pgcat"
+
+// quote_ident: the name as is when it needs no quotes. PostgreSQL's rule:
+// a lower-case letter or _ first, then lower-case letters, digits and _.
+pub fn quoteIfNeeded(n: &str): str {
+    var plain = len(n) > 0 && ((n[0] >= 'a' && n[0] <= 'z') || n[0] == '_')
+    for i in 0..len(n) {
+        let c = n[i]
+        if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_') { plain = false }
+    }
+    if plain && lexdb_sql.isReservedWord(n) { plain = false }
+    return if plain { n.toStr() } else { "\"" + strings.replaceAll(&n, "\"", "\"\"") + "\"" }
+}
+
+// An expression as PostgreSQL's deparser writes it (near enough): names
+// bare where they can be, constants typed, AND and OR in capitals.
+pub fn exprText(x: &lexdb_sql.Expr, typ: &Option[lexdb_sql.TypeName]): str {
+    match x {
+        lexdb_sql.Expr.Lit(v) {
+            let tn = match typ {
+                Some(t) { lexdb_pgcat.formatType(t.oid, -1) }
+                None { "" }
+            }
+            match v {
+                lexdb_sql.Val.Null { return if len(tn) > 0 { "NULL::" + tn } else { "NULL" } }
+                lexdb_sql.Val.Int(n) {
+                    if n >= 0 { return n.toStr() }
+                    return "'" + n.toStr() + "'::" + (if n < -2147483648 { "bigint" } else { "integer" })
+                }
+                lexdb_sql.Val.Num(d) { return if d.isNeg() { "'" + d.toStr() + "'::numeric" } else { d.toStr() } }
+                lexdb_sql.Val.Bool(b) { return if b { "true" } else { "false" } }
+                lexdb_sql.Val.Text(s) { return "'" + strings.replaceAll(&s, "'", "''") + "'::" + (if len(tn) > 0 { tn } else { "text" }) }
+                else { return lexdb_sql.exprText(x) }
+            }
+        }
+        lexdb_sql.Expr.Col(n) {
+            let d = strings.indexOf(&n, ".", 0)
+            return quoteIfNeeded(&(if d < 0 { n } else { n[d + 1..len(n)] }))
+        }
+        lexdb_sql.Expr.Bin(op, a, b) {
+            let o = if op == "and" { "AND" } else if op == "or" { "OR" } else { op }
+            let none: Option[lexdb_sql.TypeName] = None
+            return "(" + exprText(&a, &none) + " " + o + " " + exprText(&b, &none) + ")"
+        }
+        lexdb_sql.Expr.Unary(op, a) {
+            let none: Option[lexdb_sql.TypeName] = None
+            if op == "-" {
+                // a negative constant: as PostgreSQL folds it, '-1'::integer
+                match a {
+                    lexdb_sql.Expr.Lit(v) {
+                        match v {
+                            lexdb_sql.Val.Int(n) { return exprText(&lexdb_sql.Expr.Lit(lexdb_sql.Val.Int(-n)), &none) }
+                            lexdb_sql.Val.Num(d) { return exprText(&lexdb_sql.Expr.Lit(lexdb_sql.Val.Num(d.neg())), &none) }
+                            else {}
+                        }
+                    }
+                    else {}
+                }
+            }
+            return if op == "not" { "(NOT " + exprText(&a, &none) + ")" } else { "(- " + exprText(&a, &none) + ")" }
+        }
+        lexdb_sql.Expr.IsNull(a, neg) {
+            let none: Option[lexdb_sql.TypeName] = None
+            return "(" + exprText(&a, &none) + (if neg { " IS NOT NULL)" } else { " IS NULL)" })
+        }
+        lexdb_sql.Expr.Cast(a, t) {
+            match a {
+                lexdb_sql.Expr.Lit(v) {
+                    match v {
+                        lexdb_sql.Val.Text(s) { return "'" + strings.replaceAll(&s, "'", "''") + "'::" + lexdb_pgcat.formatType(t.oid, -1) }
+                        else {}
+                    }
+                }
+                else {}
+            }
+            let none: Option[lexdb_sql.TypeName] = None
+            return "(" + exprText(&a, &none) + ")::" + lexdb_pgcat.formatType(t.oid, -1)
+        }
+        lexdb_sql.Expr.Call(n, args, _) {
+            if len(args) == 0 {
+                if n == "current_timestamp" || n == "current_date" || n == "current_time" || n == "localtimestamp" || n == "localtime" {
+                    return strings.toUpperAscii(&n)
+                }
+                return n + "()"
+            }
+            // as PostgreSQL's deparser: arguments as expressions (columns
+            // bare, constants typed), its special forms (9.89)
+            let none: Option[lexdb_sql.TypeName] = None
+            if n == "date_part" && len(args) == 2 {
+                match args[0] {
+                    lexdb_sql.Expr.Lit(v) {
+                        match v {
+                            lexdb_sql.Val.Text(f) { return "EXTRACT(" + f + " FROM " + exprText(&args[1], &none) + ")" }
+                            else {}
+                        }
+                    }
+                    else {}
+                }
+            }
+            if strings.contains(&n, " ") || strings.startsWith(&n, "#") || strings.startsWith(&n, "case") { return lexdb_sql.exprText(x) }
+            var parts: []str = []
+            for a in args { append(mut &parts, exprText(&a, &none)) }
+            // a sequence function's name: a regclass, as PostgreSQL keeps it (9.117)
+            if n == "nextval" || n == "currval" || n == "setval" {
+                match lexdb_sql.litText(&args[0]) {
+                    Some(t) { parts[0] = "'" + strings.replaceAll(&t, "'", "''") + "'::regclass" }
+                    None {}
+                }
+            }
+            let shownName = if n == "coalesce" || n == "nullif" || n == "greatest" || n == "least" { strings.toUpperAscii(&n) } else { n }
+            return shownName + "(" + strings.join(&parts, ", ") + ")"
+        }
+        else { return lexdb_sql.exprText(x) }
+    }
+}
