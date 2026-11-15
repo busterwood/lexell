@@ -55,9 +55,14 @@ what a dialect names; name resolution and DDL are still in exec.
 `lexdb_plan` owns the planner's data vocabulary (`Path`, `Bound`, `Look`,
 `Cmp`, `EqClass`, `BindCol`, `WayCand`, `Way`, `Est`, `Common`, `Fig`) and
 the cost constants. The 35-query A/B against main's binary is 1.003
-geometric mean CPU (median 1.0); the write path is within noise. Still
-staged: the connection-time `Dialect` composition, the catalog DDL
-interface, and the path/join-order search in `lexdb_plan`.
+geometric mean CPU (median 1.0); the write path is within noise. The
+store gained one read-view selection and separate `Memo`, `Locks` and
+`SqlTxn` handles; its test/diagnostic knobs are behind `testHooks()`.
+Store's public functions went 126 → 91 (lines/export 55.9 → 72.1), and
+the final A/B is 0.994 CPU geometric mean. Still staged: the
+connection-time `Dialect` composition, the catalog DDL interface, the
+path/join-order search in `lexdb_plan`, and a batch reader over the scan
+family.
 
 ## 1. Why this exists
 
