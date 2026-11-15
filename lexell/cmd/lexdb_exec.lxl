@@ -5863,7 +5863,7 @@ type Run = record {
     deadline: int               // statement_timeout: the monotonic clock's ns to stop at; 0 none
     ticks: int
     turnEnd: int                // the monotonic clock's ns after which the statement lets other sessions run
-    batch: bool                 // aggregates over batches of rows (SET lexdb_batch: 9.47)
+    batch: bool                 // vector scans and batch operators (SET lexdb_batch: 9.47); compiled expressions and typed sorts are always on
     writes: bool                // an INSERT, UPDATE or DELETE's run: no index-to-scan switch (optimizer 19)
     // The first level's switch (firstSwitch, 9.107), decided once for its
     // range [swLo, swHi), for the batches and the row path: -1 not yet;
@@ -5887,7 +5887,7 @@ pub type Limits = value record {
     pub steps: int              // MATCH_RECOGNIZE's steps per start row; 0 no limit
     pub mem: int                // bytes of rows held; 0 no limit
     pub deadline: int           // time.monotonicNs() to stop at; 0 none
-    pub batch: bool             // SET lexdb_batch: aggregates over batches of rows (9.47)
+    pub batch: bool             // SET lexdb_batch: vector scans and batch operators (9.47); compiled expressions and typed sorts are always on
     pub rules: bool             // SET lexdb_planner = rules: kept with the others for a block's ROLLBACK (optimizer 20)
     pub auto: bool              // SET lexdb_autoanalyze: the session's changes counted for the automatic statistics (optimizer 44)
     pub rdel: bool              // SET lexdb_range_delete: a DELETE of a key range may drop its subtrees (design/lexdb-bulkdelete.md)
@@ -10920,13 +10920,13 @@ fn evalX(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, x: &Expr,
     return eval(x, &env2)
 }
 
-// The conditions xs of q compiled (9.108), when on; None those eval
-// evaluates (a correlated subquery's among them).
-fn cxsOf(q: &Query, xs: &[]Expr, params: &[]Val, on: bool): []Option[CX] {
+// The conditions xs of q compiled (9.108); None those eval evaluates (a
+// correlated subquery's among them).
+fn cxsOf(q: &Query, xs: &[]Expr, params: &[]Val): []Option[CX] {
     var out: []Option[CX] = []
     for x in xs {
         var sl: []int = []
-        append(mut &out, if on && !(q.corr && hasCorr(&x)) { cxOf(&x, &q.cols, params, true, false, mut &sl) } else { None })
+        append(mut &out, if !(q.corr && hasCorr(&x)) { cxOf(&x, &q.cols, params, true, false, mut &sl) } else { None })
     }
     return out
 }
@@ -10996,8 +10996,8 @@ fn prepare(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, params:
         append(mut &m.mat, [])
         append(mut &m.keys, newMap())
         append(mut &m.buckets, [])
-        append(mut &m.cc, cxsOf(q, &q.levels[k].cond, params, rs.batch))
-        append(mut &m.cp, cxsOf(q, &q.levels[k].post, params, rs.batch))
+        append(mut &m.cc, cxsOf(q, &q.levels[k].cond, params))
+        append(mut &m.cp, cxsOf(q, &q.levels[k].post, params))
     }
     for i in 0..len(q.subs) {
         let sp = &q.subs[i]
@@ -16293,7 +16293,7 @@ fn eachRowB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params
     let q = &sel.q
     var n = 0
     var vals: []Val = []                // one row's values, the array used again for each (9.99)
-    let oc = outC(sel, params, rs.batch, seqEnv(st, txn))
+    let oc = outC(sel, params, seqEnv(st, txn))
     if batched {
         let op = try outPlan(st, txn, sel, &m, params, mut &rs, false)
         if op.isSome() { return eachOut(st, txn, sel, &m, params, &op.unwrap(), &oc, each, eachB, mut &rs) }
@@ -16309,10 +16309,10 @@ fn eachRowB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params
 
 // A streamed SELECT's outputs as the row path makes them (outRow): per
 // output its column's place, found once, not by its name per row as eval
-// finds it (9.100), -1 others; with batches on, the others compiled
-// (9.108: their columns by place, functions bound once; batches off keeps
-// eval, the reference). plain: every output a column, no Env per row;
-// none: no output needs eval.
+// finds it (9.100), -1 others; the others compiled (9.108: their columns by
+// place, functions bound once), with eval only where a correlated subquery
+// needs it. plain: every output a column, no Env per row; none: no output
+// needs eval.
 type OutC = record {
     at: []int
     cxs: []Option[CX]
@@ -16321,7 +16321,7 @@ type OutC = record {
     ce: CEnv
 }
 
-fn outC(sel: &Sel, params: &[]Val, compiled: bool, seq: Option[SeqEnv]): OutC {
+fn outC(sel: &Sel, params: &[]Val, seq: Option[SeqEnv]): OutC {
     let q = &sel.q
     var oc = OutC{at: [], cxs: [], plain: true, none: true, ce: cenvOf(seq)}
     for x in sel.exprs {
@@ -16334,7 +16334,7 @@ fn outC(sel: &Sel, params: &[]Val, compiled: bool, seq: Option[SeqEnv]): OutC {
         var cx: Option[CX] = None
         if c < 0 {
             oc.plain = false
-            if compiled && !(q.corr && hasCorr(&x)) {
+            if !(q.corr && hasCorr(&x)) {
                 var sl: []int = []
                 cx = cxOf(&x, &q.cols, params, true, false, mut &sl)
             }
@@ -17902,19 +17902,18 @@ fn ordCmp(sel: &Sel, a: &[]Val, b: &[]Val): int {
 // Top-N (9.52): rows sorted and cut to the first k, in the order the full
 // sort gives (sortBy is stable, and the rows kept came before those added
 // after them). The last one's sort values, for the rows to come.
-fn keepFirst(sel: &Sel, rows: mut &[]OutRow, k: int, typed: bool): []Val {
-    sortOutRows(sel, rows, typed)
+fn keepFirst(sel: &Sel, rows: mut &[]OutRow, k: int): []Val {
+    sortOutRows(sel, rows)
     while len(rows) > k { let gone = pop(rows) }
     return copyRow(&rows[len(rows) - 1].ord)
 }
 
 // The rows in ORDER BY's order (ordCmp's, ties in their order): typed, by
-// their sort values as typed keys (9.105); else, or when a key's values
-// are of mixed kinds, by collections.sortBy with ordCmp. lexdb_batch off
-// sorts the old way, so the two can be compared.
-fn sortOutRows(sel: &Sel, rows: mut &[]OutRow, typed: bool) {
+// their sort values as typed keys (9.105); when a key's values are of mixed
+// kinds, by collections.sortBy with ordCmp.
+fn sortOutRows(sel: &Sel, rows: mut &[]OutRow) {
     let n = len(rows)
-    if typed && n > 1 {
+    if n > 1 {
         var keys: []SKey = []
         var ok = true
         for k in 0..len(sel.desc) {
@@ -18397,7 +18396,6 @@ fn execSelTo(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, param
     var outRows: []OutRow = []
     // the rows kept here, counted in the row callbacks (they cannot reach rs)
     let room = rs.room()
-    let typedSort = rs.batch            // sorts by typed keys (9.105); off: the old comparator
     var held = 0
     if sel.setop != 0 {
         var rows = try runSet(st, txn, sel, params, rs)
@@ -18568,7 +18566,7 @@ fn execSelTo(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, param
             }
             raws = []
         }
-        let oc = outC(sel, params, rs.batch, seqEnv(st, txn))
+        let oc = outC(sel, params, seqEnv(st, txn))
         for r in raws {
             if windowed { break }
             let env = Env{cols: &q.cols, row: &r, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: sqe}
@@ -18600,7 +18598,7 @@ fn execSelTo(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, param
         let topK = if sorting && limit >= 0 && !sel.distinct && sel.donKey == 0 && !sel.withTies { limit + max(offset, 0) } else { -1 }
         var bar: []Val = []                 // the last kept row's sort values, once cut
         var barSet = false
-        let oc = outC(sel, params, rs.batch, seqEnv(st, txn))
+        let oc = outC(sel, params, seqEnv(st, txn))
         try runQuery(st, txn, q, &m, params, fn(tx: mut &lexdb_store.Txn, r: &[]Val): Result[bool, DbErr] {
             let env = Env{cols: &q.cols, row: r, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: sqe}
             var vals: []Val = []
@@ -18631,7 +18629,7 @@ fn execSelTo(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, param
             if room >= 0 && held > room { return Err(memErr(rs0max)) }
             append(mut &outRows, OutRow{vals: vals, ord: ord})
             if topK > 0 && len(outRows) >= 2 * topK + 16 {
-                bar = keepFirst(sel, mut &outRows, topK, typedSort)
+                bar = keepFirst(sel, mut &outRows, topK)
                 barSet = true
                 held = 0
                 for o in outRows { held += rowBytes(&o.vals) + rowBytes(&o.ord) }
@@ -18642,7 +18640,7 @@ fn execSelTo(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, param
     if windowed {
         var wv = try winValues(st, txn, sel, &bases, &m, params, rs)
         // an output that is a column read at its place, found once (9.105);
-        // with batches on, the others compiled (9.108)
+        // the others compiled (9.108)
         var at: []int = []
         var cxs: []Option[CX] = []
         for x in sel.exprs {
@@ -18651,7 +18649,7 @@ fn execSelTo(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, param
                 else { append(mut &at, -1) }
             }
             var sl: []int = []
-            append(mut &cxs, if rs.batch && !(q.corr && hasCorr(&x)) { cxOf(&x, &q.cols, params, true, true, mut &sl) } else { None })
+            append(mut &cxs, if !(q.corr && hasCorr(&x)) { cxOf(&x, &q.cols, params, true, true, mut &sl) } else { None })
         }
         let ce = cenvOf(seqEnv(st, txn))
         for bi in 0..len(bases) {
@@ -18684,7 +18682,7 @@ fn execSelTo(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, param
     try rs.hold(held)
     if hasSrfCall(&sel.exprs) { try expandSrfs(mut &outRows, &sel.outs) }
     // (rows assigned in their order are in it already)
-    if sorting && len(sel.feedback) == 0 { sortOutRows(sel, mut &outRows, rs.batch) }
+    if sorting && len(sel.feedback) == 0 { sortOutRows(sel, mut &outRows) }
     if sorting && sel.donKey > 0 {
         // DISTINCT ON (9.94): the first row of each run of equal keys
         var kept: []OutRow = []
@@ -19043,7 +19041,7 @@ pub type Session = record {
     pathAt: int                 // bumped when the path changes (the wire's kept descriptions)
     savedPath: [][]str          // in a transaction block: the path at its BEGIN
     id: int                     // its number while the store is open (its sequences' currval: 9.43)
-    batch: bool                 // SET lexdb_batch (9.47)
+    batch: bool                 // SET lexdb_batch: vector scans and batch operators (9.47)
     rules: bool                 // SET lexdb_planner = rules: no statistics in planning (optimizer 20)
     auto: bool                  // SET lexdb_autoanalyze: its committed changes counted for the automatic statistics (optimizer 44)
     rdel: bool                  // SET lexdb_range_delete: a DELETE of a key range may drop its subtrees (design/lexdb-bulkdelete.md)
@@ -23649,7 +23647,7 @@ fn winValues(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, rows:
         var idx: []int = []
         var partBreak: []bool = array(n, false)
         var peerBreak: []bool = array(n, false)
-        var typed = rs.batch
+        var typed = true
         var keys: []SKey = []
         if typed {
             // (the values borrowed, copied only into a key of values: if a
