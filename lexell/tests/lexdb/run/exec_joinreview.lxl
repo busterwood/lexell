@@ -36,16 +36,23 @@
 // expect: select count(*) from sm s join bigv b on s.id = b.x -> [count] 3
 // expect: select count(*) from bigv b join sm s on s.vc = b.t -> [count] 2
 // expect: reset lexdb_planner -> RESET
-// expect: -- 2. a hash join fits the statement's memory: with 256kB, big is looked up per row
+// expect: -- 2. a hash join fits the statement's memory: with 256kB, mid5 (5,000 rows with a pad, hashed by the costs) is looked up per row
+// expect: create table mid5 (id int primary key, pad text) -> CREATE TABLE
+// expect: insert into mid5 select g, repeat('y', 50) from generate_series(1, 5000) g -> INSERT 0 5000
+// expect: analyze mid5 -> ANALYZE
 // expect: set max_statement_mem = '256kB' -> SET
-// expect: explain select count(*), max(b.pad) from big a join big b on b.id = a.sid -> [QUERY PLAN] scan big a: full scan; join big b: primary key lookup per row; aggregate
-// expect: select count(*) from big a join big b on b.id = a.sid -> [count] 20000
+// expect: explain select count(*), max(b.pad) from big a join mid5 b on b.id = a.v + a.sid -> [QUERY PLAN] scan big a: full scan; join mid5 b: primary key lookup per row; aggregate
+// expect: select count(*), max(b.pad) from big a join mid5 b on b.id = a.v + a.sid -> [count,max] 20000|yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy
 // expect: reset max_statement_mem -> RESET
-// expect: explain select count(*) from big a join big b on b.id = a.sid -> [QUERY PLAN] scan big a: full scan; join big b: hash on (id) over full scan; aggregate
+// expect: explain select count(*), max(b.pad) from big a join mid5 b on b.id = a.v + a.sid -> [QUERY PLAN] scan big a: full scan; join mid5 b: hash on (id) over full scan; aggregate
+// expect: select count(*), max(b.pad) from big a join mid5 b on b.id = a.v + a.sid -> [count,max] 20000|yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy
+// expect: -- big joined to itself by its key: looked up per row in key order (cheaper than hashing big, optimizer 45)
+// expect: explain select count(*) from big a join big b on b.id = a.sid -> [QUERY PLAN] scan big a: index big_sid scan, index only; join big b: primary key lookup per row; aggregate
+// expect: select count(*) from big a join big b on b.id = a.sid -> [count] 20000
 // expect: -- 3. ranges, IN lists and other filters count: the range's table first
-// expect: explain analyze select count(*) from big b join small s on b.sid = s.id where b.id < 5 and s.label = 'l3' -> scan small s: index small_label lookup, index only (estimated 10 rows) (rows read 10, kept 10, batches 1); join big b: hash on (sid) over primary key range (estimated 4 rows) (table rows 4 of 5 read, probes 10, rows read 1, joined 1); aggregate
+// expect: explain analyze select count(*) from big b join small s on b.sid = s.id where b.id < 5 and s.label = 'l3' -> scan big b: primary key range (estimated 4 rows) (rows read 5, kept 4, batches 1); join small s: primary key lookup per row (lookups 4, rows read 4, joined 1); aggregate
 // expect: explain analyze select count(*) from big a join big b on b.id = a.sid where a.id between 10 and 12 -> scan big a: primary key range (estimated 1 rows) (rows read 3, kept 3, batches 1); join big b: primary key lookup per row (lookups 3, rows read 3, joined 3); aggregate
-// expect: explain analyze select count(*) from big a join big b on b.id = a.sid where a.pad = 'none' -> scan big a: full scan (rows read 20000, kept 0, batches 20); join big b: hash on (id) over full scan (table rows 20000 of 20000 read, probes 0, rows read 0, joined 0); aggregate
+// expect: explain analyze select count(*) from big a join big b on b.id = a.sid where a.pad = 'none' -> scan big a: full scan (rows read 20000, kept 0, batches 20); join big b: primary key lookup per row (lookups 0, rows read 0, joined 0); aggregate
 // expect: -- 4. a LIMIT or EXISTS keeps lookups: no hash built for one row
 // expect: explain analyze select a.id from big a join big b on b.id = a.id limit 1 -> scan big a: full scan (rows read 1, kept 1); join big b: primary key lookup per row (lookups 1, rows read 1, joined 1); limit: stops the scan
 // expect: explain analyze select 1 where exists (select 1 from big a join big b on b.id = a.id) -> result; subquery 1 (exists): run once (runs 1, from cache 0);   scan big a: full scan (rows read 1, kept 1);   join big b: primary key lookup per row (lookups 1, rows read 1, joined 1)
@@ -85,9 +92,9 @@
 // expect: analyze -> ANALYZE
 // expect: explain analyze select count(*) from ev join dim on dim.k = ev.k where dim.k < 10 and ev.id > 19000 -> scan ev: primary key range (estimated 1000 rows) (rows read 1001, kept 1000, batches 1); join dim: hash on (k) over primary key range (estimated 9 rows) (table rows 9 of 10 read, probes 1000, rows read 0, joined 0); aggregate
 // expect: -- 4. an aggregate subquery reads everything: its join is planned as the same query alone
-// expect: explain select count(*) from big a join big b on b.id = a.sid -> [QUERY PLAN] scan big a: full scan; join big b: hash on (id) over full scan; aggregate
-// expect: explain select (select count(*) from big a join big b on b.id = a.sid) -> [QUERY PLAN] result; subquery 1 (scalar): run once;   scan big a: full scan;   join big b: hash on (id) over full scan;   aggregate
-// expect: explain select count(*) from big a join big b on b.id = a.sid limit 1 -> [QUERY PLAN] scan big a: full scan; join big b: hash on (id) over full scan; aggregate
+// expect: explain select count(*) from big a join big b on b.id = a.sid -> [QUERY PLAN] scan big a: index big_sid scan, index only; join big b: primary key lookup per row; aggregate
+// expect: explain select (select count(*) from big a join big b on b.id = a.sid) -> [QUERY PLAN] result; subquery 1 (scalar): run once;   scan big a: index big_sid scan, index only;   join big b: primary key lookup per row;   aggregate
+// expect: explain select count(*) from big a join big b on b.id = a.sid limit 1 -> [QUERY PLAN] scan big a: index big_sid scan, index only; join big b: primary key lookup per row; aggregate
 // expect: -- third review (optimizer 39): customers, orders (customer 5 has 600 of the newest), items, skus, a settings row
 // expect: create table cust3 (id int primary key, region int, name text) -> CREATE TABLE
 // expect: insert into cust3 select g, g % 4 + 1, 'c' || g from generate_series(1, 400) g -> INSERT 0 400
@@ -110,7 +117,7 @@
 // expect: explain analyze select count(*) from cust3 c join ord3 o on o.cid = c.id where c.id = 5 and o.d = date '2022-03-01' -> scan cust3 c: primary key lookup (rows read 1, kept 1); join ord3 o: hash on (cid) over index ord3_d lookup (estimated 7 rows) (table rows 2 of 2 read, probes 1, rows read 2, joined 2); aggregate
 // expect: explain analyze select count(*) from cust3 c join ord3 o on o.cid = c.id where c.id = 77 and o.st = 9 -> scan cust3 c: primary key lookup (rows read 1, kept 1); join ord3 o: index ord3_cid lookup (estimated 7 rows) per row (lookups 1, rows read 5, joined 0); aggregate
 // expect: -- 2. a pinned row that binds no other table (the settings) leaves the order to the costs
-// expect: explain analyze select count(*), min(s.id) from sku s, config g, item i, ord3 o where i.oid = o.id and s.id = i.sku and o.d >= date '2020-02-01' and o.d < date '2020-02-08' and g.id = 1 -> scan ord3 o: index ord3_d range, index only (estimated 210 rows) (rows read 240, kept 210, batches 1); join item i: primary key range (estimated 2 rows) per row (lookups 210, rows read 420, joined 420); join sku s: hash on (id) over full scan (table rows 50 of 50 read, probes 420, rows read 420, joined 420); join config g: loop over primary key lookup (table rows 1 of 1 read, probes 420, rows read 420, joined 420); aggregate
+// expect: explain analyze select count(*), min(s.id) from sku s, config g, item i, ord3 o where i.oid = o.id and s.id = i.sku and o.d >= date '2020-02-01' and o.d < date '2020-02-08' and g.id = 1 -> scan item i: full scan (rows read 3000, kept 3000); join ord3 o: hash on (id) over index ord3_d range, index only (estimated 210 rows) (table rows 210 of 240 read, probes 3000, rows read 420, joined 420); join sku s: hash on (id) over full scan (table rows 50 of 50 read, probes 420, rows read 420, joined 420); join config g: loop over primary key lookup (table rows 1 of 1 read, probes 420, rows read 420, joined 420); aggregate
 // expect: -- 3. ORDER BY ... LIMIT from a pinned row: the orders in key order, stopping at 10, wherever FROM puts them
 // expect: explain analyze select o.id, o.d, c.name from cust3 c join ord3 o on o.cid = c.id where c.id = 5 order by o.id limit 10 -> scan ord3 o: index ord3_cid lookup (estimated 605 rows) (rows read 10, kept 10); join cust3 c: hash on (id) over primary key lookup (table rows 1 of 1 read, probes 10, rows read 10, joined 10); order: the scan's; limit: stops the scan
 // expect: explain analyze select o.id, o.d, c.name from ord3 o join cust3 c on o.cid = c.id where c.id = 5 order by o.id limit 10 -> scan ord3 o: index ord3_cid lookup (estimated 605 rows) (rows read 10, kept 10); join cust3 c: hash on (id) over primary key lookup (table rows 1 of 1 read, probes 10, rows read 10, joined 10); order: the scan's; limit: stops the scan
@@ -193,12 +200,19 @@ fn body(st: lexdb_store.Store): int {
     show(mut &a, "select count(*) from sm s join bigv b on s.id = b.x")
     show(mut &a, "select count(*) from bigv b join sm s on s.vc = b.t")
     show(mut &a, "reset lexdb_planner")
-    println("-- 2. a hash join fits the statement's memory: with 256kB, big is looked up per row")
+    println("-- 2. a hash join fits the statement's memory: with 256kB, mid5 (5,000 rows with a pad, hashed by the costs) is looked up per row")
+    show(mut &a, "create table mid5 (id int primary key, pad text)")
+    show(mut &a, "insert into mid5 select g, repeat('y', 50) from generate_series(1, 5000) g")
+    show(mut &a, "analyze mid5")
     show(mut &a, "set max_statement_mem = '256kB'")
-    show(mut &a, "explain select count(*), max(b.pad) from big a join big b on b.id = a.sid")
-    show(mut &a, "select count(*) from big a join big b on b.id = a.sid")
+    show(mut &a, "explain select count(*), max(b.pad) from big a join mid5 b on b.id = a.v + a.sid")
+    show(mut &a, "select count(*), max(b.pad) from big a join mid5 b on b.id = a.v + a.sid")
     show(mut &a, "reset max_statement_mem")
+    show(mut &a, "explain select count(*), max(b.pad) from big a join mid5 b on b.id = a.v + a.sid")
+    show(mut &a, "select count(*), max(b.pad) from big a join mid5 b on b.id = a.v + a.sid")
+    println("-- big joined to itself by its key: looked up per row in key order (cheaper than hashing big, optimizer 45)")
     show(mut &a, "explain select count(*) from big a join big b on b.id = a.sid")
+    show(mut &a, "select count(*) from big a join big b on b.id = a.sid")
     println("-- 3. ranges, IN lists and other filters count: the range's table first")
     analyze(mut &a, "explain analyze select count(*) from big b join small s on b.sid = s.id where b.id < 5 and s.label = 'l3'")
     analyze(mut &a, "explain analyze select count(*) from big a join big b on b.id = a.sid where a.id between 10 and 12")
