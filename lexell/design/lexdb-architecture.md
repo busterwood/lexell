@@ -1,6 +1,6 @@
 # lexdb: the architecture we are consolidating toward
 
-Status: 2026-11-15, branch `arch/deep-modules`, based on `04fa4b80`
+Status: 2026-11-15, branch `arch/deep-modules-2`, based on `273b8229`
 (lexdb.md 9.136). This is the **current-state design**, not the
 chronological record. [lexdb.md](lexdb.md) remains the record of how each
 mechanism was measured and chosen; this note is the map we hold the code
@@ -40,6 +40,12 @@ both times: no regression beyond noise. The parser/dialect cycle is broken:
 mappings, catalog rows and catalog text. Wire/auth and the small
 connection-time `Dialect` facade remain, then `ReadView` and the
 executor/planner phases.
+
+This branch (`arch/deep-modules-2`) takes only the remaining agreed
+work: the dialect boundary, the parser split, the catalog seam and the
+planner. The storage seam, the executor stages, `Store` cleanup and the
+opaque operator tree are deferred; their design is recorded in
+[lexdb-refactor-followups.md](lexdb-refactor-followups.md).
 
 ## 1. Why this exists
 
